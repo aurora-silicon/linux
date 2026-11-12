@@ -9,17 +9,26 @@
 #include <net/cfg80211.h>
 
 #include "channels.h"
+#include "six.h"
 
 #define MT7932_POLICY_TABLES 13
 #define MT7932_POLICY_MODES 3
 #define MT7932_POLICY_6G_PAGES 32
+
+#define MT7932_6G_RECORDS 110
+
+struct mt7932_6g_table {
+	const u8 *records, *bitmap;
+	u64 channels;
+};
 
 struct mt7932_policy {
 	const u8 *mode[MT7932_POLICY_MODES];
 	const u8 *table[MT7932_POLICY_TABLES];
 	u16 length[MT7932_POLICY_TABLES];
 	u8 modes, six_pages;
-	u64 six_channels;
+	struct mt7932_6g_table six_class[3];
+	u64 six_channels, legacy_channels;
 	const u8 *six_page[MT7932_POLICY_6G_PAGES];
 	u16 six_length[MT7932_POLICY_6G_PAGES];
 	u8 six_cid[MT7932_POLICY_6G_PAGES];
@@ -56,6 +65,7 @@ static inline int mt7932_policy_6g_parse(struct mt7932_policy *out,
 	    memcmp(data + 16, alpha2, 2) || data[18] != 1 || memchr_inv(data + 19, 0, 5))
 		return -EINVAL;
 	out->six_channels = get_unaligned_le64(data + 8);
+	out->legacy_channels = out->six_channels;
 	if (!out->six_channels || (out->six_channels & ~GENMASK_ULL(58, 0)))
 		return -EINVAL;
 	out->six_pages = data[6];
@@ -106,6 +116,113 @@ static inline int mt7932_policy_6g_parse(struct mt7932_policy *out,
 	return at == size && out->assoc_power[0] && out->assoc_power[1] ? 0 : -EINVAL;
 }
 
+/* Version 4 binds the unchanged v3 class data to the SPEC's CID5d ABI.
+ * Version 3, binding revision zero, remains an unbound archive and is refused.
+ */
+static inline int mt7932_policy_classes_parse(struct mt7932_policy *out,
+					      const u8 *data, size_t size,
+					      const u8 alpha2[2])
+{
+	size_t at = 16;
+	unsigned int i, previous = 0;
+
+	if (size < at || memcmp(data, "6GCL", 4) || data[4] != 1 || !data[5] ||
+	    data[5] > 2 || data[6] != 1 || data[7] ||
+	    get_unaligned_le32(data + 8) != size ||
+	    get_unaligned_le32(data + 12))
+		return -EINVAL;
+	for (i = 0; i < data[5]; i++) {
+		const u8 *section = data + at, *record;
+		struct mt7932_6g_table *table;
+		unsigned int id, mode, j, channel = 1;
+		u64 mask;
+
+		if (size - at < 56)
+			return -EINVAL;
+		id = section[0];
+		if ((id != 1 && id != 2) || id <= previous ||
+		    section[1] != id - 1 || section[2] != 1 ||
+		    section[3] != MT7932_6G_RECORDS ||
+		    get_unaligned_le32(section + 4) !=
+			    56 + MT7932_6G_RECORDS * 122 ||
+		    size - at < 56 + MT7932_6G_RECORDS * 122 ||
+		    memcmp(section + 16, alpha2, 2) ||
+		    memchr_inv(section + 18, 0, 6))
+			return -EINVAL;
+		mask = get_unaligned_le64(section + 8);
+		if (!mask || (mask & ~GENMASK_ULL(58, 0)))
+			return -EINVAL;
+		record = section + 56;
+		for (j = 0; j < MT7932_6G_RECORDS; j++, record += 122) {
+			unsigned int k;
+			bool power = false;
+
+			/* Authenticated matrix order: channel 2, then primary and
+			 * bonded centers up to 160 MHz (excluding channel 231).
+			 */
+			if (record[0] != (j ? channel : 2))
+				return -EINVAL;
+			if (j) {
+				channel += 2;
+				while (channel == 31 || channel == 63 ||
+				       channel == 95 || channel == 127 ||
+				       channel == 159 || channel == 191 ||
+				       channel == 223 || channel == 231)
+					channel += 2;
+			}
+			if (record[0] % 4 != 1 ||
+			    !(mask & BIT_ULL((record[0] - 1) / 4)))
+				continue;
+			for (k = 1; k < 122; k++)
+				power |= record[k] != 0xc4 && record[k] != 0x7f;
+			if (!power)
+				return -EINVAL;
+		}
+		mode = id == 1 ? MT7932_6G_VLP : MT7932_6G_LPI;
+		table = &out->six_class[mode];
+		table->channels = mask;
+		table->bitmap = section + 24;
+		table->records = section + 56;
+		out->six_channels |= mask;
+		previous = id;
+		at += 56 + MT7932_6G_RECORDS * 122;
+	}
+	return at == size && out->six_class[MT7932_6G_LPI].records ? 0 :
+								     -EINVAL;
+}
+
+/* Normal infrastructure publication: submode zero, no invented class bits.
+ * Class IDs and data must agree; callers cannot relabel VLP data as LPI.
+ */
+static inline int mt7932_6g_class_page(u8 *body, size_t capacity,
+				       const struct mt7932_policy *policy,
+				       unsigned int mode, const u8 alpha2[2],
+				       unsigned int first)
+{
+	const struct mt7932_6g_table *table;
+	unsigned int count, length;
+
+	if (mode != MT7932_6G_LPI && mode != MT7932_6G_VLP)
+		return -EOPNOTSUPP;
+	table = &policy->six_class[mode];
+	if (!table->records || first >= MT7932_6G_RECORDS || first % 8)
+		return -EINVAL;
+	count = min(8U, MT7932_6G_RECORDS - first);
+	length = 44 + count * 122;
+	if (capacity < length)
+		return -ENOSPC;
+	memset(body, 0, 44);
+	body[1] = 0x0a | (mode << 4);
+	put_unaligned_le16(length, body + 2);
+	body[4] = count;
+	body[5] = 3;
+	body[6] = first + count == MT7932_6G_RECORDS;
+	memcpy(body + 8, alpha2, 2);
+	memcpy(body + 12, table->bitmap, 32);
+	memcpy(body + 44, table->records + first * 122, count * 122);
+	return length;
+}
+
 static inline int mt7932_policy_parse(struct mt7932_policy *out,
 				     const u8 *data, size_t size,
 				     const u8 alpha2[2])
@@ -115,11 +232,13 @@ static inline int mt7932_policy_parse(struct mt7932_policy *out,
 
 	memset(out, 0, sizeof(*out));
 	version = size >= 6 ? get_unaligned_le16(data + 4) : 0;
-	if (size < at || size > (version == 2 ? 65536 : 16384) || memcmp(data, "J7RP", 4) ||
-	    (version != 1 && version != 2) || memcmp(data + 6, alpha2, 2) ||
-	    data[8] < 2 || data[8] > MT7932_POLICY_MODES ||
-	    data[9] != MT7932_POLICY_TABLES || data[10] || data[11] ||
-	    get_unaligned_le32(data + 12) != size)
+	if (size < at ||
+	    size > (version == 2 || version == 4 ? 65536 : 16384) ||
+	    memcmp(data, "J7RP", 4) ||
+	    (version != 1 && version != 2 && version != 4) ||
+	    memcmp(data + 6, alpha2, 2) || data[8] < 2 ||
+	    data[8] > MT7932_POLICY_MODES || data[9] != MT7932_POLICY_TABLES ||
+	    data[10] || data[11] || get_unaligned_le32(data + 12) != size)
 		return -EINVAL;
 	out->modes = data[8];
 	for (i = 0; i < out->modes; i++, at += 328) {
@@ -175,6 +294,9 @@ static inline int mt7932_policy_parse(struct mt7932_policy *out,
 		out->length[i] = n;
 		at += n;
 	}
+	if (version == 4)
+		return mt7932_policy_classes_parse(out, data + at, size - at,
+						   alpha2);
 	return version == 2 ? mt7932_policy_6g_parse(out, data + at, size - at, alpha2) :
 		at == size ? 0 : -EINVAL;
 }
@@ -294,7 +416,7 @@ static inline unsigned int mt7932_6g_reg_index(unsigned int channel)
 }
 
 static inline struct mt7932_6g_limits
-mt7932_6g_limits(const struct mt7932_reg_snapshot *reg)
+mt7932_6g_limits_mask(const struct mt7932_reg_snapshot *reg, u64 channels)
 {
 	struct mt7932_6g_limits limits = { .eirp = 28, .psd = 256 };
 	unsigned int i, begin = reg->domain[8] + reg->domain[9];
@@ -303,11 +425,19 @@ mt7932_6g_limits(const struct mt7932_reg_snapshot *reg)
 		const u8 *entry = reg->domain + 12 + i * 8;
 		unsigned int index = mt7932_6g_reg_index(get_unaligned_le16(entry));
 
+		if (!(channels & BIT_ULL((get_unaligned_le16(entry) - 1) / 4)))
+			continue;
 		limits.eirp = min_t(int, limits.eirp, 2 * reg->power[index]);
 		if (get_unaligned_le32(entry + 4) & IEEE80211_CHAN_PSD)
 			limits.psd = min_t(int, limits.psd, 2 * reg->psd[index]);
 	}
 	return limits;
+}
+
+static inline struct mt7932_6g_limits
+mt7932_6g_limits(const struct mt7932_reg_snapshot *reg)
+{
+	return mt7932_6g_limits_mask(reg, ~0ULL);
 }
 
 /* Remove the channels the country package forbids from a CID0f domain. */
@@ -344,18 +474,21 @@ static inline void mt7932_policy_filter(struct mt7932_reg_snapshot *reg,
  */
 enum mt7932_policy_source {
 	MT7932_POLICY_NONE,
-	MT7932_POLICY_V2,	/* policy-v2/<CC>.bin */
-	MT7932_POLICY_V1,	/* policy/<CC>.bin */
-	MT7932_POLICY_WORLD,	/* policy/world-XZ.bin */
+	MT7932_POLICY_V4, /* policy-v4/<CC>.bin */
+	MT7932_POLICY_V2, /* policy-v2/<CC>.bin */
+	MT7932_POLICY_V1, /* policy/<CC>.bin */
+	MT7932_POLICY_WORLD, /* policy/world-XZ.bin */
 };
 
-#define MT7932_POLICY_CANDIDATES 3
+#define MT7932_POLICY_CANDIDATES 4
 #define MT7932_POLICY_PATH_MAX 48
 
 struct mt7932_policy_file {
 	const void *handle;
 	const u8 *data;
 	size_t size;
+	/* Optional v4 LPI sidecar; the primary remains the original v2. */
+	const void *class_handle;
 };
 
 /* get() returns 0 with @file filled in, or an error; put() releases it. */
@@ -372,6 +505,8 @@ struct mt7932_policy_choice {
 	u16 version;
 	u32 size;
 	u8 sha256[SHA256_DIGEST_SIZE];
+	u8 class_sha256[SHA256_DIGEST_SIZE];
+	bool class_valid;
 	/* 6 GHz primaries left in the firmware domain. */
 	u8 six_primaries;
 	/* Why the country's own packages were not used: -ENOENT, -EINVAL, or

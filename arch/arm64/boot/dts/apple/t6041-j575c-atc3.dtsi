@@ -1,0 +1,161 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The J575c's fourth back Type-C port (ADT port-location back-left): hpm3,
+ * atc-phy3, usb-drd3 and dart-usb3. On the J614c/J616c ATC3 is the HDMI
+ * converter's fixed DP PHY (t604x-extdisp.dtsi); here it is a USB-C port
+ * like ATC0-2, so it gets the same nodes as atcphy2/dwc3_2 in t604x.dtsi, at
+ * the ADT's ATC3 addresses (ATC2's plus 0x8000000) and interrupts.
+ */
+
+/ {
+	atcphy3: phy@39aa90000 {
+		compatible = "apple,t6040-atcphy";
+		reg = <0x3 0x9aa90000 0x0 0x4000>,
+		      <0x3 0x9a800000 0x0 0x4000>,
+		      <0x3 0x9aa84000 0x0 0x4000>,
+		      <0x3 0x9b000000 0x0 0x30000>,
+		      <0x3 0x9b200000 0x0 0x4000>,
+		      <0x3 0x9b140000 0x0 0x4000>,
+		      <0x3 0x9b0c0000 0x0 0x10000>,
+		      <0x3 0x98000000 0x0 0x8000>,
+		      <0x3 0x98020000 0x0 0x4000>,
+		      <0x3 0x9b244000 0x0 0x4000>,
+		      <0x3 0x9b250000 0x0 0x4000>;
+		reg-names = "bank0", "bank1", "pipehandler", "core", "cfg", "cpu",
+			    "cpu-data", "axi2af", "axi2af-lioa", "fabric", "common-cfg";
+		#phy-cells = <1>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc3_common_dp>;
+		mboxes = <&atcphy3_mbox>;
+		mbox-names = "phy-cpu";
+		nonposted-mmio;
+		orientation-switch;
+		apple,tunable-usb2-host = <0x8 0x7003 0x3>;
+	};
+
+	atcphy3_mbox: mailbox@39b148000 {
+		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x9b148000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 968 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 969 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 970 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 971 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_atc3_phymxwrap>;
+	};
+
+	dwc3_3_dart_0: iommu@39af00000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x3 0x9af00000 0x0 0xc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1719 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_atc3_usb>;
+		#iommu-cells = <1>;
+	};
+
+	dwc3_3_dart_1: iommu@39af80000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x3 0x9af80000 0x0 0xc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1719 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_atc3_usb>;
+		#iommu-cells = <1>;
+	};
+
+	dwc3_3: usb@39a280000 {
+		compatible = "apple,t6040-dwc3", "apple,t8103-dwc3";
+		reg = <0x3 0x9a280000 0x0 0xcd00>,
+		      <0x3 0x9a28cd00 0x0 0x3200>,
+		      <0x3 0x9a200000 0x0 0x4000>;
+		reg-names = "dwc3-core", "dwc3-apple", "drd-cfg";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1715 IRQ_TYPE_LEVEL_HIGH>;
+		/* A role switch, as on ATC0-2 (see dwc3_2 in t604x.dtsi). */
+		dr_mode = "otg";
+		usb-role-switch;
+		role-switch-default-mode = "host";
+		iommus = <&dwc3_3_dart_0 0>, <&dwc3_3_dart_1 1>;
+		power-domains = <&ps_atc3_usb>;
+		resets = <&atcphy3>;
+		phys = <&atcphy3 PHY_TYPE_USB2>;
+		phy-names = "usb2-phy";
+		/* ADT /arm-io/usb-drd3, the same tables as usb-drd0-2 */
+		apple,tunable-gbl-host = <0x4 0x0001ef00 0x00002f00>, <0x1c 0x00000100 0x0>,
+			<0x2c 0x000a07ff 0x000800c8>, <0x100 0x02000100 0x02000100>,
+			<0x504 0x00001000 0x0>, <0x528 0xff0000ff 0x06000006>,
+			<0x52c 0xff0000ff 0x08000008>, <0x538 0x00000800 0x00000800>,
+			<0x580 0xffffffff 0x6f000006>;
+		apple,tunable-cfg-host = <0x20 0xff 0x1b>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dwc3_3_hs: endpoint {
+					remote-endpoint = <&typec3_connector_hs>;
+				};
+			};
+		};
+	};
+};
+
+/* ADT /arm-io/nub-spmi-a0/hpm3: reg 0x6, interrupts 89/95/97 */
+&nub_spmi_a0 {
+	hpm3: usb-pd@6 {
+		compatible = "apple,sn201202x";
+		reg = <0x6 SPMI_USID>;
+		interrupts = <89 IRQ_TYPE_EDGE_RISING>,
+			     <91 IRQ_TYPE_EDGE_RISING>,
+			     <95 IRQ_TYPE_EDGE_RISING>,
+			     <97 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "select", "sleep", "wake";
+
+		typec3: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Back 4";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec3_connector_hs: endpoint {
+						remote-endpoint = <&dwc3_3_hs>;
+					};
+				};
+			};
+		};
+	};
+};
+
+/*
+ * t604x-pmgr.dtsi leaves the ATC3 domains disabled: on the J614c/J616c the
+ * display gate enables them for the HDMI chain. Here they power a USB port.
+ */
+&ps_atc3_common {
+	status = "okay";
+};
+
+&ps_atc3_usb_aon {
+	status = "okay";
+};
+
+&ps_atc3_usb {
+	status = "okay";
+};
+
+&ps_atc3_phymxwrap {
+	status = "okay";
+};
+
+&ps_atc3_common_dp {
+	status = "okay";
+};

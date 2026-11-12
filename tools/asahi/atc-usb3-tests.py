@@ -96,7 +96,7 @@ struct apple_atcphy {
     bool pipe_pending, t8103_dummy_pending, t8103_usb3_retry, t8103_usb3_workaround, mode_dirty, usb_off_pending;
     bool host_active, usb3_port_off, dp_only, ss_tunables, fixed_usb2, t8140_dp_tunables, dp_tunables;
     /* T8132 state: the modeled machines never select that generation. */
-    bool t8132_ss, t8132_common_owned, t8132_failed;
+    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables;
     struct { void *usb3_dp; } tunables;
 };
 struct phy { struct apple_atcphy *data; };
@@ -660,8 +660,11 @@ def harness(source):
     ]
     scope = generation_scope(source, root)
     scope_c = "static const enum atcphy_generation scope_generations[] = {" + ",".join(r["generation"] for r in scope) + "};\n"
-    functions = "\n".join(block(source, "static " + kind + " " + name + "(")
-                          for kind, name in function_specs)
+    # The PIPE backend of a mode, which T8132 CIO keeps on the dummy one.
+    helpers = [block(source, "static bool atcphy_mode_is_cio("),
+               block(source, "static enum atcphy_pipehandler_state\natcphy_pipe_state_for(")]
+    functions = "\n".join(helpers + [block(source, "static " + kind + " " + name + "(")
+                                      for kind, name in function_specs])
     configure = block(source, "static int atcphy_configure(")
     guard_start = configure.index("lockdep_assert_held")
     guard_end = configure.index("if (atcphy->usb_off_pending")
@@ -770,7 +773,8 @@ MUTATIONS = {'no-live-retry': ('atcphy_pipehandler_lock_live', '? 10 : 1;', '? 1
  'role-ignores-pending': ('atcphy_usb3_route', 'if (atcphy->t8103_dummy_pending)', 'if (false)'),
  'mux-ignores-pending': ('atcphy_mux_switch', 'if (atcphy->t8103_dummy_pending)', 'if (false)'),
  'canceled-not-reconnected': ('atcphy_mux_switch',
-                              'if (atcphy_modes[target_mode].pipehandler_state == ATCPHY_PIPEHANDLER_STATE_USB3)\n\t\t\t\treturn atcphy_configure_pipehandler',
+                              'if (atcphy_pipe_state_for(atcphy, target_mode) ==\n'
+                              '\t\t\t    ATCPHY_PIPEHANDLER_STATE_USB3)\n\t\t\t\treturn atcphy_configure_pipehandler',
                               'if (false)\n\t\t\t\treturn atcphy_configure_pipehandler'),
  'retry-cleared-at-unlock': ('atcphy_park_live_t8103_pipehandler',
                              'atcphy->t8103_dummy_pending = false;',
@@ -785,7 +789,7 @@ MUTATIONS = {'no-live-retry': ('atcphy_pipehandler_lock_live', '? 10 : 1;', '? 1
                                      'return atcphy_configure_pipehandler(atcphy, false);\n'
                                      '\t\t(void)0;'),
  'usb3-dp-wrongly-parked': ('atcphy_mux_switch',
-                            'atcphy_modes[target_mode].pipehandler_state == '
+                            'atcphy_pipe_state_for(atcphy, target_mode) == '
                             'ATCPHY_PIPEHANDLER_STATE_DUMMY) {',
                             'true) {'),
  'reset-release-ignores-pending': ('atcphy_dwc3_reset_deassert',

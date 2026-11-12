@@ -30,7 +30,7 @@ pub(crate) struct ErrorEvent {
 
 impl ErrorEvent {
     pub(crate) fn generation(&self) -> u64 {
-        self.raw[1] as u64 | ((self.raw[2] as u64) << 32)
+        u64::from(self.raw[1]) | (u64::from(self.raw[2]) << 32)
     }
 }
 

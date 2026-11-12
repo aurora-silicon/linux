@@ -15,6 +15,7 @@
 
 #include "parser.h"
 #include "dcp-refresh.h"
+#include "dcp-peer-v27.h"
 #include "trace.h"
 
 #define DCP_PARSE_HEADER 0xd3
@@ -1380,7 +1381,8 @@ static int parse_metadata_number(struct dcp_parse_ctx *handle, u32 *out, u32 min
 	return ret;
 }
 
-static int parse_metadata_point(struct dcp_parse_ctx *handle, u32 point[2], u32 *gamma)
+static int parse_metadata_point(struct dcp_parse_ctx *handle, u32 point[2], u32 *gamma,
+				bool optional_gamma)
 {
 	struct iterator it;
 	unsigned int seen = 0;
@@ -1419,7 +1421,8 @@ static int parse_metadata_point(struct dcp_parse_ctx *handle, u32 point[2], u32 
 	 * A white point is a chromaticity.  A primary is passed on as the
 	 * sink reports it: real EDIDs carry primaries with x + y above 1.
 	 */
-	if (seen != (gamma ? 7 : 3) || (gamma && point[0] + point[1] > 65536))
+	if ((seen & 3) != 3 || (gamma && !optional_gamma && !(seen & 4)) ||
+	    (gamma && point[0] + point[1] > 65536))
 		return -EINVAL;
 	return 0;
 }
@@ -1448,7 +1451,7 @@ static int parse_metadata_chromaticity(struct dcp_parse_ctx *handle,
 			if (seen & 1U << color)
 				return -EINVAL;
 			seen |= 1U << color;
-			ret = parse_metadata_point(handle, out->chromaticity[color], NULL);
+			ret = parse_metadata_point(handle, out->chromaticity[color], NULL, false);
 		} else {
 			ret = skip(handle);
 		}
@@ -1667,7 +1670,7 @@ int parse_display_metadata(struct dcp_parse_ctx *handle, struct dcp_display_meta
 			if (seen & 8)
 				return -EINVAL;
 			seen |= 8;
-			ret = parse_metadata_point(handle, parsed.white, &parsed.gamma);
+			ret = parse_metadata_point(handle, parsed.white, &parsed.gamma, false);
 		} else if (!strcmp(key, "ProductAttributes")) {
 			if (seen & 16)
 				return -EINVAL;
@@ -1709,7 +1712,8 @@ int parse_panel_metadata(struct dcp_parse_ctx *handle, struct dcp_display_metada
 {
 	struct dcp_display_metadata parsed = {};
 	struct iterator it;
-	bool product = false;
+	bool product = false, chromaticity = false, white = false;
+	unsigned int color_seen = 0;
 	int ret = iterator_begin(handle, &it, true);
 
 	if (ret)
@@ -1725,6 +1729,21 @@ int parse_panel_metadata(struct dcp_parse_ctx *handle, struct dcp_display_metada
 				return -EINVAL;
 			product = true;
 			ret = parse_metadata_product(handle, &parsed, true);
+		} else if (!strcmp(key, "Chromaticity")) {
+			struct dcp_parse_ctx color = *handle;
+
+			/* Optional colour data must not invalidate panel identity. */
+			chromaticity = !parse_metadata_chromaticity(&color, &parsed) &&
+				       !(color_seen & 1);
+			color_seen |= 1;
+			ret = skip(handle);
+		} else if (!strcmp(key, "DefaultWhitePoint")) {
+			struct dcp_parse_ctx color = *handle;
+
+			white = !parse_metadata_point(&color, parsed.white, &parsed.gamma, true) &&
+				!(color_seen & 2);
+			color_seen |= 2;
+			ret = skip(handle);
 		} else {
 			ret = skip(handle);
 		}
@@ -1733,16 +1752,68 @@ int parse_panel_metadata(struct dcp_parse_ctx *handle, struct dcp_display_metada
 	}
 	if (!product)
 		return -ENODATA;
+	/* Never combine incomplete or duplicate descriptions with a nominal white. */
+	if (!chromaticity || !white) {
+		memset(parsed.chromaticity, 0, sizeof(parsed.chromaticity));
+		memset(parsed.white, 0, sizeof(parsed.white));
+		parsed.gamma = 0;
+	}
 	*out = parsed;
 	return 0;
 }
 
+int parse_dptx_caps(struct dcp_parse_ctx *handle, struct dcp_dptx_caps *caps)
+{
+	struct iterator it;
+	struct dcp_dptx_caps parsed = {};
+	int ret = 0;
+
+	ret = iterator_begin(handle, &it, true);
+	if (ret)
+		return ret;
+	for (; it.idx < it.len; ++it.idx) {
+		u32 *field = NULL;
+		char *key = parse_string(it.handle);
+		s64 value;
+
+		if (IS_ERR(key))
+			return PTR_ERR(key);
+		if (!strcmp(key, "MaxPixelWidth"))
+			field = &parsed.width;
+		else if (!strcmp(key, "MaxTotalPixelRate"))
+			field = &parsed.total_rate;
+		else if (!strcmp(key, "MaxActivePixelRate"))
+			field = &parsed.active_rate;
+		kfree(key);
+		if (!field) {
+			ret = skip(it.handle);
+			if (ret)
+				return ret;
+			if (it.handle->pos > it.handle->len)
+				return -EINVAL;
+			continue;
+		}
+		if (*field)
+			return -EINVAL;
+		ret = parse_int_bound(it.handle, &value, 1, U32_MAX);
+		if (ret)
+			return ret;
+		*field = value;
+	}
+	if (!parsed.width || !parsed.total_rate || !parsed.active_rate)
+		return -ENOENT;
+	*caps = parsed;
+	return 0;
+}
+
 int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
-			    const char **class, s64 *unit, bool h17p_keys)
+			    const char **class, s64 *unit, bool h17p_keys,
+			    bool epic_unit_first)
 {
 	int ret = 0;
 	struct iterator it;
 	bool parsed_unit = false;
+	bool explicit_unit = false;
 	bool parsed_name = false;
 	bool parsed_class = false;
 
@@ -1769,7 +1840,9 @@ int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
 		 * service to ask and idles the panel, so no vblank and no swap
 		 * ever completes.  Only H17P callers accept them.  If a
 		 * dictionary carries both spellings, the later value wins and
-		 * the earlier string is freed.
+		 * the earlier string is freed, except that with
+		 * @epic_unit_first (firmware 27) EPICUnit is the unit in
+		 * either order.
 		 */
 		if (!strcmp(key, "EPICName") ||
 		    (h17p_keys && !strcmp(key, "compartment"))) {
@@ -1790,10 +1863,13 @@ int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
 			else
 				parsed_class = true;
 		} else if (!strcmp(key, "EPICUnit") ||
-			   (h17p_keys && !strcmp(key, "interface-id"))) {
+			   (h17p_keys && !explicit_unit && !strcmp(key, "interface-id"))) {
 			ret = parse_int(it.handle, unit);
-			if (!ret)
+			if (!ret) {
 				parsed_unit = true;
+				explicit_unit |= epic_unit_first &&
+						 !strcmp(key, "EPICUnit");
+			}
 		} else {
 			ret = skip(it.handle);
 		}
@@ -2264,6 +2340,225 @@ static int parse_identity_tree(struct dcp_parse_ctx *ctx, dcp_identity_key_fn em
 	return 0;
 }
 
+/* Read one colour element dictionary. */
+static int parse_color_element(struct dcp_parse_ctx *handle, struct dcp_color_element *e)
+{
+	struct iterator it;
+	int ret = iterator_begin(handle, &it, true);
+
+	*e = (struct dcp_color_element) {
+		.id = -1, .depth = -1, .range = -1, .eotf = -1, .encoding = -1,
+		.colorimetry = -1, .score = -1, .is_virtual = true,
+	};
+	if (ret)
+		return ret;
+	for (; it.idx < it.len; ++it.idx) {
+		char *key = parse_string(it.handle);
+
+		if (IS_ERR(key))
+			return PTR_ERR(key);
+		if (!strcmp(key, "ID"))
+			ret = parse_int(it.handle, &e->id);
+		else if (!strcmp(key, "Depth"))
+			ret = parse_int(it.handle, &e->depth);
+		else if (!strcmp(key, "DynamicRange"))
+			ret = parse_int(it.handle, &e->range);
+		else if (!strcmp(key, "EOTF"))
+			ret = parse_int(it.handle, &e->eotf);
+		else if (!strcmp(key, "PixelEncoding"))
+			ret = parse_int(it.handle, &e->encoding);
+		else if (!strcmp(key, "Colorimetry"))
+			ret = parse_int(it.handle, &e->colorimetry);
+		else if (!strcmp(key, "Score"))
+			ret = parse_int(it.handle, &e->score);
+		else if (!strcmp(key, "IsVirtual"))
+			ret = parse_bool(it.handle, &e->is_virtual);
+		else
+			ret = skip(it.handle);
+		kfree(key);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+#define DCP_TIMING_RESTRICTED_MAX 64
+
+/* Append the integers of an array to @ids (at most DCP_TIMING_RESTRICTED_MAX). */
+static int parse_id_list(struct dcp_parse_ctx *handle, s64 *ids, unsigned int *count)
+{
+	struct iterator it;
+	int ret = iterator_begin(handle, &it, false);
+
+	if (ret)
+		return ret;
+	for (; it.idx < it.len; ++it.idx) {
+		s64 id;
+
+		ret = parse_int(it.handle, &id);
+		if (ret)
+			return ret;
+		if (*count < DCP_TIMING_RESTRICTED_MAX)
+			ids[(*count)++] = id;
+	}
+	return 0;
+}
+
+/*
+ * Each colour element (virtual ones too) of the timing @timing_id in a
+ * TimingElements catalog, flagged if the timing lists it as unsafe and if it
+ * lists it as needing DSC; whether the timing is interlaced. A malformed
+ * timing entry is skipped. -ENOENT if the catalog has no such timing.
+ */
+int dcp_parse_timing_colors(const void *blob, size_t len, u32 timing_id,
+			    dcp_color_element_fn emit, void *data, bool *interlaced)
+{
+	struct dcp_parse_ctx ctx;
+	struct iterator timings;
+	s64 *unsafe, *dsc;
+	int ret = parse(blob, len, &ctx);
+
+	if (!ret)
+		ret = iterator_begin(&ctx, &timings, false);
+	if (ret)
+		return ret;
+	unsafe = kcalloc(2 * DCP_TIMING_RESTRICTED_MAX, sizeof(*unsafe), GFP_KERNEL);
+	if (!unsafe)
+		return -ENOMEM;
+	dsc = unsafe + DCP_TIMING_RESTRICTED_MAX;
+	ret = -ENOENT;
+	for (; timings.idx < timings.len; ++timings.idx) {
+		struct dcp_parse_ctx entry_start = ctx, colors = {};
+		struct iterator entry, it;
+		bool match = false, have_colors = false, is_interlaced = false;
+		unsigned int nr_unsafe = 0, nr_dsc = 0;
+		int err;
+
+		/* ColorModes may come before the ID: find both, then walk the colours. */
+		err = iterator_begin(&ctx, &entry, true);
+		for (; !err && entry.idx < entry.len; ++entry.idx) {
+			char *key = parse_string(&ctx);
+			s64 id;
+
+			if (IS_ERR(key)) {
+				err = PTR_ERR(key);
+				break;
+			}
+			if (!strcmp(key, "ID")) {
+				err = parse_int(&ctx, &id);
+				match |= !err && id == timing_id;
+			} else if (!strcmp(key, "ColorModes")) {
+				colors = ctx;
+				have_colors = true;
+				err = skip(&ctx);
+			} else if (!strcmp(key, "UnsafeColorElementIDs")) {
+				err = parse_id_list(&ctx, unsafe, &nr_unsafe);
+			} else if (!strcmp(key, "DSCRequiredColorElementIDs")) {
+				err = parse_id_list(&ctx, dsc, &nr_dsc);
+			} else if (!strcmp(key, "IsInterlaced")) {
+				err = parse_bool(&ctx, &is_interlaced);
+			} else {
+				err = skip(&ctx);
+			}
+			kfree(key);
+		}
+		if (err) {
+			/* As enumerate_modes(): a malformed entry is skipped. */
+			ctx = entry_start;
+			ret = skip(&ctx);
+			if (ret)
+				goto out;
+			ret = -ENOENT;
+			continue;
+		}
+		if (!match)
+			continue;
+		if (interlaced)
+			*interlaced = is_interlaced;
+		ret = 0;
+		if (!have_colors)
+			goto out;
+		ret = iterator_begin(&colors, &it, false);
+		for (; !ret && it.idx < it.len; ++it.idx) {
+			struct dcp_color_element e;
+
+			ret = parse_color_element(it.handle, &e);
+			if (ret)
+				break;
+			for (unsigned int i = 0; i < nr_unsafe; i++)
+				e.unsafe |= unsafe[i] == e.id;
+			for (unsigned int i = 0; i < nr_dsc; i++)
+				e.dsc_required |= dsc[i] == e.id;
+			emit(data, &e);
+		}
+		goto out;
+	}
+out:
+	kfree(unsafe);
+	return ret;
+}
+
+/*
+ * The ID and active size of each timing entry of a TimingElements-
+ * shaped catalog (PreferredTimingElements, whose entries have no colour
+ * elements of their own), the first @max of them. A malformed entry is
+ * skipped. The number found, or a negative error.
+ */
+int dcp_parse_timing_ids(const void *blob, size_t len, struct dcp_timing_id *out,
+			 unsigned int max)
+{
+	struct dcp_parse_ctx ctx;
+	struct iterator timings;
+	unsigned int found = 0;
+	int ret = parse(blob, len, &ctx);
+
+	if (!ret)
+		ret = iterator_begin(&ctx, &timings, false);
+	if (ret)
+		return ret;
+	for (; timings.idx < timings.len; ++timings.idx) {
+		struct dcp_parse_ctx entry_start = ctx;
+		struct dimension horiz = { .active = -1 }, vert = { .active = -1 };
+		struct iterator entry;
+		s64 id = -1;
+		int err = iterator_begin(&ctx, &entry, true);
+
+		for (; !err && entry.idx < entry.len; ++entry.idx) {
+			char *key = parse_string(&ctx);
+
+			if (IS_ERR(key)) {
+				err = PTR_ERR(key);
+				break;
+			}
+			if (!strcmp(key, "ID"))
+				err = parse_int_bound(&ctx, &id, 0, U32_MAX);
+			else if (!strcmp(key, "HorizontalAttributes"))
+				err = parse_dimension(&ctx, &horiz, false);
+			else if (!strcmp(key, "VerticalAttributes"))
+				err = parse_dimension(&ctx, &vert, false);
+			else
+				err = skip(&ctx);
+			kfree(key);
+		}
+		if (err) {
+			/* As enumerate_modes(): a malformed entry is skipped. */
+			ctx = entry_start;
+			ret = skip(&ctx);
+			if (ret)
+				return ret;
+			continue;
+		}
+		if (id < 0 || found >= max)
+			continue;
+		out[found++] = (struct dcp_timing_id) {
+			.id = id,
+			.width = horiz.active > 0 ? horiz.active : 0,
+			.height = vert.active > 0 ? vert.active : 0,
+		};
+	}
+	return found;
+}
+
 int parse_identity_keys(const void *blob, size_t len, dcp_identity_key_fn emit, void *data)
 {
 	struct dcp_parse_ctx ctx, root;
@@ -2355,4 +2650,40 @@ int parse_panel_edid_data(const void *blob, size_t len, const u8 **edid, size_t 
 	}
 	ret = parse(blob, len, &ctx);
 	return ret ?: parse_panel_edid_value(&ctx, 0, &budget, true, edid, size);
+}
+int parse_system_log_mnits_pairs(const void *blob, size_t size,
+				 struct dcp_system_ev_mnits *entry)
+{
+	struct dcp_parse_ctx ctx = { .blob = blob, .len = size, .pos = 0 };
+	s64 mnits = -1, idac = -1, timestamp = 0;
+	int ret = 0;
+
+	if (size > U32_MAX)
+		return -EINVAL;
+
+	while (round_up(ctx.pos, 4) + sizeof(u32) <= size) {
+		char *key = parse_string(&ctx);
+
+		if (IS_ERR(key))
+			break;
+		if (!strcmp(key, "mNits"))
+			ret = parse_int(&ctx, &mnits);
+		else if (!strcmp(key, "iDAC"))
+			ret = parse_int(&ctx, &idac);
+		else if (!strcmp(key, "timestamp"))
+			ret = parse_int(&ctx, &timestamp);
+		else
+			ret = skip(&ctx);
+		kfree(key);
+		if (ret)
+			break;
+	}
+
+	if (mnits < 0 || mnits > U32_MAX)
+		return -EINVAL;
+
+	entry->millinits = mnits;
+	entry->idac = idac < 0 ? 0 : idac;
+	entry->timestamp = timestamp;
+	return 0;
 }

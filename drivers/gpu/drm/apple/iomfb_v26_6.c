@@ -1161,16 +1161,22 @@ int iomfb_v26_6_bind(struct apple_dcp *dcp)
 		return dev_err_probe(dev, -EINVAL, "J613/25G83 same-boot clock observation required\n");
 
 	dcp_v26_link_init(&v26->link, dev, NULL);
+	/* The mailbox's callbacks need this module until reboot. */
+	if (!try_module_get(THIS_MODULE))
+		return dev_err_probe(dev, -ENODEV,
+				     "%s display not started: the module is being removed\n",
+				     v26->board->name);
 	rtk = apple_rtkit_init(dev, v26, "mbox", 0, &dcp_v26_rtkit_ops);
-	if (IS_ERR(rtk))
+	if (IS_ERR(rtk)) {
+		module_put(THIS_MODULE);
 		return dev_err_probe(dev, PTR_ERR(rtk),
 				     "%s display not started: RTKit init failed\n",
 				     v26->board->name);
+	}
 	/* From here nothing is freed and the module stays loaded. */
 	v26->rtk = rtk;
 	v26->link.rtk = rtk;
 	dcp_v26_session = true;
-	__module_get(THIS_MODULE);
 
 	ret = apple_rtkit_wake(rtk);
 	if (ret) {
@@ -1527,22 +1533,16 @@ static int dcp_v26_ctm_locked(struct apple_dcp_v26 *v26,
 {
 	u8 request[80] = {}, readback[76] = {};
 	__le32 status = 0;
-	const struct drm_color_ctm *ctm;
+	u64 coefficient[9];
 	int i, ret;
 
 	if (!state || (v26->ctm_valid && !state->color_mgmt_changed &&
 		       !state->mode_changed && !state->active_changed))
 		return 0;
-	ctm = state->ctm ? state->ctm->data : NULL;
+	dcp_ctm_to_fw(coefficient, state->ctm ? state->ctm->data : NULL);
 	put_unaligned_le32(9, request);
-	for (i = 0; i < 9; i++) {
-		u64 coefficient = ctm ? ctm->matrix[i] :
-				  ((i == 0 || i == 4 || i == 8) ? 1ULL << 32 : 0);
-		u64 magnitude = coefficient & ~(1ULL << 63);
-		u64 signed_q32 = coefficient & (1ULL << 63) ? -magnitude : magnitude;
-
-		put_unaligned_le64(signed_q32, request + 4 + 8 * i);
-	}
+	for (i = 0; i < 9; i++)
+		put_unaligned_le64(coefficient[i], request + 4 + 8 * i);
 	ret = dcp_v26_call(v26, A(423), request, sizeof(request),
 		       &status, sizeof(status), 0);
 	v26->ctm_calls++;

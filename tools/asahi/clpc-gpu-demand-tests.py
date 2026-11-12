@@ -25,6 +25,7 @@ def main():
     header = (ROOT / 'include/linux/soc/apple/pmc.h').read_text()
     rail_shift = re.search(r'^#define APPLE_PMC_RAIL_SHIFT\(rail\).*$', header, re.M).group(0)
     dense_samples = re.search(r'^#define APPLE_CLPC_GPU_DENSE_SAMPLES\s.*$', source, re.M).group(0)
+    reasons = '\n'.join(re.findall(r'^#define APPLE_CLPC_REASON_\w+\s.*$', source, re.M))
     types = '\n'.join(item(source, s) + ';' for s in [
         'struct apple_clpc_hw {', 'struct apple_clpc_vote {'])
     tables = '\n'.join(item(source, 'static const struct apple_clpc_hw ' + n) + ';'
@@ -36,6 +37,9 @@ def main():
         'static bool apple_clpc_gpu_dense(',
         'static bool apple_clpc_gpu_limited(',
         'static void apple_clpc_gpu_floor_count(',
+        'static bool apple_clpc_gpu_input_demand(',
+        'static bool apple_clpc_ane_input_demand(',
+        'static void apple_clpc_ane_cluster(',
         'static void apple_clpc_sample('])
     code = r'''
 #include <assert.h>
@@ -53,21 +57,42 @@ typedef uint64_t u64;
 #define HZ 1000
 #define max(a,b) ((a) > (b) ? (a) : (b))
 #define GENMASK(h,l) (((1u << ((h)-(l)+1))-1) << (l))
+#define BIT(n) (1u << (n))
 #define APPLE_PMC_RAIL_SHIFT(r) ((r)*8)
 #define time_after_eq(a,b) ((long)((a)-(b)) >= 0)
 #define time_after(a,b) ((long)((a)-(b)) > 0)
 #define time_before(a,b) ((long)((a)-(b)) < 0)
 #define msecs_to_jiffies(ms) (ms)
+static int warned;
+#define dev_warn_once(d, ...) ((void)(d), warned++)
 enum apple_clpc_rail { APPLE_CLPC_DCS, APPLE_CLPC_SOC, APPLE_CLPC_RAILS };
 ''' + types + r'''
 struct apple_clpc_gpu { bool active; u64 sequence; };
+struct apple_clpc_ane { int lock; bool active, pending; };
+#define spin_lock_irqsave(l, f) ((void)(l), (f) = 0)
+#define spin_unlock_irqrestore(l, f) ((void)(l), (void)(f))
 struct apple_clpc_cluster { unsigned int request[APPLE_CLPC_RAILS]; };
+// cpufreq QoS stand-ins: one policy, the last requested minimum is recorded.
+#define FREQ_QOS_MIN 1
+#define FREQ_QOS_MIN_DEFAULT_VALUE 0
+struct freq_qos_request { bool active; int value; };
+struct cpufreq_policy { int constraints; };
+static struct cpufreq_policy policy;
+static int qos_min = -1, qos_adds;
+static bool freq_qos_request_active(struct freq_qos_request *r) { return r->active; }
+static struct cpufreq_policy *cpufreq_cpu_get(int cpu) { (void)cpu; return &policy; }
+static void cpufreq_cpu_put(struct cpufreq_policy *p) { (void)p; }
+static int freq_qos_add_request(int *c, struct freq_qos_request *r, int type, int v) {
+ (void)c; assert(type==FREQ_QOS_MIN && !r->active); r->active=true; r->value=v; qos_min=v; qos_adds++; return 1;
+}
+static int freq_qos_update_request(struct freq_qos_request *r, int v) { assert(r->active); r->value=v; qos_min=v; return 1; }
 struct apple_clpc {
  const struct apple_clpc_hw *hw;
  struct apple_clpc_cluster clusters[1];
  struct apple_clpc_vote vote[APPLE_CLPC_RAILS];
  unsigned int nr_clusters, agent;
- unsigned long samples, next_scan, update_errors;
+ unsigned long samples, next_scan, update_errors, gpu_read_errors;
+ void *dev;
  void *covered, *pmc, *gpu_pmgr;
  u32 gpu_offset, mask, last_floor, last_reason;
  bool gpu_on, gpu_limited, gpu_floor_released;
@@ -78,6 +103,13 @@ struct apple_clpc {
  unsigned long gpu_streaming_samples, gpu_dense_samples;
  u64 last_vote_ns;
  struct apple_clpc_gpu *gpu;
+ struct apple_clpc_ane *ane;
+ unsigned int ane_states[APPLE_CLPC_RAILS];
+ u32 ane_cluster_khz;
+ int ane_cpu;
+ struct freq_qos_request ane_qos;
+ unsigned int ane_qos_khz;
+ unsigned long ane_until;
 };
 static unsigned long jiffies;
 static u64 ktime_get_mono_fast_ns(void) { return jiffies * 1000000ull; }
@@ -99,20 +131,72 @@ static int apple_pmc_floor_update(void *pmc, unsigned int agent, u32 mask, u32 f
  (void)pmc; assert(agent==1 && mask==3); published=floor; return vote_error;
 }
 static void apple_clpc_queue(struct apple_clpc *c, bool idle) { (void)c; queued_idle=idle; }
-''' + dense_samples + '\n' + tables + '\n' + methods + r'''
+''' + dense_samples + '\n' + reasons + '\n' + tables + '\n' + methods + r'''
+// T8140 ANE work holds its DRAM and fabric states while it runs, a request
+// shorter than one sample is still seen once, and the hold then expires.
+static void check_t8140_ane(void) {
+ struct apple_clpc_ane ane={0};
+ struct apple_clpc c={.hw=&apple_clpc_hw_t8140,.agent=1,.mask=3,.ane=&ane};
+ c.ane_states[APPLE_CLPC_DCS]=c.hw->ane[APPLE_CLPC_DCS];
+ c.ane_states[APPLE_CLPC_SOC]=c.hw->ane[APPLE_CLPC_SOC];
+ read_error=vote_error=0; pmgr_status=0; pmp_floor=0; jiffies=1000; published=~0u;
+ apple_clpc_sample(&c); assert(published==0 && c.last_reason==0);
+ ane.active=true; jiffies=1004; apple_clpc_sample(&c);
+ assert(published==0x34 && c.last_reason==32);
+ ane.active=false; ane.pending=true; jiffies=1008; apple_clpc_sample(&c);
+ assert(published==0x34 && c.last_reason==32 && !ane.pending);
+ jiffies=1012; apple_clpc_sample(&c); assert(published==0x34 && c.last_reason==16);
+ jiffies=1040; apple_clpc_sample(&c); assert(published==0 && queued_idle);
+}
+
+// T6040 ANE work also holds the second P cluster at its qualified frequency,
+// added on first use, for the vote hold after the last request, then drops it.
+static void check_t6040_ane(void) {
+ struct apple_clpc_ane ane={0};
+ struct apple_clpc c={.hw=&apple_clpc_hw_t6040,.agent=1,.mask=3,.ane=&ane};
+ c.ane_states[APPLE_CLPC_DCS]=c.hw->ane[APPLE_CLPC_DCS];
+ c.ane_states[APPLE_CLPC_SOC]=c.hw->ane[APPLE_CLPC_SOC];
+ c.ane_cpu=9; c.ane_cluster_khz=c.hw->ane_cluster_khz;
+ assert(c.hw->ane_cluster==2 && c.ane_cluster_khz==3756000);
+ read_error=vote_error=0; pmgr_status=0; pmp_floor=0; jiffies=2000; published=~0u; qos_min=-1; qos_adds=0;
+ apple_clpc_sample(&c); assert(published==0 && qos_adds==0 && queued_idle);
+ ane.active=true; jiffies=2004; apple_clpc_sample(&c);
+ assert(published==0x25 && c.last_reason==32 && qos_adds==1 && qos_min==3756000);
+ ane.active=false; jiffies=2008; apple_clpc_sample(&c);
+ assert(qos_min==3756000 && !queued_idle);
+ jiffies=2036; apple_clpc_sample(&c); assert(published==0 && qos_min==0 && c.ane_qos_khz==0 && queued_idle);
+ ane.active=true; jiffies=2040; apple_clpc_sample(&c); assert(qos_adds==1 && qos_min==3756000);
+}
+
+// T8132's G16 firmware keeps graphics powered while the GPU idles: the
+// M5/F3 floor follows the work the GPU driver reports, as on T6040.
 static void check_t8132(void) {
- struct apple_clpc c={.hw=&apple_clpc_hw_t8132,.agent=1,.mask=3,.gpu_pmgr=(void *)1};
- read_error=vote_error=0; pmgr_status=0; pmp_floor=0; jiffies=0;
- apple_clpc_sample(&c); assert(published==0 && queued_idle);
- jiffies=100; pmgr_status=0xf0;
- apple_clpc_sample(&c); assert(published==0x35 && c.last_reason==4);
- jiffies=131; pmgr_status=0; apple_clpc_sample(&c);
+ struct apple_clpc_gpu gpu={0};
+ struct apple_clpc c={.hw=&apple_clpc_hw_t8132,.agent=1,.mask=3,.gpu=&gpu};
+ assert(!c.hw->gpu_demand);
+ read_error=vote_error=0; pmgr_status=0xf0; pmp_floor=0; jiffies=0; published=~0u;
+ apple_clpc_sample(&c); assert(published==0 && queued_idle && c.last_reason==0);
+ gpu.active=true; jiffies=100;
+ apple_clpc_sample(&c); assert(published==0x35 && c.last_reason==2);
+ gpu.active=false; jiffies=131; apple_clpc_sample(&c);
  assert(published==0x35 && c.last_reason==16);
  jiffies=132; apple_clpc_sample(&c); assert(published==0 && queued_idle);
- // A failed power-state read still protects an active graphics consumer.
- jiffies=200; pmgr_status=0xe0; read_error=-EIO;
- apple_clpc_sample(&c); assert(published==0x35);
- jiffies=232; read_error=0; apple_clpc_sample(&c); assert(published==0);
+}
+
+// A failed power-state read still protects an active graphics consumer.
+static void check_read_error(void) {
+ struct apple_clpc c={.hw=&apple_clpc_hw_t8140,.agent=1,.mask=3,.gpu_pmgr=(void *)1};
+ read_error=vote_error=0; pmp_floor=4; pmgr_status=0xf0; warned=0;
+ for (jiffies=100; jiffies<=164; jiffies+=4) apple_clpc_sample(&c);
+ assert(published==0x34 && c.last_reason==4);
+ jiffies=168; pmgr_status=0; read_error=-EIO;
+ apple_clpc_sample(&c); assert(published==0x34 && c.last_reason==4);
+ // The failure is counted for debugfs and warned about once.
+ assert(c.gpu_read_errors==1 && warned==1);
+ jiffies=172; read_error=0; apple_clpc_sample(&c);
+ assert(published==0x34 && c.last_reason==16);
+ jiffies=204; apple_clpc_sample(&c); assert(published==0);
+ assert(c.gpu_read_errors==1);
 }
 
 static void check_t8140(void) {
@@ -182,9 +266,12 @@ int main(void) {
  c.clusters[0].request[0]=c.clusters[0].request[1]=0;
  jiffies=264; apple_clpc_sample(&c); assert(published==0);
  check_t8132();
+ check_read_error();
  check_t8140();
  check_t8140_dense();
- puts("PASS: T6040 host demand; T8132 powered floor; T8140 streaming, dense work and PMP backoff; idle release");
+ check_t8140_ane();
+ check_t6040_ane();
+ puts("PASS: T6040 and T8132 host demand; T8140 ANE, streaming, dense work, read errors and PMP backoff; idle release");
 }
 '''
     code = code.replace('#define APPLE_PMC_RAIL_SHIFT(r) ((r)*8)', rail_shift)
@@ -192,13 +279,20 @@ int main(void) {
         root = Path(tmp)
         for name, text in [
             ('fixed', code),
-            ('omit-host-demand', code.replace('if (clpc->gpu && !clpc->hw->gpu_demand) {', 'if (false) {')),
+            ('omit-host-demand', code.replace('if (apple_clpc_gpu_input_demand(clpc->hw, clpc->gpu, demand))',
+                                              'if (false && apple_clpc_gpu_input_demand(clpc->hw, clpc->gpu, demand))')),            ('omit-ane-demand', code.replace('if (apple_clpc_ane_input_demand(clpc, demand))',
+                                             'if (false && apple_clpc_ane_input_demand(clpc, demand))')),
+            ('omit-ane-cluster', code.replace('apple_clpc_ane_cluster(clpc, reason & APPLE_CLPC_REASON_ANE, now);',
+                                              '(void)apple_clpc_ane_cluster;')),
+            ('ane-cluster-no-hold', code.replace('if (time_before(now, clpc->ane_until))',
+                                                 'if (active)')),
             ('omit-streaming-demand', code.replace('bool streaming = apple_clpc_gpu_streaming(clpc, now);',
                                                    'bool streaming = (apple_clpc_gpu_streaming(clpc, now), false);')),
             ('omit-dense-demand', code.replace('if (streaming || dense) {', 'if (streaming || (dense && false)) {')),
             ('dense-ignores-late', code.replace('if (!threshold || late || submissions < threshold)',
                                                 'if (!threshold || (late && false) || submissions < threshold)')),
             ('uncounted-floor-return', code.replace('clpc->gpu_floor_returns++;', 'clpc->gpu_floor_returns += 0;')),
+            ('uncounted-read-error', code.replace('clpc->gpu_read_errors++;', 'clpc->gpu_read_errors += 0;')),
             ('omit-pmp-backoff', code.replace('bool released = apple_clpc_gpu_limited(clpc, now);',
                                               'bool released = (apple_clpc_gpu_limited(clpc, now), false);')),
             ('release-too-early', code.replace('msecs_to_jiffies(APPLE_CLPC_HOLD_MS)', '0')),

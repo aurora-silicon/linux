@@ -17,6 +17,8 @@
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
+#include <linux/suspend.h>
 
 #if IS_ENABLED(CONFIG_APPLE_MCC_KUNIT_TEST)
 #include <kunit/static_stub.h>
@@ -30,7 +32,7 @@
 #define MCC_CACHE_FLUSH		0x2844
 #define MCC_CACHE_FLUSH_BUSY	BIT(0)
 
-#define MCC_MAX_PLANES		16
+#define MCC_MAX_PLANES		32
 #define MCC_FLUSH_TIMEOUT_US	100000
 
 struct apple_mcc {
@@ -39,6 +41,8 @@ struct apple_mcc {
 	unsigned int nr_planes;
 	bool enabled;
 	bool retained;
+	/* Turned off for a deep sleep, to be turned back on after it. */
+	bool sleep_disabled;
 };
 
 static void apple_mcc_writel(struct apple_mcc *mcc, unsigned int plane,
@@ -236,6 +240,43 @@ static void apple_mcc_shutdown(struct platform_device *pdev)
 		apple_mcc_quiesce(mcc);
 }
 
+/*
+ * A deep sleep takes the cache's power with the rest of the SoC: stop allocating and write it
+ * back first, as at shutdown, and allocate again after. Suspend-to-idle keeps it.
+ */
+static int apple_mcc_suspend_noirq(struct device *dev)
+{
+	struct apple_mcc *mcc = dev_get_drvdata(dev);
+
+	if (!pm_suspend_via_firmware() || !mcc->enabled || mcc->retained)
+		return 0;
+	apple_mcc_quiesce(mcc);
+	mcc->sleep_disabled = true;
+
+	return 0;
+}
+
+static int apple_mcc_resume_noirq(struct device *dev)
+{
+	struct apple_mcc *mcc = dev_get_drvdata(dev);
+	int ret;
+
+	if (!mcc->sleep_disabled)
+		return 0;
+	mcc->sleep_disabled = false;
+	/* Only a performance setting: a cache not ready after the wake stays off. */
+	ret = apple_mcc_enable(mcc);
+	mcc->enabled = !ret;
+	if (ret)
+		dev_warn(dev, "system level cache allocation stays off after the sleep: %d\n", ret);
+
+	return 0;
+}
+
+static const struct dev_pm_ops apple_mcc_pm_ops = {
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_mcc_suspend_noirq, apple_mcc_resume_noirq)
+};
+
 static const struct of_device_id apple_mcc_of_match[] = {
 	{ .compatible = "apple,t8132-mcc" },
 	{ .compatible = "apple,t8140-mcc" },
@@ -247,6 +288,7 @@ static struct platform_driver apple_mcc_driver = {
 	.driver = {
 		.name = "apple-mcc",
 		.of_match_table = apple_mcc_of_match,
+		.pm = pm_sleep_ptr(&apple_mcc_pm_ops),
 	},
 	.probe = apple_mcc_probe,
 	.remove = apple_mcc_remove,

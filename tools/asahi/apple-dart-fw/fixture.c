@@ -50,7 +50,7 @@ static unsigned lock_depth;
 static size_t find_next_bit(unsigned long*p,size_t n,size_t a){for(;a<n;a++)if(test_bit(a,p))break;return a;}
 static size_t find_next_zero_bit(unsigned long*p,size_t n,size_t a){for(;a<n;a++)if(!test_bit(a,p))break;return a;}
 struct apple_dart_hw;struct device;
-struct apple_dart {struct device*dev;unsigned pgsize,oas,fw_mirror,tcr,fw_handoff,ias,locked,num_streams,version,managed_sids;struct {int ready;} iommu;struct apple_dart_hw*hw;u64 dma_offset,locked_window[2];u64 *locked_ttbr[2][4],*locked_owned[2][4];struct apple_dart_fw_root*locked_fw[2][4];int lock,locked_retire_err[2];};
+struct apple_dart {struct device*dev;unsigned pgsize,oas,fw_mirror,fw_tree,tcr,fw_handoff,ias,locked,num_streams,version,managed_sids;struct {int ready;} iommu;struct apple_dart_hw*hw;u64 dma_offset,locked_window[2];u64 *locked_ttbr[2][4],*locked_owned[2][4];struct apple_dart_fw_root*locked_fw[2][4];struct apple_dart_fw_tree*locked_fw_tree[2];bool display_dark,display_tlb_stale;DECLARE_BITMAP(display_tcr_four,64);int lock,locked_retire_err[2];};
 struct apple_dart_stream_map {struct apple_dart*dart;unsigned long sidmap[1];};
 struct apple_dart_atomic_stream_map {struct apple_dart*dart;unsigned long sidmap[1];};
 struct apple_dart_dcp;struct apple_dart_domain {struct apple_dart_atomic_stream_map stream_maps[2];unsigned long fw_sidmap[2][1];void*pgtbl_ops;struct apple_dart_dcp*dcp;};
@@ -73,6 +73,7 @@ static struct iommu_resv_region regions[8];static int region_count,release_on_al
 static struct iommu_resv_region*iommu_alloc_resv_region(u64 s,u64 l,int prot,int type,int g){assert(!lock_depth&&region_count<8&&type==IOMMU_RESV_RESERVED&&!prot);if(release_on_alloc){release_on_alloc=0;retiring_dart->locked_ttbr[0][0]=NULL;retiring_dart->locked_owned[0][0]=NULL;free(retired_table);retired_table=NULL;}struct iommu_resv_region*r=&regions[region_count++];r->start=s;r->length=l;r->type=type;return r;}
 static void list_add_tail(struct list_head*l,struct list_head*h){h->count++;}
 struct apple_dart_fw_root {u64*entry;u64*accepted;u64**leaf;};
+struct apple_dart_fw_tree {u64*entry;u64**mid;u64**mid_entry;u64***leaf;};
 #define DART_TCR(d,s) (s)
 static unsigned apple_dart_readl(struct apple_dart*d,unsigned reg){return d->tcr;}
 static u64 firmware_leaf[2048], ours_leaf[2048], root[2048];
@@ -80,6 +81,11 @@ static int ram_valid=1,reserved=1,map_failure,allocation_failure,change_root,map
 static int pfn_valid(unsigned long pfn){return ram_valid&&pfn>=4&&pfn<8;}
 static unsigned long pfn_to_page(unsigned long pfn){return pfn;}
 #define PageReserved(p) (reserved)
+#define IORESOURCE_MEM 0x200
+#define IORES_DESC_NONE 0
+enum {REGION_DISJOINT,REGION_INTERSECTS,REGION_MIXED};
+static int claimed;
+static int region_intersects(u64 s,size_t n,unsigned long f,unsigned long d){assert(n==SZ_16K&&f==IORESOURCE_MEM&&d==IORES_DESC_NONE);return claimed?REGION_INTERSECTS:REGION_DISJOINT;}
 static void*allocation(size_t n){if(allocation_failure)return NULL;return calloc(1,n);}
 #define kzalloc(n,g) allocation(n)
 #define kcalloc(n,z,g) allocation((n)*(z))
@@ -102,7 +108,7 @@ static void pm_runtime_put(struct device*d){pm_puts++;}
 static void free_io_pgtable_ops(void*ops){assert(ops);pgtable_frees++;}
 /* No borrowed display roots here; the DCP paths are covered elsewhere. */
 static bool apple_dart_has_borrowed(struct apple_dart*d){return false;}
-static int apple_dart_dcp_invalidate_tlb(struct apple_dart_stream_map*m){abort();}
+static int apple_dart_dcp_invalidate_tlb_gated(struct apple_dart_stream_map*m){abort();}
 #define dev_info(d,...) ((void)0)
 /* PRODUCTION */
 #define IOMMU_RESV_DIRECT 1
@@ -207,6 +213,22 @@ int main(int argc,char**argv){
   else if(!strcmp(c,"lookup-unmatched")){d.fw_handoff=0;assert(!apple_dart_inherited_phys(&domain,0));}
   else assert(!strcmp(c,"lookup-inherited"));
  }
+ else if(!strncmp(c,"tree-",5)){
+  /* fw_tree: firmware's recorded subtree of a four-level root (slot 0, mid 0) resolves; a changed root or mid
+   * entry, an unrecorded tree, and a fw_mirror DART without fw_tree resolve and reserve nothing. */
+  static u64 mid_table[2048];u64*entry=calloc(2048,sizeof(u64)),**mid=calloc(2048,sizeof(u64*)),**mid_entry=calloc(2048,sizeof(u64*));u64***leaves3=calloc(2048,sizeof(u64**));
+  assert(entry&&mid&&mid_entry&&leaves3);mid_entry[0]=calloc(2048,sizeof(u64));leaves3[0]=calloc(2048,sizeof(u64*));assert(mid_entry[0]&&leaves3[0]);
+  root[0]=0x1401;entry[0]=0x1401;mid[0]=mid_table;mid_table[0]=0x1801;mid_entry[0][0]=0x1801;leaves3[0][0]=firmware_leaf;
+  struct apple_dart_fw_tree tree={entry,mid,mid_entry,leaves3};
+  d.fw_handoff=0;d.fw_mirror=1;d.fw_tree=strcmp(c,"tree-mirror-only")!=0;d.tcr=1;d.locked_fw[0][0]=NULL;
+  if(strcmp(c,"tree-unrecorded")&&strcmp(c,"tree-mirror-only"))d.locked_fw_tree[0]=&tree;
+  if(!strcmp(c,"tree-lookup"))assert(apple_dart_inherited_phys(&domain,0)==0x8000);
+  else if(!strcmp(c,"tree-changed-root")){root[0]=0x1001;assert(!apple_dart_inherited_phys(&domain,0));}
+  else if(!strcmp(c,"tree-changed-mid")){mid_table[0]=0x1c01;assert(!apple_dart_inherited_phys(&domain,0));}
+  else if(!strcmp(c,"tree-unrecorded"))assert(!apple_dart_inherited_phys(&domain,0));
+  else if(!strcmp(c,"tree-reserve")){apple_dart_get_fw_resv_regions(&dev,&head);assert(head.count==1&&regions[0].start==0&&regions[0].length==(1ULL<<36)&&regions[0].type==IOMMU_RESV_RESERVED);}
+  else {assert(!strcmp(c,"tree-mirror-only"));assert(!apple_dart_inherited_phys(&domain,0));apple_dart_get_fw_resv_regions(&dev,&head);assert(!head.count);}
+ }
  else if(!strncmp(c,"reserve-",8)){
   root[0]=0x1401;d.locked_window[0]=1ULL<<40;
   if(!strcmp(c,"reserve-teardown")){retired_table=calloc(2048,sizeof(u64));assert(retired_table);retired_table[0]=retired_table[5]=0x1401;d.locked_ttbr[0][0]=retired_table;release_on_alloc=1;retiring_dart=&d;}
@@ -269,6 +291,17 @@ int main(int argc,char**argv){
  else if(!strcmp(c,"vacant")){ours[0]=0;ours[1]=0x801;assert(!apple_dart_publish_root(&d,live,owned,ours,&fw,2));assert(live[0]==0x1401&&live[1]==0x801&&owned[1]==0x801);}
  else if(!strcmp(c,"changed-owner")){live[0]=0x1801;assert(apple_dart_publish_root(&d,live,owned,ours,&fw,2)==-EBUSY);assert(!owned[0]);}
  else if(!strcmp(c,"retire")){owned[1]=0x801;live[1]=0xc01;apple_dart_retire_root(live,owned,2);assert(live[0]==0x1401&&live[1]==0xc01&&!owned[1]);}
+ else if(!strcmp(c,"subtree-free-partial")){
+  /* A failed allocation leaves any of the four arrays missing: freeing must not touch them. */
+  struct apple_dart_fw_tree*t=calloc(1,sizeof(*t));assert(t);t->leaf=calloc(2048,sizeof(u64**));assert(t->leaf);t->leaf[0]=calloc(2048,sizeof(u64*));assert(t->leaf[0]);t->leaf[0][0]=firmware_leaf;
+  apple_dart_free_fw_tree(&d,t);assert(unmap_calls==1);
+ }
+ /* fw_tree tables: reserved RAM, or memory nothing claims; never Linux's RAM or a device's registers. */
+ else if(!strcmp(c,"subtree-table-reserved")){claimed=1;assert(apple_dart_fw_tree_table(&d,0x14000));}
+ else if(!strcmp(c,"subtree-table-unclaimed")){ram_valid=0;assert(apple_dart_fw_tree_table(&d,0x14000));}
+ else if(!strcmp(c,"subtree-table-claimed")){ram_valid=0;claimed=1;assert(!apple_dart_fw_tree_table(&d,0x14000));}
+ else if(!strcmp(c,"subtree-table-ram")){reserved=0;claimed=1;assert(!apple_dart_fw_tree_table(&d,0x14000));}
+ else if(!strcmp(c,"subtree-table-misalignment")){ram_valid=0;assert(!apple_dart_fw_tree_table(&d,0x14001));}
  else if(!strcmp(c,"reserved-ram")){assert(apple_dart_fw_table_ram(&d,0x14000));}
  else if(!strcmp(c,"unreserved")){reserved=0;assert(!apple_dart_fw_table_ram(&d,0x14000));}
  else if(!strcmp(c,"mmio")){ram_valid=0;assert(!apple_dart_fw_table_ram(&d,0x14000));}

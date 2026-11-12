@@ -1,0 +1,103 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Additional T6022 hardware resources. Keep unqualified blocks disabled. */
+
+&die0 {
+	m2_aop_spmi0: spmi@2a6894000 {
+		compatible = "apple,t6020-spmi", "apple,t8103-spmi";
+		reg = <0x2 0xa6894000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 635 IRQ_TYPE_LEVEL_HIGH>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		status = "disabled";
+
+		peripheral@e {
+			compatible = "apple,t6022-spmi-peripheral",
+				"apple,spmi-peripheral";
+			reg = <0xe SPMI_USID>;
+			status = "disabled";
+		};
+	};
+
+	m2_apcie_ge0_piodma: dma-controller@1694010000 {
+		compatible = "apple,t6022-pcie-piodma", "apple,pcie-piodma";
+		reg = <0x16 0x94010000 0x0 0x4000>,
+			<0x16 0x94014000 0x0 0x4000>,
+			<0x16 0x94018000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1358 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&pcie_ge_dart 15>;
+		status = "disabled";
+	};
+};
+
+&die1 {
+	m2_atc6_dpin0: displayport-input@f01e50000 {
+		compatible = "apple,t6022-dpin", "apple,dpin";
+		reg = <0xf 0x1e50000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1 1480 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	m2_atc6_dpin1: displayport-input@f01e58000 {
+		compatible = "apple,t6022-dpin", "apple,dpin";
+		reg = <0xf 0x1e58000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1 1481 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	m2_apciec6_piodma: dma-controller@f22000000 {
+		compatible = "apple,t6022-pciec-piodma", "apple,pciec-piodma";
+		reg = <0xf 0x22000000 0x0 0x4000>,
+			<0xf 0x22004000 0x0 0x4000>,
+			<0xf 0x22008000 0x0 0x4000>,
+			<0xf 0x20008000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1 1302 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&apciec2_dart_die1 15>;
+		status = "disabled";
+	};
+
+	m2_atc7_dpin0: displayport-input@1301e50000 {
+		compatible = "apple,t6022-dpin", "apple,dpin";
+		reg = <0x13 0x1e50000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1 1528 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	m2_atc7_dpin1: displayport-input@1301e58000 {
+		compatible = "apple,t6022-dpin", "apple,dpin";
+		reg = <0x13 0x1e58000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1 1529 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	m2_apciec7_piodma: dma-controller@1322000000 {
+		compatible = "apple,t6022-pciec-piodma", "apple,pciec-piodma";
+		reg = <0x13 0x22000000 0x0 0x4000>,
+			<0x13 0x22004000 0x0 0x4000>,
+			<0x13 0x22008000 0x0 0x4000>,
+			<0x13 0x20008000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1 1320 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&apciec3_dart_die1 15>;
+		status = "disabled";
+	};
+
+	m2_apcie_ge1_piodma: dma-controller@1694010000 {
+		compatible = "apple,t6022-pcie-piodma", "apple,pcie-piodma";
+		reg = <0x16 0x94010000 0x0 0x4000>,
+			<0x16 0x94014000 0x0 0x4000>,
+			<0x16 0x94018000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1 1358 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&pcie_ge_dart_die1 15>;
+		status = "disabled";
+	};
+};

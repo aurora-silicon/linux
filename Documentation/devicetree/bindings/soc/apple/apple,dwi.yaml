@@ -1,0 +1,140 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,dwi.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple DWI controller
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  DWI hardware register window and interrupt. Register programming and
+  firmware ownership must be qualified before enabling the controller.
+  On T6000, T6040, T8112 and T8140 the panel backlight does not use DWI, and the
+  node is bound by a read-only register view.
+
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t6000-dwi
+          - apple,t6020-dwi
+          - apple,t6021-dwi
+          - apple,t6022-dwi
+          - apple,t6030-dwi
+          - apple,t6031-dwi
+          - apple,t6032-dwi
+          - apple,t6041-dwi
+          - apple,t8103-dwi
+          - apple,t8112-dwi
+          - apple,t8122-dwi
+          - apple,t8132-dwi
+          - apple,t8140-dwi
+  required:
+    - compatible
+
+properties:
+  compatible: true
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8132-dwi
+      required:
+        - compatible
+    then:
+      properties:
+        compatible:
+          items:
+            - enum:
+                - apple,t8132-dwi
+            - const: apple,dwi
+
+        reg:
+          maxItems: 1
+
+        interrupts:
+          maxItems: 1
+
+        power-domains:
+          maxItems: 1
+
+      required:
+        - compatible
+        - reg
+        - interrupts
+        - power-domains
+    else:
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  enum:
+                    - apple,t6032-dwi
+            required:
+              - compatible
+          then:
+            properties:
+              compatible:
+                items:
+                  - const: apple,t6032-dwi
+                  - const: apple,dwi
+
+              reg:
+                maxItems: 1
+
+              interrupts:
+                maxItems: 1
+
+              power-domains:
+                maxItems: 1
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - power-domains
+          else:
+            properties:
+              compatible:
+                items:
+                  - enum:
+                      - apple,t6000-dwi
+                      - apple,t6020-dwi
+                      - apple,t6021-dwi
+                      - apple,t6022-dwi
+                      - apple,t6030-dwi
+                      - apple,t6031-dwi
+                      - apple,t6041-dwi
+                      - apple,t8103-dwi
+                      - apple,t8112-dwi
+                      - apple,t8122-dwi
+                      - apple,t8140-dwi
+                  - const: apple,dwi
+
+              reg:
+                maxItems: 1
+                description: Register apertures in hardware-description order.
+
+              interrupts:
+                maxItems: 1
+
+              power-domains:
+                maxItems: 1
+
+            required:
+              - compatible
+              - reg
+              - interrupts
+              - power-domains
+
+            additionalProperties: false
+
+unevaluatedProperties: false

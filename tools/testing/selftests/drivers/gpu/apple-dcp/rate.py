@@ -45,11 +45,18 @@ def parser_fixture(root):
     source = (base / 'parser.c').read_text()
     parser = source[source.index('#define DCP_PARSE_HEADER'):source.index('int parse_epic_service_init(')]
     metadata = (base / 'dcp-display-metadata.h').read_text()
-    metadata = block(metadata, 'struct dcp_display_metadata {') + ';\n'
+    metadata = (block(metadata, 'struct dcp_display_metadata {') + ';\n' +
+                block(metadata, 'enum dcp_panel_gamut {') + ';\n' +
+                block(metadata, 'struct dcp_color_space {') + ';\n')
     header = (base / 'parser.h').read_text()
     header = header[header.index('struct apple_dcp;'):header.index('int parse(')]
     refresh = (base / 'dcp-refresh.h').read_text().replace('#include <linux/types.h>', '')
     header = refresh + '\n' + header
+    # parse_dptx_caps() fills the firmware-27 DPTX capabilities parser.c
+    # takes from dcp-peer-v27.h.
+    peer_v27 = base / 'dcp-peer-v27.h'
+    if peer_v27.exists():
+        header += block(peer_v27.read_text(), 'struct dcp_dptx_caps {') + ';\n'
     # Header helpers stay header-like: unused here, as in any includer.
     header = header.replace('static inline ', 'static inline __attribute__((unused)) ')
     edid_header = (root / 'include/drm/drm_edid.h').read_text()
@@ -556,6 +563,8 @@ struct apple_dcp {
     struct dcp_display_mode *modes;
     struct { bool holding, stopped; } announce;
     bool ext_backlight, has_panel;
+    /* External pipes carry no internal panel identity. */
+    void *panel_identity;
 };
 struct rate_guard { bool *lock; };
 static struct rate_guard rate_lock(bool *p) { assert(!*p);*p=true;return (struct rate_guard){p}; }
@@ -771,6 +780,9 @@ static void afk_service_retire(struct apple_epic_service *s) { assert(!*hpd_lock
 static bool cancel_work_sync(struct work_struct *w) { assert(!w->scheduled); return false; }
 /* Native audio is out of scope: reject entry instead of silently queueing it. */
 static void dcp_external_audio_start(struct apple_dcp *d) { assert(!d->external_native); }
+/* The stubbed read always carries an EDID: nothing asks for a re-probe. */
+static bool dcpavserv_edid_retry(struct apple_dcp *d,u64 e) { (void)d;(void)e;assert(0);return false; }
+static void dcpavserv_edid_retry_reset(struct apple_dcp *d) { assert(d->dcpavserv.lock); }
 static void dpavservep_detach(struct apple_dcp *d);
 static struct apple_dcp *probing;
 static struct drm_edid transport_edid;
@@ -1105,6 +1117,65 @@ static void failed_replacements(void) {
         unit=re.sub(r'\blookup_mode\((&d,&[\w.\[\]]+)\)', r'lookup_mode(\1,NULL)', unit)
     return {**locals(), "block": block}
 
+
+def panel_dimensions(root):
+    n = publication(root)
+    unit, block = n['unit'], n['block']
+    unit = unit.replace('bool modes_lock,modes_admitted,',
+                        'bool external_physically_absent,modes_lock,modes_admitted,', 1)
+    # The connector's physical size, which DRM keeps in display_info.
+    old = 'struct { struct { unsigned min_vfreq,max_vfreq; } monitor_range; } display_info;'
+    assert unit.count(old) == 1
+    unit = unit.replace(old, 'struct { struct { unsigned min_vfreq,max_vfreq; } monitor_range; '
+                        'int width_mm,height_mm; } display_info;')
+    dcp = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
+    unit = unit.replace(block(unit, 'static bool __attribute__((unused)) dcp_has_panel('),
+                        block(dcp, 'bool dcp_has_panel('))
+    unit = unit.replace(block(unit, 'static void dcp_update_connector_dimensions('),
+                        block(dcp, 'void dcp_update_connector_dimensions('))
+    # Ordinary panel modes do not take the 180 Hz exception's metadata lock.
+    unit = unit.replace('probing->dcpavserv.lock && probing->metadata.lock',
+                        'probing->dcpavserv.lock && '
+                        '(!probing->modes[0].automatic_rgb8_quirk || probing->metadata.lock)')
+    # Model DRM's display_info reset and the absence of an internal AV EDID.
+    unit = unit.replace(block(unit, 'static int drm_edid_connector_update('), r"""
+static int drm_edid_connector_update(struct drm_connector *c,const struct drm_edid *e) {
+    assert(c->dev->mode_config.mutex);
+    c->display_info.width_mm=e ? 600 : 0;
+    c->display_info.height_mm=e ? 330 : 0;
+    return fail_update ? -EIO : 0;
+}
+""")
+    unit = unit.replace('if(!d->dcpavserv.enabled || !d->dcpavserv.service',
+                        'if(dcp_has_panel(d)) return ERR_PTR(-ENODEV);\n'
+                        '    if(!d->dcpavserv.enabled || !d->dcpavserv.service')
+    checks = r"""
+static void panel_dimension_probes(void) {
+    reset();callbacks(false);callbacks(true);timings();admit(0);probe(true);
+    assert(con.base.display_info.width_mm==600 && con.base.display_info.height_mm==330);
+    d.panel.width_mm=302;d.panel.height_mm=196;d.width_mm=0;d.height_mm=0;
+    d.modes[0].automatic_rgb8_quirk=false;
+    con.edid_invalidation_pending=true;probe(true);
+    assert(!con.drm_edid);
+    assert(con.base.display_info.width_mm==302 && con.base.display_info.height_mm==196);
+    con.edid_invalidation_pending=true;probe(true);
+    assert(con.base.display_info.width_mm==302 && con.base.display_info.height_mm==196);
+    d.width_mm=300;d.height_mm=190;con.edid_invalidation_pending=true;probe(true);
+    assert(con.base.display_info.width_mm==300 && con.base.display_info.height_mm==190);
+    d.width_mm=0;d.height_mm=190;con.edid_invalidation_pending=true;probe(true);
+    assert(con.base.display_info.width_mm==302 && con.base.display_info.height_mm==196);
+    cleanup();
+    reset();callbacks(false);callbacks(true);timings();admit(0);probe(true);
+    assert(con.base.display_info.width_mm==600 && con.base.display_info.height_mm==330);
+    cleanup();
+    puts("PASS: internal panel dimensions survive repeated EDID clears; firmware size and DT fallback; external EDID size preserved");
+}
+"""
+    unit = unit.replace('int main(int argc,char **argv) {',
+                        checks + 'int main(int argc,char **argv) {')
+    return unit.replace('    transport_edid=raw;',
+                        '    transport_edid=raw;panel_dimension_probes();', 1)
+
 def hotplug(root):
     n = publication(root)
     unit = n['unit']
@@ -1123,8 +1194,16 @@ u32 lane_count, link_rate;''')
 #define LINK_RATE_RBR 0x06
 #define LINK_RATE_HBR 0x0a
 #define LINK_RATE_HBR2 0x14
+#define LINK_RATE_UHBR10 0x81
+#define LINK_RATE_UHBR20 0x82
 #define PHY_MODE_DP 1
 #define trace_dptxport_call_set_link_rate(...) ((void)0)
+/* Not a T8132 dcpext: its DRM outputs never follow this link. */
+static bool dcp_is_t8132_ext(const struct apple_dcp *d) { (void)d; return false; }
+/* The J700 lane policy keys on the external H17P profile, not the AFK v2 codec. */
+static bool dcp_is_external_h17p(struct apple_dcp *d) { return d->hw.iomfb_method_profile==2; }
+struct device;
+static void t8132_ext_drm_hotplug(struct device *dcpext) { (void)dcpext; assert(!"T8132 dcpext hotplug in an H17P scenario"); }
 static unsigned phy_capacity=2, phy_calls, hardware_rate, hardware_lanes;
 static int validate_error;
 static int phy_validate(void *phy,int mode,int submode,union phy_configure_opts *o) {
@@ -1146,6 +1225,8 @@ static int dcp_tunnel_set_rate(struct apple_dcp *d,void *phy,...) {
 /* The T6030 14.7 backend never matches this H17P display. */
 #define DCP_FIRMWARE_V_14_7 (DCP_FIRMWARE_H17P + 1)
 #define DCP_FIRMWARE_V_14_7_TEMPLATE (DCP_FIRMWARE_H17P + 2)
+/* Firmware 27's tunnel clock refusal and resume readiness; this H17P display never runs it. */
+#define DCP_FIRMWARE_V_27_0 (DCP_FIRMWARE_H17P + 5)
 '''
     real_handlers += block(training, 'static int dptx_j700_validate_lanes(') + '\n'
     real_handlers += block(dptx, 'static int dptxport_call_set_active_lane_count(') + '\n'
@@ -1162,10 +1243,9 @@ static int dcp_tunnel_set_rate(struct apple_dcp *d,void *phy,...) {
     bool external_physically_absent,main_display,typec_crtc_off,external_cable,external_error,external_power_attempted,external_stopped;
     bool external_hotplug_pending,external_hotplug_connected,typec_poweron_hpd;
     u64 external_stop_generation,external_rx_generation,external_crtc_generation;
-    unsigned swap_watchdog_retrains;int typec_iomfb_hpd_ready;''')
+    unsigned swap_watchdog_retrains;int typec_iomfb_hpd_ready,typec_display_ready;''')
     stubs = r'''
 #define DCP_HOTPLUG_NOTIFY 1
-static bool dcp_is_external_h17p(struct apple_dcp *d) { return d->hw.iomfb_method_profile==2; }
 static bool dcp_is_typec_output(struct apple_dcp *d) { (void)d;return true; }
 static void complete_all(int *p) { (*p)++; }
 #define dcp_mode_invalidate(s) ((s)->valid=false)
@@ -1218,6 +1298,7 @@ static bool dcp_typec_relink(struct apple_dcp *d) { (void)d;return false; }
     connected=0;d.typec_crtc_off=true;dcpep_cb_hotplug(&d,&connected);assert(d.rate_proof.sequence==sequence);
     d.typec_crtc_off=false;d.iomfb.presentation_paused=true;dcpep_cb_hotplug(&d,&connected);
     assert(d.rate_proof.sequence==sequence && !con.edid_invalidation_pending);d.iomfb.lock=false;probe(true);
+    assert(!d.typec_display_ready);
     dcpavserv_teardown(&av_services[0]);cleanup();
     puts("PASS: actual RX HPD loss immediately denies getter/lookup before deferred work; 24 fresh-proof recovery orders need only one rate/lane callback; bootstrap/power/paused suppression preserved");
 }""".replace('MAIN_PREFIX',n['main_prefix'])

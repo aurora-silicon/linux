@@ -93,6 +93,18 @@ config APPLE_ADMAC
 	help
 	  Enable support for Audio DMA Controller found on Apple Silicon SoCs.
 
+config APPLE_PIODMA
+	tristate "Apple PCIe PIODMA support"
+	depends on ARCH_APPLE || COMPILE_TEST
+	default m if ARCH_APPLE
+	select DMA_ENGINE
+	select DMA_VIRTUAL_CHANNELS
+	help
+	  Enable the auxiliary PIODMA engines attached to Apple PCIe
+	  controllers. Each engine provides one memory-to-memory DMA channel
+	  through the DMA engine API. The provider uses the PIODMA-specific
+	  DART stream described by the device tree.
+
 config APPLE_SIO
 	tristate "Apple SIO support"
 	depends on ARCH_APPLE || COMPILE_TEST
@@ -105,7 +117,7 @@ config APPLE_SIO
 	  where it provides DMA services.
 
 config APPLE_SIO_KUNIT_TEST
-	bool "KUnit tests for the Apple SIO probe" if !KUNIT_ALL_TESTS
+	bool "KUnit tests for the Apple SIO probe and boot protocol" if !KUNIT_ALL_TESTS
 	depends on APPLE_SIO=y && KUNIT=y
 	depends on OF_OVERLAY
 	default KUNIT_ALL_TESTS
@@ -113,6 +125,7 @@ config APPLE_SIO_KUNIT_TEST
 	  Check which SIO device-tree nodes the probe goes on with: the
 	  generic SIO of the M1 and M2, and a T6030 SIO only with validated
 	  protocol-10 boot tables. The compatible selects the firmware layout.
+	  Also check protocol-9 table order, DMA array counts and ACK failures.
 
 config APPLE_SIO_T6030_KUNIT_TEST
 	bool "KUnit tests for the T6030 SIO boot-table check" if !KUNIT_ALL_TESTS
@@ -123,6 +136,16 @@ config APPLE_SIO_T6030_KUNIT_TEST
 	  Check the protocol-10 boot-table admission of the T6030 SIO
 	  against tables a T6030-aware boot loader builds, an earlier
 	  loader's tables, and malformed, truncated and out-of-window ones.
+
+config APPLE_SIO_T6041_KUNIT_TEST
+	bool "KUnit tests for the T6041 SIO boot contract" if !KUNIT_ALL_TESTS
+	depends on APPLE_SIO=y && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Check the T6041 (M4 Pro/Max) SIO boot: which boot-loader tables
+	  are admitted and at which sizes, the order the firmware takes them
+	  in with the power-gating scalar, the DMA array counts, and the
+	  six-word channel configuration.
 
 config ARM_DMA350
 	tristate "Arm DMA-350 support"

@@ -1,0 +1,38 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Disabled tunnel translation and miscellaneous interfaces. */
+
+&soc {
+	pciec1_dart: iommu@b21008000 {
+		compatible = "apple,t6030-dart", "apple,t8110-dart";
+		reg = <0xb 0x21008000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1135 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		power-domains = <&ps_atc1_cio_pcie>;
+		status = "disabled";
+	};
+
+	pciec2_dart: iommu@f21008000 {
+		compatible = "apple,t6030-dart", "apple,t8110-dart";
+		reg = <0xf 0x21008000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1193 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		power-domains = <&ps_atc2_cio_pcie>;
+		status = "disabled";
+	};
+
+	serial2: serial@289208000 {
+		compatible = "apple,s5l-uart";
+		reg = <0x2 0x89208000 0 0x4000>;
+		reg-io-width = <4>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 868 IRQ_TYPE_LEVEL_HIGH>;
+		/* Reference parents follow UART0; selectable baud parents need review. */
+		clocks = <&clkref>, <&clkref>;
+		clock-names = "uart", "clk_uart_baud0";
+		power-domains = <&ps_uart2>;
+		status = "disabled";
+	};
+
+};

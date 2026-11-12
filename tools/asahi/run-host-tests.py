@@ -14,6 +14,9 @@ is not registered fails the run, so it cannot be silently skipped.
 Negative controls read older revisions with `git show`, so the checkout needs
 the commits (a full or treeless clone, not a depth-1 one).
 
+A test that reads device trees gets '{dtc}', this tree's scripts/dtc/dtc, built
+with the kconfig tool unless --dtc names one.
+
 Usage: tools/asahi/run-host-tests.py [--jobs N] [--work DIR] [--only SUBSTR]
 """
 import argparse
@@ -36,7 +39,7 @@ KILL = 'kill'
 
 # A killed mutant shows the failing control: a C assertion or abort (-6), or
 # a Rust panic (exit 101). A Python traceback means the harness itself broke.
-KILL_SIGN = re.compile(r'Assertion|": -6\b|"exit": 101\b|panicked at')
+KILL_SIGN = re.compile(r'FAIL line [0-9]+|Assertion|": -6\b|"exit": 101\b|panicked at')
 BROKEN_SIGN = re.compile(r'Traceback \(most recent call last\)')
 
 
@@ -50,8 +53,37 @@ def mutations(flag, names, base, expect=KILL):
 
 # test file -> [(arguments, expectation)]. '{out}' is a fresh directory.
 ASAHI_TESTS = {
+    'j613-mtp-s2idle-tests.py': [([], PASS)],
+    # 11eccbedc3ed writes frames without a transport-wide lock.
+    'mtp-tx-frame-tests.py': [(out(), PASS),
+                              (out() + ['--old-transport', '11eccbedc3ed'], PASS)],
+    'pmgr-ppt-tests.py': [([], PASS)],
+    'queue-priority-tests.py': [([], PASS)],
+    # The old revision reports a DART fault that clears before the second latch read as success.
+    'ane-tm-transient-fault-tests.py': [([], PASS),
+                                        (['--old-ref', 'b50066848322c6799c1433ee3a358aab2e9faabb'], PASS)],
+    'test-m3-power.py': [([], PASS)],
+    'test-m3-uapi.py': [([], PASS)],
+    'test-m3-mailbox.py': [([], PASS)],
+    'test-j613-dcp-power.py': [([], PASS)],
+    'aop-als-channel-tests.py': [([], PASS)],
+    'aop-bootargs-tests.py': [([], PASS)],
+    'mtp-pm-tests.py': [(out(), PASS),
+                         (out() + ['--old-transport', '4db3a5a22c43'], PASS)],
+    'ave-pm-tests.py': [(out(), PASS),
+                         (out() + ['--old-ref', '4db3a5a22c43'], PASS)],
+    'ave-probe-pm-tests.py': [(out(), PASS), (out() + ['--negative-control'], PASS)],
+    'binding-lifetime-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('no-close', 'no-join'), out()),
+    'apple-pwm-pm-tests.py': [([], PASS), (['--negative-control'], PASS)],
+    'apple-m4-pmu-tests.py': [([], PASS)]
+        + mutations('--mutation', ('m1-layout', 'cycles-anywhere', 'expose-8-9', 'flags-in-event'), []),
+    'apple-dart-dapf-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('missing-guard', 'ignore-replay', 'ignore-orphan'), out()),
     'apple-dart-fw-tests.py': [(out(), PASS)],
     'apple-dart-range-tests.py': [([], PASS)],
+    'asahi-stats-raw-tests.py': [([], PASS)],
+    'agx-stats-busy-tests.py': [([], PASS), (['--negative-control'], PASS)],
     'atc-usb3-tests.py': [(out(), PASS), (out() + ['--mutations'], PASS)],
     'avd-av1-tail-tests.py': [(out(), PASS)]
         + [(out() + ['--case', c], PASS) for c in ('copy', 'seed', 'aligned')]
@@ -66,9 +98,21 @@ ASAHI_TESTS = {
     'brcmf-assoc-tests.py': [(out('--output'), PASS)]
         + mutations('--mutation', ('short-ie', 'header-length', 'skb-capacity', 'cmplt-header'), out('--output')),
     'brcmf-bss-tests.py': [(out(), PASS)],
+    'brcmf-cipher-tests.py': [(out(), PASS)]
+        + [(out() + ['--ref', '33bec4016c466985bfbb5ff4c2089fcab8242dcf'], KILL)],
+    # The old revision reports a failed join against the last associated BSS.
+    'brcmf-join-bssid-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('stale-target', 'zero-named', 'no-call', 'lost-bss-success'), out()),
+    'brcmf-join-scan-tests.py': [(out(), PASS)]
+        + [(out() + ['--ref', '33bec4016c466985bfbb5ff4c2089fcab8242dcf'], KILL)],
     'brcmf-pcie-dma-tests.py': [(out('--output'), PASS)]
         + mutations('--mutation', ('narrow-stream', 'ignore-aperture', 'revision-wide'), out('--output')),
     'brcmf-roam-tests.py': [(out(), PASS)],
+    'brcmf-sae-vendor-tests.py': [(out(), PASS)]
+        + [(out() + ['--ref', '9260e1f021e075713931f3c23c0a5fa1da936b0b'], KILL)],
+    'brcmf-suspend-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('country-gate', 'queue-reasons', 'worker-gate',
+                                   'resume-order', 'tx-drain'), out()),
     'brcmfmac-scan-timeout-tests.py': [(out('--output'), PASS)],
     'clpc-gpu-demand-tests.py': [([], PASS)],
     # The old policy always disabled compute preemption.
@@ -80,6 +124,7 @@ ASAHI_TESTS = {
     'display26-tests.py': [([], PASS)],
     # The old revision publishes the fd before copy_to_user() succeeds.
     'dma-heap-fd-tests.py': [(out() + ['--old-ref', 'cb732d027aa18e1fcf9d2797f47d20b179ebc59c'], PASS)],
+    'g15-display-order-tests.py': [([], PASS)],
     'g15-input-error-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS),
                                  (out('--output') + ['--ref', 'ede99b3c1990b4a4a8c045fdf627a2bd0f14446a'], PASS)],
     'g15-maintained-handoff-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
@@ -89,8 +134,12 @@ ASAHI_TESTS = {
     'g15-retention-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
     'g15-stats-drain-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
     'g15-zero-words-tests.py': [([], PASS), (['--mutations'], PASS)],
+    'g17-telemetry-integration-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('fields', 'range', 'timestamp', 'age', 'delivery',
+                                   'quarantine', 'epoch', 'cutoff', 'whole-batch', 'legacy-format', 'read-drain'), out()),
     'g17-admission-deadline-tests.py': [([], PASS)],
     'g17-admission-order-tests.py': [([], PASS)],
+    'g17-capacity-backoff-tests.py': [([], PASS)],
     'g17-capacity-fault-tests.py': [([], PASS)],
     'g17-compute-constructor-tests.py': [([], PASS)],
     'g17-compute-deadline-tests.py': [([], PASS)],
@@ -102,30 +151,58 @@ ASAHI_TESTS = {
     'g17-pool-release-tests.py': [([], PASS)],
     'g17-resource-tests.py': [([], PASS)],
     'g17-shared-pool-tests.py': [([], PASS)],
+    'g17-t6041-initdata-tests.py': [([], PASS)],
     'g17-uninstalled-cleanup-tests.py': [([], PASS)],
     'g17-unpublished-tests.py': [([], PASS)],
+    'isp-tests.py': [(['--suite', suite] + out(), PASS) for suite in ['session', 'buffers', 'receive', 'returns', 'queue']] + [(['--suite', suite, '--control', control] + out(), KILL) for suite, controls in [('session', ['send', 'overwrite', 'stop', 'reset']), ('buffers', ['rollback']), ('receive', ['drain']), ('returns', ['address', 'pool', 'duplicate', 'snapshot']), ('queue', ['queue-error'])] for control in controls],
     'mt7932-association-events-tests.py': [(out(), PASS)],
     'mt7932-connect-result-tests.py': [(out('--output'), PASS)],
     'mt7932-owe-retry-tests.py': [(out(), PASS)],
     'mt7932-policy-6ghz-tests.py': [([], PASS)],
+    'mt7932-policy-classes-tests.py': [([], PASS)],
+    'mt7932-scan-tests.py': [(out(), PASS)],
     'neo-auxiliary-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutation'], KILL),
                                (out('--output') + ['--old'], KILL)],
     'neo-stability-tests.py': [(out('--output'), PASS)]
         + mutations('--mutation', ('sep-syscore', 'wake-irq', 'rx-suspend', 'stale-policy',
                                    'usb-rpm', 'vlp-client', 'six-band'), out('--output'))
         + [(out('--output') + ['--old-usb'], KILL), (out('--output') + ['--old-regulatory'], KILL)],
+    'pciec-policy-tests.py': [(out(), PASS)],
+    'pmgr-bus-tests.py': [([], PASS)],
+    'sep-suspend-errors-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('unsupported-as-success', 'read-as-deadline', 'no-capability-check',
+                                   'no-transport-check', 'lost-accept', 'nonphysical-wake',
+                                   'wake-before-arm', 'bulk-error-as-success', 'omit-pending-wake',
+                                   'omit-before-send', 'leak-prepared', 'sent-error-return',
+                                   'accept-unanswered-gate', 'ignore-result', 'ignore-gate-timeout',
+                                   'finish-without-physical', 'poll-after-callback', 'poll-unsupported',
+                                   'stale-observation', 'drain-two', 'post-send-wake-refusal'), out()),
+    'pmp-agx-vote-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
+    'pmp-j613-floor-tests.py': [([], PASS)] + mutations('--mutant', ['no-hold', 'no-rate', 'no-streak', 'bad-word', 'foreign-ok', 'no-names', 'no-sum', 'no-board', 'no-default', 'no-disable'], []),
     'pmp-j613-hwmon-tests.py': [([], PASS)],
+    'pmu-rtc-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('ack-clobber', 'arm-ack', 'offset-seconds',
+                                   'offset-sign', 'event-bit', 'wrong-control',
+                                   'maverick-event', 'stowe-offset', 'baku-limit',
+                                   'set-no-round', 'set-negative'), out()),
+    'perf-mmap-alias-lifecycle-tests.py': [([], PASS)],
     'qspi-nvram-tests.py': [(out('--output'), PASS)],
+    'rtkit-crashlog-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('buffer-header', 'section-header', 'section-size', 'footer-room',
+                                   'mailbox-minimum', 'version-string', 'message-string'), out()),
     'rtkit-oslog-tests.py': [(out(), PASS)]
         + mutations('--mutate', ('admission', 'channel', 'counter', 'reset', 'buffer'), out()),
+    'rtkit-retained-tests.py': [(out(), PASS)],
     't6030-clock-tests.py': [(out(), PASS)],
     't6030-display-admission-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
     't6030-display-linkage-tests.py': [(out('--output') + ['--conf', '{conf}'], PASS)],
+    't6030-pmp-dt-tests.py': [(out('--output') + ['--dtc', '{dtc}'], PASS)],
     't6030-pmp-graph-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
     't6030-pmp-supplier-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
     't6030-wiring-tests.py': [(out(), PASS), (out() + ['--old-classifier', 'tb'], PASS),
                               (out() + ['--old-classifier', 'dcp'], PASS)],
     't6040-calibration-tests.py': [([], PASS)],
+    't604x-cpu-order-tests.py': [(out('--output') + ['--dtc', '{dtc}'], PASS)],
     'tb-dp-repair-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
     'tbnet-refill-tests.py': [(out(), PASS)]
         + mutations('--mutant', ('refill-count', 'no-retry', 'no-cancel', 'worker-allocation'), out()),
@@ -134,8 +211,13 @@ ASAHI_TESTS = {
 }
 
 # Rust unit-test files built with `rustc --test`, and shell drivers.
-ASAHI_RUST = ['m3-batching-tests.rs', 'm3-runtime-tests.rs', 'pmp-bootargs-tests.rs', 'pmp-power-tests.rs']
+ASAHI_RUST = ['m3-batching-tests.rs', 'm3-runtime-tests.rs', 'pmp-bootargs-tests.rs', 'pmp-power-tests.rs',
+              'usage-tests.rs']
 ASAHI_SHELL = ['g17-ray-query-timeout-tests.sh']
+
+# Production G17 decoder vectors also build directly with rustc --test.
+ASAHI_RUST += ['g17-telemetry-tests.rs', 'legacy-frequency-tests.rs']
+ASAHI_RUST.append('m3-firmware-tests.rs')
 
 # Python that runs on the host but imports its neighbours, so it keeps the
 # script directory on sys.path (-E -s instead of -I).
@@ -149,12 +231,15 @@ SUITES = [
 ]
 
 
-def jobs(work, conf):
+def jobs(work, conf, dtc):
     found = {p.name for p in ASAHI.iterdir()
              if re.search(r'-tests\.(py|rs|sh)$', p.name) and p.name != Path(__file__).name}
+    # This Rust fixture is compiled and executed by the paired-header wrapper.
+    if 'test-m3-uapi.py' in ASAHI_TESTS:
+        found.discard('m3-uapi-tests.rs')
     known = set(ASAHI_TESTS) | set(ASAHI_RUST) | set(ASAHI_SHELL)
     missing = sorted(found - known)
-    gone = sorted(known - found)
+    gone = sorted(name for name in known if not (ASAHI / name).is_file())
     if missing or gone:
         for name in missing:
             print(f'not registered in {Path(__file__).name}: tools/asahi/{name}', file=sys.stderr)
@@ -171,9 +256,11 @@ def jobs(work, conf):
     for name, runs in ASAHI_TESTS.items():
         for index, (args, expect) in enumerate(runs):
             label = name.removesuffix('.py') + ('' if not args or args == out() or args == out('--output')
-                                                 else ' ' + ' '.join(a for a in args if a not in ('{out}', '--out', '--output', '{conf}', '--conf')))
+                                                 else ' ' + ' '.join(a for a in args if a not in ('{out}', '--out', '--output', '{conf}', '--conf',
+                                                                                                   '{dtc}', '--dtc')))
             d = work / f'{name}.{index}'
-            cmd = ['python3', '-I', '-B', str(ASAHI / name)] + [a.replace('{out}', str(d / 'out')).replace('{conf}', str(conf)) for a in args]
+            cmd = ['python3', '-I', '-B', str(ASAHI / name)] + [a.replace('{out}', str(d / 'out')).replace('{conf}', str(conf))
+                                                                 .replace('{dtc}', str(dtc)) for a in args]
             result.append((label, cmd, ASAHI, expect, d, {}))
     for name in ASAHI_RUST:
         d = work / name
@@ -214,6 +301,7 @@ def main():
     ap.add_argument('--jobs', type=int, default=os.cpu_count() or 2)
     ap.add_argument('--work', type=Path, help='keep logs and build products here (default: a temporary directory)')
     ap.add_argument('--conf', type=Path, help='a built scripts/kconfig/conf (default: build one)')
+    ap.add_argument('--dtc', type=Path, help='a built scripts/dtc/dtc (default: build one)')
     ap.add_argument('--only', help='run only jobs whose name contains this text')
     ap.add_argument('--timeout', type=int, default=900)
     args = ap.parse_args()
@@ -221,13 +309,18 @@ def main():
     work = args.work or Path(tempfile.mkdtemp(prefix='aurora-host-tests-'))
     work = work.resolve()
     work.mkdir(parents=True, exist_ok=True)
-    conf = args.conf
-    if conf is None:
-        build = work / 'kconfig'
+    conf, dtc = args.conf, args.dtc
+    build = work / 'kconfig'
+    if conf is None or dtc is None:
         subprocess.run(['make', '-s', '-C', str(ROOT), f'O={build}', 'ARCH=arm64', 'allnoconfig'],
                        check=True, stdout=subprocess.DEVNULL)
+    if conf is None:
         conf = build / 'scripts/kconfig/conf'
-    todo = jobs(work, conf.resolve())
+    if dtc is None:
+        subprocess.run(['make', '-s', '-C', str(ROOT), f'O={build}', 'ARCH=arm64', 'scripts_dtc'],
+                       check=True, stdout=subprocess.DEVNULL)
+        dtc = build / 'scripts/dtc/dtc'
+    todo = jobs(work, conf.resolve(), dtc.resolve())
     if args.only:
         todo = [j for j in todo if args.only in j[0]]
     print(f'{len(todo)} runs, {args.jobs} at a time, logs in {work}', flush=True)

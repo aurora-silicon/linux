@@ -3258,7 +3258,7 @@ drm_gpuvm_bo_unmap(struct drm_gpuvm_bo *vm_bo, void *priv)
 {
 	struct drm_gpuva_ops *ops;
 	struct drm_gpuva_op *op;
-	int ret;
+	int ret = 0;
 
 	if (unlikely(!vm_bo->vm))
 		return -EINVAL;

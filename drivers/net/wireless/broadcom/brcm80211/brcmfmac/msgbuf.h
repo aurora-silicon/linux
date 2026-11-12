@@ -33,6 +33,8 @@ void brcmf_msgbuf_delete_flowring(struct brcmf_pub *drvr, u16 flowid);
 int brcmf_proto_msgbuf_attach(struct brcmf_pub *drvr);
 void brcmf_proto_msgbuf_detach(struct brcmf_pub *drvr);
 int brcmf_msgbuf_h2d_mb_write(struct brcmf_pub *drvr, u32 data);
+void brcmf_msgbuf_suspend(struct brcmf_pub *drvr);
+void brcmf_msgbuf_resume(struct brcmf_pub *drvr);
 #else
 static inline int brcmf_proto_msgbuf_attach(struct brcmf_pub *drvr)
 {

@@ -13,6 +13,7 @@
 #include <linux/poison.h>
 #include <linux/pfn.h>
 #include <linux/debugfs.h>
+#include <linux/execmem.h>
 #include <linux/kmemleak.h>
 #include <linux/seq_file.h>
 #include <linux/memblock.h>
@@ -907,6 +908,9 @@ static unsigned long __free_reserved_area(phys_addr_t start, phys_addr_t end,
 	for_each_valid_pfn(pfn, PFN_UP(start), PFN_DOWN(end)) {
 		struct page *page = pfn_to_page(pfn);
 		void *direct_map_addr;
+
+		if (execmem_confine_pfn_in_window(pfn))
+			continue;
 
 		/*
 		 * 'direct_map_addr' might be different from the kernel virtual

@@ -1618,7 +1618,7 @@
 			#size-cells = <2>;
 
 			piodma {
-				iommus = <&dispext0_dart 4 0x0 0x0 0xf 0xffff0000>;
+				iommus = <&dispext0_dart 4 0x0 0x0 0x0 0xfc000000>;
 			};
 
 			ports {
@@ -2294,3 +2294,5 @@
 &ps_ane_set5 {
 	status = "okay";
 };
+
+#include "t8103-peripherals.dtsi"

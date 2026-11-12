@@ -1,30 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * T8122 (M3 MacBook Air, J613/J615) internal display and the external display
- * processor (dcpext, at the end of this file).
- *
- * Like T6030, the internal DCP, its mailbox, the two display DARTs and the
- * display subsystem are all described here as status = "disabled". Kernels
- * that cannot take the display over from iBoot keep scanning out through the
- * simple framebuffer, and all of them share one device tree. The boot loader
- * sets apple,t8122-handoff = <1> on the DCP and the display subsystem after
- * it has checked and locked the inherited DART mappings. A kernel display
- * gate that checks this handoff, and can start the PMP that the DCP firmware
- * needs, then enables these nodes. A kernel without such a gate leaves them
- * disabled. The 25G83 profile (t8122-j613-dcp-25g83.dtsi) has its own
- * handoff, which the display driver checks before it enables these nodes.
- *
- * Register, interrupt and DART addresses are SoC addresses from the J613
- * boot device tree: the DCP block and its iop-vbar come from /arm-io/dcp,
- * the six scan-out apertures from /arm-io/disp0, and the two DARTs from
- * /arm-io/dart-dcp and /arm-io/dart-disp0 (one reg window each, as T6030
- * uses). The DCP mailbox interrupts are the four ascwrap IRQs in the
- * send-empty, send-not-empty, recv-empty, recv-not-empty order the SMC
- * mailbox in t8122.dtsi uses. The panel child is board-specific and is added
- * by the board file.
- *
- * The display clock runs at 712 MHz, as iBoot set it up (ADT disp0
- * clock 345 on J613), the same rate as on T6030.
+ * T8122 (M3) internal display and external display processor, from the
+ * J613 ADT. Every node stays disabled until the display gate takes them
+ * over after the boot loader's handoff (apple,t8122-handoff).
  */
 
 / {
@@ -35,6 +13,7 @@
 		disp0_piodma = &disp0_piodma;
 	};
 
+	/* As iBoot sets it up (J613 ADT disp0 clock 345). */
 	clk_disp0: clock-disp0 {
 		compatible = "fixed-clock";
 		#clock-cells = <0>;
@@ -123,12 +102,7 @@
 		};
 	};
 
-
-	/*
-	 * The PMGR bandwidth page (ADT disp0/dispext0 reg 5). The internal
-	 * DCP lists it as its "disp-5" range; the external one finds it
-	 * through apple,bw-scratch, as on T8112 and T602x.
-	 */
+	/* Bandwidth page: the DCP's disp-5, dcpext's apple,bw-scratch. */
 	pmgr_dcp: power-management@2d03d0000 {
 		reg = <0x2 0xd03d0000 0x0 0x4000>;
 		reg-names = "dcp-fw-pmgr";
@@ -136,18 +110,8 @@
 	};
 
 	/*
-	 * The external display processor (ADT dispext0, dcpext, dart-dispext0
-	 * and dart-dcpext). Unlike the internal one it is not handed over by
-	 * the boot loader: the boot loader only reserves its firmware and marks
-	 * this node apple,t8122-dcpext-firmware-ready, leaving it disabled, and
-	 * the driver starts it. The board adds the Type-C routes; the display
-	 * gate enables the dcpext, its DARTs, its mailbox and the display
-	 * crossbars of those routes together.
-	 *
-	 * The DMA windows are the ones the working asahi-based kernel uses per
-	 * stream: dcpext stream 5 at 0x8_0000_0000 and PIODMA stream 4 from 0
-	 * (as on T8112). The display subsystem's stream 0 on dispext0_dart
-	 * takes its window from disp0_dart, the first DART of that device.
+	 * External display processor: the boot loader only reserves its
+	 * firmware, the driver starts it. DMA windows as on T8112.
 	 */
 	dispext0_dart: iommu@319304000 {
 		compatible = "apple,t8122-dart", "apple,t8110-dart";
@@ -187,13 +151,7 @@
 		status = "disabled";
 	};
 
-	/*
-	 * Six ranges as in the ADT dispext0 node: coproc and disp-0 to disp-4,
-	 * including the second aperture at 0x318800000. The DCP's map_reg
-	 * requests name them by index, so disp-5, the PMGR bandwidth page, is
-	 * apple,bw-scratch index 5 (scratch offset 0x910; the internal DCP's is
-	 * 0x908).
-	 */
+	/* The ADT dispext0 ranges; disp-5 is apple,bw-scratch index 5. */
 	dcpext: dcp@31ac00000 {
 		compatible = "apple,t8122-dcpext", "apple,dcpext";
 		mboxes = <&dcpext_mbox>;

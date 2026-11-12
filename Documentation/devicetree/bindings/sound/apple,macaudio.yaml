@@ -15,15 +15,70 @@ maintainers:
 
 properties:
   compatible:
-    items:
-      - enum:
-          - apple,j274-macaudio
-          - apple,j293-macaudio
-          - apple,j314-macaudio
-          - apple,j616-macaudio
-          - apple,j616-macaudio-jack
-          - apple,j700-macaudio
-      - const: apple,macaudio
+    oneOf:
+      - items:
+          - enum:
+              - apple,j180-macaudio
+              - apple,j274-macaudio
+              - apple,j293-macaudio
+              - apple,j313-macaudio
+              - apple,j314-macaudio
+              - apple,j316-macaudio
+              - apple,j375-macaudio
+              - apple,j413-macaudio
+              - apple,j415-macaudio
+              - apple,j433-macaudio
+              - apple,j434-macaudio
+              - apple,j456-macaudio
+              - apple,j457-macaudio
+              - apple,j473-macaudio
+              - apple,j493-macaudio
+              - apple,j575c-macaudio
+              - apple,j775d-macaudio
+              - apple,j575c-macaudio-jack
+              - apple,j604-macaudio
+              - apple,j604-macaudio-jack
+              - apple,j614-macaudio
+              - apple,j614-macaudio-jack
+              - apple,j616-macaudio
+              - apple,j616-macaudio-jack
+              - apple,j623-macaudio-jack
+              - apple,j624-macaudio-jack
+              - apple,j700-macaudio
+              - apple,j713-macaudio
+              - apple,j713-macaudio-jack
+              - apple,j714-macaudio
+              - apple,j715-macaudio
+              - apple,j715-macaudio-jack
+              - apple,j773-macaudio
+              - apple,j773-macaudio-jack
+              - apple,j813-macaudio
+              - apple,j815-macaudio
+              - apple,j873-macaudio
+          - const: apple,macaudio
+      - description:
+          Machines that share the speaker and jack layout of an earlier
+          machine list that machine as a fallback.
+        items:
+          - enum:
+              - apple,j414-macaudio
+              - apple,j416-macaudio
+              - apple,j474-macaudio
+              - apple,j475-macaudio
+              - apple,j504-macaudio
+              - apple,j514-macaudio
+              - apple,j516-macaudio
+              - apple,j575-macaudio
+              - apple,j613-macaudio
+              - apple,j615-macaudio
+          - enum:
+              - apple,j314-macaudio
+              - apple,j316-macaudio
+              - apple,j375-macaudio
+              - apple,j413-macaudio
+              - apple,j415-macaudio
+              - apple,j473-macaudio
+          - const: apple,macaudio
 
   "#address-cells":
     const: 1

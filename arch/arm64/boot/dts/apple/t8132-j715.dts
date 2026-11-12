@@ -4,32 +4,252 @@
  *
  * target-type: J715
  *
+ * The J713 board with a 15.3" panel and six speaker amps. Its ADT matches
+ * the J713's elsewhere, apart from the radio island and the ATC PHY trims.
+ *
  * Copyright The Asahi Linux Contributors
  */
 
 /dts-v1/;
 
 #include "t8132.dtsi"
-#include "t8132-jxxx.dtsi"
-#include <dt-bindings/leds/common.h>
+#include "t8132-j713-j715.dtsi"
+#include <dt-bindings/gpio/gpio.h>
 
 / {
 	compatible = "apple,j715", "apple,t8132", "apple,arm-platform";
 	model = "Apple MacBook Air (15-inch, M4, 2025)";
 
-	led-controller {
-		compatible = "pwm-leds";
-		led-0 {
-			pwms = <&fpwm1 0 40000>;
-			label = "kbd_backlight";
-			function = LED_FUNCTION_KBD_BACKLIGHT;
-			color = <LED_COLOR_ID_WHITE>;
-			max-brightness = <255>;
-			default-state = "keep";
+	/*
+	 * The AOP firmware runs the stream (MCA cluster 0, one serializer for
+	 * the six amps); macaudio's J715 variant links the AOP audio
+	 * component's speaker back-end (DAI 3) to them. The codecs are listed in
+	 * the ADT provider order, so each gets its native playback slot (LW1 0,
+	 * RW1 1, LT 2, RT 3, LW2 4, RW2 5). The idle masks are the ADT
+	 * amp-tx-zd-config rows 0 and 1 over the 24 sense byte slots: the left
+	 * woofer drives zeros in the right amps' sense slots, the right woofer
+	 * in the left amps'.
+	 */
+	sound: sound {
+		compatible = "apple,j715-macaudio", "apple,macaudio";
+		model = "MacBook Air J715";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Speakers";
+			dai-tdm-idle-mode-0 = "zero";
+			dai-tdm-idle-mode-1 = "zero";
+			dai-tdm-slot-tx-idle-mask-0 = <0xf0f0f0>;
+			dai-tdm-slot-tx-idle-mask-1 = <0x0f0f0f>;
+
+			cpu {
+				sound-dai = <&aop_audio 3>;
+			};
+
+			codec {
+				sound-dai = <&speaker_left_woof1>, <&speaker_right_woof1>,
+					    <&speaker_left_tweet>, <&speaker_right_tweet>,
+					    <&speaker_left_woof2>, <&speaker_right_woof2>;
+			};
 		};
+	};
+
+	/*
+	 * Physical size of the firmware framebuffer's 2880x1800 area below the
+	 * notch (15.3" panel, 224 ppi), so simpledrm reports the real DPI.
+	 */
+	fb_panel: panel {
+		width-mm = <327>;
+		height-mm = <204>;
+		status = "disabled";
 	};
 };
 
-&fpwm1 {
-	status = "okay";
+&sound_jack {
+	compatible = "apple,j715-macaudio-jack", "apple,macaudio";
+	model = "MacBook Air J715 Jack";
 };
+
+&mtp_hid {
+	multi-touch {
+		firmware-name = "apple/tpmtfw-j715.bin";
+	};
+};
+
+/* The radio module's firmware island, from the ADT's module-instance. */
+&wifi0 {
+	brcm,board-type = "apple,kos";
+};
+
+&bluetooth0 {
+	brcm,board-type = "apple,kos";
+};
+
+&aop_audio {
+	apple,chassis-name = "J715";
+	apple,machine-kind = "MacBook Air";
+};
+
+/*
+ * The six SN012776 speaker amps, held in hardware shutdown until the sound
+ * card enables them (ADT /arm-io/i2c3/audio-speaker at 0x38 and its
+ * speaker1..5): one interrupt line on AP GPIO 14, level low; sense slots
+ * from speaker-config (amp i at RX bytes 4i and 4i + 2, order LW1 RW1 LT RT
+ * LW2 RW2). Every amp joins the SDZ fail-closed group.
+ */
+&i2c3 {
+	status = "okay";
+
+	speaker_left_woof1: codec@38 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x38>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 1";
+		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <0>;
+		ti,vmon-slot-no = <2>;
+	};
+
+	speaker_left_tweet: codec@39 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x39>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Tweeter";
+		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <8>;
+		ti,vmon-slot-no = <10>;
+	};
+
+	speaker_left_woof2: codec@3a {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3a>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 2";
+		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <16>;
+		ti,vmon-slot-no = <18>;
+	};
+
+	speaker_right_woof1: codec@3b {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3b>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 1";
+		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <4>;
+		ti,vmon-slot-no = <6>;
+	};
+
+	speaker_right_tweet: codec@3c {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3c>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Tweeter";
+		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <12>;
+		ti,vmon-slot-no = <14>;
+	};
+
+	speaker_right_woof2: codec@3d {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3d>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 2";
+		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <20>;
+		ti,vmon-slot-no = <22>;
+	};
+};
+
+&mesa {
+	/*
+	 * Per-device factory data from this Mac's own iBoot system container:
+	 * the calibration, and the signed root key the nonce session loads.
+	 */
+	firmware-name = "apple/mesacal-j715.bin", "apple/msrk-j715.bin";
+};
+
+/*
+ * The ATC PHY calibration where the J715 ADT differs from the J713 tree:
+ * PLL and common-block trims, which also differ between machines and
+ * between the two PHYs.
+ */
+&atcphy0 {
+	apple,tunable-cio-common =
+		<0x800 0x3f0000 0x230000>,
+		<0x2224 0xc00 0x800>,
+		<0x2230 0x1f 0xf>,
+		<0x2240 0x18007f 0x39>,
+		<0x22b0 0x8700000 0x300000>,
+		<0x22e8 0x60001 0x40001>,
+		<0x2338 0xf800000 0x7800000>,
+		<0x2a00 0x888 0x888>,
+		<0x2a08 0x1f0000 0x30000>,
+		<0x2a24 0xc00 0x800>,
+		<0x2a28 0xf00 0xb00>,
+		<0x2a30 0x1f 0xf>,
+		<0x2a4c 0x7ffe00 0x63ba00>,
+		<0x2ab0 0x700000 0x300000>,
+		<0x2ae8 0x60000 0x20000>,
+		<0x2b00 0xfff 0xd8>,
+		<0x2894 0x100 0x100>,
+		<0x28a0 0x1ff 0x114>,
+		<0x1030 0x8000 0x8000>,
+		<0x4000 0xf00700 0xb00000>,
+		<0x10c 0x40000 0x0>;
+};
+
+&atcphy1 {
+	apple,tunable-cio-common =
+		<0x800 0x3f0000 0x230000>,
+		<0x2224 0xc00 0x800>,
+		<0x2230 0x1f 0xf>,
+		<0x2240 0x18007f 0x39>,
+		<0x22b0 0x8700000 0x300000>,
+		<0x22e8 0x60001 0x40001>,
+		<0x2338 0xf800000 0x7800000>,
+		<0x2a00 0x888 0x888>,
+		<0x2a08 0x1f0000 0x30000>,
+		<0x2a24 0xc00 0x800>,
+		<0x2a28 0xf00 0xb00>,
+		<0x2a30 0x1f 0xf>,
+		<0x2a4c 0x7ffe00 0x22ba00>,
+		<0x2ab0 0x700000 0x300000>,
+		<0x2ae8 0x60000 0x20000>,
+		<0x2b00 0xfff 0xd8>,
+		<0x2894 0x100 0x100>,
+		<0x28a0 0x1ff 0x114>,
+		<0x1030 0x8000 0x8000>,
+		<0x4000 0xf00700 0xb00000>,
+		<0x10c 0x40000 0x0>;
+	apple,tunable-cio-post =
+		<0xa04 0x7c 0x50>,
+		<0x260c 0x3ff 0x200>;
+};
+
+/* The full 2880x1864 panel including the notch rows, 224 ppi. */
+&dcp {
+	apple,panel-width-mm = <327>;
+	apple,panel-height-mm = <211>;
+};
+

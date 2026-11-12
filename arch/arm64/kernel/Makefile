@@ -41,6 +41,7 @@ obj-y			:= debug-monitors.o entry.o irq.o fpsimd.o		\
 			   rsi.o jump_label.o
 
 obj-$(CONFIG_ARCH_APPLE)	+= idle-apple.o
+obj-$(CONFIG_ARM64_APPLE_AMX)	+= apple_amx.o
 
 obj-$(CONFIG_COMPAT)			+= sys32.o signal32.o			\
 					   sys_compat.o

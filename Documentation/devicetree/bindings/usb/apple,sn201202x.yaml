@@ -39,8 +39,35 @@ properties:
     minItems: 3
     maxItems: 4
 
+  wakeup-source: true
+
+  apple,sleep-ssps:
+    type: boolean
+    description:
+      Tell the controller the system's power state (SSPS) around a
+      firmware-driven suspend, S3 before it and S0 after.
+
+  apple,debug-lock-key:
+    $ref: /schemas/types.yaml#/definitions/string
+    description:
+      The four-character key that unlocks the controller's debug mode, for
+      rearming the debug link after a sleep ended it.
+
+  apple,usb-remote-wake:
+    type: boolean
+    description:
+      This controller serves the USB controller's root port, and watches its
+      USB2 lines for a remote wakeup during a firmware-driven system sleep.
+
   connector:
     $ref: /schemas/connector/usb-connector.yaml#
+
+  apple,reset-inherited-usb2-connection:
+    type: boolean
+    description:
+      The boot USB port retains a USB2 repeater connection that cannot be
+      recovered by resetting the host PHY. Renegotiate a normal application
+      connection before starting the host controllers. Debug routes are preserved.
 
 required:
   - compatible

@@ -57,7 +57,7 @@ static struct asahi_g17_scope *to_scope(struct dma_fence *fence)
 
 static const char *scope_driver_name(struct dma_fence *fence)
 {
-	return "asahi";
+	return "aurora";
 }
 
 static const char *scope_timeline_name(struct dma_fence *fence)

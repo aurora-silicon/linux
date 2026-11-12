@@ -1,0 +1,35 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* T8132 decoder (AVD) and its DART. */
+
+&soc {
+	avd_dart: iommu@3a1020000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		reg = <0x3 0xa1020000 0x0 0x20000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 955 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		power-domains = <&ps_avd_sys>;
+		status = "disabled";
+	};
+
+	/*
+	 * The ADT gives the whole block (0x3_a0000000, 0x1404000); the driver
+	 * needs the CM3 code, SRAM, mailbox and control windows, which follow
+	 * the T6041 (M4 Pro) layout of the same decoder.
+	 */
+	avd: video-decoder@3a1080000 {
+		compatible = "apple,t8132-avd";
+		reg = <0x3 0xa1080000 0x0 0x12000>,
+		      <0x3 0xa1094000 0x0 0x12000>,
+		      <0x3 0xa10a8000 0x0 0x4000>,
+		      <0x3 0xa1100000 0x0 0x10000>;
+		reg-names = "code", "sram", "mbox", "ctrl";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 948 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 949 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&avd_dart 0>;
+		power-domains = <&ps_avd_sys>;
+		resets = <&ps_avd_sys>;
+		status = "disabled";
+	};
+};

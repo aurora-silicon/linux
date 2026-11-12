@@ -23,12 +23,17 @@ struct apple_dpin_policy {
 	bool t602x_handshake;
 	bool defer_new_bringup;
 	unsigned long host_policy;
+	/* teardown touches the DP IN block only after DCP's Activate/Deactivate did */
+	bool lazy_idle;
+	unsigned int settle_ms;
 };
 
 extern const struct apple_dpin_policy apple_dpin_disabled;
 extern const struct apple_dpin_policy apple_dpin_m1;
 extern const struct apple_dpin_policy apple_dpin_m2;
 extern const struct apple_dpin_policy apple_dpin_m3;
+extern const struct apple_dpin_policy apple_dpin_m4;
+extern const struct apple_dpin_policy apple_dpin_m5;
 
 enum apple_dpin_phase {
 	APPLE_DPIN_IDLE,

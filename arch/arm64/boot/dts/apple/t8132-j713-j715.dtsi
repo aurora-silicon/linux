@@ -1,0 +1,329 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple MacBook Air (13-inch and 15-inch, M4, 2025)
+ *
+ * The parts the J713 and J715 share. The J715 overrides the radio's
+ * firmware island and the ATC PHY trims; each board adds its panel,
+ * speakers and firmware names.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+#include "t8132-laptop.dtsi"
+#include "t8132-j713-pmgr.dtsi"
+#include <dt-bindings/phy/phy.h>
+
+/* The J713 loader tree has these placeholders. */
+&gpu_ttbs {
+	reg = <0 0 0 0>;
+};
+
+&gpu_pagetables {
+	reg = <0 0 0 0>;
+};
+
+&gpu_handoff {
+	reg = <0 0 0 0>;
+};
+
+&gpu_shared_l2 {
+	reg = <0 0 0 0>;
+};
+
+&gpu_fw_text {
+	reg = <0 0 0 0>;
+};
+
+&gpu_fw_data {
+	reg = <0 0 0 0>;
+};
+
+&framebuffer0 {
+	/delete-property/ power-domains;
+};
+
+&typec0 {
+	label = "USB-C native client";
+};
+
+&typec1 {
+	label = "USB-C MagSafe-adjacent";
+};
+
+/* The radio's firmware island: the J713's here, the J715 overrides it. */
+&wifi0 {
+	brcm,board-type = "apple,garden";
+};
+
+&bluetooth0 {
+	brcm,board-type = "apple,garden";
+};
+
+/* An external pipe's PMC enables follow its SYS state, before its FE. */
+&ps_dispext0_fe {
+	power-domains = <&ps_dispext0_sys>, <&pmc_dispext0>;
+};
+
+&ps_dispext1_fe {
+	power-domains = <&ps_dispext1_sys>, <&pmc_dispext1>;
+};
+
+&smc_hwmon {
+	current-ID0R {
+		apple,key-id = "ID0R";
+		label = "AC Input Current";
+	};
+
+	/* Panel and backlight supply; tracks brightness, idles when blanked. */
+	current-Ib8f {
+		apple,key-id = "Ib8f";
+		label = "Display Supply Current";
+	};
+
+	power-PDTR {
+		apple,key-id = "PDTR";
+		label = "AC Input Power";
+	};
+
+	power-PMVC {
+		apple,key-id = "PMVC";
+		label = "3.8 V Rail Power";
+	};
+
+	power-PSTR {
+		apple,key-id = "PSTR";
+		label = "Total System Power";
+	};
+
+	temperature-TB0T {
+		apple,key-id = "TB0T";
+		label = "Battery Hotspot";
+	};
+
+	temperature-TCHP {
+		apple,key-id = "TCHP";
+		label = "Charge Regulator Temp";
+	};
+
+	temperature-TH0x {
+		apple,key-id = "TH0x";
+		label = "NAND Flash Temperature";
+	};
+
+	temperature-TW0P {
+		apple,key-id = "TW0P";
+		label = "WiFi/BT Module Temp";
+	};
+
+	voltage-SBAV {
+		apple,key-id = "SBAV";
+		label = "Battery Voltage";
+	};
+
+	voltage-VD0R {
+		apple,key-id = "VD0R";
+		label = "Charger Input Voltage";
+	};
+};
+
+/* The GPU itself is described for every M4 Mac in t8132-gpu.dtsi. */
+&ps_gfx {
+	status = "okay";
+};
+
+/* The J713's full 2560x1664 panel including the notch rows, 224 ppi. */
+&dcp {
+	apple,panel-width-mm = <290>;
+	apple,panel-height-mm = <188>;
+};
+
+/* External displays: both pipes, routed to either USB-C port. */
+&dcpext0_mbox {
+	status = "okay";
+};
+
+&dcpext0_dart {
+	status = "okay";
+};
+
+&dispext0_dart {
+	status = "okay";
+};
+
+&dcpext1_mbox {
+	status = "okay";
+};
+
+&dcpext1_dart {
+	status = "okay";
+};
+
+&dispext1_dart {
+	status = "okay";
+};
+
+&atc0_dpxbar {
+	status = "okay";
+};
+
+&atc1_dpxbar {
+	status = "okay";
+};
+
+/*
+ * dcpext0's Type-C routes, UFP mux selector 2 on both ATC crossbars
+ * (cells 0/1/2: DP PHY, DP IN0, DP IN1). The ATC PHYs have no DP alt mode:
+ * the routes are for DisplayPort tunnels, and DP alt mode is refused. The
+ * routes are disabled here; the display gate enables them only for a dcpext
+ * the boot loader handed over, since a USB-C port controller waits for every
+ * available route.
+ */
+&dcpext0 {
+	apple,connector-type = "USB-C";
+	phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>;
+	phy-names = "typec0", "typec1";
+	mux-controls = <&atc0_dpxbar 0>, <&atc1_dpxbar 0>,
+		       <&atc0_dpxbar 1>, <&atc0_dpxbar 2>,
+		       <&atc1_dpxbar 1>, <&atc1_dpxbar 2>;
+	mux-control-names = "typec0", "typec1",
+			    "typec0-dpin0", "typec0-dpin1",
+			    "typec1-dpin0", "typec1-dpin1";
+	apple,typec-mux-indices = <2 2>;
+	apple,typec-dptx-phys = <0 1>;
+
+	status = "okay";
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext0_typec0: endpoint {
+					remote-endpoint = <&typec0_dcpext0>;
+				};
+			};
+		};
+
+		route@1 {
+			reg = <1>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext0_typec1: endpoint {
+					remote-endpoint = <&typec1_dcpext0>;
+				};
+			};
+		};
+	};
+};
+
+/*
+ * dcpext1's Type-C routes, UFP mux selector 4 on both ATC crossbars
+ * (cells 0/1/2: DP PHY, DP IN0, DP IN1). The ATC PHYs have no DP alt mode:
+ * the routes are for DisplayPort tunnels, and DP alt mode is refused. The
+ * routes are disabled here; the display gate enables them only for a dcpext
+ * the boot loader handed over, since a USB-C port controller waits for every
+ * available route.
+ */
+&dcpext1 {
+	apple,connector-type = "USB-C";
+	phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>;
+	phy-names = "typec0", "typec1";
+	mux-controls = <&atc0_dpxbar 0>, <&atc1_dpxbar 0>,
+		       <&atc0_dpxbar 1>, <&atc0_dpxbar 2>,
+		       <&atc1_dpxbar 1>, <&atc1_dpxbar 2>;
+	mux-control-names = "typec0", "typec1",
+			    "typec0-dpin0", "typec0-dpin1",
+			    "typec1-dpin0", "typec1-dpin1";
+	apple,typec-mux-indices = <4 4>;
+	apple,typec-dptx-phys = <0 1>;
+
+	status = "okay";
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext1_typec0: endpoint {
+					remote-endpoint = <&typec0_dcpext1>;
+				};
+			};
+		};
+
+		route@1 {
+			reg = <1>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext1_typec1: endpoint {
+					remote-endpoint = <&typec1_dcpext1>;
+				};
+			};
+		};
+	};
+};
+
+&typec0 {
+	ports {
+		port@3 {
+			reg = <3>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			typec0_dcpext0: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&dcpext0_typec0>;
+			};
+
+			typec0_dcpext1: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext1_typec0>;
+			};
+		};
+	};
+};
+
+&typec1 {
+	ports {
+		port@3 {
+			reg = <3>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			typec1_dcpext0: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&dcpext0_typec1>;
+			};
+
+			typec1_dcpext1: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext1_typec1>;
+			};
+		};
+	};
+};
+
+#include "t8132-j713-atcphy-tunables.dtsi"
+#include "t8132-j713-usb4.dtsi"
+#include "t8132-j713-usb4-tunables.dtsi"
+
+&avd_dart {
+	status = "okay";
+};
+
+&avd {
+	status = "okay";
+};

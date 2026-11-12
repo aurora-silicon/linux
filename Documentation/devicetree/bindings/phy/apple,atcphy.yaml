@@ -42,60 +42,105 @@ allOf:
       properties:
         compatible:
           contains:
-            const: apple,t8132-atcphy
+            enum:
+              - apple,t8122-atcphy
+              - apple,t6030-atcphy
+              - apple,t6031-atcphy
     then:
-      oneOf:
-        - properties:
-            reg:
-              minItems: 2
-              maxItems: 2
-            reg-names:
-              items:
-                - const: usb2phy
-                - const: pipehandler
-        - properties:
-            reg:
-              items:
-                - description: USB2 PHY specific controls
-                - description: USB3 PIPE interface controls
-                - description: SuperSpeed PHY core, excluding the display crossbar
-                - description: AXI to Apple Fabric interface controls
-                - description: Local IO address translation controls
-                - description: ATC fabric controls
-                - description: ATC common configuration controls
-            reg-names:
-              items:
-                - const: usb2phy
-                - const: pipehandler
-                - const: core
-                - const: axi2af
-                - const: lioa
-                - const: fabric
-                - const: common-config
-          required:
-            - power-domains
-    else:
       properties:
         reg:
-          minItems: 5
+          minItems: 1
           items:
-            - description: Common controls for all PHYs (USB2/3/4, DisplayPort, TBT)
-            - description: DisplayPort Alternate Mode PHY specific controls
-            - description: Type-C PHY AXI to Apple Fabric interconnect controls
-            - description: USB2 PHY specific controls
-            - description: USB3 PIPE interface controls
-            - description: Secondary eUSB2 PHY register bank (T8140)
+            - description: Common controls for USB and DisplayPort
+            - description: DisplayPort alternate mode PHY
+            - description: AXI to Apple Fabric interface
+            - description: USB2 PHY
+            - description: USB3 PIPE interface
         reg-names:
-          minItems: 5
+          minItems: 1
           items:
             - const: core
             - const: lpdptx
             - const: axi2af
             - const: usb2phy
             - const: pipehandler
-            - const: usb2phy-reg
+      oneOf:
+        - properties:
+            reg:
+              maxItems: 1
+            reg-names:
+              maxItems: 1
+        - properties:
+            reg:
+              minItems: 5
+            reg-names:
+              minItems: 5
       required:
         - power-domains
+    else:
+      if:
+        properties:
+          compatible:
+            contains:
+              const: apple,t8132-atcphy
+      then:
+        oneOf:
+          - properties:
+              reg:
+                minItems: 2
+                maxItems: 2
+              reg-names:
+                items:
+                  - const: usb2phy
+                  - const: pipehandler
+          - properties:
+              reg:
+                items:
+                  - description: USB2 PHY specific controls
+                  - description: USB3 PIPE interface controls
+                  - description: SuperSpeed PHY core, excluding the display crossbar
+                  - description: AXI to Apple Fabric interface controls
+                  - description: Local IO address translation controls
+                  - description: ATC fabric controls
+                  - description: ATC common configuration controls
+              reg-names:
+                items:
+                  - const: usb2phy
+                  - const: pipehandler
+                  - const: core
+                  - const: axi2af
+                  - const: lioa
+                  - const: fabric
+                  - const: common-config
+            required:
+              - power-domains
+      else:
+        properties:
+          reg:
+            minItems: 5
+            items:
+              - description: Common controls for all PHYs (USB2/3/4, DisplayPort, TBT)
+              - description: DisplayPort Alternate Mode PHY specific controls
+              - description: Type-C PHY AXI to Apple Fabric interconnect controls
+              - description: USB2 PHY specific controls
+              - description: USB3 PIPE interface controls
+              - description: Secondary eUSB2 PHY register bank (T8140)
+              - description:
+                  Power and hibernation control of the USB controller the PHY
+                  serves (T8140). The PHY drives that controller's reset and
+                  takes it through hibernation for a system sleep.
+          reg-names:
+            minItems: 5
+            items:
+              - const: core
+              - const: lpdptx
+              - const: axi2af
+              - const: usb2phy
+              - const: pipehandler
+              - const: usb2phy-reg
+              - const: pwrctl
+        required:
+          - power-domains
   - if:
       properties:
         compatible:
@@ -144,6 +189,30 @@ allOf:
         apple,tunable-usb3-common: false
         apple,tunable-usb3-efuse: false
         apple,tunable-usb3-dp: false
+        apple,tunable-cio-axi2af: false
+        apple,tunable-cio-lioa: false
+        apple,tunable-cio-fabric: false
+        apple,tunable-cio-config: false
+        apple,tunable-cio-common: false
+        apple,tunable-cio-lane0: false
+        apple,tunable-cio-lane0-eq: false
+        apple,tunable-cio-lane1: false
+        apple,tunable-cio-lane1-eq: false
+        apple,tunable-cio-post: false
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              enum:
+                - apple,t8122-atcphy
+                - apple,t6030-atcphy
+                - apple,t6031-atcphy
+    then:
+      required:
+        - orientation-switch
+        - mode-switch
+        - ports
 
 $defs:
   apple,tunable:
@@ -171,16 +240,22 @@ properties:
               - apple,t8112-atcphy
           - const: apple,t8103-atcphy
       - const: apple,t8103-atcphy
+      - const: apple,t8122-atcphy
+      - items:
+          - enum:
+              - apple,t6030-atcphy
+              - apple,t6031-atcphy
+          - const: apple,t8122-atcphy
       - const: apple,t8132-atcphy
       - const: apple,t8140-atcphy
       - const: apple,t8142-atcphy
 
   reg:
-    minItems: 2
+    minItems: 1
     maxItems: 7
 
   reg-names:
-    minItems: 2
+    minItems: 1
     maxItems: 7
 
   "#phy-cells":
@@ -194,6 +269,14 @@ properties:
 
   power-domains:
     maxItems: 1
+
+  phys:
+    maxItems: 1
+    description: Phandle to the eUSB2 to USB 2.0 repeater.
+
+  phy-names:
+    items:
+      - const: eusb2-repeater
 
   ports:
     $ref: /schemas/graph.yaml#/properties/ports
@@ -248,6 +331,46 @@ properties:
     description: >
       T8132 ADT-provided efuse-derived core values, applied after lane routing
       and before the PHY reset is released. No raw fuse register is read.
+
+  apple,tunable-cio-axi2af:
+    $ref: "#/$defs/apple,tunable"
+    description: T8132 CIO AXI setup, write-disable and lock, applied first in CIO mode.
+
+  apple,tunable-cio-lioa:
+    $ref: "#/$defs/apple,tunable"
+    description: T8132 CIO LIOA setup, applied after the CIO AXI list.
+
+  apple,tunable-cio-fabric:
+    $ref: "#/$defs/apple,tunable"
+    description: T8132 CIO fabric setup, applied after the CIO LIOA list.
+
+  apple,tunable-cio-config:
+    $ref: "#/$defs/apple,tunable"
+    description: T8132 CIO common-configuration setup, applied after the CIO fabric list.
+
+  apple,tunable-cio-common:
+    $ref: "#/$defs/apple,tunable"
+    description: T8132 CIO PLL, shim and top setup in the core bank, before the lanes.
+
+  apple,tunable-cio-lane0:
+    $ref: "#/$defs/apple,tunable"
+    description: T8132 lane 0 CIO defaults in the core bank.
+
+  apple,tunable-cio-lane0-eq:
+    $ref: "#/$defs/apple,tunable"
+    description: T8132 lane 0 CIO equalization in the core bank, after its defaults.
+
+  apple,tunable-cio-lane1:
+    $ref: "#/$defs/apple,tunable"
+    description: T8132 lane 1 CIO defaults in the core bank.
+
+  apple,tunable-cio-lane1-eq:
+    $ref: "#/$defs/apple,tunable"
+    description: T8132 lane 1 CIO equalization in the core bank, after its defaults.
+
+  apple,tunable-cio-post:
+    $ref: "#/$defs/apple,tunable"
+    description: T8132 CIO common setup applied after the crossbar, before the PHY reset is released.
 
   apple,tunable-common-a:
     $ref: "#/$defs/apple,tunable"
@@ -325,6 +448,18 @@ properties:
       T8140, copied from Apple's Device Tree by the bootloader. Unlike the
       other tunables these are applied to the usb2phy-reg region.
 
+  apple,axi2af-gate:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: Register offset in the axi2af region
+        - description: Bits
+    description: >
+      The fabric bridge bits macOS clears, in this order, before the PHY's
+      common power domain goes off for a system sleep and sets again once it
+      is back. With pwrctl, the controller then keeps its power through the
+      sleep.
+
 patternProperties:
   "^apple,dp-training-table(-rbr|-hbr|-hbr2|-hbr3)?$":
     $ref: /schemas/types.yaml#/definitions/uint32-array
@@ -341,9 +476,6 @@ required:
   - reg-names
   - "#phy-cells"
   - "#reset-cells"
-  - orientation-switch
-  - mode-switch
-  - ports
 
 additionalProperties: false
 

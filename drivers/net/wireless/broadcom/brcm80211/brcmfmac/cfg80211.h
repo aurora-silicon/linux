@@ -388,6 +388,10 @@ struct brcmf_cfg80211_info {
 	bool dongle_up;
 	bool scan_tried;
 	bool force_band_setup;
+	/* Regulatory notifier and wiphy PM callbacks are serialized by RTNL. */
+	bool suspended;
+	bool country_pending;
+	char country_alpha2[2];
 	u8 *dcmd_buf;
 	u8 *extra_buf;
 	struct dentry *debugfsdir;

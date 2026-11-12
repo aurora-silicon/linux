@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/iio/light/apple,aop-als.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple AOP ambient light sensor service
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  The service is supplied by the parent Always-On Processor. Firmware and
+  calibration handoff determine its availability. It has no independent
+  application-processor register window or interrupt.
+
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t6020-aop-als
+          - apple,t6050-aop-als
+          - apple,t8112-aop-als
+  required:
+    - compatible
+
+properties:
+  compatible:
+    items:
+      - enum:
+          - apple,t6020-aop-als
+          - apple,t6050-aop-als
+          - apple,t8112-aop-als
+      - const: apple,aop-als
+
+required:
+  - compatible
+
+additionalProperties: false

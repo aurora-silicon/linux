@@ -12,6 +12,7 @@
 #include <linux/linkage.h>
 
 #include <asm/alternative.h>
+#include <asm/apple_cpufeature.h>
 #include <asm/assembler.h>
 #include <asm/asm-offsets.h>
 #include <asm/asm_pointer_auth.h>
@@ -280,6 +281,28 @@ alternative_else_nop_endif
 	.endif /* \el == 0 */
 	mrs	x22, elr_el1
 	mrs	x23, spsr_el1
+#ifdef CONFIG_ARM64_APPLE_X86_FLAGS
+	.if	\el == 0
+	.if	\regsize == 64
+alternative_if ARM64_HAS_APFLG_APPLE
+	/*
+	 * The CPU saves Apple's x86 parity/adjust flags in ASPSR rather than
+	 * SPSR, and any later exception or another task overwrites ASPSR.
+	 * Keep them in the saved PSTATE, in the bits where EL0 reads them
+	 * from NZCV, so they follow the task like the rest of PSTATE. Only
+	 * threads that turned the flags on need this; under a hypervisor
+	 * each ASPSR access may trap.
+	 */
+	ldr	x0, [tsk, #TSK_TI_FLAGS]
+	tbz	x0, #TIF_APPLE_APFLG, 7f
+	mrs_s	x0, SYS_IMP_APL_ASPSR_EL1
+	ubfx	x0, x0, #ASPSR_APPLE_PF_SHIFT, #2
+	bfi	x23, x0, #PSR_APPLE_PF_SHIFT, #2
+7:
+alternative_else_nop_endif
+	.endif
+	.endif
+#endif
 	stp	lr, x21, [sp, #S_LR]
 
 	/*
@@ -401,6 +424,21 @@ alternative_else_nop_endif
 	mte_set_user_gcr tsk, x0, x1
 
 	apply_ssbd 0, x0, x1
+
+#ifdef CONFIG_ARM64_APPLE_X86_FLAGS
+alternative_if ARM64_HAS_APFLG_APPLE
+	/* Hand the saved x86 parity/adjust flags back to ERET through ASPSR */
+	ldr	x0, [tsk, #TSK_TI_FLAGS]
+	tbz	x0, #TIF_APPLE_APFLG, 4f
+	tst	x22, #PSR_MODE32_BIT		// AArch32 uses bits 27:26 as IT
+	b.ne	4f
+	ubfx	x0, x22, #PSR_APPLE_PF_SHIFT, #2
+	lsl	x0, x0, #ASPSR_APPLE_PF_SHIFT
+	msr_s	SYS_IMP_APL_ASPSR_EL1, x0
+	bic	x22, x22, #(PSR_APPLE_PF_BIT | PSR_APPLE_AF_BIT)
+4:
+alternative_else_nop_endif
+#endif
 	.endif
 
 	msr	elr_el1, x21			// set up the return data

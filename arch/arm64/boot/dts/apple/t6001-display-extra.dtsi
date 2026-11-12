@@ -1,0 +1,132 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Additional display engines; firmware and route ownership are unqualified. */
+
+&{/soc} {
+	dispext2_dart: iommu@48b304000 {
+		compatible = "apple,t6000-display-dart", "apple,t6000-dart", "apple,t8110-dart";
+		reg = <0x4 0x8b304000 0x0 0x4000>,
+		      <0x4 0x8b300000 0x0 0x4000>;
+		reg-names = "dart", "auxiliary";
+		#iommu-cells = <5>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 945 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext2_cpu0>;
+		status = "disabled";
+	};
+
+	dcpext2_dart: iommu@48b30c000 {
+		compatible = "apple,t6000-dart", "apple,t8110-dart";
+		reg = <0x4 0x8b30c000 0x0 0x4000>;
+		#iommu-cells = <5>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 945 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext2_cpu0>;
+		status = "disabled";
+	};
+
+	dcpext2_mbox: mailbox@48bc08000 {
+		compatible = "apple,t6000-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x4 0x8bc08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 966 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 967 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 968 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 969 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_dispext2_cpu0>;
+		resets = <&ps_dispext2_cpu0>;
+		status = "disabled";
+	};
+
+	dcpext2: dcp@48bc00000 {
+		compatible = "apple,t6000-dcpext", "apple,dcpext";
+		reg = <0x4 0x8bc00000 0x0 0x4000>,
+		      <0x4 0x8a000000 0x0 0x3000000>,
+		      <0x4 0x8b320000 0x0 0x4000>,
+		      <0x4 0x8b344000 0x0 0x4000>,
+		      <0x4 0x8b800000 0x0 0x800000>,
+		      <0x2 0x8e3d0000 0x0 0x4000>,
+		      <0x4 0x8b850000 0x0 0x4000>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2",
+			    "disp-3", "disp-4", "coproc-aux";
+		mboxes = <&dcpext2_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcpext2_dart 0 0x0 0x0 0x0 0xfc000000>;
+		power-domains = <&ps_dispext2_cpu0>;
+		resets = <&ps_dispext2_cpu0>;
+		apple,dcp-index = <3>;
+		phandle = <&dcpext2>;
+		status = "disabled";
+
+		piodma {
+			iommus = <&dispext2_dart 4 0x0 0x0 0x0 0xfc000000>;
+			status = "disabled";
+		};
+	};
+
+	dispext3_dart: iommu@48e304000 {
+		compatible = "apple,t6000-display-dart", "apple,t6000-dart", "apple,t8110-dart";
+		reg = <0x4 0x8e304000 0x0 0x4000>,
+		      <0x4 0x8e300000 0x0 0x4000>;
+		reg-names = "dart", "auxiliary";
+		#iommu-cells = <5>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 981 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext3_cpu0>;
+		status = "disabled";
+	};
+
+	dcpext3_dart: iommu@48e30c000 {
+		compatible = "apple,t6000-dart", "apple,t8110-dart";
+		reg = <0x4 0x8e30c000 0x0 0x4000>;
+		#iommu-cells = <5>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 981 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext3_cpu0>;
+		status = "disabled";
+	};
+
+	dcpext3_mbox: mailbox@48ec08000 {
+		compatible = "apple,t6000-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x4 0x8ec08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1002 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1003 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1004 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1005 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_dispext3_cpu0>;
+		resets = <&ps_dispext3_cpu0>;
+		status = "disabled";
+	};
+
+	dcpext3: dcp@48ec00000 {
+		compatible = "apple,t6000-dcpext", "apple,dcpext";
+		reg = <0x4 0x8ec00000 0x0 0x4000>,
+		      <0x4 0x8d000000 0x0 0x3000000>,
+		      <0x4 0x8e320000 0x0 0x4000>,
+		      <0x4 0x8e344000 0x0 0x4000>,
+		      <0x4 0x8e800000 0x0 0x800000>,
+		      <0x2 0x8e3d0000 0x0 0x4000>,
+		      <0x4 0x8e850000 0x0 0x4000>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2",
+			    "disp-3", "disp-4", "coproc-aux";
+		mboxes = <&dcpext3_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcpext3_dart 0 0x0 0x0 0x0 0xfc000000>;
+		power-domains = <&ps_dispext3_cpu0>;
+		resets = <&ps_dispext3_cpu0>;
+		apple,dcp-index = <4>;
+		phandle = <&dcpext3>;
+		status = "disabled";
+
+		piodma {
+			iommus = <&dispext3_dart 4 0x0 0x0 0x0 0xfc000000>;
+			status = "disabled";
+		};
+	};
+};

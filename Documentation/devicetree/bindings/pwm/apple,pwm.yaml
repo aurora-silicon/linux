@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/pwm/apple,pwm.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple timer PWM controller
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  The timer PWM controller is distinct from the FPWM keyboard-backlight
+  controller. It has one register aperture, one interrupt and a PMGR gate.
+  No firmware PWM program or board-specific output state is implied.
+  On T6000 the plain-PWM view shares its register bank with FPWM0,
+  but has a distinct gate and interrupt. Ownership must be coordinated
+  before either interface is used alongside the other.
+
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t6000-pwm
+          - apple,t8103-pwm
+          - apple,t8112-pwm
+          - apple,t8122-pwm
+          - apple,t8132-pwm
+  required:
+    - compatible
+
+properties:
+  compatible:
+    items:
+      - enum:
+          - apple,t6000-pwm
+          - apple,t8103-pwm
+          - apple,t8112-pwm
+          - apple,t8122-pwm
+          - apple,t8132-pwm
+      - const: apple,pwm
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  power-domains:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - power-domains
+
+additionalProperties: false

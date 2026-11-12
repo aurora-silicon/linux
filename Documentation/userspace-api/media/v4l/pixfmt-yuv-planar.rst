@@ -138,6 +138,20 @@ All components are stored with the same number of bits per component.
       - Cb, Cr
       - No
       - Linear
+    * - V4L2_PIX_FMT_P216
+      - 'P216'
+      - 16
+      - 4:2:2
+      - Cb, Cr
+      - Yes
+      - Linear
+    * - V4L2_PIX_FMT_P416
+      - 'P416'
+      - 16
+      - 4:4:4
+      - Cb, Cr
+      - Yes
+      - Linear
     * - V4L2_PIX_FMT_NV15
       - 'NV15'
       - 10
@@ -955,6 +969,40 @@ Data in the 12 high bits, zeros in the 4 low bits, arranged in little endian ord
       - Cr\ :sub:`10`
       - Cb\ :sub:`11`
       - Cr\ :sub:`11`
+
+
+.. _V4L2-PIX-FMT-P216:
+.. _V4L2-PIX-FMT-P416:
+
+P216 and P416
+-------------
+
+These formats store unsigned 16-bit little-endian Y, Cb and Cr samples.
+All 16 bits are sample data. P216 uses 4:2:2 horizontal chroma subsampling;
+P416 uses 4:4:4 without subsampling. Neither format has an alpha channel.
+There is one contiguous V4L2 memory plane, containing the Y region followed
+immediately by the interleaved Cb,Cr region. With the multi-planar API,
+``num_planes`` is 1. Independently allocated regions are not supported.
+
+Let W,H be the negotiated storage width and height and S be the Y
+``bytesperline`` in bytes. W and H must be positive, S must be even and
+at least 2W, and P216 requires even W. Each region has H rows. The chroma
+region begins at offset SH. Its stride is S for P216 and 2S for P416;
+the minimum ``sizeimage`` is respectively 2SH and 3SH. No extra alignment
+gap is permitted between regions. Allocation padding may follow the final
+region. Drivers must reject sizes that overflow the ABI or allocator limits.
+
+For pixel x in row y the Y offset is yS + 2x. For P216, Cb for luma pixels
+2k and 2k+1 is at SH + yS + 4k, and Cr is two bytes later. For P416, Cb
+for pixel x is at SH + 2yS + 4x, and Cr is two bytes later. Every sample
+stores bits 7:0 first and bits 15:8 second, independent of CPU byte order.
+Rows are top-to-bottom. P216 chroma is horizontally interstitially sited.
+Colorimetry is described by the ordinary pixel-format colorimetry fields.
+
+For W=4, H=2 and S=12, both formats start chroma at byte 24. P216 has a
+12-byte chroma stride and needs at least 48 bytes; P416 has a 24-byte
+chroma stride and needs at least 72 bytes. A packed Y216 buffer or a
+right-justified 10/12-bit buffer must not be relabeled as these formats.
 
 
 Fully Planar YUV Formats

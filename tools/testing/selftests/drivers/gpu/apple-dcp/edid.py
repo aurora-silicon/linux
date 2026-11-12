@@ -53,6 +53,7 @@ static unsigned diagnostic_errors,diagnostic_information,legacy_publishes;
 /* The T6030 14.7 backend never matches these H17P scenarios. */
 #define DCP_FIRMWARE_V_14_7 (DCP_FIRMWARE_H17P + 1)
 #define DCP_FIRMWARE_V_14_7_TEMPLATE (DCP_FIRMWARE_H17P + 2)
+#define DCP_FIRMWARE_V_27_0 (DCP_FIRMWARE_H17P + 3)
 #define EPIC_TYPE_NOTIFY 0
 #define EPIC_CAT_REPORT 0
 #define max(a,b) ((a)>(b)?(a):(b))
@@ -61,12 +62,15 @@ static unsigned diagnostic_errors,diagnostic_information,legacy_publishes;
 #define dma_rmb() ((void)0)
 #define DRM_CONNECTOR_REGISTERED 1
 #define DPAVSERV_ENDPOINT_V2 0x2a
+#define AV_AUDIO_ENDPOINT_DESKTOP 0x2b
 #define DCP_IOMFB_METHODS_H17P_EXTERNAL 2
+#define DCP_IOMFB_METHODS_H17G 7
 #define EPIC_SUBTYPE_STD_SERVICE 0xc0
 #define EPIC_SUBTYPE_ANNOUNCE_H17P 0x11
 #define to_platform_device(x) (x)
 #define ERR_PTR(x) ((void *)(intptr_t)(x))
 #define IS_ERR(x) ((uintptr_t)(x)>(uintptr_t)-4096)
+#define IS_ERR_OR_NULL(p) (!(p) || IS_ERR(p))
 #define lockdep_assert_held(p) assert(*(p))
 static bool *hpd_lock,*av_lock;
 static void mutex_lock(bool *p) { if(p==hpd_lock) assert(!*av_lock);assert(!*p);*p=true; }
@@ -80,7 +84,7 @@ static bool queue_work(void *wq,struct work_struct *w) { assert(wq);bool fresh=!
 static bool __attribute__((unused)) cancel_work_sync(struct work_struct *w) { bool queued=w->pending;assert(!queued);return queued; }
 struct apple_dcp;struct apple_dcp_afkep;struct apple_epic_service;
 void afk_service_retry(struct apple_dcp_afkep *ep);
-struct apple_epic_service_ops { char name[32];bool reusable,optional;void (*init)(struct apple_epic_service *,const char *,const char *,s64);int (*prepare)(struct apple_epic_service *,const char *,const char *,s64);int (*revalidate)(struct apple_epic_service *,const char *,const char *,s64);void (*teardown)(struct apple_epic_service *); };
+struct apple_epic_service_ops { char name[32];bool reusable,optional;void (*init)(struct apple_epic_service *,const char *,const char *,s64);int (*prepare)(struct apple_epic_service *,const char *,const char *,s64);int (*revalidate)(struct apple_epic_service *,const char *,const char *,s64);void (*init_props)(struct apple_epic_service *,s64,const void *,size_t);void (*teardown)(struct apple_epic_service *); };
 struct epic_cmd_info { u16 tag;u8 type;size_t reply_length,reply_len;bool reply_len_valid;void *rxbuf,*txbuf;dma_addr_t rxbuf_dma,txbuf_dma;size_t rxlen,txlen;u32 retcode;bool done,free_on_ack;int *completion; };
 struct apple_epic_service {
     struct apple_dcp_afkep *ep;const struct apple_epic_service_ops *ops;
@@ -466,13 +470,21 @@ int main(void)
     optional_admission_controls();
     struct item h17p[]={{"compartment","dcpav-service-epic",0},{"name","AppleDCPDP2HDMI",0},{"interface-id",NULL,13}};
     struct dcp_parse_ctx parse_ctx={.items=h17p,.count=3};const char *parsed_name,*parsed_class;s64 parsed_unit=-1;
-    assert(!parse_epic_service_init(&parse_ctx,&parsed_name,&parsed_class,&parsed_unit,true));
+    assert(!parse_epic_service_init(&parse_ctx,&parsed_name,&parsed_class,&parsed_unit,true,false));
     assert(parsed_unit==13 && !strcmp(parsed_name,name) && !strcmp(parsed_class,class));
     struct apple_epic_service *proof=prepare(13,parsed_unit,parsed_name,parsed_class);assert(proof);afk_service_discard(proof);
     free((void *)parsed_name);free((void *)parsed_class);
     struct item legacy[]={{"EPICName","dcpav-service-epic",0},{"EPICProviderClass","legacy-class",0},{"EPICUnit",NULL,0}};
     parse_ctx=(struct dcp_parse_ctx){.items=legacy,.count=3};
-    assert(!parse_epic_service_init(&parse_ctx,&parsed_name,&parsed_class,&parsed_unit,false));assert(parsed_unit==0);
+    assert(!parse_epic_service_init(&parse_ctx,&parsed_name,&parsed_class,&parsed_unit,false,false));assert(parsed_unit==0);
+    free((void *)parsed_name);free((void *)parsed_class);
+    /* Firmware 27 carries both spellings; its EPICUnit is the unit in either order. */
+    struct item both[]={{"compartment","dcpav-service-epic",0},{"name","AppleDCPDP2HDMI",0},{"EPICUnit",NULL,5},{"interface-id",NULL,13}};
+    parse_ctx=(struct dcp_parse_ctx){.items=both,.count=4};
+    assert(!parse_epic_service_init(&parse_ctx,&parsed_name,&parsed_class,&parsed_unit,true,true));assert(parsed_unit==5);
+    free((void *)parsed_name);free((void *)parsed_class);
+    parse_ctx=(struct dcp_parse_ctx){.items=both,.count=4};
+    assert(!parse_epic_service_init(&parse_ctx,&parsed_name,&parsed_class,&parsed_unit,true,false));assert(parsed_unit==13);
     free((void *)parsed_name);free((void *)parsed_class);
     ep.wq=&ep;ep.command_tags=calloc(AFKV2_INTERFACES,1);assert(ep.command_tags);
     struct apple_epic_service *old=prepare(1,1,name,class);assert(old);publish(old,1);
@@ -574,6 +586,7 @@ typedef int64_t s64;
 #define ERR_PTR(x) ((void *)(intptr_t)(x))
 #define PTR_ERR(x) ((int)(intptr_t)(x))
 #define IS_ERR(x) ((uintptr_t)(x) > (uintptr_t)-4096)
+#define IS_ERR_OR_NULL(p) (!(p) || IS_ERR(p))
 #define spin_lock_irqsave(p,f) do { assert(!*(p)); *(p)=true; (f)=0; } while(0)
 #define spin_unlock_irqrestore(p,f) do { (void)(f); assert(*(p)); *(p)=false; } while(0)
 #define lockdep_assert_held(p) assert(*(p))
@@ -797,6 +810,7 @@ typedef uint64_t u64;
 #define kfree(p) free(p)
 #define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))
 #define INIT_WORK(p,f) ((p)->fn=(f))
+#define IS_ERR_OR_NULL(x) (!(x) || (uintptr_t)(x) > (uintptr_t)-4096)
 #define dev_warn(...) ((void)0)
 #define DCP_FW_VER 26
 #define DCP_FW_VERSION(a,b,c) (a)
@@ -1024,7 +1038,9 @@ def startup(root):
 #define DCP_IOMFB_METHODS_H17P_EXTERNAL 2
 #define DPAVSERV_ENDPOINT 0x28
 #define DPAVSERV_ENDPOINT_V2 0x2a
+#define DCP_FIRMWARE_V_27_0 7
 #define IS_ERR(p) ((uintptr_t)(p) > (uintptr_t)-4096)
+#define IS_ERR_OR_NULL(p) (!(p) || IS_ERR(p))
 #define PTR_ERR(p) ((int)(intptr_t)(p))
 #define ERR_PTR(e) ((void *)(intptr_t)(e))
 #define dev_warn(...) do { warnings++; } while (0)
@@ -1040,6 +1056,7 @@ struct apple_dcp {
     struct { int iomfb_method_profile; bool fw_14_7_endpoints; } hw; bool ext_dead,external_native;
     struct { unsigned enable_completion; bool enabled; } dcpavserv;
     struct apple_dcp_afkep *dcpavservep;
+    int fw_compat;
 };
 static const unsigned dpavservep_ops[] = {0};
 static struct apple_dcp_afkep endpoint;
@@ -1099,7 +1116,14 @@ int main(void)
             init_error=0;
         }
     }
-    puts("PASS optional legacy discovery, AFKV2 early/absent service, endpoint failures");
+    /* Firmware 27 speaks AFKV2 on the legacy endpoint and does not wait. */
+    struct apple_dcp v27={.fw_compat=DCP_FIRMWARE_V_27_0};
+    announce=false;waits=warnings=starts=shutdowns=detaches=debug=0;
+    assert(dpavservep_init(&v27)==0);
+    assert(starts==1&&!waits&&!warnings&&!shutdowns&&!detaches&&!debug);
+    assert(v27.dcpavservep==&endpoint&&endpoint.wire_v2&&!endpoint.inline_v2);
+    assert(endpoint.endpoint==DPAVSERV_ENDPOINT&&!v27.dcpavserv.enabled);
+    puts("PASS optional legacy discovery, AFKV2 early/absent service, firmware 27, endpoint failures");
     return 0;
 }
 '''

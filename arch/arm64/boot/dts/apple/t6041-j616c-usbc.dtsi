@@ -1,0 +1,90 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * USB-C DisplayPort on the J616c's left-front port (typec1): dcpext1, the
+ * ATC1 display crossbar and atcphy1 in DP alt mode, driven by hpm1.
+ *
+ * dcpext1, its DARTs, mailbox, crossbar and Type-C route are disabled, as
+ * for HDMI: the display gate enables them once the boot loader has filled
+ * dcpext1's firmware memory. A disabled route is no mode switch, so typec1
+ * then keeps USB and PD as before.
+ */
+
+/ {
+	aliases {
+		dcpext1 = &dcpext1;
+	};
+
+	reserved-memory {
+		/*
+		 * The loader replaces this placeholder with the internal DCP's
+		 * TEXT, which the external processors share, as on the M4 Pro.
+		 */
+		dcpext1_text: dcpext1-text {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+
+		dcpext1_data: dcpext1-data {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+
+		dcpext1_heap: dcpext1-heap {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+	};
+};
+
+&dcpext1 {
+	apple,iomfb-surfaces = <1 1 0 0>;
+	apple,connector-type = "USB-C";
+	phys = <&atcphy1 PHY_TYPE_DP>;
+	phy-names = "typec1";
+	mux-controls = <&atcphy1_xbar 0>;
+	mux-control-names = "typec1";
+	/* indexed by route */
+	apple,typec-dptx-phys = <0 1 2>;
+	apple,typec-mux-indices = <2 2 2>;
+	memory-region = <&dcpext1_text>, <&dcpext1_data>, <&dcpext1_heap>;
+	memory-region-names = "text", "data", "heap";
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		route@1 {
+			reg = <1>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext1_typec1: endpoint {
+					remote-endpoint = <&typec1_dcpext1>;
+				};
+			};
+		};
+	};
+};
+
+&typec1 {
+	ports {
+		port@3 {
+			reg = <3>;
+			typec1_dcpext1: endpoint {
+				remote-endpoint = <&dcpext1_typec1>;
+			};
+		};
+	};
+};
+
+&atcphy1 {
+	mode-switch;
+	orientation-switch;
+};

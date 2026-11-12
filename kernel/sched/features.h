@@ -135,6 +135,13 @@ SCHED_FEAT(WA_BIAS, true)
  */
 SCHED_FEAT(UTIL_EST, true)
 
+/*
+ * On asymmetric CPU capacity systems, swap a task that has been stuck as a
+ * misfit on a smaller CPU with a task on a busy bigger CPU, so equal tasks
+ * get an equal share of the big CPUs.
+ */
+SCHED_FEAT(MISFIT_ROTATE, true)
+
 SCHED_FEAT(LATENCY_WARN, false)
 
 /*

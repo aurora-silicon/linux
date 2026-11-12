@@ -24,6 +24,34 @@ allOf:
     then:
       required:
         - power-domains
+  - if:
+      not:
+        properties:
+          status:
+            const: disabled
+        required:
+          - status
+    then:
+      required:
+        - resets
+        - usb-role-switch
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6050-dwc3
+    then:
+      properties:
+        reg:
+          minItems: 3
+        reg-names:
+          minItems: 3
+    else:
+      properties:
+        reg:
+          maxItems: 3
+        reg-names:
+          maxItems: 3
 
 $defs:
   apple,tunable:
@@ -37,7 +65,7 @@ $defs:
         - description: Bits to be set after applying the mask
     description: >
       Controller table from the device's Apple device tree, applied after
-      every core reset (T6040).
+      every core reset (T6040, T6050).
 
 properties:
   compatible:
@@ -46,8 +74,12 @@ properties:
           - enum:
               - apple,t6000-dwc3
               - apple,t6020-dwc3
+              - apple,t6030-dwc3
+              - apple,t6031-dwc3
               - apple,t6040-dwc3
+              - apple,t6050-dwc3
               - apple,t8112-dwc3
+              - apple,t8122-dwc3
               - apple,t8140-dwc3
               - apple,t8142-dwc3
           - const: apple,t8103-dwc3
@@ -59,7 +91,9 @@ properties:
     items:
       - description: Core DWC3 region
       - description: Apple-specific DWC3 region
-      - description: Controller configuration block (T6040)
+      - description: Controller configuration block (T6040, T6050)
+      - description: Bulk fabric block (T6050)
+      - description: AUSBC debug block (T6050)
 
   reg-names:
     minItems: 2
@@ -67,6 +101,8 @@ properties:
       - const: dwc3-core
       - const: dwc3-apple
       - const: drd-cfg
+      - const: drd-bulk
+      - const: drd-ausbc
 
   interrupts:
     maxItems: 1
@@ -100,14 +136,33 @@ properties:
     $ref: "#/$defs/apple,tunable"
     description: Tunables applied to the link registers of the Apple region.
 
+  apple,tunable-cio:
+    $ref: "#/$defs/apple,tunable"
+    description:
+      Tunables applied to the CIO registers of the Apple region, from offset
+      0x20 of that region, after the driver's fixed CIO values.
+
+  apple,tunable-bulk:
+    $ref: "#/$defs/apple,tunable"
+    description: Tunables applied to the drd-bulk region.
+
+  apple,tunable-ausbc:
+    $ref: "#/$defs/apple,tunable"
+    description: Tunables applied to the drd-ausbc region.
+
+  apple,sleep-ddr:
+    type: boolean
+    description:
+      While the controller runs as a host, a system sleep keeps DRAM for its
+      always-on side, as macOS's USB_SLP_DDR vote does from the host's start
+      to its stop.
+
 required:
   - compatible
   - reg
   - reg-names
   - interrupts
   - iommus
-  - resets
-  - usb-role-switch
 
 unevaluatedProperties: false
 

@@ -23,6 +23,11 @@ properties:
   compatible:
     oneOf:
       - description:
+          T8152 SMC post-office mailbox with counted FIFOs and interrupt
+          masking provided by the interrupt controller.
+        const: apple,t8152-smc-mailbox
+
+      - description:
           ASC mailboxes are the most common variant found on the M1 used
           for example for the display controller, the system management
           controller and the NVMe coprocessor.
@@ -37,7 +42,9 @@ properties:
               - apple,t6000-asc-mailbox
               - apple,t6020-asc-mailbox
               - apple,t6030-asc-mailbox
+              - apple,t6031-asc-mailbox
               - apple,t6041-asc-mailbox
+              - apple,t6050-asc-mailbox
           - const: apple,asc-mailbox-v4
 
       - description:
@@ -61,12 +68,29 @@ properties:
           M3 GPU ASC mailboxes with no generic mailbox fallback. This keeps
           older kernels from binding before the GPU handoff is supported.
         enum:
+          - apple,t6030-agx-asc-mailbox
           - apple,t6031-agx-asc-mailbox
           - apple,t8122-agx-asc-mailbox
 
       - description:
           AOP setup-port mailbox with a separate register layout.
         const: apple,t8140-aop-setup-mailbox
+
+      - description:
+          A coprocessor's secure RTBuddy port, the ADT's
+          iop,secure-rtbuddy-proxy. It is polled, with no interrupts described.
+        items:
+          - enum:
+              - apple,t8140-secure-rtbuddy-proxy
+          - const: apple,secure-rtbuddy-proxy
+
+      - description:
+          Later AOP setup-port mailboxes with the T8140 register layout.
+        items:
+          - enum:
+              - apple,t6050-aop-setup-mailbox
+              - apple,t8142-aop-setup-mailbox
+          - const: apple,t8140-aop-setup-mailbox
 
       - description:
           An older ASC mailbox interface found on T2 and A11 that is also
@@ -114,11 +138,43 @@ properties:
   resets:
     maxItems: 1
 
+  apple,hold-rx-in-sleep:
+    description:
+      Messages from this coprocessor need not wake the system. The OS may
+      leave them in the receive FIFO while the system sleeps and handle
+      them at resume.
+    type: boolean
+
   power-domains:
     minItems: 1
     maxItems: 2
 
 allOf:
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              const: apple,secure-rtbuddy-proxy
+    then:
+      required:
+        - interrupts
+        - interrupt-names
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8152-smc-mailbox
+    then:
+      properties:
+        interrupts:
+          minItems: 2
+          maxItems: 2
+        interrupt-names:
+          items:
+            - const: send-empty
+            - const: recv-not-empty
+
   - if:
       properties:
         compatible:
@@ -167,6 +223,7 @@ allOf:
                 - apple,t6021-ane-mailbox
                 - apple,t8112-ane-mailbox
                 - apple,t8140-aop-setup-mailbox
+                - apple,t8152-smc-mailbox
     then:
       properties:
         interrupts:
@@ -181,8 +238,6 @@ allOf:
 required:
   - compatible
   - reg
-  - interrupts
-  - interrupt-names
   - "#mbox-cells"
 
 additionalProperties: false

@@ -152,6 +152,10 @@
  * status the partner sent last (DP Status Update or Attention).
  */
 #define SN201202X_INT_DP_SID_UPDATE			BIT_ULL(37)
+/* The controller has a new liquid-detection status snapshot. */
+#define SN201202X_INT_LDCM_UPDATE			BIT_ULL(61)
+
+#define SN201202X_LDCM_STATUS_LEN	55
 
 /* TPS_REG_SYSTEM_POWER_STATE states */
 #define TPS_SYSTEM_POWER_STATE_S0	0x00
@@ -313,6 +317,21 @@ enum tipd_hw_variant {
 
 struct tps6598x;
 
+struct tipd_contaminant_ops {
+	int (*update)(struct tps6598x *tps);
+	/* update(), retried in the background on failure; tps->lock held */
+	void (*refresh)(struct tps6598x *tps);
+	void (*event)(struct tps6598x *tps);
+	void (*invalidate)(struct tps6598x *tps);
+	void (*stop)(struct tps6598x *tps);
+};
+
+struct sn201202x_ldcm_ops {
+	int (*read)(void *ctx, enum typec_contaminant *contaminant);
+	int (*set_mitigation)(void *ctx, bool enable);
+	void (*publish)(void *ctx, enum typec_contaminant contaminant);
+};
+
 struct tipd_data {
 	irq_handler_t irq_handler;
 	u64 irq_mask1;
@@ -363,15 +382,21 @@ struct tps6598x {
 	enum power_supply_usb_type usb_type;
 
 	int wakeup;
+	/* Handles events while the system sleeps, if the variant can filter them */
+	bool (*sleep_event)(struct tps6598x *tps);
 	u32 status; /* status reg */
 	u32 data_status;
 	u16 pwr_status;
 	struct delayed_work	wq_poll;
 
 	const struct tipd_data *data;
+	const struct tipd_contaminant_ops *contaminant_ops;
+	enum typec_contaminant contaminant;
 
 	struct tipd_debugfs *debugfs;
 	struct typec_altmode *partner_altmode_dp;
+	/* USB remote wake armed on this port for the sleep (USBw). */
+	bool usbw_armed;
 };
 
 /* TPS_REG_USB4_STATUS */
@@ -434,16 +459,29 @@ struct cd321x {
 	struct typec_thunderbolt_switch *tbt_switch;
 	struct notifier_block tbt_notifier;
 	bool tbt_notifier_registered;
+	/* Router that had not bound at probe: look it up when a switch registers */
+	struct fwnode_handle *tbt_fwnode;
+	struct notifier_block tbt_watch;
+	struct work_struct tbt_attach_work;
+	bool tbt_watch_registered;
 	atomic_t link_event;
 	atomic_t ready_event;
 	atomic_t restore_event;
 	bool display_route_active;
+	/* The sleep's debug link cut reset this controller: its setup is expected. */
+	bool reset_by_cut;
+	/* The debug link is still to be rearmed after a cut, and the tries so far */
+	bool rearm_pending;
+	unsigned int rearm_tries;
+	/* Resets taken since the cut for a contract the partner dropped, see cd321x_rearm_work() */
+	unsigned int rearm_resets;
 	bool dp_sink_reported;
 	bool dp_irq_hpd;
 
 	struct cd321x_status update_status;
 	struct delayed_work update_work;
 	struct delayed_work resume_work;
+	struct delayed_work rearm_work;
 	struct cd321x_pm_state pm;
 	struct usb_pd_identity cur_partner_identity;
 	bool cur_partner_is_pd;
@@ -459,6 +497,17 @@ struct sn201202x {
 	struct completion sleep_completion;
 	struct completion wake_completion;
 	struct spmi_device *sdev;
+	/* Links that wake the system, while the controller's events are filtered */
+	u32 sleep_links;
+	bool sleep_watch;
+	/* Busy-wait: in suspend-to-idle a sleeping wait outlasts the timers */
+	bool atomic;
+	/* Failed tries to sleep while idle since it last slept, gave up or was accessed */
+	unsigned int sleep_tries;
+	struct delayed_work ldcm_work;
+	bool ldcm_mitigated;
+	/* ldcm_mitigated matches the controller (unknown after a reset) */
+	bool ldcm_mitigation_known;
 };
 
 extern const struct tipd_data *tipd_hw_variants[];
@@ -473,16 +522,38 @@ int tipd_resume(struct tps6598x *tps);
 
 /* Internal to tps6598x-core */
 int tps6598x_block_read(struct tps6598x *tps, u8 reg, void *val, size_t len);
+/* What the system-sleep event filter of a port reads */
+struct cd321x_sleep_state {
+	u32 data_status;
+	u32 status;
+	/* A power source this port sinks from is capable of USB communication */
+	bool usb_comm;
+	bool contaminant_event;
+};
+
+int cd321x_sleep_events(struct tps6598x *tps, struct cd321x_sleep_state *st);
+void tipd_usb_wake(struct tps6598x *tps, bool asleep);
 int tps6598x_exec_cmd_tmo(struct tps6598x *tps, const char *cmd,
 			  size_t in_len, const u8 *in_data,
 			  size_t out_len, u8 *out_data,
 			  u32 cmd_timeout_ms, u32 res_delay_ms);
 
+struct tipd_debugfs {
+	struct dentry *dentry;
+	/*
+	 * Open "command" files that entered "DBMa"; written under tps->lock,
+	 * read without it by tipd_debugfs_dbma_held()
+	 */
+	unsigned int dbma_holders;
+};
+
 #ifdef CONFIG_DEBUG_FS
+bool tipd_debugfs_dbma_held(struct tps6598x *tps);
 void tipd_debugfs_register(struct tps6598x *tps);
 void tipd_debugfs_unregister(struct tps6598x *tps);
 void tipd_debugfs_exit(void);
 #else
+static inline bool tipd_debugfs_dbma_held(struct tps6598x *tps) { return false; }
 static inline void tipd_debugfs_register(struct tps6598x *tps) { }
 static inline void tipd_debugfs_unregister(struct tps6598x *tps) { }
 static inline void tipd_debugfs_exit(void) { }
@@ -490,11 +561,27 @@ static inline void tipd_debugfs_exit(void) { }
 
 #if IS_ENABLED(CONFIG_KUNIT)
 void cd321x_init_work(struct cd321x *cd321x);
+int cd321x_init_mux(struct cd321x *cd321x);
+void cd321x_stop_work(struct cd321x *cd321x);
 bool cd321x_tbt_switch_keep_waiting(struct device *dev);
 struct typec_thunderbolt_switch *
-cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode);
+cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode,
+		      bool *late);
+int cd321x_tbt_watch_late(struct cd321x *cd321x, struct fwnode_handle *fwnode);
 int sn201202x_suspend(struct device *dev);
 int sn201202x_resume(struct device *dev);
+int sn201202x_runtime_suspend(struct device *dev);
+int sn201202x_runtime_resume(struct device *dev);
+void sn201202x_idle_sleep_start(struct tps6598x *tps);
+void sn201202x_idle_sleep_stop(struct tps6598x *tps);
+extern const struct regmap_bus regmap_sn201202x;
+extern const struct tipd_contaminant_ops sn201202x_contaminant_ops;
+u32 sn201202x_sleep_links(const struct cd321x_sleep_state *st);
+enum typec_contaminant
+sn201202x_ldcm_decode(const u8 status[SN201202X_LDCM_STATUS_LEN]);
+int sn201202x_ldcm_update_state(void *ctx,
+				const struct sn201202x_ldcm_ops *ops,
+				enum typec_contaminant last);
 #endif
 
 #endif /* __TPS6598X_H__ */

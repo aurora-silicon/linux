@@ -12,7 +12,7 @@
 //! An index counts the firmware's DVFS states, 0 (off) to 8; its frequency is the state's
 //! table-A operating point ([`super::super::board`]), taken from the device tree.
 //!
-//! [`write`] prints the `asahi-g15/pstate` file. Its first line is what a sampler reads:
+//! [`write`] prints the `aurora-g15/pstate` file. Its first line is what a sampler reads:
 //! `pstate <index> freq_khz <kHz> source <stats|hwdata>`, from the newest power-state record
 //! seen, or HardwareDataA's current state when the stats ring has carried none.
 //!
@@ -181,7 +181,7 @@ impl fmt::Display for Khz {
     }
 }
 
-/// The `asahi-g15/pstate` file:
+/// The `aurora-g15/pstate` file:
 ///
 /// ```text
 /// pstate <index> freq_khz <kHz|unknown> source <stats|hwdata>

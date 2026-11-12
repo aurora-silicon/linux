@@ -161,6 +161,18 @@ config PHY_SNPS_EUSB2
 	  Enable support for the USB high-speed SNPS eUSB2 phy on select
 	  SoCs. The PHY is usually paired with a Synopsys DWC3 USB controller.
 
+config PHY_TI_CD2E22
+	tristate "TI CD2E22 eUSB2 repeater"
+	depends on I2C
+	depends on OF
+	select GENERIC_PHY
+	select REGMAP_I2C
+	help
+	  Enable this to support the TI CD2E22 dual eUSB2 to USB 2.0
+	  repeater. The driver applies the per-device tuning data supplied by
+	  firmware through devicetree; it does not contain fallback tuning values.
+	  The repeater is used between an eUSB2 PHY and a legacy USB 2.0 link.
+
 config PHY_XGENE
 	tristate "APM X-Gene 15Gbps PHY support"
 	depends on HAS_IOMEM && OF && (ARCH_XGENE || COMPILE_TEST)

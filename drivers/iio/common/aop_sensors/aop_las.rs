@@ -17,7 +17,21 @@ struct MsgProc;
 
 impl MessageProcessor for MsgProc {
     fn process(&self, message: &[u8]) -> Option<u64> {
-        message.get(1).map(|angle| u64::from(*angle) * MICRO)
+        // Report 1 contains a little-endian, 9-bit angle in degrees.
+        // Other report IDs carry sensor properties, not angle samples.
+        if *message.first()? != 1 {
+            return None;
+        }
+        let angle = u16::from_le_bytes([*message.get(1)?, *message.get(2)?]) & 0x1ff;
+        if angle > 360 {
+            return None;
+        }
+        Some(u64::from(angle) * MICRO)
+    }
+
+    fn scale(&self) -> Option<(i32, i32)> {
+        // IIO_ANGL uses radians: one raw count is pi / 180 radians.
+        Some((0, 17_453_293))
     }
 }
 
@@ -59,9 +73,15 @@ impl platform::Driver for IIOAopLasDriver {
         let ty = bindings::BINDINGS_IIO_ANGL;
         let data = AopSensorData::new(dev.into(), ty, MsgProc)?;
         let listener = FakehidRegistration::new(adata, service, data.clone())?;
-        let info_mask = 1 << bindings::BINDINGS_IIO_CHAN_INFO_RAW;
-        let iio =
-            IIORegistration::<MsgProc>::new(data, c"aop-sensors-las", ty, info_mask, kernel::module::this_module::<crate::LocalModule>())?;
+        let info_mask = (1 << bindings::BINDINGS_IIO_CHAN_INFO_RAW)
+            | (1 << bindings::BINDINGS_IIO_CHAN_INFO_SCALE);
+        let iio = IIORegistration::<MsgProc>::new(
+            data,
+            c"aop-sensors-las",
+            ty,
+            info_mask,
+            kernel::module::this_module::<crate::LocalModule>(),
+        )?;
         Ok(IIOAopLasDriver {
             listener,
             _iio: iio,

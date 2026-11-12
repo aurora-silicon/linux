@@ -1,0 +1,168 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Test device tree for the display gate KUnit test: the J616c's external
+ * display chains at their real paths (t604x-extdisp.dtsi,
+ * t6041-j616c-hdmi.dtsi, t6041-j616c-usbc.dtsi), disabled, and the display
+ * subsystem with the internal display's DART. There is no PMP. The data and
+ * heap regions of both processors are the boot loader's disabled
+ * placeholders, the text region the one it adds.
+ *
+ * The display subsystem is the only node that is enabled, as the internal
+ * display handoff leaves it. It sits at the root, as on the J616c, so a tree
+ * that has one does not get this applied.
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	fragment@0 {
+		target-path = "/";
+
+		__overlay__ {
+			reserved-memory {
+				dcpext0_text: dcpext0-text {
+					compatible = "apple,asc-mem";
+				};
+
+				dcpext0_data: dcpext0-data {
+					compatible = "apple,asc-mem";
+					status = "disabled";
+				};
+
+				dcpext0_heap: dcpext0-heap {
+					compatible = "apple,asc-mem";
+					status = "disabled";
+				};
+
+				dcpext1_text: dcpext1-text {
+					compatible = "apple,asc-mem";
+				};
+
+				dcpext1_data: dcpext1-data {
+					compatible = "apple,asc-mem";
+					status = "disabled";
+				};
+
+				dcpext1_heap: dcpext1-heap {
+					compatible = "apple,asc-mem";
+					status = "disabled";
+				};
+			};
+
+			power-management@502800000 {
+				power-controller@408 {
+					status = "disabled";
+				};
+			};
+
+			power-management@508300000 {
+				power-controller@e0 {
+					status = "disabled";
+				};
+
+				power-controller@168 {
+					status = "disabled";
+				};
+
+				power-controller@b8 {
+					status = "disabled";
+				};
+
+				power-controller@148 {
+					status = "disabled";
+				};
+			};
+
+			pinctrl@510824000 {
+				status = "disabled";
+			};
+
+			mailbox@39b148000 {
+				status = "disabled";
+			};
+
+			phy@39aa90000 {
+				status = "disabled";
+			};
+
+			mux@39b24c000 {
+				status = "disabled";
+			};
+
+			dcpext0_dart: iommu@3a2340000 {
+				#iommu-cells = <1>;
+				status = "disabled";
+			};
+
+			dispext0_dart: iommu@3a2300000 {
+				#iommu-cells = <1>;
+				status = "disabled";
+			};
+
+			mailbox@3a2e08000 {
+				status = "disabled";
+			};
+
+			dcp@3a2e00000 {
+				compatible = "apple,t6041-dcpext";
+				iommus = <&dcpext0_dart 23>;
+				memory-region = <&dcpext0_data>, <&dcpext0_heap>, <&dcpext0_text>;
+				status = "disabled";
+
+				piodma {
+					iommus = <&dispext0_dart 16>;
+				};
+			};
+
+			mailbox@38b148000 {
+				status = "okay";
+			};
+
+			mux@38b24c000 {
+				status = "disabled";
+			};
+
+			dcpext1_dart: iommu@602340000 {
+				#iommu-cells = <1>;
+				status = "disabled";
+			};
+
+			dispext1_dart: iommu@602300000 {
+				#iommu-cells = <1>;
+				status = "disabled";
+			};
+
+			mailbox@602e08000 {
+				status = "disabled";
+			};
+
+			dcp@602e00000 {
+				compatible = "apple,t6041-dcpext";
+				iommus = <&dcpext1_dart 23>;
+				memory-region = <&dcpext1_data>, <&dcpext1_heap>, <&dcpext1_text>;
+				status = "disabled";
+
+				typec-routes {
+					route@1 {
+						status = "disabled";
+					};
+				};
+
+				piodma {
+					iommus = <&dispext1_dart 16>;
+				};
+			};
+
+			disp_dart: iommu@a00000000 {
+				#iommu-cells = <1>;
+			};
+
+			display-subsystem {
+				compatible = "apple,display-subsystem";
+				iommus = <&disp_dart 0>;
+				status = "okay";
+			};
+		};
+	};
+};

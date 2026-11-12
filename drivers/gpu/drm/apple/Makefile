@@ -16,7 +16,7 @@ appledrm-y += iomfb_v13_3.o
 appledrm-y += iomfb_v14_7_tpl.o
 appledrm-y += iomfb_v26_6_desktop.o
 appledrm-y += iomfb_v14_7.o iomfb_v14_7_link.o
-appledrm-$(CONFIG_DRM_APPLE_DCP_T8132) += iomfb_m4.o
+appledrm-$(CONFIG_DRM_APPLE_DCP_T8132) += iomfb_m4.o t8132_ext_drm.o
 appledrm-y += iomfb_h17p.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += iomfb_h17p_test.o parser_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += apple_resume_test.o
@@ -29,6 +29,7 @@ appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_external_announce_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_external_relink_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_dropped_swap_test.o
 appledrm-y += iomfb_v26_6.o iomfb_v26_6_link.o j613_dcp_activate.o
+appledrm-y += iomfb_v27.o
 appledrm-y += epic/dpavservep.o
 appledrm-y += plane.o
 

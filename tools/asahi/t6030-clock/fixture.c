@@ -19,6 +19,8 @@ typedef uint64_t u64;
 #define dev_dbg(...) ((void)0)
 #define dev_warn(...) ((void)0)
 #define dev_err(...) ((void)0)
+#define READ_ONCE(x) (x)
+#define WRITE_ONCE(x, v) ((x) = (v))
 #define EXPORT_SYMBOL_GPL(x)
 #define APPLE_ATCPHY_MODE_USB4 1
 #define APPLE_ATCPHY_MODE_TBT 2
@@ -50,11 +52,12 @@ struct apple_dcp_typec_route {
 	u64 tunnel_generation;
 	bool xbar_up;
 	void *active_xbar;
+	u8 tunnel_rate;
 };
 struct apple_dcp {
 	int tb_lock;
 	void *dev;
-	bool dptx_tunnel, tb_clock_ok;
+	bool dptx_tunnel, tb_clock_ok, tb_clock_refused;
 	unsigned dptx_dfp_port;
 	u64 tb_generation;
 	struct apple_dcp_typec_route *active_typec_route;
@@ -73,9 +76,10 @@ static struct apple_atcphy *phy_get_drvdata(struct phy *p)
 {
 	return p->data;
 }
+static const char *machine = "apple,t6030";
 static bool of_machine_is_compatible(const char *s)
 {
-	return !strcmp(s, "apple,t6030");
+	return !strcmp(s, machine);
 }
 static void atcphy_restore_after_pd_off(struct apple_atcphy *p)
 {
@@ -114,6 +118,40 @@ static void core_mask32(struct apple_atcphy *p, unsigned off, u32 mask, u32 v)
 	       p->regs.core + off);
 }
 static int apple_atc_dp_tunnel_rate(struct phy *p, unsigned dpin, u8 rate)
+{
+	abort();
+}
+/* T6050 ATC PHY (atc-t6050-dp.c): one tunnel clock per DP IN, recorded. */
+static unsigned t6050_calls, t6050_clock;
+static u8 t6050_rate;
+static int t6050_error;
+static int apple_t6050_dp_tunnel_clock(struct phy *p, unsigned clock, u8 rate)
+{
+	assert(!strcmp(machine, "apple,t6050"));
+	t6050_calls++;
+	t6050_clock = clock;
+	t6050_rate = rate;
+	return t6050_error;
+}
+/*
+ * Production: of_device_is_compatible(dcp->dev->of_node, "apple,t8132-dcpext").
+ * These are T6030 DCPs: the T8132 dcpext paths must never be taken.
+ */
+static bool dcp_is_t8132_ext(const struct apple_dcp *dcp)
+{
+	return false;
+}
+static bool dcp_t8132_late_release(struct apple_dcp *dcp, const char *what)
+{
+	abort();
+}
+static int dcp_t8132_crossbar_down_locked(struct apple_dcp *dcp,
+					  struct apple_dcp_typec_route *route,
+					  const char *why)
+{
+	abort();
+}
+static void t8132_ext_drm_hotplug(void *dev)
 {
 	abort();
 }
@@ -176,6 +214,22 @@ static int clock_call(struct phy *phy, unsigned source, unsigned dpin, u8 rate)
 	assert(d.tb_clock_ok == (!ret && rate));
 	return ret;
 }
+/* A T6050 tunnel on DP IN @dpin; returns its route's recorded rate in @route_rate. */
+static int t6050_clock_call(struct phy *phy, unsigned dpin, u8 rate, u8 *route_rate)
+{
+	struct apple_dcp d = { .dptx_tunnel = true,
+			       .dptx_dfp_port = dpin + 1,
+			       .tb_generation = 7 };
+	struct apple_dcp_typec_route r = { .dcp = &d,
+					   .tunnel_dpin = dpin,
+					   .tunnel_generation = 7,
+					   .tunnel_rate = 0x55 };
+	d.active_typec_route = &r;
+	int ret = dcp_tunnel_set_rate(&d, phy, 0, rate);
+	assert(d.tb_clock_ok == (!ret && rate));
+	*route_rate = r.tunnel_rate;
+	return ret;
+}
 static u32 tx(void)
 {
 	return readl(registers + ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0);
@@ -196,6 +250,26 @@ int main(int argc, char **argv)
 				  .mode = APPLE_ATCPHY_MODE_USB4 };
 	running_phy = &d;
 	struct phy phy = { .ops = &apple_atc_dp_phy_ops, .data = &d };
+	if (!strcmp(name, "t6050-dpin-clocks")) {
+		/* DP IN n runs the PHY's tunnel clock n + 1; no T8122 register is touched. */
+		const u8 rates[] = { 0x14, 0x1e, 0x81, 0x82 };
+		u8 route_rate;
+		machine = "apple,t6050";
+		for (unsigned dpin = 0; dpin < 4; dpin++) {
+			assert(!t6050_clock_call(&phy, dpin, rates[dpin], &route_rate));
+			assert(t6050_calls == 2 * dpin + 1 && t6050_clock == dpin + 1 &&
+			       t6050_rate == rates[dpin] && route_rate == rates[dpin]);
+			assert(!t6050_clock_call(&phy, dpin, 0, &route_rate));
+			assert(t6050_clock == dpin + 1 && !t6050_rate && !route_rate);
+		}
+		/* A clock that failed to start leaves the route's rate alone. */
+		t6050_error = -ETIMEDOUT;
+		assert(t6050_clock_call(&phy, 2, 0x14, &route_rate) == -ETIMEDOUT &&
+		       t6050_clock == 3 && route_rate == 0x55);
+		assert(!writes && !polls && !crossbar_stops);
+		printf("PASS %s: DP IN n on tunnel clock n + 1, rate kept only when set\n", name);
+		return 0;
+	}
 	if (!strcmp(name, "wrong-generation")) {
 		hw.gen = ATCPHY_GENERATION_T8103;
 		assert(clock_call(&phy, 0, 0, 0x14) == -EOPNOTSUPP && !writes);

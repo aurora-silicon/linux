@@ -27,15 +27,18 @@ def fixture():
     runtime = (ROOT / 'runtime.rs').read_text()
     prep = (ROOT / 'preparation.rs').read_text()
     admission = (item(prep, "pub(super) struct Admission<'a>") + '\n' +
-                 item(prep, "impl<'a> Admission<'a>")).replace('pub(super) ', '').replace('super::now_ns()', 'now_ns()')
+                 item(prep, "impl<'a> Admission<'a>")).replace('pub(super) ', '').replace('super::now_ns()', 'now_ns()').replace('super::timeout::', '')
     methods = '\n'.join(item(runtime, sig) for sig in ['    fn grow_compute(', '    fn finish_uninstalled_compute('])
-    methods = methods.replace('super::object::Allocator', 'Allocator').replace('super::freelist::Pages', 'Pages')
+    methods = (methods.replace('super::object::Allocator', 'Allocator').replace('super::freelist::Pages', 'Pages')
+               .replace('super::freelist::ComputeCapacity', 'ComputeCapacity'))
     return r'''
 #![allow(dead_code)]
+use std::cell::Cell;
 use std::sync::{Mutex,MutexGuard,atomic::{AtomicBool,AtomicU64,Ordering,fence}};
 type Result<T=()> = std::result::Result<T,i32>;
 type KBox<T> = Box<T>;
 const EIO:i32=-5;const EAGAIN:i32=-11;const ENODEV:i32=-19;const EBUSY:i32=-16;const ECANCELED:i32=-125;
+const RECOVERY_WAIT_MS:u32=26_000;
 static NOW:AtomicU64=AtomicU64::new(0);static ALIAS:AtomicBool=AtomicBool::new(false);static PAGES:AtomicBool=AtomicBool::new(false);
 static RESERVED:AtomicBool=AtomicBool::new(false);static ABORTED:AtomicBool=AtomicBool::new(false);
 fn now_ns()->u64{NOW.load(Ordering::SeqCst)}
@@ -53,13 +56,16 @@ impl State{fn lock(&self)->MutexGuard<'_,Option<Box<Firmware>>>{self.0.lock().un
 struct Available;impl Available{fn observe(&self)->u64{now_ns()}fn notify(&self){}}
 struct Shared{preparations:Gate,state:State,crashed:AtomicBool,progress:Available,channels:Available}
 impl Shared{fn drm(&self)->Result<()>{Ok(())}fn queue_events(&self){}}
-struct Context;impl Context{fn vm(&self)->&(){&()}}
+struct Vm;impl Vm{fn memory_client(&self)->Option<&()>{None}}
+struct Context;impl Context{fn vm(&self)->&Vm{&Vm}}
+// A G17P compute pool is sized in blocks; the sizes only flow through here.
+type ComputeCapacity=usize;
 struct Backend{shared:Shared,context:Context,owner:u64}
 struct Allocator<'a>{dev:&'a (),uat:&'a ()}
 struct Pages;struct Alias;
 impl Pages{
- fn compute_sized(_:&Allocator<'_>,_:usize)->Result<Self>{PAGES.store(true,Ordering::SeqCst);Ok(Self)}
- fn map_client(&self,_:&())->Result<Alias>{ALIAS.store(true,Ordering::SeqCst);Ok(Alias)}
+ fn for_compute(_:&Allocator<'_>,_:ComputeCapacity,_:Option<&()>)->Result<Self>{PAGES.store(true,Ordering::SeqCst);Ok(Self)}
+ fn map_client(&self,_:&Vm)->Result<Alias>{ALIAS.store(true,Ordering::SeqCst);Ok(Alias)}
 }
 impl Drop for Pages{fn drop(&mut self){PAGES.store(false,Ordering::SeqCst);}}
 impl Drop for Alias{fn drop(&mut self){ALIAS.store(false,Ordering::SeqCst);}}
@@ -69,7 +75,7 @@ impl Queue{
  fn pool_fits(&self,_:usize)->bool{false}
  fn begin_growth(&mut self,_:&(),_:usize)->Result<bool>{Ok(false)}
  fn growth_token(&self)->Option<u64>{Some(7)}
- fn finish_growth(&mut self,_:&(),_:&mut Option<Pages>,_:&mut Option<Alias>,_:usize)->Result{Err(EAGAIN)}
+ fn finish_growth(&mut self,_:&(),_:&mut Option<Pages>,_:&mut Option<Alias>)->Result{Err(EAGAIN)}
  fn abort_growth(&mut self,t:u64)->Result<Option<bool>>{assert_eq!(t,7);ABORTED.store(true,Ordering::SeqCst);Ok(Some(self.fresh))}
 }
 impl Drop for Queue{fn drop(&mut self){if self.fresh{assert!(RESERVED.load(Ordering::SeqCst));assert!(!ALIAS.load(Ordering::SeqCst)&&!PAGES.load(Ordering::SeqCst),"growth aliases must precede fresh QID return");}}}
@@ -112,7 +118,7 @@ fn main(){
 def main():
     source = fixture()
     mutants = [('fixed', source, ''),
-               ('ignore-shared-deadline', source.replace('if now_ns() >= self.deadline', 'if false').replace('if remaining == 0 { return Err(EBUSY); }', ''), 'growth admission exceeded'),
+               ('ignore-shared-deadline', source.replace('if now_ns() >= self.deadline.get()', 'if false').replace('if remaining == 0 { return Err(EBUSY); }', ''), 'growth admission exceeded'),
                ('keep-growth-alias', source.replace('                drop(alias.take());', ''), 'growth aliases must precede')]
     with tempfile.TemporaryDirectory(prefix='g17-compute-growth-') as tmp:
         for name, code, expected in mutants:

@@ -1,6 +1,9 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
 #
+# The sensor-present ExecCondition admits interface v4 and v5; both use
+# these diag attributes for readiness and keep the same xART checks.
+#
 # Bring Touch ID up before anyone asks for a fingerprint, and say whether it
 # is ready. The first open of /dev/sep-bio activates it: the driver restores
 # the enrolled fingerprints from the enclave and brings the sensor up before
@@ -16,14 +19,21 @@
 #
 # Restored is not enough to match: a match rewrites xART session records,
 # and the xART guard (apple_sep xart_guard) refuses that where it is known
-# to, for instance on a cold-boot Mac whose Touch ID was set up with the
-# guard off. So, from diag "matching":
+# to, for instance once it has refused a write. So, from diag "matching":
 #   usable      ready: no guard runs and xART is writable;
 #   blocked     NOT ready, with the reason and, for the guard, the
 #               documented xart_guard=0 opt-out and what it gives up;
 #   unverified  restored, but whether a match can save its state is not
 #               known (a guard that has refused nothing yet, or a kernel
 #               that does not report it). Not called ready.
+#
+# When the sensor has not attached, this also looks once in this boot's
+# kernel log for the enclave refusing the calibration or the signed root
+# key (LOAD_CALIBRATION or SENSOR_ROOT_KEY refused, or the file missing).
+# It then starts aurora-touchid-setup.service, once per boot, to rebuild
+# the file from this Mac's factory data, and keeps waiting: the driver loads
+# the file again at its retry about 10 s later. A boot whose sensor attached
+# never reads the log.
 #
 # Exits 0 when Touch ID is ready, unverified or not set up on this machine,
 # and 1, with the reason, when it is not ready.
@@ -97,7 +107,31 @@ failed() {
     not_ready "$1"
 }
 
+# The enclave refused (or the driver could not find) a Touch ID file this
+# boot: start the rebuild, once per boot.
+run_dir=${AURORA_SEP_RUN:-/run/aurora-sep}
+repair_checked=
+repair_started=
+repair_once() {
+    [ -z "$repair_checked" ] || return 0
+    repair_checked=1
+    line=$({ journalctl -k -b -o cat --no-pager 2>/dev/null || dmesg 2>/dev/null; } |
+        grep -m1 -E 'sensor: ((LOAD_CALIBRATION|SENSOR_ROOT_KEY) refused|calibration refused|calibration blob [^ ]+ could not be loaded|signed root-key container [^ ]+ unavailable)')
+    [ -n "$line" ] || return 0
+    if [ -e "$run_dir/touchid-auto-rebuild" ]; then
+        log "the enclave refused a Touch ID file again ($line); the automatic rebuild already ran this boot, so not again. Run 'sudo aurora-touchid-setup --check' for details"
+        return 0
+    fi
+    mkdir -p "$run_dir" && printf '%s\n' "$line" >"$run_dir/calibration-refused" || return 0
+    log "the enclave refused a Touch ID file ($line); starting aurora-touchid-setup.service to rebuild it from this Mac's factory data"
+    systemctl start --no-block aurora-touchid-setup.service && repair_started=1
+}
+
 sensor_down() {
+    repair_once
+    if [ -n "$repair_started" ]; then
+        not_ready "sensor attach incomplete; capture unavailable ($1, sensor $(attr sensor)). A rebuild of the Touch ID file was started after the enclave refused it; the driver loads the new file at the next enrolment or verify, or reboot"
+    fi
     not_ready "sensor attach incomplete; capture unavailable ($1, sensor $(attr sensor))"
 }
 
@@ -111,8 +145,6 @@ blocked_reason() {
         echo "the xART guard (level $(attr xart_guard)) refused $refusals write(s) of records this Linux install did not create. $optout"
     elif [ "$(attr xart_guard_list)" = unavailable ]; then
         echo "the xART guard could not load its list of Linux's records, so it refuses every session write. $optout"
-    elif [ "$(attr boot)" = cold ]; then
-        echo "on this cold-boot Mac the keybag can only be created with the xART guard off, so the session records a match rewrites are not on the guard's list. $optout"
     else
         echo "the xART guard refuses a match's write. $optout"
     fi
@@ -133,13 +165,40 @@ restored() {
 
 # fprintd answers only what PAM asks it. Where authselect manages PAM (Fedora),
 # fingerprints stay unused until its with-fingerprint feature is on; that is
-# the user's choice, so only say how to make it.
+# the user's choice, so by default only say how to make it.
+#
+# A distribution whose GNOME settings then hide and lock Fingerprint Login
+# sets AURORA_SEP_OFFER_FINGERPRINT=1 (a drop-in for aurora-sep-ready.service).
+# On a Mac with a sensor this then turns the feature on once, so that the
+# option is there: the lock screens, sudo and polkit take a finger (a vendor
+# profile can keep it from the console login and su). Whether to enrol and use
+# a finger stays the user's choice. The marker records that this was done, so
+# a later "authselect disable-feature with-fingerprint" is never undone.
 pam_hint() {
+    command -v authselect >/dev/null 2>&1 || return 0
     features=$(authselect current --raw 2>/dev/null) || return 0
+    marker=${AURORA_SEP_STATE_DIR:-/var/lib/aurora-sep}/fingerprint-sign-in-offered
     case " $features " in
-        *" with-fingerprint "*) ;;
-        *) log "PAM does not use fingerprints; for Touch ID at sudo, polkit and the lock screen, run: sudo authselect enable-feature with-fingerprint" ;;
+    *" with-fingerprint "*)
+        [ "${AURORA_SEP_OFFER_FINGERPRINT:-0}" != 1 ] || [ -e "$marker" ] ||
+            printf "" >"$marker" 2>/dev/null || :
+        return 0
+        ;;
     esac
+    if [ "${AURORA_SEP_OFFER_FINGERPRINT:-0}" != 1 ]; then
+        log "PAM does not use fingerprints; for Touch ID at sudo, polkit and the lock screen, run: sudo authselect enable-feature with-fingerprint"
+        return 0
+    fi
+    if [ -e "$marker" ]; then
+        log "fingerprint sign-in is turned off; to turn it on, run: sudo authselect enable-feature with-fingerprint"
+        return 0
+    fi
+    if authselect enable-feature with-fingerprint >/dev/null 2>&1; then
+        printf "" >"$marker" 2>/dev/null || :
+        log "fingerprint sign-in is available; enrol a finger in Settings to use it"
+    else
+        log "could not turn on authselect's with-fingerprint feature"
+    fi
 }
 
 if [ ! -c "$dev" ]; then
@@ -198,7 +257,9 @@ while :; do
         esac
         ;;
     esac
-    # unknown or retrying: the driver is still at it.
+    # unknown or retrying: the driver is still at it. A retry after a
+    # refused file only helps once the file is rebuilt, so start that now.
+    [ "$attach" = retrying ] && repair_once
     [ "$(elapsed)" -lt "$wait_s" ] ||
         sensor_down "still $attach after ${wait_s} s"
     sleep 0.5

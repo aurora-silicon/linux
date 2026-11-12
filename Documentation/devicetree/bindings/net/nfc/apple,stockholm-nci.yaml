@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/net/nfc/apple,stockholm-nci.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple Stockholm NFC controller and Secure Element over SPMI
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  Stockholm is an NCI NFC controller with an embedded Secure Element,
+  connected to the SoC as a follower on a dedicated SPMI bus. NCI packets
+  are written to and read from non-incrementing FIFO registers of the
+  follower. The follower raises host-wake, data-ready and error interrupts
+  through the SPMI controller, and an enable line (VEN) selects between
+  operation and the controller's deepest power state.
+
+properties:
+  compatible:
+    const: apple,stockholm-nci
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    items:
+      - description: host wake request from the controller
+      - description: NCI packet ready in the receive FIFO
+      - description: transport error
+
+  interrupt-names:
+    items:
+      - const: host-wake
+      - const: data-ready
+      - const: error
+
+  enable-gpios:
+    maxItems: 1
+    description: VEN, the controller's enable line; low is its deepest power state.
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - interrupt-names
+  - enable-gpios
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+    #include <dt-bindings/spmi/spmi.h>
+
+    spmi {
+        #address-cells = <2>;
+        #size-cells = <0>;
+
+        nfc@9 {
+            compatible = "apple,stockholm-nci";
+            reg = <9 SPMI_USID>;
+            interrupts = <229 IRQ_TYPE_EDGE_RISING>,
+                         <230 IRQ_TYPE_EDGE_RISING>,
+                         <227 IRQ_TYPE_EDGE_RISING>;
+            interrupt-names = "host-wake", "data-ready", "error";
+            enable-gpios = <&smc_gpio 14 GPIO_ACTIVE_HIGH>;
+        };
+    };

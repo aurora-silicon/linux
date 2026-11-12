@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * KUnit tests for the videobuf2 queue of the Apple ISP driver, built into
- * isp-v4l2.c. They check the queue parameters vb2 accepts and the buffer
- * limit queue_setup() enforces, without any hardware.
+ * isp-v4l2.c. They check queue parameters, buffer limits and suspended
+ * return ownership and error wakeups without any hardware.
  */
 
 #include <kunit/device.h>
 #include <kunit/test.h>
 #include <kunit/static_stub.h>
 #include <linux/bitmap.h>
+#include <linux/completion.h>
+#include <linux/kthread.h>
 
 #define ISP_TEST_FRAME_SIZE 0x1000
 
@@ -348,13 +350,182 @@ static void isp_test_imx958_last_lease_requeue(struct kunit *test)
 	}
 }
 
+/* The exposure report is found through the section table, never past it. */
+static void isp_test_meta_exposure(struct kunit *test)
+{
+	static const struct apple_isp_hw hw = { .meta_exposure = true };
+	static const struct apple_isp_hw hw_none = { };
+	struct apple_isp *isp = isp_test_alloc(test);
+	struct isp_surf meta = { .size = 0x2000 };
+	u8 *virt = kunit_kzalloc(test, meta.size, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, virt);
+	meta.virt = virt;
+	isp->hw = &hw;
+	isp->frame_gain = 256;
+
+	/* fourth table entry: the section at 0x1870 */
+	put_unaligned_le32(0x1870, virt + 0x1c);
+	put_unaligned_le32(32475, virt + 0x1870);
+	put_unaligned_le16(0x0800, virt + 0x1874);
+	put_unaligned_le16(3253, virt + 0x1876);
+	isp_meta_read_exposure(isp, &meta);
+	KUNIT_EXPECT_EQ(test, isp->frame_exposure_us, 32475);
+	KUNIT_EXPECT_EQ(test, isp->frame_gain, 3253);
+
+	/* A short header cannot supply the section-table entry. */
+	put_unaligned_le16(700, virt + 0x1876);
+	meta.size = 0x1f;
+	isp_meta_read_exposure(isp, &meta);
+	KUNIT_EXPECT_EQ(test, isp->frame_gain, 3253);
+	meta.size = 0x2000;
+	put_unaligned_le16(3253, virt + 0x1876);
+
+	/* a section that would end past the buffer is ignored */
+	put_unaligned_le32(meta.size - 4, virt + 0x1c);
+	put_unaligned_le32(1000, virt + meta.size - 4);
+	isp_meta_read_exposure(isp, &meta);
+	KUNIT_EXPECT_EQ(test, isp->frame_gain, 3253);
+
+	/* so is an unwritten section */
+	put_unaligned_le32(0x1000, virt + 0x1c);
+	isp_meta_read_exposure(isp, &meta);
+	KUNIT_EXPECT_EQ(test, isp->frame_exposure_us, 32475);
+
+	/* and firmware without the report */
+	put_unaligned_le32(0x1870, virt + 0x1c);
+	put_unaligned_le16(600, virt + 0x1876);
+	isp->hw = &hw_none;
+	isp_meta_read_exposure(isp, &meta);
+	KUNIT_EXPECT_EQ(test, isp->frame_gain, 3253);
+	isp->hw = &hw;
+	isp_meta_read_exposure(isp, &meta);
+	KUNIT_EXPECT_EQ(test, isp->frame_gain, 600);
+}
+
+/* Returned suspended buffers remain queued, but no longer outstanding. */
+static void isp_test_suspended_return(struct kunit *test)
+{
+	struct apple_isp *isp = isp_test_alloc(test);
+	struct apple_isp_hw hw = {};
+	struct isp_surf surface = {};
+	struct isp_channel chan = {};
+	struct isp_buffer *buf;
+	struct isp_buflist *bl;
+
+	isp->hw = &hw;
+	isp->fw_iova_mask = U64_MAX;
+	spin_lock_init(&isp->buf_lock);
+	INIT_LIST_HEAD(&isp->bufs_pending);
+	INIT_LIST_HEAD(&isp->bufs_submitted);
+	buf = kunit_kzalloc(test, sizeof(*buf), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+	buf->surfs[0].iova = 0x300000;
+	list_add_tail(&buf->link, &isp->bufs_submitted);
+	bl = kunit_kzalloc(test, sizeof(*bl) + sizeof(bl->buffers[0]), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, bl);
+	bl->num_buffers = 1;
+	bl->buffers[0].iovas[0] = buf->surfs[0].iova;
+	bl->buffers[0].pool_type = CISP_POOL_TYPE_RENDERED;
+	surface.iova = 0x1000;
+	surface.virt = bl;
+	surface.size = sizeof(*bl) + sizeof(bl->buffers[0]);
+	isp->bt_surf = &surface;
+	chan.req.arg0 = surface.iova;
+	chan.req.arg1 = surface.size;
+	set_bit(ISP_STATE_SLEEPING, &isp->state);
+	KUNIT_EXPECT_EQ(test, ipc_bt_handle(isp, &chan), 0);
+	KUNIT_EXPECT_TRUE(test, list_empty(&isp->bufs_submitted));
+	KUNIT_EXPECT_PTR_EQ(test, isp->bufs_pending.next, &buf->link);
+	KUNIT_EXPECT_EQ(test, isp->sequence, 0);
+}
+
+struct isp_test_wait {
+	struct vb2_queue *queue;
+	struct completion entered;
+	struct completion exited;
+	long remaining;
+};
+
+static int isp_test_queue_waiter(void *arg)
+{
+	struct isp_test_wait *w = arg;
+	DEFINE_WAIT(wait);
+
+	prepare_to_wait(&w->queue->done_wq, &wait, TASK_UNINTERRUPTIBLE);
+	complete(&w->entered);
+	w->remaining = schedule_timeout(5 * HZ);
+	finish_wait(&w->queue->done_wq, &wait);
+	complete(&w->exited);
+	while (!kthread_should_stop())
+		schedule_timeout_interruptible(HZ);
+	return 0;
+}
+
+/* Use the real vb2 error wakeup, waitqueue and startup notification lock. */
+static void isp_test_error_wakeup(struct kunit *test)
+{
+	struct apple_isp *isp = isp_test_alloc(test);
+	struct isp_test_wait w = { .queue = &isp->vbq };
+	struct task_struct *task;
+
+	spin_lock_init(&isp->buf_lock);
+	init_waitqueue_head(&isp->vbq.done_wq);
+	isp->ipc_error = -EIO;
+	apple_isp_video_error(isp);
+	KUNIT_EXPECT_FALSE(test, isp->vbq.error);
+	set_bit(ISP_STATE_STREAMING, &isp->state);
+	isp->ipc_error = 0;
+	apple_isp_video_error(isp);
+	KUNIT_EXPECT_FALSE(test, isp->vbq.error);
+	init_completion(&w.entered);
+	init_completion(&w.exited);
+	task = kthread_run(isp_test_queue_waiter, &w, "isp-test-wait");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(task));
+	wait_for_completion(&w.entered);
+	isp->ipc_error = -EIO;
+	apple_isp_video_error(isp);
+	wait_for_completion(&w.exited);
+	kthread_stop(task);
+	KUNIT_EXPECT_TRUE(test, isp->vbq.error);
+	KUNIT_EXPECT_GT(test, w.remaining, 0L);
+}
+
+static void isp_test_exposure_control_gate(struct kunit *test)
+{
+	static const struct apple_isp_hw hw_none = { };
+	static const struct apple_isp_hw hw = { .meta_exposure = true };
+	struct apple_isp *isp = isp_test_alloc(test);
+
+	v4l2_ctrl_handler_init(&isp->ctrl_handler, 3);
+	isp->hw = &hw_none;
+	isp_init_exposure_ctrls(isp);
+	KUNIT_EXPECT_PTR_EQ(test, isp->gain, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, isp->exposure, NULL);
+	isp->hw = &hw;
+	isp_init_exposure_ctrls(isp);
+	KUNIT_EXPECT_EQ(test, isp->ctrl_handler.error, 0);
+	KUNIT_EXPECT_NOT_ERR_OR_NULL(test, isp->gain);
+	KUNIT_EXPECT_NOT_ERR_OR_NULL(test, isp->exposure);
+	if (isp->gain)
+		KUNIT_EXPECT_EQ(test, isp->gain->flags &
+			(V4L2_CTRL_FLAG_READ_ONLY | V4L2_CTRL_FLAG_VOLATILE),
+			(u32)(V4L2_CTRL_FLAG_READ_ONLY | V4L2_CTRL_FLAG_VOLATILE));
+	v4l2_ctrl_handler_free(&isp->ctrl_handler);
+}
+
 static struct kunit_case isp_v4l2_test_cases[] = {
+	KUNIT_CASE(isp_test_meta_exposure),
+	KUNIT_CASE(isp_test_exposure_control_gate),
 	KUNIT_CASE(isp_test_imx958_last_lease_requeue),
 	KUNIT_CASE(isp_test_p010_report_defers_completion),
 	KUNIT_CASE(isp_test_p010_mode_selection),
 	KUNIT_CASE(isp_test_p010_format),
 	KUNIT_CASE(isp_test_p010_admission),
 	KUNIT_CASE(isp_test_p010_completion_identity),
+
+	KUNIT_CASE(isp_test_suspended_return),
+	KUNIT_CASE(isp_test_error_wakeup),
 	KUNIT_CASE(isp_test_queue_init),
 	KUNIT_CASE(isp_test_reqbufs_limit),
 	KUNIT_CASE(isp_test_create_bufs_limit),

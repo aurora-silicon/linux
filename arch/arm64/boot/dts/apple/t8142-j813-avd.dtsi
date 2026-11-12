@@ -1,0 +1,45 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * M5 (T8142) AVD video decoder: a "Hibiscus" AVD (macOS CAvdMcpuHibiscus,
+ * avd-version 4, tunables = avd-fw v5 tier 2). From the J813 ADT: avd reg[0]
+ * 0x2f0000000 + 0x1404000, here at the arm-io offset 0x500000000; 0x14000 each
+ * of CM3 code and SRAM, mailbox at +0x10a8000 (CAvdApCommHibiscus);
+ * IRQs 1077/1078; dart-avd at +0x1020000, IRQ 1084, SIDs 0-2; power: PMGR
+ * device AVD-SYS-V -> AVD_SYS (+0x310).
+ */
+
+&pmgr {
+	ps_avd_sys: power-controller@310 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x310 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "avd_sys";
+	};
+};
+
+&{/soc} {
+	avd: avd@501080000 {
+		compatible = "apple,t8142-avd";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1077 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1078 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_avd_sys>;
+		resets = <&ps_avd_sys>;
+		reg = <0x5 0x01080000 0x0 0x14000>,
+		      <0x5 0x01094000 0x0 0x14000>,
+		      <0x5 0x010a8000 0x0 0x4000>,
+		      <0x5 0x01100000 0x0 0x10000>;
+		reg-names = "code", "sram", "mbox", "ctrl";
+		iommus = <&avd_dart 0>, <&avd_dart 1>, <&avd_dart 2>;
+	};
+
+	avd_dart: iommu@501020000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <0x5 0x01020000 0x0 0x20000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1084 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_avd_sys>;
+	};
+};

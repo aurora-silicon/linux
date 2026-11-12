@@ -45,14 +45,14 @@ struct tb_nhi {unsigned long quirks;};
 #define BIT(n) (1UL<<(n))
 #define QUIRK_NO_SYSTEM_SLEEP BIT(5)
 struct tb {int lock;struct device dev;void*wq;struct tb_switch*root_switch;struct tb_nhi*nhi;};
-struct tb_cm {bool hotplug_active;struct work_struct dp_tunnel_work;bool dp_tunnel_pending;};
+struct tb_cm {bool hotplug_active;struct work_struct dp_tunnel_work;bool dp_tunnel_pending;struct work_struct dp_relink_run;bool dp_host_hold_shared;};
 struct domain {struct tb tb;struct tb_cm cm;};
 _Static_assert(offsetof(struct domain,cm)==sizeof(struct tb),"mock private storage adjacency");
 #define INIT_WORK(w,handler) ((w)->fn=(handler))
 struct kref {int count;};
 struct tb_path {bool reserved;};
 enum {TB_TUNNEL_DP,TB_TUNNEL_USB3};
-struct tb_tunnel {struct kref kref;struct tb*tb;struct tb_port*src_port,*dst_port;int npaths;void(*destroy)(struct tb_tunnel*);struct list_head list;int type;bool dprx_started,dprx_canceled;void(*callback)(struct tb_tunnel*,void*);void*callback_data;struct tb_path*paths[3];};
+struct tb_tunnel {struct kref kref;struct tb*tb;struct tb_port*src_port,*dst_port;int npaths;void(*destroy)(struct tb_tunnel*);struct list_head list;int type;bool dprx_started,dprx_canceled,host_relinked_up;void(*callback)(struct tb_tunnel*,void*);void*callback_data;struct tb_path*paths[3];};
 static int tb_tunnel_lock,occupied,alloc_calls,alloc_failures,alloc_successes,freed;
 static int domain_refs,pm_refs,pm_calls,pm_error,stop_during_pm,requeue_once,lock_depth;
 static int restore_calls,scan_calls,unplugged_xdomains;
@@ -114,6 +114,13 @@ static struct tb*tb_domain_get(struct tb*t){CHECK(domain_refs>=1);domain_refs++;
 static void tb_domain_put(struct tb*t){CHECK(domain_refs>1);domain_refs--;}
 static bool queue_work(void*wq,struct work_struct*w){if(w->pending)return false;w->pending=true;return true;}
 static void tb_queue_dp_tunnels(struct tb*tb);
+/* The TB_HOST_DP_SHARED_RATE re-link work is not queued in these cases. */
+static void tb_dp_relink_run(struct work_struct*w){CHECK(0);}
+/* No tunnel here was re-linked at a higher rate, and none waits for it. */
+#define TB_DP_HOST_RATE_SHARED 5400
+enum tb_dp_relink {TB_DP_RELINK_NONE,TB_DP_RELINK_WAIT,TB_DP_RELINK_NOW};
+static enum tb_dp_relink tb_dp_relink_activation(bool relinked_up,bool active){CHECK(!relinked_up);return TB_DP_RELINK_NONE;}
+static void tb_dp_relink_replay(struct tb*t){CHECK(lock_depth==1);}
 static void tb_tunnel_dp(struct tb*t){
  CHECK(lock_depth==1 && domain.cm.hotplug_active && t->root_switch);
  alloc_calls++;if(occupied)alloc_failures++;else alloc_successes++;
@@ -298,7 +305,7 @@ def main():
         raise ValueError('DPRX reference-release order changed; review extraction')
     production = '\n'.join(parts.values())
     probe = (ROOT / 'drivers/thunderbolt/tb.c').read_text()
-    probe = probe[probe.index('struct tb *tb_probe(struct tb_nhi *nhi)'):]
+    probe = probe[probe.index('static void tb_cm_init(struct tb_cm *tcm)'):]
     initializers = re.findall(r'INIT_WORK\(&tcm->\w+,\s*\w+\);', probe)
     production += '\nstatic void init_fixture(struct tb_cm*tcm){\n' + '\n'.join(initializers) + '\n}\n'
     results = {}

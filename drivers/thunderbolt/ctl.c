@@ -13,6 +13,7 @@
 #include <linux/pci.h>
 #include <linux/dmapool.h>
 #include <linux/workqueue.h>
+#include <kunit/static_stub.h>
 
 #include "ctl.h"
 
@@ -1111,8 +1112,14 @@ static int tb_cfg_get_error(struct tb_ctl *ctl, enum tb_cfg_space space,
 int tb_cfg_read(struct tb_ctl *ctl, void *buffer, u64 route, u32 port,
 		enum tb_cfg_space space, u32 offset, u32 length)
 {
-	struct tb_cfg_result res = tb_cfg_read_raw(ctl, buffer, route, port,
-			space, offset, length, ctl->timeout_msec);
+	struct tb_cfg_result res;
+
+	/* The KUnit tests read adapter registers without hardware */
+	KUNIT_STATIC_STUB_REDIRECT(tb_cfg_read, ctl, buffer, route, port, space, offset,
+				   length);
+
+	res = tb_cfg_read_raw(ctl, buffer, route, port, space, offset, length,
+			      ctl->timeout_msec);
 	switch (res.err) {
 	case 0:
 		/* Success */

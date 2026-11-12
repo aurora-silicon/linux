@@ -17,9 +17,18 @@ properties:
           - apple,agx-g13s
           - apple,agx-g14g
           - apple,agx-g14s
+          - apple,agx-g17s
           - apple,agx-t6040
+          - apple,agx-t6041
+          - apple,agx-t6050
           - apple,agx-t8132
           - apple,agx-t8140
+      - items:
+          - const: apple,agx-t8103
+          - const: apple,agx-g13g
+      - items:
+          - const: apple,agx-t8112
+          - const: apple,agx-g14g
       - items:
           - enum:
               - apple,agx-g13c
@@ -32,13 +41,23 @@ properties:
           - const: apple,agx-g14s
 
   reg:
+    minItems: 1
     maxItems: 2
 
   reg-names:
+    minItems: 1
     maxItems: 2
 
   power-domains:
     maxItems: 1
+
+  interrupts:
+    maxItems: 8
+    description:
+      The GPU block's interrupt outputs, as the ADT lists them. Only
+      described on T6050, whose GPU is not driven from Linux yet.
+
+  dma-noncoherent: true
 
   mboxes:
     minItems: 1
@@ -78,6 +97,13 @@ properties:
       Host performance controller receiving GPU submission and idle demand.
       GFX supplier power cannot represent GPU work on firmware that keeps
       its coprocessor domain powered while the cores are idle.
+
+  apple,pmp-report-entry:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: |
+      PMP report entry that tells the PMP the GPU is in use. The driver withdraws
+      this request before it lowers the GPU's power state for a system sleep, and
+      makes it again after raising it.
 
   apple,idle-off-delay-ms:
     minimum: 2
@@ -184,6 +210,14 @@ properties:
       AFR leakage. Per-chip efuse values decoded by the boot loader,
       stored as IEEE-754 binary32 bit patterns in big-endian cells.
 
+  apple,leakage-calibration-words:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 3
+    maxItems: 3
+    description:
+      Raw per-chip GPU leakage calibration words for the M5 Pro controller
+      defaults. Supplied by the boot loader, never fixed in a board DT.
+
   apple,firmware-abi:
     $ref: /schemas/types.yaml#/definitions/uint32-array
     minItems: 3
@@ -195,10 +229,77 @@ properties:
 required:
   - compatible
   - reg
-  - mboxes
-  - memory-region
 
 allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,agx-g17s
+    then:
+      description:
+        The M5 Pro GPU uses one MMIO range and two firmware mailbox roles.
+        Its firmware graph supplies the performance tables, so it has no
+        operating-point table in the board DT.
+      properties:
+        reg:
+          maxItems: 1
+        reg-names:
+          items:
+            - const: sgx
+        mboxes:
+          items:
+            - description: Primary GFX firmware mailbox
+            - description: Secondary GFX firmware mailbox
+        memory-region:
+          items:
+            - description: Region containing GPU MMU TTBs
+            - description: Region containing GPU MMU page tables
+            - description: Shared handoff structure for VM coordination
+            - description: Data segment of the loaded GPU firmware
+            - description: Firmware kernel-window page tables
+            - description: Text segment identifying the loaded GPU firmware
+        memory-region-names:
+          items:
+            - const: ttbs
+            - const: pagetables
+            - const: handoff
+            - const: fw-data
+            - const: l2-pagetables
+            - const: fw-text
+      required:
+        - power-domains
+        - reg-names
+        - memory-region-names
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,agx-t6050
+    then:
+      description:
+        The T6050 GPU block, described from the ADT /arm-io/sgx node. Its
+        firmware coprocessor is a separate node, and the GPU stays disabled
+        until the firmware handoff is supported.
+      properties:
+        reg:
+          items:
+            - description: GPU block MMIO registers
+            - description: GPU block secondary registers
+        interrupts:
+          minItems: 8
+        status:
+          const: disabled
+      required:
+        - interrupts
+        - power-domains
+        - status
+    else:
+      properties:
+        interrupts: false
+      required:
+        - mboxes
+        - memory-region
   - if:
       properties:
         compatible:
@@ -307,6 +408,15 @@ allOf:
         apple,afr-leak-coef:
           minItems: 1
           maxItems: 1
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,agx-t6040
+              - apple,agx-t6041
+    then:
+      properties:
         reg:
           items:
             - description: GFX coprocessor control registers
@@ -354,8 +464,10 @@ allOf:
             contains:
               enum:
                 - apple,agx-t6040
+                - apple,agx-t6041
                 - apple,agx-t8132
                 - apple,agx-t8140
+                - apple,agx-g17s
     then:
       properties:
         reg:
