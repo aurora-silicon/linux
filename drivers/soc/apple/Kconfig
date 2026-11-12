@@ -129,6 +129,7 @@ config APPLE_T6040_SLEEP
 	bool "Apple T6040 system sleep (refusal-first)"
 	depends on ARM64 && (ARCH_APPLE || COMPILE_TEST)
 	depends on HOTPLUG_CPU && SUSPEND
+	depends on MFD_MACSMC=y
 	select APPLE_SLEEP_REGISTRY
 	select MFD_SYSCON
 	select APPLE_TUNABLE
