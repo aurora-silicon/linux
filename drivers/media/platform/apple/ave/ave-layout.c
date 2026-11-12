@@ -858,6 +858,8 @@ const struct ave_fw_layout ave_layout_6070_11_1 = {
 		},
 		[1] = {
 			.pic_size = 0x55b0,
+			/* PICMGMT + 0xf65: write the payload to sOutput.Coded. */
+			.hevc_single_transcoder = 0x6515,
 			.hevc_use_explicit_rps = 0x6504,
 			.first_process = 0x5c88,
 			.src_neighbor_info = 0x5f30,

@@ -339,6 +339,8 @@ struct ave_proc_layout {
 	u32 crop; /* HEVC only */
 	u32 meta_size, extra, frame_size;
 	u32 low_delay; /* HEVC only: 3 with reordering off */
+	/* HEVC only: u8; one transcoder writes directly to the coded buffer. */
+	u32 hevc_single_transcoder;
 	/* HEVC only: nonzero selects the explicit short-term RPS in Process. */
 	u32 hevc_use_explicit_rps;
 	/* Per-picture reconstruction and motion-search selections. */

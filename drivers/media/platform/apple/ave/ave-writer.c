@@ -1150,6 +1150,14 @@ int ave_build_process(struct ave_ctx *ctx, u8 *cmd, size_t len,
 			u8 *slice = cmd + l->retained[0].command_offset;
 			u8 *st_rps = cmd + l->retained[1].command_offset;
 
+			/*
+			 * Two-transcoder mode writes row fragments into the two
+			 * session-wide TranscodedData surfaces. Their row lengths are
+			 * private firmware state, not fields in the coded result. Select
+			 * one transcoder so the final slice payload lands directly in
+			 * this slot's coded buffer, whose total length is result +0x180.
+			 */
+			cmd[l->hevc_single_transcoder] = 1;
 			ave_put32(slice, AVE_6070_HEVC_POC_LSB,
 				  pic.poc_lsb & AVE_6070_POC_LSB_MASK);
 			slice[AVE_6070_HEVC_SAO_LUMA] = 1;

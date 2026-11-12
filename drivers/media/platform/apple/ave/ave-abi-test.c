@@ -1058,6 +1058,7 @@ static void ave_6070_hevc_contract(struct kunit *test)
 					  false),
 			0);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + pl->frame_type), 2U);
+	KUNIT_EXPECT_EQ(test, process[pl->hevc_single_transcoder], 1U);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + 0x68), 1U);
 	KUNIT_EXPECT_EQ(test, process[0x15d], 1U);
 	KUNIT_EXPECT_EQ(test, process[0x15e], 1U);
@@ -1094,6 +1095,7 @@ static void ave_6070_hevc_contract(struct kunit *test)
 			0);
 	KUNIT_EXPECT_EQ(test,
 			get_unaligned_le32(process + pl->hevc_use_explicit_rps), 0U);
+	KUNIT_EXPECT_EQ(test, process[pl->hevc_single_transcoder], 1U);
 	KUNIT_EXPECT_EQ(test, process[0x6524], 0U);
 
 	/* Low delay advertises four equivalent {-1} SPS sets. */
