@@ -439,6 +439,7 @@ struct t6040_sleep {
 	u64 ka_on_before;		/* keep-alive bits set before the commit cleared them */
 	void __iomem *smc_wdt_deadline;
 	void __iomem *agx_gate;
+	void __iomem *s2r_lo_count;
 	void __iomem *acc_apsc[3];
 	void __iomem *tvm_ctl[8];
 	void __iomem *tvm_status[8];
@@ -1112,17 +1113,16 @@ static const u32 t6040_wake_mask[AOP_WAKE_WORDS] = {
  * 0x508370970 at quiesce. It tells "the SoC entered S2R" from "the
  * engine never finished". Read-only, with the AOP-global S2R control, wake masks and
  * wake status, at debug level: at probe, for the boot after a failed sleep, and in a dry run.
+ * Mapped once at probe: the dry run reads it with interrupts off.
  */
 #define T6040_S2R_LO_COUNT_PA	0x508370970ULL
 
 static void t6040_sleep_log_s2r_state(struct t6040_sleep *s, const char *when)
 {
-	void __iomem *c = ioremap_np(T6040_S2R_LO_COUNT_PA, 4);
-	u32 raw = c ? readl(c) : 0, m[AOP_WAKE_WORDS] = {}, st[AOP_WAKE_WORDS] = {}, ctl = 0;
+	u32 raw = s->s2r_lo_count ? readl(s->s2r_lo_count) : 0;
+	u32 m[AOP_WAKE_WORDS] = {}, st[AOP_WAKE_WORDS] = {}, ctl = 0;
 	int i;
 
-	if (c)
-		iounmap(c);
 	if (s->aop_global) {
 		ctl = readl(s->aop_global + AOP_S2R_CTRL);
 		for (i = 0; i < AOP_WAKE_WORDS; i++) {
@@ -3225,6 +3225,7 @@ static int t6040_sleep_probe(struct platform_device *pdev)
 	sleep->ka_east = t6040_ioremap_np(&pdev->dev, T6040_KA_EAST_PA, KA_SIZE);
 	sleep->smc_wdt_deadline = t6040_ioremap_np(&pdev->dev, T6040_SMC_WDT_DEADLINE_PA, 4);
 	sleep->agx_gate = t6040_ioremap_np(&pdev->dev, T6040_AGX_GATE_PA, 4);
+	sleep->s2r_lo_count = t6040_ioremap_np(&pdev->dev, T6040_S2R_LO_COUNT_PA, 4);
 	for (i = 0; i < ARRAY_SIZE(t6040_acc_apsc_pa); i++)
 		sleep->acc_apsc[i] = t6040_ioremap_np(&pdev->dev, t6040_acc_apsc_pa[i], 8);
 	for (i = 0; i < ARRAY_SIZE(t6040_tvm); i++) {
