@@ -2360,8 +2360,12 @@ static int apple_pcie_t6050_tune_host(struct apple_pcie *pcie, const char *name,
 		return 0;
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, win);
 	count = of_property_count_u32_elems(np, prop);
-	if (!res || count <= 0 || count % 4)
-		return -EINVAL;
+	if (!res)
+		return dev_err_probe(pcie->dev, -EINVAL, "tunable %s names missing reg window %s\n",
+				     prop, win);
+	if (count <= 0 || count % 4)
+		return dev_err_probe(pcie->dev, -EINVAL,
+				     "tunable %s has %d cells, want a 4-cell multiple\n", prop, count);
 	cells = kmalloc_array(count, sizeof(*cells), GFP_KERNEL);
 	if (!cells)
 		return -ENOMEM;
