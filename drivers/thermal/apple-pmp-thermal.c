@@ -28,6 +28,7 @@
 #include <linux/soc/apple/pmp-cooling.h>
 #include <linux/soc/apple/pmp-power-policy.h>
 #include <linux/soc/apple/t8132.h>
+#include <linux/suspend.h>
 #include <linux/thermal.h>
 #include <linux/workqueue.h>
 
@@ -78,6 +79,7 @@ static struct {
 	bool owner; /* apple-soc-cpufreq's unmanaged cap is released */
 	bool critical_dumped;
 	bool ready;
+	bool sleep_paused;
 } pmp_thermal = {
 	.lock = __MUTEX_INITIALIZER(pmp_thermal.lock),
 };
@@ -774,6 +776,52 @@ static int apple_pmp_thermal_probe(struct platform_device *pdev)
 	return 0;
 }
 
+/*
+ * A deep sleep stops the PMP: sampling on through it would read its sensors stopped and
+ * restrict the CPUs and the GPU for seconds after the wake. Nothing runs to heat the die
+ * from the first device callback to the last, so neither sampler runs in between.
+ */
+static int apple_pmp_thermal_prepare(struct device *dev)
+{
+	if (!pm_suspend_via_firmware())
+		return 0;
+	if (pmp_thermal.polling) {
+		hrtimer_cancel(&pmp_thermal.poll_timer);
+		cancel_work_sync(&pmp_thermal.poll_work);
+	}
+	if (pmp_thermal.power_polling)
+		cancel_delayed_work_sync(&pmp_thermal.power_work);
+	pmp_thermal.sleep_paused = true;
+	return 0;
+}
+
+static void apple_pmp_thermal_complete(struct device *dev)
+{
+	struct apple_pmp_power_policy *p = &pmp_thermal.power;
+
+	if (!pmp_thermal.sleep_paused)
+		return;
+	pmp_thermal.sleep_paused = false;
+	scoped_guard(mutex, &pmp_thermal.lock) {
+		/* The sleep is no telemetry gap, nor cool time to refill the bucket. */
+		if (p->last_ns)
+			p->last_ns = ktime_get_ns();
+		if (p->active & BIT(2))
+			apple_pmp_gpu_publish(pmp_thermal.sensors, pmp_thermal.gpu_epoch,
+					      p->level[2], p->last_ns);
+	}
+	if (pmp_thermal.power_polling)
+		schedule_delayed_work(&pmp_thermal.power_work, msecs_to_jiffies(500));
+	if (pmp_thermal.polling)
+		hrtimer_start(&pmp_thermal.poll_timer, ms_to_ktime(APPLE_PMP_POLL_MS),
+			      HRTIMER_MODE_REL);
+}
+
+static const struct dev_pm_ops apple_pmp_thermal_pm_ops = {
+	.prepare = apple_pmp_thermal_prepare,
+	.complete = apple_pmp_thermal_complete,
+};
+
 static void apple_pmp_thermal_remove(struct platform_device *pdev)
 {
 	cancel_delayed_work_sync(&pmp_thermal.setup_work);
@@ -785,6 +833,7 @@ static struct platform_driver apple_pmp_thermal_driver = {
 	.remove = apple_pmp_thermal_remove,
 	.driver = {
 		.name = "apple-pmp-thermal",
+		.pm = pm_sleep_ptr(&apple_pmp_thermal_pm_ops),
 	},
 };
 module_platform_driver(apple_pmp_thermal_driver);
