@@ -257,6 +257,28 @@ patternProperties:
         $ref: '#/$defs/tunable'
         description: Initialization tuples relative to this port's registers.
 
+      apple,apcie-config-tunables:
+        $ref: '#/$defs/t6050-tunable'
+        description:
+          T6050 tuples for the controller's config window, applied when the
+          OS trains the port itself (pwren-gpios).
+
+      apple,pcie-rc-tunables:
+        $ref: '#/$defs/t6050-tunable'
+        description: T6050 tuples for the root complex window of this port.
+
+      apple,pcie-rc-gen3-shadow-tunables:
+        $ref: '#/$defs/t6050-tunable'
+        description: T6050 root complex tuples applied for a Gen3 link.
+
+      apple,pcie-rc-gen4-shadow-tunables:
+        $ref: '#/$defs/t6050-tunable'
+        description: T6050 root complex tuples applied for a Gen4 link.
+
+      apple,pcie-rc-gen5-shadow-tunables:
+        $ref: '#/$defs/t6050-tunable'
+        description: T6050 root complex tuples applied for a Gen5 link.
+
     required:
       - interrupt-controller
       - "#interrupt-cells"
