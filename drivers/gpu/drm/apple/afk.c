@@ -1713,14 +1713,18 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 					      ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0);
 		if (ret == -ENOENT &&
 		    (ep->dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G ||
+		     (ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+		      ep->dcp->hw.firmware_compat == DCP_FIRMWARE_H17P) ||
 		     ep->dcp->v27_j714s)) {
 			/*
 			 * M5 (H17G) announces powerlog-service with only
-			 * ep-has-desc-mgr and interface-id, and firmware 27
-			 * its descriptor manager (md-manager) without EPIC
-			 * keys; match them by the announced name, as for
-			 * props-less announces. The second on the J714s only,
-			 * where its endpoints are started.
+			 * ep-has-desc-mgr and interface-id, on 26.x and on
+			 * firmware 27 alike (the T8142, an H17P-generation
+			 * processor, is the one that runs firmware 27), and
+			 * firmware 27 its descriptor manager (md-manager)
+			 * without EPIC keys; match them by the announced name,
+			 * as for props-less announces. The md-manager on the
+			 * J714s only, where its endpoints are started.
 			 */
 			epic_name = NULL;
 			epic_class = NULL;
