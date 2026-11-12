@@ -486,20 +486,28 @@ static void ave_start_put8(u8 *cmd, u32 off, u8 val)
 #define AVE_6070_POC_LSB_MASK		GENMASK(7, 0)
 
 /* Retained HEVC slice-segment fields (H.265 7.3.6.1). */
-#define AVE_6070_HEVC_POC_LSB		0x028
+#define AVE_6070_HEVC_FIRST_SLICE	0x00c	/* u8: first_slice_segment_in_pic_flag */
+#define AVE_6070_HEVC_PPS_ID		0x010	/* slice_pic_parameter_set_id */
+#define AVE_6070_HEVC_POC_LSB		0x028	/* slice_pic_order_cnt_lsb */
+#define AVE_6070_HEVC_TEMPORAL_MVP	0x11c	/* u8: slice_temporal_mvp_enabled_flag */
 #define AVE_6070_HEVC_SAO_LUMA		0x11d	/* u8: slice_sao_luma_flag */
 #define AVE_6070_HEVC_SAO_CHROMA	0x11e	/* u8: slice_sao_chroma_flag */
+#define AVE_6070_HEVC_REF_IDX_OVERRIDE	0x11f	/* u8: num_ref_idx_active_override_flag */
+#define AVE_6070_HEVC_COLLOCATED_L0	0x1aa	/* u8: collocated_from_l0_flag */
+#define AVE_6070_HEVC_FIVE_MINUS_MERGE	0x3d4	/* five_minus_max_num_merge_cand */
+/* u8: slice_loop_filter_across_slices_enabled_flag */
+#define AVE_6070_HEVC_LOOP_FILTER	0x43c
+#define AVE_6070_HEVC_SEGMENT_LIMIT	0x54c	/* maximum slice-segment CTUs */
 /* Second retained partition: the slice's short-term RPS selection. */
 #define AVE_6070_HEVC_ST_RPS_SPS_FLAG	0x000	/* u8: short_term_ref_pic_set_sps_flag */
 #define AVE_6070_HEVC_ST_RPS_IDX	0x004	/* short_term_ref_pic_set_idx */
+#define AVE_6070_HEVC_ST_RPS_EXPLICIT	0x008	/* explicit short-term RPS entry */
 
 /*
  * Start short-term RPS list: a u32 count, then one entry per set holding
  * the H.265 7.3.7 syntax followed by its 7.4.8 derived values. Arrays have
  * one element per reference; only element 0 is used here.
  */
-#define AVE_6070_HEVC_RPS_LIST_HEADER	4
-#define AVE_6070_HEVC_RPS_STRIDE	0x164
 #define AVE_6070_HEVC_RPS_NUM_NEG	0x030	/* num_negative_pics */
 #define AVE_6070_HEVC_RPS_NUM_POS	0x034	/* num_positive_pics */
 #define AVE_6070_HEVC_RPS_S0_MINUS1	0x038	/* u16 delta_poc_s0_minus1[] */
@@ -513,10 +521,6 @@ static void ave_start_put8(u8 *cmd, u32 off, u8 val)
 #define AVE_6070_HEVC_RPS_S0_DELTA	0x0e0	/* s32 DeltaPocS0[] */
 #define AVE_6070_HEVC_RPS_S1_DELTA	0x120	/* s32 DeltaPocS1[] */
 #define AVE_6070_HEVC_RPS_NUM_DELTA	0x160	/* NumDeltaPocs */
-/* Low delay: four one-reference sets; one B: alternating P {-2} / B {-1, +1}. */
-#define AVE_6070_HEVC_RPS_SETS_LOW_DELAY	4
-#define AVE_6070_HEVC_RPS_SETS_REORDER	8
-
 /* HEVC Start constants (H.265 A.3 and 7.4.3.2). */
 #define AVE_6070_HEVC_INPUT_CHROMA_FROM_SPS 16 /* bits [4:2] = 4: use SPS format */
 #define AVE_6070_HEVC_CHROMA_420		1  /* H.265 chroma_format_idc */
@@ -619,39 +623,24 @@ static void ave_6070_avc_slice(u8 *state, const struct ave_params *p,
 	ave_put32(state, AVE_6070_AVC_SLICE_QP_DELTA, qp - AVE_START_INIT_QP_VALUE);
 }
 
-static void ave_6070_hevc_rps(u8 *cmd, const struct ave_start_layout *l,
-			      bool bframes)
+static void ave_6070_hevc_rps_entry(u8 *cmd, u32 entry, u32 negative,
+				    bool positive)
 {
-	u32 sets = bframes ? AVE_6070_HEVC_RPS_SETS_REORDER :
-			     AVE_6070_HEVC_RPS_SETS_LOW_DELAY;
-
-	ave_put32(cmd, l->hevc_rps, sets);
-	for (u32 i = 0; i < sets; i++) {
-		u32 entry = l->hevc_rps + AVE_6070_HEVC_RPS_LIST_HEADER +
-			    i * AVE_6070_HEVC_RPS_STRIDE;
-		/* Odd sets of a reordered session describe the B picture. */
-		bool b_set = bframes && (i & 1);
-		/* One past picture: POC -1 (low delay, B) or -2 (P after a B). */
-		u32 negative = bframes && !b_set ? 2 : 1;
-		/* The B picture also references the next P: POC +1. */
-		u32 positive = b_set ? 1 : 0;
-
-		ave_put32(cmd, entry + AVE_6070_HEVC_RPS_NUM_NEG, 1);
-		ave_put32(cmd, entry + AVE_6070_HEVC_RPS_NUM_POS, positive);
-		ave_put16(cmd, entry + AVE_6070_HEVC_RPS_S0_MINUS1, negative - 1);
-		cmd[entry + AVE_6070_HEVC_RPS_S0_USED] = 1;
-		ave_put32(cmd, entry + AVE_6070_HEVC_RPS_NUM_NEG_D, 1);
-		ave_put32(cmd, entry + AVE_6070_HEVC_RPS_NUM_POS_D, positive);
-		cmd[entry + AVE_6070_HEVC_RPS_S0_USED_D] = 1;
-		ave_put32(cmd, entry + AVE_6070_HEVC_RPS_S0_DELTA, -negative);
-		ave_put32(cmd, entry + AVE_6070_HEVC_RPS_NUM_DELTA, 1 + positive);
-		if (!positive)
-			continue;
-		ave_put32(cmd, entry + AVE_6070_HEVC_RPS_S1_MINUS1, 0);
-		cmd[entry + AVE_6070_HEVC_RPS_S1_USED] = 1;
-		cmd[entry + AVE_6070_HEVC_RPS_S1_USED_D] = 1;
-		ave_put32(cmd, entry + AVE_6070_HEVC_RPS_S1_DELTA, 1);
-	}
+	ave_put32(cmd, entry + AVE_6070_HEVC_RPS_NUM_NEG, 1);
+	ave_put32(cmd, entry + AVE_6070_HEVC_RPS_NUM_POS, positive);
+	ave_put16(cmd, entry + AVE_6070_HEVC_RPS_S0_MINUS1, negative - 1);
+	cmd[entry + AVE_6070_HEVC_RPS_S0_USED] = 1;
+	ave_put32(cmd, entry + AVE_6070_HEVC_RPS_NUM_NEG_D, 1);
+	ave_put32(cmd, entry + AVE_6070_HEVC_RPS_NUM_POS_D, positive);
+	cmd[entry + AVE_6070_HEVC_RPS_S0_USED_D] = 1;
+	ave_put32(cmd, entry + AVE_6070_HEVC_RPS_S0_DELTA, -negative);
+	ave_put32(cmd, entry + AVE_6070_HEVC_RPS_NUM_DELTA, 1 + positive);
+	if (!positive)
+		return;
+	ave_put32(cmd, entry + AVE_6070_HEVC_RPS_S1_MINUS1, 0);
+	cmd[entry + AVE_6070_HEVC_RPS_S1_USED] = 1;
+	cmd[entry + AVE_6070_HEVC_RPS_S1_USED_D] = 1;
+	ave_put32(cmd, entry + AVE_6070_HEVC_RPS_S1_DELTA, 1);
 }
 
 int ave_init_codec_state(struct ave_session *sess)
@@ -690,11 +679,16 @@ int ave_init_codec_state(struct ave_session *sess)
 	 * added while building Process.
 	 */
 	ave_put32(state, 0x000, AVE_6070_HEVC_SLICE_BYTES);
-	state[0x00c] = 1; /* first slice segment in picture */
-	state[0x1aa] = 1; /* collocated picture comes from list 0 */
-	ave_put32(state, 0x3d4, 3); /* five minus maximum merge candidates */
-	ave_put32(state, 0x54c, U32_MAX); /* no slice-segment limit */
-	ave_put32(state, 0x550, U32_MAX); /* no dependent-segment limit */
+	state[AVE_6070_HEVC_FIRST_SLICE] = 1;
+	ave_put32(state, AVE_6070_HEVC_PPS_ID, 0);
+	state[AVE_6070_HEVC_TEMPORAL_MVP] = 0;
+	state[AVE_6070_HEVC_REF_IDX_OVERRIDE] = 0;
+	state[AVE_6070_HEVC_COLLOCATED_L0] = 1;
+	ave_put32(state, AVE_6070_HEVC_FIVE_MINUS_MERGE, 3);
+	state[AVE_6070_HEVC_LOOP_FILTER] = 0;
+	ave_put32(state, AVE_6070_HEVC_SEGMENT_LIMIT, U32_MAX);
+	/* The following word is the dependent-segment limit. */
+	ave_put32(state, AVE_6070_HEVC_SEGMENT_LIMIT + 4, U32_MAX);
 	return 0;
 }
 
@@ -1052,7 +1046,8 @@ static void ave_start_config(const struct ave_params *p, u8 *cmd,
 	ave_start_put8(cmd, l->hevc_pps_fw_header, 1);
 	ave_start_put32(cmd, l->hevc_pps_header_len, 0);
 	if (fw->kind == AVE_LAYOUT_6070)
-		ave_6070_hevc_rps(cmd, l, p->bframes);
+		/* Per-picture Process state carries the explicit short-term RPS. */
+		ave_start_put32(cmd, l->hevc_rps, 0);
 }
 
 int ave_build_start(struct ave_ctx *ctx, u8 *cmd, size_t len)
@@ -1129,19 +1124,30 @@ int ave_build_process(struct ave_ctx *ctx, u8 *cmd, size_t len,
 					   &pic, sess->frames);
 		} else {
 			u8 *slice = cmd + l->retained[0].command_offset;
-
 			u8 *st_rps = cmd + l->retained[1].command_offset;
+			u32 explicit = AVE_6070_HEVC_ST_RPS_EXPLICIT;
+			u32 negative;
+			bool positive;
 
 			ave_put32(slice, AVE_6070_HEVC_POC_LSB,
 				  pic.poc_lsb & AVE_6070_POC_LSB_MASK);
 			slice[AVE_6070_HEVC_SAO_LUMA] = 1;
 			slice[AVE_6070_HEVC_SAO_CHROMA] = 1;
-			/* Inter pictures select a Start RPS; the IDR uses none. */
+			/*
+			 * Keep the header writer and reference manager on the same
+			 * explicit set. A reordered P refers to POC -2; its B refers
+			 * to the surrounding anchors at POC -1 and +1.
+			 */
 			if (pic.type == AVE_6070_PICTURE_P ||
 			    pic.type == AVE_6070_PICTURE_B) {
-				st_rps[AVE_6070_HEVC_ST_RPS_SPS_FLAG] = 1;
+				st_rps[AVE_6070_HEVC_ST_RPS_SPS_FLAG] = 0;
 				ave_put32(st_rps, AVE_6070_HEVC_ST_RPS_IDX, 0);
+				negative = p->bframes && pic.type == AVE_6070_PICTURE_P ? 2 : 1;
+				positive = pic.type == AVE_6070_PICTURE_B;
+				ave_6070_hevc_rps_entry(st_rps, explicit, negative, positive);
 			}
+			/* Nonzero makes firmware consume the explicit Process RPS. */
+			ave_put32(cmd, l->hevc_explicit_rps, 1);
 		}
 		ave_put32(cmd, l->pic_size, 0xf68);
 		if (p->bit_depth == 8) {
