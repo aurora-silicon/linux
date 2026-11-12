@@ -6,13 +6,30 @@
  *   Copyright 2016, 2022 Cirrus Logic, Inc.
  */
 
+#include <linux/cleanup.h>
+#include <linux/completion.h>
 #include <linux/i2c.h>
+#include <linux/jiffies.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/regmap.h>
 #include <linux/slab.h>
 #include <linux/types.h>
+#include <sound/soc.h>
 
 #include "cs42l42.h"
+
+/*
+ * The register restore after a sleep is about 100 ms of I2C writes, and the PM core waits
+ * for every device resume before user space thaws. ASoC holds the card from user space
+ * until its own deferred resume, so the restore runs from there when ASoC suspended the
+ * codec. 0 restores in the device's resume, as before.
+ */
+static bool defer_restore = true;
+module_param(defer_restore, bool, 0644);
+MODULE_PARM_DESC(defer_restore, "Restore the registers after a sleep from ASoC's card resume");
+
+#define CS42L83_POWERED_WAIT_MS 1000
 
 static const struct reg_default cs42l83_reg_defaults[] = {
 	{ CS42L42_FRZ_CTL,			0x00 },
@@ -164,9 +181,48 @@ static const struct regmap_config cs42l83_regmap = {
 	.use_single_write = true,
 };
 
+static void cs42l83_restore_locked(struct cs42l42_private *cs42l83)
+{
+	lockdep_assert_held(&cs42l83->restore_lock);
+	if (!cs42l83->restore_pending)
+		return;
+	cs42l83->restore_pending = false;
+	cs42l42_resume_restore(cs42l83->dev);
+}
+
+/* ASoC suspends the codec only while it's idle, and resumes it from its card resume. */
+static int cs42l83_component_suspend(struct snd_soc_component *component)
+{
+	struct cs42l42_private *cs42l83 = snd_soc_component_get_drvdata(component);
+
+	guard(mutex)(&cs42l83->restore_lock);
+	cs42l83->asoc_suspended = true;
+	return 0;
+}
+
+/*
+ * From ASoC's deferred card resume, before DAPM and before user space may use the card. It
+ * can come before the device's resume has powered the codec up: wait for that. Whichever
+ * order the two take the lock in, the restore runs once, on a powered codec.
+ */
+static int cs42l83_component_resume(struct snd_soc_component *component)
+{
+	struct cs42l42_private *cs42l83 = snd_soc_component_get_drvdata(component);
+
+	if (!wait_for_completion_timeout(&cs42l83->powered,
+					 msecs_to_jiffies(CS42L83_POWERED_WAIT_MS)))
+		dev_dbg(cs42l83->dev, "card resumed before the codec\n");
+
+	guard(mutex)(&cs42l83->restore_lock);
+	cs42l83->asoc_suspended = false;
+	cs42l83_restore_locked(cs42l83);
+	return 0;
+}
+
 static int cs42l83_i2c_probe(struct i2c_client *i2c_client)
 {
 	struct device *dev = &i2c_client->dev;
+	struct snd_soc_component_driver *component_drv;
 	struct cs42l42_private *cs42l83;
 	struct regmap *regmap;
 	int ret;
@@ -184,8 +240,18 @@ static int cs42l83_i2c_probe(struct i2c_client *i2c_client)
 	cs42l83->dev = dev;
 	cs42l83->regmap = regmap;
 	cs42l83->irq = i2c_client->irq;
+	mutex_init(&cs42l83->restore_lock);
+	init_completion(&cs42l83->powered);
+	complete_all(&cs42l83->powered);
 
-	ret = cs42l42_common_probe(cs42l83, &cs42l42_soc_component, &cs42l42_dai);
+	component_drv = devm_kmemdup(dev, &cs42l42_soc_component, sizeof(cs42l42_soc_component),
+				     GFP_KERNEL);
+	if (!component_drv)
+		return -ENOMEM;
+	component_drv->suspend = cs42l83_component_suspend;
+	component_drv->resume = cs42l83_component_resume;
+
+	ret = cs42l42_common_probe(cs42l83, component_drv, &cs42l42_dai);
 	if (ret)
 		return ret;
 
@@ -199,21 +265,43 @@ static void cs42l83_i2c_remove(struct i2c_client *i2c_client)
 	cs42l42_common_remove(cs42l83);
 }
 
+/* A restore still due from the last wake goes first: the shutdown runs on the codec. */
+static int cs42l83_i2c_suspend(struct device *dev)
+{
+	struct cs42l42_private *cs42l83 = dev_get_drvdata(dev);
+
+	scoped_guard(mutex, &cs42l83->restore_lock)
+		cs42l83_restore_locked(cs42l83);
+	reinit_completion(&cs42l83->powered);
+
+	return cs42l42_suspend(dev);
+}
+
 static int cs42l83_i2c_resume(struct device *dev)
 {
+	struct cs42l42_private *cs42l83 = dev_get_drvdata(dev);
+	bool defer;
 	int ret;
 
 	ret = cs42l42_resume(dev);
-	if (ret)
+	if (ret) {
+		complete_all(&cs42l83->powered);
 		return ret;
+	}
 
-	cs42l42_resume_restore(dev);
+	scoped_guard(mutex, &cs42l83->restore_lock) {
+		defer = READ_ONCE(defer_restore) && cs42l83->init_done && cs42l83->asoc_suspended;
+		cs42l83->restore_pending = defer;
+	}
+	complete_all(&cs42l83->powered);
+	if (!defer)
+		cs42l42_resume_restore(dev);
 
 	return 0;
 }
 
 static const struct dev_pm_ops cs42l83_i2c_pm_ops = {
-	SYSTEM_SLEEP_PM_OPS(cs42l42_suspend, cs42l83_i2c_resume)
+	SYSTEM_SLEEP_PM_OPS(cs42l83_i2c_suspend, cs42l83_i2c_resume)
 };
 
 static const struct of_device_id __maybe_unused cs42l83_of_match[] = {
