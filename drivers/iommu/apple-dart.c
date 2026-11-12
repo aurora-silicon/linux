@@ -6708,8 +6708,7 @@ static __maybe_unused int apple_dart_sys_resume_noirq(struct device *dev)
  * again with fresh firmware-owned roots, while the restored kernel still
  * describes the roots of the image (their mapping, their firmware snapshot
  * and the slots it had published). Every publication then fails (-EBUSY),
- * and with it every DMA mapping through the DART (observed for the PMP and
- * every DCP: "failed buffer request ... (-12)"). Re-import the live roots
+ * and with it every DMA mapping through the DART. Re-import the live roots
  * the way attach maps them, then publish the stream's page tables into them
  * again, as attach does. Firmware-owned memory is never written: the old root's
  * published slots are forgotten, not retired.
