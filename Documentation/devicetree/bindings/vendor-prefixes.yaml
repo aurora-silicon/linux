@@ -207,6 +207,8 @@ patternProperties:
     description: Atmel Corporation
   "^auo,.*":
     description: AU Optronics Corporation
+  "^aura,.*":
+    description: aura boot loader for Apple silicon
   "^aurora,.*":
     description: Aurora Silicon
   "^auvidea,.*":
