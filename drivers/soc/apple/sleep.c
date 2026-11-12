@@ -125,9 +125,6 @@
 #define HPM_CONTRACT_MS		1500
 #define HPM_RESET_TRIES		3
 
-/* A one-byte register write on the sleep's SPMI bus, to the PMU's USID */
-#define SPMI_CMD_WRITE		(BIT(15) | 0x30)
-#define SPMI_CMD_USID		GENMASK(11, 8)
 
 /* T8132's power words where they aren't T8140's */
 #define T8132_PS_ATC0_COMMON		0x378
@@ -2400,21 +2397,9 @@ static void sleep_ps_rewake_report(struct apple_sleep *s)
 
 #define T8132_PS_AON_ON_STATE	4
 
-/* As macOS writes the PMU: the reply's vector masked, then acknowledged, so none is left raised. */
 static void sleep_pmu_write(struct apple_sleep *s, u16 reg, u8 val)
 {
-	u32 status, enable;
-
-	enable = readl(s->spmi + SPMI_NOTIFY_ENABLE);
-	writel(enable & ~SPMI_NOTIFY_REPLY, s->spmi + SPMI_NOTIFY_ENABLE);
-	writel(((u32)reg << 16) | SPMI_CMD_WRITE |
-	       FIELD_PREP(SPMI_CMD_USID, s->soc->pmu_usid), s->spmi + SPMI_CMD);
-	writel(val, s->spmi + SPMI_CMD);
-	if (!readl_poll_timeout_atomic(s->spmi + SPMI_STATUS, status,
-				       !(status & SPMI_STATUS_RX_EMPTY), 1, 1000))
-		readl(s->spmi + SPMI_REPLY);
-	writel(1, s->spmi + SPMI_NOTIFY_ACK);
-	writel(enable, s->spmi + SPMI_NOTIFY_ENABLE);
+	apple_sleep_pmu_write(s->spmi, s->soc->pmu_usid, reg, val);
 }
 
 /*
