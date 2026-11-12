@@ -969,24 +969,23 @@ static int apple_smc_notice_idle(struct apple_smc *smc)
 
 /*
  * WKTP, one byte, the value for power state 0. It goes first at the sleep request,
- * ahead of the other sleep keys ('slpa' among them) and the AP idle notice, as the platform
- * does. 0 leaves it unwritten. Only for an SMC known to take it: T6041's.
+ * ahead of the other sleep keys ('slpa' among them) and the AP idle notice. Only for
+ * an SMC known to take it: T6041's.
  */
-static unsigned int sleep_wktp = 2;
-module_param(sleep_wktp, uint, 0644);
-MODULE_PARM_DESC(sleep_wktp, "WKTP value written before 'slpa' on a firmware-driven suspend (0: none)");
+#define SMC_WKTP_SLEEP		2
+/* And once a wake is a full one: see apple_smc_wake_full(). */
+#define SMC_WKTP_AWAKE		0
 
 static int apple_smc_sleep_commit(struct apple_smc *smc)
 {
-	unsigned int wktp = READ_ONCE(sleep_wktp);
 	int ret;
 
 	/* Whatever is written here, the SMC runs the wake after this silent until it is told. */
 	smc->wake_silent = true;
-	if (smc->wktp && wktp) {
-		ret = apple_smc_write_u8(smc, SMC_KEY(WKTP), wktp);
+	if (smc->wktp) {
+		ret = apple_smc_write_u8(smc, SMC_KEY(WKTP), SMC_WKTP_SLEEP);
 		if (ret)
-			dev_err(smc->dev, "Failed to write WKTP = %u: %d\n", wktp, ret);
+			dev_err(smc->dev, "Failed to write WKTP = %u: %d\n", SMC_WKTP_SLEEP, ret);
 	}
 	apple_smc_write_mbse(smc, SMC_KEY(slpa));
 	/* Device interrupts are off here. */
@@ -1004,25 +1003,19 @@ static int apple_smc_sleep_commit(struct apple_smc *smc)
  * Without the 0 the SMC treats all the time awake as a power nap, whether
  * the sleep wrote its 2 or not: it keeps its own fan policy against a manual fan request
  * (the mode request times out), and under thermal load it requests a sleep once a second.
- * Negative writes nothing.
  */
-static int wake_wktp;
-module_param(wake_wktp, int, 0644);
-MODULE_PARM_DESC(wake_wktp, "WKTP value written once a wake is a full one (negative: none)");
-
 static void apple_smc_wake_full(struct apple_smc *smc)
 {
-	int wktp = READ_ONCE(wake_wktp);
 	int ret;
 
 	if (!smc->wake_silent)
 		return;
 	smc->wake_silent = false;
-	if (!smc->wktp || wktp < 0)
+	if (!smc->wktp)
 		return;
-	ret = apple_smc_write_u8(smc, SMC_KEY(WKTP), wktp);
+	ret = apple_smc_write_u8(smc, SMC_KEY(WKTP), SMC_WKTP_AWAKE);
 	if (ret)
-		dev_err(smc->dev, "Failed to write WKTP = %d: %d\n", wktp, ret);
+		dev_err(smc->dev, "Failed to write WKTP = %u: %d\n", SMC_WKTP_AWAKE, ret);
 }
 
 static int apple_smc_wake_reason_names(const struct apple_smc *smc, u64 record, char *buf,
