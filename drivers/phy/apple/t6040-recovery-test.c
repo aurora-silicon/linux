@@ -362,6 +362,26 @@ static void t6040_sleep_wake_usb3_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, t6040_sleep_wake_usb3(tphy));
 }
 
+/*
+ * A sleep that powered the SoC down has reset the USB2 PHY and power-cycled
+ * the coprocessor: a power-down that didn't land before it and a power cycle
+ * that was pending are behind the port, which sleeps in place again.
+ */
+static void t6040_sleep_power_lost_test(struct kunit *test)
+{
+	struct t6040_usb2_phy *tphy = t6040_sleep_test_phy(test);
+
+	tphy->shutdown_failed = true;
+	tphy->sleep_usb3 = true;
+	t6040_recovery_power_down(&tphy->recovery, true, false);
+	KUNIT_EXPECT_FALSE(test, t6040_can_sleep_in_place(tphy));
+	KUNIT_EXPECT_FALSE(test, t6040_sleep_wake_usb3(tphy));
+	t6040_power_lost(tphy);
+	KUNIT_EXPECT_FALSE(test, tphy->shutdown_failed);
+	KUNIT_EXPECT_TRUE(test, t6040_can_sleep_in_place(tphy));
+	KUNIT_EXPECT_TRUE(test, t6040_sleep_wake_usb3(tphy));
+}
+
 static struct kunit_case t6040_sleep_test_cases[] = {
 	KUNIT_CASE(t6040_sleep_usb_test),
 	KUNIT_CASE(t6040_sleep_no_host_test),
@@ -370,6 +390,7 @@ static struct kunit_case t6040_sleep_test_cases[] = {
 	KUNIT_CASE(t6040_sleep_misses_test),
 	KUNIT_CASE(t6040_sleep_keep_failed_test),
 	KUNIT_CASE(t6040_sleep_wake_usb3_test),
+	KUNIT_CASE(t6040_sleep_power_lost_test),
 	{}
 };
 

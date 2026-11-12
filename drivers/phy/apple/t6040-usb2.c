@@ -224,7 +224,7 @@ static void t6040_recovery_complete(struct t6040_recovery_state *state)
  * The SoC lost power in a sleep, and the coprocessor and both of its power
  * domains with it: that is the power cycle a stop that wasn't clean asks for.
  */
-static void __maybe_unused t6040_recovery_power_lost(struct t6040_recovery_state *state)
+static void t6040_recovery_power_lost(struct t6040_recovery_state *state)
 {
 	state->cycle_pending = false;
 }
@@ -3475,6 +3475,12 @@ int apple_t6040_atcphy_sleep_enter(struct phy *usb2_phy)
 	/* As dwc3-apple's stop: USB3 with its PIPE, USB2, then the controller's reset. */
 	t6040_usb3_down_locked(tphy);
 	ret = t6040_usb2_off_locked(tphy);
+	/*
+	 * No reason to refuse the sleep: one that powers the SoC down resets the
+	 * USB2 PHY whatever a write that didn't land has left of it, and the wake
+	 * starts from there (t6040_power_lost()). After any other sleep the PHY
+	 * stays failed, and the wake says so.
+	 */
 	if (ret)
 		dev_err(tphy->dev, "USB2 did not power down for the sleep: %d\n", ret);
 	t6040_dwc3_reset_hold_locked(tphy);
@@ -3646,6 +3652,18 @@ void apple_t6040_atcphy_sleep_finish(struct phy *usb2_phy, bool kept)
 }
 EXPORT_SYMBOL_GPL(apple_t6040_atcphy_sleep_finish);
 
+/*
+ * The SoC lost power in a sleep or for a resume from disk, and the PHY with
+ * it. That was the power cycle its coprocessor may have been waiting for, and
+ * it put the USB2 PHY back into its reset state: a power-down or a start that
+ * didn't land before it says nothing about the PHY any more.
+ */
+static void __maybe_unused t6040_power_lost(struct t6040_usb2_phy *tphy)
+{
+	t6040_recovery_power_lost(&tphy->recovery);
+	tphy->shutdown_failed = false;
+}
+
 #ifdef CONFIG_HIBERNATION
 static int t6040_phy_count(struct phy *phy)
 {
@@ -3710,8 +3728,7 @@ static int t6040_usb2_restore_early(struct device *dev)
 	tphy->dp_mode_two_lanes = false;
 	tphy->dp_mode_flip = false;
 	tphy->dp_rate = -1;
-	tphy->shutdown_failed = false;
-	t6040_recovery_power_lost(&tphy->recovery);
+	t6040_power_lost(tphy);
 	return 0;
 }
 
@@ -3798,10 +3815,10 @@ static int t6040_usb2_poweroff(struct device *dev)
  * t6040_dp_wait_host(). Early, before any .resume: the Type-C controller
  * reports a display from its own.
  *
- * If the firmware woke the system, the SoC was powered down, and the
- * coprocessor and its domains with it: no start after this sleep has a power
- * cycle of theirs to wait for or to run, the wake of a host kept through it
- * included.
+ * If the firmware woke the system, the SoC was powered down, and the PHY and
+ * its coprocessor with it: no start after this sleep has a power cycle to
+ * wait for or to run, and none finds the USB2 PHY failed by a write from
+ * before the sleep, the wake of a host kept through it included.
  */
 static int t6040_usb2_resume_early(struct device *dev)
 {
@@ -3811,7 +3828,7 @@ static int t6040_usb2_resume_early(struct device *dev)
 		return 0;
 	guard(mutex)(&tphy->lock);
 	if (pm_resume_via_firmware())
-		t6040_recovery_power_lost(&tphy->recovery);
+		t6040_power_lost(tphy);
 	WRITE_ONCE(tphy->sleep_back, tphy->sleep_down);
 	return 0;
 }
