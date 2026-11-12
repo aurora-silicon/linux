@@ -106,6 +106,9 @@
 #define PS_APCIE_SYS_ST0	0x380	/* SOC-East: ps_apcie_sys_st0 */
 #define PS_APCIE_SYS_ST1	0x388	/* SOC-East: ps_apcie_sys_st1 */
 #define PS_APCIE_PHY_SW		0x398	/* SOC-East: ps_apcie_phy_sw (the shared PHY) */
+/* The clock-gated words (TARGET 4) the commit writes, as the sleep engine asks for them. */
+#define PS_APCIE_PHY_SW_CLKGATED	0x0f000244
+#define PS_APCIE_GP_CLKGATED	0x00000244
 
 /*
  * cluster-ctl (pmgr reg0 + cluster-ctl-offset 0x20000 = 0x502820000). Measured
@@ -180,6 +183,7 @@
 #define KA_WORDS		32
 #define KA_STRIDE		0x44
 #define KA_SIZE			(KA_WORDS * KA_STRIDE)
+#define KA_ENABLE		BIT(0)
 
 /*
  * The SMC's AP watchdog deadline (the watchdog timer's reg[2] + 8):
@@ -242,7 +246,6 @@ static const struct {
 
 #define AGX_GATE_RESIDENT	GENMASK(19, 18)
 #define T6040_AFR_PS_PA		0x288e80100ULL
-#define AFR_LEVEL		GENMASK(19, 16)
 #define AGX_TIMEOUT_US		10000
 
 /*
@@ -950,7 +953,7 @@ static void t6040_aop_ps_save(struct t6040_sleep *s)
 	if (!s->aop_ps)
 		return;
 	for (i = 0; i < T6040_AOP_PS_WORDS; i++)
-		s->aop_ps_saved[i] = readl(s->aop_ps + 8 * i);
+		s->aop_ps_saved[i] = readl(s->aop_ps + PS_STRIDE * i);
 	s->aop_ps_saved_valid = true;
 }
 
@@ -967,9 +970,9 @@ static void t6040_aop_ps_restore(struct t6040_sleep *s)
 		u32 v, want = s->aop_ps_saved[off / 8], now = readl(r);
 
 		if (FIELD_GET(PS_ACTUAL, want)) {
-			if (FIELD_GET(PS_ACTUAL, now) == 0xf && !(now & PS_AUTO_ENABLE))
+			if (FIELD_GET(PS_ACTUAL, now) == PS_ACTIVE && !(now & PS_AUTO_ENABLE))
 				continue;
-			writel((now & ~(PS_AUTO_ENABLE | PS_TARGET)) | PS_TARGET, r);
+			writel((now & ~PS_AUTO_ENABLE) | PS_TARGET, r);
 		} else {
 			if (FIELD_GET(PS_ACTUAL, now) || !FIELD_GET(PS_TARGET, want))
 				continue;
@@ -1013,16 +1016,17 @@ static void t6040_sio_ps_restore(struct t6040_sleep *s)
 		void __iomem *w = s->pmgr_east + off;
 		u32 saved = s->sio_ps_saved[i];
 
-		if (FIELD_GET(PS_TARGET, saved) != 0xf || FIELD_GET(PS_ACTUAL, saved) != 0xf)
+		if (FIELD_GET(PS_TARGET, saved) != PS_ACTIVE ||
+		    FIELD_GET(PS_ACTUAL, saved) != PS_ACTIVE)
 			continue;
 		val = readl(w);
-		if (FIELD_GET(PS_TARGET, val) == 0xf)
+		if (FIELD_GET(PS_TARGET, val) == PS_ACTIVE)
 			continue;
-		writel((val & ~PS_TARGET) | FIELD_PREP(PS_TARGET, 0xf), w);
+		writel(val | PS_TARGET, w);
 		/* Timekeeping is still suspended here: count the wait, no ktime. */
 		for (n = 0; n < 1000; n++) {
 			cur = readl(w);
-			if (FIELD_GET(PS_ACTUAL, cur) == 0xf)
+			if (FIELD_GET(PS_ACTUAL, cur) == PS_ACTIVE)
 				break;
 			udelay(10);
 		}
@@ -1220,7 +1224,7 @@ static void t6040_secondaries_off(struct t6040_sleep *s)
 
 		if (!bit || bit == self)
 			continue;
-		readl_poll_timeout_atomic(s->soc_ps + 8 * __ffs(bit), v,
+		readl_poll_timeout_atomic(s->soc_ps + PS_STRIDE * __ffs(bit), v,
 					  !FIELD_GET(PS_ACTUAL, v), 1, 10000);
 	}
 }
@@ -1265,8 +1269,8 @@ static void t6040_agx_gate(struct t6040_sleep *s)
 	val = readl(s->afr_ps);
 	if (!FIELD_GET(PS_TARGET, val))
 		return;
-	writel((val & ~AFR_LEVEL) | FIELD_PREP(AFR_LEVEL, 4), s->afr_ps);
-	if (readl_poll_timeout_atomic(s->afr_ps, cur, FIELD_GET(AFR_LEVEL, cur) == 4, 1,
+	writel((val & ~PS_MIN) | FIELD_PREP(PS_MIN, 4), s->afr_ps);
+	if (readl_poll_timeout_atomic(s->afr_ps, cur, FIELD_GET(PS_MIN, cur) == 4, 1,
 				      AGX_TIMEOUT_US))
 		return;
 	if (readl_poll_timeout_atomic(s->afr_ps, cur, FIELD_GET(PS_ACTUAL, cur) == 4, 1,
@@ -1293,9 +1297,9 @@ static u64 t6040_keep_alive(struct t6040_sleep *s, bool on, u64 mask)
 		void __iomem *b = s->ka_east + i * KA_STRIDE;
 		u32 va = readl(a), vb = readl(b);
 
-		was |= (u64)(va & 1) << i | (u64)(vb & 1) << (i + KA_WORDS);
-		writel((va & ~1U) | (on && (mask & BIT_ULL(i))), a);
-		writel((vb & ~1U) | (on && (mask & BIT_ULL(i + KA_WORDS))), b);
+		was |= (u64)(va & KA_ENABLE) << i | (u64)(vb & KA_ENABLE) << (i + KA_WORDS);
+		writel((va & ~KA_ENABLE) | (on && (mask & BIT_ULL(i))), a);
+		writel((vb & ~KA_ENABLE) | (on && (mask & BIT_ULL(i + KA_WORDS))), b);
 	}
 	return was;
 }
@@ -1367,7 +1371,7 @@ static void t6040_axi2af_rearm(struct t6040_sleep *s)
 		if (!ps || !bridge)
 			continue;
 		val = readl(ps);
-		if (FIELD_GET(PS_TARGET, val) != 0xf)
+		if (FIELD_GET(PS_TARGET, val) != PS_ACTIVE)
 			continue;
 		if (!FIELD_GET(PS_ACTUAL, val)) {
 			pr_debug("t6040-sleep: wake: axi2af %s not re-armed, PS %#x (gated)\n",
@@ -1476,13 +1480,13 @@ static void t6040_apcie_phy_off(struct t6040_sleep *s)
 	writel(readl(run) & ~APCIE_PHY_RUN_EN, run);
 }
 
-/* APCIE_PHY_SW to clock-gated (0x0f000244), its busy bit polled clear. */
+/* APCIE_PHY_SW to clock-gated, its busy bit polled clear. */
 static void t6040_apcie_phy_sw_gate(struct t6040_sleep *s)
 {
 	void __iomem *reg = s->soc_east + PS_APCIE_PHY_SW;
 	u32 val;
 
-	writel(0x0f000244, reg);
+	writel(PS_APCIE_PHY_SW_CLKGATED, reg);
 	readl_poll_timeout_atomic(reg, val, !(val & PS_BUSY), 1, PS_OFF_TIMEOUT_US);
 }
 
@@ -1492,11 +1496,11 @@ static void t6040_apcie_pll_off(struct t6040_sleep *s)
 	void __iomem *clk = s->apcie_st.clkgen + APCIE_CLK_CTRL;
 	u32 val;
 
-	writel((readl(clk) & ~GENMASK(5, 3)) | BIT(4) | BIT(3), clk);
-	writel(readl(clk) | BIT(1), clk);
+	writel((readl(clk) & ~(APCIE_CLK_RUN | GENMASK(4, 3))) | GENMASK(4, 3), clk);
+	writel(readl(clk) | APCIE_CLK_OFF, clk);
 	writel(readl(clk) & ~BIT(0), clk);
 	readl_poll_timeout_atomic(clk, val, !(val & APCIE_CLK_BUSY), 1, APCIE_POLL_US);
-	writel(readl(clk) | BIT(2), clk);
+	writel(readl(clk) | APCIE_CLK_OFF2, clk);
 }
 
 /*
@@ -1518,7 +1522,7 @@ static void t6040_atc_commons_on(struct t6040_sleep *s)
 	if (!b)
 		return;
 	t6040_ps_raise_start(b, PS_FAB2_SOC);
-	for (i = 0; i < 4; i++)
+	for (i = 0; i < ARRAY_SIZE(t6040_atc_common); i++)
 		t6040_ps_raise_start(b, t6040_atc_common[i]);
 	t6040_ps_raise_finish(b, PS_FAB2_SOC);
 }
@@ -1531,22 +1535,32 @@ static void t6040_atc_commons_on(struct t6040_sleep *s)
  * always, any other port once a display runs on it in DP alternate mode. A parked port, and
  * one its PHY driver has put to sleep, already has +0x28 bit 0 set and is left alone.
  */
+#define ATC_CFG_CLK_STATUS		0x04
+#define ATC_CFG_CLK_ACK			BIT(8)
+#define ATC_CFG_S2R_FSM			0x08
+#define ATC_CFG_S2R_FSM_EN		BIT(0)
+#define ATC_CFG_AHB_CLK			0x28
+#define ATC_CFG_AHB_CLK_REQ_N		BIT(0)
+#define ATC_CFG_S2R_AON			0x2c
+#define ATC_CFG_S2R_AON_SYNC_RST_N	BIT(0)
+
 static void t6040_atc_s2r_entry(struct t6040_sleep *s)
 {
 	u32 v;
 	int n;
 
-	for (n = 0; n < 4; n++) {
+	for (n = 0; n < ARRAY_SIZE(s->atc_cfg); n++) {
 		void __iomem *c = s->atc_cfg[n];
 
-		if (!c || (readl(c + 0x28) & BIT(0)))
+		if (!c || (readl(c + ATC_CFG_AHB_CLK) & ATC_CFG_AHB_CLK_REQ_N))
 			continue;
-		writel(readl(c + 0x2c) | BIT(0), c + 0x2c);
+		writel(readl(c + ATC_CFG_S2R_AON) | ATC_CFG_S2R_AON_SYNC_RST_N,
+		       c + ATC_CFG_S2R_AON);
 		udelay(1);
-		writel(readl(c + 0x08) | BIT(0), c + 0x08);
+		writel(readl(c + ATC_CFG_S2R_FSM) | ATC_CFG_S2R_FSM_EN, c + ATC_CFG_S2R_FSM);
 		udelay(5);
-		writel(readl(c + 0x28) | BIT(0), c + 0x28);
-		readl_poll_timeout_atomic(c + 0x04, v, v & BIT(8), 1, 1000);
+		writel(readl(c + ATC_CFG_AHB_CLK) | ATC_CFG_AHB_CLK_REQ_N, c + ATC_CFG_AHB_CLK);
+		readl_poll_timeout_atomic(c + ATC_CFG_CLK_STATUS, v, v & ATC_CFG_CLK_ACK, 1, 1000);
 	}
 }
 
@@ -1582,7 +1596,7 @@ static void t6040_fabrics_on(struct t6040_sleep *s)
 		if (!b)
 			continue;
 		v = readl(b + off);
-		if (!(v & PS_AUTO_ENABLE) || FIELD_GET(PS_TARGET, v) != 0xf)
+		if (!(v & PS_AUTO_ENABLE) || FIELD_GET(PS_TARGET, v) != PS_ACTIVE)
 			t6040_ps_raise(b, off);
 	}
 	t6040_atc_commons_on(s);
@@ -1623,16 +1637,17 @@ static u32 t6040_dcs_ps_auto_on(struct t6040_sleep *s)
 	u32 to = 0, v;
 	int i;
 
-	for (i = 0; i < 16; i++) {
+	for (i = 0; i < ARRAY_SIZE(t6040_dcs_ps); i++) {
 		void __iomem *r = t6040_dcs_ps_reg(s, i);
 
 		if (!r)
 			continue;
 		v = readl(r);
-		if ((v & PS_AUTO_ENABLE) && !(v & GENMASK(19, 16)))
+		if ((v & PS_AUTO_ENABLE) && !(v & PS_MIN))
 			continue;
-		writel((v & ~(GENMASK(19, 16) | PS_FLAGS | PS_TARGET)) | 0xf, r);
-		if (readl_poll_timeout_atomic(r, v, FIELD_GET(PS_ACTUAL, v) == 0xf, 1,
+		writel((v & ~(PS_MIN | PS_FLAGS | PS_TARGET)) |
+		       FIELD_PREP(PS_TARGET, PS_ACTIVE), r);
+		if (readl_poll_timeout_atomic(r, v, FIELD_GET(PS_ACTUAL, v) == PS_ACTIVE, 1,
 					      PS_OFF_TIMEOUT_US))
 			to |= BIT(i);
 		writel(readl(r) | PS_AUTO_ENABLE, r);
@@ -1640,18 +1655,21 @@ static u32 t6040_dcs_ps_auto_on(struct t6040_sleep *s)
 	return to;
 }
 
+#define DCS_PG_CTL		0x20
+#define DCS_PG_DYN		(BIT(12) | BIT(8))
+
 static void t6040_dcs_dyn_pg(struct t6040_sleep *s)
 {
 	int i;
 
-	for (i = 0; i < 16; i++) {
+	for (i = 0; i < ARRAY_SIZE(s->dcs); i++) {
 		u32 v;
 
 		if (!s->dcs[i])
 			continue;
-		v = readl(s->dcs[i] + 0x20);
-		if ((v & 0x1100) != 0x1100)
-			writel(v | 0x1100, s->dcs[i] + 0x20);
+		v = readl(s->dcs[i] + DCS_PG_CTL);
+		if ((v & DCS_PG_DYN) != DCS_PG_DYN)
+			writel(v | DCS_PG_DYN, s->dcs[i] + DCS_PG_CTL);
 	}
 }
 
@@ -1669,7 +1687,7 @@ static void t6040_ans_bridge_quiesce(struct t6040_sleep *s)
 	u32 a, b;
 
 	if (!bridge || !s->soc_east ||
-	    FIELD_GET(PS_ACTUAL, readl(s->soc_east + PS_ANS)) != 0xf)
+	    FIELD_GET(PS_ACTUAL, readl(s->soc_east + PS_ANS)) != PS_ACTIVE)
 		return;
 	a = readl(bridge + AXI2AF_BRIDGE_104);
 	b = readl(bridge + AXI2AF_BRIDGE_108);
@@ -1959,7 +1977,7 @@ static void t6040_sleep_stop_gp_ports(struct t6040_sleep *s)
 
 	if (!s->soc_east || !FIELD_GET(PS_ACTUAL, readl(s->soc_east + PS_APCIE_SYS_GP)))
 		return;
-	for (p = 0; p < 2; p++)
+	for (p = 0; p < ARRAY_SIZE(s->gp_port); p++)
 		t6040_gp_port_stop(s, p);
 }
 
@@ -1967,7 +1985,7 @@ static void t6040_sleep_stop_gp_ports(struct t6040_sleep *s)
  * apcie_sys_gp (AUTO off, axi2af bit0s, target 0), then apcie_gp. After ANS's ST lanes: the
  * storage lanes' cio3pll/clkgen/PHY windows sit in apcie_gp, and touching them with it off
  * hung the bus. T8140's order: SYS_ST, ST, SYS_GP, GP. APCIE_GP goes to clock-gated
- * (0x244), the state the sleep engine itself asks for, not to off.
+ * (TARGET 4), the state the sleep engine itself asks for, not to off.
  */
 static void t6040_sleep_lower_apcie_gp(struct t6040_sleep *s)
 {
@@ -1993,7 +2011,7 @@ static void t6040_sleep_lower_apcie_gp(struct t6040_sleep *s)
 	writel((val & ~PS_TARGET) | PS_FLAGS, sys);
 	readl_poll_timeout_atomic(sys, val, !FIELD_GET(PS_ACTUAL, val), 1, PS_OFF_TIMEOUT_US);
 
-	writel(0x244, gp);
+	writel(PS_APCIE_GP_CLKGATED, gp);
 	readl_poll_timeout_atomic(gp, val, FIELD_GET(PS_ACTUAL, val) == 4, 1, PS_OFF_TIMEOUT_US);
 }
 
@@ -2106,7 +2124,7 @@ static void t6040_gp_pcie_clk(struct t6040_sleep *s)
 	u32 val;
 	int i;
 
-	for (i = 0; i < 2; i++) {
+	for (i = 0; i < ARRAY_SIZE(s->gp_port); i++) {
 		void __iomem *phy = s->gp_phy[i], *port = s->gp_port[i];
 		u32 cfg, app;
 
@@ -2234,12 +2252,9 @@ static void t6040_sleep_return(struct t6040_sleep *s)
 	t6040_wake_sync();
 
 	if (s->pwrgate) {
-		writel((readl(s->pwrgate + PWRGATE_CPM_0) & ~PWRGATE_ON) | PWRGATE_ON,
-		       s->pwrgate + PWRGATE_CPM_0);
-		writel((readl(s->pwrgate + PWRGATE_CPM_1) & ~PWRGATE_ON) | PWRGATE_ON,
-		       s->pwrgate + PWRGATE_CPM_1);
-		writel((readl(s->pwrgate + PWRGATE_CPM_2) & ~PWRGATE_ON) | PWRGATE_ON,
-		       s->pwrgate + PWRGATE_CPM_2);
+		writel(readl(s->pwrgate + PWRGATE_CPM_0) | PWRGATE_ON, s->pwrgate + PWRGATE_CPM_0);
+		writel(readl(s->pwrgate + PWRGATE_CPM_1) | PWRGATE_ON, s->pwrgate + PWRGATE_CPM_1);
+		writel(readl(s->pwrgate + PWRGATE_CPM_2) | PWRGATE_ON, s->pwrgate + PWRGATE_CPM_2);
 	}
 	t6040_wake_sync();
 
@@ -2525,7 +2540,7 @@ static int t6040_psw_poll(const struct t6040_psw *w, u32 mask, u32 want)
 
 /*
  * The power-down of a PS word: with
- * AUTO_ENABLE set, take it out of automatic mode with the target kept (v & 0xeffffcff) and
+ * AUTO_ENABLE set, take it out of automatic mode with the target kept and the flags cleared, and
  * wait for ACTUAL 15; then @pre (the SYS hooks); then TARGET 0 with bits 9:8 written 1 and
  * bits 10-12, 24-31 kept; then poll bit11 clear and ACTUAL 0.
  */
@@ -2535,13 +2550,13 @@ static int t6040_psw_off(struct t6040_sleep *s, const struct t6040_psw *w,
 	u32 v = t6040_psw_read(w);
 
 	if (v & PS_AUTO_ENABLE) {
-		t6040_psw_write(w, v & 0xeffffcff);
+		t6040_psw_write(w, v & ~(PS_AUTO_ENABLE | PS_FLAGS));
 		t6040_psw_poll(w, PS_ACTUAL, PS_ACTUAL);
 		v = t6040_psw_read(w);
 	}
 	if (pre)
 		pre(s);
-	t6040_psw_write(w, (v & 0xfffffcf0) | 0x300);
+	t6040_psw_write(w, (v & ~(PS_FLAGS | PS_TARGET)) | PS_FLAGS);
 	t6040_psw_poll(w, PS_BUSY, 0);
 	return t6040_psw_poll(w, PS_ACTUAL, 0);
 }
@@ -2561,7 +2576,9 @@ static void t6040_disp_sys_pre(struct t6040_sleep *s)
 	}
 }
 
-/* dart-dcp's outstanding-transaction counters ([20:16]) at 0 before its domain goes. */
+/* dart-dcp's outstanding-transaction counters at 0 before its domain goes. */
+#define DCP_DART_TXN_COUNT	GENMASK(20, 16)
+
 static int t6040_dcp_dart_idle(struct t6040_sleep *s)
 {
 	static const u16 regs[] = { 0x240, 0x244, 0x250, 0x254, 0x260, 0x270 };
@@ -2570,7 +2587,7 @@ static int t6040_dcp_dart_idle(struct t6040_sleep *s)
 	if (!s->dcp_dart)
 		return 0;
 	for (i = 0; i < ARRAY_SIZE(regs); i++)
-		while (readl(s->dcp_dart + regs[i]) & GENMASK(20, 16)) {
+		while (readl(s->dcp_dart + regs[i]) & DCP_DART_TXN_COUNT) {
 			if (++us > DISP_PS_TIMEOUT_US)
 				return -ETIMEDOUT;
 			udelay(1);
@@ -2635,7 +2652,7 @@ static int t6040_psw_on(struct t6040_sleep *s, const struct t6040_psw *w, bool s
 	u32 v = t6040_psw_read(w);
 	int ret;
 
-	t6040_psw_write(w, (v & ~(PS_TARGET | PS_AUTO_ENABLE | PS_FLAGS)) | PS_TARGET);
+	t6040_psw_write(w, (v & ~(PS_AUTO_ENABLE | PS_FLAGS)) | PS_TARGET);
 	ret = t6040_psw_poll(w, PS_ACTUAL, PS_ACTUAL);
 	t6040_psw_poll(w, PS_BUSY, 0);
 	if (sys) {
@@ -3042,7 +3059,7 @@ static void t6040_sleep_map_gp(struct t6040_sleep *s)
 		return;
 	if (!of_device_is_available(host))
 		goto out;
-	for (p = 0; p < 2; p++) {
+	for (p = 0; p < ARRAY_SIZE(s->gp_port); p++) {
 		idx = of_property_match_string(host, "reg-names", ports[p]);
 		if (idx >= 0 && !of_address_to_resource(host, idx, &res))
 			s->gp_port[p] = t6040_ioremap_np(s->dev, res.start, resource_size(&res));
@@ -3127,11 +3144,11 @@ static int t6040_sleep_probe(struct platform_device *pdev)
 	sleep->mastermini = t6040_sleep_map(&pdev->dev, "mastermini");
 	sleep->aop_ps = t6040_ioremap_np(&pdev->dev, T6040_AOP_PS_PA, 0x160);
 	sleep->pmgr_soc = t6040_ioremap_np(&pdev->dev, 0x502800000ULL, 0x9000);
-	for (i = 0; i < 16; i++)
+	for (i = 0; i < ARRAY_SIZE(sleep->dcs); i++)
 		sleep->dcs[i] = t6040_ioremap_np(&pdev->dev, 0x220200000ULL +
 						 (i / 4) * 0x2000000ULL + (i % 4) * 0x200000ULL,
 						 0x2000);
-	for (i = 0; i < 4; i++)
+	for (i = 0; i < ARRAY_SIZE(sleep->atc_cfg); i++)
 		sleep->atc_cfg[i] = t6040_ioremap_np(&pdev->dev,
 						     0x383200000ULL + i * 0x8000000ULL, 0x100);
 	sleep->pmgr_east = t6040_ioremap_np(&pdev->dev, 0x502280000ULL, 0xd000);
