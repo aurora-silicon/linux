@@ -639,6 +639,7 @@ struct Firmware {
     rings: channel::Rings,
     recovery: recovery::State,
     effort: power::Effort,
+    ceiling: Option<power::Ceiling>,
     hold: power::Hold,
     registration_power_release_pending: bool,
     variant: &'static fw::Variant,
@@ -741,7 +742,7 @@ impl Firmware {
         if submitted {
             self.effort.submit();
         }
-        let effort = match self.effort.idle(now_ns, in_flight || submitted) {
+        let mut effort = match self.effort.idle(now_ns, in_flight || submitted) {
             power::IdleAction::None => None,
             power::IdleAction::Clear => {
                 self.port.set_effort_full(false);
@@ -755,6 +756,14 @@ impl Firmware {
             }
             power::IdleAction::Recheck(delay) => Some(delay),
         };
+        if let Some(ceiling) = self.ceiling.as_mut() {
+            ceiling.update(&self.init)?;
+            if in_flight || submitted {
+                effort = Some(effort.map_or(power::PMP_REPORT_PERIOD_NS, |delay| {
+                    delay.min(power::PMP_REPORT_PERIOD_NS)
+                }));
+            }
+        }
         Ok(match (effort, self.idle_hold(now_ns, in_flight || submitted)) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -850,6 +859,8 @@ struct Shared {
     /// Layout of renders' deflake buffers for this GPU's cores.
     deflake: fw::render::Deflake,
     descriptor_flags: [u32; 2],
+    /// PMP report aperture selected by the GPU node, if this SoC has one.
+    pmp_report: Option<u32>,
     crashed: AtomicBool,
     feed: Arc<feed::Feed>,
     #[pin]
@@ -1175,6 +1186,7 @@ impl Gpu {
         let idle_delay = power::idle_delay(
             node.get_opt_property(c_str!("apple,idle-off-delay-ms"))?,
         )?;
+        let pmp_report = node.get_opt_property(c_str!("apple,pmp-report"))?;
         power::IDLE_HOLD_MS.store(idle_delay, Ordering::Relaxed);
         dev_info!(dev.as_ref(), "GPU idle power-off delay: {} ms\n", idle_delay);
         let channels = availability::Availability::new()?;
@@ -1208,6 +1220,7 @@ impl Gpu {
                 operand_state: &cfg.core_layout.operand_state,
                 deflake: cfg.core_layout.deflake,
                 descriptor_flags: [id.perf_control, id.perf_map[0]],
+                pmp_report,
                 crashed: AtomicBool::new(false),
                 feed,
                 feed_work <- new_work!("g17::Shared::feed_work"),
@@ -1404,6 +1417,7 @@ impl Gpu {
                 rings: channel::Rings::new()?,
                 recovery: recovery::State::new(),
                 effort: power::Effort::new(),
+                ceiling: None,
                 hold: power::Hold::new(),
                 registration_power_release_pending: false,
                 variant: shared.variant,
@@ -1446,6 +1460,9 @@ impl Gpu {
             shared.active_cores,
             shared.variant,
         )?;
+        if let Some(report) = shared.pmp_report {
+            session.ceiling = Some(power::Ceiling::new(report, session.init.ppm_target()?));
+        }
         if let Some(root_entries) = root_entries {
             session.uat.confirm_firmware_root_entries(root_entries)?;
         }

@@ -7,6 +7,67 @@ use core::sync::atomic::AtomicU32;
 
 pub(super) const FULL_EFFORT: u32 = 0x10000;
 pub(super) const IDLE_HOLD_NS: u64 = 16_000_000;
+/// The lifetime-servo cadence published by the PMP runtime policy.
+pub(super) const PMP_REPORT_PERIOD_NS: u64 = 5_000_000;
+const PMP_EFFORT_ONE: u32 = 0x0100_0000;
+
+/// Converts a valid Q8.24 PMP effort to the percent ceiling used by the host.
+///
+/// The producer first discards the low eight fractional bits, then scales the
+/// remaining Q16.16 complement. Consequently the first input that survives
+/// that truncation lowers the integer ceiling by one percent.
+pub(super) fn pmp_effort_to_ceiling(effort: u32) -> Option<u32> {
+    if effort > PMP_EFFORT_ONE {
+        return None;
+    }
+    Some(((u64::from(PMP_EFFORT_ONE >> 8) - u64::from(effort >> 8)) * 100 >> 16) as u32)
+}
+
+fn pmp_sample_to_ceiling(sample: Option<u32>) -> Option<u32> {
+    sample.and_then(pmp_effort_to_ceiling)
+}
+
+/// Runtime PMP ceiling applied through the firmware-polled PPM target words.
+pub(super) struct Ceiling {
+    report_phandle: u32,
+    native: [u32; 3],
+    applied: Option<u32>,
+}
+
+impl Ceiling {
+    pub(super) fn new(report_phandle: u32, native: [u32; 3]) -> Self {
+        Self {
+            report_phandle,
+            native,
+            applied: None,
+        }
+    }
+
+    /// Samples one aligned report word and restores native policy when the
+    /// provider, count or effort is absent or invalid.
+    pub(super) fn update(&mut self, init: &super::initdata::InitData) -> kernel::error::Result {
+        let mut effort = 0;
+        // SAFETY: `effort` is writable for one u32. The provider matches the
+        // retained DT phandle under RCU and performs read-only MMIO accesses.
+        let ret = unsafe {
+            kernel::bindings::apple_pmp_report_gpu_effort(self.report_phandle, &mut effort)
+        };
+        let desired = pmp_sample_to_ceiling((ret == 0).then_some(effort))
+            .filter(|ceiling| *ceiling < 100 && self.native[1] != 0);
+        if desired == self.applied {
+            return Ok(());
+        }
+
+        if let Some(ceiling) = desired {
+            let target_mw = (u64::from(self.native[1]) * u64::from(ceiling) / 100) as u32;
+            init.publish_ppm_target(1, target_mw, self.native[2])?;
+        } else if self.applied.is_some() {
+            init.publish_ppm_target(self.native[0], self.native[1], self.native[2])?;
+        }
+        self.applied = desired;
+        Ok(())
+    }
+}
 
 /// The firmware's idle power-off delay as measured on T6040/25G83: the cores power off 2 ms after
 /// the last job. Not measured on other firmware; at or below it the hold stays off.
@@ -248,6 +309,22 @@ pub(super) fn release<C: Control>(control: &mut C) -> kernel::error::Result {
 #[cfg_attr(not(test), kernel::macros::kunit_tests(asahi_g17_idle_hold))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pmp_effort_maps_to_the_integer_ceiling() {
+        assert_eq!(pmp_effort_to_ceiling(0), Some(100));
+        assert_eq!(pmp_effort_to_ceiling(1), Some(100));
+        assert_eq!(pmp_effort_to_ceiling(0x100), Some(99));
+        assert_eq!(pmp_effort_to_ceiling(PMP_EFFORT_ONE / 4), Some(75));
+        assert_eq!(pmp_effort_to_ceiling(PMP_EFFORT_ONE / 2), Some(50));
+        assert_eq!(pmp_effort_to_ceiling(PMP_EFFORT_ONE), Some(0));
+        assert_eq!(pmp_effort_to_ceiling(PMP_EFFORT_ONE + 1), None);
+    }
+
+    #[test]
+    fn absent_or_zero_count_sample_withdraws_the_ceiling() {
+        assert_eq!(pmp_sample_to_ceiling(None), None);
+    }
 
     #[test]
     fn dt_idle_delay_is_bounded_and_absence_preserves_native_policy() {

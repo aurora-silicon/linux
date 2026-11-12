@@ -1890,6 +1890,11 @@ const SECONDARY_CONFIG_WORDS: Words = &[
 
 /// Power state the primary status B carries for the secondary instance,
 /// named by [`SecondaryRoot::power_state_va`].
+///
+/// Three live words publish a host power ceiling. The host stores the target
+/// in milliwatts at [`Self::PPM_TARGET_MW`], its timescale at
+/// [`Self::PPM_TARGET_TIMESCALE`], then one at [`Self::PPM_TARGET_VALID`].
+/// The firmware polls the words; no command or doorbell accompanies them.
 #[repr(C)]
 pub(crate) struct PowerState(pub(crate) [u8; 0x6c0]);
 
@@ -1897,6 +1902,13 @@ pub(crate) struct PowerState(pub(crate) [u8; 0x6c0]);
 unsafe impl Zeroable for PowerState {}
 
 impl PowerState {
+    /// A nonzero PPM target is ready for the firmware.
+    pub(crate) const PPM_TARGET_VALID: usize = 0x128;
+    /// PPM target in milliwatts.
+    pub(crate) const PPM_TARGET_MW: usize = 0x12c;
+    /// PPM target timescale; zero is an unexpired runtime ceiling.
+    pub(crate) const PPM_TARGET_TIMESCALE: usize = 0x144;
+
     fn init(&mut self) {
         fill_words(&mut self.0, POWER_STATE_WORDS);
     }
