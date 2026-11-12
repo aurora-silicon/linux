@@ -479,6 +479,8 @@ struct apple_dcp {
 	 */
 	bool ext_failsafe;
 	bool ext_dead;
+	/* T6041 S2R: this external DCP's firmware stop ran in a sleep of this boot */
+	bool t6041_ext_seen;
 	/*
 	 * A T6030 external processor in the main DRM device: the kernel starts
 	 * its firmware on first use, its modes come from the attached display.

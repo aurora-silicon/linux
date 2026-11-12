@@ -8866,7 +8866,6 @@ static int dcp_t6041_stop_one(struct device *dev, void *data)
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 	bool external = *(bool *)data;
 	struct task_struct *poller;
-	unsigned int idx = 0;
 	u32 status;
 	int ret;
 
@@ -8880,12 +8879,9 @@ static int dcp_t6041_stop_one(struct device *dev, void *data)
 	 */
 	if (external) {
 		/* Also one that was never running: the power word step took its domains down too. */
-		static bool seen[3];
-
-		idx = strstarts(dev_name(dev), "3a2e") ? 1 : 2;
-		if (READ_ONCE(dcp->ext_dead) || seen[idx])
+		if (READ_ONCE(dcp->ext_dead) || dcp->t6041_ext_seen)
 			return 0;
-		seen[idx] = true;
+		dcp->t6041_ext_seen = true;
 		/*
 		 * This pipe's display DART too goes dark for good, now, while its block is still on:
 		 * the power word step forces the external display domains off and nothing raises
@@ -9287,29 +9283,38 @@ static void dcp_t6041_boot_ps_io(bool restore)
 	iounmap(ps);
 }
 
+/* @np's first DART, dark if its driver is bound. */
+static void dcp_t6041_dart_dark(struct device_node *np)
+{
+	struct device_node *dart = np ? of_parse_phandle(np, "iommus", 0) : NULL;
+	struct platform_device *pdev = dart ? of_find_device_by_node(dart) : NULL;
+
+	of_node_put(dart);
+	if (!pdev)
+		return;
+	if (device_is_bound(&pdev->dev))
+		apple_dart_power_dark(&pdev->dev, true);
+	put_device(&pdev->dev);
+}
+
 /*
- * The external chains' DARTs, dark before their domains go off. The display subsystem maps
+ * Every external chain's DARTs, dark before their domains go off. The display subsystem maps
  * every framebuffer through the display DARTs, and an unmap after the wake (an sddm restart, a
  * logout) flushed one behind a dead block and stopped the machine (12 Nov). By node, so a chain
- * whose DCP never bound, which the display subsystem skips as unusable, is covered too.
+ * whose DCP never bound, which the display subsystem skips as unusable, is covered too, and so
+ * is every chain a board enables, not only the first two.
  */
 static void dcp_t6041_ext_darts_dark(void)
 {
-	static const char *const paths[] = {
-		"/iommu@3a2300000", "/iommu@3a2340000", "/iommu@602300000", "/iommu@602340000",
-	};
-	unsigned int i;
+	struct device_node *np, *piodma;
 
-	for (i = 0; i < ARRAY_SIZE(paths); i++) {
-		struct device_node *np = of_find_node_by_path(paths[i]);
-		struct platform_device *pdev = np ? of_find_device_by_node(np) : NULL;
-
-		of_node_put(np);
-		if (!pdev)
+	for_each_compatible_node(np, NULL, "apple,t6041-dcpext") {
+		if (!of_device_is_available(np))
 			continue;
-		if (device_is_bound(&pdev->dev))
-			apple_dart_power_dark(&pdev->dev, true);
-		put_device(&pdev->dev);
+		piodma = of_get_child_by_name(np, "piodma");
+		dcp_t6041_dart_dark(piodma);
+		of_node_put(piodma);
+		dcp_t6041_dart_dark(np);
 	}
 }
 
