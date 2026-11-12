@@ -1694,8 +1694,9 @@ static const struct apple_clpc_hw apple_clpc_hw_t8152 = {
  * this driver doesn't see (J714sAP, 26A428: no vote for one CPU-bound thread,
  * DCS 6 and fabric 2 for memcpy); DCS 5 and fabric 2 keep pointer chasing at
  * 110 ns against 300 ns at state 0. The GPU driver reports its work in
- * flight and gets both top states, DCS 6 and fabric 3, while it has some:
- * bandwidth-bound GPU work runs about 11% slower at DCS 5.
+ * flight and gets DCS 6 and fabric 2 while it has some, the floor macOS's
+ * PMP holds for GPU compute: bandwidth-bound GPU work runs about 11% slower
+ * at DCS 5, and none runs faster at fabric 3 (the PMP asks for it for fill).
  *
  * Sampling stays on time with no vote held. From a deferrable timer, a CPU
  * that went busy after an idle spell waited for the timer's own CPU to wake,
@@ -1708,7 +1709,7 @@ static const struct apple_clpc_hw apple_clpc_hw_t6050 = {
 		[APPLE_CLPC_DCS] = { 2, 4, 5, 5 },
 		[APPLE_CLPC_SOC] = { 1, 2, 2, 2 },
 	},
-	.gpu = { [APPLE_CLPC_DCS] = 6, [APPLE_CLPC_SOC] = 3 },
+	.gpu = { [APPLE_CLPC_DCS] = 6, [APPLE_CLPC_SOC] = 2 },
 	.sustain = 3,
 	.gpu_input = true,
 	.idle_on_time = true,
