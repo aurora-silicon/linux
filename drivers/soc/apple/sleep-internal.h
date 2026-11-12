@@ -87,6 +87,7 @@ struct aura_s2r_mailbox {
 /* PS word */
 #define PS_AUTO_ENABLE		BIT(28)
 #define PS_UNLATCH		BIT(12)
+#define PS_BUSY			BIT(11)
 #define PS_DEV_DISABLE		BIT(10)
 #define PS_FLAGS		GENMASK(9, 8)
 #define PS_ACTUAL		GENMASK(7, 4)
@@ -174,6 +175,8 @@ struct aura_s2r_mailbox {
 #define APCIE_PORT_APPCLK	0x800
 #define APCIE_PORT_APPCLK_EN	BIT(0)
 #define APCIE_PORT_APPCLK_CGDIS	BIT(8)
+#define APCIE_PORT_STATUS	0x804
+#define APCIE_PORT_STATUS_READY	BIT(0)
 #define APCIE_PORT_PERST	0x82c
 #define APCIE_PORT_PHY_LINK	BIT(31)
 #define APCIE_PORT_PHY_EN0	BIT(9)

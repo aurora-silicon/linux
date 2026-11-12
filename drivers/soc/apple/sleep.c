@@ -1087,7 +1087,6 @@ EXPORT_SYMBOL_GPL(apple_sleep_domain_is_down);
  * target 4 and 0, released with the domain off, then raised again, its DARTs' state kept. The
  * caller has cleared the run bit, and starts the firmware after.
  */
-#define PS_BUSY			BIT(11)
 #define PS_RESET		BIT(31)
 #define PS_ENGINE_RESET_4	0x8f000244
 #define PS_ENGINE_RESET_0	0x80000000
@@ -2078,7 +2077,6 @@ static void apple_sleep_set_wd2(struct apple_sleep *s, unsigned int secs)
 	apple_sleep_wd2_arm(s->wdt, secs);
 }
 
-#define PS_PARENT_MISSING	BIT(11)
 #define PS_AUTO_STATE		GENMASK(27, 24)
 #define PS_REWAKE_PASSES	2
 
@@ -2110,7 +2108,7 @@ static int sleep_ps_find(const u32 *all, int n, u32 offset)
  */
 static int sleep_ps_restore(void __iomem *reg, u32 saved)
 {
-	u32 keep = (saved & ~(PS_AUTO_ENABLE | PS_AUTO_STATE | PS_PARENT_MISSING | PS_DEV_DISABLE |
+	u32 keep = (saved & ~(PS_AUTO_ENABLE | PS_AUTO_STATE | PS_BUSY | PS_DEV_DISABLE |
 			      PS_FLAGS | PS_ACTUAL)) | (readl(reg) & PS_AUTO_STATE);
 	u32 now;
 	int ret;
