@@ -25,18 +25,10 @@ pub(crate) const CONFIG: Config = Config {
     uat_oas: 42,
     // The secondary coprocessor's kernel root follows the primary one's 256 KiB of page tables.
     secondary_root_offset: Some(0x40000),
-    // The coprocessors request their crash log buffers at these addresses, in this order, and
-    // expect them to be mapped before they start.
-    crash_buffers: CrashBuffers::Fixed([
-        FixedBuffer {
-            va: 0x01e1_c000,
-            size: 0x8000,
-        },
-        FixedBuffer {
-            va: 0x01f5_0000,
-            size: 0x8000,
-        },
-    ]),
+    // 26A428 retains each coprocessor's crash log in the firmware data reservation and asks
+    // RTKit to map that physical subrange. A replacement object at the low address is unrelated
+    // storage and hides the retained log behind the driver's fill pattern.
+    crash_buffers: CrashBuffers::FirmwareData,
     // Read by the firmware through the kernel lower root, whose top-level entries it only
     // samples when it starts.
     profile: crate::g17::FirmwareProfile::PublishedRoots,
