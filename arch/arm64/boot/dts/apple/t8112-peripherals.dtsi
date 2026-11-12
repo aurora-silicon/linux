@@ -268,18 +268,8 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 906 IRQ_TYPE_LEVEL_HIGH>,
 			<AIC_IRQ 943 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&m2_dart_apr_0 0>, <&m2_dart_apr_1 0>;
+		iommus = <&m2_dart_apr_0 0>;
 		power-domains = <&ps_scodec>;
-		status = "disabled";
-	};
-
-	m2_dart_apr_1: iommu@27d024000 {
-		compatible = "apple,t8112-dart", "apple,t8110-dart";
-		reg = <0x2 0x7d024000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 905 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_scodec>;
-		#iommu-cells = <1>;
 		status = "disabled";
 	};
 
@@ -320,7 +310,7 @@
 			<AIC_IRQ 902 IRQ_TYPE_LEVEL_HIGH>,
 			<AIC_IRQ 904 IRQ_TYPE_LEVEL_HIGH>,
 			<AIC_IRQ 943 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&m2_dart_scdc 0>, <&m2_dart_apr_0 0>, <&m2_dart_apr_1 0>;
+		iommus = <&m2_dart_scdc 0>, <&m2_dart_apr_0 0>;
 		power-domains = <&ps_scodec>;
 		status = "disabled";
 	};
