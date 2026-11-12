@@ -12,6 +12,7 @@
 #include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
+#include <linux/notifier.h>
 #include <linux/spinlock.h>
 #include <linux/mux/consumer.h>
 #include <linux/phy/phy.h>
@@ -266,6 +267,13 @@ struct apple_dcp_hw_data {
 	 * (desktop 26.x), see dcp_sink_metadata().
 	 */
 	bool sink_metadata_edid;
+	/*
+	 * With H17P firmware: a firmware-driven system sleep stops the internal processor's
+	 * firmware and powers it down, as DPMS off does, then restarts it warm, see
+	 * dcp_s2r_suspend(). @s2r_ext: the same for an external one, see dcp_s2r_ext_suspend().
+	 */
+	bool s2r;
+	bool s2r_ext;
 };
 
 enum dcp_test_point {
@@ -369,6 +377,8 @@ const struct drm_edid *dcp_panel_edid_snapshot(struct apple_dcp *dcp,
 					       const struct dcp_display_mode *modes,
 					       unsigned int count, u64 *generation);
 bool dcp_panel_metadata_current(struct apple_dcp *dcp, u64 generation);
+
+void dcp_s2r_dart_power(struct apple_dcp *dcp, u32 on);
 
 struct apple_dcp {
 	/* Generation-specific wire/transaction state, sharing the common KMS owner. */
@@ -702,6 +712,38 @@ struct apple_dcp {
 	/* Messages from the coprocessor are held in the mailbox for sleep. */
 	bool rx_held;
 
+	/* A firmware-driven suspend stops the firmware, see dcp_s2r_suspend(). */
+	bool s2r_active;
+	bool s2r_stopped;
+	/* DPMS off stopped the firmware and lowered the domains; DPMS on brings them back. */
+	bool dpms_powered_off;
+	/* Refused its idle with the display off: the firmware still runs, the display is dark. */
+	bool s2r_refused_off;
+	/* The firmware's secure mailbox, where it has one. */
+	struct apple_rtkit *secure_rtk;
+	bool secure_answered;
+	bool secure_polling;
+	/* Polled every jiffy until then, see dcp_secure_poll(). */
+	unsigned long secure_fast_until;
+	int secure_map_ret;
+	s64 secure_map_us;
+	struct delayed_work secure_poll_wq;
+	/* Stopped and not restarted, which outlives a suspend that gets refused. */
+	bool s2r_fw_down;
+	/* DCPEXT kept down through a dark wake, see dcp_s2r_dark_finish(). */
+	bool s2r_dark_held;
+	struct notifier_block s2r_pm_nb;
+	/* This driver raised the display domains, and nothing has lowered them since. */
+	bool s2r_domains_up;
+	/* Counted in pmc-dcp, the number of powered DCPs */
+	bool pmc_up;
+	bool s2r_power_on;
+	bool s2r_power_oob;
+	u8 s2r_step;
+	struct completion s2r_dart_done;
+	struct device *s2r_disp_dart;
+	struct device *s2r_dcp_dart;
+
 	/* eDP display without DP-HDMI conversion */
 	bool main_display;
 
@@ -1029,6 +1071,7 @@ int iomfb_queue_callback(struct apple_dcp *dcp, dcp_callback_t callback,
 			 const void *data, size_t size, void *cookie);
 void iomfb_queue_init(struct apple_dcp *dcp);
 void iomfb_queue_stop(struct apple_dcp *dcp);
+void iomfb_reset_transport(struct apple_dcp *dcp);
 bool iomfb_queue_drain(struct apple_dcp *dcp, unsigned long timeout);
 int iomfb_queue_settle(struct apple_dcp *dcp, unsigned long timeout);
 void iomfb_pause_presentation(struct apple_dcp *dcp, bool pause);

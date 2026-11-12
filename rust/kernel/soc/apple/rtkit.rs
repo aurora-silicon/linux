@@ -374,6 +374,26 @@ impl<T: Operations> RtKit<T> {
         to_result(unsafe { bindings::apple_rtkit_boot(self.rtk) })
     }
 
+    /// Asks the coprocessor to go idle, AP then IOP state, and waits for both acknowledgments.
+    pub fn idle(self: Pin<&mut Self>) -> Result {
+        // SAFETY: `rtk` is valid per the type invariant.
+        to_result(unsafe { bindings::apple_rtkit_idle(self.rtk) })
+    }
+
+    /// Turns the mailbox off for a coprocessor that has acknowledged idle, before its run bit and
+    /// power state go. Only [`Self::warm_restart`] follows this.
+    pub fn mailbox_off(self: Pin<&mut Self>) {
+        // SAFETY: `rtk` is valid per the type invariant.
+        unsafe { bindings::apple_rtkit_mailbox_off(self.rtk) };
+    }
+
+    /// Prepares for HELLO from firmware restarting warm, which keeps its buffers and rings. The
+    /// caller then sets the run bit and calls [`Self::boot`].
+    pub fn warm_restart(self: Pin<&mut Self>) -> Result {
+        // SAFETY: `rtk` is valid per the type invariant.
+        to_result(unsafe { bindings::apple_rtkit_warm_restart(self.rtk) })
+    }
+
     /// Starts a non-system endpoint.
     pub fn start_endpoint(self: Pin<&mut Self>, endpoint: u8) -> Result {
         // SAFETY: `rtk` is valid per the type invariant.
@@ -398,6 +418,12 @@ impl<T: Operations> RtKit<T> {
     pub fn is_crashed(&self) -> bool {
         // SAFETY: `rtk` is valid per the type invariant. The call only reads state.
         unsafe { bindings::apple_rtkit_is_crashed(self.rtk) }
+    }
+
+    /// Echoes the OSLOG counters the firmware sends, or drops them.
+    pub fn set_oslog_echo(&self, echo: bool) {
+        // SAFETY: `rtk` is valid per the type invariant.
+        unsafe { bindings::apple_rtkit_set_oslog_echo(self.rtk, echo) };
     }
 
     /// Checks if an endpoint is present

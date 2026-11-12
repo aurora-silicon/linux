@@ -555,6 +555,7 @@ DCP_THUNK_INOUT(dcp_pipe_cfg_414, dcpep_pipe_cfg_414, u64, u64);
 DCP_THUNK_OUT(dcp_pipe_query_478, dcpep_pipe_query_478, u32);
 DCP_THUNK_OUT(dcp_pipe_query_474, dcpep_pipe_query_474, u32);
 DCP_THUNK_IN(dcp_pipe_set_476, dcpep_pipe_set_476, u32);
+DCP_THUNK_IN(dcp_unnamed_500, dcpep_unnamed_500, u32);
 #endif
 DCP_THUNK_INOUT(dcp_set_brightness_correction, iomfbep_set_brightness_correction, u32, u32);
 
@@ -2553,6 +2554,121 @@ static void complete_set_powerstate(struct apple_dcp *dcp, void *out,
 		kref_put(&wait->refcount, release_wait_cookie);
 	}
 }
+
+/* V27 shares the h17p template prefix, but does not own its sleep RPCs. */
+#if DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER < DCP_FW_VERSION(27, 0, 0)
+/*
+ * set_power_state around a firmware-driven suspend. What macOS sends before it in
+ * either direction: A414(0), A478 twice, A476(1), A478, A412. All are named in
+ * this firmware's table, and their arguments are measured from macOS.
+ *
+ * For display on, macOS also sends A439 at the same moment. Its name isn't known,
+ * it carries a macOS kernel pointer and its reply wasn't captured, so it isn't
+ * sent here.
+ */
+enum dcp_s2r_step {
+	DCP_S2R_A414, DCP_S2R_A478, DCP_S2R_A476, DCP_S2R_A412, DCP_S2R_A473,
+};
+
+static const u8 dcp_s2r_seq[] = {
+	DCP_S2R_A414, DCP_S2R_A478, DCP_S2R_A478, DCP_S2R_A476, DCP_S2R_A478,
+	DCP_S2R_A412, DCP_S2R_A473,
+};
+
+static void dcp_s2r_run(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	unsigned int step = dcp->s2r_step++;
+
+	switch (dcp_s2r_seq[step]) {
+	case DCP_S2R_A414: {
+		u64 val = 0;
+
+		dcp_pipe_cfg_414(dcp, false, &val, dcp_s2r_run, cookie);
+		break;
+	}
+	case DCP_S2R_A478:
+		dcp_pipe_query_478(dcp, false, dcp_s2r_run, cookie);
+		break;
+	case DCP_S2R_A476: {
+		u32 val = 1;
+
+		dcp_pipe_set_476(dcp, false, &val, dcp_s2r_run, cookie);
+		break;
+	}
+	case DCP_S2R_A412:
+		dcp_is_main_display(dcp, false, dcp_s2r_run, cookie);
+		break;
+	case DCP_S2R_A473: {
+		/* Measured: the state, then 00 00 00 00 00 aa aa aa. */
+		struct DCP_FW_NAME(dcp_set_power_state_req) req = {
+			.unklong = dcp->s2r_power_on,
+			.padding = { 0xaa, 0xaa, 0xaa },
+		};
+
+		dcp_set_power_state(dcp, dcp->s2r_power_oob, &req,
+				    dcp->s2r_power_on ? dcp_on_final : complete_set_powerstate,
+				    cookie);
+		break;
+	}
+	}
+}
+
+static void dcp_s2r_500_done(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	struct dcp_wait_cookie *wait = cookie;
+
+	complete(&wait->done);
+	kref_put(&wait->refcount, release_wait_cookie);
+}
+
+/* Unnamed. macOS sends it after D572 on every display off, with these bytes. */
+int DCP_FW_NAME(iomfb_s2r_500)(struct apple_dcp *dcp)
+{
+	struct dcp_wait_cookie *cookie;
+	unsigned long left;
+	u32 val = 0xaaaa0000;
+
+	cookie = kzalloc_obj(*cookie);
+	if (!cookie)
+		return -ENOMEM;
+	init_completion(&cookie->done);
+	kref_init(&cookie->refcount);
+	/* increase refcount to ensure the receiver has a reference */
+	kref_get(&cookie->refcount);
+
+	dcp_unnamed_500(dcp, false, &val, dcp_s2r_500_done, cookie);
+
+	left = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(1000));
+	kref_put(&cookie->refcount, release_wait_cookie);
+
+	return left ? 0 : -ETIMEDOUT;
+}
+
+int DCP_FW_NAME(iomfb_s2r_power)(struct apple_dcp *dcp, bool on, bool named_calls, bool oob)
+{
+	struct dcp_wait_cookie *cookie;
+	unsigned long left;
+
+	cookie = kzalloc_obj(*cookie);
+	if (!cookie)
+		return -ENOMEM;
+	cookie->status = ~0U;
+	init_completion(&cookie->done);
+	kref_init(&cookie->refcount);
+	/* increase refcount to ensure the receiver has a reference */
+	kref_get(&cookie->refcount);
+
+	dcp->s2r_power_on = on;
+	dcp->s2r_power_oob = oob;
+	dcp->s2r_step = named_calls ? 0 : ARRAY_SIZE(dcp_s2r_seq) - 1;
+	dcp_s2r_run(dcp, NULL, cookie);
+
+	left = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(1000));
+	kref_put(&cookie->refcount, release_wait_cookie);
+
+	return left ? 0 : -ETIMEDOUT;
+}
+#endif
 
 static bool dcp_power_stop_confirmed(struct dcp_wait_cookie *cookie)
 {

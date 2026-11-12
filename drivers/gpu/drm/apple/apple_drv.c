@@ -47,6 +47,7 @@
 #include <drm/drm_vblank.h>
 #include <drm/drm_fixed.h>
 #include <linux/pm.h>
+#include <linux/suspend.h>
 
 #include "apple_boot_display.h"
 #include "apple_resume.h"
@@ -67,7 +68,14 @@ struct apple_drm_private {
 	 * the screen, the DRM device stays unregistered and its DCPs running.
 	 */
 	bool aborted;
+	/* This suspend found every firmware already stopped. */
+	bool s2r_skipped;
+	/* A dark wake left the outputs as the suspend did, for the next resume. */
+	bool dark_held;
+	struct notifier_block pm_nb;
 };
+
+static int apple_drm_pm_notify(struct notifier_block *nb, unsigned long action, void *data);
 
 /* Component readiness is later than platform probe/bind. */
 static DEFINE_MUTEX(apple_g15_display_lock);
@@ -1794,6 +1802,9 @@ static int apple_drm_init(struct device *dev)
 		goto err_unbind;
 	}
 
+	apple->pm_nb.notifier_call = apple_drm_pm_notify;
+	register_pm_notifier(&apple->pm_nb);
+
 	return 0;
 
 err_unlock:
@@ -1816,6 +1827,8 @@ static void apple_drm_uninit(struct device *dev)
 	/* An aborted takeover leaves its DCPs running until the reboot. */
 	if (apple->aborted)
 		return;
+
+	unregister_pm_notifier(&apple->pm_nb);
 
 	/* Before anything of the DRM device is torn down. */
 	t8132_ext_drm_fini(&apple->drm);
@@ -1935,12 +1948,38 @@ static const struct of_device_id of_match[] = {
 MODULE_DEVICE_TABLE(of, of_match);
 
 #ifdef CONFIG_PM_SLEEP
+/*
+ * Left stopped by a suspend that never reached the commit. Nothing can commit to
+ * them, and a refused sleep has to be able to try again.
+ */
+static bool apple_drm_firmware_stopped(struct apple_drm_private *apple)
+{
+	struct drm_crtc *crtc;
+	bool stopped = false;
+
+	drm_for_each_crtc(crtc, &apple->drm) {
+		if (t8132_ext_crtc(crtc) ||
+		    !dcp_s2r_firmware_stopped(to_apple_crtc(crtc)->dcp))
+			return false;
+		stopped = true;
+	}
+
+	return stopped;
+}
+
 static int apple_platform_suspend(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
 
-	if (apple && !apple->aborted)
-		return drm_mode_config_helper_suspend(&apple->drm);
+	/* Still suspended from before a dark wake. */
+	if (apple && apple->dark_held)
+		return 0;
+
+	if (apple && !apple->aborted) {
+		apple->s2r_skipped = apple_drm_firmware_stopped(apple);
+		if (!apple->s2r_skipped)
+			return drm_mode_config_helper_suspend(&apple->drm);
+	}
 
 	return 0;
 }
@@ -1962,29 +2001,71 @@ static bool apple_drm_hold_resume_events(struct apple_drm_private *apple, u32 cr
 	return held;
 }
 
+static void apple_drm_resume_outputs(struct apple_drm_private *apple)
+{
+	u32 dropped = 0;
+
+	apple->dark_held = false;
+	if (apple->drm.mode_config.suspend_state)
+		dropped = apple_drm_drop_stale_crtcs(apple->drm.mode_config.suspend_state);
+	/* Have userspace set the mode of a CRTC resumed disabled again. */
+	if (dropped && apple_drm_hold_resume_events(apple, dropped))
+		dropped = 0;
+	drm_mode_config_helper_resume(&apple->drm);
+	if (dropped)
+		drm_kms_helper_hotplug_event(&apple->drm);
+}
+
 static int apple_platform_resume(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
-	u32 dropped = 0;
 
-	if (apple && !apple->aborted) {
-		if (apple->drm.mode_config.suspend_state)
-			dropped = apple_drm_drop_stale_crtcs(apple->drm.mode_config.suspend_state);
-		/* Have userspace set the mode of a CRTC resumed disabled again. */
-		if (dropped && apple_drm_hold_resume_events(apple, dropped))
-			dropped = 0;
-		drm_mode_config_helper_resume(&apple->drm);
-		if (dropped)
-			drm_kms_helper_hotplug_event(&apple->drm);
+	if (!apple || apple->aborted || apple->s2r_skipped)
+		return 0;
+
+	/* A dark wake goes back to sleep with user space frozen: nothing is lit for it. */
+	if (pm_dark_wake()) {
+		apple->dark_held = true;
+		dev_info(dev, "dark wake: outputs stay off\n");
+		return 0;
 	}
 
+	apple_drm_resume_outputs(apple);
 	return 0;
+}
+
+/* The suspend after a dark wake failed before it suspended this device. */
+static void apple_platform_complete(struct device *dev)
+{
+	struct apple_drm_private *apple = dev_get_drvdata(dev);
+
+	if (apple && apple->dark_held && !pm_dark_wake())
+		apple_drm_resume_outputs(apple);
+}
+
+/* It failed before ->prepare() reached this device, so ->complete() didn't run either. */
+static int apple_drm_pm_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	struct apple_drm_private *apple = container_of(nb, struct apple_drm_private, pm_nb);
+
+	if (action == PM_POST_SUSPEND && apple->dark_held) {
+		dev_warn(apple->drm.dev, "dark wake over without a resume: outputs back now\n");
+		apple_drm_resume_outputs(apple);
+	}
+
+	return NOTIFY_DONE;
 }
 
 static const struct dev_pm_ops apple_platform_pm_ops = {
 	.suspend	= apple_platform_suspend,
 	.resume		= apple_platform_resume,
+	.complete	= apple_platform_complete,
 };
+#else
+static int apple_drm_pm_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	return NOTIFY_DONE;
+}
 #endif
 
 static struct platform_driver apple_platform_driver = {

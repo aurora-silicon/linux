@@ -116,8 +116,17 @@ struct apple_pmp_report {
 	/* Requests made through entries: bits requested on, all bits. */
 	u64 shadow;
 	u64 known;
-	/* Requests are held in memory until the PMP runs (@defer_requests). */
+	/* Bits whose drivers withdraw them at the sleep's commit, with the PMP still running. */
+	u64 commit_owned;
+	/*
+	 * Requests are held in memory until the PMP runs (@defer_requests), and
+	 * while it's stopped for a system sleep.
+	 */
 	bool defer;
+	/* The request word when a system sleep stopped the PMP. */
+	u64 sleep_request;
+	/* The last SOC-DEV-DVFS word written to each entry, 0 if none. */
+	u64 *dvfs_shadow;
 	unsigned int polls;
 	struct delayed_work ready_work;
 	struct device_node *native_pmp;
@@ -448,7 +457,7 @@ static void apple_pmp_report_ready_work(struct work_struct *work)
 
 	spin_lock_irqsave(&rep->lock, flags);
 	val = readq(rep->base + offs->tgt_read);
-	val = (val & ~rep->known) | rep->shadow;
+	val = apple_pmp_request_word(val, rep->known, rep->shadow);
 	writeq(val, rep->base + offs->tgt_write);
 	want = rep->shadow;
 	rep->defer = false;
@@ -461,6 +470,97 @@ static void apple_pmp_report_ready_work(struct work_struct *work)
 	dev_info(rep->dev, "PMP running (status %#llx), requests %#llx\n",
 		 readq(rep->base + offs->status), want);
 }
+
+/* A report names its PMP where a SoC has more than one kind of link to it. */
+static bool apple_pmp_report_of(const struct apple_pmp_report *rep, const struct device *pmp)
+{
+	struct device_node *np = of_parse_phandle(rep->dev->of_node, "apple,pmp", 0);
+	bool match = !np || np == pmp->of_node;
+
+	of_node_put(np);
+	return match;
+}
+
+/**
+ * apple_pmp_report_sleep() - withdraw and hold requests before a system sleep stops the PMP
+ * @pmp: the PMP device, still running
+ * @at_commit: the PMP stops at the sleep's commit, so requests whose drivers withdraw them
+ *	there are left set
+ *
+ * The devices behind these requests have stopped by now, so the PMP is told before
+ * it goes. Requests made from here on only update the books, so nothing waits on an
+ * acknowledgment from a stopped PMP. Bits no entry owns are left alone: nothing here
+ * knows whether their devices have stopped.
+ */
+void apple_pmp_report_sleep(struct device *pmp, bool at_commit)
+{
+	struct apple_pmp_report *rep;
+	unsigned long flags;
+	u64 val, withdrawn;
+
+	guard(mutex)(&apple_pmp_reports_lock);
+	list_for_each_entry(rep, &apple_pmp_reports, list) {
+		const struct apple_pmp_report_offsets *offs = rep->offsets;
+
+		if (!apple_pmp_report_of(rep, pmp))
+			continue;
+		spin_lock_irqsave(&rep->lock, flags);
+		rep->sleep_request = readq(rep->base + offs->tgt_read);
+		withdrawn = rep->sleep_request & rep->known & ~(at_commit ? rep->commit_owned : 0);
+		if (withdrawn)
+			writeq(rep->sleep_request & ~withdrawn, rep->base + offs->tgt_write);
+		rep->defer = true;
+		spin_unlock_irqrestore(&rep->lock, flags);
+
+		if (withdrawn && readq_poll_timeout(rep->base + offs->actual, val,
+						    !(val & withdrawn), 100, 50000))
+			dev_warn(rep->dev, "PMP still acknowledges withdrawn requests %#llx (ack %#llx)\n",
+				 withdrawn, val);
+	}
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_sleep);
+
+/**
+ * apple_pmp_report_wake() - hand the PMP every request after a system sleep
+ * @pmp: the PMP device, running again
+ * @lost_power: the sleep reached the hardware, so the report may have lost its
+ *	contents: bits no entry owns come from the word kept at the sleep
+ *
+ * The power requests go first and the performance requests after them, the
+ * order an entry uses when it powers on.
+ */
+void apple_pmp_report_wake(struct device *pmp, bool lost_power)
+{
+	struct apple_pmp_report *rep;
+	unsigned long flags;
+	unsigned int i;
+	u64 val, want;
+
+	guard(mutex)(&apple_pmp_reports_lock);
+	list_for_each_entry(rep, &apple_pmp_reports, list) {
+		const struct apple_pmp_report_offsets *offs = rep->offsets;
+
+		if (!apple_pmp_report_of(rep, pmp))
+			continue;
+		spin_lock_irqsave(&rep->lock, flags);
+		val = lost_power ? rep->sleep_request : readq(rep->base + offs->tgt_read);
+		writeq(apple_pmp_request_word(val, rep->known, rep->shadow),
+		       rep->base + offs->tgt_write);
+		for (i = 0; rep->dvfs_shadow && i < offs->dvfs_count; i++)
+			if (rep->dvfs_shadow[i])
+				writeq(rep->dvfs_shadow[i],
+				       rep->base + offs->update + 8 * (offs->dvfs_first + i));
+		want = rep->shadow;
+		rep->defer = false;
+		spin_unlock_irqrestore(&rep->lock, flags);
+
+		if (want && readq_poll_timeout(rep->base + offs->actual, val,
+					       (val & want) == want, 1000, 1000000))
+			dev_warn(rep->dev, "PMP did not acknowledge requests %#llx (ack %#llx)\n",
+				 want, val);
+	}
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_wake);
 
 /* The unique, enabled and acknowledged T6030 display request (DISP, reg 7). */
 static struct device_node *apple_pmp_report_t6030_entry(struct device_node *report)
@@ -2288,6 +2388,12 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	}
 
 	rep->defer = rep->offsets->defer_requests;
+	if (rep->offsets->dvfs_count) {
+		rep->dvfs_shadow = devm_kcalloc(dev, rep->offsets->dvfs_count,
+						sizeof(*rep->dvfs_shadow), GFP_KERNEL);
+		if (!rep->dvfs_shadow)
+			return -ENOMEM;
+	}
 	INIT_DELAYED_WORK(&rep->ready_work, apple_pmp_report_ready_work);
 	platform_set_drvdata(pdev, rep);
 
@@ -2840,7 +2946,13 @@ EXPORT_SYMBOL_GPL(apple_pmp_report_set_t6030_gfx);
  */
 static void apple_pmp_report_dvfs_write(struct apple_pmp_report *rep, u32 entry, u64 val)
 {
-	writeq(val, rep->base + rep->offsets->update + 8 * entry);
+	unsigned long flags;
+
+	spin_lock_irqsave(&rep->lock, flags);
+	rep->dvfs_shadow[entry - rep->offsets->dvfs_first] = val;
+	if (!rep->defer)
+		writeq(val, rep->base + rep->offsets->update + 8 * entry);
+	spin_unlock_irqrestore(&rep->lock, flags);
 }
 
 /**
@@ -2914,6 +3026,136 @@ static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, boo
 	rcu_read_unlock();
 	return ret;
 }
+
+/**
+ * apple_pmp_report_entry_request() - set or withdraw one entry's request
+ * @entry: the report entry's node
+ * @enable: make the request, or withdraw it
+ *
+ * For a driver that switches its device's power itself around a system sleep. The
+ * PMP may use a device whose request is set, so that driver withdraws the request
+ * before its power goes and makes it again after its power is back. A withdrawn
+ * request isn't replayed after the PMP restarts.
+ *
+ * Return: 0, also with no report bound or the PMP not running, or the error from
+ * waiting for its acknowledgment.
+ */
+int apple_pmp_report_entry_request(const struct device_node *entry, bool enable)
+{
+	struct device_node *report;
+	struct apple_pmp_report *rep;
+	u32 id;
+	int ret = 0;
+
+	if (of_property_read_u32(entry, "reg", &id))
+		return -EINVAL;
+
+	report = of_get_parent(entry);
+	rcu_read_lock();
+	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
+		if (rep->dev->of_node != report)
+			continue;
+		ret = apple_pmp_report_set_state(rep, id, enable, false);
+		break;
+	}
+	rcu_read_unlock();
+	of_node_put(report);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_entry_request);
+
+static struct apple_pmp_report *apple_pmp_report_of_entry(const struct device_node *entry,
+							  u32 *id)
+{
+	struct device_node *report;
+	struct apple_pmp_report *rep, *found = NULL;
+
+	if (of_property_read_u32(entry, "reg", id) || *id >= 64)
+		return NULL;
+	report = of_get_parent(entry);
+	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
+		if (rep->dev->of_node == report) {
+			found = rep;
+			break;
+		}
+	}
+	of_node_put(report);
+
+	return found;
+}
+
+/**
+ * apple_pmp_report_entry_commit_owned() - mark an entry withdrawn by its driver at the commit
+ * @entry: the report entry's node
+ * @owned: its driver withdraws it at the sleep's commit, or no longer does
+ *
+ * For a device whose stop moves to the sleep's commit: a PMP that stops there too keeps the
+ * request through apple_pmp_report_sleep(), until apple_pmp_report_entry_withdraw_polled().
+ *
+ * Return: 0, or -ENODEV with no report bound for the entry.
+ */
+int apple_pmp_report_entry_commit_owned(const struct device_node *entry, bool owned)
+{
+	struct apple_pmp_report *rep;
+	unsigned long flags;
+	int ret = -ENODEV;
+	u32 id;
+
+	rcu_read_lock();
+	rep = apple_pmp_report_of_entry(entry, &id);
+	if (rep) {
+		spin_lock_irqsave(&rep->lock, flags);
+		if (owned)
+			rep->commit_owned |= BIT_ULL(id);
+		else
+			rep->commit_owned &= ~BIT_ULL(id);
+		spin_unlock_irqrestore(&rep->lock, flags);
+		ret = 0;
+	}
+	rcu_read_unlock();
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_entry_commit_owned);
+
+/**
+ * apple_pmp_report_entry_withdraw_polled() - withdraw an entry's request at the sleep's commit
+ * @entry: the report entry's node
+ *
+ * Interrupts off, one CPU: the request goes even with requests held for the sleep, and the
+ * PMP's acknowledgment is polled for while it runs. One already withdrawn returns at once.
+ *
+ * Return: 0, also with no report bound, or -ETIMEDOUT with no acknowledgment.
+ */
+int apple_pmp_report_entry_withdraw_polled(const struct device_node *entry)
+{
+	struct apple_pmp_report *rep;
+	unsigned long flags;
+	u64 bit, val;
+	int ret = 0;
+	u32 id;
+
+	rcu_read_lock();
+	rep = apple_pmp_report_of_entry(entry, &id);
+	if (rep) {
+		bit = BIT_ULL(id);
+		spin_lock_irqsave(&rep->lock, flags);
+		rep->known |= bit;
+		rep->shadow &= ~bit;
+		val = readq(rep->base + rep->offsets->tgt_read);
+		if (val & bit)
+			writeq(val & ~bit, rep->base + rep->offsets->tgt_write);
+		spin_unlock_irqrestore(&rep->lock, flags);
+		if (apple_pmp_report_running(rep))
+			ret = readq_poll_timeout_atomic(rep->base + rep->offsets->actual, val,
+							!(val & bit), 10, 50000);
+	}
+	rcu_read_unlock();
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_entry_withdraw_polled);
 
 /*
  * System sleep. An external display processor's request keeps the PMP's

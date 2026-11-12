@@ -855,8 +855,11 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_resume(struct device *dev)
 	} else {
 		err = sn201202x_wake(sn);
 	}
-	if (!err)
+	if (!err) {
+		/* Registered before xHCI, so this is before the root port resumes. */
+		tipd_usb_wake(tps, false);
 		err = tipd_resume(tps);
+	}
 	/* The resume revalidation acknowledges events latched while asleep. */
 	if (tps->irq)
 		enable_irq(tps->irq);
@@ -906,6 +909,8 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_suspend(struct device *dev)
 		else
 			dev_warn(dev, "port state unreadable, no wakeup for an attach\n");
 	}
+	/* Registered before xHCI, so its root port has suspended by now. */
+	tipd_usb_wake(tps, true);
 	reinit_completion(&sn->sleep_completion);
 	err = spmi_command_sleep(sn->sdev);
 	if (err)

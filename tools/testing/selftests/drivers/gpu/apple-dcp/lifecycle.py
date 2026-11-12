@@ -793,6 +793,8 @@ static int dcp_external_stop_locked(struct apple_dcp *d, u64 generation)
 { (void)d; (void)generation; return 0; }
 static void dcp_external_crtc_released(struct apple_dcp *d) { (void)d; }
 static bool dcp_uses_soft_dpms(struct apple_dcp *d) { return d->soft_dpms; }
+/* The T8140 display power cycle has its own test on hardware; here it only has to be reached. */
+static void dcp_dpms_power_off(struct apple_dcp *d) { (void)d; }
 static bool __attribute__((unused)) dcp_has_panel(struct apple_dcp *d) { return !d->typec_output; }
 static void __attribute__((unused)) iomfb_blank_h17p(struct apple_dcp *d)
 { (void)d; assert(!"unexpected internal-panel blank in external-link test"); }
@@ -1069,6 +1071,9 @@ def teardown(root):
     for name in ('atcphy_mode_configuration', 'atcphy_hw', 'atcphy_dp_link_rate_configuration'):
         decls.append(block(files['atc'], files['atc'].index('struct ' + name + ' {')) + ';')
     decls.append(block(files['state'], files['state'].index('enum dwc3_apple_state {')) + ';')
+    role = 'static inline enum dwc3_apple_state dwc3_apple_state_for_role('
+    if role in files['state']:
+        decls.append(block(files['state'], files['state'].index(role)))
     start = files['atc'].index('static const struct {\n\tconst struct atcphy_mode_configuration normal;')
     end = files['atc'].index('\n};', start) + 3
     decls.append(files['atc'][start:end])
@@ -1088,7 +1093,7 @@ def teardown(root):
                 'atcphy_park_pipehandler',
                 'atcphy_get_mode_config', 'atcphy_dp_configure',
                 'j700_field_update', 'j700_aux_disable', 'atcphy_disable_dp_aux',
-                'atcphy_power_off', 'atcphy_power_on', *ATC_POST_TUNABLE, 'atcphy_configure', 'atcphy_restore_after_pd_off',
+                'atcphy_power_off', 'atcphy_power_on', *ATC_POST_TUNABLE, 'atcphy_configure', 'atcphy_forget_common_state', 'atcphy_restore_after_pd_off',
                 'atcphy_usb2_init', 'atcphy_usb3_power_off',
                 'atcphy_usb3_route', 'atcphy_usb3_set_mode', 'atcphy_usb2_power_off',
                 '_atcphy_dwc3_reset_assert', 'atcphy_dwc3_reset_assert', 'atcphy_mux_set'),
@@ -1196,6 +1201,7 @@ struct apple_dcp_hw_data {
     int iomfb_method_profile,firmware_compat;
     const struct resource *firmware_clock;
     u32 firmware_display_windows,firmware_scratch,firmware_request;
+    bool s2r,s2r_ext;
 };
 struct apple_dcp {
     struct device *dev; struct apple_dcp_hw_data hw;
