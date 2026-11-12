@@ -2666,11 +2666,10 @@ int DCP_FW_NAME(iomfb_s2r_500)(struct apple_dcp *dcp)
 
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)
 /*
- * The system's power state as the power management sets it on the
- * framebuffer: A473 with the first and
- * the last transition flag and no result, 0 for the sleep (as last_client_closed_sleep()
- * sends it) and 1 after the wake. The display's own power (dcp_poweron(), DPMS) sets no
- * flag and only moves the soft power state. After the sleep only this brings the
+ * The system's power state on the framebuffer: A473 with the first and the last
+ * transition flag and no result, 0 for the sleep and 1 after the wake. The
+ * display's own power (dcp_poweron(), DPMS) sets no flag and only moves the soft
+ * power state. After the sleep only this brings the
  * firmware's hard power state back; until then it refuses every mode set.
  */
 int DCP_FW_NAME(iomfb_system_power)(struct apple_dcp *dcp, bool on)

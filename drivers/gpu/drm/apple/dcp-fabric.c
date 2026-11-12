@@ -5063,8 +5063,8 @@ void dcp_fabric_hybrid_kick(struct apple_dcp *dcp, unsigned int delay_ms)
 
 /*
  * A wake connects every external display again, and a display that its link
- * has just woken can list the modes of its standby first: a G95NC in
- * picture-by-picture mode lists its full width then and asks for both pipes.
+ * has just woken can list the modes of its standby first: a monitor showing
+ * two inputs side by side lists its full width then and asks for both pipes.
  * dcp_wake_list_check() reads such a display again.  Until then, and until an
  * HDMI display is back that the wake found behind a converter without power,
  * the pipes stay with the displays the sleep found on them: the wake counts
