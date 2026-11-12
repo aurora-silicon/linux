@@ -530,7 +530,6 @@ allOf:
                 - apple,agx-t6050
                 - apple,agx-t8132
                 - apple,agx-t8140
-                - apple,agx-g17s
     then:
       properties:
         reg:
