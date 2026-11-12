@@ -518,7 +518,7 @@ struct sn201202x {
 	struct notifier_block role_nb;
 	struct work_struct role_work;
 	bool role_watch;
-	/* Restored from disk: the controller is driven polled until a new probe. */
+	/* Restored from disk: register selections are polled until it is set up again. */
 	bool cold_polled;
 };
 

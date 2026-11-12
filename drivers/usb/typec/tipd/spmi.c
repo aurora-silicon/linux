@@ -561,7 +561,7 @@ static int sn201202x_wake_poll(struct sn201202x *sn, bool poll)
 
 static int sn201202x_wake(struct sn201202x *sn)
 {
-	return sn201202x_wake_poll(sn, sn->polled || READ_ONCE(sn->cold_polled));
+	return sn201202x_wake_poll(sn, sn->polled);
 }
 
 VISIBLE_IF_KUNIT int __maybe_unused sn201202x_runtime_suspend(struct device *dev)
@@ -587,7 +587,7 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_runtime_suspend(struct device *dev
 	reinit_completion(&sn->sleep_completion);
 	if (spmi_command_sleep(sn->sdev))
 		goto retry;
-	if (!sn->polled && !READ_ONCE(sn->cold_polled) &&
+	if (!sn->polled &&
 	    !wait_for_completion_timeout(&sn->sleep_completion, msecs_to_jiffies(100))) {
 		/*
 		 * It accepted SLEEP, so it may be asleep without having
@@ -1001,7 +1001,7 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_suspend(struct device *dev)
 	err = spmi_command_sleep(sn->sdev);
 	if (err)
 		goto out_resume;
-	if (!sn->polled && !READ_ONCE(sn->cold_polled) &&
+	if (!sn->polled &&
 	    !wait_for_completion_timeout(&sn->sleep_completion, msecs_to_jiffies(100))) {
 		err = -ETIMEDOUT;
 		goto out_wake;
@@ -1054,17 +1054,13 @@ static int __maybe_unused sn201202x_restore(struct device *dev)
 
 	/*
 	 * The cold boot left the controller awake, so a wakeup command raises
-	 * no wake interrupt, and its register selections do not complete by
-	 * interrupt reliably: talk to it polled, as to a controller without
-	 * interrupts (selections, wake and sleep), until it is probed again.
+	 * no wake interrupt: it is woken polled. Until it is set up again its
+	 * register selections are polled as well, as on a controller without
+	 * interrupts.
 	 */
 	WRITE_ONCE(sn->cold_polled, true);
 	step = "wake";
-	err = sn201202x_wake(sn);
-	if (err == -ETIMEDOUT && !sn->polled) {
-		step = "awake check";
-		err = sn201202x_wake_poll(sn, true);
-	}
+	err = sn201202x_wake_poll(sn, true);
 	if (!err) {
 		step = "set-up";
 		err = tipd_reinit_after_cold_boot(tps);
@@ -1082,6 +1078,8 @@ static int __maybe_unused sn201202x_restore(struct device *dev)
 	/* The cold boot reset the controller, which also removed its mitigation. */
 	scoped_guard(mutex, &tps->lock)
 		sn201202x_ldcm_invalidate(tps);
+	/* Set up as after probe: from here on by its interrupts again. */
+	WRITE_ONCE(sn->cold_polled, false);
 	if (tps->irq)
 		enable_irq(tps->irq);
 	/* Give back the hold freeze took, as resume does */
