@@ -90,8 +90,17 @@ const MSG_IOVA_MASK: u64 = 0xFFFFFFFFFFFF;
 const SET_IOREG_INDEX_MASK: u64 = 0xFFFF;
 const PIO_VM_BASE: u64 = 0xc0000000;
 const PIO_GRANULARITY: u64 = 0x1000000;
-/* Coherent runtime report requested by the 25G83 T8112/T8140 PMP. */
-const PMP_REPORT_BUFFER_SIZE: u64 = 0xe400;
+/*
+ * Host-owned shared memory, as m1n1's proxyclient/m1n1/fw/pmp.py sets it up:
+ * the host allocates it and sends its DVA in a Configure message (type 0x10
+ * in bits 56:44, the same field the device power commands use); the firmware
+ * answers type 0x20 and publishes its status at +0xc000.
+ */
+const PMP_SHMEM_SIZE: usize = 0x10000;
+const MSG_TYPE_SHIFT: u32 = 44;
+const MSG_TYPE_MASK: u64 = 0x1fff;
+const MSG_TYPE_CONFIGURE: u64 = 0x10;
+const MSG_TYPE_CONFIGURE_ACK: u64 = 0x20;
 const PMP_GPU_EFFORT_OFFSET: usize = 0xc000;
 const PMP_GPU_EFFORT_MAX_COUNT: u32 = 2;
 
@@ -134,7 +143,12 @@ struct SramCopy {
 struct PmpState {
     iova_table: Option<Coherent<[IovaTableEntry]>>,
     allocs: KVec<PmpAllocation>,
-    report_addr: Option<u64>,
+    /// The host-owned shared memory, kept until unbind once the firmware has its address.
+    shmem: Option<Coherent<[u8]>>,
+    /// The firmware acknowledged the shared memory.
+    shmem_acked: bool,
+    /// The shared memory is live: offered and the firmware has not failed since.
+    report_live: bool,
     value_buf: Option<u64>,
     ioreg_entries: KVec<u32>,
     /// Held from a system sleep's start until its end.
@@ -146,7 +160,9 @@ impl PmpState {
         Ok(PmpState {
             iova_table: None,
             allocs: KVec::with_capacity(10, GFP_KERNEL)?,
-            report_addr: None,
+            shmem: None,
+            shmem_acked: false,
+            report_live: false,
             value_buf: None,
             ioreg_entries: KVec::with_capacity(340, GFP_KERNEL)?,
             sram: None,
@@ -168,9 +184,10 @@ impl PmpState {
     }
 
     fn gpu_effort(&self) -> Result<(u32, u32)> {
-        let addr = self.report_addr.ok_or(EAGAIN)?;
-        let idx = self.find_alloc(addr).ok_or(EAGAIN)?;
-        let buf = &self.allocs[idx].alloc;
+        if !self.report_live {
+            return Err(EAGAIN);
+        }
+        let buf = self.shmem.as_ref().ok_or(EAGAIN)?;
 
         if buf.len() < PMP_GPU_EFFORT_OFFSET + 3 * mem::size_of::<u32>() {
             return Err(EIO);
@@ -195,6 +212,7 @@ impl PmpState {
         /* Order the selected effort load after its published count. */
         fence(Ordering::Acquire);
         let offset = PMP_GPU_EFFORT_OFFSET + count as usize * mem::size_of::<u32>();
+        // SAFETY: as above; `count` is at most PMP_GPU_EFFORT_MAX_COUNT, checked against the length.
         let effort = u32::from_le(unsafe { base.add(offset).cast::<u32>().read_volatile() });
         Ok((count, effort))
     }
@@ -351,18 +369,11 @@ impl PmpData {
             },
             GFP_KERNEL,
         )?;
-        if size == PMP_REPORT_BUFFER_SIZE && state.report_addr.is_none() {
-            state.report_addr = Some(addr);
-            dev_info!(self.dev, "PMP coherent report buffer ready");
-        }
         Ok(msg)
     }
     fn free(&self, addr: u64) -> Result<u64> {
         let mut state = self.state.lock();
         if let Some(idx) = state.find_alloc(addr) {
-            if state.report_addr == Some(addr) {
-                state.report_addr = None;
-            }
             state.allocs.swap_remove(idx);
         } else {
             dev_err!(
@@ -475,7 +486,7 @@ impl PmpData {
     }
     fn fail_display(&self, error: Error) {
         /* A stopped or failed PMP no longer publishes coherent report data. */
-        self.state.lock().report_addr = None;
+        self.state.lock().report_live = false;
         // Publish failure before looking up either lazily registered consumer.
         // Pair with the post-registration fence below: registration cannot miss
         // the error while this path also misses the newly published provider.
@@ -604,7 +615,56 @@ impl PmpData {
         // and `control` is inside the ASC mapping held by `self`.
         to_result(unsafe { bindings::apple_rtkit_sleep_return(rtk, control) })
     }
+    /// Allocates the shared memory (once) and sends its DVA to the firmware, as m1n1 does.
+    /// The firmware's acknowledgment arrives as a message ([`Self::configure_ack`]).
+    fn offer_shmem(&self) -> Result {
+        let dva = {
+            let mut state = self.state.lock();
+            if state.shmem.is_none() {
+                // SAFETY: the PMP device is bound while its driver offers memory.
+                let bound_dev = unsafe { self.dev.as_bound() };
+                let shmem = Coherent::<u8>::zeroed_slice(bound_dev, PMP_SHMEM_SIZE, GFP_KERNEL)?;
+                state.shmem = Some(shmem);
+            }
+            let dva = state.shmem.as_ref().ok_or(ENOMEM)?.dma_address();
+            if dva & !MSG_IOVA_MASK != 0 {
+                return Err(ERANGE);
+            }
+            state.shmem_acked = false;
+            state.report_live = true;
+            dva
+        };
+        let msg = MSG_TYPE_CONFIGURE << MSG_TYPE_SHIFT | dva;
+        let sent = {
+            let mut guard = self.rtkit.lock();
+            match guard.as_mut().as_pin_mut() {
+                Some(rtk) => rtk.send_message(PMP_ENDPOINT, msg),
+                None => Err(ENODEV),
+            }
+        };
+        if let Err(error) = sent {
+            self.state.lock().report_live = false;
+            return Err(error);
+        }
+        dev_info!(self.dev, "PMP shared memory offered at {:#x}\n", dva);
+        Ok(())
+    }
+    fn configure_ack(&self, msg: u64) {
+        let mut state = self.state.lock();
+        if state.shmem.is_none() {
+            dev_warn!(self.dev, "PMP configure ack {:#018x} without shared memory\n", msg);
+            return;
+        }
+        if !state.shmem_acked {
+            state.shmem_acked = true;
+            dev_info!(self.dev, "PMP coherent report buffer ready\n");
+        }
+    }
     fn recv_message(&self, msg: u64) -> Result<()> {
+        if (msg >> MSG_TYPE_SHIFT) & MSG_TYPE_MASK == MSG_TYPE_CONFIGURE_ACK {
+            self.configure_ack(msg);
+            return Ok(());
+        }
         let pm_command = (msg >> PM_COMMAND_SHIFT) & 0xff;
         if msg & PM_COMMAND_MARKER != 0 && (pm_command == 0x0f || pm_command == 0x10) {
             let mut state = self.power_command.lock();
@@ -913,6 +973,8 @@ struct PmpHwConfig {
     /// The range of the firmware's SRAM, as (offset, size) in bytes, that a system sleep keeps
     /// and writes back. `None` where no sleep has been traced.
     sram_backup: Option<(usize, usize)>,
+    /// Give the firmware host-owned shared memory for its runtime report (GPU effort).
+    shmem: bool,
 }
 
 /// Whether a PMP firmware needs endpoint 7 to finish its RTKit boot.
@@ -931,6 +993,7 @@ const HW_CFG_DEFAULT: PmpHwConfig = PmpHwConfig {
     check_bootargs_uuid: false,
     coreanalytics: Ep7::No,
     sram_backup: None,
+    shmem: false,
 };
 
 /// T8140: the DART translates 42 bits and its DMA window starts at 1 TiB.
@@ -939,6 +1002,7 @@ const HW_CFG_T8140: PmpHwConfig = PmpHwConfig {
     check_bootargs_uuid: false,
     coreanalytics: Ep7::No,
     sram_backup: Some((0x3c000, 0x5c000)),
+    shmem: true,
 };
 
 /// T6041: the DART window starts at 1 TiB; the boot argument header is
@@ -949,6 +1013,7 @@ const HW_CFG_T6041: PmpHwConfig = PmpHwConfig {
     check_bootargs_uuid: true,
     coreanalytics: Ep7::Always,
     sram_backup: None,
+    shmem: false,
 };
 
 /// T8142: the DART window starts at 1 TiB as on T8140. Its registry-v2
@@ -959,6 +1024,7 @@ const HW_CFG_T8142: PmpHwConfig = PmpHwConfig {
     check_bootargs_uuid: false,
     coreanalytics: Ep7::Always,
     sram_backup: None,
+    shmem: false,
 };
 
 /// T6050: the DART window starts at 1 TiB (ADT dart-pmp0 vm-base) and spans
@@ -968,6 +1034,7 @@ const HW_CFG_T6050: PmpHwConfig = PmpHwConfig {
     check_bootargs_uuid: false,
     coreanalytics: Ep7::No,
     sram_backup: None,
+    shmem: false,
 };
 
 const HW_CFG_T8132: PmpHwConfig = PmpHwConfig {
@@ -975,6 +1042,7 @@ const HW_CFG_T8132: PmpHwConfig = PmpHwConfig {
     check_bootargs_uuid: false,
     coreanalytics: Ep7::RetainedBoard,
     sram_backup: None,
+    shmem: false,
 };
 
 impl Drop for PmpDriver {
@@ -1065,6 +1133,12 @@ impl platform::Driver for PmpDriver {
             .relaxed()
             .update(ASC_CPU_CONTROL, |r| r.with_const_cpu_run::<1>());
         data.start()?;
+        if cfg.shmem {
+            // Without it the PMP runs as before, only without the GPU effort report.
+            if let Err(error) = data.offer_shmem() {
+                dev_warn!(dev, "PMP shared memory not offered: {:?}\n", error);
+            }
+        }
         // SAFETY: the PMP owner retains both Devres mappings; managed child
         // teardown and provider cleanup precede device mapping revocation.
         to_result(unsafe {
