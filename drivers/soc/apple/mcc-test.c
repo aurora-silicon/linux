@@ -10,6 +10,8 @@ struct apple_mcc_test {
 	unsigned long attempted;
 	unsigned long disabled;
 	unsigned long flushed;
+	unsigned long cache_enabled;
+	unsigned long allocation_enabled;
 };
 
 static void apple_mcc_test_write(struct apple_mcc *mcc, unsigned int plane,
@@ -32,6 +34,13 @@ static void apple_mcc_test_write(struct apple_mcc *mcc, unsigned int plane,
 		/* Model a cache whose flush completes immediately. */
 		val = 0;
 	}
+	if (offset == T8112_CACHE_ENABLE) {
+		ctx->cache_enabled |= BIT(plane);
+		writel(T8112_CACHE_STATUS_READY,
+		       mcc->planes[plane] + T8112_CACHE_STATUS);
+	}
+	if (offset == T8112_CACHE_DISABLE && !val)
+		ctx->allocation_enabled |= BIT(plane);
 	writel(val, mcc->planes[plane] + offset);
 }
 
@@ -46,7 +55,7 @@ static struct apple_mcc_test *apple_mcc_test_alloc(struct kunit *test)
 	mcc = &ctx->mcc;
 	mcc->dev = kunit_device_register(test, "apple-mcc-test");
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, mcc->dev);
-	mcc->nr_planes = 3;
+	mcc->nr_planes = 4;
 	ctx->reject_plane = MCC_MAX_PLANES;
 	for (i = 0; i < mcc->nr_planes; i++) {
 		mcc->planes[i] = (__force void __iomem *)kunit_kzalloc(test, SZ_16K, GFP_KERNEL);
@@ -85,10 +94,26 @@ static void apple_mcc_test_quiesce(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, apple_mcc_enable(mcc), 0);
 	mcc->enabled = true;
 	apple_mcc_quiesce(mcc);
-	KUNIT_EXPECT_EQ(test, ctx->attempted, 7UL);
-	KUNIT_EXPECT_EQ(test, ctx->disabled, 7UL);
-	KUNIT_EXPECT_EQ(test, ctx->flushed, 7UL);
+	KUNIT_EXPECT_EQ(test, ctx->attempted, 15UL);
+	KUNIT_EXPECT_EQ(test, ctx->disabled, 15UL);
+	KUNIT_EXPECT_EQ(test, ctx->flushed, 15UL);
 	KUNIT_EXPECT_FALSE(test, mcc->enabled);
+}
+
+static void apple_mcc_test_t8112_restore(struct kunit *test)
+{
+	struct apple_mcc_test *ctx = apple_mcc_test_alloc(test);
+	struct apple_mcc *mcc = &ctx->mcc;
+	unsigned int i;
+
+	KUNIT_ASSERT_EQ(test, apple_mcc_enable_t8112(mcc), 0);
+	KUNIT_EXPECT_EQ(test, ctx->cache_enabled, 15UL);
+	KUNIT_EXPECT_EQ(test, ctx->allocation_enabled, 15UL);
+	for (i = 0; i < mcc->nr_planes; i++) {
+		KUNIT_EXPECT_EQ(test, readl(mcc->planes[i] + T8112_CACHE_ENABLE),
+				T8112_CACHE_WAYS);
+		KUNIT_EXPECT_EQ(test, readl(mcc->planes[i] + T8112_CACHE_DISABLE), 0U);
+	}
 }
 
 static void apple_mcc_test_not_ready(struct kunit *test)
@@ -107,6 +132,7 @@ static struct kunit_case apple_mcc_test_cases[] = {
 	KUNIT_CASE(apple_mcc_test_partial_enable),
 	KUNIT_CASE(apple_mcc_test_quiesce),
 	KUNIT_CASE(apple_mcc_test_not_ready),
+	KUNIT_CASE(apple_mcc_test_t8112_restore),
 	{}
 };
 
