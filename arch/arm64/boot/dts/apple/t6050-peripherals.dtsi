@@ -94,6 +94,12 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "pms";
+		/*
+		 * The PMP's firmware runs from boot until a real sleep stops it, on its own
+		 * core (pmp, "critical" in the ADT) and out of its own SRAM (pms-sram): none
+		 * of the three may be gated under it, s2idle included.
+		 */
+		apple,always-on;
 		status = "disabled";
 	};
 	ps_pmp: power-controller@128 {
@@ -103,6 +109,7 @@
 		#reset-cells = <0>;
 		label = "pmp";
 		power-domains = <&ps_pms>;
+		apple,always-on;
 		status = "disabled";
 	};
 	ps_pms_sram: power-controller@130 {
@@ -112,6 +119,7 @@
 		#reset-cells = <0>;
 		label = "pms-sram";
 		power-domains = <&ps_pms>;
+		apple,always-on;
 		status = "disabled";
 	};
 	ps_fab0_piogw: power-controller@1d8 {
