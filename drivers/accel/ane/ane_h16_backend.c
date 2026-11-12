@@ -37,9 +37,9 @@
 /*
  * Private program window above the SHAREDMALLOC range; host policy. Program
  * DVAs are never reused before a firmware reset, so the window bounds the sum
- * of every program loaded in one boot. 16G holds a whole-model encoder (the
- * Parakeet encoder is about 450M of constants) next to the per-layer programs
- * a decoder pipeline keeps resident; the DART aperture is 4T.
+ * of every program loaded in one boot. 16G holds programs with several
+ * hundred megabytes of constants each next to the many small ones a pipeline
+ * keeps resident; the DART aperture is 4T.
  */
 #define ANE_H16_PROGRAM_WINDOW SZ_16G
 
@@ -662,10 +662,9 @@ static int ane_h16_sleep_prepare(struct ane_h16_device *h)
 	 * An engine quarantined at bring-up (its firmware stopped part way
 	 * through every startup restart allowed) has no program session: there
 	 * is nothing to suspend, replay or boot again. It must not refuse every
-	 * later sleep of the boot (observed: a startup timeout at boot refused
-	 * every hibernation and suspend after it). With hung_stop, power it off
-	 * like a quarantined engine below, DARTs held until its domains are off,
-	 * and leave it off and quarantined, after the resume as after an abort.
+	 * later sleep of the boot. With hung_stop, power it off like a
+	 * quarantined engine below, DARTs held until its domains are off, and
+	 * leave it off and quarantined, after the resume as after an abort.
 	 */
 	if (!h->program_ready && h->boot.quarantined && ane_t6021_hung_stop) {
 		if (h->engine_on) {
@@ -674,7 +673,7 @@ static int ane_h16_sleep_prepare(struct ane_h16_device *h)
 			ane_h16_power_down(h);
 			ane_h16_release_darts(h, held);
 		}
-		dev_info(h->dev, "H16 ANE: quarantined engine left off for the sleep\n");
+		dev_info_once(h->dev, "H16 ANE: quarantined engine left off for the sleep\n");
 		WRITE_ONCE(h->slept, true);
 		return 0;
 	}
