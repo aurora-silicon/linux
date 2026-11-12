@@ -14,6 +14,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_wakeup.h>
 #include <linux/soc/apple/dockchannel.h>
+#include <linux/suspend.h>
 #include <linux/unaligned.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
@@ -127,12 +128,15 @@ static irqreturn_t dockchannel_tx_irq(int irq, void *data)
  * configuration registers hold what the boot loader or the boot kernel left,
  * while the restored interrupt state says that receive is armed. Program it
  * again and keep waiting, instead of waking a client to read data that is
- * not there.
+ * not there. Only a kernel restored from an image is in that position: any
+ * other takes every receive interrupt as it comes.
  */
 static bool dockchannel_rx_spurious(struct dockchannel *dockchannel)
 {
 	u32 thresh = READ_ONCE(dockchannel->rx_thresh);
 
+	if (!pm_hibernate_is_restored())
+		return false;
 	if (readl_relaxed(dockchannel->data_base + DATA_RX_COUNT) >= thresh)
 		goto real;
 	writel_relaxed(thresh, dockchannel->config_base + CONFIG_RX_THRESH);
