@@ -372,7 +372,7 @@ impl Outputs {
         self.submission.as_ref().map(Aggregate::fence).or_else(|| {
             self.fallback
                 .as_ref()
-                .map(Fence::from_fence)
+                .map(|fence| Fence::from_fence(fence))
         })
     }
     pub(crate) fn publish(&mut self, context: Arc<Context>, firmware_source: bool) -> Result<Aggregate> {
