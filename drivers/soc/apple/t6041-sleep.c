@@ -2,9 +2,10 @@
 /*
  * Apple T6041 (M4 Max) system sleep, at EL2 with no monitor below.
  *
- * Test driver, entry only: it runs macOS 26.6.2's last steps before the S2R commit, in
- * macOS's order and with its values, as traced from macOS sleeping under aura's hypervisor,
- * and commits. No resume yet: a wake goes through the boot object as a fresh boot.
+ * It runs macOS 26.6.2's last steps before the S2R commit, in macOS's order and with its
+ * values, as traced from macOS sleeping under aura's hypervisor, and commits; aura's S2R
+ * mailbox brings the boot core back to cpu_resume on the wake, and the driver restores what
+ * the sleep took.
  *
  * Needs the kernel at EL2 (CTXR window) and the "aurora,rvbar-spin-table" CPU enable method,
  * so the other cores can leave the kernel.
@@ -2046,7 +2047,7 @@ static int t6041_sleep_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "cannot control CPU power\n");
 	suspend_set_ops(&t6041_sleep_ops);
-	dev_info(dev, "T6041 deep sleep (test, entry only)\n");
+	dev_info(dev, "T6041 deep sleep at EL2 through aura's S2R mailbox\n");
 	return 0;
 }
 
