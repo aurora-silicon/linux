@@ -139,6 +139,12 @@ pub(crate) use residency::{Gate as ResidencyGate, VmShrinker};
 
 /// PPL magic number for the handoff region
 const PPL_MAGIC: u64 = 0x4b1d000000000002;
+/// Written by the G18G GFX firmware of macOS 27.2 (RTKit 3514.41.1) to the
+/// handoff's firmware magic while it maps the handoff region during its own
+/// boot, whether or not a peer exists. It is not a
+/// PPL handshake reply (that is [`PPL_MAGIC`]); 3514.0.15 writes nothing.
+#[cfg(CONFIG_DRM_ASAHI_G18)]
+const FW_BOOT_MAGIC_V3: u64 = 0x4b1d000000000003;
 
 /// Number of supported context entries in the TTBAT
 const UAT_NUM_CTX: usize = 64;
@@ -2294,7 +2300,7 @@ impl Handoff {
     fn init(&self, firmware: UatFirmware, slot: u32, unk2: u8) -> Result {
         #[cfg(CONFIG_DRM_ASAHI_G18)]
         if firmware.is_no_peer()
-            && (self.magic_fw.load(Ordering::Acquire) != 0
+            && (!matches!(self.magic_fw.load(Ordering::Acquire), 0 | FW_BOOT_MAGIC_V3)
                 || self.lock_fw.load(Ordering::Acquire) != 0)
         {
             pr_err!("T8152 handoff: unexpected firmware peer; refusing no-peer mode\n");
