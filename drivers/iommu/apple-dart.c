@@ -6408,13 +6408,15 @@ EXPORT_SYMBOL_GPL(apple_dart_state_restore);
  * before any early resume: coprocessors such as the PMP and SIO restart their firmware in
  * their early resume, and its first DMA has to find the DART already restored. Any other
  * sleep keeps the normal phase, which the PCIe-C tunnel DARTs need: their host stops and
- * restarts the port clock in its own noirq callbacks.
+ * restarts the port clock in its own noirq callbacks. The adopted J613 MTP stays live:
+ * system s2idle must retain, never reset it.
  */
-/* The adopted MTP stays live: system s2idle must retain, never reset it. */
-static int apple_dart_live_mtp_suspend(struct device *dev)
+static int apple_dart_system_suspend(struct device *dev)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
 
+	if (!dart->live_mtp)
+		return pm_suspend_via_firmware() ? 0 : pm_runtime_force_suspend(dev);
 	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
 		return -EBUSY;
 	if (apple_dart_readl(dart, DART_TCR(dart, 1)) != dart->hw->tcr_bypass)
@@ -6426,10 +6428,12 @@ static int apple_dart_live_mtp_suspend(struct device *dev)
 	return 0;
 }
 
-static int apple_dart_live_mtp_resume(struct device *dev)
+static int apple_dart_system_resume(struct device *dev)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
 
+	if (!dart->live_mtp)
+		return pm_suspend_via_firmware() ? 0 : pm_runtime_force_resume(dev);
 	if (!dart->live_mtp_sleep)
 		return 0;
 	dart->live_mtp_sleep = false;
@@ -6439,24 +6443,6 @@ static int apple_dart_live_mtp_resume(struct device *dev)
 	}
 	dev_dbg(dev, "live MTP s2idle: bypass retained; no reset or invalidate\n");
 	return 0;
-}
-
-static __maybe_unused int apple_dart_sys_suspend(struct device *dev)
-{
-	struct apple_dart *dart = dev_get_drvdata(dev);
-
-	if (dart->live_mtp)
-		return apple_dart_live_mtp_suspend(dev);
-	return pm_suspend_via_firmware() ? 0 : pm_runtime_force_suspend(dev);
-}
-
-static __maybe_unused int apple_dart_sys_resume(struct device *dev)
-{
-	struct apple_dart *dart = dev_get_drvdata(dev);
-
-	if (dart->live_mtp)
-		return apple_dart_live_mtp_resume(dev);
-	return pm_suspend_via_firmware() ? 0 : pm_runtime_force_resume(dev);
 }
 
 static __maybe_unused int apple_dart_sys_suspend_noirq(struct device *dev)
@@ -6470,7 +6456,7 @@ static __maybe_unused int apple_dart_sys_resume_noirq(struct device *dev)
 }
 
 static const struct dev_pm_ops apple_dart_pm_ops = {
-	SYSTEM_SLEEP_PM_OPS(apple_dart_sys_suspend, apple_dart_sys_resume)
+	SYSTEM_SLEEP_PM_OPS(apple_dart_system_suspend, apple_dart_system_resume)
 	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_dart_sys_suspend_noirq, apple_dart_sys_resume_noirq)
 	RUNTIME_PM_OPS(apple_dart_suspend, apple_dart_resume, NULL)
 };

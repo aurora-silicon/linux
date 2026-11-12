@@ -1466,7 +1466,7 @@ impl SepData {
         }
         // Do not commit a running enclave whose sleep protocol is not ready.
         if self.phase.load(Relaxed) != PHASE_READY || !self.endpoint_present(proto::EP_CONTROL) {
-            dev_warn!(
+            dev_warn_ratelimited!(
                 self.dev,
                 "sleep refused: the enclave did not finish coming up\n"
             );
@@ -1481,7 +1481,7 @@ impl SepData {
             |ms| kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(ms))),
         );
         if !idle {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "sleep refused: a request is still waiting for its reply\n"
             );
@@ -1490,7 +1490,7 @@ impl SepData {
         }
 
         if let Err(e) = self.sleep_leave_for_commit() {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "sleep refused: irreversible request could not be staged ({:?})\n",
                 e
@@ -1569,10 +1569,10 @@ impl SepData {
             Ok(()) => {
                 self.set_sleep_gate(pm::SleepGate::Open);
                 // One line per sleep it was told of: nothing else says it came back.
-                dev_info!(self.dev, "the enclave is back from its sleep request\n");
+                dev_info_ratelimited!(self.dev, "the enclave is back from its sleep request\n");
             }
             Err(e) => {
-                dev_err!(
+                dev_err_ratelimited!(
                     self.dev,
                     "the enclave did not come back ({:?}); it stays unused until a reboot\n",
                     e

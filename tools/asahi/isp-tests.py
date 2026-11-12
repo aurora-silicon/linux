@@ -50,6 +50,9 @@ def main():
                      'apple_isp_firmware_halt', 'isp_firmware_boot',
                      'apple_isp_firmware_boot', 'apple_isp_firmware_shutdown'],
     }
+    # #1445 sends through a per-channel helper; the latch guards it too.
+    if 'static int isp_cmd_send_chan(' in inputs['isp-cmd.c']:
+        groups['isp-cmd.c'] = ['isp_cmd_send_chan'] + groups['isp-cmd.c']
     if args.suite == 'session':
         groups['isp-ipc.c'] += ['chan_rx_done', 'ipc_chan_handle']
         groups['isp-fw.c'] += ['apple_isp_isr_thread']
@@ -66,7 +69,11 @@ def main():
         guard = 'if (READ_ONCE(isp->ipc_error))\n\t\treturn READ_ONCE(isp->ipc_error);'
         if guard not in bodies['isp_cmd_send']:
             raise RuntimeError('overwrite negative control no longer matches its guard')
-        bodies['isp_cmd_send'] = bodies['isp_cmd_send'].replace(guard, '')
+        for name in ('isp_cmd_send', 'isp_cmd_send_chan'):
+            if name in bodies:
+                if guard not in bodies[name]:
+                    raise RuntimeError('overwrite negative control no longer matches ' + name)
+                bodies[name] = bodies[name].replace(guard, '')
     elif args.control == 'stop':
         bodies['apple_isp_stop_capture'] = bodies['apple_isp_stop_capture'].replace(
             'if (!isp_cmd_ch_stop(isp, 0)) /* TODO channel mask */',
