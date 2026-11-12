@@ -3095,6 +3095,14 @@ brcmf_pcie_remove(struct pci_dev *pdev)
 
 	brcmf_bus_cancel_reset_work(bus);
 
+	/*
+	 * Stop the dongle before its host buffers go away. Until the chip is
+	 * reset its firmware keeps running and DMAs received frames into the
+	 * RX buffers that brcmf_detach() unmaps, which the IOMMU reports as
+	 * translation faults.
+	 */
+	brcmf_pcie_reset_device(devinfo);
+
 	brcmf_detach(&pdev->dev);
 	brcmf_free(&pdev->dev);
 
@@ -3106,7 +3114,6 @@ brcmf_pcie_remove(struct pci_dev *pdev)
 	brcmf_pcie_release_irq(devinfo);
 	brcmf_pcie_release_scratchbuffers(devinfo);
 	brcmf_pcie_release_ringbuffers(devinfo);
-	brcmf_pcie_reset_device(devinfo);
 	brcmf_pcie_release_resource(devinfo);
 	release_firmware(devinfo->clm_fw);
 	release_firmware(devinfo->txcap_fw);
