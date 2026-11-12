@@ -1408,12 +1408,6 @@ static void t6040_pmu_write(struct t6040_sleep *s, u16 reg, u8 val)
 	writel(enable, s->spmi0 + SPMI_NOTIFY_ENABLE);
 }
 
-/* A no-op: this controller keeps no progress marks. */
-void apple_sleep_bringup_mark(u32 v)
-{
-}
-EXPORT_SYMBOL_GPL(apple_sleep_bringup_mark);
-
 /*
  * Between the steps of the wake return: every access of a step is complete, and a fault it
  * raised is taken, before the next step starts.

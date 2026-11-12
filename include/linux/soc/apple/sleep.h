@@ -342,13 +342,7 @@ static inline int apple_sleep_engine_reset(struct device *dev)
 #if IS_ENABLED(CONFIG_APPLE_T6040_SLEEP)
 bool apple_sleep_power_loss(void);
 bool apple_sleep_last_steps(void);
-/* S2R bring-up: a progress mark that survives a reset (t6040-sleep, between .begin and .end). */
-void apple_sleep_bringup_mark(u32 v);
 #else
-static inline void apple_sleep_bringup_mark(u32 v)
-{
-}
-
 static inline bool apple_sleep_power_loss(void)
 {
 	return pm_suspend_via_firmware();
