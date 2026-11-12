@@ -1165,7 +1165,7 @@ static int aic_syscore_suspend(void *data)
 	struct aic_irq_chip *ic = aic_irqc;
 	u32 die, i, off = 0;
 
-	if (!aic_sleep.irq_cfg || !pm_suspend_via_firmware())
+	if (!pm_suspend_via_firmware())
 		return 0;
 
 	aic_sleep.config = aic_ic_read(ic, AIC2_CONFIG);
@@ -1319,9 +1319,7 @@ static void __init aic_sleep_init(struct aic_irq_chip *irqc, struct device_node 
 	if (WARN_ON(!aic_sleep.irq_cfg))
 		return;
 
-	/* A resume from disk needs the mask resync on every SoC. */
-	if (aic_sleep.irq_cfg || IS_ENABLED(CONFIG_HIBERNATION))
-		register_syscore(&aic_syscore);
+	register_syscore(&aic_syscore);
 }
 #else
 static void __init aic_sleep_init(struct aic_irq_chip *irqc, struct device_node *node)
