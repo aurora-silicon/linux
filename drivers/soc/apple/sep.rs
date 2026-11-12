@@ -668,6 +668,11 @@ struct SepData {
 
     // The mailbox's receive interrupt is held off for the enclave's sleep.
     sleep_rx_held: Atomic<bool>,
+    /// Told at device suspend (no sleep core commit, T6041) rather than staged for the commit.
+    sleep_at_suspend: Atomic<bool>,
+    /// The enclave didn't answer a sleep request or a wake this boot: no deep sleep until a
+    /// reboot, as a commit over a running enclave resets the SoC.
+    sleep_unanswered: Atomic<bool>,
 
     #[pin]
     ool_xarm: Mutex<Option<OolPair>>,
@@ -1164,6 +1169,8 @@ impl SepData {
                 phase: Atomic::new(PHASE_ATTACH),
                 sleep_gate: Atomic::new(pm::SleepGate::Open as u32),
                 sleep_rx_held: Atomic::new(false),
+                sleep_at_suspend: Atomic::new(false),
+                sleep_unanswered: Atomic::new(false),
                 ool_xarm <- new_mutex!(Some(ool_xarm)),
                 ool_sbio <- new_mutex!(Some(ool_sbio)),
                 ool_sks <- new_mutex!(Some(ool_sks)),
@@ -1460,6 +1467,10 @@ impl SepData {
     /// Prepare a firmware-driven suspend without sending SLEEP. The platform
     /// owns the irreversible request, after every returnable refusal.
     pub(crate) fn sleep_enter(&self) -> Result<()> {
+        // T6041: its sleep driver has no sleep core commit, so the enclave is told now.
+        if !pm::platform_commit() {
+            return self.sleep_enter_at_suspend();
+        }
         match self.sleep_gate() {
             // A failed earlier wake is not repaired by another precommit attempt.
             pm::SleepGate::Lost => {
@@ -1517,6 +1528,178 @@ impl SepData {
         Ok(())
     }
 
+    /// Without a sleep core commit (T6041): tell the enclave at device suspend, seconds before
+    /// the platform's commit, which answers, saves its state and gates its own domain (waited
+    /// for in suspend_noirq). A deep sleep commits only over an enclave that is asleep.
+    fn sleep_enter_at_suspend(&self) -> Result<()> {
+        if self.sleep_unanswered.load(Relaxed) {
+            dev_err!(
+                self.dev,
+                "deep sleep refused: the enclave did not answer a sleep request or wake earlier this boot\n"
+            );
+            return Err(EBUSY);
+        }
+        match self.sleep_gate() {
+            // Gated already at an earlier, refused sleep: it stays asleep until a real wake.
+            pm::SleepGate::Lost if self.sleep_at_suspend.load(Relaxed) => return Ok(()),
+            pm::SleepGate::Lost => {
+                dev_err!(
+                    self.dev,
+                    "deep sleep refused: the enclave did not come back from a sleep earlier this boot\n"
+                );
+                return Err(EBUSY);
+            }
+            pm::SleepGate::Open => {}
+            _ => return Err(EBUSY),
+        }
+        // One that didn't come up still runs: a commit over it resets the SoC.
+        if self.phase.load(Relaxed) != PHASE_READY || !self.endpoint_present(proto::EP_CONTROL) {
+            dev_err!(
+                self.dev,
+                "deep sleep refused: the enclave did not finish coming up, so it can't be put to sleep\n"
+            );
+            return Err(EBUSY);
+        }
+        if !self.mailbox_drains() {
+            dev_err!(
+                self.dev,
+                "deep sleep refused: the enclave isn't taking messages (its mailbox stays full)\n"
+            );
+            return Err(EBUSY);
+        }
+
+        self.set_sleep_gate(pm::SleepGate::Draining);
+        let idle = control::wait_idle(
+            proto::CONTROL_TIMEOUT_MS,
+            10,
+            || self.control.lock().requests_in_flight(),
+            |ms| kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(ms))),
+        );
+        if !idle {
+            dev_err!(self.dev, "sleep refused: a request is still waiting for its reply\n");
+            self.set_sleep_gate(pm::SleepGate::Open);
+            return Err(EBUSY);
+        }
+
+        if let Err(e) = pm::dart_prepare(&self.dev) {
+            dev_err!(self.dev, "sleep refused: its DART could not be saved ({:?})\n", e);
+            self.set_sleep_gate(pm::SleepGate::Open);
+            return Err(e);
+        }
+
+        self.sleep_at_suspend.store(true, Relaxed);
+        match self.sleep_request() {
+            Ok(()) => {
+                if let Some(mbox) = self.mbox.lock().as_ref() {
+                    mbox.set_recv_enabled(false);
+                }
+                self.sleep_hold_rx();
+                self.set_sleep_gate(pm::SleepGate::Told);
+                dev_dbg!(self.dev, "the enclave answered the sleep request\n");
+                Ok(())
+            }
+            Err(e) => {
+                dev_err!(self.dev, "sleep refused: no answer to the sleep request ({:?})\n", e);
+                self.sleep_unanswered.store(true, Relaxed);
+                // A request that timed out may still have been taken.
+                self.set_sleep_gate(pm::SleepGate::Told);
+                self.sleep_exit();
+                Err(e)
+            }
+        }
+    }
+
+    /// Asks the enclave to go to sleep (told at suspend). The request is sent past the gate.
+    fn sleep_request(&self) -> Result<()> {
+        let op = proto::op_sleep();
+        let tag = proto::TAG_SLEEP;
+        let idx = self.control.lock().alloc_sleep()?;
+        let msg = proto::encode_control(&op, tag);
+
+        let sent = match self.mbox.lock().as_ref() {
+            Some(mbox) => Self::ring(mbox, msg),
+            None => Err(ENODEV),
+        };
+        if let Err(e) = sent {
+            self.control.lock().abandon(idx);
+            return Err(e);
+        }
+        match self.control_wait(&op, idx, tag)? {
+            Some(_) => Ok(()),
+            None => Err(ETIMEDOUT),
+        }
+    }
+
+    /// The wake of an enclave told at suspend: a real wake starts it, a refused sleep finds
+    /// it gated (it stays asleep until the next real sleep) or asks whether it still answers.
+    fn sleep_exit_at_suspend(&self) {
+        let gate = self.sleep_gate();
+        if gate == pm::SleepGate::Draining {
+            self.set_sleep_gate(pm::SleepGate::Open);
+            return;
+        }
+        if !gate.needs_wake() {
+            return;
+        }
+        // SAFETY: only reads a flag.
+        let real = unsafe { bindings::pm_resume_via_firmware() };
+        if !real && gate == pm::SleepGate::Lost {
+            return;
+        }
+        let answered = if real {
+            self.sleep_kick()
+        } else if pm::wait_gated(&self.dev) {
+            self.sleep_hold_rx();
+            self.set_sleep_gate(pm::SleepGate::Lost);
+            dev_warn!(
+                self.dev,
+                "the enclave stays asleep until the next real sleep or a reboot\n"
+            );
+            return;
+        } else {
+            dev_warn!(self.dev, "the enclave never gated its power domain\n");
+            self.sleep_probe()
+        };
+        match answered {
+            Ok(()) => {
+                self.sleep_at_suspend.store(false, Relaxed);
+                self.set_sleep_gate(pm::SleepGate::Open);
+                // One line per sleep it was told of: nothing else says it came back.
+                dev_info!(self.dev, "the enclave is back from its sleep request\n");
+            }
+            Err(e) => {
+                dev_err!(self.dev, "the enclave did not come back ({:?}); it stays unused\n", e);
+                self.sleep_unanswered.store(true, Relaxed);
+                self.sleep_hold_rx();
+                self.set_sleep_gate(pm::SleepGate::Lost);
+            }
+        }
+    }
+
+    /// Whether an enclave that was told and never gated still answers.
+    fn sleep_probe(&self) -> Result<()> {
+        pm::dart_restore(&self.dev);
+        self.sleep_release_rx();
+        let op = proto::op_nop(0);
+        let (idx, tag) = self.control.lock().alloc()?;
+        let msg = proto::encode_control(&op, tag);
+        let sent = match self.mbox.lock().as_ref() {
+            Some(mbox) => {
+                mbox.set_recv_enabled(true);
+                Self::ring(mbox, msg)
+            }
+            None => Err(ENODEV),
+        };
+        if let Err(e) = sent {
+            self.control.lock().abandon(idx);
+            return Err(e);
+        }
+        match self.control_wait(&op, idx, tag)? {
+            Some(_) => Ok(()),
+            None => Err(ETIMEDOUT),
+        }
+    }
+
     /// Stage without sending; the platform's commit owns SLEEP with IRQs off.
     fn sleep_leave_for_commit(&self) -> Result<()> {
         let request = proto::encode_control(&proto::op_sleep(), proto::TAG_SLEEP);
@@ -1569,6 +1752,10 @@ impl SepData {
     /// A refused precommit attempt was never sent; reopen normal admission.
     /// A sent request can be restarted only after actual physical sleep/wake.
     pub(crate) fn sleep_exit(&self) {
+        if self.sleep_at_suspend.load(Relaxed) {
+            self.sleep_exit_at_suspend();
+            return;
+        }
         // Staged only: an unsent refusal releases RX without a restart.
         match pm::commit_finish(&self.dev) {
             Some(true) => self.set_sleep_gate(pm::SleepGate::Told),
