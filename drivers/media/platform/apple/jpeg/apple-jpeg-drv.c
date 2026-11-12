@@ -30,6 +30,7 @@
 #include <media/v4l2-mem2mem.h>
 #include <media/videobuf2-dma-contig.h>
 
+#include "../apple-video-nr.h"
 #include "apple-jpeg-hw.h"
 
 #define AJ_NAME			"apple-jpeg"
@@ -868,7 +869,7 @@ static int aj_probe(struct platform_device *pdev)
 	vdev->vfl_dir = VFL_DIR_M2M;
 	vdev->device_caps = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING;
 	video_set_drvdata(vdev, jpeg);
-	return video_register_device(vdev, VFL_TYPE_VIDEO, -1);
+	return video_register_device(vdev, VFL_TYPE_VIDEO, APPLE_M2M_VIDEO_NR);
 }
 
 static void aj_remove(struct platform_device *pdev)
