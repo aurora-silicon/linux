@@ -5834,6 +5834,8 @@ static int apple_pcie_reset_for_resume(struct apple_pcie *pcie)
  */
 static int apple_pcie_neo_link_up(struct apple_pcie *pcie, struct apple_pcie_port *port)
 {
+	ktime_t released;
+	s64 left_us;
 	u32 stat;
 	int ret;
 
@@ -5841,8 +5843,8 @@ static int apple_pcie_neo_link_up(struct apple_pcie *pcie, struct apple_pcie_por
 	ret = gpiod_set_value_cansleep(port->perst_gpio, 0);
 	if (ret)
 		return ret;
-	/* 100 ms after PERST# as at boot, and after the link (PCIe r5.0, 6.6.1). */
-	msleep(100);
+	released = ktime_get();
+	/* macOS starts the training right after PERST#. */
 	ret = readl_relaxed_poll_timeout(port->base + PORT_STATUS, stat, stat & PORT_STATUS_READY,
 					 100, 250000);
 	if (ret)
@@ -5853,7 +5855,10 @@ static int apple_pcie_neo_link_up(struct apple_pcie *pcie, struct apple_pcie_por
 	if (ret)
 		return ret;
 	apple_pcie_port_writel(port, BIT(PORT_INT_LINK_UP), PORT_INTSTAT);
-	msleep(100);
+	/* No config request before 100 ms after PERST#, on a 5 GT/s port (PCIe r5.0, 6.6.1). */
+	left_us = 100 * USEC_PER_MSEC - ktime_us_delta(ktime_get(), released);
+	if (left_us > 0)
+		fsleep(left_us);
 
 	return 0;
 }
