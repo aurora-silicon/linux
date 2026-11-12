@@ -1133,16 +1133,16 @@
 &{/soc/power-management@286806000/performance-controller@1} {
 };
 
-&{/soc/power-management@2300e80000} {
+&{/soc@2300000000/power-management@2300e80000} {
 	status = "okay";
 };
 
-&{/soc/power-management@2300e80000/power-controller@0} {
+&{/soc@2300000000/power-management@2300e80000/power-controller@0} {
 };
 
-&{/soc/power-management@2300e80000/power-controller@100} {
+&{/soc@2300000000/power-management@2300e80000/power-controller@100} {
 };
 
-&{/soc/power-management@2300e80000/power-controller@110} {
-	power-domains = <&{/soc/power-management@2300e80000/power-controller@100} &{/soc/power-management@2300e80000/power-controller@0}>;
+&{/soc@2300000000/power-management@2300e80000/power-controller@110} {
+	power-domains = <&{/soc@2300000000/power-management@2300e80000/power-controller@100} &{/soc@2300000000/power-management@2300e80000/power-controller@0}>;
 };
