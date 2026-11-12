@@ -16,10 +16,7 @@ use core::sync::atomic::{
     AtomicU64, //
 };
 
-use kernel::{
-    drm::gem::shmem,
-    prelude::*, //
-};
+use kernel::prelude::*;
 
 use crate::driver::AsahiDrmDevice;
 use crate::{
@@ -223,11 +220,6 @@ impl KernelObject {
             ptr.write_bytes(0, 1);
             init(&mut *ptr)
         }
-    }
-
-    /// Returns a reference-counted kernel mapping of the object.
-    pub(crate) fn kernel_map(&self) -> Result<shmem::VMapOwned<gem::AsahiObject>> {
-        self.obj.gem.owned_vmap()
     }
 
     /// Transfers an unpublished object's GPU mapping to a longer-lived owner.

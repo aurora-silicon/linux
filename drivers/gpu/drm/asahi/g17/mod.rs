@@ -83,7 +83,6 @@ use kernel::{
     device::{self, Core},
     impl_has_delayed_work, impl_has_work,
     io::{
-        IoBase,
         IoSysMap,
         Region, //
     },
