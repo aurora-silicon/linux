@@ -10,9 +10,9 @@ config VIDEO_APPLE_PRORES
 	help
 	  V4L2 memory-to-memory driver for the ProRes encoder engine (APR)
 	  in Apple M1 Pro (T6000), M4 Pro (T6041), and A18 Pro (T8140)
-	  SoCs. On T6041 an optional per-machine
-	  apple/prores-t6041-init.bin replaces the built-in initialization
-	  rows. It encodes 8
+	  SoCs. On T6041 a per-machine apple/prores-t6041-init.bin
+	  replaces the built-in initialization rows; T6041 has no built-in
+	  rows yet, so it needs the file to probe. It encodes 8
 	  and 16 bit 4:2:2 and 4:4:4 frames to ProRes 422 Proxy, LT, 422, HQ,
 	  4444 and 4444 XQ.
 

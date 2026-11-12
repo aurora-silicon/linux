@@ -4,11 +4,13 @@
 T6041 ProRes initialization data
 ===============================
 
-The driver carries the T6041 ProRes initialization rows built in.  A
+The driver can carry ProRes initialization rows built in, and on T6041 a
 machine may override them with ``apple/prores-t6041-init.bin``, an APRI
 container generated for that Mac from its own macOS and not distributed with
-Linux.  Without the file, the built-in rows are used.  T6000 and T8140 do not
-request this file.
+Linux.  T6041 has no built-in rows yet, so until they are added the device
+probes only when the file is present; without it, probe fails with -ENOENT
+before any register is mapped.  T6000 and T8140 use their built-in rows and
+do not request this file.
 
 When the file is present, the driver reads and validates the whole of it
 before mapping device registers.  An invalid file makes the device fail to
