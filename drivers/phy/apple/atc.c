@@ -7243,7 +7243,7 @@ void apple_atcphy_sleep_finish_async(struct phy *usb2_phy, bool kept)
 	if (!atcphy)
 		return;
 	WRITE_ONCE(atcphy->sleep_finish_kept, kept);
-	queue_work(system_unbound_wq, &atcphy->sleep_finish_work);
+	queue_work(system_dfl_wq, &atcphy->sleep_finish_work);
 }
 EXPORT_SYMBOL_GPL(apple_atcphy_sleep_finish_async);
 

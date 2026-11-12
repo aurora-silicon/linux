@@ -201,7 +201,7 @@ static void dcp_secure_poll(struct work_struct *work)
 		dcp->secure_fast_until = jiffies + msecs_to_jiffies(DCP_SECURE_POLL_FAST_MS);
 		fast = true;
 	}
-	queue_delayed_work(system_unbound_wq, &dcp->secure_poll_wq,
+	queue_delayed_work(system_dfl_wq, &dcp->secure_poll_wq,
 			   fast ? 1 : msecs_to_jiffies(DCP_SECURE_POLL_SLOW_MS));
 }
 
@@ -209,7 +209,7 @@ static void dcp_secure_poll_start(struct apple_dcp *dcp)
 {
 	dcp->secure_fast_until = jiffies + msecs_to_jiffies(DCP_SECURE_POLL_FAST_MS);
 	WRITE_ONCE(dcp->secure_polling, true);
-	queue_delayed_work(system_unbound_wq, &dcp->secure_poll_wq, 0);
+	queue_delayed_work(system_dfl_wq, &dcp->secure_poll_wq, 0);
 }
 
 static void dcp_secure_poll_stop(struct apple_dcp *dcp)

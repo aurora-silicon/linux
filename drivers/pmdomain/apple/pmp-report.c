@@ -1398,7 +1398,7 @@ static int apple_pmp_start_wait(struct apple_pmp_start *st, u32 id,
 	scoped_guard(mutex, &apple_pmp_start_mutex) {
 		if (!st->stopping && !st->result && !st->queued) {
 			st->queued = true;
-			queue_work(system_unbound_wq, &st->work);
+			queue_work(system_dfl_wq, &st->work);
 		}
 	}
 	ret = wait_for_completion_timeout(&st->started, timeout) ? 0 : -ETIMEDOUT;
