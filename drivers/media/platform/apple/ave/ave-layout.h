@@ -339,8 +339,8 @@ struct ave_proc_layout {
 	u32 crop; /* HEVC only */
 	u32 meta_size, extra, frame_size;
 	u32 low_delay; /* HEVC only: 3 with reordering off */
-	/* HEVC only: use the explicit short-term RPS carried by this Process. */
-	u32 hevc_explicit_rps;
+	/* HEVC only: nonzero selects the explicit short-term RPS in Process. */
+	u32 hevc_use_explicit_rps;
 	/* Per-picture reconstruction and motion-search selections. */
 	struct ave_recon_selection_layout current_recon, list0_recon;
 	struct ave_recon_selection_layout list0_recon_second, list1_recon;

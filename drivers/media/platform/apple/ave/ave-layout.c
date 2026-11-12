@@ -858,7 +858,7 @@ const struct ave_fw_layout ave_layout_6070_11_1 = {
 		},
 		[1] = {
 			.pic_size = 0x55b0,
-			.hevc_explicit_rps = 0x6504,
+			.hevc_use_explicit_rps = 0x6504,
 			.first_process = 0x5c88,
 			.src_neighbor_info = 0x5f30,
 			.src_neighbor_pixel = 0x5f50,
