@@ -330,3 +330,89 @@
 	       <&admac_ec_proxy 1>;
 	dma-names = "cout", "cin", "spkr", "sense", "hpai";
 };
+
+/*
+ * ==== The left-front USB-C port (ATC1) ====
+ *
+ * ADT /arm-io/nub-spmi-a0/hpm1 (SN201202x, SPMI address 0xa, port-number 2, port-location
+ * "left-front", acio-parent acio1), with atc-phy1, usb-drd1 and dart-usb1. The K114cAP ADT
+ * has the same hpm0, hpm1, hpm5, atc-phy and usb-drd nodes as the J714cAP one, so this is the
+ * J714c port block. The ATC1 template nodes of t6050-dieX.dtsi are enabled here; the boards
+ * sharing t6050-k114-k116.dtsi keep them disabled. The port's USB4/Thunderbolt router
+ * (/arm-io/acio1) and its DisplayPort routes are not described; the PHY runs in USB mode.
+ *
+ * The left-back port (ATC0, hpm0) is the boot link's debug port; the combo PHY driver
+ * excludes it on purpose (apple,port-index 0).
+ */
+/ {
+	aliases {
+		atcphy1 = &atc1_phy;
+	};
+};
+
+&nub_spmi_a0 {
+	status = "okay";
+
+	hpm1: usb-pd@a {
+		compatible = "apple,sn201202x";
+		reg = <0xa SPMI_USID>;
+
+		connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Left Front";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					hpm1_hs: endpoint {
+						remote-endpoint = <&usb_drd1_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					hpm1_ss: endpoint {
+						remote-endpoint = <&atc1_phy_ep>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&atc1_phy_mbox {
+	status = "okay";
+};
+
+&atc1_phy {
+	status = "okay";
+
+	port {
+		atc1_phy_ep: endpoint {
+			remote-endpoint = <&hpm1_ss>;
+		};
+	};
+};
+
+&usb_drd1 {
+	status = "okay";
+
+	port {
+		usb_drd1_hs: endpoint {
+			remote-endpoint = <&hpm1_hs>;
+		};
+	};
+};
+
+&usb_drd1_dart_0 {
+	status = "okay";
+};
+
+&usb_drd1_dart_1 {
+	status = "okay";
+};
