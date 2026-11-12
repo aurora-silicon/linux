@@ -56,6 +56,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "gfx";
+		power-domains = <&ps_afimccni0>, <&ps_piogw>;
 		/*
 		 * The GPU firmware keeps running across system sleep and
 		 * does not survive this state going off for long.
@@ -70,6 +71,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "venc0_sys";
+		power-domains = <&ps_afisocni0>;
 	};
 
 	ps_venc1_sys: power-controller@248 {
@@ -87,6 +89,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "apcie_gp";
+		power-domains = <&ps_afisocni1>;
 	};
 
 	ps_isp_sys: power-controller@268 {
@@ -95,6 +98,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "isp_sys";
+		power-domains = <&ps_afisocni1>;
 	};
 
 	ps_avd_sys: power-controller@270 {
@@ -103,6 +107,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "avd_sys";
+		power-domains = <&ps_afisocni1>;
 	};
 
 	ps_ans: power-controller@278 {
@@ -111,6 +116,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "ans";
+		power-domains = <&ps_afisocni1>;
 		apple,always-on; /* handed over running, cannot be reset */
 	};
 
@@ -120,6 +126,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "disp_sys";
+		power-domains = <&ps_afisocni2>;
 	};
 
 	/*
@@ -134,6 +141,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "dispext0_sys";
+		power-domains = <&ps_afisocni2>;
 		status = "disabled";
 	};
 
@@ -264,7 +272,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "atc0_common";
-		power-domains = <&ps_atc0_usb_aon>;
+		power-domains = <&ps_afisocni2>, <&ps_atc0_usb_aon>;
 	};
 
 	ps_atc0_usb: power-controller@3f0 {
@@ -294,6 +302,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "sep";
+		power-domains = <&ps_afisocni0>;
 		apple,always-on;
 	};
 
@@ -891,12 +900,86 @@
 		status = "okay";
 	};
 
+	/*
+	 * SoC fabric power states (ADT AFIMCCNI0, PIOGW, AFINS0, AFISOCNI0-2):
+	 * the parents of the blocks behind them. Kept on, like the fabric
+	 * states of T6041, and never accessed: an AP write to them latches an
+	 * AP event-log error, so they are firmware-owned. The loader ends its
+	 * DCP power-chain check at these always-on states (aura "end the DCP
+	 * power chain at always-on fabric"); older loaders refuse the display
+	 * handoff with them.
+	 */
+	ps_afimccni0: power-controller@198 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x198 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "afimccni0";
+		apple,always-on;
+		apple,firmware-owned;
+	};
+
+	ps_piogw: power-controller@1a8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1a8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "piogw";
+		apple,always-on;
+		apple,firmware-owned;
+	};
+
+	ps_afins0: power-controller@1e8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1e8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "afins0";
+		power-domains = <&ps_afimccni0>, <&ps_piogw>;
+		apple,always-on;
+		apple,firmware-owned;
+	};
+
+	ps_afisocni0: power-controller@218 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x218 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "afisocni0";
+		power-domains = <&ps_afins0>, <&ps_piogw>;
+		apple,always-on;
+		apple,firmware-owned;
+	};
+
+	ps_afisocni1: power-controller@220 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x220 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "afisocni1";
+		power-domains = <&ps_afins0>, <&ps_piogw>;
+		apple,always-on;
+		apple,firmware-owned;
+	};
+
+	ps_afisocni2: power-controller@228 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x228 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "afisocni2";
+		power-domains = <&ps_afins0>, <&ps_piogw>;
+		apple,always-on;
+		apple,firmware-owned;
+	};
+
 	ps_jpg: power-controller@230 {
 		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x230 4>;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "jpg";
+		power-domains = <&ps_afisocni0>;
 		status = "okay";
 	};
 
@@ -906,6 +989,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "msr";
+		power-domains = <&ps_afisocni0>;
 		status = "okay";
 	};
 
@@ -915,6 +999,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "prores";
+		power-domains = <&ps_afisocni0>;
 		status = "okay";
 	};
 
@@ -924,6 +1009,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "ane_sys";
+		power-domains = <&ps_afisocni2>;
 		status = "okay";
 	};
 
