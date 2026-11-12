@@ -320,3 +320,12 @@
 &ps_uart0 {
 	status = "okay";
 };
+
+/* SIO AES engine, software keys only. */
+&ps_aes {
+	status = "okay";
+};
+
+&aes {
+	status = "okay";
+};
