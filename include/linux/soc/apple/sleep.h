@@ -27,6 +27,11 @@ struct device_node;
 int apple_sleep_coproc_register(struct device *dev, void __iomem *asc, bool pcie_ans,
 				int (*last_stop)(void *data), void *data);
 
+/* For a SoC sleep driver of its own (T6041): the coprocessor stop, with interrupts off. */
+int apple_sleep_coprocs_stop_all(void);
+bool apple_sleep_coprocs_ans_stopped(void);
+void apple_sleep_coprocs_count(int *reg, int *ready, int *stopped);
+
 /*
  * The same with no ASC to clear: @last_stop clears its own run bits and lowers its own power
  * domain, and runs before every other coprocessor's. The refusal checks leave that domain on.

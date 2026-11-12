@@ -1059,6 +1059,57 @@ static void apple_sleep_coprocs_stop(struct apple_sleep *s, bool first)
 	dsb(sy);
 }
 
+/*
+ * For a SoC whose sleep has its own driver at EL2 (T6041): both passes of the stop above,
+ * the coprocessors registered first, then the rest. A negative return of a last stop ends it.
+ */
+int apple_sleep_coprocs_stop_all(void)
+{
+	int pass, i, ret;
+
+	for (pass = 1; pass >= 0; pass--) {
+		for (i = 0; i < SLEEP_COPROCS; i++) {
+			struct apple_sleep_coproc *c = &apple_sleep_coprocs[i];
+
+			if (!c->dev || !c->ready || c->first != pass || c->stopped)
+				continue;
+			if (c->last_stop) {
+				ret = c->last_stop(c->data);
+				if (ret < 0)
+					return ret;
+			}
+			apple_sleep_coproc_run_off(c);
+		}
+	}
+	dsb(sy);
+	return 0;
+}
+
+/* For T6041: whether the coprocessor behind the storage PCIe link (ANS) was stopped. */
+bool apple_sleep_coprocs_ans_stopped(void)
+{
+	int i;
+
+	for (i = 0; i < SLEEP_COPROCS; i++)
+		if (apple_sleep_coprocs[i].dev && apple_sleep_coprocs[i].pcie_ans &&
+		    apple_sleep_coprocs[i].stopped)
+			return true;
+	return false;
+}
+
+/* How many registered coprocessors are ready and how many stopped. */
+void apple_sleep_coprocs_count(int *reg, int *ready, int *stopped)
+{
+	int i;
+
+	*reg = *ready = *stopped = 0;
+	for (i = 0; i < SLEEP_COPROCS; i++) {
+		*reg += !!apple_sleep_coprocs[i].dev;
+		*ready += apple_sleep_coprocs[i].dev && apple_sleep_coprocs[i].ready;
+		*stopped += apple_sleep_coprocs[i].dev && apple_sleep_coprocs[i].stopped;
+	}
+}
+
 /* MPIDR's cluster is affinity 2, its core affinity 0, as 0.0.n and 1.1.n on T8140. */
 static unsigned int sleep_cpu_cluster(u64 mpidr)
 {
