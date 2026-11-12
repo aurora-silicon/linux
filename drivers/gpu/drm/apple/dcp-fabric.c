@@ -524,11 +524,11 @@ static void dcp_typec_route_phy_off(struct apple_dcp_typec_route *route)
 	phy_exit(route->phy);
 }
 
-#ifdef CONFIG_HIBERNATION
+#ifdef CONFIG_PM_SLEEP
 /*
- * Hibernation freeze: give the active route's DP PHY back as a route
- * deactivation does, so that the image records it off (the T6040 PHY has no
- * PM ops and comes back reset from the S4 cold boot).  The route, its
+ * Before a sleep that loses the PHY's state (a hibernation, a T6040 S2R): give
+ * the active route's DP PHY back as a route deactivation does, so that it is
+ * recorded off (the T6040 PHY has no PM ops and comes back reset).  The route, its
  * crossbar selection and the cable stay; the next connect powers the PHY
  * again through dcp_typec_phy_on().  Returns whether it was powered.
  */

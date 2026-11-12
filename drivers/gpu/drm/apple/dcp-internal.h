@@ -1064,7 +1064,7 @@ struct apple_dcp {
 };
 
 /*
- * Resume-from-disk restart of the desktop 26.x panel's firmware.
+ * Restart of a desktop 26.x firmware after a resume from disk or a T6040 S2R.
  * QUIESCED: the old session is dropped on the host side, nothing goes to the
  * firmware; RESTARTING: the restart work talks to the new firmware, the DRM
  * entry points still do not; FAILED: as QUIESCED, until the reboot.
@@ -1079,7 +1079,7 @@ enum dcp_hib_phase {
 /* The DRM and backlight entry points leave the firmware alone. */
 static inline bool dcp_hib_gated(const struct apple_dcp *dcp)
 {
-	return IS_ENABLED(CONFIG_HIBERNATION) &&
+	return IS_ENABLED(CONFIG_PM_SLEEP) &&
 	       READ_ONCE(dcp->hib_phase) != DCP_HIB_NONE;
 }
 
@@ -1088,7 +1088,7 @@ static inline bool dcp_hib_tx_gated(const struct apple_dcp *dcp)
 {
 	int phase = READ_ONCE(dcp->hib_phase);
 
-	return IS_ENABLED(CONFIG_HIBERNATION) &&
+	return IS_ENABLED(CONFIG_PM_SLEEP) &&
 	       (phase == DCP_HIB_QUIESCED || phase == DCP_HIB_FAILED);
 }
 
@@ -1097,7 +1097,7 @@ static inline bool dcp_hib_busy(const struct apple_dcp *dcp)
 {
 	int phase = READ_ONCE(dcp->hib_phase);
 
-	return IS_ENABLED(CONFIG_HIBERNATION) &&
+	return IS_ENABLED(CONFIG_PM_SLEEP) &&
 	       (phase == DCP_HIB_QUIESCED || phase == DCP_HIB_RESTARTING);
 }
 
