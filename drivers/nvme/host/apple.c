@@ -3026,10 +3026,25 @@ static int apple_nvme_sleep_send_shn(struct apple_nvme *anv)
 	return ret;
 }
 
+/*
+ * On post-M4 ANS (needs_ioq_registers), disabling and rebuilding the controller
+ * across suspend-to-idle reset the machine on a J714s found by aborting
+ * pm_test=devices at each device in turn. Suspend-to-idle does not need the
+ * controller down: user space is frozen and keep_link_powered() holds its power
+ * domains on. Resume needs no change: anv->suspended stays false, so it returns early.
+ */
+static bool t6050_keep_live = true;
+module_param(t6050_keep_live, bool, 0644);
+MODULE_PARM_DESC(t6050_keep_live, "Keep post-M4 ANS NVMe live across suspend-to-idle (no controller disable/rebuild)");
+
 static int apple_nvme_suspend(struct device *dev)
 {
 	struct apple_nvme *anv = dev_get_drvdata(dev);
 	int ret;
+
+	if (anv->hw->needs_ioq_registers && READ_ONCE(t6050_keep_live) &&
+	    pm_suspend_target_state == PM_SUSPEND_TO_IDLE)
+		return 0;
 
 	if (anv->hw->needs_ioq_registers) {
 		/* A sleep right after a wake, as from a dark wake: let that reset finish first. */
