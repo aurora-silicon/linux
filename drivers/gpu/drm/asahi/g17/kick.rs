@@ -797,9 +797,9 @@ impl Queue {
     /// timestamp and no parent. After a cold boot the firmware starts every kick queue over
     /// at the first timestamp, as for a freshly installed queue. A queue kept at its
     /// pre-hibernation timestamp writes a ring slot the firmware does not read next, and its
-    /// implicit parent names a completion the new firmware instance never saw (observed: the
-    /// first render after the resume timed out). The ring storage stays (its
-    /// addresses are in the restored graph and the client views).
+    /// implicit parent names a completion the new firmware instance never saw, so the first
+    /// render after the resume would wait for it until it times out. The ring storage stays
+    /// (its addresses are in the restored graph and the client views).
     pub(crate) fn reset_render_after_cold_boot(&mut self) -> Result {
         if self.id.engine == DataMaster::Compute {
             return Err(EINVAL);
