@@ -1919,7 +1919,6 @@ static int dockchannel_hid_resume(struct device *dev)
 	return ret;
 }
 
-#ifdef CONFIG_HIBERNATION
 /*
  * Resume from disk with the MTP started by the boot kernel (for instance to
  * type a disk passphrase in its initramfs). The boot kernel quiesces its
@@ -2197,17 +2196,13 @@ static int dockchannel_hid_restore(struct device *dev)
 }
 
 static const struct dev_pm_ops dockchannel_hid_pm_ops = {
-	.suspend = dockchannel_hid_suspend,
-	.resume = dockchannel_hid_resume,
-	.freeze = dockchannel_hid_freeze,
-	.thaw = dockchannel_hid_thaw,
-	.poweroff = dockchannel_hid_suspend,
-	.restore = dockchannel_hid_restore,
+	.suspend = pm_sleep_ptr(dockchannel_hid_suspend),
+	.resume = pm_sleep_ptr(dockchannel_hid_resume),
+	.freeze = pm_sleep_ptr(dockchannel_hid_freeze),
+	.thaw = pm_sleep_ptr(dockchannel_hid_thaw),
+	.poweroff = pm_sleep_ptr(dockchannel_hid_suspend),
+	.restore = pm_sleep_ptr(dockchannel_hid_restore),
 };
-#else
-static DEFINE_SIMPLE_DEV_PM_OPS(dockchannel_hid_pm_ops, dockchannel_hid_suspend,
-				dockchannel_hid_resume);
-#endif
 
 static const struct of_device_id dockchannel_hid_of_match[] = {
 	{ .compatible = "apple,dockchannel-hid" },
