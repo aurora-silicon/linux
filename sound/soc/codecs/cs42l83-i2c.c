@@ -12,6 +12,7 @@
 #include <linux/jiffies.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/of.h>
 #include <linux/regmap.h>
 #include <linux/slab.h>
 #include <linux/types.h>
@@ -22,8 +23,8 @@
 /*
  * The register restore after a sleep is about 100 ms of I2C writes, and the PM core waits
  * for every device resume before user space thaws. ASoC holds the card from user space
- * until its own deferred resume, so the restore runs from there when ASoC suspended the
- * codec. 0 restores in the device's resume, as before.
+ * until its own deferred resume, so on T8140 the restore runs from there when ASoC
+ * suspended the codec. 0 restores in the device's resume, as before.
  */
 static bool defer_restore = true;
 module_param(defer_restore, bool, 0644);
@@ -244,14 +245,21 @@ static int cs42l83_i2c_probe(struct i2c_client *i2c_client)
 	init_completion(&cs42l83->powered);
 	complete_all(&cs42l83->powered);
 
-	component_drv = devm_kmemdup(dev, &cs42l42_soc_component, sizeof(cs42l42_soc_component),
-				     GFP_KERNEL);
-	if (!component_drv)
-		return -ENOMEM;
-	component_drv->suspend = cs42l83_component_suspend;
-	component_drv->resume = cs42l83_component_resume;
-
-	ret = cs42l42_common_probe(cs42l83, component_drv, &cs42l42_dai);
+	/*
+	 * Measured on the J700 alone. Elsewhere ASoC never sees these hooks, so the device's
+	 * resume restores the registers itself, as before.
+	 */
+	if (of_machine_is_compatible("apple,t8140")) {
+		component_drv = devm_kmemdup(dev, &cs42l42_soc_component,
+					     sizeof(cs42l42_soc_component), GFP_KERNEL);
+		if (!component_drv)
+			return -ENOMEM;
+		component_drv->suspend = cs42l83_component_suspend;
+		component_drv->resume = cs42l83_component_resume;
+		ret = cs42l42_common_probe(cs42l83, component_drv, &cs42l42_dai);
+	} else {
+		ret = cs42l42_common_probe(cs42l83, &cs42l42_soc_component, &cs42l42_dai);
+	}
 	if (ret)
 		return ret;
 
