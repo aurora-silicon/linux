@@ -660,6 +660,14 @@ struct apple_sleep {
 
 static struct apple_sleep *apple_sleep;
 
+/* The SoC's part takes neither the lid at the wake nor the USB wake ports. */
+static bool apple_sleep_part_plain_wake;
+
+void apple_sleep_set_part_plain_wake(void)
+{
+	WRITE_ONCE(apple_sleep_part_plain_wake, true);
+}
+
 /* A registered coprocessor its driver has readied, whose run bit the last step clears. */
 static bool apple_sleep_coproc_ready_node(const struct device_node *np)
 {
@@ -690,6 +698,9 @@ EXPORT_SYMBOL_GPL(apple_sleep_usb_set_wake_ports);
 
 bool apple_sleep_usb_port_can_wake(unsigned int port)
 {
+	if (READ_ONCE(apple_sleep_part_plain_wake))
+		return false;
+
 	return port < BITS_PER_LONG && (READ_ONCE(sleep_usb_wake_ports) & BIT(port));
 }
 EXPORT_SYMBOL_GPL(apple_sleep_usb_port_can_wake);
@@ -2001,6 +2012,9 @@ EXPORT_SYMBOL_GPL(apple_sleep_lid_at_wake);
 
 int apple_sleep_lid_closed_at_wake(void)
 {
+	if (READ_ONCE(apple_sleep_part_plain_wake))
+		return -ENODATA;
+
 	return READ_ONCE(sleep_lid_closed);
 }
 EXPORT_SYMBOL_GPL(apple_sleep_lid_closed_at_wake);

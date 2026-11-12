@@ -85,6 +85,13 @@ struct apple_sleep_part {
 	struct apple_sleep_ctl registry;
 };
 
+/*
+ * A part whose sleep takes neither the lid's state at the wake nor the USB wake ports says so
+ * at its probe. apple_sleep_lid_closed_at_wake() and apple_sleep_usb_port_can_wake() then
+ * answer as they do with no sleep driver, whatever the SMC's and the USB host's drivers told.
+ */
+void apple_sleep_set_part_plain_wake(void);
+
 /* For a debugfs file: who is registered, and how far each is. */
 void apple_sleep_registry_show(struct seq_file *s);
 
