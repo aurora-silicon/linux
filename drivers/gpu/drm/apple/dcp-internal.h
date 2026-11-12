@@ -701,7 +701,7 @@ struct apple_dcp {
 	bool s2r_stopped;
 	/* T6040 suspend-to-RAM stopped the desktop firmware, see dcp_t6041_s2r_stop(). */
 	bool t6041_s2r_stopped;
-	/* T6040 S2R: the CPU power word's 11 children as the stop found them. */
+	/* T6040 S2R: the pipe's sub-blocks (at most 11 power words) as the stop found them. */
 	u32 s2r_child_saved[11];
 	bool s2r_child_valid;
 	/* A T6040 S2R wake reuses hib_restore_work for the warm restart. */
