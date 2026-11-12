@@ -122,6 +122,8 @@ struct apple_smc {
 	bool sleep_warn_late;
 	/* A sleep was committed, and the wake after it has not been declared a full one. */
 	bool wake_silent;
+	/* This SoC's SMC is told of a sleep and of a full wake through WKTP as well. */
+	bool wktp;
 	/* In a noirq phase: replies are polled for. */
 	bool polled;
 	/* MBSW at the last wake: what the SMC had woken the AP for. */

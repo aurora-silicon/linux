@@ -23,6 +23,7 @@
 #include <linux/overflow.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
+#include <linux/property.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/suspend.h>
@@ -87,6 +88,19 @@ static const struct mfd_cell apple_smc_described_devs[] = {
 static const struct mfd_cell apple_smc_t6050_described_devs[] = {
 	MFD_CELL_OF("macsmc-reboot", NULL, NULL, 0, 0, "apple,smc-reboot"),
 	MFD_CELL_OF("macsmc-rtc", NULL, NULL, 0, 0, "apple,smc-rtc"),
+};
+
+/* What this driver has to know of one SoC's SMC that the others do not share. */
+struct apple_smc_hw {
+	/*
+	 * The SMC takes the WKTP key at the sleep request and once a wake is a
+	 * full one: see apple_smc_sleep_commit() and apple_smc_wake_full().
+	 */
+	bool wktp;
+};
+
+static const struct apple_smc_hw apple_smc_t6041_hw = {
+	.wktp = true,
 };
 
 static int apple_smc_add_described_devices(struct apple_smc *smc, const struct mfd_cell *cells,
@@ -604,6 +618,7 @@ static void apple_smc_pm_unregister(void *unused)
 
 static int apple_smc_probe(struct platform_device *pdev)
 {
+	const struct apple_smc_hw *hw = device_get_match_data(&pdev->dev);
 	struct device *dev = &pdev->dev;
 	struct apple_smc *smc;
 	__be32 count = 0;
@@ -615,6 +630,7 @@ static int apple_smc_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	smc->wake_reasons = of_device_is_compatible(dev->of_node, "apple,t8132-smc") ?
 			    apple_smc_t8132_wake_reasons : apple_smc_t8140_wake_reasons;
+	smc->wktp = hw && hw->wktp;
 
 	/* First, so that a late probe still sees a resume start. */
 	if (IS_ENABLED(CONFIG_HIBERNATION)) {
@@ -851,6 +867,7 @@ static int apple_smc_restore(struct device *dev)
 static const struct of_device_id apple_smc_of_match[] = {
 	{ .compatible = "apple,t8152-smc" },
 	{ .compatible = "apple,t6050-smc" },
+	{ .compatible = "apple,t6041-smc", .data = &apple_smc_t6041_hw },
 	{ .compatible = "apple,t8103-smc" },
 	{ .compatible = "apple,smc" },
 	{},
@@ -953,7 +970,7 @@ static int apple_smc_notice_idle(struct apple_smc *smc)
 /*
  * WKTP, one byte, the value for power state 0. It goes first at the sleep request,
  * ahead of the other sleep keys ('slpa' among them) and the AP idle notice, as the platform
- * does. 0 leaves it unwritten.
+ * does. 0 leaves it unwritten. Only for an SMC known to take it: T6041's.
  */
 static unsigned int sleep_wktp = 2;
 module_param(sleep_wktp, uint, 0644);
@@ -966,7 +983,7 @@ static int apple_smc_sleep_commit(struct apple_smc *smc)
 
 	/* Whatever is written here, the SMC runs the wake after this silent until it is told. */
 	smc->wake_silent = true;
-	if (wktp) {
+	if (smc->wktp && wktp) {
 		ret = apple_smc_write_u8(smc, SMC_KEY(WKTP), wktp);
 		if (ret)
 			dev_err(smc->dev, "Failed to write WKTP = %u: %d\n", wktp, ret);
@@ -1001,7 +1018,7 @@ static void apple_smc_wake_full(struct apple_smc *smc)
 	if (!smc->wake_silent)
 		return;
 	smc->wake_silent = false;
-	if (wktp < 0)
+	if (!smc->wktp || wktp < 0)
 		return;
 	ret = apple_smc_write_u8(smc, SMC_KEY(WKTP), wktp);
 	if (ret)
