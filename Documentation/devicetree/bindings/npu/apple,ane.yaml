@@ -108,7 +108,10 @@ properties:
 
   resets:
     maxItems: 1
-    description: Reset of the ANE coprocessor
+    description:
+      Reset of the ANE coprocessor. On T8112 this is the ANE_SYS_CPU power
+      state reset, used to hold a coprocessor that does not stop after RUN is
+      cleared and released only while its power domains are off.
 
   mboxes:
     maxItems: 1
@@ -426,9 +429,9 @@ allOf:
         power-domains:
           minItems: 7
           maxItems: 7
-        resets: false
         memory-region: false
       required:
+        - resets
         - mboxes
 
   - if:
