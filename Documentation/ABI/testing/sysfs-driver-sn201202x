@@ -1,5 +1,6 @@
 What:		/sys/bus/spmi/devices/<dev>/hib_resume
 Date:		November 2026
+KernelVersion:	7.4
 Contact:	František Balázsy <frantisekbalazsy@gmail.com>
 Description:
 		(RW) State a resume from hibernation left an Apple SN201202x
