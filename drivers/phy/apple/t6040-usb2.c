@@ -1216,7 +1216,7 @@ retry_or_fail:
 	t6040_usb3_sleep(tphy);
 	/*
 	 * The retry power-cycles the PHY's domains, which don't go off under a system
-	 * resume: a wake with the host kept leaves it to the host's restart after it.
+	 * resume: a wake with the host kept leaves the port at USB2 instead.
 	 */
 	if (t6040_recovery_retry(&tphy->recovery) && !tphy->sleep_waking) {
 		cycle = true;
@@ -3363,6 +3363,7 @@ static bool t6040_sleep_wake_usb3(const struct t6040_usb2_phy *tphy)
 int apple_t6040_atcphy_sleep_power_up(struct phy *usb2_phy)
 {
 	struct t6040_usb2_phy *tphy = t6040_from_usb2_phy(usb2_phy);
+	bool tried;
 	int ret;
 
 	if (!tphy)
@@ -3384,27 +3385,31 @@ int apple_t6040_atcphy_sleep_power_up(struct phy *usb2_phy)
 
 	/* As dwc3-apple's start, in the core's init: USB2, then USB3 if it ran. */
 	ret = tphy->shutdown_failed ? -EIO : t6040_usb2_on_locked(tphy);
-	if (ret)
-		goto failed;
+	if (ret) {
+		dev_err(tphy->dev, "USB2 not back after the sleep (%d): the host has to restart\n",
+			ret);
+		tphy->sleep_ret = ret;
+		return ret;
+	}
 	tphy->sleep_down = false;
-	if (t6040_sleep_wake_usb3(tphy)) {
+	tried = t6040_sleep_wake_usb3(tphy);
+	if (tried) {
 		tphy->sleep_waking = true;
 		t6040_usb3_up_locked(tphy);
 		tphy->sleep_waking = false;
 	}
-	if (tphy->sleep_usb3 && !tphy->usb3_up) {
-		ret = -EIO;
-		goto failed;
-	}
-	dev_info(tphy->dev, "PHY back after the sleep with the host kept, USB3 %s\n",
-		 tphy->usb3_up ? "up" : "off");
+	/*
+	 * As at a start, a port whose USB3 doesn't come up stays at USB2: the host
+	 * is kept with what runs at USB2 on it, and only the SuperSpeed devices
+	 * leave the bus.
+	 */
+	if (tphy->sleep_usb3 && !tphy->usb3_up)
+		dev_warn(tphy->dev, "USB3 not back after the sleep (%s): the host stays, at USB2\n",
+			 tried ? "its bring-up failed" : "its coprocessor waits for a power cycle");
+	else
+		dev_info(tphy->dev, "PHY back after the sleep with the host kept, USB3 %s\n",
+			 tphy->usb3_up ? "up" : "off");
 	return 0;
-
-failed:
-	dev_err(tphy->dev, "PHY not back after the sleep (%d, USB2 %s): the host has to restart\n",
-		ret, tphy->sleep_down ? "off" : "on");
-	tphy->sleep_ret = ret;
-	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_t6040_atcphy_sleep_power_up);
 

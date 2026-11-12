@@ -137,14 +137,16 @@ int apple_t6040_atcphy_sleep_enter(struct phy *usb2_phy);
  * its core. 0: the PHY was never taken down (the sleep was abandoned first), and all is as
  * it was. APPLE_ATCPHY_SLEEP_RESET: the controller is out of reset again, which the first
  * call after the sleep sees to. -ENODEV: the reset didn't release, so the core must not
- * be touched. Any other error: the controller is out of reset, but the PHY didn't come back.
+ * be touched. Any other error: the controller is out of reset, but USB2 didn't come back.
  */
 int apple_t6040_atcphy_sleep_result(struct phy *usb2_phy);
 
 /*
  * After APPLE_ATCPHY_SLEEP_RESET, once the core is set up again and before its PIPE is
  * routed: USB2 on, and USB3 up if it ran before the sleep. May sleep for the coprocessor's
- * boot. An error leaves the controller out of reset for a restart of the host.
+ * boot. USB3 that doesn't come up leaves the port at USB2, as at a start of the host, and
+ * is not an error. An error is USB2's, and leaves the controller out of reset for a restart
+ * of the host.
  */
 int apple_t6040_atcphy_sleep_power_up(struct phy *usb2_phy);
 
