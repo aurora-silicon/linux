@@ -1048,7 +1048,7 @@ EXPORT_SYMBOL_IF_KUNIT(sn201202x_suspend);
  * there, see sn201202x_roles_finish(). A controller that does not take this
  * is left alone, with its event interrupt still disabled, for a new probe.
  */
-static int __maybe_unused sn201202x_restore(struct device *dev)
+static int sn201202x_restore(struct device *dev)
 {
 	struct tps6598x *tps = dev_get_drvdata(dev);
 	struct sn201202x *sn = tps_to_sn(tps);
@@ -1211,14 +1211,12 @@ MODULE_DEVICE_TABLE(of, sn201202x_of_match);
 static const struct dev_pm_ops sn201202x_pm_ops = {
 	.prepare = pm_sleep_ptr(sn201202x_prepare),
 	.complete = pm_sleep_ptr(sn201202x_complete),
-#ifdef CONFIG_PM_SLEEP
-	.suspend = sn201202x_suspend,
-	.resume = sn201202x_resume,
-	.freeze = sn201202x_suspend,
-	.thaw = sn201202x_resume,
-	.poweroff = sn201202x_suspend,
-	.restore = sn201202x_restore,
-#endif
+	.suspend = pm_sleep_ptr(sn201202x_suspend),
+	.resume = pm_sleep_ptr(sn201202x_resume),
+	.freeze = pm_sleep_ptr(sn201202x_suspend),
+	.thaw = pm_sleep_ptr(sn201202x_resume),
+	.poweroff = pm_sleep_ptr(sn201202x_suspend),
+	.restore = pm_sleep_ptr(sn201202x_restore),
 	SET_RUNTIME_PM_OPS(sn201202x_runtime_suspend, sn201202x_runtime_resume, NULL)
 };
 
