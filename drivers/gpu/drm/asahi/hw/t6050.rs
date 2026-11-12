@@ -3,7 +3,7 @@
 //!
 //! The M5 firmware builds its HW data, performance tables and region C in its own graph
 //! ([`crate::g17::fw::m5::initdata`]), so the 26A428/25G83 graph tables of [`Config`] are empty.
-use crate::g17::{Config, CoreLayout, CrashBuffers, FirmwareProfile, Identity};
+use crate::g17::{Config, CoreLayout, FirmwareProfile, Identity};
 use crate::hw::{GpuGen, GpuVariant};
 use crate::regs::G17Id;
 
@@ -26,7 +26,6 @@ pub(crate) const CONFIG: Config = Config {
     secondary_root_offset: Some(0x40000),
     // Each role places its own buffers. Its crash log goes in its __DATA_SHARED_RO, inside
     // `fw-data`, as on the M5 Max, whose data segments have the same layout.
-    crash_buffers: CrashBuffers::FirmwareData,
     profile: FirmwareProfile::M5PublishedRoots,
     pm_metrics: None,
     windows: &[],
@@ -96,7 +95,6 @@ pub(crate) const CONFIG_MAX: Config = Config {
     // Bare metal, as the M5 Ultra: both roles publish their kernel roots, the secondary's
     // 0x40000 into `pagetables`, and each asks for its crash log inside `fw-data`.
     secondary_root_offset: Some(0x40000),
-    crash_buffers: CrashBuffers::FirmwareData,
     profile: FirmwareProfile::M5PublishedRoots,
     pm_metrics: None,
     windows: &[],
@@ -170,7 +168,6 @@ pub(crate) const CONFIG_ULTRA: Config = Config {
     uat_ias: 42,
     uat_oas: 42,
     secondary_root_offset: Some(0x40000),
-    crash_buffers: CrashBuffers::FirmwareData,
     profile: FirmwareProfile::M5PublishedRoots,
     pm_metrics: None,
     windows: &[],

@@ -9,7 +9,7 @@ use crate::g17::fw::{
     self,
     initdata::{PerfConfig, RegionCConfig, RegisterWindow},
 };
-use crate::g17::{Config, CoreLayout, CrashBuffers, FixedBuffer, Identity};
+use crate::g17::{Config, CoreLayout, FixedBuffer, Identity};
 use crate::hw::{GpuGen, GpuVariant};
 use super::t604x::{instances, window};
 use crate::mmu::UatQuirks;
@@ -30,7 +30,6 @@ pub(crate) const CONFIG: Config = Config {
     uat_oas: 42,
     // One coprocessor carries both firmware roles; `pagetables` holds only its root.
     secondary_root_offset: None,
-    crash_buffers: CrashBuffers::FirmwareData,
     // Read by the firmware through the kernel lower root, whose top-level entries it only
     // samples when it starts.
     profile: crate::g17::FirmwareProfile::PublishedRoots,

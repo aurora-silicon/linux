@@ -8,9 +8,8 @@
 
 //! Crash log buffers in the GPU firmware's data segment.
 //!
-//! A firmware that places its own crash log ([`super::CrashBuffers::FirmwareData`]) asks for it
-//! by physical address inside its data segment, the `fw-data` reserved region, which the boot
-//! loader keeps for the loaded firmware until reboot.
+//! The firmware asks for its crash log by physical address inside its data segment, the
+//! `fw-data` reserved region, which the boot loader keeps for the loaded firmware until reboot.
 
 use kernel::{
     c_str, device,
