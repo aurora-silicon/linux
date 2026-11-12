@@ -6,12 +6,19 @@
  * suspend-to-idle the link stays up and the device's interrupt is armed as a
  * wakeup.
  */
+#include <linux/module.h>
 #include <linux/suspend.h>
 
 #include "mt7932.h"
 #include "wow.h"
 
 #ifdef CONFIG_PM
+static unsigned int mt_wow_s2idle_hif = 2, mt_wow_s2idle_pin, mt_wow_s2idle_level;
+module_param_named(wow_s2idle_hif, mt_wow_s2idle_hif, uint, 0644);
+MODULE_PARM_DESC(wow_s2idle_hif, "WoW wake signal for suspend-to-idle: 2 = PCIe, 3 = GPIO");
+module_param_named(wow_s2idle_pin, mt_wow_s2idle_pin, uint, 0644);
+module_param_named(wow_s2idle_level, mt_wow_s2idle_level, uint, 0644);
+
 const struct wiphy_wowlan_support mt_wowlan_support = {
 	.flags = WIPHY_WOWLAN_MAGIC_PKT | WIPHY_WOWLAN_DISCONNECT,
 };
@@ -100,6 +107,14 @@ void mt_wow_arm(struct mt7932 *m)
 	}
 	if (!ret) {
 		mt7932_wow_ctrl(body, true, detect);
+		/* Suspend-to-idle keeps the PCIe link: the wake signal is the host interface. */
+		if (pm_suspend_target_state == PM_SUSPEND_TO_IDLE) {
+			body[8] = mt_wow_s2idle_hif;
+			body[9] = mt_wow_s2idle_pin;
+			body[10] = mt_wow_s2idle_level;
+		}
+		dev_dbg(&m->pdev->dev, "WoW start: wake signal hif %u pin %u level %u\n",
+			body[8], body[9], body[10]);
 		ret = mt_request(m, MT7932_CID_WOW_CTRL, true, true, false, body,
 				 MT7932_WOW_CTRL_LENGTH);
 	}
