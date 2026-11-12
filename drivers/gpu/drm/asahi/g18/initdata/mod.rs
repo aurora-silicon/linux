@@ -50,7 +50,6 @@ use core::sync::atomic::{fence, Ordering};
 use kernel::prelude::*;
 use kernel::sync::Arc;
 
-const PROFILE: init::RootProfile = init::RootProfile::J873G18G26A428;
 
 const KERNEL_BASE: u64 = 0xffff_fc20_0000_0000;
 /// Shared allocation #2 (the private cluster, 0x178000 bytes).
@@ -168,6 +167,8 @@ pub(crate) struct G18FirmwareMemory {
     trace_journal: [KVVec<G18TraceRecord>; 2],
     trace_dropped: [u32; 2],
     uat: Arc<mmu::Uat>,
+    /// InitData layouts of the firmware build the loader admitted.
+    layouts: &'static init::G18GLayouts,
 }
 
 /// Read-back of the new 26A428 status cross-links (plan step 1.3 validation):
@@ -222,10 +223,12 @@ impl G18FirmwareMemory {
         uat: Arc<mmu::Uat>,
         boot_timestamp: u64,
         render: bool,
+        profile: init::RootProfile,
     ) -> Result<KBox<Self>> {
         if !uat.is_t8152_geometry() {
             return Err(ENODEV);
         }
+        let layouts = profile.g18g_layouts().ok_or(EINVAL)?;
         match crate::g18::params::g18_compute_owner_test.value() {
             0 => {},
             1 => G18UmaPoolMemory::verify_shared_compute_owner(dev, &uat)?,
@@ -257,14 +260,14 @@ impl G18FirmwareMemory {
             MappedObject::new_wc_at(dev, uat.kernel_vm(), address, size, protection)
         };
         // Install every fixed address before allocator-selected objects.
-        let mut private = fixed(PRIVATE_BASE, init::G18G_26A428_PRIVATE_CLUSTER_SIZE,
+        let mut private = fixed(PRIVATE_BASE, layouts.private.total,
                                 mmu::PROT_FW_SHARED_RW)?;
         // Both 26A428 roots are 0xc8 bytes. Separate mappings keep the empty
         // page between them.
         let mut primary_root = fixed(ROOTS_BASE, init::G18G_26A428_ROOT_SIZE, mmu::PROT_FW_SHARED_RO)?;
         let mut secondary_root = fixed(ROOTS_BASE + init::SECONDARY_ROOT_DELTA,
                                        init::G18G_26A428_ROOT_SIZE, mmu::PROT_FW_SHARED_RO)?;
-        let mut shared = fixed(SHARED_BASE, init::G18G_26A428_SHARED_CLUSTER_SIZE, mmu::PROT_FW_PRIV_RW)?;
+        let mut shared = fixed(SHARED_BASE, layouts.shared.total, mmu::PROT_FW_PRIV_RW)?;
         let region_a = fixed(REGION_A_BASE, init::REGION_A_SIZE, mmu::PROT_FW_SHARED_RO)?;
         let mut region_c = fixed(REGION_C_BASE, init::REGION_C_SIZE, mmu::PROT_FW_SHARED_RO)?;
         let fwctl = fixed(FWCTL_BASE, FWCTL_SIZE, mmu::PROT_FW_SHARED_RW)?;
@@ -326,29 +329,30 @@ impl G18FirmwareMemory {
 
         aon.with_bytes_mut(|out| init::encode_g18g_26a428_aon_ptd(out).map_err(|_| EINVAL))?;
         region_c.with_bytes_mut(|out| {
-            init::encode_region_c_for_profile(PROFILE, out).map_err(|_| EINVAL)
+            init::encode_region_c_for_profile(layouts.profile, out).map_err(|_| EINVAL)
         })?;
         private.with_bytes_mut(|out| {
-            init::encode_g18g_26a428_private_cluster(PRIVATE_BASE, FWCTL_BASE, out).map_err(|_| EINVAL)
+            init::encode_g18g_26a428_private_cluster(layouts, PRIVATE_BASE, FWCTL_BASE, out)
+                .map_err(|_| EINVAL)
         })?;
 
-        let layout = init::G18G_26A428_PRIVATE_LAYOUT;
+        let layout = layouts.private;
         let addresses = init::SharedAddresses {
             region_a: region_a.iova(),
             region_c: region_c.iova(),
             hw_data_bundle: SHARED_BASE,
-            hw_data_bundle_alloc: init::G18G_26A428_SHARED_CLUSTER_SIZE,
+            hw_data_bundle_alloc: layouts.shared.total,
         };
         let primary = init::InstanceAddresses {
             root: ROOTS_BASE,
-            main_config: SHARED_BASE + init::G18G_26A428_MAIN_BUNDLE_OFFSETS[0] as u64,
+            main_config: SHARED_BASE + layouts.shared.main_config[0] as u64,
             status_a: PRIVATE_BASE + init::G18G_26A428_PRIVATE_STATUS_A[0] as u64,
             status_b: PRIVATE_BASE + layout.status_b as u64,
             secondary_extras: [0, 0],
         };
         let secondary = init::InstanceAddresses {
             root: ROOTS_BASE + init::SECONDARY_ROOT_DELTA,
-            main_config: SHARED_BASE + init::G18G_26A428_MAIN_BUNDLE_OFFSETS[1] as u64,
+            main_config: SHARED_BASE + layouts.shared.main_config[1] as u64,
             status_a: PRIVATE_BASE + init::G18G_26A428_PRIVATE_STATUS_A[1] as u64,
             status_b: 0,
             // Secondary root +0xb8 = status config, +0xc0 = the 0x60 object
@@ -368,7 +372,7 @@ impl G18FirmwareMemory {
         shared.with_bytes_mut(|out| {
             init::encode_g18g_26a428_hw_data(completion_bindings, qos.iova(),
                 &mut out[..init::G18G_26A428_HW_DATA_SIZE]).map_err(|_| EINVAL)?;
-            init::encode_g18g_26a428_bundle_policy(init::M5PolicyBindings {
+            init::encode_g18g_26a428_bundle_policy(layouts, init::M5PolicyBindings {
                 state: PRIVATE_BASE + layout.policy_state as u64,
                 aon_ptd: aon.iova(),
                 boot_timestamp,
@@ -378,11 +382,12 @@ impl G18FirmwareMemory {
                 (init::InstanceRole::Secondary, &secondary, None),
             ] {
                 let grid = PRIVATE_BASE + init::G18G_26A428_PRIVATE_STATE_GRIDS[role as usize] as u64;
-                let channels = init::derive_channel_table_for_profile(PROFILE, role, grid,
+                let channels = init::derive_channel_table_for_profile(layouts.profile, role, grid,
                     instance.status_a, instance.main_config, SHARED_BASE);
                 let offset = (instance.main_config - SHARED_BASE) as usize;
-                init::encode_main_config_for_profile(PROFILE, role, &addresses, instance, &channels,
-                    views, &mut out[offset..offset + init::MAIN_CONFIG_SIZE]).map_err(|_| EINVAL)?;
+                init::encode_main_config_for_profile(layouts.profile, role, &addresses, instance,
+                    &channels, views, &mut out[offset..offset + init::MAIN_CONFIG_SIZE])
+                    .map_err(|_| EINVAL)?;
             }
             Ok(())
         })?;
@@ -391,11 +396,12 @@ impl G18FirmwareMemory {
             (&mut secondary_root, init::InstanceRole::Secondary, &secondary),
         ] {
             root.with_bytes_mut(|out| {
-                init::encode_root_for_profile(PROFILE, role, &addresses, instance, out)
+                init::encode_root_for_profile(layouts.profile, role, &addresses, instance, out)
                     .map_err(|_| EINVAL)?;
                 // The two firmware gates (version word, root+0x2c) must pass
                 // before anything is published.
-                init::check_firmware_root_gates_for_profile(PROFILE, out).map_err(|_| EINVAL)
+                init::check_firmware_root_gates_for_profile(layouts.profile, out)
+                    .map_err(|_| EINVAL)
             })?;
         }
         // Unlike PB/UMA, the blank sentinel is unmapped at native handoff.
@@ -412,7 +418,7 @@ impl G18FirmwareMemory {
             application_compute: None,
             completions, aliases, registers,
             report_counts: [[0; 2]; 2], completion_masks: [0; 2], trace_printed: [0; 2], uat,
-            trace_journal, trace_dropped: [0; 2],
+            trace_journal, trace_dropped: [0; 2], layouts,
         }), GFP_KERNEL)
     }
 
@@ -459,7 +465,7 @@ impl G18FirmwareMemory {
                 || record[16..20] != 2u32.to_le_bytes() || record[23] != 1 { return Err(EINVAL); }
         }
         self.shared.with_bytes_mut(|out| {
-            let start = init::G18G_26A428_WORK_RING_BUNDLE_OFFSETS[8] + head as usize * 24;
+            let start = self.layouts.work_rings[8] + head as usize * 24;
             let slots = out.get_mut(start..start + 48).ok_or(EINVAL)?;
             if slots.iter().any(|&b| b != 0) { return Err(EBUSY); }
             for (out, record) in slots.chunks_exact_mut(24).zip(records) { out.copy_from_slice(record); }
@@ -645,7 +651,7 @@ impl G18FirmwareMemory {
             return Err(EBUSY);
         }
         self.shared.with_bytes_mut(|out| {
-            let start = init::G18G_26A428_WORK_RING_BUNDLE_OFFSETS[8] + (producer as usize - 1) * 24;
+            let start = self.layouts.work_rings[8] + (producer as usize - 1) * 24;
             let record = out.get_mut(start..start + 24).ok_or(EINVAL)?;
             if record.iter().any(|byte| *byte != 0) { return Err(EBUSY); }
             record[8..16].copy_from_slice(&address.to_le_bytes());
@@ -690,7 +696,7 @@ impl G18FirmwareMemory {
         if self.control_counters()? != [[1; 3]; 2] {
             return Err(EBUSY);
         }
-        let record = init::G18G_26A428_CONTROL_RING_BUNDLE_OFFSETS[0] + init::CONTROL_RECORD_SIZE;
+        let record = self.layouts.shared.control_ring[0] + init::CONTROL_RECORD_SIZE;
         self.shared.with_bytes_mut(|out| {
             let record = out.get_mut(record..record + init::CONTROL_RECORD_SIZE).ok_or(EINVAL)?;
             if record.iter().any(|byte| *byte != 0) {
@@ -765,7 +771,7 @@ impl G18FirmwareMemory {
                 cause.first_entry.get_or_insert((index as u32, entry));
             }
         }
-        let request = SHARED_BASE + init::G18G_26A428_SHARED_LAYOUT.block_68 as u64;
+        let request = SHARED_BASE + self.layouts.shared.block_68 as u64;
         for (index, value) in cause.request.iter_mut().enumerate() {
             *value = self.shared.read_u32(request + (index * 4) as u64)?;
         }
@@ -777,7 +783,7 @@ impl G18FirmwareMemory {
         if qid >= init::G18G_26A428_QUEUE_PROGRESS_ENTRIES {
             return Err(EINVAL);
         }
-        let entry = SHARED_BASE + (init::G18G_26A428_SHARED_LAYOUT.block_800
+        let entry = SHARED_BASE + (self.layouts.shared.block_800
             + qid * init::G18G_26A428_QUEUE_PROGRESS_STRIDE) as u64;
         fence(Ordering::Acquire);
         Ok((self.shared.read_u32(entry)?, self.shared.read_u64(entry + 8)?))
@@ -788,7 +794,7 @@ impl G18FirmwareMemory {
         if qid >= init::G18G_26A428_QUEUE_PROGRESS_ENTRIES {
             return Err(EINVAL);
         }
-        let entry = SHARED_BASE + (init::G18G_26A428_SHARED_LAYOUT.block_800
+        let entry = SHARED_BASE + (self.layouts.shared.block_800
             + qid * init::G18G_26A428_QUEUE_PROGRESS_STRIDE) as u64;
         self.shared.write_u32(entry, valid)?;
         self.shared.write_u32(entry + 4, 0)?;
@@ -827,8 +833,10 @@ impl G18FirmwareMemory {
             status_b_header: self.private.read_u32(status_b + init::G18G_26A428_STATUS_B_CONFIG_HEADER as u64)?,
             status_b_word: self.private.read_u32(status_b + init::G18G_26A428_STATUS_B_LINK_WORD as u64)?,
             status_b_pointer: self.private.read_u64(status_b + init::G18G_26A428_STATUS_B_LINK_PTR as u64)?,
-            status_config_word: self.private.read_u32(config + init::G18G_26A428_STATUS_CONFIG_LINK_WORD as u64)?,
-            status_config_pointer: self.private.read_u64(config + init::G18G_26A428_STATUS_CONFIG_LINK_PTR as u64)?,
+            status_config_word: self.private
+                .read_u32(config + self.layouts.status_config_link_word as u64)?,
+            status_config_pointer: self.private
+                .read_u64(config + self.layouts.status_config_link_ptr as u64)?,
         })
     }
 
@@ -941,9 +949,9 @@ impl G18FirmwareMemory {
     pub(crate) fn log_summary(&self, dev: &AsahiDrmDevice) {
         dev_info!(dev.as_ref(),
             "G18G initdata: roots {:#x}/{:#x} version {:#x}; shared {:#x}+{:#x}; private {:#x}+{:#x}; {} register windows; {} unproven fields\n",
-            self.root(false), self.root(true), init::G18G_26A428_INITDATA_VERSION_WORD,
-            SHARED_BASE, init::G18G_26A428_SHARED_CLUSTER_SIZE,
-            PRIVATE_BASE, init::G18G_26A428_PRIVATE_CLUSTER_SIZE,
+            self.root(false), self.root(true), self.layouts.version_word,
+            SHARED_BASE, self.layouts.shared.total,
+            PRIVATE_BASE, self.layouts.private.total,
             self.registers.len(), init::G18G_26A428_UNPROVEN.len());
     }
 }
