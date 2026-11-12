@@ -5699,7 +5699,8 @@ static int apple_pcie_check_d0(struct pci_dev *pdev, void *data)
 	} else if (pdev->pm_cap &&
 		   (pci_read_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL, &value) ||
 		    ((value & PCI_PM_CTRL_STATE_MASK) != PCI_D0 &&
-		     !((value & PCI_PM_CTRL_STATE_MASK) == PCI_D3hot &&
+		     !(!pci_is_bridge(pdev) &&
+		       (value & PCI_PM_CTRL_STATE_MASK) == PCI_D3hot &&
 		       pdev->current_state == PCI_D3hot)))) {
 		*error = -EBUSY;
 	}
