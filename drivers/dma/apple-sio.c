@@ -2206,23 +2206,31 @@ static int sio_restart(struct sio_data *sio)
 	}
 
 	err = apple_rtkit_reinit(sio->rtk);
-	if (err)
-		return dev_err_probe(sio->dev, err, "restart: RTKit reinit\n");
+	if (err) {
+		dev_err(sio->dev, "restart: RTKit reinit: %d\n", err);
+		return err;
+	}
 
 	writel(CPU_CONTROL_RUN, sio->base + REG_CPU_CONTROL);
 
 	err = apple_rtkit_boot(sio->rtk);
-	if (err)
-		return dev_err_probe(sio->dev, err, "restart: SIO did not boot\n");
+	if (err) {
+		dev_err(sio->dev, "restart: SIO did not boot: %d\n", err);
+		return err;
+	}
 
 	err = apple_rtkit_start_ep(sio->rtk, EP_SIO);
-	if (err)
-		return dev_err_probe(sio->dev, err, "restart: starting SIO endpoint\n");
+	if (err) {
+		dev_err(sio->dev, "restart: starting SIO endpoint: %d\n", err);
+		return err;
+	}
 
 	err = sio_call(sio, FIELD_PREP(SIOMSG_TYPE, MSG_START));
-	if (err < 1)
-		return dev_err_probe(sio->dev, err ? err : -ENXIO,
-				     "restart: starting SIO service\n");
+	if (err < 1) {
+		err = err ? err : -ENXIO;
+		dev_err(sio->dev, "restart: starting SIO service: %d\n", err);
+		return err;
+	}
 	if (sio->protocol != protocol) {
 		dev_err(sio->dev, "restart: protocol changed from v%u to v%u\n",
 			protocol, sio->protocol);
@@ -2230,12 +2238,16 @@ static int sio_restart(struct sio_data *sio)
 	}
 
 	err = sio_send_dt_params(sio);
-	if (err < 0)
-		return dev_err_probe(sio->dev, err, "restart: boot-up parameters\n");
+	if (err < 0) {
+		dev_err(sio->dev, "restart: boot-up parameters: %d\n", err);
+		return err;
+	}
 
 	err = sio_send_shmem_params(sio);
-	if (err < 0)
-		return dev_err_probe(sio->dev, err, "restart: shared memory\n");
+	if (err < 0) {
+		dev_err(sio->dev, "restart: shared memory: %d\n", err);
+		return err;
+	}
 
 	return 0;
 }
@@ -2307,12 +2319,12 @@ static __maybe_unused int sio_restore(struct device *dev)
 	 * reprepare their streams.
 	 */
 	if (readl(sio->base + REG_CPU_CONTROL) & CPU_CONTROL_RUN) {
-		dev_info(dev, "resume from disk: SIO still running, session kept\n");
+		dev_dbg(dev, "resume from disk: SIO still running, session kept\n");
 	} else {
 		err = sio_restart(sio);
 		if (!err)
-			dev_info(dev, "resume from disk: SIO restarted (protocol v%u)\n",
-				 sio->protocol);
+			dev_dbg(dev, "resume from disk: SIO restarted (protocol v%u)\n",
+				sio->protocol);
 		else
 			dev_err(dev, "resume from disk: SIO restart failed: %d\n", err);
 	}
