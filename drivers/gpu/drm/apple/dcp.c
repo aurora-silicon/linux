@@ -6712,6 +6712,7 @@ static void dcp_t8132_ext_routes(struct apple_dcp *dcp)
 }
 
 static int dcp_s2r_pm_register(struct apple_dcp *dcp);
+static int dcp_t6041_s2r_init(struct apple_dcp *dcp);
 #ifdef CONFIG_PM_SLEEP
 static void dcp_hib_restore_work(struct work_struct *work);
 static int dcp_hib_register(struct apple_dcp *dcp);
@@ -6906,6 +6907,9 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 			return dev_err_probe(dev, ret, "no PM notifier\n");
 	}
 #endif
+	ret = dcp_t6041_s2r_init(dcp);
+	if (ret)
+		return ret;
 	INIT_DELAYED_WORK(&dcp->swap_watchdog_wq, dcp_swap_watchdog);
 	INIT_WORK(&dcp->s2r_prewarm_work, dcp_s2r_prewarm_work);
 	INIT_DELAYED_WORK(&dcp->s2r_prewarm_off_wq, dcp_s2r_prewarm_off_work);
@@ -9035,7 +9039,7 @@ bool dcp_s2r_firmware_stopped(struct platform_device *pdev)
 /*
  * The display power domains across a T6040 S2R. Their two blocks come from the
  * apple,display-power node (reg-names "ps" and "pmc-dcp") that the boot object
- * publishes. Without it dcp_t6041_display_power() returns -ENODEV and the
+ * publishes, mapped once at probe (dcp_t6041_s2r_init()). Without it the
  * domains are left as they are: the sleep controller then finds the pipe on at
  * its commit and refuses the sleep.
  *
@@ -9056,9 +9060,9 @@ bool dcp_s2r_firmware_stopped(struct platform_device *pdev)
 
 /*
  * This DCP's power words: the entry of its display endpoint in the hw data. NULL
- * for a processor without one (and the caller skips the S2R domain lower and
- * raise, leaving the output off until reboot): never a write at a guessed
- * address. An external processor is never display 0.
+ * for a processor without one (and the S2R domain lower and raise are skipped,
+ * leaving the output off until reboot): never a write at a guessed address. An
+ * external processor is never display 0.
  */
 static const struct dcp_pipe_power *dcp_t6041_pipe_power(struct apple_dcp *dcp)
 {
@@ -9066,34 +9070,9 @@ static const struct dcp_pipe_power *dcp_t6041_pipe_power(struct apple_dcp *dcp)
 
 	if (ep < dcp->hw.nr_s2r_pipes && (ep || !dcp_desktop_external(dcp)))
 		return &dcp->hw.s2r_pipes[ep];
-	dev_warn_once(dcp->dev,
-		      "display endpoint %u has no known S2R power words: left off across sleep\n",
-		      ep);
+	dev_warn(dcp->dev,
+		 "display endpoint %u has no known S2R power words: left off across sleep\n", ep);
 	return NULL;
-}
-
-static int dcp_t6041_display_power(struct apple_dcp *dcp, void __iomem **ps,
-				   void __iomem **pmc)
-{
-	struct device_node *np = of_parse_phandle(dcp->dev->of_node, "apple,display-power", 0);
-
-	*ps = NULL;
-	*pmc = NULL;
-	if (!np)
-		return -ENODEV;
-	*ps = of_iomap(np, of_property_match_string(np, "reg-names", "ps"));
-	*pmc = of_iomap(np, of_property_match_string(np, "reg-names", "pmc-dcp"));
-	of_node_put(np);
-	if (!*ps || !*pmc) {
-		if (*ps)
-			iounmap(*ps);
-		if (*pmc)
-			iounmap(*pmc);
-		*ps = NULL;
-		*pmc = NULL;
-		return -ENODEV;
-	}
-	return 0;
 }
 
 /*
@@ -9126,16 +9105,13 @@ static void dcp_t6041_gapf_release_all(struct apple_dcp *dcp);
  */
 static int dcp_t6041_s2r_domains_on(struct apple_dcp *dcp)
 {
-	const struct dcp_pipe_power *p = dcp_t6041_pipe_power(dcp);
-	void __iomem *ps, *pmc;
+	const struct dcp_pipe_power *p = dcp->s2r_pipe;
+	void __iomem *ps = dcp->s2r_ps;
 	u32 val;
 	int ret;
 
-	if (!p)
+	if (!ps)
 		return -ENODEV;
-	ret = dcp_t6041_display_power(dcp, &ps, &pmc);
-	if (ret)
-		return ret;
 
 	val = readl(ps + p->sys) & ~(DCP_PS_FLAGS | DCP_PS_TARGET | DCP_PS_AUTO_ENABLE);
 	writel(val | DCP_PS_ACTIVE, ps + p->sys);
@@ -9153,13 +9129,12 @@ static int dcp_t6041_s2r_domains_on(struct apple_dcp *dcp)
 	 */
 	ret = 0;
 	if (!(readl(ps + p->cpu) & DCP_PS_ACTUAL)) {
-		void __iomem *g = ioremap_np(DCP_T6041_GAPF_BASE +
-					     DCP_T6041_GAPF_SLICE(p->gapf_slice), 4);
+		void __iomem *g = dcp->s2r_gapf;
 		u32 v, cur;
 
 		if (g) {
+			g += DCP_T6041_GAPF_SLICE(p->gapf_slice);
 			writel(readl(g) & ~DCP_T6041_GAPF_PROTECT, g);
-			iounmap(g);
 		}
 		dcp_t6041_gapf_release_all(dcp);
 		v = readl(ps + p->cpu);
@@ -9203,10 +9178,8 @@ static int dcp_t6041_s2r_domains_on(struct apple_dcp *dcp)
 			p->cpu + 8, p->cpu + 8 * p->blocks, dcp->s2r_child_saved[0],
 			dcp->s2r_child_saved[p->blocks - 1]);
 	}
-	dcp_pmc_set(dcp, pmc, true);	/* shared voter: counts every powered DCP */
+	dcp_pmc_set(dcp, dcp->s2r_pmc, true);	/* shared voter: counts every powered DCP */
 
-	iounmap(ps);
-	iounmap(pmc);
 	return ret;
 }
 
@@ -9217,7 +9190,7 @@ static int dcp_t6041_s2r_domains_on(struct apple_dcp *dcp)
  */
 static void dcp_t6041_gapf_release_all(struct apple_dcp *dcp)
 {
-	void __iomem *b = ioremap_np(DCP_T6041_GAPF_BASE, DCP_T6041_GAPF_SIZE);
+	void __iomem *b = dcp->s2r_gapf;
 	u32 n, i, v, rel = 0;
 
 	if (!b)
@@ -9226,7 +9199,6 @@ static void dcp_t6041_gapf_release_all(struct apple_dcp *dcp)
 	if (readl(b + DCP_T6041_GAPF_CFG) != 1 || readl(b + DCP_T6041_GAPF_LOCK)) {
 		dev_warn(dcp->dev, "S2R: GAPF cfg %#x lock %#x, not touched\n",
 			 readl(b + DCP_T6041_GAPF_CFG), readl(b + DCP_T6041_GAPF_LOCK));
-		iounmap(b);
 		return;
 	}
 	for (i = DCP_T6041_GAPF_RSVD;
@@ -9238,7 +9210,6 @@ static void dcp_t6041_gapf_release_all(struct apple_dcp *dcp)
 		rel++;
 	}
 	dev_dbg(dcp->dev, "S2R: GAPF clock protection cleared on %u of %u slices\n", rel, n);
-	iounmap(b);
 }
 
 /*
@@ -9254,27 +9225,74 @@ static void dcp_t6041_gapf_release_all(struct apple_dcp *dcp)
  * firmware does not start again, and power-cycling its domain hangs the SoC. A sleep
  * that keeps the power leaves the firmware running and its domains on, as
  * suspend-to-idle does. The CPU power word and the wake (dcp_t6041_s2r_resume())
- * need the apple,display-power window: without it the word is left alone and the
- * display stays off after the wake.
+ * need the apple,display-power windows (dcp_t6041_s2r_init()): without them the
+ * word is left alone and the display stays off after the wake.
  */
 static bool dcp_t6041_s2r_capable(struct apple_dcp *dcp)
 {
 	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && dcp->hw.s2r_pipes;
 }
 
+static void dcp_t6041_s2r_unmap(void *data)
+{
+	struct apple_dcp *dcp = data;
+
+	if (dcp->s2r_gapf)
+		iounmap(dcp->s2r_gapf);
+	iounmap(dcp->s2r_pmc);
+	iounmap(dcp->s2r_ps);
+}
+
+/*
+ * At probe: this pipe's power words, and the registers a T6040 S2R writes them
+ * and its DART's GAPF slice through. Without the words or either window of the
+ * apple,display-power node nothing is kept, and the stop leaves the CPU's power
+ * word alone. Without the GAPF bank the slices are left as they are.
+ */
+static int dcp_t6041_s2r_init(struct apple_dcp *dcp)
+{
+	const struct dcp_pipe_power *pipe;
+	struct device_node *np;
+	void __iomem *ps, *pmc;
+
+	if (!IS_ENABLED(CONFIG_PM_SLEEP) || !dcp_t6041_s2r_capable(dcp))
+		return 0;
+	pipe = dcp_t6041_pipe_power(dcp);
+	np = of_parse_phandle(dcp->dev->of_node, "apple,display-power", 0);
+	if (!pipe || !np) {
+		of_node_put(np);
+		return 0;
+	}
+	ps = of_iomap(np, of_property_match_string(np, "reg-names", "ps"));
+	pmc = of_iomap(np, of_property_match_string(np, "reg-names", "pmc-dcp"));
+	of_node_put(np);
+	if (!ps || !pmc) {
+		if (ps)
+			iounmap(ps);
+		if (pmc)
+			iounmap(pmc);
+		return 0;
+	}
+	dcp->s2r_pipe = pipe;
+	dcp->s2r_ps = ps;
+	dcp->s2r_pmc = pmc;
+	dcp->s2r_gapf = ioremap_np(DCP_T6041_GAPF_BASE, DCP_T6041_GAPF_SIZE);
+
+	return devm_add_action_or_reset(dcp->dev, dcp_t6041_s2r_unmap, dcp);
+}
+
 /* Past A473(0) nothing here brings the display back: a failure leaves it off until reboot. */
 static void dcp_t6041_s2r_cpu_off(struct apple_dcp *dcp)
 {
 	void __iomem *control = dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL;
-	const struct dcp_pipe_power *p = dcp_t6041_pipe_power(dcp);
-	void __iomem *ps, *pmc, *w, *g;
+	const struct dcp_pipe_power *p = dcp->s2r_pipe;
+	void __iomem *w, *g = dcp->s2r_gapf;
 	u32 v, cur, after, i;
-	phys_addr_t gpa;
 	int ret = 0, dret = -ENODEV;
 
-	if (!p || dcp_t6041_display_power(dcp, &ps, &pmc))
+	if (!dcp->s2r_ps)
 		return;
-	w = ps + p->cpu;
+	w = dcp->s2r_ps + p->cpu;
 	/* The pipe's own sub-blocks as they are now, for the wake. */
 	for (i = 0; i < p->blocks; i++)
 		dcp->s2r_child_saved[i] = readl(w + 8 * (i + 1));
@@ -9288,15 +9306,14 @@ static void dcp_t6041_s2r_cpu_off(struct apple_dcp *dcp)
 		dev_warn(dcp->dev, "S2R: DCP DART streams not stopped: %d\n", dret);
 
 	/* This DCP's DART's own slice first. */
-	gpa = DCP_T6041_GAPF_BASE + DCP_T6041_GAPF_SLICE(p->gapf_slice);
-	g = ioremap_np(gpa, 4);
 	if (g) {
-		u32 gv = readl(g), ga;
+		u32 gv, ga;
 
+		g += DCP_T6041_GAPF_SLICE(p->gapf_slice);
+		gv = readl(g);
 		writel(gv & ~DCP_T6041_GAPF_PROTECT, g);
 		ga = readl(g);
-		dev_dbg(dcp->dev, "S2R: GAPF slice %pa %#x -> %#x\n", &gpa, gv, ga);
-		iounmap(g);
+		dev_dbg(dcp->dev, "S2R: GAPF slice %u %#x -> %#x\n", p->gapf_slice, gv, ga);
 	}
 	dcp_t6041_gapf_release_all(dcp);
 
@@ -9329,8 +9346,6 @@ static void dcp_t6041_s2r_cpu_off(struct apple_dcp *dcp)
 	 * again when its domains are up.
 	 */
 	dcp_pmc_forget(dcp);
-	iounmap(ps);
-	iounmap(pmc);
 }
 
 #define DCP_S2R_AFK_TIMEOUT_MS	200
@@ -9395,18 +9410,16 @@ static void dcp_t6041_s2r_stop_link_work(struct apple_dcp *dcp)
  */
 static bool dcp_t6041_s2r_blocks_on(struct apple_dcp *dcp)
 {
-	const struct dcp_pipe_power *p = dcp_t6041_pipe_power(dcp);
-	void __iomem *ps, *pmc;
+	const struct dcp_pipe_power *p = dcp->s2r_pipe;
+	void __iomem *ps = dcp->s2r_ps;
 	bool on = false;
 	u32 i;
 
-	if (!p || dcp_t6041_display_power(dcp, &ps, &pmc))
+	if (!ps)
 		return true;
 	for (i = 1; i <= p->blocks; i++)
 		if (readl(ps + p->cpu + 8 * i) & DCP_PS_TARGET)
 			on = true;
-	iounmap(ps);
-	iounmap(pmc);
 
 	return on;
 }

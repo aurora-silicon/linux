@@ -729,6 +729,16 @@ struct apple_dcp {
 	/* T6040 S2R: the power words of the pipe's sub-blocks as the stop found them. */
 	u32 s2r_child_saved[DCP_PIPE_POWER_MAX_BLOCKS];
 	bool s2r_child_valid;
+	/*
+	 * T6040 S2R: this pipe's power words (hw.s2r_pipes) and the registers they are
+	 * in, mapped at probe: the "ps" and "pmc-dcp" windows of the apple,display-power
+	 * node, and the GAPF bank. s2r_ps is NULL, and the other three with it, for a
+	 * pipe without power words or without either window.
+	 */
+	const struct dcp_pipe_power *s2r_pipe;
+	void __iomem *s2r_ps;
+	void __iomem *s2r_pmc;
+	void __iomem *s2r_gapf;
 	/* A T6040 S2R wake reuses hib_restore_work for the warm restart. */
 	bool s2r_restart;
 	/* DPMS off stopped the firmware and lowered the domains; DPMS on brings them back. */
