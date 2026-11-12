@@ -9432,7 +9432,9 @@ static void dcp_t6041_s2r_afk(struct apple_dcp *dcp, bool resume)
 /*
  * No link work may reach a firmware that is about to idle. An external processor's was
  * stopped at prepare, when its link went (dcp_hib_prepare()), and stays stopped until the
- * wake replays the link.
+ * wake replays the link. The internal one's is stopped here, once, and enabled again when
+ * the wake has its firmware back (dcp_t6041_s2r_warm_restart()): after a stop that fails
+ * or a firmware that does not return it stays stopped, and the next stop finds it so.
  */
 static void dcp_t6041_s2r_stop_link_work(struct apple_dcp *dcp)
 {
@@ -9442,7 +9444,10 @@ static void dcp_t6041_s2r_stop_link_work(struct apple_dcp *dcp)
 		return;
 	}
 #endif
-	dcp_disable_typec_work(dcp, false);
+	if (!dcp->hib_typec_disabled) {
+		dcp_disable_typec_work(dcp, false);
+		dcp->hib_typec_disabled = true;
+	}
 	cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
 }
 
@@ -10646,6 +10651,11 @@ static void dcp_t6041_s2r_warm_restart(struct apple_dcp *dcp)
 	if (ret) {
 		dcp_hib_give_up(dcp, "modeset", ret);
 		return;
+	}
+	/* The link work the stop disabled, see dcp_t6041_s2r_stop_link_work(). */
+	if (dcp->hib_typec_disabled) {
+		dcp->hib_typec_disabled = false;
+		dcp_enable_typec_work(dcp);
 	}
 	/* What the display got is logged by dcp_hib_recommit(). */
 	dev_info(dcp->dev, "firmware back after the warm restart\n");

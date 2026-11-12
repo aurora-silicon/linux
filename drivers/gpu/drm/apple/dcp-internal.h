@@ -1058,7 +1058,9 @@ struct apple_dcp {
 	 * until PM_POST_HIBERNATION replays the link, or from the prepare of
 	 * a T6040 S2R until its wake does; this processor still counted in the
 	 * restart's firmware-start and idle-pipe barriers (see
-	 * dcp_hib_ext_restore()).
+	 * dcp_hib_ext_restore()). hib_typec_disabled also for the internal
+	 * processor's link work, from the stop of a T6040 S2R until its wake
+	 * has the firmware back.
 	 */
 	bool hib_typec_disabled;
 	bool hib_irq_disabled;
