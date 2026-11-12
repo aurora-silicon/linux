@@ -9356,10 +9356,14 @@ static void dcp_t6041_s2r_cpu_off(struct apple_dcp *dcp)
  * before the display is powered. Without the resume the firmware never announces its
  * AV services again, its video interface stays unplugged and every mode set is
  * refused ("HPD is 0").
+ *
+ * The request is a compact packet. On an endpoint the firmware has sent no compact
+ * message on, afk_pause() and afk_resume() send nothing and return -EOPNOTSUPP, and
+ * the endpoint is left as it is.
  */
 static void dcp_t6041_s2r_afk(struct apple_dcp *dcp, bool resume)
 {
-	unsigned int i, n = ARRAY_SIZE(dcp->desktop->graph), done = 0, total = 0;
+	unsigned int i, n = ARRAY_SIZE(dcp->desktop->graph), done = 0, silent = 0, total = 0;
 	int ret;
 
 	if (!dcp->desktop)
@@ -9372,14 +9376,16 @@ static void dcp_t6041_s2r_afk(struct apple_dcp *dcp, bool resume)
 		total++;
 		ret = resume ? afk_resume(ep, DCP_S2R_AFK_TIMEOUT_MS) :
 			       afk_pause(ep, DCP_S2R_AFK_TIMEOUT_MS);
-		if (ret)
+		if (ret == -EOPNOTSUPP)
+			silent++;
+		else if (ret)
 			dev_warn(dcp->dev, "S2R: AFK endpoint %#x not %s: %d\n", ep->endpoint,
 				 resume ? "resumed" : "paused", ret);
 		else
 			done++;
 	}
-	dev_dbg(dcp->dev, "S2R: %u of %u AFK endpoints %s\n", done, total,
-		resume ? "resumed" : "paused");
+	dev_dbg(dcp->dev, "S2R: %u of %u AFK endpoints %s, %u without traffic left alone\n",
+		done, total, resume ? "resumed" : "paused", silent);
 }
 
 /*
