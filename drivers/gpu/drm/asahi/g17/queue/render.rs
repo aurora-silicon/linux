@@ -2752,6 +2752,10 @@ impl Pair {
             }
         }
     }
+    pub(crate) fn forget_registration(&mut self) {
+        self.registered = None;
+    }
+
     /// The scheduler page these queues last ran a command for, when the next
     /// publication for `context` changes the queues' owner.
     /// The steady state in which a command may publish without the device

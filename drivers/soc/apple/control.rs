@@ -164,6 +164,7 @@ pub(crate) struct ControlState {
     retired: [u64; 4],
     retired_count: u32,
     entropy: EntropySink,
+    wake_seen: u8,
 }
 
 impl ControlState {
@@ -181,6 +182,7 @@ impl ControlState {
                 retry_at: None,
                 retry_ms: ENTROPY_RETRY_MIN_MS,
             },
+            wake_seen: 0,
         }
     }
 
@@ -218,7 +220,7 @@ impl ControlState {
             } else {
                 tag + 1
             };
-            if !self.tag_in_flight(tag) && !self.is_retired(tag) {
+            if tag != proto::TAG_SLEEP && !self.tag_in_flight(tag) && !self.is_retired(tag) {
                 self.slots[idx] = Slot {
                     used: true,
                     tag,
@@ -228,6 +230,45 @@ impl ControlState {
             }
         }
         Err(EBUSY)
+    }
+
+    /// Claims the sleep request's own tag, which the pool never hands out. A
+    /// request still in flight under it means the last one was never answered.
+    pub(crate) fn alloc_sleep(&mut self) -> Result<usize> {
+        let tag = proto::TAG_SLEEP;
+        if self.tag_in_flight(tag) {
+            return Err(EBUSY);
+        }
+        let idx = self.slots.iter().position(|s| !s.used).ok_or(EBUSY)?;
+        self.reclaim_retired(tag);
+        self.slots[idx] = Slot {
+            used: true,
+            tag,
+            reply: None,
+        };
+        Ok(idx)
+    }
+
+    /// Whether any request is waiting for its reply.
+    pub(crate) fn requests_in_flight(&self) -> bool {
+        self.slots.iter().any(|s| s.used)
+    }
+
+    /// Forget the wake messages seen, before asking for them.
+    pub(crate) fn wake_reset(&mut self) {
+        self.wake_seen = 0;
+    }
+
+    /// A control message that isn't a reply: note it if it's a wake message.
+    pub(crate) fn wake_note(&mut self, ty: u8) {
+        if let Some(n) = proto::WAKE_TYPES.iter().position(|&t| t == ty) {
+            self.wake_seen |= 1 << n;
+        }
+    }
+
+    /// All the wake messages have come.
+    pub(crate) fn wake_complete(&self) -> bool {
+        self.wake_seen == (1 << proto::WAKE_TYPES.len()) - 1
     }
 
     pub(crate) fn take_reply(&mut self, idx: usize) -> Option<proto::ControlReply> {
@@ -417,6 +458,55 @@ mod tests {
         } else {
             None
         }
+    }
+
+    #[test]
+    fn the_pool_never_hands_out_the_sleep_tag() {
+        let mut state = ControlState::new();
+        for _ in 0..POOL_LEN * 2 {
+            let (idx, tag) = state.alloc().unwrap();
+            assert_ne!(tag, proto::TAG_SLEEP);
+            state.release(idx);
+        }
+    }
+
+    #[test]
+    fn a_sleep_request_gets_its_own_answer() {
+        let mut state = ControlState::new();
+        let idx = state.alloc_sleep().unwrap();
+        assert!(state.requests_in_flight());
+        assert_eq!(state.alloc_sleep(), Err(EBUSY));
+        let reply = proto::ControlReply {
+            tag: proto::TAG_SLEEP,
+            data_lo: 0,
+        };
+        assert!(matches!(state.deliver(reply), Delivery::Matched));
+        assert!(state.take_reply(idx).is_some());
+        state.release(idx);
+        assert!(!state.requests_in_flight());
+    }
+
+    #[test]
+    fn a_sleep_request_can_follow_one_that_timed_out() {
+        let mut state = ControlState::new();
+        let idx = state.alloc_sleep().unwrap();
+        state.abandon(idx);
+        assert!(state.alloc_sleep().is_ok());
+    }
+
+    #[test]
+    fn a_wake_takes_both_messages() {
+        let mut state = ControlState::new();
+        state.wake_reset();
+        assert!(!state.wake_complete());
+        state.wake_note(0x33);
+        assert!(!state.wake_complete());
+        state.wake_note(proto::WAKE_TYPES[0]);
+        assert!(!state.wake_complete());
+        state.wake_note(proto::WAKE_TYPES[1]);
+        assert!(state.wake_complete());
+        state.wake_reset();
+        assert!(!state.wake_complete());
     }
 
     #[test]

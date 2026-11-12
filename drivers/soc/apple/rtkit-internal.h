@@ -63,6 +63,17 @@ struct apple_rtkit {
 	 * hand out kdebug buffers, and poll the mailbox while waiting.
 	 */
 	bool sync_syslog_ack;
+	/* Echo each OSLOG channel-0 counter, as macOS does. */
+	bool oslog_echo;
+	/* A counter queued for the receive work and not yet echoed. */
+	u64 oslog_owed;
+	/* Device interrupts are off: poll the mailbox while waiting. */
+	bool poll_waits;
+	/* The firmware is restarting with its buffers and rings still in place. */
+	bool warm_restart;
+	u32 warm_last_mask;
+	/* A port that only answers the co-processor, see apple_rtkit_port_handshake(). */
+	bool port_only;
 	DECLARE_KFIFO(sync_ack_fifo, struct apple_mbox_msg, 64);
 	struct work_struct sync_ack_work;
 
@@ -93,6 +104,8 @@ struct apple_rtkit {
 	/* Session inherited from the bootloader: INIT geometry never observed. */
 	bool syslog_inherited;
 	bool crashlog_inherited;
+	/* The crash log buffer is the firmware's own, mapped here when it crashed. */
+	bool crashlog_placed;
 	bool oslog_inherited;
 
 	/* A crash reported before the crashlog buffer was mapped: the log is
