@@ -18,6 +18,11 @@ description: |
   documented report entries may be read; the aperture is not a
   contiguous readable array of registers.
 
+  T8140 also publishes a 32-bit lifetime-servo effort count at offset
+  0xc000, followed by at most two 32-bit Q8.24 effort values. The entries
+  are applied in order to one actuator, making the last present entry the
+  effective GPU effort. T8112 uses the same layout.
+
 properties:
   compatible:
     enum:
