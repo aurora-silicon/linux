@@ -46,16 +46,13 @@ allOf:
           contains:
             enum:
               - apple,t8132-ave
-              - apple,t6050-ave
       required:
         - compatible
     then:
       properties:
         compatible:
           items:
-            - enum:
-                - apple,t8132-ave
-                - apple,t6050-ave
+            - const: apple,t8132-ave
             - const: apple,ave
 
         reg:
@@ -129,6 +126,7 @@ allOf:
                   - enum:
                       - apple,t6000-ave
                       - apple,t6041-ave
+                      - apple,t6050-ave
                       - apple,t8112-ave
                       - apple,t8140-ave
                   - items:
@@ -234,6 +232,7 @@ allOf:
                       contains:
                         enum:
                           - apple,t6041-ave
+                          - apple,t6050-ave
                           - apple,t8140-ave
                 then:
                   properties:

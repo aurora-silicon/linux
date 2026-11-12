@@ -857,7 +857,12 @@ static void aj_remove(struct platform_device *pdev)
 static const struct of_device_id aj_of_match[] = {
 	{ .compatible = "apple,t6000-jpeg", .data = &apple_jpeg_t6000 },
 	{ .compatible = "apple,t8112-jpeg", .data = &apple_jpeg_t8112 },
+	{ .compatible = "apple,t8122-jpeg", .data = &apple_jpeg_t8122 },
+	{ .compatible = "apple,t6030-jpeg", .data = &apple_jpeg_t8122 },
+	{ .compatible = "apple,t6031-jpeg", .data = &apple_jpeg_t8122 },
+	{ .compatible = "apple,t6032-jpeg", .data = &apple_jpeg_t8122 },
 	{ .compatible = "apple,t6041-jpeg", .data = &apple_jpeg_t6041 },
+	{ .compatible = "apple,t8132-jpeg", .data = &apple_jpeg_t6041 },
 	{ .compatible = "apple,t8140-jpeg", .data = &apple_jpeg_t8140 },
 	{ }
 };

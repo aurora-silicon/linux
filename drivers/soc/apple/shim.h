@@ -19,15 +19,23 @@
 #include <linux/types.h>
 
 struct apple_sep_fv_new_file_key;
+struct dev_pm_ops;
 
 void sep_cancel_work_sync(void *work);
 void sep_cancel_delayed_work_sync(void *work);
 
 /* -- pm_shim.c ---------------------------------------------------------- */
 
-int sep_pm_register(void (*event)(bool entering));
+int sep_pm_register(void *dev, void (*event)(bool entering), int (*sleep)(void),
+		    void (*wake)(void), bool (*told)(void));
 void sep_pm_unregister(void);
 int sep_pm_keep_domains(void *dev);
+int sep_pm_wait_gated(void *dev, unsigned int timeout_ms);
+int sep_pm_clear_dev_disable(void *dev);
+void sep_pm_dart_restore(void *dev);
+int sep_pm_commit_prepare(void *dev, void *mbox, u64 msg0, u32 msg1, u64 reply, u64 mask);
+int sep_pm_commit_finish(void *dev);
+extern const struct dev_pm_ops sep_pm_ops;
 
 /* -- hwrng_shim.c ------------------------------------------------------- */
 

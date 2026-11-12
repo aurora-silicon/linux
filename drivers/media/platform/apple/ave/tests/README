@@ -21,8 +21,8 @@ profiles, B-frame settings, rates, CBR/VBR and forced-key-frame fields.
 interface emits synthetic commands; capture inputs and generated artifacts
 must stay outside the public source tree. Compare only with the matching
 firmware layout, mask enumerated pointer fields and host-only headers, and
-report inherited differences explicitly. The 26A428 description is not
-reachable through the runtime CRC lookup.
+report inherited differences explicitly. Only the T6050 build (TEXT CRC
+87279429) reaches the 26A428 description through the runtime CRC lookup.
 
 The host shim intentionally uses stdint types, Linux's private ENOTSUPP
 value and side-effect-free calls to kernel-like arithmetic macros. Those
