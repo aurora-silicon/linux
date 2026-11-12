@@ -143,11 +143,6 @@
 struct apple_cio_hw {
 	/* DP IN adapter blocks of the router; 0 means the two of t8103 */
 	unsigned int dpin_count;
-	/*
-	 * Type 7 (acio,v2) routers: firmware ready at state BIT(24), PDF
-	 * masks in the receive ring registers, loader tuning required.
-	 */
-	bool type7;
 	bool mxwrap;
 	bool lstx_explicit;
 	/* Leave MxWrap RUN alone: the CIO reconfig restarts the CPU. */
@@ -164,6 +159,8 @@ struct apple_cio_hw {
 	bool no_host_clx;
 	/* Keep the domain's links symmetric. */
 	bool no_asym;
+	/* Type 7 router: Enter_USB cable words, bootloader RC tuning, Type 7 NHI. */
+	bool type7;
 	/*
 	 * Release the CPU with a plain store of the RUN value rather than a
 	 * read-modify-write, and halt it again when the router stops.
@@ -265,8 +262,8 @@ static const struct apple_cio_hw apple_cio_t6050_hw = {
  * qualified.
  */
 static const struct apple_cio_hw apple_cio_t6040_hw = {
-	.type7 = true,
 	.mxwrap = true,
+	.type7 = true,
 	.lstx_explicit = true,
 	.skip_run = true,
 	.lstx_after_boot = true,
