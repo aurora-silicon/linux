@@ -312,6 +312,14 @@ struct brcmf_cfg80211_vif_event {
 	struct brcmf_cfg80211_vif *vif;
 };
 
+/* Wake filters of one associated sleep: the broadcast magic filter, the
+ * EtherType 0x0842 magic filter and one unicast filter per own IPv4 and
+ * IPv6 address.
+ */
+#define BRCMF_LPAS_MAX_IP4		2
+#define BRCMF_LPAS_MAX_FILTERS		(2 + BRCMF_LPAS_MAX_IP4 + NDOL_MAX_ENTRIES)
+#define BRCMF_LPAS_MAX_SLEEP_PARAMS	8
+
 /**
  * struct brcmf_cfg80211_wowl - wowl related information.
  *
@@ -323,7 +331,12 @@ struct brcmf_cfg80211_vif_event {
  * @pre_ndoe: neighbour-discovery offload enable at entering suspend.
  * @pre_nolinkup: link-up event suppression at entering suspend.
  * @pre_pkt_filter_mode: packet-filter master mode at entering suspend.
- * @lpas_filters: LPAS packet filters installed for this sleep (bit per id).
+ * @lpas_filter_ids: packet filters installed for this sleep.
+ * @n_lpas_filters: number of entries in @lpas_filter_ids.
+ * @pre_sleep_params: values of the sleep power iovars at entering suspend.
+ * @sleep_params_set: sleep power iovars changed for this sleep (bit each).
+ * @pre_icmp: ICMP echo offload enable at entering suspend.
+ * @icmp_changed: ICMP echo offload was turned on for this sleep.
  * @lpas_event_mask: firmware event mask saved across associated sleep.
  * @lpas_event_mask_len: size of @lpas_event_mask.
  * @nd: net dectect data.
@@ -341,7 +354,12 @@ struct brcmf_cfg80211_wowl {
 	u32 pre_ndoe;
 	u32 pre_nolinkup;
 	u32 pre_pkt_filter_mode;
-	unsigned long lpas_filters;
+	u32 lpas_filter_ids[BRCMF_LPAS_MAX_FILTERS];
+	u8 n_lpas_filters;
+	u32 pre_sleep_params[BRCMF_LPAS_MAX_SLEEP_PARAMS];
+	unsigned long sleep_params_set;
+	u32 pre_icmp;
+	bool icmp_changed;
 	u8 *lpas_event_mask;
 	size_t lpas_event_mask_len;
 	struct cfg80211_wowlan_nd_match *nd;

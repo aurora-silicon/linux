@@ -7,6 +7,7 @@
 
 #include <linux/kernel.h>
 #include <linux/etherdevice.h>
+#include <linux/inetdevice.h>
 #include <linux/module.h>
 #include <linux/vmalloc.h>
 #include <net/cfg80211.h>
@@ -92,6 +93,12 @@
 
 #define BRCMF_LPAS_UNICAST_FILTER_ID	100
 #define BRCMF_LPAS_MAGIC_FILTER_ID	101
+#define BRCMF_LPAS_MAGIC_ETH_FILTER_ID	102
+#define BRCMF_LPAS_IP4_FILTER_ID	103
+#define BRCMF_LPAS_IP6_FILTER_ID	(BRCMF_LPAS_IP4_FILTER_ID + \
+					 BRCMF_LPAS_MAX_IP4)
+/* The start of a magic packet: six 0xff bytes and the station address. */
+#define BRCMF_LPAS_MAGIC_PREFIX_LEN	(ETH_ALEN * 2)
 /* Magic packet: six 0xff bytes, then the station address sixteen times. */
 #define BRCMF_LPAS_MAGIC_LEN		(ETH_ALEN * 17)
 #define BRCMF_LPAS_PKT_FILTER_MODE	1
@@ -4452,38 +4459,196 @@ static int brcmf_lpas_filter_install(struct brcmf_if *ifp, u32 id, u32 type,
 	return err;
 }
 
-static const u32 brcmf_lpas_filter_ids[] = {
-	BRCMF_LPAS_UNICAST_FILTER_ID,
-	BRCMF_LPAS_MAGIC_FILTER_ID,
-};
+static void brcmf_lpas_filter_track(struct brcmf_cfg80211_wowl *wowl, u32 id)
+{
+	if (!WARN_ON(wowl->n_lpas_filters >= BRCMF_LPAS_MAX_FILTERS))
+		wowl->lpas_filter_ids[wowl->n_lpas_filters++] = id;
+}
 
-static int brcmf_lpas_filters_remove(struct brcmf_if *ifp, unsigned long *map)
+static int brcmf_lpas_filters_remove(struct brcmf_if *ifp,
+				     struct brcmf_cfg80211_wowl *wowl)
 {
 	int i, err, ret = 0;
 
-	for (i = 0; i < ARRAY_SIZE(brcmf_lpas_filter_ids); i++) {
-		if (!test_and_clear_bit(i, map))
-			continue;
-		err = brcmf_lpas_filter_remove(ifp, brcmf_lpas_filter_ids[i]);
+	for (i = 0; i < wowl->n_lpas_filters; i++) {
+		err = brcmf_lpas_filter_remove(ifp, wowl->lpas_filter_ids[i]);
 		if (err && !ret)
 			ret = err;
 	}
+	wowl->n_lpas_filters = 0;
 	return ret;
+}
+
+/* One element of a pattern-list filter, matched with an all-ones mask. */
+struct brcmf_lpas_el {
+	u16 base;
+	u16 rel;
+	u16 len;
+	bool neg;
+	const void *data;
+};
+
+/* Install a type 2 filter that matches when every element matches. The
+ * offsets count from protocol headers the firmware finds itself, so IPv4
+ * options and the LLC/SNAP header of the 802.11 frame do not move them.
+ */
+static int brcmf_lpas_list_filter_install(struct brcmf_if *ifp, u32 id,
+					  const struct brcmf_lpas_el *el,
+					  int n)
+{
+	size_t head = offsetof(struct brcmf_pkt_filter_le, u);
+	struct brcmf_pkt_filter_listel_le *e;
+	struct brcmf_pkt_filter_list_le *list;
+	struct brcmf_pkt_filter_le *filter;
+	size_t size = sizeof(*list);
+	u8 *buf, *p;
+	int i, err;
+
+	for (i = 0; i < n; i++)
+		size += sizeof(*e) + 2 * el[i].len;
+
+	buf = kzalloc(head + size, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	filter = (struct brcmf_pkt_filter_le *)buf;
+	filter->id = cpu_to_le32(id);
+	filter->type = cpu_to_le32(BRCMF_PKT_FILTER_TYPE_PATTERN_LIST);
+	filter->negate_match = cpu_to_le32(0);
+
+	list = (struct brcmf_pkt_filter_list_le *)(buf + head);
+	list->list_cnt = n;
+	list->totsize = cpu_to_le16(size);
+	p = list->elements;
+	for (i = 0; i < n; i++) {
+		e = (struct brcmf_pkt_filter_listel_le *)p;
+		e->rel_offs = cpu_to_le16(el[i].rel);
+		e->base_offs = cpu_to_le16(el[i].base);
+		e->size_bytes = cpu_to_le16(el[i].len);
+		e->match_flags = cpu_to_le16(el[i].neg ?
+					     BRCMF_PKT_FILTER_MFLAG_NEG : 0);
+		memset(e->mask_and_data, 0xff, el[i].len);
+		memcpy(e->mask_and_data + el[i].len, el[i].data, el[i].len);
+		p += sizeof(*e) + 2 * el[i].len;
+	}
+
+	err = brcmf_fil_iovar_data_set(ifp, "pkt_filter_add", buf, head + size);
+	kfree(buf);
+	if (err)
+		return err;
+	err = brcmf_lpas_filter_enable(ifp, id, true);
+	if (err)
+		brcmf_fil_iovar_int_set(ifp, "pkt_filter_delete", id);
+	return err;
+}
+
+static int brcmf_lpas_own_ip4(struct net_device *ndev, __be32 *ip4, int max)
+{
+	const struct in_ifaddr *ifa;
+	struct in_device *in_dev;
+	int n = 0;
+
+	rcu_read_lock();
+	in_dev = __in_dev_get_rcu(ndev);
+	if (in_dev) {
+		in_dev_for_each_ifa_rcu(ifa, in_dev) {
+			if (n == max)
+				break;
+			ip4[n++] = ifa->ifa_local;
+		}
+	}
+	rcu_read_unlock();
+	return n;
+}
+
+/*
+ * On unicast frames the firmware matches only patterns near the
+ * headers: the whole magic sequence after the UDP header never matches,
+ * at a fixed offset or with the magic filter type. Unicast magic packets
+ * are matched instead by addressing and the start of the sequence: UDP
+ * to one of our addresses whose payload starts with six 0xff bytes and
+ * the station address, and the same start right after an EtherType
+ * 0x0842 header. Each filter is optional; an address the firmware has no
+ * room for only loses its unicast wake.
+ */
+static void brcmf_lpas_ucast_filters_install(struct brcmf_if *ifp,
+					     struct brcmf_cfg80211_wowl *wowl,
+					     const __be32 *ip4, int n_ip4)
+{
+	static const u8 ethertype_wol[] = { 0x08, 0x42 };
+	static const u8 proto_udp = IPPROTO_UDP;
+	u8 prefix[BRCMF_LPAS_MAGIC_PREFIX_LEN];
+	struct brcmf_lpas_el el[3];
+	int i, n = 0, err;
+	u32 id;
+
+	memset(prefix, 0xff, ETH_ALEN);
+	memcpy(prefix + ETH_ALEN, ifp->ndev->dev_addr, ETH_ALEN);
+
+	el[0] = (struct brcmf_lpas_el){ BRCMF_PKT_FILTER_BASE_ETH_H, 12,
+					sizeof(ethertype_wol), false,
+					ethertype_wol };
+	el[1] = (struct brcmf_lpas_el){ BRCMF_PKT_FILTER_BASE_ETH_D, 0,
+					sizeof(prefix), false, prefix };
+	err = brcmf_lpas_list_filter_install(ifp,
+					     BRCMF_LPAS_MAGIC_ETH_FILTER_ID,
+					     el, 2);
+	if (!err) {
+		brcmf_lpas_filter_track(wowl, BRCMF_LPAS_MAGIC_ETH_FILTER_ID);
+		n++;
+	}
+
+	el[2] = (struct brcmf_lpas_el){ BRCMF_PKT_FILTER_BASE_UDP_D, 0,
+					sizeof(prefix), false, prefix };
+
+	for (i = 0; i < n_ip4; i++) {
+		id = BRCMF_LPAS_IP4_FILTER_ID + i;
+		/* IPv4 destination address, then protocol. */
+		el[0] = (struct brcmf_lpas_el){ BRCMF_PKT_FILTER_BASE_IP4_H, 16,
+						4, false, &ip4[i] };
+		el[1] = (struct brcmf_lpas_el){ BRCMF_PKT_FILTER_BASE_IP4_H, 9,
+						1, false, &proto_udp };
+		err = brcmf_lpas_list_filter_install(ifp, id, el, 3);
+		if (err)
+			break;
+		brcmf_lpas_filter_track(wowl, id);
+		n++;
+	}
+
+	for (i = 0; i < ifp->ipv6addr_idx && i < NDOL_MAX_ENTRIES; i++) {
+		id = BRCMF_LPAS_IP6_FILTER_ID + i;
+		/* IPv6 destination address, then next header. */
+		el[0] = (struct brcmf_lpas_el){ BRCMF_PKT_FILTER_BASE_IP6_H, 24,
+						sizeof(struct in6_addr), false,
+						&ifp->ipv6_addr_tbl[i] };
+		el[1] = (struct brcmf_lpas_el){ BRCMF_PKT_FILTER_BASE_IP6_H, 6,
+						1, false, &proto_udp };
+		err = brcmf_lpas_list_filter_install(ifp, id, el, 3);
+		if (err)
+			break;
+		brcmf_lpas_filter_track(wowl, id);
+		n++;
+	}
+
+	brcmf_dbg(INFO, "%d unicast magic filters (%d IPv4, %d IPv6 addresses)\n",
+		  n, n_ip4, ifp->ipv6addr_idx);
 }
 
 /*
  * Forward-on-match filters decide which frames reach (and so wake) the
- * host while LPAS keeps the association. "any" passes every unicast frame
+ * host during the associated sleep. "any" passes every unicast frame
  * with a fixed-offset pattern filter, as public DHD's minimal suspend
  * policy does. A magic-packet trigger uses the firmware's magic pattern
- * filter, which matches the sequence at the given offset or anywhere later,
- * so one filter from the start of the Ethernet payload covers UDP over IPv4
- * and IPv6 and EtherType 0x0842. ARP and neighbour discovery are answered by
- * their offloads.
+ * filter for broadcast frames, which matches the sequence at the given
+ * offset or anywhere later, so one filter from the start of the Ethernet
+ * payload covers UDP over IPv4 and IPv6 and EtherType 0x0842; unicast
+ * magic packets get the address filters above. ARP, neighbour discovery
+ * and ICMP echo are answered by their offloads.
  */
 static int brcmf_lpas_filters_install(struct brcmf_if *ifp,
 				      struct cfg80211_wowlan *trig,
-				      unsigned long *map)
+				      struct brcmf_cfg80211_wowl *wowl,
+				      const __be32 *ip4, int n_ip4)
 {
 	static const u8 ucast_mask[] = { 0x01 }, ucast_pattern[] = { 0x00 };
 	u8 mask[BRCMF_LPAS_MAGIC_LEN], magic[BRCMF_LPAS_MAGIC_LEN];
@@ -4496,7 +4661,7 @@ static int brcmf_lpas_filters_install(struct brcmf_if *ifp,
 						ucast_mask, ucast_pattern, 1);
 		if (err)
 			return err;
-		__set_bit(0, map);
+		brcmf_lpas_filter_track(wowl, BRCMF_LPAS_UNICAST_FILTER_ID);
 		return 0;
 	}
 
@@ -4510,8 +4675,90 @@ static int brcmf_lpas_filters_install(struct brcmf_if *ifp,
 					mask, magic, sizeof(magic));
 	if (err)
 		return err;
-	__set_bit(1, map);
+	brcmf_lpas_filter_track(wowl, BRCMF_LPAS_MAGIC_FILTER_ID);
+
+	brcmf_lpas_ucast_filters_install(ifp, wowl, ip4, n_ip4);
 	return 0;
+}
+
+/*
+ * Power save of the associated sleep: PM_FAST, listening to every DTIM
+ * beacon and staying awake long enough after one for the buffered
+ * broadcast frames, so a single broadcast magic packet reaches the
+ * firmware. The firmware keeps its own value for any it does not know.
+ */
+static const struct {
+	const char *name;
+	u32 val;
+} brcmf_lpas_sleep_params[] = {
+	{ "bcn_li_dtim", 1 },
+	{ "bcn_li_bcn", 0 },
+	{ "pm2_sleep_ret", 15 },
+	{ "pm2_bcn_sleep_ret", 50 },
+	{ "pm_bcmc_wait", 65000 },
+	{ "pm_bcmc_moredata_wait", 30000 },
+};
+
+static_assert(ARRAY_SIZE(brcmf_lpas_sleep_params) <=
+	      BRCMF_LPAS_MAX_SLEEP_PARAMS);
+
+static void brcmf_lpas_sleep_params_set(struct brcmf_if *ifp,
+					struct brcmf_cfg80211_wowl *wowl)
+{
+	int i;
+
+	wowl->sleep_params_set = 0;
+	for (i = 0; i < ARRAY_SIZE(brcmf_lpas_sleep_params); i++) {
+		if (brcmf_fil_iovar_int_get(ifp, brcmf_lpas_sleep_params[i].name,
+					    &wowl->pre_sleep_params[i]))
+			continue;
+		if (brcmf_fil_iovar_int_set(ifp, brcmf_lpas_sleep_params[i].name,
+					    brcmf_lpas_sleep_params[i].val))
+			continue;
+		__set_bit(i, &wowl->sleep_params_set);
+	}
+}
+
+static int brcmf_lpas_sleep_params_restore(struct brcmf_if *ifp,
+					   struct brcmf_cfg80211_wowl *wowl)
+{
+	int i, err, ret = 0;
+
+	for (i = 0; i < ARRAY_SIZE(brcmf_lpas_sleep_params); i++) {
+		if (!test_and_clear_bit(i, &wowl->sleep_params_set))
+			continue;
+		err = brcmf_fil_iovar_int_set(ifp,
+					      brcmf_lpas_sleep_params[i].name,
+					      wowl->pre_sleep_params[i]);
+		if (err && !ret)
+			ret = err;
+	}
+	return ret;
+}
+
+/* Answer ICMP echo to our IPv4 address in the firmware, if it can. */
+static void brcmf_lpas_icmp_offload(struct brcmf_if *ifp,
+				    struct brcmf_cfg80211_wowl *wowl,
+				    const __be32 *ip4, int n_ip4)
+{
+	wowl->icmp_changed = false;
+	if (!n_ip4 || brcmf_fil_iovar_int_get(ifp, "icmp", &wowl->pre_icmp))
+		return;
+	if (brcmf_fil_iovar_data_set(ifp, "icmp_hostip", &ip4[0],
+				     sizeof(ip4[0])))
+		return;
+	if (brcmf_fil_iovar_int_set(ifp, "icmp", 1))
+		return;
+	wowl->icmp_changed = true;
+}
+
+static int brcmf_lpas_icmp_restore(struct brcmf_if *ifp,
+				   struct brcmf_cfg80211_wowl *wowl)
+{
+	if (!wowl->icmp_changed)
+		return 0;
+	wowl->icmp_changed = false;
+	return brcmf_fil_iovar_int_set(ifp, "icmp", wowl->pre_icmp);
 }
 
 static void brcmf_lpas_restore_offloads(struct brcmf_if *ifp,
@@ -4542,7 +4789,8 @@ static int brcmf_restore_lpas(struct brcmf_cfg80211_info *cfg,
 						      wowl->pre_nolinkup));
 	BRCMF_LPAS_RESTORE(brcmf_fil_iovar_int_set(ifp, "pkt_filter_mode",
 						      wowl->pre_pkt_filter_mode));
-	BRCMF_LPAS_RESTORE(brcmf_lpas_filters_remove(ifp, &wowl->lpas_filters));
+	BRCMF_LPAS_RESTORE(brcmf_lpas_filters_remove(ifp, wowl));
+	BRCMF_LPAS_RESTORE(brcmf_lpas_icmp_restore(ifp, wowl));
 	BRCMF_LPAS_RESTORE(brcmf_fil_iovar_int_set(ifp, "ndoe",
 						      wowl->pre_ndoe));
 	BRCMF_LPAS_RESTORE(brcmf_fil_iovar_int_set(ifp, "arpoe",
@@ -4551,6 +4799,7 @@ static int brcmf_restore_lpas(struct brcmf_cfg80211_info *cfg,
 						      wowl->pre_arp_ol));
 	BRCMF_LPAS_RESTORE(brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PM,
 						    wowl->pre_pmmode));
+	BRCMF_LPAS_RESTORE(brcmf_lpas_sleep_params_restore(ifp, wowl));
 
 #undef BRCMF_LPAS_RESTORE
 
@@ -4579,7 +4828,8 @@ static int brcmf_configure_lpas(struct brcmf_cfg80211_info *cfg,
 	bool events_changed = false;
 	bool pm_changed = false;
 	bool lpas_attempted = false;
-	int err;
+	__be32 ip4[BRCMF_LPAS_MAX_IP4];
+	int n_ip4, err;
 
 	if (!test_bit(BRCMF_VIF_STATUS_CONNECTED, &ifp->vif->sme_state)) {
 		err = -ENOTCONN;
@@ -4643,15 +4893,19 @@ static int brcmf_configure_lpas(struct brcmf_cfg80211_info *cfg,
 	if (err)
 		goto fail;
 
-	err = brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PM, PM_MAX);
-	if (err)
-		goto fail;
+	n_ip4 = brcmf_lpas_own_ip4(ifp->ndev, ip4, ARRAY_SIZE(ip4));
+
 	pm_changed = true;
+	brcmf_lpas_sleep_params_set(ifp, wowl);
+	err = brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PM, PM_FAST);
+	if (err)
+		goto rollback;
 
 	offloads_changed = true;
 	err = brcmf_configure_arp_nd_offload(ifp, true);
 	if (err)
 		goto rollback;
+	brcmf_lpas_icmp_offload(ifp, wowl, ip4, n_ip4);
 
 	err = brcmf_fil_iovar_int_set(ifp, "pkt_filter_mode",
 					   BRCMF_LPAS_PKT_FILTER_MODE);
@@ -4667,7 +4921,7 @@ static int brcmf_configure_lpas(struct brcmf_cfg80211_info *cfg,
 	if (err)
 		goto rollback;
 
-	err = brcmf_lpas_filters_install(ifp, trig, &wowl->lpas_filters);
+	err = brcmf_lpas_filters_install(ifp, trig, wowl, ip4, n_ip4);
 	if (err)
 		goto rollback;
 
@@ -4698,11 +4952,15 @@ rollback:
 	if (filter_mode_changed)
 		brcmf_fil_iovar_int_set(ifp, "pkt_filter_mode",
 					wowl->pre_pkt_filter_mode);
-	brcmf_lpas_filters_remove(ifp, &wowl->lpas_filters);
-	if (offloads_changed)
+	brcmf_lpas_filters_remove(ifp, wowl);
+	if (offloads_changed) {
+		brcmf_lpas_icmp_restore(ifp, wowl);
 		brcmf_lpas_restore_offloads(ifp, wowl);
-	if (pm_changed)
+	}
+	if (pm_changed) {
 		brcmf_fil_cmd_int_set(ifp, BRCMF_C_SET_PM, wowl->pre_pmmode);
+		brcmf_lpas_sleep_params_restore(ifp, wowl);
+	}
 fail:
 	kfree(sleep_mask);
 	kfree(saved_mask);
