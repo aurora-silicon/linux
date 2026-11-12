@@ -101,7 +101,9 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('epoch', 'close', 'producer-fence', 'active-fence', 'board', 'board-j616s',
                                    'cold-gate', 'cold-windows', 'cold-running-fw', 'cold-rti', 'cold-unquiesce',
                                    'cold-reset', 'cold-send', 'cold-queue', 'cold-unarmed', 'cold-rearm',
-                                   'cold-error', 'cold-sticky', 'cold-setup-retry'), out(), PASS),
+                                   'cold-error', 'cold-sticky', 'cold-setup-retry', 'cold-defer',
+                                   'cold-open-queue', 'cold-owed-kept', 'cold-resume-fence',
+                                   'cold-queue-fence'), out(), PASS),
     'bcm4377-sleep-config-tests.py': [([], PASS)],
     'brcmf-assoc-tests.py': [(out('--output'), PASS)]
         + mutations('--mutation', ('short-ie', 'header-length', 'skb-capacity', 'cmplt-header'), out('--output')),

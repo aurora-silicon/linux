@@ -58,6 +58,8 @@ struct hci_dev {
 	struct work_struct power_on, cmd_sync_work, cmd_work;
 	struct delayed_work cmd_timer, ncmd_timer;
 	int req_lock, cmd_cnt, suspend_state, wake_reason, wake_addr_type;
+	/* The core's own mark: set by its suspend, cleared by its resume when powered. */
+	bool suspended;
 	bdaddr_t wake_addr;
 	int *req_skb;
 	void (*reset)(struct hci_dev *hdev);
@@ -90,8 +92,8 @@ struct bcm4377_data {
 	pthread_mutex_t resume_lock;
 	uint64_t resume_epoch, resume_pending;
 	bool resume_armed, resume_blocked, resume_powered;
-	bool resume_guarded, resume_recovering, resume_cold;
-	struct work_struct resume_work;
+	bool resume_guarded, resume_recovering, resume_cold, hci_resume_owed;
+	struct work_struct resume_work, hci_resume_work;
  struct ring acl_d2h_ring,acl_h2d_ring,sco_d2h_ring,sco_h2d_ring,hci_d2h_ring,hci_h2d_ring,sco_event_ring,sco_ack_ring,hci_acl_event_ring,hci_acl_ack_ring;
 };
 static int cal_count,ptb_count,reset_count,open_count,queued_count,addr_count,cal_failures,ptb_error,addr_error,reset_error,rings_error,close_error;
@@ -198,6 +200,7 @@ static void iowrite32(int val, void *addr)
 {
 	if (val == BCM4377_BAR0_SLEEP_CONTROL_QUIESCE) {
 		assert(!request.fn && !active->resume_work.queued && !active_running);
+		assert(!active->hci_resume_work.queued);
 		quiesces++;
 		return;
 	}
@@ -266,7 +269,15 @@ static void kfree_skb(struct sk_buff *skb)
 
 static int hci_suspend_dev(struct hci_dev *h);
 static int hci_resume_dev(struct hci_dev *h);
-static void hci_unregister_dev(struct hci_dev *h) {assert(!request.fn&&!active->resume_work.queued&&!active_running);h->flags|=HCI_UNREGISTER;unregistered++;}
+
+static void hci_unregister_dev(struct hci_dev *h)
+{
+	assert(!request.fn && !active->resume_work.queued && !active_running);
+	assert(!active->hci_resume_work.queued);
+	h->flags |= HCI_UNREGISTER;
+	unregistered++;
+}
+
 static int hci_dev_close_sync(struct hci_dev *h);
 static int hci_dev_open_sync(struct hci_dev *h);
 int hci_reset_dev_sync(struct hci_dev *h);
@@ -278,7 +289,16 @@ static int hci_skb_opcode(int *p) {return *p;}
 static bool mgmt_powering_down(struct hci_dev *h) {return h->flags&HCI_POWERING_DOWN;}
 static void hci_req_sync_lock(struct hci_dev *h) {assert(!req_locked);req_locked=true;}
 static void hci_req_sync_unlock(struct hci_dev *h) {assert(req_locked);req_locked=false;}
-static int hci_suspend_sync(struct hci_dev *h) {return suspend_error;}
+
+/* The core marks the controller suspended unless its suspend fails. */
+static int hci_suspend_sync(struct hci_dev *h)
+{
+	if (suspend_error)
+		return suspend_error;
+	h->suspended = true;
+	return 0;
+}
+
 static int hci_resume_sync(struct hci_dev *h);
 static void hci_clear_wake_reason(struct hci_dev *h) {}
 static void mgmt_suspending(struct hci_dev *h,int state) {}

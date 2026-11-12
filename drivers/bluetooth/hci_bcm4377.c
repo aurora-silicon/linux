@@ -621,7 +621,10 @@ struct bcm4377_data {
 	bool resume_recovering;
 	/* Back from a system sleep without its firmware: nothing is sent until the reset. */
 	bool resume_cold;
+	/* The HCI core is still suspended: it resumes after the open that boots the firmware. */
+	bool hci_resume_owed;
 	struct work_struct resume_work;
+	struct work_struct hci_resume_work;
 	bdaddr_t bdaddr;
 
 	wait_queue_head_t event;
@@ -1695,6 +1698,45 @@ static void bcm4377_resume_recovery_work(struct work_struct *work)
 		bcm4377_resume_recovery_destroy(bcm4377->hdev, epoch, ret);
 }
 
+/* Resume the HCI core. It stays suspended, and owed, while the controller is not powered. */
+static int bcm4377_hci_resume(struct bcm4377_data *bcm4377)
+{
+	struct hci_dev *hdev = bcm4377->hdev;
+	int ret = hci_resume_dev(hdev);
+
+	if (!READ_ONCE(hdev->suspended))
+		WRITE_ONCE(bcm4377->hci_resume_owed, false);
+	return ret;
+}
+
+/*
+ * A function that came back from a sleep without its firmware answers none of the commands
+ * the core's resume sends. The core stays suspended until an open has reset the function
+ * and booted the firmware, and resumes here, after that open.
+ */
+static void bcm4377_hci_resume_work(struct work_struct *work)
+{
+	struct bcm4377_data *bcm4377 = container_of(work, struct bcm4377_data,
+						 hci_resume_work);
+	struct hci_dev *hdev = bcm4377->hdev;
+
+	/* The open that queued this holds the request lock until the controller is up. */
+	hci_req_sync_lock(hdev);
+	hci_req_sync_unlock(hdev);
+	if (READ_ONCE(bcm4377->hci_resume_owed))
+		bcm4377_hci_resume(bcm4377);
+}
+
+static void bcm4377_queue_hci_resume(struct bcm4377_data *bcm4377)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&bcm4377->resume_lock, flags);
+	if (READ_ONCE(bcm4377->hci_resume_owed) && !bcm4377->resume_blocked)
+		queue_work(system_freezable_wq, &bcm4377->hci_resume_work);
+	spin_unlock_irqrestore(&bcm4377->resume_lock, flags);
+}
+
 static void bcm4377_hci_reset(struct hci_dev *hdev);
 
 static void bcm4377_hci_timeout(struct hci_dev *hdev)
@@ -1742,6 +1784,8 @@ static void bcm4377_resume_recovery_stop(struct bcm4377_data *bcm4377)
 			     NULL, NULL);
 	/* A callback already removed from the queue must retire before PCI quiesces. */
 	flush_work(&bcm4377->hdev->cmd_sync_work);
+	/* An open that ended ahead of this fence may have queued the core's resume. */
+	cancel_work_sync(&bcm4377->hci_resume_work);
 }
 
 static int bcm4377_hci_open(struct hci_dev *hdev)
@@ -1820,8 +1864,10 @@ static int bcm4377_hci_close(struct hci_dev *hdev)
 	}
 
 	if (bcm4377->needs_reset) {
-		dev_warn(&bcm4377->pdev->dev,
-			 "transport needs hardware reset on next open\n");
+		/* Expected of a function a sleep left cold; its restart has said so. */
+		if (!READ_ONCE(bcm4377->resume_cold))
+			dev_warn(&bcm4377->pdev->dev,
+				 "transport needs hardware reset on next open\n");
 		bcm4377->acl_d2h_ring.enabled = false;
 		bcm4377->acl_h2d_ring.enabled = false;
 		bcm4377->sco_d2h_ring.enabled = false;
@@ -1955,7 +2001,7 @@ static int bcm4377_hci_post_init(struct hci_dev *hdev)
 	int ret;
 
 	if (!bcm4377->cal_needed)
-		return 0;
+		goto out;
 
 	if (!bcm4377->cal_loaded) {
 		dev_info(&bcm4377->pdev->dev,
@@ -1989,6 +2035,9 @@ static int bcm4377_hci_post_init(struct hci_dev *hdev)
 	}
 
 	bcm4377->cal_needed = false;
+out:
+	/* The firmware answers: a core that a cold resume left suspended can resume. */
+	bcm4377_queue_hci_resume(bcm4377);
 	return 0;
 }
 
@@ -2977,6 +3026,7 @@ static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	INIT_DELAYED_WORK(&bcm4377->setup_retry_work, bcm4377_setup_retry_work);
 	spin_lock_init(&bcm4377->resume_lock);
 	INIT_WORK(&bcm4377->resume_work, bcm4377_resume_recovery_work);
+	INIT_WORK(&bcm4377->hci_resume_work, bcm4377_hci_resume_work);
 
 	ret = bcm4377_prepare_rings(bcm4377);
 	if (ret)
@@ -3258,24 +3308,34 @@ static int bcm4377_resume(struct device *dev)
 	}
 	bcm4377->resume_powered = false;
 
-	ret = hci_resume_dev(bcm4377->hdev);
-	apple_radio_sleep_endpoint_resumed(dev, ret);
-	if (apple_radio_sleep_owned(dev))
+	/* The radio-sleep owner's endpoint resumes as it suspended: whole, and reports it. */
+	if (apple_radio_sleep_owned(dev)) {
+		ret = bcm4377_hci_resume(bcm4377);
+		apple_radio_sleep_endpoint_resumed(dev, ret);
 		return ret;
-	WRITE_ONCE(bcm4377->setup_retry_blocked, false);
+	}
 	if (cold) {
 		/* What a command timeout would start, without the timeout. */
 		spin_lock_irqsave(&bcm4377->resume_lock, flags);
 		if (bcm4377->resume_armed) {
 			bcm4377->resume_armed = false;
 			bcm4377->resume_pending = bcm4377->resume_epoch;
+			/* Nothing answers before that reset: the core resumes after the open. */
+			WRITE_ONCE(bcm4377->hci_resume_owed, true);
 			queue_work(system_freezable_wq, &bcm4377->resume_work);
 		}
 		spin_unlock_irqrestore(&bcm4377->resume_lock, flags);
+		/* No reset queued: the controller is down or the core's resume fails at once. */
+		if (!READ_ONCE(bcm4377->hci_resume_owed))
+			bcm4377_hci_resume(bcm4377);
+		WRITE_ONCE(bcm4377->setup_retry_blocked, false);
 		/* A setup retry the suspend held back needs no firmware: its open resets. */
 		bcm4377_queue_setup_retry(bcm4377);
 		return 0;
 	}
+
+	ret = bcm4377_hci_resume(bcm4377);
+	WRITE_ONCE(bcm4377->setup_retry_blocked, false);
 	if (!ret)
 		bcm4377_queue_setup_retry(bcm4377);
 	return ret;

@@ -3,7 +3,7 @@
 """Compile retained Bluetooth resume callbacks against controlled core/PCI services."""
 import argparse, hashlib, json, os, re, resource, subprocess
 from pathlib import Path
-p=argparse.ArgumentParser();p.add_argument('--out',required=True);p.add_argument('--old-ref');p.add_argument('--mutation',choices=['epoch','close','producer-fence','active-fence','board','board-j616s','cold-gate','cold-windows','cold-running-fw','cold-rti','cold-unquiesce','cold-reset','cold-send','cold-queue','cold-unarmed','cold-rearm','cold-error','cold-sticky','cold-setup-retry']);a=p.parse_args()
+p=argparse.ArgumentParser();p.add_argument('--out',required=True);p.add_argument('--old-ref');p.add_argument('--mutation',choices=['epoch','close','producer-fence','active-fence','board','board-j616s','cold-gate','cold-windows','cold-running-fw','cold-rti','cold-unquiesce','cold-reset','cold-send','cold-queue','cold-unarmed','cold-rearm','cold-error','cold-sticky','cold-setup-retry','cold-defer','cold-open-queue','cold-owed-kept','cold-resume-fence','cold-queue-fence']);a=p.parse_args()
 r=Path(__file__).resolve().parents[2];o=Path(a.out);o.mkdir(parents=True,exist_ok=False);(o/'tmp').mkdir()
 def extract(s,n):
  m=re.search(r'^(?:static )?(?:int|void|bool) '+n+r'\([^;]*?\)\n\{',s,re.M|re.S)
@@ -12,11 +12,11 @@ def extract(s,n):
  while depth:depth+=(s[b]=='{')-(s[b]=='}');b+=1
  return s[m.start():b]+'\n'
 s=(r/'drivers/bluetooth/hci_bcm4377.c').read_text();core=(r/'net/bluetooth/hci_sync.c').read_text();core_hci=(r/'net/bluetooth/hci_core.c').read_text()
-names=['bcm4377_setup_retry_allowed', 'bcm4377_queue_setup_retry', 'bcm4377_setup_retry_work', 'bcm4377_resume_recovery_supported', 'bcm4377_resume_recovery_allowed', 'bcm4377_resume_recovery_invalidate', 'bcm4377_resume_recovery_sync', 'bcm4377_resume_recovery_destroy', 'bcm4377_resume_recovery_work', 'bcm4377_hci_timeout', 'bcm4377_resume_recovery_stop', 'bcm4377_hci_open', 'bcm4377_hci_close', 'bcm4377_hci_setup_once', 'bcm4377_hci_setup', 'bcm4377_hci_post_init', 'bcm4377_hci_send_frame', 'bcm4377_init_cfg', 'bcm4377_hci_unregister_dev', 'bcm4377_suspend', 'bcm4377_resume_cold', 'bcm4377_resume', 'bcm4377_sleep_finish']
+names=['bcm4377_setup_retry_allowed','bcm4377_queue_setup_retry','bcm4377_setup_retry_work','bcm4377_resume_recovery_supported','bcm4377_resume_recovery_allowed','bcm4377_resume_recovery_invalidate','bcm4377_resume_recovery_sync','bcm4377_resume_recovery_destroy','bcm4377_resume_recovery_work','bcm4377_hci_resume','bcm4377_hci_resume_work','bcm4377_queue_hci_resume','bcm4377_hci_timeout','bcm4377_resume_recovery_stop','bcm4377_hci_open','bcm4377_hci_close','bcm4377_hci_setup_once','bcm4377_hci_setup','bcm4377_hci_post_init','bcm4377_hci_send_frame','bcm4377_init_cfg','bcm4377_hci_unregister_dev','bcm4377_sleep_finish','bcm4377_suspend','bcm4377_resume_cold','bcm4377_resume']
 bodies={n:extract(s,n) for n in names};shared=[]
 if a.old_ref:
  old=subprocess.check_output(['git','show',a.old_ref+':drivers/bluetooth/hci_bcm4377.c'],cwd=r,text=True)
- for n in ['bcm4377_hci_open','bcm4377_hci_close','bcm4377_hci_unregister_dev','bcm4377_suspend','bcm4377_resume']:bodies[n]=extract(old,n)
+ for n in ['bcm4377_hci_open','bcm4377_hci_close','bcm4377_hci_unregister_dev','bcm4377_sleep_finish','bcm4377_suspend','bcm4377_resume']:bodies[n]=extract(old,n)
  shared=[n for n in names if 'resume_recovery' in n or n=='bcm4377_hci_timeout']
 mutations={
  'epoch':('bcm4377_resume_recovery_sync','epoch == bcm4377->resume_epoch && ','' ,33),
@@ -36,9 +36,15 @@ mutations={
  'cold-queue':('bcm4377_resume','queue_work(system_freezable_wq, &bcm4377->resume_work);','',46),
  'cold-unarmed':('bcm4377_resume','if (bcm4377->resume_armed) {','if (true) {',48),
  'cold-rearm':('bcm4377_resume','\t\t\tbcm4377->resume_armed = false;\n','',46),
- 'cold-error':('bcm4377_resume','\t\treturn 0;\n\t}\n\tif (!ret)','\t}\n\tif (!ret)',47),
+ 'cold-error':('bcm4377_resume','\t\treturn 0;\n\t}\n\n\tret = bcm4377_hci_resume(bcm4377);','\t}\n\n\tret = bcm4377_hci_resume(bcm4377);',47),
  'cold-sticky':('bcm4377_resume',' || READ_ONCE(bcm4377->resume_cold)','',61),
  'cold-setup-retry':('bcm4377_resume','\t\tbcm4377_queue_setup_retry(bcm4377);\n\t\treturn 0;','\t\treturn 0;',62),
+ # The core's resume waits for the open that boots the firmware, and is fenced like the recovery.
+ 'cold-defer':('bcm4377_resume','\t\tif (!READ_ONCE(bcm4377->hci_resume_owed))\n\t\t\tbcm4377_hci_resume(bcm4377);','\t\tbcm4377_hci_resume(bcm4377);',46),
+ 'cold-open-queue':('bcm4377_hci_post_init','\tbcm4377_queue_hci_resume(bcm4377);\n','',46),
+ 'cold-owed-kept':('bcm4377_hci_resume','\tif (!READ_ONCE(hdev->suspended))\n\t\tWRITE_ONCE','\tWRITE_ONCE',63),
+ 'cold-resume-fence':('bcm4377_resume_recovery_stop','\tcancel_work_sync(&bcm4377->hci_resume_work);\n','',64),
+ 'cold-queue-fence':('bcm4377_queue_hci_resume',' && !bcm4377->resume_blocked','',66),
 }
 if a.mutation:
  n,old,new,case=mutations[a.mutation];assert bodies[n].count(old)==1,(n,old);bodies[n]=bodies[n].replace(old,new,1)
@@ -75,7 +81,7 @@ c=subprocess.run(['cc','-std=gnu11','-pthread','-Wall','-Wextra','-Wno-unused-fu
 (o/'compile.log').write_text(c.stdout+c.stderr);assert not c.returncode,c.stderr
 def no_core():resource.setrlimit(resource.RLIMIT_CORE,(0,0))
 results=[]
-for n in ([mutations[a.mutation][3]] if a.mutation else [0,1,2,28] if a.old_ref else range(63)):
+for n in ([mutations[a.mutation][3]] if a.mutation else [0,1,2,28] if a.old_ref else range(67)):
  c=subprocess.run([str(o/'controls'),str(n)],capture_output=True,text=True,preexec_fn=no_core,env=dict(env,ASAN_OPTIONS='detect_leaks=1'))
  results.append({'case':n,'exit':c.returncode,'stdout':c.stdout,'stderr':c.stderr})
 expected=-6 if a.old_ref or a.mutation else 0
