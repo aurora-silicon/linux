@@ -1234,6 +1234,15 @@ static void apple_smc_wake_noirq(struct apple_smc *smc)
 	if (!smc->ap_notified)
 		return;
 
+	/*
+	 * Committed, and no power loss followed: a check that comes after this device's
+	 * suspend refused the sleep, or a wake event got in first. The SMC gets the notices
+	 * of a wake all the same, which is all there is to send, but it leaves its sleep
+	 * state only through a power loss: see apple_smc_sleep_commits().
+	 */
+	if (!pm_resume_via_firmware())
+		dev_warn(smc->dev, "sleep refused after the SMC's commit: its sensor reports may stand still until a sleep completes\n");
+
 	apple_smc_set_polled(smc, true);
 	apple_smc_sleep_wake(smc);
 	apple_smc_set_polled(smc, false);
