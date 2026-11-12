@@ -79,7 +79,7 @@
 		power-domains = <&ps_jpg>;
 		clocks = <&peripheral_clocks 354>, <&peripheral_clocks 355>;
 		iommus = <&jpeg0_dart 0>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	jpeg0_dart: iommu@409004000 {
@@ -89,7 +89,7 @@
 		interrupts = <AIC_IRQ 0 1077 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_jpg>;
 		#iommu-cells = <1>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	jpeg1: jpeg@409008000 {
@@ -100,7 +100,7 @@
 		power-domains = <&ps_jpg>;
 		clocks = <&peripheral_clocks 354>, <&peripheral_clocks 355>;
 		iommus = <&jpeg1_dart 0>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	jpeg1_dart: iommu@40900c000 {
@@ -110,7 +110,7 @@
 		interrupts = <AIC_IRQ 0 1082 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_jpg>;
 		#iommu-cells = <1>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	scaler0: scaler@40b000000 {
