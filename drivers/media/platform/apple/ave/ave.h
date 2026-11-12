@@ -167,6 +167,7 @@ enum ave_opcode {
 #define AVE_FW_TEXT_CRC_9003_78_0 0x69c54454
 /* The M4 Pro (T6040) build of the same 25G83 firmware. */
 #define AVE_FW_TEXT_CRC_T6040_25G83 0x68d5f9f6
+#define AVE_FW_TEXT_CRC_T6050_26A428 0x87279429
 
 struct ave_ctx;
 

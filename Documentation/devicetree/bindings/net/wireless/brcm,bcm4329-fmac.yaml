@@ -72,6 +72,12 @@ properties:
     description: Name for the OOB IRQ, this must be set to "host-wake".
     const: host-wake
 
+  wake-gpios:
+    maxItems: 1
+    description: GPIO the chip drives to wake the host when the PCIe link
+      is down (the PCIe WAKE# signal of the WLAN function). PCIe devices
+      only; SDIO devices use the host-wake interrupt instead.
+
   brcm,drive-strength:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Drive strength used for the SDIO pins on the device in mA.

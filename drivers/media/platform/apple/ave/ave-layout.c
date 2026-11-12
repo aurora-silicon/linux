@@ -279,7 +279,7 @@ const struct ave_fw_layout ave_layout_9003_78_0 = {
 };
 
 const struct ave_fw_layout ave_layout_26a428 = {
-	.name = "26A428 (CRC unqualified)",
+	.name = "26A428",
 	.abi = &ave_abi_9003,
 	.kind = AVE_LAYOUT_26A428,
 	.encode_ready = true,
@@ -953,6 +953,8 @@ const struct ave_fw_layout *ave_layout_for_crc(u32 crc)
 		return &ave_layout_9003_78_0;
 	if (crc == 0x460c7a7c || crc == 0x25bfd039)
 		return &ave_layout_6070_11_1;
-	/* 26A428 has no verified loader TEXT CRC: no placeholder or fallback. */
+	/* The macOS 27.0 build for the M5 Pro and Max. */
+	if (crc == AVE_FW_TEXT_CRC_T6050_26A428)
+		return &ave_layout_26a428;
 	return NULL;
 }
