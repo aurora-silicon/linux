@@ -130,6 +130,9 @@ bool dcp_peer_needs_pair_v27(struct apple_dcp *dcp, u32 clock_khz)
  * At atomic check: refuse a paired timing the pair cannot take, so that the
  * commit fails instead of a mode set that leaves the CRTC without a timing.
  * The peer's CRTC is not taken into the commit; its current state is read.
+ * A CRTC being enabled reserves its peer when the link comes up, in
+ * dcp_poweron() after this check; iomfb_modeset() refuses the timing then
+ * if no peer was reserved.
  */
 int dcp_peer_check_v27(struct apple_dcp *dcp, struct drm_atomic_commit *commit,
 		       struct drm_crtc_state *crtc_state)
@@ -154,6 +157,8 @@ int dcp_peer_check_v27(struct apple_dcp *dcp, struct drm_atomic_commit *commit,
 	scoped_guard(mutex, &dcp_peer_lock) {
 		struct apple_dcp *peer = dcp->peer_reserved;
 
+		if (!peer && crtc_state->active_changed)
+			return 0;
 		if (!peer || peer->peer_owner != dcp || peer->fixed_phy ||
 		    peer->nr_typec_routes || !peer->crtc || dcp->crashed || peer->crashed)
 			return -EINVAL;
