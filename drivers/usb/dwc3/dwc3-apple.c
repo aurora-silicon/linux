@@ -464,7 +464,7 @@ static void dwc3_apple_set_ptrcap(struct dwc3_apple *appledwc, u32 mode)
 
 /*
  * The T6040 core came up against the dummy PHY: reset its USB3 PIPE side once the PIPE has
- * moved, as the tested bring-up does (USB2 is not affected).
+ * moved (USB2 is not affected).
  */
 static void dwc3_apple_usb3_pipe_reset(struct dwc3_apple *appledwc)
 {

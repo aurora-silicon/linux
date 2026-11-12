@@ -561,7 +561,7 @@ MODULE_PARM_DESC(dp_display, "Drive displays behind qualified Thunderbolt DP tun
 static bool t6040_dp_tunnels;
 module_param(t6040_dp_tunnels, bool, 0444);
 MODULE_PARM_DESC(t6040_dp_tunnels,
-		 "T6040/T6041: tunnel DisplayPort from the routers' DP IN adapters (bring-up, default off)");
+		 "T6040/T6041: tunnel DisplayPort from the routers' DP IN adapters (default off: the DP IN adapter to dpin0/1 mapping is not decoded)");
 
 /*
  * The M1 Pro/Max ATC is the t8103 generation: same DP IN adapter registers,
