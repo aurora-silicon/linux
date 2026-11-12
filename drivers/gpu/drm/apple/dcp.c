@@ -1642,10 +1642,14 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 	 * On desktop 26.6 firmware the panel takes VRR_ENABLED with the next
 	 * frame, without a mode set (see dcp_vrr_update()).  The external
 	 * processors ignore a new minimum rate on a live mode, so they still
-	 * change adaptive sync with a mode set.
+	 * change adaptive sync with a mode set, as firmware 27's externals do:
+	 * macOS switches between a timing's fixed and variable modes with a
+	 * full mode set.
 	 */
-	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && crtc_state->enable &&
-	    !dcp_vrr_live(dcp)) {
+	if ((dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+	     (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp->main_display &&
+	      !dcp_has_panel(dcp))) &&
+	    crtc_state->enable && !dcp_vrr_live(dcp)) {
 		struct drm_crtc_state *old =
 			drm_atomic_get_old_crtc_state(commit, crtc);
 

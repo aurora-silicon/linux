@@ -11,7 +11,69 @@ static bool dcp_peer_transport_idle(struct apple_dcp *dcp)
 	       !dcp->ch_oobcmd.depth && !dcp->ch_oobcb.depth && !dcp->ch_oobasync.depth;
 }
 
-int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, bool vrr)
+/* One of macOS's calls around a paired mode set, on the primary and then the peer. */
+static int dcp_peer_both_v27(struct apple_dcp *dcp, struct apple_dcp *peer, const char *tag,
+			     void *in, size_t in_size, void *out, size_t out_size, bool status)
+{
+	struct apple_dcp *engine[2] = { dcp, peer };
+	u8 reply[0x7c];
+
+	for (unsigned int i = 0; i < 2; i++) {
+		int ret = dcp_peer_video_call(engine[i], tag, in, in_size,
+					      out_size ? reply : NULL, out_size);
+
+		if (!ret && status && get_unaligned_le32(reply))
+			ret = -EIO;
+		if (ret) {
+			dev_err(dcp->dev, "paired %s on %s failed: %d\n", tag,
+				dev_name(engine[i]->dev), ret);
+			return ret;
+		}
+		if (out && out_size)
+			memcpy(out, reply, out_size);
+	}
+	return 0;
+}
+
+/* set_parameter (A450) on both engines; value[0] in 16.16 where it is a rate or a factor. */
+static int dcp_peer_param_v27(struct apple_dcp *dcp, struct apple_dcp *peer, u32 param,
+			      u32 count, u32 value)
+{
+	struct dcp_set_parameter_dcp p = { .param = param, .value = { value }, .count = count };
+
+	return dcp_peer_both_v27(dcp, peer, "A450", &p, sizeof(p), NULL, sizeof(u32), true);
+}
+
+/*
+ * What macOS sends to both engines before a paired mode set (A411 2; adaptive
+ * sync, parameter 15, its minimum rate or 0 for a fixed rate; parameter 0x1f)
+ * and after it (A449; parameter 3 = 1.0; A453; parameter 6 = 1.0).
+ */
+static int dcp_peer_prepare_v27(struct apple_dcp *dcp, struct apple_dcp *peer, u32 min_vrr)
+{
+	__le32 device = cpu_to_le32(2);
+
+	return dcp_peer_both_v27(dcp, peer, "A411", &device, sizeof(device), NULL, 4, false) ?:
+	       dcp_peer_param_v27(dcp, peer, 15, 3, min_vrr) ?:
+	       dcp_peer_param_v27(dcp, peer, 0x1f, 2, 0);
+}
+
+static void dcp_peer_finish_v27(struct apple_dcp *dcp, struct apple_dcp *peer)
+{
+	u8 config[0x84] = {};
+	__le32 zero = 0, tile[2] = {};
+
+	put_unaligned_le32(1, config + 0x1c);
+	put_unaligned_le32(1, config + 0x3c);
+	if (!dcp_peer_both_v27(dcp, peer, "A449", config, sizeof(config), NULL, 0x7c, false) &&
+	    !dcp_peer_param_v27(dcp, peer, 3, 1, 0x10000) &&
+	    !dcp_peer_both_v27(dcp, peer, "A453", &zero, sizeof(zero), tile, sizeof(tile), false) &&
+	    !dcp_peer_param_v27(dcp, peer, 6, 1, 0x10000))
+		dev_info(dcp->dev, "paired engines report %ux%u each\n",
+			 le32_to_cpu(tile[0]), le32_to_cpu(tile[1]));
+}
+
+int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, u32 min_vrr)
 {
 	struct apple_dcp *peer;
 	int ret = -EOPNOTSUPP;
@@ -37,26 +99,17 @@ int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, bool vrr)
 			goto unlock;
 		}
 	}
-	/* Do not silently select an untiled mode when paired VRR was requested.
-	 * The internal and single-pipe external adaptive-sync paths are unchanged.
-	 */
-	if (vrr) {
-		struct dcp_peer_get_video_req_v27 req = {
-			.timing_id = cpu_to_le32(timing), .color_id = cpu_to_le32(color),
-		};
-		struct dcp_peer_get_video_resp_v27 resp;
-
-		ret = dcp_peer_video_call(dcp, "A364", &req, sizeof(req), &resp, sizeof(resp));
-		if (ret || !(resp.success & 1) || (resp.requires_merge & 1)) {
-			ret = ret ?: -EINVAL;
-			goto peer_unlock;
-		}
-	}
+	ret = dcp_peer_prepare_v27(dcp, peer, min_vrr);
+	if (ret)
+		goto peer_unlock;
 	ret = dcp_peer_install_video_v27(dcp, peer, timing, color, 4);
+	if (!ret)
+		dcp_peer_finish_v27(dcp, peer);
 	if (!ret) {
 		guard(mutex)(&dcp_peer_lock);
 		dcp->peer_frames = (struct dcp_peer_frames_v27){ .active = true };
-		dev_info(dcp->dev, "paired DRM mode ready: timing=%u color=%u\n", timing, color);
+		dev_info(dcp->dev, "paired DRM mode ready: timing=%u color=%u min_vrr=%#x\n",
+			 timing, color, min_vrr);
 	}
 peer_unlock:
 	device_unlock(peer->dev);

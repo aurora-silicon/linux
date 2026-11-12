@@ -63,7 +63,7 @@ int dcp_peer_hints_v27(struct apple_dcp *dcp, struct dptx_port *port,
 bool dcp_peer_tiling_state_v27(struct apple_dcp *dcp, bool write,
 			      u32 event, u32 param, u32 *value);
 void dcp_peer_display_ids_v27(struct apple_dcp *dcp, u32 own, u32 related);
-int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, bool vrr);
+int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, u32 min_vrr);
 int dcp_peer_color_v27(struct apple_dcp *dcp, struct iomfb_set_matrix_req *matrix);
 int dcp_peer_stop_v27(struct apple_dcp *dcp);
 struct apple_dcp *dcp_peer_scanout_v27(struct apple_dcp *dcp);
