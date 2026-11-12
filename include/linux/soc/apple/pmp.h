@@ -3,6 +3,7 @@
 #define _LINUX_SOC_APPLE_PMP_H
 #include <linux/errno.h>
 #include <linux/kconfig.h>
+#include <linux/soc/apple/pmp-report.h>
 #include <linux/types.h>
 struct device;
 #if IS_REACHABLE(CONFIG_APPLE_PMP)

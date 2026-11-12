@@ -18,6 +18,7 @@ int apple_pmp_report_wait_supplier_ready(struct device *supplier, unsigned int t
 int apple_pmp_report_wait_ready(struct device_node *entry, unsigned long timeout);
 int apple_pmp_report_fast_die_effort(const struct device_node *np,
 				     unsigned int lane, u8 *effort);
+int apple_pmp_report_gpu_effort(u32 phandle, u32 *effort);
 #else
 static inline int apple_pmp_report_wait_supplier_ready(struct device *supplier,
 						unsigned int timeout_ms)
@@ -33,6 +34,11 @@ static inline int apple_pmp_report_wait_ready(struct device_node *entry,
 
 static inline int apple_pmp_report_fast_die_effort(const struct device_node *np,
 						   unsigned int lane, u8 *effort)
+{
+	return -ENODEV;
+}
+
+static inline int apple_pmp_report_gpu_effort(u32 phandle, u32 *effort)
 {
 	return -ENODEV;
 }
