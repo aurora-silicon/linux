@@ -511,7 +511,7 @@ impl Outputs {
         self.submission
             .as_ref()
             .map(Aggregate::fence)
-            .or_else(|| self.fallback.as_ref().map(Fence::from_fence))
+            .or_else(|| self.fallback.as_ref().map(|fence| Fence::from_fence(fence)))
     }
     pub(crate) fn publish(
         &mut self,
