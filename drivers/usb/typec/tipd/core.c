@@ -2455,8 +2455,8 @@ EXPORT_SYMBOL_IF_KUNIT(cd321x_tbt_switch_keep_waiting);
 
 /*
  * The connection lookup skips a router whose node is disabled. A router that is
- * described but disabled in the device tree can still be enabled at runtime (an
- * overlay during bring-up), so the port watches for it as for a late router.
+ * described but disabled in the device tree can still be enabled at runtime (by
+ * an overlay), so the port watches for it as for a late router.
  */
 static bool cd321x_tbt_router_described(struct fwnode_handle *fwnode)
 {
