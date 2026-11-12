@@ -1275,17 +1275,32 @@ static struct syscore aic_syscore = {
 	.ops = &aic_syscore_ops,
 };
 
+/*
+ * The T6040's AIC (apple,t6041-aic3, matched through aic3_info) is the same
+ * AICv3 as the T8140's: the same CONFIG, TIMEOUT and CLUSTER_PRIO words and
+ * IRQ_CFG array. It is admitted to the sleep save only on a board whose device
+ * tree enables the T6040 sleep controller, so that every other machine with
+ * this AIC suspends and hibernates as before.
+ */
+static bool __init aic_t6040_sleep(struct device_node *node)
+{
+	struct device_node *np;
+	bool sleeps;
+
+	if (!IS_ENABLED(CONFIG_APPLE_T6040_SLEEP) ||
+	    !of_device_is_compatible(node, "apple,t6041-aic3"))
+		return false;
+
+	np = of_find_compatible_node(NULL, NULL, "apple,t6040-sleep");
+	sleeps = of_device_is_available(np);
+	of_node_put(np);
+
+	return sleeps;
+}
+
 static void __init aic_sleep_init(struct aic_irq_chip *irqc, struct device_node *node)
 {
-	/*
-	 * The T6040's AIC (apple,t6041-aic3, matched through aic3_info) is the
-	 * same AICv3 as the T8140's: the same CONFIG, TIMEOUT and CLUSTER_PRIO
-	 * words and IRQ_CFG array. Its suspend-to-RAM path is the separate
-	 * T6040 sleep controller, so it is admitted here only with that.
-	 */
-	if (!irqc->info.fw_suspend &&
-	    !(IS_ENABLED(CONFIG_APPLE_T6040_SLEEP) &&
-	      of_device_is_compatible(node, "apple,t6041-aic3")))
+	if (!irqc->info.fw_suspend && !aic_t6040_sleep(node))
 		return;
 
 	aic_sleep.irq_cfg = kcalloc(irqc->nr_die * irqc->nr_irq, sizeof(u32), GFP_KERNEL);

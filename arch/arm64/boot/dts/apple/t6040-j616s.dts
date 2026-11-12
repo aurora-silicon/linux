@@ -75,6 +75,11 @@
 	apple,chassis-name = "J616";
 };
 
+/* Suspend-to-RAM through the boot object has been tested on this board. */
+&t6040_sleep {
+	status = "okay";
+};
+
 &sound {
 	compatible = "apple,j616-macaudio", "apple,macaudio";
 	model = "MacBook Pro J616";
