@@ -540,7 +540,7 @@ static int ane_h16_power_cycle(struct ane_h16_device *h, bool verify)
  * with a budget of its own for each wake.
  */
 static int ane_h16_boot_again(struct ane_h16_device *h, unsigned int *restarts,
-			      const char *what, const char *why)
+			      const char *what, const char *why, bool recover)
 {
 	struct ane_h16_boot *b = &h->boot;
 	struct ane_fw_transport *old;
@@ -561,10 +561,12 @@ static int ane_h16_boot_again(struct ane_h16_device *h, unsigned int *restarts,
 	ane_h16_irq_wait_set(h, true);
 	dev_info(h->dev, "H16 ANE: booted again from the preload %s\n", why);
 	ane_h16_session_restart(&h->session);
-	/* The old firmware is gone with the power: a quarantine of it ends. */
-	ane_h16_session_recovered(&h->session);
-	b->quarantined = false;
-	b->error = 0;
+	/* Its domains were verified off: a quarantine of the old firmware ends. */
+	if (recover) {
+		ane_h16_session_recovered(&h->session);
+		b->quarantined = false;
+		b->error = 0;
+	}
 	ret = ane_h16_session_replay(&h->session, &h->resume_replayed, &h->resume_first_ns);
 	if (ret) {
 		dev_err(h->dev, "H16 ANE: PROGRAM REPLAY FAILED %d after %u programs; session quarantined\n",
@@ -582,7 +584,7 @@ static int ane_h16_cold_boot(struct ane_h16_device *h)
 	if (ret)
 		return ret;
 	return ane_h16_boot_again(h, &h->resume_restarts, "resume restart/budget",
-				  "after system sleep");
+				  "after system sleep", h->sleep_quarantined);
 }
 
 /*
@@ -634,14 +636,12 @@ static int ane_h16_sleep_prepare(struct ane_h16_device *h)
 		h->genpd[i].off_ns = 0;
 	}
 	h->sleep_quarantined = false;
-	if (!h->program_ready)
+	if (!h->program_ready || (h->boot.quarantined && !ane_t6021_hung_stop))
 		return -EBUSY;
-	if (h->boot.quarantined || h->session.quarantined) {
+	/* Without hung_stop a quarantined session stays so across the sleep. */
+	if (ane_t6021_hung_stop && (h->boot.quarantined || h->session.quarantined)) {
 		unsigned int held;
 
-		/* Without hung_stop a quarantined engine is kept until reboot. */
-		if (!ane_t6021_hung_stop)
-			return -EBUSY;
 		/*
 		 * The firmware cannot be asked for anything: power the engine
 		 * off under it, DARTs held until its domains are off, and boot
@@ -1375,7 +1375,7 @@ static int ane_h16_rs_boot(void *ctx)
 	unsigned int restarts = 0;
 
 	return ane_h16_boot_again(h, &restarts, "recovery restart/budget",
-				  "after a hung request");
+				  "after a hung request", true);
 }
 
 static const struct ane_t6021_restart_ops ane_h16_restart_ops = {
