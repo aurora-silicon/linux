@@ -663,8 +663,8 @@ static int apple_rtkit_helper_freeze(struct device *dev)
 	if (ret)
 		dev_warn(dev, "resume from disk: no hand-off record for the image: %d\n", ret);
 	else
-		dev_info(dev, "resume from disk: RTKit session left running for the image (%d buffers)\n",
-			 n);
+		dev_dbg(dev, "resume from disk: RTKit session left running for the image (%d buffers)\n",
+			n);
 	return 0;
 }
 
@@ -733,8 +733,8 @@ static int apple_rtkit_helper_restore_own(struct apple_rtkit_helper *helper)
 		return 0;
 	}
 	helper->readopted = true;
-	dev_info(dev, "resume from disk: took over the RTKit session the boot kernel started (%d buffers at the same IOVAs)\n",
-		 n);
+	dev_dbg(dev, "resume from disk: took over the RTKit session the boot kernel started (%d buffers at the same IOVAs)\n",
+		n);
 	return 0;
 }
 
@@ -760,21 +760,26 @@ static int apple_rtkit_helper_restore(struct device *dev)
 	 * that a CPU is running behind it.
 	 */
 	live = apple_rtkit_helper_live(helper);
-	if (live < 0)
-		return dev_err_probe(dev, live, "hibernation restore: invalid live RTKit handoff\n");
-	if (!live)
-		return dev_err_probe(dev, -ENODEV,
-				     "hibernation restore: no live RTKit session to re-adopt\n");
+	if (live < 0) {
+		dev_err(dev, "hibernation restore: invalid live RTKit handoff: %d\n", live);
+		return live;
+	}
+	if (!live) {
+		dev_err(dev, "hibernation restore: no live RTKit session to re-adopt\n");
+		return -ENODEV;
+	}
 	count = apple_rtkit_helper_inherit_buffers(helper, buffers);
-	if (count < 0)
-		return dev_err_probe(dev, count,
-				     "hibernation restore: invalid inherited RTKit buffers\n");
+	if (count < 0) {
+		dev_err(dev, "hibernation restore: invalid inherited RTKit buffers: %d\n", count);
+		return count;
+	}
 
 	rtk = apple_rtkit_init_adopted_with_buffers(dev, helper, NULL, 0,
 						    &apple_rtkit_helper_ops, buffers, count);
-	if (IS_ERR(rtk))
-		return dev_err_probe(dev, PTR_ERR(rtk),
-				     "hibernation restore: failed to re-adopt RTKit\n");
+	if (IS_ERR(rtk)) {
+		dev_err(dev, "hibernation restore: failed to re-adopt RTKit: %pe\n", rtk);
+		return PTR_ERR(rtk);
+	}
 
 	/* The old object described an instance that no longer exists. */
 	old = helper->rtk;
@@ -782,8 +787,8 @@ static int apple_rtkit_helper_restore(struct device *dev)
 	helper->strict_buffers = count > 0 ||
 		of_device_is_compatible(dev->of_node, "apple,t8132-mtp");
 	apple_rtkit_free_retaining_buffers(old);
-	dev_info(dev, "re-adopted the running RTKit session after hibernation (%d retained buffers)\n",
-		 count);
+	dev_dbg(dev, "re-adopted the running RTKit session after hibernation (%d retained buffers)\n",
+		count);
 	return 0;
 }
 #else
