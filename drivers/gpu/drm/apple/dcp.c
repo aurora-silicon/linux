@@ -9391,6 +9391,12 @@ static void dcp_t6041_s2r_cpu_off(struct apple_dcp *dcp)
 			 o.cpu, v, after);
 	else
 		dev_dbg(dcp->dev, "S2R: CPU power word +%#x %#x -> %#x\n", o.cpu, v, after);
+	/*
+	 * No longer one of the powered DCPs that pmc-dcp counts. Nothing is written: the
+	 * sleep controller zeroes the voter before the sleep, and the wake counts this DCP
+	 * again when its domains are up.
+	 */
+	dcp_pmc_forget(dcp);
 	iounmap(ps);
 	iounmap(pmc);
 }
