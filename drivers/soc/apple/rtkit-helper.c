@@ -271,6 +271,21 @@ static int apple_rtkit_helper_inherit_buffers(
 	return count;
 }
 
+/*
+ * Whether an adopted session refuses buffers its inventory does not list. With
+ * an inventory, and on T8132 and the J614s without one, no new allocation is
+ * safe: the firmware still uses what it negotiated with its first host.
+ * Producers that predate the inventory (T8140) keep mapping IOVAs inside the
+ * SRAM region. Probe and the restore after a hibernation adopt by this rule.
+ */
+static bool apple_rtkit_helper_strict(struct device *dev, int count)
+{
+	return count > 0 ||
+	       of_device_is_compatible(dev->of_node, "apple,t8132-mtp") ||
+	       (of_machine_is_compatible("apple,j614s") &&
+		of_device_is_compatible(dev->of_node, "apple,t6041-mtp"));
+}
+
 static int apple_rtkit_helper_pm_register(struct apple_rtkit_helper *helper);
 
 static int apple_rtkit_helper_probe(struct platform_device *pdev)
@@ -355,16 +370,9 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 	}
 
 	if (live) {
-		/*
-		 * Set before RX starts: with an inventory, or on T8132, no new
-		 * buffer allocation is safe here. Producers that predate the
-		 * inventory (T8140) keep mapping IOVAs inside the SRAM region.
-		 */
+		/* Set before RX starts, which may bring a buffer request. */
 		helper->adopted = true;
-		helper->strict_buffers = count > 0 ||
-			of_device_is_compatible(dev->of_node, "apple,t8132-mtp") ||
-			(of_machine_is_compatible("apple,j614s") &&
-			 of_device_is_compatible(dev->of_node, "apple,t6041-mtp"));
+		helper->strict_buffers = apple_rtkit_helper_strict(dev, count);
 		helper->rtk = apple_rtkit_init_adopted_with_buffers(
 			dev, helper, NULL, 0, &apple_rtkit_helper_ops, buffers, count);
 		if (IS_ERR(helper->rtk))
@@ -773,6 +781,8 @@ static int apple_rtkit_helper_restore(struct device *dev)
 		return count;
 	}
 
+	/* As at probe, before the new session's RX starts. */
+	helper->strict_buffers = apple_rtkit_helper_strict(dev, count);
 	rtk = apple_rtkit_init_adopted_with_buffers(dev, helper, NULL, 0,
 						    &apple_rtkit_helper_ops, buffers, count);
 	if (IS_ERR(rtk)) {
@@ -783,8 +793,6 @@ static int apple_rtkit_helper_restore(struct device *dev)
 	/* The old object described an instance that no longer exists. */
 	old = helper->rtk;
 	helper->rtk = rtk;
-	helper->strict_buffers = count > 0 ||
-		of_device_is_compatible(dev->of_node, "apple,t8132-mtp");
 	apple_rtkit_free_retaining_buffers(old);
 	dev_dbg(dev, "re-adopted the running RTKit session after hibernation (%d retained buffers)\n",
 		count);
