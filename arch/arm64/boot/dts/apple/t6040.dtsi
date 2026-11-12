@@ -294,20 +294,17 @@
 		apple,check-ps-b4-sleep-names = "disp", "dispext0", "dispext1", "dispext2",
 						"dispext3";
 		/*
-		 * ANS's storage PCIe (two ST lanes + shared PHY), for its sleep. The boot
-		 * object (aura) publishes apple,apcie here plus the axi2af/cio3pll/
-		 * clkgen/phy-block/phy-ip windows and apple,tunable-* arrays onto the
-		 * internal PCIe host (apple,t6020-pcie, identified by its "rc"
-		 * reg-name) from the ADT /arm-io/apcie0 at boot, matching the
-		 * single-lane t8140 shape. That publish is idempotent and
-		 * returns early if apple,apcie is already present, so there must be NO
-		 * static apple,apcie or apcie-storage node here -- a static one blocks
-		 * the loader (seen on the J616s: a static apple,apcie made
-		 * the driver see an empty node and refuse). Until the loader fills it,
-		 * the driver NULL-guards every window and a real sleep with ANS stopped
-		 * refuses (suspend-to-idle stays the default). The ST power words
-		 * (ps_ans, ps_apcie_st0/st1, ps_apcie_sys_st0/st1) live in SOC-East and
-		 * are driven by the controller's soc-east window, not from a node here.
+		 * apple,apcie, for the sleep of ANS's storage PCIe link (two ST lanes
+		 * and a shared PHY), comes from the boot loader. From the ADT's
+		 * /arm-io/apcie0 it adds it here and puts the axi2af, cio3pll, clkgen,
+		 * phy-block and phy-ip windows and the apple,tunable-* arrays on the
+		 * internal PCIe host (apple,t6020-pcie, the one with an "rc"
+		 * reg-name), in the single-lane T8140 shape. It leaves a node that
+		 * already has apple,apcie alone, so this tree must give neither
+		 * apple,apcie nor an apcie-storage node. Without it a sleep with ANS
+		 * stopped is refused, and suspend-to-idle stays the default. The ST
+		 * power words (ps_ans, ps_apcie_st0/st1, ps_apcie_sys_st0/st1) are in
+		 * SOC-East and are driven through the soc-east window.
 		 */
 		/* Only on a board whose sleep has been tested. */
 		status = "disabled";
