@@ -762,7 +762,7 @@ static int apple_spmi_restore_early(struct device *dev)
 	/* Commands can run by now: none may have its reply acknowledged away. */
 	scoped_guard(mutex, &spmi->fifo_lock)
 		apple_spmi_hib_resync_irqs(spmi);
-	dev_info(dev, "resume from disk: interrupt masks rewritten in the early restore\n");
+	dev_dbg(dev, "resume from disk: interrupt masks rewritten in the early restore\n");
 
 	return 0;
 }
