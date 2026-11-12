@@ -23,7 +23,7 @@
 		#iommu-cells = <1>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 885 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_pmp>;
+		power-domains = <&ps_ane_sys>;
 		status = "disabled";
 	};
 
