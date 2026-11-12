@@ -44,6 +44,7 @@ const struct dcp_color_space *dcp_panel_gamut_color_space(enum dcp_panel_gamut g
 struct drm_edid;
 struct drm_display_mode;
 struct dcp_display_mode;
+bool dcp_metadata_timing_fits(const struct drm_display_mode *mode);
 const struct drm_edid *dcp_metadata_edid(const struct dcp_display_metadata *metadata,
 					 const struct drm_display_mode *mode);
 
