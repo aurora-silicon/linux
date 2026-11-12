@@ -41,6 +41,7 @@
 #include <linux/overflow.h>
 #include <linux/pci.h>
 #include <linux/platform_device.h>
+#include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/pm_wakeup.h>
 #include <linux/slab.h>
@@ -6326,6 +6327,18 @@ static __maybe_unused int apple_dart_resume_noirq(struct device *dev)
 	}
 
 	ret = pm_runtime_force_resume(dev);
+
+	/*
+	 * A runtime-suspended DART whose power domain is still off can't be written: on
+	 * T8140 an access to the unpowered encoder DARTs resets the SoC as it wakes. Its
+	 * consumer powers the domain up before any DMA, and the runtime resume that comes
+	 * with it restores the registers and the address filter.
+	 */
+	if (!ret && pm_resume_via_firmware() && pm_runtime_status_suspended(dev) &&
+	    dev->pm_domain && !dev_pm_genpd_is_on(dev)) {
+		dev_dbg(dev, "domain off after sleep: its runtime resume restores it\n");
+		return 0;
+	}
 
 	/*
 	 * A real sleep took the registers even of a DART runtime PM had suspended, which
