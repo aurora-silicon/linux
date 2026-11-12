@@ -414,16 +414,6 @@ static const struct {
 #define SYS_APL_SIQ_CFG_EL1	sys_reg(3, 4, 15, 10, 4)
 #define IPI_SR_PENDING		BIT(0)
 
-/* Must match aura's struct aura_s2r_mailbox (aura #117). */
-#define T6040_S2R_MAGIC		0x3152325341525541ULL	/* "AURAS2R1" */
-
-struct t6040_s2r_mailbox {
-	u64 magic;
-	u64 boot_mpidr;
-	u64 resume_pa;
-	u64 resumes;
-};
-
 struct t6040_sleep_group {
 	const char *name;
 	struct regmap *regmap;
@@ -511,7 +501,7 @@ struct t6040_sleep {
 	void __iomem *soc_ps;
 	void __iomem *aop_global;
 	void __iomem *axi2af_bridge[T6040_AXI2AF_DOMAINS];
-	struct t6040_s2r_mailbox *mbox;
+	struct aura_s2r_mailbox *mbox;
 	u64 mbox_pa;
 	bool power_ops;
 	bool wd2_armed;
@@ -3178,14 +3168,14 @@ static void t6040_sleep_map_apcie(struct t6040_sleep *s)
 }
 
 /* Maps the mailbox at @pa if it is aura's, or returns NULL. */
-static struct t6040_s2r_mailbox *t6040_sleep_mailbox_at(struct t6040_sleep *s, u64 pa)
+static struct aura_s2r_mailbox *t6040_sleep_mailbox_at(struct t6040_sleep *s, u64 pa)
 {
-	struct t6040_s2r_mailbox *mbox;
+	struct aura_s2r_mailbox *mbox;
 
 	mbox = devm_memremap(s->dev, pa, sizeof(*mbox), MEMREMAP_WB);
 	if (IS_ERR(mbox))
 		return NULL;
-	if (mbox->magic != T6040_S2R_MAGIC) {
+	if (mbox->magic != AURA_S2R_MAGIC) {
 		dev_warn(s->dev, "s2r-mailbox magic %#llx is not AURAS2R1\n", mbox->magic);
 		devm_memunmap(s->dev, mbox);
 		return NULL;
@@ -3223,7 +3213,7 @@ static void t6040_sleep_map_mailbox(struct t6040_sleep *s)
 static int t6040_sleep_restore(struct device *dev)
 {
 	struct t6040_sleep *s = dev_get_drvdata(dev);
-	struct t6040_s2r_mailbox *mbox = NULL;
+	struct aura_s2r_mailbox *mbox = NULL;
 	u64 pa = 0;
 	int ret;
 
