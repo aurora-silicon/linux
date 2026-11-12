@@ -90,6 +90,10 @@ const MSG_IOVA_MASK: u64 = 0xFFFFFFFFFFFF;
 const SET_IOREG_INDEX_MASK: u64 = 0xFFFF;
 const PIO_VM_BASE: u64 = 0xc0000000;
 const PIO_GRANULARITY: u64 = 0x1000000;
+/* Coherent runtime report requested by the 25G83 T8112/T8140 PMP. */
+const PMP_REPORT_BUFFER_SIZE: u64 = 0xe400;
+const PMP_GPU_EFFORT_OFFSET: usize = 0xc000;
+const PMP_GPU_EFFORT_MAX_COUNT: u32 = 2;
 
 const fn from_fourcc(b: &[u8; 4]) -> u32 {
     b[3] as u32 | (b[2] as u32) << 8 | (b[1] as u32) << 16 | (b[0] as u32) << 24
@@ -130,6 +134,7 @@ struct SramCopy {
 struct PmpState {
     iova_table: Option<Coherent<[IovaTableEntry]>>,
     allocs: KVec<PmpAllocation>,
+    report_addr: Option<u64>,
     value_buf: Option<u64>,
     ioreg_entries: KVec<u32>,
     /// Held from a system sleep's start until its end.
@@ -141,6 +146,7 @@ impl PmpState {
         Ok(PmpState {
             iova_table: None,
             allocs: KVec::with_capacity(10, GFP_KERNEL)?,
+            report_addr: None,
             value_buf: None,
             ioreg_entries: KVec::with_capacity(340, GFP_KERNEL)?,
             sram: None,
@@ -159,6 +165,38 @@ impl PmpState {
     fn get_buf(&mut self, addr: u64) -> Option<&mut Coherent<[u8]>> {
         let idx = self.find_alloc(addr)?;
         Some(&mut self.allocs[idx].alloc)
+    }
+
+    fn gpu_effort(&self) -> Result<(u32, u32)> {
+        let addr = self.report_addr.ok_or(EAGAIN)?;
+        let idx = self.find_alloc(addr).ok_or(EAGAIN)?;
+        let buf = &self.allocs[idx].alloc;
+
+        if buf.len() < PMP_GPU_EFFORT_OFFSET + 3 * mem::size_of::<u32>() {
+            return Err(EIO);
+        }
+
+        let base = buf.as_ptr().cast::<u8>();
+        // SAFETY: the coherent allocation is retained in `allocs`, the
+        // offsets are naturally aligned and bounded above, and volatile
+        // loads observe words published asynchronously by the PMP.
+        let count = u32::from_le(unsafe {
+            base.add(PMP_GPU_EFFORT_OFFSET)
+                .cast::<u32>()
+                .read_volatile()
+        });
+        if count == 0 {
+            return Err(ENODATA);
+        }
+        if count > PMP_GPU_EFFORT_MAX_COUNT {
+            return Err(EPROTO);
+        }
+
+        /* Order the selected effort load after its published count. */
+        fence(Ordering::Acquire);
+        let offset = PMP_GPU_EFFORT_OFFSET + count as usize * mem::size_of::<u32>();
+        let effort = u32::from_le(unsafe { base.add(offset).cast::<u32>().read_volatile() });
+        Ok((count, effort))
     }
 }
 
@@ -313,11 +351,18 @@ impl PmpData {
             },
             GFP_KERNEL,
         )?;
+        if size == PMP_REPORT_BUFFER_SIZE && state.report_addr.is_none() {
+            state.report_addr = Some(addr);
+            dev_info!(self.dev, "PMP coherent report buffer ready");
+        }
         Ok(msg)
     }
     fn free(&self, addr: u64) -> Result<u64> {
         let mut state = self.state.lock();
         if let Some(idx) = state.find_alloc(addr) {
+            if state.report_addr == Some(addr) {
+                state.report_addr = None;
+            }
             state.allocs.swap_remove(idx);
         } else {
             dev_err!(
@@ -429,6 +474,8 @@ impl PmpData {
         Ok(msg)
     }
     fn fail_display(&self, error: Error) {
+        /* A stopped or failed PMP no longer publishes coherent report data. */
+        self.state.lock().report_addr = None;
         // Publish failure before looking up either lazily registered consumer.
         // Pair with the post-registration fence below: registration cannot miss
         // the error while this path also misses the newly published provider.
@@ -777,6 +824,39 @@ pub unsafe extern "C" fn apple_pmp_wake(data: *const core::ffi::c_void) -> i32 {
         Ok(()) => 0,
         Err(error) => {
             data.fail_display(error);
+            error.to_errno()
+        }
+    }
+}
+
+/// Read the lifetime-servo count and selected effort from PMP coherent memory.
+///
+/// # Safety
+/// `data` must point to the live PmpData registered by PmpDriver. `count` and
+/// `effort` must each be writable for one `u32`.
+#[export]
+pub unsafe extern "C" fn apple_pmp_read_gpu_effort(
+    data: *const core::ffi::c_void,
+    count: *mut u32,
+    effort: *mut u32,
+) -> i32 {
+    if data.is_null() || count.is_null() || effort.is_null() {
+        return EINVAL.to_errno();
+    }
+
+    let data = unsafe { &*data.cast::<PmpData>() };
+    match data.state.lock().gpu_effort() {
+        Ok((value_count, value_effort)) => {
+            unsafe {
+                count.write(value_count);
+                effort.write(value_effort);
+            }
+            0
+        }
+        Err(error) => {
+            if error == ENODATA {
+                unsafe { count.write(0) };
+            }
             error.to_errno()
         }
     }

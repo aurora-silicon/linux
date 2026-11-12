@@ -12,6 +12,7 @@ int apple_pmp_link_device(struct device *consumer);
 int apple_pmp_set_device_power(u8 command, u16 device_id, u32 enabled);
 /* After the acknowledged AGX vote and successful GPU firmware startup. */
 int apple_pmp_t6030_gpu_ready(void);
+int apple_pmp_gpu_effort(u32 *count, u32 *effort);
 #else
 static inline int apple_pmp_link_device(struct device *consumer)
 {
@@ -21,7 +22,13 @@ static inline int apple_pmp_set_device_power(u8 command, u16 device_id, u32 enab
 {
 	return -ENODEV;
 }
+
 static inline int apple_pmp_t6030_gpu_ready(void)
+{
+	return -ENODEV;
+}
+
+static inline int apple_pmp_gpu_effort(u32 *count, u32 *effort)
 {
 	return -ENODEV;
 }
@@ -50,4 +57,5 @@ struct apple_pmp_commit_stop {
 };
 
 int apple_pmp_sleep_prepare(const void *data, struct apple_pmp_commit_stop *stop);
+int apple_pmp_read_gpu_effort(const void *data, u32 *count, u32 *effort);
 #endif

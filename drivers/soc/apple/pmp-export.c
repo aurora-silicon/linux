@@ -265,3 +265,17 @@ static int apple_pmp_resume_early(struct device *dev)
 const struct dev_pm_ops apple_pmp_pm_ops = {
 	LATE_SYSTEM_SLEEP_PM_OPS(apple_pmp_suspend_late, apple_pmp_resume_early)
 };
+
+int apple_pmp_gpu_effort(u32 *count, u32 *effort)
+{
+	int ret;
+
+	if (!count || !effort)
+		return -EINVAL;
+	guard(mutex)(&pmp_lock);
+	if (!pmp_data)
+		return -ENODEV;
+	ret = apple_pmp_read_gpu_effort(pmp_data, count, effort);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_gpu_effort);

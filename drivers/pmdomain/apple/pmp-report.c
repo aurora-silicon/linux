@@ -33,6 +33,7 @@
 #include <linux/regmap.h>
 #include <linux/seq_file.h>
 #include <linux/sizes.h>
+#include <linux/soc/apple/pmp.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/pmp-report.h>
 #include <linux/soc/apple/t8132.h>
@@ -64,8 +65,6 @@
  * @fast_die: 32-bit word holding the fast die-temperature effort of each
  *	CPU cluster, one byte per lane; 0 if the SoC has none
  * @fast_die_lanes: number of lanes at @fast_die, at most 4
- * @gpu_effort: 32-bit lifetime-servo effort count followed by its array;
- *	0 if the SoC has none
  * @running_any: the PMP runs while any bit of the 64-bit status word is set,
  *	not only bit 0
  * @defer_requests: keep power state requests in memory until the PMP runs,
@@ -86,7 +85,6 @@ struct apple_pmp_report_offsets {
 	u32 status;
 	u32 fast_die;
 	u32 fast_die_lanes;
-	u32 gpu_effort;
 	/* Update aperture of every entry (8 bytes each) and SOC-DEV-DVFS range. */
 	u32 update;
 	u32 dvfs_first, dvfs_count;
@@ -194,6 +192,14 @@ static void apple_pmp_agx_vote_fn(struct work_struct *work);
 static DECLARE_DELAYED_WORK(apple_pmp_agx_vote_work, apple_pmp_agx_vote_fn);
 static void apple_pmp_agx_vote_stop(void);
 static void apple_pmp_agx_vote_stop_new(void);
+
+static bool apple_pmp_report_has_gpu_effort(const struct apple_pmp_report *rep)
+{
+	return of_device_is_compatible(rep->dev->of_node,
+				       "apple,t8112-pmp-v2-report") ||
+	       of_device_is_compatible(rep->dev->of_node,
+				       "apple,t8140-pmp-v2-report");
+}
 
 /* Bound report regions, protected by RCU until managed teardown drains readers. */
 static LIST_HEAD(apple_pmp_reports);
@@ -385,64 +391,9 @@ int apple_pmp_report_fast_die_effort(const struct device_node *np,
 }
 EXPORT_SYMBOL_GPL(apple_pmp_report_fast_die_effort);
 
-/**
- * apple_pmp_report_gpu_effort() - read the GPU lifetime-servo effort
- * @phandle: phandle of the PMP report region
- * @effort: set to the Q8.24 effort on success
- *
- * The count is a 32-bit word followed by at most two 32-bit Q8.24 efforts.
- * The host applies the entries in order to one actuator, so the last entry is
- * the effective GPU effort. A zero count withdraws the actuator. The PMP
- * running state qualifies the whole report.
- *
- * Context: Any context.
- * Return: 0 on success, -EPROBE_DEFER if the region is not bound (yet),
- * -EOPNOTSUPP if the report has no GPU effort, -ENODATA for a zero count,
- * -EPROTO for an invalid count, or -EAGAIN while the PMP is stopped.
- */
-int apple_pmp_report_gpu_effort(u32 phandle, u32 *effort)
-{
-	const struct apple_pmp_report_offsets *offs;
-	const struct apple_pmp_report *rep;
-	u32 count;
-	int index;
-	int ret = -EPROBE_DEFER;
-
-	if (!phandle || !effort)
-		return -EINVAL;
-
-	rcu_read_lock();
-	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
-		if (rep->dev->of_node->phandle != phandle)
-			continue;
-
-		offs = rep->offsets;
-		if (!offs->gpu_effort) {
-			ret = -EOPNOTSUPP;
-		} else if (!apple_pmp_report_running(rep)) {
-			ret = -EAGAIN;
-		} else {
-			count = readl(rep->base + offs->gpu_effort);
-			index = apple_pmp_gpu_effort_index(count);
-			if (index < 0) {
-				ret = index;
-			} else {
-				*effort = readl(rep->base + offs->gpu_effort +
-					       sizeof(u32) * (index + 1));
-				ret = 0;
-			}
-		}
-		break;
-	}
-	rcu_read_unlock();
-
-	return ret;
-}
-EXPORT_SYMBOL_GPL(apple_pmp_report_gpu_effort);
-
 static void apple_pmp_start_show(struct seq_file *s, struct apple_pmp_start *st);
 
-/* Read only the documented status and effort entries, never the aperture. */
+/* Read only documented MMIO entries; GPU effort comes from coherent memory. */
 static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
 {
 	struct apple_pmp_report *rep = s->private;
@@ -450,7 +401,7 @@ static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
 	bool running = apple_pmp_report_running(rep);
 	unsigned int lane;
 	u32 count, effort;
-	int index;
+	int ret;
 
 	seq_printf(s, "running: %u\n", running);
 	if (rep->start)
@@ -464,14 +415,16 @@ static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
 			seq_printf(s, "lane%u: %u\n", lane,
 				   (effort >> (lane * BITS_PER_BYTE)) & 0xff);
 	}
-	if (offs->gpu_effort) {
-		count = readl(rep->base + offs->gpu_effort);
-		seq_printf(s, "gpu_effort_count: %u\n", count);
-		index = apple_pmp_gpu_effort_index(count);
-		if (index >= 0)
-			seq_printf(s, "gpu_effort: %#x\n",
-				   readl(rep->base + offs->gpu_effort +
-					 sizeof(u32) * (index + 1)));
+	if (apple_pmp_report_has_gpu_effort(rep)) {
+		ret = apple_pmp_gpu_effort(&count, &effort);
+		if (!ret) {
+			seq_printf(s, "gpu_effort_count: %u\n", count);
+			seq_printf(s, "gpu_effort: %#x\n", effort);
+		} else if (ret == -ENODATA) {
+			seq_puts(s, "gpu_effort_count: 0\n");
+		} else {
+			seq_printf(s, "gpu_effort: unavailable (%d)\n", ret);
+		}
 	}
 
 	return 0;
@@ -2419,7 +2372,7 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	if (rep->offsets == &apple_pmp_offsets_t600x)
 		apple_pmp_agx_activity_resume();
 
-	if (rep->offsets->fast_die || rep->start)
+	if (rep->offsets->fast_die || apple_pmp_report_has_gpu_effort(rep) || rep->start)
 		rep->debugfs = debugfs_create_file(dev_name(dev), 0400,
 						   apple_pmp_report_debugfs, rep,
 						   &apple_pmp_report_status_fops);
@@ -2471,8 +2424,6 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t8112 = {
 	.tgt_write = 0x10500,
 	.actual = 0xa40,
 	.status = 0x10,
-	/* Count at +0xc000, followed by at most two Q8.24 efforts. */
-	.gpu_effort = 0xc000,
 };
 
 /*
@@ -2529,8 +2480,6 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t8140 = {
 	.status = 0x10,
 	.fast_die = 0x1c10,
 	.fast_die_lanes = 2,
-	/* Count at +0xc000, followed by at most two Q8.24 efforts. */
-	.gpu_effort = 0xc000,
 };
 
 /*
