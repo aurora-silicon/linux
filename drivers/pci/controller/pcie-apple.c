@@ -258,10 +258,10 @@ struct hw_info {
 	 * keeps its link while the domain stays on, see apple_pcie_hold_domains().
 	 */
 	bool s2idle_hold_domain;
-	/* AppleT8152PCIePort::_initializeRefclkBuffer clears REFBUF_OFF. */
+	/* Port init clears REFBUF_OFF in the refclk buffer control. */
 	bool refbuf_off;
 	/*
-	 * APCIECoreRCGen5Port::enablePortHardware: after PERST#, wait for the
+	 * Port enable: after PERST#, wait for the
 	 * lane PIPE reset status, then release PORT_T8152_PIPE_RST.
 	 */
 	bool pipe_rst;

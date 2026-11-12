@@ -511,9 +511,8 @@ static void drain_data_tx(struct centauri_wifi *wifi)
 		if (READ_ONCE(data_tx_control_profile) &&
 		    (wifi->tx_defaults_applied & BIT(1)))
 			metadata |= BIT_ULL(60) | BIT_ULL(48);
-		/* Native 25G76 AirshipDataPacket::prepare (0x18090faf8) writes
-		 * (argument & 7) to bits 17:15. Guest37's captured DHCP Discover
-		 * has value 4 (0x20000). The same-connection Linux A/B changes
+		/* Bits 17:15 carry a 3-bit packet class. A DHCP Discover
+		 * captured from the native stack has value 4 (0x20000). The same-connection Linux A/B changes
 		 * zero DHCP offers into three offers by setting only this field.
 		 * The opt-out retains the old value for diagnostic reproduction.
 		 */
@@ -641,7 +640,7 @@ static void drain(struct centauri_wifi *wifi)
 							wifi->link_tags[wifi->link_tlv_count] = tag;
 							wifi->link_lengths[wifi->link_tlv_count++] = length;
 						}
-						/* ACIDebugAdapter::dumpMloStatus, TLVs 377/378.
+						/* MLO status report, TLVs 377/378.
 						 * Keep only link count/channel/role. Do not retain MACs.
 						 */
 						if (tag == 377 && length >= 64 && value[0] <= 3) {
@@ -1023,12 +1022,12 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	memcpy(payload + 1, bss->bssid, ETH_ALEN);
 	memcpy(wifi->bssid, bss->bssid, ETH_ALEN);
 	payload[7] = ieee80211_frequency_to_channel(bss->channel->center_freq);
-	/* AppleChanSpecToACI maps chanspec 0xc000 (5 GHz) to ACI 1;
-	 * 0x4000 (6 GHz) maps to ACI 2. Earlier RE notes swapped these.
+	/* Firmware band field: chanspec 0xc000 (5 GHz) is band 1 and
+	 * 0x4000 (6 GHz) is band 2.
 	 */
 	payload[8] = bss->channel->band == NL80211_BAND_2GHZ ? 0 : 1;
 	payload[0x47] = 4;
-	/* ACIConnectionAdapter::mapRSNCipherSuiteToACIWsec maps CCMP to 4.
+	/* The firmware's fixed security field is 4 for CCMP.
 	 * The RSN IE does not replace this fixed cipher field.
 	 */
 	put_unaligned_le16(4, payload + 0x48);
@@ -1281,7 +1280,7 @@ static int wifi_power_mgmt(struct wiphy *wiphy, struct net_device *netdev,
 	u8 mode = enabled ? 0 : 3;
 	int ret;
 
-	/* ACIIO80211PowerAdapter::setPowerSaveMode, command 7. */
+	/* Power-save mode, command 7. */
 	mutex_lock(&wifi->lock);
 	ret = wifi->configured ? command(wifi, 7, &mode, sizeof(mode)) : -ENETDOWN;
 	mutex_unlock(&wifi->lock);
@@ -1294,7 +1293,7 @@ static void wifi_regulatory(struct wiphy *wiphy, struct regulatory_request *requ
 	u8 country[3] = { request->alpha2[0], request->alpha2[1], 1 };
 	int ret;
 
-	/* ACIRegulatoryAdapter::setCountryCode, command 9. Leave world-domain
+	/* Country code, command 9. Leave world-domain
 	 * handling to cfg80211; do not invent a device country or bypass SAR.
 	 */
 	if (country[0] < 'A' || country[0] > 'Z' || country[1] < 'A' || country[1] > 'Z')
@@ -1686,8 +1685,8 @@ static int data_probe_locked(struct centauri_wifi *wifi, unsigned int id, bool i
 		put_unaligned_le32(1, message + 0x18);
 		put_unaligned_le16(irq, message + 0x1c);
 	}
-	/* AirshipDataTxTransferRing::initWithOptions maps the host MCBC
-	 * parameters to version 0, hardware interface 0, TID 6, AC 3, and
+	/* The host MCBC transfer ring takes version 0, hardware
+	 * interface 0, TID 6, AC 3, and
 	 * six broadcast destination bytes. The default probe is unchanged.
 	 */
 	if (id == 25 && data_tx_broadcast) {
@@ -1783,7 +1782,7 @@ static int transmit_eapol_start(struct centauri_wifi *wifi)
 	if (eapol_control_profile)
 		metadata |= BIT_ULL(60) | BIT_ULL(48);
 	if (eapol_relative_lifetime) {
-		/* AirshipDataPacket::setRelativeExpirationTime uses mode 6 in
+		/* A relative expiration time is mode 6 in
 		 * bits 29:27 and microseconds in the second metadata word.
 		 */
 		metadata |= 6ULL << 27;
@@ -2030,8 +2029,8 @@ static ssize_t tx_config_write(struct file *file, const char __user *input,
 		goto out;
 	}
 	if (action == 1) {
-		/* AppleWLAN80211STA::resetTxPacketLifetime selects 2000 ms for
-		 * each AC. The ACI adapter converts to firmware microseconds.
+		/* The default TX packet lifetime is 2000 ms for each AC,
+		 * sent to the firmware in microseconds.
 		 */
 		for (i = 0; i < 4; i++)
 			put_unaligned_le32(2000000, lifetime + 4 + 4 * i);
@@ -2060,7 +2059,7 @@ static ssize_t host_wakeup_write(struct file *file, const char __user *input,
 				size_t count, loff_t *position)
 {
 	struct centauri_wifi *wifi = file->private_data;
-	/* ACIIO80211PowerAdapter::hostWakeup selects state 0 in command 6.
+	/* Host wakeup is state 0 in command 6.
 	 * This firmware's SysCmdSetHostPowerState accepts the fixed 27-byte
 	 * request without TLVs. Keep its existing event filter: the newer host
 	 * adapter's 92-byte event list exceeds this firmware's 86-byte limit.
@@ -2096,7 +2095,7 @@ static int query_station_stats(struct centauri_wifi *wifi)
 	u8 payload[22] = {};
 	int ret;
 
-	/* ACIDebugAdapter::queryStaCounterStats: statistic bit 37, all peers.
+	/* Station counters: statistic bit 37, all peers.
 	 * Its fixed counter record contains no key or packet payload bytes.
 	 */
 	put_unaligned_le64(BIT_ULL(37), payload);
@@ -2149,8 +2148,7 @@ static const struct file_operations station_stats_ops = {
 
 static int rx_crypto_stats_show(struct seq_file *seq, void *unused)
 {
-	/* ACIStatisticsAdapter::printRxChipCounterStats at 0x1809d7b80:
-	 * statistic bit 30, response TLV 0xf921, sixteen LE32 counters.
+	/* RX chip counters: statistic bit 30, response TLV 0xf921, sixteen LE32 counters.
 	 * Unlike the station record, this fixed structure contains no MACs.
 	 */
 	static const char * const names[] = {
@@ -2204,8 +2202,7 @@ static const struct file_operations rx_crypto_stats_ops = {
 
 static int dot11_mib_stats_show(struct seq_file *seq, void *unused)
 {
-	/* ACIStatisticsAdapter::printDot11MibStats at 0x1809d7fb0:
-	 * statistic bit 25, scope 2/interface 0, TLV 0xf91b, 24 LE64s.
+	/* 802.11 MIB counters: statistic bit 25, scope 2/interface 0, TLV 0xf91b, 24 LE64s.
 	 * Keep the host field names: tx_status_success is firmware accounting,
 	 * not independent proof of over-the-air acknowledgement or AP delivery.
 	 */
@@ -2262,10 +2259,9 @@ static const struct file_operations dot11_mib_stats_ops = {
 
 static int tx_power_report_show(struct seq_file *seq, void *unused)
 {
-	/* Exact stock 25G76 WLANACIAdapter::queryLastTxStats, 0x180914d58:
-	 * bit29, scope1/radio bitmap, TLV 0xf920 with 280 bytes. The newer
-	 * macOS27 adapter expects 320 bytes and has a different record stride.
-	 * Stock getLastTxInfo (0x1809150f8) reads the first five 28-byte records.
+	/* Last TX stats: bit 29, scope 1/radio bitmap, TLV 0xf920 with 280
+	 * bytes on this firmware. Newer firmware returns 320 bytes with a
+	 * different record stride. The first five 28-byte records are read.
 	 * These are rate/power observations, not proof of ACK or AP delivery.
 	 */
 	struct centauri_wifi *wifi = seq->private;
