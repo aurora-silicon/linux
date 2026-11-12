@@ -1215,6 +1215,14 @@ static int dcp_retrain_active_crtc(struct apple_connector *connector,
 
 	DRM_MODESET_LOCK_ALL_BEGIN(dev, ctx, 0, ret);
 
+	/*
+	 * A queued READY can wait here behind a layout-changing commit. That
+	 * commit withdraws the native26 catalogue and queues rediscovery; the
+	 * reconnect can already have cleared external_stopped again. Recheck
+	 * catalogue admission under the modeset locks, before resetting a CRTC
+	 * against a mode that mode_fixup must reject. A completed modeset also
+	 * needs no replay. Rediscovery's READY will retry when modes are admitted.
+	 */
 	crtc = connector->base.state ? connector->base.state->crtc : NULL;
 	if (crtc && crtc->state && crtc->state->active &&
 	    dcp_crtc_lost_route(crtc, connector)) {
@@ -1229,6 +1237,10 @@ static int dcp_retrain_active_crtc(struct apple_connector *connector,
 		struct drm_mode_set set = { .crtc = crtc };
 
 		ret = drm_atomic_helper_set_config(&set, &ctx);
+	} else if (dcp_is_ext26(dcp) && crtc && crtc->state &&
+		   (READ_ONCE(dcp->mode_state.valid) ||
+		    !dcp_has_mode(dcp, &crtc->state->mode))) {
+		ret = 0;
 	} else if (crtc && crtc->state && crtc->state->active &&
 		   dcp_crtc_can_retrain(crtc, connector) && power_cycle) {
 		/* A commit that held the locks first may have set the mode. */

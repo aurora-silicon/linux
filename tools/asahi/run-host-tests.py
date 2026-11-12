@@ -56,6 +56,7 @@ ASAHI_TESTS = {
     'j613-mux-order-tests.py': [([], PASS), (['--negative-control'], KILL)],
     'dcpext26-budget-tests.py': [([], PASS)],
     'dcpext26-queue-tests.py': [([], PASS)],
+    'dcpext26-retrain-tests.py': [([], PASS), (['--negative-control'], KILL)],
     'dcpext26-lifecycle-tests.py': [([], PASS)],
     'dcpext26-modeset-tests.py': [([], PASS)],
     'dcpext26-parity-tests.py': [([], PASS)],
