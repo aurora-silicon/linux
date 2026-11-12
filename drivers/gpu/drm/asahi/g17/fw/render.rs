@@ -1289,7 +1289,9 @@ impl TaDescriptor {
         self.aux_stamp_va = args.ta.aux_stamp_va;
         self.stamp_value_2 = stamp_value;
         self.qid = args.ta.qid.into();
-        self.first_kick = match args.programs == RegisterPrograms::V25G83 {
+        self.first_kick = match args.programs == RegisterPrograms::V25G83
+            && crate::module_parameters::g17_test_ta_first_kick_once.value() == 0
+        {
             true => 1,
             false => u32::from(args.ordinal == 0),
         };

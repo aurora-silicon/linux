@@ -194,6 +194,10 @@ module! {
             default: 15,
             description: "G15: repoll interval while a ready prefix waits for record consumption, us (5..100)",
         },
+        g17_test_ta_first_kick_once: u32 {
+            default: 0,
+            description: "G17 test only: on 25G83 set the tiling first-kick word on a queue pair's first kick only, as on 26A428 (0: every kick)",
+        },
         g17_test_stage_window: u32 {
             default: 0,
             description: "G17 test only: also hand render stamp slots to the firmware timestamp window (bit 0 vertex start, 1 vertex end, 2 fragment start); the host leaves those slots to the firmware",
