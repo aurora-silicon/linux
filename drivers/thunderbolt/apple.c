@@ -3953,8 +3953,9 @@ static void apple_cio_sleep_restart_work(struct work_struct *work)
  * one, CIO reconfiguration (which restarts the firmware iBoot left in the
  * router's SRAM) and RTKit boot, after the Type-C controller has reapplied the
  * cable.
- * Until the sleep is over, cable changes are only recorded, and a restart is
- * owed even without a cable so that a cable plugged in during sleep is read.
+ * Until the sleep is over, cable changes are only recorded. Only a port that
+ * had a cable owes a restart: one plugged in during the sleep is found by the
+ * Type-C controller, which reads every port again after a sleep.
  * Called with acio->lock held.
  */
 static void apple_cio_sleep_stop_locked(struct apple_cio *acio)
@@ -3962,10 +3963,10 @@ static void apple_cio_sleep_stop_locked(struct apple_cio *acio)
 	lockdep_assert_held(&acio->lock);
 
 	acio->sleep_phase = APPLE_CIO_SLEEP_CLOSED;
-	WRITE_ONCE(acio->sleep_restart_owed, true);
 	if (acio->removing || !acio->current_cable_info)
 		return;
 
+	WRITE_ONCE(acio->sleep_restart_owed, true);
 	/* Close PCIe admission; the next NHI probe reopens it. */
 	scoped_guard(mutex, &acio->pcie_tunnel_lock)
 		acio->pcie_tunnel_stopping = true;
@@ -4093,10 +4094,13 @@ static int apple_cio_pm_notify(struct notifier_block *nb, unsigned long event,
 				acio->sleep_phase = APPLE_CIO_SLEEP_RESUMED;
 				acio->sleep_aborted_early = true;
 			}
-			owed = acio->sleep_restart_owed;
+			early = acio->sleep_aborted_early;
 			/* A cable recorded while closed has nobody else to start it. */
-			early = acio->sleep_aborted_early ||
-				(stop && acio->target_cable_info && !acio->current_cable_info);
+			if (stop && acio->target_cable_info && !acio->current_cable_info) {
+				WRITE_ONCE(acio->sleep_restart_owed, true);
+				early = true;
+			}
+			owed = acio->sleep_restart_owed;
 		}
 		/* Start from a worker: probing children inside this chain can deadlock. */
 		if (owed)
