@@ -1,0 +1,2347 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Property migration from Satya Benson's 86b1f365 J775c stack.
+ * Retained board sources remain the baseline; this group is independently booted.
+ * Copyright The Asahi Linux Contributors
+ */
+&{/} {
+	interrupt-parent = <&{/soc/interrupt-controller@280400000}>;
+};
+
+&{/memory@10000000000} {
+};
+
+&{/reserved-memory} {
+};
+
+&{/reserved-memory/uat-ttbs} {
+};
+
+&{/reserved-memory/uat-pagetables} {
+};
+
+&{/reserved-memory/uat-handoff} {
+};
+
+&{/reserved-memory/uat-l2-pagetables} {
+};
+
+&{/reserved-memory/gpu-fw-text} {
+};
+
+&{/reserved-memory/gpu-fw-data} {
+};
+
+&{/cpus} {
+};
+
+&{/cpus/cpu@40000} {
+	operating-points-v2 = <&{/opp-table-mcluster}>;
+	performance-domains = <&{/soc/performance-controller@210e20000}>;
+	next-level-cache = <&{/cpus/l2-cache-m00}>;
+};
+
+&{/cpus/cpu@40001} {
+	operating-points-v2 = <&{/opp-table-mcluster}>;
+	performance-domains = <&{/soc/performance-controller@210e20000}>;
+	next-level-cache = <&{/cpus/l2-cache-m00}>;
+};
+
+&{/cpus/cpu@40002} {
+	operating-points-v2 = <&{/opp-table-mcluster}>;
+	performance-domains = <&{/soc/performance-controller@210e20000}>;
+	next-level-cache = <&{/cpus/l2-cache-m00}>;
+};
+
+&{/cpus/cpu@40003} {
+	operating-points-v2 = <&{/opp-table-mcluster}>;
+	performance-domains = <&{/soc/performance-controller@210e20000}>;
+	next-level-cache = <&{/cpus/l2-cache-m00}>;
+};
+
+&{/cpus/cpu@40004} {
+	operating-points-v2 = <&{/opp-table-mcluster}>;
+	performance-domains = <&{/soc/performance-controller@210e20000}>;
+	next-level-cache = <&{/cpus/l2-cache-m00}>;
+};
+
+&{/cpus/cpu@40005} {
+	operating-points-v2 = <&{/opp-table-mcluster}>;
+	performance-domains = <&{/soc/performance-controller@210e20000}>;
+	next-level-cache = <&{/cpus/l2-cache-m00}>;
+};
+
+&{/cpus/cpu@40100} {
+	operating-points-v2 = <&{/opp-table-mcluster}>;
+	performance-domains = <&{/soc/performance-controller@211e20000}>;
+	next-level-cache = <&{/cpus/l2-cache-m01}>;
+};
+
+&{/cpus/cpu@40101} {
+	operating-points-v2 = <&{/opp-table-mcluster}>;
+	performance-domains = <&{/soc/performance-controller@211e20000}>;
+	next-level-cache = <&{/cpus/l2-cache-m01}>;
+};
+
+&{/cpus/cpu@40102} {
+	operating-points-v2 = <&{/opp-table-mcluster}>;
+	performance-domains = <&{/soc/performance-controller@211e20000}>;
+	next-level-cache = <&{/cpus/l2-cache-m01}>;
+};
+
+&{/cpus/cpu@40103} {
+	operating-points-v2 = <&{/opp-table-mcluster}>;
+	performance-domains = <&{/soc/performance-controller@211e20000}>;
+	next-level-cache = <&{/cpus/l2-cache-m01}>;
+};
+
+&{/cpus/cpu@40104} {
+	operating-points-v2 = <&{/opp-table-mcluster}>;
+	performance-domains = <&{/soc/performance-controller@211e20000}>;
+	next-level-cache = <&{/cpus/l2-cache-m01}>;
+};
+
+&{/cpus/cpu@40105} {
+	operating-points-v2 = <&{/opp-table-mcluster}>;
+	performance-domains = <&{/soc/performance-controller@211e20000}>;
+	next-level-cache = <&{/cpus/l2-cache-m01}>;
+};
+
+&{/cpus/cpu@10200} {
+	operating-points-v2 = <&{/opp-table-pcluster}>;
+	performance-domains = <&{/soc/performance-controller@212e20000}>;
+	next-level-cache = <&{/cpus/l2-cache-p0-0}>;
+};
+
+&{/cpus/cpu@10201} {
+	operating-points-v2 = <&{/opp-table-pcluster}>;
+	performance-domains = <&{/soc/performance-controller@212e20000}>;
+	next-level-cache = <&{/cpus/l2-cache-p0-1}>;
+};
+
+&{/cpus/cpu@10202} {
+	operating-points-v2 = <&{/opp-table-pcluster}>;
+	performance-domains = <&{/soc/performance-controller@212e20000}>;
+	next-level-cache = <&{/cpus/l2-cache-p0-2}>;
+};
+
+&{/cpus/cpu@10203} {
+	operating-points-v2 = <&{/opp-table-pcluster}>;
+	performance-domains = <&{/soc/performance-controller@212e20000}>;
+	next-level-cache = <&{/cpus/l2-cache-p0-3}>;
+};
+
+&{/cpus/cpu@10204} {
+	operating-points-v2 = <&{/opp-table-pcluster}>;
+	performance-domains = <&{/soc/performance-controller@212e20000}>;
+	next-level-cache = <&{/cpus/l2-cache-p0-4}>;
+};
+
+&{/cpus/cpu@10205} {
+	operating-points-v2 = <&{/opp-table-pcluster}>;
+	performance-domains = <&{/soc/performance-controller@212e20000}>;
+	next-level-cache = <&{/cpus/l2-cache-p0-5}>;
+};
+
+&{/cpus/cpu-map} {
+};
+
+&{/cpus/cpu-map/cluster0} {
+};
+
+&{/cpus/cpu-map/cluster0/core0} {
+	cpu = <&{/cpus/cpu@40000}>;
+};
+
+&{/cpus/cpu-map/cluster0/core1} {
+	cpu = <&{/cpus/cpu@40001}>;
+};
+
+&{/cpus/cpu-map/cluster0/core2} {
+	cpu = <&{/cpus/cpu@40002}>;
+};
+
+&{/cpus/cpu-map/cluster0/core3} {
+	cpu = <&{/cpus/cpu@40003}>;
+};
+
+&{/cpus/cpu-map/cluster0/core4} {
+	cpu = <&{/cpus/cpu@40004}>;
+};
+
+&{/cpus/cpu-map/cluster0/core5} {
+	cpu = <&{/cpus/cpu@40005}>;
+};
+
+&{/cpus/cpu-map/cluster1} {
+};
+
+&{/cpus/cpu-map/cluster1/core0} {
+	cpu = <&{/cpus/cpu@40100}>;
+};
+
+&{/cpus/cpu-map/cluster1/core1} {
+	cpu = <&{/cpus/cpu@40101}>;
+};
+
+&{/cpus/cpu-map/cluster1/core2} {
+	cpu = <&{/cpus/cpu@40102}>;
+};
+
+&{/cpus/cpu-map/cluster1/core3} {
+	cpu = <&{/cpus/cpu@40103}>;
+};
+
+&{/cpus/cpu-map/cluster1/core4} {
+	cpu = <&{/cpus/cpu@40104}>;
+};
+
+&{/cpus/cpu-map/cluster1/core5} {
+	cpu = <&{/cpus/cpu@40105}>;
+};
+
+&{/cpus/cpu-map/cluster2} {
+};
+
+&{/cpus/cpu-map/cluster2/core0} {
+	cpu = <&{/cpus/cpu@10200}>;
+};
+
+&{/cpus/cpu-map/cluster2/core1} {
+	cpu = <&{/cpus/cpu@10201}>;
+};
+
+&{/cpus/cpu-map/cluster2/core2} {
+	cpu = <&{/cpus/cpu@10202}>;
+};
+
+&{/cpus/cpu-map/cluster2/core3} {
+	cpu = <&{/cpus/cpu@10203}>;
+};
+
+&{/cpus/cpu-map/cluster2/core4} {
+	cpu = <&{/cpus/cpu@10204}>;
+};
+
+&{/cpus/cpu-map/cluster2/core5} {
+	cpu = <&{/cpus/cpu@10205}>;
+};
+
+&{/cpus/l2-cache-m00} {
+};
+
+&{/cpus/l2-cache-m01} {
+};
+
+&{/cpus/l3-cache-p0} {
+};
+
+&{/cpus/l2-cache-p0-0} {
+	next-level-cache = <&{/cpus/l3-cache-p0}>;
+};
+
+&{/cpus/l2-cache-p0-1} {
+	next-level-cache = <&{/cpus/l3-cache-p0}>;
+};
+
+&{/cpus/l2-cache-p0-2} {
+	next-level-cache = <&{/cpus/l3-cache-p0}>;
+};
+
+&{/cpus/l2-cache-p0-3} {
+	next-level-cache = <&{/cpus/l3-cache-p0}>;
+};
+
+&{/cpus/l2-cache-p0-4} {
+	next-level-cache = <&{/cpus/l3-cache-p0}>;
+};
+
+&{/cpus/l2-cache-p0-5} {
+	next-level-cache = <&{/cpus/l3-cache-p0}>;
+};
+
+&{/opp-table-mcluster} {
+};
+
+&{/opp-table-mcluster/opp01} {
+};
+
+&{/opp-table-mcluster/opp02} {
+};
+
+&{/opp-table-mcluster/opp03} {
+};
+
+&{/opp-table-mcluster/opp04} {
+};
+
+&{/opp-table-mcluster/opp05} {
+};
+
+&{/opp-table-mcluster/opp06} {
+};
+
+&{/opp-table-mcluster/opp07} {
+};
+
+&{/opp-table-mcluster/opp08} {
+};
+
+&{/opp-table-mcluster/opp09} {
+};
+
+&{/opp-table-mcluster/opp10} {
+};
+
+&{/opp-table-mcluster/opp11} {
+};
+
+&{/opp-table-mcluster/opp12} {
+};
+
+&{/opp-table-mcluster/opp13} {
+};
+
+&{/opp-table-mcluster/opp14} {
+};
+
+&{/opp-table-mcluster/opp15} {
+};
+
+&{/opp-table-mcluster/opp16} {
+};
+
+&{/opp-table-pcluster} {
+};
+
+&{/opp-table-pcluster/opp01} {
+};
+
+&{/opp-table-pcluster/opp02} {
+};
+
+&{/opp-table-pcluster/opp03} {
+};
+
+&{/opp-table-pcluster/opp04} {
+};
+
+&{/opp-table-pcluster/opp05} {
+};
+
+&{/opp-table-pcluster/opp06} {
+};
+
+&{/opp-table-pcluster/opp07} {
+};
+
+&{/opp-table-pcluster/opp08} {
+};
+
+&{/opp-table-pcluster/opp09} {
+};
+
+&{/opp-table-pcluster/opp10} {
+};
+
+&{/opp-table-pcluster/opp11} {
+};
+
+&{/opp-table-pcluster/opp12} {
+};
+
+&{/opp-table-pcluster/opp13} {
+};
+
+&{/opp-table-pcluster/opp14} {
+};
+
+&{/opp-table-pcluster/opp15} {
+};
+
+&{/opp-table-pcluster/opp16} {
+};
+
+&{/opp-table-pcluster/opp17} {
+};
+
+&{/opp-table-pcluster/opp18} {
+};
+
+&{/opp-table-pcluster/opp19} {
+};
+
+&{/opp-table-pcluster/opp20} {
+};
+
+&{/opp-table-pcluster/opp21} {
+};
+
+&{/clock-ref} {
+};
+
+&{/clock-405m} {
+};
+
+&{/timer} {
+	interrupt-parent = <&{/soc/interrupt-controller@280400000}>;
+};
+
+&{/soc/performance-controller@210e20000} {
+};
+
+&{/soc/performance-controller@211e20000} {
+};
+
+&{/soc/performance-controller@212e20000} {
+};
+
+&{/soc/power-management@280600000} {
+};
+
+&{/soc/power-management@280600000/power-controller@210} {
+};
+
+&{/soc/power-management@280600000/power-controller@238} {
+};
+
+&{/soc/power-management@280600000/power-controller@240} {
+};
+
+&{/soc/power-management@280600000/power-controller@248} {
+};
+
+&{/soc/power-management@280600000/power-controller@2f8} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@240}>;
+};
+
+&{/soc/power-management@280600000/power-controller@410} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@2f8}>;
+};
+
+&{/soc/power-management@280600000/power-controller@418} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@2f8}>;
+};
+
+&{/soc/power-management@280600000/power-controller@420} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@2f8} &{/soc/power-management@280600000/power-controller@248}>;
+};
+
+&{/soc/power-management@280600000/power-controller@2e8} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@238}>;
+};
+
+&{/soc/power-management@280600000/power-controller@3f8} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@2e8}>;
+};
+
+&{/soc/power-management@280600000/power-controller@400} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@2e8}>;
+};
+
+&{/soc/power-management@280600000/power-controller@408} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@2e8} &{/soc/power-management@280600000/power-controller@248}>;
+};
+
+&{/soc/power-management@280600000/power-controller@100} {
+};
+
+&{/soc/power-management@280600000/power-controller@128} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@100}>;
+};
+
+&{/soc/power-management@280600000/power-controller@130} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@100}>;
+};
+
+&{/soc/power-management@280600000/power-controller@1d8} {
+};
+
+&{/soc/power-management@280600000/power-controller@1e0} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@1d8}>;
+};
+
+&{/soc/power-management@280600000/power-controller@1f0} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@1d8}>;
+};
+
+&{/soc/power-management@280600000/power-controller@1f8} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@1e0}>;
+};
+
+&{/soc/power-management@280600000/power-controller@208} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@1e0}>;
+};
+
+&{/soc/power-management@280600000/power-controller@258} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@1f8}>;
+};
+
+&{/soc/power-management@280600000/power-controller@280} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@208}>;
+};
+
+&{/soc/power-management@280600000/power-controller@288} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@208}>;
+};
+
+&{/soc/power-management@280600000/power-controller@290} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@210}>;
+};
+
+&{/soc/power-management@280600000/power-controller@298} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@210}>;
+};
+
+&{/soc/power-management@280600000/power-controller@2f0} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@238}>;
+};
+
+&{/soc/power-management@280600000/power-controller@300} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@240}>;
+};
+
+&{/soc/power-management@280600000/power-controller@338} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@280}>;
+};
+
+&{/soc/power-management@280600000/power-controller@340} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@280}>;
+};
+
+&{/soc/power-management@280600000/power-controller@348} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@280} &{/soc/power-management@280600000/power-controller@248}>;
+};
+
+&{/soc/power-management@280600000/power-controller@350} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@290}>;
+};
+
+&{/soc/power-management@280600000/power-controller@358} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@290}>;
+};
+
+&{/soc/power-management@280600000/power-controller@360} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@290} &{/soc/power-management@280600000/power-controller@248}>;
+};
+
+&{/soc/power-management@280600000/power-controller@270} {
+};
+
+&{/soc/power-management@280600000/power-controller@2d8} {
+};
+
+&{/soc/power-management@280900000} {
+};
+
+&{/soc/power-management@280900000/power-controller@2a8} {
+};
+
+&{/soc/power-management@280900000/power-controller@2b0} {
+};
+
+&{/soc/power-management@280900000/power-controller@2b8} {
+};
+
+&{/soc/power-management@280900000/power-controller@2c8} {
+};
+
+&{/soc/power-management@280900000/power-controller@2d0} {
+};
+
+&{/soc/power-management@280900000/power-controller@308} {
+};
+
+&{/soc/power-management@280900000/power-controller@350} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@308}>;
+};
+
+&{/soc/power-management@280900000/power-controller@100} {
+};
+
+&{/soc/power-management@280900000/power-controller@108} {
+};
+
+&{/soc/power-management@280900000/power-controller@110} {
+};
+
+&{/soc/power-management@280900000/power-controller@118} {
+};
+
+&{/soc/power-management@280900000/power-controller@120} {
+};
+
+&{/soc/power-management@280900000/power-controller@128} {
+};
+
+&{/soc/power-management@280900000/power-controller@130} {
+};
+
+&{/soc/power-management@280900000/power-controller@138} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@1d8}>;
+};
+
+&{/soc/power-management@280900000/power-controller@140} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@138}>;
+};
+
+&{/soc/power-management@280900000/power-controller@148} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@118} &{/soc/power-management@280900000/power-controller@138}>;
+};
+
+&{/soc/power-management@280900000/power-controller@150} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@128} &{/soc/power-management@280900000/power-controller@140}>;
+};
+
+&{/soc/power-management@280900000/power-controller@158} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@130} &{/soc/power-management@280900000/power-controller@140}>;
+};
+
+&{/soc/power-management@280900000/power-controller@178} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@1d8}>;
+};
+
+&{/soc/power-management@280900000/power-controller@180} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@178}>;
+};
+
+&{/soc/power-management@280900000/power-controller@188} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@120} &{/soc/power-management@280900000/power-controller@138}>;
+};
+
+&{/soc/power-management@280900000/power-controller@190} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@178}>;
+};
+
+&{/soc/power-management@280900000/power-controller@198} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@180}>;
+};
+
+&{/soc/power-management@280900000/power-controller@1a8} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@198}>;
+};
+
+&{/soc/power-management@280900000/power-controller@1b0} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@148} &{/soc/power-management@280900000/power-controller@188}>;
+};
+
+&{/soc/power-management@280900000/power-controller@240} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@1b0}>;
+};
+
+&{/soc/power-management@280900000/power-controller@248} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@1b0}>;
+};
+
+&{/soc/power-management@280900000/power-controller@250} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@1b0}>;
+};
+
+&{/soc/power-management@280900000/power-controller@258} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@1b0}>;
+};
+
+&{/soc/power-management@280900000/power-controller@268} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@240}>;
+};
+
+&{/soc/power-management@280900000/power-controller@270} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@248}>;
+};
+
+&{/soc/power-management@280900000/power-controller@278} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@250}>;
+};
+
+&{/soc/power-management@280900000/power-controller@280} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@258}>;
+};
+
+&{/soc/power-management@280900000/power-controller@288} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@1d8}>;
+};
+
+&{/soc/power-management@280900000/power-controller@290} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@288}>;
+};
+
+&{/soc/power-management@280900000/power-controller@298} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@288}>;
+};
+
+&{/soc/power-management@280900000/power-controller@2a0} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@290}>;
+};
+
+&{/soc/power-management@280900000/power-controller@2c0} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@290}>;
+};
+
+&{/soc/power-management@280900000/power-controller@2d8} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@290}>;
+};
+
+&{/soc/power-management@280900000/power-controller@2e0} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@290}>;
+};
+
+&{/soc/power-management@280900000/power-controller@2e8} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@290}>;
+};
+
+&{/soc/power-management@280900000/power-controller@2f0} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@290}>;
+};
+
+&{/soc/power-management@280900000/power-controller@2f8} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@290}>;
+};
+
+&{/soc/power-management@280900000/power-controller@300} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@290}>;
+};
+
+&{/soc/power-management@280900000/power-controller@310} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@290}>;
+};
+
+&{/soc/power-management@280900000/power-controller@318} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@290}>;
+};
+
+&{/soc/power-management@280900000/power-controller@330} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@308}>;
+};
+
+&{/soc/power-management@280900000/power-controller@338} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@308}>;
+};
+
+&{/soc/power-management@280900000/power-controller@340} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@308}>;
+};
+
+&{/soc/power-management@280900000/power-controller@360} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@310}>;
+};
+
+&{/soc/power-management@280900000/power-controller@398} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@1d8}>;
+};
+
+&{/soc/power-management@280900000/power-controller@3a0} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@398}>;
+};
+
+&{/soc/power-management@280900000/power-controller@3c8} {
+};
+
+&{/soc/power-management@280900000/power-controller@3f8} {
+};
+
+&{/soc/power-management@288300000} {
+};
+
+&{/soc/power-management@288300000/power-controller@160} {
+};
+
+&{/soc/power-management@288300000/power-controller@168} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@210} &{/soc/power-management@288300000/power-controller@160}>;
+};
+
+&{/soc/power-management@288300000/power-controller@170} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@210} &{/soc/power-management@288300000/power-controller@160}>;
+};
+
+&{/soc/power-management@288300000/power-controller@178} {
+};
+
+&{/soc/power-management@288300000/power-controller@188} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@238} &{/soc/power-management@288300000/power-controller@178}>;
+};
+
+&{/soc/power-management@288300000/power-controller@180} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@238} &{/soc/power-management@288300000/power-controller@178}>;
+};
+
+&{/soc/power-management@288300000/power-controller@190} {
+};
+
+&{/soc/power-management@288300000/power-controller@198} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@240} &{/soc/power-management@288300000/power-controller@190}>;
+};
+
+&{/soc/power-management@288300000/power-controller@1a0} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@240} &{/soc/power-management@288300000/power-controller@190}>;
+};
+
+&{/soc/power-management@288300000/power-controller@58} {
+};
+
+&{/soc/power-management@288300000/power-controller@98} {
+};
+
+&{/soc/power-management@288300000/power-controller@a0} {
+};
+
+&{/soc/power-management@288300000/power-controller@a8} {
+};
+
+&{/soc/power-management@288300000/power-controller@b0} {
+};
+
+&{/soc/power-management@288300000/power-controller@b8} {
+};
+
+&{/soc/power-management@288300000/power-controller@c0} {
+};
+
+&{/soc/power-management@288300000/power-controller@c8} {
+};
+
+&{/soc/power-management@288300000/power-controller@d0} {
+};
+
+&{/soc/power-management@288300000/power-controller@d8} {
+};
+
+&{/soc/power-management@288300000/power-controller@e0} {
+};
+
+&{/soc/power-management@288300000/power-controller@e8} {
+};
+
+&{/soc/power-management@288300000/power-controller@f0} {
+};
+
+&{/soc/power-management@288300000/power-controller@f8} {
+};
+
+&{/soc/power-management@288300000/power-controller@100} {
+};
+
+&{/soc/power-management@288300000/power-controller@108} {
+};
+
+&{/soc/power-management@288300000/power-controller@110} {
+};
+
+&{/soc/power-management@288300000/power-controller@148} {
+};
+
+&{/soc/power-management@288300000/power-controller@150} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@208} &{/soc/power-management@288300000/power-controller@148}>;
+};
+
+&{/soc/power-management@288300000/power-controller@158} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@208} &{/soc/power-management@288300000/power-controller@148}>;
+};
+
+&{/soc/iommu@2b2340000} {
+};
+
+&{/soc/iommu@2b2300000} {
+};
+
+&{/soc/mailbox@2b2e08000} {
+};
+
+&{/soc/pmc-metadata@286700000} {
+};
+
+&{/soc/dcp@2b2e00000} {
+	mboxes = <&{/soc/mailbox@2b2e08000}>;
+	iommus = <&{/soc/iommu@2b2340000} 0x17>;
+	apple,bw-scratch = <&{/soc/pmc-metadata@286700000} 0x0 0x5 0x2c000>;
+	phys = <&{/soc/phy@383000000} 0x6 &{/soc/phy@2ab000000} 0x6 &{/soc/phy@38b000000} 0x6 &{/soc/phy@2a3000000} 0x6>;
+	mux-controls = <&{/soc/mux@38324c000} 0x0 &{/soc/mux@2ab24c000} 0x0 &{/soc/mux@38b24c000} 0x0 &{/soc/mux@2a324c000} 0x0>;
+};
+
+&{/soc/dcp@2b2e00000/piodma} {
+	iommus = <&{/soc/iommu@2b2300000} 0x10>;
+};
+
+&{/soc/dcp@2b2e00000/typec-routes} {
+};
+
+&{/soc/dcp@2b2e00000/typec-routes/route@0} {
+};
+
+&{/soc/dcp@2b2e00000/typec-routes/route@0/port} {
+};
+
+&{/soc/dcp@2b2e00000/typec-routes/route@0/port/endpoint} {
+	remote-endpoint = <&{/soc/spmi@28a188000/usb-pd@8/connector/ports/port@2/endpoint}>;
+};
+
+&{/soc/dcp@2b2e00000/typec-routes/route@1} {
+};
+
+&{/soc/dcp@2b2e00000/typec-routes/route@1/port} {
+};
+
+&{/soc/dcp@2b2e00000/typec-routes/route@1/port/endpoint} {
+	remote-endpoint = <&{/soc/spmi@28a188000/usb-pd@a/connector/ports/port@2/endpoint}>;
+};
+
+&{/soc/dcp@2b2e00000/typec-routes/route@2} {
+};
+
+&{/soc/dcp@2b2e00000/typec-routes/route@2/port} {
+};
+
+&{/soc/dcp@2b2e00000/typec-routes/route@2/port/endpoint} {
+	remote-endpoint = <&{/soc/spmi@28a188000/usb-pd@6/connector/ports/port@2/endpoint}>;
+};
+
+&{/soc/dcp@2b2e00000/typec-routes/route@3} {
+};
+
+&{/soc/dcp@2b2e00000/typec-routes/route@3/port} {
+};
+
+&{/soc/dcp@2b2e00000/typec-routes/route@3/port/endpoint} {
+	remote-endpoint = <&{/soc/spmi@28a188000/usb-pd@c/connector/ports/port@2/endpoint}>;
+};
+
+&{/soc/dcp@2b2e00000/ports} {
+};
+
+&{/soc/dcp@2b2e00000/ports/port@0} {
+};
+
+&{/soc/dcp@2b2e00000/ports/port@0/endpoint} {
+	remote-endpoint = <&{/audio-controller-dispext0/ports/port@0/endpoint}>;
+};
+
+&{/soc/mailbox@2ab148000} {
+	status = "okay";
+};
+
+&{/soc/phy@2ab000000} {
+	mboxes = <&{/soc/mailbox@2ab148000}>;
+	power-domains = <&{/soc/power-management@288300000/power-controller@160} &{/soc/power-management@280600000/power-controller@210} &{/soc/power-management@288300000/power-controller@170} &{/soc/power-management@288300000/power-controller@168}>;
+};
+
+&{/soc/phy@2ab000000/port} {
+};
+
+&{/soc/phy@2ab000000/port/endpoint} {
+	remote-endpoint = <&{/soc/spmi@28a188000/usb-pd@a/connector/ports/port@1/endpoint}>;
+};
+
+&{/soc/usb@2aa280000} {
+	iommus = <&{/soc/iommu@2aaf00000} 0x0 &{/soc/iommu@2aaf80000} 0x1>;
+	power-domains = <&{/soc/power-management@288300000/power-controller@168}>;
+	resets = <&{/soc/phy@2ab000000} 0x0>;
+	phys = <&{/soc/phy@2ab000000} 0x3 &{/soc/phy@2ab000000} 0x4>;
+};
+
+&{/soc/usb@2aa280000/port} {
+};
+
+&{/soc/usb@2aa280000/port/endpoint} {
+	remote-endpoint = <&{/soc/spmi@28a188000/usb-pd@a/connector/ports/port@0/endpoint}>;
+};
+
+&{/soc/iommu@2aaf00000} {
+	power-domains = <&{/soc/power-management@288300000/power-controller@168}>;
+};
+
+&{/soc/iommu@2aaf80000} {
+	power-domains = <&{/soc/power-management@288300000/power-controller@168}>;
+};
+
+&{/soc/interrupt-controller@280400000} {
+};
+
+&{/soc/serial@288e3c000} {
+};
+
+&{/soc/watchdog@28836c000} {
+	clocks = <&{/clock-ref}>;
+};
+
+&{/soc/mailbox@28c608000} {
+};
+
+&{/soc/pinctrl@290824000} {
+	gpio-ranges = <&{/soc/pinctrl@290824000} 0x0 0x0 0x55>;
+	interrupt-parent = <&{/soc/interrupt-controller@280400000}>;
+};
+
+&{/soc/pinctrl@290824000/acio0-lstx-pins} {
+};
+
+&{/soc/pinctrl@290824000/acio1-lstx-pins} {
+};
+
+&{/soc/pinctrl@290824000/acio3-lstx-pins} {
+};
+
+&{/soc/pinctrl@290824000/acio2-lstx-pins} {
+};
+
+&{/soc/smc@28c600000} {
+	mboxes = <&{/soc/mailbox@28c608000}>;
+};
+
+&{/soc/smc@28c600000/gpio-low} {
+};
+
+&{/soc/smc@28c600000/hwmon} {
+};
+
+&{/soc/smc@28c600000/hwmon/fan-F0Ac} {
+};
+
+&{/soc/smc@28c600000/hwmon/fan-F1Ac} {
+};
+
+&{/soc/smc@28c600000/reboot} {
+	nvmem-cells = <&{/soc/spmi@28a014000/pmic@e/nvmem-layout/shutdown-flag@f80f,3} &{/soc/spmi@28a014000/pmic@e/nvmem-layout/boot-stage@f801} &{/soc/spmi@28a014000/pmic@e/nvmem-layout/boot-error-count@f802,0} &{/soc/spmi@28a014000/pmic@e/nvmem-layout/panic-count@f802,4} &{/soc/spmi@28a014000/pmic@e/nvmem-layout/pm-setting@2001}>;
+};
+
+&{/soc/smc@28c600000/gpio} {
+};
+
+&{/soc/smc@28c600000/rtc} {
+	/delete-property/ wakeup-source;
+	/delete-property/ interrupts-extended;
+	nvmem-cells = <&{/soc/spmi@28a014000/pmic@e/nvmem-layout/rtc-offset@2100}>;
+	nvmem-cell-names = "rtc_offset";
+};
+
+&{/soc/iommu@41dc50000} {
+};
+
+&{/soc/mailbox@419608000} {
+};
+
+&{/soc/nvme@45dcc0000} {
+	mboxes = <&{/soc/mailbox@419608000}>;
+	apple,sart = <&{/soc/iommu@41dc50000}>;
+};
+
+&{/soc/iommu@412000000} {
+};
+
+&{/soc/iommu@410000000} {
+};
+
+&{/soc/iommu@413000000} {
+};
+
+&{/soc/spmi@28a014000} {
+};
+
+&{/soc/spmi@28a014000/pmic@e} {
+};
+
+&{/soc/spmi@28a014000/pmic@e/nvmem-layout} {
+};
+
+&{/soc/spmi@28a014000/pmic@e/nvmem-layout/pm-setting@2001} {
+};
+
+&{/soc/spmi@28a014000/pmic@e/nvmem-layout/rtc-offset@2100} {
+};
+
+&{/soc/spmi@28a014000/pmic@e/nvmem-layout/boot-stage@f801} {
+};
+
+&{/soc/spmi@28a014000/pmic@e/nvmem-layout/boot-error-count@f802,0} {
+};
+
+&{/soc/spmi@28a014000/pmic@e/nvmem-layout/panic-count@f802,4} {
+};
+
+&{/soc/spmi@28a014000/pmic@e/nvmem-layout/shutdown-flag@f80f,3} {
+};
+
+&{/soc/power-management@286806000} {
+};
+
+&{/soc/power-management@286806000/performance-controller@1} {
+};
+
+&{/soc/reset-controller@280620000} {
+	status = "okay";
+};
+
+&{/soc/mailbox@383148000} {
+};
+
+&{/soc/phy@383000000} {
+	mboxes = <&{/soc/mailbox@383148000}>;
+	power-domains = <&{/soc/power-management@288300000/power-controller@178} &{/soc/power-management@280600000/power-controller@238} &{/soc/power-management@288300000/power-controller@188} &{/soc/power-management@288300000/power-controller@180}>;
+};
+
+&{/soc/phy@383000000/port} {
+};
+
+&{/soc/phy@383000000/port/endpoint} {
+	remote-endpoint = <&{/soc/spmi@28a188000/usb-pd@8/connector/ports/port@1/endpoint}>;
+};
+
+&{/soc/mux@38324c000} {
+	power-domains = <&{/soc/power-management@288300000/power-controller@178} &{/soc/power-management@280600000/power-controller@238}>;
+};
+
+&{/soc/spmi@28a188000} {
+	status = "okay";
+};
+
+&{/soc/spmi@28a188000/usb-pd@c} {
+};
+
+&{/soc/spmi@28a188000/usb-pd@c/connector} {
+};
+
+&{/soc/spmi@28a188000/usb-pd@c/connector/ports} {
+};
+
+&{/soc/spmi@28a188000/usb-pd@c/connector/ports/port@0} {
+};
+
+&{/soc/spmi@28a188000/usb-pd@c/connector/ports/port@0/endpoint} {
+	remote-endpoint = <&{/soc/usb@2a2280000/port/endpoint}>;
+};
+
+&{/soc/spmi@28a188000/usb-pd@c/connector/ports/port@1} {
+};
+
+&{/soc/spmi@28a188000/usb-pd@c/connector/ports/port@1/endpoint} {
+	remote-endpoint = <&{/soc/phy@2a3000000/port/endpoint}>;
+};
+
+&{/soc/spmi@28a188000/usb-pd@c/connector/ports/port@3} {
+};
+
+&{/soc/spmi@28a188000/usb-pd@c/connector/ports/port@3/endpoint} {
+	remote-endpoint = <&{/soc/acio@2a1ac0000/ports/port@1/endpoint}>;
+};
+
+&{/soc/spmi@28a188000/usb-pd@c/connector/ports/port@2} {
+};
+
+&{/soc/spmi@28a188000/usb-pd@c/connector/ports/port@2/endpoint} {
+	remote-endpoint = <&{/soc/dcp@2b2e00000/typec-routes/route@3/port/endpoint}>;
+};
+
+&{/soc/spmi@28a188000/usb-pd@a} {
+};
+
+&{/soc/spmi@28a188000/usb-pd@a/connector} {
+};
+
+&{/soc/spmi@28a188000/usb-pd@a/connector/ports} {
+};
+
+&{/soc/spmi@28a188000/usb-pd@a/connector/ports/port@0} {
+};
+
+&{/soc/spmi@28a188000/usb-pd@a/connector/ports/port@0/endpoint} {
+	remote-endpoint = <&{/soc/usb@2aa280000/port/endpoint}>;
+};
+
+&{/soc/spmi@28a188000/usb-pd@a/connector/ports/port@1} {
+};
+
+&{/soc/spmi@28a188000/usb-pd@a/connector/ports/port@1/endpoint} {
+	remote-endpoint = <&{/soc/phy@2ab000000/port/endpoint}>;
+};
+
+&{/soc/spmi@28a188000/usb-pd@a/connector/ports/port@3} {
+};
+
+&{/soc/spmi@28a188000/usb-pd@a/connector/ports/port@3/endpoint} {
+	remote-endpoint = <&{/soc/acio@2a9ac0000/ports/port@1/endpoint}>;
+};
+
+&{/soc/spmi@28a188000/usb-pd@a/connector/ports/port@2} {
+};
+
+&{/soc/spmi@28a188000/usb-pd@a/connector/ports/port@2/endpoint} {
+	remote-endpoint = <&{/soc/dcp@2b2e00000/typec-routes/route@1/port/endpoint}>;
+};
+
+&{/soc/spmi@28a188000/usb-pd@8} {
+};
+
+&{/soc/spmi@28a188000/usb-pd@8/connector} {
+};
+
+&{/soc/spmi@28a188000/usb-pd@8/connector/ports} {
+};
+
+&{/soc/spmi@28a188000/usb-pd@8/connector/ports/port@0} {
+};
+
+&{/soc/spmi@28a188000/usb-pd@8/connector/ports/port@0/endpoint} {
+	remote-endpoint = <&{/soc/usb@382280000/port/endpoint}>;
+};
+
+&{/soc/spmi@28a188000/usb-pd@8/connector/ports/port@1} {
+};
+
+&{/soc/spmi@28a188000/usb-pd@8/connector/ports/port@1/endpoint} {
+	remote-endpoint = <&{/soc/phy@383000000/port/endpoint}>;
+};
+
+&{/soc/spmi@28a188000/usb-pd@8/connector/ports/port@3} {
+};
+
+&{/soc/spmi@28a188000/usb-pd@8/connector/ports/port@3/endpoint} {
+	remote-endpoint = <&{/soc/acio@381ac0000/ports/port@1/endpoint}>;
+};
+
+&{/soc/spmi@28a188000/usb-pd@8/connector/ports/port@2} {
+};
+
+&{/soc/spmi@28a188000/usb-pd@8/connector/ports/port@2/endpoint} {
+	remote-endpoint = <&{/soc/dcp@2b2e00000/typec-routes/route@0/port/endpoint}>;
+};
+
+&{/soc/spmi@28a188000/usb-pd@6} {
+};
+
+&{/soc/spmi@28a188000/usb-pd@6/connector} {
+};
+
+&{/soc/spmi@28a188000/usb-pd@6/connector/ports} {
+};
+
+&{/soc/spmi@28a188000/usb-pd@6/connector/ports/port@0} {
+};
+
+&{/soc/spmi@28a188000/usb-pd@6/connector/ports/port@0/endpoint} {
+	remote-endpoint = <&{/soc/usb@38a280000/port/endpoint}>;
+};
+
+&{/soc/spmi@28a188000/usb-pd@6/connector/ports/port@1} {
+};
+
+&{/soc/spmi@28a188000/usb-pd@6/connector/ports/port@1/endpoint} {
+	remote-endpoint = <&{/soc/phy@38b000000/port/endpoint}>;
+};
+
+&{/soc/spmi@28a188000/usb-pd@6/connector/ports/port@3} {
+};
+
+&{/soc/spmi@28a188000/usb-pd@6/connector/ports/port@3/endpoint} {
+	remote-endpoint = <&{/soc/acio@389ac0000/ports/port@1/endpoint}>;
+};
+
+&{/soc/spmi@28a188000/usb-pd@6/connector/ports/port@2} {
+};
+
+&{/soc/spmi@28a188000/usb-pd@6/connector/ports/port@2/endpoint} {
+	remote-endpoint = <&{/soc/dcp@2b2e00000/typec-routes/route@2/port/endpoint}>;
+};
+
+&{/soc/usb@382280000} {
+	iommus = <&{/soc/iommu@382f00000} 0x0 &{/soc/iommu@382f80000} 0x1>;
+	power-domains = <&{/soc/power-management@288300000/power-controller@180}>;
+	resets = <&{/soc/phy@383000000} 0x0>;
+	phys = <&{/soc/phy@383000000} 0x3 &{/soc/phy@383000000} 0x4>;
+};
+
+&{/soc/usb@382280000/port} {
+};
+
+&{/soc/usb@382280000/port/endpoint} {
+	remote-endpoint = <&{/soc/spmi@28a188000/usb-pd@8/connector/ports/port@0/endpoint}>;
+};
+
+&{/soc/iommu@382f00000} {
+	power-domains = <&{/soc/power-management@288300000/power-controller@180}>;
+};
+
+&{/soc/iommu@382f80000} {
+	power-domains = <&{/soc/power-management@288300000/power-controller@180}>;
+};
+
+&{/soc/mailbox@38b148000} {
+	status = "okay";
+};
+
+&{/soc/phy@38b000000} {
+	mboxes = <&{/soc/mailbox@38b148000}>;
+	power-domains = <&{/soc/power-management@288300000/power-controller@190} &{/soc/power-management@280600000/power-controller@240} &{/soc/power-management@288300000/power-controller@1a0} &{/soc/power-management@288300000/power-controller@198}>;
+};
+
+&{/soc/phy@38b000000/port} {
+};
+
+&{/soc/phy@38b000000/port/endpoint} {
+	remote-endpoint = <&{/soc/spmi@28a188000/usb-pd@6/connector/ports/port@1/endpoint}>;
+};
+
+&{/soc/usb@38a280000} {
+	iommus = <&{/soc/iommu@38af00000} 0x0 &{/soc/iommu@38af80000} 0x1>;
+	power-domains = <&{/soc/power-management@288300000/power-controller@198}>;
+	resets = <&{/soc/phy@38b000000} 0x0>;
+	phys = <&{/soc/phy@38b000000} 0x3 &{/soc/phy@38b000000} 0x4>;
+};
+
+&{/soc/usb@38a280000/port} {
+};
+
+&{/soc/usb@38a280000/port/endpoint} {
+	remote-endpoint = <&{/soc/spmi@28a188000/usb-pd@6/connector/ports/port@0/endpoint}>;
+};
+
+&{/soc/iommu@38af00000} {
+	power-domains = <&{/soc/power-management@288300000/power-controller@198}>;
+};
+
+&{/soc/iommu@38af80000} {
+	power-domains = <&{/soc/power-management@288300000/power-controller@198}>;
+};
+
+&{/soc/spmi@28a1c8000} {
+};
+
+&{/soc/pinctrl@29c000000} {
+	gpio-ranges = <&{/soc/pinctrl@29c000000} 0x0 0x0 0xdd>;
+	interrupt-parent = <&{/soc/interrupt-controller@280400000}>;
+};
+
+&{/soc/i2c@505014000} {
+	clocks = <&{/clock-ref}>;
+	interrupt-parent = <&{/soc/interrupt-controller@280400000}>;
+	power-domains = <&{/soc/power-management@280900000/power-controller@2c8}>;
+};
+
+&{/soc/i2c@505014000/codec@38} {
+	shutdown-gpios = <&{/soc/pinctrl@29c000000} 0x6b 0x0>;
+	interrupts-extended = <&{/soc/pinctrl@29c000000} 0x6a 0x8>;
+};
+
+&{/soc/i2c@505018000} {
+	clocks = <&{/clock-ref}>;
+	interrupt-parent = <&{/soc/interrupt-controller@280400000}>;
+	power-domains = <&{/soc/power-management@280900000/power-controller@2d0}>;
+};
+
+&{/soc/i2c@505018000/codec@4b} {
+	reset-gpios = <&{/soc/pinctrl@29c000000} 0x8b 0x0>;
+	interrupts-extended = <&{/soc/pinctrl@29c000000} 0x86 0x8>;
+};
+
+&{/soc/pwm@505040000} {
+	clocks = <&{/clock-ref}>;
+	power-domains = <&{/soc/power-management@280900000/power-controller@2a8}>;
+};
+
+&{/soc/pwm@505044000} {
+	clocks = <&{/clock-ref}>;
+	power-domains = <&{/soc/power-management@280900000/power-controller@2b0}>;
+};
+
+&{/soc/pwm@505048000} {
+	clocks = <&{/clock-ref}>;
+	power-domains = <&{/soc/power-management@280900000/power-controller@2b8}>;
+};
+
+&{/soc/spi@505118000} {
+	clocks = <&{/clock-405m}>;
+	interrupt-parent = <&{/soc/interrupt-controller@280400000}>;
+	power-domains = <&{/soc/power-management@280900000/power-controller@350}>;
+};
+
+&{/soc/spi@505118000/flash@0} {
+};
+
+&{/soc/spi@505118000/flash@0/partitions} {
+};
+
+&{/soc/spi@505118000/flash@0/partitions/partition@700000} {
+};
+
+&{/soc/mailbox@290608000} {
+};
+
+&{/soc/iommu@290fc0000} {
+	interrupt-parent = <&{/soc/interrupt-controller@280400000}>;
+};
+
+&{/soc/dma-controller@293800000} {
+	interrupts-extended = <&{/soc/interrupt-controller@280400000} 0x0 0x0 0x27d 0x4 0 0 0>;
+	iommus = <&{/soc/iommu@290fc0000} 0x8>;
+};
+
+&{/soc/aop@290c00000} {
+	mboxes = <&{/soc/mailbox@290608000}>;
+	iommus = <&{/soc/iommu@290fc0000} 0x0>;
+};
+
+&{/soc/aop@290c00000/audio} {
+	dmas = <&{/soc/dma-controller@293800000} 0x4 &{/soc/dma-controller@293800000} 0x5 &{/soc/dma-controller@293800000} 0x0 &{/soc/dma-controller@293800000} 0x1>;
+};
+
+&{/soc/mailbox@2a1108000} {
+};
+
+&{/soc/acio@2a1ac0000} {
+	mboxes = <&{/soc/mailbox@2a1108000}>;
+	resets = <&{/soc/reset-controller@280620000} 0x0>;
+	power-domains = <&{/soc/power-management@280600000/power-controller@280} &{/soc/power-management@280600000/power-controller@338} &{/soc/power-management@280600000/power-controller@340} &{/soc/power-management@280600000/power-controller@348}>;
+	pinctrl-0 = <&{/soc/pinctrl@290824000/acio0-lstx-pins}>;
+	lstx-gpios = <&{/soc/pinctrl@290824000} 0x4d 0x0>;
+	apple,tunable-pcie-adapter = <0x1008 0x6 0x6>;
+	apple,tunable-router-ap-fw = <0x8 0xff2 0x482>;
+};
+
+&{/soc/acio@2a1ac0000/iommu@a80000} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@280}>;
+};
+
+&{/soc/acio@2a1ac0000/nhi@f00000} {
+	iommus = <&{/soc/acio@2a1ac0000/iommu@a80000} 0x0 &{/soc/acio@2a1ac0000/iommu@a80000} 0x1 &{/soc/acio@2a1ac0000/iommu@a80000} 0x2 &{/soc/acio@2a1ac0000/iommu@a80000} 0x3 &{/soc/acio@2a1ac0000/iommu@a80000} 0x4 &{/soc/acio@2a1ac0000/iommu@a80000} 0x5 &{/soc/acio@2a1ac0000/iommu@a80000} 0x6 &{/soc/acio@2a1ac0000/iommu@a80000} 0x7 &{/soc/acio@2a1ac0000/iommu@a80000} 0x8 &{/soc/acio@2a1ac0000/iommu@a80000} 0x9 &{/soc/acio@2a1ac0000/iommu@a80000} 0xa &{/soc/acio@2a1ac0000/iommu@a80000} 0xb &{/soc/acio@2a1ac0000/iommu@a80000} 0x10 &{/soc/acio@2a1ac0000/iommu@a80000} 0x11 &{/soc/acio@2a1ac0000/iommu@a80000} 0x12 &{/soc/acio@2a1ac0000/iommu@a80000} 0x13 &{/soc/acio@2a1ac0000/iommu@a80000} 0x14 &{/soc/acio@2a1ac0000/iommu@a80000} 0x15 &{/soc/acio@2a1ac0000/iommu@a80000} 0x16 &{/soc/acio@2a1ac0000/iommu@a80000} 0x17 &{/soc/acio@2a1ac0000/iommu@a80000} 0x18 &{/soc/acio@2a1ac0000/iommu@a80000} 0x19 &{/soc/acio@2a1ac0000/iommu@a80000} 0x1a &{/soc/acio@2a1ac0000/iommu@a80000} 0x1b>;
+};
+
+&{/soc/acio@2a1ac0000/ports} {
+};
+
+&{/soc/acio@2a1ac0000/ports/port@1} {
+};
+
+&{/soc/acio@2a1ac0000/ports/port@1/endpoint} {
+	remote-endpoint = <&{/soc/spmi@28a188000/usb-pd@c/connector/ports/port@3/endpoint}>;
+};
+
+&{/soc/mailbox@2a9108000} {
+};
+
+&{/soc/acio@2a9ac0000} {
+	mboxes = <&{/soc/mailbox@2a9108000}>;
+	resets = <&{/soc/reset-controller@280620000} 0x1>;
+	power-domains = <&{/soc/power-management@280600000/power-controller@290} &{/soc/power-management@280600000/power-controller@350} &{/soc/power-management@280600000/power-controller@358} &{/soc/power-management@280600000/power-controller@360}>;
+	pinctrl-0 = <&{/soc/pinctrl@290824000/acio1-lstx-pins}>;
+	lstx-gpios = <&{/soc/pinctrl@290824000} 0x4f 0x0>;
+	apple,tunable-pcie-adapter = <0x1008 0x6 0x6>;
+	apple,tunable-router-ap-fw = <0x8 0xff2 0x482>;
+};
+
+&{/soc/acio@2a9ac0000/iommu@a80000} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@290}>;
+};
+
+&{/soc/acio@2a9ac0000/nhi@f00000} {
+	iommus = <&{/soc/acio@2a9ac0000/iommu@a80000} 0x0 &{/soc/acio@2a9ac0000/iommu@a80000} 0x1 &{/soc/acio@2a9ac0000/iommu@a80000} 0x2 &{/soc/acio@2a9ac0000/iommu@a80000} 0x3 &{/soc/acio@2a9ac0000/iommu@a80000} 0x4 &{/soc/acio@2a9ac0000/iommu@a80000} 0x5 &{/soc/acio@2a9ac0000/iommu@a80000} 0x6 &{/soc/acio@2a9ac0000/iommu@a80000} 0x7 &{/soc/acio@2a9ac0000/iommu@a80000} 0x8 &{/soc/acio@2a9ac0000/iommu@a80000} 0x9 &{/soc/acio@2a9ac0000/iommu@a80000} 0xa &{/soc/acio@2a9ac0000/iommu@a80000} 0xb &{/soc/acio@2a9ac0000/iommu@a80000} 0x10 &{/soc/acio@2a9ac0000/iommu@a80000} 0x11 &{/soc/acio@2a9ac0000/iommu@a80000} 0x12 &{/soc/acio@2a9ac0000/iommu@a80000} 0x13 &{/soc/acio@2a9ac0000/iommu@a80000} 0x14 &{/soc/acio@2a9ac0000/iommu@a80000} 0x15 &{/soc/acio@2a9ac0000/iommu@a80000} 0x16 &{/soc/acio@2a9ac0000/iommu@a80000} 0x17 &{/soc/acio@2a9ac0000/iommu@a80000} 0x18 &{/soc/acio@2a9ac0000/iommu@a80000} 0x19 &{/soc/acio@2a9ac0000/iommu@a80000} 0x1a &{/soc/acio@2a9ac0000/iommu@a80000} 0x1b>;
+};
+
+&{/soc/acio@2a9ac0000/ports} {
+};
+
+&{/soc/acio@2a9ac0000/ports/port@1} {
+};
+
+&{/soc/acio@2a9ac0000/ports/port@1/endpoint} {
+	remote-endpoint = <&{/soc/spmi@28a188000/usb-pd@a/connector/ports/port@3/endpoint}>;
+};
+
+&{/soc/mailbox@389108000} {
+};
+
+&{/soc/acio@389ac0000} {
+	mboxes = <&{/soc/mailbox@389108000}>;
+	resets = <&{/soc/reset-controller@280620000} 0x3>;
+	power-domains = <&{/soc/power-management@280600000/power-controller@2f8} &{/soc/power-management@280600000/power-controller@410} &{/soc/power-management@280600000/power-controller@418} &{/soc/power-management@280600000/power-controller@420}>;
+	pinctrl-0 = <&{/soc/pinctrl@290824000/acio3-lstx-pins}>;
+	lstx-gpios = <&{/soc/pinctrl@290824000} 0x53 0x0>;
+	apple,tunable-pcie-adapter = <0x1008 0x6 0x6>;
+	apple,tunable-router-ap-fw = <0x8 0xff2 0x482>;
+};
+
+&{/soc/acio@389ac0000/iommu@a80000} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@2f8}>;
+};
+
+&{/soc/acio@389ac0000/nhi@f00000} {
+	iommus = <&{/soc/acio@389ac0000/iommu@a80000} 0x0 &{/soc/acio@389ac0000/iommu@a80000} 0x1 &{/soc/acio@389ac0000/iommu@a80000} 0x2 &{/soc/acio@389ac0000/iommu@a80000} 0x3 &{/soc/acio@389ac0000/iommu@a80000} 0x4 &{/soc/acio@389ac0000/iommu@a80000} 0x5 &{/soc/acio@389ac0000/iommu@a80000} 0x6 &{/soc/acio@389ac0000/iommu@a80000} 0x7 &{/soc/acio@389ac0000/iommu@a80000} 0x8 &{/soc/acio@389ac0000/iommu@a80000} 0x9 &{/soc/acio@389ac0000/iommu@a80000} 0xa &{/soc/acio@389ac0000/iommu@a80000} 0xb &{/soc/acio@389ac0000/iommu@a80000} 0x10 &{/soc/acio@389ac0000/iommu@a80000} 0x11 &{/soc/acio@389ac0000/iommu@a80000} 0x12 &{/soc/acio@389ac0000/iommu@a80000} 0x13 &{/soc/acio@389ac0000/iommu@a80000} 0x14 &{/soc/acio@389ac0000/iommu@a80000} 0x15 &{/soc/acio@389ac0000/iommu@a80000} 0x16 &{/soc/acio@389ac0000/iommu@a80000} 0x17 &{/soc/acio@389ac0000/iommu@a80000} 0x18 &{/soc/acio@389ac0000/iommu@a80000} 0x19 &{/soc/acio@389ac0000/iommu@a80000} 0x1a &{/soc/acio@389ac0000/iommu@a80000} 0x1b>;
+};
+
+&{/soc/acio@389ac0000/ports} {
+};
+
+&{/soc/acio@389ac0000/ports/port@1} {
+};
+
+&{/soc/acio@389ac0000/ports/port@1/endpoint} {
+	remote-endpoint = <&{/soc/spmi@28a188000/usb-pd@6/connector/ports/port@3/endpoint}>;
+};
+
+&{/soc/mailbox@294608000} {
+};
+
+&{/soc/iommu@294800000} {
+	/delete-property/ status;
+};
+
+&{/soc/mtp@294600000} {
+	mboxes = <&{/soc/mailbox@294608000}>;
+	iommus = <&{/soc/iommu@294800000} 0x0>;
+};
+
+&{/soc/fifo@294b14000} {
+};
+
+&{/soc/mailbox@381108000} {
+};
+
+&{/soc/acio@381ac0000} {
+	mboxes = <&{/soc/mailbox@381108000}>;
+	resets = <&{/soc/reset-controller@280620000} 0x2>;
+	power-domains = <&{/soc/power-management@280600000/power-controller@2e8} &{/soc/power-management@280600000/power-controller@3f8} &{/soc/power-management@280600000/power-controller@400} &{/soc/power-management@280600000/power-controller@408}>;
+	pinctrl-0 = <&{/soc/pinctrl@290824000/acio2-lstx-pins}>;
+	lstx-gpios = <&{/soc/pinctrl@290824000} 0x51 0x0>;
+	apple,tunable-pcie-adapter = <0x1008 0x6 0x6>;
+	apple,tunable-router-ap-fw = <0x8 0xff2 0x482>;
+};
+
+&{/soc/acio@381ac0000/iommu@a80000} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@2e8}>;
+};
+
+&{/soc/acio@381ac0000/nhi@f00000} {
+	iommus = <&{/soc/acio@381ac0000/iommu@a80000} 0x0 &{/soc/acio@381ac0000/iommu@a80000} 0x1 &{/soc/acio@381ac0000/iommu@a80000} 0x2 &{/soc/acio@381ac0000/iommu@a80000} 0x3 &{/soc/acio@381ac0000/iommu@a80000} 0x4 &{/soc/acio@381ac0000/iommu@a80000} 0x5 &{/soc/acio@381ac0000/iommu@a80000} 0x6 &{/soc/acio@381ac0000/iommu@a80000} 0x7 &{/soc/acio@381ac0000/iommu@a80000} 0x8 &{/soc/acio@381ac0000/iommu@a80000} 0x9 &{/soc/acio@381ac0000/iommu@a80000} 0xa &{/soc/acio@381ac0000/iommu@a80000} 0xb &{/soc/acio@381ac0000/iommu@a80000} 0x10 &{/soc/acio@381ac0000/iommu@a80000} 0x11 &{/soc/acio@381ac0000/iommu@a80000} 0x12 &{/soc/acio@381ac0000/iommu@a80000} 0x13 &{/soc/acio@381ac0000/iommu@a80000} 0x14 &{/soc/acio@381ac0000/iommu@a80000} 0x15 &{/soc/acio@381ac0000/iommu@a80000} 0x16 &{/soc/acio@381ac0000/iommu@a80000} 0x17 &{/soc/acio@381ac0000/iommu@a80000} 0x18 &{/soc/acio@381ac0000/iommu@a80000} 0x19 &{/soc/acio@381ac0000/iommu@a80000} 0x1a &{/soc/acio@381ac0000/iommu@a80000} 0x1b>;
+};
+
+&{/soc/acio@381ac0000/ports} {
+};
+
+&{/soc/acio@381ac0000/ports/port@1} {
+};
+
+&{/soc/acio@381ac0000/ports/port@1/endpoint} {
+	remote-endpoint = <&{/soc/spmi@28a188000/usb-pd@8/connector/ports/port@3/endpoint}>;
+};
+
+&{/soc/sep@502600000} {
+	mboxes = <&{/soc/mailbox@502608000}>;
+	iommus = <&{/soc/iommu@500b80000} 0x0>;
+	power-domains = <&{/soc/power-management@280900000/power-controller@298}>;
+	clocks = <&{/soc/clock-controller@280600000} 0x1bf>;
+};
+
+&{/soc/mailbox@502608000} {
+};
+
+&{/soc/iommu@500b80000} {
+};
+
+&{/soc/mailbox@2a3148000} {
+};
+
+&{/soc/phy@2a3000000} {
+	mboxes = <&{/soc/mailbox@2a3148000}>;
+	power-domains = <&{/soc/power-management@288300000/power-controller@148} &{/soc/power-management@280600000/power-controller@208} &{/soc/power-management@288300000/power-controller@158} &{/soc/power-management@288300000/power-controller@150}>;
+};
+
+&{/soc/phy@2a3000000/port} {
+};
+
+&{/soc/phy@2a3000000/port/endpoint} {
+	remote-endpoint = <&{/soc/spmi@28a188000/usb-pd@c/connector/ports/port@1/endpoint}>;
+};
+
+&{/pcie@1cb0000000} {
+	msi-parent = <&{/pcie@1cb0000000}>;
+	iommu-map = <0x100 &{/soc/iommu@412000000} 0x1 0x1 0x200 &{/soc/iommu@413000000} 0x1 0x1 0x300 &{/soc/iommu@410000000} 0x1 0x3 0x400 &{/soc/iommu@411000000} 0x1 0x1>;
+};
+
+&{/pcie@1cb0000000/pci@2,0} {
+	interrupt-map = <0x0 0x0 0x0 0x1 &{/pcie@1cb0000000/pci@2,0} 0x0 0x0 0x0 0x0 0x0 0x0 0x0 0x2 &{/pcie@1cb0000000/pci@2,0} 0x0 0x0 0x0 0x1 0x0 0x0 0x0 0x3 &{/pcie@1cb0000000/pci@2,0} 0x0 0x0 0x0 0x2 0x0 0x0 0x0 0x4 &{/pcie@1cb0000000/pci@2,0} 0x0 0x0 0x0 0x3>;
+};
+
+&{/pcie@1cb0000000/pci@2,0/ethernet@0,0} {
+};
+
+&{/pcie@1cb0000000/pci@3,0} {
+	interrupt-map = <0x0 0x0 0x0 0x1 &{/pcie@1cb0000000/pci@3,0} 0x0 0x0 0x0 0x0 0x0 0x0 0x0 0x2 &{/pcie@1cb0000000/pci@3,0} 0x0 0x0 0x0 0x1 0x0 0x0 0x0 0x3 &{/pcie@1cb0000000/pci@3,0} 0x0 0x0 0x0 0x2 0x0 0x0 0x0 0x4 &{/pcie@1cb0000000/pci@3,0} 0x0 0x0 0x0 0x3>;
+};
+
+&{/pcie@1cb0000000/pci@0,0} {
+	reset-gpios = <&{/soc/pinctrl@29c000000} 0x50 0x1>;
+	interrupt-map = <0x0 0x0 0x0 0x1 &{/pcie@1cb0000000/pci@0,0} 0x0 0x0 0x0 0x0 0x0 0x0 0x0 0x2 &{/pcie@1cb0000000/pci@0,0} 0x0 0x0 0x0 0x1 0x0 0x0 0x0 0x3 &{/pcie@1cb0000000/pci@0,0} 0x0 0x0 0x0 0x2 0x0 0x0 0x0 0x4 &{/pcie@1cb0000000/pci@0,0} 0x0 0x0 0x0 0x3>;
+};
+
+&{/pcie@1cb0000000/pci@0,0/control@0,0} {
+};
+
+&{/pcie@1cb0000000/pci@0,0/wifi@0,1} {
+};
+
+&{/pcie@1cb0000000/pci@0,0/bluetooth@0,2} {
+};
+
+&{/pcie@1cb0000000/pci@1,0} {
+	interrupt-map = <0x0 0x0 0x0 0x1 &{/pcie@1cb0000000/pci@1,0} 0x0 0x0 0x0 0x0 0x0 0x0 0x0 0x2 &{/pcie@1cb0000000/pci@1,0} 0x0 0x0 0x0 0x1 0x0 0x0 0x0 0x3 &{/pcie@1cb0000000/pci@1,0} 0x0 0x0 0x0 0x2 0x0 0x0 0x0 0x4 &{/pcie@1cb0000000/pci@1,0} 0x0 0x0 0x0 0x3>;
+};
+
+&{/pcie@1cb0000000/pci@1,0/sdcard@0,0} {
+};
+
+&{/aliases} {
+	serial0 = "/soc/serial@288e3c000";
+	nvram = "/soc/spi@505118000/flash@0/partitions/partition@700000";
+	atcphy0 = "/soc/phy@2a3000000";
+	atcphy1 = "/soc/phy@2ab000000";
+	atcphy2 = "/soc/phy@383000000";
+	atcphy3 = "/soc/phy@38b000000";
+	usb4-0-acio = "/soc/acio@2a1ac0000";
+	usb4-0-nhi = "/soc/acio@2a1ac0000/nhi@f00000";
+	usb4-1-acio = "/soc/acio@2a9ac0000";
+	usb4-1-nhi = "/soc/acio@2a9ac0000/nhi@f00000";
+	usb4-2-acio = "/soc/acio@381ac0000";
+	usb4-2-nhi = "/soc/acio@381ac0000/nhi@f00000";
+	usb4-3-acio = "/soc/acio@389ac0000";
+	usb4-3-nhi = "/soc/acio@389ac0000/nhi@f00000";
+};
+
+&{/chosen} {
+	/delete-property/ bootargs;
+};
+
+&{/soc/power-management@2380600000} {
+};
+
+&{/soc/power-management@2380600000/power-controller@1b0} {
+};
+
+&{/soc/power-management@2380600000/power-controller@1d8} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1b0}>;
+};
+
+&{/soc/power-management@2380600000/power-controller@1a0} {
+};
+
+&{/soc/power-management@2380600000/power-controller@1a8} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1a0}>;
+};
+
+&{/soc/power-management@2380600000/power-controller@1b8} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1a0}>;
+};
+
+&{/soc/power-management@2380600000/power-controller@1c0} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1a8}>;
+};
+
+&{/soc/power-management@2380600000/power-controller@1c8} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1a8}>;
+};
+
+&{/soc/power-management@2380600000/power-controller@1d0} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1a8}>;
+};
+
+&{/soc/power-management@2380600000/power-controller@1e0} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1b0}>;
+};
+
+&{/soc/power-management@2380600000/power-controller@1f0} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1b8}>;
+};
+
+&{/soc/power-management@2380600000/power-controller@1f8} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1b8}>;
+};
+
+&{/soc/power-management@2380600000/power-controller@200} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1c8}>;
+};
+
+&{/soc/power-management@2380600000/power-controller@208} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1f8}>;
+};
+
+&{/soc/power-management@2380600000/power-controller@8000} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1c0}>;
+};
+
+&{/soc/power-management@2380600000/power-controller@8008} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@8000}>;
+};
+
+&{/soc/power-management@2380600000/power-controller@8010} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@8000}>;
+};
+
+&{/soc/power-management@2380600000/power-controller@8018} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@8000}>;
+};
+
+&{/soc/power-management@2380600000/power-controller@8020} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@8018}>;
+};
+
+&{/soc/power-management@2380600000/power-controller@8028} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1f0}>;
+};
+
+&{/soc/power-management@2380600000/power-controller@8030} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@8028}>;
+};
+
+&{/soc/power-management@2380600000/power-controller@8038} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@8028}>;
+};
+
+&{/soc/power-management@2380600000/power-controller@8040} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@8028}>;
+};
+
+&{/soc/power-management@2380600000/power-controller@8048} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@8040}>;
+};
+
+&{/soc/iommu@2309020000} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1d8}>;
+	status = "disabled";
+};
+
+&{/soc@2300000000/power-management@2300e80000} {
+};
+
+&{/soc@2300000000/power-management@2300e80000/power-controller@0} {
+};
+
+&{/soc@2300000000/power-management@2300e80000/power-controller@100} {
+};
+
+&{/soc@2300000000/power-management@2300e80000/power-controller@110} {
+	power-domains = <&{/soc@2300000000/power-management@2300e80000/power-controller@100} &{/soc@2300000000/power-management@2300e80000/power-controller@0}>;
+};
+
+&{/soc/clock-controller@280600000} {
+	apple,pmgr = <&{/soc/power-management@280600000}>;
+};
+
+&{/soc/spmi@28a054000} {
+};
+
+&{/soc/spmi@28a114000} {
+};
+
+&{/soc/i2c@505024000} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@2e8}>;
+	clocks = <&{/soc/clock-controller@280600000} 0x4>;
+};
+
+&{/soc/i2c@505010000} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@2c0}>;
+	clocks = <&{/soc/clock-controller@280600000} 0x4>;
+};
+
+&{/soc/i2c@505020000} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@2e0}>;
+	clocks = <&{/soc/clock-controller@280600000} 0x4>;
+};
+
+&{/soc/i2c@505028000} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@2f0}>;
+	clocks = <&{/soc/clock-controller@280600000} 0x4>;
+};
+
+&{/soc/i2c@505030000} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@300}>;
+	clocks = <&{/soc/clock-controller@280600000} 0x4>;
+};
+
+&{/soc/dma-controller@410030000} {
+	iommus = <&{/soc/iommu@410000000} 0x11>;
+};
+
+&{/soc/iommu@411000000} {
+};
+
+&{/soc/dma-controller@411030000} {
+	iommus = <&{/soc/iommu@411000000} 0x11>;
+};
+
+&{/soc/iommu@2a4000000} {
+};
+
+&{/soc/dma-controller@2a4068000} {
+	iommus = <&{/soc/iommu@2a4000000} 0xfe>;
+};
+
+&{/soc/iommu@2ac000000} {
+};
+
+&{/soc/dma-controller@2ac068000} {
+	iommus = <&{/soc/iommu@2ac000000} 0xfe>;
+};
+
+&{/soc/iommu@384000000} {
+};
+
+&{/soc/dma-controller@384068000} {
+	iommus = <&{/soc/iommu@384000000} 0xfe>;
+};
+
+&{/soc/mux@2a324c000} {
+};
+
+&{/soc/dpin@2a1e50000} {
+};
+
+&{/soc/dpin@2a1e58000} {
+};
+
+&{/soc/dpin@2a1e68000} {
+};
+
+&{/soc/dpin@2a1e70000} {
+};
+
+&{/soc/mux@2ab24c000} {
+};
+
+&{/soc/dpin@2a9e50000} {
+};
+
+&{/soc/dpin@2a9e58000} {
+};
+
+&{/soc/dpin@2a9e68000} {
+};
+
+&{/soc/dpin@2a9e70000} {
+};
+
+&{/soc/dpin@381e50000} {
+};
+
+&{/soc/dpin@381e58000} {
+};
+
+&{/soc/dpin@381e68000} {
+};
+
+&{/soc/dpin@381e70000} {
+};
+
+&{/soc/mux@38b24c000} {
+};
+
+&{/soc/aic-timebase@280580000} {
+};
+
+&{/soc/error-handler@2220000000} {
+};
+
+&{/soc/crypto@50500c000} {
+	iommus = <&{/soc/iommu@505060000} 0x1>;
+	power-domains = <&{/soc/power-management@280900000/power-controller@318}>;
+};
+
+&{/soc/phy-coproc@395d08000} {
+};
+
+&{/soc/pinctrl@2881e4000} {
+	/delete-property/ gpio-line-names;
+	/delete-property/ interrupt-parent;
+	status = "okay";
+	gpio-ranges = <&{/soc/pinctrl@2881e4000} 0x0 0x0 0x3d>;
+};
+
+&{/soc/pinctrl@2881e4000/usb3hub-rst-hog} {
+};
+
+&{/soc/mailbox@4d067c000} {
+	iommus = <&{/soc/iommu@290fc0000} 0x1>;
+};
+
+&{/soc/aop@291600000} {
+	iommus = <&{/soc/iommu@290fc0000} 0x10>;
+};
+
+&{/soc/event-log@280040000} {
+};
+
+&{/soc/dma-controller@505e00000} {
+	iommus = <&{/soc/iommu@505060000} 0x0>;
+	power-domains = <&{/soc/power-management@280900000/power-controller@2a0}>;
+	clocks = <&{/soc/clock-controller@280600000} 0x167 &{/soc/clock-controller@280600000} 0x166>;
+};
+
+&{/soc/iommu@505060000} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@290}>;
+};
+
+&{/soc/pmp@284e00000} {
+	mboxes = <&{/soc/mailbox@284e08000}>;
+	iommus = <&{/soc/iommu@2841a0000} 0x0>;
+	power-domains = <&{/soc/power-management@280600000/power-controller@128} &{/soc/power-management@280600000/power-controller@130}>;
+};
+
+&{/soc/mailbox@284e08000} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@128}>;
+};
+
+&{/soc/pmp-report@284240000} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@130}>;
+};
+
+&{/soc/pmp-report@284240000/report@c} {
+};
+
+&{/soc/pmp-report@284240000/report@d} {
+};
+
+&{/soc/pmp-report@284240000/report@e} {
+};
+
+&{/soc/pmp-report@284240000/report@f} {
+	power-domains = <&{/soc@2300000000/power-management@2300e80000/power-controller@110}>;
+};
+
+&{/soc/pmp-report@284240000/report@12} {
+};
+
+&{/soc/pmp-report@284240000/report@24} {
+};
+
+&{/soc/iommu@2841a0000} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@128}>;
+};
+
+&{/soc/aon-ptd@28cdc0000} {
+};
+
+&{/soc/rsm@288825000} {
+	iommus = <&{/soc/iommu@2889a0000} 0x0>;
+	power-domains = <&{/soc/power-management@288300000/power-controller@58}>;
+};
+
+&{/soc/iommu@2889a0000} {
+};
+
+&{/soc/serial@505200000} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@360}>;
+	clocks = <&{/soc/clock-controller@280600000} 0x1c9 &{/soc/clock-controller@280600000} 0x4>;
+};
+
+&{/soc/iommu@2a2f00000} {
+	power-domains = <&{/soc/power-management@288300000/power-controller@150}>;
+};
+
+&{/soc/iommu@2a2f80000} {
+	power-domains = <&{/soc/power-management@288300000/power-controller@150}>;
+};
+
+&{/soc/usb@2a2280000} {
+	iommus = <&{/soc/iommu@2a2f00000} 0x0 &{/soc/iommu@2a2f80000} 0x1>;
+	power-domains = <&{/soc/power-management@288300000/power-controller@150}>;
+	resets = <&{/soc/phy@2a3000000} 0x0>;
+	phys = <&{/soc/phy@2a3000000} 0x3 &{/soc/phy@2a3000000} 0x4>;
+};
+
+&{/soc/usb@2a2280000/port} {
+};
+
+&{/soc/usb@2a2280000/port/endpoint} {
+	remote-endpoint = <&{/soc/spmi@28a188000/usb-pd@c/connector/ports/port@0/endpoint}>;
+};
+
+&{/soc/iommu@395d60000} {
+};
+
+&{/soc/usb@3953f0000} {
+	iommus = <&{/soc/iommu@395d60000} 0x0>;
+	power-domains = <&{/soc/power-management@280600000/power-controller@248}>;
+};
+
+&{/soc/spmi@28a094000} {
+};
+
+&{/soc/spmi@28a0d4000} {
+};
+
+&{/soc/spmi@290914000} {
+};
+
+&{/soc/aux@29c260000} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@108}>;
+};
+
+&{/soc/aux@29c264000} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@110}>;
+};
+
+&{/soc/iommu@48a300000} {
+};
+
+&{/soc/dcp-expert@48a3ac058} {
+};
+
+&{/soc/mailbox@48ae08000} {
+};
+
+&{/soc/iommu@48a340000} {
+};
+
+&{/soc/iommu@48a180000} {
+};
+
+&{/soc/dma-controller@48a140000} {
+	interrupts-extended = <&{/soc/interrupt-controller@280400000} 0x0 0x0 0x3f4 0x4 0 0 0>;
+	iommus = <&{/soc/iommu@48a180000} 0x1e>;
+};
+
+&{/soc/dma-control@48a2f4000} {
+};
+
+&{/soc/dcp-expert@2b23ac058} {
+};
+
+&{/soc/iommu@2b2180000} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@270}>;
+};
+
+&{/soc/dma-controller@2b2140000} {
+	interrupts-extended = <&{/soc/interrupt-controller@280400000} 0x0 0x0 0x444 0x4 0 0 0>;
+	iommus = <&{/soc/iommu@2b2180000} 0x1e>;
+	power-domains = <&{/soc/power-management@280600000/power-controller@270}>;
+};
+
+&{/soc/dma-control@2b22f4000} {
+};
+
+&{/soc/dcp-expert@3923ac058} {
+};
+
+&{/soc/mailbox@392e08000} {
+};
+
+&{/soc/dcp@392e00000} {
+	mboxes = <&{/soc/mailbox@392e08000}>;
+	iommus = <&{/soc/iommu@392340000} 0x17>;
+	apple,bw-scratch = <&{/soc/pmc-metadata@286700000} 0x0 0x5 0x30000>;
+	phys = <&{/soc/phy@29c200000}>;
+	hdmi-hpd-gpios = <&{/soc/pinctrl@290824000} 0xe 0x0>;
+	hdmi-pwren-gpios = <&{/soc/smc@28c600000/gpio} 0x0 0x0>;
+	dp2hdmi-pwren-gpios = <&{/soc/smc@28c600000/gpio} 0x1 0x0>;
+};
+
+&{/soc/dcp@392e00000/piodma} {
+	iommus = <&{/soc/iommu@392300000} 0x10>;
+};
+
+&{/soc/dcp@392e00000/ports} {
+};
+
+&{/soc/dcp@392e00000/ports/port@0} {
+};
+
+&{/soc/dcp@392e00000/ports/port@0/endpoint} {
+	remote-endpoint = <&{/audio-controller-dispext1/ports/port@0/endpoint}>;
+};
+
+&{/soc/iommu@392340000} {
+};
+
+&{/soc/iommu@392300000} {
+};
+
+&{/soc/iommu@392180000} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@2d8}>;
+};
+
+&{/soc/dma-controller@392140000} {
+	interrupts-extended = <&{/soc/interrupt-controller@280400000} 0x0 0x0 0x48c 0x4 0 0 0>;
+	iommus = <&{/soc/iommu@392180000} 0x1e>;
+	power-domains = <&{/soc/power-management@280600000/power-controller@2d8}>;
+};
+
+&{/soc/dma-control@3922f4000} {
+};
+
+&{/soc/dcp-expert@3023ac058} {
+};
+
+&{/soc/mailbox@302e08000} {
+};
+
+&{/soc/dcp@302e00000} {
+	mboxes = <&{/soc/mailbox@302e08000}>;
+	iommus = <&{/soc/iommu@302340000} 0x17>;
+};
+
+&{/soc/dcp@302e00000/piodma} {
+	iommus = <&{/soc/iommu@302300000} 0x10>;
+};
+
+&{/soc/iommu@302340000} {
+};
+
+&{/soc/iommu@302300000} {
+};
+
+&{/soc/iommu@302180000} {
+};
+
+&{/soc/dma-controller@302140000} {
+	interrupts-extended = <&{/soc/interrupt-controller@280400000} 0x0 0x0 0x4d4 0x4 0 0 0>;
+	iommus = <&{/soc/iommu@302180000} 0x1e>;
+};
+
+&{/soc/dma-control@3022f4000} {
+};
+
+&{/soc/dcp-expert@3063ac058} {
+};
+
+&{/soc/mailbox@306e08000} {
+};
+
+&{/soc/dcp@306e00000} {
+	mboxes = <&{/soc/mailbox@306e08000}>;
+	iommus = <&{/soc/iommu@306340000} 0x17>;
+};
+
+&{/soc/dcp@306e00000/piodma} {
+	iommus = <&{/soc/iommu@306300000} 0x10>;
+};
+
+&{/soc/iommu@306340000} {
+};
+
+&{/soc/iommu@306300000} {
+};
+
+&{/soc/iommu@306180000} {
+};
+
+&{/soc/dma-controller@306140000} {
+	interrupts-extended = <&{/soc/interrupt-controller@280400000} 0x0 0x0 0x51c 0x4 0 0 0>;
+	iommus = <&{/soc/iommu@306180000} 0x1e>;
+};
+
+&{/soc/dma-control@3062f4000} {
+};
+
+&{/soc/scaler@2285000000} {
+	iommus = <&{/soc/iommu@2285260000} 0x0 &{/soc/iommu@2285260000} 0x1>;
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1c8} &{/soc/power-management@2380600000/power-controller@200}>;
+	clocks = <&{/soc/clock-controller@280600000} 0x1f0>;
+	resets = <&{/soc/power-management@2380600000/power-controller@1c8}>;
+};
+
+&{/soc/iommu@2285260000} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1c8}>;
+};
+
+&{/soc/scaler@23a1000000} {
+	iommus = <&{/soc/iommu@23a1260000} 0x0 &{/soc/iommu@23a1260000} 0x1>;
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1f8} &{/soc/power-management@2380600000/power-controller@208}>;
+	clocks = <&{/soc/clock-controller@280600000} 0x1f1>;
+	resets = <&{/soc/power-management@2380600000/power-controller@1f8}>;
+};
+
+&{/soc/iommu@23a1260000} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1f8}>;
+};
+
+&{/soc/video-encoder@2283100000} {
+	iommus = <&{/soc/iommu@22830a0000} 0x0 &{/soc/iommu@2283080000} 0x0>;
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1c0} &{/soc/power-management@2380600000/power-controller@8008} &{/soc/power-management@2380600000/power-controller@8010} &{/soc/power-management@2380600000/power-controller@8018} &{/soc/power-management@2380600000/power-controller@8020} &{/soc/power-management@2380600000/power-controller@8000}>;
+	clocks = <&{/soc/clock-controller@280600000} 0x1f7>;
+};
+
+&{/soc/iommu@22830a0000} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1c0}>;
+};
+
+&{/soc/iommu@2283080000} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1c0}>;
+};
+
+&{/soc/video-encoder@23a3100000} {
+	iommus = <&{/soc/iommu@23a30a0000} 0x0 &{/soc/iommu@23a3080000} 0x0>;
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1f0} &{/soc/power-management@2380600000/power-controller@8030} &{/soc/power-management@2380600000/power-controller@8038} &{/soc/power-management@2380600000/power-controller@8040} &{/soc/power-management@2380600000/power-controller@8048} &{/soc/power-management@2380600000/power-controller@8028}>;
+	clocks = <&{/soc/clock-controller@280600000} 0x1f8>;
+};
+
+&{/soc/iommu@23a30a0000} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1f0}>;
+};
+
+&{/soc/iommu@23a3080000} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1f0}>;
+};
+
+&{/soc/prores@48d000000} {
+	iommus = <&{/soc/iommu@48d020000} 0x1>;
+	power-domains = <&{/soc/power-management@280900000/power-controller@190}>;
+};
+
+&{/soc/iommu@48d020000} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@190}>;
+};
+
+&{/soc/iommu@230b020000} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1e0}>;
+};
+
+&{/soc/jpeg@2281000000} {
+	iommus = <&{/soc/iommu@2281020000} 0x0>;
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1d0}>;
+	clocks = <&{/soc/clock-controller@280600000} 0x1e6 &{/soc/clock-controller@280600000} 0x1e7>;
+};
+
+&{/soc/jpeg@2281060000} {
+	iommus = <&{/soc/iommu@2281020000} 0x1>;
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1d0}>;
+	clocks = <&{/soc/clock-controller@280600000} 0x1e6 &{/soc/clock-controller@280600000} 0x1e7>;
+};
+
+&{/soc/iommu@2281020000} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1d0}>;
+};
+
+&{/soc/neural-processor@508000000} {
+	iommus = <&{/soc/iommu@509800000} 0x0 &{/soc/iommu@509820000} 0x0 &{/soc/iommu@509840000} 0x0>;
+	power-domains = <&{/soc/power-management@280900000/power-controller@3c8}>;
+	clocks = <&{/soc/clock-controller@280600000} 0x14f &{/soc/clock-controller@280600000} 0x14e &{/soc/clock-controller@280600000} 0x17d>;
+};
+
+&{/soc/iommu@509800000} {
+	/delete-property/ apple,dma-range;
+	/delete-property/ interrupt-parent;
+	/delete-property/ power-domains;
+	compatible = "apple,t6050-dart", "apple,t8110-dart";
+	reg = <0x5 0x9800000 0x0 0xc000 0x5 0x9810000 0x0 0x4000>;
+	status = "disabled";
+};
+
+&{/soc/iommu@509820000} {
+	/delete-property/ apple,dma-range;
+	/delete-property/ interrupt-parent;
+	/delete-property/ power-domains;
+	compatible = "apple,t6050-dart", "apple,t8110-dart";
+	status = "disabled";
+};
+
+&{/soc/iommu@509840000} {
+	/delete-property/ apple,dma-range;
+	/delete-property/ interrupt-parent;
+	/delete-property/ power-domains;
+	compatible = "apple,t6050-dart", "apple,t8110-dart";
+	status = "disabled";
+};
+
+&{/soc/video-decoder@2308000000} {
+	iommus = <&{/soc/iommu@2309020000} 0x0 &{/soc/iommu@2309020000} 0x1 &{/soc/iommu@2309020000} 0x2>;
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1d8}>;
+	clocks = <&{/soc/clock-controller@280600000} 0x1e8>;
+};
+
+&{/soc/dma-controller@293300000} {
+	interrupts-extended = <&{/soc/interrupt-controller@280400000} 0x0 0x0 0x27f 0x4 0 0 0>;
+	iommus = <&{/soc/iommu@290fc0000} 0xa>;
+};
+
+&{/soc/dma-control@293c80000} {
+};
+
+&{/soc/message-controller@29b000000} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@258}>;
+};
+
+&{/soc/dma-controller@412030000} {
+	iommus = <&{/soc/iommu@412000000} 0x11>;
+};
+
+&{/soc/dma-controller@413030000} {
+	iommus = <&{/soc/iommu@413000000} 0x11>;
+};
+
+&{/soc/spi@50510c000} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@338}>;
+	clocks = <&{/soc/clock-controller@280600000} 0x1c4>;
+};
+
+&{/soc/iommu@38c000000} {
+};
+
+&{/soc/dma-controller@38c068000} {
+	iommus = <&{/soc/iommu@38c000000} 0xfe>;
+};
+
+&{/soc/dpin@389e50000} {
+};
+
+&{/soc/dpin@389e58000} {
+};
+
+&{/soc/dpin@389e68000} {
+};
+
+&{/soc/dpin@389e70000} {
+};
+
+&{/soc/phy@29c200000} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@3f8}>;
+};
+
+&{/display-subsystem} {
+	iommus = <&{/soc/iommu@2b2300000} 0x0 &{/soc/iommu@392300000} 0x0>;
+};
+
+&{/sound} {
+};
+
+&{/sound/dai-link@0} {
+};
+
+&{/sound/dai-link@0/cpu} {
+	sound-dai = <&{/soc/aop@290c00000/audio} 0x0>;
+};
+
+&{/sound/dai-link@0/codec} {
+	sound-dai = <&{/soc/i2c@505018000/codec@4b}>;
+};
+
+&{/sound/dai-link@1} {
+};
+
+&{/sound/dai-link@1/cpu} {
+	sound-dai = <&{/soc/aop@290c00000/audio} 0x3>;
+};
+
+&{/sound/dai-link@1/codec} {
+	sound-dai = <&{/soc/i2c@505014000/codec@38}>;
+};
+
+&{/audio-controller-dispext0} {
+	dmas = <&{/soc/dma-controller@2b2140000} 0x0>;
+};
+
+&{/audio-controller-dispext0/ports} {
+};
+
+&{/audio-controller-dispext0/ports/port@0} {
+};
+
+&{/audio-controller-dispext0/ports/port@0/endpoint} {
+	remote-endpoint = <&{/soc/dcp@2b2e00000/ports/port@0/endpoint}>;
+};
+
+&{/audio-controller-dispext1} {
+	dmas = <&{/soc/dma-controller@392140000} 0x0>;
+};
+
+&{/audio-controller-dispext1/ports} {
+};
+
+&{/audio-controller-dispext1/ports/port@0} {
+};
+
+&{/audio-controller-dispext1/ports/port@0/endpoint} {
+	remote-endpoint = <&{/soc/dcp@392e00000/ports/port@0/endpoint}>;
+};
