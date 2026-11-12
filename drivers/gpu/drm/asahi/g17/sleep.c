@@ -22,13 +22,6 @@
 
 #include "sleep.h"
 
-#include <linux/moduleparam.h>
-
-/* Whether the commit stop lowers the GPU's PMGR power word itself. */
-static bool commit_lower_ps;
-module_param(commit_lower_ps, bool, 0644);
-MODULE_PARM_DESC(commit_lower_ps, "S2R commit: lower the GPU's power word in its last stop");
-
 #define PS_AUTO_ENABLE		BIT(28)
 #define PS_AUTO			GENMASK(27, 24)
 #define PS_BUSY			BIT(11)
@@ -55,16 +48,21 @@ MODULE_PARM_DESC(commit_lower_ps, "S2R commit: lower the GPU's power word in its
  * The GPU's PMP report entry: the one apple,pmp-report-entry names, or the GPU's
  * power domain where that is the entry itself (T6040: pmp-gfx).
  */
-static struct device_node *asahi_g17_pmp_entry(struct device *dev)
+static struct device_node *asahi_g17_pmp_entry(struct device *dev, bool *domain)
 {
 	struct device_node *np;
 
+	if (domain)
+		*domain = false;
 	np = of_parse_phandle(dev->of_node, "apple,pmp-report-entry", 0);
 	if (np)
 		return np;
 	np = of_parse_phandle(dev->of_node, "power-domains", 0);
-	if (np && of_device_is_compatible(np, "apple,t6000-pmp-v2-report-entry"))
+	if (np && of_device_is_compatible(np, "apple,t6000-pmp-v2-report-entry")) {
+		if (domain)
+			*domain = true;
 		return np;
+	}
 	of_node_put(np);
 
 	return NULL;
@@ -76,7 +74,7 @@ int asahi_g17_pmp_request(struct device *dev, bool enable)
 	struct device_node *np;
 	int ret;
 
-	np = asahi_g17_pmp_entry(dev);
+	np = asahi_g17_pmp_entry(dev, NULL);
 	if (!np)
 		return 0;
 	ret = apple_pmp_report_entry_request(np, enable);
@@ -236,6 +234,8 @@ struct asahi_g17_commit {
 	void __iomem *bridge;
 	void __iomem *ps;
 	struct device_node *request;
+	/* The power domain is the PMP's entry: the sleep controller lowers the word behind it. */
+	bool entry_domain;
 
 	bool ran;
 	int idle[2];
@@ -274,7 +274,7 @@ static int asahi_g17_commit_stop(void *data)
 			writel(readl(c->gating) | SGX_GATING_HOLD, c->gating);
 	}
 	c->request_ret = c->request ? apple_pmp_report_entry_withdraw_polled(c->request) : 0;
-	if (!READ_ONCE(commit_lower_ps))
+	if (c->entry_domain)
 		return (c->idle[0] || c->idle[1] || c->request_ret) ? 1 : 0;
 
 	c->saved = readl(c->ps);
@@ -381,7 +381,7 @@ struct asahi_g17_commit *asahi_g17_commit_prepare(struct device *dev,
 	/* The word as it is before the sleep, for the raise after it if the stop leaves it. */
 	c->saved = readl(c->ps);
 
-	c->request = asahi_g17_pmp_entry(dev);
+	c->request = asahi_g17_pmp_entry(dev, &c->entry_domain);
 	if (c->request)
 		apple_pmp_report_entry_commit_owned(c->request, true);
 
