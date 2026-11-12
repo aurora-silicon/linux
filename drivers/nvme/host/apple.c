@@ -2437,6 +2437,24 @@ static void apple_nvme_flush_work(struct work_struct *work)
 	}
 }
 
+/*
+ * What a new RTKit object is told about this controller: at probe, and when a
+ * hibernation restore replaces the object with one for the session the boot
+ * loader started.
+ */
+static void apple_nvme_rtkit_configure(struct apple_nvme *anv)
+{
+	/*
+	 * The T6050 ANS firmware handed over by iBoot can take about 3 s to
+	 * answer the power-state and endpoint-map handshake.
+	 */
+	if (of_device_is_compatible(anv->dev->of_node, "apple,t6050-nvme-ans2"))
+		apple_rtkit_set_handshake_timeout(anv->rtk,
+						  APPLE_NVME_T6050_HANDSHAKE_TIMEOUT_MS);
+	if (anv->hw->sleep_traced || anv->hw->sleep_untraced)
+		apple_rtkit_set_warm_epmap_mask(anv->rtk, anv->hw->sleep_epmap_last_mask);
+}
+
 static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -2636,13 +2654,7 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		goto out_detach_genpd;
 	}
 
-	/*
-	 * The T6050 ANS firmware handed over by iBoot can take about 3 s to
-	 * answer the power-state and endpoint-map handshake.
-	 */
-	if (of_device_is_compatible(dev->of_node, "apple,t6050-nvme-ans2"))
-		apple_rtkit_set_handshake_timeout(anv->rtk,
-						  APPLE_NVME_T6050_HANDSHAKE_TIMEOUT_MS);
+	apple_nvme_rtkit_configure(anv);
 
 	ret = devm_add_action_or_reset(dev, apple_nvme_free_rtkit, anv);
 	if (ret)
@@ -2761,7 +2773,6 @@ static int apple_nvme_probe(struct platform_device *pdev)
 			apple_sleep_coproc_unregister(anv->dev);
 			anv->sleep_registered = false;
 		}
-		apple_rtkit_set_warm_epmap_mask(anv->rtk, anv->hw->sleep_epmap_last_mask);
 	}
 
 	apple_nvme_set_reset_ready(anv, true);
@@ -3192,6 +3203,7 @@ static int apple_nvme_restore_post_m4(struct apple_nvme *anv)
 		return ret;
 	}
 	anv->rtk = rtk;
+	apple_nvme_rtkit_configure(anv);
 	ret = apple_rtkit_adopt_running(rtk);
 	if (ret) {
 		dev_err(anv->dev, "hibernation restore: RTKit adoption failed: %d\n", ret);
