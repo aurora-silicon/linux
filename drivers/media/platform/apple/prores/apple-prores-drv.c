@@ -1218,9 +1218,20 @@ static int apr_select_tunables(struct apr_dev *apr)
 		dev_info(dev, "initialization rows from %s\n", v->firmware_name);
 	}
 
-	if (!apr->num_tunables[APRI_CORE_BLOCK])
+	/*
+	 * A variant whose rows come only from the optional file has nothing to
+	 * program without it. The file is optional, so report its absence once
+	 * at info level and leave the engine off.
+	 */
+	if (!apr->num_tunables[APRI_CORE_BLOCK]) {
+		if (v->firmware_name) {
+			dev_info(dev, "no %s and no built-in rows, engine not used\n",
+				 v->firmware_name);
+			return -ENODEV;
+		}
 		return dev_err_probe(dev, -ENOENT,
 				     "no initialization rows for this engine\n");
+	}
 
 	return 0;
 }
