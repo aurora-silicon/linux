@@ -2261,13 +2261,8 @@ EXPORT_SYMBOL_GPL(apple_atc_dp_tunnel_open);
  *
  * USB3 runs tunnelled through the router: the controller's PIPE goes to the
  * USB4 backend (macOS's USB3 mode 3, see t6040_cio_pipe_tunnel)
- * while the PHY is in CIO, only with the cio_usb3_tunnel parameter set.
+ * while the PHY is in CIO and the router has asked for it.
  */
-
-static bool cio_usb3_tunnel;
-module_param(cio_usb3_tunnel, bool, 0644);
-MODULE_PARM_DESC(cio_usb3_tunnel,
-		 "Route the USB3 PIPE to a running USB4 router without its request (testing)");
 
 /* The ADT tables of the CIO-only tunables, in macOS's order; lane0/1 are required. */
 static const char * const t6040_cio_tunable_props[] = {
@@ -2401,8 +2396,7 @@ static void t6040_cio_pipe_update_locked(struct t6040_usb2_phy *tphy)
 	bool want;
 
 	lockdep_assert_held(&tphy->lock);
-	want = tphy->cio_up && tphy->router_running &&
-	       (tphy->usb3_tunnel_req || cio_usb3_tunnel) &&
+	want = tphy->cio_up && tphy->router_running && tphy->usb3_tunnel_req &&
 	       tphy->usb3_on && tphy->usb3_pipe && tphy->dwc3_running && !tphy->pipe_switched;
 	if (want && !tphy->pipe_tunneled) {
 		t6040_cio_pipe_tunnel(tphy);
@@ -2514,25 +2508,17 @@ sleep:
 	return ret;
 }
 
-/* USB4 entered with Enter_USB in USB4 mode, or Thunderbolt alt mode. */
-static bool cio_without_router;
-module_param(cio_without_router, bool, 0644);
-MODULE_PARM_DESC(cio_without_router,
-		 "bring-up test: enter CIO on a USB4/Thunderbolt mux event even while no USB4 router node for this port is enabled (default N)");
-
 /*
  * A USB4/Thunderbolt mux event only takes the port into CIO while the router
  * that runs over this PHY (a node whose apple,atc-phy points here) is enabled
  * in the live device tree. The default device trees keep the routers
  * disabled, so the port stays on its USB2/USB3/DP paths until a router is
- * enabled (the USB4 bring-up tree, or at runtime).
+ * enabled.
  */
 static bool t6040_cio_router_enabled(struct t6040_usb2_phy *tphy)
 {
 	struct device_node *np;
 
-	if (READ_ONCE(cio_without_router))
-		return true;
 	for_each_compatible_node(np, NULL, "apple,t6040-usb4-acio") {
 		struct device_node *phy = of_parse_phandle(np, "apple,atc-phy", 0);
 		bool match = phy == tphy->dev->of_node && of_device_is_available(np);
@@ -2546,6 +2532,7 @@ static bool t6040_cio_router_enabled(struct t6040_usb2_phy *tphy)
 	return false;
 }
 
+/* USB4 entered with Enter_USB in USB4 mode, or Thunderbolt alt mode. */
 static bool t6040_cio_requested(const struct typec_mux_state *state)
 {
 	const struct enter_usb_data *data = state->data;
