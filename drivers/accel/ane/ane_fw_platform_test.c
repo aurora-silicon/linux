@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 #include <kunit/test.h>
 #include <linux/module.h>
+#include <linux/platform_device.h>
 
 #include "ane_fw_platform.h"
 
@@ -66,7 +67,29 @@ static void ane_platform_staged_bind_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_fw_sleep_path(&h17), ANE_SLEEP_FW_BACKEND);
 }
 
+#if IS_BUILTIN(CONFIG_DRM_ACCEL_ANE) && IS_BUILTIN(CONFIG_DRM_ACCEL_ANE_FW_KUNIT_TEST)
+/* Even a manually enabled DT must not take the T6041 acquisition path. */
+static void ane_t8132_unqualified_test(struct kunit *test)
+{
+	struct platform_device *pdev = platform_device_alloc("ane-unqualified", -1);
+
+	KUNIT_ASSERT_NOT_NULL(test, pdev);
+	KUNIT_EXPECT_FALSE(test, ane_t8132_platform.boot_qualified);
+	KUNIT_EXPECT_EQ(test, ane_t8132_platform.reg_count, 6U);
+	KUNIT_EXPECT_STREQ(test, ane_t8132_platform.reg_names[5], "aux-4");
+	/* No DT, resources or preload: refusal must precede their validation. */
+	KUNIT_EXPECT_EQ(test, ane_fw_platform_preflight(pdev, &ane_t8132_platform),
+			-EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, ane_fw_platform_probe(pdev, &ane_t8132_platform),
+			-EOPNOTSUPP);
+	platform_device_put(pdev);
+}
+#endif
+
 static struct kunit_case ane_fw_platform_cases[] = {
+#if IS_BUILTIN(CONFIG_DRM_ACCEL_ANE) && IS_BUILTIN(CONFIG_DRM_ACCEL_ANE_FW_KUNIT_TEST)
+	KUNIT_CASE(ane_t8132_unqualified_test),
+#endif
 	KUNIT_CASE(ane_platform_staged_bind_test),
 	KUNIT_CASE(ane_platform_sleep_path_test),
 	KUNIT_CASE(ane_preload_ranges_test),
