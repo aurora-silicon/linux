@@ -40,6 +40,7 @@ void apple_pmp_agx_activity_begin(void);
 void apple_pmp_agx_activity_end(void);
 void apple_pmp_agx_activity_release(void);
 void apple_pmp_agx_activity_resume(void);
+int apple_pmp_report_gpu_effort(u32 phandle, u32 *effort);
 #else
 static inline int apple_pmp_report_ane_available(const struct device_node *np)
 {
@@ -105,6 +106,11 @@ static inline int apple_pmp_report_fast_die_effort(const struct device_node *np,
 
 static inline int apple_pmp_report_set_request(const struct device_node *report_np,
 					       unsigned int id, bool enable, bool no_ack)
+{
+	return -ENODEV;
+}
+
+static inline int apple_pmp_report_gpu_effort(u32 phandle, u32 *effort)
 {
 	return -ENODEV;
 }
