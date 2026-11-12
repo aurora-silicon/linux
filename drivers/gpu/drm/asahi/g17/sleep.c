@@ -359,6 +359,9 @@ struct asahi_g17_commit {
 	u32 saved;
 	u32 lowered;
 	int lower_ret;
+	/* The domain at the start of the stop, and the raise to full power before any ASC access */
+	u32 entry;
+	int raise_ret;
 };
 
 /*
@@ -374,8 +377,31 @@ static int asahi_g17_commit_stop(void *data)
 	u32 val;
 
 	c->ran = true;
+	apple_sleep_note_sub(1);
+	/*
+	 * The GPU gates itself between frames (~95 times a second on J815), and at the commit its
+	 * domain read 0x244 (actual 4, J815 boot 12505746): its coprocessor's and mailbox's
+	 * registers may not answer there, and with interrupts off a stalled read ends at WD2 (J815
+	 * boot 3c93d5a2: PMU note 0x44, the first commit stop). Bring it to full power first, as
+	 * asahi_g17_power_raise() does, and keep the word from before for the resume.
+	 */
+	c->entry = readl(c->ps);
+	c->saved = c->entry;
+	if (FIELD_GET(PS_ACTUAL, c->entry) != PS_ACTIVE) {
+		writel(asahi_g17_ps_on(c->dev, c->entry, c->entry), c->ps);
+		c->raise_ret = readl_poll_timeout_atomic(c->ps, val,
+							 FIELD_GET(PS_ACTUAL, val) == PS_ACTIVE,
+							 10, PS_TIMEOUT_US);
+	}
+	apple_sleep_note_sub(2);
+	if (c->raise_ret) {
+		/* Its registers can't be trusted to answer: lower the domain only. */
+		c->idle[0] = c->raise_ret;
+		goto lower;
+	}
 	for (i = 0; i < c->count; i++)
 		c->idle[i] = apple_rtkit_sleep_idle_polled(c->rtk[i], c->cpu[i], &c->idle_us[i]);
+	apple_sleep_note_sub(3);
 	for (i = 0; i < c->count; i++) {
 		c->status[i] = readl(c->cpu[i] + ASC_CPU_STATUS);
 		apple_rtkit_mailbox_recv_off(c->rtk[i]);
@@ -386,10 +412,12 @@ static int asahi_g17_commit_stop(void *data)
 		if (!i && c->bridge)
 			writel(readl(c->gating) | SGX_GATING_HOLD, c->gating);
 	}
+	apple_sleep_note_sub(4);
 	c->request_ret = c->request ? apple_pmp_report_entry_withdraw_polled(c->request) : 0;
+	apple_sleep_note_sub(5);
 
-	c->saved = readl(c->ps);
-	writel(c->saved & ~(PS_AUTO_ENABLE | PS_BUSY | PS_FLAGS), c->ps);
+	/* Off automatic management, still at full power, for the bridge. */
+	writel(readl(c->ps) & ~(PS_AUTO_ENABLE | PS_BUSY | PS_FLAGS), c->ps);
 	if (c->bridge) {
 		for (i = 0; i < SGX_BRIDGE_WORDS; i++)
 			c->words[i] = readl(c->bridge + 4 * i);
@@ -397,12 +425,15 @@ static int asahi_g17_commit_stop(void *data)
 		for (i = 0; i < SGX_BRIDGE_WORDS; i++)
 			writel(c->words[i] & ~SGX_BRIDGE_ENABLE, c->bridge + 4 * i);
 	}
+	apple_sleep_note_sub(6);
+lower:
 	val = readl(c->ps);
 	writel((val & ~(PS_AUTO_ENABLE | PS_BUSY | PS_FLAGS | PS_TARGET)) | PS_FLAGS, c->ps);
 	c->lower_ret = readl_poll_timeout_atomic(c->ps, c->lowered,
 						 !FIELD_GET(PS_ACTUAL, c->lowered) &&
 						 !(c->lowered & PS_BUSY),
 						 10, PS_TIMEOUT_US);
+	apple_sleep_note_sub(7);
 
 	return (c->idle[0] || c->idle[1] || c->request_ret || c->lower_ret) ? 1 : 0;
 }
@@ -672,6 +703,8 @@ bool asahi_g17_commit_finish(struct asahi_g17_commit *c, u32 *saved)
 			c->idle_us[0], c->idle_us[1], c->status[0], c->status[1]);
 		dev_dbg(c->dev, "GPU at the commit: bridge %#x %#x gating %#x, domain %#x now %#x\n",
 			c->words[0], c->words[1], c->words[2], c->saved, c->lowered);
+		dev_info(c->dev, "GPU domain at the commit stop: %#x, raise to full %d\n",
+			 c->entry, c->raise_ret);
 		*saved = c->saved;
 	}
 	asahi_g17_commit_free(c);
