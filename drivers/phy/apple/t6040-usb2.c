@@ -3339,6 +3339,35 @@ static bool t6040_can_sleep_in_place(const struct t6040_usb2_phy *tphy)
 	       !tphy->usb3_lent && tphy->usb3_up == tphy->pipe_switched;
 }
 
+/* Room for every name of t6040_sleep_in_place_misses() at once. */
+#define T6040_SLEEP_MISSES_LEN	192
+
+/* For the log: the conditions of t6040_can_sleep_in_place() that fail, by name. */
+static void t6040_sleep_in_place_misses(const struct t6040_usb2_phy *tphy, char *buf, size_t size)
+{
+	int len = 0;
+
+#define T6040_MISS(cond, name) \
+	do { if (cond) len += scnprintf(buf + len, size - len, " %s", name); } while (0)
+	buf[0] = 0;
+	T6040_MISS(!tphy->pipehandler, "no_pipehandler");
+	T6040_MISS(!tphy->powered, "usb2_off");
+	T6040_MISS(!tphy->dwc3_running, "dwc3_in_reset");
+	T6040_MISS(tphy->mode != PHY_MODE_USB_HOST, "mode");
+	T6040_MISS(tphy->shutdown_failed, "shutdown_failed");
+	T6040_MISS(tphy->sleep_no_keep, "sleep_no_keep");
+	T6040_MISS(tphy->sleep_down, "sleep_down");
+	T6040_MISS(tphy->sleep_reset, "sleep_reset");
+	T6040_MISS(tphy->cio_up, "cio_up");
+	T6040_MISS(tphy->pipe_tunneled, "pipe_tunneled");
+	T6040_MISS(tphy->router_running, "router_running");
+	T6040_MISS(tphy->dp_up, "dp_up");
+	T6040_MISS(tphy->dp_alt && !tphy->dp_two_lanes, "dp_four_lanes");
+	T6040_MISS(tphy->usb3_lent, "usb3_lent");
+	T6040_MISS(tphy->usb3_up != tphy->pipe_switched, "pipe_state");
+#undef T6040_MISS
+}
+
 int apple_t6040_atcphy_sleep_prepare(struct phy *usb2_phy)
 {
 	struct t6040_usb2_phy *tphy = t6040_from_usb2_phy(usb2_phy);
@@ -3348,11 +3377,14 @@ int apple_t6040_atcphy_sleep_prepare(struct phy *usb2_phy)
 
 	guard(mutex)(&tphy->lock);
 	if (!t6040_can_sleep_in_place(tphy)) {
+		char why[T6040_SLEEP_MISSES_LEN];
+
+		t6040_sleep_in_place_misses(tphy, why, sizeof(why));
 		dev_info(tphy->dev,
-			 "the host stops for the sleep: USB2 %d, USB3 %d, PIPE %d, DP %d/%d, CIO %d, lent %d, failed %d/%d\n",
+			 "the host stops for the sleep: USB2 %d, USB3 %d, PIPE %d, DP %d/%d, CIO %d, lent %d, failed %d/%d, because:%s\n",
 			 tphy->powered, tphy->usb3_up, tphy->pipe_switched, tphy->dp_alt,
 			 tphy->dp_up, tphy->cio_up, tphy->usb3_lent, tphy->shutdown_failed,
-			 tphy->sleep_no_keep);
+			 tphy->sleep_no_keep, why);
 		return -EBUSY;
 	}
 	tphy->sleep_armed = true;
@@ -3382,10 +3414,13 @@ int apple_t6040_atcphy_sleep_enter(struct phy *usb2_phy)
 		return 0;
 	/* The mux moved since the prepare: that mode's clients don't come back this way. */
 	if (!t6040_can_sleep_in_place(tphy)) {
+		char why[T6040_SLEEP_MISSES_LEN];
+
+		t6040_sleep_in_place_misses(tphy, why, sizeof(why));
 		dev_err(tphy->dev,
-			"USB changed for the sleep (USB3 %d, PIPE %d, DP %d/%d, CIO %d): refusing it\n",
+			"USB changed for the sleep (USB3 %d, PIPE %d, DP %d/%d, CIO %d, because:%s): refusing it\n",
 			tphy->usb3_up, tphy->pipe_switched, tphy->dp_alt, tphy->dp_up,
-			tphy->cio_up);
+			tphy->cio_up, why);
 		tphy->sleep_ret = -EBUSY;
 		return -EBUSY;
 	}

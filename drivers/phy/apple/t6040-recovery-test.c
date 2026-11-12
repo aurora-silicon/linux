@@ -209,6 +209,125 @@ static void t6040_sleep_failed_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, t6040_can_sleep_in_place(tphy));
 }
 
+/* The port can't sleep in place, and the log names the conditions that fail as @names. */
+static void t6040_expect_miss(struct kunit *test, const struct t6040_usb2_phy *tphy,
+			      const char *names)
+{
+	char why[T6040_SLEEP_MISSES_LEN];
+
+	t6040_sleep_in_place_misses(tphy, why, sizeof(why));
+	KUNIT_EXPECT_FALSE(test, t6040_can_sleep_in_place(tphy));
+	KUNIT_EXPECT_STREQ(test, why, names);
+}
+
+/*
+ * Each of the conditions of t6040_can_sleep_in_place() has its name in the
+ * log, all of them fit into the buffer, and a port that sleeps in place has
+ * none.
+ */
+static void t6040_sleep_misses_test(struct kunit *test)
+{
+	struct t6040_usb2_phy *tphy = t6040_sleep_test_phy(test);
+	char why[T6040_SLEEP_MISSES_LEN];
+
+	t6040_sleep_in_place_misses(tphy, why, sizeof(why));
+	KUNIT_EXPECT_TRUE(test, t6040_can_sleep_in_place(tphy));
+	KUNIT_EXPECT_STREQ(test, why, "");
+
+	tphy->pipehandler = NULL;
+	t6040_expect_miss(test, tphy, " no_pipehandler");
+	tphy->pipehandler = (void __iomem *)tphy;
+
+	tphy->powered = false;
+	t6040_expect_miss(test, tphy, " usb2_off");
+	tphy->powered = true;
+
+	tphy->dwc3_running = false;
+	t6040_expect_miss(test, tphy, " dwc3_in_reset");
+	tphy->dwc3_running = true;
+
+	tphy->mode = PHY_MODE_INVALID;
+	t6040_expect_miss(test, tphy, " mode");
+	tphy->mode = PHY_MODE_USB_HOST;
+
+	tphy->shutdown_failed = true;
+	t6040_expect_miss(test, tphy, " shutdown_failed");
+	tphy->shutdown_failed = false;
+
+	tphy->sleep_no_keep = true;
+	t6040_expect_miss(test, tphy, " sleep_no_keep");
+	tphy->sleep_no_keep = false;
+
+	tphy->sleep_down = true;
+	t6040_expect_miss(test, tphy, " sleep_down");
+	tphy->sleep_down = false;
+
+	tphy->sleep_reset = true;
+	t6040_expect_miss(test, tphy, " sleep_reset");
+	tphy->sleep_reset = false;
+
+	tphy->cio_up = true;
+	t6040_expect_miss(test, tphy, " cio_up");
+	tphy->cio_up = false;
+
+	tphy->pipe_tunneled = true;
+	t6040_expect_miss(test, tphy, " pipe_tunneled");
+	tphy->pipe_tunneled = false;
+
+	tphy->router_running = true;
+	t6040_expect_miss(test, tphy, " router_running");
+	tphy->router_running = false;
+
+	tphy->dp_up = true;
+	t6040_expect_miss(test, tphy, " dp_up");
+	tphy->dp_up = false;
+
+	tphy->dp_alt = true;
+	t6040_expect_miss(test, tphy, " dp_four_lanes");
+	tphy->dp_alt = false;
+
+	tphy->usb3_lent = true;
+	t6040_expect_miss(test, tphy, " usb3_lent");
+	tphy->usb3_lent = false;
+
+	tphy->usb3_up = true;
+	t6040_expect_miss(test, tphy, " pipe_state");
+	tphy->usb3_up = false;
+
+	tphy->pipe_switched = true;
+	t6040_expect_miss(test, tphy, " pipe_state");
+	tphy->pipe_switched = false;
+
+	/* Pin assignment D without a link fails nothing. */
+	tphy->dp_alt = true;
+	tphy->dp_two_lanes = true;
+	t6040_sleep_in_place_misses(tphy, why, sizeof(why));
+	KUNIT_EXPECT_TRUE(test, t6040_can_sleep_in_place(tphy));
+	KUNIT_EXPECT_STREQ(test, why, "");
+	tphy->dp_two_lanes = false;
+
+	/* A display on all four lanes, with USB3's lanes lent to it. */
+	tphy->dp_up = true;
+	tphy->usb3_lent = true;
+	t6040_expect_miss(test, tphy, " dp_up dp_four_lanes usb3_lent");
+
+	/* Everything at once. */
+	tphy->pipehandler = NULL;
+	tphy->powered = false;
+	tphy->dwc3_running = false;
+	tphy->mode = PHY_MODE_INVALID;
+	tphy->shutdown_failed = true;
+	tphy->sleep_no_keep = true;
+	tphy->sleep_down = true;
+	tphy->sleep_reset = true;
+	tphy->cio_up = true;
+	tphy->pipe_tunneled = true;
+	tphy->router_running = true;
+	tphy->usb3_up = true;
+	t6040_expect_miss(test, tphy,
+			  " no_pipehandler usb2_off dwc3_in_reset mode shutdown_failed sleep_no_keep sleep_down sleep_reset cio_up pipe_tunneled router_running dp_up dp_four_lanes usb3_lent pipe_state");
+}
+
 /*
  * Only the controller's reset and USB2 can fail the keeping of a host, and
  * only when the host was lost: not a sleep refused for a USB change, not what
@@ -248,6 +367,7 @@ static struct kunit_case t6040_sleep_test_cases[] = {
 	KUNIT_CASE(t6040_sleep_no_host_test),
 	KUNIT_CASE(t6040_sleep_other_modes_test),
 	KUNIT_CASE(t6040_sleep_failed_test),
+	KUNIT_CASE(t6040_sleep_misses_test),
 	KUNIT_CASE(t6040_sleep_keep_failed_test),
 	KUNIT_CASE(t6040_sleep_wake_usb3_test),
 	{}
