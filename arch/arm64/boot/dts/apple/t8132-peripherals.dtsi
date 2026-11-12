@@ -8,7 +8,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1041 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	dart_scaler1: filter@38079c000 {
@@ -318,7 +318,7 @@
 		power-domains = <&ps_msr>, <&ps_msr_ase_core>;
 		iommus = <&dart_scaler0 0>, <&dart_scaler0 1>;
 		clocks = <&peripheral_clocks 399>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	jpeg0: jpeg@3a5000000 {

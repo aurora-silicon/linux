@@ -559,7 +559,7 @@
 		clocks = <&peripheral_clocks 365>;
 		iommus = <&scaler_dart 0>, <&scaler_dart 1>;
 		resets = <&ps_msr>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	scaler_dart: iommu@263200000 {
@@ -569,7 +569,7 @@
 		interrupts = <AIC_IRQ 600 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_msr>;
 		#iommu-cells = <1>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	jpeg0: jpeg@265000000 {

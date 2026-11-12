@@ -421,11 +421,11 @@
 };
 
 &ps_msr {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_msr_ase_core {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_ane_sys {
