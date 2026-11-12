@@ -1154,6 +1154,7 @@ static void __init gate_t6041_max_no_memory(struct kunit *test)
 	gt_max_expect_chain(test, 0, false);
 	gt_max_expect_chain(test, 1, false);
 	gt_max_expect_chain(test, 2, false);
+	gt_max_expect_chain(test, 3, false);
 	gt_max_expect_display(test, 0);
 }
 
@@ -1167,7 +1168,21 @@ static void __init gate_t6041_max_second_usbc(struct kunit *test)
 	gt_max_expect_chain(test, 0, true);
 	gt_max_expect_chain(test, 1, true);
 	gt_max_expect_chain(test, 2, true);
+	gt_max_expect_chain(test, 3, false);
 	gt_max_expect_display(test, BIT(0) | BIT(1) | BIT(2));
+}
+
+/* With all four filled, every external chain comes up, dcpext3's last. */
+static void __init gate_t6041_max_all_externals(struct kunit *test)
+{
+	unsigned int i;
+
+	for (i = 0; i < 4; i++)
+		gt_max_fill(test, i);
+	gt_max_run(test);
+	for (i = 0; i < 4; i++)
+		gt_max_expect_chain(test, i, true);
+	gt_max_expect_display(test, BIT(0) | BIT(1) | BIT(2) | BIT(3));
 }
 
 /* The other processor's chain does not wait for one that was refused. */
@@ -1237,6 +1252,7 @@ static struct kunit_case gate_t6041_max_cases[] __refdata = {
 	KUNIT_CASE(gate_t6041_max_enabled),
 	KUNIT_CASE(gate_t6041_max_no_memory),
 	KUNIT_CASE(gate_t6041_max_second_usbc),
+	KUNIT_CASE(gate_t6041_max_all_externals),
 	KUNIT_CASE(gate_t6041_max_one_processor),
 	KUNIT_CASE(gate_t6041_max_partial_memory),
 	KUNIT_CASE(gate_t6041_max_enabled_by_loader),
