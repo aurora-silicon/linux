@@ -3256,7 +3256,7 @@ static int apple_cio_start(struct apple_cio *acio)
 	ret = apple_t6040_cio_state(acio->phy_np);
 	if (ret != 1) {
 		ret = ret < 0 ? ret : -EAGAIN;
-		dev_err(acio->dev, "Type-C PHY is not in CIO mode (%d), not starting\n", ret);
+		dev_dbg(acio->dev, "Type-C PHY is not in CIO mode (%d), not starting\n", ret);
 		return ret;
 	}
 	ret = apple_t6040_cio_router_started(acio->phy_np);
@@ -3969,8 +3969,8 @@ static void apple_cio_sleep_stop_locked(struct apple_cio *acio)
 	/* Close PCIe admission; the next NHI probe reopens it. */
 	scoped_guard(mutex, &acio->pcie_tunnel_lock)
 		acio->pcie_tunnel_stopping = true;
-	dev_info(acio->dev, "powering off router for system sleep (cable info 0x%x)\n",
-		 acio->current_cable_info);
+	dev_dbg(acio->dev, "powering off router for system sleep (cable info 0x%x)\n",
+		acio->current_cable_info);
 	apple_cio_stop(acio);
 }
 
