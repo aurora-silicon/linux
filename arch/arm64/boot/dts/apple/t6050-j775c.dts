@@ -29,6 +29,7 @@
 
 #include "t6050-j775c-legacy.dtsi"
 #include "t6050-j775c-rebased-peripherals.dtsi"
+#include "t6050-j775c-loader-gpu.dtsi"
 
 /delete-node/ &cpu18;
 /delete-node/ &cpu19;

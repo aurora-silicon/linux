@@ -12,42 +12,6 @@
 		#size-cells = <2>;
 		ranges;
 		nonposted-mmio;
-		pmgr3: power-management@2300e80000 {
-			compatible = "apple,t6050-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
-			reg = <0x23 0x00e80000 0x0 0x4000>;
-			#address-cells = <1>;
-			#size-cells = <1>;
-
-			ps_gpx: power-controller@0 {
-				compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-				reg = <0x0 4>;
-				label = "gpx";
-				#power-domain-cells = <0>;
-				#reset-cells = <0>;
-				apple,always-on;
-				status = "disabled";
-			};
-
-			ps_afr: power-controller@100 {
-				compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-				reg = <0x100 4>;
-				label = "afr";
-				#power-domain-cells = <0>;
-				#reset-cells = <0>;
-				apple,always-on;
-				status = "disabled";
-			};
-
-			ps_gfx: power-controller@110 {
-				compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-				reg = <0x110 4>;
-				label = "gfx";
-				#power-domain-cells = <0>;
-				power-domains = <&ps_afr>, <&ps_gpx>;
-				#reset-cells = <0>;
-				status = "disabled";
-			};
-		};
 
 		dart_apcie1: iommu@411000000 {
 			compatible = "apple,t6050-dart", "apple,t8110-dart";
