@@ -1228,8 +1228,7 @@ static void aic_resume_boot_cpu(void)
  * its own it never unmasks the restored kernel's other IRQs again. Make every
  * hardware mask match the restored descriptor: unmasked unless the core
  * recorded it masked (a lazily disabled IRQ was unmasked in hardware when the
- * image was taken), and masked when this kernel has no mapping for it. On the
- * thaw path the masks already match and this rewrites the same values.
+ * image was taken), and masked when this kernel has no mapping for it.
  */
 static void aic_resync_masks(struct aic_irq_chip *ic)
 {
@@ -1256,8 +1255,8 @@ static void aic_syscore_resume(void *data)
 	u32 die, i, off = 0;
 
 	if (!aic_sleep.saved) {
-		/* No firmware-driven suspend: the only other syscore resume that loses masks. */
-		if (IS_ENABLED(CONFIG_HIBERNATION))
+		/* No firmware-driven suspend: only a resume from disk has lost the masks. */
+		if (pm_hibernate_is_restored())
 			aic_resync_masks(ic);
 		return;
 	}
