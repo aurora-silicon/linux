@@ -1062,7 +1062,7 @@
 
 #include "t6050-j775c-usb4.dtsi"
 
-#include "t6050-j775c-usb4-capture.dtsi"
+/* Diagnostic-only ramoops policy is not carried into the upstream layout. */
 
 /* Match the ported board's ATC2 supplier activation. */
 &atc2_phy_mbox { status = "okay"; };
@@ -1129,3 +1129,11 @@
 
 /* Keep isolated MTP activation failure disabled after later migrations. */
 &{/soc/iommu@294800000} { status = "disabled"; };
+
+#include "t6050-j775c-incremental-gpuopp.dtsi"
+
+/* Installed Stage2 needs the final fallback while Linux uses current G17 compatibles. */
+&gpu { compatible = "apple,agx-g17c", "apple,agx-g17s", "apple,agx-t6050"; };
+
+/delete-node/ &{/opp-table-gpu-afr};
+/delete-node/ &{/opp-table-gpu-cs};
