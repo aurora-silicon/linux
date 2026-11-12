@@ -433,7 +433,7 @@
 };
 
 &ps_jpg {
-	status = "disabled";
+	status = "okay";
 };
 
 &ps_avd_sys {
