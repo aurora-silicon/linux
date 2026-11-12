@@ -47,6 +47,52 @@ void iomfb_serialize_present_v27(struct dcp_swap_submit_req_v27 *wire,
 	memcpy((u8 *)wire + tail_dst, (const u8 *)request + tail_src, tail_size);
 }
 
+/* The A407 request (dcp->v27_a407): the same fields, six surfaces more before the tail. */
+void iomfb_serialize_present_v27_a407(struct dcp_swap_submit_req_v27_a407 *wire,
+				      const struct dcp_swap_submit_req_h17p *request)
+{
+	/*
+	 * The common geometry runs from swap_id through bg_color, across
+	 * several fields, so copy it by offset from the start of each
+	 * structure.  The tail is copied field by field: the A407 request puts
+	 * six more surfaces before it, which are never presented.
+	 */
+	size_t geom_dst = offsetof(struct dcp_swap_submit_req_v27_a407, swap.swap_id);
+	size_t geom_src = offsetof(struct dcp_swap_submit_req_h17p, swap.swap_id);
+	size_t geom_size = offsetof(struct dcp_swap_v27, reserved_158) -
+			   offsetof(struct dcp_swap_v27, swap_id);
+
+	static_assert(offsetof(struct dcp_swap_submit_req_h17p, swap.swap_id) +
+		      offsetof(struct dcp_swap_v27, reserved_158) -
+		      offsetof(struct dcp_swap_v27, swap_id) <=
+		      offsetof(struct dcp_swap_submit_req_h17p, swap) +
+		      sizeof(request->swap));
+	static_assert(sizeof(wire->surf_iova) == sizeof(request->surf_iova));
+	static_assert(sizeof(wire->unk_u64_a) == sizeof(request->unk_u64_a));
+	static_assert(sizeof(wire->surf_null) == sizeof(request->surf_null));
+
+	memset(wire, 0, sizeof(*wire));
+	memcpy(wire->swap.timestamp, request->swap.timestamp,
+	       sizeof(wire->swap.timestamp));
+	wire->swap.unk_38 = request->swap.unk_38;
+	memcpy((u8 *)wire + geom_dst, (const u8 *)request + geom_src, geom_size);
+	memcpy(wire->surf, request->surf, sizeof(wire->surf));
+	memcpy(wire->surf_iova, request->surf_iova, sizeof(wire->surf_iova));
+	memcpy(wire->unk_u64_a, request->unk_u64_a, sizeof(wire->unk_u64_a));
+	wire->unkbool = request->unkbool;
+	wire->unkdouble = request->unkdouble;
+	wire->unkU64 = request->unkU64;
+	wire->unkbool2 = request->unkbool2;
+	wire->clear = request->clear;
+	wire->unkU32Ptr = request->unkU32Ptr;
+	wire->swap_null = request->swap_null;
+	memcpy(wire->surf_null, request->surf_null, sizeof(wire->surf_null));
+	memset(wire->surf2_null, 1, sizeof(wire->surf2_null));
+	wire->unkoutbool_null = request->unkoutbool_null;
+	wire->unknown_pointer_null = request->unknown_pointer_null;
+	wire->unknown_output_null = request->unknown_output_null;
+}
+
 struct dcp_h17p_hotplug_request {
 	__le64 connected;
 	u8 tiled_display[0x4c];
@@ -230,6 +276,8 @@ const struct dcp_method_entry *iomfb_v27_methods_j714s(struct device *dev,
 	if (!table)
 		return NULL;
 	table[dcpep_unnamed_500] = a500;
+	/* macOS 27 submits every swap with A407 (the H17P table's A408 is not used). */
+	memcpy(table[dcpep_swap_submit].tag, "A407", sizeof(table[dcpep_swap_submit].tag));
 	return table;
 }
 

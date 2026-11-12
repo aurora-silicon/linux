@@ -571,6 +571,14 @@ struct apple_dcp {
 	struct dcp_swap_submit_req_v27 present_v27;
 	/* Both paired wire records belong to the primary endpoint lock. */
 	struct dcp_swap_submit_req_v27 peer_present_v27;
+	/*
+	 * Swaps go out as A407 with its longer request, from these records: on the J714s with
+	 * the 27.0 method table, where A407 has run (v27_methods is then the J714s's copy of
+	 * that table). Everywhere else A408 and the records above, as before.
+	 */
+	bool v27_a407;
+	struct dcp_swap_submit_req_v27_a407 present_v27_a407;
+	struct dcp_swap_submit_req_v27_a407 peer_present_v27_a407;
 
 	/* DCP shared memory */
 	void *shmem;
