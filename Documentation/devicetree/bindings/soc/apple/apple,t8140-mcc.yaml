@@ -46,6 +46,13 @@ properties:
     items:
       maxItems: 1
 
+  apple,pmp:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      PMP whose completed startup can re-establish the T8112 memory-controller
+      mode. The cache driver restores allocation only after this supplier has
+      bound.
+
 allOf:
   - if:
       properties:
@@ -110,6 +117,8 @@ allOf:
           description:
             Devices that take over DMA the bootloader left running. Cache allocation
             is enabled only once each of them is bound to its driver.
+
+        apple,pmp: true
 
       required:
         - compatible
