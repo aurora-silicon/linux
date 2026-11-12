@@ -81,24 +81,9 @@
 
 #include "sleep-internal.h"
 
-/* PS word */
-#define PS_AUTO_ENABLE		BIT(28)
-#define PS_UNLATCH		BIT(12)
-#define PS_DEV_DISABLE		BIT(10)
-#define PS_FLAGS		GENMASK(9, 8)
-#define PS_ACTUAL		GENMASK(7, 4)
-#define PS_TARGET		GENMASK(3, 0)
-
 /* Clock protection, per slice: its control word, and the bit that guards the slice's range. */
 #define PS_PROT_SLICE(n)	(0x100 + 0x40 * (n))
 #define PS_PROT_SLICE_ON	BIT(4)
-#define PS_OFF_TIMEOUT_US	5000
-#define PS_BUSY_SETTLE_US	1000
-
-/* CPU start block, as aura's smp_start_cpu() uses it. A core's bit is the SoC's. */
-#define CPU_START_STOP		0x0
-#define CPU_START_SYS		0x4
-#define CPU_START_CLUSTER(n)	(0x8 + (n) * 4)
 
 /* Power-gate page: reads back this value already. Purpose unknown. */
 #define PWRGATE_ON		0x80000000
@@ -114,40 +99,11 @@
 #define CLUSTER_TIMEOUT_US	5000
 
 
-/* Watchdog block, ADT /arm-io/wdt reg[0]. WD2 is the sleep safety net. */
-#define WDT_WD0_COUNT		0x00
-#define WDT_WD0_CTL		0x0c
-#define WDT_WD1_COUNT		0x10
-#define WDT_WD2_COUNT		0x20
-#define WDT_WD2_ALARM		0x28
-#define WDT_WD2_CTL		0x2c
-#define WDT_TICKS_PER_S		24000000
-/* The sleep's own safety net: ADT /arm-io/wdt simple-reconfig-wdog-icc-time. */
-#define WDT_SLEEP_SECS		5
-/* Device suspend and resume can take a while, and nothing else recovers a hang in them. */
-#define WDT_SUSPEND_SECS	120
-
 #define AON_AP_DEADLINE		0x08
 
 /* Wake sources: a mask, so 0 enables. Status words are sticky. Where and how many: the SoC. */
 #define WAKE_WORDS		9
 #define WAKE_SOURCES_MAX	32
-
-/* The AP queue of the PMU's SPMI controller, and its response vector's enable and ack */
-#define SPMI_STATUS		0x00
-#define SPMI_STATUS_RX_EMPTY	BIT(24)
-#define SPMI_CMD		0x04
-#define SPMI_REPLY		0x08
-#define SPMI_NOTIFY_ENABLE	0x40
-#define SPMI_NOTIFY_REPLY	BIT(0)
-#define SPMI_NOTIFY_ACK		0x80
-#define SPMI_CMD_ACTIVE		BIT(15)
-#define SPMI_OP_EXT_WRITE(n)	((n) - 1)
-#define SPMI_OP_EXT_READ(n)	(0x20 | ((n) - 1))
-#define SPMI_OP_ZERO_WRITE	0x80
-#define SPMI_OP_SLEEP		0x11
-#define SPMI_OP_WAKEUP		0x13
-#define SPMI_POLL_US		20000
 
 /* A port controller on SPMI: registers go through a page select, then a data window. */
 #define HPM_REG_SELECT		0x00
@@ -225,75 +181,8 @@
 #define AMCC_WORD0_DSID_AGE_OUT	BIT(25)
 #define AMCC_WORD1_UNEXP_RT_HIT	BIT(8)
 
-/* A coprocessor's ASC */
-#define ASC_CPU_CONTROL		0x44
-#define ASC_CPU_CONTROL_RUN	BIT(4)
-#define ASC_CPU_STATUS		0x48
-
-/* The part of the PCIe block that ANS shares, whether or not its host is bound. */
-#define APCIE_AXI_EN0		0x104
-#define APCIE_AXI_EN1		0x108
-#define APCIE_CLK_CTRL		0x0
-#define APCIE_CLK_BUSY		BIT(31)
-#define APCIE_CLK_RUN		BIT(5)
-#define APCIE_CLK_OFF		BIT(1)
-#define APCIE_CLK_OFF2		BIT(2)
-#define APCIE_CLK_START		0x4
-#define APCIE_CLK_START_GO	BIT(31)
-#define APCIE_PHY_COMMON	0x4000
-#define APCIE_PHY_CTRL		0x8000
-#define APCIE_PHY_CTRL_CLK0REQ	BIT(0)
-#define APCIE_PHY_CTRL_CLK1REQ	BIT(1)
-#define APCIE_PHY_CTRL_CLK0ACK	BIT(2)
-#define APCIE_PHY_CTRL_CLK1ACK	BIT(3)
-#define APCIE_PHY_CTRL_RESET	BIT(4)
-#define APCIE_PHY_CTRL_UP	BIT(27)
-#define APCIE_PHY_RUN		0x8004
-#define APCIE_PHY_RUN_EN	BIT(0)
-#define APCIE_PHY_RUN_EN2	BIT(4)
-#define APCIE_PHY_READY		0x8008
-#define APCIE_PHY_IP_PLL_CTL	0x90
-#define APCIE_PHY_IP_PLL_HOLD	BIT(16)
-#define APCIE_PORT_INTSTAT	0x100
-#define APCIE_PORT_INTMSK	0x104
-#define APCIE_PORT_INT_LINK	GENMASK(7, 4)
-#define APCIE_PORT_L2		0x88
-#define APCIE_PORT_L2_ENTER	0x11
-#define APCIE_PORT_L2_BUSY	BIT(0)
-#define APCIE_PORT_PERST_GUARD	0x13c
-#define APCIE_PORT_LINKSTS	0x208
-#define APCIE_PORT_LINKSTS_UP	BIT(0)
-#define APCIE_PORT_APPCLK	0x800
-#define APCIE_PORT_APPCLK_EN	BIT(0)
-#define APCIE_PORT_APPCLK_CGDIS	BIT(8)
-#define APCIE_PORT_PERST	0x82c
-#define APCIE_PORT_PHY_LINK	BIT(31)
-#define APCIE_PORT_PHY_EN0	BIT(9)
-#define APCIE_PORT_PHY_EN1	BIT(10)
-#define APCIE_ENGINE_CTRL	0x0
-#define APCIE_ENGINE_IRQ_MASK	0x8
-#define APCIE_ENGINE_STOP	BIT(0)
-#define APCIE_FABRIC_STOP	0x4
-#define APCIE_PORT_STOP_US	5000
-#define APCIE_RC_ZERO		0x04
-#define APCIE_RC_READY_START	0x50
-#define APCIE_RC_READY_CFG	0x54
-#define APCIE_RC_READY_STAT	0x58
-#define APCIE_POLL_US		50000
-
 /* The coprocessor and enclave registry is shared with the other SoCs' controllers. */
 #define SLEEP_COPROCS		APPLE_SLEEP_COPROCS
-
-/*
- * Written with bits 0 and 63 by every core right before its last WFI, measured
- * from macOS. This is not CYC_OVRD, which is undefined on this SoC.
- */
-#define SYS_APL_DEEP_SLEEP	sys_reg(3, 5, 15, 6, 2)
-#define DEEP_SLEEP_ENABLE	(BIT_ULL(0) | BIT_ULL(63))
-
-#define SYS_APL_IPI_SR_EL1	sys_reg(3, 5, 15, 1, 1)
-#define IPI_SR_PENDING		BIT(0)
-#define SYS_APL_SIQ_CFG_EL1	sys_reg(3, 4, 15, 10, 4)
 
 #define SLEEP_DISPLAYS_MAX	3
 

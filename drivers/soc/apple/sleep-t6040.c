@@ -86,11 +86,6 @@
 #undef MODULE_PARAM_PREFIX
 #define MODULE_PARAM_PREFIX "t6040_sleep."
 
-#define PS_TARGET		GENMASK(3, 0)
-#define PS_ACTUAL		GENMASK(7, 4)
-#define PS_FLAGS		GENMASK(9, 8)
-#define PS_AUTO_ENABLE		BIT(28)
-#define PS_OFF_TIMEOUT_US	5000
 #define PS_STRIDE		8
 #define PS_MAX_PER_GROUP	16
 #define PS_SIO_FIRST		0x150	/* SOC-East: I2C0, the first SIO peripheral word */
@@ -103,8 +98,8 @@
  * offsets, same bank as ps_ans); the control windows (axi2af/cio3pll/clkgen/
  * phy-block/phy-ip/rc) and the PLL/lane tunables are NOT in this SoC's static
  * description and are published by the boot object (aura) under the apple,apcie
- * node, in the same shape as on T8140. The block-internal offsets below are T8140's:
- * the same Apple PCIe IP, expected identical.
+ * node, in the same shape as on T8140. The block-internal offsets are the T8140's
+ * (sleep-internal.h): the same Apple PCIe IP.
  */
 #define PS_ANS			0x370	/* SOC-East: ps_ans */
 #define PS_APCIE_ST0		0x108	/* SOC-East: ps_apcie_st0 */
@@ -113,43 +108,6 @@
 #define PS_APCIE_SYS_ST1	0x388	/* SOC-East: ps_apcie_sys_st1 */
 #define PS_APCIE_PHY_SW		0x398	/* SOC-East: ps_apcie_phy_sw (the shared PHY) */
 #define PS_BUSY			BIT(11)	/* a request is in progress */
-
-#define APCIE_AXI_EN0		0x104
-#define APCIE_AXI_EN1		0x108
-#define APCIE_CLK_CTRL		0x0
-#define APCIE_CLK_BUSY		BIT(31)
-#define APCIE_CLK_OFF		BIT(1)
-#define APCIE_CLK_OFF2		BIT(2)
-#define APCIE_CLK_START		0x4
-#define APCIE_CLK_START_GO	BIT(31)
-#define APCIE_PHY_COMMON	0x4000
-#define APCIE_PHY_CTRL		0x8000
-#define APCIE_PHY_CTRL_CLK0REQ	BIT(0)
-#define APCIE_PHY_CTRL_CLK1REQ	BIT(1)
-#define APCIE_PHY_CTRL_CLK0ACK	BIT(2)
-#define APCIE_PHY_CTRL_CLK1ACK	BIT(3)
-#define APCIE_PHY_CTRL_RESET	BIT(4)
-#define APCIE_PHY_CTRL_UP	BIT(27)
-#define APCIE_PHY_RUN		0x8004
-#define APCIE_PHY_RUN_EN	BIT(0)
-#define APCIE_PHY_RUN_EN2	BIT(4)
-#define APCIE_PHY_READY		0x8008
-#define APCIE_PHY_IP_PLL_CTL	0x90
-#define APCIE_PHY_IP_PLL_HOLD	BIT(16)
-#define APCIE_RC_ZERO		0x04
-#define APCIE_RC_READY_START	0x50
-#define APCIE_RC_READY_CFG	0x54
-#define APCIE_RC_READY_STAT	0x58
-#define APCIE_POLL_US		50000
-
-/*
- * CPU start block (misc-cores-offset 0x88000, the offset aura uses for
- * T6031). cpu-start = pmgr reg0 (0x502800000) +
- * 0x88000 = 0x502888000. Register semantics are the same as T8140's.
- */
-#define CPU_START_STOP		0x0
-#define CPU_START_SYS		0x4
-#define CPU_START_CLUSTER(n)	(0x8 + (n) * 4)
 
 /*
  * cluster-ctl (pmgr reg0 + cluster-ctl-offset 0x20000 = 0x502820000). Measured
@@ -300,24 +258,17 @@ static const struct {
 #define AGX_TIMEOUT_US		10000
 
 /*
- * The PMU over SPMI (spmi0 = 0x509014000, spmi-a0 = 0x509188000). Same shape as
- * T8140's t8140_pmu_write: the reply vector is masked, the command and its data
- * are written to +0x4, the reply polled and acknowledged. Measured on the J616s
- *: the boot stage is set to 0x50 by an extended write whose command
- * word is (0xf801 << 16) | 0x8e30 = 0xf8018e30, and NOTIFY_ENABLE is 0x2000001
- * on both controllers' +0x40.
+ * The PMU over SPMI (spmi0 = 0x509014000, spmi-a0 = 0x509188000), written as on the T8140.
+ * Measured on the J616s: the boot stage is set to 0x50 by an extended write whose
+ * command word is (0xf801 << 16) | 0x8e30 = 0xf8018e30, and NOTIFY_ENABLE is 0x2000001 on
+ * both controllers' +0x40.
  */
-#define SPMI_STATUS		0x00
-#define SPMI_STATUS_RX_EMPTY	BIT(24)
-#define SPMI_CMD		0x04
-#define SPMI_REPLY		0x08
-#define SPMI_NOTIFY_ENABLE	0x40
-#define SPMI_NOTIFY_ACK		0x80
-#define SPMI_NOTIFY_REPLY	BIT(0)
-#define SPMI_CMD_WRITE		(BIT(15) | (0xe << 8) | 0x30)	/* low 16 bits 0x8e30 */
-#define SPMI_NOTIFY_ENABLE_SLEEP	0x2000001
+/* A PMU register write on the sleep's SPMI bus, and the boot stage that announces a sleep */
+#define SPMI_CMD_WRITE		(BIT(15) | (0xe << 8) | 0x30)
 #define PMU_BOOT_STAGE		0xf801		/* T6040 slave/reg; cmd 0xf8018e30 */
 #define PMU_BOOT_STAGE_SLEEP	0x50
+/* The response vector's enable for the sleep */
+#define SPMI_NOTIFY_ENABLE_SLEEP	0x2000001
 
 /*
  * MasterMini (NUB_MPMGR_AON, RegMap 4 = pmgr reg[0x37] = 0x508900000).
@@ -382,37 +333,11 @@ static const struct {
 #define T6040_AXI2AF_DOMAINS	15
 
 /*
- * The AON watchdog's WD2, the sleep safety net. ADT wdt reg[0] = 0x50836c000.
- * Offsets and the 24 MHz tick follow the platform (its AON watchdog for a reconfig)
- * and the ADT (simple-reconfig-wdog-icc-time = 5). Linux's own
- * watchdog driver runs WD1 (+0x10..+0x1c), not this one.
+ * The AON watchdog's WD2, the sleep safety net: ADT wdt reg[0] = 0x50836c000, with the
+ * T8140's registers. Linux's own watchdog driver runs WD1 (+0x10..+0x1c), not this one.
+ * ALARM is 32 bits at 24 MHz.
  */
-#define WDT_WD0_CTL		0x0c
-#define WDT_WD2_COUNT		0x20
-#define WDT_WD2_ALARM		0x28
-#define WDT_WD2_CTL		0x2c
-#define WDT_TICKS_PER_S		24000000
-/* From .begin to .end: the device suspend and resume, as on T8140. */
-#define WDT_SUSPEND_SECS	120
-/* ALARM is 32 bits at 24 MHz. */
 #define WDT_MAX_SECS		178U
-
-/* ASC CPU control, the same in every Apple coprocessor wrapper. */
-#define ASC_CPU_CONTROL		0x44
-#define ASC_CPU_CONTROL_RUN	BIT(4)
-#define ASC_CPU_STATUS		0x48
-
-/*
- * The deep-sleep IMPDEF sysreg. The platform on T6040 prepares a core for
- * sleep with the same register and bits as
- * T8140. Written by every core right before its last WFI; only a reset clears
- * it.
- */
-#define SYS_APL_DEEP_SLEEP	sys_reg(3, 5, 15, 6, 2)
-#define DEEP_SLEEP_ENABLE	(BIT_ULL(0) | BIT_ULL(63))
-#define SYS_APL_IPI_SR_EL1	sys_reg(3, 5, 15, 1, 1)
-#define SYS_APL_SIQ_CFG_EL1	sys_reg(3, 4, 15, 10, 4)
-#define IPI_SR_PENDING		BIT(0)
 
 struct t6040_sleep_group {
 	const char *name;
@@ -2627,7 +2552,6 @@ static int t6040_sleep_dry_enter(struct t6040_sleep *s, unsigned int dry)
 	return -EBUSY;
 }
 
-#define PS_DEV_DISABLE		BIT(10)
 #define PS_RESET_REQ		BIT(12)
 
 #define DISP_CPU_GATE_US	50000
