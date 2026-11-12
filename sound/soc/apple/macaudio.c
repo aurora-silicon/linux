@@ -2779,6 +2779,17 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 			card->dai_link[i].num_platforms = 0;
 		else
 			card->dai_link[i].platforms->of_node = platform;
+
+		/*
+		 * A stream with more slots than amps: the front-end carries
+		 * every slot, while a back-end with a single amp would cap it
+		 * at that codec's own channel count (ASoC merges a lone
+		 * codec's channels, not several codecs'). The amp takes its
+		 * slots from its TDM mask.
+		 */
+		if (ma->cfg->speaker_fe_channels &&
+		    !strcmp(card->dai_link[i].name, "Secondary"))
+			card->dai_link[i].dpcm_merged_chan = 0;
 	}
 
 	/* Skip the speaker sense PCM link if this amp has no sense (or no speakers) */
@@ -4216,10 +4227,34 @@ struct macaudio_platform_cfg macaudio_j604_cfg = {
 };
 
 /*
- * J773 (Mac mini, M4 Pro) and J575c (Mac Studio, M4 Max): one SN012776 on
- * the AOP's speaker stream. Neither speaker has been brought up or has a
- * protection profile, and the J773s stream returns no V/I sense, so keep
- * them off as on the J614s: the speaker link is not bound.
+ * J575c (Mac Studio, M4 Max): the J616s stream, six 32-bit playback and
+ * twelve 16-bit sense slots in the same 250-bit frame (the firmware runs it
+ * so, although the ADT's audio-speaker lists one playback slot), with one
+ * SN012776 on the first two playback slots (it downmixes them) and the
+ * first two sense slots (current, then voltage), which speakersafetyd's
+ * J575 model reads. The front-end carries all six channels; the last four
+ * are silent.
+ */
+struct macaudio_platform_cfg macaudio_j575c_cfg = {
+	.enable_speakers = true,
+	.amp = AMP_SN012776,
+	.speakers = SPKR_1W,
+	.stereo = false,
+	.safe_vol = -20,
+	.fe_dai_names = { "j616-pcm-0", "j616-pcm-1", "j616-pcm-2" },
+	.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC |
+		   SND_SOC_DAIFMT_GATED | SND_SOC_DAIFMT_NB_IF,
+	.secondary_bclk_ratio = 250,
+	.fe_cpu_is_platform = true,
+	/* No headphone codec on this card: the jack is a card of its own. */
+	.route_only_fes = BIT(0),
+	.speaker_fe_channels = 6,
+};
+
+/*
+ * J773 (Mac mini, M4 Pro): one SN012776 on the AOP's speaker stream. The
+ * speaker has not been brought up and has no protection profile, so keep it
+ * off as on the J614s: the speaker link is not bound.
  */
 struct macaudio_platform_cfg macaudio_j575c_j773_cfg = {
 	.enable_speakers = false,
@@ -4350,8 +4385,8 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	/* j514    AID28   sn012776    15      2x 2W+1T Compat: apple,j314-macaudio */
 	/* j516    AID29   sn012776    15      2x 2W+1T Compat: apple,j316-macaudio */
 	/* j575    AID33   sn012776    15      1x 1W    Compat: apple,j375-macaudio */
-	/* j575c   -       sn012776    -       1x 1W    (AOP-fed; speaker off until bring-up) */
-	{ .compatible = "apple,j575c-macaudio", .data = &macaudio_j575c_j773_cfg },
+	/* j575c   -       sn012776    -       1x 1W    (AOP-fed) */
+	{ .compatible = "apple,j575c-macaudio", .data = &macaudio_j575c_cfg },
 	/* j575c   -       cs42l84     -       the jack, a card of its own (AOP-fed) */
 	{ .compatible = "apple,j575c-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* j613    AID20   sn012776    15      2x 1W+1T Compat: apple,j413-macaudio */
