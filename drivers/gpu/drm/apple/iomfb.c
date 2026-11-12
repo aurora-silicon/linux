@@ -11,6 +11,7 @@
 #include <linux/dma-map-ops.h>
 #include <linux/dma-mapping.h>
 #include <linux/iommu.h>
+#include <linux/jhash.h>
 #include <linux/kref.h>
 #include <linux/module.h>
 #include <linux/of_device.h>
@@ -1699,6 +1700,8 @@ void dcp_hotplug(struct work_struct *work)
 			dcp_clear_connector_edid(connector);
 	}
 	dcp_hotplug_retrain_note(dcp, READ_ONCE(connector->connected));
+	if (READ_ONCE(connector->connected))
+		dcp_wake_list_check(dcp);
 
 	gated = dcp_announce_gated(dcp, connector);
 	if (gated) {
@@ -1736,6 +1739,8 @@ void dcp_hotplug(struct work_struct *work)
 		    * again, and that wake does the same, forever.
 		    */
 		   !READ_ONCE(dcp->typec_crtc_off) &&
+		   /* Nor for a list that is being read again after a wake. */
+		   !dcp_wake_reread_pending(dcp) &&
 		   (!dcp_uses_t6020_tunnel_flow(dcp) ||
 		    dcp->tunnel_power_cycles < DCP_TUNNEL_POWER_CYCLES)) {
 		bool power_cycle = dcp_uses_t6020_tunnel_flow(dcp);
@@ -3030,6 +3035,24 @@ int dcp_crtc_check_hdr(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	default:
 		return -EINVAL;
 	}
+}
+
+/*
+ * The modes a display lists, as one word that is never 0 and does not depend
+ * on their order: for telling whether it lists the same ones later.
+ */
+u32 dcp_modes_signature(struct apple_dcp *dcp)
+{
+	unsigned int i;
+	u32 sig = 0;
+
+	guard(mutex)(&dcp->modes_lock);
+	for (i = 0; i < dcp->nr_modes; i++) {
+		const struct drm_display_mode *m = &dcp->modes[i].mode;
+
+		sig += jhash_3words(m->hdisplay, m->vdisplay, m->clock, 0);
+	}
+	return sig ?: 1;
 }
 
 /* The user may own drm_display_mode, so we need to search for our copy */

@@ -3175,11 +3175,55 @@ void dcp_link_recovery_schedule(struct apple_dcp *dcp)
 {
 	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP || dcp->main_display ||
 	    !dcp_is_typec_output(dcp) || !READ_ONCE(dcp->typec_cable_connected) ||
-	    dcp->link_recovery_tries >= DCP_LINK_RECOVERY_TRIES)
+	    dcp->link_recovery_tries >= DCP_LINK_RECOVERY_TRIES ||
+	    dcp_wake_reread_pending(dcp))
 		return;
 	dcp->link_recovery_snap = atomic_read(&dcp->modesets_done);
 	mod_delayed_work(system_freezable_wq, &dcp->link_recovery_wq,
 			 msecs_to_jiffies(DCP_LINK_RECOVERY_DELAY_MS));
+}
+
+#define DCP_WAKE_REREAD_DELAY_MS	500
+#define DCP_WAKE_REREAD_MS		500
+
+/* A display's list is being read again after a wake: dcp_wake_list_check(). */
+bool dcp_wake_reread_pending(struct apple_dcp *dcp)
+{
+	unsigned long until = READ_ONCE(dcp->wake_reread);
+
+	return until && time_before(jiffies, until);
+}
+
+/*
+ * A display that the link of a wake has just woken can answer the first read
+ * with the modes of its standby, and gives no new HPD when its own are there
+ * a second later: a G95NC in picture-by-picture mode lists its full-width
+ * modes and none of its half.  The desktop then finds no mode for it, and
+ * dcp_link_recovery_schedule() reads it again only if a retrain happened to
+ * run against that list.  So the first list after a wake is held against the
+ * one the sleep found (dcp_hib_release_ext_link()), and a display that lists
+ * other modes is connected again once, as a replug does, whatever it lists
+ * then.  Called from the connector's hotplug work.
+ */
+void dcp_wake_list_check(struct apple_dcp *dcp)
+{
+	u32 sig;
+
+	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP || dcp->main_display ||
+	    !READ_ONCE(dcp->wake_list_sig) || !dcp->nr_modes)
+		return;
+	sig = xchg(&dcp->wake_list_sig, 0);
+	if (!sig || !dcp_is_typec_output(dcp) ||
+	    !READ_ONCE(dcp->typec_cable_connected) || dcp_modes_signature(dcp) == sig)
+		return;
+	dev_info(dcp->dev, "the display lists other modes than before the sleep (%u), reading it again\n",
+		 dcp->nr_modes);
+	/* Past the work's own wait by a second; nothing holds on to it longer. */
+	WRITE_ONCE(dcp->wake_reread,
+		   (jiffies + msecs_to_jiffies(DCP_WAKE_REREAD_DELAY_MS +
+					       DCP_WAKE_REREAD_MS + 1000)) ?: 1);
+	mod_delayed_work(system_freezable_wq, &dcp->link_recovery_wq,
+			 msecs_to_jiffies(DCP_WAKE_REREAD_DELAY_MS));
 }
 
 static void dcp_link_recovery_work(struct work_struct *work)
@@ -3187,14 +3231,21 @@ static void dcp_link_recovery_work(struct work_struct *work)
 	struct apple_dcp *dcp = container_of(to_delayed_work(work),
 					     struct apple_dcp, link_recovery_wq);
 	struct platform_device *pdev = to_platform_device(dcp->dev);
+	bool wake = dcp_wake_reread_pending(dcp);
 
 	if (!READ_ONCE(dcp->typec_cable_connected) ||
-	    atomic_read(&dcp->modesets_done) != dcp->link_recovery_snap)
+	    (!wake && atomic_read(&dcp->modesets_done) != dcp->link_recovery_snap)) {
+		WRITE_ONCE(dcp->wake_reread, 0);
 		return;
-	dev_info(dcp->dev, "link recovery %u: connecting again after a retrain that found no mode\n",
-		 ++dcp->link_recovery_tries);
+	}
+	if (!wake)
+		dev_info(dcp->dev, "link recovery %u: connecting again after a retrain that found no mode\n",
+			 ++dcp->link_recovery_tries);
 	dcp_dptx_disconnect_oob(pdev, 0);
-	msleep(500);
+	/* What the display asked for with the list it had: the next one says. */
+	WRITE_ONCE(dcp->peer_starved, false);
+	msleep(DCP_WAKE_REREAD_MS);
+	WRITE_ONCE(dcp->wake_reread, 0);
 	dcp_dptx_connect_oob(pdev, 0);
 }
 
@@ -10220,6 +10271,12 @@ static void dcp_hib_release_ext_link(struct apple_dcp *dcp)
 	struct apple_dcp *owner;
 	int ret = 0;
 
+	/* What a Type-C display lists now, for the wake: dcp_wake_list_check(). */
+	WRITE_ONCE(dcp->wake_reread, 0);
+	WRITE_ONCE(dcp->wake_list_sig,
+		   typec && READ_ONCE(dcp->active_typec_route) && con &&
+		   READ_ONCE(con->connected) && READ_ONCE(con->dcp) == pdev &&
+		   dcp->nr_modes ? dcp_modes_signature(dcp) : 0);
 	if (!dcp->fixed_phy && !READ_ONCE(dcp->active_typec_route))
 		return;
 
@@ -10618,6 +10675,7 @@ static void dcp_hib_ext_link_up(struct apple_dcp *dcp, const char *when)
 {
 	bool display = dcp_hib_ext_has_display(dcp);
 
+	dcp_fabric_hybrid_woken(dcp);
 	dcp_hib_ext_put(dcp, true, display);
 	if (display &&
 	    !wait_event_timeout(dcp_hib_ext_wq, dcp_hib_ext_settled(),

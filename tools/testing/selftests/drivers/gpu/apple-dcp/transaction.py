@@ -42,7 +42,7 @@ def controls(ROOT):
      void *tb_dpin_set_active,*tb_dpin_ctx,*phy,*fixed_phy;
      struct mux_control *xbar,*fixed_xbar;
      /* desktop 26.x hybrid hand-over and dual-pipe state; fw_compat is never desktop here */
-     bool peer_starved,typec_narrow,hdmi_yielded;
+     bool peer_starved,typec_narrow,hdmi_yielded; unsigned wake_list_sig;
      struct apple_dcp_typec_route *active_typec_route,*typec_routes;
      struct connector *connector,*fixed_connector;int connector_type,fixed_connector_type;
      struct mux_control *direct_xbar_up; bool external_native, ext_dead; int fw_compat; unsigned long long tb_generation;
