@@ -6714,7 +6714,7 @@ static void dcp_t8132_ext_routes(struct apple_dcp *dcp)
 }
 
 static int dcp_s2r_pm_register(struct apple_dcp *dcp);
-#ifdef CONFIG_HIBERNATION
+#ifdef CONFIG_PM_SLEEP
 static void dcp_hib_restore_work(struct work_struct *work);
 static int dcp_hib_register(struct apple_dcp *dcp);
 #endif
@@ -6895,7 +6895,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&dcp->bl_fallback_wq, dcp_work_backlight_fallback);
 	/* System sleep and shutdown cancel these even if no bind succeeded. */
 	INIT_WORK(&dcp->vblank_wq, dcp_delayed_vblank);
-#ifdef CONFIG_HIBERNATION
+#ifdef CONFIG_PM_SLEEP
 	INIT_WORK(&dcp->hib_restore_work, dcp_hib_restore_work);
 	/*
 	 * From probe: the notifier flushes a restart before the next sleep,
@@ -7463,7 +7463,6 @@ static void dcp_platform_remove(struct platform_device *pdev)
 		iomfb_v14_7_remove(dcp);
 }
 
-/* A refused takeover left the DCP running untouched, see apple_drv.c. */
 #ifdef CONFIG_HIBERNATION
 /*
  * From PM_HIBERNATION_PREPARE to PM_POST_HIBERNATION, whatever
@@ -7476,11 +7475,6 @@ static bool dcp_hibernating(void)
 {
 	return READ_ONCE(dcp_hib_in_progress);
 }
-
-static int dcp_hib_prepare(struct apple_dcp *dcp);
-static void dcp_hib_stop_ext_link_work(struct apple_dcp *dcp);
-static void dcp_hib_ext_get(struct apple_dcp *dcp);
-static void dcp_hib_ext_put(struct apple_dcp *dcp, bool start, bool idle);
 #else
 static bool dcp_hibernating(void)
 {
@@ -7488,6 +7482,14 @@ static bool dcp_hibernating(void)
 }
 #endif
 
+#ifdef CONFIG_PM_SLEEP
+static int dcp_hib_prepare(struct apple_dcp *dcp);
+static void dcp_hib_stop_ext_link_work(struct apple_dcp *dcp);
+static void dcp_hib_ext_get(struct apple_dcp *dcp);
+static void dcp_hib_ext_put(struct apple_dcp *dcp, bool start, bool idle);
+#endif
+
+/* A refused takeover left the DCP running untouched, see apple_drv.c. */
 static bool dcp_takeover_was_aborted(struct apple_dcp *dcp)
 {
 	return dcp && dcp->desktop && READ_ONCE(dcp->desktop->takeover_aborted);
@@ -7713,7 +7715,7 @@ static int dcp_platform_prepare(struct device *dev)
 		}
 		return 0;
 	}
-#ifdef CONFIG_HIBERNATION
+#ifdef CONFIG_PM_SLEEP
 	/*
 	 * A T6040 S2R takes the power from the DP PHYs as the cold boot of a resume from
 	 * disk does: an external processor gives its link back the same way.
@@ -9390,7 +9392,7 @@ static void dcp_t6041_s2r_afk(struct apple_dcp *dcp, bool resume)
  */
 static void dcp_t6041_s2r_stop_link_work(struct apple_dcp *dcp)
 {
-#ifdef CONFIG_HIBERNATION
+#ifdef CONFIG_PM_SLEEP
 	if (dcp_desktop_external(dcp)) {
 		dcp_hib_stop_ext_link_work(dcp);
 		return;
@@ -9500,7 +9502,7 @@ static void dcp_t6041_s2r_resume(struct apple_dcp *dcp)
 	dcp->t6041_s2r_stopped = false;
 
 	if (!dcp_t6041_s2r_domains_on(dcp)) {
-#ifdef CONFIG_HIBERNATION
+#ifdef CONFIG_PM_SLEEP
 		if (!dcp_desktop_external(dcp)) {
 			/* W2: the internal scanout/display DART streams back first. */
 			dcp_s2r_find_darts(dcp);
@@ -9542,7 +9544,7 @@ static void dcp_t6041_s2r_resume(struct apple_dcp *dcp)
 #endif
 	}
 
-#ifdef CONFIG_HIBERNATION
+#ifdef CONFIG_PM_SLEEP
 	/* Not coming back: the other external processors do not wait for this one's link. */
 	dcp_hib_ext_put(dcp, true, true);
 #endif
@@ -9724,7 +9726,7 @@ static int dcp_platform_resume(struct device *dev)
 	return 0;
 }
 
-#ifdef CONFIG_HIBERNATION
+#ifdef CONFIG_PM_SLEEP
 /*
  * Hibernation.
  *
@@ -10914,17 +10916,12 @@ static const struct dev_pm_ops dcp_platform_pm_ops = {
 	.complete = pm_sleep_ptr(dcp_platform_complete),
 	.suspend = pm_sleep_ptr(dcp_platform_suspend),
 	.resume = pm_sleep_ptr(dcp_platform_resume),
-#ifdef CONFIG_HIBERNATION
+#ifdef CONFIG_PM_SLEEP
 	.freeze = dcp_platform_freeze,
 	.thaw = dcp_platform_thaw,
 	.poweroff = dcp_platform_poweroff,
 	.restore_early = dcp_platform_restore_early,
 	.restore = dcp_platform_restore,
-#else
-	.freeze = pm_sleep_ptr(dcp_platform_suspend),
-	.thaw = pm_sleep_ptr(dcp_platform_resume),
-	.poweroff = pm_sleep_ptr(dcp_platform_suspend),
-	.restore = pm_sleep_ptr(dcp_platform_resume),
 #endif
 };
 
