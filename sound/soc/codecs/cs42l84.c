@@ -1261,9 +1261,11 @@ err_disable_noreset:
 /*
  * System sleep. The interrupt is level low and its thread reads the codec over
  * I2C, so it is off from the suspend until the codec is set up again. A real
- * S2R cuts the codec's power: it comes back with its reset defaults, so its
- * registers are written again from the cache, and a jack that was seen before
- * is reported gone; one still plugged in raises the plug interrupt again.
+ * S2R cuts the codec's power, and a resume from disk went through a boot: the
+ * codec comes back with its reset defaults, or with what the kernel that
+ * loaded the image set up. Its registers are then written again from the
+ * cache, and a jack that was seen before is reported gone; one still plugged
+ * in raises the plug interrupt again.
  */
 static int cs42l84_suspend(struct device *dev)
 {
@@ -1280,14 +1282,14 @@ static int cs42l84_suspend(struct device *dev)
 	return 0;
 }
 
-static int cs42l84_resume(struct device *dev)
+static int cs42l84_wake(struct device *dev, bool lost)
 {
 	struct cs42l84_private *cs42l84 = dev_get_drvdata(dev);
 	struct i2c_client *i2c_client = to_i2c_client(dev);
 	int ret = 0;
 
 	regcache_cache_only(cs42l84->regmap, false);
-	if (pm_resume_via_firmware()) {
+	if (lost) {
 		if (cs42l84->reset_gpio) {
 			gpiod_set_value_cansleep(cs42l84->reset_gpio, 0);
 			usleep_range(1000, 2000);
@@ -1327,7 +1329,25 @@ static int cs42l84_resume(struct device *dev)
 	return ret;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(cs42l84_pm_ops, cs42l84_suspend, cs42l84_resume);
+static int cs42l84_resume(struct device *dev)
+{
+	return cs42l84_wake(dev, pm_resume_via_firmware());
+}
+
+/* Also after a hibernation that was given up before its image: nothing lost then. */
+static int cs42l84_restore(struct device *dev)
+{
+	return cs42l84_wake(dev, pm_hibernate_is_restored());
+}
+
+static const struct dev_pm_ops cs42l84_pm_ops = {
+	.suspend = pm_sleep_ptr(cs42l84_suspend),
+	.resume = pm_sleep_ptr(cs42l84_resume),
+	.freeze = pm_sleep_ptr(cs42l84_suspend),
+	.thaw = pm_sleep_ptr(cs42l84_resume),
+	.poweroff = pm_sleep_ptr(cs42l84_suspend),
+	.restore = pm_sleep_ptr(cs42l84_restore),
+};
 
 static void cs42l84_i2c_remove(struct i2c_client *i2c_client)
 {
