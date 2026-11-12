@@ -598,16 +598,17 @@ static bool apple_rtkit_helper_cpu_running(struct apple_rtkit_helper *helper)
  * restore re-adopts the instance the boot loader started for the resume boot,
  * exactly as probe adopted the first one.
  *
- * A session this driver started itself is left running as well: MTP does not
- * come back from QUIESCED (RTKit endpoint discovery fails with -ETIME on the
- * next start). When this is the boot kernel of a resume from disk (it started
- * MTP so that the disk passphrase can be typed), it hands the running
- * firmware to the image: mailbox RX is held, so that what the firmware sends
- * now stays queued for the restored kernel, the messages already received
- * are handled, and the shared buffers are described for the restored kernel,
- * which can only take the session over if its own buffers sit at the same
- * IOVAs (the firmware keeps writing to the IOVAs it was given, and after the
- * restore the DART translates them through the image's page tables).
+ * A session this driver started itself is left running as well: the MTP
+ * firmware does not come back from QUIESCED (it does not answer the endpoint
+ * discovery of the next start). When this is the boot kernel of a resume from
+ * disk (it started MTP so that the disk passphrase can be typed), it hands
+ * the running firmware to the image: mailbox RX is held, so that what the
+ * firmware sends now stays queued for the restored kernel, the messages
+ * already received are handled, and the shared buffers are described for the
+ * restored kernel, which can only take the session over if its own buffers
+ * sit at the same IOVAs (the firmware keeps writing to the IOVAs it was
+ * given, and after the restore the DART translates them through the image's
+ * page tables).
  */
 static int apple_rtkit_helper_freeze(struct device *dev)
 {
