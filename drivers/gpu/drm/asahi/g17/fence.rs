@@ -190,6 +190,7 @@ impl Submission {
             let error = self.error.load(Ordering::Acquire);
             if error != 0 { fence.set_error(Error::from_errno(error)); }
             else { self.release_state(); }
+            super::trace::output(fence, error);
             if fence.scoped { signal_exported(fence); } else { fence.signal(); }
         }
     }
@@ -202,7 +203,7 @@ impl Aggregate {
         // Only Outputs::publish constructs Aggregate, after setting the payload.
         self.0.source.as_ref().expect("published aggregate has submission state")
     }
-    fn fence(&self) -> Fence { Fence::from_fence(&self.0) }
+    pub(crate) fn fence(&self) -> Fence { Fence::from_fence(&self.0) }
     pub(crate) fn member(&self) -> Member {
         self.source().remaining.fetch_add(1, Ordering::Relaxed);
         self.source().owners.fetch_add(1, Ordering::Relaxed);
@@ -366,6 +367,14 @@ impl Outputs {
             submission: None, result: Err(ECANCELED), cumulative })
     }
     pub(crate) fn inputs(&self) -> &[SyncItem] { &self.syncs[..self.input_count] }
+    /// The fence installed, or about to be installed on error, in every output sync.
+    pub(crate) fn output_fence(&self) -> Option<Fence> {
+        self.submission.as_ref().map(Aggregate::fence).or_else(|| {
+            self.fallback
+                .as_ref()
+                .map(Fence::from_fence)
+        })
+    }
     pub(crate) fn publish(&mut self, context: Arc<Context>, firmware_source: bool) -> Result<Aggregate> {
         let source = Submission::new(context, firmware_source)?;
         let mut fence = self.fallback.take().ok_or(EINVAL)?;
@@ -399,6 +408,10 @@ impl Drop for Outputs {
             } else {
                 install(self.syncs.drain(self.input_count..), &Fence::from_fence(&fallback));
             }
+            super::trace::output(
+                &fallback,
+                self.result.as_ref().err().map_or(0, |error| error.to_errno()),
+            );
             fallback.signal();
         }
     }
