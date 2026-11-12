@@ -665,6 +665,15 @@ static inline void ane_t6021_progtab_count(const struct ane_t6021_progtab *t,
  */
 #define ANE_T6021_ASC_BUSY	1	/* RUN clear, STOPPED never seen */
 
+/*
+ * Module parameters hung_stop and hung_settle_ms, shared by the T8112 and
+ * H16 paths of ane_t6021.ko: whether a hung job's engine is powered off and
+ * cold-booted (1) or kept quarantined until reboot (0), and the extra wait
+ * before that power-off.
+ */
+extern unsigned int ane_t6021_hung_stop;
+extern unsigned int ane_t6021_hung_settle_ms;
+
 enum ane_t6021_restart_stage {
 	ANE_T6021_RESTART_STOP,		/* failed before power removal */
 	ANE_T6021_RESTART_CYCLE,	/* failed in the power cycle */
