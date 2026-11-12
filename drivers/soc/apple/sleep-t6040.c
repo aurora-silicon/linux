@@ -106,6 +106,7 @@
 #define PS_APCIE_SYS_ST0	0x380	/* SOC-East: ps_apcie_sys_st0 */
 #define PS_APCIE_SYS_ST1	0x388	/* SOC-East: ps_apcie_sys_st1 */
 #define PS_APCIE_PHY_SW		0x398	/* SOC-East: ps_apcie_phy_sw (the shared PHY) */
+#define PS_FAB2_SOC		0x338	/* SOC: the ATC commons' parent */
 /* The clock-gated words (TARGET 4) the commit writes, as the sleep engine asks for them. */
 #define PS_APCIE_PHY_SW_CLKGATED	0x0f000244
 #define PS_APCIE_GP_CLKGATED	0x00000244
@@ -149,28 +150,20 @@
 #define SOC_EAST_TIMEOUT_US	5000
 
 /*
- * ClkGen SOC (pmgr reg3 = 0x500000000). The clk-mux park words
- * (0x500038050/054/060/064) have bits [27:24] cleared at quiesce (observed
- * 0xa5100000 / 0xa7100000 -> 0xa0100000), with BIT31 set, each polled until
- * BIT30 clears. This is the clock quiesce, NOT measured on the J616s:
- * the one measured entry did not cover the clkgen block. Wake restores
- * the saved words (the clock restore is otherwise a NOP).
+ * The clock quiesce, whole and nothing else: two SOC-East words lose BIT28 and are
+ * polled until [7:4] reads their [3:0]; then the four clk-mux park words of ClkGen SOC (ADT
+ * pmgr reg[3] = 0x500000000, +0x38050/054/060/064), in t6040_clkgen_mux[] order, get [27:24]
+ * := 0 with BIT31 set, each polled until BIT30 clears. The wake writes the saved clk-mux
+ * words back; there is nothing else to restore. Not measured on the J616s.
  */
+#define SOC_EAST_CLK_A		0x120
+#define SOC_EAST_CLK_B		0x130
+#define SOC_EAST_CLK_AUTO	BIT(28)
 #define CLKGEN_MUX_SET		0x80000000
 #define CLKGEN_MUX_MASK		0xf0ffffff
 #define CLKGEN_MUX_WORDS	4
 #define CLKGEN_MUX_PENDING	BIT(30)
 #define CLK_QUIESCE_TIMEOUT_US	1000
-
-/*
- * The clock quiesce, whole: two SOC-East
- * words lose BIT28 and are polled until [7:4] reads their [3:0], then the four
- * clk-mux words, in this order, get [27:24] := 0 with BIT31 and are polled until
- * BIT30 clears. Nothing else (no +0x70000 write).
- */
-#define SOC_EAST_CLK_A		0x120
-#define SOC_EAST_CLK_B		0x130
-#define SOC_EAST_CLK_AUTO	BIT(28)
 
 /*
  * The keep-alive enables: 32 words in PMGR SOC
@@ -200,6 +193,9 @@
  * and [7:4] polled to 0.
  */
 #define T6040_AGX_GATE_PA	0x508375010ULL
+#define AGX_GATE_RESIDENT	GENMASK(19, 18)
+#define T6040_AFR_PS_PA		0x288e80100ULL
+#define AGX_TIMEOUT_US		10000
 
 /*
  * The hardware steps of the generic PMGR quiesce that run on J616s before
@@ -218,6 +214,7 @@ static const u64 t6040_acc_apsc_pa[] = { 0x210e20020ULL, 0x211e20020ULL, 0x212e2
 #define ACC_APSC_BUSY		BIT_ULL(7)
 #define ACC_PLL_RELOCK		BIT_ULL(42)
 #define ACC_PLL_RELOCK_COMPLEXES	2
+#define QUIESCE_TIMEOUT_US	2000
 
 static const struct {
 	u64 ctl;
@@ -241,12 +238,6 @@ static const struct {
  */
 #define T6040_PMC_BWR_PA	0x5048ac020ULL
 #define PMC_BOOST		0x8
-
-#define QUIESCE_TIMEOUT_US	2000
-
-#define AGX_GATE_RESIDENT	GENMASK(19, 18)
-#define T6040_AFR_PS_PA		0x288e80100ULL
-#define AGX_TIMEOUT_US		10000
 
 /*
  * The PMU over SPMI (spmi0 = 0x509014000, spmi-a0 = 0x509188000), written as on the T8140.
@@ -290,17 +281,34 @@ static const struct {
 #define DISP_PWRGATE_B		0x60	/* := 0 before DISP_SYS goes down, 1 after it is up */
 #define PS_DISP_FE		0x368	/* soc_east */
 #define PS_DISP_SYS		0x258	/* soc_east */
-#define AXI2AF_DISP_SYS		4	/* t6040_axi2af[] index */
 #define DISP_PS_TIMEOUT_US	8000
+#define DISP_CPU_GATE_US	50000
 
 /* The GP PCIe (t602x port layout, as T8140's radio port): power words in soc_east. */
 #define PS_APCIE_GP		0x100
 #define PS_APCIE_SYS_GP		0x390
-#define AXI2AF_ANS		9
-#define AXI2AF_APCIE_SYS_GP	14
 #define GP_PIN_DATA		BIT(0)
 #define T6040_PMC_DCP_PA	0x5048a9c14ULL	/* count of DCPs powered (+0), second voter (+4); the platform ends at 0/0 */
-#define T6040_AXI2AF_DOMAINS	15
+
+/* The axi2af fabric-bridge retention domains, t6040_axi2af[] */
+enum {
+	AXI2AF_ATC0_COMMON,
+	AXI2AF_ATC1_COMMON,
+	AXI2AF_ATC2_COMMON,
+	AXI2AF_ATC3_COMMON,
+	AXI2AF_DISP_SYS,
+	AXI2AF_DISPEXT0_SYS,
+	AXI2AF_DISPEXT1_SYS,
+	AXI2AF_DISPEXT2_SYS,
+	AXI2AF_DISPEXT3_SYS,
+	AXI2AF_ANS,
+	AXI2AF_AVD_SYS,
+	AXI2AF_VENC0_SYS,
+	AXI2AF_VENC1_SYS,
+	AXI2AF_JPG,
+	AXI2AF_APCIE_SYS_GP,
+	T6040_AXI2AF_DOMAINS
+};
 
 /*
  * The AON watchdog's WD2, the sleep safety net: ADT wdt reg[0] = 0x50836c000, with the
@@ -308,6 +316,7 @@ static const struct {
  * ALARM is 32 bits at 24 MHz.
  */
 #define WDT_MAX_SECS		178U
+#define T6040_WDT_PA		0x50836c000ULL	/* the address t6040_resume_stub writes */
 
 struct t6040_sleep_group {
 	const char *name;
@@ -598,32 +607,6 @@ static unsigned int t6040_sleep_live_blockers(struct t6040_sleep *sleep, struct 
 	return blockers + disp;
 }
 
-static void t6040_axi2af_show(struct t6040_sleep *sleep, struct seq_file *s);
-
-static int t6040_sleep_preflight_show(struct seq_file *s, void *unused)
-{
-	struct t6040_sleep *sleep = s->private;
-	unsigned int live = t6040_sleep_live_blockers(sleep, s, NULL);
-	unsigned int i;
-
-	apple_sleep_registry_show(s);
-	t6040_axi2af_show(sleep, s);
-	seq_printf(s, "verdict: %u live blocker(s)\n", live);
-	seq_printf(s, "dry_run %u, wd2_secs %u, allow_entry %d, parking ops %s\n",
-		   READ_ONCE(dry_run), READ_ONCE(wd2_secs), allow_entry,
-		   sleep->power_ops ? "registered" : "not registered");
-	if (sleep->cluster_ctl) {
-		static const char * const nm[] = { "EACC", "PACC0", "PACC1_ANE", "DISP_INT", "DISP_EXT" };
-
-		for (i = 0; i < CLUSTER_CTL_NR; i++)
-			seq_printf(s, "cluster-ctl +%#x %-9s %#x\n", CLUSTER_CTL(i), nm[i],
-				   readl(sleep->cluster_ctl + CLUSTER_CTL(i)));
-	}
-
-	return 0;
-}
-DEFINE_SHOW_ATTRIBUTE(t6040_sleep_preflight);
-
 /* The display groups' on-state, one line per group, no allocation. For the log at the commit point. */
 static unsigned int t6040_sleep_log_groups(struct t6040_sleep *sleep)
 {
@@ -704,8 +687,8 @@ static u32 t6040_cpu_start_bit(u64 mpidr)
 #define ED_EDPRCR		0x310
 #define ED_EDLAR		0xfb0
 #define ED_LOCK_ACCESS_KEY	0xc5acce55
-#define T6040_ED_CLUSTERS	3
-#define T6040_ED_CORES		6
+#define T6040_ED_CLUSTERS	ARRAY_SIZE(t6040_cluster_slots)
+#define T6040_ED_CORES		6	/* the most slots of a cluster */
 
 static void __iomem *t6040_ed[T6040_ED_CLUSTERS][T6040_ED_CORES];
 
@@ -715,7 +698,7 @@ static void t6040_ed_map(struct device *dev)
 
 	for_each_possible_cpu(cpu) {
 		u64 mpidr = cpu_logical_map(cpu);
-		unsigned int c = MPIDR_AFFINITY_LEVEL(mpidr, 1), k = MPIDR_AFFINITY_LEVEL(mpidr, 0);
+		unsigned int c = t6040_cpu_cluster(mpidr), k = t6040_cpu_core(mpidr);
 
 		if (c >= T6040_ED_CLUSTERS || k >= T6040_ED_CORES || t6040_ed[c][k])
 			continue;
@@ -729,7 +712,7 @@ static void t6040_ed_map(struct device *dev)
 static void t6040_ed_release(void)
 {
 	u64 mpidr = read_cpuid_mpidr();
-	unsigned int c = MPIDR_AFFINITY_LEVEL(mpidr, 1), k = MPIDR_AFFINITY_LEVEL(mpidr, 0);
+	unsigned int c = t6040_cpu_cluster(mpidr), k = t6040_cpu_core(mpidr);
 	void __iomem *ed;
 
 	if (c >= T6040_ED_CLUSTERS || k >= T6040_ED_CORES)
@@ -1104,21 +1087,21 @@ static const struct t6040_axi2af_domain {
 	u32 ps_off;
 	phys_addr_t bridge_pa;
 } t6040_axi2af[] = {
-	{ "atc0_common",  false, 0x390, 0x380000000 },
-	{ "atc1_common",  false, 0x3b8, 0x388000000 },
-	{ "atc2_common",  false, 0x3e0, 0x390000000 },
-	{ "atc3_common",  false, 0x408, 0x398000000 },
-	{ "disp_sys",     true,  0x258, 0x403000000 },
-	{ "dispext0_sys", false, 0x340, 0x3a3000000 },
-	{ "dispext1_sys", false, 0x490, 0x603000000 },
-	{ "dispext2_sys", false, 0x4e0, 0x607000000 },
-	{ "dispext3_sys", false, 0x2d8, 0x307000000 },
-	{ "ans",          true,  0x370, 0x40b000000 },
-	{ "avd_sys",      false, 0x170, 0x280000000 },
-	{ "venc0_sys",    false, 0x278, 0x282000000 },
-	{ "venc1_sys",    false, 0x2a0, 0x284000000 },
-	{ "jpg",          true,  0x3a0, 0x486000000 },
-	{ "apcie_sys_gp", true,  0x390, 0x416000000 },
+	[AXI2AF_ATC0_COMMON]  = { "atc0_common",  false, 0x390, 0x380000000 },
+	[AXI2AF_ATC1_COMMON]  = { "atc1_common",  false, 0x3b8, 0x388000000 },
+	[AXI2AF_ATC2_COMMON]  = { "atc2_common",  false, 0x3e0, 0x390000000 },
+	[AXI2AF_ATC3_COMMON]  = { "atc3_common",  false, 0x408, 0x398000000 },
+	[AXI2AF_DISP_SYS]     = { "disp_sys",     true,  0x258, 0x403000000 },
+	[AXI2AF_DISPEXT0_SYS] = { "dispext0_sys", false, 0x340, 0x3a3000000 },
+	[AXI2AF_DISPEXT1_SYS] = { "dispext1_sys", false, 0x490, 0x603000000 },
+	[AXI2AF_DISPEXT2_SYS] = { "dispext2_sys", false, 0x4e0, 0x607000000 },
+	[AXI2AF_DISPEXT3_SYS] = { "dispext3_sys", false, 0x2d8, 0x307000000 },
+	[AXI2AF_ANS]          = { "ans",          true,  0x370, 0x40b000000 },
+	[AXI2AF_AVD_SYS]      = { "avd_sys",      false, 0x170, 0x280000000 },
+	[AXI2AF_VENC0_SYS]    = { "venc0_sys",    false, 0x278, 0x282000000 },
+	[AXI2AF_VENC1_SYS]    = { "venc1_sys",    false, 0x2a0, 0x284000000 },
+	[AXI2AF_JPG]          = { "jpg",          true,  0x3a0, 0x486000000 },
+	[AXI2AF_APCIE_SYS_GP] = { "apcie_sys_gp", true,  0x390, 0x416000000 },
 };
 
 /* Only with the PMU's bus mapped. */
@@ -1327,6 +1310,32 @@ static void t6040_axi2af_show(struct t6040_sleep *sleep, struct seq_file *s)
 	}
 }
 
+static int t6040_sleep_preflight_show(struct seq_file *s, void *unused)
+{
+	struct t6040_sleep *sleep = s->private;
+	unsigned int live = t6040_sleep_live_blockers(sleep, s, NULL);
+	unsigned int i;
+
+	apple_sleep_registry_show(s);
+	t6040_axi2af_show(sleep, s);
+	seq_printf(s, "verdict: %u live blocker(s)\n", live);
+	seq_printf(s, "dry_run %u, wd2_secs %u, allow_entry %d, parking ops %s\n",
+		   READ_ONCE(dry_run), READ_ONCE(wd2_secs), allow_entry,
+		   sleep->power_ops ? "registered" : "not registered");
+	if (sleep->cluster_ctl) {
+		static const char * const nm[] = {
+			"EACC", "PACC0", "PACC1_ANE", "DISP_INT", "DISP_EXT",
+		};
+
+		for (i = 0; i < CLUSTER_CTL_NR; i++)
+			seq_printf(s, "cluster-ctl +%#x %-9s %#x\n", CLUSTER_CTL(i), nm[i],
+				   readl(sleep->cluster_ctl + CLUSTER_CTL(i)));
+	}
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(t6040_sleep_preflight);
+
 /*
  * Read-only axi2af gate: on entry the platform panics unless every reachable domain's
  * power word reads [7:4]==0. Here the ones still on are only named, at debug level.
@@ -1440,19 +1449,6 @@ static bool t6040_ps_actual_on(void __iomem *base, u32 offset)
 	return FIELD_GET(PS_ACTUAL, readl(base + offset));
 }
 
-/*
- * ENTRY: quiesce ANS's storage link, once ANS has been stopped by its driver. The PHY, the
- * clock generator and the AXI enables are treated as shared by the two ST lanes.
- *
- * The power words of this group are left to the SoC's sleep engine, which powers it down
- * itself and in its own order: APCIE_PHY_SW to clock-gated, APCIE_SYS_ST0/1 off, APCIE_ST0/1
- * clock-gated, ANS off, APCIE_SYS_GP off, APCIE_GP clock-gated. It polls APCIE_PHY_SW for
- * its parents, which are both SYS_ST lanes: with them lowered here, as the T8140 controller
- * does, it waited there for good on the J616s. So the commit raises APCIE_SYS_ST1, which
- * Linux never uses, and does only what the engine needs before it runs: the shared PHY put
- * to sleep, APCIE_PHY_SW clock-gated while APCIE_GP is still on, the PCIe PLL shut down.
- */
-
 /* The shared PHY and PHY-IP to sleep (the root complex disable; it polls unbounded). */
 static void t6040_apcie_phy_off(struct t6040_sleep *s)
 {
@@ -1510,8 +1506,6 @@ static void t6040_apcie_pll_off(struct t6040_sleep *s)
  * was off as well. FAB2_SOC is raised by hand, then ATC0..3_COMMON to a manual target 0xf,
  * then FAB2_SOC gets its automatic mode back: the powered children hold it up.
  */
-#define PS_FAB2_SOC		0x338
-
 static const u16 t6040_atc_common[4] = { 0x390, 0x3b8, 0x3e0, 0x408 };
 
 static void t6040_atc_commons_on(struct t6040_sleep *s)
@@ -1697,6 +1691,18 @@ static void t6040_ans_bridge_quiesce(struct t6040_sleep *s)
 	writel(b & ~BIT(0), bridge + AXI2AF_BRIDGE_108);
 }
 
+/*
+ * Quiesce ANS's storage link, once ANS has been stopped by its driver. The PHY, the
+ * clock generator and the AXI enables are treated as shared by the two ST lanes.
+ *
+ * The power words of this group are left to the SoC's sleep engine, which powers it down
+ * itself and in its own order: APCIE_PHY_SW to clock-gated, APCIE_SYS_ST0/1 off, APCIE_ST0/1
+ * clock-gated, ANS off, APCIE_SYS_GP off, APCIE_GP clock-gated. It polls APCIE_PHY_SW for
+ * its parents, which are both SYS_ST lanes: with them lowered here, as the T8140 controller
+ * does, it waited there for good on the J616s. So the commit raises APCIE_SYS_ST1, which
+ * Linux never uses, and does only what the engine needs before it runs: the shared PHY put
+ * to sleep, APCIE_PHY_SW clock-gated while APCIE_GP is still on, the PCIe PLL shut down.
+ */
 static void t6040_sleep_lower_apcie_st(struct t6040_sleep *s)
 {
 	struct t6040_apcie_st *a = &s->apcie_st;
@@ -1729,7 +1735,7 @@ static void t6040_bridge_rearm(void __iomem *bridge)
 }
 
 /*
- * RESUME: raise ANS's storage link from power-off, the two-lane adaptation of
+ * Raise ANS's storage link from power-off, the two-lane adaptation of
  * sleep.c's apple_sleep_raise_apcie(). Runs atomic on the waking core in
  * t6040_sleep_return(), AFTER t6040_axi2af_rearm() and BEFORE control returns to
  * the PM core, so nvme's resume_early sets the ANS run bit onto a live link.
@@ -1851,9 +1857,8 @@ static int t6040_sleep_raise_apcie_st(struct t6040_sleep *s)
  * The first thing Linux runs after a wake, MMU off and no stack (as the T8132 stub does). The
  * last wake program leaves the AON WD2 running for 5 s, less than the device resume takes:
  * restart it for 60 s, in t6040_sleep_set_wd2()'s order, then take cpu_resume. The PA is
- * the T6040 AON WDT (0x50836c000), used only when the DT's wdt block is that one.
+ * the T6040 AON WDT (T6040_WDT_PA), used only when the DT's wdt block is that one.
  */
-#define T6040_WDT_PA		0x50836c000ULL
 asm(
 "	.pushsection .text, \"ax\"\n"
 "	.type	t6040_resume_stub, %function\n"
@@ -2071,9 +2076,7 @@ static int t6040_sleep_commit(unsigned long unused)
 	/*
 	 * The order of the PMGR quiesce (the cluster and axi2af
 	 * parts measured on the J616s): the five complexes off, the axi2af gate read,
-	 * the clock quiesce, the keep-alive bits off, then the S2R timer. The CPM
-	 * pwrgate voters are not written on entry: they read back 0x80000000
-	 * already; the wake side re-asserts them.
+	 * the clock quiesce, the keep-alive bits off, then the S2R timer.
 	 */
 	t6040_secondaries_off(s);
 	t6040_pmgr_quiesce(s);
@@ -2236,12 +2239,7 @@ static void t6040_sleep_return(struct t6040_sleep *s)
 	t6040_axi2af_rearm(s);
 	t6040_wake_sync();
 
-	/*
-	 * Raise ANS's two ST lanes + shared PHY from power-off, AFTER the fabric
-	 * bridges are re-armed and BEFORE control returns to the PM core, so
-	 * nvme's resume_early sets the ANS run bit onto a live link.
-	 * No-op unless the apple,apcie windows are present.
-	 */
+	/* ANS's storage link, after the bridges and before nvme's resume_early (see there). */
 	s->apcie_wake_step = 0;
 	s->pcie_ans_on_ret = 0;
 	if (s->pcie_ans_stopped)
@@ -2466,8 +2464,6 @@ static int t6040_sleep_dry_enter(struct t6040_sleep *s, unsigned int dry)
 
 	return -EBUSY;
 }
-
-#define DISP_CPU_GATE_US	50000
 
 /*
  * regmap_read_poll_timeout_atomic() reads ktime_get(), which warns while timekeeping is
