@@ -1909,6 +1909,16 @@ static int brcmf_pcie_reset(struct device *dev)
 	if (devinfo->irq_allocated)
 		synchronize_irq(devinfo->pdev->irq);
 
+	/*
+	 * New firmware commands fail at once on a bus that is down; let one
+	 * already waiting for its response finish before the rings go away.
+	 */
+	brcmf_bus_change_state(bus_if, BRCMF_BUS_DOWN);
+	if (bus_if->drvr) {
+		mutex_lock(&bus_if->drvr->proto_block);
+		mutex_unlock(&bus_if->drvr->proto_block);
+	}
+
 	brcmf_pcie_bus_console_read(devinfo, true);
 
 	/*
