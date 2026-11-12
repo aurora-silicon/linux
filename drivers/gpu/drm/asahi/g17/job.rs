@@ -14,11 +14,22 @@ use kernel::{
 };
 
 pub(super) const TIMEOUT_MS: kernel::time::Msecs = super::timeout::POLL_MS;
-/// One logical render queue owns one physical pair, whose active ring holds
-/// `RENDER_DEPTH` commands. A deeper scheduler would only park run_job in
-/// admission until a retirement; the scheduler waits for the credit instead.
-const RENDER_CREDITS: u32 = crate::hw::t8140::queues::RENDER_DEPTH as u32;
-const COMPUTE_CREDITS: u32 = 16;
+/// The safe 26A428 policy is one firmware-visible front per logical engine. The module
+/// parameter is read when a logical scheduler is created and is intentionally bounded to the
+/// separately testable sweep (1, 2, 4, 8, 16), never inferred from descriptor or kick capacity.
+const MAX_PUBLICATION_CREDITS: u32 = 16;
+
+pub(super) fn publication_credits() -> u32 {
+    crate::module_parameters::g17_publication_credits
+        .value()
+        .clamp(1, MAX_PUBLICATION_CREDITS)
+}
+
+/// An unfinished logical frontier consumes an inline publication credit. Counting queued work
+/// too is conservative and prevents a later dependency-free command from overtaking it.
+pub(super) fn frontier_has_credit(frontier: usize, credits: u32) -> bool {
+    frontier < credits as usize
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Engine {
@@ -424,10 +435,11 @@ impl Fences {
 
 impl<B: Backend> Scheduler<B> {
     pub(crate) fn new(dev: &AsahiDrmDevice, backend: Arc<B>, engine: Engine) -> Result<Self> {
-        let (credits, name) = match engine {
-            Engine::Render => (RENDER_CREDITS, c_str!("asahi_g17_render")),
-            Engine::Compute => (COMPUTE_CREDITS, c_str!("asahi_g17_compute")),
+        let name = match engine {
+            Engine::Render => c_str!("asahi_g17_render"),
+            Engine::Compute => c_str!("asahi_g17_compute"),
         };
+        let credits = publication_credits();
         let scheduler = sched::Scheduler::new(dev.as_ref().as_ref(), 1, credits, 0, TIMEOUT_MS, name)?;
         let entity = sched::Entity::new(&scheduler, sched::Priority::Kernel)?;
         Ok(Self {
@@ -442,9 +454,11 @@ impl<B: Backend> Scheduler<B> {
         packet: Arc<Packet>,
         dependencies: KVec<Fence>,
         early: bool,
+        credit_blocked: bool,
         publication: Option<super::completion::PreparedPublication>,
     ) -> Result<Fences> {
-        super::trace::schedule(&packet, 0, dependencies.len() as i32);
+        let dependency_count = dependencies.len();
+        super::trace::schedule(&packet, 0, dependency_count as i32);
         let completed = packet.completion.fence();
         let host_timestamps = packet.completion.has_timestamps();
         // Only commands which actually write timestamps become host-prefix
@@ -478,7 +492,16 @@ impl<B: Backend> Scheduler<B> {
         // All fallible scheduler setup precedes early hardware publication. The
         // scheduler still owns watchdog, credits and cancellation after push.
         let inline = early && self.backend.try_early(&packet);
-        super::trace::schedule(&packet, if inline { 1 } else { 2 }, 0);
+        let queued_reason = if credit_blocked {
+            1
+        } else if dependency_count != 0 {
+            2
+        } else if early {
+            3
+        } else {
+            0
+        };
+        super::trace::schedule(&packet, if inline { 1 } else { 2 }, queued_reason);
         if !inline {
             if packet.completion.needs_source_ready() {
                 packet.completion.set_source_ready(ready.clone());
@@ -487,5 +510,46 @@ impl<B: Backend> Scheduler<B> {
         }
         job.push();
         Ok(Fences { ready, completed, publication: host_publication, owner: packet.completion.clone() })
+    }
+}
+
+#[kunit_tests(asahi_g17_publication_credits)]
+mod publication_credit_tests {
+    use super::*;
+
+    fn drain(commands: usize, credits: u32) {
+        let mut host = commands;
+        let mut published = 0;
+        while host != 0 || published != 0 {
+            while host != 0 && frontier_has_credit(published, credits) {
+                host -= 1;
+                published += 1;
+                assert!(published <= credits as usize);
+            }
+            assert_ne!(published, 0);
+            published -= 1;
+        }
+    }
+
+    #[test]
+    fn credit_one_keeps_deep_engine_backlogs_host_side() {
+        drain(128, 1);
+        drain(64, 1);
+    }
+
+    #[test]
+    fn logical_engines_account_independently() {
+        let mut fronts = [0usize; 2];
+        assert!(frontier_has_credit(fronts[Engine::Compute.index()], 1));
+        fronts[Engine::Compute.index()] += 1;
+        assert!(!frontier_has_credit(fronts[Engine::Compute.index()], 1));
+        assert!(frontier_has_credit(fronts[Engine::Render.index()], 1));
+    }
+
+    #[test]
+    fn sweep_values_never_exceed_the_selected_front() {
+        for credits in [1, 2, 4, 8, 16] {
+            drain(192, credits);
+        }
     }
 }

@@ -131,6 +131,10 @@ module! {
             // permissions: 0o644,
             description: "Fully isolate GPU contexts (limits performance)",
         },
+        g17_publication_credits: u32 {
+            default: 1,
+            description: "G17: firmware-visible commands per logical queue and engine (1..16)",
+        },
         g15_deadline_ms: u32 {
             default: 5000,
             description: "G15: host deadline of a published prefix without progress, ms (min 100)",
