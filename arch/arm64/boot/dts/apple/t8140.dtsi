@@ -456,6 +456,17 @@
 			status = "disabled";
 		};
 
+		/*
+		 * Data segments of both GPU firmware roles (ADT sgx gfx-data,
+		 * then gfx1-data), where each role keeps its crash log. The
+		 * loader fills reg with their span and enables it.
+		 */
+		gpu_fw_data: gpu-fw-data {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
 		/* Only reserved: the GPU node does not reference it */
 		uat_l2_pagetables: uat-l2-pagetables {
 			reg = <0 0 0 0>;
@@ -1506,8 +1517,9 @@
 			mboxes = <&gfx_mbox>, <&gfx1_mbox>;
 			power-domains = <&ps_gfx>;
 			memory-region = <&uat_ttbs>, <&uat_pagetables>,
-					<&uat_handoff>;
-			memory-region-names = "ttbs", "pagetables", "handoff";
+					<&uat_handoff>, <&gpu_fw_data>;
+			memory-region-names = "ttbs", "pagetables", "handoff",
+					      "fw-data";
 			operating-points-v2 = <&gpu_opp>;
 			apple,clpc = <&clpc>;
 			apple,pmp-report-entry = <&pmp_report_gfx>;
