@@ -189,13 +189,29 @@ static bool __init pfr1_sme_filter(u64 val)
 	return true;
 }
 
+static bool __init pfr1_mte_filter(u64 val)
+{
+	/*
+	 * The tag check fault address and store-only tag checking in
+	 * id_aa64pfr2_el1 are part of MTE, so they go when MTE does.
+	 */
+	if (!val) {
+		id_aa64pfr2_override.val &= ~(ID_AA64PFR2_EL1_MTEFAR_MASK |
+					      ID_AA64PFR2_EL1_MTESTOREONLY_MASK);
+		id_aa64pfr2_override.mask |= ID_AA64PFR2_EL1_MTEFAR_MASK |
+					     ID_AA64PFR2_EL1_MTESTOREONLY_MASK;
+	}
+
+	return true;
+}
+
 static const struct ftr_set_desc pfr1 __prel64_initconst = {
 	.name		= "id_aa64pfr1",
 	.override	= &id_aa64pfr1_override,
 	.fields		= {
 		FIELD("bt", ID_AA64PFR1_EL1_BT_SHIFT, NULL ),
 		FIELD("gcs", ID_AA64PFR1_EL1_GCS_SHIFT, NULL),
-		FIELD("mte", ID_AA64PFR1_EL1_MTE_SHIFT, NULL),
+		FIELD("mte", ID_AA64PFR1_EL1_MTE_SHIFT, pfr1_mte_filter),
 		FIELD("sme", ID_AA64PFR1_EL1_SME_SHIFT, pfr1_sme_filter),
 		FIELD("mpam_frac", ID_AA64PFR1_EL1_MPAM_frac_SHIFT, NULL),
 		{}
