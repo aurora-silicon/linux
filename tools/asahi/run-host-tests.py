@@ -113,6 +113,8 @@ ASAHI_TESTS = {
     'brcmf-suspend-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('country-gate', 'queue-reasons', 'worker-gate',
                                    'resume-order', 'tx-drain', 'lpas-resume'), out()),
+    'brcmf-wowl-filter-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('base-order', 'mask-last', 'totsize', 'no-track'), out()),
     'brcmfmac-scan-timeout-tests.py': [(out('--output'), PASS)],
     'clpc-gpu-demand-tests.py': [([], PASS)],
     # The old policy always disabled compute preemption.
