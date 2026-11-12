@@ -63,7 +63,7 @@ struct brcmf_if { struct brcmf_cfg80211_vif *vif; struct brcmf_pub *drvr; struct
 struct device { void *data; };
 struct pci_dev { struct device dev; int irq; bool state_saved; };
 struct brcmf_pciedev_info { bool mbdata_completed, intr, ready, timer;
- bool wowl_irq, wowl_enabled, irq_wake_enabled;
+ bool wowl_irq, wowl_enabled, irq_wake_enabled, wowl_sleeping;
  int state, mbdata_resp_wait; void *ci; struct pci_dev *pdev;
  struct { int intmask, mailboxmask; } *reginfo; };
 struct pcie_priv { struct brcmf_pciedev_info *devinfo; };
@@ -148,16 +148,17 @@ static void brcmf_pcie_fwcon_timer(struct brcmf_pciedev_info *d,bool on) {d->tim
 #define PM_SUSPEND_TO_IDLE 1
 static int pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
 static bool device_may_wakeup(struct device *d) {(void)d;return true;}
-static int enable_irq_wake(int irq) {(void)irq;return 0;}
+static int wake_error; static unsigned d3_informs, d0_informs;
+static int enable_irq_wake(int irq) {(void)irq;return wake_error;}
 static int pci_save_state(struct pci_dev *p) {p->state_saved=true;return 0;}
 static void pci_restore_state(struct pci_dev *p) {p->state_saved=false;}
 static void brcmf_pcie_disable_irq_wake(struct brcmf_pciedev_info *d) {d->irq_wake_enabled=false;}
 static int brcmf_pcie_pm_leave_D3(struct device *dev);
 static int brcmf_pcie_send_mb_data(struct brcmf_pciedev_info *d,int mb) {
- if(mb==BRCMF_H2D_HOST_D3_INFORM) {
+ if(mb==BRCMF_H2D_HOST_D3_INFORM) {d3_informs++;
   assert(ndev[0].stopped && ndev[1].stopped && ndev[0].drains && ndev[1].drains);
   assert(msgbuf.tx_suspended && cancels==2);d->mbdata_completed=ack;
- } else {assert(d->state==BRCMFMAC_PCIE_STATE_UP);return d0_error;}
+ } else {d0_informs++;assert(d->state==BRCMFMAC_PCIE_STATE_UP);return d0_error;}
  return 0;
 }
 static int brcmf_pcie_read_pcie32(struct brcmf_pciedev_info *d,int r) {(void)d;(void)r;return retain;}
@@ -223,7 +224,7 @@ static void reset(void) {
  static typeof(*devinfo.reginfo) regs;devinfo.reginfo=&regs;
  devinfo.state=BRCMFMAC_PCIE_STATE_UP;devinfo.intr=devinfo.ready=devinfo.timer=true;
  country_gets=sets=bands=txflows=creates=cancels=removes=probes=0;
- failure=translation=d0_error=probe_error=0;ack=true;retain=1;
+ failure=translation=d0_error=probe_error=wake_error=0;ack=true;retain=1;d3_informs=d0_informs=0;
 }
 static void hint(const char *a) {
  struct regulatory_request r={.alpha2={a[0],a[1]}};brcmf_cfg80211_reg_notifier(&wiphy,&r);
@@ -296,6 +297,24 @@ for(int up=0;up<2;up++)for(int fail=0;fail<2;fail++) {
   assert(lpas_restores==1 && wake_reports==1 && !cfg.suspended && !cfg.wowl.active);
   assert(!cfg.country_pending && country_gets==1 && !memcmp(applied,"GB",2));cases++;
  }
+ /* WoWLAN in s2idle keeps the firmware awake: no D3 inform, the function
+  * stays in D0 with its MSI wake-armed, and the resume is a hot one. */
+ for(int fail=0;fail<2;fail++) {
+  reset();devinfo.wowl_irq=devinfo.wowl_enabled=true;wake_error=fail?-EINVAL:0;
+  int ret=brcmf_pcie_pm_enter_D3(&device);
+  assert(!d3_informs && devinfo.state==BRCMFMAC_PCIE_STATE_UP);
+  if(fail) {
+   assert(ret==-EINVAL && !devinfo.wowl_sleeping && !devinfo.irq_wake_enabled);
+   assert(bus.state==BRCMF_BUS_UP && !msgbuf.tx_suspended && devinfo.timer);cases++;continue;
+  }
+  assert(!ret && devinfo.wowl_sleeping && devinfo.irq_wake_enabled && pdev.state_saved);
+  assert(bus.state==BRCMF_BUS_DOWN && msgbuf.tx_suspended && !devinfo.timer && ndev[0].stopped);
+  devinfo.intr=false;
+  assert(!brcmf_pcie_pm_leave_D3(&device));
+  assert(!devinfo.wowl_sleeping && !devinfo.irq_wake_enabled && !pdev.state_saved && devinfo.intr);
+  assert(bus.state==BRCMF_BUS_UP && !msgbuf.tx_suspended && devinfo.timer && !ndev[0].stopped);
+  assert(!d0_informs && !removes && !probes);cases++;
+ }
  reset();ack=false;assert(brcmf_pcie_pm_enter_D3(&device)==-EIO);
  assert(bus.state==BRCMF_BUS_UP && !msgbuf.tx_suspended && devinfo.timer && !ndev[0].stopped);cases++;
  for(int cold=0;cold<2;cold++)for(int fail=0;fail<2;fail++) {
@@ -325,7 +344,8 @@ def main():
         'core': ['brcmf_txflowblock_if', 'brcmf_bus_change_state'],
         'msgbuf': ['brcmf_msgbuf_flowring_worker', 'brcmf_msgbuf_txflow_worker',
                    'brcmf_msgbuf_suspend', 'brcmf_msgbuf_resume'],
-        'pcie': ['brcmf_pcie_pm_enter_D3', 'brcmf_pcie_pm_leave_D3'],
+        'pcie': ['brcmf_pcie_wowl_wake', 'brcmf_pcie_wowl_sleep',
+                 'brcmf_pcie_pm_enter_D3', 'brcmf_pcie_pm_leave_D3'],
     }
     body = ''.join(function(sources[group], name)
                    for group, names in groups.items() for name in names)

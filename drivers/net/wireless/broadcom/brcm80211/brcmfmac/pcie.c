@@ -424,6 +424,7 @@ struct brcmf_pciedev_info {
 	bool wowl_enabled;
 	bool wowl_irq;
 	bool irq_wake_enabled;
+	bool wowl_sleeping;
 	bool wakeup_created;
 	bool wakeup_capable;
 	u8 dma_idx_sz;
@@ -1105,10 +1106,13 @@ static irqreturn_t brcmf_pcie_isr_thread(int irq, void *arg)
 	u32 status;
 
 	devinfo->in_irq = true;
-	/* Catch a firmware wake before suspend_device_irqs() takes over. */
-	if (devinfo->wowl_irq && devinfo->wowl_enabled &&
-	    devinfo->state == BRCMFMAC_PCIE_STATE_DOWN)
-		pm_wakeup_event(&devinfo->pdev->dev, 0);
+	/*
+	 * While WoWLAN is armed the firmware only interrupts for a frame that
+	 * matched a wake filter or for a link loss: that ends the sleep, also
+	 * when it arrives before suspend_device_irqs() takes over.
+	 */
+	if (devinfo->wowl_sleeping)
+		pm_wakeup_hard_event(&devinfo->pdev->dev);
 	status = brcmf_pcie_read_pcie32(devinfo, devinfo->reginfo->mailboxint);
 	brcmf_dbg(PCIE, "Enter %x\n", status);
 	if (status) {
@@ -3121,13 +3125,60 @@ brcmf_pcie_remove(struct pci_dev *pdev)
 
 static int brcmf_pcie_pm_leave_D3(struct device *dev);
 
+static void brcmf_pcie_wowl_wake(struct brcmf_bus *bus,
+				 struct brcmf_pciedev_info *devinfo)
+{
+	devinfo->wowl_sleeping = false;
+	brcmf_pcie_intr_enable(devinfo);
+	brcmf_bus_change_state(bus, BRCMF_BUS_UP);
+	brcmf_msgbuf_resume(bus->drvr);
+	brcmf_pcie_fwcon_timer(devinfo, true);
+}
+
+/*
+ * WoWLAN in s2idle. The firmware stays awake in its associated low-power
+ * mode (LPAS) with the wake filters and offloads the cfg80211 layer set up,
+ * and the host is not told to sleep: after HOST_D3_INFORM the firmware
+ * raises no interrupt for a matched frame, neither the MSI nor a WAKE#
+ * line. Without it, a matched frame arrives as an ordinary D2H interrupt,
+ * so the MSI is the wake source. The function and its link stay in D0;
+ * saving the state here tells PCI PM that the driver keeps the power state.
+ */
+static int brcmf_pcie_wowl_sleep(struct device *dev)
+{
+	struct brcmf_bus *bus = dev_get_drvdata(dev);
+	struct brcmf_pciedev_info *devinfo = bus->bus_priv.pcie->devinfo;
+	int ret;
+
+	ret = enable_irq_wake(devinfo->pdev->irq);
+	if (ret) {
+		brcmf_err(bus, "Failed to arm WoWLAN IRQ: %d\n", ret);
+		goto fail;
+	}
+	devinfo->irq_wake_enabled = true;
+
+	ret = pci_save_state(devinfo->pdev);
+	if (ret) {
+		brcmf_pcie_disable_irq_wake(devinfo);
+		goto fail;
+	}
+	devinfo->wowl_sleeping = true;
+	return 0;
+
+fail:
+	/* A failing suspend callback is not resumed; the wiphy resume clears
+	 * the firmware WoWLAN policy.
+	 */
+	brcmf_pcie_wowl_wake(bus, devinfo);
+	return ret;
+}
+
 static int brcmf_pcie_pm_enter_D3(struct device *dev)
 {
 	struct brcmf_pciedev_info *devinfo;
 	struct brcmf_bus *bus;
 	struct brcmf_if *ifp;
 	int ifidx;
-	int ret;
 
 	brcmf_dbg(PCIE, "Enter\n");
 
@@ -3155,6 +3206,9 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 	brcmf_pcie_fwcon_timer(devinfo, false);
 	brcmf_bus_change_state(bus, BRCMF_BUS_DOWN);
 
+	if (devinfo->wowl_irq && devinfo->wowl_enabled)
+		return brcmf_pcie_wowl_sleep(dev);
+
 	devinfo->mbdata_completed = false;
 	brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_D3_INFORM);
 
@@ -3170,40 +3224,7 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 
 	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
 
-	if (devinfo->wowl_irq && devinfo->wowl_enabled) {
-		ret = enable_irq_wake(devinfo->pdev->irq);
-		if (ret) {
-			brcmf_err(bus, "Failed to arm WoWLAN IRQ: %d\n", ret);
-			goto rollback;
-		}
-		devinfo->irq_wake_enabled = true;
-		/* The firmware wakes the host with its ordinary D2H doorbell or
-		 * mailbox interrupt; it must not stay masked across host sleep.
-		 */
-		if (!brcmf_pcie_read_pcie32(devinfo, devinfo->reginfo->mailboxmask))
-			brcmf_pcie_intr_enable(devinfo);
-		/*
-		 * Firmware host sleep is distinct from PCI D3hot. An MSI wake
-		 * needs the function and its upstream bridges to remain in D0.
-		 * Saving here tells PCI PM that we manage the power state.
-		 */
-		ret = pci_save_state(devinfo->pdev);
-		if (ret) {
-			pci_restore_state(devinfo->pdev);
-			goto rollback;
-		}
-	}
-
 	return 0;
-
-rollback:
-	/*
-	 * The failing suspend callback will not be resumed by PM. Restore
-	 * the bus here; the wiphy resume clears the firmware WoWLAN policy.
-	 */
-	if (brcmf_pcie_pm_leave_D3(dev))
-		brcmf_err(NULL, "Failed to restore bus after WoWLAN suspend error\n");
-	return ret;
 }
 
 
@@ -3220,9 +3241,12 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
 	devinfo = bus->bus_priv.pcie->devinfo;
 	brcmf_dbg(PCIE, "Enter, dev=%p, bus=%p\n", dev, bus);
 
-	if (devinfo->irq_wake_enabled && devinfo->pdev->state_saved)
+	if (devinfo->wowl_sleeping) {
 		pci_restore_state(devinfo->pdev);
-	brcmf_pcie_disable_irq_wake(devinfo);
+		brcmf_pcie_disable_irq_wake(devinfo);
+		brcmf_pcie_wowl_wake(bus, devinfo);
+		return 0;
+	}
 
 	/* Check if device is still up and running, if so we are ready */
 	if (brcmf_pcie_read_pcie32(devinfo, devinfo->reginfo->intmask) != 0) {

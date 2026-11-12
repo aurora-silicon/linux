@@ -4619,8 +4619,10 @@ static int brcmf_configure_lpas(struct brcmf_cfg80211_info *cfg,
 	err = brcmf_lpas_eventmask_get(ifp, saved_mask, mask_len);
 	if (err)
 		goto fail;
-	memcpy(sleep_mask, saved_mask, mask_len);
-
+	/*
+	 * Every event the firmware sends during the sleep is an interrupt and
+	 * so a wake: keep only the link loss and supplicant events.
+	 */
 	err = brcmf_lpas_eventmask_enable(sleep_mask, mask_len, BRCMF_E_LINK);
 	if (err)
 		goto fail;
