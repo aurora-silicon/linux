@@ -638,15 +638,17 @@ static void unload_order_test(struct kunit *test)
 
 /* The restart steps, recorded in order; a step fails when asked to. */
 struct fake_restart {
-	char log[8];
+	char log[10];
 	unsigned int n;
 	char fail;
+	char fail2;
+	bool force_unavailable;
 };
 
 static int fake_step(struct fake_restart *r, char step)
 {
 	r->log[r->n++] = step;
-	return r->fail == step ? -ETIMEDOUT : 0;
+	return r->fail == step || r->fail2 == step ? -ETIMEDOUT : 0;
 }
 
 static int fr_power_down(void *ctx)
@@ -664,6 +666,17 @@ static int fr_halt(void *ctx)
 	return fake_step(ctx, 'h');
 }
 
+static int fr_force_halt(void *ctx)
+{
+	struct fake_restart *r = ctx;
+
+	if (r->force_unavailable) {
+		r->log[r->n++] = 'f';
+		return -EOPNOTSUPP;
+	}
+	return fake_step(r, 'f');
+}
+
 static int fr_power_cycle(void *ctx)
 {
 	return fake_step(ctx, 'c');
@@ -678,6 +691,7 @@ static const struct ane_t6021_restart_ops fr_ops = {
 	.power_down = fr_power_down,
 	.wait_idle = fr_wait_idle,
 	.halt = fr_halt,
+	.force_halt = fr_force_halt,
 	.power_cycle = fr_power_cycle,
 	.boot = fr_boot,
 };
@@ -703,6 +717,9 @@ static void restart_stop_boundary_test(struct kunit *test)
 		KUNIT_EXPECT_NULL(test, strchr(r.log, 'c'));
 		KUNIT_EXPECT_NULL(test, strchr(r.log, 'b'));
 	}
+
+	/* A planned stop never substitutes reset for a failed RUN clear. */
+	KUNIT_EXPECT_NULL(test, strchr(r.log, 'f'));
 }
 
 static void perf_mode_cmd_test(struct kunit *test)
@@ -740,11 +757,36 @@ static void restart_state_machine_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_t6021_restart_run(&fr_ops, &r, false, &stage), 0);
 	KUNIT_EXPECT_STREQ(test, r.log, "hcb");
 
-	/* STOPPED not proven: the domains are never touched. */
+	/* Planned STOPPED failure never takes the forced path. */
 	memset(&r, 0, sizeof(r));
 	r.fail = 'h';
 	KUNIT_EXPECT_NE(test, ane_t6021_restart_run(&fr_ops, &r, true, &stage), 0);
 	KUNIT_EXPECT_STREQ(test, r.log, "pwh");
+	KUNIT_EXPECT_EQ(test, stage, ANE_T6021_RESTART_STOP);
+
+	/* Unplanned STOPPED failure is recovered by holding ASC reset. */
+	memset(&r, 0, sizeof(r));
+	r.fail = 'h';
+	KUNIT_EXPECT_EQ(test, ane_t6021_restart_run(&fr_ops, &r, false, &stage), 0);
+	KUNIT_EXPECT_STREQ(test, r.log, "hfcb");
+	KUNIT_EXPECT_EQ(test, stage, ANE_T6021_RESTART_DONE);
+
+	/* A reset-assert failure still stops before any power transition. */
+	memset(&r, 0, sizeof(r));
+	r.fail = 'h';
+	r.fail2 = 'f';
+	KUNIT_EXPECT_EQ(test, ane_t6021_restart_run(&fr_ops, &r, false, &stage),
+			-ETIMEDOUT);
+	KUNIT_EXPECT_STREQ(test, r.log, "hf");
+	KUNIT_EXPECT_EQ(test, stage, ANE_T6021_RESTART_STOP);
+
+	/* Disabling the forced path preserves the ordinary halt error. */
+	memset(&r, 0, sizeof(r));
+	r.fail = 'h';
+	r.force_unavailable = true;
+	KUNIT_EXPECT_EQ(test, ane_t6021_restart_run(&fr_ops, &r, false, &stage),
+			-ETIMEDOUT);
+	KUNIT_EXPECT_STREQ(test, r.log, "hf");
 	KUNIT_EXPECT_EQ(test, stage, ANE_T6021_RESTART_STOP);
 
 	/* POWER_DOWN not accepted: not even the RUN clear is tried. */

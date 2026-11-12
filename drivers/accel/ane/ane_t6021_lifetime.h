@@ -649,7 +649,9 @@ static inline void ane_t6021_progtab_count(const struct ane_t6021_progtab *t,
  * planned restart first asks the idle firmware to shut down (POWER_DOWN,
  * which never completes; its dispatch is seen instead) and waits for WFI.
  * After a command timeout the command worker is blocked and nothing can
- * overtake it, so only the RUN clear is tried. If STOPPED is not seen
+ * overtake it, so only the RUN clear is tried first. If that cannot prove
+ * STOPPED, an unplanned restart may hold the ASC in its power-state reset.
+ * Planned restarts never use that forced path. If neither stop succeeds,
  * nothing is powered off, and the caller keeps the instance quarantined
  * with every mapping and its power claim.
  */
@@ -664,6 +666,7 @@ struct ane_t6021_restart_ops {
 	int (*power_down)(void *ctx);	/* POWER_DOWN taken by the firmware */
 	int (*wait_idle)(void *ctx);	/* bounded wait for WFI */
 	int (*halt)(void *ctx);		/* clear RUN, require STOPPED */
+	int (*force_halt)(void *ctx);	/* hold ASC reset; unplanned only */
 	int (*power_cycle)(void *ctx);	/* domains verified off, then on */
 	int (*boot)(void *ctx);		/* cold boot and handshake */
 };
@@ -674,7 +677,7 @@ struct ane_t6021_restart_ops {
 static inline int ane_t6021_restart_stop(const struct ane_t6021_restart_ops *ops,
 					 void *ctx, bool planned)
 {
-	int ret;
+	int ret, force_ret;
 
 	if (planned) {
 		ret = ops->power_down(ctx);
@@ -683,7 +686,13 @@ static inline int ane_t6021_restart_stop(const struct ane_t6021_restart_ops *ops
 		if (ret)
 			return ret;
 	}
-	return ops->halt(ctx);
+	ret = ops->halt(ctx);
+	if (!ret || planned || !ops->force_halt)
+		return ret;
+
+	force_ret = ops->force_halt(ctx);
+	/* An unavailable/disabled forced path selects the old behaviour. */
+	return force_ret == -EOPNOTSUPP ? ret : force_ret;
 }
 
 static inline int ane_t6021_restart_run(const struct ane_t6021_restart_ops *ops,
