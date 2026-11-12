@@ -12,11 +12,11 @@
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/mutex.h>
+#include <linux/soc/apple/tunable.h>
 #include <linux/types.h>
 
 #include <asm/sysreg.h>
 
-struct apple_tunable;
 struct device;
 struct device_node;
 struct platform_device;
@@ -214,6 +214,51 @@ static inline void apple_sleep_pmu_write(void __iomem *spmi, u16 reg, u8 val)
 		readl(spmi + SPMI_REPLY);
 	writel(1, spmi + SPMI_NOTIFY_ACK);
 	writel(enable, spmi + SPMI_NOTIFY_ENABLE);
+}
+
+/*
+ * As macOS raises a domain: the target, then AUTO_ENABLE once it reads on. Measured
+ * byte for byte on ANS and PCIe, for instance 0x0f002300, 0x0f00200f, 0x1f00200f.
+ */
+static inline int apple_sleep_ps_raise_start(void __iomem *reg)
+{
+	u32 now;
+
+	writel((readl(reg) & ~(PS_AUTO_ENABLE | GENMASK(11, 0))) | PS_TARGET, reg);
+
+	return readl_poll_timeout_atomic(reg, now, (now & PS_ACTUAL) == PS_ACTUAL, 1,
+					 PS_OFF_TIMEOUT_US);
+}
+
+static inline void apple_sleep_ps_raise_finish(void __iomem *reg)
+{
+	writel((readl(reg) & ~(PS_AUTO_ENABLE | GENMASK(11, 0))) | PS_TARGET | PS_AUTO_ENABLE,
+	       reg);
+}
+
+/* Read-modify-write in table order, with no write where nothing changes. */
+static inline void apple_sleep_tunable_apply_changed(void __iomem *regs,
+						     const struct apple_tunable *t)
+{
+	size_t i;
+
+	for (i = 0; i < t->sz; i++) {
+		void __iomem *reg = regs + t->values[i].offset;
+		u32 old = readl(reg);
+		u32 val = (old & ~t->values[i].mask) | (t->values[i].value & t->values[i].mask);
+
+		if (val != old)
+			writel(val, reg);
+	}
+}
+
+/* WD2 of the AON watchdog, the sleep's safety net, armed for @secs from now. */
+static inline void apple_sleep_wd2_arm(void __iomem *wdt, unsigned int secs)
+{
+	writel(0, wdt + WDT_WD2_CTL);
+	writel(0, wdt + WDT_WD2_COUNT);
+	writel(secs * WDT_TICKS_PER_S, wdt + WDT_WD2_ALARM);
+	writel(1, wdt + WDT_WD2_CTL);
 }
 
 /*

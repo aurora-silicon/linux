@@ -862,10 +862,7 @@ static void t6040_sleep_set_wd2(struct t6040_sleep *s, unsigned int secs)
 {
 	if (!s->wdt)
 		return;
-	writel(0, s->wdt + WDT_WD2_CTL);
-	writel(0, s->wdt + WDT_WD2_COUNT);
-	writel(secs * WDT_TICKS_PER_S, s->wdt + WDT_WD2_ALARM);
-	writel(1, s->wdt + WDT_WD2_CTL);
+	apple_sleep_wd2_arm(s->wdt, secs);
 	s->wd2_armed = true;
 }
 
@@ -1464,21 +1461,12 @@ static void t6040_wake_restore(struct t6040_sleep *s)
  */
 static int t6040_ps_raise_start(void __iomem *base, u32 offset)
 {
-	void __iomem *reg = base + offset;
-	u32 now;
-
-	writel((readl(reg) & ~(PS_AUTO_ENABLE | GENMASK(11, 0))) | PS_TARGET, reg);
-
-	return readl_poll_timeout_atomic(reg, now, (now & PS_ACTUAL) == PS_ACTUAL, 1,
-					 PS_OFF_TIMEOUT_US);
+	return apple_sleep_ps_raise_start(base + offset);
 }
 
 static void t6040_ps_raise_finish(void __iomem *base, u32 offset)
 {
-	void __iomem *reg = base + offset;
-
-	writel((readl(reg) & ~(PS_AUTO_ENABLE | GENMASK(11, 0))) | PS_TARGET | PS_AUTO_ENABLE,
-	       reg);
+	apple_sleep_ps_raise_finish(base + offset);
 }
 
 static int t6040_ps_raise(void __iomem *base, u32 offset)
@@ -1498,18 +1486,8 @@ static bool t6040_ps_actual_on(void __iomem *base, u32 offset)
 /* Read-modify-write a tunable in table order, writing only where it changes. */
 static void t6040_tunable_apply_changed(void __iomem *regs, const struct apple_tunable *t)
 {
-	size_t i;
-
-	if (!t)
-		return;
-	for (i = 0; i < t->sz; i++) {
-		void __iomem *reg = regs + t->values[i].offset;
-		u32 old = readl(reg);
-		u32 val = (old & ~t->values[i].mask) | (t->values[i].value & t->values[i].mask);
-
-		if (val != old)
-			writel(val, reg);
-	}
+	if (t)
+		apple_sleep_tunable_apply_changed(regs, t);
 }
 
 /*

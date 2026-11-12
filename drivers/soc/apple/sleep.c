@@ -961,27 +961,14 @@ static void sleep_ps_lower(struct apple_sleep *s, u32 offset)
 	sleep_ps_lower_finish(s, offset, sleep_ps_lower_start(s, offset));
 }
 
-/*
- * As macOS raises a domain: the target, then AUTO_ENABLE once it reads on. Measured
- * byte for byte on ANS and PCIe, for instance 0x0f002300, 0x0f00200f, 0x1f00200f.
- */
 static int sleep_ps_raise_start(struct apple_sleep *s, u32 offset)
 {
-	void __iomem *reg = s->ps + offset;
-	u32 now;
-
-	writel((readl(reg) & ~(PS_AUTO_ENABLE | GENMASK(11, 0))) | PS_TARGET, reg);
-
-	return readl_poll_timeout_atomic(reg, now, (now & PS_ACTUAL) == PS_ACTUAL, 1,
-					 PS_OFF_TIMEOUT_US);
+	return apple_sleep_ps_raise_start(s->ps + offset);
 }
 
 static void sleep_ps_raise_finish(struct apple_sleep *s, u32 offset)
 {
-	void __iomem *reg = s->ps + offset;
-
-	writel((readl(reg) & ~(PS_AUTO_ENABLE | GENMASK(11, 0))) | PS_TARGET | PS_AUTO_ENABLE,
-	       reg);
+	apple_sleep_ps_raise_finish(s->ps + offset);
 }
 
 static int sleep_ps_raise(struct apple_sleep *s, u32 offset)
@@ -1978,21 +1965,6 @@ static void apple_sleep_lower_apcie(struct apple_sleep *s)
 	sleep_ps_lower(s, d->ans);
 }
 
-/* Read-modify-write in table order, with no write where nothing changes. */
-static void sleep_tunable_apply_changed(void __iomem *regs, const struct apple_tunable *t)
-{
-	size_t i;
-
-	for (i = 0; i < t->sz; i++) {
-		void __iomem *reg = regs + t->values[i].offset;
-		u32 old = readl(reg);
-		u32 val = (old & ~t->values[i].mask) | (t->values[i].value & t->values[i].mask);
-
-		if (val != old)
-			writel(val, reg);
-	}
-}
-
 /*
  * The power loss takes the PHY's PLL and lane settings with it, and ANS's link can't
  * train without them. Applied as macOS does: the PLL table, then the lanes, then the
@@ -2002,8 +1974,8 @@ static void sleep_apcie_phy_ip_apply(struct apple_sleep *s)
 {
 	void __iomem *ctl = s->apcie_phy_ip + APCIE_PHY_IP_PLL_CTL;
 
-	sleep_tunable_apply_changed(s->apcie_phy_ip, s->apcie_phy_ip_pll);
-	sleep_tunable_apply_changed(s->apcie_phy_ip, s->apcie_phy_ip_lanes);
+	apple_sleep_tunable_apply_changed(s->apcie_phy_ip, s->apcie_phy_ip_pll);
+	apple_sleep_tunable_apply_changed(s->apcie_phy_ip, s->apcie_phy_ip_lanes);
 	writel(readl(ctl) & ~APCIE_PHY_IP_PLL_HOLD, ctl);
 }
 
@@ -2103,10 +2075,7 @@ static void apple_sleep_lower_io(struct apple_sleep *s)
 
 static void apple_sleep_set_wd2(struct apple_sleep *s, unsigned int secs)
 {
-	writel(0, s->wdt + WDT_WD2_CTL);
-	writel(0, s->wdt + WDT_WD2_COUNT);
-	writel(secs * WDT_TICKS_PER_S, s->wdt + WDT_WD2_ALARM);
-	writel(1, s->wdt + WDT_WD2_CTL);
+	apple_sleep_wd2_arm(s->wdt, secs);
 }
 
 #define PS_PARENT_MISSING	BIT(11)
