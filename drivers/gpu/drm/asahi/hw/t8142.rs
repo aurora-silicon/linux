@@ -8,7 +8,7 @@
 //! J813 (2026-11-07): ID registers 0xb022000 0xb0800 0x11010a 0x40404 0x1320311 0x10030302,
 //! family 0xb, variant 2, one die, one cluster of ten core slots; core mask 0x3bd (eight
 //! enabled, slots 1 and 6 fused off).
-use crate::g17::{Config, CoreLayout, CrashBuffers, FirmwareProfile, Identity};
+use crate::g17::{Config, CoreLayout, FirmwareProfile, Identity};
 use crate::hw::{GpuGen, GpuVariant};
 
 
@@ -30,7 +30,6 @@ pub(crate) const PROBE: Config = Config {
     secondary_root_offset: Some(0x40000),
     // Each role asks for its crash log at the physical address of its __DATA_SHARED_RO
     // (0x100_0250_4000, 0x100_025c_0000 under 27.0), inside the `fw-data` region.
-    crash_buffers: CrashBuffers::FirmwareData,
     profile: FirmwareProfile::M5PublishedRoots,
     pm_metrics: None,
     windows: &[],

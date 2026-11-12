@@ -82,7 +82,6 @@ use core::sync::atomic::{
 use kernel::{
     c_str,
     device::{self, Core},
-    drm::gem::shmem,
     impl_has_delayed_work, impl_has_work,
     io::{
         IoBase,
@@ -117,7 +116,6 @@ use crate::driver::{
     AsahiDevRef,
     AsahiDrmDevice, //
 };
-use crate::gem::AsahiObject;
 use crate::{
     alloc,
     gem,
@@ -211,8 +209,6 @@ pub(crate) struct Config {
     /// Offset of the secondary coprocessor's kernel root in the `pagetables` region; `None` for
     /// a single-instance firmware.
     pub(crate) secondary_root_offset: Option<u64>,
-    /// Where the coprocessors' crash log buffers live.
-    pub(crate) crash_buffers: CrashBuffers,
     /// Firmware protocol.
     pub(crate) profile: FirmwareProfile,
     /// Parameter buffer page metrics shared with the firmware; `None` where the firmware graph
@@ -267,16 +263,6 @@ pub(crate) struct CoreLayout {
     /// A render's deflake buffer.
     pub(crate) deflake: fw::render::Deflake,
     pub(crate) compute_blocks: usize,
-}
-
-/// Where a G17 target's crash log buffers live.
-pub(crate) enum CrashBuffers {
-    /// One buffer per [`Role`] that the firmware requests at a fixed address of the kernel
-    /// lower root, mapped by the driver before the coprocessors start.
-    Fixed([FixedBuffer; 2]),
-    /// The firmware places its crash log in its own data segment, the `fw-data` reserved
-    /// region, and asks for it there by physical address.
-    FirmwareData,
 }
 
 /// A firmware coprocessor instance.
@@ -348,24 +334,10 @@ const OPENING_RETIRE_POLLS: usize = 100;
 /// ([`fw::variant::InitAck::Status`]).
 const INIT_ACCEPT_POLLS: usize = 3000;
 
-/// Address bits of a buffer the coprocessor places itself; the coprocessor sets higher bits in
-/// its buffer requests.
-const RTKIT_BUFFER_ADDR_MASK: u64 = (1 << 40) - 1;
-/// Initial contents of crash log buffers, so that a crash log shows what the firmware wrote.
-const CRASH_BUFFER_FILL: [u8; 2] = [0xa5, 0x5a];
-
 /// A crash log buffer handed to RTKit.
 pub(crate) struct CrashLog {
     iova: usize,
-    map: CrashLogMap,
-}
-
-/// The CPU mapping of a crash log buffer.
-enum CrashLogMap {
-    /// The driver's buffer ([`CrashBuffers::Fixed`]).
-    Object(shmem::VMapOwned<AsahiObject>),
-    /// A buffer in the firmware's data segment ([`CrashBuffers::FirmwareData`]).
-    FirmwareData(data_segment::DataSegmentLog),
+    map: data_segment::DataSegmentLog,
 }
 
 impl rtkit::Buffer for CrashLog {
@@ -374,10 +346,7 @@ impl rtkit::Buffer for CrashLog {
     }
 
     fn buf(&mut self) -> Result<IoSysMap<'_, Region>> {
-        match &mut self.map {
-            CrashLogMap::Object(map) => Ok(IoSysMap::from((&*map).as_view())),
-            CrashLogMap::FirmwareData(log) => log.buf(),
-        }
+        self.map.buf()
     }
 }
 
@@ -386,8 +355,6 @@ impl rtkit::Buffer for CrashLog {
 struct RoleState {
     role: Role,
     shared: Arc<Shared>,
-    /// The fixed crash log buffer and its mapping; `None` where the firmware places its own.
-    crash_log: Option<(FixedBuffer, shmem::VMapOwned<AsahiObject>)>,
     crashed: AtomicBool,
     #[pin]
     ack: Opaque<kernel::bindings::completion>,
@@ -466,23 +433,10 @@ impl rtkit::Operations for RoleOps {
         iova: usize,
         size: usize,
     ) -> Result<CrashLog> {
-        if let Some((buffer, map)) = data.crash_log.as_ref() {
-            if (iova as u64) & RTKIT_BUFFER_ADDR_MASK != buffer.va || size > buffer.size {
-                return Err(EINVAL);
-            }
-            return Ok(CrashLog {
-                iova,
-                map: CrashLogMap::Object(map.owner().owned_vmap()?),
-            });
-        }
         // The firmware places its buffers in its data segment, at their physical address.
         Ok(CrashLog {
             iova,
-            map: CrashLogMap::FirmwareData(data_segment::DataSegmentLog::map(
-                &data.shared.dev,
-                iova,
-                size,
-            )?),
+            map: data_segment::DataSegmentLog::map(&data.shared.dev, iova, size)?,
         })
     }
 }
@@ -540,7 +494,6 @@ struct Coprocessor {
     running: bool,
     rtkit: Pin<KBox<Mailbox>>,
     state: Arc<RoleState>,
-    _crash_buffer: Option<KernelObject>,
 }
 
 impl Coprocessor {
@@ -548,38 +501,14 @@ impl Coprocessor {
     fn new(
         pdev: &platform::Device<Core<'_>>,
         dev: &AsahiDrmDevice,
-        cfg: &Config,
-        uat: &mmu::Uat,
         shared: &Arc<Shared>,
         role: Role,
     ) -> Result<Coprocessor> {
         let index = role as usize;
-        let (crash_buffer, crash_log) = match &cfg.crash_buffers {
-            CrashBuffers::Fixed(buffers) => {
-                let buffer = &buffers[index];
-                let mut crash_buffer = KernelObject::new(
-                    dev,
-                    uat.kernel_lower_vm(),
-                    Placement::At(buffer.va),
-                    buffer.size,
-                    mmu::PROT_FW_SHARED_RW,
-                    CpuMap::WriteCombined,
-                )?;
-                crash_buffer.bytes_mut().fill(CRASH_BUFFER_FILL[index]);
-                let crash_map = crash_buffer.kernel_map()?;
-                let fixed = FixedBuffer {
-                    va: buffer.va,
-                    size: buffer.size,
-                };
-                (Some(crash_buffer), Some((fixed, crash_map)))
-            }
-            CrashBuffers::FirmwareData => (None, None),
-        };
         let state = Arc::pin_init(
             pin_init!(RoleState {
                 role,
                 shared: shared.clone(),
-                crash_log,
                 crashed: AtomicBool::new(false),
                 ack <- Opaque::ffi_init(|ptr| {
                     // SAFETY: ptr is valid uninitialized completion storage that is pinned
@@ -595,7 +524,6 @@ impl Coprocessor {
             running: false,
             rtkit: Mailbox::new(Self::receiver(dev, index, &state)?)?,
             state,
-            _crash_buffer: crash_buffer,
         })
     }
 
@@ -1979,9 +1907,9 @@ impl Gpu {
         if cfg.chip_id == 0x8142 {
             regs.set_m5_start_control().inspect_err(at("M5 start control"))?;
         }
-        let primary = Coprocessor::new(pdev, dev, cfg, &uat, shared, Role::Primary)
+        let primary = Coprocessor::new(pdev, dev, shared, Role::Primary)
             .inspect_err(|e| dev_err!(dev.as_ref(), "Primary coprocessor setup failed: {:?}\n", e))?;
-        let secondary = Coprocessor::new(pdev, dev, cfg, &uat, shared, Role::Secondary)
+        let secondary = Coprocessor::new(pdev, dev, shared, Role::Secondary)
             .inspect_err(|e| {
                 dev_err!(dev.as_ref(), "Secondary coprocessor setup failed: {:?}\n", e)
             })?;
@@ -2181,12 +2109,12 @@ impl Gpu {
             CpuMap::WriteCombined,
         )?;
         let primary =
-            Coprocessor::new(pdev, dev, cfg, &uat, shared, Role::Primary).inspect_err(|e| {
+            Coprocessor::new(pdev, dev, shared, Role::Primary).inspect_err(|e| {
                 dev_err!(dev.as_ref(), "Primary coprocessor setup failed: {:?}\n", e)
             })?;
         let secondary = match cfg.secondary_root_offset {
             Some(_) => Some(
-                Coprocessor::new(pdev, dev, cfg, &uat, shared, Role::Secondary).inspect_err(
+                Coprocessor::new(pdev, dev, shared, Role::Secondary).inspect_err(
                     |e| {
                         dev_err!(
                             dev.as_ref(),

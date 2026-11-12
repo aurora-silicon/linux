@@ -4,7 +4,7 @@ use crate::g17::fw::{
     self,
     initdata::{v25g83, PerfConfig, RegionCConfig, RegisterWindow, PERF_STATES},
 };
-use crate::g17::{Config, CoreLayout, CrashBuffers, FixedBuffer, Identity};
+use crate::g17::{Config, CoreLayout, FixedBuffer, Identity};
 use crate::hw::{GpuGen, GpuVariant};
 use super::t604x::{instances, window};
 use crate::mmu::UatQuirks;
@@ -24,7 +24,6 @@ pub(super) const BASE: Config = Config {
     uat_ias: 42,
     uat_oas: 42,
     secondary_root_offset: None,
-    crash_buffers: CrashBuffers::FirmwareData,
     // Unverified placement; use the M4 Pro layout.
     profile: crate::g17::FirmwareProfile::PublishedRoots,
     pm_metrics: Some(FixedBuffer {
