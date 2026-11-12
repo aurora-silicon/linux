@@ -3222,8 +3222,7 @@ static int apple_nvme_restore(struct device *dev)
 	int ret;
 
 	/* Hibernation aborted before the image: the same ANS session runs on. */
-	if (IS_ENABLED(CONFIG_HIBERNATION) && anv->hw->needs_ioq_registers &&
-	    pm_hibernate_is_restored()) {
+	if (anv->hw->needs_ioq_registers && pm_hibernate_is_restored()) {
 		ret = apple_nvme_restore_post_m4(anv);
 		if (ret)
 			return ret;
@@ -3318,26 +3317,21 @@ static const struct apple_nvme_hw apple_nvme_t6040_hw = {
 	.lsq_in_nvmmu = true,
 	.max_queue_depth = 64,
 	/*
-	 * Registered with the T6040 sleep controller. The flush, quiesce, CC.SHN
-	 * shutdown notification and the resume path (SART replay, warm RTKit
-	 * restart, controller reset + namespace re-attach) are all generic and
-	 * already wired through sleep_coproc; the controller stops
-	 * ANS at the commit and raises its two ST lanes on wake
-	 * (t6040_apcie_st_lower/raise). Whether a sleep cuts the power
-	 * is the controller's decision (apple_sleep_power_loss()); a dry run (2
-	 * or 3) flushes, quiesces and sends the shutdown notification at the
-	 * device suspend, as a sleep does, and resets the controller as after
-	 * any refusal.
+	 * The sleep controller takes this ANS through a firmware-driven suspend
+	 * as on T8140: flush, quiesce and the shutdown notification at the
+	 * device suspend, the firmware idled at the commit, its storage link
+	 * quiesced behind it and brought up again on wake, then the SART replay,
+	 * the warm RTKit restart and a controller reset. A sleep taken back
+	 * before the commit has flushed, quiesced and notified too, and resets
+	 * the controller like any refused sleep.
 	 *
-	 * CC.SHN: the platform 26.7.1 on this SoC, at power state 0,
-	 * shuts NVMe down in its suspend variant:
-	 * the shutdown notification writes CC |= 0xc000 and
-	 * polls CSTS.SHST for complete. Flush: namespace 1 only, the OS's own; the
-	 * others belong to the firmware, as on T8140.
+	 * The firmware takes the shutdown notification with both CC.SHN bits set
+	 * and answers with CSTS.SHST complete. It owns every namespace above 1,
+	 * as on T8140, so only namespace 1 is flushed.
 	 *
-	 * sleep_epmap_last_mask stays 0, RTKit's default of echoing the whole
-	 * endpoint map on the warm restart: ANS came back with it in the J616s
-	 * S2R tests that cut the power.
+	 * After a sleep that cut the power it takes the whole endpoint map
+	 * echoed as the last reply of the warm restart, RTKit's default:
+	 * sleep_epmap_last_mask stays 0.
 	 */
 	.sleep_coproc = true,
 	.sleep_flush_max_nsid = 1,
