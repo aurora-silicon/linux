@@ -1181,7 +1181,8 @@ static int aic_syscore_suspend(void *data)
 	struct aic_irq_chip *ic = aic_irqc;
 	u32 die, i, off = 0;
 
-	if (!pm_suspend_via_firmware())
+	/* Registered for the resume from disk alone where the SoC has no such suspend. */
+	if (!ic->info.fw_suspend || !pm_suspend_via_firmware())
 		return 0;
 
 	aic_sleep.config = aic_ic_read(ic, AIC2_CONFIG);
@@ -1302,14 +1303,21 @@ static struct syscore aic_syscore = {
 	.ops = &aic_syscore_ops,
 };
 
+/*
+ * The save across a firmware-driven suspend is for the SoCs that have one. The
+ * mask resync after a resume from disk is for every SoC: whatever the AIC, the
+ * kernel that loaded the image left its own masks in it.
+ */
 static void __init aic_sleep_init(struct aic_irq_chip *irqc)
 {
-	if (!irqc->info.fw_suspend)
+	if (!irqc->info.fw_suspend && !IS_ENABLED(CONFIG_HIBERNATION))
 		return;
 
-	aic_sleep.irq_cfg = kcalloc(irqc->nr_die * irqc->nr_irq, sizeof(u32), GFP_KERNEL);
-	if (WARN_ON(!aic_sleep.irq_cfg))
-		return;
+	if (irqc->info.fw_suspend) {
+		aic_sleep.irq_cfg = kcalloc(irqc->nr_die * irqc->nr_irq, sizeof(u32), GFP_KERNEL);
+		if (WARN_ON(!aic_sleep.irq_cfg))
+			return;
+	}
 
 	register_syscore(&aic_syscore);
 }
