@@ -776,14 +776,6 @@ bool apple_sleep_power_loss(void)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_power_loss);
 
-bool apple_sleep_last_steps(void)
-{
-	unsigned int dry = READ_ONCE(apple_sleep_dry);
-
-	return pm_suspend_via_firmware() && (!dry || dry >= 2);
-}
-EXPORT_SYMBOL_GPL(apple_sleep_last_steps);
-
 /* The registry's questions, answered for this SoC's sleep. */
 static bool apple_sleep_reg_commit_stops(void)
 {

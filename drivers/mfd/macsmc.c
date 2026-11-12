@@ -1134,10 +1134,8 @@ static int apple_smc_prepare(struct device *dev)
 }
 
 /* Warned, and a refusal came before the notice: tell it the sleep is off. */
-static void apple_smc_complete(struct device *dev)
+static void apple_smc_sleep_end(struct apple_smc *smc)
 {
-	struct apple_smc *smc = dev_get_drvdata(dev);
-
 	smc->sleep_warn_late = false;
 	if (smc->sleep_warned) {
 		apple_smc_write_mbse(smc, SMC_KEY(waka));
@@ -1145,6 +1143,11 @@ static void apple_smc_complete(struct device *dev)
 	}
 	/* A commit the SMC refused, or dark wakes that ended in a refusal. */
 	apple_smc_wake_full(smc);
+}
+
+static void apple_smc_complete(struct device *dev)
+{
+	apple_smc_sleep_end(dev_get_drvdata(dev));
 }
 
 /*
@@ -1190,13 +1193,28 @@ static int apple_smc_sleep_enter(struct apple_smc *smc)
 	return apple_smc_sleep_commit(smc);
 }
 
-static int apple_smc_suspend_noirq(struct device *dev)
+/*
+ * Whether this suspend goes on to the SoC's power loss. Only then is the SMC given its sleep
+ * commit, which nothing sent to it takes back: a T6041 SMC that took the commit and then saw
+ * no power loss kept every sensor report at its last value until a later sleep had completed,
+ * although it got the notices of a wake as after any sleep. So the commit is among the stops
+ * that only a power cycle undoes, and a dry run, which ends short of the power loss by
+ * design, leaves it out.
+ */
+static bool apple_smc_sleep_commits(void)
 {
-	struct apple_smc *smc = dev_get_drvdata(dev);
+	if (IS_ENABLED(CONFIG_MFD_MACSMC_KUNIT_TEST))
+		KUNIT_STATIC_STUB_REDIRECT(apple_smc_sleep_commits);
+
+	return apple_sleep_power_loss();
+}
+
+static int apple_smc_sleep_noirq(struct apple_smc *smc)
+{
 	int ret;
 
-	/* A dry run short of its last steps warns the SMC, and .complete takes that back. */
-	if ((!smc->sleep_warned && !smc->sleep_warn_late) || !apple_sleep_last_steps())
+	/* A sleep that stops short of the commit warns the SMC, and .complete takes that back. */
+	if ((!smc->sleep_warned && !smc->sleep_warn_late) || !apple_smc_sleep_commits())
 		return 0;
 
 	apple_smc_set_polled(smc, true);
@@ -1206,15 +1224,24 @@ static int apple_smc_suspend_noirq(struct device *dev)
 	return ret;
 }
 
+static int apple_smc_suspend_noirq(struct device *dev)
+{
+	return apple_smc_sleep_noirq(dev_get_drvdata(dev));
+}
+
+static void apple_smc_wake_noirq(struct apple_smc *smc)
+{
+	if (!smc->ap_notified)
+		return;
+
+	apple_smc_set_polled(smc, true);
+	apple_smc_sleep_wake(smc);
+	apple_smc_set_polled(smc, false);
+}
+
 static int apple_smc_resume_noirq(struct device *dev)
 {
-	struct apple_smc *smc = dev_get_drvdata(dev);
-
-	if (smc->ap_notified) {
-		apple_smc_set_polled(smc, true);
-		apple_smc_sleep_wake(smc);
-		apple_smc_set_polled(smc, false);
-	}
+	apple_smc_wake_noirq(dev_get_drvdata(dev));
 
 	return 0;
 }

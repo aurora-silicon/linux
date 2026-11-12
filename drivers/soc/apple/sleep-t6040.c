@@ -29,9 +29,11 @@
  *         false, so what only a power cycle restores is left out), the CPUs
  *         park and answer the commit's hold, the commit point's checks run,
  *         and the sleep is refused there and resumed warm.
- *      2: 1, plus the last steps that can still be taken back (the SMC's sleep
- *         commit, each coprocessor's last check, such as ANS's check of the
- *         shutdown notification it sent at its suspend).
+ *      2: 1, plus the last steps that can still be taken back (each
+ *         coprocessor's last check, such as ANS's check of the shutdown
+ *         notification it sent at its suspend). The SMC's sleep commit is not
+ *         one of them: the SMC leaves the state it puts it in only through a
+ *         power loss of the SoC, so no dry run sends it.
  *    The AON watchdog's WD2 is armed from .begin to .end of a dry run
  *    (t6040_sleep.wd2_secs, 0 to leave it off).
  *  - The real commit (t6040_sleep_commit) runs only when no blocker remains,
@@ -488,7 +490,7 @@ static void __iomem *t6040_ioremap_np(struct device *dev, phys_addr_t pa, size_t
 	return p;
 }
 
-/* The generic driver answers apple_sleep_power_loss() and apple_sleep_last_steps() by it. */
+/* The generic driver answers apple_sleep_power_loss() by it. */
 static void t6040_sleep_set_dry(struct t6040_sleep *s, unsigned int dry)
 {
 	s->dry = dry;

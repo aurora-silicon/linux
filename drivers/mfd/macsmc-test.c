@@ -337,6 +337,36 @@ static void macsmc_sleep_refused_wktp_test(struct kunit *test)
 	macsmc_sleep_refused(test, true);
 }
 
+static bool macsmc_test_no_commit(void)
+{
+	return false;
+}
+
+static void macsmc_sleep_dry_test(struct kunit *test)
+{
+	struct macsmc_test_context *ctx = test->priv;
+
+	kunit_activate_static_stub(test, apple_smc_ap_power, macsmc_test_ap_power);
+	kunit_activate_static_stub(test, apple_smc_sleep_commits, macsmc_test_no_commit);
+	ctx->result = 8;
+	ctx->smc.wktp = true;
+
+	/*
+	 * A sleep that ends short of the power loss, as a dry run does: the SMC is
+	 * warned and told that the sleep is off, and gets nothing of the commit.
+	 */
+	apple_smc_sleep_warn(&ctx->smc);
+	KUNIT_EXPECT_EQ(test, apple_smc_sleep_noirq(&ctx->smc), 0);
+	KUNIT_EXPECT_FALSE(test, ctx->smc.ap_notified);
+	KUNIT_EXPECT_FALSE(test, ctx->smc.wake_silent);
+	apple_smc_wake_noirq(&ctx->smc);
+	apple_smc_sleep_end(&ctx->smc);
+	KUNIT_EXPECT_FALSE(test, ctx->smc.sleep_warned);
+	KUNIT_ASSERT_EQ(test, ctx->seen_count, 2U);
+	KUNIT_EXPECT_EQ(test, ctx->seen[0], SMC_KEY(slpw));
+	KUNIT_EXPECT_EQ(test, ctx->seen[1], SMC_KEY(waka));
+}
+
 static void macsmc_notice_test(struct kunit *test)
 {
 	struct macsmc_test_context *ctx = test->priv;
@@ -449,6 +479,7 @@ static struct kunit_case macsmc_parser_cases[] = {
 	KUNIT_CASE(macsmc_sleep_warn_late_test),
 	KUNIT_CASE(macsmc_sleep_refused_test),
 	KUNIT_CASE(macsmc_sleep_refused_wktp_test),
+	KUNIT_CASE(macsmc_sleep_dry_test),
 	KUNIT_CASE(macsmc_notice_test),
 	KUNIT_CASE(macsmc_lid_wake_test),
 	KUNIT_CASE(macsmc_wake_reason_test),
