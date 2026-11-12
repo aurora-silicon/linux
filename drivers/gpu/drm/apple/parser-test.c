@@ -254,6 +254,23 @@ static void parser_legacy_ties(struct kunit *test)
 	kfree(modes);
 }
 
+/* Only a timing at most 655.35 MHz, with explicit polarity, fits an EDID detailed timing. */
+static void parser_metadata_timing_fits(struct kunit *test)
+{
+	struct drm_display_mode mode = {
+		.clock = 594000, .hdisplay = 3840, .hsync_start = 4016, .hsync_end = 4104,
+		.htotal = 4400, .vdisplay = 2160, .vsync_start = 2168, .vsync_end = 2178,
+		.vtotal = 2250, .flags = DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC,
+	};
+
+	KUNIT_EXPECT_TRUE(test, dcp_metadata_timing_fits(&mode));
+	mode.clock = 1188000;	/* the same timing at 120 Hz */
+	KUNIT_EXPECT_FALSE(test, dcp_metadata_timing_fits(&mode));
+	mode.clock = 594000;
+	mode.flags = 0;
+	KUNIT_EXPECT_FALSE(test, dcp_metadata_timing_fits(&mode));
+}
+
 static void parser_color_presence(struct kunit *test)
 {
 	struct parser_record record = valid_record(7, 10);
@@ -1928,6 +1945,7 @@ static struct kunit_case parser_cases[] = {
 	KUNIT_CASE(parser_score_presence),
 	KUNIT_CASE(parser_legacy_ties),
 	KUNIT_CASE(parser_color_presence),
+	KUNIT_CASE(parser_metadata_timing_fits),
 	KUNIT_CASE(parser_geometry),
 	KUNIT_CASE(parser_bad_geometry),
 	KUNIT_CASE(parser_horizontal_rate),

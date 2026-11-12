@@ -10,13 +10,13 @@
 #include "dcp-display-metadata.h"
 #include "parser.h"
 
-static int dcp_metadata_timing(struct detailed_timing *timing,
-			       const struct drm_display_mode *mode,
-			       const struct dcp_display_metadata *metadata)
+/*
+ * Whether @mode fits an EDID detailed timing, the image size aside: at most
+ * 655.35 MHz, 4095 active pixels and the field widths of the blanking and
+ * sync.  A sink's faster modes go in extensions, never here.
+ */
+bool dcp_metadata_timing_fits(const struct drm_display_mode *mode)
 {
-	struct detailed_pixel_timing *pixel = &timing->data.pixel_data;
-	u32 hblank, vblank, hoff, voff, hsync, vsync;
-	u32 width = metadata->width_cm * 10, height = metadata->height_cm * 10;
 	u32 hflags = mode->flags & (DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_NHSYNC);
 	u32 vflags = mode->flags & (DRM_MODE_FLAG_PVSYNC | DRM_MODE_FLAG_NVSYNC);
 
@@ -31,6 +31,26 @@ static int dcp_metadata_timing(struct detailed_timing *timing,
 	    (vflags != DRM_MODE_FLAG_PVSYNC && vflags != DRM_MODE_FLAG_NVSYNC) ||
 	    (mode->flags & ~(DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_NHSYNC |
 			     DRM_MODE_FLAG_PVSYNC | DRM_MODE_FLAG_NVSYNC)))
+		return false;
+	return mode->htotal - mode->hdisplay <= 4095 &&
+	       mode->vtotal - mode->vdisplay <= 4095 &&
+	       mode->hsync_start - mode->hdisplay <= 1023 &&
+	       mode->hsync_end - mode->hsync_start <= 1023 &&
+	       mode->vsync_start - mode->vdisplay <= 63 &&
+	       mode->vsync_end - mode->vsync_start <= 63;
+}
+
+static int dcp_metadata_timing(struct detailed_timing *timing,
+			       const struct drm_display_mode *mode,
+			       const struct dcp_display_metadata *metadata)
+{
+	struct detailed_pixel_timing *pixel = &timing->data.pixel_data;
+	u32 hblank, vblank, hoff, voff, hsync, vsync;
+	u32 width = metadata->width_cm * 10, height = metadata->height_cm * 10;
+	u32 hflags = mode->flags & (DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_NHSYNC);
+	u32 vflags = mode->flags & (DRM_MODE_FLAG_PVSYNC | DRM_MODE_FLAG_NVSYNC);
+
+	if (!dcp_metadata_timing_fits(mode) || width > 4095 || height > 4095)
 		return -EINVAL;
 	hblank = mode->htotal - mode->hdisplay;
 	vblank = mode->vtotal - mode->vdisplay;
@@ -38,9 +58,6 @@ static int dcp_metadata_timing(struct detailed_timing *timing,
 	voff = mode->vsync_start - mode->vdisplay;
 	hsync = mode->hsync_end - mode->hsync_start;
 	vsync = mode->vsync_end - mode->vsync_start;
-	if (hblank > 4095 || vblank > 4095 || hoff > 1023 || hsync > 1023 ||
-	    voff > 63 || vsync > 63 || width > 4095 || height > 4095)
-		return -EINVAL;
 
 	timing->pixel_clock = cpu_to_le16(mode->clock / 10);
 	pixel->hactive_lo = mode->hdisplay;

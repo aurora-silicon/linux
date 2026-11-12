@@ -1001,12 +1001,19 @@ void dcp_firmware_metadata_timing(struct apple_dcp *dcp)
 	 * The EDID's detailed timing: the preferred mode when the firmware
 	 * describes it fully, otherwise the highest-scored timing it marks
 	 * IsPreferred, the one the sink's own EDID lists first.  An external
-	 * display's preferred mode need not be one of those.
+	 * display's preferred mode need not be one of those.  Only a timing an
+	 * EDID detailed timing can hold: a sink whose preferred mode is faster
+	 * (3840x2160@120, 1188 MHz) lists it in an extension, and without this
+	 * it got no EDID at all.  DRM's modes come from the catalog either way.
 	 */
 	for (i = 0; i < dcp->nr_modes; i++) {
 		const struct dcp_display_mode *m = &dcp->modes[i];
+		struct drm_display_mode fit = m->mode;
 
 		if (!m->metadata_timing_valid)
+			continue;
+		fit.flags |= m->metadata_sync_flags;
+		if (!dcp_metadata_timing_fits(&fit))
 			continue;
 		if (best == UINT_MAX || (m->mode.type & DRM_MODE_TYPE_PREFERRED) ||
 		    (!(dcp->modes[best].mode.type & DRM_MODE_TYPE_PREFERRED) &&
