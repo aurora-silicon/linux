@@ -2551,6 +2551,7 @@ static int t6040_cio_up_locked(struct t6040_usb2_phy *tphy)
 {
 	void __iomem *core = t6040_core(tphy);
 	unsigned int lane;
+	bool cycle;
 	bool flip;
 	int ret;
 
@@ -2584,6 +2585,16 @@ static int t6040_cio_up_locked(struct t6040_usb2_phy *tphy)
 		t6040_usb3_reclaim_locked(tphy);
 		return ret;
 	}
+
+	/* The coprocessor's recovery, as in t6040_usb3_up_locked(): it is the same firmware. */
+	cycle = t6040_recovery_start(&tphy->recovery);
+retry:
+	if (cycle) {
+		ret = t6040_usb3_hard_recover(tphy);
+		if (ret)
+			goto put;
+	}
+
 	ret = t6040_usb3_wake(tphy);
 	if (ret)
 		goto sleep;	/* the coprocessor block may be unclocked: never touch it */
@@ -2592,8 +2603,9 @@ static int t6040_cio_up_locked(struct t6040_usb2_phy *tphy)
 	t6040_cio_slpctrl(tphy);
 	ret = t6040_phy_run_firmware(tphy, "CIO", flip);
 	if (ret)
-		goto firmware;
+		goto retry_or_fail;
 
+	t6040_recovery_complete(&tphy->recovery);
 	tphy->cio_up = true;
 	tphy->cio_flip = flip;
 	dev_info(tphy->dev, "CIO PHY up (mode 2), %s orientation: xbar %#x/%#x cfg %#x/%#x\n",
@@ -2603,11 +2615,12 @@ static int t6040_cio_up_locked(struct t6040_usb2_phy *tphy)
 	t6040_cio_pipe_update_locked(tphy);
 	return 0;
 
-firmware:
+retry_or_fail:
 	/*
 	 * The lanes are powered by now: as t6040_cio_down_locked(), both TX lanes
 	 * and the common block down, then the receivers, before the coprocessor
-	 * stops and the CFG block goes back to its boot state.
+	 * stops and the CFG block goes back to its boot state. That is the full
+	 * teardown, and one complete fresh start may follow it.
 	 */
 	t6040_phy_tx_cmn_shutdown(tphy);
 	for (lane = 0; lane < 2; lane++)
@@ -2615,8 +2628,16 @@ firmware:
 				lane);
 	fsleep(200);
 	t6040_usb3_firmware_power_down(tphy);
+	t6040_usb3_sleep(tphy);
+	if (t6040_recovery_retry(&tphy->recovery)) {
+		cycle = true;
+		goto retry;
+	}
+	goto put;
+
 sleep:
 	t6040_usb3_sleep(tphy);
+put:
 	pm_runtime_put(tphy->dev);
 	dev_warn(tphy->dev, "CIO PHY bring-up failed: %d\n", ret);
 	/* The port stays out of CIO: give the lanes back to USB3. */
