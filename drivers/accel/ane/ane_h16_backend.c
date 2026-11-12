@@ -636,6 +636,16 @@ static bool ane_h16_slept_off(struct ane_h16_device *h)
 	return h->powered != 0;
 }
 
+/*
+ * System sleep cycles the engine cold: it is powered off under the running
+ * firmware, booted again from the preload and every program replayed. The
+ * other sleep path keeps the firmware and falls back to this one.
+ */
+static bool ane_h16_sleep_cold(const struct ane_h16_device *h)
+{
+	return h->boot.soc->sleep_cold && !h->boot.soc->sleep_warm;
+}
+
 static int ane_h16_sleep_prepare(struct ane_h16_device *h)
 {
 	int ret;
@@ -691,7 +701,7 @@ static int ane_h16_sleep_prepare(struct ane_h16_device *h)
 		return 0;
 	}
 	ane_h16_session_sleep(&h->session, true);
-	if (!h->boot.soc->sleep_warm) {
+	if (ane_h16_sleep_cold(h)) {
 		/* Cold cycle: nothing in flight, then power off under the firmware. */
 		for (unsigned int ch = 0; ch < ANE_FW_CHANNELS; ch++) {
 			if (h->boot.transport.pending[ch].active) {
@@ -735,7 +745,7 @@ static void ane_h16_sleep_resume(struct ane_h16_device *h)
 	h->resume_ready_ns = 0;
 	h->resume_first_ns = 0;
 	h->resume_replayed = 0;
-	h->resume_cold = !h->boot.soc->sleep_warm || h->sleep_quarantined;
+	h->resume_cold = ane_h16_sleep_cold(h) || h->sleep_quarantined;
 	h->resume_restarts = 0;
 	if (h->sleep_quarantined && !ane_h16_slept_off(h)) {
 		/* Not proven off: the old firmware may still run. Keep it. */
@@ -781,7 +791,7 @@ static int ane_h16_pm_event(struct notifier_block *nb, unsigned long event, void
 {
 	struct ane_h16_device *h = container_of(nb, struct ane_h16_device, pm_notifier);
 	bool pinned = READ_ONCE(h->pinned);
-	bool cold = !h->boot.soc->sleep_warm;
+	bool cold = ane_h16_sleep_cold(h);
 
 	/* Without a sleep path on this platform, every sleep is refused as before. */
 	if (!h->boot.soc->sleep_warm && !h->boot.soc->sleep_cold) {
