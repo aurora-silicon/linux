@@ -106,7 +106,6 @@
 #define PS_APCIE_SYS_ST0	0x380	/* SOC-East: ps_apcie_sys_st0 */
 #define PS_APCIE_SYS_ST1	0x388	/* SOC-East: ps_apcie_sys_st1 */
 #define PS_APCIE_PHY_SW		0x398	/* SOC-East: ps_apcie_phy_sw (the shared PHY) */
-#define PS_BUSY			BIT(11)	/* a request is in progress */
 
 /*
  * cluster-ctl (pmgr reg0 + cluster-ctl-offset 0x20000 = 0x502820000). Measured
@@ -139,13 +138,11 @@
 
 /*
  * SOC-East (pmgr reg2 = 0x502280000). The SEP/retention word at +0xc00: on
- * wake the platform clears DEV_DISABLE (BIT10) and then polls PARENT_MISSING (BIT11)
- * clear before going on. Also holds several
+ * wake the platform clears PS_DEV_DISABLE and then polls PS_BUSY clear before going
+ * on. Also holds several
  * of the axi2af domains' power words.
  */
 #define SOC_EAST_RETENTION	0xc00
-#define SOC_EAST_DEV_DISABLE	BIT(10)
-#define SOC_EAST_PARENT_MISSING	BIT(11)
 #define SOC_EAST_TIMEOUT_US	5000
 
 /*
@@ -298,28 +295,7 @@ static const struct {
 #define PS_APCIE_SYS_GP		0x390
 #define AXI2AF_ANS		9
 #define AXI2AF_APCIE_SYS_GP	14
-#define GP_PORT_L2		0x88
-#define GP_PORT_L2_ENTER	0x11
-#define GP_PORT_L2_BUSY		BIT(0)
-#define GP_PORT_INTSTAT		0x100
-#define GP_PORT_INTMSK		0x104
-#define GP_PORT_INT_LINK	GENMASK(7, 4)
-#define GP_PORT_PERST_GUARD	0x13c
-#define GP_PORT_LINKSTS		0x208
-#define GP_PORT_LINKSTS_UP	BIT(0)
-#define GP_PORT_APPCLK		0x800
-#define GP_PORT_APPCLK_EN	BIT(0)
-#define GP_PORT_APPCLK_CGDIS	BIT(8)
-#define GP_PORT_PERST		0x82c
-#define GP_PHY_LINK		BIT(31)
-#define GP_PHY_EN0		BIT(9)
-#define GP_PHY_EN1		BIT(10)
-#define GP_PHY_RESET		BIT(4)
-#define GP_PHY_CLK0REQ		BIT(0)
-#define GP_PHY_CLK1REQ		BIT(1)
-#define GP_PHY_CLK0ACK		BIT(2)
 #define GP_PIN_DATA		BIT(0)
-#define GP_STOP_US		5000
 #define T6040_PMC_DCP_PA	0x5048a9c14ULL	/* count of DCPs powered (+0), second voter (+4); the platform ends at 0/0 */
 #define T6040_AXI2AF_DOMAINS	15
 
@@ -1943,16 +1919,16 @@ static void t6040_gp_port_stop(struct t6040_sleep *s, int p)
 	if (!port || !phy)
 		return;
 	s->gp_phy_saved[p] = readl(phy);
-	s->gp_appclk_saved[p] = readl(port + GP_PORT_APPCLK);
-	s->gp_perst_saved[p] = readl(port + GP_PORT_PERST);
+	s->gp_appclk_saved[p] = readl(port + APCIE_PORT_APPCLK);
+	s->gp_perst_saved[p] = readl(port + APCIE_PORT_PERST);
 	s->gp_saved[p] = true;
-	writel(readl(port + GP_PORT_INTMSK) | GP_PORT_INT_LINK, port + GP_PORT_INTMSK);
-	writel(GP_PORT_INT_LINK, port + GP_PORT_INTSTAT);
-	writel(readl(port + GP_PORT_APPCLK) | GP_PORT_APPCLK_CGDIS, port + GP_PORT_APPCLK);
-	if (readl(port + GP_PORT_LINKSTS) & GP_PORT_LINKSTS_UP) {
-		writel(GP_PORT_L2_ENTER, port + GP_PORT_L2);
-		readl_poll_timeout_atomic(port + GP_PORT_L2, val, !(val & GP_PORT_L2_BUSY), 10,
-					  GP_STOP_US);
+	writel(readl(port + APCIE_PORT_INTMSK) | APCIE_PORT_INT_LINK, port + APCIE_PORT_INTMSK);
+	writel(APCIE_PORT_INT_LINK, port + APCIE_PORT_INTSTAT);
+	writel(readl(port + APCIE_PORT_APPCLK) | APCIE_PORT_APPCLK_CGDIS, port + APCIE_PORT_APPCLK);
+	if (readl(port + APCIE_PORT_LINKSTS) & APCIE_PORT_LINKSTS_UP) {
+		writel(APCIE_PORT_L2_ENTER, port + APCIE_PORT_L2);
+		readl_poll_timeout_atomic(port + APCIE_PORT_L2, val, !(val & APCIE_PORT_L2_BUSY),
+					  10, APCIE_PORT_STOP_US);
 	}
 	if (s->gp_pins && s->gp_perst[p] >= 0) {
 		void __iomem *reg = s->gp_pins + 4 * s->gp_perst[p];
@@ -1960,20 +1936,20 @@ static void t6040_gp_port_stop(struct t6040_sleep *s, int p)
 		val = readl(reg);
 		writel(s->gp_perst_low[p] ? val & ~GP_PIN_DATA : val | GP_PIN_DATA, reg);
 	}
-	writel(readl(phy) & ~GP_PHY_LINK, phy);
+	writel(readl(phy) & ~APCIE_PORT_PHY_LINK, phy);
 	udelay(1000);
 	/* What this bit does isn't known. It is set around PERST# (T8140). */
-	writel(readl(port + GP_PORT_PERST_GUARD) | BIT(8), port + GP_PORT_PERST_GUARD);
-	writel(0, port + GP_PORT_PERST);
-	writel(readl(port + GP_PORT_PERST_GUARD) & ~BIT(8), port + GP_PORT_PERST_GUARD);
-	writel(readl(phy) & ~GP_PHY_EN1, phy);
-	writel(readl(phy) & ~GP_PHY_EN0, phy);
-	writel(readl(phy) | GP_PHY_RESET, phy);
-	writel(readl(phy) & ~GP_PHY_CLK0REQ, phy);
-	readl_poll_timeout_atomic(phy, val, !(val & GP_PHY_CLK0ACK), 1, GP_STOP_US);
-	writel(readl(phy) & ~GP_PHY_CLK1REQ, phy);
-	writel(readl(port + GP_PORT_APPCLK) & ~GP_PORT_APPCLK_EN, port + GP_PORT_APPCLK);
-	writel(readl(port + GP_PORT_INTSTAT), port + GP_PORT_INTSTAT);
+	writel(readl(port + APCIE_PORT_PERST_GUARD) | BIT(8), port + APCIE_PORT_PERST_GUARD);
+	writel(0, port + APCIE_PORT_PERST);
+	writel(readl(port + APCIE_PORT_PERST_GUARD) & ~BIT(8), port + APCIE_PORT_PERST_GUARD);
+	writel(readl(phy) & ~APCIE_PORT_PHY_EN1, phy);
+	writel(readl(phy) & ~APCIE_PORT_PHY_EN0, phy);
+	writel(readl(phy) | APCIE_PHY_CTRL_RESET, phy);
+	writel(readl(phy) & ~APCIE_PHY_CTRL_CLK0REQ, phy);
+	readl_poll_timeout_atomic(phy, val, !(val & APCIE_PHY_CTRL_CLK0ACK), 1, APCIE_PORT_STOP_US);
+	writel(readl(phy) & ~APCIE_PHY_CTRL_CLK1REQ, phy);
+	writel(readl(port + APCIE_PORT_APPCLK) & ~APCIE_PORT_APPCLK_EN, port + APCIE_PORT_APPCLK);
+	writel(readl(port + APCIE_PORT_INTSTAT), port + APCIE_PORT_INTSTAT);
 }
 
 /* The GP host's two ports, while the block's domains are all still on. */
@@ -2123,12 +2099,9 @@ static int t6040_sleep_commit(unsigned long unused)
  * the controller's PERST register as saved, then the port's ready bit polled. The link
  * itself stays down for the host driver.
  */
-#define GP_PHY_CLK1ACK		BIT(3)
-#define GP_PORT_STATUS		0x804
-#define GP_PORT_STATUS_READY	BIT(0)
-
 static void t6040_gp_pcie_clk(struct t6040_sleep *s)
 {
+	const u32 appclk = APCIE_PORT_APPCLK_EN | APCIE_PORT_APPCLK_CGDIS;
 	unsigned int timeouts = 0;
 	u32 val;
 	int i;
@@ -2141,30 +2114,32 @@ static void t6040_gp_pcie_clk(struct t6040_sleep *s)
 			continue;
 		cfg = s->gp_phy_saved[i];
 		app = s->gp_appclk_saved[i];
-		writel(readl(phy) | GP_PHY_CLK0REQ, phy);
-		if (readl_poll_timeout_atomic(phy, val, val & GP_PHY_CLK0ACK, 1, 50000))
+		writel(readl(phy) | APCIE_PHY_CTRL_CLK0REQ, phy);
+		if (readl_poll_timeout_atomic(phy, val, val & APCIE_PHY_CTRL_CLK0ACK, 1, 50000))
 			timeouts++;
-		writel(readl(phy) | GP_PHY_CLK1REQ, phy);
-		if (readl_poll_timeout_atomic(phy, val, val & GP_PHY_CLK1ACK, 1, 50000))
+		writel(readl(phy) | APCIE_PHY_CTRL_CLK1REQ, phy);
+		if (readl_poll_timeout_atomic(phy, val, val & APCIE_PHY_CTRL_CLK1ACK, 1, 50000))
 			timeouts++;
-		if (!(cfg & GP_PHY_RESET)) {
-			writel(readl(phy) & ~GP_PHY_RESET, phy);
+		if (!(cfg & APCIE_PHY_CTRL_RESET)) {
+			writel(readl(phy) & ~APCIE_PHY_CTRL_RESET, phy);
 			udelay(1);
 		}
-		writel(readl(phy) | (cfg & (GP_PHY_EN0 | GP_PHY_EN1)), phy);
-		writel(readl(phy) | (cfg & GP_PHY_LINK), phy);
-		writel((readl(port + GP_PORT_APPCLK) & ~(GP_PORT_APPCLK_EN | GP_PORT_APPCLK_CGDIS)) |
-		       (app & (GP_PORT_APPCLK_EN | GP_PORT_APPCLK_CGDIS)), port + GP_PORT_APPCLK);
+		writel(readl(phy) | (cfg & (APCIE_PORT_PHY_EN0 | APCIE_PORT_PHY_EN1)), phy);
+		writel(readl(phy) | (cfg & APCIE_PORT_PHY_LINK), phy);
+		writel((readl(port + APCIE_PORT_APPCLK) & ~appclk) | (app & appclk),
+		       port + APCIE_PORT_APPCLK);
 		/*
 		 * The stop also wrote the controller's PERST register 0, and without it the
 		 * port does not report ready. Put it back as it was (the endpoint's PERST# pin
 		 * stays asserted), with the guard bit set around it.
 		 */
-		writel(readl(port + GP_PORT_PERST_GUARD) | BIT(8), port + GP_PORT_PERST_GUARD);
-		writel(s->gp_perst_saved[i], port + GP_PORT_PERST);
-		writel(readl(port + GP_PORT_PERST_GUARD) & ~BIT(8), port + GP_PORT_PERST_GUARD);
-		if (readl_poll_timeout_atomic(port + GP_PORT_STATUS, val, val & GP_PORT_STATUS_READY,
-					      1, 50000))
+		writel(readl(port + APCIE_PORT_PERST_GUARD) | BIT(8),
+		       port + APCIE_PORT_PERST_GUARD);
+		writel(s->gp_perst_saved[i], port + APCIE_PORT_PERST);
+		writel(readl(port + APCIE_PORT_PERST_GUARD) & ~BIT(8),
+		       port + APCIE_PORT_PERST_GUARD);
+		if (readl_poll_timeout_atomic(port + APCIE_PORT_STATUS, val,
+					      val & APCIE_PORT_STATUS_READY, 1, 50000))
 			timeouts++;
 	}
 	s->gp_clk_timeouts = timeouts;
@@ -2175,7 +2150,7 @@ static void t6040_gp_pcie_clk(struct t6040_sleep *s)
  * AURAS2R1 mailbox hands it back to cpu_resume. aura restores NO SoC register;
  * every write here is the OS driver's job. It is the
  * mirror of the PMGR wake restore: the three CPU complexes on, the two wake
- * pwrgates, SOC-East retention off (with the PARENT_MISSING poll), the axi2af
+ * pwrgates, SOC-East retention off (with the busy poll), the axi2af
  * fabric-bridge re-arm, the CPM voters re-asserted, the clk mux restored, the
  * AP-global S2R control cleared, and the wake-status words read. Between them,
  * what a Linux sleep needs on top: ANS's storage link, the GP PCIe ports' clocks
@@ -2221,12 +2196,12 @@ static void t6040_sleep_return(struct t6040_sleep *s)
 	}
 	t6040_wake_sync();
 
-	/* SOC-East retention off: clear DEV_DISABLE, then poll PARENT_MISSING clear. */
+	/* SOC-East retention off: clear DEV_DISABLE, then poll BUSY clear. */
 	if (s->soc_east) {
 		val = readl(s->soc_east + SOC_EAST_RETENTION);
-		writel(val & ~SOC_EAST_DEV_DISABLE, s->soc_east + SOC_EAST_RETENTION);
+		writel(val & ~PS_DEV_DISABLE, s->soc_east + SOC_EAST_RETENTION);
 		ret = readl_poll_timeout_atomic(s->soc_east + SOC_EAST_RETENTION, val,
-						!(val & SOC_EAST_PARENT_MISSING), 1,
+						!(val & PS_BUSY), 1,
 						SOC_EAST_TIMEOUT_US);
 		if (ret)
 			pr_warn("t6040-sleep: SOC-East PARENT_MISSING stuck on wake (%#x)\n", val);
@@ -2476,8 +2451,6 @@ static int t6040_sleep_dry_enter(struct t6040_sleep *s, unsigned int dry)
 
 	return -EBUSY;
 }
-
-#define PS_RESET_REQ		BIT(12)
 
 #define DISP_CPU_GATE_US	50000
 
@@ -2742,7 +2715,7 @@ static unsigned int t6040_sleep_lower_display(struct t6040_sleep *s)
 			if (!cpu && !regmap_read(g->regmap, off, &val) &&
 			    t6040_sleep_ps_on(val, cpu)) {
 				val &= ~(PS_TARGET | PS_AUTO_ENABLE | PS_FLAGS | PS_DEV_DISABLE |
-					 PS_BUSY | PS_RESET_REQ);
+					 PS_BUSY | PS_UNLATCH);
 				regmap_write(g->regmap, off, val);
 				if (t6040_regmap_poll_off(g->regmap, off, &cur)) {
 					pr_warn("t6040-sleep: %s +%#x still on: %#x\n", g->name,
