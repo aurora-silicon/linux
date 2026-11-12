@@ -38,10 +38,23 @@ static void t6040_recovery_retry_exhaustion_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, state.retries, (u8)T6040_RECOVERY_RETRIES);
 }
 
+/* A sleep that powers the SoC down is the power cycle an unclean stop asks for. */
+static void t6040_recovery_power_lost_test(struct kunit *test)
+{
+	struct t6040_recovery_state state = {};
+
+	t6040_recovery_power_down(&state, true, false);
+	KUNIT_EXPECT_TRUE(test, state.cycle_pending);
+	t6040_recovery_power_lost(&state);
+	KUNIT_EXPECT_FALSE(test, state.cycle_pending);
+	KUNIT_EXPECT_FALSE(test, t6040_recovery_start(&state));
+}
+
 static struct kunit_case t6040_recovery_test_cases[] = {
 	KUNIT_CASE(t6040_recovery_missed_ack_test),
 	KUNIT_CASE(t6040_recovery_failed_tune_test),
 	KUNIT_CASE(t6040_recovery_retry_exhaustion_test),
+	KUNIT_CASE(t6040_recovery_power_lost_test),
 	{}
 };
 
@@ -155,11 +168,30 @@ static void t6040_sleep_failed_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, t6040_can_sleep_in_place(tphy));
 }
 
+/*
+ * The wake starts USB3 if it ran before the sleep. Not while the coprocessor
+ * waits for a power cycle after a stop it didn't acknowledge, until a sleep
+ * that powered the SoC down has been that power cycle.
+ */
+static void t6040_sleep_wake_usb3_test(struct kunit *test)
+{
+	struct t6040_usb2_phy *tphy = t6040_sleep_test_phy(test);
+
+	KUNIT_EXPECT_FALSE(test, t6040_sleep_wake_usb3(tphy));
+	tphy->sleep_usb3 = true;
+	KUNIT_EXPECT_TRUE(test, t6040_sleep_wake_usb3(tphy));
+	t6040_recovery_power_down(&tphy->recovery, true, false);
+	KUNIT_EXPECT_FALSE(test, t6040_sleep_wake_usb3(tphy));
+	t6040_recovery_power_lost(&tphy->recovery);
+	KUNIT_EXPECT_TRUE(test, t6040_sleep_wake_usb3(tphy));
+}
+
 static struct kunit_case t6040_sleep_test_cases[] = {
 	KUNIT_CASE(t6040_sleep_usb_test),
 	KUNIT_CASE(t6040_sleep_no_host_test),
 	KUNIT_CASE(t6040_sleep_other_modes_test),
 	KUNIT_CASE(t6040_sleep_failed_test),
+	KUNIT_CASE(t6040_sleep_wake_usb3_test),
 	{}
 };
 

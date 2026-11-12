@@ -218,6 +218,15 @@ static void t6040_recovery_complete(struct t6040_recovery_state *state)
 	state->retries = 0;
 }
 
+/*
+ * The SoC lost power in a sleep, and the coprocessor and both of its power
+ * domains with it: that is the power cycle a stop that wasn't clean asks for.
+ */
+static void __maybe_unused t6040_recovery_power_lost(struct t6040_recovery_state *state)
+{
+	state->cycle_pending = false;
+}
+
 enum t6040_usb3_region {
 	T6040_USB3_AXI2AF,
 	T6040_USB3_AXI2AF_LIOA,
@@ -3340,6 +3349,17 @@ int apple_t6040_atcphy_sleep_result(struct phy *usb2_phy)
 }
 EXPORT_SYMBOL_GPL(apple_t6040_atcphy_sleep_result);
 
+/*
+ * Whether the wake of a sleep with the host kept starts USB3: it ran when the
+ * port went down, and the coprocessor doesn't wait for a power cycle of its
+ * domains, which a system resume can't give it. A sleep that powered the SoC
+ * down was that power cycle, see t6040_usb2_resume_early().
+ */
+static bool t6040_sleep_wake_usb3(const struct t6040_usb2_phy *tphy)
+{
+	return tphy->sleep_usb3 && !tphy->recovery.cycle_pending;
+}
+
 int apple_t6040_atcphy_sleep_power_up(struct phy *usb2_phy)
 {
 	struct t6040_usb2_phy *tphy = t6040_from_usb2_phy(usb2_phy);
@@ -3367,17 +3387,14 @@ int apple_t6040_atcphy_sleep_power_up(struct phy *usb2_phy)
 	if (ret)
 		goto failed;
 	tphy->sleep_down = false;
-	if (tphy->sleep_usb3) {
-		/* A coprocessor that didn't stop cleanly needs its domains' power cycle first. */
-		if (!tphy->recovery.cycle_pending) {
-			tphy->sleep_waking = true;
-			t6040_usb3_up_locked(tphy);
-			tphy->sleep_waking = false;
-		}
-		if (!tphy->usb3_up) {
-			ret = -EIO;
-			goto failed;
-		}
+	if (t6040_sleep_wake_usb3(tphy)) {
+		tphy->sleep_waking = true;
+		t6040_usb3_up_locked(tphy);
+		tphy->sleep_waking = false;
+	}
+	if (tphy->sleep_usb3 && !tphy->usb3_up) {
+		ret = -EIO;
+		goto failed;
 	}
 	dev_info(tphy->dev, "PHY back after the sleep with the host kept, USB3 %s\n",
 		 tphy->usb3_up ? "up" : "off");
@@ -3453,9 +3470,11 @@ static int t6040_phy_count(struct phy *phy)
  * is kept, so that every count stays balanced; a phy still held is only
  * reported.  The port's Type-C state (orientation, DP alt mode, pin
  * assignment) describes the partner, not the PHY, and stays for the next
- * power-on.  Early, before any .restore: the Type-C controller's may set
- * the mux again.  Nothing touches the hardware here.  CIO is torn down
- * before the image (.freeze), so the image never holds a CIO session.
+ * power-on.  A power cycle that the coprocessor was waiting for when the
+ * image was made has happened by now.  Early, before any .restore: the
+ * Type-C controller's may set the mux again.  Nothing touches the hardware
+ * here.  CIO is torn down before the image (.freeze), so the image never
+ * holds a CIO session.
  */
 static int t6040_usb2_restore_early(struct device *dev)
 {
@@ -3495,6 +3514,7 @@ static int t6040_usb2_restore_early(struct device *dev)
 	tphy->dp_mode_flip = false;
 	tphy->dp_rate = -1;
 	tphy->shutdown_failed = false;
+	t6040_recovery_power_lost(&tphy->recovery);
 	return 0;
 }
 
@@ -3580,6 +3600,11 @@ static int t6040_usb2_poweroff(struct device *dev)
  * host's resume. From here until then DP waits for it in its power-on, see
  * t6040_dp_wait_host(). Early, before any .resume: the Type-C controller
  * reports a display from its own.
+ *
+ * If the firmware woke the system, the SoC was powered down, and the
+ * coprocessor and its domains with it: no start after this sleep has a power
+ * cycle of theirs to wait for or to run, the wake of a host kept through it
+ * included.
  */
 static int t6040_usb2_resume_early(struct device *dev)
 {
@@ -3588,6 +3613,8 @@ static int t6040_usb2_resume_early(struct device *dev)
 	if (!tphy)
 		return 0;
 	guard(mutex)(&tphy->lock);
+	if (pm_resume_via_firmware())
+		t6040_recovery_power_lost(&tphy->recovery);
 	WRITE_ONCE(tphy->sleep_back, tphy->sleep_down);
 	return 0;
 }
