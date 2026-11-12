@@ -290,3 +290,11 @@
 &ps_atc3_usb {
 	status = "okay";
 };
+
+&avd_dart {
+	status = "okay";
+};
+
+&avd {
+	status = "okay";
+};

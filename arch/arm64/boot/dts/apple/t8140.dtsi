@@ -1176,7 +1176,12 @@
 				       <&pmp_report_ave0>;
 			power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1",
 					     "perf";
-			iommus = <&ave_dart0 0>, <&ave_dart1 0>;
+			/*
+			 * Stream 12 carries the temporal filter engines; it must
+			 * translate through the encoder's domain, not bypass.
+			 */
+			iommus = <&ave_dart0 0>, <&ave_dart0 12>,
+				 <&ave_dart1 0>, <&ave_dart1 12>;
 			status = "disabled";
 		};
 
@@ -1851,7 +1856,9 @@
 		 */
 		isp_dart0: iommu@3228c0000 {
 			compatible = "apple,t8140-dart", "apple,t8110-dart";
-			reg = <0x3 0x228c0000 0x0 0xc000>;
+			reg = <0x3 0x228c0000 0x0 0xc000>,
+			      <0x3 0x228d0000 0x0 0x4000>;
+			reg-names = "dart", "dapf";
 			#iommu-cells = <1>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 341 IRQ_TYPE_LEVEL_HIGH>;
@@ -1933,7 +1940,7 @@
 					<&ps_isp_fe>, <&ps_isp_dprx>, <&ps_isp_secure>,
 					<&ps_isp_sts0>, <&ps_isp_sts1>, <&ps_isp_pearl>,
 					<&ps_isp_be>, <&ps_isp_clr>, <&ps_isp_cvd>,
-					<&ps_isp_cvm>;
+					<&ps_isp_cvm>, <&ps_ispsens0>, <&ps_ispsens1>;
 			apple,dart-vm-size = <0x0 0xa0000000>;
 			status = "disabled";
 		};

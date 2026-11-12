@@ -43,6 +43,26 @@
 			};
 		};
 
+		/*
+		 * The video decoder (avd0): the M5's (T8142) Hibiscus layout. ADT reg[0]
+		 * 0x2108000000 + 0x1404000 at the arm-io offset; CM3 code and SRAM 0x14000
+		 * each, mailbox at +0x10a8000, ctrl at +0x1100000; IRQs 2417/2418.
+		 */
+		avd: avd@2309080000 {
+			compatible = "apple,t6050-avd", "apple,t8142-avd";
+			interrupts = <AIC_IRQ 0 2417 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 0 2418 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_avd_sys>;
+			resets = <&ps_avd_sys>;
+			reg = <0x23 0x09080000 0x0 0x14000>,
+			      <0x23 0x09094000 0x0 0x14000>,
+			      <0x23 0x090a8000 0x0 0x4000>,
+			      <0x23 0x09100000 0x0 0x10000>;
+			reg-names = "code", "sram", "mbox", "ctrl";
+			iommus = <&avd_dart 0>, <&avd_dart 1>, <&avd_dart 2>;
+			status = "disabled";
+		};
+
 		avd_dart: iommu@2309020000 {
 			compatible = "apple,t6050-dart", "apple,t8110-dart";
 			reg = <0x23 0x09020000 0x0 0x20000>;
@@ -700,12 +720,27 @@
 		power-domains = <&ps_fab9_soc>;
 		status = "disabled";
 	};
+	/*
+	 * ADT ANE_SYS. The ANE driver switches its children ANE_CPU and
+	 * ANE_TDBASE (+0x3c8, +0x3d0) itself, as on T8140, so ps_ane_cpu stays
+	 * disabled.
+	 */
+	ps_ane_sys: power-controller@3a8 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3a8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ane-sys";
+		power-domains = <&ps_fab8_soc>, <&ps_fab9_soc>;
+		status = "disabled";
+	};
 	ps_ane_cpu: power-controller@3c8 {
 		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x3c8 4>;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "ane-cpu";
+		power-domains = <&ps_ane_sys>;
 		status = "disabled";
 	};
 #if defined(T6050_J775C) || defined(T6050_J775D) || defined(T6050_J873S)
@@ -727,6 +762,15 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "debug-gated";
+		status = "disabled";
+	};
+	ps_nub_gpio: power-controller@88 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x88 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "nub-gpio";
+		apple,always-on;
 		status = "disabled";
 	};
 	ps_atc0_common_dp_0: power-controller@98 {
@@ -1471,7 +1515,7 @@
 		status = "disabled";
 	};
 
-#if !defined(T6050_J714C) && !defined(T6050_J716C)
+#if !defined(T6050_J714C) && !defined(T6050_J714S) && !defined(T6050_J716C)
 	apciec2_dart: iommu@384000000 {
 		compatible = "apple,t6050-dart", "apple,t8110-dart";
 		reg = <0x3 0x84000000 0x0 0x20000>;
@@ -1952,9 +1996,18 @@
 		status = "disabled";
 	};
 
+	/* The always-on GPIO bank (61 pins); its power state is in the always-on PMGR. */
 	nub_gpio0: pinctrl@2881e4000 {
 		compatible = "apple,t6050-pinctrl", "apple,t8103-pinctrl";
 		reg = <0x2 0x881e4000 0x0 0x4000>;
+		power-domains = <&ps_nub_gpio>;
+		gpio-controller;
+		#gpio-cells = <2>;
+		gpio-ranges = <&nub_gpio0 0 0 61>;
+		apple,npins = <61>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 706 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 0 708 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 0 710 IRQ_TYPE_LEVEL_HIGH>,
@@ -1965,12 +2018,20 @@
 		status = "disabled";
 	};
 
-	aop_exclave_mailbox: mailbox@4d067c000 {
-		compatible = "apple,t6050-secure-mailbox", "apple,secure-mailbox";
-		reg = <0x4 0xd067c000 0x0 0x4000>;
-		interrupts = <AIC_IRQ 0 585 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 0 582 IRQ_TYPE_LEVEL_HIGH>;
+	/*
+	 * The AOP setup port, ADT aop-exclave-mailbox. Its ADT reg is not behind the arm-io
+	 * translation: AOP ASC + 0x4007c000, as on T8140 and T8142. ADT interrupts [585, 582].
+	 * dart-aop stream 1: ADT vm-base-1 0x20000000000, vm-size-1 0x2000000000.
+	 */
+	aop_setup_mbox: mailbox@2d067c000 {
+		compatible = "apple,t6050-aop-setup-mailbox", "apple,t8140-aop-setup-mailbox";
+		reg = <0x2 0xd067c000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 582 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 585 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "recv-not-empty";
 		iommus = <&aop_dart 1>;
+		apple,dma-range = <0x200 0x0 0x20 0x0>;
+		#mbox-cells = <0>;
 		status = "disabled";
 	};
 
@@ -3004,20 +3065,26 @@
 		status = "disabled";
 	};
 
+	/*
+	 * The video encoder (ADT ave0): firmware that iBoot preloads, handed over by the boot
+	 * loader. dart-ave0 serves streams 0 and 12 (the temporal filter) on both instances.
+	 */
 	ave0: video-encoder@2283100000 {
-		compatible = "apple,t6050-ave", "apple,ave";
+		compatible = "apple,t6050-ave";
 		reg = <0x22 0x83100000 0x0 0x45c000>,
-		      <0x22 0x83800000 0x0 0x800000>,
 		      <0x22 0x83050000 0x0 0x4000>,
-		      <0x23 0x806001c0 0x0 0x7e64>,
-		      <0x22 0x82000000 0x0 0x8000>;
+		      <0x22 0x83800000 0x0 0x800000>;
+		reg-names = "codec", "mailbox", "coproc";
 		interrupts = <AIC_IRQ 0 2435 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 0 2790 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 0 2789 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 0 2792 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 0 2791 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&ave0_dart 0>, <&ave0_dart1 0>;
-		power-domains = <&ps_venc0_sys>, <&ps_venc0_pipe4>, <&ps_venc0_pipe5>, <&ps_venc0_me0>, <&ps_venc0_me1>, <&ps_venc0_dma>;
+		iommus = <&ave0_dart 0>, <&ave0_dart 12>,
+			 <&ave0_dart1 0>, <&ave0_dart1 12>;
+		power-domains = <&ps_venc0_dma>, <&ps_venc0_pipe4>, <&ps_venc0_pipe5>,
+				<&ps_venc0_me0>, <&ps_venc0_me1>;
+		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
 		clocks = <&peripheral_clocks 503>;
 		status = "disabled";
 	};
@@ -3029,6 +3096,7 @@
 		interrupts = <AIC_IRQ 0 2432 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc0_sys>;
 		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x00004000 0x0 0xffffc000>;
 		status = "disabled";
 	};
 
@@ -3039,23 +3107,25 @@
 		interrupts = <AIC_IRQ 0 2432 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc0_sys>;
 		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x00004000 0x0 0xffffc000>;
 		status = "disabled";
 	};
 
 	ave1: video-encoder@23a3100000 {
-		compatible = "apple,t6050-ave", "apple,ave";
+		compatible = "apple,t6050-ave";
 		reg = <0x23 0xa3100000 0x0 0x45c000>,
-		      <0x23 0xa3800000 0x0 0x800000>,
 		      <0x23 0xa3050000 0x0 0x4000>,
-		      <0x23 0x806001f0 0x0 0x7e5c>,
-		      <0x23 0xa2000000 0x0 0x8000>;
+		      <0x23 0xa3800000 0x0 0x800000>;
+		reg-names = "codec", "mailbox", "coproc";
 		interrupts = <AIC_IRQ 0 2443 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 0 2794 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 0 2793 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 0 2796 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 0 2795 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&ave1_dart 0>, <&ave1_dart1 0>;
-		power-domains = <&ps_venc1_sys>, <&ps_venc1_pipe4>, <&ps_venc1_pipe5>, <&ps_venc1_me0>, <&ps_venc1_me1>, <&ps_venc1_dma>;
+		power-domains = <&ps_venc1_dma>, <&ps_venc1_pipe4>, <&ps_venc1_pipe5>,
+				<&ps_venc1_me0>, <&ps_venc1_me1>;
+		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
 		clocks = <&peripheral_clocks 504>;
 		status = "disabled";
 	};
@@ -3067,6 +3137,7 @@
 		interrupts = <AIC_IRQ 0 2440 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc1_sys>;
 		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x00004000 0x0 0xffffc000>;
 		status = "disabled";
 	};
 
@@ -3077,6 +3148,7 @@
 		interrupts = <AIC_IRQ 0 2440 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_venc1_sys>;
 		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x00004000 0x0 0xffffc000>;
 		status = "disabled";
 	};
 
@@ -3143,32 +3215,48 @@
 		status = "disabled";
 	};
 
+	/*
+	 * ADT ane0 ("ane,t8132exclave", ane-type 0x220): the T8140 (H17) model.
+	 * The engine, the ANE PMGR window and the power gate at ADT reg[2]
+	 * +0x1590; the other ADT windows, a CPU cluster's included, are not the
+	 * ANE's. Inclusive DAPF bounds from dart-ane0 dapf-instance-0, in record
+	 * order. A board adds the preload reservations its boot loader fills.
+	 */
 	ane0: neural-processor@508000000 {
 		compatible = "apple,t6050-ane";
 		reg = <0x5 0x8000000 0x0 0x2000000>,
 		      <0x2 0x80900000 0x0 0x18000>,
-		      <0x2 0x80920000 0x0 0x4000>,
-		      <0x2 0x84240000 0x0 0x40000>,
-		      <0x2 0x12000000 0x0 0xff4000>,
-		      <0x5 0x84000000 0x0 0x2000000>,
-		      <0x2 0x88374000 0x0 0x4000>;
-		reg-names = "engine", "pmgr", "aux-0", "aux-1", "aux-2",
-			    "aux-3", "aux-4";
+		      <0x2 0x80921590 0x0 0x34>;
+		reg-names = "engine", "pmgr", "pwgate";
 		interrupts = <AIC_IRQ 0 954 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 0 967 IRQ_TYPE_LEVEL_HIGH>;
-		/* Stream 0 of each DART, as on T6041: the MPM stream 11 is not the host's. */
 		iommus = <&ane0_dart 0>, <&ane0_dart1 0>, <&ane0_dart2 0>;
-		power-domains = <&ps_ane_cpu>;
+		power-domains = <&ps_ane_sys>;
 		clocks = <&peripheral_clocks 335>, <&peripheral_clocks 334>, <&peripheral_clocks 381>;
+		apple,firmware-preloaded;
+		apple,firmware-iovas = /bits/ 64 <0x10000000000 0x100000c0000>;
+		apple,dapf-ranges = /bits/ 64 <0x2809003a8 0x2809003ab>,
+				    /bits/ 64 <0x2809003c0 0x2809003d3>,
+				    /bits/ 64 <0x581668000 0x581668003>,
+				    /bits/ 64 <0x2302668000 0x2302668003>,
+				    /bits/ 64 <0x6302668000 0x6302668003>;
 		status = "disabled";
 	};
 
+	/*
+	 * The ANE DARTs, in ANE_SYS. SID0 is the host's; the ADT's static bypass
+	 * streams (dart-ane0 bypass-10, bypass-13) stay in bypass.
+	 */
 	ane0_dart: iommu@509800000 {
 		compatible = "apple,t6050-dart", "apple,t8110-dart";
 		reg = <0x5 0x9800000 0x0 0xc000>,
 		      <0x5 0x9810000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 955 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_ane_sys>;
+		/* ADT vm-base 0x100_0000_0000, vm-size 0x300_0000_0000 */
+		apple,dma-range = <0x0 0x0 0x400 0x0>;
+		apple,bypass-sids = <10 13>;
 		status = "disabled";
 	};
 
@@ -3177,6 +3265,9 @@
 		reg = <0x5 0x9820000 0x0 0xc000>;
 		interrupts = <AIC_IRQ 0 955 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_ane_sys>;
+		apple,dma-range = <0x0 0x0 0x400 0x0>;
+		apple,bypass-sids = <10 13>;
 		status = "disabled";
 	};
 
@@ -3185,22 +3276,11 @@
 		reg = <0x5 0x9840000 0x0 0xc000>;
 		interrupts = <AIC_IRQ 0 955 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_ane_sys>;
+		apple,dma-range = <0x0 0x0 0x400 0x0>;
+		apple,bypass-sids = <10 13>;
 		status = "disabled";
 	};
-
-#if defined(T6050_J714C) || defined(T6050_J714S) || defined(T6050_J716C) || defined(T6050_J716S) || defined(T6050_J775C) || defined(T6050_J775D) || defined(T6050_K114C) || defined(T6050_K114S) || defined(T6050_K116C) || defined(T6050_K116S)
-	avd0: video-decoder@2308000000 {
-		compatible = "apple,t6050-avd", "apple,avd";
-		reg = <0x23 0x8000000 0x0 0x1404000>,
-		      <0x23 0x88090000 0x0 0x4000>;
-		interrupts = <AIC_IRQ 0 2417 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 0 2418 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&avd_dart 0>, <&avd_dart 1>, <&avd_dart 2>;
-		power-domains = <&ps_avd_sys>;
-		clocks = <&peripheral_clocks 488>;
-		status = "disabled";
-	};
-#endif
 
 	sgx: gpu@2300000000 {
 		compatible = "apple,agx-t6050";
@@ -3274,10 +3354,19 @@
 #endif
 
 #if defined(T6050_J714C) || defined(T6050_J714S) || defined(T6050_J716C) || defined(T6050_J716S) || defined(T6050_K114C) || defined(T6050_K114S) || defined(T6050_K116C) || defined(T6050_K116S)
-	admac_ec_proxy: dma-controller@4d3200000 {
-		compatible = "apple,t6050-admac-secure", "apple,admac-secure";
-		reg = <0x4 0xd3200000 0x0 0x34000>;
+	/*
+	 * admac-leap-s through its proxy aperture (ADT admac-hp-mic-ec-proxy), for the microphone
+	 * array, as on T8140 and T8142. Its ADT reg is not behind the arm-io translation.
+	 * dart-aop stream 11 with the ADT's vm-base-11/vm-size-11.
+	 */
+	admac_ec_proxy: dma-controller@2d3200000 {
+		compatible = "apple,t6050-admac", "apple,t8140-admac";
+		reg = <0x2 0xd3200000 0x0 0x34000>;
+		dma-channels = <9>;
+		interrupts-extended = <&aic AIC_IRQ 0 638 IRQ_TYPE_LEVEL_HIGH>, <0>, <0>, <0>;
 		#dma-cells = <1>;
+		iommus = <&aop_dart 11>;
+		apple,dma-range = <0x100 0x40000000 0x0 0xffff0000>;
 		status = "disabled";
 	};
 #endif
@@ -3454,19 +3543,6 @@
 		             <AIC_IRQ 0 1762 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&apr1_dart 0>;
 		power-domains = <&ps_prores>;
-		status = "disabled";
-	};
-#endif
-
-#if defined(T6050_J873S)
-	avd0: video-decoder@2308000000 {
-		compatible = "apple,t6050-avd", "apple,avd";
-		reg = <0x23 0x8000000 0x0 0x1404000>,
-		      <0x23 0x88090000 0x0 0x4000>;
-		interrupts = <AIC_IRQ 0 2417 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 0 2418 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_avd_sys>;
-		clocks = <&peripheral_clocks 488>;
 		status = "disabled";
 	};
 #endif

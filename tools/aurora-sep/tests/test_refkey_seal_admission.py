@@ -30,6 +30,10 @@ type KVec<T> = Vec<T>;
 const EIO: u8 = 5;
 const ENODEV: u8 = 19;
 macro_rules! dev_err { ($($arg:tt)*) => {}; }
+macro_rules! dev_info_refusal { ($($arg:tt)*) => {}; }
+macro_rules! dev_err_ratelimited { ($($arg:tt)*) => {}; }
+macro_rules! dev_info_ratelimited { ($($arg:tt)*) => {}; }
+macro_rules! dev_dbg { ($($arg:tt)*) => {}; }
 thread_local! {
     static ENCRYPT_ERROR: Cell<bool> = const { Cell::new(false) };
     static WIPED: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };

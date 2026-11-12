@@ -21,13 +21,14 @@ struct ave_6070_avc_recon_layout {
 };
 
 /*
- * Contiguous 8-bit 4:2:0 AVC reconstruction surface, compressed in
+ * Contiguous 4:2:0 reconstruction surface, compressed in
  * 32-pixel luma and 16-pixel chroma tile rows over the macroblock-aligned
  * picture: the luma and chroma data pair first, then the luma and chroma
- * metadata pair.
+ * metadata pair. AVC and HEVC use the same geometry; ten-bit HEVC scales
+ * only the two data regions.
  */
 static inline struct ave_6070_avc_recon_layout
-ave_6070_avc_recon_layout(u32 width, u32 height)
+ave_6070_recon_layout(u32 width, u32 height, u32 bit_depth)
 {
 	struct ave_6070_avc_recon_layout l = { };
 	u32 coded_w = ALIGN(width, 16), coded_h = ALIGN(height, 16);
@@ -37,8 +38,11 @@ ave_6070_avc_recon_layout(u32 width, u32 height)
 	u32 chroma_rows = DIV_ROUND_UP(coded_h / 2 + 4, 16);
 	u32 data_span;
 
-	l.luma_data = 1024 * luma_cols * luma_rows;
-	l.chroma_data = ALIGN(512 * chroma_cols * chroma_rows, 128);
+	if (bit_depth != 10)
+		bit_depth = 8;
+	l.luma_data = 1024 * luma_cols * luma_rows * bit_depth / 8;
+	l.chroma_data = ALIGN(512 * chroma_cols * chroma_rows * bit_depth / 8,
+			      128);
 	l.luma_metadata = ALIGN(32 * roundup_pow_of_two(luma_cols) *
 				roundup_pow_of_two(luma_rows), 128);
 	l.chroma_metadata = ALIGN(8 * roundup_pow_of_two(chroma_cols) *
@@ -51,6 +55,17 @@ ave_6070_avc_recon_layout(u32 width, u32 height)
 	l.chroma_metadata_offset = data_span + l.luma_metadata;
 	l.bytes = data_span + ALIGN(l.luma_metadata + l.chroma_metadata, 128);
 	return l;
+}
+
+static inline struct ave_6070_avc_recon_layout
+ave_6070_avc_recon_layout(u32 width, u32 height)
+{
+	return ave_6070_recon_layout(width, height, 8);
+}
+
+static inline u32 ave_6070_transcoded_size(u32 coded_bytes)
+{
+	return ALIGN(DIV_ROUND_UP(coded_bytes, 2), 4096);
 }
 
 /* Start +0x7d0 LFSRef: exact descriptor bytes, before DMA page rounding. */

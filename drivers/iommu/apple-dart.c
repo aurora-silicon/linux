@@ -42,6 +42,7 @@
 #include <linux/pci.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/pm_wakeup.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/tunable.h>
 #include <linux/string.h>
@@ -354,6 +355,9 @@ struct apple_dart {
 	u32 pgsize;
 	u32 num_streams;
 	u32 supports_bypass : 1;
+	/* J613 MTP keeps issuing DMA in the boot loader identity domain. */
+	bool live_mtp;
+	bool live_mtp_sleep;
 	u32 four_level : 1;
 	u32 locked : 1;
 	u32 tunneled : 1;
@@ -3088,6 +3092,10 @@ static int apple_dart_attach_dev_paging(struct iommu_domain *domain,
 	bool streams_added = false;
 
 	for_each_stream_map(i, cfg, stream_map)
+		if (stream_map->dart->live_mtp)
+			return -EBUSY;
+
+	for_each_stream_map(i, cfg, stream_map)
 		WARN_ON(pm_runtime_get_sync(stream_map->dart->dev) < 0);
 
 	ret = apple_dart_finalize_domain(dart_domain, cfg);
@@ -3179,6 +3187,10 @@ static int apple_dart_attach_dev_blocked(struct iommu_domain *domain,
 	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
 	struct apple_dart_stream_map *stream_map;
 	int i;
+
+	for_each_stream_map(i, cfg, stream_map)
+		if (stream_map->dart->live_mtp)
+			return -EBUSY;
 
 	if (cfg->locked)
 		return -EINVAL;
@@ -3918,7 +3930,8 @@ static int apple_dart_def_domain_type(struct device *dev)
 	if (cfg->stream_maps[0].dart->managed_sids ||
 	    apple_dart_has_borrowed(cfg->stream_maps[0].dart))
 		return IOMMU_DOMAIN_DMA;
-	if (cfg->stream_maps[0].dart->retained_mtp)
+	if (cfg->stream_maps[0].dart->retained_mtp ||
+	    cfg->stream_maps[0].dart->live_mtp)
 		return IOMMU_DOMAIN_IDENTITY;
 	if (cfg->stream_maps[0].dart->pgsize > PAGE_SIZE)
 		return IOMMU_DOMAIN_IDENTITY;
@@ -4634,6 +4647,43 @@ static int apple_dart_parse_own_setup(struct apple_dart *dart, struct resource *
 	return 0;
 }
 
+struct apple_dart_available {
+	struct list_head list;
+	struct device_node *np;
+};
+
+static DEFINE_MUTEX(apple_dart_available_lock);
+static LIST_HEAD(apple_dart_available_list);
+
+void apple_dart_make_available(struct device_node *np)
+{
+	struct apple_dart_available *a;
+
+	guard(mutex)(&apple_dart_available_lock);
+	list_for_each_entry(a, &apple_dart_available_list, list)
+		if (a->np == np)
+			return;
+	a = kzalloc_obj(*a);
+	if (!a)
+		return;
+	a->np = of_node_get(np);
+	list_add(&a->list, &apple_dart_available_list);
+}
+EXPORT_SYMBOL_GPL(apple_dart_make_available);
+
+static bool apple_dart_is_available(struct device_node *np)
+{
+	struct apple_dart_available *a;
+
+	if (!of_property_read_bool(np, "apple,manual-availability"))
+		return true;
+	guard(mutex)(&apple_dart_available_lock);
+	list_for_each_entry(a, &apple_dart_available_list, list)
+		if (a->np == np)
+			return true;
+	return false;
+}
+
 static int apple_dart_probe(struct platform_device *pdev)
 {
 	int ret, sid;
@@ -4736,6 +4786,10 @@ static int apple_dart_probe(struct platform_device *pdev)
 			return -ENODEV;
 		}
 	}
+
+	/* Its registers answer only once its client is up */
+	if (!apple_dart_is_available(dev->of_node))
+		return dev_err_probe(dev, -EPROBE_DEFER, "waiting for its client\n");
 
 	dart = kzalloc(sizeof(*dart), GFP_KERNEL);
 	if (!dart)
@@ -5054,6 +5108,29 @@ params_done:
 		goto err_clk_disable;
 	}
 
+	/* A live MTP epoch must never lose its firmware DMA addresses. */
+	if (of_property_present(dev->of_node, "apple,bypass-handoff-streams")) {
+		u32 stream;
+
+		/* A zero stream value advertises no live handoff (e.g. J700). */
+		if (of_property_count_u32_elems(dev->of_node,
+					    "apple,bypass-handoff-streams") != 1 ||
+		    of_property_read_u32(dev->of_node, "apple,bypass-handoff-streams",
+					 &stream)) {
+			ret = -EINVAL;
+			goto err_clk_disable;
+		}
+		if (stream && (!of_machine_is_compatible("apple,j613") ||
+		    !of_device_is_compatible(dev->of_node, "apple,t8122-dart") ||
+		    res->start != 0x2fa808000ULL || !dart->supports_bypass ||
+		    stream != 1 || stream >= dart->num_streams ||
+		    apple_dart_readl(dart, DART_TCR(dart, stream)) != dart->hw->tcr_bypass)) {
+			ret = -EINVAL;
+			goto err_clk_disable;
+		}
+		dart->live_mtp = stream != 0;
+	}
+
 	ret = apple_dart_read_remaps(dart);
 	if (ret)
 		goto err_clk_disable;
@@ -5192,7 +5269,7 @@ params_done:
 		}
 		/* ENABLE is write-one-to-set; no foreign stream changes state. */
 		apple_dart_writel(dart, dart->managed_sids, dart->hw->enable_streams);
-	} else if (!dart->locked && !dart->retained_mtp && !dart->preserve_display) {
+	} else if (!dart->locked && !dart->retained_mtp && !dart->live_mtp && !dart->preserve_display) {
 		ret = apple_dart_hw_reset(dart);
 		if (ret)
 			goto err_clk_disable;
@@ -5428,7 +5505,7 @@ static void apple_dart_remove(struct platform_device *pdev)
 	 * A command issued then never completes. The next probe resets the
 	 * block after that clock is running again.
 	 */
-	if (!dart->locked && !dart->retained_mtp &&
+	if (!dart->locked && !dart->retained_mtp && !dart->live_mtp &&
 	    !READ_ONCE(dart->commands_gated))
 		apple_dart_hw_reset(dart);
 
@@ -5438,7 +5515,8 @@ static void apple_dart_remove(struct platform_device *pdev)
 	iommu_device_unregister(&dart->iommu);
 	iommu_device_sysfs_remove(&dart->iommu);
 
-	clk_bulk_disable_unprepare(dart->num_clks, dart->clks);
+	if (!dart->live_mtp)
+		clk_bulk_disable_unprepare(dart->num_clks, dart->clks);
 }
 
 static void apple_dart_shutdown(struct platform_device *pdev)
@@ -5582,6 +5660,10 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
 
+	/* Runtime PM may not stop the live MTP; system sleep uses its own callbacks. */
+	if (dart->live_mtp)
+		return -EBUSY;
+
 	dart->tunnel_state_restored = false;
 	if (READ_ONCE(dart->commands_gated))
 		return 0;
@@ -5718,7 +5800,7 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	int ret;
 
 	/* No reset or restore: see apple_dart_suspend(). */
-	if (dart->cold_ane)
+	if (dart->cold_ane || dart->live_mtp)
 		return 0;
 	/* Powered down by its DCP, which restores it at power-up. */
 	if (READ_ONCE(dart->host_off))
@@ -5800,7 +5882,45 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	return ret;
 }
 
-static DEFINE_RUNTIME_DEV_PM_OPS(apple_dart_pm_ops, apple_dart_suspend, apple_dart_resume, NULL);
+/* The adopted MTP stays live: system s2idle must retain, never reset it. */
+static int apple_dart_system_suspend(struct device *dev)
+{
+	struct apple_dart *dart = dev_get_drvdata(dev);
+
+	if (!dart->live_mtp)
+		return pm_runtime_force_suspend(dev);
+	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
+		return -EBUSY;
+	if (apple_dart_readl(dart, DART_TCR(dart, 1)) != dart->hw->tcr_bypass)
+		return -EIO;
+	/* PMGR's ACTIVE_WAKEUP domains and their ancestors must stay powered. */
+	device_set_awake_path(dev);
+	dart->live_mtp_sleep = true;
+	dev_dbg(dev, "live MTP s2idle: retaining clocks, supplier power and bypass stream 1\n");
+	return 0;
+}
+
+static int apple_dart_system_resume(struct device *dev)
+{
+	struct apple_dart *dart = dev_get_drvdata(dev);
+
+	if (!dart->live_mtp)
+		return pm_runtime_force_resume(dev);
+	if (!dart->live_mtp_sleep)
+		return 0;
+	dart->live_mtp_sleep = false;
+	if (apple_dart_readl(dart, DART_TCR(dart, 1)) != dart->hw->tcr_bypass) {
+		dev_err(dev, "live MTP bypass lost across s2idle; refusing reset of inherited DMA\n");
+		return -EIO;
+	}
+	dev_dbg(dev, "live MTP s2idle: bypass retained; no reset or invalidate\n");
+	return 0;
+}
+
+static const struct dev_pm_ops apple_dart_pm_ops = {
+	RUNTIME_PM_OPS(apple_dart_suspend, apple_dart_resume, NULL)
+	SYSTEM_SLEEP_PM_OPS(apple_dart_system_suspend, apple_dart_system_resume)
+};
 
 static const struct of_device_id apple_dart_of_match[] = {
 	{ .compatible = "apple,t8103-dart", .data = &apple_dart_hw_t8103 },

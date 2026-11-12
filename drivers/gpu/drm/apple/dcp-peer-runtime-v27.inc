@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0-only OR MIT */
-/* Kept opt-in while paired DRM lifecycle is being validated on T6050. */
-static bool peer_scanout;
+/* Paired DRM scanout of a mode one firmware-27 pipe cannot drive alone. */
+static bool peer_scanout = true;
 module_param(peer_scanout, bool, 0444);
-MODULE_PARM_DESC(peer_scanout, "Enable firmware27 paired DRM scanout bring-up");
+MODULE_PARM_DESC(peer_scanout, "Firmware27 paired DRM scanout (default: on)");
 
 static bool dcp_peer_transport_idle(struct apple_dcp *dcp)
 {

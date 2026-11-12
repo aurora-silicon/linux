@@ -526,8 +526,36 @@ struct Host<'a> {
     registration_powered: bool,
     /// An M5 pair's installation, submitted with its first outer publication.
     m5_registration: Option<crate::g17::fw::m5::queue::HardwareSubmission>,
+    /// M5: the shared ring's room check of this publication, by priority. Its consumers stay
+    /// conservative for the whole hold (the firmware only advances them); its producer
+    /// serves the first pair written to the ring only.
+    outer_cursors: Option<(u8, [u32; 3])>,
+    outer_producer_used: bool,
 }
 impl Host<'_> {
+    /// The room check's cursors for the first pair this publication writes to the ring.
+    fn room_cursors(&mut self, priority: u8) -> Option<[u32; 3]> {
+        if core::mem::replace(&mut self.outer_producer_used, true) {
+            return None;
+        }
+        self.outer_cursors
+            .filter(|&(checked, _)| checked == priority)
+            .map(|(_, cursors)| cursors)
+    }
+
+    /// The room check's consumers with the producer read now: a retained pair revalidates the
+    /// producer it was prepared against.
+    fn retained_cursors(&mut self, priority: u8) -> Result<Option<[u32; 3]>> {
+        self.outer_producer_used = true;
+        let Some((checked, [consumer, consumer_b, _])) = self.outer_cursors else {
+            return Ok(None);
+        };
+        if checked != priority {
+            return Ok(None);
+        }
+        Ok(Some([consumer, consumer_b, self.firmware.init.work_producer(priority)?]))
+    }
+
     fn release_registration(&mut self) {
         if !self.registration_powered && !self.firmware.registration_power_release_pending {
             return;
@@ -634,6 +662,7 @@ impl crate::g17::queue::render::Host for Host<'_> {
                     tiling.qid,
                 )?,
             };
+            let cursors = self.room_cursors(priority);
             return self.firmware.submit_m5_render_pair(
                 priority,
                 &[copy_slot(fragment), copy_slot(tiling)],
@@ -641,6 +670,7 @@ impl crate::g17::queue::render::Host for Host<'_> {
                 commit,
                 late_tiling,
                 true,
+                cursors,
             );
         }
         self.firmware
@@ -654,7 +684,8 @@ impl crate::g17::queue::render::Host for Host<'_> {
         tiling: &crate::g17::fw::channels::WorkSlot,
         prepare: impl FnOnce(),
     ) -> Result {
-        let pair = self.firmware.init.m5_work_pair(priority, fragment, tiling)?;
+        let cursors = self.room_cursors(priority);
+        let pair = self.firmware.init.m5_work_pair(priority, fragment, tiling, cursors)?;
         pair.prepare();
         prepare();
         pair.publish();
@@ -677,10 +708,11 @@ impl crate::g17::queue::render::Host for Host<'_> {
         tiling: &crate::g17::fw::channels::WorkSlot,
         next: [u32; 2],
     ) -> Result {
-        let result = self
-            .firmware
-            .init
-            .publish_retained_work_pair(priority, fragment, tiling, next);
+        let result = self.retained_cursors(priority).and_then(|cursors| {
+            self.firmware
+                .init
+                .publish_retained_work_pair(priority, fragment, tiling, next, cursors)
+        });
         if result.is_err() {
             self.firmware.primary.state.shared.lose_device_quietly();
         }
@@ -692,11 +724,10 @@ impl crate::g17::queue::render::Host for Host<'_> {
         self.release_registration();
         let m5 = self.firmware.init.is_m5();
         if m5 {
-            // A paired publication is one tiling and one fragment submission.
-            for _ in 0..2 {
-                if let Err(error) = self.firmware.init.note_m5_submission_history() {
-                    pr_warn!("asahi: M5 submission history skipped: {:?}\n", error);
-                }
+            // A paired publication is one tiling and one fragment submission, counted in
+            // one slot.
+            if let Err(error) = self.firmware.init.note_m5_submission_history(2) {
+                pr_warn!("asahi: M5 submission history skipped: {:?}\n", error);
             }
         } else {
             crate::g17::trace::doorbell(crate::g17::trace::RENDER, || {
@@ -706,7 +737,7 @@ impl crate::g17::queue::render::Host for Host<'_> {
         let result = self.firmware.primary.notify(
             (0x83 << crate::g17::MSG_TYPE_SHIFT)
                 | u64::from(priority) << 2
-                | if m5 { 2 } else { 0 },
+                | if m5 && !crate::g17::J813_FORMS.load(core::sync::atomic::Ordering::Relaxed) { 2 } else { 0 },
         );
         if result.is_err() {
             self.firmware.primary.state.shared.lose_device_quietly();
@@ -763,6 +794,17 @@ impl crate::g17::Firmware {
         slot: usize,
         operation: impl FnOnce(&mut Pair, &mut Host<'_>) -> Result<R>,
     ) -> Result<R> {
+        self.with_render_at(slot, None, operation)
+    }
+
+    /// [`Self::with_render`] for a publication whose shared-ring room check, made in this
+    /// hold, sampled `outer_cursors`.
+    fn with_render_at<R>(
+        &mut self,
+        slot: usize,
+        outer_cursors: Option<(u8, [u32; 3])>,
+        operation: impl FnOnce(&mut Pair, &mut Host<'_>) -> Result<R>,
+    ) -> Result<R> {
         let mut pair = self
             .queues
             .render
@@ -775,6 +817,8 @@ impl crate::g17::Firmware {
             firmware: self,
             registration_powered: false,
             m5_registration: None,
+            outer_cursors,
+            outer_producer_used: false,
         };
         let result = operation(&mut pair, &mut host);
         host.release_registration();

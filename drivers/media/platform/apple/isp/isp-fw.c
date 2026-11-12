@@ -234,16 +234,24 @@ static irqreturn_t apple_isp_isr(int irq, void *dev)
 static irqreturn_t apple_isp_isr_thread(int irq, void *dev)
 {
 	struct apple_isp *isp = dev;
+	bool more;
 
-	wake_up_all(&isp->wait);
+	do {
+		wake_up_all(&isp->wait);
 
-	ipc_chan_handle(isp, isp->chan_sm);
-	wake_up_all(&isp->wait); /* Some commands depend on sm */
+		more = ipc_chan_handle(isp, isp->chan_sm) == -EAGAIN;
+		wake_up_all(&isp->wait); /* Some commands depend on sm */
 
-	ipc_chan_handle(isp, isp->chan_tm);
+		more |= ipc_chan_handle(isp, isp->chan_tm) == -EAGAIN;
+		more |= ipc_chan_handle(isp, isp->chan_bt) == -EAGAIN;
+		wake_up_all(&isp->wait);
 
-	ipc_chan_handle(isp, isp->chan_bt);
-	wake_up_all(&isp->wait);
+		/* Fair turns across channels, without depending on another IRQ. */
+		cond_resched();
+	} while (more && !READ_ONCE(isp->ipc_error) &&
+		 !READ_ONCE(isp->ipc_quiescing));
+
+	apple_isp_video_error(isp);
 
 	return IRQ_HANDLED;
 }
@@ -400,7 +408,8 @@ static int isp_reset_coproc(struct apple_isp *isp)
 
 /*
  * With hw->fw_restore, put the firmware memory back as the boot loader left
- * it: the data segment from its copy, and the main memory above it cleared.
+ * it: the data segment, and a heap the boot loader provides, from their
+ * copies, and the host-backed main memory above the data cleared.
  */
 static void isp_restore_fw_memory(struct apple_isp *isp)
 {
@@ -410,6 +419,8 @@ static void isp_restore_fw_memory(struct apple_isp *isp)
 		return;
 
 	memcpy(isp->fw_data, isp->fw_data_copy, isp->fw_data_size);
+	if (isp->fw_heap)
+		memcpy(isp->fw_heap, isp->fw_heap_copy, isp->fw_heap_size);
 	if (tail)
 		for (u32 i = 0; i < tail->num_pages; i++)
 			clear_highpage(tail->pages[i]);
@@ -891,6 +902,9 @@ static int isp_stop_command_processor(struct apple_isp *isp)
 {
 	int res, ret;
 
+	if (READ_ONCE(isp->ipc_error))
+		return READ_ONCE(isp->ipc_error);
+
 	isp_gpio_write32(isp, ISP_GPIO_0, 0xf7fbdff9);
 
 	/*
@@ -1038,6 +1052,7 @@ static int isp_firmware_boot(struct apple_isp *isp)
 		/* Stage 1 stops the coprocessor and powers it down itself. */
 		isp_err(isp, "failed firmware boot stage 1: %d\n", err);
 		isp_collect_gc_surface(isp);
+		cmpxchg(&isp->ipc_error, 0, err);
 		/* The firmware may have run: leave its memory as loaded. */
 		isp_restore_fw_memory(isp);
 		return err;
@@ -1056,6 +1071,10 @@ static int isp_firmware_boot(struct apple_isp *isp)
 		goto stop;
 	}
 
+	/* The old coprocessor stopped and all channel slots were initialized. */
+	WRITE_ONCE(isp->ipc_error, 0);
+	WRITE_ONCE(isp->ipc_quiescing, false);
+
 	err = isp_enable_irq(isp);
 	if (err < 0) {
 		isp_err(isp, "failed to enable interrupts: %d\n", err);
@@ -1073,8 +1092,10 @@ static int isp_firmware_boot(struct apple_isp *isp)
 	return 0;
 
 disable_irqs:
+	cmpxchg(&isp->ipc_error, 0, err);
 	isp_disable_irq(isp);
 stop:
+	cmpxchg(&isp->ipc_error, 0, err);
 	isp_firmware_stop(isp);
 	return err;
 }
@@ -1089,6 +1110,8 @@ static void isp_firmware_shutdown(struct apple_isp *isp)
 	 */
 	if (isp_stop_command_processor(isp))
 		dev_warn(isp->dev, "firmware did not suspend, stopping it\n");
+	/* Also stop a receive thread whose producer never leaves a gap. */
+	cmpxchg(&isp->ipc_error, 0, -ESHUTDOWN);
 	isp_disable_irq(isp);
 	isp_firmware_stop(isp);
 }
@@ -1111,7 +1134,11 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
 	case ISP_FW_OFF:
 		break;
 	case ISP_FW_RUNNING:
-		/* Resident firmware keeps running between streams. */
+		/* Resident or idling firmware keeps running between streams. */
+		err = READ_ONCE(isp->ipc_error);
+		if (err)
+			return err;
+		isp->fw_idle = false;
 		return 0;
 	case ISP_FW_DEAD:
 		dev_err_ratelimited(isp->dev,
@@ -1147,20 +1174,69 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
 /* The end of a stream or of the camera detection */
 void apple_isp_firmware_shutdown(struct apple_isp *isp)
 {
-	if (!isp->hw->resident_fw) {
+	if ((!isp->hw->resident_fw && !isp->hw->fw_idle_ms) ||
+	    READ_ONCE(isp->ipc_error)) {
 		apple_isp_firmware_halt(isp);
 		return;
 	}
 
 	/*
-	 * Resident firmware keeps running, so the surfaces it allocated for
-	 * the stream and freed again are not collected by a firmware stop.
-	 * The stream has stopped, so free them now: wait for the interrupt
-	 * thread to finish the free requests the firmware has already sent.
+	 * Resident or idling firmware keeps running, so the surfaces it
+	 * allocated for the stream and freed again are not collected by a
+	 * firmware stop. The stream has stopped, so free them now: wait for
+	 * the interrupt thread to finish the free requests the firmware has
+	 * already sent.
 	 */
-	if (isp->fw_state == ISP_FW_RUNNING)
-		synchronize_irq(isp->irq);
+	if (isp->fw_state != ISP_FW_RUNNING)
+		return;
+
+	/* Finish a fair receive round even if the producer keeps refilling. */
+	WRITE_ONCE(isp->ipc_quiescing, true);
+	disable_irq(isp->irq);
+	/* No receive handler can race this lifetime decision while disabled. */
+	if (READ_ONCE(isp->ipc_error)) {
+		apple_isp_firmware_halt(isp);
+		return;
+	}
 	isp_free_released_surfaces(isp);
+	WRITE_ONCE(isp->ipc_quiescing, false);
+	enable_irq(isp->irq);
+
+	/* Not on isp->wq: the stop flushes that. */
+	if (isp->hw->fw_idle_ms && isp->fw_state == ISP_FW_RUNNING) {
+		isp->fw_idle = true;
+		mod_delayed_work(system_unbound_wq, &isp->fw_idle_work,
+				 msecs_to_jiffies(isp->hw->fw_idle_ms));
+	}
+}
+
+static void apple_isp_fw_idle_work(struct work_struct *work)
+{
+	struct apple_isp *isp = container_of(to_delayed_work(work),
+					     struct apple_isp, fw_idle_work);
+
+	mutex_lock(&isp->video_lock);
+	if (isp->fw_idle)
+		apple_isp_firmware_halt(isp);
+	mutex_unlock(&isp->video_lock);
+}
+
+void apple_isp_firmware_init(struct apple_isp *isp)
+{
+	INIT_DELAYED_WORK(&isp->fw_idle_work, apple_isp_fw_idle_work);
+}
+
+/* Stop idling firmware now, and wait for a stop that was due. */
+void apple_isp_firmware_flush(struct apple_isp *isp)
+{
+	if (!isp->hw->fw_idle_ms)
+		return;
+
+	cancel_delayed_work_sync(&isp->fw_idle_work);
+	mutex_lock(&isp->video_lock);
+	if (isp->fw_idle)
+		apple_isp_firmware_halt(isp);
+	mutex_unlock(&isp->video_lock);
 }
 
 /* Stop the firmware; resident firmware cannot be started again. */
@@ -1175,5 +1251,6 @@ void apple_isp_firmware_halt(struct apple_isp *isp)
 	isp_firmware_shutdown(isp);
 	pm_runtime_put_sync(isp->dev);
 	isp->ipc_stale = NULL;
+	isp->fw_idle = false;
 	isp->fw_state = isp->hw->resident_fw ? ISP_FW_DEAD : ISP_FW_OFF;
 }

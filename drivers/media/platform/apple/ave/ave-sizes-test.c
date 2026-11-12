@@ -68,6 +68,11 @@ static void ave_6070_working_sizes_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, recon.chroma_data, 0x3fc000U);
 	KUNIT_EXPECT_EQ(test, recon.luma_metadata, 0x80000U);
 	KUNIT_EXPECT_EQ(test, recon.bytes, 0xc94000U);
+	recon = ave_6070_recon_layout(1920, 1080, 10);
+	KUNIT_EXPECT_EQ(test, recon.luma_data, 0x290400U);
+	KUNIT_EXPECT_EQ(test, recon.chroma_data, 0x148200U);
+	KUNIT_EXPECT_EQ(test, recon.bytes, 0x400600U);
+	KUNIT_EXPECT_EQ(test, ave_6070_transcoded_size(0x5f4000), 0x2fa000U);
 	KUNIT_EXPECT_EQ(test, ave_6070_colocated_size(1920, 1080, false), 0xff000U);
 	KUNIT_EXPECT_EQ(test, ave_6070_colocated_size(1920, 1080, true), 0x1fe00U);
 	KUNIT_EXPECT_EQ(test, ave_6070_lowres_result_size(1920, 1080), 0x20200U);

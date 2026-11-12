@@ -4143,6 +4143,10 @@ static const struct ane_t602x_soc ane_h17_soc = {
 	.platform = &ane_h17_platform,
 };
 
+static const struct ane_t602x_soc ane_t6050_soc = {
+	.platform = &ane_t6050_platform,
+};
+
 static const struct of_device_id ane_rtclient_of_match[] = {
 	{ .compatible = "apple,t6020-ane", .data = &ane_t6020_soc },
 	{ .compatible = "apple,t6021-ane", .data = &ane_t6021_soc },
@@ -4150,6 +4154,7 @@ static const struct of_device_id ane_rtclient_of_match[] = {
 	{ .compatible = "apple,t8112-ane", .data = &ane_t8112_soc },
 	{ .compatible = "apple,t6041-ane", .data = &ane_h16_soc },
 	{ .compatible = "apple,t8140-ane", .data = &ane_h17_soc },
+	{ .compatible = "apple,t6050-ane", .data = &ane_t6050_soc },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, ane_rtclient_of_match);
@@ -4262,7 +4267,7 @@ static int __init ane_rtclient_init(void)
 			pr_info("ane: H16 ANE: firmware transport unvalidated; keeping disabled\n");
 			return -EOPNOTSUPP;
 		}
-		if (soc->platform->soc == 0x8140) {
+		if (ane_fw_platform_staged(soc->platform)) {
 			ret = ane_fw_staged_init(pdev, soc->platform);
 			/* No loader hand-off: the probe below refuses quietly. */
 			if (ret == -ENODEV)

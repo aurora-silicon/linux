@@ -9,9 +9,11 @@
  *
  * Copyright The Aurora Silicon Contributors
  */
+#include <linux/crc32.h>
 #include <linux/device.h>
 #include <linux/jiffies.h>
 #include <linux/dma-mapping.h>
+#include <linux/iommu.h>
 #include <linux/log2.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
@@ -24,10 +26,7 @@
 
 #include "ave.h"
 #include "ave-regs.h"
-
-#define AVE_RC_VBR 4
-#define AVE_RC_CBR 2
-#define AVE_RC_CQ 3
+#include "ave-mctf.h"
 
 /* Filler-data NAL unit types */
 #define AVE_H264_NAL_FILLER 12
@@ -179,8 +178,9 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	if (ctx->ave->layout->kind == AVE_LAYOUT_6070 && p->sample_bytes != 1)
 		return -EOPNOTSUPP;
 	/*
-	 * The 6070 path is qualified for 8-bit H.264 with frame widths in whole
-	 * macroblocks; HEVC and wider-than-coded widths are not yet.
+	 * The 6070 path is qualified for 8-bit H.264 (low delay and one B per
+	 * P) with frame widths in whole macroblocks; HEVC and wider-than-coded
+	 * widths are not yet.
 	 */
 	if (ctx->ave->layout->kind == AVE_LAYOUT_6070 &&
 	    (p->codec != AVE_CODEC_H264 || p->width % 16))
@@ -201,9 +201,6 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	 */
 	p->intra_only = p->codec == AVE_CODEC_H264 && ctx->gop_size == 1;
 	p->bframes = !baseline && !p->intra_only && ctx->b_frames;
-	/* 6070: low-delay only for now (I and P pictures, two references). */
-	if (ctx->ave->layout->kind == AVE_LAYOUT_6070)
-		p->bframes = false;
 	p->reorder_off = !ctx->b_frames;
 	p->refs = p->intra_only ? 1 : p->bframes ? 5 : 2;
 	p->slots = p->bframes ? 5 : 3;
@@ -266,6 +263,12 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	    (p->fps_num != 30ULL * p->fps_den ||
 	     (!p->bframes && (p->codec == AVE_CODEC_HEVC || (!baseline && !p->intra_only)))))
 		return -EOPNOTSUPP;
+	/*
+	 * Where the 26A428 firmware leaves an HEVC slice header is not known: its
+	 * slots have no slice-header buffer, so refuse HEVC there.
+	 */
+	if (ctx->ave->layout->counted && p->codec == AVE_CODEC_HEVC)
+		return -EOPNOTSUPP;
 	return 0;
 }
 
@@ -288,7 +291,7 @@ struct ave_buf_req {
 
 #define AVE_MAX_BUF_REQS \
 	(3 + 6 * AVE_MAX_REFS + 3 + 4 * AVE_NEIGHBOUR_SETS + \
-	 2 * AVE_ENTROPY_SETS * AVE_TILE_BUFS + 2 + 4 * AVE_MAX_SLOTS)
+	 2 * AVE_ENTROPY_SETS * AVE_TILE_BUFS + 4 + 4 * AVE_MAX_SLOTS)
 
 static int ave_buf_req_cmp(const void *a, const void *b)
 {
@@ -351,8 +354,8 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 		}
 	}
 
-	if (fw6070 && !hevc && p->bit_depth == 8) {
-		ref_a = ave_6070_avc_recon_layout(w, h).bytes;
+	if (fw6070) {
+		ref_a = ave_6070_recon_layout(w, h, p->bit_depth).bytes;
 	} else {
 		ref_a = ALIGN(w, 32) * ALIGN(h + 16, 32);
 		if (p->bit_depth == 10)
@@ -387,7 +390,7 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 	}
 	for (unsigned int i = 0; i < p->refs; i++) {
 		ave_req(r, &n, &sess->ref_a[i], ref_a,
-			fw6070 && !hevc && p->bit_depth == 8 ? 0 : ref_a * 3 / 2,
+			fw6070 ? 0 : ref_a * 3 / 2,
 			nomap);
 		ave_req(r, &n, &sess->ref_b[i], ref_b, ref_b * 5 / 4, nomap);
 		ave_req(r, &n, &sess->ref_c[i], ref_c, 0, nomap);
@@ -432,6 +435,10 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 				fw6070 ? ave_6070_mb_input_size(w, h) :
 					 ALIGN(w * h32, SZ_16K),
 				0, nomap);
+	if (fw6070 && hevc)
+		for (unsigned int i = 0; i < 2; i++)
+			ave_req(r, &n, &sess->hevc_transcoded[i],
+				ave_6070_transcoded_size(p->coded_cap), 0, nomap);
 	for (unsigned int s = 0; s < p->slots; s++) {
 		ave_req(r, &n, &sess->slot[s].coded, p->coded_cap, 0, 0);
 		ave_req(r, &n, &sess->slot[s].meta, fw->meta_bytes, 0, 0);
@@ -467,8 +474,219 @@ static int ave_sess_alloc(struct ave_dev *ave, struct ave_session *sess)
 	return 0;
 }
 
+/* CRC of every pool buffer, as the CPU sees it */
+static u32 ave_mctf_pool_crc(struct ave_dev *ave)
+{
+	const struct ave_buf *sets[] = { ave->mctf_pool, ave->mctf_pool_in, ave->mctf_pool_out };
+	const unsigned int counts[] = { AVE_MCTF_BUFS, AVE_MCTF_IN_BUFS, AVE_MCTF_OUT_BUFS };
+	u32 crc = ~0U;
+
+	for (unsigned int s = 0; s < ARRAY_SIZE(sets); s++)
+		for (unsigned int i = 0; i < counts[s]; i++)
+			if (sets[s][i].cpu)
+				crc = crc32_le(crc, sets[s][i].cpu, sets[s][i].alloc);
+	return crc;
+}
+
+/*
+ * Return the pool if @sess holds it; its memory stays allocated and mapped.
+ * Its CRC is kept: nothing may write the pool until the next borrow, so a
+ * change by then is a device write after teardown.
+ */
+/*
+ * Compare the pool with the CRC kept when its session stopped; a change
+ * there is a device write after teardown. Then keep a fresh CRC.
+ */
+static void ave_mctf_pool_check(struct ave_dev *ave, const char *when)
+{
+	u32 crc;
+
+	if (!test_bit(AVE_MCTF_POOL_READY, &ave->mctf_pool_flags))
+		return;
+	crc = ave_mctf_pool_crc(ave);
+	if (ave->mctf_pool_crc_valid && crc != ave->mctf_pool_crc) {
+		ave->mctf_pool_changed++;
+		dev_err(ave->dev,
+			"MCTF memory changed after its session ended, seen %s (CRC %08x, was %08x): the device wrote it after teardown\n",
+			when, crc, ave->mctf_pool_crc);
+	} else if (ave->mctf_pool_crc_valid) {
+		dev_dbg(ave->dev, "MCTF memory unchanged %s (CRC %08x)\n", when, crc);
+	}
+	ave->mctf_pool_crc = crc;
+	ave->mctf_pool_crc_valid = true;
+}
+
+static void ave_mctf_pool_return(struct ave_dev *ave, struct ave_session *sess)
+{
+	if (!sess->mctf_borrowed)
+		return;
+	ave_mctf_pool_check(ave, "at reap");
+	memset(sess->mctf_buf, 0, sizeof(sess->mctf_buf));
+	memset(sess->mctf_in, 0, sizeof(sess->mctf_in));
+	memset(sess->mctf_out, 0, sizeof(sess->mctf_out));
+	sess->mctf_borrowed = false;
+	clear_bit(AVE_MCTF_POOL_LENT, &ave->mctf_pool_flags);
+}
+
+/*
+ * Only for a driver whose firmware never ran: nothing else may unmap MCTF
+ * memory (ave_remove() keeps all firmware-visible memory otherwise).
+ */
+void ave_mctf_pool_free(struct ave_dev *ave)
+{
+	for (unsigned int i = 0; i < AVE_MCTF_BUFS; i++)
+		ave_free(ave, &ave->mctf_pool[i]);
+	for (unsigned int i = 0; i < AVE_MCTF_IN_BUFS; i++)
+		ave_free(ave, &ave->mctf_pool_in[i]);
+	for (unsigned int i = 0; i < AVE_MCTF_OUT_BUFS; i++)
+		ave_free(ave, &ave->mctf_pool_out[i]);
+	ave->mctf_pool_flags = 0;
+}
+
+/*
+ * Allocate what is missing of the MCTF pool: the firmware-owned surfaces
+ * of the layout largest first, like the encoder's buffers, then the picture
+ * surfaces. Kernel-mapped, so a later session can zero them.
+ */
+static int ave_mctf_pool_fill(struct ave_dev *ave, const struct ave_mctf_layout *l)
+{
+	struct ave_buf_req *r;
+	unsigned int n = 0;
+	size_t mapped = 0;
+	int ret = 0;
+
+	r = kcalloc(l->n_surfaces, sizeof(*r), GFP_KERNEL);
+	if (!r)
+		return -ENOMEM;
+	for (unsigned int i = 0; i < l->n_surfaces; i++)
+		if (l->surfaces[i].alloc)
+			ave_req(r, &n, &ave->mctf_pool[i], l->surfaces[i].alloc, 0, 0);
+	sort(r, n, sizeof(*r), ave_buf_req_cmp, NULL);
+	for (unsigned int i = 0; i < n && !ret; i++) {
+		ret = ave_alloc(ave, r[i].b, r[i].size, r[i].attrs);
+		mapped += r[i].b->alloc;
+	}
+	kfree(r);
+	for (unsigned int i = 0; i < l->inputs && !ret; i++)
+		ret = ave_alloc(ave, &ave->mctf_pool_in[i], l->form.bytes, 0);
+	for (unsigned int i = 0; i < l->slots && !ret; i++)
+		ret = ave_alloc(ave, &ave->mctf_pool_out[i], l->form.bytes, 0);
+	if (ret) {
+		dev_err(ave->dev, "out of encoder DMA space for the MCTF pool (%zu MiB)\n",
+			mapped >> 20);
+		return -ENOMEM;
+	}
+	set_bit(AVE_MCTF_POOL_READY, &ave->mctf_pool_flags);
+	dev_dbg(ave->dev, "MCTF pool: %u surfaces, %zu KiB mapped once\n", n, mapped >> 10);
+	return 0;
+}
+
+static void ave_mctf_pool_zero(struct ave_buf *b, unsigned int count)
+{
+	for (unsigned int i = 0; i < count; i++)
+		if (b[i].cpu)
+			memset(b[i].cpu, 0, b[i].alloc);
+}
+
+/*
+ * An MCTF session: fixed 1080p NV12 on the selector-2 carriers. Its DMA
+ * memory is the device's MCTF pool, lent to one session at a time and
+ * zeroed for each: the same buffers at the same addresses for every
+ * session and every firmware boot, never unmapped while the driver is
+ * bound. A late or stale firmware or engine write after a session (rev 7
+ * and 8 on the Neo corrupted kernel memory after one) can then only reach
+ * memory this driver still owns.
+ */
+int ave_sess_mctf_init(struct ave_ctx *ctx, struct ave_session *sess)
+{
+	struct ave_dev *ave = ctx->ave;
+	const struct ave_mctf_layout *l = ave_mctf_qualified(ave->text_crc);
+	struct ave_params *p = &sess->p;
+	int ret = 0;
+
+	if (!l)
+		return -EOPNOTSUPP;
+	if (l->n_surfaces > AVE_MCTF_BUFS || l->slots > AVE_MAX_SLOTS ||
+	    l->slots > AVE_MCTF_OUT_BUFS || l->inputs > AVE_MCTF_IN_BUFS)
+		return -EINVAL;
+	*p = (struct ave_params){
+		.codec = AVE_CODEC_HEVC,	/* the selector-2 carriers */
+		.width = AVE_MCTF_WIDTH,
+		.height = AVE_MCTF_HEIGHT,
+		.cw = AVE_MCTF_WIDTH,
+		.ch = ALIGN(AVE_MCTF_HEIGHT, 16),
+		.stride = ctx->src_fmt.plane_fmt[0].bytesperline,
+		.fps_num = 30,
+		.fps_den = 1,
+		.fps_int = 30,
+		.slots = l->slots,
+	};
+	ret = ave_cmp420_geom(&sess->mctf_geom, AVE_MCTF_WIDTH, AVE_MCTF_HEIGHT);
+	if (ret || sess->mctf_geom.y_meta != l->form.y_hdr ||
+	    sess->mctf_geom.c != l->form.c ||
+	    sess->mctf_geom.c_meta != l->form.c_hdr ||
+	    sess->mctf_geom.bytes != l->form.bytes) {
+		dev_err(ave->dev, "MCTF picture surface is not the compressed 4:2:0 form\n");
+		return -EINVAL;
+	}
+	sess->mctf_surf = kvmalloc(l->form.bytes, GFP_KERNEL);
+	sess->mctf_lin = kvmalloc((size_t)p->stride * p->height * 3 / 2, GFP_KERNEL);
+	if (!sess->mctf_surf || !sess->mctf_lin)
+		return -ENOMEM;
+	sess->mctf = l;
+	sess->unit = l->unit;
+	sess->arg1 = l->arg1;
+	sess->frame_arg0 = l->frame_arg0;
+	return 0;
+}
+
+static void ave_sess_log_map(struct ave_dev *ave, struct ave_session *sess);
+
+/*
+ * Lend the pool to @ctx's MCTF session. Called once the firmware runs, so
+ * a session quarantined with the pool was already given back by the reap
+ * that the restart's power-loss proof allows. Caller holds hw_lock.
+ */
+int ave_sess_mctf_borrow(struct ave_ctx *ctx)
+{
+	struct ave_dev *ave = ctx->ave;
+	struct ave_session *sess = ctx->sess;
+	const struct ave_mctf_layout *l = sess->mctf;
+	int ret;
+
+	lockdep_assert_held(&ave->hw_lock);
+	if (!l || sess->mctf_borrowed)
+		return 0;
+	if (test_and_set_bit(AVE_MCTF_POOL_LENT, &ave->mctf_pool_flags)) {
+		dev_err(ave->dev,
+			"MCTF memory is held by a stopped session until the coprocessor loses power\n");
+		return -EBUSY;
+	}
+	sess->mctf_borrowed = true;	/* from here ave_sess_free_bufs() returns it */
+	if (test_bit(AVE_MCTF_POOL_READY, &ave->mctf_pool_flags)) {
+		ave_mctf_pool_check(ave, "at next start");
+		ave->mctf_pool_crc_valid = false;
+		ave_mctf_pool_zero(ave->mctf_pool, AVE_MCTF_BUFS);
+		ave_mctf_pool_zero(ave->mctf_pool_in, AVE_MCTF_IN_BUFS);
+		ave_mctf_pool_zero(ave->mctf_pool_out, AVE_MCTF_OUT_BUFS);
+	} else {
+		ret = ave_mctf_pool_fill(ave, l);
+		if (ret)
+			return ret;
+	}
+	memcpy(sess->mctf_buf, ave->mctf_pool, sizeof(sess->mctf_buf));
+	memcpy(sess->mctf_in, ave->mctf_pool_in, sizeof(sess->mctf_in));
+	memcpy(sess->mctf_out, ave->mctf_pool_out, sizeof(sess->mctf_out));
+	for (unsigned int i = 0; i < l->n_surfaces; i++)
+		sess->mctf_iova[i] = sess->mctf_buf[i].dma;
+	dev_dbg(ave->dev, "MCTF session on the device pool\n");
+	ave_sess_log_map(ave, sess);
+	return 0;
+}
+
 static void ave_sess_free_bufs(struct ave_dev *ave, struct ave_session *sess)
 {
+	ave_mctf_pool_return(ave, sess);
 	ave_free(ave, &sess->hdr);
 	ave_free(ave, &sess->client_mem);
 	ave_free(ave, &sess->param_sets);
@@ -496,6 +714,18 @@ static void ave_sess_free_bufs(struct ave_dev *ave, struct ave_session *sess)
 		}
 	for (unsigned int i = 0; i < 2; i++)
 		ave_free(ave, &sess->hevc_extra[i]);
+	for (unsigned int i = 0; i < 2; i++)
+		ave_free(ave, &sess->hevc_transcoded[i]);
+	for (unsigned int i = 0; i < AVE_MCTF_BUFS; i++)
+		ave_free(ave, &sess->mctf_buf[i]);
+	for (unsigned int i = 0; i < AVE_MCTF_IN_BUFS; i++)
+		ave_free(ave, &sess->mctf_in[i]);
+	for (unsigned int i = 0; i < AVE_MCTF_OUT_BUFS; i++)
+		ave_free(ave, &sess->mctf_out[i]);
+	kvfree(sess->mctf_surf);
+	sess->mctf_surf = NULL;
+	kvfree(sess->mctf_lin);
+	sess->mctf_lin = NULL;
 	for (unsigned int s = 0; s < AVE_MAX_SLOTS; s++) {
 		ave_free(ave, &sess->slot[s].coded);
 		ave_free(ave, &sess->slot[s].meta);
@@ -504,6 +734,8 @@ static void ave_sess_free_bufs(struct ave_dev *ave, struct ave_session *sess)
 		ave_free(ave, &sess->slot[s].bounce);
 		ave_vb2_put(sess->slot[s].input_mem);
 		sess->slot[s].input_mem = NULL;
+		ave_vb2_put(sess->slot[s].output_mem);
+		sess->slot[s].output_mem = NULL;
 	}
 	kfree(sess->codec_state);
 	sess->codec_state = NULL;
@@ -622,6 +854,8 @@ static void ave_sess_log_map(struct ave_dev *ave, struct ave_session *sess)
 			ave_log_buf(ave, "tile_aux", set * AVE_TILE_BUFS + i,
 				    &sess->tile_aux[set][i]);
 		}
+	for (int i = 0; i < AVE_MCTF_BUFS; i++)
+		ave_log_buf(ave, "mctf", i, &sess->mctf_buf[i]);
 	for (int i = 0; i < AVE_MAX_SLOTS; i++) {
 		ave_log_buf(ave, "coded", i, &sess->slot[i].coded);
 		ave_log_buf(ave, "meta", i, &sess->slot[i].meta);
@@ -638,9 +872,13 @@ struct ave_session *ave_sess_create(struct ave_ctx *ctx)
 	sess = kzalloc_obj(*sess);
 	if (!sess)
 		return ERR_PTR(-ENOMEM);
-	ret = ave_sess_params(ctx, &sess->p);
-	if (!ret)
-		ret = ave_sess_alloc(ctx->ave, sess);
+	if (ctx->mctf) {
+		ret = ave_sess_mctf_init(ctx, sess);
+	} else {
+		ret = ave_sess_params(ctx, &sess->p);
+		if (!ret)
+			ret = ave_sess_alloc(ctx->ave, sess);
+	}
 	if (ret) {
 		ave_sess_free_bufs(ctx->ave, sess);
 		kfree(sess);
@@ -658,7 +896,25 @@ struct ave_session *ave_sess_create(struct ave_ctx *ctx)
 	return sess;
 }
 
-/* Keep every firmware-visible allocation mapped until a confirmed power cycle. */
+/*
+ * Nothing the firmware was given is freed or unmapped before the coprocessor
+ * is proved to have lost power. A session the firmware saw (Start sent) is
+ * quarantined with all its buffers and its pinned vb2 inputs, whether its
+ * Close was answered or not: a confirmed Close and a Halt (only a settle
+ * delay on 9003) do not prove the engines stopped, and on the Neo freeing
+ * after them corrupted memory. ave_sess_reap() frees it once the restart or
+ * recovery path has seen the reset witness. A session the firmware never
+ * saw is freed now, unless the DMA domain stopped being strict, when even
+ * that waits. An MCTF session's DMA memory is the device pool, which is
+ * only handed back, never freed.
+ */
+static bool ave_sess_domain_unsafe(struct ave_dev *ave)
+{
+	struct iommu_domain *domain = iommu_get_domain_for_dev(ave->dev);
+
+	return domain && !ave_domain_type_safe(domain->type);
+}
+
 void ave_sess_destroy(struct ave_ctx *ctx)
 {
 	struct ave_dev *ave = ctx->ave;
@@ -667,8 +923,18 @@ void ave_sess_destroy(struct ave_ctx *ctx)
 	if (!sess)
 		return;
 	mutex_lock(&ave->hw_lock);
-	if (sess->handed && (ave->fw_state == AVE_FW_BROKEN ||
-			     ave->fw_state == AVE_FW_RECOVERING)) {
+	if (sess->handed || ave_sess_domain_unsafe(ave)) {
+		if (!sess->handed)
+			dev_err(ave->dev, "DMA domain is no longer strict; keeping session memory\n");
+		/* From here nothing may write the pool; the reap checks it. */
+		if (sess->mctf_borrowed && test_bit(AVE_MCTF_POOL_READY, &ave->mctf_pool_flags)) {
+			ave->mctf_pool_crc = ave_mctf_pool_crc(ave);
+			ave->mctf_pool_crc_valid = true;
+		}
+		kvfree(sess->mctf_surf);
+		sess->mctf_surf = NULL;
+		kvfree(sess->mctf_lin);
+		sess->mctf_lin = NULL;
 		sess->failed_next = ave->failed_sessions;
 		ave->failed_sessions = sess;
 	} else {
@@ -679,17 +945,36 @@ void ave_sess_destroy(struct ave_ctx *ctx)
 	mutex_unlock(&ave->hw_lock);
 }
 
-/* Caller holds hw_lock and has verified that the coprocessor lost power. */
+/*
+ * Caller holds hw_lock, has verified that the coprocessor lost power, and
+ * holds a runtime PM reference (the DART is powered). The pages go back
+ * with the device in reset; the DART TLB is then flushed so no stale
+ * translation of them survives into the next firmware boot.
+ */
 void ave_sess_reap(struct ave_dev *ave)
 {
+	struct iommu_domain *domain;
 	struct ave_session *sess;
+	bool freed = false;
 
 	lockdep_assert_held(&ave->hw_lock);
+	if (ave->failed_sessions && ave->witness_unusable) {
+		dev_warn_once(ave->dev, "no reset proof; keeping stopped sessions' memory\n");
+		return;
+	}
+	if (ave->failed_sessions && ave_sess_domain_unsafe(ave)) {
+		dev_err(ave->dev, "DMA domain is no longer strict; keeping stopped sessions' memory\n");
+		return;
+	}
 	while ((sess = ave->failed_sessions)) {
 		ave->failed_sessions = sess->failed_next;
 		ave_sess_free_bufs(ave, sess);
 		kfree(sess);
+		freed = true;
 	}
+	domain = freed ? iommu_get_domain_for_dev(ave->dev) : NULL;
+	if (domain)
+		iommu_flush_iotlb_all(domain);
 }
 
 int ave_sess_free_slot(struct ave_session *sess)
@@ -708,7 +993,8 @@ void ave_sess_prepare_slot(struct ave_session *sess, unsigned int slot)
 {
 	struct ave_slot *s = &sess->slot[slot];
 
-	memset(s->meta.cpu, 0, s->meta.size);
+	if (s->meta.cpu)
+		memset(s->meta.cpu, 0, s->meta.size);
 	if (sess->p.codec == AVE_CODEC_HEVC && s->aux.cpu)
 		memset(s->aux.cpu, 0, AVE_SHDR_ENTRY_BYTES);
 }

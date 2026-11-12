@@ -37,14 +37,15 @@
 //!
 //! A boot policy change (a new Stage 1, a different boot object) makes the
 //! enclave rewrite one existing session record the first time Linux's
-//! identity keybag is unlocked under the new policy. Linux did not create
-//! that record. On a boot under an unchanged policy that unlock rewrites no
-//! session record at all, so a rewrite inside it is the sign of a policy
+//! identity keybag is used under the new policy: its first unlock, or
+//! Touch ID's `DESIGNATE_KEYBAG` when that comes first. Linux did not create
+//! that record. On a boot under an unchanged policy neither rewrites an
+//! existing session record, so a rewrite inside them is the sign of a policy
 //! change. The guard lets exactly one kind-4 rewrite through in that window
-//! ([`policy_window`]): the first unlock of an identity keybag that already
-//! existed, at most once per boot, never a delete, and only once the
-//! record's previous value is saved in a host file ([`PREVIOUS_PATH`]).
-//! The record is not added to Linux's list.
+//! ([`policy_window`]): the first unlock or designate of an identity keybag
+//! that already existed, at most once per boot, never a delete, and only
+//! once the record's previous value is saved in a host file
+//! ([`PREVIOUS_PATH`]). The record is not added to Linux's list.
 //!
 //! For a policy change the window did not cover, `aurora-sep-policy-change`
 //! backs up the gigalocker and leaves a one-time allowance in a host file
@@ -122,9 +123,9 @@ fn with_window<T>(why: Rewrite, f: impl FnOnce() -> T) -> T {
     result
 }
 
-/// Runs `unlock`, the unlock of an identity keybag that already existed,
-/// with the boot policy window open if it is this boot's first. Later
-/// unlocks run with it closed.
+/// Runs `unlock`, the unlock or Touch ID designate of an identity keybag
+/// that already existed, with the boot policy window open if it is this
+/// boot's first. Later ones run with it closed.
 pub(crate) fn policy_window<T>(unlock: impl FnOnce() -> T) -> T {
     with_window(Rewrite::PolicyChange, unlock)
 }
@@ -326,8 +327,9 @@ pub(crate) enum Allowance {
     Record(Key),
     /// The first existing record of this kind the enclave asks to rewrite.
     /// An installer that changes the boot policy cannot know the record's
-    /// session id beforehand; the first identity unlock under the new policy
-    /// comes before anything else can rewrite a session record.
+    /// session id beforehand; the keybag's first use under the new policy
+    /// (an unlock or Touch ID's designate) comes before anything else can
+    /// rewrite a session record.
     FirstOfKind(u8),
 }
 
@@ -367,7 +369,7 @@ fn take_allowance() -> Option<Allowance> {
     };
     drop(file);
     if let Err(e) = StoreFile::open_trunc(ALLOW_PATH).and_then(|file| file.sync()) {
-        pr_warn!(
+        pr_warn_ratelimited!(
             "xART guard: could not empty the one-time allowance ({:?}); not using it\n",
             e
         );
@@ -375,16 +377,16 @@ fn take_allowance() -> Option<Allowance> {
     }
     let allowance = if read { Allowance::decode(&entry) } else { None };
     match allowance {
-        Some(Allowance::Record(key)) => pr_info!(
+        Some(Allowance::Record(key)) => pr_info_ratelimited!(
             "xART guard: this boot may rewrite kind-{} record {} once, for a boot policy change\n",
             key.kind,
             Id(&key.uuid)
         ),
-        Some(Allowance::FirstOfKind(kind)) => pr_info!(
+        Some(Allowance::FirstOfKind(kind)) => pr_info_ratelimited!(
             "xART guard: this boot may rewrite the first existing kind-{} record the enclave asks for, once, for a boot policy change\n",
             kind
         ),
-        None => pr_warn!("xART guard: ignored a damaged one-time allowance\n"),
+        None => pr_warn_ratelimited!("xART guard: ignored a damaged one-time allowance\n"),
     }
     allowance
 }
@@ -495,7 +497,7 @@ impl<F: ListFile> Guard<F> {
         match file {
             Ok(file) => {
                 if let Err(e) = guard.load(&file) {
-                    pr_warn!(
+                    pr_warn_ratelimited!(
                         "xART guard: the list of Linux's records is unreadable ({:?}); every existing session record is protected and none can be adopted\n",
                         e
                     );
@@ -503,7 +505,7 @@ impl<F: ListFile> Guard<F> {
                     guard.file = Some(file);
                 }
             }
-            Err(e) => pr_warn!(
+            Err(e) => pr_warn_ratelimited!(
                 "xART guard: the list of Linux's records could not be opened ({:?}); every existing session record is protected and none can be adopted\n",
                 e
             ),
@@ -519,7 +521,7 @@ impl<F: ListFile> Guard<F> {
         } else {
             ""
         };
-        pr_info!(
+        pr_info_ratelimited!(
             "xART guard level {}: {} session records exist, {} created by Linux; the other {} are protected{}\n",
             level,
             sessions,
@@ -547,7 +549,7 @@ impl<F: ListFile> Guard<F> {
             }
         }
         if torn != 0 {
-            pr_warn!("xART guard: ignored {} unreadable list entries\n", torn);
+            pr_warn_ratelimited!("xART guard: ignored {} unreadable list entries\n", torn);
         }
         // A torn tail entry is overwritten by the next adoption.
         self.end = (whole * ENTRY_SIZE) as u64;
@@ -607,7 +609,7 @@ impl<F: ListFile> Guard<F> {
             Verdict::Adopt if !write => Ok(()),
             Verdict::Adopt => self.adopt(key).inspect_err(|e| {
                 crate::diag::xart_guard_refused();
-                pr_warn!(
+                pr_warn_ratelimited!(
                     "xART guard: could not list a new kind-{} record as Linux's ({:?}); refusing to write it\n",
                     key.kind,
                     e
@@ -629,7 +631,7 @@ impl<F: ListFile> Guard<F> {
         self.refused += 1;
         if self.refused <= LOGGED_REFUSALS {
             let action = if write { "rewrite" } else { "delete" };
-            pr_warn!(
+            pr_warn_ratelimited!(
                 "xART guard: refused to {} kind-{} record {}, which this Linux install did not create\n",
                 action,
                 key.kind,
@@ -664,7 +666,7 @@ impl<F: ListFile> Guard<F> {
     pub(crate) fn refuse_unsaved(&mut self, key: &Key, why: Rewrite, e: Error) {
         crate::diag::xart_guard_refused();
         self.refused += 1;
-        pr_warn!(
+        pr_warn_ratelimited!(
             "xART guard: could not save kind-{} record {} before rewriting it {} ({:?}); refusing it\n",
             key.kind,
             Id(&key.uuid),

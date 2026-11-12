@@ -8,6 +8,7 @@
 #include <linux/types.h>
 
 struct device;
+struct device_node;
 
 /* Retained internal-display ownership is qualified only with a built-in
  * DART provider. Other consumers, including modular DART, keep the APIs below.
@@ -166,6 +167,16 @@ static inline int apple_dart_fw_remote(struct device *dev, dma_addr_t iova, bool
 {
 	return -EOPNOTSUPP;
 }
+#endif
+
+/*
+ * A DART marked apple,manual-availability answers only once its client (a
+ * PCIe root complex) is up. The client makes it available, and it probes then.
+ */
+#if IS_ENABLED(CONFIG_APPLE_DART)
+void apple_dart_make_available(struct device_node *np);
+#else
+static inline void apple_dart_make_available(struct device_node *np) { }
 #endif
 
 #endif

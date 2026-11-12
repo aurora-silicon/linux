@@ -146,6 +146,16 @@ properties:
       before the domain powers off, and the slice is enabled again when it
       powers up. Only the J713 internal display DARTs use it.
 
+  apple,manual-availability:
+    type: boolean
+    description: >
+      The DART's registers answer only once its client, a PCIe root complex,
+      is up. The client's driver makes the DART available after bringing the
+      root complex up, and the DART probes then. The root complex lists the DART
+      in its post-init-providers property as well as in iommu-map: otherwise
+      fw_devlink.strict=1 makes the root complex wait for a DART that waits for
+      it.
+
   apple,tunable:
     $ref: /schemas/types.yaml#/definitions/uint32-matrix
     items:

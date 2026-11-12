@@ -69,19 +69,22 @@ allocating session buffers or acquiring runtime power.
 
 Command sizes, offsets, descriptor groups, constants, Process subtype and
 buffer sizes are selected by the verified TEXT CRC, independently of the
-SoC match data. Only ``69c54454`` currently selects an encoding layout.
+SoC match data. ``69c54454`` and ``68d5f9f6`` select the 9003.78.0 layout and
+``87279429`` the 26A428 one.
 There is no fallback layout and zero is not a wildcard CRC. Hardware boot
 qualification is a separate requirement; presenting the J700 CRC on T6041
 does not authorize the J700 boot sequence.
 
 The driver describes the command layout observed on J616s with macOS 27.0
 26A428, including counted Start groups, packed AVC fields and sized Process
-descriptors. It is deliberately absent from the CRC lookup: its TEXT CRC
-and its relationship to the firmware supplied to Linux are still unknown.
-The boot-config words, coprocessor start registers, DMA aperture and output
-metadata/slice-header extraction also need qualification before encoding
-can be enabled. The 26A428 capture and the J700 capture used different OS
-versions; a SoC compatible cannot identify a command ABI.
+descriptors. The M5 Pro and Max (T6050) firmware that the loader hands over
+with macOS 27.0 installed, TEXT CRC ``87279429``, selects it. On T6050,
+macOS's boot configuration, coprocessor start and handshake follow the 9003
+transport (device 28, device type 28, after clearing the SVE idle word at
+mailbox +0x118), and H.264 encodes. Where this firmware leaves an HEVC slice
+header is not known, so HEVC sessions are refused on this layout. The 26A428
+capture and the J700 capture used different OS versions; a SoC compatible
+cannot identify a command ABI.
 
 The public API continues to offer 8-bit NV12 and VBR/CBR. CQ and Main10
 layout facts are exercised by host tests without exposing new V4L2 modes.

@@ -46,16 +46,13 @@ allOf:
           contains:
             enum:
               - apple,t8132-ave
-              - apple,t6050-ave
       required:
         - compatible
     then:
       properties:
         compatible:
           items:
-            - enum:
-                - apple,t8132-ave
-                - apple,t6050-ave
+            - const: apple,t8132-ave
             - const: apple,ave
 
         reg:
@@ -129,6 +126,7 @@ allOf:
                   - enum:
                       - apple,t6000-ave
                       - apple,t6041-ave
+                      - apple,t6050-ave
                       - apple,t8112-ave
                       - apple,t8140-ave
                   - items:
@@ -188,6 +186,10 @@ allOf:
               iommus:
                 minItems: 2
                 maxItems: 4
+                description:
+                  The encoder's stream on each of its DARTs. Where the motion-compensated
+                  temporal filter has its own stream (stream 12 on T8140), that stream is
+                  listed after the encoder's on each DART.
 
               memory-region:
                 items:
@@ -230,6 +232,7 @@ allOf:
                       contains:
                         enum:
                           - apple,t6041-ave
+                          - apple,t6050-ave
                           - apple,t8140-ave
                 then:
                   properties:

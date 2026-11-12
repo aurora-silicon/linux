@@ -7,6 +7,7 @@ on:
       - 'rust/**'
       - 'tools/aurora-bindgen/**'
       - 'drivers/soc/apple/**'
+      - 'drivers/pmdomain/apple/pmp-report.c'
       - 'include/uapi/linux/apple-sep.h'
       - 'tools/aurora-sep/**'
       - '.github/workflows/sep-source.yml'
@@ -55,6 +56,8 @@ jobs:
           python3 -m unittest tools/aurora-sep/tests/test_orphan_delete.py -v
           python3 -m unittest tools/aurora-sep/tests/test_enrol_admission.py -v
           python3 -m unittest tools/aurora-sep/tests/test_owner_preparation.py -v
+          python3 -m unittest tools/aurora-sep/tests/test_policy_window.py -v
+          python3 -m unittest tools/aurora-sep/tests/test_log_ratelimit.py -v
           python3 -m unittest discover -s tools/aurora-sep/tests -p test_packaging.py -v
 
   rust-build:

@@ -1,0 +1,25 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# ExecCondition of aurora-touchid-setup.service: exit 0 only when it has
+# work, so that a boot with Touch ID in place costs a few file tests and
+# nothing else. It has work when
+#   - aurora-sep-ready saw the enclave refuse an installed file this boot,
+#     and the one automatic rebuild per boot has not run yet; or
+#   - a file it installed or checked before is missing; or
+#   - it has never run on this Mac (it then records what it found, and on a
+#     Mac without a reader it records that there is nothing to check).
+# The calibration's name comes from the device tree and differs per model,
+# so the unit cannot name it in a static ConditionPathExists=.
+run=${AURORA_SEP_RUN:-/run/aurora-sep}
+files=${AURORA_TOUCHID_FILES:-/var/lib/aurora-sep/touchid-files}
+
+if [ -e "$run/calibration-refused" ] && [ ! -e "$run/touchid-auto-rebuild" ]; then
+    exit 0
+fi
+[ -f "$files" ] || exit 0
+while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    [ -e "$path" ] || exit 0
+done <"$files"
+exit 1
