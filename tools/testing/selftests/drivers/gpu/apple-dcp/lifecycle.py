@@ -28,6 +28,9 @@ def disconnect(root):
     held = [n for n in ('cd321x_mux_held', 'cd321x_mux_set', 'cd321x_mux_still_held',
                         'cd321x_retry_held_mux', 'cd321x_update_done')
             if re.search(r'^static \w+ ' + n + r'\(', (r / core).read_text(), re.M)]
+    # How a failed change is reported, separate so that KUnit can count it
+    reports = [n for n in ('cd321x_mux_failed', 'cd321x_mux_gave_up')
+               if re.search(r'^VISIBLE_IF_KUNIT \w+ ' + n + r'\(', (r / core).read_text(), re.M)]
     # Whether a partner identity has been received, when the update checks that
     late = [n for n in ('cd321x_identity_known',)
             if re.search(r'^static \w+ ' + n + r'\(', (r / core).read_text(), re.M)]
@@ -59,6 +62,7 @@ def disconnect(root):
         (dcp, 'dcp_external_link_locked'),
         (dcp, 'dcp_dptx_connect_oob'),
         (core, 'cd321x_retry_revalidation'),
+        *((core, n) for n in reports),
         *((core, n) for n in held),
         *((core, n) for n in ('cd321x_uses_dp_sid', 'cd321x_dp_hpd',
                               'cd321x_dp_sid_replay', 'cd321x_dp_release_first')),
@@ -217,6 +221,8 @@ struct cd321x { struct tps6598x tps; struct cd321x_status update_status;
 #define DP_STATUS_HPD_STATE (1U << 7)
 #endif
 struct typec_displayport_data { u32 status,conf; };
+#define VISIBLE_IF_KUNIT static
+#define KUNIT_STATIC_STUB_REDIRECT(...) ((void)0)
 /* No mux here declares its timeouts transient: every failure is budgeted. */
 static bool typec_mux_timeout_transient(void *m) { (void)m; return false; }
 #define dev_dbg(...) ((void)0)
