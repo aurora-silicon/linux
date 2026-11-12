@@ -45,39 +45,39 @@
 
 #include <linux/bitfield.h>
 #include <linux/bits.h>
-#include <linux/cpu.h>
+#include <linux/cacheflush.h>
+#include <linux/cpumask.h>
 #include <linux/debugfs.h>
+#include <linux/device.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/irqchip/irq-apple-aic.h>
+#include <linux/mfd/macsmc.h>
 #include <linux/mfd/syscon.h>
 #include <linux/minmax.h>
 #include <linux/moduleparam.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
-#include <linux/mfd/macsmc.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
 #include <linux/seq_file.h>
-#include <linux/slab.h>
-#include <linux/smp.h>
 #include <linux/soc/apple/aura-hibernate.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/soc/apple/tunable.h>
 #include <linux/suspend.h>
 
+#include <asm/arch_timer.h>
 #include <asm/barrier.h>
-#include <asm/cacheflush.h>
 #include <asm/cpu_ops.h>
-#include <asm/memory.h>
 #include <asm/cputype.h>
+#include <asm/memory.h>
 #include <asm/smp_plat.h>
 #include <asm/suspend.h>
 #include <asm/sysreg.h>
 #include <asm/virt.h>
+
 #include <clocksource/arm_arch_timer.h>
-#include <asm/arch_timer.h>
 
 #include "sleep-internal.h"
 
@@ -221,6 +221,7 @@ static const struct {
 	{ 0x502918000ULL, 0x502918250ULL },	/* disp-tvm */
 	{ 0x502900000ULL, 0x502900250ULL },	/* soc-tvm */
 };
+
 #define TVM_ENABLE		BIT(0)
 #define TVM_BUSY		BIT(1)
 
@@ -279,7 +280,8 @@ static const struct {
 #define PS_APCIE_GP		0x100
 #define PS_APCIE_SYS_GP		0x390
 #define GP_PIN_DATA		BIT(0)
-#define T6040_PMC_DCP_PA	0x5048a9c14ULL	/* count of DCPs powered (+0), second voter (+4); the platform ends at 0/0 */
+/* The PMC's DCP voters: the count of DCPs powered (+0) and a second voter (+4), both 0 at sleep */
+#define T6040_PMC_DCP_PA	0x5048a9c14ULL
 
 /* The axi2af fabric-bridge retention domains, t6040_axi2af[] */
 enum {
@@ -598,7 +600,7 @@ static unsigned int t6040_sleep_live_blockers(struct t6040_sleep *s, struct seq_
 	return blockers + disp;
 }
 
-/* The display groups' on-state, one line per group, no allocation. For the log at the commit point. */
+/* The display groups' on-state, one line per group, for the log at the commit point. */
 static unsigned int t6040_sleep_log_groups(struct t6040_sleep *s)
 {
 	unsigned int i, blockers = 0;
@@ -693,7 +695,8 @@ static void t6040_ed_map(struct device *dev)
 
 		if (c >= T6040_ED_CLUSTERS || k >= T6040_ED_CORES || t6040_ed[c][k])
 			continue;
-		t6040_ed[c][k] = t6040_ioremap_np(dev, T6040_ED_BASE_PA + c * T6040_ED_CLUSTER_STRIDE +
+		t6040_ed[c][k] = t6040_ioremap_np(dev, T6040_ED_BASE_PA +
+						 c * T6040_ED_CLUSTER_STRIDE +
 						 k * T6040_ED_CORE_STRIDE, 0x1000);
 		n += !!t6040_ed[c][k];
 	}
@@ -1846,8 +1849,7 @@ static int t6040_apcie_st_raise(struct t6040_sleep *s)
  * restart it for 60 s, in t6040_sleep_set_wd2()'s order, then take cpu_resume. The PA is
  * the T6040 AON WDT (T6040_WDT_PA), used only when the DT's wdt block is that one.
  */
-asm(
-"	.pushsection .text, \"ax\"\n"
+asm("	.pushsection .text, \"ax\"\n"
 "	.type	t6040_resume_stub, %function\n"
 "t6040_resume_stub:\n"
 "	movz	x9, #0xc000\n"
@@ -2196,8 +2198,10 @@ static void t6040_sleep_return(struct t6040_sleep *s)
 
 	/* Wake pwrgates and CPM voters: read, set BIT31. */
 	if (s->pwrgate) {
-		writel(readl(s->pwrgate + PWRGATE_WAKE_0) | PWRGATE_ON, s->pwrgate + PWRGATE_WAKE_0);
-		writel(readl(s->pwrgate + PWRGATE_WAKE_1) | PWRGATE_ON, s->pwrgate + PWRGATE_WAKE_1);
+		writel(readl(s->pwrgate + PWRGATE_WAKE_0) | PWRGATE_ON,
+		       s->pwrgate + PWRGATE_WAKE_0);
+		writel(readl(s->pwrgate + PWRGATE_WAKE_1) | PWRGATE_ON,
+		       s->pwrgate + PWRGATE_WAKE_1);
 	}
 	t6040_wake_sync();
 
@@ -2326,9 +2330,11 @@ static int t6040_sleep_begin(suspend_state_t state)
 	struct t6040_sleep *s = t6040_sleep;
 	unsigned int disp = 0;
 	unsigned int live = t6040_sleep_live_blockers(s, NULL, &disp);
-	/* The display pipes are lowered during device suspend (apple-dcp .suspend),
+	/*
+	 * The display pipes are lowered during device suspend (apple-dcp .suspend),
 	 * so .begin only gates on the non-display live blockers; .enter re-checks the
-	 * full set at the commit point, by which time the display is off. */
+	 * full set at the commit point, by which time the display is off.
+	 */
 	unsigned int begin_total = live - disp;
 	unsigned int dry = READ_ONCE(dry_run), secs;
 	u32 dcs_to;
@@ -2344,7 +2350,8 @@ static int t6040_sleep_begin(suspend_state_t state)
 
 	t6040_sleep_set_dry(s, 0);
 	s->returned = false;
-	s->gp_saved[0] = s->gp_saved[1] = false;
+	s->gp_saved[0] = false;
+	s->gp_saved[1] = false;
 	t6040_aop_ps_save(s);
 	t6040_sleep_pmvc(s);
 	t6040_dcs_dyn_pg(s);
@@ -2353,9 +2360,11 @@ static int t6040_sleep_begin(suspend_state_t state)
 		dev_warn(s->dev, "DCS power words %#x did not read on before automatic mode\n",
 			 dcs_to);
 	if (!begin_total && !dry) {
-		/* The non-display blockers are clear and no dry run is asked for: proceed
+		/*
+		 * The non-display blockers are clear and no dry run is asked for: proceed
 		 * to device suspend; .enter holds the real commit until the display is
-		 * also off. The AON WD2 is the net from here. */
+		 * also off. The AON WD2 is the net from here.
+		 */
 		dev_dbg(s->dev, "entering: %u display pipe(s) on, to be lowered before the commit\n",
 			disp);
 		t6040_sleep_power_ops(s);
@@ -2643,8 +2652,10 @@ static int t6040_psw_on(struct t6040_sleep *s, const struct t6040_psw *w, bool s
 			writel(1, s->disp_pwrgate + DISP_PWRGATE_B);
 		}
 		if (bridge && !ret) {
-			writel(readl(bridge + AXI2AF_BRIDGE_104) | BIT(0), bridge + AXI2AF_BRIDGE_104);
-			writel(readl(bridge + AXI2AF_BRIDGE_108) | BIT(0), bridge + AXI2AF_BRIDGE_108);
+			writel(readl(bridge + AXI2AF_BRIDGE_104) | BIT(0),
+			       bridge + AXI2AF_BRIDGE_104);
+			writel(readl(bridge + AXI2AF_BRIDGE_108) | BIT(0),
+			       bridge + AXI2AF_BRIDGE_108);
 		}
 	}
 	v = t6040_psw_read(w);
@@ -2705,7 +2716,7 @@ static unsigned int t6040_disp_lower(struct t6040_sleep *s)
 			bool cpu = off == g->first;
 			u32 val, cur = 0;
 
-			/* An automatically gated CPU still powered: wait for the PMGR to gate it. */
+			/* An automatically gated CPU still on: wait for the PMGR to gate it. */
 			if (cpu && !regmap_read(g->regmap, off, &val) && (val & PS_AUTO_ENABLE) &&
 			    FIELD_GET(PS_ACTUAL, val))
 				t6040_regmap_poll_off(g->regmap, off, &cur);
@@ -2991,11 +3002,12 @@ static void t6040_sleep_map_mailbox(struct t6040_sleep *s)
 
 #ifdef CONFIG_HIBERNATION
 /*
- * Restored from a hibernation image, this kernel runs under the aura of the boot that resumed it.
- * That aura moved with the boot object, and so did its mailbox: the one mapped at probe was the
- * hibernating boot's, and the boot core would come back from a sleep through this boot's. Take this
- * boot's address from the device tree aura keeps at its fixed slot. Without it, drop the mailbox, so
- * that a suspend refuses for it instead of arming memory that is no longer aura's.
+ * Restored from a hibernation image, this kernel runs under the aura of the boot that resumed
+ * it. That aura moved with the boot object, and so did its mailbox: the one mapped at probe was
+ * the hibernating boot's, and the boot core would come back from a sleep through this boot's.
+ * Take this boot's address from the device tree aura keeps at its fixed slot. Without it, drop
+ * the mailbox, so that a suspend refuses for it instead of arming memory that is no longer
+ * aura's.
  */
 static int t6040_sleep_restore(struct device *dev)
 {
@@ -3033,7 +3045,8 @@ static void t6040_sleep_map_gp(struct t6040_sleep *s)
 	struct resource res;
 	int p, idx;
 
-	s->gp_perst[0] = s->gp_perst[1] = -1;
+	s->gp_perst[0] = -1;
+	s->gp_perst[1] = -1;
 	host = of_find_compatible_node(NULL, NULL, "apple,t6041-pcie");
 	if (!host)
 		return;
@@ -3055,7 +3068,7 @@ static void t6040_sleep_map_gp(struct t6040_sleep *s)
 			continue;
 		p = (reg[0] >> 11) & 0x1f;	/* the device number of pci@N,0 */
 		if (p > 1 || of_parse_phandle_with_args(child, "reset-gpios", "#gpio-cells", 0,
-							 &args))
+							&args))
 			continue;
 		if (args.args_count >= 2 && (!pins || pins == args.np)) {
 			if (!pins)
@@ -3102,7 +3115,8 @@ static int t6040_sleep_probe(struct platform_device *pdev)
 	 */
 	BUILD_BUG_ON(ARRAY_SIZE(t6040_axi2af) != T6040_AXI2AF_DOMAINS);
 	BUILD_BUG_ON(ARRAY_SIZE(t6040_tvm) != ARRAY_SIZE(((struct t6040_sleep *)0)->tvm_ctl));
-	BUILD_BUG_ON(ARRAY_SIZE(t6040_acc_apsc_pa) != ARRAY_SIZE(((struct t6040_sleep *)0)->acc_apsc));
+	BUILD_BUG_ON(ARRAY_SIZE(t6040_acc_apsc_pa) !=
+		     ARRAY_SIZE(((struct t6040_sleep *)0)->acc_apsc));
 	s->cpu_start = t6040_sleep_map(&pdev->dev, "cpu-start");
 	s->wdt = t6040_sleep_map(&pdev->dev, "wdt");
 	{
