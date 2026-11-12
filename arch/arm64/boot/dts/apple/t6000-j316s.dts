@@ -131,3 +131,24 @@
 	compatible = "apple,j316-macaudio", "apple,macaudio";
 	model = "MacBook Pro J316";
 };
+
+/*
+ * NFC controller (Stockholm): identified once, then kept off. VEN is SMC
+ * GPIO gP0f with output template 0x00800000, from the function-enable
+ * property of /arm-io/aop-spmi1/stockholm-spmi/stockholm in the J316s
+ * platform device tree, the same line and template as on the J413.
+ */
+&smc_gpio {
+	apple,output-templates = <0xf 0x00800000>;
+};
+
+&aop_spmi1 {
+	status = "okay";
+};
+
+&stockholm {
+	interrupt-names = "event0", "event1", "event2", "error",
+			  "event4", "host-wake", "data-ready";
+	enable-gpios = <&smc_gpio 15 GPIO_ACTIVE_HIGH>;
+	status = "okay";
+};

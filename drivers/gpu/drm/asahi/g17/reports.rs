@@ -109,7 +109,7 @@ fn write_power(
     firmware: &super::Firmware,
     f: &mut kernel::fmt::Formatter<'_>,
 ) -> kernel::fmt::Result {
-    if firmware.rings.statistics_suspended() {
+    if firmware.rings.statistics_suspended() || firmware.primary.state.shared.sleeping() {
         return writeln!(f, "power_management=firmware suspended=1");
     }
     let core_power = firmware.bridge.regs.g17_core_power();

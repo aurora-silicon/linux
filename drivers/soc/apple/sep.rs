@@ -65,8 +65,10 @@ use kernel::{
     sync::{
         aref::ARef,
         atomic::{
+            Acquire,
             Atomic,
-            Relaxed, //
+            Relaxed,
+            Release, //
         },
         barrier::{
             dma_mb,
@@ -659,6 +661,12 @@ struct SepData {
     // u32, not u8: the kernel's Rust atomics have no u8 AtomicType
     phase: Atomic<u32>,
 
+    // A `pm::SleepGate`.
+    sleep_gate: Atomic<u32>,
+
+    // The mailbox's receive interrupt is held off for the enclave's sleep.
+    sleep_rx_held: Atomic<bool>,
+
     #[pin]
     ool_xarm: Mutex<Option<OolPair>>,
 
@@ -719,6 +727,11 @@ struct SepData {
     // next verify captures without a new bring-up, as macOS does. Cleared by
     // anything that powers the sensor off or resets it.
     sensor_kept: Atomic<bool>,
+
+    // The kept sensor reset itself under a verify capture (state 9, it asks
+    // for its patch again). The verify reports a retry, ends the prompt's
+    // match operation and drops the sensor, so the next try brings it up.
+    sensor_reset_in_capture: Atomic<bool>,
 
     // The enclave announced (SBIO tag 0x03) that a background operation
     // result is ready; it waits for the host to collect it with 0x21.
@@ -1139,6 +1152,7 @@ impl SepData {
                 match_context_generation: Atomic::new(0),
                 cold_match_contexts <- new_mutex!(KVec::new()),
                 sensor_kept: Atomic::new(false),
+                sensor_reset_in_capture: Atomic::new(false),
                 bg_ops_ready: Atomic::new(false),
                 persistence_owed: Atomic::new(false),
                 enrol_identity_candidates <- new_mutex!(KVec::new()),
@@ -1146,6 +1160,8 @@ impl SepData {
                 sensor_power_ns: Atomic::new(0),
                 device_view_synced: Atomic::new(false),
                 phase: Atomic::new(PHASE_ATTACH),
+                sleep_gate: Atomic::new(pm::SleepGate::Open as u32),
+                sleep_rx_held: Atomic::new(false),
                 ool_xarm <- new_mutex!(Some(ool_xarm)),
                 ool_sbio <- new_mutex!(Some(ool_sbio)),
                 ool_sks <- new_mutex!(Some(ool_sks)),
@@ -1405,7 +1421,200 @@ impl SepData {
         if self.shutting_down.load(Relaxed) {
             return Err(ENODEV);
         }
-        Self::ring(self.mbox.lock().as_ref().ok_or(ENODEV)?, msg)
+        // Checked with the mailbox lock held: a sender can wait for it for longer
+        // than the system takes to tell the enclave it's going to sleep.
+        let mbox = self.mbox.lock();
+        let mbox = mbox.as_ref().ok_or(ENODEV)?;
+        if !self.sleep_gate().may_request() {
+            return Err(EAGAIN);
+        }
+        Self::ring(mbox, msg)
+    }
+
+    /// As [`Self::send`], for an answer to something the enclave asked: it
+    /// waits for these before it can answer the sleep request.
+    fn send_reply(&self, msg: Message) -> Result<()> {
+        if self.shutting_down.load(Relaxed) {
+            return Err(ENODEV);
+        }
+        let mbox = self.mbox.lock();
+        let mbox = mbox.as_ref().ok_or(ENODEV)?;
+        if !self.sleep_gate().may_reply() {
+            return Err(EAGAIN);
+        }
+        Self::ring(mbox, msg)
+    }
+
+    pub(crate) fn sleep_gate(&self) -> pm::SleepGate {
+        pm::SleepGate::from_u32(self.sleep_gate.load(Acquire))
+    }
+
+    /// Under the mailbox lock, so that a sender holding it finishes first.
+    fn set_sleep_gate(&self, gate: pm::SleepGate) {
+        let _mbox = self.mbox.lock();
+        self.sleep_gate.store(gate as u32, Release);
+    }
+
+    /// Prepare a firmware-driven suspend without sending SLEEP. The platform
+    /// owns the irreversible request, after every returnable refusal.
+    pub(crate) fn sleep_enter(&self) -> Result<()> {
+        match self.sleep_gate() {
+            // A failed earlier wake is not repaired by another precommit attempt.
+            pm::SleepGate::Lost => return Err(EIO),
+            pm::SleepGate::Open => {}
+            _ => return Err(EBUSY),
+        }
+        // Do not commit a running enclave whose sleep protocol is not ready.
+        if self.phase.load(Relaxed) != PHASE_READY || !self.endpoint_present(proto::EP_CONTROL) {
+            dev_warn_ratelimited!(
+                self.dev,
+                "sleep refused: the enclave did not finish coming up\n"
+            );
+            return Err(EBUSY);
+        }
+
+        self.set_sleep_gate(pm::SleepGate::Draining);
+        let idle = control::wait_idle(
+            proto::CONTROL_TIMEOUT_MS,
+            10,
+            || self.control.lock().requests_in_flight(),
+            |ms| kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(ms))),
+        );
+        if !idle {
+            dev_err_ratelimited!(
+                self.dev,
+                "sleep refused: a request is still waiting for its reply\n"
+            );
+            self.set_sleep_gate(pm::SleepGate::Open);
+            return Err(EBUSY);
+        }
+
+        if let Err(e) = self.sleep_leave_for_commit() {
+            dev_err_ratelimited!(
+                self.dev,
+                "sleep refused: irreversible request could not be staged ({:?})\n",
+                e
+            );
+            self.set_sleep_gate(pm::SleepGate::Open);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Stage without sending; the platform's commit owns SLEEP with IRQs off.
+    fn sleep_leave_for_commit(&self) -> Result<()> {
+        let request = proto::encode_control(&proto::op_sleep(), proto::TAG_SLEEP);
+        match self.mbox.lock().as_ref() {
+            Some(mbox) => pm::leave_for_commit(
+                &self.dev,
+                mbox.as_raw(),
+                request,
+                proto::SLEEP_REPLY,
+                proto::SLEEP_REPLY_MASK,
+            ),
+            None => Err(ENODEV),
+        }?;
+        self.sleep_hold_rx();
+        dev_dbg!(self.dev, "SEP SLEEP staged for the irreversible commit\n");
+        Ok(())
+    }
+
+    /// Holds off the receive interrupt, whose handler reads the mailbox.
+    fn sleep_hold_rx(&self) {
+        if !self.sleep_rx_held.xchg(true, Relaxed) {
+            if let Some(mbox) = self.mbox.lock().as_ref() {
+                mbox.hold_rx();
+            }
+        }
+    }
+
+    fn sleep_release_rx(&self) {
+        if self.sleep_rx_held.xchg(false, Relaxed) {
+            if let Some(mbox) = self.mbox.lock().as_ref() {
+                mbox.release_rx();
+            }
+        }
+    }
+
+    /// A refused precommit attempt was never sent; reopen normal admission.
+    /// A sent request can be restarted only after actual physical sleep/wake.
+    pub(crate) fn sleep_exit(&self) {
+        // Staged only: an unsent refusal releases RX without a restart.
+        match pm::commit_finish(&self.dev) {
+            Some(true) => self.set_sleep_gate(pm::SleepGate::Told),
+            Some(false) => self.sleep_release_rx(),
+            None => {}
+        }
+        let gate = self.sleep_gate();
+        if gate == pm::SleepGate::Draining {
+            self.set_sleep_gate(pm::SleepGate::Open);
+            return;
+        }
+        if !gate.needs_wake() {
+            return;
+        }
+        // SAFETY: only reads a flag.
+        let real = unsafe { bindings::pm_resume_via_firmware() };
+        if !real && gate == pm::SleepGate::Lost {
+            return;
+        }
+        if !real {
+            // commit_finish already terminates a current sent-without-sleep case.
+            // An old lost state must not cause mailbox or DART accesses here.
+            self.set_sleep_gate(pm::SleepGate::Lost);
+            return;
+        }
+        let answered = self.sleep_kick();
+        match answered {
+            Ok(()) => {
+                self.set_sleep_gate(pm::SleepGate::Open);
+                // One line per sleep it was told of: nothing else says it came back.
+                dev_info_ratelimited!(self.dev, "the enclave is back from its sleep request\n");
+            }
+            Err(e) => {
+                dev_err_ratelimited!(
+                    self.dev,
+                    "the enclave did not come back ({:?}); it stays unused until a reboot\n",
+                    e
+                );
+                self.sleep_hold_rx();
+                self.set_sleep_gate(pm::SleepGate::Lost);
+            }
+        }
+    }
+
+    /// Starts a gated enclave and waits for the messages that say it's up.
+    fn sleep_kick(&self) -> Result<()> {
+        pm::clear_dev_disable(&self.dev)?;
+        pm::dart_restore(&self.dev);
+        // Arm completion before the held receive IRQ can deliver an early wake.
+        self.control.lock().wake_reset();
+        self.sleep_release_rx();
+        match self.mbox.lock().as_ref() {
+            Some(mbox) => {
+                mbox.set_recv_enabled(true);
+                Self::ring(mbox, proto::WAKE_KICK)?;
+            }
+            None => return Err(ENODEV),
+        }
+        let mut remaining = time::msecs_to_jiffies(proto::CONTROL_TIMEOUT_MS);
+        let mut guard = self.control.lock();
+        loop {
+            if guard.wake_complete() {
+                return Ok(());
+            }
+            if remaining == 0 {
+                return Err(ETIMEDOUT);
+            }
+            match self
+                .control_wq
+                .wait_interruptible_timeout(&mut guard, remaining)
+            {
+                CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
+                CondVarTimeoutResult::Signal { jiffies } => remaining = jiffies,
+                CondVarTimeoutResult::Timeout => remaining = 0,
+            }
+        }
     }
 
     /// Puts `msg` in the mailbox once the enclave can see what the CPU wrote
@@ -1431,6 +1640,16 @@ impl SepData {
             return Err(e);
         }
 
+        self.control_wait(op, idx, tag)
+    }
+
+    /// Waits for the answer to the request sent under `idx` and `tag`.
+    fn control_wait(
+        &self,
+        op: &proto::ControlOp,
+        idx: usize,
+        tag: u8,
+    ) -> Result<Option<proto::ControlReply>> {
         let mut remaining = time::msecs_to_jiffies(op.timeout_ms());
         let mut guard = self.control.lock();
         loop {
@@ -1574,7 +1793,7 @@ impl SepData {
         }
         let mbox = self.mbox.lock();
         let mbox = mbox.as_ref().ok_or(ENODEV)?;
-        if !self.control.lock().entropy_may_send() {
+        if !self.sleep_gate().may_request() || !self.control.lock().entropy_may_send() {
             return Err(EAGAIN);
         }
         Self::ring(mbox, msg)
@@ -2018,7 +2237,7 @@ impl SepData {
             );
         }
         let msg = crate::xarm::encode_xarm_reply(reply);
-        let _ = self.send(msg);
+        let _ = self.send_reply(msg);
     }
 
     fn release_deferred_query(&self) {
@@ -2805,6 +3024,8 @@ impl SepData {
 
     fn on_control(&self, msg: Message, f: proto::Fields) {
         if f.ty != proto::CONTROL_REPLY_TYPE {
+            self.control.lock().wake_note(f.ty);
+            self.control_wq.notify_all();
             return;
         }
 
@@ -3156,6 +3377,11 @@ impl platform::Driver for SepDriver {
     type Data<'bound> = SepDriver;
 
     const OF_ID_TABLE: Option<of::IdTable<()>> = Some(&OF_TABLE);
+
+    fn pm_ops() -> Option<&'static bindings::dev_pm_ops> {
+        // SAFETY: a static in `pm_shim.c`, never written.
+        Some(unsafe { &*core::ptr::addr_of!(pm::sep_pm_ops) })
+    }
 
     fn probe<'bound>(
         pdev: &'bound platform::Device<device::Core<'_>>,

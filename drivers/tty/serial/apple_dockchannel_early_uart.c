@@ -16,13 +16,15 @@
 
 static struct dockchannel_tx dockchannel_early_tx;
 static bool dockchannel_early_never_wait;
+/* The last character timed out: see dockchannel_wait_putc(). */
+static bool dockchannel_early_no_reader;
 
 static void dockchannel_uart_putc(struct uart_port *port, unsigned char c)
 {
 	if (dockchannel_early_never_wait)
 		dockchannel_console_putc(port->membase, &dockchannel_early_tx, c);
 	else
-		dockchannel_wait_putc(port->membase, c);
+		dockchannel_wait_putc(port->membase, &dockchannel_early_no_reader, c);
 }
 
 /* The DT's DockChannel UART node asks for DOCKCHANNEL_NEVER_WAIT (flat DT). */

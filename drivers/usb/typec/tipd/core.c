@@ -17,6 +17,8 @@
 #include <linux/regmap.h>
 #include <linux/unaligned.h>
 #include <linux/usb/pd.h>
+#include <linux/soc/apple/sleep.h>
+#include <linux/suspend.h>
 #include <linux/usb/typec.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
@@ -663,11 +665,35 @@ static int cd321x_mux_set(struct cd321x *cd321x, bool *held)
 	return ret;
 }
 
-/* A held mux is retried: report only the first failure of the series. */
-static bool cd321x_mux_still_held(struct cd321x *cd321x, bool held)
+/*
+ * Report a change the mux failed. A mux that @held the change up is retried
+ * (see cd321x_retry_held_mux()), and the hold-up is a fault worth a warning
+ * only once the retries end, as cd321x_mux_gave_up() reports. Any other
+ * failure is a fault now.
+ */
+VISIBLE_IF_KUNIT void cd321x_mux_failed(struct cd321x *cd321x, const char *what, int ret,
+					bool held)
 {
-	return held && cd321x->pm.mux_retry_ms;
+	KUNIT_STATIC_STUB_REDIRECT(cd321x_mux_failed, cd321x, what, ret, held);
+
+	if (held)
+		dev_dbg(cd321x->tps.dev, "%s, still held up: %d\n", what, ret);
+	else
+		dev_warn(cd321x->tps.dev, "%s: %d\n", what, ret);
 }
+EXPORT_SYMBOL_IF_KUNIT(cd321x_mux_failed);
+
+/* The retries of a change that a mux held up have ended (see cd321x_pm_mux_held()). */
+VISIBLE_IF_KUNIT void cd321x_mux_gave_up(struct cd321x *cd321x, unsigned int retries,
+					 unsigned int held_ms)
+{
+	KUNIT_STATIC_STUB_REDIRECT(cd321x_mux_gave_up, cd321x, retries, held_ms);
+
+	dev_warn(cd321x->tps.dev,
+		 "Type-C mux still held up after %u retries in %u s, waiting for the next event\n",
+		 retries, held_ms / 1000);
+}
+EXPORT_SYMBOL_IF_KUNIT(cd321x_mux_gave_up);
 
 /*
  * The HPD level of a DisplayPort partner. DATA_STATUS reports it. An
@@ -913,13 +939,12 @@ out:
 		/* A provider that is not ready yet asks for a retry. */
 		if (ret == -EAGAIN)
 			dev_dbg(tps->dev, "Type-C connection deferred\n");
-		else if (cd321x_mux_still_held(cd321x, *held))
-			dev_dbg(tps->dev, "Type-C connection still held up: %d\n", ret);
 		/* The DCP route says which display waits; USB goes on. */
 		else if (cd321x_display_taken(ret))
 			dev_dbg(tps->dev, "Type-C display waits for a free pipeline: %d\n", ret);
 		else
-			dev_warn(tps->dev, "failed to configure Type-C connection: %d\n", ret);
+			cd321x_mux_failed(cd321x, "failed to configure Type-C connection", ret,
+					  *held);
 	} else if (cd321x->state.alt != cd321x->port_altmode_dp) {
 		cd321x->dp_status = 0;
 		cd321x->dp_conf = 0;
@@ -986,7 +1011,8 @@ static int cd321x_dp_release_first(struct cd321x *cd321x, bool *held)
 	ret = typec_mux_set(cd321x->mux, &state);
 	*held = cd321x_mux_held(cd321x, ret);
 	if (ret)
-		dev_warn(cd321x->tps.dev, "display not released before the port changes: %d\n", ret);
+		cd321x_mux_failed(cd321x, "display not released before the port changes", ret,
+				  *held);
 	else
 		cd321x->dp_status = dp_data.status;
 	return ret;
@@ -1028,9 +1054,7 @@ static void cd321x_retry_held_mux(struct cd321x *cd321x)
 		mod_delayed_work(system_freezable_wq, &cd321x->resume_work,
 				 msecs_to_jiffies(delay));
 	else if (!delay)
-		dev_warn(cd321x->tps.dev,
-			 "Type-C mux still held up after %u retries in %u s, waiting for the next event\n",
-			 retries, held_ms / 1000);
+		cd321x_mux_gave_up(cd321x, retries, held_ms);
 }
 
 static void cd321x_update_done(struct cd321x *cd321x)
@@ -1239,12 +1263,8 @@ static void cd321x_update_work(struct work_struct *work)
 		ret = cd321x_mux_set(cd321x, &held);
 		cd321x->state_valid = !ret;
 		if (ret) {
-			if (cd321x_mux_still_held(cd321x, held))
-				dev_dbg(tps->dev, "Type-C mux still held up: %d\n", ret);
-			else
-				dev_warn(tps->dev,
-					 "failed to place Type-C mux in safe mode: %d\n",
-					 ret);
+			cd321x_mux_failed(cd321x, "failed to place Type-C mux in safe mode", ret,
+					  held);
 			cd321x->state = old_state;
 			goto retry;
 		}
@@ -1591,9 +1611,183 @@ static void cd321x_prepare(struct tps6598x *tps)
 		cd321x_pm_prepare(&cd321x->pm);
 		cd321x->state_valid = false;
 	}
-	/* Gate scheduling first; neither worker may be drained under its mutex. */
+	/* Gate scheduling first; no worker may be drained under its mutex. */
 	cancel_delayed_work_sync(&cd321x->resume_work);
 	cancel_delayed_work_sync(&cd321x->update_work);
+	cancel_delayed_work_sync(&cd321x->rearm_work);
+
+	/* As macOS does a second or so before the commit, measured on the same controller. */
+	if (pm_suspend_via_firmware() && device_property_read_bool(tps->dev, "apple,sleep-ssps")) {
+		int ret;
+
+		guard(mutex)(&tps->lock);
+		ret = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S3);
+		if (ret)
+			dev_warn(tps->dev, "didn't take system power state S3: %d\n", ret);
+		else
+			dev_dbg(tps->dev, "system power state S3\n");
+	}
+}
+
+/* A try every 250 ms for 10 s */
+#define CD321X_REARM_TRIES	40
+#define CD321X_REARM_RETRY_MS	250
+
+static int cd321x_debug_cmd(struct tps6598x *tps, const char *cmd, size_t len, const u8 *in)
+{
+	u8 out = 0;
+	int ret;
+
+	ret = tps6598x_exec_cmd(tps, cmd, len, in, 1, &out);
+	return ret ?: (out & 0xf ? -EIO : 0);
+}
+
+/* The firmware rejects a command for the mode it is switching to until it has switched. */
+static int cd321x_wait_dbma(struct tps6598x *tps, bool on)
+{
+	u32 mode;
+	int ret, err;
+
+	err = read_poll_timeout(tps6598x_read32, ret,
+				ret || (!memcmp(&mode, modes[TPS_MODE_DBMA], 4) == on),
+				1000, 100000, false, tps, TPS_REG_MODE, &mode);
+	return ret ?: err;
+}
+
+/*
+ * The boot loader's sequence: unlock with the board's key, debug mode on, enable the debug
+ * VDM, debug mode off, lock. Debug mode is left and the lock set again after a failure too.
+ */
+static int cd321x_arm_debug_link(struct tps6598x *tps, const char *key, const char **step)
+{
+	static const u8 vdm[] = { 0x06, 0x46, 0x82, 0x01 };
+	static const u8 no_key[4];
+	u8 on = 1, off = 0;
+	int ret, err;
+
+	*step = "unlock";
+	ret = cd321x_debug_cmd(tps, "LOCK", sizeof(no_key), (const u8 *)key);
+	if (ret)
+		return ret;
+
+	*step = "debug mode";
+	ret = cd321x_debug_cmd(tps, "DBMa", 1, &on);
+	if (!ret)
+		ret = cd321x_wait_dbma(tps, true);
+	if (!ret) {
+		*step = "debug VDM";
+		ret = cd321x_debug_cmd(tps, "DVEn", sizeof(vdm), vdm);
+	}
+
+	err = cd321x_debug_cmd(tps, "DBMa", 1, &off);
+	if (!err)
+		err = cd321x_wait_dbma(tps, false);
+	if (err && !ret) {
+		*step = "leaving debug mode";
+		ret = err;
+	}
+	err = cd321x_debug_cmd(tps, "LOCK", sizeof(no_key), no_key);
+	if (err && !ret) {
+		*step = "lock";
+		ret = err;
+	}
+	return ret;
+}
+
+/*
+ * A sleep cut this port's debug link. Right after the wake the controller can reject the
+ * sequence, so a failed try is repeated until the link is back.
+ */
+static void cd321x_rearm_debug_link(struct cd321x *cd321x)
+{
+	struct tps6598x *tps = &cd321x->tps;
+	const char *key, *step;
+	int ret;
+
+	lockdep_assert_held(&tps->lock);
+	if (device_property_read_string(tps->dev, "apple,debug-lock-key", &key) ||
+	    strlen(key) != 4) {
+		cd321x->rearm_pending = false;
+		return;
+	}
+
+	ret = cd321x_arm_debug_link(tps, key, &step);
+	cd321x->rearm_tries++;
+	if (!ret) {
+		if (cd321x->rearm_tries > 1)
+			dev_info(tps->dev, "debug link rearmed, try %u\n", cd321x->rearm_tries);
+		cd321x->rearm_pending = false;
+		return;
+	}
+	if (cd321x->rearm_tries < CD321X_REARM_TRIES) {
+		mod_delayed_work(system_freezable_wq, &cd321x->rearm_work,
+				 msecs_to_jiffies(CD321X_REARM_RETRY_MS));
+		return;
+	}
+	dev_warn(tps->dev, "debug link not rearmed after %u tries: %s: %d\n",
+		 cd321x->rearm_tries, step, ret);
+	cd321x->rearm_pending = false;
+}
+
+/* The cut's cold reset, and how it waits for the contract to come back, see apple_sleep_usb_down(). */
+#define CD321X_REARM_RESET_AFTER	4
+#define CD321X_REARM_RESETS		3
+#define CD321X_RESET_MS			1000
+#define CD321X_CONTRACT_MS		5000
+
+static bool cd321x_has_contract(struct tps6598x *tps)
+{
+	u16 pwr;
+
+	return !tps6598x_read16(tps, TPS_REG_POWER_STATUS, &pwr) &&
+	       TPS_POWER_STATUS_CONNECTION(pwr) &&
+	       TPS_POWER_STATUS_PWROPMODE(pwr) == TYPEC_PWR_MODE_PD;
+}
+
+/*
+ * The debug VDM needs a PD contract. After a cut whose sleep was refused, the partner was
+ * found to have dropped it, both ends at default USB power, and no try could rearm the link.
+ * Do what the cut does when the contract doesn't come back: reset the controller again and
+ * wait for it. The controller then needs setting up as after the cut.
+ */
+static void cd321x_rearm_recover_contract(struct cd321x *cd321x)
+{
+	struct tps6598x *tps = &cd321x->tps;
+	int ms, ret;
+
+	lockdep_assert_held(&tps->lock);
+	cd321x->rearm_resets++;
+	dev_warn(tps->dev, "debug link: no contract with the partner, reset %u\n",
+		 cd321x->rearm_resets);
+	ret = tps6598x_exec_cmd_tmo(tps, "Gaid", 0, NULL, 0, NULL, 2000, 0);
+	if (ret)
+		dev_dbg(tps->dev, "reset command: %d\n", ret);
+	msleep(CD321X_RESET_MS);
+	for (ms = 0; ms < CD321X_CONTRACT_MS && !cd321x_has_contract(tps); ms += 50)
+		msleep(50);
+	if (ms < CD321X_CONTRACT_MS)
+		dev_info(tps->dev, "debug link: contract back %d ms after reset %u\n",
+			 CD321X_RESET_MS + ms, cd321x->rearm_resets);
+	cd321x->pm.setup_pending = true;
+	cd321x->reset_by_cut = true;
+	cd321x->state_valid = false;
+	mod_delayed_work(system_freezable_wq, &cd321x->resume_work, 0);
+	cd321x->rearm_tries = 0;
+}
+
+static void cd321x_rearm_work(struct work_struct *work)
+{
+	struct cd321x *cd321x = container_of(to_delayed_work(work), struct cd321x, rearm_work);
+	struct tps6598x *tps = &cd321x->tps;
+
+	guard(mutex)(&tps->lock);
+	if (!cd321x->rearm_pending || cd321x->pm.phase == CD321X_PM_PREPARED ||
+	    cd321x->pm.phase == CD321X_PM_REMOVED)
+		return;
+	if (cd321x->rearm_tries >= CD321X_REARM_RESET_AFTER &&
+	    cd321x->rearm_resets < CD321X_REARM_RESETS && !cd321x_has_contract(tps))
+		cd321x_rearm_recover_contract(cd321x);
+	cd321x_rearm_debug_link(cd321x);
 }
 
 static void cd321x_complete(struct tps6598x *tps)
@@ -1601,6 +1795,27 @@ static void cd321x_complete(struct tps6598x *tps)
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
 
 	guard(mutex)(&tps->lock);
+	/*
+	 * The cut was a cold reset of this controller's firmware: its interrupt mask and power
+	 * state are back at their defaults, so set them up again whether or not an event comes.
+	 */
+	if (apple_sleep_debug_link_cut_peek(tps->dev)) {
+		cd321x->pm.setup_pending = true;
+		cd321x->reset_by_cut = true;
+	}
+	if (pm_suspend_via_firmware() && device_property_read_bool(tps->dev, "apple,sleep-ssps"))
+		tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
+	/*
+	 * A link still down from an earlier sleep isn't cut again, so it stays pending. A dark
+	 * wake sleeps again at once: the link stays down for it, and the full wake rearms it.
+	 */
+	if (apple_sleep_debug_link_was_cut(tps->dev))
+		cd321x->rearm_pending = true;
+	if (cd321x->rearm_pending && !pm_dark_wake()) {
+		cd321x->rearm_tries = 0;
+		cd321x->rearm_resets = 0;
+		cd321x_rearm_debug_link(cd321x);
+	}
 	if (cd321x_pm_resume(&cd321x->pm))
 		mod_delayed_work(system_freezable_wq, &cd321x->resume_work, 0);
 }
@@ -1670,8 +1885,11 @@ static int cd321x_check_setup(struct cd321x *cd321x, u64 event)
 			dev_err(tps->dev, "controller setup recovery exhausted: %d\n", ret);
 		return ret;
 	}
-	if (ret)
+	if (ret && cd321x->reset_by_cut)
+		dev_dbg(tps->dev, "set up again after the debug link's cut\n");
+	else if (ret)
 		dev_warn(tps->dev, "restored controller power state and interrupt mask\n");
+	cd321x->reset_by_cut = false;
 	/* Only a fresh snapshot may be applied after restoring the controller. */
 	cd321x->state_valid = false;
 	cd321x->pm.phase = CD321X_PM_REVALIDATE;
@@ -2222,6 +2440,7 @@ VISIBLE_IF_KUNIT void cd321x_stop_work(struct cd321x *cd321x)
 	}
 	cancel_delayed_work_sync(&cd321x->resume_work);
 	cancel_delayed_work_sync(&cd321x->update_work);
+	cancel_delayed_work_sync(&cd321x->rearm_work);
 }
 EXPORT_SYMBOL_IF_KUNIT(cd321x_stop_work);
 
@@ -2352,6 +2571,7 @@ VISIBLE_IF_KUNIT void cd321x_init_work(struct cd321x *cd321x)
 {
 	INIT_DELAYED_WORK(&cd321x->update_work, cd321x_update_work);
 	INIT_DELAYED_WORK(&cd321x->resume_work, cd321x_resume_work);
+	INIT_DELAYED_WORK(&cd321x->rearm_work, cd321x_rearm_work);
 	INIT_WORK(&cd321x->tbt_attach_work, cd321x_tbt_attach_work);
 	atomic_set(&cd321x->link_event, 0);
 	atomic_set(&cd321x->ready_event, 0);
@@ -3232,6 +3452,87 @@ void tipd_remove(struct tps6598x *tps)
 		gpiod_set_value_cansleep(tps->reset, 1);
 }
 EXPORT_SYMBOL_GPL(tipd_remove);
+
+/*
+ * macOS tells the port controller of a USB root port with dock-remote-wake when that port
+ * sleeps, and the controller then watches the USB2 lines for a remote wakeup (static; what its
+ * firmware does with it isn't known). The J700's root port has none, but measured on a J700,
+ * a USB keyboard on a connector wakes it this way. The mode goes by the speed on the port: 0x09
+ * for full and high speed. At the wake the controller hands the lines back before the port
+ * resumes. Only a firmware-driven sleep needs this, and a failure only logs.
+ */
+#define TIPD_USBW_HIGH_SPEED	0x09
+#define TIPD_USBW_HAND_BACK	0x80
+#define TIPD_USBW_OFF		0x00
+
+static void tipd_usbw(struct tps6598x *tps, u8 mode)
+{
+	int ret;
+
+	guard(mutex)(&tps->lock);
+	ret = tps6598x_exec_cmd(tps, "USBw", sizeof(mode), &mode, 0, NULL);
+	if (ret)
+		dev_warn(tps->dev, "USBw %#x failed: %d\n", mode, ret);
+	else
+		dev_dbg(tps->dev, "USBw %#x\n", mode);
+}
+
+/* The fixed hub's port that the connector's USB2 pair goes to, from the graph, or 0. */
+static u32 tipd_hub_port(struct tps6598x *tps)
+{
+	struct fwnode_handle *con __free(fwnode_handle) =
+		device_get_named_child_node(tps->dev, "connector");
+	struct fwnode_handle *ep __free(fwnode_handle) =
+		fwnode_graph_get_endpoint_by_id(con, 0, 0, 0);
+	struct fwnode_handle *port __free(fwnode_handle) = fwnode_graph_get_remote_port(ep);
+	u32 reg = 0;
+
+	fwnode_property_read_u32(port, "reg", &reg);
+	return reg;
+}
+
+void tipd_usb_wake(struct tps6598x *tps, bool asleep)
+{
+	bool armed;
+
+	if (!pm_suspend_via_firmware() ||
+	    !device_property_read_bool(tps->dev, "apple,usb-remote-wake"))
+		return;
+	if (asleep) {
+		u32 port = tipd_hub_port(tps);
+		bool wake = apple_sleep_usb_port_can_wake(port);
+
+		/*
+		 * Only for a device on this connector that can wake. Armed without one, the
+		 * controller reported a USB2 plug at the sleep's entry and the sleep came straight
+		 * back, on an empty port and on one left with a passive adapter (measured on a
+		 * J700). A device plugged in during the sleep still wakes through the SMC's plug
+		 * event.
+		 */
+		if (wake)
+			dev_dbg(tps->dev, "a device on hub port %u can wake: arming USB wake\n",
+				port);
+		else
+			dev_dbg(tps->dev, "nothing on hub port %u can wake: USB wake not armed\n",
+				port);
+		scoped_guard(mutex, &tps->lock)
+			tps->usbw_armed = wake;
+		if (wake)
+			tipd_usbw(tps, TIPD_USBW_HIGH_SPEED);
+		return;
+	}
+	/* Out of S3 first: .complete would only come once the port has resumed. */
+	scoped_guard(mutex, &tps->lock) {
+		tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
+		armed = tps->usbw_armed;
+		tps->usbw_armed = false;
+	}
+	if (!armed)
+		return;
+	tipd_usbw(tps, TIPD_USBW_HAND_BACK);
+	tipd_usbw(tps, TIPD_USBW_OFF);
+}
+EXPORT_SYMBOL_GPL(tipd_usb_wake);
 
 int tipd_suspend(struct tps6598x *tps)
 {

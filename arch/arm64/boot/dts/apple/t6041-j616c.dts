@@ -26,10 +26,14 @@
 
 &wifi0 {
 	brcm,board-type = "apple,hostomel";
+	/* WLAN host wake (PCIe WAKE#), active high */
+	wake-gpios = <&pinctrl 39 GPIO_ACTIVE_HIGH>;
 };
 
 &bluetooth0 {
 	brcm,board-type = "apple,hostomel";
+	/* Bluetooth host wake (PCIe WAKE#), active high */
+	wake-gpios = <&pinctrl 40 GPIO_ACTIVE_HIGH>;
 };
 
 &panel {

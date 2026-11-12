@@ -564,7 +564,8 @@ static void mt_cal_work(struct work_struct *work)
 	int ret;
 
 	mutex_lock(&m->command_mutex);
-	if (!READ_ONCE(m->rf_ready))
+	/* Stopped for a sleep, the requests wait for the restart. */
+	if (!READ_ONCE(m->rf_ready) || READ_ONCE(m->hif_suspended))
 		goto unlock;
 	ret = mt_request_input(m, &oca, "mediatek/mt7932/oca2.bin");
 	if (ret)
@@ -633,6 +634,7 @@ int mt_register_interface(struct mt7932 *m)
 	INIT_WORK(&m->connect_work, mt_connect_work);
 	INIT_WORK(&m->disconnect_work, mt_disconnect_work);
 	INIT_WORK(&m->power_work, mt_power_work);
+	INIT_WORK(&m->wow_work, mt_wow_work);
 	init_completion(&m->assoc_start);
 	init_completion(&m->assoc_done);
 	init_completion(&m->disconnect_done);

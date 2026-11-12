@@ -22,7 +22,10 @@
 #include <linux/of_platform.h>
 #include <linux/overflow.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
 #include <linux/soc/apple/rtkit.h>
+#include <linux/soc/apple/sleep.h>
+#include <linux/suspend.h>
 #include <linux/unaligned.h>
 
 #define SMC_ENDPOINT			0x20
@@ -120,6 +123,14 @@ static void apple_smc_read_sram(struct apple_smc *smc, void *buf, size_t size)
 	memcpy_fromio(buf, smc->shmem.iomem, size);
 }
 
+/* In a noirq phase the mailbox's interrupt is off, so its reply has to be fetched. */
+static bool apple_smc_reply_arrived(struct apple_smc *smc)
+{
+	apple_rtkit_poll(smc->rtk);
+
+	return completion_done(&smc->cmd_done);
+}
+
 static int apple_smc_cmd_locked(struct apple_smc *smc, u64 cmd, u64 arg,
 				  u64 size, u64 wsize, u32 *ret_data)
 {
@@ -136,6 +147,9 @@ static int apple_smc_cmd_locked(struct apple_smc *smc, u64 cmd, u64 arg,
 		return -EIO;
 	if (smc->atomic_mode)
 		return -EIO;
+	/* Between the AP power notices the firmware expects no commands. */
+	if (smc->ap_notified)
+		return -EAGAIN;
 
 	reinit_completion(&smc->cmd_done);
 
@@ -152,7 +166,17 @@ static int apple_smc_cmd_locked(struct apple_smc *smc, u64 cmd, u64 arg,
 		return ret;
 	}
 
-	if (wait_for_completion_timeout(&smc->cmd_done, msecs_to_jiffies(SMC_TIMEOUT_MS)) <= 0) {
+	if (smc->polled) {
+		bool done;
+
+		ret = read_poll_timeout(apple_smc_reply_arrived, done, done, 100,
+					SMC_TIMEOUT_MS * USEC_PER_MSEC, false, smc);
+	} else {
+		ret = wait_for_completion_timeout(&smc->cmd_done,
+						  msecs_to_jiffies(SMC_TIMEOUT_MS)) > 0 ?
+		      0 : -ETIMEDOUT;
+	}
+	if (ret) {
 		dev_err(smc->dev, "Command timed out (%llx)", msg);
 		return -ETIMEDOUT;
 	}
@@ -598,6 +622,10 @@ static int apple_smc_probe(struct platform_device *pdev)
 					    ARRAY_SIZE(apple_smc_telemetry_devs),
 					    NULL, 0, NULL);
 
+	ret = devm_device_init_wakeup(dev);
+	if (ret)
+		return ret;
+
 	/* Enable notifications */
 	apple_smc_write_flag(smc, SMC_KEY(NTAP), true);
 	ret = devm_add_action_or_reset(dev, apple_smc_disable_notifications, smc);
@@ -634,10 +662,344 @@ static const struct of_device_id apple_smc_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, apple_smc_of_match);
 
+/*
+ * The SMC keeps running through a firmware-driven suspend. It is told first and
+ * stops last, and on a wake it hears first. In order, measured on T8140 and
+ * unverified on other SoCs: MBSE = slpw before any other coprocessor is told;
+ * MBSE = slpa and the AP power notice after all the others; on a wake the notice,
+ * MBSE and MBSW read, MBSE = waka. The noirq phases give that order whatever the
+ * device order is, so these commands poll. What the values mean is inferred
+ * from their letters.
+ *
+ * SMC.OutboxNotEmpty wakes the SoC while anything waits in the outbox. An event that arrives
+ * during the sleep's entry (the lid, a key) is left there, so the sleep returns at once.
+ *
+ * The debug link's cut, on a debug cable only, makes the SMC see a cable pulled and plugged
+ * back. With the cut after slpw, the SMC woke the AP right after the commit, for USB-C_plug
+ * or acdetach, in every such sleep (J700, 223 of 223), even with its outbox quiet for 500 ms
+ * before the notice. A sleep that cuts the link warns the SMC only after the cut.
+ */
+
+/* The gaps macOS leaves before the AP idle notice and after it. */
+#define SMC_SLEEP_ARM_MS	6
+#define SMC_SLEEP_IDLE_MS	30
+/*
+ * Between a late warning (a sleep that cut the debug link) and slpa. macOS's shortest gap
+ * was 770 ms; the warning at .prepare leaves 150-500 ms, and those sleeps run to the alarm.
+ */
+#define SMC_SLEEP_WARN_MS	200
+
+/* After the debug link's cut. No message came in it in any logged sleep. */
+#define SMC_OUTBOX_QUIET_MS	100
+#define SMC_OUTBOX_SETTLE_MS	5000
+
+static int apple_smc_ap_power(struct apple_smc *smc, bool on)
+{
+	if (IS_ENABLED(CONFIG_MFD_MACSMC_KUNIT_TEST))
+		KUNIT_STATIC_STUB_REDIRECT(apple_smc_ap_power, smc, on);
+
+	return smc->polled ? apple_rtkit_ap_power_noirq(smc->rtk, on) :
+			     apple_rtkit_ap_power(smc->rtk, on);
+}
+
+static void apple_smc_set_ap_notified(struct apple_smc *smc, bool notified)
+{
+	guard(mutex)(&smc->mutex);
+
+	smc->ap_notified = notified;
+}
+
+static void apple_smc_set_polled(struct apple_smc *smc, bool polled)
+{
+	guard(mutex)(&smc->mutex);
+
+	smc->polled = polled;
+}
+
+static void apple_smc_write_mbse(struct apple_smc *smc, smc_key value)
+{
+	int ret;
+
+	ret = apple_smc_write_u32(smc, SMC_KEY(MBSE), value);
+	if (ret)
+		dev_err(smc->dev, "Failed to issue MBSE = %p4ch: %d\n", &value, ret);
+}
+
+static void apple_smc_sleep_warn(struct apple_smc *smc)
+{
+	apple_smc_write_mbse(smc, SMC_KEY(slpw));
+	smc->sleep_warned = true;
+}
+
+static int apple_smc_notice_idle(struct apple_smc *smc)
+{
+	int ret;
+
+	/*
+	 * Commands fail from here on. The mutex isn't held across the notice: the
+	 * answer comes through the same worker as the notifications, and those can
+	 * be waiting for this mutex.
+	 */
+	apple_smc_set_ap_notified(smc, true);
+
+	ret = apple_smc_ap_power(smc, false);
+	if (ret) {
+		/* Taken and not answered, perhaps, so undo it. */
+		apple_smc_ap_power(smc, true);
+		apple_smc_set_ap_notified(smc, false);
+		dev_err(smc->dev, "SMC did not take the sleep notice: %d\n", ret);
+	} else {
+		dev_dbg(smc->dev, "AP idle notice answered\n");
+	}
+
+	return ret;
+}
+
+static int apple_smc_sleep_commit(struct apple_smc *smc)
+{
+	int ret;
+
+	apple_smc_write_mbse(smc, SMC_KEY(slpa));
+	/* Device interrupts are off here. */
+	mdelay(SMC_SLEEP_ARM_MS);
+
+	ret = apple_smc_notice_idle(smc);
+	if (!ret)
+		mdelay(SMC_SLEEP_IDLE_MS);
+
+	return ret;
+}
+
+/* MBSW's bits, as smc-pmu's event_name properties number them on T8140. Other SoCs differ. */
+static const struct {
+	u8 bit;
+	const char *name;
+} apple_smc_wake_reasons[] = {
+	{ 0, "pwrbtn" }, { 9, "ipd_touch" }, { 10, "lid" }, { 16, "ipd_kbd" },
+	{ 18, "charger" }, { 23, "wifibt" }, { 40, "acattach" }, { 41, "acdetach" },
+	{ 42, "USB-C_plug" }, { 43, "USB2_plug" }, { 44, "USB2_wake" }, { 45, "aupo" },
+	{ 48, "rtc" },
+};
+
+static int apple_smc_wake_reason_names(u64 record, char *buf, size_t size)
+{
+	int i, len = 0;
+
+	buf[0] = 0;
+	for (i = 0; i < ARRAY_SIZE(apple_smc_wake_reasons); i++)
+		if (record & BIT_ULL(apple_smc_wake_reasons[i].bit))
+			len += scnprintf(buf + len, size - len, "%s%s", len ? " " : "",
+					 apple_smc_wake_reasons[i].name);
+
+	return len;
+}
+
+/* Returns whether MBSW was read. */
+static bool apple_smc_notice_on(struct apple_smc *smc)
+{
+	u8 record[8] = {};
+	char names[128];
+	u32 event = 0;
+	int ret;
+
+	ret = apple_smc_ap_power(smc, true);
+	if (ret)
+		dev_err(smc->dev, "SMC did not take the wake notice: %d\n", ret);
+	apple_smc_set_ap_notified(smc, false);
+
+	ret = apple_smc_read_u32(smc, SMC_KEY(MBSE), &event);
+	if (ret)
+		dev_warn(smc->dev, "Failed to read MBSE after a wake: %d\n", ret);
+	ret = apple_smc_read(smc, SMC_KEY(MBSW), record, sizeof(record));
+	if (ret < 0)
+		dev_warn(smc->dev, "Failed to read MBSW after a wake: %d\n", ret);
+
+	smc->wake_record = get_unaligned_le64(record);
+	apple_smc_wake_reason_names(smc->wake_record, names, sizeof(names));
+	dev_info(smc->dev, "wake record: MBSE %#x, MBSW %8ph%s%s\n", event, record,
+		 names[0] ? ": " : "", names);
+
+	return ret >= 0;
+}
+
+/* MBSW's bit for a wake reason, by its name, or -1. */
+static int apple_smc_wake_reason_bit(const char *name)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(apple_smc_wake_reasons); i++)
+		if (!strcmp(apple_smc_wake_reasons[i].name, name))
+			return apple_smc_wake_reasons[i].bit;
+
+	return -1;
+}
+
+/*
+ * Tell the sleep driver where the lid is now, for the display. Woken for the lid alone,
+ * which the SMC reports for the lid opening and for it closing: also if it's closed now.
+ */
+static void apple_smc_lid_wake(struct apple_smc *smc)
+{
+	int bit = apple_smc_wake_reason_bit("lid");
+	bool lid_alone = bit >= 0 && smc->wake_record == BIT_ULL(bit);
+	u8 lid = 0;
+	int ret;
+
+	/* No MSLD on a machine without a lid: the display then isn't told either way. */
+	ret = apple_smc_read_u8(smc, SMC_KEY(MSLD), &lid);
+	if (ret < 0) {
+		if (lid_alone)
+			dev_warn(smc->dev, "Failed to read the lid after a wake: %d\n", ret);
+		return;
+	}
+	apple_sleep_lid_at_wake(lid);
+	if (!lid_alone)
+		return;
+	dev_info(smc->dev, "woken for the lid, which is %s\n", lid ? "closed" : "open");
+	if (lid)
+		apple_sleep_lid_closed_wake();
+}
+
+/* Only what a cable pulled and plugged back reports: what the debug link's cut makes. */
+static bool apple_smc_port_reasons_only(u64 record)
+{
+	static const char * const names[] = { "acattach", "acdetach", "USB-C_plug" };
+	u64 port = 0;
+	int i, bit;
+
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		bit = apple_smc_wake_reason_bit(names[i]);
+		if (bit >= 0)
+			port |= BIT_ULL(bit);
+	}
+
+	return record && !(record & ~port);
+}
+
+static void apple_smc_sleep_wake(struct apple_smc *smc)
+{
+	/* Zero when nothing the SMC watches woke the AP: the PMU's RTC, for one. */
+	if (apple_smc_notice_on(smc))
+		apple_sleep_radio_at_wake(smc->wake_record &
+					  BIT_ULL(apple_smc_wake_reason_bit("wifibt")));
+	apple_smc_write_mbse(smc, SMC_KEY(waka));
+	smc->sleep_warned = false;
+	apple_smc_lid_wake(smc);
+	if (apple_smc_port_reasons_only(smc->wake_record))
+		apple_sleep_debug_link_cut_wake();
+	/* A dark wake isn't one: with wakeup_count in use, it would abort the sleep after it. */
+	if (smc->wake_record && !pm_dark_wake())
+		pm_wakeup_event(smc->dev, 0);
+}
+
+static int apple_smc_prepare(struct device *dev)
+{
+	struct apple_smc *smc = dev_get_drvdata(dev);
+
+	if (!pm_suspend_via_firmware())
+		return 0;
+	if (apple_sleep_debug_link_up())
+		smc->sleep_warn_late = true;
+	else
+		apple_smc_sleep_warn(smc);
+
+	return 0;
+}
+
+/* Warned, and a refusal came before the notice: tell it the sleep is off. */
+static void apple_smc_complete(struct device *dev)
+{
+	struct apple_smc *smc = dev_get_drvdata(dev);
+
+	smc->sleep_warn_late = false;
+	if (smc->sleep_warned) {
+		apple_smc_write_mbse(smc, SMC_KEY(waka));
+		smc->sleep_warned = false;
+	}
+}
+
+/*
+ * For at least @min_ms, then until the outbox is quiet for @quiet_ms. The events go to their
+ * handlers as usual, through the RTKit worker.
+ */
+static void apple_smc_outbox_poll(struct apple_smc *smc, const char *after,
+				  unsigned int min_ms, unsigned int quiet_ms)
+{
+	unsigned int ms, quiet = 0, count = 0, last = 0;
+	int ret;
+
+	if (IS_ENABLED(CONFIG_MFD_MACSMC_KUNIT_TEST))
+		KUNIT_STATIC_STUB_REDIRECT(apple_smc_outbox_poll, smc, after, min_ms, quiet_ms);
+
+	for (ms = 0; ms < SMC_OUTBOX_SETTLE_MS && (ms < min_ms || quiet < quiet_ms); ms++) {
+		ret = apple_rtkit_poll(smc->rtk);
+		if (ret > 0) {
+			count += ret;
+			last = ms;
+			quiet = 0;
+		} else {
+			quiet++;
+		}
+		usleep_range(1000, 1200);
+	}
+	/* A debug cable only. */
+	dev_info(smc->dev, "%s: %u messages in %u ms, the last at %u ms%s\n", after, count, ms,
+		 last, ms >= SMC_OUTBOX_SETTLE_MS ? ", still busy" : "");
+}
+
+/* The noirq suspend's part, polled: the cut, a late warning, the commit's notices. */
+static int apple_smc_sleep_enter(struct apple_smc *smc)
+{
+	if (apple_sleep_debug_link_cut())
+		apple_smc_outbox_poll(smc, "debug link cut", 0, SMC_OUTBOX_QUIET_MS);
+	if (smc->sleep_warn_late) {
+		smc->sleep_warn_late = false;
+		apple_smc_sleep_warn(smc);
+		apple_smc_outbox_poll(smc, "late sleep warning", SMC_SLEEP_WARN_MS, 0);
+	}
+
+	return apple_smc_sleep_commit(smc);
+}
+
+static int apple_smc_suspend_noirq(struct device *dev)
+{
+	struct apple_smc *smc = dev_get_drvdata(dev);
+	int ret;
+
+	if (!smc->sleep_warned && !smc->sleep_warn_late)
+		return 0;
+
+	apple_smc_set_polled(smc, true);
+	ret = apple_smc_sleep_enter(smc);
+	apple_smc_set_polled(smc, false);
+
+	return ret;
+}
+
+static int apple_smc_resume_noirq(struct device *dev)
+{
+	struct apple_smc *smc = dev_get_drvdata(dev);
+
+	if (smc->ap_notified) {
+		apple_smc_set_polled(smc, true);
+		apple_smc_sleep_wake(smc);
+		apple_smc_set_polled(smc, false);
+	}
+
+	return 0;
+}
+
+static const struct dev_pm_ops apple_smc_pm_ops = {
+	.prepare = pm_sleep_ptr(apple_smc_prepare),
+	.complete = pm_sleep_ptr(apple_smc_complete),
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_smc_suspend_noirq, apple_smc_resume_noirq)
+};
+
 static struct platform_driver apple_smc_driver = {
 	.driver = {
 		.name = "macsmc",
 		.of_match_table = apple_smc_of_match,
+		.pm = pm_sleep_ptr(&apple_smc_pm_ops),
 	},
 	.probe = apple_smc_probe,
 };

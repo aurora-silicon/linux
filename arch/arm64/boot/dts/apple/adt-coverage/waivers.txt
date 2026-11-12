@@ -593,11 +593,6 @@ t8140-j700 /arm-io/mtp-aop-mux | Logical firmware service or diagnostic view; re
 t8140-j700 /arm-io/nco | Logical firmware service or diagnostic view; represented through coprocessor discovery, not an independent AP device.
 t8140-j700 /arm-io/pmgr/power-devices/AFCMCCNI0 | Virtual PMGR vote; no independent power-state register.
 t8140-j700 /arm-io/pmgr/power-devices/AFIAFT | Virtual PMGR vote; no independent power-state register.
-t8140-j700 /arm-io/pmgr/power-devices/AFIMCCNI0 | Virtual PMGR vote; no independent power-state register.
-t8140-j700 /arm-io/pmgr/power-devices/AFINS0 | Virtual PMGR vote; no independent power-state register.
-t8140-j700 /arm-io/pmgr/power-devices/AFISOCNI0 | Virtual PMGR vote; no independent power-state register.
-t8140-j700 /arm-io/pmgr/power-devices/AFISOCNI1 | Virtual PMGR vote; no independent power-state register.
-t8140-j700 /arm-io/pmgr/power-devices/AFISOCNI2 | Virtual PMGR vote; no independent power-state register.
 t8140-j700 /arm-io/pmgr/power-devices/AMCC0_P0 | Virtual PMGR vote; no independent power-state register.
 t8140-j700 /arm-io/pmgr/power-devices/AMCC0_P1 | Virtual PMGR vote; no independent power-state register.
 t8140-j700 /arm-io/pmgr/power-devices/AMCC0_P2 | Virtual PMGR vote; no independent power-state register.
@@ -691,7 +686,6 @@ t8140-j700 /arm-io/pmgr/power-devices/PCPU_NRG | Virtual PMGR vote; no independe
 t8140-j700 /arm-io/pmgr/power-devices/PCPU_SRAM | Virtual PMGR vote; no independent power-state register.
 t8140-j700 /arm-io/pmgr/power-devices/PDM0_AUDIO_REF | Virtual PMGR vote; no independent power-state register.
 t8140-j700 /arm-io/pmgr/power-devices/PDM1_AUDIO_REF | Virtual PMGR vote; no independent power-state register.
-t8140-j700 /arm-io/pmgr/power-devices/PIOGW | Virtual PMGR vote; no independent power-state register.
 t8140-j700 /arm-io/pmgr/power-devices/PMS | Virtual PMGR vote; no independent power-state register.
 t8140-j700 /arm-io/pmgr/power-devices/PMS_BUSIF | Virtual PMGR vote; no independent power-state register.
 t8140-j700 /arm-io/pmgr/power-devices/PRORES-SOC-VMAX | Virtual PMGR vote; no independent power-state register.

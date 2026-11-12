@@ -168,6 +168,11 @@ struct ane_h16_session_ops {
 	 * hold a performance vote while any request is in flight.
 	 */
 	void (*busy)(void *ctx, bool busy);
+	/*
+	 * Optional. The engine is parked (off, no firmware) until a request needs
+	 * it: bring it up, or return an error if it can't come up now.
+	 */
+	int (*wake)(void *ctx);
 };
 
 /*
@@ -301,6 +306,10 @@ struct ane_h16_session {
 	 * ane_h16_session_enter() and closes are deferred to the reopen.
 	 */
 	bool asleep;
+	/* Off until the next request, which calls ops->wake first. */
+	bool parked;
+	/* A system sleep is under way: a parked engine can't come up until it ends. */
+	bool wake_blocked;
 	struct list_head deferred;
 	/*
 	 * Firmware boot count: a cold restart across system sleep loses every
@@ -354,6 +363,10 @@ struct ane_h16_session {
 int ane_h16_session_init(struct ane_h16_session *s, struct ane_fw_transport *transport,
 			 const struct ane_h16_session_ops *ops, void *ctx,
 			 u64 timeout_ns);
+int ane_h16_session_init_parked(struct ane_h16_session *s,
+				struct ane_fw_transport *transport,
+				const struct ane_h16_session_ops *ops, void *ctx,
+				u64 timeout_ns);
 int ane_h16_session_load(struct ane_h16_session *s,
 			 struct ane_h16_hwx_snapshot *snapshot,
 			 const void *const aux[ANE_H16_AUX_COUNT],

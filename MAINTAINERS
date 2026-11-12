@@ -2093,6 +2093,7 @@ F:	Documentation/devicetree/bindings/chosen/apple,dcp-rtkit-quiesced.yaml
 F:	Documentation/devicetree/bindings/chosen/aurora,ctxr-exec-window.yaml
 F:	Documentation/devicetree/bindings/display/apple,dcp.yaml
 F:	Documentation/devicetree/bindings/display/apple,display-subsystem.yaml
+F:	Documentation/devicetree/bindings/display/apple,t8140-display-power.yaml
 F:	Documentation/PCI/controller/apple-t8140.rst
 F:	Documentation/devicetree/bindings/iio/imu/apple,aop-motion.yaml
 F:	Documentation/devicetree/bindings/iio/light/apple,t8140-aop-als.yaml
@@ -2109,6 +2110,7 @@ F:	Documentation/devicetree/bindings/soc/apple/apple,rtk-helper-asc4.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,t6041-aop.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,t8140-aop.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,t8140-mcc.yaml
+F:	Documentation/devicetree/bindings/soc/apple/apple,t8140-sleep.yaml
 F:	Documentation/devicetree/bindings/sound/apple,t6041-aop-audio.yaml
 F:	Documentation/devicetree/bindings/sound/apple,t8140-aop-audio.yaml
 F:	Documentation/devicetree/bindings/usb/vialab,vl122.yaml
@@ -2130,8 +2132,10 @@ F:	drivers/phy/apple/atc-j700-dp.h
 F:	drivers/rtc/rtc-apple-pmu.c
 F:	drivers/soc/apple/aop.rs
 F:	drivers/soc/apple/mcc.c
+F:	drivers/soc/apple/sleep*.c
 F:	drivers/tty/serial/apple_dockchannel*
 F:	include/linux/soc/apple/pci-apple-piodma.h
+F:	include/linux/soc/apple/sleep.h
 F:	rust/kernel/iio/common/aop_sensors.rs
 F:	rust/kernel/soc/apple/aop.rs
 F:	sound/soc/apple/aop_t8140.rs
@@ -2750,6 +2754,7 @@ F:	Documentation/devicetree/bindings/power/reset/apple,smc-reboot.yaml
 F:	Documentation/devicetree/bindings/pwm/apple,s5l-fpwm.yaml
 F:	Documentation/devicetree/bindings/reset/apple,t8103-cio-reset.yaml
 F:	Documentation/devicetree/bindings/rtc/apple,smc-rtc.yaml
+F:	Documentation/devicetree/bindings/soc/apple/apple,cluster-pwrgate.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,t6000-pmgr-misc.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,sep.yaml
 F:	Documentation/devicetree/bindings/spi/apple,spi.yaml
@@ -2772,6 +2777,7 @@ F:	drivers/hwmon/macsmc-hwmon*.c
 F:	drivers/pmdomain/apple/
 F:	drivers/pmdomain/apple/.kunitconfig.apple-pmp
 F:	drivers/pmdomain/apple/.kunitconfig.pmgr-pwrstate
+F:	drivers/i2c/busses/i2c-dp855*
 F:	drivers/i2c/busses/i2c-pasemi-core.c
 F:	drivers/i2c/busses/i2c-pasemi-platform.c
 F:	drivers/input/misc/macsmc-input.c
@@ -2797,6 +2803,8 @@ F:	tools/asahi/apple-pwm-pm-tests.py
 F:	drivers/reset/reset-apple-cio.c
 F:	drivers/rtc/rtc-macsmc.c
 F:	drivers/soc/apple/*
+F:	tools/asahi/isp-preview-flow-tests.py
+F:	tools/asahi/isp-preview-tests.py
 F:	tools/asahi/m3-uapi-*
 F:	drivers/soc/apple/clpc.kunitconfig
 F:	tools/asahi/pmp-bootargs-tests.rs
@@ -2816,7 +2824,9 @@ F:	drivers/video/backlight/apple_dwi_bl.c
 F:	drivers/watchdog/apple_wdt.c
 F:	include/dt-bindings/interrupt-controller/apple-aic.h
 F:	include/dt-bindings/pinctrl/apple.h
+F:	include/linux/irqchip/irq-apple-aic.h
 F:	include/linux/mfd/macsmc.h
+F:	include/linux/phy/apple-atc.h
 F:	include/linux/soc/apple/*
 F:	include/uapi/drm/asahi_drm.h
 F:	include/uapi/linux/apple-sep.h

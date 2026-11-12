@@ -358,6 +358,26 @@ DCP_THUNK_OUT(dcp_finish_wake, dcpep_pipe_query_474, u32);
 IOMFB_THUNK_INOUT(abort_swaps_dcp);
 #endif
 
+#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
+static u64 __maybe_unused dcp_swap_time(void);
+
+/*
+ * macOS stamps every external swap, adaptive sync or not, in the firmware's
+ * 24 MHz continuous time: word 1 at the swap start, words 0, 4 and 6 at the
+ * submission. The panel keeps its own pacing timestamps.
+ */
+static bool dcp_external_swap_stamps(struct apple_dcp *dcp)
+{
+	return !dcp->main_display && !dcp_has_panel(dcp);
+}
+
+static void dcp_external_stamp_submit(struct apple_dcp *dcp, struct dcp_swap_v27 *swap)
+{
+	if (dcp_external_swap_stamps(dcp) && swap->timestamp[1])
+		swap->timestamp[0] = swap->timestamp[4] = swap->timestamp[6] = dcp_swap_time();
+}
+#endif
+
 #if DCP_FW_H17(DCP_FW_VER)
 static void dcp_swap_submit(struct apple_dcp *dcp, bool oob,
 			    struct dcp_swap_submit_req_h17p *request,
@@ -378,6 +398,7 @@ static void dcp_swap_submit(struct apple_dcp *dcp, bool oob,
 			dcp->present_h17p.swap[0x354] & 1;
 		dcp->present_v27.swap.brightness_nits =
 			get_unaligned_le64(dcp->present_h17p.swap + 0x35e);
+		dcp_external_stamp_submit(dcp, &dcp->present_v27.swap);
 		data = &dcp->present_v27;
 #else
 		data = &dcp->present_h17p;
@@ -540,6 +561,9 @@ DCP_THUNK_INOUT(dcp_pipe_cfg_414, dcpep_pipe_cfg_414, u64, u64);
 DCP_THUNK_OUT(dcp_pipe_query_478, dcpep_pipe_query_478, u32);
 DCP_THUNK_OUT(dcp_pipe_query_474, dcpep_pipe_query_474, u32);
 DCP_THUNK_IN(dcp_pipe_set_476, dcpep_pipe_set_476, u32);
+#if DCP_FW_VER < DCP_FW_VERSION(27, 0, 0)
+DCP_THUNK_IN(dcp_unnamed_500, dcpep_unnamed_500, u32);
+#endif
 #endif
 DCP_THUNK_INOUT(dcp_set_brightness_correction, iomfbep_set_brightness_correction, u32, u32);
 
@@ -2487,6 +2511,121 @@ static void complete_set_powerstate(struct apple_dcp *dcp, void *out,
 	}
 }
 
+/* V27 shares the h17p template prefix, but does not own its sleep RPCs. */
+#if DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER < DCP_FW_VERSION(27, 0, 0)
+/*
+ * set_power_state around a firmware-driven suspend. What macOS sends before it in
+ * either direction: A414(0), A478 twice, A476(1), A478, A412. All are named in
+ * this firmware's table, and their arguments are measured from macOS.
+ *
+ * For display on, macOS also sends A439 at the same moment. Its name isn't known,
+ * it carries a macOS kernel pointer and its reply wasn't captured, so it isn't
+ * sent here.
+ */
+enum dcp_s2r_step {
+	DCP_S2R_A414, DCP_S2R_A478, DCP_S2R_A476, DCP_S2R_A412, DCP_S2R_A473,
+};
+
+static const u8 dcp_s2r_seq[] = {
+	DCP_S2R_A414, DCP_S2R_A478, DCP_S2R_A478, DCP_S2R_A476, DCP_S2R_A478,
+	DCP_S2R_A412, DCP_S2R_A473,
+};
+
+static void dcp_s2r_run(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	unsigned int step = dcp->s2r_step++;
+
+	switch (dcp_s2r_seq[step]) {
+	case DCP_S2R_A414: {
+		u64 val = 0;
+
+		dcp_pipe_cfg_414(dcp, false, &val, dcp_s2r_run, cookie);
+		break;
+	}
+	case DCP_S2R_A478:
+		dcp_pipe_query_478(dcp, false, dcp_s2r_run, cookie);
+		break;
+	case DCP_S2R_A476: {
+		u32 val = 1;
+
+		dcp_pipe_set_476(dcp, false, &val, dcp_s2r_run, cookie);
+		break;
+	}
+	case DCP_S2R_A412:
+		dcp_is_main_display(dcp, false, dcp_s2r_run, cookie);
+		break;
+	case DCP_S2R_A473: {
+		/* Measured: the state, then 00 00 00 00 00 aa aa aa. */
+		struct DCP_FW_NAME(dcp_set_power_state_req) req = {
+			.unklong = dcp->s2r_power_on,
+			.padding = { 0xaa, 0xaa, 0xaa },
+		};
+
+		dcp_set_power_state(dcp, dcp->s2r_power_oob, &req,
+				    dcp->s2r_power_on ? dcp_on_final : complete_set_powerstate,
+				    cookie);
+		break;
+	}
+	}
+}
+
+static void dcp_s2r_500_done(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	struct dcp_wait_cookie *wait = cookie;
+
+	complete(&wait->done);
+	kref_put(&wait->refcount, release_wait_cookie);
+}
+
+/* Unnamed. macOS sends it after D572 on every display off, with these bytes. */
+int DCP_FW_NAME(iomfb_s2r_500)(struct apple_dcp *dcp)
+{
+	struct dcp_wait_cookie *cookie;
+	unsigned long left;
+	u32 val = 0xaaaa0000;
+
+	cookie = kzalloc_obj(*cookie);
+	if (!cookie)
+		return -ENOMEM;
+	init_completion(&cookie->done);
+	kref_init(&cookie->refcount);
+	/* increase refcount to ensure the receiver has a reference */
+	kref_get(&cookie->refcount);
+
+	dcp_unnamed_500(dcp, false, &val, dcp_s2r_500_done, cookie);
+
+	left = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(1000));
+	kref_put(&cookie->refcount, release_wait_cookie);
+
+	return left ? 0 : -ETIMEDOUT;
+}
+
+int DCP_FW_NAME(iomfb_s2r_power)(struct apple_dcp *dcp, bool on, bool named_calls, bool oob)
+{
+	struct dcp_wait_cookie *cookie;
+	unsigned long left;
+
+	cookie = kzalloc_obj(*cookie);
+	if (!cookie)
+		return -ENOMEM;
+	cookie->status = ~0U;
+	init_completion(&cookie->done);
+	kref_init(&cookie->refcount);
+	/* increase refcount to ensure the receiver has a reference */
+	kref_get(&cookie->refcount);
+
+	dcp->s2r_power_on = on;
+	dcp->s2r_power_oob = oob;
+	dcp->s2r_step = named_calls ? 0 : ARRAY_SIZE(dcp_s2r_seq) - 1;
+	dcp_s2r_run(dcp, NULL, cookie);
+
+	left = wait_for_completion_timeout(&cookie->done, msecs_to_jiffies(1000));
+	kref_put(&cookie->refcount, release_wait_cookie);
+
+	return left ? 0 : -ETIMEDOUT;
+}
+#endif
+
 static bool dcp_power_stop_confirmed(struct dcp_wait_cookie *cookie)
 {
 	/* H17P does not confirm that scanout has stopped. */
@@ -3273,6 +3412,16 @@ static void do_swap(struct apple_dcp *dcp, void *data, void *cookie)
 				smp_store_release(&dcp->brightness.update, true);
 			}
 		}
+#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
+		if (dcp_external_swap_stamps(dcp)) {
+			bool surface = false;
+
+			for (unsigned int i = 0; i < SWAP_SURFACES; i++)
+				surface |= !req->surf_null[i];
+			if (surface)
+				req->swap.timestamp[1] = dcp_swap_time();
+		}
+#endif
 		dcp_swap_start(dcp, false, &start_req, dcp_swap_started, NULL);
 	} else {
 		dcp_drm_crtc_vblank(dcp->crtc);
@@ -3840,6 +3989,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	struct dcp_display_mode selected, *mode = &selected;
 	struct dcp_wait_cookie *cookie;
 	struct dcp_color_mode *cmode = NULL;
+	bool paired = false;
 	int ret;
 
 	if (!lookup_mode(dcp, &crtc_state->mode, mode)) {
@@ -3907,10 +4057,17 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	} else
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
 	if ((ret = dcp_peer_modeset_v27(dcp, mode->timing_mode_id,
-				      mode->color_mode_id, crtc_state->vrr_enabled)) != -EOPNOTSUPP) {
+				      mode->color_mode_id,
+				      crtc_state->vrr_enabled && mode->vrr ? mode->min_vrr : 0)) != -EOPNOTSUPP) {
 		cookie->status = ret;
+		paired = true;
 		if (!ret)
 			crtc_state->color_mgmt_changed = true;
+		complete_set_digital_out_mode(dcp, NULL, cookie);
+	} else if (dcp_peer_needs_pair_v27(dcp, mode->mode.clock)) {
+		/* No pair for a timing one engine cannot drive: never single-pipe it. */
+		cookie->status = -EINVAL;
+		paired = true;
 		complete_set_digital_out_mode(dcp, NULL, cookie);
 	} else
 #endif
@@ -3948,6 +4105,13 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 			"set_digital_out_mode finished with %d to spare\n",
 			jiffies_to_msecs(ret));
 	}
+	/* A paired mode set that failed left the CRTC with no timing. */
+	if (paired && READ_ONCE(cookie->status)) {
+		ret = (int)READ_ONCE(cookie->status);
+		dev_err_ratelimited(dcp->dev, "paired mode set failed: %d\n", ret);
+		kref_put(&cookie->refcount, release_wait_cookie);
+		return ret;
+	}
 	/*
 	 * The external H17P display reports a link that does not come up
 	 * through its DPTX fault callbacks.  What the 32-bit result of the
@@ -3967,7 +4131,9 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	}
 	kref_put(&cookie->refcount, release_wait_cookie);
 	dcp->vrr_enabled = mode->vrr && crtc_state->vrr_enabled;
-	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL)
+	/* A firmware 27 pair took them on both engines (dcp_peer_finish_v27()). */
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL ||
+	    (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp_has_panel(dcp) && !paired))
 		dcp_external_hdr_hints(dcp, dcp->output_pq);
 
 	return 0;
