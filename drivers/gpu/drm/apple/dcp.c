@@ -9526,8 +9526,6 @@ static int dcp_t6041_s2r_stop(struct apple_dcp *dcp)
 	if (READ_ONCE(dcp->ext_dead) || READ_ONCE(dcp->crashed))
 		return dcp_t6041_s2r_stop_dead(dcp);
 
-	iomfb_v14_7_backlight_suspend(dcp);
-	dcp_drain_for_sleep(dcp);
 	dcp_t6041_s2r_stop_link_work(dcp);
 
 	/*
