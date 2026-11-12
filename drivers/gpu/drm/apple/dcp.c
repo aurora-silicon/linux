@@ -9451,6 +9451,63 @@ static void dcp_t6041_s2r_stop_link_work(struct apple_dcp *dcp)
 	cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
 }
 
+/*
+ * Whether any of the pipe's sub-blocks is on: by its target, as the sleep controller
+ * counts them. True without the power words.
+ */
+static bool dcp_t6041_s2r_blocks_on(struct apple_dcp *dcp)
+{
+	struct dcp_t6041_ps_offsets o;
+	void __iomem *ps, *pmc;
+	bool on = false;
+	u32 i;
+
+	if (!dcp_t6041_ps_offsets(dcp, &o) || dcp_t6041_display_power(dcp, &ps, &pmc))
+		return true;
+	for (i = 1; i <= o.blocks; i++)
+		if (readl(ps + o.cpu + 8 * i) & DCP_PS_TARGET)
+			on = true;
+	iounmap(ps);
+	iounmap(pmc);
+
+	return on;
+}
+
+/*
+ * A firmware that did not come back from an earlier sleep, or that crashed, takes no stop
+ * sequence, and must not refuse every later sleep: its CPU off again, nothing else. The
+ * wake starts a crashed external one once more; one given up on stays stopped.
+ *
+ * The internal pipe only when it is down already. DISP_CPU must not go down over
+ * sub-blocks that are on, and only its firmware takes a lit pipe down: a dead firmware
+ * that left the pipe powered still refuses the sleep. A crashed internal firmware is
+ * given up on here, as after a failed restart. A start that got as far as powering the
+ * pipe and then failed would leave it powered, and the machine unable to sleep again.
+ */
+static int dcp_t6041_s2r_stop_dead(struct apple_dcp *dcp)
+{
+	void __iomem *control = dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL;
+
+	if (!dcp_desktop_external(dcp)) {
+		if (dcp_t6041_s2r_blocks_on(dcp)) {
+			dev_err(dcp->dev,
+				"dead firmware left the pipe powered: the sleep is refused\n");
+			return -EBUSY;
+		}
+		WRITE_ONCE(dcp->hib_phase, DCP_HIB_FAILED);
+		WRITE_ONCE(dcp->ext_dead, true);
+	}
+	apple_rtkit_mailbox_off(dcp->rtk);
+	writel(readl(control) & ~APPLE_DCP_COPROC_CPU_CONTROL_RUN, control);
+	writel(readl(control) & ~(APPLE_DCP_COPROC_CPU_CONTROL_RUN |
+				  APPLE_DCP_COPROC_CPU_CONTROL_STOP_SECOND_CLEAR), control);
+	dcp_t6041_s2r_cpu_off(dcp);
+	dcp->t6041_s2r_stopped = true;
+	dev_info(dcp->dev, "dead firmware: CPU off for the sleep\n");
+
+	return 0;
+}
+
 static int dcp_t6041_s2r_stop(struct apple_dcp *dcp)
 {
 	void __iomem *control = dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL;
@@ -9458,25 +9515,10 @@ static int dcp_t6041_s2r_stop(struct apple_dcp *dcp)
 	bool idle;
 	int ret;
 
-	/*
-	 * An external firmware that did not come back from an earlier sleep, or that crashed,
-	 * has nothing left to quiesce, and must not refuse every later sleep: its CPU off
-	 * again, nothing else. The wake starts a crashed one once more; one given up on
-	 * stays stopped.
-	 */
-	if (dcp_desktop_external(dcp) && !IS_ERR_OR_NULL(dcp->rtk) &&
-	    (READ_ONCE(dcp->ext_dead) || READ_ONCE(dcp->crashed))) {
-		apple_rtkit_mailbox_off(dcp->rtk);
-		writel(readl(control) & ~APPLE_DCP_COPROC_CPU_CONTROL_RUN, control);
-		writel(readl(control) & ~(APPLE_DCP_COPROC_CPU_CONTROL_RUN |
-					  APPLE_DCP_COPROC_CPU_CONTROL_STOP_SECOND_CLEAR), control);
-		dcp_t6041_s2r_cpu_off(dcp);
-		dcp->t6041_s2r_stopped = true;
-		dev_info(dcp->dev, "dead external firmware: CPU off for the sleep\n");
-		return 0;
-	}
-	if (READ_ONCE(dcp->crashed) || IS_ERR_OR_NULL(dcp->rtk))
+	if (IS_ERR_OR_NULL(dcp->rtk))
 		return -EBUSY;
+	if (READ_ONCE(dcp->ext_dead) || READ_ONCE(dcp->crashed))
+		return dcp_t6041_s2r_stop_dead(dcp);
 
 	iomfb_v14_7_backlight_suspend(dcp);
 	dcp_drain_for_sleep(dcp);
