@@ -297,9 +297,17 @@ static void t6041_ps_lower(void __iomem *reg)
 /* One byte to a PMU register over nub-spmi0, as XNU's writes: command, then the data. */
 static void t6041_pmu_write(struct t6041_sleep *s, u16 reg, u8 val)
 {
+	unsigned int us;
+
 	writel((u32)reg << 16 | BIT(15) | PMU_SID << 8 | 0x30, s->spmi + SPMI_CMD);
 	writel(val, s->spmi + SPMI_CMD);
-	udelay(50);
+	/*
+	 * Take the reply once it is there. The controller stays powered through the sleep, so a
+	 * reply that comes in after we stop looking becomes the reply to the SPMI driver's next
+	 * command after the wake, which then fails as an unexpected response.
+	 */
+	for (us = 0; us < 1000 && (readl(s->spmi + SPMI_STATUS) & SPMI_RX_EMPTY); us++)
+		udelay(1);
 	while (!(readl(s->spmi + SPMI_STATUS) & SPMI_RX_EMPTY))
 		readl(s->spmi + 0x8);
 	/* macOS acknowledges every command here (its interrupt handler writes 1 to +0x80). */
