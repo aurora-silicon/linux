@@ -26,6 +26,10 @@
  * lists macOS was measured with, is each SoC's match data. Only SoCs measured
  * and tested that way are matched: on the others this driver doesn't bind, and
  * s2idle stays the only sleep.
+ *
+ * A SoC whose sequences differ in more than its lists brings them as a part
+ * (sleep-internal.h), and shares the registry of coprocessors with the rest:
+ * today T6040, in sleep-t6040.c.
  */
 
 #include <linux/bitfield.h>

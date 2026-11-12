@@ -2133,6 +2133,7 @@ F:	drivers/rtc/rtc-apple-pmu.c
 F:	drivers/soc/apple/aop.rs
 F:	drivers/soc/apple/mcc.c
 F:	drivers/soc/apple/sleep*.c
+F:	drivers/soc/apple/sleep-internal.h
 F:	drivers/tty/serial/apple_dockchannel*
 F:	include/linux/soc/apple/pci-apple-piodma.h
 F:	include/linux/soc/apple/sleep.h
