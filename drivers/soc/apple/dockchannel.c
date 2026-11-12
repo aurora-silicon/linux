@@ -536,7 +536,6 @@ static void dockchannel_remove(struct platform_device *pdev)
 	writel_relaxed(~0, dcc->irq_base + IRQ_FLAG);
 }
 
-#ifdef CONFIG_HIBERNATION
 /*
  * After a resume from disk the interrupt mask register holds what the boot
  * kernel left in it (nothing, if it never loaded this driver), while the
@@ -561,9 +560,8 @@ static int dockchannel_restore_noirq(struct device *dev)
 }
 
 static const struct dev_pm_ops dockchannel_pm_ops = {
-	.restore_noirq = dockchannel_restore_noirq,
+	.restore_noirq = pm_sleep_ptr(dockchannel_restore_noirq),
 };
-#endif
 
 static const struct of_device_id dockchannel_of_match[] = {
 	{ .compatible = "apple,dockchannel" },
@@ -575,9 +573,7 @@ static struct platform_driver dockchannel_driver = {
 	.driver = {
 		.name = "dockchannel",
 		.of_match_table = dockchannel_of_match,
-#ifdef CONFIG_HIBERNATION
-		.pm = &dockchannel_pm_ops,
-#endif
+		.pm = pm_sleep_ptr(&dockchannel_pm_ops),
 	},
 	.probe = dockchannel_probe,
 	.remove = dockchannel_remove,
