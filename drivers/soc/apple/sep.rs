@@ -728,6 +728,11 @@ struct SepData {
     // anything that powers the sensor off or resets it.
     sensor_kept: Atomic<bool>,
 
+    // The kept sensor reset itself under a verify capture (state 9, it asks
+    // for its patch again). The verify reports a retry, ends the prompt's
+    // match operation and drops the sensor, so the next try brings it up.
+    sensor_reset_in_capture: Atomic<bool>,
+
     // The enclave announced (SBIO tag 0x03) that a background operation
     // result is ready; it waits for the host to collect it with 0x21.
     bg_ops_ready: Atomic<bool>,
@@ -1147,6 +1152,7 @@ impl SepData {
                 match_context_generation: Atomic::new(0),
                 cold_match_contexts <- new_mutex!(KVec::new()),
                 sensor_kept: Atomic::new(false),
+                sensor_reset_in_capture: Atomic::new(false),
                 bg_ops_ready: Atomic::new(false),
                 persistence_owed: Atomic::new(false),
                 enrol_identity_candidates <- new_mutex!(KVec::new()),

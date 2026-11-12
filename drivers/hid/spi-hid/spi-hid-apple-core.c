@@ -281,6 +281,9 @@ static void spihid_flush_led_reports(struct spihid_apple *spihid)
 static struct spihid_interface *spihid_get_iface(struct spihid_apple *spihid,
 						 u32 iface);
 
+#define SPIHID_STATUS_MISMATCH_FMT \
+	"status message mismatch: %02x %02x %02x %02x (device %u request %02x report %02x id %u)\n"
+
 static int spihid_apple_request(struct spihid_apple *spihid, u8 target, u8 unk0,
 				u8 unk1, u8 unk2, u16 resp_len, u8 *buf,
 				    size_t len, bool *bad_status)
@@ -353,9 +356,20 @@ static int spihid_apple_request(struct spihid_apple *spihid, u8 target, u8 unk0,
 		*bad_status = status_mismatch;
 	if (status_mismatch) {
 		u8 *b = spihid->status_buf;
-		dev_warn_ratelimited(&spihid->spidev->dev,
-				     "status message mismatch: %02x %02x %02x %02x (device %u request %02x report %02x id %u)\n",
-				     b[0], b[1], b[2], b[3], target, unk0, unk1, hdr->id);
+
+		/*
+		 * A GET is retried with a fresh ID; spihid_get_report() reports
+		 * the outcome. SET and OUTPUT are single attempts: warn.
+		 */
+		if (unk0 == 0x32)
+			dev_dbg(&spihid->spidev->dev,
+				SPIHID_STATUS_MISMATCH_FMT, b[0], b[1], b[2], b[3],
+				target, unk0, unk1, hdr->id);
+		else
+			dev_warn_ratelimited(&spihid->spidev->dev,
+					     SPIHID_STATUS_MISMATCH_FMT,
+					     b[0], b[1], b[2], b[3], target,
+					     unk0, unk1, hdr->id);
 	}
 	/* Preserve best-effort SET/OUTPUT semantics; only GETs are replayable. */
 	if (status_mismatch && unk0 == 0x32)
@@ -426,6 +440,7 @@ static int spihid_get_report(struct spihid_apple *spihid,
 {
 	unsigned long flags;
 	int attempt, ret;
+	unsigned int rejected = 0;
 	bool bad_status, timed_out;
 
 	ret = mutex_lock_interruptible(&spihid->get_report_lock);
@@ -464,12 +479,22 @@ static int spihid_get_report(struct spihid_apple *spihid,
 		 */
 		if (!timed_out && !bad_status)
 			break;
+		if (bad_status)
+			rejected++;
 	}
 
 	mutex_unlock(&spihid->get_report_lock);
-	if (ret < 0)
+	if (ret < 0 && rejected)
+		dev_err(&spihid->spidev->dev,
+			"get report %02x failed: %d (bad status: %u)\n",
+			reportnum, ret, rejected);
+	else if (ret < 0)
 		dev_err(&spihid->spidev->dev,
 			"get report %02x failed: %d\n", reportnum, ret);
+	else if (rejected)
+		dev_info_ratelimited(&spihid->spidev->dev,
+				     "get report %02x recovered by retry (bad status: %u)\n",
+				     reportnum, rejected);
 	return ret;
 }
 

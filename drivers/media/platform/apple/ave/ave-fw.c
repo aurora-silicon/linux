@@ -39,6 +39,7 @@ static const u32 ave_known_text_crc[] = {
 	0x2ce7359e, /* AppleAVE2FW 9003.78.0 */
 	0x69c54454, /* AppleAVE2FW 9003.78.0 (macOS 26.0.x) */
 	AVE_FW_TEXT_CRC_T6040_25G83, /* AppleAVE2FW 9003.78.0 / T6040 */
+	AVE_FW_TEXT_CRC_T6050_26A428, /* AppleAVE2FW, macOS 27.0 26A428 / T6050 */
 	0x460c7a7c, /* AppleAVE2FW 6070.11.1 / T6000 */
 	0x25bfd039, /* AppleAVE2FW 6070.11.1 / T8112 */
 };

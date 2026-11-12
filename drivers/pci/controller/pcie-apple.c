@@ -2328,6 +2328,11 @@ static int apple_pcie_t6050_port_train(struct apple_pcie_port *port)
 #define T6050_PHY_STAT			0x8
 /* Rises once T6050_PHY_CFG_BIT4 is set; polled by macOS and by m1n1; meaning not known */
 #define T6050_PHY_STAT_BIT0		BIT(0)
+/*
+ * Set and held once the shared PHY is started in macOS's post-iBoot order (aura's
+ * T6050 bring-up sets T6050_PHY_CFG_BIT4 and waits for it); meaning not known
+ */
+#define T6050_PHY_STAT_BIT4		BIT(4)
 #define T6050_PHYCMN_CLK		0x0
 #define T6050_PHYCMN_CLK_MODE		GENMASK(1, 0)
 /*
@@ -2413,6 +2418,14 @@ static int apple_pcie_t6050_shared_phy_on(struct apple_pcie *pcie)
 	phy = pcie->t6050_phy;
 	if ((readl(phy + T6050_PHY_CTRL) & (up | T6050_PHY_CTRL_RESET_T8132 |
 					    T6050_PHY_CTRL_RESET_T8103)) == up)
+		return 0;
+	/*
+	 * A boot loader that started the PHY in macOS's order (it trained another port)
+	 * leaves status bit 4 set and the RC ready: the PHY runs, so it is not restarted
+	 * under that port's link.
+	 */
+	if ((readl(phy + T6050_PHY_STAT) & T6050_PHY_STAT_BIT4) &&
+	    (readl(pcie->base + CORE_RC_STAT) & CORE_RC_STAT_READY))
 		return 0;
 	cmn = devm_platform_ioremap_resource_byname(pdev, "phy-common");
 	if (IS_ERR(cmn))

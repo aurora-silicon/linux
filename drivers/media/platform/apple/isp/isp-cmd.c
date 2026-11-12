@@ -32,6 +32,10 @@ static int isp_cmd_send_chan(struct apple_isp *isp, struct isp_channel *chan,
 	struct isp_message *req;
 	int err;
 
+	/* A failed session takes no more commands, on any channel. */
+	if (READ_ONCE(isp->ipc_error))
+		return READ_ONCE(isp->ipc_error);
+
 	/* Before the command area is overwritten */
 	err = isp_ipc_resync(isp);
 	if (err)
@@ -71,6 +75,9 @@ static int isp_cmd_send_chan(struct apple_isp *isp, struct isp_channel *chan,
 
 int isp_cmd_send(struct apple_isp *isp, void *args, u32 insize, u32 outsize, int timeout)
 {
+	if (READ_ONCE(isp->ipc_error))
+		return READ_ONCE(isp->ipc_error);
+
 #if IS_ENABLED(CONFIG_VIDEO_APPLE_ISP_KUNIT_TEST)
 	KUNIT_STATIC_STUB_REDIRECT(isp_cmd_send, isp, args, insize, outsize, timeout);
 #endif

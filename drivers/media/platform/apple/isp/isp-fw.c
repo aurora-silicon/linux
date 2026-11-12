@@ -244,16 +244,24 @@ static irqreturn_t apple_isp_isr(int irq, void *dev)
 static irqreturn_t apple_isp_isr_thread(int irq, void *dev)
 {
 	struct apple_isp *isp = dev;
+	bool more;
 
-	wake_up_all(&isp->wait);
+	do {
+		wake_up_all(&isp->wait);
 
-	ipc_chan_handle(isp, isp->chan_sm);
-	wake_up_all(&isp->wait); /* Some commands depend on sm */
+		more = ipc_chan_handle(isp, isp->chan_sm) == -EAGAIN;
+		wake_up_all(&isp->wait); /* Some commands depend on sm */
 
-	ipc_chan_handle(isp, isp->chan_tm);
+		more |= ipc_chan_handle(isp, isp->chan_tm) == -EAGAIN;
+		more |= ipc_chan_handle(isp, isp->chan_bt) == -EAGAIN;
+		wake_up_all(&isp->wait);
 
-	ipc_chan_handle(isp, isp->chan_bt);
-	wake_up_all(&isp->wait);
+		/* Fair turns across channels, without depending on another IRQ. */
+		cond_resched();
+	} while (more && !READ_ONCE(isp->ipc_error) &&
+		 !READ_ONCE(isp->ipc_quiescing));
+
+	apple_isp_video_error(isp);
 
 	return IRQ_HANDLED;
 }
@@ -1032,6 +1040,9 @@ static int isp_stop_command_processor(struct apple_isp *isp)
 {
 	int res, ret;
 
+	if (READ_ONCE(isp->ipc_error))
+		return READ_ONCE(isp->ipc_error);
+
 	if (isp->hw->fw_restart)
 		return isp_stop_firmware_cold(isp);
 
@@ -1182,6 +1193,7 @@ static int isp_firmware_boot(struct apple_isp *isp)
 		/* Stage 1 stops the coprocessor and powers it down itself. */
 		isp_err(isp, "failed firmware boot stage 1: %d\n", err);
 		isp_collect_gc_surface(isp);
+		cmpxchg(&isp->ipc_error, 0, err);
 		/* The firmware may have run: leave its memory as loaded. */
 		isp_restore_fw_memory(isp);
 		return err;
@@ -1200,6 +1212,10 @@ static int isp_firmware_boot(struct apple_isp *isp)
 		goto stop;
 	}
 
+	/* The old coprocessor stopped and all channel slots were initialized. */
+	WRITE_ONCE(isp->ipc_error, 0);
+	WRITE_ONCE(isp->ipc_quiescing, false);
+
 	err = isp_enable_irq(isp);
 	if (err < 0) {
 		isp_err(isp, "failed to enable interrupts: %d\n", err);
@@ -1217,8 +1233,10 @@ static int isp_firmware_boot(struct apple_isp *isp)
 	return 0;
 
 disable_irqs:
+	cmpxchg(&isp->ipc_error, 0, err);
 	isp_disable_irq(isp);
 stop:
+	cmpxchg(&isp->ipc_error, 0, err);
 	isp_firmware_stop(isp);
 	return err;
 }
@@ -1233,6 +1251,8 @@ static void isp_firmware_shutdown(struct apple_isp *isp)
 	 */
 	if (isp_stop_command_processor(isp))
 		dev_warn(isp->dev, "firmware did not stop, stopping the coprocessor\n");
+	/* Also stop a receive thread whose producer never leaves a gap. */
+	cmpxchg(&isp->ipc_error, 0, -ESHUTDOWN);
 	isp_disable_irq(isp);
 	isp_firmware_stop(isp);
 }
@@ -1278,6 +1298,9 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
 		break;
 	case ISP_FW_RUNNING:
 		/* Resident or idling firmware keeps running between streams. */
+		err = READ_ONCE(isp->ipc_error);
+		if (err)
+			return err;
 		isp->fw_idle = false;
 		return 0;
 	case ISP_FW_DEAD:
@@ -1320,7 +1343,8 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
 /* The end of a stream or of the camera detection */
 void apple_isp_firmware_shutdown(struct apple_isp *isp)
 {
-	if (!isp->hw->resident_fw && !isp->hw->fw_idle_ms) {
+	if ((!isp->hw->resident_fw && !isp->hw->fw_idle_ms) ||
+	    READ_ONCE(isp->ipc_error)) {
 		apple_isp_firmware_halt(isp);
 		return;
 	}
@@ -1332,9 +1356,20 @@ void apple_isp_firmware_shutdown(struct apple_isp *isp)
 	 * the interrupt thread to finish the free requests the firmware has
 	 * already sent.
 	 */
-	if (isp->fw_state == ISP_FW_RUNNING)
-		synchronize_irq(isp->irq);
+	if (isp->fw_state != ISP_FW_RUNNING)
+		return;
+
+	/* Finish a fair receive round even if the producer keeps refilling. */
+	WRITE_ONCE(isp->ipc_quiescing, true);
+	disable_irq(isp->irq);
+	/* No receive handler can race this lifetime decision while disabled. */
+	if (READ_ONCE(isp->ipc_error)) {
+		apple_isp_firmware_halt(isp);
+		return;
+	}
 	isp_free_released_surfaces(isp);
+	WRITE_ONCE(isp->ipc_quiescing, false);
+	enable_irq(isp->irq);
 
 	/*
 	 * Firmware that starts again goes down after the stream, at once or, with

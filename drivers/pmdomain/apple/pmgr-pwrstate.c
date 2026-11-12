@@ -787,6 +787,16 @@ static void apple_pmgr_ps_release_parents(struct dev_pm_domain_list *parents)
 	dev_pm_domain_detach_list(parents);
 }
 
+/* Explicit DT policy wins; only the T8122 PPT needs the legacy fallback. */
+static bool apple_pmgr_ps_always_on(struct device_node *node, u32 offset,
+				   const char *name)
+{
+	return of_property_read_bool(node, "apple,always-on") ||
+	       (of_device_is_compatible(node, "apple,t8122-pmgr-pwrstate") &&
+		offset == APPLE_PMGR_T8122_PMS_C1PPT &&
+		!strcmp(name, "pms_c1ppt"));
+}
+
 static int apple_pmgr_ps_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -936,10 +946,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	}
 	/* Legacy handoff DTs must also keep the throttle controller powered. */
 	if (!ps->firmware_owned && !ps->inherited_on &&
-	    (of_property_read_bool(node, "apple,always-on") ||
-	     (of_device_is_compatible(node, "apple,t8122-pmgr-pwrstate") &&
-	      ps->offset == APPLE_PMGR_T8122_PMS_C1PPT &&
-	      !strcmp(name, "pms_c1ppt")))) {
+	    apple_pmgr_ps_always_on(node, ps->offset, name)) {
 		ps->genpd.flags |= GENPD_FLAG_ALWAYS_ON;
 		if (!active) {
 			/*

@@ -13,6 +13,7 @@
 #include <linux/of_platform.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
+#include <linux/pm_wakeup.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/rtkit-helper.h>
 #include <linux/soc/apple/t8132.h>
@@ -502,15 +503,31 @@ static int __maybe_unused apple_rtkit_helper_suspend(struct device *dev)
 	if (pm_suspend_via_firmware())
 		return apple_rtkit_helper_ap_idle(helper);
 
-	/* Only suspend-to-idle has a verified live-session retention contract. */
 	if (helper->adopted && pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
 		return -EBUSY;
+	if (!helper->adopted || !of_machine_is_compatible("apple,j613"))
+		return 0;
+	if (!(readl(helper->asc_base + APPLE_ASC_CPU_CONTROL) & APPLE_ASC_CPU_CONTROL_RUN))
+		return -EHOSTDOWN;
+	/* mtp-live-v1 cannot be restarted: keep its ASC suppliers awake. */
+	device_set_awake_path(dev);
+	dev_dbg(dev, "adopted MTP s2idle: retaining ASC RUN and firmware session\n");
 	return 0;
 }
 
 static int __maybe_unused apple_rtkit_helper_resume(struct device *dev)
 {
-	apple_rtkit_helper_ap_on(dev_get_drvdata(dev));
+	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
+
+	/* After a firmware-driven suspend's idle notice; nothing otherwise. */
+	apple_rtkit_helper_ap_on(helper);
+	if (!helper->adopted || !of_machine_is_compatible("apple,j613"))
+		return 0;
+	if (!(readl(helper->asc_base + APPLE_ASC_CPU_CONTROL) & APPLE_ASC_CPU_CONTROL_RUN)) {
+		dev_err(dev, "adopted MTP lost ASC RUN; refusing firmware restart\n");
+		return -EHOSTDOWN;
+	}
+	dev_dbg(dev, "adopted MTP s2idle: ASC RUN retained, no INIT\n");
 	return 0;
 }
 
