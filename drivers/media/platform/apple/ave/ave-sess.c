@@ -178,12 +178,11 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	if (ctx->ave->layout->kind == AVE_LAYOUT_6070 && p->sample_bytes != 1)
 		return -EOPNOTSUPP;
 	/*
-	 * The 6070 path is qualified for 8-bit H.264 (low delay and one B per
-	 * P) with frame widths in whole macroblocks; HEVC and wider-than-coded
-	 * widths are not yet.
+	 * The 6070 path is qualified for 8-bit H.264 and HEVC Main (low delay
+	 * and one B per P) with frame widths in whole macroblocks; wider-than-
+	 * coded widths are not yet.
 	 */
-	if (ctx->ave->layout->kind == AVE_LAYOUT_6070 &&
-	    (p->codec != AVE_CODEC_H264 || p->width % 16))
+	if (ctx->ave->layout->kind == AVE_LAYOUT_6070 && p->width % 16)
 		return -EOPNOTSUPP;
 	p->bit_depth = 8;
 	if (p->sample_bytes == 2) {
