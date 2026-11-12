@@ -283,6 +283,14 @@ struct apple_mbox_priv {
 	/* Kick and fast tick write this lock-free; reads use READ_ONCE. */
 	ktime_t rx_fast_until;
 	struct hrtimer rx_fast_timer;
+	/*
+	 * 1 from the moment a kick takes responsibility for the timer until
+	 * the tick returns without restarting it. The tick forwards its own
+	 * timer only while it holds the flag, and kick starts the timer only
+	 * when it takes the flag, so the two never enqueue the timer at once
+	 * (hrtimer_forward() requires that).
+	 */
+	atomic_t rx_fast_armed;
 };
 
 static struct apple_mbox_priv *apple_mbox_to_priv(struct apple_mbox *mbox)
@@ -666,6 +674,20 @@ static struct apple_mbox_msg apple_mbox_read_msg(struct apple_mbox *mbox)
 static int apple_mbox_poll_locked(struct apple_mbox *mbox);
 
 /*
+ * The tick found the deadline passed. Drop the flag, then look at the deadline
+ * again: a kick between the tick's read and this drop saw the flag set and did
+ * not start the timer. The full barriers of both xchg() calls pair up, so
+ * either that kick sees the flag clear and starts the timer, or this recheck
+ * sees its deadline. True: the tick holds the flag again and must restart.
+ */
+static bool apple_mbox_fast_rx_keep_armed(struct apple_mbox_priv *priv)
+{
+	atomic_xchg(&priv->rx_fast_armed, 0);
+	return ktime_before(ktime_get(), READ_ONCE(priv->rx_fast_until)) &&
+	       !atomic_xchg(&priv->rx_fast_armed, 1);
+}
+
+/*
  * Fast receive tick for rx_poll_only mailboxes (T6050): the same receive
  * step apple_mbox_v8_rx_poll_work() runs, under the same rx_lock, with
  * apple_mbox_poll_locked() doing the same PSD and removal checks. The v8
@@ -681,8 +703,12 @@ static enum hrtimer_restart apple_mbox_fast_rx_poll(struct hrtimer *timer)
 	ktime_t now;
 	int consumed = 0;
 
-	if (!READ_ONCE(mbox->active) || READ_ONCE(mbox->removing))
-		return HRTIMER_NORESTART;
+	if (!READ_ONCE(mbox->active) || READ_ONCE(mbox->removing)) {
+		/* A kick that raced the resume must not lose its poll. */
+		if (!apple_mbox_fast_rx_keep_armed(priv))
+			return HRTIMER_NORESTART;
+		goto restart;
+	}
 
 	spin_lock_irqsave(&mbox->rx_lock, flags);
 	if (likely(!READ_ONCE(mbox->removing)))
@@ -694,10 +720,12 @@ static enum hrtimer_restart apple_mbox_fast_rx_poll(struct hrtimer *timer)
 		/* Traffic arrived: keep polling as if a send just happened. */
 		WRITE_ONCE(priv->rx_fast_until,
 			   ktime_add_us(now, APPLE_MBOX_RX_FAST_GRACE_US));
-	} else if (!ktime_before(now, READ_ONCE(priv->rx_fast_until))) {
+	} else if (!ktime_before(now, READ_ONCE(priv->rx_fast_until)) &&
+		   !apple_mbox_fast_rx_keep_armed(priv)) {
 		return HRTIMER_NORESTART;
 	}
 
+restart:
 	hrtimer_forward_now(timer, us_to_ktime(APPLE_MBOX_RX_FAST_POLL_US));
 	return HRTIMER_RESTART;
 }
@@ -706,20 +734,31 @@ static enum hrtimer_restart apple_mbox_fast_rx_poll(struct hrtimer *timer)
  * tx_lock held. Lock-free on purpose: apple_mbox_poll_locked() invokes the
  * rx callback with rx_lock held, and a callback that sends would then take
  * tx_lock under rx_lock. Kick never touches rx_lock, so no ordering exists
- * to invert. A kick that loses a race with the timer's final no-restart
- * decision leaves the fast poller disarmed once; the next jiffy poll or
- * send recovers it.
+ * to invert. Only the kick that moves rx_fast_armed from 0 to 1 starts the
+ * timer, so a kick never enqueues the timer while the tick forwards it.
  */
 static void apple_mbox_fast_rx_kick(struct apple_mbox_priv *priv)
 {
 	WRITE_ONCE(priv->rx_fast_until,
 		   ktime_add_us(ktime_get(), APPLE_MBOX_RX_FAST_GRACE_US));
-	/* Publish the deadline before deciding to arm. */
-	smp_mb();
-	if (!hrtimer_active(&priv->rx_fast_timer))
+	/* The full barrier in xchg() publishes the deadline before the arm. */
+	if (!atomic_xchg(&priv->rx_fast_armed, 1))
 		hrtimer_start(&priv->rx_fast_timer,
 			      us_to_ktime(APPLE_MBOX_RX_FAST_POLL_US),
 			      HRTIMER_MODE_REL);
+}
+
+/*
+ * After this the timer is neither queued nor running. The flag is cleared only
+ * when a queued timer was cancelled: a kick that already took the flag but has
+ * not called hrtimer_start() yet keeps it, and its timer starts afterwards.
+ * An idle timer with a stale flag cannot occur, because every tick exit that
+ * returns NORESTART clears the flag first.
+ */
+static void apple_mbox_fast_rx_cancel(struct apple_mbox_priv *priv)
+{
+	if (hrtimer_cancel(&priv->rx_fast_timer))
+		atomic_set(&priv->rx_fast_armed, 0);
 }
 
 int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
@@ -1139,7 +1178,7 @@ static void apple_mbox_v8_rx_stop(struct apple_mbox *mbox)
 		disable_irq(mbox->irq_recv_not_empty);
 	/* Same cancel-and-drain guarantee for the fast poller as below. */
 	if (mbox->hw->rx_poll_only)
-		hrtimer_cancel(&priv->rx_fast_timer);
+		apple_mbox_fast_rx_cancel(priv);
 	cancel_delayed_work_sync(&priv->rx_poll_work);
 }
 
@@ -1328,7 +1367,7 @@ static void apple_mbox_quiesce(void *data)
 	/* The v8 poller also stops on the removal fence; make sure it is gone. */
 	if (apple_mbox_has_rx_poller(mbox)) {
 		if (mbox->hw->rx_poll_only)
-			hrtimer_cancel(&apple_mbox_to_priv(mbox)->rx_fast_timer);
+			apple_mbox_fast_rx_cancel(apple_mbox_to_priv(mbox));
 		cancel_delayed_work_sync(&apple_mbox_to_priv(mbox)->rx_poll_work);
 	}
 

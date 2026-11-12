@@ -93,10 +93,111 @@ static void apple_g17_rx_util_min_test(struct kunit *test)
 #endif
 }
 
+struct apple_g17_fast_rx {
+	struct apple_mbox_priv priv;
+	struct completion ticked;
+};
+
+static enum hrtimer_restart apple_g17_fast_rx_tick(struct hrtimer *timer)
+{
+	struct apple_g17_fast_rx *f = container_of(timer, struct apple_g17_fast_rx,
+						   priv.rx_fast_timer);
+
+	complete(&f->ticked);
+	return HRTIMER_NORESTART;
+}
+
+static struct apple_g17_fast_rx *apple_g17_fast_rx_new(struct kunit *test)
+{
+	struct apple_g17_fast_rx *f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	init_completion(&f->ticked);
+	hrtimer_setup(&f->priv.rx_fast_timer, apple_g17_fast_rx_tick,
+		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	return f;
+}
+
+/* Only the kick that takes rx_fast_armed from 0 to 1 starts the timer. */
+static void apple_g17_fast_rx_kick_arms_once_test(struct kunit *test)
+{
+	struct apple_g17_fast_rx *f = apple_g17_fast_rx_new(test);
+	ktime_t first;
+
+	apple_mbox_fast_rx_kick(&f->priv);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->priv.rx_fast_armed), 1);
+	KUNIT_EXPECT_GT(test, wait_for_completion_timeout(&f->ticked, HZ), 0UL);
+
+	/* The test tick does not restart, as the real tick does while armed. */
+	reinit_completion(&f->ticked);
+	first = f->priv.rx_fast_until;
+	apple_mbox_fast_rx_kick(&f->priv);
+	KUNIT_EXPECT_EQ(test, wait_for_completion_timeout(&f->ticked,
+							  msecs_to_jiffies(5)), 0UL);
+	KUNIT_EXPECT_TRUE(test, ktime_after(f->priv.rx_fast_until, first));
+
+	/* The real tick clears the flag on every NORESTART exit; model that. */
+	atomic_set(&f->priv.rx_fast_armed, 0);
+	apple_mbox_fast_rx_kick(&f->priv);
+	KUNIT_EXPECT_GT(test, wait_for_completion_timeout(&f->ticked, HZ), 0UL);
+	apple_mbox_fast_rx_cancel(&f->priv);
+}
+
+/*
+ * A kick that lands after the tick read its expired deadline but before the
+ * tick dropped the flag sees the flag set and starts nothing. The tick must
+ * then notice the new deadline instead of going idle with the kick lost.
+ */
+static void apple_g17_fast_rx_keeps_racing_kick_test(struct kunit *test)
+{
+	struct apple_g17_fast_rx *f = apple_g17_fast_rx_new(test);
+	ktime_t before;
+
+	/* Deadline passed, no kick: the tick stops and the next kick re-arms. */
+	atomic_set(&f->priv.rx_fast_armed, 1);
+	f->priv.rx_fast_until = 0;
+	KUNIT_EXPECT_FALSE(test, apple_mbox_fast_rx_keep_armed(&f->priv));
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->priv.rx_fast_armed), 0);
+
+	/* The racing kick: the flag is still set, so the kick starts no timer. */
+	atomic_set(&f->priv.rx_fast_armed, 1);
+	f->priv.rx_fast_until = 0;
+	before = ktime_get();
+	apple_mbox_fast_rx_kick(&f->priv);
+	KUNIT_EXPECT_TRUE(test, ktime_after(f->priv.rx_fast_until, before));
+	KUNIT_EXPECT_EQ(test, wait_for_completion_timeout(&f->ticked, 0), 0UL);
+	/* Pin the deadline live so a slow runner cannot expire the kick's own. */
+	f->priv.rx_fast_until = ktime_add_ms(ktime_get(), 1000);
+	KUNIT_EXPECT_TRUE(test, apple_mbox_fast_rx_keep_armed(&f->priv));
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->priv.rx_fast_armed), 1);
+	apple_mbox_fast_rx_cancel(&f->priv);
+}
+
+/*
+ * A kick that took the flag but has not called hrtimer_start() yet must keep
+ * it across a cancel: the timer is not queued, so nothing was cancelled.
+ */
+static void apple_g17_fast_rx_cancel_keeps_inflight_kick_test(struct kunit *test)
+{
+	struct apple_g17_fast_rx *f = apple_g17_fast_rx_new(test);
+
+	atomic_set(&f->priv.rx_fast_armed, 1);
+	apple_mbox_fast_rx_cancel(&f->priv);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->priv.rx_fast_armed), 1);
+
+	/* A queued timer is cancelled with its flag, so the next kick re-arms. */
+	hrtimer_start(&f->priv.rx_fast_timer, ms_to_ktime(1000), HRTIMER_MODE_REL);
+	apple_mbox_fast_rx_cancel(&f->priv);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->priv.rx_fast_armed), 0);
+}
+
 static struct kunit_case apple_g17_stall_cases[] = {
 	KUNIT_CASE(apple_g17_rx_flood_bounded_test),
 	KUNIT_CASE(apple_g17_tx_stall_bounded_test),
 	KUNIT_CASE(apple_g17_rx_util_min_test),
+	KUNIT_CASE(apple_g17_fast_rx_kick_arms_once_test),
+	KUNIT_CASE(apple_g17_fast_rx_keeps_racing_kick_test),
+	KUNIT_CASE(apple_g17_fast_rx_cancel_keeps_inflight_kick_test),
 	{ }
 };
 static struct kunit_suite apple_g17_stall_suite = {
