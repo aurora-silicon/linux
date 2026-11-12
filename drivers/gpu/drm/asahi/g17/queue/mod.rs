@@ -397,10 +397,16 @@ impl<B: Backend> Queue<B> {
                 checked_inputs.push(ready.clone(), GFP_KERNEL)?;
             }
         }
-        // Publish from the ioctl whenever nothing has to wait, at any depth.
-        // The backend falls back to the scheduler behind any backlog or on any
-        // capacity miss, so submission order is preserved.
-        let early = dependencies.is_empty();
+        // Inline publication must consume the same per-logical-engine front as scheduler
+        // publication. Unfinished frontier entries include queued predecessors, so counting
+        // them also prevents a dependency-free successor from overtaking host backlog.
+        let has_credit = match engine {
+            Engine::Render => self.render.as_ref(),
+            Engine::Compute => self.compute.as_ref(),
+        }
+        .map_or(true, |scheduler| scheduler.has_credit(self.frontiers[index].len()));
+        let credit_blocked = dependencies.is_empty() && !has_credit;
+        let early = dependencies.is_empty() && !credit_blocked;
         let packet = Packet::new(
             id,
             self.context.clone(),
@@ -414,11 +420,10 @@ impl<B: Backend> Queue<B> {
             Engine::Render => &mut self.render,
             Engine::Compute => &mut self.compute,
         };
-        let fences =
-            scheduler
-                .as_mut()
-                .ok_or(ENODEV)?
-                .enqueue(packet, dependencies, early, publication)?;
+        let fences = scheduler
+            .as_mut()
+            .ok_or(ENODEV)?
+            .enqueue(packet, dependencies, early, credit_blocked, publication)?;
         self.sequence[index] = order.sequence;
         self.frontiers[index]
             .push_within_capacity((order.sequence, fences))
@@ -531,7 +536,31 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
         bytes: &[u8],
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
     ) -> Result {
-        let mut outputs = Outputs::new(&self.fences, syncs, input_count, &self.allocation_failure)?;
+        let output_count = syncs.len().saturating_sub(input_count);
+        super::trace::submit(0, id, self.context.id(), input_count, output_count, 0, None);
+        let mut outputs = match Outputs::new(
+            &self.fences,
+            syncs,
+            input_count,
+            &self.allocation_failure,
+        ) {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                // Allocation failure installs the queue's immutable error fence. A malformed
+                // input/output split installs nothing because no output set is well-defined.
+                let fence = (error != EINVAL).then_some(&self.allocation_failure);
+                super::trace::submit(
+                    2,
+                    id,
+                    self.context.id(),
+                    input_count,
+                    output_count,
+                    error.to_errno(),
+                    fence,
+                );
+                return Err(error);
+            }
+        };
         let result = (|| {
             if !self.backend.supports_submission() {
                 return Err(ENOTSUPP);
@@ -560,6 +589,16 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
                     if *visible_completion || !visible_required)
                 && !pending[0].2.has_outputs();
             let aggregate = outputs.publish(self.context.clone(), firmware_source)?;
+            let output_fence = aggregate.fence();
+            super::trace::submit(
+                1,
+                id,
+                self.context.id(),
+                input_count,
+                output_count,
+                0,
+                Some(&output_fence),
+            );
             for (command, order, destinations) in pending {
                 let guard = guards.next().ok_or(EIO)?;
                 self.enqueue(
@@ -582,6 +621,16 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
                 self.backend.fail_vm(error);
             }
         }
+        let output_fence = outputs.output_fence();
+        super::trace::submit(
+            2,
+            id,
+            self.context.id(),
+            input_count,
+            output_count,
+            result.as_ref().err().map_or(0, |error| error.to_errno()),
+            output_fence.as_ref(),
+        );
         outputs.finish(result)
     }
 }

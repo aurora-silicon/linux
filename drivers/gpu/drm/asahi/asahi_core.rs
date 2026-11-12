@@ -182,6 +182,10 @@ module! {
             default: 512,
             description: "G13/G14: GPU event-drain utilization minimum (0..1024)",
         },
+        g17_publication_credits: u32 {
+            default: 0,
+            description: "G17: firmware-visible commands per logical queue and engine (0: firmware policy, 1..16: override)",
+        },
         g15_deadline_ms: u32 {
             default: 5000,
             description: "G15: host deadline of a published prefix without progress, ms (min 100)",
