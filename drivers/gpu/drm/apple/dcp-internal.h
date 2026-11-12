@@ -467,6 +467,8 @@ struct apple_dcp {
 	enum dcp_firmware_version fw_compat;
 	/* Bumped by every iomfb poweron; see afk_compact_slot(). */
 	u32 afk_power_gen;
+	/* Firmware 27.x: the method IDs of this build (iomfb_v27_methods()). */
+	const struct dcp_method_entry *v27_methods;
 	bool external;
 	/* A desktop 26.x external processor (apple,t6041-dcpext) */
 	bool desktop_external;
