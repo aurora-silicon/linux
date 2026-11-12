@@ -241,6 +241,7 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 	IOMFB_METHOD("A414", dcpep_pipe_cfg_414),             /* (0x8, 0x8) zeros */
 	IOMFB_METHOD("A478", dcpep_pipe_query_478),           /* (0, 0x4) */
 	IOMFB_METHOD("A474", dcpep_pipe_query_474),           /* (0, 0x4) */
+	IOMFB_METHOD("A500", dcpep_unnamed_500),              /* (0x4, 0) */
 	IOMFB_METHOD("A476", dcpep_pipe_set_476),             /* (0x4, 0) in 1 */
 	IOMFB_METHOD("A428", iomfbep_set_brightness_correction),             /* (0x4, 0x4) 0x10000 */
 	IOMFB_METHOD("A450", dcpep_enable_disable_video_power_savings), /* in = u32 0 */
@@ -310,6 +311,21 @@ static bool trampoline_get_frequency_h17p(struct apple_dcp *dcp, int tag,
 
 	*(__le64 *)out = cpu_to_le64(rate);
 	return true;
+}
+
+/*
+ * D572: the firmware controls the display DART's power stage with this. The
+ * argument is 0 when it's done with the display and 1 when it wants it back.
+ */
+static bool trampoline_dart_power_h17p(struct apple_dcp *dcp, int tag,
+				       void *out, void *in)
+{
+	const struct dcp_packet_header *header = in - sizeof(*header);
+
+	if (header->in_len >= sizeof(u32))
+		dcp_s2r_dart_power(dcp, get_unaligned_le32(in));
+
+	return trampoline_zero(dcp, tag, out, in);
 }
 
 static bool trampoline_analytics_h17p(struct apple_dcp *dcp, int tag,
@@ -691,7 +707,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[563] = trampoline_true,
 	[565] = trampoline_true,
 	[567] = trampoline_true,
-	[572] = trampoline_zero, /* powerUpDART */
+	[572] = trampoline_dart_power_h17p, /* powerUpDART */
 	[574] = trampoline_luma_span_h17p,
 	[575] = trampoline_hotplug_h17p,
 	[576] = trampoline_nop,

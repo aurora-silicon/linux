@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/display/apple,t8140-display-power.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T8140 display power words
+
+maintainers:
+  - Diljit Singh <hey@djdev.me>
+
+description:
+  The words a display coprocessor's driver writes to power its domains off
+  and on around a restart of its firmware, as macOS does. A display
+  coprocessor names this node in its apple,display-power property. The words
+  belong to the power manager and the display block, so no driver binds it.
+
+properties:
+  compatible:
+    const: apple,t8140-display-power
+
+  reg:
+    items:
+      - description: the display PMC word that counts the powered coprocessors
+      - description: the power manager's power state words
+      - description: the power manager's power gate words
+
+  reg-names:
+    items:
+      - const: pmc-dcp
+      - const: ps
+      - const: pwrgate
+
+required:
+  - compatible
+  - reg
+  - reg-names
+
+additionalProperties: false
+
+examples:
+  - |
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        display-power@3028a9c14 {
+            compatible = "apple,t8140-display-power";
+            reg = <0x3 0x028a9c14 0x0 0x4>,
+                  <0x3 0x00700000 0x0 0x14000>,
+                  <0x3 0x00724000 0x0 0x1000>;
+            reg-names = "pmc-dcp", "ps", "pwrgate";
+        };
+    };

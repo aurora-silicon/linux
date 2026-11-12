@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,cluster-pwrgate.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple SoC CPU cluster power-gate enables
+
+maintainers:
+  - Diljit Singh <hey@djdev.me>
+
+description: |
+  One PMGR word per CPU cluster, whose top bit lets the cluster's cores power
+  down in WFI. A core that PMGR powers on comes up allowed to, but the boot CPU
+  was started by the boot ROM and only follows the word, which the boot loader
+  may leave clear. The words are set early in boot, in the order listed.
+
+properties:
+  compatible:
+    items:
+      - enum:
+          - apple,t8140-cluster-pwrgate
+      - const: apple,cluster-pwrgate
+
+  reg:
+    minItems: 1
+    maxItems: 8
+    description: One word per cluster.
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false
+
+examples:
+  - |
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        power-gate@300724000 {
+            compatible = "apple,t8140-cluster-pwrgate", "apple,cluster-pwrgate";
+            reg = <0x3 0x00724000 0x0 0x4>,
+                  <0x3 0x00724040 0x0 0x4>;
+        };
+    };

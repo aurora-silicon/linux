@@ -27,6 +27,7 @@
 #include <linux/pm_opp.h>
 #include <linux/pm_qos.h>
 #include <linux/slab.h>
+#include <linux/suspend.h>
 #include <linux/soc/apple/cpufreq-thermal.h>
 #include <linux/soc/apple/pmp-report.h>
 #include <linux/spinlock.h>
@@ -837,6 +838,19 @@ static unsigned int apple_soc_cpufreq_pstate_freq(struct cpufreq_policy *policy,
 static int apple_soc_cpufreq_suspend(struct cpufreq_policy *policy)
 {
 	struct apple_cpu_priv *priv = policy->driver_data;
+	struct apple_fast_die *fd = priv->fast_die;
+
+	/*
+	 * A firmware-driven sleep stops the PMP, and its driver starts it again only after the
+	 * CPUs are back: the first samples after the wake find it down. Give it the same time to
+	 * come back as at boot. Jiffies don't count the sleep.
+	 */
+	if (fd && fd->report && pm_suspend_via_firmware()) {
+		spin_lock_bh(&fd->lock);
+		fd->start = jiffies;
+		fd->warned = false;
+		spin_unlock_bh(&fd->lock);
+	}
 
 	if (priv->info->lazy_verify) {
 		int pstate = apple_soc_cpufreq_drain(priv);
@@ -854,6 +868,37 @@ static int apple_soc_cpufreq_suspend(struct cpufreq_policy *policy)
 	}
 
 	return cpufreq_generic_suspend(policy);
+}
+
+/*
+ * A firmware-driven sleep powers the cluster down, and it comes back in a performance state
+ * of the hardware's choosing, not the one asked for at suspend. Take what it reads as the
+ * expected state again, before the governor starts, rather than stopping every request as if
+ * someone else owned it.
+ */
+static int apple_soc_cpufreq_resume(struct cpufreq_policy *policy)
+{
+	struct apple_cpu_priv *priv = policy->driver_data;
+	unsigned long flags;
+	u64 reg;
+
+	if (!priv->info->verify_transition || !pm_resume_via_firmware())
+		return 0;
+
+	raw_spin_lock_irqsave(&priv->lock, flags);
+	reg = readq_relaxed(priv->reg_base + APPLE_DVFS_CMD);
+	if (!(reg & APPLE_DVFS_CMD_BUSY)) {
+		unsigned int now = FIELD_GET(APPLE_DVFS_CMD_PS1, reg);
+
+		if (now != priv->expected_pstate)
+			dev_info(priv->cpu_dev, "DVFS state %u after the sleep, %u before\n",
+				 now, priv->expected_pstate);
+		priv->expected_pstate = now;
+		priv->transition_failed = false;
+	}
+	raw_spin_unlock_irqrestore(&priv->lock, flags);
+
+	return 0;
 }
 
 static unsigned int apple_soc_cpufreq_fast_switch(struct cpufreq_policy *policy,
@@ -1571,6 +1616,7 @@ static struct cpufreq_driver apple_soc_cpufreq_driver = {
 	.register_em	= cpufreq_register_em_with_opp,
 	.set_boost	= cpufreq_boost_set_sw,
 	.suspend	= apple_soc_cpufreq_suspend,
+	.resume		= apple_soc_cpufreq_resume,
 };
 
 static int __init apple_soc_cpufreq_module_init(void)

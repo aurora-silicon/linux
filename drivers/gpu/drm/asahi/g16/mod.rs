@@ -145,6 +145,10 @@ impl platform::Driver for Driver {
     type Data<'bound> = Option<crate::driver::AsahiPlatformDriverData<'bound>>;
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 
+    fn pm_ops() -> Option<&'static kernel::bindings::dev_pm_ops> {
+        crate::driver::sleep_refuse_ops()
+    }
+
     /// The firmware session cannot be stopped once started.
     fn suppress_bind_attrs() -> bool {
         true

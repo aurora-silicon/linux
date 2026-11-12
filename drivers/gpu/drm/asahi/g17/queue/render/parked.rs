@@ -292,6 +292,12 @@ impl ParkedPair {
     }
 }
 
+impl ParkedPair {
+    pub(crate) fn forget_registration(&mut self) {
+        self.registered = None;
+    }
+}
+
 impl Prepared {
     /// Called after the registry revalidates its preparation epoch and parked pair identity.
     pub(crate) fn finish_install(

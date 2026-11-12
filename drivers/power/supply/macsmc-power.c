@@ -1334,6 +1334,24 @@ static void macsmc_power_remove(struct platform_device *pdev)
 	blocking_notifier_chain_unregister(&power->smc->event_handlers, &power->nb);
 }
 
+/*
+ * The charge moved while asleep, and an event's uevent that ran before the SMC
+ * was back found nothing to report.
+ */
+static void macsmc_power_complete(struct device *dev)
+{
+	struct macsmc_power *power = dev_get_drvdata(dev);
+
+	if (power->batt)
+		power_supply_changed(power->batt);
+	if (power->ac)
+		power_supply_changed(power->ac);
+}
+
+static const struct dev_pm_ops macsmc_power_pm_ops = {
+	.complete = pm_sleep_ptr(macsmc_power_complete),
+};
+
 static const struct platform_device_id macsmc_power_id[] = {
 	{ .name = "macsmc-power" },
 	{ /* sentinel */ }
@@ -1343,6 +1361,7 @@ MODULE_DEVICE_TABLE(platform, macsmc_power_id);
 static struct platform_driver macsmc_power_driver = {
 	.driver = {
 		.name = "macsmc-power",
+		.pm = pm_sleep_ptr(&macsmc_power_pm_ops),
 	},
 	.id_table = macsmc_power_id,
 	.probe = macsmc_power_probe,

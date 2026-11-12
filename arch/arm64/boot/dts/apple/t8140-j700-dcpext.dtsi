@@ -23,6 +23,8 @@
 		/* First mapper in the measured ADT iommu-parent list. */
 		iommus = <&dcpext0_dart 23>;
 		power-domains = <&ps_dispext0_cpu>;
+		/* DISPEXT0's words and pmc-dcp, for the restart after a sleep */
+		apple,display-power = <&dcp_power>;
 		apple,connector-type = "USB-C";
 		status = "disabled";
 
@@ -65,7 +67,11 @@
 	};
 };
 
-/* Retain the inherited firmware supply once the loader publishes it. */
+/*
+ * Retain the inherited firmware supply once the loader publishes it. After a sleep the DCP
+ * driver raises it, the way macOS does, not the PMGR resync.
+ */
 &ps_dispext0_cpu {
 	apple,always-on;
+	apple,sleep-driver-owned;
 };

@@ -118,6 +118,7 @@ const struct ane_fw_platform ane_h17_platform = {
 	.safe_reset = false,
 	/* 25G83 boots this firmware in Exclave mode (SPEC-ANE-SLEEP-H17.md). */
 	.exclave_mode_stop = true,
+	.macos_sleep = true,
 	/*
 	 * Off: on 25G83 SUSPEND is still not taken after 0x31 (C7), so sleep
 	 * cycles the engine cold and replays every program behind its handle.

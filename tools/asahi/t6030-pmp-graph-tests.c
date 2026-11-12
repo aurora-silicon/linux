@@ -159,6 +159,9 @@ struct apple_pmp_report {
 	/* Requests held until the PMP runs; T6030 does not defer them. */
 	u64 shadow, known;
 	bool defer;
+	/* Firmware-driven sleep: the request word at its start, the DVFS words kept. */
+	u64 sleep_request;
+	u64 *dvfs_shadow;
 	unsigned int polls;
 	struct delayed_work ready_work;
 	struct apple_pmp_ane ane;
@@ -627,6 +630,11 @@ static void *devm_kzalloc(struct device *d, size_t n, int g)
 	assert(v);
 	allocations[allocation_count++] = v;
 	return v;
+}
+
+static void *devm_kcalloc(struct device *d, size_t n, size_t size, int g)
+{
+	return devm_kzalloc(d, n * size, g);
 }
 #define kzalloc_obj(v) calloc(1, sizeof(v))
 #define kfree free

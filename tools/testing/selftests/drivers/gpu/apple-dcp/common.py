@@ -146,6 +146,15 @@ def atc_restore_helpers(source):
     return atc_function(source, 'atcphy_setup_pipehandler')
 
 
+def atc_common_state_helpers(source):
+    """What atcphy_restore_after_pd_off() calls to drop the common block's DisplayPort and
+    tunnel state after a power-down. Older sources do that inline: ''.
+    """
+    if 'atcphy_forget_common_state(' not in atc_function(source, 'atcphy_restore_after_pd_off'):
+        return ''
+    return atc_function(source, 'atcphy_forget_common_state')
+
+
 def atc_mux_without_pm(source):
     """Lane/teardown fixtures omit USB PM, keeping mode mapping and lane work real.
 

@@ -55,6 +55,8 @@ struct isp_channel {
 
 struct hardware {
 	bool resident_fw;
+	/* #1445: resident firmware that starts again from its own memory */
+	bool fw_restart;
 	unsigned int fw_idle_ms;
 };
 
@@ -70,6 +72,7 @@ struct apple_isp {
 	struct isp_channel *ipc_stale;
 	bool ipc_failed;
 	const struct hardware *hw;
+	struct { bool started; } fw;
 	void *dev, *wq, *cmd_virt;
 	u64 cmd_iova;
 	unsigned int current_ch;
@@ -322,6 +325,8 @@ static u64 get_unaligned_le64(const void *p) { u64 v; memcpy(&v, p, sizeof(v)); 
 static bool isp_is_p010(struct apple_isp *isp) { return false; }
 static int isp_ipc_resync(struct apple_isp *isp) { return 0; }
 static void isp_restore_fw_memory(struct apple_isp *isp) { }
+/* #1445's post-restart query; these fixtures never restart (fw.started is clear). */
+static int isp_check_restarted(struct apple_isp *isp) { CHECK(false); return 0; }
 /* DRIVER FUNCTIONS */
 int main(void)
 {
@@ -355,6 +360,9 @@ int main(void)
 	isp.ipc_error = -EIO;
 	CHECK(ipc_chan_send(&isp, &ch, 1) == -EIO);
 	CHECK(writes == 1 && cursors == 0);
+	/* A capture stops while it streams, with the firmware running. */
+	int fw_state = isp.fw_state;
+	isp.fw_state = ISP_FW_RUNNING;
 	for (unsigned int fail = 0; fail < 2; fail++) {
 		stop_error = fail ? -ETIME : 0;
 		stops = 0;
@@ -363,6 +371,7 @@ int main(void)
 		apple_isp_stop_capture(&isp);
 		CHECK(stops == 1 && returns == !fail && watchdog_stops == 1);
 	}
+	isp.fw_state = fw_state;
 	for (fail_stage = 1; fail_stage <= 5; fail_stage++) {
 		isp.ipc_error = -ETIME;
 		stage_error = -ENOMEM;

@@ -67,6 +67,12 @@ struct ane_fw_platform {
 	 */
 	bool exclave_mode_stop;
 	/*
+	 * The sleep macOS was recorded doing on this SoC: the engine stays off with
+	 * no firmware until its first request, and powers down in macOS's word
+	 * order. Other SoCs keep the staged backend's boot-time start.
+	 */
+	bool macos_sleep;
+	/*
 	 * System sleep keeps the firmware (EXCLAVE_MODE_STOP, SUSPEND, warm
 	 * boot); otherwise the engine is cycled cold and the programs replayed.
 	 */

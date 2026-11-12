@@ -50,7 +50,7 @@ static unsigned lock_depth;
 static size_t find_next_bit(unsigned long*p,size_t n,size_t a){for(;a<n;a++)if(test_bit(a,p))break;return a;}
 static size_t find_next_zero_bit(unsigned long*p,size_t n,size_t a){for(;a<n;a++)if(!test_bit(a,p))break;return a;}
 struct apple_dart_hw;struct device;
-struct apple_dart {struct device*dev;unsigned pgsize,oas,fw_mirror,fw_tree,tcr,fw_handoff,ias,locked,num_streams,version,managed_sids;struct {int ready;} iommu;struct apple_dart_hw*hw;u64 dma_offset,locked_window[2];u64 *locked_ttbr[2][4],*locked_owned[2][4];struct apple_dart_fw_root*locked_fw[2][4];struct apple_dart_fw_tree*locked_fw_tree[2];int lock,locked_retire_err[2];};
+struct apple_dart {struct device*dev;unsigned pgsize,oas,fw_mirror,fw_tree,tcr,fw_handoff,ias,locked,num_streams,version,managed_sids;struct {int ready;} iommu;struct apple_dart_hw*hw;u64 dma_offset,locked_window[2];u64 *locked_ttbr[2][4],*locked_owned[2][4];struct apple_dart_fw_root*locked_fw[2][4];struct apple_dart_fw_tree*locked_fw_tree[2];bool display_dark,display_tlb_stale;DECLARE_BITMAP(display_tcr_four,64);int lock,locked_retire_err[2];};
 struct apple_dart_stream_map {struct apple_dart*dart;unsigned long sidmap[1];};
 struct apple_dart_atomic_stream_map {struct apple_dart*dart;unsigned long sidmap[1];};
 struct apple_dart_dcp;struct apple_dart_domain {struct apple_dart_atomic_stream_map stream_maps[2];unsigned long fw_sidmap[2][1];void*pgtbl_ops;struct apple_dart_dcp*dcp;};

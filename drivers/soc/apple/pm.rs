@@ -8,6 +8,10 @@
 //! is not frozen either, so entropy requests are held over the same window.
 //! The notifier itself is in `pm_shim.c`; the capture and entropy handling is
 //! on [`SepData`].
+//!
+//! On a firmware-driven suspend the enclave also saves its state and gates its
+//! own power domain when asked, as the sleep powers it down, and has to be
+//! started again after a wake. See [`SleepGate`] and `SepData::sleep_enter`.
 
 use core::sync::atomic::{AtomicPtr, Ordering};
 
@@ -23,9 +27,120 @@ use crate::SepData;
 static SEP: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 
 extern "C" {
-    fn sep_pm_register(event: unsafe extern "C" fn(bool)) -> c_int;
+    fn sep_pm_register(
+        dev: *mut c_void,
+        event: unsafe extern "C" fn(bool),
+        sleep: unsafe extern "C" fn() -> c_int,
+        wake: unsafe extern "C" fn(),
+        told: unsafe extern "C" fn() -> bool,
+    ) -> c_int;
     fn sep_pm_unregister();
     fn sep_pm_keep_domains(dev: *mut c_void) -> c_int;
+    fn sep_pm_clear_dev_disable(dev: *mut c_void) -> c_int;
+    fn sep_pm_dart_restore(dev: *mut c_void);
+    fn sep_pm_commit_prepare(
+        dev: *mut c_void,
+        mbox: *mut c_void,
+        msg0: u64,
+        msg1: u32,
+        reply: u64,
+        mask: u64,
+    ) -> c_int;
+    fn sep_pm_commit_finish(dev: *mut c_void) -> c_int;
+    pub(crate) static sep_pm_ops: kernel::bindings::dev_pm_ops;
+}
+
+/// Who may use the mailbox around a firmware-driven suspend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SleepGate {
+    /// Anyone.
+    Open = 0,
+    /// Replies to what the enclave asked, and the sleep request itself.
+    Draining = 1,
+    /// Nobody until the wake: the enclave is gated or about to be.
+    Told = 2,
+    /// Nobody: a previous wake failed. New firmware sleeps refuse until reboot.
+    Lost = 3,
+}
+
+impl SleepGate {
+    pub(crate) fn from_u32(v: u32) -> SleepGate {
+        match v {
+            0 => SleepGate::Open,
+            1 => SleepGate::Draining,
+            2 => SleepGate::Told,
+            _ => SleepGate::Lost,
+        }
+    }
+
+    pub(crate) fn may_request(self) -> bool {
+        self == SleepGate::Open
+    }
+
+    pub(crate) fn may_reply(self) -> bool {
+        matches!(self, SleepGate::Open | SleepGate::Draining)
+    }
+
+    /// The enclave may be gated, so a wake has to look.
+    pub(crate) fn needs_wake(self) -> bool {
+        matches!(self, SleepGate::Told | SleepGate::Lost)
+    }
+}
+
+/// Stages `request` for the irreversible commit, with RX held until physical wake.
+/// Unsupported providers/transports refuse here; device suspend never sends SLEEP.
+pub(crate) fn leave_for_commit(
+    dev: &kernel::device::Device,
+    mbox: *mut kernel::bindings::apple_mbox,
+    request: kernel::soc::apple::mailbox::Message,
+    reply: u64,
+    mask: u64,
+) -> Result<()> {
+    // SAFETY: `dev` is the bound SEP device and `mbox` its mailbox, which outlives the sleep:
+    // `commit_finish` takes the request back at the resume.
+    let rc = unsafe {
+        sep_pm_commit_prepare(
+            dev.as_raw().cast(),
+            mbox.cast(),
+            request.msg0,
+            request.msg1,
+            reply,
+            mask,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(Error::from_errno(rc))
+    }
+}
+
+/// Finishes a staged request. A sent request requires a real firmware return;
+/// the C boundary terminates an impossible sent-without-sleep unwind. `None` if unstaged.
+pub(crate) fn commit_finish(dev: &kernel::device::Device) -> Option<bool> {
+    // SAFETY: `dev` is the bound SEP device.
+    let rc = unsafe { sep_pm_commit_finish(dev.as_raw().cast()) };
+    if rc < 0 {
+        None
+    } else {
+        Some(rc > 0)
+    }
+}
+
+/// Puts the enclave's DART back if it lost its state, before the doorbell.
+pub(crate) fn dart_restore(dev: &kernel::device::Device) {
+    // SAFETY: `dev` is the bound SEP device.
+    unsafe { sep_pm_dart_restore(dev.as_raw().cast()) };
+}
+
+/// Lets a gated enclave start again. Writes only if the bit is set.
+pub(crate) fn clear_dev_disable(dev: &kernel::device::Device) -> Result<()> {
+    // SAFETY: `dev` is the bound SEP device.
+    let rc = unsafe { sep_pm_clear_dev_disable(dev.as_raw().cast()) };
+    if rc != 0 {
+        return Err(Error::from_errno(rc));
+    }
+    Ok(())
 }
 
 /// Attaches every power domain of a multi-domain SEP node and keeps them on
@@ -92,7 +207,41 @@ unsafe extern "C" fn pm_event(entering: bool) {
     sleep_event(&*sep, entering);
 }
 
+/// Runs `f` on the registered instance. Only for callbacks that
+/// `sep_pm_unregister` waits for or that the bound device excludes.
+fn with_sep<R>(none: R, f: impl FnOnce(&SepData) -> R) -> R {
+    let ptr = SEP.load(Ordering::Acquire);
+    if ptr.is_null() {
+        return none;
+    }
+    // SAFETY: as in `pm_event`.
+    let sep = unsafe { <Arc<SepData> as ForeignOwnable>::borrow(ptr) };
+    f(&*sep)
+}
+
+/// # Safety
+/// Called by `pm_shim.c` from the device's suspend callback.
+unsafe extern "C" fn pm_sleep() -> c_int {
+    with_sep(0, |sep| match sep.sleep_enter() {
+        Ok(()) => 0,
+        Err(e) => e.to_errno(),
+    })
+}
+
+/// # Safety
+/// Called by `pm_shim.c` from the device's resume callback.
+unsafe extern "C" fn pm_wake() {
+    with_sep((), |sep| sep.sleep_exit());
+}
+
+/// # Safety
+/// Called by `pm_shim.c`, whether or not the device suspended.
+unsafe extern "C" fn pm_told() -> bool {
+    with_sep(false, |sep| sep.sleep_gate() == SleepGate::Told)
+}
+
 pub(crate) fn register(sep: Arc<SepData>) -> Result<()> {
+    let dev: *mut c_void = sep.dev.as_raw().cast();
     let ptr = sep.into_foreign();
 
     if SEP
@@ -111,7 +260,7 @@ pub(crate) fn register(sep: Arc<SepData>) -> Result<()> {
 
     // SAFETY: the shim stores the callback and registers a notifier block
     // that lives for the module's lifetime.
-    let rc = unsafe { sep_pm_register(pm_event) };
+    let rc = unsafe { sep_pm_register(dev, pm_event, pm_sleep, pm_wake, pm_told) };
     if rc != 0 {
         let raw = SEP.swap(core::ptr::null_mut(), Ordering::AcqRel);
         if !raw.is_null() {
@@ -184,6 +333,33 @@ mod tests {
         }
         fn release_entropy(&self) {
             self.call(RELEASE_ENTROPY);
+        }
+    }
+
+    #[test]
+    fn the_gate_lets_replies_out_until_the_enclave_is_told() {
+        assert!(SleepGate::Open.may_request());
+        assert!(SleepGate::Open.may_reply());
+        assert!(!SleepGate::Draining.may_request());
+        assert!(SleepGate::Draining.may_reply());
+        assert!(!SleepGate::Told.may_request());
+        assert!(!SleepGate::Told.may_reply());
+        assert!(!SleepGate::Lost.may_request());
+        assert!(!SleepGate::Lost.may_reply());
+    }
+
+    #[test]
+    fn only_a_told_or_lost_enclave_needs_waking() {
+        assert!(!SleepGate::Open.needs_wake());
+        assert!(!SleepGate::Draining.needs_wake());
+        assert!(SleepGate::Told.needs_wake());
+        assert!(SleepGate::Lost.needs_wake());
+    }
+
+    #[test]
+    fn the_gate_round_trips() {
+        for gate in [SleepGate::Open, SleepGate::Draining, SleepGate::Told, SleepGate::Lost] {
+            assert_eq!(SleepGate::from_u32(gate as u32), gate);
         }
     }
 

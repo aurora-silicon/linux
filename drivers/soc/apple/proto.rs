@@ -90,6 +90,32 @@ pub(crate) const CONTROL_REPLY_TYPE: u8 = 0x01;
 
 pub(crate) const TAG_ENTROPY: u8 = 0xE7;
 
+/// The tag of the sleep request, kept out of the pool.
+pub(crate) const TAG_SLEEP: u8 = 0x08;
+
+/// The sleep request's answer, in the bits [`SLEEP_REPLY_MASK`] keeps: the control endpoint,
+/// its tag and the reply type.
+pub(crate) const SLEEP_REPLY: u64 = (EP_CONTROL as u64)
+    | ((TAG_SLEEP as u64) << MSG_TAG_SHIFT)
+    | ((CONTROL_REPLY_TYPE as u64) << MSG_TYPE_SHIFT);
+pub(crate) const SLEEP_REPLY_MASK: u64 = (1 << MSG_PARAM_SHIFT) - 1;
+
+// The answer in the trace, 0x0000_0000_0001_0800.
+static_assert!(0x0000_0000_0001_0800 & SLEEP_REPLY_MASK == SLEEP_REPLY);
+
+/// How long the enclave gets to answer the sleep request.
+pub(crate) const SLEEP_TIMEOUT_MS: u32 = 5000;
+
+/// The first message macOS sends a gated enclave after a sleep. The contents
+/// vary from sleep to sleep, so it is taken to be a doorbell. This is one of them.
+pub(crate) const WAKE_KICK: Message = Message {
+    msg0: 0xffff_ffff_a482_9303,
+    msg1: 0,
+};
+
+/// The control messages a woken enclave sends without being asked, in order.
+pub(crate) const WAKE_TYPES: [u8; 2] = [0x0d, 0x10];
+
 pub(crate) const CONTROL_TIMEOUT_MS: u32 = 2000;
 
 pub(crate) const TAG_POOL_FIRST: u8 = 0x01;
@@ -97,6 +123,7 @@ pub(crate) const TAG_POOL_LAST: u8 = 0x7e;
 
 static_assert!(TAG_POOL_FIRST > 0);
 static_assert!(TAG_POOL_LAST < TAG_ENTROPY);
+static_assert!(TAG_SLEEP >= TAG_POOL_FIRST && TAG_SLEEP <= TAG_POOL_LAST);
 
 pub(crate) struct ControlOp {
     ty: u8,
@@ -158,6 +185,19 @@ pub(crate) fn op_get_entropy() -> ControlOp {
         timeout_ms: CONTROL_TIMEOUT_MS,
         reserved_tag: true,
         name: c"GET_ENTROPY",
+    }
+}
+
+/// Asks the enclave to save its state and gate its own power domain.
+pub(crate) fn op_sleep() -> ControlOp {
+    ControlOp {
+        ty: 0x0c,
+        param: 0x02,
+        data: 0,
+        expect_reply: true,
+        timeout_ms: SLEEP_TIMEOUT_MS,
+        reserved_tag: false,
+        name: c"SLEEP",
     }
 }
 
@@ -280,6 +320,34 @@ mod tests {
         assert_eq!(f.ty, OP_OOL_INBOUND_SIZE);
         assert_eq!(f.param, EP_SBIO);
         assert_eq!(f.data_lo, 0x1234_5678);
+    }
+
+    #[test]
+    fn sleep_request_matches_the_trace() {
+        let msg = encode_control(&op_sleep(), TAG_SLEEP);
+        assert_eq!(msg.msg0, 0x0000_0000_020c_0800);
+        assert_eq!(msg.msg1, 0);
+    }
+
+    #[test]
+    fn its_answer_matches_the_trace() {
+        let reply = Message {
+            msg0: 0x0000_0000_0001_0800,
+            msg1: 0,
+        };
+        let f = decode(&reply);
+        assert_eq!(f.ep, EP_CONTROL);
+        assert_eq!(f.ty, CONTROL_REPLY_TYPE);
+        assert_eq!(f.tag, TAG_SLEEP);
+    }
+
+    #[test]
+    fn wake_messages_match_the_trace() {
+        for (raw, ty) in [(0x000d_0000u64, WAKE_TYPES[0]), (0x0010_0000u64, WAKE_TYPES[1])] {
+            let f = decode(&Message { msg0: raw, msg1: 0 });
+            assert_eq!(f.ep, EP_CONTROL);
+            assert_eq!(f.ty, ty);
+        }
     }
 
     #[test]

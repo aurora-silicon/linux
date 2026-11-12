@@ -1108,6 +1108,36 @@ kernel::of_device_table!(
     ]
 );
 
+/// A system sleep with a firmware behind it. The firmware keeps running, so what it runs for
+/// the streams has to stop first. Other variants' firmware isn't traced around a sleep.
+///
+/// # Safety
+///
+/// Called by the PM core with a live device of this driver.
+unsafe extern "C" fn aop_audio_suspend(dev: *mut bindings::device) -> i32 {
+    // SAFETY: the helper only reads a flag.
+    if !unsafe { bindings::pm_suspend_via_firmware() } {
+        return 0;
+    }
+    // SAFETY: the PM core passes a live device, and keeps unbind away for this call.
+    let dev = unsafe { device::Device::<device::Normal>::from_raw(dev) };
+    let driver = dev.get_drvdata::<AopAudio>();
+    if driver.is_null() {
+        return 0;
+    }
+    // SAFETY: this driver stored it at probe, and it stays until unbind.
+    if let AopAudio::T8140(driver) = unsafe { &*driver } {
+        driver.sleep_stop();
+    }
+    0
+}
+
+static AOP_AUDIO_PM_OPS: bindings::dev_pm_ops = bindings::dev_pm_ops {
+    suspend: Some(aop_audio_suspend),
+    // SAFETY: all-zero is a valid `dev_pm_ops`: no callbacks.
+    ..unsafe { core::mem::zeroed() }
+};
+
 /// The bound driver, as the variant set it up.
 enum AopAudio {
     /// Held for its `Drop`, which frees the card.
@@ -1120,6 +1150,10 @@ impl platform::Driver for AopAudio {
     type Data<'bound> = AopAudio;
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
+
+    fn pm_ops() -> Option<&'static bindings::dev_pm_ops> {
+        Some(&AOP_AUDIO_PM_OPS)
+    }
 
     fn probe<'bound>(
         pdev: &'bound platform::Device<Core<'_>>,

@@ -247,11 +247,79 @@ asahi_of_device_table!(
 #[cfg(CONFIG_DRM_ASAHI_G15)]
 asahi_of_device_table!();
 
+struct SleepOps(bindings::dev_pm_ops);
+
+// SAFETY: Immutable: the callbacks are plain functions.
+unsafe impl Sync for SleepOps {}
+
+/// # Safety
+///
+/// `dev` must be a device this driver is bound to, as for a PM core callback.
+unsafe fn sleep_data<'a>(dev: *mut bindings::device) -> &'a AsahiPlatformDriverData<'a> {
+    // SAFETY: Probe stored a `Pin<KBox<AsahiPlatformDriverData>>` here, and the PM core keeps the
+    // device bound for the duration of a callback.
+    unsafe { &*bindings::dev_get_drvdata(dev).cast() }
+}
+
+/// Runs before any device suspends, so the GPU goes first and work still in flight can finish.
+unsafe extern "C" fn sleep_prepare(dev: *mut bindings::device) -> core::ffi::c_int {
+    // SAFETY: Reads a global flag word.
+    if !unsafe { bindings::pm_suspend_via_firmware() } {
+        return 0;
+    }
+    // SAFETY: Called by the PM core.
+    let data = unsafe { sleep_data(dev) };
+    match data.g17.as_ref() {
+        Some(gpu) => kernel::error::from_result(|| gpu.sleep_prepare().map(|_| 0)),
+        None => EBUSY.to_errno(),
+    }
+}
+
+/// Runs after every device resumed. Does nothing unless [`sleep_prepare`] stopped the firmware.
+unsafe extern "C" fn sleep_complete(dev: *mut bindings::device) {
+    // SAFETY: Called by the PM core.
+    if let Some(gpu) = unsafe { sleep_data(dev) }.g17.as_ref() {
+        gpu.sleep_complete();
+    }
+}
+
+static SLEEP_OPS: SleepOps = SleepOps(bindings::dev_pm_ops {
+    prepare: Some(sleep_prepare),
+    complete: Some(sleep_complete),
+    // SAFETY: All-zero is the absence of every other callback.
+    ..unsafe { core::mem::zeroed() }
+});
+
+/// For a driver with no firmware restart: a sleep that powers the SoC down would lose its firmware.
+unsafe extern "C" fn sleep_refuse(_dev: *mut bindings::device) -> core::ffi::c_int {
+    // SAFETY: Reads a global flag word.
+    if unsafe { bindings::pm_suspend_via_firmware() } {
+        EBUSY.to_errno()
+    } else {
+        0
+    }
+}
+
+static SLEEP_REFUSE_OPS: SleepOps = SleepOps(bindings::dev_pm_ops {
+    prepare: Some(sleep_refuse),
+    // SAFETY: All-zero is the absence of every other callback.
+    ..unsafe { core::mem::zeroed() }
+});
+
+/// The callbacks of a driver that refuses a sleep that powers the SoC down.
+pub(crate) fn sleep_refuse_ops() -> Option<&'static bindings::dev_pm_ops> {
+    Some(&SLEEP_REFUSE_OPS.0)
+}
+
 /// Platform Driver implementation for `AsahiDriver`.
 impl platform::Driver for AsahiPlatformDriver {
     type IdInfo = ProbeConfig;
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
     type Data<'bound> = AsahiPlatformDriverData<'bound>;
+
+    fn pm_ops() -> Option<&'static bindings::dev_pm_ops> {
+        Some(&SLEEP_OPS.0)
+    }
 
     fn unbind<'bound>(_pdev: &'bound platform::Device<Core<'_>>, this: Pin<&Self::Data<'bound>>) {
         // SAFETY: Takes no arguments, process context. Clears the T6001 AGX request in the PMP report if the pmp_report.agx_vote

@@ -40,6 +40,7 @@ pub(crate) const CONFIG: Config = Config {
     m5: Some(&crate::g17::fw::m5::initdata::J714),
     adopt_root_entries: true,
     fabric_bridge: false,
+    sleep_restart: false,
     recovery_slot_keys: None,
     gpu_generation: GpuGen::G17,
     // The firmware in `fw-text` must be this build. iBoot loads the G17S build of both roles
@@ -110,6 +111,7 @@ pub(crate) const CONFIG_MAX: Config = Config {
     m5: Some(&crate::g17::fw::m5::initdata::J716C),
     adopt_root_entries: true,
     fabric_bridge: false,
+    sleep_restart: false,
     recovery_slot_keys: None,
     gpu_generation: GpuGen::G17,
     // As on the M5 Ultra, the firmware in `fw-text` must be this build. The boot loader loads
@@ -191,6 +193,7 @@ pub(crate) const CONFIG_ULTRA: Config = Config {
     m5: Some(&crate::g17::fw::m5::initdata::J775D),
     adopt_root_entries: true,
     fabric_bridge: false,
+    sleep_restart: false,
     recovery_slot_keys: None,
     gpu_generation: GpuGen::G17,
     // On bare metal nothing vouches for the firmware the boot loader left in `fw-text`: it

@@ -654,6 +654,7 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 	scoped_guard(mutex, &dcp->tb_lock) {
 		route->deactivate_xbar_done = false;
 		route->deactivate_error = 0;
+		route->sleep_parked = false;
 		route->active_xbar = xbar;
 		route->tunnel = xbar != route->xbar;
 		route->xbar_up = !route->tunnel;
@@ -703,7 +704,10 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 			return route->deactivate_error;
 		if (!route->deactivate_xbar_done) {
 			dcp_typec_route_phy_off(route);
-			if (!route->tunnel || route->xbar_up) {
+			/* Parked for a sleep, its output is already down and not held. */
+			if (route->sleep_parked) {
+				ret = 0;
+			} else if (!route->tunnel || route->xbar_up) {
 				ret = mux_control_deselect(route->active_xbar ?: route->xbar);
 			} else {
 				ret = dcp_dpxbar_preselect(route->active_xbar, MUX_IDLE_DISCONNECT);
@@ -718,6 +722,7 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 			}
 			/* Deselect always unlocks: never consume that selection twice. */
 			route->deactivate_xbar_done = true;
+			route->sleep_parked = false;
 			route->xbar_up = false;
 			if (ret) {
 				/* Idle is unproven; retain the owner and the real error. */
@@ -4598,6 +4603,53 @@ int dcp_register_typec_routes(struct apple_dcp *dcp)
 	struct dcp_route_probe_context ctx = { .dcp = dcp, .routes = routes };
 
 	return dcp_fabric_run_probe(!!routes, dcp_register_typec_routes_present, &ctx);
+}
+
+/*
+ * A sleep that reaches its commit powers the crossbar off. Take the output of a direct
+ * route down while it still has power, as a released display's is, and select it again
+ * after the wake. The route stays, and with it the display on the port.
+ */
+void dcp_typec_route_park(struct apple_dcp *dcp)
+{
+	struct apple_dcp_typec_route *route;
+	int ret;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+	route = dcp->active_typec_route;
+	if (!route || route->tunnel || !route->selected)
+		return;
+	guard(mutex)(&dcp->tb_lock);
+	if (route->deactivate_xbar_done || route->sleep_parked)
+		return;
+	/* Deselect always unlocks. */
+	ret = mux_control_deselect(route->active_xbar ?: route->xbar);
+	route->sleep_parked = true;
+	dev_dbg(dcp->dev, "display route parked for the sleep: crossbar output down: %d\n", ret);
+}
+
+void dcp_typec_route_unpark(struct apple_dcp *dcp)
+{
+	struct apple_dcp_typec_route *route;
+	int ret;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+	route = dcp->active_typec_route;
+	if (!route)
+		return;
+	guard(mutex)(&dcp->tb_lock);
+	if (!route->sleep_parked)
+		return;
+	route->sleep_parked = false;
+	ret = mux_control_try_select(route->active_xbar ?: route->xbar, route->mux_index);
+	if (ret) {
+		/* Nothing is held, so the route's release has nothing to give back. */
+		route->deactivate_xbar_done = true;
+		dev_err(dcp->dev, "display route not back after the sleep: crossbar output: %d\n",
+			ret);
+		return;
+	}
+	dev_dbg(dcp->dev, "display route back after the sleep: crossbar output up\n");
 }
 
 /*

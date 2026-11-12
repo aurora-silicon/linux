@@ -40,6 +40,7 @@
 #include <linux/rcupdate.h>
 #include <linux/reset.h>
 #include <linux/soc/apple/dart.h>
+#include <linux/soc/apple/sleep.h>
 #include <linux/soc/apple/t8132.h>
 #include <linux/soc/apple/tunable.h>
 #include <linux/suspend.h>
@@ -516,6 +517,19 @@ struct apple_pcie {
 	bool			neo_config_ready;
 	u8			neo_secondary_bus;
 	struct device		*piodma_supplier;
+	/* What it takes to come back from a deep sleep, if the loader gave it. */
+	struct apple_pcie_neo_cold *neo_cold;
+	struct notifier_block	neo_pm_nb;
+	bool			neo_sleep_armed;
+	struct work_struct	neo_recover_work;
+	bool			neo_recover;
+	/* The functions' state from the last sleep that found them answering */
+	struct pci_saved_state	*neo_fn_state[2];
+	/* Their MSI-X, set aside while they're out of reach */
+	bool			neo_fn_msix[2];
+	bool			neo_rc_down;
+	/* Down already when the sleep began: a failed wake left it unprogrammed */
+	bool			neo_rc_was_down;
 	const struct hw_info	*hw;
 	unsigned long		*bitmap;
 	struct list_head	ports;
@@ -544,6 +558,8 @@ struct apple_pcie_port {
 	unsigned int		link_irqs[2];
 	u32			saved_intmask;
 	int			sid_map_sz;
+	struct gpio_desc	*perst_gpio;
+	struct gpio_desc	*pwren_gpio;
 	int			idx;
 	bool			started;
 	bool			needs_stop;
@@ -2700,6 +2716,13 @@ static int apple_pcie_setup_link(struct apple_pcie *pcie,
 	u32 stat;
 	int ret;
 
+	/* Bringing the link up again, after a deep sleep. */
+	if (port->perst_gpio) {
+		reset = port->perst_gpio;
+		pwren = port->pwren_gpio;
+		goto have_gpios;
+	}
+
 	/*
 	 * Assert PERST# and configure the pin as output.
 	 * The Aquantia AQC113 10GB nic used desktop macs is sensitive to
@@ -2737,7 +2760,12 @@ static int apple_pcie_setup_link(struct apple_pcie *pcie,
 		else
 			return PTR_ERR(pwren);
 	}
+	if (!num_aux_resets) {
+		port->perst_gpio = reset;
+		port->pwren_gpio = pwren;
+	}
 
+have_gpios:
 	rmw_set(PORT_APPCLK_EN, port->base + PORT_APPCLK);
 
 	/* Assert PERST# before setting up the clock */
@@ -3721,6 +3749,10 @@ static void __iomem *apple_pcie_map_bus(struct pci_bus *bus,
 	if (!pcie->hw->root_bus_only)
 		return pci_ecam_map_bus(bus, devfn, where);
 
+	/* Nothing answers on a host that has lost power and isn't set up again. */
+	if (READ_ONCE(pcie->neo_rc_down))
+		return NULL;
+
 	if (bus->number != cfg->busr.start) {
 		/* Pair with ready publication before consuming the bus number. */
 		if (!smp_load_acquire(&pcie->neo_config_ready) ||
@@ -4290,6 +4322,233 @@ out:
 	return ret;
 }
 
+/*
+ * What the bootloader did to this host at boot, on the same registers, in its
+ * order, with its tunables. On this SoC a deep sleep powers all of it off.
+ */
+struct apple_pcie_neo_cold {
+	void __iomem *axi2af;
+	void __iomem *cio3pll;
+	void __iomem *clkgen;
+	void __iomem *phy_block;
+	struct apple_tunable *axi2af_tunable;
+	struct apple_tunable *cio3pll_tunable;
+	struct apple_tunable *clkgen_tunable;
+	struct apple_tunable *phy_tunable;
+	struct apple_tunable *port_tunable;
+	struct apple_tunable *rc_tunable;
+	struct apple_tunable *rc_gen3_tunable;
+	struct apple_tunable *rc_gen4_tunable;
+	/* The port's DART, clocked by the port: restored after the port is set up. */
+	struct device *dart;
+};
+
+#define NEO_PHY_CTRL			0x0
+#define   NEO_PHY_CTRL_CLK0REQ		BIT(0)
+#define   NEO_PHY_CTRL_CLK1REQ		BIT(1)
+#define   NEO_PHY_CTRL_CLK0ACK		BIT(2)
+#define   NEO_PHY_CTRL_CLK1ACK		BIT(3)
+#define   NEO_PHY_CTRL_RESET		BIT(4)
+#define NEO_PHY_RUN			0x4
+#define NEO_PHY_READY			0x8
+#define NEO_PHY_CTRL_UP			BIT(27)
+#define NEO_PHY_SETTLE_US		300
+#define NEO_AXI_EN0			0x104
+#define NEO_AXI_EN1			0x108
+#define NEO_CLK_CTRL			0x0
+#define NEO_CLK_BUSY			BIT(31)
+#define NEO_CLK_OFF			BIT(2)
+#define NEO_CLK_START			0x4
+#define NEO_CLK_START_GO		BIT(31)
+#define NEO_PHY_BLOCK_COMMON		0x4000
+#define NEO_PHY_BLOCK_PHY		0x8000
+#define NEO_PHY_POLL_US			50000
+#define NEO_RC_WRITE_ZERO		0x04
+#define NEO_RC_READY_CFG		0x54
+#define NEO_RC_READY_START		0x50
+#define NEO_RC_READY_STAT		0x58
+#define NEO_RC_POLL_US			250000
+#define NEO_DBI_CAP_LNKCAP		0x7c
+#define NEO_DBI_CAP_LNKCAP2		0x9c
+#define   NEO_DBI_LNKCAP2_SLS		GENMASK(6, 1)
+#define NEO_DBI_CAP_LNKCTL2		0xa0
+#define NEO_DBI_PORT_LINK_CONTROL	0x710
+#define   NEO_DBI_PORT_LINK_MODE	GENMASK(21, 16)
+#define NEO_DBI_WIDTH_SPEED_CONTROL	0x80c
+#define   NEO_DBI_LINK_WIDTH		GENMASK(12, 8)
+#define   NEO_DBI_SPEED_CHANGE		BIT(17)
+#define NEO_DBI_RO_WR			0x8bc
+#define   NEO_DBI_RO_WR_EN		BIT(0)
+
+static const struct apple_pcie_reset_reg apple_pcie_neo_port_regs[] = {
+	{ 0x088, 0x00000110 },
+	{ 0x100, 0xffffffff },
+	{ 0x148, 0xffffffff },
+	{ 0x210, 0xffffffff },
+	{ 0x080, 0x00000000 },
+	{ 0x084, 0x00000000 },
+	{ 0x104, 0xfffffff0 },
+	{ 0x124, 0x00000100 },
+	{ 0x16c, 0x00000000 },
+	{ 0x13c, 0x00000000 },
+	{ 0x800, 0x00100100 },
+	{ 0x808, 0x001000ff },
+	{ 0x82c, 0x00000000 },
+};
+
+static const struct apple_pcie_reset_reg apple_pcie_neo_port_regs2[] = {
+	{ 0x130, 0x03020000 },
+	{ 0x140, 0x00000010 },
+	{ 0x144, 0x00253770 },
+	{ 0x21c, 0x00000000 },
+	{ 0x834, 0x00000000 },
+	{ 0x83c, 0x00000000 },
+};
+
+static int apple_pcie_neo_phy_clocks(void __iomem *phy)
+{
+	u32 stat;
+	int ret;
+
+	rmw_set(NEO_PHY_CTRL_CLK0REQ, phy + NEO_PHY_CTRL);
+	ret = readl_relaxed_poll_timeout(phy + NEO_PHY_CTRL, stat, stat & NEO_PHY_CTRL_CLK0ACK,
+					 10, NEO_PHY_POLL_US);
+	if (ret)
+		return ret;
+	rmw_set(NEO_PHY_CTRL_CLK1REQ, phy + NEO_PHY_CTRL);
+	return readl_relaxed_poll_timeout(phy + NEO_PHY_CTRL, stat, stat & NEO_PHY_CTRL_CLK1ACK,
+					  10, NEO_PHY_POLL_US);
+}
+
+/*
+ * The part of the block that ANS shares, from power-off in macOS's order, measured on
+ * one sleep. The sleep driver does it at the wake when ANS is bound, and it can't be
+ * redone under a running PHY.
+ */
+static int apple_pcie_neo_common_init(struct apple_pcie *pcie)
+{
+	struct apple_pcie_neo_cold *cold = pcie->neo_cold;
+	void __iomem *phy = cold->phy_block + NEO_PHY_BLOCK_PHY;
+	u32 stat, val;
+	int ret;
+
+	if (readl_relaxed(pcie->base + NEO_RC_READY_STAT) & BIT(0))
+		return 0;
+
+	rmw_set(BIT(0), cold->axi2af + NEO_AXI_EN0);
+	rmw_set(BIT(0), cold->axi2af + NEO_AXI_EN1);
+	apple_tunable_apply(cold->axi2af, cold->axi2af_tunable);
+	apple_tunable_apply(cold->cio3pll, cold->cio3pll_tunable);
+	apple_tunable_apply(cold->clkgen, cold->clkgen_tunable);
+	rmw_set(NEO_CLK_START_GO, cold->clkgen + NEO_CLK_START);
+	rmw_clear(NEO_CLK_OFF, cold->clkgen + NEO_CLK_CTRL);
+	ret = readl_relaxed_poll_timeout(cold->clkgen + NEO_CLK_CTRL, stat, !(stat & NEO_CLK_BUSY),
+					 1, NEO_PHY_POLL_US);
+	if (ret)
+		return ret;
+	apple_tunable_apply(cold->phy_block, cold->phy_tunable);
+
+	ret = apple_pcie_neo_phy_clocks(phy);
+	if (ret)
+		return ret;
+	rmw_clear(NEO_PHY_CTRL_RESET, phy + NEO_PHY_CTRL);
+	udelay(1);
+	ret = readl_relaxed_poll_timeout(phy + NEO_PHY_CTRL, stat, !(stat & NEO_PHY_CTRL_RESET),
+					 10, NEO_PHY_POLL_US);
+	if (ret)
+		return ret;
+	rmw_set(BIT(0), phy + NEO_PHY_RUN);
+	udelay(NEO_PHY_SETTLE_US);
+	rmw_set(BIT(4), phy + NEO_PHY_RUN);
+	ret = readl_relaxed_poll_timeout(phy + NEO_PHY_READY, stat, stat & BIT(0),
+					 10, NEO_PHY_POLL_US);
+	if (ret)
+		return ret;
+
+	val = readl_relaxed(cold->phy_block + NEO_PHY_BLOCK_COMMON);
+	writel_relaxed((val & ~GENMASK(1, 0)) | 1, cold->phy_block + NEO_PHY_BLOCK_COMMON);
+	rmw_set(NEO_PHY_CTRL_UP, phy + NEO_PHY_CTRL);
+
+	writel_relaxed(0, pcie->base + NEO_RC_WRITE_ZERO);
+	writel_relaxed(0x140, pcie->base + NEO_RC_READY_CFG);
+	writel_relaxed(1, pcie->base + NEO_RC_READY_START);
+
+	return readl_relaxed_poll_timeout(pcie->base + NEO_RC_READY_STAT, stat, stat & BIT(0),
+					  100, NEO_RC_POLL_US);
+}
+
+static int apple_pcie_neo_cold_init(struct apple_pcie *pcie, struct apple_pcie_port *port)
+{
+	struct apple_pcie_neo_cold *cold = pcie->neo_cold;
+	void __iomem *dbi = pcie->cfg->win + ((resource_size_t)port->idx << 15);
+	int speed = of_pci_get_max_link_speed(port->np);
+	u32 stat, val;
+	int i, ret;
+
+	ret = apple_pcie_neo_common_init(pcie);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < ARRAY_SIZE(apple_pcie_neo_port_regs); i++)
+		apple_pcie_port_writel(port, apple_pcie_neo_port_regs[i].value,
+				       apple_pcie_neo_port_regs[i].offset);
+	for (i = 0; i < 16; i++)
+		apple_pcie_port_writel(port, 0, 0x3000 + 4 * i);
+	for (i = 0; i < 512; i++)
+		apple_pcie_port_writel(port, 0, pcie->hw->port_msimap + 4 * i);
+	for (i = 0; i < ARRAY_SIZE(apple_pcie_neo_port_regs2); i++)
+		apple_pcie_port_writel(port, apple_pcie_neo_port_regs2[i].value,
+				       apple_pcie_neo_port_regs2[i].offset);
+	apple_tunable_apply(port->base, cold->port_tunable);
+	rmw_set(PORT_APPCLK_EN, port->base + PORT_APPCLK);
+
+	/* PERST# off before the PHY's clocks, as macOS has it coming from power-off. */
+	rmw_set(PORT_PERST_OFF, port->base + pcie->hw->port_perst);
+	ret = readl_relaxed_poll_timeout(port->base + PORT_STATUS, stat, stat & PORT_STATUS_READY,
+					 100, NEO_RC_POLL_US);
+	if (ret)
+		return ret;
+	rmw_clear(PORT_APPCLK_CGDIS, port->base + PORT_APPCLK);
+	ret = readl_relaxed_poll_timeout(port->base + PORT_LINKSTS, stat,
+					 !(stat & PORT_LINKSTS_BUSY), 100, NEO_RC_POLL_US);
+	if (ret)
+		return ret;
+
+	rmw_clear(NEO_PHY_CTRL_CLK0REQ | NEO_PHY_CTRL_CLK1REQ, port->phy + NEO_PHY_CTRL);
+	ret = apple_pcie_neo_phy_clocks(port->phy);
+	if (ret)
+		return ret;
+	rmw_clear(NEO_PHY_CTRL_RESET, port->phy + NEO_PHY_CTRL);
+	rmw_set(BIT(9), port->phy + NEO_PHY_CTRL);
+	rmw_set(BIT(10), port->phy + NEO_PHY_CTRL);
+
+	rmw_set(NEO_DBI_RO_WR_EN, dbi + NEO_DBI_RO_WR);
+	apple_tunable_apply(dbi, cold->rc_tunable);
+	apple_tunable_apply(dbi, cold->rc_gen3_tunable);
+	apple_tunable_apply(dbi, cold->rc_gen4_tunable);
+	if (speed > 0) {
+		val = readl_relaxed(dbi + NEO_DBI_CAP_LNKCAP);
+		writel_relaxed((val & ~PCI_EXP_LNKCAP_SLS) | speed, dbi + NEO_DBI_CAP_LNKCAP);
+		val = readl_relaxed(dbi + NEO_DBI_CAP_LNKCAP2);
+		writel_relaxed((val & ~NEO_DBI_LNKCAP2_SLS) |
+			       FIELD_PREP(NEO_DBI_LNKCAP2_SLS, (1 << speed) - 1),
+			       dbi + NEO_DBI_CAP_LNKCAP2);
+		writew_relaxed((readw_relaxed(dbi + NEO_DBI_CAP_LNKCTL2) & ~PCI_EXP_LNKCTL2_TLS) |
+			       speed, dbi + NEO_DBI_CAP_LNKCTL2);
+		rmw_set(NEO_DBI_SPEED_CHANGE, dbi + NEO_DBI_WIDTH_SPEED_CONTROL);
+	}
+	val = readl_relaxed(dbi + NEO_DBI_PORT_LINK_CONTROL) & ~NEO_DBI_PORT_LINK_MODE;
+	writel_relaxed(val | FIELD_PREP(NEO_DBI_PORT_LINK_MODE, 1),
+		       dbi + NEO_DBI_PORT_LINK_CONTROL);
+	val = readl_relaxed(dbi + NEO_DBI_WIDTH_SPEED_CONTROL) & ~NEO_DBI_LINK_WIDTH;
+	writel_relaxed(val | FIELD_PREP(NEO_DBI_LINK_WIDTH, 1), dbi + NEO_DBI_WIDTH_SPEED_CONTROL);
+	val = readl_relaxed(dbi + NEO_DBI_CAP_LNKCAP) & ~PCI_EXP_LNKCAP_MLW;
+	writel_relaxed(val | FIELD_PREP(PCI_EXP_LNKCAP_MLW, 1), dbi + NEO_DBI_CAP_LNKCAP);
+	rmw_clear(NEO_DBI_RO_WR_EN, dbi + NEO_DBI_RO_WR);
+
+	return 0;
+}
+
 static int apple_pcie_attach_domains(struct apple_pcie *pcie)
 {
 	struct device *dev = pcie->dev;
@@ -4326,6 +4585,169 @@ static int apple_pcie_attach_domains(struct apple_pcie *pcie)
 		pcie->pds[i].dev = pcie->pd_list ? pcie->pd_list->pd_devs[i] : dev;
 
 	return 0;
+}
+
+static void apple_pcie_neo_recover_work(struct work_struct *work);
+
+/* A radio left unusable by the wake, or its link. POST_SUSPEND runs this once all is thawed. */
+static void apple_pcie_neo_recover(void *data)
+{
+	struct apple_pcie *pcie = data;
+
+	WRITE_ONCE(pcie->neo_recover, true);
+	/* Pairs with the barrier at PM_POST_SUSPEND: one side sees the other's write. */
+	smp_mb();
+	if (!READ_ONCE(pcie->neo_sleep_armed))
+		queue_work(system_unbound_wq, &pcie->neo_recover_work);
+}
+
+/* Runs before the freezer. The radios stay bound, and their drivers do their own suspend. */
+static int apple_pcie_neo_pm_notify(struct notifier_block *nb, unsigned long action, void *unused)
+{
+	struct apple_pcie *pcie = container_of(nb, struct apple_pcie, neo_pm_nb);
+
+	switch (action) {
+	case PM_SUSPEND_PREPARE:
+		if (pm_suspend_default_s2idle())
+			break;
+		flush_work(&pcie->neo_recover_work);
+		pcie->neo_sleep_armed = true;
+		apple_piodma_bootstrap_set_sleep(pcie->piodma_supplier, true);
+		break;
+	case PM_POST_SUSPEND:
+		if (!pcie->neo_sleep_armed)
+			break;
+		WRITE_ONCE(pcie->neo_sleep_armed, false);
+		/* Pairs with the barrier in the recovery request. */
+		smp_mb();
+		apple_piodma_bootstrap_set_sleep(pcie->piodma_supplier, false);
+		if (READ_ONCE(pcie->neo_recover))
+			queue_work(system_unbound_wq, &pcie->neo_recover_work);
+		break;
+	default:
+		break;
+	}
+
+	return NOTIFY_DONE;
+}
+
+static void __iomem *apple_pcie_neo_map(struct platform_device *pdev, const char *name,
+					struct resource **res)
+{
+	*res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
+	if (!*res)
+		return IOMEM_ERR_PTR(-ENOENT);
+
+	/* These overlap each other and the port PHYs, so they can't be claimed. */
+	return devm_ioremap(&pdev->dev, (*res)->start, resource_size(*res)) ?:
+	       IOMEM_ERR_PTR(-ENOMEM);
+}
+
+/* A shared block and the tunable the loader publishes for it. */
+static int apple_pcie_neo_get(struct platform_device *pdev, const char *name, const char *prop,
+			      void __iomem **base, struct apple_tunable **tunable)
+{
+	struct resource *res;
+
+	*base = apple_pcie_neo_map(pdev, name, &res);
+	if (IS_ERR(*base))
+		return PTR_ERR(*base);
+	*tunable = devm_apple_tunable_parse(&pdev->dev, pdev->dev.of_node, prop, res);
+
+	return PTR_ERR_OR_ZERO(*tunable);
+}
+
+/* The DART in the host's iommu-map, which reads nothing until the port is set up. */
+static struct device *apple_pcie_neo_dart(struct device *dev)
+{
+	struct device_node *np = of_parse_phandle(dev->of_node, "iommu-map", 1);
+	struct platform_device *pdev = np ? of_find_device_by_node(np) : NULL;
+	int ret;
+
+	of_node_put(np);
+	if (!pdev)
+		return NULL;
+	/* The reference is kept: this host can't be unbound. */
+	ret = apple_dart_set_host_resumes(&pdev->dev);
+	/* The DART resumes, and gates itself, before this host restores it. */
+	if (!ret && !device_link_add(dev, &pdev->dev, DL_FLAG_STATELESS))
+		ret = -EINVAL;
+	if (ret) {
+		put_device(&pdev->dev);
+		dev_warn(dev, "no deep sleep: its DART can't wait for the port: %d\n", ret);
+		return NULL;
+	}
+	return &pdev->dev;
+}
+
+/* Without all of this the host can't come back, and a deep sleep stays refused. */
+static void apple_pcie_neo_sleep_probe(struct platform_device *pdev, struct apple_pcie *pcie)
+{
+	struct device *dev = &pdev->dev;
+	struct device_node *np = dev->of_node;
+	struct apple_pcie_neo_cold *cold;
+	struct apple_pcie_port *port;
+	struct resource *res, *cfg;
+	int ret;
+
+	port = list_first_entry_or_null(&pcie->ports, struct apple_pcie_port, entry);
+	cfg = platform_get_resource_byname(pdev, IORESOURCE_MEM, "config");
+	if (!port || !cfg || !port->perst_gpio || !port->phy) {
+		dev_warn(dev, "no deep sleep: nothing here took the link up, so no pins to restart it\n");
+		return;
+	}
+	cold = devm_kzalloc(dev, sizeof(*cold), GFP_KERNEL);
+	if (!cold)
+		return;
+
+	if (apple_pcie_neo_get(pdev, "axi2af", "apple,tunable-axi2af", &cold->axi2af,
+			       &cold->axi2af_tunable) ||
+	    apple_pcie_neo_get(pdev, "cio3pll", "apple,tunable-cio3pll", &cold->cio3pll,
+			       &cold->cio3pll_tunable) ||
+	    apple_pcie_neo_get(pdev, "clkgen", "apple,tunable-clkgen", &cold->clkgen,
+			       &cold->clkgen_tunable))
+		goto absent;
+	cold->phy_block = apple_pcie_neo_map(pdev, "phy-block", &res);
+	if (IS_ERR(cold->phy_block))
+		goto absent;
+	cold->phy_tunable = devm_apple_tunable_parse(dev, np, "apple,tunable-phy", res);
+	if (IS_ERR(cold->phy_tunable))
+		goto absent;
+
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "port0");
+	if (!res)
+		goto absent;
+	cold->port_tunable = devm_apple_tunable_parse(dev, port->np, "apple,tunable-port", res);
+	if (IS_ERR(cold->port_tunable))
+		goto absent;
+	cold->rc_tunable = devm_apple_tunable_parse(dev, port->np, "apple,tunable-rc", cfg);
+	if (IS_ERR(cold->rc_tunable))
+		goto absent;
+	cold->rc_gen3_tunable = devm_apple_tunable_parse(dev, port->np, "apple,tunable-rc-gen3",
+							 cfg);
+	if (IS_ERR(cold->rc_gen3_tunable))
+		goto absent;
+	cold->rc_gen4_tunable = devm_apple_tunable_parse(dev, port->np, "apple,tunable-rc-gen4",
+							 cfg);
+	if (IS_ERR(cold->rc_gen4_tunable))
+		goto absent;
+	cold->dart = apple_pcie_neo_dart(dev);
+	if (!cold->dart)
+		goto absent;
+
+	pcie->neo_cold = cold;
+	INIT_WORK(&pcie->neo_recover_work, apple_pcie_neo_recover_work);
+	apple_piodma_bootstrap_set_recover(pcie->piodma_supplier, apple_pcie_neo_recover, pcie);
+	pcie->neo_pm_nb.notifier_call = apple_pcie_neo_pm_notify;
+	ret = register_pm_notifier(&pcie->neo_pm_nb);
+	if (ret)
+		pcie->neo_cold = NULL;
+	else
+		dev_dbg(dev, "deep sleep: radios stay powered, link stopped and retrained\n");
+	return;
+
+absent:
+	dev_warn(dev, "no deep sleep: the loader didn't publish what this host needs\n");
 }
 
 static int apple_pcie_probe(struct platform_device *pdev)
@@ -4542,6 +4964,8 @@ static int apple_pcie_probe(struct platform_device *pdev)
 		if (ret)
 			dev_err(dev, "radio admission failed=%d; host/supplier retained, no retry\n",
 				ret);
+		else
+			apple_pcie_neo_sleep_probe(pdev, pcie);
 		return 0;
 	}
 
@@ -5251,6 +5675,8 @@ static void apple_pcie_stop_for_sleep(struct device *dev)
 		apple_pcie_tunnel_hierarchy_lost(dev);
 }
 
+static void apple_pcie_neo_save_functions(struct apple_pcie *pcie);
+
 /*
  * The J716c radio drivers save PCI state without entering D3. The PCI core
  * keeps the root port in D0 as well. Its host and DART have no switchable
@@ -5307,6 +5733,34 @@ static int apple_pcie_check_adopted_s2idle(struct apple_pcie *pcie)
 static int apple_pcie_suspend_noirq(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
+
+	if (pcie->neo_sleep_armed) {
+		struct apple_pcie_port *port;
+
+		pcie->neo_rc_was_down = READ_ONCE(pcie->neo_rc_down);
+		/* A port that didn't come back from the last sleep keeps what it saved then. */
+		list_for_each_entry(port, &pcie->ports, entry) {
+			int i;
+
+			apple_pcie_port_disable_irq(port);
+			if (pcie->neo_rc_was_down)
+				continue;
+			port->saved_intmask = apple_pcie_port_readl(port, PORT_INTMSK);
+			for_each_set_bit(i, port->sid_map, port->sid_map_sz)
+				port->saved_rid2sid[i] =
+					apple_pcie_port_readl(port, port_rid2sid_offset(port, i));
+		}
+		/* The functions too: the core read them through closed config space. */
+		if (!pcie->neo_rc_was_down)
+			apple_pcie_neo_save_functions(pcie);
+		WRITE_ONCE(pcie->neo_rc_down, true);
+		/*
+		 * Genpd would gate the host here, and an abandoned sleep then finds
+		 * it unprogrammed with nothing to bring it up. The commit lowers it.
+		 */
+		device_set_awake_path(dev);
+		return 0;
+	}
 
 	/*
 	 * The managed radio has no suspend boundary of its own; suspend-to-idle
@@ -5373,6 +5827,324 @@ static int apple_pcie_reset_for_resume(struct apple_pcie *pcie)
 	return 0;
 }
 
+/*
+ * The radio kept its power and firmware, in reset since the commit. Its rail isn't touched:
+ * cycling it, or the port's own reset, is what a cold start needs. PERST# released, the link
+ * trains. Device interrupts are off in this phase, so this polls for it.
+ */
+static int apple_pcie_neo_link_up(struct apple_pcie *pcie, struct apple_pcie_port *port)
+{
+	u32 stat;
+	int ret;
+
+	usleep_range(1000, 2000);
+	ret = gpiod_set_value_cansleep(port->perst_gpio, 0);
+	if (ret)
+		return ret;
+	/* 100 ms after PERST# as at boot, and after the link (PCIe r5.0, 6.6.1). */
+	msleep(100);
+	ret = readl_relaxed_poll_timeout(port->base + PORT_STATUS, stat, stat & PORT_STATUS_READY,
+					 100, 250000);
+	if (ret)
+		return ret;
+	apple_pcie_port_writel(port, PORT_LTSSMCTL_START, PORT_LTSSMCTL);
+	ret = readl_relaxed_poll_timeout(port->base + PORT_LINKSTS, stat, stat & PORT_LINKSTS_UP,
+					 100, link_up_timeout * 1000);
+	if (ret)
+		return ret;
+	apple_pcie_port_writel(port, BIT(PORT_INT_LINK_UP), PORT_INTSTAT);
+	msleep(100);
+
+	return 0;
+}
+
+/*
+ * The PCI core saves the functions again at every sleep, and with the radio down it reads them
+ * through closed config space. Keep the last state they saved while they answered.
+ */
+static void apple_pcie_neo_save_functions(struct apple_pcie *pcie)
+{
+	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
+	struct pci_dev *root, *fn;
+	int i;
+
+	/* Pairs with the release once the functions' configuration is loaded. */
+	if (!smp_load_acquire(&pcie->neo_config_ready))
+		return;
+	root = pci_get_slot(bridge->bus, PCI_DEVFN(0, 0));
+	if (!root)
+		return;
+	for (i = 0; root->subordinate && i < ARRAY_SIZE(pcie->neo_fn_state); i++) {
+		fn = pci_get_slot(root->subordinate, PCI_DEVFN(0, i));
+		if (!fn)
+			continue;
+		kfree(pcie->neo_fn_state[i]);
+		pcie->neo_fn_state[i] = pci_store_saved_state(fn);
+		pci_dev_put(fn);
+	}
+	pci_dev_put(root);
+}
+
+/* With the link back: what the core restores next is that state. */
+static void apple_pcie_neo_load_functions(struct apple_pcie *pcie, struct pci_dev *root)
+{
+	struct pci_dev *fn;
+	int i;
+
+	for (i = 0; root->subordinate && i < ARRAY_SIZE(pcie->neo_fn_state); i++) {
+		fn = pci_get_slot(root->subordinate, PCI_DEVFN(0, i));
+		if (!fn)
+			continue;
+		if (pcie->neo_fn_state[i])
+			pci_load_saved_state(fn, pcie->neo_fn_state[i]);
+		pci_dev_put(fn);
+	}
+}
+
+/*
+ * Closed config space keeps the PCI core's restore out of the functions, except for one thing:
+ * it writes an MSI-X table in their BAR, with no check of its own. With the functions out of
+ * reach, set that aside so that it has nothing to write; their reach back puts it in place.
+ */
+static void apple_pcie_neo_msix_gate(struct apple_pcie *pcie, bool reachable)
+{
+	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
+	struct pci_dev *root, *fn;
+	int i;
+
+	root = pci_get_slot(bridge->bus, PCI_DEVFN(0, 0));
+	if (!root)
+		return;
+	for (i = 0; root->subordinate && i < ARRAY_SIZE(pcie->neo_fn_msix); i++) {
+		fn = pci_get_slot(root->subordinate, PCI_DEVFN(0, i));
+		if (!fn)
+			continue;
+		if (reachable && pcie->neo_fn_msix[i]) {
+			fn->msix_enabled = 1;
+			pcie->neo_fn_msix[i] = false;
+		} else if (!reachable && fn->msix_enabled) {
+			fn->msix_enabled = 0;
+			pcie->neo_fn_msix[i] = true;
+		}
+		pci_dev_put(fn);
+	}
+	pci_dev_put(root);
+}
+
+/*
+ * The link back, and the one engine read that native ECAM needs on it. The root port's
+ * bus number is restored first, as that read crosses it. Not a firmware load.
+ */
+static int apple_pcie_neo_radio_up(struct apple_pcie *pcie, struct apple_pcie_port *port)
+{
+	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
+	struct pci_dev *root;
+	int ret;
+
+	root = pci_get_slot(bridge->bus, PCI_DEVFN(0, 0));
+	if (!root)
+		return -ENODEV;
+	pci_restore_state(root);
+	ret = apple_pcie_neo_link_up(pcie, port);
+	if (!ret)
+		ret = apple_piodma_bootstrap_power_lost(pcie->piodma_supplier);
+	if (!ret)
+		ret = apple_piodma_bootstrap_prime(pcie->piodma_supplier, root);
+	if (!ret) {
+		apple_piodma_bootstrap_admitted(pcie->piodma_supplier);
+		apple_pcie_neo_load_functions(pcie, root);
+		/* The functions' configuration before the flag that says it's there. */
+		smp_store_release(&pcie->neo_config_ready, true);
+		apple_pcie_neo_msix_gate(pcie, true);
+	}
+	pci_dev_put(root);
+
+	return ret;
+}
+
+/*
+ * The rail is the one thing that brings back a chip whose link won't train: macOS's last resort
+ * for a dead chip too. A cold chip then has its firmware loaded by the probe that follows.
+ */
+static int apple_pcie_neo_rail_cycle(struct apple_pcie *pcie, struct apple_pcie_port *port,
+				     struct pci_dev *root)
+{
+	struct pci_dev *fn;
+	int i, ret;
+
+	ret = gpiod_set_value_cansleep(port->perst_gpio, 1);
+	if (!ret)
+		ret = gpiod_set_value_cansleep(port->pwren_gpio, 0);
+	if (ret)
+		return ret;
+	msleep(pcie->hw->pwren_off_ms);
+	ret = gpiod_set_value_cansleep(port->pwren_gpio, 1);
+	if (ret)
+		return ret;
+	msleep(pcie->hw->pwren_on_ms);
+	ret = apple_pcie_neo_radio_up(pcie, port);
+	if (ret)
+		return ret;
+	/* The PCI core's restore found them gone. Wi-Fi's stop needs its BAR back. */
+	for (i = 0; root->subordinate && i < ARRAY_SIZE(pcie->neo_fn_state); i++) {
+		fn = pci_get_slot(root->subordinate, PCI_DEVFN(0, i));
+		if (!fn)
+			continue;
+		pci_set_power_state(fn, PCI_D0);
+		pci_restore_state(fn);
+		pci_dev_put(fn);
+	}
+	return 0;
+}
+
+/* The way a hotplug would. Bluetooth first: Wi-Fi's reset needs it gone. */
+static int apple_pcie_neo_stop_functions(struct apple_pcie *pcie, struct pci_dev *root)
+{
+	struct pci_dev *fn;
+	int ret = 0;
+
+	/* Stopping Wi-Fi writes its BAR, which needs the chip to answer. */
+	fn = root->subordinate ? pci_get_slot(root->subordinate, PCI_DEVFN(0, 0)) : NULL;
+	if (fn && !pci_device_is_present(fn))
+		ret = -ENODEV;
+	pci_dev_put(fn);
+	if (ret)
+		return ret;
+
+	pci_lock_rescan_remove();
+	if (root->subordinate) {
+		fn = pci_get_slot(root->subordinate, PCI_DEVFN(0, 1));
+		if (fn) {
+			pci_stop_and_remove_bus_device(fn);
+			pci_dev_put(fn);
+		}
+		fn = pci_get_slot(root->subordinate, PCI_DEVFN(0, 0));
+		if (fn) {
+			ret = apple_piodma_bootstrap_radio_stop(pcie->piodma_supplier, fn);
+			if (!ret)
+				pci_stop_and_remove_bus_device(fn);
+			pci_dev_put(fn);
+		}
+	}
+	pci_unlock_rescan_remove();
+
+	return ret;
+}
+
+static void apple_pcie_neo_scan_functions(struct pci_dev *root)
+{
+	pci_lock_rescan_remove();
+	if (root->subordinate) {
+		pci_scan_child_bus(root->subordinate);
+		pci_assign_unassigned_bridge_resources(root);
+		pci_bus_add_devices(root->subordinate);
+	}
+	pci_unlock_rescan_remove();
+}
+
+/*
+ * Keeping the firmware across a sleep is what's wanted, and this is for when it didn't work: the
+ * radio lost power, its rings or its IPC. Removing the functions resets the chip, and their
+ * probes load the firmware again from ROM, as at boot. The link only needs its rail cycled if
+ * it didn't come back. Otherwise the next sleep tries the whole wake again.
+ */
+static void apple_pcie_neo_recover_work(struct work_struct *work)
+{
+	struct apple_pcie *pcie = container_of(work, struct apple_pcie, neo_recover_work);
+	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
+	struct apple_pcie_port *port;
+	struct pci_dev *root;
+	int ret = 0;
+
+	WRITE_ONCE(pcie->neo_recover, false);
+	port = list_first_entry(&pcie->ports, struct apple_pcie_port, entry);
+	root = pci_get_slot(bridge->bus, PCI_DEVFN(0, 0));
+	if (!root)
+		return;
+	if (READ_ONCE(pcie->neo_rc_down)) {
+		ret = -EIO;
+		goto out;
+	}
+	/* Pairs with the release once the functions' configuration is loaded. */
+	if (!smp_load_acquire(&pcie->neo_config_ready)) {
+		dev_warn(pcie->dev, "radio link down after sleep: cycling its rail\n");
+		ret = apple_pcie_neo_rail_cycle(pcie, port, root);
+		if (ret)
+			goto out;
+	}
+	ret = apple_pcie_neo_stop_functions(pcie, root);
+	if (ret != -ENODEV)
+		apple_pcie_neo_scan_functions(root);
+out:
+	if (ret)
+		dev_err(pcie->dev, "radios stay down until the next sleep: %d\n", ret);
+	else
+		dev_info(pcie->dev, "radios restarted after sleep, firmware loaded again\n");
+	pci_dev_put(root);
+}
+
+/*
+ * Before the PCI core restores the functions, which need the link. macOS's host bridge
+ * holds them back the same way until its radio port is enabled.
+ */
+static int apple_pcie_neo_resume_noirq(struct apple_pcie *pcie)
+{
+	struct apple_pcie_port *port;
+	int i, ret = 0;
+
+	/* Refused: as before the sleep. A host a failed wake left unprogrammed stays down. */
+	if (!pm_resume_via_firmware()) {
+		if (pcie->neo_rc_was_down)
+			return 0;
+		list_for_each_entry(port, &pcie->ports, entry)
+			apple_pcie_port_enable_irq(port);
+		WRITE_ONCE(pcie->neo_rc_down, false);
+		return 0;
+	}
+
+	list_for_each_entry(port, &pcie->ports, entry) {
+		/* The pin controller just put it back as it was: released, with no clock yet. */
+		ret = gpiod_set_value_cansleep(port->perst_gpio, 1);
+		if (!ret)
+			ret = apple_pcie_neo_cold_init(pcie, port);
+		if (ret) {
+			dev_err(pcie->dev, "host did not come back after sleep: %d\n", ret);
+			WRITE_ONCE(pcie->neo_config_ready, false);
+			apple_pcie_neo_msix_gate(pcie, false);
+			return ret;
+		}
+		apple_pcie_tunnel_restore_irq_hw(port);
+		apple_pcie_port_writel(port, port->saved_intmask, PORT_INTMSK);
+		for_each_set_bit(i, port->sid_map, port->sid_map_sz)
+			apple_pcie_rid2sid_write(port, i, port->saved_rid2sid[i]);
+	}
+	ret = apple_dart_host_resume(pcie->neo_cold->dart);
+	if (ret) {
+		WRITE_ONCE(pcie->neo_config_ready, false);
+		apple_pcie_neo_msix_gate(pcie, false);
+		return ret;
+	}
+	WRITE_ONCE(pcie->neo_rc_down, false);
+	apple_sleep_radio_port_up();
+
+	/* A failed link stays clocked, and its functions read as gone until the next sleep. */
+	port = list_first_entry(&pcie->ports, struct apple_pcie_port, entry);
+	ret = apple_pcie_neo_radio_up(pcie, port);
+	if (ret) {
+		/* The functions' restore then finds nothing, and their drivers say so. */
+		WRITE_ONCE(pcie->neo_config_ready, false);
+		apple_pcie_neo_msix_gate(pcie, false);
+		dev_err(pcie->dev, "radios did not come back after sleep: %d\n", ret);
+		apple_pcie_neo_recover(pcie);
+	} else {
+		dev_dbg(pcie->dev, "radio link back after sleep, rail and firmware kept\n");
+	}
+	list_for_each_entry(port, &pcie->ports, entry)
+		apple_pcie_port_enable_irq(port);
+
+	return 0;
+}
+
 static int apple_pcie_resume_noirq(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
@@ -5381,6 +6153,8 @@ static int apple_pcie_resume_noirq(struct device *dev)
 
 	/* The domain's hold for the sleep ends first, whatever follows. */
 	apple_pcie_release_domains(pcie);
+	if (pcie->neo_sleep_armed)
+		return apple_pcie_neo_resume_noirq(pcie);
 	if (pcie->hw->adopt_link) {
 		if (!pcie->link_kept)
 			return 0;
