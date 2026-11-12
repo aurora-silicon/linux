@@ -316,7 +316,16 @@ struct brcmf_cfg80211_vif_event {
  * struct brcmf_cfg80211_wowl - wowl related information.
  *
  * @active: set on suspend, cleared on resume.
+ * @lpas: associated sleep uses LPAS rather than the standard WoWLAN iovars.
  * @pre_pmmode: firmware PM mode at entering suspend.
+ * @pre_arp_ol: ARP offload mode at entering suspend.
+ * @pre_arpoe: ARP offload enable at entering suspend.
+ * @pre_ndoe: neighbour-discovery offload enable at entering suspend.
+ * @pre_nolinkup: link-up event suppression at entering suspend.
+ * @pre_pkt_filter_mode: packet-filter master mode at entering suspend.
+ * @lpas_filters: LPAS packet filters installed for this sleep (bit per id).
+ * @lpas_event_mask: firmware event mask saved across associated sleep.
+ * @lpas_event_mask_len: size of @lpas_event_mask.
  * @nd: net dectect data.
  * @nd_info: helper struct to pass to cfg80211.
  * @nd_data_wait: wait queue to sync net detect data.
@@ -325,7 +334,16 @@ struct brcmf_cfg80211_vif_event {
  */
 struct brcmf_cfg80211_wowl {
 	bool active;
+	bool lpas;
 	u32 pre_pmmode;
+	u32 pre_arp_ol;
+	u32 pre_arpoe;
+	u32 pre_ndoe;
+	u32 pre_nolinkup;
+	u32 pre_pkt_filter_mode;
+	unsigned long lpas_filters;
+	u8 *lpas_event_mask;
+	size_t lpas_event_mask_len;
 	struct cfg80211_wowlan_nd_match *nd;
 	struct cfg80211_wowlan_nd_info *nd_info;
 	wait_queue_head_t nd_data_wait;
