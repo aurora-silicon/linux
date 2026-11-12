@@ -30,9 +30,9 @@ static struct apple_isp *isp_test_alloc(struct kunit *test)
 }
 
 /*
- * With a capture watchdog the indicator is drawn by firmware Linux does not
- * run: streaming is refused before the camera is started, and machines
- * without one are let through.
+ * With a capture watchdog a stream needs the indicator the display draws:
+ * without a display that confirms it, streaming is refused before the
+ * camera is started. Machines without a watchdog are let through.
  */
 static void isp_test_indicator_gate(struct kunit *test)
 {
@@ -47,6 +47,8 @@ static void isp_test_indicator_gate(struct kunit *test)
 	isp->wdt = (void __iomem *)kunit_kzalloc(test, 0x10, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, (void __force *)isp->wdt);
 
+	KUNIT_EXPECT_EQ(test, apple_isp_indicator_acquire(isp), -EPERM);
+	KUNIT_EXPECT_FALSE(test, isp->indicator_held);
 	KUNIT_EXPECT_EQ(test, apple_isp_check_indicator(isp), -EPERM);
 	KUNIT_EXPECT_EQ(test, apple_isp_start_streaming(isp), -EPERM);
 	KUNIT_EXPECT_FALSE(test, test_bit(ISP_STATE_STREAMING, &isp->state));

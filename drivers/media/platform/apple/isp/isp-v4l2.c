@@ -637,7 +637,13 @@ static int isp_vb2_start_streaming(struct vb2_queue *q, unsigned int count)
 	v4l2_ctrl_grab(isp->exposure_priority, true);
 	v4l2_ctrl_grab(isp->power_line_frequency, true);
 
-	err = apple_isp_start_streaming(isp);
+	/* The indicator is on screen before the sensor powers up. */
+	err = apple_isp_indicator_acquire(isp);
+	if (!err) {
+		err = apple_isp_start_streaming(isp);
+		if (err)
+			apple_isp_indicator_release(isp);
+	}
 	if (err) {
 		v4l2_ctrl_grab(isp->exposure_priority, false);
 		v4l2_ctrl_grab(isp->power_line_frequency, false);
@@ -654,6 +660,8 @@ static void isp_vb2_stop_streaming(struct vb2_queue *q)
 	/* A restart still due from a sleep has nothing left to restart. */
 	clear_bit(ISP_STATE_SLEEPING, &isp->state);
 	apple_isp_stop_streaming(isp);
+	/* Held across system sleep; it goes only with the stream. */
+	apple_isp_indicator_release(isp);
 	isp_vb2_release_buffers(isp, VB2_BUF_STATE_ERROR);
 	v4l2_ctrl_grab(isp->exposure_priority, false);
 	v4l2_ctrl_grab(isp->power_line_frequency, false);

@@ -5,6 +5,7 @@
 #include <linux/gcd.h>
 #include <linux/unaligned.h>
 #include <kunit/static_stub.h>
+#include <linux/soc/apple/camera-indicator.h>
 
 #include "isp-cam.h"
 #include "isp-cmd.h"
@@ -1029,14 +1030,21 @@ void apple_isp_stop_camera(struct apple_isp *isp)
  * Capture watchdog. While it is not serviced, the ISP firmware replaces
  * every frame with a flat fill. The firmware expects it to be serviced
  * only while a camera-in-use indicator is shown, which makes it a privacy
- * interlock. That indicator is drawn by the display pipeline for secure
- * firmware that Linux does not run, so apple_isp_check_indicator() refuses
- * to stream on these machines and the watchdog is not serviced. The
- * servicing below, with the register sequence and rate observed on the
- * running hardware, is for when Linux can show and confirm the indicator.
+ * interlock. On macOS that indicator is drawn through the display pipeline
+ * by secure firmware Linux does not run; here the display driver draws it
+ * on the internal panel (drm/apple dcp-camera-indicator.c). The watchdog is
+ * serviced, with the register sequence and rate observed on the running
+ * hardware, only in periods in which the display reports the indicator on
+ * screen: when it is lost (panel off, sleep, mode set, display crash) the
+ * frames go flat until it is back.
  */
 static void apple_isp_wdt_kick(struct apple_isp *isp)
 {
+	atomic_inc(&isp->wdt_periods);
+	if (!apple_cam_indicator_shown()) {
+		atomic_inc(&isp->wdt_withheld);
+		return;
+	}
 	writel(0, isp->wdt + ISP_WDT_CLEAR);
 	writel(ISP_WDT_RELOAD_VAL, isp->wdt + ISP_WDT_RELOAD);
 	writel(1, isp->wdt + ISP_WDT_KICK);
@@ -1081,20 +1089,58 @@ void apple_isp_wdt_stop(struct apple_isp *isp)
 
 /*
  * Where the ISP gates its frames on the capture watchdog, the camera-in-use
- * indicator is not a light on the sensor supply: the display pipeline draws
- * it for secure firmware, and only while that firmware has granted the
- * capture. Linux runs neither, so it can neither show that indicator nor
- * confirm that it is shown. Streaming there would capture with no
- * indicator at all, so it is refused. Machines whose indicator is wired to
- * the sensor supply have no such watchdog and are not affected.
+ * indicator is not a light on the sensor supply but a dot the display draws
+ * on the internal panel. A stream starts only once the display reports that
+ * dot on screen, and keeps it until the stream stops; streaming is refused
+ * without it. Machines whose indicator is wired to the sensor supply have
+ * no such watchdog and are not affected.
  */
+#define ISP_INDICATOR_TIMEOUT_MS	1000
+
+int apple_isp_indicator_acquire(struct apple_isp *isp)
+{
+	int err;
+
+	if (!isp->wdt || isp->indicator_held)
+		return 0;
+
+	err = apple_cam_indicator_acquire(ISP_INDICATOR_TIMEOUT_MS);
+	if (err == -ERESTARTSYS)
+		return err;
+	if (err) {
+		dev_warn_ratelimited(isp->dev,
+				     "camera-in-use indicator not shown (%d), refusing to stream\n",
+				     err);
+		return -EPERM;
+	}
+	isp->indicator_held = true;
+	atomic_set(&isp->wdt_periods, 0);
+	atomic_set(&isp->wdt_withheld, 0);
+	return 0;
+}
+
+void apple_isp_indicator_release(struct apple_isp *isp)
+{
+	int withheld = atomic_read(&isp->wdt_withheld);
+
+	if (!isp->indicator_held)
+		return;
+	apple_cam_indicator_release();
+	isp->indicator_held = false;
+	if (withheld)
+		dev_info(isp->dev,
+			 "indicator not on screen for %d of %d watchdog periods: frames withheld\n",
+			 withheld, atomic_read(&isp->wdt_periods));
+}
+
+/* Before the sensor is powered: no capture without the indicator. */
 int apple_isp_check_indicator(struct apple_isp *isp)
 {
-	if (!isp->wdt)
+	if (!isp->wdt || isp->indicator_held)
 		return 0;
 
 	dev_warn_once(isp->dev,
-		      "camera-in-use indicator cannot be shown, refusing to stream\n");
+		      "camera-in-use indicator not held, refusing to stream\n");
 	return -EPERM;
 }
 

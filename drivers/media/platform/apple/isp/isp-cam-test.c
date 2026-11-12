@@ -597,6 +597,28 @@ static void isp_test_stop_key_on_debug(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, calls, 1);
 }
 
+/*
+ * With no indicator on screen the watchdog period is counted as withheld and
+ * no register is written: the backing memory stays as it was.
+ */
+static void isp_test_wdt_withheld(struct kunit *test)
+{
+	struct apple_isp *isp = kunit_kzalloc(test, sizeof(*isp), GFP_KERNEL);
+	u8 *regs = kunit_kzalloc(test, 0x100, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, isp);
+	KUNIT_ASSERT_NOT_NULL(test, regs);
+	memset(regs, 0xa5, 0x100);
+	isp->wdt = (void __iomem *)regs;
+	KUNIT_ASSERT_FALSE(test, apple_cam_indicator_shown());
+
+	apple_isp_wdt_kick(isp);
+	apple_isp_wdt_kick(isp);
+	KUNIT_EXPECT_EQ(test, atomic_read(&isp->wdt_periods), 2);
+	KUNIT_EXPECT_EQ(test, atomic_read(&isp->wdt_withheld), 2);
+	KUNIT_EXPECT_NULL(test, memchr_inv(regs, 0xa5, 0x100));
+}
+
 static void isp_test_call_crop(struct kunit *test)
 {
 	struct isp_preset source = {
@@ -706,6 +728,7 @@ static void isp_test_call_size_capabilities(struct kunit *test)
 }
 
 static struct kunit_case isp_cam_test_cases[] = {
+	KUNIT_CASE(isp_test_wdt_withheld),
 	KUNIT_CASE(isp_test_call_crop),
 	KUNIT_CASE(isp_test_call_crop_bounds),
 	KUNIT_CASE(isp_test_call_size_table),
