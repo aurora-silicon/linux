@@ -29,15 +29,13 @@ fn pmp_sample_to_ceiling(sample: Option<u32>) -> Option<u32> {
 
 /// Runtime PMP ceiling applied through the firmware-polled PPM target words.
 pub(super) struct Ceiling {
-    report_phandle: u32,
     native: [u32; 3],
     applied: Option<u32>,
 }
 
 impl Ceiling {
-    pub(super) fn new(report_phandle: u32, native: [u32; 3]) -> Self {
+    pub(super) fn new(native: [u32; 3]) -> Self {
         Self {
-            report_phandle,
             native,
             applied: None,
         }
@@ -47,11 +45,10 @@ impl Ceiling {
     /// provider, count or effort is absent or invalid.
     pub(super) fn update(&mut self, init: &super::initdata::InitData) -> kernel::error::Result {
         let mut effort = 0;
-        // SAFETY: `effort` is writable for one u32. The provider matches the
-        // retained DT phandle under RCU and performs read-only MMIO accesses.
-        let ret = unsafe {
-            kernel::bindings::apple_pmp_report_gpu_effort(self.report_phandle, &mut effort)
-        };
+        let mut count = 0;
+        // SAFETY: both outputs are writable for one u32. The PMP owner retains
+        // the coherent allocation and serializes its lookup against teardown.
+        let ret = unsafe { kernel::bindings::apple_pmp_gpu_effort(&mut count, &mut effort) };
         let desired = pmp_sample_to_ceiling((ret == 0).then_some(effort))
             .filter(|ceiling| *ceiling < 100 && self.native[1] != 0);
         if desired == self.applied {
