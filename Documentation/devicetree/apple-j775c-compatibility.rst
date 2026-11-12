@@ -21,12 +21,17 @@ https://github.com/aurora-silicon/linux/pull/1619#issuecomment-6816611851
 This is a boot and health result, not qualification of GPU rendering,
 audio playback, SD media, suspend, hotplug or other boards.
 
-The DT gate still reports ten new warning lines, five per J775c DTB:
+At that revision the DT gate reports ten new lines, five per J775c DTB:
 unmatched compatible, compatible oneOf failure, excessive reg length,
 excessive reg-names length, and reg-names[0] expecting sgx. The modern
 G17 binding describes one SGX bank; the retained loader contract uses
 ASC and SGX. The edited bindings themselves validate, and ADT coverage
 does not regress. These warnings remain visible.
+
+After merging integration 050f6a517, its compatible-pair recognition
+removes the two unmatched-schema diagnostics. Eight new warning lines
+remain, four per J775c DTB, with identical DTB bytes. The compatible list
+and ASC/SGX shape still conflict with the modern binding constraints.
 
 ``scripts/dtc/apple-dt-check.sh`` compares normalized warning sets for
 all Apple DTBs at base and head. It has no warning allowlist or board
