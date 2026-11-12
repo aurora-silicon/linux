@@ -127,7 +127,7 @@ config APPLE_SOC_SLEEP_KUNIT_TEST
 	  If unsure, say N.
 
 config APPLE_T6040_SLEEP
-	bool "Apple T6040 system sleep (refusal-first)"
+	bool "Apple T6040 system sleep"
 	depends on APPLE_SOC_SLEEP
 	depends on MFD_MACSMC=y
 	select MFD_SYSCON
@@ -136,12 +136,12 @@ config APPLE_T6040_SLEEP
 	  boards whose device tree enables its sleep controller. The T6040
 	  has its own sequences and refuses first: its suspend handler lists
 	  every blocker in the live state (EL2, the boot object's return
-	  path, the CPUs that can park, the display power states macOS checks
-	  before it sleeps). Unless t6040_sleep.allow_entry=1 is given and no
-	  blocker remains, a request for suspend-to-RAM prints the blockers
-	  and enters nothing, and suspend-to-idle stays the default sleep.
-	  With it the SoC is powered down to suspend-to-RAM and comes back
-	  through the boot object; the AON watchdog is the net over the
+	  path, the CPUs that can park, the display power states that have to
+	  be off before a sleep). Unless t6040_sleep.allow_entry=1 is given
+	  and no blocker remains, a request for suspend-to-RAM prints the
+	  blockers and enters nothing, and suspend-to-idle stays the default
+	  sleep. With it the SoC is powered down to suspend-to-RAM and comes
+	  back through the boot object; the AON watchdog is the net over the
 	  whole cycle (t6040_sleep.sleep_wd_secs at the power-down itself,
 	  t6040_sleep.wd2_secs over a dry run).
 
@@ -358,10 +358,11 @@ config APPLE_AURA_HIBERNATE
 	help
 	  Under aura, the boot loader and the firmware keep memory alive
 	  below Linux's allocations, and on Apple M4 Pro boots the boot
-	  firmware places it at a different address every time. With aura's fixed layout
-	  (/chosen/aura,hibernate-layout) this keeps every reserved range out
-	  of the hibernation image; without it, hibernation and resume are
-	  refused instead of overwriting the running boot loader.
+	  firmware places it at a different address every time. With
+	  aura's fixed layout (/chosen/aura,hibernate-layout) this keeps
+	  every reserved range out of the hibernation image; without it,
+	  hibernation and resume are refused instead of overwriting the
+	  running boot loader.
 
 config APPLE_DISPLAY_GATE
 	bool "Apple internal display enable gate"
