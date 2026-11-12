@@ -614,47 +614,6 @@ module_param(wd2_secs, uint, 0644);
 MODULE_PARM_DESC(wd2_secs,
 		 "Arm the AON WD2 for this many seconds from .begin to .end of a dry run 2 or 3 (0: off, at most 178)");
 
-static bool macos_quiesce = true;
-module_param(macos_quiesce, bool, 0644);
-MODULE_PARM_DESC(macos_quiesce,
-		 "Run the steps of macOS's generic PMGR quiesce in the commit: APSC off, PLL relock off, TVMs off, PMC DCS floor");
-
-/*
- * On the J616s, with the secondaries still spinning (stopped, coherent) until after
- * the timer, the complexes +0xc/+0x10 never dropped BIT4 and the engine stalled. On
- * macOS every other core is already off (self-disable + deep WFI) when the master
- * turns the complexes off. Release the stopped cores to their last WFI at the top
- * of the commit and wait for their core PS words to read off.
- */
-static bool release_early = true;
-module_param(release_early, bool, 0644);
-MODULE_PARM_DESC(release_early,
-		 "Release the stopped CPUs to their last WFI at the commit's start and wait until they are off");
-
-static bool tvm_gpu = true;
-module_param(tvm_gpu, bool, 0644);
-MODULE_PARM_DESC(tvm_gpu, "With macos_quiesce: also the GPU PMGR's afr/gfx TVMs (0x288e94000..)");
-
-/*
- * cluster-ctl DISP_INT (+0xc) / DISP_EXT (+0x10): 0 leaves them as they are, 1 writes the
- * nibble 0 and waits for BIT4 (macOS), 2 writes without waiting. Their CPU words can't be
- * lowered from here, so the slots never finish under 1.
- */
-static unsigned int disp_clusters = 1;
-module_param(disp_clusters, uint, 0644);
-MODULE_PARM_DESC(disp_clusters,
-		 "DISP_INT/DISP_EXT cluster-ctl slots at the commit: 0 untouched, 1 off + wait, 2 off, no wait");
-
-static bool agx_gate = true;
-module_param(agx_gate, bool, 0644);
-MODULE_PARM_DESC(agx_gate,
-		 "Lower the GPU's AFR power word in the commit, as macOS's PMGR quiesce does behind its AGX residency gate");
-
-static bool keep_alive_off = true;
-module_param(keep_alive_off, bool, 0644);
-MODULE_PARM_DESC(keep_alive_off,
-		 "Clear the 64 PMGR keep-alive bits right before the S2R timer, as macOS's PMGR quiesce does");
-
 static struct t6040_sleep *t6040_sleep;
 
 static void t6040_iounmap(void *p)
@@ -711,25 +670,13 @@ static const struct apple_sleep_ctl t6040_sleep_reg_ctl = {
 };
 
 /*
- * As in macOS's power-state check, a sub-block is on while its TARGET is not 0. The
- * pipe's CPU counts as on while its ACTUAL is not 0: the engine waits for the
- * CPU's actual state. A CPU under automatic power gating (AUTO_ENABLE, target 15)
- * that reads ACTUAL 0 is gated off by the PMGR and counts as off; taking it out
- * of automatic mode raised an SError on T6040, so it is left so.
+ * As in macOS's power-state check, a sub-block is on while its TARGET is not 0. A
+ * pipe's CPU word never counts: it stays under automatic power gating (taking it out
+ * of automatic mode raised an SError on T6040) and the SoC power-down drops it.
  */
-static bool ignore_display_cpu = true;
-module_param(ignore_display_cpu, bool, 0644);
-MODULE_PARM_DESC(ignore_display_cpu,
-		 "Let the commit go on with the display pipes' CPU words on (the SoC power-down drops them)");
-
 static bool t6040_sleep_ps_on(u32 val, bool cpu)
 {
-	if (cpu && READ_ONCE(ignore_display_cpu))
-		return false;
-	if (cpu)
-		return FIELD_GET(PS_ACTUAL, val) ||
-		       (FIELD_GET(PS_TARGET, val) && !(val & PS_AUTO_ENABLE));
-	return FIELD_GET(PS_TARGET, val);
+	return !cpu && FIELD_GET(PS_TARGET, val);
 }
 
 static unsigned int t6040_sleep_show_group(struct seq_file *s, const struct t6040_sleep_group *g)
@@ -968,11 +915,6 @@ static u32 t6040_cpu_start_bit(u64 mpidr)
 
 static void __iomem *t6040_ed[T6040_ED_CLUSTERS][T6040_ED_CORES];
 
-static bool ed_power_release = true;
-module_param(ed_power_release, bool, 0644);
-MODULE_PARM_DESC(ed_power_release,
-		 "Before each core's deep WFI, unlock its external debug and clear EDPRCR, as macOS does");
-
 static void t6040_ed_map(struct device *dev)
 {
 	unsigned int cpu, n = 0;
@@ -996,7 +938,7 @@ static void t6040_ed_release(void)
 	unsigned int c = MPIDR_AFFINITY_LEVEL(mpidr, 1), k = MPIDR_AFFINITY_LEVEL(mpidr, 0);
 	void __iomem *ed;
 
-	if (!READ_ONCE(ed_power_release) || c >= T6040_ED_CLUSTERS || k >= T6040_ED_CORES)
+	if (c >= T6040_ED_CLUSTERS || k >= T6040_ED_CORES)
 		return;
 	ed = t6040_ed[c][k];
 	if (!ed)
@@ -1479,9 +1421,6 @@ static const u32 t6040_ps_snap_pa[] = {
  */
 #define T6040_PS_RESTORE_FIRST	0x2280150	/* I2C0 */
 #define T6040_PS_RESTORE_LAST	0x2280228	/* UART6 */
-static bool ps_restore = true;
-module_param(ps_restore, bool, 0644);
-MODULE_PARM_DESC(ps_restore, "After a real sleep raise the SOC power words that were on at the commit and came back lower");
 
 static void __iomem *t6040_ps_snap_addr(struct t6040_sleep *s, unsigned int i)
 {
@@ -1512,7 +1451,7 @@ static void t6040_ps_restore(struct t6040_sleep *s)
 	unsigned int i, n, raised = 0, failed = 0;
 	u32 val, cur = 0;
 
-	if (!s->ps_saved_valid || !READ_ONCE(ps_restore))
+	if (!s->ps_saved_valid)
 		return;
 	s->ps_saved_valid = false;
 	for (i = 0; i < ARRAY_SIZE(t6040_ps_snap_pa); i++) {
@@ -2099,15 +2038,11 @@ static void t6040_clusters_off(struct t6040_sleep *s)
 	if (!s->cluster_ctl)
 		return;
 	for (i = 0; i < CLUSTER_CTL_NR; i++) {
-		unsigned int dc = READ_ONCE(disp_clusters);
-
 		val = readl(s->cluster_ctl + CLUSTER_CTL(i));
 		s->cluster_saved[i] = val;
 		s->cluster_after[i] = val;
-		if (i >= CLUSTER_CTL_FIRST_WAIT && !dc)
-			continue;
 		writel(val & ~CLUSTER_CTL_NIBBLE, s->cluster_ctl + CLUSTER_CTL(i));
-		if (i >= CLUSTER_CTL_FIRST_WAIT && dc == 1 &&
+		if (i >= CLUSTER_CTL_FIRST_WAIT &&
 		    readl_poll_timeout_atomic(s->cluster_ctl + CLUSTER_CTL(i), val,
 					      !(val & CLUSTER_CTL_BUSY), 1, CLUSTER_TIMEOUT_US))
 			s->quiesce_to |= QTO_CLUSTER(i);
@@ -2211,8 +2146,6 @@ static void t6040_macos_quiesce(struct t6040_sleep *s)
 		}
 	for (i = 0; i < ARRAY_SIZE(t6040_tvm); i++) {
 		if (!s->tvm_ctl[i] || !s->tvm_status[i])
-			continue;
-		if (t6040_tvm[i].ctl >> 32 == 0x2 && !READ_ONCE(tvm_gpu))
 			continue;
 		t6040_mark(s, 0x320 | i);
 		writel(readl(s->tvm_ctl[i]) & ~TVM_ENABLE, s->tvm_ctl[i]);
@@ -2514,9 +2447,6 @@ static void t6040_apcie_clk_off(struct t6040_apcie_st *a)
  * second lane), and APCIE_PHY_SW's parents are both SYS_ST lanes. apcie_st1_on raises
  * APCIE_SYS_ST1 (target 0xf, no automatic mode) before the request; the engine lowers it.
  */
-static bool apcie_st1_on = true;
-module_param(apcie_st1_on, bool, 0644);
-MODULE_PARM_DESC(apcie_st1_on, "Bring-up: power APCIE_SYS_ST1 on before the S2R request (APCIE_PHY_SW's second parent)");
 
 /*
  * With both SYS_ST lanes on the engine still waits on APCIE_PHY_SW bit 11. macOS never
@@ -2861,8 +2791,6 @@ static void __iomem *t6040_dcs_ps_reg(struct t6040_sleep *s, int i)
 	return b ? b + t6040_dcs_ps[i].off : NULL;
 }
 
-static unsigned int dcs_ps_auto = 1;
-
 /* Returns a mask of the DCS whose ACTUAL did not reach f before AUTO was set. */
 static u32 t6040_dcs_ps_auto_on(struct t6040_sleep *s)
 {
@@ -2886,25 +2814,6 @@ static u32 t6040_dcs_ps_auto_on(struct t6040_sleep *s)
 	return to;
 }
 
-static int t6040_dcs_ps_auto_set(const char *val, const struct kernel_param *kp)
-{
-	int ret = param_set_uint(val, kp);
-
-	if (!ret && (dcs_ps_auto & BIT(0)) && t6040_sleep)
-		dev_info(t6040_sleep->dev, "DCS PS automatic mode on (macOS boot parity), timeouts %#x\n",
-			 t6040_dcs_ps_auto_on(t6040_sleep));
-	return ret;
-}
-
-static const struct kernel_param_ops t6040_dcs_ps_auto_ops = {
-	.set = t6040_dcs_ps_auto_set,
-	.get = param_get_uint,
-};
-module_param_cb(dcs_ps_auto, &t6040_dcs_ps_auto_ops, &dcs_ps_auto, 0644);
-MODULE_PARM_DESC(dcs_ps_auto, "Bring-up: bit 0 = DCS power-state words to automatic mode (PS_MIN 0) now and in .begin, as macOS at boot");
-
-static unsigned int dcs_pg = 1;
-
 static void t6040_dcs_dyn_pg(struct t6040_sleep *s)
 {
 	int i;
@@ -2919,24 +2828,6 @@ static void t6040_dcs_dyn_pg(struct t6040_sleep *s)
 			writel(v | 0x1100, s->dcs[i] + 0x20);
 	}
 }
-
-static int t6040_dcs_pg_set(const char *val, const struct kernel_param *kp)
-{
-	int ret = param_set_uint(val, kp);
-
-	if (!ret && (dcs_pg & BIT(0)) && t6040_sleep) {
-		t6040_dcs_dyn_pg(t6040_sleep);
-		dev_info(t6040_sleep->dev, "DCS dynamic power-gate mode on (macOS parity)\n");
-	}
-	return ret;
-}
-
-static const struct kernel_param_ops t6040_dcs_pg_ops = {
-	.set = t6040_dcs_pg_set,
-	.get = param_get_uint,
-};
-module_param_cb(dcs_pg, &t6040_dcs_pg_ops, &dcs_pg, 0644);
-MODULE_PARM_DESC(dcs_pg, "Bring-up: bit 0 = DCS dynamic power-gate mode on (+0x20 |= 0x1100 on all 16 DCS) now and in .begin");
 
 /* Words 8-15 right before the S2R timer, then the whole record to PMU SRAM 0xa200. */
 static void t6040_apcie_diag_store(struct t6040_sleep *s)
@@ -2962,17 +2853,13 @@ static void t6040_apcie_diag_store(struct t6040_sleep *s)
  * next one meets the bridge as the first wake armed it. Only while ANS is on: the bridge sits
  * in it. Returns whether the bit was set.
  */
-static bool ans_bridge_quiesce = true;
-module_param(ans_bridge_quiesce, bool, 0644);
-MODULE_PARM_DESC(ans_bridge_quiesce,
-		 "Clear ANS's fabric-bridge bit 0 in the commit, once ANS is stopped, as macOS before the domain goes off");
 
 static bool t6040_ans_bridge_quiesce(struct t6040_sleep *s)
 {
 	void __iomem *bridge = s->axi2af_bridge[AXI2AF_ANS];
 	u32 a, b;
 
-	if (!READ_ONCE(ans_bridge_quiesce) || !bridge || !s->soc_east ||
+	if (!bridge || !s->soc_east ||
 	    FIELD_GET(PS_ACTUAL, readl(s->soc_east + PS_ANS)) != 0xf)
 		return false;
 	a = readl(bridge + AXI2AF_BRIDGE_104);
@@ -3225,16 +3112,7 @@ asm(
 );
 extern char t6040_resume_stub[];
 
-static bool resume_stub = true;
-module_param(resume_stub, bool, 0644);
-MODULE_PARM_DESC(resume_stub,
-		 "Wake into a stub that restarts the AON WD2 for 60 s before cpu_resume (default on)");
-
 static u32 t6040_axi2af_on_mask(struct t6040_sleep *s);
-
-static bool lower_atc = true;
-module_param(lower_atc, bool, 0644);
-MODULE_PARM_DESC(lower_atc, "Lower the four USB-C (ATC) complexes in the commit, as macOS has them off");
 
 /*
  * The four ATC complexes' power words in SOC (soc_ps, 0x502800000), deepest first: cio_usb,
@@ -3288,10 +3166,6 @@ static void t6040_sleep_lower_atc(struct t6040_sleep *s)
 			t6040_mark_raw(s, m | (t6040_ps_lower_word(reg) ? 0x4000 : 0x8000));
 		}
 }
-
-static bool lower_apcie_gp = true;
-module_param(lower_apcie_gp, bool, 0644);
-MODULE_PARM_DESC(lower_apcie_gp, "Stop the GP PCIe ports and lower apcie_sys_gp in the commit (T8140's radio port stop)");
 
 /*
  * T8140's radio port stop, on the same t602x port block: the link into L2, the endpoint's
@@ -3404,13 +3278,15 @@ static int t6040_sleep_commit(unsigned long unused)
 	t6040_mark(s, 0x20);
 	s->siq_cfg = read_sysreg_s(SYS_APL_SIQ_CFG_EL1);
 	spin_table_stop_parked();
-	if (READ_ONCE(release_early))
-		spin_table_release_stopped();
+	/*
+	 * On macOS every other core is off, in its last WFI, before the boot core turns the
+	 * complexes off. With the stopped cores still spinning the sleep engine stalled on the
+	 * J616s: release them now, and wait for their power words to read off further down.
+	 */
+	spin_table_release_stopped();
 	t6040_mark(s, 0x21);
-	if (READ_ONCE(lower_atc))
-		t6040_sleep_lower_atc(s);
-	if (READ_ONCE(lower_apcie_gp))
-		t6040_sleep_stop_gp_ports(s);
+	t6040_sleep_lower_atc(s);
+	t6040_sleep_stop_gp_ports(s);
 
 	/*
 	 * lower_io: ANS's two ST lanes + shared PHY down, once ANS has been
@@ -3420,14 +3296,12 @@ static int t6040_sleep_commit(unsigned long unused)
 	 */
 	memset(s->apcie_diag, 0, sizeof(s->apcie_diag));
 	s->apcie_diag[1] = (s->pcie_ans_stopped ? BIT(3) : 0) | (s->apcie_st.valid ? BIT(4) : 0);
-	if (READ_ONCE(apcie_st1_on) && s->soc_east &&
+	if (s->soc_east &&
 	    t6040_ps_raise_start(s->soc_east, PS_APCIE_SYS_ST1))
 		t6040_mark_raw(s, 0x54c00001);
-	if (s->pcie_ans_stopped) {
+	if (s->pcie_ans_stopped)
 		t6040_sleep_lower_apcie_st(s);
-	}
-	if (READ_ONCE(lower_apcie_gp))
-		t6040_sleep_lower_apcie_gp(s);
+	t6040_sleep_lower_apcie_gp(s);
 
 	/*
 	 * What macOS's quiesce gate would panic on, after everything here has lowered what it
@@ -3461,16 +3335,11 @@ static int t6040_sleep_commit(unsigned long unused)
 	 * already; the wake side re-asserts them.
 	 */
 	s->quiesce_to = 0;
-	if (READ_ONCE(release_early)) {
-		t6040_mark(s, 0x2c);
-		s->quiesce_to |= min(t6040_secondaries_off(s), 15U) << 20;
-	}
-	if (READ_ONCE(macos_quiesce)) {
-		t6040_mark(s, 0x2b);
-		t6040_macos_quiesce(s);
-	}
-	if (READ_ONCE(agx_gate))
-		t6040_mark(s, 0x2a0 | t6040_agx_gate(s));
+	t6040_mark(s, 0x2c);
+	s->quiesce_to |= min(t6040_secondaries_off(s), 15U) << 20;
+	t6040_mark(s, 0x2b);
+	t6040_macos_quiesce(s);
+	t6040_mark(s, 0x2a0 | t6040_agx_gate(s));
 	t6040_mark(s, 0x24);
 	t6040_clusters_off(s);
 
@@ -3479,14 +3348,13 @@ static int t6040_sleep_commit(unsigned long unused)
 	t6040_mark(s, 0x350);
 	t6040_clkgen_park(s);
 	t6040_mark(s, 0x351);
-	if (READ_ONCE(keep_alive_off))
-		s->ka_on_before = t6040_keep_alive(s, false, 0);
+	s->ka_on_before = t6040_keep_alive(s, false, 0);
 	t6040_mark(s, 0x25);
 
 	/* Arm aura's AURAS2R1 mailbox with this boot's resume entry. */
 	if (s->mbox) {
 		WRITE_ONCE(s->mbox->resume_pa,
-			   READ_ONCE(resume_stub) && s->wdt_stub_ok ?
+			   s->wdt_stub_ok ?
 			   __pa_symbol(t6040_resume_stub) : __pa_symbol(cpu_resume));
 		dcache_clean_poc((unsigned long)s->mbox, (unsigned long)(s->mbox + 1));
 		dsb(sy);
@@ -3893,6 +3761,7 @@ static int t6040_sleep_begin(suspend_state_t state)
 	 * full set at the commit point, by which time the display is off. */
 	unsigned int begin_total = live - disp;
 	unsigned int dry = READ_ONCE(dry_run), secs;
+	u32 dcs_to;
 
 	/*
 	 * The PM core calls .begin and .end for suspend-to-idle too when there
@@ -3909,10 +3778,11 @@ static int t6040_sleep_begin(suspend_state_t state)
 	t6040_aop_ps_save(s);
 	t6040_susf_begin(s);
 	t6040_sleep_pmvc(s);
-	if (READ_ONCE(dcs_pg) & BIT(0))
-		t6040_dcs_dyn_pg(s);
-	if (READ_ONCE(dcs_ps_auto) & BIT(0))
-		t6040_dcs_ps_auto_on(s);
+	t6040_dcs_dyn_pg(s);
+	dcs_to = t6040_dcs_ps_auto_on(s);
+	if (dcs_to)
+		pr_warn("t6040-sleep: DCS power words %#x did not read on before automatic mode\n",
+			dcs_to);
 	pr_info("t6040-sleep: suspend requested: %u live blocker(s) (%u display, cleared during device suspend)\n",
 		live, disp);
 	t6040_sleep_log_blockers(s);
@@ -4039,9 +3909,6 @@ static int t6040_sleep_dry_enter(struct t6040_sleep *s, unsigned int dry)
  * each word as the pmgr-pwrstate driver powers a domain off (TARGET 0, the one-shot bits
  * clear), polled to ACTUAL 0. Returns the number of words left on.
  */
-static bool lower_display = true;
-module_param(lower_display, bool, 0644);
-MODULE_PARM_DESC(lower_display, "Lower the display power words at the S2R commit point");
 
 #define PS_DEV_DISABLE		BIT(10)
 #define PS_BUSY			BIT(11)
@@ -4053,19 +3920,7 @@ MODULE_PARM_DESC(lower_display, "Lower the display power words at the S2R commit
  */
 #define T6040_DISP_MARK(g, st, off)	(0x5c000000 | ((g) & 0xff) << 16 | (st) << 12 | ((off) & 0xfff))
 
-static bool macos_disp_off = true;
-
 #define DISP_CPU_GATE_US	50000
-
-static bool pmc_if_restore = true;
-module_param(pmc_if_restore, bool, 0644);
-MODULE_PARM_DESC(pmc_if_restore, "After a real sleep set the display pipes' PMC BWR and boost interface enables again");
-
-static bool pmc_dcp_off = true;
-module_param(pmc_dcp_off, bool, 0644);
-MODULE_PARM_DESC(pmc_dcp_off, "Drop the PMS DCP voters to 0 before the internal display goes down");
-module_param(macos_disp_off, bool, 0644);
-MODULE_PARM_DESC(macos_disp_off, "Lower DISP_CPU, DISP_FE and DISP_SYS at the commit point as macOS's PMGR does");
 
 /*
  * regmap_read_poll_timeout_atomic() reads ktime_get(), which warns while timekeeping is
@@ -4233,7 +4088,7 @@ static int t6040_disp_off_macos(struct t6040_sleep *s, const struct t6040_sleep_
 		s->pmc_if_valid = true;
 	}
 	/* The PMS DCP voters to 0 first, as macOS's entry and T8140's driver end. */
-	if (s->pmc_dcp && READ_ONCE(pmc_dcp_off)) {
+	if (s->pmc_dcp) {
 		s->pmc_dcp_saved[0] = readl(s->pmc_dcp);
 		s->pmc_dcp_saved[1] = readl(s->pmc_dcp + 4);
 		writel(0, s->pmc_dcp);
@@ -4323,11 +4178,11 @@ static void t6040_disp_back(struct t6040_sleep *s)
 		/* DISP_CPU's word can't be written from here: automatic mode raises it. */
 		(void)g;
 	}
-	if (s->pmc_dcp && READ_ONCE(pmc_dcp_off)) {
+	if (s->pmc_dcp) {
 		writel(s->pmc_dcp_saved[1], s->pmc_dcp + 4);
 		writel(s->pmc_dcp_saved[0], s->pmc_dcp);
 	}
-	if (s->pmc_if_valid && READ_ONCE(pmc_if_restore)) {
+	if (s->pmc_if_valid) {
 		u32 bwr = readl(s->pmc_bwr), boost = readl(s->pmc_bwr + PMC_BOOST);
 
 		s->pmc_if_valid = false;
@@ -4379,8 +4234,7 @@ static unsigned int t6040_sleep_lower_display(struct t6040_sleep *s)
 				break;
 			off -= PS_STRIDE;
 		}
-		if (!i && !strcmp(g->name, "disp") && READ_ONCE(macos_disp_off) &&
-		    t6040_disp_off_macos(s, g))
+		if (!i && !strcmp(g->name, "disp") && t6040_disp_off_macos(s, g))
 			left++;
 	}
 	return left;
@@ -4451,20 +4305,17 @@ static int t6040_sleep_prepare_late(void)
 static int t6040_sleep_enter(suspend_state_t state)
 {
 	struct t6040_sleep *s = t6040_sleep;
-	unsigned int dry = READ_ONCE(t6040_sleep_dry);
+	unsigned int dry = READ_ONCE(t6040_sleep_dry), left;
 	int ret;
 
 	if (dry)
 		return t6040_sleep_dry_enter(s, dry);
 
 	t6040_mark(s, 0x05);
-	if (READ_ONCE(lower_display)) {
-		unsigned int left = t6040_sleep_lower_display(s);
-
-		t6040_mark(s, 0x06);
-		if (left)
-			pr_warn("t6040-sleep: %u display power word(s) did not go off\n", left);
-	}
+	left = t6040_sleep_lower_display(s);
+	t6040_mark(s, 0x06);
+	if (left)
+		pr_warn("t6040-sleep: %u display power word(s) did not go off\n", left);
 	/* A dry run 1 ends here as well: its .begin told the firmware nothing. */
 	if (t6040_sleep_total_blockers(s) || !allow_entry || !apple_sleep_power_loss()) {
 		unsigned int on = t6040_sleep_log_groups(s);
