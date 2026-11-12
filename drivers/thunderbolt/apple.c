@@ -3225,48 +3225,10 @@ static bool apple_cio_recovering(struct apple_cio *acio)
 	return acio->resume_recovery_active;
 }
 
-static int apple_cio_power_up(struct apple_cio *acio);
-
-/**
- * apple_cio_start - Power up and start the ACIO complex
- * @acio: ACIO complex to start
- *
- * The Type-C PHY must already be configured for USB4 or Thunderbolt. Power up
- * ACIO, boot its RTKit co-processor, populate its child devices and wait for
- * the NHI to register the USB4 domain. All completed steps are unwound on
- * failure. The caller must hold @acio->lock.
- *
- * Return: 0 on success or a negative error code on failure.
+/*
+ * Power ACIO up and start it: all of apple_cio_start() but the handshake with
+ * the Type-C PHY of a hw->cio_phy router.
  */
-static int apple_cio_start(struct apple_cio *acio)
-{
-	int ret;
-
-	lockdep_assert_held(&acio->lock);
-	if (!acio->hw->cio_phy)
-		return apple_cio_power_up(acio);
-
-	/*
-	 * The PHY must be in CIO, tuned by its firmware, before ACIO powers up.
-	 * The Type-C controller sets the mux first and retries on its next event.
-	 */
-	ret = apple_t6040_cio_state(acio->phy_np);
-	if (ret != 1) {
-		ret = ret < 0 ? ret : -EAGAIN;
-		dev_dbg(acio->dev, "Type-C PHY is not in CIO mode (%d), not starting\n", ret);
-		return ret;
-	}
-	ret = apple_t6040_cio_router_started(acio->phy_np);
-	if (ret) {
-		dev_err(acio->dev, "Type-C PHY refused the router: %d\n", ret);
-		return ret;
-	}
-	ret = apple_cio_power_up(acio);
-	if (ret)
-		apple_t6040_cio_router_stopped(acio->phy_np);
-	return ret;
-}
-
 static int apple_cio_power_up(struct apple_cio *acio)
 {
 	struct device_link *link;
@@ -3486,6 +3448,46 @@ remove_links:
 		acio->pd_list->pd_links[i] = NULL;
 		dev_pm_syscore_device(acio->pd_list->pd_devs[i], false);
 	}
+	return ret;
+}
+
+/**
+ * apple_cio_start - Power up and start the ACIO complex
+ * @acio: ACIO complex to start
+ *
+ * The Type-C PHY must already be configured for USB4 or Thunderbolt. Power up
+ * ACIO, boot its RTKit co-processor, populate its child devices and wait for
+ * the NHI to register the USB4 domain. All completed steps are unwound on
+ * failure. The caller must hold @acio->lock.
+ *
+ * Return: 0 on success or a negative error code on failure.
+ */
+static int apple_cio_start(struct apple_cio *acio)
+{
+	int ret;
+
+	lockdep_assert_held(&acio->lock);
+	if (!acio->hw->cio_phy)
+		return apple_cio_power_up(acio);
+
+	/*
+	 * The PHY must be in CIO, tuned by its firmware, before ACIO powers up.
+	 * The Type-C controller sets the mux first and retries on its next event.
+	 */
+	ret = apple_t6040_cio_state(acio->phy_np);
+	if (ret != 1) {
+		ret = ret < 0 ? ret : -EAGAIN;
+		dev_dbg(acio->dev, "Type-C PHY is not in CIO mode (%d), not starting\n", ret);
+		return ret;
+	}
+	ret = apple_t6040_cio_router_started(acio->phy_np);
+	if (ret) {
+		dev_err(acio->dev, "Type-C PHY refused the router: %d\n", ret);
+		return ret;
+	}
+	ret = apple_cio_power_up(acio);
+	if (ret)
+		apple_t6040_cio_router_stopped(acio->phy_np);
 	return ret;
 }
 
