@@ -88,8 +88,14 @@ struct ane_h16_device {
 	bool irq_wait;
 	bool irq_armed;
 	unsigned long irq_seq;
+	/*
+	 * How the armed sleeps ended: on the channel IRQ, or on the timer that
+	 * bounds each of them to the polled cadence. A reply that takes longer
+	 * than one such sleep runs several timers out before its IRQ comes, so
+	 * the second count grows in normal operation and is no error count.
+	 */
 	u64 irq_wakeups;
-	u64 irq_timeouts;
+	u64 timer_wakeups;
 	struct ane_fw_rtk rtk;
 	struct {
 		u64 word0;
@@ -1199,7 +1205,7 @@ static void ane_h16_irq_pause(struct ane_h16_device *h, u64 waited_ns)
 				   us_to_ktime(min_us));
 	scoped_guard(spinlock_irqsave, &h->irq_lock) {
 		if (ret)
-			h->irq_timeouts++;
+			h->timer_wakeups++;
 		else
 			h->irq_wakeups++;
 	}
@@ -2124,7 +2130,7 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 	debugfs_create_file("stage", 0600, h->debugfs, h, &ane_h16_stage_fops);
 	debugfs_create_file("execute", 0600, h->debugfs, h, &ane_h16_execute_fops);
 	debugfs_create_u64("irq_wakeups", 0400, h->debugfs, &h->irq_wakeups);
-	debugfs_create_u64("irq_timeouts", 0400, h->debugfs, &h->irq_timeouts);
+	debugfs_create_u64("timer_wakeups", 0400, h->debugfs, &h->timer_wakeups);
 	debugfs_create_u64("recoveries", 0400, h->debugfs, &h->recoveries);
 	debugfs_create_u64("recover_failures", 0400, h->debugfs, &h->recover_failures);
 	platform_set_drvdata(pdev, h);
