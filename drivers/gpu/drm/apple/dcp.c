@@ -10677,10 +10677,6 @@ static void dcp_t6041_s2r_warm_restart(struct apple_dcp *dcp)
 	WRITE_ONCE(dcp->crashed, false);
 	ret = apple_rtkit_power_cycled_return(dcp->rtk,
 					      dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
-	if (dcp->hib_rx_held) {
-		dcp->hib_rx_held = false;
-		apple_rtkit_resume_rx(dcp->rtk);
-	}
 	ctl = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
 	sts = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS);
 	dev_dbg(dcp->dev,
@@ -10726,10 +10722,6 @@ static void dcp_t6041_s2r_warm_restart_ext(struct apple_dcp *dcp)
 	WRITE_ONCE(dcp->crashed, false);
 	ret = apple_rtkit_power_cycled_return(dcp->rtk,
 					      dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
-	if (dcp->hib_rx_held) {
-		dcp->hib_rx_held = false;
-		apple_rtkit_resume_rx(dcp->rtk);
-	}
 	ctl = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
 	sts = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS);
 	dev_dbg(dcp->dev,
@@ -10744,7 +10736,6 @@ static void dcp_t6041_s2r_warm_restart_ext(struct apple_dcp *dcp)
 	dev_dbg(dcp->dev, "S2R resume: system power state 1: %d\n", ret);
 
 	dcp->link_recovery_tries = 0;
-	dcp_release_after_sleep(dcp);
 	WRITE_ONCE(dcp->hib_phase, DCP_HIB_NONE);
 	dcp_hib_ext_link_up(dcp, "S2R wake");
 	dev_info(dcp->dev, "external firmware back after the warm restart\n");
