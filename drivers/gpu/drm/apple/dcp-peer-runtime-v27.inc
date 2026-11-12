@@ -118,6 +118,45 @@ unlock:
 	return ret;
 }
 
+/* A timing faster than one engine's pixel rate: only a pair drives it. */
+bool dcp_peer_needs_pair_v27(struct apple_dcp *dcp, u32 clock_khz)
+{
+	u64 rate = dcp->dptxport[0].caps.total_rate;
+
+	return dcp->fw_compat == DCP_FIRMWARE_V_27_0 && rate && (u64)clock_khz * 1000 > rate;
+}
+
+/*
+ * At atomic check: refuse a paired timing the pair cannot take, so that the
+ * commit fails instead of a mode set that leaves the CRTC without a timing.
+ * The peer's CRTC is not taken into the commit; its current state is read.
+ */
+int dcp_peer_check_v27(struct apple_dcp *dcp, struct drm_atomic_commit *commit,
+		       struct drm_crtc_state *crtc_state)
+{
+	struct drm_crtc_state *peer_state;
+	struct drm_crtc *peer_crtc;
+
+	if (!crtc_state->enable || !drm_atomic_crtc_needs_modeset(crtc_state) ||
+	    !dcp_peer_needs_pair_v27(dcp, crtc_state->mode.clock))
+		return 0;
+	if (!peer_scanout || !peer_allocation_probe)
+		return -EINVAL;
+	scoped_guard(mutex, &dcp_peer_lock) {
+		struct apple_dcp *peer = dcp->peer_reserved;
+
+		if (!peer || peer->peer_owner != dcp || peer->fixed_phy ||
+		    peer->nr_typec_routes || !peer->crtc || dcp->crashed || peer->crashed)
+			return -EINVAL;
+		peer_crtc = &peer->crtc->base;
+	}
+	peer_state = drm_atomic_get_new_crtc_state(commit, peer_crtc);
+	if (peer_state ? peer_state->active :
+	    (peer_crtc->state && READ_ONCE(peer_crtc->state->active)))
+		return -EINVAL;
+	return 0;
+}
+
 /* Return1 after a paired stop,0 for a normal CRTC, or an error. */
 int dcp_peer_stop_v27(struct apple_dcp *dcp)
 {

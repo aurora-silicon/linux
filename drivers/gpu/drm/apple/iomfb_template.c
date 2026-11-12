@@ -3946,6 +3946,11 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		if (!ret)
 			crtc_state->color_mgmt_changed = true;
 		complete_set_digital_out_mode(dcp, NULL, cookie);
+	} else if (dcp_peer_needs_pair_v27(dcp, mode->mode.clock)) {
+		/* No pair for a timing one engine cannot drive: never single-pipe it. */
+		cookie->status = -EINVAL;
+		paired = true;
+		complete_set_digital_out_mode(dcp, NULL, cookie);
 	} else
 #endif
 	if (mode->vrr &&

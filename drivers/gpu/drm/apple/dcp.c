@@ -1657,6 +1657,13 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 			crtc_state->mode_changed = true;
 	}
 
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+		int ret = dcp_peer_check_v27(dcp, commit, crtc_state);
+
+		if (ret)
+			return ret;
+	}
+
 	/* DRM core only caps the blob size; the gamma update copies a full table. */
 	if (crtc_state->color_mgmt_changed && crtc_state->gamma_lut &&
 	    drm_color_lut_size(crtc_state->gamma_lut) != dcp_gamma_lut_size(pdev))
