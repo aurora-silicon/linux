@@ -155,6 +155,8 @@ const CONFIG_25G83: Config = Config {
     reserved_slots: &[],
     chip: Some(&CHIP_25G83),
     firmware: fw::variant::Firmware::Identified(&[BUILD_25G83]),
+    // The GPU is restarted after a real sleep, as on the 32-core part.
+    sleep_restart: true,
     ..BASE
 };
 

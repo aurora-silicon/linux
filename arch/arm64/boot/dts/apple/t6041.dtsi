@@ -445,3 +445,17 @@
 &{/opp-table-e/opp07} {
 	opp-microwatt = <531000>;
 };
+
+/*
+ * What the SEP's DART gets around a sleep, as offset and value: the writes T8140's has
+ * (t8140.dtsi), which the J616C has slept with. The SEP driver saves the DART with them
+ * before it tells the enclave to sleep at suspend.
+ */
+&sep_dart {
+	apple,sleep-prepare = <0x80 0xa102>, <0x704 0xffffffff>;
+	apple,sleep-restore = <0x210 0x0>, <0x20c 0x800005f5>,
+			      <0x220 0xf0f0f>, <0x224 0x80808>,
+			      <0x300 0x1>, <0x318 0x1>;
+	apple,sleep-restore-late = <0x80 0x8000>, <0x228 0x3f3f3f3f>,
+				   <0x22c 0x1010101>;
+};

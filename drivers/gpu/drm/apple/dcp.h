@@ -141,6 +141,7 @@ int dcp_dptx_park(struct apple_dcp *dcp);
 int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port);
 bool dcp_hold_resume_event(struct platform_device *pdev);
 bool dcp_s2r_firmware_stopped(struct platform_device *pdev);
+void dcp_t6041_s2r_all(bool start);
 
 int iomfb_start_rtkit(struct apple_dcp *dcp);
 void iomfb_shutdown(struct apple_dcp *dcp);

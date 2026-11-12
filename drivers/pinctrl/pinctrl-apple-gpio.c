@@ -324,6 +324,15 @@ static void apple_gpio_irq_unmask(struct irq_data *data)
 	gpiochip_enable_irq(gc, data->hwirq);
 	apple_gpio_set_reg(pctl, data->hwirq, REG_GPIOx_MODE,
 			   FIELD_PREP(REG_GPIOx_MODE, irqtype));
+	/*
+	 * On T6041 a level interrupt fired again at once every time it was unmasked although its
+	 * line was inactive (J616c speaker amps, pin 55: mode 3, data 1, ~140 interrupts a second
+	 * from boot until the core disabled the line as unhandled). Switching the mode back from
+	 * "off" leaves the status bit set. Clear it once more: a level that really is active sets
+	 * it again.
+	 */
+	if (irqd_get_trigger_type(data) & IRQ_TYPE_LEVEL_MASK)
+		apple_gpio_irq_ack(data);
 }
 
 static unsigned int apple_gpio_irq_startup(struct irq_data *data)

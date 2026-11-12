@@ -759,6 +759,18 @@ static int apple_smc_sleep_commit(struct apple_smc *smc)
 {
 	int ret;
 
+	/*
+	 * T6041: macOS's last SMC writes before MBSE (trace of its sleep under aura's hypervisor):
+	 * WKTP = 2 (AppleSMCEmbedded, going to sleep), and pmVC = 0x100, AppleT6041PMGR's
+	 * enableVddCio with every port's CIO rail off.
+	 */
+	if (of_machine_is_compatible("apple,t6041")) {
+		int r1 = apple_smc_write_u8(smc, SMC_KEY(WKTP), 2);
+		int r2 = apple_smc_write_u32(smc, SMC_KEY(pmVC), 0x101);
+
+		if (r1 || r2)
+			dev_err(smc->dev, "WKTP %d, pmVC %d\n", r1, r2);
+	}
 	apple_smc_write_mbse(smc, SMC_KEY(slpa));
 	/* Device interrupts are off here. */
 	mdelay(SMC_SLEEP_ARM_MS);

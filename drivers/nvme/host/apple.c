@@ -2454,6 +2454,8 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		return ERR_PTR(ret);
 	anv->adminq.is_adminq = true;
 	platform_set_drvdata(pdev, anv);
+	/* Its resume waits on the coprocessor (0.2 to 0.9 s after a real sleep): not in the others' way. */
+	device_enable_async_suspend(&pdev->dev);
 
 	anv->hw = of_device_get_match_data(&pdev->dev);
 	if (!anv->hw) {
@@ -3169,6 +3171,10 @@ static const struct apple_nvme_hw apple_nvme_t6040_hw = {
 	.needs_ioq_registers = true,
 	.lsq_in_nvmmu = true,
 	.max_queue_depth = 64,
+	/* ANS takes part in a firmware sleep, whole endpoint map echoed. */
+	.sleep_traced = true,
+	.sleep_flush_max_nsid = 1,
+	.sleep_shn = NVME_CC_SHN_MASK,
 	.quirks = NVME_QUIRK_NO_APST,
 };
 

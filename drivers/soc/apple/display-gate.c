@@ -3128,7 +3128,39 @@ static const struct gate_staged *t6041_max_stage(unsigned int i)
 /* Applied, they stay: the live tree refers to them. Only the KUnit test reverts them. */
 static struct of_changeset t6041_max_cs[ARRAY_SIZE(t6041_max_stages)];
 
-/* Enable every node of stage @i and put its display DART into the display subsystem's iommus. */
+/*
+ * Whether @np needs a power domain that stays disabled: neither enabled nor one of the nodes
+ * stage @st enables.
+ */
+static bool __init t6041_max_needs_off_domain(const struct gate_staged *st, struct device_node *np)
+{
+	struct of_phandle_args args;
+	bool off = false;
+	unsigned int n;
+	int i;
+
+	for (i = 0; !off && !of_parse_phandle_with_args(np, "power-domains", "#power-domain-cells",
+							i, &args); i++) {
+		off = !of_device_is_available(args.np);
+		for (n = 0; off && n < st->nr; n++) {
+			struct device_node *dn = of_find_node_by_path(st->nodes[n]);
+
+			off = dn != args.np;
+			of_node_put(dn);
+		}
+		of_node_put(args.np);
+	}
+	return off;
+}
+
+/*
+ * Enable every node of stage @i and put its display DART into the display subsystem's iommus.
+ * The in-tree trees give the chains no DISPEXT power domain: they are on as iBoot left them. A
+ * tree that does describe them (the J616c's bring-up EL2 tree: dispextN_fe, and PMP report
+ * entries above them, all disabled) loses the property on the chain's nodes here, or each
+ * device would wait for a domain provider that never comes and give up at the deferred probe
+ * timeout, and the display subsystem with them.
+ */
 static int __init t6041_max_apply(unsigned int i, struct device_node *display)
 {
 	const struct gate_staged *st = t6041_max_stage(i);
@@ -3144,6 +3176,9 @@ static int __init t6041_max_apply(unsigned int i, struct device_node *display)
 	for (n = 0; !ret && n < st->nr; n++) {
 		np = of_find_node_by_path(st->nodes[n]);
 		ret = np ? of_changeset_update_prop_string(cs, np, "status", "okay") : -ENODEV;
+		if (!ret && t6041_max_needs_off_domain(st, np))
+			ret = of_changeset_remove_property(cs, np,
+							   of_find_property(np, "power-domains", NULL));
 		of_node_put(np);
 	}
 	if (!ret)

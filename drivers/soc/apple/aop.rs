@@ -1983,8 +1983,10 @@ impl AopData {
     /// (one to one when the IOVA is the physical address, translated
     /// otherwise), so they are only checked here. Every page has to be mapped
     /// where the DT says, the external code (`__ETEXT`) at `ec0p` and any
-    /// other segment (`__OS_LOG`) at its physical address.
-    fn check_fw_regions(dev: &device::Device, ec0p: u64) -> Result<()> {
+    /// other segment (`__OS_LOG`) at its physical address. With `above_ec0p`
+    /// (27.2's firmware, which adds a segment at `ec0p + 0x20000` on T6041), a
+    /// segment above `ec0p` is translated too.
+    fn check_fw_regions(dev: &device::Device, ec0p: u64, above_ec0p: bool) -> Result<()> {
         // SAFETY: `dev` is a live device being probed.
         let np = unsafe { (*dev.as_raw()).of_node };
         if np.is_null() {
@@ -2029,7 +2031,7 @@ impl AopData {
                     return Err(EINVAL);
                 }
                 etext = true;
-            } else if iova != phys {
+            } else if iova != phys && !(above_ec0p && iova > ec0p) {
                 dev_err!(
                     dev,
                     "Firmware memory-region {} at IOVA {:#x}, neither EC0p {:#x} nor its physical address",
@@ -2820,6 +2822,9 @@ struct AopHwConfig {
     ncal: Option<u64>,
     alig: u64,
     aopt: u64,
+    /// The `ED0p` boot argument, or `None` to keep the firmware's own value; with it, a
+    /// firmware segment above `ec0p` is accepted at a translated IOVA too.
+    ed0p: Option<u64>,
     /// Complete the firmware's boot arguments before starting it.
     patch_bootargs: bool,
     /// The firmware speaks EPIC with version 4 sub-headers.
@@ -2853,6 +2858,7 @@ const HW_CFG_T8103: AopHwConfig = AopHwConfig {
     ncal: Some(0),
     aopt: 1,
     alig: 128,
+    ed0p: None,
     patch_bootargs: true,
     epic_v4: false,
     setup_port: false,
@@ -2873,6 +2879,7 @@ const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     ncal: None,
     aopt: 0,
     alig: 128,
+    ed0p: None,
     patch_bootargs: true,
     epic_v4: false,
     setup_port: false,
@@ -2892,6 +2899,7 @@ const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     ncal: None,
     aopt: 0,
     alig: 64,
+    ed0p: None,
     patch_bootargs: true,
     epic_v4: false,
     setup_port: false,
@@ -2910,6 +2918,7 @@ const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     ncal: Some(0),
     aopt: 0,
     alig: 64,
+    ed0p: None,
     patch_bootargs: true,
     epic_v4: false,
     setup_port: false,
@@ -2933,6 +2942,7 @@ const HW_CFG_T6040: AopHwConfig = AopHwConfig {
     ncal: Some(1),
     aopt: 0,
     alig: 64,
+    ed0p: None,
     patch_bootargs: true,
     epic_v4: false,
     setup_port: false,
@@ -2945,6 +2955,15 @@ const HW_CFG_T6040: AopHwConfig = AopHwConfig {
     fw_regions: true,
     bootargs_word_access: true,
     halt_on_failed_start: true,
+};
+/// T6041 (J616C): as T6040, with the AFK sleep and wake order macOS 26.6.2 uses on the J616C
+/// (trace, 8 Nov 2026: sleep to these endpoints in this order, then the AP idle notice), and
+/// `ED0p` at `ec0p + 0x20000` for the 27.2 firmware's segment above `ec0p`.
+const HW_CFG_T6041: AopHwConfig = AopHwConfig {
+    sleep_endpoints: &[0x2b, 0x2a, 0x24, 0x20, 0x27, 0x26, 0x28, 0x25, 0x21, 0x29, 0x23, 0x22],
+    wake_endpoints: &[0x22, 0x23, 0x29, 0x21, 0x25, 0x28, 0x26, 0x27, 0x20, 0x24, 0x2a, 0x2b],
+    ed0p: Some(0x0100_00000000 + 0x20000),
+    ..HW_CFG_T6040
 };
 /// T8132 (J713): as T6040. The bootloader hands the AOP over the same way, with
 /// the DART's DAPF programmed and its windows reserved alongside the firmware
@@ -2960,6 +2979,7 @@ const HW_CFG_T8140: AopHwConfig = AopHwConfig {
     ncal: Some(0),
     aopt: 0,
     alig: 0,
+    ed0p: None,
     patch_bootargs: false,
     epic_v4: true,
     setup_port: true,
@@ -2977,6 +2997,7 @@ const HW_CFG_T8140: AopHwConfig = AopHwConfig {
 /// ADT aop-exclave-mailbox) is not reachable from the AP: both bus-error.
 const HW_CFG_T8152: AopHwConfig = AopHwConfig {
     ec0p: 0,
+    ed0p: None,
     ncal: None,
     aopt: 0,
     alig: 0,
@@ -3001,6 +3022,7 @@ const HW_CFG_T8152: AopHwConfig = AopHwConfig {
 /// firmware runs with the boot arguments iBoot left.
 const HW_CFG_T8142: AopHwConfig = AopHwConfig {
     ec0p: 0,
+    ed0p: None,
     ncal: None,
     aopt: 0,
     alig: 0,
@@ -3078,7 +3100,7 @@ kernel::of_device_table!(
         (of::DeviceId::new(c_str!("apple,t6000-aop")), &HW_CFG_T6000),
         (of::DeviceId::new(c_str!("apple,t6020-aop")), &HW_CFG_T6020),
         (of::DeviceId::new(c_str!("apple,t8140-aop")), &HW_CFG_T8140),
-        (of::DeviceId::new(c_str!("apple,t6041-aop")), &HW_CFG_T6040),
+        (of::DeviceId::new(c_str!("apple,t6041-aop")), &HW_CFG_T6041),
         (of::DeviceId::new(c_str!("apple,t8132-aop")), &HW_CFG_T8132),
         (of::DeviceId::new(c_str!("apple,t6050-aop")), &HW_CFG_T6050),
         (of::DeviceId::new(c_str!("apple,t8142-aop")), &HW_CFG_T8142),
@@ -3117,7 +3139,7 @@ impl platform::Driver for AopDriver {
         let asc_mmio = asc_mmio.as_view().relaxed();
         if cfg.fw_regions {
             // Before anything is written to the AOP: no mapping, no start.
-            AopData::check_fw_regions(pdev.as_ref(), cfg.ec0p)?;
+            AopData::check_fw_regions(pdev.as_ref(), cfg.ec0p, cfg.ed0p.is_some())?;
         }
         let data = AopData::new(pdev, cfg)?;
         // Whatever fails below leaves the AOP running and its children
@@ -3132,6 +3154,7 @@ impl platform::Driver for AopDriver {
                     (from_fourcc(b"nCal"), cfg.ncal),
                     (from_fourcc(b"alig"), Some(cfg.alig)),
                     (from_fourcc(b"AOPt"), Some(cfg.aopt)),
+                    (from_fourcc(b"ED0p"), cfg.ed0p),
                 ],
                 cfg.bootargs_word_access,
             )?;

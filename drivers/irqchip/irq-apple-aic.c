@@ -341,6 +341,18 @@ static const struct aic_info aic3_t8140_info __initconst = {
 	.fw_suspend = true,
 };
 
+/*
+ * T6041 (M4 Max): the AICv3 of T8122, with the state its sleep driver's firmware
+ * suspend loses saved and restored around it.
+ */
+static const struct aic_info aic3_t6041_info __initconst = {
+	.version = 3,
+	.irq_cfg = AIC3_IRQ_CFG,
+	.fast_ipi = true,
+	.local_fast_ipi = true,
+	.fw_suspend = true,
+};
+
 static const struct aic_info aic3_t8142_info __initconst = {
 	.version = 3,
 	.irq_cfg = AIC3_IRQ_CFG,
@@ -357,6 +369,10 @@ static const struct of_device_id aic_info_match[] = {
 	{
 		.compatible = "apple,t8142-aic3",
 		.data = &aic3_t8142_info,
+	},
+	{
+		.compatible = "apple,t6041-aic3",
+		.data = &aic3_t6041_info,
 	},
 	{
 		.compatible = "apple,t8103-aic",

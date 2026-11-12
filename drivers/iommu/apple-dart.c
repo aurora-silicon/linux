@@ -6910,6 +6910,56 @@ EXPORT_SYMBOL_GPL(apple_dart_gapf_ready);
  * Stopping again after a sleep that never reached the commit does nothing: the
  * domains may be off by then.
  */
+/*
+ * T6041: a display DART is locked, so the driver neither saves nor restores its TCR / TTBR, and
+ * after a real sleep the panel stayed black with everything else up. Keep the words of @streams
+ * before the sleep (save), and after it write back what differs (!save). Returns how many words
+ * were written back.
+ */
+int apple_dart_display_keep(struct device *dev, u32 streams, bool save)
+{
+	static struct { struct apple_dart *dart; u32 tcr[32]; u32 ttbr[32][4]; } keep[2];
+	struct apple_dart *dart = dev_get_drvdata(dev);
+	unsigned long bits = streams;
+	unsigned int sid, idx, k, n = 0;
+
+	if (!dart)
+		return -ENODEV;
+	for (k = 0; k < 2 && keep[k].dart && keep[k].dart != dart; k++)
+		;
+	if (k == 2)
+		return -ENOSPC;
+	if (!save && keep[k].dart != dart)
+		return -ENOENT;
+	keep[k].dart = dart;
+	for_each_set_bit(sid, &bits, 32) {
+		u32 tcr = readl(dart->regs + DART_TCR(dart, sid));
+
+		if (sid >= dart->num_streams)
+			break;
+		if (save)
+			keep[k].tcr[sid] = tcr;
+		for (idx = 0; idx < dart->hw->ttbr_count && idx < 4; idx++) {
+			u32 ttbr = readl(dart->regs + DART_TTBR(dart, sid, idx));
+
+			if (save) {
+				keep[k].ttbr[sid][idx] = ttbr;
+				continue;
+			}
+			if (ttbr != keep[k].ttbr[sid][idx]) {
+				writel(keep[k].ttbr[sid][idx], dart->regs + DART_TTBR(dart, sid, idx));
+				n++;
+			}
+		}
+		if (!save && tcr != keep[k].tcr[sid]) {
+			writel(keep[k].tcr[sid], dart->regs + DART_TCR(dart, sid));
+			n++;
+		}
+	}
+	return n;
+}
+EXPORT_SYMBOL_GPL(apple_dart_display_keep);
+
 int apple_dart_display_streams(struct device *dev, u32 streams, bool on, bool flush)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);

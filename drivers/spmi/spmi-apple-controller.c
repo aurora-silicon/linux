@@ -614,6 +614,23 @@ static int apple_spmi_resume_noirq(struct device *dev)
 		return 0;
 
 	guard(mutex)(&spmi->fifo_lock);
+	/*
+	 * Firmware and the platform's sleep code use this queue while Linux is
+	 * away. Every command of ours was answered before the suspend, so any
+	 * reply waiting now is someone else's, and would be read as the reply
+	 * to our next command.
+	 */
+	if (pm_resume_via_firmware()) {
+		unsigned int stale = 0;
+
+		while (!(readl(spmi->regs + spmi->hw->status) & spmi->hw->rx_empty) &&
+		       stale < 64) {
+			readl(spmi->regs + spmi->hw->reply);
+			stale++;
+		}
+		if (stale)
+			dev_info(dev, "dropped %u stale reply words after the wake\n", stale);
+	}
 	raw_spin_lock_irqsave(&spmi->irq_mask_lock, flags);
 	/* Whether the enables survive a real sleep has not been measured. */
 	if (pm_resume_via_firmware()) {
