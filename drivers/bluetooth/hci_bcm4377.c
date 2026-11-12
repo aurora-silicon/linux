@@ -3289,9 +3289,9 @@ static int bcm4377_suspend(struct device *dev)
 
 /*
  * A system sleep that takes the chip's power or resets it leaves the function's private
- * windows at their reset values and no firmware: a J616s after a suspend to RAM reads
- * window 1 as 0x19328000 and, once the windows are back, boot stage 0. Put the windows
- * back and say whether a firmware still runs behind them.
+ * windows at their reset values and no firmware: a BCM4388 then reads window 1 as
+ * 0x19328000 and, once the windows are back, boot stage 0. Put the windows back and say
+ * whether a firmware still runs behind them.
  */
 static bool bcm4377_resume_cold(struct bcm4377_data *bcm4377)
 {
@@ -3304,9 +3304,9 @@ static bool bcm4377_resume_cold(struct bcm4377_data *bcm4377)
 		return true;
 	bootstage = ioread32(bcm4377->bar2 + bcm4377->hw->bar2_offset + BCM4377_BAR2_BOOTSTAGE);
 	rti_status = ioread32(bcm4377->bar2 + bcm4377->hw->bar2_offset + BCM4377_BAR2_RTI_STATUS);
-	dev_info(&bcm4377->pdev->dev,
-		 "the sleep reset the function (window %#x): boot stage %u, RTI status %u\n",
-		 win, bootstage, rti_status);
+	dev_dbg(&bcm4377->pdev->dev,
+		"the sleep reset the function (window %#x): boot stage %u, RTI status %u\n",
+		win, bootstage, rti_status);
 	return bootstage != BCM4377_BOOTSTAGE_RUNNING ||
 	       rti_status != BCM4377_RTI_STATUS_RUNNING;
 }
