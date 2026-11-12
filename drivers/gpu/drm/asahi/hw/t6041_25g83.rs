@@ -60,6 +60,8 @@ pub(super) const CONFIG: Config = Config {
         // hang this GPU's firmware on grids of more than ten workgroups.
         compute_blocks: 96,
     },
+    // The GPU is restarted after a real sleep, as on T8140.
+    sleep_restart: true,
     ..t6041::BASE
 };
 
