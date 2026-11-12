@@ -5187,6 +5187,21 @@ static void dcp_hybrid_work(struct work_struct *work)
 			return;
 		}
 
+		/*
+		 * The HDMI display made room for this one, which fits one pipe
+		 * after all (it listed other modes when it was read again):
+		 * the HDMI display takes its pipeline back.
+		 */
+		if (typec_first && READ_ONCE(hyb->hdmi_yielded) &&
+		    !READ_ONCE(owner->dcp->peer_starved) && !hyb->active_typec_route) {
+			dev_info(hyb->dev, "Type-C display fits one pipe: the HDMI display keeps the hybrid\n");
+			WRITE_ONCE(hyb->hdmi_yielded, false);
+			if (hyb->active && hdmi)
+				dcp_dptx_connect(hyb, 0);
+			dcp_hybrid_moved = jiffies ?: 1;
+			return;
+		}
+
 		if (!READ_ONCE(owner->dcp->peer_starved) || hyb->active_typec_route ||
 		    dcp_typec_safe_held(hyb) || dcp_hybrid_fails >= DCP_HYBRID_MAX_FAILS ||
 		    (!typec_first && hdmi))
