@@ -6508,8 +6508,10 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 			const struct dcp_method_entry *own =
 				iomfb_v27_methods_j714s(dev, dcp->v27_methods);
 
-			if (own)
+			if (own) {
 				dcp->v27_methods = own;
+				dcp->v27_a407 = true;
+			}
 		}
 	}
 	if (fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {

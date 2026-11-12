@@ -432,6 +432,24 @@ static void dcp_swap_submit(struct apple_dcp *dcp, bool oob,
 			return;
 		}
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
+		if (dcp->v27_a407) {
+			/* The statements below on the A407 record. */
+			iomfb_serialize_present_v27_a407(&dcp->present_v27_a407, request);
+			dcp->present_v27_a407.swap.brightness_update =
+				dcp->present_h17p.swap[0x354] & 1;
+			dcp->present_v27_a407.swap.brightness_nits =
+				get_unaligned_le64(dcp->present_h17p.swap + 0x35e);
+			dcp_external_stamp_submit(dcp, &dcp->present_v27_a407.swap);
+			if (dcp_has_panel(dcp) && iomfb_present_has_surface_h17p(request))
+				dcp_edr_prepare_v27(dcp, &dcp->present_v27_a407.swap,
+						    dcp->present_v27_a407.swap.brightness_update,
+						    dcp->edr_present_sdr);
+			dcp_push(dcp, oob, &dcp_methods[dcpep_swap_submit],
+				 sizeof(struct dcp_swap_submit_req_v27_a407),
+				 sizeof(struct dcp_swap_submit_resp_h17p),
+				 &dcp->present_v27_a407, cb, cookie);
+			return;
+		}
 		iomfb_serialize_present_v27(&dcp->present_v27, request);
 		dcp->present_v27.swap.brightness_update =
 			dcp->present_h17p.swap[0x354] & 1;
