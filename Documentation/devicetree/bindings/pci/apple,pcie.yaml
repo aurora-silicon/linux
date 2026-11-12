@@ -388,6 +388,11 @@ allOf:
         "^pci@":
           properties:
             apple,link-trained-by-bootloader: false
+            apple,apcie-config-tunables: false
+            apple,pcie-rc-tunables: false
+            apple,pcie-rc-gen3-shadow-tunables: false
+            apple,pcie-rc-gen4-shadow-tunables: false
+            apple,pcie-rc-gen5-shadow-tunables: false
   - if:
       properties:
         compatible:
