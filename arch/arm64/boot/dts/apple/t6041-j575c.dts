@@ -146,6 +146,10 @@
 	/delete-property/ apple,fast-die-effort;
 };
 
+&cpuidle {
+	status = "okay";
+};
+
 &wdt {
 	timeout-sec = <140>;
 };
