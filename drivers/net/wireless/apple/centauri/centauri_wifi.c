@@ -1240,7 +1240,7 @@ void centauri_wifi_kick(struct centauri *c)
 	struct centauri_wifi *wifi = READ_ONCE(c->wifi);
 
 	if (wifi && READ_ONCE(wifi->connected) && !READ_ONCE(wifi->stopping))
-		mod_delayed_work(system_wq, &wifi->link_work, 0);
+		mod_delayed_work(system_percpu_wq, &wifi->link_work, 0);
 }
 
 static int wifi_disconnect(struct wiphy *wiphy, struct net_device *netdev, u16 reason)
@@ -1417,7 +1417,7 @@ static netdev_tx_t net_transmit(struct sk_buff *skb, struct net_device *netdev)
 	skb_queue_tail(&wifi->data_tx_queue, skb);
 	if (skb_queue_len(&wifi->data_tx_queue) >= DATA_TX_QUEUE_LIMIT)
 		netif_stop_queue(netdev);
-	mod_delayed_work(system_wq, &wifi->link_work, 0);
+	mod_delayed_work(system_percpu_wq, &wifi->link_work, 0);
 	return NETDEV_TX_OK;
 }
 
