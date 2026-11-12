@@ -9140,56 +9140,20 @@ static int dcp_t6041_display_power(struct apple_dcp *dcp, void __iomem **ps,
 	return 0;
 }
 
-/* W1: raise the display domains (SYS+FE on, CPU to PS_MIN then on) + pmc-dcp up. */
-/*
- * After a real S2R the resume took an SError right after this raised SYS/FE with
- * automatic mode: with the DCP's CPU off nothing holds them up, AUTO gates them again (as
- * APCIE_SYS_GP did) and the display DART behind them faults. N: manual target 0xf,
- * ACTUAL polled, until the firmware runs again.
- */
 #define DCP_S2R_MARK(id, step)	(0x7d000000 | ((step) & 0xf) << 16 | (id))
 static void dcp_t6041_gapf_release_all(struct apple_dcp *dcp);
-static bool s2r_gapf_all;
 
 /*
- * The resume got past the domains and the display DART (mark 0x7d09) and took the
- * SError when the cold restart touched the DCP's ASC: s2r_cpu_off left the CPU word at target
- * 0 with automatic mode off, so nothing brings it back (the "automatic mode raises it" note
- * below predates s2r_cpu_off). s2r_cpu_on: after SYS/FE, release the GAPF clock protection as
- * the stop did and put the CPU word at manual target 0xf, ACTUAL and bit 11 polled; marks
- * 0x7d0a before, 0x7d0b after.
+ * W1: raise the display domains and pmc-dcp. SYS and FE go to manual target 0xf with
+ * ACTUAL polled: in automatic mode nothing holds them up while the DCP's CPU is off,
+ * they are gated again and the display DART behind them faults. Then the internal
+ * DCP's CPU power word, which the stop left at target 0 with automatic mode off, and
+ * its children.
  */
-static bool s2r_children_on = true;
-module_param(s2r_children_on, bool, 0644);
-MODULE_PARM_DESC(s2r_children_on, "T6040 S2R resume: the internal DCP CPU word's 11 children back as the stop found them");
-
-/*
- * T6040 S2R wake (bring-up): the internal DCP's firmware, idled by the stop
- * (A500, RTKit idle), restarted warm as the platform restarts it (HELLO, the endpoint
- * map echoed, no endpoint started again) instead of the cold session restart.
- */
-static bool s2r_warm = true;
-module_param(s2r_warm, bool, 0644);
-MODULE_PARM_DESC(s2r_warm, "T6040 S2R resume: warm RTKit restart of the idled internal DCP, not the cold session restart");
-
-static bool s2r_dcp_dart_on = true;
-module_param(s2r_dcp_dart_on, bool, 0644);
-MODULE_PARM_DESC(s2r_dcp_dart_on, "T6040 S2R resume: the internal DCP's own DART streams back on before the cold restart");
-
-static bool s2r_cpu_on = true;
-module_param(s2r_cpu_on, bool, 0644);
-MODULE_PARM_DESC(s2r_cpu_on, "T6040 S2R resume: raise the internal DCP's CPU power word that s2r_cpu_off lowered");
-
-static bool s2r_domains_auto;
-module_param(s2r_domains_auto, bool, 0644);
-MODULE_PARM_DESC(s2r_domains_auto,
-		 "T6040 S2R resume: raise the internal display's SYS/FE in automatic mode (N: manual, ACTUAL polled)");
-
 static int dcp_t6041_s2r_domains_on(struct apple_dcp *dcp)
 {
 	struct dcp_t6041_ps_offsets o;
 	void __iomem *ps, *pmc;
-	bool autom = READ_ONCE(s2r_domains_auto);
 	u32 val;
 	int ret;
 
@@ -9202,25 +9166,21 @@ static int dcp_t6041_s2r_domains_on(struct apple_dcp *dcp)
 	/* TODO(ADT): conditional-retention enable + axi2af bridge bit0 set first. */
 	val = readl(ps + o.sys) & ~(GENMASK(9, 8) | GENMASK(3, 0) | BIT(28));
 	writel(val | 0xf, ps + o.sys);
-	if (autom)
-		writel(val | 0xf | BIT(28), ps + o.sys);
-	else if (readl_poll_timeout_atomic(ps + o.sys, val, (val & GENMASK(7, 4)) == GENMASK(7, 4),
-					   1, 10000))
+	if (readl_poll_timeout_atomic(ps + o.sys, val, (val & GENMASK(7, 4)) == GENMASK(7, 4),
+				      1, 10000))
 		dev_warn(dcp->dev, "S2R resume: SYS power word stuck at %#x\n", val);
 	val = readl(ps + o.fe) & ~(GENMASK(9, 8) | GENMASK(3, 0) | BIT(28));
 	writel(val | 0xf, ps + o.fe);
-	if (autom)
-		writel(val | 0xf | BIT(28), ps + o.fe);
-	else if (readl_poll_timeout_atomic(ps + o.fe, val, (val & GENMASK(7, 4)) == GENMASK(7, 4),
-					   1, 10000))
+	if (readl_poll_timeout_atomic(ps + o.fe, val, (val & GENMASK(7, 4)) == GENMASK(7, 4),
+				      1, 10000))
 		dev_warn(dcp->dev, "S2R resume: FE power word stuck at %#x\n", val);
 	apple_sleep_bringup_mark(DCP_S2R_MARK(0, 0x8));
 	/*
-	 * The CPU's word refuses writes from the OS on T6040 (a no-op rewrite reset the
-	 * SoC): it stays in automatic mode and comes up when the run bit is set.
+	 * The internal DCP's CPU word, if it is down: the GAPF clock protection released
+	 * as the stop did, then the word to manual target 0xf, ACTUAL and bit 11 polled.
 	 */
 	ret = 0;
-	if (READ_ONCE(s2r_cpu_on) && !dcp->external && !(readl(ps + o.cpu) & 0xf0)) {
+	if (!dcp->external && !(readl(ps + o.cpu) & 0xf0)) {
 		void __iomem *g = ioremap_np(0x500578540ULL, 4);
 		u32 v, cur;
 
@@ -9228,8 +9188,7 @@ static int dcp_t6041_s2r_domains_on(struct apple_dcp *dcp)
 			writel(readl(g) & ~BIT(4), g);
 			iounmap(g);
 		}
-		if (READ_ONCE(s2r_gapf_all))
-			dcp_t6041_gapf_release_all(dcp);
+		dcp_t6041_gapf_release_all(dcp);
 		apple_sleep_bringup_mark(DCP_S2R_MARK(0, 0xa));
 		v = readl(ps + o.cpu);
 		writel((v & ~(0x30fU | BIT(28))) | 0xf, ps + o.cpu);
@@ -9242,12 +9201,12 @@ static int dcp_t6041_s2r_domains_on(struct apple_dcp *dcp)
 			 readl(ps + o.cpu), ret ? " (timeout)" : "");
 	}
 	/*
-	 * With the CPU back and the firmware restarted, still every endpoint start timed out:
-	 * the 11 children of the CPU word (+0x8..+0x58) stayed at target 0 (t6040-sleep's .enter
-	 * lowered them, nothing raised them). s2r_children_on writes back what the stop found,
-	 * in order, before the GAPF protection returns; marks 0x7d0d before, 0x7d0e after.
+	 * The 11 children of the CPU word (+0x8..+0x58) are at target 0 after the sleep (the
+	 * sleep controller's last steps lower them) and with them down every endpoint start
+	 * timed out: what the stop found is written back, in order, before the GAPF
+	 * protection returns.
 	 */
-	if (READ_ONCE(s2r_children_on) && !dcp->external && dcp->s2r_child_valid) {
+	if (!dcp->external && dcp->s2r_child_valid) {
 		u32 cur, to = 0, i;
 
 		apple_sleep_bringup_mark(DCP_S2R_MARK(0, 0xd));
@@ -9294,25 +9253,10 @@ static int dcp_t6041_s2r_domains_on(struct apple_dcp *dcp)
 #define DCP_T6041_GAPF_RSVD	3	/* /chosen dart-clock-gapf-rsvd-slices */
 
 /*
- * With the DCP DART's own slice released (0x12 -> 0x02) the CPU word still
- * faulted. Discriminator: release every protected slice (bits 1 and 4 set) in the
- * bank, past the reserved ones, so a remaining fault rules GAPF out entirely.
+ * With only the DCP DART's own slice released (0x12 -> 0x02) the CPU word still
+ * faulted: every protected slice (bits 1 and 4 set) in the bank, past the reserved
+ * ones, is released.
  */
-static bool s2r_gapf_all = true;	/* also declared above dcp_t6041_s2r_domains_on() */
-module_param(s2r_gapf_all, bool, 0644);
-MODULE_PARM_DESC(s2r_gapf_all,
-		 "T6040 S2R: with s2r_gapf_release, clear clock protection on every protected GAPF slice");
-
-/*
- * The platform writes the CPU word as full values with bits 27:24 = 0xf (measured: 0x1f0003ff
- * -> 0x0f0000ff -> 0x0f0003f0); this boot's words read 0x1000030f (bits 27:24 = 0),
- * set by the boot chain. Y: write the bits 27:24 instead of keeping ours.
- */
-static bool s2r_ps_auto_f = true;
-module_param(s2r_ps_auto_f, bool, 0644);
-MODULE_PARM_DESC(s2r_ps_auto_f,
-		 "T6040 S2R: write the CPU power word with bits 27:24 = 0xf, as the values");
-
 /* Kept by an SError after it: 0x7de2RRNN, RR slices released, NN the bank's slice count. */
 static void dcp_t6041_gapf_release_all(struct apple_dcp *dcp)
 {
@@ -9339,26 +9283,6 @@ static void dcp_t6041_gapf_release_all(struct apple_dcp *dcp)
 	dev_info(dcp->dev, "S2R: GAPF clock protection cleared on %u of %u slices\n", rel, n);
 	iounmap(b);
 }
-
-static bool s2r_cpu_write = true;
-module_param(s2r_cpu_write, bool, 0644);
-MODULE_PARM_DESC(s2r_cpu_write,
-		 "T6040 S2R: with s2r_cpu_off, also write the CPU power word here (N: DART + GAPF only, the word left to t6040-sleep's .enter)");
-
-static bool s2r_cold_stop = true;
-module_param(s2r_cold_stop, bool, 0644);
-MODULE_PARM_DESC(s2r_cold_stop,
-		 "T6040 S2R: CPU_CONTROL := 0 twice right before the CPU word, as T8140");
-
-static bool s2r_dart_quiesce = true;
-module_param(s2r_dart_quiesce, bool, 0644);
-MODULE_PARM_DESC(s2r_dart_quiesce,
-		 "T6040 S2R: stop the DCP DART's streams and flush its TLB (T8140's order) before the GAPF release");
-
-static bool s2r_gapf_release = true;
-module_param(s2r_gapf_release, bool, 0644);
-MODULE_PARM_DESC(s2r_gapf_release,
-		 "T6040 S2R: clear the DCP DART's GAPF clock protection before its CPU power word goes down");
 
 static u32 dcp_s2r_mark_id(struct apple_dcp *dcp)
 {
@@ -9401,9 +9325,11 @@ static void dcp_t6041_s2r_cpu_off(struct apple_dcp *dcp, u32 id)
 {
 	void __iomem *control = dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL;
 	struct dcp_t6041_ps_offsets o;
-	void __iomem *ps, *pmc, *w;
+	struct resource *res;
+	void __iomem *ps, *pmc, *w, *g;
 	u32 v, cur, after;
-	int ret = 0;
+	phys_addr_t gpa;
+	int ret = 0, dret = -ENODEV;
 
 	if (!dcp_t6041_ps_offsets(dcp, &o) || dcp_t6041_display_power(dcp, &ps, &pmc))
 		return;
@@ -9416,51 +9342,36 @@ static void dcp_t6041_s2r_cpu_off(struct apple_dcp *dcp, u32 id)
 		dcp->s2r_child_valid = true;
 	}
 	/* T8140's order (apple_dart_display_streams): streams off and TLB flushed, then GAPF. */
-	if (READ_ONCE(s2r_dart_quiesce)) {
-		int dret = -ENODEV;
+	dcp_s2r_find_darts(dcp);
+	apple_sleep_bringup_mark(0x7dd00000);
+	if (dcp->s2r_dcp_dart)
+		dret = apple_dart_display_streams(dcp->s2r_dcp_dart, DCP_S2R_DCP_STREAMS,
+						  false, true);
+	apple_sleep_bringup_mark(0x7dd10000 | (dret & 0xffff));
+	dev_info(dcp->dev, "S2R: DCP DART streams off + flush: %d\n", dret);
 
-		dcp_s2r_find_darts(dcp);
-		apple_sleep_bringup_mark(0x7dd00000);
-		if (dcp->s2r_dcp_dart)
-			dret = apple_dart_display_streams(dcp->s2r_dcp_dart, DCP_S2R_DCP_STREAMS,
-							  false, true);
-		apple_sleep_bringup_mark(0x7dd10000 | (dret & 0xffff));
-		dev_info(dcp->dev, "S2R: DCP DART streams off + flush: %d\n", dret);
-	}
-	if (READ_ONCE(s2r_gapf_release)) {
-		struct resource *res = platform_get_resource_byname(to_platform_device(dcp->dev),
-								     IORESOURCE_MEM, "coproc");
-		phys_addr_t gpa = !dcp->external ? DCP_T6041_GAPF_DCP :
-				  res && res->start == DCP_T6041_DISPEXT0_COPROC ? DCP_T6041_GAPF_DCPEXT0 :
-				  res && res->start == DCP_T6041_DISPEXT1_COPROC ? DCP_T6041_GAPF_DCPEXT1 : 0;
-		void __iomem *g = gpa ? ioremap_np(gpa, 4) : NULL;
+	res = platform_get_resource_byname(to_platform_device(dcp->dev), IORESOURCE_MEM, "coproc");
+	gpa = !dcp->external ? DCP_T6041_GAPF_DCP :
+	      res && res->start == DCP_T6041_DISPEXT0_COPROC ? DCP_T6041_GAPF_DCPEXT0 :
+	      res && res->start == DCP_T6041_DISPEXT1_COPROC ? DCP_T6041_GAPF_DCPEXT1 : 0;
+	g = gpa ? ioremap_np(gpa, 4) : NULL;
+	if (g) {
+		u32 gv = readl(g), ga;
 
-		if (g) {
-			u32 gv = readl(g), ga;
-
-			writel(gv & ~DCP_T6041_GAPF_PROTECT, g);
-			ga = readl(g);
-			/* Kept by an SError on the CPU word: 0x7de0BBAA, BB before, AA after. */
-			apple_sleep_bringup_mark(0x7de00000 | (gv & 0xff) << 8 | (ga & 0xff));
-			dev_info(dcp->dev, "S2R: GAPF slice %pa %#x -> %#x\n", &gpa, gv, ga);
-			iounmap(g);
-		} else {
-			apple_sleep_bringup_mark(DCP_S2R_MARK(id, 0xf));
-		}
-		if (READ_ONCE(s2r_gapf_all))
-			dcp_t6041_gapf_release_all(dcp);
+		writel(gv & ~DCP_T6041_GAPF_PROTECT, g);
+		ga = readl(g);
+		/* Kept by an SError on the CPU word: 0x7de0BBAA, BB before, AA after. */
+		apple_sleep_bringup_mark(0x7de00000 | (gv & 0xff) << 8 | (ga & 0xff));
+		dev_info(dcp->dev, "S2R: GAPF slice %pa %#x -> %#x\n", &gpa, gv, ga);
+		iounmap(g);
 	} else {
 		apple_sleep_bringup_mark(DCP_S2R_MARK(id, 0xf));
 	}
-	if (!READ_ONCE(s2r_cpu_write)) {
-		iounmap(ps);
-		iounmap(pmc);
-		return;
-	}
-	if (READ_ONCE(s2r_cold_stop)) {
-		writel(0, control);
-		writel(0, control);
-	}
+	dcp_t6041_gapf_release_all(dcp);
+
+	/* As T8140: CPU_CONTROL cleared twice right before the CPU word. */
+	writel(0, control);
+	writel(0, control);
 	v = readl(w);
 	/*
 	 * Kept by an SError on the first write: 0x7dGPAvvv. G = 4 | the DCP slice's bit 4
@@ -9481,26 +9392,22 @@ static void dcp_t6041_s2r_cpu_off(struct apple_dcp *dcp, u32 id)
 					 ((v >> 24) & 0xf) << 16 | ((v >> 28) & 0xf) << 12 |
 					 (v & 0xfff));
 	}
-	/* The platform: 0x1f0003ff -> W 0x0f0000ff, poll ACTUAL 15 -> W 0x0f0003f0. */
-	{
-		u32 keep = READ_ONCE(s2r_ps_auto_f) ? (v & 0x000f0000) | 0x0f000000 :
-						     v & 0xeffffcff & ~0xffU;
-		u32 w1 = keep | 0xff;
-
-		/* Kept after the first write: 0x7dc1VVVV, the word's low half read back. */
-		if ((v & BIT(28)) || READ_ONCE(s2r_ps_auto_f)) {
-			writel(w1, w);
-			mb();
-			ret |= readl_poll_timeout_atomic(w, cur, (cur & 0xf0) == 0xf0, 1, 8000);
-			apple_sleep_bringup_mark(0x7dc10000 | (readl(w) & 0xffff));
-		}
-		writel((readl(w) & 0xfffffcf0) | 0x300, w);
-		mb();
-		ret |= readl_poll_timeout_atomic(w, cur, !(cur & BIT(11)), 1, 8000);
-		ret |= readl_poll_timeout_atomic(w, cur, !(cur & 0xf0), 1, 8000);
-		/* Kept after the second write: 0x7dc2VVVV. */
-		apple_sleep_bringup_mark(0x7dc20000 | (readl(w) & 0xffff));
-	}
+	/*
+	 * The platform writes the CPU word as full values with bits 27:24 = 0xf (measured:
+	 * 0x1f0003ff -> 0x0f0000ff, ACTUAL polled to 15, -> 0x0f0003f0); the boot chain
+	 * leaves bits 27:24 = 0 here (0x1000030f). Both writes carry the bits 27:24.
+	 */
+	writel((v & 0x000f0000) | 0x0f0000ff, w);
+	mb();
+	ret |= readl_poll_timeout_atomic(w, cur, (cur & 0xf0) == 0xf0, 1, 8000);
+	/* Kept after the first write: 0x7dc1VVVV, the word's low half read back. */
+	apple_sleep_bringup_mark(0x7dc10000 | (readl(w) & 0xffff));
+	writel((readl(w) & 0xfffffcf0) | 0x300, w);
+	mb();
+	ret |= readl_poll_timeout_atomic(w, cur, !(cur & BIT(11)), 1, 8000);
+	ret |= readl_poll_timeout_atomic(w, cur, !(cur & 0xf0), 1, 8000);
+	/* Kept after the second write: 0x7dc2VVVV. */
+	apple_sleep_bringup_mark(0x7dc20000 | (readl(w) & 0xffff));
 	after = readl(w);
 	apple_sleep_bringup_mark(DCP_S2R_MARK(id, 0x0));
 	dev_info(dcp->dev, "S2R: CPU power word +%#x %#x -> %#x%s\n", o.cpu, v, after,
@@ -9666,15 +9573,14 @@ lost:
 }
 
 /*
- * The desktop firmware brought back after a real power loss: W1 raises the
- * display domains, then the cold restart runs async in the reused
- * hib_restore_work so a 10 s dcp_wait_ready() does not stall .resume. The
- * internal panel re-points its scanout/display DART streams here (W2) and
- * shares dcp_desktop_cold_restart; an external DCP (HDMI/USB-C DP) rebuilds its
- * DART and link in dcp_hib_ext_restore(), so a docked desktop returns after the
- * sleep too. If W1 cannot run -- no apple,display-power window, or an external
- * DCP whose DISPEXT offsets are unresolved -- the panel/output is left off
- * until reboot, exactly as before: refusal-safe, the sleep already completed.
+ * The desktop firmware brought back after a real sleep: W1 raises the display
+ * domains, the DART streams the stop turned off come back (W2), then the warm
+ * restart of the idled firmware runs async in the reused hib_restore_work so its
+ * waits do not stall .resume (dcp_t6041_s2r_warm_restart() for the internal panel,
+ * dcp_t6041_s2r_warm_restart_ext() for an external DCP). If W1 cannot run -- no
+ * apple,display-power window, or an external DCP whose DISPEXT offsets are
+ * unresolved -- the panel/output is left off until reboot: refusal-safe, the sleep
+ * already completed.
  */
 static void dcp_t6041_s2r_resume(struct apple_dcp *dcp)
 {
@@ -9702,17 +9608,17 @@ static void dcp_t6041_s2r_resume(struct apple_dcp *dcp)
 							   DCP_S2R_DISP_STREAMS, true, false);
 			apple_sleep_bringup_mark(DCP_S2R_MARK(0, 0x9));
 			/*
-			 * The cold restart ran (RUN set, RTKit init) but every endpoint
-			 * start timed out (-110) and the pipe never powered: the stop turned the
-			 * DCP's own DART streams off (s2r_dart_quiesce) and only the display
-			 * DART's came back. As dcp_s2r_ext_start() and dcp_s2r_warm_restart():
-			 * after the domains, the DCP DART's streams on (GAPF protection again).
+			 * The stop turned the DCP's own DART streams off as well: with only
+			 * the display DART's back every endpoint start timed out (-110) and
+			 * the pipe never powered. As dcp_s2r_ext_start() and
+			 * dcp_s2r_warm_restart(): after the domains, the DCP DART's streams
+			 * on (GAPF protection again).
 			 */
-			if (READ_ONCE(s2r_dcp_dart_on) && dcp->s2r_dcp_dart)
+			if (dcp->s2r_dcp_dart)
 				apple_dart_display_streams(dcp->s2r_dcp_dart,
 							   DCP_S2R_DCP_STREAMS, true, false);
 			apple_sleep_bringup_mark(DCP_S2R_MARK(0, 0xc));
-		} else if (READ_ONCE(s2r_dcp_dart_on)) {
+		} else {
 			/*
 			 * An external DCP's stop turned its own DART's streams off as well:
 			 * its firmware answers no endpoint start without them (-110).
@@ -9731,7 +9637,7 @@ static void dcp_t6041_s2r_resume(struct apple_dcp *dcp)
 		WRITE_ONCE(dcp->hib_phase, DCP_HIB_RESTARTING);
 		if (dcp_desktop_external(dcp))
 			dcp_hib_ext_get(dcp);
-		dcp->s2r_cold_restart = true;
+		dcp->s2r_restart = true;
 		queue_work(system_long_wq, &dcp->hib_restore_work);
 		return;
 #endif
@@ -10721,10 +10627,9 @@ static int dcp_cold_session_start(struct apple_dcp *dcp)
 /*
  * The desktop firmware brought back from a cold stop after a full power loss:
  * the probe-identical session restart (above), the ready wait, then a DRM
- * modeset that re-lights the panel. Factored out of the S4 hibernation restore
- * (dcp_hib_restore_work) so an S2R wake reuses the identical cold restart. The
- * internal panel only; the external link has its own dcp_hib_ext_restore().
- * Lifted out of the hibernation work item so S2R can call it on its own.
+ * modeset that re-lights the panel. The tail of the S4 hibernation restore
+ * (dcp_hib_restore_work). The internal panel only; the external link has its own
+ * dcp_hib_ext_restore().
  */
 static void dcp_desktop_cold_restart(struct apple_dcp *dcp)
 {
@@ -10837,22 +10742,15 @@ static void dcp_hib_restore_work(struct work_struct *work)
 					     hib_restore_work);
 
 	/*
-	 * An S2R wake reuses this work item for the cold restart: the
-	 * internal panel shares dcp_desktop_cold_restart; an external DCP has its
-	 * own session start + link tail, as the hibernation restore below does.
+	 * An S2R wake reuses this work item for the warm restart of the firmware its
+	 * stop idled.
 	 */
-	if (dcp->s2r_cold_restart) {
-		dcp->s2r_cold_restart = false;
-		if (dcp_desktop_external(dcp)) {
-			if (READ_ONCE(s2r_warm))
-				dcp_t6041_s2r_warm_restart_ext(dcp);
-			else if (!dcp_cold_session_start(dcp))
-				dcp_hib_ext_restore(dcp);
-		} else if (READ_ONCE(s2r_warm)) {
+	if (dcp->s2r_restart) {
+		dcp->s2r_restart = false;
+		if (dcp_desktop_external(dcp))
+			dcp_t6041_s2r_warm_restart_ext(dcp);
+		else
 			dcp_t6041_s2r_warm_restart(dcp);
-		} else {
-			dcp_desktop_cold_restart(dcp);
-		}
 		return;
 	}
 

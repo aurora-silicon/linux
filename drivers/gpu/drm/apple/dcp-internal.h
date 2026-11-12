@@ -704,8 +704,8 @@ struct apple_dcp {
 	/* T6040 S2R: the CPU power word's 11 children as the stop found them. */
 	u32 s2r_child_saved[11];
 	bool s2r_child_valid;
-	/* A T6040 S2R wake reuses hib_restore_work for the internal cold restart. */
-	bool s2r_cold_restart;
+	/* A T6040 S2R wake reuses hib_restore_work for the warm restart. */
+	bool s2r_restart;
 	/* DPMS off stopped the firmware and lowered the domains; DPMS on brings them back. */
 	bool dpms_powered_off;
 	/* Refused its idle with the display off: the firmware still runs, the display is dark. */
