@@ -4768,15 +4768,16 @@ static void apple_pcie_neo_sleep_probe(struct platform_device *pdev, struct appl
 	INIT_WORK(&pcie->neo_recover_work, apple_pcie_neo_recover_work);
 	INIT_WORK(&pcie->neo_radio_work, apple_pcie_neo_radio_work);
 	init_completion(&pcie->neo_noirq_done);
-	/* The radio work outlives resume_noirq; nothing that doesn't depend on it waits. */
-	device_enable_async_suspend(dev);
 	apple_piodma_bootstrap_set_recover(pcie->piodma_supplier, apple_pcie_neo_recover, pcie);
 	pcie->neo_pm_nb.notifier_call = apple_pcie_neo_pm_notify;
 	ret = register_pm_notifier(&pcie->neo_pm_nb);
-	if (ret)
+	if (ret) {
 		pcie->neo_cold = NULL;
-	else
-		dev_dbg(dev, "deep sleep: radios stay powered, link stopped and retrained\n");
+		return;
+	}
+	/* The radio work outlives resume_noirq; nothing that doesn't depend on it waits. */
+	device_enable_async_suspend(dev);
+	dev_dbg(dev, "deep sleep: radios stay powered, link stopped and retrained\n");
 	return;
 
 absent:
@@ -6252,7 +6253,7 @@ static int apple_pcie_resume_early(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
 
-	if (pcie->neo_cold)
+	if (pcie && pcie->neo_cold)
 		complete_all(&pcie->neo_noirq_done);
 	return 0;
 }
