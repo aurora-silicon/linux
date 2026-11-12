@@ -531,8 +531,8 @@ Description:
 		"failed" (refused, malformed, unanswered or not sent; the
 		kernel log says which).
 		(RO, root only) local_policy_digest is the digest as 96
-		lowercase hex digits once pnon reads "read"; reading it
-		before then fails with ENODATA.
+		lowercase hex digits once pnon reads "read", and
+		"unavailable" before then.
 
 What:		/sys/bus/platform/devices/<unit>.sep/diag/xarm_failures
 Date:		November 2026

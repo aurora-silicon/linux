@@ -110,14 +110,15 @@ static struct {
 	atomic_t hwrng;
 	atomic_t stac;
 	atomic_t stac_onlines;
-	/* Written once, before pnon reads SEP_DIAG_PNON_READ (release/acquire). */
-	u8 pnon_digest[SEP_DIAG_PNON_DIGEST_LEN];
-	int pnon;
+	atomic_t pnon;
 	atomic_t xarm_failures;
 	atomic_t unhandled;
 	atomic_t sleeps;
 	atomic_t sleeping;
 } sep_diag;
+
+/* Written once per probe, before pnon reads SEP_DIAG_PNON_READ. */
+static u8 sep_diag_pnon_digest[SEP_DIAG_PNON_DIGEST_LEN];
 
 static unsigned int sep_diag_sensor(void)
 {
@@ -575,8 +576,7 @@ static ssize_t pnon_show(struct device *dev, struct device_attribute *attr,
 {
 	const char *state;
 
-	/* Pairs with the release in sep_diag_set_pnon(). */
-	switch (smp_load_acquire(&sep_diag.pnon)) {
+	switch (atomic_read(&sep_diag.pnon)) {
 	case SEP_DIAG_PNON_READ:
 		state = "read";
 		break;
@@ -598,11 +598,12 @@ static DEVICE_ATTR_RO(pnon);
 static ssize_t local_policy_digest_show(struct device *dev,
 					struct device_attribute *attr, char *buf)
 {
-	/* Acquire: a reader that sees READ sees the digest. */
-	if (smp_load_acquire(&sep_diag.pnon) != SEP_DIAG_PNON_READ)
-		return -ENODATA;
+	if (atomic_read(&sep_diag.pnon) != SEP_DIAG_PNON_READ)
+		return sysfs_emit(buf, "unavailable\n");
+	/* Pairs with the smp_wmb() in sep_diag_set_pnon(). */
+	smp_rmb();
 	return sysfs_emit(buf, "%*phN\n", SEP_DIAG_PNON_DIGEST_LEN,
-			  sep_diag.pnon_digest);
+			  sep_diag_pnon_digest);
 }
 static DEVICE_ATTR_ADMIN_RO(local_policy_digest);
 
@@ -735,16 +736,16 @@ void sep_diag_set_stac(int state)
 
 void sep_diag_set_pnon(int state, const u8 *digest, size_t len)
 {
-	/* The digest is written once per probe, before the state says so. */
 	if (state == SEP_DIAG_PNON_READ) {
-		/* Acquire: never rewrite a digest a reader may be copying. */
+		/* Never rewrite a digest a reader may be copying. */
 		if (!digest || len != SEP_DIAG_PNON_DIGEST_LEN ||
-		    smp_load_acquire(&sep_diag.pnon) == SEP_DIAG_PNON_READ)
+		    atomic_read(&sep_diag.pnon) == SEP_DIAG_PNON_READ)
 			return;
-		memcpy(sep_diag.pnon_digest, digest, len);
+		memcpy(sep_diag_pnon_digest, digest, len);
+		/* The digest is visible before the state says it is there. */
+		smp_wmb();
 	}
-	/* Release: the digest is visible before READ is. */
-	smp_store_release(&sep_diag.pnon, state);
+	atomic_set(&sep_diag.pnon, state);
 }
 
 unsigned int sep_diag_xarm_failed(void)
