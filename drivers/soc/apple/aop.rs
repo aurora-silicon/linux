@@ -3358,8 +3358,8 @@ unsafe extern "C" fn aop_resume(dev: *mut bindings::device) -> c_int {
     // gone and nothing restarted it, so the warm wake's stop/start notices would each time out on
     // a dead firmware (bounded by the RTKit handshake timeout, but seconds of stall) and the AOP
     // would stay down until a reboot. Take it over the cold way instead, exactly as a resume from
-    // disk does. A co-processor that kept running (the measured T8140 behaviour, unverified on
-    // T6040) has its run bit set, so this is a no-op there and the warm wake runs unchanged.
+    // disk does. A co-processor that kept running through the sleep, as on T8140, has its run
+    // bit set, so this is a no-op there and the warm wake runs unchanged.
     // SAFETY: only reads a flag.
     if unsafe { bindings::pm_resume_via_firmware() } {
         // SAFETY: by this function's contract.
@@ -3422,9 +3422,8 @@ fn restart_after_thaw(_dev: *mut bindings::device) -> Result<()> {
 /// A resume from disk is a cold boot: the boot loader staged the co-processor anew and left it
 /// halted, and the boot kernel did not start it. The session this kernel holds is gone, but
 /// nothing tells its clients: every call they make waits for a reply that never comes, and the
-/// mailbox keeps the doorbells. The firmware the next probe starts then takes them as its own
-/// first messages (on J616s two such calls from the motion sensors' PM notifier, and the
-/// re-probed firmware crashed at a NULL pointer while its endpoints came up). So the transport
+/// mailbox keeps the doorbells. The firmware the next probe starts would take them as its own
+/// first messages while its endpoints come up, which it does not survive. So the transport
 /// closes here, before any client runs, and the device is probed again once the tasks are
 /// thawed: the unbind finds the run bit clear and drops the old session without a shutdown,
 /// the probe starts the firmware as at boot. An aborted hibernation and a co-processor that
