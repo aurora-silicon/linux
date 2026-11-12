@@ -3494,6 +3494,19 @@ static void iomfb_backlight_start(struct apple_dcp *dcp,
 		have_surface |= !!scanout->fb[i];
 	if (!have_surface)
 		return;
+	/*
+	 * That surface is the frame from before the sleep. With hold, the level waits for
+	 * the compositor's first frame, which then carries it, as macOS lights its backlight
+	 * after the first frame.
+	 */
+	if (READ_ONCE(dcp->s2r_scanout_stale)) {
+		WRITE_ONCE(dcp->s2r_scanout_stale, false);
+		dev_info(dcp->dev, "wake: brightness present %s\n",
+			 READ_ONCE(dcp->s2r_scanout_hold) ? "held for the first new frame" :
+			 "on the frame from before the sleep");
+	}
+	if (READ_ONCE(dcp->s2r_scanout_hold))
+		return;
 
 	dcp->swap.h17p = scanout->request;
 	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0)
@@ -3557,6 +3570,12 @@ static void iomfb_atomic_start(struct apple_dcp *dcp,
 		return;
 	}
 	dcp->iomfb.next_scanout = atomic->scanout;
+	/* The first frame since the wake, the compositor's: the held level goes with it. */
+	WRITE_ONCE(dcp->s2r_scanout_stale, false);
+	if (READ_ONCE(dcp->s2r_scanout_hold)) {
+		WRITE_ONCE(dcp->s2r_scanout_hold, false);
+		dev_info(dcp->dev, "wake: first new frame, backlight back with it\n");
+	}
 	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0)
 		iomfb_flush_v27(dcp, atomic->crtc, atomic->state);
 	else
