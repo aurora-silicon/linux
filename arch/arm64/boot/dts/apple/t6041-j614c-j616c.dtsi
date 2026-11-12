@@ -2844,3 +2844,45 @@
 &sio_mbox {
 	status = "okay";
 };
+
+/*
+ * The Neural Engine, as on the M4 Pro boards. The J614c's ADT has ane0 with
+ * pre-loaded firmware (__TEXT;__DATA); the loader fills the reservations of
+ * t6041-j616c-ane.dtsi and the firmware IOVAs from it.
+ */
+&ane0_dart0 {
+	status = "okay";
+};
+
+&ane0_dart1 {
+	status = "okay";
+};
+
+&ane0_dart2 {
+	status = "okay";
+};
+
+&ane {
+	status = "okay";
+};
+
+/* Both JPEG engines, as on the M4 Pro boards; they have no board wiring. */
+&ps_jpg {
+	status = "okay";
+};
+
+&jpeg0_dart {
+	status = "okay";
+};
+
+&jpeg0 {
+	status = "okay";
+};
+
+&jpeg1_dart {
+	status = "okay";
+};
+
+&jpeg1 {
+	status = "okay";
+};

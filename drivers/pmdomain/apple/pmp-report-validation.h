@@ -27,6 +27,15 @@
 #define PMP_PTD_RANGE_ACK	11
 
 /*
+ * The request word for a PMP that is starting: requests made through entries,
+ * and every other bit as it was found.
+ */
+static inline u64 apple_pmp_request_word(u64 found, u64 known, u64 shadow)
+{
+	return (found & ~known) | shadow;
+}
+
+/*
  * A complete SOC-DEV-DVFS request word: the valid bit, an optional main level
  * in bits 4:0, and zero or more <request-class level> pairs. Classes 0x21
  * through 0x25 occupy the four-bit lanes at bits 35:32 through 51:48.

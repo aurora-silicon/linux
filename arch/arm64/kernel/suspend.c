@@ -2,6 +2,7 @@
 #include <linux/ftrace.h>
 #include <linux/percpu.h>
 #include <linux/slab.h>
+#include <linux/suspend.h>
 #include <linux/uaccess.h>
 #include <linux/pgtable.h>
 #include <linux/cpuidle.h>
@@ -85,6 +86,13 @@ void notrace __cpu_suspend_exit(void)
 
 	/* Restore additional feature-specific configuration */
 	ptrauth_suspend_exit();
+
+	/*
+	 * A firmware-driven system suspend really reset this CPU. Nothing else on
+	 * this path restores implementation-defined state.
+	 */
+	if (pm_resume_via_firmware())
+		arm64_impdef_cpu_reset_restore();
 }
 
 /*

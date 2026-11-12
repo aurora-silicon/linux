@@ -126,6 +126,8 @@ static void mt_bss_presence(struct mt7932*m,const struct mt7932_event*e){}
 static void mt_awdl_event(struct mt7932*m,const struct mt7932_event*e){}
 static void mt_data_complete(struct mt7932*m,const u8*p,size_t n){}
 static void mt_packet_receive(struct mt7932*m,const u8*p,size_t n){}
+static void mt_hif_event(struct mt7932*m,const struct mt7932_event*e){}
+static void mt_wow_reason_event(struct mt7932*m,const struct mt7932_event*e){}
 static void mt_rf_fail_locked(struct mt7932*m,int e){m->rf_ready=false;m->link_failed=true;m->cal_state.error=e;m->cal_state.active=false;m->connect_error=e;complete_all(&m->assoc_done);complete_all(&m->cal_response);}
 CHANNEL
 LINK
@@ -254,6 +256,9 @@ def main():
         headers.append(header)
     cal=(root/DRIVER/"calibration.h").read_text()
     headers.append(cal[cal.index("struct mt7932_cal_completion {"):cal.index("struct mt7932_cal_segment {")])
+    # The receive path's other events, by their production IDs: the firmware's HIF and WoW reports.
+    headers.append(re.search(r"^#define MT7932_CID_HIF_CTRL\b.*$", rx, re.M).group(0))
+    headers.append(re.search(r"^#define MT7932_EID_WOW_REASON\b.*$", (root/DRIVER/"wow.h").read_text(), re.M).group(0))
     parts["HEADERS"]="\n".join(headers)
     candidates={"production":parts}
     if args.old_source:

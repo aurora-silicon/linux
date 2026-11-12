@@ -4,13 +4,14 @@
 $id: http://devicetree.org/schemas/media/apple,t8140-isp.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Apple T8140 Image Signal Processor
+title: Apple T8140 and T8142 Image Signal Processors
 
 maintainers:
   - Ryan Murray <ryan@aurorasilicon.org>
 
 description:
-  The T8140 ISP controls the attached camera sensor and processes its frames
+  The T8140 and T8142 ISPs control the attached camera sensor and process
+  its frames
   through bootloader-loaded firmware. The host exchanges commands and image
   buffers through three DART instances. A separate watchdog register window
   must be serviced while capturing to receive sensor pixels.
@@ -133,6 +134,31 @@ allOf:
       properties:
         compatible:
           contains:
+            const: apple,t8140-isp
+    then:
+      properties:
+        power-domains:
+          items:
+            - description: ISP system domain
+            - description: ISP CPU domain
+            - description: ISP CPU core 0 domain
+            - description: ISP CPU core 1 domain
+            - description: ISP FE domain
+            - description: ISP sensor 0 domain
+            - description: ISP sensor 1 domain
+            - description: ISP DPRX domain
+            - description: ISP secure domain
+            - description: ISP STS0 domain
+            - description: ISP STS1 domain
+            - description: ISP Pearl domain
+            - description: ISP BE domain
+            - description: ISP CLR domain
+            - description: ISP CVD domain
+            - description: ISP CVM domain
+  - if:
+      properties:
+        compatible:
+          contains:
             const: apple,t8142-isp
     then:
       properties:
@@ -146,27 +172,6 @@ allOf:
             - description: ISP STS0 domain
             - description: ISP BE domain
             - description: ISP CLR domain
-    else:
-      properties:
-        power-domains:
-          items:
-            - description: ISP system domain
-            - description: ISP CPU domain
-            - description: ISP CPU core 0 domain
-            - description: ISP CPU core 1 domain
-            - description: ISP FE domain
-            - description: ISP DPRX domain
-            - description: ISP secure domain
-            - description: ISP STS0 domain
-            - description: ISP STS1 domain
-            - description: ISP Pearl domain
-            - description: ISP BE domain
-            - description: ISP CLR domain
-            - description: ISP CVD domain
-            - description: ISP CVM domain
-            - description: Camera sensor 0 domain
-            - description: Camera sensor 1 domain
-          minItems: 14
 
 required:
   - compatible
@@ -204,10 +209,11 @@ examples:
             iommus = <&isp_dart0 0>, <&isp_dart1 0>, <&isp_dart2 0>;
             power-domains = <&ps_isp_sys>, <&ps_isp_cpu>,
                             <&ps_isp_cpu_core0>, <&ps_isp_cpu_core1>,
-                            <&ps_isp_fe>, <&ps_isp_dprx>, <&ps_isp_secure>,
+                            <&ps_isp_fe>, <&ps_ispsens0>, <&ps_ispsens1>,
+                            <&ps_isp_dprx>, <&ps_isp_secure>,
                             <&ps_isp_sts0>, <&ps_isp_sts1>, <&ps_isp_pearl>,
                             <&ps_isp_be>, <&ps_isp_clr>, <&ps_isp_cvd>,
-                            <&ps_isp_cvm>, <&ps_ispsens0>, <&ps_ispsens1>;
+                            <&ps_isp_cvm>;
             memory-region = <&isp_heap>;
             memory-region-names = "heap";
             apple,dart-vm-size = <0x0 0xa0000000>;
@@ -220,6 +226,44 @@ examples:
                     apple,input-size = <1920 1080>;
                     apple,output-size = <1920 1080>;
                     apple,crop = <0 0 1920 1080>;
+                };
+            };
+        };
+    };
+  - |
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        isp@4a0000000 {
+            compatible = "apple,t8142-isp", "apple,isp";
+            reg = <0x4 0xa0000000 0x0 0x1801000>,
+                  <0x4 0xa2920000 0x0 0x1000>,
+                  <0x4 0xa2921000 0x0 0x100>,
+                  <0x4 0xe3b10000 0x0 0x8000>;
+            reg-names = "coproc", "mbox", "gpio", "wdt";
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 425 IRQ_TYPE_LEVEL_HIGH>;
+            iommus = <&isp_dart0 0>, <&isp_dart1 0>, <&isp_dart2 0>;
+            power-domains = <&ps_isp_sys>, <&ps_isp_cpu>,
+                            <&ps_isp_cpu_core0>, <&ps_isp_fe>,
+                            <&ps_isp_dprx>, <&ps_isp_sts0>,
+                            <&ps_isp_be>, <&ps_isp_clr>;
+            memory-region = <&isp_heap>;
+            memory-region-names = "heap";
+            apple,dart-vm-size = <0x0 0xe0000000>;
+            apple,platform-id = <0x71>;
+            apple,temporal-filter = <1>;
+
+            sensor-presets {
+                preset0 {
+                    apple,config-index = <7>;
+                    apple,input-size = <3040 2880>;
+                    apple,output-size = <1920 1080>;
+                    apple,crop = <0 584 3040 1710>;
                 };
             };
         };

@@ -94,6 +94,13 @@ properties:
       GFX supplier power cannot represent GPU work on firmware that keeps
       its coprocessor domain powered while the cores are idle.
 
+  apple,pmp-report-entry:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: |
+      PMP report entry that tells the PMP the GPU is in use. The driver withdraws
+      this request before it lowers the GPU's power state for a system sleep, and
+      makes it again after raising it.
+
   apple,idle-off-delay-ms:
     minimum: 2
     maximum: 1000

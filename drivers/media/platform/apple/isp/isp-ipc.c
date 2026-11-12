@@ -157,12 +157,15 @@ static inline bool chan_rx_done(struct apple_isp *isp, struct isp_channel *chan)
 
 int ipc_chan_handle(struct apple_isp *isp, struct isp_channel *chan)
 {
-	unsigned int budget = isp_is_p010(isp) ? chan->num : UINT_MAX;
-	int err = 0;
+	int err = -EAGAIN;
 
 	mutex_lock(&chan->lock);
-	/* A busy producer must not starve the other completion/control rings. */
-	while (budget--) {
+	/* One ring per turn, even if the producer refills acknowledged slots. */
+	for (u32 i = 0; i < chan->num; i++) {
+		if (READ_ONCE(isp->ipc_error)) {
+			err = READ_ONCE(isp->ipc_error);
+			break;
+		}
 		chan_read_msg(isp, chan, &chan->req);
 		if (chan_rx_done(isp, chan)) {
 			err = 0;
@@ -170,8 +173,11 @@ int ipc_chan_handle(struct apple_isp *isp, struct isp_channel *chan)
 		}
 		err = chan_handle_once(isp, chan);
 		if (err < 0) {
+			cmpxchg(&isp->ipc_error, 0, err);
+			wake_up_all(&isp->wait);
 			break;
 		}
+		err = -EAGAIN;
 	}
 	mutex_unlock(&chan->lock);
 
@@ -241,7 +247,10 @@ int ipc_chan_send(struct apple_isp *isp, struct isp_channel *chan,
 		  unsigned long timeout)
 {
 	long t;
-	int err;
+	int err = READ_ONCE(isp->ipc_error);
+
+	if (err)
+		return err;
 
 #if IS_ENABLED(CONFIG_VIDEO_APPLE_ISP_KUNIT_TEST)
 	KUNIT_STATIC_STUB_REDIRECT(ipc_chan_send, isp, chan, timeout);
@@ -262,7 +271,9 @@ int ipc_chan_send(struct apple_isp *isp, struct isp_channel *chan,
 	if (!timeout)
 		return 0;
 
-	t = wait_event_timeout(isp->wait, chan_tx_done(isp, chan), timeout);
+	t = wait_event_timeout(isp->wait,
+			       READ_ONCE(isp->ipc_error) || chan_tx_done(isp, chan),
+			       timeout);
 	if (t == 0) {
 		/* Resolved before the next request, see isp_ipc_resync(). */
 		if (isp_is_p010(isp))
@@ -271,10 +282,21 @@ int ipc_chan_send(struct apple_isp *isp, struct isp_channel *chan,
 			"%s: timed out on request [0x%llx, 0x%llx, 0x%llx]\n",
 			chan->name, chan->req.arg0, chan->req.arg1,
 			chan->req.arg2);
-		return -ETIME;
+		/*
+		 * P010 resolves a late full-payload ACK before reusing the ring.
+		 * Keep that recoverable timeout path; compact sessions stay poisoned.
+		 */
+		if (isp_is_p010(isp))
+			return -ETIME;
+		cmpxchg(&isp->ipc_error, 0, -ETIME);
+		wake_up_all(&isp->wait);
+		return READ_ONCE(isp->ipc_error);
 	}
 
 	chan->deadline_active = false;
+	if (READ_ONCE(isp->ipc_error))
+		return READ_ONCE(isp->ipc_error);
+
 	isp_dbg(isp, "%s: request success (%ld)\n", chan->name, t);
 
 	return 0;

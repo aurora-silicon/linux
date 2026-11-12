@@ -249,8 +249,9 @@ def fourcc(number):
 def manifest(data, at=0, end=None):
     """{object: {property: (identifier, value)}} of the IM4M in [at, end):
     the manifest body's objects (MANP and one per sealed record) and their
-    properties, walked as DER private-class elements. A duplicate object or
-    property within one scope, or any other shape, is refused."""
+    properties, walked as DER private-class elements. A duplicate property, a
+    duplicate object in a SET, or any other shape is refused; an object named
+    twice in a SEQUENCE keeps no properties."""
     der = DER(data)
     end = len(data) if end is None else end
     identifier, _, start, stop = der.element(at, end)
@@ -264,19 +265,27 @@ def manifest(data, at=0, end=None):
     if len(body) != 1 or body[0][1] != 0xff or fourcc(body[0][2]) != b'MANB':
         raise Refused('IM4M without one MANB')
     _, objects_set = named(der, body[0], 3)
-    if objects_set[1] != 0x31:
+    # The objects are a SET in image manifests; the J714s factory seal holds a SEQUENCE.
+    if objects_set[1] not in (0x30, 0x31):
         raise Refused('malformed MANB')
-    objects = {}
+    objects, repeated = {}, set()
     for child in der.children(objects_set[3], objects_set[4], 5):
         object_name, properties_set = named(der, child, 6)
-        if object_name in objects or properties_set[1] != 0x31:
-            raise Refused('duplicate or malformed manifest object')
-        properties = objects[object_name] = {}
+        if properties_set[1] != 0x31:
+            raise Refused('malformed manifest object')
+        properties = {}
         for item in der.children(properties_set[3], properties_set[4], 8):
             prop, value = named(der, item, 9)
             if prop in properties:
                 raise Refused('duplicate manifest property')
             properties[prop] = value[1], data[value[3]:value[4]]
+        if object_name in objects:
+            # The seal's SEQUENCE names a record kind once per record of that kind. A
+            # repeated name keeps no properties, so nothing is admitted on it.
+            if objects_set[1] != 0x30:
+                raise Refused('duplicate manifest object')
+            repeated.add(object_name)
+        objects[object_name] = {} if object_name in repeated else properties
     return objects
 
 

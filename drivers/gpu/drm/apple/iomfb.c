@@ -365,7 +365,7 @@ static bool iomfb_uses_queue(struct apple_dcp *dcp)
 	       dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G;
 }
 
-static bool iomfb_channels_idle(struct apple_dcp *dcp)
+bool iomfb_channels_idle(struct apple_dcp *dcp)
 {
 	return !dcp->ch_cmd.depth && !dcp->ch_cb.depth &&
 	       !dcp->ch_oobcmd.depth && !dcp->ch_oobcb.depth &&
@@ -671,6 +671,38 @@ void iomfb_queue_init(struct apple_dcp *dcp)
 	INIT_DELAYED_WORK(&dcp->iomfb.timeout, iomfb_queue_timeout);
 	INIT_DELAYED_WORK(&dcp->iomfb.backlight_retry, iomfb_backlight_retry);
 	atomic_set(&dcp->iomfb.opaque_x_state, IOMFB_OPAQUE_X_WAITING);
+}
+
+/*
+ * For firmware stopped cold and started again: the calls and the transaction the old
+ * one never answered went with it, and would hold the channels and the queue forever.
+ */
+void iomfb_reset_transport(struct apple_dcp *dcp)
+{
+	struct iomfb_transaction *transaction;
+
+	if (!iomfb_uses_queue(dcp))
+		return;
+
+	cancel_delayed_work_sync(&dcp->iomfb.timeout);
+	mutex_lock(&dcp->iomfb.lock);
+	transaction = dcp->iomfb.active;
+	dcp->iomfb.active = NULL;
+	if (transaction) {
+		if (transaction->brightness_only)
+			dcp->iomfb.backlight_queued = false;
+		transaction->release(transaction);
+	}
+	iomfb_discard_pending(dcp);
+	dcp->ch_cmd.depth = 0;
+	dcp->ch_oobcmd.depth = 0;
+	dcp->ch_cb.depth = 0;
+	dcp->ch_oobcb.depth = 0;
+	dcp->ch_async.depth = 0;
+	dcp->ch_oobasync.depth = 0;
+	dcp->present_state_h17p.pending = false;
+	dcp->present_state_h17p.accepted = false;
+	mutex_unlock(&dcp->iomfb.lock);
 }
 
 void iomfb_queue_stop(struct apple_dcp *dcp)
@@ -2656,15 +2688,17 @@ out:
 
 /*
  * PQ output goes through the IOMFB template's mode set, which picks the
- * timing's PQ element (see dcp_display_mode.pq): the desktop 26.x firmware
- * and the external H17P processor.  The other processors keep SDR.
+ * timing's PQ element (see dcp_display_mode.pq): the desktop 26.x firmware,
+ * the external H17P processor and the firmware 27 external processors.  The
+ * other processors, and the firmware 27 panel, keep SDR.
  */
 static bool dcp_hdr_output_supported(struct apple_dcp *dcp)
 {
 	if (iomfb_is_m4(dcp))
 		return false;
 	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
-	       dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL;
+	       dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL ||
+	       (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp_has_panel(dcp));
 }
 
 /*
@@ -3179,6 +3213,10 @@ bool dcp_crtc_mode_fixup(struct drm_crtc *crtc,
 	struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
 	struct platform_device *pdev = apple_crtc->dcp;
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	/* Can't be lit: a resume then restores its CRTC disabled, not failing every output. */
+	if (READ_ONCE(dcp->crashed))
+		return false;
 
 	if (iomfb_is_m4(dcp)) {
 		struct drm_display_mode fixed;

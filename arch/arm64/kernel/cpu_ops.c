@@ -15,6 +15,9 @@
 #include <asm/smp_plat.h>
 
 extern const struct cpu_operations smp_spin_table_ops;
+#ifdef CONFIG_HOTPLUG_CPU
+extern const struct cpu_operations smp_rvbar_spin_table_ops;
+#endif
 #ifdef CONFIG_ARM64_ACPI_PARKING_PROTOCOL
 extern const struct cpu_operations acpi_parking_protocol_ops;
 #endif
@@ -24,6 +27,9 @@ static const struct cpu_operations *cpu_ops[NR_CPUS] __ro_after_init;
 
 static const struct cpu_operations *const dt_supported_cpu_ops[] __initconst = {
 	&smp_spin_table_ops,
+#ifdef CONFIG_HOTPLUG_CPU
+	&smp_rvbar_spin_table_ops,
+#endif
 	&cpu_psci_ops,
 	NULL,
 };
@@ -108,6 +114,19 @@ int __init init_cpu_ops(int cpu)
 		pr_warn("Unsupported enable-method: %s\n", enable_method);
 		return -EOPNOTSUPP;
 	}
+
+#ifdef CONFIG_HOTPLUG_CPU
+	/*
+	 * A boot object that sends a reset CPU back through its release address
+	 * says so with /chosen/aurora,s2r-mailbox. Its spin-table CPUs can then
+	 * leave the kernel, through the parking spin table.
+	 */
+	if (cpu_ops[cpu] == &smp_spin_table_ops &&
+	    of_property_present(of_chosen, "aurora,s2r-mailbox")) {
+		cpu_ops[cpu] = &smp_rvbar_spin_table_ops;
+		pr_info_once("spin-table CPUs can park: the boot object brings them back\n");
+	}
+#endif
 
 	return 0;
 }

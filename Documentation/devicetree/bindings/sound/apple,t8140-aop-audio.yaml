@@ -82,6 +82,10 @@ properties:
       Chassis identifier used to name the sound card, matching the
       apple,aop-audio convention.
 
+  mic-supply:
+    description:
+      The microphone array's power rail, switched on around each capture.
+
   apple,machine-kind:
     $ref: /schemas/types.yaml#/definitions/string
     description:

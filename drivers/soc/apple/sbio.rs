@@ -2668,7 +2668,7 @@ impl SepData {
                 || self.match_scope_gen.load(Relaxed) != self.bio_open_gen.load(Relaxed)
                 || self.match_context.lock().is_none())
         {
-            dev_info!(self.dev, "verify: a new authentication; bringing the sensor up afresh instead of reusing it\n");
+            dev_info_ratelimited!(self.dev, "verify: a new authentication; bringing the sensor up afresh instead of reusing it\n");
             let _ = sensor::idle();
             self.sensor_kept.store(false, Relaxed);
             self.forget_finger_lift();
@@ -3045,7 +3045,7 @@ impl SepData {
                     // The sensor reset itself: nothing was compared, and a
                     // fresh bring-up recovers it. Ask for another touch rather
                     // than fail the authentication.
-                    dev_info!(self.dev, "verify: the sensor reset under the capture; asking for another touch after a fresh bring-up\n");
+                    dev_info_ratelimited!(self.dev, "verify: the sensor reset under the capture; asking for another touch after a fresh bring-up\n");
                     self.sensor_reset_in_capture.store(true, Relaxed);
                     self.retry_cause(bio::Guidance::Place);
                     return bio::VerifyOutcome::Failed(ENROL_STATUS_RETRY);

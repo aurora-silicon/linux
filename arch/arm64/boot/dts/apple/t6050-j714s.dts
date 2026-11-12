@@ -200,10 +200,11 @@
  * Pin 112 takes an SError when read (as on J716c and J716s), so only the pins
  * nodes here name are exposed: 80 and 81, PCIe ports 0 and 1's PERST#; 106 and 107,
  * the speaker amps' interrupt and shutdown line; 134 and 139, the jack codec's
- * interrupt and reset; 136 and 137, the speaker ID.
+ * interrupt and reset; 136 and 137, the speaker ID; 138, the Touch ID sensor's
+ * data-ready line.
  */
 &pinctrl_ap {
-	gpio-reserved-ranges = <0 80>, <82 24>, <108 26>, <135 1>, <138 1>, <140 81>;
+	gpio-reserved-ranges = <0 80>, <82 24>, <108 26>, <135 1>, <140 81>;
 };
 
 /* It answers only once port 1's root complex is up: pcie-apple then enables it */
@@ -474,6 +475,42 @@
 	status = "okay";
 };
 
+/*
+ * Touch ID (ADT spi2/mesa): J616s's Mesa sensor (sensor-id 0x3356) at 8 MHz on
+ * chip select 0, powered by NUB GPIO 21 (function-mesa_pwr), data ready on AP
+ * GPIO 138. The controller's clock (ADT clock-ids 451) is the 24 MHz reference.
+ */
+&ps_nub_gpio {
+	status = "okay";
+};
+
+&nub_gpio0 {
+	status = "okay";
+};
+
+&ps_spi2 {
+	status = "okay";
+};
+
+&spi2 {
+	clocks = <&clkref>;
+	status = "okay";
+
+	mesa: fingerprint@0 {
+		compatible = "apple,mesa-fingerprint";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+		spi-cpol;
+		spi-cs-setup-delay-ns = <20>;
+		spi-cs-hold-delay-ns = <20>;
+		enable-gpios = <&nub_gpio0 21 GPIO_ACTIVE_HIGH>;
+		interrupt-parent = <&pinctrl_ap>;
+		interrupts = <138 IRQ_TYPE_EDGE_RISING>;
+		/* Per-device factory data from this Mac's own iBoot system container */
+		firmware-name = "apple/mesacal-j714s.bin", "apple/msrk-j714s.bin";
+	};
+};
+
 #include "t6050-j714s-pmp-tunables.dtsi"
 
 /*
@@ -516,6 +553,9 @@
 
 /* External displays, on the left-front and right ports */
 #include "t6050-j714s-display.dtsi"
+
+/* The Neural Engine, started only after the boot loader's preload hand-off */
+#include "t6050-j714s-ane.dtsi"
 
 /*
  * Sound through the AOP, as on J813: its audio service runs the serializers, the
@@ -738,4 +778,78 @@
 	       <&admac_base_ns 0>, <&admac_base_ns 1>,
 	       <&admac_ec_proxy 1>;
 	dma-names = "cout", "cin", "spkr", "sense", "hpai";
+};
+
+/* The video decoder (J714sAP ADT avd0, as on the J714c), its DART and power states. */
+&pmgr4 {
+	status = "okay";
+};
+
+/* macOS turns FAB1_SOC on once at boot and never gates it. */
+&ps_fab1_soc {
+	apple,always-on;
+	status = "okay";
+};
+
+&ps_avd_sys {
+	status = "okay";
+};
+
+&avd_dart {
+	status = "okay";
+};
+
+&avd {
+	status = "okay";
+};
+
+/*
+ * The video encoder (J714sAP ADT ave0), its DARTs and the VENC0 power states. Like
+ * FAB1_SOC, macOS sets FAB0_SOC active once at boot and never gates it; the PIO
+ * gateway above it is left to the firmware.
+ */
+&ps_fab1_piogw {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_fab0_soc {
+	apple,always-on;
+	status = "okay";
+};
+
+&ps_venc0_sys {
+	status = "okay";
+};
+
+&ps_venc0_dma {
+	status = "okay";
+};
+
+&ps_venc0_pipe4 {
+	status = "okay";
+};
+
+&ps_venc0_pipe5 {
+	status = "okay";
+};
+
+&ps_venc0_me0 {
+	status = "okay";
+};
+
+&ps_venc0_me1 {
+	status = "okay";
+};
+
+&ave0_dart {
+	status = "okay";
+};
+
+&ave0_dart1 {
+	status = "okay";
+};
+
+&ave0 {
+	status = "okay";
 };
