@@ -2074,6 +2074,7 @@ void dcp_audio_unregister(void)
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)
 #include "audio-no-sio-test.c"
+#include "audio-legacy-test.c"
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
 #include "audio-link-test.c"
 #endif
