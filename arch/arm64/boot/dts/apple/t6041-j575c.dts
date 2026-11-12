@@ -25,7 +25,8 @@
 	model = "Apple Mac Studio (M4 Max, 2025)";
 
 	aliases {
-		serial0 = &serial0;
+		serial0 = &dockchannel;
+		serial1 = &serial0;
 		wifi0 = "/pcie@1cb0000000/pci@0,0/wifi@0,0";
 		bluetooth0 = "/pcie@1cb0000000/pci@0,0/bluetooth@0,1";
 		ethernet0 = &ethernet0;
@@ -54,6 +55,26 @@
 		interrupts = <AIC_IRQ 1559 IRQ_TYPE_LEVEL_HIGH>;
 		clocks = <&clkref>, <&clkref>;
 		clock-names = "uart", "clk_uart_baud0";
+	};
+
+	/*
+	 * DockChannel channel 1, the console the USB debug link carries
+	 * (macvdmtool debugusb). ADT /arm-io/dockchannel-uart: block at
+	 * 0x5_0882_8000 with one 0x10000 stride per channel, interrupt window
+	 * 0x5_0880_c000 (0x18), IRQ 360, enable-sw-drain. Nothing drains it
+	 * unless a host reads the link, so TX must never wait.
+	 */
+	dockchannel: serial@50883c000 {
+		compatible = "apple,dockchannel-uart";
+		reg = <0x5 0x0883c000 0x0 0x4000>,
+		      <0x5 0x08838000 0x0 0x4000>,
+		      <0x5 0x0880c000 0x0 0x18>;
+		reg-names = "data", "config", "irq";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 360 IRQ_TYPE_LEVEL_HIGH>;
+		apple,channel = <1>;
+		apple,sw-drain;
+		apple,tx-never-wait;
 	};
 
 	/* guess: the J616c's limits */
@@ -264,6 +285,27 @@
 
 	xhci_clkreq_pins: xhci-clkreq-pins {
 		pinmux = <APPLE_PINMUX(3, 1)>;
+	};
+
+	/*
+	 * The GL3590 hub behind the ASM3142 (back USB-A, front USB-C) loads its
+	 * firmware from its own SPI flash. ADT /arm-io/spi3/usb3hub-flash/usb3hub-fw:
+	 * usb3hub_rst is AP pin 127 and usb3hub_flash_oe AP pin 130. The boot
+	 * loader leaves both low, which holds the hub in reset; with both high the
+	 * hub enumerates (05ac:8009 USB2, 05ac:800a USB3 Gen2).
+	 */
+	usb3hub-flash-oe-hog {
+		gpio-hog;
+		gpios = <130 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "usb3hub-flash-oe";
+	};
+
+	usb3hub-reset-hog {
+		gpio-hog;
+		gpios = <127 GPIO_ACTIVE_HIGH>;
+		output-high;
+		line-name = "usb3hub-reset";
 	};
 };
 
