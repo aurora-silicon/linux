@@ -1038,7 +1038,6 @@ struct apple_dcp {
 	int hib_phase;
 	bool hib_rx_held;
 	bool hib_poweroff_entered;
-	bool hib_nb_registered;
 	/*
 	 * External processors (dcpext): link work and the HDMI HPD interrupt
 	 * stopped, the link and DP PHYs released, from hibernation prepare

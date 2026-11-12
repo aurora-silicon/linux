@@ -10677,18 +10677,12 @@ static int dcp_hib_register(struct apple_dcp *dcp)
 {
 	int ret;
 
-	if (dcp->hib_nb_registered)
-		return 0;
 	dcp->hib_nb.notifier_call = dcp_hib_pm_notify;
 	dcp->hib_nb.priority = -5;	/* after PMP (10), before the GPU drain (-10) */
 	ret = register_pm_notifier(&dcp->hib_nb);
 	if (ret)
 		return ret;
-	ret = devm_add_action_or_reset(dcp->dev, dcp_hib_release, dcp);
-	if (ret)
-		return ret;
-	dcp->hib_nb_registered = true;
-	return 0;
+	return devm_add_action_or_reset(dcp->dev, dcp_hib_release, dcp);
 }
 
 static int dcp_platform_freeze(struct device *dev)
@@ -10763,7 +10757,6 @@ static int dcp_platform_thaw(struct device *dev)
 static int dcp_platform_restore_early(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
-	int ret;
 
 	/*
 	 * The power-off failed, or hibernation was aborted before the image
@@ -10781,12 +10774,6 @@ static int dcp_platform_restore_early(struct device *dev)
 	if (!dcp->hib_rx_held)
 		dev_warn(dev,
 			 "hibernation restore: RTKit receive was not held in the image\n");
-	ret = dcp_hib_register(dcp);
-	if (ret) {
-		/* .restore refuses, as for a processor it cannot restart. */
-		dev_err(dev, "hibernation restore: no PM notifier (%d)\n", ret);
-		return 0;
-	}
 	/* Host side only: the DMA of the old session goes in .restore. */
 	dcp_hib_quiesce(dcp);
 	dcp_hib_quiesce_ext(dcp);
@@ -10804,7 +10791,6 @@ static int dcp_platform_restore_early(struct device *dev)
 static int dcp_platform_restore(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
-	int ret;
 
 	/*
 	 * The power-off failed, or hibernation was aborted before the image:
@@ -10831,15 +10817,11 @@ static int dcp_platform_restore(struct device *dev)
 		if (!dcp->hib_rx_held)
 			dev_warn(dev,
 				 "hibernation restore: RTKit receive was not held in the image\n");
-		ret = dcp_hib_register(dcp);
-		if (!ret) {
-			dcp_hib_quiesce(dcp);
-			dcp_hib_release_dma(dcp);
-			dev_info(dev,
-				 "hibernation restore: old firmware session dropped; restart after PM_POST_HIBERNATION\n");
-			return 0;
-		}
-		dev_err(dev, "hibernation restore: no PM notifier (%d)\n", ret);
+		dcp_hib_quiesce(dcp);
+		dcp_hib_release_dma(dcp);
+		dev_info(dev,
+			 "hibernation restore: old firmware session dropped; restart after PM_POST_HIBERNATION\n");
+		return 0;
 	}
 
 	if (READ_ONCE(dcp->retain_dma) || dcp->hw.adopt_live_session)
