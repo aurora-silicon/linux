@@ -1342,11 +1342,16 @@ static int atcphy_pipehandler_lock_timeout(struct apple_atcphy *atcphy, u32 time
 
 	ret = readl_poll_timeout(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_ACK, reg,
 				 reg & PIPEHANDLER_LOCK_EN, 10, timeout);
+	/*
+	 * A controller that still drives the PIPE can take longer than this to
+	 * let go. What that means is the caller's to decide: a best-effort lock
+	 * goes on without the ACK, and a failed change is reported, and on some
+	 * ports retried, by whoever asked for it.
+	 */
 	if (ret) {
-		dev_dbg(atcphy->dev, "PIPE lock timeout: ack=%#x mode=%u pipe=%u dirty=%u\n",
+		dev_dbg(atcphy->dev, "Pipehandler lock not acked: ack=%#x mode=%u pipe=%u dirty=%u\n",
 			reg, atcphy->mode, atcphy->pipe_state, atcphy->mode_dirty);
 		clear32(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ, 1);
-		dev_warn(atcphy->dev, "Pipehandler lock not acked.\n");
 	}
 
 	return ret;
@@ -1697,11 +1702,10 @@ static int atcphy_configure_pipehandler_usb3(struct apple_atcphy *atcphy, bool h
 		set32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE,
 		      PIPEHANDLER_OVERRIDE_RXDETECT);
 
+		/* Whoever asked for USB3, Type-C or dwc3, reports a failure. */
 		ret = atcphy_pipehandler_lock(atcphy);
-		if (ret) {
-			dev_err(atcphy->dev, "Failed to lock pipehandler");
+		if (ret)
 			return ret;
-		}
 
 		/* BIST dance */
 		if (atcphy->hw->gen == ATCPHY_GENERATION_T8103)
@@ -1738,7 +1742,7 @@ static int atcphy_configure_pipehandler_usb3(struct apple_atcphy *atcphy, bool h
 	if (host) {
 		ret = atcphy_pipehandler_unlock(atcphy);
 		if (ret) {
-			dev_warn(atcphy->dev, "Failed to unlock pipehandler");
+			dev_warn(atcphy->dev, "Failed to unlock pipehandler\n");
 			atcphy->mode_dirty = true;
 			return ret;
 		}
@@ -1859,7 +1863,7 @@ static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy, bool 
 					atcphy->mode_dirty = true;
 				return ret;
 			}
-			dev_warn(atcphy->dev, "Failed to lock pipehandler");
+			dev_warn(atcphy->dev, "Failed to lock pipehandler\n");
 		}
 	}
 
@@ -1876,7 +1880,7 @@ static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy, bool 
 					atcphy->mode_dirty = true;
 				return ret;
 			}
-			dev_warn(atcphy->dev, "Failed to unlock pipehandler");
+			dev_warn(atcphy->dev, "Failed to unlock pipehandler\n");
 		}
 	}
 
