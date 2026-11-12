@@ -392,12 +392,20 @@
 /*
  * Right port (ATC2): hpm2 on nub-spmi-a1, with USB and the USB4/Thunderbolt router. The
  * inventory's nub-spmi-a1 has the generation 4 bus's three register windows and IRQ (ADT
- * nub-spmi-a1); the driver polls it and refuses an interrupt, so it takes the first window only.
+ * nub-spmi-a1). The driver polls it and refuses an interrupt, so it takes the command window
+ * and the fault queue's (ADT reg[0] and reg[1]), as for nub-spmi-a0 below.
  */
 &nub_spmi_a1 {
-	reg = <0x2 0x8a1a8000 0x0 0x4000>;
+	reg = <0x2 0x8a1a8000 0x0 0x4000>,
+	      <0x2 0x8a1a4000 0x0 0x4000>;
 	/delete-property/ interrupts;
 	status = "okay";
+};
+
+/* nub-spmi-a0's fault queue window (ADT reg[1]), which macOS empties when the controller starts */
+&nub_spmi_a0 {
+	reg = <0x2 0x8a188000 0x0 0x4000>,
+	      <0x2 0x8a184000 0x0 0x4000>;
 };
 
 #include "t6050-max-atc2.dtsi"
