@@ -813,12 +813,14 @@ static int apple_gpio_pinctrl_resume_noirq(struct device *dev)
 /*
  * A resume from disk is a cold boot: the block holds what the boot loader and
  * the boot kernel set up, not the restored kernel's pins, while the regmap
- * cache still holds the restored kernel's words. An interrupt does not get
- * its pin back by itself: the IRQ core disables lazily and unmasks only an
- * IRQ it recorded as masked, and regmap_update_bits() skips a write the cache
- * already has. So an edge interrupt armed before the hibernation, such as the
- * HDMI hotplug detect, stays off for good. Write back the pins this driver set
- * up as interrupts, from the cache; the other pins are left to their consumers.
+ * cache still holds the restored kernel's words. Neither an interrupt nor a
+ * consumer gets its pin back by itself: the IRQ core disables lazily and
+ * unmasks only an IRQ it recorded as masked, and regmap_update_bits() skips a
+ * write the cache already has. So an edge interrupt armed before the
+ * hibernation, such as the HDMI hotplug detect, stays off for good, and an
+ * output that its consumer sets to the level it had before is never driven.
+ * Write back, from the cache, every pin this driver set up that the block
+ * holds differently, in the order a pin takes its word.
  *
  * The early restore, as a PM domain does not wrap it (its restore_noirq ends
  * in the driver's resume_noirq). An uncached block reads back only what the
@@ -827,7 +829,7 @@ static int apple_gpio_pinctrl_resume_noirq(struct device *dev)
 static int apple_gpio_pinctrl_restore_early(struct device *dev)
 {
 	struct apple_gpio_pinctrl *pctl = dev_get_drvdata(dev);
-	unsigned int i, mode, val, armed = 0;
+	unsigned int i, cfg, val, restored = 0;
 
 	/* Hibernation aborted before the image: the block kept its state. */
 	if (!pm_hibernate_is_restored())
@@ -837,16 +839,18 @@ static int apple_gpio_pinctrl_restore_early(struct device *dev)
 		return 0;
 
 	for_each_set_bit(i, pctl->touched, pctl->pinctrl_desc.npins) {
-		if (regmap_read(pctl->map, REG_GPIO(i), &val))
+		if (regmap_read(pctl->map, REG_GPIO(i), &cfg))
 			continue;
-		mode = FIELD_GET(REG_GPIOx_MODE, val);
-		if (mode < REG_GPIOx_IN_IRQ_HI || mode > REG_GPIOx_IN_IRQ_ANY)
+		/* Past the cache, which every write below leaves at @cfg again. */
+		val = readl_relaxed(pctl->base + REG_GPIO(i));
+		if (val == cfg)
 			continue;
-		regmap_write(pctl->map, REG_GPIO(i), val);
-		armed++;
+		apple_gpio_safe_reconfigure(pctl, i, val, cfg);
+		restored++;
 	}
-	if (armed)
-		dev_dbg(dev, "resume from disk: %u interrupt pin(s) set up again\n", armed);
+	if (restored)
+		dev_dbg(dev, "resume from disk: %u of %u configured pins put back\n", restored,
+			bitmap_weight(pctl->touched, pctl->pinctrl_desc.npins));
 
 	return 0;
 }
