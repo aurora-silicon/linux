@@ -1338,6 +1338,8 @@ static void mt_shutdown(struct pci_dev *pdev)
  * MCU's software interrupt, by which the firmware asks for the host.
  */
 static unsigned int mt_wow_s2idle_irq = BIT(29);
+static bool mt_wow_s2idle_d3;
+module_param_named(wow_s2idle_d3, mt_wow_s2idle_d3, bool, 0644);
 module_param_named(wow_s2idle_irq, mt_wow_s2idle_irq, uint, 0644);
 MODULE_PARM_DESC(wow_s2idle_irq, "Interrupt causes that wake suspend-to-idle with WoWLAN armed (0 = none)");
 
@@ -1518,6 +1520,14 @@ static int mt_suspend(struct device *dev)
 		mt_hif_suspend(m, true);
 		if (m->wow_irq_mask)
 			m->wow_irq_wake = !enable_irq_wake(pci_irq_vector(pdev, 0));
+		if (m->wow_armed && mt_wow_s2idle_d3) {
+			pci_save_state(pdev);
+			pci_enable_wake(pdev, PCI_D3hot, true);
+			m->wow_d3 = !pci_set_power_state(pdev, PCI_D3hot);
+			dev_dbg(dev, "Wi-Fi wake: function in D3hot %d, PME armed\n", m->wow_d3);
+			device_set_awake_path(dev);
+			return 0;
+		}
 		dev_dbg(dev, "suspend-to-idle with Wi-Fi wake%s armed, irq mask %#x%s\n",
 			m->wow_armed ? "" : " not", m->wow_irq_mask,
 			m->wow_irq_wake ? ", wakeup" : "");
@@ -1534,6 +1544,16 @@ static int mt_resume(struct device *dev)
 	unsigned long flags;
 	int ret;
 
+	if (m->wow_d3) {
+		u16 pmcsr = 0;
+
+		m->wow_d3 = false;
+		pci_read_config_word(pdev, pdev->pm_cap + PCI_PM_CTRL, &pmcsr);
+		pci_set_power_state(pdev, PCI_D0);
+		pci_restore_state(pdev);
+		pci_enable_wake(pdev, PCI_D3hot, false);
+		dev_dbg(dev, "Wi-Fi wake: back to D0, PMCSR at wake %#x\n", pmcsr);
+	}
 	if (m->wow_irq_wake) {
 		disable_irq_wake(pci_irq_vector(pdev, 0));
 		m->wow_irq_wake = false;
