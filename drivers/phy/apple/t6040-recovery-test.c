@@ -53,19 +53,39 @@ static void t6040_recovery_power_lost_test(struct kunit *test)
 static void t6040_recovery_held_reference_test(struct kunit *test)
 {
 	unsigned int attempt;
+	unsigned int retries = t6040_recovery_pm_retries(false);
 
-	for (attempt = 0; attempt < T6040_RECOVERY_PM_RETRIES; attempt++)
+	KUNIT_EXPECT_EQ(test, retries, (unsigned int)T6040_RECOVERY_PM_RETRIES);
+	for (attempt = 0; attempt < retries; attempt++)
 		KUNIT_EXPECT_EQ(test,
-				t6040_recovery_pm_action(1, 0, attempt),
+				t6040_recovery_pm_action(1, 0, attempt, retries),
 				T6040_RECOVERY_PM_RETRY);
 	KUNIT_EXPECT_EQ(test,
-			t6040_recovery_pm_action(1, 0, attempt),
+			t6040_recovery_pm_action(1, 0, attempt, retries),
 			T6040_RECOVERY_PM_FALLBACK);
 	KUNIT_EXPECT_EQ(test,
-			t6040_recovery_pm_action(0, 1, attempt),
+			t6040_recovery_pm_action(0, 1, attempt, retries),
 			T6040_RECOVERY_PM_FALLBACK);
 	KUNIT_EXPECT_EQ(test,
-			t6040_recovery_pm_action(0, 0, attempt),
+			t6040_recovery_pm_action(0, 0, attempt, retries),
+			T6040_RECOVERY_PM_SUSPEND);
+}
+
+/*
+ * A PHY that is still in use holds the mailbox itself: the recovery doesn't
+ * wait for that reference, and suspends the mailbox at once if nothing holds
+ * it after all.
+ */
+static void t6040_recovery_own_reference_test(struct kunit *test)
+{
+	unsigned int retries = t6040_recovery_pm_retries(true);
+
+	KUNIT_EXPECT_EQ(test, retries, 0U);
+	KUNIT_EXPECT_EQ(test, t6040_recovery_pm_action(1, 0, 0, retries),
+			T6040_RECOVERY_PM_FALLBACK);
+	KUNIT_EXPECT_EQ(test, t6040_recovery_pm_action(0, 1, 0, retries),
+			T6040_RECOVERY_PM_FALLBACK);
+	KUNIT_EXPECT_EQ(test, t6040_recovery_pm_action(0, 0, 0, retries),
 			T6040_RECOVERY_PM_SUSPEND);
 }
 
@@ -75,6 +95,7 @@ static struct kunit_case t6040_recovery_test_cases[] = {
 	KUNIT_CASE(t6040_recovery_retry_exhaustion_test),
 	KUNIT_CASE(t6040_recovery_power_lost_test),
 	KUNIT_CASE(t6040_recovery_held_reference_test),
+	KUNIT_CASE(t6040_recovery_own_reference_test),
 	{}
 };
 

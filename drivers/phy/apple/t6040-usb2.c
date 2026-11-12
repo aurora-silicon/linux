@@ -237,13 +237,25 @@ enum t6040_recovery_pm_action {
 
 static enum t6040_recovery_pm_action
 t6040_recovery_pm_action(int usage_count, int child_count,
-			 unsigned int attempt)
+			 unsigned int attempt, unsigned int retries)
 {
 	if (!usage_count && !child_count)
 		return T6040_RECOVERY_PM_SUSPEND;
-	if (attempt < T6040_RECOVERY_PM_RETRIES)
+	if (attempt < retries)
 		return T6040_RECOVERY_PM_RETRY;
 	return T6040_RECOVERY_PM_FALLBACK;
+}
+
+/*
+ * How often the recovery waits for the mailbox's users to go. Never when the
+ * PHY is one of them: forced into suspend while it is still in use, by a phy
+ * that is powered on or by the controller's reset, it stays a consumer of its
+ * suppliers, and the mailbox keeps the reference of that device link however
+ * long the recovery waits.
+ */
+static unsigned int t6040_recovery_pm_retries(bool phy_in_use)
+{
+	return phy_in_use ? 0 : T6040_RECOVERY_PM_RETRIES;
 }
 
 enum t6040_usb3_region {
@@ -931,14 +943,15 @@ static int t6040_common_dp_force_resume(struct t6040_usb2_phy *tphy)
  *
  * Return 0 after a real suspend, 1 when the caller should use that normal-start
  * fallback, and a negative error for a provider failure unrelated to a holder.
+ * @retries is how often to wait for a holder, see t6040_recovery_pm_retries().
  */
-static int t6040_usb3_suspend_mbox(struct t6040_usb2_phy *tphy)
+static int t6040_usb3_suspend_mbox(struct t6040_usb2_phy *tphy, unsigned int retries)
 {
 	struct device *dev = tphy->mbox_dev;
 	unsigned int attempt;
 	int children, ret = -EBUSY, usage;
 
-	for (attempt = 0; attempt <= T6040_RECOVERY_PM_RETRIES; attempt++) {
+	for (attempt = 0; attempt <= retries; attempt++) {
 		enum t6040_recovery_pm_action action;
 
 		pm_runtime_barrier(dev);
@@ -948,7 +961,7 @@ static int t6040_usb3_suspend_mbox(struct t6040_usb2_phy *tphy)
 			"USB3: phymxwrap recovery attempt %u: usage_count=%d child_count=%d\n",
 			attempt, usage, children);
 
-		action = t6040_recovery_pm_action(usage, children, attempt);
+		action = t6040_recovery_pm_action(usage, children, attempt, retries);
 		if (action == T6040_RECOVERY_PM_SUSPEND) {
 			ret = pm_runtime_suspend(dev);
 			if (ret >= 0 && pm_runtime_status_suspended(dev))
@@ -963,7 +976,7 @@ static int t6040_usb3_suspend_mbox(struct t6040_usb2_phy *tphy)
 				break;
 		}
 
-		if (attempt < T6040_RECOVERY_PM_RETRIES) {
+		if (attempt < retries) {
 			unsigned int delay = T6040_RECOVERY_PM_BACKOFF_US << attempt;
 
 			usleep_range(delay, delay + T6040_RECOVERY_PM_BACKOFF_US);
@@ -988,6 +1001,7 @@ static int t6040_usb3_suspend_mbox(struct t6040_usb2_phy *tphy)
 static int t6040_usb3_hard_recover(struct t6040_usb2_phy *tphy)
 {
 	unsigned int dwell = max(recovery_dwell_ms, 1U);
+	unsigned int retries;
 	int ret, resume_ret;
 
 	/* This also releases the mailbox provider reference synchronously. */
@@ -997,7 +1011,9 @@ static int t6040_usb3_hard_recover(struct t6040_usb2_phy *tphy)
 	if (ret < 0)
 		return ret;
 
-	ret = t6040_usb3_suspend_mbox(tphy);
+	/* Left active by that: still in use, and so still the mailbox's consumer. */
+	retries = t6040_recovery_pm_retries(!pm_runtime_status_suspended(tphy->dev));
+	ret = t6040_usb3_suspend_mbox(tphy, retries);
 	if (ret < 0) {
 		dev_err(tphy->dev, "USB3: phymxwrap suspend failed: %d\n", ret);
 		goto resume_phy;
