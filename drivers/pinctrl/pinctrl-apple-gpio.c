@@ -64,7 +64,6 @@ struct apple_gpio_pinctrl {
 	 */
 	bool restore_all;
 	unsigned long *no_restore;
-	unsigned long *restored;
 	/* The block's word at REG_GLOBAL, kept across a sleep as well. */
 	u32 saved_global;
 	bool saved_global_valid;
@@ -640,8 +639,7 @@ static int apple_gpio_pinctrl_probe(struct platform_device *pdev)
 		u32 start, count;
 
 		pctl->no_restore = devm_bitmap_zalloc(&pdev->dev, npins, GFP_KERNEL);
-		pctl->restored = devm_bitmap_zalloc(&pdev->dev, npins, GFP_KERNEL);
-		if (!pctl->no_restore || !pctl->restored)
+		if (!pctl->no_restore)
 			return -ENOMEM;
 		/* The pins the firmware lists as no-restore, as (first pin, count) pairs. */
 		for (i = 0; n > 0 && i + 1 < (unsigned int)n; i += 2)
@@ -740,8 +738,7 @@ static int apple_gpio_pinctrl_suspend_noirq(struct device *dev)
 	struct apple_gpio_pinctrl *pctl = dev_get_drvdata(dev);
 	unsigned int i;
 
-	if (!pctl->saved || pm_suspend_target_state != PM_SUSPEND_MEM ||
-	    !pm_suspend_via_firmware())
+	if (pm_suspend_target_state != PM_SUSPEND_MEM || !pm_suspend_via_firmware())
 		return 0;
 
 	bitmap_zero(pctl->saved_valid, pctl->pinctrl_desc.npins);
@@ -781,7 +778,7 @@ static int apple_gpio_pinctrl_resume_noirq(struct device *dev)
 	struct apple_gpio_pinctrl *pctl = dev_get_drvdata(dev);
 	unsigned int i, val, restored = 0;
 
-	if (!pctl->saved || !pm_resume_via_firmware())
+	if (!pm_resume_via_firmware())
 		return 0;
 
 	if (pctl->saved_global_valid) {
@@ -795,8 +792,6 @@ static int apple_gpio_pinctrl_resume_noirq(struct device *dev)
 	/* The saved words came from the cache; the hardware is what to compare. */
 	if (pctl->cached)
 		regcache_cache_bypass(pctl->map, true);
-	if (pctl->restored)
-		bitmap_zero(pctl->restored, pctl->pinctrl_desc.npins);
 	for_each_set_bit(i, pctl->saved_valid, pctl->pinctrl_desc.npins) {
 		if (regmap_read(pctl->map, REG_GPIO(i), &val))
 			val = 0;
@@ -804,17 +799,12 @@ static int apple_gpio_pinctrl_resume_noirq(struct device *dev)
 			continue;
 		apple_gpio_safe_reconfigure(pctl, i, val, pctl->saved[i]);
 		restored++;
-		if (pctl->restored && !test_bit(i, pctl->touched))
-			set_bit(i, pctl->restored);
 	}
 	if (pctl->cached)
 		regcache_cache_bypass(pctl->map, false);
 	if (restored)
 		dev_dbg(dev, "resume: %u of %u configured pins put back\n", restored,
 			bitmap_weight(pctl->saved_valid, pctl->pinctrl_desc.npins));
-	if (pctl->restored && !bitmap_empty(pctl->restored, pctl->pinctrl_desc.npins))
-		dev_dbg(dev, "resume: pins not set up by Linux put back: %*pbl\n",
-			pctl->pinctrl_desc.npins, pctl->restored);
 	bitmap_zero(pctl->saved_valid, pctl->pinctrl_desc.npins);
 
 	return 0;
@@ -834,7 +824,7 @@ static int apple_gpio_pinctrl_resume_noirq(struct device *dev)
  * in the driver's resume_noirq). An uncached block reads back only what the
  * boot left, so this does nothing there.
  */
-static int __maybe_unused apple_gpio_pinctrl_restore_early(struct device *dev)
+static int apple_gpio_pinctrl_restore_early(struct device *dev)
 {
 	struct apple_gpio_pinctrl *pctl = dev_get_drvdata(dev);
 	unsigned int i, mode, val, armed = 0;
