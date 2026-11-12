@@ -9039,16 +9039,11 @@ bool dcp_s2r_firmware_stopped(struct platform_device *pdev)
  * domains are left as they are: the sleep controller then finds the pipe on at
  * its commit and refuses the sleep.
  *
- * The internal panel's processor (dcp@402e00000) has its power words in the
- * SoC's east block: DISP_SYS +0x258, DISP_FE +0x368, DISP_CPU +0x10000, as the
- * power-controller nodes ps_disp_sys@258, ps_disp_fe@368 and ps_disp_cpu@0 of
- * t6040-pmgr.dtsi name them. The platform also turns the domains' conditional
- * retention off before the sleep and on after it; that is not done here, and
- * the J616s sleeps and wakes without it.
+ * Each pipe's power words are in the hw data (apple_dcp_t6041_pipes[]), by its
+ * display endpoint. The domains' conditional retention can also be turned off
+ * before the sleep and on after it; that is not done here, and the J616s
+ * sleeps and wakes without it.
  */
-#define DCP_T6041_PS_SYS	0x258
-#define DCP_T6041_PS_FE		0x368
-#define DCP_T6041_PS_CPU	0x10000
 
 /* The fields of a PMGR power-state word (with DCP_PS_MIN above). */
 #define DCP_PS_AUTO_ENABLE	BIT(28)
@@ -9060,81 +9055,21 @@ bool dcp_s2r_firmware_stopped(struct platform_device *pdev)
 #define DCP_PS_ACTIVE		0xf
 
 /*
- * The two external DCPs share the DISPEXT power-state words in the west SOC-PS
- * block (the "ps" window of their apple,display-power node, base 0x502800000), each at its own
- * offsets: DISPEXT0 (HDMI, coproc dcp@3a2e00000) SYS/FE/CPU +0x340/0x348/0x350,
- * DISPEXT1 (USB-C DP, coproc dcp@602e00000) +0x490/0x498/0x4a0, as the
- * ps_dispext{0,1}_* nodes of t6040-pmgr.dtsi and the sleep controller's
- * apple,check-ps-b4-sleep name them. The coprocessor's base (reg-name "coproc")
- * tells the two apart.
+ * This DCP's power words: the entry of its display endpoint in the hw data. NULL
+ * for a processor without one (and the caller skips the S2R domain lower and
+ * raise, leaving the output off until reboot): never a write at a guessed
+ * address. An external processor is never display 0.
  */
-#define DCP_T6041_DISPEXT0_COPROC	0x3a2e00000ULL	/* dcp@3a2e00000, HDMI */
-#define DCP_T6041_DISPEXT1_COPROC	0x602e00000ULL	/* dcp@602e00000, USB-C DP */
-
-/*
- * A pipe's own sub-blocks have their power words right after its CPU's, 8 bytes
- * apart: eleven for the internal pipe (DISP_CPU +0x8..+0x58), seven for an
- * external one (DISPEXT0 +0x358..+0x388, DISPEXT1 +0x4a8..+0x4d8), the ranges
- * the sleep controller's apple,check-ps-b4-sleep gives. The words after them
- * are other devices': past DISPEXT0's come the power domains of the first
- * Type-C port (ATC0_COMMON +0x390, ATC0_CIO +0x398, ATC0_PCIE +0x3a0,
- * ATC0_CIO_PCIE +0x3a8), past DISPEXT1's those of the next external pipe
- * (DISPEXT2 SYS +0x4e0, FE +0x4e8, CPU +0x4f0).
- */
-#define DCP_T6041_PS_BLOCKS	11
-#define DCP_T6041_PS_EXT_BLOCKS	7
-
-struct dcp_t6041_ps_offsets {
-	u32 sys, fe, cpu;	/* u32: the internal CPU (0x10000) overflows u16 */
-	unsigned int blocks;	/* the pipe's sub-blocks after its CPU word */
-	unsigned int gapf_slice;	/* of the coprocessor's DART, in the GAPF bank */
-};
-
-/*
- * Resolve this DCP's SYS/FE/CPU offsets within its "ps" window, the number of
- * its sub-blocks and its DART's GAPF slice. The internal
- * panel uses the SOC-East offsets; an external DCP uses its DISPEXT offsets,
- * picked by its coproc reg base. Returns false (and the caller skips the S2R
- * domain lower/raise, leaving the output off until reboot) for an external DCP
- * whose base is unknown -- refusal-safe, never a write at a guessed address.
- */
-static bool dcp_t6041_ps_offsets(struct apple_dcp *dcp,
-				 struct dcp_t6041_ps_offsets *o)
+static const struct dcp_pipe_power *dcp_t6041_pipe_power(struct apple_dcp *dcp)
 {
-	struct resource *res;
+	u32 ep = dcp->peer_endpoint;
 
-	if (!dcp_desktop_external(dcp)) {
-		o->sys = DCP_T6041_PS_SYS;
-		o->fe = DCP_T6041_PS_FE;
-		o->cpu = DCP_T6041_PS_CPU;
-		o->blocks = DCP_T6041_PS_BLOCKS;
-		o->gapf_slice = 17;
-		return true;
-	}
-	res = platform_get_resource_byname(to_platform_device(dcp->dev),
-					   IORESOURCE_MEM, "coproc");
-	if (!res)
-		return false;
-	o->blocks = DCP_T6041_PS_EXT_BLOCKS;
-	switch (res->start) {
-	case DCP_T6041_DISPEXT0_COPROC:
-		o->sys = 0x340;
-		o->fe = 0x348;
-		o->cpu = 0x350;
-		o->gapf_slice = 29;
-		return true;
-	case DCP_T6041_DISPEXT1_COPROC:
-		o->sys = 0x490;
-		o->fe = 0x498;
-		o->cpu = 0x4a0;
-		o->gapf_slice = 48;
-		return true;
-	default:
-		dev_warn_once(dcp->dev,
-			      "DCPEXT coproc %pa has no known S2R power offsets: left off across sleep\n",
-			      &res->start);
-		return false;
-	}
+	if (ep < dcp->hw.nr_s2r_pipes && (ep || !dcp_desktop_external(dcp)))
+		return &dcp->hw.s2r_pipes[ep];
+	dev_warn_once(dcp->dev,
+		      "display endpoint %u has no known S2R power words: left off across sleep\n",
+		      ep);
+	return NULL;
 }
 
 static int dcp_t6041_display_power(struct apple_dcp *dcp, void __iomem **ps,
@@ -9167,7 +9102,7 @@ static int dcp_t6041_display_power(struct apple_dcp *dcp, void __iomem **ps,
  * apple_dart_gapf_ready()). The bit is cleared when the CPU is stopped, before its
  * domain goes off, and here the driver clears it itself. The DARTs' slices in the
  * GAPF bank: dart-dcp 17, dart-dcpext0 29, dart-dcpext1 48
- * (dcp_t6041_ps_offsets()).
+ * (apple_dcp_t6041_pipes[]).
  */
 #define DCP_T6041_GAPF_BASE		0x500578000ULL
 #define DCP_T6041_GAPF_SIZE		0x4000
@@ -9191,25 +9126,25 @@ static void dcp_t6041_gapf_release_all(struct apple_dcp *dcp);
  */
 static int dcp_t6041_s2r_domains_on(struct apple_dcp *dcp)
 {
-	struct dcp_t6041_ps_offsets o;
+	const struct dcp_pipe_power *p = dcp_t6041_pipe_power(dcp);
 	void __iomem *ps, *pmc;
 	u32 val;
 	int ret;
 
-	if (!dcp_t6041_ps_offsets(dcp, &o))
+	if (!p)
 		return -ENODEV;
 	ret = dcp_t6041_display_power(dcp, &ps, &pmc);
 	if (ret)
 		return ret;
 
-	val = readl(ps + o.sys) & ~(DCP_PS_FLAGS | DCP_PS_TARGET | DCP_PS_AUTO_ENABLE);
-	writel(val | DCP_PS_ACTIVE, ps + o.sys);
-	if (readl_poll_timeout_atomic(ps + o.sys, val, (val & DCP_PS_ACTUAL) == DCP_PS_ACTUAL,
+	val = readl(ps + p->sys) & ~(DCP_PS_FLAGS | DCP_PS_TARGET | DCP_PS_AUTO_ENABLE);
+	writel(val | DCP_PS_ACTIVE, ps + p->sys);
+	if (readl_poll_timeout_atomic(ps + p->sys, val, (val & DCP_PS_ACTUAL) == DCP_PS_ACTUAL,
 				      1, 10000))
 		dev_warn(dcp->dev, "S2R resume: SYS power word stuck at %#x\n", val);
-	val = readl(ps + o.fe) & ~(DCP_PS_FLAGS | DCP_PS_TARGET | DCP_PS_AUTO_ENABLE);
-	writel(val | DCP_PS_ACTIVE, ps + o.fe);
-	if (readl_poll_timeout_atomic(ps + o.fe, val, (val & DCP_PS_ACTUAL) == DCP_PS_ACTUAL,
+	val = readl(ps + p->fe) & ~(DCP_PS_FLAGS | DCP_PS_TARGET | DCP_PS_AUTO_ENABLE);
+	writel(val | DCP_PS_ACTIVE, ps + p->fe);
+	if (readl_poll_timeout_atomic(ps + p->fe, val, (val & DCP_PS_ACTUAL) == DCP_PS_ACTUAL,
 				      1, 10000))
 		dev_warn(dcp->dev, "S2R resume: FE power word stuck at %#x\n", val);
 	/*
@@ -9217,9 +9152,9 @@ static int dcp_t6041_s2r_domains_on(struct apple_dcp *dcp)
 	 * did, then the word to manual target 0xf, ACTUAL and bit 11 polled.
 	 */
 	ret = 0;
-	if (!(readl(ps + o.cpu) & DCP_PS_ACTUAL)) {
+	if (!(readl(ps + p->cpu) & DCP_PS_ACTUAL)) {
 		void __iomem *g = ioremap_np(DCP_T6041_GAPF_BASE +
-					     DCP_T6041_GAPF_SLICE(o.gapf_slice), 4);
+					     DCP_T6041_GAPF_SLICE(p->gapf_slice), 4);
 		u32 v, cur;
 
 		if (g) {
@@ -9227,15 +9162,15 @@ static int dcp_t6041_s2r_domains_on(struct apple_dcp *dcp)
 			iounmap(g);
 		}
 		dcp_t6041_gapf_release_all(dcp);
-		v = readl(ps + o.cpu);
+		v = readl(ps + p->cpu);
 		writel((v & ~(DCP_PS_FLAGS | DCP_PS_TARGET | DCP_PS_AUTO_ENABLE)) | DCP_PS_ACTIVE,
-		       ps + o.cpu);
+		       ps + p->cpu);
 		mb();	/* the write lands before the word is polled */
-		if (readl_poll_timeout_atomic(ps + o.cpu, cur,
+		if (readl_poll_timeout_atomic(ps + p->cpu, cur,
 					      (cur & DCP_PS_ACTUAL) == DCP_PS_ACTUAL, 1, 8000) ||
-		    readl_poll_timeout_atomic(ps + o.cpu, cur, !(cur & DCP_PS_BUSY), 1, 8000))
+		    readl_poll_timeout_atomic(ps + p->cpu, cur, !(cur & DCP_PS_BUSY), 1, 8000))
 			ret = -ETIMEDOUT;
-		cur = readl(ps + o.cpu);
+		cur = readl(ps + p->cpu);
 		if (ret)
 			dev_warn(dcp->dev, "S2R resume: CPU power word %#x -> %#x, not on\n",
 				 v, cur);
@@ -9250,8 +9185,8 @@ static int dcp_t6041_s2r_domains_on(struct apple_dcp *dcp)
 	if (dcp->s2r_child_valid) {
 		u32 cur, to = 0, i;
 
-		for (i = 0; i < o.blocks; i++) {
-			void __iomem *cw = ps + o.cpu + 8 * (i + 1);
+		for (i = 0; i < p->blocks; i++) {
+			void __iomem *cw = ps + p->cpu + 8 * (i + 1);
 			u32 want = dcp->s2r_child_saved[i];
 
 			if (!(want & DCP_PS_TARGET) || (readl(cw) & DCP_PS_ACTUAL))
@@ -9265,8 +9200,8 @@ static int dcp_t6041_s2r_domains_on(struct apple_dcp *dcp)
 			dev_warn(dcp->dev, "S2R resume: CPU power word children %#x not on\n",
 				 to);
 		dev_dbg(dcp->dev, "S2R resume: sub-blocks +%#x..+%#x back, saved %#x..%#x\n",
-			o.cpu + 8, o.cpu + 8 * o.blocks, dcp->s2r_child_saved[0],
-			dcp->s2r_child_saved[o.blocks - 1]);
+			p->cpu + 8, p->cpu + 8 * p->blocks, dcp->s2r_child_saved[0],
+			dcp->s2r_child_saved[p->blocks - 1]);
 	}
 	dcp_pmc_set(dcp, pmc, true);	/* shared voter: counts every powered DCP */
 
@@ -9324,27 +9259,24 @@ static void dcp_t6041_gapf_release_all(struct apple_dcp *dcp)
  */
 static bool dcp_t6041_s2r_capable(struct apple_dcp *dcp)
 {
-	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
-	       (of_device_is_compatible(dcp->dev->of_node, "apple,t6041-dcp") ||
-		of_device_is_compatible(dcp->dev->of_node, "apple,t6041-dcpext"));
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && dcp->hw.s2r_pipes;
 }
 
 /* Past A473(0) nothing here brings the display back: a failure leaves it off until reboot. */
 static void dcp_t6041_s2r_cpu_off(struct apple_dcp *dcp)
 {
 	void __iomem *control = dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL;
-	struct dcp_t6041_ps_offsets o;
+	const struct dcp_pipe_power *p = dcp_t6041_pipe_power(dcp);
 	void __iomem *ps, *pmc, *w, *g;
 	u32 v, cur, after, i;
 	phys_addr_t gpa;
 	int ret = 0, dret = -ENODEV;
 
-	if (!dcp_t6041_ps_offsets(dcp, &o) || dcp_t6041_display_power(dcp, &ps, &pmc))
+	if (!p || dcp_t6041_display_power(dcp, &ps, &pmc))
 		return;
-	w = ps + o.cpu;
+	w = ps + p->cpu;
 	/* The pipe's own sub-blocks as they are now, for the wake. */
-	BUILD_BUG_ON(ARRAY_SIZE(dcp->s2r_child_saved) < DCP_T6041_PS_BLOCKS);
-	for (i = 0; i < o.blocks; i++)
+	for (i = 0; i < p->blocks; i++)
 		dcp->s2r_child_saved[i] = readl(w + 8 * (i + 1));
 	dcp->s2r_child_valid = true;
 	/* T8140's order (apple_dart_display_streams): streams off and TLB flushed, then GAPF. */
@@ -9356,7 +9288,7 @@ static void dcp_t6041_s2r_cpu_off(struct apple_dcp *dcp)
 		dev_warn(dcp->dev, "S2R: DCP DART streams not stopped: %d\n", dret);
 
 	/* This DCP's DART's own slice first. */
-	gpa = DCP_T6041_GAPF_BASE + DCP_T6041_GAPF_SLICE(o.gapf_slice);
+	gpa = DCP_T6041_GAPF_BASE + DCP_T6041_GAPF_SLICE(p->gapf_slice);
 	g = ioremap_np(gpa, 4);
 	if (g) {
 		u32 gv = readl(g), ga;
@@ -9388,9 +9320,9 @@ static void dcp_t6041_s2r_cpu_off(struct apple_dcp *dcp)
 	after = readl(w);
 	if (ret)
 		dev_warn(dcp->dev, "S2R: CPU power word +%#x %#x -> %#x, not off\n",
-			 o.cpu, v, after);
+			 p->cpu, v, after);
 	else
-		dev_dbg(dcp->dev, "S2R: CPU power word +%#x %#x -> %#x\n", o.cpu, v, after);
+		dev_dbg(dcp->dev, "S2R: CPU power word +%#x %#x -> %#x\n", p->cpu, v, after);
 	/*
 	 * No longer one of the powered DCPs that pmc-dcp counts. Nothing is written: the
 	 * sleep controller zeroes the voter before the sleep, and the wake counts this DCP
@@ -9463,15 +9395,15 @@ static void dcp_t6041_s2r_stop_link_work(struct apple_dcp *dcp)
  */
 static bool dcp_t6041_s2r_blocks_on(struct apple_dcp *dcp)
 {
-	struct dcp_t6041_ps_offsets o;
+	const struct dcp_pipe_power *p = dcp_t6041_pipe_power(dcp);
 	void __iomem *ps, *pmc;
 	bool on = false;
 	u32 i;
 
-	if (!dcp_t6041_ps_offsets(dcp, &o) || dcp_t6041_display_power(dcp, &ps, &pmc))
+	if (!p || dcp_t6041_display_power(dcp, &ps, &pmc))
 		return true;
-	for (i = 1; i <= o.blocks; i++)
-		if (readl(ps + o.cpu + 8 * i) & DCP_PS_TARGET)
+	for (i = 1; i <= p->blocks; i++)
+		if (readl(ps + p->cpu + 8 * i) & DCP_PS_TARGET)
 			on = true;
 	iounmap(ps);
 	iounmap(pmc);
@@ -9589,8 +9521,8 @@ lost:
  * back, then the warm restart of the idled firmware runs in hib_restore_work so that
  * its waits do not stall .resume (dcp_t6041_s2r_warm_restart() for the internal
  * panel, dcp_t6041_s2r_warm_restart_ext() for an external DCP). If the domains
- * cannot be raised (no apple,display-power window, or an external DCP whose DISPEXT
- * offsets are unknown) the output stays off until reboot; the sleep itself is done.
+ * cannot be raised (no apple,display-power window, or a DCP whose power words are not
+ * known) the output stays off until reboot; the sleep itself is done.
  */
 static void dcp_t6041_s2r_resume(struct apple_dcp *dcp)
 {
@@ -11127,14 +11059,46 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8132_dcpext = {
 };
 #endif
 
-/* T6041 (M4 Pro/Max), desktop 26.6 firmware */
+/*
+ * T6041 (M4 Pro/Max), desktop 26.6 firmware.
+ *
+ * The pipes' power words, by display endpoint. The internal pipe's are in the SoC's
+ * east block, as the power-controller nodes ps_disp_sys@258, ps_disp_fe@368 and
+ * ps_disp_cpu@0 of t6040-pmgr.dtsi name them; the "ps" window of its
+ * apple,display-power node has DISP_CPU at +0x10000. The external pipes share the
+ * west block: DISPEXT0 (the HDMI output of the J616s) and DISPEXT1, as
+ * ps_dispext{0,1}_{sys,fe,cpu}. A pipe's sub-blocks are the words between its CPU's
+ * and the last one the sleep controller's apple,check-ps-b4-sleep gives: eleven
+ * for DISP (+0x8..+0x58 after the CPU's), seven for DISPEXT0 (+0x358..+0x388) and
+ * DISPEXT1 (+0x4a8..+0x4d8). The words after those are other devices': past
+ * DISPEXT0's the power domains of the first Type-C port (ATC0_COMMON +0x390,
+ * ATC0_CIO +0x398, ATC0_PCIE +0x3a0, ATC0_CIO_PCIE +0x3a8), past DISPEXT1's those
+ * of the next external pipe (DISPEXT2 SYS +0x4e0, FE +0x4e8, CPU +0x4f0).
+ */
+#define DCP_T6041_DISP_BLOCKS		11
+#define DCP_T6041_DISPEXT_BLOCKS	7
+static_assert(DCP_T6041_DISP_BLOCKS <= DCP_PIPE_POWER_MAX_BLOCKS);
+
+static const struct dcp_pipe_power apple_dcp_t6041_pipes[] = {
+	[0] = { .sys = 0x258, .fe = 0x368, .cpu = 0x10000,
+		.blocks = DCP_T6041_DISP_BLOCKS, .gapf_slice = 17 },
+	[1] = { .sys = 0x340, .fe = 0x348, .cpu = 0x350,
+		.blocks = DCP_T6041_DISPEXT_BLOCKS, .gapf_slice = 29 },
+	[2] = { .sys = 0x490, .fe = 0x498, .cpu = 0x4a0,
+		.blocks = DCP_T6041_DISPEXT_BLOCKS, .gapf_slice = 48 },
+};
+
 static const struct apple_dcp_hw_data apple_dcp_hw_t6041 = {
 	.num_dptx_ports = 2,
+	.s2r_pipes = apple_dcp_t6041_pipes,
+	.nr_s2r_pipes = 1,
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t6041_dcpext = {
 	.num_dptx_ports = 2,
 	.sink_metadata_edid = true,
+	.s2r_pipes = apple_dcp_t6041_pipes,
+	.nr_s2r_pipes = ARRAY_SIZE(apple_dcp_t6041_pipes),
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t6050 = {

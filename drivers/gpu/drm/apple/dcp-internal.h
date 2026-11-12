@@ -248,6 +248,23 @@ enum dcp_iomfb_method_profile {
 	DCP_IOMFB_METHODS_H17P_EXTERNAL,
 };
 
+/*
+ * A T6041 display pipe's PMGR power words, as offsets in the "ps" window of its
+ * apple,display-power node: SYS, FE and the coprocessor's CPU. The pipe's own
+ * sub-blocks have their words right after the CPU's, 8 bytes apart: @blocks of
+ * them. @gapf_slice is the slice of the coprocessor's DART in the GAPF bank.
+ */
+struct dcp_pipe_power {
+	u32 sys;
+	u32 fe;
+	u32 cpu;
+	u8 blocks;
+	u8 gapf_slice;
+};
+
+/* The most sub-blocks a pipe has (the internal one's). */
+#define DCP_PIPE_POWER_MAX_BLOCKS	11
+
 struct apple_dcp_hw_data {
 	u8 firmware_dma_bits;
 	u32 num_dptx_ports;
@@ -286,6 +303,14 @@ struct apple_dcp_hw_data {
 	bool s2r_ext;
 	/* The firmware crashes on any mode but the 120 Hz boot timing, see dcp_mode_settable(). */
 	bool only_120hz_modes;
+	/*
+	 * With desktop 26.x firmware: a firmware-driven system sleep that loses power
+	 * stops the firmware and powers its CPU off, and the wake restarts it warm, see
+	 * dcp_t6041_s2r_stop(). The power words of the pipes this entry covers, by
+	 * display endpoint (apple,dcp-endpoint; 0 is the internal pipe).
+	 */
+	const struct dcp_pipe_power *s2r_pipes;
+	u8 nr_s2r_pipes;
 };
 
 enum dcp_test_point {
@@ -701,8 +726,8 @@ struct apple_dcp {
 	bool s2r_stopped;
 	/* T6040 suspend-to-RAM stopped the desktop firmware, see dcp_t6041_s2r_stop(). */
 	bool t6041_s2r_stopped;
-	/* T6040 S2R: the pipe's sub-blocks (at most 11 power words) as the stop found them. */
-	u32 s2r_child_saved[11];
+	/* T6040 S2R: the power words of the pipe's sub-blocks as the stop found them. */
+	u32 s2r_child_saved[DCP_PIPE_POWER_MAX_BLOCKS];
 	bool s2r_child_valid;
 	/* A T6040 S2R wake reuses hib_restore_work for the warm restart. */
 	bool s2r_restart;
