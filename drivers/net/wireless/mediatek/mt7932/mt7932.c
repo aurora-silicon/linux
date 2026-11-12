@@ -1329,6 +1329,14 @@ static void mt_shutdown(struct pci_dev *pdev)
 	/* Storage remains allocated through reset, even if the engine is stuck. */
 }
 
+/*
+ * Interrupt causes left enabled through suspend-to-idle with Wi-Fi wake: the
+ * MCU's software interrupt, by which the firmware asks for the host.
+ */
+static unsigned int mt_wow_s2idle_irq = BIT(29);
+module_param_named(wow_s2idle_irq, mt_wow_s2idle_irq, uint, 0644);
+MODULE_PARM_DESC(wow_s2idle_irq, "Interrupt causes that wake suspend-to-idle with WoWLAN armed (0 = none)");
+
 /* command_mutex held; the firmware answers once its host interface has changed state. */
 static int mt_hif_ctrl(struct mt7932 *m, bool suspend)
 {
@@ -1485,9 +1493,27 @@ static int mt_hif_suspend(struct mt7932 *m)
  */
 static int mt_suspend(struct device *dev)
 {
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct mt7932 *m = pci_get_drvdata(pdev);
+
 	if (!pm_suspend_no_platform())
-		return mt_hif_suspend(pci_get_drvdata(to_pci_dev(dev)));
-	pci_save_state(to_pci_dev(dev));
+		return mt_hif_suspend(m);
+	/*
+	 * Suspend-to-idle with Wi-Fi wake: the firmware gets the same WoW setup and
+	 * host interface stop as for a deep sleep, and the link stays up. Only the
+	 * firmware's own interrupt is left enabled, as the wakeup.
+	 */
+	if (READ_ONCE(m->wow_detect)) {
+		mt_hif_suspend(m);
+		if (m->wow_armed && mt_wow_s2idle_irq) {
+			mt_write(m, W + 0x200, mt_read(m, W + 0x200));
+			mt_write(m, W + 0x204, mt_wow_s2idle_irq);
+			m->wow_irq_wake = !enable_irq_wake(pci_irq_vector(pdev, 0));
+		}
+		dev_dbg(dev, "suspend-to-idle with Wi-Fi wake%s armed, irq mask %#x\n",
+			m->wow_armed ? "" : " not", m->wow_irq_wake ? mt_wow_s2idle_irq : 0);
+	}
+	pci_save_state(pdev);
 	device_set_awake_path(dev);
 	return 0;
 }
@@ -1499,6 +1525,13 @@ static int mt_resume(struct device *dev)
 	unsigned long flags;
 	int ret;
 
+	if (m->wow_irq_wake) {
+		disable_irq_wake(pci_irq_vector(pdev, 0));
+		m->wow_irq_wake = false;
+		dev_dbg(dev, "Wi-Fi wake: interrupt causes %#x, MCU %#x\n",
+			mt_read(m, W + 0x200), mt_read(m, W + 0x1f0));
+		mt_write(m, W + 0x204, 0);
+	}
 	if (!READ_ONCE(m->hif_suspended))
 		return 0;
 	/* As macOS does: a chip that no longer answers isn't touched further. */

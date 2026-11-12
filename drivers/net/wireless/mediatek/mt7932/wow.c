@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Wake-on-WLAN for a deep sleep. The firmware keeps the association while the
- * host sleeps and wakes it through the radio's GPIO, which the SMC turns into
- * an AP wake. Nothing in-band can wake the SoC from S2R.
+ * Wake-on-WLAN. The firmware keeps the association while the host sleeps. From
+ * a deep sleep it wakes the host through the radio's GPIO, which the SMC turns
+ * into an AP wake: nothing in-band can wake the SoC from S2R. In
+ * suspend-to-idle the link stays up and the device's interrupt is armed as a
+ * wakeup.
  */
 #include <linux/suspend.h>
 
@@ -35,8 +37,12 @@ int mt_wow_suspend(struct wiphy *wiphy, struct cfg80211_wowlan *wow)
 	WRITE_ONCE(m->wow_detect, 0);
 	if (!wow)
 		return 0;
-	/* Only S2R hands the radio to the firmware; s2idle and hibernation leave. */
-	if (!detect || pm_suspend_target_state != PM_SUSPEND_MEM || pm_suspend_no_platform())
+	/*
+	 * S2R and suspend-to-idle hand the radio to the firmware; hibernation
+	 * leaves the network.
+	 */
+	if (!detect || (pm_suspend_target_state != PM_SUSPEND_MEM &&
+			pm_suspend_target_state != PM_SUSPEND_TO_IDLE))
 		return 1;
 	spin_lock_irqsave(&m->response_lock, flags);
 	associated = mt_wow_associated_locked(m);

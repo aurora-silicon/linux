@@ -168,6 +168,8 @@ struct mt7932 {
 	u8 wow_detect;
 	/* The firmware was given WoW at the sleep; command_mutex. */
 	bool wow_armed;
+	/* The device interrupt is armed to wake suspend-to-idle. */
+	bool wow_irq_wake;
 	/* A wake reason is awaited, and the one received; response_lock. */
 	bool wow_report;
 	u8 wow_reason;
