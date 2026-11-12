@@ -128,6 +128,8 @@ struct dcp_audio {
 	/* It holds a PM reference: its removal failed, see dcpaud_silence_stop() */
 	bool idle_pm;
 #endif
+	/* Runtime PM was enabled at bind, see dcpaud_hold_link_locked() */
+	bool rpm_enabled;
 };
 
 /* Native external audio service (DRM_APPLE_DCP_T6030_AUDIO only). */
@@ -1326,9 +1328,16 @@ static int dcpaud_hold_link_locked(struct dcp_audio *dcpaud)
 	lockdep_assert_held(&dcpaud->link_lock);
 	if (!dcpaud->chan || !dcpaud->silence)
 		return -ENODEV;
-	if (pm_runtime_get_sync(dcpaud->dev) < 0 && pm_runtime_enabled(dcpaud->dev)) {
+	/*
+	 * The SIO channel feeds the DisplayPort audio block, in this device's
+	 * power domain: no link without it powered. Runtime PM enabled at bind
+	 * and off now is a system sleep in progress, where the device cannot be
+	 * resumed; the display holds the link again at its next mode set.
+	 */
+	ret = pm_runtime_get_sync(dcpaud->dev);
+	if (ret < 0 && (pm_runtime_enabled(dcpaud->dev) || dcpaud->rpm_enabled)) {
 		pm_runtime_put_noidle(dcpaud->dev);
-		return -EIO;
+		return ret == -EACCES ? -EAGAIN : -EIO;
 	}
 	ret = dmaengine_slave_config(dcpaud->chan, &slave_config);
 	if (!ret)
@@ -1804,6 +1813,7 @@ static int dcpaud_comp_bind(struct device *dev, struct device *main, void *data)
 	ret = devm_pm_runtime_enable(dev);
 	if (ret)
 		return dev_err_probe(dev, ret, "Failed to enable runtime PM: %d\n", ret);
+	dcpaud->rpm_enabled = true;
 
 	/* find linked DCP instance */
 	endpoint = of_graph_get_endpoint_by_regs(dev->of_node, 0, 0);
@@ -2010,13 +2020,22 @@ static __maybe_unused int dcpaud_pm_prepare(struct device *dev)
 static __maybe_unused int dcpaud_system_suspend(struct device *dev)
 {
 	dcpaud_sleep_quiesce(dev_get_drvdata(dev));
-
-	return pm_runtime_force_suspend(dev);
+	return 0;
 }
 
+/*
+ * Runtime PM stops in the late phase and comes back in the early one, so it
+ * works through every device's .suspend and .resume. The display resumes
+ * before this device and holds its link again in its own resume, before
+ * the mode set (dcpaud_before_modeset()): the link's PM reference must
+ * power this device's domain then. A sleep entered with no link held finds
+ * the device idle, and pm_runtime_force_resume() leaves it suspended, so
+ * nothing else powers the domain.
+ */
 static const struct dev_pm_ops dcpaud_pm_ops = {
 	.prepare = pm_sleep_ptr(dcpaud_pm_prepare),
-	SYSTEM_SLEEP_PM_OPS(dcpaud_system_suspend, pm_runtime_force_resume)
+	SYSTEM_SLEEP_PM_OPS(dcpaud_system_suspend, NULL)
+	LATE_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
 	RUNTIME_PM_OPS(dcpaud_suspend, dcpaud_resume, NULL)
 };
 

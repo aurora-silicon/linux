@@ -550,6 +550,29 @@ static void dcpaud_hold_link_needs_channel(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&audio->dev->power.usage_count), 0);
 }
 
+static void dcpaud_hold_link_needs_power(struct kunit *test)
+{
+	struct platform_device *pdev;
+	struct dcp_audio *audio = dcpaud_link_setup(test, &pdev);
+	int ret;
+
+	/*
+	 * Runtime PM enabled at bind and off now (a system sleep in progress):
+	 * the device's domain cannot be powered, so no link is held and
+	 * nothing is sent.
+	 */
+	dcpaud_link_test_channel(test, audio);
+	audio->rpm_enabled = true;
+	scoped_guard(mutex, &audio->link_lock)
+		ret = dcpaud_hold_link_locked(audio);
+	KUNIT_EXPECT_EQ(test, ret, -EAGAIN);
+	KUNIT_EXPECT_STREQ(test, dcpaud_link_current->sequence, "");
+	KUNIT_EXPECT_FALSE(test, audio->link_prepared);
+	KUNIT_EXPECT_FALSE(test, audio->silence_running);
+	KUNIT_EXPECT_FALSE(test, audio->idle_set);
+	KUNIT_EXPECT_EQ(test, atomic_read(&audio->dev->power.usage_count), 0);
+}
+
 /* The PCM core's view of @sub for snd_pcm_suspend_all(): its PCM's only substream */
 static void dcpaud_link_test_pcm(struct kunit *test, struct dcp_audio *audio,
 				 struct snd_pcm_substream *sub)
@@ -680,6 +703,7 @@ static struct kunit_case dcpaud_link_cases[] = {
 	KUNIT_CASE(dcpaud_hold_link_start_fails),
 	KUNIT_CASE(dcpaud_hold_link_did_start_fails),
 	KUNIT_CASE(dcpaud_hold_link_needs_channel),
+	KUNIT_CASE(dcpaud_hold_link_needs_power),
 	KUNIT_CASE(dcpaud_sleep_suspends_running_stream),
 	KUNIT_CASE(dcpaud_sleep_releases_held_link),
 	KUNIT_CASE(dcpaud_sleep_ends_cleared_dma),
