@@ -377,6 +377,19 @@ MODULE_PARM_DESC(cio_s2r, "Enable J713 attached-dock system sleep (default: on)"
 
 struct apple_dpin_binding;
 
+/*
+ * hw->sleep_stop: where the stop of a port with a PCIe-C host stands, which
+ * the PM notifier leaves to sleep_stop_work. While that work runs it holds
+ * the lock, and a PCIe endpoint driver it unbinds may wait for the PM notifier
+ * chain to end. The notifier therefore waits neither for the work nor for the
+ * lock unless this says that the work is over.
+ */
+enum apple_cio_sleep_stop {
+	APPLE_CIO_SLEEP_STOP_NONE,	/* not deferred, or seen to be over */
+	APPLE_CIO_SLEEP_STOP_QUEUED,	/* for the sleep that is under way */
+	APPLE_CIO_SLEEP_STOP_ORPHAN,	/* that sleep ended, the stop has not */
+};
+
 /**
  * struct apple_cio - Apple Converged I/O host router complex
  * @dev: ACIO device
@@ -398,7 +411,7 @@ struct apple_dpin_binding;
  * @sleep_hibernating: Hibernation is under way; thaw does not reopen the port
  * @sleep_stop_work: Stops a port with a PCIe-C host for system sleep
  * @sleep_stop_done: Signals that @sleep_stop_work has finished
- * @sleep_stop_queued: @sleep_stop_work was queued for this sleep
+ * @sleep_stop_state: Where @sleep_stop_work stands for the PM notifier
  * @phy_np: Type-C PHY the router runs over (hw->cio_phy)
  */
 struct apple_cio {
@@ -464,11 +477,11 @@ struct apple_cio {
 	bool sleep_restart_owed; /* protected by lock */
 	bool sleep_aborted_early; /* protected by lock: devices never suspended */
 	/* hw->sleep_stop: hibernation is under way, thaw does not reopen */
-	bool sleep_hibernating; /* protected by lock */
+	bool sleep_hibernating; /* PM notifier and complete only */
 	/* hw->sleep_stop: the stop of a port with a PCIe-C host runs here */
 	struct work_struct sleep_stop_work;
 	struct completion sleep_stop_done;
-	bool sleep_stop_queued; /* PM notifier and prepare only */
+	atomic_t sleep_stop_state; /* enum apple_cio_sleep_stop */
 	/* hw->cio_phy: the Type-C PHY this router runs over */
 	struct device_node *phy_np;
 
@@ -3682,7 +3695,7 @@ static int apple_cio_prepare(struct device *dev)
 	 * device suspends: the PHY refuses to sleep under a running router.
 	 * Notifiers are done and the PM core holds no lock the stop needs.
 	 */
-	if (READ_ONCE(acio->sleep_stop_queued) &&
+	if (atomic_read(&acio->sleep_stop_state) == APPLE_CIO_SLEEP_STOP_QUEUED &&
 	    !wait_for_completion_timeout(&acio->sleep_stop_done,
 					 msecs_to_jiffies(APPLE_CIO_SLEEP_STOP_TIMEOUT_MS))) {
 		dev_err(dev, "router did not stop for system sleep, aborting it\n");
@@ -3905,6 +3918,25 @@ static void apple_cio_sleep_restart_work(struct work_struct *work)
 	struct apple_cio *acio = container_of(to_delayed_work(work), struct apple_cio,
 					      sleep_restart_work);
 
+	/*
+	 * A sleep that was abandoned before this device's .prepare may have
+	 * left its deferred stop running: wait for it here, outside the PM
+	 * notifier chain. If another sleep has begun by then, the stop is
+	 * that sleep's, whose PM_POST_* queues this work again.
+	 */
+	switch (atomic_read(&acio->sleep_stop_state)) {
+	case APPLE_CIO_SLEEP_STOP_QUEUED:
+		return;
+	case APPLE_CIO_SLEEP_STOP_ORPHAN:
+		flush_work(&acio->sleep_stop_work);
+		if (atomic_cmpxchg(&acio->sleep_stop_state,
+				   APPLE_CIO_SLEEP_STOP_ORPHAN,
+				   APPLE_CIO_SLEEP_STOP_NONE) !=
+		    APPLE_CIO_SLEEP_STOP_ORPHAN)
+			return;
+		break;
+	}
+
 	scoped_guard(mutex, &acio->lock) {
 		acio->sleep_aborted_early = false;
 		if (!acio->sleep_restart_owed)
@@ -3963,16 +3995,28 @@ static void apple_cio_sleep_stop(struct apple_cio *acio, bool hibernate)
 {
 	bool defer;
 
+	acio->sleep_hibernating = hibernate;
+	/*
+	 * The stop of a sleep that was abandoned may still be running. It
+	 * stops the router for this sleep as well, and the restart work
+	 * behind it stands down; neither is waited for here.
+	 */
+	if (atomic_cmpxchg(&acio->sleep_stop_state, APPLE_CIO_SLEEP_STOP_ORPHAN,
+			   APPLE_CIO_SLEEP_STOP_QUEUED) == APPLE_CIO_SLEEP_STOP_ORPHAN)
+		return;
+
+	/* Nothing from an earlier sleep may restart the port during this one. */
+	cancel_delayed_work_sync(&acio->sleep_restart_work);
 	cancel_delayed_work_sync(&acio->resume_link_work);
 
 	scoped_guard(mutex, &acio->lock) {
-		acio->sleep_hibernating = hibernate;
 		acio->sleep_aborted_early = false;
 		/*
 		 * PCIe endpoints may unregister PM notifiers on removal, which
 		 * would deadlock inside this notifier chain. A port with a PCIe-C
-		 * host stops from a worker instead, which this device's .prepare
-		 * waits for before any device suspends.
+		 * host stops from a worker instead. That may still run while
+		 * tasks freeze; this device's .prepare waits for it before any
+		 * device suspends.
 		 */
 		scoped_guard(mutex, &acio->pcie_tunnel_lock)
 			defer = acio->current_cable_info && acio->pcie_tunnel_populated;
@@ -3983,8 +4027,27 @@ static void apple_cio_sleep_stop(struct apple_cio *acio, bool hibernate)
 	}
 
 	reinit_completion(&acio->sleep_stop_done);
-	WRITE_ONCE(acio->sleep_stop_queued, true);
+	atomic_set(&acio->sleep_stop_state, APPLE_CIO_SLEEP_STOP_QUEUED);
 	queue_work(system_dfl_wq, &acio->sleep_stop_work);
+}
+
+/*
+ * PM_POST_*: whether the notifier may take the lock. A deferred stop is over
+ * once this device's .prepare has run. A sleep abandoned before that can find
+ * it still running, and waiting for it here would keep a PCIe endpoint that
+ * unregisters its PM notifier, and so the stop itself, from finishing until
+ * the wait gives up. Such a stop is left to the restart work.
+ */
+static bool apple_cio_sleep_stop_over(struct apple_cio *acio)
+{
+	if (atomic_read(&acio->sleep_stop_state) == APPLE_CIO_SLEEP_STOP_NONE)
+		return true;
+	if (completion_done(&acio->sleep_stop_done)) {
+		atomic_set(&acio->sleep_stop_state, APPLE_CIO_SLEEP_STOP_NONE);
+		return true;
+	}
+	atomic_set(&acio->sleep_stop_state, APPLE_CIO_SLEEP_STOP_ORPHAN);
+	return false;
 }
 
 static int apple_cio_pm_notify(struct notifier_block *nb, unsigned long event,
@@ -4005,14 +4068,14 @@ static int apple_cio_pm_notify(struct notifier_block *nb, unsigned long event,
 			break;
 		fallthrough;
 	case PM_SUSPEND_PREPARE:
-		/* Nothing from an earlier sleep may restart the port during this one. */
-		cancel_delayed_work_sync(&acio->sleep_restart_work);
-		/* Before tasks freeze: tearing down the NHI needs unfrozen work. */
 		if (stop) {
 			apple_cio_sleep_stop(acio, event != PM_SUSPEND_PREPARE);
 			break;
 		}
+		/* Nothing from an earlier sleep may restart the port during this one. */
+		cancel_delayed_work_sync(&acio->sleep_restart_work);
 		apple_cio_sleep_close_owed(acio);
+		/* Before tasks freeze: tearing down the NHI needs unfrozen work. */
 		if (READ_ONCE(s2idle_teardown))
 			apple_cio_sleep_teardown(acio);
 		break;
@@ -4022,16 +4085,10 @@ static int apple_cio_pm_notify(struct notifier_block *nb, unsigned long event,
 			break;
 		fallthrough;
 	case PM_POST_SUSPEND:
-		/* A deferred stop is over once .prepare has run; not if it never did. */
-		if (READ_ONCE(acio->sleep_stop_queued)) {
-			/* As .prepare: a stop that never ends must not hang PM forever. */
-			if (!wait_for_completion_timeout(&acio->sleep_stop_done,
-							 msecs_to_jiffies(APPLE_CIO_SLEEP_STOP_TIMEOUT_MS))) {
-				dev_err(acio->dev,
-					"router stop for system sleep did not finish, not restarting the port\n");
-				break;
-			}
-			WRITE_ONCE(acio->sleep_stop_queued, false);
+		acio->sleep_hibernating = false;
+		if (!apple_cio_sleep_stop_over(acio)) {
+			queue_delayed_work(system_dfl_wq, &acio->sleep_restart_work, 0);
+			break;
 		}
 		scoped_guard(mutex, &acio->lock) {
 			/*
@@ -4044,7 +4101,6 @@ static int apple_cio_pm_notify(struct notifier_block *nb, unsigned long event,
 				acio->sleep_phase = APPLE_CIO_SLEEP_RESUMED;
 				acio->sleep_aborted_early = true;
 			}
-			acio->sleep_hibernating = false;
 			owed = acio->sleep_restart_owed;
 			/* A cable recorded while closed has nobody else to start it. */
 			early = acio->sleep_aborted_early ||
