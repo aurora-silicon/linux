@@ -32,18 +32,28 @@ int apple_pmp_register(struct device *dev, const void *data)
 {
 	int ret = 0;
 
-	guard(mutex)(&pmp_lock);
-	if (pmp_data)
-		ret = -EBUSY;
-	else {
-		pmp_data = data;
-		pmp_device = dev;
+	scoped_guard(mutex, &pmp_lock) {
+		if (pmp_data)
+			ret = -EBUSY;
+		else {
+			pmp_data = data;
+			pmp_device = dev;
+		}
 	}
+	/* Outside pmp_lock: the report driver calls the reader under its own lock. */
+	if (!ret)
+		apple_pmp_report_set_gpu_effort_reader(apple_pmp_gpu_effort);
 	return ret;
 }
 
 void apple_pmp_unregister(const void *data)
 {
+	bool ours;
+
+	scoped_guard(mutex, &pmp_lock)
+		ours = pmp_data == data;
+	if (ours)
+		apple_pmp_report_set_gpu_effort_reader(NULL);
 	guard(mutex)(&pmp_lock);
 	if (pmp_data == data) {
 		pmp_data = NULL;

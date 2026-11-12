@@ -201,6 +201,25 @@ static bool apple_pmp_report_has_gpu_effort(const struct apple_pmp_report *rep)
 				       "apple,t8140-pmp-v2-report");
 }
 
+/* The PMP driver's GPU effort reader; the lock joins its withdrawal. */
+static DEFINE_MUTEX(apple_pmp_gpu_effort_lock);
+static int (*apple_pmp_gpu_effort_reader)(u32 *count, u32 *effort);
+
+void apple_pmp_report_set_gpu_effort_reader(int (*read)(u32 *count, u32 *effort))
+{
+	guard(mutex)(&apple_pmp_gpu_effort_lock);
+	apple_pmp_gpu_effort_reader = read;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_set_gpu_effort_reader);
+
+static int apple_pmp_report_gpu_effort(u32 *count, u32 *effort)
+{
+	guard(mutex)(&apple_pmp_gpu_effort_lock);
+	if (!apple_pmp_gpu_effort_reader)
+		return -ENODEV;
+	return apple_pmp_gpu_effort_reader(count, effort);
+}
+
 /* Bound report regions, protected by RCU until managed teardown drains readers. */
 static LIST_HEAD(apple_pmp_reports);
 static DEFINE_MUTEX(apple_pmp_reports_lock);
@@ -416,7 +435,7 @@ static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
 				   (effort >> (lane * BITS_PER_BYTE)) & 0xff);
 	}
 	if (apple_pmp_report_has_gpu_effort(rep)) {
-		ret = apple_pmp_gpu_effort(&count, &effort);
+		ret = apple_pmp_report_gpu_effort(&count, &effort);
 		if (!ret) {
 			seq_printf(s, "gpu_effort_count: %u\n", count);
 			seq_printf(s, "gpu_effort: %#x\n", effort);

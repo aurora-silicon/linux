@@ -47,7 +47,17 @@ void apple_pmp_agx_activity_begin(void);
 void apple_pmp_agx_activity_end(void);
 void apple_pmp_agx_activity_release(void);
 void apple_pmp_agx_activity_resume(void);
+/*
+ * The PMP driver may be a module while this report driver is built in: it
+ * hands over its GPU effort reader once bound and withdraws it before unbind.
+ */
+void apple_pmp_report_set_gpu_effort_reader(int (*read)(u32 *count, u32 *effort));
 #else
+static inline void
+apple_pmp_report_set_gpu_effort_reader(int (*read)(u32 *count, u32 *effort))
+{
+}
+
 static inline int apple_pmp_report_entry_request(const struct device_node *entry,
 						 bool enable)
 {

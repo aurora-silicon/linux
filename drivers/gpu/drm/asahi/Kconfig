@@ -16,6 +16,8 @@ config DRM_ASAHI
 	depends on MMU
 	depends on IOMMU_SUPPORT
 	depends on PAGE_SIZE_16KB
+	# The G17 power ceiling reads the PMP effort: no built-in GPU with a modular PMP.
+	depends on APPLE_PMP || !APPLE_PMP
 	select APPLE_PMP_REPORT
 	select RUST_DRM_SCHED
 	select RUST_DRM_GEM_SHMEM_HELPER
