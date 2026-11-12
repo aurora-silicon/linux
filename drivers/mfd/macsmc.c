@@ -571,10 +571,36 @@ static const struct apple_smc_wake_reason apple_smc_t8132_wake_reasons[] = {
 	{ 40, "acattach" }, { 41, "acdetach" }, { 42, "USB-C_plug" }, { 43, "USB2_plug" },
 	{ 44, "USB2_wake" }, { 45, "aupo" }, { 48, "rtc" }, { }
 };
-#ifdef CONFIG_HIBERNATION
-static struct notifier_block apple_smc_pm_nb;
-static void apple_smc_pm_unregister(void *unused);
-#endif
+
+/*
+ * The kernel that loads a hibernation image binds this driver like any boot
+ * and so holds a live RTKit session with the SMC when it jumps into the image.
+ * The restored kernel then asks the firmware to start again (IOP power INIT)
+ * and waits for a HELLO that a firmware already in a session never sends. So
+ * the loading kernel hands the SMC over quiesced, the state an unbind leaves
+ * it in (apple_smc_rtkit_shutdown()) and from which a wake starts a new
+ * session.
+ */
+static bool apple_smc_loading_image;
+static bool apple_smc_handed_over;
+
+static int apple_smc_pm_notify(struct notifier_block *nb, unsigned long action, void *unused)
+{
+	if (action == PM_RESTORE_PREPARE)
+		apple_smc_loading_image = true;
+	else if (action == PM_POST_RESTORE)
+		apple_smc_loading_image = false;
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block apple_smc_pm_nb = {
+	.notifier_call = apple_smc_pm_notify,
+};
+
+static void apple_smc_pm_unregister(void *unused)
+{
+	unregister_pm_notifier(&apple_smc_pm_nb);
+}
 
 static int apple_smc_probe(struct platform_device *pdev)
 {
@@ -590,15 +616,15 @@ static int apple_smc_probe(struct platform_device *pdev)
 	smc->wake_reasons = of_device_is_compatible(dev->of_node, "apple,t8132-smc") ?
 			    apple_smc_t8132_wake_reasons : apple_smc_t8140_wake_reasons;
 
-#ifdef CONFIG_HIBERNATION
 	/* First, so that a late probe still sees a resume start. */
-	ret = register_pm_notifier(&apple_smc_pm_nb);
-	if (ret)
-		return ret;
-	ret = devm_add_action_or_reset(dev, apple_smc_pm_unregister, NULL);
-	if (ret)
-		return ret;
-#endif
+	if (IS_ENABLED(CONFIG_HIBERNATION)) {
+		ret = register_pm_notifier(&apple_smc_pm_nb);
+		if (ret)
+			return ret;
+		ret = devm_add_action_or_reset(dev, apple_smc_pm_unregister, NULL);
+		if (ret)
+			return ret;
+	}
 
 	mutex_init(&smc->mutex);
 	spin_lock_init(&smc->lock);
@@ -692,38 +718,7 @@ static int apple_smc_probe(struct platform_device *pdev)
 					       ARRAY_SIZE(apple_smc_t6050_described_devs));
 }
 
-#ifdef CONFIG_HIBERNATION
-/*
- * The kernel that loads a hibernation image binds this driver like any boot
- * and so holds a live RTKit session with the SMC when it jumps into the image.
- * The restored kernel then asks the firmware to start again (IOP power INIT)
- * and waits for a HELLO that a firmware already in a session never sends. So
- * the loading kernel hands the SMC over quiesced, the state an unbind leaves
- * it in (apple_smc_rtkit_shutdown()) and from which a wake starts a new
- * session.
- */
-static bool apple_smc_loading_image;
-static bool apple_smc_handed_over;
-
-static int apple_smc_pm_notify(struct notifier_block *nb, unsigned long action, void *unused)
-{
-	if (action == PM_RESTORE_PREPARE)
-		apple_smc_loading_image = true;
-	else if (action == PM_POST_RESTORE)
-		apple_smc_loading_image = false;
-	return NOTIFY_DONE;
-}
-
-static struct notifier_block apple_smc_pm_nb = {
-	.notifier_call = apple_smc_pm_notify,
-};
-
 static int apple_smc_restore(struct device *dev);
-
-static void apple_smc_pm_unregister(void *unused)
-{
-	unregister_pm_notifier(&apple_smc_pm_nb);
-}
 
 static int apple_smc_freeze(struct device *dev)
 {
@@ -852,7 +847,6 @@ static int apple_smc_restore(struct device *dev)
 
 	return 0;
 }
-#endif /* CONFIG_HIBERNATION */
 
 static const struct of_device_id apple_smc_of_match[] = {
 	{ .compatible = "apple,t8152-smc" },
@@ -1233,12 +1227,10 @@ static int apple_smc_resume_noirq(struct device *dev)
 static const struct dev_pm_ops apple_smc_pm_ops = {
 	.prepare = pm_sleep_ptr(apple_smc_prepare),
 	.complete = pm_sleep_ptr(apple_smc_complete),
-#ifdef CONFIG_HIBERNATION
-	.freeze = apple_smc_freeze,
-	.thaw = apple_smc_thaw,
-	.poweroff = apple_smc_freeze,
-	.restore = apple_smc_restore,
-#endif
+	.freeze = pm_sleep_ptr(apple_smc_freeze),
+	.thaw = pm_sleep_ptr(apple_smc_thaw),
+	.poweroff = pm_sleep_ptr(apple_smc_freeze),
+	.restore = pm_sleep_ptr(apple_smc_restore),
 	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_smc_suspend_noirq, apple_smc_resume_noirq)
 };
 
