@@ -538,6 +538,7 @@ impl Pair {
             ray_query: *ray_query,
             resources: &resources,
             ordinal,
+            pair_idle: self.active.len() == 0,
             ta: abi::RenderStage {
                 qid: qids[0],
                 descriptor_va: self.memory.graph.descriptor_client(0, ordinal)?,
