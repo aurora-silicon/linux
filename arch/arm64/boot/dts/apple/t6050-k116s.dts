@@ -888,3 +888,18 @@
  * both. Everything stays disabled until the loader has reserved the firmware.
  */
 #include "t6050-j716c-isp.dtsi"
+
+/*
+ * Two things the shared T6050 files now turn on for every board are held back here until
+ * they have been tried on the K116s: the CPU PMU (t6050-base.dtsi, measured on the J714s)
+ * and the CLPC's SMC link (t6050-die0.dtsi), through which the low-power platform profile
+ * polls the package power. Without the link that profile has only its frequency ceiling.
+ * To try them, remove this block.
+ */
+&cpu_pmu {
+	status = "disabled";
+};
+
+&clpc {
+	/delete-property/ apple,smc;
+};
