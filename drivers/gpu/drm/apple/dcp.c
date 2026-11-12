@@ -9456,7 +9456,8 @@ static int dcp_t6041_s2r_stop(struct apple_dcp *dcp)
 	/*
 	 * An external firmware that did not come back from an earlier sleep, or that crashed,
 	 * has nothing left to quiesce, and must not refuse every later sleep: its CPU off
-	 * again, nothing else. The wake tries to start it once more.
+	 * again, nothing else. The wake starts a crashed one once more; one given up on
+	 * stays stopped.
 	 */
 	if (dcp_desktop_external(dcp) && !IS_ERR_OR_NULL(dcp->rtk) &&
 	    (READ_ONCE(dcp->ext_dead) || READ_ONCE(dcp->crashed))) {
@@ -9546,6 +9547,16 @@ static void dcp_t6041_s2r_resume(struct apple_dcp *dcp)
 
 	if (!dcp_t6041_s2r_domains_on(dcp)) {
 #ifdef CONFIG_PM_SLEEP
+		/*
+		 * Given up on before this sleep: its messages are dropped until the reboot
+		 * (dcp_recv_msg()), so a firmware started now could not be talked to. Its
+		 * domains are up, which the stop of the next sleep needs to reach its
+		 * registers, and its CPU stays stopped.
+		 */
+		if (READ_ONCE(dcp->ext_dead)) {
+			dcp_hib_ext_put(dcp, true, true);
+			return;
+		}
 		if (!dcp_desktop_external(dcp)) {
 			/* The internal scanout/display DART streams back first. */
 			dcp_s2r_find_darts(dcp);
