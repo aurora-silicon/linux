@@ -265,8 +265,13 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	p->coded_cap = max_t(u32, p->coded_cap, AVE_CODED_MIN);
 	if (ctx->ave->layout->counted &&
 	    (p->fps_num != 30ULL * p->fps_den ||
-	     (!p->bframes && (p->codec == AVE_CODEC_HEVC || (!baseline && !p->intra_only)))))
+	     (!p->bframes && (p->codec == AVE_CODEC_HEVC || (!baseline && !p->intra_only))))) {
+		dev_info(ctx->ave->dev,
+			 "%s layout: only 30 fps with 3 B-frames is qualified (asked %u/%u fps, %s B-frames)\n",
+			 ctx->ave->layout->name, p->fps_num, p->fps_den,
+			 p->bframes ? "with" : "no");
 		return -EOPNOTSUPP;
+	}
 	return 0;
 }
 
