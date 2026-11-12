@@ -1124,3 +1124,8 @@
 
 /* Isolate newly active MTP DART from the inventory additions. */
 &{/soc/iommu@294800000} { status = "disabled"; };
+
+#include "t6050-j775c-incremental-remaining-nogpu.dtsi"
+
+/* Keep isolated MTP activation failure disabled after later migrations. */
+&{/soc/iommu@294800000} { status = "disabled"; };

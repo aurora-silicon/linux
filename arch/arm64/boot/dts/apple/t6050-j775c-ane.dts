@@ -27,3 +27,8 @@
 &ane {
 	status = "okay";
 };
+
+/* Retain ANE_SYS suppliers when explicitly enabling these DARTs. */
+&ane_dart0 { power-domains = <&ps_ane_sys>; };
+&ane_dart1 { power-domains = <&ps_ane_sys>; };
+&ane_dart2 { power-domains = <&ps_ane_sys>; };
