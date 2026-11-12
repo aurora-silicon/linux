@@ -3658,6 +3658,24 @@ int tipd_suspend(struct tps6598x *tps)
 }
 EXPORT_SYMBOL_GPL(tipd_suspend);
 
+/* Give back what tipd_suspend() took: the interrupt, the reset line, the poll. */
+static void tipd_resume_events(struct tps6598x *tps)
+{
+	if (tps->wakeup) {
+		if (!tps->sleep_event) {
+			disable_irq_wake(tps->irq);
+			enable_irq(tps->irq);
+		}
+	} else if (tps->reset) {
+		gpiod_set_value_cansleep(tps->reset, 0);
+		msleep(TPS_SETUP_MS);
+	}
+
+	if (!tps->irq)
+		queue_delayed_work(system_power_efficient_wq, &tps->wq_poll,
+				   msecs_to_jiffies(POLL_INTERVAL));
+}
+
 int tipd_resume(struct tps6598x *tps)
 {
 	int ret;
@@ -3675,19 +3693,7 @@ int tipd_resume(struct tps6598x *tps)
 			return ret;
 	}
 
-	if (tps->wakeup) {
-		if (!tps->sleep_event) {
-			disable_irq_wake(tps->irq);
-			enable_irq(tps->irq);
-		}
-	} else if (tps->reset) {
-		gpiod_set_value_cansleep(tps->reset, 0);
-		msleep(TPS_SETUP_MS);
-	}
-
-	if (!tps->irq)
-		queue_delayed_work(system_power_efficient_wq, &tps->wq_poll,
-				   msecs_to_jiffies(POLL_INTERVAL));
+	tipd_resume_events(tps);
 
 	return 0;
 }
@@ -3697,8 +3703,9 @@ EXPORT_SYMBOL_GPL(tipd_resume);
  * Bring a controller that went through a cold boot (a resume from disk) back
  * to the state its probe leaves it in, without registering anything again:
  * system power state S0, application firmware running (patch loaded if it
- * waits for one) and the interrupt mask the driver uses. The port state is
- * read afresh by the revalidation that follows.
+ * waits for one) and the interrupt mask the driver uses. The image was made
+ * after tipd_suspend(), so what that took is given back as in tipd_resume().
+ * The port state is read afresh by the revalidation that follows.
  */
 int tipd_reinit_after_cold_boot(struct tps6598x *tps)
 {
@@ -3717,7 +3724,13 @@ int tipd_reinit_after_cold_boot(struct tps6598x *tps)
 		if (ret)
 			return ret;
 	}
-	return tps6598x_write64(tps, TPS_REG_INT_MASK1, cd321x_irq_mask(tps));
+	ret = tps6598x_write64(tps, TPS_REG_INT_MASK1, cd321x_irq_mask(tps));
+	if (ret)
+		return ret;
+
+	tipd_resume_events(tps);
+
+	return 0;
 }
 EXPORT_SYMBOL_GPL(tipd_reinit_after_cold_boot);
 
