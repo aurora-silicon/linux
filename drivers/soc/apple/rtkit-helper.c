@@ -591,7 +591,6 @@ static int __maybe_unused apple_rtkit_helper_resume(struct device *dev)
 	return 0;
 }
 
-#ifdef CONFIG_HIBERNATION
 /*
  * What the boot kernel of a resume from disk leaves for the restored kernel
  * about a session it started itself: the shared buffers the firmware holds.
@@ -791,15 +790,6 @@ static int apple_rtkit_helper_restore(struct device *dev)
 		count);
 	return 0;
 }
-#else
-static int __maybe_unused apple_rtkit_helper_freeze(struct device *dev)
-{
-	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
-
-	/* A hibernation image cannot recreate the firmware's live DMA ownership. */
-	return helper->adopted ? -EBUSY : 0;
-}
-#endif
 
 static const struct dev_pm_ops apple_rtkit_helper_pm_ops = {
 	.prepare = pm_sleep_ptr(apple_rtkit_helper_prepare),
@@ -808,10 +798,8 @@ static const struct dev_pm_ops apple_rtkit_helper_pm_ops = {
 	.resume = pm_sleep_ptr(apple_rtkit_helper_resume),
 	.freeze = pm_sleep_ptr(apple_rtkit_helper_freeze),
 	.poweroff = pm_sleep_ptr(apple_rtkit_helper_freeze),
-#ifdef CONFIG_HIBERNATION
-	.thaw = apple_rtkit_helper_thaw,
-	.restore = apple_rtkit_helper_restore,
-#endif
+	.thaw = pm_sleep_ptr(apple_rtkit_helper_thaw),
+	.restore = pm_sleep_ptr(apple_rtkit_helper_restore),
 };
 
 static const struct of_device_id apple_rtkit_helper_of_match[] = {
