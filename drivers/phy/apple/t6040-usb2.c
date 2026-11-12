@@ -3807,9 +3807,27 @@ static int t6040_usb2_resume_early(struct device *dev)
 	return 0;
 }
 
+/*
+ * A sleep that is abandoned while devices still suspend has no early phase,
+ * and the host's resume brings a port that went down for it back all the
+ * same. This runs before that resume, the PHY being its supplier: DP waits
+ * from here. After any other sleep it finds what the early phase left.
+ */
+static int t6040_usb2_resume(struct device *dev)
+{
+	struct t6040_usb2_phy *tphy = dev_get_drvdata(dev);
+
+	if (!tphy)
+		return 0;
+	guard(mutex)(&tphy->lock);
+	WRITE_ONCE(tphy->sleep_back, tphy->sleep_down);
+	return 0;
+}
+
 static const struct dev_pm_ops t6040_usb2_pm_ops = {
 	.suspend = t6040_usb2_suspend,
 	.resume_early = t6040_usb2_resume_early,
+	.resume = t6040_usb2_resume,
 	.freeze = t6040_usb2_freeze,
 	.poweroff = t6040_usb2_poweroff,
 #ifdef CONFIG_HIBERNATION
