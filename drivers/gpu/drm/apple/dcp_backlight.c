@@ -421,6 +421,18 @@ int dcp_backlight_dpms(struct apple_dcp *dcp, bool on)
 	return ret;
 }
 
+/* The panel is not blanked, powered down or asleep. */
+bool dcp_backlight_lit(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+	bool lit;
+
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	lit = dcp_bl_lit(&dcp->backlight.state);
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+	return lit;
+}
+
 int dcp_backlight_prepare(struct apple_dcp *dcp, bool have_surface,
 			  struct dcp_backlight_present *present)
 {

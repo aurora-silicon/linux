@@ -4683,6 +4683,7 @@ void dcp_poweroff(struct platform_device *pdev)
 	}
 
 	cancel_delayed_work(&dcp->swap_watchdog_wq);
+	dcp_camind_lost(dcp);
 
 	/*
 	 * Internal H17P DPMS is a brightness present, never a pipe stop. With hw.s2r the
@@ -8559,6 +8560,9 @@ static int dcp_platform_suspend(struct device *dev)
 	/* Its power sequences may crash the DCP and blank the panel. */
 	if (dcp_takeover_was_aborted(dcp))
 		return -EBUSY;
+
+	/* The panel goes dark: the camera may not count on the indicator. */
+	dcp_camind_lost(dcp);
 
 	/* A firmware start from the last resume finishes first; this sleep stops it again. */
 	flush_work(&dcp->s2r_prewarm_work);
