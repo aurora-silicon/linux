@@ -61,29 +61,25 @@ static void dwc3_apple_role_while_kept_test(struct kunit *test)
 /* A fixed hub's host may always be kept; a Type-C port's only by a PHY that restarts it. */
 static void dwc3_apple_sleep_may_keep_test(struct kunit *test)
 {
-	/* fixed hub (T8140): as before, whatever the Type-C parameter says */
-	KUNIT_EXPECT_TRUE(test, dwc3_apple_sleep_may_keep(true, false, true, DWC3_APPLE_HOST,
+	/* fixed hub (T8140) */
+	KUNIT_EXPECT_TRUE(test, dwc3_apple_sleep_may_keep(true, false, DWC3_APPLE_HOST,
 							  false, false));
-	KUNIT_EXPECT_TRUE(test, dwc3_apple_sleep_may_keep(true, false, false, DWC3_APPLE_HOST,
+	/* Type-C port with the T6040 PHY, in host mode */
+	KUNIT_EXPECT_TRUE(test, dwc3_apple_sleep_may_keep(false, true, DWC3_APPLE_HOST,
 							  false, false));
-	/* Type-C port with the T6040 PHY, in host mode: kept unless switched off */
-	KUNIT_EXPECT_TRUE(test, dwc3_apple_sleep_may_keep(false, true, true, DWC3_APPLE_HOST,
-							  false, false));
-	KUNIT_EXPECT_FALSE(test, dwc3_apple_sleep_may_keep(false, true, false, DWC3_APPLE_HOST,
-							   false, false));
 	/* any other Type-C port stops */
-	KUNIT_EXPECT_FALSE(test, dwc3_apple_sleep_may_keep(false, false, true, DWC3_APPLE_HOST,
+	KUNIT_EXPECT_FALSE(test, dwc3_apple_sleep_may_keep(false, false, DWC3_APPLE_HOST,
 							   false, false));
 	/* no host, no core, a glue that goes away, a core that didn't come back */
-	KUNIT_EXPECT_FALSE(test, dwc3_apple_sleep_may_keep(false, true, true, DWC3_APPLE_NO_CABLE,
+	KUNIT_EXPECT_FALSE(test, dwc3_apple_sleep_may_keep(false, true, DWC3_APPLE_NO_CABLE,
 							   false, false));
-	KUNIT_EXPECT_FALSE(test, dwc3_apple_sleep_may_keep(false, true, true,
+	KUNIT_EXPECT_FALSE(test, dwc3_apple_sleep_may_keep(false, true,
 							   DWC3_APPLE_PROBE_PENDING, false, false));
-	KUNIT_EXPECT_FALSE(test, dwc3_apple_sleep_may_keep(false, true, true, DWC3_APPLE_DEVICE,
+	KUNIT_EXPECT_FALSE(test, dwc3_apple_sleep_may_keep(false, true, DWC3_APPLE_DEVICE,
 							   false, false));
-	KUNIT_EXPECT_FALSE(test, dwc3_apple_sleep_may_keep(false, true, true, DWC3_APPLE_HOST,
+	KUNIT_EXPECT_FALSE(test, dwc3_apple_sleep_may_keep(false, true, DWC3_APPLE_HOST,
 							   true, false));
-	KUNIT_EXPECT_FALSE(test, dwc3_apple_sleep_may_keep(true, false, true, DWC3_APPLE_HOST,
+	KUNIT_EXPECT_FALSE(test, dwc3_apple_sleep_may_keep(true, false, DWC3_APPLE_HOST,
 							   false, true));
 }
 
