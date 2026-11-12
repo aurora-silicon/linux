@@ -458,6 +458,9 @@ macro_rules! dev_err { ($($a:tt)*) => {{}}; }
 macro_rules! dev_warn { ($($a:tt)*) => {{}}; }
 macro_rules! dev_dbg { ($($a:tt)*) => {{}}; }
 macro_rules! dev_info { ($($a:tt)*) => {{}}; }
+macro_rules! dev_err_ratelimited { ($($a:tt)*) => {{}}; }
+macro_rules! dev_warn_ratelimited { ($($a:tt)*) => {{}}; }
+macro_rules! dev_info_ratelimited { ($($a:tt)*) => {{}}; }
 extern "C" {
     fn fixture(); fn parameter(which: i32, value: i32); fn counter(which: i32) -> i32;
     fn device_pointer() -> *mut c_void; fn mbox_pointer() -> *mut c_void;
