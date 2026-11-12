@@ -1606,13 +1606,47 @@ static void host_setup_commands(struct centauri_t6050_wifi *wifi)
 	}
 }
 
+/*
+ * The status of a failed join, from the firmware's AciWifiErrorCodeEnum (its
+ * names are in the enum table of the firmware image's "_wcl" section): 1-99
+ * is the 802.11 reason code of a deauthentication, 100-299 is 100 plus the
+ * 802.11 status code of the AP's authentication or association response, and
+ * from 300 on the firmware's own: among them the step that got no answer
+ * (Timeout...), or that it gave up for a poor link (BadRfConditions...).
+ */
+#define JOIN_STATUS_AP 100
+#define JOIN_STATUS_INTERNAL 300
+#define JOIN_TIMEOUT_PROBE 305
+#define JOIN_TIMEOUT_AUTH 306
+#define JOIN_TIMEOUT_ASSOC 308
+#define JOIN_BAD_RF_PROBE 352
+#define JOIN_BAD_RF_AUTH 353
+#define JOIN_BAD_RF_ASSOC 355
+
+/* The step a join stopped at without an answer from the AP, or -1. */
+static int join_timeout(u16 status)
+{
+	switch (status) {
+	case JOIN_TIMEOUT_PROBE:
+	case JOIN_BAD_RF_PROBE:
+		return NL80211_TIMEOUT_SCAN;
+	case JOIN_TIMEOUT_AUTH:
+	case JOIN_BAD_RF_AUTH:
+		return NL80211_TIMEOUT_AUTH;
+	case JOIN_TIMEOUT_ASSOC:
+	case JOIN_BAD_RF_ASSOC:
+		return NL80211_TIMEOUT_ASSOC;
+	}
+	return -1;
+}
+
 static void connect_worker(struct work_struct *work)
 {
 	struct centauri_t6050_wifi *wifi =
 		container_of(work, struct centauri_t6050_wifi, connect_work);
 	unsigned long deadline;
 	u16 slot, status;
-	int ret;
+	int ret, timeout = -1;
 
 	mutex_lock(&wifi->lock);
 	if (READ_ONCE(wifi->connect_abort) || READ_ONCE(wifi->stopping)) {
@@ -1654,9 +1688,16 @@ static void connect_worker(struct work_struct *work)
 		dev_warn(&wifi->control->pdev->dev,
 			 "Wi-Fi connect to %pM failed: firmware status %u\n",
 			 wifi->bssid, wifi->connect_status);
-	status = !ret && wifi->connect_status == 0 ?
-			 WLAN_STATUS_SUCCESS :
-			 WLAN_STATUS_UNSPECIFIED_FAILURE;
+	status = WLAN_STATUS_UNSPECIFIED_FAILURE;
+	if (!ret && !wifi->connect_status) {
+		status = WLAN_STATUS_SUCCESS;
+	} else if (!ret) {
+		/* The AP's own status code, or the step it did not answer. */
+		if (wifi->connect_status > JOIN_STATUS_AP &&
+		    wifi->connect_status < JOIN_STATUS_INTERNAL)
+			status = wifi->connect_status - JOIN_STATUS_AP;
+		timeout = join_timeout(wifi->connect_status);
+	}
 	wifi->connecting = false;
 	wifi->connected = status == WLAN_STATUS_SUCCESS;
 	wifi->station_signal_valid = false;
@@ -1671,10 +1712,11 @@ static void connect_worker(struct work_struct *work)
 					 slot * BUFFER_SIZE,
 				 BUFFER_SIZE);
 
-	if (ret == -ECANCELED || ret == -ETIMEDOUT)
+	if (ret == -ECANCELED || ret == -ETIMEDOUT || timeout >= 0)
 		cfg80211_connect_timeout(wifi->netdev, wifi->bssid,
 					 wifi->request_ie,
 					 wifi->request_ie_size, GFP_KERNEL,
+					 timeout >= 0 ? timeout :
 					 NL80211_TIMEOUT_UNSPECIFIED);
 	else
 		cfg80211_connect_bss(wifi->netdev, wifi->bssid,
