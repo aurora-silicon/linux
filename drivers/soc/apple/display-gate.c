@@ -78,11 +78,12 @@
  * driver of its own, t6041-display-gate.c, by Ryan Murray and František
  * Balázsy.
  *
- * On the M4 Max (J616c, apple,t6041) the PMP never runs: iBoot leaves the
- * external chains powered and the boot loader fills each external display
- * processor's firmware memory. The gate enables a chain once its processor has
- * that memory, before any device exists (see gate_t6041_max_run()), and never
- * touches the internal display.
+ * On the M4 Max (J614c and J616c, apple,t6041) the internal display is
+ * handed over and enabled as on the M4 Pro. The PMP never runs there: iBoot
+ * leaves the external chains powered and the boot loader fills each external
+ * display processor's firmware memory. The gate enables a chain once its
+ * processor has that memory and the display subsystem is enabled, before any
+ * device exists (see gate_t6041_max_run()).
  */
 
 #define pr_fmt(fmt) fmt
@@ -336,11 +337,17 @@ static const struct gate_soc gate_t6041 __initconst = {
 
 static void __init gate_t6041_max_run(void);
 
-/* T6041 (M4 Max): no PMP; the external chains follow the boot loader's firmware memory. */
+/*
+ * T6041 (M4 Max): the M4 Pro's internal display handoff; no PMP, so the
+ * external chains follow the boot loader's firmware memory.
+ */
 static const struct gate_soc gate_t6041_max __initconst = {
 	.machine = "apple,t6041",
 	.prefix = "apple-t6041-display: ",
 	.name = "T6041",
+	.dcp_compat = "apple,t6041-dcp",
+	.display_compat = "apple,display-subsystem",
+	.marker = "apple,t6041-handoff",
 	.run = gate_t6041_max_run,
 };
 
@@ -2275,10 +2282,50 @@ static const char *const t6041_usbc_nodes[] = {
 	"/dcp@602e00000",
 };
 
+static bool staged_is_route_path(const char *path)
+{
+	return strstr(path, "/typec-routes/");
+}
+
+enum { STAGED_HDMI, STAGED_USBC };
+
 static const struct gate_staged t6041_stages[] = {
-	{ "/iommu@3a2300000", t6041_hdmi_nodes, ARRAY_SIZE(t6041_hdmi_nodes) },
-	{ "/iommu@602300000", t6041_usbc_nodes, ARRAY_SIZE(t6041_usbc_nodes) },
+	[STAGED_HDMI] = { "/iommu@3a2300000", t6041_hdmi_nodes, ARRAY_SIZE(t6041_hdmi_nodes) },
+	[STAGED_USBC] = { "/iommu@602300000", t6041_usbc_nodes, ARRAY_SIZE(t6041_usbc_nodes) },
 };
+
+/*
+ * The chains this boot enables: each one whose processor the boot loader gave
+ * firmware memory. The loader hands the processors over separately (the
+ * J614s ADT has no dcpext0: its HDMI processor is dcpext2, so only dcpext1
+ * is handed over), so one missing processor must not keep the other off.
+ * Set once by gate_t6041_staged().
+ */
+static unsigned long staged_on;
+
+static bool staged_stage_on(unsigned int i)
+{
+	return test_bit(i, &staged_on);
+}
+
+/*
+ * dcpext0's Type-C routes (the HDMI processor's hybrid DP outputs) switch the
+ * Type-C crossbars, which are the USB-C chain's. Without that chain they stay
+ * disabled and dcpext0 drives HDMI only; the crossbars are enabled for it,
+ * as its mux-controls name them.
+ */
+static const char *const t6041_hdmi_only_muxes[] = {
+	"/mux@38324c000",
+	"/mux@38b24c000",
+	"/mux@39324c000",
+};
+
+static bool staged_path_on(unsigned int i, const char *path)
+{
+	if (!staged_stage_on(i))
+		return false;
+	return !(i == STAGED_HDMI && staged_is_route_path(path) && !staged_stage_on(STAGED_USBC));
+}
 
 /* A display processor (a direct child of the root) and a Type-C display route. */
 static bool staged_is_dcp(const char *path)
@@ -2381,6 +2428,12 @@ static int staged_apply(const struct gate_staged *st, struct device_node *displa
 		ret = np ? of_changeset_update_prop_string(cs, np, "status", "okay") : -ENODEV;
 		of_node_put(np);
 	}
+	for (i = 0; !ret && st == &t6041_stages[STAGED_HDMI] && !staged_stage_on(STAGED_USBC) &&
+		    i < ARRAY_SIZE(t6041_hdmi_only_muxes); i++) {
+		np = of_find_node_by_path(t6041_hdmi_only_muxes[i]);
+		ret = np ? of_changeset_update_prop_string(cs, np, "status", "okay") : -ENODEV;
+		of_node_put(np);
+	}
 	if (!ret)
 		ret = of_changeset_apply(cs);
 	if (ret) {
@@ -2445,6 +2498,8 @@ static int staged_set(struct device_node *display, bool dcps, const char *dcp_st
 			const char *path = t6041_stages[i].nodes[j];
 
 			if (!(dcps && staged_is_dcp(path)) && !(routes && staged_is_route(path)))
+				continue;
+			if (!staged_path_on(i, path))
 				continue;
 			np = of_find_node_by_path(path);
 			if (np && staged_is_route(path) && route_status &&
@@ -2539,6 +2594,10 @@ static void __init staged_hold_port_controllers(void)
 {
 	struct device_node *route, *routes, *dcp, *ctrl;
 	unsigned int i, k;
+
+	/* Only dcpext1's routes are held for; without its chain nothing waits. */
+	if (!staged_stage_on(STAGED_USBC))
+		return;
 
 	for (i = 0; i < ARRAY_SIZE(t6041_usbc_nodes); i++) {
 		if (!staged_is_route(t6041_usbc_nodes[i]))
@@ -2759,7 +2818,7 @@ static const char *staged_unbound_infra(void)
 	unsigned int i, j;
 
 	for (i = 0; i < ARRAY_SIZE(t6041_stages); i++)
-		for (j = 0; j < t6041_stages[i].nr; j++) {
+		for (j = 0; staged_stage_on(i) && j < t6041_stages[i].nr; j++) {
 			const char *path = t6041_stages[i].nodes[j];
 			struct device_node *np;
 			struct device *dev;
@@ -2811,6 +2870,8 @@ static void staged_power_up(struct work_struct *work)
 	mutex_unlock(&staged_lock);
 
 	for (i = 0; !ret && i < ARRAY_SIZE(t6041_stages); i++) {
+		if (!staged_stage_on(i))
+			continue;
 		ret = staged_apply(&t6041_stages[i], staged_display);
 		if (!ret)
 			staged_info("stage %u enabled\n", i);
@@ -2922,10 +2983,20 @@ static void __init gate_t6041_staged(void)
 
 	staged_prefix = gate_soc->prefix;
 
-	/* Everything must be there and disabled, with firmware memory, before anything is changed. */
+	/*
+	 * Each chain must be all there and disabled, with firmware memory,
+	 * before anything of it is changed; a chain that is not stays as it is
+	 * and does not keep the other one off.
+	 */
 	for (i = 0; i < ARRAY_SIZE(t6041_stages); i++)
-		if (!staged_ready(&t6041_stages[i]))
-			return;
+		if (staged_ready(&t6041_stages[i]))
+			__set_bit(i, &staged_on);
+	if (!staged_on)
+		return;
+	if (!staged_stage_on(STAGED_USBC))
+		staged_info("Type-C chain not handed over: HDMI only, dcpext0 Type-C routes stay disabled\n");
+	else if (!staged_stage_on(STAGED_HDMI))
+		staged_info("HDMI chain not handed over: Type-C displays only\n");
 	staged_display = of_find_node_by_path("/display-subsystem");
 	staged_pmp = of_find_node_by_path("/pmp@500700000");
 	if (!staged_display || !staged_pmp || !of_device_is_available(staged_display) ||
@@ -2937,7 +3008,8 @@ static void __init gate_t6041_staged(void)
 	for (i = 0; i < ARRAY_SIZE(t6041_stages); i++) {
 		const struct gate_staged *st = &t6041_stages[i];
 
-		staged_dcps[i] = of_find_node_by_path(st->nodes[st->nr - 1]);
+		if (staged_stage_on(i))
+			staged_dcps[i] = of_find_node_by_path(st->nodes[st->nr - 1]);
 	}
 
 	/* No device exists yet: routes on, display subsystem held back until the power-up. */
@@ -2986,8 +3058,10 @@ static const char *const t6041_max_hdmi_nodes[] = {
 };
 
 static const char *const t6041_max_usbc_nodes[] = {
-	/* ATC1 mailbox and crossbar, DARTs, mailbox, route, dcpext1 */
-	"/mailbox@38b148000",
+	/*
+	 * ATC1 crossbar, DARTs, mailbox, route, dcpext1. The ATC1 mailbox is
+	 * the PHY's, on for USB3 whatever the display does, as on the M4 Pro.
+	 */
 	"/mux@38b24c000",
 	"/iommu@602340000",
 	"/iommu@602300000",
@@ -3001,13 +3075,29 @@ static const struct gate_staged t6041_max_stages[] = {
 	{ "/iommu@602300000", t6041_max_usbc_nodes, ARRAY_SIZE(t6041_max_usbc_nodes) },
 };
 
+/*
+ * The J575c's typec1 chain. That port is also a USB3 port, so its device tree
+ * enables the ATC1 PHY's coprocessor mailbox, as the M4 Pro boards do: the
+ * mailbox is not part of the chain here, and the rest is the J616c's.
+ */
+static const struct gate_staged t6041_j575c_usbc = {
+	"/iommu@602300000", t6041_max_usbc_nodes, ARRAY_SIZE(t6041_max_usbc_nodes),
+};
+
+static const struct gate_staged *t6041_max_stage(unsigned int i)
+{
+	if (i == 1 && of_machine_is_compatible("apple,j575c"))
+		return &t6041_j575c_usbc;
+	return &t6041_max_stages[i];
+}
+
 /* Applied, they stay: the live tree refers to them. Only the KUnit test reverts them. */
 static struct of_changeset t6041_max_cs[ARRAY_SIZE(t6041_max_stages)];
 
 /* Enable every node of stage @i and put its display DART into the display subsystem's iommus. */
 static int __init t6041_max_apply(unsigned int i, struct device_node *display)
 {
-	const struct gate_staged *st = &t6041_max_stages[i];
+	const struct gate_staged *st = t6041_max_stage(i);
 	struct of_changeset *cs = &t6041_max_cs[i];
 	struct device_node *np;
 	unsigned int n;
@@ -3030,12 +3120,13 @@ static int __init t6041_max_apply(unsigned int i, struct device_node *display)
 }
 
 /*
- * Each chain is enabled in one changeset, once its processor has firmware
- * memory. A chain that has none, or is not all there and disabled (a boot
- * loader that enabled it itself), stays as it is, and the other chain does not
- * depend on it. The display subsystem only gains the DART of an enabled chain:
- * its status is never written, so the internal display stays as the boot
- * loader left it whatever happens here.
+ * The internal display first, as on the M4 Pro: an accepted handoff enables
+ * the display subsystem with the DCP. Then each external chain is enabled in
+ * one changeset, once its processor has firmware memory. A chain that has
+ * none, or is not all there and disabled (a boot loader that enabled it
+ * itself), stays as it is, and the other chain does not depend on it. The
+ * chains need the display subsystem enabled, by the handoff or by the boot
+ * loader, and only add their DARTs to it: its status is not written here.
  */
 static void __init gate_t6041_max_run(void)
 {
@@ -3046,15 +3137,20 @@ static void __init gate_t6041_max_run(void)
 	if (IS_ENABLED(CONFIG_VIDEO) && video_firmware_drivers_only())
 		return;
 
+	gate_t6041_internal();
 	staged_prefix = gate_soc->prefix;
 	display = of_find_node_by_path("/display-subsystem");
-	if (!display || !of_device_is_available(display)) {
+	if (!display) {
 		staged_err("no display subsystem, nothing enabled\n");
+		return;
+	}
+	if (!of_device_is_available(display)) {
+		staged_info("display subsystem not enabled, external displays left off\n");
 		of_node_put(display);
 		return;
 	}
 	for (i = 0; i < ARRAY_SIZE(t6041_max_stages); i++) {
-		const struct gate_staged *st = &t6041_max_stages[i];
+		const struct gate_staged *st = t6041_max_stage(i);
 		const char *dcp = st->nodes[st->nr - 1];
 
 		if (!staged_ready(st))

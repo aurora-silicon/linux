@@ -159,6 +159,9 @@ struct apple_pmp_report {
 	/* Requests held until the PMP runs; T6030 does not defer them. */
 	u64 shadow, known;
 	bool defer;
+	/* Firmware-driven sleep: the request word at its start, the DVFS words kept. */
+	u64 sleep_request;
+	u64 *dvfs_shadow;
 	unsigned int polls;
 	struct delayed_work ready_work;
 	struct apple_pmp_ane ane;
@@ -199,6 +202,7 @@ struct apple_pmp_report_entry {
 	bool no_ack, dvfs, removed;
 	bool sleep_release, released;
 	u32 dvfs_entry;
+	u64 dvfs_off;
 	u64 dvfs_on;
 };
 #define PMP_DVFS_VALID BIT_ULL(61)
@@ -627,6 +631,11 @@ static void *devm_kzalloc(struct device *d, size_t n, int g)
 	allocations[allocation_count++] = v;
 	return v;
 }
+
+static void *devm_kcalloc(struct device *d, size_t n, size_t size, int g)
+{
+	return devm_kzalloc(d, n * size, g);
+}
 #define kzalloc_obj(v) calloc(1, sizeof(v))
 #define kfree free
 static char *kstrdup(const char *s, int g)
@@ -739,6 +748,17 @@ static const struct apple_pmp_start_ops apple_pmp_start_hw_ops = { hw_check,
 								   hw_bound };
 static const struct apple_pmp_start_timing apple_pmp_start_timing = { 2, 0, 2,
 								      2 };
+/* The extracted probe compares rep->offsets with the T6001 table and tells the AGX vote that a report came back. This harness has neither: the table is empty and
+ * never matches, and the call does nothing. */
+static const struct apple_pmp_report_offsets apple_pmp_offsets_t600x;
+static void apple_pmp_agx_activity_resume(void) {}
+/* Floor admission is covered independently by the J613 fixture. */
+static int j613_floor_probe(struct apple_pmp_report *rep)
+{
+	(void)rep;
+	return 0;
+}
+
 #include "production.h"
 #if HOST_HAS_DRAM
 static int devm_device_add_group(struct device *dev, const struct attribute_group *group)

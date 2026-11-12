@@ -171,6 +171,15 @@ static int hwmon_thermal_get_temp(struct thermal_zone_device *tz, int *temp)
 
 	ret = hwdev->chip->ops->read(tdata->dev, hwmon_temp, hwmon_temp_input,
 				     tdata->index, &t);
+	/*
+	 * -ENODATA: the sensor has no reading right now (for example it is
+	 * powered down). Let the zone skip this update and keep polling,
+	 * instead of backing off and eventually disabling it as broken.
+	 */
+	if (ret == -ENODATA) {
+		*temp = THERMAL_TEMP_INVALID;
+		return 0;
+	}
 	if (ret < 0)
 		return ret;
 
@@ -245,8 +254,8 @@ static int hwmon_thermal_add_sensor(struct device *dev, int index)
 	if (IS_ERR(tzd)) {
 		if (PTR_ERR(tzd) != -ENODEV)
 			return PTR_ERR(tzd);
-		dev_info(dev, "temp%d_input not attached to any thermal zone\n",
-			 index + 1);
+		dev_dbg(dev, "temp%d_input not attached to any thermal zone\n",
+			index + 1);
 		devm_kfree(dev, tdata);
 		return 0;
 	}

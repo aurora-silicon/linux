@@ -12,7 +12,8 @@ config VIDEO_APPLE_AVE
 	  Apple T8140 (A18 Pro) SoCs, as in the MacBook Neo.
 	  T6000 (M1 Pro) and T8112 (M2) support lifecycle-only validation
 	  of firmware 6070.11.1 through debugfs; encoding stays disabled.
-	  T6041 (M4 Pro) has probe-only support.
+	  T6041 (M4 Pro) has probe-only support. T6050 (M5 Pro/Max) encodes
+	  H.264.
 
 	  The encoder firmware is loaded by the bootloader; the driver builds
 	  every command itself. See Documentation/admin-guide/media/apple-ave.rst.
@@ -38,5 +39,7 @@ config VIDEO_APPLE_AVE_CMD_KUNIT_TEST
 	help
 	  Compare AVC/HEVC 9003 Start and Process images byte for byte with
 	  the pre-refactor builder. Test 6070 lifecycle envelopes, replies,
-	  split surface arrays, seven-channel discovery and encoding refusal.
+	  1080p/4K Start and Process fields, fixed and split surface banks,
+	  entropy interleave, alignment refusal, seven-channel discovery and
+	  encoding refusal.
 	  These tests run without firmware or encoder hardware.

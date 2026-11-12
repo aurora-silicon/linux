@@ -52,7 +52,8 @@ properties:
           PCIe adapter configuration space of the USB4 router. Present where
           the root complex exposes the adapter separately, so that the tunnel
           can be configured before a PCIe-C link is brought up.
-      - description: MxWrap co-processor control registers
+      - description: MxWrap co-processor control registers, on T8132 and T6050
+      - description: PCIe router AP firmware registers, on T6050
 
   reg-names:
     oneOf:
@@ -62,23 +63,36 @@ properties:
           - const: sram
           - const: pcie-adapter
           - const: cpu
+          - const: router-ap-fw
       - description: T6050, which has no separate PCIe adapter window
         items:
           - const: rc
           - const: sram
           - const: cpu
 
-  interrupts:
-    maxItems: 1
-    description: Type 7 SRAM parity interrupt
-
-  interrupt-names:
-    items:
-      - const: sram-parity
-
   mboxes:
     maxItems: 1
     description: Mailbox used for RTKit communication with the co-processor
+
+  interrupts:
+    minItems: 1
+    maxItems: 4
+    description: |
+      Type 7 SRAM parity interrupt, or interrupts of the router's DP IN
+      adapter blocks, one per DP IN adapter:
+      a change of the HPD level the adapter receives over the tunnel, and
+      IRQ_HPD from the sink.
+
+  interrupt-names:
+    oneOf:
+      - items:
+          - const: sram-parity
+      - minItems: 1
+        items:
+          - const: dpin0
+          - const: dpin1
+          - const: dpin2
+          - const: dpin3
 
   resets:
     maxItems: 1
@@ -87,12 +101,12 @@ properties:
 
   power-domains:
     minItems: 3
-    maxItems: 4
+    maxItems: 5
     description: |
-      The first three domains power the ACIO co-processor complex. When
-      apple,pcie-tunnel is present, the fourth domain powers its PCIe-C
+      The first three domains (four on T6050, the fourth being the routers'
+      shared audio (AUSS) domain) power the ACIO co-processor complex. When
+      apple,pcie-tunnel is present, the domain after them powers its PCIe-C
       controller and is enabled only after the USB4 PCIe tunnel is active.
-      On T6050 the fourth domain is the routers' shared audio (AUSS) domain.
 
   thunderbolt-switch:
     type: boolean
@@ -134,6 +148,18 @@ properties:
       As apple,tunable-rc, but applied to the PCIe adapter configuration space
       named by the pcie-adapter reg entry. Only meaningful where that entry is
       present.
+
+  apple,tunable-router-ap-fw:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: Register offset
+        - description: Mask of bits to clear
+        - description: Bits to set
+    description: |
+      As apple,tunable-rc, but applied to the PCIe router AP firmware
+      registers named by the router-ap-fw reg entry, with the other router
+      tunables once the co-processor firmware is ready.
 
   '#address-cells':
     const: 1
@@ -216,6 +242,16 @@ allOf:
           minItems: 4
         reg-names:
           minItems: 4
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t6040-usb4-acio
+              - apple,t6050-usb4-acio
+              - apple,t8132-usb4-acio
+    then:
+      properties:
         pinctrl-names:
           items:
             - const: lstx
@@ -228,6 +264,12 @@ allOf:
           contains:
             const: apple,t6040-usb4-acio
     then:
+      properties:
+        interrupts:
+          maxItems: 1
+        interrupt-names:
+          items:
+            - const: sram-parity
       required:
         - iommu@1a80000
         - nhi@1f00000
@@ -237,6 +279,20 @@ allOf:
       required:
         - iommu@a80000
         - nhi@f00000
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6050-usb4-acio
+    then:
+      properties:
+        power-domains:
+          minItems: 4
+    else:
+      properties:
+        power-domains:
+          maxItems: 4
+        apple,tunable-router-ap-fw: false
 
 additionalProperties: false
 

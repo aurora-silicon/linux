@@ -54,6 +54,7 @@
 #include <linux/soc/apple/pmc.h>
 #include <linux/spinlock.h>
 #include <linux/string_choices.h>
+#include <linux/suspend.h>
 #include <linux/thermal.h>
 #include <linux/workqueue.h>
 
@@ -152,6 +153,10 @@ struct apple_pmc {
  * @interface: the domain is a display pipe's BWR and boost interface enables
  * @bwr_bit: with @interface, the bit in the BWR interface enable word
  * @boost_bit: with @interface, the bit in the boost interface enable word
+ * @consumer_switched: with @interface, not a genpd domain: its consumer clears
+ *	and restores its bits (apple_pmc_interface_consumer_off())
+ * @consumer_off: with @consumer_switched, cleared by its consumer, and the
+ *	bits it had then (@consumer_bwr, @consumer_boost); protected by pmc->lock
  */
 struct apple_pmc_domain {
 	struct generic_pm_domain genpd;
@@ -168,6 +173,10 @@ struct apple_pmc_domain {
 	bool interface;
 	unsigned int bwr_bit;
 	unsigned int boost_bit;
+	bool consumer_switched;
+	bool consumer_off;
+	bool consumer_bwr;
+	bool consumer_boost;
 	bool provider;
 };
 
@@ -766,6 +775,107 @@ static int apple_pmc_interface_set(struct apple_pmc_domain *dom, bool on)
 	return ret;
 }
 
+/*
+ * A consumer-switched interface: off clears the boost, then the BWR enable,
+ * as a pipe's power-down does, after saving both; on gives both back what
+ * they had then. If the BWR enable does not take the change on the way off,
+ * the boost enable gets its old value back. Nothing is retried.
+ */
+static int apple_pmc_interface_consumer_set(struct apple_pmc_domain *dom, bool on)
+{
+	struct apple_pmc *pmc = dom->pmc;
+	const struct apple_pmc_hw *hw = pmc->hw;
+	unsigned long flags;
+	int ret;
+
+	raw_spin_lock_irqsave(&pmc->lock, flags);
+	if (on != dom->consumer_off) {
+		ret = -EALREADY;
+	} else if (on) {
+		ret = apple_pmc_interface_update(pmc, hw->boost_enable, dom->boost_bit,
+						 dom->consumer_boost);
+		if (!ret)
+			ret = apple_pmc_interface_update(pmc, hw->bwr_enable, dom->bwr_bit,
+							 dom->consumer_bwr);
+		if (!ret)
+			dom->consumer_off = false;
+	} else {
+		dom->consumer_bwr = apple_pmc_interface_read(pmc, hw->bwr_enable) &
+				    BIT(dom->bwr_bit);
+		dom->consumer_boost = apple_pmc_interface_read(pmc, hw->boost_enable) &
+				      BIT(dom->boost_bit);
+		ret = apple_pmc_interface_update(pmc, hw->boost_enable, dom->boost_bit, false);
+		if (!ret) {
+			ret = apple_pmc_interface_update(pmc, hw->bwr_enable, dom->bwr_bit, false);
+			if (ret)
+				apple_pmc_interface_update(pmc, hw->boost_enable, dom->boost_bit,
+							   dom->consumer_boost);
+		}
+		if (!ret)
+			dom->consumer_off = true;
+	}
+	raw_spin_unlock_irqrestore(&pmc->lock, flags);
+
+	return ret;
+}
+
+static struct platform_driver apple_pmc_driver;
+
+/* The consumer-switched interface named by @consumer's apple,pmc-interface. */
+static struct apple_pmc_domain *apple_pmc_consumer_interface(struct device *consumer)
+{
+	struct device_node *np = of_parse_phandle(consumer->of_node, "apple,pmc-interface", 0);
+	struct apple_pmc_domain *dom, *found = NULL;
+	struct platform_device *pdev;
+	struct apple_pmc *pmc = NULL;
+
+	if (!np)
+		return NULL;
+	pdev = of_find_device_by_node(np->parent);
+	if (pdev && pdev->dev.driver == &apple_pmc_driver.driver)
+		pmc = platform_get_drvdata(pdev);
+	if (pmc)
+		list_for_each_entry(dom, &pmc->domains, list)
+			if (dom->np == np && dom->consumer_switched)
+				found = dom;
+	if (pdev)
+		put_device(&pdev->dev);
+	of_node_put(np);
+	return found;
+}
+
+/* Whether apple_pmc_interface_consumer_off() can run for @consumer now, changing nothing. */
+int apple_pmc_interface_consumer_check(struct device *consumer)
+{
+	struct apple_pmc_domain *dom = apple_pmc_consumer_interface(consumer);
+	unsigned long flags;
+	int ret;
+
+	if (!dom)
+		return -ENODEV;
+	raw_spin_lock_irqsave(&dom->pmc->lock, flags);
+	ret = dom->consumer_off ? -EALREADY : 0;
+	raw_spin_unlock_irqrestore(&dom->pmc->lock, flags);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pmc_interface_consumer_check);
+
+int apple_pmc_interface_consumer_off(struct device *consumer)
+{
+	struct apple_pmc_domain *dom = apple_pmc_consumer_interface(consumer);
+
+	return dom ? apple_pmc_interface_consumer_set(dom, false) : -ENODEV;
+}
+EXPORT_SYMBOL_GPL(apple_pmc_interface_consumer_off);
+
+int apple_pmc_interface_consumer_on(struct device *consumer)
+{
+	struct apple_pmc_domain *dom = apple_pmc_consumer_interface(consumer);
+
+	return dom ? apple_pmc_interface_consumer_set(dom, true) : -ENODEV;
+}
+EXPORT_SYMBOL_GPL(apple_pmc_interface_consumer_on);
+
 static int apple_pmc_domain_power_on(struct generic_pm_domain *genpd)
 {
 	struct apple_pmc_domain *dom = genpd_to_apple_pmc_domain(genpd);
@@ -794,6 +904,8 @@ static int apple_pmc_domain_power_off(struct generic_pm_domain *genpd)
 
 static void apple_pmc_domain_free(struct apple_pmc_domain *dom)
 {
+	if (dom->consumer_switched)
+		goto free;
 	if (dom->provider)
 		of_genpd_del_provider(dom->np);
 	if (pm_genpd_remove(&dom->genpd)) {
@@ -802,6 +914,7 @@ static void apple_pmc_domain_free(struct apple_pmc_domain *dom)
 			 dom->genpd.name);
 		return;
 	}
+free:
 	of_node_put(dom->np);
 	kfree(dom->genpd.name);
 	kfree(dom);
@@ -1009,6 +1122,15 @@ static int apple_pmc_interface_add(struct apple_pmc *pmc, struct device_node *np
 		of_node_put(dom->np);
 		kfree(dom);
 		return -ENOMEM;
+	}
+
+	/* Its consumer clears and restores its bits: no genpd domain. */
+	dom->consumer_switched = of_property_read_bool(np, "apple,consumer-switched");
+	if (dom->consumer_switched) {
+		list_add_tail(&dom->list, &pmc->domains);
+		pmc->bwr_bits |= BIT(bwr);
+		pmc->boost_bits |= BIT(boost);
+		return 0;
 	}
 
 	ret = apple_pmc_interface_init(pmc, dom);
@@ -1280,7 +1402,9 @@ static int apple_pmc_probe(struct platform_device *pdev)
 	}
 
 	for_each_available_child_of_node(np, child) {
-		if (!of_property_present(child, "#power-domain-cells"))
+		/* A consumer-switched interface is no power domain, but still ours. */
+		if (!of_property_present(child, "#power-domain-cells") &&
+		    !of_property_read_bool(child, "apple,consumer-switched"))
 			continue;
 		if (of_property_present(child, "apple,rail"))
 			ret = apple_pmc_floor_add(pmc, child);
@@ -1385,7 +1509,63 @@ static const struct apple_pmc_hw apple_pmc_hw_t8152 = {
 	.ap_agent = 3,
 };
 
+/*
+ * T6050 (M5 Pro/Max): the T8140 layout with five agents (PMP, CLPC, GFX, AP
+ * and the second die's PMP1, ADT voter-agent) and the T8132 pending word
+ * after each floor word. Rails DCS, SOC, DISP and DISP2; the PMP's
+ * dvfs-domain lists DCS states 0-6 and fabric states 0-3. The boot loader
+ * enables no agent on any rail. Agents are enabled on DCS and SOC only, as
+ * on T6040.
+ */
+static const struct apple_pmc_hw apple_pmc_hw_t6050 = {
+	.agent_stride = 0x4000,
+	.agents = 5,
+	.rails = 4,
+	.agent_state = 0x0,
+	.rail_enable = 0x2000,
+	.dcs_rail = 0,
+	.dcs_max = 6,
+	.agent_rails = GENMASK(1, 0),
+	.ap_agent = 3,
+	.has_pending = true,
+};
+
+/*
+ * A system sleep that reached the hardware may have taken the enables and floors
+ * with it. Put back what the driver's books say: these are no-ops if they stayed.
+ */
+static int apple_pmc_resume_early(struct device *dev)
+{
+	struct apple_pmc *pmc = dev_get_drvdata(dev);
+	unsigned long flags;
+	unsigned int rail;
+	int ret = 0, err;
+
+	if (!pm_resume_via_firmware() || !pmc)
+		return 0;
+
+	raw_spin_lock_irqsave(&pmc->lock, flags);
+	for (rail = 0; rail < pmc->hw->rails; rail++) {
+		err = apple_pmc_enable_write(pmc, rail);
+		ret = ret ?: err;
+		if (pmc->floor_rails & BIT(rail)) {
+			err = apple_pmc_floor_apply(pmc, rail);
+			ret = ret ?: err;
+		}
+	}
+	raw_spin_unlock_irqrestore(&pmc->lock, flags);
+	if (ret)
+		dev_err(dev, "state not restored after sleep: %d\n", ret);
+
+	return 0;
+}
+
+static const struct dev_pm_ops apple_pmc_pm_ops = {
+	LATE_SYSTEM_SLEEP_PM_OPS(NULL, apple_pmc_resume_early)
+};
+
 static const struct of_device_id apple_pmc_of_match[] = {
+	{ .compatible = "apple,t6050-pmc", .data = &apple_pmc_hw_t6050 },
 	{ .compatible = "apple,t8132-pmc", .data = &apple_pmc_hw_t8132 },
 	{ .compatible = "apple,t8140-pmc", .data = &apple_pmc_hw_t8140 },
 	{ .compatible = "apple,t8142-pmc", .data = &apple_pmc_hw_t8142 },
@@ -1400,6 +1580,7 @@ static struct platform_driver apple_pmc_driver = {
 	.driver = {
 		.name = "apple-pmc",
 		.of_match_table = apple_pmc_of_match,
+		.pm = pm_sleep_ptr(&apple_pmc_pm_ops),
 		/* Power-domain providers are not intended for manual unbinding. */
 		.suppress_bind_attrs = true,
 	},

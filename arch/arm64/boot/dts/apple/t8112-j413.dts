@@ -12,10 +12,12 @@
 #include "t8112.dtsi"
 #include "t8112-jxxx.dtsi"
 #include <dt-bindings/leds/common.h>
+#include <dt-bindings/thermal/thermal.h>
 
 / {
 	compatible = "apple,j413", "apple,t8112", "apple,arm-platform";
 	model = "Apple MacBook Air (13-inch, M2, 2022)";
+
 	chassis-type = "laptop";
 
 	aliases {
@@ -166,6 +168,11 @@
 	status = "okay";
 };
 
+/* A spare PWM channel for developers; no consumer is known. */
+&fpwm0 {
+	status = "okay";
+};
+
 &fpwm1 {
 	status = "okay";
 };
@@ -187,12 +194,10 @@
 
 	accel {
 		compatible = "apple,t8112-aop-accel", "apple,aop-accel";
-		status = "disabled";
 	};
 
 	gyro {
 		compatible = "apple,t8112-aop-gyro", "apple,aop-gyro";
-		status = "disabled";
 	};
 };
 
@@ -272,6 +277,191 @@
 };
 
 #include "hwmon-laptop.dtsi"
+#include "t8112-j413-hwmon-rails.dtsi"
+
+/*
+ * GPU temperatures, after the channels the thermal zones index. The SMC
+ * publishes them only while the GPU is powered: with the GPU off, Tg0e,
+ * Tg0m and Tg0q read 0 C and Tg0f, Tg0n and Tg0r 4.6 C (they track the
+ * first three plus a fixed 4.6 C). Those placeholders are no data.
+ */
+&smc_hwmon {
+	temperature-Tg0e {
+		apple,key-id = "Tg0e";
+		label = "GPU Tg0e";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0f {
+		apple,key-id = "Tg0f";
+		label = "GPU Tg0f";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0m {
+		apple,key-id = "Tg0m";
+		label = "GPU Tg0m";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0n {
+		apple,key-id = "Tg0n";
+		label = "GPU Tg0n";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0q {
+		apple,key-id = "Tg0q";
+		label = "GPU Tg0q";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0r {
+		apple,key-id = "Tg0r";
+		label = "GPU Tg0r";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+};
+
+/*
+ * The other CPU temperatures, read-only, after the GPU channels. Each
+ * sensor site has a reading, the same plus a fixed offset and a hotspot
+ * estimate; the zones above use the offset keys of four P sites and Te05.
+ * Te04-Te06 follow the E cluster, every Tp key the P cluster, TCMz is the
+ * hottest hotspot key and TCMb the hottest offset key.
+ */
+&smc_hwmon {
+	temperature-TCMb {
+		apple,key-id = "TCMb";
+		label = "SoC Die TCMb";
+	};
+
+	temperature-Te04 {
+		apple,key-id = "Te04";
+		label = "E-cluster Te04";
+	};
+
+	temperature-Te06 {
+		apple,key-id = "Te06";
+		label = "E-cluster Te06";
+	};
+
+	temperature-Tp00 {
+		apple,key-id = "Tp00";
+		label = "P-cluster Tp00";
+	};
+
+	temperature-Tp02 {
+		apple,key-id = "Tp02";
+		label = "P-cluster Tp02";
+	};
+
+	temperature-Tp04 {
+		apple,key-id = "Tp04";
+		label = "P-cluster Tp04";
+	};
+
+	temperature-Tp06 {
+		apple,key-id = "Tp06";
+		label = "P-cluster Tp06";
+	};
+
+	temperature-Tp08 {
+		apple,key-id = "Tp08";
+		label = "P-cluster Tp08";
+	};
+
+	temperature-Tp0A {
+		apple,key-id = "Tp0A";
+		label = "P-cluster Tp0A";
+	};
+
+	temperature-Tp0C {
+		apple,key-id = "Tp0C";
+		label = "P-cluster Tp0C";
+	};
+
+	temperature-Tp0E {
+		apple,key-id = "Tp0E";
+		label = "P-cluster Tp0E";
+	};
+
+	temperature-Tp0a {
+		apple,key-id = "Tp0a";
+		label = "P-cluster Tp0a";
+	};
+
+	temperature-Tp0b {
+		apple,key-id = "Tp0b";
+		label = "P-cluster Tp0b";
+	};
+
+	temperature-Tp0c {
+		apple,key-id = "Tp0c";
+		label = "P-cluster Tp0c";
+	};
+
+	temperature-Tp0e {
+		apple,key-id = "Tp0e";
+		label = "P-cluster Tp0e";
+	};
+
+	temperature-Tp0f {
+		apple,key-id = "Tp0f";
+		label = "P-cluster Tp0f";
+	};
+
+	temperature-Tp0g {
+		apple,key-id = "Tp0g";
+		label = "P-cluster Tp0g";
+	};
+
+	temperature-Tp0i {
+		apple,key-id = "Tp0i";
+		label = "P-cluster Tp0i";
+	};
+
+	temperature-Tp0j {
+		apple,key-id = "Tp0j";
+		label = "P-cluster Tp0j";
+	};
+
+	temperature-Tp0k {
+		apple,key-id = "Tp0k";
+		label = "P-cluster Tp0k";
+	};
+
+	temperature-Tp0m {
+		apple,key-id = "Tp0m";
+		label = "P-cluster Tp0m";
+	};
+
+	temperature-Tp0n {
+		apple,key-id = "Tp0n";
+		label = "P-cluster Tp0n";
+	};
+
+	temperature-Tp0o {
+		apple,key-id = "Tp0o";
+		label = "P-cluster Tp0o";
+	};
+
+	temperature-Tp0q {
+		apple,key-id = "Tp0q";
+		label = "P-cluster Tp0q";
+	};
+
+	temperature-Tp0r {
+		apple,key-id = "Tp0r";
+		label = "P-cluster Tp0r";
+	};
+
+	temperature-Tp0s {
+		apple,key-id = "Tp0s";
+		label = "P-cluster Tp0s";
+	};
+};
+
 /*
  * Mesa fingerprint sensor on spi2. The J413 platform device tree
  * (/arm-io/spi2/mesa) describes it as J415's does: power on AP GPIO 178,
@@ -306,11 +496,12 @@
 };
 
 &nub_spmi1 {
+	status = "okay";
+
 	pmic@e {
 		compatible = "apple,vale-pmic", "apple,spmi-nvmem";
 		reg = <0xe SPMI_USID>;
 		read-only;
-		status = "disabled";
 	};
 };
 
@@ -357,9 +548,15 @@
 	};
 };
 
+/* NFC controller (Stockholm): identified once, then kept off. */
+&smc_gpio {
+	apple,output-templates = <0xf 0x00800000>;
+};
+
 &aop_spmi1 {
 	interrupt-controller;
 	#interrupt-cells = <2>;
+	status = "okay";
 
 	nfc@c {
 		compatible = "apple,t8112-stockholm-spmi", "apple,stockholm-spmi";
@@ -372,6 +569,250 @@
 			     <164 IRQ_TYPE_NONE>,
 			     <165 IRQ_TYPE_NONE>,
 			     <166 IRQ_TYPE_NONE>;
-		status = "disabled";
+		interrupt-names = "event0", "event1", "event2", "error",
+				  "event4", "host-wake", "data-ready";
+		enable-gpios = <&smc_gpio 15 GPIO_ACTIVE_HIGH>;
 	};
+};
+
+/ {
+	/*
+	 * Fanless: every die sensor throttles both clusters, E weighted 3:1
+	 * and capped at state 3, as on the J613, with its alert and control
+	 * trips. No critical trip: boot load bursts briefly read past 100 C,
+	 * and the SMC keeps its own protection.
+	 */
+	thermal-zones {
+		cpu-e0-thermal {
+			polling-delay-passive = <500>;
+			polling-delay = <500>;
+			thermal-sensors = <&smc_hwmon 1>;	/* Te05 */
+			sustainable-power = <6000>;
+
+			trips {
+				cpu_e0_alert: trip-alert {
+					temperature = <58000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_e0_control: trip-control {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_e0_control>;
+					cooling-device =
+						<&cpu_p0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <1024>;
+				};
+
+				map1 {
+					trip = <&cpu_e0_control>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT 3>,
+						<&cpu_e1 THERMAL_NO_LIMIT 3>,
+						<&cpu_e2 THERMAL_NO_LIMIT 3>,
+						<&cpu_e3 THERMAL_NO_LIMIT 3>;
+					contribution = <3072>;
+				};
+			};
+		};
+
+		cpu-p0-thermal {
+			polling-delay-passive = <500>;
+			polling-delay = <500>;
+			thermal-sensors = <&smc_hwmon 2>;	/* Tp01 */
+			sustainable-power = <6000>;
+
+			trips {
+				cpu_p0_alert: trip-alert {
+					temperature = <58000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p0_control: trip-control {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p0_control>;
+					cooling-device =
+						<&cpu_p0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <1024>;
+				};
+
+				map1 {
+					trip = <&cpu_p0_control>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT 3>,
+						<&cpu_e1 THERMAL_NO_LIMIT 3>,
+						<&cpu_e2 THERMAL_NO_LIMIT 3>,
+						<&cpu_e3 THERMAL_NO_LIMIT 3>;
+					contribution = <3072>;
+				};
+			};
+		};
+
+		cpu-p1-thermal {
+			polling-delay-passive = <500>;
+			polling-delay = <500>;
+			thermal-sensors = <&smc_hwmon 3>;	/* Tp05 */
+			sustainable-power = <6000>;
+
+			trips {
+				cpu_p1_alert: trip-alert {
+					temperature = <58000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p1_control: trip-control {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p1_control>;
+					cooling-device =
+						<&cpu_p0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <1024>;
+				};
+
+				map1 {
+					trip = <&cpu_p1_control>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT 3>,
+						<&cpu_e1 THERMAL_NO_LIMIT 3>,
+						<&cpu_e2 THERMAL_NO_LIMIT 3>,
+						<&cpu_e3 THERMAL_NO_LIMIT 3>;
+					contribution = <3072>;
+				};
+			};
+		};
+
+		cpu-p2-thermal {
+			polling-delay-passive = <500>;
+			polling-delay = <500>;
+			thermal-sensors = <&smc_hwmon 4>;	/* Tp09 */
+			sustainable-power = <6000>;
+
+			trips {
+				cpu_p2_alert: trip-alert {
+					temperature = <58000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p2_control: trip-control {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p2_control>;
+					cooling-device =
+						<&cpu_p0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <1024>;
+				};
+
+				map1 {
+					trip = <&cpu_p2_control>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT 3>,
+						<&cpu_e1 THERMAL_NO_LIMIT 3>,
+						<&cpu_e2 THERMAL_NO_LIMIT 3>,
+						<&cpu_e3 THERMAL_NO_LIMIT 3>;
+					contribution = <3072>;
+				};
+			};
+		};
+
+		cpu-p3-thermal {
+			polling-delay-passive = <500>;
+			polling-delay = <500>;
+			thermal-sensors = <&smc_hwmon 5>;	/* Tp0D */
+			sustainable-power = <6000>;
+
+			trips {
+				cpu_p3_alert: trip-alert {
+					temperature = <58000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p3_control: trip-control {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p3_control>;
+					cooling-device =
+						<&cpu_p0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <1024>;
+				};
+
+				map1 {
+					trip = <&cpu_p3_control>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT 3>,
+						<&cpu_e1 THERMAL_NO_LIMIT 3>,
+						<&cpu_e2 THERMAL_NO_LIMIT 3>,
+						<&cpu_e3 THERMAL_NO_LIMIT 3>;
+					contribution = <3072>;
+				};
+			};
+		};
+	};
+};
+
+/* Read-only fault counter views (apple-regview); nothing writes these windows. */
+&m2_nub_spmi0_sideband {
+	status = "okay";
+};
+
+&m2_nub_spmi1_sideband {
+	status = "okay";
+};
+
+&m2_aop_spmi0_sideband {
+	status = "okay";
+};
+
+&m2_aop_spmi1_sideband {
+	status = "okay";
 };

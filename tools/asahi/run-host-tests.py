@@ -39,7 +39,7 @@ KILL = 'kill'
 
 # A killed mutant shows the failing control: a C assertion or abort (-6), or
 # a Rust panic (exit 101). A Python traceback means the harness itself broke.
-KILL_SIGN = re.compile(r'Assertion|": -6\b|"exit": 101\b|panicked at')
+KILL_SIGN = re.compile(r'FAIL line [0-9]+|Assertion|": -6\b|"exit": 101\b|panicked at')
 BROKEN_SIGN = re.compile(r'Traceback \(most recent call last\)')
 
 
@@ -53,9 +53,19 @@ def mutations(flag, names, base, expect=KILL):
 
 # test file -> [(arguments, expectation)]. '{out}' is a fresh directory.
 ASAHI_TESTS = {
+    'j613-mtp-s2idle-tests.py': [([], PASS)],
+    # 11eccbedc3ed writes frames without a transport-wide lock.
+    'mtp-tx-frame-tests.py': [(out(), PASS),
+                              (out() + ['--old-transport', '11eccbedc3ed'], PASS)],
+    'pmgr-ppt-tests.py': [([], PASS)],
+    'queue-priority-tests.py': [([], PASS)],
     # The old revision reports a DART fault that clears before the second latch read as success.
     'ane-tm-transient-fault-tests.py': [([], PASS),
                                         (['--old-ref', 'b50066848322c6799c1433ee3a358aab2e9faabb'], PASS)],
+    'test-m3-power.py': [([], PASS)],
+    'test-m3-uapi.py': [([], PASS)],
+    'test-m3-mailbox.py': [([], PASS)],
+    'test-j613-dcp-power.py': [([], PASS)],
     'aop-als-channel-tests.py': [([], PASS)],
     'aop-bootargs-tests.py': [([], PASS)],
     'mtp-pm-tests.py': [(out(), PASS),
@@ -68,9 +78,12 @@ ASAHI_TESTS = {
     'apple-pwm-pm-tests.py': [([], PASS), (['--negative-control'], PASS)],
     'apple-m4-pmu-tests.py': [([], PASS)]
         + mutations('--mutation', ('m1-layout', 'cycles-anywhere', 'expose-8-9', 'flags-in-event'), []),
+    'apple-dart-dapf-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('missing-guard', 'ignore-replay', 'ignore-orphan'), out()),
     'apple-dart-fw-tests.py': [(out(), PASS)],
     'apple-dart-range-tests.py': [([], PASS)],
     'asahi-stats-raw-tests.py': [([], PASS)],
+    'agx-stats-busy-tests.py': [([], PASS), (['--negative-control'], PASS)],
     'atc-usb3-tests.py': [(out(), PASS), (out() + ['--mutations'], PASS)],
     'avd-av1-tail-tests.py': [(out(), PASS)]
         + [(out() + ['--case', c], PASS) for c in ('copy', 'seed', 'aligned')]
@@ -85,12 +98,18 @@ ASAHI_TESTS = {
     'brcmf-assoc-tests.py': [(out('--output'), PASS)]
         + mutations('--mutation', ('short-ie', 'header-length', 'skb-capacity', 'cmplt-header'), out('--output')),
     'brcmf-bss-tests.py': [(out(), PASS)],
+    'brcmf-cipher-tests.py': [(out(), PASS)]
+        + [(out() + ['--ref', '33bec4016c466985bfbb5ff4c2089fcab8242dcf'], KILL)],
     # The old revision reports a failed join against the last associated BSS.
     'brcmf-join-bssid-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('stale-target', 'zero-named', 'no-call', 'lost-bss-success'), out()),
+    'brcmf-join-scan-tests.py': [(out(), PASS)]
+        + [(out() + ['--ref', '33bec4016c466985bfbb5ff4c2089fcab8242dcf'], KILL)],
     'brcmf-pcie-dma-tests.py': [(out('--output'), PASS)]
         + mutations('--mutation', ('narrow-stream', 'ignore-aperture', 'revision-wide'), out('--output')),
     'brcmf-roam-tests.py': [(out(), PASS)],
+    'brcmf-sae-vendor-tests.py': [(out(), PASS)]
+        + [(out() + ['--ref', '9260e1f021e075713931f3c23c0a5fa1da936b0b'], KILL)],
     'brcmf-suspend-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('country-gate', 'queue-reasons', 'worker-gate',
                                    'resume-order', 'tx-drain'), out()),
@@ -120,6 +139,7 @@ ASAHI_TESTS = {
                                    'quarantine', 'epoch', 'cutoff', 'whole-batch', 'legacy-format', 'read-drain'), out()),
     'g17-admission-deadline-tests.py': [([], PASS)],
     'g17-admission-order-tests.py': [([], PASS)],
+    'g17-capacity-backoff-tests.py': [([], PASS)],
     'g17-capacity-fault-tests.py': [([], PASS)],
     'g17-compute-constructor-tests.py': [([], PASS)],
     'g17-compute-deadline-tests.py': [([], PASS)],
@@ -134,6 +154,7 @@ ASAHI_TESTS = {
     'g17-t6041-initdata-tests.py': [([], PASS)],
     'g17-uninstalled-cleanup-tests.py': [([], PASS)],
     'g17-unpublished-tests.py': [([], PASS)],
+    'isp-tests.py': [(['--suite', suite] + out(), PASS) for suite in ['session', 'buffers', 'receive', 'returns', 'queue']] + [(['--suite', suite, '--control', control] + out(), KILL) for suite, controls in [('session', ['send', 'overwrite', 'stop', 'reset']), ('buffers', ['rollback']), ('receive', ['drain']), ('returns', ['address', 'pool', 'duplicate', 'snapshot']), ('queue', ['queue-error'])] for control in controls],
     'mt7932-association-events-tests.py': [(out(), PASS)],
     'mt7932-connect-result-tests.py': [(out('--output'), PASS)],
     'mt7932-owe-retry-tests.py': [(out(), PASS)],
@@ -148,14 +169,30 @@ ASAHI_TESTS = {
         + [(out('--output') + ['--old-usb'], KILL), (out('--output') + ['--old-regulatory'], KILL)],
     'pciec-policy-tests.py': [(out(), PASS)],
     'pmgr-bus-tests.py': [([], PASS)],
+    'sep-suspend-errors-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('unsupported-as-success', 'read-as-deadline', 'no-capability-check',
+                                   'no-transport-check', 'lost-accept', 'nonphysical-wake',
+                                   'wake-before-arm', 'bulk-error-as-success', 'omit-pending-wake',
+                                   'omit-before-send', 'leak-prepared', 'sent-error-return',
+                                   'accept-unanswered-gate', 'ignore-result', 'ignore-gate-timeout',
+                                   'finish-without-physical', 'poll-after-callback', 'poll-unsupported',
+                                   'stale-observation', 'drain-two', 'post-send-wake-refusal'), out()),
+    'pmp-agx-vote-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
+    'pmp-j613-floor-tests.py': [([], PASS)] + mutations('--mutant', ['no-hold', 'no-rate', 'no-streak', 'bad-word', 'foreign-ok', 'no-names', 'no-sum', 'no-board', 'no-default', 'no-disable'], []),
     'pmp-j613-hwmon-tests.py': [([], PASS)],
     'pmu-rtc-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('ack-clobber', 'arm-ack', 'offset-seconds',
                                    'offset-sign', 'event-bit', 'wrong-control',
-                                   'maverick-event', 'stowe-offset'), out()),
+                                   'maverick-event', 'stowe-offset', 'baku-limit',
+                                   'set-no-round', 'set-negative'), out()),
+    'perf-mmap-alias-lifecycle-tests.py': [([], PASS)],
     'qspi-nvram-tests.py': [(out('--output'), PASS)],
+    'rtkit-crashlog-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('buffer-header', 'section-header', 'section-size', 'footer-room',
+                                   'mailbox-minimum', 'version-string', 'message-string'), out()),
     'rtkit-oslog-tests.py': [(out(), PASS)]
         + mutations('--mutate', ('admission', 'channel', 'counter', 'reset', 'buffer'), out()),
+    'rtkit-retained-tests.py': [(out(), PASS)],
     't6030-clock-tests.py': [(out(), PASS)],
     't6030-display-admission-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
     't6030-display-linkage-tests.py': [(out('--output') + ['--conf', '{conf}'], PASS)],
@@ -180,6 +217,7 @@ ASAHI_SHELL = ['g17-ray-query-timeout-tests.sh']
 
 # Production G17 decoder vectors also build directly with rustc --test.
 ASAHI_RUST += ['g17-telemetry-tests.rs', 'legacy-frequency-tests.rs']
+ASAHI_RUST.append('m3-firmware-tests.rs')
 
 # Python that runs on the host but imports its neighbours, so it keeps the
 # script directory on sys.path (-E -s instead of -I).
@@ -196,9 +234,12 @@ SUITES = [
 def jobs(work, conf, dtc):
     found = {p.name for p in ASAHI.iterdir()
              if re.search(r'-tests\.(py|rs|sh)$', p.name) and p.name != Path(__file__).name}
+    # This Rust fixture is compiled and executed by the paired-header wrapper.
+    if 'test-m3-uapi.py' in ASAHI_TESTS:
+        found.discard('m3-uapi-tests.rs')
     known = set(ASAHI_TESTS) | set(ASAHI_RUST) | set(ASAHI_SHELL)
     missing = sorted(found - known)
-    gone = sorted(known - found)
+    gone = sorted(name for name in known if not (ASAHI / name).is_file())
     if missing or gone:
         for name in missing:
             print(f'not registered in {Path(__file__).name}: tools/asahi/{name}', file=sys.stderr)

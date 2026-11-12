@@ -595,13 +595,11 @@ pub(crate) struct StatsChannel {
     /// Last raw sample of every statistics kind, shared with the export
     /// through `crate::stats_raw`.
     raw: Arc<SpinLock<RawStatsSnapshot>>,
-    /// Rate of firmware stats-message timestamps (Hz). All stats timestamps
-    /// run on the chip base clock (`HwConfig::base_clock_hz`, 24 MHz on every
-    /// supported SoC), not nanoseconds.
-    ts_hz: u64,
-    /// Last `Utilization` message timestamp (raw base-clock ticks), for
-    /// utilization-weighted `busy_ns` integration.
-    last_util_ts: u64,
+    /// Utilization-weighted `busy_ns` integration across `Utilization`
+    /// windows. All stats timestamps run on the chip base clock
+    /// (`HwConfig::base_clock_hz`, 24 MHz on every supported SoC), not
+    /// nanoseconds.
+    busy: crate::stats_busy::BusyIntegrator,
 }
 
 #[versions(AGX)]
@@ -619,8 +617,7 @@ impl StatsChannel::ver {
             ch: RxChannel::<ChannelState, RawStatsMsg::ver>::new(alloc, 0x100)?,
             snap,
             raw,
-            ts_hz,
-            last_util_ts: 0,
+            busy: crate::stats_busy::BusyIntegrator::new(ts_hz),
         })
     }
 
@@ -666,37 +663,20 @@ impl StatsChannel::ver {
                                 // across a saturated 30 s matmul and 0-2 on
                                 // an idle desktop, while FwBusy timestamp
                                 // deltas (the prior producer) covered 0.17%
-                                // of that matmul. The timestamps are base-
-                                // clock ticks (24 MHz), so convert to ns
-                                // once here. The kernel runtime has no
-                                // 128-bit division, so split whole seconds
-                                // from the tick remainder: whole seconds
-                                // contribute util * 1e7 ns each (1e9 / 100
-                                // exactly), the remainder contributes
-                                // rem * util * 1e9 / (100 * ts_hz), which
-                                // cannot overflow u64 (rem < ts_hz <= 24e6
-                                // on supported SoCs).
-                                let util = u64::from(
-                                    [*util1, *util2, *util3, *util4]
-                                        .into_iter()
-                                        .max()
-                                        .unwrap_or(0)
-                                        .min(100),
-                                );
-                                let ts = timestamp.0;
-                                if self.last_util_ts != 0 && ts > self.last_util_ts {
-                                    let delta = ts - self.last_util_ts;
-                                    let whole_s = delta / self.ts_hz;
-                                    let rem = delta % self.ts_hz;
-                                    let busy = whole_s
-                                        .saturating_mul(util)
-                                        .saturating_mul(10_000_000)
-                                        .saturating_add(
-                                            rem * util * 1_000_000_000 / (100 * self.ts_hz),
-                                        );
+                                // of that matmul.
+                                let util = [*util1, *util2, *util3, *util4]
+                                    .into_iter()
+                                    .max()
+                                    .unwrap_or(0);
+                                let busy = self.busy.utilization(timestamp.0, util);
+                                if busy != 0 {
                                     self.snap.busy_ns.fetch_add(busy, Ordering::Relaxed);
                                 }
-                                self.last_util_ts = ts;
+                            }
+                            // No Utilization is sent while the GPU is off:
+                            // the next window must not span the gap.
+                            StatsMsg::ver::PowerOn { .. } | StatsMsg::ver::PowerOff { .. } => {
+                                self.busy.power_changed();
                             }
                             StatsMsg::ver::PowerState { pstate, .. } => {
                                 self.snap.pstate.store(*pstate, Ordering::Relaxed);

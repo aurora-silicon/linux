@@ -33,12 +33,15 @@ def fixture():
     for old, new in [('super::job::Packet', 'Packet'),
                      ('super::command::Validated', 'Validated'),
                      ('super::recovery::Memory', 'Memory'),
-                     ('super::fw::compute_pool::required_blocks', 'required_blocks')]:
+                     ('super::fw::compute_pool::required_blocks', 'required_blocks'),
+                     ('super::freelist::ComputeCapacity', 'ComputeCapacity'),
+                     ('super::preparation::QUEUE_WAIT_NS', 'QUEUE_WAIT_NS')]:
         packet = packet.replace(old, new)
         ensure = ensure.replace(old, new)
     admission = (item(preparation, "pub(super) struct Admission<'a>") + '\n' +
                  item(preparation, "impl<'a> Admission<'a>")).replace('pub(super) ', '').replace('super::now_ns()', 'now_ns()').replace('super::timeout::', '')
     gate = item(preparation, 'pub(super) fn enter_until(').replace('pub(super) ', '')
+    queue_wait = next(line for line in preparation.splitlines() if 'const QUEUE_WAIT_NS:' in line).replace('pub(super) ', '')
     return r'''
 #![allow(dead_code,unused_variables,irrefutable_let_patterns)]
 use std::cell::Cell;
@@ -47,11 +50,14 @@ type Result<T=()> = std::result::Result<T,i32>;
 const EINVAL:i32=-22;const ECANCELED:i32=-125;const EIO:i32=-5;const ENODEV:i32=-19;const EBUSY:i32=-16;const EAGAIN:i32=-11;
 const RECOVERY_SETTLE_POLLS:usize=200;const WORK_RING_WAIT_NS:u64=2_000_000_000;
 const RECOVERY_WAIT_MS:u32=26_000;const RECOVERY_WAIT_NS:u64=RECOVERY_WAIT_MS as u64*1_000_000;
+''' + queue_wait + r'''
+// A compute publication waits up to QUEUE_WAIT_NS, or a recovery's wait if that is longer.
+const PUBLICATION_WAIT_NS:u64=if QUEUE_WAIT_NS>RECOVERY_WAIT_NS{QUEUE_WAIT_NS}else{RECOVERY_WAIT_NS};
 static NOW:AtomicU64=AtomicU64::new(0);static CALLS:AtomicUsize=AtomicUsize::new(0);
 static MODE:AtomicUsize=AtomicUsize::new(0);static CANCEL:AtomicU64=AtomicU64::new(u64::MAX);
 static STATUS:AtomicU64=AtomicU64::new(u64::MAX);static CLOSED:AtomicBool=AtomicBool::new(false);
 fn now_ns()->u64{NOW.load(Ordering::SeqCst)}
-fn advance(ns:u64){NOW.fetch_add(ns,Ordering::SeqCst);assert!(now_ns()<=RECOVERY_WAIT_NS+4_000_000_000,"admission budget exceeded");}
+fn advance(ns:u64){NOW.fetch_add(ns,Ordering::SeqCst);assert!(now_ns()<=PUBLICATION_WAIT_NS+4_000_000_000,"admission budget exceeded");}
 mod kernel{pub mod time{
  pub fn msecs_to_jiffies(ms:u32)->u32{ms}
  pub struct Delta(pub u64);impl Delta{pub fn from_millis(ms:u64)->Self{Self(ms*1_000_000)}pub fn from_micros(us:i64)->Self{Self(us as u64*1_000)}}
@@ -98,7 +104,13 @@ struct Shared{preparations:Arc<Gate>,state:State,crashed:AtomicBool,compute_bloc
 struct ComputeDemand;impl ComputeDemand{fn new(_:&Shared)->Self{Self}}
 struct Backend{shared:Shared,owner:u64,context:Context}
 fn required_blocks(_:usize,_:u32,_:u16)->Result<usize>{Ok(1)}
+type ComputeCapacity=usize;
 impl Backend{
+ fn compute_capacity(&self,command:&Validated)->Result<ComputeCapacity>{let Validated::Compute{scratch}=command;required_blocks(self.shared.compute_blocks,self.shared.active_cores,scratch.pages())}
+ // Off M5 there is no shared work ring: no outer domain, and a claim always holds.
+ fn outer_domain(&self)->Option<Arc<Available>>{None}
+ fn claim_outer(&self,_:&Firmware,engine:g17::job::Engine)->Result<bool>{assert_eq!(engine,g17::job::Engine::Compute,"compute admission takes a compute work state");Ok(true)}
+ fn publish_claimed(&self,firmware:&mut Firmware,packet:&Arc<Packet>,dependencies:&[()],deferred:&mut DeferredBatch)->Result{firmware.publish_compute(self.owner,packet.clone(),dependencies,deferred)}
  fn compute_direct(&self,_:&Arc<Packet>,_:usize,_:&mut DeferredBatch)->Option<Result>{None}
  fn sources_published(&self,_:&Arc<Packet>)->Result<bool>{Ok(true)}
  fn remember_direct(&self,_:&Queues){}
@@ -122,9 +134,9 @@ fn main(){
   MODE.store(mode,Ordering::SeqCst);NOW.store(0,Ordering::SeqCst);CALLS.store(0,Ordering::SeqCst);
   let r=b.compute_packet(&p,&mut DeferredBatch);
   assert_eq!(r,Err(EBUSY),"one admission budget covers binding theft/recovery/publication");
-  let budget=if mode==1{RECOVERY_WAIT_NS}else{WORK_RING_WAIT_NS};
+  let budget=if mode==1{PUBLICATION_WAIT_NS}else{QUEUE_WAIT_NS};
   assert!(now_ns()>=budget&&now_ns()<=budget+10_000_000,"admission budget exceeded");
-  if mode==0{assert_eq!(CALLS.load(Ordering::SeqCst),4);assert_eq!(now_ns(),WORK_RING_WAIT_NS);}
+  if mode==0{assert_eq!(CALLS.load(Ordering::SeqCst),(QUEUE_WAIT_NS/500_000_000) as usize);assert_eq!(now_ns(),QUEUE_WAIT_NS);}
   println!("PASS mode={} result={:?} calls={} elapsed_ms={}",mode,r,CALLS.load(Ordering::SeqCst),now_ns()/1_000_000);
  }
  // A context without a free work state waits for one under the admission
@@ -132,7 +144,7 @@ fn main(){
  MODE.store(4,Ordering::SeqCst);NOW.store(0,Ordering::SeqCst);CALLS.store(0,Ordering::SeqCst);
  let r=b.compute_packet(&p,&mut DeferredBatch);
  assert_eq!(r,Err(EBUSY),"a busy work state ends at the admission deadline");
- assert!(now_ns()>=WORK_RING_WAIT_NS&&now_ns()<=WORK_RING_WAIT_NS+10_000_000,"a busy work state waits for the admission deadline");
+ assert!(now_ns()>=QUEUE_WAIT_NS&&now_ns()<=QUEUE_WAIT_NS+10_000_000,"a busy work state waits for the admission deadline");
  println!("PASS busy work state waits elapsed_ms={}",now_ns()/1_000_000);
  for status in [false,true] {
   MODE.store(2,Ordering::SeqCst);NOW.store(0,Ordering::SeqCst);CALLS.store(0,Ordering::SeqCst);
@@ -146,6 +158,11 @@ fn main(){
  let admission=Admission::new(WORK_RING_WAIT_NS,&check);
  assert!(matches!(b.shared.preparations.enter_until(&admission),Err(EBUSY)),"spent budget before available gate");
  assert_eq!(b.ensure_compute(0,&admission),Err(EBUSY),"spent budget before nested admission");
+ // A pending drain witness extends a shorter admission to the recovery wait.
+ MODE.store(2,Ordering::SeqCst);NOW.store(0,Ordering::SeqCst);
+ let admission=Admission::new(WORK_RING_WAIT_NS,&check);
+ assert_eq!(b.ensure_compute(0,&admission),Err(EBUSY));
+ assert!(now_ns()>=RECOVERY_WAIT_NS&&now_ns()<=RECOVERY_WAIT_NS+10_000_000,"a pending witness waits out the recovery extension");
  for cancel in [false,true] {
   NOW.store(0,Ordering::SeqCst);CLOSED.store(true,Ordering::SeqCst);
   let check=||{if cancel&&now_ns()>=10_000_000{Err(ECANCELED)}else{Ok(())}};
@@ -162,14 +179,14 @@ def main():
     source = fixture()
     mutants = [
         ('fixed', source, ''),
-        ('renew-on-binding-loss', source.replace('let admission = Admission::new(deadline, &check);\n        let progress = &self.shared.progress;\n        loop {', 'let progress = &self.shared.progress;\n        loop {\n            let admission = Admission::new(now_ns().saturating_add(WORK_RING_WAIT_NS), &check);'), 'admission budget exceeded'),
+        ('renew-on-binding-loss', source.replace('let admission = Admission::new(deadline, &check);\n        let progress = &self.shared.progress;\n        let outer = self.outer_domain();\n        loop {', 'let progress = &self.shared.progress;\n        let outer = self.outer_domain();\n        loop {\n            let admission = Admission::new(now_ns().saturating_add(QUEUE_WAIT_NS), &check);'), 'admission budget exceeded'),
         ('ignore-deadline', source.replace('if now_ns() >= self.deadline.get()', 'if false'), 'admission budget exceeded'),
         ('render-work-state', source.replace('acquire(crate::g17::job::Engine::Compute)', 'acquire(crate::g17::job::Engine::Render)'), 'compute admission takes a compute work state'),
         ('omit-gate-check', source.replace('            admission.check()?;\n            match self.try_enter()', '            match self.try_enter()').replace('admission.slice_ms()?', '10'), 'gate wake storm'),
-        ('no-recovery-extension', source.replace('admission.extend_for_recovery();', ''), 'admission budget exceeded'),
+        ('no-recovery-extension', source.replace('admission.extend_for_recovery();', ''), 'recovery extension'),
     ]
     # Bind the old unbounded mutant with the review's eventual cancellation.
-    mutants[1] = (mutants[1][0], mutants[1][1].replace('for mode in 0..4 {', 'CANCEL.store(40_000_000_000,Ordering::SeqCst);\n for mode in 0..4 {'), mutants[1][2])
+    mutants[1] = (mutants[1][0], mutants[1][1].replace('for mode in 0..4 {', 'CANCEL.store(PUBLICATION_WAIT_NS+10_000_000_000,Ordering::SeqCst);\n for mode in 0..4 {'), mutants[1][2])
     with tempfile.TemporaryDirectory(prefix='g17-compute-deadline-') as tmp:
         for name, code, expected in mutants:
             if name != 'fixed':

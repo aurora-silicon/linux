@@ -438,14 +438,11 @@ static void isp_test_sensor_config_list(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, isp->sensor_configs[5].reply[ISP_SENSOR_CONFIG_SIZE - 1], 0x5a);
 	KUNIT_EXPECT_EQ(test, count, 6);
 	KUNIT_EXPECT_EQ(test, isp->num_sensor_configs, 6);
-	KUNIT_EXPECT_EQ(test, isp->num_presets, 3);
+	/* Firmware configs only qualify P010: the uncropped 4096x3072 one is not offered. */
+	KUNIT_ASSERT_EQ(test, isp->num_presets, 2);
 	KUNIT_EXPECT_EQ(test, isp->presets[0].index, 5);
 	KUNIT_EXPECT_EQ(test, isp->presets[0].output_dim.y, 1080);
 	KUNIT_EXPECT_TRUE(test, isp->presets[1].p010);
-	KUNIT_EXPECT_TRUE(test, isp->presets[2].p010);
-	KUNIT_EXPECT_EQ(test, isp->presets[2].index, 1);
-	KUNIT_EXPECT_EQ(test, isp->presets[2].output_dim.x, 4096);
-	KUNIT_EXPECT_EQ(test, isp->presets[2].crop_size.y, 3072);
 	KUNIT_EXPECT_FALSE(test, isp->sensor_configs[2].usable);
 	KUNIT_EXPECT_EQ(test, isp_ch_cache_sensor_configs(isp, 0, 0), -EINVAL);
 	KUNIT_EXPECT_EQ(test, isp_ch_cache_sensor_configs(isp, 0, 65), -EINVAL);
@@ -543,6 +540,61 @@ static void isp_test_command_ack_failures(struct kunit *test)
 	state.calls = 0;
 	KUNIT_EXPECT_EQ(test, isp_cmd_ch_camera_config_select(isp, 0, 5), -EIO);
 	KUNIT_EXPECT_EQ(test, state.calls, 0);
+}
+
+/* The firmware's answer to the stop key request, as macOS reads it */
+static int isp_test_stop_key_reply(struct apple_isp *isp,
+				   struct isp_channel *chan,
+				   unsigned long timeout)
+{
+	struct kunit *test = kunit_get_current_test();
+	unsigned int *calls = test->priv;
+	u8 *cmd = isp->cmd_virt;
+
+	(*calls)++;
+	KUNIT_EXPECT_PTR_EQ(test, chan, isp->chan_dg);
+	KUNIT_EXPECT_EQ(test, chan->req.arg1, 0x20);
+	KUNIT_EXPECT_EQ(test, chan->req.arg2, 0x20);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(cmd + 4), 0x1d);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(cmd + 8), 1);
+	KUNIT_EXPECT_TRUE(test, timeout);
+	put_unaligned_le64(0x10001e00010ULL, cmd + 0x10);
+	put_unaligned_le64(0x8042006, cmd + 0x18);
+	chan->rsp = (struct isp_message){ .arg0 = chan->req.arg0 | ISP_IPC_FLAG_ACK,
+					  .arg1 = chan->req.arg2 };
+	return 0;
+}
+
+static void isp_test_stop_key_on_debug(struct kunit *test)
+{
+	struct apple_isp *isp = isp_test_capture_alloc(test);
+	struct cmd_stop_key key;
+	unsigned int calls = 0;
+
+	isp->cmd_virt = kunit_kzalloc(test, 0x400, GFP_KERNEL);
+	isp->chan_io = kunit_kzalloc(test, sizeof(*isp->chan_io), GFP_KERNEL);
+	isp->chan_dg = kunit_kzalloc(test, sizeof(*isp->chan_dg), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, isp->cmd_virt);
+	KUNIT_ASSERT_NOT_NULL(test, isp->chan_io);
+	KUNIT_ASSERT_NOT_NULL(test, isp->chan_dg);
+	isp->chan_io->name = "IO";
+	isp->chan_dg->name = "DEBUG";
+	isp->chan_dg->type = ISP_IPC_CHAN_TYPE_COMMAND;
+	test->priv = &calls;
+	kunit_deactivate_static_stub(test, isp_cmd_send);
+	kunit_activate_static_stub(test, ipc_chan_send, isp_test_stop_key_reply);
+
+	KUNIT_EXPECT_EQ(test, isp_cmd_stop_key_get(isp, &key), 0);
+	KUNIT_EXPECT_EQ(test, calls, 1);
+	KUNIT_EXPECT_EQ(test, key.addr, 0x10001e00010ULL);
+	KUNIT_EXPECT_EQ(test, key.key, 0x8042006ULL);
+
+	/* No DEBUG command ring: nothing is sent, on IO either. */
+	isp->chan_dg->type = ISP_IPC_CHAN_TYPE_REPLY;
+	KUNIT_EXPECT_EQ(test, isp_cmd_stop_key_get(isp, &key), -ENODEV);
+	isp->chan_dg = NULL;
+	KUNIT_EXPECT_EQ(test, isp_cmd_stop_key_get(isp, &key), -ENODEV);
+	KUNIT_EXPECT_EQ(test, calls, 1);
 }
 
 static void isp_test_call_crop(struct kunit *test)
@@ -661,6 +713,7 @@ static struct kunit_case isp_cam_test_cases[] = {
 	KUNIT_CASE(isp_test_setfile_failure_stops_setup),
 	KUNIT_CASE(isp_test_optional_setfile_continues_setup),
 	KUNIT_CASE(isp_test_command_ack_failures),
+	KUNIT_CASE(isp_test_stop_key_on_debug),
 	KUNIT_CASE(isp_test_sensor_geometry),
 	KUNIT_CASE(isp_test_sensor_config_list),
 	KUNIT_CASE(isp_test_sensor_config_failure),

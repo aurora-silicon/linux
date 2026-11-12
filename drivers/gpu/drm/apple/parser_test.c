@@ -56,13 +56,20 @@ static void blob_int(struct blob *b, s64 value)
 	b->len += 8;
 }
 
-static int parse_service(struct kunit *test, const struct blob *b, bool h17p,
-			 const char **name, const char **class, s64 *unit)
+static int parse_service_v27(struct kunit *test, const struct blob *b, bool h17p,
+			     bool v27, const char **name, const char **class,
+			     s64 *unit)
 {
 	struct dcp_parse_ctx ctx;
 
 	KUNIT_ASSERT_EQ(test, parse(b->data, b->len, &ctx), 0);
-	return parse_epic_service_init(&ctx, name, class, unit, h17p);
+	return parse_epic_service_init(&ctx, name, class, unit, h17p, v27);
+}
+
+static int parse_service(struct kunit *test, const struct blob *b, bool h17p,
+			 const char **name, const char **class, s64 *unit)
+{
+	return parse_service_v27(test, b, h17p, false, name, class, unit);
 }
 
 static void parser_service_init_test(struct kunit *test)
@@ -114,6 +121,36 @@ static void parser_service_init_h17p_keys_test(struct kunit *test)
 	KUNIT_EXPECT_STREQ(test, name, "system");
 	KUNIT_EXPECT_STREQ(test, class, "system");
 	KUNIT_EXPECT_EQ(test, unit, 1);
+	kfree(name);
+	kfree(class);
+}
+
+/* Firmware 27 takes EPICUnit over interface-id; H17P keeps the later key. */
+static void parser_service_init_v27_unit_test(struct kunit *test)
+{
+	const char *name, *class;
+	struct blob b;
+	s64 unit = -1;
+
+	blob_init(&b);
+	blob_tag(&b, T_DICT, 4);
+	blob_string(&b, "EPICName");
+	blob_string(&b, "dcpdptx-port-epic");
+	blob_string(&b, "EPICProviderClass");
+	blob_string(&b, "AppleDCPDPTXRemotePort");
+	blob_string(&b, "EPICUnit");
+	blob_int(&b, 1);
+	blob_string(&b, "interface-id");
+	blob_int(&b, 3);
+
+	KUNIT_ASSERT_EQ(test, parse_service_v27(test, &b, true, true, &name, &class,
+						&unit), 0);
+	KUNIT_EXPECT_EQ(test, unit, 1);
+	kfree(name);
+	kfree(class);
+
+	KUNIT_ASSERT_EQ(test, parse_service(test, &b, true, &name, &class, &unit), 0);
+	KUNIT_EXPECT_EQ(test, unit, 3);
 	kfree(name);
 	kfree(class);
 }
@@ -271,6 +308,7 @@ static void parser_property_complete_test(struct kunit *test)
 static struct kunit_case parser_cases[] = {
 	KUNIT_CASE(parser_service_init_test),
 	KUNIT_CASE(parser_service_init_h17p_keys_test),
+	KUNIT_CASE(parser_service_init_v27_unit_test),
 	KUNIT_CASE(parser_service_init_truncated_test),
 	KUNIT_CASE(parser_nesting_test),
 	KUNIT_CASE(parser_bad_header_test),

@@ -5,7 +5,8 @@
 #include "ane_fw_transport.h"
 
 #define ANE_FW_DARTS 3
-#define ANE_FW_DAPF_RANGES 4
+/* DAPF records: four on T8140, five on T6050. */
+#define ANE_FW_DAPF_MAX 5
 
 struct ane_fw_cold_state {
 	u32 sys, cpu, subblock, gate_request, gate_ack;
@@ -42,7 +43,8 @@ static inline bool ane_fw_cold_gate_valid(const struct ane_fw_cold_state *s)
 	return s->gate_request == 3 && !s->gate_ack;
 }
 
-static inline bool ane_fw_cold_engine_valid(const struct ane_fw_cold_state *s)
+static inline bool ane_fw_cold_engine_valid(const struct ane_fw_cold_state *s,
+					    const struct ane_fw_platform *soc)
 {
 	unsigned int i;
 
@@ -58,7 +60,7 @@ static inline bool ane_fw_cold_engine_valid(const struct ane_fw_cold_state *s)
 	 * TCRs, so they read set on every boot once the DARTs are bound.
 	 */
 	for (i = 0; i < ANE_FW_DARTS; i++) {
-		if ((s->dart[i].version & 0xffff) != 0x203 ||
+		if ((s->dart[i].version & 0xffff) != soc->dart_revision ||
 		    (s->dart[i].protect & BIT(0)) ||
 		    (s->dart[i].lock & (BIT(0) | BIT(2))) || s->dart[i].error)
 			return false;
@@ -72,12 +74,14 @@ static inline bool ane_fw_cold_engine_valid(const struct ane_fw_cold_state *s)
  * DAPF are not judged; what must hold is no DART fault and no DART lock
  * that blocks re-attaching SID0.
  */
-static inline bool ane_fw_cold_engine_restartable(const struct ane_fw_cold_state *s)
+static inline bool ane_fw_cold_engine_restartable(const struct ane_fw_cold_state *s,
+						  const struct ane_fw_platform *soc)
 {
 	unsigned int i;
 
 	for (i = 0; i < ANE_FW_DARTS; i++)
-		if ((s->dart[i].version & 0xffff) != 0x203 || (s->dart[i].protect & BIT(0)) ||
+		if ((s->dart[i].version & 0xffff) != soc->dart_revision ||
+		    (s->dart[i].protect & BIT(0)) ||
 		    (s->dart[i].lock & (BIT(0) | BIT(2))) || s->dart[i].error)
 			return false;
 	return true;
@@ -101,10 +105,11 @@ static inline enum ane_fw_rvbar ane_fw_rvbar_check(u64 rvbar, u64 text)
 	return rvbar & 1 ? ANE_FW_RVBAR_FOREIGN : ANE_FW_RVBAR_WRITABLE;
 }
 
-static inline bool ane_fw_cold_valid(const struct ane_fw_cold_state *s, bool raw_boot)
+static inline bool ane_fw_cold_valid(const struct ane_fw_cold_state *s,
+				     const struct ane_fw_platform *soc, bool raw_boot)
 {
 	return ane_fw_cold_pmgr_valid(s, raw_boot) && ane_fw_cold_gate_valid(s) &&
-	       ane_fw_cold_engine_valid(s);
+	       ane_fw_cold_engine_valid(s, soc);
 }
 
 /* Bytes of firmware memory from the TEXT DVA (boot argument +0x10). */

@@ -100,7 +100,15 @@ struct apple_mbox *apple_mbox_get_byname(struct device *dev, const char *name);
 
 int apple_mbox_start(struct apple_mbox *mbox);
 void apple_mbox_stop(struct apple_mbox *mbox);
+/* For a caller with interrupts off, where apple_mbox_send()'s own deadline can't pass. */
+bool apple_mbox_send_ready(struct apple_mbox *mbox);
+int apple_mbox_restore(struct apple_mbox *mbox);
 int apple_mbox_poll(struct apple_mbox *mbox);
+/* Narrow no-post-callback-MMIO receive; see provider's supported transport guard. */
+bool apple_mbox_poll_one_supported(struct apple_mbox *mbox);
+int apple_mbox_poll_one(struct apple_mbox *mbox);
+/* Bit 0 of the receive control word, for firmware that powers itself down. */
+void apple_mbox_set_recv_enabled(struct apple_mbox *mbox, bool enabled);
 /*
  * Leave received messages in the hardware FIFO, without an interrupt, until
  * apple_mbox_release_rx().  For consumers that must not wake the system.
@@ -122,6 +130,14 @@ int apple_mbox_ascwrap_v6_get_lifecycle(
 int apple_mbox_ascwrap_v6_require_safe_cpu_lifecycle(struct apple_mbox *mbox);
 int apple_mbox_ascwrap_v6_start_cpu(struct apple_mbox *mbox);
 int apple_mbox_ascwrap_v6_stop_cpu(struct apple_mbox *mbox);
+/*
+ * For a CPU that a system sleep's last step stops with interrupts off: its control word, for
+ * polling its status, and the stop's register writes alone. Once the sleep is over,
+ * apple_mbox_ascwrap_v6_cpu_stopped() settles the books without touching the registers.
+ */
+void __iomem *apple_mbox_ascwrap_v6_cpu_control(struct apple_mbox *mbox);
+void apple_mbox_ascwrap_v6_stop_cpu_atomic(struct apple_mbox *mbox);
+int apple_mbox_ascwrap_v6_cpu_stopped(struct apple_mbox *mbox);
 int apple_mbox_ascwrap_v6_get_cpu_state(struct apple_mbox *mbox,
 				     u32 *control, u32 *status);
 

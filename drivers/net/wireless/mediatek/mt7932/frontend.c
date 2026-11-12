@@ -564,7 +564,8 @@ static void mt_cal_work(struct work_struct *work)
 	int ret;
 
 	mutex_lock(&m->command_mutex);
-	if (!READ_ONCE(m->rf_ready))
+	/* Stopped for a sleep, the requests wait for the restart. */
+	if (!READ_ONCE(m->rf_ready) || READ_ONCE(m->hif_suspended))
 		goto unlock;
 	ret = mt_request_input(m, &oca, "mediatek/mt7932/oca2.bin");
 	if (ret)
@@ -633,12 +634,15 @@ int mt_register_interface(struct mt7932 *m)
 	INIT_WORK(&m->connect_work, mt_connect_work);
 	INIT_WORK(&m->disconnect_work, mt_disconnect_work);
 	INIT_WORK(&m->power_work, mt_power_work);
+	INIT_WORK(&m->wow_work, mt_wow_work);
 	init_completion(&m->assoc_start);
 	init_completion(&m->assoc_done);
 	init_completion(&m->disconnect_done);
 	init_completion(&m->discovery_done);
 	init_completion(&m->scan_done);
-	m->peer_alloc = BIT(0) | BIT(19);
+	m->station_alloc = BIT(0) | BIT(19);
+	m->wtbl_alloc = BIT(0) | BIT(19);
+	m->wmm_alloc = BIT(0);
 	INIT_DELAYED_WORK(&m->scan_timeout_work, mt_scan_timeout_work);
 	m->netdev = netdev;
 	ret = register_netdev(netdev);
@@ -673,6 +677,11 @@ int mt_enable_scan(struct mt7932 *m)
 		return ret;
 	if (READ_ONCE(m->interface_up)) {
 		ret = mt_set_bss(m, true);
+		if (ret)
+			return ret;
+	}
+	if (IS_ENABLED(CONFIG_MT7932_AWDL) && READ_ONCE(m->awdl.interface_up)) {
+		ret = mt_awdl_activate(m);
 		if (ret)
 			return ret;
 	}
@@ -719,7 +728,13 @@ void mt_packet_receive(struct mt7932 *m, const u8 *packet, size_t length)
 					ieee80211_channel_to_frequency(frame.channel, frame.band));
 	if (!channel || (channel->flags & IEEE80211_CHAN_DISABLED))
 		return;
+	if (IS_ENABLED(CONFIG_MT7932_AWDL) && frame.bss == MT7932_AWDL_BSS_INDEX) {
+		mt_awdl_receive(m, &frame);
+		return;
+	}
 	if (frame.translated) {
+		if (frame.bss)
+			return;
 		mt_data_receive(m, &frame);
 		return;
 	}

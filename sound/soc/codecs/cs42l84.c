@@ -279,6 +279,8 @@ static const struct snd_soc_dapm_route cs42l84_audio_map[] = {
 
 	{"ADC", NULL, "HS"},
 	{"SDOUT1 Select", "ADC", "ADC"},
+	{"SDOUT1 Select", "ASP RX CH1", "SDIN1"},
+	{"SDOUT1 Select", "ASP RX CH2", "SDIN2"},
 	{"SDOUT1", NULL, "SDOUT1 Select"},
 	{"Capture", NULL, "SDOUT1"},
 

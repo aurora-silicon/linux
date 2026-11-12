@@ -2,6 +2,11 @@
 /* Populated board control clients. Transport ownership is not transferred. */
 
 &i2c4 {
+	/*
+	 * Unidentified client: a bare read may change its state. Keep it
+	 * disabled, and never probe, scan or read address 0x20. SD card
+	 * detection does not use it.
+	 */
 	sd_card_control: sd-card-control@20 {
 		compatible = "apple,t6000-sd-card-control", "apple,sd-card-control";
 		reg = <0x20>;

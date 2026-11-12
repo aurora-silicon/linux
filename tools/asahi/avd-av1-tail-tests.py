@@ -65,7 +65,7 @@ struct avd_decoded_buffer {
  struct {unsigned int color_size; unsigned short width,height; size_t seg_size;} av1;
 };
 struct avd_buf {void *cpu; dma_addr_t addr;};
-struct avd_run {struct {struct vb2_v4l2_buffer *src,*dst;} bufs; dma_addr_t y_out;};
+struct avd_run {struct {struct vb2_v4l2_buffer *src,*dst;} bufs; dma_addr_t y_out; int setup_err;};
 @RUN_STRUCT@
 @CTX_STRUCT@
 struct v4l2_ctrl {unsigned int elems; struct {void *p;} p_cur;};

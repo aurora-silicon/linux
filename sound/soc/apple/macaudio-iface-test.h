@@ -15,15 +15,16 @@ struct macaudio_test_iface {
 	struct snd_ctl_file *daemon;
 };
 
-/* A bound card with both interfaces: the volume lock in charge, at its ceiling */
-static void macaudio_test_iface_card(struct kunit *test, struct macaudio_test_iface *f)
+/* A bound card of @cfg with both interfaces: the volume lock in charge, at its ceiling */
+static void macaudio_test_iface_card_cfg(struct kunit *test, struct macaudio_test_iface *f,
+					 const struct macaudio_platform_cfg *cfg)
 {
 	struct snd_kcontrol_new slk = macaudio_test_control("Speaker Volume Unlock");
 	struct snd_kcontrol_new iface = macaudio_test_control("Speaker Protection Interface");
 	struct macaudio_snd_data *ma;
 	unsigned int i;
 
-	macaudio_test_spk_card(test, &f->t, &macaudio_j316_cfg, SN012776_0DB);
+	macaudio_test_spk_card(test, &f->t, cfg, SN012776_0DB);
 	ma = f->t.ma;
 	f->daemon = kunit_kzalloc(test, sizeof(*f->daemon), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, f->daemon);
@@ -42,6 +43,12 @@ static void macaudio_test_iface_card(struct kunit *test, struct macaudio_test_if
 	mutex_lock(&ma->volume_lock_mutex);
 	macaudio_vlimit_unlock(ma, false);
 	mutex_unlock(&ma->volume_lock_mutex);
+}
+
+/* As macaudio_test_iface_card_cfg(), for J316 */
+static void macaudio_test_iface_card(struct kunit *test, struct macaudio_test_iface *f)
+{
+	macaudio_test_iface_card_cfg(test, f, &macaudio_j316_cfg);
 }
 
 static int macaudio_test_iface_write(struct kunit *test, struct macaudio_test_iface *f,
@@ -238,6 +245,51 @@ static void macaudio_iface_needs_cap_sys_admin(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, macaudio_test_iface_write(test, &f, 2), -EINVAL);
 }
 
+/*
+ * J813: its four SN012776 (the fake card's Left/Right Woofer/Tweeter
+ * volumes, the J813 amps' prefixes) are behind both interfaces from the
+ * bind, as on the MCA machines. Under the volume lock they stay at its
+ * ceiling until a daemon holds the lock and pings; under the lease they are
+ * at the floor and no speaker start is admitted until an owner is granted.
+ */
+static void macaudio_iface_j813_speakers_protected(struct kunit *test)
+{
+	struct macaudio_test_iface f;
+
+	KUNIT_ASSERT_TRUE(test, macaudio_speakers_allowed(&macaudio_j813_cfg));
+	macaudio_test_iface_card_cfg(test, &f, &macaudio_j813_cfg);
+	KUNIT_EXPECT_FALSE(test, macaudio_spk_leased(f.t.ma));
+	KUNIT_EXPECT_FALSE(test, f.t.ma->speaker_volume_unlocked);
+	macaudio_test_expect_limit(test, &f, 1, 1);
+
+	/* A daemon that holds the lock but has not pinged lifts nothing */
+	macaudio_test_daemon_take(test, &f);
+	KUNIT_EXPECT_FALSE(test, f.t.ma->speaker_volume_unlocked);
+	macaudio_test_expect_limit(test, &f, 1, 1);
+	KUNIT_EXPECT_EQ(test, macaudio_test_daemon_ping(test, &f), 0);
+	KUNIT_EXPECT_TRUE(test, f.t.ma->speaker_volume_unlocked);
+	macaudio_test_expect_limit(test, &f, 1, SN012776_0DB);
+
+	/* Into the lease: the floor, and nothing admitted without an owner */
+	KUNIT_EXPECT_EQ(test, macaudio_test_iface_write(test, &f, MACAUDIO_SPK_IFACE_LEASE), 1);
+	KUNIT_EXPECT_TRUE(test, macaudio_spk_leased(f.t.ma));
+	KUNIT_EXPECT_FALSE(test, f.t.ma->speaker_volume_unlocked);
+	KUNIT_EXPECT_FALSE(test, macaudio_spk_admitted(f.t.ma));
+	macaudio_test_expect_limit(test, &f, 0, SN012776_0DB);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &f.t, 50), -EPERM);
+	KUNIT_EXPECT_FALSE(test, macaudio_spk_admitted(f.t.ma));
+
+	/* Its owner is granted the operating gain, and the floor on release */
+	macaudio_test_take(test, &f.t);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &f.t, 50), 0);
+	KUNIT_EXPECT_TRUE(test, macaudio_spk_admitted(f.t.ma));
+	macaudio_test_expect_limit(test, &f, SN012776_0DB, SN012776_0DB);
+	KUNIT_EXPECT_EQ(test, macaudio_test_write(test, &f.t, 0), 0);
+	macaudio_test_settle(f.t.ma);
+	KUNIT_EXPECT_FALSE(test, macaudio_spk_admitted(f.t.ma));
+	macaudio_test_expect_limit(test, &f, 0, SN012776_0DB);
+}
+
 /* The switch is no mixer setting: alsactl neither saves nor restores it */
 static void macaudio_iface_control_is_inactive(struct kunit *test)
 {
@@ -254,6 +306,7 @@ static struct kunit_case macaudio_iface_cases[] = {
 	KUNIT_CASE(macaudio_iface_unowned_lease_reverts),
 	KUNIT_CASE(macaudio_iface_needs_cap_sys_admin),
 	KUNIT_CASE(macaudio_iface_control_is_inactive),
+	KUNIT_CASE(macaudio_iface_j813_speakers_protected),
 	{}
 };
 

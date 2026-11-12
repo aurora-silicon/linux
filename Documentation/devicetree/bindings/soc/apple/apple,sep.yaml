@@ -39,12 +39,6 @@ properties:
   mbox-names:
     const: mbox
 
-  interrupts:
-    maxItems: 4
-    description:
-      The coprocessor's mailbox interrupts, on a SoC whose SEP mailbox is not
-      described as a separate node.
-
   clocks:
     maxItems: 1
 
@@ -83,6 +77,8 @@ required:
   - compatible
   - reg
   - iommus
+  - mboxes
+  - mbox-names
 
 allOf:
   - if:
@@ -91,26 +87,12 @@ allOf:
           contains:
             const: apple,t6050-sep
     then:
-      description:
-        The T6050 SEP is described from the ADT and stays disabled until its
-        mailbox and firmware handoff are supported.
       properties:
         reg:
           minItems: 2
-        interrupts:
-          minItems: 4
-        status:
-          const: disabled
-      required:
-        - interrupts
-        - status
     else:
       properties:
-        interrupts: false
         clocks: false
-      required:
-        - mboxes
-        - mbox-names
 
 additionalProperties: false
 

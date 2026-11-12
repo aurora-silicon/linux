@@ -215,6 +215,9 @@ void apple_rtkit_set_handshake_timeout(struct apple_rtkit *rtk,
  */
 int apple_rtkit_boot(struct apple_rtkit *rtk);
 
+/* apple_rtkit_boot(), calling @before_ap between the IOP's report and the AP going on. */
+int apple_rtkit_boot_with(struct apple_rtkit *rtk, void (*before_ap)(void *data), void *data);
+
 /*
  * Mark an instance created with apple_rtkit_init() as running without a
  * handshake, see apple_rtkit_init_adopted().
@@ -235,6 +238,14 @@ int apple_rtkit_wake(struct apple_rtkit *rtk);
 int apple_rtkit_wake_early_ap(struct apple_rtkit *rtk);
 
 /*
+ * Wake a co-processor stopped after apple_rtkit_idle() with its firmware,
+ * endpoints and buffers kept: restore the mailbox, resume RX, call @start to
+ * start its CPU, then complete HELLO, the endpoint map (with the started
+ * endpoints, no INIT and no new endpoint start) and IOP/AP ON.
+ */
+int apple_rtkit_wake_retained(struct apple_rtkit *rtk, int (*start)(void *), void *ctx);
+
+/*
  * Shutdown the co-processor
  */
 int apple_rtkit_shutdown(struct apple_rtkit *rtk);
@@ -250,6 +261,92 @@ int apple_rtkit_poweroff(struct apple_rtkit *rtk);
  * Put the co-processor into idle mode
  */
 int apple_rtkit_idle(struct apple_rtkit *rtk);
+
+/*
+ * Turn the mailbox off for a co-processor that has acknowledged idle, before its
+ * run bit and power state go. Only apple_rtkit_warm_restart() follows this.
+ */
+void apple_rtkit_mailbox_off(struct apple_rtkit *rtk);
+
+/*
+ * The same with interrupts off and one CPU up, for a co-processor that doesn't come
+ * back from idle without losing power, so that its idle has to follow every refusal.
+ * @us is about how long the two acknowledgements took. Only
+ * apple_rtkit_warm_restart() follows this, once the sleep has reached the hardware.
+ */
+int apple_rtkit_sleep_idle_polled(struct apple_rtkit *rtk, void __iomem *cpu_control,
+				  unsigned int *us);
+
+/*
+ * Only the mailbox's receive bit, for the moment before that co-processor's run bit
+ * goes. Safe with interrupts off, and apple_rtkit_warm_restart() sets it again.
+ */
+void apple_rtkit_mailbox_recv_off(struct apple_rtkit *rtk);
+
+/*
+ * Prepare for a firmware being restarted with its buffers kept.
+ */
+int apple_rtkit_warm_restart(struct apple_rtkit *rtk);
+
+/*
+ * For a firmware whose last endpoint map is answered, on a warm restart, with
+ * only the endpoints in @last_mask rather than an echo of all of them.
+ */
+void apple_rtkit_set_warm_epmap_mask(struct apple_rtkit *rtk, u32 last_mask);
+
+/*
+ * Tell a co-processor that keeps running across a system sleep about the AP's
+ * power state, without changing its own: idle before the sleep and on after.
+ */
+int apple_rtkit_ap_power(struct apple_rtkit *rtk, bool on);
+
+/* The same, for a noirq phase: device interrupts are off, so it polls. */
+int apple_rtkit_ap_power_noirq(struct apple_rtkit *rtk, bool on);
+
+/*
+ * Stop a co-processor for a system sleep that may remove its power: idle, wait
+ * for the status that shows it has finished, then clear the run bit. On an error
+ * the run bit is still set and the firmware still runs.
+ *
+ * @cpu_control: the ASC's CPU control register.
+ */
+int apple_rtkit_sleep_stop(struct apple_rtkit *rtk, void __iomem *cpu_control);
+
+/*
+ * Bring back a co-processor taken down for a system sleep with
+ * apple_rtkit_sleep_stop() or apple_rtkit_idle(), from a process context with its
+ * mailbox's supplier resumed.
+ *
+ * Where the sleep reached the hardware (pm_resume_via_firmware()) the firmware
+ * restarts and keeps its buffers and endpoints: this restarts the receive path, sets
+ * the run bit, echoes the endpoint map and takes the IOP state it reports unasked,
+ * then sets the AP state. Where it didn't, one that idled gets -EAGAIN: an idled
+ * firmware doesn't wake with its power kept, so it stays down, and comes back the
+ * same way after the next sleep that does reach the hardware. One whose idle
+ * failed still runs, and gets 0 once its AP state is on again.
+ *
+ * @cpu_control: the ASC's CPU control register.
+ */
+int apple_rtkit_sleep_return(struct apple_rtkit *rtk, void __iomem *cpu_control);
+
+/*
+ * A start as after a real sleep, for a co-processor its driver power-cycled without one:
+ * the warm restart, the run bit set, then RTKit's handshake.
+ */
+int apple_rtkit_power_cycled_return(struct apple_rtkit *rtk, void __iomem *cpu_control);
+
+/*
+ * The first half of apple_rtkit_sleep_return() after a real sleep: the restart and the run
+ * bit, with no wait. apple_rtkit_boot() then waits for the firmware to report on, so other
+ * firmware can be started in between. -EOPNOTSUPP after a sleep that kept the power.
+ */
+int apple_rtkit_sleep_return_start(struct apple_rtkit *rtk, void __iomem *cpu_control);
+
+/*
+ * Echo each OSLOG channel-0 counter the firmware sends, as macOS does. On by default on
+ * T8140, where a firmware with one outstanding takes no AP power notice.
+ */
+void apple_rtkit_set_oslog_echo(struct apple_rtkit *rtk, bool echo);
 
 /*
  * Checks if RTKit is running and ready to handle messages.
@@ -292,6 +389,21 @@ int apple_rtkit_send_message(struct apple_rtkit *rtk, u8 ep, u64 message,
  * @rtk:            RTKit reference
  */
 int apple_rtkit_poll(struct apple_rtkit *rtk);
+
+/*
+ * A port that only answers the co-processor, polled, with no interrupts. Map answers
+ * its HELLO and endpoint map, and on brings the AP side of the port up. Handshake is
+ * both. Idle takes the AP side down. Restart prepares for a co-processor that was
+ * stopped.
+ */
+int apple_rtkit_port_map(struct apple_rtkit *rtk, unsigned int timeout_ms);
+int apple_rtkit_port_on(struct apple_rtkit *rtk, unsigned int timeout_ms);
+int apple_rtkit_port_handshake(struct apple_rtkit *rtk, unsigned int timeout_ms);
+int apple_rtkit_port_idle(struct apple_rtkit *rtk, unsigned int timeout_ms);
+int apple_rtkit_port_restart(struct apple_rtkit *rtk);
+
+/* apple_rtkit_idle(), calling @after_ap between the AP's idle and the IOP's. */
+int apple_rtkit_idle_with(struct apple_rtkit *rtk, void (*after_ap)(void *data), void *data);
 
 /*
  * Stop taking interrupts for messages from the co-processor, which then

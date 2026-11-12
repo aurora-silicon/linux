@@ -15,6 +15,7 @@
 #include <linux/atomic.h>
 #include <linux/bits.h>
 #include <linux/bitfield.h>
+#include <linux/bitops.h>
 #include <linux/device.h>
 #include <linux/io.h>
 #include <linux/limits.h>
@@ -22,8 +23,8 @@
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
+#include <linux/suspend.h>
 #include <linux/types.h>
-#include "sart-backend.h"
 
 #define APPLE_SART_MAX_ENTRIES 16
 
@@ -54,14 +55,18 @@
 /* SARTv3 registers */
 #define APPLE_SART3_CONFIG(idx) (0x00 + 4 * (idx))
 
-#define APPLE_SART3_PADDR(idx)	(0x40 + 4 * (idx))
+#define APPLE_SART3_PADDR	0x40
 #define APPLE_SART3_PADDR_SHIFT 12
 
-#define APPLE_SART3_SIZE(idx)  (0x80 + 4 * (idx))
+#define APPLE_SART3_SIZE       0x80
 #define APPLE_SART3_SIZE_SHIFT 12
 #define APPLE_SART3_SIZE_MAX   GENMASK(29, 0)
 
 #define APPLE_SART3_FLAGS_ALLOW 0xff
+
+/* SARTv4 (M5): SARTv3's entries, with the address and size arrays moved up */
+#define APPLE_SART4_PADDR 0x60
+#define APPLE_SART4_SIZE  0xc0
 
 struct apple_sart_ops {
 	void (*get_entry)(struct apple_sart *sart, int index, u8 *flags,
@@ -70,6 +75,9 @@ struct apple_sart_ops {
 			  phys_addr_t paddr_shifted, size_t size_shifted);
 	/* This is probably a bitfield but the exact meaning of each bit is unknown. */
 	unsigned int flags_allow;
+	/* SARTv3/v4: where the address and size arrays start */
+	unsigned int paddr_reg;
+	unsigned int size_reg;
 	unsigned int size_shift;
 	unsigned int paddr_shift;
 	size_t size_max;
@@ -83,32 +91,16 @@ struct apple_sart {
 
 	unsigned long protected_entries;
 	unsigned long used_entries;
-	const struct apple_sart_backend *backend;
-	void *backend_data;
+	/* The registers as they stood before a firmware-driven suspend */
+	struct {
+		u8 flags;
+		phys_addr_t paddr;
+		size_t size;
+	} saved[APPLE_SART_MAX_ENTRIES];
+	bool saved_valid;
+	/* saved[] still holds the last sleep's entries, for apple_sart_replay() */
+	bool replay_valid;
 };
-
-struct apple_sart *apple_sart_create_backend(struct device *dev,
-		const struct apple_sart_backend *backend, void *data)
-{
-	struct apple_sart *sart;
-
-	if (!backend || !backend->add || !backend->remove)
-		return ERR_PTR(-EINVAL);
-	sart = devm_kzalloc(dev, sizeof(*sart), GFP_KERNEL);
-	if (!sart)
-		return ERR_PTR(-ENOMEM);
-	sart->dev = dev;
-	sart->backend = backend;
-	sart->backend_data = data;
-	return sart;
-}
-EXPORT_SYMBOL_GPL(apple_sart_create_backend);
-
-void *apple_sart_backend_data(struct apple_sart *sart)
-{
-	return sart->backend_data;
-}
-EXPORT_SYMBOL_GPL(apple_sart_backend_data);
 
 static void sart0_get_entry(struct apple_sart *sart, int index, u8 *flags,
 	phys_addr_t *paddr, size_t *size)
@@ -179,8 +171,8 @@ static struct apple_sart_ops sart_ops_v2 = {
 static void sart3_get_entry(struct apple_sart *sart, int index, u8 *flags,
 			    phys_addr_t *paddr, size_t *size)
 {
-	phys_addr_t paddr_ = readl(sart->regs + APPLE_SART3_PADDR(index));
-	size_t size_ = readl(sart->regs + APPLE_SART3_SIZE(index));
+	phys_addr_t paddr_ = readl(sart->regs + sart->ops->paddr_reg + 4 * index);
+	size_t size_ = readl(sart->regs + sart->ops->size_reg + 4 * index);
 
 	*flags = readl(sart->regs + APPLE_SART3_CONFIG(index));
 	*size = size_ << APPLE_SART3_SIZE_SHIFT;
@@ -190,8 +182,8 @@ static void sart3_get_entry(struct apple_sart *sart, int index, u8 *flags,
 static void sart3_set_entry(struct apple_sart *sart, int index, u8 flags,
 			    phys_addr_t paddr_shifted, size_t size_shifted)
 {
-	writel(paddr_shifted, sart->regs + APPLE_SART3_PADDR(index));
-	writel(size_shifted, sart->regs + APPLE_SART3_SIZE(index));
+	writel(paddr_shifted, sart->regs + sart->ops->paddr_reg + 4 * index);
+	writel(size_shifted, sart->regs + sart->ops->size_reg + 4 * index);
 	writel(flags, sart->regs + APPLE_SART3_CONFIG(index));
 }
 
@@ -199,6 +191,19 @@ static struct apple_sart_ops sart_ops_v3 = {
 	.get_entry = sart3_get_entry,
 	.set_entry = sart3_set_entry,
 	.flags_allow = APPLE_SART3_FLAGS_ALLOW,
+	.paddr_reg = APPLE_SART3_PADDR,
+	.size_reg = APPLE_SART3_SIZE,
+	.size_shift = APPLE_SART3_SIZE_SHIFT,
+	.paddr_shift = APPLE_SART3_PADDR_SHIFT,
+	.size_max = APPLE_SART3_SIZE_MAX,
+};
+
+static struct apple_sart_ops sart_ops_v4 = {
+	.get_entry = sart3_get_entry,
+	.set_entry = sart3_set_entry,
+	.flags_allow = APPLE_SART3_FLAGS_ALLOW,
+	.paddr_reg = APPLE_SART4_PADDR,
+	.size_reg = APPLE_SART4_SIZE,
 	.size_shift = APPLE_SART3_SIZE_SHIFT,
 	.paddr_shift = APPLE_SART3_PADDR_SHIFT,
 	.size_max = APPLE_SART3_SIZE_MAX,
@@ -236,6 +241,7 @@ static int apple_sart_probe(struct platform_device *pdev)
 			i, flags, &paddr, size);
 		set_bit(i, &sart->protected_entries);
 	}
+	dev_dbg(dev, "%lu bootloader entries protected\n", hweight_long(sart->protected_entries));
 
 	platform_set_drvdata(pdev, sart);
 	return 0;
@@ -282,8 +288,6 @@ bool apple_sart_is_inherited_region(struct apple_sart *sart, phys_addr_t paddr,
 {
 	int i;
 
-	if (sart->backend)
-		return sart->backend->inherited && sart->backend->inherited(sart, paddr, size);
 	if (!size || paddr > PHYS_ADDR_MAX - (size - 1))
 		return false;
 	for (i = 0; i < APPLE_SART_MAX_ENTRIES; i++) {
@@ -326,8 +330,6 @@ int apple_sart_add_allowed_region(struct apple_sart *sart, phys_addr_t paddr,
 {
 	int i, ret;
 
-	if (sart->backend)
-		return sart->backend->add(sart, paddr, size);
 	for (i = 0; i < APPLE_SART_MAX_ENTRIES; ++i) {
 		if (test_bit(i, &sart->protected_entries))
 			continue;
@@ -362,8 +364,6 @@ int apple_sart_remove_allowed_region(struct apple_sart *sart, phys_addr_t paddr,
 {
 	int i;
 
-	if (sart->backend)
-		return sart->backend->remove(sart, paddr, size);
 	dev_dbg(sart->dev,
 		"will remove [paddr: %pa, size: 0x%zx] from allowed regions\n",
 		&paddr, size);
@@ -408,7 +408,103 @@ static void apple_sart_shutdown(struct platform_device *pdev)
 	}
 }
 
+/*
+ * A SART in a domain that a firmware-driven suspend powers off comes back empty,
+ * and its coprocessor can't reach its firmware or buffers until the entries are
+ * back. This includes the bootloader's, which Linux otherwise never writes.
+ */
+static int apple_sart_suspend_late(struct device *dev)
+{
+	struct apple_sart *sart = dev_get_drvdata(dev);
+	int i;
+
+	sart->saved_valid = false;
+	sart->replay_valid = false;
+	if (pm_suspend_target_state != PM_SUSPEND_MEM || !pm_suspend_via_firmware())
+		return 0;
+
+	for (i = 0; i < APPLE_SART_MAX_ENTRIES; i++)
+		sart->ops->get_entry(sart, i, &sart->saved[i].flags,
+				     &sart->saved[i].paddr, &sart->saved[i].size);
+	sart->saved_valid = true;
+
+	return 0;
+}
+
+static int apple_sart_resume_noirq(struct device *dev)
+{
+	struct apple_sart *sart = dev_get_drvdata(dev);
+	unsigned int restored = 0;
+	int i;
+
+	if (!sart->saved_valid || !pm_resume_via_firmware())
+		return 0;
+	sart->saved_valid = false;
+
+	for (i = 0; i < APPLE_SART_MAX_ENTRIES; i++) {
+		/* An unused entry stays as the power left it, whatever that reads. */
+		if (!sart->saved[i].size && !sart->saved[i].flags)
+			continue;
+		/* Every one in use, the same or not: macOS rewrites 0 to 7 at every wake. */
+		sart->ops->set_entry(sart, i, sart->saved[i].flags,
+				     sart->saved[i].paddr >> sart->ops->paddr_shift,
+				     sart->saved[i].size >> sart->ops->size_shift);
+		restored++;
+	}
+	dev_dbg(dev, "%u entries restored after sleep\n", restored);
+	sart->replay_valid = true;
+
+	return 0;
+}
+
+/*
+ * A coprocessor's driver calls this right before its run bit. macOS writes the entries back
+ * there, config first, then address, then size, so this does the same on SARTv3. Unused
+ * entries stay as they read.
+ */
+int apple_sart_replay(struct apple_sart *sart)
+{
+	int i, bad = 0;
+
+	if (sart->ops != &sart_ops_v3 || !sart->replay_valid)
+		return -EOPNOTSUPP;
+
+	for (i = 0; i < APPLE_SART_MAX_ENTRIES; i++) {
+		phys_addr_t paddr;
+		size_t size;
+		u8 flags;
+
+		if (!sart->saved[i].size && !sart->saved[i].flags)
+			continue;
+		writel(sart->saved[i].flags, sart->regs + APPLE_SART3_CONFIG(i));
+		writel(sart->saved[i].paddr >> APPLE_SART3_PADDR_SHIFT,
+		       sart->regs + sart->ops->paddr_reg + 4 * i);
+		writel(sart->saved[i].size >> APPLE_SART3_SIZE_SHIFT,
+		       sart->regs + sart->ops->size_reg + 4 * i);
+		sart->ops->get_entry(sart, i, &flags, &paddr, &size);
+		if (flags == sart->saved[i].flags && paddr == sart->saved[i].paddr &&
+		    size == sart->saved[i].size)
+			continue;
+		bad++;
+		dev_warn(sart->dev, "entry %d reads %#x %pa+%#zx, wrote %#x %pa+%#zx\n",
+			 i, flags, &paddr, size, sart->saved[i].flags, &sart->saved[i].paddr,
+			 sart->saved[i].size);
+	}
+
+	return bad;
+}
+EXPORT_SYMBOL_GPL(apple_sart_replay);
+
+static const struct dev_pm_ops apple_sart_pm_ops = {
+	LATE_SYSTEM_SLEEP_PM_OPS(apple_sart_suspend_late, NULL)
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(NULL, apple_sart_resume_noirq)
+};
+
 static const struct of_device_id apple_sart_of_match[] = {
+	{
+		.compatible = "apple,t6050-sart",
+		.data = &sart_ops_v4,
+	},
 	{
 		.compatible = "apple,t6000-sart",
 		.data = &sart_ops_v3,
@@ -429,6 +525,7 @@ static struct platform_driver apple_sart_driver = {
 	.driver = {
 		.name = "apple-sart",
 		.of_match_table = apple_sart_of_match,
+		.pm = pm_sleep_ptr(&apple_sart_pm_ops),
 	},
 	.probe = apple_sart_probe,
 	.shutdown = apple_sart_shutdown,

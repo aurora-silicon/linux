@@ -49,6 +49,7 @@
 #ifndef __ANE_T6021_LIFETIME_H__
 #define __ANE_T6021_LIFETIME_H__
 
+#include <asm/byteorder.h>
 #include <linux/errno.h>
 #include <linux/limits.h>
 #include <linux/sizes.h>
@@ -705,6 +706,41 @@ static inline int ane_t6021_restart_run(const struct ane_t6021_restart_ops *ops,
 		return ret;
 	*stage = ANE_T6021_RESTART_DONE;
 	return 0;
+}
+
+/*
+ * CH_PROPERTY_WRITE body: three little-endian words after the command
+ * header, on the command channel. The engine performance mode is one of
+ * these properties: macOS writes it with value 1 once at every firmware
+ * power-on, and with it the per-call overhead drops on the M2 (about 7 us
+ * per call, 5 to 10 us per MobileNet ring). 1 is the only value written.
+ */
+#define ANE_T6021_PROP_CHANNEL_OFF	0x08	/* channel the property belongs to */
+#define ANE_T6021_PROP_ID_OFF		0x0c	/* property id */
+#define ANE_T6021_PROP_VALUE_OFF	0x10	/* new value */
+#define ANE_T6021_PROP_WRITE_LEN	0x14	/* header + the three words */
+#define ANE_T6021_PROP_CHANNEL_ENGINE	0	/* the engine-wide channel */
+#define ANE_T6021_PROP_PERF_MODE	0x10aa	/* engine performance mode */
+#define ANE_T6021_PERF_MODE_ON		1
+
+/*
+ * Fill @cmd (at least ANE_T6021_PROP_WRITE_LEN bytes, the header left to the
+ * transport) with a property write and return its length.
+ */
+static inline size_t ane_t6021_prop_write(u8 *cmd, u32 channel, u32 prop,
+					  u32 value)
+{
+	*(__le32 *)(cmd + ANE_T6021_PROP_CHANNEL_OFF) = cpu_to_le32(channel);
+	*(__le32 *)(cmd + ANE_T6021_PROP_ID_OFF) = cpu_to_le32(prop);
+	*(__le32 *)(cmd + ANE_T6021_PROP_VALUE_OFF) = cpu_to_le32(value);
+	return ANE_T6021_PROP_WRITE_LEN;
+}
+
+static inline size_t ane_t6021_perf_mode_cmd(u8 *cmd)
+{
+	return ane_t6021_prop_write(cmd, ANE_T6021_PROP_CHANNEL_ENGINE,
+				    ANE_T6021_PROP_PERF_MODE,
+				    ANE_T6021_PERF_MODE_ON);
 }
 
 #endif /* __ANE_T6021_LIFETIME_H__ */

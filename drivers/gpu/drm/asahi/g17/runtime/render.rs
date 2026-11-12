@@ -524,8 +524,38 @@ impl Registry {
 struct Host<'a> {
     firmware: &'a mut crate::g17::Firmware,
     registration_powered: bool,
+    /// An M5 pair's installation, submitted with its first outer publication.
+    m5_registration: Option<crate::g17::fw::m5::queue::HardwareSubmission>,
+    /// M5: the shared ring's room check of this publication, by priority. Its consumers stay
+    /// conservative for the whole hold (the firmware only advances them); its producer
+    /// serves the first pair written to the ring only.
+    outer_cursors: Option<(u8, [u32; 3])>,
+    outer_producer_used: bool,
 }
 impl Host<'_> {
+    /// The room check's cursors for the first pair this publication writes to the ring.
+    fn room_cursors(&mut self, priority: u8) -> Option<[u32; 3]> {
+        if core::mem::replace(&mut self.outer_producer_used, true) {
+            return None;
+        }
+        self.outer_cursors
+            .filter(|&(checked, _)| checked == priority)
+            .map(|(_, cursors)| cursors)
+    }
+
+    /// The room check's consumers with the producer read now: a retained pair revalidates the
+    /// producer it was prepared against.
+    fn retained_cursors(&mut self, priority: u8) -> Result<Option<[u32; 3]>> {
+        self.outer_producer_used = true;
+        let Some((checked, [consumer, consumer_b, _])) = self.outer_cursors else {
+            return Ok(None);
+        };
+        if checked != priority {
+            return Ok(None);
+        }
+        Ok(Some([consumer, consumer_b, self.firmware.init.work_producer(priority)?]))
+    }
+
     fn release_registration(&mut self) {
         if !self.registration_powered && !self.firmware.registration_power_release_pending {
             return;
@@ -542,6 +572,9 @@ impl Host<'_> {
     }
 }
 impl crate::g17::queue::render::Host for Host<'_> {
+    fn generation(&self) -> u64 {
+        self.firmware.recovery.generation()
+    }
     fn epoch(&self) -> Result<(u64, u32)> {
         Ok((
             self.firmware.recovery.generation(),
@@ -571,8 +604,18 @@ impl crate::g17::queue::render::Host for Host<'_> {
     /// Idle descent is held for the whole first install. A point-in-time power
     /// check let the firmware gate the cores between the host's configuration
     /// writes while several clients installed their first pairs at once.
-    fn install_pair(&mut self, registration: &crate::g17::fw::kick::RenderRegistration) -> Result {
+    /// M5's host command port installs and kicks the pair in one transaction:
+    /// its registration is retained until the outer publication, without the
+    /// core-power hold.
+    fn install_pair(&mut self, registration: &crate::g17::queue::render::Registration) -> Result {
         use crate::g17::fw::variant::QueueRegistration;
+        let registration = match registration {
+            crate::g17::queue::render::Registration::M5(submission) => {
+                self.m5_registration = Some(*submission);
+                return Ok(());
+            }
+            crate::g17::queue::render::Registration::Neo(registration) => registration,
+        };
         match self.firmware.variant.registration {
             QueueRegistration::Firmware => return Ok(()),
             QueueRegistration::Mailbox => {
@@ -611,12 +654,47 @@ impl crate::g17::queue::render::Host for Host<'_> {
         commit: impl FnOnce() -> Result,
         late_tiling: impl FnOnce(),
     ) -> Result<[u32; 2]> {
+        if self.firmware.init.is_m5() {
+            let submission = match self.m5_registration.take() {
+                Some(submission) => submission,
+                None => crate::g17::fw::m5::queue::HardwareSubmission::advance_pair(
+                    fragment.qid,
+                    tiling.qid,
+                )?,
+            };
+            let cursors = self.room_cursors(priority);
+            return self.firmware.submit_m5_render_pair(
+                priority,
+                &[copy_slot(fragment), copy_slot(tiling)],
+                &submission,
+                commit,
+                late_tiling,
+                true,
+                cursors,
+            );
+        }
         self.firmware
             .init
             .publish_work_pair(priority, fragment, tiling, true, commit, late_tiling)
     }
+    fn publish_configuration_pair(
+        &mut self,
+        priority: u8,
+        fragment: &crate::g17::fw::channels::WorkSlot,
+        tiling: &crate::g17::fw::channels::WorkSlot,
+        prepare: impl FnOnce(),
+    ) -> Result {
+        let cursors = self.room_cursors(priority);
+        let pair = self.firmware.init.m5_work_pair(priority, fragment, tiling, cursors)?;
+        pair.prepare();
+        prepare();
+        pair.publish();
+        Ok(())
+    }
     fn activate_render_pool(&mut self, id: u16, generation: u64) -> Result {
-        self.release_registration();
+        if !self.firmware.init.is_m5() {
+            self.release_registration();
+        }
         let result = self.firmware.queues.render.pools.activate(id, generation);
         if result.is_err() {
             self.firmware.primary.state.shared.lose_device_quietly();
@@ -630,25 +708,37 @@ impl crate::g17::queue::render::Host for Host<'_> {
         tiling: &crate::g17::fw::channels::WorkSlot,
         next: [u32; 2],
     ) -> Result {
-        let result = self
-            .firmware
-            .init
-            .publish_retained_work_pair(priority, fragment, tiling, next);
+        let result = self.retained_cursors(priority).and_then(|cursors| {
+            self.firmware
+                .init
+                .publish_retained_work_pair(priority, fragment, tiling, next, cursors)
+        });
         if result.is_err() {
             self.firmware.primary.state.shared.lose_device_quietly();
         }
         result
     }
-    /// Pipe 0 (tiling) in bits 1:0, priority class in bits 3:2.
+    /// Pipe 0 (tiling) in bits 1:0, priority class in bits 3:2. M5 renders
+    /// use the common compute work ring, pipe 2.
     fn notify_render(&mut self, priority: u8) -> Result {
         self.release_registration();
-        crate::g17::trace::doorbell(crate::g17::trace::RENDER, || {
-            self.firmware.bridge.regs.g17_core_power()
-        });
-        let result = self
-            .firmware
-            .primary
-            .notify((0x83 << crate::g17::MSG_TYPE_SHIFT) | u64::from(priority) << 2);
+        let m5 = self.firmware.init.is_m5();
+        if m5 {
+            // A paired publication is one tiling and one fragment submission, counted in
+            // one slot.
+            if let Err(error) = self.firmware.init.note_m5_submission_history(2) {
+                pr_warn!("asahi: M5 submission history skipped: {:?}\n", error);
+            }
+        } else {
+            crate::g17::trace::doorbell(crate::g17::trace::RENDER, || {
+                self.firmware.bridge.regs.g17_core_power()
+            });
+        }
+        let result = self.firmware.primary.notify(
+            (0x83 << crate::g17::MSG_TYPE_SHIFT)
+                | u64::from(priority) << 2
+                | if m5 && !crate::g17::J813_FORMS.load(core::sync::atomic::Ordering::Relaxed) { 2 } else { 0 },
+        );
         if result.is_err() {
             self.firmware.primary.state.shared.lose_device_quietly();
         }
@@ -684,12 +774,35 @@ impl crate::g17::queue::render::Host for Host<'_> {
     }
 }
 
+/// The M5 pair submission takes both work slots as one array.
+fn copy_slot(slot: &crate::g17::fw::channels::WorkSlot) -> crate::g17::fw::channels::WorkSlot {
+    crate::g17::fw::channels::WorkSlot {
+        unk_00: slot.unk_00,
+        queue_va: slot.queue_va,
+        data_master: slot.data_master,
+        items_end: slot.items_end,
+        qid: slot.qid,
+        first: slot.first,
+    }
+}
+
 impl crate::g17::Firmware {
     /// The pair is returned even when transport, accounting or collection fails.
     /// No off-lock operation or callback which can re-enter the device runs here.
     fn with_render<R>(
         &mut self,
         slot: usize,
+        operation: impl FnOnce(&mut Pair, &mut Host<'_>) -> Result<R>,
+    ) -> Result<R> {
+        self.with_render_at(slot, None, operation)
+    }
+
+    /// [`Self::with_render`] for a publication whose shared-ring room check, made in this
+    /// hold, sampled `outer_cursors`.
+    fn with_render_at<R>(
+        &mut self,
+        slot: usize,
+        outer_cursors: Option<(u8, [u32; 3])>,
         operation: impl FnOnce(&mut Pair, &mut Host<'_>) -> Result<R>,
     ) -> Result<R> {
         let mut pair = self
@@ -703,6 +816,9 @@ impl crate::g17::Firmware {
         let mut host = Host {
             firmware: self,
             registration_powered: false,
+            m5_registration: None,
+            outer_cursors,
+            outer_producer_used: false,
         };
         let result = operation(&mut pair, &mut host);
         host.release_registration();
@@ -1038,6 +1154,28 @@ impl Registry {
         }
         Ok(())
     }
+    /// No graph is being built or grown.
+    pub(in crate::g17) fn render_settled(&self) -> bool {
+        self.render
+            .entries
+            .iter()
+            .flatten()
+            .all(|entry| entry.preparing.is_none() && !entry.growing)
+    }
+
+    /// The firmware restarted with no power on the cores: nothing it was told about a pair through
+    /// their registers can be relied on, so the next command installs it again.
+    pub(in crate::g17) fn forget_render_registrations(&mut self) {
+        for entry in self.render.entries.iter_mut().flatten() {
+            if let Some(pair) = entry.pair.as_mut() {
+                pair.forget_registration();
+            }
+            if let Some(parked) = entry.parked.as_mut() {
+                parked.forget_registration();
+            }
+        }
+    }
+
     pub(in crate::g17) fn render_in_flight(&self) -> bool {
         self.render.entries.iter().flatten().any(|entry| {
             entry.pair.as_ref().map_or(

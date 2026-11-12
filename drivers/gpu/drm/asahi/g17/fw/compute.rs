@@ -180,6 +180,16 @@ pub(crate) struct OperandState {
 }
 
 impl OperandState {
+    /// Size of one preemption bank, the region the M5 program exchanges.
+    pub(crate) const fn bank_bytes(&self) -> u32 {
+        self.r0a5c9 as u32
+    }
+
+    /// Offset of the per-cluster tails, the M5 program's auxiliary area.
+    pub(crate) const fn tail_offset(&self) -> u32 {
+        self.r140a8 as u32
+    }
+
     /// One cluster of six cores (A18 Pro).
     pub(crate) const ONE_BY_SIX: OperandState = OperandState {
         r10229: 0x12800,
@@ -189,6 +199,17 @@ impl OperandState {
         r0a5c1: 0x0005,
         r0a5c9: 0x9000,
         size: 0x14000,
+    };
+    /// One cluster of ten cores (M5, J813), by ONE_BY_SIX's and TWO_BY_TEN's pattern: a bank of
+    /// ten slots of 0x1800, one tail of 0x800, the end rounded up to 16 KiB.
+    pub(crate) const ONE_BY_TEN: OperandState = OperandState {
+        r10229: 0x1e800,
+        r140a8: 0x1f000,
+        r10099: 0xf405,
+        r10091: 0x1e400,
+        r0a5c1: 0x0005,
+        r0a5c9: 0xf000,
+        size: 0x20000,
     };
     /// Two clusters of ten cores (M4 Pro): bank stride 0x1e400, tails 0x1000.
     pub(crate) const TWO_BY_TEN: OperandState = OperandState {
@@ -208,6 +229,17 @@ impl OperandState {
         r0a5c1: 0x0005,
         r0a5c9: 0x3c000,
         size: 0x80000,
+    };
+    /// Eight clusters of ten cores (M5 Ultra): bank stride 0x78400, tails 0x4000. The size is
+    /// the M5 compute queues' operand buffer, the tails' end rounded up to 16 KiB.
+    pub(crate) const EIGHT_BY_TEN: OperandState = OperandState {
+        r10229: 0xf0800,
+        r140a8: 0xf4800,
+        r10099: 0x78405,
+        r10091: 0xf0400,
+        r0a5c1: 0x0005,
+        r0a5c9: 0x78000,
+        size: 0xf8000,
     };
 }
 

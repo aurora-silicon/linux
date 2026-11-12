@@ -131,6 +131,7 @@ struct apple_dcp {
  struct delayed_work typec_reconnect_wq, placeholder_edid_wq;
  struct work_struct external_stop_work;
  bool external_running, external_stopped, external_power_attempted;
+ unsigned int afk_power_gen;
  bool external_stop_deferred; unsigned int external_stop_retries;
  struct delayed_work external_stop_retry_wq;
  bool external_cable, typec_cable_connected, typec_crtc_off, pipe_enabled_h17p;
@@ -792,6 +793,8 @@ static int dcp_external_stop_locked(struct apple_dcp *d, u64 generation)
 { (void)d; (void)generation; return 0; }
 static void dcp_external_crtc_released(struct apple_dcp *d) { (void)d; }
 static bool dcp_uses_soft_dpms(struct apple_dcp *d) { return d->soft_dpms; }
+/* The T8140 display power cycle has its own test on hardware; here it only has to be reached. */
+static void dcp_dpms_power_off(struct apple_dcp *d) { (void)d; }
 static bool __attribute__((unused)) dcp_has_panel(struct apple_dcp *d) { return !d->typec_output; }
 static void __attribute__((unused)) iomfb_blank_h17p(struct apple_dcp *d)
 { (void)d; assert(!"unexpected internal-panel blank in external-link test"); }
@@ -1068,6 +1071,9 @@ def teardown(root):
     for name in ('atcphy_mode_configuration', 'atcphy_hw', 'atcphy_dp_link_rate_configuration'):
         decls.append(block(files['atc'], files['atc'].index('struct ' + name + ' {')) + ';')
     decls.append(block(files['state'], files['state'].index('enum dwc3_apple_state {')) + ';')
+    role = 'static inline enum dwc3_apple_state dwc3_apple_state_for_role('
+    if role in files['state']:
+        decls.append(block(files['state'], files['state'].index(role)))
     start = files['atc'].index('static const struct {\n\tconst struct atcphy_mode_configuration normal;')
     end = files['atc'].index('\n};', start) + 3
     decls.append(files['atc'][start:end])
@@ -1087,11 +1093,11 @@ def teardown(root):
                 'atcphy_park_pipehandler',
                 'atcphy_get_mode_config', 'atcphy_dp_configure',
                 'j700_field_update', 'j700_aux_disable', 'atcphy_disable_dp_aux',
-                'atcphy_power_off', 'atcphy_power_on', *ATC_POST_TUNABLE, 'atcphy_configure', 'atcphy_restore_after_pd_off',
+                'atcphy_power_off', 'atcphy_power_on', *ATC_POST_TUNABLE, 'atcphy_configure', 'atcphy_forget_common_state', 'atcphy_restore_after_pd_off',
                 'atcphy_usb2_init', 'atcphy_usb3_power_off',
                 'atcphy_usb3_route', 'atcphy_usb3_set_mode', 'atcphy_usb2_power_off',
                 '_atcphy_dwc3_reset_assert', 'atcphy_dwc3_reset_assert', 'atcphy_mux_set'),
-        'phy': ('phy_init', 'phy_exit', 'phy_power_on', 'phy_power_off'),
+        'phy': ('phy_init', 'phy_exit', 'phy_reset', 'phy_power_on', 'phy_power_off'),
         'core': ('dwc3_phy_power_on', 'dwc3_phy_power_off', 'dwc3_phy_exit', 'dwc3_core_exit'),
         'apple': ('dwc3_apple_host_before_core_init', 'dwc3_apple_core_stop', 'dwc3_apple_core_init', 'dwc3_apple_core_start',
                   'dwc3_apple_init', 'dwc3_apple_exit', 'dwc3_usb_role_switch_set'),
@@ -1195,14 +1201,23 @@ struct apple_dcp_hw_data {
     int iomfb_method_profile,firmware_compat;
     const struct resource *firmware_clock;
     u32 firmware_display_windows,firmware_scratch,firmware_request;
+    bool s2r,s2r_ext;
 };
 struct apple_dcp {
     struct device *dev; struct apple_dcp_hw_data hw;
     struct resource *disp_registers[10],disp_bw_scratch_res,disp_bw_doorbell_res;
     u32 disp_bw_scratch_index,disp_bw_scratch_offset,disp_bw_doorbell_index,nr_disp_registers;
+    u64 disp_firmware_base[MAX_DISP_REGISTERS];
 };
+#define IS_ALIGNED(x, a) (((x) & ((a) - 1)) == 0)
+#define U64_MAX UINT64_MAX
 static bool of_property_present(struct device_node *n,const char *name)
 { return !strcmp(name,"reg-names") && n->named; }
+/* Firmware-physical windows follow the pmgr scratch lookup, which fails here. */
+static int of_property_count_u64_elems(struct device_node *n,const char *name)
+{ (void)n;(void)name;assert(!"firmware-physical-regs outside the T8140 profiles");return -EINVAL; }
+static int of_property_read_u64_array(struct device_node *n,const char *name,u64 *v,unsigned count)
+{ (void)n;(void)name;(void)v;(void)count;assert(!"firmware-physical-regs outside the T8140 profiles");return -EINVAL; }
 static int of_property_count_strings(struct device_node *n,const char *name)
 { assert(!strcmp(name,"reg-names"));return n->count+1; }
 static int of_property_read_string_index(struct device_node *n,const char *name,int i,const char **v)
@@ -1978,6 +1993,7 @@ typedef uint64_t u64;
 #define WRITE_ONCE(x,v) ((x)=(v))
 #define DCP_FIRMWARE_H17P 1
 #define DCP_FIRMWARE_V_26_6_DESKTOP 5
+#define DCP_FIRMWARE_V_27_0 6
 #define DCP_IOMFB_METHODS_H17P_EXTERNAL 2
 #define DCP_IOMFB_METHODS_H17G 3
 #define DCP_MAX_CALL_DEPTH 8
@@ -2014,6 +2030,9 @@ static bool of_device_is_compatible(struct device_node *n, const char *s)
 { (void)s; return n->external; }
 static bool iomfb_check_callback_h17p(struct apple_dcp *d, int t, u32 i, u32 o)
 { (void)d; (void)t; (void)i; (void)o; return true; }
+/* Only handled callbacks are size-checked; this fixture registers none. */
+static bool iomfb_v27_callback_size_valid(unsigned t, u32 i, u32 o)
+{ (void)t; (void)i; (void)o; assert(false); return false; }
 static bool iomfb_uses_queue(struct apple_dcp *d) { (void)d; return false; }
 static bool test_and_set_bit(int t, unsigned long *b) { (void)t; (void)b; return false; }
 static void complete(int *p) { *p = 1; }

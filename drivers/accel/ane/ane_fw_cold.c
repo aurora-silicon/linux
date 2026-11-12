@@ -20,6 +20,7 @@
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/clpc.h>
+#include <linux/soc/apple/sleep.h>
 #include <linux/suspend.h>
 
 #include "ane_fw_cold.h"
@@ -75,6 +76,13 @@ struct ane_fw_backend {
 	u8 data_digest[SHA256_DIGEST_SIZE];
 	/* Powered down for system sleep; a (cold or warm) boot is due. */
 	bool slept;
+	/*
+	 * Parked: powered off with no firmware, as macOS keeps it without a
+	 * client, until a request brings it up (ane_fw_session_wake()).
+	 */
+	bool parked;
+	/* Between PM_SUSPEND_PREPARE and PM_POST_SUSPEND. */
+	bool in_sleep;
 	/* The last cold boot after sleep: firmware ready, first replay, count. */
 	u64 resume_ready_ns, resume_first_ns;
 	unsigned int resume_replayed;
@@ -104,7 +112,7 @@ struct ane_fw_backend {
 	u32 sys_off_pmgr, sys_on_pmgr;
 	u64 sys_off_at, sys_off_ns;
 	struct ane_fw_cold_state cold;
-	u64 ranges[ANE_FW_DAPF_RANGES * 2];
+	u64 ranges[ANE_FW_DAPF_MAX * 2];
 	u64 next_dva;
 	enum ane_fw_stage stage;
 	bool retained;
@@ -215,11 +223,11 @@ static void ane_fw_snapshot_pmgr(struct ane_fw_backend *b)
 {
 	struct ane_fw_cold_state *s = &b->cold;
 
-	s->sys = ane_rd32(b, b->pmgr + 0x290);
-	s->cpu = ane_rd32(b, b->pmgr + 0xc000);
-	s->subblock = ane_rd32(b, b->pmgr + 0xc008);
-	dev_info(&b->pdev->dev, "U2 ANE_SYS=%#x CPU_PS=%#x subblock=%#x\n",
-		 s->sys, s->cpu, s->subblock);
+	s->sys = ane_rd32(b, b->pmgr + b->soc->pmgr_sys);
+	s->cpu = ane_rd32(b, b->pmgr + b->soc->pmgr_cpu);
+	s->subblock = ane_rd32(b, b->pmgr + b->soc->pmgr_subblock);
+	dev_dbg(&b->pdev->dev, "U2 ANE_SYS=%#x CPU_PS=%#x subblock=%#x\n",
+		s->sys, s->cpu, s->subblock);
 }
 
 /* Step 2: PWGATE, with ANE_SYS on and before the child power step. */
@@ -229,7 +237,7 @@ static void ane_fw_snapshot_gate(struct ane_fw_backend *b)
 
 	s->gate_request = ane_rd32(b, b->gate + 0xc);
 	s->gate_ack = ane_rd32(b, b->gate + 0x30);
-	dev_info(&b->pdev->dev, "U2 PWGATE=%#x/%#x\n", s->gate_request, s->gate_ack);
+	dev_dbg(&b->pdev->dev, "U2 PWGATE=%#x/%#x\n", s->gate_request, s->gate_ack);
 }
 
 /* Step 3: the engine and its DARTs, after the child power step. */
@@ -247,8 +255,8 @@ static void ane_fw_snapshot_engine(struct ane_fw_backend *b)
 	s->pending = ane_rd32(b, b->engine + b->soc->irq_status);
 	for (i = 0; i < 8; i++)
 		s->scratch[i] = ane_rd32(b, b->engine + b->soc->scratch + i * 4);
-	dev_info(dev, "U2 control=%#x status=%#x RVBAR=%#llx CE=%#llx/%#llx pending=%#x\n",
-		 s->control, s->status, s->rvbar, s->ce_state, s->ce_error, s->pending);
+	dev_dbg(dev, "U2 control=%#x status=%#x RVBAR=%#llx CE=%#llx/%#llx pending=%#x\n",
+		s->control, s->status, s->rvbar, s->ce_state, s->ce_error, s->pending);
 	for (i = 0; i < ANE_FW_DARTS; i++) {
 		s->dart[i].version = ane_rd32(b, b->dart[i] + 8);
 		s->dart[i].protect = ane_rd32(b, b->dart[i] + 0x200);
@@ -257,20 +265,20 @@ static void ane_fw_snapshot_engine(struct ane_fw_backend *b)
 		s->dart[i].error = ane_rd32(b, b->dart[i] + 0x100);
 		for (j = 0; j < 16; j++)
 			s->dart[i].enabled[j] = ane_rd32(b, b->dart[i] + 0xc00 + 4 * j);
-		dev_info(dev, "U2 DART%u version=%#x protect=%#x unprotect=%#x lock=%#x error=%#x\n",
-			 i, s->dart[i].version, s->dart[i].protect,
-			 s->dart[i].unprotect, s->dart[i].lock, s->dart[i].error);
+		dev_dbg(dev, "U2 DART%u version=%#x protect=%#x unprotect=%#x lock=%#x error=%#x\n",
+			i, s->dart[i].version, s->dart[i].protect,
+			s->dart[i].unprotect, s->dart[i].lock, s->dart[i].error);
 		for (j = 0; j < 16; j++)
 			if (s->dart[i].enabled[j])
-				dev_info(dev, "U2 DART%u stream enable word %u=%#x\n", i, j,
-					 s->dart[i].enabled[j]);
+				dev_dbg(dev, "U2 DART%u stream enable word %u=%#x\n", i, j,
+					s->dart[i].enabled[j]);
 	}
-	for (i = 0; i < ANE_FW_DAPF_RANGES; i++) {
+	for (i = 0; i < b->soc->dapf_count; i++) {
 		void __iomem *r = b->engine + 0x1810000 + i * 0x40;
 
-		dev_info(dev, "U2 DAPF%u flags=%#x start=%#llx end=%#llx enable=%#x\n",
-			 i, ane_rd32(b, r), ane_rd64(b, r + 8), ane_rd64(b, r + 0x10),
-			 ane_rd32(b, r + 0x20));
+		dev_dbg(dev, "U2 DAPF%u flags=%#x start=%#llx end=%#llx enable=%#x\n",
+			i, ane_rd32(b, r), ane_rd64(b, r + 8), ane_rd64(b, r + 0x10),
+			ane_rd32(b, r + 0x20));
 	}
 }
 
@@ -506,27 +514,59 @@ static int ane_fw_suspend_firmware(struct ane_fw_backend *b)
 	return ret;
 }
 
-static const u8 ane_fw_text_pin[SHA256_DIGEST_SIZE];
 static int ane_fw_boot(struct ane_fw_backend *b);
 static int ane_fw_startup(struct ane_fw_backend *b);
+static int ane_fw_first_bringup(struct ane_fw_backend *b);
+static ssize_t ane_fw_stage_action(struct device *dev, const char *buf, size_t count);
 static int ane_fw_rvbar_ready(struct ane_fw_backend *b);
 
-/* Reverse of the proven power-up: sub-block, PWGATE, CPU, then ANE_SYS. */
-static int ane_fw_power_down(struct ane_fw_backend *b)
+/* A power word goes off whole, and off means target, actual and BUSY clear. */
+#define ANE_FW_PS_OFF 0x300
+#define ANE_FW_PS_OFF_MASK 0x8ff
+#define ANE_FW_PS_BUSY BIT(11)
+#define ANE_FW_PS_UNLATCH BIT(12)
+
+/* A word left BUSY stalls a wake that keeps DRAM up: clear it, or send this sleep deep. */
+static int ane_fw_ps_off(struct ane_fw_backend *b, u32 offset)
 {
+	void __iomem *reg = b->pmgr + offset;
+	int ret;
+
+	ane_wr32(b, ANE_FW_PS_OFF, reg);
+	ret = ane_poll32(b, reg, ANE_FW_PS_OFF_MASK, 0, 1, 100000);
+	if (!ret)
+		return 0;
+	dev_warn(&b->pdev->dev, "H17 ANE: power word %#x stuck at %#x\n", offset, ane_rd32(b, reg));
+	if (!(ane_rd32(b, reg) & 0xff)) {
+		ane_wr32(b, ANE_FW_PS_OFF | ANE_FW_PS_UNLATCH, reg);
+		ane_poll32(b, reg, ANE_FW_PS_BUSY, 0, 1, 1000);
+		ane_wr32(b, ANE_FW_PS_OFF, reg);
+		if (!ane_poll32(b, reg, ANE_FW_PS_OFF_MASK, 0, 1, 1000))
+			return 0;
+	}
+	if (!apple_sleep_request_deep_once())
+		return ret;
+	dev_warn(&b->pdev->dev, "H17 ANE: power word %#x still stuck, taking the deep path\n", offset);
+	return 0;
+}
+
+/* Reverse of the proven power-up: sub-block, PWGATE, CPU, then ANE_SYS. */
+static int ane_fw_power_down_staged(struct ane_fw_backend *b)
+{
+	void __iomem *cpu = b->pmgr + b->soc->pmgr_cpu, *sub = b->pmgr + b->soc->pmgr_subblock;
 	u32 sys;
 	int ret;
 
-	ane_wr32(b, ane_rd32(b, b->pmgr + 0xc008) & ~0xf, b->pmgr + 0xc008);
-	ret = ane_poll32(b, b->pmgr + 0xc008, 0xf0, 0, 1, 100000);
+	ane_wr32(b, ane_rd32(b, sub) & ~0xf, sub);
+	ret = ane_poll32(b, sub, 0xf0, 0, 1, 100000);
 	if (ret)
 		return ret;
 	ane_wr32(b, 3, b->gate + 0xc);
 	ret = ane_poll32(b, b->gate + 0xc, 3, 3, 1, 100000);
 	if (ret)
 		return ret;
-	ane_wr32(b, ane_rd32(b, b->pmgr + 0xc000) & ~0xf, b->pmgr + 0xc000);
-	ret = ane_poll32(b, b->pmgr + 0xc000, 0xf0, 0, 1, 100000);
+	ane_wr32(b, ane_rd32(b, cpu) & ~0xf, cpu);
+	ret = ane_poll32(b, cpu, 0xf0, 0, 1, 100000);
 	if (ret)
 		return ret;
 	/* No engine or DART access from here until ANE_SYS is back on. */
@@ -537,7 +577,7 @@ static int ane_fw_power_down(struct ane_fw_backend *b)
 	 * PMGR reads are safe in any power state. ANE_SYS's actual state
 	 * (bits 7:4) reads 0 once genpd has really turned the domain off.
 	 */
-	sys = ane_rd32(b, b->pmgr + 0x290);
+	sys = ane_rd32(b, b->pmgr + b->soc->pmgr_sys);
 	/*
 	 * Here only requested: while other devices of the domain (the ANE
 	 * DARTs) are active, genpd turns it off in the noirq phase of the
@@ -546,6 +586,41 @@ static int ane_fw_power_down(struct ane_fw_backend *b)
 	dev_info(&b->pdev->dev,
 		 "H17 ANE: powered down for system sleep; ANE_SYS requested off, %s at the put (%#x)\n",
 		 sys & 0xf0 ? "still on" : "off", sys);
+	return 0;
+}
+
+/* The order macOS uses for this engine: sub-block, PWGATE, its ack, CPU, then ANE_SYS. */
+static int ane_fw_power_down(struct ane_fw_backend *b)
+{
+	int ret;
+
+	if (!b->soc->macos_sleep)
+		return ane_fw_power_down_staged(b);
+	ret = ane_fw_ps_off(b, b->soc->pmgr_subblock);
+	if (ret)
+		return ret;
+	ane_wr32(b, 3, b->gate + 0xc);
+	ret = ane_poll32(b, b->gate + 0xc, 3, 3, 1, 100000);
+	if (ret)
+		return ret;
+	ane_wr32(b, 0, b->gate + 0x30);
+	ret = ane_poll32(b, b->gate + 0x30, 1, 0, 1, 100000);
+	if (ret)
+		return ret;
+	ret = ane_fw_ps_off(b, b->soc->pmgr_cpu);
+	if (ret)
+		return ret;
+	/* No engine or DART access from here until ANE_SYS is back on. */
+	b->powered = false;
+	b->power_ref = false;
+	/*
+	 * Our reference was the last one on ANE_SYS: genpd turns it off once the
+	 * ANE DARTs are idle, or at the latest in the noirq phase of the system
+	 * suspend. ane_fw_genpd_event() records that, and the resume reports a
+	 * domain that stayed on.
+	 */
+	pm_runtime_put_sync(b->power);
+	dev_info(&b->pdev->dev, "H17 ANE: powered down for system sleep\n");
 	return 0;
 }
 
@@ -644,7 +719,7 @@ static int ane_fw_reload_segment(struct ane_fw_backend *b, unsigned int i)
 	memunmap(source);
 	dma_wmb();
 	sha256(s->cpu, s->size, digest);
-	return memcmp(digest, i ? b->data_digest : ane_fw_text_pin, sizeof(digest)) ?
+	return memcmp(digest, i ? b->data_digest : b->soc->text_pin, sizeof(digest)) ?
 	       -EKEYREJECTED : 0;
 }
 
@@ -679,11 +754,11 @@ static int ane_fw_cold_cycle_boot(struct ane_fw_backend *b)
 	 * although genpd really turned ANE_SYS off says whether they live in
 	 * an always-on block.
 	 */
-	dev_info(dev, "H17 ANE: cold cycle finds the engine %s after ANE_SYS %s (status %#x, DAPF0 %#x)\n",
-		 ane_fw_cold_engine_valid(&b->cold) ? "at its reset values" :
-		 "with registers kept", b->sys_offs ? "really went off" : "stayed on",
-		 b->cold.status, ane_rd32(b, b->engine + 0x1810000));
-	if (!ane_fw_cold_engine_restartable(&b->cold))
+	dev_dbg(dev, "H17 ANE: cold cycle finds the engine %s after ANE_SYS %s (status %#x, DAPF0 %#x)\n",
+		ane_fw_cold_engine_valid(&b->cold, b->soc) ? "at its reset values" :
+		"with registers kept", b->sys_offs ? "really went off" : "stayed on",
+		b->cold.status, ane_rd32(b, b->engine + 0x1810000));
+	if (!ane_fw_cold_engine_restartable(&b->cold, b->soc))
 		return -EPERM;
 	ret = ane_fw_rvbar_ready(b);
 	if (ret)
@@ -719,8 +794,8 @@ static int ane_fw_cold_cycle_boot(struct ane_fw_backend *b)
 		return ret;
 	b->transport.allow_free = true;
 	b->resume_ready_ns = ktime_get_ns();
-	dev_info(dev, "H17 ANE: booted again from the preload after system sleep in %llu ms\n",
-		 div_u64(b->resume_ready_ns - start, NSEC_PER_MSEC));
+	dev_dbg(dev, "H17 ANE: booted again from the preload after system sleep in %llu ms\n",
+		div_u64(b->resume_ready_ns - start, NSEC_PER_MSEC));
 	/* Every open program back behind its handle, as the application left it. */
 	ane_h16_session_restart(&b->session);
 	ret = ane_h16_session_replay(&b->session, &b->resume_replayed, &b->resume_first_ns);
@@ -732,13 +807,225 @@ static int ane_fw_cold_cycle_boot(struct ane_fw_backend *b)
 	return ret;
 }
 
-/* The cold way down: nothing in flight, then power off under the firmware. */
+/*
+ * macOS stops this firmware before its power goes (ANE_deInit, 25G83): command
+ * 1, then SCRATCH0 armed and POWER_DOWN, which is answered in SCRATCH0 and not
+ * on the ring. SUSPEND (0x24) is for chips with a warm sleep, not this one.
+ */
+#define ANE_FW_CMD_STOP 0x1
+#define ANE_FW_STOP_SIZE 12
+#define ANE_FW_CMD_POWER_DOWN 0xb
+#define ANE_FW_POWER_DOWN_SIZE 8
+#define ANE_FW_STOP_ARM 0xf7fbdff9
+#define ANE_FW_STOP_DONE 0x08042006
+
+static bool clean_stop = true;
+module_param(clean_stop, bool, 0644);
+MODULE_PARM_DESC(clean_stop, "Stop the H17 firmware before powering it off for system sleep");
+
+#define ane_fw_clean_stop(b) (clean_stop && (b)->soc->exclave_mode_stop)
+
+/* Until SCRATCH0 answers, keep serving what the firmware posts on its way down. */
+static int ane_fw_stop_wait(struct ane_fw_backend *b)
+{
+	struct ane_fw_transport *t = &b->transport;
+	void __iomem *scratch0 = b->engine + b->soc->scratch;
+	u64 deadline = ktime_get_ns() + NSEC_PER_SEC;
+	u8 report[ANE_FW_SUSPEND_REPORT_MAX];
+	u32 pending;
+	size_t size;
+	int ret;
+
+	while (ane_rd32(b, scratch0) != ANE_FW_STOP_DONE) {
+		if (ktime_get_ns() >= deadline)
+			return -ETIMEDOUT;
+		ret = ane_fw_transport_consume(t, report, sizeof(report), &size);
+		if (ret && ret != -EAGAIN)
+			return ret;
+		ret = ane_fw_transport_irq(t, &pending);
+		if (ret)
+			return ret;
+		ret = ane_fw_transport_shared(t);
+		if (ret && ret != -EAGAIN)
+			return ret;
+		usleep_range(100, 200);
+	}
+	return 0;
+}
+
+/* Every port of every ANE DART idle: what macOS checks before it powers one down. */
+static int ane_fw_dart_idle(struct ane_fw_backend *b)
+{
+	for (unsigned int i = 0; i < ANE_FW_DARTS; i++) {
+		u32 params = ane_rd32(b, b->dart[i] + 4);
+		unsigned int ports = max((params >> 16) & 7, (params >> 20) & 7);
+
+		for (unsigned int p = 0; p < min(ports, 4U); p++) {
+			int ret = ane_poll32(b, b->dart[i] + 0x230 + 4 * p, U32_MAX, 0, 1, 10000);
+
+			if (ret) {
+				dev_err(&b->pdev->dev, "H17 ANE: DART %u port %u not idle: %#x\n",
+					i, p, ane_rd32(b, b->dart[i] + 0x230 + 4 * p));
+				return ret;
+			}
+		}
+	}
+	return 0;
+}
+
+/*
+ * Each DART as macOS leaves it before the power words (recorded, 25G83): its counters
+ * cleared, error status acknowledged, every enabled stream disabled one at a time, then
+ * the TLB flushed.
+ */
+static void ane_fw_dart_deactivate(struct ane_fw_backend *b)
+{
+	for (unsigned int i = 0; i < ANE_FW_DARTS; i++) {
+		void __iomem *dart = b->dart[i];
+		u32 enabled;
+
+		ane_wr32(b, U32_MAX, dart + 0x4060);
+		ane_rd32(b, dart + 0x4060);
+		ane_rd32(b, dart + 0x4000);
+		ane_wr32(b, 0, dart + 0x4000);
+		ane_wr32(b, U32_MAX, dart + 0x704);
+		ane_rd32(b, dart + 0x704);
+		enabled = ane_rd32(b, dart + 0xc00);
+		for (unsigned int bit = 0; bit < 16; bit++) {
+			if (!(enabled & BIT(bit)) && bit != 11 && bit != 15)
+				continue;
+			ane_wr32(b, BIT(bit), dart + 0xc20);
+			ane_rd32(b, dart + 0xc20);
+		}
+		/* Flush all: V2 | STT, as macOS writes it. */
+		for (unsigned int j = 0; j < ANE_FW_DARTS; j++)
+			ane_wr32(b, 0xa000, b->dart[j] + 0x80);
+		for (unsigned int j = 0; j < ANE_FW_DARTS; j++)
+			ane_rd32(b, b->dart[j] + 0x80);
+	}
+}
+
+/* h17 push telemetry control; macOS sets bit 0 at start-up. */
+#define ANE_FW_TELEMETRY 0x196c000
+
+/*
+ * macOS's step right before the stop on this chip (ANE_deInit, its h17 case):
+ * push telemetry off once bit 4 reads clear, then SCRATCH14 = 0 and wait for
+ * SCRATCH15 bit 0, then SCRATCH16 = 1 and wait for SCRATCH17 bit 0. Each wait
+ * is 50 ms and macOS goes on after a miss.
+ */
+static void ane_fw_stop_handshake(struct ane_fw_backend *b)
+{
+	void __iomem *scratch = b->engine + b->soc->scratch;
+	void __iomem *telemetry = b->engine + ANE_FW_TELEMETRY;
+	struct device *dev = &b->pdev->dev;
+
+	if (ane_poll32(b, telemetry, BIT(4), 0, 10, 50000))
+		dev_warn(dev, "H17 ANE: telemetry busy before the stop: %#x\n", ane_rd32(b, telemetry));
+	ane_wr32(b, ane_rd32(b, telemetry) & ~BIT(0), telemetry);
+	ane_wr32(b, 0, scratch + 0x38);
+	if (ane_poll32(b, scratch + 0x3c, 1, 1, 10, 50000))
+		dev_warn(dev, "H17 ANE: SCRATCH15 not set: %#x\n", ane_rd32(b, scratch + 0x3c));
+	ane_wr32(b, 1, scratch + 0x40);
+	if (ane_poll32(b, scratch + 0x44, 1, 1, 10, 50000))
+		dev_warn(dev, "H17 ANE: SCRATCH17 not set: %#x\n", ane_rd32(b, scratch + 0x44));
+}
+
+static int ane_fw_firmware_stop(struct ane_fw_backend *b)
+{
+	struct ane_fw_transport *t = &b->transport;
+	struct device *dev = &b->pdev->dev;
+	void __iomem *status = b->engine + b->soc->wrapper + 0x48;
+	u8 stop[ANE_FW_STOP_SIZE] = {};
+	u8 down[ANE_FW_POWER_DOWN_SIZE] = {};
+	u32 val;
+	int ret;
+
+	/* A core in WFI can't finish an allocation request, so answer those first. */
+	ret = ane_fw_transport_settle(t, 2 * NSEC_PER_MSEC, 20 * NSEC_PER_MSEC);
+	if (ret < 0)
+		return ret;
+	/*
+	 * No EXCLAVE_MODE_STOP here: macOS's AP never rings that channel around its sleep
+	 * (recorded), and after it this firmware doesn't answer the stop.
+	 */
+	/* Without the PMU base the stop can't finish: its DM-bus idle query needs it. */
+	if (!b->pmu_base_set)
+		return -ENODEV;
+	ane_fw_stop_handshake(b);
+	put_unaligned_le16(ANE_FW_CMD_STOP, stop + 4);
+	ret = ane_fw_command(b, ANE_FW_IO, stop, sizeof(stop), ktime_get_ns() + ANE_FW_TIMEOUT_NS);
+	if (ret) {
+		dev_err(dev, "H17 ANE: STOP failed: %d\n", ret);
+		return ret;
+	}
+	put_unaligned_le16(ANE_FW_CMD_POWER_DOWN, down + 4);
+	ane_wr32(b, ANE_FW_STOP_ARM, b->engine + b->soc->scratch);
+	ret = ane_fw_transport_publish(t, ANE_FW_IO, down, sizeof(down),
+				       ktime_get_ns() + ANE_FW_TIMEOUT_NS);
+	if (!ret)
+		ret = ane_fw_stop_wait(b);
+	if (ret) {
+		ane_fw_sleep_trace(b, "POWER_DOWN failed", ane_fw_transport_slot(t, ANE_FW_IO));
+		ane_h16_session_dump_fwlog(&b->session);
+		return ret;
+	}
+	/* It never completes on the ring; the boot after the wake starts a new one. */
+	t->pending[ANE_FW_IO].active = false;
+	/* macOS waits up to 200 ms for WFI and goes on without it. */
+	if (readl_poll_timeout(status, val, val & 3, 10000, 200000))
+		dev_warn(dev, "H17 ANE: no WFI after POWER_DOWN, status %#x\n", ane_rd32(b, status));
+	dev_info(dev, "H17 ANE: firmware stopped, status %#x\n", ane_rd32(b, status));
+	ane_wr32(b, 0xfeedbabe, b->engine + b->soc->scratch + 4);
+	ret = ane_fw_dart_idle(b);
+	if (!ret)
+		ane_fw_dart_deactivate(b);
+	return ret;
+}
+
+/* The cold way down: nothing in flight, stop the firmware, then power off. */
 static int ane_fw_cold_cycle_down(struct ane_fw_backend *b)
 {
+	int ret;
+
 	for (unsigned int ch = 0; ch < ANE_FW_CHANNELS; ch++)
 		if (b->transport.pending[ch].active)
 			return -EBUSY;
+	if (ane_fw_clean_stop(b)) {
+		ret = ane_fw_firmware_stop(b);
+		/* A refused sleep is a failed suspend: the deep path cuts its power cleanly. */
+		if (ret && apple_sleep_request_deep_once())
+			dev_warn(&b->pdev->dev, "H17 ANE: no clean stop (%d), taking the deep path\n", ret);
+		else if (ret)
+			return ret == -EBUSY ? -EIO : ret;
+	}
 	return ane_fw_power_down(b);
+}
+
+/* A request for a parked engine: boot it from the preload, as after a sleep. */
+static int ane_fw_session_wake(void *ctx)
+{
+	struct ane_fw_backend *b = ctx;
+	int ret;
+
+	if (READ_ONCE(b->stage) == ANE_STAGE_PROBED)
+		return READ_ONCE(b->in_sleep) ? -EAGAIN : ane_fw_first_bringup(b);
+	guard(mutex)(&b->lock);
+	if (!b->parked)
+		return 0;
+	/* The system is going to sleep or coming back: PM_POST_SUSPEND wakes waiters. */
+	if (b->in_sleep)
+		return -EAGAIN;
+	ret = ane_fw_cold_cycle_boot(b);
+	WRITE_ONCE(b->parked, false);
+	WRITE_ONCE(b->session.parked, false);
+	if (ret) {
+		ane_fw_quarantine(b, ret);
+		b->session.quarantined = true;
+	}
+	ane_h16_session_sleep(&b->session, false);
+	dev_info(&b->pdev->dev, "H17 ANE: up for a request%s\n", ret ? " FAILED" : "");
+	return ret;
 }
 
 static int ane_fw_sleep_prepare(struct ane_fw_backend *b)
@@ -746,6 +1033,9 @@ static int ane_fw_sleep_prepare(struct ane_fw_backend *b)
 	int ret;
 
 	guard(mutex)(&b->lock);
+	/* Parked: already off, with nothing to stop. */
+	if (b->parked)
+		return 0;
 	/*
 	 * A quarantined engine that never came up has nothing to lose; give
 	 * back an ANE_SYS reference a failed power-up kept.
@@ -804,19 +1094,43 @@ static int ane_fw_sleep_prepare(struct ane_fw_backend *b)
 	return 0;
 }
 
-/* Called by genpd under its lock, in the noirq phase too: record only. */
+static bool dart_off = true;
+module_param(dart_off, bool, 0644);
+MODULE_PARM_DESC(dart_off, "Deactivate the H17 ANE DARTs before ANE_SYS powers off, as macOS does");
+
+/*
+ * Called by genpd under its lock, in the noirq phase too: nothing that sleeps.
+ *
+ * macOS deactivates the three ANE DARTs before every ANE_SYS power-off, with
+ * or without firmware: it also powers ANE_SYS up for DART work alone and down
+ * again this way (recorded, 25G83). Here ANE_SYS goes off in genpd, at
+ * runtime once the ANE and its DARTs are idle or in the noirq phase of a
+ * system suspend, with the DARTs' streams still enabled; without this step
+ * it reached off with BUSY latched on most sleeps. Do macOS's step right
+ * before the off.
+ */
 static int ane_fw_genpd_event(struct notifier_block *nb, unsigned long action, void *data)
 {
 	struct ane_fw_backend *b = container_of(nb, struct ane_fw_backend, genpd_nb);
 	u64 now = ktime_get_boottime_ns();
 
-	if (action == GENPD_NOTIFY_OFF) {
+	if (action == GENPD_NOTIFY_PRE_OFF && dart_off && b->soc->exclave_mode_stop &&
+	    b->dart[0] && b->dart[1] && b->dart[2]) {
+		u32 streams[ANE_FW_DARTS];
+
+		for (unsigned int i = 0; i < ANE_FW_DARTS; i++)
+			streams[i] = ane_rd32(b, b->dart[i] + 0xc00);
+		ane_fw_dart_deactivate(b);
+		dev_info(&b->pdev->dev,
+			 "H17 ANE: DARTs off before ANE_SYS: streams were %#x %#x %#x, PMGR %#x\n",
+			 streams[0], streams[1], streams[2], ane_rd32(b, b->pmgr + b->soc->pmgr_sys));
+	} else if (action == GENPD_NOTIFY_OFF) {
 		b->sys_offs++;
-		b->sys_off_pmgr = ane_rd32(b, b->pmgr + 0x290);
+		b->sys_off_pmgr = ane_rd32(b, b->pmgr + b->soc->pmgr_sys);
 		b->sys_off_at = now;
 	} else if (action == GENPD_NOTIFY_ON) {
 		b->sys_ons++;
-		b->sys_on_pmgr = ane_rd32(b, b->pmgr + 0x290);
+		b->sys_on_pmgr = ane_rd32(b, b->pmgr + b->soc->pmgr_sys);
 		if (b->sys_off_at)
 			b->sys_off_ns += now - b->sys_off_at;
 		b->sys_off_at = 0;
@@ -834,6 +1148,13 @@ static void ane_fw_sleep_resume(struct ane_fw_backend *b)
 	if (!b->slept)
 		return;
 	b->slept = false;
+	/* Stay off until a request needs the engine, as macOS does. */
+	if (b->soc->macos_sleep && !b->session.quarantined) {
+		WRITE_ONCE(b->parked, true);
+		WRITE_ONCE(b->session.parked, true);
+		dev_info(&b->pdev->dev, "H17 ANE: resume ok: parked until the next request\n");
+		return;
+	}
 	start = ktime_get_ns();
 	b->resume_ready_ns = 0;
 	b->resume_first_ns = 0;
@@ -854,10 +1175,15 @@ static void ane_fw_sleep_resume(struct ane_fw_backend *b)
 	}
 	ane_h16_session_sleep(&b->session, false);
 	/* genpd's record of the domain across this sleep (boot time, so it counts s2idle). */
-	dev_info(&b->pdev->dev,
-		 "H17 ANE: ANE_SYS while asleep: genpd off %u, on %u, off for %llu ms; PMGR %#x at off, %#x at on\n",
-		 b->sys_offs, b->sys_ons, div_u64(b->sys_off_ns, NSEC_PER_MSEC),
-		 b->sys_off_pmgr, b->sys_on_pmgr);
+	if (!b->sys_offs || (b->sys_off_pmgr & 0xf0))
+		dev_warn(&b->pdev->dev,
+			 "H17 ANE: ANE_SYS stayed on through the sleep: genpd off %u, on %u; PMGR %#x at off, %#x at on\n",
+			 b->sys_offs, b->sys_ons, b->sys_off_pmgr, b->sys_on_pmgr);
+	else
+		dev_dbg(&b->pdev->dev,
+			"H17 ANE: ANE_SYS while asleep: genpd off %u, on %u, off for %llu ms; PMGR %#x at off, %#x at on\n",
+			b->sys_offs, b->sys_ons, div_u64(b->sys_off_ns, NSEC_PER_MSEC),
+			b->sys_off_pmgr, b->sys_on_pmgr);
 	/* One line per wake; times from PM_POST_SUSPEND, which follows the thaw. */
 	ready = b->resume_ready_ns ? div_u64(b->resume_ready_ns - start, NSEC_PER_MSEC) : -1;
 	first = b->resume_first_ns ? div_u64(b->resume_first_ns - start, NSEC_PER_MSEC) : -1;
@@ -874,7 +1200,15 @@ static int ane_fw_pm_event(struct notifier_block *nb, unsigned long event, void 
 
 	if (event == PM_POST_SUSPEND) {
 		ane_fw_sleep_resume(b);
+		WRITE_ONCE(b->in_sleep, false);
+		WRITE_ONCE(b->session.wake_blocked, false);
+		/* Requests that waited out the sleep now wake the parked engine. */
+		wake_up_all(&b->session.wake);
 		return NOTIFY_DONE;
+	}
+	if (event == PM_SUSPEND_PREPARE) {
+		WRITE_ONCE(b->in_sleep, true);
+		WRITE_ONCE(b->session.wake_blocked, true);
 	}
 	if (event == PM_SUSPEND_PREPARE && retained) {
 		if (!ane_fw_sleep_prepare(b))
@@ -893,6 +1227,9 @@ static int ane_fw_pm_event(struct notifier_block *nb, unsigned long event, void 
 static int ane_fw_retain(struct ane_fw_backend *b)
 {
 	int ret;
+
+	if (b->retained)
+		return 0;
 
 	/*
 	 * The kexec blocker takes built-in users only. A module, like the H16
@@ -991,7 +1328,7 @@ static int ane_fw_alloc(void *ctx, size_t size, u32 tag, struct ane_fw_surface *
 	ret = ane_fw_alloc_at(b, b->next_dva, size, IOMMU_READ | IOMMU_WRITE, s);
 	if (!ret) {
 		b->next_dva += size;
-		dev_info(&b->pdev->dev, "SHAREDMALLOC tag=%#x bytes=%zu\n", tag, size);
+		dev_dbg(&b->pdev->dev, "SHAREDMALLOC tag=%#x bytes=%zu\n", tag, size);
 	}
 	return ret;
 }
@@ -1061,8 +1398,8 @@ static void ane_fw_cold_shared_note(void *ctx, const char *event, u64 dva, u64 s
 {
 	struct ane_fw_backend *b = ctx;
 
-	dev_info(&b->pdev->dev, "SHAREDMALLOC %s tag=%#x bytes=%llu dva=%#llx\n",
-		 event, tag, size, dva);
+	dev_dbg(&b->pdev->dev, "SHAREDMALLOC %s tag=%#x bytes=%llu dva=%#llx\n",
+		event, tag, size, dva);
 }
 
 static const struct ane_fw_transport_ops ane_fw_ops = {
@@ -1106,6 +1443,7 @@ static int ane_fw_power(struct ane_fw_backend *b, bool raw_boot)
  */
 static int ane_fw_power_up(struct ane_fw_backend *b, bool raw_boot, bool cold_engine)
 {
+	void __iomem *cpu = b->pmgr + b->soc->pmgr_cpu, *sub = b->pmgr + b->soc->pmgr_subblock;
 	struct device *dev = &b->pdev->dev;
 	u64 ce;
 	int ret;
@@ -1117,7 +1455,7 @@ static int ane_fw_power_up(struct ane_fw_backend *b, bool raw_boot, bool cold_en
 			return ret;
 		b->power_ref = true;
 	}
-	if ((ane_rd32(b, b->pmgr + 0x290) & 0xff) != 0xff)
+	if ((ane_rd32(b, b->pmgr + b->soc->pmgr_sys) & 0xff) != 0xff)
 		return -EIO;
 	/* The child state may not have moved since the probe stage. */
 	ane_fw_snapshot_pmgr(b);
@@ -1126,16 +1464,16 @@ static int ane_fw_power_up(struct ane_fw_backend *b, bool raw_boot, bool cold_en
 		dev_info(dev, "H17 ANE: child power or gate not in the cold state; refusing\n");
 		return -EPERM;
 	}
-	ane_wr32(b, ane_rd32(b, b->pmgr + 0xc000) | 0xf, b->pmgr + 0xc000);
-	ret = ane_poll32(b, b->pmgr + 0xc000, 0xff, 0xff, 1, 100000);
+	ane_wr32(b, ane_rd32(b, cpu) | 0xf, cpu);
+	ret = ane_poll32(b, cpu, 0xff, 0xff, 1, 100000);
 	if (ret)
 		return ret;
 	ane_wr32(b, 0, b->gate + 0xc);
 	ret = ane_poll32(b, b->gate + 0xc, 3, 0, 1, 100000);
 	if (ret)
 		return ret;
-	ane_wr32(b, ane_rd32(b, b->pmgr + 0xc008) | 0xf, b->pmgr + 0xc008);
-	ret = ane_poll32(b, b->pmgr + 0xc008, 0xff, 0xff, 1, 100000);
+	ane_wr32(b, ane_rd32(b, sub) | 0xf, sub);
+	ret = ane_poll32(b, sub, 0xff, 0xff, 1, 100000);
 	if (ret)
 		return ret;
 	ret = ane_poll32(b, b->gate + 0x30, U32_MAX, 0, 1, 100000);
@@ -1144,7 +1482,7 @@ static int ane_fw_power_up(struct ane_fw_backend *b, bool raw_boot, bool cold_en
 	b->powered = true;
 	ane_fw_snapshot_engine(b);
 	/* A warm resume finds a suspended firmware's state, not reset values. */
-	if (cold_engine && !ane_fw_cold_engine_valid(&b->cold)) {
+	if (cold_engine && !ane_fw_cold_engine_valid(&b->cold, b->soc)) {
 		dev_info(dev, "H17 ANE: engine or DART not in its reset state; refusing\n");
 		return -EPERM;
 	}
@@ -1157,7 +1495,7 @@ static int ane_fw_power_up(struct ane_fw_backend *b, bool raw_boot, bool cold_en
 	if ((ane_rd64(b, b->engine + 0x18a4010) & 3) != 3 ||
 	    ane_rd64(b, b->engine + 0x18a4018))
 		return -EIO;
-	dev_info(dev, "ANE power: ANE_SYS on, child/PWGATE/CE ready\n");
+	dev_dbg(dev, "ANE power: ANE_SYS on, child/PWGATE/CE ready\n");
 	return 0;
 }
 
@@ -1165,7 +1503,7 @@ static int ane_fw_dapf(struct ane_fw_backend *b)
 {
 	unsigned int i;
 
-	for (i = 0; i < ANE_FW_DAPF_RANGES; i++) {
+	for (i = 0; i < b->soc->dapf_count; i++) {
 		void __iomem *r = b->engine + 0x1810000 + i * 0x40;
 		u64 start = b->ranges[i * 2], end = b->ranges[i * 2 + 1];
 
@@ -1183,17 +1521,6 @@ static int ane_fw_dapf(struct ane_fw_backend *b)
 	}
 	return 0;
 }
-
-/*
- * The measured 26.6.2 H17 TEXT. A different firmware build is refused before
- * anything is powered or written.
- */
-static const u8 ane_fw_text_pin[SHA256_DIGEST_SIZE] = {
-	0xcd, 0xa0, 0x9e, 0xc1, 0xae, 0xe6, 0x8b, 0x88,
-	0xb4, 0x7e, 0xdc, 0x0e, 0xeb, 0xc8, 0x10, 0x45,
-	0x25, 0x32, 0xa8, 0x55, 0x56, 0x3f, 0xbd, 0x65,
-	0x0b, 0x95, 0xe2, 0x84, 0x6c, 0x34, 0x53, 0x10,
-};
 
 /*
  * The loader's preload hand-off. apple,preload-data-sha256 is optional: with
@@ -1264,7 +1591,7 @@ static int ane_fw_preload(struct ane_fw_backend *b)
 		sha256_init(&hash);
 		sha256_update(&hash, snapshots[i].cpu, size[i]);
 		sha256_final(&hash, digest);
-		if (memcmp(digest, i ? data_pin : ane_fw_text_pin, sizeof(digest)))
+		if (memcmp(digest, i ? data_pin : b->soc->text_pin, sizeof(digest)))
 			return -EKEYREJECTED;
 	}
 	/* Preserve every personalized DATA byte, including the iBoot TLV table. */
@@ -1281,6 +1608,15 @@ static int ane_fw_preload(struct ane_fw_backend *b)
 		dev_info(&b->pdev->dev, "ANE map: firmware heap tail at %#llx bytes %#llx\n",
 			 tail, tail_size);
 	return ret;
+}
+
+/* An earlier DAPF record already covers record i's 16 KiB page. */
+static bool ane_fw_dapf_page_seen(const struct ane_fw_backend *b, unsigned int i)
+{
+	for (unsigned int j = 0; j < i; j++)
+		if (round_down(b->ranges[j * 2], SZ_16K) == round_down(b->ranges[i * 2], SZ_16K))
+			return true;
+	return false;
 }
 
 static int ane_fw_prepare(struct ane_fw_backend *b)
@@ -1317,9 +1653,12 @@ static int ane_fw_prepare(struct ane_fw_backend *b)
 	ret = ane_fw_preload(b);
 	if (ret)
 		return ret;
-	for (i = 0; i < ANE_FW_DAPF_RANGES; i++) {
+	for (i = 0; i < b->soc->dapf_count; i++) {
 		u64 page = round_down(b->ranges[i * 2], SZ_16K);
 
+		/* T6050's first two records share a PMGR page: map it once. */
+		if (ane_fw_dapf_page_seen(b, i))
+			continue;
 		ret = ane_fw_map(b, page, page, SZ_16K, IOMMU_READ | IOMMU_WRITE | IOMMU_MMIO);
 		if (ret)
 			return ret;
@@ -1367,7 +1706,7 @@ static int ane_fw_boot(struct ane_fw_backend *b)
 	ret = ane_fw_scratch_wait(b, 7, 0x08042006);
 	if (ret)
 		return ret;
-	dev_info(&b->pdev->dev, "ANE boot: READY\n");
+	dev_dbg(&b->pdev->dev, "ANE boot: READY\n");
 	if (ane_rd32(b, scratch) != 8 || ane_rd32(b, scratch + 4) != 0xc440 ||
 	    ane_rd32(b, scratch + 12) != 0xf00000 || ane_rd32(b, scratch + 16))
 		return -EPROTO;
@@ -1401,14 +1740,14 @@ static int ane_fw_boot(struct ane_fw_backend *b)
 	ane_wr32(b, 0x08042006, scratch + 3 * 4);
 	ret = ane_fw_scratch_wait(b, 3, 0);
 	if (!ret)
-		dev_info(&b->pdev->dev, "ANE boot: eight channels armed, scratch3 cleared (polled)\n");
+		dev_dbg(&b->pdev->dev, "ANE boot: eight channels armed, scratch3 cleared (polled)\n");
 	/* The firmware's table order, which the macOS channel selectors index. */
 	for (i = 0; !ret && i < ANE_FW_CHANNELS; i++) {
 		const struct ane_fw_channel *c = &b->transport.channels[i];
 
-		dev_info(&b->pdev->dev,
-			 "ANE channel %s: table position %u, type %u, doorbell bit %u, %u slots at IPC +%#llx\n",
-			 ane_fw_channel_name(i), c->index, c->type, c->bit, c->slots, c->offset);
+		dev_dbg(&b->pdev->dev,
+			"ANE channel %s: table position %u, type %u, doorbell bit %u, %u slots at IPC +%#llx\n",
+			ane_fw_channel_name(i), c->index, c->type, c->bit, c->slots, c->offset);
 	}
 	return ret;
 }
@@ -1429,22 +1768,24 @@ static int ane_fw_command(struct ane_fw_backend *b, unsigned int channel,
 }
 
 /*
- * SET_SNE_PMU_BASE2 (0x29) on the control ring with the DT "pmgr" range
- * base, once per cold firmware boot. Without it the 0x24 handler's DM-bus
- * idle query never completes (C2-C7; SPEC-ANE-SLEEP-H17-r2.md).
+ * SET_SNE_PMU_BASE2 (0x29) with the DT "pmgr" range base, once per firmware
+ * boot, right after START, on the IO ring. macOS's command helper takes a
+ * queue, not a table position: 0 is IO, 1 DEBUG, 2 DATA_CHAIN_H2T
+ * (aneFirmwareCommandSend, 25G83), and 0x29 goes on queue 0, never DEBUG.
  */
 static int ane_fw_pmu_base(struct ane_fw_backend *b)
 {
-	struct ane_fw_transport *t = &b->transport;
+	u8 command[ANE_FW_PMU_BASE_SIZE] = {};
 	u64 base = b->window[1].pa;
 	int ret;
 
 	b->pmu_base_set = false;
-	ret = ane_fw_transport_publish_pmu_base(t, base, ktime_get_ns() + ANE_FW_TIMEOUT_NS);
-	if (!ret)
-		ret = ane_fw_transport_wait(t, t->control_ch);
-	dev_info(&b->pdev->dev, "H17 ANE: SET_SNE_PMU_BASE2 (0x29) %#llx on ring %s: %d\n",
-		 base, ane_fw_channel_name(t->control_ch), ret);
+	put_unaligned_le16(ANE_FW_CMD_SET_PMU_BASE, command + 4);
+	put_unaligned_le64(base, command + 8);
+	ret = ane_fw_command(b, ANE_FW_IO, command, sizeof(command),
+			     ktime_get_ns() + ANE_FW_TIMEOUT_NS);
+	dev_info(&b->pdev->dev, "H17 ANE: SET_SNE_PMU_BASE2 (0x29) %#llx on ring IO: %d\n",
+		 base, ret);
 	if (!ret)
 		b->pmu_base_set = true;
 	return ret;
@@ -1470,18 +1811,23 @@ static int ane_fw_startup(struct ane_fw_backend *b)
 			return -EPROTO;
 		if (commands[i].id == 3 && ane_fw_config_status(command, 16))
 			return -EPROTO;
-		dev_info(&b->pdev->dev, "ANE startup: command %#x ack=0\n", commands[i].id);
+		dev_dbg(&b->pdev->dev, "ANE startup: command %#x ack=0\n", commands[i].id);
 		if (commands[i].id == 3)
-			dev_info(&b->pdev->dev, "ANE CONFIG_GET tick=%u\n",
-				 get_unaligned_le32(command + 8));
+			dev_dbg(&b->pdev->dev, "ANE CONFIG_GET tick=%u\n",
+				get_unaligned_le32(command + 8));
 		if (commands[i].id == 0x22)
-			dev_info(&b->pdev->dev, "ANE RESOURCE_INFO: %*ph\n", 100, command);
+			dev_dbg(&b->pdev->dev, "ANE RESOURCE_INFO: %*ph\n", 100, command);
 		/* macOS order: START, then SET_SNE_PMU_BASE2, then CONFIG_GET. */
-		if (commands[i].id == 0 && b->soc->sleep_warm) {
+		if (commands[i].id == 0 && (b->soc->sleep_warm || ane_fw_clean_stop(b))) {
 			ret = ane_fw_pmu_base(b);
 			if (ret)
 				return ret;
 		}
+	}
+	/* The host flags macOS sets once the firmware is up (recorded, 25G83). */
+	if (b->soc->macos_sleep) {
+		ane_wr32(b, 1, b->engine + b->soc->scratch + 0x38);
+		ane_wr32(b, 0, b->engine + b->soc->scratch + 0x40);
 	}
 	return 0;
 }
@@ -1533,6 +1879,7 @@ static const struct ane_h16_session_ops ane_fw_session_ops = {
 	.log = ane_fw_program_log,
 	.sync = ane_fw_program_sync,
 	.busy = ane_fw_program_busy,
+	.wake = ane_fw_session_wake,
 };
 
 /*
@@ -1616,6 +1963,68 @@ static int ane_fw_program_stage(struct ane_fw_backend *b)
 	ane_fw_debugfs(b);
 	dev_info(&b->pdev->dev, "ANE program: session and ABI 3 node ready\n");
 	return 0;
+}
+
+/*
+ * The node without the firmware: macOS has no ANE running until its first
+ * client, so the domains stay off and a sleep has nothing to stop. The first
+ * request maps, boots and starts the engine (ane_fw_first_bringup()).
+ */
+static int ane_fw_register_parked(struct ane_fw_backend *b)
+{
+	int ret;
+
+	ret = ane_fw_retain(b);
+	if (ret)
+		return ret;
+	b->transport.soc = b->soc;
+	ret = ane_h16_session_init_parked(&b->session, &b->transport, &ane_fw_session_ops, b,
+					  ANE_FW_TIMEOUT_NS);
+	if (ret)
+		return ret;
+	ret = apple_clpc_ane_get(&b->pdev->dev, &b->clpc);
+	if (ret)
+		return ret;
+	b->session.gate_hold_ns = ANE_FW_GATE_HOLD_NS;
+	ret = ane_h16_accel_register(&b->pdev->dev, &b->session);
+	if (ret) {
+		apple_clpc_ane_put(b->clpc);
+		b->clpc = NULL;
+		return ret;
+	}
+	ane_fw_debugfs(b);
+	WRITE_ONCE(b->parked, true);
+	return 0;
+}
+
+/* The first request: what the boot used to do, map, boot and start-up, then admit it. */
+static int ane_fw_first_bringup(struct ane_fw_backend *b)
+{
+	static const char *const steps[] = { "map", "boot", "startup" };
+	unsigned int flags, i;
+	ssize_t ret = 0;
+
+	flags = lock_system_sleep();
+	if (READ_ONCE(b->stage) != ANE_STAGE_PROBED)
+		goto out;
+	for (i = 0; ret >= 0 && i < ARRAY_SIZE(steps); i++)
+		ret = ane_fw_stage_action(&b->pdev->dev, steps[i], strlen(steps[i]));
+	mutex_lock(&b->lock);
+	if (ret >= 0) {
+		b->transport.allow_free = true;
+		b->stage = ANE_STAGE_PROGRAM;
+		ret = 0;
+	} else {
+		b->session.quarantined = true;
+	}
+	WRITE_ONCE(b->parked, false);
+	WRITE_ONCE(b->session.parked, false);
+	ane_h16_session_sleep(&b->session, false);
+	mutex_unlock(&b->lock);
+	dev_info(&b->pdev->dev, "H17 ANE: first bring-up for a request: %zd\n", ret);
+out:
+	unlock_system_sleep(flags);
+	return ret;
 }
 
 static ssize_t firmware_stage_show(struct device *dev, struct device_attribute *attr, char *buf)
@@ -1716,7 +2125,7 @@ static bool ane_fw_handoff_present(struct platform_device *pdev,
 	struct device_node *np = pdev->dev.of_node;
 	struct device_node *chosen __free(device_node) = of_find_node_by_path("/chosen");
 	struct ane_fw_handoff h = {};
-	u8 digest[SHA256_DIGEST_SIZE];
+	u8 digest[SHA256_DIGEST_SIZE] = {};
 	unsigned int i;
 
 	if (chosen)
@@ -1739,7 +2148,7 @@ static bool ane_fw_handoff_present(struct platform_device *pdev,
 		if (text) {
 			sha256(text, h.size[0], digest);
 			memunmap(text);
-			h.text_ok = !memcmp(digest, ane_fw_text_pin, sizeof(digest));
+			h.text_ok = !memcmp(digest, soc->text_pin, sizeof(digest));
 		}
 	}
 	*hp = h;
@@ -1749,6 +2158,9 @@ static bool ane_fw_handoff_present(struct platform_device *pdev,
 		 !h.marker || strcmp(h.marker, ANE_FW_COLD_BOOT_EVIDENCE) ? "raw-boot marker" :
 		 !h.preloaded || !h.regions_ok ? "preload reservations" :
 		 !h.text_ok ? "firmware TEXT pin" : "preload layout");
+	if (h.regions_ok && !h.text_ok)
+		dev_info(&pdev->dev, "H17 ANE: preloaded TEXT sha256 %*phN\n",
+			 (int)sizeof(digest), digest);
 	return false;
 }
 
@@ -1757,10 +2169,10 @@ static bool ane_fw_handoff_present(struct platform_device *pdev,
  * on every boot with a loader hand-off. A failure stops at that stage; after
  * acquisition it quarantines, as from the stage file.
  */
-static void ane_fw_start_work(struct work_struct *work)
+/* The staged bring-up at boot, for SoCs without macos_sleep. */
+static void ane_fw_start_staged(struct ane_fw_backend *b)
 {
 	static const char *const steps[] = { "probe", "map", "boot", "startup", "program" };
-	struct ane_fw_backend *b = container_of(work, struct ane_fw_backend, start);
 	unsigned int i, flags;
 	ssize_t ret;
 
@@ -1776,6 +2188,32 @@ static void ane_fw_start_work(struct work_struct *work)
 		}
 	}
 	dev_info(&b->pdev->dev, "H17 ANE: up at boot, accel node ready\n");
+}
+
+static void ane_fw_start_work(struct work_struct *work)
+{
+	struct ane_fw_backend *b = container_of(work, struct ane_fw_backend, start);
+	unsigned int flags;
+	ssize_t ret;
+
+	if (!b->soc->macos_sleep) {
+		ane_fw_start_staged(b);
+		return;
+	}
+	flags = lock_system_sleep();
+	ret = ane_fw_stage_action(&b->pdev->dev, "probe", strlen("probe"));
+	if (ret >= 0) {
+		mutex_lock(&b->lock);
+		ret = ane_fw_register_parked(b);
+		mutex_unlock(&b->lock);
+	}
+	unlock_system_sleep(flags);
+	/* Nothing holds ANE_SYS now: with no firmware, genpd turns it off, as macOS keeps it. */
+	ane_fw_bind_release(b);
+	if (ret < 0)
+		dev_err(&b->pdev->dev, "H17 ANE: node registration stopped: %zd\n", ret);
+	else
+		dev_info(&b->pdev->dev, "H17 ANE: accel node ready; firmware starts on the first request\n");
 }
 
 static void ane_fw_observer_free(struct ane_fw_backend *b)
@@ -1821,7 +2259,7 @@ int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platfor
 	u32 dart_phandles[ANE_FW_DARTS];
 	int ret = -EINVAL;
 
-	if (ane_backend || soc->soc != 0x8140)
+	if (ane_backend || !ane_fw_platform_staged(soc) || soc->dapf_count > ANE_FW_DAPF_MAX)
 		return -EOPNOTSUPP;
 	/* No hand-off (an older loader, a warm boot): leave the engine alone. */
 	if (!ane_fw_handoff_present(pdev, soc, &handoff))
@@ -1849,17 +2287,14 @@ int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platfor
 		    strcmp(name, soc->reg_names[i]))
 			goto fail;
 	}
-	if (of_property_read_u64_array(np, "apple,dapf-ranges", b->ranges,
-				       ARRAY_SIZE(b->ranges)))
+	if (of_property_count_u64_elems(np, "apple,dapf-ranges") != soc->dapf_count * 2 ||
+	    of_property_read_u64_array(np, "apple,dapf-ranges", b->ranges, soc->dapf_count * 2))
 		goto fail;
-	for (i = 0; i < ANE_FW_DAPF_RANGES; i++) {
+	for (i = 0; i < soc->dapf_count; i++) {
 		u64 start = b->ranges[i * 2], end = b->ranges[i * 2 + 1];
 
 		if (start > end || round_down(start, SZ_16K) != round_down(end, SZ_16K))
 			goto fail;
-		for (unsigned int j = 0; j < i; j++)
-			if (round_down(start, SZ_16K) == round_down(b->ranges[j * 2], SZ_16K))
-				goto fail;
 	}
 	if (of_count_phandle_with_args(np, "iommus", "#iommu-cells") != ANE_FW_DARTS)
 		goto fail;
@@ -1870,7 +2305,7 @@ int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platfor
 		if (ret)
 			goto fail;
 		if (args.args_count != 1 || args.args[0] ||
-		    !of_device_is_compatible(args.np, "apple,t8140-ane-dart")) {
+		    !of_device_is_compatible(args.np, soc->dart_compatible)) {
 			of_node_put(args.np);
 			ret = -EINVAL;
 			goto fail;
