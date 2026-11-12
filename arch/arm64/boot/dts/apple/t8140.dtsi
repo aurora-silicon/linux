@@ -1511,7 +1511,7 @@
 			operating-points-v2 = <&gpu_opp>;
 			apple,clpc = <&clpc>;
 			apple,pmp-report-entry = <&pmp_report_gfx>;
-			apple,pmp-report = <&pmp_report>;
+			apple,pmp = <&pmp>;
 			status = "disabled";
 		};
 
