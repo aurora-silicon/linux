@@ -666,10 +666,6 @@ static void *devm_kzalloc(struct device *d, size_t n, int g)
 	return v;
 }
 
-static void *devm_kcalloc(struct device *d, size_t n, size_t size, int g)
-{
-	return devm_kzalloc(d, n * size, g);
-}
 #define kzalloc_obj(v) calloc(1, sizeof(v))
 #define kfree free
 static char *kstrdup(const char *s, int g)
