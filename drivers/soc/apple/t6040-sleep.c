@@ -247,9 +247,8 @@
  *  - features off: cpu-fixed-freq-pll-relock, BIT42 := 0 in the E and P0
  *    ACC words; then the TVMs disp2, afr, dcs (two), gfx (two), disp, soc: control
  *    BIT0 := 0, status polled until BIT1 clears;
- *  - the PMC performance state quiesce: the AP voter agent (3) drops its
- *    DCS floor vote, PMC_DVFM_IF + 3 * 0x4000 [3:0] := 0, pending +4 BIT3 polled
- *    (the SOC domain has no AP voter map entry here: no write).
+ * The platform then drops the AP voter's DCS floor vote in the PMC. That step is left out: the
+ * first access to that word hung the bus on the J616s.
  * The platform polls the APSC and TVM words without a timeout; here every poll is bounded
  * and a timeout sets a bit of the commit's 0x5d mark.
  */
@@ -274,7 +273,6 @@ static const struct {
 };
 #define TVM_ENABLE		BIT(0)
 #define TVM_BUSY		BIT(1)
-#define T6040_PMC_AP_FLOOR_PA	0x50480c000ULL
 
 /*
  * As the platform does (measured on the J616s where marked), a display pipe's PMC votes go
@@ -283,31 +281,8 @@ static const struct {
  * BIT(p ? p + 2 : 0); the cluster rail 0x5048a9c18 BIT2 (DISP_INT) or BIT3 (DISP_EXT, last
  * pipe only) with the ack at 0x5048a9c1c (measured). p: 0 internal, 1 DCPEXT0, 2 DCPEXT1.
  */
-#define T6040_PMC_DVMR_PA	0x5048a4000ULL
-#define PMC_DVMR_ACK		0x20
 #define T6040_PMC_BWR_PA	0x5048ac020ULL
 #define PMC_BOOST		0x8
-#define PMC_DCP_COUNT		0x0	/* 0x5048a9c14 */
-#define PMC_RAIL		0x4	/* 0x5048a9c18 */
-#define PMC_RAIL_ACK		0x8	/* 0x5048a9c1c */
-#define PMC_RAIL_INT		BIT(2)
-#define PMC_RAIL_EXT		BIT(3)
-#define PMC_TIMEOUT_US		8000
-
-/*
- * The DCPEXT power words in SOC (soc_ps), CPU then FE then SYS, the values
- * (measured: CPU 0x1f0003ff -> 0x0f0000ff -> 0x0f0003f0, FE 0x3ff -> 0x3f0, SYS -> 0x3f0); the
- * SYS word after its axi2af bridge bits and its pwrgate pair (A := 3, B := 0) in the
- * SOC pwrgate block's second page.
- */
-#define T6040_DISPEXT_PWRGATE_PA	0x50282d000ULL
-
-/*
- * The display coprocessors' ASC CPU_CONTROL (+0x44): DCP, DCPEXT0, DCPEXT1. Upstream
- * T8140 (working S2R) writes it 0 twice right before the display CPU word goes
- * down; RUN and bit5 alone, cleared at the device suspend, leave the word refusing writes.
- */
-static const u64 t6040_dcp_asc_ctl_pa[3] = { 0x402e00044ULL, 0x3a2e00044ULL, 0x602e00044ULL };
 
 /*
  * The PMP's PTD (pmp-report 0x5003c0000, T6041 layout as drivers/pmdomain/apple/
@@ -318,25 +293,12 @@ static const u64 t6040_dcp_asc_ctl_pa[3] = { 0x402e00044ULL, 0x3a2e00044ULL, 0x6
  */
 #define T6040_PTD_PA		0x5003c0000ULL
 #define PTD_REQ_READ		0x1e00
-#define PTD_REQ_WRITE		0x10f00
 #define PTD_ACK			0x1e80
-#define PTD_DISP_INT		16
-static const struct {
-	u32 sys, fe, cpu, pg_a, pg_b;
-	int axi2af;
-} t6040_dispext[2] = {
-	{ 0x340, 0x348, 0x350, 0x234, 0x258, 5 },
-	{ 0x490, 0x498, 0x4a0, 0x6b4, 0x6d8, 6 },
-};
-#define PMC_FLOOR_DCS		GENMASK(3, 0)
-#define PMC_PENDING		0x4
-#define PMC_PENDING_AP		BIT(3)
 #define QUIESCE_TIMEOUT_US	2000
 
 /* The 0x5d mark's timeout bits. */
 #define QTO_APSC(c)		BIT(c)
 #define QTO_TVM(i)		BIT(3 + (i))
-#define QTO_PMC			BIT(11)
 #define QTO_CLUSTER(i)		BIT(12 + (i) - CLUSTER_CTL_FIRST_WAIT)
 #define QTO_EAST_CLK(i)		BIT(14 + (i))
 #define QTO_MUX(i)		BIT(16 + (i))
@@ -368,8 +330,6 @@ static const struct {
 #define SPMI_NOTIFY_ENABLE_SLEEP	0x2000001
 #define PMU_BOOT_STAGE		0xf801		/* T6040 slave/reg; cmd 0xf8018e30 */
 #define PMU_BOOT_STAGE_SLEEP	0x50
-/* The post-timer PMU "go hib (0x7)" replay framing. */
-#define SPMI_GO_HIB_NOTIFY	0x2000000
 
 /*
  * MasterMini (NUB_MPMGR_AON, RegMap 4 = pmgr reg[0x37] = 0x508900000).
@@ -566,26 +526,14 @@ struct t6040_sleep {
 	void __iomem *a2d_mini, *a2d_mini4, *a2d_mm8, *a2d_pmc, *a2d_blk;
 	void __iomem *a2d_mm12;	/* MasterMini 0x50890c000 (IB2 engine + handshake +0x14) */
 	void __iomem *aop_req;	/* AOP island power requests 0x5108b8100 (bit 0 DRAM, 1 AP, 2 CPU) */
-	void __iomem *mtp_ps;	/* MiniPMGR MTP island PS words 0x50830c000..0x060 (bring-up) */
-	u32 mtp_left;		/* MTP PS words that did not reach ACTUAL 0 at this commit */
 	u32 apcie_diag[16];	/* apcie_seq bit 2: 'APCS' + flags + PHY/PS words, PMU 0xa200 */
-	void __iomem *atc_aon;	/* 0x508320c00: the 4 ATC port blocks of A2D seq 25 */
 	void __iomem *dcs[16];	/* DCS(n,k): 0x220200000 + n * 0x2000000 + k * 0x200000 */
-	void __iomem *amcc_sem[4];	/* 0x2201c0000 + n * 0x2000000 (+0x28 MCU handshake) */
-	void __iomem *pg_main, *pg_east;	/* pwrgate 0x50282c000, SOC-East 0x5022a0000 */
 	void __iomem *aop_asc;	/* AOP ASC 0x510600000 (CPU_CONTROL +0x44) */
 	void __iomem *atc_cfg[4];	/* ATCPHY_CFG(n) 0x383200000 + n * 0x8000000 */
-	void __iomem *mini_ps;	/* 0x508300000: MiniPMGR PS words */
 	void __iomem *aop_ps;	/* MiniPMGR AOP + audio island PS words 0x508304000..0x158 */
 	void __iomem *snap_soc, *snap_east;	/* PS snapshot pages 0x502800000 / 0x502280000 */
 	u32 *ps_saved;				/* each PS word at the commit, see t6040_ps_restore() */
 	bool ps_saved_valid;
-	void __iomem *pmc_probe_io[9];	/* bring-up PMC probe words */
-	u32 aop_left;		/* AOP words left on << 8 | first index left on */
-	void __iomem *cpm_cfg[3];	/* cluster + 0xe50000 (iBoot idle power-down, bring-up) */
-	void __iomem *cpm_impl[3];	/* cluster + 0xe40000 (cpm-impl-reg) */
-	void __iomem *cpu4_impl110;	/* boot CPU cpu-impl-reg + 0x110 (0x211050110) */
-	u32 cpm_to;			/* clusters whose CPM state poll timed out at this commit */
 	void __iomem *soc_east;
 	void __iomem *soc_ps;
 	void __iomem *aop_global;
@@ -594,7 +542,6 @@ struct t6040_sleep {
 	u64 mbox_pa;
 	bool power_ops;
 	bool wd2_armed;
-	bool timer_written;	/* bring-up observer: the S2R timer is armed */
 	u64 siq_cfg;
 	u64 cntkctl;
 	/* Saved across the commit, restored on wake. */
@@ -610,11 +557,7 @@ struct t6040_sleep {
 	void __iomem *acc_apsc[3];
 	void __iomem *tvm_ctl[8];
 	void __iomem *tvm_status[8];
-	void __iomem *pmc_ap_floor;
-	void __iomem *pmc_dvmr;
 	void __iomem *pmc_bwr;
-	void __iomem *dispext_pwrgate;
-	void __iomem *dcp_asc_ctl[3];
 	void __iomem *ptd;
 	void __iomem *gapf;
 	u32 quiesce_to;			/* timeout bits of this commit's quiesce polls */
@@ -630,7 +573,6 @@ struct t6040_sleep {
 	struct t6040_apcie_st apcie_st;
 	bool pcie_ans_stopped;
 	bool ans_bridge_quiesced;	/* the commit found ANS's fabric bridge armed */
-	int ans_off_ret;
 	int pcie_ans_on_ret;
 	u32 apcie_wake_step;
 	u32 gp_phy_saved[2], gp_appclk_saved[2], gp_perst_saved[2];
@@ -672,22 +614,11 @@ module_param(wd2_secs, uint, 0644);
 MODULE_PARM_DESC(wd2_secs,
 		 "Arm the AON WD2 for this many seconds from .begin to .end of a dry run 2 or 3 (0: off, at most 178)");
 
-/*
- * After the S2R timer, the platform issues a PMU "go hib (0x7)" SPMI sequence.
- * Whether a Linux-at-EL2 driver must issue it, or the MasterMini timer alone
- * arms the engine and the PMU sees it over the hardware SPMI link, is unproven.
- * Off by default.
- */
 static bool pmgr_quiesce = true;
 module_param(pmgr_quiesce, bool, 0644);
 MODULE_PARM_DESC(pmgr_quiesce,
 		 "Run the steps of the generic PMGR quiesce in the commit: APSC off, PLL relock off, TVMs off, PMC DCS floor");
 
-/*
- * On the J616s the first access to 0x50480c000 (the AP voter agent's floor) hung the
- * bus (mark 0x330, reset by the 30 s WD2). The address is unverified on
- * hardware; off until it is.
- */
 /*
  * On the J616s, with the secondaries still spinning (stopped, coherent) until after
  * the timer, the complexes +0xc/+0x10 never dropped BIT4 and the engine stalled. On
@@ -699,10 +630,6 @@ static bool release_early = true;
 module_param(release_early, bool, 0644);
 MODULE_PARM_DESC(release_early,
 		 "Release the stopped CPUs to their last WFI at the commit's start and wait until they are off");
-
-static bool pmc_floor;
-module_param(pmc_floor, bool, 0644);
-MODULE_PARM_DESC(pmc_floor, "With pmgr_quiesce: the PMC AP DCS floor vote (its address hung the bus on the J616s)");
 
 static bool tvm_gpu = true;
 module_param(tvm_gpu, bool, 0644);
@@ -718,43 +645,6 @@ module_param(disp_clusters, uint, 0644);
 MODULE_PARM_DESC(disp_clusters,
 		 "DISP_INT/DISP_EXT cluster-ctl slots at the commit: 0 untouched, 1 off + wait, 2 off, no wait");
 
-/*
- * At runtime the PTD request word reads 0x63c00: EACC0/PACC0/PACC1/GFX (10-13) and the
- * two DCPEXTs (17, 18, withdrawn by pmp-report at suspend_noirq). Bits set here are
- * withdrawn at the commit right before the S2R timer (no ack wait). Bring-up knob.
- */
-static unsigned long ptd_withdraw;
-module_param(ptd_withdraw, ulong, 0644);
-MODULE_PARM_DESC(ptd_withdraw, "PTD SOC-DEV-PS-REQ bits to withdraw right before the S2R timer");
-
-static bool post_timer_mask;
-module_param(post_timer_mask, bool, 0644);
-MODULE_PARM_DESC(post_timer_mask, "Bring-up: the post-timer counter probe's mark carries which cores and ANE words are on");
-
-static bool post_timer_ane;
-module_param(post_timer_ane, bool, 0644);
-MODULE_PARM_DESC(post_timer_ane, "Bring-up: the post-timer counter probe's mark carries the ANE power words instead");
-
-static bool post_timer_counter_probe;
-module_param(post_timer_counter_probe, bool, 0644);
-MODULE_PARM_DESC(post_timer_counter_probe,
-		 "Bring-up: after the S2R timer, test whether CNTPCT still moves (answer by WD2 timing + mark)");
-
-static unsigned int post_timer_wd_ms;
-module_param(post_timer_wd_ms, uint, 0644);
-MODULE_PARM_DESC(post_timer_wd_ms,
-		 "Bring-up: re-arm the AON WD2 to this many ms (max 178000) right after the S2R timer");
-
-static unsigned int post_timer_probe_ms;
-module_param(post_timer_probe_ms, uint, 0644);
-MODULE_PARM_DESC(post_timer_probe_ms,
-		 "Bring-up: after the S2R timer spin this long (max 4 s), then mark 0x50EEPPQQ = cluster-ctl E/P0/P1");
-
-static unsigned int timer_delay_ms;
-module_param(timer_delay_ms, uint, 0644);
-MODULE_PARM_DESC(timer_delay_ms,
-		 "Bring-up: hold this long (max 10 s) right before the S2R timer, mark 0x3e0 first");
-
 static bool agx_gate = true;
 module_param(agx_gate, bool, 0644);
 MODULE_PARM_DESC(agx_gate,
@@ -764,11 +654,6 @@ static bool keep_alive_off = true;
 module_param(keep_alive_off, bool, 0644);
 MODULE_PARM_DESC(keep_alive_off,
 		 "Clear the 64 PMGR keep-alive bits right before the S2R timer, as the PMGR quiesce does");
-
-static bool replay_pmu_go_hib;
-module_param(replay_pmu_go_hib, bool, 0644);
-MODULE_PARM_DESC(replay_pmu_go_hib,
-		 "Replay the PMU \"go hib\" SPMI pairs after the S2R timer (necessity unconfirmed)");
 
 static struct t6040_sleep *t6040_sleep;
 
@@ -1151,90 +1036,8 @@ static void t6040_cpu_stop(u64 mpidr)
 	dsb(sy);
 }
 
-/*
- * Bring-up observer (on the J616s, after the timer only the master core is on, P1 still 0x10;
- * the master never WFIs while it probes). One parked core is kept spinning instead of its
- * deep WFI; after the master writes the timer and takes its own deep WFI, it samples the
- * complexes and the master's core word and keeps the latest in the PMU comparator:
- *   0x3PPLLEEM  [27:22] P0, [21:16] P1, [15:10] E cluster-ctl bits [5:0],
- *               [9:6] the master core's ACTUAL, [5:0] sample number (saturates at 63)
- * Its own complex can't drop while it spins: put it in P1 to watch E and P0.
- */
-static unsigned long observer_mpidr = ULONG_MAX;
-module_param(observer_mpidr, ulong, 0644);
-MODULE_PARM_DESC(observer_mpidr,
-		 "Bring-up: MPIDR of a parked core that observes the complexes after the S2R timer (ULONG_MAX: none)");
-
-static void t6040_mark_nodelay(struct t6040_sleep *s, u32 m)
-{
-	void __iomem *b = s->spmi0;
-	u32 i;
-
-	if (!b)
-		return;
-	for (i = 0; i < 16 && !(readl(b + SPMI_STATUS) & SPMI_STATUS_RX_EMPTY); i++)
-		readl(b + SPMI_REPLY);
-	writel(SPMI_CMD_PMU(PMU_RTC_COMPARE, SPMI_OP_WRITE4), b + SPMI_CMD);
-	writel(m, b + SPMI_CMD);
-	for (i = 0; i < 1000000; i++)
-		if (readl(b + SPMI_NOTIFY_ACK) & SPMI_NOTIFY_REPLY)
-			break;
-	writel(SPMI_NOTIFY_REPLY, b + SPMI_NOTIFY_ACK);
-	if (!(readl(b + SPMI_STATUS) & SPMI_STATUS_RX_EMPTY))
-		readl(b + SPMI_REPLY);
-}
-
-static u32 t6040_a2d_state(struct t6040_sleep *s);
-static u32 t6040_aop_state(struct t6040_sleep *s);
-
-static bool observer_aop;
-module_param(observer_aop, bool, 0644);
-MODULE_PARM_DESC(observer_aop, "Bring-up: the observer core marks the AOP power requests (0x1 tag, t6040_aop_state)");
-
-static bool observer_a2d;
-module_param(observer_a2d, bool, 0644);
-MODULE_PARM_DESC(observer_a2d,
-		 "Bring-up: the observer core marks the A2D state (0x2 tag, t6040_a2d_state) instead of the complexes");
-
-static void __noreturn t6040_observe(struct t6040_sleep *s)
-{
-	u32 n = 0, i, e, p0, p1, mc;
-
-	while (!READ_ONCE(s->timer_written))
-		cpu_relax();
-	for (;;) {
-		if (READ_ONCE(observer_aop)) {
-			t6040_mark_nodelay(s, 0x10000000 | t6040_aop_state(s) | (n & 3));
-			n++;
-			for (i = 0; i < 500000; i++)
-				(void)readl_relaxed(s->cluster_ctl);
-			continue;
-		}
-		if (READ_ONCE(observer_a2d)) {
-			t6040_mark_nodelay(s, 0x20000000 | t6040_a2d_state(s) | (n & 3));
-			n++;
-			for (i = 0; i < 500000; i++)
-				(void)readl_relaxed(s->cluster_ctl);
-			continue;
-		}
-		e = readl(s->cluster_ctl + CLUSTER_CTL(0)) & 0x3f;
-		p0 = readl(s->cluster_ctl + CLUSTER_CTL(1)) & 0x3f;
-		p1 = readl(s->cluster_ctl + CLUSTER_CTL(2)) & 0x3f;
-		mc = s->soc_ps ? FIELD_GET(PS_ACTUAL, readl(s->soc_ps + 8 * 4)) : 0xf;
-		t6040_mark_nodelay(s, 0x30000000 | p0 << 22 | p1 << 16 | e << 10 | mc << 6 |
-				      min(n, 63U));
-		n++;
-		for (i = 0; i < 500000; i++)
-			(void)readl_relaxed(s->cluster_ctl);
-	}
-}
-
 static void t6040_cpu_off(u64 mpidr)
 {
-	struct t6040_sleep *s = t6040_sleep;
-
-	if (s && s->cluster_ctl && READ_ONCE(observer_mpidr) == (mpidr & MPIDR_HWID_BITMASK))
-		t6040_observe(s);
 	t6040_deep_wfi();
 }
 
@@ -1441,16 +1244,6 @@ static void t6040_log_ane(struct t6040_sleep *s, const char *when)
 		when, t6040_ane_actual(s), c[0], c[1], c[2]);
 }
 
-/* Bring-up: the WD2 re-armed for @ms from now, writes only (usable with the counter stopped). */
-static void t6040_wd2_raw(struct t6040_sleep *s, u32 ms)
-{
-	writel(0, s->wdt + WDT_WD2_CTL);
-	writel(0, s->wdt + WDT_WD2_COUNT);
-	writel(ms * (WDT_TICKS_PER_S / 1000), s->wdt + WDT_WD2_ALARM);
-	writel(1, s->wdt + WDT_WD2_CTL);
-	dsb(sy);
-}
-
 /*
  * In process context, after the device suspend: which watched devices are
  * bound. The commit point runs with interrupts off and only reads power words.
@@ -1617,147 +1410,6 @@ static int t6040_sleep_enclave_tell(void)
 	return ret;
 }
 
-/*
- * Bring-up: the platform idles the PMP (AP and IOP power state 0x201) right before the cores
- * sleep (PMP mailbox 0x500e08800) and no stop was seen after that, so the
- * coprocessor may have to stay runnable for the engine. Bit 0 keeps the PMP's run bit
- * after its idle, bit 1 ANS's.
- */
-static unsigned int coproc_keep_run;
-module_param(coproc_keep_run, uint, 0644);
-MODULE_PARM_DESC(coproc_keep_run,
-		 "Bring-up: keep the run bit after the idle at the commit (bit 0 PMP, bit 1 ANS)");
-
-/*
- * Bring-up: A2D stalls at MiniPMGR +0x40, the AP partition that does not power down.
- * LLB's power-down runs the same A2D to completion after powering the MTP (and AOP+audio)
- * islands off; the MTP is the only coprocessor whose DAPF reaches the MiniPMGR request words
- * +0x100..+0x10b. Bit 0: power the 13 MTP island PS words (MiniPMGR 0x50830c000..0x060,
- * MTP_FABRIC..MTP_DMA) off right before the S2R timer, children first, each polled to
- * ACTUAL 0 (mark 0x57 + the words left on). Bit 1: the same at the dry-run commit point,
- * logged, then the saved words written back (the MTP firmware does not survive it).
- */
-static unsigned int mtp_island_off;
-module_param(mtp_island_off, uint, 0644);
-MODULE_PARM_DESC(mtp_island_off,
-		 "Bring-up: MTP island PS off as LLB before A2D (bit 0 real commit, bit 1 dry-run point)");
-
-#define T6040_MTP_PS_PA		0x50830c000ULL
-#define T6040_MTP_PS_WORDS	13
-
-/* Children first. Returns the words (bit n = +8 * n) that did not reach ACTUAL 0. */
-static u32 t6040_mtp_island_off(struct t6040_sleep *s, u32 *saved)
-{
-	u32 left = 0, v;
-	int n;
-
-	if (!s->mtp_ps)
-		return GENMASK(T6040_MTP_PS_WORDS - 1, 0);
-	for (n = T6040_MTP_PS_WORDS - 1; n >= 0; n--) {
-		void __iomem *r = s->mtp_ps + 8 * n;
-
-		v = readl(r);
-		if (saved)
-			saved[n] = v;
-		/* As LLB: automatic mode off first, then the target. */
-		if (v & PS_AUTO_ENABLE) {
-			v &= ~PS_AUTO_ENABLE;
-			writel(v, r);
-		}
-		if (FIELD_GET(PS_TARGET, v))
-			writel(v & ~PS_TARGET, r);
-		if (readl_poll_timeout_atomic(r, v, !FIELD_GET(PS_ACTUAL, v), 1, 2000))
-			left |= BIT(n);
-	}
-	return left;
-}
-
-/*
- * Bring-up: iBoot's idle power-down (the same A2D as LLB's,
- * which completes) configures the CPU clusters' CPM right before the cluster-ctl writes and
- * the S2R request: cluster+0xe50000
- * |= 0x1c000000, poll +0x90 [19:16] in {5, 6, 10}, RMW (& 0xffffffef9c7e1fff) | 0x61816000,
- * cpm-impl-reg cluster+0xe40000 |= bit 63 | bit 0, clear 0x1c000000 again; then the boot
- * CPU's cpu-impl-reg 0x211050110 |= 0x3000000. Linux and aura never write these.
- * Bit 0: clusters 0 and 1 as iBoot, bit 1: cluster 2 too, bit 2: the boot CPU's +0x110.
- * A CPM state poll that times out leaves that cluster with 0x1c000000 cleared (mark 0x56).
- */
-static unsigned int cpm_iboot;
-module_param(cpm_iboot, uint, 0644);
-MODULE_PARM_DESC(cpm_iboot,
-		 "Bring-up: iBoot's CPM cluster config before the S2R request (bit 0 clusters 0+1, bit 1 cluster 2, bit 2 boot CPU +0x110)");
-
-#define T6040_CPM_CFG_PA(c)	(0x210e50000ULL + (c) * 0x1000000ULL)
-#define T6040_CPM_IMPL_PA(c)	(0x210e40000ULL + (c) * 0x1000000ULL)
-#define T6040_CPU4_IMPL110_PA	0x211050110ULL
-#define CPM_CFG_LOCK		0x1c000000ULL
-#define CPM_CFG_STATE		0x90
-#define CPM_CFG_KEEP		0xffffffef9c7e1fffULL
-#define CPM_CFG_SET		0x61816000ULL
-#define CPM_IMPL_SET		0x8000000000000001ULL
-
-static bool t6040_cpm_state_ok(u64 v)
-{
-	unsigned int st = (v >> 16) & 0xf;
-
-	return st <= 10 && (BIT(st) & 0x460);
-}
-
-static u32 t6040_cpm_iboot(struct t6040_sleep *s, unsigned int mask)
-{
-	u32 to = 0;
-	u64 v;
-	int c;
-
-	for (c = 0; c < 3; c++) {
-		void __iomem *cfg = s->cpm_cfg[c], *impl = s->cpm_impl[c];
-
-		if (!(c < 2 ? mask & BIT(0) : mask & BIT(1)) || !cfg || !impl)
-			continue;
-		writeq(readq(cfg) | CPM_CFG_LOCK, cfg);
-		if (readq_poll_timeout_atomic(cfg + CPM_CFG_STATE, v, t6040_cpm_state_ok(v), 1, 2000)) {
-			to |= BIT(c);
-			writeq(readq(cfg) & ~CPM_CFG_LOCK, cfg);
-			continue;
-		}
-		writeq((readq(cfg) & CPM_CFG_KEEP) | CPM_CFG_SET, cfg);
-		writeq(readq(impl) | CPM_IMPL_SET, impl);
-		writeq(readq(cfg) & ~CPM_CFG_LOCK, cfg);
-	}
-	if ((mask & BIT(2)) && s->cpu4_impl110)
-		writeq(readq(s->cpu4_impl110) | 0x3000000ULL, s->cpu4_impl110);
-	return to;
-}
-
-static void t6040_log_cpm(struct t6040_sleep *s, const char *when)
-{
-	u64 v[3][3] = {};
-	int c;
-
-	for (c = 0; c < 3; c++) {
-		if (s->cpm_cfg[c]) {
-			v[c][0] = readq(s->cpm_cfg[c]);
-			v[c][1] = readq(s->cpm_cfg[c] + CPM_CFG_STATE);
-		}
-		if (s->cpm_impl[c])
-			v[c][2] = readq(s->cpm_impl[c]);
-	}
-	pr_info("t6040-sleep: %s: CPM cfg/state/impl c0 %#llx/%#llx/%#llx c1 %#llx/%#llx/%#llx c2 %#llx/%#llx/%#llx cpu4 +0x110 %#llx\n",
-		when, v[0][0], v[0][1], v[0][2], v[1][0], v[1][1], v[1][2], v[2][0], v[2][1], v[2][2],
-		s->cpu4_impl110 ? readq(s->cpu4_impl110) : 0);
-}
-
-/*
- * Bring-up: the AOP + audio island off as iBoot's idle power-down (PS ids
- * 0x49..0x31 in this order, LLB's id table gives each one's offset from MiniPMGR 0x508304000;
- * 0x56 appears twice there). Bit 0: right before the S2R timer (mark 0x55, words left on
- * << 8 | first index left on). Wake through the AOP may not work with it.
- */
-static unsigned int aop_island_off;
-module_param(aop_island_off, uint, 0644);
-MODULE_PARM_DESC(aop_island_off,
-		 "Bring-up: AOP + audio island PS off as iBoot before A2D (bit 0 real commit)");
-
 #define T6040_AOP_PS_PA		0x508304000ULL
 static const u16 t6040_aop_ps_order[] = {
 	0x0b0, 0x128, 0x120, 0x158, 0x150, 0x148, 0x140, 0x138, 0x130, 0x118, 0x0c0, 0x0c8,
@@ -1765,7 +1417,6 @@ static const u16 t6040_aop_ps_order[] = {
 	0x020, 0x098, 0x0a0, 0x0a8, 0x028, 0x030, 0x068, 0x070, 0x078, 0x080, 0x038, 0x040,
 	0x048, 0x058, 0x060, 0x088, 0x050, 0x010, 0x018, 0x008, 0x000,
 };
-
 
 /*
  * Bring-up: which SOC / SOC-East power words are still on right before the S2R timer.
@@ -1925,93 +1576,6 @@ static void t6040_ps_snap_store(struct t6040_sleep *s)
 			      &map[i], NULL, 0);
 }
 
-
-/*
- * Bring-up: the stalled MCPS sits in its PMC write block (static voters 0x5048ac000..,
- * rail words 0x504820000 + rail * 0x4000, agent floors 0x504800000 + agent * 0x4000), and an
- * AP access to the agent-3 floor hung the bus on the J616s. Read the words one by one, a mark
- * (0x3d0 + index) before each so a hang names the word. Bit 0: at the dry-run commit point
- * (WD2 armed, values logged). Bit 1: in the real commit right before the S2R timer, after the
- * clock and keep-alive steps; the values go to PMU SRAM 0xa280 ('PMCP' + the 9 words).
- */
-static unsigned int pmc_probe;
-module_param(pmc_probe, uint, 0644);
-MODULE_PARM_DESC(pmc_probe, "Bring-up: read the PMC words the A2D engine writes (bit 0 dry-run point, bit 1 real commit before the timer)");
-
-static const u64 t6040_pmc_probe_pa[9] = {
-	0x5048aa140ULL, 0x5048ac000ULL, 0x5048ac00cULL, 0x5048ac020ULL, 0x504800000ULL,
-	0x50480c000ULL, 0x504820000ULL, 0x504824004ULL, 0x504828004ULL,
-};
-#define T6040_PMC_PROBE_PMU	0xa280
-#define T6040_PMC_PROBE_MAGIC	0x50434d50	/* "PMCP" in PMU byte order */
-
-static void t6040_mark(struct t6040_sleep *s, u32 n);
-
-static void t6040_pmc_probe_read(struct t6040_sleep *s, u32 *v)
-{
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(t6040_pmc_probe_pa); i++) {
-		t6040_mark(s, 0x3d0 + i);
-		v[i] = s->pmc_probe_io[i] ? readl(s->pmc_probe_io[i]) : 0xdeadbeef;
-	}
-}
-
-/*
- * Bring-up (the PMC stopped answering between the dry-run point and the timer): one read
- * of PMC 0x5048aa140 after each .enter / commit step, mark 0x380 + checkpoint before it, so a
- * hang names the first step after which the PMC is gone.
- */
-static bool pmc_bisect;
-module_param(pmc_bisect, bool, 0644);
-MODULE_PARM_DESC(pmc_bisect, "Bring-up: read PMC 0x5048aa140 after each sleep step (mark 0x380 + step)");
-
-static void t6040_pmc_cp(struct t6040_sleep *s, unsigned int k)
-{
-	if (!READ_ONCE(pmc_bisect) || !s->pmc_probe_io[0])
-		return;
-	t6040_mark(s, 0x380 + k);
-	(void)readl(s->pmc_probe_io[0]);
-}
-
-static void t6040_pmc_probe_store(struct t6040_sleep *s, const u32 *v)
-{
-	u32 m = T6040_PMC_PROBE_MAGIC;
-	int i;
-
-	t6040_pmu_cmd(s, SPMI_CMD_PMU(T6040_PMC_PROBE_PMU, SPMI_OP_WRITE4), &m, NULL, 0);
-	for (i = 0; i < ARRAY_SIZE(t6040_pmc_probe_pa); i++)
-		t6040_pmu_cmd(s, SPMI_CMD_PMU(T6040_PMC_PROBE_PMU + 4 + 4 * i, SPMI_OP_WRITE4),
-			      &v[i], NULL, 0);
-}
-
-/* As LLB per word: automatic mode off, target 0, ACTUAL polled (bounded here). */
-static u32 t6040_aop_island_off(struct t6040_sleep *s)
-{
-	u32 left = 0, first = 0xff, v;
-	int i;
-
-	if (!s->aop_ps)
-		return 0xffff;
-	for (i = 0; i < ARRAY_SIZE(t6040_aop_ps_order); i++) {
-		void __iomem *r = s->aop_ps + t6040_aop_ps_order[i];
-
-		v = readl(r);
-		if (v & PS_AUTO_ENABLE) {
-			v &= ~PS_AUTO_ENABLE;
-			writel(v, r);
-		}
-		if (FIELD_GET(PS_TARGET, v))
-			writel(v & ~PS_TARGET, r);
-		if (readl_poll_timeout_atomic(r, v, !FIELD_GET(PS_ACTUAL, v), 1, 2000)) {
-			left++;
-			if (first == 0xff)
-				first = i;
-		}
-	}
-	return left ? (left << 8 | first) : 0;
-}
-
 /*
  * On the J616s the device resume reached the AOP (510c10000.aop) and took an SError in its resume,
  * whose first act after a firmware-driven sleep is reading its ASC's run bit: the AOP + audio
@@ -2129,30 +1693,14 @@ static void t6040_aop_wake(struct t6040_sleep *s)
 	}
 }
 
-/* As read: parents first, the saved targets back. */
-static void t6040_mtp_island_back(struct t6040_sleep *s, const u32 *saved)
-{
-	int n;
-
-	for (n = 0; n < T6040_MTP_PS_WORDS; n++)
-		writel(saved[n], s->mtp_ps + 8 * n);
-}
-
 /* As on T8140, measured on ANS: status and control read, then the run bit cleared twice. */
 static void t6040_sleep_coproc_run_off(struct apple_sleep_coproc *c)
 {
-	unsigned int keep = READ_ONCE(coproc_keep_run);
-
 	if (!c->asc) {
 		c->stopped = true;
 		return;
 	}
 	c->status = readl(c->asc + ASC_CPU_STATUS);
-	if ((c->pcie_ans && (keep & BIT(1))) ||
-	    (!c->pcie_ans && c->last_stop && (keep & BIT(0)))) {
-		c->stopped = true;
-		return;
-	}
 	writel(readl(c->asc + ASC_CPU_CONTROL) & ~ASC_CPU_CONTROL_RUN, c->asc + ASC_CPU_CONTROL);
 	writel(readl(c->asc + ASC_CPU_CONTROL) & ~ASC_CPU_CONTROL_RUN, c->asc + ASC_CPU_CONTROL);
 	c->stopped = true;
@@ -2267,23 +1815,6 @@ static const struct t6040_axi2af_domain {
 	{ "venc1_sys",    false, 0x2a0, 0x284000000 },
 	{ "jpg",          true,  0x3a0, 0x486000000 },
 	{ "apcie_sys_gp", true,  0x390, 0x416000000 },
-};
-
-/*
- * The post-timer PMU "go hib (0x7)" SPMI pairs, as the platform sends them. Opaque
- * (the abbey PMU opcode map is not decoded); replayed only if replay_pmu_go_hib
- * is set. Each is framed as the platform frames it: notify, command, optional data, poll
- * +0x80 bit0, acknowledge.
- */
-static const struct {
-	u32 cmd;
-	u32 data;
-	bool has_data;
-} t6040_pmu_go_hib_seq[] = {
-	{ 0x20008e38, 0,        false },
-	{ 0x20088e33, 0x1e9238, true  },
-	{ 0x200e8e30, 0x0,      true  },
-	{ 0x20008e30, 0x41,     true  },
 };
 
 /*
@@ -2555,35 +2086,6 @@ static void t6040_mark_restore(struct t6040_sleep *s)
 }
 
 /*
- * The optional "go hib" replay. Necessity from Linux is unconfirmed. Its second
- * pair writes the PMU RTC compare (reg 0x2008); the measured value 0x1e9238 was the
- * alarm of that moment and lies in the past now, which would fire the alarm at once. The live alarm
- * goes there instead (the one t6040_mark_restore puts back), or nothing is replayed.
- */
-#define PMU_GO_HIB_COMPARE_CMD	0x20088e33
-
-static void t6040_pmu_go_hib(struct t6040_sleep *s)
-{
-	u32 status, data;
-	int i;
-
-	if (!s->spmi0 || !s->alarm_ok)
-		return;
-	for (i = 0; i < ARRAY_SIZE(t6040_pmu_go_hib_seq); i++) {
-		data = t6040_pmu_go_hib_seq[i].cmd == PMU_GO_HIB_COMPARE_CMD ?
-		       s->alarm_saved + 1 : t6040_pmu_go_hib_seq[i].data;
-		readl(s->spmi0 + SPMI_STATUS);
-		writel(SPMI_GO_HIB_NOTIFY, s->spmi0 + SPMI_NOTIFY_ENABLE);
-		writel(t6040_pmu_go_hib_seq[i].cmd, s->spmi0 + SPMI_CMD);
-		if (t6040_pmu_go_hib_seq[i].has_data)
-			writel(data, s->spmi0 + SPMI_CMD);
-		readl_poll_timeout_atomic(s->spmi0 + SPMI_NOTIFY_ACK, status,
-					  status & SPMI_NOTIFY_REPLY, 1, 1000);
-		writel(1, s->spmi0 + SPMI_NOTIFY_ACK);
-	}
-}
-
-/*
  * The five complexes off, as the quiesce loop turns cluster c off and waits if c > 3,
  * for c = 1..5 (measured on the J616s): each slot's low nibble -> 0, in order +0x0 .. +0x10,
  * and the last two (+0xc, +0x10) polled until BIT4 clears (+0xc read 0x2f ->
@@ -2717,13 +2219,6 @@ static void t6040_pmgr_quiesce(struct t6040_sleep *s)
 		if (readl_poll_timeout_atomic(s->tvm_status[i], v, !(v & TVM_BUSY), 1,
 					      QUIESCE_TIMEOUT_US))
 			s->quiesce_to |= QTO_TVM(i);
-	}
-	if (s->pmc_ap_floor && READ_ONCE(pmc_floor)) {
-		t6040_mark(s, 0x330);
-		writel(readl(s->pmc_ap_floor) & ~PMC_FLOOR_DCS, s->pmc_ap_floor);
-		if (readl_poll_timeout_atomic(s->pmc_ap_floor + PMC_PENDING, v,
-					      !(v & PMC_PENDING_AP), 1, 8000))
-			s->quiesce_to |= QTO_PMC;
 	}
 }
 
@@ -2878,26 +2373,16 @@ static void t6040_axi2af_rearm(struct t6040_sleep *s)
 	}
 }
 
-/*
- * Bring-up: every AP wake source masked, as LLB and iBoot do before their power-down (the
- * same A2D, which completes there). Nothing but a cold boot (the power key) ends that sleep.
- */
-static bool wake_mask_all;
-module_param(wake_mask_all, bool, 0644);
-MODULE_PARM_DESC(wake_mask_all,
-		 "Bring-up: mask all 9 AOP-global wake words as LLB (no wake source: power key only)");
-
 /* Arm the 9 AOP-global wake masks before the commit, saving the old words. */
 static void t6040_wake_arm(struct t6040_sleep *s)
 {
-	bool all = READ_ONCE(wake_mask_all);
 	int i;
 
 	if (!s->aop_global)
 		return;
 	for (i = 0; i < AOP_WAKE_WORDS; i++) {
 		s->wake_mask_saved[i] = readl(s->aop_global + AOP_WAKE_MASK(i));
-		writel(all ? 0xffffffff : t6040_wake_mask[i], s->aop_global + AOP_WAKE_MASK(i));
+		writel(t6040_wake_mask[i], s->aop_global + AOP_WAKE_MASK(i));
 	}
 	s->wake_mask_saved_valid = true;
 }
@@ -2921,28 +2406,6 @@ static void t6040_wake_restore(struct t6040_sleep *s)
  * the target, then AUTO_ENABLE once ACTUAL reads on. Writing PS_FLAGS clears
  * them. Separate from t6040_sleep_ps_on(), which reads a cached value.
  */
-static u32 t6040_ps_lower_start(void __iomem *base, u32 offset)
-{
-	void __iomem *reg = base + offset;
-	u32 val = readl(reg);
-
-	if (val & PS_AUTO_ENABLE) {
-		val &= ~(PS_AUTO_ENABLE | PS_FLAGS);
-		writel(val, reg);
-	}
-
-	return val;
-}
-
-static void t6040_ps_lower_finish(void __iomem *base, u32 offset, u32 val)
-{
-	writel((val & ~PS_TARGET) | PS_FLAGS, base + offset);
-}
-
-static void t6040_ps_lower(void __iomem *base, u32 offset)
-{
-	t6040_ps_lower_finish(base, offset, t6040_ps_lower_start(base, offset));
-}
 
 static int t6040_ps_raise_start(void __iomem *base, u32 offset)
 {
@@ -2970,14 +2433,6 @@ static int t6040_ps_raise(void __iomem *base, u32 offset)
 	t6040_ps_raise_finish(base, offset);
 
 	return ret;
-}
-
-static int t6040_ps_wait_off(void __iomem *base, u32 offset)
-{
-	u32 val;
-
-	return readl_poll_timeout_atomic(base + offset, val, !FIELD_GET(PS_ACTUAL, val), 10,
-					 PS_OFF_TIMEOUT_US);
 }
 
 static bool t6040_ps_actual_on(void __iomem *base, u32 offset)
@@ -3052,9 +2507,6 @@ static void t6040_apcie_clk_off(struct t6040_apcie_st *a)
  * apcie_st_ps=0 leaves the power words to the engine (the PHY, clock and AXI quiesce
  * still run); 1 lowers them here as the T8140 driver does.
  */
-static bool apcie_st_ps;
-module_param(apcie_st_ps, bool, 0644);
-MODULE_PARM_DESC(apcie_st_ps, "Lower ANS's ST lanes and ANS in the commit (0: leave them to the A2D engine, which needs APCIE_PHY_SW's parents on)");
 
 /*
  * With apcie_st_ps=0 the engine still waits on APCIE_PHY_SW: right before the timer
@@ -3384,130 +2836,6 @@ static void t6040_fabrics_on(struct t6040_sleep *s)
 }
 
 /*
- * The MCPS stalls in seq 25's ATC block of port 0 or port 1 at random. Each port n has a
- * block at 0x508320c00 + 0x80n (seq 23 writes +0x00..+0x14, seq 21 +0x1c/+0x40/+0x60, seq 25
- * writes +0x60 := 2 and polls +0x00 bit 30). aon_rec stores, right before the S2R timer (instead
- * of 'APCS'), 'AONB' + port 0/1 {+0x00, +0x1c, +0x40, +0x60} + port 2/3 {+0x00, +0x60} +
- * ATC0/1_PHYMXWRAP + ATC1_USB_AON at PMU 0xa200; only the offsets those programs use are
- * read. Writing aon_dump logs the same words now.
- */
-static bool aon_rec;
-module_param(aon_rec, bool, 0644);
-MODULE_PARM_DESC(aon_rec, "Bring-up: record the ATC A2D hand-over blocks at PMU 0xa200 right before the S2R timer (replaces 'APCS')");
-
-#define T6040_AON_MAGIC		0x424e4f41	/* "AONB" in PMU byte order */
-
-static void t6040_aon_take(struct t6040_sleep *s, u32 *w)
-{
-	static const u16 off[12] = { 0x000, 0x01c, 0x040, 0x060, 0x080, 0x09c, 0x0c0, 0x0e0,
-				     0x100, 0x160, 0x180, 0x1e0 };
-	int i;
-
-	w[0] = T6040_AON_MAGIC;
-	for (i = 0; i < 12; i++)
-		w[1 + i] = s->atc_aon ? readl(s->atc_aon + off[i]) : 0xdeadbeef;
-	w[13] = s->mini_ps ? readl(s->mini_ps + 0x150) : 0xdeadbeef;
-	w[14] = s->mini_ps ? readl(s->mini_ps + 0x158) : 0xdeadbeef;
-	w[15] = s->mini_ps ? readl(s->mini_ps + 0x0d0) : 0xdeadbeef;
-}
-
-static void t6040_aon_store(struct t6040_sleep *s)
-{
-	u32 w[16];
-	int i;
-
-	t6040_aon_take(s, w);
-	for (i = 0; i < 16; i++)
-		t6040_pmu_cmd(s, SPMI_CMD_PMU(T6040_APCIE_DIAG_PMU + 4 * i, SPMI_OP_WRITE4), &w[i],
-			      NULL, 0);
-}
-
-static int t6040_aon_dump_set(const char *val, const struct kernel_param *kp)
-{
-	u32 w[16];
-
-	if (!t6040_sleep)
-		return -ENODEV;
-	t6040_aon_take(t6040_sleep, w);
-	dev_info(t6040_sleep->dev,
-		 "aon: p0 %08x %08x %08x %08x p1 %08x %08x %08x %08x p2 %08x %08x p3 %08x %08x mxwrap0 %08x mxwrap1 %08x usb_aon1 %08x\n",
-		 w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12], w[13],
-		 w[14], w[15]);
-	return 0;
-}
-
-static const struct kernel_param_ops t6040_aon_dump_ops = {
-	.set = t6040_aon_dump_set,
-};
-module_param_cb(aon_dump, &t6040_aon_dump_ops, NULL, 0200);
-MODULE_PARM_DESC(aon_dump, "Bring-up: write anything to log the ATC A2D hand-over blocks now");
-
-/*
- * A2D completes; the engine stalls in D2S (seq 28) polling the AMCC0 DCS pair's power
- * gate (0x50282c918 bit 30). On this revision the program never writes the DCS power words: the
- * DCS gate themselves after self-refresh, only in dynamic power-gate mode (DCS+0x20 bit 12, bit 8
- * enable). The platform keeps that mode on at runtime and re-applies it after each wake
- * (DCS dynamic power-gate mode 1: RMW +0x20 mask 0x1100 := 0x1100 on
- * all 16 DCS); Linux never sets it. Only the offsets the platform and the engine use are read.
- * dcs_dump logs them now; dcs_pg bit 0 applies the the platform mode now (on write) and again in
- * .begin; dcs_rec stores 'DCSR' + the DCS +0x20 low halves + the 4 AMCC handshake words + the
- * 8 pwrgate CFG0 top bytes + the DCS +0x500 bits [1:0] at PMU 0xa200 right before the timer.
- */
-#define T6040_DCS_MAGIC		0x52534344	/* "DCSR" in PMU byte order */
-static const u16 t6040_pg_main_off[4] = { 0x918, 0x998, 0xa18, 0xa98 };
-static const u16 t6040_pg_east_off[4] = { 0xa00, 0xa80, 0xb00, 0xb80 };
-
-static bool dcs_rec;
-module_param(dcs_rec, bool, 0644);
-MODULE_PARM_DESC(dcs_rec, "Bring-up: record the DCS power-gate state at PMU 0xa200 right before the S2R timer (replaces 'AONB'/'APCS')");
-
-/*
- * D2S still stalls with dynamic power gating on and the AOP/PMP/MTP ruled out.
- * The T8140 commit stops each memory channel right before its gates at
- * about -18 ms (t8140_sleep_mcc_stop): at DCS +0x580 ("mcc0..2" = 0x2_2040_0580 +
- * ch * 0x20_0000, the DCS slices' spacing) the enables word +0x4 cleared one bit at a time,
- * then lanes 0..3 strobed and cleared on +0x8 (mask word +0xc), two lanes per channel per
- * pass. The T6040 commit never did it (the measurement behind "the platform writes none" did not
- * cover these pages). dcs_mcc_stop bit 0 runs that sequence on all 16 DCS right before the S2R
- * timer; 'DCSR' words 10/11 then hold DCS 0.0 +0x584/+0x588 after it.
- */
-static unsigned int dcs_mcc_stop;
-module_param(dcs_mcc_stop, uint, 0644);
-MODULE_PARM_DESC(dcs_mcc_stop, "Bring-up: bit 0 = T8140 mcc_stop (DCS +0x584 enables, +0x588 lanes) on all 16 DCS right before the S2R timer");
-
-static void t6040_dcs_mcc_stop(struct t6040_sleep *s)
-{
-	int i, pass, n;
-	u32 val;
-
-	for (i = 0; i < 16; i++) {
-		void __iomem *m = s->dcs[i] ? s->dcs[i] + 0x580 : NULL;
-
-		if (!m)
-			continue;
-		val = readl(m + 0x4);
-		for (n = 0; val && n < 32; n++) {
-			val &= val - 1;
-			writel(val, m + 0x4);
-			val = readl(m + 0x4);
-		}
-	}
-	for (pass = 0; pass < 2; pass++) {
-		for (i = 0; i < 16; i++) {
-			void __iomem *m = s->dcs[i] ? s->dcs[i] + 0x580 : NULL;
-
-			if (!m)
-				continue;
-			for (n = 2 * pass; n < 2 * pass + 2; n++) {
-				writel(readl(m + 0xc), m + 0xc);
-				writel(readl(m + 0x8) | BIT(16 + 4 * n), m + 0x8);
-				writel(readl(m + 0x8) & ~BIT(4 * n), m + 0x8);
-			}
-		}
-	}
-}
-
-/*
  * On this revision the D2S program does not write the DCS power-state words; it expects
  * them in automatic mode (bit 28) with PS_MIN 0, so each DCS domain drops to 0 after
  * self-refresh and its pwrgate block reports bit 30. The platform sets that at boot
@@ -3525,7 +2853,6 @@ static const struct {
 	{ false, 0x1d0 }, { false, 0x1e0 }, { false, 0x1f0 }, { false, 0x200 },
 	{ true, 0x300 },  { true, 0x308 },  { true, 0x310 },  { true, 0x318 },
 };
-static const u16 t6040_amcc_ps[8] = { 0x180, 0x198, 0x1a8, 0x1b8, 0x1c8, 0x1d8, 0x1e8, 0x1f8 };
 
 static void __iomem *t6040_dcs_ps_reg(struct t6040_sleep *s, int i)
 {
@@ -3575,110 +2902,6 @@ static const struct kernel_param_ops t6040_dcs_ps_auto_ops = {
 };
 module_param_cb(dcs_ps_auto, &t6040_dcs_ps_auto_ops, &dcs_ps_auto, 0644);
 MODULE_PARM_DESC(dcs_ps_auto, "Bring-up: bit 0 = DCS power-state words to automatic mode (PS_MIN 0) now and in .begin, as the platform at boot");
-
-static void t6040_dcs_take(struct t6040_sleep *s, u32 *w)
-{
-	int i;
-
-	memset(w, 0, 16 * sizeof(u32));
-	w[0] = T6040_DCS_MAGIC;
-	for (i = 0; i < 16; i++) {
-		u32 v = s->dcs[i] ? readl(s->dcs[i] + 0x20) : 0xdead;
-		u32 b = s->dcs[i] ? readl(s->dcs[i] + 0x500) : 0;
-
-		w[1 + i / 2] |= (v & 0xffff) << (16 * (i % 2));
-		w[15] |= (b & 3) << (2 * i);
-	}
-	for (i = 0; i < 4; i++) {
-		if (s->amcc_sem[i])
-			w[9] |= (readl(s->amcc_sem[i] + 0x28) & 1) << i;
-		if (s->pg_main)
-			w[13] |= (readl(s->pg_main + t6040_pg_main_off[i]) >> 24) << (8 * i);
-		if (s->pg_east)
-			w[14] |= (readl(s->pg_east + t6040_pg_east_off[i]) >> 24) << (8 * i);
-	}
-	/* The AOP island's DRAM request (0x5108b8100 bit 0) and MasterMini+0x14. */
-	if (s->aop_req)
-		w[9] |= (readl(s->aop_req + 0x100) & 0xff) << 8;
-	if (s->mastermini)
-		w[9] |= (readl(s->mastermini + 0x14) & 0xffff) << 16;
-	/* DCS_00 and DCS_04 PS words, AMCC0 PS word (instead of the AOP ASC). */
-	w[10] = t6040_dcs_ps_reg(s, 0) ? readl(t6040_dcs_ps_reg(s, 0)) : 0xdeadbeef;
-	w[11] = t6040_dcs_ps_reg(s, 4) ? readl(t6040_dcs_ps_reg(s, 4)) : 0xdeadbeef;
-	w[12] = s->snap_soc ? readl(s->snap_soc + t6040_amcc_ps[0]) : 0xdeadbeef;
-}
-
-/*
- * With dynamic power gating on (0x1100 on all 16 DCS) and the DRAM MCU handshake done
- * for all 4 AMCC, the DCS still do not gate: something keeps using DRAM. The AOP runs through
- * A2D/D2S and has a DRAM request bit (0x5108b8100 bit 0). aop_halt bit 0 clears the AOP ASC RUN
- * bit right after the 'DCSR' record, just before the S2R timer (diagnostic: the AOP island stays
- * on; a wake then has no AOP). Record word 12 = CPU_CONTROL after the halt.
- */
-static unsigned int aop_halt;
-module_param(aop_halt, uint, 0644);
-MODULE_PARM_DESC(aop_halt, "Bring-up: bit 0 = stop the AOP CPU right before the S2R timer (diagnostic)");
-
-static void t6040_dcs_store(struct t6040_sleep *s)
-{
-	u32 w[16];
-	int i;
-
-	t6040_dcs_take(s, w);
-	if ((READ_ONCE(dcs_mcc_stop) & BIT(0)) && s->dcs[0]) {
-		t6040_dcs_mcc_stop(s);
-		w[10] = readl(s->dcs[0] + 0x584);
-		w[11] = readl(s->dcs[0] + 0x588);
-	}
-	if ((READ_ONCE(aop_halt) & BIT(0)) && s->aop_asc) {
-		writel(readl(s->aop_asc + ASC_CPU_CONTROL) & ~ASC_CPU_CONTROL_RUN,
-		       s->aop_asc + ASC_CPU_CONTROL);
-		udelay(10);
-		w[12] = readl(s->aop_asc + ASC_CPU_CONTROL) | (readl(s->aop_req + 0x100) & 0xff) << 24;
-	}
-	for (i = 0; i < 16; i++)
-		t6040_pmu_cmd(s, SPMI_CMD_PMU(T6040_APCIE_DIAG_PMU + 4 * i, SPMI_OP_WRITE4), &w[i],
-			      NULL, 0);
-}
-
-static int t6040_dcs_dump_set(const char *val, const struct kernel_param *kp)
-{
-	struct t6040_sleep *s = t6040_sleep;
-	int i;
-
-	if (!s)
-		return -ENODEV;
-	for (i = 0; i < 16; i++)
-		if (s->dcs[i])
-			dev_info(s->dev, "dcs %d.%d: +0x20 %08x +0x500 %08x +0x1d48 %08x +0x580 %08x %08x %08x %08x\n",
-				 i / 4, i % 4, readl(s->dcs[i] + 0x20), readl(s->dcs[i] + 0x500),
-				 readl(s->dcs[i] + 0x1d48), readl(s->dcs[i] + 0x580),
-				 readl(s->dcs[i] + 0x584), readl(s->dcs[i] + 0x588),
-				 readl(s->dcs[i] + 0x58c));
-	for (i = 0; i < 4; i++)
-		dev_info(s->dev, "amcc %d: +0x1c0028 %08x pg main %08x east %08x\n", i,
-			 s->amcc_sem[i] ? readl(s->amcc_sem[i] + 0x28) : 0xdeadbeef,
-			 s->pg_main ? readl(s->pg_main + t6040_pg_main_off[i]) : 0xdeadbeef,
-			 s->pg_east ? readl(s->pg_east + t6040_pg_east_off[i]) : 0xdeadbeef);
-	for (i = 0; i < 16; i++)
-		dev_info(s->dev, "dcs ps %d: %08x\n", i,
-			 t6040_dcs_ps_reg(s, i) ? readl(t6040_dcs_ps_reg(s, i)) : 0xdeadbeef);
-	for (i = 0; i < 8; i++)
-		dev_info(s->dev, "amcc ps %d: %08x\n", i,
-			 s->snap_soc ? readl(s->snap_soc + t6040_amcc_ps[i]) : 0xdeadbeef);
-	dev_info(s->dev, "aop: req %08x mastermini+0x14 %08x asc ctl %08x status %08x\n",
-		 s->aop_req ? readl(s->aop_req + 0x100) : 0xdeadbeef,
-		 s->mastermini ? readl(s->mastermini + 0x14) : 0xdeadbeef,
-		 s->aop_asc ? readl(s->aop_asc + ASC_CPU_CONTROL) : 0xdeadbeef,
-		 s->aop_asc ? readl(s->aop_asc + ASC_CPU_STATUS) : 0xdeadbeef);
-	return 0;
-}
-
-static const struct kernel_param_ops t6040_dcs_dump_ops = {
-	.set = t6040_dcs_dump_set,
-};
-module_param_cb(dcs_dump, &t6040_dcs_dump_ops, NULL, 0200);
-MODULE_PARM_DESC(dcs_dump, "Bring-up: write anything to log the DCS power-gate state now");
 
 static unsigned int dcs_pg = 1;
 
@@ -3787,23 +3010,12 @@ static void t6040_sleep_lower_apcie_st(struct t6040_sleep *s)
 			t6040_apcie_clk_off(a);
 	}
 
-	/* Per-lane: both sys_st then both st, deepest first. */
-	if (READ_ONCE(apcie_st_ps)) {
-		t6040_ps_lower(ps, PS_APCIE_SYS_ST1);
-		t6040_ps_lower(ps, PS_APCIE_SYS_ST0);
-		t6040_ps_lower(ps, PS_APCIE_ST1);
-		t6040_ps_lower(ps, PS_APCIE_ST0);
-	}
-
-	/* AXI enables off (shared), then ANS last. */
+	/* AXI enables off (shared). */
 	if (a->axi) {
 		writel(readl(a->axi + APCIE_AXI_EN0) & ~BIT(0), a->axi + APCIE_AXI_EN0);
 		writel(readl(a->axi + APCIE_AXI_EN1) & ~BIT(0), a->axi + APCIE_AXI_EN1);
 	}
 	s->ans_bridge_quiesced = t6040_ans_bridge_quiesce(s);
-	if (READ_ONCE(apcie_st_ps))
-		t6040_ps_lower(ps, PS_ANS);
-	/* The caller polls PS_ANS off, as on T8140. */
 }
 
 /*
@@ -4195,13 +3407,10 @@ static int t6040_sleep_commit(unsigned long unused)
 	if (READ_ONCE(release_early))
 		spin_table_release_stopped();
 	t6040_mark(s, 0x21);
-	t6040_pmc_cp(s, 4);
 	if (READ_ONCE(lower_atc))
 		t6040_sleep_lower_atc(s);
-	t6040_pmc_cp(s, 11);
 	if (READ_ONCE(lower_apcie_gp))
 		t6040_sleep_stop_gp_ports(s);
-	t6040_pmc_cp(s, 12);
 
 	/*
 	 * lower_io: ANS's two ST lanes + shared PHY down, once ANS has been
@@ -4216,11 +3425,7 @@ static int t6040_sleep_commit(unsigned long unused)
 		t6040_mark_raw(s, 0x54c00001);
 	if (s->pcie_ans_stopped) {
 		t6040_sleep_lower_apcie_st(s);
-		t6040_pmc_cp(s, 13);
-		if (s->soc_east && READ_ONCE(apcie_st_ps))
-			s->ans_off_ret = t6040_ps_wait_off(s->soc_east, PS_ANS);
 	}
-	t6040_pmc_cp(s, 14);
 	if (READ_ONCE(lower_apcie_gp))
 		t6040_sleep_lower_apcie_gp(s);
 
@@ -4230,7 +3435,6 @@ static int t6040_sleep_commit(unsigned long unused)
 	 * the SoC without a sleep, so the mark is kept: the wake alarm is not put back.
 	 */
 	s->commit_on_mask = t6040_axi2af_on_mask(s);
-	t6040_pmc_cp(s, 5);
 
 	t6040_mark(s, 0x22);
 	/* WD0 off, then the AON 5 s reconfig net (as the platform arms it for a reconfig). */
@@ -4257,7 +3461,6 @@ static int t6040_sleep_commit(unsigned long unused)
 	 * already; the wake side re-asserts them.
 	 */
 	s->quiesce_to = 0;
-	WRITE_ONCE(s->timer_written, false);
 	if (READ_ONCE(release_early)) {
 		t6040_mark(s, 0x2c);
 		s->quiesce_to |= min(t6040_secondaries_off(s), 15U) << 20;
@@ -4266,28 +3469,18 @@ static int t6040_sleep_commit(unsigned long unused)
 		t6040_mark(s, 0x2b);
 		t6040_pmgr_quiesce(s);
 	}
-	t6040_pmc_cp(s, 6);
 	if (READ_ONCE(agx_gate))
 		t6040_mark(s, 0x2a0 | t6040_agx_gate(s));
-	s->cpm_to = 0;
-	if (READ_ONCE(cpm_iboot)) {
-		t6040_mark(s, 0x2e);
-		s->cpm_to = t6040_cpm_iboot(s, READ_ONCE(cpm_iboot));
-	}
-	t6040_pmc_cp(s, 7);
 	t6040_mark(s, 0x24);
 	t6040_clusters_off(s);
-	t6040_pmc_cp(s, 8);
 
 	/* Read-only: the axi2af panic gate the platform checks before the engine goes. */
 	t6040_axi2af_readcheck(s);
 	t6040_mark(s, 0x350);
 	t6040_clkgen_park(s);
 	t6040_mark(s, 0x351);
-	t6040_pmc_cp(s, 9);
 	if (READ_ONCE(keep_alive_off))
 		s->ka_on_before = t6040_keep_alive(s, false, 0);
-	t6040_pmc_cp(s, 10);
 	t6040_mark(s, 0x25);
 
 	/* Arm aura's AURAS2R1 mailbox with this boot's resume entry. */
@@ -4299,55 +3492,17 @@ static int t6040_sleep_commit(unsigned long unused)
 		dsb(sy);
 	}
 
-	if (s->ptd && READ_ONCE(ptd_withdraw))
-		writeq(readq(s->ptd + PTD_REQ_READ) & ~(u64)READ_ONCE(ptd_withdraw),
-		       s->ptd + PTD_REQ_WRITE);
-
-	/*
-	 * Discriminator: hold everything right before the timer. A reset that lands in the
-	 * hold keeps mark 0x3e0 (its source started before the timer: the SMC/PMU after
-	 * 'slpa', or a net); one that moves later by the hold follows the timer (the engine).
-	 */
-	if (READ_ONCE(timer_delay_ms)) {
-		t6040_mark(s, 0x3e0);
-		mdelay(min(READ_ONCE(timer_delay_ms), 10000U));
-	}
-
-	/* iBoot's order: the AOP + audio island, then the MTP island. */
-	s->aop_left = 0;
-	if (READ_ONCE(aop_island_off) & BIT(0))
-		s->aop_left = t6040_aop_island_off(s);
-	s->mtp_left = 0;
-	if (READ_ONCE(mtp_island_off) & BIT(0))
-		s->mtp_left = t6040_mtp_island_off(s, NULL);
-
 	if (READ_ONCE(fab_on))
 		t6040_fabrics_on(s);
 	t6040_ps_save(s);
 	if (READ_ONCE(ps_snap))
 		t6040_ps_snap_store(s);
-	if (READ_ONCE(dcs_rec))
-		t6040_dcs_store(s);
-	else if (READ_ONCE(aon_rec))
-		t6040_aon_store(s);
-	else if (READ_ONCE(apcie_seq) & BIT(2))
+	if (READ_ONCE(apcie_seq) & BIT(2))
 		t6040_apcie_diag_store(s);
-	if (READ_ONCE(pmc_probe) & BIT(1)) {
-		u32 pv[ARRAY_SIZE(t6040_pmc_probe_pa)];
-
-		t6040_pmc_probe_read(s, pv);
-		t6040_pmc_probe_store(s, pv);
-	}
 
 	/* Last before the S2R timer: what is still on, re-read now, kept through the reset. */
 	s->commit_on_mask |= t6040_axi2af_on_mask(s);
-	if (s->aop_left) {
-		t6040_mark_raw(s, 0x55000000 | s->aop_left);
-	} else if (s->mtp_left) {
-		t6040_mark_raw(s, 0x57000000 | s->mtp_left);
-	} else if (s->cpm_to) {
-		t6040_mark_raw(s, 0x56000000 | s->cpm_to);
-	} else if (s->commit_on_mask) {
+	if (s->commit_on_mask) {
 		t6040_mark_raw(s, 0x58000000 | s->commit_on_mask);
 	} else if (s->quiesce_to & (QTO_CLUSTER(3) | QTO_CLUSTER(4))) {
 		/*
@@ -4369,128 +3524,10 @@ static int t6040_sleep_commit(unsigned long unused)
 	if (s->mastermini)
 		writel(1, s->mastermini + MASTERMINI_S2R_TIMER);
 	dsb(sy);
-	WRITE_ONCE(s->timer_written, true);
-	dsb(ish);
-
-	/*
-	 * Bring-up: an SPMI mark right after the timer never lands. Re-arm the AON
-	 * WD2 here, no SPMI: a reset at timer + this many ms means this core still runs
-	 * after the timer; one at the usual timer + ~4.5 s means it does not (measured: it runs).
-	 * Long values test whether A2D only needs longer than ~5 s: the reset follows the
-	 * timer by that much although the commit armed WD2 for sleep_wd_secs (ADT
-	 * simple-reconfig-wdog-icc-time = 5).
-	 */
-	if (READ_ONCE(post_timer_wd_ms) && s->wdt) {
-		writel(0, s->wdt + WDT_WD2_CTL);
-		writel(0, s->wdt + WDT_WD2_COUNT);
-		writel(min(READ_ONCE(post_timer_wd_ms), WDT_MAX_SECS * 1000U) * (WDT_TICKS_PER_S / 1000),
-		       s->wdt + WDT_WD2_ALARM);
-		writel(1, s->wdt + WDT_WD2_CTL);
-		dsb(sy);
-	}
-
-	/*
-	 * Bring-up (this core does run after the timer: the WD2 above fired). Does
-	 * the system counter stop at the timer (every udelay() would then hang)? Safety WD2
-	 * 4 s, 1M cluster-ctl reads timed by CNTPCT, an SPMI mark polled by count (no udelay):
-	 * 0x50EEPPQQ, E bit 7 set, bit 6 = counter stopped. Then the WD2 by the answer:
-	 * stopped -> 100 ms, moving -> 2.5 s; a loop that hangs leaves the 4 s.
-	 */
-	if (READ_ONCE(post_timer_counter_probe) && s->wdt && s->cluster_ctl) {
-		u32 i, v[3], st;
-		u64 c0, c1;
-		bool stopped;
-
-		t6040_wd2_raw(s, 4000);
-		isb();
-		c0 = read_sysreg(cntpct_el0);
-		for (i = 0; i < 1000000; i++)
-			(void)readl_relaxed(s->cluster_ctl);
-		isb();
-		c1 = read_sysreg(cntpct_el0);
-		stopped = c1 == c0;
-		for (i = 0; i < 3; i++)
-			v[i] = readl(s->cluster_ctl + CLUSTER_CTL(i)) & 0x3f;
-		if (s->spmi0 && READ_ONCE(marks) && s->alarm_ok) {
-			void __iomem *b = s->spmi0;
-			u32 m = 0x50000000 | (v[0] | 0x80 | (stopped ? 0x40 : 0)) << 16 |
-				v[1] << 8 | v[2];
-
-			/* 0x50EAAAAA: tag E, then the ANE ACTUAL nibbles (t6040_ane_actual). */
-			if (READ_ONCE(post_timer_ane))
-				m = 0x50e00000 | t6040_ane_actual(s);
-			/*
-			 * 0x50CMMMMM: tag C, ACTUAL != 0 as bits: 0-3 E cores, 4-8 P0 cores,
-			 * 9-13 P1 cores (cpu-start bits 0-8, 10-14), 14-18 ANE sys/mpm/cpu/td/base.
-			 */
-			if (READ_ONCE(post_timer_mask)) {
-				u32 a = t6040_ane_actual(s), mask = 0, b;
-
-				for (b = 0; b < 15 && s->soc_ps; b++) {
-					if (b == 9)
-						continue;
-					if (FIELD_GET(PS_ACTUAL, readl(s->soc_ps + 8 * b)))
-						mask |= BIT(b < 9 ? b : b - 1);
-				}
-				for (b = 0; b < 5; b++)
-					if ((a >> (16 - 4 * b)) & 0xf)
-						mask |= BIT(14 + b);
-				m = 0x50c00000 | mask;
-			}
-
-			for (i = 0; i < 16 && !(readl(b + SPMI_STATUS) & SPMI_STATUS_RX_EMPTY); i++)
-				readl(b + SPMI_REPLY);
-			writel(SPMI_CMD_PMU(PMU_RTC_COMPARE, SPMI_OP_WRITE4), b + SPMI_CMD);
-			writel(m, b + SPMI_CMD);
-			for (i = 0; i < 1000000; i++) {
-				st = readl(b + SPMI_NOTIFY_ACK);
-				if (st & SPMI_NOTIFY_REPLY)
-					break;
-			}
-			writel(SPMI_NOTIFY_REPLY, b + SPMI_NOTIFY_ACK);
-			if (!(readl(b + SPMI_STATUS) & SPMI_STATUS_RX_EMPTY))
-				readl(b + SPMI_REPLY);
-		}
-		t6040_wd2_raw(s, stopped ? 100 : 2500);
-	}
 
 	/* A raised line would end the WFI the engine waits for. */
 	aic_sleep_mask_all();
 	spin_table_release_stopped();
-
-	/* Optional, the bytes, necessity from Linux unproven (off by default). */
-	if (replay_pmu_go_hib)
-		t6040_pmu_go_hib(s);
-
-	/*
-	 * Bring-up probe: the SoC resets ~5 s after the timer (a hold before the timer moves it),
-	 * and a probe that waited with udelay() never marked: nothing that waits on
-	 * time or on a reply may finish after the timer. Staged, no timer-based waits; the
-	 * last mark that lands tells how far it got (the wake alarm is not put back):
-	 *   0x50ffffff  A: an SPMI mark right after the timer landed
-	 *   0x50EEPPQQ  B: cluster-ctl E/P0/P1 bytes [5:0] read once
-	 *   0x50EEPPQQ  C: after N * 1000 cluster-ctl reads: E bit 7 set, E bit 6 = the
-	 *               counter (CNTPCT) did not move over the reads
-	 */
-	if (READ_ONCE(post_timer_probe_ms) && s->cluster_ctl) {
-		u32 n = min(READ_ONCE(post_timer_probe_ms), 4000U) * 1000, i, v[3];
-		u64 c0, c1;
-
-		t6040_mark_raw(s, 0x50ffffff);
-		for (i = 0; i < 3; i++)
-			v[i] = readl(s->cluster_ctl + CLUSTER_CTL(i)) & 0x3f;
-		t6040_mark_raw(s, 0x50000000 | v[0] << 16 | v[1] << 8 | v[2]);
-		isb();
-		c0 = read_sysreg(cntpct_el0);
-		for (i = 0; i < n; i++)
-			(void)readl_relaxed(s->cluster_ctl);
-		isb();
-		c1 = read_sysreg(cntpct_el0);
-		for (i = 0; i < 3; i++)
-			v[i] = readl(s->cluster_ctl + CLUSTER_CTL(i)) & 0x3f;
-		t6040_mark_raw(s, 0x50000000 | (v[0] | 0x80 | (c1 == c0 ? 0x40 : 0)) << 16 |
-				  v[1] << 8 | v[2]);
-	}
 
 	t6040_deep_wfi();
 }
@@ -4950,7 +3987,6 @@ static int t6040_sleep_dry_enter(struct t6040_sleep *s, unsigned int dry)
 	t6040_log_ane(s, "dry-run commit point");
 	t6040_log_a2d(s, "dry-run commit point");
 	t6040_sleep_log_s2r_state(s, "dry-run commit point");
-	t6040_log_cpm(s, "dry-run commit point");
 	{
 		u32 map[T6040_PS_SNAP_WORDS];
 
@@ -4958,14 +3994,6 @@ static int t6040_sleep_dry_enter(struct t6040_sleep *s, unsigned int dry)
 		pr_info("t6040-sleep: dry-run commit point: PS snapshot %*ph\n", (int)sizeof(map), map);
 		if (READ_ONCE(ps_snap))
 			t6040_ps_snap_store(s);
-	}
-	if (READ_ONCE(pmc_probe) & BIT(0)) {
-		u32 pv[ARRAY_SIZE(t6040_pmc_probe_pa)];
-
-		t6040_pmc_probe_read(s, pv);
-		pr_info("t6040-sleep: dry-run commit point: PMC probe aa140 %#x ac000 %#x ac00c %#x ac020 %#x 800000 %#x 80c000 %#x 820000 %#x 824004 %#x 828004 %#x\n",
-			pv[0], pv[1], pv[2], pv[3], pv[4], pv[5], pv[6], pv[7], pv[8]);
-		t6040_pmc_probe_store(s, pv);
 	}
 	/*
 	 * A wake source pending and left unmasked by the masks a real commit arms would keep the
@@ -4979,21 +4007,6 @@ static int t6040_sleep_dry_enter(struct t6040_sleep *s, unsigned int dry)
 			p[i] = readl(s->aop_global + AOP_WAKE_STATUS(i)) & ~t6040_wake_mask[i];
 		pr_info("t6040-sleep: dry-run commit point: wake status left unmasked by the commit's masks %*ph\n",
 			(int)sizeof(p), p);
-	}
-	if ((READ_ONCE(mtp_island_off) & BIT(1)) && s->mtp_ps) {
-		u32 saved[T6040_MTP_PS_WORDS], after[T6040_MTP_PS_WORDS], left;
-		int i;
-
-		left = t6040_mtp_island_off(s, saved);
-		for (i = 0; i < T6040_MTP_PS_WORDS; i++)
-			after[i] = readl(s->mtp_ps + 8 * i);
-		pr_info("t6040-sleep: dry-run MTP island off: left on %#x, PS before %*ph\n",
-			left, (int)sizeof(saved), saved);
-		pr_info("t6040-sleep: dry-run MTP island off: PS after %*ph\n",
-			(int)sizeof(after), after);
-		t6040_log_a2d(s, "dry-run MTP island off");
-		t6040_mtp_island_back(s, saved);
-		t6040_log_a2d(s, "dry-run MTP island back");
 	}
 	refused = t6040_sleep_refuse(s);
 	pr_info("t6040-sleep: a real commit would %s here (%u check(s) failed)\n",
@@ -5030,14 +4043,6 @@ static bool lower_display = true;
 module_param(lower_display, bool, 0644);
 MODULE_PARM_DESC(lower_display, "Lower the display power words at the S2R commit point");
 
-static bool lower_cpu;
-module_param(lower_cpu, bool, 0644);
-MODULE_PARM_DESC(lower_cpu, "Also lower each display group's pipe CPU word by hand (raised an SError on T6040)");
-
-static bool axi2af_quiesce;
-module_param(axi2af_quiesce, bool, 0644);
-MODULE_PARM_DESC(axi2af_quiesce, "Clear a display group's axi2af fabric-bridge bit0 before lowering it (off: its SYS domain stays on)");
-
 #define PS_DEV_DISABLE		BIT(10)
 #define PS_BUSY			BIT(11)
 #define PS_RESET_REQ		BIT(12)
@@ -5048,78 +4053,9 @@ MODULE_PARM_DESC(axi2af_quiesce, "Clear a display group's axi2af fabric-bridge b
  */
 #define T6040_DISP_MARK(g, st, off)	(0x5c000000 | ((g) & 0xff) << 16 | (st) << 12 | ((off) & 0xfff))
 
-/* The axi2af domain that carries a display group ("disp" -> "disp_sys"), or -1. */
-static int t6040_axi2af_of_group(const char *group)
-{
-	size_t n = strlen(group);
-	int i;
-
-	for (i = 0; i < T6040_AXI2AF_DOMAINS; i++)
-		if (!strncmp(t6040_axi2af[i].name, group, n) &&
-		    !strcmp(t6040_axi2af[i].name + n, "_sys"))
-			return i;
-	return -1;
-}
-
-/*
- * The entry side of the axi2af workaround (the quiesce step for it and the PMGR
- * power-down hook): before a retained domain goes off, its fabric bridge
- * +0x104/+0x108 bit0 is cleared; t6040_axi2af_rearm() sets it again on wake. Only while
- * the domain is powered: the bridge sits in it. Mark 0x5eII0000, II the domain.
- */
-static void t6040_axi2af_quiesce(struct t6040_sleep *s, int i)
-{
-	void __iomem *ps, *bridge;
-
-	if (i < 0)
-		return;
-	ps = t6040_axi2af_ps(s, &t6040_axi2af[i]);
-	bridge = s->axi2af_bridge[i];
-	if (!ps || !bridge || !FIELD_GET(PS_ACTUAL, readl(ps)))
-		return;
-	t6040_mark_raw(s, 0x5e000000 | (i & 0xff) << 16);
-	writel(readl(bridge + AXI2AF_BRIDGE_104) & ~BIT(0), bridge + AXI2AF_BRIDGE_104);
-	writel(readl(bridge + AXI2AF_BRIDGE_108) & ~BIT(0), bridge + AXI2AF_BRIDGE_108);
-	t6040_mark_raw(s, 0x5e008000 | (i & 0xff) << 16);
-}
-
 static bool disp_seq_off = true;
 
-/*
- * Under Linux cluster-ctl DISP_INT went 0x2f -> 0x10 and stuck there; on the platform it reached 0,
- * DISP_CPU having gone down at the DCP stop (RUN, bit5, dart idle, then the PS word
- * in two steps). Rewriting the word under a running DCP resets the SoC. With
- * appledrm.s2r_keep_run=0 this tries the exact sequence on it.
- */
-static bool pmc_seq;
-module_param(pmc_seq, bool, 0644);
-MODULE_PARM_DESC(pmc_seq,
-		 "Release a display pipe's PMC votes as the platform (boost, DVMR + ack, BWR, rail + ack) instead of zeroing c14/c18");
-
-static bool dispext_off;
-module_param(dispext_off, bool, 0644);
-MODULE_PARM_DESC(dispext_off,
-		 "Power the stopped DCPEXT pipes down as the platform (PMC votes, CPU, FE, SYS) so DISP_EXT can go off");
-
-static bool pmp_disp_release;
-module_param(pmp_disp_release, bool, 0644);
-MODULE_PARM_DESC(pmp_disp_release,
-		 "With disp_cpu_seq: withdraw the internal display's PMP request (PTD bit 16) and wait for the ack first");
-
-static bool disp_cpu_seq;
-module_param(disp_cpu_seq, bool, 0644);
-MODULE_PARM_DESC(disp_cpu_seq,
-		 "Lower DISP_CPU in the two steps after the DCP stop (needs appledrm.s2r_keep_run=0)");
-
-static bool disp_need_cpu_gated;
-module_param(disp_need_cpu_gated, bool, 0644);
-MODULE_PARM_DESC(disp_need_cpu_gated, "Leave DISP_FE/SYS on unless the PMGR has gated DISP_CPU");
-
 #define DISP_CPU_GATE_US	50000
-
-static bool gated_cpu_target_only = true;
-module_param(gated_cpu_target_only, bool, 0644);
-MODULE_PARM_DESC(gated_cpu_target_only, "A DISP_CPU already gated (ACTUAL 0) only gets TARGET 0, keeping AUTO_ENABLE, and dart-dcp is left unread");
 
 static bool pmc_if_restore = true;
 module_param(pmc_if_restore, bool, 0644);
@@ -5273,100 +4209,6 @@ static int t6040_dcp_dart_idle(struct t6040_sleep *s)
 }
 
 /* The internal display's three domains, child first, after its sub-blocks (the order). */
-/* A display pipe's PMC votes, released in the order; @rail the cluster rail bit or 0. */
-static int t6040_pmc_disp_release(struct t6040_sleep *s, unsigned int p, u32 rail)
-{
-	int ret = 0;
-	u32 v;
-
-	if (s->pmc_bwr)
-		writel(readl(s->pmc_bwr + PMC_BOOST) & ~BIT(p), s->pmc_bwr + PMC_BOOST);
-	if (s->pmc_dvmr) {
-		writel(readl(s->pmc_dvmr) & ~BIT(p), s->pmc_dvmr);
-		if (readl_poll_timeout_atomic(s->pmc_dvmr + PMC_DVMR_ACK, v, !(v & BIT(0)), 1,
-					      PMC_TIMEOUT_US))
-			ret |= 1;
-		if (s->pmc_dcp)
-			writel(hweight32(readl(s->pmc_dvmr)), s->pmc_dcp + PMC_DCP_COUNT);
-	}
-	if (s->pmc_bwr)
-		writel(readl(s->pmc_bwr) & ~BIT(p ? p + 2 : 0), s->pmc_bwr);
-	if (rail && s->pmc_dcp) {
-		writel(readl(s->pmc_dcp + PMC_RAIL) & ~rail, s->pmc_dcp + PMC_RAIL);
-		if (readl_poll_timeout_atomic(s->pmc_dcp + PMC_RAIL_ACK, v, !(v & rail), 1,
-					      PMC_TIMEOUT_US))
-			ret |= 2;
-	}
-	return ret;
-}
-
-/* As T8140: the coprocessor's CPU_CONTROL to 0, twice, right before its CPU word goes. */
-static void t6040_dcp_cold_stop(struct t6040_sleep *s, unsigned int p)
-{
-	if (!s->dcp_asc_ctl[p])
-		return;
-	writel(0, s->dcp_asc_ctl[p]);
-	writel(0, s->dcp_asc_ctl[p]);
-}
-
-/* One power word down in the two steps (any AUTO first). Returns 0x80 on a timeout. */
-static u32 t6040_soc_ps_off(void __iomem *w)
-{
-	u32 v = readl(w), cur;
-	u32 to = 0;
-
-	if (!FIELD_GET(PS_ACTUAL, v) && !FIELD_GET(PS_TARGET, v))
-		return 0;
-	if (v & PS_AUTO_ENABLE) {
-		writel(v & 0xeffffcff, w);
-		if (readl_poll_timeout_atomic(w, cur, FIELD_GET(PS_ACTUAL, cur) == 0xf, 1,
-					      PMC_TIMEOUT_US))
-			to = 0x80;
-	}
-	writel((readl(w) & 0xfffffcf0) | 0x300, w);
-	if (readl_poll_timeout_atomic(w, cur, !(cur & PS_BUSY), 1, PMC_TIMEOUT_US) ||
-	    readl_poll_timeout_atomic(w, cur, !FIELD_GET(PS_ACTUAL, cur), 1, PMC_TIMEOUT_US))
-		to = 0x80;
-	return to;
-}
-
-/*
- * The stopped DCPEXT pipes down it, DCPEXT1 first. Marks 0x56SS00RR,
- * SS 0x80 | pipe << 4 | step (1 PMC, 2 CPU, 3 FE, 4 SYS), RR 0x80 on a timeout.
- */
-static void t6040_dispext_off(struct t6040_sleep *s)
-{
-	int n;
-
-	if (!s->soc_ps)
-		return;
-	for (n = 1; n >= 0; n--) {
-		u32 base = 0x80 | n << 4;
-		void __iomem *bridge = s->axi2af_bridge[t6040_dispext[n].axi2af];
-
-		t6040_disp_mark(s, base | 1, 0);
-		if (READ_ONCE(pmc_seq))
-			t6040_disp_mark(s, base | 1,
-					0x1 | t6040_pmc_disp_release(s, n + 1, n ? 0 : PMC_RAIL_EXT) << 4);
-		t6040_disp_mark(s, base | 2, 0);
-		t6040_dcp_cold_stop(s, n + 1);
-		t6040_disp_mark(s, base | 2, 1);
-		t6040_disp_mark(s, base | 2,
-				2 | t6040_soc_ps_off(s->soc_ps + t6040_dispext[n].cpu));
-		t6040_disp_mark(s, base | 3,
-				t6040_soc_ps_off(s->soc_ps + t6040_dispext[n].fe));
-		if (bridge) {
-			writel(readl(bridge + AXI2AF_BRIDGE_104) & ~BIT(0), bridge + AXI2AF_BRIDGE_104);
-			writel(readl(bridge + AXI2AF_BRIDGE_108) & ~BIT(0), bridge + AXI2AF_BRIDGE_108);
-		}
-		if (s->dispext_pwrgate) {
-			writel(3, s->dispext_pwrgate + t6040_dispext[n].pg_a);
-			writel(0, s->dispext_pwrgate + t6040_dispext[n].pg_b);
-		}
-		t6040_disp_mark(s, base | 4,
-				t6040_soc_ps_off(s->soc_ps + t6040_dispext[n].sys));
-	}
-}
 
 static int t6040_disp_off(struct t6040_sleep *s, const struct t6040_sleep_group *g)
 {
@@ -5394,14 +4236,8 @@ static int t6040_disp_off(struct t6040_sleep *s, const struct t6040_sleep_group 
 	if (s->pmc_dcp && READ_ONCE(pmc_dcp_off)) {
 		s->pmc_dcp_saved[0] = readl(s->pmc_dcp);
 		s->pmc_dcp_saved[1] = readl(s->pmc_dcp + 4);
-		if (READ_ONCE(pmc_seq)) {
-			t6040_disp_mark(s, 0x0a, 0);
-			t6040_disp_mark(s, 0x0a, t6040_pmc_disp_release(s, 0, PMC_RAIL_INT) << 4 |
-						 (readl(s->pmc_dcp + PMC_RAIL) & 0xf));
-		} else {
-			writel(0, s->pmc_dcp);
-			writel(0, s->pmc_dcp + 4);
-		}
+		writel(0, s->pmc_dcp);
+		writel(0, s->pmc_dcp + 4);
 		t6040_disp_mark(s, 0x09, (s->pmc_dcp_saved[0] & 0xf) | (s->pmc_dcp_saved[1] & 0xf) << 4);
 	}
 	/*
@@ -5418,32 +4254,8 @@ static int t6040_disp_off(struct t6040_sleep *s, const struct t6040_sleep_group 
 					 !!FIELD_GET(PS_TARGET, v) << 5);
 		if (FIELD_GET(PS_ACTUAL, v))
 			t6040_dcp_dart_idle(s);
-		if (READ_ONCE(disp_cpu_seq) && FIELD_GET(PS_ACTUAL, v)) {
-			if (s->ptd && READ_ONCE(pmp_disp_release)) {
-				u64 req = readq(s->ptd + PTD_REQ_READ), ack;
-				int to;
-
-				t6040_disp_mark(s, 0x0d, (req >> PTD_DISP_INT) & 1);
-				writeq(req & ~BIT_ULL(PTD_DISP_INT), s->ptd + PTD_REQ_WRITE);
-				to = readq_poll_timeout_atomic(s->ptd + PTD_ACK, ack,
-							       !(ack & BIT_ULL(PTD_DISP_INT)), 10,
-							       50000);
-				t6040_disp_mark(s, 0x0d, 0x10 | (to ? 0x80 : 0) |
-							 ((ack >> PTD_DISP_INT) & 1));
-			}
-			t6040_disp_mark(s, 0x0b, 0);
-			t6040_dcp_cold_stop(s, 0);
-			if (s->disp_pwrgate) {
-				writel(3, s->disp_pwrgate + DISP_PWRGATE_A);
-				writel(0, s->disp_pwrgate + DISP_PWRGATE_B);
-			}
-			t6040_disp_mark(s, 0x0b, 1);
-			t6040_psw_off(s, &cpu, 0x0c, NULL);
-		}
 		ret = t6040_psw_poll_long(&cpu, PS_ACTUAL, 0, DISP_CPU_GATE_US);
 		t6040_disp_mark(s, 0x10, ret ? 0x90 : 0x10);
-		if (ret && READ_ONCE(disp_need_cpu_gated))
-			return ret;
 		ret = 0;
 	}
 	if (!ret)
@@ -5529,58 +4341,14 @@ static void t6040_disp_back(struct t6040_sleep *s)
 	}
 }
 
-static bool disp_probe;
-module_param(disp_probe, bool, 0644);
-MODULE_PARM_DESC(disp_probe, "Bring-up: at the commit point record the internal display's words and refuse");
-
-/*
- * The internal display as the DCP's stop left it: bits 0-10 the sub-blocks +0x8..+0x58 with
- * TARGET != 0, 11-14 DISP_CPU ACTUAL, 15 its AUTO_ENABLE, 16-19 DISP_FE ACTUAL, 20-23
- * DISP_SYS ACTUAL.
- */
-static u32 t6040_disp_probe_word(struct t6040_sleep *s)
-{
-	u32 w = 0, val, off;
-	unsigned int i;
-
-	for (i = 0; i < s->ngroups; i++) {
-		const struct t6040_sleep_group *g = &s->groups[i];
-
-		if (strcmp(g->name, "disp"))
-			continue;
-		for (off = g->first + PS_STRIDE; off <= g->last && off - g->first <= 11 * PS_STRIDE;
-		     off += PS_STRIDE)
-			if (!regmap_read(g->regmap, off, &val) && FIELD_GET(PS_TARGET, val))
-				w |= BIT((off - g->first) / PS_STRIDE - 1);
-		if (!regmap_read(g->regmap, g->first, &val))
-			w |= FIELD_GET(PS_ACTUAL, val) << 11 | !!(val & PS_AUTO_ENABLE) << 15;
-	}
-	if (s->soc_east) {
-		w |= FIELD_GET(PS_ACTUAL, readl(s->soc_east + PS_DISP_FE)) << 16;
-		w |= FIELD_GET(PS_ACTUAL, readl(s->soc_east + PS_DISP_SYS)) << 20;
-	}
-	return w;
-}
-
 static unsigned int t6040_sleep_lower_display(struct t6040_sleep *s)
 {
-	bool quiesce = READ_ONCE(axi2af_quiesce), with_cpu = READ_ONCE(lower_cpu);
 	unsigned int i, left = 0;
-
-	/*
-	 * The platform takes a DCPEXT pipe down CPU, FE, SYS (child first). The group loop below
-	 * lowers FE and SYS and leaves the CPU, whose word then refuses the write:
-	 * the DCPEXT pipes go first.
-	 */
-	if (READ_ONCE(dispext_off))
-		t6040_dispext_off(s);
 
 	for (i = 0; i < s->ngroups; i++) {
 		const struct t6040_sleep_group *g = &s->groups[i];
 		u32 off = g->last;
 
-		if (quiesce)
-			t6040_axi2af_quiesce(s, t6040_axi2af_of_group(g->name));
 		for (;;) {
 			bool cpu = off == g->first;
 			u32 val, cur;
@@ -5592,7 +4360,7 @@ static unsigned int t6040_sleep_lower_display(struct t6040_sleep *s)
 				t6040_mark_raw(s, T6040_DISP_MARK(i,
 					t6040_regmap_poll_off(g->regmap, off, &cur) ? 3 : 2, off));
 			}
-			if ((!cpu || with_cpu) && !regmap_read(g->regmap, off, &val) &&
+			if (!cpu && !regmap_read(g->regmap, off, &val) &&
 			    t6040_sleep_ps_on(val, cpu)) {
 				t6040_mark_raw(s, T6040_DISP_MARK(i, 0, off));
 				val &= ~(PS_TARGET | PS_AUTO_ENABLE | PS_FLAGS | PS_DEV_DISABLE |
@@ -5658,10 +4426,6 @@ static u32 t6040_sleep_first_on(struct t6040_sleep *s)
 	return 0;
 }
 
-static bool axi2af_gate;
-module_param(axi2af_gate, bool, 0644);
-MODULE_PARM_DESC(axi2af_gate, "Refuse the commit while any axi2af domain is still powered (the panic gate)");
-
 /* Which of the 15 axi2af domains read ACTUAL != 0, one bit each. */
 static u32 t6040_axi2af_on_mask(struct t6040_sleep *s)
 {
@@ -5694,40 +4458,12 @@ static int t6040_sleep_enter(suspend_state_t state)
 		return t6040_sleep_dry_enter(s, dry);
 
 	t6040_mark(s, 0x05);
-	t6040_pmc_cp(s, 0);
-	if (READ_ONCE(disp_probe)) {
-		/* Bring-up: what the DCP's stop left, then refuse with it kept (0x55). */
-		t6040_mark_raw(s, 0x55000000 | t6040_disp_probe_word(s));
-		WRITE_ONCE(pm_bringup_dev_mark, NULL);
-		pr_info("t6040-sleep: display probe at the commit point; refusing\n");
-		return -EBUSY;
-	}
 	if (READ_ONCE(lower_display)) {
 		unsigned int left = t6040_sleep_lower_display(s);
 
 		t6040_mark(s, 0x06);
 		if (left)
 			pr_warn("t6040-sleep: %u display power word(s) did not go off\n", left);
-	}
-	/*
-	 * The PMGR quiesce panics unless all 15 axi2af domains read ACTUAL 0, and a commit with
-	 * some on reset the SoC about a second after the S2R timer was armed. Refuse
-	 * with the domains still on: 0x59 then a 15-bit mask, bit i = t6040_axi2af[i].
-	 */
-	t6040_pmc_cp(s, 1);
-	if (READ_ONCE(axi2af_gate)) {
-		/* The commit lowers the ATC complexes (bits 0-3) and ANS (bit 9) itself. */
-		u32 on = t6040_axi2af_on_mask(s) &
-			 ~((READ_ONCE(lower_atc) ? GENMASK(3, 0) : 0) | BIT(9));
-
-		if (on) {
-			t6040_mark_raw(s, 0x59000000 | on);
-			WRITE_ONCE(pm_bringup_dev_mark, NULL);
-			pr_info("t6040-sleep: at the commit point: axi2af domains still on %#x; refusing\n",
-				on);
-			t6040_disp_back(s);
-			return -EBUSY;
-		}
 	}
 	/* A dry run 1 ends here as well: its .begin told the firmware nothing. */
 	if (t6040_sleep_total_blockers(s) || !allow_entry || !apple_sleep_power_loss()) {
@@ -5774,13 +4510,11 @@ static int t6040_sleep_enter(suspend_state_t state)
 		return ret;
 	}
 	t6040_mark(s, 0x12);
-	t6040_pmc_cp(s, 2);
 	s->pcie_ans_stopped = false;
 	s->ans_bridge_quiesced = false;
 	t6040_sleep_coprocs_stop(true);
 	t6040_sleep_coprocs_stop(false);
 	t6040_mark(s, 0x13);
-	t6040_pmc_cp(s, 3);
 	t6040_wake_arm(s);
 	t6040_mark(s, 0x14);
 
@@ -6277,34 +5011,19 @@ static int t6040_sleep_probe(struct platform_device *pdev)
 	sleep->a2d_blk = t6040_ioremap_np(&pdev->dev, 0x502850000ULL, 0x1000);
 	sleep->aop_req = t6040_ioremap_np(&pdev->dev, 0x5108b8000ULL, 0x1000);
 	sleep->a2d_mm12 = t6040_ioremap_np(&pdev->dev, 0x50890c000ULL, 0x1000);
-	sleep->mtp_ps = t6040_ioremap_np(&pdev->dev, T6040_MTP_PS_PA, 8 * T6040_MTP_PS_WORDS);
 	sleep->aop_ps = t6040_ioremap_np(&pdev->dev, T6040_AOP_PS_PA, 0x160);
 	sleep->snap_soc = t6040_ioremap_np(&pdev->dev, 0x502800000ULL, 0x9000);
 	sleep->ps_saved = devm_kcalloc(&pdev->dev, ARRAY_SIZE(t6040_ps_snap_pa),
 				       sizeof(*sleep->ps_saved), GFP_KERNEL);
-	sleep->atc_aon = t6040_ioremap_np(&pdev->dev, 0x508320c00ULL, 0x200);
 	for (i = 0; i < 16; i++)
 		sleep->dcs[i] = t6040_ioremap_np(&pdev->dev, 0x220200000ULL +
 						 (i / 4) * 0x2000000ULL + (i % 4) * 0x200000ULL,
 						 0x2000);
-	for (i = 0; i < 4; i++)
-		sleep->amcc_sem[i] = t6040_ioremap_np(&pdev->dev,
-						      0x2201c0000ULL + i * 0x2000000ULL, 0x1000);
-	sleep->pg_main = t6040_ioremap_np(&pdev->dev, 0x50282c000ULL, 0x1000);
 	sleep->aop_asc = t6040_ioremap_np(&pdev->dev, 0x510600000ULL, 0x100);
 	for (i = 0; i < 4; i++)
 		sleep->atc_cfg[i] = t6040_ioremap_np(&pdev->dev,
 						     0x383200000ULL + i * 0x8000000ULL, 0x100);
-	sleep->pg_east = t6040_ioremap_np(&pdev->dev, 0x5022a0000ULL, 0x1000);
-	sleep->mini_ps = t6040_ioremap_np(&pdev->dev, 0x508300000ULL, 0x200);
 	sleep->snap_east = t6040_ioremap_np(&pdev->dev, 0x502280000ULL, 0xd000);
-	for (i = 0; i < ARRAY_SIZE(t6040_pmc_probe_pa); i++)
-		sleep->pmc_probe_io[i] = t6040_ioremap_np(&pdev->dev, t6040_pmc_probe_pa[i], 4);
-	for (i = 0; i < 3; i++) {
-		sleep->cpm_cfg[i] = t6040_ioremap_np(&pdev->dev, T6040_CPM_CFG_PA(i), CPM_CFG_STATE + 8);
-		sleep->cpm_impl[i] = t6040_ioremap_np(&pdev->dev, T6040_CPM_IMPL_PA(i), 8);
-	}
-	sleep->cpu4_impl110 = t6040_ioremap_np(&pdev->dev, T6040_CPU4_IMPL110_PA, 8);
 	sleep->soc_east = t6040_sleep_map(&pdev->dev, "soc-east");
 	sleep->soc_ps = t6040_sleep_map(&pdev->dev, "soc-ps");
 	sleep->aop_global = t6040_sleep_map(&pdev->dev, "aop-global");
@@ -6319,11 +5038,7 @@ static int t6040_sleep_probe(struct platform_device *pdev)
 	sleep->dcp_dart = t6040_ioremap_np(&pdev->dev, T6040_DCP_DART_PA, 0x1000);
 	sleep->disp_pwrgate = t6040_ioremap_np(&pdev->dev, T6040_DISP_PWRGATE_PA, 0x100);
 	sleep->pmc_dcp = t6040_ioremap_np(&pdev->dev, T6040_PMC_DCP_PA, 12);
-	sleep->pmc_dvmr = t6040_ioremap_np(&pdev->dev, T6040_PMC_DVMR_PA, 0x40);
 	sleep->pmc_bwr = t6040_ioremap_np(&pdev->dev, T6040_PMC_BWR_PA, 0x10);
-	sleep->dispext_pwrgate = t6040_ioremap_np(&pdev->dev, T6040_DISPEXT_PWRGATE_PA, 0x1000);
-	for (i = 0; i < ARRAY_SIZE(t6040_dcp_asc_ctl_pa); i++)
-		sleep->dcp_asc_ctl[i] = t6040_ioremap_np(&pdev->dev, t6040_dcp_asc_ctl_pa[i], 4);
 	sleep->ptd = t6040_ioremap_np(&pdev->dev, T6040_PTD_PA, 0x11000);
 	/* The DART clock-protection (GAPF) block, read-only here. */
 	sleep->gapf = t6040_ioremap_np(&pdev->dev, 0x500578000ULL, 0x1000);
@@ -6339,7 +5054,6 @@ static int t6040_sleep_probe(struct platform_device *pdev)
 		sleep->tvm_ctl[i] = t6040_ioremap_np(&pdev->dev, t6040_tvm[i].ctl, 4);
 		sleep->tvm_status[i] = t6040_ioremap_np(&pdev->dev, t6040_tvm[i].status, 4);
 	}
-	sleep->pmc_ap_floor = t6040_ioremap_np(&pdev->dev, T6040_PMC_AP_FLOOR_PA, 8);
 	sleep->afr_ps = t6040_ioremap_np(&pdev->dev, T6040_AFR_PS_PA, 4);
 	if (sleep->ka_soc && sleep->ka_east) {
 		u32 soc = 0, east = 0;
