@@ -16,6 +16,7 @@ typedef uint32_t u32;
 typedef uint16_t u16;
 typedef uint8_t u8;
 #define BIT_ULL(n) (1ULL << (n))
+#define GENMASK_ULL(h, l) ((~0ULL << (l)) & (~0ULL >> (63 - (h))))
 #define __ffs64(v) __builtin_ctzll(v)
 #define BIT(n) (1U << (n))
 #define IS_ENABLED(x) (x)
@@ -100,6 +101,9 @@ struct generic_pm_domain {
 struct apple_pmp_report_offsets {
 	u32 tgt_read, tgt_write, actual, status, fast_die, fast_die_lanes;
 	u32 update, dvfs_first, dvfs_count;
+	u32 dvfs_ready_state, dvfs_ready_entry;
+	u64 dvfs_ready_prime;
+	u32 soc_dvfs_state;
 	bool starts_pmp;
 	const char *name, *fallback, *pwrstate;
 	bool devices_ordered;
@@ -158,6 +162,15 @@ struct apple_pmp_report {
 	struct apple_pmp_start *start;
 	/* Requests held until the PMP runs; T6030 does not defer them. */
 	u64 shadow, known;
+	u64 request_word;
+	bool request_word_known;
+	/* Provider-owned whole-word DVFS shadows; unused by T6030. */
+	u64 dvfs_words[64];
+	u64 dvfs_known;
+	u64 dvfs_pending;
+	u64 dvfs_ready_prime_word;
+	u64 dvfs_ready_achieved_word;
+	bool dvfs_ready_prime_sent, dvfs_ready;
 	bool defer;
 	/* Firmware-driven sleep: the request word at its start, the DVFS words kept. */
 	u64 sleep_request;
@@ -206,6 +219,12 @@ struct apple_pmp_report_entry {
 	u64 dvfs_on;
 };
 #define PMP_DVFS_VALID BIT_ULL(61)
+#define PMP_DVFS_DEFAULT_MASK GENMASK_ULL(4, 0)
+#define PMP_DVFS_CLASS_25_MASK GENMASK_ULL(51, 48)
+#define FIELD_FIT(mask, val) \
+	!((((u64)(val)) << __builtin_ctzll(mask)) & ~(mask))
+#define FIELD_PREP(mask, val) \
+	((((u64)(val)) << __builtin_ctzll(mask)) & (mask))
 #define genpd_to_apple_pmp_report_entry(p) \
 	container_of(p, struct apple_pmp_report_entry, genpd)
 struct of_phandle_iterator {
@@ -432,6 +451,21 @@ static void writeq(u64 v, void *a)
 		r;                                                    \
 	})
 #define readq_poll_timeout_atomic readq_poll_timeout
+#define read_poll_timeout(op, value, condition, delay, timeout, before, args...) \
+	({                                                            \
+		int r = -ETIMEDOUT;                                   \
+		for (int i = 0; i < 4; i++) {                         \
+			(value) = op(args);                           \
+			if (condition) {                              \
+				r = 0;                                \
+				break;                                \
+			}                                             \
+		}                                                     \
+		(void)(delay);                                        \
+		(void)(timeout);                                      \
+		(void)(before);                                       \
+		r;                                                    \
+	})
 static u32 get_unaligned_le32(const void *p)
 {
 	u32 v;

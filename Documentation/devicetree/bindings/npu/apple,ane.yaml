@@ -64,8 +64,9 @@ properties:
     $ref: /schemas/types.yaml#/definitions/phandle
     description:
       PMP report provider that owns the ANE clock-level request interface.
-      Only supported on T6000. The ANE and report SRAM must remain powered
-      while the driver holds a request.
+      On T6000 this owns the ANE clock-level interface. On T8112 it owns the
+      host-published, job-scoped DCS and SoC constraints. The ANE and report
+      SRAM must remain powered while the driver holds a request.
 
   interconnects:
     maxItems: 1
@@ -205,12 +206,19 @@ allOf:
       required:
         - apple,performance-controller
     then:
-      properties:
-        compatible:
-          const: apple,t6000-ane
-        power-domains:
-          minItems: 6
-          maxItems: 6
+      oneOf:
+        - properties:
+            compatible:
+              const: apple,t6000-ane
+            power-domains:
+              minItems: 6
+              maxItems: 6
+        - properties:
+            compatible:
+              const: apple,t8112-ane
+            power-domains:
+              minItems: 8
+              maxItems: 8
 
   - if:
       properties:
@@ -425,22 +433,23 @@ allOf:
           minItems: 4
         power-domains:
           minItems: 7
-          maxItems: 7
+          maxItems: 8
         resets: false
         memory-region: false
       required:
         - mboxes
 
   - if:
-      properties:
-        compatible:
-          contains:
-            enum:
-              - apple,t8140-ane
-              - apple,t6041-ane
-              - apple,t6050-ane
-              - apple,t6001-ane
-    else:
+      not:
+        properties:
+          compatible:
+            contains:
+              enum:
+                - apple,t8140-ane
+                - apple,t6041-ane
+                - apple,t6050-ane
+                - apple,t6001-ane
+    then:
       properties:
         power-domains:
           minItems: 5
@@ -460,13 +469,14 @@ allOf:
       required:
         - clocks
   - if:
-      properties:
-        compatible:
-          contains:
-            enum:
-              - apple,t6001-ane
-              - apple,t6050-ane
-    else:
+      not:
+        properties:
+          compatible:
+            contains:
+              enum:
+                - apple,t6001-ane
+                - apple,t6050-ane
+    then:
       properties:
         clocks: false
 

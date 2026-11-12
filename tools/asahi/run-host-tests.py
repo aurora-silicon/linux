@@ -186,6 +186,7 @@ ASAHI_TESTS = {
                                    'maverick-event', 'stowe-offset', 'baku-limit',
                                    'set-no-round', 'set-negative'), out()),
     'perf-mmap-alias-lifecycle-tests.py': [([], PASS)],
+    'pmp-validation-tests.py': [(out(), PASS)],
     'qspi-nvram-tests.py': [(out('--output'), PASS)],
     'rtkit-crashlog-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('buffer-header', 'section-header', 'section-size', 'footer-room',
@@ -197,6 +198,7 @@ ASAHI_TESTS = {
     't6030-display-admission-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
     't6030-display-linkage-tests.py': [(out('--output') + ['--conf', '{conf}'], PASS)],
     't6030-pmp-dt-tests.py': [(out('--output') + ['--dtc', '{dtc}'], PASS)],
+    't6000-t8112-pmp-dt-tests.py': [(out('--output') + ['--dtc', '{dtc}'], PASS)],
     't6030-pmp-graph-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
     't6030-pmp-supplier-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
     't6030-wiring-tests.py': [(out(), PASS), (out() + ['--old-classifier', 'tb'], PASS),

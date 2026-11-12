@@ -13,6 +13,12 @@
 struct device_node;
 struct device;
 
+enum apple_pmp_t8112_constraint_source {
+	APPLE_PMP_T8112_CONSTRAINT_CPU,
+	APPLE_PMP_T8112_CONSTRAINT_ANE,
+	APPLE_PMP_T8112_CONSTRAINT_SOURCE_COUNT,
+};
+
 #if IS_ENABLED(CONFIG_APPLE_PMP_REPORT)
 /* J613 floor demand input; no-op without an admitted owner. */
 void apple_pmp_j613_floor_gpu_activity(bool busy);
@@ -38,6 +44,10 @@ int apple_pmp_report_entry_withdraw_polled(const struct device_node *entry);
  */
 int apple_pmp_report_set_request(const struct device_node *report_np, unsigned int id,
 				 bool enable, bool no_ack);
+int apple_pmp_t8112_set_constraint(const struct device_node *report_np,
+				   unsigned int entry,
+				   enum apple_pmp_t8112_constraint_source source,
+				   unsigned int dcs, unsigned int soc);
 /*
  * T6001: the GPU driver reports each operation in flight. With the pmp_report.agx_vote parameter set, the AGX request (PS-REQ bit 9) is
  * set while any operation runs and cleared agx_vote_idle_ms after the last one ends. Parameter off: no effect. Both may be called from
@@ -144,6 +154,15 @@ static inline int apple_pmp_report_set_request(const struct device_node *report_
 static inline void apple_pmp_j613_floor_gpu_activity(bool busy)
 {
 }
+
+static inline int apple_pmp_t8112_set_constraint(const struct device_node *report_np,
+						 unsigned int entry,
+						 enum apple_pmp_t8112_constraint_source source,
+						 unsigned int dcs, unsigned int soc)
+{
+	return -ENODEV;
+}
+
 #endif
 
 #endif /* _LINUX_SOC_APPLE_PMP_REPORT_H_ */

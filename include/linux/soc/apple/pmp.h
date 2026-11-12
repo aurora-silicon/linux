@@ -6,6 +6,20 @@
 #include <linux/types.h>
 struct device;
 struct dev_pm_ops;
+
+/*
+ * T8112 SOC-device IDs of the CPU-cluster and ANE constraint targets, and the
+ * highest qualified DCS and SoC-fabric levels. The host publishes each
+ * target's SOC-DEV-DVFS entry at the SOC-device ID from a base of 0xa5.
+ */
+#define APPLE_PMP_T8112_EACC0		3
+#define APPLE_PMP_T8112_PACC0		4
+#define APPLE_PMP_T8112_ANE0		6
+#define APPLE_PMP_T8112_DCS_MAX		4
+#define APPLE_PMP_T8112_SOC_MAX		2
+#define APPLE_PMP_T8112_DVFS_BASE	0xa5
+#define APPLE_PMP_T8112_DVFS_ENTRY(id)	(APPLE_PMP_T8112_DVFS_BASE + (id))
+
 #if IS_REACHABLE(CONFIG_APPLE_PMP)
 int apple_pmp_link_device(struct device *consumer);
 int apple_pmp_set_device_power(u8 command, u16 device_id, u32 enabled);
@@ -20,6 +34,7 @@ static inline int apple_pmp_set_device_power(u8 command, u16 device_id, u32 enab
 {
 	return -ENODEV;
 }
+
 static inline int apple_pmp_t6030_gpu_ready(void)
 {
 	return -ENODEV;
