@@ -1561,7 +1561,7 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 
 	if (READ_ONCE(dcp->quiescing))
 		return;
-	/* Resume from disk: the host session is being rebuilt, see dcp.c. */
+	/* A session dropped for a resume from disk, or a failed restart. */
 	if (dcp_hib_tx_gated(dcp))
 		return;
 
@@ -2655,10 +2655,10 @@ static int dcp_desktop_dptx_connect(struct apple_dcp *dcp, u32 port)
 
 	/*
 	 * The DP-to-HDMI converter is powered for its link and each link starts
-	 * from its power-up, as macOS's port controller has it (it powers the
-	 * converter when the port is connected to a pipe, before the port is
-	 * activated). Not while the other port's link runs through it, and not
-	 * again for a link dcp_hib_ext_relink() has just powered it up for.
+	 * from its power-up: the converter is powered when the port is connected
+	 * to a pipe, before the port is activated. Not while the other port's
+	 * link runs through it, and not again for a link dcp_hib_ext_relink() has
+	 * just powered it up for.
 	 */
 	if (dcp->dp2hdmi_pwren && !dcp->dptxport[!port].connected) {
 		if (!dcp->hdmi_converter_fresh)
@@ -2744,10 +2744,9 @@ static int dcp_desktop_dptx_disconnect_oob(struct apple_dcp *dcp, u32 port)
  * bringing up.  Once the link has trained and the firmware has set up the
  * converter's HDMI side, it takes a new HPD as the same link: it trains the
  * DP side again, skips the HDMI side and shows the display with a mode set,
- * and the display stays black until its link is released.  On the J616s a
- * 100 ms HPD pulse sent 0.6 s or later after the first training, and before
- * the display was shown, ended black every time; a release and a new
- * connection at the same moment did not.  So an HPD change under a connected
+ * and the display stays black until its link is released.  An HPD pulse
+ * after the first training, before the display is shown, leaves it black; a
+ * release and a new connection do not.  So an HPD change under a connected
  * port starts the link over through a release, see dcp_desktop_hdmi_restart().
  */
 /* The HDMI display gives its pipeline up: report it gone, release its link. */
@@ -3196,8 +3195,8 @@ bool dcp_wake_reread_pending(struct apple_dcp *dcp)
 /*
  * A display that the link of a wake has just woken can answer the first read
  * with the modes of its standby, and gives no new HPD when its own are there
- * a second later: a G95NC in picture-by-picture mode lists its full-width
- * modes and none of its half.  The desktop then finds no mode for it, and
+ * a second later: a monitor showing two inputs side by side lists its
+ * full-width modes and none of its half-width ones.  The desktop then finds no mode for it, and
  * dcp_link_recovery_schedule() reads it again only if a retrain happened to
  * run against that list.  So the first list after a wake is held against the
  * one the sleep found (dcp_hib_release_ext_link()), and a display that lists
@@ -6479,14 +6478,12 @@ static int dcp_hdmi_power_up(struct apple_dcp *dcp)
 }
 
 /*
- * The converter's own rail goes and comes with its link: macOS's port
- * controller powers the converter when its port is connected to a pipe and
- * takes the power away when the display is released, at an unplug and at
- * every system sleep (the enable is a count of users; J616s has no
- * "pcon-stays-on"). HDMI's +5 V stays on, HPD needs it.
- * A converter left powered through a T6040 S2R, its DP lanes gone and back
- * under it, locked to no link rate after the wake. One still on when a link
- * starts is switched off first, as probe does.
+ * The converter's own rail goes and comes with its link: the converter is
+ * powered when its port is connected to a pipe and loses its power when the
+ * display is released, at an unplug and at every system sleep. HDMI's +5 V
+ * stays on, HPD needs it. A converter left powered through a T6040 S2R, its
+ * DP lanes gone and back under it, locks to no link rate after the wake. One
+ * still on when a link starts is switched off first, as probe does.
  */
 static void dcp_hdmi_converter_power(struct apple_dcp *dcp, bool on)
 {
@@ -6572,7 +6569,7 @@ static void dcp_desktop_phy_off(void *data)
 {
 	struct dcp_desktop_phy_hold *hold = data;
 
-	/* Given back for hibernation and not powered again, see dcp.c. */
+	/* Given back for a sleep and not powered again, see dcp_hib_release_ext_link(). */
 	if (hold->dcp->hib_fixed_phy_off)
 		return;
 	phy_power_off(hold->phy);
@@ -8992,7 +8989,7 @@ bool dcp_s2r_firmware_stopped(struct platform_device *pdev)
 
 /*
  * The two external DCPs share the DISPEXT power-state words in the west SOC-PS
- * block (the "ps" window aura publishes, base 0x502800000), each at its own
+ * block (the "ps" window of their apple,display-power node, base 0x502800000), each at its own
  * offsets: DISPEXT0 (HDMI, coproc dcp@3a2e00000) SYS/FE/CPU +0x340/0x348/0x350,
  * DISPEXT1 (USB-C DP, coproc dcp@602e00000) +0x490/0x498/0x4a0, as the
  * ps_dispext{0,1}_* nodes of t6040-pmgr.dtsi and the sleep controller's
@@ -9073,10 +9070,10 @@ static int dcp_t6041_display_power(struct apple_dcp *dcp, void __iomem **ps,
 
 /*
  * T6040: the fabric rejects a write to a display coprocessor's CPU power word while
- * bit 4 ("clock protection") of its DART's GAPF slice is set (T8140's
- * apple_dart_gapf_ready, b769c9543b56). macOS has SPTM call 0x8116 clear it when it
- * stops the CPU, before it turns the domain off; this boot has no SPTM. Slices from the live ADT:
- * dart-dcp 17, dart-dcpext0 29, dart-dcpext1 48 at GAPF 0x500578000 + 0x100 + 0x40 * n.
+ * bit 4 ("clock protection") of its DART's GAPF slice is set, as on T8140 (see
+ * apple_dart_gapf_ready()). The bit is cleared when the CPU is stopped, before its
+ * domain goes off, and here the driver clears it itself. The DARTs' slices in the
+ * GAPF bank: dart-dcp 17, dart-dcpext0 29, dart-dcpext1 48.
  */
 #define DCP_T6041_GAPF_BASE		0x500578000ULL
 #define DCP_T6041_GAPF_SIZE		0x4000
@@ -9095,11 +9092,11 @@ static int dcp_t6041_display_power(struct apple_dcp *dcp, void __iomem **ps,
 static void dcp_t6041_gapf_release_all(struct apple_dcp *dcp);
 
 /*
- * W1: raise the display domains and pmc-dcp. SYS and FE go to manual target 0xf with
+ * Raise the display domains and pmc-dcp. SYS and FE go to manual target 0xf with
  * ACTUAL polled: in automatic mode nothing holds them up while the DCP's CPU is off,
- * they are gated again and the display DART behind them faults. Then the internal
- * DCP's CPU power word, which the stop left at target 0 with automatic mode off, and
- * its children.
+ * they are gated again and the display DART behind them faults. Then the DCP's CPU
+ * power word, which the stop left at target 0 with automatic mode off, and its
+ * children.
  */
 static int dcp_t6041_s2r_domains_on(struct apple_dcp *dcp)
 {
@@ -9151,9 +9148,8 @@ static int dcp_t6041_s2r_domains_on(struct apple_dcp *dcp)
 	}
 	/*
 	 * The 11 children of the CPU word (+0x8..+0x58) are at target 0 after the sleep (the
-	 * sleep controller's last steps lower them) and with them down every endpoint start
-	 * timed out: what the stop found is written back, in order, before the GAPF
-	 * protection returns.
+	 * sleep controller's last steps lower them), and with them down the firmware answers
+	 * no endpoint start: what the stop found is written back, in order.
 	 */
 	if (!dcp->external && dcp->s2r_child_valid) {
 		u32 cur, to = 0, i;
@@ -9180,9 +9176,9 @@ static int dcp_t6041_s2r_domains_on(struct apple_dcp *dcp)
 }
 
 /*
- * With only the DCP DART's own slice released (0x12 -> 0x02) the CPU word still
- * faulted: every protected slice (bits 1 and 4 set) in the bank, past the reserved
- * ones, is released.
+ * Releasing the DCP DART's own slice is not enough for the CPU word to take a
+ * write: every protected slice in the bank, past the reserved ones, is released.
+ * Nothing protects them again before the next boot.
  */
 static void dcp_t6041_gapf_release_all(struct apple_dcp *dcp)
 {
@@ -9211,19 +9207,20 @@ static void dcp_t6041_gapf_release_all(struct apple_dcp *dcp)
 }
 
 /*
- * T6040 suspend-to-RAM: the desktop 26.x firmware's own stop, in macOS's order
- * (the pipeline's power state, then the DCP power manager's and the
- * coprocessor's CPU stop), as measured on the J616s (A500 reached,
- * RTKit idle 0, the CPU stopped with status 0x6d): presentation drained, A473(0)
- * restartable sleep (dcp_sleep()), A500, RTKit idle (AP and IOP 0x201), the run bit
- * off, then bit 5, then the CPU's power word down in macOS's two steps
- * (dcp_t6041_s2r_cpu_off()), while its FE and SYS parents are still on: macOS lowers
- * DISP_CPU 131 us after it stops the CPU. FE and SYS are not lowered here. Only for a
- * sleep that may lose power: with its power kept, a stopped desktop firmware has no way
- * back here (still 0x6d after the run bit; a forced power cycle of its domain hung the
- * SoC). So a dry run keeps it running, its domains on, as suspend-to-idle does. The CPU
- * power word and the wake (dcp_t6041_s2r_resume()) need the apple,display-power window:
- * without it the word is left alone and the display stays off after the wake.
+ * T6040 suspend-to-RAM stops the desktop 26.x firmware in macOS's order: the
+ * pipeline's power state first, then the DCP power manager and the coprocessor's
+ * CPU. Presentation is drained, then come the restartable sleep A473(0)
+ * (dcp_sleep()), A500 and RTKit idle (AP and IOP 0x201); the run bit goes off, then
+ * bit 5, and the CPU's power word goes down in two steps (dcp_t6041_s2r_cpu_off())
+ * right after, while its FE and SYS parents are still on. FE and SYS are not
+ * lowered here.
+ *
+ * Only for a sleep that may lose power: with its power kept, a stopped desktop
+ * firmware does not start again, and power-cycling its domain hangs the SoC. A sleep
+ * that keeps the power leaves the firmware running and its domains on, as
+ * suspend-to-idle does. The CPU power word and the wake (dcp_t6041_s2r_resume())
+ * need the apple,display-power window: without it the word is left alone and the
+ * display stays off after the wake.
  */
 static bool dcp_t6041_s2r_capable(struct apple_dcp *dcp)
 {
@@ -9280,9 +9277,10 @@ static void dcp_t6041_s2r_cpu_off(struct apple_dcp *dcp)
 	writel(0, control);
 	v = readl(w);
 	/*
-	 * macOS writes the CPU word as full values with bits 27:24 = 0xf (measured:
-	 * 0x1f0003ff -> 0x0f0000ff, ACTUAL polled to 15, -> 0x0f0003f0); the boot chain
-	 * leaves bits 27:24 = 0 here (0x1000030f). Both writes carry macOS's bits 27:24.
+	 * The CPU word is written as full values, both times with the automatic state
+	 * (bits 27:24) at 0xf, as macOS does; the boot chain leaves it at 0 here. First
+	 * the target 0xf, ACTUAL polled until it follows, then the target 0 with the
+	 * gated flags cleared, until the word is no longer busy and ACTUAL is 0.
 	 */
 	writel((v & DCP_PS_MIN) | DCP_PS_AUTO | DCP_PS_ACTUAL | DCP_PS_TARGET, w);
 	mb();	/* the write lands before the word is polled */
@@ -9301,11 +9299,11 @@ static void dcp_t6041_s2r_cpu_off(struct apple_dcp *dcp)
 #define DCP_S2R_AFK_TIMEOUT_MS	200
 
 /*
- * As macOS around a DCP that idles for a sleep (the AFK endpoints' state machine on RTKit's
- * power notifications): every AFK endpoint is paused, highest first, before the IOP
- * idles, and resumed, lowest first, after its HELLO, before the display is powered.
- * Without the resume the firmware never announces its AV services again, its video
- * interface stays unplugged and every mode set is refused ("HPD is 0").
+ * Around a sleep that idles the DCP, as macOS does: every AFK endpoint is paused,
+ * highest first, before the IOP idles, and resumed, lowest first, after its HELLO,
+ * before the display is powered. Without the resume the firmware never announces its
+ * AV services again, its video interface stays unplugged and every mode set is
+ * refused ("HPD is 0").
  */
 static void dcp_t6041_s2r_afk(struct apple_dcp *dcp, bool resume)
 {
@@ -9380,11 +9378,10 @@ static int dcp_t6041_s2r_stop(struct apple_dcp *dcp)
 	dcp_t6041_s2r_stop_link_work(dcp);
 
 	/*
-	 * The internal panel's DPMS is soft (backlight only), so its pipe is still lit here.
-	 * macOS has the display off before the sleep: the firmware's set_power_state(0)
-	 * lowers the pipe's eleven sub-blocks itself, and its PMGR panics if they are on
-	 * when DISP_CPU goes down. Without it the pipe was fully on at the commit
-	 * point and lowering under it raised an SError.
+	 * The internal panel's DPMS is soft (backlight only), so its pipe may still be lit
+	 * here. The display goes off before the sleep: the firmware's set_power_state(0)
+	 * lowers the pipe's eleven sub-blocks itself, and the PMGR faults if they are on
+	 * when DISP_CPU goes down. Lowering the domains under a lit pipe raises an SError.
 	 */
 	_dcp_poweroff(dcp);
 
@@ -9437,14 +9434,13 @@ lost:
 }
 
 /*
- * The desktop firmware brought back after a real sleep: W1 raises the display
- * domains, the DART streams the stop turned off come back (W2), then the warm
- * restart of the idled firmware runs async in the reused hib_restore_work so its
- * waits do not stall .resume (dcp_t6041_s2r_warm_restart() for the internal panel,
- * dcp_t6041_s2r_warm_restart_ext() for an external DCP). If W1 cannot run -- no
- * apple,display-power window, or an external DCP whose DISPEXT offsets are
- * unresolved -- the panel/output is left off until reboot: refusal-safe, the sleep
- * already completed.
+ * The desktop firmware brought back after a real sleep: the display domains are
+ * raised (dcp_t6041_s2r_domains_on()), the DART streams the stop turned off come
+ * back, then the warm restart of the idled firmware runs in hib_restore_work so that
+ * its waits do not stall .resume (dcp_t6041_s2r_warm_restart() for the internal
+ * panel, dcp_t6041_s2r_warm_restart_ext() for an external DCP). If the domains
+ * cannot be raised (no apple,display-power window, or an external DCP whose DISPEXT
+ * offsets are unknown) the output stays off until reboot; the sleep itself is done.
  */
 static void dcp_t6041_s2r_resume(struct apple_dcp *dcp)
 {
@@ -9453,17 +9449,15 @@ static void dcp_t6041_s2r_resume(struct apple_dcp *dcp)
 	if (!dcp_t6041_s2r_domains_on(dcp)) {
 #ifdef CONFIG_PM_SLEEP
 		if (!dcp_desktop_external(dcp)) {
-			/* W2: the internal scanout/display DART streams back first. */
+			/* The internal scanout/display DART streams back first. */
 			dcp_s2r_find_darts(dcp);
 			if (dcp->s2r_disp_dart)
 				apple_dart_display_streams(dcp->s2r_disp_dart,
 							   DCP_S2R_DISP_STREAMS, true, false);
 			/*
-			 * The stop turned the DCP's own DART streams off as well: with only
-			 * the display DART's back every endpoint start timed out (-110) and
-			 * the pipe never powered. As dcp_s2r_ext_start() and
-			 * dcp_s2r_warm_restart(): after the domains, the DCP DART's streams
-			 * on (GAPF protection again).
+			 * The stop turned the DCP's own DART streams off as well: without
+			 * them the firmware answers no endpoint start and never powers the
+			 * pipe. They come back after the domains, as in the T8140 wake.
 			 */
 			if (dcp->s2r_dcp_dart)
 				apple_dart_display_streams(dcp->s2r_dcp_dart,
@@ -9471,7 +9465,7 @@ static void dcp_t6041_s2r_resume(struct apple_dcp *dcp)
 		} else {
 			/*
 			 * An external DCP's stop turned its own DART's streams off as well:
-			 * its firmware answers no endpoint start without them (-110).
+			 * its firmware answers no endpoint start without them.
 			 */
 			dcp_s2r_find_darts(dcp);
 			if (dcp->s2r_dcp_dart)
@@ -10509,8 +10503,8 @@ static void dcp_desktop_cold_restart(struct apple_dcp *dcp)
  * firmware the stop idled keeps its buffers and rings, answers HELLO, gets its
  * endpoint map echoed and has no endpoint started again
  * (apple_rtkit_power_cycled_return()). Then the modeset that lights the panel.
- * The cold session restart re-inits RTKit and starts every endpoint: after the
- * idle the firmware answered none of those starts (-110 each).
+ * Not the cold session restart, which re-inits RTKit and starts every endpoint:
+ * the idled firmware answers none of those starts.
  */
 static void dcp_t6041_s2r_warm_restart(struct apple_dcp *dcp)
 {
@@ -10701,7 +10695,7 @@ static int dcp_hib_register(struct apple_dcp *dcp)
 	int ret;
 
 	dcp->hib_nb.notifier_call = dcp_hib_pm_notify;
-	dcp->hib_nb.priority = -5;	/* after PMP (10), before the GPU drain (-10) */
+	dcp->hib_nb.priority = -5;	/* after the PMP (10), before the GPU thaw (-10) */
 	ret = register_pm_notifier(&dcp->hib_nb);
 	if (ret)
 		return ret;

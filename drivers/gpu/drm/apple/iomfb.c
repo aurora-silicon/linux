@@ -1591,16 +1591,16 @@ void dcp_route_failure_notify(struct apple_connector *connector)
 }
 
 /*
- * A sink that drops its link and raises IRQ_HPD after every training (seen
- * with a dual-pipe monitor after a modeset from the kernel console during a
- * hibernation entry) turns each hotplug into a retrain and each
- * retrain into a hotplug, every 0.4-1.2 s, until the Type-C controller gives
- * up on the cable.  The worker retrains at most DCP_HOTPLUG_RETRAIN_MAX times
- * in a DCP_HOTPLUG_RETRAIN_WINDOW that starts with its first retrain and is
- * not extended by refused requests, so a storm is bounded to that rate and
- * never stops the retrains for good.  Past the limit the link status stays
- * BAD (userspace still gets every hotplug event and may set a mode); when the
- * window ends, one more retrain is tried if the sink is still connected.
+ * A sink that drops its link and raises IRQ_HPD after every training (a
+ * dual-pipe monitor can, after a modeset from the kernel console) turns each
+ * hotplug into a retrain and each retrain into a hotplug, every 0.4-1.2 s,
+ * until the Type-C controller gives up on the cable.  The worker retrains at
+ * most DCP_HOTPLUG_RETRAIN_MAX times in a DCP_HOTPLUG_RETRAIN_WINDOW that
+ * starts with its first retrain and is not extended by refused requests, so a
+ * storm is bounded to that rate and never stops the retrains for good.  Past
+ * the limit the link status stays BAD (userspace still gets every hotplug
+ * event and may set a mode); when the window ends, one more retrain is tried
+ * if the sink is still connected.
  *
  * A disconnect lasting DCP_HOTPLUG_REPLUG_GAP or longer is a real replug and
  * starts a fresh window.  A completed modeset does not: in the storm every

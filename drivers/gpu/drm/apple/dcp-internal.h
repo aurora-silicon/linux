@@ -1042,13 +1042,13 @@ struct apple_dcp {
 	 * External processors (dcpext): link work and the HDMI HPD interrupt
 	 * stopped, the link and DP PHYs released, from hibernation prepare
 	 * until PM_POST_HIBERNATION replays the link, or from the prepare of
-	 * a T6040 S2R until its wake does; this
-	 * processor still counted in the restart's firmware-start and
-	 * idle-pipe barriers (see dcp_hib_ext_restore()).
+	 * a T6040 S2R until its wake does; this processor still counted in the
+	 * restart's firmware-start and idle-pipe barriers (see
+	 * dcp_hib_ext_restore()).
 	 */
 	bool hib_typec_disabled;
 	bool hib_irq_disabled;
-	/* The fixed (HDMI) DP PHY given back at prepare, see dcp.c. */
+	/* The fixed (HDMI) DP PHY given back at prepare, see dcp_hib_release_ext_link(). */
 	bool hib_fixed_phy_off;
 	/* Link work stopped and the link released at hibernation prepare. */
 	bool hib_link_released;
