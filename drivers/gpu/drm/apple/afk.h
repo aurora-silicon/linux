@@ -119,6 +119,9 @@ struct apple_epic_service_ops {
 			  const char *class, s64 unit);
 	void (*init)(struct apple_epic_service *service, const char *name,
 			      const char *class, s64 unit);
+	/* Consumed synchronously before init publishes service readiness. */
+	void (*init_props)(struct apple_epic_service *service, s64 unit,
+			   const void *props, size_t size);
 	int (*call)(struct apple_epic_service *service, u32 idx,
 		    const void *data, size_t data_size, void *reply,
 		    size_t reply_size);
@@ -541,6 +544,24 @@ struct apple_dcp_afkep {
 
 	bool match_epic_name;
 };
+
+/*
+ * The locks, lists and wait queues of an endpoint, before anything may use
+ * them. afk_init() starts from it, and so does any endpoint built without it.
+ */
+static inline void afk_ep_init_state(struct apple_dcp_afkep *ep)
+{
+	u32 i;
+
+	spin_lock_init(&ep->lock);
+	INIT_LIST_HEAD(&ep->compact_cmds);
+	init_waitqueue_head(&ep->compact_orphan_wq);
+	mutex_init(&ep->compact_tx_lock);
+	init_completion(&ep->started);
+	init_completion(&ep->stopped);
+	for (i = 0; i < AFK_MAX_CHANNEL; i++)
+		spin_lock_init(&ep->services[i].lock);
+}
 
 struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 				 const struct apple_epic_service_ops *ops);

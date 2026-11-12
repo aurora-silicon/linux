@@ -217,13 +217,24 @@ static void sio_t6041_config_test(struct kunit *test)
 		.datashape = 2, .timeout = 0, .fifo = 0x800,
 		.threshold = sio_hw_t6041.fifo_threshold, .limit = sio_hw_t6041.cfg_word4,
 	};
-	static const u32 t6041[] = { 2, 0, 0x800, 0x600, 5, 0 };
+	/* macOS 26.6 DisplayPort audio records */
+	static const u32 t6041[] = { 2, 0, 0x800, 0x600, 0x800, 0 };
+	static const u32 t8140[] = { 2, 0, 0x800, 0x800, 0x800, 0 };
 	u32 words[8];
 
 	memset(words, 0xa5, sizeof(words));
 	sio_write_config(&sio_hw_t6041, words, &cfg);
 	KUNIT_EXPECT_MEMEQ(test, words, t6041, sizeof(t6041));
 	KUNIT_EXPECT_EQ(test, words[6], 0xa5a5a5a5U);
+
+	memset(words, 0xa5, sizeof(words));
+	cfg.threshold = sio_hw_t8140.fifo_threshold;
+	cfg.limit = sio_hw_t8140.cfg_word4;
+	sio_write_config(&sio_hw_t8140, words, &cfg);
+	KUNIT_EXPECT_MEMEQ(test, words, t8140, sizeof(t8140));
+	KUNIT_EXPECT_EQ(test, words[6], 0xa5a5a5a5U);
+	cfg.threshold = sio_hw_t6041.fifo_threshold;
+	cfg.limit = sio_hw_t6041.cfg_word4;
 
 	/* The other layouts keep their five words and leave the sixth alone. */
 	memset(words, 0xa5, sizeof(words));
@@ -244,6 +255,15 @@ static void sio_t6041_match_test(struct kunit *test)
 			break;
 	KUNIT_ASSERT_TRUE(test, id->compatible[0] != '\0');
 	KUNIT_EXPECT_PTR_EQ(test, id->data, (const void *)&sio_hw_t6041);
+	/* T8140 takes the T6041 tables, with its own channel record */
+	for (id = sio_of_match; id->compatible[0]; id++)
+		if (!strcmp(id->compatible, "apple,t8140-sio"))
+			break;
+	KUNIT_ASSERT_TRUE(test, id->compatible[0] != '\0');
+	KUNIT_EXPECT_PTR_EQ(test, id->data, (const void *)&sio_hw_t8140);
+	KUNIT_EXPECT_EQ(test, sio_hw_t8140.protocol, 10U);
+	KUNIT_EXPECT_PTR_EQ(test, sio_hw_t8140.arrays, &sio_t6041_arrays);
+	KUNIT_EXPECT_TRUE(test, sio_hw_t8140.check_boot_tables == sio_t6041_check_boot_tables);
 	KUNIT_EXPECT_EQ(test, sio_hw_t6041.protocol, 10U);
 	KUNIT_EXPECT_TRUE(test, sio_hw_t6041.clear_period_desc);
 	KUNIT_EXPECT_PTR_EQ(test, sio_hw_t6041.arrays, &sio_t6041_arrays);

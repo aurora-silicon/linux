@@ -395,6 +395,8 @@ struct tps6598x {
 
 	struct tipd_debugfs *debugfs;
 	struct typec_altmode *partner_altmode_dp;
+	/* USB remote wake armed on this port for the sleep (USBw). */
+	bool usbw_armed;
 };
 
 /* TPS_REG_USB4_STATUS */
@@ -466,12 +468,20 @@ struct cd321x {
 	atomic_t ready_event;
 	atomic_t restore_event;
 	bool display_route_active;
+	/* The sleep's debug link cut reset this controller: its setup is expected. */
+	bool reset_by_cut;
+	/* The debug link is still to be rearmed after a cut, and the tries so far */
+	bool rearm_pending;
+	unsigned int rearm_tries;
+	/* Resets taken since the cut for a contract the partner dropped, see cd321x_rearm_work() */
+	unsigned int rearm_resets;
 	bool dp_sink_reported;
 	bool dp_irq_hpd;
 
 	struct cd321x_status update_status;
 	struct delayed_work update_work;
 	struct delayed_work resume_work;
+	struct delayed_work rearm_work;
 	struct cd321x_pm_state pm;
 	struct usb_pd_identity cur_partner_identity;
 	bool cur_partner_is_pd;
@@ -522,6 +532,7 @@ struct cd321x_sleep_state {
 };
 
 int cd321x_sleep_events(struct tps6598x *tps, struct cd321x_sleep_state *st);
+void tipd_usb_wake(struct tps6598x *tps, bool asleep);
 int tps6598x_exec_cmd_tmo(struct tps6598x *tps, const char *cmd,
 			  size_t in_len, const u8 *in_data,
 			  size_t out_len, u8 *out_data,
@@ -564,6 +575,7 @@ int sn201202x_runtime_resume(struct device *dev);
 void sn201202x_idle_sleep_start(struct tps6598x *tps);
 void sn201202x_idle_sleep_stop(struct tps6598x *tps);
 extern const struct regmap_bus regmap_sn201202x;
+extern const struct tipd_contaminant_ops sn201202x_contaminant_ops;
 u32 sn201202x_sleep_links(const struct cd321x_sleep_state *st);
 enum typec_contaminant
 sn201202x_ldcm_decode(const u8 status[SN201202X_LDCM_STATUS_LEN]);

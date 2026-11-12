@@ -561,7 +561,8 @@ static void mt_startup_work(struct work_struct *work)
 		spin_lock_irqsave(&m->response_lock, flags);
 		generation = m->reg_generation;
 		*reg = m->reg_desired;
-		if (m->stopping || generation == m->reg_attempted) {
+		/* Stopped for a sleep, the restart runs this generation again. */
+		if (m->stopping || READ_ONCE(m->hif_suspended) || generation == m->reg_attempted) {
 			spin_unlock_irqrestore(&m->response_lock, flags);
 			kfree(reg);
 			return;
@@ -804,6 +805,15 @@ static const struct cfg80211_ops mt_cfg_ops = {
 	.dump_station = mt_dump_station,
 	.set_power_mgmt = mt_set_power_mgmt,
 	.set_cqm_rssi_config = mt_set_cqm_rssi_config,
+#if IS_ENABLED(CONFIG_MT7932_AWDL)
+	.add_station = mt_awdl_add_station,
+	.del_station = mt_awdl_del_station,
+	.change_station = mt_awdl_change_station,
+#endif
+#ifdef CONFIG_PM
+	.suspend = mt_wow_suspend,
+	.resume = mt_wow_resume,
+#endif
 };
 
 int mt_register_regulatory_gate(struct mt7932 *m)
@@ -829,6 +839,7 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 	set_wiphy_dev(m->wiphy, &m->pdev->dev);
 	ether_addr_copy(m->wiphy->perm_addr, m->mac);
 	m->wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
+	mt_awdl_wiphy_setup(m);
 	m->wiphy->signal_type = CFG80211_SIGNAL_TYPE_MBM;
 	m->wiphy->cipher_suites = ciphers;
 	m->wiphy->n_cipher_suites = ARRAY_SIZE(ciphers);
@@ -840,6 +851,9 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 	wiphy_ext_feature_set(m->wiphy, NL80211_EXT_FEATURE_MFP_OPTIONAL);
 	m->wiphy->max_scan_ssids = MT7932_SCAN_SSIDS;
 	m->wiphy->max_scan_ie_len = 600;
+#ifdef CONFIG_PM
+	m->wiphy->wowlan = &mt_wowlan_support;
+#endif
 	m->wiphy->reg_notifier = mt_regulatory_notify;
 	/* World roaming may relax NO_IR after observing an AP beacon without
 	 * changing alpha2. Request the callback so firmware's CID0f domain is
@@ -943,6 +957,9 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 	m->wiphy_registered = true;
 	mt_policy_debugfs_init(m);
 	ret = mt_register_interface(m);
+	if (ret)
+		return ret;
+	ret = mt_awdl_register(m);
 	if (ret)
 		return ret;
 	WRITE_ONCE(m->interface_registered, true);

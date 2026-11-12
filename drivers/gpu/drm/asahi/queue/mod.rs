@@ -64,6 +64,10 @@ mod common;
 mod compute;
 mod render;
 
+fn can_submit_inline(dependencies_ready: bool, previous_status: Option<i32>) -> bool {
+    dependencies_ready && previous_status.is_none_or(|status| status != 0)
+}
+
 /// Trait implemented by all versioned queues.
 pub(crate) trait Queue: Send + Sync {
     fn reserve_render_scs(&mut self, layouts: [u64; 2]) -> Result {
@@ -82,6 +86,10 @@ pub(crate) trait Queue: Send + Sync {
         cmdbuf_raw: &[u8],
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
     ) -> Result;
+
+    /// Waits for the work submitted so far to finish, before the mappings of a closing
+    /// client go. Queues whose VMs keep user mappings for accepted jobs need not wait.
+    fn drain(&mut self) {}
 }
 
 #[versions(AGX)]
@@ -128,6 +136,10 @@ impl SubQueueJob::ver {
     fn can_submit(&self) -> Option<Fence> {
         self.job.as_ref().and_then(|job| job.can_submit())
     }
+
+    fn can_submit_inline(&self) -> bool {
+        self.job.as_ref().is_none_or(|job| job.can_submit_inline())
+    }
 }
 
 #[versions(AGX)]
@@ -142,6 +154,8 @@ pub(crate) struct Queue {
     fence_ctx: FenceContexts,
     inner: QueueInner::ver,
     stats: Arc<stats::StatsSnapshot>,
+    /// Finished fence of the last submitted job, waited for when the queue goes away.
+    last_out: Option<Fence>,
 }
 
 #[versions(AGX)]
@@ -212,6 +226,9 @@ pub(crate) struct QueueJob {
     fence: UserFence<JobFence::ver>,
     notifier: Arc<GpuObject<fw::event::Notifier::ver>>,
     notification_count: u32,
+    /// Zero until the ioctl tries publication, one for success, or a negative
+    /// errno for a failed attempt. The scheduler consumes the recorded result.
+    inline_result: i32,
     id: u64,
 }
 
@@ -259,6 +276,20 @@ impl QueueJob::ver {
             .map(|a| a.commit())
             .unwrap_or(Ok(()))?;
         self.sj_comp.as_mut().map(|a| a.commit()).unwrap_or(Ok(()))
+    }
+
+    fn can_submit_inline(&self) -> bool {
+        self.sj_vtx
+            .as_ref()
+            .is_none_or(|job| job.can_submit_inline())
+            && self
+                .sj_frag
+                .as_ref()
+                .is_none_or(|job| job.can_submit_inline())
+            && self
+                .sj_comp
+                .as_ref()
+                .is_none_or(|job| job.can_submit_inline())
     }
 }
 
@@ -313,6 +344,14 @@ impl sched::JobImpl for QueueJob::ver {
 
     #[allow(unused_assignments)]
     fn run(job: &mut Self) -> Result<Option<dma_fence::Fence>> {
+        if job.inline_result != 0 {
+            return if job.inline_result == 1 {
+                Ok(Some(Fence::from_fence(&job.fence)))
+            } else {
+                Err(Error::from_errno(job.inline_result))
+            };
+        }
+
         mod_dev_dbg!(job.dev, "QueueJob {}: Running Job\n", job.id);
 
         // We can only increase the notifier threshold here, now that we are
@@ -551,6 +590,7 @@ impl Queue::ver {
             q_comp: None,
             fence_ctx: FenceContexts::new(1, QUEUE_NAME, QUEUE_CLASS_KEY)?,
             stats,
+            last_out: None,
             inner: QueueInner::ver {
                 dev: dev.clone(),
                 ualloc,
@@ -681,7 +721,39 @@ fn build_attachments(reader: &mut Reader<'_>, size: usize) -> Result<microseq::A
 }
 
 #[versions(AGX)]
+impl Queue::ver {
+    /// Waits, for at most [`QUEUE_CLOSE_WAIT_MS`], for the last submitted job to finish. The
+    /// jobs of one queue complete in order, so its finished fence covers all of them.
+    fn wait_submitted(&self) {
+        let Some(fence) = self.last_out.as_ref() else {
+            return;
+        };
+        // SAFETY: `fence` holds a reference for the duration of the call. No lock is held,
+        // so completion can signal it.
+        let left = unsafe {
+            kernel::bindings::dma_fence_wait_timeout(
+                fence.raw(),
+                false,
+                kernel::time::msecs_to_jiffies(QUEUE_CLOSE_WAIT_MS) as _,
+            )
+        };
+        if left == 0 {
+            dev_warn!(
+                self.dev.as_ref(),
+                "[Queue {}] Closing with work still running after {} ms\n",
+                self.inner.id,
+                QUEUE_CLOSE_WAIT_MS
+            );
+        }
+    }
+}
+
+#[versions(AGX)]
 impl Queue for Queue::ver {
+    fn drain(&mut self) {
+        self.wait_submitted();
+    }
+
     fn submit<'drm>(
         &mut self,
         reg_data: &AsahiRegData<'drm>,
@@ -839,6 +911,8 @@ impl Queue for Queue::ver {
                 // notification count for the job.
                 notification_count: (2 * nr_render) + nr_compute,
 
+                inline_result: 0,
+
                 id,
             },
         )?;
@@ -849,8 +923,13 @@ impl Queue for Queue::ver {
             id,
             in_sync_count
         );
+        let mut dependencies_ready = true;
         for sync in syncs.drain(0..in_sync_count) {
             if let Some(fence) = sync.fence {
+                // SAFETY: `fence` owns the live dma_fence reference used for
+                // this concurrent status query.
+                dependencies_ready &=
+                    unsafe { kernel::bindings::dma_fence_get_status(fence.raw()) != 0 };
                 job.add_dependency(fence)?;
             }
         }
@@ -1008,6 +1087,22 @@ impl Queue for Queue::ver {
         mod_dev_dbg!(self.dev, "Queue {}: Arming job {}\n", self.inner.id, job.id);
         let mut job = job.arm();
         let out_fence = job.fences().finished();
+        let previous_status = self.last_out.as_ref().map(|fence| {
+            // SAFETY: `last_out` owns the live dma_fence reference used for
+            // this concurrent status query.
+            unsafe { kernel::bindings::dma_fence_get_status(fence.raw()) }
+        });
+        if module_parameters::legacy_inline_submit.value() != 0
+            && can_submit_inline(dependencies_ready, previous_status)
+            && job.can_submit_inline()
+        {
+            // All fallible construction and scheduler arming has completed.
+            // Regardless of this result the scheduler takes ownership below,
+            // preserving timeout, credit, error, and teardown bookkeeping.
+            let result = <QueueJob::ver as sched::JobImpl>::run(&mut job).map(|_| ());
+            job.inline_result = result.map_or_else(|error| error.to_errno(), |()| 1);
+        }
+        self.last_out = Some(out_fence.clone());
         mod_dev_dbg!(
             self.dev,
             "Queue {}: Pushing job {}\n",
@@ -1035,9 +1130,57 @@ impl Queue for Queue::ver {
     }
 }
 
+#[kunit_tests(asahi_legacy_inline_queue)]
+mod tests {
+    use super::can_submit_inline;
+
+    #[test]
+    fn depth_192_only_publishes_the_idle_head_inline() {
+        const DEPTH: usize = 192;
+        let mut previous_status = None;
+        let mut inline = 0;
+
+        for _ in 0..DEPTH {
+            if can_submit_inline(true, previous_status) {
+                inline += 1;
+            }
+            // Every later ioctl sees the preceding logical queue fence. A
+            // burst cannot publish around that unsignalled scheduler owner.
+            previous_status = Some(0);
+        }
+
+        assert_eq!(inline, 1);
+    }
+
+    #[test]
+    fn serial_round_trips_stay_eligible() {
+        const SUBMITS: usize = 192;
+
+        for index in 0..SUBMITS {
+            let previous_status = (index != 0).then_some(1);
+            assert!(can_submit_inline(true, previous_status));
+        }
+    }
+
+    #[test]
+    fn unsignalled_dependency_or_predecessor_falls_back() {
+        assert!(!can_submit_inline(false, None));
+        assert!(!can_submit_inline(true, Some(0)));
+        assert!(can_submit_inline(true, Some(-5)));
+    }
+}
+
 #[versions(AGX)]
 impl Drop for Queue::ver {
     fn drop(&mut self) {
         mod_dev_dbg!(self.dev, "[Queue {}] Dropping queue\n", self.inner.id);
+        // A client that exits or is killed drops its queues with jobs still queued or running
+        // on the GPU, and its VMs right after (see `file::File`). Those VMs do not track jobs:
+        // dropping one unmaps the user range at once, and the firmware then faults on the
+        // next access of the running job and times out. Let the submitted work finish first.
+        self.wait_submitted();
     }
 }
+
+/// How long a closing queue waits for its submitted work to finish.
+const QUEUE_CLOSE_WAIT_MS: u32 = 5000;

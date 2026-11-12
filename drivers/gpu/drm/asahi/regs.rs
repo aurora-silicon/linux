@@ -80,6 +80,7 @@ const G17_BRIDGE_ENABLE: u32 = 0x1; // BIT(0)
 /// G17 dynamic power gating control. Clearing these bits enables gating of idle GPU cores.
 const G17_GATING_CONTROL: usize = 0xd06030;
 const G17_GATING_DISABLE: u32 = 0x6; // BIT(1) | BIT(2)
+const G17_GATING_HOLD: u32 = 0x4; // BIT(2)
 
 /// These performance selectors must be sampled before firmware can gate the core registers.
 const G17_PERF_CONTROL: usize = 0xe0141c;
@@ -280,6 +281,37 @@ impl CpuControl {
                 );
             }
         }
+    }
+
+    /// The provider, for a system sleep's last step to stop the CPU with interrupts off.
+    pub(crate) fn as_raw(&self) -> *mut bindings::apple_mbox {
+        self.mbox
+    }
+
+    /// Settles the provider's books for a CPU that a system sleep's last step stopped.
+    pub(crate) fn stopped_elsewhere(&self) {
+        // SAFETY: The constructor established the live, role-checked provider.
+        let result = to_result(unsafe { bindings::apple_mbox_ascwrap_v6_cpu_stopped(self.mbox) });
+        if let Err(error) = result {
+            if error != ENODEV {
+                dev_err!(
+                    self.dev.as_ref(),
+                    "Could not settle a stopped GPU coprocessor: {:?}\n",
+                    error
+                );
+            }
+        }
+    }
+
+    /// The CPU's control and status words.
+    pub(crate) fn state(&self) -> Result<(u32, u32)> {
+        let (mut control, mut status) = (0, 0);
+        // SAFETY: The constructor established the live, role-checked provider, and both pointers
+        // are writable.
+        to_result(unsafe {
+            bindings::apple_mbox_ascwrap_v6_get_cpu_state(self.mbox, &mut control, &mut status)
+        })?;
+        Ok((control, status))
     }
 }
 
@@ -625,6 +657,58 @@ impl G17Resources {
         Ok(true)
     }
 
+    /// Publishes through the M5 host command port, including the kick that
+    /// makes an idle queue runnable. Core activity is not a prerequisite.
+    pub(crate) fn submit_m5_work(
+        &self,
+        submission: &crate::g17::fw::m5::queue::HardwareSubmission,
+    ) -> Result {
+        if crate::g17::J813_FORMS.load(core::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let sgx = (&*sgx).as_view();
+        for &(offset, value) in submission.writes() {
+            sgx.try_write64(value, offset)?;
+        }
+        Ok(())
+    }
+
+    /// The M5 fault window, read for recovery evidence: the fault status, the MMU fault status
+    /// and address, and three further fault words. The selector is observed, never changed.
+    pub(crate) fn m5_fault_registers(&self) -> Result<[u64; 6]> {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let sgx = (&*sgx).as_view();
+        if sgx.relaxed().read32(G17_HOST_IRQ_SUMMARY) & G17_HOST_POWERED == 0 {
+            return Err(EAGAIN);
+        }
+        Ok([
+            sgx.try_read64(0xd800)?,
+            sgx.try_read64(0xd8c0)?,
+            sgx.try_read64(0xd8c8)?,
+            sgx.try_read64(0xc078)?,
+            sgx.try_read64(0xc008)?,
+            sgx.try_read64(0xc028)?,
+        ])
+    }
+
+    /// Sample only the two owned queue configuration words through the
+    /// host tag/data port. The caller holds the device mutex and power hold.
+    pub(crate) fn m5_queue_configurations(&self, qids: [u8; 2]) -> Result<[u64; 2]> {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let sgx = (&*sgx).as_view();
+        if sgx.relaxed().read32(G17_HOST_IRQ_SUMMARY) & G17_HOST_POWERED == 0 {
+            return Err(EAGAIN);
+        }
+        let mut values = [0; 2];
+        for (value, qid) in values.iter_mut().zip(qids) {
+            let tag = crate::g17::fw::m5::queue::HardwareSubmission::configuration_tag(qid)?;
+            sgx.try_write64(tag, 0x4090)?;
+            *value = sgx.try_read64(0x4098)?;
+        }
+        Ok(values)
+    }
+
     /// Registers a queue KSM slot through the firmware mailbox.
     pub(crate) fn register_ksm_queue(&self, qid: u8, descriptor: u64) -> Result {
         if qid > 127 {
@@ -819,13 +903,48 @@ impl G17Resources {
         Ok(())
     }
 
-    /// Enable dynamic power gating of idle G17 GPU cores. The firmware expects this before it is
-    /// initialized.
+    /// Sets bit 0 of the firmware start control, which reads 0x30000 or 0x30001 until then.
+    /// macOS writes it at platform init, long before the GPU's power-on and its coprocessors.
+    pub(crate) fn set_m5_start_control(&self) -> Result {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let sgx = (&*sgx).as_view();
+        let value = sgx.try_read32(0xe90000)?;
+        if value != 0x30000 && value != 0x30001 {
+            return Err(EIO);
+        }
+        sgx.try_write32(value | 1, 0xe90000)
+    }
+
+    /// Prepares the GPU for the M5 firmware: the start control, then dynamic core power gating.
+    pub(crate) fn prepare_m5_firmware(&self) -> Result {
+        self.set_m5_start_control()?;
+        self.enable_g17_gating()
+    }
+
     pub(crate) fn enable_g17_gating(&self) -> Result {
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
         let sgx = (&*sgx).as_view();
         let val = sgx.try_read32(G17_GATING_CONTROL)?;
         sgx.try_write32(val & !G17_GATING_DISABLE, G17_GATING_CONTROL)
+    }
+
+    /// Hold part of the gating off, for a domain about to go off. The firmware must be idle.
+    pub(crate) fn hold_g17_gating(&self) -> Result {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let sgx = (&*sgx).as_view();
+        let val = sgx.try_read32(G17_GATING_CONTROL)?;
+        sgx.try_write32(val | G17_GATING_HOLD, G17_GATING_CONTROL)
+    }
+
+    /// Both bridge words and the gating word.
+    pub(crate) fn g17_fabric_words(&self) -> Result<[u32; 3]> {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let sgx = (&*sgx).as_view();
+        Ok([
+            sgx.try_read32(G17_BRIDGE_CONTROL[0])?,
+            sgx.try_read32(G17_BRIDGE_CONTROL[1])?,
+            sgx.try_read32(G17_GATING_CONTROL)?,
+        ])
     }
 }
 

@@ -36,6 +36,7 @@
 #include <linux/regmap.h>
 #include <linux/reset.h>
 #include <linux/slab.h>
+#include <linux/suspend.h>
 
 #include <sound/core.h>
 #include <sound/pcm.h>
@@ -126,6 +127,9 @@
 #define APPLE_MCA_FMTBITS (SNDRV_PCM_FMTBIT_S16_LE | \
 			   SNDRV_PCM_FMTBIT_S24_LE | \
 			   SNDRV_PCM_FMTBIT_S32_LE)
+
+/* Largest PCM buffer, and the playback preallocation: 3 MiB. */
+#define MCA_BUFFER_BYTES_MAX (512 * 1024 * 6)
 
 struct mca_cluster {
 	int no;
@@ -962,7 +966,15 @@ static int mca_set_runtime_hwparams(struct snd_soc_component *component,
 	hw.periods_max = UINT_MAX;
 	hw.period_bytes_min = 256;
 	hw.period_bytes_max = dma_get_max_seg_size(dma_dev);
-	hw.buffer_bytes_max = SIZE_MAX;
+	/*
+	 * The capture buffer is not preallocated (see mca_pcm_new()), so the
+	 * core does not bound it by a preallocation: bound it here, at the size
+	 * the playback preallocation (and formerly the capture one) allows. An
+	 * unbounded maximum lets a client that sets no buffer size, such as
+	 * speakersafetyd on the speaker sense PCM, ask for gigabytes and fail
+	 * hw_params with -ENOMEM.
+	 */
+	hw.buffer_bytes_max = MCA_BUFFER_BYTES_MAX;
 	hw.fifo_size = 16;
 
 	ret = snd_dmaengine_pcm_refine_runtime_hwparams(substream, &dma_data,
@@ -1245,7 +1257,7 @@ static int mca_pcm_new(struct snd_soc_component *component,
 						   chan->device->dev, 0, SIZE_MAX);
 		else
 			snd_pcm_set_managed_buffer(substream, SNDRV_DMA_TYPE_DEV_IRAM,
-						   chan->device->dev, 512 * 1024 * 6,
+						   chan->device->dev, MCA_BUFFER_BYTES_MAX,
 						   SIZE_MAX);
 	}
 
@@ -1456,10 +1468,41 @@ static const struct of_device_id apple_mca_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, apple_mca_of_match);
 
+/*
+ * hw_params is the only place a stream's cluster and serdes setup is written. A
+ * sleep that takes the registers would leave an open stream silent, and nothing
+ * here restores them yet.
+ */
+static int __maybe_unused apple_mca_suspend_late(struct device *dev)
+{
+	struct mca_data *mca = dev_get_drvdata(dev);
+	int i;
+
+	if (!pm_suspend_via_firmware())
+		return 0;
+
+	for (i = 0; i < mca->nclusters; i++) {
+		struct mca_cluster *cl = &mca->clusters[i];
+
+		if (cl->pd_link || cl->clocks_in_use[SNDRV_PCM_STREAM_PLAYBACK] ||
+		    cl->clocks_in_use[SNDRV_PCM_STREAM_CAPTURE]) {
+			dev_err(dev, "cluster %d is in use, refusing the sleep\n", i);
+			return -EBUSY;
+		}
+	}
+
+	return 0;
+}
+
+static const struct dev_pm_ops apple_mca_pm_ops = {
+	LATE_SYSTEM_SLEEP_PM_OPS(apple_mca_suspend_late, NULL)
+};
+
 static struct platform_driver apple_mca_driver = {
 	.driver = {
 		.name = "apple-mca",
 		.of_match_table = apple_mca_of_match,
+		.pm = pm_sleep_ptr(&apple_mca_pm_ops),
 	},
 	.probe = apple_mca_probe,
 	.remove = apple_mca_remove,

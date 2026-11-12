@@ -149,10 +149,10 @@ impl<B: Backend> Queue<B> {
         })
     }
 
-    fn ensure_compute(&mut self, scs_pages: u16) -> Result {
+    fn ensure_compute(&mut self, command: &Validated) -> Result {
         // Validate every request, including an existing scheduler. Physical
         // admission happens after its DRM dependencies, in backend publication.
-        self.backend.ensure_compute(scs_pages)?;
+        self.backend.ensure_compute(command)?;
         if self.compute.is_none() {
             self.compute = Some(Scheduler::new(
                 &self.dev,
@@ -218,17 +218,18 @@ impl<B: Backend> Queue<B> {
         self.prune_frontier(index);
         self.frontiers[index].reserve(1, GFP_KERNEL)?;
         if engine == Engine::Compute {
-            let Validated::Compute { scratch, .. } = &command else {
-                return Err(EINVAL);
-            };
-            self.ensure_compute(scratch.pages())?;
+            self.ensure_compute(&command)?;
         }
         // Only convert inputs when no independent host-prefix wait could keep
         // the retained source bookkeeping queued behind an external signal.
         if engine == Engine::Compute {
             super::trace::inputs(self.context.id(), order.sequence, 0, inputs.len(), None);
         }
-        let sources = if engine == Engine::Compute
+        // Ring order completes a converted input only if a kick waits for its
+        // ring predecessor; without that, keep the input's completion wait.
+        let host_waits = self.backend.host_producer_waits();
+        let sources = if !host_waits
+            && engine == Engine::Compute
             && !inputs.is_empty()
             && !destinations.has_outputs()
             && self.frontiers[0].iter().all(|(sequence, fences)| {
@@ -298,8 +299,14 @@ impl<B: Backend> Queue<B> {
             &[]
         };
         let count = frontier.len();
+        // Only a command that copies or resets queries can observe timestamps the
+        // host has not yet published for its predecessors.
+        let query_access = match &command {
+            Validated::Compute { query_access, .. } => *query_access,
+            Validated::Render { .. } => true,
+        };
         let timestamp_prefix = order.wait_through[index];
-        let timestamps = if engine == Engine::Compute && timestamp_prefix.is_some() {
+        let timestamps = if engine == Engine::Compute && query_access && timestamp_prefix.is_some() {
             let frontier = self.frontiers[index].as_slice();
             let end = frontier
                 .partition_point(|(sequence, _)| Order::contains(timestamp_prefix, *sequence));
@@ -322,9 +329,17 @@ impl<B: Backend> Queue<B> {
             inputs.len() + count + timestamp_count + failure_count,
             GFP_KERNEL,
         )?;
-        let mut checked_inputs =
-            KVec::with_capacity(inputs.len() + timestamp_count + failure_count, GFP_KERNEL)?;
-        let mut firmware = KVec::with_capacity(count, GFP_KERNEL)?;
+        // Host-waited producers are checked on the host instead of in firmware.
+        let (host_count, firmware_count) = if host_waits {
+            (count, 0)
+        } else {
+            (0, count)
+        };
+        let mut checked_inputs = KVec::with_capacity(
+            inputs.len() + host_count + timestamp_count + failure_count,
+            GFP_KERNEL,
+        )?;
+        let mut firmware = KVec::with_capacity(firmware_count, GFP_KERNEL)?;
         for fence in failures.into_iter().flatten() {
             checked_inputs.push(fence.clone(), GFP_KERNEL)?;
             dependencies.push(fence.clone(), GFP_KERNEL)?;
@@ -345,8 +360,15 @@ impl<B: Backend> Queue<B> {
             if fences.status() > 0 {
                 continue;
             }
-            dependencies.push(fences.ready.clone(), GFP_KERNEL)?;
-            firmware.push(fences.completed.clone(), GFP_KERNEL)?;
+            if host_waits {
+                // Keep other-engine producers on the host until completion, and
+                // propagate their errors before publishing the consumer.
+                dependencies.push(fences.completed.clone(), GFP_KERNEL)?;
+                checked_inputs.push(fences.completed.clone(), GFP_KERNEL)?;
+            } else {
+                dependencies.push(fences.ready.clone(), GFP_KERNEL)?;
+                firmware.push(fences.completed.clone(), GFP_KERNEL)?;
+            }
         }
         // Each command owns every input fence; independent engines may publish in
         // either order and must each consume an input's error status before running.
@@ -411,7 +433,20 @@ impl<B: Backend> Queue<B> {
         bytes: &[u8],
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
     ) -> Result<ValidatedBatch> {
-        let parse_guard = self.context.vm().retain_first_job()?;
+        // A refused submission reaches userspace as EINVAL alone, so name the step that
+        // refused it: the command's own requirements are only one of several.
+        let refused = |step: &str, error: kernel::error::Error| {
+            static REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            if REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8 {
+                pr_warn!("G17: refused a submission at {}: {:?}\n", step, error);
+            }
+            error
+        };
+        let parse_guard = self
+            .context
+            .vm()
+            .retain_first_job()
+            .map_err(|error| refused("pinning the VM", error))?;
         let mut parser = Parser::new(bytes);
         // All historical ordinals use the same entry counters; publication
         // starts only after the entire ioctl has been validated and pinned.
@@ -419,31 +454,47 @@ impl<B: Backend> Queue<B> {
         let mut preceding = [0; 2];
         let mut pending = KVec::with_capacity(1, GFP_KERNEL)?;
         while let Some(command) = parser.next()? {
-            let payload = self.proof.validate(
-                self.context.vm(),
-                self.range.clone(),
-                &self.window,
-                self.variant,
-                &command.payload,
-            )?;
+            let mut payload = self
+                .proof
+                .validate(
+                    self.context.vm(),
+                    self.range.clone(),
+                    &self.window,
+                    self.variant,
+                    &command.payload,
+                )
+                .map_err(|error| refused("the command's requirements", error))?;
             let engine = match &payload {
                 Validated::Render { .. } => Engine::Render,
                 Validated::Compute { .. } => Engine::Compute,
             };
-            let order = Order::new(
+            if !self.backend.supports_engine(engine) { return Err(ENOTSUPP); }
+            self.backend
+                .prepare_command(&mut payload)
+                .map_err(|error| refused("preparing the command", error))?;
+            let mut order = Order::new(
                 base,
                 preceding,
                 command.barriers,
                 command.payload.prior(),
                 engine,
-            )?;
+            )
+            .map_err(|error| refused("its barriers and priors", error))?;
+            if let Some((barriers, prior)) = command.payload.tiling_prefixes() {
+                let tiling = Order::new(base, preceding, barriers, prior, engine)
+                    .map_err(|error| refused("its tiling prefixes", error))?;
+                order
+                    .narrow_tiling(&tiling)
+                    .map_err(|error| refused("narrowing to its tiling prefixes", error))?;
+            }
             preceding[engine.index()] += 1;
             let destinations = match &payload {
-                Validated::Render { timestamps, .. } => Destinations::resolve(objects, timestamps)?,
+                Validated::Render { timestamps, .. } => Destinations::resolve(objects, timestamps),
                 Validated::Compute { timestamps, .. } => {
-                    Destinations::resolve(objects, core::slice::from_ref(timestamps))?
+                    Destinations::resolve(objects, core::slice::from_ref(timestamps))
                 }
-            };
+            }
+            .map_err(|error| refused("its timestamp destinations", error))?;
             pending.push((payload, order, destinations), GFP_KERNEL)?;
         }
         parser.finish()?;
@@ -482,6 +533,9 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
     ) -> Result {
         let mut outputs = Outputs::new(&self.fences, syncs, input_count, &self.allocation_failure)?;
         let result = (|| {
+            if !self.backend.supports_submission() {
+                return Err(ENOTSUPP);
+            }
             if self.context.status().get() != 0 {
                 return Err(EIO);
             }
@@ -498,8 +552,12 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
                 }
             }
             let mut guards = guards.into_iter();
+            // Where a firmware wait reports completion before a weak stream tail's writes are
+            // visible, only a command that declares a visible completion is waited for there.
+            let visible_required = self.backend.firmware_sources_need_visible_completion();
             let firmware_source = pending.len() == 1
-                && matches!(&pending[0].0, Validated::Compute { .. })
+                && matches!(&pending[0].0, Validated::Compute { visible_completion, .. }
+                    if *visible_completion || !visible_required)
                 && !pending[0].2.has_outputs();
             let aggregate = outputs.publish(self.context.clone(), firmware_source)?;
             for (command, order, destinations) in pending {

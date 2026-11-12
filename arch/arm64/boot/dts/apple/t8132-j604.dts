@@ -23,6 +23,15 @@
 	model = "Apple MacBook Pro (14-inch, M4, 2024)";
 
 	/*
+	 * iBoot leaves the J604's MTP stopped, where the J713's runs it, so the
+	 * loader programs its DART filter as for a halted consumer and Linux
+	 * cold-starts it.
+	 */
+	chosen {
+		linux-enablement-mac,dapf-halted-handoff = "/arm-io/mtp";
+	};
+
+	/*
 	 * The AOP firmware runs the stream: the J616s frame, six playback and
 	 * twelve sense slots, one serializer for all six amps. The codecs are
 	 * listed in the ADT provider order, so each gets its native playback
@@ -78,6 +87,14 @@
 &dcp {
 	apple,panel-width-mm = <302>;
 	apple,panel-height-mm = <196>;
+};
+
+/*
+ * The M4 PMGR policy disables ps_dptx_phy, which the shared boot
+ * framebuffer lists; as on the J713, the loader keeps the display on.
+ */
+&framebuffer0 {
+	/delete-property/ power-domains;
 };
 
 &sound_jack {
@@ -301,7 +318,22 @@
 	pwren-gpios = <&smc_gpio 0x19 GPIO_ACTIVE_HIGH>;
 };
 
+/*
+ * The cold-started MTP runs on DART stream 0, as on the M4 Pro and Max,
+ * instead of the stream 1 the J713's running MTP is handed over on.
+ * ADT "remap": streams 1 2 3 are stream 0.
+ */
+&mtp_dart {
+	apple,remap-streams = <1 0>, <2 0>, <3 0>;
+};
+
+&mtp {
+	iommus = <&mtp_dart 0>;
+};
+
 &mtp_hid {
+	iommus = <&mtp_dart 0>;
+
 	multi-touch {
 		firmware-name = "apple/tpmtfw-j604.bin";
 	};
@@ -332,5 +364,13 @@
 };
 
 &ps_atc3_usb {
+	status = "okay";
+};
+
+&avd_dart {
+	status = "okay";
+};
+
+&avd {
 	status = "okay";
 };

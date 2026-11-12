@@ -3,6 +3,8 @@
  * Apple RTKit IPC library
  * Copyright (C) The Asahi Linux Contributors
  */
+#include <linux/unaligned.h>
+
 #include "rtkit-internal.h"
 
 #define FOURCC(a, b, c, d) \
@@ -13,6 +15,51 @@
 #define APPLE_RTKIT_CRASHLOG_MBOX FOURCC('C', 'm', 'b', 'x')
 #define APPLE_RTKIT_CRASHLOG_TIME FOURCC('C', 't', 'i', 'm')
 #define APPLE_RTKIT_CRASHLOG_REGS FOURCC('C', 'r', 'g', '8')
+#define APPLE_RTKIT_CRASHLOG_REGS_CL4 FOURCC('C', 'r', 'l', '4')
+
+/*
+ * Newer firmware writes a container instead of a single crashlog: a
+ * 'CLGH' header and a table of records, each with an ID and an offset from
+ * the container. The record whose ID is the container's current ID holds
+ * the log of this crash, and may itself be a container (on T6050's DCP:
+ * per-coprocessor, then per-task). The log at the end is an ordinary
+ * 'CLHE' crashlog with the same sections.
+ */
+struct apple_rtkit_crashlog_container {
+	u32 fourcc;
+	u32 version;
+	u32 size;
+	u32 current_id;
+	u32 count;
+} __packed;
+static_assert(sizeof(struct apple_rtkit_crashlog_container) == 0x14);
+
+struct apple_rtkit_crashlog_record {
+	u64 id;
+	u64 _unk0;
+	u32 offset;
+	u32 _unk1;
+} __packed;
+static_assert(sizeof(struct apple_rtkit_crashlog_record) == 0x18);
+
+#define APPLE_RTKIT_CRASHLOG_CONTAINER_VERSION 2
+#define APPLE_RTKIT_CRASHLOG_CONTAINER_MAX_DEPTH 8
+/* Set in a log's flags while the co-processor is still writing it. */
+#define APPLE_RTKIT_CRASHLOG_INCOMPLETE BIT(8)
+
+/* Register frame of the 'Crl4' section, offsets from the section start. */
+#define APPLE_RTKIT_CRASHLOG_CL4_SECTION_SIZE 0x378
+#define APPLE_RTKIT_CRASHLOG_CL4_FLAGS 0x10
+#define APPLE_RTKIT_CRASHLOG_CL4_SIZE 0x14
+#define APPLE_RTKIT_CRASHLOG_CL4_NOMINAL_SIZE 0xd8
+#define APPLE_RTKIT_CRASHLOG_CL4_REGS 0x18
+#define APPLE_RTKIT_CRASHLOG_CL4_LR 0x108
+#define APPLE_RTKIT_CRASHLOG_CL4_PC 0x110
+#define APPLE_RTKIT_CRASHLOG_CL4_SP 0x118
+#define APPLE_RTKIT_CRASHLOG_CL4_PSR 0x120
+#define APPLE_RTKIT_CRASHLOG_CL4_ESR 0x358
+#define APPLE_RTKIT_CRASHLOG_CL4_FAR 0x360
+#define APPLE_RTKIT_CRASHLOG_CL4_UNDECODABLE BIT(16)
 
 /* For COMPILE_TEST on non-ARM64 architectures */
 #ifndef PSR_MODE_EL0t
@@ -71,8 +118,8 @@ static void apple_rtkit_crashlog_dump_str(struct apple_rtkit *rtk, u8 *bfr,
 			*newline = tmp;
 			ptr = newline + 1;
 		} else {
-			dev_warn(rtk->dev, "RTKit: Message (id=%x): %s", idx,
-				 ptr);
+			dev_warn(rtk->dev, "RTKit: Message (id=%x): %.*s", idx,
+				 (int)(end - ptr), ptr);
 			break;
 		}
 	}
@@ -81,7 +128,8 @@ static void apple_rtkit_crashlog_dump_str(struct apple_rtkit *rtk, u8 *bfr,
 static void apple_rtkit_crashlog_dump_version(struct apple_rtkit *rtk, u8 *bfr,
 					      size_t size)
 {
-	dev_warn(rtk->dev, "RTKit: Version: %s", bfr + 16);
+	/* The string need not be terminated inside the section. */
+	dev_warn(rtk->dev, "RTKit: Version: %.*s", (int)(size - 16), bfr + 16);
 }
 
 static void apple_rtkit_crashlog_dump_time(struct apple_rtkit *rtk, u8 *bfr,
@@ -100,6 +148,10 @@ static void apple_rtkit_crashlog_dump_mailbox(struct apple_rtkit *rtk, u8 *bfr,
 	size_t n_messages;
 	struct apple_rtkit_crashlog_mbox_entry entry;
 
+	if (size < 28) {
+		dev_warn(rtk->dev, "RTKit: Mailbox section too small: 0x%zx", size);
+		return;
+	}
 	memcpy(&type, bfr + 16, 4);
 	memcpy(&index, bfr + 24, 4);
 	n_messages = (size - 28) / sizeof(entry);
@@ -173,13 +225,150 @@ static void apple_rtkit_crashlog_dump_regs(struct apple_rtkit *rtk, u8 *bfr,
 	dev_warn(rtk->dev, "\n");
 }
 
+static void apple_rtkit_crashlog_dump_regs_cl4(struct apple_rtkit *rtk,
+					       u8 *section, size_t size)
+{
+	u32 flags, regs_size;
+	int i;
+
+	if (size < APPLE_RTKIT_CRASHLOG_CL4_SECTION_SIZE) {
+		dev_warn(rtk->dev, "RTKit: Crl4 section too small: 0x%zx", size);
+		return;
+	}
+	flags = get_unaligned_le32(section + APPLE_RTKIT_CRASHLOG_CL4_FLAGS);
+	regs_size = get_unaligned_le32(section + APPLE_RTKIT_CRASHLOG_CL4_SIZE);
+	if (regs_size != APPLE_RTKIT_CRASHLOG_CL4_NOMINAL_SIZE ||
+	    (flags & APPLE_RTKIT_CRASHLOG_CL4_UNDECODABLE)) {
+		dev_warn(rtk->dev, "RTKit: Crl4 frame not decodable (flags %#x, size %#x)",
+			 flags, regs_size);
+		return;
+	}
+
+	dev_warn(rtk->dev, "RTKit: Exception dump (Crl4):");
+	dev_warn(rtk->dev, "  PSR    = 0x%llx",
+		 get_unaligned_le64(section + APPLE_RTKIT_CRASHLOG_CL4_PSR));
+	dev_warn(rtk->dev, "  PC     = 0x%llx",
+		 get_unaligned_le64(section + APPLE_RTKIT_CRASHLOG_CL4_PC));
+	dev_warn(rtk->dev, "  LR     = 0x%llx",
+		 get_unaligned_le64(section + APPLE_RTKIT_CRASHLOG_CL4_LR));
+	dev_warn(rtk->dev, "  ESR    = 0x%llx",
+		 get_unaligned_le64(section + APPLE_RTKIT_CRASHLOG_CL4_ESR));
+	dev_warn(rtk->dev, "  FAR    = 0x%llx",
+		 get_unaligned_le64(section + APPLE_RTKIT_CRASHLOG_CL4_FAR));
+	dev_warn(rtk->dev, "  SP     = 0x%llx",
+		 get_unaligned_le64(section + APPLE_RTKIT_CRASHLOG_CL4_SP));
+	for (i = 0; i < 28; i += 4) {
+		u8 *r = section + APPLE_RTKIT_CRASHLOG_CL4_REGS + i * 8;
+
+		dev_warn(rtk->dev, "  x%02d-x%02d = %016llx %016llx %016llx %016llx",
+			 i, i + 3, get_unaligned_le64(r), get_unaligned_le64(r + 8),
+			 get_unaligned_le64(r + 16), get_unaligned_le64(r + 24));
+	}
+}
+
+/**
+ * apple_rtkit_crashlog_locate() - find this crash's log in a crashlog buffer
+ * @bfr: a copy of the buffer
+ * @size: its size
+ * @log_offset: set to the offset of the 'CLHE' log
+ * @log_id: set to the ID of the record that held it (0 for a bare log)
+ * @depth: set to the number of containers followed
+ *
+ * A bare 'CLHE' log at offset 0 is returned as it is. In a 'CLGH' container,
+ * the record with the current ID is followed, through nested containers,
+ * to its log. Offsets only move forward, so a corrupt table cannot loop.
+ *
+ * Return: 0 if a complete log was found, -EAGAIN if the selected log is
+ * still being written, -EINVAL otherwise.
+ */
+int apple_rtkit_crashlog_locate(const u8 *bfr, size_t size, size_t *log_offset,
+				u32 *log_id, unsigned int *depth)
+{
+	struct apple_rtkit_crashlog_container container;
+	struct apple_rtkit_crashlog_header header;
+	struct apple_rtkit_crashlog_record record;
+	size_t offset = 0, avail, next;
+	unsigned int level;
+	u32 id = 0, i;
+
+	for (level = 0; level <= APPLE_RTKIT_CRASHLOG_CONTAINER_MAX_DEPTH; level++) {
+		avail = size - offset;
+		if (avail < sizeof(header))
+			return -EINVAL;
+		memcpy(&header, bfr + offset, sizeof(header));
+
+		if (header.fourcc == APPLE_RTKIT_CRASHLOG_HEADER_FOURCC) {
+			if (header.size < sizeof(header) || header.size > avail)
+				return -EINVAL;
+			if (level && (header.flags & APPLE_RTKIT_CRASHLOG_INCOMPLETE))
+				return -EAGAIN;
+			*log_offset = offset;
+			*log_id = id;
+			*depth = level;
+			return 0;
+		}
+		if (header.fourcc != APPLE_RTKIT_CRASHLOG_CONTAINER_FOURCC)
+			return -EINVAL;
+
+		memcpy(&container, bfr + offset, sizeof(container));
+		if (((container.version >> 8) & 0xff) !=
+		    APPLE_RTKIT_CRASHLOG_CONTAINER_VERSION ||
+		    container.size > avail || !container.count ||
+		    container.count > (avail - sizeof(container)) / sizeof(record))
+			return -EINVAL;
+
+		next = 0;
+		for (i = 0; i < container.count; i++) {
+			memcpy(&record, bfr + offset + sizeof(container) +
+			       i * sizeof(record), sizeof(record));
+			if (record.id == container.current_id) {
+				next = record.offset;
+				break;
+			}
+		}
+		if (next < sizeof(container) || next >= avail)
+			return -EINVAL;
+
+		id = container.current_id;
+		offset += next;
+	}
+
+	return -EINVAL;
+}
+
 void apple_rtkit_crashlog_dump(struct apple_rtkit *rtk, u8 *bfr, size_t size)
 {
 	size_t offset;
 	u32 section_fourcc, section_size;
 	struct apple_rtkit_crashlog_header header;
 
+	if (size < sizeof(header)) {
+		dev_warn(rtk->dev, "RTKit: Crashlog buffer too small: 0x%zx",
+			 size);
+		return;
+	}
 	memcpy(&header, bfr, sizeof(header));
+	if (header.fourcc == APPLE_RTKIT_CRASHLOG_CONTAINER_FOURCC) {
+		unsigned int depth;
+		u32 id;
+		int ret;
+
+		ret = apple_rtkit_crashlog_locate(bfr, size, &offset, &id, &depth);
+		if (ret) {
+			dev_warn(rtk->dev,
+				 "RTKit: Crashlog container holds no complete log (%d)",
+				 ret);
+			return;
+		}
+		dev_warn(rtk->dev,
+			 "RTKit: Crashlog container: log '%c%c%c%c' at 0x%zx (depth %u)",
+			 (id >> 24) & 0xff, (id >> 16) & 0xff, (id >> 8) & 0xff,
+			 id & 0xff, offset, depth);
+		bfr += offset;
+		size -= offset;
+		memcpy(&header, bfr, sizeof(header));
+	}
+
 	if (header.fourcc != APPLE_RTKIT_CRASHLOG_HEADER_FOURCC) {
 		dev_warn(rtk->dev, "RTKit: Expected crashlog header but got %x",
 			 header.fourcc);
@@ -196,13 +385,35 @@ void apple_rtkit_crashlog_dump(struct apple_rtkit *rtk, u8 *bfr, size_t size)
 	offset = sizeof(header);
 
 	while (offset < size) {
+		if (size - offset < 16) {
+			dev_warn(rtk->dev,
+				 "RTKit: Crashlog section header at 0x%zx is truncated",
+				 offset);
+			return;
+		}
 		memcpy(&section_fourcc, bfr + offset, 4);
 		memcpy(&section_size, bfr + offset + 12, 4);
 
-		switch (section_fourcc) {
-		case APPLE_RTKIT_CRASHLOG_HEADER_FOURCC:
+		if (section_fourcc == APPLE_RTKIT_CRASHLOG_HEADER_FOURCC) {
 			dev_dbg(rtk->dev, "RTKit: End of crashlog reached");
 			return;
+		}
+		/* A zero size would never advance. */
+		if (section_size < 16 || section_size > size - offset) {
+			dev_warn(rtk->dev,
+				 "RTKit: Crashlog section %x at 0x%zx has a bad size 0x%x",
+				 section_fourcc, offset, section_size);
+			return;
+		}
+		/*
+		 * The decoders read up to section_size bytes from 16 bytes into
+		 * the section, so a section is only decoded with at least the
+		 * footer's 16-byte header after it.
+		 */
+		if (section_size > size - offset - 16)
+			break;
+
+		switch (section_fourcc) {
 		case APPLE_RTKIT_CRASHLOG_STR:
 			apple_rtkit_crashlog_dump_str(rtk, bfr + offset + 16,
 						      section_size);
@@ -222,6 +433,10 @@ void apple_rtkit_crashlog_dump(struct apple_rtkit *rtk, u8 *bfr, size_t size)
 		case APPLE_RTKIT_CRASHLOG_REGS:
 			apple_rtkit_crashlog_dump_regs(rtk, bfr + offset + 16,
 						       section_size);
+			break;
+		case APPLE_RTKIT_CRASHLOG_REGS_CL4:
+			apple_rtkit_crashlog_dump_regs_cl4(rtk, bfr + offset,
+							   section_size);
 			break;
 		default:
 			dev_warn(rtk->dev,

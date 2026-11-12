@@ -136,3 +136,64 @@ static struct kunit_suite admac_pos_suite = {
 };
 
 kunit_test_suite(admac_pos_suite);
+
+/*
+ * The paused-capture realignment (admac_cyclic_realign()) is the AOP audio
+ * driver's alone: it passes the frame size in the peripheral config, for its
+ * speaker sense capture. The MCA's PCM zeroes its slave config, so every MCA
+ * channel, and every playback channel, resumes where it paused.
+ */
+static void admac_realign_needs_a_frame_size(struct kunit *test)
+{
+	struct dma_slave_config config = {};
+	u32 frame = 16;
+	u64 wrong = 16;
+
+	/* As mca_hw_params() configures a channel */
+	config.direction = DMA_DEV_TO_MEM;
+	config.src_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES;
+	config.src_port_window_size = 4;
+	KUNIT_EXPECT_EQ(test, admac_config_realign_bytes(&config), 0);
+
+	config.peripheral_config = &wrong;
+	config.peripheral_size = sizeof(wrong);
+	KUNIT_EXPECT_EQ(test, admac_config_realign_bytes(&config), 0);
+
+	config.peripheral_config = &frame;
+	config.peripheral_size = sizeof(frame);
+	KUNIT_EXPECT_EQ(test, admac_config_realign_bytes(&config), 16);
+}
+
+static void admac_realign_only_a_configured_capture(struct kunit *test)
+{
+	struct admac_tx tx = admac_test_tx(0, 0);
+	struct admac_chan adchan = { .current_tx = &tx };
+
+	/* Playback (even channels): never, frame size or not */
+	adchan.no = 0;
+	KUNIT_EXPECT_FALSE(test, admac_resume_realigns(&adchan));
+	adchan.realign_bytes = 16;
+	KUNIT_EXPECT_FALSE(test, admac_resume_realigns(&adchan));
+
+	/* Capture (odd channels): only with a frame size and a transfer */
+	adchan.no = 1;
+	adchan.realign_bytes = 0;
+	KUNIT_EXPECT_FALSE(test, admac_resume_realigns(&adchan));
+	adchan.realign_bytes = 16;
+	KUNIT_EXPECT_TRUE(test, admac_resume_realigns(&adchan));
+	adchan.current_tx = NULL;
+	KUNIT_EXPECT_FALSE(test, admac_resume_realigns(&adchan));
+}
+
+static struct kunit_case admac_realign_cases[] = {
+	KUNIT_CASE(admac_realign_needs_a_frame_size),
+	KUNIT_CASE(admac_realign_only_a_configured_capture),
+	{}
+};
+
+static struct kunit_suite admac_realign_suite = {
+	.name = "apple-admac-realign",
+	.test_cases = admac_realign_cases,
+};
+
+kunit_test_suite(admac_realign_suite);

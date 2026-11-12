@@ -43,15 +43,16 @@ static void isp_test_dapf_in_fw_mmio(struct kunit *test)
  * leaves every other byte alone. The bank is plain memory here: the driver
  * is arm64 only, where the MMIO accessors work on it unchanged.
  */
-static void isp_test_dapf_program(struct kunit *test)
+static void isp_test_dapf_program_mask(struct kunit *test, u32 sidmask)
 {
 	static const struct isp_dapf_window windows[] = {
 		{ 0x380704000, 0x380704063 },
 		{ 0x382824000, 0x382824004 },
 	};
-	static const struct apple_isp_hw hw = {
+	const struct apple_isp_hw hw = {
 		.dapf = windows,
 		.num_dapf = ARRAY_SIZE(windows),
+		.dapf_sidmask = sidmask,
 	};
 	size_t size = (ARRAY_SIZE(windows) + 1) * DAPF_WINDOW_STRIDE;
 	u8 expect[DAPF_WINDOW_STRIDE];
@@ -76,7 +77,7 @@ static void isp_test_dapf_program(struct kunit *test)
 		put_unaligned_le32(0, &expect[0x04]);
 		put_unaligned_le64(windows[i].start, &expect[0x08]);
 		put_unaligned_le64(windows[i].end, &expect[0x10]);
-		put_unaligned_le32(1, &expect[0x20]);
+		put_unaligned_le32(sidmask ?: 1, &expect[0x20]);
 		KUNIT_EXPECT_MEMEQ_MSG(test, bank + i * DAPF_WINDOW_STRIDE, expect,
 				       sizeof(expect), "window %u", i);
 	}
@@ -86,9 +87,20 @@ static void isp_test_dapf_program(struct kunit *test)
 					   ISP_TEST_DAPF_FILL, DAPF_WINDOW_STRIDE));
 }
 
+static void isp_test_dapf_program(struct kunit *test)
+{
+	isp_test_dapf_program_mask(test, 0);
+}
+
+static void isp_test_dapf_program_t6050(struct kunit *test)
+{
+	isp_test_dapf_program_mask(test, 0xcc3);
+}
+
 static struct kunit_case isp_dapf_test_cases[] = {
 	KUNIT_CASE(isp_test_dapf_in_fw_mmio),
 	KUNIT_CASE(isp_test_dapf_program),
+	KUNIT_CASE(isp_test_dapf_program_t6050),
 	{}
 };
 
@@ -101,8 +113,8 @@ kunit_test_suite(isp_dapf_test_suite);
 
 /*
  * A deferred start detects the camera once: its firmware must keep running
- * or start again. Firmware that starts again is not resident, and only it
- * is quiesced before the power-down.
+ * or start again. Only firmware that starts again, from a restored copy or
+ * from its own memory, is quiesced before the power-down.
  */
 static void isp_test_firmware_lifetime(struct kunit *test)
 {
@@ -117,8 +129,16 @@ static void isp_test_firmware_lifetime(struct kunit *test)
 		KUNIT_EXPECT_FALSE_MSG(test, hw->resident_fw && hw->fw_restore, "%s",
 				       match->compatible);
 		if (hw->coproc_quiesce)
-			KUNIT_EXPECT_TRUE_MSG(test, hw->fw_restore, "%s",
+			KUNIT_EXPECT_TRUE_MSG(test, hw->fw_restore || hw->fw_restart, "%s",
 					      match->compatible);
+		/* Only firmware that starts again idles before it stops. */
+		if (hw->fw_idle_ms)
+			KUNIT_EXPECT_TRUE_MSG(test, hw->fw_restore || hw->fw_restart, "%s",
+					      match->compatible);
+		/* The fallback keeps restartable firmware resident. */
+		if (hw->resident_fallback)
+			KUNIT_EXPECT_TRUE_MSG(test, hw->fw_restore && hw->num_dapf,
+					      "%s", match->compatible);
 	}
 }
 

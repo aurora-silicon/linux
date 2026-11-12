@@ -78,6 +78,11 @@ impl VmStatus {
         self.recovery_guilty.load(Ordering::Acquire)
     }
 
+    /// The client's VM handle is gone (`release_mirror`): the client submits nothing more.
+    pub(crate) fn client_closed(&self) -> bool {
+        self.client_closed.load(Ordering::Acquire)
+    }
+
     /// Record permanent admission failure and report it to the client.
     #[track_caller]
     pub(crate) fn record(&self, error: Error) {
@@ -188,10 +193,16 @@ impl VmStatus {
         Ok(())
     }
 
+    /// The client closed its DRM file: nobody sees the teardown errors of its queued work any
+    /// more, even before its VM handle goes (the file drops its queues first).
+    pub(crate) fn mark_client_closed(&self) {
+        self.client_closed.store(true, Ordering::Release);
+    }
+
     /// The client's VM handle is gone and nobody reads the mirror any more. The
     /// mapping and object reference drop outside the mutex (GEM release may sleep).
     pub(crate) fn release_mirror(&self) {
-        self.client_closed.store(true, Ordering::Release);
+        self.mark_client_closed();
         let taken = self.mirror.lock().take();
         drop(taken);
     }
@@ -216,6 +227,20 @@ mod tests {
         assert!(!status.unobserved_teardown(ETIMEDOUT));
         assert!(!status.unobserved_teardown(EIO));
         assert!(!status.unobserved_teardown(ENODEV));
+    }
+
+    #[test]
+    fn a_closing_file_hides_teardown_errors_before_its_vm_goes() {
+        let Ok(status) = KBox::pin_init(VmStatus::new(), GFP_KERNEL) else {
+            panic!("allocation failed");
+        };
+        status.mark_client_closed();
+        assert!(status.unobserved_teardown(ENOENT));
+        assert!(status.unobserved_teardown(ECANCELED));
+        assert!(!status.unobserved_teardown(ETIMEDOUT));
+        status.report_failure(ENOENT);
+        assert!(!status.warned.load(Ordering::Acquire));
+        assert!(status.mirror.lock().is_none());
     }
 
     #[test]

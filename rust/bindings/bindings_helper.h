@@ -113,6 +113,7 @@
 #include <linux/soc/apple/pmp-display.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/pmp.h>
+#include <linux/soc/apple/pmp-report.h>
 #include <linux/suspend.h>
 #include <linux/sys_soc.h>
 #include <linux/task_work.h>
@@ -165,6 +166,7 @@ const u32 RUST_CONST_HELPER_APPLE_RTKIT_FIRMWARE_OWNED_CRASHLOG = APPLE_RTKIT_FI
 const u32 RUST_CONST_HELPER_APPLE_RTKIT_EARLY_CRASHLOG = APPLE_RTKIT_EARLY_CRASHLOG;
 
 const u64 BINDINGS_SNDRV_PCM_FMTBIT_FLOAT_LE = SNDRV_PCM_FMTBIT_FLOAT_LE;
+const u64 BINDINGS_SNDRV_PCM_FMTBIT_S16_LE = SNDRV_PCM_FMTBIT_S16_LE;
 const u64 BINDINGS_SNDRV_PCM_FMTBIT_S32_LE = SNDRV_PCM_FMTBIT_S32_LE;
 const u64 BINDINGS_SNDRV_PCM_FMTBIT_S24_LE = SNDRV_PCM_FMTBIT_S24_LE;
 const u32 BINDINGS_SNDRV_PCM_SUBFMTBIT_STD = SNDRV_PCM_SUBFMTBIT_STD;

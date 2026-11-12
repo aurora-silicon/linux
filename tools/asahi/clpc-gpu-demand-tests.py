@@ -25,6 +25,7 @@ def main():
     header = (ROOT / 'include/linux/soc/apple/pmc.h').read_text()
     rail_shift = re.search(r'^#define APPLE_PMC_RAIL_SHIFT\(rail\).*$', header, re.M).group(0)
     dense_samples = re.search(r'^#define APPLE_CLPC_GPU_DENSE_SAMPLES\s.*$', source, re.M).group(0)
+    reasons = '\n'.join(re.findall(r'^#define APPLE_CLPC_REASON_\w+\s.*$', source, re.M))
     types = '\n'.join(item(source, s) + ';' for s in [
         'struct apple_clpc_hw {', 'struct apple_clpc_vote {'])
     tables = '\n'.join(item(source, 'static const struct apple_clpc_hw ' + n) + ';'
@@ -38,6 +39,7 @@ def main():
         'static void apple_clpc_gpu_floor_count(',
         'static bool apple_clpc_gpu_input_demand(',
         'static bool apple_clpc_ane_input_demand(',
+        'static void apple_clpc_ane_cluster(',
         'static void apple_clpc_sample('])
     code = r'''
 #include <assert.h>
@@ -55,6 +57,7 @@ typedef uint64_t u64;
 #define HZ 1000
 #define max(a,b) ((a) > (b) ? (a) : (b))
 #define GENMASK(h,l) (((1u << ((h)-(l)+1))-1) << (l))
+#define BIT(n) (1u << (n))
 #define APPLE_PMC_RAIL_SHIFT(r) ((r)*8)
 #define time_after_eq(a,b) ((long)((a)-(b)) >= 0)
 #define time_after(a,b) ((long)((a)-(b)) > 0)
@@ -69,6 +72,20 @@ struct apple_clpc_ane { int lock; bool active, pending; };
 #define spin_lock_irqsave(l, f) ((void)(l), (f) = 0)
 #define spin_unlock_irqrestore(l, f) ((void)(l), (void)(f))
 struct apple_clpc_cluster { unsigned int request[APPLE_CLPC_RAILS]; };
+// cpufreq QoS stand-ins: one policy, the last requested minimum is recorded.
+#define FREQ_QOS_MIN 1
+#define FREQ_QOS_MIN_DEFAULT_VALUE 0
+struct freq_qos_request { bool active; int value; };
+struct cpufreq_policy { int constraints; };
+static struct cpufreq_policy policy;
+static int qos_min = -1, qos_adds;
+static bool freq_qos_request_active(struct freq_qos_request *r) { return r->active; }
+static struct cpufreq_policy *cpufreq_cpu_get(int cpu) { (void)cpu; return &policy; }
+static void cpufreq_cpu_put(struct cpufreq_policy *p) { (void)p; }
+static int freq_qos_add_request(int *c, struct freq_qos_request *r, int type, int v) {
+ (void)c; assert(type==FREQ_QOS_MIN && !r->active); r->active=true; r->value=v; qos_min=v; qos_adds++; return 1;
+}
+static int freq_qos_update_request(struct freq_qos_request *r, int v) { assert(r->active); r->value=v; qos_min=v; return 1; }
 struct apple_clpc {
  const struct apple_clpc_hw *hw;
  struct apple_clpc_cluster clusters[1];
@@ -88,6 +105,11 @@ struct apple_clpc {
  struct apple_clpc_gpu *gpu;
  struct apple_clpc_ane *ane;
  unsigned int ane_states[APPLE_CLPC_RAILS];
+ u32 ane_cluster_khz;
+ int ane_cpu;
+ struct freq_qos_request ane_qos;
+ unsigned int ane_qos_khz;
+ unsigned long ane_until;
 };
 static unsigned long jiffies;
 static u64 ktime_get_mono_fast_ns(void) { return jiffies * 1000000ull; }
@@ -109,7 +131,7 @@ static int apple_pmc_floor_update(void *pmc, unsigned int agent, u32 mask, u32 f
  (void)pmc; assert(agent==1 && mask==3); published=floor; return vote_error;
 }
 static void apple_clpc_queue(struct apple_clpc *c, bool idle) { (void)c; queued_idle=idle; }
-''' + dense_samples + '\n' + tables + '\n' + methods + r'''
+''' + dense_samples + '\n' + reasons + '\n' + tables + '\n' + methods + r'''
 // T8140 ANE work holds its DRAM and fabric states while it runs, a request
 // shorter than one sample is still seen once, and the hold then expires.
 static void check_t8140_ane(void) {
@@ -125,6 +147,25 @@ static void check_t8140_ane(void) {
  assert(published==0x34 && c.last_reason==32 && !ane.pending);
  jiffies=1012; apple_clpc_sample(&c); assert(published==0x34 && c.last_reason==16);
  jiffies=1040; apple_clpc_sample(&c); assert(published==0 && queued_idle);
+}
+
+// T6040 ANE work also holds the second P cluster at its qualified frequency,
+// added on first use, for the vote hold after the last request, then drops it.
+static void check_t6040_ane(void) {
+ struct apple_clpc_ane ane={0};
+ struct apple_clpc c={.hw=&apple_clpc_hw_t6040,.agent=1,.mask=3,.ane=&ane};
+ c.ane_states[APPLE_CLPC_DCS]=c.hw->ane[APPLE_CLPC_DCS];
+ c.ane_states[APPLE_CLPC_SOC]=c.hw->ane[APPLE_CLPC_SOC];
+ c.ane_cpu=9; c.ane_cluster_khz=c.hw->ane_cluster_khz;
+ assert(c.hw->ane_cluster==2 && c.ane_cluster_khz==3756000);
+ read_error=vote_error=0; pmgr_status=0; pmp_floor=0; jiffies=2000; published=~0u; qos_min=-1; qos_adds=0;
+ apple_clpc_sample(&c); assert(published==0 && qos_adds==0 && queued_idle);
+ ane.active=true; jiffies=2004; apple_clpc_sample(&c);
+ assert(published==0x25 && c.last_reason==32 && qos_adds==1 && qos_min==3756000);
+ ane.active=false; jiffies=2008; apple_clpc_sample(&c);
+ assert(qos_min==3756000 && !queued_idle);
+ jiffies=2036; apple_clpc_sample(&c); assert(published==0 && qos_min==0 && c.ane_qos_khz==0 && queued_idle);
+ ane.active=true; jiffies=2040; apple_clpc_sample(&c); assert(qos_adds==1 && qos_min==3756000);
 }
 
 // T8132's G16 firmware keeps graphics powered while the GPU idles: the
@@ -229,6 +270,7 @@ int main(void) {
  check_t8140();
  check_t8140_dense();
  check_t8140_ane();
+ check_t6040_ane();
  puts("PASS: T6040 and T8132 host demand; T8140 ANE, streaming, dense work, read errors and PMP backoff; idle release");
 }
 '''
@@ -240,6 +282,10 @@ int main(void) {
             ('omit-host-demand', code.replace('if (apple_clpc_gpu_input_demand(clpc->hw, clpc->gpu, demand))',
                                               'if (false && apple_clpc_gpu_input_demand(clpc->hw, clpc->gpu, demand))')),            ('omit-ane-demand', code.replace('if (apple_clpc_ane_input_demand(clpc, demand))',
                                              'if (false && apple_clpc_ane_input_demand(clpc, demand))')),
+            ('omit-ane-cluster', code.replace('apple_clpc_ane_cluster(clpc, reason & APPLE_CLPC_REASON_ANE, now);',
+                                              '(void)apple_clpc_ane_cluster;')),
+            ('ane-cluster-no-hold', code.replace('if (time_before(now, clpc->ane_until))',
+                                                 'if (active)')),
             ('omit-streaming-demand', code.replace('bool streaming = apple_clpc_gpu_streaming(clpc, now);',
                                                    'bool streaming = (apple_clpc_gpu_streaming(clpc, now), false);')),
             ('omit-dense-demand', code.replace('if (streaming || dense) {', 'if (streaming || (dense && false)) {')),

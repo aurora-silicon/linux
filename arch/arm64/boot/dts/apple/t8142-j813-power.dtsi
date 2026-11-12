@@ -3,6 +3,7 @@
  * Apple MacBook Air (13-inch, M5) J813: SMC power off / restart, the PMU on
  * SPMI and the watchdog.
  */
+#include <dt-bindings/spmi/spmi.h>
 
 &{/soc} {
 	/* ADT /arm-io/wdt (wdt,t8142): restart (and the SMC's fallback). */

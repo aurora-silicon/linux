@@ -19,15 +19,23 @@
 #include <linux/types.h>
 
 struct apple_sep_fv_new_file_key;
+struct dev_pm_ops;
 
 void sep_cancel_work_sync(void *work);
 void sep_cancel_delayed_work_sync(void *work);
 
 /* -- pm_shim.c ---------------------------------------------------------- */
 
-int sep_pm_register(void (*event)(bool entering));
+int sep_pm_register(void *dev, void (*event)(bool entering), int (*sleep)(void),
+		    void (*wake)(void), bool (*told)(void));
 void sep_pm_unregister(void);
 int sep_pm_keep_domains(void *dev);
+int sep_pm_wait_gated(void *dev, unsigned int timeout_ms);
+int sep_pm_clear_dev_disable(void *dev);
+void sep_pm_dart_restore(void *dev);
+int sep_pm_commit_prepare(void *dev, void *mbox, u64 msg0, u32 msg1, u64 reply, u64 mask);
+int sep_pm_commit_finish(void *dev);
+extern const struct dev_pm_ops sep_pm_ops;
 
 /* -- hwrng_shim.c ------------------------------------------------------- */
 
@@ -175,10 +183,24 @@ int sep_sensor_irq_wait(unsigned int timeout_ms);
 #define SEP_DIAG_MATCHING_UNVERIFIED	2
 #define SEP_DIAG_MATCHING_BLOCKED	3
 
+/* Mirrored by diag.rs (OsIdentity). */
+#define SEP_DIAG_OS_IDENTITY_UNKNOWN		0
+#define SEP_DIAG_OS_IDENTITY_EXPLICIT		1
+#define SEP_DIAG_OS_IDENTITY_CHOSEN		2
+#define SEP_DIAG_OS_IDENTITY_UNAVAILABLE	3
+
+#define SEP_DIAG_HWRNG_PENDING		0
+#define SEP_DIAG_HWRNG_REGISTERED	1
+#define SEP_DIAG_HWRNG_FAILED		2
+
 struct device;
 
 int sep_diag_register(struct device *dev, const char *profile,
 		      size_t profile_len, bool cold, bool sepos13, bool xart);
+void sep_diag_set_policy(bool provision_keybag, bool trusted_keys,
+			 bool filevault_api, bool xarm_trace, bool refkey_v2,
+			 bool identity_override);
+void sep_diag_set_identity_source(unsigned int source);
 void sep_diag_set_attach(bool attached);
 void sep_diag_set_endpoints(unsigned int count);
 void sep_diag_set_keystore_open(void);
@@ -194,6 +216,13 @@ void sep_diag_set_xart_guard(unsigned int level, bool list_loaded,
 			     int matching);
 void sep_diag_xart_guard_refused(int matching);
 void sep_diag_bringup_ended(void);
+void sep_diag_set_endpoint(u8 id, u32 name);
+void sep_diag_set_os_identity(int source);
+void sep_diag_set_hwrng(bool registered);
+unsigned int sep_diag_xarm_failed(void);
+unsigned int sep_diag_unhandled(void);
+void sep_diag_sleep(bool entering);
+void sep_diag_log_summary(struct device *dev);
 
 /* -- bio_shim.c --------------------------------------------------------- */
 
@@ -202,9 +231,15 @@ void *sep_bio_register(const char *name, unsigned short mode, void *ctx,
 			  void (*f_release)(void *),
 			  long (*f_ioctl)(void *, unsigned int, unsigned long),
 			  int (*f_ready)(void *));
+void *sep_bio_register_concurrent(const char *name, unsigned short mode,
+				  void *ctx, int (*f_open)(void *),
+				  void (*f_release)(void *),
+				  long (*f_ioctl)(void *, unsigned int, unsigned long),
+				  int (*f_ready)(void *));
 void sep_bio_unregister(void *dev);
 void sep_bio_wake(void *dev);
 int sep_bio_capable_admin(void);
+__u32 sep_bio_current_euid(void);
 __u64 sep_bio_monotonic_ns(void);
 __u64 sep_bio_boottime_ns(void);
 
@@ -243,5 +278,15 @@ void sep_tk_set_key_len(struct trusted_key_payload *p, unsigned int n);
 unsigned char *sep_tk_blob_ptr(struct trusted_key_payload *p);
 unsigned int sep_tk_blob_len(const struct trusted_key_payload *p);
 void sep_tk_set_blob_len(struct trusted_key_payload *p, unsigned int n);
+
+
+/* Initrd attach and completion; sysfs removal drains the callback. */
+bool sep_keystore_only(void);
+bool sep_keystore_user_bags(void);
+int sep_complete_attach_register(struct device *dev, void *ctx,
+                                int (*complete)(void *ctx));
+void sep_complete_attach_unregister(struct device *dev);
+void sep_diag_keystore_ended(void);
+void sep_diag_set_xart(bool writable);
 
 #endif /* SEP_SHIM_H */

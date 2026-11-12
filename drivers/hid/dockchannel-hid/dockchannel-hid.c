@@ -21,6 +21,7 @@
 #include <linux/soc/apple/dockchannel.h>
 #include <linux/soc/apple/rtkit-helper.h>
 #include <linux/string.h>
+#include <linux/suspend.h>
 #include <linux/unaligned.h>
 #include <linux/of.h>
 #include "../hid-ids.h"
@@ -86,6 +87,9 @@ struct dchid_init_hdr {
 #define CMD_REGISTER_RING 0x91
 #define CMD_SEND_FIRMWARE 0x95
 #define CMD_ENABLE_INTERFACE 0xb4
+#define CMD_HOST_STATE 0xc1
+#define HOST_STATE_SLEEP 1
+#define HOST_STATE_AWAKE 2
 #define CMD_ACK_GPIO_CMD 0xa1
 
 struct dchid_init_block_hdr {
@@ -202,6 +206,8 @@ struct dockchannel_hid {
 	bool inherited_mtp;
 	/* Between the system sleep suspend and resume callbacks */
 	bool suspended;
+	/* The firmware was told of a sleep and has not been told of the wake */
+	bool host_asleep;
 
 	/* Held from probe on when the multi-touch interface uses power method 2 */
 	struct gpio_desc *afe_reset;
@@ -224,6 +230,9 @@ struct dockchannel_hid {
 
 	/* Workqueue to asynchronously create HID devices */
 	struct workqueue_struct *new_iface_wq;
+
+	/* Held while one frame is written to the shared TX FIFO */
+	struct mutex tx_mutex;
 };
 
 static ssize_t apple_layout_id_show(struct device *dev,
@@ -347,7 +356,7 @@ static bool dchid_verify_checksum(struct dchid_hdr *hdr, void *data, u32 *checks
 	return *checksum == U32_MAX;
 }
 
-static int dchid_send(struct dchid_iface *iface, u32 flags, void *msg, size_t size)
+static int dchid_send_frame(struct dchid_iface *iface, u32 flags, void *msg, size_t size)
 {
 	u32 checksum = 0xffffffff;
 	size_t wsize = round_down(size, 4);
@@ -398,6 +407,23 @@ static int dchid_send(struct dchid_iface *iface, u32 flags, void *msg, size_t si
 	return 0;
 }
 
+/*
+ * A frame goes out as several FIFO writes, and each interface has its own
+ * output lock, so frames for two interfaces could interleave in the shared
+ * FIFO. The MTP firmware then fails the frame checksum and crashes
+ * ("[dock ch tl]: xsum err"). Write whole frames only.
+ */
+static int dchid_send(struct dchid_iface *iface, u32 flags, void *msg, size_t size)
+{
+	struct dockchannel_hid *dchid = iface->dchid;
+	int ret;
+
+	mutex_lock(&dchid->tx_mutex);
+	ret = dchid_send_frame(iface, flags, msg, size);
+	mutex_unlock(&dchid->tx_mutex);
+	return ret;
+}
+
 static int dchid_cmd(struct dchid_iface *iface, u32 type, u32 req,
 		     void *data, size_t size, void *resp_buf, size_t resp_size)
 {
@@ -445,6 +471,14 @@ done:
 static int dchid_comm_cmd(struct dockchannel_hid *dchid, void *cmd, size_t size)
 {
 	return dchid_cmd(dchid->comm, HID_FEATURE_REPORT, REQ_SET_REPORT, cmd, size, NULL, 0);
+}
+
+static int dchid_host_state(struct dockchannel_hid *dchid, u8 state)
+{
+	u8 msg[] = { CMD_HOST_STATE, state };
+	int ret = dchid_comm_cmd(dchid, msg, sizeof(msg));
+
+	return ret < 0 ? ret : 0;
 }
 
 static int dchid_enable_interface(struct dchid_iface *iface)
@@ -513,7 +547,7 @@ static int dchid_register_ring(struct dockchannel_hid *dchid)
 		.size = DCHID_RING_SIZE,
 	};
 	/* Observed in both macOS and standalone T8132 bringup before 0x91. */
-	u8 prepare[] = { 0xc1, 0x02 };
+	u8 prepare[] = { CMD_HOST_STATE, HOST_STATE_AWAKE };
 	int ret = 0;
 
 	if (!dchid->use_ring)
@@ -1583,6 +1617,7 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	}
 
 	dchid->dev = dev;
+	mutex_init(&dchid->tx_mutex);
 	stm = device_get_named_child_node(dev, "stm");
 	dchid->id_ready = !stm || !fwnode_device_is_available(stm);
 	fwnode_handle_put(stm);
@@ -1768,10 +1803,13 @@ static void dockchannel_hid_remove(struct platform_device *pdev)
 }
 
 /*
- * The coprocessor keeps running across suspend-to-idle: there is no known
- * sleep command for it, and its RTKit session and the trackpad AFE power
- * sequence are not restartable. Only mark the sleep window, in which input
- * may wake the system and requests from the HID core fail fast.
+ * The coprocessor keeps running across suspend-to-idle, and its RTKit session
+ * and the trackpad AFE power sequence are not restartable. Mark the sleep
+ * window, in which input may wake the system and requests from the HID core
+ * fail fast. A firmware-driven suspend also sets the host state, after the idle
+ * notice the helper sends in its .prepare, and the wake sets it back after the
+ * helper's .resume has sent the on notice, the device link ordering the two. That
+ * is macOS's order.
  */
 static int dockchannel_hid_suspend(struct device *dev)
 {
@@ -1787,6 +1825,13 @@ static int dockchannel_hid_suspend(struct device *dev)
 		ret = hid_driver_suspend(iface->hid, PMSG_SUSPEND);
 		if (ret)
 			goto unwind;
+	}
+	if (pm_suspend_via_firmware()) {
+		/* A firmware that doesn't answer isn't a reason to stay awake. */
+		ret = dchid_host_state(dchid, HOST_STATE_SLEEP);
+		if (ret)
+			dev_warn(dev, "host state not set: %d\n", ret);
+		dchid->host_asleep = !ret;
 	}
 	WRITE_ONCE(dchid->suspended, true);
 	return 0;
@@ -1806,6 +1851,14 @@ static int dockchannel_hid_resume(struct device *dev)
 {
 	struct dockchannel_hid *dchid = dev_get_drvdata(dev);
 	int i, ret = 0;
+
+	if (dchid->host_asleep) {
+		dchid->host_asleep = false;
+		ret = dchid_host_state(dchid, HOST_STATE_AWAKE);
+		if (ret)
+			dev_warn(dev, "host state not restored: %d\n", ret);
+		ret = 0;
+	}
 
 	/* Allow feature requests again before notifying any HID driver. */
 	WRITE_ONCE(dchid->suspended, false);

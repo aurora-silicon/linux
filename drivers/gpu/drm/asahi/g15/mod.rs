@@ -45,7 +45,6 @@
 mod adt;
 mod board;
 mod boot;
-mod retain;
 
 // One admission rule for the generation mappings and shared adopted UAT.
 pub(crate) use boot::glue::memory_mode;
@@ -69,10 +68,10 @@ mod pools;
 mod power;
 mod queue;
 mod recovery;
-mod regs;
+pub(crate) mod regs;
 mod slots;
 mod timestamp;
-mod uat;
+pub(crate) mod uat;
 mod vm;
 mod wire;
 
@@ -178,6 +177,10 @@ impl platform::Driver for Driver<'_> {
     type IdInfo = &'static Config;
     type Data<'bound> = Driver<'bound>;
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
+
+    fn pm_ops() -> Option<&'static kernel::bindings::dev_pm_ops> {
+        crate::driver::sleep_refuse_ops()
+    }
 
     fn unbind<'bound>(_pdev: &'bound platform::Device<Core<'_>>, this: Pin<&Self::Data<'bound>>) {
         if let Some(driver) = &this._driver {

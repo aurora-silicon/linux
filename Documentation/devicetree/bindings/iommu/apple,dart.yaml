@@ -48,6 +48,7 @@ properties:
               - apple,t6031-dart
               - apple,t6041-dart
               - apple,t6050-dart
+              - apple,t6050-isp-dart
               - apple,t8122-dart
               - apple,t8132-dart
               - apple,t8140-dart
@@ -78,13 +79,15 @@ properties:
       - description: DART registers
       - description:
           Address filter (DAPF) registers, which restrict the physical
-          addresses the DART lets its masters reach
+          addresses the DART lets its masters reach, or the slice of the
+          fabric filter (GAPF) that protects the power state of the
+          coprocessor CPU behind this DART, cleared to power that CPU down
 
   reg-names:
     minItems: 1
     items:
       - const: dart
-      - enum: [dapf, auxiliary]
+      - enum: [dapf, gapf, auxiliary]
 
   interrupts:
     maxItems: 1
@@ -116,6 +119,64 @@ properties:
       may select a firmware-visible alias of the translation aperture.
       A consumer may further specify its own aperture in its binding.
 
+  apple,dapf-ranges:
+    $ref: /schemas/types.yaml#/definitions/uint64-matrix
+    items:
+      items:
+        - description: First address of a range
+        - description: Last address of a range
+    description:
+      The address filter the loader programs into the dapf registers, one
+      entry per range. A sleep that reaches the hardware clears it, and the
+      DART writes it back before its consumer's firmware starts again.
+
+  apple,dapf-r20:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      The last word of each filter entry, one per range in apple,dapf-ranges.
+      1 where absent.
+
+  apple,restore-on-power-up:
+    type: boolean
+    description:
+      Reset and restore the DART, and write its address filter back, every
+      time it powers up, even where its registers still read as they were
+      left. For a DART that keeps its values through a sleep in which the
+      SoC's sleep engine runs its consumer, but whose address filter only
+      takes effect once written again.
+
+  apple,sleep-prepare:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: Register offset
+        - description: Value
+    description:
+      Register writes before a consumer that gates itself is told about a
+      firmware-driven system suspend, after the DART's state is saved. Streams
+      they stop are started again at the restore. Needs apple,sleep-restore.
+
+  apple,sleep-restore:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: Register offset
+        - description: Value
+    description:
+      Register writes after such a suspend, before the translations are put
+      back. With this, the consumer saves and restores the DART around the
+      suspend, as the order relative to its firmware's start matters.
+
+  apple,sleep-restore-late:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: Register offset
+        - description: Value
+    description:
+      Register writes after the translations are back and before the streams
+      are enabled.
+
   apple,dma-offset:
     $ref: /schemas/types.yaml#/definitions/uint64
     description: >
@@ -132,6 +193,29 @@ properties:
       handoff. Linux retains occupied root slots and excludes their entire
       IOVA spans from allocation. This does not assert immutable descendants.
 
+  apple,clock-protection:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    items:
+      - items:
+          - description: PS_PROT (clock protection) register bank
+          - description: Index of this DART's slice in the bank
+    description: >
+      The clock protection slice that guards a power state register of the
+      power domain of this DART. Its consumer may power that domain down: the
+      DART's streams are then disabled and flushed, and the slice disabled,
+      before the domain powers off, and the slice is enabled again when it
+      powers up. Only the J713 internal display DARTs use it.
+
+  apple,manual-availability:
+    type: boolean
+    description: >
+      The DART's registers answer only once its client, a PCIe root complex,
+      is up. The client's driver makes the DART available after bringing the
+      root complex up, and the DART probes then. The root complex lists the DART
+      in its post-init-providers property as well as in iommu-map: otherwise
+      fw_devlink.strict=1 makes the root complex wait for a DART that waits for
+      it.
+
   apple,tunable:
     $ref: /schemas/types.yaml#/definitions/uint32-matrix
     items:
@@ -144,6 +228,18 @@ properties:
       Tree by the bootloader and required to initialize dynamically powered
       DART instances.
 
+  apple,resume-tunable:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: Register offset
+        - description: Mask to be applied to the register value
+        - description: Bits to be set after applying the mask
+    description: >
+      The same tuples for a DART whose bootloader has already applied them,
+      written back where a power-off lost them, before its consumer's
+      firmware starts again.
+
   apple,bypass-sids:
     $ref: /schemas/types.yaml#/definitions/uint32-array
     minItems: 1
@@ -151,9 +247,25 @@ properties:
     items:
       maximum: 255
     description:
-      Reserved streams of a USB4 PCIe tunnel DART that its PCIe-C port issues
+      Streams set to bypass after every reset of the DART, outside any domain.
+      On a USB4 PCIe tunnel DART, the reserved streams its PCIe-C port issues
       its own writes on, such as the interrupt controller writes its MSIs
-      turn into. They are set to bypass after every reset of the DART.
+      turn into. On a T8110 DART that nothing initialises before Linux, such
+      as a USB4 router's, the streams its co-processor uses without
+      translation.
+
+  apple,full-error-reporting:
+    type: boolean
+    description:
+      Unmask every error and enable the error interrupt for every stream,
+      with the registers of the DART's revision, and leave the DART unlocked
+      on error. For a T8110 DART that nothing initialises before Linux.
+
+  apple,ctc-flush:
+    type: boolean
+    description:
+      Flush the DART's context cache after a stream flush, where the DART
+      has one. For a T8110 DART that nothing initialises before Linux.
 
   apple,remap-streams:
     $ref: /schemas/types.yaml#/definitions/uint32-matrix

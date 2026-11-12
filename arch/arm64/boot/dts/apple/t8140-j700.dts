@@ -26,14 +26,20 @@
 		keyboard = &keyboard;
 		sep = &sep;
 		serial0 = &serial0;
+		serial1 = &uart4;
+		serial2 = &uart5;
+		serial3 = &uart0;
 		pmp = &pmp;
-		rtc0 = &smc_rtc;
-		rtc1 = &pmu_rtc;
+		/* First the RTC that can wake the system */
+		rtc0 = &pmu_rtc;
+		rtc1 = &smc_rtc;
 		wifi0 = &wifi0;
 		/* used by the loader to hand over the display */
 		dcp = &dcp;
 		disp0 = &display;
 		disp0-piodma = &disp0_piodma;
+		/* and the SIO, with its firmware */
+		sio = &sio;
 	};
 
 	chosen {
@@ -411,23 +417,63 @@
 		regulator-name = "jack-codec";
 		regulator-always-on;
 	};
+
+	/*
+	 * The mic array's rail: SMC pcIO output 25, the ADT's
+	 * function-input_power_enable. macOS switches it around each capture.
+	 */
+	mic_array_supply: regulator-mic-array {
+		compatible = "regulator-fixed";
+		regulator-name = "mic-array";
+		gpio = <&smc_gpio 25 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
 };
 
 #include "isp-imx558.dtsi"
 
-&ave_dart0 {
-	status = "okay";
+/*
+ * A J700 has one of the two video encoders, and its ADT describes the one
+ * the unit has: ave (VENC0) or ave1 (VENC1). Both stay disabled here, with
+ * encoder 0's power states and performance report; the bootloader enables
+ * the encoder the ADT describes, its DARTs and its power states. On a unit
+ * with ave1, VENC0_SYS refuses its target, so nothing may enable it there.
+ */
+&pmp_report_ave0 {
+	status = "disabled";
 };
 
-&ave_dart1 {
-	status = "okay";
+&ps_venc0_sys {
+	status = "disabled";
 };
 
-&ave {
-	status = "okay";
+&ps_venc0_dma {
+	status = "disabled";
+};
+
+&ps_venc0_pipe4 {
+	status = "disabled";
+};
+
+&ps_venc0_pipe5 {
+	status = "disabled";
+};
+
+&ps_venc0_me0 {
+	status = "disabled";
+};
+
+&ps_venc0_me1 {
+	status = "disabled";
 };
 
 &serial0 {
+	status = "okay";
+};
+
+&uart0 {
+	/* The PMGR clock provider is not enabled on this SoC yet. */
+	clocks = <&clkref>, <&clkref>;
 	status = "okay";
 };
 
@@ -473,6 +519,14 @@
 };
 
 &jpeg0 {
+	status = "okay";
+};
+
+&jpeg1_dart {
+	status = "okay";
+};
+
+&jpeg1 {
 	status = "okay";
 };
 
@@ -532,11 +586,34 @@
 				label = "nvram";
 				reg = <0x24000 0x1d0000>;
 			};
+
+			/*
+			 * syscfg factory data. Listed after nvram so the nvram
+			 * MTD index stays the same.
+			 */
+			partition@0 {
+				label = "syscfg";
+				reg = <0x0 0x24000>;
+				read-only;
+			};
 		};
 	};
 };
 
 &dcp_mbox {
+	status = "okay";
+};
+
+&dcp_secure_mbox {
+	status = "okay";
+};
+
+/* The SIO itself is enabled by the loader that hands it over. */
+&sio_dart {
+	status = "okay";
+};
+
+&sio_mbox {
 	status = "okay";
 };
 
@@ -634,6 +711,7 @@
 &aop_audio {
 	apple,chassis-name = "J700";
 	apple,machine-kind = "MacBook Neo";
+	mic-supply = <&mic_array_supply>;
 };
 
 &admac_leap_ns {
@@ -687,12 +765,47 @@
 	};
 };
 
+/* A spare PWM channel for developers; no consumer is known. */
+&fpwm0 {
+	status = "okay";
+};
+
 &smc {
 	status = "okay";
 };
 
+/*
+ * The AOP's GPIO bank. The AOP keeps interrupt groups 0-3; the AP's are 4-6
+ * (AIC 384-386). No consumer requests a line yet. The reserved lines are the
+ * ones the firmware has already configured away from the bank's reset state
+ * by the time Linux boots; their users are not known, so they stay off limits.
+ */
+&pinctrl_aop {
+	gpio-reserved-ranges = <18 1>, <21 1>, <27 9>, <46 2>, <50 7>;
+	interrupts = <AIC_IRQ 384 IRQ_TYPE_LEVEL_HIGH>,
+		     <AIC_IRQ 385 IRQ_TYPE_LEVEL_HIGH>,
+		     <AIC_IRQ 386 IRQ_TYPE_LEVEL_HIGH>;
+	apple,irq-group-base = <4>;
+	status = "okay";
+};
+
+/*
+ * The always-on GPIO bank, as on the J616s: the AP takes none of its
+ * interrupts. Line 20 is the secure-repair enable and is never requested;
+ * the other reserved lines are configured by the firmware before Linux
+ * boots (line 27 is driven high) and have no known user.
+ */
+&pinctrl_nub {
+	gpio-reserved-ranges = <5 1>, <10 1>, <20 1>, <23 1>, <27 3>;
+	status = "okay";
+	/delete-property/ interrupt-controller;
+	/delete-property/ #interrupt-cells;
+	/delete-property/ interrupts;
+};
+
 &smc_gpio {
-	apple,pcio-templates = <10 0x800000 0xa0000>;
+	apple,pcio-templates = <10 0x800000 0xa0000>,
+			       <25 0x0 0x190000>;
 };
 
 &aop_spmi0 {
@@ -1107,6 +1220,59 @@
 	temperature-Tsx1 {
 		apple,key-id = "Tsx1";
 		label = "SMC Tsx1";
+	};
+
+	/*
+	 * GPU temperatures, last so the indexed channels above keep their
+	 * numbers. The SMC publishes them only while the GPU is powered; with
+	 * the GPU off they read -4.0 to 0.2 C placeholders, which are no data.
+	 */
+	temperature-Tg04 {
+		apple,key-id = "Tg04";
+		label = "GPU Tg04";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg05 {
+		apple,key-id = "Tg05";
+		label = "GPU Tg05";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0C {
+		apple,key-id = "Tg0C";
+		label = "GPU Tg0C";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0D {
+		apple,key-id = "Tg0D";
+		label = "GPU Tg0D";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0K {
+		apple,key-id = "Tg0K";
+		label = "GPU Tg0K";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0L {
+		apple,key-id = "Tg0L";
+		label = "GPU Tg0L";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0d {
+		apple,key-id = "Tg0d";
+		label = "GPU Tg0d";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0e {
+		apple,key-id = "Tg0e";
+		label = "GPU Tg0e";
+		apple,no-data-below-millicelsius = <10000>;
 	};
 
 	/*
@@ -1745,13 +1911,22 @@
 	};
 };
 
-/* USB PD controllers, on the nub SPMI A0 bus */
+&sleep {
+	apple,debug-port = <&hpm0>;
+};
+
+/*
+ * USB PD controllers, on the nub SPMI A0 bus. macOS sends them SSPS 3 and 0 around a sleep
+ * and nothing else: no USBw, as the J700 ADT has no dock-remote-wake. A USB key press
+ * wakes the J700 through the host's own wake source.
+ */
 &nub_spmi_a0 {
 	status = "okay";
 
 	hpm1: usb-pd@a {
 		compatible = "apple,sn201202x";
 		reg = <0xa SPMI_USID>;
+		apple,sleep-ssps;
 		interrupts = <37 IRQ_TYPE_EDGE_RISING>,
 			     <39 IRQ_TYPE_EDGE_RISING>,
 			     <43 IRQ_TYPE_EDGE_RISING>,
@@ -1776,6 +1951,8 @@
 	hpm0: usb-pd@c {
 		compatible = "apple,sn201202x";
 		reg = <0xc SPMI_USID>;
+		apple,debug-lock-key = "007J";
+		apple,sleep-ssps;
 		interrupts = <11 IRQ_TYPE_EDGE_RISING>,
 			     <13 IRQ_TYPE_EDGE_RISING>,
 			     <17 IRQ_TYPE_EDGE_RISING>,
@@ -1947,6 +2124,34 @@
 	pcie0_clkreq: pcie0-clkreq-pins {
 		pinmux = <APPLE_PINMUX(101, 2)>;
 	};
+
+	uart4_rx: uart4-rx-pins {
+		pinmux = <APPLE_PINMUX(85, 2)>;
+	};
+
+	uart5_rx: uart5-rx-pins {
+		pinmux = <APPLE_PINMUX(169, 3)>;
+	};
+};
+
+/*
+ * Wi-Fi (uart4) and Bluetooth (uart5) firmware debug output. Only the
+ * receive line is routed; the ports stay closed unless a user opens them.
+ */
+&uart4 {
+	pinctrl-0 = <&uart4_rx>;
+	pinctrl-names = "default";
+	/* The PMGR clock provider is not enabled on this SoC yet. */
+	clocks = <&clkref>, <&clkref>;
+	status = "okay";
+};
+
+&uart5 {
+	pinctrl-0 = <&uart5_rx>;
+	pinctrl-names = "default";
+	/* The PMGR clock provider is not enabled on this SoC yet. */
+	clocks = <&clkref>, <&clkref>;
+	status = "okay";
 };
 
 /* SID17 bootstrap; the arena stays owned until a full reset. */
@@ -1983,6 +2188,11 @@
 
 /* The loader publishes external resources after validating their firmware. */
 #include "t8140-j700-dcpext.dtsi"
+#include "t8140-j700-dpaudio.dtsi"
+
+&sleep {
+	apple,display-coprocessors = <&dcp>, <&dcpext>;
+};
 
 &display {
 	iommus = <&disp0_dart 0>, <&dispext0_dart 0>;

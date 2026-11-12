@@ -81,6 +81,13 @@ properties:
           - const: cout
           - const: cin
 
+  iommus:
+    maxItems: 1
+    description:
+      The DART stream of the firmware's low-power microphone I/O buffer. The
+      host allocates the ring the low-power microphone is produced into
+      through it; a node without it has no low-power microphone stream.
+
   "#sound-dai-cells":
     const: 1
     description: |
@@ -121,6 +128,7 @@ examples:
             dmas = <&admac0 1>, <&admac1 0>, <&admac1 1>,
                    <&admac1 4>, <&admac1 5>;
             dma-names = "dma", "spkr", "sense", "cout", "cin";
+            iommus = <&aop_dart 8>;
             #sound-dai-cells = <1>;
         };
     };

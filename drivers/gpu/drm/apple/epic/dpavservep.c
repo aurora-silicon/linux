@@ -594,6 +594,66 @@ bool dcpavserv_edid_service_current(struct apple_dcp *dcp, u64 epoch)
 		 !READ_ONCE(dcp->external_physically_absent));
 }
 
+#define DCPAVSERV_EDID_RETRIES 5
+#define DCPAVSERV_EDID_RETRY_MS 500
+
+static void dcpavserv_edid_retry_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(to_delayed_work(work), struct apple_dcp,
+					     dcpavserv.edid_retry_wq);
+	struct apple_connector *con;
+	bool current_instance;
+
+	guard(mutex)(&dcp->hpd_mutex);
+	scoped_guard(mutex, &dcp->dcpavserv.lock)
+		current_instance = dcpavserv_edid_service_current(dcp,
+							  dcp->dcpavserv.edid_retry_epoch);
+	con = dcp->connector;
+	/* A new instance or a new sink is probed by its own hotplug. */
+	if (current_instance && !READ_ONCE(dcp->quiescing) && con &&
+	    READ_ONCE(con->dcp) == to_platform_device(dcp->dev))
+		schedule_work(&con->hotplug_wq);
+}
+
+static void dcpavserv_edid_retry_cancel(void *data)
+{
+	struct apple_dcp *dcp = data;
+
+	cancel_delayed_work_sync(&dcp->dcpavserv.edid_retry_wq);
+}
+
+int dcpavserv_edid_retry_init(struct apple_dcp *dcp)
+{
+	INIT_DELAYED_WORK(&dcp->dcpavserv.edid_retry_wq, dcpavserv_edid_retry_work);
+	return devm_add_action_or_reset(dcp->dev, dcpavserv_edid_retry_cancel, dcp);
+}
+
+/*
+ * The EDID read through instance @epoch came back without data: probe again
+ * shortly, as the firmware fills in the EDID once it has the sink's link up.
+ * Returns false when this instance has used up its retries.
+ */
+bool dcpavserv_edid_retry(struct apple_dcp *dcp, u64 epoch)
+{
+	lockdep_assert_held(&dcp->dcpavserv.lock);
+	if (dcp->dcpavserv.edid_retry_epoch != epoch) {
+		dcp->dcpavserv.edid_retry_epoch = epoch;
+		dcp->dcpavserv.edid_retries = 0;
+	}
+	if (dcp->dcpavserv.edid_retries >= DCPAVSERV_EDID_RETRIES)
+		return false;
+	dcp->dcpavserv.edid_retries++;
+	mod_delayed_work(system_freezable_wq, &dcp->dcpavserv.edid_retry_wq,
+			 msecs_to_jiffies(DCPAVSERV_EDID_RETRY_MS));
+	return true;
+}
+
+void dcpavserv_edid_retry_reset(struct apple_dcp *dcp)
+{
+	lockdep_assert_held(&dcp->dcpavserv.lock);
+	dcp->dcpavserv.edid_retries = 0;
+}
+
 const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp, u64 generation,
 					u64 *epoch)
 {
@@ -712,7 +772,8 @@ int dpavservep_init(struct apple_dcp *dcp)
 	if (IS_ERR(ep))
 		return PTR_ERR(ep);
 	/* External H17P uses AFKV2 service calls with host-owned OOB buffers. */
-	ep->wire_v2 = dcp->hw.iomfb_method_profile ==
+	ep->wire_v2 = dcp->fw_compat == DCP_FIRMWARE_V_27_0 ||
+		dcp->hw.iomfb_method_profile ==
 		DCP_IOMFB_METHODS_H17P_EXTERNAL;
 	ep->inline_v2 = false;
 	dcp->dcpavservep = ep;

@@ -23,7 +23,6 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 273 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_dwi>;
-		status = "disabled";
 	};
 
 	/* ADT /arm-io/aes. */
@@ -105,7 +104,6 @@
 	aic_timebase: aic-timebase@502580000 {
 		compatible = "apple,t6041-aic-timebase", "apple,aic-timebase";
 		reg = <0x5 0x02580000 0x0 0x1000>;
-		status = "disabled";
 	};
 
 	/* ADT /arm-io/dbgCPU. */
@@ -127,7 +125,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1725 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&pcie_dart 17>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	/* ADT /arm-io/apcie1-piodma. */
@@ -139,7 +137,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1734 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&apcie1_dart 17>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	/* ADT /arm-io/apciec0-piodma. */

@@ -20,8 +20,9 @@
  *    leaves the internal panel alone.
  *  - T6041 on the J616c (t6041-gate-test.dtso): no PMP; each external chain
  *    is enabled once its processor has firmware memory, one without it or
- *    already enabled stays as it is, and the display subsystem is never
- *    written.
+ *    already enabled stays as it is, and the chains never write the display
+ *    subsystem's status. The tree has no dcp alias, so the internal display
+ *    handoff finds nothing to adopt.
  * Included at the end of display-gate.c.
  *
  * The test trees are applied once and stay: the gate gives some properties

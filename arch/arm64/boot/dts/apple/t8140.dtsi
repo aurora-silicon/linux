@@ -551,7 +551,42 @@
 
 		pmp_dart: iommu@300300000 {
 			compatible = "apple,t8140-dart", "apple,t8110-dart";
-			reg = <0x3 0x00300000 0x0 0xc000>;
+			reg = <0x3 0x00300000 0x0 0xc000>,
+			      <0x3 0x00310000 0x0 0x4000>;
+			reg-names = "dart", "dapf";
+			/*
+			 * The loader's address filter, from the ADT's dapf-instance-0,
+			 * written back after a sleep.
+			 */
+			apple,dapf-ranges = /bits/ 64 <0x220020000 0x220030000
+						     0x220060000 0x220070000
+						     0x2200a0000 0x2200b0000
+						     0x2200e0000 0x2200f0000
+						     0x220404000 0x220404070
+						     0x220604000 0x220604070
+						     0x220804000 0x220804070
+						     0x30819d000 0x30819d00c
+						     0x210e40000 0x210e7ffff
+						     0x211e40000 0x211e7ffff
+						     0x40196c000 0x40197bfff
+						     0x480d14000 0x480e23fff
+						     0x210e78000 0x210ef0000
+						     0x211e78000 0x211ef0000
+						     0x401868000 0x40186df08
+						     0x24f004000 0x24f004084
+						     0x24f008000 0x24f00c140
+						     0x250004000 0x250004084
+						     0x250008000 0x25000c140
+						     0x251004000 0x251004084
+						     0x251008000 0x25100c140
+						     0x22001c000 0x22001e000
+						     0x22005c000 0x22005e000
+						     0x22009c000 0x22009e000
+						     0x2200dc000 0x2200de000
+						     0x3082c8000 0x3082c8050
+						     0x220104000 0x22011c000>;
+			apple,dapf-r20 = <0x1 0x1 0x1 0x1 0x1 0x1 0x1 0x4 0x1 0x1 0x1 0x1 0x1 0x1
+					  0x1 0x1 0x1 0x1 0x1 0x1 0x1 0x1 0x1 0x1 0x1 0x1 0x1>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 827 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <1>;
@@ -672,7 +707,9 @@
 
 		dcpext0_dart: iommu@416340000 {
 			compatible = "apple,t8140-dart", "apple,t8110-dart";
-			reg = <0x4 0x16340000 0x0 0xc000>;
+			reg = <0x4 0x16340000 0x0 0xc000>,
+			      <0x3 0x0079c700 0x0 0x4>;
+			reg-names = "dart", "gapf";
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 770 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <1>;
@@ -770,6 +807,13 @@
 			 */
 			apple,dma-range = /bits/ 64 <0x10000004000 0xffff0000>;
 			apple,dma-offset = /bits/ 64 <0x0>;
+			/* What macOS writes around a sleep, as offset and value. */
+			apple,sleep-prepare = <0x80 0xa102>, <0x704 0xffffffff>;
+			apple,sleep-restore = <0x210 0x0>, <0x20c 0x800005f5>,
+					      <0x220 0xf0f0f>, <0x224 0x80808>,
+					      <0x300 0x1>, <0x318 0x1>;
+			apple,sleep-restore-late = <0x80 0x8000>, <0x228 0x3f3f3f3f>,
+						   <0x22c 0x1010101>;
 		};
 
 		sep: sep@282600000 {
@@ -825,12 +869,79 @@
 			/* child nodes are added in t8140-pmgr.dtsi */
 		};
 
+		/*
+		 * The CPU clusters' power-gate enables, in /arm-io/pmgr reg[22]:
+		 * cluster-id 0 (E) at +0x0, 1 (P) at +0x40. iBoot sets E's only.
+		 */
+		cluster_pwrgate: power-gate@300724000 {
+			compatible = "apple,t8140-cluster-pwrgate", "apple,cluster-pwrgate";
+			reg = <0x3 0x00724000 0x0 0x4>,
+			      <0x3 0x00724040 0x0 0x4>;
+		};
+
+		/*
+		 * Addresses from the ADT: /arm-io/pmgr reg[21], reg[22],
+		 * reg[24] + 0x4000, reg[27], reg[28], reg[31] + 0x4000, /arm-io/wdt
+		 * reg[0], /arm-io/pmgr reg[29] and reg[4]. The AMCC words were
+		 * measured under aura. Sizes cover only the words used: others in
+		 * these blocks are locked by the fabric.
+		 */
+		sleep: sleep-controller@300700000 {
+			compatible = "apple,t8140-sleep";
+			reg = <0x3 0x00700000 0x0 0x14000>,
+			      <0x3 0x00724000 0x0 0x1000>,
+			      <0x3 0x00734000 0x0 0x10>,
+			      <0x3 0x00768000 0x0 0x40>,
+			      <0x3 0x00780000 0x0 0xc>,
+			      <0x3 0x082d4000 0x0 0x4>,
+			      <0x3 0x082b0000 0x0 0x30>,
+			      <0x3 0x082b8000 0x0 0x44>,
+			      <0x3 0x08004000 0x0 0x48>,
+			      <0x2 0x20025000 0x0 0x10>,
+			      <0x2 0x20065000 0x0 0x10>,
+			      <0x2 0x200a5000 0x0 0x10>,
+			      <0x2 0x200e5000 0x0 0x10>,
+			      <0x3 0x028a9c14 0x0 0x4>,
+			      <0x2 0x10e70000 0x0 0x1000>,
+			      <0x2 0x11e70000 0x0 0x1000>,
+			      <0x3 0x08714000 0x0 0x84>,
+			      <0x3 0x02800000 0x0 0x10000>,
+			      <0x3 0x0005c000 0x0 0x4>,
+			      <0x3 0x08280000 0x0 0x10000>,
+			      <0x3 0x08908040 0x0 0x4>,
+			      <0x3 0x00040034 0x0 0xc>,
+			      <0x2 0x20400580 0x0 0x10>,
+			      <0x2 0x20600580 0x0 0x10>,
+			      <0x2 0x20800580 0x0 0x10>,
+			      <0x3 0x003d0bc8 0x0 0x10>,
+			      <0x3 0x00058000 0x0 0x10004>,
+			      <0x3 0x00780010 0x0 0x4>;
+			reg-names = "ps", "pwrgate", "cpu-start", "cllt", "cluster",
+				    "commit", "wdt", "aon-misc", "wake",
+				    "amcc0", "amcc1", "amcc2", "amcc3", "pmc-dcp",
+				    "dvfm-e", "dvfm-p", "spmi", "pmc-voters", "dcs",
+				    "ps-aon", "spmi-a0", "clk-mux", "mcc0", "mcc1", "mcc2",
+				    "ptd", "clk-perf", "cluster-dcs";
+			apple,apcie = <&pcie0>;
+			/* All but the pins macOS leaves alone after a wake */
+			apple,pinctrl = <&pinctrl_ap>;
+			apple,pinctrl-skip-pins = <49 50 51 134>;
+			/*
+			 * NUB.SPMI0.SW3: the PMU's RTC alarm. ATC0_PMGR_USB_WAKEUP: the
+			 * USB host's, which macOS enables at boot from the ADT and never
+			 * masks. SMC.CPUWakeupAP and SMC.OutboxNotEmpty: the power button,
+			 * the lid, AC, Wi-Fi and Bluetooth. MTP.DOCK.CHANNELS.AP0.IRQ and
+			 * MTP.OUTBOX.N.EMPTY_IRQ: the internal keyboard and trackpad.
+			 */
+			apple,wake-enable = <131 70 145 165 80 99>;
+		};
+
 		wdt: watchdog@3082b0000 {
 			compatible = "apple,t8140-wdt", "apple,t8103-wdt";
 			reg = <0x3 0x082b0000 0x0 0x4000>;
 			clocks = <&clkref>;
 			interrupt-parent = <&aic>;
-			interrupts = <AIC_IRQ 507 IRQ_TYPE_LEVEL_HIGH>;
+			interrupts = <AIC_IRQ 481 IRQ_TYPE_LEVEL_HIGH>;
 		};
 
 		nub_spmi0: spmi@308714000 {
@@ -1176,7 +1287,59 @@
 				       <&pmp_report_ave0>;
 			power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1",
 					     "perf";
-			iommus = <&ave_dart0 0>, <&ave_dart1 0>;
+			/*
+			 * Stream 12 carries the temporal filter engines; it must
+			 * translate through the encoder's domain, not bypass.
+			 */
+			iommus = <&ave_dart0 0>, <&ave_dart0 12>,
+				 <&ave_dart1 0>, <&ave_dart1 12>;
+			status = "disabled";
+		};
+
+		/*
+		 * The second encoder. A J700 has either this one or ave (the ADT
+		 * describes the one the part has); the bootloader enables it, its
+		 * DARTs and its power states when the ADT has it.
+		 */
+		ave1_dart0: iommu@289080000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x2 0x89080000 0 0xc000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 967 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_venc1_sys>;
+			#iommu-cells = <1>;
+			apple,dma-range = <0x100 0x00004000 0 0xffffc000>;
+			status = "disabled";
+		};
+
+		ave1_dart1: iommu@2890a0000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x2 0x890a0000 0 0xc000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 967 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_venc1_sys>;
+			#iommu-cells = <1>;
+			apple,dma-range = <0x100 0x00004000 0 0xffffc000>;
+			status = "disabled";
+		};
+
+		ave1: video-codec@289100000 {
+			compatible = "apple,t8140-ave";
+			reg = <0x2 0x89100000 0 0x45c000>,
+			      <0x2 0x89050000 0 0x4000>,
+			      <0x2 0x89800000 0 0x800000>;
+			reg-names = "codec", "mailbox", "coproc";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 970 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 964 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 963 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 966 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 965 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_venc1_dma>, <&ps_venc1_pipe4>,
+				       <&ps_venc1_pipe5>, <&ps_venc1_me0>, <&ps_venc1_me1>;
+			power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
+			iommus = <&ave1_dart0 0>, <&ave1_dart0 12>,
+				 <&ave1_dart1 0>, <&ave1_dart1 12>;
 			status = "disabled";
 		};
 
@@ -1190,9 +1353,15 @@
 			      <0x3 0x92028000 0x0 0x8000>,
 			      <0x3 0x97020000 0x0 0x4000>,
 			      <0x3 0x97024000 0x0 0x4000>,
-			      <0x3 0x97028000 0x0 0x4000>;
+			      <0x3 0x97028000 0x0 0x4000>,
+			      <0x3 0x96000000 0x0 0x1000000>,
+			      <0x3 0x95046200 0x0 0x4000>,
+			      <0x3 0x95044000 0x0 0x4000>,
+			      <0x3 0x97000000 0x0 0x40000>,
+			      <0x3 0x97040000 0x0 0x28000>;
 			reg-names = "config", "rc", "port0", "port1", "port2",
-				    "phy0", "phy1", "phy2";
+				    "phy0", "phy1", "phy2",
+				    "axi2af", "cio3pll", "clkgen", "phy-block", "phy-ip";
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1205 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 1214 IRQ_TYPE_LEVEL_HIGH>,
@@ -1206,7 +1375,7 @@
 			#size-cells = <2>;
 			ranges = <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0x0 0x20000000>,
 				 <0x02000000 0x0 0x80000000 0xb 0x80000000 0x0 0x40000000>;
-			power-domains = <&ps_apcie_gp>;
+			power-domains = <&ps_apcie_phy_sw>;
 			status = "disabled";
 
 			pcie0_port0: pci@0,0 {
@@ -1239,8 +1408,9 @@
 		dwc3_0: usb@40a280000 {
 			compatible = "apple,t8140-dwc3", "apple,t8103-dwc3";
 			reg = <0x4 0x0a280000 0x0 0xcd00>,
-			      <0x4 0x0a28cd00 0x0 0x3200>;
-			reg-names = "dwc3-core", "dwc3-apple";
+			      <0x4 0x0a28cd00 0x0 0x3200>,
+			      <0x4 0x0a200000 0x0 0x4000>;
+			reg-names = "dwc3-core", "dwc3-apple", "drd-cfg";
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 1244 IRQ_TYPE_LEVEL_HIGH>;
 			dr_mode = "otg";
@@ -1251,6 +1421,8 @@
 			resets = <&atcphy0>;
 			phys = <&atcphy0 PHY_TYPE_USB2>, <&atcphy0 PHY_TYPE_USB3>;
 			phy-names = "usb2-phy", "usb3-phy";
+			/* usb-drd's USB_SLP_DDR-V clock gate in the ADT */
+			apple,sleep-ddr;
 			status = "disabled";
 		};
 
@@ -1262,6 +1434,22 @@
 			power-domains = <&ps_atc0_usb>;
 			#iommu-cells = <1>;
 			apple,dma-range = <0x100 0x00004000 0x0 0xffff0000>;
+			/*
+			 * macOS's writes around a sleep that keeps the host: exceptions
+			 * and block errors off, streams stopped, a flush; at the wake, its
+			 * config words before the translations, then the rest. 0x104 is
+			 * Linux's own unmasked error interrupt.
+			 */
+			apple,sleep-prepare = <0x4060 0xffffffff>, <0x4000 0x0>,
+					      <0x704 0xffffffff>, <0xc20 0xffff>,
+					      <0x80 0xa000>;
+			apple,sleep-restore = <0x210 0x0>, <0x20c 0x800005f5>,
+					      <0x220 0xf0f0f>, <0x224 0x80808>,
+					      <0x300 0x1>, <0x308 0x10000000>,
+					      <0x310 0x3fffffff>, <0x318 0x1>,
+					      <0x320 0xff00000>, <0x328 0xff017ff>;
+			apple,sleep-restore-late = <0x228 0x3f3f3f3f>, <0x22c 0x1010101>,
+						   <0x104 0x0>, <0x4060 0x0>;
 			status = "disabled";
 		};
 
@@ -1273,6 +1461,17 @@
 			power-domains = <&ps_atc0_usb>;
 			#iommu-cells = <1>;
 			apple,dma-range = <0x100 0x00004000 0x0 0xffff0000>;
+			/* As dwc3_0_dart_0's. */
+			apple,sleep-prepare = <0x4060 0xffffffff>, <0x4000 0x0>,
+					      <0x704 0xffffffff>, <0xc20 0xffff>,
+					      <0x80 0xa000>;
+			apple,sleep-restore = <0x210 0x0>, <0x20c 0x800005f5>,
+					      <0x220 0xf0f0f>, <0x224 0x80808>,
+					      <0x300 0x1>, <0x308 0x10000000>,
+					      <0x310 0x3fffffff>, <0x318 0x1>,
+					      <0x320 0xff00000>, <0x328 0xff017ff>;
+			apple,sleep-restore-late = <0x228 0x3f3f3f3f>, <0x22c 0x1010101>,
+						   <0x104 0x0>, <0x4060 0x0>;
 			status = "disabled";
 		};
 
@@ -1283,9 +1482,12 @@
 			      <0x4 0x08000000 0x0 0x8000>,
 			      <0x4 0x0aa90000 0x0 0x4000>,
 			      <0x4 0x0aa84000 0x0 0x4000>,
-			      <0x4 0x0a300000 0x0 0x4000>;
+			      <0x4 0x0a300000 0x0 0x4000>,
+			      <0x4 0x0aa80000 0x0 0x4000>;
 			reg-names = "core", "lpdptx", "axi2af", "usb2phy",
-				    "pipehandler", "usb2phy-reg";
+				    "pipehandler", "usb2phy-reg", "pwrctl";
+			/* Bit 0 of both, around every ATC0_COMMON change on macOS. */
+			apple,axi2af-gate = <0x104 0x1>, <0x108 0x1>;
 
 			#phy-cells = <1>;
 			#reset-cells = <0>;
@@ -1308,6 +1510,7 @@
 			memory-region-names = "ttbs", "pagetables", "handoff";
 			operating-points-v2 = <&gpu_opp>;
 			apple,clpc = <&clpc>;
+			apple,pmp-report-entry = <&pmp_report_gfx>;
 			status = "disabled";
 		};
 
@@ -1363,7 +1566,9 @@
 
 		dcp_dart: iommu@412340000 {
 			compatible = "apple,t8140-dart", "apple,t8110-dart";
-			reg = <0x4 0x12340000 0x0 0xc000>;
+			reg = <0x4 0x12340000 0x0 0xc000>,
+			      <0x3 0x0079c880 0x0 0x4>;
+			reg-names = "dart", "gapf";
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 698 IRQ_TYPE_LEVEL_HIGH>;
 			#iommu-cells = <1>;
@@ -1444,8 +1649,22 @@
 			#apple,bw-doorbell-cells = <2>;
 		};
 
+		/*
+		 * Display power words the DCP driver writes around a warm restart.
+		 * /arm-io/disp0 reg[5] + 0xa9c14, and /arm-io/pmgr reg[21] and reg[22].
+		 * The firmware owns DISP_CPU only while it runs. No driver binds this.
+		 */
+		dcp_power: display-power@3028a9c14 {
+			compatible = "apple,t8140-display-power";
+			reg = <0x3 0x028a9c14 0x0 0x4>,
+			      <0x3 0x00700000 0x0 0x14000>,
+			      <0x3 0x00724000 0x0 0x1000>;
+			reg-names = "pmc-dcp", "ps", "pwrgate";
+		};
+
 		dcp: dcp@412e00000 {
 			compatible = "apple,t8140-dcp", "apple,dcp";
+			apple,display-power = <&dcp_power>;
 			reg = <0x4 0x12e00000 0x0 0x4000>,
 			      <0x4 0x10000000 0x0 0xafc000>,
 			      <0x4 0x12240000 0x0 0x10000>,
@@ -1455,8 +1674,8 @@
 			      <0x4 0x12850000 0x0 0x4000>;
 			reg-names = "coproc", "disp-0", "disp-1", "disp-2",
 				    "disp-3", "disp-4", "iop-vbar";
-			mboxes = <&dcp_mbox>;
-			mbox-names = "mbox";
+			mboxes = <&dcp_mbox>, <&dcp_secure_mbox>;
+			mbox-names = "mbox", "secure";
 			iommus = <&dcp_dart 23>;
 			power-domains = <&ps_disp_cpu>;
 			clocks = <&clk_disp0_154>, <&clk_disp0_194>;
@@ -1840,6 +2059,17 @@
 			status = "disabled";
 		};
 
+#define T8140_ISP_DART_TUNABLES					\
+	apple,resume-tunable = <0x20c 0x80000521 0x80000521>,	\
+			       <0x220 0x000f0f0f 0x000f0f0f>,	\
+			       <0x224 0x00ffffff 0x00080808>,	\
+			       <0x300 0x00001f31 0x00000001>,	\
+			       <0x308 0x3ffffffc 0x10000000>,	\
+			       <0x310 0x3ffffffc 0x3ffffffc>,	\
+			       <0x318 0x00001f31 0x00000001>,	\
+			       <0x320 0x3ffffffc 0x0ff00000>,	\
+			       <0x328 0x3ffffffc 0x0ff017fc>
+
 		/*
 		 * ISP (live J700 ADT /arm-io/isp, sensor-type 0x70, H17 "ISP17a"
 		 * firmware, iBoot-loaded).  "coproc" is the ISP block, the IRQ
@@ -1851,11 +2081,38 @@
 		 */
 		isp_dart0: iommu@3228c0000 {
 			compatible = "apple,t8140-dart", "apple,t8110-dart";
-			reg = <0x3 0x228c0000 0x0 0xc000>;
+			reg = <0x3 0x228c0000 0x0 0xc000>,
+			      <0x3 0x228d0000 0x0 0x4000>;
+			reg-names = "dart", "dapf";
+			/* The ADT's dart-tunables-instance-0 */
+			T8140_ISP_DART_TUNABLES;
+			/*
+			 * The loader's address filter, from the ADT's dart-isp
+			 * dapf-instance-0, written back after a sleep: the
+			 * firmware's PMGR, PMP and DSID windows.
+			 */
+			apple,dapf-ranges = /bits/ 64 <0x300704000 0x300704063
+						     0x300730000 0x300733fff
+						     0x300e3c000 0x300e3c003
+						     0x31062c000 0x310648003
+						     0x401660000 0x401660003
+						     0x220004000 0x2200162fc
+						     0x220044000 0x2200562fc
+						     0x220084000 0x2200962fc
+						     0x2200c4000 0x2200d62fc
+						     0x220104000 0x2201162fc
+						     0x302824000 0x302824004
+						     0x3003c0000 0x3003e4000>;
 			#iommu-cells = <1>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 341 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_isp_sys>;
+			/*
+			 * It keeps Linux's values through a wake that kept DRAM up,
+			 * where the sleep engine runs the ISP through it, but its
+			 * address filter works again only once written.
+			 */
+			apple,restore-on-power-up;
 			/*
 			 * 3-level tables (ias <= 36) as iBoot and the native host
 			 * ran them: the ISP fetches at vm-base 0x10000000000 and the
@@ -1872,6 +2129,8 @@
 		isp_dart1: iommu@3228e0000 {
 			compatible = "apple,t8140-dart", "apple,t8110-dart";
 			reg = <0x3 0x228e0000 0x0 0xc000>;
+			/* The ADT's dart-tunables-instance-1 */
+			T8140_ISP_DART_TUNABLES;
 			#iommu-cells = <1>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 341 IRQ_TYPE_LEVEL_HIGH>;
@@ -1892,6 +2151,8 @@
 		isp_dart2: iommu@322900000 {
 			compatible = "apple,t8140-dart", "apple,t8110-dart";
 			reg = <0x3 0x22900000 0x0 0xc000>;
+			/* The ADT's dart-tunables-instance-2 */
+			T8140_ISP_DART_TUNABLES;
 			#iommu-cells = <1>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 341 IRQ_TYPE_LEVEL_HIGH>;
@@ -1928,15 +2189,21 @@
 			interrupt-parent = <&aic>;
 			/* ADT [323 324 325 326 336]; 323 carries the IPC mailbox */
 			interrupts = <AIC_IRQ 323 IRQ_TYPE_LEVEL_HIGH>;
+			/*
+			 * In macOS's order: the camera sensor domains come up
+			 * after ISP_FE and before the rest of the pipeline.
+			 */
 			power-domains = <&ps_isp_sys>, <&ps_isp_cpu>,
 					<&ps_isp_cpu_core0>, <&ps_isp_cpu_core1>,
-					<&ps_isp_fe>, <&ps_isp_dprx>, <&ps_isp_secure>,
+					<&ps_isp_fe>, <&ps_ispsens0>, <&ps_ispsens1>,
+					<&ps_isp_dprx>, <&ps_isp_secure>,
 					<&ps_isp_sts0>, <&ps_isp_sts1>, <&ps_isp_pearl>,
 					<&ps_isp_be>, <&ps_isp_clr>, <&ps_isp_cvd>,
 					<&ps_isp_cvm>;
 			apple,dart-vm-size = <0x0 0xa0000000>;
 			status = "disabled";
 		};
+#undef T8140_ISP_DART_TUNABLES
 
 		ane_dart0: iommu@401800000 {
 			compatible = "apple,t8140-ane-dart", "apple,t8140-dart",

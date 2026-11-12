@@ -23,11 +23,25 @@ allOf:
       properties:
         apple,firmware-owned: false
         apple,sleep-retained: false
+        apple,sleep-driver-owned: false
         apple,always-on: false
         apple,min-state: false
         apple,force-disable: false
         apple,force-reset: false
         apple,externally-clocked: false
+        apple,consumer-switched: false
+  - if:
+      required:
+        - apple,consumer-switched
+    then:
+      required:
+        - apple,firmware-owned
+  - if:
+      required:
+        - apple,retention-workaround
+    then:
+      required:
+        - apple,consumer-switched
 
 description: |
   Apple SoCs include PMGR blocks responsible for power management,
@@ -122,6 +136,13 @@ properties:
       system sleep. Runtime power management is unaffected.
     type: boolean
 
+  apple,sleep-driver-owned:
+    description:
+      The driver behind this domain lowers it before a system sleep and brings
+      it back afterwards, in an order its hardware needs. The power controller
+      leaves it alone after a wake.
+    type: boolean
+
   apple,firmware-owned:
     description:
       The boot loader hands over active hardware whose power domain remains
@@ -131,6 +152,32 @@ properties:
       is supplied by the firmware handoff rather than determined by probing
       the power-state register.
     type: boolean
+
+  apple,consumer-switched:
+    description:
+      With apple,firmware-owned, the consumer of this domain may power it
+      off and on again around stopping its coprocessor, through the PMGR
+      driver, which then writes the state register. The OS otherwise treats
+      the domain as firmware-owned and always on. A chain of such domains
+      (this one and its consumer-switched parents) is powered off child first
+      and on parent first.
+    type: boolean
+
+  apple,retention-workaround:
+    description:
+      PMGR registers to set while this consumer-switched domain is off, and
+      to restore afterwards, as triplets of the offset in the PMGR register
+      block, a mask and the masked value while the domain is off. They are
+      set after automatic power management of the domain is disabled and
+      before it powers off, and restored after it powers on and before
+      automatic power management is enabled again.
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: register offset
+        - description: mask
+        - description: value while the domain is off
+    maxItems: 4
 
   apple,inherited-on:
     description: |

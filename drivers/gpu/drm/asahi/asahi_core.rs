@@ -30,6 +30,7 @@ mod gpu;
 mod hw;
 mod initdata;
 mod m3;
+mod legacy_rx;
 mod mem;
 mod memacct;
 mod microseq;
@@ -37,9 +38,12 @@ mod mmu;
 mod object;
 mod pgtable;
 mod queue;
+mod queue_share;
 mod regs;
+mod retain;
 mod slotalloc;
 mod stats;
+mod stats_busy;
 mod stats_raw;
 mod sysfs_exports;
 mod timestamp;
@@ -87,6 +91,7 @@ struct DriverModule {
     _g18: kernel::driver::Registration<kernel::platform::Adapter<g18::probe::Driver>>,
     #[pin]
     _driver: kernel::driver::Registration<kernel::platform::Adapter<driver::AsahiPlatformDriver>>,
+    _legacy_rx: legacy_rx::QueueOwner,
     _cleanup: cleanup::QueueOwner,
     #[cfg(CONFIG_DRM_ASAHI_G15)]
     _g15_ready: (),
@@ -96,9 +101,12 @@ impl kernel::InPlaceModule for DriverModule {
     fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
         // SAFETY: Module init runs once, before either adapter is registered below.
         unsafe { binding::init() };
+        // SAFETY: Module init runs once, before either adapter is registered below.
+        unsafe { queue_share::init() };
         try_pin_init!(Self {
             // Initialize the queue first, before registration can invoke probe.
             _cleanup: cleanup::QueueOwner::new()?,
+            _legacy_rx: legacy_rx::QueueOwner::new()?,
             #[cfg(CONFIG_DRM_ASAHI_G15)]
             _g15 <- kernel::driver::Registration::new(c"aurora-g15", module),
             _driver <- kernel::driver::Registration::new(
@@ -122,6 +130,22 @@ module! {
     license: "Dual MIT/GPL",
     alias: ["asahi"],
     params: {
+        m5_mesh_storage_chunks: u32 {
+            default: 0x200,
+            description: "M5 mesh rendering buffer bound to API task (object-stage) render kicks only, in 64 KiB chunks; 0 disables the binding and the task feature",
+        },
+        m5_thermal_governor: u32 {
+            default: 0,
+            description: "M5 thermal flags: bit 0 enables the host GPU power budget controller, bit 2 lets the controller lower the CPU frequency ceiling while the GPU is budget-bound, bit 3 runs the fans at their maximum while it governs; default 0 preserves the existing policy",
+        },
+        m5_thermal_target_mc: u32 {
+            default: 90000,
+            description: "M5 GPU power budget governor target for the SoC hotspot temperature computed by the SMC, in milli-degrees C (70000..104000)",
+        },
+        m5_depth_msaa_compression: u32 {
+            default: 1,
+            description: "Enable single-layer D32 compressed 2x/4x ZLS admission",
+        },
         debug_flags: u64 {
             default: 0,
             // permissions: 0o644,
@@ -145,6 +169,18 @@ module! {
             default: 0,
             // permissions: 0o644,
             description: "Fully isolate GPU contexts (limits performance)",
+        },
+        legacy_inline_submit: u32 {
+            default: 1,
+            description: "G13/G14: publish ready in-order jobs from SUBMIT (0: off)",
+        },
+        legacy_rx_fastpath: u32 {
+            default: 1,
+            description: "G13/G14: drain GPU events on a dedicated receive worker (0: off)",
+        },
+        legacy_rx_util_min: u32 {
+            default: 512,
+            description: "G13/G14: GPU event-drain utilization minimum (0..1024)",
         },
         g15_deadline_ms: u32 {
             default: 5000,

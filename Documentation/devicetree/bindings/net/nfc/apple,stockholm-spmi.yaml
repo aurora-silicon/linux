@@ -11,8 +11,8 @@ maintainers:
 
 description: |
   The endpoint occupies an SPMI follower address and exports seven event
-  interrupts. Event roles and the firmware-controlled enable sequence are
-  unqualified. This description does not select the later NCI transport.
+  interrupts, of which three have a known role: the transport error, host
+  wake and receive data ready. VEN enables the controller.
 
 properties:
   compatible:
@@ -29,6 +29,20 @@ properties:
   interrupts:
     minItems: 7
     maxItems: 7
+
+  interrupt-names:
+    items:
+      - const: event0
+      - const: event1
+      - const: event2
+      - const: error
+      - const: event4
+      - const: host-wake
+      - const: data-ready
+
+  enable-gpios:
+    maxItems: 1
+    description: VEN, the controller enable line.
 
 required:
   - compatible

@@ -300,9 +300,13 @@ static int sn201202x_ldcm_set_mitigation(void *ctx, bool enable)
 	if (sn->ldcm_mitigation_known && sn->ldcm_mitigated == enable)
 		return 0;
 
-	/* Successful task completion is the controller's mitigation ACK. */
+	/*
+	 * Successful task completion is the controller's mitigation ACK.
+	 * Startup commands can take more than a second on SN201202x. Wait for
+	 * completion before a retry can request the opposite mitigation state.
+	 */
 	ret = tps6598x_exec_cmd_tmo(tps, "LDCM", sizeof(command), &command,
-				   0, NULL, 1000, 0);
+				   0, NULL, 5000, 0);
 	sn->ldcm_mitigation_known = !ret;
 	if (!ret)
 		sn->ldcm_mitigated = enable;
@@ -354,6 +358,16 @@ sn201202x_ldcm_update_state(void *ctx, const struct sn201202x_ldcm_ops *ops,
 
 	/* Do not report dry if liquid appeared while mitigation was removed. */
 	read_ret = ops->read(ctx, &contaminant);
+	if (!read_ret && contaminant == TYPEC_CONTAMINANT_UNKNOWN) {
+		/*
+		 * Removing mitigation can start another measurement. The dry
+		 * snapshot above is still the latest result; preserve it just
+		 * as we preserve a previously published result at entry. Forcing
+		 * mitigation back on here can prevent the measurement finishing.
+		 */
+		ops->publish(ctx, TYPEC_CONTAMINANT_NONE);
+		return -EINPROGRESS;
+	}
 	if (read_ret || contaminant != TYPEC_CONTAMINANT_NONE) {
 		ret = ops->set_mitigation(ctx, true);
 		if (ret) {
@@ -453,16 +467,18 @@ static void sn201202x_ldcm_invalidate(struct tps6598x *tps)
 
 static void sn201202x_ldcm_stop(struct tps6598x *tps)
 {
-	cancel_delayed_work_sync(&tps_to_sn(tps)->ldcm_work);
+	/* Reset recovery is drained later and may still try to queue an update. */
+	disable_delayed_work_sync(&tps_to_sn(tps)->ldcm_work);
 }
 
-static const struct tipd_contaminant_ops sn201202x_contaminant_ops = {
+VISIBLE_IF_KUNIT const struct tipd_contaminant_ops sn201202x_contaminant_ops = {
 	.update = sn201202x_ldcm_update,
 	.refresh = sn201202x_ldcm_refresh,
 	.event = sn201202x_ldcm_event,
 	.invalidate = sn201202x_ldcm_invalidate,
 	.stop = sn201202x_ldcm_stop,
 };
+EXPORT_SYMBOL_IF_KUNIT(sn201202x_contaminant_ops);
 
 static struct regmap *__devm_regmap_init_sn201202x(struct spmi_device *sdev,
 						   const struct regmap_config *config,
@@ -839,8 +855,11 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_resume(struct device *dev)
 	} else {
 		err = sn201202x_wake(sn);
 	}
-	if (!err)
+	if (!err) {
+		/* Registered before xHCI, so this is before the root port resumes. */
+		tipd_usb_wake(tps, false);
 		err = tipd_resume(tps);
+	}
 	/* The resume revalidation acknowledges events latched while asleep. */
 	if (tps->irq)
 		enable_irq(tps->irq);
@@ -890,6 +909,8 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_suspend(struct device *dev)
 		else
 			dev_warn(dev, "port state unreadable, no wakeup for an attach\n");
 	}
+	/* Registered before xHCI, so its root port has suspended by now. */
+	tipd_usb_wake(tps, true);
 	reinit_completion(&sn->sleep_completion);
 	err = spmi_command_sleep(sn->sdev);
 	if (err)

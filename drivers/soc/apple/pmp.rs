@@ -71,6 +71,7 @@ const BOOTARGS_UUID_MAGIC: u32 = 0x6469_7575; // "uuid"
 const BOOTARGS_UUID_VERSION: u32 = 5;
 const BOOTARGS_OFFSET: usize = 0x22c;
 const BOOTARGS_SIZE: usize = 0x230;
+const ASC_CPU_CONTROL_OFFSET: usize = 0x44;
 const PMP_ENDPOINT: u8 = 0x20;
 const PM_COMMAND_MARKER: u64 = pmp_power::MARKER;
 const PM_COMMAND_SHIFT: u32 = pmp_power::SHIFT;
@@ -120,11 +121,19 @@ unsafe impl AsBytes for IovaTableEntry {}
 // SAFETY: TODO:
 unsafe impl FromBytes for IovaTableEntry {}
 
+/// A range of the firmware's SRAM as it was when the firmware stopped.
+struct SramCopy {
+    offset: usize,
+    words: KVVec<u32>,
+}
+
 struct PmpState {
     iova_table: Option<Coherent<[IovaTableEntry]>>,
     allocs: KVec<PmpAllocation>,
     value_buf: Option<u64>,
     ioreg_entries: KVec<u32>,
+    /// Held from a system sleep's start until its end.
+    sram: Option<SramCopy>,
 }
 
 impl PmpState {
@@ -134,6 +143,7 @@ impl PmpState {
             allocs: KVec::with_capacity(10, GFP_KERNEL)?,
             value_buf: None,
             ioreg_entries: KVec::with_capacity(340, GFP_KERNEL)?,
+            sram: None,
         })
     }
     fn find_alloc(&self, addr: u64) -> Option<usize> {
@@ -169,10 +179,12 @@ struct PmpData {
     display: AtomicPtr<bindings::apple_pmp_display>,
     /// The first failure seen before or after the bridge was published.
     display_error: AtomicI32,
+    /// See [`PmpHwConfig::sram_backup`].
+    sram_backup: Option<(usize, usize)>,
 }
 
 impl PmpData {
-    fn new(dev: &platform::Device<Core<'_>>) -> Result<Arc<PmpData>> {
+    fn new(dev: &platform::Device<Core<'_>>, cfg: &PmpHwConfig) -> Result<Arc<PmpData>> {
         let pmp_req = dev.io_request_by_name(c"pmp").ok_or(EINVAL)?;
         let pmp_mmio = pmp_req.iomap_sized::<PMP_MIN_MMIO_SIZE>()?.into_devres()?;
         let asc_req = dev.io_request_by_name(c"asc").ok_or(EINVAL)?;
@@ -189,6 +201,7 @@ impl PmpData {
                     asc_mmio,
                     display: AtomicPtr::new(core::ptr::null_mut()),
                     display_error: AtomicI32::new(0),
+                    sram_backup: cfg.sram_backup,
                 }
             ),
             GFP_KERNEL,
@@ -438,6 +451,112 @@ impl PmpData {
             )
         };
     }
+    /// The handle, to wait on the firmware with the lock free: its messages take that lock.
+    fn rtkit_handle(&self) -> Result<*mut bindings::apple_rtkit> {
+        let mut guard = self.rtkit.lock();
+        let rtk = guard.as_mut().as_pin_mut().ok_or(ENODEV)?;
+        Ok(rtk.as_raw())
+    }
+    /// The ASC's CPU control register.
+    fn asc_cpu_control(&self) -> Result<*mut kernel::ffi::c_void> {
+        // SAFETY: the PM core only calls a bound device.
+        let bound_dev = unsafe { self.dev.as_bound() };
+        let asc_mmio = self.asc_mmio.access(bound_dev)?.as_view();
+        Ok(MmioBackend::as_ptr(asc_mmio)
+            .cast::<u8>()
+            .wrapping_add(ASC_CPU_CONTROL_OFFSET)
+            .cast())
+    }
+    /// Room for what SRAM needs kept, taken first so that running out refuses a sleep cleanly.
+    fn sram_alloc(&self, sram_size: usize) -> Result<Option<SramCopy>> {
+        let Some((offset, size)) = self.sram_backup else {
+            return Ok(None);
+        };
+        if !pmp_bootargs::word_range_valid(offset, size, sram_size) {
+            return Err(EINVAL);
+        }
+        let mut words = KVVec::new();
+        words.resize(size / 4, 0u32, GFP_KERNEL)?;
+        Ok(Some(SramCopy { offset, words }))
+    }
+    /// Stops the firmware for a system sleep, then keeps what its restart needs from SRAM.
+    fn sleep(&self) -> Result {
+        // SAFETY: the PM core only calls a bound device.
+        let bound_dev = unsafe { self.dev.as_bound() };
+        let pmp_mmio = self.pmp_mmio.access(bound_dev)?.as_view();
+        let io = pmp_mmio.as_view().relaxed();
+        let mut copy = self.sram_alloc(io.size())?;
+        let rtk = self.rtkit_handle()?;
+        let control = self.asc_cpu_control()?;
+        // SAFETY: the handle stays valid until unbind, which can't run during a system sleep,
+        // and `control` is inside the ASC mapping held by `self`.
+        if let Err(error) = to_result(unsafe { bindings::apple_rtkit_sleep_stop(rtk, control) }) {
+            // SAFETY: as above.
+            if to_result(unsafe { bindings::apple_rtkit_sleep_return(rtk, control) }).is_err() {
+                self.fail_display(error);
+            }
+            return Err(error);
+        }
+        if let Some(copy) = copy.as_mut() {
+            for (idx, word) in copy.words.iter_mut().enumerate() {
+                // The range was checked against the mapping when it was allocated.
+                *word = io.try_read32(copy.offset + idx * 4).unwrap_or(0);
+            }
+        }
+        self.state.lock().sram = copy;
+        Ok(())
+    }
+    /// For a stop at the commit: the RTKit handle, the CPU control and the SRAM copy's room,
+    /// whose buffer stays where it is once moved into the state.
+    fn sleep_prepare(&self, stop: &mut bindings::apple_pmp_commit_stop) -> Result {
+        // SAFETY: the PM core only calls a bound device.
+        let bound_dev = unsafe { self.dev.as_bound() };
+        let pmp_mmio = self.pmp_mmio.access(bound_dev)?.as_view();
+        let size = pmp_mmio.as_view().relaxed().size();
+        let mut copy = self.sram_alloc(size)?;
+        stop.rtk = self.rtkit_handle()?;
+        stop.control = self.asc_cpu_control()?;
+        stop.sram = core::ptr::null_mut();
+        stop.words = core::ptr::null_mut();
+        stop.count = 0;
+        if let Some(copy) = copy.as_mut() {
+            stop.sram = MmioBackend::as_ptr(pmp_mmio)
+                .cast::<u8>()
+                .wrapping_add(copy.offset)
+                .cast();
+            stop.words = copy.words.as_mut_ptr();
+            stop.count = copy.words.len();
+        }
+        self.state.lock().sram = copy;
+        Ok(())
+    }
+    /// Writes SRAM back after a sleep that took its power, while the firmware is stopped.
+    fn sram_restore(&self) -> Result {
+        let Some(copy) = self.state.lock().sram.take() else {
+            return Ok(());
+        };
+        // SAFETY: the PM core only calls a bound device.
+        let bound_dev = unsafe { self.dev.as_bound() };
+        let pmp_mmio = self.pmp_mmio.access(bound_dev)?.as_view();
+        let io = pmp_mmio.as_view().relaxed();
+        for (idx, word) in copy.words.iter().enumerate() {
+            io.try_write32(*word, copy.offset + idx * 4)?;
+        }
+        // The firmware mustn't start ahead of writes still on their way.
+        let _ = io.try_read32(copy.offset);
+        dev_dbg!(self.dev, "SRAM restored: {} bytes\n", copy.words.len() * 4);
+        Ok(())
+    }
+    /// Brings the firmware back after a system sleep. It keeps its endpoints and everything the
+    /// host gave it, so nothing here repeats what it asked for at probe.
+    fn wake(&self) -> Result {
+        self.sram_restore()?;
+        let rtk = self.rtkit_handle()?;
+        let control = self.asc_cpu_control()?;
+        // SAFETY: the handle stays valid until unbind, which can't run during a system sleep,
+        // and `control` is inside the ASC mapping held by `self`.
+        to_result(unsafe { bindings::apple_rtkit_sleep_return(rtk, control) })
+    }
     fn recv_message(&self, msg: u64) -> Result<()> {
         let pm_command = (msg >> PM_COMMAND_SHIFT) & 0xff;
         if msg & PM_COMMAND_MARKER != 0 && (pm_command == 0x0f || pm_command == 0x10) {
@@ -487,6 +606,8 @@ unsafe extern "C" fn display_send(cookie: *const kernel::ffi::c_void, word: u64)
     match word {
         0x0020f50100000000 => unsafe { bindings::apple_pmp_set_device_power(0x0f, 5, 1) },
         0x0020f80100000000 => unsafe { bindings::apple_pmp_set_device_power(0x0f, 8, 1) },
+        // DISP released while its DCP has powered the display domains down.
+        0x0020f80000000000 => unsafe { bindings::apple_pmp_set_device_power(0x0f, 8, 0) },
         _ => EINVAL.to_errno(),
     }
 }
@@ -609,6 +730,58 @@ pub unsafe extern "C" fn apple_pmp_send_power_command(
     0
 }
 
+/// Stops the firmware for a system sleep.
+///
+/// # Safety
+/// `data` must point to the live PmpData registered by PmpDriver.
+#[export]
+pub unsafe extern "C" fn apple_pmp_sleep(data: *const core::ffi::c_void) -> i32 {
+    // SAFETY: The C bridge serializes calls against unregister in Drop.
+    let data = unsafe { &*data.cast::<PmpData>() };
+    match data.sleep() {
+        Ok(()) => 0,
+        Err(error) => error.to_errno(),
+    }
+}
+
+/// Takes what the sleep's last step needs to stop the firmware with interrupts off, and the room
+/// for the SRAM it keeps. Nothing is stopped here.
+///
+/// # Safety
+/// `data` must point to the live PmpData registered by PmpDriver, and `stop` to writable memory.
+#[export]
+pub unsafe extern "C" fn apple_pmp_sleep_prepare(
+    data: *const core::ffi::c_void,
+    stop: *mut bindings::apple_pmp_commit_stop,
+) -> i32 {
+    // SAFETY: The C bridge serializes calls against unregister in Drop.
+    let data = unsafe { &*data.cast::<PmpData>() };
+    // SAFETY: The caller passes a valid pointer.
+    let stop = unsafe { &mut *stop };
+    match data.sleep_prepare(stop) {
+        Ok(()) => 0,
+        Err(error) => error.to_errno(),
+    }
+}
+
+/// Brings the firmware back after a system sleep. A firmware that doesn't come back disables
+/// further power commands.
+///
+/// # Safety
+/// `data` must point to the live PmpData registered by PmpDriver.
+#[export]
+pub unsafe extern "C" fn apple_pmp_wake(data: *const core::ffi::c_void) -> i32 {
+    // SAFETY: The C bridge serializes calls against unregister in Drop.
+    let data = unsafe { &*data.cast::<PmpData>() };
+    match data.wake() {
+        Ok(()) => 0,
+        Err(error) => {
+            data.fail_display(error);
+            error.to_errno()
+        }
+    }
+}
+
 struct NoBuffer;
 impl rtkit::Buffer for NoBuffer {
     fn iova(&self) -> Result<usize> {
@@ -657,6 +830,9 @@ struct PmpHwConfig {
     /// When the firmware needs system endpoint 7 (CoreAnalytics) started
     /// and given its buffer before it acknowledges the IOP power state.
     coreanalytics: Ep7,
+    /// The range of the firmware's SRAM, as (offset, size) in bytes, that a system sleep keeps
+    /// and writes back. `None` where no sleep has been traced.
+    sram_backup: Option<(usize, usize)>,
 }
 
 /// Whether a PMP firmware needs endpoint 7 to finish its RTKit boot.
@@ -674,6 +850,7 @@ const HW_CFG_DEFAULT: PmpHwConfig = PmpHwConfig {
     dma_mask: None,
     check_bootargs_uuid: false,
     coreanalytics: Ep7::No,
+    sram_backup: None,
 };
 
 /// T8140: the DART translates 42 bits and its DMA window starts at 1 TiB.
@@ -681,6 +858,7 @@ const HW_CFG_T8140: PmpHwConfig = PmpHwConfig {
     dma_mask: Some(DmaMask::new::<42>()),
     check_bootargs_uuid: false,
     coreanalytics: Ep7::No,
+    sram_backup: Some((0x3c000, 0x5c000)),
 };
 
 /// T6041: the DART window starts at 1 TiB; the boot argument header is
@@ -690,6 +868,7 @@ const HW_CFG_T6041: PmpHwConfig = PmpHwConfig {
     dma_mask: Some(DmaMask::new::<42>()),
     check_bootargs_uuid: true,
     coreanalytics: Ep7::Always,
+    sram_backup: None,
 };
 
 /// T8142: the DART window starts at 1 TiB as on T8140. Its registry-v2
@@ -699,12 +878,23 @@ const HW_CFG_T8142: PmpHwConfig = PmpHwConfig {
     dma_mask: Some(DmaMask::new::<42>()),
     check_bootargs_uuid: false,
     coreanalytics: Ep7::Always,
+    sram_backup: None,
+};
+
+/// T6050: the DART window starts at 1 TiB (ADT dart-pmp0 vm-base) and spans
+/// 64 GiB, as on T8142. Its firmware never readies endpoint 7 (-ETIME).
+const HW_CFG_T6050: PmpHwConfig = PmpHwConfig {
+    dma_mask: Some(DmaMask::new::<42>()),
+    check_bootargs_uuid: false,
+    coreanalytics: Ep7::No,
+    sram_backup: None,
 };
 
 const HW_CFG_T8132: PmpHwConfig = PmpHwConfig {
     dma_mask: None,
     check_bootargs_uuid: false,
     coreanalytics: Ep7::RetainedBoard,
+    sram_backup: None,
 };
 
 impl Drop for PmpDriver {
@@ -722,6 +912,7 @@ kernel::of_device_table!(
         (of::DeviceId::new(c"apple,t8140-pmp-v2"), &HW_CFG_T8140),
         (of::DeviceId::new(c"apple,t8142-pmp-v2"), &HW_CFG_T8142),
         (of::DeviceId::new(c"apple,t6041-pmp-v2"), &HW_CFG_T6041),
+        (of::DeviceId::new(c"apple,t6050-pmp-v2"), &HW_CFG_T6050),
         (of::DeviceId::new(c"apple,t6000-pmp-v2"), &HW_CFG_DEFAULT),
     ]
 );
@@ -731,9 +922,14 @@ impl platform::Driver for PmpDriver {
     type Data<'bound> = PmpDriver;
 
     fn suppress_bind_attrs() -> bool {
-        // Retained J713 power votes have no teardown path.
-        // SAFETY: read-only board identity check; other boards remain unchanged.
-        unsafe { bindings::apple_pmp_display_retained_board() }
+        // Retained J713 power votes have no teardown path, and an unbound T8140 PMP still runs.
+        // SAFETY: read-only machine identity checks; other machines remain unchanged.
+        unsafe { bindings::apple_pmp_keep_bound() }
+    }
+
+    fn pm_ops() -> Option<&'static bindings::dev_pm_ops> {
+        // SAFETY: a static in `pmp-export.c`, never written.
+        Some(unsafe { &*core::ptr::addr_of!(bindings::apple_pmp_pm_ops) })
     }
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
@@ -749,7 +945,7 @@ impl platform::Driver for PmpDriver {
             // yet.
             unsafe { pdev.dma_set_mask_and_coherent(mask)? };
         }
-        let data = PmpData::new(pdev)?;
+        let data = PmpData::new(pdev, cfg)?;
         let pmp_mmio = data.pmp_mmio.access(pdev.as_ref())?.as_view();
         let asc_mmio = data.asc_mmio.access(pdev.as_ref())?.as_view();
         let node = dev.fwnode().ok_or(EIO)?;

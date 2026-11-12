@@ -343,6 +343,23 @@ static const struct ane_h16_preload_rule ane_h16_preload_25g83_j616c = {
 	},
 };
 
+/*
+ * The same layout as iBoot leaves it on a J614C with 40 GPU cores: the
+ * J616C's patch cells and zeroed range, with this machine's digest.
+ */
+static const struct ane_h16_preload_rule ane_h16_preload_25g83_j614c = {
+	.cells = ane_h16_patchbay_25g83,
+	.cell_count = ARRAY_SIZE(ane_h16_patchbay_25g83),
+	.zero_start = 0x1bc00,
+	.zero_end = 0x1c2a0,
+	.digest = {
+		0x58, 0x2c, 0x92, 0x2a, 0x74, 0xd7, 0x4a, 0xc6,
+		0xd0, 0xdd, 0x04, 0xbf, 0xa5, 0x74, 0x63, 0x2e,
+		0x8a, 0x51, 0x65, 0x1b, 0xe2, 0x07, 0xa7, 0x18,
+		0x14, 0x77, 0xc4, 0x25, 0xa5, 0xef, 0x4b, 0x32,
+	},
+};
+
 /* Every supported H16 firmware build, matched against the live preload. */
 static const struct ane_h16_profile ane_h16_profiles[] __maybe_unused = {
 	{
@@ -358,6 +375,11 @@ static const struct ane_h16_profile ane_h16_profiles[] __maybe_unused = {
 	{
 		.identity = "H16 26.6.2 25G83 J616C",
 		.preload = &ane_h16_preload_25g83_j616c,
+		.build = &ane_h16_build_26a428,
+	},
+	{
+		.identity = "H16 26.6.2 25G83 J614C",
+		.preload = &ane_h16_preload_25g83_j614c,
 		.build = &ane_h16_build_26a428,
 	},
 	{
