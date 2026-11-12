@@ -1023,12 +1023,7 @@ static void ave_6070_hevc_contract(struct kunit *test)
 			get_unaligned_le32(start +
 					   sl->hevc_pps_l1_default_active_minus1),
 			0U);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_rps), 8U);
-	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_rps + 4 + 0xbc),
-			0U);
-	KUNIT_EXPECT_EQ(test,
-			get_unaligned_le32(start + sl->hevc_rps + 4 + 0x164 + 0xbc),
-			1U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_rps), 0U);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le64(start + sl->recon.address + 8),
 			sess->ref_a[0].dma + recon.luma_metadata_offset);
 	KUNIT_EXPECT_EQ(test,
@@ -1048,10 +1043,48 @@ static void ave_6070_hevc_contract(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + 0x68), 1U);
 	KUNIT_EXPECT_EQ(test, process[0x15d], 1U);
 	KUNIT_EXPECT_EQ(test, process[0x15e], 1U);
-	KUNIT_EXPECT_EQ(test, process[0x6524], 1U);
+	KUNIT_EXPECT_EQ(test, process[0x15f], 0U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + 0x414), 3U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + pl->hevc_explicit_rps),
+			1U);
+	KUNIT_EXPECT_EQ(test, process[0x6524], 0U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + 0x652c + 0x30), 1U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + 0x652c + 0x34), 1U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + 0x652c + 0xbc), 1U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + 0x652c + 0x120), 1U);
 	KUNIT_EXPECT_EQ(test,
 			get_unaligned_le64(process + pl->list1_recon.luma_data),
 			sess->ref_a[2].dma);
+
+	/* The P after a B explicitly references the preceding anchor at POC -2. */
+	sess->frames = 2;
+	memset(process, 0, 0x6838);
+	KUNIT_ASSERT_EQ(test,
+			ave_build_process(ctx, process, 0x6838, 2,
+					  0x8f0000000ULL, 4000000, false,
+					  false),
+			0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(process + 0x652c + 0x38), 1U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + 0x652c + 0x34), 0U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + 0x652c + 0xe0),
+			(u32)-2);
+
+	/* Low delay carries the same explicit one-reference {-1} set. */
+	sess->p.bframes = false;
+	sess->p.reorder_off = true;
+	sess->p.refs = 2;
+	sess->p.slots = 3;
+	sess->frames = 1;
+	memset(process, 0, 0x6838);
+	KUNIT_ASSERT_EQ(test,
+			ave_build_process(ctx, process, 0x6838, 1,
+					  0x8f0000000ULL, 4000000, false,
+					  false),
+			0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(process + 0x652c + 0x38), 0U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + 0x652c + 0x34), 0U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(process + 0x652c + 0xe0),
+			(u32)-1);
 }
 
 static void ave_6070_alignment_refusal(struct kunit *test)
