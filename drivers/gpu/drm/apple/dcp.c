@@ -9201,45 +9201,11 @@ static int dcp_t6041_s2r_domains_on(struct apple_dcp *dcp)
 	return ret;
 }
 
-/* Entry: lower the display domains after the firmware stop, CPU first. */
 /*
  * S2R bring-up marks (0x7D0SIIII): S the step of dcp_t6041_s2r_stop() (8/9: the resume's
  * domains on / display DART streams back), I which DCP (0 internal, 1 DCPEXT0/HDMI,
  * 2 DCPEXT1/USB-C DP, f unknown); DCP_S2R_MARK is defined above dcp_t6041_s2r_domains_on().
  */
-static bool s2r_ext_domains_off;
-module_param(s2r_ext_domains_off, bool, 0644);
-MODULE_PARM_DESC(s2r_ext_domains_off,
-		 "T6040 S2R: also lower an external DCP's domains after its stop (not measured, off)");
-/*
- * The internal panel's off recipe panicked on T6040 at its first word, DISP_CPU: until the
- * display domains are lowered where nothing touches them any more, leave them on here.
- */
-static bool s2r_int_domains_off;
-module_param(s2r_int_domains_off, bool, 0644);
-MODULE_PARM_DESC(s2r_int_domains_off,
-		 "T6040 S2R: lower the internal DCP's domains after its stop (panicked on HW, off)");
-
-/* The internal pipe off by its firmware before the T6040 S2R stop (macOS's display sleep). */
-static bool s2r_pipe_off = true;
-module_param(s2r_pipe_off, bool, 0644);
-MODULE_PARM_DESC(s2r_pipe_off, "T6040 S2R: power the internal pipe off through its firmware first");
-
-/*
- * Keep the run bit through the T6040 S2R stop: the CPU's power word can't be written from
- * the OS, so the CPU has to idle in WFI for the PMGR's automatic mode to gate it.
- */
-/*
- * T6040 S2R: the CPU power word down in macOS's two steps right after the stop, while
- * its FE and SYS parents are still on. Linux's genpd takes a DCPEXT pipe's FE/SYS down at
- * suspend_noirq and leaves the CPU word (no Linux domain), which then refuses any access.
- * macOS lowers DISP_CPU 131 us after it stops the CPU.
- */
-static bool s2r_cpu_off = true;
-module_param(s2r_cpu_off, bool, 0644);
-MODULE_PARM_DESC(s2r_cpu_off,
-		 "T6040 S2R: lower the DCP's CPU power word right after its stop (needs s2r_keep_run=0)");
-
 /*
  * T6040: the fabric rejects a write to a display coprocessor's CPU power word while
  * bit 4 ("clock protection") of its DART's GAPF slice is set (T8140's
@@ -9322,11 +9288,6 @@ module_param(s2r_gapf_release, bool, 0644);
 MODULE_PARM_DESC(s2r_gapf_release,
 		 "T6040 S2R: clear the DCP DART's GAPF clock protection before its CPU power word goes down");
 
-static bool s2r_keep_run;
-module_param(s2r_keep_run, bool, 0644);
-MODULE_PARM_DESC(s2r_keep_run,
-		 "T6040 S2R: leave the idle DCP CPU running (gated by the PMGR) instead of stopping it");
-
 static u32 dcp_s2r_mark_id(struct apple_dcp *dcp)
 {
 	struct resource *res;
@@ -9341,66 +9302,20 @@ static u32 dcp_s2r_mark_id(struct apple_dcp *dcp)
 	return 0xf;
 }
 
-static void dcp_t6041_s2r_domains_off(struct apple_dcp *dcp)
-{
-	struct dcp_t6041_ps_offsets o;
-	/* DISP_CPU is 0x10000, too wide for u16 -- keep the offsets u32. */
-	struct {
-		u32 offset, first, second;
-	} steps[3];
-	void __iomem *ps, *pmc;
-	u32 val, id = dcp_s2r_mark_id(dcp);
-	int i;
-
-	if (!dcp_t6041_ps_offsets(dcp, &o))
-		return;
-	/* CPU first, then FE, then SYS. */
-	steps[0] = (typeof(steps[0])){ o.cpu, 0xf0400ff, 0xf0403f0 };
-	steps[1] = (typeof(steps[0])){ o.fe,  0,         0x23f0 };
-	steps[2] = (typeof(steps[0])){ o.sys, 0,         0x23f0 };
-
-	if (dcp_t6041_display_power(dcp, &ps, &pmc))
-		return;
-
-	/*
-	 * As on T8140, where the firmware's D572 does it: the display DART's scanout streams
-	 * off before the domains go (the wake turns them back on first, W2).
-	 */
-	if (!dcp->external) {
-		dcp_s2r_find_darts(dcp);
-		if (dcp->s2r_disp_dart)
-			apple_dart_display_streams(dcp->s2r_disp_dart, DCP_S2R_DISP_STREAMS,
-						   false, false);
-	}
-	apple_sleep_bringup_mark(DCP_S2R_MARK(id, 0xc));
-	dcp_pmc_set(dcp, pmc, false);	/* shared voter: counts every powered DCP */
-	/* TODO(ADT): conditional-retention disable + axi2af bridge bit0 clear here. */
-	for (i = 0; i < ARRAY_SIZE(steps); i++) {
-		apple_sleep_bringup_mark(DCP_S2R_MARK(id, 0xd) | (i + 1) << 8);
-		if (steps[i].first)
-			writel(steps[i].first, ps + steps[i].offset);
-		writel(steps[i].second, ps + steps[i].offset);
-		readl_poll_timeout(ps + steps[i].offset, val,
-				   !(val & GENMASK(7, 4)) && !(val & BIT(11)), 100, 50000);
-	}
-	iounmap(ps);
-	iounmap(pmc);
-}
-
 /*
  * T6040 suspend-to-RAM: the desktop 26.x firmware's own stop, in macOS's order
  * (the pipeline's power state, then the DCP power manager's and the
  * coprocessor's CPU stop), as measured on the J616s (A500 reached,
  * RTKit idle 0, the CPU stopped with status 0x6d): presentation drained, A473(0)
  * restartable sleep (dcp_sleep()), A500, RTKit idle (AP and IOP 0x201), the run bit
- * off, then bit 5. Only for a sleep that may lose power: with its power kept, a stopped
- * desktop firmware has no way back here (still 0x6d after the run bit; a
- * forced power cycle of its domain hung the SoC). So a dry run keeps it
- * running, its domains on, as suspend-to-idle does. The domain lower after the
- * stop (dcp_t6041_s2r_domains_off) and the cold restart on wake
- * (dcp_t6041_s2r_resume -> dcp_desktop_cold_restart) are built but NULL-guarded
- * on the apple,display-power window, absent in-tree: this stays gated until it (or
- * the genpd design) lands and a real power-loss S2R proves the restart.
+ * off, then bit 5, then the CPU's power word down in macOS's two steps
+ * (dcp_t6041_s2r_cpu_off()), while its FE and SYS parents are still on: macOS lowers
+ * DISP_CPU 131 us after it stops the CPU. FE and SYS are not lowered here. Only for a
+ * sleep that may lose power: with its power kept, a stopped desktop firmware has no way
+ * back here (still 0x6d after the run bit; a forced power cycle of its domain hung the
+ * SoC). So a dry run keeps it running, its domains on, as suspend-to-idle does. The CPU
+ * power word and the wake (dcp_t6041_s2r_resume()) need the apple,display-power window:
+ * without it the word is left alone and the display stays off after the wake.
  */
 static bool dcp_t6041_s2r_capable(struct apple_dcp *dcp)
 {
@@ -9522,10 +9437,6 @@ static void dcp_t6041_s2r_cpu_off(struct apple_dcp *dcp, u32 id)
 	iounmap(pmc);
 }
 
-static bool s2r_afk_pause = true;
-module_param(s2r_afk_pause, bool, 0644);
-MODULE_PARM_DESC(s2r_afk_pause, "T6040 S2R: pause the DCP's AFK endpoints before its idle and resume them after the wake, as macOS (bring-up)");
-
 #define DCP_S2R_AFK_TIMEOUT_MS	200
 
 /*
@@ -9540,7 +9451,7 @@ static void dcp_t6041_s2r_afk(struct apple_dcp *dcp, bool resume)
 	unsigned int i, n = ARRAY_SIZE(dcp->desktop->graph), done = 0, total = 0;
 	int ret;
 
-	if (!dcp->desktop || !READ_ONCE(s2r_afk_pause))
+	if (!dcp->desktop)
 		return;
 	for (i = 0; i < n; i++) {
 		struct apple_dcp_afkep *ep = READ_ONCE(dcp->desktop->graph[resume ? i : n - 1 - i]);
@@ -9593,13 +9504,9 @@ static int dcp_t6041_s2r_stop(struct apple_dcp *dcp)
 	if (dcp_desktop_external(dcp) && !IS_ERR_OR_NULL(dcp->rtk) &&
 	    (READ_ONCE(dcp->ext_dead) || READ_ONCE(dcp->crashed))) {
 		apple_rtkit_mailbox_off(dcp->rtk);
-		if (!READ_ONCE(s2r_keep_run)) {
-			writel(readl(control) & ~APPLE_DCP_COPROC_CPU_CONTROL_RUN, control);
-			writel(readl(control) & ~(APPLE_DCP_COPROC_CPU_CONTROL_RUN | BIT(5)),
-			       control);
-			if (READ_ONCE(s2r_cpu_off))
-				dcp_t6041_s2r_cpu_off(dcp, id);
-		}
+		writel(readl(control) & ~APPLE_DCP_COPROC_CPU_CONTROL_RUN, control);
+		writel(readl(control) & ~(APPLE_DCP_COPROC_CPU_CONTROL_RUN | BIT(5)), control);
+		dcp_t6041_s2r_cpu_off(dcp, id);
 		dcp->t6041_s2r_stopped = true;
 		dev_info(dcp->dev, "dead external firmware: CPU off for the sleep\n");
 		return 0;
@@ -9627,7 +9534,7 @@ static int dcp_t6041_s2r_stop(struct apple_dcp *dcp)
 	 * when DISP_CPU goes down. Without it the pipe was fully on at the commit
 	 * point and lowering under it raised an SError.
 	 */
-	if (!dcp->external && READ_ONCE(s2r_pipe_off)) {
+	if (!dcp->external) {
 		apple_sleep_bringup_mark(DCP_S2R_MARK(id, 0xe));
 		_dcp_poweroff(dcp);
 	}
@@ -9666,35 +9573,17 @@ static int dcp_t6041_s2r_stop(struct apple_dcp *dcp)
 	if (readl_poll_timeout(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS, status,
 			       status & 3, 100, 10000))
 		dev_warn(dcp->dev, "CPU not idle (%#x), stopping it anyway\n", status);
-	/*
-	 * macOS clears the run bit, then bit 5, and lowers the CPU's
-	 * power word itself. That word refuses writes from the OS here, so by default
-	 * the run bit stays: the firmware idles in WFI and the PMGR's automatic mode gates it.
-	 */
-	if (!READ_ONCE(s2r_keep_run)) {
-		writel(readl(control) & ~APPLE_DCP_COPROC_CPU_CONTROL_RUN, control);
-		writel(readl(control) & ~(APPLE_DCP_COPROC_CPU_CONTROL_RUN | BIT(5)), control);
-		/* Read now: once its CPU word is down, the ASC page faults. */
-		status = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS);
-		if (READ_ONCE(s2r_cpu_off))
-			dcp_t6041_s2r_cpu_off(dcp, id);
-	} else {
-		status = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS);
-	}
+	/* As macOS: the run bit off, then bit 5, then the CPU's power word down. */
+	writel(readl(control) & ~APPLE_DCP_COPROC_CPU_CONTROL_RUN, control);
+	writel(readl(control) & ~(APPLE_DCP_COPROC_CPU_CONTROL_RUN | BIT(5)), control);
+	/* Read now: once its CPU word is down, the ASC page faults. */
+	status = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS);
+	dcp_t6041_s2r_cpu_off(dcp, id);
 	apple_sleep_bringup_mark(DCP_S2R_MARK(id, 8));
 	apple_sleep_bringup_mark(DCP_S2R_MARK(id, 9));
 	dcp->t6041_s2r_stopped = true;
 	dev_info(dcp->dev, "firmware stopped for the sleep: status %#x\n", status);
 
-	/*
-	 * Lower the display domains after the stop (NULL-guarded, see above). An
-	 * external DCP's off sequence is the internal one's, not yet measured: by default its
-	 * domains are left to the SoC power-down.
-	 */
-	if (dcp->external ? READ_ONCE(s2r_ext_domains_off) : READ_ONCE(s2r_int_domains_off)) {
-		apple_sleep_bringup_mark(DCP_S2R_MARK(id, 0xa));
-		dcp_t6041_s2r_domains_off(dcp);
-	}
 	apple_sleep_bringup_mark(DCP_S2R_MARK(id, 0xb));
 
 	return 0;
