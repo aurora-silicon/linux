@@ -141,6 +141,13 @@ static const struct apple_rtkit_ops apple_rtkit_helper_ops = {
 	.shmem_destroy = apple_rtkit_helper_shmem_destroy,
 };
 
+/* Whether the coprocessor's CPU runs: halted, nothing answers on its mailbox. */
+static bool apple_rtkit_helper_cpu_running(struct apple_rtkit_helper *helper)
+{
+	return readl_relaxed(helper->asc_base + APPLE_ASC_CPU_CONTROL) &
+	       APPLE_ASC_CPU_CONTROL_RUN;
+}
+
 static void apple_rtkit_helper_release(void *data)
 {
 	struct apple_rtkit_helper *helper = data;
@@ -172,8 +179,7 @@ static int apple_rtkit_helper_live(struct apple_rtkit_helper *helper)
 		return -EINVAL;
 	}
 
-	if (!(readl_relaxed(helper->asc_base + APPLE_ASC_CPU_CONTROL) &
-	      APPLE_ASC_CPU_CONTROL_RUN)) {
+	if (!apple_rtkit_helper_cpu_running(helper)) {
 		dev_warn(helper->dev, "RTKit handoff without a running CPU\n");
 		return -ENODEV;
 	}
@@ -427,8 +433,7 @@ static void apple_rtkit_helper_remove(struct platform_device *pdev)
 	 * believes it runs: nothing would answer the quiesce. Drop the session
 	 * without a handshake so that the next probe starts the CPU again.
 	 */
-	if (!(readl_relaxed(helper->asc_base + APPLE_ASC_CPU_CONTROL) &
-	      APPLE_ASC_CPU_CONTROL_RUN)) {
+	if (!apple_rtkit_helper_cpu_running(helper)) {
 		dev_info(&pdev->dev, "co-processor halted underneath (resume from disk): removed without quiesce\n");
 		return;
 	}
@@ -613,12 +618,6 @@ static_assert(sizeof(struct apple_rtkit_helper_hib) <= APPLE_RTKIT_HIB_HANDOFF_M
 static void apple_rtkit_helper_hib_tag(struct device *dev, char *tag, size_t len)
 {
 	snprintf(tag, len, "rtkh:%s", dev_name(dev));
-}
-
-static bool apple_rtkit_helper_cpu_running(struct apple_rtkit_helper *helper)
-{
-	return readl_relaxed(helper->asc_base + APPLE_ASC_CPU_CONTROL) &
-	       APPLE_ASC_CPU_CONTROL_RUN;
 }
 
 /*
