@@ -511,6 +511,28 @@
 	};
 };
 
+/*
+ * The ProRes engine (apr0) and its DART, in the SCODEC power state. Its
+ * parent fab7-soc also feeds the display pipeline, so it is left to the
+ * firmware, as fab0-piogw is.
+ */
+&ps_fab7_soc {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_scodec {
+	status = "okay";
+};
+
+&apr0_dart {
+	status = "okay";
+};
+
+&apr0 {
+	status = "okay";
+};
+
 #include "t6050-j714s-pmp-tunables.dtsi"
 
 /*
