@@ -554,6 +554,25 @@ static void v14_bl_t6030_work(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, dcp_backlight_pending(f.dcp));
 }
 
+/*
+ * A present without a surface cannot apply a new level: it carries the last
+ * completed one and reserves nothing, so it is still sent, and the request
+ * waits for the next present with a surface.
+ */
+static void v14_bl_surfaceless_present(struct kunit *test)
+{
+	struct v14_bl_fixture f = v14_bl_fixture(test, &dcp_v14_board_t6030, true);
+	struct dcp_backlight_present p = { .nits = U32_MAX };
+
+	v14_bl_request(test, f.dcp, 250);
+	KUNIT_EXPECT_EQ(test, dcp_backlight_prepare(f.dcp, false, &p), -EALREADY);
+	KUNIT_EXPECT_EQ(test, p.nits, DCP_V14_NITS_DEFAULT);
+	KUNIT_EXPECT_TRUE(test, f.dcp->backlight.state.dirty);
+	KUNIT_EXPECT_FALSE(test, f.dcp->backlight.state.in_flight);
+	KUNIT_ASSERT_EQ(test, dcp_backlight_prepare(f.dcp, true, &p), 0);
+	KUNIT_EXPECT_EQ(test, p.nits, 250U);
+}
+
 static struct kunit_case v14_backlight_cases[] = {
 	KUNIT_CASE(v14_bl_binary64),
 	KUNIT_CASE(v14_bl_level_block),
@@ -562,6 +581,7 @@ static struct kunit_case v14_backlight_cases[] = {
 	KUNIT_CASE(v14_bl_gate_transitions),
 	KUNIT_CASE(v14_bl_plan),
 	KUNIT_CASE(v14_bl_policy),
+	KUNIT_CASE(v14_bl_surfaceless_present),
 	KUNIT_CASE(v14_bl_other_boards_untouched),
 	KUNIT_CASE(v14_bl_external_untouched),
 	KUNIT_CASE(v14_bl_t6030_swap_levels),
