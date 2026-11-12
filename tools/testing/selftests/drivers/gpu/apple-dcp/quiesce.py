@@ -149,7 +149,7 @@ struct apple_atcphy {
  void *dev; int lock;
  const struct atcphy_hw *hw;
  struct { void *usb2phy; } regs;
- bool fixed_usb2,host_active,mode_dirty,pipe_pending,usb_off_pending,ss_tunables,dp_tunables,cio_tunables;
+ bool fixed_usb2,host_active,mode_dirty,pipe_pending,usb_off_pending,ss_tunables,dp_tunables,cio_tunables,t8132_dp_alt;
  bool usb3_port_off,park_owed,dp_only,pd_was_off;
  bool t8103_dummy_pending,t8103_usb3_retry,t8103_usb3_workaround;
  enum atcphy_mode mode,typec_mode;
