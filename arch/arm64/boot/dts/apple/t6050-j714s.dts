@@ -533,6 +533,26 @@
 	status = "okay";
 };
 
+/*
+ * Both JPEG engines and their shared DART, under the media fabric that the
+ * video encoder above already enables.
+ */
+&ps_jpg {
+	status = "okay";
+};
+
+&jpeg0_dart {
+	status = "okay";
+};
+
+&jpeg0 {
+	status = "okay";
+};
+
+&jpeg1 {
+	status = "okay";
+};
+
 #include "t6050-j714s-pmp-tunables.dtsi"
 
 /*
