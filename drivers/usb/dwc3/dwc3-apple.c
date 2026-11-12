@@ -585,8 +585,8 @@ static int dwc3_apple_pre_host_resume(struct dwc3 *dwc)
 		if (ret)
 			break;
 		appledwc->sleep_reinit = true;
-		dev_info(appledwc->dev,
-			 "host kept through the sleep: core and PHY set up again, xHCI starts over\n");
+		dev_dbg(appledwc->dev,
+			"host kept through the sleep: core and PHY set up again, xHCI starts over\n");
 		return 1;
 	case DWC3_APPLE_WAKE_FAILED:
 	default:
