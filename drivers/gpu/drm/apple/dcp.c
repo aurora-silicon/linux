@@ -9138,7 +9138,7 @@ static int dcp_t6041_s2r_domains_on(struct apple_dcp *dcp)
 		v = readl(ps + o.cpu);
 		writel((v & ~(DCP_PS_FLAGS | DCP_PS_TARGET | DCP_PS_AUTO_ENABLE)) | DCP_PS_ACTIVE,
 		       ps + o.cpu);
-		mb();
+		mb();	/* the write lands before the word is polled */
 		if (readl_poll_timeout_atomic(ps + o.cpu, cur,
 					      (cur & DCP_PS_ACTUAL) == DCP_PS_ACTUAL, 1, 8000) ||
 		    readl_poll_timeout_atomic(ps + o.cpu, cur, !(cur & DCP_PS_BUSY), 1, 8000))
@@ -9435,7 +9435,6 @@ static int dcp_t6041_s2r_stop(struct apple_dcp *dcp)
 	dcp_t6041_s2r_cpu_off(dcp);
 	dcp->t6041_s2r_stopped = true;
 	dev_dbg(dcp->dev, "firmware stopped for the sleep: status %#x\n", status);
-
 
 	return 0;
 
@@ -10156,6 +10155,7 @@ static void dcp_hib_quiesce_ext(struct apple_dcp *dcp)
 		for (i = 0; i < ARRAY_SIZE(dcp->dptxport); i++) {
 			struct dptx_port *port = &dcp->dptxport[i];
 
+			/* Pairs with dptx_service_available(): the port is withdrawn. */
 			smp_store_release(&port->enabled, false);
 			WRITE_ONCE(port->connected, false);
 			WRITE_ONCE(port->closed, false);
