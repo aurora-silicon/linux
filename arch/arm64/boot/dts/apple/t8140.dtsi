@@ -1144,6 +1144,7 @@
 			memory-region-names = "ttbs", "pagetables", "handoff";
 			operating-points-v2 = <&gpu_opp>;
 			apple,clpc = <&clpc>;
+			apple,pmp-report = <&pmp_report>;
 			status = "disabled";
 		};
 
