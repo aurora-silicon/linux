@@ -9,6 +9,10 @@
 #include "mt7932.h"
 #include "wow.h"
 
+/* KIT ONLY: fleet64 predates the radio stop/recover hooks of linux#1208. */
+#define apple_piodma_radio_set_stop(fn) do { (void)(fn); } while (0)
+#define apple_piodma_radio_recover() do { } while (0)
+
 #include <kunit/static_stub.h>
 
 #include <linux/pm_wakeup.h>
