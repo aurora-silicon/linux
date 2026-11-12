@@ -46,6 +46,13 @@ properties:
     items:
       maxItems: 1
 
+  apple,pmp:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      PMP whose startup may replace the bootloader's T8112 per-channel DCS
+      DRAM configuration. The driver takes a read-only snapshot before the
+      supplier binds; restoring it remains a separate boot-time opt-in.
+
 allOf:
   - if:
       properties:
@@ -110,6 +117,8 @@ allOf:
           description:
             Devices that take over DMA the bootloader left running. Cache allocation
             is enabled only once each of them is bound to its driver.
+
+        apple,pmp: true
 
       required:
         - compatible
