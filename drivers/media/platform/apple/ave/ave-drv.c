@@ -89,12 +89,16 @@ const struct ave_variant ave_t8112 = {
 /*
  * The M4 Pro (T6040 in the ADT, apple,t6041 in the DT) starts its encoder
  * like the A18 Pro: same coprocessor registers and boot sequence, its own
- * device ID and type.
+ * device ID and type. The M4 Max (J575c) runs its first encoder, ADT ave0
+ * with soc-id t6040, the same way; iBoot 25G83 preloads it with a 0x130000
+ * DATA and sets a word at TEXT 0x4224 differently on every boot.
  */
-static const struct ave_variant ave_t6041 = {
+const struct ave_variant ave_t6041 = {
 	.regs = &ave_coproc_v40,
 	.fw_text_size = 0x14c000,
 	.fw_data_size = 0x12c000,
+	.fw_data_size_alt = 0x130000,
+	.text_boot_word = 0x4224,
 	.boot_device_id = 27,
 	.boot_arg_value = AVE_COPROC_BOOT_ARG_VALUE,
 	.timebase_multiplier = 1,

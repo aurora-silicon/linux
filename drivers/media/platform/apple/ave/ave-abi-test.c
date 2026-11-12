@@ -1461,7 +1461,40 @@ static void ave_6070_text_id(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ave_fw_text_id_crc(text, size, size - 4, 0, &crc), -EINVAL);
 }
 
+/*
+ * The M4 Max loader sets one TEXT word every boot: the identity hashes it as
+ * zero, so two boots give one CRC, and it leaves the rest of TEXT counted.
+ */
+static void ave_t6041_text_boot_word(struct kunit *test)
+{
+	const u32 off = ave_t6041.text_boot_word, size = off + 0x100;
+	u8 *text = kunit_kzalloc(test, size, GFP_KERNEL);
+	u32 image, a, b;
+
+	KUNIT_ASSERT_NOT_NULL(test, text);
+	KUNIT_EXPECT_EQ(test, off, 0x4224U);
+	KUNIT_EXPECT_EQ(test, ave_t6041.fw_data_size_alt, 0x130000U);
+	KUNIT_EXPECT_EQ(test, ave_t6041.text_link_cell, 0U);
+	for (u32 i = 0; i < size; i++)
+		text[i] = i * 7 + 3;
+	memset(text + off, 0, 4);
+	image = crc32_le(~0U, text, size) ^ ~0U;
+
+	put_unaligned_le32(0x00dd0000, text + off);
+	KUNIT_EXPECT_EQ(test, ave_fw_text_boot_crc(text, size, off, &a), 0);
+	put_unaligned_le32(0x007d0000, text + off);
+	KUNIT_EXPECT_EQ(test, ave_fw_text_boot_crc(text, size, off, &b), 0);
+	KUNIT_EXPECT_EQ(test, a, image);
+	KUNIT_EXPECT_EQ(test, b, image);
+	/* A change anywhere else is a different TEXT. */
+	text[off + 4] ^= 1;
+	KUNIT_EXPECT_EQ(test, ave_fw_text_boot_crc(text, size, off, &a), 0);
+	KUNIT_EXPECT_NE(test, a, image);
+	KUNIT_EXPECT_EQ(test, ave_fw_text_boot_crc(text, size, size - 2, &a), -EINVAL);
+}
+
 static struct kunit_case ave_abi_cases[] = {
+	KUNIT_CASE(ave_t6041_text_boot_word),
 	KUNIT_CASE(ave_9003_byte_equality), KUNIT_CASE(ave_9003_hevc_main10),
 	KUNIT_CASE(ave_9003_speed),	    KUNIT_CASE(ave_cq_table),
 	KUNIT_CASE(ave_6070_images),
