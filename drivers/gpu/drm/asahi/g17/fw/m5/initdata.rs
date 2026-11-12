@@ -36,6 +36,11 @@ pub(crate) enum RootProfile {
     J873G18G26A428,
 
     J714G17S26A428,
+
+    /// The common interface of macOS 27.2 (26B123, RTKit 3514.41.1): the
+    /// [`Self::J873G18G26A428`] graph with a longer policy and status config
+    /// ([`COMMON26B123_LAYOUTS`]). The J813's G17G build runs it as the J873's G18G one does.
+    J873G18G26B123,
 }
 
 impl RootProfile {
@@ -44,13 +49,28 @@ impl RootProfile {
             Self::J700G17P => INITDATA_VERSION_WORD,
             Self::J813G17G25G76 => 0x0c8a_a322_039e_04c0,
             Self::J873G18G26A428 => COMMON26_INITDATA_VERSION_WORD,
+            Self::J873G18G26B123 => COMMON26B123_INITDATA_VERSION_WORD,
             Self::J714G17S26A428 => M5_INITDATA_VERSION_WORD,
+        }
+    }
+
+    /// Either common-interface build, 26A428 or 26B123.
+    pub(crate) const fn is_common26(self) -> bool {
+        matches!(self, Self::J873G18G26A428 | Self::J873G18G26B123)
+    }
+
+    /// The shared, private and per-object layouts of a common-interface build.
+    pub(crate) const fn common26_layouts(self) -> Option<&'static Common26Layouts> {
+        match self {
+            Self::J873G18G26A428 => Some(&COMMON26_LAYOUTS),
+            Self::J873G18G26B123 => Some(&COMMON26B123_LAYOUTS),
+            Self::J700G17P | Self::J813G17G25G76 | Self::J714G17S26A428 => None,
         }
     }
 
     pub(crate) const fn root_size(self, role: InstanceRole) -> usize {
         match self {
-            Self::J873G18G26A428 => COMMON26_ROOT_SIZE,
+            Self::J873G18G26A428 | Self::J873G18G26B123 => COMMON26_ROOT_SIZE,
             Self::J714G17S26A428 => M5_ROOT_SIZE,
             Self::J700G17P | Self::J813G17G25G76 => root_size(role),
         }
@@ -58,10 +78,10 @@ impl RootProfile {
 
     pub(crate) const fn control_opening_opcode(self, role: InstanceRole) -> u32 {
         match (self, role) {
-            (Self::J873G18G26A428, InstanceRole::Primary) => {
+            (Self::J873G18G26A428 | Self::J873G18G26B123, InstanceRole::Primary) => {
                 COMMON26_CONTROL_OPENING_OPCODE_PRIMARY
             }
-            (Self::J873G18G26A428, InstanceRole::Secondary) => {
+            (Self::J873G18G26A428 | Self::J873G18G26B123, InstanceRole::Secondary) => {
                 COMMON26_CONTROL_OPENING_OPCODE_SECONDARY
             }
             (Self::J714G17S26A428, InstanceRole::Primary) => M5_CONTROL_OPENING_OPCODE_PRIMARY,
@@ -75,7 +95,7 @@ impl RootProfile {
 
     pub(crate) const fn control_register_opcode(self) -> Option<u32> {
         match self {
-            Self::J873G18G26A428 | Self::J714G17S26A428 => None,
+            Self::J873G18G26A428 | Self::J873G18G26B123 | Self::J714G17S26A428 => None,
             Self::J700G17P | Self::J813G17G25G76 => Some(CONTROL_OPENING_PRIMARY_REGISTER_OPCODE),
         }
     }
@@ -83,6 +103,7 @@ impl RootProfile {
     pub(crate) const fn bundle_view_offsets(self) -> [usize; 5] {
         match self {
             Self::J873G18G26A428 => COMMON26_BUNDLE_VIEW_OFFSETS,
+            Self::J873G18G26B123 => COMMON26B123_BUNDLE_VIEW_OFFSETS,
             Self::J714G17S26A428 => M5_BUNDLE_VIEW_OFFSETS,
             Self::J700G17P | Self::J813G17G25G76 => BUNDLE_VIEW_OFFSETS,
         }
@@ -90,7 +111,8 @@ impl RootProfile {
 
     pub(crate) const fn bundle_view_extents(self) -> [usize; 5] {
         match self {
-            Self::J873G18G26A428 => COMMON26_BUNDLE_VIEW_EXTENTS,
+            // 26B123 grows only the policy and the status config; the five views keep their sizes.
+            Self::J873G18G26A428 | Self::J873G18G26B123 => COMMON26_BUNDLE_VIEW_EXTENTS,
             Self::J714G17S26A428 => M5_BUNDLE_VIEW_EXTENTS,
             Self::J700G17P | Self::J813G17G25G76 => BUNDLE_VIEW_EXTENTS,
         }
@@ -99,7 +121,7 @@ impl RootProfile {
     /// The GPU-visible aliases of the firmware's own tables the main config names.
     pub(crate) const fn region_view_low_addrs(self) -> [u64; 2] {
         match self {
-            Self::J873G18G26A428 => COMMON26_REGION_VIEW_LOW_ADDRS,
+            Self::J873G18G26A428 | Self::J873G18G26B123 => COMMON26_REGION_VIEW_LOW_ADDRS,
             Self::J714G17S26A428 | Self::J700G17P | Self::J813G17G25G76 => REGION_VIEW_LOW_ADDRS,
         }
     }
@@ -107,6 +129,7 @@ impl RootProfile {
     pub(crate) const fn repeated_region_bundle_offset(self) -> usize {
         match self {
             Self::J873G18G26A428 => COMMON26_SHARED_LAYOUT.block_88,
+            Self::J873G18G26B123 => COMMON26B123_SHARED_LAYOUT.block_88,
             Self::J714G17S26A428 => M5_SHARED_LAYOUT.block_88,
             Self::J700G17P | Self::J813G17G25G76 => MAIN_REPEATED_REGION_BUNDLE_OFFSET,
         }
@@ -115,6 +138,7 @@ impl RootProfile {
     pub(crate) const fn work_ring_bundle_offsets(self) -> [usize; WORK_CHANNEL_COUNT] {
         match self {
             Self::J873G18G26A428 => COMMON26_WORK_RING_BUNDLE_OFFSETS,
+            Self::J873G18G26B123 => COMMON26B123_WORK_RING_BUNDLE_OFFSETS,
             Self::J714G17S26A428 => M5_WORK_RING_BUNDLE_OFFSETS,
             Self::J700G17P | Self::J813G17G25G76 => WORK_RING_BUNDLE_OFFSETS,
         }
@@ -876,18 +900,17 @@ pub(crate) fn encode_main_config_for_profile(
                 RootProfile::J700G17P => MAIN_SECONDARY_KIND_VALUE,
                 RootProfile::J813G17G25G76 => 0xc,
 
-                RootProfile::J873G18G26A428 | RootProfile::J714G17S26A428 => {
-                    COMMON26_MAIN_SECONDARY_KIND
-                }
+                RootProfile::J873G18G26A428 | RootProfile::J873G18G26B123
+                | RootProfile::J714G17S26A428 => COMMON26_MAIN_SECONDARY_KIND,
             });
             if profile == RootProfile::J714G17S26A428 {
 
                 put_u64(out, COMMON26_MAIN_SECONDARY_POLICY_PTR,
                         bundle + M5_SHARED_LAYOUT.policy as u64);
-            } else if profile == RootProfile::J873G18G26A428 {
+            } else if let Some(layouts) = profile.common26_layouts() {
 
                 put_u64(out, COMMON26_MAIN_SECONDARY_POLICY_PTR,
-                        bundle + COMMON26_SHARED_LAYOUT.policy as u64);
+                        bundle + layouts.shared.policy as u64);
             } else {
 
                 let extra = bundle
@@ -909,7 +932,7 @@ pub(crate) fn encode_region_c_for_profile(
     if out.len() != REGION_C_SIZE {
         return Err(InitdataError::BufferSize);
     }
-    if profile == RootProfile::J873G18G26A428 {
+    if profile.is_common26() {
 
         return encode_common26_region_c(out);
     }
@@ -976,7 +999,7 @@ pub(crate) fn encode_secondary_root_extra_1_for_profile(
     out.fill(0);
     write_runs(out, SECONDARY_ROOT_EXTRA_1_RUNS);
 
-    if matches!(profile, RootProfile::J813G17G25G76 | RootProfile::J873G18G26A428) {
+    if profile == RootProfile::J813G17G25G76 || profile.is_common26() {
         put_u32(out, 0x10, 2);
     }
     Ok(())
@@ -1904,16 +1927,213 @@ const _: () = {
         <= COMMON26_STATUS_B_SPAN);
 };
 
+// --- The common interface of macOS 27.2 (26B123, RTKit 3514.41.1) -------------------------------
+//
+// Against 26A428, the same changes as the J873's G18G build of this release:
+//
+// - Both roles expect the InitData root version word with bit 45 set.
+// - The policy grows by 0x60 (0x7168 -> 0x71c8 for G17G; 0x7800 -> 0x7860 in the common table)
+//   and the status config by 8 (0x6d0 -> 0x6d8); the other 22 allocations keep their sizes.
+// - Policy and status-config fields move as the bands below describe. The new words carry a new
+//   accelerator power-controller field (accel +0x1122c), which the generic power and performance
+//   setup sets to 5000 and the G17G one leaves alone.
+// - Every other InitData object keeps its field offsets.
+
+/// FW_PROVEN 26B123: u16 {0x04c0, 0x83a0, 0x6339, 0x0c8b}.
+pub(crate) const COMMON26B123_INITDATA_VERSION_WORD: u64 = 0x0c8b_6339_83a0_04c0;
+
+/// The common 26A428 table with the 26B123 policy and status config.
+pub(crate) const ABI_ALLOCATION_SIZES_26B123: [usize; 24] = [
+    0x2848, 0x0c18, 0x1048, 0x0e10, 0x7860, 0x0068, 0x0800, 0x0088, 0x1800, 0x04c0, 0x4000, 0x0030,
+    0xe730, 0x06d8, 0x0020, 0x01b0, 0x4800, 0x28800, 0x79800, 0x9000, 0x0060, 0x0008, 0x0e80, 0x00e4,
+];
+
+/// Everything after the policy in the shared cluster moves by 0x80 (64-byte packing); the page
+/// total is unchanged.
+pub(crate) const COMMON26B123_SHARED_LAYOUT: SharedClusterLayout =
+    shared_cluster_layout(&ABI_ALLOCATION_SIZES_26B123);
+/// 0x6d8 packs to the 0x700 that 0x6d0 took: the private cluster is the 26A428 one.
+pub(crate) const COMMON26B123_PRIVATE_LAYOUT: PrivateClusterLayout =
+    private_cluster_layout(&ABI_ALLOCATION_SIZES_26B123);
+
+pub(crate) const COMMON26B123_BUNDLE_VIEW_OFFSETS: [usize; 5] = [
+    COMMON26B123_SHARED_LAYOUT.block_c18,
+    COMMON26B123_SHARED_LAYOUT.block_1048,
+    COMMON26B123_SHARED_LAYOUT.block_e10,
+    COMMON26B123_SHARED_LAYOUT.block_68,
+    COMMON26B123_SHARED_LAYOUT.block_800,
+];
+
+pub(crate) const COMMON26B123_WORK_RING_BUNDLE_OFFSETS: [usize; WORK_CHANNEL_COUNT] =
+    work_ring_offsets(&COMMON26B123_SHARED_LAYOUT);
+
+/// Policy 26A428 -> 26B123.
+///
+/// - +0x2f08 stays; the accelerator's power-controller words at +0x2f0c..+0x2f17 move by 0x10
+///   and the new field is the u32 at +0x2f28.
+/// - +0x2f18..+0x2fb3 holds nothing the host writes in either build.
+/// - From +0x2fb4 to the last 26A428 store (+0x6d98, u64) everything moves by 0x18, among them
+///   the policy state pointer, the AON PTD pointer and the boot timestamp. The host writes
+///   nothing past +0x6da0.
+const COMMON26B123_POLICY_BANDS: &[LayoutBand] = &[
+    band(0x0000, 0x2f0c, 0, Evidence::ProducerChecked),
+    band(0x2f0c, 0x2f18, 0x10, Evidence::ProducerChecked),
+    band(0x2fb4, 0x6da0, 0x18, Evidence::ProducerChecked),
+];
+const COMMON26B123_POLICY_NEW_WORDS: &[(usize, u32)] = &[(0x2f28, 5000)];
+
+/// Status config 26A428 -> 26B123: +0x59c..+0x5b3 move by 4 and +0x5b4 to the end by 8 (the
+/// link word and pointer among them). The new +0x59c stays zero (only the zeroing of
+/// +0x590..+0x59f covers it); +0x5b8 is the new accelerator field.
+const COMMON26B123_STATUS_CONFIG_BANDS: &[LayoutBand] = &[
+    band(0x000, 0x59c, 0, Evidence::ProducerChecked),
+    band(0x59c, 0x5b4, 4, Evidence::ProducerChecked),
+    band(0x5b4, 0x6d0, 8, Evidence::ProducerChecked),
+];
+const COMMON26B123_STATUS_CONFIG_NEW_WORDS: &[(usize, u32)] = &[(0x5b8, 5000)];
+
+/// How a later build moves the blocks the 26A428 encoders produce.
+pub(crate) struct Common26Relayout {
+    policy_bands: &'static [LayoutBand],
+    policy_new_words: &'static [(usize, u32)],
+    status_config_bands: &'static [LayoutBand],
+    status_config_new_words: &'static [(usize, u32)],
+}
+
+/// The layouts of one common-interface build.
+pub(crate) struct Common26Layouts {
+    pub(crate) shared: SharedClusterLayout,
+    pub(crate) private: PrivateClusterLayout,
+    pub(crate) policy_size: usize,
+    pub(crate) status_config_size: usize,
+    /// None for 26A428, which the encoders produce directly.
+    relayout: Option<Common26Relayout>,
+}
+
+pub(crate) const COMMON26_LAYOUTS: Common26Layouts = Common26Layouts {
+    shared: COMMON26_SHARED_LAYOUT,
+    private: COMMON26_PRIVATE_LAYOUT,
+    policy_size: COMMON26_POLICY_SIZE,
+    status_config_size: COMMON26_STATUS_CONFIG_SIZE,
+    relayout: None,
+};
+
+pub(crate) const COMMON26B123_LAYOUTS: Common26Layouts = Common26Layouts {
+    shared: COMMON26B123_SHARED_LAYOUT,
+    private: COMMON26B123_PRIVATE_LAYOUT,
+    policy_size: ABI_ALLOCATION_SIZES_26B123[ALLOC_POLICY],
+    status_config_size: ABI_ALLOCATION_SIZES_26B123[ALLOC_STATUS_CONFIG],
+    relayout: Some(Common26Relayout {
+        policy_bands: COMMON26B123_POLICY_BANDS,
+        policy_new_words: COMMON26B123_POLICY_NEW_WORDS,
+        status_config_bands: COMMON26B123_STATUS_CONFIG_BANDS,
+        status_config_new_words: COMMON26B123_STATUS_CONFIG_NEW_WORDS,
+    }),
+};
+
+/// The common 26B123 build (macOS 27.2; the J813).
+pub(crate) const COMMON26B123_GRAPH: Graph = Graph {
+    profile: RootProfile::J873G18G26B123,
+    private: COMMON26B123_PRIVATE_LAYOUT,
+    shared: COMMON26B123_SHARED_LAYOUT,
+    policy_size: COMMON26B123_LAYOUTS.policy_size,
+    bundle_view_offsets: COMMON26B123_BUNDLE_VIEW_OFFSETS,
+    bundle_view_extents: COMMON26_BUNDLE_VIEW_EXTENTS,
+    work_ring_offsets: COMMON26B123_WORK_RING_BUNDLE_OFFSETS,
+    state_grids: state_grids(&COMMON26B123_PRIVATE_LAYOUT),
+    power_assert_tally: COMMON26_GRAPH.power_assert_tally,
+};
+
+const _: () = {
+    let (old, new) = (COMMON26_SHARED_LAYOUT, COMMON26B123_SHARED_LAYOUT);
+    assert!(new.total == old.total && new.policy == old.policy);
+    assert!(new.block_68 == old.block_68 + 0x80 && new.main_config[0] == old.main_config[0] + 0x80);
+    assert!(COMMON26B123_PRIVATE_LAYOUT.total == COMMON26_PRIVATE_LAYOUT.total);
+    assert!(COMMON26B123_PRIVATE_LAYOUT.status_config == COMMON26_PRIVATE_LAYOUT.status_config);
+    assert!(COMMON26B123_PRIVATE_LAYOUT.roles[0].status_a == COMMON26_PRIVATE_LAYOUT.roles[0].status_a);
+    assert!(COMMON26B123_PRIVATE_LAYOUT.policy_state == COMMON26_PRIVATE_LAYOUT.policy_state);
+    assert!(COMMON26_STATUS_CONFIG_IN_STATUS_B + COMMON26B123_LAYOUTS.status_config_size
+        <= COMMON26_STATUS_B_SPAN);
+    assert!(bands_fit(COMMON26B123_POLICY_BANDS, COMMON26_POLICY_SIZE,
+                      COMMON26B123_LAYOUTS.policy_size));
+    assert!(bands_fit(COMMON26B123_STATUS_CONFIG_BANDS, COMMON26_STATUS_CONFIG_SIZE,
+                      COMMON26B123_LAYOUTS.status_config_size));
+};
+
+/// Whether `bands` are ascending, move no byte down, keep their order once moved and land
+/// inside `new_size`, so [`relayout_by_bands`] can move them in place.
+const fn bands_fit(bands: &[LayoutBand], old_size: usize, new_size: usize) -> bool {
+    let mut index = 0;
+    while index < bands.len() {
+        let band = bands[index];
+        if band.delta < 0 || band.start >= band.end || band.end > old_size
+            || band.end + band.delta as usize > new_size {
+            return false;
+        }
+        if index > 0 {
+            let previous = bands[index - 1];
+            if previous.end > band.start
+                || previous.end + previous.delta as usize > band.start + band.delta as usize {
+                return false;
+            }
+        }
+        index += 1;
+    }
+    true
+}
+
+/// Move a block encoded in the 26A428 layout (the first `old_size` bytes of `out`) to the layout
+/// `bands` describe, in place, and zero what the bands leave behind. A nonzero byte no band
+/// carries has no place in the new layout and is refused.
+fn relayout_by_bands(bands: &[LayoutBand], old_size: usize, out: &mut [u8])
+    -> Result<(), InitdataError> {
+    let old = out.get(..old_size).ok_or(InitdataError::BufferSize)?;
+    if old.iter().enumerate().any(|(offset, byte)| {
+        *byte != 0 && relocate_by_bands(bands, offset).is_none()
+    }) {
+        return Err(InitdataError::InterfaceMismatch);
+    }
+    for band in bands.iter().rev() {
+        let delta = band.delta as usize;
+        if delta == 0 {
+            continue;
+        }
+        let target = band.start + delta;
+        if target + (band.end - band.start) > out.len() {
+            return Err(InitdataError::BufferSize);
+        }
+        out.copy_within(band.start..band.end, target);
+        out[band.start..band.end.min(target)].fill(0);
+    }
+    Ok(())
+}
+
+/// Bring a block the 26A428 encoder produced to the build's layout and set the words the build
+/// added.
+fn relayout_common26(
+    bands: &[LayoutBand],
+    new_words: &[(usize, u32)],
+    old_size: usize,
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
+    relayout_by_bands(bands, old_size, out)?;
+    for &(offset, value) in new_words {
+        put_u32(out, offset, value);
+    }
+    Ok(())
+}
+
 impl Graph {
     pub(crate) fn is_common26(&self) -> bool {
-        self.profile == RootProfile::J873G18G26A428
+        self.profile.is_common26()
     }
 }
 
-/// Encode the common 26A428 primary status-B span: status B, status config and the gap to
-/// status A. The status config carries the board's 25G76 words relocated, the fields 26A428
-/// added and its new cross-link to status B.
+/// Encode the common primary status-B span: status B, status config and the gap to status A. The
+/// status config carries the board's 25G76 words relocated, the fields 26A428 added and its new
+/// cross-link to status B, moved to the layout of the build `layouts` describes.
 fn encode_common26_primary_status_b(
+    layouts: &Common26Layouts,
     fwctl_state: u64,
     fwctl_ring: u64,
     status_b: u64,
@@ -1926,15 +2146,24 @@ fn encode_common26_primary_status_b(
     required_address(fwctl_ring)?;
     required_address(status_b)?;
     let config = COMMON26_STATUS_CONFIG_IN_STATUS_B;
+    // Where the build keeps the status config's half of the cross-link.
+    let link_word = match &layouts.relayout {
+        Some(relayout) => relocate_by_bands(relayout.status_config_bands,
+                                            COMMON26_STATUS_CONFIG_LINK_WORD)
+            .ok_or(InitdataError::InterfaceMismatch)?,
+        None => COMMON26_STATUS_CONFIG_LINK_WORD,
+    };
     out.fill(0);
     encode_status_block(&mut out[..STATUS_BLOCK_SIZE])?;
     put_u64(out, COMMON26_STATUS_B_FWCTL_STATE, fwctl_state);
     put_u64(out, COMMON26_STATUS_B_FWCTL_RING, fwctl_ring);
     put_u32(out, COMMON26_STATUS_B_CONFIG_HEADER, 1);
     put_u32(out, COMMON26_STATUS_B_LINK_WORD, 0);
-    put_u64(out, COMMON26_STATUS_B_LINK_PTR,
-            status_b + (config + COMMON26_STATUS_CONFIG_LINK_WORD) as u64);
-    let status_config = &mut out[config..config + COMMON26_STATUS_CONFIG_SIZE];
+    put_u64(out, COMMON26_STATUS_B_LINK_PTR, status_b + (config + link_word) as u64);
+    // The 26A428 encoding fills the first COMMON26_STATUS_CONFIG_SIZE bytes; a later build's
+    // layout is made from it below.
+    let status_config = out.get_mut(config..config + layouts.status_config_size)
+        .ok_or(InitdataError::BufferSize)?;
     write_relocated_words(M5_25G76_STATUS_CONFIG_WORDS, 0, COMMON26_STATUS_CONFIG_BANDS,
                           status_config)?;
     for (offset, value) in COMMON26_STATUS_CONFIG_NEW_WORDS {
@@ -1964,18 +2193,24 @@ fn encode_common26_primary_status_b(
     put_u32(status_config, COMMON26_STATUS_CONFIG_LINK_WORD, 1);
     put_u64(status_config, COMMON26_STATUS_CONFIG_LINK_PTR,
             status_b + COMMON26_STATUS_B_LINK_WORD as u64);
+    if let Some(relayout) = &layouts.relayout {
+        relayout_common26(relayout.status_config_bands, relayout.status_config_new_words,
+                          COMMON26_STATUS_CONFIG_SIZE, status_config)?;
+    }
     Ok(())
 }
 
-/// Encode the common 26A428 private cluster mapped at `private_base`: the status-B span, both
-/// status A blocks, the secondary root's 0x60 object and one opening-producer entry per control
-/// channel.
+/// Encode the private cluster of the common build `profile` mapped at `private_base`: the
+/// status-B span, both status A blocks, the secondary root's 0x60 object and one opening-producer
+/// entry per control channel.
 pub(crate) fn encode_common26_private_cluster(
+    profile: RootProfile,
     private_base: u64,
     fwctl_state: u64,
     out: &mut [u8],
 ) -> Result<(), InitdataError> {
-    let layout = COMMON26_PRIVATE_LAYOUT;
+    let layouts = profile.common26_layouts().ok_or(InitdataError::InterfaceMismatch)?;
+    let layout = layouts.private;
     if out.len() != layout.total {
         return Err(InitdataError::BufferSize);
     }
@@ -1995,13 +2230,14 @@ pub(crate) fn encode_common26_private_cluster(
     out.fill(0);
     let status_b = layout.status_b;
     let status_a = layout.roles[0].status_a;
-    encode_common26_primary_status_b(fwctl_state, fwctl_ring, private_base + status_b as u64,
+    encode_common26_primary_status_b(layouts, fwctl_state, fwctl_ring,
+                                     private_base + status_b as u64,
                                      &mut out[status_b..status_a])?;
     for role in layout.roles {
         encode_status_block(&mut out[role.status_a..role.status_a + STATUS_BLOCK_SIZE])?;
     }
     let extra = layout.secondary_extra_1;
-    encode_secondary_root_extra_1_for_profile(RootProfile::J873G18G26A428,
+    encode_secondary_root_extra_1_for_profile(profile,
         &mut out[extra..extra + STATUS_BLOCK_SIZE])?;
     put_u32(out, layout.control_state + CHANNEL_STATE_PRODUCER * CHANNEL_STATE_SPACING,
             CONTROL_OPENING_PRIMARY_PRODUCER);
@@ -2010,15 +2246,18 @@ pub(crate) fn encode_common26_private_cluster(
     Ok(())
 }
 
-/// Encode the six common 26A428 blocks after the HW data (0xc18, 0x1048, 0xe10, perf/policy,
-/// 0x68, 0x800): the board's 25G76 policy words relocated, the fields 26A428 added and the owned
-/// pointers. Preserves the HW data and everything from the BRN table on.
+/// Encode the six common blocks after the HW data (0xc18, 0x1048, 0xe10, perf/policy, 0x68,
+/// 0x800): the board's 25G76 policy words relocated, the fields 26A428 added and the owned
+/// pointers, in the layout of the board's build. Preserves the HW data and everything from the
+/// BRN table on.
 pub(crate) fn encode_common26_bundle_policy(
     board: &Board,
     bindings: M5PolicyBindings,
     out: &mut [u8],
 ) -> Result<(), InitdataError> {
-    let layout = COMMON26_SHARED_LAYOUT;
+    let layouts = board.graph.profile.common26_layouts()
+        .ok_or(InitdataError::InterfaceMismatch)?;
+    let layout = layouts.shared;
     if out.len() < layout.brn_table {
         return Err(InitdataError::BufferSize);
     }
@@ -2043,7 +2282,10 @@ pub(crate) fn encode_common26_bundle_policy(
             return Err(InitdataError::BufferSize);
         }
     }
-    let policy = &mut out[layout.policy..layout.policy + COMMON26_POLICY_SIZE];
+    // The 26A428 encoding fills the first COMMON26_POLICY_SIZE bytes; a later build's layout is
+    // made from it below.
+    let policy = out.get_mut(layout.policy..layout.policy + layouts.policy_size)
+        .ok_or(InitdataError::BufferSize)?;
     for &(offset, value) in M5_25G76_POLICY_WORDS {
         if (m5.policy..m5_policy_end).contains(&offset) {
             write_relocated_words(&[(offset, value)], m5.policy, COMMON26_POLICY_BANDS, policy)?;
@@ -2067,6 +2309,10 @@ pub(crate) fn encode_common26_bundle_policy(
     put_u64(policy, COMMON26_POLICY_STATE_PTR, bindings.state);
     put_u64(policy, COMMON26_POLICY_AON_PTD_PTR, bindings.aon_ptd);
     put_u64(policy, COMMON26_POLICY_BOOT_TIMESTAMP, bindings.boot_timestamp);
+    if let Some(relayout) = &layouts.relayout {
+        relayout_common26(relayout.policy_bands, relayout.policy_new_words, COMMON26_POLICY_SIZE,
+                          policy)?;
+    }
     Ok(())
 }
 
@@ -2309,6 +2555,12 @@ pub(crate) const J813: Board = Board {
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
     completion_inputs: false,
+};
+
+/// The J813 on its macOS 27.2 (26B123) firmware: the same board on the common 26B123 graph.
+pub(crate) const J813_26B123: Board = Board {
+    graph: &COMMON26B123_GRAPH,
+    ..J813
 };
 
 const _: () = {
