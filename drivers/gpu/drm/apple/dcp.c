@@ -5987,7 +5987,7 @@ static void dcp_ext_give_up(struct apple_dcp *dcp, int err, const char *when);
 
 /*
  * The external processors whose failure must not take the DRM device down:
- * T8122's, T6041's and T6050's dcpext. One that fails to probe or bind joins
+ * T8122's, T6041's, T6050's and T8142's dcpext. One that fails to probe or bind joins
  * as an unusable pipe (ext_dead), and the other displays go on without it.
  * With every processor failed the DRM device has no pipe and does not bind.
  */
@@ -5995,7 +5995,8 @@ static bool dcp_ext_is_failsafe(struct device_node *np)
 {
 	return of_device_is_compatible(np, "apple,t8122-dcpext") ||
 	       of_device_is_compatible(np, "apple,t6041-dcpext") ||
-	       of_device_is_compatible(np, "apple,t6050-dcpext");
+	       of_device_is_compatible(np, "apple,t6050-dcpext") ||
+	       of_device_is_compatible(np, "apple,t8142-dcpext");
 }
 
 /*
@@ -8878,7 +8879,20 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6050_dcpext = {
 	.sink_metadata_edid = true,
 };
 
+/*
+ * T8142's external processors (dcpext0/1: the Airs' two USB-C ports, the
+ * J704's HDMI) run the internal DCP's firmware 27 image and are left running
+ * idle by iBoot, like T6050's. One DPTX port each, behind an ATC PHY.
+ */
+static const struct apple_dcp_hw_data apple_dcp_hw_t8142_dcpext = {
+	.num_dptx_ports = 1,
+	.adopt_live_session = true,
+	.firmware_compat = DCP_FIRMWARE_V_27_0,
+	.sink_metadata_edid = true,
+};
+
 static const struct of_device_id of_match[] = {
+	{ .compatible = "apple,t8142-dcpext", .data = &apple_dcp_hw_t8142_dcpext },
 	{ .compatible = "apple,t6041-dcp", .data = &apple_dcp_hw_t6041, },
 	{ .compatible = "apple,t6041-dcpext", .data = &apple_dcp_hw_t6041_dcpext, },
 	{ .compatible = "apple,t6050-dcp", .data = &apple_dcp_hw_t6050 },
