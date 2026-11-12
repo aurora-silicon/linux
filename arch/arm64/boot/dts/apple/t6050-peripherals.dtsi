@@ -2438,6 +2438,7 @@
 		compatible = "apple,t6050-dart", "apple,t8110-dart";
 		reg = <0x2 0x889a0000 0x0 0xc000>;
 		interrupts = <AIC_IRQ 0 498 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_debug_gated>;
 		#iommu-cells = <1>;
 		status = "disabled";
 	};
@@ -2487,6 +2488,7 @@
 		compatible = "apple,t6050-dart", "apple,t8110-dart";
 		reg = <0x3 0x95d60000 0x0 0xc000>;
 		interrupts = <AIC_IRQ 0 2343 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_auss>;
 		#iommu-cells = <1>;
 		status = "disabled";
 	};
