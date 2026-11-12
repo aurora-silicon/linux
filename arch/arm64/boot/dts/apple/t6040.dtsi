@@ -251,7 +251,7 @@
 		#size-cells = <1>;
 	};
 
-	t6040_sleep: sleep-controller {
+	t6040_sleep: sleep-controller@502888000 {
 		compatible = "apple,t6040-sleep";
 		/*
 		 * The SoC blocks the commit and wake
