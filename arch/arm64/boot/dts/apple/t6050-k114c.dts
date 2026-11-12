@@ -4,7 +4,8 @@
  *
  * target-type: K114c (Mac17,11)
  *
- * Preliminary: described from the ADT only, not yet booted on the hardware.
+ * Boots on the hardware; the SD card reader (PCIe port 1) is tested. The other
+ * blocks are described from the ADT.
  *
  * Copyright The Asahi Linux Contributors
  */
