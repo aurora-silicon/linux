@@ -153,7 +153,10 @@ int apple_t6040_atcphy_sleep_power_up(struct phy *usb2_phy);
 /* For -ENODEV: tries the reset's release again. APPLE_ATCPHY_SLEEP_RESET, or -ENODEV. */
 int apple_t6040_atcphy_sleep_recover(struct phy *usb2_phy);
 
-/* Ends what the prepare took on. Without @kept, a failure of the PHY's own stops later ones. */
+/*
+ * Ends what the prepare took on. Without @kept, a failure of the PHY's own makes the host
+ * stop for sleeps until it has started again.
+ */
 void apple_t6040_atcphy_sleep_finish(struct phy *usb2_phy, bool kept);
 #else
 static inline int apple_t6040_atcphy_sleep_prepare(struct phy *usb2_phy)

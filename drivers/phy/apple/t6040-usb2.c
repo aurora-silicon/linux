@@ -337,7 +337,7 @@ struct t6040_usb2_phy {
 	bool sleep_waking;	/* in that wake: no power cycle of the PHY's domains */
 	bool sleep_back;	/* the system resumes and that wake is still to run */
 	wait_queue_head_t sleep_wq;	/* DP's power-on waits here for sleep_back to end */
-	bool sleep_no_keep;	/* a wake of its own failed: the host stops for later sleeps */
+	bool sleep_no_keep;	/* keeping the host failed: it stops for the next sleep */
 	int sleep_ret;		/* what the wake has come to, for the controller's glue */
 };
 
@@ -501,6 +501,11 @@ static int t6040_usb2_power_on(struct phy *phy)
 	if (ret)
 		return ret;
 	tphy->powered = true;
+	/*
+	 * The controller's reset released and USB2 came up, which is all that
+	 * keeping a host through a sleep needs to work again at its wake.
+	 */
+	tphy->sleep_no_keep = false;
 	return 0;
 }
 
@@ -2844,8 +2849,6 @@ static int t6040_debugfs_init(struct t6040_usb2_phy *tphy)
 	}
 	debugfs_create_atomic_t("drop_next_power_down_ack", 0600, tphy->debugfs,
 				&tphy->drop_next_power_down_ack);
-	/* Set by a wake that failed with the host kept; clear it to let the port try again. */
-	debugfs_create_bool("sleep_no_keep", 0600, tphy->debugfs, &tphy->sleep_no_keep);
 	ret = devm_add_action_or_reset(tphy->dev, t6040_debugfs_remove, tphy->debugfs);
 	if (ret)
 		tphy->debugfs = NULL;
@@ -3441,6 +3444,18 @@ int apple_t6040_atcphy_sleep_recover(struct phy *usb2_phy)
 }
 EXPORT_SYMBOL_GPL(apple_t6040_atcphy_sleep_recover);
 
+/*
+ * Whether a sleep ended with keeping the host having failed: the host was
+ * lost, and what the wake came to is an error of the PHY's own, which is the
+ * controller's reset that didn't release or USB2 that didn't come back. USB3
+ * never costs the host. A sleep refused for a USB change doesn't count, nor
+ * a host that was restarted for another reason.
+ */
+static bool t6040_sleep_keep_failed(bool kept, int sleep_ret)
+{
+	return !kept && sleep_ret < 0 && sleep_ret != -EBUSY;
+}
+
 void apple_t6040_atcphy_sleep_finish(struct phy *usb2_phy, bool kept)
 {
 	struct t6040_usb2_phy *tphy = t6040_from_usb2_phy(usb2_phy);
@@ -3452,11 +3467,14 @@ void apple_t6040_atcphy_sleep_finish(struct phy *usb2_phy, bool kept)
 	t6040_sleep_back_done(tphy);
 	if (!tphy->sleep_armed)
 		return;
-	/* A sleep refused for a USB change doesn't count, nor a restart for another reason. */
-	if (!kept && tphy->sleep_ret < 0 && tphy->sleep_ret != -EBUSY) {
+	/*
+	 * The host has been restarted by now. It stops for the next sleep, and
+	 * the start after that one lets it be kept again.
+	 */
+	if (t6040_sleep_keep_failed(kept, tphy->sleep_ret)) {
 		tphy->sleep_no_keep = true;
 		dev_warn(tphy->dev,
-			 "PHY did not come back from a sleep with the host kept (%d): the host stops for sleeps from now on (debugfs sleep_no_keep)\n",
+			 "PHY did not come back from a sleep with the host kept (%d): the host stops for the next sleep\n",
 			 tphy->sleep_ret);
 	}
 	tphy->sleep_armed = false;

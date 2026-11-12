@@ -169,6 +169,22 @@ static void t6040_sleep_failed_test(struct kunit *test)
 }
 
 /*
+ * Only the controller's reset and USB2 can fail the keeping of a host, and
+ * only when the host was lost: not a sleep refused for a USB change, not what
+ * a wake that released the reset reports, and no host that was kept.
+ */
+static void t6040_sleep_keep_failed_test(struct kunit *test)
+{
+	KUNIT_EXPECT_TRUE(test, t6040_sleep_keep_failed(false, -ENODEV));
+	KUNIT_EXPECT_TRUE(test, t6040_sleep_keep_failed(false, -EIO));
+	KUNIT_EXPECT_FALSE(test, t6040_sleep_keep_failed(false, -EBUSY));
+	KUNIT_EXPECT_FALSE(test, t6040_sleep_keep_failed(false, 0));
+	KUNIT_EXPECT_FALSE(test, t6040_sleep_keep_failed(false, APPLE_ATCPHY_SLEEP_RESET));
+	KUNIT_EXPECT_FALSE(test, t6040_sleep_keep_failed(true, -ENODEV));
+	KUNIT_EXPECT_FALSE(test, t6040_sleep_keep_failed(true, APPLE_ATCPHY_SLEEP_RESET));
+}
+
+/*
  * The wake starts USB3 if it ran before the sleep. Not while the coprocessor
  * waits for a power cycle after a stop it didn't acknowledge, until a sleep
  * that powered the SoC down has been that power cycle.
@@ -191,6 +207,7 @@ static struct kunit_case t6040_sleep_test_cases[] = {
 	KUNIT_CASE(t6040_sleep_no_host_test),
 	KUNIT_CASE(t6040_sleep_other_modes_test),
 	KUNIT_CASE(t6040_sleep_failed_test),
+	KUNIT_CASE(t6040_sleep_keep_failed_test),
 	KUNIT_CASE(t6040_sleep_wake_usb3_test),
 	{}
 };
