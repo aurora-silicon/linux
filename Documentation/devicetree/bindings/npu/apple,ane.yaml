@@ -469,14 +469,15 @@ allOf:
   - if:
       properties:
         compatible:
-          contains:
-            enum:
-              - apple,t8140-ane
-              - apple,t6041-ane
-              - apple,t6050-ane
-              - apple,t8132-ane
-              - apple,t6001-ane
-    else:
+          not:
+            contains:
+              enum:
+                - apple,t8140-ane
+                - apple,t6041-ane
+                - apple,t6050-ane
+                - apple,t8132-ane
+                - apple,t6001-ane
+    then:
       properties:
         power-domains:
           minItems: 5
@@ -498,11 +499,12 @@ allOf:
   - if:
       properties:
         compatible:
-          contains:
-            enum:
-              - apple,t6001-ane
-              - apple,t6050-ane
-    else:
+          not:
+            contains:
+              enum:
+                - apple,t6001-ane
+                - apple,t6050-ane
+    then:
       properties:
         clocks: false
 
