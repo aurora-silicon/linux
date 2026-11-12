@@ -12,6 +12,7 @@
 /* Defined before the includes: t6050-max.dtsi guards the ATC2 router on it. */
 #define T6050_K114C
 #include "t6050-k114-k116.dtsi"
+#include <dt-bindings/pinctrl/apple.h>
 
 / {
 	compatible = "apple,k114c", "apple,t6050", "apple,arm-platform";
@@ -580,4 +581,41 @@
 	power-domains = <&ps_atc2_cio>, <&ps_atc2_cio_pcie>,
 			<&ps_atc2_cio_usb>, <&ps_atc2_cio_auss>, <&ps_atc2_pcie>;
 	apple,pcie-tunnel = <&acio2_pcie_tunnel>;
+};
+
+/*
+ * The touchscreen (kiwi). It sequences its own power: power method 2 with
+ * its own reset line (nub GPIO 25, active low) and supply enable (nub GPIO
+ * 26), not the shared multi-touch AFE reset. The GPIO numbers, pin values
+ * and polarities are those of a device tree that gave touch on this machine.
+ */
+&ps_nub_gpio {
+	status = "okay";
+};
+
+&nub_gpio0 {
+	status = "okay";
+
+	kiwi_clk24_pins: kiwi-clk24-pins {
+		pinmux = <APPLE_PINMUX(22, 1)>;
+	};
+};
+
+&pinctrl_ap {
+	kiwi_dsync_pins: kiwi-dsync-pins {
+		pinmux = <APPLE_PINMUX(11, 1)>;
+	};
+};
+
+&mtp_hid {
+	pinctrl-0 = <&kiwi_clk24_pins>, <&kiwi_dsync_pins>;
+	pinctrl-names = "default";
+};
+
+&kiwi {
+	firmware-name = "apple/tpkiwifw-k114c.bin";
+	apple,power-method = <2>;
+	apple,reset-gpios = <&nub_gpio0 25 GPIO_ACTIVE_LOW>;
+	apple,power-gpios = <&nub_gpio0 26 GPIO_ACTIVE_HIGH>;
+	status = "okay";
 };
