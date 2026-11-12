@@ -219,18 +219,19 @@ static void spin_table_pen_clean(void *start, size_t size)
  */
 int spin_table_hibernate_pen_begin(phys_addr_t image_ttbr1, int primary)
 {
+	phys_addr_t here = __pa_symbol(swapper_pg_dir);
 	int cpu;
 
 	/* No record of an earlier, abandoned resume may reach the restored kernel. */
 	spin_table_pen.magic = 0;
 	spin_table_pen_clean(&spin_table_pen, sizeof(spin_table_pen.magic));
 
-	if (image_ttbr1 != __pa_symbol(swapper_pg_dir)) {
+	if (image_ttbr1 != here) {
 		for_each_online_cpu(cpu) {
 			if (cpu == primary || get_cpu_ops(cpu) != &smp_rvbar_spin_table_ops)
 				continue;
 			pr_err("hibernation: the image's kernel ran at another physical address (swapper_pg_dir %pa, here %pa): spin-table CPUs cannot wait in this kernel's pen, resume refused\n",
-			       &image_ttbr1, &(phys_addr_t){ __pa_symbol(swapper_pg_dir) });
+			       &image_ttbr1, &here);
 			return -EINVAL;
 		}
 		return 0;
