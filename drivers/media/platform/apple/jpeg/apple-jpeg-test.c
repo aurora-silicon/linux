@@ -162,6 +162,7 @@ static void apple_jpeg_layout_test(struct kunit *test)
 
 	KUNIT_EXPECT_PTR_EQ(test, apple_jpeg_t8112.layout, wide);
 	KUNIT_EXPECT_PTR_EQ(test, apple_jpeg_t6041.layout, wide);
+	KUNIT_EXPECT_PTR_EQ(test, apple_jpeg_t8122.layout, wide);
 	KUNIT_EXPECT_PTR_NE(test, legacy, wide);
 	KUNIT_EXPECT_TRUE(test, wide->reset_complete);
 	KUNIT_EXPECT_TRUE(test, legacy->reset_complete);
@@ -210,6 +211,7 @@ static void apple_jpeg_layout_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, legacy->decode_block_base, 0x130);
 	KUNIT_EXPECT_EQ(test, apple_jpeg_t8140.int_done_mask, BIT(31));
 	KUNIT_EXPECT_EQ(test, apple_jpeg_t8112.int_done_mask, BIT(31) | BIT(30));
+	KUNIT_EXPECT_EQ(test, apple_jpeg_t8122.int_done_mask, BIT(31) | BIT(30));
 	KUNIT_EXPECT_EQ(test, apple_jpeg_t6000.int_done_mask, BIT(31));
 }
 
@@ -218,8 +220,9 @@ static void apple_jpeg_older_hwrev_test(struct kunit *test)
 	const struct apple_jpeg_variant *variants[] = {
 		&apple_jpeg_t6000, &apple_jpeg_t6041,
 		&apple_jpeg_t8112, &apple_jpeg_t8140,
+		&apple_jpeg_t8122,
 	};
-	const u32 raw[] = { 0x0d1013, 0x101008, 0x0e0008, 0x110000 };
+	const u32 raw[] = { 0x0d1013, 0x101008, 0x0e0008, 0x110000, 0x0f0008 };
 
 	for (unsigned int i = 0; i < ARRAY_SIZE(variants); i++) {
 		KUNIT_EXPECT_EQ(test, variants[i]->hwrev_mask, 0xffff0fff);

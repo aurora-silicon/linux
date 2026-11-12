@@ -159,6 +159,7 @@ extern unsigned int pm_suspend_global_flags;
 #define PM_SUSPEND_FLAG_FW_SUSPEND	BIT(0)
 #define PM_SUSPEND_FLAG_FW_RESUME	BIT(1)
 #define PM_SUSPEND_FLAG_NO_PLATFORM	BIT(2)
+#define PM_SUSPEND_FLAG_DARK_WAKE	BIT(3)
 
 static inline void pm_suspend_clear_flags(void)
 {
@@ -178,6 +179,11 @@ static inline void pm_set_resume_via_firmware(void)
 static inline void pm_set_suspend_no_platform(void)
 {
 	pm_suspend_global_flags |= PM_SUSPEND_FLAG_NO_PLATFORM;
+}
+
+static inline void pm_set_dark_wake(void)
+{
+	pm_suspend_global_flags |= PM_SUSPEND_FLAG_DARK_WAKE;
 }
 
 /**
@@ -237,6 +243,27 @@ static inline bool pm_suspend_no_platform(void)
 	return !!(pm_suspend_global_flags & PM_SUSPEND_FLAG_NO_PLATFORM);
 }
 
+/**
+ * pm_dark_wake - Check if the system woke up for nothing user space has to see.
+ *
+ * To be called during system-wide power management transitions from sleep
+ * states.
+ *
+ * Return 'true' if the platform found that the event that woke up the system
+ * needs nothing from user space (for example, a laptop lid closing while the
+ * system slept). Every device then resumes as usual, and the system goes back
+ * to the same sleep state with user space still frozen. A device should not do
+ * what the user would notice, such as lighting a display, during such a wake.
+ *
+ * Only a wake from the sleep state can be dark. A device that had to leave out
+ * part of its resume finishes it in a later resume that is not dark, or in
+ * ->complete() if the next suspend fails before suspending it.
+ */
+static inline bool pm_dark_wake(void)
+{
+	return !!(pm_suspend_global_flags & PM_SUSPEND_FLAG_DARK_WAKE);
+}
+
 /* Suspend-to-idle state machnine. */
 enum s2idle_states {
 	S2IDLE_STATE_NONE,      /* Not suspended/suspending. */
@@ -287,6 +314,8 @@ static inline void pm_set_resume_via_firmware(void) {}
 static inline bool pm_suspend_via_firmware(void) { return false; }
 static inline bool pm_resume_via_firmware(void) { return false; }
 static inline bool pm_suspend_no_platform(void) { return false; }
+static inline void pm_set_dark_wake(void) {}
+static inline bool pm_dark_wake(void) { return false; }
 static inline bool pm_suspend_default_s2idle(void) { return false; }
 
 static inline void suspend_set_ops(const struct platform_suspend_ops *ops) {}

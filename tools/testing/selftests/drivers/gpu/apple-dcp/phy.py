@@ -4,7 +4,7 @@
 from pathlib import Path
 import re
 from common import (block, source_defines, atc_mux_without_pm, ATC_POST_TUNABLE,
-                    atc_function, ATC_SPLIT, ATC_T8103_LIVE, atc_restore_helpers,
+                    atc_function, ATC_SPLIT, ATC_T8103_LIVE, atc_restore_helpers, atc_common_state_helpers,
                     atc_cio_helpers)
 
 def parking(root):
@@ -36,6 +36,8 @@ struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
     bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables;
     struct { void *usb3_dp; } tunables;
+    /* A sleep took the USB host's domains down; never set here. */
+    bool sleep_dead;
 
     const struct atcphy_hw *hw;
     struct { unsigned char *core, *lpdptx, *pipehandler, *usb2phy; } regs;
@@ -181,6 +183,7 @@ static int __attribute__((unused)) atcphy_configure_pipehandler_usb3_host_t8132(
         parts.append(function(atc, name))
     parts.append(dp)
     parts.append(atc_restore_helpers(atc))
+    parts.append(atc_common_state_helpers(atc))
     for name in ('atcphy_configure_lanes', 'j700_aux_enable', 'j700_aux_disable',
                  'atcphy_enable_dp_aux', 'atcphy_disable_dp_aux', 'atcphy_power_off',
                  'atcphy_power_on', *ATC_POST_TUNABLE, 'atcphy_configure', 'atcphy_set_orientation',

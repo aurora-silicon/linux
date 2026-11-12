@@ -17,7 +17,10 @@
 #define PIODMA_IRQ_COMPLETE	APPLE_PIODMA_IRQ_COMPLETION
 #define PIODMA_IRQ_LIMIT		16
 
-/* Only RELEASE before publication can end guard ownership. No reset event. */
+/*
+ * Only RELEASE before publication can end guard ownership, or POWER_LOST: the
+ * engine's whole register file reading as reset after the SoC powered it off.
+ */
 enum apple_piodma_state {
 	PIODMA_IDLE,
 	PIODMA_GUARDED,
@@ -39,6 +42,7 @@ enum apple_piodma_event {
 	PIODMA_COMPLETE,
 	PIODMA_ADMIT,
 	PIODMA_FAIL,
+	PIODMA_POWER_LOST,
 	PIODMA_EVENT_COUNT,
 };
 
@@ -106,6 +110,10 @@ static inline int apple_piodma_next(enum apple_piodma_state state,
 			return PIODMA_FAILED;
 		if (state == PIODMA_RETAINED)
 			return PIODMA_FAILED_RETAINED;
+		break;
+	case PIODMA_POWER_LOST:
+		if (state == PIODMA_ADMITTED)
+			return PIODMA_GUARDED;
 		break;
 	default:
 		break;

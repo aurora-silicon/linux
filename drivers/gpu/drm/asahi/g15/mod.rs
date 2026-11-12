@@ -178,6 +178,10 @@ impl platform::Driver for Driver<'_> {
     type Data<'bound> = Driver<'bound>;
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 
+    fn pm_ops() -> Option<&'static kernel::bindings::dev_pm_ops> {
+        crate::driver::sleep_refuse_ops()
+    }
+
     fn unbind<'bound>(_pdev: &'bound platform::Device<Core<'_>>, this: Pin<&Self::Data<'bound>>) {
         if let Some(driver) = &this._driver {
             driver.close_binding();

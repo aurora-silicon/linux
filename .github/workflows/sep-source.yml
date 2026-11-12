@@ -7,8 +7,15 @@ on:
       - 'rust/**'
       - 'tools/aurora-bindgen/**'
       - 'drivers/soc/apple/**'
+      - 'drivers/pmdomain/apple/pmp-report.c'
       - 'include/uapi/linux/apple-sep.h'
       - 'tools/aurora-sep/**'
+      - 'Kconfig'
+      - '**/Kconfig*'
+      - 'arch/arm64/configs/defconfig'
+      - 'drivers/usb/dwc3/**'
+      - 'include/linux/phy/apple-atc.h'
+      - 'scripts/ci/apple-dwc3-atc-compile.sh'
       - '.github/workflows/sep-source.yml'
 
 jobs:
@@ -116,3 +123,38 @@ jobs:
             --make_options LLVM=1 \
             --kunitconfig=drivers/soc/apple/sep.kunitconfig \
             --jobs="$(nproc)" --timeout=900 'apple_sep*'
+
+  dwc3-atc-compile:
+    name: DWC3/ATC ${{ matrix.profile }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        profile: [builtin-no-atc, modular-no-atc, builtin-modular-atc]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Install arm64 C build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q clang-18 lld-18 llvm-18 libelf-dev libssl-dev \
+            flex bison bc pkg-config make perl
+          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+      - name: Compile the Apple DWC3 object with the resolved PHY profile
+        env:
+          PROFILE: ${{ matrix.profile }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: scripts/ci/apple-dwc3-atc-compile.sh "$PROFILE"
+      - name: Keep configuration and compiler receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dwc3-atc-${{ matrix.profile }}
+          path: ${{ runner.temp }}/dwc3-atc-${{ matrix.profile }}/artifacts/
+          retention-days: 14

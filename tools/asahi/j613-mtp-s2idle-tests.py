@@ -32,6 +32,11 @@ static int pm_runtime_force_suspend(struct device *d){forced_suspend++;return 7;
 static int pm_runtime_force_resume(struct device *d){forced_resume++;return 8;}
 static bool of_machine_is_compatible(const char *s){return true;}
 static unsigned readl(void *p){return *(unsigned *)p;}
+/* #1445: only a firmware-driven (T8140 S2R) sleep takes the noirq or AP-idle paths. */
+static bool pm_suspend_via_firmware(void){return false;}
+static int apple_rtkit_helper_ap_idle(struct apple_rtkit_helper *h){assert(!"firmware-driven path in s2idle");return 0;}
+/* Its AP-on notice is a no-op without an earlier idle notice. */
+static void apple_rtkit_helper_ap_on(struct apple_rtkit_helper *h){assert(h);}
 '''
 body=fn(s,'apple_dart_system_suspend')+fn(s,'apple_dart_system_resume')+fn(h,'apple_rtkit_helper_suspend')+fn(h,'apple_rtkit_helper_resume')
 for forbidden in ['writel','hw_reset','invalidate_tlb','apple_rtkit_wake','apple_rtkit_boot','apple_rtkit_quiesce']:

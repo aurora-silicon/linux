@@ -93,6 +93,12 @@ struct mt7932 {
 	bool dma_owned, module_pinned;
 	struct completion reset_retry;
 	int removal_error;
+	/* The firmware keeps running across a deep sleep with its host interface stopped. */
+	struct completion hif_done;
+	int hif_result;
+	u32 hif_glo;
+	/* hif_suspended stops new work; hif_gate then closes the BAR to all but the control. */
+	bool hif_waiting, hif_suspending, hif_suspended, hif_gate;
 	bool ram_config;
 	bool runtime_epoch;
 	bool runtime_cal_valid;
@@ -158,6 +164,14 @@ struct mt7932 {
 	/* Desired/submitted PS configuration uses command_mutex; TIM uses response_lock. */
 	u8 power_mode, power_applied;
 	bool power_applied_valid, power_tim;
+	/* WoWLAN detectors cfg80211 asked for at this sleep; 0 leaves the network. */
+	u8 wow_detect;
+	/* The firmware was given WoW at the sleep; command_mutex. */
+	bool wow_armed;
+	/* A wake reason is awaited, and the one received; response_lock. */
+	bool wow_report;
+	u8 wow_reason;
+	struct work_struct wow_work;
 	struct completion assoc_start, assoc_done, disconnect_done;
 	struct completion discovery_done;
 	struct completion scan_done;
@@ -347,5 +361,15 @@ int mt_set_power_mgmt(struct wiphy *wiphy, struct net_device *netdev,
 		      bool enabled, int timeout);
 void mt_power_work(struct work_struct *work);
 int mt_power_init(struct mt7932 *m);
+int mt_power_submit(struct mt7932 *m, u8 mode);
+#ifdef CONFIG_PM
+extern const struct wiphy_wowlan_support mt_wowlan_support;
+int mt_wow_suspend(struct wiphy *wiphy, struct cfg80211_wowlan *wow);
+int mt_wow_resume(struct wiphy *wiphy);
+#endif
+void mt_wow_arm(struct mt7932 *m);
+int mt_wow_disarm(struct mt7932 *m);
+void mt_wow_reason_event(struct mt7932 *m, const struct mt7932_event *event);
+void mt_wow_work(struct work_struct *work);
 
 #endif

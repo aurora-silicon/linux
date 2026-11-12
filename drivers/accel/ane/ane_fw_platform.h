@@ -67,6 +67,12 @@ struct ane_fw_platform {
 	 */
 	bool exclave_mode_stop;
 	/*
+	 * The sleep macOS was recorded doing on this SoC: the engine stays off with
+	 * no firmware until its first request, and powers down in macOS's word
+	 * order. Other SoCs keep the staged backend's boot-time start.
+	 */
+	bool macos_sleep;
+	/*
 	 * System sleep keeps the firmware (EXCLAVE_MODE_STOP, SUSPEND, warm
 	 * boot); otherwise the engine is cycled cold and the programs replayed.
 	 */
@@ -82,6 +88,17 @@ struct ane_fw_platform {
 	 * once that PMP runs (see ane_h16_wait_pmp()).
 	 */
 	const char *pmp_report;
+	/*
+	 * Staged (H17) backend: the power state words in the "pmgr" window
+	 * (ANE_SYS, which genpd owns, then the CPU and the sub-block, which the
+	 * backend switches), the ANE DART compatible and revision, the DAPF
+	 * record count and the pinned TEXT digest.
+	 */
+	u32 pmgr_sys, pmgr_cpu, pmgr_subblock;
+	const char *dart_compatible;
+	u16 dart_revision;
+	u8 dapf_count;
+	const u8 *text_pin;
 };
 
 /* Pure range check: the boot loader supplies the physical addresses. */
@@ -128,7 +145,7 @@ ane_fw_sleep_path(const struct ane_fw_platform *platform)
 	return platform ? ANE_SLEEP_FW_BACKEND : ANE_SLEEP_RTCLIENT;
 }
 
-extern const struct ane_fw_platform ane_h16_platform, ane_h17_platform;
+extern const struct ane_fw_platform ane_h16_platform, ane_h17_platform, ane_t6050_platform;
 int ane_fw_platform_preflight(struct platform_device *pdev,
 			      const struct ane_fw_platform *soc);
 

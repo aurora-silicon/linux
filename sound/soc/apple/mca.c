@@ -36,6 +36,7 @@
 #include <linux/regmap.h>
 #include <linux/reset.h>
 #include <linux/slab.h>
+#include <linux/suspend.h>
 
 #include <sound/core.h>
 #include <sound/pcm.h>
@@ -1467,10 +1468,41 @@ static const struct of_device_id apple_mca_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, apple_mca_of_match);
 
+/*
+ * hw_params is the only place a stream's cluster and serdes setup is written. A
+ * sleep that takes the registers would leave an open stream silent, and nothing
+ * here restores them yet.
+ */
+static int __maybe_unused apple_mca_suspend_late(struct device *dev)
+{
+	struct mca_data *mca = dev_get_drvdata(dev);
+	int i;
+
+	if (!pm_suspend_via_firmware())
+		return 0;
+
+	for (i = 0; i < mca->nclusters; i++) {
+		struct mca_cluster *cl = &mca->clusters[i];
+
+		if (cl->pd_link || cl->clocks_in_use[SNDRV_PCM_STREAM_PLAYBACK] ||
+		    cl->clocks_in_use[SNDRV_PCM_STREAM_CAPTURE]) {
+			dev_err(dev, "cluster %d is in use, refusing the sleep\n", i);
+			return -EBUSY;
+		}
+	}
+
+	return 0;
+}
+
+static const struct dev_pm_ops apple_mca_pm_ops = {
+	LATE_SYSTEM_SLEEP_PM_OPS(apple_mca_suspend_late, NULL)
+};
+
 static struct platform_driver apple_mca_driver = {
 	.driver = {
 		.name = "apple-mca",
 		.of_match_table = apple_mca_of_match,
+		.pm = pm_sleep_ptr(&apple_mca_pm_ops),
 	},
 	.probe = apple_mca_probe,
 	.remove = apple_mca_remove,

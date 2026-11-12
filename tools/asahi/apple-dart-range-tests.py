@@ -36,6 +36,8 @@ typedef uint32_t u32;
 #define atomic_long_read(x) (*(x))
 #define bitmap_empty(x, n) (!(x)[0])
 #define dev_err_ratelimited(...) ((void)0)
+#define READ_ONCE(x) (x)
+#define WRITE_ONCE(x, v) ((x) = (v))
 #define DART_T8110_TLB_CMD_OP_FLUSH_SID 1
 struct io_pgtable_cfg { int unused; };
 struct io_pgtable { struct io_pgtable_cfg cfg; };
@@ -43,7 +45,7 @@ struct io_pgtable { struct io_pgtable_cfg cfg; };
 struct apple_dart;
 struct apple_dart_stream_map { struct apple_dart *dart; unsigned long sidmap[1]; };
 struct apple_dart_hw { int (*invalidate_tlb)(struct apple_dart_stream_map *); };
-struct apple_dart { int num_streams, locked, version; bool fw_mirror, fw_handoff, managed_sids; void *dev; struct apple_dart_hw *hw; };
+struct apple_dart { int num_streams, locked, version; bool fw_mirror, fw_handoff, managed_sids, display_dark, display_tlb_stale; void *dev; struct apple_dart_hw *hw; };
 struct apple_dart_atomic_stream_map { struct apple_dart *dart; unsigned long sidmap[1]; };
 struct apple_dart_domain {
  void *pgtbl_ops; bool dcp; struct apple_dart_atomic_stream_map streams[2]; int count;

@@ -565,11 +565,14 @@ int apple_isp_detect_camera(struct apple_isp *isp)
 
 	err = isp_detect_camera(isp);
 
-	/* Resident firmware stays up; the channel is set up per stream. */
+	/*
+	 * Resident firmware stays up, the channel set up per stream, unless it starts
+	 * again: then it's off until the first stream, as on macOS.
+	 */
 	if (isp->hw->resident_fw) {
-		if (err)
+		if (err || isp->hw->fw_restart)
 			apple_isp_firmware_halt(isp);
-		else
+		if (!err)
 			isp->camera_detected = true;
 		return err;
 	}
@@ -1080,10 +1083,10 @@ int apple_isp_start_capture(struct apple_isp *isp)
 
 void apple_isp_stop_capture(struct apple_isp *isp)
 {
-	if (isp->ipc_failed || isp->fw_state == ISP_FW_DEAD)
+	if (isp->ipc_failed || isp->fw_state != ISP_FW_RUNNING)
 		return;
-	isp_cmd_ch_stop(isp, 0); // TODO channel mask
-	isp_cmd_ch_buffer_return(isp, isp->current_ch);
+	if (!isp_cmd_ch_stop(isp, 0)) /* TODO channel mask */
+		isp_cmd_ch_buffer_return(isp, isp->current_ch);
 
 	/* ... until its buffers are back. */
 	apple_isp_wdt_stop(isp);
