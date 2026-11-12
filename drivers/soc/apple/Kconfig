@@ -92,11 +92,16 @@ config APPLE_CLUSTER_PWRGATE
 	  started and PMGR never powered on, such as the boot CPU, only
 	  clock-gates in WFI.
 
+config APPLE_SLEEP_REGISTRY
+	bool
+	depends on ARM64
+
 config APPLE_SOC_SLEEP
 	bool "Apple SoC system sleep at EL2"
 	default APPLE_T8140_SLEEP
 	depends on ARM64 && (ARCH_APPLE || COMPILE_TEST)
 	depends on HOTPLUG_CPU && SUSPEND
+	select APPLE_SLEEP_REGISTRY
 	select APPLE_TUNABLE
 	help
 	  Powers the secondary CPUs off and suspends the system to RAM on an
@@ -124,7 +129,7 @@ config APPLE_T6040_SLEEP
 	bool "Apple T6040 system sleep (refusal-first)"
 	depends on ARM64 && (ARCH_APPLE || COMPILE_TEST)
 	depends on HOTPLUG_CPU && SUSPEND
-	depends on !APPLE_SOC_SLEEP
+	select APPLE_SLEEP_REGISTRY
 	select MFD_SYSCON
 	select APPLE_TUNABLE
 	help
@@ -143,8 +148,8 @@ config APPLE_T6040_SLEEP
 	  can be taken back runs, the CPUs park and are held, and the sleep is
 	  refused at the commit point and resumed warm.
 
-	  It owns the same registry as APPLE_SOC_SLEEP, so a kernel has one
-	  of the two.
+	  It shares the registry with APPLE_SOC_SLEEP, and both can be built
+	  into one kernel: each binds only to its own SoC.
 
 config APPLE_RTKIT
 	tristate "Apple RTKit co-processor IPC protocol"

@@ -33,10 +33,12 @@
  *  - The real commit (t6040_sleep_commit) runs only when no blocker remains,
  *    t6040_sleep.allow_entry=1 is given and no dry run is asked for.
  *
- * Why this file and not a generalisation of t8140-sleep.c: the port keeps
- * #1208's T8140 behaviour byte-identical. Until the two share per-SoC match
- * data the registry lives here as well, with the same contract, and a kernel
- * builds one of the two controllers.
+ * Why this file and not a generalisation of sleep.c: the port keeps
+ * the T8140 behaviour byte-identical, and the per-SoC match data should be
+ * built once the T6040 commit and wake are known from a trace. Until then it is
+ * a controller of its own. The coprocessor and enclave registry is shared
+ * (sleep-registry.c), so one kernel carries both controllers, and each binds
+ * only to its own SoC.
  */
 
 #include <linux/bitfield.h>
@@ -78,6 +80,8 @@
 #include <asm/virt.h>
 #include <clocksource/arm_arch_timer.h>
 #include <asm/arch_timer.h>
+
+#include "sleep-internal.h"
 
 #define PS_TARGET		GENMASK(3, 0)
 #define PS_ACTUAL		GENMASK(7, 4)
@@ -804,174 +808,22 @@ bool apple_sleep_last_steps(void)
 EXPORT_SYMBOL_GPL(apple_sleep_last_steps);
 
 /*
- * The coprocessor and enclave registry, with #1208's contract (sleep.h). A
- * registered coprocessor that isn't ready refuses the sleep; a ready one keeps
- * running until the commit's last stop, after every refusal, so a refused sleep
- * finds it as it was.
+ * The coprocessor and enclave registry (sleep-registry.c), shared with the T8140
+ * controller, same contract (sleep.h). A registered coprocessor that isn't ready
+ * refuses the sleep; a ready one keeps running until the commit's last stop,
+ * after every refusal, so a refused sleep finds it as it was.
  */
-#define SLEEP_COPROCS		6
-
-static struct t6040_sleep_coproc {
-	struct device *dev;
-	void __iomem *asc;
-	bool pcie_ans;
-	int (*last_check)(void *data);
-	int (*last_stop)(void *data);
-	void *data;
-	bool ready;
-	bool stopped;
-	u32 status;
-	/* No ASC: its last stop takes it whole, power word included, before the others. */
-	bool first;
-} t6040_sleep_coprocs[SLEEP_COPROCS];
-static DEFINE_MUTEX(t6040_sleep_coprocs_lock);
-
-/* The enclave's sleep request, left to the last refusal. Under t6040_sleep_coprocs_lock. */
-static struct {
-	struct device *dev;
-	int (*tell)(void *data);
-	void *data;
-} t6040_sleep_enclave;
-
-static struct t6040_sleep_coproc *t6040_sleep_coproc_find(struct device *dev)
-{
-	int i;
-
-	for (i = 0; i < SLEEP_COPROCS; i++)
-		if (t6040_sleep_coprocs[i].dev == dev)
-			return &t6040_sleep_coprocs[i];
-
-	return NULL;
-}
-
-/* Below EL2 a monitor owns the last mile, and this code doesn't run it. */
-int apple_sleep_coproc_register(struct device *dev, void __iomem *asc, bool pcie_ans,
-				int (*last_stop)(void *data), void *data)
-{
-	struct t6040_sleep_coproc *c;
-
-	if (!is_kernel_in_hyp_mode())
-		return -ENODEV;
-
-	guard(mutex)(&t6040_sleep_coprocs_lock);
-	if (t6040_sleep_coproc_find(dev))
-		return -EEXIST;
-	c = t6040_sleep_coproc_find(NULL);
-	if (!c)
-		return -ENOSPC;
-	c->asc = asc;
-	c->pcie_ans = pcie_ans;
-	c->last_check = NULL;
-	c->last_stop = last_stop;
-	c->data = data;
-	c->ready = false;
-	c->stopped = false;
-	c->first = false;
-	c->dev = dev;
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(apple_sleep_coproc_register);
-
-int apple_sleep_coproc_register_first(struct device *dev, int (*last_stop)(void *data),
-				      void *data)
-{
-	struct t6040_sleep_coproc *c;
-	int ret;
-
-	if (!last_stop)
-		return -EINVAL;
-	ret = apple_sleep_coproc_register(dev, NULL, false, last_stop, data);
-	if (ret)
-		return ret;
-
-	guard(mutex)(&t6040_sleep_coprocs_lock);
-	c = t6040_sleep_coproc_find(dev);
-	if (c)
-		c->first = true;
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(apple_sleep_coproc_register_first);
-
-int apple_sleep_coproc_set_last_check(struct device *dev, int (*last_check)(void *data))
-{
-	struct t6040_sleep_coproc *c;
-
-	guard(mutex)(&t6040_sleep_coprocs_lock);
-	c = t6040_sleep_coproc_find(dev);
-	if (!c)
-		return -ENOENT;
-	c->last_check = last_check;
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(apple_sleep_coproc_set_last_check);
-
-int apple_sleep_enclave_register(struct device *dev, int (*tell)(void *data), void *data)
-{
-	if (!is_kernel_in_hyp_mode())
-		return -ENODEV;
-
-	guard(mutex)(&t6040_sleep_coprocs_lock);
-	if (t6040_sleep_enclave.dev)
-		return -EBUSY;
-	t6040_sleep_enclave.tell = tell;
-	t6040_sleep_enclave.data = data;
-	t6040_sleep_enclave.dev = dev;
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(apple_sleep_enclave_register);
-
-void apple_sleep_enclave_unregister(struct device *dev)
-{
-	guard(mutex)(&t6040_sleep_coprocs_lock);
-	if (t6040_sleep_enclave.dev == dev)
-		memset(&t6040_sleep_enclave, 0, sizeof(t6040_sleep_enclave));
-}
-EXPORT_SYMBOL_GPL(apple_sleep_enclave_unregister);
-
-void apple_sleep_coproc_unregister(struct device *dev)
-{
-	struct t6040_sleep_coproc *c;
-
-	guard(mutex)(&t6040_sleep_coprocs_lock);
-	c = t6040_sleep_coproc_find(dev);
-	if (c)
-		memset(c, 0, sizeof(*c));
-}
-EXPORT_SYMBOL_GPL(apple_sleep_coproc_unregister);
-
-void apple_sleep_coproc_set_ready(struct device *dev, bool ready)
-{
-	struct t6040_sleep_coproc *c;
-
-	guard(mutex)(&t6040_sleep_coprocs_lock);
-	c = t6040_sleep_coproc_find(dev);
-	if (!c)
-		return;
-	c->ready = ready;
-	c->stopped = false;
-}
-EXPORT_SYMBOL_GPL(apple_sleep_coproc_set_ready);
-
-bool apple_sleep_coproc_stopped(struct device *dev)
-{
-	struct t6040_sleep_coproc *c;
-
-	guard(mutex)(&t6040_sleep_coprocs_lock);
-	c = t6040_sleep_coproc_find(dev);
-	return c && c->stopped;
-}
-EXPORT_SYMBOL_GPL(apple_sleep_coproc_stopped);
+#define SLEEP_COPROCS		APPLE_SLEEP_COPROCS
 
 /* A real entry: its commit stops the registered coprocessors; a dry run's never does. */
-bool apple_sleep_commit_stops_coprocs(void)
+static bool t6040_sleep_reg_commit_stops(void)
 {
 	return READ_ONCE(t6040_sleep) && is_kernel_in_hyp_mode() && apple_sleep_power_loss();
 }
-EXPORT_SYMBOL_GPL(apple_sleep_commit_stops_coprocs);
+
+static const struct apple_sleep_ctl t6040_sleep_reg_ctl = {
+	.commit_stops = t6040_sleep_reg_commit_stops,
+};
 
 /*
  * As in macOS's power-state check, a sub-block is on while its TARGET is not 0. The
@@ -1096,10 +948,10 @@ static void t6040_sleep_show_registry(struct seq_file *s)
 {
 	int i;
 
-	guard(mutex)(&t6040_sleep_coprocs_lock);
+	guard(mutex)(&apple_sleep_coprocs_lock);
 	seq_puts(s, "coprocessors registered for the commit's last stop:\n");
 	for (i = 0; i < SLEEP_COPROCS; i++) {
-		struct t6040_sleep_coproc *c = &t6040_sleep_coprocs[i];
+		struct apple_sleep_coproc *c = &apple_sleep_coprocs[i];
 
 		if (!c->dev)
 			continue;
@@ -1108,7 +960,7 @@ static void t6040_sleep_show_registry(struct seq_file *s)
 			   c->ready ? ", ready" : "");
 	}
 	seq_printf(s, "enclave sleep request left for the last refusal: %s\n",
-		   t6040_sleep_enclave.dev ? dev_name(t6040_sleep_enclave.dev) : "none");
+		   apple_sleep_enclave.dev ? dev_name(apple_sleep_enclave.dev) : "none");
 }
 
 static void t6040_axi2af_show(struct t6040_sleep *sleep, struct seq_file *s);
@@ -1649,7 +1501,7 @@ static unsigned int t6040_sleep_refuse(struct t6040_sleep *s)
 	int i;
 
 	for (i = 0; i < SLEEP_COPROCS; i++) {
-		struct t6040_sleep_coproc *c = &t6040_sleep_coprocs[i];
+		struct apple_sleep_coproc *c = &apple_sleep_coprocs[i];
 
 		if (!c->dev)
 			continue;
@@ -1695,7 +1547,7 @@ static unsigned int t6040_sleep_refuse(struct t6040_sleep *s)
 		pr_err("t6040-sleep: refused: sep isn't bound (state %#x)\n", val);
 		refused++;
 		why |= BIT(3);
-	} else if (!t6040_sleep_enclave.tell) {
+	} else if (!apple_sleep_enclave.stop) {
 		pr_err("t6040-sleep: refused: sep's sleep request isn't left for the last refusal\n");
 		refused++;
 		why |= BIT(3);
@@ -1735,7 +1587,7 @@ static int t6040_sleep_coprocs_check(void)
 	int i, ret;
 
 	for (i = 0; i < SLEEP_COPROCS; i++) {
-		struct t6040_sleep_coproc *c = &t6040_sleep_coprocs[i];
+		struct apple_sleep_coproc *c = &apple_sleep_coprocs[i];
 
 		if (!c->dev || !c->ready || c->stopped || !c->last_check)
 			continue;
@@ -1755,9 +1607,9 @@ static int t6040_sleep_enclave_tell(void)
 {
 	int ret;
 
-	if (!t6040_sleep_enclave.tell)
+	if (!apple_sleep_enclave.stop)
 		return 0;
-	ret = t6040_sleep_enclave.tell(t6040_sleep_enclave.data);
+	ret = apple_sleep_enclave.stop(apple_sleep_enclave.data);
 	if (ret)
 		pr_err("t6040-sleep: refused: the enclave didn't take the sleep request: %d\n",
 		       ret);
@@ -2286,8 +2138,8 @@ static void t6040_mtp_island_back(struct t6040_sleep *s, const u32 *saved)
 		writel(saved[n], s->mtp_ps + 8 * n);
 }
 
-/* As #1208's, measured on ANS: status and control read, then the run bit cleared twice. */
-static void t6040_sleep_coproc_run_off(struct t6040_sleep_coproc *c)
+/* As on T8140, measured on ANS: status and control read, then the run bit cleared twice. */
+static void t6040_sleep_coproc_run_off(struct apple_sleep_coproc *c)
 {
 	unsigned int keep = READ_ONCE(coproc_keep_run);
 
@@ -2317,7 +2169,7 @@ static void t6040_sleep_coprocs_stop(bool first)
 	int i;
 
 	for (i = 0; i < SLEEP_COPROCS; i++) {
-		struct t6040_sleep_coproc *c = &t6040_sleep_coprocs[i];
+		struct apple_sleep_coproc *c = &apple_sleep_coprocs[i];
 
 		if (!c->dev || !c->ready || c->first != first || c->stopped)
 			continue;
@@ -5161,7 +5013,7 @@ static int t6040_sleep_dry_enter(struct t6040_sleep *s, unsigned int dry)
 		spin_table_unhold_parked();
 
 	pr_info("t6040-sleep: dry run: refused before the enclave's sleep request (%s), the coprocessors' last stops and the SoC power-down\n",
-		t6040_sleep_enclave.dev ? "left by sep" : "none left");
+		apple_sleep_enclave.dev ? "left by sep" : "none left");
 
 	return -EBUSY;
 }
@@ -6501,6 +6353,10 @@ static int t6040_sleep_probe(struct platform_device *pdev)
 	}
 	t6040_sleep_map_gp(sleep);
 	t6040_ed_map(&pdev->dev);
+
+	ret = apple_sleep_registry_bind(&t6040_sleep_reg_ctl);
+	if (ret)
+		return dev_err_probe(&pdev->dev, ret, "another sleep controller is bound\n");
 
 	platform_set_drvdata(pdev, sleep);
 	t6040_sleep = sleep;

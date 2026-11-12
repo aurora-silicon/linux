@@ -68,6 +68,8 @@
 #include <asm/sysreg.h>
 #include <asm/virt.h>
 
+#include "sleep-internal.h"
+
 /* Must match aura's struct aura_s2r_mailbox. */
 #define AURA_S2R_MAGIC		0x3152325341525541ULL	/* "AURAS2R1" */
 
@@ -288,32 +290,8 @@ struct aura_s2r_mailbox {
 #define APCIE_RC_READY_STAT	0x58
 #define APCIE_POLL_US		50000
 
-/* The coprocessors the last mile stops. Each driver idles its own first. */
-#define SLEEP_COPROCS		4
-
-static struct apple_sleep_coproc {
-	struct device *dev;
-	void __iomem *asc;
-	bool pcie_ans;
-	int (*last_check)(void *data);
-	int (*last_stop)(void *data);
-	void *data;
-	bool ready;
-	bool stopped;
-	u32 status;
-	int stop_ret;
-	/* No ASC: its last stop takes it whole, power word @ps included, before the others. */
-	bool first;
-	u32 ps;
-} apple_sleep_coprocs[SLEEP_COPROCS];
-static DEFINE_MUTEX(apple_sleep_coprocs_lock);
-
-/* Irreversible enclave stop; nonzero is legal only if SLEEP was not sent. */
-static struct {
-	struct device *dev;
-	int (*stop)(void *data);
-	void *data;
-} apple_sleep_enclave;
+/* The coprocessor and enclave registry is shared with the other SoCs' controllers. */
+#define SLEEP_COPROCS		APPLE_SLEEP_COPROCS
 
 /*
  * Written with bits 0 and 63 by every core right before its last WFI, measured
@@ -601,17 +579,6 @@ struct apple_sleep {
 
 static struct apple_sleep *apple_sleep;
 
-static struct apple_sleep_coproc *apple_sleep_coproc_find(struct device *dev)
-{
-	int i;
-
-	for (i = 0; i < SLEEP_COPROCS; i++)
-		if (apple_sleep_coprocs[i].dev == dev)
-			return &apple_sleep_coprocs[i];
-
-	return NULL;
-}
-
 /* A registered coprocessor its driver has readied, whose run bit the last step clears. */
 static bool apple_sleep_coproc_ready_node(const struct device_node *np)
 {
@@ -809,148 +776,21 @@ void apple_sleep_restore_pins(void)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_restore_pins);
 
-/* Below EL2 a monitor owns the last mile, and this code doesn't run it. */
-int apple_sleep_coproc_register(struct device *dev, void __iomem *asc, bool pcie_ans,
-				int (*last_stop)(void *data), void *data)
-{
-	struct apple_sleep_coproc *c;
-
-	if (!is_kernel_in_hyp_mode())
-		return -ENODEV;
-
-	guard(mutex)(&apple_sleep_coprocs_lock);
-	if (apple_sleep_coproc_find(dev))
-		return -EEXIST;
-	c = apple_sleep_coproc_find(NULL);
-	if (!c)
-		return -ENOSPC;
-	c->asc = asc;
-	c->pcie_ans = pcie_ans;
-	c->last_check = NULL;
-	c->last_stop = last_stop;
-	c->data = data;
-	c->ready = false;
-	c->stopped = false;
-	c->first = false;
-	c->ps = 0;
-	c->dev = dev;
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(apple_sleep_coproc_register);
-
-int apple_sleep_coproc_register_first(struct device *dev, int (*last_stop)(void *data),
-				      void *data)
-{
-	struct apple_sleep_coproc *c;
-	struct device_node *np;
-	u32 ps = 0;
-	int ret;
-
-	if (!last_stop)
-		return -EINVAL;
-	np = of_parse_phandle(dev->of_node, "power-domains", 0);
-	if (np) {
-		of_property_read_u32(np, "reg", &ps);
-		of_node_put(np);
-	}
-	ret = apple_sleep_coproc_register(dev, NULL, false, last_stop, data);
-	if (ret)
-		return ret;
-
-	guard(mutex)(&apple_sleep_coprocs_lock);
-	c = apple_sleep_coproc_find(dev);
-	if (c) {
-		c->first = true;
-		c->ps = ps;
-	}
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(apple_sleep_coproc_register_first);
-
-int apple_sleep_coproc_set_last_check(struct device *dev, int (*last_check)(void *data))
-{
-	struct apple_sleep_coproc *c;
-
-	guard(mutex)(&apple_sleep_coprocs_lock);
-	c = apple_sleep_coproc_find(dev);
-	if (!c)
-		return -ENOENT;
-	c->last_check = last_check;
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(apple_sleep_coproc_set_last_check);
-
-int apple_sleep_enclave_register(struct device *dev, int (*stop)(void *data), void *data)
-{
-	if (!is_kernel_in_hyp_mode())
-		return -ENODEV;
-
-	if (!stop)
-		return -EINVAL;
-	if (!apple_sleep_commit_stops_coprocs())
-		return -EOPNOTSUPP;
-
-	guard(mutex)(&apple_sleep_coprocs_lock);
-	if (apple_sleep_enclave.dev)
-		return -EBUSY;
-	apple_sleep_enclave.stop = stop;
-	apple_sleep_enclave.data = data;
-	apple_sleep_enclave.dev = dev;
-
-	return 0;
-}
-EXPORT_SYMBOL_GPL(apple_sleep_enclave_register);
-
-void apple_sleep_enclave_unregister(struct device *dev)
-{
-	guard(mutex)(&apple_sleep_coprocs_lock);
-	if (apple_sleep_enclave.dev == dev)
-		memset(&apple_sleep_enclave, 0, sizeof(apple_sleep_enclave));
-}
-EXPORT_SYMBOL_GPL(apple_sleep_enclave_unregister);
-
-void apple_sleep_coproc_unregister(struct device *dev)
-{
-	struct apple_sleep_coproc *c;
-
-	guard(mutex)(&apple_sleep_coprocs_lock);
-	c = apple_sleep_coproc_find(dev);
-	if (c)
-		memset(c, 0, sizeof(*c));
-}
-EXPORT_SYMBOL_GPL(apple_sleep_coproc_unregister);
-
-void apple_sleep_coproc_set_ready(struct device *dev, bool ready)
-{
-	struct apple_sleep_coproc *c;
-
-	guard(mutex)(&apple_sleep_coprocs_lock);
-	c = apple_sleep_coproc_find(dev);
-	if (!c)
-		return;
-	c->ready = ready;
-	c->stopped = false;
-}
-EXPORT_SYMBOL_GPL(apple_sleep_coproc_set_ready);
-
-bool apple_sleep_coproc_stopped(struct device *dev)
-{
-	struct apple_sleep_coproc *c;
-
-	guard(mutex)(&apple_sleep_coprocs_lock);
-	c = apple_sleep_coproc_find(dev);
-	return c && c->stopped;
-}
-EXPORT_SYMBOL_GPL(apple_sleep_coproc_stopped);
-
-bool apple_sleep_commit_stops_coprocs(void)
+/* The registry's questions, answered for this SoC's sleep. */
+static bool apple_sleep_reg_commit_stops(void)
 {
 	return READ_ONCE(apple_sleep) && pm_suspend_via_firmware();
 }
-EXPORT_SYMBOL_GPL(apple_sleep_commit_stops_coprocs);
+
+static int apple_sleep_reg_enclave_admit(void)
+{
+	return apple_sleep_reg_commit_stops() ? 0 : -EOPNOTSUPP;
+}
+
+static const struct apple_sleep_ctl apple_sleep_reg_ctl = {
+	.commit_stops = apple_sleep_reg_commit_stops,
+	.enclave_admit = apple_sleep_reg_enclave_admit,
+};
 
 /*
  * The last thing that can fail on the way to the commit: no CPU but this one is up and
@@ -3693,9 +3533,14 @@ static int apple_sleep_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, s);
 
-	ret = spin_table_set_power_ops(&sleep_cpu_power_ops);
+	ret = apple_sleep_registry_bind(&apple_sleep_reg_ctl);
 	if (ret)
+		return dev_err_probe(dev, ret, "another sleep controller is bound\n");
+	ret = spin_table_set_power_ops(&sleep_cpu_power_ops);
+	if (ret) {
+		apple_sleep_registry_unbind(&apple_sleep_reg_ctl);
 		return dev_err_probe(dev, ret, "cannot control CPU power\n");
+	}
 
 	/* Last: the exported helpers take it as a probed driver, and a failure frees s. */
 	apple_sleep = s;
