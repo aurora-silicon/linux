@@ -134,11 +134,20 @@ bool dcp_peer_needs_pair_v27(struct apple_dcp *dcp, u32 clock_khz)
 int dcp_peer_check_v27(struct apple_dcp *dcp, struct drm_atomic_commit *commit,
 		       struct drm_crtc_state *crtc_state)
 {
+	u64 rate = dcp->dptxport[0].caps.total_rate;
 	struct drm_crtc_state *peer_state;
 	struct drm_crtc *peer_crtc;
+	bool pair;
 
 	if (!crtc_state->enable || !drm_atomic_crtc_needs_modeset(crtc_state) ||
-	    !dcp_peer_needs_pair_v27(dcp, crtc_state->mode.clock))
+	    dcp->fw_compat != DCP_FIRMWARE_V_27_0 || !rate)
+		return 0;
+	pair = dcp_peer_needs_pair_v27(dcp, crtc_state->mode.clock);
+	dev_info(dcp->dev, "mode %ux%u@%u: %u kHz against one engine's %llu Hz: %s\n",
+		 crtc_state->mode.hdisplay, crtc_state->mode.vdisplay,
+		 drm_mode_vrefresh(&crtc_state->mode), crtc_state->mode.clock, rate,
+		 pair ? "needs the pair" : "one engine");
+	if (!pair)
 		return 0;
 	if (!peer_scanout || !peer_allocation_probe)
 		return -EINVAL;
