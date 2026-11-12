@@ -31,6 +31,19 @@ fn pmp_sample_to_ceiling(sample: Option<u32>) -> Option<u32> {
 pub(super) struct Ceiling {
     native: [u32; 3],
     applied: Option<u32>,
+    /// The ceiling last logged, so the log follows steps of [`CEILING_LOG_STEP`] percent.
+    logged: Option<u32>,
+}
+
+/// A logged ceiling change: engaging, releasing, or moving this many percent from the last log.
+const CEILING_LOG_STEP: u32 = 5;
+
+fn ceiling_log_due(logged: Option<u32>, desired: Option<u32>) -> bool {
+    match (logged, desired) {
+        (None, None) => false,
+        (Some(a), Some(b)) => a.abs_diff(b) >= CEILING_LOG_STEP,
+        _ => true,
+    }
 }
 
 impl Ceiling {
@@ -38,6 +51,7 @@ impl Ceiling {
         Self {
             native,
             applied: None,
+            logged: None,
         }
     }
 
@@ -62,6 +76,23 @@ impl Ceiling {
             init.publish_ppm_target(self.native[0], self.native[1], self.native[2])?;
         }
         self.applied = desired;
+        if ceiling_log_due(self.logged, desired) {
+            match desired {
+                Some(ceiling) => kernel::pr_info!(
+                    "asahi: PMP GPU effort {:#x} (count {}): power ceiling {}% of {} mW\n",
+                    effort,
+                    count,
+                    ceiling,
+                    self.native[1]
+                ),
+                None => kernel::pr_info!(
+                    "asahi: PMP GPU power ceiling released (effort {:#x}, status {})\n",
+                    effort,
+                    ret
+                ),
+            }
+            self.logged = desired;
+        }
         Ok(())
     }
 }
@@ -362,6 +393,16 @@ mod tests {
         assert_eq!(pmp_effort_to_ceiling(PMP_EFFORT_ONE / 2), Some(50));
         assert_eq!(pmp_effort_to_ceiling(PMP_EFFORT_ONE), Some(0));
         assert_eq!(pmp_effort_to_ceiling(PMP_EFFORT_ONE + 1), None);
+    }
+
+    #[test]
+    fn ceiling_changes_are_logged_in_steps() {
+        assert!(!ceiling_log_due(None, None));
+        assert!(ceiling_log_due(None, Some(99)));
+        assert!(ceiling_log_due(Some(99), None));
+        assert!(!ceiling_log_due(Some(90), Some(94)));
+        assert!(ceiling_log_due(Some(90), Some(95)));
+        assert!(ceiling_log_due(Some(90), Some(85)));
     }
 
     #[test]
