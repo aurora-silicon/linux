@@ -661,6 +661,11 @@ struct apple_dcp {
 	u32 edr_hm;
 	u32 edr_sdr;
 	bool edr_restart;
+	/* Firmware 27: when the headroom last moved, and short of its target. */
+	ktime_t edr_step;
+	bool edr_ramping;
+	/* SDR white in nits of the present being built (H17P backlight) */
+	u32 edr_present_sdr;
 	struct dcp_set_digital_out_mode_req mode;
 
 	/* completion for active turning true */
@@ -938,6 +943,8 @@ struct apple_dcp {
 		unsigned int callback_count;
 		struct delayed_work timeout;
 		struct delayed_work backlight_retry;
+		/* A firmware 27 panel's EDR ramp on a still frame (iomfb_edr_tick()) */
+		struct delayed_work edr_tick;
 		unsigned long deadline;
 		unsigned int queued;
 		bool stopped;

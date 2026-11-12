@@ -10,6 +10,8 @@ struct dcp_panel_adt {
 	u32 width_mm, height_mm;
 	/* /backlight EDRPotentialHeadroom, 16.16; 0 if absent */
 	u32 edr_potential_headroom;
+	/* /backlight LmaxProduct, the panel's peak luminance, 16.16 nits; 0 if absent */
+	u32 lmax_product;
 	/* /product target, only when its calibration matrix is also valid */
 	enum dcp_panel_gamut gamut;
 	bool found;

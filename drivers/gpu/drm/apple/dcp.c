@@ -1132,8 +1132,21 @@ static void dcp_panel_read_adt(struct apple_dcp *dcp)
 	if (dcp->panel_identity)
 		dcp->panel_identity->adt = panel.identity;
 	dcp->panel.color_target = ret ? NULL : dcp_panel_gamut_color_space(panel.gamut);
-	if (desktop)
+	if (desktop || dcp->fw_compat == DCP_FIRMWARE_V_27_0)
 		dcp->panel.edr_ceiling = dcp_edr_ceiling(panel.edr_potential_headroom);
+	/*
+	 * Firmware 27 reports no peak (desktop 26.x: res_max_panel_brightness()).
+	 * The ADT's LmaxProduct gives it (1600 nits on the M5 Pro).  Only a peak
+	 * above the SDR range gives headroom.
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+		u32 peak = panel.lmax_product >> 16;
+
+		if (peak > dcp->brightness.maximum && peak <= 10000) {
+			dev_info(dcp->dev, "panel peak luminance %u nits (ADT)\n", peak);
+			WRITE_ONCE(dcp->panel.peak_nits, peak);
+		}
+	}
 	dev_info(dcp->dev, "panel ADT: %s, panel node %s, dimensions %ux%u mm\n",
 		 ret ? "unavailable" : "parsed", panel.found ? "present" : "absent",
 		 dcp->panel.width_mm, dcp->panel.height_mm);
@@ -3693,6 +3706,15 @@ bool dcp_fw_compat_is_desktop(struct platform_device *pdev)
 	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
 }
 
+/* Firmware whose panel shows PQ content as EDR (dcp_panel_edr_supported()). */
+bool dcp_fw_compat_panel_edr(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+	       dcp->fw_compat == DCP_FIRMWARE_V_27_0;
+}
+
 bool dcp_fw_compat_is_14_7(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
@@ -4310,6 +4332,10 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_27_0:
 		iomfb_poweroff_v27(dcp);
+		if (dcp->edr_hm)
+			dcp->edr_restart = true;
+		WRITE_ONCE(dcp->edr_ramping, false);
+		cancel_delayed_work(&dcp->iomfb.edr_tick);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
