@@ -241,14 +241,6 @@ static const struct {
 #define T6040_PMC_BWR_PA	0x5048ac020ULL
 #define PMC_BOOST		0x8
 
-/*
- * The PMP's PTD (pmp-report 0x5003c0000, T6041 layout as drivers/pmdomain/apple/
- * pmp-report.c): SOC-DEV-PS-REQ read at +0x1e00, SOC-DEV-PS-ACK at +0x1e80, 64-bit.
- * Read only, for the preflight.
- */
-#define T6040_PTD_PA		0x5003c0000ULL
-#define PTD_REQ_READ		0x1e00
-#define PTD_ACK			0x1e80
 #define QUIESCE_TIMEOUT_US	2000
 
 #define AGX_GATE_RESIDENT	GENMASK(19, 18)
@@ -438,8 +430,6 @@ struct t6040_sleep {
 	void __iomem *tvm_ctl[8];
 	void __iomem *tvm_status[8];
 	void __iomem *pmc_bwr;
-	void __iomem *ptd;
-	void __iomem *gapf;
 	void __iomem *afr_ps;
 	u32 cluster_saved[CLUSTER_CTL_NR];
 	u32 wake_mask_saved[AOP_WAKE_WORDS];
@@ -645,15 +635,6 @@ static int t6040_sleep_preflight_show(struct seq_file *s, void *unused)
 			seq_printf(s, "cluster-ctl +%#x %-9s %#x\n", CLUSTER_CTL(i), nm[i],
 				   readl(sleep->cluster_ctl + CLUSTER_CTL(i)));
 	}
-	if (sleep->gapf)
-		seq_printf(s, "gapf: base %#x cfg %#x lock %#x, slices dcp(17) %#x dcpext0(29) %#x dcpext1(48) %#x\n",
-			   readl(sleep->gapf), readl(sleep->gapf + 0x20), readl(sleep->gapf + 0x24),
-			   readl(sleep->gapf + 0x540), readl(sleep->gapf + 0x840),
-			   readl(sleep->gapf + 0xd00));
-	if (sleep->ptd)
-		seq_printf(s, "pmp ptd: SOC-DEV-PS-REQ %#llx, SOC-DEV-PS-ACK %#llx, status %#llx\n",
-			   readq(sleep->ptd + PTD_REQ_READ), readq(sleep->ptd + PTD_ACK),
-			   readq(sleep->ptd + 0x10));
 
 	return 0;
 }
@@ -3191,9 +3172,6 @@ static int t6040_sleep_probe(struct platform_device *pdev)
 	sleep->disp_pwrgate = t6040_ioremap_np(&pdev->dev, T6040_DISP_PWRGATE_PA, 0x100);
 	sleep->pmc_dcp = t6040_ioremap_np(&pdev->dev, T6040_PMC_DCP_PA, 12);
 	sleep->pmc_bwr = t6040_ioremap_np(&pdev->dev, T6040_PMC_BWR_PA, 0x10);
-	sleep->ptd = t6040_ioremap_np(&pdev->dev, T6040_PTD_PA, 0x11000);
-	/* The DART clock-protection (GAPF) block, read-only here. */
-	sleep->gapf = t6040_ioremap_np(&pdev->dev, 0x500578000ULL, 0x1000);
 	sleep->ka_soc = t6040_ioremap_np(&pdev->dev, T6040_KA_SOC_PA, KA_SIZE);
 	sleep->ka_east = t6040_ioremap_np(&pdev->dev, T6040_KA_EAST_PA, KA_SIZE);
 	sleep->smc_wdt_deadline = t6040_ioremap_np(&pdev->dev, T6040_SMC_WDT_DEADLINE_PA, 4);
