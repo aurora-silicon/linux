@@ -3,8 +3,10 @@
  * Apple T6040 (M4 Pro) system sleep: refusal-first controller.
  *
  * This is the T6040 port of the T8140 deep sleep at EL2 (sleep.c). Its commit
- * is the T6040 entry as measured on the J616s under macOS, which is much
- * shorter than the T8140's (see t6040_sleep_commit).
+ * EL2). Its commit follows the T6040 entry as measured on the J616s under macOS,
+ * with what the SoC's sleep engine needs from an OS that is not macOS (see
+ * t6040_sleep_commit); its wake return mirrors macOS's PMGR wake restore (see
+ * t6040_sleep_return).
  *
  * What it does:
  *
@@ -31,7 +33,9 @@
  *    The AON watchdog's WD2 is armed from .begin to .end of a dry run 2 or 3
  *    (t6040_sleep.wd2_secs, 0 to leave it off).
  *  - The real commit (t6040_sleep_commit) runs only when no blocker remains,
- *    t6040_sleep.allow_entry=1 is given and no dry run is asked for.
+ *    t6040_sleep.allow_entry=1 is given and no dry run is asked for. The AON
+ *    watchdog's WD2 is its net (t6040_sleep.sleep_wd_secs), and over the device
+ *    suspend and resume around it.
  *
  * Why this file and not a generalisation of sleep.c: the port keeps
  * the T8140 behaviour byte-identical, and the per-SoC match data should be
@@ -107,7 +111,7 @@
 #define PS_APCIE_SYS_ST0	0x380	/* SOC-East: ps_apcie_sys_st0 */
 #define PS_APCIE_SYS_ST1	0x388	/* SOC-East: ps_apcie_sys_st1 */
 #define PS_APCIE_PHY_SW		0x398	/* SOC-East: ps_apcie_phy_sw (the shared PHY) */
-#define PS_BUSY			BIT(11)	/* polled clear by the A2D engine after each request */
+#define PS_BUSY			BIT(11)	/* a request is in progress */
 
 #define APCIE_AXI_EN0		0x104
 #define APCIE_AXI_EN1		0x108
@@ -245,7 +249,7 @@
  *    poll BIT7 clear (CPM gating after it reads back already set: not written);
  *  - features off: cpu-fixed-freq-pll-relock, BIT42 := 0 in the E and P0
  *    ACC words; then the TVMs disp2, afr, dcs (two), gfx (two), disp, soc: control
- *    BIT0 := 0, status polled until BIT1 clears;
+ *    BIT0 := 0, status polled until BIT1 clears.
  * macOS then drops the AP voter's DCS floor vote in the PMC. That step is left out: the
  * first access to that word hung the bus on the J616s.
  * macOS polls the APSC and TVM words without a timeout; here every poll is bounded.
@@ -273,21 +277,16 @@ static const struct {
 #define TVM_BUSY		BIT(1)
 
 /*
- * As macOS does (measured on the J616s where marked), a display pipe's PMC votes go
- * before any of its power words: boost 0x5048ac028 BIT(p), DVMR 0x5048a4000 BIT(p) with
- * the ack polled at +0x20 BIT0 and 0x5048a9c14 := popcount(DVMR) (measured), BWR 0x5048ac020
- * BIT(p ? p + 2 : 0); the cluster rail 0x5048a9c18 BIT2 (DISP_INT) or BIT3 (DISP_EXT, last
- * pipe only) with the ack at 0x5048a9c1c (measured). p: 0 internal, 1 DCPEXT0, 2 DCPEXT1.
+ * The PMC's bandwidth-request and boost interface enables of the display pipes
+ * (0x5048ac020 and +0x8), one bit per pipe.
  */
 #define T6040_PMC_BWR_PA	0x5048ac020ULL
 #define PMC_BOOST		0x8
 
 /*
  * The PMP's PTD (pmp-report 0x5003c0000, T6041 layout as drivers/pmdomain/apple/
- * pmp-report.c): SOC-DEV-PS-REQ read +0x1e00, written +0x10f00, SOC-DEV-PS-ACK +0x1e80,
- * 64-bit. DCPEXT0/1 are requests 17/18 (DT report@11/@12, withdrawn by that driver at
- * suspend_noirq); the internal display is 16, assumed from the pattern. macOS has
- * the PMP release a display's request before its power words change.
+ * pmp-report.c): SOC-DEV-PS-REQ read at +0x1e00, SOC-DEV-PS-ACK at +0x1e80, 64-bit.
+ * Read only, for the preflight.
  */
 #define T6040_PTD_PA		0x5003c0000ULL
 #define PTD_REQ_READ		0x1e00
@@ -570,12 +569,12 @@ MODULE_PARM_DESC(allow_entry,
 /*
  * The AON WD2 net armed at the commit. macOS arms 5 s for its reconfig; a longer
  * net tells "the SoC never slept" (reset at the net) from "it slept and the wake
- * failed" (reset at the wake source) on a first bring-up. Never off: 1 to 178.
+ * failed" (reset at the wake source). Never off: 1 to 178.
  */
 static unsigned int sleep_wd_secs = 30;
 module_param(sleep_wd_secs, uint, 0644);
 MODULE_PARM_DESC(sleep_wd_secs,
-		 "AON WD2 net armed at the S2R commit, in seconds (default 5, clamped to 1..178)");
+		 "AON WD2 net armed at the S2R commit, in seconds (default 30, clamped to 1..178)");
 
 static unsigned int wd2_secs = WDT_SUSPEND_SECS;
 module_param(wd2_secs, uint, 0644);
@@ -1699,13 +1698,10 @@ static void t6040_wake_restore(struct t6040_sleep *s)
 }
 
 /*
- * ANS's storage-apcie power words (the two ST lanes + ANS) live in SOC-East.
- * These helpers drive one power word in a given bank, as T8140's t8140_ps_*
- * do in its single PMGR bank: lower is AUTO_ENABLE off then target 0; raise is
- * the target, then AUTO_ENABLE once ACTUAL reads on. Writing PS_FLAGS clears
- * them. Separate from t6040_sleep_ps_on(), which reads a cached value.
+ * One power word raised, as T8140's t8140_ps_raise() does: target 0xf with automatic
+ * mode off and the flag bits cleared, ACTUAL polled, then AUTO_ENABLE. The two halves
+ * are separate for a word that has to stay at a manual target for a while or for good.
  */
-
 static int t6040_ps_raise_start(void __iomem *base, u32 offset)
 {
 	void __iomem *reg = base + offset;
@@ -1978,10 +1974,10 @@ static void t6040_dcs_dyn_pg(struct t6040_sleep *s)
 /*
  * ANS's own fabric bridge (0x4_0b00_0000 +0x104/+0x108 bit 0). macOS clears the bit before a
  * retained domain goes off and sets it again once it is back up; here the wake sets it
- * (t6040_sleep_raise_apcie_st()) and the A2D engine, not this driver, takes ANS down. iBoot
- * leaves the bit clear, so a boot's first sleep goes down with it clear; without this the
- * next one meets the bridge as the first wake armed it. Only while ANS is on: the bridge sits
- * in it. Returns whether the bit was set.
+ * (t6040_sleep_raise_apcie_st()) and the SoC's sleep engine, not this driver, takes ANS down.
+ * The boot loader leaves the bit clear, so a boot's first sleep goes down with it clear;
+ * without this the next one meets the bridge as the first wake armed it. Only while ANS is
+ * on: the bridge sits in it. Returns whether the bit was set.
  */
 static bool t6040_ans_bridge_quiesce(struct t6040_sleep *s)
 {
@@ -2186,7 +2182,7 @@ extern char t6040_resume_stub[];
  * Their common_dp, usb, phymxwrap and usb_aon words are MiniPMGR words (0x508300000 + 0xa0..,
  * ADT ATCn_COMMON_DP/USB/PHYMXWRAP/USB_AON), not SOC ones: applied to soc_ps,
  * those offsets lower SOC AIC (0x118), PMC (0x120), PMS_FPWM0-4 and
- * FAB0_SOC (0x168) right before the S2R request; the dead PMC then blocks the A2D engine's
+ * FAB0_SOC (0x168) right before the S2R request; the dead PMC then blocks the sleep engine's
  * PMC writes (an AP read of the PMC hangs from that step on).
  */
 static const u16 t6040_atc_words[4][5] = {
@@ -2745,7 +2741,7 @@ static int t6040_sleep_dry_enter(struct t6040_sleep *s, unsigned int dry)
 	t6040_sleep_log_s2r_state(s, "dry-run commit point");
 	/*
 	 * A wake source pending and left unmasked by the masks a real commit arms would keep the
-	 * AP partition from powering down (A2D then stalls at MiniPMGR +0x40). Read only.
+	 * AP partition from powering down, and the sleep engine then stalls. Read only.
 	 */
 	if (s->aop_global) {
 		u32 p[AOP_WAKE_WORDS];
@@ -2779,17 +2775,7 @@ static int t6040_sleep_dry_enter(struct t6040_sleep *s, unsigned int dry)
 	return -EBUSY;
 }
 
-/*
- * The display power words macOS has off before its sleep (apple,check-ps-b4-sleep), lowered
- * here: after the device suspend, interrupts off, one CPU up, so no driver, interrupt handler
- * or DART touches the pipes any more. The DCPs only stop their firmware: lowering the domains
- * from their suspend panicked on T6040. Each group from its last sub-block to its pipe CPU,
- * each word as the pmgr-pwrstate driver powers a domain off (TARGET 0, the one-shot bits
- * clear), polled to ACTUAL 0. Returns the number of words left on.
- */
-
 #define PS_DEV_DISABLE		BIT(10)
-#define PS_BUSY			BIT(11)
 #define PS_RESET_REQ		BIT(12)
 
 #define DISP_CPU_GATE_US	50000
@@ -2918,8 +2904,7 @@ static int t6040_dcp_dart_idle(struct t6040_sleep *s)
 	return 0;
 }
 
-/* The internal display's three domains, child first, after its sub-blocks (macOS's order). */
-
+/* The internal display's FE and SYS domains, child first, after its sub-blocks (macOS's order). */
 static int t6040_disp_off_macos(struct t6040_sleep *s, const struct t6040_sleep_group *g)
 {
 	struct t6040_psw cpu = { .map = g->regmap, .off = g->first };
@@ -3028,6 +3013,15 @@ static void t6040_disp_back(struct t6040_sleep *s)
 	}
 }
 
+/*
+ * The display power words macOS has off before its sleep (apple,check-ps-b4-sleep), lowered
+ * here: after the device suspend, interrupts off, one CPU up, so no driver, interrupt handler
+ * or DART touches the pipes any more. The DCPs only stop their firmware: lowering the domains
+ * from their suspend panicked on T6040. Each group from its last sub-block up to, and not
+ * including, its pipe CPU, which the PMGR gates by itself: each word as the pmgr-pwrstate
+ * driver powers a domain off (TARGET 0, the one-shot bits clear), polled to ACTUAL 0. The
+ * internal display's FE and SYS domains follow. Returns the number of words left on.
+ */
 static unsigned int t6040_sleep_lower_display(struct t6040_sleep *s)
 {
 	unsigned int i, left = 0;

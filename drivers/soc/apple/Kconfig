@@ -141,6 +141,9 @@ config APPLE_T6040_SLEEP
 	  CPUs that can park, the display power states macOS checks before it
 	  sleeps). Unless t6040_sleep.allow_entry=1 is given and no blocker
 	  remains, a suspend request prints the blockers and enters nothing.
+	  With it the SoC is powered down to suspend-to-RAM and comes back
+	  through the boot object; the AON watchdog is the net over the
+	  whole cycle (t6040_sleep.sleep_wd_secs at the power-down itself).
 
 	  It keeps the coprocessor and enclave registry for the T6040, so
 	  the drivers that leave their last stop to the sleep's commit (ANS,
