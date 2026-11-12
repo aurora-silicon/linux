@@ -3697,7 +3697,8 @@ static int t6040_usb2_restore_early(struct device *dev)
 		tphy->usb3_tunnel_req = false;
 		tphy->pipe_tunneled = false;
 		tphy->tun_pll = false;
-		tphy->tun_rate[0] = tphy->tun_rate[1] = 0;
+		tphy->tun_rate[0] = 0;
+		tphy->tun_rate[1] = 0;
 		pm_runtime_put_noidle(dev);
 	}
 	dev_info(dev, "restore: PHY state reset (usb3 up %d, pipe %d, lent %d, dp up %d, 2-lane %d)\n",
