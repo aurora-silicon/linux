@@ -3005,39 +3005,6 @@ static void __iomem *t6040_sleep_map(struct device *dev, const char *name)
 	return t6040_ioremap_np(dev, res.start, resource_size(&res));
 }
 
-/* A tunable table on the apple,apcie node, named by its matching reg-name. */
-static struct apple_tunable *t6040_apcie_tunable(struct t6040_sleep *s, struct device_node *np,
-						 const char *name, const char *prop)
-{
-	int idx = of_property_match_string(np, "reg-names", name);
-	struct apple_tunable *t;
-	struct resource res;
-
-	if (idx < 0 || of_address_to_resource(np, idx, &res))
-		return NULL;
-	t = devm_apple_tunable_parse(s->dev, np, prop, &res);
-
-	return IS_ERR(t) ? NULL : t;
-}
-
-/* A control window on the apple,apcie node, with its optional tunable. */
-static void __iomem *t6040_apcie_block(struct t6040_sleep *s, struct device_node *np,
-				       const char *name, const char *prop,
-				       struct apple_tunable **tunable)
-{
-	int idx = of_property_match_string(np, "reg-names", name);
-
-	if (idx < 0)
-		return NULL;
-	if (prop) {
-		*tunable = t6040_apcie_tunable(s, np, name, prop);
-		if (!*tunable)
-			return NULL;
-	}
-
-	return of_iomap(np, idx);
-}
-
 /*
  * ANS's storage-apcie windows + PLL/lane tunables, from the apple,apcie node
  * the boot object publishes from the ADT. Our static tree has none
@@ -3054,14 +3021,19 @@ static void t6040_sleep_map_apcie(struct t6040_sleep *s)
 
 	if (!np)
 		return;
-	a->axi = t6040_apcie_block(s, np, "axi2af", "apple,tunable-axi2af", &a->axi_tunable);
-	a->cio3pll = t6040_apcie_block(s, np, "cio3pll", "apple,tunable-cio3pll",
-				       &a->cio3pll_tunable);
-	a->clkgen = t6040_apcie_block(s, np, "clkgen", "apple,tunable-clkgen", &a->clkgen_tunable);
-	a->phy = t6040_apcie_block(s, np, "phy-block", "apple,tunable-phy", &a->phy_tunable);
-	a->rc = t6040_apcie_block(s, np, "rc", NULL, NULL);
-	a->phy_ip = t6040_apcie_block(s, np, "phy-ip", "apple,tunable-phy-ip-pll", &a->phy_ip_pll);
-	a->phy_ip_lanes = t6040_apcie_tunable(s, np, "phy-ip", "apple,tunable-phy-ip-auspma");
+	a->axi = apple_sleep_apcie_block(s->dev, np, "axi2af", "apple,tunable-axi2af",
+					 &a->axi_tunable);
+	a->cio3pll = apple_sleep_apcie_block(s->dev, np, "cio3pll", "apple,tunable-cio3pll",
+					     &a->cio3pll_tunable);
+	a->clkgen = apple_sleep_apcie_block(s->dev, np, "clkgen", "apple,tunable-clkgen",
+					    &a->clkgen_tunable);
+	a->phy = apple_sleep_apcie_block(s->dev, np, "phy-block", "apple,tunable-phy",
+					 &a->phy_tunable);
+	a->rc = apple_sleep_apcie_block(s->dev, np, "rc", NULL, NULL);
+	a->phy_ip = apple_sleep_apcie_block(s->dev, np, "phy-ip", "apple,tunable-phy-ip-pll",
+					    &a->phy_ip_pll);
+	a->phy_ip_lanes = apple_sleep_apcie_tunable(s->dev, np, "phy-ip",
+						    "apple,tunable-phy-ip-auspma");
 	of_node_put(np);
 
 	a->valid = a->axi && a->cio3pll && a->clkgen && a->phy && a->rc && a->phy_ip &&

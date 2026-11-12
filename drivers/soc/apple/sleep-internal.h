@@ -16,7 +16,9 @@
 
 #include <asm/sysreg.h>
 
+struct apple_tunable;
 struct device;
+struct device_node;
 struct platform_device;
 struct seq_file;
 
@@ -235,6 +237,17 @@ extern const struct apple_sleep_part t6040_sleep_part;
  * taken back. apple_sleep_power_loss() and apple_sleep_last_steps() answer by it.
  */
 void apple_sleep_set_dry(unsigned int level);
+
+/*
+ * The storage PCIe block's windows and tunables are on a node a loader fills. A tunable table
+ * @prop for the window @name, or NULL; and the window itself mapped, with its tunable if @prop
+ * names one, or NULL where either is missing.
+ */
+struct apple_tunable *apple_sleep_apcie_tunable(struct device *dev, struct device_node *np,
+						const char *name, const char *prop);
+void __iomem *apple_sleep_apcie_block(struct device *dev, struct device_node *np,
+				      const char *name, const char *prop,
+				      struct apple_tunable **tunable);
 
 /*
  * A part whose sleep takes neither the lid's state at the wake nor the USB wake ports says so

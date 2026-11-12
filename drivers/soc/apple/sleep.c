@@ -3238,9 +3238,8 @@ static int apple_sleep_map_mailbox(struct apple_sleep *s)
 	return 0;
 }
 
-static struct apple_tunable *apple_sleep_apcie_tunable(struct apple_sleep *s,
-						       struct device_node *np,
-						       const char *name, const char *prop)
+struct apple_tunable *apple_sleep_apcie_tunable(struct device *dev, struct device_node *np,
+						const char *name, const char *prop)
 {
 	int idx = of_property_match_string(np, "reg-names", name);
 	struct apple_tunable *t;
@@ -3248,21 +3247,21 @@ static struct apple_tunable *apple_sleep_apcie_tunable(struct apple_sleep *s,
 
 	if (idx < 0 || of_address_to_resource(np, idx, &res))
 		return NULL;
-	t = devm_apple_tunable_parse(s->dev, np, prop, &res);
+	t = devm_apple_tunable_parse(dev, np, prop, &res);
 
 	return IS_ERR(t) ? NULL : t;
 }
 
-static void __iomem *apple_sleep_apcie_block(struct apple_sleep *s, struct device_node *np,
-					     const char *name, const char *prop,
-					     struct apple_tunable **tunable)
+void __iomem *apple_sleep_apcie_block(struct device *dev, struct device_node *np,
+				      const char *name, const char *prop,
+				      struct apple_tunable **tunable)
 {
 	int idx = of_property_match_string(np, "reg-names", name);
 
 	if (idx < 0)
 		return NULL;
 	if (prop) {
-		*tunable = apple_sleep_apcie_tunable(s, np, name, prop);
+		*tunable = apple_sleep_apcie_tunable(dev, np, name, prop);
 		if (!*tunable)
 			return NULL;
 	}
@@ -3281,18 +3280,18 @@ static void apple_sleep_map_apcie(struct apple_sleep *s)
 
 	if (!np)
 		return;
-	s->apcie_axi = apple_sleep_apcie_block(s, np, "axi2af", "apple,tunable-axi2af",
+	s->apcie_axi = apple_sleep_apcie_block(s->dev, np, "axi2af", "apple,tunable-axi2af",
 					       &s->apcie_axi_tunable);
-	s->apcie_cio3pll = apple_sleep_apcie_block(s, np, "cio3pll", "apple,tunable-cio3pll",
+	s->apcie_cio3pll = apple_sleep_apcie_block(s->dev, np, "cio3pll", "apple,tunable-cio3pll",
 						   &s->apcie_cio3pll_tunable);
-	s->apcie_clkgen = apple_sleep_apcie_block(s, np, "clkgen", "apple,tunable-clkgen",
+	s->apcie_clkgen = apple_sleep_apcie_block(s->dev, np, "clkgen", "apple,tunable-clkgen",
 						  &s->apcie_clkgen_tunable);
-	s->apcie_phy = apple_sleep_apcie_block(s, np, "phy-block", "apple,tunable-phy",
+	s->apcie_phy = apple_sleep_apcie_block(s->dev, np, "phy-block", "apple,tunable-phy",
 					       &s->apcie_phy_tunable);
-	s->apcie_rc = apple_sleep_apcie_block(s, np, "rc", NULL, NULL);
-	s->apcie_phy_ip = apple_sleep_apcie_block(s, np, "phy-ip", "apple,tunable-phy-ip-pll",
+	s->apcie_rc = apple_sleep_apcie_block(s->dev, np, "rc", NULL, NULL);
+	s->apcie_phy_ip = apple_sleep_apcie_block(s->dev, np, "phy-ip", "apple,tunable-phy-ip-pll",
 						  &s->apcie_phy_ip_pll);
-	s->apcie_phy_ip_lanes = apple_sleep_apcie_tunable(s, np, "phy-ip",
+	s->apcie_phy_ip_lanes = apple_sleep_apcie_tunable(s->dev, np, "phy-ip",
 							  "apple,tunable-phy-ip-auspma");
 	if (!s->apcie_axi || !s->apcie_cio3pll || !s->apcie_clkgen || !s->apcie_phy ||
 	    !s->apcie_rc || !s->apcie_phy_ip || !s->apcie_phy_ip_lanes) {
@@ -3304,12 +3303,12 @@ static void apple_sleep_map_apcie(struct apple_sleep *s)
 		s->apcie_axi = NULL;
 	}
 
-	s->apcie_port = apple_sleep_apcie_block(s, np, "port0", NULL, NULL);
-	s->apcie_port_phy = apple_sleep_apcie_block(s, np, "phy0", NULL, NULL);
+	s->apcie_port = apple_sleep_apcie_block(s->dev, np, "port0", NULL, NULL);
+	s->apcie_port_phy = apple_sleep_apcie_block(s->dev, np, "phy0", NULL, NULL);
 	engine = of_parse_phandle(np, "apple,piodma", 0);
 	if (engine) {
-		s->apcie_engine = apple_sleep_apcie_block(s, engine, "engine", NULL, NULL);
-		s->apcie_fabric = apple_sleep_apcie_block(s, engine, "fabric", NULL, NULL);
+		s->apcie_engine = apple_sleep_apcie_block(s->dev, engine, "engine", NULL, NULL);
+		s->apcie_fabric = apple_sleep_apcie_block(s->dev, engine, "fabric", NULL, NULL);
 		of_node_put(engine);
 	}
 	of_node_put(np);
