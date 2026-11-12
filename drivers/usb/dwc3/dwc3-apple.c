@@ -1380,10 +1380,14 @@ static bool dwc3_apple_sleep_kept(struct dwc3_apple *appledwc)
 			return true;
 		}
 		ret = -EIO;
+		dev_warn(appledwc->dev,
+			 "host lost its state in the sleep (%d, GUID %#x): restarting it\n",
+			 ret, guid);
+	} else {
+		/* The mark wasn't read: what the PHY says, or the set-up after it, is why. */
+		dev_warn(appledwc->dev,
+			 "host not set up again after the sleep (PHY %d): restarting it\n", ret);
 	}
-
-	dev_warn(appledwc->dev, "host lost its state in the sleep (%d, GUID %#x): restarting it\n",
-		 ret, guid);
 	ret = dwc3_apple_exit(appledwc);
 	if (ret)
 		dev_err(appledwc->dev, "Failed to stop after sleep, err=%d\n", ret);
