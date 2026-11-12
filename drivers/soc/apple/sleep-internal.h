@@ -13,6 +13,7 @@
 
 struct device;
 struct platform_device;
+struct seq_file;
 
 /* The coprocessors the last mile stops. Each driver idles its own first. */
 #define APPLE_SLEEP_COPROCS	6
@@ -83,5 +84,24 @@ struct apple_sleep_part {
 	int (*restore)(struct device *dev);
 	struct apple_sleep_ctl registry;
 };
+
+/* For a debugfs file: who is registered, and how far each is. */
+void apple_sleep_registry_show(struct seq_file *s);
+
+/*
+ * The rest is for the commit point, in this order: interrupts off and one CPU up, so nothing
+ * takes the registry's lock. @dev is the sleep driver's, for the log.
+ *
+ * Every registered coprocessor has to be ready: returns how many aren't, each logged, and sets
+ * @pcie_ans_idled if ANS is among the ready ones.
+ */
+unsigned int apple_sleep_coprocs_refuse(struct device *dev, bool *pcie_ans_idled);
+/* Each ready coprocessor's last check: the first refusal, or 0. */
+int apple_sleep_coprocs_check(struct device *dev);
+bool apple_sleep_enclave_registered(void);
+/* The enclave's stop, last of all refusals: nonzero only if no request was sent. */
+int apple_sleep_enclave_stop(struct device *dev);
+/* The last stops, those registered first with @first and then the rest. */
+void apple_sleep_coprocs_stop(bool first, bool *pcie_ans);
 
 #endif

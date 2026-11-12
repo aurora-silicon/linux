@@ -49,6 +49,7 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/panic.h>
+#include <linux/seq_file.h>
 #include <linux/pm_domain.h>
 #include <linux/smp.h>
 #include <linux/soc/apple/dart.h>
@@ -816,8 +817,56 @@ static bool apple_sleep_coproc_lowers(u32 ps)
 	return false;
 }
 
+bool apple_sleep_enclave_registered(void)
+{
+	return apple_sleep_enclave.dev;
+}
+
+void apple_sleep_registry_show(struct seq_file *s)
+{
+	int i;
+
+	guard(mutex)(&apple_sleep_coprocs_lock);
+	seq_puts(s, "coprocessors registered for the commit's last stop:\n");
+	for (i = 0; i < SLEEP_COPROCS; i++) {
+		struct apple_sleep_coproc *c = &apple_sleep_coprocs[i];
+
+		if (!c->dev)
+			continue;
+		seq_printf(s, "  %s%s%s%s%s\n", dev_name(c->dev), c->pcie_ans ? " (ANS)" : "",
+			   c->first ? " (first)" : "", c->last_check ? ", last check" : "",
+			   c->ready ? ", ready" : "");
+	}
+	seq_printf(s, "enclave sleep request left for the last refusal: %s\n",
+		   apple_sleep_enclave.dev ? dev_name(apple_sleep_enclave.dev) : "none");
+}
+
+/* A registered coprocessor that isn't ready refuses the sleep. */
+unsigned int apple_sleep_coprocs_refuse(struct device *dev, bool *pcie_ans_idled)
+{
+	unsigned int refused = 0;
+	int i;
+
+	for (i = 0; i < SLEEP_COPROCS; i++) {
+		struct apple_sleep_coproc *c = &apple_sleep_coprocs[i];
+
+		if (!c->dev)
+			continue;
+		if (c->ready) {
+			*pcie_ans_idled |= c->pcie_ans;
+		} else {
+			/* Nothing may lower a coprocessor's domain under its driver. */
+			dev_err(dev, "refused: %s is running and its driver has not quiesced it\n",
+				dev_name(c->dev));
+			refused++;
+		}
+	}
+
+	return refused;
+}
+
 /* The last refusals, each coprocessor's own: nothing has stopped yet. */
-static int apple_sleep_coprocs_check(struct apple_sleep *s)
+int apple_sleep_coprocs_check(struct device *dev)
 {
 	int i, ret;
 
@@ -828,7 +877,7 @@ static int apple_sleep_coprocs_check(struct apple_sleep *s)
 			continue;
 		ret = c->last_check(c->data);
 		if (ret) {
-			dev_err(s->dev, "refused: %s: %d\n", dev_name(c->dev), ret);
+			dev_err(dev, "refused: %s: %d\n", dev_name(c->dev), ret);
 			return ret;
 		}
 	}
@@ -852,7 +901,7 @@ static int apple_sleep_cpus_hold(struct apple_sleep *s)
 }
 
 /* A nonzero result must mean no SLEEP was sent; post-send errors are fatal. */
-static int apple_sleep_enclave_stop(struct apple_sleep *s)
+int apple_sleep_enclave_stop(struct device *dev)
 {
 	int ret;
 
@@ -860,7 +909,7 @@ static int apple_sleep_enclave_stop(struct apple_sleep *s)
 		return 0;
 	ret = apple_sleep_enclave.stop(apple_sleep_enclave.data);
 	if (ret)
-		dev_err(s->dev, "refused before SEP SLEEP was sent: %d\n", ret);
+		dev_err(dev, "refused before SEP SLEEP was sent: %d\n", ret);
 
 	return ret;
 }
@@ -869,20 +918,21 @@ static int apple_sleep_enclave_stop(struct apple_sleep *s)
  * In two passes, after the last refusal: from the first stop only a real sleep restarts the
  * GPU, so a failure here goes on to the commit. Those registered first stop whole first,
  * before macOS's off words drop under them: the GPU withdraws its PMP request there, and the
- * PMP has to see that before its own stop. The rest after the match.
+ * PMP has to see that before its own stop. The rest after the match. With ANS among the ready
+ * ones, @pcie_ans.
  */
-static void apple_sleep_coprocs_stop(struct apple_sleep *s, bool first)
+void apple_sleep_coprocs_stop(bool first, bool *pcie_ans)
 {
 	int i;
 
 	if (first)
-		s->pcie_ans_stopped = false;
+		*pcie_ans = false;
 	for (i = 0; i < SLEEP_COPROCS; i++) {
 		struct apple_sleep_coproc *c = &apple_sleep_coprocs[i];
 
 		if (!c->dev || !c->ready || c->first != first)
 			continue;
-		s->pcie_ans_stopped |= c->pcie_ans;
+		*pcie_ans |= c->pcie_ans;
 		if (c->stopped)
 			continue;
 		c->stop_ret = c->last_stop ? c->last_stop(c->data) : 0;
@@ -1477,20 +1527,8 @@ static int apple_sleep_refuse(struct apple_sleep *s)
 	bool refused = false, idled = false;
 	int i;
 
-	for (i = 0; i < SLEEP_COPROCS; i++) {
-		struct apple_sleep_coproc *c = &apple_sleep_coprocs[i];
-
-		if (!c->dev)
-			continue;
-		if (c->ready) {
-			idled |= c->pcie_ans;
-		} else {
-			/* Nothing may lower a coprocessor's domain under its driver. */
-			dev_err(s->dev, "refused: %s is running and its driver has not quiesced it\n",
-				dev_name(c->dev));
-			refused = true;
-		}
-	}
+	if (apple_sleep_coprocs_refuse(s->dev, &idled))
+		refused = true;
 
 	if (num_online_cpus() != 1 ||
 	    (read_cpuid_mpidr() & MPIDR_HWID_BITMASK) != s->mbox->boot_mpidr) {
@@ -2759,19 +2797,19 @@ static int apple_sleep_enter(suspend_state_t state)
 	if (!ret)
 		ret = sleep_display_off(s);
 	if (!ret)
-		ret = apple_sleep_coprocs_check(s);
+		ret = apple_sleep_coprocs_check(s->dev);
 	/* Cover the platform's own preparation, after the PM core's early check. */
 	if (!ret && pm_wakeup_pending())
 		ret = -EBUSY;
 	if (!ret)
-		ret = apple_sleep_enclave_stop(s);
+		ret = apple_sleep_enclave_stop(s->dev);
 	if (ret) {
 		dev_dbg(s->dev, "refused before any commit coprocessor stop: %d\n", ret);
 		spin_table_unhold_parked();
 		apple_sleep_stray_restore(s);
 		return ret;
 	}
-	apple_sleep_coprocs_stop(s, true);
+	apple_sleep_coprocs_stop(true, &s->pcie_ans_stopped);
 
 	sleep_wake_arm(s);
 	apple_sleep_match(s);
@@ -2779,7 +2817,7 @@ static int apple_sleep_enter(suspend_state_t state)
 	/* Acknowledge a leftover done flag, as the DCS word has none on macOS. */
 	if (readl(s->cluster_dcs) & CLUSTER_UP_DONE)
 		writel(readl(s->cluster_dcs), s->cluster_dcs);
-	apple_sleep_coprocs_stop(s, false);
+	apple_sleep_coprocs_stop(false, &s->pcie_ans_stopped);
 	/* Done by now unless no SMC driver is bound. */
 	apple_sleep_usb_down(s);
 	s->deep_once = READ_ONCE(sleep_deep_requested);
