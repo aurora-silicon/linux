@@ -414,6 +414,8 @@ struct apple_dart {
 	u32 restore_on_power_up : 1;
 	/* Powered down by its DCP across a real sleep: see apple_dart_host_power_on(). */
 	u32 host_off_slept : 1;
+	/* A PCIe-C DART that loses its probe tunables with its state (T6040, T6041). */
+	u32 reapply_tunables : 1;
 	bool commands_gated;
 	/* Resume restored the translations, but the last steps of its reset failed. */
 	bool reset_incomplete;
@@ -5359,6 +5361,8 @@ static int apple_dart_probe(struct platform_device *pdev)
 		dev_dbg(dev, "applying %zu PCIe-C DART tunables\n",
 			dart->tunables->sz);
 		apple_dart_apply_tunables(dart, dart->tunables);
+		dart->reapply_tunables = of_device_is_compatible(dev->of_node,
+								 "apple,t6041-dart");
 	}
 
 	if (tunneled) {
@@ -6508,8 +6512,7 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	 * A T6040/T6041 PCIe-C DART that lost its state lost its tunables with it:
 	 * apply them again before the reset, in the order of probe.
 	 */
-	if (dart->tunneled && dart->tunables &&
-	    of_device_is_compatible(dev->of_node, "apple,t6041-dart"))
+	if (dart->reapply_tunables)
 		apple_dart_apply_tunables(dart, dart->tunables);
 
 	ret = apple_dart_hw_reset(dart);
