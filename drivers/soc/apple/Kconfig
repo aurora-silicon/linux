@@ -42,7 +42,6 @@ config APPLE_MCC
 	tristate "Apple system level cache"
 	depends on ARCH_APPLE || COMPILE_TEST
 	depends on OF
-	select AUXILIARY_BUS
 	default ARCH_APPLE
 	help
 	  The boot path establishes the system level cache on Apple T8112,
@@ -299,7 +298,6 @@ config APPLE_REGVIEW
 	tristate "Apple SoC read-only register views"
 	depends on ARCH_APPLE || COMPILE_TEST
 	depends on OF && DEBUG_FS
-	select AUXILIARY_BUS
 	help
 	  Exposes fixed lists of registers of Apple SoC blocks that have no
 	  functional driver, such as the memory cache controller, as

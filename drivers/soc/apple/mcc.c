@@ -8,7 +8,6 @@
  * bound, and disables allocation and flushes the cache again on shutdown.
  */
 
-#include <linux/auxiliary_bus.h>
 #include <linux/bitfield.h>
 #include <linux/bits.h>
 #include <linux/device.h>
@@ -33,10 +32,7 @@
 #define MCC_CACHE_FLUSH		0x2844
 #define MCC_CACHE_FLUSH_BUSY	BIT(0)
 
-/*
- * T8112 exposes four cache planes through its second MCC aperture. These are
- * the cache controls the m1n1 boot loader programs on every T8112 boot.
- */
+/* T8112 exposes four cache planes through its second MCC aperture. */
 #define T8112_MCC_PLANES		4
 #define T8112_MCC_PLANE_STRIDE	0x40000
 #define T8112_MCC_RESOURCE	1
@@ -177,11 +173,14 @@ static int apple_mcc_wait_pmp(struct device *dev)
 
 static int apple_mcc_init_t8112(struct platform_device *pdev, struct apple_mcc *mcc)
 {
-	const u32 mask = T8112_CACHE_STATUS_DATA | T8112_CACHE_STATUS_TAG;
 	struct resource *res;
 	void __iomem *base;
 	unsigned int p;
+	int ret;
 
+	ret = apple_mcc_wait_pmp(&pdev->dev);
+	if (ret)
+		return ret;
 	res = platform_get_resource(pdev, IORESOURCE_MEM, T8112_MCC_RESOURCE);
 	if (!res || resource_size(res) <
 		    (T8112_MCC_PLANES - 1) * T8112_MCC_PLANE_STRIDE + T8112_CACHE_STATUS + 4)
@@ -194,52 +193,7 @@ static int apple_mcc_init_t8112(struct platform_device *pdev, struct apple_mcc *
 	mcc->nr_planes = T8112_MCC_PLANES;
 	mcc->leave_enabled = true;
 
-	for (p = 0; p < mcc->nr_planes; p++) {
-		u32 status = readl(mcc->planes[p] + T8112_CACHE_STATUS);
-
-		if ((status & mask) != T8112_CACHE_STATUS_READY)
-			dev_info(&pdev->dev, "plane %u cache not ready after PMP startup: %#x\n",
-				 p, status);
-	}
-
 	return apple_mcc_enable_t8112(mcc);
-}
-
-/*
- * T8112 has one MCC node for both the read-only register view and the cache
- * restore, so this driver owns the node and hands the view to apple-regview
- * through an auxiliary device. Without a PMP the boot loader's cache setup
- * stands and nothing is written.
- */
-static int apple_mcc_probe_t8112(struct platform_device *pdev, struct apple_mcc *mcc)
-{
-	struct device *dev = &pdev->dev;
-	bool pmp = of_property_present(dev->of_node, "apple,pmp");
-	int ret;
-
-	if (pmp) {
-		ret = apple_mcc_wait_pmp(dev);
-		if (ret)
-			return ret;
-	}
-
-	if (!devm_auxiliary_device_create(dev, "regview", NULL))
-		dev_warn(dev, "register view unavailable\n");
-
-	platform_set_drvdata(pdev, mcc);
-	if (!pmp)
-		return 0;
-
-	/* The cache is only a performance setting: stay bound if it fails. */
-	ret = apple_mcc_init_t8112(pdev, mcc);
-	if (ret) {
-		dev_err(dev, "system level cache not restored after PMP startup: %d\n", ret);
-		return 0;
-	}
-	mcc->enabled = true;
-	dev_info(dev, "system level cache restored after PMP startup on %u planes\n",
-		 mcc->nr_planes);
-	return 0;
 }
 
 static int apple_mcc_wait_boot_dma(struct device *dev)
@@ -342,8 +296,16 @@ static int apple_mcc_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	mcc->dev = dev;
-	if (of_device_is_compatible(dev->of_node, "apple,t8112-mcc"))
-		return apple_mcc_probe_t8112(pdev, mcc);
+	if (of_device_is_compatible(dev->of_node, "apple,t8112-mcc")) {
+		ret = apple_mcc_init_t8112(pdev, mcc);
+		if (ret)
+			return ret;
+		platform_set_drvdata(pdev, mcc);
+		mcc->enabled = true;
+		dev_info(dev, "system level cache restored after PMP startup on %u planes\n",
+			 mcc->nr_planes);
+		return 0;
+	}
 	mcc->retained = of_device_is_compatible(dev->of_node, "apple,t8132-mcc");
 	while (platform_get_resource(pdev, IORESOURCE_MEM, mcc->nr_planes)) {
 		struct resource *res = platform_get_resource(pdev, IORESOURCE_MEM, mcc->nr_planes);
@@ -450,7 +412,7 @@ static struct platform_driver apple_mcc_driver = {
 module_platform_driver(apple_mcc_driver);
 
 MODULE_AUTHOR("Ryan Murray <ryan@aurorasilicon.org>");
-MODULE_DESCRIPTION("Apple system level cache allocation");
+MODULE_DESCRIPTION("Apple T8140 system level cache allocation");
 MODULE_LICENSE("Dual MIT/GPL");
 
 #if IS_ENABLED(CONFIG_APPLE_MCC_KUNIT_TEST)
