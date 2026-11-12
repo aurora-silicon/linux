@@ -74,6 +74,7 @@
 	};
 };
 #endif
+#ifndef T6050_J716C
 / {
 	soc {
 		compatible = "simple-bus";
@@ -83,6 +84,8 @@
 		nonposted-mmio;
 	};
 };
+
+#endif
 
 &pmgr0 {
 	ps_pms: power-controller@100 {
@@ -929,7 +932,11 @@
 	};
 };
 
+#ifdef T6050_J716C
+&j716c_gpu_bus {
+#else
 &{/soc} {
+#endif
 	pmgr_gpx: power-management@2300e80000 {
 		compatible = "apple,t6050-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
 		reg = <0x23 0xe80000 0x0 0x4000>;
@@ -1158,7 +1165,11 @@
 	};
 };
 
+#ifdef T6050_J716C
+&die0 {
+#else
 &{/soc} {
+#endif
 	peripheral_clocks: clock-controller@280600000 {
 		compatible = "apple,t6050-pmgr-clocks", "apple,pmgr-clocks";
 		reg = <0x2 0x80600000 0x0 0x1fc000>,
@@ -1227,7 +1238,11 @@
 	};
 };
 
+#ifdef T6050_J716C
+&die0 {
+#else
 &{/soc} {
+#endif
 #if defined(T6050_J714C) || defined(T6050_J716C) || defined(T6050_J775C) || defined(T6050_J775D) || defined(T6050_K114C) || defined(T6050_K116C)
 	nub_spmi1: spmi@28a054000 {
 		compatible = "apple,t6050-spmi", "apple,t8142-spmi";
@@ -1366,6 +1381,7 @@
 #endif
 
 #if defined(T6050_J714S) || defined(T6050_K114C) || defined(T6050_K114S) || defined(T6050_K116C) || defined(T6050_K116S)
+#ifndef T6050_J716C
 	nub_spmi_a1: spmi@28a1a8000 {
 		compatible = "apple,t6050-spmi", "apple,t8142-spmi";
 		reg = <0x2 0x8a1a8000 0x0 0x4000>,
@@ -1376,6 +1392,7 @@
 		#size-cells = <0>;
 		status = "disabled";
 	};
+#endif
 #endif
 
 #if defined(T6050_J714C) || defined(T6050_J714S) || defined(T6050_J716C) || defined(T6050_J716S) || defined(T6050_K114C) || defined(T6050_K114S) || defined(T6050_K116C) || defined(T6050_K116S)
@@ -1477,6 +1494,7 @@
 
 
 
+#ifndef T6050_J716C
 	apciec0_dart: iommu@2a4000000 {
 		compatible = "apple,t6050-dart", "apple,t8110-dart";
 		reg = <0x2 0xa4000000 0x0 0x20000>;
@@ -1484,6 +1502,7 @@
 		#iommu-cells = <1>;
 		status = "disabled";
 	};
+#endif
 
 	apciec0_piodma: dma-controller@2a4068000 {
 		compatible = "apple,t6050-pciec-piodma", "apple,pciec-piodma";
@@ -1496,6 +1515,7 @@
 		status = "disabled";
 	};
 
+#ifndef T6050_J716C
 	apciec1_dart: iommu@2ac000000 {
 		compatible = "apple,t6050-dart", "apple,t8110-dart";
 		reg = <0x2 0xac000000 0x0 0x20000>;
@@ -1503,6 +1523,7 @@
 		#iommu-cells = <1>;
 		status = "disabled";
 	};
+#endif
 
 	apciec1_piodma: dma-controller@2ac068000 {
 		compatible = "apple,t6050-pciec-piodma", "apple,pciec-piodma";
@@ -3159,10 +3180,12 @@
 		      <0x4 0x8d0c0000 0x0 0x4000>,
 		      <0x4 0x8d070000 0x0 0x4000>,
 		      <0x4 0x8d071000 0x0 0x4000>;
+		reg-names = "core", "wrapper", "aux", "ctrl", "ctrl1";
 		interrupts = <AIC_IRQ 0 1713 IRQ_TYPE_LEVEL_HIGH>,
 		             <AIC_IRQ 0 1750 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&apr0_dart 1>;
 		power-domains = <&ps_scodec>;
+		resets = <&ps_scodec>;
 		status = "disabled";
 	};
 
@@ -3172,6 +3195,7 @@
 		interrupts = <AIC_IRQ 0 1712 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_scodec>;
 		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x300 0x0>;
 		status = "disabled";
 	};
 

@@ -4,21 +4,6 @@ if ARCH_APPLE || COMPILE_TEST
 
 menu "Apple SoC drivers"
 
-config APPLE_SIO_AES
-	tristate "Apple SIO AES probe-time diagnostics"
-	depends on OF && HAS_IOMEM && PM && IOMMU_API
-	help
-	  Capture the S8000-family AES readiness and hardware-key disable
-	  state once at probe on T6041 and T8140. T6000 and T8112 are served
-	  by the CRYPTO_DEV_APPLE_SIO_AES skcipher driver instead. The snapshot
-	  is logged and available in a root-readable debugfs state file.
-	  Revision is reported from the SoC compatible; register words are
-	  raw diagnostics, not a claim that a hardware key is usable.
-
-	  This does not enable the engine, submit commands, handle interrupts,
-	  register crypto algorithms or provide a device node. Keep the DT
-	  node disabled except during an explicitly enabled diagnostic boot.
-
 config APPLE_DBGVIEW
 	tristate "Apple SoC read-only debug register views"
 	depends on ARCH_APPLE || COMPILE_TEST
@@ -324,11 +309,14 @@ config APPLE_CLPC
 	tristate "Apple host performance controller floors"
 	depends on ARCH_APPLE || COMPILE_TEST
 	depends on APPLE_PMC && CPU_FREQ
+	depends on MFD_MACSMC || !MFD_MACSMC
+	select ACPI_PLATFORM_PROFILE if ACPI
 	default ARCH_APPLE
 	help
 	  Raises the DRAM controller and SoC fabric performance floors of the
 	  host's PMC voter agent while CPU clusters are busy, and releases
-	  them at idle.
+	  them at idle. On SoCs with power modes it also offers them as
+	  platform profiles.
 
 	  Say 'y' or 'm' here if you have an Apple SoC with a PMC.
 

@@ -34,6 +34,7 @@ typedef uint32_t u32; typedef uint64_t u64;
 #define mutex_lock(x) ((void)0)
 #define mutex_unlock(x) ((void)0)
 #define dev_dbg(...) ((void)0)
+#define dev_info(...) ((void)0)
 #define dev_warn_ratelimited(...) ((void)0)
 #define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))
 struct list_head { struct list_head *next,*prev; };
@@ -72,6 +73,7 @@ struct apple_dcp;
 struct iomfb_transaction {struct list_head link;void (*start)(struct apple_dcp *,struct iomfb_transaction *);void (*release)(struct iomfb_transaction *);bool brightness_only,presentation,completed,backlight_failed;};
 struct iomfb_scanout_h17p {int request;struct drm_framebuffer *fb[4];struct list_head link;};
 struct apple_dcp {
+ void *dev;bool s2r_scanout_stale,s2r_scanout_hold;
  struct {int lock,timeout,backlight_retry,callback_count;void *owner;unsigned long deadline;unsigned queued;bool presentation_paused,backlight_queued,stopped;struct work_struct work;struct list_head pending,dropped;struct iomfb_transaction *active;struct iomfb_scanout_h17p *scanout,*next_scanout;} iomfb;
  struct {bool pending;} present_state_h17p;struct {bool valid;} mode_state;struct {bool connected;} *connector;
  struct {void *data;} chunks;bool native,crashed,ext26_control_pending,ext26_blanked,ext26_normal,ext26_early_complete;
@@ -106,9 +108,11 @@ int main(void){
  struct apple_dcp d={0};setup(&d);struct drm_crtc c={0};
  struct obj o={32ULL<<20};struct drm_framebuffer fb={.obj={&o},.refs=1};
  struct drm_atomic_commit s={.refs=1,.count=1,.new={{.crtc=&c,.visible=true,.fb=&fb}}};
+ d.s2r_scanout_stale=d.s2r_scanout_hold=true;
  for(unsigned i=0;i<30;i++){
   iomfb_queue_atomic(&d,&c,&s);assert(s.refs==2&&d.iomfb.queued==1);
   iomfb_queue_work(&d.iomfb.work);assert(d.present_state_h17p.pending&&flushed==i+1);
+  assert(!d.s2r_scanout_stale&&!d.s2r_scanout_hold);
   /* Mock the firmware completion publication; the queue/release bodies are real. */
   d.iomfb.scanout=d.iomfb.next_scanout;d.iomfb.next_scanout=NULL;
   d.present_state_h17p.pending=false;iomfb_queue_advance(&d);
@@ -116,9 +120,11 @@ int main(void){
   assert(!iomfb_ext26_retain_epoch(&d));
  }
  assert(d.ext26_epochs==30&&d.ext26_retained_bytes==(960ULL<<20));
+ d.s2r_scanout_stale=d.s2r_scanout_hold=true;
  iomfb_queue_atomic(&d,&c,&s);iomfb_queue_work(&d.iomfb.work);
  assert(!d.crashed&&!d.iomfb.active&&!d.iomfb.next_scanout&&!d.iomfb.queued);
  assert(s.refs==1&&fb.refs==31&&flushed==30&&d.vblank_wq.scheduled);
+ assert(d.s2r_scanout_stale&&d.s2r_scanout_hold); /* refusal is not a new frame */
  /* Partial prepare replaces inherited refs, then rejects without exposing. */
  struct iomfb_scanout_h17p *old=calloc(1,sizeof(*old));INIT_LIST_HEAD(&old->link);
  old->fb[0]=&fb;drm_framebuffer_get(&fb);d.iomfb.scanout=old;

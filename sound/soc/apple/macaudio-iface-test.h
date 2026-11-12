@@ -216,7 +216,7 @@ static void macaudio_iface_unowned_lease_reverts(struct kunit *test)
 	macaudio_spk_unlock(f.t.spk);
 
 	/* The grace runs out */
-	mod_delayed_work(system_wq, &f.t.ma->spk_unowned_work, 0);
+	mod_delayed_work(system_percpu_wq, &f.t.ma->spk_unowned_work, 0);
 	flush_delayed_work(&f.t.ma->spk_unowned_work);
 	macaudio_test_settle(f.t.ma);
 	KUNIT_EXPECT_FALSE(test, macaudio_spk_leased(f.t.ma));

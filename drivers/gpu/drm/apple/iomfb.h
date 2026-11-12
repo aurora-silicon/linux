@@ -218,6 +218,12 @@ struct dcp_method_entry {
 	{ tag[0], tag[1], tag[2], tag[3] }, {0}, \
 	{ native[0], native[1], native[2], native[3] } }
 
+/* The IOMFB method table of a firmware 27.x build, by its compat string; NULL if unknown. */
+const struct dcp_method_entry *iomfb_v27_methods(const char *compat);
+/* The first method of a firmware 27.x table that has no ID, NULL if none. */
+const char *iomfb_v27_missing_method(const struct dcp_method_entry *methods,
+				     unsigned int *count);
+
 #define IOMFB_MAX_CB (1000)
 
 bool iomfb_validate_callback_h17p(int tag, u32 in_len, u32 out_len);

@@ -105,7 +105,7 @@ static int apple_pmp_report_bit(struct apple_pmp_start *st,
 static struct apple_pmp_start managed_start;
 static int ready_result, start_calls;
 #define msecs_to_jiffies(n) (n)
-#define system_unbound_wq NULL
+#define system_dfl_wq NULL
 static bool wait_for_completion_timeout(struct completion *c,
 					unsigned long timeout)
 {

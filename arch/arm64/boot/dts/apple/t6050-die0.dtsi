@@ -291,6 +291,7 @@
 		clpc: performance-controller@1 {
 			compatible = "apple,t6050-clpc", "apple,t6041-clpc";
 			reg = <1>;
+			apple,smc = <&smc>;
 		};
 	};
 

@@ -1342,11 +1342,16 @@ static int atcphy_pipehandler_lock_timeout(struct apple_atcphy *atcphy, u32 time
 
 	ret = readl_poll_timeout(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_ACK, reg,
 				 reg & PIPEHANDLER_LOCK_EN, 10, timeout);
+	/*
+	 * A controller that still drives the PIPE can take longer than this to
+	 * let go. What that means is the caller's to decide: a best-effort lock
+	 * goes on without the ACK, and a failed change is reported, and on some
+	 * ports retried, by whoever asked for it.
+	 */
 	if (ret) {
-		dev_dbg(atcphy->dev, "PIPE lock timeout: ack=%#x mode=%u pipe=%u dirty=%u\n",
+		dev_dbg(atcphy->dev, "Pipehandler lock not acked: ack=%#x mode=%u pipe=%u dirty=%u\n",
 			reg, atcphy->mode, atcphy->pipe_state, atcphy->mode_dirty);
 		clear32(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ, 1);
-		dev_warn(atcphy->dev, "Pipehandler lock not acked.\n");
 	}
 
 	return ret;
@@ -1697,11 +1702,10 @@ static int atcphy_configure_pipehandler_usb3(struct apple_atcphy *atcphy, bool h
 		set32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE,
 		      PIPEHANDLER_OVERRIDE_RXDETECT);
 
+		/* Whoever asked for USB3, Type-C or dwc3, reports a failure. */
 		ret = atcphy_pipehandler_lock(atcphy);
-		if (ret) {
-			dev_err(atcphy->dev, "Failed to lock pipehandler");
+		if (ret)
 			return ret;
-		}
 
 		/* BIST dance */
 		if (atcphy->hw->gen == ATCPHY_GENERATION_T8103)
@@ -1738,7 +1742,7 @@ static int atcphy_configure_pipehandler_usb3(struct apple_atcphy *atcphy, bool h
 	if (host) {
 		ret = atcphy_pipehandler_unlock(atcphy);
 		if (ret) {
-			dev_warn(atcphy->dev, "Failed to unlock pipehandler");
+			dev_warn(atcphy->dev, "Failed to unlock pipehandler\n");
 			atcphy->mode_dirty = true;
 			return ret;
 		}
@@ -1859,7 +1863,7 @@ static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy, bool 
 					atcphy->mode_dirty = true;
 				return ret;
 			}
-			dev_warn(atcphy->dev, "Failed to lock pipehandler");
+			dev_warn(atcphy->dev, "Failed to lock pipehandler\n");
 		}
 	}
 
@@ -1876,7 +1880,7 @@ static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy, bool 
 					atcphy->mode_dirty = true;
 				return ret;
 			}
-			dev_warn(atcphy->dev, "Failed to unlock pipehandler");
+			dev_warn(atcphy->dev, "Failed to unlock pipehandler\n");
 		}
 	}
 
@@ -7072,19 +7076,20 @@ static int atcphy_suspend_noirq(struct device *dev)
 }
 
 /*
- * A PHY in a DisplayPort mode doesn't sleep in place, and a sleep that reached its commit
- * lowered ATC0_COMMON under it, behind its power domain's back: the lanes and the AUX
- * channel went. Have atcphy_resume() set the tracked mode up again, before the display
- * controller connects the link anew.
+ * A PHY that didn't sleep in place had ATC0_COMMON lowered under it by a sleep that reached
+ * its commit, behind its power domain's back, in any mode. In a DisplayPort mode the lanes
+ * and the AUX channel went; with no controller bound, the PIPE's dummy PHY enable, without
+ * which the next host's PIPE lock isn't acknowledged. Have the next PHY operation set the
+ * tracked mode up again, as after the domain was off, before the display controller
+ * connects the link anew or a controller starts.
  */
-static void atcphy_sleep_lost_dp(struct apple_atcphy *atcphy)
+static void atcphy_sleep_lost_common(struct apple_atcphy *atcphy)
 {
 	if (!atcphy->hw->has_t8140_dp || !atcphy->hw->restore_after_pd_off ||
-	    !pm_resume_via_firmware() || !atcphy_modes[atcphy->mode].enable_dp_aux)
+	    !pm_resume_via_firmware())
 		return;
 	WRITE_ONCE(atcphy->pd_was_off, true);
-	dev_dbg(atcphy->dev, "DisplayPort mode %d lost in the sleep: setting it up again\n",
-		atcphy->mode);
+	dev_dbg(atcphy->dev, "mode %d lost in the sleep: setting it up again\n", atcphy->mode);
 }
 
 static int atcphy_resume_noirq(struct device *dev)
@@ -7093,7 +7098,7 @@ static int atcphy_resume_noirq(struct device *dev)
 
 	guard(mutex)(&atcphy->lock);
 	if (!atcphy->hibernated) {
-		atcphy_sleep_lost_dp(atcphy);
+		atcphy_sleep_lost_common(atcphy);
 		return 0;
 	}
 	apple_sleep_usb_set_asleep(false);
@@ -7243,7 +7248,7 @@ void apple_atcphy_sleep_finish_async(struct phy *usb2_phy, bool kept)
 	if (!atcphy)
 		return;
 	WRITE_ONCE(atcphy->sleep_finish_kept, kept);
-	queue_work(system_unbound_wq, &atcphy->sleep_finish_work);
+	queue_work(system_dfl_wq, &atcphy->sleep_finish_work);
 }
 EXPORT_SYMBOL_GPL(apple_atcphy_sleep_finish_async);
 

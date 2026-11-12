@@ -440,6 +440,7 @@ impl Orphan {
 }
 
 /// Probe-time admission.
+#[inline(never)]
 pub(crate) fn admit(
     pdev: &platform::Device<Core<'_>>,
     _dev: &AsahiDrmDevice,
@@ -659,6 +660,7 @@ fn run(
 }
 
 /// Brings the firmware to READY.
+#[inline(never)]
 pub(crate) fn start(
     admitted: Admitted,
     dev: &AsahiDrmDevice,
