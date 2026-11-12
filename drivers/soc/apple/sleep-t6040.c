@@ -396,6 +396,8 @@ struct t6040_sleep {
 	u64 mbox_pa;
 	bool power_ops;
 	bool wd2_armed;
+	/* Set by .begin for a suspend to RAM; .end only undoes what .begin did. */
+	bool mem_begun;
 	u64 siq_cfg;
 	u64 cntkctl;
 	/* Saved across the commit, restored on wake. */
@@ -2276,9 +2278,6 @@ static int t6040_sleep_valid(suspend_state_t state)
 	return state == PM_SUSPEND_MEM && READ_ONCE(allow_entry);
 }
 
-/* Set by .begin for a suspend to RAM; .end only undoes what .begin did. */
-static bool t6040_sleep_mem_begun;
-
 /*
  * SMC key pmVC, the request for the VDD_CIO rail: macOS writes its enable mask | 0x100
  * (0x101 on the J616s) while an ATC port's always-on side is powered, also at sleep. Linux
@@ -2338,10 +2337,10 @@ static int t6040_sleep_begin(suspend_state_t state)
 	 * The PM core calls .begin and .end for suspend-to-idle too when there
 	 * are no s2idle_ops. s2idle needs nothing from this controller.
 	 */
-	t6040_sleep_mem_begun = false;
+	s->mem_begun = false;
 	if (state != PM_SUSPEND_MEM)
 		return 0;
-	t6040_sleep_mem_begun = true;
+	s->mem_begun = true;
 
 	t6040_sleep_set_dry(s, 0);
 	s->returned = false;
@@ -2814,9 +2813,9 @@ static void t6040_sleep_end(void)
 	struct t6040_sleep *s = t6040_sleep;
 	unsigned int dry = s->dry;
 
-	if (!t6040_sleep_mem_begun)
+	if (!s->mem_begun)
 		return;
-	t6040_sleep_mem_begun = false;
+	s->mem_begun = false;
 	t6040_sleep_clear_wd2(s);
 	if (dry)
 		dev_info(s->dev, "dry run %u over, WD2 off\n", dry);
