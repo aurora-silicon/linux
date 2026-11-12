@@ -94,19 +94,6 @@ properties:
       - enum: [hw-cal-b, fw-text, l2-pagetables]
       - enum: [globals, fw-data, fw-text]
 
-  apple,aon-ptd:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
-    minItems: 9
-    maxItems: 18
-    description:
-      Loader-provided always-on sensor calibration table, in three-cell
-      rows. The J775c compatibility description reserves zero-filled rows
-      for the firmware handoff.
-
-  apple,csafr-min-sram-microvolt:
-    maxItems: 1
-    description: Minimum SRAM voltage for the CS and AFR performance domains.
-
   apple,clpc:
     $ref: /schemas/types.yaml#/definitions/phandle
     description: |
