@@ -85,6 +85,8 @@ enum bcm4377_chip {
 #define BCM4377_BAR0_HOST_WINDOW_SIZE 0x598
 
 #define BCM4377_BAR2_BOOTSTAGE 0x200454
+/* The firmware has booted. */
+#define BCM4377_BOOTSTAGE_RUNNING 2
 
 #define BCM4377_BAR2_FW_LO   0x200478
 #define BCM4377_BAR2_FW_HI   0x20047c
@@ -96,6 +98,8 @@ enum bcm4377_chip {
 #define BCM4388_BAR2_CONTEXT_ADDR_HI 0x200490
 
 #define BCM4377_BAR2_RTI_STATUS	     0x20045c
+/* The firmware has taken the context and serves the rings. */
+#define BCM4377_RTI_STATUS_RUNNING   2
 #define BCM4377_BAR2_RTI_WINDOW_LO   0x200494
 #define BCM4377_BAR2_RTI_WINDOW_HI   0x200498
 #define BCM4377_BAR2_RTI_WINDOW_SIZE 0x20049c
@@ -1598,10 +1602,28 @@ static void bcm4377_setup_retry_work(struct work_struct *work)
 	queue_work(hdev->req_workqueue, &hdev->power_on);
 }
 
+/*
+ * Boards whose transport is restarted in place, by a close and an open that resets the
+ * function: when a command gets no answer after a resume, and when a sleep left the
+ * function without its firmware.
+ */
+static const struct bcm4377_resume_board {
+	unsigned int id;
+	const char *machine;
+} bcm4377_resume_boards[] = {
+	{ .id = 0x4378, .machine = "apple,j493" },
+	{ .id = 0x4388, .machine = "apple,j616s" },
+	{ }
+};
+
 static bool bcm4377_resume_recovery_supported(struct bcm4377_data *bcm4377)
 {
-	return (bcm4377->hw->id == 0x4378 && of_machine_is_compatible("apple,j493")) ||
-	       (bcm4377->hw->id == 0x4388 && of_machine_is_compatible("apple,j616s"));
+	const struct bcm4377_resume_board *board;
+
+	for (board = bcm4377_resume_boards; board->machine; board++)
+		if (bcm4377->hw->id == board->id && of_machine_is_compatible(board->machine))
+			return true;
+	return false;
 }
 
 static bool bcm4377_resume_recovery_allowed(struct hci_dev *hdev)
@@ -3261,7 +3283,8 @@ static bool bcm4377_resume_cold(struct bcm4377_data *bcm4377)
 	dev_info(&bcm4377->pdev->dev,
 		 "the sleep reset the function (window %#x): boot stage %u, RTI status %u\n",
 		 win, bootstage, rti_status);
-	return bootstage != 2 || rti_status != 2;
+	return bootstage != BCM4377_BOOTSTAGE_RUNNING ||
+	       rti_status != BCM4377_RTI_STATUS_RUNNING;
 }
 
 static int bcm4377_resume(struct device *dev)

@@ -13,23 +13,26 @@ def extract(s,n):
  return s[m.start():b]+'\n'
 s=(r/'drivers/bluetooth/hci_bcm4377.c').read_text();core=(r/'net/bluetooth/hci_sync.c').read_text();core_hci=(r/'net/bluetooth/hci_core.c').read_text()
 names=['bcm4377_setup_retry_allowed','bcm4377_queue_setup_retry','bcm4377_setup_retry_work','bcm4377_resume_recovery_supported','bcm4377_resume_recovery_allowed','bcm4377_resume_recovery_invalidate','bcm4377_resume_recovery_sync','bcm4377_resume_recovery_destroy','bcm4377_resume_recovery_work','bcm4377_hci_resume','bcm4377_hci_resume_work','bcm4377_queue_hci_resume','bcm4377_hci_timeout','bcm4377_resume_recovery_stop','bcm4377_hci_open','bcm4377_hci_close','bcm4377_hci_setup_once','bcm4377_hci_setup','bcm4377_hci_post_init','bcm4377_hci_send_frame','bcm4377_init_cfg','bcm4377_hci_unregister_dev','bcm4377_sleep_finish','bcm4377_suspend','bcm4377_resume_cold','bcm4377_resume']
-bodies={n:extract(s,n) for n in names};shared=[]
+# The board table goes ahead of the functions that walk it.
+boards=re.search(r'^static const struct bcm4377_resume_board \{.*?^\};',s,re.M|re.S).group()+'\n'
+bodies={'@boards':boards,**{n:extract(s,n) for n in names}};shared=[]
 if a.old_ref:
  old=subprocess.check_output(['git','show',a.old_ref+':drivers/bluetooth/hci_bcm4377.c'],cwd=r,text=True)
- for n in ['bcm4377_hci_open','bcm4377_hci_close','bcm4377_hci_unregister_dev','bcm4377_sleep_finish','bcm4377_suspend','bcm4377_resume']:bodies[n]=extract(old,n)
+ for n in ['bcm4377_hci_open','bcm4377_hci_close','bcm4377_hci_unregister_dev','bcm4377_suspend','bcm4377_resume']:bodies[n]=extract(old,n)
  shared=[n for n in names if 'resume_recovery' in n or n=='bcm4377_hci_timeout']
 mutations={
  'epoch':('bcm4377_resume_recovery_sync','epoch == bcm4377->resume_epoch && ','' ,33),
  'close':('bcm4377_hci_close','bcm4377_resume_recovery_invalidate(bcm4377);','',18),
  'producer-fence':('bcm4377_resume_recovery_stop','cancel_work_sync(&bcm4377->resume_work);','',21),
  'active-fence':('bcm4377_resume_recovery_stop','flush_work(&bcm4377->hdev->cmd_sync_work);','',40),
- 'board':('bcm4377_resume_recovery_supported','of_machine_is_compatible("apple,j493")','true',13),
- 'board-j616s':('bcm4377_resume_recovery_supported','of_machine_is_compatible("apple,j616s")','true',16),
+ 'board':('bcm4377_resume_recovery_supported','of_machine_is_compatible(board->machine)','true',13),
+ # The BCM4388 row on the J493's board.
+ 'board-j616s':('@boards','"apple,j616s"','"apple,j493"',16),
  # A resume that finds the function reset by the sleep and without firmware.
  'cold-gate':('bcm4377_resume','bcm4377_resume_recovery_supported(bcm4377) &&\n\t       (bcm4377_resume_cold','(bcm4377_resume_cold',54),
  'cold-windows':('bcm4377_resume_cold','if (bcm4377_init_cfg(bcm4377))\n\t\treturn true;','',46),
- 'cold-running-fw':('bcm4377_resume_cold','return bootstage != 2 || rti_status != 2;','return true;',50),
- 'cold-rti':('bcm4377_resume_cold','bootstage != 2 || rti_status != 2','bootstage != 2 && rti_status != 2',52),
+ 'cold-running-fw':('bcm4377_resume_cold','return bootstage != BCM4377_BOOTSTAGE_RUNNING ||\n\t       rti_status != BCM4377_RTI_STATUS_RUNNING;','return true;',50),
+ 'cold-rti':('bcm4377_resume_cold','BCM4377_BOOTSTAGE_RUNNING ||','BCM4377_BOOTSTAGE_RUNNING &&',52),
  'cold-unquiesce':('bcm4377_resume','\t\tbcm4377->quiesced = false;\n\t\tbcm4377->needs_reset = true;','\t\tbcm4377->needs_reset = true;',46),
  'cold-reset':('bcm4377_resume','\t\tbcm4377->needs_reset = true;\n','',48),
  'cold-send':('bcm4377_hci_send_frame','READ_ONCE(bcm4377->resume_cold)','false',58),

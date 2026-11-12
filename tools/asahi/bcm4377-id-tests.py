@@ -103,6 +103,8 @@ def main():
     }
     pieces = {name: take(current, pattern) for name, pattern in patterns.items()}
     old_pieces = {name: take(old, pattern) for name, pattern in patterns.items()}
+    # The admission function walks a table of chip and board pairs; the old one named its pair.
+    pieces['gate'] = take(current, r'^static const struct bcm4377_resume_board \{.*?^\};') + '\n\n' + pieces['gate']
     # The old gate is compiled against the current tables. Later commits added
     # hardware fields and variant settings, so the struct and table may differ,
     # but the old gate must still see the same chip IDs, PCI table and probe code.
@@ -130,12 +132,16 @@ def main():
     assert pieces['gate'].count('0x4378') == 1
     gates['decimal-id'] = pieces['gate'].replace('0x4378', '4378')
     gates['other-chip'] = pieces['gate'].replace('0x4378', '0x4387')
-    gates['board-bypass'] = pieces['gate'].replace('of_machine_is_compatible("apple,j493")', 'true')
-    # The J616s clause gets the same three, and the two clauses must not trade boards.
+    # No row may match on any board, nor on the other row's.
+    assert pieces['gate'].count('of_machine_is_compatible(board->machine)') == 1
+    gates['board-bypass'] = pieces['gate'].replace('of_machine_is_compatible(board->machine)', 'true')
+    assert pieces['gate'].count('"apple,j493"') == 1 and pieces['gate'].count('"apple,j616s"') == 1
+    gates['j493-row-on-j616s'] = pieces['gate'].replace('"apple,j493"', '"apple,j616s"')
+    # The J616s row gets the same three, and the two rows must not trade boards.
     assert pieces['gate'].count('0x4388') == 1
     gates['j616s-decimal-id'] = pieces['gate'].replace('0x4388', '4388')
     gates['j616s-other-chip'] = pieces['gate'].replace('0x4388', '0x4387')
-    gates['j616s-board-bypass'] = pieces['gate'].replace('of_machine_is_compatible("apple,j616s")', 'true')
+    gates['j616s-row-on-j493'] = pieces['gate'].replace('"apple,j616s"', '"apple,j493"')
     gates['crossed-boards'] = pieces['gate'].replace('"apple,j493"', '@').replace('"apple,j616s"', '"apple,j493"').replace('@', '"apple,j616s"')
     results = {}
     def no_core():
