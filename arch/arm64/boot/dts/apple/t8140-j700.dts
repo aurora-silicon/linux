@@ -433,10 +433,11 @@
 #include "isp-imx558.dtsi"
 
 /*
- * The J700 has one video encoder, the ADT's ave1 at 0x289100000 under
- * VENC1_SYS. Encoder 0, which t8140.dtsi describes, isn't there: the ADT has
- * no node for it and VENC0_SYS refuses its target. Its DARTs and domains
- * would wait forever on a domain that never rises.
+ * A J700 has one of the two video encoders, and its ADT describes the one
+ * the unit has: ave (VENC0) or ave1 (VENC1). Both stay disabled here, with
+ * encoder 0's power states and performance report; the bootloader enables
+ * the encoder the ADT describes, its DARTs and its power states. On a unit
+ * with ave1, VENC0_SYS refuses its target, so nothing may enable it there.
  */
 &pmp_report_ave0 {
 	status = "disabled";

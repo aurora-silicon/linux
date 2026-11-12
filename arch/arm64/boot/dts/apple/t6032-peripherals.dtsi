@@ -17,6 +17,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1292 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_msr0>;
 		status = "disabled";
 	};
 
@@ -26,6 +27,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1298 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_msr1>;
 		status = "disabled";
 	};
 
@@ -62,6 +64,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1283 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_jpg>;
 		status = "okay";
 	};
 
@@ -71,6 +74,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1288 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_jpg>;
 		status = "okay";
 	};
 
@@ -520,6 +524,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1292 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_msr0_die1>;
 		status = "disabled";
 	};
 
@@ -529,6 +534,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1298 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_msr1_die1>;
 		status = "disabled";
 	};
 
@@ -565,6 +571,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1283 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_jpg_die1>;
 		status = "okay";
 	};
 
@@ -574,6 +581,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1288 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_jpg_die1>;
 		status = "okay";
 	};
 

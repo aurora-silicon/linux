@@ -81,6 +81,7 @@ enum isp_firmware_version {
 	ISP_FIRMWARE_V_12_4,
 	ISP_FIRMWARE_V_13_5,
 	ISP_FIRMWARE_V_14_7,
+	ISP_FIRMWARE_V_26_6_2,
 };
 
 struct isp_surf {
@@ -354,6 +355,7 @@ struct apple_isp {
 	struct device *dev;
 	const struct apple_isp_hw *hw;
 	enum isp_firmware_version fw_compat;
+	bool preview_26;
 	u32 platform_id;
 	u32 temporal_filter;
 	u32 cam_connections_scheme;
