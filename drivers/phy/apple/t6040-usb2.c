@@ -283,23 +283,33 @@ static const char * const t6040_usb3_region_names[T6040_USB3_NR_REGIONS] = {
  * The ADT tables AppleT6040TypeCPhy applies at every USB3 power-on (mode 4),
  * in its order; the device tree carries them per port, as calibration.
  */
+enum t6040_usb3_tunable {
+	T6040_USB3_TUNABLE_AXI2AF,
+	T6040_USB3_TUNABLE_FABRIC,
+	T6040_USB3_TUNABLE_COMMON_CFG,
+	T6040_USB3_TUNABLE_AXI2AF_LIOA,
+	T6040_USB3_TUNABLE_LANE0,
+	T6040_USB3_TUNABLE_LANE1,
+	T6040_USB3_TUNABLE_AUS40CMN_SHM,
+	T6040_USB3_TUNABLE_AUSPLL,
+	T6040_USB3_TUNABLE_CIO4PLL,
+	T6040_USB3_NR_TUNABLES,
+};
+
 static const struct {
 	const char *prop;
 	enum t6040_usb3_region region;
-} t6040_usb3_tunable_list[] = {
-	{ "apple,tunable-axi2af", T6040_USB3_AXI2AF },
-	{ "apple,tunable-fabric", T6040_USB3_FABRIC },
-	{ "apple,tunable-common-cfg", T6040_USB3_COMMON_CFG },
-	{ "apple,tunable-axi2af-lioa", T6040_USB3_AXI2AF_LIOA },
-	{ "apple,tunable-lane0", T6040_USB3_CORE },
-	{ "apple,tunable-lane1", T6040_USB3_CORE },
-	{ "apple,tunable-aus40cmn-shm", T6040_USB3_CORE },
-	{ "apple,tunable-auspll", T6040_USB3_CORE },
-	{ "apple,tunable-cio4pll", T6040_USB3_CORE },
+} t6040_usb3_tunable_list[T6040_USB3_NR_TUNABLES] = {
+	[T6040_USB3_TUNABLE_AXI2AF] = { "apple,tunable-axi2af", T6040_USB3_AXI2AF },
+	[T6040_USB3_TUNABLE_FABRIC] = { "apple,tunable-fabric", T6040_USB3_FABRIC },
+	[T6040_USB3_TUNABLE_COMMON_CFG] = { "apple,tunable-common-cfg", T6040_USB3_COMMON_CFG },
+	[T6040_USB3_TUNABLE_AXI2AF_LIOA] = { "apple,tunable-axi2af-lioa", T6040_USB3_AXI2AF_LIOA },
+	[T6040_USB3_TUNABLE_LANE0] = { "apple,tunable-lane0", T6040_USB3_CORE },
+	[T6040_USB3_TUNABLE_LANE1] = { "apple,tunable-lane1", T6040_USB3_CORE },
+	[T6040_USB3_TUNABLE_AUS40CMN_SHM] = { "apple,tunable-aus40cmn-shm", T6040_USB3_CORE },
+	[T6040_USB3_TUNABLE_AUSPLL] = { "apple,tunable-auspll", T6040_USB3_CORE },
+	[T6040_USB3_TUNABLE_CIO4PLL] = { "apple,tunable-cio4pll", T6040_USB3_CORE },
 };
-
-#define T6040_USB3_TUNABLE_AUSPLL	7
-#define T6040_USB3_NR_TUNABLES		ARRAY_SIZE(t6040_usb3_tunable_list)
 
 struct t6040_usb2_phy {
 	struct device *dev;
@@ -1586,8 +1596,8 @@ static bool t6040_dp_only(struct t6040_usb2_phy *tphy)
 	return !tphy->usb3_ok;
 }
 
-/* apply_tunables' generic tables: the first six of t6040_usb3_tunable_list. */
-#define T6040_DP_NR_GENERIC_TUNABLES	6
+/* apply_tunables' generic tables: those of t6040_usb3_tunable_list up to the lanes'. */
+#define T6040_DP_NR_GENERIC_TUNABLES	(T6040_USB3_TUNABLE_LANE1 + 1)
 
 /*
  * slpctrl_init for DP on both lanes: the cmn_rm_ovrd/txrx_rm_ovrd releases of
@@ -1733,10 +1743,6 @@ static int t6040_dp_seq_step(struct t6040_usb2_phy *tphy, const struct atc_op *s
 	return ret;
 }
 
-/* The ADT's lane0 and lane1 tables in t6040_usb3_tunable_list. */
-#define T6040_USB3_TUNABLE_LANE0	4
-static_assert(T6040_USB3_TUNABLE_LANE0 + 2 == T6040_DP_NR_GENERIC_TUNABLES);
-
 /*
  * A lane's registers are back at their reset values each time the lane has been powered
  * down: after one link at a rate, one DPMS cycle or one failed training, the lane tables
@@ -1748,7 +1754,7 @@ static void t6040_dp_lane_tunables(struct t6040_usb2_phy *tphy)
 	void __iomem *core = t6040_core(tphy);
 	size_t i;
 
-	for (i = T6040_USB3_TUNABLE_LANE0; i < T6040_USB3_TUNABLE_LANE0 + 2; i++)
+	for (i = T6040_USB3_TUNABLE_LANE0; i <= T6040_USB3_TUNABLE_LANE1; i++)
 		apple_tunable_apply(core, tphy->tunables[i]);
 	for (i = ARRAY_SIZE(t6040_dptx_tunables) - T6040_DPTX_LANE_TUNABLES;
 	     i < ARRAY_SIZE(t6040_dptx_tunables); i++)
