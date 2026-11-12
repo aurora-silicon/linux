@@ -2095,6 +2095,7 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 		ctx->metadata_timing = dcp_firmware_metadata_enabled(dcp);
 		ctx->sdr_default_rgb = dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
 				       !dcp_has_panel(dcp);
+		ctx->pq_dsc = dcp->fw_compat == DCP_FIRMWARE_V_27_0;
 	}
 	ctx->zero_vrr_range_fallback = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
 	modes = enumerate_modes(ctx, &nr_modes, dcp->width_mm, dcp->height_mm,
