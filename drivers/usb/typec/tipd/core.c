@@ -2583,6 +2583,22 @@ VISIBLE_IF_KUNIT int cd321x_init_mux(struct cd321x *cd321x)
 }
 EXPORT_SYMBOL_IF_KUNIT(cd321x_init_mux);
 
+/* The J613 profile enables its disabled DCP routes during DRM coldplug. */
+static bool cd321x_display_gate_pending(void)
+{
+	struct device_node *dcp;
+	bool pending;
+
+	if (!IS_ENABLED(CONFIG_DRM_APPLE) || !of_machine_is_compatible("apple,j613"))
+		return false;
+
+	dcp = of_find_node_by_path("dcp");
+	pending = dcp && of_property_present(dcp, "apple,j613-25g83-profile") &&
+		  !of_property_present(dcp, "apple,j613-25g83-coldplug-done");
+	of_node_put(dcp);
+	return pending;
+}
+
 static int
 cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 {
@@ -3218,6 +3234,10 @@ int tipd_init(struct tps6598x *tps)
 	u32 vid = 0;
 	int ret, cleanup_ret;
 	bool reset_allowed = true;
+
+	/* Do not retain a PHY-only mux handle before the route changeset runs. */
+	if (cd321x_display_gate_pending())
+		return -EPROBE_DEFER;
 
 	dev_dbg(tps->dev, "Type-C probe start\n");
 	tps->reset = devm_gpiod_get_optional(tps->dev, "reset", GPIOD_OUT_LOW);

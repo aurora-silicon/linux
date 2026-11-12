@@ -383,6 +383,10 @@ def probe(root):
 #define dev_err_probe(...) (-EINVAL)
 struct fwnode_handle { int unused; };
 static int connect_error,irq_error,register_error,node_puts,mux_get_error,controller_mode;
+#define EPROBE_DEFER 517
+/* Real OF/profile combinations are covered by j613-mux-order-tests.py. */
+static bool gate_pending;
+static bool cd321x_display_gate_pending(void) { return gate_pending; }
 static void *devm_gpiod_get_optional(void *d,const char *s,int v) { (void)d;(void)s;(void)v;return NULL; }
 static void msleep(unsigned ms) { (void)ms; }
 static bool device_is_compatible(void *d,const char *s) { (void)d;(void)s;return false; }
@@ -421,6 +425,9 @@ static void probe_initial(struct cd321x *c) {
 }
 int main(void) {
  struct cd321x c;
+ probe_initial(&c);gate_pending=true;
+ assert(tipd_init(&c.tps)==-EPROBE_DEFER&&!node_puts&&!reset_calls&&!gpio_calls);
+ gate_pending=false;
  probe_initial(&c);irq_error=-ENOSPC;phy_error=-ETIMEDOUT;
  assert(tipd_init(&c.tps)==-ENOSPC&&reset_calls==0&&gpio_calls==0&&port.owner==&route&&port.safe_pending&&unregisters==1&&node_puts==1);
  probe_initial(&c);connect_error=-EAGAIN;role_error=-EBUSY;

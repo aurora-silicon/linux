@@ -598,6 +598,20 @@ int __init apple_j613_25g83_coldplug(void)
 			display_clock_hz);
 	}
 out:
+	/* Publish completion on refusal too: disabled routes must then be skipped. */
+	if (nodes[J613_DCP] && of_machine_is_compatible("apple,j613")) {
+		struct of_changeset *done = kzalloc_obj(*done);
+
+		if (done) {
+			of_changeset_init(done);
+			if (of_changeset_add_prop_bool(done, nodes[J613_DCP],
+						       "apple,j613-25g83-coldplug-done") ||
+			    of_changeset_apply(done)) {
+				of_changeset_destroy(done);
+				kfree(done);
+			}
+		}
+	}
 	for (i = 0; i < ARRAY_SIZE(nodes); i++)
 		of_node_put(nodes[i]);
 	return ret;
