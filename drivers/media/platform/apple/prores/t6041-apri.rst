@@ -4,13 +4,16 @@
 T6041 ProRes initialization data
 ===============================
 
-The T6041 ProRes encoder requires ``apple/prores-t6041-init.bin``.  This file
-is generated from the copy of AppleProResHW installed on the same Mac and is
-not distributed with Linux.  T6000 and T8140 do not request this file.
+The driver carries the T6041 ProRes initialization rows built in.  A
+machine may override them with ``apple/prores-t6041-init.bin``, an APRI
+container generated for that Mac from its own macOS and not distributed with
+Linux.  Without the file, the built-in rows are used.  T6000 and T8140 do not
+request this file.
 
-The driver requests and validates the whole file before mapping device
-registers.  A missing or invalid file therefore makes the T6041 device fail
-to probe without partially initializing the encoder.
+When the file is present, the driver reads and validates the whole of it
+before mapping device registers.  An invalid file makes the device fail to
+probe without partially initializing the encoder; it never falls back to the
+built-in rows.
 
 APRI version 1
 ==============
@@ -48,5 +51,5 @@ order.  It then installs the descriptor ring and statistics buffers and
 continues with the common T6000/T8140 initialization sequence.
 
 The container deliberately has no MMIO addresses, selectors, power policy,
-or arbitrary write commands.  File integrity and installation provenance are
-the responsibility of the vendorfw manifest that carries the per-Mac file.
+or arbitrary write commands.  File integrity is the responsibility of the
+package that installs the per-Mac file.

@@ -256,11 +256,15 @@ struct apr_variant {
 	size_t num_engine_tunables;
 	const struct apr_tunable *wrapper_tunables;
 	size_t num_wrapper_tunables;
+	/* SCODEC-system rows, applied to the "aux" window before the engine. */
+	const struct apr_tunable *aux_tunables;
+	size_t num_aux_tunables;
 	const char *reg_names[3];
 	unsigned int num_regs;
 	unsigned int num_irqs;
 	u32 ring_bytes;
 	u32 desc_bytes;
+	/* Optional per-machine APRI file that replaces the built-in rows. */
 	const char *firmware_name;
 };
 
@@ -314,6 +318,9 @@ struct apr_dev {
 	void __iomem *wrapper;
 	void __iomem *aux;
 	struct apr_init_data init;
+	/* Rows applied at power-up, per APRI block: built-in or the file's. */
+	const struct apr_tunable *tunables[APRI_BLOCK_COUNT];
+	size_t num_tunables[APRI_BLOCK_COUNT];
 	struct reset_control *reset;
 	struct dev_pm_domain_list *pd_list;
 	int irq[2];
@@ -389,19 +396,14 @@ static void apr_hw_init(struct apr_dev *apr)
 
 	apr_write(apr, APR_REG_MODE, APR_MODE_OFF);
 	apr_write(apr, APR_REG_IRQ_ENABLE, 0);
-	if (v->firmware_name) {
-		apr_apply(apr->aux, apr->init.blocks[APRI_SYSTEM_BLOCK].entries,
-			  apr->init.blocks[APRI_SYSTEM_BLOCK].count);
-		apr_apply(apr->regs, apr->init.blocks[APRI_CORE_BLOCK].entries,
-			  apr->init.blocks[APRI_CORE_BLOCK].count);
-		apr_apply(apr->wrapper, apr->init.blocks[APRI_WRAPPER_BLOCK].entries,
-			  apr->init.blocks[APRI_WRAPPER_BLOCK].count);
-	} else {
-		apr_apply(apr->regs, v->engine_tunables, v->num_engine_tunables);
-		if (v->num_wrapper_tunables)
-			apr_apply(apr->wrapper, v->wrapper_tunables,
-				  v->num_wrapper_tunables);
-	}
+	if (apr->aux)
+		apr_apply(apr->aux, apr->tunables[APRI_SYSTEM_BLOCK],
+			  apr->num_tunables[APRI_SYSTEM_BLOCK]);
+	apr_apply(apr->regs, apr->tunables[APRI_CORE_BLOCK],
+		  apr->num_tunables[APRI_CORE_BLOCK]);
+	if (apr->wrapper)
+		apr_apply(apr->wrapper, apr->tunables[APRI_WRAPPER_BLOCK],
+			  apr->num_tunables[APRI_WRAPPER_BLOCK]);
 	apr_write(apr, APR_REG_RING_HEAD, 0);
 	apr_write(apr, APR_REG_RING_TAIL, 0);
 	apr_write(apr, APR_REG_RING_SIZE, v->ring_bytes);
@@ -1180,10 +1182,52 @@ static void apr_cleanup(void *data)
 	v4l2_device_unregister(&apr->v4l2_dev);
 }
 
+/*
+ * Pick the power-up rows before touching the hardware. The built-in tables
+ * are the default. A variant with a firmware name also accepts a per-machine
+ * APRI file that replaces them; a file that is present but malformed fails
+ * the probe rather than silently falling back.
+ */
+static int apr_select_tunables(struct apr_dev *apr)
+{
+	const struct apr_variant *v = apr->variant;
+	const struct firmware *firmware;
+	struct device *dev = apr->dev;
+	unsigned int i;
+	int ret;
+
+	apr->tunables[APRI_SYSTEM_BLOCK] = v->aux_tunables;
+	apr->num_tunables[APRI_SYSTEM_BLOCK] = v->num_aux_tunables;
+	apr->tunables[APRI_CORE_BLOCK] = v->engine_tunables;
+	apr->num_tunables[APRI_CORE_BLOCK] = v->num_engine_tunables;
+	apr->tunables[APRI_WRAPPER_BLOCK] = v->wrapper_tunables;
+	apr->num_tunables[APRI_WRAPPER_BLOCK] = v->num_wrapper_tunables;
+
+	if (v->firmware_name &&
+	    !firmware_request_nowarn(&firmware, v->firmware_name, dev)) {
+		ret = apr_parse_t6041_init(firmware->data, firmware->size,
+					   &apr->init);
+		release_firmware(firmware);
+		if (ret)
+			return dev_err_probe(dev, ret, "invalid %s\n",
+					     v->firmware_name);
+		for (i = 0; i < APRI_BLOCK_COUNT; i++) {
+			apr->tunables[i] = apr->init.blocks[i].entries;
+			apr->num_tunables[i] = apr->init.blocks[i].count;
+		}
+		dev_info(dev, "initialization rows from %s\n", v->firmware_name);
+	}
+
+	if (!apr->num_tunables[APRI_CORE_BLOCK])
+		return dev_err_probe(dev, -ENOENT,
+				     "no initialization rows for this engine\n");
+
+	return 0;
+}
+
 static int apr_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
-	const struct firmware *firmware;
 	struct video_device *vdev;
 	void __iomem *regs[3] = {};
 	struct apr_dev *apr;
@@ -1197,17 +1241,9 @@ static int apr_probe(struct platform_device *pdev)
 	apr->variant = of_device_get_match_data(dev);
 	if (!apr->variant)
 		return -ENODEV;
-	if (apr->variant->firmware_name) {
-		ret = request_firmware(&firmware, apr->variant->firmware_name, dev);
-		if (ret)
-			return dev_err_probe(dev, ret,
-					     "required initialization firmware unavailable\n");
-		ret = apr_parse_t6041_init(firmware->data, firmware->size, &apr->init);
-		release_firmware(firmware);
-		if (ret)
-			return dev_err_probe(dev, ret,
-					     "invalid initialization firmware\n");
-	}
+	ret = apr_select_tunables(apr);
+	if (ret)
+		return ret;
 	mutex_init(&apr->vdev_lock);
 	spin_lock_init(&apr->hw_lock);
 	INIT_DELAYED_WORK(&apr->watchdog, apr_watchdog);
