@@ -49,6 +49,7 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/panic.h>
+#include <linux/pm_domain.h>
 #include <linux/smp.h>
 #include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/sleep.h>
@@ -106,6 +107,8 @@ struct aura_s2r_mailbox {
 #define CLUSTER_P		0x4
 #define CLUSTER_AVE		0x8
 #define CLUSTER_ON		0xf
+/* AVE: a transition still in progress, as when a lower waits for a domain it powers */
+#define CLUSTER_PENDING		BIT(4)
 /* Set when a complex's up sequence ends, and cleared by writing 1. */
 #define CLUSTER_UP_DONE		BIT(5)
 #define CLUSTER_E_READY		BIT(5)
@@ -436,6 +439,12 @@ struct apple_sleep_soc {
 	u32 wake_last_word;
 	/* The PCIe host whose port the radio is on, for its PERST#, or NULL */
 	const char *radio_pcie;
+	/* The encoders' system power words: their domains need the AVE complex up */
+	const u32 *ave_domains;
+	unsigned int nave_domains;
+	/* The PMC whose cluster vote for the encoders needs the complex up, and its bit */
+	const char *ave_pmc;
+	u32 ave_pmc_cluster;
 };
 
 struct apple_sleep {
@@ -515,6 +524,14 @@ struct apple_sleep {
 	u64 resumes_after;
 	int cluster_e_ret;
 	int cluster_ave_ret;
+	/* The AVE complex, as the parent domain of the encoders' enabled domains */
+	struct generic_pm_domain ave_pd;
+	bool ave_pd_owned;
+	/* Which of the SoC's encoder domains are its subdomains, one bit each */
+	unsigned long ave_linked;
+	/* Its subdomains: the encoders' system domains, then the PMC's cluster vote */
+	struct device_node *ave_children[4];
+	unsigned int ave_nchildren;
 	int cluster_ave_commit_ret;
 	unsigned int ps_rewoken;
 	unsigned int ps_rewake_timeouts;
@@ -2764,7 +2781,7 @@ static int apple_sleep_commit(unsigned long unused)
 	writel(PWRGATE_ON, s->pwrgate + s->soc->pwrgate_cpm[0]);
 	writel(PWRGATE_ON, s->pwrgate + s->soc->pwrgate_cpm[1]);
 
-	/* Already off since .prepare, as on macOS. */
+	/* Already off since .prepare, or since genpd turned the encoders off, as on macOS. */
 	writel(0, s->cluster + CLUSTER_AVE);
 	s->cluster_ave_commit_ret = readl_poll_timeout_atomic(s->cluster + CLUSTER_AVE, val, !val,
 							      1, 5000);
@@ -2984,12 +3001,196 @@ static void apple_sleep_ave_off(struct apple_sleep *s)
 		dev_warn(s->dev, "AVE complex didn't go off: %#x\n", val);
 }
 
+/*
+ * The encoders' system power domains (VENC0_SYS, VENC1_SYS) only power on with the complex
+ * up: with it off, VENC0_SYS refuses its target and the complex is left pending, and with
+ * one of them on the complex doesn't go off. genpd ignores a failed power-on in the noirq
+ * resume, so without the parent link the first wake raised VENC0_SYS under a complex that
+ * .prepare and the wake had turned off, and apple-dart's restore of the encoder's DARTs in
+ * that unpowered block reset the SoC. As their parent, the complex comes on before either
+ * of them and goes off after both: off at boot and after each wake, on while an encoder is
+ * in use, as macOS has it. The PMC's cluster vote for the encoders (VENC-CLSTR-V) is the
+ * same: raised with the complex off, the complex's next power-up never completes, and with
+ * the complex off first the vote doesn't drop. So it's a subdomain too.
+ */
+static int apple_sleep_ave_pd_on(struct generic_pm_domain *pd)
+{
+	struct apple_sleep *s = container_of(pd, struct apple_sleep, ave_pd);
+	u32 val;
+	int ret;
+
+	/* A raise over a lower still in progress never completes. */
+	ret = readl_poll_timeout_atomic(s->cluster + CLUSTER_AVE, val, !(val & CLUSTER_PENDING),
+					1, CLUSTER_TIMEOUT_US);
+	if (ret) {
+		dev_err(s->dev, "AVE complex still busy: %#x\n", val);
+		return ret;
+	}
+
+	writel(CLUSTER_ON, s->cluster + CLUSTER_AVE);
+	ret = readl_poll_timeout_atomic(s->cluster + CLUSTER_AVE, val, val & CLUSTER_UP_DONE, 1,
+					CLUSTER_TIMEOUT_US);
+	if (ret)
+		dev_err(s->dev, "AVE complex didn't come on: %#x\n", val);
+
+	return ret;
+}
+
+static int apple_sleep_ave_pd_off(struct generic_pm_domain *pd)
+{
+	struct apple_sleep *s = container_of(pd, struct apple_sleep, ave_pd);
+	unsigned int i;
+	u32 val;
+	int ret;
+
+	/*
+	 * Each encoder domain reads actual 0 a moment before its switch is done. Lowered
+	 * before that, the complex stays pending and its next raise never completes, so wait
+	 * for BUSY to clear too, as macOS waits for a lowered word to read 0 in its low bits.
+	 */
+	for (i = 0; i < s->soc->nave_domains; i++) {
+		if (!(s->ave_linked & BIT(i)))
+			continue;
+		ret = readl_poll_timeout_atomic(s->ps + s->soc->ave_domains[i], val,
+						!(val & (PS_BUSY | PS_ACTUAL)), 1,
+						PS_OFF_TIMEOUT_US);
+		if (ret) {
+			dev_err(s->dev, "encoder domain %#x not off: %#x\n",
+				s->soc->ave_domains[i], val);
+			return -EBUSY;
+		}
+	}
+
+	/* Target 0, and the done flag of its last power-up. */
+	writel(CLUSTER_UP_DONE, s->cluster + CLUSTER_AVE);
+	ret = readl_poll_timeout_atomic(s->cluster + CLUSTER_AVE, val, !val, 1,
+					CLUSTER_TIMEOUT_US);
+	if (ret)
+		dev_err(s->dev, "AVE complex didn't go off: %#x\n", val);
+
+	return ret;
+}
+
+/* The PMGR node "ps" maps */
+static struct device_node *apple_sleep_ps_pmgr(struct apple_sleep *s)
+{
+	struct device_node *np;
+	struct resource res;
+
+	for_each_compatible_node(np, NULL, "apple,t8103-pmgr")
+		if (!of_address_to_resource(np, 0, &res) && res.start == s->ps_res.start)
+			return np;
+
+	return NULL;
+}
+
+static void apple_sleep_ave_pd_remove(void *data)
+{
+	struct apple_sleep *s = data;
+	struct of_phandle_args parent = { .np = s->dev->of_node }, child = {};
+	unsigned int i;
+
+	for (i = 0; i < s->ave_nchildren; i++) {
+		child.np = s->ave_children[i];
+		of_genpd_remove_subdomain(&parent, &child);
+		of_node_put(s->ave_children[i]);
+	}
+	s->ave_nchildren = 0;
+	of_genpd_del_provider(s->dev->of_node);
+	pm_genpd_remove(&s->ave_pd);
+	s->ave_pd_owned = false;
+}
+
+/* The enabled encoder domains, and with any of them the PMC's encoder cluster vote. */
+static void apple_sleep_ave_find(struct apple_sleep *s)
+{
+	const struct apple_sleep_soc *soc = s->soc;
+	struct device_node *pmgr, *pmc, *np;
+	unsigned int i;
+	u32 val;
+
+	pmgr = apple_sleep_ps_pmgr(s);
+	if (!pmgr)
+		return;
+	for_each_available_child_of_node(pmgr, np) {
+		for (i = 0; i < soc->nave_domains; i++) {
+			if (of_property_read_u32(np, "reg", &val) || val != soc->ave_domains[i] ||
+			    s->ave_nchildren == ARRAY_SIZE(s->ave_children))
+				continue;
+			s->ave_linked |= BIT(i);
+			s->ave_children[s->ave_nchildren++] = of_node_get(np);
+		}
+	}
+	of_node_put(pmgr);
+	if (!s->ave_nchildren || !soc->ave_pmc)
+		return;
+
+	for_each_compatible_node(pmc, NULL, soc->ave_pmc) {
+		if (!of_device_is_available(pmc))
+			continue;
+		for_each_available_child_of_node(pmc, np) {
+			if (of_property_read_u32(np, "apple,cluster-bit", &val) ||
+			    val != soc->ave_pmc_cluster ||
+			    s->ave_nchildren == ARRAY_SIZE(s->ave_children))
+				continue;
+			s->ave_children[s->ave_nchildren++] = of_node_get(np);
+		}
+	}
+}
+
+/* The complex as the parent of the encoders' domains, or left to .prepare if none is enabled. */
+static int apple_sleep_ave_pd_init(struct apple_sleep *s)
+{
+	struct of_phandle_args parent = { .np = s->dev->of_node }, child = {};
+	unsigned int i;
+	int ret;
+
+	apple_sleep_ave_find(s);
+	if (!s->ave_nchildren)
+		return 0;
+
+	s->ave_pd.name = "ave_complex";
+	s->ave_pd.power_on = apple_sleep_ave_pd_on;
+	s->ave_pd.power_off = apple_sleep_ave_pd_off;
+	s->ave_pd.flags = GENPD_FLAG_IRQ_SAFE | GENPD_FLAG_NO_STAY_ON | GENPD_FLAG_NO_SYNC_STATE;
+	ret = pm_genpd_init(&s->ave_pd, NULL,
+			    !(readl(s->cluster + CLUSTER_AVE) & CLUSTER_ON));
+	if (!ret) {
+		ret = of_genpd_add_provider_simple(s->dev->of_node, &s->ave_pd);
+		if (ret)
+			pm_genpd_remove(&s->ave_pd);
+	}
+	if (ret) {
+		for (i = 0; i < s->ave_nchildren; i++)
+			of_node_put(s->ave_children[i]);
+		s->ave_nchildren = 0;
+		s->ave_linked = 0;
+		return ret;
+	}
+	s->ave_pd_owned = true;
+	ret = devm_add_action_or_reset(s->dev, apple_sleep_ave_pd_remove, s);
+	if (ret)
+		return ret;
+
+	/* -EPROBE_DEFER until the PMGR's and the PMC's drivers have their domains */
+	for (i = 0; i < s->ave_nchildren; i++) {
+		child.np = s->ave_children[i];
+		ret = of_genpd_add_subdomain(&parent, &child);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
 static int apple_sleep_prepare(void)
 {
 	struct apple_sleep *s = apple_sleep;
 	int i;
 
-	apple_sleep_ave_off(s);
+	/* With an encoder's domain linked, genpd has it off once the encoders are. */
+	if (!s->ave_pd_owned)
+		apple_sleep_ave_off(s);
 
 	for (i = 0; i < SLEEP_DISPLAY_COUNT; i++) {
 		struct platform_device *pdev;
@@ -3450,6 +3651,9 @@ static int apple_sleep_probe(struct platform_device *pdev)
 				     &s->ps_res);
 	if (ret)
 		return ret;
+	ret = apple_sleep_ave_pd_init(s);
+	if (ret)
+		return dev_err_probe(dev, ret, "cannot link the AVE complex\n");
 	s->driver_down = devm_bitmap_zalloc(dev, resource_size(&s->ps_res) / 4, GFP_KERNEL);
 	if (!s->driver_down)
 		return -ENOMEM;
@@ -3620,6 +3824,9 @@ static const struct apple_sleep_word t8140_gate_off[] = {
 	{ "avd_sys", 0x270 }, { "jpg", 0x230 }, { "venc0_sys", 0x240 },
 };
 
+/* VENC0_SYS, VENC1_SYS */
+static const u32 t8140_ave_domains[] = { 0x240, 0x248 };
+
 static const struct apple_sleep_wake_name t8140_wake_names[] = {
 	{ 0, "AOP.AICWakeupAP" }, { 5, "AOP.CPUWakeupAP" },
 	{ 42, "AOP.OutboxNotEmpty" }, { 62, "AOP.SPMI0.SW3" },
@@ -3678,6 +3885,10 @@ static const struct apple_sleep_soc t8140_sleep_soc = {
 	/* 21 sources. Measured: macOS reads 0x001fef77 there. */
 	.wake_last_word = GENMASK(20, 0),
 	.radio_pcie = "apple,t8140-pcie",
+	.ave_domains = t8140_ave_domains,
+	.nave_domains = ARRAY_SIZE(t8140_ave_domains),
+	.ave_pmc = "apple,t8140-pmc",
+	.ave_pmc_cluster = 3,
 };
 
 /*
