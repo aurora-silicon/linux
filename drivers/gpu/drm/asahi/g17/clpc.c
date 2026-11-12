@@ -15,6 +15,7 @@ void asahi_clpc_gpu_put(struct apple_clpc_gpu *gpu)
 {
 	apple_clpc_gpu_put(gpu);
 }
+
 int asahi_pmp_report_wait_handed(unsigned int timeout_ms)
 {
 	return apple_pmp_report_wait_handed(timeout_ms);

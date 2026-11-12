@@ -403,7 +403,7 @@ int asahi_sysfs_register(struct device *dev, const void *snapshot,
 		}
 		if (hibernate) {
 			stats->hib_notifier.notifier_call = asahi_stats_hib_notify;
-			/* Above the DCP (10) and PMP (10) notifiers. */
+			/* Ahead of the display (10, -5) and PMP (10) notifiers. */
 			stats->hib_notifier.priority = 20;
 			ret = register_pm_notifier(&stats->hib_notifier);
 			if (ret) {
@@ -420,7 +420,7 @@ int asahi_sysfs_register(struct device *dev, const void *snapshot,
 	 * notifier (-10, which marks the late prepare) without the drain (20), and
 	 * the image would hold a GPU that was never drained.
 	 */
-	ret = asahi_hibernate_device_bound(hibernate != NULL);
+	ret = asahi_hibernate_device_bound(hibernate);
 	if (ret) {
 		if (stats->suspend) {
 			if (stats->hibernate)
@@ -439,7 +439,7 @@ int asahi_sysfs_register(struct device *dev, const void *snapshot,
 
 	ret = device_create_file(dev, &stats->attr);
 	if (ret) {
-		asahi_hibernate_device_unbound(hibernate != NULL);
+		asahi_hibernate_device_unbound(hibernate);
 		if (stats->suspend) {
 			if (stats->hibernate)
 				unregister_pm_notifier(&stats->hib_notifier);
@@ -452,7 +452,7 @@ int asahi_sysfs_register(struct device *dev, const void *snapshot,
 	ret = device_create_file(dev, &stats->memory_attr);
 	if (ret) {
 		device_remove_file(dev, &stats->attr);
-		asahi_hibernate_device_unbound(hibernate != NULL);
+		asahi_hibernate_device_unbound(hibernate);
 		if (stats->suspend) {
 			if (stats->hibernate)
 				unregister_pm_notifier(&stats->hib_notifier);
@@ -515,7 +515,7 @@ void asahi_sysfs_unregister(struct device *dev, void *handle)
 		return;
 
 	/* Out of the gate first: the reverse of asahi_sysfs_register(). */
-	asahi_hibernate_device_unbound(stats->hibernate != NULL);
+	asahi_hibernate_device_unbound(stats->hibernate);
 	/* Both notifier removal and file removal join readers of the Rust Arc. */
 	if (stats->suspend) {
 		if (stats->hibernate)
