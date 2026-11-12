@@ -16,6 +16,7 @@
 #include <linux/of_dma.h>
 #include <linux/overflow.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
 #include <linux/reset.h>
 #include <linux/spinlock.h>
 #include <linux/interrupt.h>
@@ -162,6 +163,8 @@ struct admac_data {
 	bool evolved_layout;
 	bool split_channels;
 	bool ctl_programmed;
+	bool global_state_pending;
+	u64 global_event_count;
 	int irq;
 	int irq_index;
 	int nchannels;
@@ -674,6 +677,14 @@ static void admac_synchronize(struct dma_chan *chan)
 	}
 }
 
+static void admac_clear_global_state(struct admac_data *ad)
+{
+	int i;
+
+	for (i = 0; i < IRQ_NOUTPUTS; i++)
+		writel(U32_MAX, ad->base + REG_GLOBAL_INTSTATE(i));
+}
+
 static int admac_alloc_chan_resources(struct dma_chan *chan)
 {
 	struct admac_chan *adchan = to_admac_chan(chan);
@@ -688,8 +699,13 @@ static int admac_alloc_chan_resources(struct dma_chan *chan)
 	 * the audio driver has set the audio power state, before its first
 	 * channel request. The one-time CTL write is done here, before the
 	 * first carveout access.
+	 * Stale global state must also wait until the controller is powered.
 	 */
 	mutex_lock(&ad->cache_alloc_lock);
+	if (ad->global_state_pending) {
+		admac_clear_global_state(ad);
+		ad->global_state_pending = false;
+	}
 	if (!ad->ctl_programmed) {
 		if (ad->split_channels)
 			writel_relaxed(0x18080001, ad->base + REG_CTL);
@@ -866,9 +882,12 @@ static irqreturn_t admac_interrupt(int irq, void *devid)
 	}
 
 	if (global_intstate) {
-		dev_warn(ad->dev, "clearing unknown global interrupt flag: %x\n",
-			 global_intstate);
-		writel_relaxed(~(u32) 0, ad->base + REG_GLOBAL_INTSTATE(ad->irq_index));
+		/* Global events are sticky W1C notifications, not channel faults. */
+		writel_relaxed(global_intstate,
+			       ad->base + REG_GLOBAL_INTSTATE(ad->irq_index));
+		ad->global_event_count++;
+		dev_dbg_ratelimited(ad->dev, "global event: %x (count %llu)\n",
+				    global_intstate, ad->global_event_count);
 	}
 
 	return IRQ_HANDLED;
@@ -1086,6 +1105,11 @@ static int admac_probe(struct platform_device *pdev)
 		return dev_err_probe(&pdev->dev, err,
 				     "unable to trigger reset\n");
 
+	if (ad->split_channels)
+		ad->global_state_pending = true;
+	else
+		admac_clear_global_state(ad);
+
 	err = request_irq(irq, admac_interrupt, 0, dev_name(&pdev->dev), ad);
 	if (err) {
 		dev_err_probe(&pdev->dev, err,
@@ -1127,6 +1151,21 @@ static void admac_remove(struct platform_device *pdev)
 	reset_control_rearm(ad->rstc);
 }
 
+static int admac_pm_resume(struct device *dev)
+{
+	struct admac_data *ad = dev_get_drvdata(dev);
+
+	/* Split-bank controllers are powered by the audio client later. */
+	if (ad->split_channels)
+		ad->global_state_pending = true;
+	else
+		admac_clear_global_state(ad);
+
+	return 0;
+}
+
+static DEFINE_NOIRQ_DEV_PM_OPS(admac_pm_ops, NULL, admac_pm_resume);
+
 static const struct admac_hw admac_t8013_hw = {
 	.set_unk28 = false,
 };
@@ -1163,6 +1202,7 @@ static struct platform_driver apple_admac_driver = {
 	.driver = {
 		.name = "apple-admac",
 		.of_match_table = admac_of_match,
+		.pm = pm_sleep_ptr(&admac_pm_ops),
 	},
 	.probe = admac_probe,
 	.remove = admac_remove,
