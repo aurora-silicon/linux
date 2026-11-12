@@ -45,6 +45,7 @@
 #include <linux/phy/apple-t6040-cio.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
+#include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/reset-controller.h>
 #include <linux/soc/apple/dp-tunnel.h>
@@ -335,6 +336,8 @@ struct t6040_usb2_phy {
 	/* ADT tunable_USB2PHY_HOST, applied after the signal setup. */
 	struct apple_tunable *tunable_usb2_host;
 	struct apple_rtkit *rtk;
+	struct notifier_block pd_nb;	/* keeps the power domain on under a running coprocessor */
+	bool fw_live;		/* the coprocessor runs; pd_nb reads it under the domain's lock */
 	struct device *mbox_dev;
 	struct completion app_reply;
 	struct t6040_recovery_state recovery;
@@ -788,6 +791,8 @@ static int t6040_usb3_cpu_start(struct t6040_usb2_phy *tphy)
 		dev_err(tphy->dev, "USB3: the PHY coprocessor runs without an RTKit session\n");
 		return -EBUSY;
 	}
+	/* From here to the end of its stop the coprocessor's power domains stay on. */
+	WRITE_ONCE(tphy->fw_live, true);
 	writel(T6040_CPU_RUN_START, cpu + T6040_CPU_RUN);
 	usleep_range(5000, 6000);
 	return apple_rtkit_boot(tphy->rtk);
@@ -893,6 +898,8 @@ static void t6040_usb3_firmware_power_down(struct t6040_usb2_phy *tphy)
 
 	/* Leave the transport stopped until the next firmware start. Free drains RX. */
 	t6040_rtkit_stop_transport(tphy);
+	/* Stopped, or to be power-cycled: either way its domains may go off again. */
+	WRITE_ONCE(tphy->fw_live, false);
 	/* Power Down is asynchronous; never wait solely for its application reply. */
 	acknowledged = completion_done(&tphy->app_reply);
 	if (!acknowledged)
@@ -2931,6 +2938,51 @@ static void t6040_rtkit_cleanup(void *data)
 	t6040_rtkit_stop_transport(data);
 }
 
+/*
+ * Whether the PHY's power domain has to stay on at a power-off that is about
+ * to happen: while the coprocessor's firmware runs.
+ *
+ * The PHY's domain, and the mailbox's above it, power the coprocessor. A
+ * system sleep takes the domain of every device that has suspended off, a
+ * suspend-to-idle included, which leaves a host running: its controller
+ * keeps its own domain as a syscore device, and nothing kept this one. The
+ * coprocessor then lost its power under a firmware the driver took for
+ * running, and did not acknowledge the idle request of its next stop.
+ */
+static bool t6040_pd_stays_on(unsigned long action, bool fw_live)
+{
+	return action == GENPD_NOTIFY_PRE_OFF && fw_live;
+}
+
+/* Called by the PM domain with its lock held, which is a spinlock for these domains. */
+static int t6040_pd_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	struct t6040_usb2_phy *tphy = container_of(nb, struct t6040_usb2_phy, pd_nb);
+
+	if (t6040_pd_stays_on(action, READ_ONCE(tphy->fw_live)))
+		return notifier_from_errno(-EBUSY);
+	return NOTIFY_OK;
+}
+
+static void t6040_pd_notifier_remove(void *data)
+{
+	dev_pm_genpd_remove_notifier(data);
+}
+
+/* Without a single PM domain nothing takes the coprocessor's power away under it. */
+static int t6040_pd_notifier_init(struct t6040_usb2_phy *tphy)
+{
+	int ret;
+
+	tphy->pd_nb.notifier_call = t6040_pd_notify;
+	ret = dev_pm_genpd_add_notifier(tphy->dev, &tphy->pd_nb);
+	if (ret == -ENODEV || ret == -EOPNOTSUPP)
+		return 0;
+	if (ret)
+		return ret;
+	return devm_add_action_or_reset(tphy->dev, t6040_pd_notifier_remove, tphy->dev);
+}
+
 static void t6040_mbox_dev_put(void *data)
 {
 	put_device(data);
@@ -3102,6 +3154,10 @@ static int t6040_usb3_probe(struct t6040_usb2_phy *tphy, struct platform_device 
 	ret = t6040_debugfs_init(tphy);
 	if (ret)
 		return ret;
+
+	ret = t6040_pd_notifier_init(tphy);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to follow the PHY's power domain\n");
 
 	tphy->usb3_ok = true;
 	return 0;
@@ -3662,6 +3718,7 @@ static void __maybe_unused t6040_power_lost(struct t6040_usb2_phy *tphy)
 {
 	t6040_recovery_power_lost(&tphy->recovery);
 	tphy->shutdown_failed = false;
+	WRITE_ONCE(tphy->fw_live, false);
 }
 
 #ifdef CONFIG_HIBERNATION

@@ -89,6 +89,20 @@ static void t6040_recovery_own_reference_test(struct kunit *test)
 			T6040_RECOVERY_PM_SUSPEND);
 }
 
+/*
+ * The coprocessor's power domain stays on while its firmware runs, whoever
+ * asks for the power-off: a suspend-to-idle with a host running does. A
+ * stopped coprocessor lets it go, and the other notifications pass.
+ */
+static void t6040_pd_stays_on_test(struct kunit *test)
+{
+	KUNIT_EXPECT_TRUE(test, t6040_pd_stays_on(GENPD_NOTIFY_PRE_OFF, true));
+	KUNIT_EXPECT_FALSE(test, t6040_pd_stays_on(GENPD_NOTIFY_PRE_OFF, false));
+	KUNIT_EXPECT_FALSE(test, t6040_pd_stays_on(GENPD_NOTIFY_OFF, true));
+	KUNIT_EXPECT_FALSE(test, t6040_pd_stays_on(GENPD_NOTIFY_PRE_ON, true));
+	KUNIT_EXPECT_FALSE(test, t6040_pd_stays_on(GENPD_NOTIFY_ON, true));
+}
+
 static struct kunit_case t6040_recovery_test_cases[] = {
 	KUNIT_CASE(t6040_recovery_missed_ack_test),
 	KUNIT_CASE(t6040_recovery_failed_tune_test),
@@ -96,6 +110,7 @@ static struct kunit_case t6040_recovery_test_cases[] = {
 	KUNIT_CASE(t6040_recovery_power_lost_test),
 	KUNIT_CASE(t6040_recovery_held_reference_test),
 	KUNIT_CASE(t6040_recovery_own_reference_test),
+	KUNIT_CASE(t6040_pd_stays_on_test),
 	{}
 };
 
