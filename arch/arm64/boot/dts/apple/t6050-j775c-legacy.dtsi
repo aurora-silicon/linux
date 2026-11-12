@@ -119,7 +119,7 @@
 		 */
 		cpu0: cpu@40000 {
 			compatible = "apple,sawtooth";
-			capacity-dmips-mhz = <768>;
+			capacity-dmips-mhz = <794>;
 			device_type = "cpu";
 			reg = <0x0 0x40000>;
 			enable-method = "spin-table";
@@ -131,7 +131,7 @@
 
 		cpu1: cpu@40001 {
 			compatible = "apple,sawtooth";
-			capacity-dmips-mhz = <768>;
+			capacity-dmips-mhz = <794>;
 			device_type = "cpu";
 			reg = <0x0 0x40001>;
 			enable-method = "spin-table";
@@ -143,7 +143,7 @@
 
 		cpu2: cpu@40002 {
 			compatible = "apple,sawtooth";
-			capacity-dmips-mhz = <768>;
+			capacity-dmips-mhz = <794>;
 			device_type = "cpu";
 			reg = <0x0 0x40002>;
 			enable-method = "spin-table";
@@ -155,7 +155,7 @@
 
 		cpu3: cpu@40003 {
 			compatible = "apple,sawtooth";
-			capacity-dmips-mhz = <768>;
+			capacity-dmips-mhz = <794>;
 			device_type = "cpu";
 			reg = <0x0 0x40003>;
 			enable-method = "spin-table";
@@ -167,7 +167,7 @@
 
 		cpu4: cpu@40004 {
 			compatible = "apple,sawtooth";
-			capacity-dmips-mhz = <768>;
+			capacity-dmips-mhz = <794>;
 			device_type = "cpu";
 			reg = <0x0 0x40004>;
 			enable-method = "spin-table";
@@ -178,7 +178,7 @@
 		};
 		cpu5: cpu@40005 {
 			compatible = "apple,sawtooth";
-			capacity-dmips-mhz = <768>;
+			capacity-dmips-mhz = <794>;
 			device_type = "cpu";
 			reg = <0x0 0x40005>;
 			enable-method = "spin-table";
@@ -190,7 +190,7 @@
 
 		cpu6: cpu@40100 {
 			compatible = "apple,sawtooth";
-			capacity-dmips-mhz = <768>;
+			capacity-dmips-mhz = <794>;
 			device_type = "cpu";
 			reg = <0x0 0x40100>;
 			enable-method = "spin-table";
@@ -202,7 +202,7 @@
 
 		cpu7: cpu@40101 {
 			compatible = "apple,sawtooth";
-			capacity-dmips-mhz = <768>;
+			capacity-dmips-mhz = <794>;
 			device_type = "cpu";
 			reg = <0x0 0x40101>;
 			enable-method = "spin-table";
@@ -214,7 +214,7 @@
 
 		cpu8: cpu@40102 {
 			compatible = "apple,sawtooth";
-			capacity-dmips-mhz = <768>;
+			capacity-dmips-mhz = <794>;
 			device_type = "cpu";
 			reg = <0x0 0x40102>;
 			enable-method = "spin-table";
@@ -226,7 +226,7 @@
 
 		cpu9: cpu@40103 {
 			compatible = "apple,sawtooth";
-			capacity-dmips-mhz = <768>;
+			capacity-dmips-mhz = <794>;
 			device_type = "cpu";
 			reg = <0x0 0x40103>;
 			enable-method = "spin-table";
@@ -238,7 +238,7 @@
 
 		cpu10: cpu@40104 {
 			compatible = "apple,sawtooth";
-			capacity-dmips-mhz = <768>;
+			capacity-dmips-mhz = <794>;
 			device_type = "cpu";
 			reg = <0x0 0x40104>;
 			enable-method = "spin-table";
@@ -249,7 +249,7 @@
 		};
 		cpu11: cpu@40105 {
 			compatible = "apple,sawtooth";
-			capacity-dmips-mhz = <768>;
+			capacity-dmips-mhz = <794>;
 			device_type = "cpu";
 			reg = <0x0 0x40105>;
 			enable-method = "spin-table";
@@ -332,7 +332,7 @@
 
 		cpu18: cpu@41000 {
 			compatible = "apple,sawtooth";
-			capacity-dmips-mhz = <768>;
+			capacity-dmips-mhz = <794>;
 			device_type = "cpu";
 			reg = <0x0 0x41000>;
 			enable-method = "spin-table";
@@ -344,7 +344,7 @@
 
 		cpu19: cpu@41001 {
 			compatible = "apple,sawtooth";
-			capacity-dmips-mhz = <768>;
+			capacity-dmips-mhz = <794>;
 			device_type = "cpu";
 			reg = <0x0 0x41001>;
 			enable-method = "spin-table";
@@ -356,7 +356,7 @@
 
 		cpu20: cpu@41002 {
 			compatible = "apple,sawtooth";
-			capacity-dmips-mhz = <768>;
+			capacity-dmips-mhz = <794>;
 			device_type = "cpu";
 			reg = <0x0 0x41002>;
 			enable-method = "spin-table";
@@ -368,7 +368,7 @@
 
 		cpu21: cpu@41003 {
 			compatible = "apple,sawtooth";
-			capacity-dmips-mhz = <768>;
+			capacity-dmips-mhz = <794>;
 			device_type = "cpu";
 			reg = <0x0 0x41003>;
 			enable-method = "spin-table";
@@ -380,7 +380,7 @@
 
 		cpu22: cpu@41004 {
 			compatible = "apple,sawtooth";
-			capacity-dmips-mhz = <768>;
+			capacity-dmips-mhz = <794>;
 			device_type = "cpu";
 			reg = <0x0 0x41004>;
 			enable-method = "spin-table";
@@ -392,7 +392,7 @@
 
 		cpu24: cpu@41100 {
 			compatible = "apple,sawtooth";
-			capacity-dmips-mhz = <768>;
+			capacity-dmips-mhz = <794>;
 			device_type = "cpu";
 			reg = <0x0 0x41100>;
 			enable-method = "spin-table";
@@ -404,7 +404,7 @@
 
 		cpu25: cpu@41101 {
 			compatible = "apple,sawtooth";
-			capacity-dmips-mhz = <768>;
+			capacity-dmips-mhz = <794>;
 			device_type = "cpu";
 			reg = <0x0 0x41101>;
 			enable-method = "spin-table";
@@ -416,7 +416,7 @@
 
 		cpu26: cpu@41102 {
 			compatible = "apple,sawtooth";
-			capacity-dmips-mhz = <768>;
+			capacity-dmips-mhz = <794>;
 			device_type = "cpu";
 			reg = <0x0 0x41102>;
 			enable-method = "spin-table";
@@ -428,7 +428,7 @@
 
 		cpu27: cpu@41103 {
 			compatible = "apple,sawtooth";
-			capacity-dmips-mhz = <768>;
+			capacity-dmips-mhz = <794>;
 			device_type = "cpu";
 			reg = <0x0 0x41103>;
 			enable-method = "spin-table";
@@ -440,7 +440,7 @@
 
 		cpu28: cpu@41104 {
 			compatible = "apple,sawtooth";
-			capacity-dmips-mhz = <768>;
+			capacity-dmips-mhz = <794>;
 			device_type = "cpu";
 			reg = <0x0 0x41104>;
 			enable-method = "spin-table";

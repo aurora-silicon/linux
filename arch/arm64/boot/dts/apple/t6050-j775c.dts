@@ -1097,3 +1097,24 @@
 
 /* J775c has no internal panel: retain the booted desktop handoff selection. */
 /delete-node/ &{/soc/dcp@48ae00000};
+
+#include "t6050-j775c-incremental-audio.dtsi"
+
+#include "t6050-j775c-incremental-sd.dtsi"
+
+/* Remove unreferenced die1 caches inherited by the retained source. */
+/delete-node/ &{/cpus/l2-cache-m10};
+/delete-node/ &{/cpus/l2-cache-m11};
+/delete-node/ &{/cpus/l3-cache-p1};
+/delete-node/ &{/cpus/l2-cache-p1-0};
+/delete-node/ &{/cpus/l2-cache-p1-1};
+/delete-node/ &{/cpus/l2-cache-p1-2};
+/delete-node/ &{/cpus/l2-cache-p1-3};
+/delete-node/ &{/cpus/l2-cache-p1-4};
+/delete-node/ &{/cpus/l2-cache-p1-5};
+
+#include "t6050-j775c-incremental-usbpolicy.dtsi"
+
+#include "t6050-j775c-incremental-spmi.dtsi"
+
+#include "t6050-j775c-incremental-pmgr4.dtsi"
