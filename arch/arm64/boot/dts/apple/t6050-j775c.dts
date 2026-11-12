@@ -1161,3 +1161,25 @@
 
 /delete-node/ &{/opp-table-gpu-afr};
 /delete-node/ &{/opp-table-gpu-cs};
+
+/* The shared router graph uses adapter port 1; drop stale duplicate links. */
+&acio0 {
+	/delete-node/ port;
+};
+
+&acio1 {
+	/delete-node/ port;
+};
+
+&acio2 {
+	/delete-node/ port;
+};
+
+&acio3 {
+	/delete-node/ port;
+};
+
+/* Name the retained second ADT window without assigning a filter role. */
+&ane_dart0 {
+	reg-names = "dart", "auxiliary";
+};
