@@ -91,11 +91,11 @@
 #define PS_SIO_LAST		0x228	/* SOC-East: UART6, the last */
 
 /*
- * ANS's storage PCIe block: the TWO ST lanes (apcie_st0/apcie_st1) and their
+ * ANS's storage PCIe block: the two ST lanes (apcie_st0/apcie_st1) and their
  * shared PHY (T8140 has a single lane). Taken down at the commit
  * and raised on wake. The power words sit in SOC-East (t604x-pmgr.dtsi
  * offsets, same bank as ps_ans); the control windows (axi2af/cio3pll/clkgen/
- * phy-block/phy-ip/rc) and the PLL/lane tunables are NOT in this SoC's static
+ * phy-block/phy-ip/rc) and the PLL/lane tunables are not in this SoC's static
  * description and are published by the boot object (aura) under the apple,apcie
  * node, as on the T8140. The block-internal offsets are the T8140's
  * (sleep-internal.h): the same Apple PCIe IP.
@@ -126,11 +126,9 @@
 #define CLUSTER_TIMEOUT_US	50000
 
 /*
- * SOC-PwrGate (pmgr reg0x26 = 0x50282c000). Retention
- * bits at +0x0/+0x40 and the three CPM voters at +0x100/+0x108/+0x110, each
- * BIT31. macOS's wake restore re-asserts them; no pwrgate write was seen
- * in macOS's entry (the voters read back 0x80000000, a no-op), so entry
- * leaves them alone.
+ * SOC-PwrGate (ADT pmgr reg[0x26] = 0x50282c000): the retention bits at +0x0/+0x40 and
+ * the three CPM voters at +0x100/+0x108/+0x110, each BIT31. The wake restore re-asserts
+ * them. The entry leaves them alone: the voters already read 0x80000000 there.
  */
 #define PWRGATE_ON		0x80000000
 #define PWRGATE_WAKE_0		0x000
@@ -140,9 +138,8 @@
 #define PWRGATE_CPM_2		0x110
 
 /*
- * SOC-East (pmgr reg2 = 0x502280000). The SEP/retention word at +0xc00: on
- * wake macOS clears PS_DEV_DISABLE and then polls PS_BUSY clear before going
- * on. Also holds several
+ * SOC-East (ADT pmgr reg[2] = 0x502280000). The SEP/retention word at +0xc00: the wake
+ * clears PS_DEV_DISABLE and then polls PS_BUSY clear before going on. Also holds several
  * of the axi2af domains' power words.
  */
 #define SOC_EAST_RETENTION	0xc00
@@ -165,10 +162,9 @@
 #define CLK_QUIESCE_TIMEOUT_US	1000
 
 /*
- * The keep-alive enables: 32 words in PMGR SOC
- * from +0x1dc000 and 32 in SOC-East from +0x50000, stride 0x44, BIT0 the keep-alive.
- * macOS's quiesce clears them right before the S2R timer (unless the boot-arg
- * pmgr-disable-ka); its wake restore sets them again.
+ * The keep-alive enables: 32 words in PMGR SOC from +0x1dc000 and 32 in SOC-East from
+ * +0x50000, stride 0x44, BIT0 the keep-alive. Cleared right before the S2R timer, set
+ * again at the wake.
  */
 #define T6040_KA_SOC_PA		0x5029dc000ULL
 #define T6040_KA_EAST_PA	0x5022d0000ULL
@@ -178,9 +174,8 @@
 #define KA_ENABLE		BIT(0)
 
 /*
- * The SMC's AP watchdog deadline (the watchdog timer's reg[2] + 8):
- * macOS writes 0 when it enables the AON watchdog for a reconfig,
- * right after arming the AON WD2 (measured on the J616s: 0x508330008 := 0).
+ * The SMC's AP watchdog deadline (the watchdog timer's reg[2] + 8): written 0 right after
+ * the AON WD2 is armed for the sleep, as macOS does.
  */
 #define T6040_SMC_WDT_DEADLINE_PA	0x508330008ULL
 
@@ -197,16 +192,14 @@
 #define AGX_TIMEOUT_US		10000
 
 /*
- * The hardware steps of macOS's generic PMGR quiesce that run on J616s before
- * its T6041 part (from macOS and the ADT). In order:
+ * Before the SoC-specific steps of the PMGR quiesce, in order:
  *  - the ACC quiesce of c = E, P0, P1: APSC off, ACC +0xe20020 BIT23 := 1 (64-bit),
  *    poll BIT7 clear (CPM gating after it reads back already set: not written);
  *  - features off: cpu-fixed-freq-pll-relock, BIT42 := 0 in the E and P0
  *    ACC words; then the TVMs disp2, afr, dcs (two), gfx (two), disp, soc: control
  *    BIT0 := 0, status polled until BIT1 clears.
- * macOS then drops the AP voter's DCS floor vote in the PMC. That step is left out: the
- * first access to that word hung the bus on the J616s.
- * macOS polls the APSC and TVM words without a timeout; here every poll is bounded.
+ * The PMC's DCS floor vote is not touched: an access to that word hangs the bus. Every poll
+ * here is bounded.
  */
 static const u64 t6040_acc_apsc_pa[] = { 0x210e20020ULL, 0x211e20020ULL, 0x212e20020ULL };
 #define ACC_APSC_DISABLE	BIT_ULL(23)
@@ -240,21 +233,20 @@ static const struct {
 
 /*
  * The PMU over SPMI (spmi0 = 0x509014000, spmi-a0 = 0x509188000), written as on the T8140.
- * Measured on the J616s under macOS: the boot stage is set to 0x50 by an extended write whose
- * command word is (0xf801 << 16) | 0x8e30 = 0xf8018e30, and NOTIFY_ENABLE is 0x2000001 on
- * both controllers' +0x40.
+ * Measured on the J616s under macOS: the boot stage is set to 0x50 by an extended write to
+ * PMU_BOOT_STAGE, and NOTIFY_ENABLE is 0x2000001 on both controllers' +0x40.
  */
-#define PMU_BOOT_STAGE		0xf801		/* T6040 slave/reg; cmd 0xf8018e30 */
+#define PMU_BOOT_STAGE		0xf801		/* T6040 slave/reg */
 
 /*
- * MasterMini (NUB_MPMGR_AON, RegMap 4 = pmgr reg[0x37] = 0x508900000).
+ * MasterMini, the block of the always-on PMGR (ADT pmgr reg[0x37] = 0x508900000).
  * The S2R timer at +0x4000 (physical 0x508904000) is the commit: writing 1 arms
  * the SoC sleep engine. Measured on the J616s: macOS makes exactly this write.
  */
 #define MASTERMINI_S2R_TIMER	0x4000
 
 /*
- * AOP-global (AP controls, RegMap 0x42, window 0x508000000). Mapped from the
+ * AOP-global (the AP controls, window 0x508000000). Mapped from the
  * S2R-control word 0x508004000: +0x0 the S2R control (cleared to 0 on wake),
  * +0xc..+0x2c the 9 wake-source masks (armed before
  * sleep), +0x30..+0x50 the 9 wake-source status words (read on wake).
@@ -503,7 +495,7 @@ static bool t6040_sleep_reg_commit_stops(void)
 /*
  * As in macOS's power-state check, a sub-block is on while its TARGET is not 0. A
  * pipe's CPU word never counts: it stays under automatic power gating (taking it out
- * of automatic mode raised an SError on T6040) and the SoC power-down drops it.
+ * of automatic mode raises an SError) and the SoC power-down drops it.
  */
 static bool t6040_sleep_ps_on(u32 val, bool cpu)
 {
@@ -906,10 +898,10 @@ static unsigned int t6040_sleep_refuse(struct t6040_sleep *s)
 
 /*
  * The AOP and audio island's power words (MiniPMGR 0x508304000 + 0x000..0x158). The island
- * is off after a sleep, and the AOP's resume, which reads its ASC first, then faulted on the
- * J616s. The words are read in .begin and put back at the wake, parents first: a word that
- * was on goes to a manual target 0xf (in automatic mode it gated again before the AOP's
- * driver got to its ASC), any other gets its saved value if that asks for power. The table
+ * is off after a sleep, and the AOP's resume, which reads its ASC first, faults on it. The
+ * words are read in .begin and put back at the wake, parents first: a word that was on goes
+ * to a manual target 0xf (in automatic mode it gates again before the AOP's driver gets to
+ * its ASC), any other gets its saved value if that asks for power. The table
  * is the power-down order, children first.
  */
 #define T6040_AOP_PS_PA		0x508304000ULL
@@ -1037,12 +1029,11 @@ static const u32 t6040_wake_mask[AOP_WAKE_WORDS] = {
 };
 
 /*
- * The hardware S2R-lo entry counter: the count is PMGR
- * regmap 1 + 0x70970 shifted right by 3; macOS reads
- * 0x508370970 at quiesce. It tells "the SoC entered S2R" from "the
- * engine never finished". Read-only, with the AOP-global S2R control, wake masks and
- * wake status, at debug level: at probe, for the boot after a failed sleep, and in a dry run.
- * Mapped once at probe: the dry run reads it with interrupts off.
+ * The hardware S2R-lo entry counter: bits 31:3 of MiniPMGR + 0x70970. It tells "the SoC
+ * entered S2R" from "the engine never finished". Read-only, with the AOP-global S2R
+ * control, wake masks and wake status, at debug level: at probe, for the boot after a
+ * failed sleep, and in a dry run. Mapped once at probe: the dry run reads it with
+ * interrupts off.
  */
 #define T6040_S2R_LO_COUNT_PA	0x508370970ULL
 
@@ -1068,12 +1059,11 @@ static void t6040_sleep_log_s2r_state(struct t6040_sleep *s, const char *when)
 }
 
 /*
- * The 15 axi2af fabric-bridge retention domains (macOS's
- * table for the axi2af workaround). Each domain's power word is in
+ * The 15 domains with an axi2af fabric bridge to re-arm. Each domain's power word is in
  * SOC (soc_ps, base 0x502800000) or SOC-East (soc_east, base 0x502280000); its
  * fabric bridge is a separate window. On wake every domain that is powered up
  * (PS TARGET == 0xf) gets bridge +0x104/+0x108 bit0 set, or the bridge drops
- * its traffic (the ANS/Wi-Fi/display-dead signature).
+ * its traffic.
  */
 static const struct t6040_axi2af_domain {
 	const char *name;
@@ -1116,10 +1106,9 @@ static void t6040_wake_sync(void)
 }
 
 /*
- * The five complexes off, as macOS's quiesce loop turns cluster c off and waits if c > 3,
- * for c = 1..5 (measured on the J616s): each slot's low nibble -> 0, in order +0x0 .. +0x10,
- * and the last two (+0xc, +0x10) polled until BIT4 clears (+0xc read 0x2f ->
- * 0x20 -> 0x10 -> 0x0 there). The CPU complexes (E, P0, P1) go down at the WFI.
+ * The five complexes off, measured on the J616s: each slot's low nibble to 0, in order
+ * +0x0 .. +0x10, and the two display complexes (+0xc, +0x10) polled until BIT4 clears.
+ * The CPU complexes (E, P0, P1) go down at the WFI.
  */
 static void t6040_clusters_off(struct t6040_sleep *s)
 {
@@ -1331,8 +1320,8 @@ static int t6040_sleep_preflight_show(struct seq_file *m, void *unused)
 DEFINE_SHOW_ATTRIBUTE(t6040_sleep_preflight);
 
 /*
- * Read-only axi2af gate: on entry macOS panics unless every reachable domain's
- * power word reads [7:4]==0. Here the ones still on are only named, at debug level.
+ * Read-only axi2af gate: every reachable domain's power word is expected to read
+ * [7:4] == 0 here. The ones still on are only named, at debug level.
  */
 static void t6040_axi2af_readcheck(struct t6040_sleep *s)
 {
@@ -1359,8 +1348,7 @@ static void t6040_axi2af_readcheck(struct t6040_sleep *s)
  * The wake-side axi2af re-arm: every retained domain powered back up (PS TARGET 0xf and
  * ACTUAL on) gets its fabric bridge +0x104/+0x108 bit0 set, or the bridge drops its
  * traffic. A word in automatic mode can read TARGET 0xf with its domain gated; the bridge
- * is then off too (the first resume on the J616s took an SError in this step), so such a
- * domain is left alone.
+ * is then off too, and an access to it raises an SError, so such a domain is left alone.
  */
 static void t6040_axi2af_rearm(struct t6040_sleep *s)
 {
@@ -1443,7 +1431,7 @@ static bool t6040_ps_actual_on(void __iomem *base, u32 offset)
 	return FIELD_GET(PS_ACTUAL, readl(base + offset));
 }
 
-/* The shared PHY and PHY-IP to sleep (macOS's root complex disable; it polls unbounded). */
+/* The shared PHY and PHY-IP to sleep: the PCIe root complex disable sequence. */
 static void t6040_apcie_phy_off(struct t6040_sleep *s)
 {
 	struct t6040_apcie_st *a = &s->apcie_st;
@@ -1496,8 +1484,8 @@ static void t6040_apcie_pll_off(struct t6040_sleep *s)
 /*
  * The sleep engine hands each ATC port to its always-on side and then powers the port's
  * common domain off itself: it needs the four ATC commons on, as they are on macOS at that
- * point. With them off it stalled on the J616s raising ATC0_COMMON, whose parent FAB2_SOC
- * was off as well. FAB2_SOC is raised by hand, then ATC0..3_COMMON to a manual target 0xf,
+ * point. With them off it waits for good raising ATC0_COMMON, whose parent FAB2_SOC is
+ * off as well. FAB2_SOC is raised by hand, then ATC0..3_COMMON to a manual target 0xf,
  * then FAB2_SOC gets its automatic mode back: the powered children hold it up.
  */
 static const u16 t6040_atc_common[4] = { 0x390, 0x3b8, 0x3e0, 0x408 };
@@ -1519,8 +1507,8 @@ static void t6040_atc_commons_on(struct t6040_sleep *s)
  * The CFG writes of macOS's PHY sleep entry, which it runs on every ATC port before a sleep:
  * ATCPHY_CFG +0x2c bit 0 (S2R_AON_SYNC_RST_N), +0x08 bit 0 (CFG_S2R_FSM_EN) and +0x28 bit 0
  * (AHB_CLK_REQ_N) set, then +0x04 bit 8 (the clock's ack) polled. Without them the engine
- * stalled on the J616s on a port that carries DisplayPort lanes: port 3 (the HDMI output)
- * always, any other port once a display runs on it in DP alternate mode. A parked port, and
+ * waits for good on a port that carries DisplayPort lanes: port 3 (the HDMI output) always,
+ * any other port once a display runs on it in DP alternate mode. A parked port, and
  * one its PHY driver has put to sleep, already has +0x28 bit 0 set and is left alone.
  */
 #define ATC_CFG_CLK_STATUS		0x04
@@ -1596,8 +1584,8 @@ static void t6040_fabrics_on(struct t6040_sleep *s)
  * expects each DCS to gate itself after self-refresh. That takes the DCS's dynamic power-gate
  * mode (DCS +0x20 bits 12 and 8) and its power word in automatic mode with no minimum state.
  * macOS sets both at boot and again after each wake. Nothing does under Linux (the DT leaves
- * the ps_dcs_* domains disabled: target 0xf, no automatic mode), and the engine then waited
- * for the first DCS pair's power gate for good on the J616s. Both are applied in each .begin.
+ * the ps_dcs_* domains disabled: target 0xf, no automatic mode), and the engine then waits
+ * for the first DCS pair's power gate for good. Both are applied in each .begin.
  */
 static const struct {
 	bool east;
@@ -1693,7 +1681,7 @@ static void t6040_ans_bridge_quiesce(struct t6040_sleep *s)
  * itself and in its own order: APCIE_PHY_SW to clock-gated, APCIE_SYS_ST0/1 off, APCIE_ST0/1
  * clock-gated, ANS off, APCIE_SYS_GP off, APCIE_GP clock-gated. It polls APCIE_PHY_SW for
  * its parents, which are both SYS_ST lanes: with them lowered here, as the T8140 controller
- * does, it waited there for good on the J616s. So the commit raises APCIE_SYS_ST1, which
+ * does, it waits there for good. So the commit raises APCIE_SYS_ST1, which
  * Linux never uses, and does only what macOS does before the engine runs: the shared PHY put
  * to sleep, APCIE_PHY_SW clock-gated while APCIE_GP is still on, the PCIe PLL shut down.
  */
@@ -1731,7 +1719,7 @@ static void t6040_bridge_rearm(void __iomem *bridge)
 /*
  * Raise ANS's storage link from power-off, the two-lane adaptation of
  * sleep.c's apple_sleep_raise_apcie(). Runs atomic on the waking core in
- * t6040_sleep_return(), AFTER t6040_axi2af_rearm() and BEFORE control returns to
+ * t6040_sleep_return(), after t6040_axi2af_rearm() and before control returns to
  * the PM core, so nvme's resume_early sets the ANS run bit onto a live link.
  * Both lanes come up; the PLL/clkgen/PHY tables run once (shared). The two
  * apcie_sys_st domains are not in macOS's 15-domain axi2af table, so their bridges
@@ -1760,8 +1748,8 @@ static int t6040_apcie_st_raise(struct t6040_sleep *s)
 	/*
 	 * macOS's order, each domain to ACTUAL 0xf: ANS, GP, SYS_GP, ST0, SYS_ST0, ST1, SYS_ST1,
 	 * the fabric-bridge bit0s set after ANS and after SYS_GP. SYS_GP stays at a manual
-	 * target 0xf: in automatic mode it gated again on the J616s, and the DART behind it
-	 * then faulted in its resume.
+	 * target 0xf: in automatic mode it gates again, and the DART behind it then faults in
+	 * its resume.
 	 */
 	ret = t6040_ps_raise(ps, PS_ANS);
 	if (!ret)
@@ -1879,10 +1867,8 @@ extern char t6040_resume_stub[];
  * quiesce gate; their drivers don't lower atcN_common.
  *
  * Their common_dp, usb, phymxwrap and usb_aon words are MiniPMGR words (0x508300000 + 0xa0..,
- * ADT ATCn_COMMON_DP/USB/PHYMXWRAP/USB_AON), not SOC ones: applied to soc_ps,
- * those offsets lower SOC AIC (0x118), PMC (0x120), PMS_FPWM0-4 and
- * FAB0_SOC (0x168) right before the S2R request; the dead PMC then blocks the sleep engine's
- * PMC writes (an AP read of the PMC hangs from that step on).
+ * ADT ATCn_COMMON_DP/USB/PHYMXWRAP/USB_AON) and not in this table: the same offsets in SOC
+ * are AIC, PMC, PMS_FPWM0-4 and FAB0_SOC.
  */
 static const u16 t6040_atc_words[4][5] = {
 	{ 0x3b0, 0x3a8, 0x398, 0x3a0, 0x390 },
@@ -1982,8 +1968,8 @@ static void t6040_gp_ports_stop(struct t6040_sleep *s)
 
 /*
  * apcie_sys_gp (AUTO off, axi2af bit0s, target 0), then apcie_gp. After ANS's ST lanes: the
- * storage lanes' cio3pll/clkgen/PHY windows sit in apcie_gp, and touching them with it off
- * hung the bus. T8140's order: SYS_ST, ST, SYS_GP, GP. APCIE_GP goes to clock-gated
+ * storage lanes' cio3pll/clkgen/PHY windows sit in apcie_gp, and an access to them with it
+ * off hangs the bus. T8140's order: SYS_ST, ST, SYS_GP, GP. APCIE_GP goes to clock-gated
  * (TARGET 4), the state the sleep engine itself asks for, not to off.
  */
 static void t6040_apcie_gp_lower(struct t6040_sleep *s)
@@ -2033,9 +2019,9 @@ static int t6040_sleep_commit(unsigned long unused)
 	s->siq_cfg = read_sysreg_s(SYS_APL_SIQ_CFG_EL1);
 	spin_table_stop_parked();
 	/*
-	 * On macOS every other core is off, in its last WFI, before the boot core turns the
-	 * complexes off. With the stopped cores still spinning the sleep engine stalled on the
-	 * J616s: release them now, and wait for their power words to read off further down.
+	 * Every other core has to be off, in its last WFI, before the boot core turns the
+	 * complexes off, or the sleep engine waits for them: release them now, and wait for
+	 * their power words to read off further down.
 	 */
 	spin_table_release_stopped();
 	t6040_atc_lower(s);
@@ -2108,8 +2094,8 @@ static int t6040_sleep_commit(unsigned long unused)
 
 /*
  * The GP PCIe host's two ports (Wi-Fi/BT, SD): the boot loader set their clocks up, and
- * nobody does after a sleep. The DART in port 0's block then faulted in its noirq resume on
- * the J616s. t6040_gp_port_stop() backwards, short of the link: the lane reference clocks
+ * nobody does after a sleep. Without them the DART in port 0's block faults in its noirq
+ * resume. t6040_gp_port_stop() backwards, short of the link: the lane reference clocks
  * requested and acknowledged, the PHY's enables and the port's application clock as saved,
  * the controller's PERST register as saved, then the port's ready bit polled. The link
  * itself stays down for the host driver.
@@ -2218,7 +2204,7 @@ static void t6040_sleep_return(struct t6040_sleep *s)
 						!(val & PS_BUSY), 1,
 						SOC_EAST_TIMEOUT_US);
 		if (ret)
-			dev_warn(s->dev, "SOC-East PARENT_MISSING stuck on wake (%#x)\n", val);
+			dev_warn(s->dev, "SOC-East retention word still busy on wake (%#x)\n", val);
 	}
 	t6040_wake_sync();
 
@@ -2228,7 +2214,7 @@ static void t6040_sleep_return(struct t6040_sleep *s)
 	 * left as the power loss left them.
 	 */
 
-	/* The fabric-bridge retention re-arm (the ANS/Wi-Fi/display-dead guard). */
+	/* The fabric-bridge retention re-arm, or the bridges drop their traffic. */
 	t6040_axi2af_rearm(s);
 	t6040_wake_sync();
 
@@ -2460,7 +2446,7 @@ static int t6040_sleep_dry_enter(struct t6040_sleep *s, unsigned int dry)
 
 /*
  * regmap_read_poll_timeout_atomic() reads ktime_get(), which warns while timekeeping is
- * suspended (12 warnings from .enter on the J616s). Counted 1 us steps instead.
+ * suspended. Counted 1 us steps instead.
  */
 static int t6040_regmap_poll_off(struct regmap *map, u32 off, u32 *cur)
 {
@@ -2697,7 +2683,7 @@ static void t6040_disp_back(struct t6040_sleep *s)
  * The display power words macOS has off before its sleep (apple,check-ps-b4-sleep), lowered
  * here: after the device suspend, interrupts off, one CPU up, so no driver, interrupt handler
  * or DART touches the pipes any more. The DCPs only stop their firmware: lowering the domains
- * from their suspend panicked on T6040. Each group from its last sub-block up to, and not
+ * from their suspend makes the SoC panic. Each group from its last sub-block up to, and not
  * including, its pipe CPU, which the PMGR gates by itself: each word as the pmgr-pwrstate
  * driver powers a domain off (TARGET 0, the one-shot bits clear), polled to ACTUAL 0. The
  * internal display's FE and SYS domains follow. Returns the number of words left on.
