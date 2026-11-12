@@ -8957,6 +8957,17 @@ static int dcp_platform_suspend(struct device *dev)
 		if (dcp_is_ext26(dcp) &&
 		    !(readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL) & APPLE_DCP_COPROC_CPU_CONTROL_RUN))
 			return -EHOSTDOWN;
+		/*
+		 * The crossbar shares the ATC power domain, which an s2idle can take
+		 * down too: with deep sleep selected, the USB controller stops for any
+		 * sleep and stops holding it. The crossbar then wakes with its route
+		 * lost, while the mux core still holds the selection, and the link
+		 * never trains again (DEVICE_NOT_RESPONDING). Take the output down
+		 * while it has power and select it again on resume, as s2r does.
+		 */
+		/* Pair with the H17P unpark; native26 has its own retained resume. */
+		if (dcp_is_external_h17p(dcp))
+			dcp_typec_route_park(dcp);
 		device_set_wakeup_path(dev);
 		if (dcp_is_ext26(dcp))
 			dev_dbg(dev, "native26 retained s2idle stop; firmware and supplier leases held\n");
@@ -9028,6 +9039,9 @@ static int dcp_platform_resume(struct device *dev)
 	}
 	dcp_release_after_sleep(dcp);
 	iomfb_v14_7_backlight_resume(dcp);
+	/* Its crossbar output, parked by the suspend, before the link connects again. */
+	if (dcp_is_external_h17p(dcp))
+		dcp_typec_route_unpark(dcp);
 	dcp_enable_typec_work(dcp);
 	/* The HDMI output's PHY and crossbar may have lost their setup in sleep. */
 	if (dcp->external_native)

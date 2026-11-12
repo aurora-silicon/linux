@@ -3455,14 +3455,23 @@ bool iomfb_present_brightness_only_h17p(struct apple_dcp *dcp)
 	return dcp->iomfb.active && dcp->iomfb.active->brightness_only;
 }
 
+bool iomfb_present_has_surface_h17p(const struct dcp_swap_submit_req_h17p *request)
+{
+	unsigned int i;
+
+	for (i = 0; i < SWAP_SURFACES; i++)
+		if (!request->surf_null[i])
+			return true;
+	return false;
+}
+
 bool iomfb_apply_backlight_h17p(struct apple_dcp *dcp,
 				const struct dcp_swap_submit_req_h17p *request,
 				struct dcp_present_h17p *wire)
 {
 	struct iomfb_transaction *transaction = dcp->iomfb.active;
 	struct dcp_backlight_present present;
-	bool have_surface = false;
-	unsigned int i;
+	bool have_surface;
 	int ret;
 
 	lockdep_assert_held(&dcp->iomfb.lock);
@@ -3483,8 +3492,17 @@ bool iomfb_apply_backlight_h17p(struct apple_dcp *dcp,
 				     !!transaction, dcp->brightness.maximum);
 		return false;
 	}
-	for (i = 0; i < SWAP_SURFACES; i++)
-		have_surface |= !request->surf_null[i];
+	have_surface = iomfb_present_has_surface_h17p(request);
+	/*
+	 * Firmware 27 takes a swap with no surface of its own (a plane removed
+	 * alone, every plane off) with the brightness block idle, as macOS sends
+	 * its cursor and clear swaps. The level waits for a present of a surface.
+	 */
+	if (!have_surface && dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+		dcp->edr_present_sdr = 0;
+		iomfb_encode_backlight_h17p(wire, 0, dcp->brightness.maximum, false);
+		return true;
+	}
 	ret = dcp_backlight_prepare(dcp, have_surface, &present);
 	if (ret && ret != -EALREADY) {
 		dev_warn_ratelimited(dcp->dev,

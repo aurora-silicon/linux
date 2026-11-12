@@ -453,7 +453,8 @@ static void dcp_swap_submit(struct apple_dcp *dcp, bool oob,
 		dcp->present_v27.swap.brightness_nits =
 			get_unaligned_le64(dcp->present_h17p.swap + 0x35e);
 		dcp_external_stamp_submit(dcp, &dcp->present_v27.swap);
-		if (dcp_has_panel(dcp))
+		/* A swap with no surface of its own carries no EDR step either. */
+		if (dcp_has_panel(dcp) && iomfb_present_has_surface_h17p(request))
 			dcp_edr_prepare_v27(dcp, &dcp->present_v27.swap,
 					    dcp->present_v27.swap.brightness_update,
 					    dcp->edr_present_sdr);

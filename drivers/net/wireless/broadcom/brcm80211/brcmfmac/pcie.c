@@ -425,6 +425,7 @@ struct brcmf_pciedev_info {
 	bool wowl_irq;
 	bool irq_wake_enabled;
 	bool wowl_sleeping;
+	bool s2idle_d0;
 	bool wakeup_created;
 	bool wakeup_capable;
 	u8 dma_idx_sz;
@@ -3095,6 +3096,14 @@ brcmf_pcie_remove(struct pci_dev *pdev)
 
 	brcmf_bus_cancel_reset_work(bus);
 
+	/*
+	 * Stop the dongle before its host buffers go away. Until the chip is
+	 * reset its firmware keeps running and DMAs received frames into the
+	 * RX buffers that brcmf_detach() unmaps, which the IOMMU reports as
+	 * translation faults.
+	 */
+	brcmf_pcie_reset_device(devinfo);
+
 	brcmf_detach(&pdev->dev);
 	brcmf_free(&pdev->dev);
 
@@ -3106,7 +3115,6 @@ brcmf_pcie_remove(struct pci_dev *pdev)
 	brcmf_pcie_release_irq(devinfo);
 	brcmf_pcie_release_scratchbuffers(devinfo);
 	brcmf_pcie_release_ringbuffers(devinfo);
-	brcmf_pcie_reset_device(devinfo);
 	brcmf_pcie_release_resource(devinfo);
 	release_firmware(devinfo->clm_fw);
 	release_firmware(devinfo->txcap_fw);
@@ -3173,6 +3181,32 @@ fail:
 	return ret;
 }
 
+/*
+ * s2idle without WoWLAN on Apple firmware (fw_seed). cfg80211 has already
+ * left the network and the radio is off (mpc), so keep the function in D0
+ * and skip the HOST_D3_INFORM handshake. The BCM4387 firmware acknowledges
+ * D3 while a DMA is still in flight ("pciedev_d3_ack: dma in progress");
+ * after the next association its TX FIFO then stalls, the firmware traps in
+ * the reinit that follows and every command times out until reboot. This
+ * is the transport state of the WoWLAN sleep, without the wake IRQ.
+ */
+static int brcmf_pcie_s2idle_sleep(struct device *dev)
+{
+	struct brcmf_bus *bus = dev_get_drvdata(dev);
+	struct brcmf_pciedev_info *devinfo = bus->bus_priv.pcie->devinfo;
+	int ret;
+
+	ret = pci_save_state(devinfo->pdev);
+	if (ret) {
+		brcmf_bus_change_state(bus, BRCMF_BUS_UP);
+		brcmf_msgbuf_resume(bus->drvr);
+		brcmf_pcie_fwcon_timer(devinfo, true);
+		return ret;
+	}
+	devinfo->s2idle_d0 = true;
+	return 0;
+}
+
 static int brcmf_pcie_pm_enter_D3(struct device *dev)
 {
 	struct brcmf_pciedev_info *devinfo;
@@ -3209,6 +3243,9 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 	if (devinfo->wowl_irq && devinfo->wowl_enabled)
 		return brcmf_pcie_wowl_sleep(dev);
 
+	if (devinfo->fwseed && pm_suspend_target_state == PM_SUSPEND_TO_IDLE)
+		return brcmf_pcie_s2idle_sleep(dev);
+
 	devinfo->mbdata_completed = false;
 	brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_D3_INFORM);
 
@@ -3244,6 +3281,13 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
 	if (devinfo->wowl_sleeping) {
 		pci_restore_state(devinfo->pdev);
 		brcmf_pcie_disable_irq_wake(devinfo);
+		brcmf_pcie_wowl_wake(bus, devinfo);
+		return 0;
+	}
+
+	if (devinfo->s2idle_d0) {
+		devinfo->s2idle_d0 = false;
+		pci_restore_state(devinfo->pdev);
 		brcmf_pcie_wowl_wake(bus, devinfo);
 		return 0;
 	}

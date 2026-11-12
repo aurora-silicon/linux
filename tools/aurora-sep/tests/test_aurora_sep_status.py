@@ -27,7 +27,7 @@ HEALTHY = {
     "xart_guard_list": "loaded", "xart_guard_refusals": "0",
     "matching": "unverified", "os_identity": "explicit", "hwrng": "registered",
     "xarm_failures": "0", "unhandled_messages": "0", "sleep": "awake",
-    "sleeps": "3",
+    "sleeps": "3", "stac": "online", "stac_onlines": "4",
 }
 
 
@@ -105,6 +105,25 @@ class StatusTest(unittest.TestCase):
         self.set("endpoints", "7")
         rc, _, v = self.run_status()
         self.assertEqual((rc, v["endpoints"]), (1, "FAIL"))
+
+    def test_the_accessory_service_is_reported(self):
+        rc, report, v = self.run_status()
+        self.assertEqual((rc, v["stac"]), (0, "PASS"))
+        row = [r for r in report["checks"] if r["check"] == "endpoint-clients"][0]
+        self.assertIn("stac=", row["value"])
+        self.assertNotIn("stac", row["detail"])
+        self.set("stac", "failed")
+        rc, _, v = self.run_status()
+        self.assertEqual((rc, v["stac"]), (0, "WARN"))
+        self.set("stac", "absent")
+        rc, _, v = self.run_status()
+        self.assertEqual((rc, v["stac"]), (0, "INFO"))
+        # A kernel without the client lists stac as unserved.
+        self.set("stac", None)
+        rc, report, v = self.run_status()
+        self.assertNotIn("stac", v)
+        row = [r for r in report["checks"] if r["check"] == "endpoint-clients"][0]
+        self.assertIn("stac", row["detail"])
 
     def test_a_closed_key_store_fails(self):
         self.set("keystore", "closed")

@@ -31,8 +31,9 @@ enum ane_t6021_pm_state {
  * and boots, once system PM has released its references.
  *
  * park is optional. It runs when a FAILED device is suspended and must leave
- * its CPU safe to lose power (proven stopped, or already unpowered); an error
- * aborts only that suspend. A FAILED device stays unavailable until reboot
+ * its CPU safe to lose power (proven stopped, already unpowered, or a busy
+ * core after a hung job that the driver lets the domain power-off contain);
+ * an error aborts only that suspend. A FAILED device stays unavailable until reboot
  * but never blocks system sleep by itself.
  *
  * These callbacks hold the existing firmware mutex. stop, restart and park
