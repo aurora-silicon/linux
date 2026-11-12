@@ -75,6 +75,7 @@ const ASC_CPU_CONTROL_OFFSET: usize = 0x44;
 const PMP_ENDPOINT: u8 = 0x20;
 const PM_COMMAND_MARKER: u64 = pmp_power::MARKER;
 const PM_COMMAND_SHIFT: u32 = pmp_power::SHIFT;
+const OPC_READY: u64 = 0x00;
 const OPC_GET_IOVA_TABLE: u64 = 0x10;
 const OPC_MALLOC: u64 = 0x12;
 const OPC_FREE: u64 = 0x14;
@@ -91,12 +92,12 @@ const SET_IOREG_INDEX_MASK: u64 = 0xFFFF;
 const PIO_VM_BASE: u64 = 0xc0000000;
 const PIO_GRANULARITY: u64 = 0x1000000;
 /*
- * Host-owned shared memory, as m1n1's proxyclient/m1n1/fw/pmp.py sets it up:
- * the host allocates it and sends its DVA in a Configure message (type 0x10
- * in bits 56:44, the same field the device power commands use); the firmware
- * answers type 0x20 and publishes its status at +0xc000.
+ * 25G83 host-owned runtime report. The firmware sends Ready (type 0), the
+ * host allocates and zeroes the buffer and sends its DVA in Configure (type
+ * 0x10 in bits 56:44), then the firmware answers type 0x20. The public m1n1
+ * implementation documents the same message layout.
  */
-const PMP_SHMEM_SIZE: usize = 0x10000;
+const PMP_SHMEM_SIZE: usize = 0xe400;
 const MSG_TYPE_SHIFT: u32 = 44;
 const MSG_TYPE_MASK: u64 = 0x1fff;
 const MSG_TYPE_CONFIGURE: u64 = 0x10;
@@ -194,7 +195,7 @@ impl PmpState {
         }
 
         let base = buf.as_ptr().cast::<u8>();
-        // SAFETY: the coherent allocation is retained in `allocs`, the
+        // SAFETY: the coherent allocation is retained in `shmem`, the
         // offsets are naturally aligned and bounded above, and volatile
         // loads observe words published asynchronously by the PMP.
         let count = u32::from_le(unsafe {
@@ -237,6 +238,8 @@ struct PmpData {
     display_error: AtomicI32,
     /// See [`PmpHwConfig::sram_backup`].
     sram_backup: Option<(usize, usize)>,
+    /// See [`PmpHwConfig::shmem`].
+    host_shmem: bool,
 }
 
 impl PmpData {
@@ -258,6 +261,7 @@ impl PmpData {
                     display: AtomicPtr::new(core::ptr::null_mut()),
                     display_error: AtomicI32::new(0),
                     sram_backup: cfg.sram_backup,
+                    host_shmem: cfg.shmem,
                 }
             ),
             GFP_KERNEL,
@@ -615,48 +619,37 @@ impl PmpData {
         // and `control` is inside the ASC mapping held by `self`.
         to_result(unsafe { bindings::apple_rtkit_sleep_return(rtk, control) })
     }
-    /// Allocates the shared memory (once) and sends its DVA to the firmware, as m1n1 does.
-    /// The firmware's acknowledgment arrives as a message ([`Self::configure_ack`]).
-    fn offer_shmem(&self) -> Result {
-        let dva = {
-            let mut state = self.state.lock();
-            if state.shmem.is_none() {
-                // SAFETY: the PMP device is bound while its driver offers memory.
-                let bound_dev = unsafe { self.dev.as_bound() };
-                let shmem = Coherent::<u8>::zeroed_slice(bound_dev, PMP_SHMEM_SIZE, GFP_KERNEL)?;
-                state.shmem = Some(shmem);
-            }
-            let dva = state.shmem.as_ref().ok_or(ENOMEM)?.dma_address();
-            if dva & !MSG_IOVA_MASK != 0 {
-                return Err(ERANGE);
-            }
-            state.shmem_acked = false;
-            state.report_live = true;
-            dva
-        };
-        let msg = MSG_TYPE_CONFIGURE << MSG_TYPE_SHIFT | dva;
-        let sent = {
-            let mut guard = self.rtkit.lock();
-            match guard.as_mut().as_pin_mut() {
-                Some(rtk) => rtk.send_message(PMP_ENDPOINT, msg),
-                None => Err(ENODEV),
-            }
-        };
-        if let Err(error) = sent {
-            self.state.lock().report_live = false;
-            return Err(error);
+    /// Answers Ready with the DVA of the host-owned runtime report.
+    /// Configure Ack makes the report live ([`Self::configure_ack`]).
+    fn offer_shmem(&self) -> Result<u64> {
+        let mut state = self.state.lock();
+        if state.shmem.is_none() {
+            // SAFETY: the PMP device is bound while its driver offers memory.
+            let bound_dev = unsafe { self.dev.as_bound() };
+            let shmem = Coherent::<u8>::zeroed_slice(bound_dev, PMP_SHMEM_SIZE, GFP_KERNEL)?;
+            state.shmem = Some(shmem);
         }
-        dev_info!(self.dev, "PMP shared memory offered at {:#x}\n", dva);
-        Ok(())
+        let dva = state.shmem.as_ref().ok_or(ENOMEM)?.dma_address();
+        if dva & !MSG_IOVA_MASK != 0 {
+            return Err(ERANGE);
+        }
+        state.shmem_acked = false;
+        state.report_live = false;
+        Ok(MSG_TYPE_CONFIGURE << MSG_TYPE_SHIFT | dva)
     }
     fn configure_ack(&self, msg: u64) {
         let mut state = self.state.lock();
         if state.shmem.is_none() {
-            dev_warn!(self.dev, "PMP configure ack {:#018x} without shared memory\n", msg);
+            dev_warn!(
+                self.dev,
+                "PMP configure ack {:#018x} without shared memory\n",
+                msg
+            );
             return;
         }
         if !state.shmem_acked {
             state.shmem_acked = true;
+            state.report_live = true;
             dev_info!(self.dev, "PMP coherent report buffer ready\n");
         }
     }
@@ -684,6 +677,7 @@ impl PmpData {
         }
         let opc = (msg >> OPC_SHIFT) & 0xFF;
         let reply = match opc {
+            OPC_READY if self.host_shmem => self.offer_shmem()?,
             OPC_GET_IOVA_TABLE => self.get_iova_table()?,
             OPC_MALLOC => self.malloc(msg & MALLOC_SIZE_MASK)?,
             OPC_FREE => self.free(msg & MSG_IOVA_MASK)?,
@@ -1133,12 +1127,6 @@ impl platform::Driver for PmpDriver {
             .relaxed()
             .update(ASC_CPU_CONTROL, |r| r.with_const_cpu_run::<1>());
         data.start()?;
-        if cfg.shmem {
-            // Without it the PMP runs as before, only without the GPU effort report.
-            if let Err(error) = data.offer_shmem() {
-                dev_warn!(dev, "PMP shared memory not offered: {:?}\n", error);
-            }
-        }
         // SAFETY: the PMP owner retains both Devres mappings; managed child
         // teardown and provider cleanup precede device mapping revocation.
         to_result(unsafe {
