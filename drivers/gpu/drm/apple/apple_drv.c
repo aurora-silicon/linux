@@ -403,7 +403,7 @@ static void apple_crtc_atomic_enable(struct drm_crtc *crtc,
 	if (crtc_state->active) {
 		ret = dcp_crtc_atomic_modeset(crtc, commit);
 		if (ret) {
-			/* -EPIPE: an external pipe without a link, the hotplug worker reports it. */
+			/* -EPIPE: an external pipe has no link; the hotplug worker reports it. */
 			if (ret != -EPIPE)
 				drm_err_ratelimited(crtc->dev, "[CRTC:%d:%s] mode set failed: %d\n",
 						    crtc->base.id, crtc->name, ret);
