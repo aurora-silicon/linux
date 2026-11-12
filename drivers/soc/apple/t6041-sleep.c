@@ -299,6 +299,9 @@ static void t6041_pmu_write(struct t6041_sleep *s, u16 reg, u8 val)
 {
 	unsigned int us;
 
+	/* A reply someone else left (aura's own writes at the wake), so the next one is ours. */
+	while (!(readl(s->spmi + SPMI_STATUS) & SPMI_RX_EMPTY))
+		readl(s->spmi + 0x8);
 	writel((u32)reg << 16 | BIT(15) | PMU_SID << 8 | 0x30, s->spmi + SPMI_CMD);
 	writel(val, s->spmi + SPMI_CMD);
 	/*
