@@ -1119,3 +1119,8 @@
 #include "t6050-j775c-incremental-spmi.dtsi"
 
 #include "t6050-j775c-incremental-pmgr4.dtsi"
+
+#include "t6050-j775c-incremental-additions.dtsi"
+
+/* Isolate newly active MTP DART from the inventory additions. */
+&{/soc/iommu@294800000} { status = "disabled"; };
