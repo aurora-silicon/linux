@@ -16,10 +16,8 @@
 #include <linux/jiffies.h>
 #include <linux/kconfig.h>
 #include <linux/kernel.h>
-#include <linux/kmsg_dump.h>
 #include <linux/kref.h>
 #include <linux/kthread.h>
-#include <linux/nvmem-consumer.h>
 #include <linux/module.h>
 #include <linux/mux/driver.h>
 #include <linux/soc/apple/dart.h>
@@ -4387,7 +4385,7 @@ int dcp_wait_ready(struct platform_device *pdev, u64 timeout)
 	return dcp->active ? 0 : -ETIMEDOUT;
 }
 
-static void dcp_sleep(struct apple_dcp *dcp)
+static void __maybe_unused dcp_sleep(struct apple_dcp *dcp)
 {
 	switch (dcp->fw_compat) {
 	case DCP_FIRMWARE_V_12_3:
@@ -8625,9 +8623,6 @@ static int dcp_platform_resume(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
-	if (pm_resume_via_firmware())
-		dev_warn(dev, "S2RTIME dcp resume entered\n");
-
 	if (dcp_takeover_was_aborted(dcp))
 		return 0;
 
@@ -8844,39 +8839,9 @@ static struct platform_driver apple_platform_driver = {
 };
 
 /*
- * T6041 sleep test: stop each firmware from Linux before the suspend starts. Per DCP
- * (main, ext0, ext1): status at start, status after the display call, first idle result,
- * second idle result, status after idle, CPU word 20 ms after the run bit.
+ * T6041 suspend-to-RAM: each display firmware is stopped from Linux before the sleep, from the
+ * display subsystem's own suspend, and the internal one is restarted warm after the wake.
  */
-static u32 dcp_stop_log[18];
-static struct nvmem_device *dcp_stop_nv;
-
-static int dcp_stop_nv_match(struct device *dev, const void *data)
-{
-	return dev->parent && !strcmp(dev_name(dev->parent), "0-0b");
-}
-
-/* Written before each step: it survives a panic, and aura never touches it. */
-static void dcp_stop_mark(int idx, u32 stage)
-{
-	if (IS_ERR_OR_NULL(dcp_stop_nv))
-		dcp_stop_nv = nvmem_device_find(NULL, dcp_stop_nv_match);
-	if (!IS_ERR_OR_NULL(dcp_stop_nv))
-		nvmem_device_write(dcp_stop_nv, 0x83f0 + 4 * idx, 4, &stage);
-}
-
-static u32 dcp_stop_word(unsigned long addr)
-{
-	void __iomem *reg = ioremap(addr, 4);
-	u32 val = ~0U;
-
-	if (reg) {
-		val = readl(reg);
-		iounmap(reg);
-	}
-	return val;
-}
-
 static int dcp_stop_poller(void *data)
 {
 	while (!kthread_should_stop()) {
@@ -8887,213 +8852,131 @@ static int dcp_stop_poller(void *data)
 }
 
 /*
- * Per DCP: status at start, A500 result, first idle result,
- * I2A control then, idle result with the mailbox polled, status at the end.
+ * The fixed waits of the display stop and restart, as run on 11 Nov (lit on every wake): after
+ * the pipe power-on before the mode set, before the power words go back to their boot state,
+ * between the firmware stop and the power words, and after the power words.
  */
-/*
- * How the internal DCP is put down for the sleep test: 0 nothing (pipe left on; the firmware
- * then panics reprogramming it after the wake), 1 display power-off then the sleep transition
- * (abort_swaps, last_client_close, set_power_state sleep), 2 the display power-off only, the
- * cycle that lit the panel again within one boot on 27 Oct.
- */
-int apple_dart_display_keep(struct device *dev, u32 streams, bool save);
-
-/*
- * The fixed waits of the S2R display stop and restart, tunable while the wake time is cut down:
- * settle = after the pipe power-on, before the mode set (1 s since the first restart that lit);
- * words = before the power words go back to boot state; stop = between steps 1 and 2;
- * down = after step 2.
- */
-/* Defaults as run on 11 Nov (lit on every wake once the backlight and DART fixes were in). */
-static unsigned int s2r_settle_ms = 200, s2r_words_ms = 100, s2r_stop_ms = 300, s2r_down_ms = 100;
-module_param(s2r_settle_ms, uint, 0644);
-module_param(s2r_words_ms, uint, 0644);
-module_param(s2r_stop_ms, uint, 0644);
-module_param(s2r_down_ms, uint, 0644);
-
-static unsigned int s2r_hard = 2;
-module_param(s2r_hard, uint, 0644);
+#define DCP_S2R_SETTLE_MS	200
+#define DCP_S2R_WORDS_MS	100
+#define DCP_S2R_STOP_MS		300
+#define DCP_S2R_DOWN_MS		100
 
 static int dcp_t6041_stop_one(struct device *dev, void *data)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 	bool external = *(bool *)data;
-	unsigned long base = 0x402e00000UL;
-	unsigned long word = 0x502290000UL;
-	u32 *r = dcp_stop_log, status, a2i, i2a, val;
 	struct task_struct *poller;
-	int ret, idx;
+	unsigned int idx = 0;
+	u32 status;
+	int ret;
 
 	/* dcp->external is only set on T6030. */
 	if (!dcp || IS_ERR_OR_NULL(dcp->rtk) ||
 	    strstarts(dev_name(dev), "402e") == external)
 		return 0;
-	if (external && strstarts(dev_name(dev), "3a2e")) {
-		r += 6;
-		base = 0x3a2e00000UL;
-		word = 0x502800350UL;
-	} else if (external) {
-		r += 12;
-		base = 0x602e00000UL;
-		word = 0x5028004a0UL;
-	}
-	idx = (r - dcp_stop_log) / 6;
 	/*
 	 * An external DCP stopped for an earlier sleep stays down, with its domains forced off by
-	 * step 2: reading its registers again hung the second sleep of a boot (11 Nov).
+	 * the power word step: reading its registers again hung the second sleep of a boot (11 Nov).
 	 */
 	if (external) {
-		/* Also one that was never running: step 2 took its domains down all the same. */
-		static bool seen[4];
+		/* Also one that was never running: the power word step took its domains down too. */
+		static bool seen[3];
 
-		if (READ_ONCE(dcp->ext_dead) || seen[idx & 3]) {
-			dev_warn(dev, "S2RSTOP: left down by an earlier sleep, skipped\n");
+		idx = strstarts(dev_name(dev), "3a2e") ? 1 : 2;
+		if (READ_ONCE(dcp->ext_dead) || seen[idx])
 			return 0;
-		}
-		seen[idx & 3] = true;
+		seen[idx] = true;
 		/*
 		 * This pipe's display DART too goes dark for good, now, while its block is still on:
-		 * step 2 forces the external display domains off and nothing raises them, but the
-		 * framebuffers are mapped through all three display DARTs, so every later unmap went
-		 * to flush a DART behind a dead block and the CPU doing it never came back (login or
-		 * sddm restart after a wake, last line DRM_IOCTL_MODE_CLOSEFB; 11 Nov). Marked dark,
-		 * the flush only publishes to memory.
+		 * the power word step forces the external display domains off and nothing raises
+		 * them, but the framebuffers are mapped through all three display DARTs, so every
+		 * later unmap went to flush a DART behind a dead block and the CPU doing it never came
+		 * back (login or sddm restart after a wake, last line DRM_IOCTL_MODE_CLOSEFB; 11 Nov).
+		 * Marked dark, the flush only publishes to memory.
 		 */
 		dcp_s2r_find_darts(dcp);
 		if (dcp->s2r_disp_dart)
-			dev_warn(dev, "S2RSTOP: display DART dark for good: %d\n",
-				 apple_dart_display_streams(dcp->s2r_disp_dart, DCP_S2R_DISP_STREAMS,
-							    false, true));
+			apple_dart_display_streams(dcp->s2r_disp_dart, DCP_S2R_DISP_STREAMS, false, true);
 	}
-	dcp_stop_mark(idx, 1);
-	r[0] = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS);
-	dev_warn(dev, "S2RSTOP start: running %d status %#x crashed %d\n",
-		 apple_rtkit_is_running(dcp->rtk), r[0], READ_ONCE(dcp->crashed));
-	if (!apple_rtkit_is_running(dcp->rtk)) {
-		r[2] = r[4] = 0xfffffff0;
+	if (!apple_rtkit_is_running(dcp->rtk))
 		return 0;
-	}
 	dcp_drain_for_sleep(dcp);
 	cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
 	iomfb_pause_presentation(dcp, true);
 	iomfb_queue_settle(dcp, msecs_to_jiffies(500));
 	dcp_s2r_find_darts(dcp);
 	if (!external) {
+		bool idle;
+
 		if (dcp->s2r_disp_dart)
 			apple_dart_display_keep(dcp->s2r_disp_dart, DCP_S2R_DISP_STREAMS, true);
 		if (dcp->s2r_dcp_dart)
 			apple_dart_display_keep(dcp->s2r_dcp_dart, DCP_S2R_DCP_STREAMS, true);
-	}
-	dcp_stop_mark(idx, 2);
-	if (!external) {
-		bool idle;
-
 		/*
-		 * As linux#1477 dcp_t6041_s2r_stop: the pipe off through the firmware, then the display
-		 * sleep, then wait for its calls to settle. No av_service_disconnect any more: the
-		 * firmware answered it with an unplug (HPD removed), and after the warm restart it
-		 * refused every mode set with "HPD is 0 link_status is 0" (10 Nov).
+		 * As linux#1477 dcp_t6041_s2r_stop: the pipe off through the firmware, then wait for
+		 * its calls to settle. No av_service_disconnect: the firmware answered it with an
+		 * unplug (HPD removed), and after the warm restart it refused every mode set with
+		 * "HPD is 0 link_status is 0" (10 Nov). No display sleep transition after the
+		 * power-off either.
 		 */
-		/*
-		 * s2r_hard = 0 (default since the t3 run): no hard power-off at all. Any set_power_state(0)
-		 * makes this firmware terminate its IOAV video interface and drop HPD, and it never
-		 * takes a mode again ("IOAVVideoInterface open failed", "HPD is 0"). The firmware is
-		 * stopped with its pipe state still on; after the wake a full mode set makes it
-		 * reprogram the pipe, as the takeover mode set does at boot.
-		 */
-		if (s2r_hard)
-			_dcp_poweroff(dcp);
-		if (s2r_hard == 1)
-			dcp_sleep(dcp);
+		_dcp_poweroff(dcp);
 		if (read_poll_timeout(iomfb_channels_idle, idle, idle, 1000, 200000, false, dcp))
-			dev_warn(dev, "S2RSTOP calls still in flight after the display sleep\n");
+			dev_warn(dev, "display calls still in flight after the power-off\n");
 		msleep(100);
-		dcp_stop_mark(idx, 3);
-		/*
-		 * The firmware's D572(0): this path only answers it. Only after a hard power-off:
-		 * with the pipe still scanning out, cutting its DART streams made the firmware panic
-		 * ("IOMFB int_handler_gated: failure: axi_rd_err", t4 run). Without one they go off
-		 * once the CPU is stopped, below.
-		 */
-		if (s2r_hard && dcp->s2r_disp_dart)
+		/* The firmware's D572(0), only answered here: its display DART streams off now. */
+		if (dcp->s2r_disp_dart)
 			apple_dart_display_streams(dcp->s2r_disp_dart, DCP_S2R_DISP_STREAMS,
 						   false, false);
 		usleep_range(5000, 6000);
 	}
-	dcp_stop_mark(idx, 4);
-	r[1] = iomfb_s2r_500_v26_6_desktop(dcp);
-	dev_warn(dev, "S2RSTOP A500 %d status %#x\n", (int)r[1],
-		 readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS));
+	iomfb_s2r_500_v26_6_desktop(dcp);
 	usleep_range(4000, 5000);
-	dcp_stop_mark(idx, 5);
 	ret = apple_rtkit_idle(dcp->rtk);
-	r[2] = ret;
-	dcp_stop_mark(idx, 6);
-	a2i = dcp_stop_word(base + 0x8110);
-	i2a = dcp_stop_word(base + 0x8114);
-	r[3] = i2a;
-	dev_warn(dev, "S2RSTOP first idle %d a2i %#x i2a %#x\n", ret, a2i, i2a);
 	if (ret) {
 		poller = kthread_run(dcp_stop_poller, dcp->rtk, "dcpstop");
 		ret = apple_rtkit_idle(dcp->rtk);
 		if (!IS_ERR(poller))
 			kthread_stop(poller);
-		dev_warn(dev, "S2RSTOP polled idle %d\n", ret);
 	}
-	if (ret)
+	if (ret) {
+		dev_warn(dev, "the firmware didn't go idle for the sleep: %d\n", ret);
 		return 0;
+	}
 	apple_rtkit_poll(dcp->rtk);
-	r[4] = readl_poll_timeout(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS, status,
-				  (status & (APPLE_DCP_COPROC_CPU_STATUS_IDLE |
-					     APPLE_DCP_COPROC_CPU_STATUS_STOPPED)) ==
-				  (APPLE_DCP_COPROC_CPU_STATUS_IDLE |
-				   APPLE_DCP_COPROC_CPU_STATUS_STOPPED), 100, 50000);
-	dev_warn(dev, "S2RSTOP idle ok, wait %d status %#x word %#x\n", (int)r[4], status,
-		 dcp_stop_word(word));
-	dcp_stop_mark(idx, 7);
+	readl_poll_timeout(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS, status,
+			   (status & (APPLE_DCP_COPROC_CPU_STATUS_IDLE |
+				      APPLE_DCP_COPROC_CPU_STATUS_STOPPED)) ==
+			   (APPLE_DCP_COPROC_CPU_STATUS_IDLE |
+			    APPLE_DCP_COPROC_CPU_STATUS_STOPPED), 100, 50000);
 	/*
 	 * QUIESCED and SLEEP after idle: T23 reached STOPPED (0x6e) only this way. Not for the
-	 * internal DCP any more: linux#1477 stops it at the idle (A500, idle, mailbox off, run
-	 * bit, bit 5) and its warm restart then works; after a shutdown ours crashed in the
-	 * restart (10 Nov, data abort at 0xffffffff00000040 right after the first shmem_setup).
+	 * internal DCP: linux#1477 stops it at the idle (A500, idle, mailbox off, run bit, bit 5)
+	 * and its warm restart then works; after a shutdown ours crashed in the restart (10 Nov,
+	 * data abort at 0xffffffff00000040 right after the first shmem_setup).
 	 */
-	ret = external ? apple_rtkit_shutdown(dcp->rtk) : 0;
-	r[4] = ret;
-	dev_warn(dev, "S2RSTOP shutdown %d status %#x word %#x\n", ret,
-		 readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS), dcp_stop_word(word));
-	dcp_stop_mark(idx, 8);
+	if (external)
+		apple_rtkit_shutdown(dcp->rtk);
 	WRITE_ONCE(dcp->crashed, true);
 	WRITE_ONCE(dcp->ext_dead, true);
 	WRITE_ONCE(dcp->s2r_fw_down, true);
 	apple_rtkit_mailbox_off(dcp->rtk);
 	dcp_s2r_cpu_stop(dcp);
-	dcp_stop_mark(idx, 9);
-	dev_warn(dev, "S2RSTOP run off: status %#x word %#x\n",
-		 readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS), dcp_stop_word(word));
-	if (!external && !s2r_hard && dcp->s2r_disp_dart)
-		apple_dart_display_streams(dcp->s2r_disp_dart, DCP_S2R_DISP_STREAMS, false, false);
-	ret = dcp_s2r_stop_streams(dcp);
-	dcp_stop_mark(idx, 10);
+	dcp_s2r_stop_streams(dcp);
 	msleep(20);
-	r[5] = dcp_stop_word(word);
-	dev_warn(dev, "S2RSTOP streams off %d word %#x\n", ret, r[5]);
 
 	return 0;
 }
 
 /*
- * Second pass, after the log is on disk. The fabric rejects writes to a DCP's CPU word
- * until bit 4 of its slice in the protection table at 0x500578000 is clear: ADT
- * clock-protection-slice-index, 0x100 + 0x40 * index. Then macOS's order on the Neo.
+ * The power words of each display CPU down, after its firmware stopped. The fabric rejects
+ * writes to a DCP's CPU word until bit 4 of its slice in the protection table at 0x500578000 is
+ * clear: ADT clock-protection-slice-index, 0x100 + 0x40 * index. Then macOS's order on the Neo.
  */
 static u32 dcp_t6041_child_saved[11];
 static bool dcp_t6041_child_valid;
 
-static u32 dcp_t6041_gapf_boot;
-
-static void dcp_t6041_word_try(const char *name, int idx, u32 slice, unsigned long cpu,
-			       unsigned long fe, unsigned long sys, unsigned long pg_a,
-			       unsigned long pg_b)
+static void dcp_t6041_word_try(const char *name, u32 slice, unsigned long cpu, unsigned long fe,
+			       unsigned long sys, unsigned long pg_a, unsigned long pg_b)
 {
 	void __iomem *gapf = ioremap(0x500578000UL + slice, 4);
 	void __iomem *rcpu = ioremap(cpu, 4), *rfe = ioremap(fe, 4), *rsys = ioremap(sys, 4);
@@ -9102,25 +8985,14 @@ static void dcp_t6041_word_try(const char *name, int idx, u32 slice, unsigned lo
 	u32 val, fab = 0, cur;
 
 	if (!gapf || !rcpu || !rfe || !rsys || !ra || !rb)
-		return;
+		goto out;
 	val = readl(gapf);
-	pr_warn("S2RSTOP %s slice %#x\n", name, val);
-	/* The internal pipe's word as boot left it (0x12), to put back after the restart. */
-	if (cpu < 0x502800000UL && (val & BIT(4)) && !dcp_t6041_gapf_boot)
-		dcp_t6041_gapf_boot = val;
-	dcp_stop_mark(idx, 20);
 	writel(val & ~BIT(4), gapf);
-	dcp_stop_mark(idx, 21);
 	msleep(1);
-	pr_warn("S2RSTOP %s slice now %#x word %#x\n", name, readl(gapf), readl(rcpu));
-	dcp_stop_mark(idx, 22);
 	val = readl(rcpu);
 	writel(val & ~(BIT(28) | GENMASK(9, 8)), rcpu);
-	dcp_stop_mark(idx, 23);
 	msleep(1);
 	val = readl(rcpu);
-	pr_warn("S2RSTOP %s after bit 28: %#x\n", name, val);
-	dcp_stop_mark(idx, 24);
 	/*
 	 * Everything macOS's sleep check wants off under this CPU, last first: DSC, PPP, GPL,
 	 * GP1, GP0, DPEXT, DBE. iBoot leaves them on over a DCP Linux never started.
@@ -9129,10 +9001,10 @@ static void dcp_t6041_word_try(const char *name, int idx, u32 slice, unsigned lo
 		static const u8 ext_subs[] = { 0x38, 0x30, 0x28, 0x20, 0x18, 0x10, 0x08, 0 };
 		static const u8 main_subs[] = { 0x58, 0x50, 0x48, 0x40, 0x38, 0x30, 0x28, 0x20,
 						0x18, 0x10, 0x08, 0 };
-		const u8 *subs = cpu >= 0x502800000UL ? ext_subs : main_subs;
+		const u8 *subs = subs_main ? main_subs : ext_subs;
 		int i;
 
-		if (subs == main_subs) {
+		if (subs_main) {
 			for (i = 0; i < 11; i++) {
 				void __iomem *sub = ioremap(cpu + 8 * (i + 1), 4);
 
@@ -9154,17 +9026,10 @@ static void dcp_t6041_word_try(const char *name, int idx, u32 slice, unsigned lo
 				writel(val, sub);
 			}
 			writel((val & ~GENMASK(3, 0)) | GENMASK(9, 8), sub);
-			pr_warn("S2RSTOP %s +%#x %#x\n", name, subs[i], readl(sub));
 			iounmap(sub);
 		}
 		val = readl(rcpu);
 	}
-	/*
-	 * The internal display's SYS hangs off fab6_soc, which gates itself as soon as nothing
-	 * under it is on. Lowered while the fabric is already going (second stop of a boot, the
-	 * external pipes long off), SYS latches PARENT_OFF (reads 0x800, FE 0x200), the sleep
-	 * engine waits on that bit and the chip resets. So: the fabric on by hand until SYS is down.
-	 */
 	/*
 	 * Two things the restart sets that boot did not have, undone before the lowering: bit 0 of
 	 * both words of bridge 4 (boot 0x10000 / 0x101330, after a restart 0x10001 / 0x101331) and the
@@ -9176,32 +9041,33 @@ static void dcp_t6041_word_try(const char *name, int idx, u32 slice, unsigned lo
 		void __iomem *cnt = ioremap(0x5048a9c14UL, 4);
 
 		if (br && cnt) {
-			u32 b4 = readl(br + 0x4), b8 = readl(br + 0x8), c = readl(cnt);
-
-			writel(b4 & ~1U, br + 0x4);
-			writel(b8 & ~1U, br + 0x8);
+			writel(readl(br + 0x4) & ~1U, br + 0x4);
+			writel(readl(br + 0x8) & ~1U, br + 0x8);
 			writel(0, cnt);
-			pr_warn("S2RSTOP %s: bridge4 %#x %#x -> %#x %#x, voters %u -> %u\n", name,
-				b4, b8, readl(br + 0x4), readl(br + 0x8), c, readl(cnt));
 		}
 		if (br)
 			iounmap(br);
 		if (cnt)
 			iounmap(cnt);
 	}
+	/*
+	 * The internal display's SYS hangs off fab6_soc, which gates itself as soon as nothing
+	 * under it is on. Lowered while the fabric is already going (second stop of a boot, the
+	 * external pipes long off), SYS latches PARENT_OFF (reads 0x800, FE 0x200), the sleep
+	 * engine waits on that bit and the chip resets. So: the fabric on by hand until SYS is down.
+	 */
 	if (subs_main) {
 		rfab = ioremap(0x502800480UL, 4);
 		if (rfab) {
 			fab = readl(rfab);
 			writel((fab & ~(BIT(28) | GENMASK(9, 8) | GENMASK(3, 0))) | 0xf, rfab);
 			if (readl_poll_timeout(rfab, cur, (cur & 0xf0) == 0xf0, 50, 20000))
-				pr_warn("S2RSTOP %s: fab6_soc not on: %#x\n", name, cur);
+				pr_warn("dcp %s: fab6_soc not on: %#x\n", name, cur);
 		}
 	}
 	writel(3, ra);
 	writel(0, rb);
 	writel((val & ~GENMASK(3, 0)) | GENMASK(9, 8), rcpu);
-	dcp_stop_mark(idx, 25);
 	val = readl(rfe);
 	if (val & BIT(28))
 		writel(val & ~(BIT(28) | GENMASK(9, 8)), rfe);
@@ -9210,110 +9076,37 @@ static void dcp_t6041_word_try(const char *name, int idx, u32 slice, unsigned lo
 	if (val & BIT(28))
 		writel(val & ~(BIT(28) | GENMASK(9, 8)), rsys);
 	writel((readl(rsys) & ~GENMASK(3, 0)) | GENMASK(9, 8), rsys);
-	dcp_stop_mark(idx, 26);
 	msleep(50);
 	if (rfab) {
 		if (readl_poll_timeout(rsys, cur, !(cur & (0xf0 | BIT(11))), 50, 50000))
-			pr_warn("S2RSTOP %s: sys still %#x with fab6_soc held\n", name, cur);
+			pr_warn("dcp %s: sys still %#x with fab6_soc held\n", name, cur);
 		/* Back to automatic, as it was; the flag bits are write-one-to-clear, left alone. */
 		writel((readl(rfab) & ~(GENMASK(9, 8) | BIT(28))) | (fab & BIT(28)), rfab);
 		msleep(5);
-		pr_warn("S2RSTOP %s: fab6_soc was %#x, held, now %#x; sys %#x\n", name, fab,
-			readl(rfab), readl(rsys));
 		iounmap(rfab);
 	}
-	pr_warn("S2RSTOP %s domains: cpu %#x fe %#x sys %#x\n", name, readl(rcpu), readl(rfe),
-		readl(rsys));
-	dcp_stop_mark(idx, 27);
+out:
+	if (gapf)
+		iounmap(gapf);
+	if (rcpu)
+		iounmap(rcpu);
+	if (rfe)
+		iounmap(rfe);
+	if (rsys)
+		iounmap(rsys);
+	if (ra)
+		iounmap(ra);
+	if (rb)
+		iounmap(rb);
 }
 
 /*
- * Sleep test: the panic's key lines into free PMU scratch, by hand, since nothing else
- * survives the reset and a panic can't sleep. 0x8340 up to the stop marks at 0x83f0.
- */
-static void __iomem *dcp_panic_spmi;
-static bool dcp_panic_on;
-
-static void dcp_panic_put(u16 reg, const char *p)
-{
-	u32 data;
-	int i;
-
-	memcpy(&data, p, 4);
-	while (!(readl(dcp_panic_spmi) & BIT(24)))
-		readl(dcp_panic_spmi + 8);
-	writel(((u32)reg << 16) | BIT(15) | (0xb << 8) | 0x33, dcp_panic_spmi + 4);
-	writel(data, dcp_panic_spmi + 4);
-	for (i = 0; i < 2000 && (readl(dcp_panic_spmi) & BIT(24)); i++)
-		udelay(5);
-	if (!(readl(dcp_panic_spmi) & BIT(24)))
-		readl(dcp_panic_spmi + 8);
-}
-
-static void dcp_panic_dump(struct kmsg_dumper *dumper, struct kmsg_dump_detail *detail)
-{
-	static char buf[8192], out[180];
-	bool in_trace = false;
-	struct kmsg_dump_iter iter;
-	size_t len = 0, o = 0;
-	char *line = buf;
-	int i;
-
-	if (detail->reason != KMSG_DUMP_PANIC || !dcp_panic_spmi)
-		return;
-	kmsg_dump_rewind(&iter);
-	kmsg_dump_get_buffer(&iter, false, buf, sizeof(buf) - 1, &len);
-	buf[len] = 0;
-	/* The call trace's function names: the first frames are the abort handling. */
-	while (line && *line && o < 176) {
-		char *end = strchr(line, '\n'), *text = strchr(line, ']');
-
-		if (end)
-			*end = 0;
-		text = text ? text + 2 : line;
-		while (*text == ' ')
-			text++;
-		if (in_trace) {
-			char *plus = strchr(text, '+');
-			size_t n = plus ? plus - text : strlen(text);
-
-			if (n && !strstarts(text, "SMP:") && !strstarts(text, "Kernel") &&
-			    !strstarts(text, "el1") && !strstarts(text, "do_") &&
-			    !strstarts(text, "arm64_") && !strstarts(text, "show_") &&
-			    !strstarts(text, "dump_") && !strstarts(text, "vpanic") &&
-			    !strstarts(text, "panic") && !strstarts(text, "__warn") &&
-			    !strstarts(text, "nmi_") && !strstarts(text, "add_taint") &&
-			    !strstarts(text, "_printk") && !strstarts(text, "stack_")) {
-				n = min_t(size_t, n, 28);
-				n = min_t(size_t, n, 175 - o);
-				memcpy(out + o, text, n);
-				o += n;
-				out[o++] = '|';
-			}
-		} else if (strstr(text, "Call trace:")) {
-			in_trace = true;
-		}
-		line = end ? end + 1 : NULL;
-	}
-	for (i = 0; i < 176; i += 4)
-		dcp_panic_put(0x8340 + i, out + i);
-}
-
-static struct kmsg_dumper dcp_panic_dumper = {
-	.dump = dcp_panic_dump,
-	.max_reason = KMSG_DUMP_PANIC,
-};
-
-/*
- * Sleep test, after a real wake: the internal DCP back, as linux#1477 does it for the M4 Pro
+ * After a real wake: the internal DCP back, as linux#1477 does it for the M4 Pro
  * (t6040_disp_back, dcp_t6041_s2r_domains_on, dcp_t6041_s2r_resume, the warm restart and the
- * mode set of dcp_hib_recommit): DISP_SYS on, the retention pair (A := 0, B := 1), its bridge
- * armed, DISP_FE on, the GAPF protection off, DISP_CPU on, its 11 children as the stop found
- * them, the PMC voter, both DARTs' streams, the idled firmware restarted, the pipe powered
- * and the mode set again. Result words in dcp_start_log (s2r_stop reads them after the stop's).
+ * mode set of dcp_hib_recommit): DISP_SYS on, the retention pair (A := 0, B := 1), DISP_FE on,
+ * the GAPF protection off, DISP_CPU on, its 11 children as the stop found them, the PMC voter,
+ * both DARTs' streams, the idled firmware restarted, the pipe powered and the mode set again.
  */
-static u32 dcp_start_log[6];
-
 static int dcp_t6041_recommit(struct apple_dcp *dcp)
 {
 	struct apple_crtc *acrtc = READ_ONCE(dcp->crtc);
@@ -9323,17 +9116,15 @@ static int dcp_t6041_recommit(struct apple_dcp *dcp)
 	struct drm_crtc *crtc;
 	int ret;
 
-	if (s2r_hard) {
-		iomfb_poweron_v26_6_desktop(dcp);
-		/* Room for the firmware to bring its link and hotplug state back before the mode set. */
-		msleep(READ_ONCE(s2r_settle_ms));
-	}
+	iomfb_poweron_v26_6_desktop(dcp);
+	/* Room for the firmware to bring its link and hotplug state back before the mode set. */
+	msleep(DCP_S2R_SETTLE_MS);
 	if (!acrtc)
-		return 1;
+		return 0;
 	crtc = &acrtc->base;
 	DRM_MODESET_LOCK_ALL_BEGIN(crtc->dev, ctx, 0, ret);
 	if (!crtc->state->active) {
-		ret = 2;
+		ret = 0;
 		goto unlock;
 	}
 	state = drm_atomic_commit_alloc(crtc->dev);
@@ -9360,34 +9151,24 @@ unlock:
 	return ret;
 }
 
-static struct apple_dcp *dcp_t6041_main;
-static int dcp_t6041_bl_text(char *buf, size_t len);
 void dcp_backlight_s2r_restore(struct apple_dcp *dcp);
-static bool s2r_bridge_arm;
-module_param(s2r_bridge_arm, bool, 0644);
-static bool s2r_gapf_restore;	/* writing 0x12 back after a wake froze the Max (11 Nov 22:0x) */
-module_param(s2r_gapf_restore, bool, 0644);
-static bool s2r_bl_restore = true;
-module_param(s2r_bl_restore, bool, 0644);
 
 static int dcp_t6041_start_one(struct device *dev, void *data)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
-	void __iomem *ps, *pg, *br, *gapf, *pmc;
-	u32 v, cur, to = 0, *r = dcp_start_log;
+	void __iomem *ps, *pg, *gapf, *pmc;
+	u32 v, cur, to = 0;
 	int ret, i;
 
-	pr_warn("S2RSTART %s: dcp %d rtk %d\n", dev_name(dev), !!dcp, dcp && !IS_ERR_OR_NULL(dcp->rtk));
 	if (!dcp || IS_ERR_OR_NULL(dcp->rtk) || !strstarts(dev_name(dev), "402e"))
 		return 0;
 	ps = ioremap(0x502280000UL, 0x14000);
 	pg = ioremap(0x5022a1000UL, 0x100);
-	br = ioremap(0x403000100UL, 0x10);
 	gapf = ioremap(0x500578540UL, 4);
 	pmc = ioremap(0x5048a9c14UL, 8);
-	if (!ps || !pg || !br || !gapf || !pmc) {
-		pr_warn("S2RSTART: ioremap failed\n");
-		return 0;
+	if (!ps || !pg || !gapf || !pmc) {
+		dev_err(dev, "cannot map the display power words after the sleep\n");
+		goto unmap;
 	}
 
 	v = readl(ps + 0x258) & ~(GENMASK(9, 8) | GENMASK(3, 0) | BIT(28));
@@ -9403,17 +9184,10 @@ static int dcp_t6041_start_one(struct device *dev, void *data)
 	writel(0, pg + 0x1c);
 	writel(1, pg + 0x60);
 	/*
-	 * Bit 0 of bridge 4's two words: macOS's wake sets it and so did this restart, but boot has
-	 * it clear (0x10000 / 0x101330) with the display working, and with it set the driver's own
-	 * display power-off after a wake froze the whole machine right after "dcp_poweroff() done"
-	 * (login after a wake, sddm restart; 11 Nov 21:37 with a live log). Left as boot has it.
+	 * Bridge 4 stays as boot has it (bit 0 of both words clear, 0x10000 / 0x101330), unlike
+	 * macOS's wake: with it set, the driver's own display power-off after a wake froze the whole
+	 * machine right after "dcp_poweroff() done" (login after a wake, sddm restart; 11 Nov).
 	 */
-	if (READ_ONCE(s2r_bridge_arm)) {
-		writel(readl(br + 0x4) | 1, br + 0x4);
-		writel(readl(br + 0x8) | 1, br + 0x8);
-	}
-	pr_warn("S2RSTART bridge4 %#x %#x (arm %d)\n", readl(br + 0x4), readl(br + 0x8),
-		READ_ONCE(s2r_bridge_arm));
 	v = readl(ps + 0x368) & ~(GENMASK(9, 8) | GENMASK(3, 0) | BIT(28));
 	writel((v & ~0x30fU) | 0xf, ps + 0x368);
 	if (readl_poll_timeout(ps + 0x368, cur, (cur & 0xf0) == 0xf0, 50, 10000))
@@ -9435,15 +9209,19 @@ static int dcp_t6041_start_one(struct device *dev, void *data)
 			to |= BIT(8 + i);
 	}
 	dcp_pmc_set(dcp, pmc, true);
-	r[0] = to | 0x80000000;
-	r[1] = readl(ps + 0x10000);
-	dev_warn(dev, "S2RSTART domains: sys %#x fe %#x cpu %#x, not on %#x\n", readl(ps + 0x258),
-		 readl(ps + 0x368), r[1], to);
-	iounmap(ps);
-	iounmap(pg);
-	iounmap(br);
-	iounmap(gapf);
-	iounmap(pmc);
+	if (to)
+		dev_warn(dev, "display domains not on after the sleep: %#x\n", to);
+unmap:
+	if (ps)
+		iounmap(ps);
+	if (pg)
+		iounmap(pg);
+	if (gapf)
+		iounmap(gapf);
+	if (pmc)
+		iounmap(pmc);
+	if (!ps || !pg || !gapf || !pmc)
+		return 0;
 
 	dcp_s2r_find_darts(dcp);
 	if (dcp->s2r_disp_dart) {
@@ -9460,11 +9238,8 @@ static int dcp_t6041_start_one(struct device *dev, void *data)
 	WRITE_ONCE(dcp->ext_dead, false);
 	ret = apple_rtkit_power_cycled_return(dcp->rtk,
 					      dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
-	r[2] = ret;
-	r[3] = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS);
-	dev_warn(dev, "S2RSTART warm restart %d control %#x status %#x\n", ret,
-		 readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL), r[3]);
 	if (ret) {
+		dev_err(dev, "the firmware's warm restart after the sleep failed: %d\n", ret);
 		WRITE_ONCE(dcp->crashed, true);
 		return 0;
 	}
@@ -9477,40 +9252,11 @@ static int dcp_t6041_start_one(struct device *dev, void *data)
 	 */
 	iomfb_pause_presentation(dcp, false);
 	ret = dcp_t6041_recommit(dcp);
-	r[4] = ret;
-	r[5] = READ_ONCE(dcp->crashed);
-	dev_warn(dev, "S2RSTART mode set %d crashed %d\n", ret, READ_ONCE(dcp->crashed));
+	if (ret)
+		dev_warn(dev, "mode set after the sleep failed: %d\n", ret);
 	if (!READ_ONCE(dcp->crashed))
 		iomfb_pause_presentation(dcp, false);
-	/*
-	 * The stop clears bit 4 of the internal pipe's GAPF word (0x500578540) and nothing set it
-	 * again: boot has 0x12, after a restart it read 0x2 or 0. With it clear, the first display
-	 * power-off by the driver after a wake left one CPU dead (CPU 8 both times, no NMI answer)
-	 * right after "dcp_poweroff() done". Put the boot value back once the display runs.
-	 */
-	if (READ_ONCE(s2r_gapf_restore) && dcp_t6041_gapf_boot) {
-		void __iomem *g = ioremap(0x500578540UL, 4);
-
-		if (g) {
-			u32 was = readl(g);
-
-			writel(dcp_t6041_gapf_boot, g);
-			dev_warn(dev, "S2RSTART gapf %#x -> %#x (boot %#x)\n", was, readl(g),
-				 dcp_t6041_gapf_boot);
-			iounmap(g);
-		}
-	}
-	if (READ_ONCE(s2r_bl_restore))
-		dcp_backlight_s2r_restore(dcp);
-	else if (dcp->brightness.bl_dev)
-		backlight_update_status(dcp->brightness.bl_dev);
-	{
-		char line[320];
-
-		dcp_t6041_main = dcp;
-		dcp_t6041_bl_text(line, sizeof(line));
-		dev_warn(dev, "S2RSTART backlight: %s", line);
-	}
+	dcp_backlight_s2r_restore(dcp);
 	return 0;
 }
 
@@ -9523,8 +9269,6 @@ static bool dcp_t6041_down, dcp_t6041_words;
  * wake hung the machine (11 Nov, run 6). Put back once the display runs again.
  */
 static u32 dcp_t6041_boot_ps[3];
-static bool s2r_auto_words = true;
-module_param(s2r_auto_words, bool, 0644);
 
 static void dcp_t6041_boot_ps_io(bool restore)
 {
@@ -9535,64 +9279,54 @@ static void dcp_t6041_boot_ps_io(bool restore)
 	if (!ps)
 		return;
 	for (i = 0; i < 3; i++) {
-		if (!restore) {
+		if (!restore)
 			dcp_t6041_boot_ps[i] = readl(ps + off[i]);
-		} else if (dcp_t6041_boot_ps[i] && READ_ONCE(s2r_auto_words)) {
-			u32 was = readl(ps + off[i]);
-
+		else if (dcp_t6041_boot_ps[i])
 			writel(dcp_t6041_boot_ps[i] & ~0xf0U, ps + off[i]);
-			pr_warn("S2RSTART word +%#x: %#x -> %#x (boot %#x)\n", off[i], was,
-				readl(ps + off[i]), dcp_t6041_boot_ps[i]);
-		}
 	}
 	iounmap(ps);
 }
 
-static int dcp_s2r_stop_set(const char *val, const struct kernel_param *kp)
+enum dcp_t6041_step { DCP_S2R_FW_STOP, DCP_S2R_WORDS_DOWN, DCP_S2R_START };
+
+/* Each step once per sleep. */
+static int dcp_t6041_s2r_step(enum dcp_t6041_step step)
 {
 	bool external = true;
 	int ret;
 
-	pr_warn("S2RSTOP set %c (down %d words %d)\n", val[0], dcp_t6041_down, dcp_t6041_words);
-	/* Each step once per sleep, whoever asks: the driver's own suspend or the test script. */
-	if (val[0] == '3') {
+	if (step == DCP_S2R_START) {
 		if (!dcp_t6041_down)
 			return 0;
 		dcp_t6041_down = false;
 		dcp_t6041_words = false;
 		ret = driver_for_each_device(&apple_platform_driver.driver, NULL, NULL,
 					     dcp_t6041_start_one);
-		msleep(READ_ONCE(s2r_words_ms));
+		msleep(DCP_S2R_WORDS_MS);
 		dcp_t6041_boot_ps_io(true);
 		return ret;
 	}
-	if (val[0] == '2' ? dcp_t6041_words || !dcp_t6041_down : dcp_t6041_down)
-		return 0;
-	if (val[0] == '2') {
+	if (step == DCP_S2R_WORDS_DOWN) {
+		if (dcp_t6041_words || !dcp_t6041_down)
+			return 0;
 		dcp_t6041_words = true;
-	} else {
-		dcp_t6041_down = true;
-		dcp_t6041_boot_ps_io(false);
-	}
-
-	if (!dcp_panic_on) {
-		dcp_panic_spmi = ioremap(0x509014000UL, 0x100);
-		dcp_panic_on = !kmsg_dump_register(&dcp_panic_dumper);
-	}
-	if (val[0] == '2') {
 		/* Never started, but the complex counts them. */
-		dcp_t6041_word_try("ext3", 3, 0x740, 0x5028002e8UL, 0x5028002e0UL, 0x5028002d8UL,
+		dcp_t6041_word_try("ext3", 0x740, 0x5028002e8UL, 0x5028002e0UL, 0x5028002d8UL,
 				   0x50282dfb4UL, 0x50282dfd8UL);
-		dcp_t6041_word_try("ext2", 3, 0xd80, 0x5028004f0UL, 0x5028004e8UL, 0x5028004e0UL,
+		dcp_t6041_word_try("ext2", 0xd80, 0x5028004f0UL, 0x5028004e8UL, 0x5028004e0UL,
 				   0x50282db34UL, 0x50282db58UL);
-		dcp_t6041_word_try("ext1", 2, 0xd00, 0x5028004a0UL, 0x502800498UL, 0x502800490UL,
+		dcp_t6041_word_try("ext1", 0xd00, 0x5028004a0UL, 0x502800498UL, 0x502800490UL,
 				   0x50282d6b4UL, 0x50282d6d8UL);
-		dcp_t6041_word_try("ext0", 1, 0x840, 0x502800350UL, 0x502800348UL, 0x502800340UL,
+		dcp_t6041_word_try("ext0", 0x840, 0x502800350UL, 0x502800348UL, 0x502800340UL,
 				   0x50282d234UL, 0x50282d258UL);
-		dcp_t6041_word_try("main", 0, 0x540, 0x502290000UL, 0x502280368UL, 0x502280258UL,
+		dcp_t6041_word_try("main", 0x540, 0x502290000UL, 0x502280368UL, 0x502280258UL,
 				   0x5022a101cUL, 0x5022a1060UL);
 		return 0;
 	}
+	if (dcp_t6041_down)
+		return 0;
+	dcp_t6041_down = true;
+	dcp_t6041_boot_ps_io(false);
 	ret = driver_for_each_device(&apple_platform_driver.driver, NULL, &external,
 				     dcp_t6041_stop_one);
 	external = false;
@@ -9600,71 +9334,22 @@ static int dcp_s2r_stop_set(const char *val, const struct kernel_param *kp)
 					     dcp_t6041_stop_one);
 }
 
-/*
- * T6041 (bring-up): the display down for a real sleep and back after it, from the display
- * subsystem's own suspend and resume, with the sequence the s2r_stop test hooks proved.
- */
-static bool s2r_auto = true;
-module_param(s2r_auto, bool, 0644);
-
+/* T6041: the display down for a real sleep and back after it. */
 void dcp_t6041_s2r_all(bool start)
 {
-	if (!READ_ONCE(s2r_auto) || !of_machine_is_compatible("apple,t6041"))
+	if (!of_machine_is_compatible("apple,t6041"))
 		return;
 	if (start) {
-		dcp_s2r_stop_set("3", NULL);
+		dcp_t6041_s2r_step(DCP_S2R_START);
 		return;
 	}
 	if (dcp_t6041_down)
 		return;
-	dcp_s2r_stop_set("1", NULL);
-	msleep(READ_ONCE(s2r_stop_ms));
-	dcp_s2r_stop_set("2", NULL);
-	msleep(READ_ONCE(s2r_down_ms));
+	dcp_t6041_s2r_step(DCP_S2R_FW_STOP);
+	msleep(DCP_S2R_STOP_MS);
+	dcp_t6041_s2r_step(DCP_S2R_WORDS_DOWN);
+	msleep(DCP_S2R_DOWN_MS);
 }
-
-/* The internal panel's backlight state, for the wakes that come back dark (11 Nov). */
-
-static int dcp_t6041_bl_text(char *buf, size_t len)
-{
-	struct apple_dcp *dcp = dcp_t6041_main;
-	struct dcp_backlight_state *b;
-
-	if (!dcp)
-		return scnprintf(buf, len, "no internal dcp seen yet\n");
-	b = &dcp->backlight.state;
-	return scnprintf(buf, len,
-			 "target %u level %u actual %u sent %u reported %u ready %d controlled %d dpms_off %d core_blank %d suspended %d dirty %d in_flight %d fading %d retries %u crashed %d fw_down %d quiescing %d\n",
-			 b->target, b->level, b->actual, b->sent_nits, b->reported, b->ready,
-			 b->controlled, b->dpms_off, b->core_blank, b->suspended, b->dirty,
-			 b->in_flight, b->fading, b->retries, READ_ONCE(dcp->crashed),
-			 READ_ONCE(dcp->s2r_fw_down), READ_ONCE(dcp->quiescing));
-}
-
-static int dcp_s2r_bl_get(char *buf, const struct kernel_param *kp)
-{
-	return dcp_t6041_bl_text(buf, PAGE_SIZE);
-}
-
-static const struct kernel_param_ops dcp_s2r_bl_ops = { .get = dcp_s2r_bl_get };
-module_param_cb(s2r_bl, &dcp_s2r_bl_ops, NULL, 0444);
-
-static int dcp_s2r_stop_get(char *buf, const struct kernel_param *kp)
-{
-	int i, n = 0;
-
-	for (i = 0; i < ARRAY_SIZE(dcp_stop_log); i++)
-		n += sysfs_emit_at(buf, n, "%08x", dcp_stop_log[i]);
-	for (i = 0; i < ARRAY_SIZE(dcp_start_log); i++)
-		n += sysfs_emit_at(buf, n, "%08x", dcp_start_log[i]);
-	return n;
-}
-
-static const struct kernel_param_ops dcp_s2r_stop_ops = {
-	.set = dcp_s2r_stop_set,
-	.get = dcp_s2r_stop_get,
-};
-module_param_cb(s2r_stop, &dcp_s2r_stop_ops, NULL, 0644);
 
 int __init dcp_register(void)
 {

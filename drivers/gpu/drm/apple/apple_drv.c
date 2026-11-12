@@ -2012,12 +2012,8 @@ static int apple_platform_resume(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
 
-	if (pm_resume_via_firmware())
-		dev_warn(dev, "S2RTIME display resume entered\n");
 	/* Nothing if this suspend never took the display down. */
 	dcp_t6041_s2r_all(true);
-	if (pm_resume_via_firmware())
-		dev_warn(dev, "S2RTIME display restart done\n");
 
 	if (!apple || apple->aborted || apple->s2r_skipped)
 		return 0;
