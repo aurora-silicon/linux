@@ -1286,6 +1286,18 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 
 	irqc->info = *(struct aic_info *)match->data;
 
+	/*
+	 * The VM_TMR_FIQ_ENA_EL2 write that traps on T8142 was seen under
+	 * SPTM. A loader that runs the OS at EL2 in a CTXR execute window
+	 * starts no SPTM and says so with this property, and there the
+	 * register takes writes. Masking through the EL02 controls instead
+	 * sets IMASK in the guest's own timer, which KVM then keeps as
+	 * guest state: the guest gets no timer interrupt again.
+	 */
+	if (irqc->info.vm_timer_fiq_readonly && is_kernel_in_hyp_mode() &&
+	    of_property_present(of_chosen, "aurora,ctxr-exec-window"))
+		irqc->info.vm_timer_fiq_readonly = false;
+
 	aic_irqc = irqc;
 
 	switch (irqc->info.version) {
