@@ -31,6 +31,7 @@
 #include "ane_h16_accel.h"
 #include "ane_h16_boot.h"
 #include "ane_h16_preload.h"
+#include "ane_t6021_lifetime.h"
 
 #define ANE_H16_TX_WORDS 272
 /* Private program window above the SHAREDMALLOC range; host policy. */
@@ -124,6 +125,18 @@ struct ane_h16_device {
 	unsigned int resume_replayed;
 	unsigned int resume_restarts;
 	bool resume_cold;
+	/*
+	 * A quarantined session at system sleep: its engine goes off without
+	 * the firmware and boots cold on resume, if every domain went off.
+	 */
+	bool sleep_quarantined;
+	/* Recovery of a session quarantined at runtime (ane_h16_hung()). */
+	struct work_struct recover;
+	bool recovering;
+	/* System sleep is under way: it recovers a quarantined session itself. */
+	bool recover_blocked;
+	u64 recoveries;
+	u64 recover_failures;
 	struct ane_h16_session session;
 	struct work_struct start;
 };
@@ -526,15 +539,13 @@ static int ane_h16_power_cycle(struct ane_h16_device *h, bool verify)
  * startup as it does at bring-up; it gets the same bounded, verified restart,
  * with a budget of its own for each wake.
  */
-static int ane_h16_cold_boot(struct ane_h16_device *h)
+static int ane_h16_boot_again(struct ane_h16_device *h, unsigned int *restarts,
+			      const char *what, const char *why, bool recover)
 {
 	struct ane_h16_boot *b = &h->boot;
 	struct ane_fw_transport *old;
 	int ret;
 
-	ret = ane_h16_power_cycle(h, false);
-	if (ret)
-		return ret;
 	old = kmemdup(&b->transport, sizeof(*old), GFP_KERNEL);
 	if (!old)
 		return -ENOMEM;
@@ -543,21 +554,74 @@ static int ane_h16_cold_boot(struct ane_h16_device *h)
 		ane_fw_transport_carry_shared(&b->transport, old);
 	kfree(old);
 	if (!ret)
-		ret = ane_h16_startup_restarting(b, &h->resume_restarts,
-						 "resume restart/budget");
+		ret = ane_h16_startup_restarting(b, restarts, what);
 	if (ret)
 		return ret;
 	h->resume_ready_ns = ktime_get_ns();
 	ane_h16_irq_wait_set(h, true);
-	dev_info(h->dev, "H16 ANE: booted again from the preload after system sleep\n");
+	dev_info(h->dev, "H16 ANE: booted again from the preload %s\n", why);
 	ane_h16_session_restart(&h->session);
+	/* Its domains were verified off: a quarantine of the old firmware ends. */
+	if (recover) {
+		ane_h16_session_recovered(&h->session);
+		b->quarantined = false;
+		b->error = 0;
+	}
 	ret = ane_h16_session_replay(&h->session, &h->resume_replayed, &h->resume_first_ns);
 	if (ret) {
 		dev_err(h->dev, "H16 ANE: PROGRAM REPLAY FAILED %d after %u programs; session quarantined\n",
 			ret, h->resume_replayed);
-		WARN_ONCE(1, "H16 ANE: program replay failed after system sleep (%d)\n", ret);
+		WARN_ONCE(1, "H16 ANE: program replay failed %s (%d)\n", why, ret);
 	}
 	return ret;
+}
+
+static int ane_h16_cold_boot(struct ane_h16_device *h)
+{
+	int ret;
+
+	ret = ane_h16_power_cycle(h, false);
+	if (ret)
+		return ret;
+	return ane_h16_boot_again(h, &h->resume_restarts, "resume restart/budget",
+				  "after system sleep", h->sleep_quarantined);
+}
+
+/*
+ * Hold the ANE DARTs (and with them the sys domain) powered while a hung
+ * engine goes off, so translation stays up for anything still in flight.
+ * Returns the mask of DARTs held, for ane_h16_release_darts().
+ */
+static unsigned int ane_h16_hold_darts(struct ane_h16_device *h)
+{
+	unsigned int i, held = 0;
+
+	for (i = 0; i < ARRAY_SIZE(h->dart); i++) {
+		if (!h->dart[i])
+			continue;
+		if (pm_runtime_resume_and_get(h->dart[i]) < 0) {
+			dev_warn(h->dev, "H16 ANE: %s not held powered\n", dev_name(h->dart[i]));
+			continue;
+		}
+		held |= BIT(i);
+	}
+	return held;
+}
+
+static void ane_h16_release_darts(struct ane_h16_device *h, unsigned int held)
+{
+	for (unsigned int i = 0; i < ARRAY_SIZE(h->dart); i++)
+		if (held & BIT(i))
+			pm_runtime_put(h->dart[i]);
+}
+
+/* Every domain reported an OFF transition since ane_h16_sleep_prepare(). */
+static bool ane_h16_slept_off(struct ane_h16_device *h)
+{
+	for (unsigned int i = 0; i < h->powered; i++)
+		if (!h->genpd[i].added || !h->genpd[i].offs)
+			return false;
+	return h->powered != 0;
 }
 
 static int ane_h16_sleep_prepare(struct ane_h16_device *h)
@@ -571,8 +635,29 @@ static int ane_h16_sleep_prepare(struct ane_h16_device *h)
 		h->genpd[i].off_at = 0;
 		h->genpd[i].off_ns = 0;
 	}
-	if (!h->program_ready || h->boot.quarantined)
+	h->sleep_quarantined = false;
+	if (!h->program_ready || (h->boot.quarantined && !ane_t6021_hung_stop))
 		return -EBUSY;
+	/* Without hung_stop a quarantined session stays so across the sleep. */
+	if (ane_t6021_hung_stop && (h->boot.quarantined || h->session.quarantined)) {
+		unsigned int held;
+
+		/*
+		 * The firmware cannot be asked for anything: power the engine
+		 * off under it, DARTs held until its domains are off, and boot
+		 * it cold on resume if every domain went off.
+		 */
+		ane_h16_session_sleep(&h->session, true);
+		if (h->engine_on) {
+			held = ane_h16_hold_darts(h);
+			ane_h16_power_down(h);
+			ane_h16_release_darts(h, held);
+		}
+		h->sleep_quarantined = true;
+		dev_info(h->dev, "H16 ANE: quarantined engine powered off for system sleep\n");
+		WRITE_ONCE(h->slept, true);
+		return 0;
+	}
 	ane_h16_session_sleep(&h->session, true);
 	if (!h->boot.soc->sleep_warm) {
 		/* Cold cycle: nothing in flight, then power off under the firmware. */
@@ -613,9 +698,15 @@ static void ane_h16_sleep_resume(struct ane_h16_device *h)
 	h->resume_ready_ns = 0;
 	h->resume_first_ns = 0;
 	h->resume_replayed = 0;
-	h->resume_cold = !h->boot.soc->sleep_warm;
+	h->resume_cold = !h->boot.soc->sleep_warm || h->sleep_quarantined;
 	h->resume_restarts = 0;
-	if (h->resume_cold) {
+	if (h->sleep_quarantined && !ane_h16_slept_off(h)) {
+		/* Not proven off: the old firmware may still run. Keep it. */
+		dev_err(h->dev, "H16 ANE: a domain of the quarantined engine never went off; kept quarantined\n");
+		ret = ane_h16_power_up(h);
+		if (!ret)
+			ret = -EIO;
+	} else if (h->resume_cold) {
 		ret = ane_h16_cold_boot(h);
 	} else {
 		ret = ane_h16_warm_boot(h);
@@ -632,7 +723,11 @@ static void ane_h16_sleep_resume(struct ane_h16_device *h)
 		ane_h16_quarantine(h, ret);
 		h->boot.quarantined = true;
 		h->session.quarantined = true;
+	} else if (h->sleep_quarantined) {
+		h->recoveries++;
+		dev_info(h->dev, "H16 ANE: quarantined engine recovered by system sleep\n");
 	}
+	h->sleep_quarantined = false;
 	ane_h16_session_sleep(&h->session, false);
 	ane_h16_genpd_record(h);
 	/* One line per wake; times from PM_POST_SUSPEND, which follows the thaw. */
@@ -658,11 +753,16 @@ static int ane_h16_pm_event(struct notifier_block *nb, unsigned long event, void
 	}
 	if (event == PM_POST_SUSPEND) {
 		ane_h16_sleep_resume(h);
+		WRITE_ONCE(h->recover_blocked, false);
 		return NOTIFY_DONE;
 	}
 	if (event == PM_SUSPEND_PREPARE && pinned) {
+		/* A recovery under way finishes first; sleep handles later ones. */
+		WRITE_ONCE(h->recover_blocked, true);
+		flush_work(&h->recover);
 		if (!ane_h16_sleep_prepare(h))
 			return NOTIFY_DONE;
+		WRITE_ONCE(h->recover_blocked, false);
 		dev_warn_once(h->dev, ANE_FW_SLEEP_REFUSED);
 		return NOTIFY_BAD;
 	}
@@ -1210,10 +1310,138 @@ static bool ane_h16_cpu_stopped(void *ctx)
 	return !(ane_h16_mmio_read32(h, ANE_H16_ENGINE, f->cpu_control) & f->run);
 }
 
+/*
+ * Recovery of a session quarantined at runtime by a hung request, with the
+ * restart sequence of the T8112 path (ane_t6021_restart_run(), unplanned):
+ * RUN cleared (halt), hung_settle_ms for the engine to drain (contain), the
+ * CPU and engine domains powered off through genpd with the DARTs held on,
+ * cpu, mpm, td and base each verified off before sys is cycled on its own
+ * (power_cycle), then the firmware booted again from the preload with every
+ * open program replayed behind its handle (boot). The H16 wrapper status
+ * cannot prove a stop, so the verified power-off is the proof: halt always
+ * reports a busy core, and without hung_stop the session stays quarantined.
+ * Nothing asserts a reset. Requests wait in ane_h16_session_enter() while
+ * it runs.
+ */
+static int ane_h16_rs_planned_only(void *ctx)
+{
+	return -EOPNOTSUPP;
+}
+
+static int ane_h16_rs_halt(void *ctx)
+{
+	struct ane_h16_device *h = ctx;
+	struct ane_h16_boot *b = &h->boot;
+	const struct ane_h16_build *f = b->build;
+
+	if (!h->engine_on)
+		return -ENODEV;
+	dev_info(h->dev, "H16 ANE: hung engine: wrapper control %#x status %#x\n",
+		 b->ops->read32(b->ctx, ANE_H16_ENGINE, f->cpu_control),
+		 b->ops->read32(b->ctx, ANE_H16_ENGINE, f->cpu_control + 4));
+	b->ops->write32(b->ctx, ANE_H16_ENGINE, f->cpu_control, 0);
+	b->transport_ops->write_barrier(b->ctx);
+	return ANE_T6021_ASC_BUSY;
+}
+
+static int ane_h16_rs_contain(void *ctx)
+{
+	struct ane_h16_device *h = ctx;
+	struct ane_h16_boot *b = &h->boot;
+	unsigned int settle = min(ane_t6021_hung_settle_ms, 60000U);
+
+	if (!ane_t6021_hung_stop)
+		return -EOPNOTSUPP;
+	msleep(settle);
+	dev_info(h->dev,
+		 "H16 ANE: RUN cleared, wrapper status %#x after %u ms; powering the ANE off through its domains\n",
+		 b->ops->read32(b->ctx, ANE_H16_ENGINE, b->build->cpu_control + 4), settle);
+	return 0;
+}
+
+static int ane_h16_rs_power_cycle(void *ctx)
+{
+	struct ane_h16_device *h = ctx;
+	unsigned int held = ane_h16_hold_darts(h);
+	int ret = ane_h16_power_cycle(h, true);
+
+	ane_h16_release_darts(h, held);
+	return ret;
+}
+
+static int ane_h16_rs_boot(void *ctx)
+{
+	struct ane_h16_device *h = ctx;
+	unsigned int restarts = 0;
+
+	return ane_h16_boot_again(h, &restarts, "recovery restart/budget",
+				  "after a hung request", true);
+}
+
+static const struct ane_t6021_restart_ops ane_h16_restart_ops = {
+	.power_down = ane_h16_rs_planned_only,
+	.wait_idle = ane_h16_rs_planned_only,
+	.halt = ane_h16_rs_halt,
+	.contain = ane_h16_rs_contain,
+	.power_cycle = ane_h16_rs_power_cycle,
+	.boot = ane_h16_rs_boot,
+};
+
+static void ane_h16_recover_work(struct work_struct *work)
+{
+	struct ane_h16_device *h = container_of(work, struct ane_h16_device, recover);
+	static const char * const stages[] = {
+		[ANE_T6021_RESTART_STOP] = "stop",
+		[ANE_T6021_RESTART_CYCLE] = "power cycle",
+		[ANE_T6021_RESTART_BOOT] = "boot",
+		[ANE_T6021_RESTART_DONE] = "done",
+	};
+	enum ane_t6021_restart_stage stage;
+	u64 start = ktime_get_ns();
+	int ret;
+
+	guard(mutex)(&ane_h16_lock);
+	if (READ_ONCE(h->recover_blocked) || h->slept || !h->program_ready ||
+	    h->boot.quarantined || !h->session.quarantined || !ane_t6021_hung_stop) {
+		WRITE_ONCE(h->recovering, false);
+		return;
+	}
+	ane_h16_session_sleep(&h->session, true);
+	h->resume_replayed = 0;
+	h->resume_first_ns = 0;
+	ret = ane_t6021_restart_run(&ane_h16_restart_ops, h, false, &stage);
+	if (ret) {
+		h->recover_failures++;
+		dev_err(h->dev,
+			"H16 ANE: recovery after a hung request failed at the %s, error %d; quarantined until the next system sleep\n",
+			stages[stage], ret);
+	} else {
+		h->recoveries++;
+		dev_info(h->dev,
+			 "H16 ANE: firmware recovered after a hung request in %llu ms, %u programs replayed\n",
+			 div_u64(ktime_get_ns() - start, NSEC_PER_MSEC), h->resume_replayed);
+	}
+	ane_h16_session_sleep(&h->session, false);
+	WRITE_ONCE(h->recovering, false);
+}
+
+/* Session ops->hung: may run under the session lock, so only queue. */
+static void ane_h16_hung(void *ctx, int error)
+{
+	struct ane_h16_device *h = ctx;
+
+	if (!ane_t6021_hung_stop || READ_ONCE(h->recover_blocked) || READ_ONCE(h->recovering))
+		return;
+	WRITE_ONCE(h->recovering, true);
+	dev_warn(h->dev, "H16 ANE: session quarantined (%d); recovering the engine\n", error);
+	queue_work(system_dfl_wq, &h->recover);
+}
+
 static const struct ane_h16_session_ops ane_h16_session_ops = {
 	.map = ane_h16_program_map,
 	.log = ane_h16_log,
 	.busy = ane_h16_busy,
+	.hung = ane_h16_hung,
 };
 
 static const struct ane_fw_transport_ops ane_h16_transport_ops = {
@@ -1854,7 +2082,10 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 	debugfs_create_file("execute", 0600, h->debugfs, h, &ane_h16_execute_fops);
 	debugfs_create_u64("irq_wakeups", 0400, h->debugfs, &h->irq_wakeups);
 	debugfs_create_u64("irq_timeouts", 0400, h->debugfs, &h->irq_timeouts);
+	debugfs_create_u64("recoveries", 0400, h->debugfs, &h->recoveries);
+	debugfs_create_u64("recover_failures", 0400, h->debugfs, &h->recover_failures);
 	platform_set_drvdata(pdev, h);
+	INIT_WORK(&h->recover, ane_h16_recover_work);
 	INIT_WORK(&h->start, ane_h16_start_work);
 	schedule_work(&h->start);
 	ret = 0;
@@ -1875,6 +2106,7 @@ void ane_h16_backend_remove(struct platform_device *pdev)
 		return;
 	/* Waits for the boot bring-up and any stage write in progress. */
 	cancel_work_sync(&h->start);
+	cancel_work_sync(&h->recover);
 	if (h->program_ready) {
 		cancel_delayed_work_sync(&h->session.gate_work);
 		/* Return released exports; mapped ones stay with their mappings. */
