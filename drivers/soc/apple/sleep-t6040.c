@@ -621,12 +621,12 @@ static unsigned int t6040_sleep_log_groups(struct t6040_sleep *s)
 			if (regmap_read(g->regmap, off, &val) ||
 			    t6040_sleep_ps_on(val, off == g->first)) {
 				on_mask |= BIT(bit);
-				pr_info("t6040-sleep:   %s +%#x = %#x\n", g->name, off, val);
+				dev_info(s->dev, "  %s +%#x = %#x\n", g->name, off, val);
 			}
 		}
 		if (on_mask)
-			pr_info("t6040-sleep: %-8s ON (on mask %#x, cpu first)\n", g->name,
-				on_mask);
+			dev_info(s->dev, "%-8s ON (on mask %#x, cpu first)\n", g->name,
+				 on_mask);
 		blockers += !!on_mask;
 	}
 
@@ -638,9 +638,9 @@ static void t6040_sleep_log_blockers(struct t6040_sleep *s)
 {
 	const char *ops_name;
 
-	pr_info("t6040-sleep: EL2 %s, s2r-mailbox %s, parkable %u/%u (%s)\n",
-		is_kernel_in_hyp_mode() ? "yes" : "no", s->mbox ? "yes" : "no",
-		t6040_sleep_parkable(&ops_name), num_possible_cpus() - 1, ops_name);
+	dev_info(s->dev, "EL2 %s, s2r-mailbox %s, parkable %u/%u (%s)\n",
+		 is_kernel_in_hyp_mode() ? "yes" : "no", s->mbox ? "yes" : "no",
+		 t6040_sleep_parkable(&ops_name), num_possible_cpus() - 1, ops_name);
 }
 
 /*
@@ -861,7 +861,7 @@ static unsigned int t6040_sleep_refuse(struct t6040_sleep *s)
 
 	if (num_online_cpus() != 1 || !s->mbox ||
 	    (read_cpuid_mpidr() & MPIDR_HWID_BITMASK) != s->mbox->boot_mpidr) {
-		pr_err("t6040-sleep: refused: wrong CPU, other CPUs online, or no mailbox\n");
+		dev_err(s->dev, "refused: wrong CPU, other CPUs online, or no mailbox\n");
 		refused++;
 	}
 
@@ -872,25 +872,25 @@ static unsigned int t6040_sleep_refuse(struct t6040_sleep *s)
 	 */
 	if (!s->cluster_ctl || !s->pwrgate || !s->mastermini || !s->spmi0 ||
 	    !s->soc_east || !s->aop_global) {
-		pr_err("t6040-sleep: refused: a commit/wake register base is not mapped (cluster-ctl %d pwrgate %d mastermini %d spmi0 %d soc-east %d aop-global %d)\n",
-		       !!s->cluster_ctl, !!s->pwrgate, !!s->mastermini, !!s->spmi0,
-		       !!s->soc_east, !!s->aop_global);
+		dev_err(s->dev, "refused: a commit/wake register base is not mapped (cluster-ctl %d pwrgate %d mastermini %d spmi0 %d soc-east %d aop-global %d)\n",
+			!!s->cluster_ctl, !!s->pwrgate, !!s->mastermini, !!s->spmi0,
+			!!s->soc_east, !!s->aop_global);
 		refused++;
 	}
 
 	if (!sep->bound) {
 		/* Nobody told it of the sleep: a commit with it running never returns. */
 		t6040_sleep_watch_on(sep, &val);
-		pr_err("t6040-sleep: refused: sep isn't bound (state %#x)\n", val);
+		dev_err(s->dev, "refused: sep isn't bound (state %#x)\n", val);
 		refused++;
 	} else if (!apple_sleep_enclave_registered()) {
-		pr_err("t6040-sleep: refused: sep's sleep request isn't left for the last refusal\n");
+		dev_err(s->dev, "refused: sep's sleep request isn't left for the last refusal\n");
 		refused++;
 	}
 
 	/* Only ANS's driver can stop it, and it doesn't come back without a real sleep. */
 	if (!ans_idled && t6040_sleep_watch_on(ans, &val)) {
-		pr_err("t6040-sleep: refused: ANS is on (%#x) with no driver to stop it\n", val);
+		dev_err(s->dev, "refused: ANS is on (%#x) with no driver to stop it\n", val);
 		refused++;
 	}
 
@@ -899,7 +899,7 @@ static unsigned int t6040_sleep_refuse(struct t6040_sleep *s)
 	 * apple,apcie control windows + PLL/lane tunables: refused.
 	 */
 	if (ans_idled && !s->apcie_st.valid) {
-		pr_err("t6040-sleep: refused: ANS would stop but the storage-apcie windows/tunables are absent (apple,apcie)\n");
+		dev_err(s->dev, "refused: ANS would stop but the storage-apcie windows/tunables are absent (apple,apcie)\n");
 		refused++;
 	}
 
@@ -1016,12 +1016,12 @@ static void t6040_sio_ps_restore(struct t6040_sleep *s)
 		if (n == 1000)
 			failed++;
 		raised++;
-		pr_debug("t6040-sleep: wake: SOC-East power word +%#x: %#x at the commit, %#x after the wake, now %#x\n",
-			 off, saved, val, cur);
+		dev_dbg(s->dev, "wake: SOC-East power word +%#x: %#x at the commit, %#x after the wake, now %#x\n",
+			off, saved, val, cur);
 	}
 	if (failed)
-		pr_warn("t6040-sleep: wake: %u of %u SIO power word(s) raised again did not come on\n",
-			failed, raised);
+		dev_warn(s->dev, "wake: %u of %u SIO power word(s) raised again did not come on\n",
+			 failed, raised);
 }
 
 /*
@@ -1352,13 +1352,13 @@ static void t6040_axi2af_readcheck(struct t6040_sleep *s)
 			continue;
 		val = readl(ps);
 		if (FIELD_GET(PS_ACTUAL, val)) {
-			pr_debug("t6040-sleep: axi2af %s still on (%#x) at commit\n",
-				 t6040_axi2af[i].name, val);
+			dev_dbg(s->dev, "axi2af %s still on (%#x) at commit\n",
+				t6040_axi2af[i].name, val);
 			on++;
 		}
 	}
 	if (on)
-		pr_debug("t6040-sleep: %d axi2af domain(s) still powered at commit\n", on);
+		dev_dbg(s->dev, "%d axi2af domain(s) still powered at commit\n", on);
 }
 
 /*
@@ -1383,8 +1383,8 @@ static void t6040_axi2af_rearm(struct t6040_sleep *s)
 		if (FIELD_GET(PS_TARGET, val) != PS_ACTIVE)
 			continue;
 		if (!FIELD_GET(PS_ACTUAL, val)) {
-			pr_debug("t6040-sleep: wake: axi2af %s not re-armed, PS %#x (gated)\n",
-				 t6040_axi2af[i].name, val);
+			dev_dbg(s->dev, "wake: axi2af %s not re-armed, PS %#x (gated)\n",
+				t6040_axi2af[i].name, val);
 			continue;
 		}
 		t6040_wake_sync();
@@ -2225,7 +2225,7 @@ static void t6040_sleep_return(struct t6040_sleep *s)
 						!(val & PS_BUSY), 1,
 						SOC_EAST_TIMEOUT_US);
 		if (ret)
-			pr_warn("t6040-sleep: SOC-East PARENT_MISSING stuck on wake (%#x)\n", val);
+			dev_warn(s->dev, "SOC-East PARENT_MISSING stuck on wake (%#x)\n", val);
 	}
 	t6040_wake_sync();
 
@@ -2276,7 +2276,7 @@ static void t6040_sleep_return(struct t6040_sleep *s)
 
 	if (s->mbox) {
 		dcache_inval_poc((unsigned long)s->mbox, (unsigned long)(s->mbox + 1));
-		pr_debug("t6040-sleep: wake: resumes now %llu\n", READ_ONCE(s->mbox->resumes));
+		dev_dbg(s->dev, "wake: resumes now %llu\n", READ_ONCE(s->mbox->resumes));
 	}
 	if (s->aop_global)
 		for (i = 0; i < AOP_WAKE_WORDS; i++)
@@ -2366,29 +2366,29 @@ static int t6040_sleep_begin(suspend_state_t state)
 	t6040_dcs_dyn_pg(s);
 	dcs_to = t6040_dcs_ps_auto_on(s);
 	if (dcs_to)
-		pr_warn("t6040-sleep: DCS power words %#x did not read on before automatic mode\n",
-			dcs_to);
+		dev_warn(s->dev, "DCS power words %#x did not read on before automatic mode\n",
+			 dcs_to);
 	if (!begin_total && !dry) {
 		/* The non-display blockers are clear and no dry run is asked for: proceed
 		 * to device suspend; .enter holds the real commit until the display is
 		 * also off. The AON WD2 is the net from here. */
-		pr_debug("t6040-sleep: entering: %u display pipe(s) on, to be lowered before the commit\n",
-			 disp);
+		dev_dbg(s->dev, "entering: %u display pipe(s) on, to be lowered before the commit\n",
+			disp);
 		t6040_sleep_power_ops(s);
 		t6040_sleep_set_wd2(s, WDT_SUSPEND_SECS);
 		pm_set_suspend_via_firmware();
 		return 0;
 	}
 
-	pr_info("t6040-sleep: suspend requested: %u live blocker(s) (%u display, cleared during device suspend)\n",
-		live, disp);
+	dev_info(s->dev, "suspend requested: %u live blocker(s) (%u display, cleared during device suspend)\n",
+		 live, disp);
 	t6040_sleep_log_blockers(s);
 
 	if (dry) {
 		dry = min(dry, 2U);
 		t6040_sleep_power_ops(s);
 		if (!s->power_ops)
-			pr_warn("t6040-sleep: dry run: no CPU parking power ops, so no hold at the commit point\n");
+			dev_warn(s->dev, "dry run: no CPU parking power ops, so no hold at the commit point\n");
 		t6040_sleep_set_dry(s, dry);
 		pm_set_suspend_via_firmware();
 		secs = min(READ_ONCE(wd2_secs), WDT_MAX_SECS);
@@ -2396,13 +2396,13 @@ static int t6040_sleep_begin(suspend_state_t state)
 			t6040_sleep_set_wd2(s, secs);
 		else
 			secs = 0;
-		pr_info("t6040-sleep: dry run %u: firmware-driven device sleep short of %s, refused at the commit point, WD2 %u s (0: off)\n",
-			dry, dry >= 2 ? "the stops only a power cycle undoes" :
-					"the last steps", secs);
+		dev_info(s->dev, "dry run %u: firmware-driven device sleep short of %s, refused at the commit point, WD2 %u s (0: off)\n",
+			 dry, dry >= 2 ? "the stops only a power cycle undoes" :
+			 "the last steps", secs);
 		return 0;
 	}
 
-	pr_info("t6040-sleep: refusing the suspend; nothing entered\n");
+	dev_info(s->dev, "refusing the suspend; nothing entered\n");
 	return -EOPNOTSUPP;
 }
 
@@ -2426,8 +2426,8 @@ static int t6040_sleep_dry_enter(struct t6040_sleep *s, unsigned int dry)
 	unsigned int refused;
 	int ret;
 
-	pr_info("t6040-sleep: dry run %u at the commit point: %u CPU(s) online\n", dry,
-		num_online_cpus());
+	dev_info(s->dev, "dry run %u at the commit point: %u CPU(s) online\n", dry,
+		 num_online_cpus());
 	t6040_sleep_log_s2r_state(s, "dry-run commit point");
 	/*
 	 * A wake source pending and left unmasked by the masks a real commit arms would keep the
@@ -2439,28 +2439,28 @@ static int t6040_sleep_dry_enter(struct t6040_sleep *s, unsigned int dry)
 
 		for (i = 0; i < AOP_WAKE_WORDS; i++)
 			p[i] = readl(s->aop_global + AOP_WAKE_STATUS(i)) & ~t6040_wake_mask[i];
-		pr_info("t6040-sleep: dry-run commit point: wake status left unmasked by the commit's masks %*ph\n",
-			(int)sizeof(p), p);
+		dev_info(s->dev, "dry-run commit point: wake status left unmasked by the commit's masks %*ph\n",
+			 (int)sizeof(p), p);
 	}
 	refused = t6040_sleep_refuse(s);
-	pr_info("t6040-sleep: a real commit would %s here (%u check(s) failed)\n",
-		refused ? "refuse" : "go on", refused);
+	dev_info(s->dev, "a real commit would %s here (%u check(s) failed)\n",
+		 refused ? "refuse" : "go on", refused);
 
 	ret = s->power_ops ? spin_table_hold_parked() : -EOPNOTSUPP;
 	if (ret)
-		pr_err("t6040-sleep: the parked CPUs didn't answer the hold: %d\n", ret);
+		dev_err(s->dev, "the parked CPUs didn't answer the hold: %d\n", ret);
 	else
-		pr_info("t6040-sleep: %u parked CPU(s) answered the hold\n",
-			num_present_cpus() - num_online_cpus());
+		dev_info(s->dev, "%u parked CPU(s) answered the hold\n",
+			 num_present_cpus() - num_online_cpus());
 
 	if (dry >= 2 && !ret)
-		pr_info("t6040-sleep: the coprocessors' last checks: %d\n",
-			apple_sleep_coprocs_check(s->dev));
+		dev_info(s->dev, "the coprocessors' last checks: %d\n",
+			 apple_sleep_coprocs_check(s->dev));
 	if (!ret)
 		spin_table_unhold_parked();
 
-	pr_info("t6040-sleep: dry run: refused before the enclave's sleep request (%s), the coprocessors' last stops and the SoC power-down\n",
-		apple_sleep_enclave_registered() ? "left by sep" : "none left");
+	dev_info(s->dev, "dry run: refused before the enclave's sleep request (%s), the coprocessors' last stops and the SoC power-down\n",
+		 apple_sleep_enclave_registered() ? "left by sep" : "none left");
 
 	return -EBUSY;
 }
@@ -2695,8 +2695,8 @@ static void t6040_disp_back(struct t6040_sleep *s)
 		if (boost != s->pmc_if_saved[1])
 			writel(boost | s->pmc_if_saved[1], s->pmc_bwr + PMC_BOOST);
 		if (bwr != s->pmc_if_saved[0] || boost != s->pmc_if_saved[1])
-			pr_debug("t6040-sleep: wake: PMC display interfaces BWR %#x boost %#x, put back to %#x %#x\n",
-				 bwr, boost, readl(s->pmc_bwr), readl(s->pmc_bwr + PMC_BOOST));
+			dev_dbg(s->dev, "wake: PMC display interfaces BWR %#x boost %#x, put back to %#x %#x\n",
+				bwr, boost, readl(s->pmc_bwr), readl(s->pmc_bwr + PMC_BOOST));
 	}
 }
 
@@ -2731,8 +2731,8 @@ static unsigned int t6040_disp_lower(struct t6040_sleep *s)
 					 PS_BUSY | PS_UNLATCH);
 				regmap_write(g->regmap, off, val);
 				if (t6040_regmap_poll_off(g->regmap, off, &cur)) {
-					pr_warn("t6040-sleep: %s +%#x still on: %#x\n", g->name,
-						off, cur);
+					dev_warn(s->dev, "%s +%#x still on: %#x\n", g->name,
+						 off, cur);
 					left++;
 				}
 			}
@@ -2757,12 +2757,12 @@ static int t6040_sleep_enter(suspend_state_t state)
 
 	left = t6040_disp_lower(s);
 	if (left)
-		pr_warn("t6040-sleep: %u display power word(s) did not go off\n", left);
+		dev_warn(s->dev, "%u display power word(s) did not go off\n", left);
 	if (t6040_sleep_live_blockers(s, NULL, NULL)) {
 		unsigned int on = t6040_sleep_log_groups(s);
 
-		pr_info("t6040-sleep: at the commit point: %u CPU(s) online, %u display group(s) on; refusing\n",
-			num_online_cpus(), on);
+		dev_info(s->dev, "at the commit point: %u CPU(s) online, %u display group(s) on; refusing\n",
+			 num_online_cpus(), on);
 		t6040_disp_back(s);
 		return -EBUSY;
 	}
@@ -2807,14 +2807,14 @@ static int t6040_sleep_enter(suspend_state_t state)
 	if (s->returned) {
 		t6040_wake_sync();
 		if (s->pcie_ans_on_ret)
-			pr_warn("t6040-sleep: wake: the storage PCIe raise failed after step %u: %d\n",
-				s->apcie_wake_step, s->pcie_ans_on_ret);
+			dev_warn(s->dev, "wake: the storage PCIe raise failed after step %u: %d\n",
+				 s->apcie_wake_step, s->pcie_ans_on_ret);
 		if (s->gp_clk_timeouts)
-			pr_warn("t6040-sleep: wake: %u GP PCIe clock or ready poll(s) timed out\n",
-				s->gp_clk_timeouts);
+			dev_warn(s->dev, "wake: %u GP PCIe clock or ready poll(s) timed out\n",
+				 s->gp_clk_timeouts);
 		if (s->aop_ps_timeouts)
-			pr_warn("t6040-sleep: wake: %u AOP island power word(s) did not come on\n",
-				s->aop_ps_timeouts);
+			dev_warn(s->dev, "wake: %u AOP island power word(s) did not come on\n",
+				 s->aop_ps_timeouts);
 	}
 	return ret;
 }
@@ -2829,7 +2829,7 @@ static void t6040_sleep_end(void)
 	t6040_sleep_mem_begun = false;
 	t6040_sleep_clear_wd2(s);
 	if (dry)
-		pr_info("t6040-sleep: dry run %u over, WD2 off\n", dry);
+		dev_info(s->dev, "dry run %u over, WD2 off\n", dry);
 	t6040_sleep_set_dry(s, 0);
 }
 
