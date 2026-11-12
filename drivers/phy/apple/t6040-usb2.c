@@ -333,7 +333,7 @@ struct t6040_usb2_phy {
 	bool sleep_armed;	/* taken on by the prepare, until the finish */
 	bool sleep_down;	/* USB2 off and USB3 asleep for it, behind their consumers */
 	bool sleep_reset;	/* the controller held in reset for it, behind its consumer */
-	bool sleep_usb3;	/* USB3 ran when it went down, and comes back with USB2 */
+	bool sleep_usb3;	/* USB3 ran at a sleep of this host, and comes back with USB2 */
 	bool sleep_waking;	/* in that wake: no power cycle of the PHY's domains */
 	bool sleep_back;	/* the system resumes and that wake is still to run */
 	wait_queue_head_t sleep_wq;	/* DP's power-on waits here for sleep_back to end */
@@ -1279,6 +1279,8 @@ static int t6040_usb3_power_off(struct phy *phy)
 	guard(mutex)(&tphy->lock);
 	tphy->usb3_on = false;
 	tphy->usb3_pipe = false;
+	/* The host stops: what its next start brings up is what a later wake brings back. */
+	tphy->sleep_usb3 = false;
 	t6040_usb3_down_locked(tphy);
 	return 0;
 }
@@ -3270,6 +3272,7 @@ EXPORT_SYMBOL_GPL(apple_t6040_atcphy_sleep_prepare);
 int apple_t6040_atcphy_sleep_enter(struct phy *usb2_phy)
 {
 	struct t6040_usb2_phy *tphy = t6040_from_usb2_phy(usb2_phy);
+	bool usb3;
 	int ret;
 
 	if (!tphy)
@@ -3295,8 +3298,14 @@ int apple_t6040_atcphy_sleep_enter(struct phy *usb2_phy)
 		return -EBUSY;
 	}
 
+	/*
+	 * USB3 that an earlier wake of this host left down counts as well: this
+	 * sleep's wake tries it again, with the SoC's power cycle behind it if
+	 * the sleep is a real one.
+	 */
+	usb3 = tphy->usb3_up;
+	tphy->sleep_usb3 |= usb3;
 	/* As dwc3-apple's stop: USB3 with its PIPE, USB2, then the controller's reset. */
-	tphy->sleep_usb3 = tphy->usb3_up;
 	t6040_usb3_down_locked(tphy);
 	ret = t6040_usb2_off_locked(tphy);
 	if (ret)
@@ -3306,7 +3315,7 @@ int apple_t6040_atcphy_sleep_enter(struct phy *usb2_phy)
 	tphy->sleep_reset = true;
 	WRITE_ONCE(tphy->sleep_back, false);
 	dev_info(tphy->dev, "PHY down for the sleep with the host kept, USB3 %s\n",
-		 tphy->sleep_usb3 ? "was up" : "was off");
+		 usb3 ? "was up" : "was off");
 	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_t6040_atcphy_sleep_enter);
