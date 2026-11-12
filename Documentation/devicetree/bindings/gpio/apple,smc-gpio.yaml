@@ -23,6 +23,14 @@ properties:
   '#gpio-cells':
     const: 2
 
+  interrupt-controller:
+    description:
+      The SMC reports the inputs it can watch as events; a node with this
+      property offers them as interrupts.
+
+  '#interrupt-cells':
+    const: 2
+
   apple,output-templates:
     $ref: /schemas/types.yaml#/definitions/uint32-array
     minItems: 2
@@ -39,5 +47,8 @@ required:
   - compatible
   - gpio-controller
   - '#gpio-cells'
+
+dependencies:
+  interrupt-controller: ['#interrupt-cells']
 
 additionalProperties: false
