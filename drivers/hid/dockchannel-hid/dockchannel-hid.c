@@ -178,6 +178,7 @@ struct dchid_iface {
 
 	void *hid_desc;
 	size_t hid_desc_len;
+	u8 *pad;	/* full-size report buffer, set when Report Size is clamped */
 
 	struct gpio_desc *gpio;
 	char gpio_name[MAX_GPIO_NAME];
@@ -1048,6 +1049,10 @@ static void dchid_clamp_report_sizes(struct dchid_iface *iface, u8 *desc, size_t
 				dev_info(iface->dchid->dev,
 					 "%s: clamping Report Size %u to %u\n",
 					 iface->name, val, DCHID_MAX_REPORT_SIZE);
+				if (!iface->pad)
+					iface->pad = devm_kzalloc(iface->dchid->dev,
+								  DCHID_MAX_REPORT_SIZE / 8,
+								  GFP_KERNEL);
 				for (j = 0; j < n; j++)
 					desc[i + 1 + j] = (DCHID_MAX_REPORT_SIZE >> (8 * j)) & 0xff;
 			}
@@ -1310,6 +1315,21 @@ static void dchid_handle_report(struct dchid_iface *iface, void *data, size_t le
 	 */
 	if (!smp_load_acquire(&iface->open))
 		return;
+
+	/*
+	 * A clamped Report Size makes hid-core expect reports of the clamped
+	 * size. Real reports are shorter, and hid-core refuses a buffer smaller
+	 * than the expected size. Pad into the interface buffer, which only
+	 * this interface's ordered workqueue uses. raw_event() sees the true
+	 * length.
+	 */
+	if (iface->pad && length < DCHID_MAX_REPORT_SIZE / 8) {
+		memcpy(iface->pad, data, length);
+		memset(iface->pad + length, 0, DCHID_MAX_REPORT_SIZE / 8 - length);
+		hid_safe_input_report(iface->hid, HID_INPUT_REPORT, iface->pad,
+				      DCHID_MAX_REPORT_SIZE / 8, length, 1);
+		return;
+	}
 
 	hid_input_report(iface->hid, HID_INPUT_REPORT, data, length, 1);
 }
