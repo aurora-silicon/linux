@@ -238,8 +238,8 @@ impl PmpData {
 
     /// Re-run the PMP bring-up after a hibernation restore. The boot loader
     /// cold-restarts the PMP (image resident in PMS_SRAM, ASC CPU halted), and
-    /// nothing replays the probe-time sequence, so the firmware stays down:
-    /// "no PMP within 20000ms" / cpufreq "PMP not running after 30s". The
+    /// nothing replays the probe-time sequence, so the firmware stays down and
+    /// its clients, cpufreq among them, wait for it in vain. The
     /// retained `PmpData` Arc, both `DevresIoMem` mappings and the C power-vote
     /// bridge all stay; only the volatile session and firmware are rebuilt.
     /// The decision between a halted (reinit + boot) and a live (adopt) firmware
@@ -980,7 +980,8 @@ const HW_CFG_T8140: PmpHwConfig = PmpHwConfig {
 /// SRAM kept across a system sleep: the firmware's __DATA, as the
 /// ADT's segment-ranges place it (0x500761000, 0x7d000 bytes, after __TEXT at
 /// 0x500700000, 0x61000 bytes), the segment T8140's range covers too.
-/// Without it the PMP never answered after a real S2R (endpoint discovery -62).
+/// Without it the PMP does not answer its endpoint discovery after a sleep
+/// that powered the SoC down.
 const HW_CFG_T6041: PmpHwConfig = PmpHwConfig {
     dma_mask: Some(DmaMask::new::<42>()),
     check_bootargs_uuid: true,
