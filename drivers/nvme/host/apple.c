@@ -215,15 +215,13 @@ struct apple_nvme_hw {
 	bool needs_ioq_registers;
 	/* T8132 needs a PMGR reset when starting a stopped coprocessor. */
 	bool cold_reset;
-	/* Firmware-driven suspend has been traced on this controller. */
-	bool sleep_traced;
 	/*
-	 * Not measured, but the sleep controller may take it the same way: its flush,
-	 * quiesce and shutdown notification, then the polled idle at the commit. The
-	 * values below come from this SoC's own sources, as each says.
+	 * The sleep controller takes this ANS through a firmware-driven suspend:
+	 * flush, quiesce and shutdown notification at the device suspend, the
+	 * polled idle at the commit and a warm restart after the wake.
 	 */
-	bool sleep_untraced;
-	/* The last endpoint map reply from that trace */
+	bool sleep_coproc;
+	/* The last endpoint map reply of that warm restart; 0: the whole map again. */
 	u32 sleep_epmap_last_mask;
 	/* Higher namespaces are the firmware's, and a Flush to one faults the controller. */
 	u32 sleep_flush_max_nsid;
@@ -2451,7 +2449,7 @@ static void apple_nvme_rtkit_configure(struct apple_nvme *anv)
 	if (of_device_is_compatible(anv->dev->of_node, "apple,t6050-nvme-ans2"))
 		apple_rtkit_set_handshake_timeout(anv->rtk,
 						  APPLE_NVME_T6050_HANDSHAKE_TIMEOUT_MS);
-	if (anv->hw->sleep_traced || anv->hw->sleep_untraced)
+	if (anv->hw->sleep_coproc)
 		apple_rtkit_set_warm_epmap_mask(anv->rtk, anv->hw->sleep_epmap_last_mask);
 }
 
@@ -2763,7 +2761,7 @@ static int apple_nvme_probe(struct platform_device *pdev)
 
 	INIT_DELAYED_WORK(&anv->flush_dwork, apple_nvme_flush_work);
 
-	if (anv->hw->sleep_traced || anv->hw->sleep_untraced) {
+	if (anv->hw->sleep_coproc) {
 		anv->sleep_registered =
 			!apple_sleep_coproc_register(anv->dev, anv->mmio_coproc, true,
 						     apple_nvme_sleep_last_stop, anv);
@@ -3271,7 +3269,7 @@ static const struct apple_nvme_hw apple_nvme_t8132_hw = {
 	.cold_reset = true,
 	.max_queue_depth = 64,
 	/* T8140's values: T8132's sleep path hasn't been traced. */
-	.sleep_traced = true,
+	.sleep_coproc = true,
 	.sleep_epmap_last_mask = BIT(0),
 	.sleep_flush_max_nsid = 1,
 	.sleep_shn = NVME_CC_SHN_MASK,
@@ -3284,7 +3282,7 @@ static const struct apple_nvme_hw apple_nvme_t8140_hw = {
 	.has_separate_nvmmu = true,
 	.needs_ioq_registers = true,
 	.max_queue_depth = 64,
-	.sleep_traced = true,
+	.sleep_coproc = true,
 	.sleep_epmap_last_mask = BIT(0),
 	.sleep_flush_max_nsid = 1,
 	.sleep_shn = NVME_CC_SHN_MASK,
@@ -3323,7 +3321,7 @@ static const struct apple_nvme_hw apple_nvme_t6040_hw = {
 	 * Registered with the T6040 sleep controller. The flush, quiesce, CC.SHN
 	 * shutdown notification and the resume path (SART replay, warm RTKit
 	 * restart, controller reset + namespace re-attach) are all generic and
-	 * already wired through this sleep_untraced state; the controller stops
+	 * already wired through sleep_coproc; the controller stops
 	 * ANS at the commit and raises its two ST lanes on wake
 	 * (t6040_apcie_st_lower/raise). Whether a sleep cuts the power
 	 * is the controller's decision (apple_sleep_power_loss()); a dry run (2
@@ -3341,7 +3339,7 @@ static const struct apple_nvme_hw apple_nvme_t6040_hw = {
 	 * endpoint map on the warm restart: ANS came back with it in the J616s
 	 * S2R tests that cut the power.
 	 */
-	.sleep_untraced = true,
+	.sleep_coproc = true,
 	.sleep_flush_max_nsid = 1,
 	.sleep_shn = NVME_CC_SHN_MASK,
 	.quirks = NVME_QUIRK_NO_APST,
