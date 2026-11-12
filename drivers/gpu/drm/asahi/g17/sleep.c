@@ -24,13 +24,10 @@
 
 #include <linux/moduleparam.h>
 
-/* Bring-up: whether the commit stop lowers the GPU's PMGR power word itself. */
+/* Whether the commit stop lowers the GPU's PMGR power word itself. */
 static bool commit_lower_ps;
 module_param(commit_lower_ps, bool, 0644);
 MODULE_PARM_DESC(commit_lower_ps, "S2R commit: lower the GPU's power word in its last stop");
-
-/* Bring-up marks of the GPU's last stop: 0x5ff000SS, SS the step reached. */
-#define G17_STOP_MARK(step)	apple_sleep_bringup_mark(0x5ff00000 | (step))
 
 #define PS_AUTO_ENABLE		BIT(28)
 #define PS_AUTO			GENMASK(27, 24)
@@ -261,21 +258,16 @@ static int asahi_g17_commit_stop(void *data)
 	u32 val;
 
 	c->ran = true;
-	G17_STOP_MARK(0x01);
 	for (i = 0; i < c->count; i++)
 		c->idle[i] = apple_rtkit_sleep_idle_polled(c->rtk[i], c->cpu[i], &c->idle_us[i]);
-	G17_STOP_MARK(0x02);
 	for (i = 0; i < c->count; i++) {
 		c->status[i] = readl(c->cpu[i] + ASC_CPU_STATUS);
 		apple_rtkit_mailbox_recv_off(c->rtk[i]);
-		G17_STOP_MARK(0x03);
 		apple_mbox_ascwrap_v6_stop_cpu_atomic(c->mbox[i]);
-		G17_STOP_MARK(0x04);
 		if (!i && c->bridge)
 			writel(readl(c->gating) | SGX_GATING_HOLD, c->gating);
 	}
 	c->request_ret = c->request ? apple_pmp_report_entry_withdraw_polled(c->request) : 0;
-	G17_STOP_MARK(0x05);
 	if (!READ_ONCE(commit_lower_ps))
 		return (c->idle[0] || c->idle[1] || c->request_ret) ? 1 : 0;
 
@@ -288,15 +280,12 @@ static int asahi_g17_commit_stop(void *data)
 		for (i = 0; i < SGX_BRIDGE_WORDS; i++)
 			writel(c->words[i] & ~SGX_BRIDGE_ENABLE, c->bridge + 4 * i);
 	}
-	G17_STOP_MARK(0x06);
 	val = readl(c->ps);
 	writel((val & ~(PS_AUTO_ENABLE | PS_BUSY | PS_FLAGS | PS_TARGET)) | PS_FLAGS, c->ps);
-	G17_STOP_MARK(0x07);
 	c->lower_ret = readl_poll_timeout_atomic(c->ps, c->lowered,
 						 !FIELD_GET(PS_ACTUAL, c->lowered) &&
 						 !(c->lowered & PS_BUSY),
 						 10, PS_TIMEOUT_US);
-	G17_STOP_MARK(c->lower_ret ? 0x09 : 0x08);
 
 	return (c->idle[0] || c->idle[1] || c->request_ret || c->lower_ret) ? 1 : 0;
 }

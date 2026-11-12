@@ -9,7 +9,6 @@
 #include <linux/errno.h>
 #include <linux/export.h>
 #include <linux/module.h>
-#include <linux/moduleparam.h>
 #include <linux/notifier.h>
 #include <linux/suspend.h>
 #include <linux/slab.h>
@@ -73,24 +72,13 @@ struct asahi_stats_attribute {
  * A backend with a cold restore path (G17: it registers a hibernate
  * callback) drains its GPU at PM_HIBERNATION_PREPARE and re-boots the
  * firmware against the restored host state at PM_POST_HIBERNATION; while
- * only such devices are bound, hibernation is allowed unless
- * hibernate_republish=0. Any other bound GPU still refuses it unless
- * hibernate_cold_init=1.
+ * only such devices are bound, hibernation is allowed. Any other bound GPU
+ * refuses it.
  *
  * Restoring an image is always refused while a GPU is bound here: the kernel
  * that restores must not own a GPU firmware session of its own, since the
  * image's driver would then find a running firmware it did not program.
  */
-static bool asahi_hibernate_cold_init;
-module_param_named(hibernate_cold_init, asahi_hibernate_cold_init, bool, 0644);
-MODULE_PARM_DESC(hibernate_cold_init,
-		 "Allow hibernation while a GPU without a restore path owns DMA (experimental)");
-
-static bool asahi_hibernate_republish = true;
-module_param_named(hibernate_republish, asahi_hibernate_republish, bool, 0644);
-MODULE_PARM_DESC(hibernate_republish,
-		 "Allow hibernation with a G17 GPU bound: drain it before the image, re-boot its firmware after resume (default: on)");
-
 static atomic_t asahi_hibernate_devices = ATOMIC_INIT(0);
 /* Bound devices without a hibernate callback. */
 static atomic_t asahi_hibernate_unrestorable = ATOMIC_INIT(0);
@@ -102,14 +90,8 @@ static int asahi_hibernate_notify(struct notifier_block *nb, unsigned long actio
 
 	switch (action) {
 	case PM_HIBERNATION_PREPARE:
-		if (!devices || asahi_hibernate_cold_init)
-			break;
-		if (atomic_read(&asahi_hibernate_unrestorable)) {
-			pr_warn("asahi: refusing hibernation: a bound GPU has no restore path (hibernate_cold_init=1 to try)\n");
-			return notifier_from_errno(-EBUSY);
-		}
-		if (!asahi_hibernate_republish) {
-			pr_warn("asahi: refusing hibernation: hibernate_republish=0\n");
+		if (devices && atomic_read(&asahi_hibernate_unrestorable)) {
+			pr_warn("asahi: refusing hibernation: a bound GPU has no restore path\n");
 			return notifier_from_errno(-EBUSY);
 		}
 		break;
@@ -117,11 +99,10 @@ static int asahi_hibernate_notify(struct notifier_block *nb, unsigned long actio
 		/*
 		 * A restorable (G17) device bound here would leave a firmware running
 		 * with this kernel's graph under the image's driver, which then takes it
-		 * for its own: always refuse. hibernate_cold_init only relaxes the
-		 * refusal for backends without a restore path.
+		 * for its own, and a backend without a restore path cannot be restored
+		 * at all: always refuse.
 		 */
-		if (devices > atomic_read(&asahi_hibernate_unrestorable) ||
-		    (devices && !asahi_hibernate_cold_init)) {
+		if (devices) {
 			pr_warn("asahi: refusing to restore an image: this kernel owns a GPU firmware session\n");
 			return notifier_from_errno(-EBUSY);
 		}
