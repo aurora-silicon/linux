@@ -76,6 +76,19 @@ properties:
       whole time Linux runs. The T6050 driver registers DVFS only when this
       is present.
 
+  apple,pmp-memory-vote:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    description: |
+      PMP report region and the cluster's SOC-DEV-DVFS entry. The entry
+      identifies the host-published SOC-device constraint target; cpufreq
+      queues an irq_work hop and publishes the max-aggregated DCS and SoC
+      request with one PTD store outside fast-switch.
+    items:
+      - items:
+          - description: PMP report region
+          - description: EACC0 or PACC0 SOC-DEV-DVFS entry on T8112
+            enum: [0xa8, 0xa9]
+
   '#performance-domain-cells':
     const: 0
 
