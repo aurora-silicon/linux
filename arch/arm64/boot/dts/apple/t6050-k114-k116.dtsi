@@ -216,11 +216,12 @@
 		/*
 		 * The touchscreen (ADT mtp-transport/kiwi, image-tag "fsat"). macOS
 		 * sends it firmware through the same CBOR bootloader as the trackpad.
-		 * Its power, reset, 24 MHz clock and display-sync lines are SoC GPIOs
-		 * (nub-gpio0 0x1a, 0x19, 0x16; gpio0 0xb), with an SMC power reference
-		 * (pKW4('rCIO', 0x20000)) and the TSRC clock source. How that load and
-		 * the report format map onto this transport is still being worked
-		 * out, so the interface stays off until it has been tested.
+		 * Its power (nub-gpio0 0x1a) and reset (0x19) lines are GPIOs; the 24
+		 * MHz clock (nub-gpio0 0x16) and display-sync (gpio0 0xb) pads are pad
+		 * functions, muxed by the transport node's pinctrl-0. The ADT also
+		 * names an SMC power reference (pKW4('rCIO', 0x20000)) and the TSRC
+		 * clock source. A board enables the interface once its settings have
+		 * been tested (the K114c so far).
 		 */
 		kiwi: kiwi {
 			status = "disabled";
