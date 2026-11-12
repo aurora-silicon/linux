@@ -6504,7 +6504,6 @@ static __maybe_unused int apple_dart_sys_resume_noirq(struct device *dev)
 	return pm_suspend_via_firmware() ? apple_dart_resume_noirq(dev) : 0;
 }
 
-#ifdef CONFIG_HIBERNATION
 /*
  * Resume from disk is a cold boot: the boot loader locked every locked DART
  * again with fresh firmware-owned roots, while the restored kernel still
@@ -6628,7 +6627,6 @@ static int apple_dart_restore(struct device *dev)
 	pm_runtime_put(dev);
 	return 0;
 }
-#endif
 
 /* A resume from disk also re-imports the roots the boot loader locked again. */
 static const struct dev_pm_ops apple_dart_pm_ops = {
@@ -6637,11 +6635,7 @@ static const struct dev_pm_ops apple_dart_pm_ops = {
 	.freeze = pm_sleep_ptr(apple_dart_system_suspend),
 	.thaw = pm_sleep_ptr(apple_dart_system_resume),
 	.poweroff = pm_sleep_ptr(apple_dart_system_suspend),
-#ifdef CONFIG_HIBERNATION
-	.restore = apple_dart_restore,
-#else
-	.restore = pm_sleep_ptr(apple_dart_system_resume),
-#endif
+	.restore = pm_sleep_ptr(apple_dart_restore),
 	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_dart_sys_suspend_noirq, apple_dart_sys_resume_noirq)
 	RUNTIME_PM_OPS(apple_dart_suspend, apple_dart_resume, NULL)
 };
