@@ -122,6 +122,18 @@
 #include "t8142-j813-audio.dtsi"
 
 /*
+ * Ambient light sensor, the AOP's "als" service: an ST VD6286, as on J815
+ * (same ADT node, /arm-io/aop/iop-aop-nub/als). aop_als sends it the
+ * per-device calibration (apple/aop-als-cal.bin). No firmware-name: that
+ * names the CT817 setup-port message, which this sensor does not take.
+ */
+&aop {
+	aop_als: als {
+		compatible = "apple,t8142-aop-als", "apple,aop-als";
+	};
+};
+
+/*
  * N1 functions behind apcie port 0 (0000:00:00.0 -> 01:00.{0,1,2}), so the
  * loader has somewhere to put the factory addresses: it copies ADT /chosen
  * mac-address-wifi0 and mac-address-bluetooth0 into the wifi0/bluetooth0
