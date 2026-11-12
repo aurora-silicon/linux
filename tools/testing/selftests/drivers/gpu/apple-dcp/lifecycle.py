@@ -194,6 +194,7 @@ enum drm_connector_status { connector_status_disconnected, connector_status_conn
 enum usb_role { USB_ROLE_NONE, USB_ROLE_HOST, USB_ROLE_DEVICE };
 enum typec_pwr_opmode { TYPEC_PWR_MODE_USB, TYPEC_PWR_MODE_PD };
 enum typec_orientation { TYPEC_ORIENTATION_NONE, TYPEC_ORIENTATION_NORMAL, TYPEC_ORIENTATION_REVERSE };
+enum typec_data_role { TYPEC_DEVICE, TYPEC_HOST };
 struct usb_pd_identity { int id; };
 static void * __attribute__((unused)) memchr_inv(const void *p, int c, size_t n)
 { const unsigned char *b = p; for (size_t i = 0; i < n; i++) if (b[i] != (unsigned char)c) return (void *)(b + i); return NULL; }
