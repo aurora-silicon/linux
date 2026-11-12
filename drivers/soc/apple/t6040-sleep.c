@@ -526,7 +526,6 @@ struct t6040_sleep {
 	void __iomem *a2d_mini, *a2d_mini4, *a2d_mm8, *a2d_pmc, *a2d_blk;
 	void __iomem *a2d_mm12;	/* MasterMini 0x50890c000 (IB2 engine + handshake +0x14) */
 	void __iomem *aop_req;	/* AOP island power requests 0x5108b8100 (bit 0 DRAM, 1 AP, 2 CPU) */
-	u32 apcie_diag[16];	/* apcie_seq bit 2: 'APCS' + flags + PHY/PS words, PMU 0xa200 */
 	void __iomem *dcs[16];	/* DCS(n,k): 0x220200000 + n * 0x2000000 + k * 0x200000 */
 	void __iomem *aop_asc;	/* AOP ASC 0x510600000 (CPU_CONTROL +0x44) */
 	void __iomem *atc_cfg[4];	/* ATCPHY_CFG(n) 0x383200000 + n * 0x8000000 */
@@ -1531,10 +1530,6 @@ static void t6040_ret_mark(struct t6040_sleep *s, u32 n);
 #define T6040_AOPW_PMU		0xa2c0
 #define T6040_AOPW_MAGIC	0x57504f41	/* "AOPW" in PMU byte order */
 
-static unsigned int aop_wake = 15;
-module_param(aop_wake, uint, 0644);
-MODULE_PARM_DESC(aop_wake, "Bring-up wake: bit0 record the AOP island ('AOPW' at PMU 0xa2c0), bit1 power it back as saved in .begin, bit2 words on before the sleep to manual target 0xf, bit3 read the ASC CPU_CONTROL (marks 0x58/0x59)");
-
 static void t6040_aop_ps_save(struct t6040_sleep *s)
 {
 	int i;
@@ -1565,15 +1560,15 @@ static unsigned int t6040_aop_ps_count_on(struct t6040_sleep *s, u32 *nib)
 
 static void t6040_aop_wake(struct t6040_sleep *s)
 {
-	unsigned int mode = READ_ONCE(aop_wake), before, after, to = 0;
+	unsigned int before, after, to = 0;
 	u32 w[10] = { T6040_AOPW_MAGIC };
 	int k, i;
 
-	if (!mode || !s->aop_ps)
+	if (!s->aop_ps)
 		return;
 	before = t6040_aop_ps_count_on(s, &w[2]);
 	w[8] = w[9] = 0;
-	if ((mode & BIT(1)) && s->aop_ps_saved_valid) {
+	if (s->aop_ps_saved_valid) {
 		for (k = ARRAY_SIZE(t6040_aop_ps_order) - 1; k >= 0; k--) {
 			u16 off = t6040_aop_ps_order[k];
 			void __iomem *r = s->aop_ps + off;
@@ -1584,7 +1579,7 @@ static void t6040_aop_wake(struct t6040_sleep *s)
 			 * driver reads its ASC. bit2: every word that was on before the sleep goes to
 			 * manual target 0xf (AUTO off) and stays up through the resume.
 			 */
-			bool manual = (mode & BIT(2)) && FIELD_GET(PS_ACTUAL, want);
+			bool manual = FIELD_GET(PS_ACTUAL, want);
 
 			if (manual) {
 				if (FIELD_GET(PS_ACTUAL, now) == 0xf && !(now & PS_AUTO_ENABLE))
@@ -1605,7 +1600,7 @@ static void t6040_aop_wake(struct t6040_sleep *s)
 	}
 	after = t6040_aop_ps_count_on(s, NULL);
 	w[1] = before | after << 8 | min(to, 0xffffU) << 16;
-	if ((mode & BIT(0)) && s->spmi0)
+	if (s->spmi0)
 		for (i = 0; i < 10; i++)
 			t6040_pmu_cmd(s, SPMI_CMD_PMU(T6040_AOPW_PMU + 4 * i, SPMI_OP_WRITE4),
 				      &w[i], NULL, 0);
@@ -1617,7 +1612,7 @@ static void t6040_aop_wake(struct t6040_sleep *s)
 	 * wake (nothing later gated it). AOPW w8 then becomes CPU_CONTROL, w9 the AOP
 	 * requests 0x5108b8100 [15:0] | MasterMini+0x14 << 16.
 	 */
-	if ((mode & BIT(3)) && s->aop_asc && s->spmi0) {
+	if (s->aop_asc && s->spmi0) {
 		u32 ctl, rq;
 
 		rq = (s->aop_req ? readl(s->aop_req + 0x100) & 0xffff : 0xffff) |
@@ -2259,25 +2254,14 @@ static void t6040_axi2af_readcheck(struct t6040_sleep *s)
 }
 
 /*
- * The wake-side axi2af re-arm: every retained domain powered back up (PS
- * TARGET == 0xf) gets its fabric bridge +0x104/+0x108 bit0 set, or the bridge
- * drops its traffic. The highest-risk wake write.
+ * The wake-side axi2af re-arm: every retained domain powered back up (PS TARGET 0xf and
+ * ACTUAL on) gets its fabric bridge +0x104/+0x108 bit0 set, or the bridge drops its
+ * traffic. A word in automatic mode can read TARGET 0xf with its domain gated; the bridge
+ * is then off too (the first resume on the J616s took an SError in this step), so such a
+ * domain is left alone.
  */
-/*
- * On the J616s the first real resume took an asynchronous SError in here (mark 0x36 landed, 0x37
- * did not). Mode 1 re-arms every domain with TARGET 0xf, as the wake restore does; mode 2 also
- * wants ACTUAL on, since an AUTO word can read TARGET 0xf with the domain gated, and its
- * bridge is then off too; 0 skips the re-arm. Each domain is marked before (0x5eII01VV) and
- * after (0x5eII09VV) its bridge writes, VV the PS word's low byte (ACTUAL << 4 | TARGET).
- */
-static unsigned int axi2af_rearm_mode = 2;
-module_param(axi2af_rearm_mode, uint, 0644);
-MODULE_PARM_DESC(axi2af_rearm_mode,
-		 "Bring-up wake: axi2af bridge re-arm 0 off, 1 TARGET 0xf (as the platform), 2 TARGET 0xf and ACTUAL on");
-
 static void t6040_axi2af_rearm(struct t6040_sleep *s)
 {
-	unsigned int mode = READ_ONCE(axi2af_rearm_mode);
 	int i;
 
 	for (i = 0; i < T6040_AXI2AF_DOMAINS; i++) {
@@ -2288,9 +2272,9 @@ static void t6040_axi2af_rearm(struct t6040_sleep *s)
 		if (!ps || !bridge)
 			continue;
 		val = readl(ps);
-		if (!mode || FIELD_GET(PS_TARGET, val) != 0xf)
+		if (FIELD_GET(PS_TARGET, val) != 0xf)
 			continue;
-		if (mode >= 2 && !FIELD_GET(PS_ACTUAL, val)) {
+		if (!FIELD_GET(PS_ACTUAL, val)) {
 			pr_info("t6040-sleep: wake: axi2af %s not re-armed, PS %#x (gated)\n",
 				t6040_axi2af[i].name, val);
 			continue;
@@ -2390,35 +2374,6 @@ static void t6040_tunable_apply_changed(void __iomem *regs, const struct apple_t
 	}
 }
 
-/* The shared PHY quieted (as T8140's t8140_apcie_phy_off): both clocks off, run bits down. */
-static void t6040_apcie_phy_off(struct t6040_apcie_st *a)
-{
-	void __iomem *ctrl = a->phy + APCIE_PHY_CTRL;
-	void __iomem *run = a->phy + APCIE_PHY_RUN;
-	u32 val;
-
-	writel(readl(ctrl) | APCIE_PHY_CTRL_RESET, ctrl);
-	writel(readl(ctrl) & ~APCIE_PHY_CTRL_CLK1REQ, ctrl);
-	readl_poll_timeout_atomic(ctrl, val, !(val & APCIE_PHY_CTRL_CLK1ACK), 1, APCIE_POLL_US);
-	writel(readl(ctrl) & ~APCIE_PHY_CTRL_CLK0REQ, ctrl);
-	readl_poll_timeout_atomic(ctrl, val, !(val & APCIE_PHY_CTRL_CLK0ACK), 1, APCIE_POLL_US);
-	writel(readl(ctrl) & ~APCIE_PHY_CTRL_UP, ctrl);
-	writel(readl(run) & ~APCIE_PHY_RUN_EN2, run);
-	writel(readl(run) & ~APCIE_PHY_RUN_EN, run);
-}
-
-/* The shared clkgen off (as T8140's t8140_apcie_clk_off). */
-static void t6040_apcie_clk_off(struct t6040_apcie_st *a)
-{
-	void __iomem *clk = a->clkgen + APCIE_CLK_CTRL;
-	u32 val;
-
-	writel(readl(clk) & ~APCIE_CLK_RUN, clk);
-	writel(readl(clk) | APCIE_CLK_OFF, clk);
-	readl_poll_timeout_atomic(clk, val, !(val & APCIE_CLK_BUSY), 1, APCIE_POLL_US);
-	writel(readl(clk) | APCIE_CLK_OFF2, clk);
-}
-
 /*
  * ENTRY: lower ANS's storage link, the two-lane adaptation of
  * t8140_sleep_lower_apcie(). Called from the commit's lower_io only once ANS
@@ -2459,12 +2414,6 @@ static void t6040_apcie_clk_off(struct t6040_apcie_st *a)
  * Flags (word 1): 0 S1 ran, 1 PHY_SW gate ran, 2 S3 ran, 3 ANS stopped, 4 windows valid,
  * 5 GP clock-gated; timeouts 8 CLK1ACK, 9 CLK0ACK, 16 PHY_SW bit 11, 17 clkgen busy, 18 GP.
  */
-static unsigned int apcie_seq = 11;
-module_param(apcie_seq, uint, 0644);
-MODULE_PARM_DESC(apcie_seq, "Bring-up: storage PCIe quiesce as the platform (bit 0 PHY sleep, 1 APCIE_PHY_SW gate + PLL off, 2 record at PMU 0xa200, 3 APCIE_GP clock-gated)");
-
-#define T6040_APCIE_DIAG_PMU	0xa200
-#define T6040_APCIE_DIAG_MAGIC	0x53435041	/* "APCS" in PMU byte order */
 
 /* S1, the root complex disable: the shared PHY and PHY-IP to sleep; the platform spins unbounded. */
 static void t6040_apcie_phy_off(struct t6040_sleep *s)
@@ -2474,7 +2423,6 @@ static void t6040_apcie_phy_off(struct t6040_sleep *s)
 	void __iomem *run = a->phy + APCIE_PHY_RUN;
 	u32 val;
 
-	s->apcie_diag[2] = readl(ctrl);
 	writel(readl(ctrl) | APCIE_PHY_CTRL_UP, ctrl);
 	udelay(10);
 	writel(readl(a->phy_ip + 0x38) & ~GENMASK(27, 26), a->phy_ip + 0x38);
@@ -2483,20 +2431,15 @@ static void t6040_apcie_phy_off(struct t6040_sleep *s)
 	writel(readl(ctrl) | APCIE_PHY_CTRL_RESET, ctrl);
 	udelay(1);
 	writel(readl(ctrl) & ~APCIE_PHY_CTRL_CLK1REQ, ctrl);
-	if (readl_poll_timeout_atomic(ctrl, val, !(val & APCIE_PHY_CTRL_CLK1ACK), 1, APCIE_POLL_US))
-		s->apcie_diag[1] |= BIT(8);
+	readl_poll_timeout_atomic(ctrl, val, !(val & APCIE_PHY_CTRL_CLK1ACK), 1, APCIE_POLL_US);
 	udelay(1);
 	writel(readl(ctrl) & ~APCIE_PHY_CTRL_CLK0REQ, ctrl);
-	if (readl_poll_timeout_atomic(ctrl, val, !(val & APCIE_PHY_CTRL_CLK0ACK), 1, APCIE_POLL_US))
-		s->apcie_diag[1] |= BIT(9);
+	readl_poll_timeout_atomic(ctrl, val, !(val & APCIE_PHY_CTRL_CLK0ACK), 1, APCIE_POLL_US);
 	udelay(1);
 	writel(readl(ctrl) & ~APCIE_PHY_CTRL_UP, ctrl);
 	udelay(10);
 	writel(readl(run) & ~APCIE_PHY_RUN_EN2, run);
 	writel(readl(run) & ~APCIE_PHY_RUN_EN, run);
-	s->apcie_diag[3] = readl(ctrl);
-	s->apcie_diag[4] = readl(run);
-	s->apcie_diag[1] |= BIT(0);
 }
 
 /* S2 step 1, gate idx 7 off: APCIE_PHY_SW gated while APCIE_GP is still on. */
@@ -2505,12 +2448,8 @@ static void t6040_apcie_phy_sw_gate(struct t6040_sleep *s)
 	void __iomem *reg = s->soc_east + PS_APCIE_PHY_SW;
 	u32 val;
 
-	s->apcie_diag[5] = readl(reg);
 	writel(0x0f000244, reg);
-	if (readl_poll_timeout_atomic(reg, val, !(val & PS_BUSY), 1, PS_OFF_TIMEOUT_US))
-		s->apcie_diag[1] |= BIT(16);
-	s->apcie_diag[6] = readl(reg);
-	s->apcie_diag[1] |= BIT(1);
+	readl_poll_timeout_atomic(reg, val, !(val & PS_BUSY), 1, PS_OFF_TIMEOUT_US);
 }
 
 /* S3, the PCIe PLL shutdown: PCIECLKGEN +0 as the platform. */
@@ -2522,11 +2461,8 @@ static void t6040_apcie_pll_off(struct t6040_sleep *s)
 	writel((readl(clk) & ~GENMASK(5, 3)) | BIT(4) | BIT(3), clk);
 	writel(readl(clk) | BIT(1), clk);
 	writel(readl(clk) & ~BIT(0), clk);
-	if (readl_poll_timeout_atomic(clk, val, !(val & APCIE_CLK_BUSY), 1, APCIE_POLL_US))
-		s->apcie_diag[1] |= BIT(17);
+	readl_poll_timeout_atomic(clk, val, !(val & APCIE_CLK_BUSY), 1, APCIE_POLL_US);
 	writel(readl(clk) | BIT(2), clk);
-	s->apcie_diag[7] = readl(clk);
-	s->apcie_diag[1] |= BIT(2);
 }
 
 /*
@@ -2561,9 +2497,6 @@ static void t6040_apcie_pll_off(struct t6040_sleep *s)
  * Bit 3 holds FAB1/2/4/7_SOC on by hand (AUTO off, target f, ACTUAL f polled) through the
  * timer; record word 1/2 bits 16+i name them (bit 1 is not used with it).
  */
-static unsigned int fab_on = 5;
-module_param(fab_on, uint, 0644);
-MODULE_PARM_DESC(fab_on, "Bring-up: fabric PS words before the S2R timer (bit 0 AUTO + target f as the D2A expects, bit 1 automatic level f, bit 2 ATC commons on under FAB2; records at PMU 0xa240/0xa280)");
 
 #define T6040_ATC_PMU		0xa280
 #define T6040_ATC_MAGIC		0x43435441	/* "ATCC" in PMU byte order */
@@ -2613,16 +2546,13 @@ static void t6040_atc_commons_on(struct t6040_sleep *s, u32 *timeouts)
  * +0x28 bit 0 set. So every port in the mask whose +0x28 bit 0 is still clear gets the three
  * writes; the default mask is all four.
  */
-static unsigned int atc_s2r = 0xf;
-module_param(atc_s2r, uint, 0644);
-MODULE_PARM_DESC(atc_s2r, "Port mask: the CFG writes of the PHY S2R entry (+0x2c, +0x08, +0x28 |= 1, poll +0x04 bit 8) right before the S2R timer on each port that has not asked for its clock gate yet");
 static bool atc_rec = true;
 module_param(atc_rec, bool, 0644);
 MODULE_PARM_DESC(atc_rec, "Bring-up: record the 4 ATCPHY_CFG blocks at PMU 0xa240 right before the S2R timer (replaces 'FABS')");
 
 #define T6040_ATCF_MAGIC	0x46435441	/* "ATCF" in PMU byte order */
 
-static u32 t6040_atc_s2r_entry(struct t6040_sleep *s, unsigned int mask)
+static u32 t6040_atc_s2r_entry(struct t6040_sleep *s)
 {
 	u32 to = 0, v;
 	int n;
@@ -2630,7 +2560,7 @@ static u32 t6040_atc_s2r_entry(struct t6040_sleep *s, unsigned int mask)
 	for (n = 0; n < 4; n++) {
 		void __iomem *c = s->atc_cfg[n];
 
-		if (!(mask & BIT(n)) || !c || (readl(c + 0x28) & BIT(0)))
+		if (!c || (readl(c + 0x28) & BIT(0)))
 			continue;
 		writel(readl(c + 0x2c) | BIT(0), c + 0x2c);
 		udelay(1);
@@ -2699,13 +2629,12 @@ static const struct {
 	{ false, 0x298 } /* FAB_AFR */,
 };
 
-#define PS_AUTO_LEVEL		GENMASK(27, 24)
 #define T6040_FAB_PMU		0xa240
 #define T6040_FAB_MAGIC		0x53424146	/* "FABS" in PMU byte order */
 
 static void t6040_fabrics_on(struct t6040_sleep *s)
 {
-	u32 rec[16] = { T6040_FAB_MAGIC }, atc_to = 0;
+	u32 rec[16] = { T6040_FAB_MAGIC }, atc_to;
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(t6040_fabrics); i++) {
@@ -2722,34 +2651,10 @@ static void t6040_fabrics_on(struct t6040_sleep *s)
 			if (t6040_ps_raise(b, off))
 				rec[2] |= BIT(i);
 		}
-		v = readl(b + off);
-		if ((READ_ONCE(fab_on) & BIT(1)) && FIELD_GET(PS_AUTO_LEVEL, v) != 0xf) {
-			rec[1] |= BIT(16 + i);
-			writel((v & ~(PS_AUTO_LEVEL | PS_FLAGS)) | FIELD_PREP(PS_AUTO_LEVEL, 0xf),
-			       b + off);
-			if (readl_poll_timeout_atomic(b + off, v, FIELD_GET(PS_ACTUAL, v) == 0xf, 1,
-						      PS_OFF_TIMEOUT_US))
-				rec[2] |= BIT(16 + i);
-		}
 		rec[3 + i] = readl(b + off);
 	}
-	if (READ_ONCE(fab_on) & BIT(2))
-		t6040_atc_commons_on(s, &rec[2]);
-	if (READ_ONCE(atc_s2r) & 0xf)
-		atc_to = t6040_atc_s2r_entry(s, READ_ONCE(atc_s2r) & 0xf);
-	if (READ_ONCE(fab_on) & BIT(3)) {
-		for (i = 0; i < ARRAY_SIZE(t6040_fabrics); i++) {
-			void __iomem *b = t6040_fabrics[i].east ? s->snap_east : s->snap_soc;
-			u32 off = t6040_fabrics[i].off;
-
-			if (!b || (off != 0x2d0 && off != 0x338 && off != 0x488 &&
-				   !(t6040_fabrics[i].east && off == 0x128)))
-				continue;
-			rec[1] |= BIT(16 + i);
-			if (t6040_ps_raise_start(b, off))
-				rec[2] |= BIT(16 + i);
-		}
-	}
+	t6040_atc_commons_on(s, &rec[2]);
+	atc_to = t6040_atc_s2r_entry(s);
 	for (i = 0; i < ARRAY_SIZE(t6040_fabrics); i++) {
 		void __iomem *b = t6040_fabrics[i].east ? s->snap_east : s->snap_soc;
 
@@ -2829,22 +2734,6 @@ static void t6040_dcs_dyn_pg(struct t6040_sleep *s)
 	}
 }
 
-/* Words 8-15 right before the S2R timer, then the whole record to PMU SRAM 0xa200. */
-static void t6040_apcie_diag_store(struct t6040_sleep *s)
-{
-	static const u16 w[8] = { PS_APCIE_PHY_SW, PS_APCIE_SYS_ST0, PS_APCIE_SYS_ST1,
-				  PS_APCIE_ST0, PS_APCIE_ST1, PS_ANS, PS_APCIE_SYS_GP,
-				  PS_APCIE_GP };
-	int i;
-
-	s->apcie_diag[0] = T6040_APCIE_DIAG_MAGIC;
-	for (i = 0; i < 8; i++)
-		s->apcie_diag[8 + i] = s->soc_east ? readl(s->soc_east + w[i]) : 0xdeadbeef;
-	for (i = 0; i < ARRAY_SIZE(s->apcie_diag); i++)
-		t6040_pmu_cmd(s, SPMI_CMD_PMU(T6040_APCIE_DIAG_PMU + 4 * i, SPMI_OP_WRITE4),
-			      &s->apcie_diag[i], NULL, 0);
-}
-
 /*
  * ANS's own fabric bridge (0x4_0b00_0000 +0x104/+0x108 bit 0). The platform clears the bit before a
  * retained domain goes off and sets it again once it is back up; here the wake sets it
@@ -2876,26 +2765,16 @@ static void t6040_sleep_lower_apcie_st(struct t6040_sleep *s)
 {
 	struct t6040_apcie_st *a = &s->apcie_st;
 	void __iomem *ps = s->soc_east;
-	unsigned int mac = READ_ONCE(apcie_seq);
 
 	if (!a->valid || !ps)
 		return;
 
 	/* The PHY's registers need a lane domain on; quiet it first (shared). */
-	if (a->phy && t6040_ps_actual_on(ps, PS_APCIE_SYS_ST0)) {
-		if (mac & BIT(0))
-			t6040_apcie_phy_off(s);
-		else
-			t6040_apcie_phy_off(a);
-	}
-	if (mac & BIT(1))
-		t6040_apcie_phy_sw_gate(s);
-	if (a->clkgen && t6040_ps_actual_on(ps, PS_APCIE_SYS_ST0)) {
-		if (mac & BIT(1))
-			t6040_apcie_pll_off(s);
-		else
-			t6040_apcie_clk_off(a);
-	}
+	if (a->phy && t6040_ps_actual_on(ps, PS_APCIE_SYS_ST0))
+		t6040_apcie_phy_off(s);
+	t6040_apcie_phy_sw_gate(s);
+	if (a->clkgen && t6040_ps_actual_on(ps, PS_APCIE_SYS_ST0))
+		t6040_apcie_pll_off(s);
 
 	/* AXI enables off (shared). */
 	if (a->axi) {
@@ -2927,10 +2806,6 @@ static void t6040_sleep_lower_apcie_st(struct t6040_sleep *s)
  * common +0 bit31) before the PHY init. apcie_wake bit0: that domain order and both bridges;
  * bit1: APCIE_PHY_SW on and the refpll wait. Marks 0x50..0x55 follow the steps.
  */
-static unsigned int apcie_wake = 7;
-module_param(apcie_wake, uint, 0644);
-MODULE_PARM_DESC(apcie_wake,
-		 "Bring-up wake: bit0 the platform gate order ANS,GP,SYS_GP,ST0,SYS_ST0,ST1,SYS_ST1 + axi2af bits; bit1 PHY_SW on + refpll wait; bit2 SYS_GP without AUTO");
 
 static void t6040_bridge_rearm(void __iomem *bridge)
 {
@@ -2945,7 +2820,6 @@ static int t6040_sleep_raise_apcie_st(struct t6040_sleep *s)
 	struct t6040_apcie_st *a = &s->apcie_st;
 	void __iomem *ps = s->soc_east;
 	void __iomem *ctrl, *run;
-	unsigned int wake = READ_ONCE(apcie_wake);
 	u32 val;
 	int ret;
 
@@ -2954,48 +2828,30 @@ static int t6040_sleep_raise_apcie_st(struct t6040_sleep *s)
 	ctrl = a->phy + APCIE_PHY_CTRL;
 	run = a->phy + APCIE_PHY_RUN;
 
-	if (wake & BIT(0)) {
-		ret = t6040_ps_raise(ps, PS_ANS);
-		if (!ret)
-			t6040_bridge_rearm(s->axi2af_bridge[AXI2AF_ANS]);
-		ret |= t6040_ps_raise(ps, PS_APCIE_GP);
-		/*
-		 * The 'APCW' record: after the raise SYS_GP read 0x1000030f (AUTO on, auto state 0,
-		 * ACTUAL 0): AUTO gated it again and the ANS apcie DART (0x4_1000_0000) behind it
-		 * took the SError in its noirq resume. bit2 leaves SYS_GP in manual target 0xf,
-		 * as GP/ST0/ST1 read (0x2ff).
-		 */
-		if (!ret)
-			ret = (wake & BIT(2)) ? t6040_ps_raise_start(ps, PS_APCIE_SYS_GP) :
-						t6040_ps_raise(ps, PS_APCIE_SYS_GP);
-		if (!ret) {
-			writel(readl(a->axi + APCIE_AXI_EN0) | BIT(0), a->axi + APCIE_AXI_EN0);
-			writel(readl(a->axi + APCIE_AXI_EN1) | BIT(0), a->axi + APCIE_AXI_EN1);
-		}
-		ret |= t6040_ps_raise(ps, PS_APCIE_ST0);
-		ret |= t6040_ps_raise(ps, PS_APCIE_SYS_ST0);
-		ret |= t6040_ps_raise(ps, PS_APCIE_ST1);
-		ret |= t6040_ps_raise(ps, PS_APCIE_SYS_ST1);
-		t6040_ret_mark(s, 0x50);
-		s->apcie_wake_step = 1;
-		if (ret)
-			return ret;
-	} else {
-	/* Domains up: ANS first, then both lanes (st then sys_st), AXI enables. */
-	ret  = t6040_ps_raise(ps, PS_ANS);
-	ret |= t6040_ps_raise(ps, PS_APCIE_ST0);
-	ret |= t6040_ps_raise(ps, PS_APCIE_ST1);
-	ret |= t6040_ps_raise_start(ps, PS_APCIE_SYS_ST0);
-	ret |= t6040_ps_raise_start(ps, PS_APCIE_SYS_ST1);
+	/*
+	 * The order, each domain to ACTUAL 0xf: ANS, GP, SYS_GP, ST0, SYS_ST0, ST1, SYS_ST1,
+	 * the fabric-bridge bit0s set after ANS and after SYS_GP. SYS_GP stays at a manual
+	 * target 0xf: in automatic mode it gated again on the J616s, and the DART behind it
+	 * then faulted in its resume.
+	 */
+	ret = t6040_ps_raise(ps, PS_ANS);
+	if (!ret)
+		t6040_bridge_rearm(s->axi2af_bridge[AXI2AF_ANS]);
+	ret |= t6040_ps_raise(ps, PS_APCIE_GP);
+	if (!ret)
+		ret = t6040_ps_raise_start(ps, PS_APCIE_SYS_GP);
 	if (!ret) {
 		writel(readl(a->axi + APCIE_AXI_EN0) | BIT(0), a->axi + APCIE_AXI_EN0);
 		writel(readl(a->axi + APCIE_AXI_EN1) | BIT(0), a->axi + APCIE_AXI_EN1);
 	}
-	t6040_ps_raise_finish(ps, PS_APCIE_SYS_ST0);
-	t6040_ps_raise_finish(ps, PS_APCIE_SYS_ST1);
+	ret |= t6040_ps_raise(ps, PS_APCIE_ST0);
+	ret |= t6040_ps_raise(ps, PS_APCIE_SYS_ST0);
+	ret |= t6040_ps_raise(ps, PS_APCIE_ST1);
+	ret |= t6040_ps_raise(ps, PS_APCIE_SYS_ST1);
+	t6040_ret_mark(s, 0x50);
+	s->apcie_wake_step = 1;
 	if (ret)
 		return ret;
-	}
 
 	/* Tunables + clkgen (shared). Both OFF bits clear; only a power-off cleared them. */
 	apple_tunable_apply(a->axi, a->axi_tunable);
@@ -3007,29 +2863,24 @@ static int t6040_sleep_raise_apcie_st(struct t6040_sleep *s)
 	       a->clkgen + APCIE_CLK_CTRL);
 	ret = readl_poll_timeout_atomic(a->clkgen + APCIE_CLK_CTRL, val,
 					!(val & APCIE_CLK_BUSY), 1, APCIE_POLL_US);
-	if (wake)
-		t6040_ret_mark(s, 0x51);
+	t6040_ret_mark(s, 0x51);
 	s->apcie_wake_step = 2;
 	if (ret)
 		return ret;
 
-	if (wake & BIT(1)) {
-		ret = t6040_ps_raise(ps, PS_APCIE_PHY_SW);
-		s->apcie_wake_step = 3;
-		if (ret)
-			return ret;
-	}
+	ret = t6040_ps_raise(ps, PS_APCIE_PHY_SW);
+	s->apcie_wake_step = 3;
+	if (ret)
+		return ret;
 
 	/* Shared PHY bring-up + PLL/lane tables (as T8140's t8140_apcie_phy_ip_apply). */
 	apple_tunable_apply(a->phy, a->phy_tunable);
-	if (wake & BIT(1)) {
-		ret = readl_poll_timeout_atomic(a->phy + APCIE_PHY_COMMON, val, val & BIT(31), 1,
-						APCIE_POLL_US);
-		t6040_ret_mark(s, 0x52);
-		s->apcie_wake_step = 4;
-		if (ret)
-			return ret;
-	}
+	ret = readl_poll_timeout_atomic(a->phy + APCIE_PHY_COMMON, val, val & BIT(31), 1,
+					APCIE_POLL_US);
+	t6040_ret_mark(s, 0x52);
+	s->apcie_wake_step = 4;
+	if (ret)
+		return ret;
 	writel(readl(ctrl) | APCIE_PHY_CTRL_CLK0REQ, ctrl);
 	ret = readl_poll_timeout_atomic(ctrl, val, val & APCIE_PHY_CTRL_CLK0ACK, 1, APCIE_POLL_US);
 	if (ret)
@@ -3039,8 +2890,7 @@ static int t6040_sleep_raise_apcie_st(struct t6040_sleep *s)
 	if (ret)
 		return ret;
 	writel(readl(ctrl) & ~APCIE_PHY_CTRL_RESET, ctrl);
-	if (wake)
-		t6040_ret_mark(s, 0x53);
+	t6040_ret_mark(s, 0x53);
 	s->apcie_wake_step = 5;
 
 	writel(readl(run) | APCIE_PHY_RUN_EN, run);
@@ -3053,13 +2903,11 @@ static int t6040_sleep_raise_apcie_st(struct t6040_sleep *s)
 					APCIE_POLL_US);
 	if (ret)
 		return ret;
-	if (wake)
-		t6040_ret_mark(s, 0x54);
+	t6040_ret_mark(s, 0x54);
 	s->apcie_wake_step = 6;
 	writel(readl(a->phy + APCIE_PHY_COMMON) | BIT(0), a->phy + APCIE_PHY_COMMON);
 	writel(readl(ctrl) | APCIE_PHY_CTRL_UP, ctrl);
-	if (wake)
-		t6040_ret_mark(s, 0x55);
+	t6040_ret_mark(s, 0x55);
 	s->apcie_wake_step = 7;
 
 	/* RC ready handshake (as T8140's). */
@@ -3260,14 +3108,8 @@ static void t6040_sleep_lower_apcie_gp(struct t6040_sleep *s)
 	t6040_mark_raw(s, 0x54300002 | (ret ? 0x80 : 0));
 
 	t6040_mark_raw(s, 0x54400001);
-	if (READ_ONCE(apcie_seq) & BIT(3)) {
-		writel(0x244, gp);
-		ret = readl_poll_timeout_atomic(gp, val, FIELD_GET(PS_ACTUAL, val) == 4, 1,
-						PS_OFF_TIMEOUT_US);
-		s->apcie_diag[1] |= BIT(5) | (ret ? BIT(18) : 0);
-	} else {
-		ret = t6040_ps_lower_word(gp);
-	}
+	writel(0x244, gp);
+	ret = readl_poll_timeout_atomic(gp, val, FIELD_GET(PS_ACTUAL, val) == 4, 1, PS_OFF_TIMEOUT_US);
 	t6040_mark_raw(s, 0x54400002 | (ret ? 0x80 : 0));
 }
 
@@ -3294,8 +3136,6 @@ static int t6040_sleep_commit(unsigned long unused)
 	 * here it follows every refusal, so a refused sleep finds the link up.
 	 * No-op unless the apple,apcie windows are present (apcie_st.valid).
 	 */
-	memset(s->apcie_diag, 0, sizeof(s->apcie_diag));
-	s->apcie_diag[1] = (s->pcie_ans_stopped ? BIT(3) : 0) | (s->apcie_st.valid ? BIT(4) : 0);
 	if (s->soc_east &&
 	    t6040_ps_raise_start(s->soc_east, PS_APCIE_SYS_ST1))
 		t6040_mark_raw(s, 0x54c00001);
@@ -3360,13 +3200,10 @@ static int t6040_sleep_commit(unsigned long unused)
 		dsb(sy);
 	}
 
-	if (READ_ONCE(fab_on))
-		t6040_fabrics_on(s);
+	t6040_fabrics_on(s);
 	t6040_ps_save(s);
 	if (READ_ONCE(ps_snap))
 		t6040_ps_snap_store(s);
-	if (READ_ONCE(apcie_seq) & BIT(2))
-		t6040_apcie_diag_store(s);
 
 	/* Last before the S2R timer: what is still on, re-read now, kept through the reset. */
 	s->commit_on_mask |= t6040_axi2af_on_mask(s);
@@ -3441,14 +3278,8 @@ MODULE_PARM_DESC(apcie_wake_rec, "Bring-up: record the wake-side ANS/APCIe raise
 #define GP_PORT_STATUS		0x804
 #define GP_PORT_STATUS_READY	BIT(0)
 
-static unsigned int pcie_port_clk = 3;
-module_param(pcie_port_clk, uint, 0644);
-MODULE_PARM_DESC(pcie_port_clk,
-		 "Bring-up wake: GP PCIe ports (mask) whose refclk + app clock are brought back after the apcie raise");
-
 static void t6040_gp_pcie_clk(struct t6040_sleep *s)
 {
-	unsigned int mask = READ_ONCE(pcie_port_clk);
 	u32 res = 0, val;
 	int i;
 
@@ -3456,8 +3287,6 @@ static void t6040_gp_pcie_clk(struct t6040_sleep *s)
 		void __iomem *phy = s->gp_phy[i], *port = s->gp_port[i];
 		u32 r = 0, cfg, app;
 
-		if (!(mask & BIT(i)))
-			continue;
 		if (!phy || !port || !s->gp_saved[i]) {
 			res |= BIT(7) << (8 * i);
 			continue;
@@ -3600,15 +3429,11 @@ static void t6040_sleep_return(struct t6040_sleep *s)
 	if (s->pcie_ans_stopped)
 		s->pcie_ans_on_ret = t6040_sleep_raise_apcie_st(s);
 	s->gp_port_res = 0;
-	if (READ_ONCE(pcie_port_clk)) {
-		t6040_gp_pcie_clk(s);
-		t6040_ret_mark(s, 0x56);
-	}
+	t6040_gp_pcie_clk(s);
+	t6040_ret_mark(s, 0x56);
 	t6040_apcie_wake_rec(s);
-	if (READ_ONCE(aop_wake)) {
-		t6040_aop_wake(s);
-		t6040_ret_mark(s, 0x57);
-	}
+	t6040_aop_wake(s);
+	t6040_ret_mark(s, 0x57);
 	t6040_ret_mark(s, 0x38);
 
 	if (s->pwrgate) {
@@ -3675,11 +3500,9 @@ static bool t6040_sleep_mem_begun;
  * the sleep transition would race the engine. pmvc != 0 writes that value in .begin and logs
  * the key before and after.
  */
-static unsigned int pmvc = 0x101;
-module_param(pmvc, uint, 0644);
-MODULE_PARM_DESC(pmvc, "Bring-up: value for SMC key pmVC (VDD_CIO request, the platform 0x101) written in .begin; 0 = leave it");
 
 /* The .begin log does not reach the journal; keep the result in PMU SRAM 0xa2ac. */
+#define T6040_PMVC_REQUEST	0x101
 #define T6040_PMVC_PMU		0xa2ac
 #define T6040_PMVC_MAGIC	0x43564d50	/* "PMVC" in PMU byte order */
 
@@ -3745,10 +3568,7 @@ MODULE_PARM_DESC(pmvc_now, "Bring-up: write this value to SMC key pmVC now and l
 
 static void t6040_sleep_pmvc(struct t6040_sleep *s)
 {
-	u32 v = READ_ONCE(pmvc);
-
-	if (v)
-		t6040_sleep_pmvc_write(s, v, true);
+	t6040_sleep_pmvc_write(s, T6040_PMVC_REQUEST, true);
 }
 
 static int t6040_sleep_begin(suspend_state_t state)
