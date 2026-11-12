@@ -39,8 +39,8 @@ void apple_t6040_cio_router_stopped(struct device_node *phy_np);
 
 /*
  * The router carries (@on) or no longer carries USB3 for the port's USB
- * controller: the controller's PIPE follows (the USB3 mode 3). -EAGAIN
- * when @on and the router is not marked running.
+ * controller: the controller's PIPE follows. -EAGAIN when @on and the router
+ * is not marked running.
  */
 int apple_t6040_cio_usb3_tunnel(struct device_node *phy_np, bool on);
 #else

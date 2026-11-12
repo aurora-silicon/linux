@@ -253,17 +253,16 @@ static const struct apple_cio_hw apple_cio_t6050_hw = {
 };
 
 /*
- * T6040/T6041 (M4 Pro/Max) routers are Type 7 as on T8142: the platform drives their
- * acio,v2 nodes with the Type 7 HAL, and the ADT has no per-direction NHI
- * fabric tables. iBoot loads the CIO firmware into the router's SRAM; the platform
- * never loads it and never writes RUN: starting the IOP enables acio-cpuN's
- * clock gate, the PMGR virtual device CIOn-RECONFIG-V, i.e. the CIO
- * reconfiguration this driver requests through its reset. After RTKit boot
- * The platform waits 400 ms for Thunderbolt 3 (not USB4) links, hands LSTX to the
- * router, then polls the firmware state for 1 (assert: bit 31 + code). The platform
- * powers the router off for every system sleep, with or without a cable, and
- * starts it cold on wake; so does this driver. The host links stay in CL0
- * until CL states are qualified (the platform allows them). Not hardware-tested.
+ * T6040/T6041 (M4 Pro/Max) routers are Type 7 (acio,v2) as on T8142, without
+ * per-direction NHI fabric tables. The boot loader leaves the CIO firmware in
+ * the router's SRAM, and the CIO reconfiguration this driver requests through
+ * its reset restarts the CPU from it: the firmware is not loaded again and
+ * RUN is never written. Once RTKit is up, a Thunderbolt 3 (not USB4) link
+ * gets 400 ms to settle, LSTX is handed to the router, and the firmware state
+ * is read until it is 1 (bit 31 set: the firmware asserted, with a code). The
+ * router is powered off for every system sleep, with or without a cable, and
+ * started cold on wake. The host links stay in CL0 until CL states are
+ * qualified.
  */
 static const struct apple_cio_hw apple_cio_t6040_hw = {
 	.type7 = true,
@@ -280,7 +279,7 @@ static const struct apple_cio_hw apple_cio_t6040_hw = {
 	.dp = &apple_dpin_disabled,
 };
 
-/* The platform sleeps 400 ms on the embedded CPU's enable if CIO generation < 3. */
+/* Settle time of a Thunderbolt 3 or older link once the router's RTKit is up */
 #define APPLE_CIO_TBT_SETTLE_MS 400
 /* Upper bound for a deferred sleep stop before the suspend is aborted. */
 #define APPLE_CIO_SLEEP_STOP_TIMEOUT_MS 60000
@@ -2463,7 +2462,7 @@ static const struct tb_nhi_ops apple_nhi_ops = {
 /*
  * hw->cio_phy: the port's USB controller reaches a dock's USB3 through the
  * router's host USB3 adapter, so the PHY points its PIPE at the router while
- * such a tunnel is up (the USB3 mode 3) and back before the tunnel goes.
+ * such a tunnel is up and back before the tunnel goes.
  */
 static int apple_nhi_usb3_tunnel_changed(struct tb_nhi *nhi, bool on)
 {
@@ -3251,9 +3250,8 @@ static int apple_cio_start(struct apple_cio *acio)
 		return apple_cio_power_up(acio);
 
 	/*
-	 * The PHY must be in CIO, tuned by its firmware, before ACIO powers up
-	 * (the platform opens the PHY in mode 2 before the embedded CPU's enable). The
-	 * Type-C controller sets the mux first and retries on its next event.
+	 * The PHY must be in CIO, tuned by its firmware, before ACIO powers up.
+	 * The Type-C controller sets the mux first and retries on its next event.
 	 */
 	ret = apple_t6040_cio_state(acio->phy_np);
 	if (ret != 1) {
@@ -3396,7 +3394,7 @@ static int apple_cio_power_up(struct apple_cio *acio)
 		goto err_free_rtkit;
 	}
 
-	/* The platform gives a Thunderbolt 3 or legacy link 400 ms here, USB4 none. */
+	/* A Thunderbolt 3 or legacy link gets its settle time here, USB4 none. */
 	if (acio->hw->tbt_settle &&
 	    (acio->target_cable_info & TB_VSE_CAP_APPLE_CABLE_INFO_TBT2_3))
 		msleep(APPLE_CIO_TBT_SETTLE_MS);
@@ -3902,8 +3900,10 @@ static void apple_cio_sleep_close_owed(struct apple_cio *acio)
 
 /*
  * Runs when no post-resume revalidation has restarted the port: always
- * after an aborted suspend, and as a fallback after a real one. Ask CD321x
- * for a fresh read instead of starting from the state recorded before sleep.
+ * after an aborted suspend, and as a fallback after a real one; for a
+ * sleep_stop router also at once when a cable was only recorded while the
+ * port was closed. Ask CD321x for a fresh read instead of starting from the
+ * state recorded before sleep.
  */
 static void apple_cio_sleep_restart_work(struct work_struct *work)
 {
@@ -3946,13 +3946,12 @@ static void apple_cio_sleep_restart_work(struct work_struct *work)
 }
 
 /*
- * hw->sleep_stop: the router goes down for every system sleep
- * (its sleep sets hardware state 1 with a cable, hardware state 0 without),
+ * hw->sleep_stop: the router goes down for every system sleep,
  * whether the sleep is s2idle, a firmware-driven suspend or hibernation.
  * Nothing of the router survives that is used again: the next start is a cold
- * one, CIO reconfiguration (which restarts the firmware iBoot left in the
- * router's SRAM) and RTKit boot, after the Type-C controller has reapplied the
- * cable.
+ * one, CIO reconfiguration (which restarts the firmware the boot loader left in
+ * the router's SRAM) and RTKit boot, after the Type-C controller has reapplied
+ * the cable.
  * Until the sleep is over, cable changes are only recorded. Only a port that
  * had a cable owes a restart: one plugged in during the sleep is found by the
  * Type-C controller, which reads every port again after a sleep.
