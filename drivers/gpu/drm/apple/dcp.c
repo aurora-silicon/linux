@@ -9287,6 +9287,32 @@ static void dcp_t6041_boot_ps_io(bool restore)
 	iounmap(ps);
 }
 
+/*
+ * The external chains' DARTs, dark before their domains go off. The display subsystem maps
+ * every framebuffer through the display DARTs, and an unmap after the wake (an sddm restart, a
+ * logout) flushed one behind a dead block and stopped the machine (12 Nov). By node, so a chain
+ * whose DCP never bound, which the display subsystem skips as unusable, is covered too.
+ */
+static void dcp_t6041_ext_darts_dark(void)
+{
+	static const char *const paths[] = {
+		"/iommu@3a2300000", "/iommu@3a2340000", "/iommu@602300000", "/iommu@602340000",
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(paths); i++) {
+		struct device_node *np = of_find_node_by_path(paths[i]);
+		struct platform_device *pdev = np ? of_find_device_by_node(np) : NULL;
+
+		of_node_put(np);
+		if (!pdev)
+			continue;
+		if (device_is_bound(&pdev->dev))
+			apple_dart_power_dark(&pdev->dev, true);
+		put_device(&pdev->dev);
+	}
+}
+
 enum dcp_t6041_step { DCP_S2R_FW_STOP, DCP_S2R_WORDS_DOWN, DCP_S2R_START };
 
 /* Each step once per sleep. */
@@ -9310,6 +9336,7 @@ static int dcp_t6041_s2r_step(enum dcp_t6041_step step)
 		if (dcp_t6041_words || !dcp_t6041_down)
 			return 0;
 		dcp_t6041_words = true;
+		dcp_t6041_ext_darts_dark();
 		/* Never started, but the complex counts them. */
 		dcp_t6041_word_try("ext3", 0x740, 0x5028002e8UL, 0x5028002e0UL, 0x5028002d8UL,
 				   0x50282dfb4UL, 0x50282dfd8UL);
