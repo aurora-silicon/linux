@@ -349,6 +349,18 @@ static const struct aic_info aic3_t8132_info __initconst = {
 	.fw_suspend = true,
 };
 
+/*
+ * The same AICv3 as T8140's across a firmware-driven suspend: the CONFIG,
+ * TIMEOUT and CLUSTER_PRIO words and the IRQ_CFG array are lost with its power.
+ */
+static const struct aic_info aic3_t6041_info __initconst = {
+	.version = 3,
+	.irq_cfg = AIC3_IRQ_CFG,
+	.fast_ipi = true,
+	.local_fast_ipi = true,
+	.fw_suspend = true,
+};
+
 static const struct aic_info aic3_t8142_info __initconst = {
 	.version = 3,
 	.irq_cfg = AIC3_IRQ_CFG,
@@ -365,6 +377,10 @@ static const struct of_device_id aic_info_match[] = {
 	{
 		.compatible = "apple,t8140-aic3",
 		.data = &aic3_t8140_info,
+	},
+	{
+		.compatible = "apple,t6041-aic3",
+		.data = &aic3_t6041_info,
 	},
 	{
 		.compatible = "apple,t8142-aic3",
@@ -1287,32 +1303,9 @@ static struct syscore aic_syscore = {
 	.ops = &aic_syscore_ops,
 };
 
-/*
- * The T6040's AIC (apple,t6041-aic3, matched through aic3_info) is the same
- * AICv3 as the T8140's: the same CONFIG, TIMEOUT and CLUSTER_PRIO words and
- * IRQ_CFG array. It is admitted to the sleep save only on a board whose device
- * tree enables the T6040 sleep controller, so that every other machine with
- * this AIC suspends and hibernates as before.
- */
-static bool __init aic_t6040_sleep(struct device_node *node)
+static void __init aic_sleep_init(struct aic_irq_chip *irqc)
 {
-	struct device_node *np;
-	bool sleeps;
-
-	if (!IS_ENABLED(CONFIG_APPLE_T6040_SLEEP) ||
-	    !of_device_is_compatible(node, "apple,t6041-aic3"))
-		return false;
-
-	np = of_find_compatible_node(NULL, NULL, "apple,t6040-sleep");
-	sleeps = of_device_is_available(np);
-	of_node_put(np);
-
-	return sleeps;
-}
-
-static void __init aic_sleep_init(struct aic_irq_chip *irqc, struct device_node *node)
-{
-	if (!irqc->info.fw_suspend && !aic_t6040_sleep(node))
+	if (!irqc->info.fw_suspend)
 		return;
 
 	aic_sleep.irq_cfg = kcalloc(irqc->nr_die * irqc->nr_irq, sizeof(u32), GFP_KERNEL);
@@ -1322,7 +1315,7 @@ static void __init aic_sleep_init(struct aic_irq_chip *irqc, struct device_node 
 	register_syscore(&aic_syscore);
 }
 #else
-static void __init aic_sleep_init(struct aic_irq_chip *irqc, struct device_node *node)
+static void __init aic_sleep_init(struct aic_irq_chip *irqc)
 {
 }
 #endif
@@ -1480,7 +1473,7 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 			  "irqchip/apple-aic/ipi:starting",
 			  aic_init_cpu, NULL);
 
-	aic_sleep_init(irqc, node);
+	aic_sleep_init(irqc);
 
 	if (is_kernel_in_hyp_mode()) {
 		struct irq_fwspec mi = {
