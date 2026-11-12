@@ -1891,7 +1891,7 @@ static int t6040_sleep_raise_apcie_st(struct t6040_sleep *s)
 }
 
 /*
- * The first thing Linux runs after a wake, MMU off and no stack (#1314's T8132 stub). The
+ * The first thing Linux runs after a wake, MMU off and no stack (as the T8132 stub does). The
  * last wake program leaves the AON WD2 running for 5 s, less than the device resume takes:
  * restart it for 60 s, in t6040_sleep_set_wd2()'s order, then take cpu_resume. The PA is
  * the T6040 AON WDT (0x50836c000), used only when the DT's wdt block is that one.
