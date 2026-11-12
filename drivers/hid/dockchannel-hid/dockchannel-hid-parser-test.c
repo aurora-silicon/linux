@@ -197,6 +197,72 @@ static void dchid_report_size_clamp_test(struct kunit *test)
 	KUNIT_EXPECT_MEMEQ(test, iface->hid_desc, want, sizeof(want));
 }
 
+static void dchid_test_destroy_hid(void *data)
+{
+	hid_destroy_device(data);
+}
+
+struct dchid_test_report {
+	int raw_size;
+	bool parsed;
+};
+
+static int dchid_test_capture_raw(struct hid_device *hid, struct hid_report *report,
+				  u8 *data, int size)
+{
+	struct dchid_test_report *seen = hid_get_drvdata(hid);
+
+	seen->raw_size = size;
+	return 0;
+}
+
+static void dchid_test_capture_parsed(struct hid_device *hid, struct hid_report *report)
+{
+	struct dchid_test_report *seen = hid_get_drvdata(hid);
+
+	seen->parsed = true;
+}
+
+static void dchid_numbered_short_report_test(struct kunit *test)
+{
+	static struct hid_driver driver = {
+		.raw_event = dchid_test_capture_raw,
+		.report = dchid_test_capture_parsed,
+	};
+	static const u8 descriptor[] = {
+		0x05, 0x01, 0x09, 0x04, 0xa1, 0x01,
+		0x85, 0x01, 0x09, 0x30, 0x15, 0x00, 0x26, 0xff, 0x00,
+		0x75, 0x08, 0x96, 0x00, 0x01, 0x81, 0x02, 0xc0,
+	};
+	struct dchid_iface *iface = test->priv;
+	u8 data[] = { 1, 0x12, 0x34 };
+	struct hid_device *hid;
+	struct dchid_test_report seen = {};
+
+	hid = hid_allocate_device();
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, hid);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, dchid_test_destroy_hid, hid), 0);
+	hid->ll_driver = &dchid_ll;
+	hid->driver = &driver;
+	hid_set_drvdata(hid, &seen);
+	KUNIT_ASSERT_EQ(test, hid_parse_report(hid, descriptor, sizeof(descriptor)), 0);
+	hid->bpf_rdesc = hid->dev_rdesc;
+	hid->bpf_rsize = hid->dev_rsize;
+	KUNIT_ASSERT_EQ(test, hid_open_report(hid), 0);
+
+	iface->hid = hid;
+	iface->open = true;
+	iface->pad = kunit_kmalloc(test, DCHID_REPORT_PAD_SIZE, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, iface->pad);
+	memset(iface->pad, 0xa5, DCHID_REPORT_PAD_SIZE);
+	dchid_handle_report(iface, data, sizeof(data));
+
+	KUNIT_EXPECT_EQ(test, seen.raw_size, sizeof(data));
+	KUNIT_EXPECT_TRUE(test, seen.parsed);
+	KUNIT_EXPECT_MEMEQ(test, iface->pad, data, sizeof(data));
+	KUNIT_EXPECT_EQ(test, iface->pad[DCHID_REPORT_PAD_SIZE - 1], 0);
+}
+
 static void dchid_packet_checksum_test(struct kunit *test)
 {
 	struct dchid_hdr hdr = { .hdr_len = sizeof(hdr), .length = 8 };
@@ -293,6 +359,7 @@ static struct kunit_case dchid_parser_cases[] = {
 	KUNIT_CASE(dchid_short_input_test),
 	KUNIT_CASE(dchid_init_descriptor_test),
 	KUNIT_CASE(dchid_report_size_clamp_test),
+	KUNIT_CASE(dchid_numbered_short_report_test),
 	KUNIT_CASE(dchid_packet_checksum_test),
 	KUNIT_CASE(dchid_ring_wrap_test),
 	KUNIT_CASE(dchid_ring_bad_header_test),
