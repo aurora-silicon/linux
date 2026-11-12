@@ -21,16 +21,15 @@
  *    `echo mem > /sys/power/state` prints every blocker and returns an error
  *    before any device suspends.
  *  - Dry runs (t6040_sleep.dry_run, also writable at runtime):
- *      1: the ordinary device suspend and CPU parking, the firmware never told.
- *      2: pm_suspend_via_firmware() is set, so every driver's firmware-driven
+ *      1: pm_suspend_via_firmware() is set, so every driver's firmware-driven
  *         sleep step that can be taken back runs (apple_sleep_power_loss() is
  *         false, so what only a power cycle restores is left out), the CPUs
  *         park and answer the commit's hold, the commit point's checks run,
  *         and the sleep is refused there and resumed warm.
- *      3: 2, plus the last steps that can still be taken back (the SMC's sleep
+ *      2: 1, plus the last steps that can still be taken back (the SMC's sleep
  *         commit, each coprocessor's last check, such as ANS's check of the
  *         shutdown notification it sent at its suspend).
- *    The AON watchdog's WD2 is armed from .begin to .end of a dry run 2 or 3
+ *    The AON watchdog's WD2 is armed from .begin to .end of a dry run
  *    (t6040_sleep.wd2_secs, 0 to leave it off).
  *  - The real commit (t6040_sleep_commit) runs only when no blocker remains,
  *    t6040_sleep.allow_entry=1 is given and no dry run is asked for. The AON
@@ -551,15 +550,14 @@ struct t6040_sleep {
 };
 
 /*
- * 0: refuse at .begin. 1: device suspend and parking, the firmware never told.
- * 2: the firmware-driven device suspend short of what only a power cycle
- * restores, parking and the commit's hold, refused at the commit point. 3: 2 and
+ * 0: no dry run. 1: the firmware-driven device suspend short of what only a power
+ * cycle restores, parking and the commit's hold, refused at the commit point. 2: 1 and
  * the last steps that can still be taken back. Read at each suspend's .begin.
  */
 static unsigned int dry_run;
 module_param(dry_run, uint, 0644);
 MODULE_PARM_DESC(dry_run,
-		 "Dry run level: 1 parking only, 2 firmware-driven device sleep refused at the commit point, 3 also the last steps");
+		 "Dry run level: 1 firmware-driven device sleep refused at the commit point, 2 also the last steps");
 
 static bool allow_entry;
 module_param(allow_entry, bool, 0444);
@@ -579,7 +577,7 @@ MODULE_PARM_DESC(sleep_wd_secs,
 static unsigned int wd2_secs = WDT_SUSPEND_SECS;
 module_param(wd2_secs, uint, 0644);
 MODULE_PARM_DESC(wd2_secs,
-		 "Arm the AON WD2 for this many seconds from .begin to .end of a dry run 2 or 3 (0: off, at most 178)");
+		 "Arm the AON WD2 for this many seconds from .begin to .end of a dry run (0: off, at most 178)");
 
 static struct t6040_sleep *t6040_sleep;
 
@@ -614,7 +612,7 @@ bool apple_sleep_last_steps(void)
 {
 	unsigned int dry = READ_ONCE(t6040_sleep_dry);
 
-	return pm_suspend_via_firmware() && (!dry || dry >= 3);
+	return pm_suspend_via_firmware() && (!dry || dry >= 2);
 }
 EXPORT_SYMBOL_GPL(apple_sleep_last_steps);
 
@@ -2683,8 +2681,8 @@ static int t6040_sleep_begin(suspend_state_t state)
 		live, disp);
 	t6040_sleep_log_blockers(s);
 
-	if (dry >= 2) {
-		dry = min(dry, 3U);
+	if (dry) {
+		dry = min(dry, 2U);
 		t6040_sleep_power_ops(s);
 		if (!s->power_ops)
 			pr_warn("t6040-sleep: dry run: no CPU parking power ops, so no hold at the commit point\n");
@@ -2696,13 +2694,8 @@ static int t6040_sleep_begin(suspend_state_t state)
 		else
 			secs = 0;
 		pr_info("t6040-sleep: dry run %u: firmware-driven device sleep short of %s, refused at the commit point, WD2 %u s (0: off)\n",
-			dry, dry >= 3 ? "the stops only a power cycle undoes" :
+			dry, dry >= 2 ? "the stops only a power cycle undoes" :
 					"the last steps", secs);
-		return 0;
-	}
-
-	if (dry) {
-		pr_info("t6040-sleep: dry run 1: parking CPUs and refusing at the commit point; the firmware is never told\n");
 		return 0;
 	}
 
@@ -2719,8 +2712,8 @@ static int t6040_sleep_prepare(void)
 }
 
 /*
- * A dry run 2 or 3 at the commit point, interrupts off and one CPU up: every
- * check a real commit makes, the parked CPUs held and let go, at level 3 each
+ * A dry run at the commit point, interrupts off and one CPU up: every
+ * check a real commit makes, the parked CPUs held and let go, at level 2 each
  * coprocessor's last check, then the refusal. Never reached: the enclave's
  * sleep request, each coprocessor's last stop, the wake masks, the SoC
  * power-down.
@@ -2757,7 +2750,7 @@ static int t6040_sleep_dry_enter(struct t6040_sleep *s, unsigned int dry)
 		pr_info("t6040-sleep: %u parked CPU(s) answered the hold\n",
 			num_present_cpus() - num_online_cpus());
 
-	if (dry >= 3 && !ret)
+	if (dry >= 2 && !ret)
 		pr_info("t6040-sleep: the coprocessors' last checks: %d\n",
 			t6040_sleep_coprocs_check());
 	if (!ret)
@@ -3065,7 +3058,6 @@ static int t6040_sleep_enter(suspend_state_t state)
 	left = t6040_sleep_lower_display(s);
 	if (left)
 		pr_warn("t6040-sleep: %u display power word(s) did not go off\n", left);
-	/* A dry run 1 ends here as well: its .begin told the firmware nothing. */
 	if (t6040_sleep_total_blockers(s) || !allow_entry || !apple_sleep_power_loss()) {
 		unsigned int on = t6040_sleep_log_groups(s);
 

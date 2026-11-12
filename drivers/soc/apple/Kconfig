@@ -148,7 +148,7 @@ config APPLE_T6040_SLEEP
 	  It keeps the coprocessor and enclave registry for the T6040, so
 	  the drivers that leave their last stop to the sleep's commit (ANS,
 	  the PMP, the SEP) can register, and offers dry runs: with
-	  t6040_sleep.dry_run=2 every driver's firmware-driven sleep step that
+	  t6040_sleep.dry_run=1 every driver's firmware-driven sleep step that
 	  can be taken back runs, the CPUs park and are held, and the sleep is
 	  refused at the commit point and resumed warm.
 
