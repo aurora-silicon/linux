@@ -687,7 +687,6 @@ static int apple_spmi_probe(struct platform_device *pdev)
 	return 0;
 }
 
-#ifdef CONFIG_HIBERNATION
 /*
  * After a resume from disk the controller holds the boot kernel's masks and
  * pending interrupts, not this kernel's: drop the pending ones and rewrite
@@ -767,8 +766,6 @@ static int apple_spmi_restore_early(struct device *dev)
 	return 0;
 }
 
-#endif
-
 /*
  * Suspend-to-RAM parks the notification queue; a resume from disk rewrites the
  * masks, in the early restore where a PM domain kept the noirq one from running.
@@ -779,12 +776,8 @@ static const struct dev_pm_ops apple_spmi_pm_ops = {
 	.freeze_noirq = pm_sleep_ptr(apple_spmi_suspend_noirq),
 	.thaw_noirq = pm_sleep_ptr(apple_spmi_resume_noirq),
 	.poweroff_noirq = pm_sleep_ptr(apple_spmi_suspend_noirq),
-#ifdef CONFIG_HIBERNATION
-	.restore_noirq = apple_spmi_restore_noirq,
-	.restore_early = apple_spmi_restore_early,
-#else
-	.restore_noirq = pm_sleep_ptr(apple_spmi_resume_noirq),
-#endif
+	.restore_noirq = pm_sleep_ptr(apple_spmi_restore_noirq),
+	.restore_early = pm_sleep_ptr(apple_spmi_restore_early),
 };
 
 static const struct of_device_id apple_spmi_match_table[] = {
