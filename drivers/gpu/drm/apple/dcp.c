@@ -9036,7 +9036,7 @@ bool dcp_s2r_firmware_stopped(struct platform_device *pdev)
 
 /*
  * The display power domains across a T6040 S2R, the raw-MMIO fallback
- * adapted from #1208's dcp_s2r_ext_domains_on/off. The bases come from an
+ * adapted from the T8140 dcp_s2r_ext_domains_on/off. The bases come from an
  * apple,display-power node (reg-names "ps" + "pmc-dcp") the boot object would
  * publish; our static tree has none, so dcp_t6041_display_power() returns
  * -ENODEV, the entry lower is skipped (the commit's axi2af readcheck logs the

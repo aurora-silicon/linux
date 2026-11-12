@@ -2,15 +2,15 @@
 /*
  * Apple T6040 (M4 Pro) system sleep: refusal-first controller.
  *
- * This is the T6040 port of aurora-silicon/linux #1208 (T8140 deep sleep at
- * EL2). Its commit is the T6040 entry as measured on the J616s,
- * which is much shorter than the T8140's (see t6040_sleep_commit).
+ * This is the T6040 port of the T8140 deep sleep at EL2 (sleep.c). Its commit
+ * is the T6040 entry as measured on the J616s, which is much
+ * shorter than the T8140's (see t6040_sleep_commit).
  *
  * What it does:
  *
  *  - It keeps the debugfs preflight of the display power states the platform checks
  *    before it sleeps (device-check-ps-b4-sleep).
- *  - It keeps #1208's coprocessor and enclave registry (sleep.h) for the T6040:
+ *  - It uses the coprocessor and enclave registry it shares with T8140 (sleep.h):
  *    a driver that can only stop its coprocessor once the sleep is certain
  *    (ANS, the PMP, the SEP's sleep request) registers here, readies it in its
  *    own suspend and leaves the last stop to the commit, after every refusal.
@@ -98,7 +98,7 @@
  * offsets, same bank as ps_ans); the control windows (axi2af/cio3pll/clkgen/
  * phy-block/phy-ip/rc) and the PLL/lane tunables are NOT in this SoC's static
  * description and are published by the boot object (aura) under the apple,apcie
- * node, matching aurora #1208. The block-internal offsets below are T8140's:
+ * node, in the same shape as on T8140. The block-internal offsets below are T8140's:
  * the same Apple PCIe IP, expected identical.
  */
 #define PS_ANS			0x370	/* SOC-East: ps_ans */
@@ -304,7 +304,7 @@ static const struct {
 
 /*
  * The display coprocessors' ASC CPU_CONTROL (+0x44): DCP, DCPEXT0, DCPEXT1. Upstream
- * T8140 (#1208, working S2R) writes it 0 twice right before the display CPU word goes
+ * T8140 (working S2R) writes it 0 twice right before the display CPU word goes
  * down; RUN and bit5 alone, cleared at the device suspend, leave the word refusing writes.
  */
 static const u64 t6040_dcp_asc_ctl_pa[3] = { 0x402e00044ULL, 0x3a2e00044ULL, 0x602e00044ULL };
@@ -347,7 +347,7 @@ static const struct {
 
 /*
  * The PMU over SPMI (spmi0 = 0x509014000, spmi-a0 = 0x509188000). Same shape as
- * #1208's t8140_pmu_write: the reply vector is masked, the command and its data
+ * T8140's t8140_pmu_write: the reply vector is masked, the command and its data
  * are written to +0x4, the reply polled and acknowledged. Measured on the J616s
  *: the boot stage is set to 0x50 by an extended write whose command
  * word is (0xf801 << 16) | 0x8e30 = 0xf8018e30, and NOTIFY_ENABLE is 0x2000001
@@ -452,7 +452,7 @@ static const struct {
 #define WDT_TICKS_PER_S		24000000
 /* At the commit, as the reconfig. */
 #define WDT_SLEEP_SECS		5
-/* From .begin to .end: the device suspend and resume, as #1208 does. */
+/* From .begin to .end: the device suspend and resume, as on T8140. */
 #define WDT_SUSPEND_SECS	120
 /* ALARM is 32 bits at 24 MHz. */
 #define WDT_MAX_SECS		178U
@@ -1562,7 +1562,7 @@ static unsigned int t6040_sleep_refuse(struct t6040_sleep *s)
 
 	/*
 	 * ANS would be stopped, but its ST lanes have no way back without the
-	 * apple,apcie control windows + PLL/lane tunables. #1208 keeps
+	 * apple,apcie control windows + PLL/lane tunables. The T8140 driver keeps
 	 * suspend-to-idle the default in this state; here the deep sleep refuses.
 	 */
 	if (ans_idled && !s->apcie_st.valid) {
@@ -2287,7 +2287,7 @@ static const struct {
 };
 
 /*
- * As the platform writes the PMU over SPMI (mirror of #1208's t8140_pmu_write): the
+ * As the platform writes the PMU over SPMI (mirror of T8140's t8140_pmu_write): the
  * reply vector masked, the command and value written to +0x4, the reply polled
  * and acknowledged, so none is left raised.
  */
@@ -2916,7 +2916,7 @@ static void t6040_wake_restore(struct t6040_sleep *s)
 
 /*
  * ANS's storage-apcie power words (the two ST lanes + ANS) live in SOC-East.
- * These helpers drive one power word in a given bank, as #1208's t8140_ps_*
+ * These helpers drive one power word in a given bank, as T8140's t8140_ps_*
  * do in its single PMGR bank: lower is AUTO_ENABLE off then target 0; raise is
  * the target, then AUTO_ENABLE once ACTUAL reads on. Writing PS_FLAGS clears
  * them. Separate from t6040_sleep_ps_on(), which reads a cached value.
@@ -3032,7 +3032,7 @@ static void t6040_apcie_clk_off(struct t6040_apcie_st *a)
 }
 
 /*
- * ENTRY: lower ANS's storage link, the two-lane adaptation of #1208's
+ * ENTRY: lower ANS's storage link, the two-lane adaptation of
  * t8140_sleep_lower_apcie(). Called from the commit's lower_io only once ANS
  * has been stopped by its driver (pcie_ans_stopped). The PHY/clkgen/axi are
  * shared across the lanes; only the two sys_st/st domains are per-lane.
@@ -3050,7 +3050,7 @@ static void t6040_apcie_clk_off(struct t6040_apcie_st *a)
  * clock-gated. APCIE_PHY_SW's parents are APCIE_SYS_ST0/1 (ADT): with them already off
  * the engine waits on PARENT_MISSING for good (on the J616s: MCPS stuck at 0x502280398).
  * apcie_st_ps=0 leaves the power words to the engine (the PHY, clock and AXI quiesce
- * still run); 1 lowers them here as #1208 does on T8140.
+ * still run); 1 lowers them here as the T8140 driver does.
  */
 static bool apcie_st_ps;
 module_param(apcie_st_ps, bool, 0644);
@@ -3463,7 +3463,7 @@ MODULE_PARM_DESC(dcs_rec, "Bring-up: record the DCS power-gate state at PMU 0xa2
 
 /*
  * D2S still stalls with dynamic power gating on and the AOP/PMP/MTP ruled out.
- * #1208's T8140 commit stops each memory channel right before its gates at
+ * The T8140 commit stops each memory channel right before its gates at
  * about -18 ms (t8140_sleep_mcc_stop): at DCS +0x580 ("mcc0..2" = 0x2_2040_0580 +
  * ch * 0x20_0000, the DCS slices' spacing) the enables word +0x4 cleared one bit at a time,
  * then lanes 0..3 strobed and cleared on +0x8 (mask word +0xc), two lanes per channel per
@@ -3803,12 +3803,12 @@ static void t6040_sleep_lower_apcie_st(struct t6040_sleep *s)
 	s->ans_bridge_quiesced = t6040_ans_bridge_quiesce(s);
 	if (READ_ONCE(apcie_st_ps))
 		t6040_ps_lower(ps, PS_ANS);
-	/* The caller polls PS_ANS off, as #1208 does. */
+	/* The caller polls PS_ANS off, as on T8140. */
 }
 
 /*
  * RESUME: raise ANS's storage link from power-off, the two-lane adaptation of
- * #1208's t8140_sleep_raise_apcie(). Runs atomic on the waking core in
+ * t8140_sleep_raise_apcie(). Runs atomic on the waking core in
  * t6040_sleep_return(), AFTER t6040_axi2af_rearm() (the ANS/apcie_sys fabric
  * bridges must be re-armed before link traffic) and BEFORE control returns to
  * the PM core, so nvme's resume_early sets the ANS run bit onto a live link.
@@ -3975,7 +3975,7 @@ static int t6040_sleep_raise_apcie_st(struct t6040_sleep *s)
  * The real commit (t6040_sleep_commit, reached through cpu_suspend):
  * t6040_sleep_enter calls it only when no blocker remains and allow_entry is
  * set. The SoC power-down here is the T6040 entry as
- * measured on the J616s, which is SHORT: unlike #1208's T8140 commit there
+ * measured on the J616s, which is SHORT: unlike the T8140 commit there
  * is NO dcs_down / mcc_stop / pwrgate / PTD / clk-mux-per-lane / CLLT / dvfm /
  * AMCC / ps_seq list (the platform writes none of them). The
  * order is the, as measured: WD0 off, PMU boot-stage 0x50
@@ -5748,7 +5748,7 @@ static int t6040_sleep_enter(suspend_state_t state)
 		return -EBUSY;
 	}
 
-	/* #1208's order. */
+	/* The T8140 driver's order. */
 	if (t6040_sleep_refuse(s)) {
 		/* 0x5aGGWWWW: why, as t6040_sleep_refuse() recorded it (GG display groups on). */
 		t6040_mark_raw(s, 0x5a000000 | (t6040_refuse_why & 0xffffff));
@@ -6001,7 +6001,7 @@ static void __iomem *t6040_apcie_block(struct t6040_sleep *s, struct device_node
  * the boot object publishes from the ADT. Our static tree has none
  * of these, so until aura fills the node @valid stays false and a real sleep
  * with ANS stopped refuses (t6040_sleep_refuse). The reg-names and tunable
- * property names match aurora #1208's apple,apcie shape exactly, so the same
+ * property names match the T8140 apple,apcie shape exactly, so the same
  * loader fills both SoCs. The GP PCIe host (pcie@1cb0000000, Wi-Fi + SD) is a
  * different node and is left to cold-recover.
  */
