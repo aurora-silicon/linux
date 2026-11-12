@@ -150,6 +150,13 @@ properties:
     $ref: "#/$defs/apple,tunable"
     description: Tunables applied to the drd-ausbc region.
 
+  apple,sleep-ddr:
+    type: boolean
+    description:
+      While the controller runs as a host, a system sleep keeps DRAM for its
+      always-on side, as macOS's USB_SLP_DDR vote does from the host's start
+      to its stop.
+
 required:
   - compatible
   - reg

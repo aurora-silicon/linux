@@ -7,9 +7,13 @@
 #include <asm/io.h>
 #include <linux/delay.h>
 #include <linux/highmem.h>
+#include <linux/io.h>
+#include <linux/iommu.h>
 #include <linux/iopoll.h>
+#include <linux/ktime.h>
 #include <linux/overflow.h>
 #include <linux/pm_runtime.h>
+#include <linux/soc/apple/sleep.h>
 #include <linux/types.h>
 #include <linux/unaligned.h>
 
@@ -28,6 +32,12 @@
 #define ISP_FIRMWARE_DATA_SIZE 0x28000
 
 #define ISP_COPROC_IN_WFI      0x3
+
+/* the waits for firmware that has been told to power down */
+#define ISP_STOP_KEY_TRIES     20
+#define ISP_STOP_KEY_MS	       10
+#define ISP_STOP_WFI_POLL_US   (10 * USEC_PER_MSEC)
+#define ISP_STOP_WFI_US	       (190 * USEC_PER_MSEC)
 
 static inline u32 isp_coproc_read32(struct apple_isp *isp, u32 reg)
 {
@@ -262,9 +272,12 @@ static void isp_disable_irq(struct apple_isp *isp)
 	if (isp->hw->mbox_irq_route || isp->hw->mbox_extra_enables) {
 		isp_mbox_write32(isp, ISP_MBOX_IRQ_ENABLE1_T8140, 0x0);
 		isp_mbox_write32(isp, ISP_MBOX_IRQ_ENABLE2_T8140, 0x0);
+		if (isp->hw->mbox_irq_route)
+			isp_mbox_write32(isp, ISP_MBOX_IRQ_ROUTE_T8140, 0x0);
 	}
 	free_irq(isp->irq, isp);
 	isp_gpio_write32(isp, ISP_GPIO_1, 0xfeedbabe); /* real funny */
+	fsleep(10);
 }
 
 static int isp_enable_irq(struct apple_isp *isp)
@@ -426,6 +439,39 @@ static void isp_restore_fw_memory(struct apple_isp *isp)
 			clear_highpage(tail->pages[i]);
 }
 
+/*
+ * The coprocessor starts at its reset vector, which the bootloader sets and
+ * which bit 0 latches. Note it at the first start; where a power-off cleared
+ * it, set it again.
+ */
+static int isp_coproc_entry(struct apple_isp *isp)
+{
+	struct isp_firmware *fw = &isp->fw;
+	u64 rvbar = readq(isp->coproc + ISP_COPROC_RVBAR);
+
+	if (!fw->started) {
+		fw->entry = rvbar & ~1ULL;
+		dev_dbg(isp->dev, "firmware reset vector %#llx\n", rvbar);
+		return 0;
+	}
+
+	if (!fw->entry || rvbar == (fw->entry | 1))
+		return 0;
+
+	if (rvbar & 1) {
+		isp_err(isp, "reset vector %#llx latched, not the firmware's %#llx\n",
+			rvbar, fw->entry);
+		return -EIO;
+	}
+
+	writeq(fw->entry | 1, isp->coproc + ISP_COPROC_RVBAR);
+	dev_dbg(isp->dev, "reset vector was %#llx, set to %#llx\n", rvbar,
+		readq(isp->coproc + ISP_COPROC_RVBAR));
+
+	return (readq(isp->coproc + ISP_COPROC_RVBAR) & ~1ULL) == fw->entry ?
+		       0 : -EIO;
+}
+
 static void isp_firmware_shutdown_stage1(struct apple_isp *isp)
 {
 	/* Only a coprocessor that was started has to settle and quiesce */
@@ -440,7 +486,13 @@ static void isp_firmware_shutdown_stage1(struct apple_isp *isp)
 		dev_warn(isp->dev, "coproc not in WFI before power-down (status 0x%x)\n",
 			 val);
 
-	isp_coproc_write32(isp, isp_coproc_control(isp), 0x0);
+	/*
+	 * macOS powers T8140's ISP off from WFI with the run bit still set. The sleep
+	 * engine's own restore of the ISP in a wake that kept DRAM up depends on it:
+	 * with the bit cleared that wake stalls until the SoC's watchdog resets it.
+	 */
+	if (isp->hw->gen != ISP_GEN_T8140)
+		isp_coproc_write32(isp, isp_coproc_control(isp), 0x0);
 
 	if (started) {
 		/* The request bit alone asks for it, and reads back once done */
@@ -488,6 +540,12 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
 	if (err < 0)
 		goto shutdown;
 
+	if (isp->hw->fw_restart) {
+		err = isp_coproc_entry(isp);
+		if (err < 0)
+			goto shutdown;
+	}
+
 	isp_gpio_write32(isp, ISP_GPIO_0, 0x0);
 	isp_gpio_write32(isp, ISP_GPIO_1, 0x0);
 	isp_gpio_write32(isp, ISP_GPIO_2, 0x0);
@@ -501,6 +559,7 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
 
 	isp_coproc_write32(isp, isp_coproc_control(isp), 0x0);
 	isp_coproc_write32(isp, isp_coproc_control(isp), 0x10);
+	isp->fw.started = true;
 
 	/* Wait for ISP_GPIO_7 to 0x0 -> 0x8042006 */
 	if (isp_gpio_wait(isp, ISP_GPIO_7, 0x8042006)) {
@@ -898,12 +957,94 @@ static int isp_firmware_boot_stage3(struct apple_isp *isp)
 	return 0;
 }
 
+/* Wait for the word of its own memory the firmware sets once it has stopped. */
+static void isp_wait_stop_key(struct apple_isp *isp, u64 addr, u32 key)
+{
+	u64 iova = isp_fw_iova(isp, addr);
+	phys_addr_t phys = 0;
+	u32 *word = NULL;
+
+	if (iova < isp_fw_iova(isp, isp->fw.heap_top))
+		phys = iommu_iova_to_phys(isp->domain, iova);
+	if (phys)
+		word = memremap(phys, sizeof(*word), MEMREMAP_WC);
+	if (!word) {
+		dev_warn(isp->dev, "stop key at 0x%llx isn't in firmware memory\n",
+			 addr);
+		return;
+	}
+
+	for (int i = 0; i < ISP_STOP_KEY_TRIES && READ_ONCE(*word) != key; i++)
+		msleep(ISP_STOP_KEY_MS);
+
+	if (READ_ONCE(*word) != key)
+		dev_warn(isp->dev, "stop key at 0x%llx reads 0x%x, not 0x%x\n",
+			 addr, READ_ONCE(*word), key);
+
+	memunmap(word);
+}
+
+/*
+ * Stop firmware that starts cold next time. CISP_CMD_SUSPEND is for firmware
+ * that resumes: it isn't followed by a cold start.
+ */
+static int isp_stop_firmware_cold(struct apple_isp *isp)
+{
+	struct cmd_stop_key stop_key = {};
+	ktime_t start = ktime_get();
+	u32 status;
+	int err;
+
+	/* Without the key the rest of the stop still works. */
+	if (isp_cmd_stop_key_get(isp, &stop_key))
+		stop_key.addr = 0;
+
+	err = isp_cmd_stop_cold(isp, 0);
+	if (err) {
+		isp_err(isp, "isp_cmd_stop_cold() failed\n");
+		return err;
+	}
+
+	/* The firmware answers the power-down in this word, not on the ring. */
+	isp_gpio_write32(isp, ISP_GPIO_0, 0xf7fbdff9);
+
+	err = isp_cmd_power_down(isp);
+	if (err) {
+		isp_err(isp, "isp_cmd_power_down() failed\n");
+		return err;
+	}
+
+	if (isp_gpio_wait(isp, ISP_GPIO_0, 0x8042006)) {
+		isp_err(isp, "never received magic number from firmware\n");
+		return -ENODEV;
+	}
+
+	if (stop_key.addr)
+		isp_wait_stop_key(isp, stop_key.addr, stop_key.key);
+
+	/* Its domains go off next, so its CPU should be idle by now. */
+	if (readl_poll_timeout(isp->coproc + ISP_COPROC_STATUS_T8140, status,
+			       status & ISP_COPROC_IN_WFI, ISP_STOP_WFI_POLL_US,
+			       ISP_STOP_WFI_US))
+		dev_warn(isp->dev, "coprocessor not in WFI (status: 0x%x)\n",
+			 status);
+	else
+		dev_dbg(isp->dev, "firmware stopped in %lld ms (key at 0x%llx, status 0x%x)\n",
+			ktime_ms_delta(ktime_get(), start), stop_key.addr,
+			status);
+
+	return 0;
+}
+
 static int isp_stop_command_processor(struct apple_isp *isp)
 {
 	int res, ret;
 
 	if (READ_ONCE(isp->ipc_error))
 		return READ_ONCE(isp->ipc_error);
+
+	if (isp->hw->fw_restart)
+		return isp_stop_firmware_cold(isp);
 
 	isp_gpio_write32(isp, ISP_GPIO_0, 0xf7fbdff9);
 
@@ -1106,10 +1247,10 @@ static void isp_firmware_shutdown(struct apple_isp *isp)
 
 	/*
 	 * Stop the coprocessor before releasing any memory the firmware
-	 * uses, also when it did not acknowledge the suspend request.
+	 * uses, also when it did not acknowledge the stop request.
 	 */
 	if (isp_stop_command_processor(isp))
-		dev_warn(isp->dev, "firmware did not suspend, stopping it\n");
+		dev_warn(isp->dev, "firmware did not stop, stopping the coprocessor\n");
 	/* Also stop a receive thread whose producer never leaves a gap. */
 	cmpxchg(&isp->ipc_error, 0, -ESHUTDOWN);
 	isp_disable_irq(isp);
@@ -1117,17 +1258,39 @@ static void isp_firmware_shutdown(struct apple_isp *isp)
 }
 
 /*
+ * After a restart, the firmware must find the camera found at probe. The
+ * query also shows that it takes commands.
+ */
+static int isp_check_restarted(struct apple_isp *isp)
+{
+	struct cmd_config_get args = {};
+	int err;
+
+	err = isp_cmd_config_get(isp, &args);
+	if (err)
+		return err;
+
+	if (min_t(u32, args.num_channels, ISP_MAX_CHANNELS) != isp->num_channels) {
+		isp_err(isp, "firmware found %u channels after a restart, %d before\n",
+			args.num_channels, isp->num_channels);
+		return -ENODEV;
+	}
+
+	return 0;
+}
+
+/*
  * Resident firmware (hw->resident_fw) is loaded by the bootloader and
- * does not start again once it has been stopped: after CISP_CMD_SUSPEND,
- * a coprocessor reset and a power cycle of its domains it never completes
- * the first handshake. It is booted once, at probe or with
- * deferred_start at the first stream, and runs until the
- * driver is unbound, probe fails or the system hibernates, also across
- * suspend; after it has stopped the device stays unusable until the next
- * system boot.
+ * changes its own memory as it runs. It is booted at probe, or with
+ * deferred_start at the first stream, and runs until the driver is unbound,
+ * probe fails, the system hibernates or a sleep powers the SoC down;
+ * suspend-to-idle keeps it running. With hw->fw_restart it starts again, and
+ * rebuilds that memory itself; other stopped firmware stays down until the
+ * next system boot.
  */
 int apple_isp_firmware_boot(struct apple_isp *isp)
 {
+	bool restart = isp->hw->resident_fw && isp->fw.started;
 	int err;
 
 	switch (isp->fw_state) {
@@ -1158,10 +1321,16 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
 	}
 
 	err = isp_firmware_boot(isp);
+	if (!err && restart) {
+		err = isp_check_restarted(isp);
+		if (err)
+			isp_firmware_shutdown(isp);
+	}
 	if (err) {
 		dev_err(isp->dev, "failed to boot firmware: %d\n", err);
 		pm_runtime_put_sync(isp->dev);
-		if (isp->hw->resident_fw)
+		/* Firmware that starts again can be tried again at the next open. */
+		if (isp->hw->resident_fw && !isp->hw->fw_restart)
 			isp->fw_state = ISP_FW_DEAD;
 		return err;
 	}
@@ -1202,6 +1371,16 @@ void apple_isp_firmware_shutdown(struct apple_isp *isp)
 	WRITE_ONCE(isp->ipc_quiescing, false);
 	enable_irq(isp->irq);
 
+	/*
+	 * Firmware that starts again goes down after the stream, at once or, with
+	 * hw->fw_idle_ms, once it has idled that long, as macOS's camera service
+	 * powers it off. A system sleep finds it off either way: idle firmware is
+	 * stopped before the sleep begins (apple_isp_pm_notify()). The DRAM-kept
+	 * wake runs the ISP itself and needs it left that way.
+	 */
+	if (isp->hw->fw_restart && !isp->hw->fw_idle_ms)
+		apple_isp_firmware_halt(isp);
+
 	/* Not on isp->wq: the stop flushes that. */
 	if (isp->hw->fw_idle_ms && isp->fw_state == ISP_FW_RUNNING) {
 		isp->fw_idle = true;
@@ -1239,7 +1418,7 @@ void apple_isp_firmware_flush(struct apple_isp *isp)
 	mutex_unlock(&isp->video_lock);
 }
 
-/* Stop the firmware; resident firmware cannot be started again. */
+/* Stop the firmware; resident firmware without hw->fw_restart stays down. */
 void apple_isp_firmware_halt(struct apple_isp *isp)
 {
 	/* Only a capture services the watchdog, but be sure. */
@@ -1252,5 +1431,6 @@ void apple_isp_firmware_halt(struct apple_isp *isp)
 	pm_runtime_put_sync(isp->dev);
 	isp->ipc_stale = NULL;
 	isp->fw_idle = false;
-	isp->fw_state = isp->hw->resident_fw ? ISP_FW_DEAD : ISP_FW_OFF;
+	isp->fw_state = isp->hw->resident_fw && !isp->hw->fw_restart ?
+				ISP_FW_DEAD : ISP_FW_OFF;
 }
