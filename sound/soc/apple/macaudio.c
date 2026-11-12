@@ -4174,13 +4174,34 @@ struct macaudio_platform_cfg macaudio_j616_cfg = {
 };
 
 /*
- * J614s: the same amps and frame as the J616s, but its speakers have not
- * been brought up and have no protection profile. Keep them off entirely
- * until they get their own bring-up: the speaker link is not bound, so no
- * stream ever reaches the amps. The J604 (T8132, MacBook Pro 14" M4) has
- * the same amps, frame and chassis, and is in the same state.
+ * J614s: the same amps and frame as the J616s. Its speakers are bound like
+ * the J616s's; playback still waits for a protection lease (see
+ * macaudio_spk_admitted()), which speakerguardd v2 takes only once it has
+ * compiled and self-checked this Mac's own tuning (AID34). The legacy
+ * protection has no J614 profile, so without v2 the amps stay at the floor.
  */
 struct macaudio_platform_cfg macaudio_j614_cfg = {
+	.enable_speakers = true,
+	.amp = AMP_SN012776,
+	.speakers = SPKR_2W1T,
+	.stereo = true,
+	.safe_vol = -20,
+	.fe_dai_names = { "j616-pcm-0", "j616-pcm-1", "j616-pcm-2" },
+	.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC |
+		   SND_SOC_DAIFMT_GATED | SND_SOC_DAIFMT_NB_IF,
+	.secondary_bclk_ratio = 250,
+	.fe_cpu_is_platform = true,
+	.route_only_fes = BIT(0),
+	/* Granted, the tweeters restore their DT corner, as on the J616s */
+	.tweeter_hpf_granted = true,
+};
+
+/*
+ * J604 (T8132, MacBook Pro 14" M4): the J614s's amps, frame and chassis,
+ * but its speakers have not been brought up. Keep them off entirely: the
+ * speaker link is not bound, so no stream ever reaches the amps.
+ */
+struct macaudio_platform_cfg macaudio_j604_cfg = {
 	.enable_speakers = false,
 	.amp = AMP_SN012776,
 	.speakers = SPKR_2W1T,
@@ -4336,7 +4357,7 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	/* j613    AID20   sn012776    15      2x 1W+1T Compat: apple,j413-macaudio */
 	/* j615    AID21   sn012776    15      2x 2W+1T Compat: apple,j415-macaudio */
 	/* j604    -       sn012776    15      2x 2W+1T (AOP-fed; speakers off until bring-up) */
-	{ .compatible = "apple,j604-macaudio", .data = &macaudio_j614_cfg },
+	{ .compatible = "apple,j604-macaudio", .data = &macaudio_j604_cfg },
 	/* j604    -       cs42l84     -       the jack, a card of its own (AOP-fed) */
 	{ .compatible = "apple,j604-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* j614    AID34   sn012776    15      2x 2W+1T (AOP-fed; speakers off until bring-up) */

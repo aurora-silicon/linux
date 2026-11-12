@@ -38,38 +38,15 @@
 };
 
 /*
- * The speakers wait for their own bring-up and a J614 protection profile.
- * Until then the speaker card and the six amps stay disabled, so nothing
- * can drive them; the headphone jack card is unaffected.
+ * The speakers, as on the J616s: the same six amps, slots and frame (the
+ * boot loader copies each amp's ADT speaker-config row). Playback waits for
+ * a protection lease, which speakerguardd v2 takes only after compiling and
+ * self-checking this Mac's own tuning; the legacy protection has no J614
+ * profile, so without v2 the amps stay at the kernel's floor.
  */
 &sound {
 	compatible = "apple,j614-macaudio", "apple,macaudio";
 	model = "MacBook Pro J614";
-	status = "disabled";
-};
-
-&speaker_left_woof1 {
-	status = "disabled";
-};
-
-&speaker_left_woof2 {
-	status = "disabled";
-};
-
-&speaker_left_tweet {
-	status = "disabled";
-};
-
-&speaker_right_woof1 {
-	status = "disabled";
-};
-
-&speaker_right_woof2 {
-	status = "disabled";
-};
-
-&speaker_right_tweet {
-	status = "disabled";
 };
 
 &sound_jack {
