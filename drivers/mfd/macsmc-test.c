@@ -241,8 +241,11 @@ static void macsmc_sleep_order(struct kunit *test, bool wktp)
 	KUNIT_EXPECT_FALSE(test, ctx->smc.ap_notified);
 	KUNIT_EXPECT_FALSE(test, ctx->smc.sleep_warned);
 
-	/* As on the platform, values included: WKTP's 2 comes before 'slpa', its 0 ends the wake. */
-	KUNIT_ASSERT_EQ(test, ctx->seen_count, wktp ? 9U : 7U);
+	/*
+	 * Values included: WKTP's 2 comes before 'slpa', its 0 ends the wake.
+	 * The lid is read at every wake, for the display.
+	 */
+	KUNIT_ASSERT_EQ(test, ctx->seen_count, wktp ? 10U : 8U);
 	KUNIT_EXPECT_EQ(test, ctx->seen[n++], SMC_KEY(slpw));
 	if (wktp)
 		KUNIT_EXPECT_EQ(test, ctx->seen[n++], 2U);
@@ -252,6 +255,7 @@ static void macsmc_sleep_order(struct kunit *test, bool wktp)
 	KUNIT_EXPECT_EQ(test, ctx->seen[n++], SMC_KEY(MBSE));
 	KUNIT_EXPECT_EQ(test, ctx->seen[n++], SMC_KEY(MBSW));
 	KUNIT_EXPECT_EQ(test, ctx->seen[n++], SMC_KEY(waka));
+	KUNIT_EXPECT_EQ(test, ctx->seen[n++], SMC_KEY(MSLD));
 	if (wktp)
 		KUNIT_EXPECT_EQ(test, ctx->seen[n++], 0U);
 	KUNIT_EXPECT_FALSE(test, ctx->smc.wake_silent);
