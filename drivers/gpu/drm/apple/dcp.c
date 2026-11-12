@@ -69,6 +69,7 @@
 #include "dcp-syslog.h"
 #include "dcpext_scanout.h"
 #include "dcp-internal.h"
+#include "dcp-lifecycle.h"
 #include "dcp-external-bw.h"
 #include "dptx-service.h"
 #include "iomfb.h"
@@ -9052,6 +9053,15 @@ bool dcp_s2r_firmware_stopped(struct platform_device *pdev)
 #define DCP_T6041_PS_FE		0x368
 #define DCP_T6041_PS_CPU	0x10000
 
+/* The fields of a PMGR power-state word (with DCP_PS_MIN above). */
+#define DCP_PS_AUTO_ENABLE	BIT(28)
+#define DCP_PS_AUTO		GENMASK(27, 24)
+#define DCP_PS_BUSY		BIT(11)
+#define DCP_PS_FLAGS		GENMASK(9, 8)	/* was clock gated, was power gated */
+#define DCP_PS_ACTUAL		GENMASK(7, 4)
+#define DCP_PS_TARGET		GENMASK(3, 0)
+#define DCP_PS_ACTIVE		0xf
+
 /*
  * The two external DCPs share the DISPEXT power-state words in the west SOC-PS
  * block (the "ps" window aura publishes, base 0x502800000), each at its own
@@ -9133,6 +9143,27 @@ static int dcp_t6041_display_power(struct apple_dcp *dcp, void __iomem **ps,
 	return 0;
 }
 
+/*
+ * T6040: the fabric rejects a write to a display coprocessor's CPU power word while
+ * bit 4 ("clock protection") of its DART's GAPF slice is set (T8140's
+ * apple_dart_gapf_ready, b769c9543b56). It is to be cleared when the CPU stops, before
+ * the domain goes off; nothing clears it here. Slices from the live ADT:
+ * dart-dcp 17, dart-dcpext0 29, dart-dcpext1 48 at GAPF 0x500578000 + 0x100 + 0x40 * n.
+ */
+#define DCP_T6041_GAPF_BASE		0x500578000ULL
+#define DCP_T6041_GAPF_SIZE		0x4000
+#define DCP_T6041_GAPF_NR_SLICES	GENMASK(8, 0)	/* of the bank's first word */
+#define DCP_T6041_GAPF_CFG		0x20
+#define DCP_T6041_GAPF_LOCK		0x24
+#define DCP_T6041_GAPF_SLICE(n)		(0x100 + 0x40 * (n))
+#define DCP_T6041_GAPF_RSVD		3	/* /chosen dart-clock-gapf-rsvd-slices */
+#define DCP_T6041_GAPF_DCP	(DCP_T6041_GAPF_BASE + DCP_T6041_GAPF_SLICE(17))
+#define DCP_T6041_GAPF_DCPEXT0	(DCP_T6041_GAPF_BASE + DCP_T6041_GAPF_SLICE(29))
+#define DCP_T6041_GAPF_DCPEXT1	(DCP_T6041_GAPF_BASE + DCP_T6041_GAPF_SLICE(48))
+#define DCP_T6041_GAPF_PROTECT		BIT(4)
+/* A protected slice has bits 1 and 4 set. */
+#define DCP_T6041_GAPF_PROTECTED	(BIT(1) | DCP_T6041_GAPF_PROTECT)
+
 static void dcp_t6041_gapf_release_all(struct apple_dcp *dcp);
 
 /*
@@ -9155,14 +9186,14 @@ static int dcp_t6041_s2r_domains_on(struct apple_dcp *dcp)
 	if (ret)
 		return ret;
 
-	val = readl(ps + o.sys) & ~(GENMASK(9, 8) | GENMASK(3, 0) | BIT(28));
-	writel(val | 0xf, ps + o.sys);
-	if (readl_poll_timeout_atomic(ps + o.sys, val, (val & GENMASK(7, 4)) == GENMASK(7, 4),
+	val = readl(ps + o.sys) & ~(DCP_PS_FLAGS | DCP_PS_TARGET | DCP_PS_AUTO_ENABLE);
+	writel(val | DCP_PS_ACTIVE, ps + o.sys);
+	if (readl_poll_timeout_atomic(ps + o.sys, val, (val & DCP_PS_ACTUAL) == DCP_PS_ACTUAL,
 				      1, 10000))
 		dev_warn(dcp->dev, "S2R resume: SYS power word stuck at %#x\n", val);
-	val = readl(ps + o.fe) & ~(GENMASK(9, 8) | GENMASK(3, 0) | BIT(28));
-	writel(val | 0xf, ps + o.fe);
-	if (readl_poll_timeout_atomic(ps + o.fe, val, (val & GENMASK(7, 4)) == GENMASK(7, 4),
+	val = readl(ps + o.fe) & ~(DCP_PS_FLAGS | DCP_PS_TARGET | DCP_PS_AUTO_ENABLE);
+	writel(val | DCP_PS_ACTIVE, ps + o.fe);
+	if (readl_poll_timeout_atomic(ps + o.fe, val, (val & DCP_PS_ACTUAL) == DCP_PS_ACTUAL,
 				      1, 10000))
 		dev_warn(dcp->dev, "S2R resume: FE power word stuck at %#x\n", val);
 	/*
@@ -9170,20 +9201,22 @@ static int dcp_t6041_s2r_domains_on(struct apple_dcp *dcp)
 	 * did, then the word to manual target 0xf, ACTUAL and bit 11 polled.
 	 */
 	ret = 0;
-	if (!(readl(ps + o.cpu) & 0xf0)) {
-		void __iomem *g = ioremap_np(0x500578540ULL, 4);
+	if (!(readl(ps + o.cpu) & DCP_PS_ACTUAL)) {
+		void __iomem *g = ioremap_np(DCP_T6041_GAPF_DCP, 4);
 		u32 v, cur;
 
 		if (g) {
-			writel(readl(g) & ~BIT(4), g);
+			writel(readl(g) & ~DCP_T6041_GAPF_PROTECT, g);
 			iounmap(g);
 		}
 		dcp_t6041_gapf_release_all(dcp);
 		v = readl(ps + o.cpu);
-		writel((v & ~(0x30fU | BIT(28))) | 0xf, ps + o.cpu);
+		writel((v & ~(DCP_PS_FLAGS | DCP_PS_TARGET | DCP_PS_AUTO_ENABLE)) | DCP_PS_ACTIVE,
+		       ps + o.cpu);
 		mb();
-		if (readl_poll_timeout_atomic(ps + o.cpu, cur, (cur & 0xf0) == 0xf0, 1, 8000) ||
-		    readl_poll_timeout_atomic(ps + o.cpu, cur, !(cur & BIT(11)), 1, 8000))
+		if (readl_poll_timeout_atomic(ps + o.cpu, cur,
+					      (cur & DCP_PS_ACTUAL) == DCP_PS_ACTUAL, 1, 8000) ||
+		    readl_poll_timeout_atomic(ps + o.cpu, cur, !(cur & DCP_PS_BUSY), 1, 8000))
 			ret = -ETIMEDOUT;
 		dev_info(dcp->dev, "S2R resume: CPU power word %#x -> %#x%s\n", v,
 			 readl(ps + o.cpu), ret ? " (timeout)" : "");
@@ -9201,10 +9234,10 @@ static int dcp_t6041_s2r_domains_on(struct apple_dcp *dcp)
 			void __iomem *cw = ps + o.cpu + 8 * (i + 1);
 			u32 want = dcp->s2r_child_saved[i];
 
-			if (!(want & 0xf) || (readl(cw) & 0xf0))
+			if (!(want & DCP_PS_TARGET) || (readl(cw) & DCP_PS_ACTUAL))
 				continue;
 			writel(want, cw);
-			if (readl_poll_timeout_atomic(cw, cur, cur & 0xf0, 1, 2000))
+			if (readl_poll_timeout_atomic(cw, cur, cur & DCP_PS_ACTUAL, 1, 2000))
 				to |= BIT(i);
 		}
 		dcp->s2r_child_valid = false;
@@ -9219,21 +9252,6 @@ static int dcp_t6041_s2r_domains_on(struct apple_dcp *dcp)
 }
 
 /*
- * T6040: the fabric rejects a write to a display coprocessor's CPU power word while
- * bit 4 ("clock protection") of its DART's GAPF slice is set (T8140's
- * apple_dart_gapf_ready, b769c9543b56). It is to be cleared when the CPU stops, before
- * the domain goes off; nothing clears it here. Slices from the live ADT:
- * dart-dcp 17, dart-dcpext0 29, dart-dcpext1 48 at GAPF 0x500578000 + 0x100 + 0x40 * n.
- */
-#define DCP_T6041_GAPF_DCP	0x500578540ULL
-#define DCP_T6041_GAPF_DCPEXT0	0x500578840ULL
-#define DCP_T6041_GAPF_DCPEXT1	0x500578d00ULL
-#define DCP_T6041_GAPF_PROTECT	BIT(4)
-#define DCP_T6041_GAPF_BASE	0x500578000ULL
-#define DCP_T6041_GAPF_SIZE	0x4000
-#define DCP_T6041_GAPF_RSVD	3	/* /chosen dart-clock-gapf-rsvd-slices */
-
-/*
  * With only the DCP DART's own slice released (0x12 -> 0x02) the CPU word still
  * faulted: every protected slice (bits 1 and 4 set) in the bank, past the reserved
  * ones, is released.
@@ -9245,18 +9263,19 @@ static void dcp_t6041_gapf_release_all(struct apple_dcp *dcp)
 
 	if (!b)
 		return;
-	n = readl(b) & 0x1ff;
-	if (readl(b + 0x20) != 1 || readl(b + 0x24)) {
+	n = readl(b) & DCP_T6041_GAPF_NR_SLICES;
+	if (readl(b + DCP_T6041_GAPF_CFG) != 1 || readl(b + DCP_T6041_GAPF_LOCK)) {
 		dev_warn(dcp->dev, "S2R: GAPF cfg %#x lock %#x, not touched\n",
-			 readl(b + 0x20), readl(b + 0x24));
+			 readl(b + DCP_T6041_GAPF_CFG), readl(b + DCP_T6041_GAPF_LOCK));
 		iounmap(b);
 		return;
 	}
-	for (i = DCP_T6041_GAPF_RSVD; i < n && 0x100 + 0x40 * (i + 1) <= DCP_T6041_GAPF_SIZE; i++) {
-		v = readl(b + 0x100 + 0x40 * i);
-		if ((v & 0x12) != 0x12)
+	for (i = DCP_T6041_GAPF_RSVD;
+	     i < n && DCP_T6041_GAPF_SLICE(i + 1) <= DCP_T6041_GAPF_SIZE; i++) {
+		v = readl(b + DCP_T6041_GAPF_SLICE(i));
+		if ((v & DCP_T6041_GAPF_PROTECTED) != DCP_T6041_GAPF_PROTECTED)
 			continue;
-		writel(v & ~DCP_T6041_GAPF_PROTECT, b + 0x100 + 0x40 * i);
+		writel(v & ~DCP_T6041_GAPF_PROTECT, b + DCP_T6041_GAPF_SLICE(i));
 		rel++;
 	}
 	dev_info(dcp->dev, "S2R: GAPF clock protection cleared on %u of %u slices\n", rel, n);
@@ -9337,13 +9356,13 @@ static void dcp_t6041_s2r_cpu_off(struct apple_dcp *dcp)
 	 * 0x1f0003ff -> 0x0f0000ff, ACTUAL polled to 15, -> 0x0f0003f0); the boot chain
 	 * leaves bits 27:24 = 0 here (0x1000030f). Both writes carry the bits 27:24.
 	 */
-	writel((v & 0x000f0000) | 0x0f0000ff, w);
+	writel((v & DCP_PS_MIN) | DCP_PS_AUTO | DCP_PS_ACTUAL | DCP_PS_TARGET, w);
 	mb();	/* the write lands before the word is polled */
-	ret |= readl_poll_timeout_atomic(w, cur, (cur & 0xf0) == 0xf0, 1, 8000);
-	writel((readl(w) & 0xfffffcf0) | 0x300, w);
+	ret |= readl_poll_timeout_atomic(w, cur, (cur & DCP_PS_ACTUAL) == DCP_PS_ACTUAL, 1, 8000);
+	writel((readl(w) & ~(DCP_PS_FLAGS | DCP_PS_TARGET)) | DCP_PS_FLAGS, w);
 	mb();	/* as above */
-	ret |= readl_poll_timeout_atomic(w, cur, !(cur & BIT(11)), 1, 8000);
-	ret |= readl_poll_timeout_atomic(w, cur, !(cur & 0xf0), 1, 8000);
+	ret |= readl_poll_timeout_atomic(w, cur, !(cur & DCP_PS_BUSY), 1, 8000);
+	ret |= readl_poll_timeout_atomic(w, cur, !(cur & DCP_PS_ACTUAL), 1, 8000);
 	after = readl(w);
 	dev_info(dcp->dev, "S2R: CPU power word +%#x %#x -> %#x%s\n", o.cpu, v, after,
 		 ret ? " (timeout)" : "");
@@ -9418,7 +9437,8 @@ static int dcp_t6041_s2r_stop(struct apple_dcp *dcp)
 	    (READ_ONCE(dcp->ext_dead) || READ_ONCE(dcp->crashed))) {
 		apple_rtkit_mailbox_off(dcp->rtk);
 		writel(readl(control) & ~APPLE_DCP_COPROC_CPU_CONTROL_RUN, control);
-		writel(readl(control) & ~(APPLE_DCP_COPROC_CPU_CONTROL_RUN | BIT(5)), control);
+		writel(readl(control) & ~(APPLE_DCP_COPROC_CPU_CONTROL_RUN |
+					  APPLE_DCP_COPROC_CPU_CONTROL_STOP_SECOND_CLEAR), control);
 		dcp_t6041_s2r_cpu_off(dcp);
 		dcp->t6041_s2r_stopped = true;
 		dev_info(dcp->dev, "dead external firmware: CPU off for the sleep\n");
@@ -9472,7 +9492,8 @@ static int dcp_t6041_s2r_stop(struct apple_dcp *dcp)
 		dev_warn(dcp->dev, "CPU not idle (%#x), stopping it anyway\n", status);
 	/* The run bit off, then bit 5, then the CPU's power word down. */
 	writel(readl(control) & ~APPLE_DCP_COPROC_CPU_CONTROL_RUN, control);
-	writel(readl(control) & ~(APPLE_DCP_COPROC_CPU_CONTROL_RUN | BIT(5)), control);
+	writel(readl(control) & ~(APPLE_DCP_COPROC_CPU_CONTROL_RUN |
+				  APPLE_DCP_COPROC_CPU_CONTROL_STOP_SECOND_CLEAR), control);
 	/* Read now: once its CPU word is down, the ASC page faults. */
 	status = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS);
 	dcp_t6041_s2r_cpu_off(dcp);
