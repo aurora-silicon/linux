@@ -630,7 +630,6 @@ static int apple_pmgr_ps_resume_noirq(struct device *dev)
 	return 0;
 }
 
-#ifdef CONFIG_HIBERNATION
 /*
  * After a resume from disk genpd still records the domains as they were when
  * the image was taken, but the cold boot behind the resume left the hardware
@@ -670,7 +669,6 @@ static int apple_pmgr_ps_restore_noirq(struct device *dev)
 		apple_pmgr_ps_restore_hw(ps, 0);
 	return 0;
 }
-#endif
 
 static int apple_pmgr_reset_assert(struct reset_controller_dev *rcdev, unsigned long id)
 {
@@ -1334,11 +1332,7 @@ static const struct dev_pm_ops apple_pmgr_ps_pm_ops = {
 	/* Suspend-to-RAM resyncs after the sleep engine; a resume from disk after the cold boot. */
 	.resume_noirq = pm_sleep_ptr(apple_pmgr_ps_resume_noirq),
 	.thaw_noirq = pm_sleep_ptr(apple_pmgr_ps_resume_noirq),
-#ifdef CONFIG_HIBERNATION
-	.restore_noirq = apple_pmgr_ps_restore_noirq,
-#else
-	.restore_noirq = pm_sleep_ptr(apple_pmgr_ps_resume_noirq),
-#endif
+	.restore_noirq = pm_sleep_ptr(apple_pmgr_ps_restore_noirq),
 };
 
 static struct platform_driver apple_pmgr_ps_driver = {
