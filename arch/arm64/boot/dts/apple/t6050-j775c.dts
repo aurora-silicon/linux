@@ -1094,3 +1094,6 @@
 #include "t6050-j775c-incremental-pcie.dtsi"
 
 #include "t6050-j775c-incremental-display.dtsi"
+
+/* J775c has no internal panel: retain the booted desktop handoff selection. */
+/delete-node/ &{/soc/dcp@48ae00000};
