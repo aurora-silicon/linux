@@ -141,6 +141,14 @@ static struct apple_mbox_hw hw;
 static struct apple_mbox mbox;
 static int apple_sleep_coprocs_lock;
 static void *apple_sleep;
+struct apple_sleep_ctl { bool (*commit_stops)(void); int (*enclave_admit)(void); };
+static bool apple_sleep_reg_commit_stops(void);
+static int apple_sleep_reg_enclave_admit(void);
+/* The T8140 controller's answers, bound to the registry as its probe binds them. */
+static const struct apple_sleep_ctl apple_sleep_reg_ctl = {
+    apple_sleep_reg_commit_stops, apple_sleep_reg_enclave_admit,
+};
+static const struct apple_sleep_ctl *apple_sleep_ctl = &apple_sleep_reg_ctl;
 static struct {
     struct device *dev; int (*stop)(void *); void *data;
 } apple_sleep_enclave;
@@ -665,19 +673,21 @@ def sources(source, contracts, mutation):
     shim = (source / 'drivers/soc/apple/pm_shim.c').read_text()
     mailbox = (source / 'drivers/soc/apple/mailbox.c').read_text()
     sleep = (source / 'drivers/soc/apple/sleep.c').read_text()
+    registry = (source / 'drivers/soc/apple/sleep-registry.c').read_text()
     iopoll = (contracts / 'include/linux/iopoll.h').read_text()
     names = {
         'shim': ['sep_pm_wait_gated', 'sep_pm_clear_dev_disable', 'sep_pm_dart_restore',
                  'sep_pm_commit_rx', 'sep_pm_commit_take_rx', 'sep_pm_commit_stop',
                  'sep_pm_commit_prepare', 'sep_pm_commit_finish', 'sep_pm_suspend_noirq'],
         'mailbox': ['apple_mbox_poll_one_supported', 'apple_mbox_poll_one'],
-        'sleep': ['apple_sleep_commit_stops_coprocs', 'apple_sleep_enclave_register',
-                  'apple_sleep_enclave_unregister'],
+        'sleep': ['apple_sleep_reg_commit_stops', 'apple_sleep_reg_enclave_admit'],
+        'registry': ['apple_sleep_commit_stops_coprocs', 'apple_sleep_enclave_register',
+                     'apple_sleep_enclave_unregister'],
         'pm': ['leave_for_commit', 'commit_finish', 'clear_dev_disable', 'dart_restore'],
         'sep': ['sleep_enter', 'sleep_leave_for_commit', 'sleep_hold_rx', 'sleep_release_rx',
                 'sleep_exit', 'sleep_kick'],
     }
-    texts = dict(shim=shim, mailbox=mailbox, sleep=sleep, pm=pm, sep=sep)
+    texts = dict(shim=shim, mailbox=mailbox, sleep=sleep, registry=registry, pm=pm, sep=sep)
     bodies = {n: function(texts[k], n) for k, group in names.items() for n in group}
     if mutation:
         name, before, after = MUTATIONS[mutation]
@@ -691,7 +701,7 @@ def sources(source, contracts, mutation):
     c += '\n' + shim[start:shim.index('} sep_pm_commit;', start) + len('} sep_pm_commit;')]
     # Use the actual provider helper, with only removal/capability dependency state
     # injected by send for the post-send negative-poll scenarios.
-    c += '\n' + '\n'.join(bodies[n] for group in ['mailbox', 'sleep', 'shim'] for n in names[group])
+    c += '\n' + '\n'.join(bodies[n] for group in ['mailbox', 'sleep', 'registry', 'shim'] for n in names[group])
     c += '\n' + C_CONTROLS
     gate_start = pm.index('#[derive(Clone, Copy, Debug, PartialEq, Eq)]')
     gate_end = pm.index('/// Stages `request`', gate_start)
