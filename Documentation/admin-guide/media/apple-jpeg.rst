@@ -16,10 +16,21 @@ The device compatible selects immutable register-layout and identity data:
 Compatible           Layout     Masked HWREV
 ===================  =========  ========================
 apple,t6000-jpeg      legacy32   0x0d0013
+apple,t6030-jpeg      wide64     0x0f0008
+apple,t6031-jpeg      wide64     0x0f0008
+apple,t6032-jpeg      wide64     0x0f0008
 apple,t6041-jpeg      wide64     0x100008
 apple,t8112-jpeg      wide64     0x0e0008
+apple,t8122-jpeg      wide64     0x0f0008
+apple,t8132-jpeg      wide64     0x100008
 apple,t8140-jpeg      wide64     0x110000
 ===================  =========  ========================
+
+On the wide64 engines the HWREV readback equals the hardware description's
+``hw-type`` with the stepping nibble masked (read back on T8112 and T6041), so
+the T8122 and T8132 rows use their ``hw-type``. T8132 has the T6041
+identity and shares its data. The T8103 engines report the legacy selector
+0x0a0103 there, which is not a HWREV, so T8103 has no row yet.
 
 Identification powers the domain, writes MODE=0x147 and reads the selected
 layout's HWREV register. The mask is 0xffff0fff: bits 12 through 15 are ignored.
@@ -37,9 +48,11 @@ interrupt status bit 31.
 Each engine has a 16 KiB MMIO resource and a separate adjacent DART at SID 0.
 The engine's resource must not include the DART window. Both T8112 engines
 and their DARTs are enabled in ``t8112.dtsi`` (qualified on the J413), and
-both T6000 engines in ``t6000.dtsi`` (qualified on the J316s). T6001 and T6002
-stay disabled. Enabling nodes on another SoC requires qualifying both of its
-instances.
+both T6000 engines in ``t6000.dtsi`` (qualified on the J316s). The T6001 and
+T6002 engines use the qualified T6000 data and are enabled with them. The
+T8122/T6030/T6031/T6032 and T8132 engines are enabled but
+not yet qualified on hardware; a wrong identity is refused at probe, so an
+unexpected revision leaves the engine unused rather than misprogrammed.
 
 KUnit
 -----

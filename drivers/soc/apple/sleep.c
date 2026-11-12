@@ -1984,6 +1984,21 @@ void apple_sleep_lid_closed_wake(void)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_lid_closed_wake);
 
+/* Read in the SMC's noirq resume. Forgotten as each sleep begins. */
+static int sleep_lid_closed = -ENODATA;
+
+void apple_sleep_lid_at_wake(bool closed)
+{
+	WRITE_ONCE(sleep_lid_closed, closed);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_lid_at_wake);
+
+int apple_sleep_lid_closed_at_wake(void)
+{
+	return READ_ONCE(sleep_lid_closed);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_lid_closed_at_wake);
+
 /*
  * The SMC woke the AP for the port alone, and this sleep cut the debug link: the cut's own
  * events. Sleep again. The link stays down until tipd rearms it at a full wake, so the next
@@ -2928,6 +2943,7 @@ static int apple_sleep_begin(suspend_state_t state)
 {
 	/* The last sleep's cut is its port controller's to take, by its .complete. */
 	WRITE_ONCE(sleep_debug_link_cut, false);
+	WRITE_ONCE(sleep_lid_closed, -ENODATA);
 	/* The PM core also calls .begin for s2idle when no s2idle ops are installed. */
 	if (state != PM_SUSPEND_MEM)
 		return 0;

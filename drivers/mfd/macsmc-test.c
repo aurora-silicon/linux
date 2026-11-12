@@ -337,11 +337,14 @@ static void macsmc_lid_wake_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ctx->seen[3], SMC_KEY(waka));
 	KUNIT_EXPECT_EQ(test, ctx->seen[4], SMC_KEY(MSLD));
 
-	/* The lid with anything else is a normal wake: the lid isn't read. */
+	/* The lid with anything else is a normal wake: the lid is still read, for the display. */
 	ctx->seen_count = 0;
 	ctx->record = BIT_ULL(10) | BIT_ULL(0);
 	apple_smc_sleep_wake(&ctx->smc);
-	KUNIT_EXPECT_EQ(test, ctx->seen_count, 4U);
+	KUNIT_ASSERT_EQ(test, ctx->seen_count, 5U);
+	KUNIT_EXPECT_EQ(test, ctx->seen[4], SMC_KEY(MSLD));
+	if (IS_ENABLED(CONFIG_APPLE_SOC_SLEEP))
+		KUNIT_EXPECT_EQ(test, apple_sleep_lid_closed_at_wake(), 1);
 }
 
 static void macsmc_wake_reason_test(struct kunit *test)

@@ -377,6 +377,14 @@ const struct apple_jpeg_variant apple_jpeg_t8112 = {
 };
 EXPORT_SYMBOL_IF_KUNIT(apple_jpeg_t8112);
 
+const struct apple_jpeg_variant apple_jpeg_t8122 = {
+	.layout = &aj_wide64,
+	.hwrev_mask = AJ_HWREV_MASK,
+	.hwrev = AJ_HWREV_T8122,
+	.int_done_mask = BIT(31) | BIT(30),
+};
+EXPORT_SYMBOL_IF_KUNIT(apple_jpeg_t8122);
+
 const struct apple_jpeg_variant apple_jpeg_t8140 = {
 	.layout = &aj_wide64,
 	.hwrev_mask = AJ_HWREV_MASK,

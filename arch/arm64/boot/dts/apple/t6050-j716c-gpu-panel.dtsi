@@ -1,0 +1,400 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J716c GPU and internal panel. The loader validates the running hardware,
+ * fills the memory reservations and operating points, then enables the
+ * dependent devices. A source DT alone must not start either coprocessor.
+ */
+
+/* Replace the disabled inventory with the GPU driver's resource layout. */
+/delete-node/ &sgx;
+/delete-node/ &gfx_asc;
+/delete-node/ &gfx1_asc;
+
+/ {
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		uat_ttbs: uat-ttbs {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		uat_pagetables: uat-pagetables {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		uat_handoff: uat-handoff {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		uat_l2_pagetables: uat-l2-pagetables {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		gpu_fw_text: gpu-fw-text {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		gpu_fw_data: gpu-fw-data {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+	};
+
+	/* Four clusters on one die: four main voltage lanes and one CS/AFR lane. */
+	gpu_opp: opp-table-gpu {
+		compatible = "operating-points-v2";
+
+		opp00 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0 0 0>;
+			opp-microvolt-sram = <0 0 0 0>;
+		};
+
+		opp01 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0 0 0>;
+			opp-microvolt-sram = <0 0 0 0>;
+		};
+
+		opp02 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0 0 0>;
+			opp-microvolt-sram = <0 0 0 0>;
+		};
+
+		opp03 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0 0 0>;
+			opp-microvolt-sram = <0 0 0 0>;
+		};
+
+		opp04 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0 0 0>;
+			opp-microvolt-sram = <0 0 0 0>;
+		};
+
+		opp05 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0 0 0>;
+			opp-microvolt-sram = <0 0 0 0>;
+		};
+
+		opp06 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0 0 0>;
+			opp-microvolt-sram = <0 0 0 0>;
+		};
+
+		opp07 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0 0 0>;
+			opp-microvolt-sram = <0 0 0 0>;
+		};
+
+		opp08 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0 0 0>;
+			opp-microvolt-sram = <0 0 0 0>;
+		};
+
+		opp09 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0 0 0>;
+			opp-microvolt-sram = <0 0 0 0>;
+		};
+
+		opp10 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0 0 0>;
+			opp-microvolt-sram = <0 0 0 0>;
+		};
+
+		opp11 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0 0 0>;
+			opp-microvolt-sram = <0 0 0 0>;
+		};
+
+		opp12 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0 0 0>;
+			opp-microvolt-sram = <0 0 0 0>;
+		};
+
+		opp13 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0 0 0>;
+			opp-microvolt-sram = <0 0 0 0>;
+		};
+	};
+
+	gpu_afr_opp: opp-table-gpu-afr {
+		compatible = "operating-points-v2";
+
+		opp00 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp01 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp02 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp03 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp04 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp05 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp06 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp07 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp08 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp09 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp10 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp11 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp12 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp13 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+	};
+
+	gpu_cs_opp: opp-table-gpu-cs {
+		compatible = "operating-points-v2";
+
+		opp00 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp01 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp02 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp03 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp04 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp05 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp06 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp07 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp08 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp09 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp10 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp11 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp12 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+
+		opp13 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+	};
+
+	soc@2300000000 {
+
+		gpu: gpu@2302600000 {
+			compatible = "apple,agx-g17c", "apple,agx-g17s";
+			reg = <0x23 0x02600000 0x0 0x88000>,
+			      <0x23 0x00000000 0x0 0x4000000>;
+			reg-names = "asc", "sgx";
+			mboxes = <&gfx_mbox>, <&gfx1_mbox>;
+			power-domains = <&ps_gfx>;
+			/* Raises the DRAM and fabric floors while GPU work is in flight */
+			apple,clpc = <&clpc>;
+			memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>,
+					<&gpu_fw_data>, <&uat_l2_pagetables>, <&gpu_fw_text>;
+			memory-region-names = "ttbs", "pagetables", "handoff", "fw-data",
+					      "l2-pagetables", "fw-text";
+			operating-points-v2 = <&gpu_opp>;
+			apple,afr-opp = <&gpu_afr_opp>;
+			apple,cs-opp = <&gpu_cs_opp>;
+			apple,csafr-min-sram-microvolt = <0>;
+			/* Three power telemetry records, each an identifier and two words. */
+			apple,aon-ptd = <0 0 0  0 0 0  0 0 0>;
+			status = "disabled";
+		};
+
+		gfx_mbox: mailbox@2302600000 {
+			compatible = "apple,t6050-j775d-ascwrap-v6";
+			reg = <0x23 0x02600000 0x0 0x88000>,
+			      <0x23 0x02050000 0x0 0x8>;
+			reg-names = "wrapper", "iop-vbar";
+			interrupts = <AIC_IRQ 0 2797 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 0 2800 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "recv-not-empty";
+			apple,firmware-role = "GFX";
+			power-domains = <&ps_gfx>;
+			#mbox-cells = <0>;
+			status = "disabled";
+		};
+
+		gfx1_mbox: mailbox@2302e00000 {
+			compatible = "apple,t6050-j775d-ascwrap-v6";
+			reg = <0x23 0x02e00000 0x0 0x88000>,
+			      <0x23 0x02850000 0x0 0x8>;
+			reg-names = "wrapper", "iop-vbar";
+			interrupts = <AIC_IRQ 0 2801 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 0 2804 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "recv-not-empty";
+			apple,firmware-role = "GFX1";
+			power-domains = <&ps_gfx>;
+			#mbox-cells = <0>;
+			status = "disabled";
+		};
+	};
+
+	/* The loader verifies these clock identifiers and fills their rates. */
+	dcp_fw_clk361: clock-dcp-firmware-361 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <810000000>;
+		clock-output-names = "dcp_firmware_361";
+	};
+
+	dcp_fw_clk458: clock-dcp-firmware-458 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <521064992>;
+		clock-output-names = "dcp_firmware_458";
+	};
+
+	display: display-subsystem {
+		compatible = "apple,display-subsystem";
+		iommus = <&disp0_dart 0>;
+		status = "disabled";
+	};
+};
+
+/* The power states stay disabled until the loader accepts the GPU handoff. */
+&pmgr_gpx {
+	status = "okay";
+};
+
+&ps_gpx {
+	apple,always-on;
+};
+
+&ps_afr {
+	apple,always-on;
+};
+
+&dcp_dart {
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
+};
+
+&disp0_dart {
+	reg = <0x4 0x8a300000 0x0 0xc000>;
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
+};
+
+&dcp {
+	apple,bw-scratch = <&dcpext0_pmc 0 5 0x20000>;
+	apple,clock-ids = <361 458>;
+	clocks = <&dcp_fw_clk361>, <&dcp_fw_clk458>;
+	clock-names = "firmware-0", "firmware-1";
+
+	panel {
+		compatible = "apple,panel-mini-led";
+		apple,max-brightness = <600>;
+	};
+};

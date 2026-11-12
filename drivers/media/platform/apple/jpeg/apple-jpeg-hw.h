@@ -75,6 +75,8 @@
 #define AJ_HWREV_MASK			0xffff0fff
 /* ADT hw-type 0x101008; its stepping nibble is masked off like T8140's. */
 #define AJ_HWREV_T6041			0x100008
+/* ADT hw-type of the T8122/T6030/T6031/T6032 engines (not yet read back). */
+#define AJ_HWREV_T8122			0x0f0008
 #define AJ_HWREV_T8140			0x110000
 
 struct apple_jpeg_write {
@@ -108,6 +110,7 @@ struct apple_jpeg_variant {
 extern const struct apple_jpeg_variant apple_jpeg_t6000;
 extern const struct apple_jpeg_variant apple_jpeg_t6041;
 extern const struct apple_jpeg_variant apple_jpeg_t8112;
+extern const struct apple_jpeg_variant apple_jpeg_t8122;
 extern const struct apple_jpeg_variant apple_jpeg_t8140;
 
 static inline bool

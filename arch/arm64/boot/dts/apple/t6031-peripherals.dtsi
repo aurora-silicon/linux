@@ -68,7 +68,7 @@
 		interrupts = <AIC_IRQ 0 1283 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		power-domains = <&ps_jpg>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	dart_jpeg1: iommu@2cf00c000 {
@@ -78,7 +78,7 @@
 		interrupts = <AIC_IRQ 0 1288 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
 		power-domains = <&ps_jpg>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	dart_ave00: iommu@285030000 {
@@ -826,7 +826,7 @@
 		interrupts = <AIC_IRQ 0 1282 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_jpg>;
 		iommus = <&dart_jpeg0 0>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	jpeg1: jpeg@2cf008000 {
@@ -836,7 +836,7 @@
 		interrupts = <AIC_IRQ 0 1287 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_jpg>;
 		iommus = <&dart_jpeg1 0>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ave0: video-encoder@285100000 {

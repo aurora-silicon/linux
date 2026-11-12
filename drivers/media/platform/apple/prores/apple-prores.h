@@ -53,6 +53,35 @@
 #define APR_RING_BYTES		SZ_128K
 #define APR_DESC_BYTES		0x180
 
+#define APRI_T6041_FIRMWARE_NAME	"apple/prores-t6041-init.bin"
+#define APRI_T6041_FIRMWARE_SIZE	2728
+#define APRI_SYSTEM_COUNT	82
+#define APRI_CORE_COUNT		80
+#define APRI_WRAPPER_COUNT	62
+#define APRI_MAX_COUNT		APRI_SYSTEM_COUNT
+
+enum apri_block_index {
+	APRI_SYSTEM_BLOCK,
+	APRI_CORE_BLOCK,
+	APRI_WRAPPER_BLOCK,
+	APRI_BLOCK_COUNT,
+};
+
+struct apr_tunable {
+	u32 offset;
+	u32 mask;
+	u32 value;
+};
+
+struct apr_init_block {
+	u32 count;
+	struct apr_tunable entries[APRI_MAX_COUNT];
+};
+
+struct apr_init_data {
+	struct apr_init_block blocks[APRI_BLOCK_COUNT];
+};
+
 /* Quantisation tables the engine holds, in register order. */
 enum apr_qtable {
 	APR_QTABLE_XQ,
@@ -119,5 +148,7 @@ u32 apr_slice_count(u32 width, u32 height, u32 log2_slice);
 int apr_build_desc(const struct apr_frame *f, u8 *desc);
 int apr_build_desc_v0(const struct apr_frame *f, u8 *desc);
 int apr_check_output(const u8 *out, size_t capacity, u32 *frame_bytes);
+int apr_parse_t6041_init(const u8 *data, size_t size,
+			 struct apr_init_data *init);
 
 #endif

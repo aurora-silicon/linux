@@ -127,6 +127,18 @@ bool apple_sleep_debug_link_up(void);
 void apple_sleep_lid_closed_wake(void);
 
 /*
+ * From the SMC's driver, in its noirq resume: the lid as it reads now, after every
+ * sleep the SMC was told of, whatever woke it.
+ */
+void apple_sleep_lid_at_wake(bool closed);
+
+/*
+ * For the display: 1 if the lid read closed in this wake's noirq resume, 0 if open,
+ * -ENODATA if it wasn't read. macOS keeps the internal panel off with the lid closed.
+ */
+int apple_sleep_lid_closed_at_wake(void);
+
+/*
  * From the SMC's driver, in its noirq resume: the SMC woke the AP for the port alone. If
  * this sleep cut the debug link and nothing else woke the SoC, it's a dark wake.
  */
@@ -253,6 +265,15 @@ static inline bool apple_sleep_debug_link_up(void)
 
 static inline void apple_sleep_lid_closed_wake(void)
 {
+}
+
+static inline void apple_sleep_lid_at_wake(bool closed)
+{
+}
+
+static inline int apple_sleep_lid_closed_at_wake(void)
+{
+	return -ENODATA;
 }
 
 static inline void apple_sleep_debug_link_cut_wake(void)

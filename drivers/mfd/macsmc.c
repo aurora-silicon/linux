@@ -832,23 +832,26 @@ static int apple_smc_wake_reason_bit(const char *name)
 }
 
 /*
- * Woken for the lid alone, which the SMC reports for the lid opening and for it closing:
- * tell the sleep driver if it's closed now.
+ * Tell the sleep driver where the lid is now, for the display. Woken for the lid alone,
+ * which the SMC reports for the lid opening and for it closing: also if it's closed now.
  */
 static void apple_smc_lid_wake(struct apple_smc *smc)
 {
 	int bit = apple_smc_wake_reason_bit("lid");
+	bool lid_alone = bit >= 0 && smc->wake_record == BIT_ULL(bit);
 	u8 lid = 0;
 	int ret;
 
-	if (bit < 0 || smc->wake_record != BIT_ULL(bit))
-		return;
-
+	/* No MSLD on a machine without a lid: the display then isn't told either way. */
 	ret = apple_smc_read_u8(smc, SMC_KEY(MSLD), &lid);
 	if (ret < 0) {
-		dev_warn(smc->dev, "Failed to read the lid after a wake: %d\n", ret);
+		if (lid_alone)
+			dev_warn(smc->dev, "Failed to read the lid after a wake: %d\n", ret);
 		return;
 	}
+	apple_sleep_lid_at_wake(lid);
+	if (!lid_alone)
+		return;
 	dev_info(smc->dev, "woken for the lid, which is %s\n", lid ? "closed" : "open");
 	if (lid)
 		apple_sleep_lid_closed_wake();

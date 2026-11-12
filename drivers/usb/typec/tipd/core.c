@@ -665,11 +665,35 @@ static int cd321x_mux_set(struct cd321x *cd321x, bool *held)
 	return ret;
 }
 
-/* A held mux is retried: report only the first failure of the series. */
-static bool cd321x_mux_still_held(struct cd321x *cd321x, bool held)
+/*
+ * Report a change the mux failed. A mux that @held the change up is retried
+ * (see cd321x_retry_held_mux()), and the hold-up is a fault worth a warning
+ * only once the retries end, as cd321x_mux_gave_up() reports. Any other
+ * failure is a fault now.
+ */
+VISIBLE_IF_KUNIT void cd321x_mux_failed(struct cd321x *cd321x, const char *what, int ret,
+					bool held)
 {
-	return held && cd321x->pm.mux_retry_ms;
+	KUNIT_STATIC_STUB_REDIRECT(cd321x_mux_failed, cd321x, what, ret, held);
+
+	if (held)
+		dev_dbg(cd321x->tps.dev, "%s, still held up: %d\n", what, ret);
+	else
+		dev_warn(cd321x->tps.dev, "%s: %d\n", what, ret);
 }
+EXPORT_SYMBOL_IF_KUNIT(cd321x_mux_failed);
+
+/* The retries of a change that a mux held up have ended (see cd321x_pm_mux_held()). */
+VISIBLE_IF_KUNIT void cd321x_mux_gave_up(struct cd321x *cd321x, unsigned int retries,
+					 unsigned int held_ms)
+{
+	KUNIT_STATIC_STUB_REDIRECT(cd321x_mux_gave_up, cd321x, retries, held_ms);
+
+	dev_warn(cd321x->tps.dev,
+		 "Type-C mux still held up after %u retries in %u s, waiting for the next event\n",
+		 retries, held_ms / 1000);
+}
+EXPORT_SYMBOL_IF_KUNIT(cd321x_mux_gave_up);
 
 /*
  * The HPD level of a DisplayPort partner. DATA_STATUS reports it. An
@@ -915,13 +939,12 @@ out:
 		/* A provider that is not ready yet asks for a retry. */
 		if (ret == -EAGAIN)
 			dev_dbg(tps->dev, "Type-C connection deferred\n");
-		else if (cd321x_mux_still_held(cd321x, *held))
-			dev_dbg(tps->dev, "Type-C connection still held up: %d\n", ret);
 		/* The DCP route says which display waits; USB goes on. */
 		else if (cd321x_display_taken(ret))
 			dev_dbg(tps->dev, "Type-C display waits for a free pipeline: %d\n", ret);
 		else
-			dev_warn(tps->dev, "failed to configure Type-C connection: %d\n", ret);
+			cd321x_mux_failed(cd321x, "failed to configure Type-C connection", ret,
+					  *held);
 	} else if (cd321x->state.alt != cd321x->port_altmode_dp) {
 		cd321x->dp_status = 0;
 		cd321x->dp_conf = 0;
@@ -988,7 +1011,8 @@ static int cd321x_dp_release_first(struct cd321x *cd321x, bool *held)
 	ret = typec_mux_set(cd321x->mux, &state);
 	*held = cd321x_mux_held(cd321x, ret);
 	if (ret)
-		dev_warn(cd321x->tps.dev, "display not released before the port changes: %d\n", ret);
+		cd321x_mux_failed(cd321x, "display not released before the port changes", ret,
+				  *held);
 	else
 		cd321x->dp_status = dp_data.status;
 	return ret;
@@ -1030,9 +1054,7 @@ static void cd321x_retry_held_mux(struct cd321x *cd321x)
 		mod_delayed_work(system_freezable_wq, &cd321x->resume_work,
 				 msecs_to_jiffies(delay));
 	else if (!delay)
-		dev_warn(cd321x->tps.dev,
-			 "Type-C mux still held up after %u retries in %u s, waiting for the next event\n",
-			 retries, held_ms / 1000);
+		cd321x_mux_gave_up(cd321x, retries, held_ms);
 }
 
 static void cd321x_update_done(struct cd321x *cd321x)
@@ -1241,12 +1263,8 @@ static void cd321x_update_work(struct work_struct *work)
 		ret = cd321x_mux_set(cd321x, &held);
 		cd321x->state_valid = !ret;
 		if (ret) {
-			if (cd321x_mux_still_held(cd321x, held))
-				dev_dbg(tps->dev, "Type-C mux still held up: %d\n", ret);
-			else
-				dev_warn(tps->dev,
-					 "failed to place Type-C mux in safe mode: %d\n",
-					 ret);
+			cd321x_mux_failed(cd321x, "failed to place Type-C mux in safe mode", ret,
+					  held);
 			cd321x->state = old_state;
 			goto retry;
 		}

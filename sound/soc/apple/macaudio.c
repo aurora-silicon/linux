@@ -1753,7 +1753,7 @@ static int macaudio_spk_enter_lease(struct macaudio_snd_data *ma)
 		dev_err(ma->card.dev, "software gain full scale not set: %d\n", ret);
 
 	if (!ma->spk_owner)
-		mod_delayed_work(system_wq, &ma->spk_unowned_work,
+		mod_delayed_work(system_percpu_wq, &ma->spk_unowned_work,
 				 msecs_to_jiffies(SPEAKER_LEASE_UNOWNED_MS));
 	dev_info(ma->card.dev,
 		 "Speaker protection interface: Speaker Protection (lease); Speaker Volume Unlock refused\n");
@@ -2013,7 +2013,7 @@ static void macaudio_spk_unlock(struct snd_kcontrol *kcontrol)
 		macaudio_spk_floor_ramped(ma, "owner gone");
 		/* A restarting engine takes it back in time; a dead one does not */
 		if (!ma->spk_dead)
-			mod_delayed_work(system_wq, &ma->spk_unowned_work,
+			mod_delayed_work(system_percpu_wq, &ma->spk_unowned_work,
 					 msecs_to_jiffies(SPEAKER_LEASE_UNOWNED_MS));
 	}
 	mutex_unlock(&ma->spk_mutex);

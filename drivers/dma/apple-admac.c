@@ -1059,10 +1059,17 @@ static irqreturn_t admac_interrupt(int irq, void *devid)
 		rx_intstate >>= 1;
 	}
 
+	/*
+	 * Controller-global event sources are sticky write-one-to-clear
+	 * notifications. They carry no recovery semantics: DMA faults are
+	 * reported per channel through REG_CHAN_INTSTATUS. Acknowledge the
+	 * sources seen in this snapshot so a later one raises a new interrupt.
+	 */
 	if (global_intstate) {
-		dev_warn(ad->dev, "clearing unknown global interrupt flag: %x\n",
-			 global_intstate);
-		writel_relaxed(~(u32) 0, ad->base + REG_GLOBAL_INTSTATE(ad->irq_index));
+		dev_dbg_ratelimited(ad->dev, "global event state: %#x\n",
+				    global_intstate);
+		writel_relaxed(global_intstate,
+			       ad->base + REG_GLOBAL_INTSTATE(ad->irq_index));
 	}
 
 	return IRQ_HANDLED;

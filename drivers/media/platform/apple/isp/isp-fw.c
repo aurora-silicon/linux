@@ -1384,7 +1384,7 @@ void apple_isp_firmware_shutdown(struct apple_isp *isp)
 	/* Not on isp->wq: the stop flushes that. */
 	if (isp->hw->fw_idle_ms && isp->fw_state == ISP_FW_RUNNING) {
 		isp->fw_idle = true;
-		mod_delayed_work(system_unbound_wq, &isp->fw_idle_work,
+		mod_delayed_work(system_dfl_wq, &isp->fw_idle_work,
 				 msecs_to_jiffies(isp->hw->fw_idle_ms));
 	}
 }

@@ -34,6 +34,7 @@
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/pmp-report.h>
+#include <linux/soc/apple/sleep.h>
 #include <linux/string.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
@@ -201,7 +202,7 @@ static void dcp_secure_poll(struct work_struct *work)
 		dcp->secure_fast_until = jiffies + msecs_to_jiffies(DCP_SECURE_POLL_FAST_MS);
 		fast = true;
 	}
-	queue_delayed_work(system_unbound_wq, &dcp->secure_poll_wq,
+	queue_delayed_work(system_dfl_wq, &dcp->secure_poll_wq,
 			   fast ? 1 : msecs_to_jiffies(DCP_SECURE_POLL_SLOW_MS));
 }
 
@@ -209,7 +210,7 @@ static void dcp_secure_poll_start(struct apple_dcp *dcp)
 {
 	dcp->secure_fast_until = jiffies + msecs_to_jiffies(DCP_SECURE_POLL_FAST_MS);
 	WRITE_ONCE(dcp->secure_polling, true);
-	queue_delayed_work(system_unbound_wq, &dcp->secure_poll_wq, 0);
+	queue_delayed_work(system_dfl_wq, &dcp->secure_poll_wq, 0);
 }
 
 static void dcp_secure_poll_stop(struct apple_dcp *dcp)
@@ -378,6 +379,28 @@ static bool t6041_dcpext = true;
 module_param(t6041_dcpext, bool, 0444);
 MODULE_PARM_DESC(t6041_dcpext,
 		 "T6041: drive the external display processors (default 1; 0 leaves them alone)");
+
+/*
+ * After a wake that finds the internal panel off by DPMS, start its firmware from the
+ * resume, as macOS does about 83 ms into a wake, so that DPMS on only has to light the
+ * panel. If DPMS on hasn't come this long after, the firmware stops again. 0: the
+ * firmware waits for DPMS on, as before.
+ */
+static unsigned int wake_prewarm_ms = 10000;
+module_param(wake_prewarm_ms, uint, 0644);
+MODULE_PARM_DESC(wake_prewarm_ms,
+		 "Start the internal display's firmware at resume, stop it if DPMS stays off this long (ms, 0: off)");
+
+/*
+ * With wake_prewarm_ms set, on a full wake with the lid open, also power the panel from
+ * the resume, A414(0) to set_power_state(1) as macOS's power path sends them, and keep it
+ * dark until the compositor's first frame, which brings back the level from before the
+ * sleep. A closed lid leaves the display and its firmware off. 0: firmware only.
+ */
+static bool wake_light = true;
+module_param(wake_light, bool, 0644);
+MODULE_PARM_DESC(wake_light,
+		 "With wake_prewarm_ms, also power the internal panel at resume if the lid is open (default 1)");
 
 bool dcp_t6041_ext_enabled(void)
 {
@@ -1779,15 +1802,26 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 	 * On desktop 26.6 firmware the panel takes VRR_ENABLED with the next
 	 * frame, without a mode set (see dcp_vrr_update()).  The external
 	 * processors ignore a new minimum rate on a live mode, so they still
-	 * change adaptive sync with a mode set.
+	 * change adaptive sync with a mode set, as firmware 27's externals do:
+	 * macOS switches between a timing's fixed and variable modes with a
+	 * full mode set.
 	 */
-	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && crtc_state->enable &&
-	    !dcp_vrr_live(dcp)) {
+	if ((dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+	     (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp->main_display &&
+	      !dcp_has_panel(dcp))) &&
+	    crtc_state->enable && !dcp_vrr_live(dcp)) {
 		struct drm_crtc_state *old =
 			drm_atomic_get_old_crtc_state(commit, crtc);
 
 		if (old && old->vrr_enabled != crtc_state->vrr_enabled)
 			crtc_state->mode_changed = true;
+	}
+
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+		int ret = dcp_peer_check_v27(dcp, commit, crtc_state);
+
+		if (ret)
+			return ret;
 	}
 
 	/* DRM core only caps the blob size; the gamma update copies a full table. */
@@ -4399,6 +4433,8 @@ static bool dcp_h17g_panel(struct apple_dcp *dcp)
 
 static void dcp_dpms_power_off(struct apple_dcp *dcp);
 static void dcp_dpms_power_on(struct apple_dcp *dcp);
+static void dcp_s2r_prewarm_work(struct work_struct *work);
+static void dcp_s2r_prewarm_off_work(struct work_struct *work);
 
 static bool dcp_uses_soft_dpms(struct apple_dcp *dcp)
 {
@@ -6423,6 +6459,9 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	/* System sleep and shutdown cancel these even if no bind succeeded. */
 	INIT_WORK(&dcp->vblank_wq, dcp_delayed_vblank);
 	INIT_DELAYED_WORK(&dcp->swap_watchdog_wq, dcp_swap_watchdog);
+	INIT_WORK(&dcp->s2r_prewarm_work, dcp_s2r_prewarm_work);
+	INIT_DELAYED_WORK(&dcp->s2r_prewarm_off_wq, dcp_s2r_prewarm_off_work);
+	mutex_init(&dcp->s2r_prewarm_lock);
 	INIT_WORK(&dcp->bl_register_wq, dcp_work_register_backlight);
 	INIT_WORK(&dcp->bl_update_wq, dcp_work_update_backlight);
 	mutex_init(&dcp->bl_register_mutex);
@@ -6925,6 +6964,11 @@ static void dcp_platform_remove(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
+	if (dcp) {
+		cancel_work_sync(&dcp->s2r_prewarm_work);
+		cancel_delayed_work_sync(&dcp->s2r_prewarm_off_wq);
+	}
+
 	if (dcp && dcp->external && !dcp->external_native) {
 		/* Enabled for the external start at probe. No component unbind. */
 		disable_delayed_work_sync(&dcp->typec_reconnect_wq);
@@ -7180,6 +7224,10 @@ static void dcp_platform_complete(struct device *dev)
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
 	dcp_s2r_dark_finish(dcp);
+	/* The sleep failed, or wasn't one that stops the firmware: it still times out. */
+	if (READ_ONCE(dcp->s2r_wake_lit))
+		mod_delayed_work(system_freezable_wq, &dcp->s2r_prewarm_off_wq,
+				 msecs_to_jiffies(READ_ONCE(wake_prewarm_ms)));
 	if (!dcp->external)
 		return;
 	mutex_lock(&dcp->hpd_mutex);
@@ -8135,6 +8183,23 @@ static int dcp_s2r_restart(struct apple_dcp *dcp, bool real)
 	return ret;
 }
 
+/*
+ * A full wake that finds the panel off by DPMS. With wake_light, a lid read closed leaves
+ * the display and its firmware off, as macOS keeps the internal display off with the lid
+ * closed, and a lid read open lights the panel too. A lid not read only starts the firmware.
+ */
+static void dcp_s2r_wake_queue(struct apple_dcp *dcp)
+{
+	int closed = READ_ONCE(wake_light) ? apple_sleep_lid_closed_at_wake() : -ENODATA;
+
+	if (closed > 0) {
+		dev_info(dcp->dev, "wake: lid closed, display and firmware stay off\n");
+		return;
+	}
+	dcp->s2r_wake_light = !closed;
+	queue_work(system_highpri_wq, &dcp->s2r_prewarm_work);
+}
+
 static int dcp_s2r_resume(struct apple_dcp *dcp)
 {
 	bool real = pm_resume_via_firmware();
@@ -8155,12 +8220,21 @@ static int dcp_s2r_resume(struct apple_dcp *dcp)
 		return 0;
 	}
 	dcp->s2r_dark_held = false;
-	/* Off by DPMS before the sleep: it stays off until DPMS on brings it back. */
+	/* Off by DPMS before the sleep: DPMS on, or this wake, brings it back. */
 	if (dcp->dpms_powered_off) {
 		/* Off after a refused idle, its power may be on: DPMS on needs it lowered. */
 		if (!real)
 			dcp_s2r_refused_domains_off(dcp);
 		dcp_s2r_put_darts(dcp);
+		if (real) {
+			/* Its last frame is from before the sleep, and may not be what comes next. */
+			WRITE_ONCE(dcp->s2r_scanout_stale, true);
+			WRITE_ONCE(dcp->s2r_scanout_hold,
+				   READ_ONCE(wake_prewarm_ms) && READ_ONCE(wake_light));
+		}
+		/* Its firmware starts now, alongside the devices still resuming. */
+		if (real && !pm_dark_wake() && READ_ONCE(wake_prewarm_ms))
+			dcp_s2r_wake_queue(dcp);
 		return 0;
 	}
 	dcp_s2r_restart(dcp, real);
@@ -8239,7 +8313,7 @@ static bool dcp_dpms_power_cycles(struct apple_dcp *dcp)
 	return dcp_s2r_capable(dcp) && pm_suspend_target_state == PM_SUSPEND_ON;
 }
 
-static void dcp_dpms_power_off(struct apple_dcp *dcp)
+static void __dcp_dpms_power_off(struct apple_dcp *dcp)
 {
 	ktime_t start = ktime_get();
 	int ret;
@@ -8289,6 +8363,26 @@ static void dcp_dpms_power_on(struct apple_dcp *dcp)
 	ktime_t start = ktime_get();
 	int ret;
 
+	/* A firmware start from the resume finishes first; then only the panel is left. */
+	flush_work(&dcp->s2r_prewarm_work);
+	cancel_delayed_work_sync(&dcp->s2r_prewarm_off_wq);
+	guard(mutex)(&dcp->s2r_prewarm_lock);
+	/* Lit by the resume: only the mode set and the first frame are left, in the commit. */
+	if (dcp->s2r_wake_lit) {
+		dcp->s2r_wake_lit = false;
+		dev_info(dcp->dev, "DPMS on: panel already on, %lld ms after the resume lit it\n",
+			 ktime_ms_delta(start, dcp->s2r_wake_lit_at));
+		return;
+	}
+	if (dcp->s2r_prewarmed) {
+		dcp->s2r_prewarmed = false;
+		dcp->dpms_powered_off = false;
+		dcp->s2r_refused_off = false;
+		dcp_s2r_light_running(dcp);
+		dev_info(dcp->dev, "DPMS on: panel lit on the firmware the resume started, %lld ms\n",
+			 ktime_ms_delta(ktime_get(), start));
+		return;
+	}
 	if (dcp->s2r_refused_off) {
 		dcp->s2r_refused_off = false;
 		dcp_s2r_light_running(dcp);
@@ -8314,6 +8408,98 @@ static void dcp_dpms_power_on(struct apple_dcp *dcp)
 		ktime_ms_delta(ktime_get(), start));
 }
 
+/*
+ * From the resume: the firmware up with the panel dark, the state a refused idle leaves,
+ * which DPMS on, DPMS off and the next sleep all handle. macOS has DCP's HELLO 83 ms into
+ * a wake and its first display call about 10 ms later. With the lid open and wake_light,
+ * the panel then powers up too, still dark, as DPMS on would power it.
+ */
+static void dcp_s2r_prewarm_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(work, struct apple_dcp, s2r_prewarm_work);
+	ktime_t start = ktime_get();
+	bool light;
+	s64 fw_ms;
+	int ret;
+
+	guard(mutex)(&dcp->s2r_prewarm_lock);
+	light = dcp->s2r_wake_light;
+	dcp->s2r_wake_light = false;
+	if (!dcp->dpms_powered_off || !READ_ONCE(dcp->s2r_fw_down) || READ_ONCE(dcp->crashed))
+		return;
+	dcp_s2r_find_darts(dcp);
+	ret = dcp_s2r_warm_restart(dcp);
+	if (ret) {
+		/* Back as DPMS off left it, stopped and powered down: DPMS on starts it again. */
+		dcp_s2r_stop_failed_start(dcp);
+		dcp_s2r_stop_streams(dcp);
+		dcp_s2r_domains_off(dcp);
+		dcp_s2r_put_darts(dcp);
+		dev_warn(dcp->dev, "wake: firmware start failed, DPMS on tries again: %d\n", ret);
+		return;
+	}
+	dcp_s2r_put_darts(dcp);
+	WRITE_ONCE(dcp->s2r_fw_down, false);
+	dcp->s2r_refused_off = true;
+	if (!light) {
+		dcp->s2r_prewarmed = true;
+		mod_delayed_work(system_freezable_wq, &dcp->s2r_prewarm_off_wq,
+				 msecs_to_jiffies(READ_ONCE(wake_prewarm_ms)));
+		dev_info(dcp->dev, "wake: firmware up in %lld ms, panel off until DPMS on\n",
+			 ktime_ms_delta(ktime_get(), start));
+		return;
+	}
+
+	/*
+	 * Then what DPMS on would do: A414(0), A478 x2, A476(1), A478, A412, A473(1) and D572,
+	 * as macOS's power path sends them 10 ms after DCP's HELLO. The backlight stays at its
+	 * DPMS-off level, 0, until DPMS on: the compositor's first frame brings the old level.
+	 */
+	fw_ms = ktime_ms_delta(ktime_get(), start);
+	dcp->s2r_refused_off = false;
+	dcp->dpms_powered_off = false;
+	dcp_s2r_light_running(dcp);
+	if (READ_ONCE(dcp->crashed))
+		return;
+	dcp->s2r_wake_lit = true;
+	dcp->s2r_wake_lit_at = ktime_get();
+	mod_delayed_work(system_freezable_wq, &dcp->s2r_prewarm_off_wq,
+			 msecs_to_jiffies(READ_ONCE(wake_prewarm_ms)));
+	dev_info(dcp->dev, "wake: panel on in %lld ms (firmware %lld ms), dark until the first frame\n",
+		 ktime_ms_delta(dcp->s2r_wake_lit_at, start), fw_ms);
+}
+
+/* DPMS stayed off after the wake, with the lid closed say: stopped again as DPMS off does. */
+static void dcp_s2r_prewarm_off_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(to_delayed_work(work), struct apple_dcp,
+					     s2r_prewarm_off_wq);
+
+	guard(mutex)(&dcp->s2r_prewarm_lock);
+	/* Lit and never shown: off as DPMS off does it, set_power_state(0) first. */
+	if (dcp->s2r_wake_lit) {
+		dcp->s2r_wake_lit = false;
+		dev_info(dcp->dev, "wake: DPMS stayed off, panel and firmware off again\n");
+		__dcp_dpms_power_off(dcp);
+		return;
+	}
+	if (!dcp->s2r_prewarmed)
+		return;
+	dcp->s2r_prewarmed = false;
+	dev_info(dcp->dev, "wake: DPMS stayed off, display firmware stopped again\n");
+	__dcp_dpms_power_off(dcp);
+}
+
+static void dcp_dpms_power_off(struct apple_dcp *dcp)
+{
+	flush_work(&dcp->s2r_prewarm_work);
+	cancel_delayed_work_sync(&dcp->s2r_prewarm_off_wq);
+	guard(mutex)(&dcp->s2r_prewarm_lock);
+	dcp->s2r_prewarmed = false;
+	dcp->s2r_wake_lit = false;
+	__dcp_dpms_power_off(dcp);
+}
+
 bool dcp_s2r_firmware_stopped(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
@@ -8329,8 +8515,21 @@ static int dcp_platform_suspend(struct device *dev)
 	if (dcp_takeover_was_aborted(dcp))
 		return -EBUSY;
 
-	if (pm_suspend_via_firmware() && dcp_s2r_capable(dcp))
-		return dcp_s2r_suspend(dcp);
+	/* A firmware start from the last resume finishes first; this sleep stops it again. */
+	flush_work(&dcp->s2r_prewarm_work);
+	cancel_delayed_work_sync(&dcp->s2r_prewarm_off_wq);
+	dcp->s2r_prewarmed = false;
+
+	if (pm_suspend_via_firmware() && dcp_s2r_capable(dcp)) {
+		int ret = dcp_s2r_suspend(dcp);
+
+		/* Lit by the last resume with its CRTC off: the next resume finds it off by DPMS. */
+		if (!ret && dcp->s2r_wake_lit) {
+			dcp->s2r_wake_lit = false;
+			dcp->dpms_powered_off = true;
+		}
+		return ret;
+	}
 	if (pm_suspend_via_firmware() && dcp_s2r_ext_capable(dcp))
 		return dcp_s2r_ext_suspend(dcp);
 

@@ -698,6 +698,20 @@ struct apple_dcp {
 	struct notifier_block s2r_pm_nb;
 	/* This driver raised the display domains, and nothing has lowered them since. */
 	bool s2r_domains_up;
+	/* Firmware started by the resume, panel still dark: DPMS on lights it. */
+	bool s2r_prewarmed;
+	struct work_struct s2r_prewarm_work;
+	struct delayed_work s2r_prewarm_off_wq;
+	/* Orders the start from the resume and its timeout against DPMS on and off. */
+	struct mutex s2r_prewarm_lock;
+	/* This wake lights the panel from the resume too: full wake, lid read open. */
+	bool s2r_wake_light;
+	/* Lit by the resume, with the CRTC still off: DPMS on has nothing left to power. */
+	bool s2r_wake_lit;
+	ktime_t s2r_wake_lit_at;
+	/* The retained scanout is from before the sleep; with hold, no present reuses it. */
+	bool s2r_scanout_stale;
+	bool s2r_scanout_hold;
 	/* Counted in pmc-dcp, the number of powered DCPs */
 	bool pmc_up;
 	bool s2r_power_on;

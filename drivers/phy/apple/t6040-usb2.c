@@ -162,7 +162,7 @@
 
 /* MXWrap CPU control ("cpu"), atc-phy reg[38], of the PHY coprocessor */
 #define T6040_CPU_RUN			0x28
-#define T6040_CPU_RUN_START		0x10	/* AppleMxWrap::_runCPU; STOP stores ~0x10 */
+#define T6040_CPU_RUN_START		0x10	/* RUN sets bit 4; STOP stores ~0x10 */
 #define T6040_CPU_IDLE_CTRL		0x40	/* MXWRAP_BLK_IDLE_CTRL */
 #define T6040_CPU_IDLE_CTRL_EN		BIT(0)
 #define T6040_CPU_STATUS		0x44
@@ -375,8 +375,8 @@ static int t6040_usb2_power_on(struct phy *phy)
 		return 0;
 
 	/*
-	 * AppleT6040TypeCPhy::eusb2phy_init(false, false), in exact order.
-	 * Keep the five signal mutations separate: the paired driver performs
+	 * eUSB2 PHY init, in this exact order.
+	 * Keep the five signal mutations separate: the reference sequence performs
 	 * five read/modify/write operations rather than one combined write.
 	 */
 	t6040_usb2_set32(tphy->usb2 + T6040_USB2_SIG,
@@ -720,7 +720,7 @@ static int t6040_usb3_run_firmware(struct t6040_usb2_phy *tphy, bool usb, bool s
 }
 
 /*
- * Detach, RTBuddy::setPowerState(0): Power Down, RTKit AP then IOP to idle,
+ * Detach (RTKit power state 0): Power Down, RTKit AP then IOP to idle,
  * wait up to 10 ms for the CPU to idle, STOP. The RTKit transport stays stopped
  * so the next attach can either restart it normally or first power-cycle the
  * domains. The mailbox outbox enable that macOS clears here is left as iBoot

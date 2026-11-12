@@ -1296,6 +1296,53 @@
 			status = "disabled";
 		};
 
+		/*
+		 * The second encoder. A J700 has either this one or ave (the ADT
+		 * describes the one the part has); the bootloader enables it, its
+		 * DARTs and its power states when the ADT has it.
+		 */
+		ave1_dart0: iommu@289080000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x2 0x89080000 0 0xc000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 967 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_venc1_sys>;
+			#iommu-cells = <1>;
+			apple,dma-range = <0x100 0x00004000 0 0xffffc000>;
+			status = "disabled";
+		};
+
+		ave1_dart1: iommu@2890a0000 {
+			compatible = "apple,t8140-dart", "apple,t8110-dart";
+			reg = <0x2 0x890a0000 0 0xc000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 967 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_venc1_sys>;
+			#iommu-cells = <1>;
+			apple,dma-range = <0x100 0x00004000 0 0xffffc000>;
+			status = "disabled";
+		};
+
+		ave1: video-codec@289100000 {
+			compatible = "apple,t8140-ave";
+			reg = <0x2 0x89100000 0 0x45c000>,
+			      <0x2 0x89050000 0 0x4000>,
+			      <0x2 0x89800000 0 0x800000>;
+			reg-names = "codec", "mailbox", "coproc";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 970 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 964 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 963 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 966 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 965 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_venc1_dma>, <&ps_venc1_pipe4>,
+				       <&ps_venc1_pipe5>, <&ps_venc1_me0>, <&ps_venc1_me1>;
+			power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
+			iommus = <&ave1_dart0 0>, <&ave1_dart0 12>,
+				 <&ave1_dart1 0>, <&ave1_dart1 12>;
+			status = "disabled";
+		};
+
 		pcie0: pcie@1cb0000000 {
 			compatible = "apple,t8140-pcie";
 			device_type = "pci";

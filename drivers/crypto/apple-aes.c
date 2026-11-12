@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Apple SIO AES engine (T6000/T8112 family) skcipher driver.
+ * Apple SIO AES engine skcipher driver (T6000, T8112, T6040 and T8140).
  *
  * The engine takes commands through a word FIFO: load a key into one of
  * two key slots, load an IV into an IV slot, then run a block operation
@@ -30,6 +30,7 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/property.h>
 #include <linux/scatterlist.h>
 #include <linux/seq_file.h>
 #include <linux/unaligned.h>
@@ -79,10 +80,16 @@
 /* SET_IV */
 #define AES_IV_SLOT		GENMASK(27, 26)
 
-/* CRYPT: followed by the upper address word, source and destination. */
+/*
+ * CRYPT: followed by the upper address word, then the low 32 bits of the
+ * source and destination addresses. The upper address word carries
+ * address bits 32 and up of the source in its upper half and of the
+ * destination in its lower half.
+ */
 #define AES_CRYPT_KEY_SLOT	BIT(27)
 #define AES_CRYPT_IV_SLOT	GENMASK(26, 25)
-#define AES_CRYPT_LEN		GENMASK(24, 0)
+#define AES_CRYPT_LEN		GENMASK(23, 0)
+#define AES_ADDR_HI_SRC_SHIFT	16
 
 /* BARRIER */
 #define AES_BARRIER_IRQ		BIT(27)
@@ -97,6 +104,8 @@
 
 struct apple_sio_aes_data {
 	u32 revision;
+	/* DMA address width the upper address word can carry. */
+	u8 dma_bits;
 };
 
 struct apple_sio_aes {
@@ -108,8 +117,10 @@ struct apple_sio_aes {
 	u32 irq_status;
 	bool running;
 
+	const struct apple_sio_aes_data *data;
 	void *bounce;
 	dma_addr_t bounce_dma;
+	u32 bounce_hi;
 
 	u64 requests;
 	u64 bytes;
@@ -226,9 +237,6 @@ static int apple_sio_aes_run(struct apple_sio_aes *aes,
 		break;
 	}
 
-	if (upper_32_bits(aes->bounce_dma))
-		return -EIO;
-
 	reinit_completion(&aes->done);
 	aes->irq_status = 0;
 	apple_sio_aes_start(aes);
@@ -260,10 +268,9 @@ static int apple_sio_aes_run(struct apple_sio_aes *aes,
 		      FIELD_PREP(AES_CRYPT_LEN, len);
 		dma_sync_single_for_device(aes->dev, aes->bounce_dma, len,
 					   DMA_BIDIRECTIONAL);
-		/* A 32-bit DMA mask keeps the upper address word zero. */
 		ret = apple_sio_aes_push(aes, cmd);
 		if (!ret)
-			ret = apple_sio_aes_push(aes, 0);
+			ret = apple_sio_aes_push(aes, aes->bounce_hi);
 		if (!ret)
 			ret = apple_sio_aes_push(aes, lower_32_bits(aes->bounce_dma));
 		if (!ret)
@@ -496,6 +503,8 @@ static int apple_sio_aes_stats_show(struct seq_file *s, void *unused)
 {
 	struct apple_sio_aes *aes = s->private;
 
+	seq_printf(s, "revision: %u\n", aes->data->revision);
+	seq_printf(s, "bounce_dma: %pad\n", &aes->bounce_dma);
 	seq_printf(s, "readiness_at_probe: %#010x\n", aes->readiness);
 	seq_printf(s, "requests: %llu\n", aes->requests);
 	seq_printf(s, "bytes: %llu\n", aes->bytes);
@@ -517,6 +526,23 @@ static void apple_sio_aes_free_bounce(void *data)
 			     aes->bounce_dma, DMA_BIDIRECTIONAL);
 }
 
+/*
+ * Build the upper address word for an in-place operation on @addr. The
+ * engine drops address bits above its DMA width, so refuse such an
+ * address instead of letting it alias a lower one.
+ */
+static int apple_sio_aes_addr_hi(const struct apple_sio_aes_data *data,
+				 dma_addr_t addr, u32 *hi)
+{
+	u32 upper = upper_32_bits(addr);
+
+	if (data->dma_bits < 64 && (u64)addr >> data->dma_bits)
+		return -ERANGE;
+
+	*hi = (upper << AES_ADDR_HI_SRC_SHIFT) | upper;
+	return 0;
+}
+
 static int apple_sio_aes_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -532,6 +558,9 @@ static int apple_sio_aes_probe(struct platform_device *pdev)
 	if (!aes)
 		return -ENOMEM;
 	aes->dev = dev;
+	aes->data = device_get_match_data(dev);
+	if (!aes->data)
+		return -ENODEV;
 	init_completion(&aes->done);
 	platform_set_drvdata(pdev, aes);
 
@@ -544,9 +573,9 @@ static int apple_sio_aes_probe(struct platform_device *pdev)
 	if (aes->irq < 0)
 		return aes->irq;
 
-	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
+	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(aes->data->dma_bits));
 	if (ret)
-		return dev_err_probe(dev, ret, "no 32-bit DMA\n");
+		return dev_err_probe(dev, ret, "no %u-bit DMA\n", aes->data->dma_bits);
 
 	aes->bounce = dma_alloc_noncoherent(dev, AES_BOUNCE_SIZE, &aes->bounce_dma,
 					    DMA_BIDIRECTIONAL, GFP_KERNEL);
@@ -555,6 +584,10 @@ static int apple_sio_aes_probe(struct platform_device *pdev)
 	ret = devm_add_action_or_reset(dev, apple_sio_aes_free_bounce, aes);
 	if (ret)
 		return ret;
+	ret = apple_sio_aes_addr_hi(aes->data, aes->bounce_dma, &aes->bounce_hi);
+	if (ret)
+		return dev_err_probe(dev, ret, "bounce buffer at %pad is out of reach\n",
+				     &aes->bounce_dma);
 
 	ret = devm_request_irq(dev, aes->irq, apple_sio_aes_irq, 0,
 			       dev_name(dev), aes);
@@ -602,8 +635,9 @@ static int apple_sio_aes_probe(struct platform_device *pdev)
 	aes->debugfs = debugfs_create_dir(dev_name(dev), NULL);
 	debugfs_create_file("stats", 0400, aes->debugfs, aes, &apple_sio_aes_stats_fops);
 
-	dev_info(dev, "AES engine ready (readiness %#010x, ECB/CBC/CTR, priority %d)\n",
-		 aes->readiness, AES_PRIORITY);
+	dev_info(dev, "AES engine rev %u ready (readiness %#010x, %u-bit DMA, ECB/CBC/CTR, priority %d)\n",
+		 aes->data->revision, aes->readiness, aes->data->dma_bits,
+		 AES_PRIORITY);
 	return 0;
 }
 
@@ -644,13 +678,27 @@ static int apple_sio_aes_resume(struct device *dev)
 static DEFINE_SIMPLE_DEV_PM_OPS(apple_sio_aes_pm, apple_sio_aes_suspend,
 				apple_sio_aes_resume);
 
+/*
+ * Revision 3 decodes 36 address bits; this driver keeps it on a 32-bit
+ * mask, so its upper address word stays zero. Revision 5 decodes 42
+ * address bits, ten in each half of the upper address word, and its SIO
+ * DART window starts above 4 GiB, so that word is always in use there.
+ */
 static const struct apple_sio_aes_data apple_sio_aes_v3 = {
 	.revision = 3,
+	.dma_bits = 32,
+};
+
+static const struct apple_sio_aes_data apple_sio_aes_v5 = {
+	.revision = 5,
+	.dma_bits = 42,
 };
 
 static const struct of_device_id apple_sio_aes_of_match[] = {
 	{ .compatible = "apple,t6000-aes", .data = &apple_sio_aes_v3 },
 	{ .compatible = "apple,t8112-aes", .data = &apple_sio_aes_v3 },
+	{ .compatible = "apple,t6041-aes", .data = &apple_sio_aes_v5 },
+	{ .compatible = "apple,t8140-aes", .data = &apple_sio_aes_v5 },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, apple_sio_aes_of_match);

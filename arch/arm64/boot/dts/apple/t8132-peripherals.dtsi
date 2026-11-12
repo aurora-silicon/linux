@@ -8,7 +8,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1041 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	dart_scaler1: filter@38079c000 {
@@ -23,7 +23,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1020 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	dart_jpeg10: iommu@3a5080000 {
@@ -32,7 +32,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1023 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	dart_ave0: iommu@421080000 {
@@ -318,7 +318,7 @@
 		power-domains = <&ps_msr>, <&ps_msr_ase_core>;
 		iommus = <&dart_scaler0 0>, <&dart_scaler0 1>;
 		clocks = <&peripheral_clocks 399>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	jpeg0: jpeg@3a5000000 {
@@ -329,7 +329,7 @@
 		power-domains = <&ps_jpg>;
 		iommus = <&dart_jpeg00 0>;
 		clocks = <&peripheral_clocks 322>, <&peripheral_clocks 323>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	jpeg1: jpeg@3a5060000 {
@@ -340,7 +340,7 @@
 		power-domains = <&ps_jpg>;
 		iommus = <&dart_jpeg10 0>;
 		clocks = <&peripheral_clocks 322>, <&peripheral_clocks 323>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ave: video-encoder@421100000 {
