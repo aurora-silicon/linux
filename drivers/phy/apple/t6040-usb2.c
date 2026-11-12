@@ -358,7 +358,6 @@ struct t6040_usb2_phy {
 	bool tun_pll;		/* AUSPLL programmed for DP tunnels */
 	bool router_running;	/* the USB4 router runs on this port's CIO link */
 	bool usb3_tunnel_req;	/* the router carries USB3 for the controller */
-	bool cio_flip;
 
 	/* A sleep with the host kept, see apple_t6040_atcphy_sleep_prepare() */
 	bool sleep_armed;	/* taken on by the prepare, until the finish */
@@ -2613,7 +2612,6 @@ retry:
 
 	t6040_recovery_complete(&tphy->recovery);
 	tphy->cio_up = true;
-	tphy->cio_flip = flip;
 	dev_info(tphy->dev, "CIO PHY up (mode 2), %s orientation: xbar %#x/%#x cfg %#x/%#x\n",
 		 flip ? "reverse" : "normal", readl(core + T6040_CORE_XBAR),
 		 readl(core + T6040_CORE_XBAR_LANES), readl(t6040_cfg(tphy) + T6040_CFG_CTRL),
