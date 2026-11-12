@@ -17,6 +17,14 @@
 static DEFINE_MUTEX(pmp_lock);
 static const void *pmp_data;
 static struct device *pmp_device;
+
+/* Standalone C host extraction has no Rust object; real APPLE_PMP depends on RUST. */
+#ifndef CONFIG_RUST
+int apple_pmp_read_gpu_effort(const void *data, u32 *count, u32 *effort)
+{
+	return -ENODEV;
+}
+#endif
 /* The firmware is stopped for a system sleep. */
 static bool pmp_asleep;
 
