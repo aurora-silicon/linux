@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/chosen/aurora,s2r-mailbox.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Return path of a boot object that owns the CPU reset vectors
+
+maintainers:
+  - František Balázsy <frantisekbalazsy@gmail.com>
+
+description: |
+  On Apple silicon the boot firmware locks every CPU's reset vector to the
+  boot object it started. A CPU that comes back from a power-off, and every
+  CPU after a suspend to RAM, therefore restarts in the boot object, not in the
+  kernel. A boot object that sends such a CPU back to the kernel says so with
+  this property: a secondary CPU returns through its spin-table release
+  address, and the boot CPU of a resume jumps, at EL2 with the MMU off, to the
+  address the kernel left in the mailbox. Its presence also tells the kernel
+  that its spin-table CPUs may leave the kernel and come back.
+
+  The mailbox is four 64-bit words in the CPU's byte order:
+    0: the magic value 0x3152325341525541 ("AURAS2R1"), written by the boot
+       object before the kernel starts
+    1: the MPIDR of the only CPU that may take the resume address
+    2: the resume address, set by the kernel before it suspends and cleared
+       by the boot object when a CPU takes it
+    3: how many times the resume address was taken
+
+select:
+  properties:
+    $nodename:
+      const: chosen
+  required:
+    - $nodename
+
+properties:
+  $nodename:
+    const: chosen
+
+  aurora,s2r-mailbox:
+    $ref: /schemas/types.yaml#/definitions/uint64
+    description:
+      Physical address of the mailbox, inside the boot object's own memory,
+      which the kernel does not use.
+
+additionalProperties: true
+...

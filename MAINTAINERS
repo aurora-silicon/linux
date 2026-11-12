@@ -2091,6 +2091,7 @@ F:	include/linux/mt7932.h
 F:	include/linux/soc/apple/pmp-report.h
 F:	Documentation/devicetree/bindings/chosen/apple,dcp-rtkit-quiesced.yaml
 F:	Documentation/devicetree/bindings/chosen/aurora,ctxr-exec-window.yaml
+F:	Documentation/devicetree/bindings/chosen/aurora,s2r-mailbox.yaml
 F:	Documentation/devicetree/bindings/display/apple,dcp.yaml
 F:	Documentation/devicetree/bindings/display/apple,display-subsystem.yaml
 F:	Documentation/devicetree/bindings/display/apple,t8140-display-power.yaml
