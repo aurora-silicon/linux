@@ -110,6 +110,9 @@ static struct {
 	atomic_t hwrng;
 	atomic_t stac;
 	atomic_t stac_onlines;
+	/* Written once, before pnon reads SEP_DIAG_PNON_READ (release/acquire). */
+	u8 pnon_digest[SEP_DIAG_PNON_DIGEST_LEN];
+	int pnon;
 	atomic_t xarm_failures;
 	atomic_t unhandled;
 	atomic_t sleeps;
@@ -567,6 +570,42 @@ static ssize_t stac_onlines_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(stac_onlines);
 
+static ssize_t pnon_show(struct device *dev, struct device_attribute *attr,
+			 char *buf)
+{
+	const char *state;
+
+	/* Pairs with the release in sep_diag_set_pnon(). */
+	switch (smp_load_acquire(&sep_diag.pnon)) {
+	case SEP_DIAG_PNON_READ:
+		state = "read";
+		break;
+	case SEP_DIAG_PNON_ABSENT:
+		state = "absent";
+		break;
+	case SEP_DIAG_PNON_FAILED:
+		state = "failed";
+		break;
+	default:
+		state = "pending";
+		break;
+	}
+	return sysfs_emit(buf, "%s\n", state);
+}
+static DEVICE_ATTR_RO(pnon);
+
+/* Root only: it identifies the machine's boot policy. */
+static ssize_t local_policy_digest_show(struct device *dev,
+					struct device_attribute *attr, char *buf)
+{
+	/* Acquire: a reader that sees READ sees the digest. */
+	if (smp_load_acquire(&sep_diag.pnon) != SEP_DIAG_PNON_READ)
+		return -ENODATA;
+	return sysfs_emit(buf, "%*phN\n", SEP_DIAG_PNON_DIGEST_LEN,
+			  sep_diag.pnon_digest);
+}
+static DEVICE_ATTR_ADMIN_RO(local_policy_digest);
+
 static ssize_t xarm_failures_show(struct device *dev,
 				  struct device_attribute *attr, char *buf)
 {
@@ -624,6 +663,8 @@ static struct attribute *sep_diag_attrs[] = {
 	&dev_attr_hwrng.attr,
 	&dev_attr_stac.attr,
 	&dev_attr_stac_onlines.attr,
+	&dev_attr_pnon.attr,
+	&dev_attr_local_policy_digest.attr,
 	&dev_attr_xarm_failures.attr,
 	&dev_attr_unhandled_messages.attr,
 	&dev_attr_sleeps.attr,
@@ -690,6 +731,20 @@ void sep_diag_set_stac(int state)
 	if (state == SEP_DIAG_STAC_ONLINE)
 		atomic_inc(&sep_diag.stac_onlines);
 	atomic_set(&sep_diag.stac, state);
+}
+
+void sep_diag_set_pnon(int state, const u8 *digest, size_t len)
+{
+	/* The digest is written once per probe, before the state says so. */
+	if (state == SEP_DIAG_PNON_READ) {
+		/* Acquire: never rewrite a digest a reader may be copying. */
+		if (!digest || len != SEP_DIAG_PNON_DIGEST_LEN ||
+		    smp_load_acquire(&sep_diag.pnon) == SEP_DIAG_PNON_READ)
+			return;
+		memcpy(sep_diag.pnon_digest, digest, len);
+	}
+	/* Release: the digest is visible before READ is. */
+	smp_store_release(&sep_diag.pnon, state);
 }
 
 unsigned int sep_diag_xarm_failed(void)
