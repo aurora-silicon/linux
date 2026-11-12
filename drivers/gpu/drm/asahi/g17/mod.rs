@@ -1686,7 +1686,7 @@ impl Gpu {
         if pmp {
             // SAFETY: `dev` remains live for the device link. The helper
             // resolves the phandle and defers probe until the PMP is bound.
-            let ret = unsafe { kernel::bindings::apple_pmp_link_device(dev.as_raw()) };
+            let ret = unsafe { kernel::bindings::apple_pmp_link_device(dev.as_ref().as_raw()) };
             if ret != 0 {
                 return Err(Error::from_errno(ret));
             }
