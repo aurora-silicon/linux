@@ -6,13 +6,13 @@ from pathlib import Path
 p=argparse.ArgumentParser();p.add_argument('--out',required=True);p.add_argument('--old-ref');p.add_argument('--mutation',choices=['epoch','close','producer-fence','active-fence','board','board-j616s','cold-gate','cold-windows','cold-running-fw','cold-rti','cold-unquiesce','cold-reset','cold-send','cold-queue','cold-unarmed','cold-rearm','cold-error','cold-sticky','cold-setup-retry','cold-defer','cold-open-queue','cold-owed-kept','cold-resume-fence','cold-queue-fence']);a=p.parse_args()
 r=Path(__file__).resolve().parents[2];o=Path(a.out);o.mkdir(parents=True,exist_ok=False);(o/'tmp').mkdir()
 def extract(s,n):
- m=re.search(r'^(?:static )?(?:int|void|bool) '+n+r'\([^;]*?\)\n\{',s,re.M|re.S)
+ m=re.search(r'^(?:static )?(?:(?:int|void|bool) |const struct \w+ \*)'+n+r'\([^;]*?\)\n\{',s,re.M|re.S)
  if not m:raise ValueError(n)
  b=s.index('{',m.start())+1;depth=1
  while depth:depth+=(s[b]=='{')-(s[b]=='}');b+=1
  return s[m.start():b]+'\n'
 s=(r/'drivers/bluetooth/hci_bcm4377.c').read_text();core=(r/'net/bluetooth/hci_sync.c').read_text();core_hci=(r/'net/bluetooth/hci_core.c').read_text()
-names=['bcm4377_setup_retry_allowed','bcm4377_queue_setup_retry','bcm4377_setup_retry_work','bcm4377_resume_recovery_supported','bcm4377_resume_recovery_allowed','bcm4377_resume_recovery_invalidate','bcm4377_resume_recovery_sync','bcm4377_resume_recovery_destroy','bcm4377_resume_recovery_work','bcm4377_hci_resume','bcm4377_hci_resume_work','bcm4377_queue_hci_resume','bcm4377_hci_timeout','bcm4377_resume_recovery_stop','bcm4377_hci_open','bcm4377_hci_close','bcm4377_hci_setup_once','bcm4377_hci_setup','bcm4377_hci_post_init','bcm4377_hci_send_frame','bcm4377_init_cfg','bcm4377_hci_unregister_dev','bcm4377_sleep_finish','bcm4377_suspend','bcm4377_resume_cold','bcm4377_resume']
+names=['bcm4377_setup_retry_allowed','bcm4377_queue_setup_retry','bcm4377_setup_retry_work','bcm4377_resume_board','bcm4377_resume_recovery_supported','bcm4377_resume_recovery_allowed','bcm4377_resume_recovery_invalidate','bcm4377_resume_recovery_sync','bcm4377_resume_recovery_destroy','bcm4377_resume_recovery_work','bcm4377_hci_resume','bcm4377_hci_resume_work','bcm4377_queue_hci_resume','bcm4377_hci_timeout','bcm4377_resume_recovery_stop','bcm4377_hci_open','bcm4377_hci_close','bcm4377_hci_setup_once','bcm4377_hci_setup','bcm4377_hci_post_init','bcm4377_hci_send_frame','bcm4377_init_cfg','bcm4377_hci_unregister_dev','bcm4377_sleep_finish','bcm4377_suspend','bcm4377_resume_cold','bcm4377_resume']
 # The board table goes ahead of the functions that walk it.
 boards=re.search(r'^static const struct bcm4377_resume_board \{.*?^\};',s,re.M|re.S).group()+'\n'
 bodies={'@boards':boards,**{n:extract(s,n) for n in names}};shared=[]
@@ -25,7 +25,7 @@ mutations={
  'close':('bcm4377_hci_close','bcm4377_resume_recovery_invalidate(bcm4377);','',18),
  'producer-fence':('bcm4377_resume_recovery_stop','cancel_work_sync(&bcm4377->resume_work);','',21),
  'active-fence':('bcm4377_resume_recovery_stop','flush_work(&bcm4377->hdev->cmd_sync_work);','',40),
- 'board':('bcm4377_resume_recovery_supported','of_machine_is_compatible(board->machine)','true',13),
+ 'board':('bcm4377_resume_board','of_machine_is_compatible(board->machine)','true',13),
  # The BCM4388 row on the J493's board.
  'board-j616s':('@boards','"apple,j616s"','"apple,j493"',16),
  # A resume that finds the function reset by the sleep and without firmware.

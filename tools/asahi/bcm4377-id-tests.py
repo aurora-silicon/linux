@@ -37,7 +37,9 @@ static int bcm4387_send_calibration(struct bcm4377_data *b) { (void)b;return 0; 
 static int bcm4388_send_calibration(struct bcm4377_data *b) { (void)b;return 0; }
 struct pci_device_id { unsigned int vendor,device,subvendor,subdevice,class,class_mask;unsigned long driver_data; };
 struct bcm4377_data { const struct bcm4377_hw *hw; };
-struct hci_dev { void (*reset)(struct hci_dev *); };
+struct hci_dev { void (*reset)(struct hci_dev *); bool no_suspend_notifier; };
+#define HCI_QUIRK_NO_SUSPEND_NOTIFIER 1
+#define hci_set_quirk(hdev, nr) ((hdev)->no_suspend_notifier = (nr) == HCI_QUIRK_NO_SUSPEND_NOTIFIER)
 static void bcm4377_hci_timeout(struct hci_dev *hdev) { (void)hdev; }
 static const char *board;
 static bool of_machine_is_compatible(const char *compat) { assert(!strcmp(compat,"apple,j493")||!strcmp(compat,"apple,j616s"));return !strcmp(board,compat); }
@@ -47,6 +49,7 @@ SUFFIX = r'''
 static bool probe_registration(struct bcm4377_data *bcm4377,const struct pci_device_id *id,struct hci_dev *hdev) {
 @SELECTION@
 @REGISTRATION@
+@NOTIFIER@
     return hdev->reset==bcm4377_hci_timeout;
 }
 int main(void) {
@@ -68,6 +71,8 @@ int main(void) {
             assert(data.hw==&bcm4377_hw_variants[id->driver_data]);
             assert(bcm4377_resume_recovery_supported(&data)==expected);
             if(expected)assert(hdev.reset==bcm4377_hci_timeout);else assert(!hdev.reset);
+            /* Only the pair whose suspend to RAM takes the firmware suspends and resumes HCI alone. */
+            assert(hdev.no_suspend_notifier==(id->device==BCM4388_DEVICE_ID && !strcmp(board,"apple,j616s")));
             cases++;
         }
     }
@@ -101,10 +106,15 @@ def main():
         'registration': r'^\tif \(bcm4377_resume_recovery_supported\(bcm4377\)\)\n\t\thdev->reset = bcm4377_hci_timeout;',
         'gate': r'^static bool bcm4377_resume_recovery_supported\([^;]*?\)\n\{.*?^\}',
     }
+    # What the current probe adds for a pair whose sleep takes the firmware; the old one has none.
+    notifier = take(current, r'^\tif \(bcm4377_resume_cold_sleep\(bcm4377\)\)\n\t\thci_set_quirk\(hdev, HCI_QUIRK_NO_SUSPEND_NOTIFIER\);')
     pieces = {name: take(current, pattern) for name, pattern in patterns.items()}
     old_pieces = {name: take(old, pattern) for name, pattern in patterns.items()}
     # The admission function walks a table of chip and board pairs; the old one named its pair.
-    pieces['gate'] = take(current, r'^static const struct bcm4377_resume_board \{.*?^\};') + '\n\n' + pieces['gate']
+    pieces['gate'] = '\n\n'.join([take(current, r'^static const struct bcm4377_resume_board \{.*?^\};'),
+                                  take(current, r'^static const struct bcm4377_resume_board \*bcm4377_resume_board\([^;]*?\)\n\{.*?^\}'),
+                                  pieces['gate'],
+                                  take(current, r'^static bool bcm4377_resume_cold_sleep\([^;]*?\)\n\{.*?^\}')])
     # The old gate is compiled against the current tables. Later commits added
     # hardware fields and variant settings, so the struct and table may differ,
     # but the old gate must still see the same chip IDs, PCI table and probe code.
@@ -128,6 +138,9 @@ def main():
     assert 'BAR2_CONTEXT_ADDR_HI' in hw_defs, hw_defs
     source_prefix = PREFIX + defs + '\n' + hw_defs + '\n' + pci_defs + '\n' + any_id + '\n' + '\n'.join(pieces[n] for n in ('enum', 'hw_struct', 'variants', 'pci_macro_table'))
     suffix = SUFFIX.replace('@SELECTION@', pieces['selection']).replace('@REGISTRATION@', pieces['registration'])
+    # The published original has no such pair: its probe is compiled without the statement.
+    old_suffix = suffix.replace('@NOTIFIER@', '')
+    suffix = suffix.replace('@NOTIFIER@', notifier)
     gates = {'positive': pieces['gate'], 'published-original': old_pieces['gate']}
     assert pieces['gate'].count('0x4378') == 1
     gates['decimal-id'] = pieces['gate'].replace('0x4378', '4378')
@@ -143,12 +156,17 @@ def main():
     gates['j616s-other-chip'] = pieces['gate'].replace('0x4388', '0x4387')
     gates['j616s-row-on-j493'] = pieces['gate'].replace('"apple,j616s"', '"apple,j493"')
     gates['crossed-boards'] = pieces['gate'].replace('"apple,j493"', '@').replace('"apple,j616s"', '"apple,j493"').replace('@', '"apple,j616s"')
+    # The row whose sleep takes the firmware is the J616s one, and only that one.
+    assert pieces['gate'].count(', .cold_sleep = true') == 1
+    gates['cold-sleep-nowhere'] = pieces['gate'].replace(', .cold_sleep = true', '')
+    gates['cold-sleep-on-j493'] = pieces['gate'].replace(', .cold_sleep = true', '').replace('"apple,j493" }', '"apple,j493", .cold_sleep = true }')
+    assert gates['cold-sleep-on-j493'].count('.cold_sleep = true') == 1
     results = {}
     def no_core():
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     for name, gate in gates.items():
         source = args.out / f'{name}.c'
-        source.write_text(source_prefix + gate + suffix)
+        source.write_text(source_prefix + gate + (old_suffix if name == 'published-original' else suffix))
         binary = source.with_suffix('')
         subprocess.run([args.cc, '-std=gnu11', '-g', '-O1', '-fsanitize=address,undefined', '-fno-omit-frame-pointer', str(source), '-o', str(binary)], check=True)
         run = subprocess.run([str(binary)], capture_output=True, text=True, preexec_fn=no_core)

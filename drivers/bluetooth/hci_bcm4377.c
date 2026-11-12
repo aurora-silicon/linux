@@ -1610,20 +1610,38 @@ static void bcm4377_setup_retry_work(struct work_struct *work)
 static const struct bcm4377_resume_board {
 	unsigned int id;
 	const char *machine;
+	/*
+	 * A suspend to RAM takes the firmware. The core then resumes after the reset, from
+	 * this driver, which makes its system sleep callbacks the only ones that suspend
+	 * and resume the core.
+	 */
+	bool cold_sleep;
 } bcm4377_resume_boards[] = {
 	{ .id = 0x4378, .machine = "apple,j493" },
-	{ .id = 0x4388, .machine = "apple,j616s" },
+	{ .id = 0x4388, .machine = "apple,j616s", .cold_sleep = true },
 	{ }
 };
 
-static bool bcm4377_resume_recovery_supported(struct bcm4377_data *bcm4377)
+static const struct bcm4377_resume_board *bcm4377_resume_board(struct bcm4377_data *bcm4377)
 {
 	const struct bcm4377_resume_board *board;
 
 	for (board = bcm4377_resume_boards; board->machine; board++)
 		if (bcm4377->hw->id == board->id && of_machine_is_compatible(board->machine))
-			return true;
-	return false;
+			return board;
+	return NULL;
+}
+
+static bool bcm4377_resume_recovery_supported(struct bcm4377_data *bcm4377)
+{
+	return bcm4377_resume_board(bcm4377);
+}
+
+static bool bcm4377_resume_cold_sleep(struct bcm4377_data *bcm4377)
+{
+	const struct bcm4377_resume_board *board = bcm4377_resume_board(bcm4377);
+
+	return board && board->cold_sleep;
 }
 
 static bool bcm4377_resume_recovery_allowed(struct hci_dev *hdev)
@@ -3154,6 +3172,12 @@ static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	hdev->post_init = bcm4377_hci_post_init;
 	if (bcm4377_resume_recovery_supported(bcm4377))
 		hdev->reset = bcm4377_hci_timeout;
+	/*
+	 * The core's notifier would resume the controller as soon as tasks are thawed, when
+	 * the function a sleep left cold is not reset yet. bcm4377_resume() does it instead.
+	 */
+	if (bcm4377_resume_cold_sleep(bcm4377))
+		hci_set_quirk(hdev, HCI_QUIRK_NO_SUSPEND_NOTIFIER);
 
 	if (bcm4377->hw->broken_mws_transport_config)
 		hci_set_quirk(hdev, HCI_QUIRK_BROKEN_MWS_TRANSPORT_CONFIG);
