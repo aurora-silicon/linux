@@ -7158,6 +7158,38 @@ static void atcphy_sleep_ss_up(struct apple_atcphy *atcphy)
 }
 
 /* No lane or port change here: anything the sleep needs is done at noirq, in a few ms. */
+/* For the debug line: the conditions of atcphy_can_sleep_in_place() that fail, by name. */
+static void atcphy_sleep_in_place_misses(const struct apple_atcphy *atcphy, char *buf, size_t size)
+{
+	enum atcphy_pipehandler_state pipe = atcphy_pipe_state_for(atcphy, atcphy->mode);
+	unsigned int i;
+	int len = 0;
+
+#define ATCPHY_MISS(cond, name) \
+	do { if (cond) len += scnprintf(buf + len, size - len, " %s", name); } while (0)
+	buf[0] = 0;
+	ATCPHY_MISS(!atcphy->hw->has_t8140_dp, "no_t8140_dp");
+	ATCPHY_MISS(!atcphy->fixed_usb2, "no_fixed_usb2");
+	ATCPHY_MISS(!atcphy->sleep_power, "no_sleep_power");
+	for (i = 0; i < atcphy->sleep_ndarts; i++)
+		ATCPHY_MISS(!apple_dart_sleep_listed(atcphy->sleep_darts[i]), "dart_unlisted");
+	ATCPHY_MISS(apple_sleep_domain_check(atcphy->pd_usb), "pd_usb");
+	ATCPHY_MISS(apple_sleep_domain_check(atcphy->pd_common), "pd_common");
+	ATCPHY_MISS(atcphy->sleep_no_keep, "sleep_no_keep");
+	ATCPHY_MISS(!atcphy->host_active, "host_inactive");
+	ATCPHY_MISS(atcphy->mode != APPLE_ATCPHY_MODE_USB2 &&
+		    atcphy->mode != APPLE_ATCPHY_MODE_USB3, "mode");
+	ATCPHY_MISS(atcphy->mode_dirty, "mode_dirty");
+	ATCPHY_MISS(atcphy->pipe_pending, "pipe_pending");
+	ATCPHY_MISS(atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY &&
+		    atcphy->pipe_state != pipe, "pipe_state");
+	ATCPHY_MISS(atcphy->usb_off_pending, "usb_off_pending");
+	ATCPHY_MISS(atcphy->dp_owned_pmas, "dp_owned_pmas");
+	ATCPHY_MISS(atcphy->aux_power_requested, "aux_power_requested");
+	ATCPHY_MISS(atcphy->tunnel_users, "tunnel_users");
+#undef ATCPHY_MISS
+}
+
 int apple_atcphy_sleep_prepare(struct phy *usb2_phy)
 {
 	struct apple_atcphy *atcphy = atcphy_from_usb2_phy(usb2_phy);
@@ -7172,10 +7204,14 @@ int apple_atcphy_sleep_prepare(struct phy *usb2_phy)
 		atcphy->sleep_ret = 0;
 		return 0;
 	}
-	if (atcphy->regs.pwrctl && atcphy->fixed_usb2)
+	if (atcphy->regs.pwrctl && atcphy->fixed_usb2) {
+		char why[160];
+
+		atcphy_sleep_in_place_misses(atcphy, why, sizeof(why));
 		dev_dbg(atcphy->dev,
-			"USB controller stops for the sleep: mode %d, PIPE %d, host %d\n",
-			atcphy->mode, atcphy->pipe_state, atcphy->host_active);
+			"USB controller stops for the sleep: mode %d, PIPE %d, host %d, because:%s\n",
+			atcphy->mode, atcphy->pipe_state, atcphy->host_active, why);
+	}
 
 	return -EBUSY;
 }
