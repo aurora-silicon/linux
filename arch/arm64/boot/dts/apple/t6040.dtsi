@@ -254,7 +254,7 @@
 	sleep-controller {
 		compatible = "apple,t6040-sleep";
 		/*
-		 * The SoC blocks the (currently unreachable) commit and wake
+		 * The SoC blocks the commit and wake
 		 * write, all shared read/write with their owning drivers and
 		 * touched only once no blocker remains:
 		 *   cpu-start   pmgr reg0 + 0x88000 (misc-cores): CPU start/stop
@@ -298,8 +298,8 @@
 		 * object (aura) publishes apple,apcie here plus the axi2af/cio3pll/
 		 * clkgen/phy-block/phy-ip windows and apple,tunable-* arrays onto the
 		 * internal PCIe host (apple,t6020-pcie, identified by its "rc"
-		 * reg-name) from the ADT /arm-io/apcie0 at boot, matching aurora
-		 * #1208's single-lane t8140 shape. That publish is idempotent and
+		 * reg-name) from the ADT /arm-io/apcie0 at boot, matching the
+		 * single-lane t8140 shape. That publish is idempotent and
 		 * returns early if apple,apcie is already present, so there must be NO
 		 * static apple,apcie or apcie-storage node here -- a static one blocks
 		 * the loader (seen on the J616s: a static apple,apcie made
