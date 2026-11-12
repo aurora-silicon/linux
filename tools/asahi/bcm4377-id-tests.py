@@ -40,7 +40,7 @@ struct bcm4377_data { const struct bcm4377_hw *hw; };
 struct hci_dev { void (*reset)(struct hci_dev *); };
 static void bcm4377_hci_timeout(struct hci_dev *hdev) { (void)hdev; }
 static const char *board;
-static bool of_machine_is_compatible(const char *compat) { assert(!strcmp(compat,"apple,j493"));return !strcmp(board,compat); }
+static bool of_machine_is_compatible(const char *compat) { assert(!strcmp(compat,"apple,j493")||!strcmp(compat,"apple,j616s"));return !strcmp(board,compat); }
 '''
 
 SUFFIX = r'''
@@ -51,16 +51,19 @@ static bool probe_registration(struct bcm4377_data *bcm4377,const struct pci_dev
 }
 int main(void) {
     unsigned cases=0;
-    const char *boards[]={"apple,j493","apple,j273","apple,j293","apple,j313","apple,j274","apple,j375","apple,j473","apple,j474","apple,j414s","apple,j416c","apple,j613","apple,j615","apple,j514s","apple,j700"};
+    const char *boards[]={"apple,j493","apple,j273","apple,j293","apple,j313","apple,j274","apple,j375","apple,j473","apple,j474","apple,j414s","apple,j416c","apple,j613","apple,j615","apple,j514s","apple,j616s","apple,j700"};
     assert(bcm4377_hw_variants[BCM4378].id==0x4378);
     assert(bcm4377_hw_variants[BCM4378].id!=4378);
+    assert(bcm4377_hw_variants[BCM4388].id==0x4388);
+    assert(bcm4377_hw_variants[BCM4388].id!=4388);
     for(unsigned chip=0;chip<4;chip++) {
         const struct pci_device_id *id=&bcm4377_devid_table[chip];
         assert(id->vendor==PCI_VENDOR_ID_BROADCOM);
         assert(id->driver_data==chip);
         for(unsigned b=0;b<sizeof(boards)/sizeof(boards[0]);b++) {
             board=boards[b];struct bcm4377_data data={};struct hci_dev hdev={};
-            bool expected=id->device==BCM4378_DEVICE_ID && !strcmp(board,"apple,j493");
+            bool expected=(id->device==BCM4378_DEVICE_ID && !strcmp(board,"apple,j493")) ||
+                          (id->device==BCM4388_DEVICE_ID && !strcmp(board,"apple,j616s"));
             assert(probe_registration(&data,id,&hdev)==expected);
             assert(data.hw==&bcm4377_hw_variants[id->driver_data]);
             assert(bcm4377_resume_recovery_supported(&data)==expected);
@@ -71,6 +74,9 @@ int main(void) {
     board="apple,j493";
     struct bcm4377_hw wrong=bcm4377_hw_variants[BCM4378];wrong.id=4378;
     struct bcm4377_data decimal={.hw=&wrong};assert(!bcm4377_resume_recovery_supported(&decimal));cases++;
+    board="apple,j616s";
+    struct bcm4377_hw wrong88=bcm4377_hw_variants[BCM4388];wrong88.id=4388;
+    struct bcm4377_data decimal88={.hw=&wrong88};assert(!bcm4377_resume_recovery_supported(&decimal88));cases++;
     printf("%u table-backed identity and callback cases PASS\n",cases);return 0;
 }
 '''
@@ -125,6 +131,12 @@ def main():
     gates['decimal-id'] = pieces['gate'].replace('0x4378', '4378')
     gates['other-chip'] = pieces['gate'].replace('0x4378', '0x4387')
     gates['board-bypass'] = pieces['gate'].replace('of_machine_is_compatible("apple,j493")', 'true')
+    # The J616s clause gets the same three, and the two clauses must not trade boards.
+    assert pieces['gate'].count('0x4388') == 1
+    gates['j616s-decimal-id'] = pieces['gate'].replace('0x4388', '4388')
+    gates['j616s-other-chip'] = pieces['gate'].replace('0x4388', '0x4387')
+    gates['j616s-board-bypass'] = pieces['gate'].replace('of_machine_is_compatible("apple,j616s")', 'true')
+    gates['crossed-boards'] = pieces['gate'].replace('"apple,j493"', '@').replace('"apple,j616s"', '"apple,j493"').replace('@', '"apple,j616s"')
     results = {}
     def no_core():
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))

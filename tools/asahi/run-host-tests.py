@@ -98,7 +98,10 @@ ASAHI_TESTS = {
     'bcm4377-id-tests.py': [(out() + ['--old-ref', '87ddae1397f6f70817cb57df76477a86bdf96424'], PASS)],
     # These mutations are caught inside the test, which then exits 0.
     'bcm4377-resume-tests.py': [(out(), PASS)]
-        + mutations('--mutation', ('epoch', 'close', 'producer-fence', 'active-fence', 'board'), out(), PASS),
+        + mutations('--mutation', ('epoch', 'close', 'producer-fence', 'active-fence', 'board', 'board-j616s',
+                                   'cold-gate', 'cold-windows', 'cold-running-fw', 'cold-rti', 'cold-unquiesce',
+                                   'cold-reset', 'cold-send', 'cold-queue', 'cold-unarmed', 'cold-rearm',
+                                   'cold-error', 'cold-sticky', 'cold-setup-retry'), out(), PASS),
     'bcm4377-sleep-config-tests.py': [([], PASS)],
     'brcmf-assoc-tests.py': [(out('--output'), PASS)]
         + mutations('--mutation', ('short-ie', 'header-length', 'skb-capacity', 'cmplt-header'), out('--output')),
