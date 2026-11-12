@@ -1,25 +1,28 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * Apple T6040 (M4 Pro) system sleep: refusal-first controller.
+ * Apple SoC system sleep: the T6040 (M4 Pro) part
  *
- * This is the T6040 port of the T8140 deep sleep at EL2 (sleep.c). Its commit
- * EL2). Its commit follows the T6040 entry as measured on the J616s,
- * with what the SoC's sleep engine needs from an OS that is not the platform (see
- * t6040_sleep_commit); its wake return mirrors the PMGR wake restore (see
- * t6040_sleep_return).
+ * The T6040 sleeps through the same boot object and mailbox as the SoCs sleep.c takes from
+ * its lists, and nearly every step in between differs: three CPU complexes, five display
+ * pipes whose power states have to read off first, two storage PCIe lanes, the wake block
+ * and the order of the commit. So this file is a part of that driver (sleep-internal.h) with
+ * its own probe, state and suspend operations. The commit follows the T6040 entry as
+ * measured on the J616s, with what the SoC's sleep engine needs from the OS (see
+ * t6040_sleep_commit); the wake return mirrors the PMGR wake restore
+ * (see t6040_sleep_return). The registry of coprocessors and of the enclave
+ * (linux/soc/apple/sleep.h), the dry run level and the mailbox layout are the generic
+ * driver's.
  *
- * What it does:
+ * It refuses first:
  *
- *  - It keeps the debugfs preflight of the display power states the platform checks
- *    before it sleeps (device-check-ps-b4-sleep).
- *  - It uses the coprocessor and enclave registry it shares with T8140 (sleep.h):
- *    a driver that can only stop its coprocessor once the sleep is certain
- *    (ANS, the PMP, the SEP's sleep request) registers here, readies it in its
- *    own suspend and leaves the last stop to the commit, after every refusal.
- *    A refused sleep then finds it running.
- *  - Its suspend_ops .begin computes the blocker list. By default a
- *    `echo mem > /sys/power/state` prints every blocker and returns an error
- *    before any device suspends.
+ *  - It binds below EL2 and without the boot object's mailbox as well, and shows both as
+ *    blockers in debugfs t6040-sleep/preflight, next to the CPUs that can park and the
+ *    display power states the ADT lists to check before a sleep (device-check-ps-b4-sleep).
+ *  - It offers suspend-to-RAM only to a system booted with t6040_sleep.allow_entry=1.
+ *    Without it suspend-to-idle stays the default sleep, and it passes through here
+ *    untouched either way.
+ *  - Its suspend_ops .begin computes the blocker list of a suspend-to-RAM. With a blocker
+ *    left it prints every one and returns an error before any device suspends.
  *  - Dry runs (t6040_sleep.dry_run, also writable at runtime):
  *      1: pm_suspend_via_firmware() is set, so every driver's firmware-driven
  *         sleep step that can be taken back runs (apple_sleep_power_loss() is
@@ -36,12 +39,8 @@
  *    watchdog's WD2 is its net (t6040_sleep.sleep_wd_secs), and over the device
  *    suspend and resume around it.
  *
- * Why this file and not a generalisation of sleep.c: the port keeps
- * the T8140 behaviour byte-identical, and the T6040 commit and wake differ
- * from it in most steps, so it is a controller of its own. The coprocessor and
- * enclave registry is shared
- * (sleep-registry.c), so one kernel carries both controllers, and each binds
- * only to its own SoC.
+ * The lid's state at the wake and the USB wake ports, which the generic driver keeps for the
+ * display and the port controllers, are declined: this sleep was tested without them.
  */
 
 #include <linux/bitfield.h>
@@ -98,7 +97,7 @@
  * offsets, same bank as ps_ans); the control windows (axi2af/cio3pll/clkgen/
  * phy-block/phy-ip/rc) and the PLL/lane tunables are NOT in this SoC's static
  * description and are published by the boot object (aura) under the apple,apcie
- * node, in the same shape as on T8140. The block-internal offsets are the T8140's
+ * node, as on the T8140. The block-internal offsets are the T8140's
  * (sleep-internal.h): the same Apple PCIe IP.
  */
 #define PS_ANS			0x370	/* SOC-East: ps_ans */
@@ -965,8 +964,7 @@ static unsigned int t6040_sleep_refuse(struct t6040_sleep *s)
 
 	/*
 	 * ANS would be stopped, but its ST lanes have no way back without the
-	 * apple,apcie control windows + PLL/lane tunables. The T8140 driver keeps
-	 * suspend-to-idle the default in this state; here the deep sleep refuses.
+	 * apple,apcie control windows + PLL/lane tunables: refused.
 	 */
 	if (ans_idled && !s->apcie_st.valid) {
 		pr_err("t6040-sleep: refused: ANS would stop but the storage-apcie windows/tunables are absent (apple,apcie)\n");
@@ -1465,7 +1463,7 @@ static void t6040_wake_restore(struct t6040_sleep *s)
 }
 
 /*
- * One power word raised, as T8140's t8140_ps_raise() does: target 0xf with automatic
+ * One power word raised, as sleep.c's sleep_ps_raise() does: target 0xf with automatic
  * mode off and the flag bits cleared, ACTUAL polled, then AUTO_ENABLE. The two halves
  * are separate for a word that has to stay at a manual target for a while or for good.
  */
@@ -1797,7 +1795,7 @@ static void t6040_bridge_rearm(void __iomem *bridge)
 
 /*
  * RESUME: raise ANS's storage link from power-off, the two-lane adaptation of
- * T8140's t8140_sleep_raise_apcie(). Runs atomic on the waking core in
+ * sleep.c's apple_sleep_raise_apcie(). Runs atomic on the waking core in
  * t6040_sleep_return(), AFTER t6040_axi2af_rearm() and BEFORE control returns to
  * the PM core, so nvme's resume_early sets the ANS run bit onto a live link.
  * Both lanes come up; the PLL/clkgen/PHY tables run once (shared). The two
@@ -1869,7 +1867,7 @@ static int t6040_sleep_raise_apcie_st(struct t6040_sleep *s)
 	if (ret)
 		return ret;
 
-	/* Shared PHY bring-up + PLL/lane tables (as T8140's t8140_apcie_phy_ip_apply). */
+	/* Shared PHY bring-up + PLL/lane tables (as sleep.c's sleep_apcie_phy_ip_apply()). */
 	apple_tunable_apply(a->phy, a->phy_tunable);
 	ret = readl_poll_timeout_atomic(a->phy + APCIE_PHY_COMMON, val, val & BIT(31), 1,
 					APCIE_POLL_US);
@@ -2841,7 +2839,7 @@ static int t6040_sleep_enter(suspend_state_t state)
 		return -EBUSY;
 	}
 
-	/* The T8140 driver's order. */
+	/* The refusals, the hold and the stops in the generic driver's order. */
 	if (t6040_sleep_refuse(s)) {
 		t6040_disp_back(s);
 		return -EBUSY;
@@ -3015,7 +3013,7 @@ static void __iomem *t6040_sleep_map(struct device *dev, const char *name)
  * the boot object publishes from the ADT. Our static tree has none
  * of these, so until aura fills the node @valid stays false and a real sleep
  * with ANS stopped refuses (t6040_sleep_refuse). The reg-names and tunable
- * property names match the T8140 apple,apcie shape exactly, so the same
+ * property names match the T8140's apple,apcie shape exactly, so the same
  * loader fills both SoCs. The GP PCIe host (pcie@1cb0000000, Wi-Fi + SD) is a
  * different node and is left to cold-recover.
  */
@@ -3064,7 +3062,7 @@ static struct aura_s2r_mailbox *t6040_sleep_mailbox_at(struct t6040_sleep *s, u6
 	return mbox;
 }
 
-/* The aura #117 mailbox, if the boot object published one. Optional (a blocker if absent). */
+/* The boot object's mailbox, if it published one. Optional (a blocker if absent). */
 static void t6040_sleep_map_mailbox(struct t6040_sleep *s)
 {
 	struct device_node *chosen = of_find_node_by_path("/chosen");

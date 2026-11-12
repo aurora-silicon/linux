@@ -30,6 +30,10 @@
  * T8132 takes the same path with its own tables and operations, t8132_sleep_ops,
  * measured the same way from a macOS sleep under aura's hypervisor. Its blocks are
  * T8140's at the same offsets from a SoC base 0x80000000 higher unless noted.
+ *
+ * A SoC whose sequences differ in more than its lists brings them as a part
+ * (sleep-internal.h), and shares the registry of coprocessors with the rest:
+ * today T6040, in sleep-t6040.c.
  */
 
 #include <linux/bitfield.h>
