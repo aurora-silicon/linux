@@ -63,7 +63,10 @@ int dcp_peer_hints_v27(struct apple_dcp *dcp, struct dptx_port *port,
 bool dcp_peer_tiling_state_v27(struct apple_dcp *dcp, bool write,
 			      u32 event, u32 param, u32 *value);
 void dcp_peer_display_ids_v27(struct apple_dcp *dcp, u32 own, u32 related);
-int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, bool vrr);
+int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, u32 min_vrr);
+bool dcp_peer_needs_pair_v27(struct apple_dcp *dcp, u32 clock_khz);
+int dcp_peer_check_v27(struct apple_dcp *dcp, struct drm_atomic_commit *commit,
+		       struct drm_crtc_state *crtc_state);
 int dcp_peer_color_v27(struct apple_dcp *dcp, struct iomfb_set_matrix_req *matrix);
 int dcp_peer_stop_v27(struct apple_dcp *dcp);
 struct apple_dcp *dcp_peer_scanout_v27(struct apple_dcp *dcp);
@@ -77,6 +80,7 @@ int dcp_get_connector_type(struct platform_device *pdev);
 bool dcp_fw_compat_is_12_x(struct platform_device *pdev);
 bool dcp_fw_compat_is_14_7(struct platform_device *pdev);
 bool dcp_fw_compat_is_desktop(struct platform_device *pdev);
+bool dcp_fw_compat_panel_edr(struct platform_device *pdev);
 unsigned int dcp_gamma_lut_size(struct platform_device *pdev);
 /* T6041 external display processors may join the DRM device. */
 bool dcp_t6041_ext_enabled(void);

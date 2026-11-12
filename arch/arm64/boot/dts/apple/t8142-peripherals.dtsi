@@ -153,8 +153,9 @@
 		compatible = "apple,t8142-dart", "apple,t8110-dart";
 		reg = <0x3 0x5260000 0x0 0x20000>;
 		interrupts = <AIC_IRQ 1208 IRQ_TYPE_LEVEL_HIGH>;
+		/* No DART gate in the ADT: powered with its engine. */
+		power-domains = <&ps_msr>;
 		#iommu-cells = <1>;
-		/* A dedicated scaler-DART gate mapping is not published by this ADT. */
 		status = "disabled";
 	};
 

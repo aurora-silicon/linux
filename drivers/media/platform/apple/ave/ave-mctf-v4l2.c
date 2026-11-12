@@ -22,6 +22,7 @@
 #include <media/v4l2-ioctl.h>
 #include <media/v4l2-mem2mem.h>
 
+#include "../apple-video-nr.h"
 #include "ave.h"
 #include "ave-mctf.h"
 
@@ -609,7 +610,7 @@ int ave_mctf_register(struct ave_dev *ave)
 	vdev->device_caps = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING;
 	video_set_drvdata(vdev, ave);
 
-	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
+	ret = video_register_device(vdev, VFL_TYPE_VIDEO, APPLE_M2M_VIDEO_NR);
 	if (ret) {
 		v4l2_m2m_release(ave->mctf_m2m);
 		return ret;

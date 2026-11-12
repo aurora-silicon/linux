@@ -560,6 +560,8 @@ static inline void tipd_debugfs_exit(void) { }
 #endif
 
 #if IS_ENABLED(CONFIG_KUNIT)
+void cd321x_mux_failed(struct cd321x *cd321x, const char *what, int ret, bool held);
+void cd321x_mux_gave_up(struct cd321x *cd321x, unsigned int retries, unsigned int held_ms);
 void cd321x_init_work(struct cd321x *cd321x);
 int cd321x_init_mux(struct cd321x *cd321x);
 void cd321x_stop_work(struct cd321x *cd321x);

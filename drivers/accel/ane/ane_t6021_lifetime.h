@@ -652,7 +652,19 @@ static inline void ane_t6021_progtab_count(const struct ane_t6021_progtab *t,
  * overtake it, so only the RUN clear is tried. If STOPPED is not seen
  * nothing is powered off, and the caller keeps the instance quarantined
  * with every mapping and its power claim.
+ *
+ * A job that hangs the engine leaves the core busy: RUN clear never brings
+ * STOPPED (halt returns ANE_T6021_ASC_BUSY). Only an unplanned stop may then
+ * use the contain step, which replaces the STOPPED proof with a power-off of
+ * the CPU and engine domains through the power-domain framework (children
+ * first, the PMGR state machine doing each transition, address translation
+ * kept on). It never asserts a reset: a power-state reset of the live CPU
+ * domain resets the whole SoC. The power cycle that follows still has to
+ * read every domain back off, and the cold CPU must read STOPPED again
+ * before the firmware boots.
  */
+#define ANE_T6021_ASC_BUSY	1	/* RUN clear, STOPPED never seen */
+
 enum ane_t6021_restart_stage {
 	ANE_T6021_RESTART_STOP,		/* failed before power removal */
 	ANE_T6021_RESTART_CYCLE,	/* failed in the power cycle */
@@ -664,6 +676,7 @@ struct ane_t6021_restart_ops {
 	int (*power_down)(void *ctx);	/* POWER_DOWN taken by the firmware */
 	int (*wait_idle)(void *ctx);	/* bounded wait for WFI */
 	int (*halt)(void *ctx);		/* clear RUN, require STOPPED */
+	int (*contain)(void *ctx);	/* optional: busy core, unplanned only */
 	int (*power_cycle)(void *ctx);	/* domains verified off, then on */
 	int (*boot)(void *ctx);		/* cold boot and handshake */
 };
@@ -683,7 +696,14 @@ static inline int ane_t6021_restart_stop(const struct ane_t6021_restart_ops *ops
 		if (ret)
 			return ret;
 	}
-	return ops->halt(ctx);
+	ret = ops->halt(ctx);
+	if (ret != ANE_T6021_ASC_BUSY)
+		return ret;
+	/* A planned stop of an idle instance that will not stop is not a hang. */
+	if (planned || !ops->contain)
+		return -ETIMEDOUT;
+	ret = ops->contain(ctx);
+	return ret == -EOPNOTSUPP ? -ETIMEDOUT : ret;
 }
 
 static inline int ane_t6021_restart_run(const struct ane_t6021_restart_ops *ops,
