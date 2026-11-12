@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0-only OR MIT */
 /*
- * The coprocessor and enclave registry that the Apple SoC sleep controllers
- * (sleep.c for T8140, t6040-sleep.c for T6040) share. Drivers register through
- * <linux/soc/apple/sleep.h>; the controller bound on this SoC walks the table
- * at its commit.
+ * The coprocessor and enclave registry, and what the Apple SoC sleep driver
+ * (sleep.c) shares with a SoC's own part of it (sleep-t6040.c for T6040).
+ * Drivers register through <linux/soc/apple/sleep.h>; the controller bound on
+ * this SoC walks the table at its commit.
  */
 #ifndef _APPLE_SLEEP_INTERNAL_H_
 #define _APPLE_SLEEP_INTERNAL_H_
@@ -84,6 +84,16 @@ struct apple_sleep_part {
 	int (*restore)(struct device *dev);
 	struct apple_sleep_ctl registry;
 };
+
+/* sleep-t6040.c */
+extern const struct apple_sleep_part t6040_sleep_part;
+
+/*
+ * For a part with dry runs, from its .begin to its .end: 1 runs the firmware-driven device
+ * suspend short of what only a power cycle restores, 2 also the last steps that can still be
+ * taken back. apple_sleep_power_loss() and apple_sleep_last_steps() answer by it.
+ */
+void apple_sleep_set_dry(unsigned int level);
 
 /*
  * A part whose sleep takes neither the lid's state at the wake nor the USB wake ports says so

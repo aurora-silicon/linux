@@ -16,7 +16,7 @@ obj-$(CONFIG_APPLE_CLUSTER_PWRGATE) += apple-cluster-pwrgate.o
 obj-$(CONFIG_APPLE_SLEEP_REGISTRY) += sleep-registry.o
 obj-$(CONFIG_APPLE_SOC_SLEEP) += apple-sleep.o
 apple-sleep-y = sleep.o
-obj-$(CONFIG_APPLE_T6040_SLEEP) += t6040-sleep.o
+apple-sleep-$(CONFIG_APPLE_T6040_SLEEP) += sleep-t6040.o
 
 obj-$(CONFIG_APPLE_RTKIT) += apple-rtkit.o
 apple-rtkit-y = rtkit.o rtkit-crashlog.o rtkit-hib-handoff.o

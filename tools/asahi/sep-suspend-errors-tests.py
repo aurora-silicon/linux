@@ -52,8 +52,7 @@ MUTATIONS = {
     'read-as-deadline': ('sep_pm_wait_gated', 'if (ret)\n\t\treturn ret;\n\n\treturn !!poll_ret;',
                          'if (ret)\n\t\treturn 1;\n\n\treturn !!poll_ret;'),
     'no-capability-check': ('sep_pm_commit_prepare',
-                           ' ||\n\t    !(IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) || IS_ENABLED(CONFIG_APPLE_T6040_SLEEP)) ||'
-                           '\n\t    !is_kernel_in_hyp_mode()', ''),
+                           ' || !IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) ||\n\t    !is_kernel_in_hyp_mode()', ''),
     'no-transport-check': ('sep_pm_commit_prepare',
                           'if (!apple_mbox_poll_one_supported(mbox))', 'if (false)'),
     'lost-accept': ('sleep_enter', 'pm::SleepGate::Lost => return Err(EIO),',
@@ -110,7 +109,6 @@ typedef int64_t s64; typedef long long ktime_t;
 #define READ_ONCE(x) (x)
 #define IS_ENABLED(x) (config_enabled)
 #define CONFIG_APPLE_SOC_SLEEP 1
-#define CONFIG_APPLE_T6040_SLEEP 1
 #define __maybe_unused
 #define __iomem
 #define unlikely(x) (x)
