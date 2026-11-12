@@ -1252,7 +1252,9 @@ static int __maybe_unused admac_resume_early(struct device *dev)
 	unsigned long flags;
 	int i;
 
-	admac_init_global_state(ad);
+	/* Runtime-suspended devices are cleared when they are powered again. */
+	if (!pm_runtime_status_suspended(dev))
+		admac_init_global_state(ad);
 
 	if (!pm_suspend_via_firmware())
 		return 0;
