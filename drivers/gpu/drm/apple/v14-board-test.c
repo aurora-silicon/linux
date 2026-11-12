@@ -4,8 +4,9 @@
  * and which DCP firmware image a record admits. The J516C (T6031) record
  * admits only the T6030 image, whose IOMFB layouts were validated, and
  * refuses every other; the existing records are unchanged. Which DCPs stamp
- * their swaps: the internal panel of a T6031 record; the T6030 and T8122
- * panels and external processors keep zero timestamps, byte for byte.
+ * their swaps: the internal panel of every record with a 120 Hz panel (T6030,
+ * J516C, J514C); the 60 Hz T8122 panels and external processors keep zero
+ * timestamps, byte for byte.
  */
 #include <kunit/test.h>
 #include <linux/string.h>
@@ -53,7 +54,9 @@ static const char *const j516c[] = { "apple,j516c", "apple,t6031", "apple,arm-pl
 static const char *const j514c[] = { "apple,j514c", "apple,t6031", "apple,arm-platform", NULL };
 static const char *const j516m[] = { "apple,j516m", "apple,t6034", "apple,arm-platform", NULL };
 static const char *const j516s[] = { "apple,j516s", "apple,t6030", "apple,arm-platform", NULL };
+static const char *const j514s[] = { "apple,j514s", "apple,t6030", "apple,arm-platform", NULL };
 static const char *const j613[] = { "apple,j613", "apple,t8122", "apple,arm-platform", NULL };
+static const char *const j615[] = { "apple,j615", "apple,t8122", "apple,arm-platform", NULL };
 
 static void v14_board_j516c(struct kunit *test)
 {
@@ -178,29 +181,45 @@ static void v14_board_unchanged(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, known);
 }
 
-/* Only the internal panel of the J516C record stamps its swaps. */
+/* The internal panel of every 120 Hz record stamps its swaps, and only that. */
 static void v14_board_swap_timestamps(struct kunit *test)
 {
-	const struct dcp_v14_board *j516c_b, *j514c_b, *t6030_b, *j613_b;
+	const struct dcp_v14_board *j516c_b, *j514c_b, *j514s_b, *j516s_b, *j613_b, *j615_b;
 	bool known;
 
 	j516c_b = board_for("apple,t6031-dcp", j516c, &known);
 	j514c_b = board_for("apple,t6031-dcp", j514c, &known);
-	t6030_b = board_for("apple,t6030-dcp", j516s, &known);
+	j514s_b = board_for("apple,t6030-dcp", j514s, &known);
+	j516s_b = board_for("apple,t6030-dcp", j516s, &known);
 	j613_b = board_for("apple,t8122-dcp", j613, &known);
-	KUNIT_ASSERT_TRUE(test, j516c_b && j514c_b && t6030_b && j613_b);
+	j615_b = board_for("apple,t8122-dcp", j615, &known);
+	KUNIT_ASSERT_TRUE(test, j516c_b && j514c_b && j514s_b && j516s_b && j613_b && j615_b);
+
+	/* The J514S and J516S (M3 Pro) share the T6030 record. */
+	KUNIT_EXPECT_PTR_EQ(test, j514s_b, j516s_b);
+	KUNIT_EXPECT_STREQ(test, j514s_b->name, "T6030");
 
 	KUNIT_EXPECT_TRUE(test, j516c_b->swap_timestamps);
-	KUNIT_EXPECT_FALSE(test, j514c_b->swap_timestamps);
-	KUNIT_EXPECT_FALSE(test, t6030_b->swap_timestamps);
+	KUNIT_EXPECT_TRUE(test, j514c_b->swap_timestamps);
+	KUNIT_EXPECT_TRUE(test, j514s_b->swap_timestamps);
 	KUNIT_EXPECT_FALSE(test, j613_b->swap_timestamps);
+	KUNIT_EXPECT_FALSE(test, j615_b->swap_timestamps);
+
+	/* A 120 Hz panel without stamps presents at 60 fps. */
+	KUNIT_EXPECT_EQ(test, j516c_b->swap_timestamps, j516c_b->promotion);
+	KUNIT_EXPECT_EQ(test, j514c_b->swap_timestamps, j514c_b->promotion);
+	KUNIT_EXPECT_EQ(test, j514s_b->swap_timestamps, j514s_b->promotion);
+	KUNIT_EXPECT_EQ(test, j613_b->swap_timestamps, j613_b->promotion);
+	KUNIT_EXPECT_EQ(test, j615_b->swap_timestamps, j615_b->promotion);
 
 	KUNIT_EXPECT_TRUE(test, dcp_v14_board_stamps_swaps(j516c_b, false));
-	/* The J514C, the external role, the T6030 (J514S, J516S) and T8122 panels, no record. */
-	KUNIT_EXPECT_FALSE(test, dcp_v14_board_stamps_swaps(j514c_b, false));
+	KUNIT_EXPECT_TRUE(test, dcp_v14_board_stamps_swaps(j514c_b, false));
+	KUNIT_EXPECT_TRUE(test, dcp_v14_board_stamps_swaps(j514s_b, false));
+	/* The external role, the 60 Hz T8122 panels, no record. */
 	KUNIT_EXPECT_FALSE(test, dcp_v14_board_stamps_swaps(j516c_b, true));
-	KUNIT_EXPECT_FALSE(test, dcp_v14_board_stamps_swaps(t6030_b, false));
+	KUNIT_EXPECT_FALSE(test, dcp_v14_board_stamps_swaps(j514s_b, true));
 	KUNIT_EXPECT_FALSE(test, dcp_v14_board_stamps_swaps(j613_b, false));
+	KUNIT_EXPECT_FALSE(test, dcp_v14_board_stamps_swaps(j615_b, false));
 	KUNIT_EXPECT_FALSE(test, dcp_v14_board_stamps_swaps(NULL, false));
 	KUNIT_EXPECT_FALSE(test, dcp_v14_board_stamps_swaps(NULL, true));
 }

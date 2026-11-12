@@ -103,6 +103,7 @@ static const struct dcp_v14_board dcp_v14_board_t6030 = {
 	.firmware_uuid = DCP_V14_FIRMWARE_UUID,
 	.handoff = "apple,t6030-handoff",
 	.promotion = true,
+	.swap_timestamps = true,
 	.panel_nits = true,
 };
 
@@ -187,6 +188,7 @@ static const struct dcp_v14_board dcp_v14_board_j514c = {
 	.handoff = "apple,t6031-handoff",
 	.promotion = true,
 	.log_bringup = true,
+	.swap_timestamps = true,
 };
 
 static const struct dcp_v14_board *const dcp_v14_boards[] = {
