@@ -553,6 +553,11 @@ static int apple_isp_start_streaming(struct apple_isp *isp)
 	unsigned long flags;
 	int err;
 
+	/* Before the sensor is powered: no capture without the indicator. */
+	err = apple_isp_check_indicator(isp);
+	if (err)
+		return err;
+
 	err = apple_isp_start_camera(isp);
 	if (err) {
 		dev_err(isp->dev, "failed to start camera: %d\n", err);

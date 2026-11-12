@@ -1030,9 +1030,10 @@ void apple_isp_stop_camera(struct apple_isp *isp)
  * every frame with a flat fill. The firmware expects it to be serviced
  * only while a camera-in-use indicator is shown, which makes it a privacy
  * interlock. That indicator is drawn by the display pipeline for secure
- * firmware that Linux does not run, so the driver services the watchdog
- * whenever it captures, with the register sequence and rate observed on
- * the running hardware.
+ * firmware that Linux does not run, so apple_isp_check_indicator() refuses
+ * to stream on these machines and the watchdog is not serviced. The
+ * servicing below, with the register sequence and rate observed on the
+ * running hardware, is for when Linux can show and confirm the indicator.
  */
 static void apple_isp_wdt_kick(struct apple_isp *isp)
 {
@@ -1076,6 +1077,25 @@ void apple_isp_wdt_stop(struct apple_isp *isp)
 
 	hrtimer_cancel(&isp->wdt_timer);
 	isp->wdt_running = false;
+}
+
+/*
+ * Where the ISP gates its frames on the capture watchdog, the camera-in-use
+ * indicator is not a light on the sensor supply: the display pipeline draws
+ * it for secure firmware, and only while that firmware has granted the
+ * capture. Linux runs neither, so it can neither show that indicator nor
+ * confirm that it is shown. Streaming there would capture with no
+ * indicator at all, so it is refused. Machines whose indicator is wired to
+ * the sensor supply have no such watchdog and are not affected.
+ */
+int apple_isp_check_indicator(struct apple_isp *isp)
+{
+	if (!isp->wdt)
+		return 0;
+
+	dev_warn_once(isp->dev,
+		      "camera-in-use indicator cannot be shown, refusing to stream\n");
+	return -EPERM;
 }
 
 int apple_isp_start_capture(struct apple_isp *isp)

@@ -29,6 +29,31 @@ static struct apple_isp *isp_test_alloc(struct kunit *test)
 	return isp;
 }
 
+/*
+ * With a capture watchdog the indicator is drawn by firmware Linux does not
+ * run: streaming is refused before the camera is started, and machines
+ * without one are let through.
+ */
+static void isp_test_indicator_gate(struct kunit *test)
+{
+	struct apple_isp *isp = isp_test_alloc(test);
+
+	isp->dev = kunit_device_register(test, "apple-isp-indicator-test");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, isp->dev);
+
+	KUNIT_EXPECT_EQ(test, apple_isp_check_indicator(isp), 0);
+
+	/* Never mapped: the refusal must come before any register access. */
+	isp->wdt = (void __iomem *)kunit_kzalloc(test, 0x10, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, (void __force *)isp->wdt);
+
+	KUNIT_EXPECT_EQ(test, apple_isp_check_indicator(isp), -EPERM);
+	KUNIT_EXPECT_EQ(test, apple_isp_start_streaming(isp), -EPERM);
+	KUNIT_EXPECT_FALSE(test, test_bit(ISP_STATE_STREAMING, &isp->state));
+	KUNIT_EXPECT_FALSE(test, isp->wdt_running);
+	KUNIT_EXPECT_EQ(test, isp->fw_state, ISP_FW_OFF);
+}
+
 /* The queue must initialise with the parameters the driver probes with. */
 static void isp_test_queue_init(struct kunit *test)
 {
@@ -527,6 +552,7 @@ static struct kunit_case isp_v4l2_test_cases[] = {
 	KUNIT_CASE(isp_test_suspended_return),
 	KUNIT_CASE(isp_test_error_wakeup),
 	KUNIT_CASE(isp_test_queue_init),
+	KUNIT_CASE(isp_test_indicator_gate),
 	KUNIT_CASE(isp_test_reqbufs_limit),
 	KUNIT_CASE(isp_test_create_bufs_limit),
 	{}
