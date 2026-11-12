@@ -33,6 +33,8 @@ int sep_pm_keep_domains(void *dev);
 int sep_pm_wait_gated(void *dev, unsigned int timeout_ms);
 int sep_pm_clear_dev_disable(void *dev);
 void sep_pm_dart_restore(void *dev);
+int sep_pm_dart_prepare(void *dev);
+bool sep_pm_platform_commit(void);
 int sep_pm_commit_prepare(void *dev, void *mbox, u64 msg0, u32 msg1, u64 reply, u64 mask);
 int sep_pm_commit_finish(void *dev);
 extern const struct dev_pm_ops sep_pm_ops;
