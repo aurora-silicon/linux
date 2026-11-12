@@ -3562,6 +3562,20 @@ static bool atcphy_t8132_dp_on(const struct apple_atcphy *atcphy)
 	return atcphy->hw->gen == ATCPHY_GENERATION_T8132 && atcphy->t8132_dp_alt;
 }
 
+/*
+ * The T8132 lane start differs from the T8122 one: both blocks start at swing
+ * 0 / pre-emphasis 0, the RX block's VREF filter is held until both DTVREG
+ * stages are on, and HBR3 keeps the LDOCLK1 regulator in circuit.
+ */
+static unsigned int atcphy_dp_lane_flags(const struct apple_atcphy *atcphy,
+					 unsigned int link_rate)
+{
+	if (atcphy->hw->gen != ATCPHY_GENERATION_T8132)
+		return 0;
+	return ATC_T8132_DP_START_EQ | ATC_T8132_DP_VREF |
+	       (link_rate == 8100 ? ATC_T8132_DP_NO_LDOCLK_BYPASS : 0);
+}
+
 static void atcphy_dp_aux_on_t8122(struct apple_atcphy *atcphy)
 {
 	void __iomem *core = atcphy->regs.core;
@@ -3667,7 +3681,8 @@ static int atcphy_dp_link_start_t8122(struct apple_atcphy *atcphy,
 	atcphy->dp_t8122.pairs = pairs;
 	for (unsigned int pair = 0; pair < 2; pair++)
 		if (pairs & BIT(pair))
-			atc_t8122_dp_lane_start(core, pair, rate->div2);
+			atc_t8122_dp_lane_start(core, pair, rate->div2,
+						atcphy_dp_lane_flags(atcphy, rate->link_rate));
 	core_clear32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DP_PMA_BYTECLK_RESET);
 
 	return 0;
