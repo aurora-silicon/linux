@@ -194,6 +194,24 @@ int asahi_g17_pmp_request(struct device *dev, bool enable)
 	return ret;
 }
 
+/*
+ * The node of the GPU's power state word. Where the GPU's first power domain is its PMP
+ * report entry (a small index for a reg, under the PMP), as in the J616C device tree the
+ * bring-up runs, the word is that entry's own domain.
+ */
+static struct device_node *asahi_g17_ps_node(struct device *dev)
+{
+	struct device_node *np, *next;
+
+	np = of_parse_phandle(dev->of_node, "power-domains", 0);
+	if (np && of_device_is_compatible(np, "apple,t6000-pmp-v2-report-entry")) {
+		next = of_parse_phandle(np, "power-domains", 0);
+		of_node_put(np);
+		np = next;
+	}
+	return np;
+}
+
 static int asahi_g17_ps(struct device *dev, struct regmap **regmap, u32 *offset)
 {
 	struct device_node *np;
@@ -213,7 +231,7 @@ static int asahi_g17_ps(struct device *dev, struct regmap **regmap, u32 *offset)
 		of_node_put(np);
 		return ret;
 	}
-	np = of_parse_phandle(dev->of_node, "power-domains", 0);
+	np = asahi_g17_ps_node(dev);
 	if (!np)
 		return -EINVAL;
 	ret = of_property_read_u32(np, "reg", offset);
@@ -597,7 +615,7 @@ struct asahi_g17_commit *asahi_g17_commit_prepare(struct device *dev,
 		of_node_put(parent);
 		of_node_put(np);
 	} else {
-		np = of_parse_phandle(dev->of_node, "power-domains", 0);
+		np = asahi_g17_ps_node(dev);
 		if (!np)
 			goto err;
 		if (!of_property_read_u32(np, "reg", &offset) && np->parent)
