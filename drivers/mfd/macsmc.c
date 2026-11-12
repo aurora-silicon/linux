@@ -699,8 +699,9 @@ static int apple_smc_probe(struct platform_device *pdev)
  * and so holds a live RTKit session with the SMC when it jumps into the image.
  * The restored kernel then asks the firmware to start again (IOP power INIT)
  * and waits for a HELLO that a firmware already in a session never sends. So
- * the loading kernel hands the SMC over quiesced, the state the upstream
- * teardown leaves it in and from which a wake starts a new session.
+ * the loading kernel hands the SMC over quiesced, the state an unbind leaves
+ * it in (apple_smc_rtkit_shutdown()) and from which a wake starts a new
+ * session.
  */
 static bool apple_smc_loading_image;
 static bool apple_smc_handed_over;
@@ -750,17 +751,10 @@ static int apple_smc_freeze(struct device *dev)
 	}
 
 	/*
-	 * Nothing host-side needs to be saved or torn down for hibernation.
-	 * The image is written with the SMC coprocessor left running, and the
-	 * driver keeps no SMC state that has to survive inside the image: every
-	 * live handle (the RTKit session in smc->rtk, the SRAM mapping and the
-	 * shared-memory window) is tied to the firmware instance that the boot
-	 * firmware cold-restarts on resume, so it is rebuilt from scratch in
-	 * apple_smc_restore(). Leaving the firmware running here is also what
-	 * keeps thermal/power management working while the image is written.
-	 *
-	 * .poweroff (invoked after the image has been written, just before the
-	 * machine powers off) shares this callback for the same reasons.
+	 * Hibernating: the SMC keeps running, and with it thermal and power
+	 * management, while the image is written and until the power-off
+	 * (.poweroff shares this). Nothing is saved: the boot that loads the
+	 * image restarts the SMC, and apple_smc_restore() starts a new session.
 	 */
 	return 0;
 }
@@ -773,11 +767,7 @@ static int apple_smc_thaw(struct device *dev)
 		return apple_smc_restore(dev);
 	}
 
-	/*
-	 * .thaw is reached only when image creation was aborted or has just
-	 * finished and the current, live session continues unchanged. Since
-	 * .freeze tore nothing down, there is nothing to restore.
-	 */
+	/* The image was written or abandoned: .freeze left the session running. */
 	return 0;
 }
 
@@ -792,19 +782,12 @@ static int apple_smc_restore(struct device *dev)
 		return apple_smc_thaw(dev);
 
 	/*
-	 * The system has been through a full cold boot to load the hibernation
-	 * image: the boot firmware restarted the SMC co-processor, so the RTKit
-	 * session that our restored state still describes belongs to a firmware
-	 * instance that no longer exists. Every SMC command would otherwise
-	 * poll-time-out.
-	 *
-	 * Our RTKit power-state bookkeeping was restored from the pre-hibernate
-	 * image, which marks the (now dead) coprocessor as running; in that
-	 * state apple_rtkit_wake() refuses to run. Reinitialize the transport
-	 * first to drop the stale session back to the held-in-reset state
-	 * (power state OFF, endpoint map cleared, mailbox RX restarted), which
-	 * matches the post-devm_apple_rtkit_init() state probe starts from, then
-	 * replay probe's bring-up handshake against the freshly booted firmware.
+	 * The boot that loaded the image restarted the SMC. The RTKit session
+	 * in the image belongs to a firmware instance that no longer runs, and
+	 * its power state still reads running, which apple_rtkit_wake()
+	 * refuses. Reset the transport to the state probe starts from (power
+	 * state off, no endpoints, mailbox receive restarted) and repeat
+	 * probe's handshake with the new instance.
 	 */
 	ret = apple_rtkit_reinit(smc->rtk);
 	if (ret)
@@ -965,9 +948,9 @@ static int apple_smc_notice_idle(struct apple_smc *smc)
 }
 
 /*
- * WKTP, one byte for its power state 0.
- * The platform writes it at the sleep request, before 'slpa' (measured on T6040: the WKTP write,
- * then pmVC, then MBSE, then the AP idle notice). 0 leaves it unwritten.
+ * WKTP, one byte, the value for power state 0. It goes first at the sleep request,
+ * ahead of the other sleep keys ('slpa' among them) and the AP idle notice, as the platform
+ * does. 0 leaves it unwritten.
  */
 static unsigned int sleep_wktp = 2;
 module_param(sleep_wktp, uint, 0644);
@@ -997,11 +980,10 @@ static int apple_smc_sleep_commit(struct apple_smc *smc)
 }
 
 /*
- * WKTP once a wake is a full one: 0, where a wake that stays dark keeps the key nonzero.
- * Without the 0 the SMC takes all the time
- * awake for a power nap, whether the sleep wrote its 2 or not: it does not leave its own fan
- * policy for a manual fan request (the mode request times out), and under load it logs
- * "Thermal pressure requested Sleep during power nap" and asks for a sleep once a second.
+ * WKTP once a wake is a full one: 0, where a wake that stays dark keeps the key nonzero,
+ * Without the 0 the SMC treats all the time awake as a power nap, whether
+ * the sleep wrote its 2 or not: it keeps its own fan policy against a manual fan request
+ * (the mode request times out), and under thermal load it requests a sleep once a second.
  * Negative writes nothing.
  */
 static int wake_wktp;
