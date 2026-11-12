@@ -616,12 +616,58 @@ static void apple_smc_pm_unregister(void *unused)
 	unregister_pm_notifier(&apple_smc_pm_nb);
 }
 
+/*
+ * The handshake with an SMC that was just woken, at probe and after a resume
+ * from disk alike: its endpoint, the initialization and the key count. The
+ * firmware is a new instance each time, and nothing says that its key table is
+ * the one of the instance before.
+ */
+static int apple_smc_handshake(struct apple_smc *smc)
+{
+	struct device *dev = smc->dev;
+	__be32 count = 0;
+	int ret;
+
+	ret = apple_rtkit_start_ep(smc->rtk, SMC_ENDPOINT);
+	if (ret) {
+		dev_err(dev, "Failed to start SMC endpoint: %d\n", ret);
+		return ret;
+	}
+
+	ret = apple_rtkit_send_message(smc->rtk, SMC_ENDPOINT,
+				       FIELD_PREP(SMC_MSG, SMC_MSG_INITIALIZE), NULL, false);
+	if (ret) {
+		dev_err(dev, "Failed to send init message: %d\n", ret);
+		return ret;
+	}
+
+	if (wait_for_completion_timeout(&smc->init_done, msecs_to_jiffies(SMC_TIMEOUT_MS)) == 0) {
+		dev_err(dev, "Timed out initializing SMC\n");
+		return -ETIMEDOUT;
+	}
+
+	if (smc->boot_stage != APPLE_SMC_INITIALIZED) {
+		dev_err(dev, "SMC failed to boot successfully, boot stage=%d\n", smc->boot_stage);
+		return -EIO;
+	}
+
+	ret = apple_smc_read(smc, SMC_KEY(#KEY), &count, sizeof(count));
+	if (ret >= 0 && ret != sizeof(count))
+		ret = -EIO;
+	if (ret < 0) {
+		dev_err(dev, "Failed to get key count: %d\n", ret);
+		return ret;
+	}
+	smc->key_count = be32_to_cpu(count);
+
+	return 0;
+}
+
 static int apple_smc_probe(struct platform_device *pdev)
 {
 	const struct apple_smc_hw *hw = device_get_match_data(&pdev->dev);
 	struct device *dev = &pdev->dev;
 	struct apple_smc *smc;
-	__be32 count = 0;
 	bool t6050;
 	int ret;
 
@@ -662,39 +708,14 @@ static int apple_smc_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	ret = apple_rtkit_start_ep(smc->rtk, SMC_ENDPOINT);
-	if (ret)
-		return dev_err_probe(dev, ret, "Failed to start SMC endpoint");
-
 	init_completion(&smc->init_done);
 	init_completion(&smc->cmd_done);
-
-	ret = apple_rtkit_send_message(smc->rtk, SMC_ENDPOINT,
-				       FIELD_PREP(SMC_MSG, SMC_MSG_INITIALIZE), NULL, false);
-	if (ret)
-		return dev_err_probe(dev, ret, "Failed to send init message");
-
-	if (wait_for_completion_timeout(&smc->init_done, msecs_to_jiffies(SMC_TIMEOUT_MS)) == 0) {
-		dev_err(dev, "Timed out initializing SMC");
-		return -ETIMEDOUT;
-	}
-
-	if (smc->boot_stage != APPLE_SMC_INITIALIZED) {
-		dev_err(dev, "SMC failed to boot successfully, boot stage=%d\n", smc->boot_stage);
-		return -EIO;
-	}
-
 	dev_set_drvdata(&pdev->dev, smc);
 	BLOCKING_INIT_NOTIFIER_HEAD(&smc->event_handlers);
 
-	ret = apple_smc_read(smc, SMC_KEY(#KEY), &count, sizeof(count));
-	if (ret >= 0 && ret != sizeof(count)) {
-		count = 0;
-		ret = -EIO;
-	}
-	if (ret < 0)
-		return dev_err_probe(smc->dev, ret, "Failed to get key count");
-	smc->key_count = be32_to_cpu(count);
+	ret = apple_smc_handshake(smc);
+	if (ret)
+		return ret;
 
 	/* Notifications, GPIO and power management are not qualified on T8152. */
 	if (of_device_is_compatible(dev->of_node, "apple,t8152-smc"))
@@ -784,7 +805,6 @@ static int apple_smc_thaw(struct device *dev)
 static int apple_smc_restore(struct device *dev)
 {
 	struct apple_smc *smc = dev_get_drvdata(dev);
-	__be32 count = 0;
 	int ret;
 
 	/* Hibernation aborted before the image (PMSG_RESTORE then too): nothing restarted. */
@@ -813,46 +833,12 @@ static int apple_smc_restore(struct device *dev)
 		return ret;
 	}
 
-	ret = apple_rtkit_start_ep(smc->rtk, SMC_ENDPOINT);
-	if (ret) {
-		dev_err(dev, "Failed to start SMC endpoint on restore: %d\n", ret);
-		return ret;
-	}
-
 	reinit_completion(&smc->init_done);
 	reinit_completion(&smc->cmd_done);
 
-	ret = apple_rtkit_send_message(smc->rtk, SMC_ENDPOINT,
-				       FIELD_PREP(SMC_MSG, SMC_MSG_INITIALIZE), NULL, false);
-	if (ret) {
-		dev_err(dev, "Failed to send init message on restore: %d\n", ret);
+	ret = apple_smc_handshake(smc);
+	if (ret)
 		return ret;
-	}
-
-	if (wait_for_completion_timeout(&smc->init_done, msecs_to_jiffies(SMC_TIMEOUT_MS)) == 0) {
-		dev_err(dev, "Timed out initializing SMC on restore\n");
-		return -ETIMEDOUT;
-	}
-
-	if (smc->boot_stage != APPLE_SMC_INITIALIZED) {
-		dev_err(dev, "SMC failed to boot on restore, boot stage=%d\n", smc->boot_stage);
-		return -EIO;
-	}
-
-	/*
-	 * Re-read the key count: the firmware is a fresh instance and nothing
-	 * guarantees the table is identical to the pre-hibernate one.
-	 */
-	ret = apple_smc_read(smc, SMC_KEY(#KEY), &count, sizeof(count));
-	if (ret >= 0 && ret != sizeof(count)) {
-		count = 0;
-		ret = -EIO;
-	}
-	if (ret < 0) {
-		dev_err(dev, "Failed to get key count on restore: %d\n", ret);
-		return ret;
-	}
-	smc->key_count = be32_to_cpu(count);
 
 	/*
 	 * Re-enable the firmware-side notification flag. The event_handlers
