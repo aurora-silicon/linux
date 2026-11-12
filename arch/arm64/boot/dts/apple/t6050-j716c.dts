@@ -1,0 +1,253 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * MacBook Pro (16-inch, M5 Max, 2026)
+ *
+ * target-type: J716c
+ *
+ * The M5 Max is one T6050 die, die 0 (t6050-max.dtsi). This file enables
+ * and configures what has been brought up on this board; the SoC's other
+ * ports and buses stay disabled until each is described for it.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#define T6050_J716C
+#include "t6050-max.dtsi"
+
+/ {
+	compatible = "apple,j716c", "apple,t6050", "apple,arm-platform";
+	model = "Apple MacBook Pro (16-inch, M5 Max, 2026)";
+	chassis-type = "laptop";
+
+	aliases {
+		serial0 = &dockchannel;
+		/* kboot fills the N1's factory addresses from /chosen through these */
+		wifi0 = &n1_alpha;
+		bluetooth0 = &n1_beta;
+	};
+
+	/* GPU aperture; its PMGR and coprocessors are described below. */
+	j716c_gpu_bus: soc@2300000000 {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges = <0x23 0x0 0x23 0x0 0x0 0x4000000>;
+		interrupt-parent = <&aic>;
+		nonposted-mmio;
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>; /* To be filled by the loader */
+			/* Format properties will be added by the loader */
+			status = "disabled";
+		};
+	};
+};
+
+/*
+ * PCIe port 0: the N1 (Wi-Fi and Bluetooth), the only GP port this board uses besides the SD
+ * reader on port 1 (not yet described). The boot loader trains the link after the SMC releases
+ * the N1's reset and keeps power, clocks, the PHY and PERST; Linux owns the routing, MSI and
+ * the DART. Disabled with its DART until the boot loader trains it, which also renumbers the
+ * bus here to the PCI core's order.
+ */
+&pcie0 {
+	reg = <0x1c 0xb0000000 0x0 0x10000000>,
+	      <0x4 0x14000000 0x0 0x4000>,
+	      <0x4 0x10028000 0x0 0x8000>,
+	      <0x4 0x17010000 0x0 0x4000>,
+	      <0x4 0x10024000 0x0 0x4000>;
+	reg-names = "config", "rc", "port0", "phy0", "intr2axi0";
+	interrupts = <AIC_IRQ 0 1523 IRQ_TYPE_LEVEL_HIGH>;
+	interrupt-names = "port0";
+
+	/* The N1's three functions are on DART streams 1-3 */
+	iommu-map = <0x100 &dart_apcie0 1 3>;
+	bus-range = <0 4>;
+
+	port00: pci@0,0 {
+		device_type = "pci";
+		reg = <0x0 0 0 0 0>;
+		bus-range = <1 1>;
+		apple,link-trained-by-bootloader;
+		/* PERST#, driven only by the root-port reset after the N1's ROM stage */
+		reset-gpios = <&pinctrl_ap 80 GPIO_ACTIVE_LOW>;
+		status = "disabled";
+
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		interrupt-controller;
+		#interrupt-cells = <1>;
+		interrupt-map-mask = <0 0 0 7>;
+		interrupt-map = <0 0 0 1 &port00 0 0 0 0>,
+				<0 0 0 2 &port00 0 0 0 1>,
+				<0 0 0 3 &port00 0 0 0 2>,
+				<0 0 0 4 &port00 0 0 0 3>;
+
+		/* platform ID (board 0x0e << 16) | chip 0x6050 */
+		n1_control: control@0,0 {
+			compatible = "pci106b,1900";
+			reg = <0x10000 0x0 0x0 0x0 0x0>;
+			firmware-name = "apple/centauri/j716c-ftab.bin";
+			apple,centauri-platform-id = <0x000e6050>;
+			apple,centauri-protocol = <27>;
+		};
+
+		n1_alpha: wifi@0,1 {
+			compatible = "pci106b,1902";
+			reg = <0x10100 0x0 0x0 0x0 0x0>;
+			local-mac-address = [00 00 00 00 00 00];
+		};
+
+		n1_beta: bluetooth@0,2 {
+			compatible = "pci106b,1903";
+			reg = <0x10200 0x0 0x0 0x0 0x0>;
+			local-bd-address = [00 00 00 00 00 00];
+		};
+	};
+};
+
+/* ATC1, ATC3 and the PD controller buses nub-spmi-a0 and -a2: not yet described for this board */
+&nub_spmi_a0 {
+	status = "disabled";
+};
+
+&nub_spmi_a2 {
+	status = "disabled";
+};
+
+&atc1_phy_mbox {
+	status = "disabled";
+};
+
+&atc1_phy {
+	status = "disabled";
+};
+
+&usb_drd1 {
+	status = "disabled";
+};
+
+&usb_drd1_dart_0 {
+	status = "disabled";
+};
+
+&usb_drd1_dart_1 {
+	status = "disabled";
+};
+
+&atc3_phy_mbox {
+	status = "disabled";
+};
+
+&atc3_phy {
+	status = "disabled";
+};
+
+&usb_drd3 {
+	status = "disabled";
+};
+
+&usb_drd3_dart_0 {
+	status = "disabled";
+};
+
+&usb_drd3_dart_1 {
+	status = "disabled";
+};
+
+&i2c1 {
+	status = "disabled";
+};
+
+&i2c2 {
+	status = "disabled";
+};
+
+/*
+ * Pin 112's register (0x29c0001c0) takes an SError when read, so only the pins a node
+ * here names are exposed: 80 (PCIe port 0's PERST#, ADT pci-bridge0 function-perst).
+ * A reserved line cannot be requested, so a node that names a new pin opens it here too.
+ */
+&pinctrl_ap {
+	gpio-reserved-ranges = <0 80>, <81 140>;
+};
+
+/* This board's SMC fan and power keys are not yet checked */
+&smc_hwmon {
+	status = "disabled";
+};
+
+/*
+ * The console is on the USB debug link, which drains only while a host reads
+ * it; the machine also boots with nothing attached there.
+ */
+&dockchannel {
+	apple,tx-never-wait;
+	status = "okay";
+};
+
+/* The keyboard and trackpad: the HID transport on the MTP's DockChannel FIFO */
+&mtp_dockchannel {
+	mtp_hid: input@8000 {
+		compatible = "apple,dockchannel-hid";
+		reg = <0x8000 0x1000>, <0xc000 0x1000>,
+		      <0x0 0x1000>, <0x4000 0x1000>;
+		reg-names = "config", "data", "rmt-config", "rmt-data";
+		iommus = <&mtp_dart 0>;
+		interrupt-parent = <&mtp_dockchannel>;
+		interrupts = <2 IRQ_TYPE_LEVEL_HIGH>,
+			     <3 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "tx", "rx";
+		apple,fifo-size = <0x800>;
+		apple,helper-cpu = <&mtp>;
+		apple,afe-reset-gpios = <&smc_pcio 2 GPIO_ACTIVE_HIGH>;
+
+		multi-touch {
+			apple,power-method = <2>;
+			firmware-name = "apple/tpmtfw-j716c.bin";
+		};
+
+		keyboard {
+		};
+
+		stm {
+		};
+	};
+};
+
+/* This board's PCIO outputs, the trackpad AFE reset (2) among them */
+&smc_pcio {
+	apple,output-commands = /bits/ 64 <0x001a000000000000 0x000f000000800000 0x011c000000010000>;
+};
+
+#include "t6050-peripherals.dtsi"
+
+#include "t6050-max-atc2.dtsi"
+
+/* This unit's host DROM (router UUID from an earlier boot) */
+&acio2_nhi {
+	apple,thunderbolt-drom = [ff 92 e6 6e ee 18 7c ac 05 90 19 c3 8c 00 5c 00
+			00 00 00 00 00 00 08 81 82 02 82 00 00 00 08 82
+			92 01 82 00 00 00 03 83 20 08 84 00 00 00 00 00
+			00 08 85 00 00 00 00 00 00 05 86 09 01 00 08 87
+			00 00 00 00 00 00 05 88 09 01 00 05 89 09 01 00
+			05 8a 09 01 00 0e 01 41 70 70 6c 65 2c 20 49 6e
+			63 2e 00 06 02 69 4f 53 00 00 00 00];
+};
+
+#include "t6050-j716c-isp.dtsi"
+#include "t6050-j716c-gpu-panel.dtsi"
+
+#include "t6050-j716c-display.dtsi"
+#include "t6050-j716c-left-usb4.dtsi"

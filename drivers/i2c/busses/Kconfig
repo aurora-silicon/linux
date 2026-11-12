@@ -1007,6 +1007,41 @@ config I2C_APPLE
 	  This driver can also be built as a module. If so, the module
 	  will be called i2c-apple.
 
+config I2C_DP855
+	tristate "Parade DP855 panel controller downstream bus (read-only)"
+	depends on SPI
+	depends on ARCH_APPLE || COMPILE_TEST
+	help
+	  Say Y here to expose the panel management bus behind a Parade
+	  DP855 timing controller, as found in Apple Silicon laptops. The
+	  adapter only reads, and only from the devices the device tree
+	  lists under the controller.
+
+	  This driver can also be built as a module. If so, the module
+	  will be called i2c-dp855.
+
+config I2C_DP855_KUNIT_TEST
+	bool "KUnit tests for the DP855 downstream bus" if !KUNIT_ALL_TESTS
+	depends on KUNIT && I2C_DP855
+	default KUNIT_ALL_TESTS
+	help
+	  Test request packing, SPI framing and message rejection, and
+	  check that the access lock is released on every poll timeout,
+	  refusal, completion error and register write failure. A fake
+	  register file stands in for the controller, so no hardware is
+	  needed. These tests are for developers.
+
+config I2C_PASEMI_KUNIT_TEST
+	bool "KUnit tests for PA Semi/Apple I2C runtime PM" if !KUNIT_ALL_TESTS
+	depends on KUNIT && PM && I2C_APPLE
+	default KUNIT_ALL_TESTS
+	help
+	  Test runtime PM reference handling on resume and transfer failures.
+	  Exercise both I2C and SMBus transfer entry points with a fake PM
+	  domain and register storage. Failed resumes must not touch MMIO,
+	  and transfer errors must release their power references.
+	  No controller hardware is needed. These tests are for developers.
+
 config I2C_PCA_PLATFORM
 	tristate "PCA9564/PCA9665 as platform device"
 	select I2C_ALGOPCA

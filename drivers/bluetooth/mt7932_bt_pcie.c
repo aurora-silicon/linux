@@ -23,6 +23,7 @@
 #include <linux/overflow.h>
 #include <linux/pci.h>
 #include <linux/soc/apple/pci-apple-piodma.h>
+#include <linux/soc/apple/sleep.h>
 #include <linux/pm.h>
 #include <linux/pm_runtime.h>
 #include <linux/pm_wakeup.h>
@@ -65,6 +66,8 @@
 /* Vendor command telling the controller that the host goes to sleep. */
 #define BT7932_OP_HOST_SLEEP 0xfc6f
 #define BT7932_HOST_SLEEP_PLEN 7
+/* How long a wake reason may take to arrive once the transport is back. */
+#define BT7932_WAKE_REASON_MS 200
 
 #define BT7932_FW_B0 "mediatek/MT7932B0_OS_TypeB_0.1.44.0_241001003711.bin"
 #define BT7932_FW_B1 "mediatek/MT7932B1_OS_TypeB_2.0.177.0_260706180356.bin"
@@ -153,6 +156,8 @@ struct bt7932 {
 	bool tx_blocked;	/* nothing is sent until resume */
 	bool irq_held;		/* IRQ off until the PCI state is restored */
 	bool pci_saved;		/* saved PCI state not yet restored */
+	bool wake_quiesced;	/* in host sleep with HCI set up to wake, deep sleep */
+	bool wake_expected;	/* the next wake report is what woke the host */
 	enum bt7932_recovery recovery;
 	enum bt7932_pm_state pm_state;
 };
@@ -298,6 +303,70 @@ static bool bt7932_wake_report(struct bt7932 *bt, const u8 *data, size_t len)
 	default:
 		return false;
 	}
+}
+
+/*
+ * Names a wake report (see bt7932_wake_event()) for the log, and points @addr
+ * at the remote address it carries, or NULL.
+ */
+static const char *bt7932_wake_name(const u8 *data, size_t len, const u8 **addr)
+{
+	/* Where the address starts: after status and handle, or LE report fields. */
+	size_t offset = 0;
+	const char *name = "event";
+
+	switch (data[0]) {
+	case HCI_EV_CONN_REQUEST:
+		name = "connection request";
+		offset = HCI_EVENT_HDR_SIZE;
+		break;
+	case HCI_EV_CONN_COMPLETE:
+		name = "connection complete";
+		offset = HCI_EVENT_HDR_SIZE + 3;
+		break;
+	case HCI_EV_SYNC_CONN_COMPLETE:
+		name = "synchronous connection complete";
+		offset = HCI_EVENT_HDR_SIZE + 3;
+		break;
+	case HCI_EV_HARDWARE_ERROR:
+		name = "hardware error";
+		break;
+	case HCI_EV_LE_META:
+		if (len < HCI_EVENT_HDR_SIZE + 1)
+			break;
+		/* Subevent, report count, event type (two bytes if extended), address type. */
+		switch (data[HCI_EVENT_HDR_SIZE]) {
+		case HCI_EV_LE_ADVERTISING_REPORT:
+			name = "LE advertising report";
+			offset = HCI_EVENT_HDR_SIZE + 4;
+			break;
+		case HCI_EV_LE_DIRECT_ADV_REPORT:
+			name = "LE directed advertising report";
+			offset = HCI_EVENT_HDR_SIZE + 4;
+			break;
+		case HCI_EV_LE_EXT_ADV_REPORT:
+			name = "LE extended advertising report";
+			offset = HCI_EVENT_HDR_SIZE + 5;
+			break;
+		}
+		break;
+	}
+	*addr = offset && len >= offset + sizeof(bdaddr_t) ? data + offset : NULL;
+	return name;
+}
+
+/* Caller owns lock and expects the wake reason. */
+static void bt7932_log_wake(struct bt7932 *bt, const u8 *data, size_t len)
+{
+	const u8 *addr;
+	const char *name = bt7932_wake_name(data, len, &addr);
+
+	if (addr)
+		dev_info(&bt->pdev->dev, "woken by Bluetooth: %s from %pMR\n", name, addr);
+	else
+		dev_info(&bt->pdev->dev, "woken by Bluetooth: %s\n", name);
+	bt->wake_expected = false;
+	wake_up_all(&bt->wake_wait);
 }
 
 static int bt7932_validate_ptx(const u8 *data, size_t size)
@@ -520,11 +589,13 @@ static int bt7932_sleep_locked(struct bt7932 *bt)
 	}
 	if (value > 1)
 		return -EPROTO;
-	/* A previous host-sleep notification must not cancel control 3. */
-	if (bt->pm_state == BT7932_QUIESCING)
+	/*
+	 * A previous host-sleep notification must not cancel control 3. Once
+	 * quiesced, only the host ends the host sleep, so leave the rest to
+	 * bt7932_restore_transport(), as macOS ignores it then too.
+	 */
+	if (bt->pm_state == BT7932_QUIESCING || bt->pm_state == BT7932_QUIESCED)
 		return 0;
-	if (bt->pm_state == BT7932_QUIESCED)
-		return -EPROTO;
 	if (bt->pm_state == BT7932_RESTORING) {
 		if (value) {
 			if (!bt->waking) {
@@ -725,8 +796,11 @@ static int bt7932_rx_locked(struct bt7932 *bt, unsigned int channel)
 			 * remember that it arrived.
 			 */
 			if (geo->packet == HCI_EVENT_PKT && bt->wake_tracking &&
-			    bt7932_wake_report(bt, descriptor + 16, length))
+			    bt7932_wake_report(bt, descriptor + 16, length)) {
+				if (bt->wake_expected)
+					bt7932_log_wake(bt, descriptor + 16, length);
 				pm_wakeup_dev_event(&bt->pdev->dev, 0, true);
+			}
 			hci_recv_frame(bt->hdev, skb);
 		}
 		slot = (slot + 1) & BT7932_MASK;
@@ -743,9 +817,9 @@ static int bt7932_rx_locked(struct bt7932 *bt, unsigned int channel)
 	return 0;
 }
 
-static irqreturn_t bt7932_irq_thread(int irq, void *data)
+/* Takes what the firmware published: sleep notifications, completions, packets. */
+static void bt7932_service(struct bt7932 *bt)
 {
-	struct bt7932 *bt = data;
 	u16 producer;
 	int channel, ret;
 
@@ -785,6 +859,11 @@ static irqreturn_t bt7932_irq_thread(int irq, void *data)
 		queue_work(bt->tx_wq, &bt->tx_work);
 out:
 	mutex_unlock(&bt->lock);
+}
+
+static irqreturn_t bt7932_irq_thread(int irq, void *data)
+{
+	bt7932_service(data);
 	return IRQ_HANDLED;
 }
 
@@ -1125,7 +1204,7 @@ static void bt7932_hw_error(struct hci_dev *hdev, u8 code)
  * Follows the wakeup setting of the PCI function, see bt7932_probe().
  * Only while it is on does hci_suspend_sync() leave page scan and LE passive
  * scan set up for the devices flagged for remote wakeup, and only then does
- * bt7932_suspend() keep the transport running with its interrupt armed.
+ * bt7932_suspend() leave the controller able to wake the system.
  */
 static bool bt7932_wakeup(struct hci_dev *hdev)
 {
@@ -1487,29 +1566,33 @@ static bool bt7932_hci_pm(struct bt7932 *bt)
 }
 
 /*
- * Suspend-to-idle can keep the transport running so that the controller can
- * wake the system: with wakeup enabled on the PCI function, the controller
- * up and HCI suspended by this driver.
+ * The controller can wake the system with wakeup enabled on the PCI function, the controller
+ * up and HCI suspended by this driver. In suspend-to-idle the transport stays up and the wake
+ * is its MSI. A deep sleep takes the link down: the controller goes into host sleep, which is
+ * the quiesce, and wakes the system through the SMC, as macOS does.
  */
 static bool bt7932_may_wake(struct bt7932 *bt)
 {
-	return device_may_wakeup(&bt->pdev->dev) && pm_suspend_no_platform() &&
-	       bt7932_hci_pm(bt) && test_bit(HCI_UP, &bt->hdev->flags);
+	return device_may_wakeup(&bt->pdev->dev) && bt7932_hci_pm(bt) &&
+	       test_bit(HCI_UP, &bt->hdev->flags);
 }
 
 static void bt7932_track_wake(struct bt7932 *bt, bool on)
 {
 	mutex_lock(&bt->lock);
 	bt->wake_tracking = on;
+	if (!on)
+		bt->wake_expected = false;
 	mutex_unlock(&bt->lock);
 }
 
 /*
- * Before system sleep, the host tells the controller that it is going to
- * sleep with a vendor command whose parameters are all ones; nothing is sent
- * when the host is back. It is answered by a vendor event, if at all, so
- * place it on the command ring directly rather than through the HCI command
- * flow, and wait until the controller has taken it.
+ * For suspend-to-idle with the transport kept running: a vendor command whose
+ * parameters are all ones. macOS uses the same bytes, but only as a request to
+ * its own transport, which turns them into the host sleep of a deep sleep (see
+ * bt7932_suspend()) and never sends them on. It is answered by a vendor event,
+ * if at all, so place it on the command ring directly rather than through the
+ * HCI command flow, and wait until the controller has taken it.
  *
  * Returns -EAGAIN if nothing was published (the controller could not be
  * reached without a fault, or the ring was full), -EBUSY if the command was
@@ -1583,6 +1666,7 @@ static int bt7932_arm_wakeup(struct bt7932 *bt)
 	ret = bt->fault ? -EIO : 0;
 	if (!ret) {
 		bt->wake_armed = true;
+		bt->wake_expected = true;
 		/* A failed wake handshake would fault the transport. */
 		bt->tx_blocked = true;
 	}
@@ -1607,7 +1691,6 @@ static void bt7932_disarm_wakeup(struct bt7932 *bt)
 	mutex_lock(&bt->lock);
 	bt->wake_armed = false;
 	bt->tx_blocked = false;
-	bt->wake_tracking = false;
 	bt->pci_saved = false;
 	mutex_unlock(&bt->lock);
 	wake_up_all(&bt->wake_wait);
@@ -1615,6 +1698,31 @@ static void bt7932_disarm_wakeup(struct bt7932 *bt)
 		bt->irq_held = false;
 		enable_irq(bt->irq);
 	}
+}
+
+/*
+ * After a sleep set up for Bluetooth wake, the controller delivers what woke
+ * the host once the transport runs again. Take it while HCI is still
+ * suspended, so that the core records the wake reason too, and log it.
+ * Ends wake tracking.
+ */
+static void bt7932_take_wake_reason(struct bt7932 *bt)
+{
+	/* Without the radios in the SMC's record of the wake, no report is coming. */
+	unsigned long timeout = apple_sleep_radio_woke() ?
+				msecs_to_jiffies(BT7932_WAKE_REASON_MS) : 0;
+
+	/* The interrupt thread leaves the rings alone until the restore ends. */
+	bt7932_service(bt);
+	wait_event_timeout(bt->wake_wait,
+			   !READ_ONCE(bt->wake_expected) || READ_ONCE(bt->fault), timeout);
+	mutex_lock(&bt->lock);
+	if (bt->wake_expected && !bt->fault)
+		dev_dbg(&bt->pdev->dev, "Bluetooth did not wake the host\n");
+	mutex_unlock(&bt->lock);
+	bt7932_track_wake(bt, false);
+	/* The core takes a wake reason only until hci_resume_dev(). */
+	flush_work(&bt->hdev->rx_work);
 }
 
 /*
@@ -1637,6 +1745,12 @@ static void bt7932_disarm_wakeup(struct bt7932 *bt)
  * The PCIe link and host bridge stay up in suspend-to-idle anyway, as the
  * Wi-Fi function on the same link is never stopped, and ASPM stays off on
  * this link as the transport was admitted.
+ *
+ * A deep sleep with wakeup enabled quiesces the transport after HCI has set
+ * up its wake scans. The quiesce (sleep control 3, notification 3) is the
+ * host sleep that macOS enters at S2R. The controller keeps scanning and
+ * wakes the system through the SMC. bt7932_resume() ends the host sleep
+ * with control 0, as macOS does, and then takes the wake reason.
  */
 static int bt7932_suspend(struct device *dev)
 {
@@ -1644,8 +1758,9 @@ static int bt7932_suspend(struct device *dev)
 	bool wake;
 	int ret;
 
+	/* A transport that's down has nothing to stop, and it can't cost a deep sleep. */
 	if (READ_ONCE(bt->fault))
-		return -EIO;
+		return pm_suspend_no_platform() ? -EIO : 0;
 	if (!bt->registered)
 		return 0;
 	wake = bt7932_may_wake(bt);
@@ -1656,16 +1771,19 @@ static int bt7932_suspend(struct device *dev)
 		ret = hci_suspend_dev(bt->hdev);
 		if (ret) {
 			bt7932_track_wake(bt, false);
-			return ret;
+			if (pm_suspend_no_platform())
+				return ret;
+			dev_warn(dev, "HCI did not suspend: %d\n", ret);
 		}
 	}
-	if (wake) {
+	if (wake && pm_suspend_no_platform()) {
 		ret = bt7932_arm_wakeup(bt);
 		if (!ret) {
-			dev_dbg(dev, "system sleep with wakeup armed\n");
+			dev_dbg(dev, "sleep with Bluetooth wake armed\n");
 			return 0;
 		}
 		bt7932_track_wake(bt, false);
+		wake = false;
 		if (ret == -EBUSY) {
 			/*
 			 * The host sleep command may still take effect, so the
@@ -1676,8 +1794,7 @@ static int bt7932_suspend(struct device *dev)
 			hci_resume_dev(bt->hdev);
 			bt7932_reset(bt->hdev);
 			return ret;
-		}
-		if (ret != -EAGAIN) {
+		} else if (ret != -EAGAIN) {
 			dev_err(dev, "transport failed while arming wakeup\n");
 			hci_resume_dev(bt->hdev);
 			return ret;
@@ -1686,9 +1803,28 @@ static int bt7932_suspend(struct device *dev)
 	ret = bt7932_quiesce(bt);
 	if (!ret) {
 		dev_dbg(dev, "system sleep quiesce acknowledged\n");
+		if (!wake)
+			return 0;
+		/* hci_suspend_dev() may have stopped short of the wake setup. */
+		if (!bt->hdev->suspended ||
+		    bt->hdev->suspend_state != BT_SUSPEND_CONFIGURE_WAKE) {
+			bt7932_track_wake(bt, false);
+			dev_warn(dev, "no Bluetooth wake for this sleep\n");
+			return 0;
+		}
+		mutex_lock(&bt->lock);
+		bt->wake_quiesced = true;
+		bt->wake_expected = true;
+		mutex_unlock(&bt->lock);
+		dev_dbg(dev, "sleep with Bluetooth wake armed\n");
 		return 0;
 	}
+	if (wake)
+		bt7932_track_wake(bt, false);
 	dev_warn(dev, "system sleep quiesce failed: %d\n", ret);
+	/* The wake finds out what's left. A deep sleep takes the power regardless. */
+	if (!pm_suspend_no_platform())
+		return 0;
 	/* Undo our request before the PM core rolls back the rest of the bus. */
 	if (!READ_ONCE(bt->fault))
 		bt7932_restore_transport(bt);
@@ -1732,23 +1868,43 @@ static int bt7932_resume_noirq(struct device *dev)
 static int bt7932_resume(struct device *dev)
 {
 	struct bt7932 *bt = pci_get_drvdata(to_pci_dev(dev));
+	bool wake_quiesced = bt->wake_quiesced;
 	int ret;
+
+	bt->wake_quiesced = false;
+	/* A deep sleep retrains the link. With the chip gone, nothing here may touch it. */
+	if (!pci_device_is_present(bt->pdev)) {
+		bt7932_track_wake(bt, false);
+		mutex_lock(&bt->lock);
+		bt7932_fault_locked(bt, "radio gone after the sleep");
+		mutex_unlock(&bt->lock);
+		apple_piodma_radio_recover();
+		return -ENODEV;
+	}
 
 	if (bt->wake_armed) {
 		bt7932_disarm_wakeup(bt);
+		bt7932_take_wake_reason(bt);
 		if (READ_ONCE(bt->fault))
 			return -EIO;
 		return bt7932_hci_pm(bt) ? hci_resume_dev(bt->hdev) : 0;
 	}
-	if (READ_ONCE(bt->fault))
+	if (READ_ONCE(bt->fault)) {
+		bt7932_track_wake(bt, false);
 		return -EIO;
+	}
 	if (!bt->registered)
 		return 0;
 	if (READ_ONCE(bt->pm_state) != BT7932_RUNNING) {
 		ret = bt7932_restore_transport(bt);
-		if (ret)
+		if (ret) {
+			bt7932_track_wake(bt, false);
+			apple_piodma_radio_recover();
 			return ret;
+		}
 	}
+	if (wake_quiesced)
+		bt7932_take_wake_reason(bt);
 	dev_dbg(dev, "transport restored after system sleep\n");
 	return bt7932_hci_pm(bt) ? hci_resume_dev(bt->hdev) : 0;
 }
@@ -1778,9 +1934,15 @@ static void bt7932_remove(struct pci_dev *pdev)
 	u16 command = U16_MAX;
 	bool quiesced, drained;
 
-	/* Closing HCI may send Reset: keep the transport and IRQ alive for it. */
-	if (bt->registered)
+	/*
+	 * The HCI core stops its command and event work before it closes a device it
+	 * unregisters, so a Reset on that close goes unsent and waits out its 2 s timeout.
+	 * The quiesce below stops the firmware. Close still runs with the transport alive.
+	 */
+	if (bt->registered) {
+		hci_clear_quirk(bt->hdev, HCI_QUIRK_RESET_ON_CLOSE);
 		hci_unregister_dev(bt->hdev);
+	}
 	quiesced = bt->ipc_ready && !READ_ONCE(bt->fault) && !bt7932_quiesce(bt);
 	mutex_lock(&bt->lock);
 	WRITE_ONCE(bt->stopping, true);

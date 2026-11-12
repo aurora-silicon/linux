@@ -1,0 +1,168 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The T8132's third and fourth ATCs (ADT atc-phy2/3, usb-drd2/3,
+ * dart-usb2/3, atc2/3-dpxbar) and the second port controller SPMI bus
+ * (nub-spmi-a1), from the J604 and J773g ADTs. Boards enable what they
+ * wire.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+#include <dt-bindings/interrupt-controller/apple-aic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/phy/phy.h>
+
+/ {
+	aliases {
+		atcphy2 = &atcphy2;
+		atcphy3 = &atcphy3;
+	};
+};
+
+&soc {
+	nub_spmi_a1: spmi@388a08000 {
+		compatible = "apple,t8132-spmi", "apple,t8103-spmi";
+		reg = <0x3 0x88a08000 0x0 0x4000>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		#interrupt-cells = <2>;
+		interrupt-controller;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 522 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	atcphy2: phy@412a90000 {
+		compatible = "apple,t8132-atcphy";
+		/* Leave the display crossbar at core + 0x4c000 to its own driver. */
+		reg = <0x4 0x12a90000 0x0 0x4000>,
+		      <0x4 0x12a84000 0x0 0x4000>,
+		      <0x4 0x13000000 0x0 0x24000>,
+		      <0x4 0x10000000 0x0 0x8000>,
+		      <0x4 0x10020000 0x0 0x4000>,
+		      <0x4 0x13044000 0x0 0x4000>,
+		      <0x4 0x13050000 0x0 0x4000>;
+		reg-names = "usb2phy", "pipehandler", "core", "axi2af", "lioa",
+			    "fabric", "common-config";
+		#phy-cells = <1>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc2_usb>;
+		orientation-switch;
+		mode-switch;
+		status = "disabled";
+	};
+
+	atc2_dpxbar: mux@41304c000 {
+		compatible = "apple,t8132-display-crossbar";
+		reg = <0x4 0x1304c000 0x0 0x4000>;
+		#mux-control-cells = <1>;
+		power-domains = <&ps_atc2_usb>;
+		status = "disabled";
+	};
+
+	dwc3_2_dart_0: iommu@412f00000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		reg = <0x4 0x12f00000 0x0 0xc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1407 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		power-domains = <&ps_atc2_usb>;
+		status = "disabled";
+	};
+
+	dwc3_2_dart_1: iommu@412f80000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		reg = <0x4 0x12f80000 0x0 0xc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1407 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		power-domains = <&ps_atc2_usb>;
+		status = "disabled";
+	};
+
+	dwc3_2: usb@412280000 {
+		compatible = "apple,t8132-dwc3";
+		reg = <0x4 0x12280000 0x0 0xcd00>,
+		      <0x4 0x1228cd00 0x0 0x3200>;
+		reg-names = "dwc3-core", "dwc3-apple";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1403 IRQ_TYPE_LEVEL_HIGH>;
+		dr_mode = "otg";
+		maximum-speed = "high-speed";
+		usb-role-switch;
+		role-switch-default-mode = "host";
+		iommus = <&dwc3_2_dart_0 0>, <&dwc3_2_dart_1 1>;
+		power-domains = <&ps_atc2_usb>;
+		resets = <&atcphy2>;
+		phys = <&atcphy2 PHY_TYPE_USB2>;
+		phy-names = "usb2-phy";
+		status = "disabled";
+	};
+
+	atcphy3: phy@41aa90000 {
+		compatible = "apple,t8132-atcphy";
+		/* Leave the display crossbar at core + 0x4c000 to its own driver. */
+		reg = <0x4 0x1aa90000 0x0 0x4000>,
+		      <0x4 0x1aa84000 0x0 0x4000>,
+		      <0x4 0x1b000000 0x0 0x24000>,
+		      <0x4 0x18000000 0x0 0x8000>,
+		      <0x4 0x18020000 0x0 0x4000>,
+		      <0x4 0x1b044000 0x0 0x4000>,
+		      <0x4 0x1b050000 0x0 0x4000>;
+		reg-names = "usb2phy", "pipehandler", "core", "axi2af", "lioa",
+			    "fabric", "common-config";
+		#phy-cells = <1>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc3_usb>;
+		orientation-switch;
+		mode-switch;
+		status = "disabled";
+	};
+
+	atc3_dpxbar: mux@41b04c000 {
+		compatible = "apple,t8132-display-crossbar";
+		reg = <0x4 0x1b04c000 0x0 0x4000>;
+		#mux-control-cells = <1>;
+		power-domains = <&ps_atc3_usb>;
+		status = "disabled";
+	};
+
+	dwc3_3_dart_0: iommu@41af00000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		reg = <0x4 0x1af00000 0x0 0xc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1469 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		power-domains = <&ps_atc3_usb>;
+		status = "disabled";
+	};
+
+	dwc3_3_dart_1: iommu@41af80000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		reg = <0x4 0x1af80000 0x0 0xc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1469 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		power-domains = <&ps_atc3_usb>;
+		status = "disabled";
+	};
+
+	dwc3_3: usb@41a280000 {
+		compatible = "apple,t8132-dwc3";
+		reg = <0x4 0x1a280000 0x0 0xcd00>,
+		      <0x4 0x1a28cd00 0x0 0x3200>;
+		reg-names = "dwc3-core", "dwc3-apple";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1465 IRQ_TYPE_LEVEL_HIGH>;
+		dr_mode = "otg";
+		maximum-speed = "high-speed";
+		usb-role-switch;
+		role-switch-default-mode = "host";
+		iommus = <&dwc3_3_dart_0 0>, <&dwc3_3_dart_1 1>;
+		power-domains = <&ps_atc3_usb>;
+		resets = <&atcphy3>;
+		phys = <&atcphy3 PHY_TYPE_USB2>;
+		phy-names = "usb2-phy";
+		status = "disabled";
+	};
+};

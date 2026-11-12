@@ -11,6 +11,8 @@
 
 #include <linux/cleanup.h>
 #include <linux/device.h>
+#include <linux/limits.h>
+#include <linux/minmax.h>
 #include <linux/thermal.h>
 
 #include "thermal_netlink.h"
@@ -34,7 +36,30 @@ struct thermal_trip_desc {
 	struct list_head list_node;
 	struct list_head thermal_instances;
 	int threshold;
+	unsigned int critical_count;
 };
+
+/*
+ * thermal_critical_confirm - count updates at or above a critical trip
+ * @count:	consecutive updates at or above the trip so far
+ * @temp:	zone temperature of this update
+ * @trip_temp:	critical trip temperature
+ * @samples:	updates in a row that confirm the trip, 0 or 1 for the first
+ *
+ * Return: true on the update that confirms the trip, and only on that one:
+ * the zone has to drop below the trip and rise again to confirm it anew.
+ */
+static inline bool thermal_critical_confirm(unsigned int *count, int temp,
+					    int trip_temp, unsigned int samples)
+{
+	if (temp < trip_temp) {
+		*count = 0;
+		return false;
+	}
+	if (*count < UINT_MAX)
+		(*count)++;
+	return *count == max(samples, 1U);
+}
 
 /**
  * struct thermal_governor - structure that holds thermal governor information

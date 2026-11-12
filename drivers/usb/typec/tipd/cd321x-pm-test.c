@@ -702,20 +702,15 @@ static void cd321x_held_mux_other_failure_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, pm.mux_retries, 0);
 }
 
-/* Only a pipeline owned by another port skips the retry. */
+/* Only a pipeline owned by another port skips the retry, on every SoC. */
 static void cd321x_display_taken_test(struct kunit *test)
 {
-	/* T8140/T8142: a PHY mid-transition or a pending SAFE state is retried. */
-	KUNIT_EXPECT_TRUE(test, cd321x_display_taken(-ENOSPC, true));
-	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-EBUSY, true));
-	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-EAGAIN, true));
-	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-ETIMEDOUT, true));
-	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(0, true));
-	/* Other SoCs keep -EBUSY as the taken display. */
-	KUNIT_EXPECT_TRUE(test, cd321x_display_taken(-EBUSY, false));
-	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-ENOSPC, false));
-	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-EAGAIN, false));
-	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(0, false));
+	KUNIT_EXPECT_TRUE(test, cd321x_display_taken(-ENOSPC));
+	/* A PHY mid-transition or a pending SAFE state must be retried. */
+	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-EBUSY));
+	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-EAGAIN));
+	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-ETIMEDOUT));
+	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(0));
 }
 
 static void cd321x_completion_failure_sequence_test(struct kunit *test)
@@ -1070,7 +1065,29 @@ static void cd321x_dp_send_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cd321x_dp_send(irq, irq, true), CD321X_DP_SEND_EDGE);
 }
 
+/* Probe joins the same timed series, without making the port usable early. */
+static void cd321x_probe_mux_held_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+
+	cd321x_pm_init(&pm);
+	KUNIT_EXPECT_EQ(test, cd321x_pm_mux_held(&pm, 1000), CD321X_MUX_RETRY_MS);
+	KUNIT_EXPECT_EQ(test, pm.phase, CD321X_PM_INITIALIZING);
+	KUNIT_EXPECT_EQ(test, pm.attempts_left, 0U);
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_can_update(&pm));
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_begin_read(&pm));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_ready(&pm));
+	KUNIT_EXPECT_TRUE(test, pm.force_reconnect);
+	KUNIT_EXPECT_EQ(test, pm.mux_since_ms, 1000U);
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
+	cd321x_pm_snapshot_ready(&pm);
+	KUNIT_EXPECT_EQ(test, cd321x_pm_mux_held(&pm, 1000 + CD321X_MUX_HELD_MS), 0U);
+	KUNIT_EXPECT_EQ(test, pm.phase, CD321X_PM_STALE);
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_can_update(&pm));
+}
+
 static struct kunit_case cd321x_pm_cases[] = {
+	KUNIT_CASE(cd321x_probe_mux_held_test),
 	KUNIT_CASE(cd321x_reset_first_irq_before_ready_test),
 	KUNIT_CASE(cd321x_reset_first_irq_during_prepare_test),
 	KUNIT_CASE(cd321x_reset_setup_retry_test),

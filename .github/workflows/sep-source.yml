@@ -7,10 +7,65 @@ on:
       - 'rust/**'
       - 'tools/aurora-bindgen/**'
       - 'drivers/soc/apple/**'
+      - 'drivers/pmdomain/apple/pmp-report.c'
       - 'include/uapi/linux/apple-sep.h'
+      - 'tools/aurora-sep/**'
+      - 'Kconfig'
+      - '**/Kconfig*'
+      - 'arch/arm64/configs/defconfig'
+      - 'drivers/usb/dwc3/**'
+      - 'include/linux/phy/apple-atc.h'
+      - 'scripts/ci/apple-dwc3-atc-compile.sh'
       - '.github/workflows/sep-source.yml'
 
 jobs:
+  source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            drivers/soc/apple/**
+            include/uapi/linux/apple-sep.h
+            tools/aurora-sep/**
+      - name: Check biometric ioctl ABI sizes
+        run: |
+          cat > /tmp/sep-abi.c <<'EOF'
+          #include <linux/apple-sep.h>
+          _Static_assert(sizeof(struct sep_bio_enrol_start) == 144, "enrol ABI");
+          _Static_assert(sizeof(struct sep_bio_enclave_list) == 520, "list ABI");
+          _Static_assert(sizeof(struct sep_bio_delete) == 16, "delete ABI");
+          int main(void) { return 0; }
+          EOF
+          cc -Wall -Werror -Iinclude/uapi /tmp/sep-abi.c -o /tmp/sep-abi
+          /tmp/sep-abi
+      - name: Select the identity-test Rust toolchain
+        run: |
+          rustup toolchain install 1.85.0 --profile minimal --no-self-update
+          echo "RUSTUP_TOOLCHAIN=1.85.0" >> "$GITHUB_ENV"
+      - name: Test saved identity readers
+        run: |
+          python3 -m unittest tools/aurora-sep/tests/test_store_open_errors.py -v
+          python3 -O -m unittest tools/aurora-sep/tests/test_store_open_errors.py -v
+          python3 -m unittest tools/aurora-sep/tests/test_identity_preservation.py -v
+          python3 -O -m unittest tools/aurora-sep/tests/test_identity_preservation.py -v
+      - name: Test selected-policy diagnostics
+        run: |
+          python3 -m unittest tools/aurora-sep/tests/test_diag_policy.py tools/aurora-sep/tests/test_diag_sensor.py -v
+          python3 -O -m unittest tools/aurora-sep/tests/test_diag_policy.py tools/aurora-sep/tests/test_diag_sensor.py -v
+      - name: Test recovery utility and package sources
+        run: |
+          python3 -m unittest tools/aurora-sep/tests/test_sep_bio_identities.py -v
+          python3 -m unittest tools/aurora-sep/tests/test_orphan_delete.py -v
+          python3 -m unittest tools/aurora-sep/tests/test_enrol_admission.py -v
+          python3 -m unittest tools/aurora-sep/tests/test_owner_preparation.py -v
+          python3 -m unittest tools/aurora-sep/tests/test_policy_window.py -v
+          python3 -m unittest tools/aurora-sep/tests/test_log_ratelimit.py -v
+          python3 -m unittest discover -s tools/aurora-sep/tests -p test_packaging.py -v
+
   rust-build:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -41,3 +96,65 @@ jobs:
           grep -qx 'CONFIG_APPLE_SEP_KUNIT_TEST=y' .config
           make -j2 LLVM=1 ARCH=arm64 modules_prepare
           make -j2 LLVM=1 ARCH=arm64 drivers/soc/apple/apple-sep.o
+
+  kunit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Install kernel build and QEMU dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm libclang-dev libelf-dev libssl-dev \
+            flex bison bc pkg-config make perl qemu-system-arm
+          rustup component add rust-src
+      - name: Prepare the layout-corrected bindgen
+        env:
+          LIBCLANG_PATH: /usr/lib/llvm-18/lib
+        run: python3 tools/aurora-bindgen/build.py
+      # rust-build only compiles the tests; this runs them.
+      - name: Run the Apple SEP KUnit suites on arm64 QEMU
+        env:
+          LIBCLANG_PATH: /usr/lib/llvm-18/lib
+        run: |
+          ./tools/testing/kunit/kunit.py run --arch=arm64 \
+            --make_options LLVM=1 \
+            --kunitconfig=drivers/soc/apple/sep.kunitconfig \
+            --jobs="$(nproc)" --timeout=900 'apple_sep*'
+
+  dwc3-atc-compile:
+    name: DWC3/ATC ${{ matrix.profile }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        profile: [builtin-no-atc, modular-no-atc, builtin-modular-atc]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Install arm64 C build dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q clang-18 lld-18 llvm-18 libelf-dev libssl-dev \
+            flex bison bc pkg-config make perl
+          echo "/usr/lib/llvm-18/bin" >> "$GITHUB_PATH"
+      - name: Compile the Apple DWC3 object with the resolved PHY profile
+        env:
+          PROFILE: ${{ matrix.profile }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: scripts/ci/apple-dwc3-atc-compile.sh "$PROFILE"
+      - name: Keep configuration and compiler receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dwc3-atc-${{ matrix.profile }}
+          path: ${{ runner.temp }}/dwc3-atc-${{ matrix.profile }}/artifacts/
+          retention-days: 14

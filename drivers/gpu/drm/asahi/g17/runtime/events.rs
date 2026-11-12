@@ -30,6 +30,9 @@ impl event::Transport for Service<'_> {
     fn roles(&self) -> &'static [Role] {
         self.firmware.roles()
     }
+    fn reports_after_signal(&self) -> bool {
+        self.firmware.init.is_m5()
+    }
     fn trace(&mut self, role: Role) {
         let firmware = &mut *self.firmware;
         firmware
@@ -38,16 +41,19 @@ impl event::Transport for Service<'_> {
     }
     fn statistics(&mut self, role: Role) {
         let firmware = &mut *self.firmware;
+        firmware.observe_statistics_power();
         firmware
             .rings
             .drain_statistics(&firmware.primary.state.shared.dev, &firmware.init, role);
+        firmware.observe_statistics_power();
     }
     fn drain(
         &mut self,
         role: Role,
         mut consume: impl FnMut(&mut Self, Event) -> Result<bool>,
     ) -> Result {
-        let mut events = channel::Events::new(role, self.firmware.primary.state.shared.variant.graph);
+        let mut events =
+            channel::Events::new(role, self.firmware.primary.state.shared.variant.graph);
         while let Some(event) =
             events.next(&self.firmware.primary.state.shared.dev, &self.firmware.init)?
         {
@@ -86,6 +92,12 @@ impl event::Queues for Service<'_> {
     }
     fn flush_tvb_reply(&mut self) -> Result<bool> {
         self.firmware.flush_tvb_reply()
+    }
+    fn channel_error(&mut self, engine: crate::g17::fw::channels::Engine, qid: u8, stamp: u32) -> Result {
+        self.firmware.queue_channel_error(engine, qid, stamp)
+    }
+    fn flush_channel_errors(&mut self) -> Result<bool> {
+        self.firmware.flush_channel_errors()
     }
     fn flush_freelist_release(&mut self) -> Result<bool> {
         self.firmware.flush_freelist_release()
@@ -127,6 +139,9 @@ impl recovery::Host for Service<'_> {
 }
 
 impl recovery::Memory for Service<'_> {
+    fn is_m5(&self) -> bool {
+        self.firmware.init.is_m5()
+    }
     fn recovery_state(&self) -> Result<u32> {
         self.firmware.init.recovery_state()
     }
@@ -134,7 +149,30 @@ impl recovery::Memory for Service<'_> {
         self.firmware.init.host_recovery()
     }
     fn fault_sources(&self) -> Result<recovery::Sources> {
-        self.firmware.init.fault_sources()
+        let mut mmu_fault = false;
+        if self.firmware.init.is_m5() {
+            let registers = self.firmware.bridge.regs.m5_fault_registers();
+            pr_err!("asahi: recovery fault registers: {:x?}\n", registers);
+            // MMU fault status: valid (bit 0), reason (1..3, 0 = unmapped), read
+            // (4), level (7..8), requestor (9..16), VM slot (17..22); the address
+            // word holds the faulting address shifted right by 6.
+            if let Ok([_, status, address, ..]) = registers {
+                if status & 1 != 0 {
+                    mmu_fault = true;
+                    let access = if status & 0x10 != 0 { "read" } else { "write" };
+                    pr_err!("asahi: recovery: GPU MMU fault: {} reason {} at {:#x}, level {}, requestor {:#x}, VM slot {}\n",
+                        access, (status >> 1) & 7,
+                        (address & ((1 << 42) - 1)) << 6, (status >> 7) & 3, (status >> 9) & 0xff,
+                        (status >> 17) & 0x3f);
+                }
+            }
+        }
+        let mut sources = self.firmware.init.fault_sources()?;
+        // M5 reads no firmware reason word; a latched MMU fault is reason 3.
+        if mmu_fault && sources.reason.is_none() {
+            sources.reason = Some(recovery::PAGE_FAULT);
+        }
+        Ok(sources)
     }
 
     fn transition(&self, expected: u32, next: u32) -> Result {
@@ -154,6 +192,9 @@ impl recovery::Memory for Service<'_> {
 impl recovery::Queues for Service<'_> {
     fn render_pass_started(&self, qid: u8, stamp: u64) -> Option<bool> {
         self.firmware.queues.render_pass_started(qid, stamp)
+    }
+    fn render_culprit(&self, blamed: u8) -> Option<u128> {
+        self.firmware.queues.render_culprit(blamed)
     }
     fn publish_recovery_targets(&self) -> Option<Error> {
         let mut failure = self.firmware.queues.publish_render_recovery_targets();
@@ -232,7 +273,31 @@ impl recovery::Queues for Service<'_> {
             })
     }
     fn report_blamed_render(&self, qid: u8) {
-        self.firmware.queues.report_render_recovery(qid, &self.firmware.port);
+        self.firmware
+            .queues
+            .report_render_recovery(qid, &self.firmware.port);
+    }
+    fn report_mmu_fault(&self) {
+        let banks = match self.firmware.port.fault_banks() {
+            Ok(banks) => banks,
+            Err(error) => {
+                pr_warn!("G17: recovery MMU fault banks unreadable: {:?}\n", error);
+                return;
+            }
+        };
+        for (bank, &(status, address)) in banks.iter().enumerate() {
+            match crate::regs::decode_fault(status, address, true) {
+                Some(info) => pr_warn!(
+                    "G17: recovery MMU fault bank {}: address {:#x} {} {:?} unit {:?} ({:#x}) level {} vm_slot {} sideband {:#x} (status {:#x})\n",
+                    bank, info.address, if info.read { "read" } else { "write" }, info.reason,
+                    info.unit, info.unit_code, info.level, info.vm_slot, info.sideband, status
+                ),
+                None => pr_info!(
+                    "G17: recovery MMU fault bank {}: no fault (status {:#x})\n",
+                    bank, status
+                ),
+            }
+        }
     }
     fn settle_blamed_render(&mut self, qid: u8, error: Error) {
         let result = self
@@ -264,13 +329,81 @@ impl Firmware {
             .flatten()
             .filter_map(|entry| entry.queue.as_deref_mut())
         {
-            queue.release_witnessed(
-                state,
-                |owner| port.qos_complete(&[owner]),
-                &mut |event| deferred.push(event),
-            )?;
+            queue.release_witnessed(state, |owner| port.qos_complete(&[owner]), &mut |event| {
+                deferred.push(event)
+            })?;
         }
         Ok(())
+    }
+
+    /// Drains every role's trace ring, then their statistics rings. On M5 the event worker calls
+    /// this after it has signalled the completions of its pass: the reports are not scheduling
+    /// inputs.
+    fn drain_reports(&mut self) {
+        let dev = &self.primary.state.shared.dev;
+        for &role in self.roles() {
+            self.rings.drain_trace(dev, &self.init, role);
+        }
+        // Each drain is bracketed by power observations; consecutive roles share the one
+        // between them (each reads the GPU's power register).
+        self.observe_statistics_power();
+        for &role in self.roles() {
+            self.rings.drain_statistics(&self.primary.state.shared.dev, &self.init, role);
+            self.observe_statistics_power();
+        }
+    }
+
+    /// A step of the event pass is waiting on the firmware with no event to wake it.
+    fn runtime_polling(&self, now: u64) -> bool {
+        self.render_control_backpressured()
+            || self.init.outer_waiting()
+            || self.queues.replay_outer_wait.is_some()
+            || self.queues.replay_consumer_wait.is_some()
+            || self.queues.render.replay_polling()
+            || self.queues.teardown.polling(now)
+            || self.compute_exit_polling(now)
+            || self
+                .queues
+                .compute
+                .iter()
+                .flatten()
+                .filter_map(|entry| entry.queue.as_deref())
+                .any(|queue| queue.retirement_polling() || queue.pool_release_pending())
+    }
+
+    /// Nothing is published that hasn't retired, nothing is waiting on the firmware, its rings
+    /// are empty, and the idle check has taken the effort and power holds down.
+    pub(in crate::g17) fn sleep_quiet(&self, now: u64) -> Result<bool> {
+        use crate::g17::recovery::Memory;
+        let compute = self
+            .queues
+            .compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+            .any(|queue| queue.in_flight());
+        if compute
+            || self.queues.render_in_flight()
+            || !self.queues.render_settled()
+            || self.recovery.pending()
+            || self.init.recovery_state()? != 0
+            || self.runtime_polling(now)
+            || self.hold.active()
+            || self.registration_power_release_pending
+            || self.effort.applied() != 0
+        {
+            return Ok(false);
+        }
+        let [consumer, unknown, producer] = self.init.control_counters()?;
+        if consumer != producer || unknown != producer {
+            return Ok(false);
+        }
+        for &role in self.roles() {
+            if channel::Events::pending(&self.init, role)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     pub(super) fn service_runtime_events(
@@ -297,6 +430,7 @@ impl Firmware {
 
     /// Preparation admission is already closed and all builders have joined.
     pub(super) fn service_runtime_recovery(&mut self, deferred: &mut DeferredBatch) -> Result {
+        self.rings.invalidate_statistics();
         if self.recovery.restart_limit(super::now_ns()) {
             pr_warn!("G17: restart storm limit reached\n");
             return Err(ETIMEDOUT);
@@ -313,8 +447,15 @@ impl Firmware {
         });
         // Publishers without the device mutex stamp their tickets with this
         // mirror; they rejoin only after preparation admission reopens.
-        service.firmware.port.set_generation(service.firmware.recovery.generation());
+        service
+            .firmware
+            .port
+            .set_generation(service.firmware.recovery.generation());
+        service.firmware.rings.invalidate_statistics();
         let result = result?;
+        if result.leftover && service.firmware.recovery.forgive_restart() {
+            pr_warn!("G17: recovery dropped queued work of an already failed VM; not counted as a restart storm\n");
+        }
         if let Some(error) = result.target_error {
             dev_warn!(
                 shared.dev.as_ref(),
@@ -341,6 +482,10 @@ impl crate::g17::Shared {
     /// callbacks are finished. Shutdown can detach Firmware during an off-lock
     /// boundary; the collector itself still owns every deferred completion.
     pub(in crate::g17) fn run_runtime_events(self: &Arc<Self>) {
+        // The way back queues a pass, which also handles a crash noticed meanwhile.
+        if self.sleeping() {
+            return;
+        }
         if self.crashed.load(core::sync::atomic::Ordering::Acquire) {
             self.stop_runtime();
             return;
@@ -394,7 +539,8 @@ impl crate::g17::Shared {
         deferred.finish();
         crate::g17::trace::event(1);
         if recover {
-            self.preparations.wait_drained_until(super::now_ns().saturating_add(super::WORK_RING_WAIT_NS))?;
+            self.preparations
+                .wait_drained_until(super::now_ns().saturating_add(super::WORK_RING_WAIT_NS))?;
         }
         let mut state = self.state.lock();
         let Some(firmware) = (*state).as_deref_mut() else {
@@ -403,9 +549,15 @@ impl crate::g17::Shared {
         if self.crashed.load(core::sync::atomic::Ordering::Acquire) {
             return Err(EIO);
         }
+        if firmware.init.is_m5() {
+            // The completions above are signalled; the reports that arrived with them come after.
+            firmware.drain_reports();
+        }
         if recover {
             firmware.service_runtime_recovery(deferred)?;
-            if !firmware.recovery.pending() {
+            if !firmware.recovery.pending()
+                && !self.sleep_gate.load(core::sync::atomic::Ordering::Acquire)
+            {
                 if !self.preparations.reopen() {
                     return Ok(());
                 }
@@ -451,8 +603,10 @@ impl crate::g17::Shared {
             || self.progress.has_waiters()
             || self.queues.has_waiters()
             || self.renders.has_waiters()
-            || now.saturating_sub(self.housekeeping_ns.load(core::sync::atomic::Ordering::Relaxed))
-                >= HOUSEKEEPING_NS;
+            || now.saturating_sub(
+                self.housekeeping_ns
+                    .load(core::sync::atomic::Ordering::Relaxed),
+            ) >= HOUSEKEEPING_NS;
         let mut lingers = None;
         let mut pools = None;
         let mut shrinking = false;
@@ -479,19 +633,10 @@ impl crate::g17::Shared {
                 self.queue_reclaims();
             }
         }
-        let backpressured = firmware.render_control_backpressured();
-        let polling = backpressured
-            || firmware.queues.replay_outer_wait.is_some()
-            || firmware.queues.render.replay_polling()
-            || firmware.queues.teardown.polling(now)
-            || firmware.compute_exit_polling(now)
-            || firmware
-                .queues
-                .compute
-                .iter()
-                .flatten()
-                .filter_map(|entry| entry.queue.as_deref())
-                .any(|queue| queue.retirement_polling() || queue.pool_release_pending());
+        // The firmware may consume M5 work-ring slots without a completion interrupt: while
+        // a preparation waits for unclaimed room, every pass polls the consumers.
+        let outer = firmware.init.poll_outer_progress()?;
+        let polling = firmware.runtime_polling(now);
         if polling {
             self.queue_poll();
         }
@@ -530,6 +675,10 @@ impl crate::g17::Shared {
         drop(state);
         if grow_ready {
             self.queue_grow();
+        }
+        // Outside the device mutex: the notification can run DMA-fence callbacks.
+        if let Some(domain) = outer {
+            domain.notify();
         }
         // Firmware ring room, consumed releases and teardown steps have no
         // event of their own: recheck render publishers' conditions every pass.

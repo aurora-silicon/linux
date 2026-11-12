@@ -23,24 +23,26 @@ type Result<T=()> = std::result::Result<T,i32>;
 const EIO:i32=-5;const EBUSY:i32=-16;const EINVAL:i32=-22;
 fn now_ns()->u64{123}
 struct Context {live:Arc<AtomicUsize>}
-impl Context {fn note_compute_binding(&self,_:bool){} fn new(live:&Arc<AtomicUsize>)->Arc<Self>{live.fetch_add(1,Ordering::SeqCst);Arc::new(Self{live:live.clone()})}}
+impl Context {fn note_compute_binding(&self,_:bool){} fn retain_firmware_pages(&self){} fn new(live:&Arc<AtomicUsize>)->Arc<Self>{live.fetch_add(1,Ordering::SeqCst);Arc::new(Self{live:live.clone()})}}
 impl Drop for Context {fn drop(&mut self){self.live.fetch_sub(1,Ordering::SeqCst);}}
 struct Binding {context:Arc<Context>,pool_alias:Option<u64>,descriptors:Option<u64>}
-struct Previous {context:Arc<Context>,binding:Option<Binding>,publication:Option<(u64,u64)>}
+struct Previous {context:Arc<Context>,binding:Option<Binding>,publication:Option<(u64,u64)>,moved:bool}
+// A G17P compute pool is sized in blocks; M5's geometry does not reach this queue.
+#[derive(Clone,Copy,Debug,PartialEq)] enum ComputeCapacity{Blocks(usize)}
 #[derive(Clone,Copy,PartialEq)] enum PoolPhase{Populated,ReleaseSent(u32),Vacant}
 struct Fifo {len:usize}
 struct Graph;
 impl Graph {fn set_owner(&mut self,_:&Context)->Result{Ok(())}}
 struct ReaderHint; impl ReaderHint {fn has_readers(&self,count:&AtomicU32)->bool{count.load(Ordering::Acquire)!=0}}
 struct Queue {
- owner:Option<u64>,installed:bool,growing:bool,growth_blocks:usize,free_list_generation:u64,
+ owner:Option<u64>,installed:bool,growing:bool,channel_error:bool,growth:Option<ComputeCapacity>,free_list_generation:u64,configuration:Option<()>,retained_owner:Option<()>,
  pool_phase:PoolPhase,release_sent_ns:Option<u64>,pool:Pool,binding:Option<Binding>,previous:Option<Previous>,graph:Graph,
  active:Fifo,replays:Fifo,quarantined:bool,released:bool,retirement_ready:bool,
  retired_by_teardown:bool,released_at:u64,exit:Option<()>,needs_fresh_backing:bool,
  source_hint:ReaderHint,source_readers:AtomicU32,
 }
-fn idle(live:&Arc<AtomicUsize>)->Queue{Queue{owner:Some(1),installed:true,growing:false,growth_blocks:0,
- free_list_generation:0,pool_phase:PoolPhase::Populated,release_sent_ns:None,pool:Pool{pages:Some(Pages(10)),fail:false},
+fn idle(live:&Arc<AtomicUsize>)->Queue{Queue{owner:Some(1),installed:true,growing:false,channel_error:false,growth:None,
+ free_list_generation:0,configuration:None,retained_owner:None,pool_phase:PoolPhase::Populated,release_sent_ns:None,pool:Pool{pages:Some(Pages(10,21)),fail:false},
  binding:Some(Binding{context:Context::new(live),pool_alias:Some(1),descriptors:Some(2)}),previous:None,graph:Graph,
  active:Fifo{len:0},replays:Fifo{len:0},quarantined:false,released:false,retirement_ready:true,
  retired_by_teardown:false,released_at:0,exit:None,needs_fresh_backing:false,source_hint:ReaderHint,source_readers:AtomicU32::new(0)}}
@@ -48,23 +50,30 @@ impl Queue {
 ''' + item(source,'pub(crate) fn release_owner(') + item(source,'pub(crate) fn reusable(') + '\n}\n'
     methods = '\n'.join(item(source, sig) for sig in ['pub(crate) fn begin_growth(', 'pub(crate) fn finish_growth(', 'pub(crate) fn growth_token(', 'pub(crate) fn abort_growth(', 'pub(crate) fn observe_vacancy('])
     replace = item((ROOT / 'freelist.rs').read_text(), 'pub(crate) fn replace_pages(')
-    observe = item((ROOT / 'runtime.rs').read_text(), 'pub(super) fn observe_pool_releases(').replace('pub(super) ', '').replace('super::initdata::', 'initdata::')
+    observe = item((ROOT / 'runtime.rs').read_text(), 'pub(super) fn observe_pool_releases(').replace('pub(super) ', '').replace('super::initdata::', 'initdata::').replace('super::channel::', 'g17::channel::')
     return text + r'''
 const EAGAIN:i32=-11;const EFAULT:i32=-14;
 static CONSUMER:AtomicU32=AtomicU32::new(0);
 static PRODUCER:AtomicU32=AtomicU32::new(3);
-struct Pages(u64);
-impl Pages {fn page_list_va(&self)->u64{self.0}}
+// A page list's address and its block count.
+struct Pages(u64,usize);
+struct PoolDescriptor;
+impl Pages {
+ fn page_list_va(&self)->u64{self.0}
+ fn fits_capacity(&self,required:ComputeCapacity)->bool{let ComputeCapacity::Blocks(blocks)=required;self.1>=blocks}
+ fn descriptor(&self,_:u16)->Result<PoolDescriptor>{Ok(PoolDescriptor)}
+}
 mod mmu {pub type KernelMapping=u64;}
 mod g17 {
  pub fn now_ns()->u64{crate::now_ns()}
+ pub mod channel {pub fn observe_control(_:u32,_:u32){}}
  pub mod freelist {pub(crate) use crate::Pages; pub fn control_consumed(c:u32,_:u32,t:u32)->crate::Result<bool>{Ok(c==t)}}
  pub mod initdata {
   pub struct InitData {pub fail:bool}
   impl InitData {
    pub fn control_consumer(&self)->crate::Result<&crate::AtomicU32>{Ok(&crate::CONSUMER)}
    pub fn control_producer(&self)->crate::Result<&crate::AtomicU32>{Ok(&crate::PRODUCER)}
-   pub fn initialize_compute_pool_blocks(&self,_:u16,_:u64,_:usize)->crate::Result{if self.fail{Err(crate::EIO)}else{Ok(())}}
+   pub fn install_compute_pool(&self,_:crate::PoolDescriptor)->crate::Result{if self.fail{Err(crate::EIO)}else{Ok(())}}
   }
  }
 }
@@ -102,19 +111,19 @@ fn main(){
  let live=Arc::new(AtomicUsize::new(0));let init=initdata::InitData{fail:false};
  for close_first in [false,true] {for consumed_first in [false,true] {
   let mut q=idle(&live);q.retirement_ready=true;
-  assert!(q.begin_growth(&init,40).unwrap());let token=q.growth_token().unwrap();
+  assert!(q.begin_growth(&init,ComputeCapacity::Blocks(40)).unwrap());let token=q.growth_token().unwrap();
   assert!(q.growing);assert!(q.pool_phase==PoolPhase::ReleaseSent(3));
   assert_eq!(q.release_sent_ns,Some(now_ns()),"exact publication starts the release deadline");
   assert_eq!(q.abort_growth(Growth{qid:8,phase:token.phase}).unwrap(),None,"wrong physical queue");
   assert_eq!(q.abort_growth(Growth{qid:token.qid,phase:PoolPhase::ReleaseSent(4)}).unwrap(),None,"stale release transaction");
   assert!(q.growing);
-  assert!(q.begin_growth(&init,40).is_err(),"another builder cannot steal growth");
+  assert!(q.begin_growth(&init,ComputeCapacity::Blocks(40)).is_err(),"another builder cannot steal growth");
   if close_first {q.release_owner().unwrap();}
   CONSUMER.store(if consumed_first{3}else{2},Ordering::SeqCst);
   assert!(q.observe_vacancy(CONSUMER.load(Ordering::SeqCst),3).unwrap().is_none(),"live builder owns growth");
   // Timeout, epoch invalidation, notify/MMIO error all run this same abort.
   assert_eq!(q.abort_growth(token).unwrap(),Some(false));
-  assert!(!q.growing);assert!(q.owner.is_none());assert_eq!(q.growth_blocks,0);
+  assert!(!q.growing);assert!(q.owner.is_none());assert_eq!(q.growth,None);
   assert_eq!(q.abort_growth(token).unwrap(),None);
   assert!(q.pool.pages.is_some(),"abort must retain backing");
   assert_eq!(q.release_sent_ns,Some(now_ns()),"abort must not refresh or discard an owned deadline");
@@ -134,19 +143,23 @@ fn main(){
   drop(registry);drop(deferred);assert_eq!(live.load(Ordering::SeqCst),0);
  }}
  for failure in 0..2 {
-  let mut q=idle(&live);q.retirement_ready=true;q.begin_growth(&init,40).unwrap();
+  let mut q=idle(&live);q.retirement_ready=true;q.begin_growth(&init,ComputeCapacity::Blocks(40)).unwrap();
   let token=q.growth_token().unwrap();CONSUMER.store(3,Ordering::SeqCst);
-  let mut pages=Some(Pages(20));let mut alias=Some(30);
+  let mut pages=Some(Pages(20,40));let mut alias=Some(30);
   q.pool.fail=failure==0;
-  assert!(q.finish_growth(&initdata::InitData{fail:failure==1},&mut pages,&mut alias,40).is_err());
+  assert!(q.finish_growth(&initdata::InitData{fail:failure==1},&mut pages,&mut alias).is_err());
   assert_eq!(pages.as_ref().unwrap().0,20,"failed rearm preserves tentative pages");
   assert_eq!(q.pool.pages.as_ref().unwrap().0,10,"failed rearm preserves old pages");
   assert_eq!(alias,Some(30));assert_eq!(q.binding.as_ref().unwrap().pool_alias,Some(1));
   q.abort_growth(token).unwrap();assert!(q.observe_vacancy(3,3).unwrap().is_some());
  }
- let mut q=idle(&live);q.retirement_ready=true;q.begin_growth(&init,40).unwrap();
- let token=q.growth_token().unwrap();let mut pages=Some(Pages(20));let mut alias=Some(30);
- let old=q.finish_growth(&init,&mut pages,&mut alias,40).unwrap();
+ let mut q=idle(&live);q.retirement_ready=true;q.begin_growth(&init,ComputeCapacity::Blocks(40)).unwrap();
+ let token=q.growth_token().unwrap();let mut pages=Some(Pages(20,39));let mut alias=Some(30);
+ // The fresh backing must hold what the growth began for.
+ assert_eq!(q.finish_growth(&init,&mut pages,&mut alias).err(),Some(EAGAIN),"undersized backing must not commit");
+ assert!(q.growing);assert_eq!(q.pool.pages.as_ref().unwrap().0,10);assert_eq!(alias,Some(30));
+ let mut pages=Some(Pages(20,40));
+ let old=q.finish_growth(&init,&mut pages,&mut alias).unwrap();
  assert_eq!(q.release_sent_ns,None,"committed replacement clears the witnessed release deadline");
  assert_eq!(old._pages.unwrap().0,10);assert_eq!(old._alias,Some(1));assert!(pages.is_none());assert!(alias.is_none());
  assert_eq!(q.pool.pages.as_ref().unwrap().0,20);assert_eq!(q.abort_growth(token).unwrap(),None,"committed growth cannot be aborted");
@@ -160,7 +173,8 @@ def main():
     runtime = (ROOT / 'runtime.rs').read_text()
     assert 'growth = queue.growth_token();' in runtime and 'queue.abort_growth(token)' in runtime
     cases = [('fixed', source),
-             ('missing-abort-transfer', source.replace('self.growing = false;\n        self.growth_blocks = 0;\n        self.release_owner().map(Some)', 'self.release_owner().map(Some)')),
+             ('missing-abort-transfer', source.replace('self.growing = false;\n        self.growth = None;\n        self.release_owner().map(Some)', 'self.release_owner().map(Some)')),
+             ('ignore-growth-target', source.replace('if !pages.as_ref().ok_or(EINVAL)?.fits_capacity(target) {', 'if false {')),
              ('ignore-consumption', source.replace('if !crate::g17::freelist::control_consumed(consumer, producer, cursor)? {', 'if false {')),
              ('ignore-collector-pressure', source.replace('if !deferred.vacated_room() { break; }', ''))]
     with tempfile.TemporaryDirectory(prefix='g17-growth-') as tmp:
@@ -168,6 +182,8 @@ def main():
             path=Path(tmp)/(name+'.rs');path.write_text(code);binary=path.with_suffix('')
             subprocess.run([os.environ.get('RUSTC','rustc'),'--edition=2021','-Awarnings',str(path),'-o',str(binary)],check=True)
             result=subprocess.run([str(binary)],capture_output=True,text=True,timeout=15)
+            if name!='fixed':
+                assert code!=source,f'vacuous mutation: {name}'
             if name=='fixed':
                 assert result.returncode==0,result.stderr
                 print(result.stdout.strip())

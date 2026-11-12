@@ -1,11 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! PMP-owned cooling requests and retained-session performance ceiling.
+//! PMP-owned cooling requests, retained-session performance ceiling and the
+//! utilization governor.
 //!
 //! The firmware owns voltage and clock transitions through PMP. The host
 //! consumes PMP-owner telemetry and publishes only three Globals selectors,
 //! in hundredths of a performance state. Firmware power tables and policy
 //! words from other GPU generations are never modified here.
+//!
+//! The firmware runs at the published state, busy or not, so the host requests
+//! one from the GPU's busy share of each window, bounded by the ceiling.
+//!
+//! The firmware keeps GFX powered while the GPU idles, so the host reports
+//! when it has work in flight to the DT-selected CLPC, which holds the memory
+//! and fabric floor for that work.
 
 pub(crate) mod policy;
 
@@ -23,6 +31,9 @@ static_assert!(globals::PSTATE_SELECTORS[1] == 0x8c);
 static_assert!(globals::PSTATE_SELECTORS[2] == 0x98);
 
 extern "C" {
+    fn asahi_g16_clpc_gpu_get(dev: *mut c_void, out: *mut *mut c_void) -> core::ffi::c_int;
+    fn asahi_g16_clpc_gpu_set_active(gpu: *mut c_void, active: bool);
+    fn asahi_g16_clpc_gpu_put(gpu: *mut c_void);
     fn asahi_g16_cooling_register(dev: *mut c_void) -> *mut c_void;
     fn asahi_g16_cooling_unregister(cooling: *mut c_void);
     fn asahi_g16_cooling_sample(
@@ -96,9 +107,49 @@ struct Sample {
     backstop: u32,
 }
 
+/// DT-selected memory-demand provider (`apple,clpc`), or none. Its
+/// independent allocation outlives a detached provider; a device link orders
+/// supplier removal and suspend.
+struct Demand(*mut c_void);
+
+// SAFETY: the provider's leaf spinlock serializes all access; no GPU callback.
+unsafe impl Send for Demand {}
+// SAFETY: shared access only changes that locked request, never its lifetime.
+unsafe impl Sync for Demand {}
+
+impl Demand {
+    fn new(dev: &device::Device) -> Result<Self> {
+        let mut out = core::ptr::null_mut();
+        // SAFETY: live platform device and writable result; C returns an owned
+        // reference, or NULL without an `apple,clpc` provider.
+        let ret = unsafe { asahi_g16_clpc_gpu_get(dev.as_raw().cast(), &mut out) };
+        if ret < 0 {
+            Err(Error::from_errno(ret))
+        } else {
+            Ok(Self(out))
+        }
+    }
+
+    fn set_active(&self, active: bool) {
+        // SAFETY: the retained reference is live; NULL denotes no provider.
+        unsafe { asahi_g16_clpc_gpu_set_active(self.0, active) };
+    }
+}
+
+impl Drop for Demand {
+    fn drop(&mut self) {
+        // SAFETY: releases exactly the reference returned by get, clearing
+        // the demand first.
+        unsafe { asahi_g16_clpc_gpu_put(self.0) };
+    }
+}
+
 /// All fields are protected by the device mutex. Before the first valid
 /// provider sample the shared cooling policy keeps the ceiling at S1.
 pub(crate) struct Power {
+    clpc: Demand,
+    /// The work-in-flight state last reported to `clpc`.
+    reported: Option<bool>,
     cooling: Cooling,
     sample: Sample,
     last_sample_ns: Option<u64>,
@@ -113,6 +164,7 @@ pub(crate) struct Power {
     pub(crate) sensor_errors: u64,
     pub(crate) decisions: u64,
     last_decision: Option<(u32, u32, u32, u32, Option<Error>)>,
+    pub(crate) utilization: policy::Governor,
 }
 
 impl Power {
@@ -120,6 +172,9 @@ impl Power {
     /// startup S1 before INIT; this object starts with that same effective state.
     pub(crate) fn new(dev: &device::Device) -> Result<Self> {
         Ok(Self {
+            // First: a CLPC that has not probed yet defers before the PMP vote.
+            clpc: Demand::new(dev)?,
+            reported: None,
             cooling: Cooling::new(dev)?,
             sample: Sample {
                 temperature_mc: 0,
@@ -139,7 +194,17 @@ impl Power {
             sensor_errors: 0,
             decisions: 0,
             last_decision: None,
+            utilization: policy::Governor::new(),
         })
+    }
+
+    /// Reports a change of work in flight to the CLPC: the memory and fabric
+    /// floor follows it, not the GFX power state.
+    pub(crate) fn report_work(&mut self, in_flight: bool) {
+        if self.reported != Some(in_flight) {
+            self.clpc.set_active(in_flight);
+            self.reported = Some(in_flight);
+        }
     }
 
     fn ceiling(&mut self, now: u64) -> (u32, bool) {
@@ -184,6 +249,10 @@ impl Firmware {
         }
         let now = now_ns();
         let (limit, decision) = self.power.ceiling(now);
+        let target = self
+            .power
+            .utilization
+            .govern(now, limit, !self.engine.flights.is_empty());
         if decision {
             dev_info!(
                 self.dev(),
@@ -197,15 +266,15 @@ impl Firmware {
                 limit
             );
         }
-        if limit == self.power.effective {
+        if target == self.power.effective {
             return Ok(());
         }
         let globals = self.init.globals.as_ref().ok_or(ENODEV)?;
         for offset in globals::PSTATE_SELECTORS {
-            globals.w32(offset, limit * 100)?;
+            globals.w32(offset, target * 100)?;
         }
         wmb();
-        self.power.effective = limit;
+        self.power.effective = target;
         self.power.updates += 1;
         Ok(())
     }

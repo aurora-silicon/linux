@@ -44,6 +44,9 @@ properties:
       - items:
           - const: apple,t6041-admac
           - const: apple,t8132-admac
+      - items:
+          - const: apple,t6050-admac
+          - const: apple,t8140-admac
 
   reg:
     maxItems: 1
@@ -79,6 +82,8 @@ properties:
       Host DMA allocation window as a base and nonzero size. T8140 ADMAC
       instances share firmware-owned AOP DART roots and use windows assigned
       to their own streams. If absent, the DART allocation aperture applies.
+
+  nonposted-mmio: true
 
   power-domains:
     maxItems: 1

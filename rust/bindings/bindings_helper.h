@@ -31,6 +31,7 @@
 #include <linux/acpi.h>
 #include <linux/gpu_buddy.h>
 #include <drm/drm_auth.h>
+#include <drm/drm_debugfs.h>
 #include <drm/drm_device.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_file.h>
@@ -38,6 +39,7 @@
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_gpuvm.h>
 #include <drm/drm_ioctl.h>
+#include <drm/drm_print.h>
 #include <drm/drm_syncobj.h>
 #include <drm/gpu_scheduler.h>
 #include <kunit/test.h>
@@ -68,7 +70,12 @@
 #include <linux/fwctl.h>
 #include <linux/fs.h>
 #include <linux/i2c.h>
+#include <linux/iio/buffer.h>
 #include <linux/iio/iio.h>
+#include <linux/iio/kfifo_buf.h>
+#include <linux/iio/trigger.h>
+#include <linux/iio/trigger_consumer.h>
+#include <linux/iio/triggered_buffer.h>
 #include <linux/iio/types.h>
 #include <linux/input.h>
 #include <linux/interrupt.h>
@@ -106,6 +113,8 @@
 #include <linux/soc/apple/pmp-display.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/pmp.h>
+#include <linux/soc/apple/pmp-report.h>
+#include <linux/suspend.h>
 #include <linux/sys_soc.h>
 #include <linux/task_work.h>
 #include <linux/tracepoint.h>
@@ -153,8 +162,11 @@ const blk_features_t RUST_CONST_HELPER_BLK_FEAT_ROTATIONAL = BLK_FEAT_ROTATIONAL
 const fop_flags_t RUST_CONST_HELPER_FOP_UNSIGNED_OFFSET = FOP_UNSIGNED_OFFSET;
 const u32 RUST_CONST_HELPER_APPLE_RTKIT_COPROC_PLACES_BUFFERS = APPLE_RTKIT_COPROC_PLACES_BUFFERS;
 const u32 RUST_CONST_HELPER_APPLE_RTKIT_NEEDS_COREANALYTICS = APPLE_RTKIT_NEEDS_COREANALYTICS;
+const u32 RUST_CONST_HELPER_APPLE_RTKIT_FIRMWARE_OWNED_CRASHLOG = APPLE_RTKIT_FIRMWARE_OWNED_CRASHLOG;
+const u32 RUST_CONST_HELPER_APPLE_RTKIT_EARLY_CRASHLOG = APPLE_RTKIT_EARLY_CRASHLOG;
 
 const u64 BINDINGS_SNDRV_PCM_FMTBIT_FLOAT_LE = SNDRV_PCM_FMTBIT_FLOAT_LE;
+const u64 BINDINGS_SNDRV_PCM_FMTBIT_S16_LE = SNDRV_PCM_FMTBIT_S16_LE;
 const u64 BINDINGS_SNDRV_PCM_FMTBIT_S32_LE = SNDRV_PCM_FMTBIT_S32_LE;
 const u64 BINDINGS_SNDRV_PCM_FMTBIT_S24_LE = SNDRV_PCM_FMTBIT_S24_LE;
 const u32 BINDINGS_SNDRV_PCM_SUBFMTBIT_STD = SNDRV_PCM_SUBFMTBIT_STD;
@@ -162,8 +174,20 @@ const snd_ctl_elem_iface_t BINDINGS_SNDRV_CTL_ELEM_IFACE_MIXER = SNDRV_CTL_ELEM_
 
 const u32 BINDINGS_IIO_CHAN_INFO_RAW = IIO_CHAN_INFO_RAW;
 const u32 BINDINGS_IIO_CHAN_INFO_PROCESSED = IIO_CHAN_INFO_PROCESSED;
+const u32 BINDINGS_IIO_CHAN_INFO_SCALE = IIO_CHAN_INFO_SCALE;
 const u32 BINDINGS_IIO_ANGL = IIO_ANGL;
 const u32 BINDINGS_IIO_LIGHT = IIO_LIGHT;
+const u32 BINDINGS_IIO_COLORTEMP = IIO_COLORTEMP;
+const u32 BINDINGS_IIO_ACCEL = IIO_ACCEL;
+const u32 BINDINGS_IIO_ANGL_VEL = IIO_ANGL_VEL;
+const u32 BINDINGS_IIO_ROT = IIO_ROT;
+const u32 BINDINGS_IIO_TEMP = IIO_TEMP;
+const u32 BINDINGS_IIO_TIMESTAMP = IIO_TIMESTAMP;
+const u32 BINDINGS_IIO_MOD_X = IIO_MOD_X;
+const u32 BINDINGS_IIO_MOD_Y = IIO_MOD_Y;
+const u32 BINDINGS_IIO_MOD_Z = IIO_MOD_Z;
+const u32 BINDINGS_IIO_MOD_QUATERNION = IIO_MOD_QUATERNION;
+const u32 BINDINGS_IIO_CHAN_INFO_SAMP_FREQ = IIO_CHAN_INFO_SAMP_FREQ;
 
 const xa_mark_t RUST_CONST_HELPER_XA_PRESENT = XA_PRESENT;
 

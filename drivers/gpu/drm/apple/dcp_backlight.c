@@ -16,6 +16,7 @@
 #include "connector.h"
 #include "dcp.h"
 #include "dcp-internal.h"
+#include "iomfb_v14_7.h"
 
 #define MIN_BRIGHTNESS_PART1	2U
 #define MAX_BRIGHTNESS_PART1	99U
@@ -93,12 +94,31 @@ static u32 brightness_part2[] = {
 #define DCP_BL_FADE_MS		250U
 #define DCP_BL_FADE_STEP_MS	16U
 
+static bool dcp_backlight_presents_nits(struct apple_dcp *dcp)
+{
+	return ((dcp->fw_compat == DCP_FIRMWARE_H17P || dcp->fw_compat == DCP_FIRMWARE_V_27_0) &&
+		dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) ||
+	       iomfb_v14_7_panel_nits(dcp);
+}
+
 bool dcp_backlight_active(struct apple_dcp *dcp)
 {
-	return ((dcp->fw_compat == DCP_FIRMWARE_H17P &&
-		 dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) ||
-		iomfb_is_m4(dcp)) &&
+	return (dcp_backlight_presents_nits(dcp) || iomfb_is_m4(dcp)) &&
 		READ_ONCE(dcp->backlight.state.ready);
+}
+
+bool dcp_backlight_level_known(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+	bool known;
+
+	/* Only a panel running the policy initialised its lock and state. */
+	if (!dcp_backlight_active(dcp))
+		return false;
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	known = dcp->backlight.state.ready && dcp->backlight.state.level_known;
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+	return known;
 }
 
 static bool dcp_backlight_desktop(struct apple_dcp *dcp)
@@ -228,11 +248,17 @@ static int dcp_get_brightness(struct backlight_device *bd)
 		return -ENODEV;
 
 	if (dcp_backlight_active(dcp) || dcp_backlight_desktop(dcp)) {
+		/*
+		 * The 14.7 panel reports no actual level until a present
+		 * carried one: before that it shows the boot loader's level,
+		 * which Linux does not know.
+		 */
 		spin_lock_irqsave(&dcp->backlight.lock, flags);
 		if (dcp_backlight_desktop(dcp))
 			actual = dcp_bl_actual(&dcp->backlight.state);
 		else
-			actual = dcp->backlight.state.actual;
+			actual = dcp_bl_reported_actual(&dcp->backlight.state,
+							iomfb_v14_7_panel_nits(dcp));
 		spin_unlock_irqrestore(&dcp->backlight.lock, flags);
 		return actual;
 	}
@@ -248,8 +274,8 @@ int dcp_backlight_configure(struct apple_dcp *dcp, u32 maximum,
 	unsigned long flags;
 	int ret;
 
-	if ((dcp->fw_compat != DCP_FIRMWARE_H17P &&
-	     !iomfb_is_m4(dcp)) ||
+	if ((dcp->fw_compat != DCP_FIRMWARE_H17P && dcp->fw_compat != DCP_FIRMWARE_V_27_0 &&
+	     !iomfb_is_m4(dcp) && !iomfb_v14_7_panel_nits(dcp)) ||
 	    !dcp_has_panel(dcp) || !dcp->crtc || !kick)
 		return -EINVAL;
 
@@ -269,7 +295,7 @@ int dcp_backlight_configure(struct apple_dcp *dcp, u32 maximum,
 			dcp_bl_jump(&dcp->backlight.state);
 			dcp->backlight.kick = kick;
 		} else if (!ret) {
-			dcp->backlight.state.fade = true;
+			dcp->backlight.state.fade = !iomfb_v14_7_panel_nits(dcp);
 			dcp->backlight.kick = kick;
 		}
 	}
@@ -339,6 +365,7 @@ static void dcp_backlight_retry_work(struct work_struct *work)
 void dcp_backlight_stop(struct apple_dcp *dcp)
 {
 	cancel_delayed_work_sync(&dcp->backlight.fade_work);
+	cancel_delayed_work_sync(&dcp->brightness.fade_work);
 	cancel_delayed_work_sync(&dcp->backlight.retry_work);
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
 		cancel_work_sync(&dcp->backlight.notify_work);
@@ -349,6 +376,8 @@ static void dcp_backlight_release(void *data)
 	dcp_backlight_stop(data);
 }
 
+static void dcp_dac_fade_work(struct work_struct *work);
+
 /*
  * The backlight device is a devres of @dev, registered after probe, so it is
  * unregistered before this action runs, and no request can start a fade
@@ -358,6 +387,7 @@ int dcp_backlight_init(struct apple_dcp *dcp, struct device *dev)
 {
 	spin_lock_init(&dcp->backlight.lock);
 	INIT_DELAYED_WORK(&dcp->backlight.fade_work, dcp_backlight_fade_work);
+	INIT_DELAYED_WORK(&dcp->brightness.fade_work, dcp_dac_fade_work);
 	INIT_WORK(&dcp->backlight.notify_work, dcp_backlight_notify_work);
 	INIT_DELAYED_WORK(&dcp->backlight.retry_work, dcp_backlight_retry_work);
 	return devm_add_action_or_reset(dev, dcp_backlight_release, dcp);
@@ -655,8 +685,7 @@ int dcp_backlight_update(struct apple_dcp *dcp)
 		dcp_backlight_kick(dcp);
 		return 0;
 	}
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
-	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+	if (dcp_backlight_presents_nits(dcp))
 		return -ENODATA;
 
 	/*
@@ -674,6 +703,64 @@ int dcp_backlight_update(struct apple_dcp *dcp)
 		msleep((1001 + 23) / 24); // 42ms for 23.976 fps
 
 	return drm_crtc_set_brightness(dcp);
+}
+
+/*
+ * The firmware shows a swap's DAC value at once, so a new level would be a
+ * visible jump.  Step from the level set last towards it instead.  Each step
+ * rides on the compositor's next swap, or is presented on its own if no swap
+ * took it within a step.
+ */
+static void dcp_dac_fade_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(to_delayed_work(work),
+					     struct apple_dcp, brightness.fade_work);
+	struct dcp_brightness *b = &dcp->brightness;
+	bool again;
+	u32 elapsed;
+
+	if (READ_ONCE(dcp->quiescing) || READ_ONCE(dcp->crashed))
+		return;
+	if (READ_ONCE(b->update) && READ_ONCE(dcp->mode_state.valid))
+		drm_crtc_set_brightness(dcp);
+
+	if (drm_modeset_lock_single_interruptible(&dcp->crtc->base.mutex))
+		return;
+	if (b->fading) {
+		u32 level;
+
+		elapsed = jiffies_to_msecs(jiffies - b->fade_start);
+		if (elapsed >= DCP_BL_FADE_MS) {
+			level = b->fade_to;
+			b->fading = false;
+		} else if (b->fade_to >= b->fade_from) {
+			level = b->fade_from +
+				mult_frac(b->fade_to - b->fade_from, elapsed, DCP_BL_FADE_MS);
+		} else {
+			level = b->fade_from -
+				mult_frac(b->fade_from - b->fade_to, elapsed, DCP_BL_FADE_MS);
+		}
+		if (level != b->level) {
+			b->level = level;
+			b->dac = calculate_dac(dcp, level);
+			b->update = true;
+		}
+	}
+	/* With no mode set, the next enable swap carries the pending level. */
+	again = b->fading || (b->update && READ_ONCE(dcp->mode_state.valid));
+	drm_modeset_unlock(&dcp->crtc->base.mutex);
+	if (again)
+		queue_delayed_work(system_freezable_wq, &b->fade_work,
+				   msecs_to_jiffies(DCP_BL_FADE_STEP_MS));
+}
+
+/* A lit panel with a mode fades to a new lit level; anything else jumps. */
+static bool dcp_dac_fade_starts(struct apple_dcp *dcp, u32 nits)
+{
+	struct dcp_brightness *b = &dcp->brightness;
+
+	return dcp_has_panel(dcp) && READ_ONCE(dcp->mode_state.valid) &&
+	       b->level && nits && b->level != nits;
 }
 
 static int dcp_set_brightness(struct backlight_device *bd)
@@ -714,6 +801,18 @@ static int dcp_set_brightness(struct backlight_device *bd)
 	if (ret)
 		return ret;
 
+	/* A new level restarts the fade from the level set last. */
+	if (dcp_dac_fade_starts(dcp, brightness)) {
+		dcp->brightness.fade_from = dcp->brightness.level;
+		dcp->brightness.fade_to = brightness;
+		dcp->brightness.fade_start = jiffies;
+		dcp->brightness.fading = true;
+		drm_modeset_unlock(&dcp->crtc->base.mutex);
+		mod_delayed_work(system_freezable_wq, &dcp->brightness.fade_work, 0);
+		return 0;
+	}
+	dcp->brightness.fading = false;
+	dcp->brightness.level = brightness;
 	dcp->brightness.dac = calculate_dac(dcp, brightness);
 	dcp->brightness.update = true;
 
@@ -744,6 +843,22 @@ static const struct backlight_ops dcp_backlight_ops = {
 	.controls_device = dcp_backlight_controls_device,
 };
 
+static bool dcp_backlight_controls_device_v14(struct backlight_device *bd,
+					      struct device *display_dev)
+{
+	struct apple_dcp *dcp = bl_get_data(bd);
+
+	/* An fbdev unblank must not present the unrequested default level. */
+	return dcp_backlight_level_known(dcp) &&
+		dcp_backlight_controls_device(bd, display_dev);
+}
+
+static const struct backlight_ops dcp_backlight_ops_v14 = {
+	.get_brightness = dcp_get_brightness,
+	.update_status = dcp_set_brightness,
+	.controls_device = dcp_backlight_controls_device_v14,
+};
+
 int dcp_backlight_register(struct apple_dcp *dcp)
 {
 	struct device *dev = dcp->dev;
@@ -756,9 +871,7 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 		.scale = BACKLIGHT_SCALE_LINEAR,
 	};
 	props.max_brightness = min(dcp->brightness.maximum, MAX_BRIGHTNESS_PART2 - 1);
-	if (((dcp->fw_compat == DCP_FIRMWARE_H17P &&
-	      dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) ||
-	     iomfb_is_m4(dcp)) &&
+	if ((dcp_backlight_presents_nits(dcp) || iomfb_is_m4(dcp)) &&
 	    !dcp_backlight_active(dcp))
 		return -ENODATA;
 	if (dcp_backlight_active(dcp)) {
@@ -804,7 +917,9 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 	}
 
 	bl_dev = devm_backlight_device_register(dev, "apple-panel-bl", dev, dcp,
-						&dcp_backlight_ops, &props);
+						iomfb_v14_7_panel_nits(dcp) ?
+						&dcp_backlight_ops_v14 : &dcp_backlight_ops,
+						&props);
 	if (IS_ERR(bl_dev))
 		return PTR_ERR(bl_dev);
 
@@ -819,8 +934,10 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
 		dcp_backlight_sync_hint(dcp);
 	if (!dcp_backlight_active(dcp) &&
-	    dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP)
+	    dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP) {
+		dcp->brightness.level = dcp->brightness.nits;
 		dcp->brightness.dac = calculate_dac(dcp, dcp->brightness.nits);
+	}
 
 	return 0;
 }

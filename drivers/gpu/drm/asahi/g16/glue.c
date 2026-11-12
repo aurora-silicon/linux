@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * G16 (T8132, M4) helpers that have no Rust bindings: static inlines,
- * macros and THIS_MODULE. Built only with CONFIG_DRM_ASAHI_G16.
+ * G16 (T8132, M4) helpers that have no Rust bindings: static inlines
+ * and macros. The module pin is retain.c's. Built only with CONFIG_DRM_ASAHI_G16.
  */
 #include <linux/device.h>
 #include <linux/atomic.h>
@@ -17,14 +17,16 @@
 #include <linux/of_reserved_mem.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/clpc.h>
+#include <linux/soc/apple/display.h>
 #include <linux/soc/apple/pmp-display.h>
 #include <linux/soc/apple/pmp-cooling.h>
 #include <linux/soc/apple/pmp-telemetry.h>
 #include <linux/thermal.h>
 
 bool asahi_g16_board(void);
+int asahi_g16_display_prepare(struct device *dev);
 int asahi_g16_hold_power(struct device *dev);
-void asahi_g16_module_get(void);
 bool asahi_g16_ram_disjoint(u64 start, u64 size);
 void __iomem *asahi_g16_ioremap_wc(u64 start, size_t size);
 bool asahi_g16_dma_unsupported(struct device *dev);
@@ -46,6 +48,9 @@ void asahi_g16_cooling_unregister(struct asahi_g16_cooling *cooling);
 int asahi_g16_cooling_sample(struct asahi_g16_cooling *cooling, u64 now,
 			    long *temperature, u32 *governor, u32 *power,
 			    u32 *backstop);
+int asahi_g16_clpc_gpu_get(struct device *dev, struct apple_clpc_gpu **out);
+void asahi_g16_clpc_gpu_set_active(struct apple_clpc_gpu *gpu, bool active);
+void asahi_g16_clpc_gpu_put(struct apple_clpc_gpu *gpu);
 
 static int asahi_g16_cooling_max(struct thermal_cooling_device *cdev,
 				unsigned long *state)
@@ -101,7 +106,7 @@ struct asahi_g16_cooling *asahi_g16_cooling_register(struct device *dev)
 		goto put_node;
 	}
 	cooling->cdev = thermal_of_cooling_device_register(dev->of_node, 0,
-							  "asahi-g16g", cooling,
+							  "aurora-g16g", cooling,
 							  &asahi_g16_cooling_ops);
 	if (IS_ERR(cooling->cdev)) {
 		ret = PTR_ERR(cooling->cdev);
@@ -150,6 +155,31 @@ bool asahi_g16_board(void)
 }
 
 /*
+ * The first firmware start follows the native display the boot loader handed
+ * over, as on J713 bring-up: defer until drm/apple has published it. A boot
+ * without one (no internal panel, or none qualified) starts on the boot
+ * framebuffer.
+ */
+int asahi_g16_display_prepare(struct device *dev)
+{
+	struct device_node *np;
+	bool handed_over;
+	int ret;
+
+	np = of_find_compatible_node(NULL, NULL, "apple,t8132-display-subsystem");
+	handed_over = np && of_device_is_available(np);
+	of_node_put(np);
+	if (!handed_over) {
+		dev_info_once(dev, "G16: no native display this boot; starting on the boot framebuffer\n");
+		return 0;
+	}
+	ret = apple_drm_t8132_link_device(dev);
+	if (ret == -EPROBE_DEFER)
+		dev_info_once(dev, "G16: waiting for the T8132 native display to register\n");
+	return ret;
+}
+
+/*
  * Keep the GFX domain powered for the whole (retained) session. Never released,
  * like the firmware session itself.
  */
@@ -163,12 +193,6 @@ int asahi_g16_hold_power(struct device *dev)
 		return ret;
 	pm_runtime_enable(dev);
 	return dev->pm_domain ? 0 : -EINVAL;
-}
-
-/* Pin this module until reboot. */
-void asahi_g16_module_get(void)
-{
-	__module_get(THIS_MODULE);
 }
 
 /* The range is disjoint from System RAM (ADT region admission). */
@@ -260,4 +284,33 @@ int asahi_g16_power_domain_state(struct device *dev, u32 *offset, u32 *state)
 	if (IS_ERR(pmgr))
 		return PTR_ERR(pmgr);
 	return regmap_read(pmgr, *offset, state);
+}
+
+/*
+ * The CLPC holding the memory floor for GPU work is a performance aid: the GPU
+ * works without one, only slower. A kernel without the CLPC runs without it;
+ * one that has not probed yet defers the GPU, with the reason recorded.
+ */
+int asahi_g16_clpc_gpu_get(struct device *dev, struct apple_clpc_gpu **out)
+{
+	int ret = apple_clpc_gpu_get(dev, out);
+
+	if (ret == -ENODEV) {
+		dev_warn(dev, "no CLPC: GPU work gets no memory floor\n");
+		*out = NULL;
+		return 0;
+	}
+	if (ret)
+		return dev_err_probe(dev, ret, "no CLPC for GPU work\n");
+	return 0;
+}
+
+void asahi_g16_clpc_gpu_set_active(struct apple_clpc_gpu *gpu, bool active)
+{
+	apple_clpc_gpu_set_active(gpu, active);
+}
+
+void asahi_g16_clpc_gpu_put(struct apple_clpc_gpu *gpu)
+{
+	apple_clpc_gpu_put(gpu);
 }

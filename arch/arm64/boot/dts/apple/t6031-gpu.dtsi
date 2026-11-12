@@ -1,20 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * Apple T6031 (M3 Max / G15C) GPU description.
- *
- * The register ranges and interrupts come from the J516C iBoot ADT: /arm-io
- * maps child 0 to 0x2_0000_0000 here, so sgx is at 0x4_0800_0000 and gfx-asc
- * at sgx + 0x240_0000, the T6030 offset. The GPU and its mailbox stay
- * disabled.
- *
- * The rest of the description is each machine's, and the boot loader fills it
- * from its ADT when it hands the GPU over, as on T8122: the operating points
- * (one opp-microvolt cell per cluster, four clusters, and a power each), the
- * CS and AFR operating points, the leakage and power-management coefficients,
- * the firmware version, the UAT regions below, and the firmware segments,
- * which it adds itself as the "fw-text" and "fw-data" memory regions. It
- * enables the mailbox and then the GPU node last. Nothing here has a T6030
- * value copied into it.
+ * Apple T6031 (M3 Max / G15C) GPU, from the J516C ADT. The boot loader fills
+ * in this machine's performance states, coefficients, firmware version and
+ * memory, enables the mailbox and then the GPU.
  */
 
 / {
@@ -25,12 +13,7 @@
 	gpu_opp: opp-table-gpu {
 		compatible = "operating-points-v2";
 
-		/*
-		 * Placeholder only. The boot loader deletes these children and
-		 * creates one OPP per performance state, with one opp-microvolt
-		 * cell per cluster (the four per-cluster voltage tables of the
-		 * ADT) and opp-microwatt. Until then every value is zero.
-		 */
+		/* Placeholder; the boot loader writes one OPP per state, per cluster. */
 		opp00 {
 			opp-hz = /bits/ 64 <0>;
 			opp-microvolt = <0 0 0 0>;
@@ -38,11 +21,7 @@
 		};
 	};
 
-	/*
-	 * CS and AFR clock domains (ADT cs-perf-states, afr-perf-states).
-	 * Placeholders with one opp-microvolt cell (one die); the boot loader
-	 * replaces the children.
-	 */
+	/* CS and AFR clock domains; placeholders the boot loader replaces. */
 	gpu_cs_opp: opp-table-gpu-cs {
 		compatible = "operating-points-v2";
 
@@ -62,11 +41,7 @@
 	};
 
 	reserved-memory {
-		/*
-		 * Filled and enabled by the boot loader from the ADT sgx
-		 * gpu-region-*, gfx-shared-region-*, gfx-handoff-* and
-		 * gfx-shared-l2-region-* properties. Disabled until then.
-		 */
+		/* Filled and enabled by the boot loader; disabled while empty. */
 		uat_ttbs: uat-ttbs@10 {
 			reg = <0 0x10 0 0>;
 			status = "disabled";
@@ -104,12 +79,8 @@
 			     <AIC_IRQ 0 1247 IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_IRQ 0 1249 IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_IRQ 0 1239 IRQ_TYPE_LEVEL_HIGH>;
-		/* "gfx" (pmgr_gfx + 0x110), whose parent is afr. */
 		power-domains = <&ps_gfx>;
-		/*
-		 * Do not hold back the ps_gfx sync_state() on this device when it
-		 * never probes, as on the T6030 and T8122.
-		 */
+		/* Do not hold back ps_gfx sync_state() if the GPU never probes. */
 		post-init-providers = <&ps_gfx>;
 		mboxes = <&agx_mbox>;
 		memory-region = <&uat_ttbs>, <&uat_pagetables>,
@@ -131,11 +102,8 @@
 	};
 
 	/*
-	 * The ASC mailbox at asc + 0x8000. The ADT lists the gfx-asc interrupts
-	 * as 1244, 1243, 1246, 1245; in mailbox order they are 1243..1246, the
-	 * same swap as on T8122. Like the T6030 and T8122 ones it carries no
-	 * asc-mailbox-v4 fallback, so a kernel without M3 Max GPU support
-	 * leaves it unbound even after the boot loader has enabled it.
+	 * The ADT lists 1244, 1243, 1246, 1245, swapped as on T8122. No
+	 * asc-mailbox-v4 fallback: unbound without M3 Max GPU support.
 	 */
 	agx_mbox: mbox@40a408000 {
 		compatible = "apple,t6031-agx-asc-mailbox";

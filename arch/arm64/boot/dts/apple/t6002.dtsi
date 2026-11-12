@@ -380,3 +380,24 @@
 };
 
 #include "hwmon-common.dtsi"
+
+#include "t6002-peripherals.dtsi"
+#include "t6002-aux-spmi.dtsi"
+#include "t6002-display-extra.dtsi"
+
+/*
+ * The die 0 video encoder is the M1 Pro's: the bootloader hands it the
+ * firmware iBoot preloads, and without that handoff the driver refuses
+ * the reservation and the encoder stays off.
+ */
+&ave_dart0 {
+	status = "okay";
+};
+
+&ave_dart1 {
+	status = "okay";
+};
+
+&ave {
+	status = "okay";
+};

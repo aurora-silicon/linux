@@ -35,6 +35,8 @@ typedef unsigned short umode_t;
 typedef uint64_t __u64; typedef uint32_t __u32; typedef uint16_t __u16; typedef uint8_t __u8;
 typedef int64_t __s64; typedef int32_t __s32;
 #define __user
+#define READ_ONCE(x) __atomic_load_n(&(x), __ATOMIC_RELAXED)
+#define WRITE_ONCE(x, v) __atomic_store_n(&(x), (v), __ATOMIC_RELAXED)
 ''',
     'linux/atomic.h': r'''
 #include <linux/types.h>
@@ -53,10 +55,50 @@ static inline bool atomic_try_cmpxchg(atomic_t *v, int *old, int new_)
 					   __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
 }
 #define atomic_inc(v) __atomic_add_fetch(&(v)->counter, 1, __ATOMIC_SEQ_CST)
+#define atomic_inc_return(v) atomic_inc(v)
+#define atomic_xchg(v, i) __atomic_exchange_n(&(v)->counter, (i), __ATOMIC_SEQ_CST)
+typedef struct { int64_t counter; } atomic64_t;
+#define atomic64_read(v) __atomic_load_n(&(v)->counter, __ATOMIC_SEQ_CST)
+static inline int64_t atomic64_cmpxchg(atomic64_t *v, int64_t old, int64_t new_)
+{
+    __atomic_compare_exchange_n(&v->counter, &old, new_, false,
+                               __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    return old;
+}
+''',
+    'linux/bitmap.h': r'''
+#include <linux/types.h>
+#define BITS_PER_LONG (8 * sizeof(unsigned long))
+#define DECLARE_BITMAP(name, bits) unsigned long name[((bits) + BITS_PER_LONG - 1) / BITS_PER_LONG]
+static inline void set_bit(unsigned int bit, unsigned long *map)
+{
+    map[bit / BITS_PER_LONG] |= 1UL << (bit % BITS_PER_LONG);
+}
+#define for_each_set_bit(bit, map, size) \
+    for ((bit) = 0; (bit) < (size); (bit)++) \
+        if ((map)[(bit) / BITS_PER_LONG] & (1UL << ((bit) % BITS_PER_LONG)))
+''',
+    'linux/bitops.h': r'''
+#define smp_rmb() __atomic_thread_fence(__ATOMIC_ACQUIRE)
+#define smp_wmb() __atomic_thread_fence(__ATOMIC_RELEASE)
+''',
+    'linux/ctype.h': '#include <ctype.h>\n',
+    'linux/ktime.h': r'''
+#include <linux/types.h>
+#include <time.h>
+#define NSEC_PER_MSEC 1000000ULL
+static inline u64 ktime_get_boottime_ns(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_BOOTTIME, &now);
+    return (u64)now.tv_sec * 1000000000ULL + now.tv_nsec;
+}
+static inline u64 div_u64(u64 value, u32 divisor) { return value / divisor; }
 ''',
     'linux/device.h': r'''
 #include <linux/types.h>
 struct device { int unused; };
+#define dev_info(dev, ...) ((void)(dev))
 struct attribute { const char *name; umode_t mode; };
 struct device_attribute {
 	struct attribute attr;
@@ -88,8 +130,25 @@ static inline int sysfs_emit(char *buf, const char *fmt, ...)
 	va_end(args);
 	return n;
 }
+static inline int sysfs_emit_at(char *buf, int at, const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    int n = vsnprintf(buf + at, 4096 - at, fmt, args);
+    va_end(args);
+    return n;
+}
+static inline int scnprintf(char *buf, size_t size, const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    int n = vsnprintf(buf, size, fmt, args);
+    va_end(args);
+    return n < 0 ? 0 : ((size_t)n < size ? n : (size ? (int)size - 1 : 0));
+}
 ''',
-    'linux/minmax.h': '#define min(a, b) ((a) < (b) ? (a) : (b))\n',
+    'linux/minmax.h': '#include <limits.h>\n#define min(a, b) ((a) < (b) ? (a) : (b))\n'
+                      '#define min_t(type, a, b) min((type)(a), (type)(b))\n',
     'linux/string.h': '#include <string.h>\n',
 }
 
@@ -160,7 +219,7 @@ int main(int argc, char **argv)
 	sep_diag_set_xart_guard(0, false, SEP_DIAG_MATCHING_USABLE);
 	sep_diag_register(&dev, "T8140/J700", 10, false, false, true);
 	/* The guard's attributes were added within version 2. */
-	expect("probe", "abi", "2");
+	expect("probe", "abi", "3");
 	expect("probe", "sensor", "unbound");
 	expect("probe", "touchid", "unknown");
 	expect("probe", "xart_guard", "0");
@@ -295,14 +354,14 @@ class DiagSensorTest(unittest.TestCase):
         usable, unverified, blocked = 1, 2, 3  # SEP_DIAG_MATCHING_* in shim.h
         cases = [
             # level, list, matching at probe, refusals, matching after them
-            ((0, 0, usable, 0, 0), '2 0 none 0 usable'),            # Neo, M1 Pro (pinned 0)
-            ((1, 1, unverified, 0, 0), '2 1 loaded 0 unverified'),  # M2 under the guard
-            ((1, 1, unverified, 2, blocked), '2 1 loaded 2 blocked'),  # ... after refusals
-            ((2, 1, unverified, 0, 0), '2 2 loaded 0 unverified'),
-            ((1, 0, blocked, 0, 0), '2 1 unavailable 0 blocked'),   # no list
-            ((1, 1, blocked, 0, 0), '2 1 loaded 0 blocked'),        # cold boot, level 1
-            ((0, 0, 0, 0, 0), '2 0 none 0 unknown'),                # never set
-            ((0, 0, 7, 0, 0), '2 0 none 0 unknown'),                # out of range
+            ((0, 0, usable, 0, 0), '3 0 none 0 usable'),            # Neo, M1 Pro (pinned 0)
+            ((1, 1, unverified, 0, 0), '3 1 loaded 0 unverified'),  # M2 under the guard
+            ((1, 1, unverified, 2, blocked), '3 1 loaded 2 blocked'),  # ... after refusals
+            ((2, 1, unverified, 0, 0), '3 2 loaded 0 unverified'),
+            ((1, 0, blocked, 0, 0), '3 1 unavailable 0 blocked'),   # no list
+            ((1, 1, blocked, 0, 0), '3 1 loaded 0 blocked'),        # cold boot, level 1
+            ((0, 0, 0, 0, 0), '3 0 none 0 unknown'),                # never set
+            ((0, 0, 7, 0, 0), '3 0 none 0 unknown'),                # out of range
         ]
         with tempfile.TemporaryDirectory() as directory:
             harness = self.build(Path(directory), GUARD_HARNESS, 'guard')

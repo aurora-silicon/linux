@@ -16,8 +16,10 @@
 #include <linux/of_dma.h>
 #include <linux/overflow.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/reset.h>
 #include <linux/spinlock.h>
+#include <linux/suspend.h>
 #include <linux/interrupt.h>
 
 #include "dmaengine.h"
@@ -127,6 +129,8 @@ struct admac_chan {
 	spinlock_t lock;
 	struct admac_tx *current_tx;
 	int nperiod_acks;
+	/* frame size a paused capture restarts aligned to on resume, or 0 */
+	u32 realign_bytes;
 
 	/*
 	 * We maintain a 'submitted' and 'issued' list mainly for interface
@@ -138,6 +142,12 @@ struct admac_chan {
 	struct list_head issued;
 
 	struct list_head to_free;
+
+	/* The client's last configuration, set up again after a system sleep. */
+	struct dma_slave_config cfg;
+	bool cfg_valid;
+	/* A system sleep took the channel's registers; set it up before a transfer. */
+	bool lost;
 };
 
 struct admac_sram {
@@ -180,6 +190,8 @@ struct admac_tx {
 
 	size_t submitted_pos;
 	size_t reclaimed_pos;
+	/* The last position tx_status reported, in [0, 2 * buf_len) */
+	size_t reported_pos;
 
 	struct list_head node;
 };
@@ -328,12 +340,28 @@ static struct dma_async_tx_descriptor *admac_prep_dma_cyclic(
 
 	adtx->submitted_pos = 0;
 	adtx->reclaimed_pos = 0;
+	adtx->reported_pos = 0;
 
 	dma_async_tx_descriptor_init(&adtx->tx, chan);
 	adtx->tx.tx_submit = admac_tx_submit;
 	adtx->tx.desc_free = admac_desc_free;
 
 	return &adtx->tx;
+}
+
+/*
+ * Write one hardware descriptor.
+ */
+static void admac_write_hw_desc(struct admac_data *ad, int channo,
+				dma_addr_t addr, size_t len)
+{
+	dev_dbg(ad->dev, "ch%d descriptor: addr=0x%pad len=0x%zx flags=0x%lx\n",
+		channo, &addr, len, FLAG_DESC_NOTIFY);
+
+	writel_relaxed(lower_32_bits(addr), ad->base + REG_DESC_WRITE(channo));
+	writel_relaxed(upper_32_bits(addr), ad->base + REG_DESC_WRITE(channo));
+	writel_relaxed(len,                 ad->base + REG_DESC_WRITE(channo));
+	writel_relaxed(FLAG_DESC_NOTIFY,    ad->base + REG_DESC_WRITE(channo));
 }
 
 /*
@@ -352,13 +380,7 @@ static bool admac_cyclic_write_one_desc(struct admac_data *ad, int channo,
 	/* If happens means we have buggy code */
 	WARN_ON_ONCE(addr + tx->period_len > tx->buf_end);
 
-	dev_dbg(ad->dev, "ch%d descriptor: addr=0x%pad len=0x%zx flags=0x%lx\n",
-		channo, &addr, tx->period_len, FLAG_DESC_NOTIFY);
-
-	writel_relaxed(lower_32_bits(addr), ad->base + REG_DESC_WRITE(channo));
-	writel_relaxed(upper_32_bits(addr), ad->base + REG_DESC_WRITE(channo));
-	writel_relaxed(tx->period_len,      ad->base + REG_DESC_WRITE(channo));
-	writel_relaxed(FLAG_DESC_NOTIFY,    ad->base + REG_DESC_WRITE(channo));
+	admac_write_hw_desc(ad, channo, addr, tx->period_len);
 	/* Include a descriptor already consumed while the ring is refilled. */
 	tx->nperiods_outstanding++;
 
@@ -402,34 +424,101 @@ static int admac_ring_noccupied_slots(int ringval)
 	}
 }
 
+/* Reads of the report ring and the residue before the position is given up */
+#define ADMAC_RESIDUE_READS	16
+
+/* The report ring and the residue, read twice in that order */
+struct admac_residue_read {
+	u32 ring1, residue1;
+	u32 ring2, residue2;
+};
+
+/*
+ * The position of a cyclic transaction, in [0, 2 * buf_len), from one
+ * &struct admac_residue_read: the periods reclaimed, those reported since,
+ * and the part of the period in progress. False if the read is not a
+ * consistent snapshot of the controller.
+ *
+ * At the end of a period the controller runs the residue down to 0, posts
+ * the period's report, then loads the next descriptor (its full period as
+ * the residue): seen on the J316s, where a read between the last two put
+ * the playback position a period ahead and the PCM core stopped the
+ * stream for an underrun at a period's end. With the residue at 0 the report may or may not
+ * be in the ring yet: the same read is the end of the period in progress,
+ * or, the report counted, a whole period further on. And a load between
+ * the two residue reads can come with a report posted before the first
+ * ring read or after it. So only a read whose ring did not move and whose
+ * residue is non-zero and did not reload is a position.
+ */
+static bool admac_cyclic_pos(const struct admac_tx *adtx,
+			     const struct admac_residue_read *r, size_t *pos)
+{
+	if (r->ring1 != r->ring2 || !r->residue2 || r->residue2 > r->residue1 ||
+	    r->residue2 > adtx->period_len)
+		return false;
+	*pos = (adtx->reclaimed_pos +
+		adtx->period_len * (admac_ring_noccupied_slots(r->ring2) + 1) -
+		r->residue2) % (2 * adtx->buf_len);
+	return true;
+}
+
+/* Position @b is ahead of @a, both in [0, 2 * buf_len), by less than a buffer */
+static bool admac_cyclic_pos_after(const struct admac_tx *adtx, size_t a, size_t b)
+{
+	size_t span = 2 * adtx->buf_len;
+	size_t ahead = (b + span - a) % span;
+
+	return ahead && ahead < adtx->buf_len;
+}
+
+/*
+ * The position for a read that is caught in a period's end (see
+ * admac_cyclic_pos()): never ahead of the transfer, and never behind the
+ * last position reported. The periods reclaimed and reported are done
+ * either way, the report of the one ending perhaps among them.
+ */
+static size_t admac_cyclic_pos_at_period_end(const struct admac_tx *adtx,
+					     const struct admac_residue_read *r)
+{
+	size_t done = (adtx->reclaimed_pos +
+		       adtx->period_len * admac_ring_noccupied_slots(r->ring2)) %
+		      (2 * adtx->buf_len);
+
+	return admac_cyclic_pos_after(adtx, adtx->reported_pos, done) ? done :
+								       adtx->reported_pos;
+}
+
 /*
  * Read from hardware the residue of a cyclic dmaengine transaction.
+ *
+ * The read is repeated while it is caught in a period's end (see
+ * admac_cyclic_pos()), which lasts well under a microsecond. A controller
+ * that stays there, stalled at a period's end with no descriptor to load,
+ * gets admac_cyclic_pos_at_period_end(). The PCM core takes a position a
+ * period ahead of the transfer for an underrun, and one behind the last it
+ * read for a wrap of the whole buffer: both stop the stream.
+ *
+ * Context: adchan->lock held.
  */
 static u32 admac_cyclic_read_residue(struct admac_data *ad, int channo,
 				     struct admac_tx *adtx)
 {
-	u32 ring1, ring2;
-	u32 residue1, residue2;
-	int nreports;
+	struct admac_residue_read r;
 	size_t pos;
+	int i;
 
-	ring1 =    readl_relaxed(ad->base + REG_REPORT_RING(ad, channo));
-	residue1 = readl_relaxed(ad->base + REG_RESIDUE(ad, channo));
-	ring2 =    readl_relaxed(ad->base + REG_REPORT_RING(ad, channo));
-	residue2 = readl_relaxed(ad->base + REG_RESIDUE(ad, channo));
+	for (i = 0; i < ADMAC_RESIDUE_READS; i++) {
+		r.ring1 =    readl_relaxed(ad->base + REG_REPORT_RING(ad, channo));
+		r.residue1 = readl_relaxed(ad->base + REG_RESIDUE(ad, channo));
+		r.ring2 =    readl_relaxed(ad->base + REG_REPORT_RING(ad, channo));
+		r.residue2 = readl_relaxed(ad->base + REG_RESIDUE(ad, channo));
 
-	if (residue2 > residue1) {
-		/*
-		 * Controller must have loaded next descriptor between
-		 * the two residue reads
-		 */
-		nreports = admac_ring_noccupied_slots(ring1) + 1;
-	} else {
-		/* No descriptor load between the two reads, ring2 is safe to use */
-		nreports = admac_ring_noccupied_slots(ring2);
+		if (admac_cyclic_pos(adtx, &r, &pos))
+			break;
 	}
-
-	pos = adtx->reclaimed_pos + adtx->period_len * (nreports + 1) - residue2;
+	if (i == ADMAC_RESIDUE_READS)
+		pos = admac_cyclic_pos_at_period_end(adtx, &r);
+	adtx->reported_pos = pos;
 
 	return adtx->buf_len - pos % adtx->buf_len;
 }
@@ -558,11 +647,30 @@ static void admac_reset_rings(struct admac_chan *adchan)
 	writel_relaxed(0, ad->base + REG_CHAN_CTL(ad, adchan->no));
 }
 
+static int admac_device_config(struct dma_chan *chan, struct dma_slave_config *config);
+
+/* Registers can't be reached before a client powers the fabric, so this waits for it. */
+static void admac_restore_chan(struct admac_chan *adchan)
+{
+	struct admac_data *ad = adchan->host;
+
+	if (!adchan->lost)
+		return;
+	adchan->lost = false;
+
+	if (ad->split_channels)
+		writel_relaxed(0x18080001, ad->base + REG_CTL);
+	writel_relaxed(adchan->carveout, ad->base + REG_CHAN_SRAM_CARVEOUT(ad, adchan->no));
+	if (adchan->cfg_valid)
+		admac_device_config(&adchan->chan, &adchan->cfg);
+}
+
 static void admac_start_current_tx(struct admac_chan *adchan)
 {
 	struct admac_data *ad = adchan->host;
 	int ch = adchan->no;
 
+	admac_restore_chan(adchan);
 	admac_reset_rings(adchan);
 	writel_relaxed(0, ad->base + REG_CHAN_CTL(ad, ch));
 	if (ad->split_channels) {
@@ -608,6 +716,73 @@ static int admac_pause(struct dma_chan *chan)
 	return 0;
 }
 
+static int admac_drain_reports(struct admac_data *ad, int channo);
+
+/*
+ * Restart a paused cyclic capture at the next frame boundary of the current
+ * period. A source that stopped in the middle of a frame (a serializer that
+ * firmware stops whenever it likes) leaves a partial frame in the buffer, and
+ * without this every later frame would be off by its words. Called with the
+ * channel stopped and the lock held.
+ */
+static void admac_cyclic_realign(struct admac_chan *adchan)
+{
+	struct admac_data *ad = adchan->host;
+	struct admac_tx *tx = adchan->current_tx;
+	int ch = adchan->no;
+	size_t done, aligned;
+	int nreports;
+
+	/* Periods completed before the pause */
+	nreports = admac_drain_reports(ad, ch);
+	tx->nperiods_outstanding -= min_t(unsigned int, nreports, tx->nperiods_outstanding);
+	adchan->nperiod_acks += nreports;
+	tx->reclaimed_pos += nreports * tx->period_len;
+	tx->reclaimed_pos %= 2 * tx->buf_len;
+
+	done = tx->period_len -
+		min_t(size_t, readl_relaxed(ad->base + REG_RESIDUE(ad, ch)), tx->period_len);
+	aligned = roundup(done, adchan->realign_bytes);
+	if (aligned >= tx->period_len) {
+		adchan->nperiod_acks++;
+		tx->reclaimed_pos += tx->period_len;
+		tx->reclaimed_pos %= 2 * tx->buf_len;
+		aligned = 0;
+	}
+	if (adchan->nperiod_acks)
+		tasklet_schedule(&adchan->tasklet);
+
+	dev_dbg(ad->dev, "ch%d realign: %zu bytes into the period, restart at %zu\n",
+		ch, done, aligned);
+
+	admac_reset_rings(adchan);
+	writel_relaxed(0, ad->base + REG_CHAN_CTL(ad, ch));
+	/* The reset dropped every descriptor still in the ring. */
+	tx->nperiods_outstanding = 0;
+
+	/* The rest of the current period, then whole periods as before */
+	tx->submitted_pos = tx->reclaimed_pos;
+	admac_write_hw_desc(ad, ch, tx->buf_addr + (tx->submitted_pos % tx->buf_len) + aligned,
+			    tx->period_len - aligned);
+	tx->nperiods_outstanding++;
+	tx->submitted_pos += tx->period_len;
+	tx->submitted_pos %= 2 * tx->buf_len;
+
+	admac_start_chan(adchan);
+	admac_cyclic_write_desc(ad, ch, tx);
+}
+
+/*
+ * Whether a resume restarts the channel aligned (admac_cyclic_realign()): only a
+ * capture whose client gave a frame size, with a transfer to restart. Every
+ * other channel, and every playback one, starts again where it paused.
+ */
+static bool admac_resume_realigns(const struct admac_chan *adchan)
+{
+	return adchan->realign_bytes && adchan->current_tx &&
+	       admac_chan_direction(adchan->no) == DMA_DEV_TO_MEM;
+}
+
 static int admac_resume(struct dma_chan *chan)
 {
 	struct admac_chan *adchan = to_admac_chan(chan);
@@ -615,10 +790,21 @@ static int admac_resume(struct dma_chan *chan)
 	int ret = 0;
 
 	spin_lock_irqsave(&adchan->lock, flags);
-	if (adchan->current_tx && adchan->current_tx->error)
+	if (adchan->current_tx && adchan->current_tx->error) {
 		ret = -EIO;
-	else
+	} else if (adchan->lost && adchan->current_tx) {
+		struct admac_tx *tx = adchan->current_tx;
+
+		/* The rings went with the registers: start again from the last period reclaimed. */
+		tx->submitted_pos = tx->reclaimed_pos;
+		tx->nperiods_outstanding = 0;
+		adchan->nperiod_acks = 0;
+		admac_start_current_tx(adchan);
+	} else if (admac_resume_realigns(adchan)) {
+		admac_cyclic_realign(adchan);
+	} else {
 		admac_start_chan(adchan);
+	}
 	spin_unlock_irqrestore(&adchan->lock, flags);
 
 	return ret;
@@ -680,6 +866,11 @@ static int admac_alloc_chan_resources(struct dma_chan *chan)
 	struct admac_data *ad = adchan->host;
 	int ret;
 
+	/* Keep MMIO accessible for config, status and the atomic DMA callbacks. */
+	ret = pm_runtime_resume_and_get(ad->dev);
+	if (ret < 0)
+		return ret;
+
 	dma_cookie_init(&adchan->chan);
 
 	/*
@@ -699,8 +890,10 @@ static int admac_alloc_chan_resources(struct dma_chan *chan)
 
 	ret = admac_alloc_sram_carveout(ad, admac_chan_direction(adchan->no),
 					&adchan->carveout);
-	if (ret < 0)
+	if (ret < 0) {
+		pm_runtime_put_autosuspend(ad->dev);
 		return ret;
+	}
 
 	writel_relaxed(adchan->carveout,
 		       ad->base + REG_CHAN_SRAM_CARVEOUT(ad, adchan->no));
@@ -715,6 +908,7 @@ static void admac_free_chan_resources(struct dma_chan *chan)
 	admac_synchronize(chan);
 	admac_free_sram_carveout(adchan->host, admac_chan_direction(adchan->no),
 				 adchan->carveout);
+	pm_runtime_put_autosuspend(adchan->host->dev);
 }
 
 static struct dma_chan *admac_dma_of_xlate(struct of_phandle_args *dma_spec,
@@ -865,10 +1059,17 @@ static irqreturn_t admac_interrupt(int irq, void *devid)
 		rx_intstate >>= 1;
 	}
 
+	/*
+	 * Controller-global event sources are sticky write-one-to-clear
+	 * notifications. They carry no recovery semantics: DMA faults are
+	 * reported per channel through REG_CHAN_INTSTATUS. Acknowledge the
+	 * sources seen in this snapshot so a later one raises a new interrupt.
+	 */
 	if (global_intstate) {
-		dev_warn(ad->dev, "clearing unknown global interrupt flag: %x\n",
-			 global_intstate);
-		writel_relaxed(~(u32) 0, ad->base + REG_GLOBAL_INTSTATE(ad->irq_index));
+		dev_dbg_ratelimited(ad->dev, "global event state: %#x\n",
+				    global_intstate);
+		writel_relaxed(global_intstate,
+			       ad->base + REG_GLOBAL_INTSTATE(ad->irq_index));
 	}
 
 	return IRQ_HANDLED;
@@ -906,6 +1107,18 @@ static void admac_chan_tasklet(struct tasklet_struct *t)
 		/* The callback may terminate this cyclic transaction. */
 		dmaengine_desc_callback_invoke(&cb, &tx_result);
 	}
+}
+
+/*
+ * The frame size a paused capture is restarted aligned to on resume (see
+ * admac_cyclic_realign()): an optional u32 in bytes in the peripheral config.
+ * A client that passes none, as the MCA's PCM does, gets 0: no realignment.
+ */
+static u32 admac_config_realign_bytes(const struct dma_slave_config *config)
+{
+	if (config->peripheral_config && config->peripheral_size == sizeof(u32))
+		return *(const u32 *)config->peripheral_config;
+	return 0;
 }
 
 static int admac_device_config(struct dma_chan *chan,
@@ -962,6 +1175,8 @@ static int admac_device_config(struct dma_chan *chan,
 
 	writel_relaxed(bus_width, ad->base + REG_BUS_WIDTH(ad, adchan->no));
 
+	adchan->realign_bytes = admac_config_realign_bytes(config);
+
 	/*
 	 * By FIFOCTL_LIMIT we seem to set the maximal number of bytes allowed to be
 	 * held in controller's per-channel FIFO. Transfers seem to be triggered
@@ -973,8 +1188,70 @@ static int admac_device_config(struct dma_chan *chan,
 		       | FIELD_PREP(CHAN_FIFOCTL_THRESHOLD, 0x18 * wordsize),
 		       ad->base + REG_CHAN_FIFOCTL(ad, adchan->no));
 
+	adchan->cfg = *config;
+	adchan->cfg_valid = true;
+
 	return 0;
 }
+
+static int admac_runtime_suspend(struct device *dev)
+{
+	struct admac_data *ad = dev_get_drvdata(dev);
+
+	/* No channel resources remain; drain handlers before genpd gates MMIO. */
+	disable_irq(ad->irq);
+	if (dev->pm_domain)
+		ad->ctl_programmed = false;
+
+	return 0;
+}
+
+static int admac_runtime_resume(struct device *dev)
+{
+	struct admac_data *ad = dev_get_drvdata(dev);
+
+	/*
+	 * Defer register restoration to alloc/config, before any transfer. Some
+	 * controllers are powered by firmware only after the audio handshake.
+	 * Restore only the requested channel, never reset the shared fabric.
+	 */
+	enable_irq(ad->irq);
+
+	return 0;
+}
+
+/*
+ * A firmware-driven sleep, refused or not, takes the registers of a channel a
+ * client still holds (genpd gates the domain at noirq), and its client won't
+ * configure it again: only a new hw_params does that.
+ */
+static int __maybe_unused admac_resume_early(struct device *dev)
+{
+	struct admac_data *ad = dev_get_drvdata(dev);
+	unsigned long flags;
+	int i;
+
+	if (!pm_suspend_via_firmware())
+		return 0;
+
+	mutex_lock(&ad->cache_alloc_lock);
+	ad->ctl_programmed = false;
+	mutex_unlock(&ad->cache_alloc_lock);
+
+	for (i = 0; i < ad->nchannels; i++) {
+		spin_lock_irqsave(&ad->channels[i].lock, flags);
+		ad->channels[i].lost = true;
+		spin_unlock_irqrestore(&ad->channels[i].lock, flags);
+	}
+
+	return 0;
+}
+
+/* Allocated channels must stay powered, including paused cyclic transfers. */
+static const struct dev_pm_ops admac_pm_ops = {
+	LATE_SYSTEM_SLEEP_PM_OPS(NULL, admac_resume_early)
+	RUNTIME_PM_OPS(admac_runtime_suspend, admac_runtime_resume, NULL)
+};
 
 static int admac_probe(struct platform_device *pdev)
 {
@@ -1093,24 +1370,37 @@ static int admac_probe(struct platform_device *pdev)
 		goto free_reset;
 	}
 
+	pm_runtime_get_noresume(ad->dev);
+	err = pm_runtime_set_active(ad->dev);
+	if (err)
+		goto put_pm;
+	pm_runtime_set_autosuspend_delay(ad->dev, 100);
+	pm_runtime_use_autosuspend(ad->dev);
+	pm_runtime_enable(ad->dev);
+
 	err = dma_async_device_register(&ad->dma);
 	if (err) {
 		dev_err_probe(&pdev->dev, err, "failed to register DMA device\n");
-		goto free_irq;
+		goto disable_pm;
 	}
 
 	err = of_dma_controller_register(pdev->dev.of_node, admac_dma_of_xlate, ad);
 	if (err) {
 		dma_async_device_unregister(&ad->dma);
 		dev_err_probe(&pdev->dev, err, "failed to register with OF\n");
-		goto free_irq;
+		goto disable_pm;
 	}
 
 	dev_info(&pdev->dev, "Audio DMA Controller\n");
+	pm_runtime_put_autosuspend(ad->dev);
 
 	return 0;
 
-free_irq:
+disable_pm:
+	pm_runtime_disable(ad->dev);
+	pm_runtime_dont_use_autosuspend(ad->dev);
+put_pm:
+	pm_runtime_put_noidle(ad->dev);
 	free_irq(ad->irq, ad);
 free_reset:
 	reset_control_rearm(ad->rstc);
@@ -1123,6 +1413,8 @@ static void admac_remove(struct platform_device *pdev)
 
 	of_dma_controller_free(pdev->dev.of_node);
 	dma_async_device_unregister(&ad->dma);
+	pm_runtime_disable(ad->dev);
+	pm_runtime_dont_use_autosuspend(ad->dev);
 	free_irq(ad->irq, ad);
 	reset_control_rearm(ad->rstc);
 }
@@ -1163,11 +1455,16 @@ static struct platform_driver apple_admac_driver = {
 	.driver = {
 		.name = "apple-admac",
 		.of_match_table = admac_of_match,
+		.pm = pm_ptr(&admac_pm_ops),
 	},
 	.probe = admac_probe,
 	.remove = admac_remove,
 };
 module_platform_driver(apple_admac_driver);
+
+#if IS_ENABLED(CONFIG_KUNIT) && !defined(MODULE)
+#include "apple-admac-test.h"
+#endif
 
 MODULE_AUTHOR("Martin Povišer <povik+lin@cutebit.org>");
 MODULE_DESCRIPTION("Driver for Audio DMA Controller (ADMAC) on Apple SoCs");

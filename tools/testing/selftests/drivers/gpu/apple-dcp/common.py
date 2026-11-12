@@ -117,6 +117,24 @@ def atc_function(source, name):
 ATC_RPM = ('atcphy_rpm_get', 'atcphy_rpm_busy', 'atcphy_rpm_sync', 'atcphy_rpm_put')
 
 
+def atc_cio_helpers(source):
+    """The PIPE backend of a mode, which T8132 CIO keeps on the dummy one.
+
+    The mux and PIPE functions call these; older sources have neither: ''.
+    """
+    result = ''
+    for name in ('atcphy_mode_is_cio', 'atcphy_pipe_state_for',
+                 'atcphy_usb2_sig_host'):
+        marker = re.search(r'^static [^;{}()]+\b' + name + r'\([^;{}]*\)\s*\{', source, re.M)
+        if marker:
+            helper = block(source, marker.start())
+            if name == 'atcphy_usb2_sig_host':
+                helper = helper.replace('static u32',
+                                        'static __attribute__((unused)) u32', 1)
+            result += helper + '\n'
+    return result
+
+
 def atc_restore_helpers(source):
     """What atcphy_restore_after_pd_off() needs beyond the parking helpers.
 
@@ -126,6 +144,15 @@ def atc_restore_helpers(source):
     if 'atcphy_setup_pipehandler(' not in atc_function(source, 'atcphy_restore_after_pd_off'):
         return ''
     return atc_function(source, 'atcphy_setup_pipehandler')
+
+
+def atc_common_state_helpers(source):
+    """What atcphy_restore_after_pd_off() calls to drop the common block's DisplayPort and
+    tunnel state after a power-down. Older sources do that inline: ''.
+    """
+    if 'atcphy_forget_common_state(' not in atc_function(source, 'atcphy_restore_after_pd_off'):
+        return ''
+    return atc_function(source, 'atcphy_forget_common_state')
 
 
 def atc_mux_without_pm(source):

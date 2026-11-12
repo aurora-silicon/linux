@@ -139,7 +139,21 @@ pub(crate) enum Event {
     /// The firmware failed a compute command of queue `qid` and stores no completion stamp for
     /// it: `stamp` is the value that command would have stored.
     ComputeFault { qid: u8, stamp: u32 },
+    /// 25G83: the firmware stopped a command of physical queue `qid` on `engine` with an error
+    /// of `class`. It names the command by the `stamp` it would have stored, stores nothing for
+    /// it, and keeps the queue's firmware state until the host acknowledges the report with
+    /// [`ChannelErrorAck`].
+    ChannelError { class: u32, engine: Engine, qid: u8, stamp: u32 },
     Unknown(u32),
+}
+
+/// The engine a channel error names, in its event encoding.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub(crate) enum Engine {
+    Tiling = 0,
+    Fragment = 1,
+    Compute = 2,
 }
 
 impl EventRecord {
@@ -150,6 +164,8 @@ impl EventRecord {
     const CONTEXT_KILLED: u32 = 12;
     const COMPUTE_FAULT: u32 = 7;
     const COMPUTE_QIDS: u32 = 128;
+    /// 25G83 channel-error classes run from zero up to this bound.
+    const CHANNEL_ERROR_CLASSES: u32 = 5;
     const DIAGNOSTIC_PAIRS_MAX: u16 = 5;
     const TVB_SLOTS: u32 = 127;
     const SUBPIPES: u32 = 64;
@@ -166,13 +182,34 @@ impl EventRecord {
     }
 
     /// Type 7 is a retirement witness only on the firmware whose layout and
-    /// visibility semantics are qualified. 25G83 must keep consuming it as an
-    /// unknown event until its own fault contract is established.
-    pub(crate) fn decode_for(&self, graph: super::variant::InitGraph) -> Result<Event> {
+    /// visibility semantics are qualified. 25G83 reports a channel error with it;
+    /// M5 must keep consuming it as an unknown event until its own fault contract is
+    /// established.
+    pub(crate) fn decode_for(&self, graph: super::variant::InitGraph, m5: bool) -> Result<Event> {
         if graph == super::variant::InitGraph::V25G83 && self.tag() == Self::COMPUTE_FAULT {
+            return Ok(self.decode_channel_error());
+        }
+        if m5 && self.tag() == Self::COMPUTE_FAULT {
             return Ok(Event::Unknown(Self::COMPUTE_FAULT));
         }
         self.decode()
+    }
+
+    /// The 25G83 type-7 layout: tag, class, engine, physical queue, stamp. A record outside
+    /// these bounds stays an unknown event, consumed and ignored as before.
+    fn decode_channel_error(&self) -> Event {
+        // SAFETY: Every constructor initializes all integer words.
+        let words = unsafe { self.words };
+        let engine = match words[2] {
+            0 => Engine::Tiling,
+            1 => Engine::Fragment,
+            2 => Engine::Compute,
+            _ => return Event::Unknown(Self::COMPUTE_FAULT),
+        };
+        if words[1] >= Self::CHANNEL_ERROR_CLASSES || words[3] >= Self::COMPUTE_QIDS {
+            return Event::Unknown(Self::COMPUTE_FAULT);
+        }
+        Event::ChannelError { class: words[1], engine, qid: words[3] as u8, stamp: words[4] }
     }
 
     /// Validates the record's fields without interpreting resource ownership.
@@ -266,6 +303,7 @@ pub(crate) enum ControlRecord {
     SchedulerStateRelease(SchedulerStateRelease),
     FreeListRelease(FreeListRelease),
     ContextKill(ContextKill),
+    ChannelErrorAck(ChannelErrorAck),
 }
 
 impl ControlRecord {
@@ -273,9 +311,12 @@ impl ControlRecord {
         match self {
             Self::TvbGrow(_) => DeviceControlOp::TvbGrowReply,
             Self::IdlePowerOff(_) => DeviceControlOp::IdlePowerOff,
-            Self::SchedulerStateRelease(_) => DeviceControlOp::SchedulerStateRelease,
+            Self::SchedulerStateRelease(record) => if record.opcode == DeviceControlOp::M5SchedulerStateRelease as u32 {
+                DeviceControlOp::M5SchedulerStateRelease
+            } else { DeviceControlOp::SchedulerStateRelease },
             Self::FreeListRelease(_) => DeviceControlOp::FreeListRelease,
             Self::ContextKill(_) => DeviceControlOp::ContextKill,
+            Self::ChannelErrorAck(_) => DeviceControlOp::ChannelErrorAck,
         }
     }
 
@@ -287,6 +328,7 @@ impl ControlRecord {
             Self::SchedulerStateRelease(record) => core::ptr::from_ref(record).cast(),
             Self::FreeListRelease(record) => core::ptr::from_ref(record).cast(),
             Self::ContextKill(record) => core::ptr::from_ref(record).cast(),
+            Self::ChannelErrorAck(record) => core::ptr::from_ref(record).cast(),
         };
         // SAFETY: Each variant has a statically checked size of 0x40 bytes,
         // contains only initialized integer fields with no implicit padding,
@@ -301,10 +343,14 @@ impl ControlRecord {
 pub(crate) enum DeviceControlOp {
     /// Reply to a parameter-buffer grow request ([`TvbGrowReply`]).
     TvbGrowReply = 0x08,
+    /// Acknowledge a 25G83 channel error ([`ChannelErrorAck`]).
+    ChannelErrorAck = 0x09,
     /// Set the idle power-off policy ([`IdlePowerOff`]).
     IdlePowerOff = 0x0a,
     /// Release a logical queue's scheduler state ([`SchedulerStateRelease`]).
     SchedulerStateRelease = 0x14,
+    /// M5 encoding of the same scheduler-state release.
+    M5SchedulerStateRelease = 0x13,
     /// Release a free list's buffer slot ([`FreeListRelease`]).
     FreeListRelease = 0x2e,
     /// Stop the queues named by a closed logical scheduler.
@@ -531,6 +577,34 @@ impl WorkSlot {
     }
 }
 
+/// Acknowledges a 25G83 channel error: the firmware releases the named queue's error state
+/// when it consumes this record, and the queue may be reused only after that.
+#[repr(C, packed)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ChannelErrorAck {
+    opcode: u32,
+    engine: u32,
+    queue_va: u64,
+    stamp: u64,
+    reserved: [u8; 0x28],
+}
+static_assert!(size_of::<ChannelErrorAck>() == DEVICE_CONTROL_RECORD_SIZE);
+static_assert!(core::mem::offset_of!(ChannelErrorAck, engine) == 4);
+static_assert!(core::mem::offset_of!(ChannelErrorAck, queue_va) == 8);
+static_assert!(core::mem::offset_of!(ChannelErrorAck, stamp) == 0x10);
+impl ChannelErrorAck {
+    /// `queue_va` is the queue record the firmware runs `engine` of the queue from.
+    pub(crate) fn new(engine: Engine, queue_va: u64, stamp: u32) -> Self {
+        Self {
+            opcode: DeviceControlOp::ChannelErrorAck as u32,
+            engine: engine as u32,
+            queue_va,
+            stamp: u64::from(stamp),
+            reserved: [0; 0x28],
+        }
+    }
+}
+
 /// Stop a closed context's scheduler page and echo its cookie through event 12.
 #[repr(C, packed)]
 #[derive(Copy, Clone, Debug)]
@@ -574,11 +648,31 @@ mod tests {
     fn v25g83_does_not_accept_an_unqualified_fault_witness() {
         use super::super::variant::InitGraph;
         let fault = record(&[7, 1, 2, 0x39, 0x300]);
-        assert_eq!(fault.decode_for(InitGraph::G17P),
+        assert_eq!(fault.decode_for(InitGraph::G17P, false),
             Ok(Event::ComputeFault { qid: 0x39, stamp: 0x300 }));
-        assert_eq!(fault.decode_for(InitGraph::V25G83), Ok(Event::Unknown(7)));
-        assert_eq!(record(&[7, 1, 2, 128, 0x301]).decode_for(InitGraph::V25G83),
+        assert_eq!(fault.decode_for(InitGraph::G17P, true), Ok(Event::Unknown(7)));
+        assert_eq!(fault.decode_for(InitGraph::V25G83, false), Ok(Event::ChannelError {
+            class: 1, engine: Engine::Compute, qid: 0x39, stamp: 0x300 }));
+        assert_eq!(record(&[7, 0, 1, 46, 0x301]).decode_for(InitGraph::V25G83, false),
+            Ok(Event::ChannelError { class: 0, engine: Engine::Fragment, qid: 46, stamp: 0x301 }));
+        // Out-of-range fields stay unknown events.
+        assert_eq!(record(&[7, 1, 2, 128, 0x301]).decode_for(InitGraph::V25G83, false),
             Ok(Event::Unknown(7)));
+        assert_eq!(record(&[7, 5, 0, 1, 0x301]).decode_for(InitGraph::V25G83, false),
+            Ok(Event::Unknown(7)));
+        assert_eq!(record(&[7, 0, 3, 1, 0x301]).decode_for(InitGraph::V25G83, false),
+            Ok(Event::Unknown(7)));
+    }
+
+    #[test]
+    fn channel_error_ack_layout() {
+        let ack = ChannelErrorAck::new(Engine::Fragment, 0x70_0410_0000, 0x301);
+        let bytes = ControlRecord::ChannelErrorAck(ack).bytes().clone();
+        assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), DeviceControlOp::ChannelErrorAck as u32);
+        assert_eq!(u32::from_le_bytes(bytes[4..8].try_into().unwrap()), Engine::Fragment as u32);
+        assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), 0x70_0410_0000);
+        assert_eq!(u64::from_le_bytes(bytes[16..24].try_into().unwrap()), 0x301);
+        assert!(bytes[24..].iter().all(|byte| *byte == 0));
     }
 
     #[test]

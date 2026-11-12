@@ -163,7 +163,8 @@ struct dcp_m4_upper {
 	u32 id, flags;
 };
 
-static inline int dcp_m4_upper_check(const struct dcp_m4_upper *u)
+/* As dcp_m4_upper_check(), on an output of @width x @height. */
+static inline int dcp_m4_upper_check_on(const struct dcp_m4_upper *u, u32 width, u32 height)
 {
 	const struct dcp_m4_frame *f = u->frame;
 	u64 size;
@@ -177,10 +178,15 @@ static inline int dcp_m4_upper_check(const struct dcp_m4_upper *u)
 	if (f->width < 32 || f->height < 32 || f->width > 256 || f->height > 256 ||
 	    f->stride < f->width * 4 || f->stride % 64 || f->backing_size < size ||
 	    !f->dva || f->dva % 0x4000 || f->dva >= (1ULL << 42) ||
-	    f->format != DCP_M4_ARGB8888 ||
-	    u->x > DCP_M4_PANEL_WIDTH - f->width || u->y > DCP_M4_PANEL_HEIGHT - f->height)
+	    f->format != DCP_M4_ARGB8888 || f->width > width || f->height > height ||
+	    u->x > width - f->width || u->y > height - f->height)
 		return -EINVAL;
 	return 0;
+}
+
+static inline int dcp_m4_upper_check(const struct dcp_m4_upper *u)
+{
+	return dcp_m4_upper_check_on(u, DCP_M4_PANEL_WIDTH, DCP_M4_PANEL_HEIGHT);
 }
 
 /*
@@ -189,12 +195,14 @@ static inline int dcp_m4_upper_check(const struct dcp_m4_upper *u)
  * indices in keep while presenting (so a primary flip never removes a live
  * cursor), plus them when blanking. upper adds its own update bit: a swap
  * without primary leaves surface 0 untouched (bit 0 clear, null byte 1).
+ * An upper surface must lie on the @width x @height output.
  */
-static inline int dcp_m4_swap_encode_full(void *output, size_t length, u32 swap_id,
-					  bool primary, const struct dcp_m4_frame *frame,
-					  const struct dcp_m4_upper *upper, u32 keep,
-					  bool brightness_change, u32 nits,
-					  int (*check)(const struct dcp_m4_frame *frame))
+static inline int dcp_m4_swap_encode_on(void *output, size_t length, u32 swap_id,
+					bool primary, const struct dcp_m4_frame *frame,
+					const struct dcp_m4_upper *upper, u32 keep,
+					bool brightness_change, u32 nits,
+					int (*check)(const struct dcp_m4_frame *frame),
+					u32 width, u32 height)
 {
 	u8 *data = output;
 	u32 mask = 0;
@@ -204,7 +212,7 @@ static inline int dcp_m4_swap_encode_full(void *output, size_t length, u32 swap_
 		return -EINVAL;
 	if (primary && frame && check(frame))
 		return -EINVAL;
-	if (upper && dcp_m4_upper_check(upper))
+	if (upper && dcp_m4_upper_check_on(upper, width, height))
 		return -EINVAL;
 	if (primary)
 		mask = frame ? 0x80000007 & ~keep : 0x80000007 | keep;
@@ -251,6 +259,49 @@ static inline int dcp_m4_swap_encode_full(void *output, size_t length, u32 swap_
 		data[dcp_m4_pf->swap_nullable + i] = 0;
 	}
 	return 0;
+}
+
+/* As dcp_m4_swap_encode_on(), on the panel. */
+static inline int dcp_m4_swap_encode_full(void *output, size_t length, u32 swap_id,
+					  bool primary, const struct dcp_m4_frame *frame,
+					  const struct dcp_m4_upper *upper, u32 keep,
+					  bool brightness_change, u32 nits,
+					  int (*check)(const struct dcp_m4_frame *frame))
+{
+	return dcp_m4_swap_encode_on(output, length, swap_id, primary, frame, upper, keep,
+				     brightness_change, nits, check, DCP_M4_PANEL_WIDTH,
+				     DCP_M4_PANEL_HEIGHT);
+}
+
+/* Swap intent that registers surface 0 as the idle-cache surface. */
+#define DCP_M4_SWAP_INTENT_IDLE_CACHE	8
+
+/*
+ * Retarget an encoded present: the DCP registers rather than presents its
+ * sole surface, which must be a distinct object (surface_id other than
+ * the primary's 1) from every surface on screen.
+ */
+static inline void dcp_m4_swap_set_intent(void *output, u32 intent, u32 surface_id)
+{
+	u8 *data = output;
+
+	put_unaligned_le32(intent, data + dcp_m4_pf->swap_intent);
+	put_unaligned_le32(surface_id, data + 0x9c);
+}
+
+/*
+ * Set an encoded swap's presentation deadline: IOMobileFramebuffer timestamp
+ * types 1, 2 and 7 (+0x0, +0x8, +0x30), as the firmware 26 desktop path
+ * fills them (dcp_desktop_present_deadline()). Left 0 on a 120 Hz panel, the
+ * DCP completes a swap only every second vblank.
+ */
+static inline void dcp_m4_swap_set_deadline(void *output, u64 deadline)
+{
+	u8 *data = output;
+
+	put_unaligned_le64(deadline, data + 0x0);
+	put_unaligned_le64(deadline, data + 0x8);
+	put_unaligned_le64(deadline, data + 0x30);
 }
 
 static inline int dcp_m4_swap_encode_checked(void *output, size_t length, u32 swap_id,
@@ -366,6 +417,23 @@ static inline int dcp_m4_swap_take_completion(struct dcp_m4_swap_state *swap)
 		return 0;
 	swap->emitted = true;
 	return 1;
+}
+
+/*
+ * Hand a replied swap over to @to, which tracks it from then on (its D590 may
+ * be in already): @swap counts as taken, so that the next swap may begin.
+ */
+static inline int dcp_m4_swap_hand_off(struct dcp_m4_swap_state *swap,
+				       struct dcp_m4_swap_state *to)
+{
+	if (swap->error)
+		return swap->error;
+	if (!swap->id || !swap->replied || swap->emitted)
+		return dcp_m4_swap_fail(swap, -EPROTO);
+	*to = *swap;
+	swap->completed = true;
+	swap->emitted = true;
+	return 0;
 }
 
 #endif

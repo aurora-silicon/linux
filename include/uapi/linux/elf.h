@@ -529,6 +529,12 @@ typedef struct elf64_shdr {
 #define NT_ARM_POE	0x40f		/* ARM POE registers */
 #define NN_ARM_GCS	"LINUX"
 #define NT_ARM_GCS	0x410		/* ARM GCS state */
+/* Aurora experimental: Apple AFPCR_EL0, a u64 (x86 floating-point mode) */
+#define NN_AURORA_APPLE_AFPCR	"LINUX"
+#define NT_AURORA_APPLE_AFPCR	0x41555001
+/* Aurora experimental: Apple AMX register file, struct user_apple_amx */
+#define NN_AURORA_APPLE_AMX	"LINUX"
+#define NT_AURORA_APPLE_AMX	0x41555002
 #define NN_ARC_V2	"LINUX"
 #define NT_ARC_V2	0x600		/* ARCv2 accumulator/extra registers */
 #define NN_VMCOREDD	"LINUX"

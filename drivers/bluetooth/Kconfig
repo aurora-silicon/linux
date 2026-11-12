@@ -506,4 +506,26 @@ config BT_INTEL_PCIE
 
 	  Say Y here to compiler support for Intel Bluetooth PCIe device into
 	  the kernel or say M to compile it as module (btintel_pcie)
+
+config BT_CENTAURI
+	tristate "Apple N1 Beta Bluetooth transport (experimental)"
+	depends on PCI && (ARCH_APPLE || COMPILE_TEST)
+	help
+	  Experimental Bluetooth transport for Apple N1 on J813.
+	  The Centauri Control driver must boot the shared firmware before this
+	  driver binds to Beta. Controller initialization, discovery, BR/EDR ACL,
+	  pairing and encrypted AVDTP discovery have been tested on hardware.
+	  ACL delivery and native startup/connection handling remain opt-in;
+	  audio playback and LE data are unqualified. SCO/ISO is not implemented.
+
+	  Say M to build the btcentauri module for bring-up testing.
+
+config BT_HCICENTAURI
+	tristate "Apple N1 Centauri T6050 Bluetooth"
+	depends on PCI && APPLE_CENTAURI_T6050
+	help
+	  Protocol-27 Beta HCI and ACL transport using the T6050 Control
+	  supplier and a device-tree factory address. This can coexist with
+	  the J813/J873 Bluetooth transport. SCO and ISO are not implemented.
+
 endmenu

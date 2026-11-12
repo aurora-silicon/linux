@@ -1,0 +1,187 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Additional T6021 hardware resources. Keep unqualified blocks disabled. */
+
+&{/soc} {
+
+	m2_dart_dispext2_0: iommu@48d304000 {
+		compatible = "apple,t6020-dart", "apple,t8110-dart";
+		reg = <0x4 0x8d304000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1022 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext2_cpu0>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	m2_dart_dcpext2: iommu@48d30c000 {
+		compatible = "apple,t6020-dart", "apple,t8110-dart";
+		reg = <0x4 0x8d30c000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1022 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext2_cpu0>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	m2_dcpext2_mbox: mailbox@48dc08000 {
+		compatible = "apple,t6020-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x4 0x8dc08000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1043 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1044 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1045 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1046 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+			"recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	m2_dcpext2: dcp@48dc00000 {
+		compatible = "apple,t6020-dcpext", "apple,dcpext";
+		mbox-names = "mbox";
+		mboxes = <&m2_dcpext2_mbox>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3";
+		reg = <0x4 0x8dc00000 0 0x4000>,
+			<0x4 0x8c000000 0 0x4000000>,
+			<0x4 0x8d320000 0 0x4000>,
+			<0x4 0x8d344000 0 0x4000>,
+			<0x4 0x8d800000 0 0x800000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1013 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1012 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1013 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1014 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1015 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1016 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1017 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1018 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1019 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1020 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1021 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1032 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&m2_dart_dcpext2 5>;
+		power-domains = <&ps_dispext2_cpu0>;
+		status = "disabled";
+
+		piodma {
+			iommus = <&m2_dart_dispext2_0 4>;
+		};
+	};
+
+	m2_dart_dispext3_0: iommu@50d304000 {
+		compatible = "apple,t6020-dart", "apple,t8110-dart";
+		reg = <0x5 0xd304000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1058 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext3_cpu0>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	m2_dart_dcpext3: iommu@50d30c000 {
+		compatible = "apple,t6020-dart", "apple,t8110-dart";
+		reg = <0x5 0xd30c000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1058 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext3_cpu0>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	m2_dcpext3_mbox: mailbox@50dc08000 {
+		compatible = "apple,t6020-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x5 0xdc08000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1079 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1080 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1081 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1082 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+			"recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	m2_dcpext3: dcp@50dc00000 {
+		compatible = "apple,t6020-dcpext", "apple,dcpext";
+		mbox-names = "mbox";
+		mboxes = <&m2_dcpext3_mbox>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3";
+		reg = <0x5 0xdc00000 0 0x4000>,
+			<0x5 0xc000000 0 0x4000000>,
+			<0x5 0xd320000 0 0x4000>,
+			<0x5 0xd344000 0 0x4000>,
+			<0x5 0xd800000 0 0x800000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1049 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1048 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1049 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1050 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1051 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1052 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1053 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1054 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1055 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1056 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1057 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 0 1068 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&m2_dart_dcpext3 5>;
+		power-domains = <&ps_dispext3_cpu0>;
+		status = "disabled";
+
+		piodma {
+			iommus = <&m2_dart_dispext3_0 4>;
+		};
+	};
+
+	m2_apcie2_piodma: dma-controller@596010000 {
+		compatible = "apple,t6021-pcie-piodma", "apple,pcie-piodma";
+		reg = <0x5 0x96010000 0x0 0x4000>,
+			<0x5 0x96014000 0x0 0x4000>,
+			<0x5 0x96018000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1350 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&pcie0_dart_2 15>;
+		status = "disabled";
+	};
+
+	m2_apcie3_piodma: dma-controller@597010000 {
+		compatible = "apple,t6021-pcie-piodma", "apple,pcie-piodma";
+		reg = <0x5 0x97010000 0x0 0x4000>,
+			<0x5 0x97014000 0x0 0x4000>,
+			<0x5 0x97018000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1354 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&pcie0_dart_3 15>;
+		status = "disabled";
+	};
+
+	m2_atc3_dpin0: displayport-input@1301e50000 {
+		compatible = "apple,t6021-dpin", "apple,dpin";
+		reg = <0x13 0x1e50000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1528 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	m2_atc3_dpin1: displayport-input@1301e58000 {
+		compatible = "apple,t6021-dpin", "apple,dpin";
+		reg = <0x13 0x1e58000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1529 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	m2_apciec3_piodma: dma-controller@1322000000 {
+		compatible = "apple,t6021-pciec-piodma", "apple,pciec-piodma";
+		reg = <0x13 0x22000000 0x0 0x4000>,
+			<0x13 0x22004000 0x0 0x4000>,
+			<0x13 0x22008000 0x0 0x4000>,
+			<0x13 0x20008000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1320 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&apciec3_dart 15>;
+		status = "disabled";
+	};
+};

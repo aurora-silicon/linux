@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
-/* J613 25G83: inherit the hardware wiring, select a separate firmware ABI.
- * No board tunables or DMA mappings are embedded. The boot loader passes
- * this Mac's PMP values and validates the running display's mappings.
+/*
+ * J613 25G83: the same wiring with the 26.6 firmware ABI. The boot loader
+ * passes this Mac's PMP values and validates the running display's mappings.
  */
 / {
 	aliases {
@@ -59,27 +59,16 @@
 	status = "disabled";
 };
 
-/* The 25G83 GPU uses the native ASC mailbox and the same PMP supplier.
- * Firmware mappings and calibration are supplied by the boot loader.
- */
+/* Native ASC mailbox; the boot loader supplies firmware and calibration. */
 &agx_mbox {
 	compatible = "apple,t8122-agx-asc-mailbox", "apple,asc-mailbox-v4";
 	status = "disabled";
 };
 
 /*
- * G16G admission (g16_resources.rs) requires exactly six memory regions named
- * ttbs, pagetables, handoff, shared-l2, fw-text and fw-data, in that order.
- * The boot loader's 25G83 handoff replaces entries with those names and keeps
- * any other entry ahead of them, so the generic "pagetables-l2" entry would
- * leave seven regions and admission would fail with -EINVAL. List only the
- * entries the boot loader replaces; it reserves uat-pagetables-l2 itself and
- * links it as shared-l2.
- *
- * The ASC window is the 16 KiB ASC page that G16G maps exclusively. The
- * generic 0x6c000 window also covers the GFX mailbox at +0x8000, which the
- * mailbox driver has already claimed, so the exclusive mapping would fail
- * with -EBUSY.
+ * G16G takes exactly six memory regions: list the three the boot loader
+ * replaces (it adds the others), and only the 16 KiB ASC page, as the
+ * mailbox owns +0x8000.
  */
 &gpu {
 	reg = <0x2 0x92400000 0x0 0x4000>,

@@ -10,12 +10,15 @@ import resource
 import subprocess
 ROOT = Path(__file__).resolve().parents[2]
 FUNCTIONS = {
-    'include/linux/soc/apple/dp-tunnel.h': ['apple_dp_tunnel_t6030_pclk'],
+    'include/linux/soc/apple/dp-tunnel.h': [
+        'apple_dp_tunnel_t6030_pclk', 'apple_dp_tunnel_t8132_pclk',
+        'apple_dp_tunnel_pclks', 'apple_dp_tunnel_t8132_rate_ok'],
     'drivers/gpu/drm/apple/dcp-fabric-core.h': ['dcp_fabric_t6030_pclk'],
-    'drivers/gpu/drm/apple/dcp-fabric-session.h': ['dcp_fabric_callback_valid'],
+    'drivers/gpu/drm/apple/dcp-fabric-session.h': [
+        'dcp_fabric_callback_valid', 'dcp_fabric_clock_refused'],
     'drivers/phy/apple/atc.c': [
-        'apple_atc_tunnel_is_t6030', 'atc_t8122_tunnel_apb', 'atc_t8122_tunnel_stop',
-        'atc_t8122_tunnel_pclk', 'atc_t8122_tunnel_start',
+        'apple_atc_tunnel_t8122_clock', 'apple_atc_tunnel_pclk', 'atc_t8122_tunnel_apb',
+        'atc_t8122_tunnel_stop', 'atc_t8122_tunnel_pclk', 'atc_t8122_tunnel_start',
         'apple_atc_dp_tunnel_rate_source'],
     'drivers/gpu/drm/apple/dcp-fabric.c': [
         'dcp_route_clock_rate', 'dcp_tunnel_set_rate'],
@@ -24,9 +27,10 @@ CASES = ['dual-start', 'reverse-start', 'stop-second', 'same-rate',
          'stale-owner', 'same-source', 'retune-one', 'busy-mode', 'busy-pll',
          'invalid-source', 'invalid-rate', 'wrong-generation', 'failed-cleanup', 'failed-final-stop']
 CASES += ['fail-start-' + str(i) for i in range(4)]
+CASES += ['t6050-dpin-clocks']
 
 def function(source, name):
-    match = re.search(r'^(?:static\s+)?(?:inline\s+)?(?:int|void|bool)\s+' + name +
+    match = re.search(r'^(?:static\s+)?(?:inline\s+)?(?:unsigned\s+)?(?:int|void|bool)\s+' + name +
                       r'\([^;]*?\)\n\{', source, re.M | re.S)
     if not match:
         raise ValueError('Missing production function: ' + name)
@@ -53,7 +57,11 @@ def main():
         bodies['dcp_tunnel_set_rate'] = function(original, 'dcp_tunnel_set_rate')
     if args.pclk_function:
         bodies['atc_t8122_tunnel_pclk'] = args.pclk_function.read_text()
-    lines = iter((ROOT / 'drivers/phy/apple/atc.c').read_text().splitlines(keepends=True))
+    # The tunnel pixel clock gates (APPLE_DP_TUNNEL_PCLK*) are dp-tunnel.h's.
+    lines = iter([line for path in ('include/linux/soc/apple/dp-tunnel.h',
+                                    'drivers/phy/apple/atc.c')
+                  for line in (ROOT / path).read_text().splitlines(keepends=True)
+                  if not line.startswith('#define _LINUX_')])
     defines = []
     for line in lines:
         if line.startswith('#define'):

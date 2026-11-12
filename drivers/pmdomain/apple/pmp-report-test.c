@@ -21,6 +21,16 @@ static void pmp_gpu_effort_count(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, apple_pmp_gpu_effort_index(U32_MAX), -EPROTO);
 }
 
+static void pmp_request_word_replay(struct kunit *test)
+{
+	/* A request an entry withdrew stays off; one nobody here owns stays on. */
+	KUNIT_EXPECT_EQ(test, apple_pmp_request_word(0x31, 0x03, 0x02), 0x32ULL);
+	/* The found word can be empty: only the requests come back. */
+	KUNIT_EXPECT_EQ(test, apple_pmp_request_word(0, 0x03, 0x01), 0x01ULL);
+	/* Nothing requested, nothing known. */
+	KUNIT_EXPECT_EQ(test, apple_pmp_request_word(0x10, 0, 0), 0x10ULL);
+}
+
 static void pmp_ranges_t6030(struct kunit *test)
 {
 	u8 table[2 * PMP_PTD_RANGE_SIZE];
@@ -263,9 +273,44 @@ static void pmp_bootargs_reject_integer_width(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, apple_pmp_bootargs_valid(args, 29));
 }
 
+static void pmp_dvfs_words(struct kunit *test)
+{
+	const u32 lanes[] = { 0x22, 5, 0x24, 7 };
+	const u32 vmax[] = { 0x25, 2 };
+	const u32 duplicate[] = { 0x21, 1, 0x21, 2 };
+	const u32 bad_class[] = { 0x20, 1 };
+	const u32 bad_level[] = { 0x21, 0x10 };
+	u64 word;
+
+	KUNIT_ASSERT_TRUE(test, apple_pmp_dvfs_word(2, NULL, 0, &word));
+	KUNIT_EXPECT_EQ(test, word, 0x2000000000000002ULL);
+	KUNIT_ASSERT_TRUE(test, apple_pmp_dvfs_word(0, NULL, 0, &word));
+	KUNIT_EXPECT_EQ(test, word, 0x2000000000000000ULL);
+	KUNIT_ASSERT_TRUE(test, apple_pmp_dvfs_word(0, (u32[]){ 0x21, 1 }, 2, &word));
+	KUNIT_EXPECT_EQ(test, word, 0x2000000100000000ULL);
+	KUNIT_ASSERT_TRUE(test, apple_pmp_dvfs_word(0, (u32[]){ 0x21, 2 }, 2, &word));
+	KUNIT_EXPECT_EQ(test, word, 0x2000000200000000ULL);
+	KUNIT_ASSERT_TRUE(test, apple_pmp_dvfs_word(0, vmax, ARRAY_SIZE(vmax), &word));
+	KUNIT_EXPECT_EQ(test, word, 0x2002000000000000ULL);
+	KUNIT_ASSERT_TRUE(test,
+			  apple_pmp_dvfs_word(6, lanes, ARRAY_SIZE(lanes), &word));
+	KUNIT_EXPECT_EQ(test, word, 0x2000705000000006ULL);
+	KUNIT_EXPECT_FALSE(test,
+			   apple_pmp_dvfs_word(0, bad_class, ARRAY_SIZE(bad_class), &word));
+	KUNIT_EXPECT_FALSE(test,
+			   apple_pmp_dvfs_word(0, bad_level, ARRAY_SIZE(bad_level), &word));
+	KUNIT_EXPECT_FALSE(test,
+			   apple_pmp_dvfs_word(0, duplicate, ARRAY_SIZE(duplicate), &word));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_dvfs_word(0x20, NULL, 0, &word));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_dvfs_word(0, lanes, 3, &word));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_dvfs_word(0, NULL, 2, &word));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_dvfs_word(0, NULL, 0, NULL));
+}
+
 static struct kunit_case apple_pmp_report_cases[] = {
 	KUNIT_CASE(pmp_gpu_effort_count),
 	KUNIT_CASE(pmp_ranges_t6030),
+	KUNIT_CASE(pmp_request_word_replay),
 	KUNIT_CASE(pmp_ranges_t8122),
 	KUNIT_CASE(pmp_ranges_t6031),
 	KUNIT_CASE(pmp_ranges_reject_bad_records),
@@ -277,6 +322,7 @@ static struct kunit_case apple_pmp_report_cases[] = {
 	KUNIT_CASE(pmp_bootargs_valid_ids),
 	KUNIT_CASE(pmp_bootargs_reject_truncation),
 	KUNIT_CASE(pmp_bootargs_reject_integer_width),
+	KUNIT_CASE(pmp_dvfs_words),
 	{}
 };
 

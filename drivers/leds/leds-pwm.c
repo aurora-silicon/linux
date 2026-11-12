@@ -109,9 +109,16 @@ static int led_pwm_add(struct device *dev, struct led_pwm_priv *priv,
 		if (led_data->pwmstate.period)
 			break;
 		led->default_state = LEDS_DEFSTATE_OFF;
-		dev_warn(dev,
-			"failed to read period for %s, default to off",
-			led->name);
+		/*
+		 * A PWM the bootloader left disabled and never programmed has
+		 * no period to read back, and keeping its state means keeping
+		 * the LED off. Only an enabled PWM without a period is a
+		 * failure to read it.
+		 */
+		if (led_data->pwmstate.enabled)
+			dev_warn(dev,
+				 "failed to read period for %s, default to off",
+				 led->name);
 		fallthrough;
 	default:
 		pwm_init_state(led_data->pwm, &led_data->pwmstate);

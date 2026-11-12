@@ -439,6 +439,7 @@ snd-soc-tpa6130a2-y := tpa6130a2.o
 snd-soc-tas2552-y := tas2552.o
 snd-soc-tas2562-y := tas2562.o
 snd-soc-tas2764-y := tas2764.o
+snd-soc-tas2764-$(CONFIG_SND_SOC_TAS2764_KUNIT_TEST) += tas2764-kunit.dtbo.o
 snd-soc-tas2780-y := tas2780.o
 # Mux
 snd-soc-simple-mux-y := simple-mux.o

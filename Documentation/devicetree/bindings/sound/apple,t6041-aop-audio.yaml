@@ -4,21 +4,22 @@
 $id: http://devicetree.org/schemas/sound/apple,t6041-aop-audio.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Apple T6041 AOP audio
+title: Apple T6041 and T8132 AOP audio
 
 maintainers:
   - Jonathan Goyvaerts <jonathan.goyvaerts@gmail.com>
 
 description: |
-  The Always-On Processor on Apple T6041 SoCs runs the machine's audio
+  The Always-On Processor on Apple T6041 and T8132 SoCs runs the machine's audio
   streams in its firmware: the microphone array, the internal speakers with
   their voltage and current sense, and the 3.5 mm headset jack in both
   directions. This node is a child of the AOP node and names the ADMAC
   channels the host moves each stream's data over while the firmware runs
   its serializer. The parent AOP binding describes the firmware transport.
 
-  The headset jack's channels are optional: a node without them has no jack
-  streams.
+  The speaker and headset jack channels are optional: a node without them has
+  no speaker or jack streams. A Mac without microphones (Mac mini, Mac Studio)
+  lists no microphone channel, only its headset jack streams.
 
 # Only select T6041 nodes: other AOP audio nodes carry the
 # apple,t6030-aop-audio fallback too and have a different set of streams.
@@ -35,27 +36,57 @@ allOf:
 
 properties:
   compatible:
-    items:
-      - const: apple,t6041-aop-audio
-      - const: apple,t6030-aop-audio
+    oneOf:
+      - items:
+          - const: apple,t6041-aop-audio
+          - const: apple,t6030-aop-audio
+      - items:
+          - const: apple,t8132-aop-audio
+          - const: apple,t6041-aop-audio
+          - const: apple,t6030-aop-audio
 
   dmas:
-    minItems: 3
-    items:
-      - description: Microphone array input
-      - description: Internal speaker output
-      - description: Speaker voltage and current sense input
-      - description: Headset jack output
-      - description: Headset microphone input
+    description:
+      The ADMAC channels named in dma-names, in that order. "dma" is the
+      microphone array input, "spkr" the internal speaker output, "sense" the
+      speakers' voltage and current sense input, "cout" the headset jack output
+      and "cin" the headset microphone input.
+    minItems: 1
+    maxItems: 5
 
   dma-names:
-    minItems: 3
-    items:
-      - const: dma
-      - const: spkr
-      - const: sense
-      - const: cout
-      - const: cin
+    oneOf:
+      - description: The headset jack only, on a Mac without microphones
+        items:
+          - const: cout
+          - const: cin
+      - description: The microphones only
+        items:
+          - const: dma
+      - description: The microphones and the headset jack
+        items:
+          - const: dma
+          - const: cout
+          - const: cin
+      - description: The microphones and the speakers
+        items:
+          - const: dma
+          - const: spkr
+          - const: sense
+      - description: The microphones, the speakers and the headset jack
+        items:
+          - const: dma
+          - const: spkr
+          - const: sense
+          - const: cout
+          - const: cin
+
+  iommus:
+    maxItems: 1
+    description:
+      The DART stream of the firmware's low-power microphone I/O buffer. The
+      host allocates the ring the low-power microphone is produced into
+      through it; a node without it has no low-power microphone stream.
 
   "#sound-dai-cells":
     const: 1
@@ -97,6 +128,18 @@ examples:
             dmas = <&admac0 1>, <&admac1 0>, <&admac1 1>,
                    <&admac1 4>, <&admac1 5>;
             dma-names = "dma", "spkr", "sense", "cout", "cin";
+            iommus = <&aop_dart 8>;
+            #sound-dai-cells = <1>;
+        };
+    };
+  - |
+    aop {
+        audio {
+            compatible = "apple,t6041-aop-audio", "apple,t6030-aop-audio";
+            apple,chassis-name = "J773";
+            apple,machine-kind = "Mac mini";
+            dmas = <&admac1 4>, <&admac1 5>;
+            dma-names = "cout", "cin";
             #sound-dai-cells = <1>;
         };
     };

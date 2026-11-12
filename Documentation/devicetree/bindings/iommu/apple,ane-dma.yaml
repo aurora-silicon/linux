@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/iommu/apple,ane-dma.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple M1 Neural Engine auxiliary DMA aperture
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  An auxiliary address-translation aperture accompanies the three Neural
+  Engine DART register banks. It is described separately because it is
+  not an instance of the general-purpose DART programming model.
+  Its interrupt is shared with the DART banks.
+
+properties:
+  compatible:
+    items:
+      - enum:
+          - apple,t6000-ane-dma
+      - const: apple,ane-dma
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 1
+
+  power-domains:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - power-domains
+
+additionalProperties: false

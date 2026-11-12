@@ -16,6 +16,7 @@ use core::ops::Range;
 use core::slice;
 use core::sync::atomic::{
     AtomicBool,
+    AtomicU32,
     AtomicU64,
     Ordering, //
 };
@@ -35,6 +36,8 @@ use kernel::{
     },
     macros::versions,
     new_mutex,
+    new_spinlock,
+    new_work,
     prelude::*,
     soc::apple::rtkit,
     sync::{
@@ -44,6 +47,7 @@ use kernel::{
         },
         Arc,
         Mutex,
+        SpinLock,
         UniqueArc, //
     },
     time::{
@@ -53,6 +57,7 @@ use kernel::{
     },
     types::ForeignOwnable,
     uapi, //
+    workqueue::{HasWork, Work, WorkItem},
 };
 
 use crate::alloc::Allocator;
@@ -79,11 +84,13 @@ use crate::{
     gem,
     hw,
     initdata,
+    legacy_rx,
     mem,
     mmu,
     queue,
     regs,
     stats,
+    stats_raw,
     workqueue, //
 };
 
@@ -98,6 +105,9 @@ const EP_DOORBELL: u8 = 0x21;
 /// Initialize the GPU firmware.
 const MSG_INIT: u64 = 0x81 << 48;
 const INIT_DATA_MASK: u64 = (1 << 44) - 1;
+
+const RX_WORK_PENDING: u32 = 1 << 0;
+const RX_WORK_RUNNING: u32 = 1 << 1;
 
 /// TX channel doorbell.
 const MSG_TX_DOORBELL: u64 = 0x83 << 48;
@@ -251,6 +261,9 @@ pub(crate) struct GpuManager {
     rtkit: Mutex<Option<rtkit::RtKit<GpuManager::ver>>>,
     #[pin]
     rx_channels: Mutex<RxChannels::ver>,
+    rx_work_state: AtomicU32,
+    #[pin]
+    rx_work: Work<GpuManager::ver>,
     #[pin]
     tx_channels: Mutex<TxChannels::ver>,
     #[pin]
@@ -258,10 +271,53 @@ pub(crate) struct GpuManager {
     pipes: PipeChannels::ver,
     event_manager: Arc<event::EventManager>,
     stats: Arc<stats::StatsSnapshot>,
+    /// Last raw firmware statistics of this device, exported read-only
+    /// through `stats_raw`.
+    raw_stats: Arc<SpinLock<stats_raw::RawStatsSnapshot>>,
     buffer_mgr: buffer::BufferManager::ver,
     ids: SequenceIDs,
     #[pin]
     garbage_contexts: Mutex<KVec<workqueue::RetiredContext>>,
+}
+
+#[versions(AGX)]
+unsafe impl HasWork<GpuManager::ver> for GpuManager::ver {
+    unsafe fn raw_get_work(ptr: *mut Self) -> *mut Work<GpuManager::ver> {
+        // SAFETY: The caller supplies a live GpuManager allocation.
+        unsafe { core::ptr::addr_of_mut!((*ptr).rx_work) }
+    }
+
+    unsafe fn work_container_of(ptr: *mut Work<GpuManager::ver>) -> *mut Self {
+        // SAFETY: `ptr` came from `raw_get_work` above.
+        unsafe { kernel::container_of!(ptr, Self, rx_work) }
+    }
+}
+
+#[versions(AGX)]
+impl WorkItem for GpuManager::ver {
+    type Pointer = Arc<Self>;
+
+    fn run(this: Arc<Self>) {
+        let _util_min =
+            legacy_rx::UtilMinGuard::new(crate::module_parameters::legacy_rx_util_min.value());
+
+        loop {
+            this.rx_work_state
+                .fetch_and(!RX_WORK_PENDING, Ordering::AcqRel);
+            this.poll_rx_channels();
+
+            if this.rx_work_state.load(Ordering::Acquire) & RX_WORK_PENDING != 0 {
+                continue;
+            }
+            if this
+                .rx_work_state
+                .compare_exchange(RX_WORK_RUNNING, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
 }
 
 /// Operations the DRM driver performs on a GPU, independent of its firmware interface.
@@ -273,6 +329,11 @@ pub(crate) trait Gpu: Send + Sync {
 
     /// The firmware statistics snapshot of this GPU, if its firmware reports any.
     fn stats_snapshot(&self) -> Option<Arc<stats::StatsSnapshot>>;
+
+    /// The raw firmware statistics snapshot of this GPU, if its firmware reports any.
+    fn raw_stats_snapshot(&self) -> Option<Arc<SpinLock<stats_raw::RawStatsSnapshot>>> {
+        None
+    }
 
     /// Cast as an Any type.
     fn as_any(&self) -> &dyn Any;
@@ -311,7 +372,7 @@ pub(crate) trait Gpu: Send + Sync {
             flags |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES);
         }
         if self.soft_faults() && self.supports_soft_faults() {
-            flags |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;
+            flags |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS);
         }
         flags
     }
@@ -350,6 +411,14 @@ pub(crate) trait Gpu: Send + Sync {
     fn base_clock_hz(&self) -> u32;
     /// Return the GPU address space geometry.
     fn uat_geometry(&self) -> mmu::UatGeometry;
+    /// Admit a client's parameter ABI before creating its VM.
+    fn admit_vm(&self, _dev: &kernel::device::Device, _params_size: u64, _flags: u32) -> Result {
+        Ok(())
+    }
+    /// GPU VA of each VM's dummy page, which must match the address the firmware was given.
+    fn unknown_page(&self) -> u64 {
+        self.uat_geometry().unk_page()
+    }
     /// Create a new `Vm` with the given range reserved for kernel-managed objects.
     fn new_vm(&self, kernel_range: Range<u64>) -> Result<mmu::Vm>;
     /// Create a VM charged to a DRM file when the backend bounds retained bindings.
@@ -367,6 +436,7 @@ pub(crate) trait Gpu: Send + Sync {
         ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
         priority: u32,
         usc_exec_base: u64,
+        usage: Arc<crate::usage::Client>,
     ) -> Result<KBox<dyn queue::Queue>>;
     /// Bind a BO range as a firmware- or CPU-written timestamp buffer.
     fn map_timestamp_buffer(
@@ -454,12 +524,24 @@ impl rtkit::Operations for GpuManager::ver {
             return;
         }
 
-        let mut ch = data.rx_channels.lock();
+        data.poll_rx_channels();
+    }
 
-        ch.fw_log.poll();
-        ch.ktrace.poll();
-        ch.stats.poll();
-        ch.event.poll();
+    fn recv_message_early(
+        data: <Self::Data as ForeignOwnable>::Borrowed<'_>,
+        ep: u8,
+        msg: u64,
+    ) -> bool {
+        if crate::module_parameters::legacy_rx_fastpath.value() == 0
+            || ep != EP_FIRMWARE
+            || msg != MSG_RX_DOORBELL
+            || legacy_rx::get().is_none()
+        {
+            return false;
+        }
+
+        let manager = Arc::from(data);
+        manager.queue_rx_work()
     }
 
     fn crashed(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, _crashlog: Option<&[u8]>) {
@@ -498,6 +580,51 @@ impl rtkit::Operations for GpuManager::ver {
 
 #[versions(AGX)]
 impl GpuManager::ver {
+    fn poll_rx_channels(&self) {
+        let mut ch = self.rx_channels.lock();
+
+        ch.fw_log.poll();
+        ch.ktrace.poll();
+        ch.stats.poll();
+        ch.event.poll();
+    }
+
+    /// Coalesce doorbells without losing the one arriving as work returns.
+    fn queue_rx_work(self: Arc<Self>) -> bool {
+        loop {
+            let state = self
+                .rx_work_state
+                .fetch_or(RX_WORK_PENDING, Ordering::AcqRel);
+            if state & RX_WORK_RUNNING != 0 {
+                return true;
+            }
+            if self
+                .rx_work_state
+                .compare_exchange(
+                    state | RX_WORK_PENDING,
+                    state | RX_WORK_PENDING | RX_WORK_RUNNING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+            {
+                continue;
+            }
+
+            let Some(queue) = legacy_rx::get() else {
+                self.rx_work_state.store(0, Ordering::Release);
+                return false;
+            };
+            return match queue.enqueue(self) {
+                Ok(()) => true,
+                Err(manager) => {
+                    manager.rx_work_state.store(0, Ordering::Release);
+                    false
+                }
+            };
+        }
+    }
+
     /// Create a new GpuManager of this version/GPU combination.
     #[inline(never)]
     pub(crate) fn new(
@@ -824,8 +951,24 @@ impl GpuManager::ver {
         let buffer_mgr = buffer::BufferManager::ver::new()?;
         let event_manager_clone = event_manager.clone();
         let buffer_mgr_clone = buffer_mgr.clone();
-        let stats_snap = Arc::new(stats::StatsSnapshot::default(), GFP_KERNEL)?;
+        let mut frequencies_hz = KVec::with_capacity(dyncfg.pwr.perf_states.len(), GFP_KERNEL)?;
+        for state in &dyncfg.pwr.perf_states {
+            frequencies_hz.push(u64::from(state.freq_hz), GFP_KERNEL)?;
+        }
+        let stats_snap = Arc::new(
+            stats::StatsSnapshot {
+                frequencies_hz,
+                ..Default::default()
+            },
+            GFP_KERNEL,
+        )?;
         let stats_snap_clone = stats_snap.clone();
+        // Per-device raw statistics snapshot, shared with the debugfs export.
+        let raw_stats_snap = Arc::pin_init(
+            new_spinlock!(stats_raw::RawStatsSnapshot::default(), "asahi_stats_raw"),
+            GFP_KERNEL,
+        )?;
+        let raw_stats_snap_clone = raw_stats_snap.clone();
         let alloc_ref = &mut alloc;
         let rx_channels = KBox::init(
             try_init!(RxChannels::ver {
@@ -841,6 +984,7 @@ impl GpuManager::ver {
                     dev.into(),
                     alloc_ref,
                     stats_snap_clone,
+                    raw_stats_snap_clone,
                     u64::from(cfg.base_clock_hz),
                 )?,
             }),
@@ -868,9 +1012,12 @@ impl GpuManager::ver {
                 crashed: AtomicBool::new(false),
                 event_manager,
                 stats: stats_snap.clone(),
+                raw_stats: raw_stats_snap.clone(),
                 alloc <- new_mutex!(alloc, "alloc"),
                 fwctl_channel <- new_mutex!(fwctl_channel, "fwctl_channel"),
                 rx_channels <- new_mutex!(KBox::<RxChannels::ver>::into_inner(rx_channels), "rx_channels"),
+                rx_work_state: AtomicU32::new(0),
+                rx_work <- new_work!("GpuManager::rx_work"),
                 tx_channels <- new_mutex!(KBox::<TxChannels::ver>::into_inner(tx_channels), "tx_channels"),
                 pipes,
                 buffer_mgr,
@@ -1099,7 +1246,7 @@ impl GpuManager::ver {
                     virt_addr: U64(iova + off as u64),
                     total_size: (map.size * map.count * dies) as u32,
                     element_size: map.size as u32,
-                    readwrite: U64(map.writable as u64),
+                    readwrite: U64(u64::from(map.writable)),
                 };
             });
 
@@ -1149,20 +1296,14 @@ impl GpuManager::ver {
     /// Fetch the GPU MMU fault information from the hardware registers.
     fn get_fault_info(&self) -> Option<regs::FaultInfo> {
         // TODO: handle differently
-        let Some(guard) = self.dev.registration_guard() else {
-            return None;
-        };
+        let guard = self.dev.registration_guard()?;
 
         guard.registration_data_with(|reg_data| {
             let res = &reg_data.resources;
 
             let info = res.get_fault_info(self.cfg);
-            if info.is_some() {
-                dev_err!(
-                    self.dev.as_ref(),
-                    "  Fault info: {:#x?}\n",
-                    info.as_ref().unwrap()
-                );
+            if let Some(fault) = &info {
+                dev_err!(self.dev.as_ref(), "  Fault info: {:#x?}\n", fault);
             }
             info
         })
@@ -1252,6 +1393,9 @@ impl GpuManager::ver {
             .with(|raw, _inner| raw.pending_submissions.fetch_add(1, Ordering::Acquire));
 
         mod_dev_dbg!(self.dev, "OP start (pending: {})\n", val + 1);
+        // SAFETY: Takes no arguments and does nothing unless pmp_report.agx_vote is set on a T6001. The matching end call is made
+        // by OpGuard's Drop, and the guard is created right below, so every path out of here (including a failed kick) pairs it.
+        unsafe { kernel::bindings::apple_pmp_agx_activity_begin() };
         let guard = OpGuard(self.clone());
         self.kick_firmware()?;
         Ok(guard)
@@ -1323,10 +1467,40 @@ impl GpuManager::ver {
     }
 }
 
+extern "C" {
+    fn asahi_min_cpu_capacity() -> u32;
+}
+
 #[versions(AGX)]
 impl Gpu for GpuManager::ver {
+    /// A light submission completes in tens of microseconds, so its submitter
+    /// sleeps briefly between submissions and the CPU scheduler places and
+    /// clocks it like idle work: on G13/G14 a single client then spends more
+    /// time waking, recording and submitting than the GPU spends executing.
+    /// Give its blocking syncobj waits the G17 feed's expiring capacity hint
+    /// (half of the capacity scale, valid for 8 ms after each submission) when
+    /// that fits on every CPU, so the hint only raises the clock of the core
+    /// the waiter wakes on. Where the smallest cores are below half scale the
+    /// hint would move the waiter to another cluster instead, so none is given.
+    /// The hint changes no task attribute or affinity.
+    fn syncobj_wait_hint(&self) -> Option<(u32, u32)> {
+        /// Half of the CPU capacity scale (0..1024), as for the G17 feed.
+        const WAIT_UTIL_MIN: u32 = 512;
+        const WAIT_HINT_MS: u32 = 8;
+        if !cfg!(CONFIG_UCLAMP_TASK) {
+            return None;
+        }
+        // SAFETY: The helper only reads the per-CPU capacity table.
+        let smallest = unsafe { asahi_min_cpu_capacity() };
+        (smallest >= WAIT_UTIL_MIN).then_some((WAIT_UTIL_MIN, WAIT_HINT_MS))
+    }
+
     fn stats_snapshot(&self) -> Option<Arc<stats::StatsSnapshot>> {
         Some(self.stats.clone())
+    }
+
+    fn raw_stats_snapshot(&self) -> Option<Arc<SpinLock<stats_raw::RawStatsSnapshot>>> {
+        Some(self.raw_stats.clone())
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -1411,6 +1585,7 @@ impl Gpu for GpuManager::ver {
         ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
         priority: u32,
         usc_exec_base: u64,
+        usage: Arc<crate::usage::Client>,
     ) -> Result<KBox<dyn queue::Queue>> {
         let mut kalloc = self.alloc();
         let id = self.ids.queue.next();
@@ -1428,6 +1603,7 @@ impl Gpu for GpuManager::ver {
                 id,
                 priority,
                 usc_exec_base,
+                usage,
             )?,
             GFP_KERNEL,
         )?)
@@ -1771,5 +1947,7 @@ impl GpuManagerPriv for GpuManager::ver {
             .with(|raw, _inner| raw.pending_submissions.fetch_sub(1, Ordering::Release));
 
         mod_dev_dbg!(self.dev, "OP end (pending: {})\n", val - 1);
+        // SAFETY: Pairs with the begin call in start_op(); callable from any context.
+        unsafe { kernel::bindings::apple_pmp_agx_activity_end() };
     }
 }

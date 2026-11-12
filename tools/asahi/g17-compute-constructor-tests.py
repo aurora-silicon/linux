@@ -27,14 +27,16 @@ def fixture():
     runtime = (ROOT / 'runtime.rs').read_text()
     preparation = (ROOT / 'preparation.rs').read_text()
     admission = (item(preparation, "pub(super) struct Admission<'a>") + '\n' +
-                 item(preparation, "impl<'a> Admission<'a>")).replace('pub(super) ', '').replace('super::now_ns()', 'now_ns()')
+                 item(preparation, "impl<'a> Admission<'a>")).replace('pub(super) ', '').replace('super::now_ns()', 'now_ns()').replace('super::timeout::', '')
     methods = '\n'.join(item(runtime, sig) for sig in ['    fn shared_compute(', '    fn compute_scheduler('])
     methods = methods.replace('super::object::Allocator', 'Allocator').replace('super::preparation::Lease', 'Lease').replace('super::initdata::', '')
     return r'''
 #![allow(dead_code)]
+use std::cell::Cell;
 use std::sync::{Mutex,MutexGuard,atomic::{AtomicBool,AtomicU64,Ordering}};
 type Result<T=()> = std::result::Result<T,i32>;
 const EIO:i32=-5;const EAGAIN:i32=-11;const ENODEV:i32=-19;const EBUSY:i32=-16;const ECANCELED:i32=-125;
+const RECOVERY_WAIT_MS:u32=26_000;
 static NOW:AtomicU64=AtomicU64::new(0);static CANCEL:AtomicBool=AtomicBool::new(false);static ALLOCATE:AtomicBool=AtomicBool::new(false);
 fn now_ns()->u64{NOW.load(Ordering::SeqCst)}
 mod kernel{pub mod time{pub fn msecs_to_jiffies(ms:u32)->u32{ms}}}
@@ -51,7 +53,7 @@ impl Changed{
 }
 struct Shared{preparations:Gate,state:State,changed:Changed,crashed:AtomicBool}
 impl Shared{fn drm(&self)->Result<()>{Ok(())} fn note_changed(&self){self.changed.notify_all();}}
-struct Context;impl Context{fn vm(&self)->&(){&()}}
+struct Context{m5:bool}impl Context{fn vm(&self)->&(){&()} fn is_m5(&self)->bool{self.m5}}
 struct Backend{shared:Shared,context:Context}
 struct Allocator<'a>{dev:&'a (),uat:&'a ()}
 struct ComputeShared;struct ComputeScheduler;
@@ -74,7 +76,7 @@ impl Backend{
 fn main(){
  for scheduler in [false,true]{for cancel in [false,true]{for building in [false,true]{
   NOW.store(0,Ordering::SeqCst);CANCEL.store(cancel,Ordering::SeqCst);ALLOCATE.store(!building,Ordering::SeqCst);
-  let b=Backend{context:Context,shared:Shared{preparations:Gate,changed:Changed,crashed:AtomicBool::new(false),state:State(Mutex::new(Some(Box::new(Firmware{uat:(),init:Init{shared:false,scheduler:false},queues:Queues{compute_building:building,compute_scheduler_building:building}}))))}};
+  let b=Backend{context:Context{m5:false},shared:Shared{preparations:Gate,changed:Changed,crashed:AtomicBool::new(false),state:State(Mutex::new(Some(Box::new(Firmware{uat:(),init:Init{shared:false,scheduler:false},queues:Queues{compute_building:building,compute_scheduler_building:building}}))))}};
   let check=||{if CANCEL.load(Ordering::SeqCst)&&now_ns()>=10_000_000{Err(ECANCELED)}else{Ok(())}};
   let admission=Admission::new(20_000_000,&check);
   let alloc=Allocator{dev:&(),uat:&()};
@@ -85,7 +87,13 @@ fn main(){
   assert!(!fw.init.shared&&!fw.init.scheduler,"expired constructor must not install");
   if !building{assert!(!fw.queues.compute_building&&!fw.queues.compute_scheduler_building,"failed constructor must clear builder flag");}
  }}}
- println!("PASS 8 production shared/scheduler constructor waits: expiry, cancellation, off-lock-build expiry, no installation and flag cleanup");
+ // M5 compute queues need no shared aperture: nothing waits, builds or installs.
+ NOW.store(0,Ordering::SeqCst);CANCEL.store(false,Ordering::SeqCst);ALLOCATE.store(true,Ordering::SeqCst);
+ let b=Backend{context:Context{m5:true},shared:Shared{preparations:Gate,changed:Changed,crashed:AtomicBool::new(false),state:State(Mutex::new(Some(Box::new(Firmware{uat:(),init:Init{shared:false,scheduler:false},queues:Queues{compute_building:true,compute_scheduler_building:false}}))))}};
+ let check=||Ok(());
+ assert_eq!(b.shared_compute(&Admission::new(20_000_000,&check)),Ok(()));
+ assert_eq!(now_ns(),0);assert!(!b.shared.state.lock().as_ref().unwrap().init.shared);
+ println!("PASS 8 production shared/scheduler constructor waits: expiry, cancellation, off-lock-build expiry, no installation and flag cleanup; M5 skips the G17P shared aperture");
 }
 '''
 

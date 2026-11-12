@@ -11,6 +11,25 @@ static const char mt_rx_stat_names[][ETH_GSTRING_LEN] = {
 	"host_rx_no_memory",
 	"host_rx_retry_records",
 	"host_rx_amsdu_records",
+	"irq_service_passes",
+	"irq_unmasked_passes",
+	"irq_unmasked_bits",
+	"rx_ring0_records",
+	"rx_ring1_records",
+	"rx_ring2_records",
+	"rx_ring3_records",
+	"rx_ring4_records",
+	"rx_ring5_records",
+	"rx_ring6_records",
+	"rx_ring7_records",
+	"rx_ring8_records",
+	"tx_free_events",
+	"bss_absent_events",
+	"bss_absent_ms",
+	"home_beacons",
+	"rx_2ghz_records",
+	"rx_5ghz_records",
+	"rx_6ghz_records",
 };
 
 static int mt_get_sset_count(struct net_device *netdev, int set)
@@ -33,8 +52,19 @@ static void mt_get_ethtool_stats(struct net_device *netdev,
 {
 	struct mt7932 *m = *(struct mt7932 **)netdev_priv(netdev);
 	unsigned long flags;
+	unsigned int i;
 
+	BUILD_BUG_ON(ARRAY_SIZE(mt_rx_stat_names) != 28);
+	/* The interrupt thread alone writes these; a torn pass is harmless. */
+	data[9] = READ_ONCE(m->irq_passes);
+	data[10] = READ_ONCE(m->irq_unmasked_passes);
+	data[11] = READ_ONCE(m->irq_unmasked);
+	for (i = 0; i < ARRAY_SIZE(m->rx_ring_records); i++)
+		data[12 + i] = READ_ONCE(m->rx_ring_records[i]);
 	spin_lock_irqsave(&m->response_lock, flags);
+	data[22] = m->bss_absent_events;
+	data[23] = m->bss_absent_ms;
+	data[24] = m->home_beacons;
 	data[0] = m->rx_integrity;
 	data[1] = m->rx_malformed;
 	data[2] = m->rx_unsupported;
@@ -45,6 +75,17 @@ static void mt_get_ethtool_stats(struct net_device *netdev,
 	data[7] = m->rx_retry;
 	data[8] = m->rx_amsdu;
 	spin_unlock_irqrestore(&m->response_lock, flags);
+	if (READ_ONCE(m->data_ready)) {
+		spin_lock_irqsave(&m->data_lock, flags);
+		data[21] = m->tx_free_events;
+		for (i = 0; i < ARRAY_SIZE(m->rx_band_records); i++)
+			data[25 + i] = m->rx_band_records[i];
+		spin_unlock_irqrestore(&m->data_lock, flags);
+	} else {
+		data[21] = 0;
+		for (i = 0; i < ARRAY_SIZE(m->rx_band_records); i++)
+			data[25 + i] = 0;
+	}
 }
 
 const struct ethtool_ops mt_ethtool_ops = {

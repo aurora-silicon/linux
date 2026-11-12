@@ -46,6 +46,19 @@ $defs:
         - description: Bits to set
     description: Register initialization tuples for one controller region.
 
+  t6050-tunable:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: Register offset in the named window
+        - description: Access width in bytes
+          const: 4
+        - description: Mask of the bits to replace
+        - description: Value of those bits
+    description:
+      A T6050 host tunable list, copied by the boot loader from the Apple
+      device tree.
+
 properties:
   compatible:
     oneOf:
@@ -57,17 +70,30 @@ properties:
           - const: apple,pcie
       - items:
           - enum:
+              - apple,t6030-pcie
+              - apple,t6031-pcie
               - apple,t6041-pcie
               - apple,t8122-pcie
           - const: apple,t6020-pcie
       - const: apple,t6020-pcie
+      - items:
+          - const: apple,t6020-pcie-ge
+          - const: apple,t6020-pcie
       - const: apple,t8140-pcie
+      - const: apple,t6050-pcie
+      - const: apple,t8152-pcie
       - const: apple,t8132-pcie
       - const: apple,t8103-pciec
       - items:
           - const: apple,t8112-pciec
           - const: apple,t8103-pciec
       - const: apple,t6000-pciec
+      - const: apple,t6050-pciec
+      - items:
+          - const: apple,t8132-pciec
+          - const: apple,t8122-pciec
+          - const: apple,t8103-pciec
+      - const: apple,t6040-pciec
 
   apple,managed-sids:
     $ref: /schemas/types.yaml#/definitions/uint32-array
@@ -86,11 +112,11 @@ properties:
 
   reg:
     minItems: 3
-    maxItems: 10
+    maxItems: 20
 
   reg-names:
     minItems: 3
-    maxItems: 10
+    maxItems: 20
 
   ranges:
     minItems: 2
@@ -100,18 +126,42 @@ properties:
     description:
       Interrupt specifiers, one for each root port.
     minItems: 1
-    maxItems: 4
+    maxItems: 6
+
+  interrupt-names:
+    minItems: 1
+    maxItems: 6
 
   msi-parent: true
+
+  nonposted-mmio: true
 
   msi-ranges:
     maxItems: 1
 
+  apple,msi-vector-base:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      First global vector targeted by this controller's local MSI map.
+
   iommu-map: true
   iommu-map-mask: true
 
+  post-init-providers:
+    description:
+      The DART of a host whose iommu-map names a DART marked
+      apple,manual-availability, so that fw_devlink does not make the host wait
+      for a DART that probes only after the host has brought up its port.
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+
   power-domains:
-    maxItems: 1
+    description:
+      The power domains the controller needs. Internal controllers on some
+      SoCs sit behind two separate domain chains (for example the PCIe
+      system and PHY domains), all of which must stay on while the links
+      are up.
+    minItems: 1
+    maxItems: 2
 
   resets:
     description:
@@ -123,7 +173,11 @@ properties:
 
   apple,pciec-kernel-init:
     type: boolean
-    description: The kernel initializes the tunneled controller from reset.
+    description: |
+      The kernel initializes the tunneled controller when firmware has not
+      already initialized it. The compatible selects the initialization
+      sequence. T600x and T8112 use the Intr2AXI bridge and require tunables
+      for their associated DART before the tunnel children can be populated.
 
   apple,tunable-rc:
     $ref: '#/$defs/tunable'
@@ -140,6 +194,34 @@ properties:
   apple,tunable-oe-fabric:
     $ref: '#/$defs/tunable'
     description: Initialization tuples for the oe-fabric register region.
+
+  apple,tunable-axi2af:
+    description: Register tuples for the controller's AXI bridge.
+
+  apple,tunable-cio3pllcore:
+    $ref: '#/$defs/t6050-tunable'
+    description: T6050 tuples for the CIO3 PLL core, in the pcieclkgen window.
+
+  apple,tunable-pcieclkgen:
+    $ref: '#/$defs/t6050-tunable'
+    description: T6050 tuples for the pcieclkgen window.
+
+  apple,tunable-cio3pll:
+    $ref: '#/$defs/tunable'
+    description: Initialization tuples for the shared PHY block's PLL.
+
+  apple,tunable-clkgen:
+    $ref: '#/$defs/tunable'
+    description: Initialization tuples for the shared PHY block's clock generator.
+
+  apple,tunable-phy:
+    description: Register tuples for the controller's PHY window.
+
+  apple,tunable-phy-ip-pll:
+    description: PLL register tuples relative to the controller's phy-ip window.
+
+  apple,tunable-phy-ip-auspma:
+    description: Lane register tuples relative to the controller's phy-ip window.
 
   apple,piodma:
     $ref: /schemas/types.yaml#/definitions/phandle
@@ -161,6 +243,15 @@ patternProperties:
         maxItems: 1
 
       interrupt-controller: true
+
+      apple,link-trained-by-bootloader:
+        type: boolean
+        description:
+          The boot loader trained this port's link and handed it over up. The
+          driver adopts the link as it is instead of resetting the port, so
+          the port needs no PERST# line. A T6050 port that also names
+          pwren-gpios may be left untrained; the OS then trains it first and
+          adopts it the same way.
 
       apple,tunable:
         $ref: '#/$defs/tunable'
@@ -187,8 +278,94 @@ required:
 unevaluatedProperties: false
 
 allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8132-pciec
+              - apple,t6040-pciec
+    then:
+      required:
+        - apple,msi-vector-base
   - $ref: /schemas/pci/pci-host-bridge.yaml#
   - $ref: /schemas/interrupt-controller/msi-controller.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6050-pcie
+    then:
+      properties:
+        reg:
+          minItems: 5
+          maxItems: 20
+        reg-names:
+          description:
+            config and rc, then port<n>, phy<n> and intr2axi<n> for each
+            adopted root port 00:<n>.0. A host with a port the OS trains
+            itself (pwren-gpios) also names the shared PHY (phy-shared), its
+            common block (phy-common) and the windows its tunable lists
+            apply to (axi2af, pcieclkgen, phy-window, phy-ip).
+          minItems: 5
+          maxItems: 20
+          items:
+            pattern: "^(config|rc|(port|phy|intr2axi)[0-3]|phy-shared|phy-common|axi2af|pcieclkgen|phy-window|phy-ip)$"
+        interrupts:
+          maxItems: 4
+        interrupt-names:
+          items:
+            pattern: "^port[0-3]$"
+        apple,msi-vector-base:
+          const: 64
+        power-domains: false
+        apple,tunable-axi2af:
+          $ref: '#/$defs/t6050-tunable'
+        apple,tunable-phy:
+          $ref: '#/$defs/t6050-tunable'
+        apple,tunable-phy-ip-pll:
+          $ref: '#/$defs/t6050-tunable'
+        apple,tunable-phy-ip-auspma:
+          $ref: '#/$defs/t6050-tunable'
+        apple,tunable-cio3pll: false
+        apple,tunable-clkgen: false
+      required:
+        - interrupt-names
+        - apple,msi-vector-base
+        - iommu-map
+      patternProperties:
+        "^pci@":
+          properties:
+            reset-gpios:
+              description:
+                The PERST# line of a port whose endpoint needs a root-port
+                reset after the bootloader trained the link. Left as the
+                bootloader set it until that reset, or until the OS trains
+                the port itself.
+            pwren-gpios:
+              description:
+                The endpoint's power line. A port that names it may be left
+                untrained by the bootloader; the OS then powers the endpoint
+                and trains the link itself (the host then needs phy-shared
+                and phy-common), and adopts it as a bootloader-trained one.
+          required:
+            - apple,link-trained-by-bootloader
+    else:
+      properties:
+        apple,tunable-axi2af:
+          $ref: '#/$defs/tunable'
+        apple,tunable-cio3pllcore: false
+        apple,tunable-pcieclkgen: false
+        apple,tunable-phy:
+          $ref: '#/$defs/tunable'
+        apple,tunable-phy-ip-pll:
+          $ref: '#/$defs/tunable'
+        apple,tunable-phy-ip-auspma:
+          $ref: '#/$defs/tunable'
+      patternProperties:
+        "^pci@":
+          properties:
+            apple,link-trained-by-bootloader: false
   - if:
       properties:
         compatible:
@@ -227,11 +404,13 @@ allOf:
             enum:
               - apple,t8103-pciec
               - apple,t6000-pciec
+              - apple,t6040-pciec
+              - apple,t6050-pciec
     then:
       properties:
         reg:
           minItems: 5
-          maxItems: 7
+          maxItems: 9
         reg-names:
           oneOf:
             - items:
@@ -248,11 +427,59 @@ allOf:
                 - const: debug
                 - const: ltssm
                 - enum: [intr2axi, oe-fabric]
+            - items:
+                - const: config
+                - const: rc
+                - const: port0
+                - const: fabric
+                - const: debug
+                - const: ioa
+                - const: ltssm
+                - const: intr2axi
+                - const: oe-fabric
+            - items:
+                - const: config
+                - const: rc
+                - const: port0
+                - const: fabric
+                - const: debug
+                - const: ioa
+                - const: ltssm
+                - const: intr2axi
         interrupts:
-          maxItems: 1
+          maxItems: 6
         ranges:
           minItems: 3
           maxItems: 3
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t6040-pciec
+          then:
+            properties:
+              reg:
+                minItems: 8
+                maxItems: 8
+              interrupts:
+                minItems: 6
+                maxItems: 6
+              interrupt-names:
+                items:
+                  - const: port
+                  - const: intx-a
+                  - const: intx-b
+                  - const: intx-c
+                  - const: intx-d
+                  - const: parity
+            required:
+              - interrupt-names
+          else:
+            properties:
+              interrupts:
+                maxItems: 1
+              interrupt-names: false
     else:
       properties:
         resets: false
@@ -273,8 +500,9 @@ allOf:
             properties:
               reg:
                 minItems: 8
-                maxItems: 8
+                maxItems: 13
               reg-names:
+                minItems: 8
                 items:
                   - const: config
                   - const: rc
@@ -284,29 +512,80 @@ allOf:
                   - const: phy0
                   - const: phy1
                   - const: phy2
+                  - const: axi2af
+                  - const: cio3pll
+                  - const: clkgen
+                  - const: phy-block
+                  - const: phy-ip
               interrupts:
                 maxItems: 3
           else:
-            properties:
-              reg-names:
-                minItems: 3
-                items:
-                  - const: config
-                  - const: rc
-                  - const: port0
-                  - const: port1
-                  - const: port2
-                  - const: port3
-                  - const: phy0
-                  - const: phy1
-                  - const: phy2
-                  - const: phy3
+            if:
+              properties:
+                compatible:
+                  contains:
+                    const: apple,t6050-pcie
+            then:
+              properties:
+                reg:
+                  minItems: 5
+                  maxItems: 20
+                reg-names:
+                  minItems: 5
+                  maxItems: 20
+                  items:
+                    enum: [config, rc, port0, phy0, intr2axi0, port1, phy1,
+                           intr2axi1, port2, phy2, intr2axi2, port3, phy3,
+                           intr2axi3, phy-shared, phy-common, axi2af,
+                           pcieclkgen, phy-window, phy-ip]
+                interrupts:
+                  maxItems: 4
+            else:
+              if:
+                properties:
+                  compatible:
+                    contains:
+                      const: apple,t8152-pcie
+              then:
+                properties:
+                  reg:
+                    minItems: 4
+                    maxItems: 8
+                  reg-names:
+                    minItems: 4
+                    maxItems: 8
+                    items:
+                      enum: [config, rc, port0, phy0, port1, phy1, port2, phy2]
+                  interrupts:
+                    maxItems: 3
+              else:
+                properties:
+                  reg:
+                    maxItems: 10
+                  reg-names:
+                    minItems: 3
+                    items:
+                      - const: config
+                      - const: rc
+                      - const: port0
+                      - const: port1
+                      - const: port2
+                      - const: port3
+                      - const: phy0
+                      - const: phy1
+                      - const: phy2
+                      - const: phy3
       patternProperties:
         "^pci@":
           properties:
             apple,tunable: false
-          required:
-            - reset-gpios
+          if:
+            not:
+              required:
+                - apple,link-trained-by-bootloader
+          then:
+            required:
+              - reset-gpios
 
 examples:
   - |

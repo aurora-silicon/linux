@@ -91,10 +91,33 @@ impl<T: MailCallback> Mailbox<T> {
         unsafe { device::Device::from_raw((*self.mbox).dev) }
     }
 
+    /// The C mailbox, for code that drives it with interrupts off.
+    pub fn as_raw(&self) -> *mut bindings::apple_mbox {
+        self.mbox
+    }
+
     /// Sends the specified message
     pub fn send(&self, msg: Message, atomic: bool) -> Result<()> {
         // SAFETY: Calling the c function, `mbox` is a valid pointer
         to_result(unsafe { bindings::apple_mbox_send(self.mbox, msg, atomic) })
+    }
+
+    /// Sets bit 0 of the receive control word, for firmware that powers itself down.
+    pub fn set_recv_enabled(&self, enabled: bool) {
+        // SAFETY: Calling the c function, `mbox` is a valid pointer
+        unsafe { bindings::apple_mbox_set_recv_enabled(self.mbox, enabled) };
+    }
+
+    /// Stops taking receive interrupts, so that no handler reads the mailbox.
+    pub fn hold_rx(&self) {
+        // SAFETY: Calling the c function, `mbox` is a valid pointer
+        unsafe { bindings::apple_mbox_hold_rx(self.mbox) };
+    }
+
+    /// Undoes [`Self::hold_rx`].
+    pub fn release_rx(&self) {
+        // SAFETY: Calling the c function, `mbox` is a valid pointer
+        unsafe { bindings::apple_mbox_release_rx(self.mbox) };
     }
 }
 

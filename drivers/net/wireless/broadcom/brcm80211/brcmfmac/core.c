@@ -105,14 +105,14 @@ struct brcmf_if *brcmf_get_ifp(struct brcmf_pub *drvr, int ifidx)
 	return ifp;
 }
 
-void brcmf_configure_arp_nd_offload(struct brcmf_if *ifp, bool enable)
+int brcmf_configure_arp_nd_offload(struct brcmf_if *ifp, bool enable)
 {
-	s32 err;
+	s32 err, ret = 0;
 	u32 mode;
 
 	if (enable && brcmf_is_apmode_operating(ifp->drvr->wiphy)) {
 		brcmf_dbg(TRACE, "Skip ARP/ND offload enable when soft AP is running\n");
-		return;
+		return 0;
 	}
 
 	if (enable)
@@ -124,11 +124,13 @@ void brcmf_configure_arp_nd_offload(struct brcmf_if *ifp, bool enable)
 	/* is simply not supported and err 0 will be returned                 */
 	err = brcmf_fil_iovar_int_set(ifp, "arp_ol", mode);
 	if (err) {
+		ret = err;
 		brcmf_dbg(TRACE, "failed to set ARP offload mode to 0x%x, err = %d\n",
 			  mode, err);
 	} else {
 		err = brcmf_fil_iovar_int_set(ifp, "arpoe", enable);
 		if (err) {
+			ret = err;
 			brcmf_dbg(TRACE, "failed to configure (%d) ARP offload err = %d\n",
 				  enable, err);
 		} else {
@@ -139,12 +141,16 @@ void brcmf_configure_arp_nd_offload(struct brcmf_if *ifp, bool enable)
 
 	err = brcmf_fil_iovar_int_set(ifp, "ndoe", enable);
 	if (err) {
+		if (!ret)
+			ret = err;
 		brcmf_dbg(TRACE, "failed to configure (%d) ND offload err = %d\n",
 			  enable, err);
 	} else {
 		brcmf_dbg(TRACE, "successfully configured (%d) ND offload to 0x%x\n",
 			  enable, mode);
 	}
+
+	return ret;
 }
 
 static void _brcmf_set_multicast_list(struct work_struct *work)
@@ -766,6 +772,27 @@ static const struct net_device_ops brcmf_netdev_ops_pri = {
 	.ndo_set_mac_address = brcmf_netdev_set_mac_address,
 	.ndo_set_rx_mode = brcmf_netdev_set_multicast_list
 };
+
+bool brcmf_has_awdl_interface(struct brcmf_pub *drvr)
+{
+	struct net_device *ndev;
+	struct brcmf_if *ifp;
+	bool present = false;
+
+	rcu_read_lock();
+	for_each_netdev_rcu(wiphy_net(drvr->wiphy), ndev) {
+		if (ndev->netdev_ops != &brcmf_netdev_ops_awdl)
+			continue;
+		ifp = netdev_priv(ndev);
+		if (ifp->drvr == drvr) {
+			present = true;
+			break;
+		}
+	}
+	rcu_read_unlock();
+
+	return present;
+}
 
 int brcmf_net_attach(struct brcmf_if *ifp, bool locked)
 {
@@ -1725,7 +1752,6 @@ int brcmf_netdev_wait_pend8021x(struct brcmf_if *ifp)
 void brcmf_bus_change_state(struct brcmf_bus *bus, enum brcmf_bus_state state)
 {
 	struct brcmf_pub *drvr = bus->drvr;
-	struct net_device *ndev;
 	int ifidx;
 
 	brcmf_dbg(TRACE, "%d -> %d\n", bus->state, state);
@@ -1737,16 +1763,10 @@ void brcmf_bus_change_state(struct brcmf_bus *bus, enum brcmf_bus_state state)
 
 	bus->state = state;
 
-	if (state == BRCMF_BUS_UP) {
-		for (ifidx = 0; ifidx < BRCMF_MAX_IFS; ifidx++) {
-			if ((drvr->iflist[ifidx]) &&
-			    (drvr->iflist[ifidx]->ndev)) {
-				ndev = drvr->iflist[ifidx]->ndev;
-				if (netif_queue_stopped(ndev))
-					netif_wake_queue(ndev);
-			}
-		}
-	}
+	for (ifidx = 0; ifidx < BRCMF_MAX_IFS; ifidx++)
+		brcmf_txflowblock_if(drvr->iflist[ifidx],
+				     BRCMF_NETIF_STOP_REASON_BUS,
+				     state != BRCMF_BUS_UP);
 }
 
 int __init brcmf_core_init(void)
@@ -1779,4 +1799,3 @@ void __exit brcmf_core_exit(void)
 	brcmf_usb_exit();
 	brcmf_pcie_exit();
 }
-

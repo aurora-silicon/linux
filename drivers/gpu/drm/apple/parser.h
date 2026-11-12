@@ -17,6 +17,7 @@ typedef void (*dcp_identity_key_fn)(void *data, const char *key, u32 key_len,
 int parse_identity_keys(const void *blob, size_t len, dcp_identity_key_fn emit, void *data);
 struct apple_connector;
 struct apple_dcp_typec_route;
+struct dcp_dptx_caps;
 
 struct dcp_parse_ctx {
 	struct apple_dcp *dcp;
@@ -33,6 +34,16 @@ struct dcp_parse_ctx {
 	 * the H17P external color policy.
 	 */
 	bool metadata_timing;
+	/*
+	 * A firmware 27 external processor: for SDR, prefer the timing's
+	 * Default RGB element, as macOS does, over a higher-scored BT.2020 one.
+	 */
+	bool sdr_default_rgb;
+	/*
+	 * A firmware 27 processor: it compresses a PQ element the timing lists
+	 * as needing DSC itself, so such an element is usable for PQ.
+	 */
+	bool pq_dsc;
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
 	/*
 	 * T6030 external processor audio elements (DCP firmware 14.7, external
@@ -224,7 +235,9 @@ int parse_panel_product_metadata(struct dcp_parse_ctx *handle,
 int parse_display_attributes(struct dcp_parse_ctx *handle, int *width_mm,
 			     int *height_mm, bool *backlight_control);
 int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
-			    const char **class, s64 *unit, bool h17p_keys);
+			    const char **class, s64 *unit, bool h17p_keys,
+			    bool epic_unit_first);
+int parse_dptx_caps(struct dcp_parse_ctx *handle, struct dcp_dptx_caps *caps);
 
 struct dcp_sound_format_mask {
 	u64 formats;			/* SNDRV_PCM_FMTBIT_* */
@@ -265,5 +278,27 @@ struct dcp_system_ev_mnits {
 
 int parse_system_log_mnits(struct dcp_parse_ctx *handle,
 			   struct dcp_system_ev_mnits *entry);
+int parse_system_log_mnits_pairs(const void *blob, size_t size,
+				 struct dcp_system_ev_mnits *entry);
+
+/* One colour element as the firmware lists it; -1 for an absent field. */
+struct dcp_color_element {
+	s64 id, depth, range, eotf, encoding, colorimetry, score;
+	bool is_virtual;
+	/* The timing lists it as unsafe, or as needing DSC (timing walks only). */
+	bool unsafe, dsc_required;
+};
+
+typedef void (*dcp_color_element_fn)(void *data, const struct dcp_color_element *element);
+int dcp_parse_timing_colors(const void *blob, size_t len, u32 timing_id,
+			    dcp_color_element_fn emit, void *data, bool *interlaced);
+
+/* A timing entry's ID and active size (0 where not given) */
+struct dcp_timing_id {
+	u32 id, width, height;
+};
+
+int dcp_parse_timing_ids(const void *blob, size_t len, struct dcp_timing_id *out,
+			 unsigned int max);
 
 #endif

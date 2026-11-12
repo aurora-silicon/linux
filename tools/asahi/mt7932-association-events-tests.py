@@ -48,6 +48,7 @@ typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t
 #define GFP_ATOMIC 0
 #define IEEE80211_CHAN_DISABLED 1
 #define IEEE80211_CHAN_RADAR 2
+#define IEEE80211_CHAN_NO_IR 4
 #define NL80211_CHAN_WIDTH_20 0
 #define NL80211_CHAN_WIDTH_40 1
 #define NL80211_CHAN_WIDTH_80 2
@@ -85,7 +86,7 @@ struct mt7932 {
  bool connecting,connected,disconnecting,disconnect_seen,disconnect_event_received;
  bool disconnect_local,connect_open,assoc_request_seen,peer_valid,link_failed,stopping,rf_ready;
  u8 connect_channel,connect_center,peer_wtbl,smart_version,waiting;
- enum nl80211_band connect_band; u8 six_assoc_power[2][1020];
+ enum nl80211_band connect_band; u8 six_assoc_power[2][1020]; bool six_legacy_assoc;
  int waiting_eid;
  struct cfg80211_chan_def connect_chandef;
  struct test_band band2,band5;
@@ -121,8 +122,12 @@ static void netif_stop_queue(void*n){}
 static void schedule_work(void*w){scheduled++;}
 static void mt_scan_event(struct mt7932*m,const struct mt7932_event*e){}
 static void mt_bss_presence(struct mt7932*m,const struct mt7932_event*e){}
+#define IS_ENABLED(option) 0
+static void mt_awdl_event(struct mt7932*m,const struct mt7932_event*e){}
 static void mt_data_complete(struct mt7932*m,const u8*p,size_t n){}
 static void mt_packet_receive(struct mt7932*m,const u8*p,size_t n){}
+static void mt_hif_event(struct mt7932*m,const struct mt7932_event*e){}
+static void mt_wow_reason_event(struct mt7932*m,const struct mt7932_event*e){}
 static void mt_rf_fail_locked(struct mt7932*m,int e){m->rf_ready=false;m->link_failed=true;m->cal_state.error=e;m->cal_state.active=false;m->connect_error=e;complete_all(&m->assoc_done);complete_all(&m->cal_response);}
 CHANNEL
 LINK
@@ -251,6 +256,9 @@ def main():
         headers.append(header)
     cal=(root/DRIVER/"calibration.h").read_text()
     headers.append(cal[cal.index("struct mt7932_cal_completion {"):cal.index("struct mt7932_cal_segment {")])
+    # The receive path's other events, by their production IDs: the firmware's HIF and WoW reports.
+    headers.append(re.search(r"^#define MT7932_CID_HIF_CTRL\b.*$", rx, re.M).group(0))
+    headers.append(re.search(r"^#define MT7932_EID_WOW_REASON\b.*$", (root/DRIVER/"wow.h").read_text(), re.M).group(0))
     parts["HEADERS"]="\n".join(headers)
     candidates={"production":parts}
     if args.old_source:

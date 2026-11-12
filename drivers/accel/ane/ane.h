@@ -64,6 +64,8 @@ struct ane_device {
 	 * and protects bo_list, preserved_list and removed.
 	 */
 	struct mutex engine_lock;
+	/* Serializes runtime-PM references across a recovery cycle. */
+	struct mutex pm_lock;
 	struct list_head bo_list;
 
 	/*
@@ -111,10 +113,48 @@ struct ane_device {
 	bool tm_retention;
 
 	/*
+	 * Set under engine_lock when a failure is known to survive the
+	 * recovery power cycle: the engine stays wedged, recovery and the
+	 * reset attribute refuse, and only a reboot brings it back.
+	 * wedge_reason names why for the wedge_reason sysfs file.
+	 */
+	bool wedge_final;
+	const char *wedge_reason;
+
+	/*
+	 * Recoveries since the last completed job: raised by a recovery that
+	 * reported the engine idle, cleared by the next completed job. A
+	 * recovery that only looks successful is caught by the jobs after it
+	 * hanging the same way.
+	 */
+	unsigned int recovery_unproven;
+
+	/* Protected independently of engine_lock so idle work can release votes. */
+	struct ane_perf {
+		struct mutex lock; /* protects votes, idle work and status */
+		struct delayed_work idle;
+		struct device_node *report;
+		struct icc_path *memory;
+		unsigned int high_level;
+		unsigned int level;
+		u32 avg_bw;
+		u32 peak_bw;
+		int error;
+		unsigned int release_retries;
+		bool initialized;
+		bool busy;
+		bool voted;
+		bool clock_held;
+		bool pinned;
+		bool cpu_boost;
+	} perf;
+
+	/*
 	 * Engine-busy CPU cluster boost (ane_boost.c): min-frequency QoS on
 	 * every cpufreq policy while a submit runs and until boost_idle_ms
-	 * after the last one completes: on T8103 bandwidth-bound programs
-	 * run ~2x slower while schedutil parks the idle clusters low.
+	 * after the last one completes. Used only when the DT binds no
+	 * performance controller, so the engine keeps the boost it had
+	 * until it gets a clock level instead.
 	 */
 	struct ane_boost {
 		struct mutex lock;	/* protects the fields below */
@@ -147,6 +187,34 @@ struct ane_request {
 	u32 bar[DRM_ANE_TILE_COUNT];
 };
 
+/*
+ * Recoveries in a row without one completed job that a T600x engine gets
+ * before it is declared wedged until reboot: a run this long means the
+ * recovery does not bring the engine back.
+ */
+#define ANE_TM_RECOVERIES_MAX 3
+
+/*
+ * Can a power cycle bring the engine back after a failed job? A job that
+ * timed out without one completion event (@finished == 0) left the task
+ * manager stopped mid-program. The cycle stops it; a hang on a job after a
+ * recovery (@unproven recoveries since the last completed job) shows that
+ * the recovery did not bring the engine back. T8103 allows no such repeat.
+ * T600x (@tm_retention), whose recovery also drains and re-arms the tm/tq
+ * file, allows up to ANE_TM_RECOVERIES_MAX in a row, so back-to-back bad
+ * programs do not cost a reboot. Every other failure is worth a recovery.
+ */
+static inline bool ane_tm_failure_recoverable(bool tm_retention,
+					      unsigned int unproven, int err,
+					      u32 finished)
+{
+	if (err != -ETIMEDOUT || finished)
+		return true;
+	if (tm_retention)
+		return unproven < ANE_TM_RECOVERIES_MAX;
+	return !unproven;
+}
+
 #if IS_ENABLED(CONFIG_KUNIT)
 int ane_submit_check_sizes(const struct drm_ane_submit *args, size_t cmd_size,
 			   size_t btsp_size);
@@ -158,6 +226,12 @@ int ane_submit_check_sizes(const struct drm_ane_submit *args, size_t cmd_size,
  * recovery power cycle, or at driver remove. Callers hold engine_lock.
  */
 void ane_reclaim_preserved(struct ane_device *ane);
+
+int ane_perf_init(struct ane_device *ane, unsigned int high_level);
+int ane_perf_exit(struct ane_device *ane);
+int ane_perf_begin(struct ane_device *ane);
+void ane_perf_end(struct ane_device *ane);
+int ane_perf_suspend(struct ane_device *ane);
 
 int ane_boost_init(struct ane_device *ane);
 void ane_boost_exit(struct ane_device *ane);

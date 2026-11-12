@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config VIDEO_APPLE_PRORES
+	tristate "Apple Silicon ProRes encoder"
+	depends on VIDEO_DEV
+	depends on ARCH_APPLE || (COMPILE_TEST && 64BIT)
+	depends on OF && IOMMU_API && PM
+	select V4L2_MEM2MEM_DEV
+	select VIDEOBUF2_DMA_CONTIG
+	help
+	  V4L2 memory-to-memory driver for the ProRes encoder engine (APR)
+	  in Apple M1 Pro (T6000), M4 Pro (T6041), M5 Pro/Max (T6050) and
+	  A18 Pro (T8140) SoCs. On T6041 and T6050 a per-machine
+	  apple/prores-t6041-init.bin or apple/prores-t6050-init.bin takes
+	  the place of any built-in initialization rows; neither has
+	  built-in rows yet, so each needs its file to bind. It encodes 8
+	  and 16 bit 4:2:2 and 4:4:4 frames to ProRes 422 Proxy, LT, 422, HQ,
+	  4444 and 4444 XQ.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called apple-prores.
+
+config VIDEO_APPLE_PRORES_KUNIT_TEST
+	tristate "KUnit tests for the Apple ProRes encoder" if !KUNIT_ALL_TESTS
+	depends on KUNIT && VIDEO_APPLE_PRORES
+	default KUNIT_ALL_TESTS
+	help
+	  Check the APRI firmware parser, quantisation tables, DC scale table,
+	  and job descriptors. APRI fixtures are wholly synthetic and contain
+	  no vendor initialization values. The parser cases cover the complete
+	  container shape and every row constraint. No hardware is needed.

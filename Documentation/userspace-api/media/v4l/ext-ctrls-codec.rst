@@ -2679,3 +2679,33 @@ enum v4l2_mpeg_video_hevc_size_of_length_field -
     Indicates whether to generate SPS and PPS at every IDR. Setting it to 0
     disables generating SPS and PPS at every IDR. Setting it to one enables
     generating SPS and PPS at every IDR.
+
+ProRes Encoder Control
+======================
+
+``V4L2_CID_MPEG_VIDEO_PRORES_PROFILE`` (enum)
+    Selects the ProRes encoder profile. The menu indices are:
+
+    * ``V4L2_MPEG_VIDEO_PRORES_PROFILE_PROXY`` (0): 422 Proxy, tag 'apco'.
+    * ``V4L2_MPEG_VIDEO_PRORES_PROFILE_LT`` (1): 422 LT, tag 'apcs'.
+    * ``V4L2_MPEG_VIDEO_PRORES_PROFILE_STANDARD`` (2): 422, tag 'apcn'.
+    * ``V4L2_MPEG_VIDEO_PRORES_PROFILE_HQ`` (3): 422 HQ, tag 'apch'.
+    * ``V4L2_MPEG_VIDEO_PRORES_PROFILE_4444`` (4): 4444, tag 'ap4h'.
+    * ``V4L2_MPEG_VIDEO_PRORES_PROFILE_4444_XQ`` (5): 4444 XQ, tag 'ap4x'.
+
+    Drivers expose only supported menu entries and a supported default.
+    Clients must query both. Profiles 0 through 3 select the 4:2:2 family;
+    profiles 4 and 5 select the 4:4:4 family, which can optionally carry
+    alpha. Selecting a profile does not imply alpha support, an exact
+    bitrate, lossless color, or 16-bit coded color precision.
+
+    The control is inactive outside ProRes and is grabbed while either queue
+    owns allocated buffers. Changes while grabbed return ``EBUSY``. The
+    implementing driver marks this control as modifying layout. After a
+    profile change before allocation, clients re-enumerate raw formats and
+    negotiate and read back both queue formats, including ``sizeimage``.
+    Incompatible raw/profile configurations fail at stream start with
+    ``EINVAL``; the selected profile must not be silently changed.
+
+    This is an encoder control. The exact quality profile must not be
+    inferred for decoders from chroma subsampling or quantization matrices.

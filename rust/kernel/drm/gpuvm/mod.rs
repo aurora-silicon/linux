@@ -335,11 +335,14 @@ impl<T: DriverGpuVm> GpuVm<T> {
         let mut vm_exec = KBox::init(
             init!(bindings::drm_gpuvm_exec {
                 vm: self.as_raw(),
-                flags: if interruptible {
-                    bindings::DRM_EXEC_INTERRUPTIBLE_WAIT
-                } else {
-                    0
-                },
+                // Two GEM objects can share one reservation (a dma-buf imported again while
+                // the closed object still has mappings); lock it once, as C drm_exec users do.
+                flags: bindings::DRM_EXEC_IGNORE_DUPLICATES
+                    | if interruptible {
+                        bindings::DRM_EXEC_INTERRUPTIBLE_WAIT
+                    } else {
+                        0
+                    },
                 exec: Default::default(),
                 extra: match (is_ext, obj) {
                     (true, Some(obj)) => bindings::drm_gpuvm_exec__bindgen_ty_1 {
@@ -761,24 +764,38 @@ impl<T: DriverGpuVm> GpuVmInnerGuard<'_, T> {
     /// node or operation list is allocated. Call [`GpuVm::deferred_cleanup`] after releasing this
     /// guard, including when a callback failed after earlier mappings were removed.
     pub fn unmap_all(&mut self, unmap: impl FnMut(&mut T, &GpuVa<T>) -> Result) -> Result {
-        self.unmap_matching(None, unmap)
+        self.unmap_matching(None, |_| true, unmap)
     }
 
     /// Allocation-free whole-node removal for one GEM object in an immediate-mode VM.
     ///
     /// Uses the same translation-removal and deferred-put contract as [`Self::unmap_all`]. This
-    /// scans the VM list and is intended as a low-memory cleanup fallback.
+    /// scans the VM list and can be used when the per-object operation list is unavailable.
     pub fn unmap_object(
         &mut self,
         object: &T::Object,
         unmap: impl FnMut(&mut T, &GpuVa<T>) -> Result,
     ) -> Result {
-        self.unmap_matching(Some(object), unmap)
+        self.unmap_object_where(object, |_| true, unmap)
+    }
+
+    /// Remove only mappings of an object selected by `matches`, without allocating.
+    ///
+    /// This scans the whole VM and uses the same translation-removal and deferred-put contract as
+    /// [`Self::unmap_all`]. If a callback fails, mappings already visited remain removed.
+    pub fn unmap_object_where(
+        &mut self,
+        object: &T::Object,
+        matches: impl FnMut(&GpuVa<T>) -> bool,
+        unmap: impl FnMut(&mut T, &GpuVa<T>) -> Result,
+    ) -> Result {
+        self.unmap_matching(Some(object), matches, unmap)
     }
 
     fn unmap_matching(
         &mut self,
         object: Option<&T::Object>,
+        mut matches: impl FnMut(&GpuVa<T>) -> bool,
         mut unmap: impl FnMut(&mut T, &GpuVa<T>) -> Result,
     ) -> Result {
         let vm = self.gpuvm.as_raw();
@@ -802,7 +819,11 @@ impl<T: DriverGpuVm> GpuVmInnerGuard<'_, T> {
                 if object.is_some_and(|object| (*va).gem.obj != object.as_raw()) {
                     continue;
                 }
-                unmap(&mut *self.gpuvm.data.get(), GpuVa::<T>::from_raw(va))?;
+                let typed_va = GpuVa::<T>::from_raw(va);
+                if !matches(typed_va) {
+                    continue;
+                }
+                unmap(&mut *self.gpuvm.data.get(), typed_va)?;
                 // Remove it as `OpUnmap::remove()` does.
                 let op = bindings::drm_gpuva_op_unmap { va, keep: false };
                 bindings::drm_gpuva_unmap(&op);

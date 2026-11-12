@@ -33,6 +33,43 @@ const struct apple_dpin_policy apple_dpin_m3 = {
 	.host_policy = TB_HOST_DP_NOTIFY,
 };
 
+/*
+ * M4 (T8132): the M3 flow. The DP IN handshake is the t8103 one, which
+ * writes only DPTX_INACTIVE (+0x0c bit 0) and polls its ACK (+0x10 bit 0),
+ * gated on HPD. The DP IN interrupts are not set up (nothing handles them),
+ * and a tunnel that DCP never activated is torn down without touching the
+ * block at all. Both DP IN streams of an ATC PHY need one link rate: a
+ * tunnel alone gets up to HBR3, two get HBR2 (TB_HOST_DP_SHARED_RATE).
+ */
+const struct apple_dpin_policy apple_dpin_m4 = {
+	.flow = APPLE_DPIN_CHANGED,
+	.capacity_retry = true,
+	.defer_new_bringup = true,
+	.host_policy = TB_HOST_DP_NOTIFY | TB_HOST_DP_SHARED_RATE,
+	.lazy_idle = true,
+};
+
+/*
+ * T6050: the M3 flow (tunnel changed notifications, with the 10 ms HPD
+ * Output Set pulse and HPD wait before them; capacity retry, deferred
+ * bringup). Once a tunnel uses a DP IN block, its pending events are
+ * acknowledged (+0x04 written back, and +0x00 after a plug event) and its
+ * two events enabled (+0x08), as the block is prepared for a display. The
+ * DP IN handshake writes only DPTX_INACTIVE (+0x0c bit 0) and polls its ACK
+ * (+0x10 bit 0), gated on HPD. A tunnel whose DP IN block DCP never
+ * activated is torn down without the inactive handshake. A DPRX that is not
+ * done in time keeps the tunnel: the display may still train.
+ */
+const struct apple_dpin_policy apple_dpin_m5 = {
+	.flow = APPLE_DPIN_CHANGED,
+	.settle_ms = 100,
+	.capacity_retry = true,
+	.setup_irqs = true,
+	.defer_new_bringup = true,
+	.host_policy = TB_HOST_DP_NOTIFY | TB_HOST_DP_KEEP_DPRX_TIMEOUT,
+	.lazy_idle = true,
+};
+
 enum apple_dpin_flow apple_dpin_hooks(const struct apple_dpin_policy *policy,
 				      bool queue_present, bool display_enabled)
 {

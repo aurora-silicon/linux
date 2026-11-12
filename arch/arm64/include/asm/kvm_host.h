@@ -499,6 +499,10 @@ enum vcpu_sysreg {
 	TFSRE0_EL1,	/* Tag Fault Status Register (EL0) */
 
 	POR_EL0,	/* Permission Overlay Register 0 (EL0) */
+	APPLE_ASPSR_EL1, /* Apple saved x86 parity/adjust flags (APFLG) */
+	APPLE_ASPSR_EL2, /* The same flags as of the guest's last exit */
+	APPLE_AFPCR_EL0, /* Apple x86 FP mode control (AFP: DAZ, FTZ) */
+	APPLE_AMX_CTL_EL1, /* Apple AMX enable for the guest's EL1/EL0 */
 
 	/* FP/SIMD/SVE */
 	SVCR,
@@ -844,7 +848,12 @@ struct vcpu_reset_state {
 
 struct vncr_tlb;
 
+struct apple_amx_state;
+
 struct kvm_vcpu_arch {
+	/* Apple AMX register file, allocated once the guest enables AMX */
+	struct apple_amx_state *apple_amx;
+
 	struct kvm_cpu_context ctxt;
 
 	/*

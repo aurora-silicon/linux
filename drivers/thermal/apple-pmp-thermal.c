@@ -27,6 +27,7 @@
 #include <linux/soc/apple/pmp-telemetry.h>
 #include <linux/soc/apple/pmp-cooling.h>
 #include <linux/soc/apple/pmp-power-policy.h>
+#include <linux/soc/apple/t8132.h>
 #include <linux/thermal.h>
 #include <linux/workqueue.h>
 
@@ -174,10 +175,11 @@ static void apple_pmp_power_work(struct work_struct *work)
 	u64 epoch = apple_pmp_gpu_epoch(pmp_thermal.sensors);
 	u64 now;
 	int ret = apple_pmp_power_read_rails(mw);
-	/* The running CPUs/reader cannot plausibly consume <0.1 W in total.
-	 * A firmware reset/all-zero image must not refill the energy bucket.
+	/* The running reader cannot read zero on both CPU rails. A firmware
+	 * reset/all-zero image must not refill the energy bucket; an idle
+	 * system may still draw well under 0.1 W on all three rails.
 	 */
-	if (!ret && mw[0] + mw[1] + mw[2] < 100)
+	if (!ret && !mw[0] && !mw[1])
 		ret = -ENODATA;
 	/* Clock under the lock: a raw sample published while the SMC reads ran
 	 * must not make the unsigned age below wrap into a false -EAGAIN.
@@ -738,8 +740,8 @@ static int apple_pmp_thermal_probe(struct platform_device *pdev)
 {
 	const struct apple_pmp_sensor_data *sensors = dev_get_platdata(&pdev->dev);
 
-	/* Only this board's sensor topology and operating policy are qualified. */
-	if (!of_machine_is_compatible("apple,j713"))
+	/* The M4 PMP sensor records and the Airs' fanless policy are qualified. */
+	if (!apple_t8132_firmware_path())
 		return -ENODEV;
 	if (!sensors || !sensors->read || !sensors->dev)
 		return -EINVAL;

@@ -96,7 +96,7 @@ static int apple_pmp_report_bit(struct apple_pmp_start *st,
 static struct apple_pmp_start managed_start;
 static int ready_result, start_calls;
 #define msecs_to_jiffies(n) (n)
-#define system_unbound_wq NULL
+#define system_dfl_wq NULL
 static bool wait_for_completion_timeout(struct completion *c,
 					unsigned long timeout)
 {
@@ -126,10 +126,14 @@ static bool passive_present, passive_lockable, passive_data;
 static const char *machine;
 static const void *pmp_data;
 static struct device *pmp_device;
+/* Set only while the PMP is stopped for a system sleep, which this test never does. */
+static bool pmp_asleep;
 static int pmp_lock, ready_calls, add_calls, add_result;
 static int poll_calls, device_locked, power_calls, power_result, link_calls;
 static int find_calls, lockable, present_device, link_ok;
 static int case_count;
+/* The report transaction itself is covered by the G15 PMP-vote selftest. */
+static int gfx_check_result, gfx_check_calls, gfx_set_calls;
 
 static struct device_node *of_node_get(struct device_node *node)
 {
@@ -156,6 +160,17 @@ static bool of_device_is_available(const struct device_node *node)
 static bool of_machine_is_compatible(const char *name)
 {
 	return !strcmp(machine, name);
+}
+/* As in <linux/soc/apple/t8132.h>. */
+static inline bool apple_t8132_air(void)
+{
+	return of_machine_is_compatible("apple,j713") ||
+	       of_machine_is_compatible("apple,j715");
+}
+/* The qualified-firmware term: these harnesses model no /chosen. */
+static inline bool apple_t8132_firmware_path(void)
+{
+	return apple_t8132_air();
 }
 static struct device_node *of_find_compatible_node(struct device_node *from,
 						   const char *type,
@@ -375,6 +390,19 @@ static void queue_work(void *wq, int *work)
 	managed_start.result = ready_result;
 	managed_start.started.done = true;
 }
+static int apple_pmp_report_check_t6030_gfx(struct device *dev)
+{
+	assert(dev == pmp_device && pmp_lock == 1);
+	gfx_check_calls++;
+	return gfx_check_result;
+}
+static int apple_pmp_report_set_t6030_gfx(struct device *dev, bool enabled)
+{
+	assert(dev == pmp_device && pmp_lock == 1);
+	(void)enabled;
+	gfx_set_calls++;
+	return 0;
+}
 #include "t6030-pmp-production.h"
 
 static void balanced(void)
@@ -457,6 +485,7 @@ static void reset(void)
 	pmp_data = (void *)1;
 	ready_calls = add_calls = add_result = poll_calls = 0;
 	power_calls = power_result = link_calls = find_calls = 0;
+	gfx_check_result = gfx_check_calls = gfx_set_calls = 0;
 	lockable = present_device = link_ok = 1;
 	status_word = PMP_REPORT_READY;
 }
@@ -498,6 +527,9 @@ int main(void)
 	balanced();
 	case_count++;
 	RUN((void)0, 0, 0, 1);
+	assert(gfx_check_calls == 1 && gfx_set_calls == 0);
+	RUN(gfx_check_result = -EINVAL, -EINVAL, 0, 0);
+	assert(gfx_check_calls == 1 && gfx_set_calls == 0);
 	RUN(report14.child = &entry7; entry7.sibling = &entry17;
 	    entry17.sibling = NULL, 0, 0, 1);
 	RUN(apple_pmp_starts.first = NULL, -ENODEV, 0, 0);

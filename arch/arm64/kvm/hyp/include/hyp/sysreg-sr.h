@@ -16,6 +16,8 @@
 #include <asm/kvm_hyp.h>
 #include <asm/kvm_mmu.h>
 
+#include <asm/apple_cpufeature.h>
+
 #define SYS_IMP_APL_ACTLR_EL12		sys_reg(3, 6, 15, 14, 6)
 #define SYS_ACTLR_EL12			sys_reg(3, 5, 1, 0, 1)
 
@@ -66,10 +68,21 @@ static inline void __sysreg_save_common_state(struct kvm_cpu_context *ctxt)
 		ctxt_sys_reg(ctxt, POR_EL0)	= read_sysreg_s(SYS_POR_EL0);
 }
 
+static inline bool ctxt_has_apple_afp(void)
+{
+	return IS_ENABLED(CONFIG_ARM64_APPLE_X86_FP) &&
+		alternative_has_cap_unlikely(ARM64_HAS_AFP_APPLE);
+}
+
 static inline void __sysreg_save_user_state(struct kvm_cpu_context *ctxt)
 {
 	ctxt_sys_reg(ctxt, TPIDR_EL0)	= read_sysreg(tpidr_el0);
 	ctxt_sys_reg(ctxt, TPIDRRO_EL0)	= read_sysreg(tpidrro_el0);
+
+	/* One AFPCR_EL0 serves host EL0, guest EL1 and guest EL0 */
+	if (ctxt_has_apple_afp())
+		ctxt_sys_reg(ctxt, APPLE_AFPCR_EL0) =
+			read_sysreg_s(SYS_IMP_APL_AFPCR_EL0);
 }
 
 static inline bool ctxt_has_mte(struct kvm_cpu_context *ctxt)
@@ -176,6 +189,13 @@ static inline void __sysreg_save_el1_state(struct kvm_cpu_context *ctxt)
 	if (ctxt_has_sctlr2(ctxt))
 		ctxt_sys_reg(ctxt, SCTLR2_EL1) = read_sysreg_el1(SYS_SCTLR2);
 
+	/* The CPU saves a guest's x86 parity/adjust flags here on exceptions */
+	if (IS_ENABLED(CONFIG_ARM64_APPLE_X86_FLAGS) &&
+	    alternative_has_cap_unlikely(ARM64_HAS_APFLG_APPLE))
+		ctxt_sys_reg(ctxt, APPLE_ASPSR_EL1) = has_vhe() ?
+			read_sysreg_s(SYS_IMP_APL_ASPSR_EL12) :
+			read_sysreg_s(SYS_IMP_APL_ASPSR_EL1);
+
 	if (IS_ENABLED(CONFIG_ARM64_ACTLR_STATE)) {
 		if (alternative_has_cap_unlikely(ARM64_HAS_ACTLR_VIRT))
 			ctxt_sys_reg(ctxt, ACTLR_EL1)	= read_sysreg_s(SYS_ACTLR_EL12);
@@ -188,9 +208,25 @@ static inline void __sysreg_save_el1_state(struct kvm_cpu_context *ctxt)
 		ctxt_sys_reg(ctxt, NVHCR_EL2) = read_sysreg_s(SYS_NVHCR_EL2);
 }
 
+static inline bool ctxt_has_apple_apflg(struct kvm_cpu_context *ctxt)
+{
+	return IS_ENABLED(CONFIG_ARM64_APPLE_X86_FLAGS) &&
+		!ctxt->__hyp_running_vcpu &&
+		alternative_has_cap_unlikely(ARM64_HAS_APFLG_APPLE);
+}
+
 static inline void __sysreg_save_el2_return_state(struct kvm_cpu_context *ctxt)
 {
 	ctxt->regs.pc			= read_sysreg_el2(SYS_ELR);
+
+	/*
+	 * An exit to EL2 saves the guest's x86 parity/adjust flags in
+	 * ASPSR_EL2, which the host's own exceptions overwrite before the
+	 * ERET back into the guest restores them from it.
+	 */
+	if (ctxt_has_apple_apflg(ctxt))
+		ctxt_sys_reg(ctxt, APPLE_ASPSR_EL2) =
+			read_sysreg_s(SYS_IMP_APL_ASPSR_EL2);
 	/*
 	 * Guest PSTATE gets saved at guest fixup time in all
 	 * cases. We still need to handle the nVHE host side here.
@@ -220,6 +256,10 @@ static inline void __sysreg_restore_user_state(struct kvm_cpu_context *ctxt)
 {
 	write_sysreg(ctxt_sys_reg(ctxt, TPIDR_EL0),	tpidr_el0);
 	write_sysreg(ctxt_sys_reg(ctxt, TPIDRRO_EL0),	tpidrro_el0);
+
+	if (ctxt_has_apple_afp())
+		write_sysreg_s(ctxt_sys_reg(ctxt, APPLE_AFPCR_EL0),
+			       SYS_IMP_APL_AFPCR_EL0);
 }
 
 static inline void __sysreg_restore_el1_state(struct kvm_cpu_context *ctxt,
@@ -307,6 +347,16 @@ static inline void __sysreg_restore_el1_state(struct kvm_cpu_context *ctxt,
 	if (ctxt_has_sctlr2(ctxt))
 		write_sysreg_el1(ctxt_sys_reg(ctxt, SCTLR2_EL1), SYS_SCTLR2);
 
+	if (IS_ENABLED(CONFIG_ARM64_APPLE_X86_FLAGS) &&
+	    alternative_has_cap_unlikely(ARM64_HAS_APFLG_APPLE)) {
+		if (has_vhe())
+			write_sysreg_s(ctxt_sys_reg(ctxt, APPLE_ASPSR_EL1),
+				       SYS_IMP_APL_ASPSR_EL12);
+		else
+			write_sysreg_s(ctxt_sys_reg(ctxt, APPLE_ASPSR_EL1),
+				       SYS_IMP_APL_ASPSR_EL1);
+	}
+
 	/*
 	 * Publish the L2 view of HCR_EL2 to the HW if L1 is using NV3.
 	 * Otherwise, the data is already in place in the L1's own VNCR.
@@ -354,6 +404,10 @@ static inline void __sysreg_restore_el2_return_state(struct kvm_cpu_context *ctx
 
 	write_sysreg_el2(ctxt->regs.pc,			SYS_ELR);
 	write_sysreg_el2(pstate,			SYS_SPSR);
+
+	if (ctxt_has_apple_apflg(ctxt))
+		write_sysreg_s(ctxt_sys_reg(ctxt, APPLE_ASPSR_EL2),
+			       SYS_IMP_APL_ASPSR_EL2);
 
 	if (!cpus_have_final_cap(ARM64_HAS_RAS_EXTN))
 		return;

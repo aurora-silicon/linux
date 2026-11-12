@@ -1,0 +1,1605 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Device name, address and DT path only; - means no usable reg address.
+/exbrightpil - -> MISSING
+/cpus - -> /cpus
+/cpus/cpu0 /cpus@0x0 -> /cpus/cpu@40000
+/cpus/cpu1 /cpus@0x1 -> /cpus/cpu@40001
+/cpus/cpu2 /cpus@0x2 -> /cpus/cpu@40002
+/cpus/cpu3 /cpus@0x3 -> /cpus/cpu@40003
+/cpus/cpu4 /cpus@0x4 -> /cpus/cpu@40004
+/cpus/cpu5 /cpus@0x5 -> /cpus/cpu@40005
+/cpus/cpu6 /cpus@0x100 -> /cpus/cpu@40100
+/cpus/cpu7 /cpus@0x101 -> /cpus/cpu@40101
+/cpus/cpu8 /cpus@0x102 -> /cpus/cpu@40102
+/cpus/cpu9 /cpus@0x103 -> /cpus/cpu@40103
+/cpus/cpu10 /cpus@0x104 -> /cpus/cpu@40104
+/cpus/cpu11 /cpus@0x105 -> /cpus/cpu@40105
+/cpus/cpu12 /cpus@0x200 -> /cpus/cpu@10200
+/cpus/cpu13 /cpus@0x201 -> /cpus/cpu@10201
+/cpus/cpu14 /cpus@0x202 -> /cpus/cpu@10202
+/cpus/cpu15 /cpus@0x203 -> /cpus/cpu@10203
+/cpus/cpu16 /cpus@0x204 -> /cpus/cpu@10204
+/cpus/cpu17 /cpus@0x205 -> /cpus/cpu@10205
+/cpus/cpu18 /cpus@0x1000 -> MISSING
+/cpus/cpu19 /cpus@0x1001 -> MISSING
+/cpus/cpu20 /cpus@0x1002 -> MISSING
+/cpus/cpu21 /cpus@0x1003 -> MISSING
+/cpus/cpu22 /cpus@0x1004 -> MISSING
+/cpus/cpu23 /cpus@0x1005 -> MISSING
+/cpus/cpu24 /cpus@0x1100 -> MISSING
+/cpus/cpu25 /cpus@0x1101 -> MISSING
+/cpus/cpu26 /cpus@0x1102 -> MISSING
+/cpus/cpu27 /cpus@0x1103 -> MISSING
+/cpus/cpu28 /cpus@0x1104 -> MISSING
+/cpus/cpu29 /cpus@0x1105 -> MISSING
+/cpus/cpu30 /cpus@0x1200 -> MISSING
+/cpus/cpu31 /cpus@0x1201 -> MISSING
+/cpus/cpu32 /cpus@0x1202 -> MISSING
+/cpus/cpu33 /cpus@0x1203 -> MISSING
+/cpus/cpu34 /cpus@0x1204 -> MISSING
+/cpus/cpu35 /cpus@0x1205 -> MISSING
+/hib-exclave-watchdog 0x2c836c000 -> MISSING
+/arm-io 0x210f00000 -> WAIVED: ADT SoC bus container; child hardware is inventoried separately.
+/arm-io/dynamic-pil - -> MISSING
+/arm-io/dynamic-pil/cil - -> MISSING
+/arm-io/dynamic-pil/mil - -> MISSING
+/arm-io/i2c5 0x505024000 -> /soc/i2c@505024000
+/arm-io/i2c5/mogul-las /arm-io/i2c5@0x10 -> MISSING
+/arm-io/i2c7 0x50502c000 -> /soc/i2c@50502c000
+/arm-io/i2c7/disp-bklt /arm-io/i2c7@0x44 -> MISSING
+/arm-io/displaymanager - -> /soc/dcp@48ae00000
+/arm-io/i2c0 0x505010000 -> /soc/i2c@505010000
+/arm-io/i2c0/sync-hub-config /arm-io/i2c0@0x20 -> MISSING
+/arm-io/i2c0/sync-hub-prog /arm-io/i2c0@0x40 -> MISSING
+/arm-io/i2c1 0x505014000 -> /soc@200000000/i2c@505014000
+/arm-io/i2c1/audio-speaker /arm-io/i2c1@0x38 -> MISSING
+/arm-io/i2c1/audio-speaker-left-woofer-2 /arm-io/i2c1@0x39 -> MISSING
+/arm-io/i2c1/audio-speaker-left-tweeter /arm-io/i2c1@0x3a -> MISSING
+/arm-io/i2c2 0x505018000 -> /soc@200000000/i2c@505018000
+/arm-io/i2c2/audio-codec-output /arm-io/i2c2@0x4b -> MISSING
+/arm-io/i2c3 0x50501c000 -> /soc/i2c@50501c000
+/arm-io/i2c3/audio-speaker-right-woofer-1 /arm-io/i2c3@0x3b -> MISSING
+/arm-io/i2c3/audio-speaker-right-woofer-2 /arm-io/i2c3@0x3c -> MISSING
+/arm-io/i2c3/audio-speaker-right-tweeter /arm-io/i2c3@0x3d -> MISSING
+/arm-io/iop-voicetrigger-controller - -> MISSING
+/arm-io/iop-voicetrigger-controller/audio-vt-device - -> MISSING
+/arm-io/i2c4 0x505020000 -> /soc/i2c@505020000
+/arm-io/i2c4/sd-card /arm-io/i2c4@0x20 -> MISSING
+/arm-io/i2c6 0x505028000 -> /soc/i2c@505028000
+/arm-io/i2c6/uatcrt0 /arm-io/i2c6@0x18 -> MISSING
+/arm-io/i2c6/uatcrt1 /arm-io/i2c6@0x19 -> MISSING
+/arm-io/i2c6/uatcrt2 /arm-io/i2c6@0x1a -> MISSING
+/arm-io/i2c8 0x505030000 -> /soc/i2c@505030000
+/arm-io/i2c8/pcon0 /arm-io/i2c8@0x8 -> MISSING
+/arm-io/spi2 0x505108000 -> /soc/spi@505108000
+/arm-io/spi2/mesa /arm-io/spi2@0x0 -> MISSING
+/arm-io/spi4 0x505110000 -> /soc/spi@505110000
+/arm-io/spi4/dp855 /arm-io/spi4@0x0 -> MISSING
+/arm-io/spi4/dp855/lcd-pmicwp /arm-io/spi4/dp855@0x4f -> MISSING
+/arm-io/spi4/dp855/lcd-pmic /arm-io/spi4/dp855@0x74 -> MISSING
+/arm-io/spi4/dp855/lcd-sswp /arm-io/spi4/dp855@0x71 -> MISSING
+/arm-io/spi4/dp855/lcd-ss /arm-io/spi4/dp855@0x40 -> MISSING
+/arm-io/spi4/dp855/tcon-registers /arm-io/spi4/dp855@0x0 -> MISSING
+/arm-io/spi4/dp855/lcd-eeprom /arm-io/spi4/dp855@0x0 -> MISSING
+/arm-io/spi4/display-temp-sens1 /arm-io/spi4@0x70 -> MISSING
+/arm-io/spi4/display-temp-sens2 /arm-io/spi4@0x71 -> MISSING
+/arm-io/spi4/display-temp-sens3 /arm-io/spi4@0x72 -> MISSING
+/arm-io/nub-spmi-a1 0x28a1a8000 -> /soc@200000000/spmi@28a1a8000
+/arm-io/nub-spmi-a1/hpm2 /arm-io/nub-spmi-a1@0xc -> /soc@200000000/spmi@28a1a8000/usb-pd@c
+/arm-io/isp0 0x580000000 -> /soc/isp@580000000
+/arm-io/isp0/:sotra_h17c_0 - -> MISSING
+/arm-io/isp0/:sotra_h17d_0 - -> MISSING
+/arm-io/isp0/:sotra_h17s_0 - -> MISSING
+/arm-io/isp0/:sotra_h17cr1_0 - -> MISSING
+/arm-io/isp0/:sotra_h17cr2_0 - -> MISSING
+/arm-io/dart-isp0 0x5828c0000 -> /soc/iommu@5828c0000
+/arm-io/dart-isp0/:sotra_h17c_45 - -> MISSING
+/arm-io/dart-isp0/:sotra_h17s_33 - -> MISSING
+/arm-io/dart-isp0/:sotra_h17d_94 - -> MISSING
+/arm-io/dart-isp0/:sotra_h17cr1_40 - -> MISSING
+/arm-io/dart-isp0/:sotra_h17c_46 - -> MISSING
+/arm-io/dart-isp0/:sotra_h17d_95 - -> MISSING
+/arm-io/dart-isp0/:sotra_h17cr1_41 - -> MISSING
+/arm-io/dart-isp0/:sotra_h17cr2_40 - -> MISSING
+/arm-io/dart-isp0/:sotra_h17c_47 - -> MISSING
+/arm-io/dart-isp0/:sotra_h17d_96 - -> MISSING
+/arm-io/dart-isp0/:sotra_h17cr2_41 - -> MISSING
+/arm-io/dart-isp0/mapper-isp0 - -> /soc/iommu@5828c0000
+/arm-io/dart-isp0/mapper-isp-mpm - -> /soc/iommu@5828c0000
+/arm-io/dart-isp0/mapper-isp-epipe0-exclave - -> /soc/iommu@5828c0000
+/arm-io/dart-isp0/mapper-isp-epipe1-exclave - -> /soc/iommu@5828c0000
+/arm-io/dart-isp0/mapper-isp-piodma0-exclave - -> /soc/iommu@5828c0000
+/arm-io/dart-isp0/mapper-isp-piodma1-exclave - -> /soc/iommu@5828c0000
+/arm-io/isp-exclave-proxy - -> MISSING
+/arm-io/pwm0 0x505040000 -> /soc@200000000/pwm@505040000
+/arm-io/pwm0/kbd-backlight - -> /led-controller
+/arm-io/apcie0 0x1cb0000000 -> /pcie@1cb0000000
+/arm-io/apcie0/pci-bridge0 - -> /pcie@1cb0000000/pci@0,0
+/arm-io/apcie0/pci-bridge0/centauri-control - -> MISSING
+/arm-io/apcie0/pci-bridge0/centauri-alpha - -> MISSING
+/arm-io/apcie0/pci-bridge0/centauri-beta - -> MISSING
+/arm-io/apcie0/pci-bridge1 - -> WAIVED: PCI root-port topology; PCIe controller hardware is inventoried separately.
+/arm-io/apcie0/pci-bridge1/pcie-sdreader - -> MISSING
+/arm-io/dart-apcie0 0x410000000 -> /soc@200000000/iommu@410000000
+/arm-io/dart-apcie0/mapper-apcie0-control - -> /soc@200000000/iommu@410000000
+/arm-io/dart-apcie0/mapper-apcie0-alpha - -> /soc@200000000/iommu@410000000
+/arm-io/dart-apcie0/mapper-apcie0-beta - -> /soc@200000000/iommu@410000000
+/arm-io/dart-apcie0/mapper-apcie0-piodma - -> /soc@200000000/iommu@410000000
+/arm-io/apcie0-piodma 0x410030000 -> /soc/dma-controller@410030000
+/arm-io/dart-apcie1 0x411000000 -> /soc/iommu@411000000
+/arm-io/dart-apcie1/mapper-apcie1 - -> /soc/iommu@411000000
+/arm-io/dart-apcie1/mapper-apcie1-piodma - -> /soc/iommu@411000000
+/arm-io/apcie1-piodma 0x411030000 -> /soc/dma-controller@411030000
+/arm-io/acio-phy-cpu0 0x2a3148000 -> /soc/phy-coproc@2a3148000
+/arm-io/acio-phy-cpu0/iop-aciophy0-nub - -> /soc/phy-coproc@2a3148000
+/arm-io/acio-phy-cpu1 0x2ab148000 -> /soc@200000000/mailbox@2ab148000
+/arm-io/acio-phy-cpu1/iop-aciophy1-nub - -> /soc@200000000/mailbox@2ab148000
+/arm-io/acio-phy-cpu2 0x383148000 -> /soc@200000000/mailbox@383148000
+/arm-io/acio-phy-cpu2/iop-aciophy2-nub - -> /soc@200000000/mailbox@383148000
+/arm-io/acio-phy-cpu3 0x38b148000 -> /soc@200000000/mailbox@38b148000
+/arm-io/acio-phy-cpu3/iop-aciophy3-nub - -> /soc@200000000/mailbox@38b148000
+/arm-io/dockchannel-mtp 0x294b14000 -> /soc@200000000/fifo@294b14000
+/arm-io/dockchannel-mtp/mtp-transport - -> /soc@200000000/fifo@294b14000/input@8000
+/arm-io/dockchannel-mtp/mtp-transport/multi-touch - -> /soc@200000000/fifo@294b14000/input@8000/multi-touch
+/arm-io/dockchannel-mtp/mtp-transport/keyboard - -> /soc@200000000/fifo@294b14000/input@8000/keyboard
+/arm-io/dockchannel-mtp/mtp-transport/stm - -> /soc@200000000/fifo@294b14000/input@8000/stm
+/arm-io/dockchannel-mtp/mtp-transport/actuator - -> /soc@200000000/fifo@294b14000/input@8000/actuator
+/arm-io/dockchannel-mtp/mtp-transport/tp-accel - -> /soc@200000000/fifo@294b14000/input@8000/tp-accel
+/arm-io/mtp 0x294600000 -> /soc@200000000/mtp@294600000
+/arm-io/mtp/iop-mtp-nub - -> /soc@200000000/mtp@294600000
+/arm-io/dart-mtp 0x294800000 -> /soc@200000000/iommu@294800000
+/arm-io/dart-mtp/mapper-mtp - -> /soc@200000000/iommu@294800000
+/arm-io/mtp-aop-mux - -> WAIVED: Firmware transport arbitration policy; MTP and AOP hardware are inventoried separately.
+/arm-io/secure-repair 0x2881e4000 -> /soc/pinctrl@2881e4000
+/arm-io/eic - -> MISSING
+/arm-io/aod2 - -> MISSING
+/arm-io/apciec0 0x1c50000000 -> MISSING
+/arm-io/apciec0/pcic0-bridge - -> WAIVED: PCI root-port topology; PCIe controller hardware is inventoried separately.
+/arm-io/dart-apciec0 0x2a4000000 -> /soc/iommu@2a4000000
+/arm-io/dart-apciec0/mapper-apciec0-piodma - -> /soc/iommu@2a4000000
+/arm-io/apciec0-piodma 0x2a4068000 -> /soc/dma-controller@2a4068000
+/arm-io/acio0 0x2a1f00000 -> MISSING
+/arm-io/dart-acio0 0x2a1a80000 -> MISSING
+/arm-io/dart-acio0/mapper-acio0-tx-0 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio0/mapper-acio0-tx-1 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio0/mapper-acio0-tx-2 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio0/mapper-acio0-tx-3 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio0/mapper-acio0-tx-4 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio0/mapper-acio0-tx-5 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio0/mapper-acio0-tx-6 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio0/mapper-acio0-tx-7 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio0/mapper-acio0-tx-8 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio0/mapper-acio0-tx-9 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio0/mapper-acio0-tx-10 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio0/mapper-acio0-tx-11 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio0/mapper-acio0-rx-0 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio0/mapper-acio0-rx-1 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio0/mapper-acio0-rx-2 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio0/mapper-acio0-rx-3 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio0/mapper-acio0-rx-4 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio0/mapper-acio0-rx-5 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio0/mapper-acio0-rx-6 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio0/mapper-acio0-rx-7 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio0/mapper-acio0-rx-8 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio0/mapper-acio0-rx-9 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio0/mapper-acio0-rx-10 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio0/mapper-acio0-rx-11 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/acio-cpu0 0x2a1108000 -> MISSING
+/arm-io/acio-cpu0/iop-acio0-nub - -> WAIVED: Firmware endpoint container; hosting coprocessor is inventoried separately.
+/arm-io/apciec1 0x1c60000000 -> MISSING
+/arm-io/apciec1/pcic1-bridge - -> WAIVED: PCI root-port topology; PCIe controller hardware is inventoried separately.
+/arm-io/dart-apciec1 0x2ac000000 -> /soc/iommu@2ac000000
+/arm-io/dart-apciec1/mapper-apciec1-piodma - -> /soc/iommu@2ac000000
+/arm-io/apciec1-piodma 0x2ac068000 -> /soc/dma-controller@2ac068000
+/arm-io/acio1 0x2a9f00000 -> MISSING
+/arm-io/dart-acio1 0x2a9a80000 -> MISSING
+/arm-io/dart-acio1/mapper-acio1-tx-0 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio1/mapper-acio1-tx-1 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio1/mapper-acio1-tx-2 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio1/mapper-acio1-tx-3 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio1/mapper-acio1-tx-4 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio1/mapper-acio1-tx-5 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio1/mapper-acio1-tx-6 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio1/mapper-acio1-tx-7 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio1/mapper-acio1-tx-8 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio1/mapper-acio1-tx-9 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio1/mapper-acio1-tx-10 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio1/mapper-acio1-tx-11 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio1/mapper-acio1-rx-0 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio1/mapper-acio1-rx-1 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio1/mapper-acio1-rx-2 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio1/mapper-acio1-rx-3 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio1/mapper-acio1-rx-4 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio1/mapper-acio1-rx-5 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio1/mapper-acio1-rx-6 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio1/mapper-acio1-rx-7 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio1/mapper-acio1-rx-8 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio1/mapper-acio1-rx-9 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio1/mapper-acio1-rx-10 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio1/mapper-acio1-rx-11 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/acio-cpu1 0x2a9108000 -> MISSING
+/arm-io/acio-cpu1/iop-acio1-nub - -> WAIVED: Firmware endpoint container; hosting coprocessor is inventoried separately.
+/arm-io/apciec2 0x1c70000000 -> MISSING
+/arm-io/apciec2/pcic2-bridge - -> WAIVED: PCI root-port topology; PCIe controller hardware is inventoried separately.
+/arm-io/dart-apciec2 0x384000000 -> /soc/iommu@384000000
+/arm-io/dart-apciec2/mapper-apciec2-piodma - -> /soc/iommu@384000000
+/arm-io/apciec2-piodma 0x384068000 -> /soc/dma-controller@384068000
+/arm-io/acio2 0x381f00000 -> MISSING
+/arm-io/dart-acio2 0x381a80000 -> MISSING
+/arm-io/dart-acio2/mapper-acio2-tx-0 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio2/mapper-acio2-tx-1 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio2/mapper-acio2-tx-2 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio2/mapper-acio2-tx-3 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio2/mapper-acio2-tx-4 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio2/mapper-acio2-tx-5 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio2/mapper-acio2-tx-6 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio2/mapper-acio2-tx-7 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio2/mapper-acio2-tx-8 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio2/mapper-acio2-tx-9 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio2/mapper-acio2-tx-10 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio2/mapper-acio2-tx-11 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio2/mapper-acio2-rx-0 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio2/mapper-acio2-rx-1 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio2/mapper-acio2-rx-2 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio2/mapper-acio2-rx-3 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio2/mapper-acio2-rx-4 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio2/mapper-acio2-rx-5 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio2/mapper-acio2-rx-6 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio2/mapper-acio2-rx-7 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio2/mapper-acio2-rx-8 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio2/mapper-acio2-rx-9 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio2/mapper-acio2-rx-10 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-acio2/mapper-acio2-rx-11 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/acio-cpu2 0x381108000 -> MISSING
+/arm-io/acio-cpu2/iop-acio2-nub - -> WAIVED: Firmware endpoint container; hosting coprocessor is inventoried separately.
+/arm-io/bluetooth - -> /pcie@1cb0000000/pci@0,0/bluetooth@0,2
+/arm-io/centauri - -> MISSING
+/arm-io/display-crossbar0 - -> /soc/dcp@48ae00000
+/arm-io/atc0-dpxbar 0x2a324c000 -> /soc/mux@2a324c000
+/arm-io/atc0-dpphy - -> MISSING
+/arm-io/atc0-dpin0 0x2a1e50000 -> /soc/dpin@2a1e50000
+/arm-io/atc0-dpin1 0x2a1e58000 -> /soc/dpin@2a1e58000
+/arm-io/atc0-dpin2 0x2a1e68000 -> /soc/dpin@2a1e68000
+/arm-io/atc0-dpin3 0x2a1e70000 -> /soc/dpin@2a1e70000
+/arm-io/atc1-dpxbar 0x2ab24c000 -> /soc/mux@2ab24c000
+/arm-io/atc1-dpphy - -> /soc@200000000/phy@2ab000000
+/arm-io/atc1-dpin0 0x2a9e50000 -> /soc/dpin@2a9e50000
+/arm-io/atc1-dpin1 0x2a9e58000 -> /soc/dpin@2a9e58000
+/arm-io/atc1-dpin2 0x2a9e68000 -> /soc/dpin@2a9e68000
+/arm-io/atc1-dpin3 0x2a9e70000 -> /soc/dpin@2a9e70000
+/arm-io/atc2-dpxbar 0x38324c000 -> /soc@200000000/mux@38324c000
+/arm-io/atc2-dpphy - -> /soc@200000000/phy@383000000
+/arm-io/atc2-dpin0 0x381e50000 -> /soc/dpin@381e50000
+/arm-io/atc2-dpin1 0x381e58000 -> /soc/dpin@381e58000
+/arm-io/atc2-dpin2 0x381e68000 -> /soc/dpin@381e68000
+/arm-io/atc2-dpin3 0x381e70000 -> /soc/dpin@381e70000
+/arm-io/atc3-dpxbar 0x38b24c000 -> /soc/mux@38b24c000
+/arm-io/atc3-dpphy - -> /soc@200000000/phy@38b000000
+/arm-io/mcc 0x280620000 -> /soc@200000000/reset-controller@280620000
+/arm-io/mcc/:sotra_h17s_2 - -> MISSING
+/arm-io/mcc/:sotra_h17cr1_3 - -> MISSING
+/arm-io/mcc/:sotra_h17cr2_3 - -> MISSING
+/arm-io/mcc/:sotra_h17c_4 - -> MISSING
+/arm-io/mcc/:sotra_h17d_7 - -> MISSING
+/arm-io/mcc/:sotra_h17c_5 - -> MISSING
+/arm-io/mcc/:sotra_h17d_8 - -> MISSING
+/arm-io/mcc/:sotra_h17s_3 - -> MISSING
+/arm-io/mcc/:sotra_h17cr1_4 - -> MISSING
+/arm-io/mcc/:sotra_h17cr2_4 - -> MISSING
+/arm-io/mcc/:sotra_h17s_4 - -> MISSING
+/arm-io/mcc/:sotra_h17cr1_5 - -> MISSING
+/arm-io/mcc/:sotra_h17cr2_5 - -> MISSING
+/arm-io/mcc/:sotra_h17c_6 - -> MISSING
+/arm-io/mcc/:sotra_h17d_9 - -> MISSING
+/arm-io/mcc/:sotra_h17s_5 - -> MISSING
+/arm-io/mcc/:sotra_h17c_7 - -> MISSING
+/arm-io/mcc/:sotra_h17d_10 - -> MISSING
+/arm-io/mcc/:sotra_h17cr1_6 - -> MISSING
+/arm-io/mcc/:sotra_h17cr2_6 - -> MISSING
+/arm-io/aic 0x280400000 -> /soc@200000000/interrupt-controller@280400000
+/arm-io/aic-timebase 0x280580000 -> /soc/aic-timebase@280580000
+/arm-io/wdt 0x28836c000 -> MISSING
+/arm-io/wdt/:sotra_h17d_86 - -> MISSING
+/arm-io/error-handler - -> /soc/error-handler@2220000000
+/arm-io/error-handler/:sotra_h17d_62 - -> MISSING
+/arm-io/error-handler/:sotra_h17s_9 - -> MISSING
+/arm-io/error-handler/:sotra_h17cr1_15 - -> MISSING
+/arm-io/error-handler/:sotra_h17cr2_15 - -> MISSING
+/arm-io/error-handler/:sotra_h17c_19 - -> MISSING
+/arm-io/error-handler/amcc-error-handler - -> MISSING
+/arm-io/error-handler/amcc-error-handler/:sotra_h17s_6 - -> MISSING
+/arm-io/error-handler/amcc-error-handler/:sotra_h17cr1_7 - -> MISSING
+/arm-io/error-handler/amcc-error-handler/:sotra_h17c_8 - -> MISSING
+/arm-io/error-handler/amcc-error-handler/:sotra_h17d_11 - -> MISSING
+/arm-io/error-handler/amcc-error-handler/:sotra_h17cr1_8 - -> MISSING
+/arm-io/error-handler/amcc-error-handler/:sotra_h17cr2_7 - -> MISSING
+/arm-io/error-handler/amcc-error-handler/:sotra_h17c_9 - -> MISSING
+/arm-io/error-handler/amcc-error-handler/:sotra_h17d_12 - -> MISSING
+/arm-io/error-handler/amcc-error-handler/:sotra_h17cr2_8 - -> MISSING
+/arm-io/error-handler/amcc-error-handler/:sotra_h17c_10 - -> MISSING
+/arm-io/error-handler/amcc-error-handler/:sotra_h17d_13 - -> MISSING
+/arm-io/error-handler/amcc-error-handler/:sotra_h17d_14 - -> MISSING
+/arm-io/error-handler/dcs-error-handler - -> MISSING
+/arm-io/error-handler/dcs-error-handler/:sotra_h17s_7 - -> MISSING
+/arm-io/error-handler/dcs-error-handler/:sotra_h17cr1_9 - -> MISSING
+/arm-io/error-handler/dcs-error-handler/:sotra_h17c_11 - -> MISSING
+/arm-io/error-handler/dcs-error-handler/:sotra_h17d_15 - -> MISSING
+/arm-io/error-handler/dcs-error-handler/:sotra_h17cr1_10 - -> MISSING
+/arm-io/error-handler/dcs-error-handler/:sotra_h17cr2_9 - -> MISSING
+/arm-io/error-handler/dcs-error-handler/:sotra_h17c_12 - -> MISSING
+/arm-io/error-handler/dcs-error-handler/:sotra_h17d_16 - -> MISSING
+/arm-io/error-handler/dcs-error-handler/:sotra_h17cr2_10 - -> MISSING
+/arm-io/error-handler/dcs-error-handler/:sotra_h17c_13 - -> MISSING
+/arm-io/error-handler/dcs-error-handler/:sotra_h17d_17 - -> MISSING
+/arm-io/error-handler/dcs-error-handler/:sotra_h17d_18 - -> MISSING
+/arm-io/error-handler/pmgr-error-handler - -> MISSING
+/arm-io/error-handler/pmgr-error-handler/:sotra_h17d_19 - -> MISSING
+/arm-io/error-handler/pmgr-error-handler/:sotra_h17d_20 - -> MISSING
+/arm-io/error-handler/afxni-error-handler - -> MISSING
+/arm-io/error-handler/afxni-error-handler/:sotra_h17cr1_11 - -> MISSING
+/arm-io/error-handler/afxni-error-handler/:sotra_h17cr2_11 - -> MISSING
+/arm-io/error-handler/afxni-error-handler/:sotra_h17c_14 - -> MISSING
+/arm-io/error-handler/afxni-error-handler/:sotra_h17d_24 - -> MISSING
+/arm-io/error-handler/afxni-error-handler/:sotra_h17cr1_12 - -> MISSING
+/arm-io/error-handler/afxni-error-handler/:sotra_h17cr2_12 - -> MISSING
+/arm-io/error-handler/afxni-error-handler/:sotra_h17c_15 - -> MISSING
+/arm-io/error-handler/afxni-error-handler/:sotra_h17d_25 - -> MISSING
+/arm-io/error-handler/afxni-error-handler/:sotra_h17s_8 - -> MISSING
+/arm-io/error-handler/afxni-error-handler/:sotra_h17cr1_13 - -> MISSING
+/arm-io/error-handler/afxni-error-handler/:sotra_h17c_16 - -> MISSING
+/arm-io/error-handler/afxni-error-handler/:sotra_h17d_26 - -> MISSING
+/arm-io/error-handler/afxni-error-handler/:sotra_h17cr1_14 - -> MISSING
+/arm-io/error-handler/afxni-error-handler/:sotra_h17cr2_13 - -> MISSING
+/arm-io/error-handler/afxni-error-handler/:sotra_h17c_17 - -> MISSING
+/arm-io/error-handler/afxni-error-handler/:sotra_h17d_27 - -> MISSING
+/arm-io/error-handler/afxni-error-handler/:sotra_h17cr2_14 - -> MISSING
+/arm-io/error-handler/afxni-error-handler/:sotra_h17c_18 - -> MISSING
+/arm-io/error-handler/afxni-error-handler/:sotra_h17d_28 - -> MISSING
+/arm-io/error-handler/afxni-error-handler/:sotra_h17d_29 - -> MISSING
+/arm-io/error-handler/afxni-error-handler/:sotra_h17d_30 - -> MISSING
+/arm-io/error-handler/afxni-error-handler/:sotra_h17d_31 - -> MISSING
+/arm-io/error-handler/afins0-error-handler - -> MISSING
+/arm-io/error-handler/afins0-error-handler/:sotra_h17d_32 - -> MISSING
+/arm-io/error-handler/afins1-error-handler - -> MISSING
+/arm-io/error-handler/afins1-error-handler/:sotra_h17d_33 - -> MISSING
+/arm-io/error-handler/afins2-error-handler - -> MISSING
+/arm-io/error-handler/afins2-error-handler/:sotra_h17d_34 - -> MISSING
+/arm-io/error-handler/afins3-error-handler - -> MISSING
+/arm-io/error-handler/afins3-error-handler/:sotra_h17d_35 - -> MISSING
+/arm-io/error-handler/afins4-error-handler - -> MISSING
+/arm-io/error-handler/afins4-error-handler/:sotra_h17d_36 - -> MISSING
+/arm-io/error-handler/afins5-error-handler - -> MISSING
+/arm-io/error-handler/afins5-error-handler/:sotra_h17d_37 - -> MISSING
+/arm-io/error-handler/afins6-error-handler - -> MISSING
+/arm-io/error-handler/afins6-error-handler/:sotra_h17d_38 - -> MISSING
+/arm-io/error-handler/afins7-error-handler - -> MISSING
+/arm-io/error-handler/afins7-error-handler/:sotra_h17d_39 - -> MISSING
+/arm-io/error-handler/afins8-error-handler - -> MISSING
+/arm-io/error-handler/afins8-error-handler/:sotra_h17d_40 - -> MISSING
+/arm-io/error-handler/afins9-error-handler - -> MISSING
+/arm-io/error-handler/afins9-error-handler/:sotra_h17d_41 - -> MISSING
+/arm-io/error-handler/afins10-error-handler - -> MISSING
+/arm-io/error-handler/afins10-error-handler/:sotra_h17d_42 - -> MISSING
+/arm-io/error-handler/afins11-error-handler - -> MISSING
+/arm-io/error-handler/afins11-error-handler/:sotra_h17d_43 - -> MISSING
+/arm-io/error-handler/afins12-error-handler - -> MISSING
+/arm-io/error-handler/afins12-error-handler/:sotra_h17d_44 - -> MISSING
+/arm-io/error-handler/afins13-error-handler - -> MISSING
+/arm-io/error-handler/afins13-error-handler/:sotra_h17d_45 - -> MISSING
+/arm-io/error-handler/afins14-error-handler - -> MISSING
+/arm-io/error-handler/afins14-error-handler/:sotra_h17d_46 - -> MISSING
+/arm-io/error-handler/afins15-error-handler - -> MISSING
+/arm-io/error-handler/afins15-error-handler/:sotra_h17d_47 - -> MISSING
+/arm-io/error-handler/afcns0-error-handler - -> MISSING
+/arm-io/error-handler/afcns0-error-handler/:sotra_h17d_48 - -> MISSING
+/arm-io/error-handler/afcns1-error-handler - -> MISSING
+/arm-io/error-handler/afcns1-error-handler/:sotra_h17d_49 - -> MISSING
+/arm-io/error-handler/afcns2-error-handler - -> MISSING
+/arm-io/error-handler/afcns2-error-handler/:sotra_h17d_50 - -> MISSING
+/arm-io/error-handler/afcns3-error-handler - -> MISSING
+/arm-io/error-handler/afcns3-error-handler/:sotra_h17d_51 - -> MISSING
+/arm-io/error-handler/afcns4-error-handler - -> MISSING
+/arm-io/error-handler/afcns4-error-handler/:sotra_h17d_52 - -> MISSING
+/arm-io/error-handler/afcns5-error-handler - -> MISSING
+/arm-io/error-handler/afcns5-error-handler/:sotra_h17d_53 - -> MISSING
+/arm-io/error-handler/afcns6-error-handler - -> MISSING
+/arm-io/error-handler/afcns6-error-handler/:sotra_h17d_54 - -> MISSING
+/arm-io/error-handler/afcns7-error-handler - -> MISSING
+/arm-io/error-handler/afcns7-error-handler/:sotra_h17d_55 - -> MISSING
+/arm-io/error-handler/afcns8-error-handler - -> MISSING
+/arm-io/error-handler/afcns8-error-handler/:sotra_h17d_56 - -> MISSING
+/arm-io/error-handler/afcns9-error-handler - -> MISSING
+/arm-io/error-handler/afcns9-error-handler/:sotra_h17d_57 - -> MISSING
+/arm-io/error-handler/afcns10-error-handler - -> MISSING
+/arm-io/error-handler/afcns10-error-handler/:sotra_h17d_58 - -> MISSING
+/arm-io/error-handler/sep-error-handler - -> MISSING
+/arm-io/error-handler/cllt-error-handler - -> MISSING
+/arm-io/error-handler/cllt-error-handler/:sotra_h17d_59 - -> MISSING
+/arm-io/error-handler/piogw-error-handler - -> MISSING
+/arm-io/error-handler/piogw-error-handler/:sotra_h17d_21 - -> MISSING
+/arm-io/error-handler/sram-parity-error-handler - -> MISSING
+/arm-io/error-handler/sram-parity-error-handler/:sotra_h17d_60 - -> MISSING
+/arm-io/error-handler/sram-parity-error-handler/:sotra_h17d_61 - -> MISSING
+/arm-io/error-handler/axi2af-error-handler - -> MISSING
+/arm-io/error-handler/axi2af-error-handler/:sotra_h17d_22 - -> MISSING
+/arm-io/error-handler/axi2af-error-handler/:sotra_h17d_23 - -> MISSING
+/arm-io/error-handler/:sotra_h17c_0 - -> MISSING
+/arm-io/error-handler/:sotra_h17d_0 - -> MISSING
+/arm-io/error-handler/:sotra_h17s_0 - -> MISSING
+/arm-io/error-handler/:sotra_h17cr1_0 - -> MISSING
+/arm-io/error-handler/:sotra_h17cr2_0 - -> MISSING
+/arm-io/aes 0x50500c000 -> /soc/crypto@50500c000
+/arm-io/auss-cpu0 0x395d08000 -> /soc/phy-coproc@395d08000
+/arm-io/auss-cpu0/auss-cpu0-nub - -> MISSING
+/arm-io/gpio0 0x29c000000 -> /soc@200000000/pinctrl@29c000000
+/arm-io/aop-gpio0 0x290824000 -> /soc@200000000/pinctrl@290824000
+/arm-io/nub-gpio0 0x2881e4000 -> /soc/pinctrl@2881e4000
+/arm-io/aop 0x290600000 -> /soc@200000000/aop@290c00000
+/arm-io/aop/iop-aop-nub - -> /soc@200000000/aop@290c00000
+/arm-io/aop/iop-aop-nub/aop-audio - -> /soc@200000000/aop@290c00000
+/arm-io/aop/iop-aop-nub/aop-voicetrigger - -> /soc@200000000/aop@290c00000
+/arm-io/aop/iop-aop-nub/als - -> /soc@200000000/aop@290c00000
+/arm-io/aop/iop-aop-nub/aop-gapf-filters - -> /soc@200000000/aop@290c00000
+/arm-io/aop/iop-aop-nub/aop-pio-filters - -> /soc@200000000/aop@290c00000
+/arm-io/aop/iop-aop-nub/aop-scm-xbar - -> /soc@200000000/aop@290c00000
+/arm-io/aop/iop-aop-nub/accel - -> /soc@200000000/aop@290c00000
+/arm-io/aop/iop-aop-nub/gyro - -> /soc@200000000/aop@290c00000
+/arm-io/dart-aop 0x290fc0000 -> /soc@200000000/iommu@290fc0000
+/arm-io/dart-aop/mapper-aop - -> /soc@200000000/iommu@290fc0000
+/arm-io/dart-aop/mapper-exclave-aop - -> /soc@200000000/iommu@290fc0000
+/arm-io/dart-aop/mapper-aop2 - -> /soc@200000000/iommu@290fc0000
+/arm-io/dart-aop/mapper-admac-leap-ns - -> /soc@200000000/iommu@290fc0000
+/arm-io/dart-aop/mapper-admac-base-ns - -> /soc@200000000/iommu@290fc0000
+/arm-io/dart-aop/mapper-admac-leap-s - -> /soc@200000000/iommu@290fc0000
+/arm-io/dart-aop/mapper-admac-base-s - -> /soc@200000000/iommu@290fc0000
+/arm-io/dart-aop/mapper-scm - -> /soc@200000000/iommu@290fc0000
+/arm-io/aop-exclave-mailbox 0x2d067c000 -> /soc/mailbox@2d067c000
+/arm-io/aop-exclave-ioreporting - -> MISSING
+/arm-io/aop2 0x291600000 -> /soc/aop@291600000
+/arm-io/aop2/iop-aop2-nub - -> /soc/aop@291600000
+/arm-io/pmgr 0x280600000 -> /soc@200000000/power-management@280600000
+/arm-io/pmgr/soc-tuner - -> WAIVED: Firmware tuning policy; not an independent hardware block.
+/arm-io/pmgr/clpc - -> WAIVED: Firmware performance policy; PMGR and PMP hardware are inventoried separately.
+/arm-io/pmgr/clpc/:sotra_h17d_79 - -> MISSING
+/arm-io/pmgr/clpc/:sotra_h17s_21 - -> MISSING
+/arm-io/pmgr/clpc/:sotra_h17cr1_27 - -> MISSING
+/arm-io/pmgr/clpc/:sotra_h17cr2_27 - -> MISSING
+/arm-io/pmgr/clpc/:sotra_h17c_31 - -> MISSING
+/arm-io/pmgr/clpc/:sotra_h17d_80 - -> MISSING
+/arm-io/pmgr/clpc/:sotra_h17s_22 - -> MISSING
+/arm-io/pmgr/clpc/:sotra_h17cr1_28 - -> MISSING
+/arm-io/pmgr/clpc/:sotra_h17cr2_28 - -> MISSING
+/arm-io/pmgr/clpc/:sotra_h17c_32 - -> MISSING
+/arm-io/pmgr/clpc/:sotra_h17s_23 - -> MISSING
+/arm-io/pmgr/clpc/:sotra_h17cr1_29 - -> MISSING
+/arm-io/pmgr/clpc/:sotra_h17cr2_29 - -> MISSING
+/arm-io/pmgr/clpc/:sotra_h17c_33 - -> MISSING
+/arm-io/pmgr/ppm - -> WAIVED: Firmware power policy; PMGR and PMP hardware are inventoried separately.
+/arm-io/pmgr/pmgrtools - -> MISSING
+/arm-io/pmgr/:sotra_h17d_63 - -> MISSING
+/arm-io/pmgr/:sotra_h17cr1_16 - -> MISSING
+/arm-io/pmgr/:sotra_h17cr2_16 - -> MISSING
+/arm-io/pmgr/:sotra_h17c_20 - -> MISSING
+/arm-io/pmgr/:sotra_h17s_10 - -> MISSING
+/arm-io/pmgr/:sotra_h17d_64 - -> MISSING
+/arm-io/pmgr/:sotra_h17cr1_17 - -> MISSING
+/arm-io/pmgr/:sotra_h17cr2_17 - -> MISSING
+/arm-io/pmgr/:sotra_h17c_21 - -> MISSING
+/arm-io/pmgr/:sotra_h17s_11 - -> MISSING
+/arm-io/pmgr/:sotra_h17d_65 - -> MISSING
+/arm-io/pmgr/:sotra_h17d_66 - -> MISSING
+/arm-io/pmgr/:sotra_h17d_67 - -> MISSING
+/arm-io/pmgr/:sotra_h17cr1_18 - -> MISSING
+/arm-io/pmgr/:sotra_h17cr2_18 - -> MISSING
+/arm-io/pmgr/:sotra_h17c_22 - -> MISSING
+/arm-io/pmgr/:sotra_h17s_12 - -> MISSING
+/arm-io/pmgr/:sotra_h17d_68 - -> MISSING
+/arm-io/pmgr/:sotra_h17cr1_19 - -> MISSING
+/arm-io/pmgr/:sotra_h17cr2_19 - -> MISSING
+/arm-io/pmgr/:sotra_h17c_23 - -> MISSING
+/arm-io/pmgr/:sotra_h17s_13 - -> MISSING
+/arm-io/pmgr/:sotra_h17d_69 - -> MISSING
+/arm-io/pmgr/:sotra_h17cr1_20 - -> MISSING
+/arm-io/pmgr/:sotra_h17cr2_20 - -> MISSING
+/arm-io/pmgr/:sotra_h17c_24 - -> MISSING
+/arm-io/pmgr/:sotra_h17s_14 - -> MISSING
+/arm-io/pmgr/:sotra_h17d_70 - -> MISSING
+/arm-io/pmgr/:sotra_h17cr1_21 - -> MISSING
+/arm-io/pmgr/:sotra_h17cr2_21 - -> MISSING
+/arm-io/pmgr/:sotra_h17c_25 - -> MISSING
+/arm-io/pmgr/:sotra_h17s_15 - -> MISSING
+/arm-io/pmgr/:sotra_h17s_16 - -> MISSING
+/arm-io/pmgr/:sotra_h17cr1_22 - -> MISSING
+/arm-io/pmgr/:sotra_h17cr2_22 - -> MISSING
+/arm-io/pmgr/:sotra_h17c_26 - -> MISSING
+/arm-io/pmgr/:sotra_h17d_71 - -> MISSING
+/arm-io/pmgr/:sotra_h17d_72 - -> MISSING
+/arm-io/pmgr/:sotra_h17cr1_23 - -> MISSING
+/arm-io/pmgr/:sotra_h17cr2_23 - -> MISSING
+/arm-io/pmgr/:sotra_h17c_27 - -> MISSING
+/arm-io/pmgr/:sotra_h17s_17 - -> MISSING
+/arm-io/pmgr/:sotra_h17cr1_24 - -> MISSING
+/arm-io/pmgr/:sotra_h17cr2_24 - -> MISSING
+/arm-io/pmgr/:sotra_h17c_28 - -> MISSING
+/arm-io/pmgr/:sotra_h17s_18 - -> MISSING
+/arm-io/pmgr/:sotra_h17d_73 - -> MISSING
+/arm-io/pmgr/:sotra_h17d_74 - -> MISSING
+/arm-io/pmgr/:sotra_h17s_19 - -> MISSING
+/arm-io/pmgr/:sotra_h17cr1_25 - -> MISSING
+/arm-io/pmgr/:sotra_h17cr2_25 - -> MISSING
+/arm-io/pmgr/:sotra_h17c_29 - -> MISSING
+/arm-io/pmgr/:sotra_h17cr1_26 - -> MISSING
+/arm-io/pmgr/:sotra_h17cr2_26 - -> MISSING
+/arm-io/pmgr/:sotra_h17c_30 - -> MISSING
+/arm-io/pmgr/:sotra_h17d_75 - -> MISSING
+/arm-io/pmgr/:sotra_h17s_20 - -> MISSING
+/arm-io/pmgr/power-devices - -> WAIVED: ADT power-device collection container; individual power-state records are checked separately.
+/arm-io/pmgr/power-devices/MCPU0_0 0x280600000 -> MISSING
+/arm-io/pmgr/power-devices/MCPU0_1 0x280600008 -> MISSING
+/arm-io/pmgr/power-devices/MCPU0_2 0x280600010 -> MISSING
+/arm-io/pmgr/power-devices/MCPU0_3 0x280600018 -> MISSING
+/arm-io/pmgr/power-devices/MCPU0_4 0x280600020 -> MISSING
+/arm-io/pmgr/power-devices/MCPU0_5 0x280600028 -> MISSING
+/arm-io/pmgr/power-devices/MCPU1_0 0x280600030 -> MISSING
+/arm-io/pmgr/power-devices/MCPU1_1 0x280600038 -> MISSING
+/arm-io/pmgr/power-devices/MCPU1_2 0x280600040 -> MISSING
+/arm-io/pmgr/power-devices/MCPU1_3 0x280600048 -> MISSING
+/arm-io/pmgr/power-devices/MCPU1_4 0x280600050 -> MISSING
+/arm-io/pmgr/power-devices/MCPU1_5 0x280600058 -> MISSING
+/arm-io/pmgr/power-devices/PCPU_0 0x280600060 -> MISSING
+/arm-io/pmgr/power-devices/PCPU_1 0x280600068 -> MISSING
+/arm-io/pmgr/power-devices/PCPU_2 0x280600070 -> MISSING
+/arm-io/pmgr/power-devices/PCPU_3 0x280600078 -> MISSING
+/arm-io/pmgr/power-devices/PCPU_4 0x280600080 -> MISSING
+/arm-io/pmgr/power-devices/PCPU_5 0x280600088 -> MISSING
+/arm-io/pmgr/power-devices/PMS 0x280600100 -> /soc@200000000/power-management@280600000/power-controller@100
+/arm-io/pmgr/power-devices/AIC 0x280600108 -> MISSING
+/arm-io/pmgr/power-devices/PMC 0x280600110 -> MISSING
+/arm-io/pmgr/power-devices/PMS_C1PPT 0x280600118 -> MISSING
+/arm-io/pmgr/power-devices/SOC_DPE 0x280600120 -> MISSING
+/arm-io/pmgr/power-devices/PMP 0x280600128 -> /soc@200000000/power-management@280600000/power-controller@128
+/arm-io/pmgr/power-devices/PMS_SRAM 0x280600130 -> /soc@200000000/power-management@280600000/power-controller@130
+/arm-io/pmgr/power-devices/PMGR_SOC_OCLA 0x280600138 -> MISSING
+/arm-io/pmgr/power-devices/B2B_CTRL_NOGATE 0x280600140 -> MISSING
+/arm-io/pmgr/power-devices/FAB0_ACC_0 0x280600148 -> MISSING
+/arm-io/pmgr/power-devices/FAB0_ACC_1 0x280600150 -> MISSING
+/arm-io/pmgr/power-devices/FAB2_ACC 0x280600158 -> MISSING
+/arm-io/pmgr/power-devices/FAB1_ACC 0x280600160 -> MISSING
+/arm-io/pmgr/power-devices/B2BC_AFC_0 0x280600168 -> MISSING
+/arm-io/pmgr/power-devices/B2BC_AFC_0_DFX 0x280600170 -> MISSING
+/arm-io/pmgr/power-devices/B2BC_AFC_1 0x280600178 -> MISSING
+/arm-io/pmgr/power-devices/B2BC_AFC_1_DFX 0x280600180 -> MISSING
+/arm-io/pmgr/power-devices/FAB0_AFI_0 0x280600188 -> MISSING
+/arm-io/pmgr/power-devices/FAB0_AFI_1 0x280600190 -> MISSING
+/arm-io/pmgr/power-devices/FAB0_AFI_2 0x280600198 -> MISSING
+/arm-io/pmgr/power-devices/FAB0_AFI_3 0x2806001a0 -> MISSING
+/arm-io/pmgr/power-devices/FAB_B2BC_AFI_0 0x2806001a8 -> MISSING
+/arm-io/pmgr/power-devices/FAB_B2BC_AFI_1 0x2806001b0 -> MISSING
+/arm-io/pmgr/power-devices/B2BC_AFI_0 0x2806001b8 -> MISSING
+/arm-io/pmgr/power-devices/B2BC_AFI_0_DFX 0x2806001c0 -> MISSING
+/arm-io/pmgr/power-devices/B2BC_AFI_1 0x2806001c8 -> MISSING
+/arm-io/pmgr/power-devices/B2BC_AFI_1_DFX 0x2806001d0 -> MISSING
+/arm-io/pmgr/power-devices/FAB0_PIOGW 0x2806001d8 -> /soc@200000000/power-management@280600000/power-controller@1d8
+/arm-io/pmgr/power-devices/FAB3_SOC 0x2806001e0 -> /soc@200000000/power-management@280600000/power-controller@1e0
+/arm-io/pmgr/power-devices/FAB4_SOC 0x2806001e8 -> MISSING
+/arm-io/pmgr/power-devices/FAB5_SOC 0x2806001f0 -> /soc@200000000/power-management@280600000/power-controller@1f0
+/arm-io/pmgr/power-devices/SBR 0x2806001f8 -> /soc@200000000/power-management@280600000/power-controller@1f8
+/arm-io/pmgr/power-devices/DISPEXT0_SYS 0x280600200 -> MISSING
+/arm-io/pmgr/power-devices/ATC0_COMMON 0x280600208 -> /soc@200000000/power-management@280600000/power-controller@208
+/arm-io/pmgr/power-devices/ATC1_COMMON 0x280600210 -> /soc@200000000/power-management@280600000/power-controller@210
+/arm-io/pmgr/power-devices/TRACE_FAB - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT2_SYS 0x280600220 -> MISSING
+/arm-io/pmgr/power-devices/DISPEXT3_SYS 0x280600228 -> MISSING
+/arm-io/pmgr/power-devices/DISPEXT1_SYS 0x280600230 -> MISSING
+/arm-io/pmgr/power-devices/ATC2_COMMON 0x280600238 -> /soc@200000000/power-management@280600000/power-controller@238
+/arm-io/pmgr/power-devices/ATC3_COMMON 0x280600240 -> /soc@200000000/power-management@280600000/power-controller@240
+/arm-io/pmgr/power-devices/AUSS 0x280600248 -> /soc@200000000/power-management@280600000/power-controller@248
+/arm-io/pmgr/power-devices/GPIO 0x280600250 -> MISSING
+/arm-io/pmgr/power-devices/MSG 0x280600258 -> /soc@200000000/power-management@280600000/power-controller@258
+/arm-io/pmgr/power-devices/AP_TMM 0x280600260 -> MISSING
+/arm-io/pmgr/power-devices/DISPEXT0_FE 0x280600268 -> MISSING
+/arm-io/pmgr/power-devices/DISPEXT0_ADMA 0x280600270 -> MISSING
+/arm-io/pmgr/power-devices/DISPEXT0_CPU 0x280600278 -> MISSING
+/arm-io/pmgr/power-devices/ATC0_CIO 0x280600280 -> /soc@200000000/power-management@280600000/power-controller@280
+/arm-io/pmgr/power-devices/ATC0_PCIE 0x280600288 -> /soc@200000000/power-management@280600000/power-controller@288
+/arm-io/pmgr/power-devices/ATC1_CIO 0x280600290 -> /soc@200000000/power-management@280600000/power-controller@290
+/arm-io/pmgr/power-devices/ATC1_PCIE 0x280600298 -> /soc@200000000/power-management@280600000/power-controller@298
+/arm-io/pmgr/power-devices/DISPEXT2_FE 0x2806002a0 -> MISSING
+/arm-io/pmgr/power-devices/DISPEXT2_ADMA 0x2806002a8 -> MISSING
+/arm-io/pmgr/power-devices/DISPEXT2_CPU 0x2806002b0 -> MISSING
+/arm-io/pmgr/power-devices/DISPEXT3_FE 0x2806002b8 -> MISSING
+/arm-io/pmgr/power-devices/DISPEXT3_ADMA 0x2806002c0 -> MISSING
+/arm-io/pmgr/power-devices/DISPEXT3_CPU 0x2806002c8 -> MISSING
+/arm-io/pmgr/power-devices/DISPEXT1_FE 0x2806002d0 -> MISSING
+/arm-io/pmgr/power-devices/DISPEXT1_ADMA 0x2806002d8 -> MISSING
+/arm-io/pmgr/power-devices/DISPEXT1_CPU 0x2806002e0 -> MISSING
+/arm-io/pmgr/power-devices/ATC2_CIO 0x2806002e8 -> /soc@200000000/power-management@280600000/power-controller@2e8
+/arm-io/pmgr/power-devices/ATC2_PCIE 0x2806002f0 -> /soc@200000000/power-management@280600000/power-controller@2f0
+/arm-io/pmgr/power-devices/ATC3_CIO 0x2806002f8 -> /soc@200000000/power-management@280600000/power-controller@2f8
+/arm-io/pmgr/power-devices/ATC3_PCIE 0x280600300 -> /soc@200000000/power-management@280600000/power-controller@300
+/arm-io/pmgr/power-devices/DISPEXT0_DBE - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DPEXT0 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT0_GP0 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT0_GP1 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT0_GPL - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT0_PPP - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/ATC0_CIO_PCIE 0x280600338 -> /soc@200000000/power-management@280600000/power-controller@338
+/arm-io/pmgr/power-devices/ATC0_CIO_USB 0x280600340 -> /soc@200000000/power-management@280600000/power-controller@340
+/arm-io/pmgr/power-devices/ATC0_CIO_AUSS 0x280600348 -> /soc@200000000/power-management@280600000/power-controller@348
+/arm-io/pmgr/power-devices/ATC1_CIO_PCIE 0x280600350 -> /soc@200000000/power-management@280600000/power-controller@350
+/arm-io/pmgr/power-devices/ATC1_CIO_USB 0x280600358 -> /soc@200000000/power-management@280600000/power-controller@358
+/arm-io/pmgr/power-devices/ATC1_CIO_AUSS 0x280600360 -> /soc@200000000/power-management@280600000/power-controller@360
+/arm-io/pmgr/power-devices/DISPEXT2_DBE - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DPEXT2 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT2_GP0 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT2_GP1 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT2_GPL - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT2_PPP - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT3_DBE - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DPEXT3 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT3_GP0 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT3_GP1 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT3_GPL - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT3_PPP - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT1_DBE - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DPEXT1 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT1_GP0 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT1_GP1 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT1_GPL - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT1_PPP - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/ATC2_CIO_PCIE 0x2806003f8 -> /soc@200000000/power-management@280600000/power-controller@3f8
+/arm-io/pmgr/power-devices/ATC2_CIO_USB 0x280600400 -> /soc@200000000/power-management@280600000/power-controller@400
+/arm-io/pmgr/power-devices/ATC2_CIO_AUSS 0x280600408 -> /soc@200000000/power-management@280600000/power-controller@408
+/arm-io/pmgr/power-devices/ATC3_CIO_PCIE 0x280600410 -> /soc@200000000/power-management@280600000/power-controller@410
+/arm-io/pmgr/power-devices/ATC3_CIO_USB 0x280600418 -> /soc@200000000/power-management@280600000/power-controller@418
+/arm-io/pmgr/power-devices/ATC3_CIO_AUSS 0x280600420 -> /soc@200000000/power-management@280600000/power-controller@420
+/arm-io/pmgr/power-devices/DISPEXT0_DSC - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT2_DSC - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT3_DSC - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT1_DSC - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/FAB0_AFIGW 0x280600448 -> MISSING
+/arm-io/pmgr/power-devices/FPPT 0x280600450 -> MISSING
+/arm-io/pmgr/power-devices/B2BC_DFT 0x280600458 -> MISSING
+/arm-io/pmgr/power-devices/B2BC_CNTL_DFX 0x280600460 -> MISSING
+/arm-io/pmgr/power-devices/B2BC_DBG_0 0x280600468 -> MISSING
+/arm-io/pmgr/power-devices/B2BC_DBG_1 0x280600470 -> MISSING
+/arm-io/pmgr/power-devices/B2BC_DBG_2 0x280600478 -> MISSING
+/arm-io/pmgr/power-devices/ISPSENS0 0x280900100 -> /soc@200000000/power-management@280900000/power-controller@100
+/arm-io/pmgr/power-devices/GLOBAL_AUX_HPD_0 0x280900108 -> /soc@200000000/power-management@280900000/power-controller@108
+/arm-io/pmgr/power-devices/GLOBAL_AUX_HPD_1 0x280900110 -> /soc@200000000/power-management@280900000/power-controller@110
+/arm-io/pmgr/power-devices/APCIE_GP 0x280900118 -> /soc@200000000/power-management@280900000/power-controller@118
+/arm-io/pmgr/power-devices/APCIE_GE 0x280900120 -> /soc@200000000/power-management@280900000/power-controller@120
+/arm-io/pmgr/power-devices/APCIE_ST0 0x280900128 -> /soc@200000000/power-management@280900000/power-controller@128
+/arm-io/pmgr/power-devices/APCIE_ST1 0x280900130 -> /soc@200000000/power-management@280900000/power-controller@130
+/arm-io/pmgr/power-devices/FAB6_SOC 0x280900138 -> /soc@200000000/power-management@280900000/power-controller@138
+/arm-io/pmgr/power-devices/ANS 0x280900140 -> /soc@200000000/power-management@280900000/power-controller@140
+/arm-io/pmgr/power-devices/APCIE_SYS_GP 0x280900148 -> /soc@200000000/power-management@280900000/power-controller@148
+/arm-io/pmgr/power-devices/APCIE_SYS_ST0 0x280900150 -> /soc@200000000/power-management@280900000/power-controller@150
+/arm-io/pmgr/power-devices/APCIE_SYS_ST1 0x280900158 -> /soc@200000000/power-management@280900000/power-controller@158
+/arm-io/pmgr/power-devices/APCIE_SYS_GP_OC 0x280900160 -> MISSING
+/arm-io/pmgr/power-devices/APCIE_SYS_ST0_O 0x280900168 -> MISSING
+/arm-io/pmgr/power-devices/APCIE_SYS_ST1_O 0x280900170 -> MISSING
+/arm-io/pmgr/power-devices/FAB7_SOC 0x280900178 -> /soc@200000000/power-management@280900000/power-controller@178
+/arm-io/pmgr/power-devices/DISP_SYS 0x280900180 -> /soc@200000000/power-management@280900000/power-controller@180
+/arm-io/pmgr/power-devices/APCIE_SYS_GE 0x280900188 -> /soc@200000000/power-management@280900000/power-controller@188
+/arm-io/pmgr/power-devices/SCODEC 0x280900190 -> /soc@200000000/power-management@280900000/power-controller@190
+/arm-io/pmgr/power-devices/DISP_FE 0x280900198 -> /soc@200000000/power-management@280900000/power-controller@198
+/arm-io/pmgr/power-devices/DISP_ADMA 0x2809001a0 -> MISSING
+/arm-io/pmgr/power-devices/DISP_CPU 0x2809001a8 -> /soc@200000000/power-management@280900000/power-controller@1a8
+/arm-io/pmgr/power-devices/APCIE_PHY_SW 0x2809001b0 -> /soc@200000000/power-management@280900000/power-controller@1b0
+/arm-io/pmgr/power-devices/APCIE_SYS_GE_OL 0x2809001b8 -> MISSING
+/arm-io/pmgr/power-devices/SCODEC_STREAMING 0x2809001c0 -> MISSING
+/arm-io/pmgr/power-devices/DISP_SPI - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISP_SPMI - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISP_SMB0 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISP_SMB1 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISP_DBE - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DP - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISP_GP0 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISP_GP1 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISP_GPL - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISP_CMB - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISP_PPP - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISP_BRC - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISP_BLC - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISP_HILO - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISP_RCA - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/APHY_ST0_AUS5_A 0x280900240 -> /soc@200000000/power-management@280900000/power-controller@240
+/arm-io/pmgr/power-devices/APHY_ST1_AUS5_A 0x280900248 -> /soc@200000000/power-management@280900000/power-controller@248
+/arm-io/pmgr/power-devices/APHY_GE_AUS5_A 0x280900250 -> /soc@200000000/power-management@280900000/power-controller@250
+/arm-io/pmgr/power-devices/APHY_GP_AUS5_A 0x280900258 -> /soc@200000000/power-management@280900000/power-controller@258
+/arm-io/pmgr/power-devices/DISP_DSC - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/APHY_ST0_AUS5 0x280900268 -> /soc@200000000/power-management@280900000/power-controller@268
+/arm-io/pmgr/power-devices/APHY_ST1_AUS5 0x280900270 -> /soc@200000000/power-management@280900000/power-controller@270
+/arm-io/pmgr/power-devices/APHY_GE_AUS5 0x280900278 -> /soc@200000000/power-management@280900000/power-controller@278
+/arm-io/pmgr/power-devices/APHY_GP_AUS5 0x280900280 -> /soc@200000000/power-management@280900000/power-controller@280
+/arm-io/pmgr/power-devices/FAB8_SOC 0x280900288 -> /soc@200000000/power-management@280900000/power-controller@288
+/arm-io/pmgr/power-devices/SIO 0x280900290 -> /soc@200000000/power-management@280900000/power-controller@290
+/arm-io/pmgr/power-devices/SEP 0x280900298 -> /soc@200000000/power-management@280900000/power-controller@298
+/arm-io/pmgr/power-devices/SIO_CPU 0x2809002a0 -> /soc@200000000/power-management@280900000/power-controller@2a0
+/arm-io/pmgr/power-devices/FPWM0 0x2809002a8 -> /soc@200000000/power-management@280900000/power-controller@2a8
+/arm-io/pmgr/power-devices/FPWM1 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/FPWM2 0x2809002b8 -> /soc@200000000/power-management@280900000/power-controller@2b8
+/arm-io/pmgr/power-devices/I2C0 0x2809002c0 -> /soc@200000000/power-management@280900000/power-controller@2c0
+/arm-io/pmgr/power-devices/I2C1 0x2809002c8 -> /soc@200000000/power-management@280900000/power-controller@2c8
+/arm-io/pmgr/power-devices/I2C2 0x2809002d0 -> /soc@200000000/power-management@280900000/power-controller@2d0
+/arm-io/pmgr/power-devices/I2C3 0x2809002d8 -> /soc@200000000/power-management@280900000/power-controller@2d8
+/arm-io/pmgr/power-devices/I2C4 0x2809002e0 -> /soc@200000000/power-management@280900000/power-controller@2e0
+/arm-io/pmgr/power-devices/I2C5 0x2809002e8 -> /soc@200000000/power-management@280900000/power-controller@2e8
+/arm-io/pmgr/power-devices/I2C6 0x2809002f0 -> /soc@200000000/power-management@280900000/power-controller@2f0
+/arm-io/pmgr/power-devices/I2C7 0x2809002f8 -> /soc@200000000/power-management@280900000/power-controller@2f8
+/arm-io/pmgr/power-devices/I2C8 0x280900300 -> /soc@200000000/power-management@280900000/power-controller@300
+/arm-io/pmgr/power-devices/SPI_P 0x280900308 -> /soc@200000000/power-management@280900000/power-controller@308
+/arm-io/pmgr/power-devices/UART_P 0x280900310 -> /soc@200000000/power-management@280900000/power-controller@310
+/arm-io/pmgr/power-devices/AES 0x280900318 -> /soc@200000000/power-management@280900000/power-controller@318
+/arm-io/pmgr/power-devices/SPI0 0x280900320 -> MISSING
+/arm-io/pmgr/power-devices/SPI1 0x280900328 -> MISSING
+/arm-io/pmgr/power-devices/SPI2 0x280900330 -> /soc@200000000/power-management@280900000/power-controller@330
+/arm-io/pmgr/power-devices/SPI3 0x280900338 -> /soc@200000000/power-management@280900000/power-controller@338
+/arm-io/pmgr/power-devices/SPI4 0x280900340 -> /soc@200000000/power-management@280900000/power-controller@340
+/arm-io/pmgr/power-devices/SPI5 0x280900348 -> MISSING
+/arm-io/pmgr/power-devices/QSPI 0x280900350 -> /soc@200000000/power-management@280900000/power-controller@350
+/arm-io/pmgr/power-devices/UART_N 0x280900358 -> MISSING
+/arm-io/pmgr/power-devices/UART0 0x280900360 -> /soc@200000000/power-management@280900000/power-controller@360
+/arm-io/pmgr/power-devices/UART1 0x280900368 -> MISSING
+/arm-io/pmgr/power-devices/UART2 0x280900370 -> MISSING
+/arm-io/pmgr/power-devices/UART3 0x280900378 -> MISSING
+/arm-io/pmgr/power-devices/UART4 0x280900380 -> MISSING
+/arm-io/pmgr/power-devices/UART5 0x280900388 -> MISSING
+/arm-io/pmgr/power-devices/UART6 0x280900390 -> MISSING
+/arm-io/pmgr/power-devices/FAB9_SOC 0x280900398 -> /soc@200000000/power-management@280900000/power-controller@398
+/arm-io/pmgr/power-devices/ISP_SYS 0x2809003a0 -> /soc@200000000/power-management@280900000/power-controller@3a0
+/arm-io/pmgr/power-devices/ISP_CPU - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/ISP_FE - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/ANE_MPM 0x2809003c0 -> MISSING
+/arm-io/pmgr/power-devices/ANE_CPU 0x2809003c8 -> /soc@200000000/power-management@280900000/power-controller@3c8
+/arm-io/pmgr/power-devices/ANE_TDBASE 0x2809003d0 -> MISSING
+/arm-io/pmgr/power-devices/DPRX - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/ISP_SECURE - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/ISP_BE - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/ISP_CLR - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DPTX_PHY - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DEBUG_GATED 0x288300058 -> /soc@200000000/power-management@288300000/power-controller@58
+/arm-io/pmgr/power-devices/NUB_SPMI_A0 0x288300060 -> MISSING
+/arm-io/pmgr/power-devices/NUB_SPMI_A1 0x288300068 -> MISSING
+/arm-io/pmgr/power-devices/NUB_SPMI_A2 0x288300070 -> MISSING
+/arm-io/pmgr/power-devices/NUB_AON 0x288300078 -> MISSING
+/arm-io/pmgr/power-devices/NUB_DOCK_CHANNEL 0x288300080 -> MISSING
+/arm-io/pmgr/power-devices/NUB_GPIO 0x288300088 -> MISSING
+/arm-io/pmgr/power-devices/NUB_OCLA - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/ATC0_COMMON_DP_0 0x288300098 -> /soc@200000000/power-management@288300000/power-controller@98
+/arm-io/pmgr/power-devices/ATC0_COMMON_DP_1 0x2883000a0 -> /soc@200000000/power-management@288300000/power-controller@a0
+/arm-io/pmgr/power-devices/ATC0_COMMON_DP_2 0x2883000a8 -> /soc@200000000/power-management@288300000/power-controller@a8
+/arm-io/pmgr/power-devices/ATC0_COMMON_DP_3 0x2883000b0 -> /soc@200000000/power-management@288300000/power-controller@b0
+/arm-io/pmgr/power-devices/ATC1_COMMON_DP_0 0x2883000b8 -> /soc@200000000/power-management@288300000/power-controller@b8
+/arm-io/pmgr/power-devices/ATC1_COMMON_DP_1 0x2883000c0 -> /soc@200000000/power-management@288300000/power-controller@c0
+/arm-io/pmgr/power-devices/ATC1_COMMON_DP_2 0x2883000c8 -> /soc@200000000/power-management@288300000/power-controller@c8
+/arm-io/pmgr/power-devices/ATC1_COMMON_DP_3 0x2883000d0 -> /soc@200000000/power-management@288300000/power-controller@d0
+/arm-io/pmgr/power-devices/ATC2_COMMON_DP_0 0x2883000d8 -> /soc@200000000/power-management@288300000/power-controller@d8
+/arm-io/pmgr/power-devices/ATC2_COMMON_DP_1 0x2883000e0 -> /soc@200000000/power-management@288300000/power-controller@e0
+/arm-io/pmgr/power-devices/ATC2_COMMON_DP_2 0x2883000e8 -> /soc@200000000/power-management@288300000/power-controller@e8
+/arm-io/pmgr/power-devices/ATC2_COMMON_DP_3 0x2883000f0 -> /soc@200000000/power-management@288300000/power-controller@f0
+/arm-io/pmgr/power-devices/ATC3_COMMON_DP_0 0x2883000f8 -> /soc@200000000/power-management@288300000/power-controller@f8
+/arm-io/pmgr/power-devices/ATC3_COMMON_DP_1 0x288300100 -> /soc@200000000/power-management@288300000/power-controller@100
+/arm-io/pmgr/power-devices/ATC3_COMMON_DP_2 0x288300108 -> /soc@200000000/power-management@288300000/power-controller@108
+/arm-io/pmgr/power-devices/ATC3_COMMON_DP_3 0x288300110 -> /soc@200000000/power-management@288300000/power-controller@110
+/arm-io/pmgr/power-devices/NUB_SPMI_AHB 0x288300118 -> MISSING
+/arm-io/pmgr/power-devices/NUB_SPMI0 0x288300120 -> MISSING
+/arm-io/pmgr/power-devices/NUB_SPMI1 0x288300128 -> MISSING
+/arm-io/pmgr/power-devices/NUB_SPMI2 0x288300130 -> MISSING
+/arm-io/pmgr/power-devices/NUB_SPMI3 0x288300138 -> MISSING
+/arm-io/pmgr/power-devices/NUB_SPMI4 0x288300140 -> MISSING
+/arm-io/pmgr/power-devices/ATC0_USB_AON 0x288300148 -> /soc@200000000/power-management@288300000/power-controller@148
+/arm-io/pmgr/power-devices/ATC0_USB 0x288300150 -> /soc@200000000/power-management@288300000/power-controller@150
+/arm-io/pmgr/power-devices/ATC0_PHYMXWRAP 0x288300158 -> /soc@200000000/power-management@288300000/power-controller@158
+/arm-io/pmgr/power-devices/ATC1_USB_AON 0x288300160 -> /soc@200000000/power-management@288300000/power-controller@160
+/arm-io/pmgr/power-devices/ATC1_USB 0x288300168 -> /soc@200000000/power-management@288300000/power-controller@168
+/arm-io/pmgr/power-devices/ATC1_PHYMXWRAP 0x288300170 -> /soc@200000000/power-management@288300000/power-controller@170
+/arm-io/pmgr/power-devices/ATC2_USB_AON 0x288300178 -> /soc@200000000/power-management@288300000/power-controller@178
+/arm-io/pmgr/power-devices/ATC2_USB 0x288300180 -> /soc@200000000/power-management@288300000/power-controller@180
+/arm-io/pmgr/power-devices/ATC2_PHYMXWRAP 0x288300188 -> /soc@200000000/power-management@288300000/power-controller@188
+/arm-io/pmgr/power-devices/ATC3_USB_AON 0x288300190 -> /soc@200000000/power-management@288300000/power-controller@190
+/arm-io/pmgr/power-devices/ATC3_USB 0x288300198 -> /soc@200000000/power-management@288300000/power-controller@198
+/arm-io/pmgr/power-devices/ATC3_PHYMXWRAP 0x2883001a0 -> /soc@200000000/power-management@288300000/power-controller@1a0
+/arm-io/pmgr/power-devices/NUB_FABRIC 0x2883001a8 -> MISSING
+/arm-io/pmgr/power-devices/NUB_SRAM 0x2883001b0 -> MISSING
+/arm-io/pmgr/power-devices/DEBUG_SWITCH 0x2883001b8 -> MISSING
+/arm-io/pmgr/power-devices/AOP_FILTER - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AOP_GPIO - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AOP_SRAM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AOP_FR - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AOP_DART - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AUDIO_A - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AOP_I2CM0 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AOP_I2CM1 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AOP_I2CM2 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AOP_I2CM3 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AOP_SPI0 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AOP_SPI1 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AOP_SPMI0 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AOP_SPMI1 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AOP_HE_NRCS0 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AOP_HE_NRCS1 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AOP_BASE - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AUDIO_FR - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AOP_SHIM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AOP_PIODMA - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AOP2_PIODMA - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AOP_SCM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AOP_CPU - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AOP2_CPU - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AUDIO_P - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AUDIO_LEAP_A - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AUDIO_SENSE_PDMC - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AOP_UART0 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AOP_UART1 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AOP_UART2 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AUDIO_BASE_S_A - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AUDIO_BASE_NS_A - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AUDIO_LEAP_MCA - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AUDIO_MCA0_M - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AUDIO_MCA1_M - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AUDIO_MCA2_M - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AUDIO_MCA3_M - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AUDIO_MCA4_M - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AUDIO_MCA5_M - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AUDIO_LEAP_C - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AUDIO_LEAP_S_A - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AUDIO_LEAP_NS_A - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AUDIO_LEAP_RX0 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AUDIO_LEAP_RX1 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AUDIO_LEAP_RX2 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AUDIO_LEAP_RX3 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AUDIO_LEAP_RX4 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AUDIO_LEAP_TX0 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/PDM0_AUDIO_REF - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/PDM1_AUDIO_REF - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/SMC_FABRIC - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/SMC_GPIO - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/SMC_AON - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/SMC_UART0 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/SMC_UART1 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/SMC_I2CM0 0x288308028 -> MISSING
+/arm-io/pmgr/power-devices/SMC_I2CM1 0x288308030 -> MISSING
+/arm-io/pmgr/power-devices/SMC_I2CM2 0x288308038 -> MISSING
+/arm-io/pmgr/power-devices/SMC_I2CM3 0x288308040 -> MISSING
+/arm-io/pmgr/power-devices/SMC_I2CM4 0x288308048 -> MISSING
+/arm-io/pmgr/power-devices/SMC_I2CM5 0x288308050 -> MISSING
+/arm-io/pmgr/power-devices/SMC_I2CM6 0x288308058 -> MISSING
+/arm-io/pmgr/power-devices/SMC_FPWM0 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/SMC_FPWM1 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/SMC_FPWM2 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/SMC_FPWM3 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/SMC_PTD - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/SMC_CPU - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MTP_FABRIC - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MTP_GPIO - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MTP_BASE - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MTP_PERIPH - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MTP_SCM_QSPI0 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MTP_CPU - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MTP_DMA - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MTP_DMA2 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MTP_SHIM_PCLK - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MTP_SCM_FABRIC - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MTP_SPI0 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MTP_I2CM0 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MTP_QSPI0 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MTP_SCM_QSPI0_S - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MTP_UART0 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MTP_SRAM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/GPX 0x2300e80000 -> /soc/power-management@2300e80000/power-controller@0
+/arm-io/pmgr/power-devices/AFR 0x2300e80100 -> /soc/power-management@2300e80000/power-controller@100
+/arm-io/pmgr/power-devices/CS 0x2300e80108 -> MISSING
+/arm-io/pmgr/power-devices/GFX 0x2300e80110 -> /soc/power-management@2300e80000/power-controller@110
+/arm-io/pmgr/power-devices/PMS_GFX 0x2380600100 -> MISSING
+/arm-io/pmgr/power-devices/AIC_GFX 0x2380600108 -> MISSING
+/arm-io/pmgr/power-devices/PMS_GFX_C1PPT 0x2380600110 -> MISSING
+/arm-io/pmgr/power-devices/SOC_DPE_GFX 0x2380600118 -> MISSING
+/arm-io/pmgr/power-devices/PMGR_SOC_OCLA_G 0x2380600120 -> MISSING
+/arm-io/pmgr/power-devices/B2B_CTRL_GFX 0x2380600128 -> MISSING
+/arm-io/pmgr/power-devices/B2BG_AFC_0 0x2380600130 -> MISSING
+/arm-io/pmgr/power-devices/B2BG_AFC_0_DFX 0x2380600138 -> MISSING
+/arm-io/pmgr/power-devices/B2BG_AFC_1 0x2380600140 -> MISSING
+/arm-io/pmgr/power-devices/B2BG_AFC_1_DFX 0x2380600148 -> MISSING
+/arm-io/pmgr/power-devices/FAB1_AFI_0 0x2380600150 -> MISSING
+/arm-io/pmgr/power-devices/FAB1_AFI_1 0x2380600158 -> MISSING
+/arm-io/pmgr/power-devices/FAB_B2BG_AFI_0 0x2380600160 -> MISSING
+/arm-io/pmgr/power-devices/FAB_B2BG_AFI_1 0x2380600168 -> MISSING
+/arm-io/pmgr/power-devices/B2BG_AFI_0 0x2380600170 -> MISSING
+/arm-io/pmgr/power-devices/B2BG_AFI_0_DFX 0x2380600178 -> MISSING
+/arm-io/pmgr/power-devices/B2BG_AFI_1 0x2380600180 -> MISSING
+/arm-io/pmgr/power-devices/B2BG_AFI_1_DFX 0x2380600188 -> MISSING
+/arm-io/pmgr/power-devices/FAB1_AFIGW 0x2380600190 -> MISSING
+/arm-io/pmgr/power-devices/FPPT_GFX 0x2380600198 -> MISSING
+/arm-io/pmgr/power-devices/FAB1_PIOGW 0x23806001a0 -> /soc@2308000000/power-management@2380600000/power-controller@1a0
+/arm-io/pmgr/power-devices/FAB0_SOC 0x23806001a8 -> /soc@2308000000/power-management@2380600000/power-controller@1a8
+/arm-io/pmgr/power-devices/FAB1_SOC 0x23806001b0 -> /soc@2308000000/power-management@2380600000/power-controller@1b0
+/arm-io/pmgr/power-devices/FAB2_SOC 0x23806001b8 -> /soc@2308000000/power-management@2380600000/power-controller@1b8
+/arm-io/pmgr/power-devices/VENC0_SYS 0x23806001c0 -> /soc@2308000000/power-management@2380600000/power-controller@1c0
+/arm-io/pmgr/power-devices/MSR0 0x23806001c8 -> /soc@2308000000/power-management@2380600000/power-controller@1c8
+/arm-io/pmgr/power-devices/JPG 0x23806001d0 -> /soc@2308000000/power-management@2380600000/power-controller@1d0
+/arm-io/pmgr/power-devices/AVD_SYS 0x23806001d8 -> /soc@2308000000/power-management@2380600000/power-controller@1d8
+/arm-io/pmgr/power-devices/PRORES 0x23806001e0 -> /soc@2308000000/power-management@2380600000/power-controller@1e0
+/arm-io/pmgr/power-devices/SBR_GFX 0x23806001e8 -> MISSING
+/arm-io/pmgr/power-devices/VENC1_SYS 0x23806001f0 -> /soc@2308000000/power-management@2380600000/power-controller@1f0
+/arm-io/pmgr/power-devices/MSR1 0x23806001f8 -> /soc@2308000000/power-management@2380600000/power-controller@1f8
+/arm-io/pmgr/power-devices/MSR0_ASE_CORE 0x2380600200 -> /soc@2308000000/power-management@2380600000/power-controller@200
+/arm-io/pmgr/power-devices/MSR1_ASE_CORE 0x2380600208 -> /soc@2308000000/power-management@2380600000/power-controller@208
+/arm-io/pmgr/power-devices/FAB_AFI_AMCC_0 0x2380600210 -> MISSING
+/arm-io/pmgr/power-devices/AMCC0 0x2380600218 -> MISSING
+/arm-io/pmgr/power-devices/AMCC1 0x2380600220 -> MISSING
+/arm-io/pmgr/power-devices/AMCC2 0x2380600228 -> MISSING
+/arm-io/pmgr/power-devices/AMCC3 0x2380600230 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFR_AMCC_0 0x2380600238 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFR_AMCC_1 0x2380600240 -> MISSING
+/arm-io/pmgr/power-devices/DCS_00 0x2380600248 -> MISSING
+/arm-io/pmgr/power-devices/DCS_01 0x2380600258 -> MISSING
+/arm-io/pmgr/power-devices/DCS_02 0x2380600268 -> MISSING
+/arm-io/pmgr/power-devices/DCS_03 0x2380600278 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFC_AMCC_0 0x2380600288 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFI_AMCC_1 0x2380600290 -> MISSING
+/arm-io/pmgr/power-devices/AMCC4 0x2380600298 -> MISSING
+/arm-io/pmgr/power-devices/AMCC5 0x23806002a0 -> MISSING
+/arm-io/pmgr/power-devices/AMCC6 0x23806002a8 -> MISSING
+/arm-io/pmgr/power-devices/AMCC7 0x23806002b0 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFR_AMCC_2 0x23806002b8 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFR_AMCC_3 0x23806002c0 -> MISSING
+/arm-io/pmgr/power-devices/DCS_04 0x23806002c8 -> MISSING
+/arm-io/pmgr/power-devices/DCS_05 0x23806002d8 -> MISSING
+/arm-io/pmgr/power-devices/DCS_06 0x23806002e8 -> MISSING
+/arm-io/pmgr/power-devices/DCS_07 0x23806002f8 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFC_AMCC_1 0x2380600308 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFI_AMCC_2 0x2380600310 -> MISSING
+/arm-io/pmgr/power-devices/AMCC8 0x2380600318 -> MISSING
+/arm-io/pmgr/power-devices/AMCC9 0x2380600320 -> MISSING
+/arm-io/pmgr/power-devices/AMCC10 0x2380600328 -> MISSING
+/arm-io/pmgr/power-devices/AMCC11 0x2380600330 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFR_AMCC_4 0x2380600338 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFR_AMCC_5 0x2380600340 -> MISSING
+/arm-io/pmgr/power-devices/DCS_08 0x2380600348 -> MISSING
+/arm-io/pmgr/power-devices/DCS_09 0x2380600358 -> MISSING
+/arm-io/pmgr/power-devices/DCS_10 0x2380600368 -> MISSING
+/arm-io/pmgr/power-devices/DCS_11 0x2380600378 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFC_AMCC_2 0x2380600388 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFI_AMCC_3 0x2380600390 -> MISSING
+/arm-io/pmgr/power-devices/AMCC12 0x2380600398 -> MISSING
+/arm-io/pmgr/power-devices/AMCC13 0x23806003a0 -> MISSING
+/arm-io/pmgr/power-devices/AMCC14 0x23806003a8 -> MISSING
+/arm-io/pmgr/power-devices/AMCC15 0x23806003b0 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFR_AMCC_6 0x23806003b8 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFR_AMCC_7 0x23806003c0 -> MISSING
+/arm-io/pmgr/power-devices/DCS_12 0x23806003c8 -> MISSING
+/arm-io/pmgr/power-devices/DCS_13 0x23806003d8 -> MISSING
+/arm-io/pmgr/power-devices/DCS_14 0x23806003e8 -> MISSING
+/arm-io/pmgr/power-devices/DCS_15 0x23806003f8 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFC_AMCC_3 0x2380600408 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFI_AMCC_4 0x2380600410 -> MISSING
+/arm-io/pmgr/power-devices/AMCC16 0x2380600418 -> MISSING
+/arm-io/pmgr/power-devices/AMCC17 0x2380600420 -> MISSING
+/arm-io/pmgr/power-devices/AMCC18 0x2380600428 -> MISSING
+/arm-io/pmgr/power-devices/AMCC19 0x2380600430 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFR_AMCC_8 0x2380600438 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFR_AMCC_9 0x2380600440 -> MISSING
+/arm-io/pmgr/power-devices/DCS_16 0x2380600448 -> MISSING
+/arm-io/pmgr/power-devices/DCS_17 0x2380600458 -> MISSING
+/arm-io/pmgr/power-devices/DCS_18 0x2380600468 -> MISSING
+/arm-io/pmgr/power-devices/DCS_19 0x2380600478 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFC_AMCC_4 0x2380600488 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFI_AMCC_5 0x2380600490 -> MISSING
+/arm-io/pmgr/power-devices/AMCC20 0x2380600498 -> MISSING
+/arm-io/pmgr/power-devices/AMCC21 0x23806004a0 -> MISSING
+/arm-io/pmgr/power-devices/AMCC22 0x23806004a8 -> MISSING
+/arm-io/pmgr/power-devices/AMCC23 0x23806004b0 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFR_AMCC_10 0x23806004b8 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFR_AMCC_11 0x23806004c0 -> MISSING
+/arm-io/pmgr/power-devices/DCS_20 0x23806004c8 -> MISSING
+/arm-io/pmgr/power-devices/DCS_21 0x23806004d8 -> MISSING
+/arm-io/pmgr/power-devices/DCS_22 0x23806004e8 -> MISSING
+/arm-io/pmgr/power-devices/DCS_23 0x23806004f8 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFC_AMCC_5 0x2380600508 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFI_AMCC_6 0x2380600510 -> MISSING
+/arm-io/pmgr/power-devices/AMCC24 0x2380600518 -> MISSING
+/arm-io/pmgr/power-devices/AMCC25 0x2380600520 -> MISSING
+/arm-io/pmgr/power-devices/AMCC26 0x2380600528 -> MISSING
+/arm-io/pmgr/power-devices/AMCC27 0x2380600530 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFR_AMCC_12 0x2380600538 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFR_AMCC_13 0x2380600540 -> MISSING
+/arm-io/pmgr/power-devices/DCS_24 0x2380600548 -> MISSING
+/arm-io/pmgr/power-devices/DCS_25 0x2380600558 -> MISSING
+/arm-io/pmgr/power-devices/DCS_26 0x2380600568 -> MISSING
+/arm-io/pmgr/power-devices/DCS_27 0x2380600578 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFC_AMCC_6 0x2380600588 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFI_AMCC_7 0x2380600590 -> MISSING
+/arm-io/pmgr/power-devices/AMCC28 0x2380600598 -> MISSING
+/arm-io/pmgr/power-devices/AMCC29 0x23806005a0 -> MISSING
+/arm-io/pmgr/power-devices/AMCC30 0x23806005a8 -> MISSING
+/arm-io/pmgr/power-devices/AMCC31 0x23806005b0 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFR_AMCC_14 0x23806005b8 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFR_AMCC_15 0x23806005c0 -> MISSING
+/arm-io/pmgr/power-devices/TRACE_FAB_GFX - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DCS_28 0x23806005d0 -> MISSING
+/arm-io/pmgr/power-devices/DCS_29 0x23806005e0 -> MISSING
+/arm-io/pmgr/power-devices/DCS_30 0x23806005f0 -> MISSING
+/arm-io/pmgr/power-devices/DCS_31 0x2380600600 -> MISSING
+/arm-io/pmgr/power-devices/FAB_AFC_AMCC_7 0x2380600610 -> MISSING
+/arm-io/pmgr/power-devices/FAB_B2BD_AFI_0 0x2380600618 -> MISSING
+/arm-io/pmgr/power-devices/FAB_B2BD_AFI_1 0x2380600620 -> MISSING
+/arm-io/pmgr/power-devices/B2BD_AFI_0 0x2380600628 -> MISSING
+/arm-io/pmgr/power-devices/B2BD_AFI_0_DFX 0x2380600630 -> MISSING
+/arm-io/pmgr/power-devices/B2BD_AFI_1 0x2380600638 -> MISSING
+/arm-io/pmgr/power-devices/B2BD_AFI_1_DFX 0x2380600640 -> MISSING
+/arm-io/pmgr/power-devices/FAB_B2BD_AFC_0 0x2380600648 -> MISSING
+/arm-io/pmgr/power-devices/FAB_B2BD_AFC_1 0x2380600650 -> MISSING
+/arm-io/pmgr/power-devices/B2BD_AFC_0 0x2380600658 -> MISSING
+/arm-io/pmgr/power-devices/B2BD_AFC_0_DFX 0x2380600660 -> MISSING
+/arm-io/pmgr/power-devices/B2BD_AFC_1 0x2380600668 -> MISSING
+/arm-io/pmgr/power-devices/B2BD_AFC_1_DFX 0x2380600670 -> MISSING
+/arm-io/pmgr/power-devices/B2BD_AFR_0 0x2380600678 -> MISSING
+/arm-io/pmgr/power-devices/B2BD_AFR_1 0x2380600680 -> MISSING
+/arm-io/pmgr/power-devices/B2BD_AFR_DFX_0 0x2380600688 -> MISSING
+/arm-io/pmgr/power-devices/B2BD_AFR_DFX_1 0x2380600690 -> MISSING
+/arm-io/pmgr/power-devices/B2BD_AFR_3 0x2380600698 -> MISSING
+/arm-io/pmgr/power-devices/B2BD_AFR_2 0x23806006a0 -> MISSING
+/arm-io/pmgr/power-devices/B2BD_AFR_DFX_3 0x23806006a8 -> MISSING
+/arm-io/pmgr/power-devices/B2BD_AFR_DFX_2 0x23806006b0 -> MISSING
+/arm-io/pmgr/power-devices/B2BG_DFT 0x23806006b8 -> MISSING
+/arm-io/pmgr/power-devices/B2BG_CNTL_DFX 0x23806006c0 -> MISSING
+/arm-io/pmgr/power-devices/B2BG_DBG_0 0x23806006c8 -> MISSING
+/arm-io/pmgr/power-devices/B2BG_DBG_1 0x23806006d0 -> MISSING
+/arm-io/pmgr/power-devices/B2BG_DBG_2 0x23806006d8 -> MISSING
+/arm-io/pmgr/power-devices/B2BD_CNTL_DFX_0 0x23806006e0 -> MISSING
+/arm-io/pmgr/power-devices/B2BD_CNTL_DFX_1 0x23806006e8 -> MISSING
+/arm-io/pmgr/power-devices/B2BD_DBG_0 0x23806006f0 -> MISSING
+/arm-io/pmgr/power-devices/B2BD_DBG_1 0x23806006f8 -> MISSING
+/arm-io/pmgr/power-devices/B2BD_DBG_2 0x2380600700 -> MISSING
+/arm-io/pmgr/power-devices/B2BD_DBG_3 0x2380600708 -> MISSING
+/arm-io/pmgr/power-devices/B2BD_DBG_4 0x2380600710 -> MISSING
+/arm-io/pmgr/power-devices/VENC0_DMA 0x2380608000 -> /soc@2308000000/power-management@2380600000/power-controller@8000
+/arm-io/pmgr/power-devices/VENC0_PIPE4 0x2380608008 -> /soc@2308000000/power-management@2380600000/power-controller@8008
+/arm-io/pmgr/power-devices/VENC0_PIPE5 0x2380608010 -> /soc@2308000000/power-management@2380600000/power-controller@8010
+/arm-io/pmgr/power-devices/VENC0_ME0 0x2380608018 -> /soc@2308000000/power-management@2380600000/power-controller@8018
+/arm-io/pmgr/power-devices/VENC0_ME1 0x2380608020 -> /soc@2308000000/power-management@2380600000/power-controller@8020
+/arm-io/pmgr/power-devices/VENC1_DMA 0x2380608028 -> /soc@2308000000/power-management@2380600000/power-controller@8028
+/arm-io/pmgr/power-devices/VENC1_PIPE4 0x2380608030 -> /soc@2308000000/power-management@2380600000/power-controller@8030
+/arm-io/pmgr/power-devices/VENC1_PIPE5 0x2380608038 -> /soc@2308000000/power-management@2380600000/power-controller@8038
+/arm-io/pmgr/power-devices/VENC1_ME0 0x2380608040 -> /soc@2308000000/power-management@2380600000/power-controller@8040
+/arm-io/pmgr/power-devices/VENC1_ME1 0x2380608048 -> /soc@2308000000/power-management@2380600000/power-controller@8048
+/arm-io/pmgr/power-devices/DEBUG_GFX_GATED 0x2388300058 -> MISSING
+/arm-io/pmgr/power-devices/NUB_GFX_AON 0x2388300060 -> MISSING
+/arm-io/pmgr/power-devices/NUB_GFX_GPIO 0x2388300068 -> MISSING
+/arm-io/pmgr/power-devices/NUB_GFX_OCLA - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/NUB_GFX_FABRIC 0x2388300078 -> MISSING
+/arm-io/pmgr/power-devices/DEBUG_GFX_SWITCH 0x2388300080 -> MISSING
+/arm-io/pmgr/power-devices/NUB_GFX_SRAM 0x2388304000 -> MISSING
+/arm-io/pmgr/power-devices/MACC0_0_SRAM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MACC0_1_SRAM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MACC0_2_SRAM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MACC0_3_SRAM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MACC0_4_SRAM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MACC0_5_SRAM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MACC1_0_SRAM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MACC1_1_SRAM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MACC1_2_SRAM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MACC1_3_SRAM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MACC1_4_SRAM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MACC1_5_SRAM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/PACC_0_SRAM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/PACC_1_SRAM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/PACC_2_SRAM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/PACC_3_SRAM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/PACC_4_SRAM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/PACC_5_SRAM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MCPM0_SRAM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MCPM1_SRAM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/PCPM_SRAM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MCPM0_NRG - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MCPM1_NRG - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/PCPM_NRG - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/ATC0_USB_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/SIO_CPU_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/SIO_DART_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/ATC1_USB_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/ATC0_USB_DART - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/ATC1_USB_DART - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/ATC2_USB_DART - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/ATC3_USB_DART - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/APCIE_SYS_GX_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/APCIE_SYS_STX_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/GFX_SGX - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/GFX_ASC - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/GFX_ASC1 - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/GFX_BUSY - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/ANE_SYS_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/ANE_SYS_V_PMP - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/ANE_SYS_DART - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/VENC0_SYS_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/VENC0_FAST - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/VENC0_SOC_VMAX - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AVD_SOC_VNOM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AVD_SOC_VMAX - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/JPG_SOC_VNOM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/JPG_SOC_VMAX - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MSR0_SOC_VNOM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MSR0_SOC_VMAX - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/ISP_SOC_VNOM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/ISP_SOC_VMAX - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/SCODEC_SOC_VNOM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/SCODEC_SOC_VMAX - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/VENC1_FAST - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/VENC1_SOC_VMAX - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MSR1_SOC_VNOM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MSR1_SOC_VMAX - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/PRORES_SOC_VNOM - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/PRORES_SOC_VMAX - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/VENC0_MEM_FAST - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/VENC0_SYS_DART - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AVD_SYS_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AVD_SOC_DART - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/JPG0_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/JPG0_DART - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/JPG1_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/JPG1_DART - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MSR0_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MSR0_DART - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/ISP_SYS_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/ISP_SYS_DART - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISP_CPU_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT0_CPU_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT1_CPU_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT2_CPU_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT3_CPU_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/CIO0_RECONFIG_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/CIO1_RECONFIG_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/CIO2_RECONFIG_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/CIO3_RECONFIG_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AUSB0_AONPCIE_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AUSB1_AONPCIE_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AUSB2_AONPCIE_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AUSB3_AONPCIE_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/AUDIO_P_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/SCODEC_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/SCODEC_DART - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/VENC1_SYS_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/VENC1_MEM_FAST - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/VENC1_SYS_DART - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MSR1_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MSR1_DART - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/PRORES_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/PRORES_DART - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/SMC_FAB_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/MTP_FAB_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/ATC0_USB_AON_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/ATC1_USB_AON_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/ATC2_USB_AON_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/ATC3_USB_AON_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISP_MIE_DPB - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISP_FB_ACTIVE - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISP_CARVE_OUT - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/ANS_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/APCIE_GP_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/APCIE_SYS_GP_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/APCIE_ST0_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/APCIE_SYS_ST0_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/APCIE_ST1_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/APCIE_SYS_ST1_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/APCIE_PHY_SW~2 - -> MISSING
+/arm-io/pmgr/power-devices/AUSS_V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISP-M3-V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT0-M3-V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT1-M3-V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT2-M3-V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/pmgr/power-devices/DISPEXT3-M3-V - -> WAIVED: Virtual PMGR vote with no power-state register in the ADT table; not a separate power controller.
+/arm-io/event-log-handler 0x280040000 -> /soc/event-log@280040000
+/arm-io/event-log-handler/:sotra_h17d_76 - -> MISSING
+/arm-io/event-log-handler/:sotra_h17d_77 - -> MISSING
+/arm-io/event-log-handler/:sotra_h17d_78 - -> MISSING
+/arm-io/sio 0x505e00000 -> /soc/dma-controller@505e00000
+/arm-io/sio/iop-sio-nub - -> /soc/dma-controller@505e00000
+/arm-io/sio/iop-sio-nub/sio-dma - -> /soc/dma-controller@505e00000
+/arm-io/dart-sio 0x505060000 -> /soc/iommu@505060000
+/arm-io/dart-sio/mapper-sio - -> /soc/iommu@505060000
+/arm-io/dart-sio/mapper-aes - -> /soc/iommu@505060000
+/arm-io/pmp0 0x284e00000 -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17s_26 - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17c_38 - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17cr1_33 - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17cr2_33 - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17d_87 - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17c_39 - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17cr1_34 - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17cr2_34 - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17s_27 - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17s_28 - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17c_40 - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17d_88 - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17cr1_35 - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17cr2_35 - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17s_29 - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17c_41 - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17cr1_36 - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17cr2_36 - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17d_89 - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17s_30 - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17c_42 - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17cr1_37 - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17cr2_37 - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17d_90 - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17s_31 - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17c_43 - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17cr1_38 - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17cr2_38 - -> /soc/pmp@284e00000
+/arm-io/pmp0/iop-pmp0-nub/:sotra_h17d_91 - -> /soc/pmp@284e00000
+/arm-io/dart-pmp0 0x2841a0000 -> /soc/iommu@2841a0000
+/arm-io/dart-pmp0/mapper-pmp0 - -> /soc/iommu@2841a0000
+/arm-io/dart-pmp0/mapper-pmp0-ptd-fwd - -> /soc/iommu@2841a0000
+/arm-io/pmp1 - -> MISSING
+/arm-io/pmp1/iop-pmp1-nub - -> WAIVED: Firmware endpoint container; hosting coprocessor is inventoried separately.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17s_26 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17c_38 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17cr1_33 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17cr2_33 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17d_87 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17c_39 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17cr1_34 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17cr2_34 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17s_27 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17s_28 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17c_40 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17d_88 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17cr1_35 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17cr2_35 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17s_29 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17c_41 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17cr1_36 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17cr2_36 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17d_89 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17s_30 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17c_42 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17cr1_37 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17cr2_37 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17d_90 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17s_31 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17c_43 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17cr1_38 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17cr2_38 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/pmp1/iop-pmp1-nub/:sotra_h17d_91 - -> WAIVED: Firmware-discovered coprocessor service; no independent MMIO device.
+/arm-io/dart-pmp1 - -> MISSING
+/arm-io/dart-pmp1/mapper-pmp1 - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/dart-pmp1/mapper-pmp1-ptd-fwd - -> WAIVED: IOMMU stream, described by iommus or iommu-map; DART hardware is inventoried separately.
+/arm-io/sep 0x502600000 -> /soc@200000000/sep@502600000
+/arm-io/sep/iop-sep-nub - -> /soc@200000000/sep@502600000
+/arm-io/sep/iop-sep-nub/Sandcat - -> /soc@200000000/sep@502600000
+/arm-io/sep/iop-sep-nub/xART - -> /soc@200000000/sep@502600000
+/arm-io/sep/iop-sep-nub/InvalidateHmac - -> /soc@200000000/sep@502600000
+/arm-io/dart-sep 0x500b80000 -> /soc@200000000/iommu@500b80000
+/arm-io/dart-sep/mapper-sep - -> /soc@200000000/iommu@500b80000
+/arm-io/dart-sep/mapper-sep-exclave - -> /soc@200000000/iommu@500b80000
+/arm-io/esm 0x54267c000 -> MISSING
+/arm-io/ans 0x419600000 -> /soc@200000000/nvme@45dcc0000
+/arm-io/ans/iop-ans-nub - -> /soc@200000000/nvme@45dcc0000
+/arm-io/ans/ans-pcie - -> WAIVED: Internal coprocessor PCI topology; represented by the ANS controller.
+/arm-io/sart-ans 0x41dc50000 -> /soc@200000000/iommu@41dc50000
+/arm-io/smc 0x28c600000 -> /soc@200000000/smc@28c600000
+/arm-io/smc/iop-smc-nub - -> /soc@200000000/smc@28c600000
+/arm-io/smc/iop-smc-nub/smc-pmu - -> /soc@200000000/smc@28c600000
+/arm-io/smc/iop-smc-nub/smc-charger-util-0 - -> /soc@200000000/smc@28c600000
+/arm-io/smc/iop-smc-nub/smc-charger-util-1 - -> /soc@200000000/smc@28c600000
+/arm-io/smc/iop-smc-nub/smc-charger-util-2 - -> /soc@200000000/smc@28c600000
+/arm-io/smc/iop-smc-nub/smc-charger-util - -> /soc@200000000/smc@28c600000
+/arm-io/aon-ptd 0x28cdc0000 -> /soc/aon-ptd@28cdc0000
+/arm-io/rsm 0x288825000 -> /soc/rsm@288825000
+/arm-io/dart-rsm 0x2889a0000 -> /soc/iommu@2889a0000
+/arm-io/dart-rsm/mapper-rsm - -> /soc/iommu@2889a0000
+/arm-io/uart0 0x505200000 -> /soc/serial@505200000
+/arm-io/uart0/debug-console - -> /soc/serial@505200000
+/arm-io/dockchannel-uart 0x288e28000 -> MISSING
+/arm-io/qspi 0x505118000 -> /soc@200000000/spi@505118000
+/arm-io/qspi/spinor /arm-io/qspi@0x0 -> MISSING
+/arm-io/qspi/spinor/firmware - -> WAIVED: Firmware flash partition; parent flash hardware is inventoried separately.
+/arm-io/qspi/spinor/anvram - -> WAIVED: Firmware NVRAM partition; parent flash hardware is inventoried separately.
+/arm-io/qspi/spinor/syscfg - -> WAIVED: Firmware configuration partition; parent flash hardware is inventoried separately.
+/arm-io/dp2hdmi-gpio0 - -> MISSING
+/arm-io/atc-phy0 0x2a2a90000 -> MISSING
+/arm-io/dart-usb0 0x2a2f00000 -> /soc/iommu@2a2f00000
+/arm-io/dart-usb0/mapper-usb0 - -> /soc/iommu@2a2f00000
+/arm-io/usb-drd0 0x2a2280000 -> /soc/usb@2a2280000
+/arm-io/usb-drd0/usb-drd0-port-hs - -> /soc/usb@2a2280000
+/arm-io/usb-drd0/usb-drd0-port-ss - -> /soc/usb@2a2280000
+/arm-io/atc-phy1 0x2aaa90000 -> /soc@200000000/phy@2ab000000
+/arm-io/dart-usb1 0x2aaf00000 -> /soc@200000000/iommu@2aaf00000
+/arm-io/dart-usb1/mapper-usb1 - -> /soc@200000000/iommu@2aaf00000
+/arm-io/usb-drd1 0x2aa280000 -> /soc@200000000/usb@2aa280000
+/arm-io/usb-drd1/usb-drd1-port-hs - -> /soc@200000000/usb@2aa280000
+/arm-io/usb-drd1/usb-drd1-port-ss - -> /soc@200000000/usb@2aa280000
+/arm-io/atc-phy2 0x382a90000 -> /soc@200000000/phy@383000000
+/arm-io/dart-usb2 0x382f00000 -> /soc@200000000/iommu@382f00000
+/arm-io/dart-usb2/mapper-usb2 - -> /soc@200000000/iommu@382f00000
+/arm-io/usb-drd2 0x382280000 -> /soc@200000000/usb@382280000
+/arm-io/usb-drd2/usb-drd2-port-hs - -> /soc@200000000/usb@382280000
+/arm-io/usb-drd2/usb-drd2-port-ss - -> /soc@200000000/usb@382280000
+/arm-io/atc-phy3 0x38aa90000 -> /soc@200000000/phy@38b000000
+/arm-io/dart-auss0 0x395d60000 -> /soc/iommu@395d60000
+/arm-io/dart-auss0/mapper-auss0 - -> /soc/iommu@395d60000
+/arm-io/usb-auss0 0x3953f0000 -> /soc/usb@3953f0000
+/arm-io/nub-spmi0 0x28a014000 -> /soc@200000000/spmi@28a014000
+/arm-io/nub-spmi0/spmi-abbeyL1 /arm-io/nub-spmi0@0xe -> /soc@200000000/spmi@28a014000/pmic@e
+/arm-io/nub-spmi0/spmi-mosquitoM0 /arm-io/nub-spmi0@0x9 -> MISSING
+/arm-io/nub-spmi0/btm /arm-io/nub-spmi0@0xb -> MISSING
+/arm-io/nub-spmi2 0x28a094000 -> /soc/spmi@28a094000
+/arm-io/nub-spmi2/spmi-abbeyF1 /arm-io/nub-spmi2@0xe -> MISSING
+/arm-io/nub-spmi3 0x28a0d4000 -> /soc/spmi@28a0d4000
+/arm-io/nub-spmi3/spmi-abbeyF2 /arm-io/nub-spmi3@0xe -> MISSING
+/arm-io/nub-spmi-a0 0x28a188000 -> /soc@200000000/spmi@28a188000
+/arm-io/nub-spmi-a0/hpm0 /arm-io/nub-spmi-a0@0xc -> MISSING
+/arm-io/nub-spmi-a0/hpm1 /arm-io/nub-spmi-a0@0xa -> /soc@200000000/spmi@28a188000/usb-pd@a
+/arm-io/nub-spmi-a0/hpm5 /arm-io/nub-spmi-a0@0x8 -> MISSING
+/arm-io/aop-spmi0 0x290914000 -> /soc/spmi@290914000
+/arm-io/aop-spmi0/stockholm-spmi /arm-io/aop-spmi0@0x9 -> MISSING
+/arm-io/aop-spmi0/stockholm-spmi/stockholm - -> WAIVED: NFC firmware service of the parent SPMI device, not another addressed bus device.
+/arm-io/aop-spmi0/spmi-wifibt /arm-io/aop-spmi0@0xe -> MISSING
+/arm-io/dptx0-aux 0x29c260000 -> /soc/aux@29c260000
+/arm-io/dptx0-aux/dptx0-aux-core 0x29c260000 -> /soc/aux@29c260000
+/arm-io/dptx0-aux/dptx0-aux-ufp - -> MISSING
+/arm-io/dptx1-aux 0x29c264000 -> /soc/aux@29c264000
+/arm-io/dptx1-aux/dptx1-aux-core 0x29c264000 -> /soc/aux@29c264000
+/arm-io/dptx1-aux/dptx1-aux-ufp - -> MISSING
+/arm-io/disp0 0x488000000 -> /soc/dcp@48ae00000
+/arm-io/dart-disp0 0x48a300000 -> /soc/iommu@48a300000
+/arm-io/dart-disp0/mapper-disp0 - -> /soc/iommu@48a300000
+/arm-io/dart-disp0/mapper-disp0-piodma - -> /soc/iommu@48a300000
+/arm-io/dart-disp0/mapper-disp0-scl - -> /soc/iommu@48a300000
+/arm-io/dart-disp0/mapper-disp0-sca - -> /soc/iommu@48a300000
+/arm-io/dcp0-expert 0x48a3ac058 -> /soc/dcp-expert@48a3ac058
+/arm-io/dcp 0x48ae00000 -> /soc/dcp@48ae00000
+/arm-io/dcp/iop-dcp-nub - -> /soc/dcp@48ae00000
+/arm-io/dart-dcp 0x48a340000 -> /soc/iommu@48a340000
+/arm-io/dart-dcp/mapper-dcp - -> /soc/iommu@48a340000
+/arm-io/dart-dcp/mapper-dcp-exclave - -> /soc/iommu@48a340000
+/arm-io/dcp0-sac-controller - -> MISSING
+/arm-io/dp-audio0 - -> WAIVED: Logical display audio DMA endpoint; SIO and display controllers are inventoried separately.
+/arm-io/dart-disp0-isoc 0x48a180000 -> /soc/iommu@48a180000
+/arm-io/dart-disp0-isoc/mapper-disp0-dpa - -> /soc/iommu@48a180000
+/arm-io/admac-disp0 0x48a140000 -> /soc/dma-controller@48a140000
+/arm-io/admac-disp0-ced-ssw 0x48a2f4000 -> MISSING
+/arm-io/dispext0 0x2b0000000 -> /soc@200000000/dcp@2b2e00000
+/arm-io/dcpext0-expert 0x2b23ac058 -> /soc/dcp-expert@2b23ac058
+/arm-io/dcpext0 0x2b2e00000 -> /soc@200000000/dcp@2b2e00000
+/arm-io/dcpext0/iop-dcpext0-nub - -> /soc@200000000/dcp@2b2e00000
+/arm-io/dart-dcpext0 0x2b2340000 -> /soc@200000000/iommu@2b2340000
+/arm-io/dart-dcpext0/mapper-dcpext0 - -> /soc@200000000/iommu@2b2340000
+/arm-io/dart-dcpext0/mapper-dcpext0-exclave - -> /soc@200000000/iommu@2b2340000
+/arm-io/dart-dispext0 0x2b2300000 -> /soc@200000000/iommu@2b2300000
+/arm-io/dart-dispext0/mapper-dispext0 - -> /soc@200000000/iommu@2b2300000
+/arm-io/dart-dispext0/mapper-dispext0-piodma - -> /soc@200000000/iommu@2b2300000
+/arm-io/dp-audio1 - -> WAIVED: Logical display audio DMA endpoint; SIO and display controllers are inventoried separately.
+/arm-io/dart-dispext0-isoc 0x2b2180000 -> /soc/iommu@2b2180000
+/arm-io/dart-dispext0-isoc/mapper-dispext0-dpa - -> /soc/iommu@2b2180000
+/arm-io/admac-dispext0 0x2b2140000 -> /soc/dma-controller@2b2140000
+/arm-io/admac-dispext0-ced-ssw 0x2b22f4000 -> MISSING
+/arm-io/dispext1 0x390000000 -> /soc/dcp@392e00000
+/arm-io/dcpext1-expert 0x3923ac058 -> /soc/dcp-expert@3923ac058
+/arm-io/dcpext1 0x392e00000 -> /soc/dcp@392e00000
+/arm-io/dcpext1/iop-dcpext1-nub - -> /soc/dcp@392e00000
+/arm-io/dart-dcpext1 0x392340000 -> /soc/iommu@392340000
+/arm-io/dart-dcpext1/mapper-dcpext1 - -> /soc/iommu@392340000
+/arm-io/dart-dcpext1/mapper-dcpext1-exclave - -> /soc/iommu@392340000
+/arm-io/dart-dispext1 0x392300000 -> /soc/iommu@392300000
+/arm-io/dart-dispext1/mapper-dispext1 - -> /soc/iommu@392300000
+/arm-io/dart-dispext1/mapper-dispext1-piodma - -> /soc/iommu@392300000
+/arm-io/dp-audio2 - -> WAIVED: Logical display audio DMA endpoint; SIO and display controllers are inventoried separately.
+/arm-io/dart-dispext1-isoc 0x392180000 -> /soc/iommu@392180000
+/arm-io/dart-dispext1-isoc/mapper-dispext1-dpa - -> /soc/iommu@392180000
+/arm-io/admac-dispext1 0x392140000 -> /soc/dma-controller@392140000
+/arm-io/admac-dispext1-ced-ssw 0x3922f4000 -> MISSING
+/arm-io/dispext2 0x300000000 -> /soc/dcp@302e00000
+/arm-io/dcpext2-expert 0x3023ac058 -> /soc/dcp-expert@3023ac058
+/arm-io/dcpext2 0x302e00000 -> /soc/dcp@302e00000
+/arm-io/dcpext2/iop-dcpext2-nub - -> /soc/dcp@302e00000
+/arm-io/dart-dcpext2 0x302340000 -> /soc/iommu@302340000
+/arm-io/dart-dcpext2/mapper-dcpext2 - -> /soc/iommu@302340000
+/arm-io/dart-dcpext2/mapper-dcpext2-exclave - -> /soc/iommu@302340000
+/arm-io/dart-dispext2 0x302300000 -> /soc/iommu@302300000
+/arm-io/dart-dispext2/mapper-dispext2 - -> /soc/iommu@302300000
+/arm-io/dart-dispext2/mapper-dispext2-piodma - -> /soc/iommu@302300000
+/arm-io/dp-audio3 - -> WAIVED: Logical display audio DMA endpoint; SIO and display controllers are inventoried separately.
+/arm-io/dart-dispext2-isoc 0x302180000 -> /soc/iommu@302180000
+/arm-io/dart-dispext2-isoc/mapper-dispext2-dpa - -> /soc/iommu@302180000
+/arm-io/admac-dispext2 0x302140000 -> /soc/dma-controller@302140000
+/arm-io/admac-dispext2-ced-ssw 0x3022f4000 -> MISSING
+/arm-io/dispext3 0x304000000 -> /soc/dcp@306e00000
+/arm-io/dcpext3-expert 0x3063ac058 -> /soc/dcp-expert@3063ac058
+/arm-io/dcpext3 0x306e00000 -> /soc/dcp@306e00000
+/arm-io/dcpext3/iop-dcpext3-nub - -> /soc/dcp@306e00000
+/arm-io/dart-dcpext3 0x306340000 -> /soc/iommu@306340000
+/arm-io/dart-dcpext3/mapper-dcpext3 - -> /soc/iommu@306340000
+/arm-io/dart-dcpext3/mapper-dcpext3-exclave - -> /soc/iommu@306340000
+/arm-io/dart-dispext3 0x306300000 -> /soc/iommu@306300000
+/arm-io/dart-dispext3/mapper-dispext3 - -> /soc/iommu@306300000
+/arm-io/dart-dispext3/mapper-dispext3-piodma - -> /soc/iommu@306300000
+/arm-io/dp-audio4 - -> WAIVED: Logical display audio DMA endpoint; SIO and display controllers are inventoried separately.
+/arm-io/dart-dispext3-isoc 0x306180000 -> /soc/iommu@306180000
+/arm-io/dart-dispext3-isoc/mapper-dispext3-dpa - -> /soc/iommu@306180000
+/arm-io/admac-dispext3 0x306140000 -> /soc/dma-controller@306140000
+/arm-io/admac-dispext3-ced-ssw 0x3062f4000 -> MISSING
+/arm-io/dart-scaler 0x2285260000 -> /soc/iommu@2285260000
+/arm-io/dart-scaler/:sotra_h17d_93 - -> MISSING
+/arm-io/dart-scaler/:sotra_h17c_44 - -> MISSING
+/arm-io/dart-scaler/:sotra_h17cr1_39 - -> MISSING
+/arm-io/dart-scaler/:sotra_h17cr2_39 - -> MISSING
+/arm-io/dart-scaler/:sotra_h17s_32 - -> MISSING
+/arm-io/dart-scaler/mapper-scaler - -> /soc/iommu@2285260000
+/arm-io/dart-scaler/mapper-scaler-piodma - -> /soc/iommu@2285260000
+/arm-io/scaler0 0x2285000000 -> /soc/scaler@2285000000
+/arm-io/scaler0/:sotra_h17c_0 - -> MISSING
+/arm-io/scaler0/:sotra_h17d_0 - -> MISSING
+/arm-io/scaler0/:sotra_h17s_0 - -> MISSING
+/arm-io/scaler0/:sotra_h17cr1_0 - -> MISSING
+/arm-io/scaler0/:sotra_h17cr2_0 - -> MISSING
+/arm-io/dart-scaler0 0x2285260000 -> /soc/iommu@2285260000
+/arm-io/dart-scaler0/mapper-scaler0 - -> /soc/iommu@2285260000
+/arm-io/dart-scaler0/mapper-scaler-piodma0 - -> /soc/iommu@2285260000
+/arm-io/scaler1 0x23a1000000 -> /soc/scaler@23a1000000
+/arm-io/scaler1/:sotra_h17c_0 - -> MISSING
+/arm-io/scaler1/:sotra_h17d_0 - -> MISSING
+/arm-io/scaler1/:sotra_h17s_0 - -> MISSING
+/arm-io/scaler1/:sotra_h17cr1_0 - -> MISSING
+/arm-io/scaler1/:sotra_h17cr2_0 - -> MISSING
+/arm-io/dart-scaler1 0x23a1260000 -> /soc/iommu@23a1260000
+/arm-io/dart-scaler1/mapper-scaler1 - -> /soc/iommu@23a1260000
+/arm-io/dart-scaler1/mapper-scaler-piodma1 - -> /soc/iommu@23a1260000
+/arm-io/ave0 0x2283100000 -> /soc/video-encoder@2283100000
+/arm-io/ave0/:sotra_h17c_0 - -> MISSING
+/arm-io/ave0/:sotra_h17d_0 - -> MISSING
+/arm-io/ave0/:sotra_h17s_0 - -> MISSING
+/arm-io/ave0/:sotra_h17cr1_0 - -> MISSING
+/arm-io/ave0/:sotra_h17cr2_0 - -> MISSING
+/arm-io/dart-ave0 0x22830a0000 -> /soc/iommu@22830a0000
+/arm-io/dart-ave0/mapper-ave0 - -> /soc/iommu@22830a0000
+/arm-io/ave1 0x23a3100000 -> /soc/video-encoder@23a3100000
+/arm-io/ave1/:sotra_h17c_0 - -> MISSING
+/arm-io/ave1/:sotra_h17d_0 - -> MISSING
+/arm-io/ave1/:sotra_h17s_0 - -> MISSING
+/arm-io/ave1/:sotra_h17cr1_0 - -> MISSING
+/arm-io/ave1/:sotra_h17cr2_0 - -> MISSING
+/arm-io/dart-ave1 0x23a30a0000 -> /soc/iommu@23a30a0000
+/arm-io/dart-ave1/mapper-ave1 - -> /soc/iommu@23a30a0000
+/arm-io/apr0 0x48d000000 -> /soc/prores@48d000000
+/arm-io/dart-apr0 0x48d020000 -> /soc/iommu@48d020000
+/arm-io/dart-apr0/mapper-apr0 - -> /soc/iommu@48d020000
+/arm-io/dart-apr1 0x230b020000 -> /soc/iommu@230b020000
+/arm-io/dart-apr1/mapper-apr1 - -> /soc/iommu@230b020000
+/arm-io/:sotra_h17cr1_42 - -> MISSING
+/arm-io/:sotra_h17cr1_42/apr1 - -> MISSING
+/arm-io/:sotra_h17cr2_42 - -> MISSING
+/arm-io/:sotra_h17cr2_42/apr1 - -> MISSING
+/arm-io/:sotra_h17c_48 - -> MISSING
+/arm-io/:sotra_h17c_48/apr1 - -> MISSING
+/arm-io/:sotra_h17d_97 - -> MISSING
+/arm-io/:sotra_h17d_97/apr1 - -> MISSING
+/arm-io/jpeg0 0x2281000000 -> /soc/jpeg@2281000000
+/arm-io/jpeg1 0x2281060000 -> /soc/jpeg@2281060000
+/arm-io/dart-jpeg0 0x2281020000 -> /soc/iommu@2281020000
+/arm-io/dart-jpeg0/mapper-jpeg0 - -> /soc/iommu@2281020000
+/arm-io/dart-jpeg0/mapper-jpeg1 - -> /soc/iommu@2281020000
+/arm-io/ane0 0x508000000 -> /soc/neural-processor@508000000
+/arm-io/dart-ane0 0x509800000 -> /soc/iommu@509800000
+/arm-io/dart-ane0/mapper-ane0 - -> /soc/iommu@509800000
+/arm-io/dart-ane0/mapper-ane0-iso1 - -> /soc/iommu@509800000
+/arm-io/dart-ane0/mapper-ane0-iso2 - -> /soc/iommu@509800000
+/arm-io/dart-ane0/mapper-ane0-iso3 - -> /soc/iommu@509800000
+/arm-io/dart-ane0/mapper-ane0-iso4 - -> /soc/iommu@509800000
+/arm-io/dart-ane0/mapper-ane0-iso5 - -> /soc/iommu@509800000
+/arm-io/dart-ane0/mapper-ane0-iso6 - -> /soc/iommu@509800000
+/arm-io/dart-ane0/mapper-ane0-iso7 - -> /soc/iommu@509800000
+/arm-io/dart-ane0/mapper-ane0-mpm - -> /soc/iommu@509800000
+/arm-io/avd0 0x2308000000 -> /soc@2308000000/avd@2309080000
+/arm-io/avd0/:sotra_h17c_0 - -> MISSING
+/arm-io/avd0/:sotra_h17d_0 - -> MISSING
+/arm-io/avd0/:sotra_h17s_0 - -> MISSING
+/arm-io/avd0/:sotra_h17cr1_0 - -> MISSING
+/arm-io/avd0/:sotra_h17cr2_0 - -> MISSING
+/arm-io/dart-avd0 0x2309020000 -> /soc@2308000000/iommu@2309020000
+/arm-io/dart-avd0/mapper-avd0 - -> /soc@2308000000/iommu@2309020000
+/arm-io/dart-avd0/mapper-avd0-piodma - -> /soc@2308000000/iommu@2309020000
+/arm-io/dart-avd0/mapper-avd0-adsbuf - -> /soc@2308000000/iommu@2309020000
+/arm-io/sgx 0x2300000000 -> /soc/gpu@2300000000
+/arm-io/sgx/:sotra_h17c_0 - -> MISSING
+/arm-io/sgx/:sotra_h17d_0 - -> MISSING
+/arm-io/sgx/:sotra_h17s_0 - -> MISSING
+/arm-io/sgx/:sotra_h17cr1_0 - -> MISSING
+/arm-io/sgx/:sotra_h17cr2_0 - -> MISSING
+/arm-io/gfx-asc 0x2302600000 -> MISSING
+/arm-io/gfx-asc/iop-gfx-nub - -> WAIVED: Firmware endpoint container; hosting coprocessor is inventoried separately.
+/arm-io/gfx1-asc 0x2302e00000 -> /soc/gpu-coproc@2302e00000
+/arm-io/gfx1-asc/iop-gfx1-nub - -> /soc/gpu-coproc@2302e00000
+/arm-io/mapper-gfx-asc - -> WAIVED: GPU firmware IOMMU stream; represented by the GPU IOMMU relationship.
+/arm-io/sapt - -> WAIVED: Firmware audio performance policy, not an independent hardware block.
+/arm-io/sapt/:sotra_h17d_92 - -> MISSING
+/arm-io/iop-audio-controller - -> MISSING
+/arm-io/iop-audio-controller/audio-hp-mic - -> MISSING
+/arm-io/iop-audio-controller/audio-hp-mic/audio-hp-mic - -> MISSING
+/arm-io/iop-audio-controller/audio-codec-input - -> MISSING
+/arm-io/iop-audio-controller/audio-codec-input/audio-codec-input - -> MISSING
+/arm-io/iop-audio-controller/audio-codec-output - -> MISSING
+/arm-io/iop-audio-controller/audio-codec-output/audio-codec-output - -> MISSING
+/arm-io/iop-audio-controller/audio-leap-internal-loopback - -> MISSING
+/arm-io/iop-audio-controller/audio-leap-internal-loopback/audio-leap-internal-loopback - -> MISSING
+/arm-io/iop-audio-controller/audio-secure-leap-loopback - -> MISSING
+/arm-io/iop-audio-controller/audio-secure-leap-loopback/audio-secure-leap-loopback - -> MISSING
+/arm-io/iop-audio-controller/audio-mca-loopback - -> MISSING
+/arm-io/iop-audio-controller/audio-mca-loopback/audio-mca-loopback - -> MISSING
+/arm-io/iop-audio-controller/audio-speaker - -> MISSING
+/arm-io/iop-audio-controller/audio-speaker/audio-speaker - -> MISSING
+/arm-io/iop-audio-controller/audio-speaker-tap - -> MISSING
+/arm-io/iop-audio-controller/audio-speaker-tap/audio-speaker-tap - -> MISSING
+/arm-io/iop-audio-controller/lp-mic-device - -> MISSING
+/arm-io/iop-audio-controller/lp-mic-io-buffer-device - -> MISSING
+/arm-io/iop-audio-controller/siri-listening-device - -> MISSING
+/arm-io/iop-audio-controller/lp-mic-injection-device - -> MISSING
+/arm-io/iop-audio-controller/lp-mic-injection-device/lp-mic-injection-device - -> MISSING
+/arm-io/admac-base-ns 0x293800000 -> /soc@200000000/dma-controller@293800000
+/arm-io/admac-base-ns/base-ns-adma-tx-0 - -> /soc@200000000/dma-controller@293800000
+/arm-io/admac-base-ns/base-ns-adma-rx-0 - -> /soc@200000000/dma-controller@293800000
+/arm-io/admac-base-ns/base-ns-adma-rx-1 - -> /soc@200000000/dma-controller@293800000
+/arm-io/admac-base-ns/base-ns-adma-tx-2 - -> /soc@200000000/dma-controller@293800000
+/arm-io/admac-base-ns/base-ns-adma-rx-2 - -> /soc@200000000/dma-controller@293800000
+/arm-io/admac-base-ns/base-ns-adma-tx-3 - -> /soc@200000000/dma-controller@293800000
+/arm-io/admac-base-ns/base-ns-adma-rx-3 - -> /soc@200000000/dma-controller@293800000
+/arm-io/admac-base-ns/base-ns-adma-tx-5 - -> /soc@200000000/dma-controller@293800000
+/arm-io/admac-leap-ns 0x293300000 -> /soc/dma-controller@293300000
+/arm-io/admac-leap-ns/leap-ns-adma-tx-4 - -> /soc/dma-controller@293300000
+/arm-io/admac-leap-ns/leap-ns-adma-rx-4 - -> /soc/dma-controller@293300000
+/arm-io/admac-leap-ns/leap-ns-adma-tx-5 - -> /soc/dma-controller@293300000
+/arm-io/admac-aop-ced-ssw 0x293c80000 -> MISSING
+/arm-io/admac-leap-s 0x293200000 -> /soc/dma-controller@293200000
+/arm-io/admac-leap-s/leap-s-adma-rx-0 - -> /soc/dma-controller@293200000
+/arm-io/admac-leap-s/leap-s-adma-rx-5 - -> /soc/dma-controller@293200000
+/arm-io/audio-shared-dart-proxy - -> MISSING
+/arm-io/admac-hp-mic-ec-proxy 0x2d3200000 -> /soc/dma-controller@2d3200000
+/arm-io/audio-hp-mic-proxy - -> MISSING
+/arm-io/admac-sllb-ec-proxy 0x2d3200000 -> /soc/dma-controller@2d3200000
+/arm-io/audio-sllb-proxy - -> MISSING
+/arm-io/smctempsensor0 - -> /soc@200000000/smc@28c600000/hwmon
+/arm-io/cpu-debug-interface - -> /cpus
+/arm-io/cpu-debug-interface/:sotra_h17d_81 - -> MISSING
+/arm-io/cpu-debug-interface/:sotra_h17d_82 - -> MISSING
+/arm-io/cpu-debug-interface/:sotra_h17d_83 - -> MISSING
+/arm-io/cpu-debug-interface/:sotra_h17s_24 - -> MISSING
+/arm-io/cpu-debug-interface/:sotra_h17cr1_30 - -> MISSING
+/arm-io/cpu-debug-interface/:sotra_h17cr2_30 - -> MISSING
+/arm-io/cpu-debug-interface/:sotra_h17c_34 - -> MISSING
+/arm-io/cpu-debug-interface/:sotra_h17s_25 - -> MISSING
+/arm-io/cpu-debug-interface/:sotra_h17cr1_31 - -> MISSING
+/arm-io/cpu-debug-interface/:sotra_h17c_35 - -> MISSING
+/arm-io/cpu-debug-interface/:sotra_h17cr1_32 - -> MISSING
+/arm-io/cpu-debug-interface/:sotra_h17cr2_31 - -> MISSING
+/arm-io/cpu-debug-interface/:sotra_h17c_36 - -> MISSING
+/arm-io/cpu-debug-interface/:sotra_h17cr2_32 - -> MISSING
+/arm-io/cpu-debug-interface/:sotra_h17c_37 - -> MISSING
+/arm-io/cpu-debug-interface/:sotra_h17d_84 - -> MISSING
+/arm-io/cpu-debug-interface/:sotra_h17d_85 - -> MISSING
+/arm-io/dbgCPU 0x288b00000 -> MISSING
+/arm-io/nub-swd0 - -> WAIVED: Native debug access service; debug hardware is inventoried separately.
+/arm-io/pwm1 0x505040000 -> /soc@200000000/pwm@505040000
+/arm-io/timesync - -> WAIVED: Firmware clock synchronization policy, not a separate timer device.
+/arm-io/fillmore - -> MISSING
+/arm-io/isp-exclave-s-proxy - -> MISSING
+/arm-io/msg 0x29b000000 -> /soc/message-controller@29b000000
+/arm-io/msghub - -> MISSING
+/arm-io/:sotra_h17d_5 - -> MISSING
+/arm-io/:sotra_h17d_6 - -> MISSING
+/arm-io/apple-processor-trace 0x2100f0000 -> WAIVED: Native diagnostic trace policy; CPU debug hardware is inventoried separately.
+/arm-io/device-supports-gf2 - -> MISSING
+/buttons - -> WAIVED: Button collection container; child devices are inventoried separately.
+/port-usb-c-1 - -> MISSING
+/port-usb-c-2 - -> /soc@200000000/spmi@28a188000/usb-pd@a/connector
+/port-usb-c-3 - -> /soc@200000000/spmi@28a1a8000/usb-pd@c/connector
+/port-hdmi0 - -> WAIVED: Logical DCP output interface; display controllers and their routes are inventoried separately.
+/port-magsafe3-1 - -> /soc@200000000/smc@28c600000
+/backlight - -> /soc/dcp@48ae00000
+/backlight/twodbl - -> /soc/dcp@48ae00000
+/pcie-sdreader-helper - -> WAIVED: Firmware SD-card policy helper; PCIe reader hardware is inventoried separately.
+/sacm - -> WAIVED: Display access-control policy; display hardware is inventoried separately.
+/exclaves-test - -> MISSING

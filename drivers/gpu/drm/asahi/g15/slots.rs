@@ -376,7 +376,7 @@ impl ClearQueue {
         // SAFETY: The name is a valid NUL-terminated string the C side copies.
         let ptr = unsafe {
             bindings::alloc_ordered_workqueue(
-                c_str!("asahi-g15-clear").as_char_ptr(),
+                c_str!("aurora-g15-clear").as_char_ptr(),
                 bindings::wq_flags_WQ_MEM_RECLAIM,
             )
         };
@@ -535,7 +535,7 @@ impl Claims {
     }
 }
 
-/// Slot accounting statistics (`asahi-g15/stats`).
+/// Slot accounting statistics (`aurora-g15/stats`).
 #[derive(Copy, Clone, Default)]
 pub(crate) struct SlotStats {
     /// Clustering buffers zeroed at claim, pass slots reset at claim, compute slots scrubbed

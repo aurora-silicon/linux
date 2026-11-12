@@ -22,6 +22,14 @@ description: |
   On t8142, a standalone register page contains a shared request register
   with alternating request and busy bits for four ports.
 
+  On t6050 the same request register sits at offset 0x60 of a page in the
+  die's PMGR block.
+
+  On t6041, a PMGR child register contains one request bit per CIO port and
+  the corresponding busy bit at 16 plus the port index. The controller waits
+  up to 192 ms for that busy bit to clear both before and after its
+  read-modify-write request.
+
   In all cases the reset id is the CIO port index on the die.
 
 properties:
@@ -30,12 +38,19 @@ properties:
       - enum:
           - apple,t8103-cio-reset
           - apple,t8142-cio-reset
+          - apple,t6050-cio-reset
           - apple,t6000-cio-reset
+          - apple,t6041-cio-reset
       - items:
           - const: apple,t8112-cio-reset
           - const: apple,t8103-cio-reset
       - items:
-          - const: apple,t6020-cio-reset
+          - enum:
+              - apple,t6020-cio-reset
+              - apple,t6030-cio-reset
+              - apple,t6031-cio-reset
+              - apple,t8122-cio-reset
+              - apple,t8132-cio-reset
           - const: apple,t6000-cio-reset
 
   reg:

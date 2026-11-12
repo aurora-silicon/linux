@@ -53,9 +53,13 @@
  * option.
  *
  * On T6031 (M3 Max) the gate serves the same handoff, marked
- * apple,t6031-handoff, but only when apple_t6031_display.enable=1 is on the
- * kernel command line: the native display is off by default there until it
- * has been seen to work. The PMP values must come from the boot loader, in
+ * apple,t6031-handoff. Its default is scoped to the J516C: there the native
+ * display is on unless apple_t6031_display.enable=0; the other T6031 boards
+ * need apple_t6031_display.enable=1. The T6031 GPU starts its firmware only
+ * after this native display is up, so enable=0 (or a display that never
+ * comes up) keeps the GPU off for that boot too: it is not a display-only
+ * switch. The default changes no check of the
+ * handoff or the PMP below. The PMP values must come from the boot loader, in
  * /chosen/asahi,t6031-pmp; there is no fallback. Its PMP topology is
  * reused from the device tree, as on T8122. The T6031 display power
  * states nest the other way round (the DCP's DISP_FE under DISP_CPU under
@@ -70,8 +74,16 @@
  * complete: the device tree describes it and its own driver starts it. The
  * gate checks the handoff and the running DCP, enables the internal display
  * nodes, and powers up the external display chain in stages once the PMP is
- * bound (see gate_t6041_run()). This part was a driver of its own,
- * t6041-display-gate.c, by Ryan Murray and František Balázsy.
+ * bound, even long after the boot (see gate_t6041_run()). This part was a
+ * driver of its own, t6041-display-gate.c, by Ryan Murray and František
+ * Balázsy.
+ *
+ * On the M4 Max (J614c and J616c, apple,t6041) the internal display is
+ * handed over and enabled as on the M4 Pro. The PMP never runs there: iBoot
+ * leaves the external chains powered and the boot loader fills each external
+ * display processor's firmware memory. The gate enables a chain once its
+ * processor has that memory and the display subsystem is enabled, before any
+ * device exists (see gate_t6041_max_run()).
  */
 
 #define pr_fmt(fmt) fmt
@@ -86,14 +98,17 @@
 #include <linux/io.h>
 #include <linux/kstrtox.h>
 #include <linux/memblock.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_graph.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
 #include <linux/sizes.h>
+#include <linux/soc/apple/t8132.h>
 #include <linux/string.h>
 #include <linux/stringify.h>
 #include <linux/types.h>
@@ -160,8 +175,20 @@ static const char gate_t6031_pmp_uuid[] __initconst = "07FF4C5B-CB2E-3DE6-95FF-3
  */
 static bool gate_requested __initdata = true;
 
-/* apple_t6031_display.enable: the T6031 native display is off unless it is 1. */
+/*
+ * apple_t6031_display.enable: -1 while it is not on the command line, else 0
+ * or 1. Unset, the T6031 native display is on only on gate_t6031_board.
+ */
+static int gate_t6031_switch __initdata = -1;
+static const char *gate_t6031_board __initdata = "apple,j516c";
+/* The resolved request, set by gate_run() on a T6031. */
 static bool gate_t6031_requested __initdata;
+
+/* Whether the T6031 native display is requested: an explicit 0 or 1 wins. */
+static bool __init gate_t6031_wanted(int sw, bool default_board)
+{
+	return sw < 0 ? default_board : sw;
+}
 
 /* One SoC's internal display handoff, as the gate checks and completes it */
 struct gate_soc {
@@ -259,8 +286,10 @@ static const struct gate_soc gate_t8122 __initconst = {
 };
 
 /*
- * T6031 (M3 Max): the T6030 handoff at the T6031 addresses, off unless
- * apple_t6031_display.enable=1. The PMP values must come from the boot
+ * T6031 (M3 Max): the T6030 handoff at the T6031 addresses, on by default on
+ * the J516C and off unless apple_t6031_display.enable=1 on the other boards;
+ * apple_t6031_display.enable=0 keeps it, and with it the GPU, off everywhere.
+ * The PMP values must come from the boot
  * loader: there is no built-in fallback. The PMP image is T6031's own;
  * any other, the T6030 image included, is refused. The report driver checks
  * the image's SRAM layout before it starts the PMP. The internal display's
@@ -306,11 +335,28 @@ static const struct gate_soc gate_t6041 __initconst = {
 	.run = gate_t6041_run,
 };
 
+static void __init gate_t6041_max_run(void);
+
+/*
+ * T6041 (M4 Max): the M4 Pro's internal display handoff; no PMP, so the
+ * external chains follow the boot loader's firmware memory.
+ */
+static const struct gate_soc gate_t6041_max __initconst = {
+	.machine = "apple,t6041",
+	.prefix = "apple-t6041-display: ",
+	.name = "T6041",
+	.dcp_compat = "apple,t6041-dcp",
+	.display_compat = "apple,display-subsystem",
+	.marker = "apple,t6041-handoff",
+	.run = gate_t6041_max_run,
+};
+
 static const struct gate_soc *const gate_socs[] __initconst = {
 	&gate_t6030,
 	&gate_t8122,
 	&gate_t6031,
 	&gate_t6041,
+	&gate_t6041_max,
 };
 
 /* The SoC this boot runs on, if the gate serves it. */
@@ -368,10 +414,18 @@ static int __init gate_setup_t8122(char *arg)
 }
 early_param("apple_t8122_display.enable", gate_setup_t8122);
 
-/* Its own switch: the T6030 and T8122 options do not change it, nor it them. */
+/*
+ * Its own switch: the T6030 and T8122 options do not change it, nor it them.
+ * A value kstrtobool() rejects sets nothing, so the board default stays.
+ */
 static int __init gate_setup_t6031(char *arg)
 {
-	return kstrtobool(arg, &gate_t6031_requested);
+	bool on;
+	int ret = kstrtobool(arg, &on);
+
+	if (!ret)
+		gate_t6031_switch = on;
+	return ret;
 }
 early_param("apple_t6031_display.enable", gate_setup_t6031);
 
@@ -1487,6 +1541,9 @@ static int __init gate_ext_apply(struct gate_ext *ext, bool native)
 	/* The driver must wait for this request's acknowledgement before RUN. */
 	if (!ret)
 		ret = gate_set_u32(cs, ext->dcp, "apple,pmp-report", ext->entry->phandle);
+	/* No external display is attached in system sleep: the PMP may drop it. */
+	if (!ret)
+		ret = gate_add_bool(cs, ext->entry, "apple,release-for-sleep");
 	if (!ret)
 		ret = of_changeset_update_prop_string(cs, ext->entry, "status", "okay");
 	if (!ret)
@@ -1993,8 +2050,17 @@ static void __init gate_run(void)
 	if (gate_soc->describe)
 		gate_describe();
 
+	if (gate_soc == &gate_t6031) {
+		bool board = of_machine_is_compatible(gate_t6031_board);
+
+		gate_t6031_requested = gate_t6031_wanted(gate_t6031_switch, board);
+		if (gate_t6031_switch < 0 && board)
+			gate_info("native display on by default on %s; apple_t6031_display.enable=0 keeps the boot framebuffer\n",
+				  gate_t6031_board);
+	}
+
 	if (!*gate_soc->requested) {
-		if (gate_soc->opt_in)
+		if (gate_soc->opt_in && gate_t6031_switch < 0)
 			gate_info("native display not requested (%s is not on the command line), display stays on the boot framebuffer\n",
 				  gate_soc->opt_in);
 		else
@@ -2148,6 +2214,18 @@ static const char *staged_prefix = "";
  * whose acknowledgement the DISPEXT domains need: HDMI chain, Type-C chain,
  * then both processors and the display subsystem together, so the display
  * master is created once with every DART in its iommus.
+ *
+ * The PMP can bind long after the boot: on an encrypted root its driver
+ * (apple-pmp.ko) loads only after the passphrase. Nothing that drives a
+ * display can come up before it, as appledrm needs apple-pmp's symbols, so
+ * the display subsystem stays held back until the PMP binds, however late,
+ * and then the whole chain comes up. Only the Type-C ports cannot wait for
+ * it: after STAGED_PMP_WAIT_MS their controllers are let go with the USB
+ * muxes only, and they take the display routes after a late power-up (see
+ * below). The internal panel alone, for the rest of the boot, is left for a
+ * PMP whose probe failed and that is still unbound at the deadline, or
+ * STAGED_PMP_WAIT_MS after a failure past it (a deferral looks the same, so
+ * it gets that long to bind), and for a power-up that fails.
  */
 
 /*
@@ -2204,10 +2282,78 @@ static const char *const t6041_usbc_nodes[] = {
 	"/dcp@602e00000",
 };
 
-static const struct gate_staged t6041_stages[] = {
-	{ "/iommu@3a2300000", t6041_hdmi_nodes, ARRAY_SIZE(t6041_hdmi_nodes) },
-	{ "/iommu@602300000", t6041_usbc_nodes, ARRAY_SIZE(t6041_usbc_nodes) },
+static bool staged_is_route_path(const char *path)
+{
+	return strstr(path, "/typec-routes/");
+}
+
+/*
+ * J614s HDMI: its ADT has no dcpext0 and its DISPEXT0 power states are
+ * virtual, so the J616s chain above must never be powered there. HDMI is
+ * dcpext2 instead (t6040-j614s-extdisp-hdmi.dtsi): the same ATC3 PHY,
+ * crossbar and converter, behind the DISPEXT2 block.
+ */
+static const char *const t6041_j614s_hdmi_nodes[] = {
+	/* ATC3 power, PMP DISPEXT2 request, FAB7_SOC, DISPEXT2, AOP pins, PHY, crossbar, DARTs, mailbox, dcpext2 */
+	"/power-management@502800000/power-controller@408",
+	"/power-management@508300000/power-controller@e0",
+	"/power-management@508300000/power-controller@168",
+	"/power-management@508300000/power-controller@b8",
+	"/power-management@508300000/power-controller@148",
+	"/pmp-report@5003c0000/report@13",
+	"/power-management@502800000/power-controller@488",
+	"/power-management@502800000/power-controller@4e0",
+	"/power-management@502800000/power-controller@4e8",
+	"/pinctrl@510824000",
+	"/mailbox@39b148000",
+	"/phy@39aa90000",
+	"/mux@39b24c000",
+	"/iommu@606340000",
+	"/iommu@606300000",
+	"/mailbox@606e08000",
+	"/dcp@606e00000",
 };
+
+enum { STAGED_HDMI, STAGED_USBC };
+
+/* The J614s HDMI stage replaces the J616s one in gate_t6041_staged(). */
+static struct gate_staged t6041_stages[] = {
+	[STAGED_HDMI] = { "/iommu@3a2300000", t6041_hdmi_nodes, ARRAY_SIZE(t6041_hdmi_nodes) },
+	[STAGED_USBC] = { "/iommu@602300000", t6041_usbc_nodes, ARRAY_SIZE(t6041_usbc_nodes) },
+};
+
+/*
+ * The chains this boot enables: each one whose processor the boot loader gave
+ * firmware memory. The loader hands the processors over separately (the
+ * J614s ADT has no dcpext0: its HDMI processor is dcpext2, so only dcpext1
+ * is handed over), so one missing processor must not keep the other off.
+ * Set once by gate_t6041_staged().
+ */
+static unsigned long staged_on;
+
+static bool staged_stage_on(unsigned int i)
+{
+	return test_bit(i, &staged_on);
+}
+
+/*
+ * dcpext0's Type-C routes (the HDMI processor's hybrid DP outputs) switch the
+ * Type-C crossbars, which are the USB-C chain's. Without that chain they stay
+ * disabled and dcpext0 drives HDMI only; the crossbars are enabled for it,
+ * as its mux-controls name them.
+ */
+static const char *const t6041_hdmi_only_muxes[] = {
+	"/mux@38324c000",
+	"/mux@38b24c000",
+	"/mux@39324c000",
+};
+
+static bool staged_path_on(unsigned int i, const char *path)
+{
+	if (!staged_stage_on(i))
+		return false;
+	return !(i == STAGED_HDMI && staged_is_route_path(path) && !staged_stage_on(STAGED_USBC));
+}
 
 /* A display processor (a direct child of the root) and a Type-C display route. */
 static bool staged_is_dcp(const char *path)
@@ -2310,6 +2456,13 @@ static int staged_apply(const struct gate_staged *st, struct device_node *displa
 		ret = np ? of_changeset_update_prop_string(cs, np, "status", "okay") : -ENODEV;
 		of_node_put(np);
 	}
+	/* dcpext0's Type-C crossbars; J614s's dcpext2 has no Type-C routes. */
+	for (i = 0; !ret && st->nodes == t6041_hdmi_nodes && !staged_stage_on(STAGED_USBC) &&
+		    i < ARRAY_SIZE(t6041_hdmi_only_muxes); i++) {
+		np = of_find_node_by_path(t6041_hdmi_only_muxes[i]);
+		ret = np ? of_changeset_update_prop_string(cs, np, "status", "okay") : -ENODEV;
+		of_node_put(np);
+	}
 	if (!ret)
 		ret = of_changeset_apply(cs);
 	if (ret) {
@@ -2375,6 +2528,8 @@ static int staged_set(struct device_node *display, bool dcps, const char *dcp_st
 
 			if (!(dcps && staged_is_dcp(path)) && !(routes && staged_is_route(path)))
 				continue;
+			if (!staged_path_on(i, path))
+				continue;
 			np = of_find_node_by_path(path);
 			if (np && staged_is_route(path) && route_status &&
 			    !strcmp(route_status, "okay") && !staged_route_phy_available(np)) {
@@ -2401,7 +2556,7 @@ static int staged_set(struct device_node *display, bool dcps, const char *dcp_st
 /*
  * The Type-C core passes over a mode switch inside a disabled node, so a port
  * controller that probes before dcpext1 is enabled only takes the USB muxes.
- * Taking the display ones afterwards meant probing it again, and that tears
+ * Taking the display ones afterwards means probing it again, and that tears
  * its USB host down while the devices behind it are being enumerated. Instead,
  * each port controller wired to a route waits for the processor that registers
  * the route: a supplier link from the controller to that processor makes it
@@ -2421,9 +2576,35 @@ static int staged_set(struct device_node *display, bool dcps, const char *dcp_st
  * defers in the Type-C core, which never gives up on a mux. A processor that
  * gives up on its routes disables them (dcp_typec_routes_disable()), and its
  * controllers then probe without them.
+ *
+ * The wait ends at STAGED_PMP_WAIT_MS, PMP or not: USB must work while the
+ * PMP driver is still on an encrypted root, behind its passphrase prompt.
+ * The routes are disabled again and the controllers probe with the USB
+ * muxes only. A PMP that binds later enables the routes again, together with
+ * the processors. Once every processor that still has an enabled route is
+ * bound, so that every route mode switch is registered, staged_take_routes()
+ * gives each released controller that is still wired to an enabled route
+ * the managed link it would have had, and probes it again, and only those.
+ * That takes their USB hosts down once, after the PMP has bound, and the
+ * devices behind them enumerate again. A controller whose routes its
+ * processor gave up on keeps its USB-only probe.
  */
-static struct fwnode_handle *staged_port_ctrls[ARRAY_SIZE(t6041_usbc_nodes)];
-static unsigned int staged_nr_port_ctrls;
+
+/* A port controller and the processor whose routes it is wired to. */
+struct staged_port_ctrl {
+	struct fwnode_handle *ctrl, *dcp;
+};
+
+/* Guards the port controller lists, staged_routes_off and staged_late's writers. */
+static DEFINE_MUTEX(staged_lock);
+/* Held by a fwnode link until the processors are bound or the deadline. */
+static struct staged_port_ctrl staged_held[ARRAY_SIZE(t6041_usbc_nodes)];
+static unsigned int staged_nr_held;
+/* Let go at the deadline with the USB muxes only, for a late power-up. */
+static struct staged_port_ctrl staged_released[ARRAY_SIZE(t6041_usbc_nodes)];
+static unsigned int staged_nr_released;
+static bool staged_routes_off;	/* the deadline disabled the routes */
+static bool staged_late;	/* a late power-up waits for the processors */
 
 /* The port controller wired to a route (the parent of the connector at its far end). */
 static struct device_node *staged_route_port_ctrl(struct device_node *route)
@@ -2443,6 +2624,10 @@ static void __init staged_hold_port_controllers(void)
 	struct device_node *route, *routes, *dcp, *ctrl;
 	unsigned int i, k;
 
+	/* Only dcpext1's routes are held for; without its chain nothing waits. */
+	if (!staged_stage_on(STAGED_USBC))
+		return;
+
 	for (i = 0; i < ARRAY_SIZE(t6041_usbc_nodes); i++) {
 		if (!staged_is_route(t6041_usbc_nodes[i]))
 			continue;
@@ -2454,62 +2639,200 @@ static void __init staged_hold_port_controllers(void)
 		ctrl = staged_route_port_ctrl(route);
 		of_node_put(routes);
 		of_node_put(route);
-		for (k = 0; ctrl && k < staged_nr_port_ctrls; k++)
-			if (staged_port_ctrls[k] == of_fwnode_handle(ctrl))
+		for (k = 0; ctrl && k < staged_nr_held; k++)
+			if (staged_held[k].ctrl == of_fwnode_handle(ctrl))
 				break;
 		/*
 		 * A disabled port controller never gets a device: a link from it
 		 * would land on its bound bus controller as a sync-state-only
 		 * link, which the device core refuses.
 		 */
-		if (ctrl && dcp && k == staged_nr_port_ctrls && of_device_is_available(ctrl) &&
-		    !fwnode_link_add(of_fwnode_handle(ctrl), of_fwnode_handle(dcp), 0))
-			staged_port_ctrls[staged_nr_port_ctrls++] =
-				fwnode_handle_get(of_fwnode_handle(ctrl));
+		if (ctrl && dcp && k == staged_nr_held && of_device_is_available(ctrl) &&
+		    !fwnode_link_add(of_fwnode_handle(ctrl), of_fwnode_handle(dcp), 0)) {
+			staged_held[k].ctrl = fwnode_handle_get(of_fwnode_handle(ctrl));
+			staged_held[k].dcp = fwnode_handle_get(of_fwnode_handle(dcp));
+			staged_nr_held++;
+		}
 		of_node_put(dcp);
 		of_node_put(ctrl);
 	}
 }
 
+static void staged_forget(struct staged_port_ctrl *list, unsigned int *nr)
+{
+	while (*nr) {
+		struct staged_port_ctrl *pc = &list[--*nr];
+
+		fwnode_handle_put(pc->dcp);
+		fwnode_handle_put(pc->ctrl);
+	}
+}
+
 /*
- * The processors stay off: drop the wait, so that the port controllers probe
- * now, with the USB muxes only. By this time the controllers' other suppliers
- * are device links; what is left are links to nodes without a device.
+ * The processors are not on (yet): drop the wait, so that the port
+ * controllers probe now, with the USB muxes only, and keep them for a late
+ * power-up. By this time the controllers' other suppliers are device links;
+ * what is left are links to nodes without a device.
  */
 static void staged_release_port_controllers(void)
 {
 	struct device *dev;
 
-	while (staged_nr_port_ctrls) {
-		struct fwnode_handle *fwnode = staged_port_ctrls[--staged_nr_port_ctrls];
+	lockdep_assert_held(&staged_lock);
+	while (staged_nr_held) {
+		struct staged_port_ctrl *pc = &staged_held[--staged_nr_held];
 
-		fwnode_links_purge(fwnode);
-		dev = get_device(READ_ONCE(fwnode->dev));
+		fwnode_links_purge(pc->ctrl);
+		dev = get_device(READ_ONCE(pc->ctrl->dev));
 		if (dev && !READ_ONCE(dev->driver) && device_attach(dev) < 0)
 			dev_err(dev, "probe without the display routes failed\n");
 		put_device(dev);
-		fwnode_handle_put(fwnode);
+		staged_released[staged_nr_released++] = *pc;
 	}
 }
 
-/* The processors are bound: the port controllers probe through their supplier links. */
-static void staged_forget_port_controllers(void)
+/* @ctrl is wired to a route of dcpext1 that is still enabled. */
+static bool staged_ctrl_routed(struct fwnode_handle *ctrl)
 {
-	while (staged_nr_port_ctrls)
-		fwnode_handle_put(staged_port_ctrls[--staged_nr_port_ctrls]);
+	struct device_node *route, *np;
+	bool routed = false;
+	unsigned int i;
+
+	for (i = 0; !routed && i < ARRAY_SIZE(t6041_usbc_nodes); i++) {
+		if (!staged_is_route(t6041_usbc_nodes[i]))
+			continue;
+		route = of_find_node_by_path(t6041_usbc_nodes[i]);
+		np = route && of_device_is_available(route) ? staged_route_port_ctrl(route) : NULL;
+		routed = np && of_fwnode_handle(np) == ctrl;
+		of_node_put(np);
+		of_node_put(route);
+	}
+	return routed;
+}
+
+static struct device_node *staged_dcps[ARRAY_SIZE(t6041_stages)];
+
+/* Every processor with an enabled route is bound: all route mode switches are registered. */
+static bool staged_processors_bound(void)
+{
+	struct device_node *routes, *route;
+	struct device *dev;
+	bool bound = true;
+	unsigned int i;
+
+	for (i = 0; bound && i < ARRAY_SIZE(staged_dcps); i++) {
+		routes = of_get_child_by_name(staged_dcps[i], "typec-routes");
+		route = routes ? of_get_next_available_child(routes, NULL) : NULL;
+		dev = route ? READ_ONCE(staged_dcps[i]->fwnode.dev) : NULL;
+		bound = !route || (dev && device_is_bound(dev));
+		of_node_put(route);
+		of_node_put(routes);
+	}
+	return bound;
+}
+
+/* After a late power-up: the released port controllers take the display routes. */
+static void staged_take_routes(struct work_struct *work)
+{
+	struct device *ctrl, *dcp;
+	unsigned int n = 0;
+
+	mutex_lock(&staged_lock);
+	if (!staged_late || !staged_processors_bound()) {
+		mutex_unlock(&staged_lock);
+		return;
+	}
+	WRITE_ONCE(staged_late, false);
+	while (staged_nr_released) {
+		struct staged_port_ctrl *pc = &staged_released[--staged_nr_released];
+
+		ctrl = get_device(READ_ONCE(pc->ctrl->dev));
+		dcp = get_device(READ_ONCE(pc->dcp->dev));
+		if (ctrl && dcp && staged_ctrl_routed(pc->ctrl)) {
+			/* What fw_devlink makes of a held controller's fwnode link. */
+			if (!device_link_add(ctrl, dcp, DL_FLAG_AUTOPROBE_CONSUMER))
+				dev_warn(ctrl, "no link to %s, keeping the USB muxes only\n",
+					 dev_name(dcp));
+			else if (device_reprobe(ctrl))
+				dev_err(ctrl, "probe with the display routes failed\n");
+			else
+				n++;
+		}
+		put_device(dcp);
+		put_device(ctrl);
+		fwnode_handle_put(pc->dcp);
+		fwnode_handle_put(pc->ctrl);
+	}
+	mutex_unlock(&staged_lock);
+	if (n)
+		staged_info("%u Type-C port controllers probed again with the display routes\n", n);
+}
+static DECLARE_WORK(staged_take_routes_work, staged_take_routes);
+
+/*
+ * Where the power-up is. Only staged_move() changes it, so each step is
+ * taken once: the first of the PMP's bind, its failure and, before either,
+ * the deadline wins.
+ */
+enum staged_state {
+	STAGED_WAITING,		/* routes on, port controllers held, display subsystem off */
+	STAGED_RELEASED,	/* past the deadline: routes off, port controllers on USB only */
+	STAGED_STARTED,		/* the PMP is bound: the power-up runs or has run */
+	STAGED_FALLBACK,	/* internal panel only, for the rest of the boot */
+};
+
+enum staged_event {
+	STAGED_PMP_BOUND,
+	STAGED_DEADLINE,
+	STAGED_PMP_FAILED,
+};
+
+static enum staged_state staged_next(enum staged_state state, enum staged_event event)
+{
+	if (state != STAGED_WAITING && state != STAGED_RELEASED)
+		return state;
+	switch (event) {
+	case STAGED_PMP_BOUND:
+		return STAGED_STARTED;
+	case STAGED_DEADLINE:
+		return STAGED_RELEASED;
+	case STAGED_PMP_FAILED:
+		return STAGED_FALLBACK;
+	}
+	return state;
 }
 
 static struct device_node *staged_display;
 static struct device_node *staged_pmp;
-static atomic_t staged_started = ATOMIC_INIT(0);
+static atomic_t staged_state = ATOMIC_INIT(STAGED_WAITING);
+static atomic_t staged_pmp_tried = ATOMIC_INIT(0);
+
+/* Take the step @event leads to; false if it leads nowhere from here. */
+static bool staged_move(enum staged_event event)
+{
+	int from = atomic_read(&staged_state);
+	int to;
+
+	do {
+		to = staged_next(from, event);
+		if (to == from)
+			return false;
+	} while (!atomic_try_cmpxchg(&staged_state, &from, to));
+	return true;
+}
 
 /* Internal panel only: the routes go again, so the port controllers probe without mode switches. */
 static void staged_fallback(const char *why)
 {
 	int ret = staged_set(staged_display, false, NULL, true, "disabled", "okay");
 
+	atomic_set(&staged_state, STAGED_FALLBACK);
 	staged_err("%s: external displays stay off, internal panel only (%d)\n", why, ret);
+	mutex_lock(&staged_lock);
+	WRITE_ONCE(staged_late, false);
 	staged_release_port_controllers();
+	staged_forget(staged_released, &staged_nr_released);
+	mutex_unlock(&staged_lock);
 }
 
 /*
@@ -2524,7 +2847,7 @@ static const char *staged_unbound_infra(void)
 	unsigned int i, j;
 
 	for (i = 0; i < ARRAY_SIZE(t6041_stages); i++)
-		for (j = 0; j < t6041_stages[i].nr; j++) {
+		for (j = 0; staged_stage_on(i) && j < t6041_stages[i].nr; j++) {
 			const char *path = t6041_stages[i].nodes[j];
 			struct device_node *np;
 			struct device *dev;
@@ -2559,49 +2882,128 @@ static void staged_wait_for_drivers(void)
 		path);
 }
 
+static void staged_timeout(struct work_struct *work);
+static DECLARE_DELAYED_WORK(staged_timeout_work, staged_timeout);
+
 static void staged_power_up(struct work_struct *work)
 {
 	unsigned int i;
+	bool late;
 	int ret = 0;
 
+	/* Let a deadline that is letting the port controllers go finish first. */
+	cancel_delayed_work_sync(&staged_timeout_work);
+	mutex_lock(&staged_lock);
+	late = staged_routes_off || staged_nr_released;
+	WRITE_ONCE(staged_late, late);
+	mutex_unlock(&staged_lock);
+
 	for (i = 0; !ret && i < ARRAY_SIZE(t6041_stages); i++) {
+		if (!staged_stage_on(i))
+			continue;
 		ret = staged_apply(&t6041_stages[i], staged_display);
 		if (!ret)
 			staged_info("stage %u enabled\n", i);
 	}
 	if (!ret)
 		staged_wait_for_drivers();
-	/* Both processors and the display subsystem together: the master binds once, with all DCPs. */
+	/*
+	 * Both processors and the display subsystem together: the master binds
+	 * once, with all DCPs. Past the deadline the routes come back in the
+	 * same changeset, so each processor finds them when it probes.
+	 */
 	if (!ret)
-		ret = staged_set(staged_display, true, "okay", false, NULL, "okay");
+		ret = staged_set(staged_display, true, "okay", late, "okay", "okay");
 	if (ret) {
 		staged_fallback("could not enable the external displays");
 		return;
 	}
 	staged_info("processors and display subsystem enabled\n");
-	staged_forget_port_controllers();
+	mutex_lock(&staged_lock);
+	staged_routes_off = false;
+	/* Held ones probe through their supplier links. */
+	staged_forget(staged_held, &staged_nr_held);
+	mutex_unlock(&staged_lock);
+	if (late)
+		queue_work(system_long_wq, &staged_take_routes_work);
 }
 static DECLARE_WORK(staged_power_up_work, staged_power_up);
 
+/* The PMP's probe failed, as a deferral's does too, and it is neither bound nor probing now. */
+static bool staged_pmp_failed(void)
+{
+	struct platform_device *pdev;
+	bool failed;
+
+	if (!atomic_read(&staged_pmp_tried))
+		return false;
+	pdev = of_find_device_by_node(staged_pmp);
+	failed = pdev && !READ_ONCE(pdev->dev.driver);
+	platform_device_put(pdev);
+	return failed;
+}
+
 static void staged_timeout(struct work_struct *work)
 {
-	if (!atomic_xchg(&staged_started, 1))
-		staged_fallback("no PMP within " __stringify(STAGED_PMP_WAIT_MS) " ms");
-}
-static DECLARE_DELAYED_WORK(staged_timeout_work, staged_timeout);
+	int ret;
 
-/* The PMP's driver is bound: DISPEXT can be acknowledged now. */
-static int staged_pmp_bound(struct notifier_block *nb, unsigned long action, void *data)
+	if (staged_pmp_failed() && staged_move(STAGED_PMP_FAILED)) {
+		staged_fallback("the PMP did not bind");
+		return;
+	}
+	if (!staged_move(STAGED_DEADLINE))
+		return;
+	mutex_lock(&staged_lock);
+	ret = staged_set(staged_display, false, NULL, true, "disabled", NULL);
+	staged_routes_off = !ret;
+	staged_release_port_controllers();
+	mutex_unlock(&staged_lock);
+	staged_info("no PMP within " __stringify(STAGED_PMP_WAIT_MS) " ms: Type-C ports on USB only, external displays wait for it (%d)\n",
+		    ret);
+}
+
+static bool staged_is_processor(const struct device_node *np)
+{
+	unsigned int i;
+
+	for (i = 0; np && i < ARRAY_SIZE(staged_dcps); i++)
+		if (np == staged_dcps[i])
+			return true;
+	return false;
+}
+
+/*
+ * The PMP's driver is bound: DISPEXT can be acknowledged now, before or after
+ * the deadline. A failed probe of the PMP (a deferral too) past the deadline
+ * gives it STAGED_PMP_WAIT_MS more before the internal panel fallback; before
+ * the deadline, the deadline decides. After a late power-up, each processor's
+ * probe may be the last the port controllers wait for.
+ */
+static int staged_bus_notify(struct notifier_block *nb, unsigned long action, void *data)
 {
 	struct device *dev = data;
 
-	if (action != BUS_NOTIFY_BOUND_DRIVER || dev->of_node != staged_pmp || atomic_xchg(&staged_started, 1))
+	if (action != BUS_NOTIFY_BOUND_DRIVER && action != BUS_NOTIFY_DRIVER_NOT_BOUND)
 		return NOTIFY_DONE;
-	cancel_delayed_work(&staged_timeout_work);
-	queue_work(system_long_wq, &staged_power_up_work);
-	return NOTIFY_OK;
+	if (dev->of_node == staged_pmp) {
+		if (action == BUS_NOTIFY_BOUND_DRIVER) {
+			if (!staged_move(STAGED_PMP_BOUND))
+				return NOTIFY_DONE;
+			cancel_delayed_work(&staged_timeout_work);
+			queue_work(system_long_wq, &staged_power_up_work);
+			return NOTIFY_OK;
+		}
+		atomic_set(&staged_pmp_tried, 1);
+		if (atomic_read(&staged_state) == STAGED_RELEASED)
+			schedule_delayed_work(&staged_timeout_work,
+					      msecs_to_jiffies(STAGED_PMP_WAIT_MS));
+		return NOTIFY_DONE;
+	}
+	if (READ_ONCE(staged_late) && staged_is_processor(dev->of_node))
+		queue_work(system_long_wq, &staged_take_routes_work);
+	return NOTIFY_DONE;
 }
-static struct notifier_block staged_pmp_nb = { .notifier_call = staged_pmp_bound };
+static struct notifier_block staged_nb = { .notifier_call = staged_bus_notify };
 
 static void __init gate_t6041_staged(void)
 {
@@ -2610,16 +3012,38 @@ static void __init gate_t6041_staged(void)
 
 	staged_prefix = gate_soc->prefix;
 
-	/* Everything must be there and disabled, with firmware memory, before anything is changed. */
+	if (of_machine_is_compatible("apple,j614s"))
+		t6041_stages[STAGED_HDMI] = (struct gate_staged){
+			"/iommu@606300000", t6041_j614s_hdmi_nodes,
+			ARRAY_SIZE(t6041_j614s_hdmi_nodes) };
+
+	/*
+	 * Each chain must be all there and disabled, with firmware memory,
+	 * before anything of it is changed; a chain that is not stays as it is
+	 * and does not keep the other one off.
+	 */
 	for (i = 0; i < ARRAY_SIZE(t6041_stages); i++)
-		if (!staged_ready(&t6041_stages[i]))
-			return;
+		if (staged_ready(&t6041_stages[i]))
+			__set_bit(i, &staged_on);
+	if (!staged_on)
+		return;
+	if (!staged_stage_on(STAGED_USBC))
+		staged_info("Type-C chain not handed over: HDMI only, dcpext0 Type-C routes stay disabled\n");
+	else if (!staged_stage_on(STAGED_HDMI))
+		staged_info("HDMI chain not handed over: Type-C displays only\n");
 	staged_display = of_find_node_by_path("/display-subsystem");
 	staged_pmp = of_find_node_by_path("/pmp@500700000");
 	if (!staged_display || !staged_pmp || !of_device_is_available(staged_display) ||
 	    !of_device_is_available(staged_pmp)) {
 		staged_err("no display subsystem or PMP, nothing enabled\n");
 		return;
+	}
+	/* staged_ready() found them. */
+	for (i = 0; i < ARRAY_SIZE(t6041_stages); i++) {
+		const struct gate_staged *st = &t6041_stages[i];
+
+		if (staged_stage_on(i))
+			staged_dcps[i] = of_find_node_by_path(st->nodes[st->nr - 1]);
 	}
 
 	/* No device exists yet: routes on, display subsystem held back until the power-up. */
@@ -2629,7 +3053,7 @@ static void __init gate_t6041_staged(void)
 		return;
 	}
 	staged_hold_port_controllers();
-	ret = bus_register_notifier(&platform_bus_type, &staged_pmp_nb);
+	ret = bus_register_notifier(&platform_bus_type, &staged_nb);
 	if (ret) {
 		staged_fallback("no bus notifier");
 		return;
@@ -2646,10 +3070,185 @@ static void __init gate_t6041_run(void)
 	gate_t6041_staged();
 }
 
+/*
+ * J616c's external chains. No PMP, so no DISPEXT power domain is described and
+ * nothing is requested or waited for: the domains are on as iBoot left them.
+ */
+static const char *const t6041_max_hdmi_nodes[] = {
+	/* ATC3 power, AOP pins, PHY, crossbar, DARTs, mailbox, dcpext0 */
+	"/power-management@502800000/power-controller@408",
+	"/power-management@508300000/power-controller@e0",
+	"/power-management@508300000/power-controller@168",
+	"/power-management@508300000/power-controller@b8",
+	"/power-management@508300000/power-controller@148",
+	"/pinctrl@510824000",
+	"/mailbox@39b148000",
+	"/phy@39aa90000",
+	"/mux@39b24c000",
+	"/iommu@3a2340000",
+	"/iommu@3a2300000",
+	"/mailbox@3a2e08000",
+	"/dcp@3a2e00000",
+};
+
+static const char *const t6041_max_usbc_nodes[] = {
+	/*
+	 * ATC1 crossbar, DARTs, mailbox, route, dcpext1. The ATC1 mailbox is
+	 * the PHY's, on for USB3 whatever the display does, as on the M4 Pro.
+	 */
+	"/mux@38b24c000",
+	"/iommu@602340000",
+	"/iommu@602300000",
+	"/mailbox@602e08000",
+	"/dcp@602e00000/typec-routes/route@1",
+	"/dcp@602e00000",
+};
+
+static const struct gate_staged t6041_max_stages[] = {
+	{ "/iommu@3a2300000", t6041_max_hdmi_nodes, ARRAY_SIZE(t6041_max_hdmi_nodes) },
+	{ "/iommu@602300000", t6041_max_usbc_nodes, ARRAY_SIZE(t6041_max_usbc_nodes) },
+};
+
+/*
+ * The J575c's typec1 chain. That port is also a USB3 port, so its device tree
+ * enables the ATC1 PHY's coprocessor mailbox, as the M4 Pro boards do: the
+ * mailbox is not part of the chain here, and the rest is the J616c's.
+ */
+static const struct gate_staged t6041_j575c_usbc = {
+	"/iommu@602300000", t6041_max_usbc_nodes, ARRAY_SIZE(t6041_max_usbc_nodes),
+};
+
+static const struct gate_staged *t6041_max_stage(unsigned int i)
+{
+	if (i == 1 && of_machine_is_compatible("apple,j575c"))
+		return &t6041_j575c_usbc;
+	return &t6041_max_stages[i];
+}
+
+/* Applied, they stay: the live tree refers to them. Only the KUnit test reverts them. */
+static struct of_changeset t6041_max_cs[ARRAY_SIZE(t6041_max_stages)];
+
+/* Enable every node of stage @i and put its display DART into the display subsystem's iommus. */
+static int __init t6041_max_apply(unsigned int i, struct device_node *display)
+{
+	const struct gate_staged *st = t6041_max_stage(i);
+	struct of_changeset *cs = &t6041_max_cs[i];
+	struct device_node *np;
+	unsigned int n;
+	int ret;
+
+	of_changeset_init(cs);
+	np = of_find_node_by_path(st->dart);
+	ret = np ? gate_iommus_append(cs, display, np) : -ENODEV;
+	of_node_put(np);
+	for (n = 0; !ret && n < st->nr; n++) {
+		np = of_find_node_by_path(st->nodes[n]);
+		ret = np ? of_changeset_update_prop_string(cs, np, "status", "okay") : -ENODEV;
+		of_node_put(np);
+	}
+	if (!ret)
+		ret = of_changeset_apply(cs);
+	if (ret)
+		of_changeset_destroy(cs);
+	return ret;
+}
+
+/*
+ * The internal display first, as on the M4 Pro: an accepted handoff enables
+ * the display subsystem with the DCP. Then each external chain is enabled in
+ * one changeset, once its processor has firmware memory. A chain that has
+ * none, or is not all there and disabled (a boot loader that enabled it
+ * itself), stays as it is, and the other chain does not depend on it. The
+ * chains need the display subsystem enabled, by the handoff or by the boot
+ * loader, and only add their DARTs to it: its status is not written here.
+ */
+static void __init gate_t6041_max_run(void)
+{
+	struct device_node *display;
+	unsigned int i;
+	int ret;
+
+	if (IS_ENABLED(CONFIG_VIDEO) && video_firmware_drivers_only())
+		return;
+
+	gate_t6041_internal();
+	staged_prefix = gate_soc->prefix;
+	display = of_find_node_by_path("/display-subsystem");
+	if (!display) {
+		staged_err("no display subsystem, nothing enabled\n");
+		return;
+	}
+	if (!of_device_is_available(display)) {
+		staged_info("display subsystem not enabled, external displays left off\n");
+		of_node_put(display);
+		return;
+	}
+	for (i = 0; i < ARRAY_SIZE(t6041_max_stages); i++) {
+		const struct gate_staged *st = t6041_max_stage(i);
+		const char *dcp = st->nodes[st->nr - 1];
+
+		if (!staged_ready(st))
+			continue;
+		ret = t6041_max_apply(i, display);
+		if (ret)
+			staged_err("%s: could not enable the chain: %d\n", dcp, ret);
+		else
+			staged_info("%s enabled\n", dcp);
+	}
+	of_node_put(display);
+}
+
+/*
+ * M4: the dcpext Type-C routes are disabled in the device tree,
+ * as on J613, because a USB-C port controller waits for the mode switch of
+ * every available route. Enable them only for a dcpext the boot loader handed
+ * over (apple,t8132-dcpext-firmware-ready = 1). A handed-over dcpext that is
+ * not adopted then disables them again, see dcp_platform_probe_t8132_ext().
+ * Only the device tree changes here; no register is touched.
+ */
+static void __init gate_j713_dcpext_routes(void)
+{
+	struct of_changeset *cs = gate_cs_alloc();
+	struct device_node *np;
+	unsigned int n = 0;
+	u32 ready;
+	int ret = 0;
+
+	if (!cs)
+		return;
+	for_each_compatible_node(np, NULL, "apple,t8132-dcpext") {
+		if (!of_device_is_available(np) ||
+		    of_property_read_u32(np, "apple,t8132-dcpext-firmware-ready", &ready) ||
+		    ready != 1)
+			continue;
+		ret = gate_ext_routes(cs, np, "okay");
+		if (ret) {
+			of_node_put(np);
+			break;
+		}
+		n++;
+	}
+	if (!ret && n)
+		ret = of_changeset_apply(cs);
+	if (ret)
+		pr_err("apple-j713-display: dcpext Type-C routes left disabled: %d\n", ret);
+	else if (n)
+		pr_info("apple-j713-display: Type-C routes enabled for %u handed-over dcpext(s)\n",
+			n);
+	/* Applied, it stays: the live tree refers to it. */
+	if (ret || !n)
+		gate_cs_free(cs);
+}
+
 /* Runs before of_platform_default_populate_init() at arch_initcall_sync. */
 static int __init apple_display_gate(void)
 {
 	int i;
+
+	if (apple_t8132_firmware_path()) {
+		gate_j713_dcpext_routes();
+		return 0;
+	}
 
 	for (i = 0; i < ARRAY_SIZE(gate_socs) && !gate_soc; i++)
 		if (of_machine_is_compatible(gate_socs[i]->machine))

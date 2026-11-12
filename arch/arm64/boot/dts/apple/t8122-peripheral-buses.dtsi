@@ -1,0 +1,71 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Unclaimed T8122 peripheral buses. */
+
+&soc {
+	spi4: spi@2a1110000 {
+		compatible = "apple,t8122-spi", "apple,t8103-spi";
+		reg = <0x2 0xa1110000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 769 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clk_200m>;
+		power-domains = <&ps_spi4>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	qspi: spi@2a1118000 {
+		compatible = "apple,t8122-qspi", "apple,qspi";
+		reg = <0x2 0xa1118000 0 0x4800>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 771 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clk_200m>;
+		power-domains = <&ps_qspi>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	nub_spmi1: spmi@2e4794000 {
+		compatible = "apple,t8122-spmi", "apple,t8103-spmi";
+		reg = <0x2 0xe4794000 0 0x4000>,
+		      <0x2 0xe4784000 0 0x4000>,
+		      <0x2 0xe4780000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 447 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	aop_spmi0: spmi@2f4894000 {
+		compatible = "apple,t8122-spmi", "apple,t8103-spmi";
+		reg = <0x2 0xf4894000 0 0x4000>,
+		      <0x2 0xf4884000 0 0x4000>,
+		      <0x2 0xf4880000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 406 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	aop_spmi1: spmi@2f48d4000 {
+		compatible = "apple,t8122-spmi", "apple,t8103-spmi";
+		reg = <0x2 0xf48d4000 0 0x4000>,
+		      <0x2 0xf48c4000 0 0x4000>,
+		      <0x2 0xf48c0000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 410 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+};

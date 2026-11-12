@@ -51,6 +51,14 @@ config ARM64_USER4K_EXPERIMENTAL
 	  private prctl numbers are not upstream assignments or a stable ABI
 	  promise. Programs that do not use the prctl keep the native granule.
 
+config ARM64_CPUINFO_KUNIT_TEST
+	bool "KUnit tests for the /proc/cpuinfo model name" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && DMI
+	default KUNIT_ALL_TESTS
+	help
+	  Test how /proc/cpuinfo reads the processor's name from the SMBIOS
+	  Processor Information.
+
 config ARM64_USER4K_KUNIT_TEST
 	bool "Test mixed userspace granules with larger kernel pages"
 	depends on KUNIT=y && ARM64_USER4K_EXPERIMENTAL

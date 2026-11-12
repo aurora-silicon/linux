@@ -41,6 +41,52 @@ struct dcp_adt_frontend {
 	u32 nodes;
 };
 
+/* One J713 display coprocessor: its ADT nodes and its firmware segments. */
+struct dcp_adt_instance {
+	const char *dart;	/* firmware DART, SID23 */
+	const char *dcp;
+	const char *nub;
+	const char *disp;	/* display DART; only the internal frontend is admitted */
+	const char *segment_names;
+	const u32 *kinds;
+	u32 num_segments;
+};
+
+static const u32 dcp_adt_kinds_internal[] = {1, 0, 10, 2, 2, 2, 2};
+static const u32 dcp_adt_kinds_external[] = {1, 0, 10, 2};
+
+static const struct dcp_adt_instance dcp_adt_internal = {
+	.dart = "dart-dcp",
+	.dcp = "dcp",
+	.nub = "iop-dcp-nub",
+	.disp = "dart-disp0",
+	.segment_names = "__TEXT;__DATA;__OS_LOG;unknown;unknown;unknown;unknown",
+	.kinds = dcp_adt_kinds_internal,
+	.num_segments = ARRAY_SIZE(dcp_adt_kinds_internal),
+};
+
+/* The external DCPs run the same firmware with a single extra segment. */
+static const struct dcp_adt_instance dcp_adt_external[] = {
+	{
+		.dart = "dart-dcpext0",
+		.dcp = "dcpext0",
+		.nub = "iop-dcpext0-nub",
+		.disp = "dart-dispext0",
+		.segment_names = "__TEXT;__DATA;__OS_LOG;unknown",
+		.kinds = dcp_adt_kinds_external,
+		.num_segments = ARRAY_SIZE(dcp_adt_kinds_external),
+	},
+	{
+		.dart = "dart-dcpext1",
+		.dcp = "dcpext1",
+		.nub = "iop-dcpext1-nub",
+		.disp = "dart-dispext1",
+		.segment_names = "__TEXT;__DATA;__OS_LOG;unknown",
+		.kinds = dcp_adt_kinds_external,
+		.num_segments = ARRAY_SIZE(dcp_adt_kinds_external),
+	},
+};
+
 static inline int dcp_dart_pte_check(u64 pte, bool leaf)
 {
 	u64 fields = leaf ? DCP_DART_LEAF_FIELDS : DCP_DART_PADDR | 1;
@@ -103,14 +149,21 @@ static inline bool dcp_dart_contains(u64 base, u64 end, u64 start, u64 size)
 	return base < end && size && start >= base && start < end && size <= end - start;
 }
 
-static inline int dcp_adt_value(struct dcp_adt_tables *out, unsigned int kind,
+static inline int dcp_adt_value(struct dcp_adt_tables *out,
+				const struct dcp_adt_instance *inst, unsigned int kind,
 				const char *name, const u8 *value, u32 length)
 {
 	u32 bit = 0;
 
 	if (kind == 1 && !strcmp(name, "target-type")) {
 		bit = 1;
-		if (length != 5 || memcmp(value, "J713", 5))
+		/* Every M4 Mac shares the retained display handoff. */
+		if (!(length == 5 && (!memcmp(value, "J713", 5) ||
+				      !memcmp(value, "J715", 5) ||
+				      !memcmp(value, "J604", 5) ||
+				      !memcmp(value, "J623", 5) ||
+				      !memcmp(value, "J624", 5))) &&
+		    !(length == 6 && !memcmp(value, "J773g", 6)))
 			return -ENODEV;
 	} else if (kind == 3 && !strcmp(name, "compatible")) {
 		bit = 2;
@@ -147,17 +200,15 @@ static inline int dcp_adt_value(struct dcp_adt_tables *out, unsigned int kind,
 			seg->kind = get_unaligned_le32(record + 28);
 		}
 	} else if (kind == 6 && !strcmp(name, "uuid")) {
-		static const char uuid[] = "81BAF476-679D-3CC0-8C6A-E6B6FA659D5E";
-
+		/* Any image: the firmware version gates the layout. */
 		bit = 64;
-		if (length != sizeof(uuid) || memcmp(value, uuid, sizeof(uuid)))
-			return -ENODEV;
+		if (length != 37 || value[36])
+			return -EINVAL;
 	} else if (kind == 6 && !strcmp(name, "segment-names")) {
-		static const char names[] =
-			"__TEXT;__DATA;__OS_LOG;unknown;unknown;unknown;unknown";
+		size_t names = strlen(inst->segment_names) + 1;
 
 		bit = 128;
-		if (length != sizeof(names) || memcmp(value, names, sizeof(names)))
+		if (length != names || memcmp(value, inst->segment_names, names))
 			return -ENODEV;
 	}
 	if (out->seen & bit)
@@ -192,9 +243,10 @@ static inline int dcp_adt_frontend_value(struct dcp_adt_frontend *out,
 	return 0;
 }
 
-/* Bounded, read-only ADT subset: ROOT / arm-io / dart-dcp and ROOT / chosen. */
+/* Bounded, read-only ADT subset: one coprocessor's nodes under ROOT / arm-io, and ROOT / chosen. */
 static inline int dcp_adt_node(const u8 *data, size_t size, size_t *cursor,
 			       unsigned int parent, unsigned int depth,
+			       const struct dcp_adt_instance *inst,
 			       struct dcp_adt_tables *out, struct dcp_adt_frontend *frontend)
 {
 	size_t first, pos;
@@ -232,15 +284,15 @@ static inline int dcp_adt_node(const u8 *data, size_t size, size_t *cursor,
 		kind = 1;
 	else if (parent == 1 && !strcmp(node_name, "arm-io"))
 		kind = 2;
-	else if (parent == 2 && !strcmp(node_name, "dart-dcp"))
+	else if (parent == 2 && !strcmp(node_name, inst->dart))
 		kind = 3;
 	else if (parent == 1 && !strcmp(node_name, "chosen"))
 		kind = 4;
-	else if (parent == 2 && !strcmp(node_name, "dcp"))
+	else if (parent == 2 && !strcmp(node_name, inst->dcp))
 		kind = 5;
-	else if (parent == 5 && !strcmp(node_name, "iop-dcp-nub"))
+	else if (parent == 5 && !strcmp(node_name, inst->nub))
 		kind = 6;
-	else if (parent == 2 && !strcmp(node_name, "dart-disp0"))
+	else if (parent == 2 && !strcmp(node_name, inst->disp))
 		kind = 7;
 	if (kind == 7 && frontend && frontend->nodes++)
 		return -EINVAL;
@@ -249,7 +301,8 @@ static inline int dcp_adt_node(const u8 *data, size_t size, size_t *cursor,
 	for (u32 i = 0; i < props; i++) {
 		u32 length = get_unaligned_le32(data + pos + 32) & 0x7fffffff;
 
-		ret = dcp_adt_value(out, kind, (const char *)data + pos, data + pos + 36, length);
+		ret = dcp_adt_value(out, inst, kind, (const char *)data + pos, data + pos + 36,
+				    length);
 		if (ret)
 			return ret;
 		if (kind == 7 && frontend) {
@@ -261,7 +314,7 @@ static inline int dcp_adt_node(const u8 *data, size_t size, size_t *cursor,
 		pos += 36 + ((length + 3ULL) & ~3ULL);
 	}
 	for (u32 i = 0; i < children; i++) {
-		ret = dcp_adt_node(data, size, cursor, kind, depth + 1, out, frontend);
+		ret = dcp_adt_node(data, size, cursor, kind, depth + 1, inst, out, frontend);
 		if (ret)
 			return ret;
 	}
@@ -269,6 +322,7 @@ static inline int dcp_adt_node(const u8 *data, size_t size, size_t *cursor,
 }
 
 static inline int dcp_adt_parse_common(const void *data, size_t size,
+				       const struct dcp_adt_instance *inst,
 				       struct dcp_adt_tables *out,
 				       struct dcp_adt_frontend *frontend)
 {
@@ -280,10 +334,10 @@ static inline int dcp_adt_parse_common(const void *data, size_t size,
 		*frontend = (struct dcp_adt_frontend){};
 	if (size > 0x200000)
 		return -E2BIG;
-	ret = dcp_adt_node(data, size, &cursor, 0, 0, out, frontend);
+	ret = dcp_adt_node(data, size, &cursor, 0, 0, inst, out, frontend);
 	if (ret)
 		return ret;
-	if (out->seen != 255 || out->num_segments != 7 || !out->dram_size ||
+	if (out->seen != 255 || out->num_segments != inst->num_segments || !out->dram_size ||
 	    out->dram_start + out->dram_size < out->dram_start ||
 	    out->start >= out->end || out->end - out->start > 0x100000 ||
 	    ((out->start | out->end) & (DCP_DART_PAGE - 1)) ||
@@ -291,10 +345,9 @@ static inline int dcp_adt_parse_common(const void *data, size_t size,
 			       out->start, out->end - out->start))
 		return -EINVAL;
 	for (u32 i = 0; i < out->num_segments; i++) {
-		static const u32 kinds[] = {1, 0, 10, 2, 2, 2, 2};
 		const struct dcp_adt_segment *seg = &out->segment[i];
 
-		if (seg->kind != kinds[i] || (seg->phys & (DCP_DART_PAGE - 1)) ||
+		if (seg->kind != inst->kinds[i] || (seg->phys & (DCP_DART_PAGE - 1)) ||
 		    !dcp_dart_contains(out->dram_start, out->dram_start + out->dram_size,
 				       seg->phys, seg->size))
 			return -EINVAL;
@@ -318,7 +371,14 @@ static inline int dcp_adt_parse_common(const void *data, size_t size,
 
 static inline int dcp_adt_parse(const void *data, size_t size, struct dcp_adt_tables *out)
 {
-	return dcp_adt_parse_common(data, size, out, NULL);
+	return dcp_adt_parse_common(data, size, &dcp_adt_internal, out, NULL);
+}
+
+static inline int dcp_adt_parse_instance(const void *data, size_t size,
+					 const struct dcp_adt_instance *inst,
+					 struct dcp_adt_tables *out)
+{
+	return dcp_adt_parse_common(data, size, inst, out, NULL);
 }
 
 /* Parse metadata only: live MMIO, RAM exclusion and page tables remain unproven. */
@@ -326,7 +386,7 @@ static inline int dcp_adt_parse_frontend(const void *data, size_t size,
 					struct dcp_adt_tables *firmware,
 					struct dcp_adt_frontend *frontend)
 {
-	int ret = dcp_adt_parse_common(data, size, firmware, frontend);
+	int ret = dcp_adt_parse_common(data, size, &dcp_adt_internal, firmware, frontend);
 
 	if (ret)
 		return ret;

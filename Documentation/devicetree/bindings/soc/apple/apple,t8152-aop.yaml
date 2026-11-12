@@ -1,0 +1,106 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,t8152-aop.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T8152-generation Always-On Processor
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description:
+  The Always-On Processor on T8142, T8152 and T6050 runs firmware that the
+  boot loader loads and leaves halted. It owns the audio and sensor services.
+  The host boots it over its RTKit mailbox, on T8142 together with a
+  separate setup-port mailbox, and shares buffers through one stream of the
+  AOP DART.
+
+properties:
+  compatible:
+    oneOf:
+      - items:
+          - enum:
+              - apple,t6050-aop
+              - apple,t8142-aop
+          - const: apple,t8152-aop
+      - const: apple,t8152-aop
+
+  reg:
+    items:
+      - description: AOP register and boot-argument window
+      - description: ASC wrapper and processor control registers
+
+  reg-names:
+    items:
+      - const: mmio
+      - const: asc
+
+  mboxes:
+    minItems: 1
+    items:
+      - description: Primary firmware transport
+      - description: Firmware setup-port transport
+
+  mbox-names:
+    minItems: 1
+    items:
+      - const: mbox
+      - const: setup
+
+  iommus:
+    maxItems: 1
+
+  apple,dma-range:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    minItems: 2
+    maxItems: 2
+    description:
+      Host DMA allocation window as a base and nonzero size, inside the root
+      slots of this AOP DART stream that are free for the host.
+
+  audio:
+    type: object
+    $ref: /schemas/sound/apple,t8152-aop-audio.yaml#
+
+  als:
+    type: object
+    $ref: /schemas/iio/light/apple,aop-als.yaml#
+    description: The ambient light sensor service.
+    unevaluatedProperties: false
+
+  las:
+    type: object
+    $ref: /schemas/iio/position/apple,aop-las.yaml#
+    description: The lid angle sensor service.
+    unevaluatedProperties: false
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - mboxes
+  - mbox-names
+  - iommus
+  - apple,dma-range
+
+additionalProperties: false
+
+examples:
+  - |
+    aop@290c00000 {
+        compatible = "apple,t6050-aop", "apple,t8152-aop";
+        reg = <0x90c00000 0x1e0000>, <0x90600000 0x4000>;
+        reg-names = "mmio", "asc";
+        mboxes = <&aop_mbox>;
+        mbox-names = "mbox";
+        iommus = <&aop_dart 0>;
+        apple,dma-range = /bits/ 64 <0x11000000000 0x1000000000>;
+
+        audio {
+            compatible = "apple,t6050-aop-audio";
+            dmas = <&admac 4>, <&admac 5>, <&admac 0>, <&admac 1>;
+            dma-names = "cout", "cin", "spkr", "sense";
+            #sound-dai-cells = <1>;
+        };
+    };

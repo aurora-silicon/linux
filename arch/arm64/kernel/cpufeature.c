@@ -788,6 +788,7 @@ struct arm64_ftr_override __read_mostly id_aa64mmfr2_override;
 struct arm64_ftr_override __read_mostly id_aa64mmfr4_override;
 struct arm64_ftr_override __read_mostly id_aa64pfr0_override;
 struct arm64_ftr_override __read_mostly id_aa64pfr1_override;
+struct arm64_ftr_override __read_mostly id_aa64pfr2_override;
 struct arm64_ftr_override __read_mostly id_aa64zfr0_override;
 struct arm64_ftr_override __read_mostly id_aa64smfr0_override;
 struct arm64_ftr_override __read_mostly id_aa64isar1_override;
@@ -832,7 +833,8 @@ static const struct __ftr_reg_entry {
 			       &id_aa64pfr0_override),
 	ARM64_FTR_REG_OVERRIDE(SYS_ID_AA64PFR1_EL1, ftr_id_aa64pfr1,
 			       &id_aa64pfr1_override),
-	ARM64_FTR_REG(SYS_ID_AA64PFR2_EL1, ftr_id_aa64pfr2),
+	ARM64_FTR_REG_OVERRIDE(SYS_ID_AA64PFR2_EL1, ftr_id_aa64pfr2,
+			       &id_aa64pfr2_override),
 	ARM64_FTR_REG_OVERRIDE(SYS_ID_AA64ZFR0_EL1, ftr_id_aa64zfr0,
 			       &id_aa64zfr0_override),
 	ARM64_FTR_REG_OVERRIDE(SYS_ID_AA64SMFR0_EL1, ftr_id_aa64smfr0,
@@ -2625,6 +2627,31 @@ test_has_gicv5_legacy(const struct arm64_cpu_capabilities *entry, int scope)
 	return !!(read_sysreg_s(SYS_ICC_IDR0_EL1) & ICC_IDR0_EL1_GCIE_LEGACY);
 }
 
+/*
+ * Apple T8152 (M6) cores clear architectural state across WFIT, the FP/SIMD
+ * registers included. __delay() would execute it from any context, including
+ * the cpufreq transition polling that load-driven governors run on a CPU
+ * whose current task still has live FP/SIMD state: on J873 (M6) 25-56% of
+ * SHA-256 runs gave wrong results under schedutil. Treat WFxT as absent
+ * there, as arm64.nowfxt does, so __delay() uses WFE. T8142 (M5) was not
+ * measured; it is included because apple_m5_needs_wait_save() groups its
+ * cores with T8152 for this state loss.
+ */
+static bool has_wfxt(const struct arm64_cpu_capabilities *entry, int scope)
+{
+	static const struct midr_range apple_wfxt_loses_state[] = {
+		MIDR_ALL_VERSIONS(MIDR_CPU_MODEL(ARM_CPU_IMP_APPLE, 0x062)),
+		MIDR_ALL_VERSIONS(MIDR_CPU_MODEL(ARM_CPU_IMP_APPLE, 0x063)),
+		MIDR_ALL_VERSIONS(MIDR_CPU_MODEL(ARM_CPU_IMP_APPLE, 0x072)),
+		MIDR_ALL_VERSIONS(MIDR_CPU_MODEL(ARM_CPU_IMP_APPLE, 0x073)),
+		{}
+	};
+
+	if (is_midr_in_range_list(apple_wfxt_loses_state))
+		return false;
+	return has_cpuid_feature(entry, scope);
+}
+
 static const struct arm64_cpu_capabilities arm64_features[] = {
 #ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
 	{
@@ -3129,7 +3156,7 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
 		.desc = "WFx with timeout",
 		.capability = ARM64_HAS_WFXT,
 		.type = ARM64_CPUCAP_SYSTEM_FEATURE,
-		.matches = has_cpuid_feature,
+		.matches = has_wfxt,
 		ARM64_CPUID_FIELDS(ID_AA64ISAR2_EL1, WFxT, IMP)
 	},
 	{

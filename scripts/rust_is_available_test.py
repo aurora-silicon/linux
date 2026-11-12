@@ -20,6 +20,7 @@ class TestRustIsAvailable(unittest.TestCase):
     class Expected(enum.Enum):
         SUCCESS = enum.auto()
         SUCCESS_WITH_WARNINGS = enum.auto()
+        SUCCESS_WITH_OPTIONAL_WARNINGS = enum.auto()
         SUCCESS_WITH_EXTRA_OUTPUT = enum.auto()
         FAILURE = enum.auto()
 
@@ -54,7 +55,8 @@ else:
 """)
 
     @classmethod
-    def generate_bindgen(cls, version_stdout, libclang_stderr, libclang_22_patched=False):
+    def generate_bindgen(cls, version_stdout, libclang_stderr, libclang_22_patched=False,
+                         empty_alignment=True):
         if libclang_stderr is None:
             libclang_case = f"raise SystemExit({cls.bindgen_default_bindgen_libclang_failure_exit_code})"
         else:
@@ -71,6 +73,8 @@ if "rust_is_available_bindgen_libclang.h" in " ".join(sys.argv):
     {libclang_case}
 elif "rust_is_available_bindgen_libclang_22.h" in " ".join(sys.argv):
     {libclang_22_case}
+elif "rust_is_available_bindgen_alignment.h" in " ".join(sys.argv):
+    print({repr('#[repr(C, align(64))]' if empty_alignment else '#[repr(C)]')})
 else:
     print({repr(version_stdout)})
 """)
@@ -142,6 +146,10 @@ else:
             # be checked further by the test).
             self.assertEqual(result.returncode, 0)
             self.assertNotEqual(result.stderr, b"")
+        elif expected == self.Expected.SUCCESS_WITH_OPTIONAL_WARNINGS:
+            self.assertEqual(result.returncode, 0)
+            if result.stderr:
+                self.assertIn(b"Please see Documentation/rust/quick-start.rst for details", result.stderr)
         elif expected == self.Expected.SUCCESS_WITH_WARNINGS:
             # When expecting a success with warnings, the script should return 0
             # and it should output at least the instructions to `stderr`.
@@ -338,6 +346,33 @@ InstalledDir: /usr/bin
                 bindgen = self.generate_bindgen_version(bindgen_stdout)
                 result = self.run_script(self.Expected.SUCCESS, { "BINDGEN": bindgen })
 
+    def test_bindgen_empty_alignment_unpatched(self):
+        # The same version can be patched by a distribution, so test behavior.
+        bindgen = self.generate_bindgen("bindgen 0.73.2",
+                                       self.bindgen_default_bindgen_libclang_stderr,
+                                       empty_alignment=False)
+        result = self.run_script(self.Expected.SUCCESS_WITH_WARNINGS, { "BINDGEN": bindgen })
+        self.assertIn("does not preserve empty struct alignment", result.stderr)
+        self.assertIn("python3 tools/aurora-bindgen/build.py", result.stderr)
+
+    def test_bindgen_empty_alignment_patched(self):
+        bindgen = self.generate_bindgen("bindgen 0.73.2",
+                                       self.bindgen_default_bindgen_libclang_stderr)
+        self.run_script(self.Expected.SUCCESS, { "BINDGEN": bindgen })
+
+    def test_bindgen_empty_alignment_probe_failure(self):
+        bindgen = self.generate_executable(f'''#!/usr/bin/env python3
+import os
+import sys
+if "rust_is_available_bindgen_alignment.h" in " ".join(sys.argv):
+    print("#[repr(C, align(64))]")
+    print("probe failed", file=sys.stderr)
+    raise SystemExit(1)
+os.execv({str(self.default_bindgen)!r}, [{str(self.default_bindgen)!r}] + sys.argv[1:])
+''')
+        result = self.run_script(self.Expected.SUCCESS_WITH_WARNINGS, { "BINDGEN": bindgen })
+        self.assertIn("Could not check empty struct alignment", result.stderr)
+
     def test_success_bindgen_libclang(self):
         for stderr in (
             f"scripts/rust_is_available_bindgen_libclang.h:2:9: warning: clang version {self.llvm_default_version} (https://github.com/llvm/llvm-project.git 4a2c05b05ed07f1f620e94f6524a8b4b2760a0b1) [-W#pragma-messages], err: false",
@@ -370,7 +405,7 @@ scripts/rust_is_available_bindgen_libclang.h:2:9: warning: clang version {self.l
     def test_success_real_programs(self):
         for cc in ["gcc", "clang"]:
             with self.subTest(cc=cc):
-                result = self.run_script(self.Expected.SUCCESS, {
+                result = self.run_script(self.Expected.SUCCESS_WITH_OPTIONAL_WARNINGS, {
                     "PATH": os.environ["PATH"],
                     "RUSTC": "rustc",
                     "BINDGEN": "bindgen",

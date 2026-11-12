@@ -1,0 +1,62 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * CPU idle through PSCI CPU_SUSPEND when aura runs the OS at EL1 under its
+ * monitor (aura's /psci node, "method = smc", enable-method = "psci"). The
+ * monitor's CPU_SUSPEND is a WFI at EL2 that preserves the registers WFI
+ * wipes on these cores, so this one retention state replaces idle=nop.
+ * Without a /psci node (raw aura, spin-table) cpuidle-psci does not probe.
+ */
+
+&{/cpus} {
+	idle-states {
+		entry-method = "psci";
+
+		cpu_retention: cpu-retention {
+			compatible = "arm,idle-state";
+			arm,psci-suspend-param = <0x0>;
+			entry-latency-us = <10>;
+			exit-latency-us = <10>;
+			min-residency-us = <100>;
+		};
+	};
+};
+
+&cpu0 {
+	cpu-idle-states = <&cpu_retention>;
+};
+
+&cpu1 {
+	cpu-idle-states = <&cpu_retention>;
+};
+
+&cpu2 {
+	cpu-idle-states = <&cpu_retention>;
+};
+
+&cpu3 {
+	cpu-idle-states = <&cpu_retention>;
+};
+
+&cpu4 {
+	cpu-idle-states = <&cpu_retention>;
+};
+
+&cpu5 {
+	cpu-idle-states = <&cpu_retention>;
+};
+
+&cpu6 {
+	cpu-idle-states = <&cpu_retention>;
+};
+
+&cpu7 {
+	cpu-idle-states = <&cpu_retention>;
+};
+
+&cpu8 {
+	cpu-idle-states = <&cpu_retention>;
+};
+
+&cpu9 {
+	cpu-idle-states = <&cpu_retention>;
+};

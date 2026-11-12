@@ -215,9 +215,24 @@ static void test_snd_soc_params_to_bclk(struct kunit *test)
 	}
 }
 
+static void test_snd_soc_link_trigger_refused(struct kunit *test)
+{
+	struct snd_soc_dai_link link = {};
+
+	/* Without the flag every error is logged */
+	KUNIT_EXPECT_FALSE(test, snd_soc_link_trigger_refused(&link, -EPERM));
+	link.quiet_trigger_eperm = 1;
+	/* With it only -EPERM is a refusal */
+	KUNIT_EXPECT_TRUE(test, snd_soc_link_trigger_refused(&link, -EPERM));
+	KUNIT_EXPECT_FALSE(test, snd_soc_link_trigger_refused(&link, -EIO));
+	KUNIT_EXPECT_FALSE(test, snd_soc_link_trigger_refused(&link, -EINVAL));
+	KUNIT_EXPECT_FALSE(test, snd_soc_link_trigger_refused(&link, 0));
+}
+
 static struct kunit_case soc_utils_test_cases[] = {
 	KUNIT_CASE(test_tdm_params_to_bclk),
 	KUNIT_CASE(test_snd_soc_params_to_bclk),
+	KUNIT_CASE(test_snd_soc_link_trigger_refused),
 	{}
 };
 

@@ -8,8 +8,10 @@
 #include <linux/list.h>
 #include <linux/maple_tree.h>
 #include <linux/mutex.h>
+#include <linux/notifier.h>
 #include <linux/types.h>
 #include <linux/spinlock.h>
+#include <linux/workqueue.h>
 
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
@@ -79,6 +81,7 @@ enum isp_firmware_version {
 	ISP_FIRMWARE_V_12_4,
 	ISP_FIRMWARE_V_13_5,
 	ISP_FIRMWARE_V_14_7,
+	ISP_FIRMWARE_V_26_6_2,
 };
 
 struct isp_surf {
@@ -137,6 +140,15 @@ struct isp_mmio_window {
 	u64 size;
 };
 
+/*
+ * A DART address filter window. Both bounds are inclusive and word
+ * granular, as the hardware takes them.
+ */
+struct isp_dapf_window {
+	u64 start;
+	u64 end;
+};
+
 struct isp_preset {
 	u32 index;
 	struct coord input_dim;
@@ -153,6 +165,7 @@ struct apple_isp_hw {
 	u64 pmu_base;
 
 	int dsid_count;
+	const u64 *dsid_clr_bases;
 	/* windows of the H17 multi broadcast-clear command, the unused all ones */
 	u8 dsid_slots;
 	u64 dsid_clr_base0;
@@ -185,12 +198,30 @@ struct apple_isp_hw {
 	u32 mbox2_offset;
 	/* further interrupt enable and routing words (ISP17a) */
 	bool mbox_irq_route;
+	bool mbox_extra_enables;
 	/* coprocessor control register, 0 for ISP_COPROC_CONTROL */
 	u32 coproc_control;
+	/* coprocessor status register, 0 for ISP_COPROC_STATUS */
+	u32 coproc_status;
+	/*
+	 * coprocessor quiesce register, 0 for none. The CPU core domains of
+	 * a coprocessor that stopped only power down cleanly once it has
+	 * quiesced; otherwise they stay busy and never run again.
+	 */
+	u32 coproc_quiesce;
 
 	/* windows mapped 1:1 for the firmware */
 	const struct isp_mmio_window *fw_mmio;
 	unsigned int num_fw_mmio;
+
+	/*
+	 * The windows the ADT gives the first DART's address filter, inside
+	 * the fw_mmio windows. The filter loses them with ISP_SYS, so they
+	 * are programmed after every power-up.
+	 */
+	const struct isp_dapf_window *dapf;
+	unsigned int num_dapf;
+	u32 dapf_sidmask;
 
 	/* ISP_GPIO_6 boot mode */
 	u32 boot_mode;
@@ -201,11 +232,51 @@ struct apple_isp_hw {
 	/* size of a capture metadata buffer, 0 for no such pool */
 	u32 capture_meta_size;
 
+	/* metadata buffers carry the frame's exposure report (H17 firmware) */
+	bool meta_exposure;
+
 	/*
-	 * The firmware can be started only once per system boot, so it is
-	 * started at probe and kept running while the driver is bound.
+	 * The firmware leaves its data segment changed when it stops, and
+	 * does not start from it again. Keep a copy of the segment as the
+	 * boot loader loaded it, taken at probe before the firmware first
+	 * runs, and put it back whenever the firmware has stopped.
+	 */
+	bool fw_restore;
+
+	/*
+	 * The firmware isn't started for each stream: once started it is kept
+	 * running while the driver is bound. It starts at probe, or at the
+	 * first stream with deferred_start.
 	 */
 	bool resident_fw;
+
+	/* Resident firmware that starts again after a stop, from its own memory */
+	bool fw_restart;
+
+	/*
+	 * Start the firmware, and detect the camera, at the first stream
+	 * instead of at probe, so the ISP stays off until then. The firmware
+	 * must be resident or start again (fw_restore): the camera is
+	 * detected only once.
+	 */
+	bool deferred_start;
+
+	/* The xx24 setfiles' lens shading strides need zeroing (T8142). */
+	bool setfile_stride_fixup;
+
+	/*
+	 * Firmware that starts again (fw_restore) only with what the device
+	 * tree may lack: the DART address filter registers and the location
+	 * of the data segment. Without them it is kept resident instead.
+	 */
+	bool resident_fallback;
+
+	/*
+	 * Firmware that starts again stays up this long after a stream, so
+	 * that a stream started again soon, as applications do when they
+	 * reopen the camera, does not wait for another firmware start.
+	 */
+	unsigned int fw_idle_ms;
 };
 
 enum isp_sensor_id {
@@ -284,6 +355,7 @@ struct apple_isp {
 	struct device *dev;
 	const struct apple_isp_hw *hw;
 	enum isp_firmware_version fw_compat;
+	bool preview_26;
 	u32 platform_id;
 	u32 temporal_filter;
 	u32 cam_connections_scheme;
@@ -302,6 +374,13 @@ struct apple_isp {
 	struct v4l2_device v4l2_dev;
 	struct v4l2_ctrl_handler ctrl_handler;
 	struct v4l2_ctrl *exposure_priority;
+	struct v4l2_ctrl *power_line_frequency;
+	/* read-only exposure report of the last frame, NULL without one */
+	struct v4l2_ctrl *gain;
+	struct v4l2_ctrl *exposure;
+	/* last reported total gain (1/256 steps) and exposure (us) */
+	u32 frame_gain;
+	u32 frame_exposure_us;
 	struct vb2_queue vbq;
 	struct mutex video_lock;
 	unsigned int sequence;
@@ -320,6 +399,7 @@ struct apple_isp {
 	void __iomem *gpio;
 	void __iomem *mbox2;
 	void __iomem *wdt;
+	void __iomem *dapf;
 	struct hrtimer wdt_timer;
 	bool wdt_running;
 
@@ -334,14 +414,47 @@ struct apple_isp {
 		u64 heap_base;
 		u64 heap_top;
 		u64 data_top; /* 0 unless the bootloader loads the data */
+		/* the coprocessor's reset vector at the first start */
+		u64 entry;
+		/* the coprocessor has run since probe */
+		bool started;
 	} fw;
 	/* changes under video_lock once the video device is registered */
 	enum isp_fw_state fw_state;
+	/* First IPC failure; cleared only after fresh channel initialization. */
+	int ipc_error;
+	/* End the current receive invocation before resident reclamation. */
+	bool ipc_quiescing;
+	/* firmware that starts again, idling until fw_idle_work stops it */
+	bool fw_idle;
+	struct delayed_work fw_idle_work;
+	/* the camera was detected; until then a deferred start is pending */
+	bool camera_detected;
+	/* configurations the firmware has, once a deferred start detected them */
+	u32 num_fw_presets;
+
+	/* stops idle resident firmware before a system sleep */
+	struct notifier_block pm_nb;
+
+	/* stopped for system sleep, to start again on resume */
+	bool fw_sleep_stopped;
+	/* restarts a stream that ran across that sleep, see apple_isp_resume() */
+	struct work_struct resume_work;
 
 	struct isp_surf *ipc_surf;
 	struct isp_surf *extra_surf;
 	struct isp_surf *data_surf;
 	struct isp_surf *main_tail_surf;
+	/* With hw->fw_restore: the firmware data segment and its copy */
+	void *fw_data;
+	void *fw_data_copy;
+	size_t fw_data_size;
+	/* and the boot loader's heap memory, where it provides it */
+	void *fw_heap;
+	void *fw_heap_copy;
+	size_t fw_heap_size;
+	/* hw, as this device runs it (see apple_isp_select_hw()) */
+	struct apple_isp_hw hw_local;
 	struct isp_surf *log_surf;
 	struct isp_surf *bt_surf;
 	struct isp_surf *meta_surfs[ISP_MAX_BUFFERS];
@@ -414,6 +527,8 @@ enum {
 	ISP_STATE_SLEEPING,
 };
 
+int apple_isp_program_dapf(struct apple_isp *isp);
+
 #define isp_dbg(isp, fmt, ...) \
 	dev_dbg((isp)->dev, "[%s] " fmt, __func__, ##__VA_ARGS__)
 
@@ -433,7 +548,8 @@ enum {
 
 static inline bool isp_supports_p010(struct apple_isp *isp)
 {
-	return isp->hw->gen == ISP_GEN_T6040 &&
+	/* Its config discovery would change formats already advertised. */
+	return isp->hw->gen == ISP_GEN_T6040 && !isp->hw->deferred_start &&
 	       isp_get_current_format(isp)->version == 0x958;
 }
 

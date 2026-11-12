@@ -27,11 +27,13 @@ import transaction
 import accounting
 import idle
 import desktop
+import audio
 import j616s
 import rate
 import boot
 import m4
 import display
+import colorimetry
 
 
 def parking_unit(root):
@@ -43,7 +45,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', type=Path, default=Path(__file__).resolve().parents[6])
     parser.add_argument('--output', type=Path, help='retain generated C, commands and results here')
-    parser.add_argument('--group', choices=('all', 'edid', 'rate', 'phy', 'lifecycle', 'boot', 'quiesce', 'm4', 'display'), default='all')
+    parser.add_argument('--group', choices=('all', 'edid', 'rate', 'phy', 'lifecycle', 'boot', 'quiesce', 'm4', 'display', 'audio'), default='all')
     args = parser.parse_args()
     root = args.source.resolve()
     output = args.output or Path(tempfile.mkdtemp(prefix='apple-dcp-selftest-'))
@@ -54,6 +56,11 @@ def main():
                                        'orientation-faults', 'backend-change', 'safe-first',
                                        'failed-flip-return', 'live-park'))
     tests = [
+        ('display', 'panel-colorimetry', lambda r: colorimetry.panel(r, output), ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
+        ('audio', 'compact-audio-reply-bounds', audio.reply_bounds, ((),), ()),
+        ('display', 'desktop-gamma', desktop.gamma, ((),), ()),
+        ('display', 'hdr-static-metadata', display.hdr_metadata, ((),), ()),
+        ('display', 'ctm-encoding', colorimetry.ctm, ((),), ()),
         ('lifecycle', 'desktop-modeset-unmap', desktop.modeset_unmap, ((),), ()),
         ('lifecycle', 'desktop-unknown-modeset-recovery', desktop.modeset_unknown, ((),), ()),
         ('display', 'panel-backlight-ramp', display.backlight, ((),), ()),
@@ -76,7 +83,9 @@ def main():
         ('m4', 'm4-common-plane', m4.plane, ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
         ('m4', 'm4-producer-retirement', m4.prepare, ((),), ('-Wno-unused-function',)),
         ('m4', 'm4-dpms-retirement', m4.blank, ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
+        ('m4', 'm4-power-gate', m4.gate, ((),), ('-Wno-unused-function',)),
         ('m4', 'm4-dart-consumer', m4.dart, ((),), ('-Wno-unused-function',)),
+        ('m4', 'm4-panel-timing', m4.timing, ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
         ('boot', 'oslog-events', boot.oslog, ((),), ()),
         ('boot', 'syslog-policy', boot.syslog, ((),), ()),
         ('edid', 'dpavserv-start', edid.startup, ((),), ()),
@@ -85,6 +94,7 @@ def main():
         ('edid', 'ordered-rx', edid.rx_progress, ((),), ('-pthread',)),
         ('rate', 'parser-policy', lambda r: rate.policy(r)['unit'], ((),), ()),
         ('rate', 'publication-hpd', rate.hotplug, ((),), ()),
+        ('rate', 'panel-dimensions', rate.panel_dimensions, ((),), ()),
         ('rate', 'metadata-decoder', lambda r: rate.metadata(r, output), ((),), ('-Wno-sign-compare',)),
         ('rate', 'bounded-retry', rate.retry, ((),), ()),
         ('phy', 'pm-ownership', pm.ownership, ((),), ()),
@@ -137,7 +147,7 @@ def main():
             elif isinstance(unit, tuple):
                 unit, cases = unit
             if unit is not None and name in ('provider-admission', 'ordered-rx',
-                    'publication-hpd', 'stale-crtc-poweroff', 'readiness'):
+                    'publication-hpd', 'panel-dimensions', 'stale-crtc-poweroff', 'readiness'):
                 # These fixtures select older external-display backends. The M4
                 # transport is covered by the separate m4 group, not mocked here.
                 prefix = ('#include <stdbool.h>\n#include <assert.h>\n'
@@ -145,7 +155,9 @@ def main():
                           '#define iomfb_m4_get_mode(...) (-95)\n'
                           '#define iomfb_m4_blank(...) (-95)\n')
                 if 'dcp_fail_stop(' in unit:
+                    # Firmware 27 fail-stops like H17P; no fixture here runs firmware 27.
                     prefix += ('struct apple_dcp;\n'
+                               '#define DCP_FIRMWARE_V_27_0 0x2700\n'
                                'static inline bool dcp_fail_stop(const struct apple_dcp *dcp);\n')
                     unit += '\n' + block((apple / 'dcp-internal.h').read_text(),
                                           'static inline bool dcp_fail_stop(')

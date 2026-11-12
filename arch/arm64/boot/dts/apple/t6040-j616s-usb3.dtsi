@@ -543,7 +543,7 @@
 	apple,tunable-usb2-host = <0x8 0x7003 0x3>;
 };
 
-&usb_drd0 {
+&dwc3_0 {
 	/* DRD_USB31_GBL_DEFAULT, then GCTL.PWRDNSCALE = 0xd as macOS's controller reset() sets it */
 	apple,tunable-gbl-default = <0x64 0x2 0x0>, <0x10 0xfff80000 0x00680000>;
 	apple,tunable-gbl-host = <0x4 0x0001ef00 0x00002f00>, <0x1c 0x00000100 0x0>,
@@ -557,7 +557,7 @@
 		<0x60 0x0003ffff 0x00000600>;
 };
 
-&usb_drd1 {
+&dwc3_1 {
 	/* DRD_USB31_GBL_DEFAULT, then GCTL.PWRDNSCALE = 0xd as macOS's controller reset() sets it */
 	apple,tunable-gbl-default = <0x64 0x2 0x0>, <0x10 0xfff80000 0x00680000>;
 	apple,tunable-gbl-host = <0x4 0x0001ef00 0x00002f00>, <0x1c 0x00000100 0x0>,
@@ -571,7 +571,7 @@
 		<0x60 0x0003ffff 0x00000600>;
 };
 
-&usb_drd2 {
+&dwc3_2 {
 	/* DRD_USB31_GBL_DEFAULT, then GCTL.PWRDNSCALE = 0xd as macOS's controller reset() sets it */
 	apple,tunable-gbl-default = <0x64 0x2 0x0>, <0x10 0xfff80000 0x00680000>;
 	apple,tunable-gbl-host = <0x4 0x0001ef00 0x00002f00>, <0x1c 0x00000100 0x0>,

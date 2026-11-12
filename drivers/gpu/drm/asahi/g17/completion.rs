@@ -13,8 +13,15 @@ use super::{
     recovery::Class,
     status::VmStatus,
 };
-use crate::{driver::AsahiDrmDevice, file, hw::t8140::{dynamic, resources as cfg}, mmu};
-use core::sync::atomic::{fence as barrier, AtomicBool, AtomicI32, AtomicU8, Ordering};
+use crate::{
+    driver::AsahiDrmDevice,
+    file,
+    hw::t8140::{dynamic, resources as cfg},
+    mmu,
+};
+use core::sync::atomic::{
+    fence as barrier, AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering,
+};
 use kernel::{
     dma_fence::{Fence, FenceContexts, RawDmaFence, UserFence},
     new_mutex,
@@ -30,6 +37,8 @@ struct Destination {
     // The buffer keeps its GPU alias and its CPU mapping alive.
     buffer: Arc<crate::timestamp::Buffer>,
     offset: usize,
+    /// The destination's address in the firmware timestamp window, if its buffer is mapped there.
+    window_va: Option<u64>,
 }
 
 impl Destination {
@@ -50,25 +59,81 @@ impl Destination {
         if offset.checked_add(size_of::<u64>()).ok_or(EINVAL)? > buffer.size() {
             return Err(ERANGE);
         }
+        let window_va = buffer.window_va(offset);
         let offset = buffer.timestamp_offset(offset)?;
-        Ok(Some(Self { buffer, offset }))
+        Ok(Some(Self { buffer, offset, window_va }))
     }
 
     fn write(&self, ticks: u64) {
-        const NSEC_PER_SEC: u64 = 1_000_000_000;
-        let ns = (ticks / cfg::COMMAND_TIMESTAMP_HZ)
-            .wrapping_mul(NSEC_PER_SEC)
-            .wrapping_add(
-                ticks % cfg::COMMAND_TIMESTAMP_HZ * NSEC_PER_SEC / cfg::COMMAND_TIMESTAMP_HZ,
-            );
-        self.buffer.write_timestamp(self.offset, ns);
+        self.buffer.write_timestamp(self.offset, ticks_to_ns(ticks));
         barrier(Ordering::Release);
     }
+
+    /// An end stamp the firmware writes itself, through the window, as the same nanoseconds the
+    /// host would write. Wait for it without writing: a host write, or a firmware write landing
+    /// after the fence, could undo a reset userspace may make once the fence has signalled. If
+    /// it does not land in time, the host writes the value, still before the fence.
+    fn write_window(&self, ticks: u64) {
+        let ns = ticks_to_ns(ticks);
+        let mut polls = 0;
+        while self.buffer.read_timestamp(self.offset) != Some(ns) {
+            if polls == WINDOW_POLLS {
+                WINDOW_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                WINDOW_MISSES.fetch_add(1, Ordering::Relaxed);
+                self.write(ticks);
+                return;
+            }
+            kernel::time::delay::udelay(kernel::time::Delta::from_micros(WINDOW_POLL_US));
+            polls += 1;
+        }
+        WINDOW_KEPT.fetch_add(1, Ordering::Relaxed);
+        WINDOW_MISSES.store(0, Ordering::Relaxed);
+    }
+}
+
+fn ticks_to_ns(ticks: u64) -> u64 {
+    const NSEC_PER_SEC: u64 = 1_000_000_000;
+    (ticks / cfg::COMMAND_TIMESTAMP_HZ)
+        .wrapping_mul(NSEC_PER_SEC)
+        .wrapping_add(ticks % cfg::COMMAND_TIMESTAMP_HZ * NSEC_PER_SEC / cfg::COMMAND_TIMESTAMP_HZ)
+}
+
+/// The firmware writes the stamp ~20 us after the pass ends; macOS saw it up to 36 us after the
+/// event ring. In practice it has always landed by retirement's first read.
+const WINDOW_POLLS: u32 = 40;
+const WINDOW_POLL_US: i64 = 5;
+static WINDOW_KEPT: AtomicU64 = AtomicU64::new(0);
+static WINDOW_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+/// Host fallbacks in a row. At [`WINDOW_GIVE_UP`] the firmware is taken not to write through
+/// the window at all (mapping refused, other firmware), and no render is handed a window
+/// address again, so none pays the full wait.
+static WINDOW_MISSES: AtomicU32 = AtomicU32::new(0);
+const WINDOW_GIVE_UP: u32 = 8;
+
+/// `capacity`: firmware-written end stamps kept, and those the host had to write.
+pub(crate) fn window_counters() -> [u64; 2] {
+    [WINDOW_KEPT.load(Ordering::Relaxed), WINDOW_FALLBACKS.load(Ordering::Relaxed)]
+}
+
+/// Only the fragment end stamp goes through the window (slots: vertex start, vertex end,
+/// fragment start, fragment end). The firmware latches a start stamp before the command's
+/// barriers resolve, so a reset of the same query ordered before the command can still land
+/// on top of it. A vertex end handed to the firmware never held the host's value by the end
+/// of the wait, so it would only cost every render that stamps it the full wait.
+const fn window_slot(index: usize) -> bool {
+    index == 3
 }
 
 /// Timestamp destinations resolved and retained before any command is enqueued. Dropping
 /// one releases only a buffer reference; the buffer defers its own mapping release.
-pub(crate) struct Destinations([Option<Destination>; 4]);
+pub(crate) struct Destinations {
+    stamps: [Option<Destination>; 4],
+    /// A render: the firmware gets its fragment end destination through the window. A compute
+    /// command's only stamp pair stays kernel-private (recovery trusts it).
+    render: bool,
+    /// The firmware was handed window destinations ([`Self::window_vas`]).
+    handed: AtomicBool,
+}
 
 impl Destinations {
     pub(crate) fn resolve(
@@ -83,13 +148,48 @@ impl Destinations {
             destinations[2 * index] = Destination::resolve(objects, timestamp.start)?;
             destinations[2 * index + 1] = Destination::resolve(objects, timestamp.end)?;
         }
-        Ok(Self(destinations))
+        Ok(Self {
+            stamps: destinations,
+            render: timestamps.len() == 2,
+            handed: AtomicBool::new(false),
+        })
     }
 
-    pub(crate) fn has_outputs(&self) -> bool { self.0.iter().any(Option::is_some) }
+    /// Window addresses for a render's vertex and fragment start/end destinations: the fragment
+    /// end's if it is mapped in the window, 0 for the others.
+    fn window_vas(&self) -> [u64; 4] {
+        if !self.render || WINDOW_MISSES.load(Ordering::Relaxed) >= WINDOW_GIVE_UP {
+            return [0; 4];
+        }
+        let vas: [u64; 4] = core::array::from_fn(|i| {
+            let destination = self.stamps[i].as_ref().filter(|_| window_slot(i));
+            destination.and_then(|d| d.window_va).unwrap_or(0)
+        });
+        if vas.iter().any(|&va| va != 0) {
+            self.handed.store(true, Ordering::Release);
+        }
+        vas
+    }
+
+    pub(crate) fn has_outputs(&self) -> bool {
+        self.stamps.iter().any(Option::is_some)
+    }
 
     fn iter(&self) -> core::slice::Iter<'_, Option<Destination>> {
-        self.0.iter()
+        self.stamps.iter()
+    }
+
+    fn write(&self, ticks: [u64; 4]) {
+        let handed = self.handed.load(Ordering::Acquire);
+        for (index, (destination, ticks)) in self.stamps.iter().zip(ticks).enumerate() {
+            match destination {
+                Some(destination) if handed && window_slot(index) && destination.window_va.is_some() => {
+                    destination.write_window(ticks)
+                }
+                Some(destination) => destination.write(ticks),
+                None => {}
+            }
+        }
     }
 }
 
@@ -103,13 +203,7 @@ struct Output {
 impl Output {
     fn publish(&self, result: Result<[u64; 4]>) {
         match result {
-            Ok(ticks) => {
-                for (destination, ticks) in self.destinations.iter().zip(ticks) {
-                    if let Some(destination) = destination {
-                        destination.write(ticks);
-                    }
-                }
-            }
+            Ok(ticks) => self.destinations.write(ticks),
             Err(error) => self.fence.set_error(error),
         }
         self.fence.signal();
@@ -175,11 +269,15 @@ pub(crate) struct ComputeTimestampCache {
 }
 
 impl ComputeTimestampCache {
-    /// Pages retained per context; deeper pipelines allocate the rest.
-    const RETAINED: usize = 8;
+    /// Pages retained per context; deeper pipelines allocate the rest. Every queued command
+    /// holds a page from submission on, and a game keeps a couple of hundred compute commands
+    /// queued, so a smaller cache refills and frees a page for nearly every command.
+    const RETAINED: usize = 256;
+    /// The cache grows to `RETAINED` only in contexts that queue that deep.
+    const INITIAL: usize = 8;
 
     pub(crate) fn new() -> Result<Arc<Self>> {
-        let pages = KVec::with_capacity(Self::RETAINED, GFP_KERNEL)?;
+        let pages = KVec::with_capacity(Self::INITIAL, GFP_KERNEL)?;
         Arc::pin_init(
             pin_init!(Self {
                 pages <- new_mutex!(pages, "G17 compute timestamp pages"),
@@ -208,7 +306,11 @@ impl ComputeTimestampCache {
     fn put(&self, page: ComputeTimestamps) {
         let rejected = {
             let mut pages = self.pages.lock();
-            pages.push_within_capacity(page).err()
+            if pages.len() < Self::RETAINED && pages.reserve(1, GFP_KERNEL).is_ok() {
+                pages.push_within_capacity(page).err().map(|rejected| rejected.0)
+            } else {
+                Some(page)
+            }
         };
         // Teardown of a page beyond the retained count runs unlocked.
         drop(rejected);
@@ -239,6 +341,31 @@ impl Drop for PooledTimestamps {
 /// Republications of one command whose earlier publications firmware dropped unexecuted.
 pub(crate) const MAX_REPLAYS: u8 = 3;
 
+/// M5 timestamp pairs share a retained page of the physical compute queue.
+/// A completion keeps its backing alive through quarantine and replay.
+struct M5ComputeTimestamps {
+    object: Arc<KernelObject>,
+    offset: usize,
+}
+
+impl M5ComputeTimestamps {
+    fn clear(&self) -> Result {
+        let start = self.object.dword(self.offset)?;
+        let end = self.object.dword(self.offset + 8)?;
+        start.store(0, Ordering::Relaxed);
+        end.store(0, Ordering::Relaxed);
+        barrier(Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn words(&self) -> Result<[u64; 2]> {
+        let words = [self.object.dword(self.offset)?.load(Ordering::Relaxed),
+            self.object.dword(self.offset + 8)?.load(Ordering::Relaxed)];
+        barrier(Ordering::Acquire);
+        Ok(words)
+    }
+}
+
 #[pin_data]
 pub(crate) struct Completion {
     status: Arc<VmStatus>,
@@ -247,7 +374,13 @@ pub(crate) struct Completion {
     // predecessor's host writes. DRM credits must follow the terminal result.
     terminal: Option<UserFence<CompletionFence>>,
     compute: Option<PooledTimestamps>,
+    #[pin]
+    m5_compute: Mutex<Option<M5ComputeTimestamps>>,
+    /// A compute command. M5 compute binds its timestamps at publication, so
+    /// `compute` alone does not identify the engine.
+    is_compute: bool,
     feed: Option<Arc<super::feed::Feed>>,
+    usage: Arc<crate::usage::Client>,
     sources: Option<Arc<super::sync_input::Sources>>,
     #[pin]
     vm_job: Mutex<Option<mmu::VmJobGuard>>,
@@ -285,22 +418,28 @@ impl Completion {
         host_predecessors: bool,
         feed: Option<Arc<super::feed::Feed>>,
         sources: Option<Arc<super::sync_input::Sources>>,
+        usage: Arc<crate::usage::Client>,
     ) -> Result<Arc<Self>> {
         let fence = fence::independent(contexts)?;
-        let ordered = !compute
-            && (host_predecessors || destinations.iter().any(Option::is_some));
+        let ordered = !compute && (host_predecessors || destinations.iter().any(Option::is_some));
         let terminal = if host_predecessors {
             Some(fence::independent(contexts)?)
         } else {
             None
         };
-        let output = Output { fence, member, destinations };
+        let output = Output {
+            fence,
+            member,
+            destinations,
+        };
         let output = if ordered {
             HostOutput::Ordered(Publication::new(output, context.status().clone())?)
         } else {
             HostOutput::Immediate(output)
         };
-        let compute = if compute {
+        // M5 compute binds its timestamp pair in its physical queue's page at publication.
+        let is_compute = compute;
+        let compute = if compute && !context.is_m5() {
             Some(context.compute_timestamps().take(dev, context.vm())?)
         } else {
             None
@@ -311,7 +450,10 @@ impl Completion {
                 output,
                 terminal,
                 compute,
+                m5_compute <- new_mutex!(None, "M5 queue timestamps"),
+                is_compute,
                 feed,
+                usage,
                 sources,
                 vm_job <- new_mutex!(Some(vm_job), "G17 command VM pin"),
                 render <- new_mutex!(None, "G17 command render lease"),
@@ -334,7 +476,9 @@ impl Completion {
         Fence::from_fence(&self.output.output().fence)
     }
     pub(crate) fn scheduler_fence(&self) -> Fence {
-        self.terminal.as_ref().map_or_else(|| self.fence(), |fence| Fence::from_fence(fence))
+        self.terminal
+            .as_ref()
+            .map_or_else(|| self.fence(), |fence| Fence::from_fence(fence))
     }
     pub(crate) fn publication(&self) -> Option<Arc<Publication>> {
         match &self.output {
@@ -382,11 +526,15 @@ impl Completion {
         }
         match self.check_source_inputs() {
             Ok(()) => self.output.output().member.note_retired(),
-            Err(error) => { self.note_input_error(error); }
+            Err(error) => {
+                self.note_input_error(error);
+            }
         }
     }
     pub(super) fn check_source_inputs(&self) -> Result {
-        if let Some(sources) = &self.sources { sources.check()?; }
+        if let Some(sources) = &self.sources {
+            sources.check()?;
+        }
         Ok(())
     }
 
@@ -394,18 +542,46 @@ impl Completion {
         self.output.output().member.work_state()
     }
     pub(crate) fn has_timestamps(&self) -> bool {
-        self.output.output().destinations.iter().any(Option::is_some)
+        self.output
+            .output()
+            .destinations
+            .iter()
+            .any(Option::is_some)
+    }
+
+    /// The firmware window addresses of a render's vertex and fragment start/end stamps.
+    pub(crate) fn window_vas(&self) -> [u64; 4] {
+        self.output.output().destinations.window_vas()
     }
 
     pub(crate) fn compute_timestamp_va(&self) -> Result<u64> {
-        Ok(self.compute.as_ref().ok_or(EINVAL)?.page()?.mapping.iova())
+        if let Some(compute) = &self.compute { return Ok(compute.page()?.mapping.iova()); }
+        let compute = self.m5_compute.lock();
+        let compute = compute.as_ref().ok_or(EINVAL)?;
+        Ok(compute.object.gpu_va() + compute.offset as u64)
+    }
+
+    /// The queue checked its record-slot retirement before calling this.
+    /// Clearing and binding precede descriptor publication under the device lock.
+    pub(crate) fn bind_m5_compute_timestamps(&self, object: &Arc<KernelObject>, offset: usize) -> Result<u64> {
+        if self.compute.is_some() || self.signalled.load(Ordering::Acquire) {
+            return Err(EINVAL);
+        }
+        let timestamps = M5ComputeTimestamps { object: object.clone(), offset };
+        timestamps.clear()?;
+        let address = timestamps.object.gpu_va() + offset as u64;
+        *self.m5_compute.lock() = Some(timestamps);
+        Ok(address)
     }
 
     /// The caller has proved that firmware retired this command, or has
     /// received its scheduler kill acknowledgement with recovery closed.
     /// These are the command's public timestamp words, not queue-private state.
     pub(crate) fn compute_words(&self) -> Result<[u64; 2]> {
-        let object = &self.compute.as_ref().ok_or(EINVAL)?.page()?.object;
+        let Some(compute) = self.compute.as_ref() else {
+            return self.m5_compute.lock().as_ref().ok_or(EINVAL)?.words();
+        };
+        let object = &compute.page()?.object;
         let words = [
             object.dword(0)?.load(Ordering::Relaxed),
             object.dword(8)?.load(Ordering::Relaxed),
@@ -458,7 +634,10 @@ impl Completion {
         if self.signalled.load(Ordering::Acquire) {
             return Err(ECANCELED);
         }
-        let object = &self.compute.as_ref().ok_or(EINVAL)?.page()?.object;
+        let Some(compute) = self.compute.as_ref() else {
+            return self.m5_compute.lock().as_ref().ok_or(EINVAL)?.clear();
+        };
+        let object = &compute.page()?.object;
         let start = object.dword(0)?;
         let end = object.dword(8)?;
         start.store(0, Ordering::Relaxed);
@@ -524,7 +703,7 @@ impl Completion {
     /// A firmware restart listed this command in its recovery table: it was in
     /// flight, so it may have run partly. Its stamps and completion record may
     /// still look like success. Unless a replay republishes it from the start,
-    /// it fails and the failure is always reported to the client.
+    /// it fails: its fence carries ECANCELED, and only a guilty VM is poisoned.
     pub(crate) fn note_interrupted(&self) {
         self.interrupted.store(true, Ordering::Release);
     }
@@ -533,19 +712,32 @@ impl Completion {
         self.interrupted.load(Ordering::Acquire)
     }
 
-    /// Whether this failure makes the VM unusable. Spared work, and interrupted
-    /// work no recovery found guilty, fail without poisoning it.
+    /// Whether the fence has been signalled (completed or failed).
+    pub(crate) fn signalled(&self) -> bool {
+        self.signalled.load(Ordering::Acquire)
+    }
+
+    /// Whether this failure makes the VM unusable. Spared work, interrupted
+    /// work no recovery found guilty, and work that never ran (ENODATA) fail
+    /// without poisoning it.
     pub(crate) fn poisons(&self, error: Error) -> bool {
+        // A command that never ran cannot have faulted the GPU. The queue's own failed
+        // command also comes back as ENODATA (a zero-duration record); it is classified
+        // guilty before it fails, by the firmware's fault report or by a recovery.
+        if error == ENODATA && !self.guilty() {
+            return false;
+        }
         let interrupted = self.interrupted();
         (error != ECANCELED || interrupted) && !self.spared() && !(interrupted && !self.guilty())
     }
 
-    /// ECANCELED stays silent only for work that was never interrupted (closed
-    /// or cancelled by its owner); every other failure reaches the client.
+    /// A non-poisoning ECANCELED or ENODATA (work a recovery discarded or dropped) stays out of
+    /// the VM status, as the UAPI documents for work another VM's recovery discarded:
+    /// Honeykrisp reads any status error as a lost device. Every other failure reaches the client.
     fn report(&self, error: Error) {
         if self.poisons(error) {
             self.status.record(error);
-        } else if error != ECANCELED || self.interrupted() {
+        } else if !discarded(error) {
             self.status.report_failure(error);
         }
     }
@@ -597,7 +789,9 @@ impl Completion {
     /// An exact whole-pair drain or processor stop allows rehabilitation. The
     /// VM pin goes first; the still-held lease excludes reuse until both settle.
     pub(crate) fn release_after_retirement(&self) {
-        if let Some(sources) = &self.sources { sources.release(); }
+        if let Some(sources) = &self.sources {
+            sources.release();
+        }
         drop(self.vm_job.lock().take());
         let lease = self.render.lock().take();
         if let Some(lease) = lease.as_ref() {
@@ -612,7 +806,9 @@ impl Completion {
     }
 
     fn release_healthy(&self) {
-        if let Some(sources) = &self.sources { sources.release(); }
+        if let Some(sources) = &self.sources {
+            sources.release();
+        }
         drop(self.render.lock().take());
         drop(self.vm_job.lock().take());
     }
@@ -620,9 +816,25 @@ impl Completion {
     /// Exact retirement permits the physical lease and VM pin to be released
     /// before waking userspace. A failure fence alone never establishes this.
     #[track_caller]
-    pub(crate) fn complete(&self, mut result: Result<[u64; 4]>) {
+    pub(crate) fn complete(&self, result: Result<[u64; 4]>) {
+        // M5 compute feeds the refill detector only from its exact execution record
+        // (RetiredCompute); M5 compute is the compute without pooled timestamps.
+        let execution = if self.is_compute && self.compute.is_none() {
+            None
+        } else {
+            result.as_ref().ok().map(|ticks| [ticks[0], ticks[1]])
+        };
+        self.complete_with_compute(result, execution);
+    }
+
+    /// Compute feedback is separate from public timestamps, which may contain
+    /// a synthesized retirement envelope when the execution record is absent.
+    #[track_caller]
+    fn complete_with_compute(&self, mut result: Result<[u64; 4]>, compute: Option<[u64; 2]>) {
         if result.is_ok() {
-            if let Err(error) = self.check_source_inputs() { result = Err(error); }
+            if let Err(error) = self.check_source_inputs() {
+                result = Err(error);
+            }
         }
         if self.signalled.swap(true, Ordering::AcqRel) {
             return;
@@ -630,11 +842,23 @@ impl Completion {
         if result.is_ok() && self.interrupted() {
             result = Err(ECANCELED);
         }
+        if let Ok(ticks) = &result {
+            use crate::usage::Engine;
+            let hz = cfg::COMMAND_TIMESTAMP_HZ as u32;
+            if self.is_compute {
+                self.usage.add(Engine::Compute, ticks[0], ticks[1], hz);
+            } else {
+                self.usage.add(Engine::Vertex, ticks[0], ticks[1], hz);
+                self.usage.add(Engine::Fragment, ticks[2], ticks[3], hz);
+            }
+        }
         if let (Some(feed), Ok(ticks)) = (&self.feed, &result) {
             // Compute reports its dispatch envelope in the first pair, a
             // render its fragment pass in the second.
-            if self.compute.is_some() {
-                feed.note_pass(ticks[0], ticks[1]);
+            if self.is_compute {
+                if let Some([start, end]) = compute {
+                    feed.note_pass(start, end);
+                }
             } else {
                 feed.note_pass(ticks[2], ticks[3]);
             }
@@ -655,7 +879,9 @@ impl Completion {
             return;
         }
         self.status.record_if_device_loss(error);
-        if self.accepted.load(Ordering::Acquire) {
+        // As in complete(): a cancellation is not this client's device loss. A guilty VM
+        // already carries its own sticky error.
+        if self.accepted.load(Ordering::Acquire) && error != ECANCELED {
             self.status.report_failure(error);
         }
         self.release_healthy();
@@ -674,7 +900,9 @@ impl Completion {
             guard.quarantine();
         }
         if self.spared() {
-            self.status.report_failure(error);
+            if !discarded(error) {
+                self.status.report_failure(error);
+            }
         } else {
             self.report(error);
         }
@@ -683,11 +911,18 @@ impl Completion {
     }
 }
 
+/// The errors of work a recovery discarded (ECANCELED) or dropped before it ran (ENODATA).
+fn discarded(error: Error) -> bool {
+    error == ECANCELED || error == ENODATA
+}
+
 /// Collected under the device mutex and executed only after releasing it.
 /// Runtime queues establish the ownership witness before constructing `Retired`
 /// or `Release`; `FailedOwned` leaves their physical and VM ownership intact.
 pub(crate) enum Deferred {
     Retired(Arc<Completion>, Result<[u64; 4]>),
+    /// Only the optional interval comes from an exact compute execution record.
+    RetiredCompute(Arc<Completion>, [u64; 4], Option<[u64; 2]>),
     Drained(Arc<Completion>, Result<[u64; 4]>),
     FailedOwned(Arc<Completion>, Error),
     Unpublished(Arc<Completion>, Error),
@@ -697,6 +932,10 @@ pub(crate) enum Deferred {
 impl Deferred {
     pub(crate) fn finish(self) {
         match self {
+            Self::RetiredCompute(completion, ticks, execution) => {
+                completion.complete_with_compute(Ok(ticks), execution);
+                completion.release_after_retirement();
+            }
             Self::Retired(completion, result) => {
                 completion.complete(result);
                 // An earlier failure may already have signalled this fence while
@@ -711,5 +950,22 @@ impl Deferred {
             Self::Unpublished(completion, error) => completion.fail_unpublished(error),
             Self::Release(completion) => completion.release_after_retirement(),
         }
+    }
+}
+
+#[kernel::macros::kunit_tests(asahi_g17_timestamp_window)]
+mod window_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_fragment_end_goes_through_the_window() {
+        assert!(!window_slot(0) && !window_slot(1) && !window_slot(2) && window_slot(3));
+    }
+
+    #[test]
+    fn ticks_convert_to_nanoseconds_at_24_mhz() {
+        assert_eq!(ticks_to_ns(24_000_000), 1_000_000_000);
+        assert_eq!(ticks_to_ns(24), 1_000);
+        assert_eq!(ticks_to_ns(24_000_025), 1_000_001_041);
     }
 }
