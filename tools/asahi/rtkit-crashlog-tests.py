@@ -239,7 +239,7 @@ static void test_dcp_log(void)
 		"RTKit: End of crashlog reached",
 	};
 	static u8 b[DCP_SIZE];
-	unsigned int n, i, j = 0, entries = 0;
+	unsigned int n, i, j = 0, entries = 0, dumped = 0;
 	size_t log_offset;
 	unsigned int depth;
 	u32 id;
@@ -253,12 +253,20 @@ static void test_dcp_log(void)
 			entries++;
 			continue;
 		}
+		/* The payload of a section without a decoder. */
+		if (!strncmp(lines[i], "RTKit:  + ", 10)) {
+			dumped++;
+			continue;
+		}
 		assert(j < sizeof(expect) / sizeof(expect[0]));
 		assert(!strcmp(lines[i], expect[j]));
 		j++;
 	}
 	assert(j == sizeof(expect) / sizeof(expect[0]));
 	assert(entries == MAILBOX_ENTRIES);
+	/* Seven such sections: a name line each, and 32 bytes to a line, 256 at most. */
+	assert(dumped == 7 + 3 + 8 + 2 + 1 + 2 + 1 + 1);
+	assert(printed("RTKit:  + 'Ccst', 96 bytes") && printed("RTKit:  + 'Crtk', 6064 bytes"));
 	assert(printed("RTKit:  #000@da8656a9: 0000000000000037 0000000000000202"));
 	assert(printed("RTKit:  #127@da8e46a9: 0000000000000037 0000000000000242"));
 
