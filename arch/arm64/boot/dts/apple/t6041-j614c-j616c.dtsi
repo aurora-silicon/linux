@@ -33,6 +33,11 @@
 		sep = &sep;
 	};
 
+	/* Suspend-to-RAM at EL2 through aura's S2R mailbox; without the mailbox it stays out. */
+	t6041-sleep {
+		compatible = "apple,t6041-sleep";
+	};
+
 	chosen {
 		#address-cells = <2>;
 		#size-cells = <2>;
