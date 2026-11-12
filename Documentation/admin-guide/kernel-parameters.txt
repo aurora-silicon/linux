@@ -549,15 +549,6 @@ Kernel parameters
 	autoconf=	[IPV6]
 			See Documentation/networking/ipv6.rst.
 
-	apple_pmuv3_traps=
-			[ARM64,EARLY] Enable the IMPDEF PMUv3 trapping of KVM
-			guests (HACR_EL2 bit 56) on Apple cores where it has
-			not been verified yet, currently the M4 Pro/Max (T6040)
-			E and P cores. With it, KVM advertises a PMUv3 to its
-			guests backed by the Apple CPU PMU driver; without it
-			those guests see no PMU. Default: off on these cores.
-			Format: <bool>, a bare "apple_pmuv3_traps" means on.
-
 	apm=		[APM] Advanced Power Management
 			See header of arch/x86/kernel/apm_32.c.
 

@@ -8,7 +8,6 @@
 #include <linux/arm-smccc.h>
 #include <linux/types.h>
 #include <linux/cpu.h>
-#include <linux/kstrtox.h>
 #include <asm/cpu.h>
 #include <asm/cputype.h>
 #include <asm/cpufeature.h>
@@ -292,29 +291,6 @@ static const struct midr_range apple_cpus[] = {
 	{},
 };
 
-/*
- * Apple cores that aren't in apple_cpus whose IMPDEF PMUv3 traps (HACR_EL2
- * bit 56) are turned on only when asked for on the command line
- * (apple_pmuv3_traps), until they have been verified on these cores.
- */
-static const struct midr_range apple_m4_cpus[] = {
-	MIDR_ALL_VERSIONS(MIDR_APPLE_T6040_E),
-	MIDR_ALL_VERSIONS(MIDR_APPLE_T6040_P),
-	{},
-};
-
-static bool apple_pmuv3_traps_optin __ro_after_init;
-
-static int __init early_apple_pmuv3_traps_cfg(char *arg)
-{
-	/* A bare "apple_pmuv3_traps" enables the traps. */
-	if (!arg || !*arg)
-		arg = "on";
-
-	return kstrtobool(arg, &apple_pmuv3_traps_optin);
-}
-early_param("apple_pmuv3_traps", early_apple_pmuv3_traps_cfg);
-
 static bool has_impdef_pmuv3(const struct arm64_cpu_capabilities *entry, int scope)
 {
 	u64 dfr0 = read_sanitised_ftr_reg(SYS_ID_AA64DFR0_EL1);
@@ -328,13 +304,13 @@ static bool has_impdef_pmuv3(const struct arm64_cpu_capabilities *entry, int sco
 	if (pmuver != ID_AA64DFR0_EL1_PMUVer_IMP_DEF)
 		return false;
 
-	if (is_midr_in_range_list(apple_cpus))
-		return true;
-
-	return apple_pmuv3_traps_optin && is_midr_in_range_list(apple_m4_cpus);
+	return is_midr_in_range_list(apple_cpus);
 }
 
-/* Apple cores with the same vGIC as M1/M2 that aren't in apple_cpus yet. */
+/*
+ * Apple cores with the same vGIC as M1/M2 that aren't in apple_cpus yet:
+ * that list also turns on the IMPDEF PMUv3 traps, unverified here.
+ */
 static const struct midr_range apple_broken_seis_cpus[] = {
 	MIDR_ALL_VERSIONS(MIDR_APPLE_T6040_E),
 	MIDR_ALL_VERSIONS(MIDR_APPLE_T6040_P),
