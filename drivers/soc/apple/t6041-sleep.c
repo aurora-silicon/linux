@@ -1831,6 +1831,16 @@ static int t6041_sleep_enter(suspend_state_t state)
 		}
 		return -EBUSY;
 	}
+	/*
+	 * Every parked CPU answers the hold while a refusal is still possible: at the commit
+	 * only a held CPU stops, and one left awake there keeps the engine waiting until the
+	 * watchdog resets the SoC.
+	 */
+	ret = spin_table_hold_parked();
+	if (ret) {
+		pr_err("t6041-sleep: refused: a parked CPU didn't answer the hold: %d\n", ret);
+		return ret;
+	}
 	MARK(s, 0x12);
 	/* macOS stops the PMP before its last steps; past this a refusal can't go back. */
 	ret = apple_sleep_coprocs_stop_all();
