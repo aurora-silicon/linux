@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Wake-on-WLAN for a deep sleep. The firmware keeps the association while the
- * host sleeps and wakes it through the radio's GPIO, which the SMC turns into
- * an AP wake. Nothing in-band can wake the SoC from S2R.
+ * Wake-on-WLAN. The firmware keeps the association while the host sleeps and
+ * filters what it receives. From a deep sleep it wakes the host through the
+ * radio's GPIO, which the SMC turns into an AP wake: nothing in-band can wake
+ * the SoC from S2R. Suspend-to-idle keeps the host interface running, and the
+ * firmware's report of the wake, serviced while the system sleeps, ends it.
  */
 #include <linux/suspend.h>
 
@@ -35,8 +37,9 @@ int mt_wow_suspend(struct wiphy *wiphy, struct cfg80211_wowlan *wow)
 	WRITE_ONCE(m->wow_detect, 0);
 	if (!wow)
 		return 0;
-	/* Only S2R hands the radio to the firmware; s2idle and hibernation leave. */
-	if (!detect || pm_suspend_target_state != PM_SUSPEND_MEM || pm_suspend_no_platform())
+	/* Hibernation leaves the network; both kinds of suspend hand the radio to the firmware. */
+	if (!detect || mt7932_wow_sleep(pm_suspend_target_state, pm_suspend_no_platform()) ==
+		       MT7932_WOW_SLEEP_NONE)
 		return 1;
 	spin_lock_irqsave(&m->response_lock, flags);
 	associated = mt_wow_associated_locked(m);
@@ -157,6 +160,9 @@ void mt_wow_reason_event(struct mt7932 *m, const struct mt7932_event *event)
 	m->wow_report = false;
 	m->wow_reason = reason;
 	schedule_work(&m->wow_work);
+	/* In suspend-to-idle this report is the wake; nothing else from the firmware is. */
+	if (READ_ONCE(m->wow_idle) && reason != MT7932_WOW_REASON_NONE)
+		pm_system_wakeup();
 }
 
 void mt_wow_work(struct work_struct *work)

@@ -1290,8 +1290,14 @@ static int mt_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (ret < 0)
 		goto retain;
 	m->vectors_allocated = true;
+	/*
+	 * Not suspended with the system: in suspend-to-idle with Wi-Fi wake the
+	 * firmware keeps posting its own events, and only its wake reason ends the
+	 * sleep. Every other sleep disables the vector or stops the firmware.
+	 */
 	ret = devm_request_threaded_irq(&pdev->dev, pci_irq_vector(pdev, 0),
-					mt_irq, mt_irq_thread, IRQF_ONESHOT | IRQF_SHARED, "mt7932", m);
+					mt_irq, mt_irq_thread,
+					IRQF_ONESHOT | IRQF_SHARED | IRQF_NO_SUSPEND, "mt7932", m);
 	if (ret)
 		goto retain;
 	m->irq_requested = true;
@@ -1351,6 +1357,26 @@ static int mt_hif_ctrl(struct mt7932 *m, bool suspend)
 		ret = m->hif_result;
 	spin_unlock_irqrestore(&m->response_lock, flags);
 	return ret;
+}
+
+/* No frame from the stack and no work of the driver's own runs into the sleep. */
+static void mt_sleep_quiesce(struct mt7932 *m)
+{
+	int ret;
+
+	if (!m->interface_registered)
+		return;
+	if (m->netdev)
+		netif_device_detach(m->netdev);
+	flush_work(&m->startup_work);
+	flush_work(&m->connect_work);
+	flush_work(&m->disconnect_work);
+	flush_work(&m->cal_work);
+	flush_work(&m->power_work);
+	mt_abort_scan(m->wiphy, &m->wdev);
+	ret = mt_scan_quiesce(m);
+	if (ret)
+		dev_warn(&m->pdev->dev, "scan still retiring at the sleep: %d\n", ret);
 }
 
 /* Every published command and frame retired, ahead of the firmware's own stop. */
@@ -1438,19 +1464,7 @@ static int mt_hif_suspend(struct mt7932 *m)
 		return 0;
 	/* New work waits from here, and what already runs finishes before the gate. */
 	WRITE_ONCE(m->hif_suspended, true);
-	if (m->interface_registered) {
-		if (m->netdev)
-			netif_device_detach(m->netdev);
-		flush_work(&m->startup_work);
-		flush_work(&m->connect_work);
-		flush_work(&m->disconnect_work);
-		flush_work(&m->cal_work);
-		flush_work(&m->power_work);
-		mt_abort_scan(m->wiphy, &m->wdev);
-		ret = mt_scan_quiesce(m);
-		if (ret)
-			dev_warn(&m->pdev->dev, "scan still retiring at the sleep: %d\n", ret);
-	}
+	mt_sleep_quiesce(m);
 	mutex_lock(&m->command_mutex);
 	mt_wow_arm(m);
 	WRITE_ONCE(m->hif_gate, true);
@@ -1478,6 +1492,52 @@ static int mt_hif_suspend(struct mt7932 *m)
 }
 
 /*
+ * Suspend-to-idle with Wi-Fi wake. The SMC turns the radio's GPIO into an AP
+ * wake only from a deep sleep, so here the firmware keeps its host interface and
+ * DMA. It is given WoW, stays associated and filters what it receives. Its
+ * events are still serviced while the system sleeps, and only its report of a
+ * wake ends the sleep (mt_wow_reason_event()).
+ */
+static void mt_wow_idle_suspend(struct mt7932 *m)
+{
+	if (!READ_ONCE(m->ready) || READ_ONCE(m->stopping))
+		return;
+	mt_sleep_quiesce(m);
+	mutex_lock(&m->command_mutex);
+	mt_wow_arm(m);
+	mutex_unlock(&m->command_mutex);
+	WRITE_ONCE(m->wow_idle, m->wow_armed);
+	/* Not armed: the stack gets the device back, as without WoW. */
+	if (!m->wow_idle && m->netdev)
+		netif_device_attach(m->netdev);
+}
+
+/* The firmware stops filtering and the stack gets the device back. */
+static int mt_wow_idle_resume(struct mt7932 *m)
+{
+	unsigned long flags;
+	int ret;
+
+	WRITE_ONCE(m->wow_idle, false);
+	mutex_lock(&m->command_mutex);
+	ret = mt_wow_disarm(m);
+	mutex_unlock(&m->command_mutex);
+	if (ret) {
+		/* A firmware left filtering drops traffic: restart it. */
+		dev_err(&m->pdev->dev, "Wi-Fi wake not stopped after the sleep: %d; restarting it\n",
+			ret);
+		spin_lock_irqsave(&m->response_lock, flags);
+		mt_rf_fail_locked(m, ret);
+		spin_unlock_irqrestore(&m->response_lock, flags);
+		return ret;
+	}
+	schedule_work(&m->power_work);
+	if (m->netdev)
+		netif_device_attach(m->netdev);
+	return 0;
+}
+
+/*
  * Stopping the firmware for sleep takes the whole remove and probe sequence, so
  * leave it running across suspend-to-idle. A saved state keeps the PCI core from
  * changing the function's power state or command register, and the awake path
@@ -1485,8 +1545,16 @@ static int mt_hif_suspend(struct mt7932 *m)
  */
 static int mt_suspend(struct device *dev)
 {
+	struct mt7932 *m = pci_get_drvdata(to_pci_dev(dev));
+
 	if (!pm_suspend_no_platform())
-		return mt_hif_suspend(pci_get_drvdata(to_pci_dev(dev)));
+		return mt_hif_suspend(m);
+	if (READ_ONCE(m->wow_detect))
+		mt_wow_idle_suspend(m);
+	/* Without Wi-Fi wake its events wait for the resume, as other devices' do. */
+	m->irq_parked = !m->wow_idle;
+	if (m->irq_parked)
+		disable_irq(pci_irq_vector(to_pci_dev(dev), 0));
 	pci_save_state(to_pci_dev(dev));
 	device_set_awake_path(dev);
 	return 0;
@@ -1499,6 +1567,12 @@ static int mt_resume(struct device *dev)
 	unsigned long flags;
 	int ret;
 
+	if (m->irq_parked) {
+		m->irq_parked = false;
+		enable_irq(pci_irq_vector(pdev, 0));
+	}
+	if (m->wow_idle)
+		return mt_wow_idle_resume(m);
 	if (!READ_ONCE(m->hif_suspended))
 		return 0;
 	/* As macOS does: a chip that no longer answers isn't touched further. */

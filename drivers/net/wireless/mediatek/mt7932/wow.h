@@ -7,6 +7,7 @@
 #include <linux/string.h>
 #include <linux/types.h>
 #include <linux/unaligned.h>
+#include <linux/suspend.h>
 #include <net/cfg80211.h>
 
 /*
@@ -56,6 +57,29 @@
 #define MT7932_WOW_REASON_NONE		0xff
 /* The stock driver ignores a shorter reason event. */
 #define MT7932_WOW_REASON_LENGTH	132
+
+/* How a sleep can wake on WLAN. */
+enum mt7932_wow_sleep {
+	/* Hibernation, or no sleep: the radio leaves the network. */
+	MT7932_WOW_SLEEP_NONE,
+	/* A deep sleep: the radio's GPIO wakes the SMC, which wakes the AP. */
+	MT7932_WOW_SLEEP_DEEP,
+	/* Suspend-to-idle: the host interface stays up and the device interrupt wakes the AP. */
+	MT7932_WOW_SLEEP_IDLE,
+};
+
+/*
+ * The SMC turns the radio's GPIO into an AP wake only from a deep sleep, and a
+ * suspend-to-idle never reaches the platform, so there it never wakes the AP.
+ */
+static inline enum mt7932_wow_sleep mt7932_wow_sleep(suspend_state_t target, bool no_platform)
+{
+	if (target == PM_SUSPEND_TO_IDLE || (target == PM_SUSPEND_MEM && no_platform))
+		return MT7932_WOW_SLEEP_IDLE;
+	if (target == PM_SUSPEND_MEM)
+		return MT7932_WOW_SLEEP_DEEP;
+	return MT7932_WOW_SLEEP_NONE;
+}
 
 /* The firmware detectors for the triggers cfg80211 asked for; 0 if none applies. */
 static inline u8 mt7932_wow_detect(const struct cfg80211_wowlan *wow)

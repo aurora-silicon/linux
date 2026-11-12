@@ -31,6 +31,19 @@ static void mt_wow_detect_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, mt7932_wow_detect(&wow), 0x15);
 }
 
+static void mt_wow_sleep_test(struct kunit *test)
+{
+	/* A deep sleep reaches the platform, whose SMC turns the radio's GPIO into a wake. */
+	KUNIT_EXPECT_EQ(test, mt7932_wow_sleep(PM_SUSPEND_MEM, false), MT7932_WOW_SLEEP_DEEP);
+	/* Suspend-to-idle never does: the device interrupt has to wake it. */
+	KUNIT_EXPECT_EQ(test, mt7932_wow_sleep(PM_SUSPEND_TO_IDLE, true), MT7932_WOW_SLEEP_IDLE);
+	KUNIT_EXPECT_EQ(test, mt7932_wow_sleep(PM_SUSPEND_TO_IDLE, false), MT7932_WOW_SLEEP_IDLE);
+	KUNIT_EXPECT_EQ(test, mt7932_wow_sleep(PM_SUSPEND_MEM, true), MT7932_WOW_SLEEP_IDLE);
+	/* Hibernation and no sleep at all leave the network. */
+	KUNIT_EXPECT_EQ(test, mt7932_wow_sleep(PM_SUSPEND_ON, false), MT7932_WOW_SLEEP_NONE);
+	KUNIT_EXPECT_EQ(test, mt7932_wow_sleep(PM_SUSPEND_ON, true), MT7932_WOW_SLEEP_NONE);
+}
+
 static void mt_wow_ctrl_test(struct kunit *test)
 {
 	u8 body[MT7932_WOW_CTRL_LENGTH];
@@ -203,6 +216,7 @@ static void mt_wow_reason_event_test(struct kunit *test)
 
 static struct kunit_case mt_wow_test_cases[] = {
 	KUNIT_CASE(mt_wow_detect_test),
+	KUNIT_CASE(mt_wow_sleep_test),
 	KUNIT_CASE(mt_wow_ctrl_test),
 	KUNIT_CASE(mt_wow_suspend_mode_test),
 	KUNIT_CASE(mt_wow_config_test),
