@@ -241,7 +241,7 @@
 		clocks = <&peripheral_clocks 356>;
 		iommus = <&scaler0_dart 0>, <&scaler0_dart 1>;
 		resets = <&ps_msr0>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	scaler0_dart: iommu@40b200000 {
@@ -251,7 +251,7 @@
 		interrupts = <AIC_IRQ 0 1086 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_msr0>;
 		#iommu-cells = <1>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ave0_dma: dma-controller@40d020000 {
@@ -298,7 +298,7 @@
 		clocks = <&peripheral_clocks 356>;
 		iommus = <&scaler1_dart 0>, <&scaler1_dart 1>;
 		resets = <&ps_msr1>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	scaler1_dart: iommu@505200000 {
@@ -308,7 +308,7 @@
 		interrupts = <AIC_IRQ 0 1092 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_msr1>;
 		#iommu-cells = <1>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ave1_dma: dma-controller@507020000 {
@@ -804,7 +804,7 @@
 		clocks = <&peripheral_clocks_die1 356>;
 		iommus = <&scaler2_dart 0>, <&scaler2_dart 1>;
 		resets = <&ps_msr0_die1>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	scaler2_dart: iommu@40b200000 {
@@ -814,7 +814,7 @@
 		interrupts = <AIC_IRQ 1 1086 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_msr0_die1>;
 		#iommu-cells = <1>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ave2_dma: dma-controller@40d020000 {
@@ -902,7 +902,7 @@
 		clocks = <&peripheral_clocks_die1 356>;
 		iommus = <&scaler3_dart 0>, <&scaler3_dart 1>;
 		resets = <&ps_msr1_die1>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	scaler3_dart: iommu@505200000 {
@@ -912,7 +912,7 @@
 		interrupts = <AIC_IRQ 1 1092 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_msr1_die1>;
 		#iommu-cells = <1>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	ave3_dma: dma-controller@507020000 {

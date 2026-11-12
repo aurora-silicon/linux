@@ -855,6 +855,12 @@ static void asc_remove(struct platform_device *pdev)
 	video_unregister_device(&asc->vdev);
 }
 
+/* M1: one engine with no PIODMA-side register range. */
+static const struct apple_scaler_variant apple_scaler_t8103 = {
+	.hw_version = 10,
+	.num_reg = 2,
+};
+
 static const struct apple_scaler_variant apple_scaler_t6000 = {
 	.hw_version = 12,
 	.num_reg = 3,
@@ -863,6 +869,13 @@ static const struct apple_scaler_variant apple_scaler_t6000 = {
 static const struct apple_scaler_variant apple_scaler_t8112 = {
 	.hw_version = 13,
 	.num_reg = 3,
+};
+
+/* M4: the first engine with the MSR20 control block. */
+static const struct apple_scaler_variant apple_scaler_t8132 = {
+	.hw_version = 20,
+	.num_reg = 4,
+	.msr20 = true,
 };
 
 static const struct apple_scaler_variant apple_scaler_t6041 = {
@@ -878,8 +891,10 @@ static const struct apple_scaler_variant apple_scaler_t8140 = {
 };
 
 static const struct of_device_id asc_of_match[] = {
+	{ .compatible = "apple,t8103-scaler", .data = &apple_scaler_t8103 },
 	{ .compatible = "apple,t6000-scaler", .data = &apple_scaler_t6000 },
 	{ .compatible = "apple,t8112-scaler", .data = &apple_scaler_t8112 },
+	{ .compatible = "apple,t8132-scaler", .data = &apple_scaler_t8132 },
 	{ .compatible = "apple,t6041-scaler", .data = &apple_scaler_t6041 },
 	{ .compatible = "apple,t8140-scaler", .data = &apple_scaler_t8140 },
 	{ }
