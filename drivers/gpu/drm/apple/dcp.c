@@ -9164,11 +9164,11 @@ static int dcp_t6041_s2r_domains_on(struct apple_dcp *dcp)
 				      1, 10000))
 		dev_warn(dcp->dev, "S2R resume: FE power word stuck at %#x\n", val);
 	/*
-	 * The internal DCP's CPU word, if it is down: the GAPF clock protection released
-	 * as the stop did, then the word to manual target 0xf, ACTUAL and bit 11 polled.
+	 * The CPU word, if it is down: the GAPF clock protection released as the stop
+	 * did, then the word to manual target 0xf, ACTUAL and bit 11 polled.
 	 */
 	ret = 0;
-	if (!dcp->external && !(readl(ps + o.cpu) & 0xf0)) {
+	if (!(readl(ps + o.cpu) & 0xf0)) {
 		void __iomem *g = ioremap_np(0x500578540ULL, 4);
 		u32 v, cur;
 
@@ -9424,15 +9424,8 @@ static int dcp_t6041_s2r_stop(struct apple_dcp *dcp)
 	}
 	if (READ_ONCE(dcp->crashed) || IS_ERR_OR_NULL(dcp->rtk))
 		return -EBUSY;
-	/* The DP port lets its display go first; that teardown isn't built here. */
-	if (dcp->external && (READ_ONCE(dcp->active_typec_route) ||
-			      READ_ONCE(dcp->typec_cable_connected))) {
-		dev_err(dcp->dev, "refusing to sleep: a display is attached\n");
-		return -EBUSY;
-	}
 
-	if (!dcp->external)
-		iomfb_v14_7_backlight_suspend(dcp);
+	iomfb_v14_7_backlight_suspend(dcp);
 	dcp_drain_for_sleep(dcp);
 	dcp_t6041_s2r_stop_link_work(dcp);
 
@@ -9443,8 +9436,7 @@ static int dcp_t6041_s2r_stop(struct apple_dcp *dcp)
 	 * when DISP_CPU goes down. Without it the pipe was fully on at the commit
 	 * point and lowering under it raised an SError.
 	 */
-	if (!dcp->external)
-		_dcp_poweroff(dcp);
+	_dcp_poweroff(dcp);
 
 	dcp_sleep(dcp);
 	/*
@@ -9506,18 +9498,6 @@ lost:
 static void dcp_t6041_s2r_resume(struct apple_dcp *dcp)
 {
 	dcp->t6041_s2r_stopped = false;
-
-	/*
-	 * An external DCP's domains come back only by the raise (retention pair, axi2af
-	 * bridges), which isn't built for DISPEXT: touching it now raised an SError.
-	 * Leave it dead, its USB-C/HDMI port's USB unaffected, until reboot.
-	 */
-	if (dcp->external) {
-		WRITE_ONCE(dcp->ext_dead, true);
-		WRITE_ONCE(dcp->crashed, true);
-		dev_warn(dcp->dev, "external display left off after the sleep until reboot\n");
-		return;
-	}
 
 	if (!dcp_t6041_s2r_domains_on(dcp)) {
 #ifdef CONFIG_HIBERNATION
@@ -9839,7 +9819,6 @@ static int dcp_platform_resume(struct device *dev)
 static bool dcp_hib_can_restart(struct apple_dcp *dcp)
 {
 	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && dcp->desktop &&
-	       !dcp->external &&
 	       !dcp->hw.adopt_live_session && !READ_ONCE(dcp->retain_dma) &&
 	       !IS_ERR_OR_NULL(dcp->rtk) && dcp->coproc_reg && dcp->shmem;
 }
