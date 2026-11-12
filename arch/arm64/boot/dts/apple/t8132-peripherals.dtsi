@@ -137,6 +137,40 @@
 		status = "disabled";
 	};
 
+	ane_dart0: iommu@501800000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		reg = <0x5 0x01800000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 630 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_ane_sys>;
+		/* Include firmware identity MMIO pages below the preload DVAs. */
+		apple,dma-range = <0x0 0x0 0x400 0x0>;
+		status = "disabled";
+	};
+
+	ane_dart1: iommu@501820000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		reg = <0x5 0x01820000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 630 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_ane_sys>;
+		apple,dma-range = <0x0 0x0 0x400 0x0>;
+		status = "disabled";
+	};
+
+	ane_dart2: iommu@501840000 {
+		compatible = "apple,t8132-dart", "apple,t8110-dart";
+		reg = <0x5 0x01840000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 630 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_ane_sys>;
+		apple,dma-range = <0x0 0x0 0x400 0x0>;
+		status = "disabled";
+	};
+
 	dart_ane_companion3: filter@501810000 {
 		compatible = "apple,t8132-dapf", "apple,dapf";
 		reg = <0x5 0x01810000 0x0 0x4000>;
@@ -303,6 +337,43 @@
 		compatible = "apple,t8132-dcp-expert", "apple,dcp-expert";
 		reg = <0x3 0x882b8044 0x0 0xc>,
 		      <0x3 0x88030000 0x0 0x4>;
+		status = "disabled";
+	};
+
+	/*
+	 * ADT-derived only: keep disabled until an M4 owner qualifies the H16
+	 * backend and the loader hands off reserved TEXT/DATA preloads.
+	 */
+	ane: ane@500000000 {
+		compatible = "apple,t8132-ane";
+		reg = <0x5 0x00000000 0x0 0x2000000>,
+		      <0x3 0x80700000 0x0 0x18000>,
+		      <0x3 0x80724000 0x0 0x4000>,
+		      <0x3 0x803c0000 0x0 0x30000>,
+		      <0x2 0x11000000 0x0 0xff4000>,
+		      <0x3 0x882c8000 0x0 0x4000>;
+		/* There is no second-engine aux-3 window on T8132. */
+		reg-names = "engine", "pmgr", "aux-0", "aux-1", "aux-2", "aux-4";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 629 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 642 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&ane_dart0 0>, <&ane_dart1 0>, <&ane_dart2 0>;
+		/*
+		 * Gate 292 (ANE-SYS-V) resolves to physical gate 155 (ANE_SYS).
+		 * Gate 396 (ANE-SYS-V-PMP) is a virtual PMP notification, not a
+		 * PMGR power state, and has no genpd provider yet.
+		 */
+		power-domains = <&ps_ane_sys>;
+		apple,ane-type = <0x100>;
+		apple,firmware-preloaded;
+		/* ADT dapf-instance-0: inclusive CPU addresses, in record order. */
+		apple,dapf-ranges = /bits/ 64 <0x48d668000 0x48d668003>,
+				    /bits/ 64 <0x38070c000 0x38070c01b>,
+				    /bits/ 64 <0x380700570 0x380700573>,
+				    /bits/ 64 <0x3807273cc 0x3807273cf>,
+				    /bits/ 64 <0x302668000 0x302668003>;
+		/* Default layout; the loader supplies per-boot physical reservations. */
+		apple,firmware-iovas = /bits/ 64 <0x10000000000 0x100000c0000>;
 		status = "disabled";
 	};
 

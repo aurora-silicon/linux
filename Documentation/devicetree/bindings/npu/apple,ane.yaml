@@ -20,7 +20,10 @@ description:
   its CPU, MPM and task domains depend on the ANE system domain, and its
   base domain depends on the task domain. T6050 follows the T8140 model,
   with five DAPF ranges. Interrupt roles on T6041, T6050 and T8140 are not
-  yet established.
+  yet established. T8132 has a single H16 engine, two interrupts, six
+  register windows (no second-engine aux-3), and five DAPF records. Its
+  virtual ANE-SYS-V gate resolves to the ANE system domain; ANE-SYS-V-PMP
+  is a firmware notification gate with no physical PMGR power state.
 
 properties:
   compatible:
@@ -34,6 +37,7 @@ properties:
           - apple,t6041-ane
           - apple,t6050-ane
           - apple,t8112-ane
+          - apple,t8132-ane
           - apple,t8140-ane
       - items:
           - const: apple,t6001-ane
@@ -96,8 +100,8 @@ properties:
     description:
       The power states the engine needs, five on T8103, six on T6000 with
       ANE level control (including PMP report SRAM), eight on
-      T602x, seven on T8112 and one system domain on T8140. T6041 may add
-      a sixth, "perf", a performance floor (such as the SoC rail floor)
+      T602x, seven on T8112 and one system domain on T8132 and T8140.
+      T6041 may add a sixth, "perf", a performance floor (such as the SoC rail floor)
       that the driver holds only while requests are in flight.
     minItems: 1
     maxItems: 8
@@ -119,8 +123,8 @@ properties:
     maxItems: 2
     description:
       On T602x, the IOVA-only reservation of the firmware entry alias.
-      On T6041, T6050 and T8140, bootloader-provided physical TEXT and DATA preload
-      reservations in that order. Each reservation must have no-map, must
+      On T6041, T6050, T8132 and T8140, bootloader-provided physical TEXT
+      and DATA preload reservations in that order. Each reservation must have no-map, must
       not be reusable, and must remain reserved until reboot. Physical
       addresses vary per boot and must not be hard-coded in a board DTS.
 
@@ -149,8 +153,8 @@ properties:
         - description: Physical start address, inclusive
         - description: Physical end address, inclusive
     description:
-      Four (five on T6050) DART address protection filter (DAPF) ranges, in
-      hardware record order. Each pair contains inclusive 64-bit physical
+      Four (five on T6050 and T8132) DART address protection filter (DAPF)
+      ranges, in hardware record order. Each pair contains inclusive 64-bit physical
       bounds, not a base and length. The same records apply to all three ANE DARTs.
       Firmware accesses these registers through identity mappings of the
       containing 16 KiB pages in its private domain. These are MMIO ranges,
@@ -169,7 +173,7 @@ properties:
 
   apple,ane-type:
     $ref: /schemas/types.yaml#/definitions/uint32
-    enum: [0x110, 0x200]
+    enum: [0x100, 0x110, 0x200]
     description: Firmware generation identifier supplied by the bootloader
 
   apple,firmware-preloaded:
@@ -265,6 +269,7 @@ allOf:
           enum:
             - apple,t6041-ane
             - apple,t6050-ane
+            - apple,t8132-ane
             - apple,t8140-ane
       required:
         - memory-region
@@ -320,6 +325,35 @@ allOf:
   - if:
       properties:
         compatible:
+          const: apple,t8132-ane
+    then:
+      properties:
+        interrupts:
+          minItems: 2
+        reg:
+          minItems: 6
+          maxItems: 6
+        reg-names:
+          items:
+            - const: engine
+            - const: pmgr
+            - const: aux-0
+            - const: aux-1
+            - const: aux-2
+            - const: aux-4
+        power-domains:
+          maxItems: 1
+        apple,ane-type:
+          const: 0x100
+        apple,dapf-ranges:
+          minItems: 5
+      required:
+        - apple,ane-type
+        - apple,firmware-preloaded
+        - apple,dapf-ranges
+  - if:
+      properties:
+        compatible:
           const: apple,t6050-ane
     then:
       properties:
@@ -339,6 +373,7 @@ allOf:
               - apple,t8140-ane
               - apple,t6041-ane
               - apple,t6050-ane
+              - apple,t8132-ane
     then:
       properties:
         interrupt-names: false
@@ -439,6 +474,7 @@ allOf:
               - apple,t8140-ane
               - apple,t6041-ane
               - apple,t6050-ane
+              - apple,t8132-ane
               - apple,t6001-ane
     else:
       properties:
@@ -580,6 +616,40 @@ examples:
                                 /bits/ 64 <0x28a668000 0x28a668003>;
             memory-region = <&ane_fw_text>, <&ane_fw_data>;
             memory-region-names = "firmware-text", "firmware-data";
+            apple,firmware-iovas = /bits/ 64 <0x10000000000 0x100000c0000>;
+            status = "disabled";
+        };
+    };
+
+  - |
+    #include <dt-bindings/interrupt-controller/apple-aic.h>
+    #include <dt-bindings/interrupt-controller/irq.h>
+
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        ane@500000000 {
+            compatible = "apple,t8132-ane";
+            reg = <0x5 0x00000000 0x0 0x2000000>,
+                  <0x3 0x80700000 0x0 0x18000>,
+                  <0x3 0x80724000 0x0 0x4000>,
+                  <0x3 0x803c0000 0x0 0x30000>,
+                  <0x2 0x11000000 0x0 0xff4000>,
+                  <0x3 0x882c8000 0x0 0x4000>;
+            reg-names = "engine", "pmgr", "aux-0", "aux-1", "aux-2", "aux-4";
+            interrupt-parent = <&aic>;
+            interrupts = <AIC_IRQ 629 IRQ_TYPE_LEVEL_HIGH>,
+                         <AIC_IRQ 642 IRQ_TYPE_LEVEL_HIGH>;
+            iommus = <&ane_dart0 0>, <&ane_dart1 0>, <&ane_dart2 0>;
+            power-domains = <&ps_ane_sys>;
+            apple,ane-type = <0x100>;
+            apple,firmware-preloaded;
+            apple,dapf-ranges = /bits/ 64 <0x48d668000 0x48d668003>,
+                                /bits/ 64 <0x38070c000 0x38070c01b>,
+                                /bits/ 64 <0x380700570 0x380700573>,
+                                /bits/ 64 <0x3807273cc 0x3807273cf>,
+                                /bits/ 64 <0x302668000 0x302668003>;
             apple,firmware-iovas = /bits/ 64 <0x10000000000 0x100000c0000>;
             status = "disabled";
         };
