@@ -3027,15 +3027,19 @@ static int apple_nvme_sleep_send_shn(struct apple_nvme *anv)
 }
 
 /*
- * On post-M4 ANS (needs_ioq_registers), disabling and rebuilding the controller
- * across suspend-to-idle reset the machine on a J714s found by aborting
- * pm_test=devices at each device in turn. Suspend-to-idle does not need the
- * controller down: user space is frozen and keep_link_powered() holds its power
- * domains on. Resume needs no change: anv->suspended stays false, so it returns early.
+ * Post-M4 ANS (needs_ioq_registers) default: suspend-to-idle disables the controller
+ * and resume rebuilds it. A 14-inch M5 Max (K114c) sleeps 93 s and wakes clean this way.
+ *
+ * t6050_keep_live=1 skips the disable and leaves the controller enabled across
+ * suspend-to-idle. On the K114c that crashed the ANS firmware about 60 s in
+ * ("non empty queue delete error"), so it is opt-in. It was added because
+ * disabling the controller reset a J714s found by aborting pm_test=devices at each
+ * device in turn; that machine is the one that may need it. Deep sleep (suspend to
+ * RAM, via firmware) never takes this path.
  */
-static bool t6050_keep_live = true;
+static bool t6050_keep_live;
 module_param(t6050_keep_live, bool, 0644);
-MODULE_PARM_DESC(t6050_keep_live, "Keep post-M4 ANS NVMe live across suspend-to-idle (no controller disable/rebuild)");
+MODULE_PARM_DESC(t6050_keep_live, "Keep post-M4 ANS NVMe enabled across suspend-to-idle (default off: disable and rebuild)");
 
 static int apple_nvme_suspend(struct device *dev)
 {
