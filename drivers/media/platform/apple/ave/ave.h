@@ -174,6 +174,8 @@ enum ave_opcode {
  */
 #define AVE_FW_TEXT_CRC_T6041_25G83 0x9a080cad
 #define AVE_FW_TEXT_CRC_T6050_26A428 0x87279429
+/* The M4 Air (T8132) build of AppleAVE2FW 9003.78.0. */
+#define AVE_FW_TEXT_CRC_T8132_25G83 0x9308d2ab
 
 struct ave_ctx;
 
