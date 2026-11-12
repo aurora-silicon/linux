@@ -2454,29 +2454,6 @@ VISIBLE_IF_KUNIT bool cd321x_tbt_switch_keep_waiting(struct device *dev)
 EXPORT_SYMBOL_IF_KUNIT(cd321x_tbt_switch_keep_waiting);
 
 /*
- * The connection lookup skips a router whose node is disabled. A router that is
- * described but disabled in the device tree can still be enabled at runtime (by
- * an overlay), so the port watches for it as for a late router.
- */
-static bool cd321x_tbt_router_described(struct fwnode_handle *fwnode)
-{
-	struct fwnode_handle *ep, *node;
-	bool found = false;
-
-	fwnode_graph_for_each_endpoint(fwnode, ep) {
-		node = fwnode_graph_get_remote_port_parent(ep);
-		found = fwnode_property_present(node, "thunderbolt-switch");
-		fwnode_handle_put(node);
-		if (found) {
-			fwnode_handle_put(ep);
-			break;
-		}
-	}
-
-	return found;
-}
-
-/*
  * The USB4/Thunderbolt router is only needed once a USB4 or Thunderbolt link
  * comes up. If its driver is not built or has not bound yet, do not leave power
  * delivery, USB and DisplayPort on this port without a driver as well: stop
@@ -2491,11 +2468,6 @@ cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode,
 
 	*late = false;
 	sw = fwnode_typec_thunderbolt_switch_get(fwnode);
-	if (!sw && cd321x_tbt_router_described(fwnode)) {
-		dev_dbg(dev, "USB4/Thunderbolt router disabled, watching for it\n");
-		*late = true;
-		return NULL;
-	}
 	if (sw != ERR_PTR(-EPROBE_DEFER) || cd321x_tbt_switch_keep_waiting(dev))
 		return sw;
 
