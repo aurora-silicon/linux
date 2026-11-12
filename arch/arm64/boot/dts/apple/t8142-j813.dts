@@ -131,6 +131,12 @@
 	aliases {
 		wifi0 = &n1_alpha;
 		bluetooth0 = &n1_beta;
+		/*
+		 * The loader finds the SEP through this alias: it reserves SEPFW
+		 * and copies the boot's local-policy and iBoot manifests onto
+		 * the node.
+		 */
+		sep = &sep;
 	};
 };
 
@@ -171,3 +177,94 @@
 };
 
 /* Unexposed chassis port instances remain described and disabled. */
+
+/*
+ * Secure Enclave and the Touch ID sensor. All values are from the J813 ADT
+ * (macOS 27.0) and are the same as J815's:
+ *  - sep: iop-sep,ascwrap-v6 at 0x30a600000 (0x88000), sepfw-booted, so
+ *    apple_sep warm-attaches; ASC mailbox at +0x8000, AIC 445-448.
+ *  - dart-sep: t8110 at 0x308b80000, irq 455; vm-base-0 0x10000004000,
+ *    vm-size-0 0xffff0000.
+ *  - spi2 at 0x3a5108000, irq 1241; PMGR device SPI2 at +0x440, parent SPI_P.
+ *  - mesa: "biosensor,mesa", sensor-id 0x3356, 8 MHz, CS0; power
+ *    function-mesa_pwr = NUB GPIO pin 36; data-ready interrupt on AP GPIO
+ *    pin 200.
+ * The SEP and its DART stay disabled here: apple_sep enables them at module
+ * init (drivers/soc/apple/dt.rs).
+ */
+&pmgr {
+	ps_spi2: power-controller@440 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x440 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_spi_p>;
+		label = "spi2";
+	};
+};
+
+&{/soc} {
+	sep: sep@30a600000 {
+		compatible = "apple,sep";
+		reg = <0x3 0x0a600000 0x0 0x88000>;
+		mboxes = <&sep_mbox>;
+		mbox-names = "mbox";
+		iommus = <&sep_dart 0>;
+		status = "disabled";
+	};
+
+	sep_mbox: mbox@30a608000 {
+		compatible = "apple,t8142-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x0a608000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 445 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 446 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 447 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 448 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		status = "okay";
+	};
+
+	spi2: spi@3a5108000 {
+		compatible = "apple,t8142-spi", "apple,t8103-spi";
+		reg = <0x3 0xa5108000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1241 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clkref>;
+		power-domains = <&ps_spi2>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "okay";
+
+		mesa: fingerprint@0 {
+			compatible = "apple,mesa-fingerprint";
+			reg = <0>;
+			spi-max-frequency = <8000000>;
+			spi-cpol;
+			spi-cs-setup-delay-ns = <20>;
+			spi-cs-hold-delay-ns = <20>;
+			enable-gpios = <&pinctrl_nub 36 GPIO_ACTIVE_HIGH>;
+			interrupt-parent = <&pinctrl_ap>;
+			interrupts = <200 IRQ_TYPE_EDGE_RISING>;
+			/* Per-device files, built from the Mac's own factory records. */
+			firmware-name = "apple/mesacal-j813.bin", "apple/msrk-j813.bin";
+			status = "okay";
+		};
+	};
+};
+
+&sep_dart {
+	apple,dma-range = /bits/ 64 <0x10000004000 0xffff0000>;
+	apple,dma-offset = /bits/ 64 <0x0>;
+};
+
+/* Expose the sensor's two pins next to the ones sound uses. */
+&pinctrl_ap {
+	gpio-reserved-ranges = <0 100>, <101 49>, <152 48>, <201 23>;
+};
+
+&pinctrl_nub {
+	gpio-reserved-ranges = <0 18>, <19 17>, <37 3>;
+};

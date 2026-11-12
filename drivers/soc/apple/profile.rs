@@ -710,8 +710,9 @@ fn select(
     if has(b"apple,t8132") && (has(b"apple,j713") || has(b"apple,j715")) {
         return Ok(&T8132);
     }
-    // Only the J815, whose ADT was read; the J813's sensor bus is unchecked.
-    if has(b"apple,t8142") && has(b"apple,j815") {
+    // The J815 and the J813, whose ADTs were read (macOS 27.0 stub firmware):
+    // the J813's SEP, its DART, spi2 and the Mesa node carry the J815's values.
+    if has(b"apple,t8142") && (has(b"apple,j815") || has(b"apple,j813")) {
         return Ok(&T8142);
     }
     Err(ENODEV)
@@ -721,6 +722,28 @@ fn select(
 #[::kernel::macros::kunit_tests(apple_sep_profile)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn t8142_sensor_boards_require_the_matching_soc() {
+        let cases: [(&[u8], &[u8], bool); 7] = [
+            (b"apple,t8142", b"apple,j813", true),
+            (b"apple,t8142", b"apple,j815", true),
+            (b"apple,t8142", b"apple,j814", false),
+            (b"apple,t8142", b"", false),
+            (b"", b"apple,j813", false),
+            (b"apple,t8132", b"apple,j813", false),
+            (b"apple,t6050", b"apple,j815", false),
+        ];
+        for (soc, board, admitted) in cases {
+            let has = |c: &[u8]| c == soc || c == board;
+            let selected = select(&has, &|| &T6020);
+            if admitted {
+                assert!(matches!(selected, Ok(profile) if core::ptr::eq(profile, &T8142)));
+            } else {
+                assert!(selected.is_err());
+            }
+        }
+    }
 
     #[test]
     fn old_firmware_uses_the_legacy_key_store() {
