@@ -129,7 +129,7 @@ static int macsmc_power_off(struct sys_off_data *data)
 	struct macsmc_reboot *reboot = data->cb_data;
 	int ret, i;
 
-	dev_emerg(reboot->dev, "Issuing power off (off1)\n");
+	dev_info(reboot->dev, "Issuing power off (off1)\n");
 
 	/*
 	 * This is the only power-off path when Linux runs at EL2 without a
@@ -143,14 +143,14 @@ static int macsmc_power_off(struct sys_off_data *data)
 		ret = apple_smc_write_u32_atomic(reboot->smc, SMC_KEY(MBSE), SMC_KEY(off1));
 		if (ret >= 0)
 			break;
-		dev_emerg(reboot->dev, "MBSE = off1 refused (%d), attempt %d\n", ret, i + 1);
+		dev_warn(reboot->dev, "MBSE = off1 refused (%d), attempt %d\n", ret, i + 1);
 		mdelay(100);
 	}
 	if (ret < 0) {
-		dev_emerg(reboot->dev, "Failed to issue MBSE = off1 (power_off)\n");
+		dev_err(reboot->dev, "Failed to issue MBSE = off1 (power_off)\n");
 		return NOTIFY_OK;
 	}
-	dev_emerg(reboot->dev, "off1 accepted, waiting for the power to drop\n");
+	dev_dbg(reboot->dev, "off1 accepted, waiting for the power to drop\n");
 	for (i = 0; i < 50; i++)
 		mdelay(100);
 	WARN_ONCE(1, "Unable to power off system: off1 accepted, power still on after 5 s\n");
@@ -193,7 +193,7 @@ static int macsmc_reboot_notify(struct notifier_block *this, unsigned long actio
 		return NOTIFY_DONE;
 	}
 
-	dev_emerg(reboot->dev, "Preparing for reboot (%p4ch)\n", &val);
+	dev_info(reboot->dev, "Preparing for reboot (%p4ch)\n", &val);
 
 	/* On the Mac Mini, this will turn off the LED for power off */
 	if (apple_smc_write_u32(reboot->smc, SMC_KEY(MBSE), val) < 0)
@@ -212,8 +212,6 @@ static int macsmc_reboot_notify(struct notifier_block *this, unsigned long actio
 	if (reboot->nvm.shutdown_flag &&
 	    nvmem_cell_set_u8(reboot->nvm.shutdown_flag, shutdown_flag) < 0)
 		dev_err(reboot->dev, "Failed to write shutdown_flag\n");
-	dev_emerg(reboot->dev, "PMU flags set (shutdown_flag cell %s)\n",
-		  reboot->nvm.shutdown_flag ? "present" : "absent");
 
 	return NOTIFY_OK;
 }
