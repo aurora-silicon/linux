@@ -2523,11 +2523,28 @@ static void t6040_cio_pipe_update_locked(struct t6040_usb2_phy *tphy)
 	}
 }
 
-/* The PHY shutdown of mode 2: part A, the coprocessor down, part B. */
+/*
+ * The PHY shutdown of mode 2 once the PIPE is off the router: part A (both TX
+ * lanes and the common block, then the receivers), the coprocessor down, part
+ * B. Also what a bring-up that failed after the lanes' power-up has to undo.
+ */
+static void t6040_cio_phy_shutdown(struct t6040_usb2_phy *tphy)
+{
+	unsigned int lane;
+
+	t6040_phy_tx_cmn_shutdown(tphy);
+	for (lane = 0; lane < 2; lane++)
+		t6040_cio_steps(tphy, t6040_cio_rx_powerdown, ARRAY_SIZE(t6040_cio_rx_powerdown),
+				lane);
+	fsleep(200);
+	t6040_usb3_firmware_power_down(tphy);
+	t6040_usb3_sleep(tphy);
+}
+
+/* The PHY out of mode 2: the tunnel clocks, the PIPE, then the PHY shutdown. */
 static void t6040_cio_down_locked(struct t6040_usb2_phy *tphy)
 {
 	u32 uc;
-	unsigned int lane;
 
 	lockdep_assert_held(&tphy->lock);
 	if (!tphy->cio_up)
@@ -2539,13 +2556,7 @@ static void t6040_cio_down_locked(struct t6040_usb2_phy *tphy)
 		tphy->pipe_tunneled = false;
 	}
 	uc = readl(t6040_core(tphy) + T6040_CORE_UC_CTRL);
-	t6040_phy_tx_cmn_shutdown(tphy);
-	for (lane = 0; lane < 2; lane++)
-		t6040_cio_steps(tphy, t6040_cio_rx_powerdown, ARRAY_SIZE(t6040_cio_rx_powerdown),
-				lane);
-	fsleep(200);
-	t6040_usb3_firmware_power_down(tphy);
-	t6040_usb3_sleep(tphy);
+	t6040_cio_phy_shutdown(tphy);
 	dev_info(tphy->dev, "CIO PHY asleep: uc %#x -> %#x, cfg %#x/%#x\n", uc,
 		 readl(t6040_core(tphy) + T6040_CORE_UC_CTRL),
 		 readl(t6040_cfg(tphy) + T6040_CFG_CTRL),
@@ -2561,7 +2572,6 @@ static void t6040_cio_down_locked(struct t6040_usb2_phy *tphy)
 static int t6040_cio_up_locked(struct t6040_usb2_phy *tphy)
 {
 	void __iomem *core = t6040_core(tphy);
-	unsigned int lane;
 	bool cycle;
 	bool flip;
 	int ret;
@@ -2626,19 +2636,8 @@ retry:
 	return 0;
 
 retry_or_fail:
-	/*
-	 * The lanes are powered by now: as t6040_cio_down_locked(), both TX lanes
-	 * and the common block down, then the receivers, before the coprocessor
-	 * stops and the CFG block goes back to its boot state. That is the full
-	 * teardown, and one complete fresh start may follow it.
-	 */
-	t6040_phy_tx_cmn_shutdown(tphy);
-	for (lane = 0; lane < 2; lane++)
-		t6040_cio_steps(tphy, t6040_cio_rx_powerdown, ARRAY_SIZE(t6040_cio_rx_powerdown),
-				lane);
-	fsleep(200);
-	t6040_usb3_firmware_power_down(tphy);
-	t6040_usb3_sleep(tphy);
+	/* The lanes are powered by now: the full shutdown, and one fresh start may follow. */
+	t6040_cio_phy_shutdown(tphy);
 	if (t6040_recovery_retry(&tphy->recovery)) {
 		cycle = true;
 		goto retry;
