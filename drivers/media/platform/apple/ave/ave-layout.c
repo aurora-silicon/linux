@@ -946,10 +946,11 @@ const struct ave_fw_layout ave_layout_6070_11_1 = {
 const struct ave_fw_layout *ave_layout_for_crc(u32 crc)
 {
 	/*
-	 * The M4 Pro gets the same 25G83 firmware build as the A18 Pro, built
-	 * for its own chip, and speaks the same command layout.
+	 * The M4 Pro and M4 Max get the same 25G83 firmware build as the
+	 * A18 Pro, built for their own chips, and speak the same command layout.
 	 */
-	if (crc == AVE_FW_TEXT_CRC_9003_78_0 || crc == AVE_FW_TEXT_CRC_T6040_25G83)
+	if (crc == AVE_FW_TEXT_CRC_9003_78_0 || crc == AVE_FW_TEXT_CRC_T6040_25G83 ||
+	    crc == AVE_FW_TEXT_CRC_T6041_25G83)
 		return &ave_layout_9003_78_0;
 	if (crc == 0x460c7a7c || crc == 0x25bfd039)
 		return &ave_layout_6070_11_1;
