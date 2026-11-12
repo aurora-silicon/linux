@@ -977,6 +977,14 @@ struct apple_dcp {
 	unsigned int link_recovery_tries;
 	unsigned int link_recovery_snap;
 	/*
+	 * What a Type-C display listed when a sleep released its link
+	 * (dcp_modes_signature(), 0: nothing), until the wake's first list is
+	 * held against it; and until when the new connection that follows a
+	 * difference is under way (jiffies, 0: none).
+	 */
+	u32 wake_list_sig;
+	unsigned long wake_reread;
+	/*
 	 * Kernel retrains of an active CRTC from the hotplug worker in the
 	 * current window (dcp_hotplug_retrain_allowed()): a sink that answers
 	 * every retrain with IRQ_HPD would otherwise loop forever.
