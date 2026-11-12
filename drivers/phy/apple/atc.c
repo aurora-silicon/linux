@@ -6224,6 +6224,11 @@ static int atcphy_load_dp_banks(struct apple_atcphy *atcphy)
 {
 	struct apple_tunable *lioa, *common;
 
+	if (!atcphy->res.lioa) {
+		atcphy->dp_tunables = false;
+		return 0;
+	}
+
 	lioa = devm_apple_tunable_parse(atcphy->dev, atcphy->np,
 				      "apple,tunable-dp-lioa", atcphy->res.lioa);
 	common = devm_apple_tunable_parse(atcphy->dev, atcphy->np,
@@ -6448,8 +6453,13 @@ static int atcphy_map_resources(struct platform_device *pdev, struct apple_atcph
 			*resources[i].res = res;
 	}
 
-	if (atcphy->hw->dp_banked_tunables) {
-		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "lioa");
+	/*
+	 * Device trees written before DisplayPort was supported have no LIOA
+	 * bank: the PHY then serves USB as before, without DisplayPort.
+	 */
+	res = atcphy->hw->dp_banked_tunables ?
+	      platform_get_resource_byname(pdev, IORESOURCE_MEM, "lioa") : NULL;
+	if (res) {
 		addr = devm_ioremap_resource(&pdev->dev, res);
 		if (IS_ERR(addr))
 			return dev_err_probe(atcphy->dev, PTR_ERR(addr),
