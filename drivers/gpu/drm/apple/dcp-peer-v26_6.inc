@@ -259,6 +259,12 @@ int dcp_peer_hints_26_6(struct apple_dcp *dcp, struct dptx_port *port,
 
 	width = get_unaligned_le32(r->hints + 0x38);
 	if (!(r->hints[0] & 1) || !width || width <= DCP_DESKTOP_PIPE_MAX_WIDTH) {
+		/* It fits one pipe now, whatever it listed when it came. */
+		if ((r->hints[0] & 1) && width && READ_ONCE(dcp->peer_starved)) {
+			dev_info(dcp->dev, "the display fits one pipe now (%u px)\n", width);
+			WRITE_ONCE(dcp->peer_starved, false);
+			dcp_fabric_hybrid_kick(dcp, 1000);
+		}
 		memset(&r->allocation, 0, sizeof(r->allocation));
 		return 0;
 	}
