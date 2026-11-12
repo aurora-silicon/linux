@@ -196,7 +196,7 @@ module! {
         },
         g17_test_ta_first_kick_once: u32 {
             default: 0,
-            description: "G17 test only: on 25G83 set the tiling first-kick word on a queue pair's first kick only, as on 26A428 (0: every kick)",
+            description: "G17 test only: on 25G83 set the tiling first-kick word (0: on every kick; 1: on a queue pair's first kick only, as on 26A428; 2: on the first kick and whenever the pair has no render in flight)",
         },
         g17_test_stage_window: u32 {
             default: 0,

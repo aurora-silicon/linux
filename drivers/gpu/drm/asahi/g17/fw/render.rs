@@ -386,6 +386,8 @@ pub(crate) struct RenderArgs<'a> {
     pub(crate) resources: &'a RenderResources,
     /// Submission ordinal of the render queue pair, from zero.
     pub(crate) ordinal: u64,
+    /// No earlier render of the pair is in flight at submit.
+    pub(crate) pair_idle: bool,
     /// Tiling stage.
     pub(crate) ta: RenderStage,
     /// Fragment stage.
@@ -1289,11 +1291,13 @@ impl TaDescriptor {
         self.aux_stamp_va = args.ta.aux_stamp_va;
         self.stamp_value_2 = stamp_value;
         self.qid = args.ta.qid.into();
-        self.first_kick = match args.programs == RegisterPrograms::V25G83
-            && crate::module_parameters::g17_test_ta_first_kick_once.value() == 0
-        {
-            true => 1,
-            false => u32::from(args.ordinal == 0),
+        self.first_kick = match (
+            args.programs == RegisterPrograms::V25G83,
+            crate::module_parameters::g17_test_ta_first_kick_once.value(),
+        ) {
+            (true, 0) => 1,
+            (true, 2) => u32::from(args.ordinal == 0 || args.pair_idle),
+            _ => u32::from(args.ordinal == 0),
         };
         self.current_id = resources.ta_ids.current.into();
         self.ordinal = args.ordinal as u32;
@@ -1834,6 +1838,7 @@ mod ta_mode_tests {
             resources,
             ray_query: [ray; 2],
             ordinal: 0,
+            pair_idle: true,
             ta: stage,
             fragment: stage,
             programs: RegisterPrograms::V25G83,
