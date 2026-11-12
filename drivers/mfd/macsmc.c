@@ -22,6 +22,9 @@
 #include <linux/of_platform.h>
 #include <linux/overflow.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
+#include <linux/pm_wakeup.h>
+#include <linux/suspend.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/unaligned.h>
 
@@ -136,6 +139,9 @@ static int apple_smc_cmd_locked(struct apple_smc *smc, u64 cmd, u64 arg,
 		return -EIO;
 	if (smc->atomic_mode)
 		return -EIO;
+	/* Between the AP power notices the firmware expects no commands. */
+	if (smc->ap_notified)
+		return -EAGAIN;
 
 	reinit_completion(&smc->cmd_done);
 
@@ -458,6 +464,13 @@ static bool apple_smc_rtkit_recv_early(void *cookie, u8 endpoint, u64 message)
 		return false;
 	}
 
+	/* TEST ONLY: any SMC message while the AP is noticed idle in s2idle ends the sleep. */
+	if (READ_ONCE(smc->s2idle_armed)) {
+		if (!smc->s2idle_wake_count++)
+			smc->s2idle_wake_msg = message;
+		pm_system_wakeup();
+	}
+
 	if (smc->boot_stage == APPLE_SMC_BOOTING) {
 		int ret;
 
@@ -634,10 +647,109 @@ static const struct of_device_id apple_smc_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, apple_smc_of_match);
 
+/*
+ * TEST ONLY (default off): tell the SMC about a suspend-to-idle the way a
+ * firmware-driven suspend does (MBSE = slpw, MBSE = slpa, AP idle notice; at
+ * the wake the AP on notice, MBSE/MBSW read, MBSE = waka), to see whether it
+ * then forwards wake sources such as wifibt to the AP. The notices are given
+ * in the late phases, where the mailbox interrupt still runs.
+ */
+static bool apple_smc_s2idle_notice;
+module_param_named(s2idle_sleep_notice, apple_smc_s2idle_notice, bool, 0644);
+MODULE_PARM_DESC(s2idle_sleep_notice, "TEST ONLY: tell the SMC about suspend-to-idle");
+
+static void apple_smc_write_mbse(struct apple_smc *smc, smc_key value)
+{
+	int ret = apple_smc_write_u32(smc, SMC_KEY(MBSE), value);
+
+	if (ret)
+		dev_err(smc->dev, "Failed to issue MBSE = %p4ch: %d\n", &value, ret);
+}
+
+static int apple_smc_prepare(struct device *dev)
+{
+	struct apple_smc *smc = dev_get_drvdata(dev);
+
+	if (smc && apple_smc_s2idle_notice && pm_suspend_target_state == PM_SUSPEND_TO_IDLE) {
+		apple_smc_write_mbse(smc, SMC_KEY(slpw));
+		smc->sleep_warned = true;
+		dev_info(dev, "s2idle test: MBSE = slpw\n");
+	}
+	return 0;
+}
+
+static void apple_smc_complete(struct device *dev)
+{
+	struct apple_smc *smc = dev_get_drvdata(dev);
+
+	if (smc && smc->sleep_warned) {
+		apple_smc_write_mbse(smc, SMC_KEY(waka));
+		smc->sleep_warned = false;
+		dev_info(dev, "s2idle test: sleep off, MBSE = waka\n");
+	}
+}
+
+static int apple_smc_suspend_late(struct device *dev)
+{
+	struct apple_smc *smc = dev_get_drvdata(dev);
+	int ret;
+
+	if (!smc || !smc->sleep_warned)
+		return 0;
+	apple_smc_write_mbse(smc, SMC_KEY(slpa));
+	mdelay(6);
+	scoped_guard(mutex, &smc->mutex)
+		smc->ap_notified = true;
+	ret = apple_rtkit_ap_power(smc->rtk, false);
+	if (ret) {
+		apple_rtkit_ap_power(smc->rtk, true);
+		scoped_guard(mutex, &smc->mutex)
+			smc->ap_notified = false;
+		dev_err(dev, "s2idle test: SMC did not take the idle notice: %d\n", ret);
+		return 0;
+	}
+	mdelay(30);
+	smc->s2idle_wake_count = 0;
+	smc->s2idle_wake_msg = 0;
+	WRITE_ONCE(smc->s2idle_armed, true);
+	return 0;
+}
+
+static int apple_smc_resume_early(struct device *dev)
+{
+	struct apple_smc *smc = dev_get_drvdata(dev);
+	u8 record[8] = {};
+	u32 event = 0;
+	int ret;
+
+	if (!smc || !smc->ap_notified)
+		return 0;
+	WRITE_ONCE(smc->s2idle_armed, false);
+	ret = apple_rtkit_ap_power(smc->rtk, true);
+	if (ret)
+		dev_err(dev, "s2idle test: SMC did not take the wake notice: %d\n", ret);
+	scoped_guard(mutex, &smc->mutex)
+		smc->ap_notified = false;
+	apple_smc_read_u32(smc, SMC_KEY(MBSE), &event);
+	apple_smc_read(smc, SMC_KEY(MBSW), record, sizeof(record));
+	dev_info(dev, "s2idle test: wake record MBSE %#x MBSW %8ph; %u SMC messages while idle, first %#llx\n",
+		 event, record, smc->s2idle_wake_count, smc->s2idle_wake_msg);
+	apple_smc_write_mbse(smc, SMC_KEY(waka));
+	smc->sleep_warned = false;
+	return 0;
+}
+
+static const struct dev_pm_ops apple_smc_pm_ops = {
+	.prepare = apple_smc_prepare,
+	.complete = apple_smc_complete,
+	LATE_SYSTEM_SLEEP_PM_OPS(apple_smc_suspend_late, apple_smc_resume_early)
+};
+
 static struct platform_driver apple_smc_driver = {
 	.driver = {
 		.name = "macsmc",
 		.of_match_table = apple_smc_of_match,
+		.pm = pm_sleep_ptr(&apple_smc_pm_ops),
 	},
 	.probe = apple_smc_probe,
 };

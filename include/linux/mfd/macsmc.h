@@ -126,6 +126,13 @@ struct apple_smc {
 	struct completion cmd_done;
 	u64 cmd_ret;
 
+	/* TEST ONLY: suspend-to-idle with the SMC told of the sleep. */
+	bool sleep_warned;
+	bool ap_notified;
+	bool s2idle_armed;
+	u64 s2idle_wake_msg;
+	unsigned int s2idle_wake_count;
+
 	struct mutex mutex;
 	spinlock_t lock;
 };

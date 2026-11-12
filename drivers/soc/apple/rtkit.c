@@ -1948,6 +1948,14 @@ int apple_rtkit_poweroff(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_poweroff);
 
+/* The AP's power state as told to the co-processor: on, or idle with state kept. */
+int apple_rtkit_ap_power(struct apple_rtkit *rtk, bool on)
+{
+	return apple_rtkit_set_ap_power_state(rtk, on ? APPLE_RTKIT_PWR_STATE_ON :
+							APPLE_RTKIT_PWR_STATE_IDLE);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_ap_power);
+
 int apple_rtkit_idle(struct apple_rtkit *rtk)
 {
 	int ret;
