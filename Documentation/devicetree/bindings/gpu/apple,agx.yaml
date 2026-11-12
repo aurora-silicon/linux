@@ -111,6 +111,11 @@ properties:
     $ref: /schemas/types.yaml#/definitions/phandle
     description: PMP firmware provider owning the GPU power vote and telemetry
 
+  apple,pmp-report:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      PMP report aperture publishing the GPU lifetime-servo effort
+
   operating-points-v2: true
 
   apple,firmware-version:
@@ -362,6 +367,7 @@ allOf:
       required:
         - power-domains
         - operating-points-v2
+        - apple,pmp-report
   - if:
       properties:
         compatible:
