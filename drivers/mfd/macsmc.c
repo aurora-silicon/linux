@@ -789,26 +789,34 @@ static int apple_smc_restore(struct device *dev)
 	 * probe's handshake with the new instance.
 	 */
 	ret = apple_rtkit_reinit(smc->rtk);
-	if (ret)
-		return dev_err_probe(dev, ret, "Failed to reinit RTKit on restore");
+	if (ret) {
+		dev_err(dev, "Failed to reinit RTKit on restore: %d\n", ret);
+		return ret;
+	}
 
 	smc->boot_stage = APPLE_SMC_BOOTING;
 
 	ret = apple_rtkit_wake(smc->rtk);
-	if (ret)
-		return dev_err_probe(dev, ret, "Failed to wake up SMC on restore");
+	if (ret) {
+		dev_err(dev, "Failed to wake up SMC on restore: %d\n", ret);
+		return ret;
+	}
 
 	ret = apple_rtkit_start_ep(smc->rtk, SMC_ENDPOINT);
-	if (ret)
-		return dev_err_probe(dev, ret, "Failed to start SMC endpoint on restore");
+	if (ret) {
+		dev_err(dev, "Failed to start SMC endpoint on restore: %d\n", ret);
+		return ret;
+	}
 
 	reinit_completion(&smc->init_done);
 	reinit_completion(&smc->cmd_done);
 
 	ret = apple_rtkit_send_message(smc->rtk, SMC_ENDPOINT,
 				       FIELD_PREP(SMC_MSG, SMC_MSG_INITIALIZE), NULL, false);
-	if (ret)
-		return dev_err_probe(dev, ret, "Failed to send init message on restore");
+	if (ret) {
+		dev_err(dev, "Failed to send init message on restore: %d\n", ret);
+		return ret;
+	}
 
 	if (wait_for_completion_timeout(&smc->init_done, msecs_to_jiffies(SMC_TIMEOUT_MS)) == 0) {
 		dev_err(dev, "Timed out initializing SMC on restore\n");
@@ -829,8 +837,10 @@ static int apple_smc_restore(struct device *dev)
 		count = 0;
 		ret = -EIO;
 	}
-	if (ret < 0)
-		return dev_err_probe(dev, ret, "Failed to get key count on restore");
+	if (ret < 0) {
+		dev_err(dev, "Failed to get key count on restore: %d\n", ret);
+		return ret;
+	}
 	smc->key_count = be32_to_cpu(count);
 
 	/*
