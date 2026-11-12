@@ -57,6 +57,7 @@ extern "C" {
     fn sep_diag_set_endpoint(id: u8, name: u32);
     fn sep_diag_set_os_identity(source: c_int);
     fn sep_diag_set_hwrng(registered: bool);
+    fn sep_diag_set_stac(state: c_int);
     fn sep_diag_xarm_failed() -> c_uint;
     fn sep_diag_unhandled() -> c_uint;
     fn sep_diag_log_summary(dev: *mut c_void);
@@ -308,6 +309,25 @@ pub(crate) fn os_identity(source: OsIdentity) {
 pub(crate) fn hwrng(registered: bool) {
     // SAFETY: no preconditions; stores one word.
     unsafe { sep_diag_set_hwrng(registered) };
+}
+
+/// The trusted-accessory power-state report, as `SEP_DIAG_STAC_*` in
+/// `shim.h` spells it.
+#[derive(Clone, Copy)]
+pub(crate) enum Stac {
+    /// The service took the online state.
+    Online = 1,
+    /// The enclave does not offer the endpoint as the driver knows it.
+    Absent = 2,
+    /// The last report was refused, malformed, unanswered or not sent.
+    Failed = 3,
+}
+
+/// The outcome of a trusted-accessory power-state report; an accepted one is
+/// also counted.
+pub(crate) fn stac(state: Stac) {
+    // SAFETY: no preconditions; updates two words.
+    unsafe { sep_diag_set_stac(state as c_int) };
 }
 
 /// The driver answered an xART request with the failure status. Returns how
