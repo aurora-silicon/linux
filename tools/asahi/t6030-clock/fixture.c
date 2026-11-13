@@ -138,6 +138,18 @@ static int apple_t6050_dp_tunnel_clock(struct phy *p, unsigned clock, u8 rate)
 	t6050_rate = rate;
 	return t6050_error;
 }
+/* T6040 ATC PHY (t6040-usb2.c): one pixel clock per DP IN adapter (0 or 1), recorded. */
+static unsigned t6040_calls, t6040_dpin;
+static u8 t6040_rate;
+static int t6040_error;
+static int apple_t6040_dp_tunnel_rate(struct phy *p, unsigned dpin, u8 rate)
+{
+	assert(!strcmp(machine, "apple,t6040") || !strcmp(machine, "apple,t6041"));
+	t6040_calls++;
+	t6040_dpin = dpin;
+	t6040_rate = rate;
+	return t6040_error;
+}
 /*
  * Production: of_device_is_compatible(dcp->dev->of_node, "apple,t8132-dcpext").
  * These are T6030 DCPs: the T8132 dcpext paths must never be taken.
@@ -273,6 +285,30 @@ int main(int argc, char **argv)
 		       t6050_clock == 3 && route_rate == 0x55);
 		assert(!writes && !polls && !crossbar_stops);
 		printf("PASS %s: DP IN n on tunnel clock n + 1, rate kept only when set\n", name);
+		return 0;
+	}
+	if (!strcmp(name, "t6040-tunnel-clock")) {
+		/* T6040 and T6041 use the PHY's own symbol, not the ATC one nor the T6050 one. */
+		const char *const machines[] = { "apple,t6040", "apple,t6041" };
+		u8 route_rate;
+		for (unsigned m = 0; m < 2; m++) {
+			machine = machines[m];
+			t6040_calls = 0;
+			t6040_error = 0;
+			for (unsigned dpin = 0; dpin < 2; dpin++) {
+				assert(!t6050_clock_call(&phy, dpin, 0x1e, &route_rate));
+				assert(t6040_dpin == dpin && t6040_rate == 0x1e && route_rate == 0x1e);
+				assert(!t6050_clock_call(&phy, dpin, 0, &route_rate));
+				assert(t6040_dpin == dpin && !t6040_rate && !route_rate);
+			}
+			assert(t6040_calls == 4);
+			/* A clock that failed to start leaves the route's rate alone. */
+			t6040_error = -ETIMEDOUT;
+			assert(t6050_clock_call(&phy, 1, 0x14, &route_rate) == -ETIMEDOUT &&
+			       route_rate == 0x55);
+		}
+		assert(!t6050_calls && !writes && !polls && !crossbar_stops);
+		printf("PASS %s: T6040/T6041 tunnel clock through apple_t6040_dp_tunnel_rate\n", name);
 		return 0;
 	}
 	if (!strcmp(name, "wrong-generation")) {
