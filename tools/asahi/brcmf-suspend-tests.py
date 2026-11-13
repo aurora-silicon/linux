@@ -180,8 +180,9 @@ static void apple_radio_sleep_endpoint_resumed(struct device *d,int r) {(void)d;
 static void brcmf_pcie_sleep_finish(struct device *d) {(void)d;abort();}
 static void brcmf_bus_cancel_reset_work(struct brcmf_bus *b) {(void)b;abort();}
 static int brcmf_pcie_pm_leave_D3(struct device *dev);
-static bool via_firmware,queue_fails;static unsigned int queued;
+static bool via_firmware,image_restored,queue_fails;static unsigned int queued;
 static bool pm_resume_via_firmware(void) {return via_firmware;}
+static bool pm_hibernate_is_restored(void) {return image_restored;}
 static bool brcmf_pcie_restart_queue(struct pci_dev *p) {(void)p;if(queue_fails)return false;queued++;return true;}
 '''
 
@@ -362,11 +363,15 @@ for(int up=0;up<2;up++)for(int fail=0;fail<2;fail++) {
   probe_error=fail?-EIO:0;assert(brcmf_pcie_pm_leave_D3(&device)==probe_error);
   assert(removes==1 && probes==1 && ndev[0].stopped && msgbuf.tx_suspended);cases++;
  }
- /* After a firmware suspend the cold function's restart is queued, or done here if it can't be. */
- for(int nomem=0;nomem<2;nomem++) {
+ /*
+  * After a firmware suspend or the restore of a hibernation image the cold function's restart
+  * is queued, or done here if it can't be.
+  */
+ for(int image=0;image<2;image++)for(int nomem=0;nomem<2;nomem++) {
   reset();assert(!brcmf_pcie_pm_enter_D3(&device));retain=false;
-  via_firmware=true;queue_fails=nomem;queued=0;assert(!brcmf_pcie_pm_leave_D3(&device));
-  assert(queued==!nomem && removes==nomem && probes==nomem);via_firmware=false;queue_fails=false;cases++;
+  via_firmware=!image;image_restored=image;queue_fails=nomem;queued=0;assert(!brcmf_pcie_pm_leave_D3(&device));
+  assert(queued==!nomem && removes==nomem && probes==nomem);
+  via_firmware=image_restored=false;queue_fails=false;cases++;
  }
  printf("%u regulatory, TX queue, worker retention and PCIe PM controls passed\n",cases);
  return 0;

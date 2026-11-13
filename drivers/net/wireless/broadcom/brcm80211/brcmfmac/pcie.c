@@ -3615,11 +3615,13 @@ cleanup:
 	devinfo->ci = NULL;
 	pdev = devinfo->pdev;
 	/*
-	 * A function that lost its power in a firmware suspend starts over. Taking the
-	 * interfaces and the wiphy down takes about 550 ms, and everything that follows
-	 * this device in the resume waits for it, so do it right behind the resume.
+	 * A function that lost its power in a firmware suspend, or in the boot that loaded a
+	 * hibernation image, starts over. Taking the interfaces and the wiphy down and the
+	 * firmware download take about 600 ms, and everything that follows this device in
+	 * the resume waits for it, so do it right behind the resume.
 	 */
-	if (pm_resume_via_firmware() && brcmf_pcie_restart_queue(pdev))
+	if ((pm_resume_via_firmware() || pm_hibernate_is_restored()) &&
+	    brcmf_pcie_restart_queue(pdev))
 		return 0;
 	brcmf_pcie_remove(pdev);
 
