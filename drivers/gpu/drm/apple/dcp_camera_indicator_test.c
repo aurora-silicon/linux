@@ -130,12 +130,22 @@ static void camind_test_present(struct kunit *test)
 			2408u - DCP_CAMIND_SIZE - DCP_CAMIND_MARGIN);
 	KUNIT_EXPECT_FALSE(test, apple_cam_indicator_shown());
 
-	/* Another present's completion confirms nothing. */
-	dcp_camind_complete(dcp, 6);
-	KUNIT_EXPECT_EQ(test, atomic_read(&ci->confirmed), 0);
 	dcp_camind_complete(dcp, 7);
 	KUNIT_EXPECT_EQ(test, atomic_read(&ci->confirmed), 1);
 	KUNIT_EXPECT_TRUE(test, apple_cam_indicator_shown());
+
+	/* A later present that did not carry it (no room in a new mode) ends it. */
+	ci->mode_w = 0;
+	memset(req, 0, sizeof(*req));
+	dcp_camind_prepare(dcp, req, 8);
+	KUNIT_EXPECT_EQ(test, req->swap.swap_enabled, 0u);
+	dcp_camind_complete(dcp, 8);
+	KUNIT_EXPECT_EQ(test, atomic_read(&ci->confirmed), 0);
+	KUNIT_EXPECT_FALSE(test, apple_cam_indicator_shown());
+	ci->mode_w = 2408;
+	dcp_camind_prepare(dcp, req, 9);
+	dcp_camind_complete(dcp, 9);
+	KUNIT_EXPECT_EQ(test, atomic_read(&ci->confirmed), 1);
 
 	/* Lost at once on a power-off, sleep or mode set. */
 	dcp_camind_lost(dcp);

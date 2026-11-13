@@ -182,12 +182,20 @@ void dcp_camind_complete(struct apple_dcp *dcp, u32 swap_id)
 {
 	struct dcp_camind *ci = &dcp->camind;
 
-	if (!ci->registered || !ci->carrying || ci->carry_id != swap_id)
+	bool carried;
+
+	if (!ci->registered)
 		return;
-	ci->carrying = false;
-	if (!ci->want || ci->carry_epoch != atomic_read(&ci->epoch) ||
-	    !dcp_camind_panel_ok(dcp))
+	carried = ci->carrying && ci->carry_id == swap_id &&
+		  ci->carry_epoch == atomic_read(&ci->epoch);
+	if (ci->carry_id == swap_id)
+		ci->carrying = false;
+	/* Every completed present is checked: one without the dot ends it. */
+	if (!ci->want || !carried || !dcp_camind_panel_ok(dcp)) {
+		if (ci->want)
+			dcp_camind_lost(dcp);
 		return;
+	}
 	if (!atomic_xchg(&ci->confirmed, 1))
 		apple_cam_indicator_set_shown(true);
 }
