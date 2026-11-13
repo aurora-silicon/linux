@@ -60,6 +60,32 @@ static void indicator_single_owner(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, dcp_ind_begin(&ind), 0);
 }
 
+/*
+ * A DRM unbind drops the plane while the camera may still stream: the request
+ * is kept and asked for again. A request that was ended, or never made, is not.
+ */
+static void indicator_resumes_only_a_kept_request(struct kunit *test)
+{
+	struct dcp_indicator ind = {};
+
+	KUNIT_EXPECT_FALSE(test, dcp_ind_wants_resume(&ind));
+	KUNIT_ASSERT_EQ(test, dcp_ind_begin(&ind), 0);
+	/* On the panel or pending, nothing to resume. */
+	KUNIT_EXPECT_FALSE(test, dcp_ind_wants_resume(&ind));
+	dcp_ind_present_done(&ind, true);
+	KUNIT_EXPECT_FALSE(test, dcp_ind_wants_resume(&ind));
+	dcp_ind_suspend(&ind);
+	KUNIT_EXPECT_EQ(test, ind.state, DCP_IND_OFF);
+	KUNIT_EXPECT_TRUE(test, dcp_ind_wants_resume(&ind));
+	/* Asking again is a new request, and a stop ends it for good. */
+	KUNIT_ASSERT_EQ(test, dcp_ind_begin(&ind), 0);
+	KUNIT_EXPECT_FALSE(test, dcp_ind_wants_resume(&ind));
+	dcp_ind_end(&ind);
+	KUNIT_EXPECT_FALSE(test, dcp_ind_wants_resume(&ind));
+	dcp_ind_suspend(&ind);
+	KUNIT_EXPECT_FALSE(test, dcp_ind_wants_resume(&ind));
+}
+
 /* A userspace change to the reserved plane is put back, never honoured. */
 static void indicator_plane_reservation(struct kunit *test)
 {
@@ -79,6 +105,7 @@ static struct kunit_case indicator_cases[] = {
 	KUNIT_CASE(indicator_confirmed_only_after_present),
 	KUNIT_CASE(indicator_idle_ignores_presents),
 	KUNIT_CASE(indicator_single_owner),
+	KUNIT_CASE(indicator_resumes_only_a_kept_request),
 	KUNIT_CASE(indicator_plane_reservation),
 	{}
 };

@@ -23,6 +23,8 @@ enum dcp_ind_state {
 
 struct dcp_indicator {
 	enum dcp_ind_state state;
+	/* Requested and not ended: it survives a DRM unbind, so the next bind shows it again. */
+	bool wanted;
 };
 
 /* One owner at a time: a second request cannot reset a running one. */
@@ -31,6 +33,7 @@ static inline int dcp_ind_begin(struct dcp_indicator *ind)
 	if (ind->state != DCP_IND_OFF)
 		return -EBUSY;
 	ind->state = DCP_IND_PENDING;
+	ind->wanted = true;
 	return 0;
 }
 
@@ -41,9 +44,23 @@ static inline void dcp_ind_present_done(struct dcp_indicator *ind, bool dot_show
 		ind->state = DCP_IND_LIT;
 }
 
+/* The request is over: stopped, failed or withdrawn. */
 static inline void dcp_ind_end(struct dcp_indicator *ind)
 {
 	ind->state = DCP_IND_OFF;
+	ind->wanted = false;
+}
+
+/* The plane is gone (DRM unbind) but the camera may still stream: keep the request. */
+static inline void dcp_ind_suspend(struct dcp_indicator *ind)
+{
+	ind->state = DCP_IND_OFF;
+}
+
+/* Wanted but not on the panel: the next present after a rebind asks again. */
+static inline bool dcp_ind_wants_resume(const struct dcp_indicator *ind)
+{
+	return ind->wanted && ind->state == DCP_IND_OFF;
 }
 
 /*

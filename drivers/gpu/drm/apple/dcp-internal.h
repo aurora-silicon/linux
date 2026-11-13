@@ -385,6 +385,8 @@ struct dcp_camera_indicator {
 	spinlock_t lock;
 	struct mutex ctl;
 	struct delayed_work watch;
+	struct work_struct resume;
+	unsigned long deadline;
 	struct drm_plane *plane;
 	struct drm_framebuffer *fb;
 	u32 surf;
