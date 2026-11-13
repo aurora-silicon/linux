@@ -144,5 +144,6 @@ void iomfb_poweron_v27(struct apple_dcp *dcp);
 void iomfb_poweroff_v27(struct apple_dcp *dcp);
 void iomfb_sleep_v27(struct apple_dcp *dcp);
 void iomfb_present_backlight_v27(struct apple_dcp *dcp);
+void iomfb_present_matrix_v27(struct apple_dcp *dcp);
 
 #endif

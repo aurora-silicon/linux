@@ -497,6 +497,36 @@ bool dcp_backlight_resend(struct apple_dcp *dcp)
 	return resend;
 }
 
+/*
+ * For the first present after a firmware 27 power-on. That present comes before DRM's DPMS-on
+ * and the backlight core's resume, which clear the DPMS-off, suspend and blank marks only later
+ * (backlight_is_blank() counts the core's suspend too), so it would carry level 0. Clear the
+ * three marks now: the present carries the panel's level, and the DPMS-on and resume that
+ * follow change nothing. The level is marked for this present directly rather than through
+ * dcp_backlight_resend(), whose once-a-second budget stays for the firmware's own
+ * enable-backlight request after the power-on.
+ * Returns the level the present carries, or a negative error.
+ */
+int dcp_backlight_wake_lit(struct apple_dcp *dcp)
+{
+	struct dcp_backlight_state *state = &dcp->backlight.state;
+	unsigned long flags;
+	int ret = -ENODATA;
+
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	if (state->ready) {
+		state->dpms_off = false;
+		state->suspended = false;
+		state->core_blank = false;
+		state->controlled = true;
+		state->retries = 0;
+		dcp_bl_jump(state);
+		ret = dcp_bl_effective(state);
+	}
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+	return ret;
+}
+
 unsigned int dcp_backlight_retry_delay(struct apple_dcp *dcp)
 {
 	unsigned long flags;

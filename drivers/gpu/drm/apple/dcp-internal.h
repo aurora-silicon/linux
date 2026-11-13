@@ -844,6 +844,11 @@ struct apple_dcp {
 
 	struct dptx_port dptxport[2];
 
+	/* V27 sleep: the panel's next mode set is the mode it already has */
+	bool v27_keep_mode;
+	/* V27 sleep: the output area of the call being pushed holds this (an in/out word) */
+	const void *push_out_prefill;
+
 	/* firmware 27 panel: its AV and DP service endpoints, by endpoint - 0x20 */
 	struct apple_dcp_afkep *panelav[0x20];
 	struct workqueue_struct *panelav_wq;
@@ -1080,6 +1085,7 @@ const struct drm_edid *dcp_firmware_edid(struct apple_dcp *dcp, u64 *generation)
 
 void iomfb_scanout_complete_h17p(struct apple_dcp *dcp);
 void iomfb_present_backlight_h17p(struct apple_dcp *dcp);
+void iomfb_present_matrix_h17p(struct apple_dcp *dcp);
 bool iomfb_present_brightness_only_h17p(struct apple_dcp *dcp);
 bool iomfb_present_complete_h17p(struct apple_dcp *dcp);
 void iomfb_present_failed_h17p(struct apple_dcp *dcp);

@@ -11,6 +11,46 @@ static const u8 v27_sleep_endpoints[] = {
 	0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x31,
 };
 enum v27_phase { V27_LIVE, V27_PREPARED, V27_ARMED, V27_STOPPED, V27_FAILED };
+static bool v27_two_stage = true;
+module_param(v27_two_stage, bool, 0644);
+MODULE_PARM_DESC(v27_two_stage, "V27 sleep: the panel's soft power state off before the hard one, on after it (macOS's display stage)");
+static bool v27_soft_first = true;
+module_param(v27_soft_first, bool, 0644);
+MODULE_PARM_DESC(v27_soft_first, "V27 sleep: the display's soft off (display stage, plain A484) before the hard off, as macOS's display sleep");
+
+/*
+ * The calls made before A484's plain form in either direction, at the wake and at the display's
+ * sleep: A414, A489, A489, A487, A489, A412. At the wake each is followed by A500's wake form, at
+ * the display's sleep none is. Their arguments come from the DT; their replies are not needed.
+ */
+static void dcp_v27_display_stage(struct apple_dcp *dcp, bool a500)
+{
+	u8 args[IOMFB_V27_STAGE_ARGS];
+	const struct {
+		char tag[4] __nonstring;
+		u8 in, out;
+		const u8 *data;
+	} seq[] = {
+		{ "A414", 8, 8, args },
+		{ "A489", 0, 4, NULL },
+		{ "A489", 0, 4, NULL },
+		{ "A487", 4, 0, args + 8 },
+		{ "A489", 0, 4, NULL },
+		{ "A412", 0, 4, NULL },
+	};
+	unsigned int i;
+	int ret;
+
+	if (iomfb_v27_display_args(dcp, true, args))
+		return;
+	for (i = 0; i < ARRAY_SIZE(seq); i++) {
+		ret = iomfb_v27_sleep_call(dcp, seq[i].tag, seq[i].data, seq[i].in, seq[i].out);
+		if (ret)
+			dev_warn(dcp->dev, "V27 display stage: %.4s: %d\n", seq[i].tag, ret);
+		if (a500)
+			iomfb_v27_sleep_rpc(dcp, true, true);
+	}
+}
 struct dcp_v27_sleep {
 	struct apple_dcp *dcp;
 	struct device *scanout;
@@ -18,11 +58,16 @@ struct dcp_v27_sleep {
 	struct apple_dart_v27_lease *firmware, *display;
 	enum v27_phase phase;
 	unsigned long closed;
-	bool workers_disabled, paused, power_off, registered, restore_on;
+	bool workers_disabled, paused, power_off, registered, restore_on, soft_off;
 	bool display_early;	/* the display DART's lease taken and stopped at the prepare */
 	int stop_error, recovery_error;
 	u64 attempt;
 };
+/* The display's own power state moves too, when the DT describes its calls. */
+static bool dcp_v27_two_stage(struct dcp_v27_sleep *s)
+{
+	return s->restore_on && v27_two_stage && iomfb_v27_display_described(s->dcp);
+}
 static bool dcp_v27_sleep_selected(struct apple_dcp *dcp)
 {
 	return apple_sleep_v27_late() &&
@@ -242,14 +287,35 @@ static int dcp_v27_reopen_live(struct apple_dcp *dcp)
 		if (s->restore_on) {
 			/* A500's wake form first; its failure does not stop the power-on. */
 			iomfb_v27_sleep_rpc(dcp, true, true);
+			if (s->soft_off)
+				iomfb_v27_sleep_call(dcp, "A489", NULL, 0, 4);
 			ret = iomfb_v27_sleep_rpc(dcp, false, true);
 			if (ret)
 				return ret;
+			/* The hard state is on again; the display comes on with the soft one, as macOS's wake. */
+			if (s->soft_off) {
+				ret = iomfb_v27_sleep_a115(dcp, true);
+				if (ret)
+					dev_warn(dcp->dev, "V27 wake: A115(1): %d\n", ret);
+				dcp_v27_display_stage(dcp, true);
+				ret = iomfb_v27_sleep_plain(dcp, true);
+				if (ret)
+					return ret;
+				s->soft_off = false;
+			}
+			WRITE_ONCE(dcp->v27_keep_mode, true);
 		}
 		/* An unused external pipeline stays OFF; its next actual activation
 		 * uses the existing DEFAULT V27 normal power-on path. No fake sink.
 		 */
 		s->power_off = false;
+	} else if (s->soft_off) {
+		/* An entry refused between the display's soft off and the hard one. */
+		dcp_v27_display_stage(dcp, true);
+		ret = iomfb_v27_sleep_plain(dcp, true);
+		if (ret)
+			return ret;
+		s->soft_off = false;
 	}
 	ret = iomfb_queue_settle(dcp, msecs_to_jiffies(1000));
 	if (ret)
@@ -259,6 +325,8 @@ static int dcp_v27_reopen_live(struct apple_dcp *dcp)
 	mutex_unlock(&dcp->iomfb.lock);
 	if (s->paused)
 		iomfb_pause_presentation(dcp, false);
+	if (READ_ONCE(dcp->v27_keep_mode))
+		iomfb_v27_wake_present(dcp);
 	if (s->workers_disabled) {
 		if (dcp->rate_retry_initialized)
 			enable_delayed_work(&dcp->rate_retry_wq);
@@ -475,14 +543,44 @@ static int dcp_v27_sleep_suspend(struct apple_dcp *dcp)
 	ret = dcp_v27_sleep_settle(dcp);
 	if (ret)
 		goto undo;
+	/*
+	 * macOS's display sleep first (the display stage, the plain A484(0), answered when the
+	 * display is off, then A500's wake form), and the system's hard off after it.
+	 */
+	if (dcp_v27_two_stage(s) && v27_soft_first) {
+		dcp_v27_display_stage(dcp, false);
+		ret = iomfb_v27_sleep_plain(dcp, false);
+		if (ret)
+			goto undo;
+		s->soft_off = true;
+		iomfb_v27_sleep_rpc(dcp, true, true);
+	}
+	if (dcp_v27_two_stage(s))
+		iomfb_v27_sleep_call(dcp, "A489", NULL, 0, 4);
 	ret = iomfb_v27_sleep_rpc(dcp, false, false); /* A484, actual state/status */
 	if (ret)
 		goto uncertain;
 	s->power_off = true;
+	/* The AP's state word for the sleep, right after the hard off, as macOS. */
+	if (dcp_v27_two_stage(s)) {
+		ret = iomfb_v27_sleep_a115(dcp, false);
+		if (ret)
+			dev_warn(dcp->dev, "V27 sleep: A115(0): %d\n", ret);
+	}
 	/*
-	 * The display's DART stops once the pipe has stopped fetching: after A484, which is
-	 * answered when the display is off, and before A500. Stopped before A484, a pipe that is
-	 * still lit can read through it and the firmware dies of a bus error.
+	 * Without the display's sleep first, the soft state goes off after the hard one, so that the
+	 * wake's hard power-on still leaves the display off and the plain form turns it on.
+	 */
+	if (dcp_v27_two_stage(s) && !s->soft_off) {
+		ret = iomfb_v27_sleep_plain(dcp, false);
+		if (ret)
+			goto uncertain;
+		s->soft_off = true;
+	}
+	/*
+	 * The display's DART stops once the pipe has stopped fetching: after the A484s, answered
+	 * when the display is off, and before A500. Stopped before A484, a pipe that is still lit
+	 * can read through it and the firmware dies of a bus error.
 	 */
 	if (!dcp_v27_external(dcp)) {
 		ret = dcp_v27_disp_dart_stop_early(s);
