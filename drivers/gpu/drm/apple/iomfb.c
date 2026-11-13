@@ -839,7 +839,7 @@ struct iomfb_v27_sleep_rpc {
 	struct dcp_method_entry method;
 	u8 data[16];
 	u32 input, output, status, power_state;
-	bool oob, flags_form;
+	bool oob, flags_form, any_reply, inout;
 };
 
 static void iomfb_v27_sleep_free(struct kref *ref)
@@ -859,7 +859,8 @@ static void iomfb_v27_sleep_done(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	struct iomfb_v27_sleep_rpc *rpc = cookie;
 
-	rpc->status = rpc->output ? (out ? get_unaligned_le32(out + 4) : ~0U) : 0;
+	rpc->status = rpc->any_reply ? 0 :
+		      rpc->output ? (out ? get_unaligned_le32(out + 4) : ~0U) : 0;
 	/* With the sleep's flags the reply's first word is not the state. */
 	if (rpc->output && !rpc->status && !rpc->flags_form) {
 		if (get_unaligned_le32(out) != rpc->power_state)
@@ -874,8 +875,11 @@ static void iomfb_v27_sleep_start(struct apple_dcp *dcp,
 	struct iomfb_v27_sleep_rpc *rpc = container_of(transaction,
 		struct iomfb_v27_sleep_rpc, transaction);
 
+	if (rpc->inout)
+		dcp->push_out_prefill = rpc->data;
 	dcp_push(dcp, rpc->oob, &rpc->method, rpc->input, rpc->output,
 		 rpc->data, iomfb_v27_sleep_done, rpc);
+	dcp->push_out_prefill = NULL;
 }
 
 /*
@@ -900,7 +904,50 @@ bool iomfb_v27_sleep_described(struct apple_dcp *dcp)
 	       !iomfb_v27_sleep_args(dcp, true, args);
 }
 
+/*
+ * The display's own power state around the sleep, from the DT: the eight bytes after the
+ * power state in A484's plain form, which moves that state without the sleep's hard one; or
+ * the display stage's arguments made before it, A414's eight followed by A487's four.
+ */
+int iomfb_v27_display_args(struct apple_dcp *dcp, bool stage, u8 *args)
+{
+	return of_property_read_u8_array(dcp->dev->of_node,
+					 stage ? "apple,sleep-display-stage-args" :
+						 "apple,sleep-display-power-args",
+					 args, stage ? IOMFB_V27_STAGE_ARGS : IOMFB_V27_SLEEP_ARGS);
+}
+
+/* Whether the DT gives both; without them the display's own power state is left alone. */
+bool iomfb_v27_display_described(struct apple_dcp *dcp)
+{
+	u8 args[IOMFB_V27_STAGE_ARGS];
+
+	return !iomfb_v27_display_args(dcp, false, args) &&
+	       !iomfb_v27_display_args(dcp, true, args);
+}
+
+/*
+ * macOS sends every A484 of a V27 sleep and wake, both forms, on the command context, and its
+ * power-on callbacks come back on the callback context.
+ */
+static bool v27_sleep_power_oob;
+module_param(v27_sleep_power_oob, bool, 0644);
+MODULE_PARM_DESC(v27_sleep_power_oob, "V27 sleep: the power state calls on the out-of-band context (0, default: the command context)");
+
+static int iomfb_v27_rpc(struct apple_dcp *dcp, bool a500, bool on, bool flags);
+
 int iomfb_v27_sleep_rpc(struct apple_dcp *dcp, bool a500, bool on)
+{
+	return iomfb_v27_rpc(dcp, a500, on, true);
+}
+
+/* A484's plain form: the display's own (soft) power state, off and on. */
+int iomfb_v27_sleep_plain(struct apple_dcp *dcp, bool on)
+{
+	return iomfb_v27_rpc(dcp, false, on, false);
+}
+
+static int iomfb_v27_rpc(struct apple_dcp *dcp, bool a500, bool on, bool flags)
 {
 	struct iomfb_v27_sleep_rpc *rpc;
 	u8 args[IOMFB_V27_SLEEP_ARGS];
@@ -909,7 +956,8 @@ int iomfb_v27_sleep_rpc(struct apple_dcp *dcp, bool a500, bool on)
 	if (!IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) ||
 	    dcp->fw_compat != DCP_FIRMWARE_V_27_0 ||
 	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G ||
-	    iomfb_v27_sleep_args(dcp, a500, args))
+	    (a500 || flags ? iomfb_v27_sleep_args(dcp, a500, args) :
+			     iomfb_v27_display_args(dcp, false, args)))
 		return -EOPNOTSUPP;
 	rpc = kzalloc_obj(*rpc);
 	if (!rpc)
@@ -933,16 +981,17 @@ int iomfb_v27_sleep_rpc(struct apple_dcp *dcp, bool a500, bool on)
 	} else {
 		rpc->input = 16;
 		rpc->output = sizeof(struct dcp_set_power_state_resp);
-		rpc->oob = true;
+		rpc->oob = READ_ONCE(v27_sleep_power_oob);
 		rpc->power_state = on;
 		put_unaligned_le64(on, rpc->data);
 		/*
 		 * The firmware keeps a hard and a soft power state, and the flags move the hard one,
-		 * so both directions carry them. The plain form after a flagged off answers ok and
-		 * changes nothing: the panel stays dark and the next swap times out.
+		 * so both directions carry them; the plain form moves the soft one. The plain form
+		 * after a flagged off answers ok and changes nothing: the panel stays dark and the
+		 * next swap times out.
 		 */
 		memcpy(rpc->data + 8, args, sizeof(args));
-		rpc->flags_form = true;
+		rpc->flags_form = flags;
 	}
 	kref_get(&rpc->ref);
 	ret = iomfb_queue(dcp, &rpc->transaction);
@@ -954,6 +1003,62 @@ int iomfb_v27_sleep_rpc(struct apple_dcp *dcp, bool a500, bool on)
 		ret = -EREMOTEIO;
 	else if (rpc->output)
 		WRITE_ONCE(dcp->pipe_enabled_h17p, !!rpc->power_state);
+	kref_put(&rpc->ref, iomfb_v27_sleep_free);
+	return ret;
+}
+
+static int iomfb_v27_call(struct apple_dcp *dcp, const char *tag, const void *in,
+			  u32 in_len, u32 out_len, bool inout);
+
+/* One call of the display stage around a V27 sleep, by tag; any reply is accepted. */
+int iomfb_v27_sleep_call(struct apple_dcp *dcp, const char *tag, const void *in,
+			 u32 in_len, u32 out_len)
+{
+	return iomfb_v27_call(dcp, tag, in, in_len, out_len, false);
+}
+
+/*
+ * A115, an in/out word: 0 after the sleep's flags-form A484(0), 1 after the wake's flags-form
+ * A484(1), as macOS.
+ */
+int iomfb_v27_sleep_a115(struct apple_dcp *dcp, bool awake)
+{
+	u32 v = awake;
+
+	return iomfb_v27_call(dcp, "A115", &v, 0, sizeof(v), true);
+}
+
+static int iomfb_v27_call(struct apple_dcp *dcp, const char *tag, const void *in,
+			  u32 in_len, u32 out_len, bool inout)
+{
+	struct iomfb_v27_sleep_rpc *rpc;
+	int ret;
+
+	if (!IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) ||
+	    dcp->fw_compat != DCP_FIRMWARE_V_27_0 || in_len > sizeof(rpc->data) ||
+	    (inout && out_len > sizeof(rpc->data)))
+		return -EOPNOTSUPP;
+	rpc = kzalloc_obj(*rpc);
+	if (!rpc)
+		return -ENOMEM;
+	kref_init(&rpc->ref);
+	init_completion(&rpc->done);
+	rpc->status = ~0U;
+	rpc->any_reply = true;
+	rpc->transaction.start = iomfb_v27_sleep_start;
+	rpc->transaction.release = iomfb_v27_sleep_release;
+	rpc->method = (struct dcp_method_entry) { .name = "v27_display_stage" };
+	memcpy(rpc->method.tag, tag, 4);
+	rpc->input = in_len;
+	rpc->output = out_len;
+	rpc->inout = inout;
+	memcpy(rpc->data, in, inout ? out_len : in_len);
+	kref_get(&rpc->ref);
+	ret = iomfb_queue(dcp, &rpc->transaction);
+	if (ret)
+		iomfb_v27_sleep_release(&rpc->transaction);
+	else if (!wait_for_completion_timeout(&rpc->done, msecs_to_jiffies(1000)))
+		ret = -ETIMEDOUT;
 	kref_put(&rpc->ref, iomfb_v27_sleep_free);
 	return ret;
 }
@@ -1142,7 +1247,9 @@ static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 	if (in_len > 0)
 		memcpy(out_data, data, in_len);
 	/* An unwritten status must not look like a successful response. */
-	if (out_len)
+	if (out_len && dcp->push_out_prefill)
+		memcpy(out_data + in_len, dcp->push_out_prefill, out_len);
+	else if (out_len)
 		memset(out_data + in_len, 0xff, out_len);
 
 	trace_iomfb_push(dcp, call, context, offset, depth);
@@ -3742,6 +3849,57 @@ static void iomfb_edr_tick(struct work_struct *work)
 
 	if (READ_ONCE(dcp->edr_ramping))
 		iomfb_backlight_kick(dcp);
+}
+
+/*
+ * After a V27 sleep's power-on: the last frame again at once. macOS has
+ * frames queued before the panel's plug; the firmware brings the
+ * link up and exports the panel's modes only with one pending.
+ */
+static void iomfb_wake_present_start(struct apple_dcp *dcp,
+				     struct iomfb_transaction *transaction)
+{
+	struct iomfb_scanout_h17p *scanout = dcp->iomfb.scanout;
+	bool have_surface = false;
+	unsigned int i;
+
+	if (!READ_ONCE(dcp->mode_state.valid) || !scanout || !dcp->connector)
+		return;
+	for (i = 0; i < SWAP_SURFACES; i++)
+		have_surface |= !!scanout->fb[i];
+	if (!have_surface)
+		return;
+	dev_info(dcp->dev, "presenting the last frame again after the power-on\n");
+	/*
+	 * This present comes before DRM's DPMS-on and the backlight core's resume, so it carries
+	 * the panel's level rather than the blanked 0 (dcp_backlight_wake_lit()). It is not a
+	 * resend either: the once-a-second resend budget stays for the firmware's enable-backlight
+	 * request after the power-on, which must be answered by a present before the firmware
+	 * enables its stage-1 blocks.
+	 */
+	if (dcp_has_panel(dcp) && dcp_backlight_active(dcp)) {
+		int nits = dcp_backlight_wake_lit(dcp);
+
+		dev_dbg(dcp->dev, "the first frame after the power-on carries %d nits\n", nits);
+	}
+	dcp->swap.h17p = scanout->request;
+	/* macOS sends the colour matrix and its correction before the first swap. */
+	iomfb_present_matrix_v27(dcp);
+}
+
+void iomfb_v27_wake_present(struct apple_dcp *dcp)
+{
+	struct iomfb_transaction *transaction;
+
+	transaction = kzalloc_obj(*transaction);
+	if (!transaction)
+		return;
+	transaction->start = iomfb_wake_present_start;
+	transaction->release = iomfb_backlight_release;
+	transaction->brightness_only = true;
+	transaction->presentation = true;
+	if (iomfb_queue(dcp, transaction))
+		kfree(transaction);
 }
 
 int iomfb_configure_backlight_h17p(struct apple_dcp *dcp, u32 maximum,
