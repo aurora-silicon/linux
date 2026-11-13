@@ -3,7 +3,93 @@
 //! Work-based firmware performance effort. Idle power gating is managed separately by the
 //! device-control ring; this input never keeps an otherwise idle GPU powered.
 
-use core::sync::atomic::AtomicU32;
+use core::{ffi::c_void, ptr::NonNull, sync::atomic::AtomicU32};
+
+use super::dietemp;
+
+unsafe extern "C" {
+    fn asahi_g17_dietemp_get(
+        dev: *mut kernel::bindings::device,
+        out: *mut *mut c_void,
+    ) -> core::ffi::c_int;
+    fn asahi_g17_dietemp_sample(source: *mut c_void, effort: *mut u8) -> core::ffi::c_int;
+    fn asahi_g17_dietemp_put(source: *mut c_void);
+}
+
+/// Retained reference to the documented PMP report lane selected by DT.
+struct DieTempSource(NonNull<c_void>);
+
+impl DieTempSource {
+    fn new(dev: *mut kernel::bindings::device) -> kernel::error::Result<Self> {
+        let mut source = core::ptr::null_mut();
+        // SAFETY: `dev` is live and `source` is writable. C returns one owned
+        // reference to the DT report node, released by Drop.
+        let ret = unsafe { asahi_g17_dietemp_get(dev, &mut source) };
+        if ret < 0 {
+            return Err(kernel::error::Error::from_errno(ret));
+        }
+        Ok(Self(
+            NonNull::new(source).ok_or(kernel::error::code::ENODEV)?,
+        ))
+    }
+
+    fn sample(&self) -> Option<u8> {
+        let mut effort = 0;
+        // SAFETY: the source and output remain live for this call. The report
+        // driver performs only its documented status and effort reads.
+        (unsafe { asahi_g17_dietemp_sample(self.0.as_ptr(), &mut effort) } == 0).then_some(effort)
+    }
+}
+
+// SAFETY: C protects report registration with RCU and this object is only
+// sampled by the device owner under its mutex.
+unsafe impl Send for DieTempSource {}
+
+impl Drop for DieTempSource {
+    fn drop(&mut self) {
+        // SAFETY: releases the unique reference returned by get.
+        unsafe { asahi_g17_dietemp_put(self.0.as_ptr()) };
+    }
+}
+
+/// Host side of the J700 die-temperature ceiling.
+pub(super) struct Ceiling {
+    source: DieTempSource,
+    native: [u32; 3],
+    controller: dietemp::Controller,
+}
+
+impl Ceiling {
+    pub(super) fn new(
+        dev: *mut kernel::bindings::device,
+        native: [u32; 3],
+    ) -> kernel::error::Result<Self> {
+        Ok(Self {
+            source: DieTempSource::new(dev)?,
+            native,
+            controller: dietemp::Controller::new(),
+        })
+    }
+
+    pub(super) const fn applied(&self) -> Option<u32> {
+        self.controller.applied()
+    }
+
+    /// Sample the PMP-owned closed loop and publish only the documented AGX
+    /// runtime ceiling words. Invalid/stopped providers restore native policy.
+    pub(super) fn update(&mut self, init: &super::initdata::InitData) -> kernel::error::Result {
+        match self.controller.observe(self.source.sample()) {
+            dietemp::Change::None => Ok(()),
+            dietemp::Change::Limit(percent) if self.native[1] != 0 => {
+                let target = dietemp::scale_target(self.native[1], percent);
+                init.publish_ppm_target(1, target, self.native[2])
+            }
+            dietemp::Change::Limit(_) | dietemp::Change::Restore => {
+                init.publish_ppm_target(self.native[0], self.native[1], self.native[2])
+            }
+        }
+    }
+}
 
 pub(super) const FULL_EFFORT: u32 = 0x10000;
 pub(super) const IDLE_HOLD_NS: u64 = 16_000_000;

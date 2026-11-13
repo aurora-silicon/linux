@@ -34,6 +34,7 @@ mod completion;
 pub(crate) mod context;
 mod data_segment;
 mod dependency;
+mod dietemp;
 mod sync_input;
 pub(crate) mod sync_output;
 mod trace;
@@ -813,6 +814,8 @@ struct Firmware {
     hold: power::Hold,
     /// M5: host GPU power budget governor (Region C's budget word).
     governor: thermal::Governor,
+    /// PMP die-temperature effort applied through the AGX power ceiling.
+    ceiling: Option<power::Ceiling>,
     registration_power_release_pending: bool,
     variant: &'static fw::Variant,
     queues: runtime::Registry,
@@ -1178,6 +1181,7 @@ const GROW_WORK: u64 = 3;
 const RECLAIM_WORK: u64 = 4;
 const FEED_WORK: u64 = 5;
 const GOVERNOR_WORK: u64 = 6;
+const DIETEMP_WORK: u64 = 7;
 
 /// Device state shared with the coprocessor callbacks and the event worker.
 #[pin_data]
@@ -1264,6 +1268,8 @@ struct Shared {
     /// M5: the CPU of the last publication, `u32::MAX` before the first.
     submitter: AtomicU32,
     #[pin]
+    dietemp: DelayedWork<Shared, DIETEMP_WORK>,
+    #[pin]
     grow: Work<Shared, GROW_WORK>,
     #[pin]
     reclaim_work: Work<Shared, RECLAIM_WORK>,
@@ -1320,6 +1326,9 @@ impl WorkItem<GOVERNOR_WORK> for Shared {
             this.queue_governor();
         }
     }
+}
+impl_has_delayed_work! {
+    impl HasDelayedWork<Shared, DIETEMP_WORK> for Shared { self.dietemp }
 }
 impl_has_work! {
     impl HasWork<Shared, GROW_WORK> for Shared { self.grow }
@@ -1378,6 +1387,12 @@ impl WorkItem<POLL_WORK> for Shared {
     }
 }
 impl WorkItem<IDLE_WORK> for Shared {
+    type Pointer = Arc<Shared>;
+    fn run(this: Arc<Shared>) {
+        this.queue_events();
+    }
+}
+impl WorkItem<DIETEMP_WORK> for Shared {
     type Pointer = Arc<Shared>;
     fn run(this: Arc<Shared>) {
         this.queue_events();
@@ -1532,6 +1547,13 @@ impl Shared {
         let delay_ms = delay_ns.div_ceil(1_000_000).min(u64::from(u32::MAX)) as u32;
         let _ = workqueue::system_highpri()
             .enqueue_delayed::<Arc<Self>, IDLE_WORK>(self.clone(), msecs_to_jiffies(delay_ms));
+    }
+
+    fn queue_dietemp(self: &Arc<Self>) {
+        let _ = workqueue::system_highpri().enqueue_delayed::<Arc<Self>, DIETEMP_WORK>(
+            self.clone(),
+            msecs_to_jiffies((dietemp::PERIOD_NS / 1_000_000) as u32),
+        );
     }
 
     fn disable_timer<const ID: u64>(self: &Arc<Self>, timer: &DelayedWork<Self, ID>) {
@@ -1783,6 +1805,7 @@ impl Gpu {
                 events,
                 follows_submitter: m5,
                 submitter: AtomicU32::new(u32::MAX),
+                dietemp <- new_delayed_work!("g17::Shared::dietemp"),
                 grow <- new_work!("g17::Shared::grow"),
                 reclaim_work <- new_work!("g17::Shared::reclaim_work"),
                 reclaim <- new_mutex!(reclaim, "g17::Shared::reclaim"),
@@ -2245,6 +2268,7 @@ impl Gpu {
                 effort: power::Effort::new(),
                 hold: power::Hold::new(),
                 governor: thermal::Governor::new(),
+                ceiling: None,
                 registration_power_release_pending: false,
                 variant: shared.variant,
                 queues <- runtime::Registry::with_waiters(
@@ -2336,6 +2360,16 @@ impl Gpu {
                 session.init.control_counters()?
             );
         }
+        let node = dev.as_ref().as_ref().of_node().ok_or(EIO)?;
+        if node
+            .get_opt_property::<KVec<u32>>(c_str!("apple,fast-die-effort"))?
+            .is_some()
+        {
+            session.ceiling = Some(power::Ceiling::new(
+                pdev.as_ref().as_raw(),
+                session.init.ppm_target()?,
+            )?);
+        }
         session
             .uat
             .activate_render_context(&session._render_global)?;
@@ -2410,6 +2444,7 @@ impl Gpu {
             firmware.governor_restore();
         }
         self.shared.actuators.lock().release();
+        self.shared.disable_timer(&self.shared.dietemp);
         self.shared.disable_work(&self.shared.grow);
         self.shared.disable_work(&self.shared.reclaim_work);
         self.shared.disable_work(&self.shared.work);
