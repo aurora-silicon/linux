@@ -70,10 +70,10 @@ static bool s2idle_keep_link = true;
 module_param(s2idle_keep_link, bool, 0644);
 MODULE_PARM_DESC(s2idle_keep_link, "Keep tunneled links up through suspend-to-idle");
 
-/* Opt-in until the NHI, PHY and DART power cycle is qualified together. */
-static bool cio_s2r;
+/* Lets the NHI take a tunneled PCIe-C port through a deep sleep. */
+static bool cio_s2r = true;
 module_param(cio_s2r, bool, 0400);
-MODULE_PARM_DESC(cio_s2r, "Enable NHI-owned J713 PCIe-C system sleep");
+MODULE_PARM_DESC(cio_s2r, "Enable NHI-owned J713 PCIe-C system sleep (default: on)");
 
 static int link_up_timeout = 500;
 /* Fundamental resets of a conventional port whose endpoint does not train. */
@@ -4220,10 +4220,15 @@ static int apple_pcie_tunnel_add_links(struct apple_pcie *pcie)
 				     "PCIe-C DART device is not ready\n");
 
 	raw_spin_lock_init(&pcie->cio_cfg_lock);
+	ret = -EOPNOTSUPP;
 	if (cio_s2r && pcie->hw == &t8132_pciec_hw &&
-	    of_machine_is_compatible("apple,j713"))
+	    of_machine_is_compatible("apple,j713")) {
 		ret = apple_dart_cio_bind(pcie->dev, &dart_pdev->dev, &pcie->cio_dart);
-	else
+		/* An older DT gives the DART no sleep path: keep the tunnel without one. */
+		if (ret == -EOPNOTSUPP)
+			dev_warn(pcie->dev, "DART has no CIO sleep path; a docked deep sleep is refused\n");
+	}
+	if (ret == -EOPNOTSUPP)
 		ret = apple_pcie_tunnel_add_link(pcie, &dart_pdev->dev, pcie->dev);
 	put_device(&dart_pdev->dev);
 	if (ret)

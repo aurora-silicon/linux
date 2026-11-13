@@ -34,6 +34,9 @@ variants = {
     "missing-pending-cleanup": actual.replace(
         "devinfo->sleep_reset_blocked = true;", ""
     ),
+    "dropped-sleep-reset": actual.replace(
+        "if (READ_ONCE(devinfo->reset_wanted))", "if (false)"
+    ),
 }
 with tempfile.TemporaryDirectory(prefix="brcmf-sleep-lifetime-") as tmp:
     c, exe = Path(tmp) / "test.c", Path(tmp) / "test"

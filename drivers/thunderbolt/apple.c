@@ -331,9 +331,9 @@ MODULE_PARM_DESC(dpin_mode_value,
 /* DP IN adapters without an interrupt are polled this often (ms). */
 #define APPLE_DPIN_POLL_MS 20
 
-static bool cio_s2r;
+static bool cio_s2r = true;
 module_param(cio_s2r, bool, 0400);
-MODULE_PARM_DESC(cio_s2r, "Enable experimental J713 attached-dock system sleep");
+MODULE_PARM_DESC(cio_s2r, "Enable J713 attached-dock system sleep (default: on)");
 
 struct apple_dpin_binding;
 
