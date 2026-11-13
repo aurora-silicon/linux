@@ -114,13 +114,14 @@ static inline int dcp_ind_retry(struct dcp_indicator *ind, bool plane,
 }
 
 /*
- * The display came back (system resume) and the resume commit is done. A plane
- * that came back dark shows no square, so it is OFF again and a kept request
- * asks anew. A plane that came back with the square (suspend saved it, resume
- * committed it) is carried by a present that confirms it: resetting that state
+ * The display came back (system resume) and the resume commit is done. The
+ * reserved plane comes back dark: suspend disabled it, and the resume commit
+ * that names the kernel's framebuffer is put back to that disabled state
+ * (DCP_IND_PLANE_RESTORE). So the square is OFF again and a kept request asks
+ * anew. A lit plane here means a set(true) landed between the resume commit
+ * and this call: its commit is already on the panel, and resetting its state
  * would make the new request an unchanged plane, no swap would follow, and the
- * watch would withdraw the square. The same holds for a request that landed
- * after the resume commit.
+ * watch would withdraw the square.
  */
 static inline void dcp_ind_display_resumed(struct dcp_indicator *ind, bool plane_dark)
 {

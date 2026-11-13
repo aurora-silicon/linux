@@ -7353,12 +7353,6 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		bitmap_zero(dcp->iomfb_surfaces, DCP_MAX_PLANES);
 		set_bit(0, dcp->iomfb_surfaces);
 	}
-	{
-		int ret_ind = dcp_indicator_probe(dcp);
-
-		if (ret_ind)
-			return ret_ind;
-	}
 
 	/* The J700 loader names surface zero rather than enabling it. */
 	if (of_machine_is_compatible("apple,j700") &&
