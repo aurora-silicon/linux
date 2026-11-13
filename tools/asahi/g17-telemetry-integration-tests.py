@@ -146,6 +146,8 @@ mod g17 {
     struct State(std::sync::Mutex<Option<Box<Firmware>>>);
     impl State {
         fn lock(&self)->std::sync::MutexGuard<'_,Option<Box<Firmware>>> { self.0.lock().unwrap() }
+        // No post-hibernation restore in these tests: the barrier is always open.
+        fn lock_unless_restoring(&self)->Option<std::sync::MutexGuard<'_,Option<Box<Firmware>>>> { Some(self.lock()) }
     }
     struct Variant { graph:fw::variant::InitGraph, m5_commands:bool }
     struct Shared { state:State, dev:crate::device::Device, variant:Variant, crashed:std::sync::atomic::AtomicBool }
@@ -153,6 +155,7 @@ mod g17 {
     impl Shared {
         fn freeze_for_hibernation(&self)->crate::prelude::Result { unreachable!() }
         fn thaw_after_hibernation(&self) { unreachable!() }
+        fn finish_restore(&self) {}
     }
     mod reports;
 '''

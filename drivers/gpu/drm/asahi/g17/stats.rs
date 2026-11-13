@@ -101,8 +101,21 @@ impl Reader {
         )
     }
 
+    /// Starts (`PM_*_PREPARE`) or ends (`PM_POST_*`) a sleep's statistics epoch.
     pub(crate) fn suspend(&self, suspended: bool) {
-        if let Some(firmware) = self.0.state.lock().as_deref_mut() {
+        let mut state = if suspended {
+            // No sleep begins while a post-hibernation restore runs.
+            self.0.finish_restore();
+            self.0.state.lock()
+        } else {
+            // `PM_POST_HIBERNATION` does not wait for the restore it just queued: the restore
+            // ends the epoch itself once the firmware is republished.
+            let Some(state) = self.0.state.lock_unless_restoring() else {
+                return;
+            };
+            state
+        };
+        if let Some(firmware) = state.as_deref_mut() {
             firmware.rings.suspend_statistics(suspended);
         }
     }

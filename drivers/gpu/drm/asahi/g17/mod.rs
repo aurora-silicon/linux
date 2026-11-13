@@ -13,13 +13,14 @@
 //! # Locking
 //!
 //! `Shared::state` is the device lock. It serializes binding, recovery, the event worker and all
-//! firmware-shared state that has no narrower owner. Steady-state compute publication into a
-//! bound queue takes only that queue's cell lock and the port's locks ([`port`]), reached under
-//! a preparation lease. Completions are signalled after dropping the device lock. Lock order:
+//! firmware-shared state that has no narrower owner. After a resume from disk it also waits for the
+//! firmware's re-boot, which runs in a work item (`DeviceLock`). Steady-state compute publication
+//! into a bound queue takes only that queue's cell lock and the port's locks ([`port`]), reached
+//! under a preparation lease. Completions are signalled after dropping the device lock. Lock order:
 //! `Shared::state` -> compute queue cell (one at a time) -> port locks -> availability domains;
-//! `Shared::state` -> UAT shared state -> VM exec lock -> GEM reservation. `RoleState::ack`
-//! nests inside nothing. Capacity waits block on an availability domain signalled by the
-//! release that provides the capacity, never on a sleep.
+//! `Shared::state` -> UAT shared state -> VM exec lock -> GEM reservation. `RoleState::ack` nests
+//! inside nothing. Capacity waits block on an availability domain signalled by the release that
+//! provides the capacity, never on a sleep.
 
 pub(crate) mod availability;
 mod buffer;
@@ -98,7 +99,8 @@ use kernel::{
         aref::ARef,
         Arc,
         CondVar,
-        Mutex, //
+        Mutex,
+        MutexGuard, //
     },
     time::{
         delay::fsleep,
@@ -1114,8 +1116,9 @@ impl Firmware {
     /// Re-boots a coprocessor that the boot loader cold-restarted while this kernel was
     /// restored from a hibernation image, against the restored host state, in the order of
     /// the first boot ([`Gpu::boot`]) with the one-shot allocation and build replaced by
-    /// in-place resets. Called with the device mutex held, from `PM_POST_HIBERNATION` after
-    /// the PMP restore, with publication closed since the freeze (the GPU was idle then).
+    /// in-place resets. Called from the restore work that `PM_POST_HIBERNATION` queues after
+    /// the PMP restore, with the device mutex held and its restore barrier closed
+    /// ([`DeviceLock`]), and with publication closed since the freeze (the GPU was idle then).
     ///
     /// On error the caller loses the device; nothing is half-published: the publication gate
     /// stays closed and every later command fails.
@@ -1507,6 +1510,84 @@ const GROW_WORK: u64 = 3;
 const RECLAIM_WORK: u64 = 4;
 const FEED_WORK: u64 = 5;
 const GOVERNOR_WORK: u64 = 6;
+const RESTORE_WORK: u64 = 7;
+
+/// The device lock ([`Shared::state`]) with the barrier of a post-hibernation restore.
+///
+/// After a resume from disk the boot loader has cold-restarted the firmware, and it is
+/// re-booted against the restored host state ([`Shared::restore_after_hibernation`]) in a work
+/// item, not in the PM notifier: the restore waits for the PMP to run again, about two
+/// seconds. Userspace is already thawed then. While the restore runs, [`Self::lock`] does not
+/// return: whoever takes the device lock (admission, the event worker, runtime PM, sysfs and
+/// debugfs readers, a new sleep) waits for the restore to finish, exactly as it waited for the
+/// mutex when the notifier held it for the whole restore. The barrier is closed and opened
+/// only with the mutex held, and checked with it held, so no locker sees the cold firmware.
+///
+/// Only the restore work bypasses the barrier ([`Self::lock_for_restore`]); it holds the mutex
+/// for the whole restore, so nothing it calls takes the lock again. The barrier is closed only
+/// on a device that was drained for hibernation: no preparation lease is held, so no builder
+/// sleeps on [`Shared::changed`] with this mutex's guard (such a wait reacquires the mutex
+/// without passing the barrier).
+#[pin_data]
+struct DeviceLock {
+    #[pin]
+    inner: Mutex<Option<KBox<Firmware>>>,
+    #[pin]
+    restored: CondVar,
+    /// A post-hibernation restore owns the firmware. Written with `inner` held; read with it
+    /// held, except by [`Self::lock_unless_restoring`]'s first look.
+    restoring: AtomicBool,
+}
+
+impl DeviceLock {
+    fn new() -> impl PinInit<Self> {
+        pin_init!(Self {
+            inner <- new_mutex!(None, "g17::Shared::state"),
+            restored <- new_condvar!("g17::Shared::state::restored"),
+            restoring: AtomicBool::new(false),
+        })
+    }
+
+    /// The device lock, once no post-hibernation restore owns the firmware.
+    fn lock(&self) -> MutexGuard<'_, Option<KBox<Firmware>>> {
+        let mut guard = self.inner.lock();
+        while self.restoring.load(Ordering::Relaxed) {
+            self.restored.wait(&mut guard);
+        }
+        guard
+    }
+
+    /// The device lock, or `None` while a post-hibernation restore owns the firmware. Does not
+    /// wait for the mutex that the restore holds.
+    fn lock_unless_restoring(&self) -> Option<MutexGuard<'_, Option<KBox<Firmware>>>> {
+        if self.restoring.load(Ordering::Acquire) {
+            return None;
+        }
+        let guard = self.inner.lock();
+        (!self.restoring.load(Ordering::Relaxed)).then_some(guard)
+    }
+
+    /// The device lock for the restore work, which owns the firmware while the barrier is
+    /// closed.
+    fn lock_for_restore(&self) -> MutexGuard<'_, Option<KBox<Firmware>>> {
+        self.inner.lock()
+    }
+
+    /// Closes the barrier; `_held` is this lock's guard.
+    fn close_for_restore(&self, _held: &MutexGuard<'_, Option<KBox<Firmware>>>) {
+        self.restoring.store(true, Ordering::Release);
+    }
+
+    /// Opens the barrier and wakes its waiters; `_held` is this lock's guard. Whether it was
+    /// closed.
+    fn open_after_restore(&self, _held: &MutexGuard<'_, Option<KBox<Firmware>>>) -> bool {
+        let closed = self.restoring.swap(false, Ordering::Release);
+        if closed {
+            self.restored.notify_all();
+        }
+        closed
+    }
+}
 
 /// Device state shared with the coprocessor callbacks and the event worker.
 #[pin_data]
@@ -1607,7 +1688,12 @@ struct Shared {
     stop: Mutex<()>,
     /// The device lock. `None` before boot completes and after detachment.
     #[pin]
-    state: Mutex<Option<KBox<Firmware>>>,
+    state: DeviceLock,
+    /// Re-boots a cold firmware after a resume from disk ([`Self::restore_after_hibernation`]).
+    #[pin]
+    restore: Work<Shared, RESTORE_WORK>,
+    /// When the thaw that queued [`Self::restore`] began, in ns.
+    restore_ns: AtomicU64,
     /// M5: the CPU frequency ceiling the thermal governor shares the SoC's heat with, and the
     /// fan boost. Never taken with `state` held.
     #[pin]
@@ -1708,6 +1794,15 @@ impl WorkItem<POLL_WORK> for Shared {
         }
     }
 }
+impl_has_work! {
+    impl HasWork<Shared, RESTORE_WORK> for Shared { self.restore }
+}
+impl WorkItem<RESTORE_WORK> for Shared {
+    type Pointer = Arc<Shared>;
+    fn run(this: Arc<Shared>) {
+        this.restore_after_hibernation();
+    }
+}
 impl WorkItem<IDLE_WORK> for Shared {
     type Pointer = Arc<Shared>;
     fn run(this: Arc<Shared>) {
@@ -1792,6 +1887,8 @@ impl Shared {
     /// the image; [`Self::thaw_after_hibernation`] reopens it. The coprocessor is not stopped:
     /// an aborted hibernation, and the image write in this kernel, keep a running firmware.
     pub(crate) fn freeze_for_hibernation(self: &Arc<Self>) -> Result {
+        // A second hibernation right after a resume: the previous restore finishes first.
+        self.finish_restore();
         if self.crashed.load(Ordering::Acquire) {
             dev_info!(self.dev.as_ref(), "GPU lost; hibernating without a drain\n");
             return Ok(());
@@ -1879,7 +1976,9 @@ impl Shared {
     /// (aborted hibernation, failed image write) only gets its stale-marked UAT state synced
     /// and publication back. A firmware that the boot loader cold-restarted while this kernel
     /// was restored from disk is re-booted against the restored host state
-    /// ([`Firmware::republish_after_cold_boot`]) first.
+    /// ([`Self::restore_after_hibernation`]) in a work item, so that the notifier, and with it
+    /// the hibernation, returns without waiting for the PMP; the device lock's restore barrier
+    /// ([`DeviceLock`]) keeps every other locker out until the firmware is republished.
     ///
     /// On any failure the device is lost: outstanding and future work fails and the firmware
     /// is not reachable half-published.
@@ -1901,7 +2000,6 @@ impl Shared {
             return;
         }
         let started = now_ns();
-        let mut retired = runtime::RetiredCompute::new();
         let mut state = self.state.lock();
         let Some(firmware) = state.as_deref_mut() else {
             return;
@@ -1924,14 +2022,62 @@ impl Shared {
             }
             Ok(true) => {
                 dev_info!(dev.as_ref(), "GPU firmware cold after resume; re-booting it\n");
-                let mut reclaim = self.reclaim.lock();
-                firmware
-                    .republish_after_cold_boot(dev, self, &mut retired, &mut reclaim)
-                    .map(|()| true)
+                // Closed before the mutex is dropped: from here until the restore work has
+                // republished the firmware, no other locker gets the device lock.
+                self.state.close_for_restore(&state);
+                self.restore_ns.store(started, Ordering::Relaxed);
+                drop(state);
+                // Not queued yet: every freeze and shutdown flushes it first.
+                let _ = workqueue::system_long().enqueue::<Arc<Self>, RESTORE_WORK>(self.clone());
+                return;
             }
             Err(error) => Err(error),
         };
         drop(state);
+        self.complete_thaw(dev, runtime::RetiredCompute::new(), result, started);
+    }
+
+    /// The restore work queued by [`Self::thaw_after_hibernation`] for a cold firmware: re-boots
+    /// it under the device lock ([`Firmware::republish_after_cold_boot`]), then opens the
+    /// lock's restore barrier, on success and on failure alike.
+    fn restore_after_hibernation(self: &Arc<Self>) {
+        let started = self.restore_ns.load(Ordering::Relaxed);
+        let mut retired = runtime::RetiredCompute::new();
+        let dev_ref = self.drm();
+        let mut state = self.state.lock_for_restore();
+        let result = match (&dev_ref, state.as_deref_mut()) {
+            (Ok(dev), Some(firmware)) => {
+                let mut reclaim = self.reclaim.lock();
+                let result = firmware
+                    .republish_after_cold_boot(dev, self, &mut retired, &mut reclaim)
+                    .map(|()| true);
+                drop(reclaim);
+                // The notifier's end of the sleep's statistics epoch found the barrier closed
+                // and left it to this work (see `stats::Reader::suspend`).
+                firmware.rings.suspend_statistics(false);
+                result
+            }
+            _ => Err(ENODEV),
+        };
+        self.state.open_after_restore(&state);
+        drop(state);
+        match dev_ref {
+            Ok(dev) => self.complete_thaw(&dev, retired, result, started),
+            // Shutdown flushes this work before it releases the DRM device.
+            Err(_) => self.lose_device_quietly(),
+        }
+    }
+
+    /// The end of a thaw, without the device mutex: destroys the queues the cold firmware
+    /// never knew, and reopens publication, or loses the device on failure. `result` is whether
+    /// the firmware was re-booted.
+    fn complete_thaw(
+        self: &Arc<Self>,
+        dev: &AsahiDrmDevice,
+        retired: runtime::RetiredCompute,
+        result: Result<bool>,
+        started: u64,
+    ) {
         // Queues the cold firmware never knew are destroyed without the device mutex.
         let finished = retired.finish(self);
         let result = result.and_then(|cold| finished.map(|()| cold));
@@ -1957,6 +2103,14 @@ impl Shared {
                 self.lose_device_quietly();
             }
         }
+    }
+
+    /// Waits for a queued post-hibernation restore and the end of its thaw. Called before a
+    /// new sleep, freeze or restore begins, and before shutdown.
+    fn finish_restore(&self) {
+        // SAFETY: `restore` is this Shared's initialized pinned work field; flushing waits for
+        // a pending or running callback and leaves the work item usable.
+        unsafe { kernel::bindings::flush_work(Work::raw_get(&self.restore)) };
     }
 
     /// Wakes the waiters for a returned pair, binding or capacity change.
@@ -2349,7 +2503,9 @@ impl Gpu {
                 reclaim_work <- new_work!("g17::Shared::reclaim_work"),
                 reclaim <- new_mutex!(reclaim, "g17::Shared::reclaim"),
                 stop <- new_mutex!((), "g17::Shared::stop"),
-                state <- new_mutex!(None, "g17::Shared::state"),
+                state <- DeviceLock::new(),
+                restore <- new_work!("g17::Shared::restore"),
+                restore_ns: AtomicU64::new(0),
                 actuators <- new_mutex!(thermal::Actuators::new(), "g17::Shared::actuators"),
                 changed <- new_condvar!("g17::Shared::changed"),
                 port: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
@@ -2944,6 +3100,9 @@ impl Gpu {
 
     /// Stops the firmware and releases everything it used.
     pub(crate) fn shutdown(&self) {
+        // A post-hibernation restore still running ends before anything is torn down; the PM
+        // notifiers that queue it are already unregistered.
+        self.shared.finish_restore();
         self.shared.feed.begin_shutdown();
         self.shared.preparations.remove();
         self.shared.stop_queues();
@@ -2958,6 +3117,13 @@ impl Gpu {
         self.shared.disable_work(&self.shared.reclaim_work);
         self.shared.disable_work(&self.shared.work);
         self.shared.disable_work(&self.shared.feed_work);
+        self.shared.disable_work(&self.shared.restore);
+        // A restore cancelled before it ran leaves the barrier closed: open it, the cold
+        // firmware is lost.
+        let abandoned = self.shared.state.open_after_restore(&self.shared.state.lock_for_restore());
+        if abandoned {
+            self.shared.lose_device_quietly();
+        }
         self.shared.feed.shutdown();
         self.shared.drain_reclaims();
         self.shared.release_drm();

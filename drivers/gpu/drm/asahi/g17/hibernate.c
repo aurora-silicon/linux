@@ -143,8 +143,12 @@ static int asahi_pm_notify(struct notifier_block *nb, unsigned long action, void
 		 * After a resume from disk the boot loader has cold-restarted the GPU
 		 * firmware while the host state was restored from the image; after an
 		 * aborted hibernation the firmware kept running. The callback tells
-		 * them apart, re-boots a cold firmware against the restored state and
-		 * reopens submission. This notifier has a lower priority than the PMP
+		 * them apart and reopens submission; a cold firmware is re-booted
+		 * against the restored state by a work item it queues, which keeps the
+		 * GPU's device lock until then (the PMP comes back about two seconds
+		 * later), so this notifier returns at once. That work also ends the
+		 * statistics epoch: the suspend callback below leaves it alone while
+		 * the work runs. This notifier has a lower priority than the PMP
 		 * restore, which has already run.
 		 */
 		if (hooks->hibernate)
