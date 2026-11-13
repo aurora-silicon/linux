@@ -2976,10 +2976,11 @@ static void apple_pcie_port_gate_clocks(struct apple_pcie *pcie,
 
 /*
  * The tunables the loader applied to a conventional port and its root port at boot, where it
- * publishes them: written again after a sleep that reset the block. Optional.
+ * publishes them: written again after a sleep that reset the block. A missing property is
+ * fine, a malformed one fails the probe.
  */
-static void apple_pcie_port_s2r_tunables(struct apple_pcie *pcie, struct apple_pcie_port *port,
-					 struct resource *port_res)
+static int apple_pcie_port_s2r_tunables(struct apple_pcie *pcie, struct apple_pcie_port *port,
+					struct resource *port_res)
 {
 	static const char * const rc_names[] = {
 		"apple,tunable-rc", "apple,tunable-rc-gen3", "apple,tunable-rc-gen4",
@@ -2989,11 +2990,19 @@ static void apple_pcie_port_s2r_tunables(struct apple_pcie *pcie, struct apple_p
 	int i;
 
 	t = devm_apple_tunable_parse(pcie->dev, port->np, "apple,tunable-port", port_res);
+	if (IS_ERR(t) && PTR_ERR(t) != -ENOENT)
+		return dev_err_probe(pcie->dev, PTR_ERR(t), "port %pOF: apple,tunable-port\n",
+				     port->np);
 	port->s2r_port_tunable = IS_ERR(t) ? NULL : t;
 	for (i = 0; i < ARRAY_SIZE(rc_names); i++) {
 		t = devm_apple_tunable_parse(pcie->dev, port->np, rc_names[i], &rc);
+		if (IS_ERR(t) && PTR_ERR(t) != -ENOENT)
+			return dev_err_probe(pcie->dev, PTR_ERR(t), "port %pOF: %s\n",
+					     port->np, rc_names[i]);
 		port->s2r_rc_tunable[i] = IS_ERR(t) ? NULL : t;
 	}
+
+	return 0;
 }
 
 static int apple_pcie_setup_port(struct apple_pcie *pcie,
@@ -3059,8 +3068,11 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 		if (ret)
 			goto err_teardown;
 	}
-	if (!pcie->hw->tunneled && !pcie->hw->adopt_link && !pcie->managed_sids)
-		apple_pcie_port_s2r_tunables(pcie, port, res);
+	if (!pcie->hw->tunneled && !pcie->hw->adopt_link && !pcie->managed_sids) {
+		ret = apple_pcie_port_s2r_tunables(pcie, port, res);
+		if (ret)
+			goto err_teardown;
+	}
 	if (pcie->hw->tunneled) {
 		port->tunable = devm_apple_tunable_parse(pcie->dev, np,
 							  "apple,tunable", res);
