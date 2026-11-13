@@ -121,6 +121,8 @@ struct apple_epic_service_ops {
 	 * generation (DPAVCTRL) must leave this clear.
 	 */
 	bool singleton;
+	/* AFKV2: the provider sends this service's OPEN itself, afk_service_open(). */
+	bool open_later;
 
 	/*
 	 * Optional admission, before OPEN/publication. Must not retain service
@@ -595,6 +597,7 @@ int afk_start(struct apple_dcp_afkep *ep);
 int afk_v27_sleep_control(struct apple_dcp_afkep *ep, bool open);
 int afk_v27_sleep_check(struct apple_dcp_afkep *ep);
 int afk_start_service(struct apple_epic_service *service);
+int afk_service_open(struct apple_epic_service *service);
 void afk_cancel_commands(struct apple_dcp_afkep *ep);
 bool afk_compact_orphans_wait(struct apple_dcp_afkep *ep, unsigned long timeout);
 unsigned int afk_compact_orphans_drop(struct apple_dcp_afkep *ep);

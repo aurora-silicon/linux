@@ -1493,6 +1493,13 @@ static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
 	/* The J700 DCPEXT's audio service sits on endpoint 0x2b, not AV 0x29. */
 	if (!IS_ERR_OR_NULL(dcp->avep) && endpoint == dcp->avep->endpoint)
 		return dcp->avep;
+	/* A firmware 27 panel's AV and DP services (J714s: dcp->v27_j714s). */
+	if (dcp->v27_j714s && endpoint >= 0x20 && endpoint < 0x40) {
+		struct apple_dcp_afkep *ep = READ_ONCE(dcp->panelav[endpoint - 0x20]);
+
+		if (ep)
+			return ep;
+	}
 	/* DPAV 0x2a on H17P overlaps the legacy DPTX endpoint number. */
 	if (dcp->dcpavservep && endpoint == dcp->dcpavservep->endpoint)
 		return dcp->dcpavservep;
@@ -4313,6 +4320,14 @@ int dcp_start(struct platform_device *pdev)
 	if (ret) {
 		dev_err(dcp->dev, "Failed to start IOMFB endpoint: %d\n", ret);
 		return ret;
+	}
+
+	/* On the board they have run on; elsewhere these endpoints are not started, as before. */
+	if (dcp->v27_j714s && !dcp->external && dcp_has_panel(dcp)) {
+		ret = panelavep_init(dcp);
+		if (ret)
+			dev_warn(dcp->dev, "panel AV and DP services not started: %d\n", ret);
+		ret = 0;
 	}
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
