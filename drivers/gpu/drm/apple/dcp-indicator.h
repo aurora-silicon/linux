@@ -25,15 +25,12 @@ struct dcp_indicator {
 	enum dcp_ind_state state;
 	/* Requested and not ended: it survives a DRM unbind, so the next bind shows it again. */
 	bool wanted;
-	/* An off commit was refused for a pending flip and is being retried. */
-	bool off_pending;
-};
-
-enum dcp_ind_off_result {
-	DCP_IND_OFF_DONE,
-	/* A flip is still pending: ask again shortly. */
-	DCP_IND_OFF_RETRY,
-	DCP_IND_OFF_FAILED,
+	/* A commit refused for a pending flip, and which one is being retried. */
+	enum {
+		DCP_IND_RETRY_NONE,
+		DCP_IND_RETRY_ON,
+		DCP_IND_RETRY_OFF,
+	} retry;
 };
 
 /* One owner at a time: a second request cannot reset a running one. */
@@ -44,7 +41,7 @@ static inline int dcp_ind_begin(struct dcp_indicator *ind)
 	ind->state = DCP_IND_PENDING;
 	ind->wanted = true;
 	/* This request puts the square on again, so a retried off has no meaning. */
-	ind->off_pending = false;
+	ind->retry = DCP_IND_RETRY_NONE;
 	return 0;
 }
 
@@ -55,32 +52,53 @@ static inline void dcp_ind_present_done(struct dcp_indicator *ind, bool dot_show
 		ind->state = DCP_IND_LIT;
 }
 
-/* The request is over: stopped, failed or withdrawn. */
+/* The request is over: stopped, failed or withdrawn. An on retry has no request left. */
 static inline void dcp_ind_end(struct dcp_indicator *ind)
 {
 	ind->state = DCP_IND_OFF;
 	ind->wanted = false;
+	ind->retry = DCP_IND_RETRY_NONE;
 }
 
 /* The plane is gone (DRM unbind) but the camera may still stream: keep the request. */
 static inline void dcp_ind_suspend(struct dcp_indicator *ind)
 {
 	ind->state = DCP_IND_OFF;
-	ind->off_pending = false;
+	ind->retry = DCP_IND_RETRY_NONE;
 }
 
+struct dcp_ind_ops {
+	int (*commit)(void *ctx, bool on);
+	void (*queue_retry)(void *ctx);
+};
+
 /*
- * The result of an off commit. The commit is nonblocking, so a flip that is
- * still pending on the CRTC refuses it with -EBUSY. The square must still come
- * off, so that refusal is retried until the commit lands; any other error is
- * final. The camera never waits for it.
+ * Commits the square on or off. The commit is nonblocking, so a flip still
+ * pending on the CRTC refuses it with -EBUSY. The request stands, so that
+ * refusal is queued to be asked again, never waited for: 0 means committed or
+ * queued. Any other error is final and returned.
  */
-static inline enum dcp_ind_off_result dcp_ind_off_result(struct dcp_indicator *ind, int err)
+static inline int dcp_ind_apply(struct dcp_indicator *ind, bool on,
+				const struct dcp_ind_ops *ops, void *ctx)
 {
-	ind->off_pending = err == -EBUSY;
-	if (!err)
-		return DCP_IND_OFF_DONE;
-	return err == -EBUSY ? DCP_IND_OFF_RETRY : DCP_IND_OFF_FAILED;
+	int ret = ops->commit(ctx, on);
+
+	ind->retry = DCP_IND_RETRY_NONE;
+	if (ret == -EBUSY) {
+		ind->retry = on ? DCP_IND_RETRY_ON : DCP_IND_RETRY_OFF;
+		ops->queue_retry(ctx);
+		return 0;
+	}
+	return ret;
+}
+
+/* The retry work: asks again for whatever was refused, if the plane is still there. */
+static inline int dcp_ind_retry(struct dcp_indicator *ind, bool plane,
+				const struct dcp_ind_ops *ops, void *ctx)
+{
+	if (!plane || ind->retry == DCP_IND_RETRY_NONE)
+		return 0;
+	return dcp_ind_apply(ind, ind->retry == DCP_IND_RETRY_ON, ops, ctx);
 }
 
 /* Wanted but not on the panel: the next present after a rebind asks again. */

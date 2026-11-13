@@ -35,11 +35,11 @@
 #define IND_FILL		0xffff9500
 #define IND_EDGE		0xff000000
 #define IND_PRESENT_TIMEOUT	msecs_to_jiffies(1000)
-#define IND_OFF_RETRY		msecs_to_jiffies(50)
+#define IND_RETRY		msecs_to_jiffies(50)
 
 static void dcp_indicator_watch(struct work_struct *work);
 static void dcp_indicator_resume(struct work_struct *work);
-static void dcp_indicator_off_retry(struct work_struct *work);
+static void dcp_indicator_retry(struct work_struct *work);
 
 int dcp_indicator_probe(struct apple_dcp *dcp)
 {
@@ -50,7 +50,7 @@ int dcp_indicator_probe(struct apple_dcp *dcp)
 	mutex_init(&ci->ctl);
 	INIT_DELAYED_WORK(&ci->watch, dcp_indicator_watch);
 	INIT_WORK(&ci->resume, dcp_indicator_resume);
-	INIT_DELAYED_WORK(&ci->off_retry, dcp_indicator_off_retry);
+	INIT_DELAYED_WORK(&ci->retry, dcp_indicator_retry);
 
 	if (of_property_read_u32(dcp->dev->of_node, "apple,camera-indicator-surface", &surf))
 		return 0;
@@ -89,7 +89,7 @@ void dcp_indicator_release(struct apple_dcp *dcp)
 	}
 	/* With no fb nothing queues them again, and all take ctl, so cancel after dropping it. */
 	cancel_delayed_work_sync(&ci->watch);
-	cancel_delayed_work_sync(&ci->off_retry);
+	cancel_delayed_work_sync(&ci->retry);
 	cancel_work_sync(&ci->resume);
 }
 
@@ -242,39 +242,48 @@ static void dcp_indicator_end(struct apple_dcp *dcp)
 	spin_unlock_irqrestore(&ci->lock, flags);
 }
 
+static int dcp_indicator_do_commit(void *ctx, bool on)
+{
+	return dcp_indicator_commit(ctx, on);
+}
+
+static void dcp_indicator_queue_retry(void *ctx)
+{
+	struct apple_dcp *dcp = ctx;
+
+	queue_delayed_work(system_percpu_wq, &dcp->camera_ind.retry, IND_RETRY);
+}
+
+static const struct dcp_ind_ops dcp_indicator_ops = {
+	.commit = dcp_indicator_do_commit,
+	.queue_retry = dcp_indicator_queue_retry,
+};
+
 /*
- * ctl held. The off commit is nonblocking, so a flip still pending on the CRTC
- * refuses it. The square must still come off, so the refusal is retried from
- * a work item until it lands, never by making the camera wait.
+ * ctl held. The square must come off, so a commit refused for a pending flip
+ * is retried from a work item until it lands.
  */
 static void dcp_indicator_off(struct apple_dcp *dcp)
 {
-	struct dcp_camera_indicator *ci = &dcp->camera_ind;
-	int ret = dcp_indicator_commit(dcp, false);
+	int ret = dcp_ind_apply(&dcp->camera_ind.state, false, &dcp_indicator_ops, dcp);
 
-	switch (dcp_ind_off_result(&ci->state, ret)) {
-	case DCP_IND_OFF_RETRY:
-		queue_delayed_work(system_percpu_wq, &ci->off_retry, IND_OFF_RETRY);
-		break;
-	case DCP_IND_OFF_FAILED:
+	if (ret)
 		dev_warn(dcp->dev, "camera indicator off commit failed: %d\n", ret);
-		break;
-	case DCP_IND_OFF_DONE:
-		break;
-	}
 }
 
-static void dcp_indicator_off_retry(struct work_struct *work)
+static void dcp_indicator_retry(struct work_struct *work)
 {
 	struct dcp_camera_indicator *ci =
-		container_of(work, struct dcp_camera_indicator, off_retry.work);
+		container_of(work, struct dcp_camera_indicator, retry.work);
 	struct apple_dcp *dcp = container_of(ci, struct apple_dcp, camera_ind);
+	int ret;
 
 	guard(mutex)(&ci->ctl);
-	/* A request made since, or the plane going away, ended the retry. */
-	if (!ci->state.off_pending || !ci->fb)
-		return;
-	dcp_indicator_off(dcp);
+	ret = dcp_ind_retry(&ci->state, ci->fb, &dcp_indicator_ops, dcp);
+	if (ret) {
+		dev_warn(dcp->dev, "camera indicator commit failed: %d\n", ret);
+		dcp_indicator_end(dcp);
+	}
 }
 
 /*
@@ -320,7 +329,7 @@ static int dcp_indicator_request(struct apple_dcp *dcp)
 		return ret;
 
 	/* A refused commit changed nothing on the plane, so there is no square to take off. */
-	ret = dcp_indicator_commit(dcp, true);
+	ret = dcp_ind_apply(&ci->state, true, &dcp_indicator_ops, dcp);
 	if (ret) {
 		dcp_indicator_end(dcp);
 		return ret;
@@ -352,11 +361,11 @@ static void dcp_indicator_resume(struct work_struct *work)
 }
 
 /*
- * on: requests the square and returns 0 once the request is committed; the
- * present that carries it is confirmed, or withdrawn, within 1 s without
- * blocking the caller. An error means no indicator. off: always succeeds, and
- * a commit refused for a pending flip is retried until it lands. The caller
- * streams either way.
+ * on: requests the square and returns 0 once the request is committed, or
+ * queued after a pending flip refused it; the present that carries it is
+ * confirmed, or withdrawn, within 1 s without blocking the caller. An error
+ * means no indicator. off: always succeeds, and a commit refused for a pending
+ * flip is retried until it lands. The caller streams either way.
  */
 int apple_dcp_camera_indicator_set(struct device *dev, bool on)
 {
