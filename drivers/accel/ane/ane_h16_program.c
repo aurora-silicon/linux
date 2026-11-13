@@ -1455,15 +1455,19 @@ static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 	 * H17 checks each descriptor against the size the generic section
 	 * declared for its buffer at LOAD and asserts in its program manager
 	 * when it is smaller (relu64: section 0x1000 of a declared 0x4000
-	 * surface), so H17 descriptors carry the declared size. H16 keeps the
-	 * whole HWX section, which is what ran MobileNet on the J616s; the two
-	 * agree there (0x4c000). The declared size lies between the tensor span
-	 * and the mapped allocation. Userspace still sees and copies the span.
+	 * surface), so H17 descriptors carry the declared size. The H16
+	 * firmware runs the same check: an HWX whose surface section is smaller
+	 * than its declared buffer (0x400 of 0x4000) asserts there too. H16
+	 * keeps the whole HWX section when it is the larger one, which is what
+	 * ran MobileNet on the J616s. The declared size lies between the tensor
+	 * span and the mapped allocation. Userspace still sees and copies the
+	 * span.
 	 */
 	for (i = 0; i < p->resource_count; i++) {
 		buffers[i] = p->resources[i].buffer;
 		buffers[i].size = s->transport->soc->chip_family >= 17 ? p->declared[i] :
-				  p->hwx.surfaces[i].section.size;
+				  max_t(u64, p->declared[i],
+					p->hwx.surfaces[i].section.size);
 	}
 	if (p->has_scratch)
 		buffers[i++] = p->scratch;

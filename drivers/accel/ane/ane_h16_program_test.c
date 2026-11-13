@@ -2134,6 +2134,34 @@ static void program_h17_switch_test(struct kunit *test)
 }
 
 /*
+ * H16 runs the same declared-size check as H17: a descriptor smaller than the
+ * buffer the generic section declared asserts in the firmware. A section
+ * smaller than its declared buffer (Apple-compiled HWX: 0x400 of 0x4000)
+ * sends the declared size; a larger section keeps the section size.
+ */
+static void program_h16_declared_size_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+	u64 grown;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	/* The Apple shape: the section holds only the tensor span. */
+	grown = p->hwx.surfaces[0].allocation;
+	KUNIT_ASSERT_LT(test, p->hwx.surfaces[0].span, grown);
+	p->hwx.surfaces[0].section.size = p->hwx.surfaces[0].span;
+	p->declared[0] = grown;
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(f->exec + 0x60 + 0x20), grown);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(f->exec + 0x90 + 0x20),
+			p->hwx.surfaces[1].section.size);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+}
+
+/*
  * H17 sends no custom BAR record, even for a linear program whose descriptor
  * names the mcache field: the H17 firmware asserts on the record.
  */
@@ -3085,6 +3113,7 @@ static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_failed_close_keeps_test),
 	KUNIT_CASE(program_busy_test),
 	KUNIT_CASE(program_cached_sync_test),
+	KUNIT_CASE(program_h16_declared_size_test),
 	KUNIT_CASE(program_h17_no_custom_bar_test),
 	KUNIT_CASE(program_add128_slots_test),
 	KUNIT_CASE(program_kernel_slots_test),
