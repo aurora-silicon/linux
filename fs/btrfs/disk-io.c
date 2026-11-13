@@ -1766,6 +1766,8 @@ static void btrfs_stop_all_workers(struct btrfs_fs_info *fs_info)
 	btrfs_destroy_workqueue(fs_info->workers);
 	if (fs_info->endio_workers)
 		destroy_workqueue(fs_info->endio_workers);
+	if (fs_info->endio_read_workers)
+		destroy_workqueue(fs_info->endio_read_workers);
 	if (fs_info->rmw_workers)
 		destroy_workqueue(fs_info->rmw_workers);
 	btrfs_destroy_workqueue(fs_info->endio_write_workers);
@@ -1974,6 +1976,18 @@ static int btrfs_init_workqueues(struct btrfs_fs_info *fs_info)
 
 	fs_info->endio_workers =
 		alloc_workqueue("btrfs-endio", flags, max_active);
+	/*
+	 * Data read completions verify checksums. Run them on the CPU that
+	 * completed the bio, which the block layer keeps in the submitter's
+	 * cache domain: the verification then runs in the frequency domain
+	 * that carries the waiting reader's I/O boost, instead of wherever the
+	 * scheduler puts an unbound worker (on asymmetric systems usually the
+	 * most efficient core at its lowest clock).
+	 */
+	fs_info->endio_read_workers =
+		alloc_workqueue("btrfs-endio-read",
+				WQ_MEM_RECLAIM | WQ_FREEZABLE | WQ_PERCPU |
+				WQ_CPU_INTENSIVE, max_active);
 	fs_info->endio_meta_workers =
 		alloc_workqueue("btrfs-endio-meta", flags, max_active);
 	fs_info->rmw_workers = alloc_workqueue("btrfs-rmw", flags, max_active);
@@ -1994,7 +2008,8 @@ static int btrfs_init_workqueues(struct btrfs_fs_info *fs_info)
 
 	if (!(fs_info->workers &&
 	      fs_info->delalloc_workers && fs_info->flush_workers &&
-	      fs_info->endio_workers && fs_info->endio_meta_workers &&
+	      fs_info->endio_workers && fs_info->endio_read_workers &&
+	      fs_info->endio_meta_workers &&
 	      fs_info->endio_write_workers &&
 	      fs_info->endio_freespace_worker && fs_info->rmw_workers &&
 	      fs_info->caching_workers && fs_info->fixup_workers &&

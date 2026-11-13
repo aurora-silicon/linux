@@ -376,6 +376,8 @@ static struct workqueue_struct *btrfs_end_io_wq(const struct btrfs_fs_info *fs_i
 {
 	if (bio->bi_opf & REQ_META)
 		return fs_info->endio_meta_workers;
+	if (bio_op(bio) == REQ_OP_READ)
+		return fs_info->endio_read_workers;
 	return fs_info->endio_workers;
 }
 
