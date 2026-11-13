@@ -199,6 +199,14 @@ retry:
 		ret = PTR_ERR(ps);
 		goto out;
 	}
+	/*
+	 * A swap that carries only the indicator plane has no primary surface, and the H17P
+	 * firmware path drops it (backlight prepare -ENODATA), so an off commit never
+	 * reached the panel. Re-present the CRTC's other planes with every indicator swap.
+	 */
+	ret = drm_atomic_add_affected_planes(state, crtc);
+	if (ret)
+		goto out;
 	if (on) {
 		if (!cs->active) {
 			ret = -ENODEV;
