@@ -378,6 +378,8 @@ pub(crate) struct File {
     /// Largest size this file has asked GET_PARAMS for the global parameters with
     /// ([`gpu::Gpu::admit_vm`]).
     params_size: core::sync::atomic::AtomicU64,
+    /// The device's statistics, for the GPU frequency in fdinfo.
+    stats: Option<Arc<crate::stats::StatsSnapshot>>,
     /// The queues were drained once for an exiting task.
     drained: AtomicBool,
 }
@@ -401,9 +403,10 @@ impl drm::file::DriverFile for File {
             let user_range = gpu.user_range();
             let mem = memacct::Client::new()?;
             let usage = Arc::new(crate::usage::Client::new(), GFP_KERNEL)?;
+            let stats = gpu.stats_snapshot();
 
             mod_dev_dbg!(device, "[File {}]: DRM device opened\n", id);
-            KBox::pin_init(File::new(id, user_range, mem, usage), GFP_KERNEL)
+            KBox::pin_init(File::new(id, user_range, mem, usage, stats), GFP_KERNEL)
         })
     }
 
@@ -428,6 +431,11 @@ impl drm::file::DriverFile for File {
         }
     }
 
+    /// One clock drives every engine.
+    fn engine_frequency(&self) -> Option<(Option<u64>, u64)> {
+        self.stats.as_ref()?.engine_frequency()
+    }
+
     fn as_raw(&self) -> *mut bindings::drm_file {
         todo!()
     }
@@ -442,6 +450,7 @@ impl File {
         user_range: Range<u64>,
         mem: Arc<memacct::Client>,
         usage: Arc<crate::usage::Client>,
+        stats: Option<Arc<crate::stats::StatsSnapshot>>,
     ) -> impl PinInit<Self, Error> {
         // SAFETY: The initializer supplies aligned, pinned storage for Self.
         // XArray::new is infallible; each pinned array is initialized in place,
@@ -473,6 +482,7 @@ impl File {
                 addr_of_mut!((*slot).mem).write(mem);
                 addr_of_mut!((*slot).usage).write(usage);
                 addr_of_mut!((*slot).params_size).write(core::sync::atomic::AtomicU64::new(0));
+                addr_of_mut!((*slot).stats).write(stats);
                 addr_of_mut!((*slot).drained).write(AtomicBool::new(false));
                 Ok(())
             })
