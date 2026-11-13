@@ -3306,6 +3306,41 @@ static int cd321x_reset_inherited_connection(struct tps6598x *tps, u32 *status)
 	return 0;
 }
 
+/*
+ * The controller's system power state S0, and application firmware running: the patch is
+ * loaded if the controller waits for one (@patched, if given, says so). What a probe and a
+ * resume from disk both start from.
+ *
+ * Return: the controller's mode after the check (0 once a patch was loaded), or a negative
+ * error code.
+ */
+static int tipd_start_application(struct tps6598x *tps, bool *patched)
+{
+	int ret;
+
+	if (patched)
+		*patched = false;
+	if (tps->data->switch_power_state) {
+		ret = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
+		if (ret)
+			return ret;
+	}
+
+	ret = tps6598x_check_mode(tps);
+	if (ret < 0)
+		return ret;
+
+	if (ret == TPS_MODE_PTCH) {
+		if (patched)
+			*patched = true;
+		ret = tps->data->init(tps);
+		if (ret)
+			return ret;
+	}
+
+	return ret;
+}
+
 int tipd_init(struct tps6598x *tps)
 {
 	struct fwnode_handle *fwnode;
@@ -3332,23 +3367,9 @@ int tipd_init(struct tps6598x *tps)
 		}
 	}
 
-	if (tps->data->switch_power_state) {
-		ret = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
-		if (ret)
-			return ret;
-	}
-
-	/* Make sure the controller has application firmware running */
-	ret = tps6598x_check_mode(tps);
+	ret = tipd_start_application(tps, &patch_loaded);
 	if (ret < 0)
 		return ret;
-
-	if (ret == TPS_MODE_PTCH) {
-		patch_loaded = true;
-		ret = tps->data->init(tps);
-		if (ret)
-			return ret;
-	}
 
 	/*
 	 * A controller found in "DBMa" is used as it is. Nothing below issues a
@@ -3683,19 +3704,9 @@ int tipd_reinit_after_cold_boot(struct tps6598x *tps)
 {
 	int ret;
 
-	if (tps->data->switch_power_state) {
-		ret = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
-		if (ret)
-			return ret;
-	}
-	ret = tps6598x_check_mode(tps);
+	ret = tipd_start_application(tps, NULL);
 	if (ret < 0)
 		return ret;
-	if (ret == TPS_MODE_PTCH) {
-		ret = tps->data->init(tps);
-		if (ret)
-			return ret;
-	}
 	ret = tps6598x_write64(tps, TPS_REG_INT_MASK1, cd321x_irq_mask(tps));
 	if (ret)
 		return ret;
