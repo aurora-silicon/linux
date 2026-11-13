@@ -226,6 +226,9 @@ ASAHI_TESTS = {
                                    'no-step-past', 'pop-owed', 'head-includes-owed', 'held-stamped-pops',
                                    'crossed-behind-owed', 'owed-classified', 'rebind-check-entry',
                                    'timeout-fails-retired', 'no-owed-poll'), []),
+    # The mutations hand out a context a queue record still names, and wait without a bound.
+    'g17-context-reuse-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('take-waiting', 'ignore-holds', 'wait-past-deadline'), out()),
     'g17-compute-deadline-tests.py': [([], PASS)],
     'g17-compute-growth-deadline-tests.py': [([], PASS)],
     'g17-kill-route-tests.py': [([], PASS)]
