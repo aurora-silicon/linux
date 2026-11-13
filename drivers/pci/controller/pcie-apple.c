@@ -662,6 +662,7 @@ struct apple_pcie_port {
 	struct delayed_work	sd_work;
 	struct list_head	sd_entry;
 	bool			sd_off;		/* powered down for an empty slot */
+	struct pci_dev		*sd_rp_held;	/* its root port, kept active while it is down */
 };
 
 static bool apple_radio_writer_closed(struct apple_pcie *pcie);
@@ -3022,6 +3023,14 @@ static void apple_pcie_sd_power_down(struct apple_pcie *pcie, struct apple_pcie_
 
 	pci_lock_rescan_remove();
 	rp = bridge->bus ? pci_get_slot(bridge->bus, PCI_DEVFN(port->idx, 0)) : NULL;
+	/*
+	 * With the endpoint off the root port's config space reads all ones, as on macOS, so the
+	 * PCI core must not move it between D-states until the reader is back: a childless port
+	 * runtime-suspends, and its D0 -> D3hot (and a config read's D3cold -> D0) then fail as
+	 * "device inaccessible". Keep it active, from while it still answers.
+	 */
+	if (rp && !port->sd_rp_held && pm_runtime_resume_and_get(&rp->dev) >= 0)
+		port->sd_rp_held = pci_dev_get(rp);
 	if (rp && rp->subordinate)
 		list_for_each_entry_safe_reverse(dev, tmp, &rp->subordinate->devices, bus_list)
 			pci_stop_and_remove_bus_device(dev);
@@ -3039,6 +3048,18 @@ static void apple_pcie_sd_power_down(struct apple_pcie *pcie, struct apple_pcie_
 	pci_dev_put(rp);
 	pci_unlock_rescan_remove();
 	dev_info(pcie->dev, "port %pOF: slot empty, reader powered down\n", port->np);
+}
+
+/* The reader is back (or the port goes away): its root port's runtime PM is the core's again. */
+static void apple_pcie_sd_release_rp(struct apple_pcie_port *port)
+{
+	struct pci_dev *rp = port->sd_rp_held;
+
+	if (!rp)
+		return;
+	port->sd_rp_held = NULL;
+	pm_runtime_put(&rp->dev);
+	pci_dev_put(rp);
 }
 
 static int apple_pcie_sd_power_up(struct apple_pcie *pcie, struct apple_pcie_port *port)
@@ -3093,6 +3114,7 @@ out:
 	if (bridge->bus)
 		pci_rescan_bus(bridge->bus);
 	pci_unlock_rescan_remove();
+	apple_pcie_sd_release_rp(port);
 	return 0;
 }
 
@@ -3171,6 +3193,7 @@ static void apple_pcie_sd_remove(void *data)
 		unregister_pm_notifier(&apple_pcie_sd_pm_nb);
 	mutex_unlock(&apple_pcie_sd_lock);
 	cancel_delayed_work_sync(&port->sd_work);
+	apple_pcie_sd_release_rp(port);
 }
 
 /*
