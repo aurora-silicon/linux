@@ -1509,6 +1509,43 @@ static __maybe_unused int apple_isp_suspend(struct device *dev)
 	return 0;
 }
 
+/*
+ * The domains of resident firmware are syscore devices, so genpd never counts
+ * them suspended for a system sleep, see apple_isp_attach_genpd(). The CPU and
+ * front-end domains go off with a firmware stop, through runtime PM. The
+ * system domain is held by the ISP's own runtime PM link, which a stream kept
+ * active and which the PM core holds active through the sleep. With the
+ * firmware stopped for a sleep that powers the SoC down, nothing uses the
+ * domain any more: count it suspended, so it goes off with the last device in
+ * it, as it does without a stream.
+ */
+static __maybe_unused int apple_isp_suspend_noirq(struct device *dev)
+{
+	struct apple_isp *isp = dev_get_drvdata(dev);
+
+	if (isp->pd_count <= 1 || !isp->hw->resident_fw || !pm_suspend_via_firmware() ||
+	    isp->fw_state == ISP_FW_RUNNING ||
+	    pm_runtime_status_suspended(isp->pd_dev[0]))
+		return 0;
+
+	dev_pm_genpd_suspend(isp->pd_dev[0]);
+	isp->sleep_pd_counted = true;
+
+	return 0;
+}
+
+static __maybe_unused int apple_isp_resume_noirq(struct device *dev)
+{
+	struct apple_isp *isp = dev_get_drvdata(dev);
+
+	if (isp->sleep_pd_counted) {
+		dev_pm_genpd_resume(isp->pd_dev[0]);
+		isp->sleep_pd_counted = false;
+	}
+
+	return 0;
+}
+
 static __maybe_unused int apple_isp_freeze(struct device *dev)
 {
 	struct apple_isp *isp = dev_get_drvdata(dev);
@@ -1549,6 +1586,8 @@ static __maybe_unused int apple_isp_resume(struct device *dev)
 static const struct dev_pm_ops apple_isp_pm_ops = {
 	.suspend	= pm_sleep_ptr(apple_isp_suspend),
 	.resume		= pm_sleep_ptr(apple_isp_resume),
+	.suspend_noirq	= pm_sleep_ptr(apple_isp_suspend_noirq),
+	.resume_noirq	= pm_sleep_ptr(apple_isp_resume_noirq),
 	.freeze		= pm_sleep_ptr(apple_isp_freeze),
 	.thaw		= pm_sleep_ptr(apple_isp_resume),
 	.poweroff	= pm_sleep_ptr(apple_isp_freeze),

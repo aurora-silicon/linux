@@ -438,6 +438,11 @@ struct apple_isp {
 
 	/* stopped for system sleep, to start again on resume */
 	bool fw_sleep_stopped;
+	/*
+	 * The system domain was counted suspended for a sleep that powers the
+	 * SoC down, see apple_isp_suspend_noirq().
+	 */
+	bool sleep_pd_counted;
 	/* restarts a stream that ran across that sleep, see apple_isp_resume() */
 	struct work_struct resume_work;
 
