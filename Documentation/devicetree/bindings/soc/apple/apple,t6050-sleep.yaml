@@ -1,0 +1,225 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,t6050-sleep.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T6050 system sleep controls
+
+maintainers:
+  - Diljit Singh <hey@djdev.me>
+
+description: |
+  The registers a kernel running directly at EL2 on the M5 Pro writes to enter and
+  return from suspend-to-RAM: the PMGR's power, clock, perf and table banks on both
+  dies, the CPU clusters, power gates and start block, the sleep commit word, the
+  watchdogs, nub-spmi0, the PMC, PTD, the DART GAPF bank, the clusters' CPM blocks,
+  the storage link's PHY, the clock generator, the memory controller's channel pages,
+  the AP wake-enable words and the GFX die's interrupt controller. They belong to
+  several hardware blocks, some of which other drivers also use, so the driver does
+  not claim them.
+
+properties:
+  compatible:
+    const: apple,t6050-sleep
+
+  reg:
+    minItems: 46
+    maxItems: 46
+
+  reg-names:
+    items:
+      - const: ps0
+      - const: ps1
+      - const: ps-aon
+      - const: ps-gpx
+      - const: ps-media
+      - const: ps-gfx-aon
+      - const: clk
+      - const: clk-soc
+      - const: clk1
+      - const: afr-clk
+      - const: media-clk
+      - const: perf
+      - const: media-perf
+      - const: table0
+      - const: table1
+      - const: media-table
+      - const: cluster
+      - const: pwrgate
+      - const: cpu-start
+      - const: commit
+      - const: wdt
+      - const: wdt-aux
+      - const: disp-gate
+      - const: spmi
+      - const: pmc-voters
+      - const: pmc-rails
+      - const: ptd
+      - const: gapf
+      - const: aon-clk
+      - const: media-aon-clk
+      - const: cpm0
+      - const: cpm1
+      - const: cpm2
+      - const: storage-phy
+      - const: storage-phy-ip
+      - const: clkgen
+      - const: clkgen-78
+      - const: media-clkgen-78
+      - const: mcc22
+      - const: mcc23
+      - const: mcc24
+      - const: mcc25
+      - const: mcc26
+      - const: wake
+      - const: wake-gfx
+      - const: aic-gfx
+
+  apple,display-coprocessors:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    minItems: 5
+    maxItems: 5
+    description: Internal DCP, DCPEXT0, DCPEXT1, DCPEXT2, DCPEXT3.
+
+  apple,spmi-buses:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    maxItems: 5
+    description: The SPMI buses whose interrupt masks the sleep sets, aop-spmi0 last.
+
+  apple,sleep-darts:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    maxItems: 4
+    description: SEP's, PMP0's, SIO's and the DCP's DART, stopped in the sleep's last steps.
+
+  apple,radio-pcie:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The PCIe host whose port 0 carries the radio. Its link is shut down for the
+      sleep, and the shared PHY and root complex are started again after it.
+
+  apple,pinctrl:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: The AP pin controller, whose pins a deep sleep resets.
+
+  apple,pinctrl-skip-pins:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: Pins neither saved nor restored.
+
+  apple,sleep-low-pins:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    maxItems: 4
+    description: Pins driven high that go low in the sleep entry.
+
+  apple,wake-enable:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    maxItems: 64
+    description: The AP wake sources left enabled for a sleep, by their ADT index.
+
+  apple,wake-enable-gfx:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    maxItems: 32
+    description: The GFX die's wake sources left enabled for a sleep.
+
+  apple,clk-gating-boot:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: Index of a clock page or table in reg
+        - description: Offset
+        - description: Value
+    description:
+      The one-time clock-gating set-up of the PMGR's clock pages, written in this
+      order at probe. Set by the bootloader; without it the pages keep the values
+      the bootloader left.
+
+  apple,cpm-boot:
+    $ref: /schemas/types.yaml#/definitions/uint64-matrix
+    items:
+      items:
+        - description: Cluster (0 to 2, the cpm0 to cpm2 apertures)
+        - description: Offset
+        - description: Value
+    description:
+      The clusters' CPM set-up, written in this order at probe. Set by the
+      bootloader.
+
+  apple,cpm-rearm:
+    $ref: /schemas/types.yaml#/definitions/uint64-matrix
+    items:
+      items:
+        - description: 0 to write the value, 1 to read, 2 to read and write back
+        - description: Offset
+        - description: Value
+    description:
+      A cluster's CPM after a power-up in the sleep entry, after its counters are
+      restored. Set by the bootloader.
+
+  apple,cpm-rearm-boot-cluster:
+    $ref: /schemas/types.yaml#/definitions/uint64-matrix
+    items:
+      items:
+        - description: 0 to write the value, 1 to read, 2 to read and write back
+        - description: Offset
+        - description: Value
+    description: As apple,cpm-rearm, for the boot cluster only, after it.
+
+  apple,radio-link-down:
+    $ref: "#/$defs/register-sequence"
+    description:
+      The radio link's shutdown before the sleep, up to its PME_Turn_Off
+      handshake; PERST# goes low after it. Without it the link is not shut down
+      and the sleep is refused while the radio's host is bound.
+
+  apple,radio-link-down-port:
+    $ref: "#/$defs/register-sequence"
+    description: The radio port's shutdown after its DART is stopped.
+
+  apple,radio-port-wake:
+    $ref: "#/$defs/register-sequence"
+    description: The radio port's wake steps, after the port is set up again.
+
+  apple,radio-dart-wake:
+    $ref: "#/$defs/register-sequence"
+    description: The radio port's wake steps after its DART runs again.
+
+  apple,radio-phy-wake:
+    $ref: "#/$defs/register-sequence"
+    description:
+      The shared PCIe PHY's tunables and start after a sleep, before its root
+      complex runs again.
+
+  apple,phy-park:
+    $ref: "#/$defs/register-sequence"
+    description: The shared PCIe PHY parked before its power words go down.
+
+  apple,phy-down:
+    $ref: "#/$defs/register-sequence"
+    description: The shared PCIe PHY's last step before APCIE_PHY_SW goes down.
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - apple,display-coprocessors
+
+additionalProperties: false
+
+$defs:
+  register-sequence:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description:
+      Set by the bootloader. Run in order. Kind bits 7:0 are 0 write the value,
+      1 read, 2 set the value's bits, 3 clear them, 4 write back what is read,
+      5 wait for the value's bits to be set, 6 wait for them to be clear, 7 a
+      16-bit write; bits 31:16 a wait's timeout in ms (0 for 10 ms); bit 8 a
+      wait whose timeout is not an error. The blocks are the radio host's
+      config, port0 (0x24000 bytes from its start), phy0, rc, phy0's four port
+      words (0x10000 bytes from its start), the PHY's common page below them,
+      then this node's storage-phy and storage-phy-ip.
+    items:
+      items:
+        - description: Kind
+        - description: Block
+        - description: Offset
+        - description: Value

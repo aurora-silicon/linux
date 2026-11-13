@@ -8,6 +8,7 @@
 /* Matched only once its sleep has been tested on hardware. */
 static const char *const apple_sleep_test_tested[] = {
 	"apple,t8140-sleep",
+	"apple,t6050-sleep",
 };
 
 static bool apple_sleep_test_has(const struct apple_sleep_words *all, u32 offset)
@@ -51,10 +52,10 @@ static void apple_sleep_test_only_tested(struct kunit *test)
 	const struct of_device_id *id;
 	int n = 0;
 
-	for (id = apple_sleep_of_match; id->compatible[0]; id++, n++) {
+	for (id = apple_sleep_of_match; id->compatible[0]; id++) {
 		KUNIT_EXPECT_NOT_NULL_MSG(test, id->data, "%s has no data", id->compatible);
 		KUNIT_ASSERT_LT(test, n, ARRAY_SIZE(apple_sleep_test_tested));
-		KUNIT_EXPECT_STREQ(test, id->compatible, apple_sleep_test_tested[n]);
+		KUNIT_EXPECT_STREQ(test, id->compatible, apple_sleep_test_tested[n++]);
 	}
 	KUNIT_EXPECT_EQ(test, n, ARRAY_SIZE(apple_sleep_test_tested));
 }
@@ -76,6 +77,9 @@ static void apple_sleep_test_words(struct kunit *test)
 		};
 		int i;
 
+		/* Region-based profiles keep their words in their own tables */
+		if (soc->regions)
+			continue;
 		apple_sleep_test_full(test, c, "ps_all", all);
 		apple_sleep_test_full(test, c, "ps_aon_all", aon);
 		for (i = 0; i < ARRAY_SIZE(named); i++)
@@ -126,6 +130,8 @@ static void apple_sleep_test_wake_names(struct kunit *test)
 		const struct apple_sleep_soc *soc = id->data;
 		int i, j;
 
+		if (soc->regions)
+			continue;
 		KUNIT_EXPECT_NE(test, soc->wake_last_word, 0);
 		for (i = 0; i < soc->nwake_names; i++) {
 			u32 n = soc->wake_names[i].id;
@@ -141,7 +147,25 @@ static void apple_sleep_test_wake_names(struct kunit *test)
 	}
 }
 
+static void apple_sleep_test_t6050(struct kunit *test)
+{
+	u32 request = 0xa5a5;
+
+	KUNIT_EXPECT_EQ(test, t6050_sleep_plan_complex_request(0xf, &request), 0);
+	KUNIT_EXPECT_EQ(test, request, 0U);
+	KUNIT_EXPECT_EQ(test, t6050_sleep_plan_complex_request(0x2f, &request), 0);
+	KUNIT_EXPECT_EQ(test, request, 0x20U);
+	KUNIT_EXPECT_EQ(test, t6050_sleep_plan_complex_request(0x3f, &request), -EOPNOTSUPP);
+	KUNIT_EXPECT_EQ(test, request, 0x20U);
+	KUNIT_EXPECT_NOT_NULL(test, t6050_sleep_soc.ops->commit_regs);
+	KUNIT_EXPECT_NOT_NULL(test, t6050_sleep_soc.ops->display_off);
+	KUNIT_EXPECT_EQ(test, sleep_region_validate(t6050_sleep_soc.regions), 0);
+	KUNIT_EXPECT_EQ(test, t6050_sleep_soc.cpu_cluster_affinity, 1U);
+	KUNIT_EXPECT_EQ(test, t6050_sleep_soc.cpu_start_stride, 6U);
+}
+
 static struct kunit_case apple_sleep_test_cases[] = {
+	KUNIT_CASE(apple_sleep_test_t6050),
 	KUNIT_CASE(apple_sleep_test_only_tested),
 	KUNIT_CASE(apple_sleep_test_words),
 	KUNIT_CASE(apple_sleep_test_books),

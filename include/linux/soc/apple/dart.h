@@ -162,6 +162,8 @@ int apple_dart_fw_remote(struct device *dev, dma_addr_t iova, bool write, phys_a
  */
 int apple_dart_set_host_resumes(struct device *dev);
 int apple_dart_host_resume(struct device *dev);
+/* The same after a sleep entry that stopped its streams: always the whole reset and restore. */
+int apple_dart_host_restart(struct device *dev);
 #else
 static inline int apple_dart_quiesce_commands(struct device *dev) { return 0; }
 static inline int apple_dart_resume_commands(struct device *dev) { return 0; }
@@ -175,6 +177,7 @@ static inline int apple_dart_fw_remote(struct device *dev, dma_addr_t iova, bool
 }
 static inline int apple_dart_set_host_resumes(struct device *dev) { return -EOPNOTSUPP; }
 static inline int apple_dart_host_resume(struct device *dev) { return -EOPNOTSUPP; }
+static inline int apple_dart_host_restart(struct device *dev) { return -EOPNOTSUPP; }
 #endif
 
 /* For a consumer whose firmware gates itself around a firmware-driven suspend. */
@@ -189,6 +192,7 @@ int apple_dart_gapf_ready(struct device *dev);
 /* A display DART whose domain goes off at runtime while others still map into it. */
 void apple_dart_power_dark(struct device *dev, bool dark);
 /* A DART's state kept across its consumer's own power cycle, outside a system sleep. */
+int apple_dart_m5_restore(struct device *dev, struct device *owner);
 int apple_dart_state_save(struct device *dev);
 int apple_dart_state_restore(struct device *dev);
 void apple_dart_sleep_restore_lost(struct device *dev, bool lost);
@@ -220,6 +224,11 @@ static inline int apple_dart_gapf_ready(struct device *dev)
 
 static inline void apple_dart_power_dark(struct device *dev, bool dark)
 {
+}
+
+static inline int apple_dart_m5_restore(struct device *dev, struct device *owner)
+{
+	return -EOPNOTSUPP;
 }
 
 static inline int apple_dart_state_save(struct device *dev)
