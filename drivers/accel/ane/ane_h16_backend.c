@@ -745,6 +745,7 @@ static int ane_h16_pm_event(struct notifier_block *nb, unsigned long event, void
 	struct ane_h16_device *h = container_of(nb, struct ane_h16_device, pm_notifier);
 	bool pinned = READ_ONCE(h->pinned);
 
+	event = ane_fw_sleep_dry_run_event(event);
 	/* Without a sleep path on this platform, every sleep is refused as before. */
 	if (!h->boot.soc->sleep_warm && !h->boot.soc->sleep_cold) {
 		if (ane_fw_sleep_refused(event, pinned))

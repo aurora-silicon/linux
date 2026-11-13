@@ -1198,6 +1198,7 @@ static int ane_fw_pm_event(struct notifier_block *nb, unsigned long event, void 
 	struct ane_fw_backend *b = container_of(nb, struct ane_fw_backend, pm_notifier);
 	bool retained = READ_ONCE(b->retained);
 
+	event = ane_fw_sleep_dry_run_event(event);
 	if (event == PM_POST_SUSPEND) {
 		ane_fw_sleep_resume(b);
 		WRITE_ONCE(b->in_sleep, false);
