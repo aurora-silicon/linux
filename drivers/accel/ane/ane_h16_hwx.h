@@ -16,6 +16,8 @@
 /* __bss, four surfaces, __text, __const and the kernel sections. */
 #define ANE_H16_SECTIONS (7 + ANE_H16_KERNEL_SEGMENTS)
 #define ANE_H16_REGIONS 7
+/* Surface names with their terminator, as a buffer reference holds them. */
+#define ANE_H16_NAME_MAX 32
 #define ANE_H16_SEGMENT_MAX SZ_1G
 #define ANE_H16_HWX_MAX (ANE_H16_SEGMENT_MAX + SZ_1M)
 /* Mach-O CPU subtypes of the two targets that share this container form. */
@@ -37,7 +39,7 @@ struct ane_h16_hwx_surface {
 	u64 span;
 	u32 direction;
 	u32 symbol_offset;
-	char name[8];
+	char name[ANE_H16_NAME_MAX];
 };
 
 enum ane_h16_region_kind {

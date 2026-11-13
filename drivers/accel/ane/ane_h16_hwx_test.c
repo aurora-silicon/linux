@@ -252,6 +252,48 @@ static void hwx_surface_order_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
 }
 
+/*
+ * Names longer than 7 bytes travel in 0x28-byte buffer references; the
+ * reference, the tensor and the symbol must still agree on the whole name.
+ */
+static void hwx_long_names_test(struct kunit *test)
+{
+	const struct hwx_fixture_options o = { .long_names = true };
+	struct hwx_fixture *f = fixture_create_options(test, &o);
+	struct ane_h16_hwx info;
+	u8 *ref;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+	KUNIT_EXPECT_STREQ(test, info.surfaces[0].name, "input_features");
+	KUNIT_EXPECT_STREQ(test, info.surfaces[1].name, "encoder_hidden");
+	ref = fixture_ref(f, 1);
+	KUNIT_ASSERT_NOT_NULL(test, ref);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(ref + 4), 0x28U);
+	/* A prefix of the tensor's name is a different name. */
+	ref[0x18 + 7] = 0;
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	ref[0x18 + 7] = 'r';
+	/* The name is terminated inside the reference, padding zero. */
+	memset(ref + 0x18, 'n', 16);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	memset(ref + 0x18, 0, 16);
+	strscpy(ref + 0x18, "encoder_hidden", 16);
+	ref[0x18 + 15] = 'x';
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	ref[0x18 + 15] = 0;
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+	/* Reference lengths: at least 32 bytes, at most a 32-byte name field. */
+	put_unaligned_le32(0x18 + ANE_H16_NAME_MAX + 8, ref + 4);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	put_unaligned_le32(0x28, ref + 4);
+	f = fixture_create(test, false, false);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	ref = fixture_ref(f, 0);
+	put_unaligned_le32(24, ref + 4);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+}
+
 static void hwx_program_test(struct kunit *test)
 {
 	static const u32 fields[] = {
@@ -1024,6 +1066,7 @@ static struct kunit_case hwx_cases[] = {
 	KUNIT_CASE(hwx_note_test),
 	KUNIT_CASE(hwx_tensor_test),
 	KUNIT_CASE(hwx_surface_order_test),
+	KUNIT_CASE(hwx_long_names_test),
 	KUNIT_CASE(hwx_program_test),
 	KUNIT_CASE(hwx_staged_counts_test),
 	KUNIT_CASE(hwx_final_task_end_test),

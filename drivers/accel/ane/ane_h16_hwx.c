@@ -394,23 +394,29 @@ static int hwx_program(struct hwx_parser *p)
  * Buffer references follow the surface segments, but tensor descriptors list
  * the inputs before the output, so the add-128 HWX describes segments x, y, z
  * with tensors x, z, y. Pair each surface with the one tensor whose short name
- * is the name its buffer reference gives.
+ * is the name its buffer reference gives. The reference holds the name in the
+ * rest of the command after +0x18: 8 bytes in a 32-byte command, 16 in the
+ * 0x28-byte commands that longer names ("encoder_hidden") take.
  */
+static size_t hwx_ref_name(const u8 *ref)
+{
+	return strnlen(ref + 0x18, get_unaligned_le32(ref + 4) - 0x18);
+}
+
 static int hwx_tensor_for(struct hwx_parser *p, u32 index, u32 *used)
 {
 	const u8 *ref = p->bytes + p->refs[index];
+	size_t name = hwx_ref_name(ref);
 	u32 i, match = ANE_H16_SURFACES;
 
 	for (i = 0; i < p->tensor_count; i++) {
 		const u8 *c = p->bytes + p->tensors[i];
 		u32 length = get_unaligned_le32(c + 4), shortoff = get_unaligned_le32(c + 0x7c);
-		size_t room;
 
 		if (shortoff >= length)
 			return -ENOEXEC;
-		room = min_t(size_t, length - shortoff, 8);
-		if (strnlen(c + shortoff, room) == room ||
-		    strncmp(c + shortoff, ref + 0x18, 8))
+		if (strnlen(c + shortoff, length - shortoff) != name ||
+		    memcmp(c + shortoff, ref + 0x18, name))
 			continue;
 		if (match != ANE_H16_SURFACES || (*used & BIT(i)))
 			return -ENOEXEC;
@@ -473,7 +479,9 @@ static int hwx_tensor(struct hwx_parser *p, u32 index, u32 tensor)
 	b->symbol_offset = p->tensors[tensor] + 0xd3d;
 	if (get_unaligned_le64(ref + 8) != 0x18 ||
 	    get_unaligned_le64(ref + 0x10) != b->section.vm ||
-	    memcmp(ref + 0x18, b->name, sizeof(b->name)))
+	    hwx_ref_name(ref) != short_length ||
+	    memcmp(ref + 0x18, b->name, short_length) ||
+	    !hwx_zero(ref, 0x18 + short_length, get_unaligned_le32(ref + 4)))
 		return -ENOEXEC;
 	for (i = 0; i < index; i++)
 		if (!strcmp(b->name, p->info.surfaces[i].name) ||
@@ -671,7 +679,10 @@ int ane_h16_hwx_validate(const void *bytes, size_t size, struct ane_h16_hwx *inf
 			}
 			break;
 		case 0x40:
-			if (len != 32 || p->ref_count == ANE_H16_SURFACES)
+			/* A terminated name fills the command after +0x18. */
+			if (len < 32 || len > 0x18 + ANE_H16_NAME_MAX ||
+			    p->ref_count == ANE_H16_SURFACES ||
+			    strnlen(c + 0x18, len - 0x18) == len - 0x18)
 				goto invalid;
 			p->refs[p->ref_count++] = pos;
 			break;

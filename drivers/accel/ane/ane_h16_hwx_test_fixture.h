@@ -27,6 +27,8 @@ struct hwx_fixture_options {
 	 * section the single relocation names.
 	 */
 	u32 kernels, reloc_kernel;
+	/* Surface names longer than 7 bytes: 0x28-byte buffer references. */
+	bool long_names;
 };
 
 static u8 *fixture_command(struct hwx_fixture *f, u32 command, u32 length)
@@ -80,8 +82,13 @@ fixture_create_options(struct kunit *test, const struct hwx_fixture_options *o)
 	u64 text = surface + 2 * SZ_16K, kern = text + SZ_32K;
 	u32 i, strings_length = 1;
 	u8 *c, *s, *text_section;
-	static const char * const names[] = { "in", "out" };
-	static const char * const symbols[] = { "input", "output" };
+	static const char * const short_names[] = { "in", "out" };
+	static const char * const short_symbols[] = { "input", "output" };
+	static const char * const long_names[] = { "input_features", "encoder_hidden" };
+	static const char * const long_symbols[] = { "input_features", "encoder_hidden@output" };
+	const char * const *names = o->long_names ? long_names : short_names;
+	const char * const *symbols = o->long_names ? long_symbols : short_symbols;
+	u32 ref_length = o->long_names ? 0x28 : 32;
 
 	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
 	if (!f)
@@ -122,10 +129,10 @@ fixture_create_options(struct kunit *test, const struct hwx_fixture_options *o)
 				SZ_32K + SZ_16K + k * SZ_16K, 6, 0x26);
 	}
 	for (i = 0; i < 2; i++) {
-		c = fixture_command(f, 0x40, 32);
+		c = fixture_command(f, 0x40, ref_length);
 		put_unaligned_le64(0x18, c + 8);
 		put_unaligned_le64(surface + i * SZ_16K, c + 0x10);
-		strscpy(c + 0x18, names[i], 8);
+		strscpy(c + 0x18, names[i], ref_length - 0x18);
 	}
 	f->program = f->cursor;
 	c = fixture_command(f, 4, mixed ? 0x8c0 : 0x8a0);
@@ -170,7 +177,8 @@ fixture_create_options(struct kunit *test, const struct hwx_fixture_options *o)
 		u32 shortoff = 0xd3d + strlen(symbols[i]) + 1;
 
 		f->tensor[i] = f->cursor;
-		c = fixture_command(f, 4, 0xd48);
+		c = fixture_command(f, 4, max_t(u32, 0xd48,
+						ALIGN(shortoff + strlen(names[i]) + 1, 8)));
 		put_unaligned_le32(3, c + 8);
 		put_unaligned_le32(0x34a, c + 0xc);
 		put_unaligned_le32(3, c + 0x10);
