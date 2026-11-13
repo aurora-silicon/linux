@@ -361,9 +361,13 @@ pub(crate) trait Gpu: Send + Sync {
     fn queue_limits(&self) -> Option<uapi::drm_asahi_queue_limits> {
         None
     }
+    /// GET_PARAMS feature bits that only this backend implements.
+    fn backend_feature_flags(&self) -> u64 {
+        0
+    }
     /// Shared GET_PARAMS additions, using this backend's feature-number assignments.
     fn feature_flags(&self) -> u64 {
-        let mut flags = 0;
+        let mut flags = self.backend_feature_flags();
         if self.supports_vm_status() {
             flags |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS)
                 | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS_MIRROR);
@@ -1473,6 +1477,12 @@ extern "C" {
 
 #[versions(AGX)]
 impl Gpu for GpuManager::ver {
+    /// Render commands may order their dependencies on earlier renders after
+    /// their vertex half only (DRM_ASAHI_RENDER_FRAGMENT_BARRIERS).
+    fn backend_feature_flags(&self) -> u64 {
+        u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)
+    }
+
     /// A light submission completes in tens of microseconds, so its submitter
     /// sleeps briefly between submissions and the CPU scheduler places and
     /// clocks it like idle work: on G13/G14 a single client then spends more

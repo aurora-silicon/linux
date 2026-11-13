@@ -203,7 +203,8 @@ impl super::QueueInner::ver {
             & !(uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_VERTEX_SCRATCH
                 | uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES
                 | uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_NO_VERTEX_CLUSTERING
-                | uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT)
+                | uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT
+                | uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRAGMENT_BARRIERS)
             != 0
         {
             cls_pr_debug!(Errors, "Invalid flags ({:#x})\n", cmdbuf.flags);
