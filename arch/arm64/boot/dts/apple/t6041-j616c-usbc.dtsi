@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * USB-C DisplayPort on the J616c's left-front port (typec1): dcpext1, the
- * ATC1 display crossbar and atcphy1 in DP alt mode, driven by hpm1.
+ * USB-C DisplayPort on the J614c's and J616c's three USB-C ports (typec0-2):
+ * dcpext1, the ATC0-2 display crossbars and atcphy0-2 in DP alt mode, driven
+ * by hpm0-2, as dcpext1 on the M4 Pro (t6040-j616s-extdisp-usbc.dtsi).
  *
- * dcpext1, its DARTs, mailbox, crossbar and Type-C route are disabled, as
+ * dcpext1, its DARTs, mailbox, crossbars and Type-C routes are disabled, as
  * for HDMI: the display gate enables them once the boot loader has filled
- * dcpext1's firmware memory. A disabled route is no mode switch, so typec1
- * then keeps USB and PD as before.
+ * dcpext1's firmware memory. A disabled route is no mode switch, so the ports
+ * then keep USB and PD as before.
  */
 
 / {
@@ -45,11 +46,11 @@
 &dcpext1 {
 	apple,iomfb-surfaces = <1 1 0 0>;
 	apple,connector-type = "USB-C";
-	phys = <&atcphy1 PHY_TYPE_DP>;
-	phy-names = "typec1";
-	mux-controls = <&atcphy1_xbar 0>;
-	mux-control-names = "typec1";
-	/* indexed by route */
+	phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>, <&atcphy2 PHY_TYPE_DP>;
+	phy-names = "typec0", "typec1", "typec2";
+	mux-controls = <&atcphy0_xbar 0>, <&atcphy1_xbar 0>, <&atcphy2_xbar 0>;
+	mux-control-names = "typec0", "typec1", "typec2";
+	/* indexed by route; dcpext1 ufp 1 port 0 = crossbar state 2, as on the M4 Pro */
 	apple,typec-dptx-phys = <0 1 2>;
 	apple,typec-mux-indices = <2 2 2>;
 	memory-region = <&dcpext1_text>, <&dcpext1_data>, <&dcpext1_heap>;
@@ -58,6 +59,18 @@
 	typec-routes {
 		#address-cells = <1>;
 		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext1_typec0: endpoint {
+					remote-endpoint = <&typec0_dcpext1>;
+				};
+			};
+		};
 
 		route@1 {
 			reg = <1>;
@@ -68,6 +81,29 @@
 				dcpext1_typec1: endpoint {
 					remote-endpoint = <&typec1_dcpext1>;
 				};
+			};
+		};
+
+		route@2 {
+			reg = <2>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext1_typec2: endpoint {
+					remote-endpoint = <&typec2_dcpext1>;
+				};
+			};
+		};
+	};
+};
+
+&typec0 {
+	ports {
+		port@3 {
+			reg = <3>;
+			typec0_dcpext1: endpoint {
+				remote-endpoint = <&dcpext1_typec0>;
 			};
 		};
 	};
@@ -84,7 +120,28 @@
 	};
 };
 
+&typec2 {
+	ports {
+		port@3 {
+			reg = <3>;
+			typec2_dcpext1: endpoint {
+				remote-endpoint = <&dcpext1_typec2>;
+			};
+		};
+	};
+};
+
+&atcphy0 {
+	mode-switch;
+	orientation-switch;
+};
+
 &atcphy1 {
+	mode-switch;
+	orientation-switch;
+};
+
+&atcphy2 {
 	mode-switch;
 	orientation-switch;
 };
