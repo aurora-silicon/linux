@@ -181,8 +181,8 @@ impl ApplicationJob {
         }
         let expected=self.job.encoded.as_ref().ok_or(EINVAL)?.digests;
         self.job.graph.with_bytes_mut(|out| {
-            if crate::g18::fw::graphics_payload::fnv64(&out[..cmd::G18_TA_COMMAND_BYTES])!=expected[0]
-                || crate::g18::fw::graphics_payload::fnv64(&out[0x4000..0x4000+cmd::G18_3D_COMMAND_BYTES])!=expected[1] {return Err(EIO);}Ok(())
+            if crate::g18::fw::graphics_payload::fnv64_uncached(&out[..cmd::G18_TA_COMMAND_BYTES])!=expected[0]
+                || crate::g18::fw::graphics_payload::fnv64_uncached(&out[0x4000..0x4000+cmd::G18_3D_COMMAND_BYTES])!=expected[1] {return Err(EIO);}Ok(())
         })?;
         if frame.generation<=3 {
             for (name,digest) in assembly::DIGEST_NAMES.iter().zip(expected) {

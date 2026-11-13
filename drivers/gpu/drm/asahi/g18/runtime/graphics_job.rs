@@ -303,11 +303,19 @@ impl G18GraphicsJob {
         // zero is valid for every field. Initialize the allocation in place.
         unsafe { core::ptr::write_bytes(workspace.as_mut_ptr(), 0, 1); }
         let mut workspace = unsafe { workspace.assume_init() };
-        let encoded = self.graph.with_bytes_mut(|bytes| {
+        // Encode in cached memory and copy the commands to the write-combined
+        // graph at once: the encoder and its digests read what they write.
+        let mut commands = KVec::from_elem(0u8, cmd::G18_TA_COMMAND_BYTES + cmd::G18_3D_COMMAND_BYTES,
+            GFP_KERNEL)?;
+        let (ta, fragment) = commands.split_at_mut(cmd::G18_TA_COMMAND_BYTES);
+        let encoded = assembly::encode_into(ta.try_into().map_err(|_| EINVAL)?,
+            fragment.try_into().map_err(|_| EINVAL)?,
+            &self.parameters, &self.controls, inputs, &mut workspace).map_err(|_| EINVAL)?;
+        self.graph.with_bytes_mut(|bytes| {
             let (ta_page, rest) = bytes.split_at_mut(assembly::FRAGMENT_OFFSET);
-            assembly::encode_into((&mut ta_page[..cmd::G18_TA_COMMAND_BYTES]).try_into().map_err(|_| EINVAL)?,
-                (&mut rest[..cmd::G18_3D_COMMAND_BYTES]).try_into().map_err(|_| EINVAL)?,
-                &self.parameters, &self.controls, inputs, &mut workspace).map_err(|_| EINVAL)
+            ta_page[..cmd::G18_TA_COMMAND_BYTES].copy_from_slice(ta);
+            rest[..cmd::G18_3D_COMMAND_BYTES].copy_from_slice(fragment);
+            Ok(())
         })?;
         self.encoded = Some(encoded);
         fence(Ordering::SeqCst);
