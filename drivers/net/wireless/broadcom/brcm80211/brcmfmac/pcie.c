@@ -3370,6 +3370,7 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 	struct brcmf_pciedev_info *devinfo;
 	struct brcmf_bus *bus;
 	struct brcmf_if *ifp;
+	bool wowl;
 	int ifidx;
 
 	brcmf_dbg(PCIE, "Enter\n");
@@ -3377,11 +3378,15 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 	bus = dev_get_drvdata(dev);
 	devinfo = bus->bus_priv.pcie->devinfo;
 
-	if (devinfo->wowl_irq && devinfo->wowl_enabled &&
-	    !device_may_wakeup(dev))
+	/*
+	 * Hibernation keeps pm_suspend_target_state at PM_SUSPEND_ON and
+	 * cannot wake on a packet, so it takes the plain D3 path.
+	 */
+	wowl = devinfo->wowl_irq && devinfo->wowl_enabled &&
+	       pm_suspend_target_state != PM_SUSPEND_ON;
+	if (wowl && !device_may_wakeup(dev))
 		return -EINVAL;
-	if (devinfo->wowl_irq && devinfo->wowl_enabled &&
-	    pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
+	if (wowl && pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
 		return -EOPNOTSUPP;
 
 	/* Stop new packets and drain ndo_start_xmit before taking the bus down.
@@ -3398,7 +3403,7 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 	brcmf_pcie_fwcon_timer(devinfo, false);
 	brcmf_bus_change_state(bus, BRCMF_BUS_DOWN);
 
-	if (devinfo->wowl_irq && devinfo->wowl_enabled)
+	if (wowl)
 		return brcmf_pcie_wowl_sleep(dev);
 
 	if (devinfo->fwseed && pm_suspend_target_state == PM_SUSPEND_TO_IDLE)

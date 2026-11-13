@@ -18,6 +18,23 @@
  * front, before any device suspends. Without retained firmware nothing is
  * refused.
  */
+/*
+ * A hibernation pm_test dry run, the only hibernation that reaches the
+ * notifiers while hibernation_available() is false, makes no image and keeps
+ * the power on. A backend that cycles the engine handles it as a suspend:
+ * the engine is powered off for the freeze and booted again afterwards.
+ */
+static inline unsigned long ane_fw_sleep_dry_run_event(unsigned long event)
+{
+	if (hibernation_available())
+		return event;
+	if (event == PM_HIBERNATION_PREPARE)
+		return PM_SUSPEND_PREPARE;
+	if (event == PM_POST_HIBERNATION)
+		return PM_POST_SUSPEND;
+	return event;
+}
+
 static inline bool ane_fw_sleep_refused_cycle(unsigned long event, bool retained, bool cycles)
 {
 	if (!retained)

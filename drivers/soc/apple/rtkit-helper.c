@@ -535,8 +535,12 @@ static int __maybe_unused apple_rtkit_helper_freeze(struct device *dev)
 {
 	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
 
-	/* A hibernation image cannot recreate the firmware's live DMA ownership. */
-	return helper->adopted ? -EBUSY : 0;
+	/*
+	 * A hibernation image cannot recreate the firmware's live DMA ownership.
+	 * Without hibernation_available() only pm_test dry runs get here: the
+	 * session stays live and nothing needs undoing.
+	 */
+	return helper->adopted && hibernation_available() ? -EBUSY : 0;
 }
 
 static const struct dev_pm_ops apple_rtkit_helper_pm_ops = {
