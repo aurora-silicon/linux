@@ -2,6 +2,8 @@
 #ifndef _LINUX_SOC_APPLE_DISPLAY_H_
 #define _LINUX_SOC_APPLE_DISPLAY_H_
 
+#include <linux/errno.h>
+#include <linux/kconfig.h>
 #include <linux/of.h>
 #include <linux/string.h>
 #include <linux/types.h>
@@ -45,5 +47,20 @@ static inline bool apple_t6041_dcpext_v27_2(const struct device_node *np)
 {
 	return apple_t6041_dcp_any_v27_2(np, "apple,t6041-dcpext");
 }
+
+/*
+ * Software camera indicator (interim, not the secure indicator): a
+ * kernel-owned overlay on the internal panel, requested best-effort by the
+ * camera driver. set(true) returns 0 once a present carried it to the panel;
+ * the camera streams regardless of the answer.
+ */
+#if IS_ENABLED(CONFIG_DRM_APPLE)
+int apple_dcp_camera_indicator_set(struct device *dcp, bool on);
+#else
+static inline int apple_dcp_camera_indicator_set(struct device *dcp, bool on)
+{
+	return -ENODEV;
+}
+#endif
 
 #endif
