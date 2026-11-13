@@ -100,11 +100,20 @@ static ssize_t agx_qualified_stats_show(struct asahi_stats_attribute *stats, cha
 		n += sysfs_emit_at(buf, n, "pstate %u\n", snap.pstate);
 	else
 		n += sysfs_emit_at(buf, n, "pstate unsupported\n");
-	/* No A/B selector, packet duration, measured power or temperature. */
-	n += sysfs_emit_at(buf, n, "requested_frequency_hz unsupported\n"
-			   "achieved_frequency_hz unsupported\n"
-			   "busy_ns unsupported\n"
-			   "power_mw unsupported\n"
+	/* No A/B selector, measured power or temperature. */
+	n += sysfs_emit_at(buf, n, "requested_frequency_hz unsupported\n");
+	/* M5 reports the state the GPU runs at: its frequency is the achieved one. */
+	if (snap.pstate_status == 1 && snap.achieved_frequency_hz)
+		n += sysfs_emit_at(buf, n, "achieved_frequency_hz %llu\n",
+				   (unsigned long long)snap.achieved_frequency_hz);
+	else
+		n += sysfs_emit_at(buf, n, "achieved_frequency_hz unsupported\n");
+	if (snap.busy_status == 1)
+		n += sysfs_emit_at(buf, n, "busy_ns %llu\n",
+				   (unsigned long long)snap.busy_ns);
+	else
+		n += sysfs_emit_at(buf, n, "busy_ns unsupported\n");
+	n += sysfs_emit_at(buf, n, "power_mw unsupported\n"
 			   "temperature_raw unsupported\n");
 	n += sysfs_emit_at(buf, n, "utilisation_source firmware-statistics-tag-0x13\n"
 			   "utilisation_samples %llu\n"
@@ -232,7 +241,8 @@ int asahi_sysfs_register(struct device *dev, const void *snapshot,
 		return -ENODEV;
 
 	BUILD_BUG_ON(offsetof(struct asahi_qualified_stats, util_host_ns) != 24);
-	BUILD_BUG_ON(sizeof(struct asahi_qualified_stats) != 56);
+	BUILD_BUG_ON(offsetof(struct asahi_qualified_stats, busy_ns) != 56);
+	BUILD_BUG_ON(sizeof(struct asahi_qualified_stats) != 80);
 	BUILD_BUG_ON(offsetof(struct asahi_gpu_memory, refused) != 24);
 	BUILD_BUG_ON(offsetof(struct asahi_gpu_memory, client_limit) != 40);
 	BUILD_BUG_ON(offsetof(struct asahi_gpu_memory, user_kept) != 48);
