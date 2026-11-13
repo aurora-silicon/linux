@@ -212,11 +212,12 @@ static_assert(APPLE_ASCWRAP_V6_MBOX_OFFSET + APPLE_ASC_MBOX_I2A_RECV0 ==
 #define APPLE_G17_MBOX_RX_BUDGET 64
 #define APPLE_G17_MBOX_ATOMIC_TX_US 1000
 /*
- * T6050 poll-only receive: every send arms an hrtimer that polls the receive
- * FIFO at this period, kept for this long after the last message or send. A
- * GPU reply lands within one 0.22 ms frame; polling every 25 us bounds the
- * added receive latency to ~11% of a frame instead of one 4 ms jiffy, while
- * idle receive stays on the jiffy poller.
+ * T6050 receive until the recv-not-empty interrupt has delivered a message:
+ * every send arms an hrtimer that polls the receive FIFO at this period, kept
+ * for this long after the last message or send. A GPU reply lands within one
+ * 0.22 ms frame; polling every 25 us bounds the added receive latency to ~11%
+ * of a frame instead of one 4 ms jiffy, while idle receive stays on the jiffy
+ * poller.
  */
 #define APPLE_MBOX_RX_FAST_POLL_US 25
 #define APPLE_MBOX_RX_FAST_GRACE_US 1000
@@ -236,8 +237,12 @@ struct apple_mbox_hw {
 	unsigned int num_ascwrap_v6_roles;
 	/* T8152 GPU ASCWrap v8: wrapper + iop-vbar + post-office window + PSD. */
 	bool is_ascwrap_v8;
-	/* The mailbox interrupt never reaches the AIC: receive by polling. */
-	bool rx_poll_only;
+	/*
+	 * The recv-not-empty interrupt does not reach the AIC on every board:
+	 * enable it, and also receive by polling until it delivers a message.
+	 * The jiffy poller keeps running after that as a watchdog.
+	 */
+	bool rx_poll_until_irq;
 	/* Status word counts RX occupancy and free TX slots; paired transfers. */
 	bool counted_fifo;
 	bool ap_initializes_mailboxes;
@@ -275,6 +280,13 @@ struct apple_mbox_priv {
 	bool rx_poll_only;
 	/* rx_lock: recv interrupt enabled and not yet disabled again. */
 	bool rx_irq_live;
+	/*
+	 * rx_lock, read lock-free by the send path: the live recv interrupt
+	 * delivered a message, so fast receive polling stops. Only set while
+	 * rx_irq_live, and cleared with it, or when the jiffy poller finds a
+	 * message the interrupt did not deliver.
+	 */
+	bool rx_irq_proven;
 	/* rx_lock: consecutive recv interrupts that drained nothing. */
 	unsigned int rx_irq_empty_run;
 	/* rx_lock: an unpowered-PSD receive skip was logged this activation. */
@@ -293,7 +305,7 @@ static struct apple_mbox_priv *apple_mbox_to_priv(struct apple_mbox *mbox)
 /* Only providers allocated by apple_mbox_probe() have a receive poller. */
 static bool apple_mbox_has_rx_poller(const struct apple_mbox *mbox)
 {
-	return mbox->hw->is_ascwrap_v8 || mbox->hw->rx_poll_only;
+	return mbox->hw->is_ascwrap_v8 || mbox->hw->rx_poll_until_irq;
 }
 
 /* Both ASCWrap generations share the consumer lifecycle API below. */
@@ -666,11 +678,10 @@ static struct apple_mbox_msg apple_mbox_read_msg(struct apple_mbox *mbox)
 static int apple_mbox_poll_locked(struct apple_mbox *mbox);
 
 /*
- * Fast receive tick for rx_poll_only mailboxes (T6050): the same receive
+ * Fast receive tick for rx_poll_until_irq mailboxes (T6050): the same receive
  * step apple_mbox_v8_rx_poll_work() runs, under the same rx_lock, with
- * apple_mbox_poll_locked() doing the same PSD and removal checks. The v8
- * storm guard does not apply: it guards the recv-not-empty IRQ line, which
- * rx_poll_only hardware never enables. Runs in hardirq context.
+ * apple_mbox_poll_locked() doing the same removal checks. It stops while the
+ * recv interrupt is proven. Runs in hardirq context.
  */
 static enum hrtimer_restart apple_mbox_fast_rx_poll(struct hrtimer *timer)
 {
@@ -680,6 +691,7 @@ static enum hrtimer_restart apple_mbox_fast_rx_poll(struct hrtimer *timer)
 	unsigned long flags;
 	ktime_t now;
 	int consumed = 0;
+	bool proven;
 
 	if (!READ_ONCE(mbox->active) || READ_ONCE(mbox->removing))
 		return HRTIMER_NORESTART;
@@ -687,7 +699,12 @@ static enum hrtimer_restart apple_mbox_fast_rx_poll(struct hrtimer *timer)
 	spin_lock_irqsave(&mbox->rx_lock, flags);
 	if (likely(!READ_ONCE(mbox->removing)))
 		consumed = apple_mbox_poll_locked(mbox);
+	proven = priv->rx_irq_proven;
 	spin_unlock_irqrestore(&mbox->rx_lock, flags);
+
+	/* The interrupt receives (see apple_mbox_rx_irq_guard()). */
+	if (proven)
+		return HRTIMER_NORESTART;
 
 	now = ktime_get();
 	if (consumed > 0) {
@@ -708,10 +725,13 @@ static enum hrtimer_restart apple_mbox_fast_rx_poll(struct hrtimer *timer)
  * tx_lock under rx_lock. Kick never touches rx_lock, so no ordering exists
  * to invert. A kick that loses a race with the timer's final no-restart
  * decision leaves the fast poller disarmed once; the next jiffy poll or
- * send recovers it.
+ * send recovers it. A stale rx_irq_proven costs at most one fast-poll
+ * burst, or one reply left to the jiffy poller.
  */
 static void apple_mbox_fast_rx_kick(struct apple_mbox_priv *priv)
 {
+	if (READ_ONCE(priv->rx_irq_proven))
+		return;
 	WRITE_ONCE(priv->rx_fast_until,
 		   ktime_add_us(ktime_get(), APPLE_MBOX_RX_FAST_GRACE_US));
 	/* Publish the deadline before deciding to arm. */
@@ -755,9 +775,10 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 		}
 		remaining = deadline - now;
 		if (!atomic && apple_mbox_has_rx_poller(mbox) &&
-		    apple_mbox_to_priv(mbox)->rx_poll_only) {
+		    (mbox->hw->rx_poll_until_irq ||
+		     apple_mbox_to_priv(mbox)->rx_poll_only)) {
 			/*
-			 * Poll-only v8: never enable the send-empty line.
+			 * Poll-only v8, or T6050: never enable the send-empty line.
 			 * Sleep-poll the TX status, touching MMIO only under
 			 * tx_lock so that removal cannot unmap it underneath.
 			 */
@@ -846,7 +867,7 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 	apple_mbox_write_msg(mbox, msg);
 
 	/* The reply may be back well within a jiffy: fast-poll for it. */
-	if (mbox->hw->rx_poll_only)
+	if (mbox->hw->rx_poll_until_irq)
 		apple_mbox_fast_rx_kick(apple_mbox_to_priv(mbox));
 
 	spin_unlock_irqrestore(&mbox->tx_lock, flags);
@@ -968,17 +989,32 @@ int apple_mbox_set_rx_util_min(struct apple_mbox *mbox, int util_min)
 EXPORT_SYMBOL_GPL(apple_mbox_set_rx_util_min);
 
 /*
- * ASCWrap v8 storm guard, rx_lock held. The handler cannot mask the line at
- * the mailbox (no irq controls), so a line that keeps firing with nothing to
- * read (for example a send-empty line wired as recv-not-empty) would lock up
- * the CPU while always returning IRQ_HANDLED. Cut it at the AIC and poll.
+ * Storm guard of the mailboxes with a receive poller, rx_lock held. The
+ * handler cannot mask the line at the mailbox (no irq controls), so a line
+ * that keeps firing with nothing to read (for example a send-empty line
+ * wired as recv-not-empty) would lock up the CPU while always returning
+ * IRQ_HANDLED. Cut it at the AIC and poll.
+ *
+ * A live line that delivers a message has proven itself: fast polling stops
+ * and the line receives, with the jiffy poller left as a watchdog (see
+ * apple_mbox_rx_watchdog()). It is level triggered and the G17 handler is
+ * oneshot, so a message that arrives while the handler runs fires it again.
+ * If the line later storms, the guard below cuts it and makes sure the jiffy
+ * poller runs; the next send restarts fast polling.
  */
-static void apple_mbox_v8_rx_irq_guard(struct apple_mbox *mbox, int drained)
+static void apple_mbox_rx_irq_guard(struct apple_mbox *mbox, int drained)
 {
 	struct apple_mbox_priv *priv = apple_mbox_to_priv(mbox);
 
 	if (drained > 0) {
 		priv->rx_irq_empty_run = 0;
+		if (priv->rx_irq_live && !priv->rx_irq_proven) {
+			WRITE_ONCE(priv->rx_irq_proven, true);
+			if (mbox->hw->rx_poll_until_irq)
+				dev_dbg(mbox->dev,
+					"recv-not-empty IRQ %d delivered a message; fast receive polling stopped\n",
+					mbox->irq_recv_not_empty);
+		}
 		return;
 	}
 	if (!priv->rx_irq_live ||
@@ -986,9 +1022,10 @@ static void apple_mbox_v8_rx_irq_guard(struct apple_mbox *mbox, int drained)
 		return;
 
 	priv->rx_irq_live = false;
+	WRITE_ONCE(priv->rx_irq_proven, false);
 	disable_irq_nosync(mbox->irq_recv_not_empty);
 	dev_err(mbox->dev,
-		"ASCWrap v8 recv-not-empty IRQ %d fired %u times without a message; disabled, receive falls back to polling\n",
+		"recv-not-empty IRQ %d fired %u times without a message; disabled, receive falls back to polling\n",
 		mbox->irq_recv_not_empty, priv->rx_irq_empty_run);
 	queue_delayed_work(system_highpri_wq, &priv->rx_poll_work, 0);
 }
@@ -1006,8 +1043,8 @@ static irqreturn_t apple_mbox_recv_irq(int irq, void *data)
 	spin_lock_irqsave(&mbox->rx_lock, flags);
 	if (likely(!READ_ONCE(mbox->removing)))
 		consumed = apple_mbox_poll_locked(mbox);
-	if (mbox->hw->is_ascwrap_v8)
-		apple_mbox_v8_rx_irq_guard(mbox, consumed);
+	if (apple_mbox_has_rx_poller(mbox))
+		apple_mbox_rx_irq_guard(mbox, consumed);
 	spin_unlock_irqrestore(&mbox->rx_lock, flags);
 
 	/* G17 uses a oneshot threaded IRQ. Leave it masked during this sleep
@@ -1085,17 +1122,51 @@ out:
 }
 EXPORT_SYMBOL_GPL(apple_mbox_poll_one);
 
-/* ASCWrap v8 receive poller: poll-only mode, or after the storm guard. */
+/*
+ * Watchdog after each jiffy poll, rx_lock held. On a line that delivers, the
+ * interrupt thread has drained the FIFO and the poller finds it empty. A
+ * message the poller consumed while the interrupt was proven was not
+ * delivered by the interrupt, or its thread had not run yet: either way
+ * receive goes back to fast polling on every send until the interrupt
+ * delivers a message again. All receive steps drain under rx_lock, so
+ * messages reach the consumer once and in FIFO order whichever step reads
+ * them.
+ */
+static void apple_mbox_rx_watchdog(struct apple_mbox *mbox, int consumed)
+{
+	struct apple_mbox_priv *priv = apple_mbox_to_priv(mbox);
+
+	if (consumed <= 0 || !priv->rx_irq_proven)
+		return;
+	WRITE_ONCE(priv->rx_irq_proven, false);
+	dev_dbg(mbox->dev,
+		"recv-not-empty IRQ %d left a message in the FIFO; receive polling restarted\n",
+		mbox->irq_recv_not_empty);
+}
+
+/*
+ * Receive poller: v8 poll-only mode, T6050 for as long as the mailbox is
+ * active (as a watchdog once the recv interrupt is proven), or after the
+ * storm guard.
+ */
 static void apple_mbox_v8_rx_poll_work(struct work_struct *work)
 {
 	struct apple_mbox_priv *priv = container_of(to_delayed_work(work),
 						    struct apple_mbox_priv,
 						    rx_poll_work);
 	struct apple_mbox *mbox = &priv->mbox;
+	unsigned long flags;
+	int consumed = 0;
 
 	if (!READ_ONCE(mbox->active) || READ_ONCE(mbox->removing))
 		return;
-	apple_mbox_poll(mbox);
+
+	spin_lock_irqsave(&mbox->rx_lock, flags);
+	if (likely(!READ_ONCE(mbox->removing)))
+		consumed = apple_mbox_poll_locked(mbox);
+	apple_mbox_rx_watchdog(mbox, consumed);
+	spin_unlock_irqrestore(&mbox->rx_lock, flags);
+
 	queue_delayed_work(system_highpri_wq, &priv->rx_poll_work,
 			   APPLE_ASCWRAP_V8_RX_POLL_JIFFIES);
 }
@@ -1110,11 +1181,13 @@ static void apple_mbox_v8_rx_start(struct apple_mbox *mbox)
 	priv->rx_irq_empty_run = 0;
 	priv->rx_psd_skip_logged = false;
 	priv->rx_irq_live = !priv->rx_poll_only;
+	/* Each activation proves the line again. */
+	WRITE_ONCE(priv->rx_irq_proven, false);
 	spin_unlock_irqrestore(&mbox->rx_lock, flags);
 
-	if (priv->rx_poll_only)
+	if (priv->rx_poll_only || mbox->hw->rx_poll_until_irq)
 		queue_delayed_work(system_highpri_wq, &priv->rx_poll_work, 0);
-	else
+	if (!priv->rx_poll_only)
 		enable_irq(mbox->irq_recv_not_empty);
 }
 
@@ -1133,12 +1206,13 @@ static void apple_mbox_v8_rx_stop(struct apple_mbox *mbox)
 	spin_lock_irqsave(&mbox->rx_lock, flags);
 	live = priv->rx_irq_live;
 	priv->rx_irq_live = false;
+	WRITE_ONCE(priv->rx_irq_proven, false);
 	spin_unlock_irqrestore(&mbox->rx_lock, flags);
 
 	if (live)
 		disable_irq(mbox->irq_recv_not_empty);
 	/* Same cancel-and-drain guarantee for the fast poller as below. */
-	if (mbox->hw->rx_poll_only)
+	if (mbox->hw->rx_poll_until_irq)
 		hrtimer_cancel(&priv->rx_fast_timer);
 	cancel_delayed_work_sync(&priv->rx_poll_work);
 }
@@ -1327,7 +1401,7 @@ static void apple_mbox_quiesce(void *data)
 	}
 	/* The v8 poller also stops on the removal fence; make sure it is gone. */
 	if (apple_mbox_has_rx_poller(mbox)) {
-		if (mbox->hw->rx_poll_only)
+		if (mbox->hw->rx_poll_until_irq)
 			hrtimer_cancel(&apple_mbox_to_priv(mbox)->rx_fast_timer);
 		cancel_delayed_work_sync(&apple_mbox_to_priv(mbox)->rx_poll_work);
 	}
@@ -1546,8 +1620,7 @@ static int apple_mbox_probe(struct platform_device *pdev)
 		return -EINVAL;
 	if (mbox->hw->counted_fifo && !IS_ENABLED(CONFIG_ARM64))
 		return -EOPNOTSUPP;
-	if (mbox->hw->rx_poll_only) {
-		priv->rx_poll_only = true;
+	if (mbox->hw->rx_poll_until_irq) {
 		hrtimer_setup(&priv->rx_fast_timer, apple_mbox_fast_rx_poll,
 			      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 		INIT_DELAYED_WORK(&priv->rx_poll_work, apple_mbox_v8_rx_poll_work);
@@ -1942,7 +2015,7 @@ static const struct apple_mbox_hw apple_mbox_t6050_ascwrap_v6_hw = {
 	.i2a_recv0 = APPLE_ASC_MBOX_I2A_RECV0,
 	.i2a_recv1 = APPLE_ASC_MBOX_I2A_RECV1,
 	.has_irq_controls = false,
-	.rx_poll_only = true,
+	.rx_poll_until_irq = true,
 };
 
 static const struct apple_mbox_hw apple_mbox_t6050_j775d_ascwrap_v6_hw = {
@@ -1959,7 +2032,7 @@ static const struct apple_mbox_hw apple_mbox_t6050_j775d_ascwrap_v6_hw = {
 	.i2a_recv0 = APPLE_ASC_MBOX_I2A_RECV0,
 	.i2a_recv1 = APPLE_ASC_MBOX_I2A_RECV1,
 	.has_irq_controls = false,
-	.rx_poll_only = true,
+	.rx_poll_until_irq = true,
 };
 
 /*
