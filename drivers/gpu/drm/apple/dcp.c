@@ -10323,77 +10323,57 @@ static void dcp_hib_wait_commits(struct drm_crtc *crtc)
 	drm_crtc_commit_put(commit);
 }
 
-/*
- * Power the pipe on and commit the current state of the CRTC with a mode
- * set and its planes: the firmware gets the mode and the frame, and the
- * compositor's next flip goes to the new session.  A CRTC switched off by
- * soft DPMS gets the pipe back with the backlight off; its enable sets the
- * mode.
- */
-static int dcp_hib_recommit(struct apple_dcp *dcp)
+/* Power the pipe on for the recommit; -EIO when the firmware did not take it. */
+static int dcp_hib_recommit_power(struct apple_dcp *dcp)
 {
-	struct apple_crtc *acrtc = READ_ONCE(dcp->crtc);
-	struct drm_modeset_acquire_ctx ctx;
-	struct drm_atomic_commit *state;
-	struct drm_crtc_state *cs;
-	struct drm_crtc *crtc;
-	bool powered = false;
+	iomfb_poweron_v26_6_desktop(dcp);
+	if (READ_ONCE(dcp->crashed) || dcp->desktop->poweron_result)
+		return -EIO;
+	return 0;
+}
+
+/* The CRTC is off: the pipe comes back, or waits for the enable. */
+static int dcp_hib_recommit_inactive(struct apple_dcp *dcp)
+{
 	int ret;
 
-	if (!acrtc) {
-		/* No DRM pipeline: nothing to set, the firmware is up. */
+	if (!dcp_uses_soft_dpms(dcp)) {
+		/* dcp_poweron() powers the pipe on the enable. */
 		WRITE_ONCE(dcp->hib_phase, DCP_HIB_NONE);
-		dev_dbg(dcp->dev, "firmware restart: no CRTC, no mode to set\n");
+		dev_dbg(dcp->dev,
+			"firmware restart: CRTC off, pipe and mode set on enable\n");
 		return 0;
 	}
-	crtc = &acrtc->base;
+	ret = dcp_hib_recommit_power(dcp);
+	if (ret)
+		return ret;
+	WRITE_ONCE(dcp->hib_phase, DCP_HIB_NONE);
+	ret = dcp_backlight_dpms(dcp, false);
+	if (ret)
+		dev_warn(dcp->dev,
+			 "firmware restart: backlight blank unavailable: %d\n",
+			 ret);
+	dev_dbg(dcp->dev,
+		"firmware restart: CRTC off, pipe powered, mode set on enable\n");
+	return 0;
+}
 
-	DRM_MODESET_LOCK_ALL_BEGIN(crtc->dev, ctx, 0, ret);
-	dcp_hib_wait_commits(crtc);
+/* The CRTC is on: commit its state again with the mode set. */
+static int dcp_hib_recommit_active(struct apple_dcp *dcp, struct drm_crtc *crtc,
+				   struct drm_modeset_acquire_ctx *ctx)
+{
+	struct drm_atomic_commit *state;
+	struct drm_crtc_state *cs;
+	int ret;
 
-	if (!crtc->state->active) {
-		if (!dcp_uses_soft_dpms(dcp)) {
-			/* dcp_poweron() powers the pipe on the enable. */
-			WRITE_ONCE(dcp->hib_phase, DCP_HIB_NONE);
-			dev_dbg(dcp->dev,
-				"firmware restart: CRTC off, pipe and mode set on enable\n");
-			goto unlock;
-		}
-		if (!powered) {
-			iomfb_poweron_v26_6_desktop(dcp);
-			powered = true;
-		}
-		if (READ_ONCE(dcp->crashed) || dcp->desktop->poweron_result) {
-			ret = -EIO;
-			goto unlock;
-		}
-		WRITE_ONCE(dcp->hib_phase, DCP_HIB_NONE);
-		ret = dcp_backlight_dpms(dcp, false);
-		if (ret)
-			dev_warn(dcp->dev,
-				 "firmware restart: backlight blank unavailable: %d\n",
-				 ret);
-		ret = 0;
-		dev_dbg(dcp->dev,
-			"firmware restart: CRTC off, pipe powered, mode set on enable\n");
-		goto unlock;
-	}
-
-	if (!powered) {
-		iomfb_poweron_v26_6_desktop(dcp);
-		powered = true;
-	}
-	if (READ_ONCE(dcp->crashed) || dcp->desktop->poweron_result) {
-		ret = -EIO;
-		goto unlock;
-	}
+	ret = dcp_hib_recommit_power(dcp);
+	if (ret)
+		return ret;
 
 	state = drm_atomic_commit_alloc(crtc->dev);
-	if (!state) {
-		ret = -ENOMEM;
-		goto unlock;
-	}
-	state->acquire_ctx = &ctx;
+	if (!state)
+		return -ENOMEM;
+	state->acquire_ctx = ctx;
 	cs = drm_atomic_get_crtc_state(state, crtc);
 	if (IS_ERR(cs)) {
 		ret = PTR_ERR(cs);
@@ -10421,7 +10401,39 @@ static int dcp_hib_recommit(struct apple_dcp *dcp)
 		WRITE_ONCE(dcp->hib_phase, DCP_HIB_RESTARTING);
 put:
 	drm_atomic_commit_put(state);
-unlock:
+	return ret;
+}
+
+/*
+ * Power the pipe on and commit the current state of the CRTC with a mode
+ * set and its planes: the firmware gets the mode and the frame, and the
+ * compositor's next flip goes to the new session.  A CRTC switched off by
+ * soft DPMS gets the pipe back with the backlight off; its enable sets the
+ * mode.
+ */
+static int dcp_hib_recommit(struct apple_dcp *dcp)
+{
+	struct apple_crtc *acrtc = READ_ONCE(dcp->crtc);
+	struct drm_modeset_acquire_ctx ctx;
+	struct drm_crtc *crtc;
+	int ret;
+
+	if (!acrtc) {
+		/* No DRM pipeline: nothing to set, the firmware is up. */
+		WRITE_ONCE(dcp->hib_phase, DCP_HIB_NONE);
+		dev_dbg(dcp->dev, "firmware restart: no CRTC, no mode to set\n");
+		return 0;
+	}
+	crtc = &acrtc->base;
+
+	DRM_MODESET_LOCK_ALL_BEGIN(crtc->dev, ctx, 0, ret);
+	dcp_hib_wait_commits(crtc);
+
+	if (!crtc->state->active)
+		ret = dcp_hib_recommit_inactive(dcp);
+	else
+		ret = dcp_hib_recommit_active(dcp, crtc, &ctx);
+
 	if (ret == -EDEADLK)
 		WRITE_ONCE(dcp->hib_phase, DCP_HIB_RESTARTING);
 	DRM_MODESET_LOCK_ALL_END(crtc->dev, ctx, ret);
@@ -10610,20 +10622,16 @@ static void dcp_desktop_cold_restart(struct apple_dcp *dcp)
 }
 
 /*
- * The internal DCP after a real sleep, brought back as a restarted DCP: the
- * firmware the stop idled keeps its buffers and rings, answers HELLO, gets its
- * endpoint map echoed and has no endpoint started again
- * (apple_rtkit_power_cycled_return()). Then the modeset that lights the panel.
- * Not the cold session restart, which re-inits RTKit and starts every endpoint:
- * the idled firmware answers none of those starts.
+ * The first half of both warm restarts: the firmware the stop idled comes back
+ * through the power-cycled return, its AFK endpoints are restarted and the hard
+ * power state of the framebuffer is put back on. 0, or the error of the return,
+ * after which the display processor has been given up.
  */
-static void dcp_t6041_s2r_warm_restart(struct apple_dcp *dcp)
+static int dcp_t6041_s2r_firmware_back(struct apple_dcp *dcp)
 {
 	u32 ctl, sts;
 	int ret;
 
-	WRITE_ONCE(dcp->hib_phase, DCP_HIB_RESTARTING);
-	WRITE_ONCE(dcp->crashed, false);
 	ret = apple_rtkit_power_cycled_return(dcp->rtk,
 					      dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
 	ctl = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
@@ -10633,12 +10641,31 @@ static void dcp_t6041_s2r_warm_restart(struct apple_dcp *dcp)
 		ret, ctl, sts);
 	if (ret) {
 		dcp_hib_give_up(dcp, "warm-restart", ret);
-		return;
+		return ret;
 	}
 	dcp_t6041_s2r_afk(dcp, true);
-	/* As the platform powers the framebuffer after the wake: the hard power state back on. */
+	/* The hard power state back on, as the framebuffer needs it after the wake. */
 	ret = iomfb_system_power_v26_6_desktop(dcp, true);
 	dev_dbg(dcp->dev, "S2R resume: system power state 1: %d\n", ret);
+	return 0;
+}
+
+/*
+ * The internal DCP after a real sleep, brought back as a restarted DCP: the
+ * firmware the stop idled keeps its buffers and rings, answers HELLO, gets its
+ * endpoint map echoed and has no endpoint started again
+ * (apple_rtkit_power_cycled_return()). Then the modeset that lights the panel.
+ * Not the cold session restart, which re-inits RTKit and starts every endpoint:
+ * the idled firmware answers none of those starts.
+ */
+static void dcp_t6041_s2r_warm_restart(struct apple_dcp *dcp)
+{
+	int ret;
+
+	WRITE_ONCE(dcp->hib_phase, DCP_HIB_RESTARTING);
+	WRITE_ONCE(dcp->crashed, false);
+	if (dcp_t6041_s2r_firmware_back(dcp))
+		return;
 
 	ret = dcp_hib_recommit(dcp);
 	if (ret) {
@@ -10664,25 +10691,10 @@ static void dcp_t6041_s2r_warm_restart(struct apple_dcp *dcp)
  */
 static void dcp_t6041_s2r_warm_restart_ext(struct apple_dcp *dcp)
 {
-	u32 ctl, sts;
-	int ret;
-
 	dcp_s2r_forget_crash(dcp);
 	WRITE_ONCE(dcp->crashed, false);
-	ret = apple_rtkit_power_cycled_return(dcp->rtk,
-					      dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
-	ctl = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
-	sts = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS);
-	dev_dbg(dcp->dev,
-		"S2R resume: warm restart of the idled firmware: %d (CPU_CONTROL %#x STATUS %#x)\n",
-		ret, ctl, sts);
-	if (ret) {
-		dcp_hib_give_up(dcp, "warm-restart", ret);
+	if (dcp_t6041_s2r_firmware_back(dcp))
 		return;
-	}
-	dcp_t6041_s2r_afk(dcp, true);
-	ret = iomfb_system_power_v26_6_desktop(dcp, true);
-	dev_dbg(dcp->dev, "S2R resume: system power state 1: %d\n", ret);
 
 	dcp->link_recovery_tries = 0;
 	WRITE_ONCE(dcp->hib_phase, DCP_HIB_NONE);
