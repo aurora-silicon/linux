@@ -252,13 +252,113 @@ static void indicator_lit_across_suspend_asks_again(struct kunit *test)
 	dcp_ind_present_done(&ind, true);
 	KUNIT_ASSERT_EQ(test, ind.state, DCP_IND_LIT);
 	KUNIT_EXPECT_FALSE(test, dcp_ind_wants_resume(&ind));
-	dcp_ind_display_resumed(&ind);
+	/* A request that got its square on the plane after the resume commit keeps it. */
+	dcp_ind_display_resumed(&ind, false);
+	KUNIT_EXPECT_EQ(test, ind.state, DCP_IND_LIT);
+	KUNIT_EXPECT_FALSE(test, dcp_ind_wants_resume(&ind));
+	/* The plane came back dark. */
+	dcp_ind_display_resumed(&ind, true);
 	KUNIT_EXPECT_TRUE(test, dcp_ind_wants_resume(&ind));
 	/* Stopped during the suspend: nothing to ask for. */
 	KUNIT_ASSERT_EQ(test, dcp_ind_begin(&ind), 0);
 	dcp_ind_end(&ind);
-	dcp_ind_display_resumed(&ind);
+	dcp_ind_display_resumed(&ind, true);
 	KUNIT_EXPECT_FALSE(test, dcp_ind_wants_resume(&ind));
+}
+
+/*
+ * The arguments plane.c hands the policy, gathered from the old and new plane
+ * state: what counts as unchanged, as a clear, as the CRTC going off, and as
+ * the kernel's own framebuffer.
+ */
+static void indicator_plane_check_reads_the_plane_state(struct kunit *test)
+{
+	static const struct drm_framebuffer_funcs own_funcs, user_funcs;
+	struct drm_framebuffer own = { .funcs = &own_funcs }, other_own = { .funcs = &own_funcs };
+	struct drm_framebuffer user = { .funcs = &user_funcs };
+	struct drm_crtc *crtc = (struct drm_crtc *)&user_funcs;
+	struct drm_plane_state old = { .fb = &own, .crtc = crtc, .src_w = 16 << 16, .crtc_w = 16,
+				       .alpha = 0xffff }, new = old;
+	struct drm_crtc_state active = { .active = true }, off = { .active = false };
+
+	/* Carried unchanged. */
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_check(&old, &new, &active, false, &own_funcs),
+			DCP_IND_PLANE_PASS);
+	/* The kernel's own commit. */
+	new.fb = &user;
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_check(&old, &new, &active, true, &own_funcs),
+			DCP_IND_PLANE_PASS);
+	/* A userspace fb on the plane is refused, with or without the kernel's funcs mixed up. */
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_check(&old, &new, &active, false, &own_funcs),
+			DCP_IND_PLANE_REJECT);
+	/* The kernel's fb committed back by resume. */
+	new.fb = &other_own;
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_check(&old, &new, &active, false, &own_funcs),
+			DCP_IND_PLANE_RESTORE);
+	/* Any other field changed is not "unchanged": the kernel's fb is put back. */
+	new = old;
+	new.alpha = 0x8000;
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_check(&old, &new, &active, false, &own_funcs),
+			DCP_IND_PLANE_RESTORE);
+	new = old;
+	new.crtc_x = 5;
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_check(&old, &new, &active, false, &own_funcs),
+			DCP_IND_PLANE_RESTORE);
+	/* Every compared field counts. */
+	new = old;
+	new.src_x++;
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_check(&old, &new, &active, false, &own_funcs),
+			DCP_IND_PLANE_RESTORE);
+	new = old;
+	new.src_y++;
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_check(&old, &new, &active, false, &own_funcs),
+			DCP_IND_PLANE_RESTORE);
+	new = old;
+	new.src_w++;
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_check(&old, &new, &active, false, &own_funcs),
+			DCP_IND_PLANE_RESTORE);
+	new = old;
+	new.src_h++;
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_check(&old, &new, &active, false, &own_funcs),
+			DCP_IND_PLANE_RESTORE);
+	new = old;
+	new.crtc_y = 1;
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_check(&old, &new, &active, false, &own_funcs),
+			DCP_IND_PLANE_RESTORE);
+	new = old;
+	new.crtc_w++;
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_check(&old, &new, &active, false, &own_funcs),
+			DCP_IND_PLANE_RESTORE);
+	new = old;
+	new.crtc_h++;
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_check(&old, &new, &active, false, &own_funcs),
+			DCP_IND_PLANE_RESTORE);
+	new = old;
+	new.pixel_blend_mode++;
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_check(&old, &new, &active, false, &own_funcs),
+			DCP_IND_PLANE_RESTORE);
+	new = old;
+	new.rotation++;
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_check(&old, &new, &active, false, &own_funcs),
+			DCP_IND_PLANE_RESTORE);
+	new = old;
+	new.crtc = NULL;
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_check(&old, &new, &active, false, &own_funcs),
+			DCP_IND_PLANE_RESTORE);
+	/* A userspace fb with a move is refused. */
+	new = old;
+	new.fb = &user;
+	new.crtc_x = 5;
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_check(&old, &new, &active, false, &own_funcs),
+			DCP_IND_PLANE_REJECT);
+	/* A clear is undone; with the CRTC going off it is let through. */
+	new = (struct drm_plane_state){ };
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_check(&old, &new, &active, false, &own_funcs),
+			DCP_IND_PLANE_RESTORE);
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_check(&old, &new, &off, false, &own_funcs),
+			DCP_IND_PLANE_PASS);
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_check(&old, &new, NULL, false, &own_funcs),
+			DCP_IND_PLANE_RESTORE);
 }
 
 static struct kunit_case indicator_cases[] = {
@@ -272,6 +372,7 @@ static struct kunit_case indicator_cases[] = {
 	KUNIT_CASE(indicator_survives_a_display_that_is_not_ready),
 	KUNIT_CASE(indicator_lit_across_suspend_asks_again),
 	KUNIT_CASE(indicator_plane_reservation),
+	KUNIT_CASE(indicator_plane_check_reads_the_plane_state),
 	{}
 };
 
