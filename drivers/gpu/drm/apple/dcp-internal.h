@@ -386,6 +386,7 @@ struct dcp_camera_indicator {
 	struct mutex ctl;
 	struct delayed_work watch;
 	struct work_struct resume;
+	struct delayed_work off_retry;
 	unsigned long deadline;
 	struct drm_plane *plane;
 	struct drm_framebuffer *fb;
