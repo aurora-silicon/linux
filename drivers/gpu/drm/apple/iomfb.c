@@ -3339,6 +3339,8 @@ void iomfb_scanout_complete_h17p(struct apple_dcp *dcp)
 		scanout->request.swap.bg_color = previous->request.swap.bg_color;
 	dcp->iomfb.scanout = scanout;
 	dcp->iomfb.next_scanout = NULL;
+	if (dcp->camera_ind.has_surf)
+		dcp_indicator_swap_done(dcp, scanout->fb[dcp->camera_ind.surf]);
 	iomfb_scanout_release_h17p(previous);
 }
 

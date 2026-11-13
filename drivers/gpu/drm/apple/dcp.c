@@ -6612,6 +6612,13 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 			set_bit(surf, dcp->iomfb_surfaces);
 		surf++;
 	}
+	{
+		int ret_ind = dcp_indicator_probe(dcp);
+
+		if (ret_ind)
+			return ret_ind;
+	}
+
 	/* The J700 loader names surface zero rather than enabling it. */
 	if (of_machine_is_compatible("apple,j700") &&
 	    of_device_is_compatible(dev->of_node, "apple,t8140-dcp") &&
