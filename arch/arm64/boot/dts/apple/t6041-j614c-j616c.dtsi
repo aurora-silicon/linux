@@ -2546,6 +2546,7 @@
 
 #include "t6041-j616c-hdmi.dtsi"
 #include "t6041-j616c-usbc.dtsi"
+#include "t6041-j616c-usbc-dcpext2.dtsi"
 
 /*
  * Keyboard backlight, as on the M4 Pro boards: the ADT /arm-io/pwm0 has one

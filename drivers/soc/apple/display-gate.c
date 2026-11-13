@@ -3114,9 +3114,25 @@ static const char *const t6041_max_usbc_nodes[] = {
 	"/dcp@602e00000",
 };
 
+/*
+ * The second USB-C processor of the J614c/J616c: DARTs, mailbox, a route per
+ * port, dcpext2. It shares the ATC0-2 crossbars with dcpext1, whose chain
+ * enables them, so they are not part of this one.
+ */
+static const char *const t6041_max_usbc2_nodes[] = {
+	"/iommu@606340000",
+	"/iommu@606300000",
+	"/mailbox@606e08000",
+	"/dcp@606e00000/typec-routes/route@0",
+	"/dcp@606e00000/typec-routes/route@1",
+	"/dcp@606e00000/typec-routes/route@2",
+	"/dcp@606e00000",
+};
+
 static const struct gate_staged t6041_max_stages[] = {
 	{ "/iommu@3a2300000", t6041_max_hdmi_nodes, ARRAY_SIZE(t6041_max_hdmi_nodes) },
 	{ "/iommu@602300000", t6041_max_usbc_nodes, ARRAY_SIZE(t6041_max_usbc_nodes) },
+	{ "/iommu@606300000", t6041_max_usbc2_nodes, ARRAY_SIZE(t6041_max_usbc2_nodes) },
 };
 
 /*
