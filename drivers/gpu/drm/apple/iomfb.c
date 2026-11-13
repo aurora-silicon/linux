@@ -1389,8 +1389,22 @@ bool dcp_connector_connected(struct apple_connector *connector)
 	struct platform_device *pdev = READ_ONCE(connector->dcp);
 	struct apple_dcp *dcp = pdev ? platform_get_drvdata(pdev) : NULL;
 
-	if (!dcp || !dcp_announce_gated(dcp, connector))
+	if (!dcp || !dcp_announce_gated(dcp, connector)) {
+		/*
+		 * A display behind a Thunderbolt tunnel whose catalog has no
+		 * usable timing (every colour element virtual: no pixel clock
+		 * yet) is not reported: compositors abort on a connected output
+		 * without a mode. The catalog that brings modes ends with the
+		 * firmware's hotplug notification, which probes again.
+		 */
+		if (dcp && READ_ONCE(connector->connected) && dcp_is_usb4_output(dcp) &&
+		    !READ_ONCE(dcp->nr_modes)) {
+			dev_dbg_ratelimited(dcp->dev,
+					    "tunnel display without usable modes: reported disconnected\n");
+			return false;
+		}
 		return READ_ONCE(connector->connected);
+	}
 
 	guard(mutex)(&dcp->hpd_mutex);
 	dcp_announce_poll(dcp, connector, false);
