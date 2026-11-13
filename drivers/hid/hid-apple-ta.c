@@ -8,8 +8,15 @@
  * traffic between the keyboard's Touch ID sensor and the Secure Enclave. On
  * USB it is a separate interface whose input reports arrive on a bulk IN
  * endpoint (see usbhid). Over Bluetooth the collection shares one HID device
- * with the keyboard; that path is not handled here yet. The collection declares three input reports; they
- * are told apart by their declared lengths, so no report ID is assumed.
+ * with the keyboard; that path is not handled here yet.
+ *
+ * The descriptor declares three input reports, told apart by their declared
+ * lengths, but the keyboard also answers commands and streams sensor frames
+ * in input reports it does not declare: IDs 0x40-0x4f and 0xb0-0xbf, from 8
+ * bytes to almost 11 KiB. HID core drops reports with an undeclared ID before
+ * any driver sees them, and usbhid sizes its input buffer from the
+ * descriptor, so report_fixup() declares those IDs with room for 16 KiB. The
+ * client gets every report with its ID and actual length.
  *
  * The channel is the enclave's, not user space's: this driver claims the
  * collection exclusively, starts it without hidraw, hiddev or input devices,
@@ -25,11 +32,77 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
+#include <linux/string.h>
 
 #include "hid-ids.h"
 
 #define APPLE_TA_PAGE		0xff00
 #define APPLE_TA_USAGE		0x4b
+
+/*
+ * The descriptor of the USB Touch ID interface (49 bytes): the vendor
+ * collection with input reports 0x20 (107 bytes), 0x21 (649) and 0x22 (62).
+ */
+static const u8 apple_ta_usb_rdesc[] = {
+	0x06, 0x00, 0xff,	/* Usage Page (Vendor 0xff00) */
+	0x09, 0x4b,		/* Usage (0x4b) */
+	0xa1, 0x01,		/* Collection (Application) */
+	0x06, 0x00, 0xff,	/*  Usage Page (Vendor 0xff00) */
+	0x09, 0x4b,		/*  Usage (0x4b) */
+	0x15, 0x00,		/*  Logical Minimum (0) */
+	0x26, 0xff, 0x00,	/*  Logical Maximum (255) */
+	0x85, 0x20,		/*  Report ID (0x20) */
+	0x96, 0x6b, 0x00,	/*  Report Count (107) */
+	0x75, 0x08,		/*  Report Size (8) */
+	0x81, 0x02,		/*  Input (Data,Var,Abs) */
+	0x85, 0x21,		/*  Report ID (0x21) */
+	0x96, 0x89, 0x02,	/*  Report Count (649) */
+	0x75, 0x08,		/*  Report Size (8) */
+	0x81, 0x02,		/*  Input (Data,Var,Abs) */
+	0x85, 0x22,		/*  Report ID (0x22) */
+	0x96, 0x3e, 0x00,	/*  Report Count (62) */
+	0x75, 0x08,		/*  Report Size (8) */
+	0x81, 0x02,		/*  Input (Data,Var,Abs) */
+	0xc0,			/* End Collection */
+};
+
+/*
+ * One undeclared input report: 16383 data bytes (4 x 4095 + 3), so with its
+ * ID it fills HID_MAX_BUFFER_SIZE. No usage, so HID core treats the fields as
+ * padding: the report exists and is sized, nothing is parsed out of it.
+ */
+#define APPLE_TA_IN(id)						\
+	0x85, (id),		/* Report ID */			\
+	0x96, 0xff, 0x0f, 0x81, 0x02,	/* 4095 x Input */	\
+	0x96, 0xff, 0x0f, 0x81, 0x02,				\
+	0x96, 0xff, 0x0f, 0x81, 0x02,				\
+	0x96, 0xff, 0x0f, 0x81, 0x02,				\
+	0x95, 0x03, 0x81, 0x02		/* 3 x Input */
+#define APPLE_TA_IN4(id)					\
+	APPLE_TA_IN(id), APPLE_TA_IN((id) + 1),			\
+	APPLE_TA_IN((id) + 2), APPLE_TA_IN((id) + 3)
+#define APPLE_TA_IN16(id)					\
+	APPLE_TA_IN4(id), APPLE_TA_IN4((id) + 4),		\
+	APPLE_TA_IN4((id) + 8), APPLE_TA_IN4((id) + 12)
+
+/* The USB descriptor with the undeclared reports added to its collection. */
+static const u8 apple_ta_usb_rdesc_fixed[] = {
+	0x06, 0x00, 0xff, 0x09, 0x4b, 0xa1, 0x01, 0x06, 0x00, 0xff, 0x09, 0x4b,
+	0x15, 0x00, 0x26, 0xff, 0x00,
+	0x85, 0x20, 0x96, 0x6b, 0x00, 0x75, 0x08, 0x81, 0x02,
+	0x85, 0x21, 0x96, 0x89, 0x02, 0x75, 0x08, 0x81, 0x02,
+	0x85, 0x22, 0x96, 0x3e, 0x00, 0x75, 0x08, 0x81, 0x02,
+	/* Report Size (8) is still in effect. */
+	APPLE_TA_IN16(0x40),
+	APPLE_TA_IN16(0xb0),
+	0xc0,
+};
+
+/* The IDs report_fixup() adds. */
+static bool apple_ta_is_undeclared(u8 id)
+{
+	return (id & 0xf0) == 0x40 || (id & 0xf0) == 0xb0;
+}
 
 struct apple_ta_device {
 	struct hid_device *hdev;
@@ -69,6 +142,8 @@ static int apple_ta_assign_roles(struct apple_ta_device *ta)
 		return -ENODEV;
 
 	list_for_each_entry(r, &in->report_list, list) {
+		if (apple_ta_is_undeclared(r->id))
+			continue;
 		if (n == ARRAY_SIZE(rep))
 			return -ENODEV;
 		rep[n++] = r;
@@ -217,26 +292,30 @@ static int apple_ta_raw_event(struct hid_device *hdev, struct hid_report *report
 			      u8 *data, int size)
 {
 	struct apple_ta_device *ta = hid_get_drvdata(hdev);
-	enum apple_ta_role role;
 	unsigned long flags;
 
 	if (size < 1)
 		return -EINVAL;
-	for (role = 0; role < APPLE_TA_NR_ROLES; role++)
-		if (ta->id[role] == data[0])
-			break;
-	if (role == APPLE_TA_NR_ROLES || size - 1 != ta->len[role]) {
-		hid_dbg(hdev, "dropped report %#x of %d bytes\n", data[0], size);
-		return -EINVAL;
-	}
 
 	spin_lock_irqsave(&apple_ta_client_lock, flags);
 	if (apple_ta_ops && ta->attached)
-		apple_ta_ops->report(apple_ta_ctx, ta, role, data + 1, size - 1);
+		apple_ta_ops->report(apple_ta_ctx, ta, data[0], data + 1, size - 1);
 	spin_unlock_irqrestore(&apple_ta_client_lock, flags);
 
 	/* Nothing else is connected, so the report goes nowhere else. */
 	return 0;
+}
+
+static const __u8 *apple_ta_report_fixup(struct hid_device *hdev, __u8 *rdesc,
+					 unsigned int *rsize)
+{
+	if (hdev->bus == BUS_USB && *rsize == sizeof(apple_ta_usb_rdesc) &&
+	    !memcmp(rdesc, apple_ta_usb_rdesc, *rsize)) {
+		hid_dbg(hdev, "declaring the undeclared Touch ID input reports\n");
+		*rsize = sizeof(apple_ta_usb_rdesc_fixed);
+		return apple_ta_usb_rdesc_fixed;
+	}
+	return rdesc;
 }
 
 static int apple_ta_probe(struct hid_device *hdev, const struct hid_device_id *id)
@@ -313,6 +392,7 @@ static struct hid_driver apple_ta_driver = {
 	.id_table = apple_ta_devices_table,
 	.probe = apple_ta_probe,
 	.remove = apple_ta_remove,
+	.report_fixup = apple_ta_report_fixup,
 	.raw_event = apple_ta_raw_event,
 };
 module_hid_driver(apple_ta_driver);

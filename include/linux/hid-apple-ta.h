@@ -41,12 +41,14 @@ struct apple_ta_client_ops {
 	 */
 	void (*detach)(void *ctx, struct apple_ta_device *ta);
 	/*
-	 * One input report, without its report ID, exactly the length the
-	 * descriptor declares for @role. Called in atomic context: copy what
-	 * is needed and return.
+	 * One input report: its report ID and the @len bytes after it. Any ID
+	 * and any length up to HID_MAX_BUFFER_SIZE - 1: besides the declared
+	 * roles, the keyboard answers commands and sends sensor frames in
+	 * reports its descriptor does not declare. Called in atomic context:
+	 * copy what is needed and return.
 	 */
-	void (*report)(void *ctx, struct apple_ta_device *ta,
-		       enum apple_ta_role role, const u8 *data, size_t len);
+	void (*report)(void *ctx, struct apple_ta_device *ta, u8 id,
+		       const u8 *data, size_t len);
 };
 
 int apple_ta_register_client(const struct apple_ta_client_ops *ops, void *ctx);

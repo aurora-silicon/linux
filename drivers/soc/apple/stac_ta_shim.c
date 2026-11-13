@@ -125,8 +125,8 @@ static void sep_ta_detach(void *ctx, struct apple_ta_device *ta)
 	sep_ta.detached(ctx);
 }
 
-static void sep_ta_report(void *ctx, struct apple_ta_device *ta,
-			  enum apple_ta_role role, const u8 *data, size_t len)
+static void sep_ta_report(void *ctx, struct apple_ta_device *ta, u8 id,
+			  const u8 *data, size_t len)
 {
 	atomic_inc(&sep_ta.dropped);
 }
