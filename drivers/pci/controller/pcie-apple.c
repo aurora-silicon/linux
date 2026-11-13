@@ -18,6 +18,7 @@
  * Author: Marc Zyngier <maz@kernel.org>
  */
 
+#include <linux/async.h>
 #include <linux/bitfield.h>
 #include <linux/gpio/consumer.h>
 #include <linux/kernel.h>
@@ -636,6 +637,8 @@ struct apple_pcie_port {
 	bool			restore_link_up;
 	/* ... and found down by the restore: the boot that resumed did not set it up */
 	bool			restore_cold;
+	/* The result of setting it up again (apple_pcie_conventional_up()) */
+	int			restore_ret;
 };
 
 /* A function's configuration, for its link back after a resume from disk. */
@@ -6921,12 +6924,25 @@ static int apple_pcie_prepare(struct device *dev)
 	return apple_radio_prepare(dev);
 }
 
+static void apple_pcie_restore_port_up_async(void *data, async_cookie_t cookie)
+{
+	struct apple_pcie_port *port = data;
+
+	port->restore_ret = apple_pcie_restore_port_up(port->pcie, port);
+}
+
 /*
  * The normal phase, after the SMC's own restore (the PWREN GPIOs are its) and before the PCI
  * core's normal restore of the functions, which waits for this host as their ancestor.
+ *
+ * Each port's bring-up is mostly the waits of the PCIe timing (power to PERST#, PERST# to
+ * the link, the link to the first configuration request) and touches only that port's own
+ * registers, GPIOs and RID-to-SID table (under the host's lock): the ports are brought up
+ * side by side and their waits overlap.
  */
 static void apple_pcie_conventional_up(struct apple_pcie *pcie, const char *what)
 {
+	ASYNC_DOMAIN_EXCLUSIVE(ports_up);
 	struct device *dev = pcie->dev;
 	struct apple_pcie_port *port;
 	struct apple_pcie_restore_fn *fn;
@@ -6944,7 +6960,14 @@ static void apple_pcie_conventional_up(struct apple_pcie *pcie, const char *what
 			apple_pcie_restore_rid2sid(pcie, port);
 			continue;
 		}
-		ret = apple_pcie_restore_port_up(pcie, port);
+		async_schedule_domain(apple_pcie_restore_port_up_async, port, &ports_up);
+	}
+	async_synchronize_full_domain(&ports_up);
+
+	list_for_each_entry(port, &pcie->ports, entry) {
+		if (!port->restore_link_up || !port->restore_cold)
+			continue;
+		ret = port->restore_ret;
 		if (ret) {
 			dev_err(dev, "%s: %pOF link not back (%d), its functions stay unreachable\n",
 				what, port->np, ret);
