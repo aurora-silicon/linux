@@ -89,17 +89,28 @@ static inline bool dcp_ind_wants_resume(const struct dcp_indicator *ind)
 	return ind->wanted && ind->state == DCP_IND_OFF;
 }
 
+enum dcp_ind_plane_action {
+	DCP_IND_PLANE_PASS,
+	DCP_IND_PLANE_RESTORE,
+	DCP_IND_PLANE_REJECT,
+};
+
 /*
- * The reserved plane belongs to the kernel. Any other commit that changes it
- * (FB_ID=0, CRTC_ID=0, a client's own framebuffer, a move) is put back to the
- * state the plane had, so a blind clear of every plane, as the console restore
- * does, still succeeds. Carried unchanged, or disabled with the CRTC it sits
- * on (DPMS off, suspend, shutdown), the plane is left alone.
+ * The reserved plane belongs to the kernel. A commit that clears it (FB_ID=0
+ * and CRTC_ID=0), as the console restore does for every plane, still succeeds
+ * and the plane is put back to the state it had. Any other userspace change (a
+ * client's own framebuffer, a move, a property) is refused with -EINVAL, so a
+ * compositor sees it in its TEST_ONLY commit and falls back instead of having
+ * its buffer silently dropped. Carried unchanged, or disabled with the CRTC it
+ * sits on (DPMS off, suspend, shutdown), the plane is left alone.
  */
-static inline bool dcp_ind_plane_must_restore(bool reserved_plane, bool kernel_commit,
-					      bool unchanged, bool crtc_going_off)
+static inline enum dcp_ind_plane_action dcp_ind_plane_policy(bool reserved_plane,
+							      bool kernel_commit, bool unchanged,
+							      bool crtc_going_off, bool clearing)
 {
-	return reserved_plane && !kernel_commit && !unchanged && !crtc_going_off;
+	if (!reserved_plane || kernel_commit || unchanged || crtc_going_off)
+		return DCP_IND_PLANE_PASS;
+	return clearing ? DCP_IND_PLANE_RESTORE : DCP_IND_PLANE_REJECT;
 }
 
 #endif /* DCP_INDICATOR_H */
