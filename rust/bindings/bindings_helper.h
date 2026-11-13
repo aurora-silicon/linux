@@ -233,6 +233,15 @@ const unsigned long RUST_CONST_HELPER_GPU_BUDDY_CLEARED = GPU_BUDDY_CLEARED;
 const unsigned long RUST_CONST_HELPER_GPU_BUDDY_TRIM_DISABLE = GPU_BUDDY_TRIM_DISABLE;
 #endif
 
+#if IS_ENABLED(CONFIG_KUNIT)
+/*
+ * struct bus_dma_region, for KUnit tests that give a test device a
+ * dma_range_map. Not for drivers or abstractions: the header is the DMA
+ * layer's own.
+ */
+#include <linux/dma-direct.h>
+#endif
+
 #if IS_ENABLED(CONFIG_ANDROID_BINDER_IPC_RUST)
 #include "../../drivers/android/binder/rust_binder.h"
 #include "../../drivers/android/binder/rust_binder_events.h"

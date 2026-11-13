@@ -112,6 +112,18 @@
 #define __DMA_ATTR_ALLOC_CC_SHARED	(1UL << 14)
 
 /*
+ * DMA_ATTR_NO_BOUNCE: Indicates that the device must be given the memory that
+ * was passed in itself. A mapping request that could only be satisfied through
+ * a bounce buffer (SWIOTLB) fails instead, as does one for a device that is
+ * mapped by DMA operations of its own, where the DMA core cannot tell. Unlike
+ * DMA_ATTR_REQUIRE_COHERENT, it places no requirement on the device's cache
+ * coherence and leaves CPU cache maintenance as it is. Only the mapping
+ * functions look at it: allocations, dma_mmap_attrs() and
+ * dma_get_sgtable_attrs() ignore it.
+ */
+#define DMA_ATTR_NO_BOUNCE		(1UL << 15)
+
+/*
  * A dma_addr_t can hold any valid DMA or bus address for the platform.  It can
  * be given to a device to use as a DMA source or target.  It is specific to a
  * given device and there may be a translation between the CPU physical address

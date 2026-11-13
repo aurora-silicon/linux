@@ -18,7 +18,9 @@ description: |
 properties:
   compatible:
     items:
-      - const: apple,t6041-aop-als-temp
+      - enum:
+          - apple,t6041-aop-als-temp
+          - apple,t8132-aop-als-temp
       - const: apple,aop-als-temp
 
   apple,temp-offset-calibration:

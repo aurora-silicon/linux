@@ -330,3 +330,204 @@
 	       <&admac_ec_proxy 1>;
 	dma-names = "cout", "cin", "spkr", "sense", "hpai";
 };
+
+/*
+ * ==== The left-front USB-C port (ATC1) ====
+ *
+ * ADT /arm-io/nub-spmi-a0/hpm1 (SN201202x, SPMI address 0xa, port-number 2, port-location
+ * "left-front", acio-parent acio1), with atc-phy1, usb-drd1 and dart-usb1. The K114cAP ADT
+ * has the same hpm0, hpm1, hpm5, atc-phy and usb-drd nodes as the J714cAP one, so this is the
+ * J714c port block. The ATC1 template nodes of t6050-dieX.dtsi are enabled here; the boards
+ * sharing t6050-k114-k116.dtsi keep them disabled. The port's USB4/Thunderbolt router
+ * (/arm-io/acio1) and its DisplayPort routes are not described; the PHY runs in USB mode.
+ *
+ * The left-back port (ATC0, hpm0) is the boot link's debug port; the combo PHY driver
+ * excludes it on purpose (apple,port-index 0).
+ */
+/ {
+	aliases {
+		atcphy1 = &atc1_phy;
+	};
+};
+
+&nub_spmi_a0 {
+	status = "okay";
+	/* reg[1]: the generation 4 fault queue, which macOS empties when the controller starts */
+	reg = <0x2 0x8a188000 0x0 0x4000>,
+	      <0x2 0x8a184000 0x0 0x4000>;
+
+	hpm1: usb-pd@a {
+		compatible = "apple,sn201202x";
+		reg = <0xa SPMI_USID>;
+
+		connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Left-front";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					hpm1_hs: endpoint {
+						remote-endpoint = <&usb_drd1_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					hpm1_ss: endpoint {
+						remote-endpoint = <&atc1_phy_ep>;
+					};
+				};
+			};
+		};
+	};
+
+	/*
+	 * The MagSafe 3 port's PD controller (ADT hpm5, port-type 0x11). It has no USB data
+	 * path, so it gets no connector node; tipd registers a Type-C port and a power supply
+	 * for it. Its ADT features-supported is <3>, "Power In" only: no liquid detection.
+	 */
+	hpm5: usb-pd@8 {
+		compatible = "apple,sn201202x";
+		reg = <0x8 SPMI_USID>;
+		apple,no-liquid-detection;
+	};
+};
+
+&atc1_phy_mbox {
+	status = "okay";
+};
+
+&atc1_phy {
+	status = "okay";
+
+	port {
+		atc1_phy_ep: endpoint {
+			remote-endpoint = <&hpm1_ss>;
+		};
+	};
+};
+
+&usb_drd1 {
+	status = "okay";
+
+	port {
+		usb_drd1_hs: endpoint {
+			remote-endpoint = <&hpm1_hs>;
+		};
+	};
+};
+
+&usb_drd1_dart_0 {
+	status = "okay";
+};
+
+&usb_drd1_dart_1 {
+	status = "okay";
+};
+
+/*
+ * ==== The right USB-C port (ATC2), USB only ====
+ *
+ * ADT /arm-io/nub-spmi-a1/hpm2 (SN201202x, SPMI address 0xc, port-number 3, port-location
+ * "right", acio-parent acio2), with atc-phy2, usb-drd2 and dart-usb2. The HPM is on its own
+ * bus, nub-spmi-a1, and nothing hands the port off, so the power domains, the PHY mailbox, the
+ * PHY, the DWC3 and its DARTs are enabled outright, as t6050-max-atc2.dtsi does for the J714c
+ * and J716c. The USB4/Thunderbolt router (acio2), the PCIe tunnel and the DisplayPort route
+ * are not described; the PHY runs in USB mode.
+ */
+/ {
+	aliases {
+		atcphy2 = &atc2_phy;
+	};
+};
+
+&ps_atc2_common {
+	status = "okay";
+};
+
+&ps_atc2_usb_aon {
+	status = "okay";
+};
+
+&ps_atc2_phymxwrap {
+	status = "okay";
+};
+
+&ps_atc2_usb {
+	status = "okay";
+};
+
+&atc2_phy_mbox {
+	status = "okay";
+};
+
+&atc2_phy {
+	status = "okay";
+
+	port {
+		atc2_phy_ep: endpoint {
+			remote-endpoint = <&hpm2_ss>;
+		};
+	};
+};
+
+&usb_drd2 {
+	status = "okay";
+
+	port {
+		usb_drd2_hs: endpoint {
+			remote-endpoint = <&hpm2_hs>;
+		};
+	};
+};
+
+&usb_drd2_dart_0 {
+	status = "okay";
+};
+
+&usb_drd2_dart_1 {
+	status = "okay";
+};
+
+&nub_spmi_a1 {
+	status = "okay";
+	/* the driver polls the PD controllers and refuses an interrupt on this bus */
+	/delete-property/ interrupts;
+
+	hpm2: usb-pd@c {
+		compatible = "apple,sn201202x";
+		reg = <0xc SPMI_USID>;
+
+		connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Right";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					hpm2_hs: endpoint {
+						remote-endpoint = <&usb_drd2_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					hpm2_ss: endpoint {
+						remote-endpoint = <&atc2_phy_ep>;
+					};
+				};
+			};
+		};
+	};
+};

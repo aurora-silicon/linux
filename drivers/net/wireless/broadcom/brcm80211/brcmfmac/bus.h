@@ -87,6 +87,9 @@ struct brcmf_bus_dcmd {
  * @get_memdump: obtain device memory dump in provided buffer.
  * @get_blob: obtain a firmware blob.
  * @remove: initiate unbind of the device.
+ * @ctl_stall: a control request got no response or could not be queued;
+ *	@stalls counts such requests since the last one that completed
+ *	(optional).
  *
  * This structure provides an abstract interface towards the
  * bus specific driver. For control messages to common driver
@@ -109,6 +112,7 @@ struct brcmf_bus_ops {
 	int (*reset)(struct device *dev);
 	void (*remove)(struct device *dev);
 	void (*d2h_mb_rx)(struct device *dev, u32 data);
+	void (*ctl_stall)(struct device *dev, u32 stalls);
 };
 
 
@@ -302,6 +306,15 @@ void brcmf_bus_d2h_mb_rx(struct brcmf_bus *bus, u32 data)
 		return;
 
 	return bus->ops->d2h_mb_rx(bus->dev, data);
+}
+
+static inline
+void brcmf_bus_ctl_stall(struct brcmf_bus *bus, u32 stalls)
+{
+	if (!bus->ops->ctl_stall)
+		return;
+
+	bus->ops->ctl_stall(bus->dev, stalls);
 }
 
 /*

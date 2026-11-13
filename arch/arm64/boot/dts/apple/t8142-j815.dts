@@ -418,3 +418,8 @@
 &pinctrl_nub {
 	gpio-reserved-ranges = <0 18>, <19 17>, <37 3>;
 };
+
+/* aura (mcc_init_m5) turns the system level cache on; the driver confirms it and flushes on shutdown. */
+&mcc {
+	status = "okay";
+};

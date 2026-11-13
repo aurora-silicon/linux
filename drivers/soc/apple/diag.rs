@@ -57,6 +57,8 @@ extern "C" {
     fn sep_diag_set_endpoint(id: u8, name: u32);
     fn sep_diag_set_os_identity(source: c_int);
     fn sep_diag_set_hwrng(registered: bool);
+    fn sep_diag_set_stac(state: c_int);
+    fn sep_diag_set_pnon(state: c_int, digest: *const u8, len: usize);
     fn sep_diag_xarm_failed() -> c_uint;
     fn sep_diag_unhandled() -> c_uint;
     fn sep_diag_log_summary(dev: *mut c_void);
@@ -308,6 +310,44 @@ pub(crate) fn os_identity(source: OsIdentity) {
 pub(crate) fn hwrng(registered: bool) {
     // SAFETY: no preconditions; stores one word.
     unsafe { sep_diag_set_hwrng(registered) };
+}
+
+/// The trusted-accessory power-state report, as `SEP_DIAG_STAC_*` in
+/// `shim.h` spells it.
+#[derive(Clone, Copy)]
+pub(crate) enum Stac {
+    /// The service took the online state.
+    Online = 1,
+    /// The enclave does not offer the endpoint as the driver knows it.
+    Absent = 2,
+    /// The last report was refused, malformed, unanswered or not sent.
+    Failed = 3,
+}
+
+/// The outcome of a trusted-accessory power-state report; an accepted one is
+/// also counted.
+pub(crate) fn stac(state: Stac) {
+    // SAFETY: no preconditions; updates two words.
+    unsafe { sep_diag_set_stac(state as c_int) };
+}
+
+/// The boot-policy digest read, as `SEP_DIAG_PNON_*` in `shim.h` spells it.
+#[derive(Clone, Copy)]
+pub(crate) enum Pnon {
+    /// The service returned the blessed LocalPolicy nonce digest.
+    Read = 1,
+    /// The enclave does not offer the endpoint as the driver knows it.
+    Absent = 2,
+    /// The read was refused, malformed, unanswered or not sent.
+    Failed = 3,
+}
+
+/// The outcome of the boot-policy digest read, with the digest when read.
+pub(crate) fn pnon(state: Pnon, digest: Option<&[u8; crate::pnon::DIGEST_LEN]>) {
+    let (ptr, len) = digest.map_or((core::ptr::null(), 0), |d| (d.as_ptr(), d.len()));
+    // SAFETY: `ptr` is null or points at `len` readable bytes for the call;
+    // the shim copies them.
+    unsafe { sep_diag_set_pnon(state as c_int, ptr, len) };
 }
 
 /// The driver answered an xART request with the failure status. Returns how

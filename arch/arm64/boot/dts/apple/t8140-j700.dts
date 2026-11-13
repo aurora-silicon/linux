@@ -477,6 +477,11 @@
 	status = "okay";
 };
 
+/* SIO AES engine, software keys only. */
+&aes {
+	status = "okay";
+};
+
 &pmp_dart {
 	status = "okay";
 };
@@ -637,6 +642,8 @@
 
 &i2c0 {
 	status = "okay";
+	/* The ADT gives the codec, alone on this bus, a 2500 ns SCL period. */
+	clock-frequency = <400000>;
 
 	jack_codec: codec@48 {
 		compatible = "cirrus,cs42l83";

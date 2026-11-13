@@ -81,6 +81,7 @@ ASAHI_TESTS = {
     'apple-dart-dapf-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('missing-guard', 'ignore-replay', 'ignore-orphan'), out()),
     'apple-dart-fw-tests.py': [(out(), PASS)],
+    'apple-dart-fw-harness-tests.py': [([], PASS)],
     'apple-dart-range-tests.py': [([], PASS)],
     'asahi-stats-raw-tests.py': [([], PASS)],
     'agx-stats-busy-tests.py': [([], PASS), (['--negative-control'], PASS)],
@@ -107,6 +108,9 @@ ASAHI_TESTS = {
         + [(out() + ['--ref', '33bec4016c466985bfbb5ff4c2089fcab8242dcf'], KILL)],
     'brcmf-pcie-dma-tests.py': [(out('--output'), PASS)]
         + mutations('--mutation', ('narrow-stream', 'ignore-aperture', 'revision-wide'), out('--output')),
+    'brcmf-recovery-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('stall-limit', 'trap-flag', 'console', 'line-start', 'once',
+                                   'rate-limit', 'stall-reset', 'ring-full'), out()),
     'brcmf-roam-tests.py': [(out(), PASS)],
     'brcmf-sae-vendor-tests.py': [(out(), PASS)]
         + [(out() + ['--ref', '9260e1f021e075713931f3c23c0a5fa1da936b0b'], KILL)],

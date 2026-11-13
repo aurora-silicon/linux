@@ -515,14 +515,14 @@ static bool dcpep_cb_core_analytics_v27(struct apple_dcp *dcp, int tag,
 	static_assert(DCP_ANALYTICS_DICT_SIZE == 0x1004);
 
 	strscpy(name, event, min(sizeof(name), (size_t)DCP_ANALYTICS_NAME_SIZE));
-	dev_info_ratelimited(dcp->dev, "CoreAnalytics event %s, reply area %16ph\n",
-			     name, out);
+	dev_dbg_ratelimited(dcp->dev, "CoreAnalytics event %s, reply area %16ph\n",
+			    name, out);
 	if (dcp->analytics_dumps < DCP_ANALYTICS_FULL_DUMPS) {
 		dcp->analytics_dumps++;
 		while (len && !event[len - 1])
 			len--;
-		print_hex_dump(KERN_INFO, "dcp analytics: ", DUMP_PREFIX_OFFSET,
-			       32, 1, event, len, true);
+		print_hex_dump_debug("dcp analytics: ", DUMP_PREFIX_OFFSET,
+				     32, 1, event, len, true);
 	}
 	/* The same record and answer as desktop 26.6's analytics event. */
 	dcp_dict_passthrough_reply(in, out);
