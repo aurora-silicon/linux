@@ -460,16 +460,19 @@ impl Demand {
     }
 
     /// Reports the share of the last window the GPU spent executing, once a window has run.
-    /// Racing submitters can only lose one window's report.
+    /// Of submitters racing at the end of a window, only the one that moves its start reports.
     pub(super) fn report_busy(&self, now_ns: u64) {
         let start = BUSY_WINDOW_START.load(Ordering::Relaxed);
         let elapsed = now_ns.saturating_sub(start);
-        if elapsed < BUSY_WINDOW_NS {
+        if elapsed < BUSY_WINDOW_NS
+            || BUSY_WINDOW_START
+                .compare_exchange(start, now_ns, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+        {
             return;
         }
         let total = crate::usage::TOTAL_NS.load(Ordering::Relaxed);
         let busy = total.saturating_sub(BUSY_WINDOW_TOTAL.swap(total, Ordering::Relaxed));
-        BUSY_WINDOW_START.store(now_ns, Ordering::Relaxed);
         if start == 0 || elapsed > BUSY_WINDOW_MAX_NS {
             return;
         }

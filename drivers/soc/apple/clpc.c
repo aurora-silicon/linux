@@ -287,6 +287,9 @@ void apple_clpc_gpu_set_active(struct apple_clpc_gpu *gpu, bool active)
 	if (active && !gpu->active && gpu->wake)
 		mod_delayed_work(system_freezable_power_efficient_wq, gpu->wake, 0);
 	gpu->active = active;
+	/* A new burst after idle starts from the top, not from an old share. */
+	if (!active)
+		gpu->busy_valid = false;
 	gpu->updated_ns = ktime_get_mono_fast_ns();
 	gpu->sequence++;
 	spin_unlock_irqrestore(&gpu->lock, flags);
