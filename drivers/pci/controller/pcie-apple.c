@@ -6642,10 +6642,13 @@ static void apple_pcie_s2r_restore_rc(struct apple_pcie *pcie, struct apple_pcie
  * root port's settings back, PERST# released, the link trained. The endpoint's power line
  * is not touched: it is the SMC's, whose session is back only in the normal phase, and it
  * reads on after the wake.
+ *
+ * In two steps, so that the ports share the two waits instead of each taking its own: up to
+ * the release of PERST#, and from the port's ready bit on.
  */
-static int apple_pcie_s2r_port_up_noirq(struct apple_pcie *pcie, struct apple_pcie_port *port)
+static int apple_pcie_s2r_port_release_noirq(struct apple_pcie *pcie,
+					     struct apple_pcie_port *port)
 {
-	u32 stat;
 	int ret;
 
 	rmw_set(PORT_APPCLK_EN, port->base + PORT_APPCLK);
@@ -6661,8 +6664,14 @@ static int apple_pcie_s2r_port_up_noirq(struct apple_pcie *pcie, struct apple_pc
 	usleep_range(100, 200);
 	rmw_set(PORT_PERST_OFF, port->base + pcie->hw->port_perst);
 	gpiod_set_value(port->perst_gpio, 0);
-	/* 100 ms after PERST# (PCIe r5.0, 6.6.1) */
-	msleep(100);
+	return 0;
+}
+
+static int apple_pcie_s2r_port_train_noirq(struct apple_pcie *pcie, struct apple_pcie_port *port)
+{
+	u32 stat;
+	int ret;
+
 	ret = readl_relaxed_poll_timeout(port->base + PORT_STATUS, stat,
 					 stat & PORT_STATUS_READY, 100, 250000);
 	if (ret)
@@ -6676,30 +6685,58 @@ static int apple_pcie_s2r_port_up_noirq(struct apple_pcie *pcie, struct apple_pc
 		return ret;
 	apple_pcie_port_writel(port, BIT(PORT_INT_LINK_UP), PORT_INTSTAT);
 	apple_pcie_port_writel(port, port->saved_intmask, PORT_INTMSK);
-	msleep(100);
 	return 0;
+}
+
+static void apple_pcie_s2r_port_failed(struct apple_pcie *pcie, struct apple_pcie_port *port,
+				       int ret)
+{
+	dev_warn(pcie->dev, "S2R: %pOF link not back in the noirq phase (%d, LTSSM %#x)\n",
+		 port->np, ret, apple_pcie_port_ltssm(pcie, port));
 }
 
 /* A port that does not come up here is left to the normal phase, as before. */
 static void apple_pcie_s2r_up_noirq(struct apple_pcie *pcie)
 {
 	struct apple_pcie_port *port;
+	unsigned long released = 0, trained = 0;
 	int ret;
 
 	list_for_each_entry(port, &pcie->ports, entry) {
 		if (!port->hib_link_up || !port->s2r_saved || !port->perst_gpio ||
-		    gpiod_cansleep(port->perst_gpio) ||
+		    gpiod_cansleep(port->perst_gpio) || port->idx >= BITS_PER_LONG ||
 		    (apple_pcie_port_readl(port, PORT_LINKSTS) & PORT_LINKSTS_UP))
 			continue;
-		ret = apple_pcie_s2r_port_up_noirq(pcie, port);
+		ret = apple_pcie_s2r_port_release_noirq(pcie, port);
 		if (ret)
-			dev_warn(pcie->dev, "S2R: %pOF link not back in the noirq phase (%d, LTSSM %#x)\n",
-				 port->np, ret, apple_pcie_port_ltssm(pcie, port));
+			apple_pcie_s2r_port_failed(pcie, port, ret);
 		else
-			dev_info(pcie->dev, "S2R: %pOF link back with the loader's port settings\n",
-				 port->np);
+			released |= BIT(port->idx);
+	}
+	if (!released)
+		return;
+	/* 100 ms after PERST# (PCIe r5.0, 6.6.1), once for all of them. */
+	msleep(100);
+	list_for_each_entry(port, &pcie->ports, entry) {
+		if (port->idx >= BITS_PER_LONG || !(released & BIT(port->idx)))
+			continue;
+		ret = apple_pcie_s2r_port_train_noirq(pcie, port);
+		if (ret)
+			apple_pcie_s2r_port_failed(pcie, port, ret);
+		else
+			trained |= BIT(port->idx);
+	}
+	if (!trained)
+		return;
+	msleep(100);
+	list_for_each_entry(port, &pcie->ports, entry) {
+		if (port->idx >= BITS_PER_LONG || !(trained & BIT(port->idx)))
+			continue;
+		dev_info(pcie->dev, "S2R: %pOF link back with the loader's port settings\n",
+			 port->np);
 	}
 }
+
 
 /* What only the port registers hold, for a restore that finds them reset. */
 static void apple_pcie_hib_save(struct apple_pcie *pcie)
