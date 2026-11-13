@@ -1090,6 +1090,12 @@ static int apple_isp_dcp_indicator_set(struct device *dcp, bool on)
 	return apple_dcp_camera_indicator_set(dcp, on);
 }
 
+static struct platform_device *apple_isp_dcp_lookup(struct device_node *np)
+{
+	KUNIT_STATIC_STUB_REDIRECT(apple_isp_dcp_lookup, np);
+	return of_find_device_by_node(np);
+}
+
 /* The DCP may probe after the ISP, so it is looked up when a stream starts. */
 static void apple_isp_indicator_bind(struct apple_isp *isp)
 {
@@ -1097,7 +1103,7 @@ static void apple_isp_indicator_bind(struct apple_isp *isp)
 
 	if (isp->dcp || !isp->dcp_np)
 		return;
-	pdev = of_find_device_by_node(isp->dcp_np);
+	pdev = apple_isp_dcp_lookup(isp->dcp_np);
 	if (!pdev) {
 		dev_warn_ratelimited(isp->dev,
 				     "camera indicator: its DCP is not probed, no indicator for this stream\n");
