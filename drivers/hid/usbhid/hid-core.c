@@ -1377,7 +1377,17 @@ static int usbhid_probe(struct usb_interface *intf, const struct usb_device_id *
 
 	ret = usb_find_int_in_endpoint(interface, &ep);
 	if (ret) {
-		hid_err(intf, "couldn't find an input interrupt endpoint\n");
+		/*
+		 * Some vendor interfaces carry the HID class code and a report
+		 * descriptor but move their reports over a bulk IN endpoint,
+		 * e.g. the Touch ID interface of Apple's Magic Keyboards.
+		 * usbhid cannot drive those; they are not broken devices, so
+		 * skip them without an error.
+		 */
+		if (!usb_find_bulk_in_endpoint(interface, &ep))
+			hid_dbg(intf, "bulk IN endpoint only, not a usbhid interface\n");
+		else
+			hid_err(intf, "couldn't find an input interrupt endpoint\n");
 		return -ENODEV;
 	}
 
