@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 #include <kunit/test.h>
 #include <linux/module.h>
+#include <linux/sprintf.h>
 
 #include "ane_h16_hwx.h"
 #include "ane_h16_tasks.h"
@@ -450,6 +451,72 @@ static void hwx_symbols_test(struct kunit *test)
 }
 
 /*
+ * A whole model has one section symbol per kernel blob. Move the table to
+ * the end of a larger copy and give it @count constant symbols besides the
+ * two surface symbols.
+ */
+static u8 *fixture_many_symbols(struct kunit *test, struct hwx_fixture *f, u32 count,
+				size_t *size)
+{
+	u32 symoff = f->size, nsyms = count + 2, stroff = symoff + nsyms * 16, strx = 1, i;
+	size_t total = stroff + 1 + 2 * 8 + (size_t)count * 8;
+	u8 *bytes = kunit_kzalloc(test, total, GFP_KERNEL), *c;
+
+	if (!bytes)
+		return NULL;
+	memcpy(bytes, f->bytes, f->size);
+	for (i = 0; i < nsyms; i++) {
+		u8 *symbol = bytes + symoff + i * 16;
+		char name[8];
+
+		if (i < 2) {
+			memcpy(symbol, f->bytes + f->symbols + i * 16, 16);
+			strscpy(name, i ? "out" : "in", sizeof(name));
+		} else {
+			/* __TEXT,__const of the plain form is section 4. */
+			symbol[4] = 0xf;
+			symbol[5] = 4;
+			put_unaligned_le64(0x30008000 + 64, symbol + 8);
+			snprintf(name, sizeof(name), "k%u", i);
+		}
+		put_unaligned_le32(strx, symbol);
+		strscpy(bytes + stroff + strx, name, sizeof(name));
+		strx += strlen(name) + 1;
+	}
+	c = bytes + f->symtab;
+	put_unaligned_le32(symoff, c + 8);
+	put_unaligned_le32(nsyms, c + 12);
+	put_unaligned_le32(stroff, c + 16);
+	put_unaligned_le32(strx, c + 20);
+	*size = total;
+	return bytes;
+}
+
+static void hwx_symbol_scale_test(struct kunit *test)
+{
+	struct hwx_fixture *f = fixture_create(test, false, false);
+	struct ane_h16_hwx info;
+	size_t size;
+	u8 *bytes, *table;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	bytes = fixture_many_symbols(test, f, 30000, &size);
+	KUNIT_ASSERT_NOT_NULL(test, bytes);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(bytes, size, &info), 0);
+	KUNIT_EXPECT_EQ(test, info.surface_count, 2U);
+	/* Two names far apart in the table are still found equal. */
+	table = bytes + get_unaligned_le32(bytes + f->symtab + 8);
+	put_unaligned_le32(get_unaligned_le32(table + 17 * 16), table + 29001 * 16);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(bytes, size, &info), -ENOEXEC);
+	/* A constant symbol may not reuse a surface name. */
+	put_unaligned_le32(get_unaligned_le32(table + 1 * 16), table + 29001 * 16);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(bytes, size, &info), -ENOEXEC);
+	/* The table bounds stay: more than 64K entries refuse. */
+	put_unaligned_le32(SZ_64K + 1, bytes + f->symtab + 12);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(bytes, size, &info), -ENOEXEC);
+}
+
+/*
  * Debugging entries carry source type descriptions: no section, no value,
  * and names that may repeat. They are skipped, their names bounded.
  */
@@ -862,6 +929,7 @@ static struct kunit_case hwx_cases[] = {
 	KUNIT_CASE(hwx_text_flags_test),
 	KUNIT_CASE(hwx_symbols_test),
 	KUNIT_CASE(hwx_stabs_test),
+	KUNIT_CASE(hwx_symbol_scale_test),
 	KUNIT_CASE(hwx_relocations_test),
 	KUNIT_CASE(hwx_snapshot_test),
 	KUNIT_CASE(hwx_load_plan_test),

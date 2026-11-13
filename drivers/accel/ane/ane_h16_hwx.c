@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 #include <linux/module.h>
 #include <linux/slab.h>
+#include <linux/sort.h>
 #include <linux/sizes.h>
 #include <linux/vmalloc.h>
 #include <linux/uaccess.h>
@@ -9,7 +10,13 @@
 #include "ane_h16_tasks.h"
 
 #define HWX_COMMANDS_MAX 64
-#define HWX_SYMBOLS_MAX 4096
+/*
+ * A whole model names each kernel blob: the Parakeet encoder (390 MiB of
+ * kernels) has 24783 section symbols and 1.77 MB of names, so a 1 GiB
+ * kernel region needs about 64K symbols and 5 MB.
+ */
+#define HWX_SYMBOLS_MAX SZ_64K
+#define HWX_STRINGS_MAX SZ_8M
 #define HWX_SEGMENTS_MAX 8
 #define HWX_SG_NORELOC 0x4
 #define HWX_N_STAB 0xe0
@@ -427,15 +434,26 @@ static int hwx_tensor(struct hwx_parser *p, u32 index, u32 tensor)
 	return 0;
 }
 
+static int hwx_name_compare(const void *a, const void *b, const void *strings)
+{
+	return strcmp((const char *)strings + *(const u32 *)a,
+		      (const char *)strings + *(const u32 *)b);
+}
+
 static int hwx_symbols(struct hwx_parser *p)
 {
-	u32 found = 0, i, j;
+	const char *strings = (const char *)p->bytes + p->stroff;
+	u32 found = 0, named = 0, *names, i, j;
+	int ret = -ENOEXEC;
 
 	if (!p->symtab || !p->nsyms || p->nsyms > HWX_SYMBOLS_MAX ||
-	    !p->strsize || p->strsize > SZ_256K ||
+	    !p->strsize || p->strsize > HWX_STRINGS_MAX ||
 	    hwx_file_add(p, p->symoff, (u64)p->nsyms * 16) ||
 	    hwx_file_add(p, p->stroff, p->strsize) || p->bytes[p->stroff])
 		return -ENOEXEC;
+	names = kvmalloc_array(p->nsyms, sizeof(*names), GFP_KERNEL);
+	if (!names)
+		return -ENOMEM;
 	for (i = 0; i < p->nsyms; i++) {
 		const u8 *s = p->bytes + p->symoff + i * 16;
 		u32 strx = get_unaligned_le32(s);
@@ -445,7 +463,7 @@ static int hwx_symbols(struct hwx_parser *p)
 		bool h17 = p->info.subtype == ANE_HWX_SUBTYPE_H17;
 
 		if (strx >= p->strsize)
-			return -ENOEXEC;
+			goto out;
 		/*
 		 * Debugging (STAB) entries describe the source types of the
 		 * tensors (N_GSYM 0x20 for each surface, N_LSYM 0x80 for each
@@ -455,27 +473,20 @@ static int hwx_symbols(struct hwx_parser *p)
 		 */
 		if (s[4] & HWX_N_STAB) {
 			if (s[5] || value)
-				return -ENOEXEC;
+				goto out;
 			continue;
 		}
 		if (!s[5] || s[5] > p->section_count || (s[4] & ~1) != 0xe)
-			return -ENOEXEC;
-		name = p->bytes + p->stroff + strx;
+			goto out;
+		name = strings + strx;
 		if (!*name || strnlen(name, min_t(u32, 256, p->strsize - strx)) ==
 		    min_t(u32, 256, p->strsize - strx))
-			return -ENOEXEC;
-		for (j = 0; j < i; j++) {
-			const u8 *previous = p->bytes + p->symoff + j * 16;
-
-			if (!(previous[4] & HWX_N_STAB) &&
-			    !strcmp(name, p->bytes + p->stroff + get_unaligned_le32(previous)))
-				return -ENOEXEC;
-		}
+			goto out;
 		section = &p->sections[s[5] - 1];
 		/* H17 places the empty per-core kernel objects (…_ne_N) at the section end. */
 		if (value < section->vm || value - section->vm > section->size ||
 		    (value - section->vm == section->size && !h17))
-			return -ENOEXEC;
+			goto out;
 		for (j = 0; j < p->info.surface_count; j++) {
 			const struct ane_h16_hwx_surface *b = &p->info.surfaces[j];
 
@@ -483,11 +494,26 @@ static int hwx_symbols(struct hwx_parser *p)
 				continue;
 			if ((found & BIT(j)) || s[5] != b->section.ordinal ||
 			    value != b->section.vm)
-				return -ENOEXEC;
+				goto out;
 			found |= BIT(j);
 		}
+		names[named++] = strx;
 	}
-	return found == BIT(p->info.surface_count) - 1 ? 0 : -ENOEXEC;
+	if (found != BIT(p->info.surface_count) - 1)
+		goto out;
+	/*
+	 * Every section symbol name is unique. A whole model has one symbol
+	 * per kernel blob, tens of thousands, so compare neighbours in name
+	 * order rather than every pair.
+	 */
+	sort_r(names, named, sizeof(*names), hwx_name_compare, NULL, strings);
+	for (i = 1; i < named; i++)
+		if (!strcmp(strings + names[i - 1], strings + names[i]))
+			goto out;
+	ret = 0;
+out:
+	kvfree(names);
+	return ret;
 }
 
 /* The stream has already passed the complete structural walk. Clear every
