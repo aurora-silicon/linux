@@ -206,9 +206,12 @@ pub(crate) fn fragment(
 ///
 ///   `[0xfe][logical id][u16 segment word][40-byte chunk]`
 ///
-/// The last chunk is zero-padded; every frame is the full length. The carried
-/// logical ID is repeated in every frame and is neither part of a chunk nor
-/// counted in the body length.
+/// Every frame is the full length. The final frame carries fewer valid bytes
+/// than a chunk, but it is not zero-padded: the encoder works out of one
+/// reused fixed-length buffer, overwrites only the final frame's valid prefix,
+/// and leaves the bytes after it as the preceding frame's tail (see
+/// [`xfe_frame`]). The carried logical ID is repeated in every frame and is
+/// neither part of a chunk nor counted in the body length.
 pub(crate) const XFE_REPORT: u8 = 0xfe;
 /// The feature report length, the ID byte included.
 pub(crate) const XFE_FRAME_LEN: usize = 44;
@@ -240,9 +243,12 @@ pub(crate) fn xfe_frame_count(len: usize) -> usize {
 }
 
 /// Frame `index` of `body` on the `0xfe` transport, carrying `logical_id`, as
-/// one 44-byte feature report, the ID first and the tail after the chunk zero.
-/// Refuses a body that fits a direct SET, a frame count past the 14-bit field,
-/// or an index past the end.
+/// one 44-byte feature report, the ID first. Every frame is the full length.
+/// The final frame holds its `chunk` valid bytes then, in place of zero
+/// padding, the preceding frame's trailing bytes (what a reused fixed-length
+/// buffer retains); the keyboard commits the logical object on this frame and
+/// takes it only in that form. Refuses a body that fits a direct SET, a frame
+/// count past the 14-bit field, or an index past the end.
 pub(crate) fn xfe_frame(
     logical_id: u8,
     body: &[u8],
@@ -266,6 +272,18 @@ pub(crate) fn xfe_frame(
     out[1] = logical_id;
     out[2..XFE_HEADER_LEN].copy_from_slice(&word.to_le_bytes());
     out[XFE_HEADER_LEN..XFE_HEADER_LEN + chunk].copy_from_slice(&body[offset..offset + chunk]);
+    if index == n - 1 && chunk < XFE_CHUNK {
+        // The final frame's valid prefix is `chunk` bytes; the rest of the
+        // fixed-length frame is not zero but the preceding frame's tail,
+        // because the transport encoder reuses one 44-byte buffer across a
+        // report's fragments and rewrites only the prefix on the final frame.
+        // The keyboard commits the logical object on this frame and rejects a
+        // final frame that is zero-filled or trimmed, so reproduce the carried
+        // tail explicitly. The preceding frame is always a full chunk, its
+        // body starting one chunk earlier.
+        let prev = offset - XFE_CHUNK;
+        out[XFE_HEADER_LEN + chunk..].copy_from_slice(&body[prev + chunk..prev + XFE_CHUNK]);
+    }
     Ok(out)
 }
 
@@ -619,14 +637,53 @@ mod tests {
                 assert_eq!(f[0], XFE_REPORT);
                 assert_eq!(f[1], id);
                 assert_eq!(u16::from_le_bytes([f[2], f[3]]), words[k]);
-                // The last chunk's tail is zero.
+                // The last frame keeps the full length; past its valid prefix
+                // it carries the preceding frame's tail, not zero.
                 if k == n - 1 {
                     let valid = len - XFE_CHUNK * (n - 1);
-                    assert!(f[XFE_HEADER_LEN + valid..].iter().all(|&b| b == 0));
+                    assert_eq!(
+                        &f[XFE_HEADER_LEN + valid..],
+                        &frames[k - 1][XFE_HEADER_LEN + valid..]
+                    );
                 }
             }
             assert!(xfe_reassemble(id, &frames).unwrap().as_slice() == body.as_slice());
         }
+    }
+
+    // The step-2 host-object report (137 bytes) is four 0xfe frames. The final
+    // frame keeps the fixed 44-byte length: its 17 valid bytes are the body's
+    // tail, and the 23 bytes after them are the preceding frame's tail (what a
+    // reused fixed-length buffer retains), not zero and not trimmed off. This
+    // pins the exact segment words and the final frame's carry-forward layout.
+    #[test]
+    fn the_last_0xfe_frame_carries_the_preceding_tail() {
+        let body = obj(137);
+        assert_eq!(xfe_frame_count(137), 4);
+        let frames = xfe_frames(cmd::PAIRING_CHECK, &body);
+        // The exact segment words of a four-frame report.
+        let words = [0x4004u16, 0x0001, 0x0002, 0x8011];
+        for (k, f) in frames.iter().enumerate() {
+            assert_eq!(f[0], XFE_REPORT);
+            assert_eq!(f[1], cmd::PAIRING_CHECK);
+            assert_eq!(u16::from_le_bytes([f[2], f[3]]), words[k]);
+        }
+        // The three leading frames carry their 40-byte body slices in full.
+        for k in 0..3 {
+            let off = k * XFE_CHUNK;
+            assert_eq!(&frames[k][XFE_HEADER_LEN..], &body[off..off + XFE_CHUNK]);
+        }
+        // The final frame: 17 valid body bytes, then the 23-byte tail of the
+        // third frame (body[97..120]) — not zero, not dropped.
+        let last = &frames[3];
+        assert_eq!(&last[XFE_HEADER_LEN..XFE_HEADER_LEN + 17], &body[120..137]);
+        assert_eq!(&last[XFE_HEADER_LEN + 17..], &frames[2][XFE_HEADER_LEN + 17..]);
+        assert_eq!(&last[XFE_HEADER_LEN + 17..], &body[97..120]);
+        assert!(last[XFE_HEADER_LEN + 17..].iter().any(|&b| b != 0));
+        // Every frame stays the full fixed length.
+        assert!(frames.iter().all(|f| f.len() == XFE_FRAME_LEN));
+        // The keyboard reads only the valid prefix, so the object round-trips.
+        assert!(xfe_reassemble(cmd::PAIRING_CHECK, &frames).unwrap().as_slice() == body.as_slice());
     }
 
     #[test]
