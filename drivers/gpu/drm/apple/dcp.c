@@ -4071,9 +4071,20 @@ static int dcp_start_desktop_external(struct apple_dcp *dcp, u32 map)
 	/*
 	 * A Type-C route powers the PHY and selects the crossbar when it is
 	 * claimed; until then there is no link to bring up.
+	 *
+	 * The HDMI output's connect waits up to DPTX_CONNECT_TIMEOUT for a link
+	 * configuration, which without a sink never comes: with HPD low, leave
+	 * the connect to dcp_enable_dp2hdmi_hpd() once the processor is up and
+	 * to the HPD interrupt, so the start does not hold the display driver
+	 * back by that wait.
 	 */
 	if (!dptx_ret && dptx_service_available(&dcp->dptxport[0]) &&
 	    (dcp->fixed_phy || dcp->active_typec_route)) {
+		if (!dcp->active_typec_route && dcp->hdmi_hpd &&
+		    !gpiod_get_value_cansleep(dcp->hdmi_hpd)) {
+			dev_dbg(dcp->dev, "no HDMI sink at startup: no DPTX link yet\n");
+			return 0;
+		}
 		ret = dcp_dptx_connect(dcp, 0);
 		if (ret)
 			dev_info(dcp->dev, "no DPTX link at startup: %d\n", ret);
