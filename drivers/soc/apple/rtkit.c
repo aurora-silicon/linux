@@ -1013,7 +1013,9 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 		if (rtk->crashlog_buffer.size <
 		    sizeof(struct apple_rtkit_crashlog_header))
 			goto no_buffer;
-		if (!apple_rtkit_crashlog_header_valid(rtk))
+		/* A firmware-owned buffer has no CPU mapping to read a header from. */
+		if ((rtk->crashlog_buffer.buffer || rtk->crashlog_buffer.iomem) &&
+		    !apple_rtkit_crashlog_header_valid(rtk))
 			goto no_log;
 	}
 
