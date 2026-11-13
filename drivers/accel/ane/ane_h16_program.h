@@ -105,6 +105,11 @@ struct ane_h16_load_layout {
 	u32 region_count;
 	u64 aux_dva[ANE_H16_AUX_COUNT];
 	u64 aux_size[ANE_H16_AUX_COUNT];
+	/*
+	 * The kernel sections travel as EXECUTE buffers, so slot 1 carries
+	 * the __TEXT,__const constants (see ane_h16_process_bindings_kernels()).
+	 */
+	bool kernel_buffers;
 };
 
 /* Round 5, section 7: resource usage type to EXECUTE descriptor class. */
@@ -146,6 +151,21 @@ int ane_h16_operation_validate(const struct ane_h16_hwx_snapshot *snapshot,
 			       const struct ane_h16_process_binding *bindings,
 			       unsigned int count,
 			       const struct ane_h16_process_binding *scratch);
+int ane_h16_process_bindings_kernels(const struct ane_h16_hwx *hwx, const void *generic,
+				     size_t generic_size,
+				     struct ane_h16_process_binding *bindings,
+				     unsigned int *count,
+				     struct ane_h16_process_binding *scratch,
+				     struct ane_h16_process_binding *kernels,
+				     unsigned int *kernel_count);
+int ane_h16_operation_validate_kernels(const struct ane_h16_hwx_snapshot *snapshot,
+				       const struct ane_h16_hwx *hwx, const void *operation,
+				       size_t operation_size,
+				       const struct ane_h16_process_binding *bindings,
+				       unsigned int count,
+				       const struct ane_h16_process_binding *scratch,
+				       const struct ane_h16_process_binding *kernels,
+				       unsigned int kernel_count);
 int ane_h16_custom_bars(const struct ane_h16_hwx_snapshot *snapshot,
 			const struct ane_h16_hwx *hwx, u32 dsid,
 			struct ane_h16_custom_bar *bars, unsigned int *count);
@@ -222,6 +242,9 @@ struct ane_h16_program {
 	 */
 	struct ane_h16_execute_buffer scratch;
 	bool has_scratch;
+	/* Kernel sections bound as EXECUTE inputs inside the kernel region. */
+	struct ane_h16_execute_buffer kernels[ANE_H16_KERNEL_SEGMENTS];
+	unsigned int kernel_buffer_count;
 	struct ane_h16_session *session;
 	/* Session-local identity; firmware program IDs are reused after UNLOAD. */
 	u64 generation;
