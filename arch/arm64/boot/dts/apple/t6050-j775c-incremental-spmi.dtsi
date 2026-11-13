@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Property migration from Satya Benson's 86b1f365 J775c stack.
+ * Retained board sources remain the baseline; this group is independently booted.
+ * Copyright The Asahi Linux Contributors
+ */
+&{/soc/smc@28c600000} {
+	gpio-low {
+		compatible = "apple,smc-low-gpio";
+		gpio-controller;
+		#gpio-cells = <0x2>;
+	};
+};
+
+&{/soc/spmi@28a014000} {
+	/delete-property/ #interrupt-cells;
+	/delete-property/ interrupt-parent;
+	/delete-property/ interrupts;
+	/delete-property/ interrupt-controller;
+};
+
+&{/soc/spmi@28a014000/pmic@e} {
+};
+
+&{/soc/spmi@28a014000/pmic@e/nvmem-layout} {
+};
+
+&{/soc/spmi@28a014000/pmic@e/nvmem-layout/pm-setting@2001} {
+};
+
+&{/soc/spmi@28a014000/pmic@e/nvmem-layout/rtc-offset@2100} {
+};
+
+&{/soc/spmi@28a014000/pmic@e/nvmem-layout/boot-stage@f801} {
+};
+
+&{/soc/spmi@28a014000/pmic@e/nvmem-layout/boot-error-count@f802,0} {
+};
+
+&{/soc/spmi@28a014000/pmic@e/nvmem-layout/panic-count@f802,4} {
+};
+
+&{/soc/spmi@28a014000/pmic@e/nvmem-layout/shutdown-flag@f80f,3} {
+};
+
+&{/soc/spmi@28a1c8000} {
+	/delete-property/ status;
+};

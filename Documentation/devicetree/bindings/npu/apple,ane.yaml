@@ -60,6 +60,14 @@ properties:
     minItems: 1
     maxItems: 7
 
+  apple,clpc:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Host controller holding the DRAM and fabric floor for ANE work.
+
+  performance-domains:
+    maxItems: 1
+    description: CPU performance domain sharing the ANE voltage supply.
+
   apple,performance-controller:
     $ref: /schemas/types.yaml#/definitions/phandle
     description:
@@ -169,7 +177,7 @@ properties:
 
   apple,ane-type:
     $ref: /schemas/types.yaml#/definitions/uint32
-    enum: [0x110, 0x200]
+    enum: [0x110, 0x200, 0x220]
     description: Firmware generation identifier supplied by the bootloader
 
   apple,firmware-preloaded:
@@ -229,9 +237,7 @@ allOf:
   - if:
       properties:
         compatible:
-          enum:
-            - apple,t6050-ane
-            - apple,t8140-ane
+          const: apple,t8140-ane
     then:
       properties:
         interrupts:
@@ -248,6 +254,53 @@ allOf:
             - const: pwgate
       required:
         - apple,dapf-ranges
+  - if:
+      properties:
+        compatible:
+          const: apple,t6050-ane
+    then:
+      properties:
+        interrupts:
+          minItems: 2
+        power-domains:
+          maxItems: 1
+        apple,ane-type:
+          const: 0x220
+      oneOf:
+        - properties:
+            reg:
+              minItems: 3
+              maxItems: 4
+            reg-names:
+              minItems: 3
+              items:
+                - const: engine
+                - const: pmgr
+                - const: pwgate
+                - const: xl
+          required:
+            - apple,dapf-ranges
+        - description: Complete ADT inventory, not a firmware backend interface.
+          properties:
+            reg:
+              minItems: 7
+            reg-names:
+              items:
+                - const: engine
+                - const: pmgr
+                - const: aux-0
+                - const: aux-1
+                - const: aux-2
+                - const: aux-3
+                - const: aux-4
+            status:
+              const: disabled
+          required:
+            - status
+    else:
+      properties:
+        apple,clpc: false
+        performance-domains: false
   - if:
       required:
         - apple,preload-data-sha256
@@ -440,6 +493,7 @@ allOf:
               - apple,t6041-ane
               - apple,t6050-ane
               - apple,t6001-ane
+    then: {}
     else:
       properties:
         power-domains:
@@ -466,6 +520,7 @@ allOf:
             enum:
               - apple,t6001-ane
               - apple,t6050-ane
+    then: {}
     else:
       properties:
         clocks: false
