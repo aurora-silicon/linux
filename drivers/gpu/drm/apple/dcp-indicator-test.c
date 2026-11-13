@@ -86,40 +86,98 @@ static void indicator_resumes_only_a_kept_request(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, dcp_ind_wants_resume(&ind));
 }
 
+/* Stands in for the DRM commit and the work queue; the test drives the retry by hand. */
+struct fake_drm {
+	int results[4];
+	int commits, queued;
+	bool last_on;
+};
+
+static int fake_commit(void *ctx, bool on)
+{
+	struct fake_drm *d = ctx;
+
+	d->last_on = on;
+	return d->results[d->commits++];
+}
+
+static void fake_queue(void *ctx)
+{
+	((struct fake_drm *)ctx)->queued++;
+}
+
+static const struct dcp_ind_ops fake_ops = { fake_commit, fake_queue };
+
 /*
- * A flip still pending refuses the nonblocking off commit with -EBUSY. The
- * square must still come off: the refusal is retried until the commit lands.
- * Any other error is final and said so. A new request supersedes a retry.
+ * A flip still pending refuses the nonblocking commit with -EBUSY, on or off.
+ * The request stands, so the commit is queued again until it lands, and the
+ * camera never waits for it. Any other error is final and returned.
  */
-static void indicator_off_retries_a_pending_flip(struct kunit *test)
+static void indicator_refused_commit_is_retried(struct kunit *test)
 {
 	struct dcp_indicator ind = {};
+	struct fake_drm d = { .results = { -EBUSY, -EBUSY, 0 } };
 
+	/* Off: the square must still come off. */
 	KUNIT_ASSERT_EQ(test, dcp_ind_begin(&ind), 0);
 	dcp_ind_end(&ind);
-	KUNIT_EXPECT_EQ(test, dcp_ind_off_result(&ind, 0), DCP_IND_OFF_DONE);
-	KUNIT_EXPECT_FALSE(test, ind.off_pending);
+	KUNIT_EXPECT_EQ(test, dcp_ind_apply(&ind, false, &fake_ops, &d), 0);
+	KUNIT_EXPECT_EQ(test, d.queued, 1);
+	KUNIT_EXPECT_EQ(test, dcp_ind_retry(&ind, true, &fake_ops, &d), 0);
+	KUNIT_EXPECT_EQ(test, d.queued, 2);
+	KUNIT_EXPECT_FALSE(test, d.last_on);
+	KUNIT_EXPECT_EQ(test, dcp_ind_retry(&ind, true, &fake_ops, &d), 0);
+	KUNIT_EXPECT_EQ(test, d.commits, 3);
+	/* Landed: nothing left to retry. */
+	KUNIT_EXPECT_EQ(test, dcp_ind_retry(&ind, true, &fake_ops, &d), 0);
+	KUNIT_EXPECT_EQ(test, d.commits, 3);
+	KUNIT_EXPECT_EQ(test, d.queued, 2);
 
-	KUNIT_EXPECT_EQ(test, dcp_ind_off_result(&ind, -EBUSY), DCP_IND_OFF_RETRY);
-	KUNIT_EXPECT_TRUE(test, ind.off_pending);
-	/* Still refused: still pending. Then it lands. */
-	KUNIT_EXPECT_EQ(test, dcp_ind_off_result(&ind, -EBUSY), DCP_IND_OFF_RETRY);
-	KUNIT_EXPECT_EQ(test, dcp_ind_off_result(&ind, 0), DCP_IND_OFF_DONE);
-	KUNIT_EXPECT_FALSE(test, ind.off_pending);
-
-	/* Any other error is final. */
-	KUNIT_EXPECT_EQ(test, dcp_ind_off_result(&ind, -EBUSY), DCP_IND_OFF_RETRY);
-	KUNIT_EXPECT_EQ(test, dcp_ind_off_result(&ind, -ENODEV), DCP_IND_OFF_FAILED);
-	KUNIT_EXPECT_FALSE(test, ind.off_pending);
-
-	/* A request made while a retry waits supersedes it; so does losing the plane. */
-	KUNIT_EXPECT_EQ(test, dcp_ind_off_result(&ind, -EBUSY), DCP_IND_OFF_RETRY);
+	/* On: the request stands, so the square is asked for again. */
+	d = (struct fake_drm){ .results = { -EBUSY, 0 } };
 	KUNIT_ASSERT_EQ(test, dcp_ind_begin(&ind), 0);
-	KUNIT_EXPECT_FALSE(test, ind.off_pending);
+	KUNIT_EXPECT_EQ(test, dcp_ind_apply(&ind, true, &fake_ops, &d), 0);
+	KUNIT_EXPECT_EQ(test, d.queued, 1);
+	KUNIT_EXPECT_EQ(test, dcp_ind_retry(&ind, true, &fake_ops, &d), 0);
+	KUNIT_EXPECT_TRUE(test, d.last_on);
+	KUNIT_EXPECT_EQ(test, d.commits, 2);
+	KUNIT_EXPECT_EQ(test, dcp_ind_retry(&ind, true, &fake_ops, &d), 0);
+	KUNIT_EXPECT_EQ(test, d.commits, 2);
+}
+
+static void indicator_retry_ends_with_the_request(struct kunit *test)
+{
+	struct dcp_indicator ind = {};
+	struct fake_drm d = { .results = { -EBUSY, -EIO, 0 } };
+
+	/* Any other error is final, and ends the retry. */
+	KUNIT_ASSERT_EQ(test, dcp_ind_begin(&ind), 0);
+	KUNIT_EXPECT_EQ(test, dcp_ind_apply(&ind, true, &fake_ops, &d), 0);
+	KUNIT_EXPECT_EQ(test, dcp_ind_retry(&ind, true, &fake_ops, &d), -EIO);
+	KUNIT_EXPECT_EQ(test, dcp_ind_retry(&ind, true, &fake_ops, &d), 0);
+	KUNIT_EXPECT_EQ(test, d.commits, 2);
+
+	/* A request that ends (stopped, withdrawn) takes its on retry with it. */
+	d = (struct fake_drm){ .results = { -EBUSY, 0 } };
 	dcp_ind_end(&ind);
-	KUNIT_EXPECT_EQ(test, dcp_ind_off_result(&ind, -EBUSY), DCP_IND_OFF_RETRY);
+	KUNIT_ASSERT_EQ(test, dcp_ind_begin(&ind), 0);
+	KUNIT_EXPECT_EQ(test, dcp_ind_apply(&ind, true, &fake_ops, &d), 0);
+	dcp_ind_end(&ind);
+	KUNIT_EXPECT_EQ(test, dcp_ind_retry(&ind, true, &fake_ops, &d), 0);
+	KUNIT_EXPECT_EQ(test, d.commits, 1);
+
+	/* A new request supersedes an off retry; losing the plane drops any retry. */
+	d = (struct fake_drm){ .results = { -EBUSY, -EBUSY, 0 } };
+	KUNIT_EXPECT_EQ(test, dcp_ind_apply(&ind, false, &fake_ops, &d), 0);
+	KUNIT_ASSERT_EQ(test, dcp_ind_begin(&ind), 0);
+	KUNIT_EXPECT_EQ(test, dcp_ind_retry(&ind, true, &fake_ops, &d), 0);
+	KUNIT_EXPECT_EQ(test, d.commits, 1);
+	KUNIT_EXPECT_EQ(test, dcp_ind_apply(&ind, true, &fake_ops, &d), 0);
+	KUNIT_EXPECT_EQ(test, dcp_ind_retry(&ind, false, &fake_ops, &d), 0);
+	KUNIT_EXPECT_EQ(test, d.commits, 2);
 	dcp_ind_suspend(&ind);
-	KUNIT_EXPECT_FALSE(test, ind.off_pending);
+	KUNIT_EXPECT_EQ(test, dcp_ind_retry(&ind, true, &fake_ops, &d), 0);
+	KUNIT_EXPECT_EQ(test, d.commits, 2);
 }
 
 /*
@@ -153,7 +211,8 @@ static struct kunit_case indicator_cases[] = {
 	KUNIT_CASE(indicator_idle_ignores_presents),
 	KUNIT_CASE(indicator_single_owner),
 	KUNIT_CASE(indicator_resumes_only_a_kept_request),
-	KUNIT_CASE(indicator_off_retries_a_pending_flip),
+	KUNIT_CASE(indicator_refused_commit_is_retried),
+	KUNIT_CASE(indicator_retry_ends_with_the_request),
 	KUNIT_CASE(indicator_plane_reservation),
 	{}
 };
