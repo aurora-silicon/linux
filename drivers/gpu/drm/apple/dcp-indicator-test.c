@@ -86,6 +86,42 @@ static void indicator_resumes_only_a_kept_request(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, dcp_ind_wants_resume(&ind));
 }
 
+/*
+ * A flip still pending refuses the nonblocking off commit with -EBUSY. The
+ * square must still come off: the refusal is retried until the commit lands.
+ * Any other error is final and said so. A new request supersedes a retry.
+ */
+static void indicator_off_retries_a_pending_flip(struct kunit *test)
+{
+	struct dcp_indicator ind = {};
+
+	KUNIT_ASSERT_EQ(test, dcp_ind_begin(&ind), 0);
+	dcp_ind_end(&ind);
+	KUNIT_EXPECT_EQ(test, dcp_ind_off_result(&ind, 0), DCP_IND_OFF_DONE);
+	KUNIT_EXPECT_FALSE(test, ind.off_pending);
+
+	KUNIT_EXPECT_EQ(test, dcp_ind_off_result(&ind, -EBUSY), DCP_IND_OFF_RETRY);
+	KUNIT_EXPECT_TRUE(test, ind.off_pending);
+	/* Still refused: still pending. Then it lands. */
+	KUNIT_EXPECT_EQ(test, dcp_ind_off_result(&ind, -EBUSY), DCP_IND_OFF_RETRY);
+	KUNIT_EXPECT_EQ(test, dcp_ind_off_result(&ind, 0), DCP_IND_OFF_DONE);
+	KUNIT_EXPECT_FALSE(test, ind.off_pending);
+
+	/* Any other error is final. */
+	KUNIT_EXPECT_EQ(test, dcp_ind_off_result(&ind, -EBUSY), DCP_IND_OFF_RETRY);
+	KUNIT_EXPECT_EQ(test, dcp_ind_off_result(&ind, -ENODEV), DCP_IND_OFF_FAILED);
+	KUNIT_EXPECT_FALSE(test, ind.off_pending);
+
+	/* A request made while a retry waits supersedes it; so does losing the plane. */
+	KUNIT_EXPECT_EQ(test, dcp_ind_off_result(&ind, -EBUSY), DCP_IND_OFF_RETRY);
+	KUNIT_ASSERT_EQ(test, dcp_ind_begin(&ind), 0);
+	KUNIT_EXPECT_FALSE(test, ind.off_pending);
+	dcp_ind_end(&ind);
+	KUNIT_EXPECT_EQ(test, dcp_ind_off_result(&ind, -EBUSY), DCP_IND_OFF_RETRY);
+	dcp_ind_suspend(&ind);
+	KUNIT_EXPECT_FALSE(test, ind.off_pending);
+}
+
 /* A userspace change to the reserved plane is put back, never honoured. */
 static void indicator_plane_reservation(struct kunit *test)
 {
@@ -106,6 +142,7 @@ static struct kunit_case indicator_cases[] = {
 	KUNIT_CASE(indicator_idle_ignores_presents),
 	KUNIT_CASE(indicator_single_owner),
 	KUNIT_CASE(indicator_resumes_only_a_kept_request),
+	KUNIT_CASE(indicator_off_retries_a_pending_flip),
 	KUNIT_CASE(indicator_plane_reservation),
 	{}
 };
