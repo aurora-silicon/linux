@@ -4,16 +4,22 @@
  * Copyright The Asahi Linux Contributors
  */
 
+#include <linux/bitfield.h>
+#include <linux/crc32.h>
+#include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/ioport.h>
+#include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
 #include <linux/pm_wakeup.h>
+#include <linux/regmap.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/rtkit-helper.h>
 #include <linux/soc/apple/sleep.h>
@@ -28,6 +34,17 @@
 #define APPLE_RTKIT_HELPER_HANDOFF	"mtp-live-v1"
 #define APPLE_RTKIT_HELPER_MAX_BUFFERS	4
 #define APPLE_RTKIT_HELPER_BUFFER_CELLS	5
+
+/* PMGR power state words */
+#define APPLE_PS_RESET			BIT(31)
+#define APPLE_PS_AUTO_ENABLE		BIT(28)
+#define APPLE_PS_BUSY			BIT(11)
+#define APPLE_PS_DEV_DISABLE		BIT(10)
+#define APPLE_PS_FLAGS			GENMASK(9, 8)
+#define APPLE_PS_ACTUAL			GENMASK(7, 4)
+#define APPLE_PS_TARGET			GENMASK(3, 0)
+#define APPLE_PS_ACTIVE			0xf
+#define APPLE_RTKIT_HELPER_MAX_PS_WORDS	8
 
 struct apple_rtkit_helper {
 	struct device *dev;
@@ -56,6 +73,15 @@ struct apple_rtkit_helper {
 
 	struct resource *sram;
 	void __iomem *sram_base;
+
+	/*
+	 * A parked firmware (apple,sram-image): its power words in the always-on PMGR
+	 * (apple,aon-power-words, parents first, apple,aon-cpu-word the CPU's).
+	 */
+	struct regmap *aon;
+	u32 ps_words[APPLE_RTKIT_HELPER_MAX_PS_WORDS];
+	int nps_words;
+	u32 ps_cpu;
 };
 
 bool apple_rtkit_helper_preserves_input(struct device *dev)
@@ -253,6 +279,114 @@ static int apple_rtkit_helper_inherit_buffers(
 	return count;
 }
 
+/* One power word: automatic power management off and fully on, keeping RESET/DEV_DISABLE. */
+static int apple_rtkit_helper_ps_pin(struct apple_rtkit_helper *helper, u32 word)
+{
+	u32 val;
+	int ret;
+
+	ret = regmap_read(helper->aon, word, &val);
+	if (ret)
+		return ret;
+	val &= ~(APPLE_PS_AUTO_ENABLE | APPLE_PS_FLAGS | APPLE_PS_TARGET);
+	ret = regmap_write(helper->aon, word, val | APPLE_PS_ACTIVE);
+	if (ret)
+		return ret;
+	ret = regmap_read_poll_timeout(helper->aon, word, val,
+				       FIELD_GET(APPLE_PS_ACTUAL, val) == APPLE_PS_ACTIVE &&
+				       !(val & APPLE_PS_BUSY), 10, 5000);
+	if (ret)
+		dev_err(helper->dev, "power word %#x didn't come on: %#x\n", word, val);
+	return ret;
+}
+
+/*
+ * A firmware the boot loader started and then parked: its CPU held in reset and disabled,
+ * and the SRAM image it had before its first run kept in reserved memory. Write that image
+ * back, release the CPU, and the firmware starts as if nobody had run it. The whole power
+ * chain stays on without automatic power management meanwhile, so the SRAM never goes away
+ * under the copy.
+ */
+static int apple_rtkit_helper_restore(struct apple_rtkit_helper *helper)
+{
+	struct device *dev = helper->dev;
+	struct device_node *np = dev->of_node;
+	struct resource *fw;
+	void __iomem *dst;
+	u64 image[2];
+	u32 crc, want, val;
+	void *src;
+	int i, ret;
+
+	if (of_property_read_u64_array(np, "apple,sram-image", image, 2) ||
+	    of_property_read_u32(np, "apple,sram-image-crc32", &want))
+		return -ENOENT;
+	fw = platform_get_resource_byname(to_platform_device(dev), IORESOURCE_MEM, "firmware");
+	helper->aon = syscon_regmap_lookup_by_phandle(np, "apple,aon-pmgr");
+	helper->nps_words = of_property_read_variable_u32_array(np, "apple,aon-power-words",
+								helper->ps_words, 1,
+								APPLE_RTKIT_HELPER_MAX_PS_WORDS);
+	if (!fw || resource_size(fw) != image[1] || IS_ERR(helper->aon) || helper->nps_words < 1 ||
+	    of_property_read_u32(np, "apple,aon-cpu-word", &helper->ps_cpu))
+		return -EINVAL;
+
+	ret = regmap_read(helper->aon, helper->ps_cpu, &val);
+	if (ret)
+		return ret;
+	if ((readl(helper->asc_base + APPLE_ASC_CPU_CONTROL) & APPLE_ASC_CPU_CONTROL_RUN) ||
+	    (val & (APPLE_PS_RESET | APPLE_PS_DEV_DISABLE)) !=
+	    (APPLE_PS_RESET | APPLE_PS_DEV_DISABLE)) {
+		dev_err(dev, "parked firmware: CPU not held (CPU word %#x)\n", val);
+		return -EIO;
+	}
+
+	for (i = 0; i < helper->nps_words; i++) {
+		ret = apple_rtkit_helper_ps_pin(helper, helper->ps_words[i]);
+		if (ret)
+			return ret;
+	}
+
+	src = memremap(image[0], image[1], MEMREMAP_WB);
+	if (!src)
+		return -ENOMEM;
+	crc = crc32_le(~0, src, image[1]) ^ ~0;
+	if (crc != want) {
+		memunmap(src);
+		dev_err(dev, "parked firmware: image CRC %#x, expected %#x\n", crc, want);
+		return -EIO;
+	}
+	dst = devm_ioremap(dev, fw->start, resource_size(fw));
+	if (!dst) {
+		memunmap(src);
+		return -ENOMEM;
+	}
+	memcpy_toio(dst, src, image[1]);
+	/* The whole image lands in SRAM before the readback and the CPU's release. */
+	wmb();
+	for (i = 0; i < image[1]; i += SZ_64K) {
+		if (readl(dst + i) != *(u32 *)(src + i)) {
+			memunmap(src);
+			dev_err(dev, "parked firmware: SRAM readback differs at %#x\n", i);
+			return -EIO;
+		}
+	}
+	memunmap(src);
+	devm_iounmap(dev, dst);
+
+	/* Out of reset first, then enabled, as the PMGR's own device reset does. */
+	regmap_update_bits(helper->aon, helper->ps_cpu,
+			   APPLE_PS_RESET | APPLE_PS_FLAGS, 0);
+	usleep_range(10, 20);
+	regmap_update_bits(helper->aon, helper->ps_cpu,
+			   APPLE_PS_DEV_DISABLE | APPLE_PS_FLAGS, 0);
+	ret = regmap_read_poll_timeout(helper->aon, helper->ps_cpu, val,
+				       !(val & (APPLE_PS_BUSY | APPLE_PS_RESET |
+						APPLE_PS_DEV_DISABLE)), 10, 5000);
+	dev_info(dev, "parked firmware: %llu byte image written back, CPU word %#x\n",
+		 image[1], val);
+	return ret;
+}
+
 /*
  * A T8140 MTP firmware that ran and was stopped for a sleep, as U-Boot leaves it, only comes
  * back from its reset vector, and the run bit alone doesn't take it there. So its CPU is reset
@@ -264,7 +398,11 @@ static int apple_rtkit_helper_start(struct apple_rtkit_helper *helper)
 	void __iomem *ctrl = helper->asc_base + APPLE_ASC_CPU_CONTROL;
 	int ret;
 
-	if (helper->restartable) {
+	/* A parked firmware gets its pristine image back; without one, a CPU reset in place. */
+	ret = helper->restartable ? apple_rtkit_helper_restore(helper) : 0;
+	if (ret && ret != -ENOENT)
+		return ret;
+	if (ret == -ENOENT) {
 		if (readl(ctrl) & APPLE_ASC_CPU_CONTROL_RUN) {
 			dev_warn(dev, "CPU already running with no handoff; not resetting it\n");
 		} else {
