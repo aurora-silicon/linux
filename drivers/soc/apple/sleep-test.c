@@ -8,6 +8,7 @@
 /* Matched only once its sleep has been tested on hardware. */
 static const char *const apple_sleep_test_tested[] = {
 	"apple,t8140-sleep",
+	"apple,t8132-sleep",
 };
 
 static bool apple_sleep_test_has(const struct apple_sleep_words *all, u32 offset)
@@ -115,7 +116,9 @@ static void apple_sleep_test_ops(struct kunit *test)
 
 		KUNIT_ASSERT_NOT_NULL_MSG(test, ops, "%s has no operations", id->compatible);
 		KUNIT_EXPECT_NOT_NULL(test, ops->deep_wfi_arm);
+		KUNIT_EXPECT_NOT_NULL(test, ops->lower_io);
 		KUNIT_EXPECT_NOT_NULL(test, ops->last_mile);
+		KUNIT_EXPECT_NOT_NULL(test, ops->resume);
 		KUNIT_EXPECT_NOT_NULL(test, ops->wake);
 		KUNIT_EXPECT_NOT_NULL(test, ops->aic_mask_all);
 		KUNIT_EXPECT_NOT_NULL(test, ops->aic_ack);

@@ -47,6 +47,12 @@ void apple_atcphy_sleep_finish(struct phy *usb2_phy, bool kept);
 /* The same from the PHY's work, for after a wake; the flush waits for it. */
 void apple_atcphy_sleep_finish_async(struct phy *usb2_phy, bool kept);
 void apple_atcphy_sleep_finish_flush(struct phy *usb2_phy);
+
+/* ACIO owns this transaction; @phy is its shared USB3 lane PHY handle. */
+int apple_atcphy_cio_prepare(struct phy *phy);
+int apple_atcphy_cio_off(struct phy *phy);
+int apple_atcphy_cio_on(struct phy *phy);
+int apple_atcphy_cio_finish(struct phy *phy);
 #else
 static inline int apple_atcphy_sleep_prepare(struct phy *usb2_phy)
 {
@@ -74,6 +80,27 @@ static inline void apple_atcphy_sleep_finish_async(struct phy *usb2_phy, bool ke
 static inline void apple_atcphy_sleep_finish_flush(struct phy *usb2_phy)
 {
 }
+
+static inline int apple_atcphy_cio_prepare(struct phy *phy)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int apple_atcphy_cio_off(struct phy *phy)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int apple_atcphy_cio_on(struct phy *phy)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int apple_atcphy_cio_finish(struct phy *phy)
+{
+	return -EOPNOTSUPP;
+}
+
 #endif
 
 #endif

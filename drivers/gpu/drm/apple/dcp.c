@@ -8629,8 +8629,9 @@ static int dcp_platform_suspend(struct device *dev)
 	/*
 	 * T8132: setPowerState powers the display down; the coprocessor keeps
 	 * running and its power domains stay on, as below, unless the internal
-	 * display is blanked with appledrm.power_gate_ms set: then the
-	 * coprocessor and its domains are powered down too (iomfb_m4_suspend()).
+	 * display is blanked and this is a deep sleep, or appledrm.power_gate_ms
+	 * is set: then the coprocessor and its domains are powered down too
+	 * (iomfb_m4_suspend()).
 	 */
 	if (iomfb_is_m4(dcp)) {
 		int ret = iomfb_m4_suspend(dcp);

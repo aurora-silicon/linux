@@ -39,6 +39,7 @@ typedef int32_t s32; typedef uint32_t u32; typedef uint8_t u8;
 #define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x)=(v))
+#define smp_load_acquire(p) (*(p))
 #define brcmf_dbg(...) ((void)0)
 #define bphy_err(...) ((void)drvr)
 #define brcmf_err(...) ((void)0)
@@ -62,7 +63,7 @@ struct brcmf_if { struct brcmf_cfg80211_vif *vif; struct brcmf_pub *drvr; struct
  unsigned netif_stop; int netif_stop_lock, bsscfgidx; };
 struct device { void *data; };
 struct pci_dev { struct device dev; int irq; bool state_saved; };
-struct brcmf_pciedev_info { bool mbdata_completed, intr, ready, timer;
+struct brcmf_pciedev_info { bool mbdata_completed, intr, ready, timer, sleep_reset_blocked, setup_complete;
  bool wowl_irq, wowl_enabled, irq_wake_enabled, wowl_sleeping, fwseed, s2idle_d0;
  int state, mbdata_resp_wait; void *ci; struct pci_dev *pdev;
  struct { int intmask, mailboxmask; } *reginfo; };
@@ -169,6 +170,16 @@ static void brcmf_pcie_hostready(struct brcmf_pciedev_info *d) {assert(d->intr);
 static void brcmf_chip_detach(void *c) {(void)c;}
 static void brcmf_pcie_remove(struct pci_dev *p) {(void)p;removes++;}
 static int brcmf_pcie_probe(struct pci_dev *p,void *id) {(void)p;(void)id;probes++;return probe_error;}
+/* Not a J713 sleep: the radio sleep hooks do nothing, as on every other board. */
+static bool apple_radio_sleep_owned(struct device *d) {(void)d;return false;}
+static int apple_radio_sleep_endpoint_prepare(struct device *d,void (*finish)(struct device *)) {(void)d;(void)finish;return 0;}
+static int apple_radio_sleep_endpoint_suspended(struct device *d) {(void)d;return 0;}
+static int apple_radio_sleep_endpoint_resume(struct device *d) {(void)d;return 0;}
+static void apple_radio_sleep_endpoint_resumed(struct device *d,int r) {(void)d;(void)r;}
+/* Only a sleep that owns the radio gets to these. */
+static void brcmf_pcie_sleep_finish(struct device *d) {(void)d;abort();}
+static void brcmf_bus_cancel_reset_work(struct brcmf_bus *b) {(void)b;abort();}
+static int brcmf_pcie_pm_leave_D3(struct device *dev);
 '''
 
 CALLBACK_STUBS = r'''
