@@ -288,6 +288,13 @@
 			     <AIC_FIQ 0 AIC_TMR_HV_VIRT IRQ_TYPE_LEVEL_HIGH>;
 	};
 
+	cpu_pmu: pmu {
+		compatible = "apple,t6050-pmu";
+		interrupt-parent = <&aic>;
+		/* The AIC raises both core types' PMU FIQs as this one. */
+		interrupts = <AIC_FIQ 0 AIC_CPU_PMU_P IRQ_TYPE_LEVEL_HIGH>;
+	};
+
 	/* Die 0 MMIO */
 	die0: soc {
 		compatible = "simple-bus";

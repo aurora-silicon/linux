@@ -1062,6 +1062,7 @@
 };
 
 &{/soc/power-management@286806000/performance-controller@1} {
+	apple,smc = <&smc>;
 };
 
 &{/soc/reset-controller@280620000} {
@@ -1919,6 +1920,7 @@
 };
 
 &{/soc/iommu@2889a0000} {
+	power-domains = <&{/soc/power-management@288300000/power-controller@58}>;
 };
 
 &{/soc/serial@505200000} {
@@ -1949,6 +1951,7 @@
 };
 
 &{/soc/iommu@395d60000} {
+	power-domains = <&{/soc/power-management@280600000/power-controller@248}>;
 };
 
 &{/soc/usb@3953f0000} {
@@ -2176,11 +2179,14 @@
 };
 
 &{/soc/prores@48d000000} {
+	reg-names = "core", "wrapper", "aux", "ctrl", "ctrl1";
+	resets = <&{/soc/power-management@280900000/power-controller@190}>;
 	iommus = <&{/soc/iommu@48d020000} 0x1>;
 	power-domains = <&{/soc/power-management@280900000/power-controller@190}>;
 };
 
 &{/soc/iommu@48d020000} {
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
 	power-domains = <&{/soc/power-management@280900000/power-controller@190}>;
 };
 
@@ -2201,6 +2207,7 @@
 };
 
 &{/soc/iommu@2281020000} {
+	apple,dma-range = <0x100 0x0 0x300 0x0>;
 	power-domains = <&{/soc/power-management@2380600000/power-controller@1d0}>;
 };
 
