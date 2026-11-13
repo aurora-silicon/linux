@@ -450,8 +450,10 @@ static void apple_pmu_rtc_release(void *context)
 	struct device *dev = context;
 	struct apple_pmu_rtc *rtc = dev_get_drvdata(dev);
 
-	disable_irq(rtc->interrupt);
-	dev_pm_clear_wake_irq(dev);
+	if (rtc->interrupt > 0) {
+		disable_irq(rtc->interrupt);
+		dev_pm_clear_wake_irq(dev);
+	}
 	mutex_lock(&rtc->transaction);
 	if (apple_pmu_rtc_stop_alarm(rtc))
 		dev_err(dev, "cannot disable RTC alarm on removal\n");
@@ -477,8 +479,9 @@ static int apple_pmu_rtc_probe(struct platform_device *pdev)
 	rtc->offset = devm_nvmem_cell_get(dev, "rtc_offset");
 	if (IS_ERR(rtc->offset))
 		return dev_err_probe(dev, PTR_ERR(rtc->offset), "RTC offset unavailable\n");
-	rtc->interrupt = platform_get_irq(pdev, 0);
-	if (rtc->interrupt < 0)
+	/* Gen4 SPMI (T6050) raises none: the armed alarm only wakes the SoC from a sleep. */
+	rtc->interrupt = platform_get_irq_optional(pdev, 0);
+	if (rtc->interrupt < 0 && rtc->interrupt != -ENXIO)
 		return rtc->interrupt;
 	mutex_init(&rtc->transaction);
 	platform_set_drvdata(pdev, rtc);
@@ -499,15 +502,17 @@ static int apple_pmu_rtc_probe(struct platform_device *pdev)
 	 * alarm over the parent PMIC's SPMI regmap. Off-domain wake routing is
 	 * still supplied by the platform sleep implementation.
 	 */
-	error = devm_request_threaded_irq(dev, rtc->interrupt, NULL,
-					  apple_pmu_rtc_interrupt,
-					  IRQF_NO_AUTOEN | IRQF_ONESHOT,
-					  dev_name(dev), dev);
-	if (error)
-		goto disable_wakeup;
-	error = dev_pm_set_wake_irq(dev, rtc->interrupt);
-	if (error)
-		goto disable_wakeup;
+	if (rtc->interrupt > 0) {
+		error = devm_request_threaded_irq(dev, rtc->interrupt, NULL,
+						  apple_pmu_rtc_interrupt,
+						  IRQF_NO_AUTOEN | IRQF_ONESHOT,
+						  dev_name(dev), dev);
+		if (error)
+			goto disable_wakeup;
+		error = dev_pm_set_wake_irq(dev, rtc->interrupt);
+		if (error)
+			goto disable_wakeup;
+	}
 	error = apple_pmu_rtc_init_alarm(rtc);
 	if (error)
 		goto disable_wakeup;
@@ -517,7 +522,8 @@ static int apple_pmu_rtc_probe(struct platform_device *pdev)
 	error = devm_add_action_or_reset(dev, apple_pmu_rtc_release, dev);
 	if (error)
 		return error;
-	enable_irq(rtc->interrupt);
+	if (rtc->interrupt > 0)
+		enable_irq(rtc->interrupt);
 	return 0;
 
 disable_wakeup:

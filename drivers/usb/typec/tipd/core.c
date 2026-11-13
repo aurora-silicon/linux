@@ -1618,14 +1618,17 @@ static void cd321x_prepare(struct tps6598x *tps)
 
 	/* As macOS does a second or so before the commit, measured on the same controller. */
 	if (pm_suspend_via_firmware() && device_property_read_bool(tps->dev, "apple,sleep-ssps")) {
+		ktime_t start = ktime_get();
 		int ret;
 
 		guard(mutex)(&tps->lock);
 		ret = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S3);
 		if (ret)
-			dev_warn(tps->dev, "didn't take system power state S3: %d\n", ret);
+			dev_warn(tps->dev, "didn't take system power state S3: %d after %lld ms\n", ret,
+				 ktime_ms_delta(ktime_get(), start));
 		else
-			dev_dbg(tps->dev, "system power state S3\n");
+			dev_info(tps->dev, "system power state S3 in %lld ms\n",
+				 ktime_ms_delta(ktime_get(), start));
 	}
 }
 
@@ -2252,9 +2255,11 @@ static int cd321x_switch_power_state(struct tps6598x *tps, u8 target_state)
 	if (state == target_state)
 		return 0;
 
-	/* SN201202x can still be negotiating an attached dock while waking. */
-	if (target_state == TPS_SYSTEM_POWER_STATE_S0 &&
-	    device_is_compatible(tps->dev, "apple,sn201202x"))
+	/*
+	 * SN201202x can still be negotiating an attached dock while waking, and J714s's hpm1 took
+	 * longer than 1 s to switch to S3.
+	 */
+	if (device_is_compatible(tps->dev, "apple,sn201202x"))
 		ret = tps6598x_exec_cmd_tmo(tps, "SSPS", sizeof(target_state),
 					  &target_state, 0, NULL, 5000, 0);
 	else

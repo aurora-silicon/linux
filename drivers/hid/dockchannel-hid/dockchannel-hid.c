@@ -1827,6 +1827,15 @@ static int dockchannel_hid_suspend(struct device *dev)
 			goto unwind;
 	}
 	if (pm_suspend_via_firmware()) {
+		/* The M5 Pro's macOS first sends {0x21, 0x00} on interface 4. */
+		if (of_machine_is_compatible("apple,t6050") && dchid->ifaces[4]) {
+			u8 msg[] = { 0x21, 0x00 };
+
+			ret = dchid_cmd(dchid->ifaces[4], HID_FEATURE_REPORT, REQ_SET_REPORT, msg,
+					sizeof(msg), NULL, 0);
+			if (ret < 0)
+				dev_warn(dev, "interface 4 sleep report not sent: %d\n", ret);
+		}
 		/* A firmware that doesn't answer isn't a reason to stay awake. */
 		ret = dchid_host_state(dchid, HOST_STATE_SLEEP);
 		if (ret)
