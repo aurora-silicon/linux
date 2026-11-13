@@ -15,7 +15,7 @@ description: |
   start block, the always-on watchdog, the complex and power-gate words, the
   PMU's SPMI controllers and the always-on timer that starts the SoC's sleep
   engine. All of these register blocks are shared with the devices that own
-  them. Without the blocks a suspend can be checked, and not entered.
+  them, and all of them are needed to enter a suspend and to undo it.
 
   The sleep engine waits for the display pipes, so the node lists the power
   states that have to be off before a sleep, as the ADT's
@@ -28,7 +28,6 @@ properties:
     const: apple,t6040-sleep
 
   reg:
-    minItems: 2
     items:
       - description: CPU start/stop block (pmgr + 0x88000)
       - description: AON watchdog
@@ -43,7 +42,6 @@ properties:
       - description: AOP global block, S2R control and wake masks
 
   reg-names:
-    minItems: 2
     items:
       - const: cpu-start
       - const: wdt
@@ -82,6 +80,8 @@ properties:
 
 required:
   - compatible
+  - reg
+  - reg-names
   - apple,check-ps-b4-sleep
   - apple,check-ps-b4-sleep-names
 
@@ -89,8 +89,27 @@ additionalProperties: false
 
 examples:
   - |
-    sleep-controller {
-        compatible = "apple,t6040-sleep";
-        apple,check-ps-b4-sleep = <&pmgr_disp 0x0 0x58>;
-        apple,check-ps-b4-sleep-names = "disp";
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        sleep-controller@502888000 {
+            compatible = "apple,t6040-sleep";
+            reg = <0x5 0x02888000 0x0 0x20>,
+                  <0x5 0x0836c000 0x0 0x4000>,
+                  <0x5 0x02820000 0x0 0x20>,
+                  <0x5 0x0282c000 0x0 0x1000>,
+                  <0x5 0x00000000 0x0 0x80000>,
+                  <0x5 0x09014000 0x0 0x1000>,
+                  <0x5 0x09188000 0x0 0x1000>,
+                  <0x5 0x08900000 0x0 0x8000>,
+                  <0x5 0x02280000 0x0 0x1000>,
+                  <0x5 0x02800000 0x0 0x1000>,
+                  <0x5 0x08004000 0x0 0x1000>;
+            reg-names = "cpu-start", "wdt", "cluster-ctl", "soc-pwrgate",
+                        "clkgen", "spmi0", "spmi-a0", "mastermini",
+                        "soc-east", "soc-ps", "aop-global";
+            apple,check-ps-b4-sleep = <&pmgr_disp 0x0 0x58>;
+            apple,check-ps-b4-sleep-names = "disp";
+        };
     };
