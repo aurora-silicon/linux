@@ -19,6 +19,8 @@ struct apple_plane {
 	bool indicator;
 	/* The kernel commit in flight, compared by pointer only. */
 	const struct drm_atomic_commit *indicator_commit;
+	/* The kernel's own framebuffer, compared by pointer only; NULL once released. */
+	const struct drm_framebuffer *indicator_fb;
 };
 
 #define to_apple_plane(x) container_of(x, struct apple_plane, base)
