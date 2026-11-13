@@ -10,6 +10,7 @@
 #include <linux/device.h>
 #include <linux/list.h>
 #include <linux/module.h>
+#include <linux/soc/apple/j613-display.h>
 #include <linux/mutex.h>
 #include <linux/property.h>
 #include <linux/slab.h>
@@ -406,10 +407,14 @@ static void *typec_mux_match(const struct fwnode_handle *fwnode,
 	if (id && !fwnode_property_present(fwnode, id))
 		return NULL;
 
+	if (apple_j613_display_skip(fwnode, false))
+		return NULL;
+
 	dev = class_find_device(&typec_mux_class, NULL, fwnode,
 				mux_fwnode_match);
 	if (!dev)
-		return typec_mux_ancestors_available(fwnode) ? ERR_PTR(-EPROBE_DEFER) : NULL;
+		return !apple_j613_display_skip(fwnode, true) &&
+		       typec_mux_ancestors_available(fwnode) ? ERR_PTR(-EPROBE_DEFER) : NULL;
 
 	/* Skip duplicates */
 	for (i = 0; i < TYPEC_MUX_MAX_DEVS; i++)

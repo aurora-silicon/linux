@@ -7,6 +7,7 @@
  * Copyright (C) 2014 Endless Mobile
  */
 
+#include <linux/soc/apple/j613-display.h>
 #include <linux/aperture.h>
 #include <linux/component.h>
 #include <linux/completion.h>
@@ -2084,8 +2085,10 @@ static struct platform_driver apple_platform_driver = {
 static int __init appledrm_register(void)
 {
 	int ret;
-	if (drm_firmware_drivers_only())
+	if (drm_firmware_drivers_only()) {
+		apple_j613_display_fail();
 		return -ENODEV;
+	}
 
 	/* A refused experimental profile keeps the boot framebuffer available. */
 	ret = apple_j613_25g83_coldplug();
@@ -2094,8 +2097,10 @@ static int __init appledrm_register(void)
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
 	ret = dcp_audio_register();
-	if (ret)
+	if (ret) {
+		apple_j613_display_fail();
 		return ret;
+	}
 #endif
 	ret = dcp_register();
 	if (ret)
@@ -2105,6 +2110,7 @@ static int __init appledrm_register(void)
 		return 0;
 	dcp_unregister();
 unregister_audio:
+	apple_j613_display_fail();
 #if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
 	dcp_audio_unregister();
 #endif
@@ -2113,6 +2119,7 @@ unregister_audio:
 
 static void __exit appledrm_unregister(void)
 {
+	apple_j613_display_fail();
 #if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
 	dcp_audio_unregister();
 #endif

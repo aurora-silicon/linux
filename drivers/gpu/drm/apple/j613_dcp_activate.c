@@ -7,6 +7,7 @@
 #include <linux/sizes.h>
 #include <linux/io.h>
 #include <linux/module.h>
+#include <linux/soc/apple/j613-display.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/slab.h>
@@ -495,6 +496,9 @@ int __init apple_j613_25g83_coldplug(void)
 
 	if (!of_machine_is_compatible("apple,j613") && !of_machine_is_compatible("apple,j615"))
 		return 0;
+	if (!apple_j613_display_begin())
+		return -ENODEV;
+
 	nodes[J613_DCP] = of_find_node_by_path("dcp");
 	if (nodes[J613_DCP] && !of_device_is_compatible(nodes[J613_DCP], "apple,t8122-dcp")) {
 		of_node_put(nodes[J613_DCP]);
@@ -598,20 +602,8 @@ int __init apple_j613_25g83_coldplug(void)
 			display_clock_hz);
 	}
 out:
-	/* Publish completion on refusal too: disabled routes must then be skipped. */
-	if (nodes[J613_DCP] && of_machine_is_compatible("apple,j613")) {
-		struct of_changeset *done = kzalloc_obj(*done);
-
-		if (done) {
-			of_changeset_init(done);
-			if (of_changeset_add_prop_bool(done, nodes[J613_DCP],
-						       "apple,j613-25g83-coldplug-done") ||
-			    of_changeset_apply(done)) {
-				of_changeset_destroy(done);
-				kfree(done);
-			}
-		}
-	}
+	/* Every exit after begin publishes a terminal state, without allocation. */
+	apple_j613_display_end(ret ?: (external_gate_applied ? 0 : -ENODEV));
 	for (i = 0; i < ARRAY_SIZE(nodes); i++)
 		of_node_put(nodes[i]);
 	return ret;

@@ -389,7 +389,7 @@ static int connect_error,irq_error,register_error,node_puts,mux_get_error,contro
 #define EPROBE_DEFER 517
 /* Real OF/profile combinations are covered by j613-mux-order-tests.py. */
 static bool gate_pending;
-static bool cd321x_display_gate_pending(void) { return gate_pending; }
+static bool cd321x_display_gate_pending(struct tps6598x *tps) { return gate_pending; }
 static void *devm_gpiod_get_optional(void *d,const char *s,int v) { (void)d;(void)s;(void)v;return NULL; }
 static void msleep(unsigned ms) { (void)ms; }
 static bool device_is_compatible(void *d,const char *s) { (void)d;(void)s;return false; }

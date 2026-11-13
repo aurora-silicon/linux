@@ -55,7 +55,8 @@ def mutations(flag, names, base, expect=KILL):
 ASAHI_TESTS = {
     'dcpext26-crossbar-union-tests.py': [([], PASS), (['--drop-native26'], KILL), (['--drop-t8132'], KILL)],
     'dcpext26-suspend-route-tests.py': [([], PASS), (['--native-parks'], KILL), (['--drop-h17p-park'], KILL)],
-    'j613-mux-order-tests.py': [([], PASS), (['--negative-control'], KILL)],
+    'j613-mux-order-tests.py': [([], PASS), (['--negative-control'], KILL),
+                                 (['--ignore-nomodeset'], KILL), (['--drop-failed-completion'], KILL)],
     'dcpext26-budget-tests.py': [([], PASS)],
     'dcpext26-queue-tests.py': [([], PASS)],
     'dcpext26-retrain-tests.py': [([], PASS), (['--negative-control'], KILL)],
