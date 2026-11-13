@@ -57,6 +57,9 @@ static DECLARE_DELAYED_WORK(j613_display_timeout_work, j613_display_timeout);
 /* Held through the changeset: a late module must not reopen fallback routes. */
 bool apple_j613_display_begin(void)
 {
+	if (!of_machine_is_compatible("apple,j613"))
+		return true;
+
 	mutex_lock(&j613_display_lock);
 	if (j613_display_state == J613_DISPLAY_FALLBACK) {
 		mutex_unlock(&j613_display_lock);
@@ -68,6 +71,9 @@ EXPORT_SYMBOL_GPL(apple_j613_display_begin);
 
 void apple_j613_display_end(int ret)
 {
+	if (!of_machine_is_compatible("apple,j613"))
+		return;
+
 	j613_display_state = ret ? J613_DISPLAY_FALLBACK : J613_DISPLAY_HANDOFF;
 	mutex_unlock(&j613_display_lock);
 }
@@ -75,6 +81,9 @@ EXPORT_SYMBOL_GPL(apple_j613_display_end);
 
 void apple_j613_display_fail(void)
 {
+	if (!of_machine_is_compatible("apple,j613"))
+		return;
+
 	mutex_lock(&j613_display_lock);
 	j613_display_state = J613_DISPLAY_FALLBACK;
 	mutex_unlock(&j613_display_lock);
@@ -124,8 +133,9 @@ EXPORT_SYMBOL_GPL(apple_j613_display_pending);
 /* Ignore only this profile's DCP subtree; PHY providers remain mandatory. */
 bool apple_j613_display_skip(const struct fwnode_handle *node, bool missing)
 {
+	struct device_node *dcp, *ext;
 	struct fwnode_handle *parent;
-	bool fallback;
+	bool fallback, skip = false;
 
 	if (!of_machine_is_compatible("apple,j613"))
 		return false;
@@ -135,15 +145,38 @@ bool apple_j613_display_skip(const struct fwnode_handle *node, bool missing)
 	mutex_unlock(&j613_display_lock);
 	if (!fallback)
 		return false;
+
+	dcp = of_find_node_by_path("dcp");
+	if (!dcp || !of_device_is_compatible(dcp, "apple,t8122-dcp") ||
+	    !of_property_present(dcp, "apple,j613-25g83-profile")) {
+		of_node_put(dcp);
+		return false;
+	}
+
+	/* The Type-C routes belong to this sibling, not to the marked panel. */
+	ext = of_find_node_by_path("dcpext");
+	if (!ext)
+		ext = of_find_node_by_path("dcpext0");
+	if (ext && !of_device_is_compatible(ext, "apple,t8122-dcpext")) {
+		of_node_put(ext);
+		ext = NULL;
+	}
+
 	fwnode_for_each_parent_node(node, parent) {
-		if (fwnode_property_present(parent, "apple,j613-25g83-profile")) {
+		if (parent == of_fwnode_handle(dcp) ||
+		    parent == of_fwnode_handle(ext)) {
 			fwnode_handle_put(parent);
-			mutex_lock(&j613_display_lock);
-			j613_display_state = J613_DISPLAY_FALLBACK;
-			mutex_unlock(&j613_display_lock);
-			return true;
+			skip = true;
+			break;
 		}
 	}
-	return false;
+	of_node_put(ext);
+	of_node_put(dcp);
+	if (skip) {
+		mutex_lock(&j613_display_lock);
+		j613_display_state = J613_DISPLAY_FALLBACK;
+		mutex_unlock(&j613_display_lock);
+	}
+	return skip;
 }
 EXPORT_SYMBOL_GPL(apple_j613_display_skip);

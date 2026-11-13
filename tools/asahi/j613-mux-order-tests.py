@@ -5,6 +5,8 @@
 Usage: python3 reproduce-mux-order.py /path/to/aurora-linux
 """
 from pathlib import Path
+import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -75,6 +77,13 @@ guard = tipd[a:b]
 if '--negative-control' in sys.argv:
     guard = '(void)cd321x_display_gate_pending(tps);'
 sync = (root / 'drivers/soc/apple/j613-display.c').read_text()
+if '--ignore-external-node' in sys.argv:
+    sync = sync.replace('parent == of_fwnode_handle(ext)', 'false')
+if '--drop-board-scope' in sys.argv:
+    for name, value in [('apple_j613_display_begin', 'true'), ('apple_j613_display_end', ''), ('apple_j613_display_fail', '')]:
+        body = fn(name, sync)
+        scope_guard = '\tif (!of_machine_is_compatible("apple,j613"))\n\t\treturn' + (' ' + value if value else '') + ';\n'
+        sync = sync.replace(body, body.replace(scope_guard, ''))
 if '--ignore-nomodeset' in sys.argv:
     sync = sync.replace('video_firmware_drivers_only()', 'false')
 if '--drop-failed-completion' in sys.argv:
@@ -87,15 +96,23 @@ pre += r'''
 #define IS_ENABLED(x) (x)
 #define __init
 #define DEFINE_MUTEX(n) int n
-#define mutex_lock(n) ((void)(n))
-#define mutex_unlock(n) ((void)(n))
-struct device_node { bool profile, done; };
+#define mutex_lock(n) do { assert(*(n)==0); *(n)=1; } while (0)
+#define mutex_unlock(n) do { assert(*(n)==1); *(n)=0; } while (0)
+struct device_node { bool profile, done; const char *compatible; struct fwnode_handle *fwnode; };
 struct tps6598x { struct device *dev; };
-static struct device_node dcp_node;
-static bool j613 = true, drm_built = true, firmware_only;
+static struct device_node dcp_node = {.compatible="apple,t8122-dcp"};
+static struct device_node ext_node = {.compatible="apple,t8122-dcpext"};
+static bool ext_alias_missing;
+static bool j613 = true, j615, drm_built = true, firmware_only;
 static int core_state = -EPROBE_DEFER;
-static bool of_machine_is_compatible(const char *s) { return j613; }
-static struct device_node *of_find_node_by_path(const char *s) { return &dcp_node; }
+static bool of_machine_is_compatible(const char *s) { return !strcmp(s,"apple,j613") ? j613 : !strcmp(s,"apple,j615") ? j615 : false; }
+static struct device_node *of_find_node_by_path(const char *s) {
+ if (!strcmp(s,"dcpext")) return ext_alias_missing ? NULL : &ext_node;
+ if (!strcmp(s,"dcpext0")) return &ext_node;
+ return &dcp_node;
+}
+static struct fwnode_handle *of_fwnode_handle(struct device_node *n) { return n ? n->fwnode : NULL; }
+static bool of_device_is_compatible(struct device_node *n,const char *s) { return n && n->compatible && !strcmp(n->compatible,s); }
 static bool of_property_present(struct device_node *n,const char *s) { return n->profile; }
 static void of_node_put(struct device_node *n) {}
 static bool video_firmware_drivers_only(void) { return firmware_only; }
@@ -142,7 +159,6 @@ static bool external_gate_applied, refuse;
 static unsigned int display_clock_hz, apply_calls, reverts;
 static int allocation_error, application_error;
 static struct device_node producer_nodes[J613_NR_NODES];
-static bool of_device_is_compatible(struct device_node *n,const char *s){return true;}
 static bool apple_t8122_25g83_board(void){return !refuse;}
 static int of_property_count_u32_elems(struct device_node *n,const char *s){return strstr(s,"clock-adt")?5:strstr(s,"firmware-compat")?3:1;}
 static int of_property_read_u32(struct device_node *n,const char *s,u32 *v){*v=1;return 0;}
@@ -162,13 +178,71 @@ static int of_changeset_update_prop_string(struct of_changeset *c,struct device_
 static int of_changeset_apply(struct of_changeset *c){apply_calls++;return application_error;}
 static void of_changeset_revert(struct of_changeset *c){reverts++;}
 static void of_changeset_destroy(struct of_changeset *c){}
-static int j613_external_gate(struct device_node *n){external_gate_applied=true;return 0;}
+static int j613_external_gate(struct device_node *n){external_gate_applied=j613;return 0;}
 '''
 pre += fn('apple_j613_25g83_coldplug', producer)
+pre += '\n#define J615_ONLY %d\n#define SIBLING_ONLY %d\n' % ('--j615-only' in sys.argv, '--sibling-only' in sys.argv)
 code = pre + fn('fwnode_graph_devcon_matches', prop) + '\n'.join(fn(n) for n in ['typec_mux_ancestors_available', 'typec_mux_match', 'fwnode_typec_mux_get']) + r'''
+static void test_sibling_external_fallback(void)
+{
+ struct fwnode_handle internal={.available=true,.profile=true};
+ struct fwnode_handle processor={.available=true};
+ struct fwnode_handle route={.parent=&processor,.available=true};
+ struct fwnode_handle phy_parent={.available=true},phy={.parent=&phy_parent,.available=true};
+ struct fwnode_handle connector={.available=true};
+ struct typec_mux_dev atc={.dev={.node=&phy}},dcp={.dev={.node=&route}};
+ unsigned before_scheduled=scheduled;
+ bool timer_was_started=j613_display_timer_started;
+ phy.provider=&atc;targets[0]=&phy;targets[1]=&route;
+ dcp_node.fwnode=&internal;dcp_node.profile=true;
+ ext_node.fwnode=&processor;ext_node.compatible="apple,t8122-dcpext";ext_alias_missing=false;
+ assert(of_fwnode_handle(&dcp_node)==&internal && of_fwnode_handle(&ext_node)==&processor);
+ j613=true;j615=false;drm_built=true;firmware_only=false;core_state=-EPROBE_DEFER;
+ j613_display_state=J613_DISPLAY_HANDOFF;j613_display_expired=false;
+ assert(probe(&connector)==-EPROBE_DEFER);
+ assert(scheduled==before_scheduled+(timer_was_started?0:1));
+ j613_display_expired=true;
+ assert(probe(&connector)==1); /* enabled sibling dcpext: missing after deadline */
+ assert(j613_display_state==J613_DISPLAY_FALLBACK);
+ assert(!apple_j613_display_begin());
+ ext_alias_missing=true;j613_display_state=J613_DISPLAY_HANDOFF;
+ assert(probe(&connector)==1); /* same producer's dcpext0 fallback alias */
+ ext_alias_missing=false;route.provider=&dcp;j613_display_state=J613_DISPLAY_HANDOFF;
+ assert(probe(&connector)==2 && j613_display_state==J613_DISPLAY_HANDOFF);
+ j613_display_state=J613_DISPLAY_FALLBACK;phy.provider=NULL;
+ assert(probe(&connector)==-EPROBE_DEFER); /* never hide a missing PHY */
+ ext_node.fwnode=&phy_parent;ext_node.compatible="test,not-dcp";
+ assert(probe(&connector)==-EPROBE_DEFER); /* malformed alias cannot hide a PHY */
+ phy.provider=&atc;route.provider=NULL;ext_node.fwnode=&processor;
+ ext_node.compatible="apple,t8122-dcpext";dcp_node.profile=false;
+ assert(probe(&connector)==-EPROBE_DEFER); /* unprofiled J613 stays generic */
+}
+static void test_j615_pre_activation_retry(void)
+{
+ unsigned before_scheduled=scheduled;
+ j613=false;j615=true;drm_built=true;firmware_only=false;dcp_node.profile=true;
+ j613_display_state=J613_DISPLAY_PENDING;external_gate_applied=false;
+ display_clock_hz=0;refuse=false;allocation_error=-ENOMEM;application_error=0;
+ assert(apple_j613_25g83_coldplug()==-ENOMEM);
+ assert(j613_display_lock==0 && j613_display_state==J613_DISPLAY_PENDING);
+ assert(display_clock_hz==0);
+ allocation_error=0;
+ assert(apple_j613_25g83_coldplug()==0); /* retry after no changeset was applied */
+ assert(display_clock_hz==1);
+ assert(j613_display_lock==0 && j613_display_state==J613_DISPLAY_PENDING);
+ apple_j613_display_fail();
+ assert(j613_display_lock==0 && j613_display_state==J613_DISPLAY_PENDING);
+ assert(apple_j613_display_begin());apple_j613_display_end(-EIO);
+ assert(j613_display_lock==0 && j613_display_state==J613_DISPLAY_PENDING);
+ assert(scheduled==before_scheduled);
+}
 int main(void){
+ if (J615_ONLY) { test_j615_pre_activation_retry(); return 0; }
+ if (SIBLING_ONLY) { test_sibling_external_fallback(); return 0; }
  struct fwnode_handle processor={.available=false},route={.parent=&processor,.available=true},phy={.available=true},connector={.available=true};
  struct typec_mux_dev atc={.dev.node=&phy},dcp={.dev.node=&route};phy.provider=&atc;targets[0]=&phy;targets[1]=&route;
+ struct fwnode_handle internal={.available=true,.profile=true};
+ dcp_node.fwnode=&internal;ext_node.fwnode=&processor;
  struct typec_mux *early=fwnode_typec_mux_get(&connector);assert(early&&!IS_ERR(early)&&early->num_mux_devs==1);
  /* A disabled route node is skipped even before mux_match sees its ancestor. */
  processor.available=true;route.available=false;
@@ -197,7 +271,7 @@ int main(void){
  assert(probe(&connector)==1); /* ordinary J613 without the changeset */
  dcp_node.profile=true; j613=false;
  assert(probe(&connector)==1); /* another board never waits */
- j613=true; dcp_node.profile=true; processor.profile=true;
+ j613=true; dcp_node.profile=true; processor.profile=false; /* actual sibling dcpext has no internal profile */
  firmware_only=true; assert(video_firmware_drivers_only()); j613_display_state=J613_DISPLAY_PENDING;
  assert(probe(&connector)==1); assert(j613_display_state==J613_DISPLAY_FALLBACK);
  assert(!apple_j613_display_begin()); /* module loaded later cannot reopen */
@@ -249,13 +323,16 @@ int main(void){
  j613_display_state=J613_DISPLAY_FALLBACK;
  unsigned before=apply_calls;
  assert(apple_j613_25g83_coldplug()==-ENODEV && apply_calls==before);
+ test_sibling_external_fallback();
+ test_j615_pre_activation_retry();
 }
 '''
 with tempfile.TemporaryDirectory() as t:
     p = Path(t) / 'mux.c'
     p.write_text(code)
-    subprocess.run(['clang', '-std=gnu11', '-Wall', '-Werror', '-fsanitize=address,undefined', str(p), '-o', str(p.with_suffix(''))], check=True)
+    compiler = shlex.split(os.environ.get('HOSTCC', 'clang'))
+    subprocess.run(compiler + ['-std=gnu11', '-Wall', '-Werror', '-fsanitize=address,undefined', str(p), '-o', str(p.with_suffix(''))], check=True)
     result = subprocess.run([str(p.with_suffix(''))])
     if result.returncode:
         sys.exit(1)
-print('PASS production coldplug success/refusal/allocation/application failures; nomodeset/no-driver/late-module/probe-timeout fallback; early J613 defers; enabled/unregistered defers; registered has both muxes; refused/no-profile/other-board skip; original lookup: unavailable route or ancestor produces an early handle omits disabled DCP and stays ATC-only after coldplug/register; available-unregistered defers; late handle includes both')
+print('PASS real sibling dcpext fallback and J615 pre-activation retry; production coldplug success/refusal/allocation/application failures; nomodeset/no-driver/late-module/probe-timeout fallback; early J613 defers; enabled/unregistered defers; registered has both muxes; refused/no-profile/other-board skip; original lookup: unavailable route or ancestor produces an early handle omits disabled DCP and stays ATC-only after coldplug/register; available-unregistered defers; late handle includes both')
