@@ -197,9 +197,8 @@
 
 /*
  * ProRes encoder and its DART. The engine runs with SCODEC_STREAMING (and so
- * SCODEC) powered. Its power-up rows come from this Mac's
- * apple/prores-t6041-init.bin; without the file the driver leaves the engine
- * off.
+ * SCODEC) powered. The driver has built-in power-up rows for it; an optional
+ * apple/prores-t6041-init.bin replaces them.
  */
 &ps_fab1_soc {
 	status = "okay";
