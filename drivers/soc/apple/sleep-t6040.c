@@ -498,12 +498,6 @@ static void t6040_sleep_set_dry(struct t6040_sleep *s, unsigned int dry)
 	apple_sleep_set_dry(dry);
 }
 
-/* A real entry: its commit stops the registered coprocessors; a dry run's never does. */
-static bool t6040_sleep_reg_commit_stops(void)
-{
-	return READ_ONCE(t6040_sleep) && is_kernel_in_hyp_mode() && apple_sleep_power_loss();
-}
-
 /*
  * In the power-state check, a sub-block is on while its TARGET is not 0. A
  * pipe's CPU word never counts: it stays under automatic power gating (taking it out
@@ -3136,6 +3130,7 @@ static int t6040_sleep_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, s);
 	t6040_sleep = s;
+	apple_sleep_registry_ready();
 
 	dir = debugfs_create_dir("t6040-sleep", NULL);
 	debugfs_create_file("preflight", 0400, dir, s, &t6040_sleep_preflight_fops);
@@ -3166,8 +3161,6 @@ const struct apple_sleep_part t6040_sleep_part = {
 #ifdef CONFIG_HIBERNATION
 	.restore = t6040_sleep_restore,
 #endif
-	/* No enclave_admit: every enclave is taken, in a dry run as in a real sleep. */
-	.registry = {
-		.commit_stops = t6040_sleep_reg_commit_stops,
-	},
+	/* Every enclave is taken, in a dry run as in a real sleep. */
+	.registry_flags = APPLE_SLEEP_REG_ENCLAVE_ANY,
 };

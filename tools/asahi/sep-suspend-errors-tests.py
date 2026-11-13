@@ -140,15 +140,12 @@ static struct regmap regmap;
 static struct apple_mbox_hw hw;
 static struct apple_mbox mbox;
 static int apple_sleep_coprocs_lock;
-static void *apple_sleep;
-struct apple_sleep_ctl { bool (*commit_stops)(void); int (*enclave_admit)(void); };
-static bool apple_sleep_reg_commit_stops(void);
-static int apple_sleep_reg_enclave_admit(void);
-/* The T8140 controller's answers, bound to the registry as its probe binds them. */
-static const struct apple_sleep_ctl apple_sleep_reg_ctl = {
-    apple_sleep_reg_commit_stops, apple_sleep_reg_enclave_admit,
-};
-static const struct apple_sleep_ctl *apple_sleep_ctl = &apple_sleep_reg_ctl;
+#define APPLE_SLEEP_REG_ENCLAVE_ANY BIT(0)
+#define APPLE_SLEEP_REG_BOUND BIT(8)
+#define APPLE_SLEEP_REG_READY BIT(9)
+/* The T8140 controller as its probe leaves the registry: bound, then ready. */
+static unsigned int apple_sleep_reg = APPLE_SLEEP_REG_BOUND | APPLE_SLEEP_REG_READY;
+static unsigned int apple_sleep_dry;
 static struct {
     struct device *dev; int (*stop)(void *); void *data;
 } apple_sleep_enclave;
@@ -277,7 +274,7 @@ void fixture(void) {
     memset(&hw, 0, sizeof(hw));
     mbox = (struct apple_mbox){ .regs = &hw, .hw = &hw, .rx = foreign_rx, .cookie = &device };
     config_enabled = hyp = sep_pm_suspending = dart_present = dart_ready = map_ok = true;
-    firmware = tx_ready = true; apple_sleep = &device;
+    firmware = tx_ready = true; apple_sleep_reg = APPLE_SLEEP_REG_BOUND | APPLE_SLEEP_REG_READY;
     real_wake = pending_wake = late_wake = sleep_refuse_before_send = false;
     domain_error = property_error = address_error = read_error = gate_after = reads = 0;
     put_refs = maps = unmaps = lookups = prepares = restores = sends = closes = 0;
@@ -294,7 +291,7 @@ void parameter(int which, int value) {
     case 0: config_enabled = value; break; case 1: hyp = value; break;
     case 2: sep_pm_suspending = value; break; case 3: dart_present = value; break;
     case 4: map_ok = value; break; case 5: domain_error = value; break;
-    case 6: read_error = value; break; case 7: apple_sleep = value ? &device : NULL; break;
+    case 6: read_error = value; break; case 7: apple_sleep_reg = APPLE_SLEEP_REG_BOUND | (value ? APPLE_SLEEP_REG_READY : 0); break;
     case 8: gate_after = value; break; case 9: sep_pm_commit.registered = value; break;
     case 10: read_error_after = value; break; case 11: dart_ready = value; break;
     case 12: real_wake = value; break; case 13: hw.is_ascwrap_v8 = value; break;
@@ -725,7 +722,7 @@ def sources(source, contracts, mutation):
                  'sep_pm_commit_prepare', 'sep_pm_commit_finish', 'sep_pm_suspend_noirq',
                  'sep_pm_notify'],
         'mailbox': ['apple_mbox_poll_one_supported', 'apple_mbox_poll_one'],
-        'sleep': ['apple_sleep_reg_commit_stops', 'apple_sleep_reg_enclave_admit'],
+        'sleep': ['apple_sleep_power_loss'],
         'registry': ['apple_sleep_commit_stops_coprocs', 'apple_sleep_enclave_register',
                      'apple_sleep_enclave_unregister'],
         'pm': ['leave_for_commit', 'commit_finish', 'clear_dev_disable', 'dart_restore'],

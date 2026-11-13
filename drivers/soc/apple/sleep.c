@@ -776,22 +776,6 @@ bool apple_sleep_power_loss(void)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_power_loss);
 
-/* The registry's questions, answered for this SoC's sleep. */
-static bool apple_sleep_reg_commit_stops(void)
-{
-	return READ_ONCE(apple_sleep) && pm_suspend_via_firmware();
-}
-
-static int apple_sleep_reg_enclave_admit(void)
-{
-	return apple_sleep_reg_commit_stops() ? 0 : -EOPNOTSUPP;
-}
-
-static const struct apple_sleep_ctl apple_sleep_reg_ctl = {
-	.commit_stops = apple_sleep_reg_commit_stops,
-	.enclave_admit = apple_sleep_reg_enclave_admit,
-};
-
 /*
  * The other cores stop at the commit, and one left awake there keeps the engine waiting
  * until WD2 resets the SoC. Each answers here, before the display goes off, and waits for the
@@ -3693,12 +3677,12 @@ static int apple_sleep_probe(struct platform_device *pdev)
 
 	/* A SoC with its own sequences also has its own conditions, and its own answers. */
 	if (soc && soc->part) {
-		ret = apple_sleep_registry_bind(&soc->part->registry);
+		ret = apple_sleep_registry_bind(soc->part->registry_flags);
 		if (ret)
 			return dev_err_probe(dev, ret, "another sleep controller is bound\n");
 		ret = soc->part->probe(pdev);
 		if (ret)
-			apple_sleep_registry_unbind(&soc->part->registry);
+			apple_sleep_registry_unbind();
 
 		return ret;
 	}
@@ -3756,17 +3740,18 @@ static int apple_sleep_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, s);
 
-	ret = apple_sleep_registry_bind(&apple_sleep_reg_ctl);
+	ret = apple_sleep_registry_bind(0);
 	if (ret)
 		return dev_err_probe(dev, ret, "another sleep controller is bound\n");
 	ret = spin_table_set_power_ops(&sleep_cpu_power_ops);
 	if (ret) {
-		apple_sleep_registry_unbind(&apple_sleep_reg_ctl);
+		apple_sleep_registry_unbind();
 		return dev_err_probe(dev, ret, "cannot control CPU power\n");
 	}
 
 	/* Last: the exported helpers take it as a probed driver, and a failure frees s. */
 	apple_sleep = s;
+	apple_sleep_registry_ready();
 	/* Deep becomes the default sleep state, unless mem_sleep_default= chose another. */
 	suspend_set_ops(&apple_sleep_ops);
 

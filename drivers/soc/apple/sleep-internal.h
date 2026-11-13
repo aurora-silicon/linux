@@ -57,19 +57,18 @@ struct apple_sleep_coproc *apple_sleep_coproc_find(struct device *dev);
 
 /*
  * The sleep controller bound on this SoC. Each binds only to its own SoC's
- * compatible, so at most one is bound.
+ * compatible, so at most one is bound. Bound, it tells the registry when its
+ * probe is complete: from then on a suspend through firmware that is not a dry
+ * run is one whose commit stops the registered coprocessors.
  *
- * @commit_stops: this sleep's commit stops the registered coprocessors.
- * @enclave_admit: 0 to take an enclave registration, or the error to refuse
- *	it with. NULL takes every one.
+ * APPLE_SLEEP_REG_ENCLAVE_ANY: take every enclave registration. Without it one
+ * is taken only while such a commit is the case.
  */
-struct apple_sleep_ctl {
-	bool (*commit_stops)(void);
-	int (*enclave_admit)(void);
-};
+#define APPLE_SLEEP_REG_ENCLAVE_ANY	BIT(0)
 
-int apple_sleep_registry_bind(const struct apple_sleep_ctl *ctl);
-void apple_sleep_registry_unbind(const struct apple_sleep_ctl *ctl);
+int apple_sleep_registry_bind(unsigned int flags);
+void apple_sleep_registry_unbind(void);
+void apple_sleep_registry_ready(void);
 
 /* Must match aura's struct aura_s2r_mailbox. */
 #define AURA_S2R_MAGIC		0x3152325341525541ULL	/* "AURAS2R1" */
@@ -270,12 +269,12 @@ static inline void apple_sleep_wd2_arm(void __iomem *wdt, unsigned int secs)
  * A SoC whose sleep doesn't fit the lists of struct apple_sleep_soc brings its own sequences.
  * @probe then runs in place of the driver's own, and installs the part's suspend operations.
  * @restore, if set, runs when the system comes back from a hibernation image.
- * @registry: the part's answers to the registry, which the driver binds around @probe.
+ * @registry_flags: how the part binds to the registry, which the driver does around @probe.
  */
 struct apple_sleep_part {
 	int (*probe)(struct platform_device *pdev);
 	int (*restore)(struct device *dev);
-	struct apple_sleep_ctl registry;
+	unsigned int registry_flags;
 };
 
 /* sleep-t6040.c */

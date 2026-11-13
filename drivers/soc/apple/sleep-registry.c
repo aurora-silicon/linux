@@ -29,23 +29,32 @@ struct apple_sleep_enclave apple_sleep_enclave;
 /* Guards the table, the enclave slot and the bound controller. */
 DEFINE_MUTEX(apple_sleep_coprocs_lock);
 
-static const struct apple_sleep_ctl *apple_sleep_ctl;
+#define APPLE_SLEEP_REG_BOUND	BIT(8)
+#define APPLE_SLEEP_REG_READY	BIT(9)
 
-int apple_sleep_registry_bind(const struct apple_sleep_ctl *ctl)
+/* The bound controller's flags and state. */
+static unsigned int apple_sleep_reg;
+
+int apple_sleep_registry_bind(unsigned int flags)
 {
 	guard(mutex)(&apple_sleep_coprocs_lock);
-	if (apple_sleep_ctl)
+	if (apple_sleep_reg & APPLE_SLEEP_REG_BOUND)
 		return -EBUSY;
-	WRITE_ONCE(apple_sleep_ctl, ctl);
+	WRITE_ONCE(apple_sleep_reg, flags | APPLE_SLEEP_REG_BOUND);
 
 	return 0;
 }
 
-void apple_sleep_registry_unbind(const struct apple_sleep_ctl *ctl)
+void apple_sleep_registry_unbind(void)
 {
 	guard(mutex)(&apple_sleep_coprocs_lock);
-	if (apple_sleep_ctl == ctl)
-		WRITE_ONCE(apple_sleep_ctl, NULL);
+	WRITE_ONCE(apple_sleep_reg, 0);
+}
+
+void apple_sleep_registry_ready(void)
+{
+	guard(mutex)(&apple_sleep_coprocs_lock);
+	WRITE_ONCE(apple_sleep_reg, apple_sleep_reg | APPLE_SLEEP_REG_READY);
 }
 
 struct apple_sleep_coproc *apple_sleep_coproc_find(struct device *dev)
@@ -138,22 +147,18 @@ EXPORT_SYMBOL_GPL(apple_sleep_coproc_set_last_check);
 /* With no sleep controller bound, nothing would ever send the request: refuse it. */
 int apple_sleep_enclave_register(struct device *dev, int (*stop)(void *data), void *data)
 {
-	const struct apple_sleep_ctl *ctl;
-	int ret;
+	unsigned int reg;
 
 	if (!is_kernel_in_hyp_mode())
 		return -ENODEV;
 
 	if (!stop)
 		return -EINVAL;
-	ctl = READ_ONCE(apple_sleep_ctl);
-	if (!ctl)
+	reg = READ_ONCE(apple_sleep_reg);
+	if (!(reg & APPLE_SLEEP_REG_BOUND))
 		return -EOPNOTSUPP;
-	if (ctl->enclave_admit) {
-		ret = ctl->enclave_admit();
-		if (ret)
-			return ret;
-	}
+	if (!(reg & APPLE_SLEEP_REG_ENCLAVE_ANY) && !apple_sleep_commit_stops_coprocs())
+		return -EOPNOTSUPP;
 
 	guard(mutex)(&apple_sleep_coprocs_lock);
 	if (apple_sleep_enclave.dev)
@@ -210,9 +215,8 @@ EXPORT_SYMBOL_GPL(apple_sleep_coproc_stopped);
 
 bool apple_sleep_commit_stops_coprocs(void)
 {
-	const struct apple_sleep_ctl *ctl = READ_ONCE(apple_sleep_ctl);
-
-	return ctl && ctl->commit_stops();
+	return (READ_ONCE(apple_sleep_reg) & APPLE_SLEEP_REG_READY) && is_kernel_in_hyp_mode() &&
+	       apple_sleep_power_loss();
 }
 EXPORT_SYMBOL_GPL(apple_sleep_commit_stops_coprocs);
 
