@@ -309,7 +309,12 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 	 * and the sleep engine, which powers them up itself in a wake that keeps DRAM
 	 * up, stalls on a latched one until its watchdog resets the SoC. Only a PS
 	 * reset clears it, and the domain is off, so pulse one as on the power-on
-	 * path (not in a system sleep transition, see apple_pmgr_ps_clear_latch()).
+	 * path.
+	 *
+	 * T8140 only. Other SoCs do not need it: on T8112 the gfx domain reaches
+	 * off with BUSY set before every system sleep and is fine left that way,
+	 * while a PS reset of a domain whose block is still busy can reset the
+	 * whole SoC (a hung ANE does on T8112).
 	 */
 	/*
 	 * Off only once BUSY clears too: macOS waits for (word & 0x8ff) == 0. The
@@ -322,15 +327,19 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 						APPLE_PMGR_BUSY_SETTLE_US);
 
 	if (!ret && pstate != APPLE_PMGR_PS_ACTIVE && (cur & APPLE_PMGR_BUSY) &&
-	    !FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) && (!ps->system_sleep || ps->macos_lower) &&
-	    !ps->wait_parent && !ps->strict_state && !ps->externally_clocked) {
-		/* macOS never needs this: say so when it does. */
-		if (ps->macos_lower)
+	    !FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) && !ps->wait_parent &&
+	    !ps->strict_state && !ps->externally_clocked) {
+		if (ps->macos_lower) {
+			/* macOS never needs this: say so when it does. */
 			dev_info_ratelimited(ps->dev,
 					     "PS %s: off with BUSY%s: %#x; cleared by a PS reset\n",
 					     genpd->name, ps->system_sleep ? " in a system sleep" : "",
 					     cur);
-		apple_pmgr_ps_unlatch_off(ps, &cur);
+			apple_pmgr_ps_unlatch_off(ps, &cur);
+		} else {
+			dev_dbg(ps->dev, "PS %s: off with BUSY: %#x; left as it is\n",
+				genpd->name, cur);
+		}
 	}
 
 report:
