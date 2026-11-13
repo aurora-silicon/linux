@@ -189,6 +189,23 @@ impl PmpData {
         let pmp_mmio = pmp_req.iomap_sized::<PMP_MIN_MMIO_SIZE>()?.into_devres()?;
         let asc_req = dev.io_request_by_name(c"asc").ok_or(EINVAL)?;
         let asc_mmio = asc_req.iomap_sized::<ASC_MMIO_SIZE>()?.into_devres()?;
+        // The SRAM range kept over a sleep, if the SoC's config has none: from the DT, where
+        // the boot loader puts it.
+        let sram_backup = match cfg.sram_backup {
+            Some(range) => Some(range),
+            None => {
+                let node = dev.as_ref().fwnode().ok_or(EIO)?;
+                let prop_name = c"apple,sram-keep";
+                if node.property_present(prop_name) {
+                    let v = node
+                        .property_read_array_vec::<u32>(prop_name, 2)?
+                        .required_by(dev.as_ref())?;
+                    Some((v[0] as usize, v[1] as usize))
+                } else {
+                    None
+                }
+            }
+        };
         Arc::pin_init(
             try_pin_init!(
                 PmpData {
@@ -201,7 +218,7 @@ impl PmpData {
                     asc_mmio,
                     display: AtomicPtr::new(core::ptr::null_mut()),
                     display_error: AtomicI32::new(0),
-                    sram_backup: cfg.sram_backup,
+                    sram_backup,
                 }
             ),
             GFP_KERNEL,
@@ -882,7 +899,8 @@ const HW_CFG_T8142: PmpHwConfig = PmpHwConfig {
 };
 
 /// T6050: the DART window starts at 1 TiB (ADT dart-pmp0 vm-base) and spans
-/// 64 GiB, as on T8142. Its firmware never readies endpoint 7 (-ETIME).
+/// 64 GiB, as on T8142. Its firmware never readies endpoint 7 (-ETIME). The
+/// SRAM it keeps over a sleep comes from the DT (`apple,sram-keep`).
 const HW_CFG_T6050: PmpHwConfig = PmpHwConfig {
     dma_mask: Some(DmaMask::new::<42>()),
     check_bootargs_uuid: false,

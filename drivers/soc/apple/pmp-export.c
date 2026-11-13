@@ -145,8 +145,10 @@ static int apple_pmp_commit_stop_fn(void *unused)
 	apple_rtkit_mailbox_recv_off(c->rtk);
 	for (i = 0; c->sram && i < c->count; i++)
 		c->words[i] = readl_relaxed(c->sram + 4 * i);
-	/* Told to idle, it can't carry on whatever it answered: the sleep goes on. */
-	return ret ? 1 : 0;
+	/* Told to idle, it can't carry on whatever it answered: the sleep goes on. The value is
+	 * reported before the timer.
+	 */
+	return ret;
 }
 
 /*

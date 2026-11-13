@@ -78,6 +78,18 @@ properties:
   '#size-cells':
     const: 0
 
+  apple,ptd-boot:
+    $ref: /schemas/types.yaml#/definitions/uint64-matrix
+    items:
+      items:
+        - description:
+            The entry to write, or 0xfff to wait for the memory-cache channel's
+            echo of the value, or 0xffe to read the entry the value names.
+        - description: Value
+    description:
+      T6050. PTD entries written once the PMP runs, in order, which no driver
+      otherwise writes. Set by the bootloader.
+
   operating-points-v2: true
   apple,dram-type: true
   apple,data-bus-width: true

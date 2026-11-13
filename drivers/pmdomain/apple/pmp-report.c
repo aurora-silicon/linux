@@ -131,6 +131,8 @@ struct apple_pmp_report {
 	struct delayed_work ready_work;
 	/* J613 floor owner, absent on all other report instances. */
 	struct j613_floor *j613;
+	/* T6050: XNU's boot-time PTD writes are done */
+	bool t6050_boot_done;
 };
 
 static bool apple_pmp_report_running(const struct apple_pmp_report *rep)
@@ -431,6 +433,68 @@ static void apple_pmp_report_release(void *data)
 }
 
 /*
+ * T6050: the PTD entries the PMP's memory-cache channel and PPM-TO-SMC need at boot, which no
+ * Linux driver otherwise writes, from the DT (apple,ptd-boot: entry and value pairs, where the
+ * boot loader puts them). An entry is written at the update page (+0x10000, 8 bytes each) and
+ * read at the read aperture (16 bytes each). Entry 0xfff waits for the channel's echo (0x269) of
+ * the value; entry 0xffe reads the entry the value names.
+ */
+#define PTD_W(e)		(0x10000 + 8 * (e))
+#define PTD_R(e)		(16 * (e))
+#define T6050_MC_ECHO		0x269
+#define T6050_PTD_WAIT		0xfff
+#define T6050_PTD_READ		0xffe
+#define T6050_PTD_ENTRIES	0x400
+#define T6050_MC_FIRST_MS	3000
+#define T6050_MC_STEP_MS	100
+
+static void apple_pmp_report_t6050_boot(struct apple_pmp_report *rep)
+{
+	struct device_node *np = rep->dev->of_node;
+	int n = of_property_count_u64_elems(np, "apple,ptd-boot");
+	unsigned int i, waited = 0;
+	u64 *seq, val = 0;
+	int ret = 0;
+
+	if (rep->t6050_boot_done || !of_device_is_compatible(np, "apple,t6050-pmp-v2-report"))
+		return;
+	rep->t6050_boot_done = true;
+	if (n <= 0)
+		return;
+	if (n % 2) {
+		dev_err(rep->dev, "apple,ptd-boot is not in pairs\n");
+		return;
+	}
+	seq = kcalloc(n, sizeof(*seq), GFP_KERNEL);
+	if (!seq)
+		return;
+	if (of_property_read_u64_array(np, "apple,ptd-boot", seq, n))
+		goto out;
+	for (i = 0; i < n; i += 2) {
+		u64 e = seq[i], want = seq[i + 1];
+
+		if (e == T6050_PTD_WAIT) {
+			ret = readq_poll_timeout(rep->base + PTD_R(T6050_MC_ECHO), val, val == want,
+						 1000, (waited++ ? T6050_MC_STEP_MS :
+							T6050_MC_FIRST_MS) * 1000);
+			if (ret)
+				break;
+		} else if (e == T6050_PTD_READ && want < T6050_PTD_ENTRIES) {
+			readq(rep->base + PTD_R(want));
+		} else if (e < T6050_PTD_ENTRIES) {
+			writeq(want, rep->base + PTD_W(e));
+		}
+	}
+	if (ret)
+		dev_err(rep->dev, "PTD boot entries: no echo of %llu at step %u (echo %#llx)\n",
+			seq[i + 1], i / 2, val);
+	else
+		dev_info(rep->dev, "PTD boot entries written (%d steps)\n", n / 2);
+out:
+	kfree(seq);
+}
+
+/*
  * Wait for the PMP to run, then hand it every request made so far, as macOS
  * does for each PMP-notified device that is already powered on.
  */
@@ -466,6 +530,7 @@ static void apple_pmp_report_ready_work(struct work_struct *work)
 			 want, val);
 	dev_info(rep->dev, "PMP running (status %#llx), requests %#llx\n",
 		 readq(rep->base + offs->status), want);
+	apple_pmp_report_t6050_boot(rep);
 }
 
 /* A report names its PMP where a SoC has more than one kind of link to it. */
