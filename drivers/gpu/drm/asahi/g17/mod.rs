@@ -1170,6 +1170,18 @@ const RETIRED_FEATURES: u64 = (uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE
     | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES) as u64;
 const _: () = assert!(M5_FEATURES & RETIRED_FEATURES == 0);
 
+unsafe extern "C" {
+    fn asahi_g17_gpubench_opt() -> u32;
+}
+
+/// Measurement only: whether submission-path change `bit` is on (`aurora.gpubench_opt`). Each
+/// user reads its bit once per publication or event pass, so the mask may change at any time.
+pub(crate) fn opt(bit: u32) -> bool {
+    // SAFETY: Reads a module parameter word.
+    let enabled = unsafe { asahi_g17_gpubench_opt() };
+    enabled & bit != 0
+}
+
 /// Event work item ID.
 const EVENT_WORK: u64 = 0;
 /// Short control/retirement polls do not wait behind the longer idle deadline.
