@@ -163,6 +163,16 @@
 	aop_als: als {
 		compatible = "apple,t8142-aop-als", "apple,aop-als";
 	};
+
+	/*
+	 * Lid angle: the J815 AOP firmware announces a "las" service, which
+	 * macOS 27.2 on this machine binds as an AppleSPUHIDDevice (usage page
+	 * 0x20, usage 0x8a), as on T6050. The ADT's i2c1 "mogul-las" is the
+	 * sensor's authentication chip, not the angle.
+	 */
+	aop_las: las {
+		compatible = "apple,t8142-aop-las", "apple,aop-las";
+	};
 };
 
 /*
