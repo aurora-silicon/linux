@@ -27,6 +27,34 @@ extern "C" {
 }
 
 extern "C" {
+    fn asahi_hibernate_gate_init() -> c_int;
+    fn asahi_hibernate_gate_exit();
+}
+
+/// The hibernation gate notifier, in the PM notifier chain from module load to unload.
+/// Declare it after every field that registers a device: they are dropped first.
+pub(crate) struct HibernateGate(());
+
+impl HibernateGate {
+    pub(crate) fn new() -> kernel::error::Result<Self> {
+        // SAFETY: Module init, once, before any device is bound.
+        let ret = unsafe { asahi_hibernate_gate_init() };
+        if ret < 0 {
+            Err(kernel::error::Error::from_errno(ret))
+        } else {
+            Ok(Self(()))
+        }
+    }
+}
+
+impl Drop for HibernateGate {
+    fn drop(&mut self) {
+        // SAFETY: Registered by `new`; the drivers that count devices are gone (field order).
+        unsafe { asahi_hibernate_gate_exit() };
+    }
+}
+
+extern "C" {
     fn asahi_sysfs_register_idle(dev: *mut c_void, word: *mut u32) -> c_int;
 }
 

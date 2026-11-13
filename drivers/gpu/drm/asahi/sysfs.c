@@ -6,17 +6,17 @@
 
 #include <linux/atomic.h>
 #include <linux/device.h>
+#include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/export.h>
 #include <linux/module.h>
-#include <linux/notifier.h>
-#include <linux/suspend.h>
 #include <linux/slab.h>
 #include <linux/stddef.h>
 #include <linux/string.h>
 #include <linux/sysfs.h>
 #include <linux/types.h>
 
+#include "g17/hibernate.h"
 #include "sysfs.h"
 
 /* Legacy prefix of repr(C) Rust atomics; READ_ONCE accesses current values. */
@@ -53,101 +53,11 @@ struct asahi_stats_attribute {
 	const struct asahi_gpu_memory *memory;
 	bool export_enabled;
 	asahi_stats_read_fn read;
-	asahi_stats_suspend_fn suspend;
 	asahi_stats_frequency_fn frequency;
 	asahi_stats_hibernate_fn hibernate;
-	struct notifier_block pm_notifier;
-	/* Drain at PM_HIBERNATION_PREPARE ahead of the display and PMP notifiers. */
-	struct notifier_block hib_notifier;
-	/* pm_notifier saw PM_HIBERNATION_PREPARE: it owns the thaw at PM_POST_HIBERNATION. */
-	bool hib_late_prepared;
+	/* System sleep and hibernation notifiers (g17/hibernate.c), NULL without suspend. */
+	void *pm_hooks;
 };
-
-#ifdef CONFIG_HIBERNATION
-/*
- * Hibernation gate. Native graphics owns firmware DMA (GPU page tables,
- * queues, firmware heap) that a hibernation image cannot recreate: after a
- * resume from disk the GPU is the instance the boot loader left halted, not
- * the one this driver programmed.
- *
- * A backend with a cold restore path (G17: it registers a hibernate
- * callback) drains its GPU at PM_HIBERNATION_PREPARE and re-boots the
- * firmware against the restored host state at PM_POST_HIBERNATION; while
- * only such devices are bound, hibernation is allowed. Any other bound GPU
- * refuses it.
- *
- * Restoring an image is always refused while a GPU is bound here: the kernel
- * that restores must not own a GPU firmware session of its own, since the
- * image's driver would then find a running firmware it did not program.
- */
-static atomic_t asahi_hibernate_devices = ATOMIC_INIT(0);
-/* Bound devices without a hibernate callback. */
-static atomic_t asahi_hibernate_unrestorable = ATOMIC_INIT(0);
-
-static int asahi_hibernate_notify(struct notifier_block *nb, unsigned long action,
-				  void *unused)
-{
-	int devices = atomic_read(&asahi_hibernate_devices);
-
-	switch (action) {
-	case PM_HIBERNATION_PREPARE:
-		if (devices && atomic_read(&asahi_hibernate_unrestorable)) {
-			pr_warn("asahi: refusing hibernation: a bound GPU has no restore path\n");
-			return notifier_from_errno(-EBUSY);
-		}
-		break;
-	case PM_RESTORE_PREPARE:
-		/*
-		 * A restorable (G17) device bound here would leave a firmware running
-		 * with this kernel's graph under the image's driver, which then takes it
-		 * for its own, and a backend without a restore path cannot be restored
-		 * at all: always refuse.
-		 */
-		if (devices) {
-			pr_warn("asahi: refusing to restore an image: this kernel owns a GPU firmware session\n");
-			return notifier_from_errno(-EBUSY);
-		}
-		break;
-	default:
-		break;
-	}
-	return NOTIFY_OK;
-}
-
-static struct notifier_block asahi_hibernate_nb = {
-	.notifier_call = asahi_hibernate_notify,
-	/* Ahead of the G17 drain (20): a refusal costs no drain. */
-	.priority = 30,
-};
-
-static int asahi_hibernate_device_bound(bool restorable)
-{
-	int ret = 0;
-
-	if (!restorable)
-		atomic_inc(&asahi_hibernate_unrestorable);
-	if (atomic_inc_return(&asahi_hibernate_devices) == 1) {
-		ret = register_pm_notifier(&asahi_hibernate_nb);
-		if (ret) {
-			atomic_dec(&asahi_hibernate_devices);
-			if (!restorable)
-				atomic_dec(&asahi_hibernate_unrestorable);
-		}
-	}
-	return ret;
-}
-
-static void asahi_hibernate_device_unbound(bool restorable)
-{
-	if (atomic_dec_and_test(&asahi_hibernate_devices))
-		unregister_pm_notifier(&asahi_hibernate_nb);
-	if (!restorable)
-		atomic_dec(&asahi_hibernate_unrestorable);
-}
-#else
-static inline int asahi_hibernate_device_bound(bool restorable) { return 0; }
-static inline void asahi_hibernate_device_unbound(bool restorable) { }
-#endif
 
 /* 0: unavailable, 1: valid, 2: stale, 3: unsupported; matches g17::telemetry. */
 static const char *asahi_stats_quality(u32 status)
@@ -216,76 +126,6 @@ static ssize_t agx_qualified_stats_show(struct asahi_stats_attribute *stats, cha
 			   (unsigned long long)snap.util_samples,
 			   (unsigned long long)snap.util_host_ns);
 	return n;
-}
-
-static int asahi_stats_pm_notify(struct notifier_block *nb, unsigned long action, void *unused)
-{
-	struct asahi_stats_attribute *stats =
-		container_of(nb, struct asahi_stats_attribute, pm_notifier);
-
-	switch (action) {
-	case PM_HIBERNATION_PREPARE:
-		/* The drain already ran in asahi_stats_hib_notify(). */
-		stats->suspend(stats->snapshot, true);
-		WRITE_ONCE(stats->hib_late_prepared, true);
-		break;
-	case PM_SUSPEND_PREPARE:
-	case PM_RESTORE_PREPARE:
-		stats->suspend(stats->snapshot, true);
-		break;
-	case PM_POST_HIBERNATION:
-		/*
-		 * After a resume from disk the boot loader has cold-restarted the GPU
-		 * firmware while the host state was restored from the image; after an
-		 * aborted hibernation the firmware kept running. The callback tells
-		 * them apart, re-boots a cold firmware against the restored state and
-		 * reopens submission. This notifier has a lower priority than the PMP
-		 * restore, which has already run.
-		 */
-		if (stats->hibernate)
-			stats->hibernate(stats->snapshot, ASAHI_HIBERNATE_THAW);
-		stats->suspend(stats->snapshot, false);
-		WRITE_ONCE(stats->hib_late_prepared, false);
-		break;
-	case PM_POST_SUSPEND:
-	case PM_POST_RESTORE:
-		stats->suspend(stats->snapshot, false);
-		break;
-	}
-	return NOTIFY_OK;
-}
-
-/*
- * G17 drain, at a priority above the display (DCP) and PMP notifiers: a GPU that cannot be
- * drained refuses the hibernation before any other driver has given anything up (the DCP
- * releases its display links at PM_HIBERNATION_PREPARE). A refusal here reaches no later
- * notifier, and the chain sends PM_POST_HIBERNATION only to the notifiers before it.
- *
- * The thaw stays with asahi_stats_pm_notify(), below the PMP restore that a cold firmware
- * needs. Only when the transition failed before that notifier saw PM_HIBERNATION_PREPARE
- * (a later notifier refused it) does it never get PM_POST_HIBERNATION; the firmware then
- * kept running, and the thaw runs here. After a resume from disk the flag is set in the
- * image, so the restored kernel leaves the cold republish to asahi_stats_pm_notify().
- */
-static int asahi_stats_hib_notify(struct notifier_block *nb, unsigned long action, void *unused)
-{
-	struct asahi_stats_attribute *stats =
-		container_of(nb, struct asahi_stats_attribute, hib_notifier);
-	int ret;
-
-	switch (action) {
-	case PM_HIBERNATION_PREPARE:
-		WRITE_ONCE(stats->hib_late_prepared, false);
-		ret = stats->hibernate(stats->snapshot, ASAHI_HIBERNATE_FREEZE);
-		if (ret)
-			return notifier_from_errno(ret);
-		break;
-	case PM_POST_HIBERNATION:
-		if (!READ_ONCE(stats->hib_late_prepared))
-			stats->hibernate(stats->snapshot, ASAHI_HIBERNATE_THAW);
-		break;
-	}
-	return NOTIFY_OK;
 }
 
 static ssize_t agx_stats_show(struct device *dev,
@@ -410,29 +250,13 @@ int asahi_sysfs_register(struct device *dev, const void *snapshot,
 	stats->snapshot = snapshot;
 	stats->export_enabled = export_enabled;
 	stats->read = read;
-	stats->suspend = suspend;
 	stats->frequency = frequency;
 	stats->hibernate = hibernate;
-	if (suspend) {
-		stats->pm_notifier.notifier_call = asahi_stats_pm_notify;
-		/* Below the PMP restore notifier (priority 10), which must run first. */
-		stats->pm_notifier.priority = -10;
-		ret = register_pm_notifier(&stats->pm_notifier);
-		if (ret) {
-			kfree(stats);
-			return ret;
-		}
-		if (hibernate) {
-			stats->hib_notifier.notifier_call = asahi_stats_hib_notify;
-			/* Ahead of the display (10, -5) and PMP (10) notifiers. */
-			stats->hib_notifier.priority = 20;
-			ret = register_pm_notifier(&stats->hib_notifier);
-			if (ret) {
-				unregister_pm_notifier(&stats->pm_notifier);
-				kfree(stats);
-				return ret;
-			}
-		}
+	stats->pm_hooks = asahi_pm_hooks_register(snapshot, suspend, hibernate);
+	if (IS_ERR(stats->pm_hooks)) {
+		ret = PTR_ERR(stats->pm_hooks);
+		kfree(stats);
+		return ret;
 	}
 
 	/*
@@ -441,16 +265,7 @@ int asahi_sysfs_register(struct device *dev, const void *snapshot,
 	 * notifier (-10, which marks the late prepare) without the drain (20), and
 	 * the image would hold a GPU that was never drained.
 	 */
-	ret = asahi_hibernate_device_bound(hibernate);
-	if (ret) {
-		if (stats->suspend) {
-			if (stats->hibernate)
-				unregister_pm_notifier(&stats->hib_notifier);
-			unregister_pm_notifier(&stats->pm_notifier);
-		}
-		kfree(stats);
-		return ret;
-	}
+	asahi_hibernate_device_bound(hibernate);
 
 	sysfs_attr_init(&stats->memory_attr.attr);
 	stats->memory_attr.attr.name = "gpu_memory";
@@ -461,11 +276,7 @@ int asahi_sysfs_register(struct device *dev, const void *snapshot,
 	ret = device_create_file(dev, &stats->attr);
 	if (ret) {
 		asahi_hibernate_device_unbound(hibernate);
-		if (stats->suspend) {
-			if (stats->hibernate)
-				unregister_pm_notifier(&stats->hib_notifier);
-			unregister_pm_notifier(&stats->pm_notifier);
-		}
+		asahi_pm_hooks_unregister(stats->pm_hooks);
 		kfree(stats);
 		return ret;
 	}
@@ -474,11 +285,7 @@ int asahi_sysfs_register(struct device *dev, const void *snapshot,
 	if (ret) {
 		device_remove_file(dev, &stats->attr);
 		asahi_hibernate_device_unbound(hibernate);
-		if (stats->suspend) {
-			if (stats->hibernate)
-				unregister_pm_notifier(&stats->hib_notifier);
-			unregister_pm_notifier(&stats->pm_notifier);
-		}
+		asahi_pm_hooks_unregister(stats->pm_hooks);
 		kfree(stats);
 		return ret;
 	}
@@ -538,11 +345,7 @@ void asahi_sysfs_unregister(struct device *dev, void *handle)
 	/* Out of the gate first: the reverse of asahi_sysfs_register(). */
 	asahi_hibernate_device_unbound(stats->hibernate);
 	/* Both notifier removal and file removal join readers of the Rust Arc. */
-	if (stats->suspend) {
-		if (stats->hibernate)
-			unregister_pm_notifier(&stats->hib_notifier);
-		unregister_pm_notifier(&stats->pm_notifier);
-	}
+	asahi_pm_hooks_unregister(stats->pm_hooks);
 	/* Removal drains active show callbacks before either allocation dies. */
 	device_remove_file(dev, &stats->memory_attr);
 	device_remove_file(dev, &stats->attr);

@@ -557,6 +557,10 @@ struct notifier_block { int (*notifier_call)(struct notifier_block*,unsigned lon
 static int notifier_from_errno(int err) { return err?NOTIFY_STOP_MASK|(NOTIFY_OK-err):NOTIFY_OK; }
 #define ENODEV 19
 #define ENOMEM 12
+#define EBUSY 16
+#define ERR_PTR(e) ((void*)(long)(e))
+#define PTR_ERR(p) ((long)(p))
+#define IS_ERR(p) ((unsigned long)(p)>=(unsigned long)-4095)
 #define BUILD_BUG_ON(x) _Static_assert(!(x),#x)
 #define kzalloc_obj(x) calloc(1,sizeof(x))
 #define sysfs_attr_init(x) ((void)0)
@@ -657,8 +661,10 @@ int main(void) {
     assert(!asahi_sysfs_register(&dev,&snap,1,&memory,&handle,read_stats,suspend_stats,NULL,NULL));
     struct asahi_stats_attribute *registered_stats=handle;
     assert(registered==1 && removed==0);
-    asahi_stats_pm_notify(&registered_stats->pm_notifier,PM_SUSPEND_PREPARE,NULL);
-    asahi_stats_pm_notify(&registered_stats->pm_notifier,PM_POST_SUSPEND,NULL);
+    struct asahi_pm_hooks *hooks=registered_stats->pm_hooks;
+    assert(hooks->pm_notifier.priority==-10);
+    asahi_pm_notify(&hooks->pm_notifier,PM_SUSPEND_PREPARE,NULL);
+    asahi_pm_notify(&hooks->pm_notifier,PM_POST_SUSPEND,NULL);
     assert(suspend_calls==11);
     asahi_sysfs_unregister(&dev,handle);
     assert(removed==1);
@@ -762,6 +768,7 @@ fn write_power(_: &super::Firmware, f:&mut kernel::fmt::Formatter<'_>)->kernel::
     if args.mutation == 'legacy-format':
         source = source.replace('READ_ONCE(snap->util1)', 'READ_ONCE(snap->util2)', 1)
     header = (DRIVER / 'sysfs.h').read_text()
+    hibernate = (DRIVER / 'g17/hibernate.c').read_text()
     baseline = subprocess.check_output(['git', '-C', str(ROOT), 'show', args.baseline + ':drivers/gpu/drm/asahi/sysfs.c'], text=True)
     pieces = [C_HEADER]
     for signature in ['struct asahi_qualified_stats']:
@@ -769,11 +776,17 @@ fn write_power(_: &super::Firmware, f:&mut kernel::fmt::Formatter<'_>)->kernel::
     pieces += [line for line in header.splitlines() if line.startswith(('typedef', '#define ASAHI_HIBERNATE_'))]
     for signature in ['struct asahi_stats_snapshot', 'struct asahi_gpu_memory', 'struct asahi_stats_attribute']:
         pieces.append(item(source, signature) + ';')
+    # The notifier hooks live in g17/hibernate.c. The gate is built out without CONFIG_HIBERNATION.
+    pieces += [line for line in hibernate.splitlines() if line.startswith('#define ASAHI_PM_PRIO_')]
+    pieces.append(item(hibernate, 'struct asahi_pm_hooks') + ';')
+    for signature in ['void asahi_hibernate_device_bound(bool restorable) {', 'void asahi_hibernate_device_unbound(bool restorable) {']:
+        pieces.append(item(hibernate, signature))
+    for signature in ['static int asahi_pm_notify', 'static int asahi_pm_drain_notify',
+                      'void *asahi_pm_hooks_register(', 'void asahi_pm_hooks_unregister(']:
+        pieces.append(item(hibernate, signature))
     pieces.append(item(baseline, 'static ssize_t agx_stats_show').replace('agx_stats_show(', 'old_agx_stats_show(', 1))
-    # No CONFIG_HIBERNATION here: the gate that counts the bound devices is built out.
-    for signature in ['static inline int asahi_hibernate_device_bound', 'static inline void asahi_hibernate_device_unbound',
-                      'static const char *asahi_stats_quality', 'static ssize_t agx_qualified_stats_show',
-                      'static int asahi_stats_pm_notify', 'static int asahi_stats_hib_notify', 'static ssize_t agx_stats_show',
+    for signature in ['static const char *asahi_stats_quality', 'static ssize_t agx_qualified_stats_show',
+                      'static ssize_t agx_stats_show',
                       'int asahi_sysfs_register(', 'void asahi_sysfs_unregister(']:
         pieces.append(item(source, signature))
     pieces.append(C_TESTS)
