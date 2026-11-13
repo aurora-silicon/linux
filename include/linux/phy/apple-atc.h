@@ -8,8 +8,7 @@
 
 #include <linux/errno.h>
 #include <linux/kconfig.h>
-
-struct phy;
+#include <linux/phy/phy.h>
 
 /* In D0 after the sleep, but its always-on side lost power, so xHCI's saved state is gone. */
 #define APPLE_ATCPHY_SLEEP_POWER_LOST	1
@@ -22,7 +21,8 @@ struct phy;
  */
 #define APPLE_ATCPHY_SLEEP_RESET	2
 
-#if IS_REACHABLE(CONFIG_PHY_APPLE_ATC)
+extern const struct phy_ops apple_atc_usb2_phy_ops;
+
 /*
  * For a firmware-driven system sleep, before any device suspends and without the
  * controller's locks held. 0 means the PHY takes the controller through hibernation after
@@ -57,38 +57,12 @@ void apple_atcphy_sleep_finish_async(struct phy *usb2_phy, bool kept);
 void apple_atcphy_sleep_finish_flush(struct phy *usb2_phy);
 
 /* ACIO owns this transaction; @phy is its shared USB3 lane PHY handle. */
+#if IS_REACHABLE(CONFIG_PHY_APPLE_ATC)
 int apple_atcphy_cio_prepare(struct phy *phy);
 int apple_atcphy_cio_off(struct phy *phy);
 int apple_atcphy_cio_on(struct phy *phy);
 int apple_atcphy_cio_finish(struct phy *phy);
 #else
-static inline int apple_atcphy_sleep_prepare(struct phy *usb2_phy)
-{
-	return -EOPNOTSUPP;
-}
-
-static inline int apple_atcphy_sleep_result(struct phy *usb2_phy)
-{
-	return -EOPNOTSUPP;
-}
-
-static inline int apple_atcphy_sleep_recover(struct phy *usb2_phy)
-{
-	return -EOPNOTSUPP;
-}
-
-static inline void apple_atcphy_sleep_finish(struct phy *usb2_phy, bool kept)
-{
-}
-
-static inline void apple_atcphy_sleep_finish_async(struct phy *usb2_phy, bool kept)
-{
-}
-
-static inline void apple_atcphy_sleep_finish_flush(struct phy *usb2_phy)
-{
-}
-
 static inline int apple_atcphy_cio_prepare(struct phy *phy)
 {
 	return -EOPNOTSUPP;
@@ -108,10 +82,10 @@ static inline int apple_atcphy_cio_finish(struct phy *phy)
 {
 	return -EOPNOTSUPP;
 }
-
 #endif
 
-#if IS_REACHABLE(CONFIG_PHY_APPLE_T6040_USB2)
+extern const struct phy_ops apple_t6040_usb2_phy_ops;
+
 /*
  * The T6040 Type-C PHY's side of the same sleep, for a Type-C port in host mode with nothing
  * but USB on its lanes. It has no hibernation to take the controller through: it takes its
@@ -158,93 +132,83 @@ int apple_t6040_atcphy_sleep_recover(struct phy *usb2_phy);
  * stop for sleeps until it has started again.
  */
 void apple_t6040_atcphy_sleep_finish(struct phy *usb2_phy, bool kept);
-#else
-static inline int apple_t6040_atcphy_sleep_prepare(struct phy *usb2_phy)
+
+/* Whether @usb2_phy is the USB2 PHY of a driver that is built for this kernel. */
+static inline bool apple_atcphy_is_atc(struct phy *usb2_phy)
 {
-	return -EOPNOTSUPP;
+	return IS_REACHABLE(CONFIG_PHY_APPLE_ATC) && usb2_phy &&
+	       usb2_phy->ops == &apple_atc_usb2_phy_ops;
 }
 
-static inline int apple_t6040_atcphy_sleep_enter(struct phy *usb2_phy)
+static inline bool apple_atcphy_is_t6040(struct phy *usb2_phy)
 {
-	return -EOPNOTSUPP;
+	return IS_REACHABLE(CONFIG_PHY_APPLE_T6040_USB2) && usb2_phy &&
+	       usb2_phy->ops == &apple_t6040_usb2_phy_ops;
 }
-
-static inline int apple_t6040_atcphy_sleep_result(struct phy *usb2_phy)
-{
-	return -EOPNOTSUPP;
-}
-
-static inline int apple_t6040_atcphy_sleep_power_up(struct phy *usb2_phy)
-{
-	return -EOPNOTSUPP;
-}
-
-static inline int apple_t6040_atcphy_sleep_recover(struct phy *usb2_phy)
-{
-	return -EOPNOTSUPP;
-}
-
-static inline void apple_t6040_atcphy_sleep_finish(struct phy *usb2_phy, bool kept)
-{
-}
-#endif
 
 /*
- * What the controller's glue calls: the driver that @usb2_phy belongs to answers, and the
- * other one doesn't know the PHY. A step that only one of them has is nothing to do for the
- * other's PHYs.
+ * What the controller's glue calls: the driver that @usb2_phy belongs to, found by the PHY's
+ * ops, answers. A step that only one of the drivers has is nothing to do for the other's PHYs,
+ * and for any other PHY.
  */
 static inline int apple_typec_phy_sleep_prepare(struct phy *usb2_phy)
 {
-	int ret = apple_atcphy_sleep_prepare(usb2_phy);
-
-	return ret == -EOPNOTSUPP ? apple_t6040_atcphy_sleep_prepare(usb2_phy) : ret;
+	if (apple_atcphy_is_atc(usb2_phy))
+		return apple_atcphy_sleep_prepare(usb2_phy);
+	if (apple_atcphy_is_t6040(usb2_phy))
+		return apple_t6040_atcphy_sleep_prepare(usb2_phy);
+	return -EOPNOTSUPP;
 }
 
 static inline int apple_typec_phy_sleep_enter(struct phy *usb2_phy)
 {
-	int ret = apple_t6040_atcphy_sleep_enter(usb2_phy);
-
-	return ret == -EOPNOTSUPP ? 0 : ret;
+	return apple_atcphy_is_t6040(usb2_phy) ? apple_t6040_atcphy_sleep_enter(usb2_phy) : 0;
 }
 
 static inline int apple_typec_phy_sleep_result(struct phy *usb2_phy)
 {
-	int ret = apple_atcphy_sleep_result(usb2_phy);
-
-	return ret == -EOPNOTSUPP ? apple_t6040_atcphy_sleep_result(usb2_phy) : ret;
+	if (apple_atcphy_is_atc(usb2_phy))
+		return apple_atcphy_sleep_result(usb2_phy);
+	if (apple_atcphy_is_t6040(usb2_phy))
+		return apple_t6040_atcphy_sleep_result(usb2_phy);
+	return -EOPNOTSUPP;
 }
 
 static inline int apple_typec_phy_sleep_power_up(struct phy *usb2_phy)
 {
-	int ret = apple_t6040_atcphy_sleep_power_up(usb2_phy);
-
-	return ret == -EOPNOTSUPP ? 0 : ret;
+	return apple_atcphy_is_t6040(usb2_phy) ? apple_t6040_atcphy_sleep_power_up(usb2_phy) : 0;
 }
 
 static inline int apple_typec_phy_sleep_recover(struct phy *usb2_phy)
 {
-	int ret = apple_atcphy_sleep_recover(usb2_phy);
-
-	return ret == -EOPNOTSUPP ? apple_t6040_atcphy_sleep_recover(usb2_phy) : ret;
+	if (apple_atcphy_is_atc(usb2_phy))
+		return apple_atcphy_sleep_recover(usb2_phy);
+	if (apple_atcphy_is_t6040(usb2_phy))
+		return apple_t6040_atcphy_sleep_recover(usb2_phy);
+	return -EOPNOTSUPP;
 }
 
 static inline void apple_typec_phy_sleep_finish(struct phy *usb2_phy, bool kept)
 {
-	apple_atcphy_sleep_finish(usb2_phy, kept);
-	apple_t6040_atcphy_sleep_finish(usb2_phy, kept);
+	if (apple_atcphy_is_atc(usb2_phy))
+		apple_atcphy_sleep_finish(usb2_phy, kept);
+	else if (apple_atcphy_is_t6040(usb2_phy))
+		apple_t6040_atcphy_sleep_finish(usb2_phy, kept);
 }
 
 /* The T6040 PHY's finish has nothing to wait for, so it ends at once. */
 static inline void apple_typec_phy_sleep_finish_async(struct phy *usb2_phy, bool kept)
 {
-	apple_atcphy_sleep_finish_async(usb2_phy, kept);
-	apple_t6040_atcphy_sleep_finish(usb2_phy, kept);
+	if (apple_atcphy_is_atc(usb2_phy))
+		apple_atcphy_sleep_finish_async(usb2_phy, kept);
+	else if (apple_atcphy_is_t6040(usb2_phy))
+		apple_t6040_atcphy_sleep_finish(usb2_phy, kept);
 }
 
 static inline void apple_typec_phy_sleep_finish_flush(struct phy *usb2_phy)
 {
-	apple_atcphy_sleep_finish_flush(usb2_phy);
+	if (apple_atcphy_is_atc(usb2_phy))
+		apple_atcphy_sleep_finish_flush(usb2_phy);
 }
 
 #endif

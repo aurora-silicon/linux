@@ -635,12 +635,13 @@ static int t6040_usb2_power_off(struct phy *phy)
 	return 0;
 }
 
-static const struct phy_ops t6040_usb2_phy_ops = {
+const struct phy_ops apple_t6040_usb2_phy_ops = {
 	.owner = THIS_MODULE,
 	.set_mode = t6040_usb2_set_mode,
 	.power_on = t6040_usb2_power_on,
 	.power_off = t6040_usb2_power_off,
 };
+EXPORT_SYMBOL_GPL(apple_t6040_usb2_phy_ops);
 
 /* ---- USB3 ---- */
 
@@ -3309,7 +3310,7 @@ static int t6040_usb2_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	tphy->phy = devm_phy_create(dev, NULL, &t6040_usb2_phy_ops);
+	tphy->phy = devm_phy_create(dev, NULL, &apple_t6040_usb2_phy_ops);
 	if (IS_ERR(tphy->phy))
 		return PTR_ERR(tphy->phy);
 	phy_set_drvdata(tphy->phy, tphy);
@@ -3384,7 +3385,7 @@ static int t6040_usb2_probe(struct platform_device *pdev)
 
 static struct t6040_usb2_phy *t6040_from_usb2_phy(struct phy *phy)
 {
-	if (!phy || phy->ops != &t6040_usb2_phy_ops)
+	if (!phy || phy->ops != &apple_t6040_usb2_phy_ops)
 		return NULL;
 	return phy_get_drvdata(phy);
 }
