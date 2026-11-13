@@ -38,9 +38,6 @@
 	 * slot (LW1 0, RW1 1, LW2 2, RW2 3, LT 4, RT 5). The idle masks are
 	 * the ADT amp-tx-zd-config rows 0 and 1: LW1 drives zeros in the right
 	 * amps' sense slots, RW1 in the left amps'.
-	 *
-	 * The speakers wait for their own bring-up and a J604 protection
-	 * profile; until then the card and the amps stay disabled.
 	 */
 	sound: sound {
 		compatible = "apple,j604-macaudio", "apple,macaudio";
@@ -50,7 +47,6 @@
 				   <&pinctrl_ap 13 GPIO_ACTIVE_HIGH>;
 		#address-cells = <1>;
 		#size-cells = <0>;
-		status = "disabled";
 
 		dai-link@0 {
 			reg = <0>;
@@ -111,8 +107,7 @@
  * The six SN012776 speaker amps (ADT /arm-io/i2c3/audio-speaker at 0x38
  * and its speaker1..5): one interrupt line on AP GPIO 14, level low; sense
  * slots from speaker-config (amp i at bytes 4i and 4i + 2, in provider
- * order). Every amp joins the SDZ fail-closed group. Disabled until the
- * speakers' bring-up.
+ * order). Every amp joins the SDZ fail-closed group.
  */
 &i2c3 {
 	status = "okay";
@@ -128,7 +123,6 @@
 		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
 		ti,imon-slot-no = <0>;
 		ti,vmon-slot-no = <2>;
-		status = "disabled";
 	};
 
 	speaker_left_woof2: codec@39 {
@@ -142,7 +136,6 @@
 		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
 		ti,imon-slot-no = <8>;
 		ti,vmon-slot-no = <10>;
-		status = "disabled";
 	};
 
 	speaker_left_tweet: codec@3a {
@@ -156,7 +149,6 @@
 		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
 		ti,imon-slot-no = <16>;
 		ti,vmon-slot-no = <18>;
-		status = "disabled";
 	};
 
 	speaker_right_woof1: codec@3b {
@@ -170,7 +162,6 @@
 		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
 		ti,imon-slot-no = <4>;
 		ti,vmon-slot-no = <6>;
-		status = "disabled";
 	};
 
 	speaker_right_woof2: codec@3c {
@@ -184,7 +175,6 @@
 		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
 		ti,imon-slot-no = <12>;
 		ti,vmon-slot-no = <14>;
-		status = "disabled";
 	};
 
 	speaker_right_tweet: codec@3d {
@@ -198,7 +188,6 @@
 		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
 		ti,imon-slot-no = <20>;
 		ti,vmon-slot-no = <22>;
-		status = "disabled";
 	};
 };
 

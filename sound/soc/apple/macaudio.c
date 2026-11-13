@@ -4208,12 +4208,13 @@ struct macaudio_platform_cfg macaudio_j614_cfg = {
 };
 
 /*
- * J604 (T8132, MacBook Pro 14" M4): the J614s's amps, frame and chassis,
- * but its speakers have not been brought up. Keep them off entirely: the
- * speaker link is not bound, so no stream ever reaches the amps.
+ * J604 (T8132, MacBook Pro 14" M4): the J614s's six amps, two woofers and a
+ * tweeter per side, on all six playback and twelve sense slots of the same
+ * frame. The speakers stay at their safe level until speakersafetyd takes
+ * them with the J604 profile.
  */
 struct macaudio_platform_cfg macaudio_j604_cfg = {
-	.enable_speakers = false,
+	.enable_speakers = true,
 	.amp = AMP_SN012776,
 	.speakers = SPKR_2W1T,
 	.stereo = true,
@@ -4391,7 +4392,7 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j575c-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* j613    AID20   sn012776    15      2x 1W+1T Compat: apple,j413-macaudio */
 	/* j615    AID21   sn012776    15      2x 2W+1T Compat: apple,j415-macaudio */
-	/* j604    -       sn012776    15      2x 2W+1T (AOP-fed; speakers off until bring-up) */
+	/* j604    -       sn012776    15      2x 2W+1T (AOP-fed) */
 	{ .compatible = "apple,j604-macaudio", .data = &macaudio_j604_cfg },
 	/* j604    -       cs42l84     -       the jack, a card of its own (AOP-fed) */
 	{ .compatible = "apple,j604-macaudio-jack", .data = &macaudio_j616_jack_cfg },
