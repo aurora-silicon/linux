@@ -442,4 +442,14 @@ void apple_rtkit_flush_rx(struct apple_rtkit *rtk);
  */
 bool apple_rtkit_has_endpoint(struct apple_rtkit *rtk, u8 ep);
 
+/*
+ * Registers an application endpoint the client started itself on a
+ * co-processor whose endpoint map the bootloader consumed, so that its
+ * messages are not reported as undiscovered
+ *
+ * @rtk:            RTKit reference
+ * @ep:             endpoint to register
+ */
+void apple_rtkit_adopt_ep(struct apple_rtkit *rtk, u8 ep);
+
 #endif /* _LINUX_APPLE_RTKIT_H_ */
