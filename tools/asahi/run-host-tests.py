@@ -108,6 +108,9 @@ ASAHI_TESTS = {
         + [(out() + ['--ref', '33bec4016c466985bfbb5ff4c2089fcab8242dcf'], KILL)],
     'brcmf-pcie-dma-tests.py': [(out('--output'), PASS)]
         + mutations('--mutation', ('narrow-stream', 'ignore-aperture', 'revision-wide'), out('--output')),
+    'brcmf-recovery-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('stall-limit', 'trap-flag', 'console', 'line-start', 'once',
+                                   'rate-limit', 'stall-reset', 'ring-full'), out()),
     'brcmf-roam-tests.py': [(out(), PASS)],
     'brcmf-sae-vendor-tests.py': [(out(), PASS)]
         + [(out() + ['--ref', '9260e1f021e075713931f3c23c0a5fa1da936b0b'], KILL)],
