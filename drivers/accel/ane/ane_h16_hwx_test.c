@@ -779,6 +779,59 @@ static void hwx_load_plan_test(struct kunit *test)
 	}
 }
 
+/*
+ * The load budget bounds the sum of all mapped regions, not one segment.
+ * __TEXT maps 1G here and the kernel segment, moved after it, the rest; both
+ * are file-backed only for their first pages, so the file stays small.
+ */
+static struct ane_h16_hwx_snapshot *fixture_budget(struct kunit *test, u64 kernel_size)
+{
+	const struct hwx_fixture_options o = { .mixed = true, .kernel = true };
+	struct hwx_fixture *f = fixture_create_options(test, &o);
+	u8 *text, *kernel;
+	u64 kern;
+
+	if (!f)
+		return NULL;
+	text = f->bytes + f->text_command;
+	kernel = fixture_kernel_segment(f, 0);
+	kern = get_unaligned_le64(text + 24) + SZ_1G;
+	put_unaligned_le64(SZ_1G, text + 32);
+	put_unaligned_le64(kern, kernel + 24);
+	put_unaligned_le64(kernel_size, kernel + 32);
+	put_unaligned_le64(kern, kernel + 72 + 32);
+	put_unaligned_le64(kern, f->bytes + f->program + 0x90);
+	return fixture_snapshot(test, f);
+}
+
+static void hwx_load_budget_test(struct kunit *test)
+{
+	/* Scratch plus two surfaces are 48K. */
+	const u64 small = 3 * SZ_16K;
+	struct ane_h16_hwx_snapshot *snapshot;
+	struct ane_h16_load_plan plan;
+
+	snapshot = fixture_budget(test, SZ_512M);
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	KUNIT_ASSERT_EQ(test, ane_h16_load_plan_create(snapshot, &plan), 0);
+	KUNIT_EXPECT_EQ(test, plan.count, 5U);
+	KUNIT_EXPECT_EQ(test, plan.total, small + SZ_1G + SZ_512M);
+
+	/* Exactly the budget loads, one page more refuses and leaves the plan alone. */
+	snapshot = fixture_budget(test, ANE_H16_LOAD_BYTES_MAX - SZ_1G - small);
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	KUNIT_ASSERT_EQ(test, ane_h16_load_plan_create(snapshot, &plan), 0);
+	KUNIT_EXPECT_EQ(test, plan.total, (u64)ANE_H16_LOAD_BYTES_MAX);
+	snapshot = fixture_budget(test, ANE_H16_LOAD_BYTES_MAX - SZ_1G - small + SZ_16K);
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	plan.count = 0x1234;
+	KUNIT_EXPECT_EQ(test, ane_h16_load_plan_create(snapshot, &plan), -E2BIG);
+	KUNIT_EXPECT_EQ(test, plan.count, 0x1234U);
+
+	/* Each segment keeps its own bound. */
+	KUNIT_EXPECT_NULL(test, fixture_budget(test, ANE_H16_SEGMENT_MAX + SZ_16K));
+}
+
 static void hwx_load_original_test(struct kunit *test)
 {
 	struct hwx_fixture *f = fixture_create(test, false, false);
@@ -1079,6 +1132,7 @@ static struct kunit_case hwx_cases[] = {
 	KUNIT_CASE(hwx_kernel_segments_test),
 	KUNIT_CASE(hwx_snapshot_test),
 	KUNIT_CASE(hwx_load_plan_test),
+	KUNIT_CASE(hwx_load_budget_test),
 	KUNIT_CASE(hwx_load_original_test),
 	KUNIT_CASE(hwx_load_resources_test),
 	KUNIT_CASE(hwx_import_bounds_test),

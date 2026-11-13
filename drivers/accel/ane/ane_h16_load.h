@@ -4,8 +4,14 @@
 
 #include "ane_h16_resources.h"
 
-/* Conservative host budget; firmware resource replies cannot enlarge it. */
-#define ANE_H16_LOAD_BYTES_MAX SZ_512M
+/*
+ * Host budget for the private mappings of one program, scratch included;
+ * firmware resource replies cannot enlarge it. Each segment may map 1G, and
+ * a whole-model encoder already maps 488M (390M of kernel data, 37M of
+ * __TEXT, a 59M scratch), so the sum is bounded here at twice the segment
+ * limit rather than at a fraction of one segment.
+ */
+#define ANE_H16_LOAD_BYTES_MAX SZ_2G
 
 struct ane_h16_load_plan {
 	struct ane_h16_hwx_region regions[ANE_H16_REGIONS];
