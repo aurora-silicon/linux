@@ -137,6 +137,17 @@ static int apple_mcc_t6041_stream_dsid(struct apple_mcc *mcc, u32 *dsid)
 	int size, ret;
 
 	pmp = of_parse_phandle(mcc->dev->of_node, "apple,pmp", 0);
+	/*
+	 * The J616c bring-up device tree has no apple,pmp link; its PMP node
+	 * (alias "pmp") carries the same copied stream records.
+	 */
+	if (!pmp) {
+		pmp = of_find_node_by_path("pmp");
+		if (pmp && !of_device_is_compatible(pmp, "apple,t6041-pmp-v2")) {
+			of_node_put(pmp);
+			pmp = NULL;
+		}
+	}
 	if (!pmp)
 		return -ENOENT;
 	records = of_get_property(pmp, MCC_MCACHE_STREAM_PROPERTY, &size);
@@ -343,7 +354,7 @@ static int apple_mcc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct apple_mcc *mcc;
-	bool t6041;
+	bool t6041, t6041_small = false;
 	int ret;
 
 	mcc = devm_kzalloc(dev, sizeof(*mcc), GFP_KERNEL);
@@ -355,13 +366,31 @@ static int apple_mcc_probe(struct platform_device *pdev)
 	mcc->retained = of_device_is_compatible(dev->of_node, "apple,t8132-mcc");
 	while (platform_get_resource(pdev, IORESOURCE_MEM, mcc->nr_planes)) {
 		struct resource *res = platform_get_resource(pdev, IORESOURCE_MEM, mcc->nr_planes);
+		void __iomem *base = NULL;
 
 		if (mcc->nr_planes == MCC_MAX_PLANES)
 			return dev_err_probe(dev, -EINVAL, "too many planes\n");
-		if (resource_size(res) < (mcc->retained ? 0x1c1c04 :
-					  t6041 ? MCC_T6041_PLANE_SIZE : 0x4000))
+		/*
+		 * The J616c bring-up device tree gives each T6041 plane only its
+		 * first 16 KiB. The planes sit 256 KiB apart, so map the whole
+		 * plane from the same base; if that cannot be had, keep the
+		 * 16 KiB window and only skip the stream release.
+		 */
+		if (t6041 && resource_size(res) < MCC_T6041_PLANE_SIZE &&
+		    resource_size(res) >= 0x4000) {
+			struct resource whole = *res;
+
+			whole.end = whole.start + MCC_T6041_PLANE_SIZE - 1;
+			base = devm_ioremap_resource(dev, &whole);
+			if (IS_ERR(base)) {
+				base = NULL;
+				t6041_small = true;
+			}
+		} else if (resource_size(res) < (mcc->retained ? 0x1c1c04 :
+						 t6041 ? MCC_T6041_PLANE_SIZE : 0x4000)) {
 			return dev_err_probe(dev, -EINVAL, "cache register aperture too small\n");
-		mcc->planes[mcc->nr_planes] = devm_platform_ioremap_resource(pdev, mcc->nr_planes);
+		}
+		mcc->planes[mcc->nr_planes] = base ?: devm_platform_ioremap_resource(pdev, mcc->nr_planes);
 		if (IS_ERR(mcc->planes[mcc->nr_planes]))
 			return PTR_ERR(mcc->planes[mcc->nr_planes]);
 		mcc->nr_planes++;
@@ -375,7 +404,9 @@ static int apple_mcc_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, mcc);
 
-	if (t6041) {
+	if (t6041 && t6041_small)
+		dev_warn(dev, "a plane is mapped only in part: GPU parameter-buffer stream left as is\n");
+	if (t6041 && !t6041_small) {
 		ret = apple_mcc_release_t6041_stream(mcc);
 		if (ret == -ENOENT)
 			/* No PMP stream record to act on (e.g. a DTB or SoC
