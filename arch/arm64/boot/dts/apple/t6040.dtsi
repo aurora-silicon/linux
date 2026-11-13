@@ -265,8 +265,8 @@
 		 *   spmi0       0x509014000: the PMU boot-stage + NOTIFY + go-hib
 		 *   spmi-a0     0x509188000: the second SPMI NOTIFY
 		 *   mastermini  0x508900000: the S2R timer at +0x4000 (the commit)
-		 *   soc-east    0x502280000: SOC-East retention + east power words
-		 *   soc-ps      0x502800000: the west axi2af power words
+		 *   soc-east    0x502280000: SOC-East page, retention + east power words
+		 *   soc-ps      0x502800000: SOC page, the west axi2af power words
 		 *   aop-global  0x508004000: the S2R control + wake masks/status
 		 * The handler refuses before touching any of them.
 		 */
@@ -278,8 +278,8 @@
 		      <0x5 0x09014000 0x0 0x1000>,
 		      <0x5 0x09188000 0x0 0x1000>,
 		      <0x5 0x08900000 0x0 0x8000>,
-		      <0x5 0x02280000 0x0 0x1000>,
-		      <0x5 0x02800000 0x0 0x1000>,
+		      <0x5 0x02280000 0x0 0xd000>,
+		      <0x5 0x02800000 0x0 0x9000>,
 		      <0x5 0x08004000 0x0 0x1000>;
 		reg-names = "cpu-start", "wdt", "cluster-ctl", "soc-pwrgate",
 			    "clkgen", "spmi0", "spmi-a0", "mastermini",
