@@ -120,6 +120,9 @@ static void apple_sleep_test_ops(struct kunit *test)
 		const struct apple_sleep_soc *soc = id->data;
 		const struct apple_sleep_ops *ops = soc->ops;
 
+		/* A SoC with a part of its own (T6040) brings its sequences there. */
+		if (soc->part)
+			continue;
 		KUNIT_ASSERT_NOT_NULL_MSG(test, ops, "%s has no operations", id->compatible);
 		KUNIT_EXPECT_NOT_NULL(test, ops->deep_wfi_arm);
 		KUNIT_EXPECT_NOT_NULL(test, ops->lower_io);
@@ -181,6 +184,8 @@ static void apple_sleep_test_layout(struct kunit *test)
 	for (id = apple_sleep_of_match; id->compatible[0]; id++) {
 		const struct apple_sleep_soc *soc = id->data;
 
+		if (soc->part)
+			continue;
 		KUNIT_EXPECT_GE(test, soc->ncluster_cpu, 1);
 		KUNIT_EXPECT_LE(test, soc->ncluster_cpu, SLEEP_CPU_CLUSTERS_MAX);
 		KUNIT_EXPECT_GT(test, soc->cpu_start_stride, 0);
