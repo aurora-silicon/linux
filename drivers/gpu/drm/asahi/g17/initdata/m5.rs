@@ -149,7 +149,11 @@ impl InitData {
     ) -> Result {
         use mmu::{PROT_FW_SHARED_RW as RW, PROT_FW_SHARED_RO as RO,
                   PROT_GPU_SHARED_RW as GPU};
-        self.set_m5_policy_layouts(variant.m5_layouts.ok_or(EINVAL)?);
+        let layouts = variant.m5_layouts.ok_or(EINVAL)?;
+        let m5_layout = m::RootProfile::for_m5_layouts(layouts)
+            .m5_layout()
+            .ok_or(EINVAL)?;
+        self.set_m5_policy_layouts(layouts);
         self.m5 = true;
         self.graph = board.graph;
         let common26 = board.graph.is_common26();
@@ -226,7 +230,7 @@ impl InitData {
                 .map_err(|_| EINVAL)?;
         } else {
             m::encode_m5_region_c(self.object_mut(self.region_c)?.bytes_mut()).map_err(|_| EINVAL)?;
-            m::encode_m5_private_cluster(PRIVATE, FWCTL,
+            m::encode_m5_private_cluster(m5_layout, PRIVATE, FWCTL,
                 &mut self.object_mut(self.cluster)?.bytes_mut()[..private.total]).map_err(|_| EINVAL)?;
         }
         let windows = board.register_windows();
@@ -252,7 +256,7 @@ impl InitData {
         let views = m::PrimaryRegionViews {
             sentinel_high: BASE + 0xc07e_0000, alias_high: [PB, UMA],
         };
-        m::encode_m5_hw_data(board, completions, QOS, windows,
+        m::encode_m5_hw_data(m5_layout, board, completions, QOS, windows,
             &mut self.object_mut(self.bundle)?.bytes_mut()[..m::M5_HW_DATA_SIZE]).map_err(|_| EINVAL)?;
         m::set_m5_kick_shared(board,
             &mut self.object_mut(self.bundle)?.bytes_mut()[..m::M5_HW_DATA_SIZE], KICK_SHARED)
@@ -269,7 +273,11 @@ impl InitData {
         if common26 {
             m::encode_common26_bundle_policy(board, bindings, self.object_mut(self.bundle)?.bytes_mut())
         } else {
-            m::encode_m5_bundle_policy(bindings, self.object_mut(self.bundle)?.bytes_mut())
+            m::encode_m5_bundle_policy(
+                m5_layout,
+                bindings,
+                self.object_mut(self.bundle)?.bytes_mut(),
+            )
         }.map_err(|_| EINVAL)?;
         // The controller configuration applies where the part's leakage calibration matches the
         // one it was made for, or on a board whose configuration holds for every part.

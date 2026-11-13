@@ -130,7 +130,10 @@ impl RootProfile {
     pub(crate) const fn region_view_low_addrs(self) -> [u64; 2] {
         match self {
             Self::J873G18G26A428 => COMMON26_REGION_VIEW_LOW_ADDRS,
-            Self::J714G17S26A428 | Self::J700G17P | Self::J813G17G25G76 => REGION_VIEW_LOW_ADDRS,
+            Self::J714G17S26A428
+            | Self::J714G17S26B123
+            | Self::J700G17P
+            | Self::J813G17G25G76 => REGION_VIEW_LOW_ADDRS,
         }
     }
 
