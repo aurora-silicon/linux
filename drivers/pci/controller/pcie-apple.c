@@ -5983,7 +5983,13 @@ static void apple_pcie_s2r_save_port(struct apple_pcie *pcie, struct apple_pcie_
 	int i;
 
 	BUILD_BUG_ON(ARRAY_SIZE(apple_pcie_s2r_dbi) != ARRAY_SIZE(port->s2r_dbi));
-	/* The loader's port setup writes 0x130; the port tunable has its own word. */
+	/*
+	 * Read at every sleep, not once at probe: after the loader, these words are written again
+	 * by the cold initialization of a port (link capabilities, mode, width, target speed),
+	 * by the PCI core through the root port's config space (Link Control 2) and by a tunnel's
+	 * setup (0x130), so the restore has to reproduce the values of the moment.
+	 * The loader's port setup writes 0x130; the port tunable has its own word.
+	 */
 	port->s2r_port_130 = apple_pcie_port_readl(port, 0x130);
 	for (i = 0; i < ARRAY_SIZE(apple_pcie_s2r_dbi); i++)
 		port->s2r_dbi[i] = readl_relaxed(dbi + apple_pcie_s2r_dbi[i]);
