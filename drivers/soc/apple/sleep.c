@@ -550,14 +550,6 @@ struct apple_sleep {
 
 static struct apple_sleep *apple_sleep;
 
-/* The SoC's part takes neither the lid at the wake nor the USB wake ports. */
-static bool apple_sleep_part_plain_wake;
-
-void apple_sleep_set_part_plain_wake(void)
-{
-	WRITE_ONCE(apple_sleep_part_plain_wake, true);
-}
-
 /* A registered coprocessor its driver has readied, whose run bit the last step clears. */
 static bool apple_sleep_coproc_ready_node(const struct device_node *np)
 {
@@ -577,23 +569,6 @@ void apple_sleep_usb_set_asleep(bool asleep)
 	WRITE_ONCE(sleep_usb_asleep, asleep);
 }
 EXPORT_SYMBOL_GPL(apple_sleep_usb_set_asleep);
-
-static unsigned long sleep_usb_wake_ports;
-
-void apple_sleep_usb_set_wake_ports(unsigned long ports)
-{
-	WRITE_ONCE(sleep_usb_wake_ports, ports);
-}
-EXPORT_SYMBOL_GPL(apple_sleep_usb_set_wake_ports);
-
-bool apple_sleep_usb_port_can_wake(unsigned int port)
-{
-	if (READ_ONCE(apple_sleep_part_plain_wake))
-		return false;
-
-	return port < BITS_PER_LONG && (READ_ONCE(sleep_usb_wake_ports) & BIT(port));
-}
-EXPORT_SYMBOL_GPL(apple_sleep_usb_port_can_wake);
 
 /* The USB host's vote, kept until the word is mapped. Only bit 0 is touched, as on macOS. */
 static DEFINE_SPINLOCK(sleep_slp_ddr_lock);
@@ -1729,39 +1704,6 @@ void apple_sleep_lid_closed_wake(void)
 	pm_set_dark_wake();
 }
 EXPORT_SYMBOL_GPL(apple_sleep_lid_closed_wake);
-
-/* Read in the SMC's noirq resume. Forgotten as each sleep begins. */
-static int sleep_lid_closed = -ENODATA;
-
-void apple_sleep_lid_at_wake(bool closed)
-{
-	WRITE_ONCE(sleep_lid_closed, closed);
-}
-EXPORT_SYMBOL_GPL(apple_sleep_lid_at_wake);
-
-int apple_sleep_lid_closed_at_wake(void)
-{
-	if (READ_ONCE(apple_sleep_part_plain_wake))
-		return -ENODATA;
-
-	return READ_ONCE(sleep_lid_closed);
-}
-EXPORT_SYMBOL_GPL(apple_sleep_lid_closed_at_wake);
-
-/* Set in the SMC's noirq resume. Forgotten as each sleep begins. */
-static int sleep_radio_woke = -ENODATA;
-
-void apple_sleep_radio_at_wake(bool woke)
-{
-	WRITE_ONCE(sleep_radio_woke, woke);
-}
-EXPORT_SYMBOL_GPL(apple_sleep_radio_at_wake);
-
-int apple_sleep_radio_woke(void)
-{
-	return READ_ONCE(sleep_radio_woke);
-}
-EXPORT_SYMBOL_GPL(apple_sleep_radio_woke);
 
 /*
  * The SMC woke the AP for the port alone, and this sleep cut the debug link: the cut's own
@@ -2975,8 +2917,7 @@ static int apple_sleep_begin(suspend_state_t state)
 {
 	/* The last sleep's cut is its port controller's to take, by its .complete. */
 	WRITE_ONCE(sleep_debug_link_cut, false);
-	WRITE_ONCE(sleep_lid_closed, -ENODATA);
-	WRITE_ONCE(sleep_radio_woke, -ENODATA);
+	apple_sleep_wake_info_forget();
 	/* The PM core also calls .begin for s2idle when no s2idle ops are installed. */
 	if (state != PM_SUSPEND_MEM)
 		return 0;
@@ -3740,7 +3681,8 @@ static int apple_sleep_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, s);
 
-	ret = apple_sleep_registry_bind(0);
+	ret = apple_sleep_registry_bind(APPLE_SLEEP_REG_LID_AT_WAKE |
+				       APPLE_SLEEP_REG_USB_WAKE_PORTS);
 	if (ret)
 		return dev_err_probe(dev, ret, "another sleep controller is bound\n");
 	ret = spin_table_set_power_ops(&sleep_cpu_power_ops);

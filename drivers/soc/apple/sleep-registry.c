@@ -366,3 +366,71 @@ void apple_sleep_coprocs_stop(bool first, bool *pcie_ans)
 	}
 	dsb(sy);
 }
+
+/*
+ * A controller that was tested with neither the lid's state at the wake nor the USB wake ports
+ * binds without the capability: the queries then answer as they do with no sleep driver.
+ */
+static bool apple_sleep_declines(unsigned int cap)
+{
+	unsigned int reg = READ_ONCE(apple_sleep_reg);
+
+	return (reg & APPLE_SLEEP_REG_BOUND) && !(reg & cap);
+}
+
+static unsigned long sleep_usb_wake_ports;
+
+void apple_sleep_usb_set_wake_ports(unsigned long ports)
+{
+	WRITE_ONCE(sleep_usb_wake_ports, ports);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_usb_set_wake_ports);
+
+bool apple_sleep_usb_port_can_wake(unsigned int port)
+{
+	if (apple_sleep_declines(APPLE_SLEEP_REG_USB_WAKE_PORTS))
+		return false;
+
+	return port < BITS_PER_LONG && (READ_ONCE(sleep_usb_wake_ports) & BIT(port));
+}
+EXPORT_SYMBOL_GPL(apple_sleep_usb_port_can_wake);
+
+/* Read in the SMC's noirq resume. Forgotten as each sleep begins. */
+static int sleep_lid_closed = -ENODATA;
+
+void apple_sleep_lid_at_wake(bool closed)
+{
+	WRITE_ONCE(sleep_lid_closed, closed);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_lid_at_wake);
+
+int apple_sleep_lid_closed_at_wake(void)
+{
+	if (apple_sleep_declines(APPLE_SLEEP_REG_LID_AT_WAKE))
+		return -ENODATA;
+
+	return READ_ONCE(sleep_lid_closed);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_lid_closed_at_wake);
+
+/* Set in the SMC's noirq resume. Forgotten as each sleep begins. */
+static int sleep_radio_woke = -ENODATA;
+
+void apple_sleep_radio_at_wake(bool woke)
+{
+	WRITE_ONCE(sleep_radio_woke, woke);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_radio_at_wake);
+
+int apple_sleep_radio_woke(void)
+{
+	return READ_ONCE(sleep_radio_woke);
+}
+EXPORT_SYMBOL_GPL(apple_sleep_radio_woke);
+
+/* Each sleep begins with no answer about the wake before it. */
+void apple_sleep_wake_info_forget(void)
+{
+	WRITE_ONCE(sleep_lid_closed, -ENODATA);
+	WRITE_ONCE(sleep_radio_woke, -ENODATA);
+}

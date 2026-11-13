@@ -3042,9 +3042,6 @@ static int t6040_sleep_probe(struct platform_device *pdev)
 	struct dentry *dir;
 	int ret, i;
 
-	/* This sleep was tested with neither the lid's state at the wake nor USB wake ports. */
-	apple_sleep_set_part_plain_wake();
-
 	s = devm_kzalloc(&pdev->dev, sizeof(*s), GFP_KERNEL);
 	if (!s)
 		return -ENOMEM;
@@ -3161,6 +3158,9 @@ const struct apple_sleep_part t6040_sleep_part = {
 #ifdef CONFIG_HIBERNATION
 	.restore = t6040_sleep_restore,
 #endif
-	/* Every enclave is taken, in a dry run as in a real sleep. */
+	/*
+	 * Every enclave is taken, in a dry run as in a real sleep. This sleep was tested with
+	 * neither the lid's state at the wake nor USB wake ports.
+	 */
 	.registry_flags = APPLE_SLEEP_REG_ENCLAVE_ANY,
 };

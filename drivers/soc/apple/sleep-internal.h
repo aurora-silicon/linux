@@ -63,8 +63,14 @@ struct apple_sleep_coproc *apple_sleep_coproc_find(struct device *dev);
  *
  * APPLE_SLEEP_REG_ENCLAVE_ANY: take every enclave registration. Without it one
  * is taken only while such a commit is the case.
+ * APPLE_SLEEP_REG_LID_AT_WAKE, APPLE_SLEEP_REG_USB_WAKE_PORTS: the sleep takes the lid's state
+ * at the wake, and the USB wake ports. Without them
+ * apple_sleep_lid_closed_at_wake() and apple_sleep_usb_port_can_wake() answer as they do
+ * with no sleep driver, whatever the SMC's and the USB host's drivers told.
  */
 #define APPLE_SLEEP_REG_ENCLAVE_ANY	BIT(0)
+#define APPLE_SLEEP_REG_LID_AT_WAKE	BIT(1)
+#define APPLE_SLEEP_REG_USB_WAKE_PORTS	BIT(2)
 
 int apple_sleep_registry_bind(unsigned int flags);
 void apple_sleep_registry_unbind(void);
@@ -298,12 +304,8 @@ void __iomem *apple_sleep_apcie_block(struct device *dev, struct device_node *np
 				      const char *name, const char *prop,
 				      struct apple_tunable **tunable);
 
-/*
- * A part whose sleep takes neither the lid's state at the wake nor the USB wake ports says so
- * at its probe. apple_sleep_lid_closed_at_wake() and apple_sleep_usb_port_can_wake() then
- * answer as they do with no sleep driver, whatever the SMC's and the USB host's drivers told.
- */
-void apple_sleep_set_part_plain_wake(void);
+/* Each sleep begins with no answer about the wake before it. */
+void apple_sleep_wake_info_forget(void);
 
 /* For a debugfs file: who is registered, and how far each is. */
 void apple_sleep_registry_show(struct seq_file *s);
