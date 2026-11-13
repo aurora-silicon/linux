@@ -1219,6 +1219,43 @@ static void ane_fw_hung(void *ctx, int error)
 	queue_work(system_dfl_wq, &b->recover);
 }
 
+/* TEST ONLY (NEOANE): drive the recovery paths on hardware. Never merged. */
+static unsigned int neoane_fail_boot_every;
+module_param(neoane_fail_boot_every, uint, 0644);
+static unsigned int neoane_boots;
+
+static int neoane_test_hang_set(const char *val, const struct kernel_param *kp)
+{
+	struct ane_fw_backend *b = ane_backend;
+	bool on;
+	int ret = kstrtobool(val, &on);
+
+	if (ret || !on)
+		return ret;
+	if (!b)
+		return -ENODEV;
+	guard(mutex)(&b->lock);
+	if (!b->powered || b->parked || b->stage != ANE_STAGE_PROGRAM)
+		return -EAGAIN;
+	ane_wr32(b, 0, b->engine + b->soc->wrapper + ANE_FW_WRAPPER_CONTROL);
+	dev_warn(&b->pdev->dev, "H17 ANE: NEOANE TEST: RUN cleared to force a hang\n");
+	return 0;
+}
+
+static const struct kernel_param_ops neoane_test_hang_ops = {
+	.set = neoane_test_hang_set,
+};
+module_param_cb(neoane_test_hang, &neoane_test_hang_ops, NULL, 0200);
+
+static int neoane_inject(struct ane_fw_backend *b, int ret)
+{
+	if (!ret && neoane_fail_boot_every && ++neoane_boots % neoane_fail_boot_every == 0) {
+		dev_warn(&b->pdev->dev, "H17 ANE: NEOANE TEST injected boot failure\n");
+		ret = -ETIMEDOUT;
+	}
+	return ret;
+}
+
 /* A request for a parked engine: boot it from the preload, as after a sleep. */
 static int ane_fw_session_wake(void *ctx)
 {
@@ -1233,7 +1270,7 @@ static int ane_fw_session_wake(void *ctx)
 	/* The system is going to sleep or coming back: PM_POST_SUSPEND wakes waiters. */
 	if (b->in_sleep)
 		return -EAGAIN;
-	ret = ane_fw_cold_cycle_boot(b);
+	ret = neoane_inject(b, ane_fw_cold_cycle_boot(b));
 	if (ret)
 		ret = ane_fw_boot_retry(b, ret, "for a request");
 	WRITE_ONCE(b->parked, false);
