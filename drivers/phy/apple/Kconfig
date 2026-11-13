@@ -86,3 +86,15 @@ config PHY_APPLE_T6050_DP
 	  Fixed HDMI bridges and Type-C USB host/DisplayPort alternate mode.
 	  One owner coordinates the shared PHY, firmware, PIPE and USB2 state.
 	  Requires named register banks, power domains and firmware tunables.
+
+config PHY_APPLE_ACIOPHY_USB3
+	tristate "Apple T8152 ACIOPHY USB3 PHY"
+	depends on ARCH_APPLE || COMPILE_TEST
+	select GENERIC_PHY
+	select APPLE_TUNABLE
+	help
+	  Enable this for USB3 on an Apple T8152 (M6) Type-C PHY that is wired
+	  to a fixed USB3 device instead of a Type-C port, such as the
+	  on-board hub behind the Mac mini (2026) front ports.
+
+	  If M is selected the module will be called 'phy-apple-aciophy-usb3'.

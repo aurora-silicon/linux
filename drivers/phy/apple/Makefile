@@ -10,3 +10,6 @@ obj-$(CONFIG_PHY_APPLE_DPTX)	+= phy-apple-dptx.o
 phy-apple-dptx-y		+= dptx.o
 
 obj-$(CONFIG_PHY_APPLE_T6050_DP) += atc-t6050-dp.o
+
+obj-$(CONFIG_PHY_APPLE_ACIOPHY_USB3)	+= phy-apple-aciophy-usb3.o
+phy-apple-aciophy-usb3-y		:= aciophy-usb3.o
