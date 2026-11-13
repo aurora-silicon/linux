@@ -75,7 +75,6 @@ const ASC_CPU_CONTROL_OFFSET: usize = 0x44;
 const PMP_ENDPOINT: u8 = 0x20;
 const PM_COMMAND_MARKER: u64 = pmp_power::MARKER;
 const PM_COMMAND_SHIFT: u32 = pmp_power::SHIFT;
-const OPC_READY: u64 = 0x00;
 const OPC_GET_IOVA_TABLE: u64 = 0x10;
 const OPC_MALLOC: u64 = 0x12;
 const OPC_FREE: u64 = 0x14;
@@ -91,19 +90,6 @@ const MSG_IOVA_MASK: u64 = 0xFFFFFFFFFFFF;
 const SET_IOREG_INDEX_MASK: u64 = 0xFFFF;
 const PIO_VM_BASE: u64 = 0xc0000000;
 const PIO_GRANULARITY: u64 = 0x1000000;
-/*
- * 25G83 host-owned runtime report. The firmware sends Ready (type 0), the
- * host allocates and zeroes the buffer and sends its DVA in Configure (type
- * 0x10 in bits 56:44), then the firmware answers type 0x20. The public m1n1
- * implementation documents the same message layout.
- */
-const PMP_SHMEM_SIZE: usize = 0xe400;
-const MSG_TYPE_SHIFT: u32 = 44;
-const MSG_TYPE_MASK: u64 = 0x1fff;
-const MSG_TYPE_CONFIGURE: u64 = 0x10;
-const MSG_TYPE_CONFIGURE_ACK: u64 = 0x20;
-const PMP_GPU_EFFORT_OFFSET: usize = 0xc000;
-const PMP_GPU_EFFORT_MAX_COUNT: u32 = 2;
 
 const fn from_fourcc(b: &[u8; 4]) -> u32 {
     b[3] as u32 | (b[2] as u32) << 8 | (b[1] as u32) << 16 | (b[0] as u32) << 24
@@ -144,12 +130,6 @@ struct SramCopy {
 struct PmpState {
     iova_table: Option<Coherent<[IovaTableEntry]>>,
     allocs: KVec<PmpAllocation>,
-    /// The host-owned shared memory, kept until unbind once the firmware has its address.
-    shmem: Option<Coherent<[u8]>>,
-    /// The firmware acknowledged the shared memory.
-    shmem_acked: bool,
-    /// The shared memory is live: offered and the firmware has not failed since.
-    report_live: bool,
     value_buf: Option<u64>,
     ioreg_entries: KVec<u32>,
     /// Held from a system sleep's start until its end.
@@ -161,9 +141,6 @@ impl PmpState {
         Ok(PmpState {
             iova_table: None,
             allocs: KVec::with_capacity(10, GFP_KERNEL)?,
-            shmem: None,
-            shmem_acked: false,
-            report_live: false,
             value_buf: None,
             ioreg_entries: KVec::with_capacity(340, GFP_KERNEL)?,
             sram: None,
@@ -182,40 +159,6 @@ impl PmpState {
     fn get_buf(&mut self, addr: u64) -> Option<&mut Coherent<[u8]>> {
         let idx = self.find_alloc(addr)?;
         Some(&mut self.allocs[idx].alloc)
-    }
-
-    fn gpu_effort(&self) -> Result<(u32, u32)> {
-        if !self.report_live {
-            return Err(EAGAIN);
-        }
-        let buf = self.shmem.as_ref().ok_or(EAGAIN)?;
-
-        if buf.len() < PMP_GPU_EFFORT_OFFSET + 3 * mem::size_of::<u32>() {
-            return Err(EIO);
-        }
-
-        let base = buf.as_ptr().cast::<u8>();
-        // SAFETY: the coherent allocation is retained in `shmem`, the
-        // offsets are naturally aligned and bounded above, and volatile
-        // loads observe words published asynchronously by the PMP.
-        let count = u32::from_le(unsafe {
-            base.add(PMP_GPU_EFFORT_OFFSET)
-                .cast::<u32>()
-                .read_volatile()
-        });
-        if count == 0 {
-            return Err(ENODATA);
-        }
-        if count > PMP_GPU_EFFORT_MAX_COUNT {
-            return Err(EPROTO);
-        }
-
-        /* Order the selected effort load after its published count. */
-        fence(Ordering::Acquire);
-        let offset = PMP_GPU_EFFORT_OFFSET + count as usize * mem::size_of::<u32>();
-        // SAFETY: as above; `count` is at most PMP_GPU_EFFORT_MAX_COUNT, checked against the length.
-        let effort = u32::from_le(unsafe { base.add(offset).cast::<u32>().read_volatile() });
-        Ok((count, effort))
     }
 }
 
@@ -238,8 +181,6 @@ struct PmpData {
     display_error: AtomicI32,
     /// See [`PmpHwConfig::sram_backup`].
     sram_backup: Option<(usize, usize)>,
-    /// See [`PmpHwConfig::shmem`].
-    host_shmem: bool,
 }
 
 impl PmpData {
@@ -261,7 +202,6 @@ impl PmpData {
                     display: AtomicPtr::new(core::ptr::null_mut()),
                     display_error: AtomicI32::new(0),
                     sram_backup: cfg.sram_backup,
-                    host_shmem: cfg.shmem,
                 }
             ),
             GFP_KERNEL,
@@ -489,8 +429,6 @@ impl PmpData {
         Ok(msg)
     }
     fn fail_display(&self, error: Error) {
-        /* A stopped or failed PMP no longer publishes coherent report data. */
-        self.state.lock().report_live = false;
         // Publish failure before looking up either lazily registered consumer.
         // Pair with the post-registration fence below: registration cannot miss
         // the error while this path also misses the newly published provider.
@@ -619,45 +557,7 @@ impl PmpData {
         // and `control` is inside the ASC mapping held by `self`.
         to_result(unsafe { bindings::apple_rtkit_sleep_return(rtk, control) })
     }
-    /// Answers Ready with the DVA of the host-owned runtime report.
-    /// Configure Ack makes the report live ([`Self::configure_ack`]).
-    fn offer_shmem(&self) -> Result<u64> {
-        let mut state = self.state.lock();
-        if state.shmem.is_none() {
-            // SAFETY: the PMP device is bound while its driver offers memory.
-            let bound_dev = unsafe { self.dev.as_bound() };
-            let shmem = Coherent::<u8>::zeroed_slice(bound_dev, PMP_SHMEM_SIZE, GFP_KERNEL)?;
-            state.shmem = Some(shmem);
-        }
-        let dva = state.shmem.as_ref().ok_or(ENOMEM)?.dma_address();
-        if dva & !MSG_IOVA_MASK != 0 {
-            return Err(ERANGE);
-        }
-        state.shmem_acked = false;
-        state.report_live = false;
-        Ok(MSG_TYPE_CONFIGURE << MSG_TYPE_SHIFT | dva)
-    }
-    fn configure_ack(&self, msg: u64) {
-        let mut state = self.state.lock();
-        if state.shmem.is_none() {
-            dev_warn!(
-                self.dev,
-                "PMP configure ack {:#018x} without shared memory\n",
-                msg
-            );
-            return;
-        }
-        if !state.shmem_acked {
-            state.shmem_acked = true;
-            state.report_live = true;
-            dev_info!(self.dev, "PMP coherent report buffer ready\n");
-        }
-    }
     fn recv_message(&self, msg: u64) -> Result<()> {
-        if (msg >> MSG_TYPE_SHIFT) & MSG_TYPE_MASK == MSG_TYPE_CONFIGURE_ACK {
-            self.configure_ack(msg);
-            return Ok(());
-        }
         let pm_command = (msg >> PM_COMMAND_SHIFT) & 0xff;
         if msg & PM_COMMAND_MARKER != 0 && (pm_command == 0x0f || pm_command == 0x10) {
             let mut state = self.power_command.lock();
@@ -677,7 +577,6 @@ impl PmpData {
         }
         let opc = (msg >> OPC_SHIFT) & 0xFF;
         let reply = match opc {
-            OPC_READY if self.host_shmem => self.offer_shmem()?,
             OPC_GET_IOVA_TABLE => self.get_iova_table()?,
             OPC_MALLOC => self.malloc(msg & MALLOC_SIZE_MASK)?,
             OPC_FREE => self.free(msg & MSG_IOVA_MASK)?,
@@ -883,39 +782,6 @@ pub unsafe extern "C" fn apple_pmp_wake(data: *const core::ffi::c_void) -> i32 {
     }
 }
 
-/// Read the lifetime-servo count and selected effort from PMP coherent memory.
-///
-/// # Safety
-/// `data` must point to the live PmpData registered by PmpDriver. `count` and
-/// `effort` must each be writable for one `u32`.
-#[export]
-pub unsafe extern "C" fn apple_pmp_read_gpu_effort(
-    data: *const core::ffi::c_void,
-    count: *mut u32,
-    effort: *mut u32,
-) -> i32 {
-    if data.is_null() || count.is_null() || effort.is_null() {
-        return EINVAL.to_errno();
-    }
-
-    let data = unsafe { &*data.cast::<PmpData>() };
-    match data.state.lock().gpu_effort() {
-        Ok((value_count, value_effort)) => {
-            unsafe {
-                count.write(value_count);
-                effort.write(value_effort);
-            }
-            0
-        }
-        Err(error) => {
-            if error == ENODATA {
-                unsafe { count.write(0) };
-            }
-            error.to_errno()
-        }
-    }
-}
-
 struct NoBuffer;
 impl rtkit::Buffer for NoBuffer {
     fn iova(&self) -> Result<usize> {
@@ -967,8 +833,6 @@ struct PmpHwConfig {
     /// The range of the firmware's SRAM, as (offset, size) in bytes, that a system sleep keeps
     /// and writes back. `None` where no sleep has been traced.
     sram_backup: Option<(usize, usize)>,
-    /// Give the firmware host-owned shared memory for its runtime report (GPU effort).
-    shmem: bool,
 }
 
 /// Whether a PMP firmware needs endpoint 7 to finish its RTKit boot.
@@ -987,7 +851,6 @@ const HW_CFG_DEFAULT: PmpHwConfig = PmpHwConfig {
     check_bootargs_uuid: false,
     coreanalytics: Ep7::No,
     sram_backup: None,
-    shmem: false,
 };
 
 /// T8140: the DART translates 42 bits and its DMA window starts at 1 TiB.
@@ -996,7 +859,6 @@ const HW_CFG_T8140: PmpHwConfig = PmpHwConfig {
     check_bootargs_uuid: false,
     coreanalytics: Ep7::No,
     sram_backup: Some((0x3c000, 0x5c000)),
-    shmem: true,
 };
 
 /// T6041: the DART window starts at 1 TiB; the boot argument header is
@@ -1007,7 +869,6 @@ const HW_CFG_T6041: PmpHwConfig = PmpHwConfig {
     check_bootargs_uuid: true,
     coreanalytics: Ep7::Always,
     sram_backup: None,
-    shmem: false,
 };
 
 /// T8142: the DART window starts at 1 TiB as on T8140. Its registry-v2
@@ -1018,7 +879,6 @@ const HW_CFG_T8142: PmpHwConfig = PmpHwConfig {
     check_bootargs_uuid: false,
     coreanalytics: Ep7::Always,
     sram_backup: None,
-    shmem: false,
 };
 
 /// T6050: the DART window starts at 1 TiB (ADT dart-pmp0 vm-base) and spans
@@ -1028,7 +888,6 @@ const HW_CFG_T6050: PmpHwConfig = PmpHwConfig {
     check_bootargs_uuid: false,
     coreanalytics: Ep7::No,
     sram_backup: None,
-    shmem: false,
 };
 
 const HW_CFG_T8132: PmpHwConfig = PmpHwConfig {
@@ -1036,7 +895,6 @@ const HW_CFG_T8132: PmpHwConfig = PmpHwConfig {
     check_bootargs_uuid: false,
     coreanalytics: Ep7::RetainedBoard,
     sram_backup: None,
-    shmem: false,
 };
 
 impl Drop for PmpDriver {

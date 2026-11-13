@@ -15,12 +15,6 @@ description: |
   bootloader must initialize the PMP DART address protection filter before
   Linux starts the firmware. Firmware-owned PMC power state must be retained.
 
-  On T8112 and T8140 the PMP also requests a 0xe400-byte DMA-coherent runtime
-  report buffer. This is not one of the device's reg ranges. At offset 0xc000
-  the firmware publishes a 32-bit lifetime-servo effort count followed by at
-  most two 32-bit Q8.24 efforts. The entries are applied in order to one
-  actuator, making the last present entry the effective GPU effort.
-
 properties:
   compatible:
     oneOf:

@@ -33,7 +33,6 @@
 #include <linux/regmap.h>
 #include <linux/seq_file.h>
 #include <linux/sizes.h>
-#include <linux/soc/apple/pmp.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/pmp-report.h>
 #include <linux/soc/apple/t8132.h>
@@ -65,6 +64,8 @@
  * @fast_die: 32-bit word holding the fast die-temperature effort of each
  *	CPU cluster, one byte per lane; 0 if the SoC has none
  * @fast_die_lanes: number of lanes at @fast_die, at most 4
+ * @gpu_effort: 64-bit GPU lifetime-control effort, an integer percent;
+ *	0 if the SoC has none
  * @running_any: the PMP runs while any bit of the 64-bit status word is set,
  *	not only bit 0
  * @defer_requests: keep power state requests in memory until the PMP runs,
@@ -85,6 +86,7 @@ struct apple_pmp_report_offsets {
 	u32 status;
 	u32 fast_die;
 	u32 fast_die_lanes;
+	u32 gpu_effort;
 	/* Update aperture of every entry (8 bytes each) and SOC-DEV-DVFS range. */
 	u32 update;
 	u32 dvfs_first, dvfs_count;
@@ -192,33 +194,6 @@ static void apple_pmp_agx_vote_fn(struct work_struct *work);
 static DECLARE_DELAYED_WORK(apple_pmp_agx_vote_work, apple_pmp_agx_vote_fn);
 static void apple_pmp_agx_vote_stop(void);
 static void apple_pmp_agx_vote_stop_new(void);
-
-static bool apple_pmp_report_has_gpu_effort(const struct apple_pmp_report *rep)
-{
-	return of_device_is_compatible(rep->dev->of_node,
-				       "apple,t8112-pmp-v2-report") ||
-	       of_device_is_compatible(rep->dev->of_node,
-				       "apple,t8140-pmp-v2-report");
-}
-
-/* The PMP driver's GPU effort reader; the lock joins its withdrawal. */
-static DEFINE_MUTEX(apple_pmp_gpu_effort_lock);
-static int (*apple_pmp_gpu_effort_reader)(u32 *count, u32 *effort);
-
-void apple_pmp_report_set_gpu_effort_reader(int (*read)(u32 *count, u32 *effort))
-{
-	guard(mutex)(&apple_pmp_gpu_effort_lock);
-	apple_pmp_gpu_effort_reader = read;
-}
-EXPORT_SYMBOL_GPL(apple_pmp_report_set_gpu_effort_reader);
-
-static int apple_pmp_report_gpu_effort(u32 *count, u32 *effort)
-{
-	guard(mutex)(&apple_pmp_gpu_effort_lock);
-	if (!apple_pmp_gpu_effort_reader)
-		return -ENODEV;
-	return apple_pmp_gpu_effort_reader(count, effort);
-}
 
 /* Bound report regions, protected by RCU until managed teardown drains readers. */
 static LIST_HEAD(apple_pmp_reports);
@@ -410,17 +385,59 @@ int apple_pmp_report_fast_die_effort(const struct device_node *np,
 }
 EXPORT_SYMBOL_GPL(apple_pmp_report_fast_die_effort);
 
+/**
+ * apple_pmp_report_gpu_effort() - read the PMP's GPU lifetime-control effort
+ * @percent: set to the effort on success
+ *
+ * The PMP of some SoCs runs a lifetime control loop for the GPU and
+ * publishes its output in one report entry as an integer percent: 0 requests
+ * no limit, and the effort rises towards 100 as the loop limits the GPU
+ * harder. The firmware rewrites the entry whenever the integer changes. The
+ * effort is only valid while the PMP reports that it is running.
+ *
+ * Context: Any context.
+ * Return: 0 on success, -ENODEV if no bound report publishes the effort,
+ * -EAGAIN if the PMP does not report that it is running, or -EPROTO if the
+ * entry holds no valid percent.
+ */
+int apple_pmp_report_gpu_effort(u32 *percent)
+{
+	const struct apple_pmp_report *rep;
+	int ret = -ENODEV;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
+		if (!rep->offsets->gpu_effort)
+			continue;
+
+		if (!apple_pmp_report_running(rep)) {
+			ret = -EAGAIN;
+		} else {
+			ret = apple_pmp_gpu_effort_percent(
+				readq(rep->base + rep->offsets->gpu_effort));
+			if (ret >= 0) {
+				*percent = ret;
+				ret = 0;
+			}
+		}
+		break;
+	}
+	rcu_read_unlock();
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_gpu_effort);
+
 static void apple_pmp_start_show(struct seq_file *s, struct apple_pmp_start *st);
 
-/* Read only documented MMIO entries; GPU effort comes from coherent memory. */
+/* Read only the documented status and effort entries, never the aperture. */
 static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
 {
 	struct apple_pmp_report *rep = s->private;
 	const struct apple_pmp_report_offsets *offs = rep->offsets;
 	bool running = apple_pmp_report_running(rep);
 	unsigned int lane;
-	u32 count, effort;
-	int ret;
+	u32 effort;
 
 	seq_printf(s, "running: %u\n", running);
 	if (rep->start)
@@ -434,16 +451,13 @@ static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
 			seq_printf(s, "lane%u: %u\n", lane,
 				   (effort >> (lane * BITS_PER_BYTE)) & 0xff);
 	}
-	if (apple_pmp_report_has_gpu_effort(rep)) {
-		ret = apple_pmp_report_gpu_effort(&count, &effort);
-		if (!ret) {
-			seq_printf(s, "gpu_effort_count: %u\n", count);
-			seq_printf(s, "gpu_effort: %#x\n", effort);
-		} else if (ret == -ENODATA) {
-			seq_puts(s, "gpu_effort_count: 0\n");
-		} else {
-			seq_printf(s, "gpu_effort: unavailable (%d)\n", ret);
-		}
+	if (offs->gpu_effort) {
+		int ret = apple_pmp_gpu_effort_percent(readq(rep->base + offs->gpu_effort));
+
+		if (ret >= 0)
+			seq_printf(s, "gpu_effort: %d\n", ret);
+		else
+			seq_printf(s, "gpu_effort: invalid (%d)\n", ret);
 	}
 
 	return 0;
@@ -2391,10 +2405,7 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	if (rep->offsets == &apple_pmp_offsets_t600x)
 		apple_pmp_agx_activity_resume();
 
-	if (rep->offsets->fast_die ||
-	    of_device_is_compatible(np, "apple,t8112-pmp-v2-report") ||
-	    of_device_is_compatible(np, "apple,t8140-pmp-v2-report") ||
-	    rep->start)
+	if (rep->offsets->fast_die || rep->offsets->gpu_effort || rep->start)
 		rep->debugfs = debugfs_create_file(dev_name(dev), 0400,
 						   apple_pmp_report_debugfs, rep,
 						   &apple_pmp_report_status_fops);
@@ -2491,7 +2502,10 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t6031 = {
 	.devices_ordered = true,
 };
 
-/* The fast die-temperature report is the low two bytes of entry 0x1c1. */
+/*
+ * The fast die-temperature report is the low two bytes of entry 0x1c1. The
+ * GPU lifetime-control effort is the low 64 bits of entry 0x1ec.
+ */
 static const struct apple_pmp_report_offsets apple_pmp_offsets_t8140 = {
 	.tgt_read = 0x1880,
 	.tgt_write = 0x10c40,
@@ -2502,6 +2516,7 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t8140 = {
 	.status = 0x10,
 	.fast_die = 0x1c10,
 	.fast_die_lanes = 2,
+	.gpu_effort = 0x1ec0,
 };
 
 /*

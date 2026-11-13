@@ -165,8 +165,6 @@ int apple_pmp_report_set_t6030_gfx(struct device*d,bool enabled){assert(!"unexpe
 bool apple_pmp_display_retained_board(void){return false;}
 void apple_pmp_report_sleep(struct device*d,bool at_commit){assert(!"no system sleep here");}
 void apple_pmp_report_wake(struct device*d,bool real){assert(!"no system sleep here");}
-static int (*effort_reader)(u32*,u32*);
-void apple_pmp_report_set_gpu_effort_reader(int (*read)(u32*,u32*)){effort_reader=read;}
 int apple_pmp_sleep(const void*data){assert(!"no system sleep here");return -EIO;}
 int apple_pmp_sleep_prepare(const void*data,struct apple_pmp_commit_stop*stop){assert(!"no system sleep here");return -EIO;}
 int apple_pmp_wake(const void*data){assert(!"no system sleep here");return -EIO;}
@@ -175,9 +173,8 @@ int main(void){
  assert(apple_pmp_set_device_power(0xf,8,1)==-ENODEV);
  assert(apple_pmp_link_device(&consumer)==-EINVAL);
  phandle=&n;assert(apple_pmp_link_device(&consumer)==-EPROBE_DEFER);
- assert(apple_pmp_register(&supplier,&data)==0);assert(effort_reader==apple_pmp_gpu_effort);
- {u32 c=0,e=0;assert(effort_reader(&c,&e)==-ENODEV);}
- assert(apple_pmp_register(&supplier,&data)==-EBUSY);assert(effort_reader);
+ assert(apple_pmp_register(&supplier,&data)==0);
+ assert(apple_pmp_register(&supplier,&data)==-EBUSY);
  supplier.bound=false;assert(apple_pmp_link_device(&consumer)==-EPROBE_DEFER);supplier.bound=true;
  phandle=&wrong;assert(apple_pmp_link_device(&consumer)==-EPROBE_DEFER);phandle=&n;
  link_fail=true;assert(apple_pmp_link_device(&consumer)==-EINVAL);assert(supplier.refs==0);link_fail=false;
@@ -192,9 +189,8 @@ int main(void){
  send_result=0;assert(apple_pmp_set_device_power(0xf,8,1)==0);assert(calls==2);
  assert(apple_pmp_set_device_power(0xf,5,1)==0);assert(calls==3);
  assert(apple_pmp_set_device_power(0xe,5,0)==0);assert(calls==4);
- apple_pmp_unregister(&wrong);assert(pmp_data==&data);assert(effort_reader);
- apple_pmp_unregister(&data);assert(!pmp_data && !pmp_device);assert(!effort_reader);
- {u32 c,e;assert(apple_pmp_gpu_effort(&c,&e)==-ENODEV);}
+ apple_pmp_unregister(&wrong);assert(pmp_data==&data);
+ apple_pmp_unregister(&data);assert(!pmp_data && !pmp_device);
  assert(apple_pmp_set_device_power(0xf,8,1)==-ENODEV);
  puts("production PMP bridge supplier/ready/ack controls: PASS");
 }

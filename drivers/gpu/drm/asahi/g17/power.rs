@@ -9,18 +9,14 @@ pub(super) const FULL_EFFORT: u32 = 0x10000;
 pub(super) const IDLE_HOLD_NS: u64 = 16_000_000;
 /// The lifetime-servo cadence published by the PMP runtime policy.
 pub(super) const PMP_REPORT_PERIOD_NS: u64 = 5_000_000;
-const PMP_EFFORT_ONE: u32 = 0x0100_0000;
+/// The largest PMP GPU lifetime-control effort, in percent.
+const PMP_EFFORT_MAX: u32 = 100;
 
-/// Converts a valid Q8.24 PMP effort to the percent ceiling used by the host.
-///
-/// The producer first discards the low eight fractional bits, then scales the
-/// remaining Q16.16 complement. Consequently the first input that survives
-/// that truncation lowers the integer ceiling by one percent.
+/// Converts a PMP GPU lifetime-control effort (integer percent) to the
+/// percent ceiling of the native power target: an effort of `e` leaves
+/// `100 - e` percent.
 pub(super) fn pmp_effort_to_ceiling(effort: u32) -> Option<u32> {
-    if effort > PMP_EFFORT_ONE {
-        return None;
-    }
-    Some(((u64::from(PMP_EFFORT_ONE >> 8) - u64::from(effort >> 8)) * 100 >> 16) as u32)
+    PMP_EFFORT_MAX.checked_sub(effort)
 }
 
 fn pmp_sample_to_ceiling(sample: Option<u32>) -> Option<u32> {
@@ -55,14 +51,13 @@ impl Ceiling {
         }
     }
 
-    /// Samples one aligned report word and restores native policy when the
-    /// provider, count or effort is absent or invalid.
+    /// Samples the PMP report's effort entry and restores native policy when
+    /// the report is absent, the PMP is not running or the effort is invalid.
     pub(super) fn update(&mut self, init: &super::initdata::InitData) -> kernel::error::Result {
         let mut effort = 0;
-        let mut count = 0;
-        // SAFETY: both outputs are writable for one u32. The PMP owner retains
-        // the coherent allocation and serializes its lookup against teardown.
-        let ret = unsafe { kernel::bindings::apple_pmp_gpu_effort(&mut count, &mut effort) };
+        // SAFETY: `effort` is writable for one u32. The report driver looks
+        // the region up under RCU and reads only its documented entries.
+        let ret = unsafe { kernel::bindings::apple_pmp_report_gpu_effort(&mut effort) };
         let desired = pmp_sample_to_ceiling((ret == 0).then_some(effort))
             .filter(|ceiling| *ceiling < 100 && self.native[1] != 0);
         if desired == self.applied {
@@ -79,14 +74,13 @@ impl Ceiling {
         if ceiling_log_due(self.logged, desired) {
             match desired {
                 Some(ceiling) => kernel::pr_info!(
-                    "asahi: PMP GPU effort {:#x} (count {}): power ceiling {}% of {} mW\n",
+                    "asahi: PMP GPU effort {}%: power ceiling {}% of {} mW\n",
                     effort,
-                    count,
                     ceiling,
                     self.native[1]
                 ),
                 None => kernel::pr_info!(
-                    "asahi: PMP GPU power ceiling released (effort {:#x}, status {})\n",
+                    "asahi: PMP GPU power ceiling released (effort {}%, status {})\n",
                     effort,
                     ret
                 ),
@@ -387,12 +381,12 @@ mod tests {
     #[test]
     fn pmp_effort_maps_to_the_integer_ceiling() {
         assert_eq!(pmp_effort_to_ceiling(0), Some(100));
-        assert_eq!(pmp_effort_to_ceiling(1), Some(100));
-        assert_eq!(pmp_effort_to_ceiling(0x100), Some(99));
-        assert_eq!(pmp_effort_to_ceiling(PMP_EFFORT_ONE / 4), Some(75));
-        assert_eq!(pmp_effort_to_ceiling(PMP_EFFORT_ONE / 2), Some(50));
-        assert_eq!(pmp_effort_to_ceiling(PMP_EFFORT_ONE), Some(0));
-        assert_eq!(pmp_effort_to_ceiling(PMP_EFFORT_ONE + 1), None);
+        assert_eq!(pmp_effort_to_ceiling(1), Some(99));
+        assert_eq!(pmp_effort_to_ceiling(25), Some(75));
+        assert_eq!(pmp_effort_to_ceiling(50), Some(50));
+        assert_eq!(pmp_effort_to_ceiling(100), Some(0));
+        assert_eq!(pmp_effort_to_ceiling(101), None);
+        assert_eq!(pmp_effort_to_ceiling(u32::MAX), None);
     }
 
     #[test]
@@ -406,8 +400,9 @@ mod tests {
     }
 
     #[test]
-    fn absent_or_zero_count_sample_withdraws_the_ceiling() {
+    fn absent_sample_withdraws_the_ceiling() {
         assert_eq!(pmp_sample_to_ceiling(None), None);
+        assert_eq!(pmp_sample_to_ceiling(Some(101)), None);
     }
 
     #[test]

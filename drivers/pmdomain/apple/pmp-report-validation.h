@@ -22,7 +22,7 @@
 
 #define PMP_SOC_DEVICE_SIZE	0x7c
 #define PMP_SOC_DEVICE_ACK	BIT(1)
-#define PMP_GPU_EFFORT_MAX_COUNT	2
+#define PMP_GPU_EFFORT_MAX	100
 #define PMP_PTD_RANGE_SIZE	32
 #define PMP_PTD_RANGE_REQUEST	10
 #define PMP_PTD_RANGE_ACK	11
@@ -72,13 +72,12 @@ static inline bool apple_pmp_dvfs_word(u32 main_level, const u32 *class_levels,
 	return true;
 }
 
-static inline int apple_pmp_gpu_effort_index(u32 count)
+/* The GPU lifetime-control effort entry holds an integer percent. */
+static inline int apple_pmp_gpu_effort_percent(u64 word)
 {
-	if (!count)
-		return -ENODATA;
-	if (count > PMP_GPU_EFFORT_MAX_COUNT)
+	if (word > PMP_GPU_EFFORT_MAX)
 		return -EPROTO;
-	return count - 1;
+	return word;
 }
 
 /* The PTD request read, request update and acknowledgment apertures. */

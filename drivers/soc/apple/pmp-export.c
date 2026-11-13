@@ -17,14 +17,6 @@
 static DEFINE_MUTEX(pmp_lock);
 static const void *pmp_data;
 static struct device *pmp_device;
-
-/* Standalone C host extraction has no Rust object; real APPLE_PMP depends on RUST. */
-#ifndef CONFIG_RUST
-int apple_pmp_read_gpu_effort(const void *data, u32 *count, u32 *effort)
-{
-	return -ENODEV;
-}
-#endif
 /* The firmware is stopped for a system sleep. */
 static bool pmp_asleep;
 
@@ -32,28 +24,18 @@ int apple_pmp_register(struct device *dev, const void *data)
 {
 	int ret = 0;
 
-	scoped_guard(mutex, &pmp_lock) {
-		if (pmp_data)
-			ret = -EBUSY;
-		else {
-			pmp_data = data;
-			pmp_device = dev;
-		}
+	guard(mutex)(&pmp_lock);
+	if (pmp_data)
+		ret = -EBUSY;
+	else {
+		pmp_data = data;
+		pmp_device = dev;
 	}
-	/* Outside pmp_lock: the report driver calls the reader under its own lock. */
-	if (!ret)
-		apple_pmp_report_set_gpu_effort_reader(apple_pmp_gpu_effort);
 	return ret;
 }
 
 void apple_pmp_unregister(const void *data)
 {
-	bool ours;
-
-	scoped_guard(mutex, &pmp_lock)
-		ours = pmp_data == data;
-	if (ours)
-		apple_pmp_report_set_gpu_effort_reader(NULL);
 	guard(mutex)(&pmp_lock);
 	if (pmp_data == data) {
 		pmp_data = NULL;
@@ -283,17 +265,3 @@ static int apple_pmp_resume_early(struct device *dev)
 const struct dev_pm_ops apple_pmp_pm_ops = {
 	LATE_SYSTEM_SLEEP_PM_OPS(apple_pmp_suspend_late, apple_pmp_resume_early)
 };
-
-int apple_pmp_gpu_effort(u32 *count, u32 *effort)
-{
-	int ret;
-
-	if (!count || !effort)
-		return -EINVAL;
-	guard(mutex)(&pmp_lock);
-	if (!pmp_data)
-		return -ENODEV;
-	ret = apple_pmp_read_gpu_effort(pmp_data, count, effort);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(apple_pmp_gpu_effort);
