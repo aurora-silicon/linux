@@ -341,9 +341,8 @@ config APPLE_CLPC
 	  Say 'y' or 'm' here if you have an Apple SoC with a PMC.
 
 config APPLE_AURA_HIBERNATE
-	bool "Hibernation under an aura boot object"
+	def_bool y
 	depends on ARCH_APPLE && HIBERNATION && OF_EARLY_FLATTREE
-	default y
 	help
 	  Under aura, the boot loader and the firmware keep memory alive
 	  below Linux's allocations, and on Apple M4 Pro boots the boot
@@ -351,7 +350,8 @@ config APPLE_AURA_HIBERNATE
 	  aura's fixed layout (/chosen/aura,hibernate-layout) this keeps
 	  every reserved range out of the hibernation image; without it,
 	  hibernation and resume are refused instead of overwriting the
-	  running boot loader.
+	  running boot loader. The refusal is part of the hibernation
+	  support of these machines, so the option cannot be turned off.
 
 config APPLE_DISPLAY_GATE
 	bool "Apple internal display enable gate"

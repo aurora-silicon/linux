@@ -65,6 +65,23 @@ bool aura_hibernate_layout_fixed(void)
 	return aura_layout_fixed;
 }
 
+/*
+ * Apple silicon Macs run firmware on their coprocessors (storage, secure
+ * enclave, display, always-on processor, system controller, GPU and more).
+ * Restoring an image means a cold boot through the platform boot chain, which
+ * restarts that firmware, but most of the Linux drivers have no
+ * freeze/poweroff/restore path that rebuilds their mailbox, ring and DMA state
+ * from a cold start. The restored kernel would keep using stale state, so
+ * writing and restoring images stays disabled on these machines, except where
+ * the boot object gives the OS a fixed memory layout and the drivers rebuild
+ * their coprocessor state from the cold boot that restores the image (aura
+ * hib=1, see above).
+ */
+static bool aura_hibernate_blocked(void)
+{
+	return of_machine_is_compatible("apple,arm-platform") && !aura_layout_fixed;
+}
+
 bool aura_hibernate_pfn_nosave(unsigned long pfn)
 {
 	unsigned int i;
@@ -384,6 +401,9 @@ static int __init aura_hibernate_init(void)
 	const void *fdt = initial_boot_params;
 	u64 layout[2], dt_slot;
 	int i, n;
+
+	hibernation_set_platform_check(aura_hibernate_blocked,
+				       "coprocessor firmware state is not restored from an image");
 
 	/* Only a boot loader that keeps the layout fixed publishes it. */
 	chosen = of_find_node_by_path("/chosen");

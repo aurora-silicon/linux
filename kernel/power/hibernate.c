@@ -15,7 +15,6 @@
 #include <linux/blkdev.h>
 #include <linux/export.h>
 #include <linux/suspend.h>
-#include <linux/soc/apple/aura-hibernate.h>
 #include <linux/reboot.h>
 #include <linux/string.h>
 #include <linux/device.h>
@@ -34,7 +33,6 @@
 #include <linux/ktime.h>
 #include <linux/security.h>
 #include <linux/secretmem.h>
-#include <linux/of.h>
 #include <trace/events/power.h>
 
 #include "power.h"
@@ -160,29 +158,36 @@ bool hibernation_in_progress(void)
 	return !atomic_read(&hibernate_atomic);
 }
 
-/*
- * Apple silicon Macs run firmware on their coprocessors (storage, secure
- * enclave, display, always-on processor, system controller, GPU and more).
- * Restoring an image means a cold boot through the platform boot chain, which
- * restarts that firmware, but most of the Linux drivers have no
- * freeze/poweroff/restore path that rebuilds their mailbox, ring and DMA state
- * from a cold start. The restored kernel would keep using stale state, so
- * writing and restoring images stays disabled on these machines.
+static bool (*hibernation_platform_blocked_fn)(void);
+static const char *hibernation_platform_blocked_reason;
+
+/**
+ * hibernation_set_platform_check - Let platform code refuse hibernation.
+ * @blocked: Tells whether hibernation is refused on this platform at the time.
+ * @reason: Why it is refused, for the log.
+ *
+ * A platform whose drivers cannot yet restore their devices from an image
+ * registers a check that is true until the platform has what it needs.  While
+ * it is true, writing and restoring images stays disabled
+ * (hibernation_available() is false) and @reason is logged at the end of the
+ * boot.  Only one check can be registered.
  *
  * pm_test dry runs are allowed (see hibernate()): every pm_test level stops
  * before create_image() takes a snapshot, so no image is written or restored.
  * They exercise the freezer and the device freeze/thaw callbacks that a real
  * implementation needs.
  */
+void hibernation_set_platform_check(bool (*blocked)(void), const char *reason)
+{
+	if (WARN_ON_ONCE(hibernation_platform_blocked_fn))
+		return;
+	hibernation_platform_blocked_reason = reason;
+	hibernation_platform_blocked_fn = blocked;
+}
+
 static bool hibernation_platform_blocked(void)
 {
-	/*
-	 * Except where the boot object gives the OS a fixed memory layout and
-	 * the drivers rebuild their coprocessor state from the cold boot that
-	 * restores the image (aura hib=1, see aura-hibernate.c).
-	 */
-	return of_machine_is_compatible("apple,arm-platform") &&
-		!aura_hibernate_layout_fixed();
+	return hibernation_platform_blocked_fn && hibernation_platform_blocked_fn();
 }
 
 static bool hibernation_generic_available(void)
@@ -201,7 +206,7 @@ bool hibernation_available(void)
 static int __init hibernation_platform_report(void)
 {
 	if (hibernation_platform_blocked())
-		pr_info("disabled on this platform: coprocessor firmware state is not restored from an image\n");
+		pr_info("disabled on this platform: %s\n", hibernation_platform_blocked_reason);
 	return 0;
 }
 late_initcall(hibernation_platform_report);
