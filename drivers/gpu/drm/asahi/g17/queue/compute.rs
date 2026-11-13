@@ -902,7 +902,7 @@ impl Queue {
         }
         let context = self.binding.as_ref().ok_or(EIO)?.context.clone();
         self.graph.reset_after_cold_boot(&context)?;
-        self.kick.reset_compute_after_cold_boot()?;
+        self.kick.reset_after_cold_boot()?;
         let blocks = self.pool.reset_after_cold_boot()?;
         let row = (self.pool.id(), self.pool.page_list_va()?, blocks);
         self.installed = false;

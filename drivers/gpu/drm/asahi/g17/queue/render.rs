@@ -1975,7 +1975,7 @@ impl Pair {
     /// job list rewritten (item-ring cursors 0), the buffer manager graph rebuilt (InitBM
     /// again), the install, registration, first-slot and context-update state of a fresh pair
     /// and no configuration cache. The kick rings restart at [`KickTimestamp::FIRST`] with
-    /// no parent, as the cold firmware expects ([`kick::Queue::reset_render_after_cold_boot`]);
+    /// no parent, as the cold firmware expects ([`kick::Queue::reset_after_cold_boot`]);
     /// the ordinal stays monotonic (completion stamps and pass sequence numbers derive from it,
     /// not from the kick timestamp). The caller seeds the pair's completion stamps with
     /// [`Self::cold_stamp`], so the next command is covered and its seed names timestamp 0,
@@ -2006,7 +2006,7 @@ impl Pair {
         self.switch = None;
         self.resync();
         for kick in &mut self.kicks {
-            kick.reset_render_after_cold_boot()?;
+            kick.reset_after_cold_boot()?;
         }
         Ok(())
     }

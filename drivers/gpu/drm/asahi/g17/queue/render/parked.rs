@@ -65,7 +65,7 @@ impl ParkedPair {
         self.executed = 0;
         if let Some(kicks) = self.kicks.as_mut() {
             for kick in kicks.iter_mut() {
-                kick.reset_render_after_cold_boot()?;
+                kick.reset_after_cold_boot()?;
             }
         }
         Ok((
