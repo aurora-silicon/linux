@@ -41,6 +41,7 @@ mod shmem;
 mod sks;
 mod stac;
 mod stac_client;
+mod stac_ta_wire;
 // The read-only client uses the pairing-state query; the other operations
 // come with the session relay.
 #[allow(dead_code)]
