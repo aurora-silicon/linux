@@ -32,7 +32,7 @@
 #define IND_SIDE		48
 #define IND_MARGIN		12
 #define IND_BORDER		3
-#define IND_FILL		0xffff9500
+#define IND_FILL		0xff34c759
 #define IND_EDGE		0xff000000
 #define IND_PRESENT_TIMEOUT	msecs_to_jiffies(1000)
 #define IND_RETRY		msecs_to_jiffies(50)
@@ -362,9 +362,10 @@ static int dcp_indicator_request(struct apple_dcp *dcp)
 }
 
 /*
- * The display resumed and the resume commit is done: a plane that came back
- * dark has no square, so it is OFF now and a request that still stands is asked
- * for again. A plane that came back lit is left alone (see dcp_ind_display_resumed).
+ * The display resumed and the resume commit is done: the plane came back dark,
+ * so the square is OFF now and a request that still stands is asked for again.
+ * A lit plane is a set(true) that landed after the resume commit; it is left
+ * alone (see dcp_ind_display_resumed).
  * ctl and the plane lock are taken in the order dcp_indicator_commit takes them,
  * so a request cannot land between reading the plane and resetting the state.
  */
