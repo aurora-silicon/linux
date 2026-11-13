@@ -764,7 +764,7 @@ static int t6040_cpu_on(u64 mpidr)
 	unsigned int cluster = t6040_cpu_cluster(mpidr);
 	u32 bit = t6040_cpu_start_bit(mpidr);
 
-	if (!s || !s->cpu_start)
+	if (!s)
 		return -ENODEV;
 	if (!bit)
 		return -EINVAL;
@@ -788,7 +788,7 @@ static const struct spin_table_power_ops t6040_cpu_power_ops = {
  */
 static void t6040_sleep_power_ops(struct t6040_sleep *s)
 {
-	if (s->power_ops || !s->cpu_start)
+	if (s->power_ops)
 		return;
 	if (!spin_table_set_power_ops(&t6040_cpu_power_ops)) {
 		s->power_ops = true;
@@ -798,15 +798,13 @@ static void t6040_sleep_power_ops(struct t6040_sleep *s)
 
 static void t6040_sleep_set_wd2(struct t6040_sleep *s, unsigned int secs)
 {
-	if (!s->wdt)
-		return;
 	apple_sleep_wd2_arm(s->wdt, secs);
 	s->wd2_armed = true;
 }
 
 static void t6040_sleep_clear_wd2(struct t6040_sleep *s)
 {
-	if (!s->wdt || !s->wd2_armed)
+	if (!s->wd2_armed)
 		return;
 	writel(0, s->wdt + WDT_WD2_CTL);
 	s->wd2_armed = false;
@@ -860,19 +858,6 @@ static unsigned int t6040_sleep_refuse(struct t6040_sleep *s)
 	if (num_online_cpus() != 1 || !s->mbox ||
 	    (read_cpuid_mpidr() & MPIDR_HWID_BITMASK) != s->mbox->boot_mpidr) {
 		dev_err(s->dev, "refused: wrong CPU, other CPUs online, or no mailbox\n");
-		refused++;
-	}
-
-	/*
-	 * Refuse rather than half-sleep if any register block the commit or the
-	 * wake must write is missing from the device tree. The deep WFI would
-	 * never arm, and the wake could not restore the SoC.
-	 */
-	if (!s->cluster_ctl || !s->pwrgate || !s->mastermini || !s->spmi0 ||
-	    !s->soc_east || !s->aop_global) {
-		dev_err(s->dev, "refused: a commit/wake register base is not mapped (cluster-ctl %d pwrgate %d mastermini %d spmi0 %d soc-east %d aop-global %d)\n",
-			!!s->cluster_ctl, !!s->pwrgate, !!s->mastermini, !!s->spmi0,
-			!!s->soc_east, !!s->aop_global);
 		refused++;
 	}
 
@@ -1055,12 +1040,10 @@ static void t6040_sleep_log_s2r_state(struct t6040_sleep *s, const char *when)
 	u32 m[AOP_WAKE_WORDS] = {}, st[AOP_WAKE_WORDS] = {}, ctl = 0;
 	int i;
 
-	if (s->aop_global) {
-		ctl = readl(s->aop_global + AOP_S2R_CTRL);
-		for (i = 0; i < AOP_WAKE_WORDS; i++) {
-			m[i] = readl(s->aop_global + AOP_WAKE_MASK(i));
-			st[i] = readl(s->aop_global + AOP_WAKE_STATUS(i));
-		}
+	ctl = readl(s->aop_global + AOP_S2R_CTRL);
+	for (i = 0; i < AOP_WAKE_WORDS; i++) {
+		m[i] = readl(s->aop_global + AOP_WAKE_MASK(i));
+		st[i] = readl(s->aop_global + AOP_WAKE_STATUS(i));
 	}
 	dev_dbg(s->dev, "S2R state at %s: S2R-lo count %u (raw %#x), AOP-global ctl %#x\n",
 		when, raw >> 3, raw, ctl);
@@ -1100,11 +1083,9 @@ static const struct t6040_axi2af_domain {
 	[AXI2AF_APCIE_SYS_GP] = { "apcie_sys_gp", true,  0x390, 0x416000000 },
 };
 
-/* Only with the PMU's bus mapped. */
 static void t6040_pmu_write(struct t6040_sleep *s, u16 reg, u8 val)
 {
-	if (s->spmi0)
-		apple_sleep_pmu_write(s->spmi0, PMU_USID, reg, val);
+	apple_sleep_pmu_write(s->spmi0, PMU_USID, reg, val);
 }
 
 /*
@@ -1127,8 +1108,6 @@ static void t6040_clusters_off(struct t6040_sleep *s)
 	u32 val;
 	int i;
 
-	if (!s->cluster_ctl)
-		return;
 	for (i = 0; i < CLUSTER_CTL_NR; i++) {
 		val = readl(s->cluster_ctl + CLUSTER_CTL(i));
 		s->cluster_saved[i] = val;
@@ -1155,12 +1134,8 @@ static void t6040_clkgen_park(struct t6040_sleep *s)
 	u32 cur;
 	int i;
 
-	if (s->soc_east) {
-		t6040_east_clk_quiesce(s, SOC_EAST_CLK_A);
-		t6040_east_clk_quiesce(s, SOC_EAST_CLK_B);
-	}
-	if (!s->clkgen)
-		return;
+	t6040_east_clk_quiesce(s, SOC_EAST_CLK_A);
+	t6040_east_clk_quiesce(s, SOC_EAST_CLK_B);
 	for (i = 0; i < CLKGEN_MUX_WORDS; i++) {
 		void __iomem *reg = s->clkgen + t6040_clkgen_mux[i];
 		u32 val = readl(reg);
@@ -1178,7 +1153,7 @@ static void t6040_clkgen_restore(struct t6040_sleep *s)
 {
 	int i;
 
-	if (!s->clkgen || !s->clkgen_saved)
+	if (!s->clkgen_saved)
 		return;
 	for (i = CLKGEN_MUX_WORDS - 1; i >= 0; i--)
 		writel(s->clkgen_mux_saved[i], s->clkgen + t6040_clkgen_mux[i]);
@@ -1195,8 +1170,6 @@ static void t6040_secondaries_off(struct t6040_sleep *s)
 	unsigned int cpu;
 	u32 v;
 
-	if (!s->soc_ps)
-		return;
 	for_each_present_cpu(cpu) {
 		u32 bit = t6040_cpu_start_bit(cpu_logical_map(cpu));
 
@@ -1309,6 +1282,9 @@ static int t6040_sleep_preflight_show(struct seq_file *m, void *unused)
 {
 	struct t6040_sleep *s = m->private;
 	unsigned int live = t6040_sleep_live_blockers(s, m, NULL);
+	static const char * const nm[] = {
+		"EACC", "PACC0", "PACC1_ANE", "DISP_INT", "DISP_EXT",
+	};
 	unsigned int i;
 
 	apple_sleep_registry_show(m);
@@ -1317,15 +1293,9 @@ static int t6040_sleep_preflight_show(struct seq_file *m, void *unused)
 	seq_printf(m, "dry_run %u, wd2_secs %u, allow_entry %d, parking ops %s\n",
 		   READ_ONCE(dry_run), READ_ONCE(wd2_secs), allow_entry,
 		   s->power_ops ? "registered" : "not registered");
-	if (s->cluster_ctl) {
-		static const char * const nm[] = {
-			"EACC", "PACC0", "PACC1_ANE", "DISP_INT", "DISP_EXT",
-		};
-
-		for (i = 0; i < CLUSTER_CTL_NR; i++)
-			seq_printf(m, "cluster-ctl +%#x %-9s %#x\n", CLUSTER_CTL(i), nm[i],
-				   readl(s->cluster_ctl + CLUSTER_CTL(i)));
-	}
+	for (i = 0; i < CLUSTER_CTL_NR; i++)
+		seq_printf(m, "cluster-ctl +%#x %-9s %#x\n", CLUSTER_CTL(i), nm[i],
+			   readl(s->cluster_ctl + CLUSTER_CTL(i)));
 
 	return 0;
 }
@@ -1393,8 +1363,6 @@ static void t6040_wake_arm(struct t6040_sleep *s)
 {
 	int i;
 
-	if (!s->aop_global)
-		return;
 	for (i = 0; i < AOP_WAKE_WORDS; i++) {
 		s->wake_mask_saved[i] = readl(s->aop_global + AOP_WAKE_MASK(i));
 		writel(t6040_wake_mask[i], s->aop_global + AOP_WAKE_MASK(i));
@@ -1407,7 +1375,7 @@ static void t6040_wake_restore(struct t6040_sleep *s)
 {
 	int i;
 
-	if (!s->aop_global || !s->wake_mask_saved_valid)
+	if (!s->wake_mask_saved_valid)
 		return;
 	for (i = 0; i < AOP_WAKE_WORDS; i++)
 		writel(s->wake_mask_saved[i], s->aop_global + AOP_WAKE_MASK(i));
@@ -1674,7 +1642,7 @@ static void t6040_ans_bridge_quiesce(struct t6040_sleep *s)
 	void __iomem *bridge = s->axi2af_bridge[AXI2AF_ANS];
 	u32 a, b;
 
-	if (!bridge || !s->soc_east ||
+	if (!bridge ||
 	    FIELD_GET(PS_ACTUAL, readl(s->soc_east + PS_ANS)) != PS_ACTIVE)
 		return;
 	a = readl(bridge + AXI2AF_BRIDGE_104);
@@ -1906,8 +1874,6 @@ static void t6040_atc_lower(struct t6040_sleep *s)
 {
 	int p, k;
 
-	if (!s->soc_ps)
-		return;
 	for (p = 0; p < ARRAY_SIZE(t6040_atc_words); p++)
 		for (k = 0; k < ARRAY_SIZE(t6040_atc_words[0]); k++) {
 			void __iomem *reg = s->soc_ps + t6040_atc_words[p][k];
@@ -1971,7 +1937,7 @@ static void t6040_gp_ports_stop(struct t6040_sleep *s)
 {
 	int p;
 
-	if (!s->soc_east || !FIELD_GET(PS_ACTUAL, readl(s->soc_east + PS_APCIE_SYS_GP)))
+	if (!FIELD_GET(PS_ACTUAL, readl(s->soc_east + PS_APCIE_SYS_GP)))
 		return;
 	for (p = 0; p < ARRAY_SIZE(s->gp_port); p++)
 		t6040_gp_port_stop(s, p);
@@ -1988,8 +1954,6 @@ static void t6040_apcie_gp_lower(struct t6040_sleep *s)
 	void __iomem *sys, *gp, *bridge = s->axi2af_bridge[AXI2AF_APCIE_SYS_GP];
 	u32 val;
 
-	if (!s->soc_east)
-		return;
 	sys = s->soc_east + PS_APCIE_SYS_GP;
 	gp = s->soc_east + PS_APCIE_GP;
 	if (!FIELD_GET(PS_ACTUAL, readl(sys)))
@@ -2041,17 +2005,15 @@ static int t6040_sleep_commit(unsigned long unused)
 	/*
 	 * ANS's storage link, once ANS has been stopped by its driver (see
 	 * t6040_apcie_phy_off). It follows every refusal, so a refused sleep finds
-	 * the link up. No-op unless the apple,apcie windows are present (apcie_st.valid).
+	 * the link up.
 	 */
-	if (s->soc_east)
-		t6040_ps_raise_start(s->soc_east, PS_APCIE_SYS_ST1);
+	t6040_ps_raise_start(s->soc_east, PS_APCIE_SYS_ST1);
 	if (s->pcie_ans_stopped)
 		t6040_apcie_st_lower(s);
 	t6040_apcie_gp_lower(s);
 
 	/* WD0 off, then the AON WD2 net (5 s covers the reconfig). */
-	if (s->wdt)
-		writel(0, s->wdt + WDT_WD0_CTL);
+	writel(0, s->wdt + WDT_WD0_CTL);
 	t6040_sleep_set_wd2(s, clamp(READ_ONCE(sleep_wd_secs), 1U, WDT_MAX_SECS));
 	/* And the SMC's AP watchdog deadline off, right after the WD2 (measured). */
 	if (s->smc_wdt_deadline)
@@ -2059,10 +2021,8 @@ static int t6040_sleep_commit(unsigned long unused)
 
 	/* PMU boot stage 0x50 and NOTIFY_ENABLE on both SPMI controllers (measured). */
 	t6040_pmu_write(s, PMU_BOOT_STAGE, PMU_BOOT_STAGE_SLEEP);
-	if (s->spmi0)
-		writel(SPMI_NOTIFY_ENABLE_SLEEP, s->spmi0 + SPMI_NOTIFY_ENABLE);
-	if (s->spmi_a0)
-		writel(SPMI_NOTIFY_ENABLE_SLEEP, s->spmi_a0 + SPMI_NOTIFY_ENABLE);
+	writel(SPMI_NOTIFY_ENABLE_SLEEP, s->spmi0 + SPMI_NOTIFY_ENABLE);
+	writel(SPMI_NOTIFY_ENABLE_SLEEP, s->spmi_a0 + SPMI_NOTIFY_ENABLE);
 
 	/*
 	 * The order of the PMGR quiesce (the cluster and axi2af
@@ -2092,8 +2052,7 @@ static int t6040_sleep_commit(unsigned long unused)
 	t6040_sio_ps_save(s);
 
 	/* The commit: the MasterMini S2R timer arms the SoC sleep engine. */
-	if (s->mastermini)
-		writel(1, s->mastermini + MASTERMINI_S2R_TIMER);
+	writel(1, s->mastermini + MASTERMINI_S2R_TIMER);
 	dsb(sy);
 
 	/* A raised line would end the WFI the engine waits for. */
@@ -2190,35 +2149,27 @@ static void t6040_sleep_return(struct t6040_sleep *s)
 	 * normal per-CPU start afterwards, and all 14 CPUs of the J616s are
 	 * online after a wake without it.
 	 */
-	if (s->cluster_ctl)
-		for (i = 0; i < CLUSTER_CTL_NR; i++) {
-			u32 on = i < CLUSTER_CTL_FIRST_WAIT ? CLUSTER_CTL_ON :
-				 s->cluster_saved[i] & CLUSTER_CTL_NIBBLE;
+	for (i = 0; i < CLUSTER_CTL_NR; i++) {
+		u32 on = i < CLUSTER_CTL_FIRST_WAIT ? CLUSTER_CTL_ON :
+			 s->cluster_saved[i] & CLUSTER_CTL_NIBBLE;
 
-			val = readl(s->cluster_ctl + CLUSTER_CTL(i));
-			writel((val & ~CLUSTER_CTL_NIBBLE) | on, s->cluster_ctl + CLUSTER_CTL(i));
-		}
+		val = readl(s->cluster_ctl + CLUSTER_CTL(i));
+		writel((val & ~CLUSTER_CTL_NIBBLE) | on, s->cluster_ctl + CLUSTER_CTL(i));
+	}
 	t6040_wake_sync();
 
 	/* Wake pwrgates and CPM voters: read, set BIT31. */
-	if (s->pwrgate) {
-		writel(readl(s->pwrgate + PWRGATE_WAKE_0) | PWRGATE_ON,
-		       s->pwrgate + PWRGATE_WAKE_0);
-		writel(readl(s->pwrgate + PWRGATE_WAKE_1) | PWRGATE_ON,
-		       s->pwrgate + PWRGATE_WAKE_1);
-	}
+	writel(readl(s->pwrgate + PWRGATE_WAKE_0) | PWRGATE_ON, s->pwrgate + PWRGATE_WAKE_0);
+	writel(readl(s->pwrgate + PWRGATE_WAKE_1) | PWRGATE_ON, s->pwrgate + PWRGATE_WAKE_1);
 	t6040_wake_sync();
 
 	/* SOC-East retention off: clear DEV_DISABLE, then poll BUSY clear. */
-	if (s->soc_east) {
-		val = readl(s->soc_east + SOC_EAST_RETENTION);
-		writel(val & ~PS_DEV_DISABLE, s->soc_east + SOC_EAST_RETENTION);
-		ret = readl_poll_timeout_atomic(s->soc_east + SOC_EAST_RETENTION, val,
-						!(val & PS_BUSY), 1,
-						SOC_EAST_TIMEOUT_US);
-		if (ret)
-			dev_warn(s->dev, "SOC-East retention word still busy on wake (%#x)\n", val);
-	}
+	val = readl(s->soc_east + SOC_EAST_RETENTION);
+	writel(val & ~PS_DEV_DISABLE, s->soc_east + SOC_EAST_RETENTION);
+	ret = readl_poll_timeout_atomic(s->soc_east + SOC_EAST_RETENTION, val,
+					!(val & PS_BUSY), 1, SOC_EAST_TIMEOUT_US);
+	if (ret)
+		dev_warn(s->dev, "SOC-East retention word still busy on wake (%#x)\n", val);
 	t6040_wake_sync();
 
 	/*
@@ -2241,11 +2192,9 @@ static void t6040_sleep_return(struct t6040_sleep *s)
 	t6040_aop_ps_restore(s);
 	t6040_wake_sync();
 
-	if (s->pwrgate) {
-		writel(readl(s->pwrgate + PWRGATE_CPM_0) | PWRGATE_ON, s->pwrgate + PWRGATE_CPM_0);
-		writel(readl(s->pwrgate + PWRGATE_CPM_1) | PWRGATE_ON, s->pwrgate + PWRGATE_CPM_1);
-		writel(readl(s->pwrgate + PWRGATE_CPM_2) | PWRGATE_ON, s->pwrgate + PWRGATE_CPM_2);
-	}
+	writel(readl(s->pwrgate + PWRGATE_CPM_0) | PWRGATE_ON, s->pwrgate + PWRGATE_CPM_0);
+	writel(readl(s->pwrgate + PWRGATE_CPM_1) | PWRGATE_ON, s->pwrgate + PWRGATE_CPM_1);
+	writel(readl(s->pwrgate + PWRGATE_CPM_2) | PWRGATE_ON, s->pwrgate + PWRGATE_CPM_2);
 	t6040_wake_sync();
 
 	/* Undo the entry clk-mux park; the clock restore is otherwise a NOP. */
@@ -2253,8 +2202,7 @@ static void t6040_sleep_return(struct t6040_sleep *s)
 	t6040_wake_sync();
 
 	/* Software ack of the armed S2R request (the S2R timer has no stop). */
-	if (s->aop_global)
-		writel(0, s->aop_global + AOP_S2R_CTRL);
+	writel(0, s->aop_global + AOP_S2R_CTRL);
 	t6040_wake_sync();
 
 	/* The keep-alive bits the commit cleared, back (the wake restore enables them). */
@@ -2270,9 +2218,8 @@ static void t6040_sleep_return(struct t6040_sleep *s)
 		dcache_inval_poc((unsigned long)s->mbox, (unsigned long)(s->mbox + 1));
 		dev_dbg(s->dev, "wake: resumes now %llu\n", READ_ONCE(s->mbox->resumes));
 	}
-	if (s->aop_global)
-		for (i = 0; i < AOP_WAKE_WORDS; i++)
-			s->wake_status[i] = readl(s->aop_global + AOP_WAKE_STATUS(i));
+	for (i = 0; i < AOP_WAKE_WORDS; i++)
+		s->wake_status[i] = readl(s->aop_global + AOP_WAKE_STATUS(i));
 	s->returned = true;
 }
 
@@ -2426,8 +2373,9 @@ static int t6040_sleep_prepare(void)
  */
 static int t6040_sleep_dry_enter(struct t6040_sleep *s, unsigned int dry)
 {
+	u32 p[AOP_WAKE_WORDS];
 	unsigned int refused;
-	int ret;
+	int ret, i;
 
 	dev_info(s->dev, "dry run %u at the commit point: %u CPU(s) online\n", dry,
 		 num_online_cpus());
@@ -2436,15 +2384,10 @@ static int t6040_sleep_dry_enter(struct t6040_sleep *s, unsigned int dry)
 	 * A wake source pending and left unmasked by the masks a real commit arms would keep the
 	 * AP partition from powering down, and the sleep engine then stalls. Read only.
 	 */
-	if (s->aop_global) {
-		u32 p[AOP_WAKE_WORDS];
-		int i;
-
-		for (i = 0; i < AOP_WAKE_WORDS; i++)
-			p[i] = readl(s->aop_global + AOP_WAKE_STATUS(i)) & ~t6040_wake_mask[i];
-		dev_info(s->dev, "dry-run commit point: wake status left unmasked by the commit's masks %*ph\n",
-			 (int)sizeof(p), p);
-	}
+	for (i = 0; i < AOP_WAKE_WORDS; i++)
+		p[i] = readl(s->aop_global + AOP_WAKE_STATUS(i)) & ~t6040_wake_mask[i];
+	dev_info(s->dev, "dry-run commit point: wake status left unmasked by the commit's masks %*ph\n",
+		 (int)sizeof(p), p);
 	refused = t6040_sleep_refuse(s);
 	dev_info(s->dev, "a real commit would %s here (%u check(s) failed)\n",
 		 refused ? "refuse" : "go on", refused);
@@ -2602,8 +2545,6 @@ static int t6040_disp_off(struct t6040_sleep *s, const struct t6040_sleep_group 
 	struct t6040_psw sys = { .io = s->soc_east, .off = PS_DISP_SYS };
 	int ret;
 
-	if (!s->soc_east)
-		return -ENODEV;
 	s->disp_down = true;
 	/*
 	 * The PMC's bandwidth-request and boost interface enables of the display pipes
@@ -3119,9 +3060,9 @@ static int t6040_sleep_probe(struct platform_device *pdev)
 		return ret;
 
 	/*
-	 * Optional: the commit's and the wake's hardware (all NULL on absence;
-	 * every write is guarded and the gate refuses if a required one is
-	 * missing). The axi2af fabric bridges are fixed PAs, not DT.
+	 * The commit's and the wake's register blocks are mandatory: without them a suspend
+	 * could not be entered or undone, and the node always lists them. The axi2af fabric
+	 * bridges are fixed PAs, not DT.
 	 */
 	BUILD_BUG_ON(ARRAY_SIZE(t6040_axi2af) != T6040_AXI2AF_DOMAINS);
 	BUILD_BUG_ON(ARRAY_SIZE(t6040_tvm) != ARRAY_SIZE(((struct t6040_sleep *)0)->tvm_ctl));
@@ -3129,6 +3070,23 @@ static int t6040_sleep_probe(struct platform_device *pdev)
 		     ARRAY_SIZE(((struct t6040_sleep *)0)->acc_apsc));
 	s->cpu_start = t6040_sleep_map(&pdev->dev, "cpu-start");
 	s->wdt = t6040_sleep_map(&pdev->dev, "wdt");
+	s->cluster_ctl = t6040_sleep_map(&pdev->dev, "cluster-ctl");
+	s->pwrgate = t6040_sleep_map(&pdev->dev, "soc-pwrgate");
+	s->clkgen = t6040_sleep_map(&pdev->dev, "clkgen");
+	s->spmi0 = t6040_sleep_map(&pdev->dev, "spmi0");
+	s->spmi_a0 = t6040_sleep_map(&pdev->dev, "spmi-a0");
+	s->mastermini = t6040_sleep_map(&pdev->dev, "mastermini");
+	s->soc_east = t6040_sleep_map(&pdev->dev, "soc-east");
+	s->soc_ps = t6040_sleep_map(&pdev->dev, "soc-ps");
+	s->aop_global = t6040_sleep_map(&pdev->dev, "aop-global");
+	if (!s->cpu_start || !s->wdt || !s->cluster_ctl || !s->pwrgate || !s->clkgen ||
+	    !s->spmi0 || !s->spmi_a0 || !s->mastermini || !s->soc_east || !s->soc_ps ||
+	    !s->aop_global)
+		return dev_err_probe(&pdev->dev, -ENODEV,
+				     "a register block is missing or not mapped (cpu-start %d wdt %d cluster-ctl %d soc-pwrgate %d clkgen %d spmi0 %d spmi-a0 %d mastermini %d soc-east %d soc-ps %d aop-global %d)\n",
+				     !!s->cpu_start, !!s->wdt, !!s->cluster_ctl, !!s->pwrgate,
+				     !!s->clkgen, !!s->spmi0, !!s->spmi_a0, !!s->mastermini,
+				     !!s->soc_east, !!s->soc_ps, !!s->aop_global);
 	{
 		struct resource wres;
 		int widx = of_property_match_string(pdev->dev.of_node, "reg-names", "wdt");
@@ -3140,12 +3098,6 @@ static int t6040_sleep_probe(struct platform_device *pdev)
 			dev_warn(&pdev->dev,
 				 "the wdt block is not the AON watchdog: no WD2 restart at the wake\n");
 	}
-	s->cluster_ctl = t6040_sleep_map(&pdev->dev, "cluster-ctl");
-	s->pwrgate = t6040_sleep_map(&pdev->dev, "soc-pwrgate");
-	s->clkgen = t6040_sleep_map(&pdev->dev, "clkgen");
-	s->spmi0 = t6040_sleep_map(&pdev->dev, "spmi0");
-	s->spmi_a0 = t6040_sleep_map(&pdev->dev, "spmi-a0");
-	s->mastermini = t6040_sleep_map(&pdev->dev, "mastermini");
 	s->aop_ps = t6040_ioremap_np(&pdev->dev, T6040_AOP_PS_PA, 0x160);
 	s->pmgr_soc = t6040_ioremap_np(&pdev->dev, 0x502800000ULL, 0x9000);
 	for (i = 0; i < ARRAY_SIZE(s->dcs); i++)
@@ -3156,9 +3108,6 @@ static int t6040_sleep_probe(struct platform_device *pdev)
 		s->atc_cfg[i] = t6040_ioremap_np(&pdev->dev,
 						 0x383200000ULL + i * 0x8000000ULL, 0x100);
 	s->pmgr_east = t6040_ioremap_np(&pdev->dev, 0x502280000ULL, 0xd000);
-	s->soc_east = t6040_sleep_map(&pdev->dev, "soc-east");
-	s->soc_ps = t6040_sleep_map(&pdev->dev, "soc-ps");
-	s->aop_global = t6040_sleep_map(&pdev->dev, "aop-global");
 	for (i = 0; i < T6040_AXI2AF_DOMAINS; i++)
 		s->axi2af_bridge[i] = t6040_ioremap_np(&pdev->dev,
 						       t6040_axi2af[i].bridge_pa, 0x200);
@@ -3203,11 +3152,8 @@ static int t6040_sleep_probe(struct platform_device *pdev)
 
 	suspend_set_ops(&t6040_sleep_ops);
 	dev_info(&pdev->dev,
-		 "refusal-first: %u display groups, cpu-start %s, wdt %s, commit/wake blocks %s, storage-apcie %s, s2r-mailbox %s, parking ops %s, dry run %u\n",
-		 s->ngroups, s->cpu_start ? "mapped" : "absent",
-		 s->wdt ? "mapped" : "absent",
-		 (s->cluster_ctl && s->pwrgate && s->mastermini && s->spmi0 &&
-		  s->soc_east && s->aop_global) ? "mapped" : "incomplete",
+		 "refusal-first: %u display groups, storage-apcie %s, s2r-mailbox %s, parking ops %s, dry run %u\n",
+		 s->ngroups,
 		 s->apcie_st.valid ? "mapped" : "absent",
 		 s->mbox ? "present" : "absent",
 		 s->power_ops ? "registered" : "not registered", READ_ONCE(dry_run));
