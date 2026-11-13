@@ -104,6 +104,25 @@ static void apple_sleep_test_words(struct kunit *test)
 	}
 }
 
+/* Every matched SoC brings its own operations for each SoC-specific step. */
+static void apple_sleep_test_ops(struct kunit *test)
+{
+	const struct of_device_id *id;
+
+	for (id = apple_sleep_of_match; id->compatible[0]; id++) {
+		const struct apple_sleep_soc *soc = id->data;
+		const struct apple_sleep_ops *ops = soc->ops;
+
+		KUNIT_ASSERT_NOT_NULL_MSG(test, ops, "%s has no operations", id->compatible);
+		KUNIT_EXPECT_NOT_NULL(test, ops->deep_wfi_arm);
+		KUNIT_EXPECT_NOT_NULL(test, ops->last_mile);
+		KUNIT_EXPECT_NOT_NULL(test, ops->wake);
+		KUNIT_EXPECT_NOT_NULL(test, ops->aic_mask_all);
+		KUNIT_EXPECT_NOT_NULL(test, ops->aic_ack);
+		KUNIT_EXPECT_NOT_NULL(test, ops->aic_restore);
+	}
+}
+
 /* The books keep one bit for each stray word and one gate for each coprocessor. */
 static void apple_sleep_test_books(struct kunit *test)
 {
@@ -130,9 +149,9 @@ static void apple_sleep_test_wake_names(struct kunit *test)
 		for (i = 0; i < soc->nwake_names; i++) {
 			u32 n = soc->wake_names[i].id;
 
-			KUNIT_EXPECT_LT_MSG(test, n, WAKE_WORDS * 32, "%s",
+			KUNIT_EXPECT_LT_MSG(test, n, soc->wake_words * 32, "%s",
 					    soc->wake_names[i].name);
-			if (n / 32 == WAKE_WORDS - 1)
+			if (n / 32 == soc->wake_words - 1)
 				KUNIT_EXPECT_TRUE_MSG(test, soc->wake_last_word & BIT(n % 32), "%s",
 						      soc->wake_names[i].name);
 			for (j = 0; j < i; j++)
@@ -141,8 +160,33 @@ static void apple_sleep_test_wake_names(struct kunit *test)
 	}
 }
 
+/* The SoC's counts fit the driver's arrays, and each list is set. */
+static void apple_sleep_test_layout(struct kunit *test)
+{
+	const struct of_device_id *id;
+
+	for (id = apple_sleep_of_match; id->compatible[0]; id++) {
+		const struct apple_sleep_soc *soc = id->data;
+
+		KUNIT_EXPECT_GE(test, soc->ncluster_cpu, 1);
+		KUNIT_EXPECT_LE(test, soc->ncluster_cpu, SLEEP_CPU_CLUSTERS_MAX);
+		KUNIT_EXPECT_GT(test, soc->cpu_start_stride, 0);
+		KUNIT_EXPECT_LE(test, soc->nclk_mux_parked, SLEEP_CLK_MUX_MAX);
+		KUNIT_EXPECT_LE(test, soc->ncllt, SLEEP_CLLT_MAX);
+		KUNIT_EXPECT_GE(test, soc->nmcc, 1);
+		KUNIT_EXPECT_LE(test, soc->nmcc, MCC_CHANNELS);
+		KUNIT_EXPECT_LE(test, soc->namcc, SLEEP_AMCC_MAX);
+		KUNIT_EXPECT_GE(test, soc->wake_words, 1);
+		KUNIT_EXPECT_LE(test, soc->wake_words, WAKE_WORDS);
+		KUNIT_EXPECT_GE(test, soc->wake_status, soc->wake_mask + soc->wake_words * 4);
+		KUNIT_EXPECT_LT(test, soc->pmu_usid, 16);
+	}
+}
+
 static struct kunit_case apple_sleep_test_cases[] = {
+	KUNIT_CASE(apple_sleep_test_layout),
 	KUNIT_CASE(apple_sleep_test_only_tested),
+	KUNIT_CASE(apple_sleep_test_ops),
 	KUNIT_CASE(apple_sleep_test_words),
 	KUNIT_CASE(apple_sleep_test_books),
 	KUNIT_CASE(apple_sleep_test_wake_names),

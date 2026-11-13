@@ -88,7 +88,7 @@ struct aura_s2r_mailbox {
 #define PS_OFF_TIMEOUT_US	5000
 #define PS_BUSY_SETTLE_US	1000
 
-/* CPU start block, as aura's smp_start_cpu() uses it */
+/* CPU start block, as aura's smp_start_cpu() uses it. A core's bit is the SoC's. */
 #define CPU_START_STOP		0x0
 #define CPU_START_SYS		0x4
 #define CPU_START_CLUSTER(n)	(0x8 + (n) * 4)
@@ -96,15 +96,7 @@ struct aura_s2r_mailbox {
 /* Power-gate page: reads back this value already. Purpose unknown. */
 #define PWRGATE_ON		0x80000000
 
-/* Three clock muxes macOS writes before the commit. */
-#define CLK_MUX_PARKED		0x80100000
-#define CLK_MUX_34		0x0
-#define CLK_MUX_38		0x4
-#define CLK_MUX_3C		0x8
-
-/* Cluster control: only these three words, the next one is locked. */
-#define CLUSTER_E		0x0
-#define CLUSTER_P		0x4
+/* Cluster control: one word per CPU cluster, then the AVE complex's where the SoC has one. */
 #define CLUSTER_AVE		0x8
 #define CLUSTER_ON		0xf
 /* AVE: a transition still in progress, as when a lower waits for a domain it powers */
@@ -114,13 +106,6 @@ struct aura_s2r_mailbox {
 #define CLUSTER_E_READY		BIT(5)
 #define CLUSTER_TIMEOUT_US	5000
 
-/* CLLT: names from nothing. Bits measured cleared by macOS before the commit. */
-#define CLLT_0			0x30
-#define CLLT_1			0x34
-#define CLLT_2			0x3c
-#define CLLT_0_CLEAR		GENMASK(7, 0)
-#define CLLT_1_CLEAR		GENMASK(7, 0)
-#define CLLT_2_CLEAR		GENMASK(17, 16)
 
 /* Watchdog block, ADT /arm-io/wdt reg[0]. WD2 is the sleep safety net. */
 #define WDT_WD0_COUNT		0x00
@@ -137,10 +122,8 @@ struct aura_s2r_mailbox {
 
 #define AON_AP_DEADLINE		0x08
 
-/* Wake sources: a mask, so 0 enables. Status words are sticky. */
-#define WAKE_MASK(word)		(0x08 + (word) * 4)
-#define WAKE_STATUS(word)	(0x28 + (word) * 4)
-#define WAKE_WORDS		8
+/* Wake sources: a mask, so 0 enables. Status words are sticky. Where and how many: the SoC. */
+#define WAKE_WORDS		9
 #define WAKE_SOURCES_MAX	32
 
 /* The AP queue of the PMU's SPMI controller, and its response vector's enable and ack */
@@ -149,7 +132,6 @@ struct aura_s2r_mailbox {
 #define SPMI_CMD		0x04
 #define SPMI_REPLY		0x08
 #define SPMI_NOTIFY_ENABLE	0x40
-#define SPMI_NOTIFY_ENABLE_SLEEP	0x2000001
 #define SPMI_NOTIFY_REPLY	BIT(0)
 #define SPMI_NOTIFY_ACK		0x80
 #define SPMI_CMD_ACTIVE		BIT(15)
@@ -180,13 +162,12 @@ struct aura_s2r_mailbox {
 #define HPM_CONTRACT_MS		1500
 #define HPM_RESET_TRIES		3
 
-/* A PMU register write on the sleep's SPMI bus */
-#define SPMI_CMD_WRITE		(BIT(15) | (0xe << 8) | 0x30)
-#define PMU_BOOT_STAGE		0xf701
-#define PMU_BOOT_STAGE_SLEEP	0x50
+/* A one-byte register write on the sleep's SPMI bus, to the PMU's USID */
+#define SPMI_CMD_WRITE		(BIT(15) | 0x30)
+#define SPMI_CMD_USID		GENMASK(11, 8)
 
-/* Three of the memory controller's channels, and what macOS steps down on each. */
-#define MCC_CHANNELS		3
+/* The memory controller's channels the SoC steps down, and what macOS steps down on each. */
+#define MCC_CHANNELS		16
 #define MCC_ENABLES		0x4
 #define MCC_LANES		0x8
 #define MCC_LANES_MASK		0xc
@@ -328,8 +309,13 @@ static struct {
 
 #define SLEEP_DISPLAY_COUNT	2
 
-/* CPU clusters: 0 is E, 1 is P */
+/* CPU clusters: 0 is E, 1 is P, for the cpm-dvfm windows */
 #define SLEEP_CLUSTERS		2
+/* Cluster-control words, CPU clusters only */
+#define SLEEP_CPU_CLUSTERS_MAX	4
+#define SLEEP_CLK_MUX_MAX	4
+#define SLEEP_CLLT_MAX		4
+#define SLEEP_AMCC_MAX		16
 
 /* cpm-dvfm */
 #define DVFM_CTL		0x178
@@ -374,6 +360,12 @@ struct apple_sleep_wake_name {
 	const char *name;
 };
 
+/* A word read, these bits cleared, and written back */
+struct apple_sleep_clear {
+	u32 offset;
+	u32 clear;
+};
+
 /* The power words in "ps" that the sleep drives itself */
 struct apple_sleep_domains {
 	/* CPU, front end and system, of the DCP and then of the external DCP */
@@ -396,12 +388,66 @@ struct apple_sleep_domains {
 	u32 apcie_phy_sw;
 };
 
+struct apple_sleep;
+
+/*
+ * The steps whose operations differ between SoCs, not only their values: SoCs park their
+ * clocks, stop their memory, lower their fabric and arm the cores' deep WFI each their own
+ * way. The refusals, the coprocessor stops, macOS's power words, the mailbox and the commit
+ * word are shared, and run around these.
+ */
+struct apple_sleep_ops {
+	/* What makes a core's last WFI end in a reset, after its timers are masked */
+	void (*deep_wfi_arm)(void);
+	/*
+	 * The commit, from the still-on polls to the mailbox: the SoC, memory and clusters
+	 * down. It calls sleep_ps_save() once the power words are as the wake will find them.
+	 * It can't fail, can't print, and has the engine's 33 ms to the last WFI.
+	 */
+	void (*last_mile)(struct apple_sleep *s);
+	/* Back on the boot core with the AIC restored: clusters, gates and words back up */
+	void (*wake)(struct apple_sleep *s);
+	/* Every interrupt line masked before the last WFI, one that ended it acked, restored */
+	void (*aic_mask_all)(void);
+	u32 (*aic_ack)(void);
+	void (*aic_restore)(void);
+};
+
 /*
  * What differs between SoCs. Power words are offsets in "ps", or in "ps-aon" where named
  * so, and the lists keep the order macOS was measured with.
  */
 struct apple_sleep_soc {
+	const struct apple_sleep_ops *ops;
 	struct apple_sleep_domains ps;
+	/*
+	 * In "cluster": each CPU cluster's word, E first. The commit writes them off in this
+	 * order, and the wake turns the first on and waits for it before the others.
+	 */
+	u32 cluster_cpu[SLEEP_CPU_CLUSTERS_MAX];
+	unsigned int ncluster_cpu;
+	/* "cpu-start": a core's bit is BIT(cpu_start_stride * cluster + core). */
+	unsigned int cpu_start_stride;
+	/* In "clk-mux": parked in this order before the commit, with this value */
+	u32 clk_mux_parked[SLEEP_CLK_MUX_MAX];
+	unsigned int nclk_mux_parked;
+	u32 clk_mux_parked_val;
+	/* In "cllt": bits cleared before the commit */
+	struct apple_sleep_clear cllt[SLEEP_CLLT_MAX];
+	unsigned int ncllt;
+	/* The PMU on the sleep's SPMI bus, and the byte it is told the AP sleeps with */
+	u8 pmu_usid;
+	u16 pmu_sleep_reg;
+	u8 pmu_sleep_val;
+	/* The SPMI response-vector enables the sleep runs with */
+	u32 spmi_notify_sleep;
+	/* "mcc0".. and "amcc0"..: how many the SoC has */
+	unsigned int nmcc;
+	unsigned int namcc;
+	/* In "wake": the mask and status words, and how many */
+	u32 wake_mask;
+	u32 wake_status;
+	unsigned int wake_words;
 	/* In "ps-aon": held up by a live debug link, and off on macOS */
 	u32 ps_aon_debug_switch;
 	/* In "pwrgate": each pair written as macOS does */
@@ -459,7 +505,7 @@ struct apple_sleep {
 	void __iomem *wdt;
 	void __iomem *aon_misc;
 	void __iomem *wake;
-	void __iomem *amcc[4];
+	void __iomem *amcc[SLEEP_AMCC_MAX];
 	void __iomem *pmc_dcp;
 	void __iomem *spmi;
 	void __iomem *pmc_voters;
@@ -1072,7 +1118,13 @@ static unsigned int sleep_cpu_core(u64 mpidr)
 
 static u32 sleep_cpu_start_bit(u64 mpidr)
 {
-	return BIT(4 * sleep_cpu_cluster(mpidr) + sleep_cpu_core(mpidr));
+	return BIT(apple_sleep->soc->cpu_start_stride * sleep_cpu_cluster(mpidr) +
+		   sleep_cpu_core(mpidr));
+}
+
+static void t8140_deep_wfi_arm(void)
+{
+	sysreg_clear_set_s(SYS_APL_DEEP_SLEEP, 0, DEEP_SLEEP_ENABLE);
 }
 
 static void sleep_deep_wfi_arm(void)
@@ -1080,7 +1132,7 @@ static void sleep_deep_wfi_arm(void)
 	/* A timer left running ends the WFI, and costs power until reset. */
 	write_sysreg(ARCH_TIMER_CTRL_IT_MASK, cntp_ctl_el0);
 	write_sysreg(ARCH_TIMER_CTRL_IT_MASK, cntv_ctl_el0);
-	sysreg_clear_set_s(SYS_APL_DEEP_SLEEP, 0, DEEP_SLEEP_ENABLE);
+	apple_sleep->soc->ops->deep_wfi_arm();
 }
 
 /* A core's last instructions: nothing brings it back but a reset. */
@@ -1615,9 +1667,9 @@ static bool apple_sleep_gate_failed(struct apple_sleep *s)
 	return false;
 }
 
-static void sleep_wake_unmask(u32 *val, u32 id)
+static void sleep_wake_unmask(const struct apple_sleep *s, u32 *val, u32 id)
 {
-	if (id / 32 < WAKE_WORDS)
+	if (id / 32 < s->soc->wake_words)
 		val[id / 32] &= ~BIT(id % 32);
 }
 
@@ -1632,10 +1684,10 @@ static void sleep_wake_masks(struct apple_sleep *s, u32 *val)
 {
 	int i;
 
-	for (i = 0; i < WAKE_WORDS; i++)
-		val[i] = i == WAKE_WORDS - 1 ? s->soc->wake_last_word : U32_MAX;
+	for (i = 0; i < s->soc->wake_words; i++)
+		val[i] = i == s->soc->wake_words - 1 ? s->soc->wake_last_word : U32_MAX;
 	for (i = 0; i < s->wake_enable_count; i++)
-		sleep_wake_unmask(val, s->wake_enable[i]);
+		sleep_wake_unmask(s, val, s->wake_enable[i]);
 }
 
 /* The last checks, then the stray words lowered: what has stopped may not return until a wake. */
@@ -1709,11 +1761,11 @@ static void sleep_wake_arm(struct apple_sleep *s)
 	u32 val[WAKE_WORDS];
 	int i;
 
-	for (i = 0; i < WAKE_WORDS; i++)
-		s->wake_saved[i] = readl(s->wake + WAKE_MASK(i));
+	for (i = 0; i < s->soc->wake_words; i++)
+		s->wake_saved[i] = readl(s->wake + s->soc->wake_mask + i * 4);
 	sleep_wake_masks(s, val);
-	for (i = 0; i < WAKE_WORDS; i++) {
-		writel(val[i], s->wake + WAKE_MASK(i));
+	for (i = 0; i < s->soc->wake_words; i++) {
+		writel(val[i], s->wake + s->soc->wake_mask + i * 4);
 		s->wake_armed[i] = ~val[i];
 	}
 }
@@ -1722,8 +1774,8 @@ static void sleep_wake_restore(struct apple_sleep *s)
 {
 	int i;
 
-	for (i = 0; i < WAKE_WORDS; i++)
-		writel(s->wake_saved[i], s->wake + WAKE_MASK(i));
+	for (i = 0; i < s->soc->wake_words; i++)
+		writel(s->wake_saved[i], s->wake + s->soc->wake_mask + i * 4);
 }
 
 /*
@@ -2487,7 +2539,8 @@ static void sleep_pmu_write(struct apple_sleep *s, u16 reg, u8 val)
 
 	enable = readl(s->spmi + SPMI_NOTIFY_ENABLE);
 	writel(enable & ~SPMI_NOTIFY_REPLY, s->spmi + SPMI_NOTIFY_ENABLE);
-	writel(((u32)reg << 16) | SPMI_CMD_WRITE, s->spmi + SPMI_CMD);
+	writel(((u32)reg << 16) | SPMI_CMD_WRITE |
+	       FIELD_PREP(SPMI_CMD_USID, s->soc->pmu_usid), s->spmi + SPMI_CMD);
 	writel(val, s->spmi + SPMI_CMD);
 	if (!readl_poll_timeout_atomic(s->spmi + SPMI_STATUS, status,
 				       !(status & SPMI_STATUS_RX_EMPTY), 1, 1000))
@@ -2538,12 +2591,12 @@ static void apple_sleep_match(struct apple_sleep *s)
 
 	writel(0, s->wdt + WDT_WD0_COUNT);
 	writel(0, s->wdt + WDT_WD1_COUNT);
-	sleep_pmu_write(s, PMU_BOOT_STAGE, PMU_BOOT_STAGE_SLEEP);
+	sleep_pmu_write(s, soc->pmu_sleep_reg, soc->pmu_sleep_val);
 
 	s->spmi_saved[0] = readl(s->spmi + SPMI_NOTIFY_ENABLE);
 	s->spmi_saved[1] = readl(s->spmi_a0);
-	writel(SPMI_NOTIFY_ENABLE_SLEEP, s->spmi + SPMI_NOTIFY_ENABLE);
-	writel(SPMI_NOTIFY_ENABLE_SLEEP, s->spmi_a0);
+	writel(soc->spmi_notify_sleep, s->spmi + SPMI_NOTIFY_ENABLE);
+	writel(soc->spmi_notify_sleep, s->spmi_a0);
 
 	for (i = 0; i < soc->ps_macos_on.count; i++) {
 		u32 offset = soc->ps_macos_on.offset[i];
@@ -2665,7 +2718,7 @@ static void apple_sleep_mcc_stop(struct apple_sleep *s)
 	int ch, pass, n;
 	u32 val;
 
-	for (ch = 0; ch < MCC_CHANNELS; ch++) {
+	for (ch = 0; ch < s->soc->nmcc; ch++) {
 		val = readl(s->mcc[ch] + MCC_ENABLES);
 		for (n = 0; val && n < 32; n++) {
 			val &= val - 1;
@@ -2675,7 +2728,7 @@ static void apple_sleep_mcc_stop(struct apple_sleep *s)
 	}
 
 	for (pass = 0; pass < 2; pass++) {
-		for (ch = 0; ch < MCC_CHANNELS; ch++) {
+		for (ch = 0; ch < s->soc->nmcc; ch++) {
 			void __iomem *mcc = s->mcc[ch];
 
 			for (n = 2 * pass; n < 2 * pass + 2; n++) {
@@ -2724,7 +2777,7 @@ static void __noreturn sleep_boot_wfi(struct apple_sleep *s)
 		dsb(sy);
 		isb();
 		wfi();
-		aic_sleep_ack();
+		s->soc->ops->aic_ack();
 		write_sysreg_s(IPI_SR_PENDING, SYS_APL_IPI_SR_EL1);
 	}
 }
@@ -2753,8 +2806,6 @@ static void apple_sleep_wait_still_on(struct apple_sleep *s)
 static int apple_sleep_commit(unsigned long unused)
 {
 	struct apple_sleep *s = apple_sleep;
-	int plane, agent;
-	u32 val;
 
 	/*
 	 * The other cores stop first, as on macOS. Each answered the hold in .enter, and they
@@ -2772,6 +2823,34 @@ static int apple_sleep_commit(unsigned long unused)
 		s->deep_once = true;
 		sleep_slp_ddr_set_deep_once(true);
 	}
+
+	s->soc->ops->last_mile(s);
+
+	/* aura reads this with the MMU off. */
+	s->resumes_before = READ_ONCE(s->mbox->resumes);
+	WRITE_ONCE(s->mbox->resume_pa, __pa_symbol(cpu_resume));
+	dcache_clean_poc((unsigned long)s->mbox, (unsigned long)(s->mbox + 1));
+	dsb(sy);
+
+	writel(1, s->commit);
+
+	/* As on macOS: a raised line would end the last WFI, and the engine waits for it. */
+	s->soc->ops->aic_mask_all();
+
+	/* Each core's deep WFI comes after the commit, this one last. No SPMI from here on. */
+	spin_table_release_stopped();
+	sleep_boot_wfi(s);
+}
+
+/*
+ * T8140, in macOS's order: SoC and DCS states down, MCC lanes stopped, the CPM gates, PTD
+ * and voters, the clusters off, the clock muxes parked, CLLT and DVFM, AMCC errors masked.
+ */
+static void t8140_last_mile(struct apple_sleep *s)
+{
+	const struct apple_sleep_soc *soc = s->soc;
+	int plane, agent, i;
+	u32 val;
 
 	/* The SoC comes down before memory does, as on macOS. */
 	if (sleep_perf_wait(s->clk_perf + CLK_PERF_SOC, SOC_SLEEP_STATE)) {
@@ -2800,19 +2879,18 @@ static int apple_sleep_commit(unsigned long unused)
 	writel(0, s->cluster + CLUSTER_AVE);
 	s->cluster_ave_commit_ret = readl_poll_timeout_atomic(s->cluster + CLUSTER_AVE, val, !val,
 							      1, 5000);
-	writel(0, s->cluster + CLUSTER_E);
-	writel(0, s->cluster + CLUSTER_P);
+	for (i = 0; i < soc->ncluster_cpu; i++)
+		writel(0, s->cluster + soc->cluster_cpu[i]);
 
-	writel(readl(s->ps + s->soc->ps.sio_cpu) & ~PS_AUTO_ENABLE, s->ps + s->soc->ps.sio_cpu);
+	writel(readl(s->ps + soc->ps.sio_cpu) & ~PS_AUTO_ENABLE, s->ps + soc->ps.sio_cpu);
 
 	/* The SoC refuses the first, on macOS too. */
-	writel(CLK_MUX_PARKED, s->clk_mux + CLK_MUX_38);
-	writel(CLK_MUX_PARKED, s->clk_mux + CLK_MUX_3C);
-	writel(CLK_MUX_PARKED, s->clk_mux + CLK_MUX_34);
+	for (i = 0; i < soc->nclk_mux_parked; i++)
+		writel(soc->clk_mux_parked_val, s->clk_mux + soc->clk_mux_parked[i]);
 
-	writel(readl(s->cllt + CLLT_0) & ~CLLT_0_CLEAR, s->cllt + CLLT_0);
-	writel(readl(s->cllt + CLLT_1) & ~CLLT_1_CLEAR, s->cllt + CLLT_1);
-	writel(readl(s->cllt + CLLT_2) & ~CLLT_2_CLEAR, s->cllt + CLLT_2);
+	for (i = 0; i < soc->ncllt; i++)
+		writel(readl(s->cllt + soc->cllt[i].offset) & ~soc->cllt[i].clear,
+		       s->cllt + soc->cllt[i].offset);
 
 	/*
 	 * Two runs put these writes after the CLLT's: 5 to 6 ms before the commit
@@ -2821,7 +2899,7 @@ static int apple_sleep_commit(unsigned long unused)
 	sleep_dvfm_park(s);
 
 	sleep_ps_save(s);
-	for (plane = 0; plane < ARRAY_SIZE(s->amcc); plane++) {
+	for (plane = 0; plane < soc->namcc; plane++) {
 		void __iomem *amcc = s->amcc[plane];
 
 		writel(readl(amcc + AMCC_WORD0_ENABLE) & ~AMCC_WORD0_DSID_AGE_OUT,
@@ -2829,27 +2907,11 @@ static int apple_sleep_commit(unsigned long unused)
 		writel(readl(amcc + AMCC_WORD1_ENABLE) & ~AMCC_WORD1_UNEXP_RT_HIT,
 		       amcc + AMCC_WORD1_ENABLE);
 	}
-
-	/* aura reads this with the MMU off. */
-	s->resumes_before = READ_ONCE(s->mbox->resumes);
-	WRITE_ONCE(s->mbox->resume_pa, __pa_symbol(cpu_resume));
-	dcache_clean_poc((unsigned long)s->mbox, (unsigned long)(s->mbox + 1));
-	dsb(sy);
-
-	writel(1, s->commit);
-
-	/* As on macOS: a raised line would end the last WFI, and the engine waits for it. */
-	aic_sleep_mask_all();
-
-	/* Each core's deep WFI comes after the commit, this one last. No SPMI from here on. */
-	spin_table_release_stopped();
-	sleep_boot_wfi(s);
 }
 
 /* Back on the boot core through the reset vector, MMU on, in macOS's order. */
 static void apple_sleep_return(struct apple_sleep *s)
 {
-	u32 val;
 	int i;
 
 	/*
@@ -2863,13 +2925,31 @@ static void apple_sleep_return(struct apple_sleep *s)
 	write_sysreg_s(s->siq_cfg, SYS_APL_SIQ_CFG_EL1);
 
 	spin_table_stop_finished();
-	aic_sleep_restore();
+	s->soc->ops->aic_restore();
 
-	writel(CLUSTER_ON, s->cluster + CLUSTER_E);
-	s->cluster_e_ret = readl_poll_timeout_atomic(s->cluster + CLUSTER_E, val,
+	s->soc->ops->wake(s);
+
+	dcache_inval_poc((unsigned long)s->mbox, (unsigned long)(s->mbox + 1));
+	s->resumes_after = READ_ONCE(s->mbox->resumes);
+
+	for (i = 0; i < s->soc->wake_words; i++)
+		s->wake_status[i] = readl(s->wake + s->soc->wake_status + i * 4);
+	s->returned = true;
+}
+
+/* T8140, in macOS's order: E then the other clusters, the gates, the words, the complex. */
+static void t8140_wake(struct apple_sleep *s)
+{
+	u32 val;
+	int i;
+
+	/* The E cluster first, as macOS does, then the others. */
+	writel(CLUSTER_ON, s->cluster + s->soc->cluster_cpu[0]);
+	s->cluster_e_ret = readl_poll_timeout_atomic(s->cluster + s->soc->cluster_cpu[0], val,
 						     val & CLUSTER_E_READY, 1,
 						     CLUSTER_TIMEOUT_US);
-	writel(CLUSTER_ON, s->cluster + CLUSTER_P);
+	for (i = 1; i < s->soc->ncluster_cpu; i++)
+		writel(CLUSTER_ON, s->cluster + s->soc->cluster_cpu[i]);
 
 	writel(PWRGATE_ON, s->pwrgate + s->soc->pwrgate_wake[0]);
 	writel(PWRGATE_ON, s->pwrgate + s->soc->pwrgate_wake[1]);
@@ -2905,13 +2985,6 @@ static void apple_sleep_return(struct apple_sleep *s)
 		s->pcie_ans_on_ret = apple_sleep_raise_apcie(s);
 	s->apcie_port_down = true;
 	s->pins_lost = s->pins_saved_valid;
-
-	dcache_inval_poc((unsigned long)s->mbox, (unsigned long)(s->mbox + 1));
-	s->resumes_after = READ_ONCE(s->mbox->resumes);
-
-	for (i = 0; i < WAKE_WORDS; i++)
-		s->wake_status[i] = readl(s->wake + WAKE_STATUS(i));
-	s->returned = true;
 }
 
 static int apple_sleep_enter(suspend_state_t state)
@@ -3237,10 +3310,10 @@ static bool apple_sleep_smc_woke_alone(struct apple_sleep *s)
 	for (i = 0; i < s->soc->nwake_names; i++) {
 		u32 id = names[i].id;
 
-		if (strstarts(names[i].name, "SMC.") && id / 32 < WAKE_WORDS)
+		if (strstarts(names[i].name, "SMC.") && id / 32 < s->soc->wake_words)
 			smc[id / 32] |= BIT(id % 32);
 	}
-	for (i = 0; i < WAKE_WORDS; i++) {
+	for (i = 0; i < s->soc->wake_words; i++) {
 		u32 woke = s->wake_status[i] & s->wake_armed[i];
 
 		if (woke & ~smc[i])
@@ -3390,23 +3463,33 @@ static const struct {
 	{ "ps-aon", offsetof(struct apple_sleep, ps_aon) },
 	{ "spmi-a0", offsetof(struct apple_sleep, spmi_a0) },
 	{ "clk-mux", offsetof(struct apple_sleep, clk_mux) },
-	{ "mcc0", offsetof(struct apple_sleep, mcc[0]) },
-	{ "mcc1", offsetof(struct apple_sleep, mcc[1]) },
-	{ "mcc2", offsetof(struct apple_sleep, mcc[2]) },
 	{ "ptd", offsetof(struct apple_sleep, ptd) },
 	{ "clk-perf", offsetof(struct apple_sleep, clk_perf) },
 	{ "cluster-dcs", offsetof(struct apple_sleep, cluster_dcs) },
 	{ "dvfm-e", offsetof(struct apple_sleep, dvfm[0]) },
 	{ "dvfm-p", offsetof(struct apple_sleep, dvfm[1]) },
-	{ "amcc0", offsetof(struct apple_sleep, amcc[0]) },
-	{ "amcc1", offsetof(struct apple_sleep, amcc[1]) },
-	{ "amcc2", offsetof(struct apple_sleep, amcc[2]) },
-	{ "amcc3", offsetof(struct apple_sleep, amcc[3]) },
 };
+
+/* "<prefix>0", "<prefix>1", ...: @count of them */
+static int apple_sleep_map_numbered(struct apple_sleep *s, const char *prefix,
+				    void __iomem **regs, unsigned int count)
+{
+	char name[16];
+	int i;
+
+	for (i = 0; i < count; i++) {
+		snprintf(name, sizeof(name), "%s%d", prefix, i);
+		regs[i] = apple_sleep_map(s->dev, name);
+		if (IS_ERR(regs[i]))
+			return dev_err_probe(s->dev, PTR_ERR(regs[i]), "no %s registers\n", name);
+	}
+
+	return 0;
+}
 
 static int apple_sleep_map_regs(struct apple_sleep *s)
 {
-	int i;
+	int i, ret;
 
 	for (i = 0; i < ARRAY_SIZE(apple_sleep_regs); i++) {
 		void __iomem **field = (void __iomem **)((u8 *)s + apple_sleep_regs[i].offset);
@@ -3417,7 +3500,11 @@ static int apple_sleep_map_regs(struct apple_sleep *s)
 					     apple_sleep_regs[i].name);
 	}
 
-	return 0;
+	ret = apple_sleep_map_numbered(s, "mcc", s->mcc, s->soc->nmcc);
+	if (ret)
+		return ret;
+
+	return apple_sleep_map_numbered(s, "amcc", s->amcc, s->soc->namcc);
 }
 
 static int apple_sleep_map_mailbox(struct apple_sleep *s)
@@ -3856,7 +3943,37 @@ static const struct apple_sleep_wake_name t8140_wake_names[] = {
 	{ 231, "AOP2.TrustedOutboxNotEmpty" }, { 236, "AOP2.CPUWakeupAP" },
 };
 
+static const struct apple_sleep_ops t8140_sleep_ops = {
+	.deep_wfi_arm = t8140_deep_wfi_arm,
+	.last_mile = t8140_last_mile,
+	.wake = t8140_wake,
+	.aic_mask_all = aic_sleep_mask_all,
+	.aic_ack = aic_sleep_ack,
+	.aic_restore = aic_sleep_restore,
+};
+
 static const struct apple_sleep_soc t8140_sleep_soc = {
+	.ops = &t8140_sleep_ops,
+	/* E, P */
+	.cluster_cpu = { 0x0, 0x4 },
+	.ncluster_cpu = 2,
+	.cpu_start_stride = 4,
+	.clk_mux_parked = { 0x4, 0x8, 0x0 },
+	.nclk_mux_parked = 3,
+	.clk_mux_parked_val = 0x80100000,
+	/* CLLT: names from nothing. Bits measured cleared by macOS before the commit. */
+	.cllt = { { 0x30, GENMASK(7, 0) }, { 0x34, GENMASK(7, 0) }, { 0x3c, GENMASK(17, 16) } },
+	.ncllt = 3,
+	/* The PMU's boot-stage register: the AP sleeps */
+	.pmu_usid = 0xe,
+	.pmu_sleep_reg = 0xf701,
+	.pmu_sleep_val = 0x50,
+	.spmi_notify_sleep = 0x2000001,
+	.nmcc = 3,
+	.namcc = 4,
+	.wake_mask = 0x08,
+	.wake_status = 0x28,
+	.wake_words = 8,
 	.ps = {
 		.disp = {
 			{ T8140_PS_DISP_CPU, T8140_PS_DISP_FE, T8140_PS_DISP_SYS },
