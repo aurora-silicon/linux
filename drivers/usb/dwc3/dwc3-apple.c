@@ -1689,6 +1689,11 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	appledwc->idle_rpm = of_device_is_compatible(dev->of_node, "apple,t6040-dwc3") ||
 			     of_device_is_compatible(dev->of_node, "apple,t8132-dwc3");
 	mutex_init(&appledwc->lock);
+	/*
+	 * Its suspend takes 70-120 ms per controller, and its xHCI child, which is asynchronous,
+	 * can't start to resume before the PM core has reached this device in its list.
+	 */
+	device_enable_async_suspend(dev);
 	/* A never-connected port has no generic core probe to publish this. */
 	appledwc->dwc.dev = dev;
 	platform_set_drvdata(pdev, &appledwc->dwc);
