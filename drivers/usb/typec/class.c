@@ -310,11 +310,24 @@ void typec_altmode_update_active(struct typec_altmode *adev, bool active)
 	if (adev->active == active)
 		return;
 
+	/*
+	 * The reference pins the driver's module while the mode is active. Only
+	 * a driver that is bound can be pinned: a mode activated before its
+	 * driver bound gets its reference in typec_probe(), and only a taken
+	 * reference is put back.
+	 */
 	if (!is_typec_port(adev->dev.parent) && adev->dev.driver) {
-		if (!active)
-			module_put(adev->dev.driver->owner);
-		else
-			WARN_ON(!try_module_get(adev->dev.driver->owner));
+		struct altmode *alt = to_altmode(adev);
+
+		if (!active) {
+			if (alt->owner_held) {
+				module_put(adev->dev.driver->owner);
+				alt->owner_held = false;
+			}
+		} else if (!alt->owner_held) {
+			alt->owner_held = try_module_get(adev->dev.driver->owner);
+			WARN_ON(!alt->owner_held);
+		}
 	}
 
 	adev->active = active;
