@@ -122,6 +122,9 @@ struct audiosrv_data {
 	wait_queue_head_t gen_wq;
 	/* The instance the link was last prepared on (open_lock) */
 	u64 link_gen;
+	/* Firmware 27: the video interface (srv_rwsem), the instance its start calls went to */
+	struct apple_epic_service *video_srv;
+	u64 v27_boot_gen;
 #endif
 
 	struct dcp_av_audio_cmds cmds;
@@ -857,6 +860,103 @@ static void av_cec_teardown(struct apple_epic_service *service)
 {
 	afk_service_disable(service);
 }
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+/* Firmware 27: the video interface is kept for av_v27_start(). */
+static void av_video_init(struct apple_epic_service *service, const char *name,
+			  const char *class, s64 unit)
+{
+	struct audiosrv_data *asrv = service->ep->dcp->audiosrv;
+	struct apple_epic_service *old;
+
+	if (!asrv || !dcp_is_v27_external(service->ep->dcp))
+		return;
+	service = afk_service_get(service);
+	if (!service)
+		return;
+	scoped_guard(rwsem_write, &asrv->srv_rwsem) {
+		old = asrv->video_srv;
+		asrv->video_srv = service;
+	}
+	if (old)
+		afk_service_put(old);
+}
+
+static void av_video_teardown(struct apple_epic_service *service)
+{
+	struct audiosrv_data *asrv = service->ep->dcp->audiosrv;
+	bool owned = false;
+
+	if (asrv) {
+		scoped_guard(rwsem_write, &asrv->srv_rwsem) {
+			owned = asrv->video_srv == service;
+			if (owned)
+				asrv->video_srv = NULL;
+		}
+	}
+	if (owned)
+		afk_service_put(service);
+	av_cec_teardown(service);
+}
+
+/*
+ * The calls macOS 27 makes as the audio service starts (M5 Pro), before its
+ * first link: on the audio interface 19, 15, 18, 14, 16, 20 and 13, then on
+ * the video interface 22 and 33, with macOS's arguments (at body+0x20) and
+ * sizes. 19, 18, 16 and 33 are OSObject calls; 18 and 16 are the product
+ * attributes and the catalog. The answers are not used here.
+ */
+static const struct av_v27_start_call {
+	bool video;
+	bool object;
+	u32 command;
+	u32 len;
+	u32 arg[4];
+} av_v27_start_calls[] = {
+	{ .object = true, .command = 19, .len = SZ_32K },
+	{ .command = 15, .len = 0x10 },
+	{ .object = true, .command = 18, .len = SZ_32K },
+	{ .command = 14, .len = 0x30, .arg = { 2 } },
+	{ .object = true, .command = 16, .len = SZ_256K },
+	{ .command = 20, .len = 0x40, .arg = { 1, 2, 24, 48000 } },
+	{ .command = 13, .len = 0x40, .arg = { 1 } },
+	{ .video = true, .command = 22, .len = 0x30, .arg = { 2 } },
+	{ .video = true, .object = true, .command = 33, .len = SZ_32K },
+};
+
+static void av_v27_start(struct apple_dcp *dcp, struct apple_epic_service *srv)
+{
+	struct audiosrv_data *asrv = dcp->audiosrv;
+	struct apple_epic_service *video;
+	unsigned int i, j;
+	int ret;
+
+	scoped_guard(rwsem_read, &asrv->srv_rwsem)
+		video = afk_service_get(asrv->video_srv);
+	for (i = 0; i < ARRAY_SIZE(av_v27_start_calls); i++) {
+		const struct av_v27_start_call *c = &av_v27_start_calls[i];
+		struct apple_epic_service *to = c->video ? video : srv;
+		u8 body[0x40] = {}, reply[0x40];
+
+		if (!to) {
+			dev_warn(dcp->dev, "audiosrv: no video interface for its calls\n");
+			continue;
+		}
+		if (c->object) {
+			/* group 1, as the catalog and the attributes */
+			ret = dcp_audiosrv_osobject_call(to, 1, c->command, NULL, c->len, NULL);
+		} else {
+			for (j = 0; j < ARRAY_SIZE(c->arg); j++)
+				put_unaligned_le32(c->arg[j], body + 0x20 + 4 * j);
+			ret = av_audiosrv_call(to, c->command, body, c->len, 0, reply, c->len);
+		}
+		if (ret)
+			dev_warn(dcp->dev, "audiosrv: start call %u failed: %d\n", c->command, ret);
+	}
+	if (video)
+		afk_service_put(video);
+}
+#endif
 #endif
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
@@ -909,13 +1009,14 @@ static const struct apple_epic_service_ops av_desktop_ops[] = {
 		/*
 		 * And its video interface, cut to "dcpav-video-interface-" on
 		 * every display power-on. The video side runs through the
-		 * IOMFB endpoint; take it like the CEC interface.
+		 * IOMFB endpoint; take it like the CEC interface. Firmware 27
+		 * gets macOS's two calls on it as audio starts (av_v27_start()).
 		 */
 		.name = "dcpav-video-interface-epic",
 		.compact_full = "dcpav-video-interface-epic:0",
-		.init = av_cec_init,
+		.init = av_video_init,
 		.report = av_cec_report,
-		.teardown = av_cec_teardown,
+		.teardown = av_video_teardown,
 	},
 	{}
 };
@@ -975,6 +1076,16 @@ void av_service_connect(struct apple_dcp *dcp)
 	if (dcp_audiosrv_native_link(dcp->dev)) {
 		if (dcp_is_v14_7_external(dcp) && !iomfb_v14_7_external_powered(dcp))
 			goto out;
+		if (dcp_is_v27_external(dcp)) {
+			u64 gen;
+
+			scoped_guard(rwsem_read, &asrv->srv_rwsem)
+				gen = asrv->gen;
+			if (READ_ONCE(asrv->v27_boot_gen) != gen) {
+				WRITE_ONCE(asrv->v27_boot_gen, gen);
+				av_v27_start(dcp, service);
+			}
+		}
 		scoped_guard(mutex, &asrv->plug_lock) {
 			if (asrv->audio_dev)
 				dcpaud_connect(asrv->audio_dev, asrv->plugged);
