@@ -9,6 +9,8 @@
 #[cfg(not(CONFIG_OF_DYNAMIC))]
 compile_error!("apple_sep requires CONFIG_OF_DYNAMIC: the SEP and DART nodes ship disabled and are enabled with a device-tree changeset");
 
+#[macro_use]
+mod ratelimit;
 mod attach;
 mod bio;
 mod catacomb;
@@ -17,6 +19,7 @@ mod der;
 mod diag;
 mod dt;
 mod fv;
+mod hibe;
 mod hwrng;
 mod image;
 mod key;
@@ -24,6 +27,7 @@ mod keybag;
 mod keybag_identity;
 mod os_identity;
 mod pm;
+mod pnon;
 mod profile;
 mod proto;
 mod refkey;
@@ -35,7 +39,10 @@ mod scrd;
 mod sensor;
 mod shim;
 mod shmem;
+mod skdl;
 mod sks;
+mod sse;
+mod stac;
 mod store;
 mod transfer;
 mod trusted;
@@ -63,8 +70,10 @@ use kernel::{
     sync::{
         aref::ARef,
         atomic::{
+            Acquire,
             Atomic,
-            Relaxed, //
+            Relaxed,
+            Release, //
         },
         barrier::{
             dma_mb,
@@ -112,6 +121,16 @@ static_assert!(VERIFY_WORK_ID != 0);
 const LATE_ATTACH_WORK_ID: u64 = 4;
 static_assert!(LATE_ATTACH_WORK_ID != VERIFY_WORK_ID && LATE_ATTACH_WORK_ID != ENROL_WORK_ID);
 static_assert!(LATE_ATTACH_WORK_ID != SETTLE_WORK_ID && LATE_ATTACH_WORK_ID != 0);
+/// The trusted-accessory power-state report; see `stac`.
+const STAC_WORK_ID: u64 = 5;
+static_assert!(STAC_WORK_ID != LATE_ATTACH_WORK_ID && STAC_WORK_ID != VERIFY_WORK_ID);
+static_assert!(STAC_WORK_ID != ENROL_WORK_ID && STAC_WORK_ID != SETTLE_WORK_ID);
+static_assert!(STAC_WORK_ID != 0);
+/// The boot-policy digest read; see `pnon`.
+const PNON_WORK_ID: u64 = 6;
+static_assert!(PNON_WORK_ID != STAC_WORK_ID && PNON_WORK_ID != LATE_ATTACH_WORK_ID);
+static_assert!(PNON_WORK_ID != VERIFY_WORK_ID && PNON_WORK_ID != ENROL_WORK_ID);
+static_assert!(PNON_WORK_ID != SETTLE_WORK_ID && PNON_WORK_ID != 0);
 
 // When an attach-time sensor bring-up falls short, one more round runs this
 // long after Touch ID was activated. A round that cannot run yet, because the
@@ -657,6 +676,12 @@ struct SepData {
     // u32, not u8: the kernel's Rust atomics have no u8 AtomicType
     phase: Atomic<u32>,
 
+    // A `pm::SleepGate`.
+    sleep_gate: Atomic<u32>,
+
+    // The mailbox's receive interrupt is held off for the enclave's sleep.
+    sleep_rx_held: Atomic<bool>,
+
     #[pin]
     ool_xarm: Mutex<Option<OolPair>>,
 
@@ -717,6 +742,11 @@ struct SepData {
     // next verify captures without a new bring-up, as macOS does. Cleared by
     // anything that powers the sensor off or resets it.
     sensor_kept: Atomic<bool>,
+
+    // The kept sensor reset itself under a verify capture (state 9, it asks
+    // for its patch again). The verify reports a retry, ends the prompt's
+    // match operation and drops the sensor, so the next try brings it up.
+    sensor_reset_in_capture: Atomic<bool>,
 
     // The enclave announced (SBIO tag 0x03) that a background operation
     // result is ready; it waits for the host to collect it with 0x21.
@@ -779,6 +809,39 @@ struct SepData {
 
     #[pin]
     ool_scrd: Mutex<Option<OolPair>>,
+
+    // The trusted-accessory endpoint (see `stac`): its buffers, its one
+    // exchange, and what discovery said about it.
+    #[pin]
+    ool_stac: Mutex<Option<OolPair>>,
+    #[pin]
+    stac_rx: Mutex<stac::Exchange>,
+    #[pin]
+    stac_wq: CondVar,
+    stac_named: Atomic<bool>,
+    stac_layout: Atomic<u32>,
+    stac_absent_logged: Atomic<bool>,
+
+    // The boot-policy endpoint (see `pnon`): its buffers, its one
+    // exchange, and what discovery said about it.
+    #[pin]
+    ool_pnon: Mutex<Option<OolPair>>,
+    #[pin]
+    pnon_rx: Mutex<pnon::Exchange>,
+    #[pin]
+    pnon_wq: CondVar,
+    pnon_named: Atomic<bool>,
+    pnon_layout: Atomic<u32>,
+    pnon_done: Atomic<bool>,
+
+    // What discovery said about the endpoints the driver checks and sends
+    // nothing to (see `sse`, `hibe`, `skdl`).
+    sse_named: Atomic<bool>,
+    sse_layout: Atomic<u32>,
+    hibe_named: Atomic<bool>,
+    hibe_layout: Atomic<u32>,
+    skdl_named: Atomic<bool>,
+    skdl_layout: Atomic<u32>,
     #[pin]
     scrd_probe: Mutex<ScrdProbe>,
     #[pin]
@@ -951,12 +1014,20 @@ struct SepData {
 
     #[pin]
     late_attach_work: DelayedWork<SepData, LATE_ATTACH_WORK_ID>,
+
+    #[pin]
+    stac_work: Work<SepData, STAC_WORK_ID>,
+
+    #[pin]
+    pnon_work: Work<SepData, PNON_WORK_ID>,
 }
 
 impl_has_work! {
     impl HasWork<Self, 0> for SepData { self.rx_work }
     impl HasWork<Self, ENROL_WORK_ID> for SepData { self.enrol_work }
     impl HasWork<Self, VERIFY_WORK_ID> for SepData { self.verify_work }
+    impl HasWork<Self, STAC_WORK_ID> for SepData { self.stac_work }
+    impl HasWork<Self, PNON_WORK_ID> for SepData { self.pnon_work }
 }
 
 impl_has_delayed_work! {
@@ -977,7 +1048,7 @@ impl SepData {
         let profile = profile::detect()?;
         let built = shmem::build(pdev, profile.shmem_capacity, profile.shmem_first_item)?;
         let dev: &device::Device<device::Core<'_>> = pdev.as_ref();
-        dev_info!(dev, "SEP platform profile: {}\n", profile.name);
+        dev_info_ratelimited!(dev, "SEP platform profile: {}\n", profile.name);
 
         let buf = built.buf;
 
@@ -1001,6 +1072,14 @@ impl SepData {
             OOL_SIZE_SCRD,
             (OOL_SIZE_SCRD, OOL_SIZE_SCRD),
         )?;
+        let ool_stac = Self::alloc_ool(
+            dev,
+            stac::EP_STAC,
+            stac::OOL_SIZE_STAC,
+            (stac::OOL_SIZE_STAC, stac::OOL_SIZE_STAC),
+        )?;
+        // Sized from the endpoint's layout before it is registered.
+        let ool_pnon = Self::alloc_ool(dev, pnon::EP_PNON, pnon::OOL_SIZE_PNON, (0, 0))?;
         let dma_ring = dma::Coherent::<u8>::zeroed_slice(dev, DMA_RING_SIZE, GFP_KERNEL)?;
 
         let keystore_only = attach::requested();
@@ -1018,7 +1097,7 @@ impl SepData {
             module_parameters::xart_writes.value() != 0
         };
         if keystore_user_bags && !xart_writes {
-            dev_info!(
+            dev_info_ratelimited!(
                 dev,
                 "initrd: per-user key bags need xart_writes=1 and no xART guard; they wait for the real root\n"
             );
@@ -1031,7 +1110,7 @@ impl SepData {
                 || module_parameters::os_uuid_lo.value() != 0
                 || xart_guard.is_none()
             {
-                dev_err!(dev, "J613 26.6.2 requires a DT identity and xART guard\n");
+                dev_err_ratelimited!(dev, "J613 26.6.2 requires a DT identity and xART guard\n");
                 return Err(EINVAL);
             }
         }
@@ -1039,7 +1118,7 @@ impl SepData {
             Ok(mut store) => {
                 match xart_guard {
                     Some(level) if store.writes_enabled() => store.set_guard(level)?,
-                    None if store.writes_enabled() => dev_info!(
+                    None if store.writes_enabled() => dev_info_ratelimited!(
                         dev,
                         "xART guard off: the enclave may rewrite any session record\n"
                     ),
@@ -1048,7 +1127,7 @@ impl SepData {
                 let (slots, records, revision, malformed, duplicates, repaired, writable) =
                     store.summary();
                 let base = store.base();
-                dev_info!(
+                dev_info_ratelimited!(
                     dev,
                     "xART: APFS-resolved .gl extent (base {:#x}); {} slots, {} live records, max revision {}, {} malformed, {} duplicate, {} repaired; writes {}\n",
                     base,
@@ -1063,7 +1142,7 @@ impl SepData {
                 Some(store)
             }
             Err(e) => {
-                dev_err!(
+                dev_err_ratelimited!(
                     dev,
                     "xART gigalocker in the iBoot container is unavailable or invalid: {:?}\n",
                     e
@@ -1079,10 +1158,10 @@ impl SepData {
                 Ok(store) => Some(store),
                 Err(e) => {
                     if profile::j613_26_6_2() {
-                        dev_err!(dev, "J613 26.6.2 host-state store unavailable: {:?}\n", e);
+                        dev_err_ratelimited!(dev, "J613 26.6.2 host-state store unavailable: {:?}\n", e);
                         return Err(e);
                     }
-                    dev_warn!(dev, "Linux host-state store unavailable: {:?}\n", e);
+                    dev_warn_ratelimited!(dev, "Linux host-state store unavailable: {:?}\n", e);
                     None
                 }
             }
@@ -1137,6 +1216,7 @@ impl SepData {
                 match_context_generation: Atomic::new(0),
                 cold_match_contexts <- new_mutex!(KVec::new()),
                 sensor_kept: Atomic::new(false),
+                sensor_reset_in_capture: Atomic::new(false),
                 bg_ops_ready: Atomic::new(false),
                 persistence_owed: Atomic::new(false),
                 enrol_identity_candidates <- new_mutex!(KVec::new()),
@@ -1144,6 +1224,8 @@ impl SepData {
                 sensor_power_ns: Atomic::new(0),
                 device_view_synced: Atomic::new(false),
                 phase: Atomic::new(PHASE_ATTACH),
+                sleep_gate: Atomic::new(pm::SleepGate::Open as u32),
+                sleep_rx_held: Atomic::new(false),
                 ool_xarm <- new_mutex!(Some(ool_xarm)),
                 ool_sbio <- new_mutex!(Some(ool_sbio)),
                 ool_sks <- new_mutex!(Some(ool_sks)),
@@ -1154,6 +1236,24 @@ impl SepData {
                 ool_scrd <- new_mutex!(Some(ool_scrd)),
                 scrd_probe <- new_mutex!(ScrdProbe::new()),
                 scrd_wq <- new_condvar!("SepData::scrd_wq"),
+                ool_stac <- new_mutex!(Some(ool_stac)),
+                stac_rx <- new_mutex!(stac::Exchange::new()),
+                stac_wq <- new_condvar!("SepData::stac_wq"),
+                stac_named: Atomic::new(false),
+                stac_layout: Atomic::new(0),
+                stac_absent_logged: Atomic::new(false),
+                ool_pnon <- new_mutex!(Some(ool_pnon)),
+                pnon_rx <- new_mutex!(pnon::Exchange::new()),
+                pnon_wq <- new_condvar!("SepData::pnon_wq"),
+                pnon_named: Atomic::new(false),
+                pnon_layout: Atomic::new(0),
+                pnon_done: Atomic::new(false),
+                sse_named: Atomic::new(false),
+                sse_layout: Atomic::new(0),
+                hibe_named: Atomic::new(false),
+                hibe_layout: Atomic::new(0),
+                skdl_named: Atomic::new(false),
+                skdl_layout: Atomic::new(0),
                 dma_ring <- new_mutex!(Some(dma_ring)),
                 sbio_exchange_lock <- new_mutex!(()),
                 sbio_rx <- new_mutex!(transfer::Reassembly::new()),
@@ -1211,6 +1311,8 @@ impl SepData {
                 verify_work <- new_work!("SepData::verify_work"),
                 settle_work <- new_delayed_work!("SepData::settle_work"),
                 late_attach_work <- new_delayed_work!("SepData::late_attach_work"),
+                stac_work <- new_work!("SepData::stac_work"),
+                pnon_work <- new_work!("SepData::pnon_work"),
             }),
             GFP_KERNEL,
         )
@@ -1241,7 +1343,7 @@ impl SepData {
         }
 
         if let Err(e) = dt::mark_registration_sent(sep_node, iova) {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "could not record the registration marker ({:?}); refusing to send, since without it an rmmod/insmod cycle could send it twice and park the SEP\n",
                 e
@@ -1264,7 +1366,7 @@ impl SepData {
         // path does, so a reload stops at probe and says to reboot instead.
         let iova = self.shmem.lock().as_ref().map_or(0, |buf| buf.dma_address());
         if let Err(e) = dt::mark_registration_sent(sep_node, iova) {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "could not record the boot marker ({:?}); refusing to boot the SEP, since a reload could not tell it is already running\n",
                 e
@@ -1283,15 +1385,15 @@ impl SepData {
         let ty = (msg.msg0 >> proto::MSG_TYPE_SHIFT) & 0xff;
         match ty {
             proto::MSG_BOOT_TZ0_ACK1 => {
-                dev_info!(self.dev, "boot: first TZ0 acknowledgement\n");
+                dev_info_ratelimited!(self.dev, "boot: first TZ0 acknowledgement\n");
             }
             proto::MSG_BOOT_TZ0_ACK2 => {
-                dev_info!(
+                dev_info_ratelimited!(
                     self.dev,
                     "boot: TZ0 accepted; handing over firmware and shared memory\n"
                 );
                 if let Err(e) = self.load_firmware_and_shmem() {
-                    dev_err!(
+                    dev_err_ratelimited!(
                         self.dev,
                         "boot: firmware/shared-memory handoff failed ({:?})\n",
                         e
@@ -1299,14 +1401,14 @@ impl SepData {
                 }
             }
             proto::MSG_BOOT_IMG4_ACK => {
-                dev_info!(
+                dev_info_ratelimited!(
                     self.dev,
                     "boot: IMG4 acknowledged; the SEP owns the shared-memory table\n"
                 );
                 self.registered.store(true, Relaxed);
             }
             _ => {
-                dev_warn!(
+                dev_warn_ratelimited!(
                     self.dev,
                     "boot: unknown message type {} (msg0 {:#018x})\n",
                     ty,
@@ -1403,7 +1505,203 @@ impl SepData {
         if self.shutting_down.load(Relaxed) {
             return Err(ENODEV);
         }
-        Self::ring(self.mbox.lock().as_ref().ok_or(ENODEV)?, msg)
+        // Checked with the mailbox lock held: a sender can wait for it for longer
+        // than the system takes to tell the enclave it's going to sleep.
+        let mbox = self.mbox.lock();
+        let mbox = mbox.as_ref().ok_or(ENODEV)?;
+        if !self.sleep_gate().may_request() {
+            return Err(EAGAIN);
+        }
+        Self::ring(mbox, msg)
+    }
+
+    /// As [`Self::send`], for an answer to something the enclave asked: it
+    /// waits for these before it can answer the sleep request.
+    fn send_reply(&self, msg: Message) -> Result<()> {
+        if self.shutting_down.load(Relaxed) {
+            return Err(ENODEV);
+        }
+        let mbox = self.mbox.lock();
+        let mbox = mbox.as_ref().ok_or(ENODEV)?;
+        if !self.sleep_gate().may_reply() {
+            return Err(EAGAIN);
+        }
+        Self::ring(mbox, msg)
+    }
+
+    pub(crate) fn sleep_gate(&self) -> pm::SleepGate {
+        pm::SleepGate::from_u32(self.sleep_gate.load(Acquire))
+    }
+
+    /// Under the mailbox lock, so that a sender holding it finishes first.
+    fn set_sleep_gate(&self, gate: pm::SleepGate) {
+        let _mbox = self.mbox.lock();
+        self.sleep_gate.store(gate as u32, Release);
+    }
+
+    /// Prepare a firmware-driven suspend without sending SLEEP. The platform
+    /// owns the irreversible request, after every returnable refusal.
+    pub(crate) fn sleep_enter(&self) -> Result<()> {
+        match self.sleep_gate() {
+            // A failed earlier wake is not repaired by another precommit attempt.
+            pm::SleepGate::Lost => return Err(EIO),
+            pm::SleepGate::Open => {}
+            _ => return Err(EBUSY),
+        }
+        // Do not commit a running enclave whose sleep protocol is not ready.
+        if self.phase.load(Relaxed) != PHASE_READY || !self.endpoint_present(proto::EP_CONTROL) {
+            dev_warn_ratelimited!(
+                self.dev,
+                "sleep refused: the enclave did not finish coming up\n"
+            );
+            return Err(EBUSY);
+        }
+
+        self.set_sleep_gate(pm::SleepGate::Draining);
+        let idle = control::wait_idle(
+            proto::CONTROL_TIMEOUT_MS,
+            10,
+            || self.control.lock().requests_in_flight(),
+            |ms| kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(ms))),
+        );
+        if !idle {
+            dev_err_ratelimited!(
+                self.dev,
+                "sleep refused: a request is still waiting for its reply\n"
+            );
+            self.set_sleep_gate(pm::SleepGate::Open);
+            return Err(EBUSY);
+        }
+
+        if let Err(e) = self.sleep_leave_for_commit() {
+            dev_err_ratelimited!(
+                self.dev,
+                "sleep refused: irreversible request could not be staged ({:?})\n",
+                e
+            );
+            self.set_sleep_gate(pm::SleepGate::Open);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Stage without sending; the platform's commit owns SLEEP with IRQs off.
+    fn sleep_leave_for_commit(&self) -> Result<()> {
+        let request = proto::encode_control(&proto::op_sleep(), proto::TAG_SLEEP);
+        match self.mbox.lock().as_ref() {
+            Some(mbox) => pm::leave_for_commit(
+                &self.dev,
+                mbox.as_raw(),
+                request,
+                proto::SLEEP_REPLY,
+                proto::SLEEP_REPLY_MASK,
+            ),
+            None => Err(ENODEV),
+        }?;
+        self.sleep_hold_rx();
+        dev_dbg!(self.dev, "SEP SLEEP staged for the irreversible commit\n");
+        Ok(())
+    }
+
+    /// Holds off the receive interrupt, whose handler reads the mailbox.
+    fn sleep_hold_rx(&self) {
+        if !self.sleep_rx_held.xchg(true, Relaxed) {
+            if let Some(mbox) = self.mbox.lock().as_ref() {
+                mbox.hold_rx();
+            }
+        }
+    }
+
+    fn sleep_release_rx(&self) {
+        if self.sleep_rx_held.xchg(false, Relaxed) {
+            if let Some(mbox) = self.mbox.lock().as_ref() {
+                mbox.release_rx();
+            }
+        }
+    }
+
+    /// A refused precommit attempt was never sent; reopen normal admission.
+    /// A sent request can be restarted only after actual physical sleep/wake.
+    /// Returns whether the enclave came back from a sleep it was told of.
+    pub(crate) fn sleep_exit(&self) -> bool {
+        // Staged only: an unsent refusal releases RX without a restart.
+        match pm::commit_finish(&self.dev) {
+            Some(true) => self.set_sleep_gate(pm::SleepGate::Told),
+            Some(false) => self.sleep_release_rx(),
+            None => {}
+        }
+        let gate = self.sleep_gate();
+        if gate == pm::SleepGate::Draining {
+            self.set_sleep_gate(pm::SleepGate::Open);
+            return false;
+        }
+        if !gate.needs_wake() {
+            return false;
+        }
+        // SAFETY: only reads a flag.
+        let real = unsafe { bindings::pm_resume_via_firmware() };
+        if !real && gate == pm::SleepGate::Lost {
+            return false;
+        }
+        if !real {
+            // commit_finish already terminates a current sent-without-sleep case.
+            // An old lost state must not cause mailbox or DART accesses here.
+            self.set_sleep_gate(pm::SleepGate::Lost);
+            return false;
+        }
+        let answered = self.sleep_kick();
+        match answered {
+            Ok(()) => {
+                self.set_sleep_gate(pm::SleepGate::Open);
+                // One line per sleep it was told of: nothing else says it came back.
+                dev_info_ratelimited!(self.dev, "the enclave is back from its sleep request\n");
+                true
+            }
+            Err(e) => {
+                dev_err_ratelimited!(
+                    self.dev,
+                    "the enclave did not come back ({:?}); it stays unused until a reboot\n",
+                    e
+                );
+                self.sleep_hold_rx();
+                self.set_sleep_gate(pm::SleepGate::Lost);
+                false
+            }
+        }
+    }
+
+    /// Starts a gated enclave and waits for the messages that say it's up.
+    fn sleep_kick(&self) -> Result<()> {
+        pm::clear_dev_disable(&self.dev)?;
+        pm::dart_restore(&self.dev);
+        // Arm completion before the held receive IRQ can deliver an early wake.
+        self.control.lock().wake_reset();
+        self.sleep_release_rx();
+        match self.mbox.lock().as_ref() {
+            Some(mbox) => {
+                mbox.set_recv_enabled(true);
+                Self::ring(mbox, proto::WAKE_KICK)?;
+            }
+            None => return Err(ENODEV),
+        }
+        let mut remaining = time::msecs_to_jiffies(proto::CONTROL_TIMEOUT_MS);
+        let mut guard = self.control.lock();
+        loop {
+            if guard.wake_complete() {
+                return Ok(());
+            }
+            if remaining == 0 {
+                return Err(ETIMEDOUT);
+            }
+            match self
+                .control_wq
+                .wait_interruptible_timeout(&mut guard, remaining)
+            {
+                CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
+                CondVarTimeoutResult::Signal { jiffies } => remaining = jiffies,
+                CondVarTimeoutResult::Timeout => remaining = 0,
+            }
+        }
     }
 
     /// Puts `msg` in the mailbox once the enclave can see what the CPU wrote
@@ -1429,6 +1727,16 @@ impl SepData {
             return Err(e);
         }
 
+        self.control_wait(op, idx, tag)
+    }
+
+    /// Waits for the answer to the request sent under `idx` and `tag`.
+    fn control_wait(
+        &self,
+        op: &proto::ControlOp,
+        idx: usize,
+        tag: u8,
+    ) -> Result<Option<proto::ControlReply>> {
         let mut remaining = time::msecs_to_jiffies(op.timeout_ms());
         let mut guard = self.control.lock();
         loop {
@@ -1450,7 +1758,7 @@ impl SepData {
                 let retired = guard.retired_count();
                 drop(guard);
                 if op.expects_reply() {
-                    dev_warn!(
+                    dev_warn_ratelimited!(
                         self.dev,
                         "control <- {}: no reply within {} ms; tag 0x{:02x} retired ({} retired in total)\n",
                         op.name(),
@@ -1572,7 +1880,7 @@ impl SepData {
         }
         let mbox = self.mbox.lock();
         let mbox = mbox.as_ref().ok_or(ENODEV)?;
-        if !self.control.lock().entropy_may_send() {
+        if !self.sleep_gate().may_request() || !self.control.lock().entropy_may_send() {
             return Err(EAGAIN);
         }
         Self::ring(mbox, msg)
@@ -1594,7 +1902,7 @@ impl SepData {
             |ms| kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(ms))),
         );
         if !idle {
-            dev_warn!(
+            dev_warn_ratelimited!(
                 self.dev,
                 "hwrng: a request was still in flight after {} ms; suspending anyway\n",
                 RNG_SLEEP_DRAIN_MS
@@ -1647,7 +1955,7 @@ impl SepData {
         match next {
             control::Survey::Registered => {
                 diag::hwrng(true);
-                dev_info!(
+                dev_info_ratelimited!(
                     this.dev,
                     "hwrng: registered after ready-phase survey (attempt {})\n",
                     attempt
@@ -1657,12 +1965,12 @@ impl SepData {
             // this attempt did not ask the enclave anything.
             control::Survey::Held => Self::arm_settle(this),
             control::Survey::Retry(e) => {
-                dev_warn!(this.dev, "hwrng: survey attempt {} failed ({:?}); retrying\n", attempt, e);
+                dev_warn_ratelimited!(this.dev, "hwrng: survey attempt {} failed ({:?}); retrying\n", attempt, e);
                 Self::arm_settle(this);
             }
             control::Survey::GiveUp(e) => {
                 diag::hwrng(false);
-                dev_err!(
+                dev_err_ratelimited!(
                     this.dev,
                     "hwrng: survey failed after {} attempts ({:?})\n",
                     attempt,
@@ -1709,6 +2017,32 @@ impl SepData {
             Some(reply) => Ok(reply),
             None => Err(ETIMEDOUT),
         }
+    }
+
+    /// Sets the sizes an endpoint's buffers are registered with, for an
+    /// endpoint sized from its discovery layout. Once registered, only the
+    /// same sizes are accepted.
+    fn size_ool(&self, slot: &Mutex<Option<OolPair>>, declared: (usize, usize)) -> Result<()> {
+        let mut guard = slot.lock();
+        let pair: &mut Option<OolPair> = &mut guard;
+        let b = pair.as_mut().ok_or(ENODEV)?;
+        if b.registered {
+            return if (b.declared_in, b.declared_out) == declared {
+                Ok(())
+            } else {
+                Err(EBUSY)
+            };
+        }
+        if declared.0 == 0
+            || declared.1 == 0
+            || declared.0 > b.allocated
+            || declared.1 > b.allocated
+        {
+            return Err(EINVAL);
+        }
+        b.declared_in = declared.0;
+        b.declared_out = declared.1;
+        Ok(())
     }
 
     fn register_ool(&self, slot: &Mutex<Option<OolPair>>) -> Result<()> {
@@ -1784,19 +2118,19 @@ impl SepData {
                 self.xarm.lock().os_uuid = Some(uuid);
                 diag::identity_source(diag::IdentitySource::Override);
                 diag::os_identity(diag::OsIdentity::Explicit);
-                dev_info!(self.dev, "xART: using explicit OS identity\n");
+                dev_info_ratelimited!(self.dev, "xART: using explicit OS identity\n");
             }
             os_identity::Selection::Chosen(uuid) => {
                 self.xarm.lock().os_uuid = Some(uuid);
                 diag::identity_source(diag::IdentitySource::DeviceTree);
                 diag::os_identity(diag::OsIdentity::Chosen);
-                dev_info!(self.dev, "xART: using /chosen/apfs-preboot-uuid\n");
+                dev_info_ratelimited!(self.dev, "xART: using /chosen/apfs-preboot-uuid\n");
             }
             os_identity::Selection::Unavailable => {
                 self.xarm.lock().os_uuid = None;
                 diag::identity_source(diag::IdentitySource::Missing);
                 diag::os_identity(diag::OsIdentity::Unavailable);
-                dev_warn!(self.dev, "xART: /chosen/apfs-preboot-uuid is unavailable\n");
+                dev_warn_ratelimited!(self.dev, "xART: /chosen/apfs-preboot-uuid is unavailable\n");
             }
         }
     }
@@ -1877,7 +2211,7 @@ impl SepData {
             && done.reply.status != xarm::STATUS_OK
             && !self.xart_refusal_logged.xchg(true, Relaxed)
         {
-            dev_warn!(
+            dev_warn_ratelimited!(
                 self.dev,
                 "xART: refused the enclave's write (op 0x{:02x}): writes are disabled (xart_writes=0)\n",
                 req.opcode
@@ -2009,14 +2343,14 @@ impl SepData {
         // Each of these used to fail the enclave's request without a trace.
         // Count them all and log the first, so a refusal is never silent.
         if reply.status == xarm::STATUS_FAILED && diag::xarm_failed() == 1 {
-            dev_warn!(
+            dev_warn_ratelimited!(
                 self.dev,
                 "xART: answered a request (tag {:#04x}) with the failure status; diag/xarm_failures counts them\n",
                 reply.tag
             );
         }
         let msg = crate::xarm::encode_xarm_reply(reply);
-        let _ = self.send(msg);
+        let _ = self.send_reply(msg);
     }
 
     fn release_deferred_query(&self) {
@@ -2187,7 +2521,7 @@ impl SepData {
         user: crate::sbio::UserId,
     ) -> Option<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]> {
         if !self.scrd_ready() {
-            dev_err!(self.dev, "enrol: SCRD endpoint is not ready\n");
+            dev_err_ratelimited!(self.dev, "enrol: SCRD endpoint is not ready\n");
             return None;
         }
 
@@ -2200,51 +2534,51 @@ impl SepData {
         };
 
         let Some((status, _)) = self.scrd_command(&crate::scrd::scrd_initialize()) else {
-            dev_err!(self.dev, "enrol: SCRD initialize did not answer\n");
+            dev_err_ratelimited!(self.dev, "enrol: SCRD initialize did not answer\n");
             return None;
         };
         if status != 0 {
-            dev_err!(self.dev, "enrol: SCRD initialize refused (status {})\n", status);
+            dev_err_ratelimited!(self.dev, "enrol: SCRD initialize refused (status {})\n", status);
             return None;
         }
 
         let Some((status, out)) = self.scrd_command(&crate::scrd::scrd_context_create_tracked(user.value())) else {
-            dev_err!(self.dev, "enrol: SCRD context create did not answer\n");
+            dev_err_ratelimited!(self.dev, "enrol: SCRD context create did not answer\n");
             return None;
         };
         if status != 0 || out.len() < crate::scrd::SCRD_ACM_HANDLE_LEN {
-            dev_err!(self.dev, "enrol: SCRD context create failed (status {}, {} reply bytes)\n", status, out.len());
+            dev_err_ratelimited!(self.dev, "enrol: SCRD context create failed (status {}, {} reply bytes)\n", status, out.len());
             return None;
         }
         let mut acm_handle = [0u8; crate::scrd::SCRD_ACM_HANDLE_LEN];
         acm_handle.copy_from_slice(&out[..crate::scrd::SCRD_ACM_HANDLE_LEN]);
 
         let Some((status, _)) = self.scrd_command(&crate::scrd::scrd_context_externalize(&acm_handle)) else {
-            dev_err!(self.dev, "enrol: SCRD context externalize did not answer\n");
+            dev_err_ratelimited!(self.dev, "enrol: SCRD context externalize did not answer\n");
             return None;
         };
         if status != 0 {
-            dev_err!(self.dev, "enrol: SCRD context externalize refused (status {})\n", status);
+            dev_err_ratelimited!(self.dev, "enrol: SCRD context externalize refused (status {})\n", status);
             return None;
         }
 
         let Some(out) = self.sks_send(self.sks_req_verify_secret(special, &secret, &acm_handle)) else {
-            dev_err!(self.dev, "enrol: SKS verify-secret did not answer\n");
+            dev_err_ratelimited!(self.dev, "enrol: SKS verify-secret did not answer\n");
             return None;
         };
         if out.reply.status != 0 {
-            dev_err!(self.dev, "enrol: SKS verify-secret refused (status {})\n", out.reply.status);
+            dev_err_ratelimited!(self.dev, "enrol: SKS verify-secret refused (status {})\n", out.reply.status);
             return None;
         }
 
         let Some((status, out)) = self.scrd_command(&crate::scrd::scrd_verify_touchid_enrollment(&acm_handle)) else {
-            dev_err!(self.dev, "enrol: SCRD Touch ID policy check did not answer\n");
+            dev_err_ratelimited!(self.dev, "enrol: SCRD Touch ID policy check did not answer\n");
             return None;
         };
         let satisfied = out.len() >= 4
             && u32::from_le_bytes([out[0], out[1], out[2], out[3]]) != 0;
         if status != 0 || !satisfied {
-            dev_err!(self.dev, "enrol: SCRD Touch ID policy rejected (status {}, satisfied {})\n", status, satisfied);
+            dev_err_ratelimited!(self.dev, "enrol: SCRD Touch ID policy rejected (status {}, satisfied {})\n", status, satisfied);
             return None;
         }
 
@@ -2299,13 +2633,13 @@ impl SepData {
             Some(handle) => {
                 let mut contexts = self.cold_match_contexts.lock();
                 if contexts.push(handle, GFP_KERNEL).is_err() {
-                    dev_warn!(self.dev, "scrd: could not track the new cold-match credential\n");
+                    dev_warn_ratelimited!(self.dev, "scrd: could not track the new cold-match credential\n");
                 }
                 contexts.len()
             }
             None => self.cold_match_contexts.lock().len(),
         };
-        dev_info!(self.dev, "scrd: cold-match credential established {} ({} live)\n", ok, live);
+        dev_info_ratelimited!(self.dev, "scrd: cold-match credential established {} ({} live)\n", ok, live);
         ok
     }
 
@@ -2319,7 +2653,7 @@ impl SepData {
                 Some((0, _)) => deleted += 1,
                 other => {
                     refused += 1;
-                    dev_warn!(
+                    dev_warn_ratelimited!(
                         self.dev,
                         "scrd: deleting a cold-match credential answered {:?}\n",
                         other.map(|(status, _)| status)
@@ -2327,7 +2661,7 @@ impl SepData {
                 }
             }
         }
-        dev_info!(
+        dev_info_ratelimited!(
             self.dev,
             "scrd: retired {} cold-match credential(s), {} refused\n",
             deleted,
@@ -2345,18 +2679,18 @@ impl SepData {
         user: crate::sbio::UserId,
     ) -> Option<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]> {
         if !self.scrd_ready() {
-            dev_err!(self.dev, "scrd: unlock evaluation: endpoint not ready\n");
+            dev_err_ratelimited!(self.dev, "scrd: unlock evaluation: endpoint not ready\n");
             return None;
         }
         let (status, _) = self.scrd_command(&crate::scrd::scrd_initialize())?;
         if status != 0 {
-            dev_err!(self.dev, "scrd: unlock evaluation: initialize answered {}\n", status);
+            dev_err_ratelimited!(self.dev, "scrd: unlock evaluation: initialize answered {}\n", status);
             return None;
         }
         let (status, out) =
             self.scrd_command(&crate::scrd::scrd_context_create_tracked(user.value()))?;
         let Some(handle) = crate::scrd::tracked_create_reference(&out).filter(|_| status == 0) else {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "scrd: unlock evaluation: tracked create answered {} with {} reply bytes\n",
                 status,
@@ -2367,7 +2701,7 @@ impl SepData {
         let opened = (|| -> Option<()> {
             let (status, _) = self.scrd_command(&crate::scrd::scrd_context_externalize(&handle))?;
             if status != 0 {
-                dev_err!(self.dev, "scrd: unlock evaluation: externalize answered {}\n", status);
+                dev_err_ratelimited!(self.dev, "scrd: unlock evaluation: externalize answered {}\n", status);
                 return None;
             }
             let cmd = crate::scrd::scrd_verify_unlock_policy(&handle, user.value(), true);
@@ -2376,7 +2710,7 @@ impl SepData {
             let answer = crate::scrd::parse_policy_answer(&out);
             let generation = self.match_context_generation.load(Relaxed).wrapping_add(1);
             match answer {
-                Some(a) => dev_info!(
+                Some(a) => dev_info_ratelimited!(
                     self.dev,
                     "scrd: unlock preflight: policy device-owner-biometry, user {}, request {:#x}, parameters 1, status {}, satisfied {}, requirement {:?}, generation {}\n",
                     user.value(),
@@ -2386,7 +2720,7 @@ impl SepData {
                     a.requirement,
                     generation
                 ),
-                None => dev_err!(
+                None => dev_err_ratelimited!(
                     self.dev,
                     "scrd: unlock preflight: status {}, malformed answer of {} bytes\n",
                     status,
@@ -2404,7 +2738,7 @@ impl SepData {
                 return None;
             }
             if a.requirement.is_some_and(|(_, _, flags)| flags & 1 != 0) {
-                dev_info!(self.dev, "scrd: unlock preflight: requirement carries acm-mechanism-bit0\n");
+                dev_info_ratelimited!(self.dev, "scrd: unlock preflight: requirement carries acm-mechanism-bit0\n");
             }
             Some(())
         })();
@@ -2427,7 +2761,7 @@ impl SepData {
             .scrd_command(&crate::scrd::scrd_verify_unlock_policy(handle, user.value(), false))
             .map(|(status, out)| (status, crate::scrd::parse_policy_answer(&out)));
         let satisfied = matches!(answer, Some((0, Some(a))) if a.satisfied);
-        dev_info!(
+        dev_info_ratelimited!(
             self.dev,
             "scrd: unlock policy after the match: satisfied {}, generation {}\n",
             satisfied,
@@ -2439,7 +2773,7 @@ impl SepData {
     pub(crate) fn close_unlock_evaluation(&self, handle: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) {
         match self.scrd_command(&crate::scrd::scrd_context_delete(handle)) {
             Some((0, _)) => {}
-            other => dev_warn!(
+            other => dev_warn_ratelimited!(
                 self.dev,
                 "scrd: deleting the unlock evaluation answered {:?}\n",
                 other.map(|(status, _)| status)
@@ -2491,7 +2825,7 @@ impl SepData {
         let n = self.rng_failures.load(Relaxed).wrapping_add(1);
         self.rng_failures.store(n, Relaxed);
         if n == 1 {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "hwrng: read produced nothing ({:?}); further failures will not be logged\n",
                 e
@@ -2577,7 +2911,7 @@ impl SepData {
         }
 
         if this.endpoint_count() == 0 {
-            dev_err!(
+            dev_err_ratelimited!(
                 this.dev,
                 "attach: {} messages received but no endpoint advertised; xART and key store cannot run\n",
                 now
@@ -2587,7 +2921,7 @@ impl SepData {
             this.finish_bringup();
             return;
         }
-        dev_info!(
+        dev_info_ratelimited!(
             this.dev,
             "attach: {} endpoints advertised in {} messages\n",
             this.endpoint_count(),
@@ -2600,7 +2934,7 @@ impl SepData {
         this.control_survey();
 
         if let Err(e) = this.register_ool(&this.ool_xarm) {
-            dev_err!(
+            dev_err_ratelimited!(
                 this.dev,
                 "xarm: out-of-line buffer registration failed ({:?}); the persistent-state exchange cannot run\n",
                 e
@@ -2654,6 +2988,14 @@ impl SepData {
         }
         diag::log_summary(&this.dev);
         this.finish_bringup();
+        // As macOS does once the enclave is up.
+        Self::queue_stac_online(this.clone());
+        // The enclave's account of the LocalPolicy that admitted this boot.
+        Self::queue_pnon_digest(this.clone());
+        // As macOS does at boot, these are checked and sent nothing.
+        this.sse_attach();
+        this.hibe_attach();
+        this.skdl_attach();
         Self::arm_settle(this);
     }
 
@@ -2752,7 +3094,7 @@ impl SepData {
                 return Ok(());
             }
             if remaining == 0 {
-                dev_err!(self.dev, "trusted-keys: key-store bringup timed out\n");
+                dev_err_ratelimited!(self.dev, "trusted-keys: key-store bringup timed out\n");
                 return Err(ETIMEDOUT);
             }
             match self.trusted_ready.wait_interruptible_timeout(&mut guard, remaining) {
@@ -2789,13 +3131,23 @@ impl SepData {
 
             proto::EP_SCRD => self.on_scrd(msg),
 
+            stac::EP_STAC => self.on_stac(msg),
+
+            pnon::EP_PNON => self.on_pnon(msg),
+
+            sse::EP_SSE => self.on_sse(msg),
+
+            hibe::EP_HIBE => self.on_hibe(msg),
+
+            skdl::EP_SKDL => self.on_skdl(msg),
+
             proto::EP_BOOT => self.on_boot(msg),
 
             ep => {
                 // Counted in diag/unhandled_messages; logged the first few
                 // times only, so a chatty endpoint cannot flood the log.
                 if diag::unhandled() <= UNHANDLED_LOG_LIMIT {
-                    dev_info!(self.dev, "rx: unhandled endpoint {:#04x} (msg0 {:#018x})\n", ep, msg.msg0);
+                    dev_info_ratelimited!(self.dev, "rx: unhandled endpoint {:#04x} (msg0 {:#018x})\n", ep, msg.msg0);
                 }
             }
         }
@@ -2803,6 +3155,8 @@ impl SepData {
 
     fn on_control(&self, msg: Message, f: proto::Fields) {
         if f.ty != proto::CONTROL_REPLY_TYPE {
+            self.control.lock().wake_note(f.ty);
+            self.control_wq.notify_all();
             return;
         }
 
@@ -2814,7 +3168,7 @@ impl SepData {
                 self.control_wq.notify_all();
             }
             control::Delivery::EntropyLate { recovered: true } => {
-                dev_info!(
+                dev_info_ratelimited!(
                     self.dev,
                     "hwrng: the enclave answered a request that had timed out; reads resume\n"
                 );
@@ -2832,6 +3186,11 @@ impl SepData {
         match f.ty {
             proto::DISCOVER_TYPE_DESCRIPTOR | proto::DISCOVER_TYPE_CONFIG => {
                 let _ = table.slot(f.param);
+                self.stac_discovered(&f);
+                self.pnon_discovered(&f);
+                self.sse_discovered(&f);
+                self.hibe_discovered(&f);
+                self.skdl_discovered(&f);
                 diag::endpoints(table.eps.len());
                 if f.ty == proto::DISCOVER_TYPE_DESCRIPTOR {
                     diag::endpoint(f.param, (msg.msg0 >> 32) as u32);
@@ -2885,18 +3244,22 @@ impl SepData {
         self.sbio_wq.notify_all();
         self.sks_wq.notify_all();
         self.scrd_wq.notify_all();
+        self.stac_wq.notify_all();
+        self.pnon_wq.notify_all();
         if let Some(mut handle) = self.rng.lock().take() {
             handle.unregister();
         }
 
         *self.mbox.lock() = None;
 
-        // SAFETY: all five pointers refer to pinned work fields in `self`.
+        // SAFETY: all seven pointers refer to pinned work fields in `self`.
         // Shutdown blocks requeueing, and the mailbox can no longer add work.
         unsafe {
             sep_cancel_work_sync(Work::raw_get(core::ptr::addr_of!(self.rx_work)).cast());
             sep_cancel_work_sync(Work::raw_get(core::ptr::addr_of!(self.enrol_work)).cast());
             sep_cancel_work_sync(Work::raw_get(core::ptr::addr_of!(self.verify_work)).cast());
+            sep_cancel_work_sync(Work::raw_get(core::ptr::addr_of!(self.stac_work)).cast());
+            sep_cancel_work_sync(Work::raw_get(core::ptr::addr_of!(self.pnon_work)).cast());
             sep_cancel_delayed_work_sync(
                 DelayedWork::raw_as_work(core::ptr::addr_of!(self.settle_work)).cast(),
             );
@@ -2918,6 +3281,8 @@ impl SepData {
             &self.ool_sbio,
             &self.ool_sks,
             &self.ool_scrd,
+            &self.ool_stac,
+            &self.ool_pnon,
         ] {
             if let Some(buffers) = slot.lock().take() {
                 if buffers.registered {
@@ -3065,7 +3430,7 @@ impl MailCallback for SepData {
         // buffers the enclave wrote before it only after that, as RTKit does.
         dma_mb(Read);
         if !data.rx.push(msg) && data.rx.dropped() == 1 {
-            dev_err!(
+            dev_err_ratelimited!(
                 data.dev,
                 "receive ring full; dropping messages (first was msg0 {:#018x})\n",
                 msg.msg0
@@ -3106,6 +3471,22 @@ impl WorkItem<LATE_ATTACH_WORK_ID> for SepData {
 
     fn run(this: Arc<SepData>) {
         SepData::run_late_attach(&this);
+    }
+}
+
+impl WorkItem<PNON_WORK_ID> for SepData {
+    type Pointer = Arc<SepData>;
+
+    fn run(this: Arc<SepData>) {
+        this.run_pnon_digest();
+    }
+}
+
+impl WorkItem<STAC_WORK_ID> for SepData {
+    type Pointer = Arc<SepData>;
+
+    fn run(this: Arc<SepData>) {
+        this.run_stac_online();
     }
 }
 
@@ -3155,6 +3536,11 @@ impl platform::Driver for SepDriver {
 
     const OF_ID_TABLE: Option<of::IdTable<()>> = Some(&OF_TABLE);
 
+    fn pm_ops() -> Option<&'static bindings::dev_pm_ops> {
+        // SAFETY: a static in `pm_shim.c`, never written.
+        Some(unsafe { &*core::ptr::addr_of!(pm::sep_pm_ops) })
+    }
+
     fn probe<'bound>(
         pdev: &'bound platform::Device<device::Core<'_>>,
         _info: Option<&'bound Self::IdInfo>,
@@ -3164,7 +3550,7 @@ impl platform::Driver for SepDriver {
             && module_parameters::provision_keybag.value() != 0
             && module_parameters::xart_writes.value() == 0
         {
-            dev_err!(dev, "provision_keybag=1 requires xart_writes=1\n");
+            dev_err_ratelimited!(dev, "provision_keybag=1 requires xart_writes=1\n");
             return Err(EINVAL);
         }
         let sep_node = dt::DtNode::of_device(dev).ok_or(ENODEV)?;
@@ -3177,7 +3563,7 @@ impl platform::Driver for SepDriver {
         }
 
         if dt::registration_already_sent(&sep_node) {
-            dev_err!(
+            dev_err_ratelimited!(
                 dev,
                 "the SEP was already booted or registered on this boot by an earlier load (marker property present). Linux cannot reset it and the handoff cannot be repeated, so reloading the driver is not supported: reboot to attach again. Not probing.\n"
             );
@@ -3185,7 +3571,7 @@ impl platform::Driver for SepDriver {
         }
 
         if let Err(e) = pm::keep_domains(dev) {
-            dev_err!(dev, "could not keep the power domains on ({:?})\n", e);
+            dev_err_ratelimited!(dev, "could not keep the power domains on ({:?})\n", e);
             return Err(e);
         }
 
@@ -3204,7 +3590,7 @@ impl platform::Driver for SepDriver {
                 || module_parameters::os_uuid_lo.value() != 0,
         };
         if let Err(e) = diag::register(dev, data.profile, data.xart_writable(), guard, policy) {
-            dev_warn!(dev, "diag: could not add the sysfs attributes ({:?})\n", e);
+            dev_warn_ratelimited!(dev, "diag: could not add the sysfs attributes ({:?})\n", e);
         }
 
         *data.mbox.lock() = Some(Mailbox::new_byname(dev, c"mbox", data.clone())?);
@@ -3213,18 +3599,18 @@ impl platform::Driver for SepDriver {
 
         if module_parameters::filevault_api.value() != 0 {
             if let Err(e) = data.register_fv_kernel() {
-                dev_err!(dev, "could not register the FileVault kernel API: {:?}\n", e);
+                dev_err_ratelimited!(dev, "could not register the FileVault kernel API: {:?}\n", e);
             }
         }
 
         if module_parameters::trusted_keys.value() != 0 {
             if let Err(e) = trusted::register(data.clone()) {
-                dev_warn!(data.dev, "trusted-keys: registration failed ({:?})\n", e);
+                dev_warn_ratelimited!(data.dev, "trusted-keys: registration failed ({:?})\n", e);
             }
         }
 
         if let Err(e) = pm::register(data.clone()) {
-            dev_warn!(
+            dev_warn_ratelimited!(
                 data.dev,
                 "sleep notifier registration failed ({:?}); a capture may run into a suspend\n",
                 e
@@ -3279,7 +3665,7 @@ impl kernel::InPlaceModule for SepModule {
                     // Without this the module loads, probes nothing and logs
                     // nothing on an unlisted SoC, which is indistinguishable
                     // from a driver that started correctly.
-                    Err(_) => pr_info!(
+                    Err(_) => pr_info_ratelimited!(
                         "no platform profile for this SoC; the SEP stays disabled\n"
                     ),
                 }

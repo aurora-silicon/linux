@@ -288,7 +288,14 @@ impl ParkedPair {
             configuration: None,
             configured_context: None,
             configured_qos: None,
+            channel_error: false,
         }))
+    }
+}
+
+impl ParkedPair {
+    pub(crate) fn forget_registration(&mut self) {
+        self.registered = None;
     }
 }
 

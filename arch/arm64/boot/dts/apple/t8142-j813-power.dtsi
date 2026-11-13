@@ -20,7 +20,8 @@
 	/*
 	 * ADT /arm-io/nub-spmi0 (gen 4) and its primary PMU, pmu-main
 	 * ("abbey", slave 0xe). The boot flags live in the legacy scratchpad
-	 * (info-leg_scrpad = 0xf800), laid out as on T8103 and J873.
+	 * (info-leg_scrpad = 0xf800), laid out as on T8103 and J873; the RTC
+	 * offset is at info-rtc_scrpad = 0x2100 (J815 ADT; same as J704).
 	 */
 	nub_spmi0: spmi@388714000 {
 		compatible = "apple,t8142-spmi";
@@ -36,6 +37,11 @@
 				compatible = "fixed-layout";
 				#address-cells = <1>;
 				#size-cells = <1>;
+
+				/* ADT info-rtc_scrpad: 48-bit offset in 32768 Hz ticks. */
+				rtc_offset: rtc-offset@2100 {
+					reg = <0x2100 0x6>;
+				};
 
 				boot_stage: boot-stage@f801 {
 					reg = <0xf801 0x1>;
@@ -69,5 +75,11 @@
 			      <&boot_error_count>, <&panic_count>;
 		nvmem-cell-names = "shutdown_flag", "boot_stage",
 				   "boot_error_count", "panic_count";
+	};
+
+	rtc {
+		compatible = "apple,smc-rtc";
+		nvmem-cells = <&rtc_offset>;
+		nvmem-cell-names = "rtc_offset";
 	};
 };

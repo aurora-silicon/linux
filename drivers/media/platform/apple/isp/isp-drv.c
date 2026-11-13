@@ -14,6 +14,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/suspend.h>
 #include <linux/workqueue.h>
 
 #include "isp-cam.h"
@@ -25,36 +26,6 @@
 static void apple_isp_kvfree(void *data)
 {
 	kvfree(data);
-}
-
-/*
- * Keep a copy of the firmware data segment as the boot loader loaded it
- * (hw->fw_restore). This must run before the firmware first starts.
- */
-static int apple_isp_copy_fw_data(struct apple_isp *isp)
-{
-	struct device *dev = isp->dev;
-	struct resource res;
-	int err;
-
-	err = of_reserved_mem_region_to_resource_byname(dev->of_node, "data", &res);
-	if (err)
-		return err;
-
-	isp->fw_data_size = resource_size(&res);
-	isp->fw_data = devm_memremap(dev, res.start, isp->fw_data_size, MEMREMAP_WB);
-	if (IS_ERR(isp->fw_data))
-		return PTR_ERR(isp->fw_data);
-
-	isp->fw_data_copy = kvmalloc(isp->fw_data_size, GFP_KERNEL);
-	if (!isp->fw_data_copy)
-		return -ENOMEM;
-	err = devm_add_action_or_reset(dev, apple_isp_kvfree, isp->fw_data_copy);
-	if (err)
-		return err;
-
-	memcpy(isp->fw_data_copy, isp->fw_data, isp->fw_data_size);
-	return 0;
 }
 
 static void apple_isp_detach_genpd(struct apple_isp *isp)
@@ -181,17 +152,12 @@ static int apple_isp_map_fw_mmio(struct apple_isp *isp)
 	return 0;
 }
 
-/* The IOVA range of a memory-region, from its last iommu-addresses entry. */
-static int isp_of_region_iova(struct device *dev, const char *name,
-			      phys_addr_t *base, size_t *size)
+/* The IOVA range of memory-region @idx, from its last iommu-addresses entry. */
+static int isp_of_region_iova_idx(struct device *dev, int idx,
+				  phys_addr_t *base, size_t *size)
 {
 	const __be32 *maps, *end;
-	int idx, len;
-
-	idx = of_property_match_string(dev->of_node, "memory-region-names",
-				       name);
-	if (idx < 0)
-		return -ENOENT;
+	int len;
 
 	struct device_node *np __free(device_node) =
 		of_parse_phandle(dev->of_node, "memory-region", idx);
@@ -210,6 +176,155 @@ static int isp_of_region_iova(struct device *dev, const char *name,
 	}
 
 	return 0;
+}
+
+/* The IOVA range of a named memory-region. */
+static int isp_of_region_iova(struct device *dev, const char *name,
+			      phys_addr_t *base, size_t *size)
+{
+	int idx;
+
+	idx = of_property_match_string(dev->of_node, "memory-region-names",
+				       name);
+	if (idx < 0)
+		return -ENOENT;
+
+	return isp_of_region_iova_idx(dev, idx, base, size);
+}
+
+/*
+ * The memory-region of the firmware data segment: the one named "data", or,
+ * where the boot loader lists the firmware segments without names (T8140),
+ * the one that ends where the heap starts. The loader places the text and
+ * data segments and the heap back to back in the firmware's address space.
+ */
+static int isp_of_fw_data_region(struct device *dev)
+{
+	phys_addr_t heap_base, base;
+	size_t heap_size, size;
+	int idx, count;
+
+	idx = of_property_match_string(dev->of_node, "memory-region-names",
+				       "data");
+	if (idx >= 0)
+		return idx;
+
+	if (isp_of_region_iova(dev, "heap", &heap_base, &heap_size))
+		return -ENOENT;
+
+	count = of_count_phandle_with_args(dev->of_node, "memory-region", NULL);
+	for (idx = 0; idx < count; idx++) {
+		if (isp_of_region_iova_idx(dev, idx, &base, &size))
+			continue;
+		if (size && base + size == heap_base)
+			return idx;
+	}
+
+	return -ENOENT;
+}
+
+static void *apple_isp_copy_region(struct device *dev, struct resource *res,
+				   void **copy)
+{
+	void *mem;
+
+	mem = devm_memremap(dev, res->start, resource_size(res), MEMREMAP_WB);
+	if (IS_ERR(mem))
+		return mem;
+
+	*copy = kvmalloc(resource_size(res), GFP_KERNEL);
+	if (!*copy)
+		return ERR_PTR(-ENOMEM);
+	if (devm_add_action_or_reset(dev, apple_isp_kvfree, *copy))
+		return ERR_PTR(-ENOMEM);
+
+	memcpy(*copy, mem, resource_size(res));
+	return mem;
+}
+
+/*
+ * Keep a copy of the firmware data segment as the boot loader loaded it
+ * (hw->fw_restore), and of the heap where the boot loader provides its
+ * memory instead of the host. This must run before the firmware first
+ * starts.
+ */
+static int apple_isp_copy_fw_data(struct apple_isp *isp)
+{
+	struct device *dev = isp->dev;
+	struct resource res;
+	int idx, err;
+
+	idx = isp_of_fw_data_region(dev);
+	if (idx < 0)
+		return idx;
+
+	err = of_reserved_mem_region_to_resource(dev->of_node, idx, &res);
+	if (err)
+		return err;
+
+	isp->fw_data_size = resource_size(&res);
+	isp->fw_data = apple_isp_copy_region(dev, &res, &isp->fw_data_copy);
+	if (IS_ERR(isp->fw_data))
+		return PTR_ERR(isp->fw_data);
+
+	/* A host-backed main memory tail is cleared instead. */
+	if (isp->fw.data_top ||
+	    of_reserved_mem_region_to_resource_byname(dev->of_node, "heap", &res))
+		return 0;
+
+	isp->fw_heap_size = resource_size(&res);
+	isp->fw_heap = apple_isp_copy_region(dev, &res, &isp->fw_heap_copy);
+	return PTR_ERR_OR_ZERO(isp->fw_heap);
+}
+
+/*
+ * Firmware that starts again needs the DART address filter registers, to
+ * program the filter after each power-up, and its data segment. Device
+ * trees from before those were described run it resident instead
+ * (hw->resident_fallback), as it ran before.
+ */
+static void apple_isp_select_hw(struct apple_isp *isp)
+{
+	struct device *dev = isp->dev;
+	struct apple_isp_hw *hw = &isp->hw_local;
+
+	*hw = *isp->hw;
+	isp->hw = hw;
+
+	struct device_node *dart __free(device_node) =
+		of_parse_phandle(dev->of_node, "iommus", 0);
+
+	/*
+	 * Resident firmware that starts again (hw->fw_restart) runs from its own
+	 * memory, but after a power-down it reaches its MMIO only once the first
+	 * DART has replayed the boot loader's address filter. Without
+	 * apple,dapf-ranges on that DART it keeps running, as it ran before.
+	 */
+	if (hw->fw_restart &&
+	    !(dart && of_property_present(dart, "apple,dapf-ranges"))) {
+		dev_info(dev, "no address filter replay in the device tree, keeping the firmware resident\n");
+		hw->fw_restart = false;
+		hw->deferred_start = false;
+		hw->coproc_quiesce = 0;
+		hw->fw_idle_ms = 0;
+		return;
+	}
+
+	if (!hw->resident_fallback)
+		return;
+
+	if (dart && of_property_match_string(dart, "reg-names", "dapf") >= 0 &&
+	    isp_of_fw_data_region(dev) >= 0)
+		return;
+
+	dev_info(dev, "no address filter or firmware data in the device tree, keeping the firmware resident\n");
+	hw->fw_restore = false;
+	hw->deferred_start = false;
+	hw->resident_fw = true;
+	hw->coproc_quiesce = 0;
+	hw->dapf = NULL;
+	hw->num_dapf = 0;
+	hw->fw_idle_ms = 0;
 }
 
 /*
@@ -435,6 +550,11 @@ static int apple_isp_init_presets(struct apple_isp *isp)
 	return 0;
 }
 
+/* Preview only; processing and image quality need separate qualification. */
+static bool preview_26 = true;
+module_param(preview_26, bool, 0400);
+MODULE_PARM_DESC(preview_26, "Enable J613 preview on ISP firmware 26.6.2 (default: true; false disables)");
+
 static const char * isp_fw2str(enum isp_firmware_version version)
 {
 	switch (version) {
@@ -446,6 +566,8 @@ static const char * isp_fw2str(enum isp_firmware_version version)
 		return "13.5";
 	case ISP_FIRMWARE_V_14_7:
 		return "14.7";
+	case ISP_FIRMWARE_V_26_6_2:
+		return "26.6.2";
 	default:
 		return "unknown";
 	}
@@ -475,6 +597,8 @@ static enum isp_firmware_version isp_read_fw_version(struct device *dev,
 		/* not provided, see isp_check_firmware_version() */
 		break;
 	case 3:
+		if (ver[0] == 26 && ver[1] == 6 && ver[2] == 2)
+			return ISP_FIRMWARE_V_26_6_2;
 		if (ver[0] == 12 && ver[1] == 3 && ver[2] <= 1)
 			return ISP_FIRMWARE_V_12_3;
 		else if (ver[0] == 12 && ver[1] == 4 && ver[2] == 0)
@@ -525,6 +649,44 @@ isp_check_firmware_version(struct apple_isp *isp)
 	return compat;
 }
 
+static bool isp_preview26_admitted(struct device *dev,
+				   enum isp_firmware_version compat)
+{
+	if (compat != ISP_FIRMWARE_V_26_6_2 || !preview_26 ||
+	    !of_machine_is_compatible("apple,j613"))
+		return false;
+	if (!of_device_is_compatible(dev->of_node, "apple,t8122-isp"))
+		return false;
+	return isp_read_fw_version(dev, "apple,firmware-version") ==
+		ISP_FIRMWARE_V_26_6_2;
+}
+
+/* After a system sleep, see apple_isp_resume(). */
+static void apple_isp_resume_work(struct work_struct *work)
+{
+	struct apple_isp *isp = container_of(work, struct apple_isp, resume_work);
+
+	mutex_lock(&isp->video_lock);
+	isp->fw_sleep_stopped = false;
+	mutex_unlock(&isp->video_lock);
+	apple_isp_video_resume(isp);
+}
+
+/*
+ * Idle firmware that starts again from its own memory is stopped before a
+ * system sleep begins, as macOS's camera service powers an idle ISP off
+ * before the kernel sleeps: the sleep then finds it off, as after a stream.
+ */
+static int apple_isp_pm_notify(struct notifier_block *nb, unsigned long event,
+			       void *unused)
+{
+	struct apple_isp *isp = container_of(nb, struct apple_isp, pm_nb);
+
+	if (event == PM_SUSPEND_PREPARE || event == PM_HIBERNATION_PREPARE)
+		apple_isp_firmware_flush(isp);
+	return NOTIFY_DONE;
+}
+
 static int apple_isp_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -553,6 +715,17 @@ static int apple_isp_probe(struct platform_device *pdev)
 	 * with unknown firmware.
 	 */
 	isp->fw_compat = isp_check_firmware_version(isp);
+	if (isp->hw->fw_abi != ISP_FW_ABI_H17 &&
+	    (isp->fw_compat == ISP_FIRMWARE_V_26_6_2 ||
+	     isp_read_fw_version(dev, "apple,firmware-version") ==
+						ISP_FIRMWARE_V_26_6_2)) {
+		if (!isp_preview26_admitted(dev, isp->fw_compat)) {
+			err = dev_err_probe(dev, -ENODEV,
+					    "26.6.2 preview requires J613/T8122; preview_26=0 disables it\n");
+			goto free_isp;
+		}
+		isp->preview_26 = true;
+	}
 
 	err = of_property_read_u32(dev->of_node, "apple,platform-id",
 				   &isp->platform_id);
@@ -576,6 +749,8 @@ static int apple_isp_probe(struct platform_device *pdev)
 		dev_err(dev, "failed to initialize presets\n");
 		goto free_isp;
 	}
+
+	apple_isp_select_hw(isp);
 
 	err = apple_isp_attach_genpd(isp);
 	if (err) {
@@ -647,6 +822,8 @@ static int apple_isp_probe(struct platform_device *pdev)
 	}
 
 	mutex_init(&isp->video_lock);
+	INIT_WORK(&isp->resume_work, apple_isp_resume_work);
+	apple_isp_firmware_init(isp);
 	spin_lock_init(&isp->buf_lock);
 	init_waitqueue_head(&isp->wait);
 	INIT_LIST_HEAD(&isp->gc);
@@ -699,6 +876,11 @@ static int apple_isp_probe(struct platform_device *pdev)
 		goto halt_firmware;
 	}
 
+	if (isp->hw->fw_idle_ms && isp->hw->resident_fw) {
+		isp->pm_nb.notifier_call = apple_isp_pm_notify;
+		register_pm_notifier(&isp->pm_nb);
+	}
+
 	return 0;
 
 halt_firmware:
@@ -723,8 +905,12 @@ static void apple_isp_remove(struct platform_device *pdev)
 {
 	struct apple_isp *isp = platform_get_drvdata(pdev);
 
+	if (isp->pm_nb.notifier_call)
+		unregister_pm_notifier(&isp->pm_nb);
+	cancel_work_sync(&isp->resume_work);
 	apple_isp_remove_video(isp);
 	/* Stop resident firmware before freeing what it may still use. */
+	apple_isp_firmware_flush(isp);
 	apple_isp_firmware_halt(isp);
 	apple_isp_free_video(isp);
 	pm_runtime_disable(isp->dev);
@@ -949,11 +1135,23 @@ static const struct apple_isp_hw apple_isp_hw_t8140 = {
 	.mbox2_offset = 0x410,
 	.mbox_irq_route = true,
 	.coproc_control = ISP_COPROC_CONTROL_T8140,
+	/*
+	 * macOS quiesces the coprocessor before the core words go off
+	 * (DisableISPClocksAndPower, 25G83); without it they reach off with BUSY
+	 * latched.
+	 */
+	.coproc_status = ISP_COPROC_STATUS_T8140,
+	.coproc_quiesce = ISP_COPROC_QUIESCE_T8140,
 	.fw_mmio = apple_isp_fw_mmio_t8140,
 	.num_fw_mmio = ARRAY_SIZE(apple_isp_fw_mmio_t8140),
 	.boot_mode = 1,
 	.capture_meta_size = ISP_CAPTURE_META_SIZE_T8140,
 	.resident_fw = true,
+	.fw_restart = true,
+	/* As on macOS, the firmware first starts when a client opens the camera. */
+	.deferred_start = true,
+	/* macOS powers it off 5 s after the last frame (twice in its recording). */
+	.fw_idle_ms = 5000,
 	.meta_exposure = true,
 };
 
@@ -978,6 +1176,12 @@ static const struct isp_mmio_window apple_isp_fw_mmio_t6040[] = {
  * map) and as aurora's m1n1 proxy captures with it: no coprocessor reset,
  * four broadcast-clear windows in eight slots, the scaler 1 output path and
  * no capture metadata pool or watchdog.
+ *
+ * Its firmware starts again from its own memory, as T8140's does, so the
+ * ISP is powered only while the camera is in use: the firmware starts at
+ * probe to detect the camera and stops again, and each stream starts it.
+ * It stays up for 5 s after a stream, as on T8140, and the coprocessor is
+ * quiesced before its domains go off.
  */
 static const struct apple_isp_hw apple_isp_hw_t6040 = {
 	.gen = ISP_GEN_T6040,
@@ -1010,9 +1214,13 @@ static const struct apple_isp_hw apple_isp_hw_t6040 = {
 	.num_fw_mmio = ARRAY_SIZE(apple_isp_fw_mmio_t6040),
 
 	.coproc_control = ISP_COPROC_CONTROL_T8140,
+	.coproc_status = ISP_COPROC_STATUS_T8140,
+	.coproc_quiesce = ISP_COPROC_QUIESCE_T8140,
 	.boot_mode = 1,
 	.shared_size = 0xde600000,
 	.resident_fw = true,
+	.fw_restart = true,
+	.fw_idle_ms = 5000,
 	.meta_exposure = true,
 };
 
@@ -1244,9 +1452,43 @@ static __maybe_unused int apple_isp_runtime_resume(struct device *dev)
 	return 0;
 }
 
+/*
+ * Stop resident firmware. For a system sleep it starts again on resume where
+ * it can; otherwise, or for hibernation, the camera is gone until the next
+ * boot.
+ */
+static void apple_isp_stop_resident(struct apple_isp *isp, bool sleep)
+{
+	bool restart = sleep && isp->hw->fw_restart;
+
+	if (!isp->hw->resident_fw)
+		return;
+
+	mutex_lock(&isp->video_lock);
+	if (isp->fw_state == ISP_FW_RUNNING) {
+		if (restart)
+			dev_dbg(isp->dev, "stopping the firmware for system sleep\n");
+		else
+			dev_warn(isp->dev, "stopping the firmware for %s, the camera is unavailable until the next boot\n",
+				 sleep ? "system sleep" : "hibernation");
+		isp->fw_sleep_stopped = restart;
+	}
+	apple_isp_firmware_halt(isp);
+	/* Hibernation resumes in another boot, where that memory isn't ours. */
+	if (!restart)
+		isp->fw_state = ISP_FW_DEAD;
+	mutex_unlock(&isp->video_lock);
+}
+
 static __maybe_unused int apple_isp_suspend(struct device *dev)
 {
 	struct apple_isp *isp = dev_get_drvdata(dev);
+	bool power_lost = isp->hw->resident_fw && pm_suspend_via_firmware();
+
+	/* A stream that couldn't restart on the other side keeps the system up. */
+	if (power_lost && !isp->hw->fw_restart &&
+	    test_bit(ISP_STATE_STREAMING, &isp->state))
+		return -EBUSY;
 
 	/* We must restore V4L2 context on system resume. If we were streaming
 	 * before, we (essentially) stop streaming and start streaming again.
@@ -1254,9 +1496,26 @@ static __maybe_unused int apple_isp_suspend(struct device *dev)
 	apple_isp_video_suspend(isp);
 
 	/*
-	 * Resident firmware stays up, idle, across suspend-to-idle and
-	 * suspend-to-RAM: its domains stay on, see apple_isp_attach_genpd().
+	 * Resident firmware stays up, idle, across suspend-to-idle: its domains
+	 * stay on, see apple_isp_attach_genpd(). A sleep that powers the SoC down
+	 * takes it anyway, so stop it first. Firmware that starts again and still
+	 * idles after a stream stops.
 	 */
+	if (power_lost)
+		apple_isp_stop_resident(isp, true);
+	apple_isp_firmware_flush(isp);
+
+	/*
+	 * A stream stopped for suspend-to-idle has stopped firmware that starts
+	 * again, too. Its start from .resume never gets the firmware's first
+	 * boot message; from process context it does. Restart it there, as
+	 * after a sleep that powered the SoC down.
+	 */
+	mutex_lock(&isp->video_lock);
+	if (isp->hw->fw_restart && isp->fw_state == ISP_FW_OFF &&
+	    test_bit(ISP_STATE_SLEEPING, &isp->state))
+		isp->fw_sleep_stopped = true;
+	mutex_unlock(&isp->video_lock);
 	return 0;
 }
 
@@ -1265,6 +1524,7 @@ static __maybe_unused int apple_isp_freeze(struct device *dev)
 	struct apple_isp *isp = dev_get_drvdata(dev);
 
 	apple_isp_video_suspend(isp);
+	apple_isp_firmware_flush(isp);
 
 	/*
 	 * Hibernation hands the system from one kernel to another, and
@@ -1272,13 +1532,7 @@ static __maybe_unused int apple_isp_freeze(struct device *dev)
 	 * that started it. Stop it cleanly instead; if it ran, the camera is
 	 * then unavailable until the next system boot.
 	 */
-	if (isp->hw->resident_fw) {
-		mutex_lock(&isp->video_lock);
-		if (isp->fw_state == ISP_FW_RUNNING)
-			dev_warn(dev, "stopping the firmware for hibernation, the camera is unavailable until the next boot\n");
-		apple_isp_firmware_halt(isp);
-		mutex_unlock(&isp->video_lock);
-	}
+	apple_isp_stop_resident(isp, false);
 
 	return 0;
 }
@@ -1287,6 +1541,16 @@ static __maybe_unused int apple_isp_resume(struct device *dev)
 {
 	struct apple_isp *isp = dev_get_drvdata(dev);
 
+	/*
+	 * Firmware stopped for the sleep starts again in process context: its
+	 * handshake here held up the whole resume. A stream that ran across the
+	 * sleep restarts from a freezable work item, once tasks thaw; without one
+	 * the firmware starts at the next stream.
+	 */
+	if (isp->fw_sleep_stopped) {
+		queue_work(system_freezable_wq, &isp->resume_work);
+		return 0;
+	}
 	apple_isp_video_resume(isp);
 
 	return 0;
@@ -1314,6 +1578,7 @@ static void apple_isp_shutdown(struct platform_device *pdev)
 		return;
 	/* A stream that still runs is stopped cleanly first, as for hibernation */
 	apple_isp_video_suspend(isp);
+	apple_isp_firmware_flush(isp);
 	mutex_lock(&isp->video_lock);
 	apple_isp_firmware_halt(isp);
 	mutex_unlock(&isp->video_lock);

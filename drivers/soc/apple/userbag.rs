@@ -1058,7 +1058,7 @@ impl crate::SepData {
     fn userbag_body<'a>(&self, name: &CStr, out: &'a crate::SksOutcome) -> Result<&'a [u8]> {
         let body = self.sks_report_response(name, out);
         if body.is_none() {
-            dev_info!(self.dev, "userbag: {}: no usable response (status {})\n", name, out.reply.status);
+            dev_info_ratelimited!(self.dev, "userbag: {}: no usable response (status {})\n", name, out.reply.status);
         }
         body.ok_or(EPROTO)
     }
@@ -1067,7 +1067,7 @@ impl crate::SepData {
     /// first bytes. Replies to these queries carry no secret.
     fn userbag_refused(&self, step: &str, body: &[u8]) -> Error {
         let n = body.len().min(96);
-        dev_info!(self.dev, "userbag: {}: reply refused, {} bytes: {:02x?}\n", step, body.len(), &body[..n]);
+        dev_info_ratelimited!(self.dev, "userbag: {}: reply refused, {} bytes: {:02x?}\n", step, body.len(), &body[..n]);
         EPROTO
     }
 
@@ -1154,7 +1154,7 @@ impl crate::SepData {
         let out = self.sks_send(self.sks_req_copy_keybag_special(user.special_handle())).ok_or(EACCES)?;
         let wrapped = self.wrapped_from_copy_reply(&out, c"a user bag").ok_or(EACCES)?;
         if wrapped.len() > BAG_BLOB_MAX {
-            dev_info!(self.dev, "userbag: wrapped bag is {} bytes, more than {}\n", wrapped.len(), BAG_BLOB_MAX);
+            dev_info_ratelimited!(self.dev, "userbag: wrapped bag is {} bytes, more than {}\n", wrapped.len(), BAG_BLOB_MAX);
             return Err(E2BIG);
         }
         Ok(wrapped)
@@ -1178,7 +1178,7 @@ impl crate::SepData {
         });
         let _ = self.sks_send(self.sks_req_unload_keybag(handle));
         if !valid {
-            dev_info!(self.dev, "userbag: designating the imported bag as {} failed\n", user.special_handle().value());
+            dev_info_ratelimited!(self.dev, "userbag: designating the imported bag as {} failed\n", user.special_handle().value());
             return Err(EACCES);
         }
         Ok(())
@@ -1243,7 +1243,7 @@ impl crate::SepData {
             Some(0) => Ok(false),
             Some(h) if h == user.special_handle().value() => Ok(true),
             fired => {
-                dev_info!(self.dev, "userbag: timer fire answered {:?}, expected {}\n", fired, user.special_handle().value());
+                dev_info_ratelimited!(self.dev, "userbag: timer fire answered {:?}, expected {}\n", fired, user.special_handle().value());
                 Err(self.userbag_refused("timer fire", body))
             }
         }
@@ -1281,7 +1281,7 @@ impl crate::SepData {
         let body = self.userbag_body(crate::sks::SKS_GET_DEVICE_STATE_NAME, &state)?;
         let state = decode_get_state_reply(body).ok_or_else(|| self.userbag_refused("device state", body))?;
         if state.handle != handle {
-            dev_info!(self.dev, "userbag: device state names bag handle {}, asked about {}\n", state.handle, handle);
+            dev_info_ratelimited!(self.dev, "userbag: device state names bag handle {}, asked about {}\n", state.handle, handle);
             return Err(self.userbag_refused("device state (handle)", body));
         }
         Ok(state)
@@ -1308,7 +1308,7 @@ impl crate::SepData {
             // The user-bag layouts were captured on the variant-5 key store
             // (macOS 26 on the Neo). The 13.x key store of M1/M2-generation
             // Macs has not been captured, so nothing is sent there.
-            dev_info!(
+            dev_info_ratelimited!(
                 self.dev,
                 "userbag: per-user key bags are not supported on this key store yet (only variant 5 has been captured)\n"
             );
@@ -1464,7 +1464,7 @@ impl crate::SepData {
                 let state = self.userbag_state(user)?;
                 let configuration = self.userbag_configuration(user)?;
                 if state.attempt_limit != configuration.attempt_limit {
-                    dev_info!(self.dev, "userbag: attempt limit {} in the state, {} in the configuration\n", state.attempt_limit, configuration.attempt_limit);
+                    dev_info_ratelimited!(self.dev, "userbag: attempt limit {} in the state, {} in the configuration\n", state.attempt_limit, configuration.attempt_limit);
                     return Err(EPROTO);
                 }
                 reply.bag_state = match state.lock_phase {

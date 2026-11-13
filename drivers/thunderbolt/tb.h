@@ -447,6 +447,8 @@ struct tb_path {
 	bool clear_fc;
 	int path_length;
 	bool alloc_hopid;
+	struct tb_regs_hop *sleep_hops;
+	bool sleep_valid;
 
 	struct tb_path_hop hops[] __counted_by(path_length);
 };
@@ -799,6 +801,10 @@ void tb_domain_remove(struct tb *tb);
 int tb_domain_suspend_noirq(struct tb *tb);
 int tb_domain_resume_noirq(struct tb *tb);
 int tb_domain_suspend(struct tb *tb);
+int tb_cio_sleep_prepare(struct tb *tb);
+int tb_cio_sleep(struct tb *tb);
+int tb_cio_wake(struct tb *tb, bool *host_pci_lost);
+void tb_cio_sleep_complete(struct tb *tb);
 int tb_domain_freeze_noirq(struct tb *tb);
 int tb_domain_thaw_noirq(struct tb *tb);
 void tb_domain_complete(struct tb *tb);
@@ -875,6 +881,7 @@ int tb_switch_configuration_valid(struct tb_switch *sw);
 int tb_switch_add(struct tb_switch *sw);
 void tb_switch_remove(struct tb_switch *sw);
 void tb_switch_suspend(struct tb_switch *sw, bool runtime);
+int tb_switch_suspend_cio(struct tb_switch *sw);
 int tb_switch_resume(struct tb_switch *sw, bool runtime);
 int tb_switch_reset(struct tb_switch *sw);
 int tb_switch_wait_for_bit(struct tb_switch *sw, u32 offset, u32 bit,
@@ -1247,6 +1254,10 @@ struct tb_path *tb_path_alloc(struct tb *tb, struct tb_port *src, int src_hopid,
 void tb_path_free(struct tb_path *path);
 int tb_path_activate(struct tb_path *path);
 void tb_path_deactivate(struct tb_path *path);
+int tb_path_sleep_prepare(struct tb_path *path);
+int tb_path_sleep(struct tb_path *path);
+int tb_path_wake(struct tb_path *path);
+void tb_path_sleep_complete(struct tb_path *path);
 int tb_path_deactivate_hop(struct tb_port *port, int hop_index);
 bool tb_path_is_invalid(struct tb_path *path);
 bool tb_path_port_on_path(const struct tb_path *path,

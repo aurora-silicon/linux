@@ -130,3 +130,8 @@
 };
 
 /* Unexposed chassis port instances remain described and disabled. */
+
+/* aura (mcc_init_m5) turns the system level cache on; the driver confirms it and flushes on shutdown. */
+&mcc {
+	status = "okay";
+};

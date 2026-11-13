@@ -36,7 +36,9 @@ pub(super) struct WorkStates {
 impl WorkStates {
     pub(super) const fn new() -> Self {
         Self {
-            next: AtomicU32::new(0),
+            // Start at generation 1: macOS 27.0 never uses generation 0 (its words run
+            // 0x17c8.. 0x17ea on the J813).
+            next: AtomicU32::new(0x40),
             live: [const { AtomicU32::new(FREE) }; 64],
             held: [const { AtomicU32::new(0) }; ENGINES],
         }

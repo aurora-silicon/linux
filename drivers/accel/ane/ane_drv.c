@@ -1377,7 +1377,7 @@ static int __maybe_unused ane_runtime_suspend(struct device *dev)
 	 * when recovery is power-cycling a wedged engine to establish
 	 * exactly that quiescence.
 	 */
-	if (atomic_read(&ane->wedged) && !ane->recovering)
+	if (atomic_read(&ane->wedged) && !ane->recovering && !ane->sleep_wedged)
 		return -EBUSY;
 
 	return ane_perf_suspend(ane);
@@ -1439,10 +1439,55 @@ static int __maybe_unused ane_runtime_resume(struct device *dev)
 	return 0;
 }
 
+/*
+ * A wedged engine (a job hung and recovery failed or gave up) no longer
+ * refuses system sleep. Its partitions go off with the sleep, consumer
+ * before its DART suppliers, the same power-off a recovery cycle performs.
+ * On resume an engine whose recovery may still help gets one more
+ * attempt, as from the reset file; a final wedge stays until reboot.
+ */
+static int __maybe_unused ane_system_suspend(struct device *dev)
+{
+	struct ane_device *ane = dev_get_drvdata(dev);
+	int ret;
+
+	mutex_lock(&ane->engine_lock);
+	ane->sleep_wedged = atomic_read(&ane->wedged);
+	mutex_unlock(&ane->engine_lock);
+	if (ane->sleep_wedged)
+		dev_info(dev, "engine wedged; its partitions go off with the sleep\n");
+	ret = pm_runtime_force_suspend(dev);
+	if (ret)
+		ane->sleep_wedged = false;
+	return ret;
+}
+
+static int __maybe_unused ane_system_resume(struct device *dev)
+{
+	struct ane_device *ane = dev_get_drvdata(dev);
+	bool wedged = ane->sleep_wedged;
+	int ret;
+
+	ret = pm_runtime_force_resume(dev);
+	ane->sleep_wedged = false;
+	if (ret || !wedged)
+		return ret;
+	mutex_lock(&ane->pm_lock);
+	if (pm_runtime_resume_and_get(dev) >= 0) {
+		mutex_lock(&ane->engine_lock);
+		if (!ane->removed && !ane->wedge_final && ane_tm_recover(ane) < 0)
+			dev_err(dev, "recovery after system sleep failed; submissions stay disabled\n");
+		mutex_unlock(&ane->engine_lock);
+		pm_runtime_put_autosuspend(dev);
+	}
+	mutex_unlock(&ane->pm_lock);
+	return 0;
+}
+
 // clang-format off
 static const struct dev_pm_ops ane_pm_ops = {
 	SET_RUNTIME_PM_OPS(ane_runtime_suspend, ane_runtime_resume, NULL)
-	SET_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
+	SET_SYSTEM_SLEEP_PM_OPS(ane_system_suspend, ane_system_resume)
 };
 
 // clang-format on

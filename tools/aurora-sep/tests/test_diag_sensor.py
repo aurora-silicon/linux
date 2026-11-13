@@ -108,6 +108,9 @@ struct attribute_group { const char *name; struct attribute **attrs; };
 #define DEVICE_ATTR_RO(_name) \
 	struct device_attribute dev_attr_##_name = \
 		{ .attr = { .name = #_name, .mode = 0444 }, .show = _name##_show }
+#define DEVICE_ATTR_ADMIN_RO(_name) \
+	struct device_attribute dev_attr_##_name = \
+		{ .attr = { .name = #_name, .mode = 0400 }, .show = _name##_show }
 extern const struct attribute_group *registered_group;
 static inline int devm_device_add_group(struct device *dev,
 					const struct attribute_group *grp)

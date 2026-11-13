@@ -168,6 +168,19 @@ struct ane_h16_session_ops {
 	 * hold a performance vote while any request is in flight.
 	 */
 	void (*busy)(void *ctx, bool busy);
+	/*
+	 * Optional. The engine is parked (off, no firmware) until a request needs
+	 * it: bring it up, or return an error if it can't come up now.
+	 */
+	int (*wake)(void *ctx);
+	/*
+	 * Optional. Called once when the session quarantines (a request hung
+	 * or the firmware answered something it cannot have meant), possibly
+	 * with the session lock held: the backend may cycle the engine off and
+	 * boot it again (ane_h16_session_restart(), then
+	 * ane_h16_session_recovered()). It must not take the session lock.
+	 */
+	void (*hung)(void *ctx, int error);
 };
 
 /*
@@ -301,6 +314,10 @@ struct ane_h16_session {
 	 * ane_h16_session_enter() and closes are deferred to the reopen.
 	 */
 	bool asleep;
+	/* Off until the next request, which calls ops->wake first. */
+	bool parked;
+	/* A system sleep is under way: a parked engine can't come up until it ends. */
+	bool wake_blocked;
 	struct list_head deferred;
 	/*
 	 * Firmware boot count: a cold restart across system sleep loses every
@@ -310,6 +327,12 @@ struct ane_h16_session {
 	u64 epoch;
 	/* Created programs not yet closed, in load order. */
 	struct list_head programs;
+	/*
+	 * Programs closed while quarantined: the old firmware may still read
+	 * their memory, so it is kept until a verified power cycle ends that
+	 * firmware (ane_h16_session_recovered()).
+	 */
+	struct list_head held;
 	wait_queue_head_t wake;
 	/* The accel node lock the sleep gate serializes on. */
 	struct mutex *lock;
@@ -354,6 +377,10 @@ struct ane_h16_session {
 int ane_h16_session_init(struct ane_h16_session *s, struct ane_fw_transport *transport,
 			 const struct ane_h16_session_ops *ops, void *ctx,
 			 u64 timeout_ns);
+int ane_h16_session_init_parked(struct ane_h16_session *s,
+				struct ane_fw_transport *transport,
+				const struct ane_h16_session_ops *ops, void *ctx,
+				u64 timeout_ns);
 int ane_h16_session_load(struct ane_h16_session *s,
 			 struct ane_h16_hwx_snapshot *snapshot,
 			 const void *const aux[ANE_H16_AUX_COUNT],
@@ -376,6 +403,7 @@ unsigned int ane_h16_session_dump_fwlog(struct ane_h16_session *s);
 void ane_h16_session_sleep(struct ane_h16_session *s, bool asleep);
 int ane_h16_session_gate_expire(struct ane_h16_session *s);
 void ane_h16_session_restart(struct ane_h16_session *s);
+void ane_h16_session_recovered(struct ane_h16_session *s);
 int ane_h16_session_replay(struct ane_h16_session *s, unsigned int *replayed,
 			   u64 *first_ns);
 bool ane_h16_program_lost(const struct ane_h16_session *s, const struct ane_h16_program *p);

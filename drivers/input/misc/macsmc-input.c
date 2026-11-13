@@ -17,6 +17,7 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/reboot.h>
+#include <linux/suspend.h>
 
 #define LID_WAKE_SETTLE_MS_J716S	2000
 
@@ -31,22 +32,26 @@ MODULE_PARM_DESC(lid_wake_settle_ms,
  * @smc: Pointer to apple_smc struct of the mfd parent
  * @input: Allocated input_dev; devres managed
  * @nb: Notifier block used for incoming events from SMC (e.g. button pressed down)
- * @lid_lock: Serialises lid reports with the system sleep callbacks
- * @lid_settle_ms: Window after system sleep starts in which a lid-open report is held back
- * @wakeup_mode: Set to true when system is suspended and power button events should wake it
- * @lid_held: A lid-open report was not passed on during this system sleep
- * @sleep_start: CLOCK_BOOTTIME at which this system sleep started
+ * @pm_nb: Notifier for the whole suspend window, including early aborts
+ * @lid_lock: Serialises lid reports, the notifier and device sleep callbacks
+ * @lid_settle_ms: Early lid-open confirmation window for affected boards
+ * @wakeup_mode: Power/lid events are wake events during system sleep
+ * @lid_held: A lid-open report was held until a full resume
+ * @sleep_start: CLOCK_BOOTTIME at the start of the current sleep attempt
+ * @dark: A dark wake must recheck the lid before sleeping again
  */
 struct macsmc_input {
 	struct device *dev;
 	struct apple_smc *smc;
 	struct input_dev *input;
 	struct notifier_block nb;
+	struct notifier_block pm_nb;
 	unsigned int lid_settle_ms;
-	struct mutex lid_lock; /* protects the three fields below */
+	struct mutex lid_lock; /* protects wakeup_mode, lid_held, sleep_start and dark */
 	bool wakeup_mode;
 	bool lid_held;
 	ktime_t sleep_start;
+	bool dark;
 };
 
 #define SMC_EV_BTN 0x7201
@@ -59,18 +64,19 @@ struct macsmc_input {
 
 static void macsmc_input_event_button(struct macsmc_input *smcin, unsigned long event)
 {
+	bool wakeup_mode = READ_ONCE(smcin->wakeup_mode);
 	u8 button = (event >> 8) & 0xff;
 	u8 state = !!(event & 0xff);
 
 	switch (button) {
 	case BTN_POWER:
 	case BTN_TOUCHID:
-		pm_wakeup_dev_event(smcin->dev, 0, (smcin->wakeup_mode && state));
+		pm_wakeup_dev_event(smcin->dev, 0, (wakeup_mode && state));
 		/*
 		 * Suppress KEY_POWER reports when suspended to avoid powering down
 		 * immediately after waking from s2idle.
 		 * */
-		if (smcin->wakeup_mode)
+		if (wakeup_mode)
 			return;
 
 		input_report_key(smcin->input, KEY_POWER, state);
@@ -151,6 +157,10 @@ static void macsmc_input_event_lid(struct macsmc_input *smcin, unsigned long eve
 	}
 
 	pm_wakeup_dev_event(smcin->dev, 0, (smcin->wakeup_mode && !lid_state));
+	/* Through a sleep, .complete reports where the lid ended up. */
+	if (smcin->wakeup_mode)
+		return;
+
 	input_report_switch(smcin->input, SW_LID, lid_state);
 	input_sync(smcin->input);
 }
@@ -171,6 +181,44 @@ static int macsmc_input_event(struct notifier_block *nb, unsigned long event, vo
 		/* SMC event meant for another driver */
 		return NOTIFY_DONE;
 	}
+}
+
+/*
+ * A suspend's first steps run before .prepare, and the SMC reports the lid and the button as
+ * plain events until its AP idle notice. Treat them as wakes from the suspend's start, so a lid
+ * opened or a button pressed while the machine goes down ends the suspend, as on macOS.
+ */
+static int macsmc_input_pm_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	struct macsmc_input *smcin = container_of(nb, struct macsmc_input, pm_nb);
+
+	guard(mutex)(&smcin->lid_lock);
+	if (action == PM_SUSPEND_PREPARE) {
+		smcin->sleep_start = ktime_get_boottime();
+		smcin->lid_held = false;
+		WRITE_ONCE(smcin->wakeup_mode, true);
+	} else if (action == PM_POST_SUSPEND) {
+		u8 val;
+
+		WRITE_ONCE(smcin->wakeup_mode, false);
+		smcin->dark = false;
+		smcin->lid_held = false;
+		/* A suspend that ended before .prepare held its lid events back too. */
+		if (apple_smc_key_exists(smcin->smc, SMC_KEY(MSLD)) &&
+		    apple_smc_read_u8(smcin->smc, SMC_KEY(MSLD), &val) >= 0) {
+			input_report_switch(smcin->input, SW_LID, val);
+			input_sync(smcin->input);
+		}
+	}
+
+	return NOTIFY_DONE;
+}
+
+static void macsmc_input_unregister_pm_notifier(void *data)
+{
+	struct macsmc_input *smcin = data;
+
+	unregister_pm_notifier(&smcin->pm_nb);
 }
 
 static void macsmc_input_unregister_notifier(void *data)
@@ -275,41 +323,64 @@ static int macsmc_input_probe(struct platform_device *pdev)
 	if (error)
 		return error;
 
-	return 0;
+	smcin->pm_nb.notifier_call = macsmc_input_pm_notify;
+	error = register_pm_notifier(&smcin->pm_nb);
+	if (error)
+		return error;
+
+	return devm_add_action_or_reset(&pdev->dev, macsmc_input_unregister_pm_notifier, smcin);
 }
 
 static int macsmc_input_pm_prepare(struct device *dev)
 {
 	struct macsmc_input *smcin = dev_get_drvdata(dev);
+	u8 val;
 
 	guard(mutex)(&smcin->lid_lock);
 	smcin->sleep_start = ktime_get_boottime();
 	smcin->lid_held = false;
-	smcin->wakeup_mode = true;
+	WRITE_ONCE(smcin->wakeup_mode, true);
+	/* A lid opened as the dark wake ended may have sent its event already. */
+	if (smcin->dark) {
+		smcin->dark = false;
+		if (apple_smc_key_exists(smcin->smc, SMC_KEY(MSLD)) &&
+		    apple_smc_read_u8(smcin->smc, SMC_KEY(MSLD), &val) >= 0 && !val) {
+			dev_info(dev, "the lid opened during a dark wake: not sleeping again\n");
+			return -EBUSY;
+		}
+	}
 	return 0;
 }
 
 static void macsmc_input_pm_complete(struct device *dev)
 {
 	struct macsmc_input *smcin = dev_get_drvdata(dev);
-	u8 closed;
+	u8 lid;
+	bool held;
 	int error;
 
 	guard(mutex)(&smcin->lid_lock);
-	smcin->wakeup_mode = false;
-	if (!smcin->lid_held)
-		return;
-	smcin->lid_held = false;
-
-	/* An open report was held back: report what the SMC says now. */
-	error = apple_smc_read_u8(smcin->smc, SMC_KEY(MSLD), &closed);
-	if (error < 0) {
-		dev_warn(dev, "Failed to read the lid state after sleep: %d\n", error);
+	/* Keep the wake window and held lid event through an automatic dark re-sleep. */
+	if (pm_dark_wake()) {
+		smcin->dark = apple_smc_read_u8(smcin->smc, SMC_KEY(MSLD), &lid) < 0 || lid;
 		return;
 	}
-	dev_info(dev, "lid after sleep: MSLD=%u\n", closed);
-	input_report_switch(smcin->input, SW_LID, !!closed);
-	input_sync(smcin->input);
+	WRITE_ONCE(smcin->wakeup_mode, false);
+	held = smcin->lid_held;
+	smcin->lid_held = false;
+
+	/* Full resume reports the actual state, including an open held for confirmation. */
+	if (apple_smc_key_exists(smcin->smc, SMC_KEY(MSLD))) {
+		error = apple_smc_read_u8(smcin->smc, SMC_KEY(MSLD), &lid);
+		if (error < 0) {
+			dev_warn(dev, "Failed to read the lid state after sleep: %d\n", error);
+			return;
+		}
+		if (held)
+			dev_info(dev, "lid after sleep: MSLD=%u\n", lid);
+		input_report_switch(smcin->input, SW_LID, !!lid);
+		input_sync(smcin->input);
+	}
 }
 
 static const struct dev_pm_ops macsmc_input_pm_ops = {

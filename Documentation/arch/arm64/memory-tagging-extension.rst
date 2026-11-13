@@ -94,9 +94,16 @@ mode is specified, the program will run in that mode. If multiple
 modes are specified, the mode is selected as described in the "Per-CPU
 preferred tag checking modes" section below.
 
+Some CPUs do not implement asynchronous tag check faults
+(``ID_AA64PFR1_EL1.MTE_frac`` is ``0b1111``), so the asynchronous and
+asymmetric modes would never report a fault. On those, a request for
+``PR_MTE_TCF_ASYNC`` alone fails with ``-EINVAL``, and
+``PR_MTE_TCF_SYNC | PR_MTE_TCF_ASYNC`` selects synchronous mode.
+
 The current tag check fault configuration can be read using the
 ``prctl(PR_GET_TAGGED_ADDR_CTRL, 0, 0, 0, 0)`` system call. If
-multiple modes were requested then all will be reported.
+multiple modes were requested then all will be reported, except
+asynchronous mode on CPUs without asynchronous tag check faults.
 
 Tag checking can also be disabled for a user thread by setting the
 ``PSTATE.TCO`` bit with ``MSR TCO, #1``.
@@ -144,7 +151,9 @@ tag checking mode as the CPU's preferred tag checking mode.
 The preferred tag checking mode for each CPU is controlled by
 ``/sys/devices/system/cpu/cpu<N>/mte_tcf_preferred``, to which a
 privileged user may write the value ``async``, ``sync`` or ``asymm``.  The
-default preferred mode for each CPU is ``async``.
+default preferred mode for each CPU is ``async``. On CPUs without
+asynchronous tag check faults the default is ``sync``, and ``async`` and
+``asymm`` cannot be written.
 
 To allow a program to potentially run in the CPU's preferred tag
 checking mode, the user program may set multiple tag check fault mode

@@ -79,13 +79,15 @@ properties:
       - description: DART registers
       - description:
           Address filter (DAPF) registers, which restrict the physical
-          addresses the DART lets its masters reach
+          addresses the DART lets its masters reach, or the slice of the
+          fabric filter (GAPF) that protects the power state of the
+          coprocessor CPU behind this DART, cleared to power that CPU down
 
   reg-names:
     minItems: 1
     items:
       - const: dart
-      - enum: [dapf, auxiliary]
+      - enum: [dapf, gapf, auxiliary]
 
   interrupts:
     maxItems: 1
@@ -117,6 +119,64 @@ properties:
       may select a firmware-visible alias of the translation aperture.
       A consumer may further specify its own aperture in its binding.
 
+  apple,dapf-ranges:
+    $ref: /schemas/types.yaml#/definitions/uint64-matrix
+    items:
+      items:
+        - description: First address of a range
+        - description: Last address of a range
+    description:
+      The address filter the loader programs into the dapf registers, one
+      entry per range. A sleep that reaches the hardware clears it, and the
+      DART writes it back before its consumer's firmware starts again.
+
+  apple,dapf-r20:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      The last word of each filter entry, one per range in apple,dapf-ranges.
+      1 where absent.
+
+  apple,restore-on-power-up:
+    type: boolean
+    description:
+      Reset and restore the DART, and write its address filter back, every
+      time it powers up, even where its registers still read as they were
+      left. For a DART that keeps its values through a sleep in which the
+      SoC's sleep engine runs its consumer, but whose address filter only
+      takes effect once written again.
+
+  apple,sleep-prepare:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: Register offset
+        - description: Value
+    description:
+      Register writes before a consumer that gates itself is told about a
+      firmware-driven system suspend, after the DART's state is saved. Streams
+      they stop are started again at the restore. Needs apple,sleep-restore.
+
+  apple,sleep-restore:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: Register offset
+        - description: Value
+    description:
+      Register writes after such a suspend, before the translations are put
+      back. With this, the consumer saves and restores the DART around the
+      suspend, as the order relative to its firmware's start matters.
+
+  apple,sleep-restore-late:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: Register offset
+        - description: Value
+    description:
+      Register writes after the translations are back and before the streams
+      are enabled.
+
   apple,dma-offset:
     $ref: /schemas/types.yaml#/definitions/uint64
     description: >
@@ -144,7 +204,9 @@ properties:
       power domain of this DART. Its consumer may power that domain down: the
       DART's streams are then disabled and flushed, and the slice disabled,
       before the domain powers off, and the slice is enabled again when it
-      powers up. Only the J713 internal display DARTs use it.
+      powers up. On the J713 the internal display DARTs use it for their DCP's
+      power-down, and the ACIO, tunneled PCIe and external display DARTs for a
+      deep sleep, in which their hosts save and restore them.
 
   apple,manual-availability:
     type: boolean
@@ -167,6 +229,18 @@ properties:
       List of (register offset, mask, value) tuples copied from Apple's Device
       Tree by the bootloader and required to initialize dynamically powered
       DART instances.
+
+  apple,resume-tunable:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: Register offset
+        - description: Mask to be applied to the register value
+        - description: Bits to be set after applying the mask
+    description: >
+      The same tuples for a DART whose bootloader has already applied them,
+      written back where a power-off lost them, before its consumer's
+      firmware starts again.
 
   apple,bypass-sids:
     $ref: /schemas/types.yaml#/definitions/uint32-array

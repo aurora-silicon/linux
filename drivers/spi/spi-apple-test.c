@@ -177,8 +177,32 @@ static void apple_spi_test_irq_after_timeout(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, reg_read(spi, APPLE_SPI_IE_XFER), 0);
 }
 
+/* The TX-only fallback masks the interrupt and leaves refill to the thread. */
+static void apple_spi_test_irq_wakes_tx_thread(struct kunit *test)
+{
+	struct apple_spi *spi = apple_spi_test_init(test);
+	u8 buf[32] = {};
+
+	spi->active = true;
+	spi->threaded_tx = true;
+	spi->tx_ptr = buf;
+	spi->remaining_tx = sizeof(buf);
+	spi->xfer_flags = APPLE_SPI_XFER_TXCOMPLETE;
+	apple_spi_test_fifo_level(spi, 8, 0);
+	reg_write(spi, APPLE_SPI_IE_FIFO, APPLE_SPI_FIFO_TXTHRESH);
+	reg_write(spi, APPLE_SPI_IF_FIFO, APPLE_SPI_FIFO_TXTHRESH);
+	reg_write(spi, APPLE_SPI_IE_XFER, APPLE_SPI_XFER_TXCOMPLETE);
+
+	KUNIT_EXPECT_EQ(test, apple_spi_irq(0, spi), IRQ_HANDLED);
+	KUNIT_EXPECT_EQ(test, spi->remaining_tx, sizeof(buf));
+	KUNIT_EXPECT_TRUE(test, completion_done(&spi->done));
+	KUNIT_EXPECT_EQ(test, reg_read(spi, APPLE_SPI_IE_FIFO), 0);
+	KUNIT_EXPECT_EQ(test, reg_read(spi, APPLE_SPI_IE_XFER), 0);
+}
+
 static struct kunit_case apple_spi_test_cases[] = {
 	KUNIT_CASE(apple_spi_test_irq_refills_tx),
+	KUNIT_CASE(apple_spi_test_irq_wakes_tx_thread),
 	KUNIT_CASE(apple_spi_test_irq_drains_rx),
 	KUNIT_CASE(apple_spi_test_irq_waits_for_both_halves),
 	KUNIT_CASE(apple_spi_test_irq_completes_transfer),

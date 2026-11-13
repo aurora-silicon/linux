@@ -90,8 +90,21 @@ config APPLE_ADMAC
 	depends on ARCH_APPLE || COMPILE_TEST
 	select DMA_ENGINE
 	select DMA_VIRTUAL_CHANNELS
+	select APPLE_TUNABLE
 	help
 	  Enable support for Audio DMA Controller found on Apple Silicon SoCs.
+
+config APPLE_PIODMA
+	tristate "Apple PCIe PIODMA support"
+	depends on ARCH_APPLE || COMPILE_TEST
+	default m if ARCH_APPLE
+	select DMA_ENGINE
+	select DMA_VIRTUAL_CHANNELS
+	help
+	  Enable the auxiliary PIODMA engines attached to Apple PCIe
+	  controllers. Each engine provides one memory-to-memory DMA channel
+	  through the DMA engine API. The provider uses the PIODMA-specific
+	  DART stream described by the device tree.
 
 config APPLE_SIO
 	tristate "Apple SIO support"

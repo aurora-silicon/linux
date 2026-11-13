@@ -87,6 +87,9 @@ struct brcmf_bus_dcmd {
  * @get_memdump: obtain device memory dump in provided buffer.
  * @get_blob: obtain a firmware blob.
  * @remove: initiate unbind of the device.
+ * @ctl_stall: a control request got no response or could not be queued;
+ *	@stalls counts such requests since the last one that completed
+ *	(optional).
  *
  * This structure provides an abstract interface towards the
  * bus specific driver. For control messages to common driver
@@ -109,6 +112,7 @@ struct brcmf_bus_ops {
 	int (*reset)(struct device *dev);
 	void (*remove)(struct device *dev);
 	void (*d2h_mb_rx)(struct device *dev, u32 data);
+	void (*ctl_stall)(struct device *dev, u32 stalls);
 };
 
 
@@ -159,7 +163,8 @@ struct brcmf_bus_stats {
  * @chiprev: revision of the dongle chip.
  * @fwvid: firmware vendor-support identifier of the device.
  * @always_use_fws_queue: bus wants use queue also when fwsignal is inactive.
- * @wowl_supported: is wowl supported by bus driver.
+ * @wowl_transport: bus can keep the firmware running during system sleep.
+ * @wowl_wake: platform can route a wake signal from the device.
  * @ops: callbacks for this bus instance.
  * @msgbuf: msgbuf protocol parameters provided by bus layer.
  * @list: member used to add this bus instance to linked list.
@@ -180,7 +185,8 @@ struct brcmf_bus {
 	u32 chiprev;
 	enum brcmf_fwvendor fwvid;
 	bool always_use_fws_queue;
-	bool wowl_supported;
+	bool wowl_transport;
+	bool wowl_wake;
 	bool removing;		/* device removal in progress; quiesce async work */
 	struct mutex bus_reset_lock;
 
@@ -300,6 +306,15 @@ void brcmf_bus_d2h_mb_rx(struct brcmf_bus *bus, u32 data)
 		return;
 
 	return bus->ops->d2h_mb_rx(bus->dev, data);
+}
+
+static inline
+void brcmf_bus_ctl_stall(struct brcmf_bus *bus, u32 stalls)
+{
+	if (!bus->ops->ctl_stall)
+		return;
+
+	bus->ops->ctl_stall(bus->dev, stalls);
 }
 
 /*

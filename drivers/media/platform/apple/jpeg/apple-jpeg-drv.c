@@ -30,6 +30,7 @@
 #include <media/v4l2-mem2mem.h>
 #include <media/videobuf2-dma-contig.h>
 
+#include "../apple-video-nr.h"
 #include "apple-jpeg-hw.h"
 
 #define AJ_NAME			"apple-jpeg"
@@ -42,6 +43,7 @@ struct apple_jpeg {
 	void __iomem *regs;
 	const struct apple_jpeg_variant *variant;
 	struct dev_pm_domain_list *pd_list;
+	u32 stream;		/* DART stream: picks the DMA identifiers */
 	struct mutex lock;	/* serialises ioctls and queue state */
 	struct v4l2_device v4l2_dev;
 	struct video_device vdev;
@@ -120,6 +122,12 @@ static int aj_reset(struct apple_jpeg *jpeg)
 		return ret;
 	aj_write(jpeg, AJ_RST_INTERVAL, 0);
 	aj_write(jpeg, AJ_MODE, AJ_MODE_IDLE);
+	n = apple_jpeg_dma_ids(jpeg->variant->layout, jpeg->stream, jpeg->writes,
+			       ARRAY_SIZE(jpeg->writes));
+	if (n < 0)
+		return n;
+	for (int i = 0; i < n; i++)
+		aj_write(jpeg, jpeg->writes[i].offset, jpeg->writes[i].value);
 	return 0;
 }
 
@@ -291,9 +299,10 @@ static const struct v4l2_m2m_ops aj_m2m_ops = {
 /* ---- formats ---------------------------------------------------------- */
 
 /* Raw input: Y rows then interleaved CbCr rows in one buffer, full range. */
-static void aj_fill_raw(struct v4l2_pix_format_mplane *pix)
+static void aj_fill_raw(const struct apple_jpeg *jpeg, struct v4l2_pix_format_mplane *pix)
 {
-	bool is422 = pix->pixelformat == V4L2_PIX_FMT_NV16;
+	bool is422 = pix->pixelformat == V4L2_PIX_FMT_NV16 &&
+		     apple_jpeg_has_422(jpeg->variant->layout);
 	u32 w = clamp_t(u32, ALIGN(pix->width, 2), AJ_MIN_SIZE, AJ_MAX_SIZE);
 	u32 h = clamp_t(u32, pix->height, AJ_MIN_SIZE, AJ_MAX_SIZE);
 	struct apple_jpeg_layout layout;
@@ -342,8 +351,9 @@ static int aj_querycap(struct file *file, void *priv, struct v4l2_capability *ca
 static int aj_enum_fmt_out(struct file *file, void *priv, struct v4l2_fmtdesc *f)
 {
 	static const u32 fmts[] = { V4L2_PIX_FMT_NV12, V4L2_PIX_FMT_NV16 };
+	const struct apple_jpeg *jpeg = aj_file_to_ctx(file)->jpeg;
 
-	if (f->index >= ARRAY_SIZE(fmts))
+	if (f->index >= (apple_jpeg_has_422(jpeg->variant->layout) ? ARRAY_SIZE(fmts) : 1))
 		return -EINVAL;
 	f->pixelformat = fmts[f->index];
 	return 0;
@@ -360,9 +370,12 @@ static int aj_enum_fmt_cap(struct file *file, void *priv, struct v4l2_fmtdesc *f
 
 static int aj_enum_framesizes(struct file *file, void *priv, struct v4l2_frmsizeenum *fs)
 {
+	const struct apple_jpeg *jpeg = aj_file_to_ctx(file)->jpeg;
+	bool nv16 = apple_jpeg_has_422(jpeg->variant->layout);
+
 	if (fs->index || (fs->pixel_format != V4L2_PIX_FMT_JPEG &&
 			  fs->pixel_format != V4L2_PIX_FMT_NV12 &&
-			  fs->pixel_format != V4L2_PIX_FMT_NV16))
+			  (fs->pixel_format != V4L2_PIX_FMT_NV16 || !nv16)))
 		return -EINVAL;
 	fs->type = V4L2_FRMSIZE_TYPE_STEPWISE;
 	fs->stepwise = (struct v4l2_frmsize_stepwise){
@@ -385,7 +398,7 @@ static int aj_g_fmt_cap(struct file *file, void *priv, struct v4l2_format *f)
 
 static int aj_try_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
 {
-	aj_fill_raw(&f->fmt.pix_mp);
+	aj_fill_raw(aj_file_to_ctx(file)->jpeg, &f->fmt.pix_mp);
 	return 0;
 }
 
@@ -403,7 +416,7 @@ static int aj_s_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
 	if (vb2_is_busy(v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx)) ||
 	    vb2_is_busy(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx)))
 		return -EBUSY;
-	aj_fill_raw(&f->fmt.pix_mp);
+	aj_fill_raw(ctx->jpeg, &f->fmt.pix_mp);
 	ctx->src = f->fmt.pix_mp;
 	aj_fill_coded(&ctx->dst, &ctx->src, ctx->dst_keep);
 	return 0;
@@ -633,7 +646,7 @@ static int aj_open(struct file *file)
 	ctx->src.width = 1920;
 	ctx->src.height = 1080;
 	ctx->src.pixelformat = V4L2_PIX_FMT_NV12;
-	aj_fill_raw(&ctx->src);
+	aj_fill_raw(jpeg, &ctx->src);
 	aj_fill_coded(&ctx->dst, &ctx->src, 0);
 	v4l2_fh_init(&ctx->fh, video_devdata(file));
 
@@ -777,6 +790,18 @@ static int aj_probe(struct platform_device *pdev)
 
 	if (!device_iommu_mapped(dev))
 		return dev_err_probe(dev, -ENODEV, "no IOMMU\n");
+	if (jpeg->variant->layout->num_dma_ids) {
+		struct of_phandle_args args;
+
+		ret = of_parse_phandle_with_args(dev->of_node, "iommus", "#iommu-cells", 0,
+						 &args);
+		if (ret)
+			return ret;
+		of_node_put(args.np);
+		if (args.args_count != 1)
+			return -EINVAL;
+		jpeg->stream = args.args[0];
+	}
 	/*
 	 * A second power domain, "perf", is the SoC performance request the
 	 * engine needs for full speed; attach both with runtime PM links so it
@@ -844,7 +869,7 @@ static int aj_probe(struct platform_device *pdev)
 	vdev->vfl_dir = VFL_DIR_M2M;
 	vdev->device_caps = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING;
 	video_set_drvdata(vdev, jpeg);
-	return video_register_device(vdev, VFL_TYPE_VIDEO, -1);
+	return video_register_device(vdev, VFL_TYPE_VIDEO, APPLE_M2M_VIDEO_NR);
 }
 
 static void aj_remove(struct platform_device *pdev)
@@ -857,7 +882,13 @@ static void aj_remove(struct platform_device *pdev)
 static const struct of_device_id aj_of_match[] = {
 	{ .compatible = "apple,t6000-jpeg", .data = &apple_jpeg_t6000 },
 	{ .compatible = "apple,t8112-jpeg", .data = &apple_jpeg_t8112 },
+	{ .compatible = "apple,t8122-jpeg", .data = &apple_jpeg_t8122 },
+	{ .compatible = "apple,t6030-jpeg", .data = &apple_jpeg_t8122 },
+	{ .compatible = "apple,t6031-jpeg", .data = &apple_jpeg_t8122 },
+	{ .compatible = "apple,t6032-jpeg", .data = &apple_jpeg_t8122 },
 	{ .compatible = "apple,t6041-jpeg", .data = &apple_jpeg_t6041 },
+	{ .compatible = "apple,t8132-jpeg", .data = &apple_jpeg_t6041 },
+	{ .compatible = "apple,t6050-jpeg", .data = &apple_jpeg_t6050 },
 	{ .compatible = "apple,t8140-jpeg", .data = &apple_jpeg_t8140 },
 	{ }
 };

@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 #include <linux/device.h>
 #include <linux/export.h>
+#include <linux/io.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
+#include <linux/pm.h>
 #include <linux/soc/apple/pmp.h>
+#include <linux/soc/apple/pmp-display.h>
 #include <linux/soc/apple/pmp-report.h>
+#include <linux/soc/apple/rtkit.h>
+#include <linux/soc/apple/sleep.h>
+#include <linux/suspend.h>
 
 /* Join removal and serialize the firmware's untagged power reply stream. */
 static DEFINE_MUTEX(pmp_lock);
 static const void *pmp_data;
 static struct device *pmp_device;
+/* The firmware is stopped for a system sleep. */
+static bool pmp_asleep;
 
 int apple_pmp_register(struct device *dev, const void *data)
 {
@@ -66,6 +75,8 @@ int apple_pmp_set_device_power(u8 command, u16 device_id, u32 enabled)
 	guard(mutex)(&pmp_lock);
 	if (!pmp_data)
 		return -ENODEV;
+	if (pmp_asleep)
+		return -EAGAIN;
 	/* The matched native report must be ready; never use an elapsed-time fallback. */
 	ret = apple_pmp_report_wait_supplier_ready(pmp_device, 5000);
 	if (ret)
@@ -104,9 +115,150 @@ int apple_pmp_t6030_gpu_ready(void)
 	guard(mutex)(&pmp_lock);
 	if (!pmp_data)
 		return -ENODEV;
+	if (pmp_asleep)
+		return -EAGAIN;
 	ret = apple_pmp_report_set_t6030_gfx(pmp_device, false);
 	if (ret)
 		return ret;
 	return apple_pmp_report_set_t6030_gfx(pmp_device, true);
 }
 EXPORT_SYMBOL_GPL(apple_pmp_t6030_gpu_ready);
+
+/*
+ * The PMP's idle is a point of no return: an idled PMP doesn't come back with its power kept,
+ * and only a real sleep restarts it. Where the sleep driver can take them, its idle
+ * and stop move to the sleep's last step, after every refusal: a refused sleep then finds it
+ * still running, and the GPU's request, withdrawn at the commit, reaches a running PMP.
+ */
+static struct apple_pmp_commit_stop pmp_commit;
+static bool pmp_commit_registered, pmp_commit_used;
+
+/* Interrupts off, one CPU: what apple_pmp_sleep() does, through pointers taken before. */
+static int apple_pmp_commit_stop_fn(void *unused)
+{
+	struct apple_pmp_commit_stop *c = &pmp_commit;
+	unsigned int us;
+	size_t i;
+	int ret;
+
+	ret = apple_rtkit_sleep_idle_polled(c->rtk, c->control, &us);
+	apple_rtkit_mailbox_recv_off(c->rtk);
+	for (i = 0; c->sram && i < c->count; i++)
+		c->words[i] = readl_relaxed(c->sram + 4 * i);
+	/* Told to idle, it can't carry on whatever it answered: the sleep goes on. */
+	return ret ? 1 : 0;
+}
+
+/*
+ * Retained J713 power votes have no teardown. On T8140 an unbind leaves the firmware running,
+ * and a commit with it running reset the SoC: its sleep registration is what refuses
+ * then, every sleep until reboot, since a rebind can't register again.
+ */
+bool apple_pmp_keep_bound(void)
+{
+	return apple_pmp_display_retained_board() || of_machine_is_compatible("apple,t8140");
+}
+
+/* Whether the sleep's last step takes the PMP: registered with the sleep driver, once. */
+static bool apple_pmp_commit_available(struct device *dev)
+{
+	void __iomem *asc;
+	int idx;
+
+	if (pmp_commit_registered)
+		return true;
+	idx = of_property_match_string(dev->of_node, "reg-names", "asc");
+	asc = idx >= 0 ? of_iomap(dev->of_node, idx) : NULL;
+	if (!asc)
+		return false;
+	if (apple_sleep_coproc_register(dev, asc, false, apple_pmp_commit_stop_fn, NULL)) {
+		iounmap(asc);
+		return false;
+	}
+	pmp_commit_registered = true;
+
+	return true;
+}
+
+static int apple_pmp_commit_prepare(struct device *dev)
+{
+	int ret;
+
+	ret = apple_pmp_sleep_prepare(pmp_data, &pmp_commit);
+	if (ret)
+		return ret;
+	apple_sleep_coproc_set_ready(dev, true);
+	pmp_commit_used = true;
+	dev_dbg(dev, "idle and stop left for the sleep's commit\n");
+
+	return 0;
+}
+
+static int apple_pmp_suspend_late(struct device *dev)
+{
+	bool at_commit;
+	int ret;
+
+	if (!pm_suspend_via_firmware())
+		return 0;
+
+	guard(mutex)(&pmp_lock);
+	if (pmp_device != dev || pmp_asleep)
+		return 0;
+	at_commit = apple_pmp_commit_available(dev);
+	/* Idled any earlier, a refusal after it would leave it stopped. */
+	if (!at_commit && apple_sleep_commit_stops_coprocs()) {
+		dev_err(dev, "no stop at the sleep's commit: refusing the sleep\n");
+		return -EBUSY;
+	}
+	apple_pmp_report_sleep(dev, at_commit);
+	ret = at_commit ? apple_pmp_commit_prepare(dev) : apple_pmp_sleep(pmp_data);
+	if (ret) {
+		apple_pmp_report_wake(dev, false);
+		return dev_err_probe(dev, ret, "firmware did not go idle for sleep\n");
+	}
+	pmp_asleep = true;
+
+	return 0;
+}
+
+static int apple_pmp_resume_early(struct device *dev)
+{
+	int ret;
+
+	guard(mutex)(&pmp_lock);
+	if (!pmp_asleep)
+		return 0;
+	/* Left for the commit: if the sleep was refused before it, the firmware never idled. */
+	if (pmp_commit_used) {
+		bool stopped = apple_sleep_coproc_stopped(dev);
+
+		pmp_commit_used = false;
+		apple_sleep_coproc_set_ready(dev, false);
+		if (!pm_resume_via_firmware() && !stopped) {
+			pmp_asleep = false;
+			apple_pmp_report_wake(dev, true);
+			dev_info(dev, "sleep refused before the commit: firmware never stopped\n");
+			return 0;
+		}
+	}
+	/* A stopped firmware doesn't restart with its power kept: the next real sleep does. */
+	if (!pm_resume_via_firmware()) {
+		dev_warn(dev, "sleep refused: firmware stays stopped until a real sleep\n");
+		return 0;
+	}
+	pmp_asleep = false;
+	ret = apple_pmp_wake(pmp_data);
+	if (ret)
+		dev_err(dev, "firmware did not come back from sleep: %d\n", ret);
+	else
+		dev_dbg(dev, "firmware back from sleep\n");
+	/* Requests go back either way: consumers read them from the report too. */
+	apple_pmp_report_wake(dev, true);
+
+	return 0;
+}
+
+const struct dev_pm_ops apple_pmp_pm_ops = {
+	LATE_SYSTEM_SLEEP_PM_OPS(apple_pmp_suspend_late, apple_pmp_resume_early)
+};

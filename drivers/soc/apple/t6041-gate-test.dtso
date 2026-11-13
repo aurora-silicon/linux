@@ -2,7 +2,8 @@
 /*
  * Test device tree for the display gate KUnit test: the J616c's external
  * display chains at their real paths (t604x-extdisp.dtsi,
- * t6041-j616c-hdmi.dtsi, t6041-j616c-usbc.dtsi), disabled, and the display
+ * t6041-j616c-hdmi.dtsi, t6041-j616c-usbc.dtsi, t6041-j616c-usbc-dcpext2.dtsi),
+ * disabled, and the display
  * subsystem with the internal display's DART. There is no PMP. The data and
  * heap regions of both processors are the boot loader's disabled
  * placeholders, the text region the one it adds.
@@ -45,6 +46,20 @@
 				};
 
 				dcpext1_heap: dcpext1-heap {
+					compatible = "apple,asc-mem";
+					status = "disabled";
+				};
+
+				dcpext2_text: dcpext2-text {
+					compatible = "apple,asc-mem";
+				};
+
+				dcpext2_data: dcpext2-data {
+					compatible = "apple,asc-mem";
+					status = "disabled";
+				};
+
+				dcpext2_heap: dcpext2-heap {
 					compatible = "apple,asc-mem";
 					status = "disabled";
 				};
@@ -116,10 +131,18 @@
 			};
 
 			mailbox@38b148000 {
+				status = "okay";
+			};
+
+			mux@38324c000 {
 				status = "disabled";
 			};
 
 			mux@38b24c000 {
+				status = "disabled";
+			};
+
+			mux@39324c000 {
 				status = "disabled";
 			};
 
@@ -144,13 +167,60 @@
 				status = "disabled";
 
 				typec-routes {
+					route@0 {
+						status = "disabled";
+					};
+
 					route@1 {
+						status = "disabled";
+					};
+
+					route@2 {
 						status = "disabled";
 					};
 				};
 
 				piodma {
 					iommus = <&dispext1_dart 16>;
+				};
+			};
+
+			dcpext2_dart: iommu@606340000 {
+				#iommu-cells = <1>;
+				status = "disabled";
+			};
+
+			dispext2_dart: iommu@606300000 {
+				#iommu-cells = <1>;
+				status = "disabled";
+			};
+
+			mailbox@606e08000 {
+				status = "disabled";
+			};
+
+			dcp@606e00000 {
+				compatible = "apple,t6041-dcpext";
+				iommus = <&dcpext2_dart 23>;
+				memory-region = <&dcpext2_data>, <&dcpext2_heap>, <&dcpext2_text>;
+				status = "disabled";
+
+				typec-routes {
+					route@0 {
+						status = "disabled";
+					};
+
+					route@1 {
+						status = "disabled";
+					};
+
+					route@2 {
+						status = "disabled";
+					};
+				};
+
+				piodma {
+					iommus = <&dispext2_dart 16>;
 				};
 			};
 

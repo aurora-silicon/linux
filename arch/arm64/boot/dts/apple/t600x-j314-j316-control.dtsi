@@ -29,16 +29,19 @@
 			temperature-sensor@70 {
 				compatible = "ti,tmp103";
 				reg = <0x70>;
+				read-only;
 				status = "disabled";
 			};
 			temperature-sensor@71 {
 				compatible = "ti,tmp103";
 				reg = <0x71>;
+				read-only;
 				status = "disabled";
 			};
 			temperature-sensor@72 {
 				compatible = "ti,tmp103";
 				reg = <0x72>;
+				read-only;
 				status = "disabled";
 			};
 		};

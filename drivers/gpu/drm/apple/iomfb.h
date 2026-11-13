@@ -196,6 +196,7 @@ enum dcpep_method {
 	dcpep_pipe_query_478,
 	dcpep_pipe_query_474,
 	dcpep_pipe_set_476,
+	dcpep_unnamed_500,
 	iomfbep_set_brightness_correction,
 	dcpep_num_methods
 };
@@ -212,10 +213,17 @@ struct dcp_method_entry {
 	char tag_h17g[4];
 };
 
+/* The IOMFB method table of a firmware 27.x build, by its compat string; NULL if unknown. */
+const struct dcp_method_entry *iomfb_v27_methods(const char *compat);
+/* The first method of a firmware 27.x table that has no ID, NULL if none. */
+const char *iomfb_v27_missing_method(const struct dcp_method_entry *methods,
+				     unsigned int *count);
+
 #define IOMFB_MAX_CB (1000)
 
 bool iomfb_validate_callback_h17p(int tag, u32 in_len, u32 out_len);
 struct apple_dcp;
+bool iomfb_channels_idle(struct apple_dcp *dcp);
 bool iomfb_check_callback_h17p(struct apple_dcp *dcp, int tag, u32 in_len,
 			       u32 out_len);
 /* Desktop 26.6: does the record hold what the tag's handler reads and writes? */
@@ -350,6 +358,12 @@ struct iomfb_property {
 	u32 id;
 	u32 value;
 } __packed;
+
+/*
+ * The two IOMFB parameters macOS sends to an external display after each mode
+ * set (see dcp_external_hdr_hints()).  Split out so it can be unit tested.
+ */
+void iomfb_external_hdr_hint_values(bool pq, struct iomfb_property out[2]);
 
 struct iomfb_get_color_remap_mode_req {
 	u32 mode;

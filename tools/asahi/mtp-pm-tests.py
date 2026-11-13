@@ -46,12 +46,18 @@ static bool cancel_delayed_work_sync(struct delayed_work *w) { bool p = w->pendi
 static bool schedule_delayed_work(struct delayed_work *w, unsigned long d) { w->queued++; w->pending = true; return true; }
 struct hid_device { struct magicmouse_sc *data; int id; };
 struct dchid_iface { struct hid_device *hid; };
-struct dockchannel_hid { struct dchid_iface *ifaces[MAX_INTERFACES]; bool suspended; };
+struct dockchannel_hid { struct dchid_iface *ifaces[MAX_INTERFACES]; bool suspended, host_asleep; };
 struct device { struct dockchannel_hid *data; };
 static struct dockchannel_hid *transport;
 static unsigned suspends[16], resumes[16], key_releases;
 static int suspend_error_at = -1, resume_error_at = -1;
 static void *dev_get_drvdata(struct device *d) { return d->data; }
+#define HOST_STATE_SLEEP 1
+#define HOST_STATE_AWAKE 2
+#define dev_warn(...) ((void)0)
+/* Not a firmware-driven suspend: the host state is never set here. */
+static bool pm_suspend_via_firmware(void) { return false; }
+static int dchid_host_state(struct dockchannel_hid *d, int state) { (void)d; (void)state; assert(0); return 0; }
 static void *hid_get_drvdata(struct hid_device *d) { return d->data; }
 static void magicmouse_force_key(struct magicmouse_sc *m, bool down) {
     assert(!down); key_releases++;

@@ -24,6 +24,9 @@ properties:
           - apple,agx-t8132
           - apple,agx-t8140
       - items:
+          - const: apple,agx-g17c
+          - const: apple,agx-g17s
+      - items:
           - const: apple,agx-t8103
           - const: apple,agx-g13g
       - items:
@@ -54,8 +57,8 @@ properties:
   interrupts:
     maxItems: 8
     description:
-      The GPU block's interrupt outputs, as the ADT lists them. Only
-      described on T6050, whose GPU is not driven from Linux yet.
+      Interrupt outputs of the raw T6050 GPU block. The coprocessor-driven
+      GPU uses its mailbox interrupts instead.
 
   dma-noncoherent: true
 
@@ -98,6 +101,13 @@ properties:
       GFX supplier power cannot represent GPU work on firmware that keeps
       its coprocessor domain powered while the cores are idle.
 
+  apple,pmp-report-entry:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: |
+      PMP report entry that tells the PMP the GPU is in use. The driver withdraws
+      this request before it lowers the GPU's power state for a system sleep, and
+      makes it again after raising it.
+
   apple,idle-off-delay-ms:
     minimum: 2
     maximum: 1000
@@ -112,6 +122,21 @@ properties:
     description: PMP firmware provider owning the GPU power vote and telemetry
 
   operating-points-v2: true
+
+  apple,csafr-min-sram-microvolt:
+    maxItems: 1
+    description: Loader-filled SRAM voltage floor for the CS and AFR domains.
+
+  apple,aon-ptd:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    oneOf:
+      - minItems: 9
+        maxItems: 9
+      - minItems: 18
+        maxItems: 18
+    description:
+      Loader-filled power telemetry records, three per die. Each record is
+      an identifier followed by two configuration words.
 
   apple,firmware-version:
     $ref: /schemas/types.yaml#/definitions/uint32-array
@@ -269,6 +294,7 @@ allOf:
         compatible:
           contains:
             const: apple,agx-t6050
+          maxItems: 1
     then:
       description:
         The T6050 GPU block, described from the ADT /arm-io/sgx node. Its
@@ -293,6 +319,48 @@ allOf:
       required:
         - mboxes
         - memory-region
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,agx-g17s
+    then:
+      properties:
+        reg:
+          items:
+            - description: GFX coprocessor control registers
+            - description: GPU block MMIO registers
+        reg-names:
+          items:
+            - const: asc
+            - const: sgx
+        mboxes:
+          items:
+            - description: GFX coprocessor mailbox
+            - description: GFX1 coprocessor mailbox
+        memory-region:
+          minItems: 6
+        memory-region-names:
+          items:
+            - const: ttbs
+            - const: pagetables
+            - const: handoff
+            - const: fw-data
+            - const: l2-pagetables
+            - const: fw-text
+      required:
+        - reg-names
+        - power-domains
+        - memory-region-names
+        - operating-points-v2
+        - apple,cs-opp
+        - apple,afr-opp
+        - apple,csafr-min-sram-microvolt
+        - apple,aon-ptd
+    else:
+      properties:
+        apple,csafr-min-sram-microvolt: false
+        apple,aon-ptd: false
   - if:
       properties:
         compatible:
@@ -348,17 +416,23 @@ allOf:
             - description: GFX coprocessor mailbox
             - description: GFX1 coprocessor mailbox
         memory-region:
+          minItems: 3
           items:
             - description: Region containing GPU MMU TTBs
             - description: Region containing GPU MMU page tables
             - description:
                 Region containing a shared handoff structure for VM
                 management coordination
+            - description:
+                Data segments of both GPU firmware roles, where each keeps
+                its crash log
         memory-region-names:
+          minItems: 3
           items:
             - const: ttbs
             - const: pagetables
             - const: handoff
+            - const: fw-data
       required:
         - power-domains
         - operating-points-v2
@@ -456,8 +530,10 @@ allOf:
           compatible:
             contains:
               enum:
+                - apple,agx-g17s
                 - apple,agx-t6040
                 - apple,agx-t6041
+                - apple,agx-t6050
                 - apple,agx-t8132
                 - apple,agx-t8140
                 - apple,agx-g17s

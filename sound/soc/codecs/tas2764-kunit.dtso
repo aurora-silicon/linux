@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Nodes for the TAS2764 KUnit tests (tas2764-bop-test.h). The values are made
- * up; only their length and placement matter.
+ * Nodes for the TAS2764 KUnit tests (tas2764-bop-test.h and
+ * tas2764-bclk-ratio-test.h). The values are made up; only their length
+ * and placement matter.
  */
 /dts-v1/;
 /plugin/;
@@ -31,5 +32,16 @@
 
 	tas2764-kunit-bop-none {
 		compatible = "test,tas2764-kunit";
+	};
+
+	/* tas2764-bclk-ratio-test.h */
+	tas2764-kunit-bclk-250 {
+		compatible = "test,tas2764-kunit";
+		ti,bclk-ratio = <250>;
+	};
+
+	tas2764-kunit-bclk-64 {
+		compatible = "test,tas2764-kunit";
+		ti,bclk-ratio = <64>;
 	};
 };

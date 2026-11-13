@@ -529,6 +529,7 @@ def policy(root):
     state=r'''
 #define U64_MAX UINT64_MAX
 #define READ_ONCE(v) (v)
+#define smp_load_acquire(p) (*(p))
 #define WRITE_ONCE(p,v) ((p)=(v))
 #define DCP_IOMFB_METHODS_H17P_EXTERNAL 2
 #define DPTX_ENDPOINT_V2 0x2c
@@ -548,7 +549,7 @@ struct apple_connector {
 };
 struct apple_epic { struct apple_dcp *dcp; unsigned endpoint; bool wire_v2; };
 struct apple_epic_service { struct apple_epic *ep; void *cookie; bool enabled; };
-struct dptx_port { u32 lane_count, link_rate; bool enabled, closed, connected; void *atcphy; struct apple_epic_service *service; };
+struct dptx_port { u32 lane_count, link_rate; bool enabled, closed, connected; void *atcphy; struct apple_epic_service *service; bool tile_hint; u32 tile_width, tile_height; };
 struct apple_dcp {
     struct { int iomfb_method_profile; bool fw_14_7_endpoints; } hw;
     struct { bool lock, attributes_valid, timing_valid, hpd_seen; struct dcp_metadata_epoch epoch; struct dcp_metadata_ticket catalog_ticket;
@@ -852,6 +853,10 @@ static void disable_work_sync(struct work_struct *w) { (void)w; }
 #endif
 /* Nor the desktop 26.6 firmware. */
 #define DCP_FIRMWARE_V_26_6_DESKTOP (DCP_FIRMWARE_H17P + 3)
+/* Nor firmware 27, which the catalogue helpers name for its externals' parse flags. */
+#ifndef DCP_FIRMWARE_V_27_0
+#define DCP_FIRMWARE_V_27_0 (DCP_FIRMWARE_H17P + 5)
+#endif
 #define DIV_ROUND_UP(n,d) (((n)+(d)-1)/(d))
 static void dcp_update_connector_dimensions(struct apple_dcp *d,struct drm_connector *c)
 { (void)c;assert(d->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP); }

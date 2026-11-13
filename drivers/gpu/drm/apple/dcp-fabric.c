@@ -192,13 +192,17 @@ bool dcp_hdmi_port_attached(struct apple_dcp *dcp)
 }
 
 /*
- * A route of an adopted T8132 dcpext. Its PHY has no DP alt mode, so the
- * crossbar's DP PHY output has nothing behind it, and the dcpext is no
+ * A route of an adopted T8132 dcpext whose PHY has no DP alt mode: the
+ * crossbar's DP PHY output has nothing behind it. The board marks the PHYs
+ * wired for DP alt mode (apple,dp-alt-mode). Either way the dcpext is no
  * apple_crtc pipeline: its DRM objects are its own (t8132_ext_drm.c).
  */
 static bool dcp_typec_route_no_dp_alt(const struct apple_dcp_typec_route *route)
 {
-	return of_device_is_compatible(route->dcp->dev->of_node, "apple,t8132-dcpext");
+	if (!of_device_is_compatible(route->dcp->dev->of_node, "apple,t8132-dcpext"))
+		return false;
+	return IS_ERR_OR_NULL(route->phy) ||
+	       !of_property_read_bool(route->phy->dev.of_node, "apple,dp-alt-mode");
 }
 
 bool dcp_is_t8132_ext(const struct apple_dcp *dcp)
@@ -654,6 +658,7 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 	scoped_guard(mutex, &dcp->tb_lock) {
 		route->deactivate_xbar_done = false;
 		route->deactivate_error = 0;
+		route->sleep_parked = false;
 		route->active_xbar = xbar;
 		route->tunnel = xbar != route->xbar;
 		route->xbar_up = !route->tunnel;
@@ -703,7 +708,10 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 			return route->deactivate_error;
 		if (!route->deactivate_xbar_done) {
 			dcp_typec_route_phy_off(route);
-			if (!route->tunnel || route->xbar_up) {
+			/* Parked for a sleep, its output is already down and not held. */
+			if (route->sleep_parked) {
+				ret = 0;
+			} else if (!route->tunnel || route->xbar_up) {
 				ret = mux_control_deselect(route->active_xbar ?: route->xbar);
 			} else {
 				ret = dcp_dpxbar_preselect(route->active_xbar, MUX_IDLE_DISCONNECT);
@@ -718,6 +726,7 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 			}
 			/* Deselect always unlocks: never consume that selection twice. */
 			route->deactivate_xbar_done = true;
+			route->sleep_parked = false;
 			route->xbar_up = false;
 			if (ret) {
 				/* Idle is unproven; retain the owner and the real error. */
@@ -1964,14 +1973,14 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	}
 
 	/*
-	 * No DP alt mode on T8132. The state is taken as applied and
+	 * No DP alt mode on this T8132 port. The state is taken as applied and
 	 * nothing is routed, as before these routes existed, so the port
 	 * controller's mode change goes on. USB, USB4/TBT and safe states are
 	 * handled above as on every other SoC.
 	 */
 	if (dcp_typec_route_no_dp_alt(route)) {
 		dev_info_once(route->dcp->dev,
-			      "DP alt mode display not routed: no DP alt mode PHY on this SoC\n");
+			      "DP alt mode display not routed: no DP alt mode PHY on this port\n");
 		port->applied_valid = true;
 		return 0;
 	}
@@ -2040,8 +2049,16 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 		struct apple_dcp *dcp = port->owner->dcp;
 
 		WRITE_ONCE(dcp->typec_cable_connected, true);
-		if (dcp->typec_connector)
+		if (dcp->typec_connector) {
 			dcp_dptx_connect_oob(to_platform_device(dcp->dev), 0);
+		} else if (dcp_is_t8132_ext(dcp)) {
+			/*
+			 * A T8132 dcpext has no connector of its own: it connects
+			 * from the Type-C reconnect work, as for a tunnel.
+			 */
+			dcp->typec_reconnect_tries = 0;
+			dcp_queue_typec_reconnect(dcp, 0);
+		}
 	} else if (hpd && dp_data && (dp_data->status & DP_STATUS_IRQ_HPD)) {
 		struct apple_dcp *dcp = port->owner->dcp;
 
@@ -2447,7 +2464,11 @@ int dcp_direct_crossbar_link(struct apple_dcp *dcp, bool up)
 
 	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0)
 		return dcp_direct_crossbar_link_t6050(dcp, up);
-	if (!of_machine_is_compatible("apple,t6030"))
+	/*
+	 * On T6030 and on a T8132 dcpext, selecting a crossbar output only
+	 * routes it; the link-up enables its clocks.
+	 */
+	if (!of_machine_is_compatible("apple,t6030") && !dcp_is_t8132_ext(dcp))
 		return 0;
 	guard(mutex)(&dcp->tb_lock);
 	route = dcp->active_typec_route;
@@ -2999,7 +3020,7 @@ static bool dcp_typec_port_untileable(struct apple_dcp_typec_port *port)
 	/* No tiles on a T8132 dcpext. */
 	list_for_each_entry(route, &port->routes, port_link)
 		if (!route->dcp->external &&
-		    !dcp_typec_route_no_dp_alt(route) &&
+		    !dcp_is_t8132_ext(route->dcp) &&
 		    route->dcp->fw_compat != DCP_FIRMWARE_V_27_0)
 			return false;
 	return !list_empty(&port->routes);
@@ -4225,7 +4246,7 @@ bool dcp_typec_port_unusable(unsigned int idx)
 		return false;
 
 	list_for_each_entry(route, &port->routes, port_link)
-		if (!READ_ONCE(route->dcp->ext_dead) && !dcp_typec_route_no_dp_alt(route))
+		if (!READ_ONCE(route->dcp->ext_dead) && !dcp_is_t8132_ext(route->dcp))
 			return false;
 
 	return true;
@@ -4598,6 +4619,53 @@ int dcp_register_typec_routes(struct apple_dcp *dcp)
 	struct dcp_route_probe_context ctx = { .dcp = dcp, .routes = routes };
 
 	return dcp_fabric_run_probe(!!routes, dcp_register_typec_routes_present, &ctx);
+}
+
+/*
+ * A sleep that reaches its commit powers the crossbar off. Take the output of a direct
+ * route down while it still has power, as a released display's is, and select it again
+ * after the wake. The route stays, and with it the display on the port.
+ */
+void dcp_typec_route_park(struct apple_dcp *dcp)
+{
+	struct apple_dcp_typec_route *route;
+	int ret;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+	route = dcp->active_typec_route;
+	if (!route || route->tunnel || !route->selected)
+		return;
+	guard(mutex)(&dcp->tb_lock);
+	if (route->deactivate_xbar_done || route->sleep_parked)
+		return;
+	/* Deselect always unlocks. */
+	ret = mux_control_deselect(route->active_xbar ?: route->xbar);
+	route->sleep_parked = true;
+	dev_dbg(dcp->dev, "display route parked for the sleep: crossbar output down: %d\n", ret);
+}
+
+void dcp_typec_route_unpark(struct apple_dcp *dcp)
+{
+	struct apple_dcp_typec_route *route;
+	int ret;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+	route = dcp->active_typec_route;
+	if (!route)
+		return;
+	guard(mutex)(&dcp->tb_lock);
+	if (!route->sleep_parked)
+		return;
+	route->sleep_parked = false;
+	ret = mux_control_try_select(route->active_xbar ?: route->xbar, route->mux_index);
+	if (ret) {
+		/* Nothing is held, so the route's release has nothing to give back. */
+		route->deactivate_xbar_done = true;
+		dev_err(dcp->dev, "display route not back after the sleep: crossbar output: %d\n",
+			ret);
+		return;
+	}
+	dev_dbg(dcp->dev, "display route back after the sleep: crossbar output up\n");
 }
 
 /*

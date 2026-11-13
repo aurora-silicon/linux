@@ -21,6 +21,7 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/suspend.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_eld.h>
 #include <linux/hdmi.h>
@@ -77,6 +78,8 @@ struct dcp_audio {
 	struct snd_pcm_substream *substream;
 	unsigned int open_cookie;
 	bool open_unplugged;
+	/* Suspended for a system sleep and kept when its sink went, see dcpaud_take_kept() */
+	bool kept;
 
 	struct mutex data_lock;
 	bool dcp_connected; /// dcp status keep for delayed initialization
@@ -125,6 +128,8 @@ struct dcp_audio {
 	/* It holds a PM reference: its removal failed, see dcpaud_silence_stop() */
 	bool idle_pm;
 #endif
+	/* Runtime PM was enabled at bind, see dcpaud_hold_link_locked() */
+	bool rpm_enabled;
 };
 
 /* Native external audio service (DRM_APPLE_DCP_T6030_AUDIO only). */
@@ -260,6 +265,35 @@ static void dcpaud_consult_elements(struct dcp_audio *dcpaud,
 	dev_dbg(dcpaud->dev, "elements out: %llx %x %x\n", hits->formats, hits->nchans, hits->rates);
 }
 
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+/*
+ * Firmware 27's external role takes the stream's format as its link data,
+ * not the element's ElementData: macOS 27 links stereo 24-bit 48 kHz on
+ * the M5 Pro as (1, 2, 24, 48000). @sieve is the selected element's: one
+ * channel count, sample format and rate.
+ */
+static void dcpaud_link_format(struct dcp_audio *dcpaud,
+			       const struct dcp_sound_format_mask *sieve)
+{
+	struct dcp_audio_link_format *f = (void *)&dcpaud->selected_cookie;
+	int width = snd_pcm_format_width((__force snd_pcm_format_t)__ffs64(sieve->formats));
+
+	if (!dcp_audiosrv_link_by_format(dcpaud->dcp_dev) || !sieve->formats ||
+	    !sieve->nchans || !sieve->rates || width < 0)
+		return;
+	memset(&dcpaud->selected_cookie, 0, sizeof(dcpaud->selected_cookie));
+	f->format = cpu_to_le32(1);
+	f->channels = cpu_to_le32(__ffs(sieve->nchans));
+	f->sample_size = cpu_to_le32(width);
+	f->rate = cpu_to_le32(snd_pcm_known_rates.list[__ffs(sieve->rates)]);
+}
+#else
+static void dcpaud_link_format(struct dcp_audio *dcpaud,
+			       const struct dcp_sound_format_mask *sieve)
+{
+}
+#endif
+
 static int dcpaud_select_cookie(struct dcp_audio *dcpaud,
 				 struct snd_pcm_hw_params *params)
 {
@@ -273,10 +307,14 @@ static int dcpaud_select_cookie(struct dcp_audio *dcpaud,
 		.v14_7_audio = dcpaud->native_link,
 #endif
 	};
+	int ret;
 
 	dcpaud_fill_fmt_sieve(params, &sieve);
-	return parse_sound_mode(&elements, &sieve, &dcpaud->selected_chmap,
-				&dcpaud->selected_cookie);
+	ret = parse_sound_mode(&elements, &sieve, &dcpaud->selected_chmap,
+			       &dcpaud->selected_cookie);
+	if (ret > 0)
+		dcpaud_link_format(dcpaud, &sieve);
+	return ret;
 }
 
 static int dcpaud_rule_channels(struct snd_pcm_hw_params *params,
@@ -418,6 +456,11 @@ refine:
 							&hw, dcpaud->chan);
 	if (ret)
 		return ret;
+	/*
+	 * A system sleep ends the stream's link and DMA (dcpaud_sleep_quiesce()):
+	 * a suspended stream is prepared again, it cannot resume where it was.
+	 */
+	hw.info &= ~SNDRV_PCM_INFO_RESUME;
 	substream->runtime->hw = hw;
 
 	return snd_dmaengine_pcm_open(substream, dcpaud->chan);
@@ -428,6 +471,7 @@ static int dcp_pcm_close(struct snd_pcm_substream *substream)
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
 	dcpaud->selected_chmap.channels = 0;
 	dcpaud->open_unplugged = false;
+	WRITE_ONCE(dcpaud->kept, false);
 
 	return snd_dmaengine_pcm_close(substream);
 }
@@ -442,6 +486,58 @@ static int dcpaud_connection_up(struct dcp_audio *dcpaud)
 	return ret;
 }
 
+/*
+ * A stream suspended for a system sleep is kept when the display drops its
+ * sink for the sleep (dcpaud_report_hotplug()), and goes on with the sink
+ * connected after the wake: its next hw_params or prepare reads that sink's
+ * elements and takes its connection. A prepare (userspace recovering the
+ * suspended stream) selects the stream's element anew from its parameters.
+ * Without a sink, or with one that does not take the stream's format, the
+ * stream fails and userspace opens a new one.
+ */
+static int dcpaud_take_kept(struct dcp_audio *dcpaud, struct snd_pcm_runtime *runtime)
+{
+	struct snd_pcm_hw_params params = { };
+	struct snd_interval *i;
+	unsigned int cookie;
+	int ret;
+
+	if (!READ_ONCE(dcpaud->kept))
+		return 0;
+	scoped_guard(mutex, &dcpaud->data_lock) {
+		if (!dcpaud->connected)
+			return -ENXIO;
+		cookie = dcpaud->connection_cookie;
+	}
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	/* The display closed the stream's audio service with its sink. */
+	if (dcpaud->native_link) {
+		ret = dcp_audiosrv_open(dcpaud->dcp_dev);
+		if (ret)
+			return ret;
+	}
+#endif
+	ret = dcpaud_read_remote_info(dcpaud);
+	if (ret < 0)
+		return ret;
+	if (runtime) {
+		snd_mask_set_format(hw_param_mask(&params, SNDRV_PCM_HW_PARAM_FORMAT),
+				    runtime->format);
+		i = hw_param_interval(&params, SNDRV_PCM_HW_PARAM_CHANNELS);
+		i->min = i->max = runtime->channels;
+		i = hw_param_interval(&params, SNDRV_PCM_HW_PARAM_RATE);
+		i->min = i->max = runtime->rate;
+		ret = dcpaud_select_cookie(dcpaud, &params);
+		if (ret <= 0)
+			return ret ? ret : -EINVAL;
+	}
+	scoped_guard(mutex, &dcpaud->data_lock)
+		dcpaud->open_cookie = cookie;
+	WRITE_ONCE(dcpaud->kept, false);
+	dev_dbg(dcpaud->dev, "suspended stream goes on with the sink connected now\n");
+	return 0;
+}
+
 static int dcp_pcm_hw_params(struct snd_pcm_substream *substream,
 			     struct snd_pcm_hw_params *params)
 {
@@ -449,6 +545,10 @@ static int dcp_pcm_hw_params(struct snd_pcm_substream *substream,
 	struct dma_slave_config slave_config;
 	struct dma_chan *chan = snd_dmaengine_pcm_get_chan(substream);
 	int ret;
+
+	ret = dcpaud_take_kept(dcpaud, NULL);
+	if (ret)
+		return ret;
 
 	/* no sink: the stream runs without DMA, see dcpaud_void_start() */
 	if (dcpaud->open_unplugged || !dcpaud_connection_up(dcpaud))
@@ -491,6 +591,11 @@ static int dcp_pcm_hw_free(struct snd_pcm_substream *substream)
 static int dcp_pcm_prepare(struct snd_pcm_substream *substream)
 {
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
+	int ret;
+
+	ret = dcpaud_take_kept(dcpaud, substream->runtime);
+	if (ret)
+		return ret;
 
 	/* alsa-lib prepares right after hw_params; see dcp_pcm_hw_unplugged */
 	if (dcpaud->open_unplugged || !dcpaud_connection_up(dcpaud))
@@ -597,7 +702,9 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		return -EINVAL;
 	}
 
-	ret = snd_dmaengine_pcm_trigger(substream, cmd);
+	/* A suspended stream's DMA ends, as on STOP: the SIO firmware stops in the sleep. */
+	ret = snd_dmaengine_pcm_trigger(substream, cmd == SNDRV_PCM_TRIGGER_SUSPEND ?
+					SNDRV_PCM_TRIGGER_STOP : cmd);
 	if (ret < 0)
 		return ret;
 
@@ -694,11 +801,12 @@ static int dcpaud_pin_rate_format(struct dcp_audio *dcpaud,
 				  struct snd_pcm_runtime *runtime)
 {
 	static const unsigned int rates[] = { 48000, 44100, 32000 };
+	/* The 24-bit element only: a 16-bit one would need a widening path (see open). */
 	static const snd_pcm_format_t formats[] = {
-		SNDRV_PCM_FORMAT_S24_LE, SNDRV_PCM_FORMAT_S16_LE,
+		SNDRV_PCM_FORMAT_S24_LE,
 	};
 	struct dcp_sound_format_mask sieve = {
-		.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE,
+		.formats = SNDRV_PCM_FMTBIT_S24_LE,
 		.rates = GENMASK(snd_pcm_known_rates.count - 1, 0),
 		.nchans = BIT(2),
 	};
@@ -865,6 +973,20 @@ static int dcp_pcm_native_open(struct snd_pcm_substream *substream)
 	}
 
 	ret = dcp_pcm_open(substream);
+	/*
+	 * The DPA takes one 32-bit entry per channel sample whatever the
+	 * link's sample size: packed S16_LE (one word per stereo frame) plays
+	 * as silence, so native links take 32-bit containers only.
+	 */
+	if (!ret) {
+		ret = snd_pcm_hw_constraint_mask64(substream->runtime, SNDRV_PCM_HW_PARAM_FORMAT,
+						   SNDRV_PCM_FMTBIT_S20_LE | SNDRV_PCM_FMTBIT_S24_LE |
+						   SNDRV_PCM_FMTBIT_S32_LE);
+		if (ret > 0)
+			ret = 0;
+		if (ret)
+			dcp_pcm_close(substream);
+	}
 	if (!ret && live && !dcpaud->open_unplugged) {
 		ret = dcpaud_pin_rate_format(dcpaud, substream->runtime);
 		if (!ret)
@@ -926,6 +1048,16 @@ static void dcpaud_link_teardown(struct dcp_audio *dcpaud)
 	live = (dcpaud->link_prepared || dcpaud->link_started) &&
 	       dcp_audiosrv_link_live(dcpaud->dcp_dev);
 	if (dcpaud->link_started && live) {
+		/* Firmware 27, as macOS: the link's state as the stream stops. */
+		ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_QUERY,
+					&dcpaud->link_cookie);
+		if (ret && ret != -ENODEV)
+			dev_err(dcpaud->dev, "audio link query failed: %d\n", ret);
+		/* As macOS: the stopping notification, then STOP, same link data. */
+		ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_WILL_STOP,
+					&dcpaud->link_cookie);
+		if (ret && ret != -ENODEV)
+			dev_err(dcpaud->dev, "audio link will-stop failed: %d\n", ret);
 		ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_STOP,
 					&dcpaud->link_cookie);
 		if (ret && ret != -ENODEV)
@@ -950,9 +1082,13 @@ static int dcp_pcm_native_hw_params(struct snd_pcm_substream *substream,
 				    struct snd_pcm_hw_params *params)
 {
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
-	bool up = !dcpaud->open_unplugged && dcpaud_connection_up(dcpaud);
+	bool up;
 	int ret;
 
+	ret = dcpaud_take_kept(dcpaud, NULL);
+	if (ret)
+		return ret;
+	up = !dcpaud->open_unplugged && dcpaud_connection_up(dcpaud);
 	scoped_guard(mutex, &dcpaud->link_lock) {
 		dcpaud_drop_stale(dcpaud);
 		if (up && dcpaud->silence_running) {
@@ -1002,9 +1138,14 @@ static int dcpaud_link_prepare(struct dcp_audio *dcpaud, struct snd_pcm_substrea
 static int dcp_pcm_native_prepare(struct snd_pcm_substream *substream)
 {
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
+	int ret;
 
 	if (dcpaud->open_unplugged)
 		return 0;
+
+	ret = dcpaud_take_kept(dcpaud, substream->runtime);
+	if (ret)
+		return ret;
 
 	if (!dcpaud_connection_up(dcpaud))
 		return -ENXIO;
@@ -1073,12 +1214,27 @@ static int dcp_pcm_native_start(struct snd_pcm_substream *substream, int cmd)
 
 	if (!dcpaud->link_prepared)
 		return -EBADFD;
-	if (dcpaud->link_started)
-		return 0;
-	ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_START,
-				&dcpaud->link_cookie);
-	dcpaud->link_started = !ret;
-	return ret;
+	if (!dcpaud->link_started) {
+		ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_START,
+					&dcpaud->link_cookie);
+		if (ret)
+			return ret;
+		/* As macOS: START, then the started notification with the same link data. */
+		ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_DID_START,
+					&dcpaud->link_cookie);
+		if (ret) {
+			dev_err(dcpaud->dev, "audio link did-start failed: %d\n", ret);
+			dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_STOP,
+					  &dcpaud->link_cookie);
+			return ret;
+		}
+		dcpaud->link_started = true;
+	}
+	/* Firmware 27, as macOS: the link's state as the stream starts. */
+	ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_QUERY, &dcpaud->link_cookie);
+	if (ret)
+		dev_err(dcpaud->dev, "audio link query failed: %d\n", ret);
+	return 0;
 }
 
 static int dcp_pcm_native_trigger(struct snd_pcm_substream *substream, int cmd)
@@ -1111,8 +1267,13 @@ static int dcp_pcm_native_trigger(struct snd_pcm_substream *substream, int cmd)
 		}
 		fallthrough;
 	case SNDRV_PCM_TRIGGER_SUSPEND:
-		/* A START that issued no DMA leaves a held link's silence alone. */
-		ret = READ_ONCE(dcpaud->stream_dma) ? snd_dmaengine_pcm_trigger(substream, cmd) : 0;
+		/*
+		 * A START that issued no DMA leaves a held link's silence alone.
+		 * SUSPEND ends the DMA as STOP does (a paused channel stays busy
+		 * for the sleep); sync_stop then drains it and ends the link.
+		 */
+		ret = READ_ONCE(dcpaud->stream_dma) ?
+		      snd_dmaengine_pcm_trigger(substream, SNDRV_PCM_TRIGGER_STOP) : 0;
 		pm_runtime_mark_last_busy(dcpaud->dev);
 		__pm_runtime_put_autosuspend(dcpaud->dev);
 		return ret;
@@ -1157,6 +1318,181 @@ static int dcp_pcm_native_sync_stop(struct snd_pcm_substream *substream)
 	dcpaud_link_teardown(dcpaud);
 
 	return ret;
+}
+
+/*
+ * The default element of a held link: stereo at the rate and sample size
+ * dcpaud_pin_rate_format() gives a stream, so that the first stream follows
+ * the link instead of replacing it. 0 if the sink has none.
+ */
+static int dcpaud_select_default_cookie(struct dcp_audio *dcpaud)
+{
+	static const unsigned int rates[] = { 48000, 44100, 32000 };
+	struct dcp_sound_format_mask sieve = {
+		.formats = SNDRV_PCM_FMTBIT_S24_LE,
+		.rates = GENMASK(snd_pcm_known_rates.count - 1, 0),
+		.nchans = BIT(2),
+	};
+	struct dcp_sound_format_mask hits = { 0, 0, 0 };
+	struct dcp_parse_ctx elements = {
+		.dcp = dev_get_drvdata(dcpaud->dcp_dev),
+		.blob = dcpaud->elements + 4,
+		.len = dcpaud_elements_size(dcpaud) - 4,
+		.pos = 0,
+		.v14_7_audio = dcpaud->native_link,
+	};
+	unsigned int i, j;
+
+	parse_sound_constraints(&elements, &sieve, &hits);
+	for (i = 0; i < ARRAY_SIZE(rates); i++)
+		for (j = 0; j < snd_pcm_known_rates.count; j++)
+			if (snd_pcm_known_rates.list[j] == rates[i] && (hits.rates & BIT(j))) {
+				int ret;
+
+				sieve.rates = BIT(j);
+				elements.pos = 0;
+				ret = parse_sound_mode(&elements, &sieve, &dcpaud->selected_chmap,
+						       &dcpaud->selected_cookie);
+				if (ret > 0)
+					dcpaud_link_format(dcpaud, &sieve);
+				return ret;
+			}
+	return 0;
+}
+
+/*
+ * Holds a link of the selected element with silence, as one a stream left:
+ * PREPARE, the silence as the channel's idle transfer, START and the
+ * started notification. The link then carries the PM reference.
+ */
+static int dcpaud_hold_link_locked(struct dcp_audio *dcpaud)
+{
+	struct dma_slave_config slave_config = {
+		.direction = DMA_MEM_TO_DEV,
+		.dst_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES,
+	};
+	int ret;
+
+	lockdep_assert_held(&dcpaud->link_lock);
+	if (!dcpaud->chan || !dcpaud->silence)
+		return -ENODEV;
+	/*
+	 * The SIO channel feeds the DisplayPort audio block, in this device's
+	 * power domain: no link without it powered. Runtime PM enabled at bind
+	 * and off now is a system sleep in progress, where the device cannot be
+	 * resumed; the display holds the link again at its next mode set.
+	 */
+	ret = pm_runtime_get_sync(dcpaud->dev);
+	if (ret < 0 && (pm_runtime_enabled(dcpaud->dev) || dcpaud->rpm_enabled)) {
+		pm_runtime_put_noidle(dcpaud->dev);
+		return ret == -EACCES ? -EAGAIN : -EIO;
+	}
+	ret = dmaengine_slave_config(dcpaud->chan, &slave_config);
+	if (!ret)
+		ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_PREPARE,
+					&dcpaud->selected_cookie);
+	if (ret)
+		goto put;
+	dcpaud->link_prepared = true;
+	dcpaud->link_cookie = dcpaud->selected_cookie;
+	/* The silence first, as a stream's first period: the link must not start dry. */
+	ret = dcpaud_silence_start(dcpaud);
+	if (ret) {
+		dcpaud_link_teardown(dcpaud);
+		goto put;
+	}
+	ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_START, &dcpaud->link_cookie);
+	if (!ret) {
+		ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_DID_START,
+					&dcpaud->link_cookie);
+		if (ret)
+			dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_STOP,
+					  &dcpaud->link_cookie);
+	}
+	if (ret) {
+		/* The silence carries the PM reference: teardown drops it. */
+		dcpaud_link_teardown(dcpaud);
+		return ret;
+	}
+	dcpaud->link_started = true;
+	return 0;
+put:
+	pm_runtime_mark_last_busy(dcpaud->dev);
+	pm_runtime_put_autosuspend(dcpaud->dev);
+	return ret;
+}
+
+/* A link is held, or a stream runs or is about to start its own. */
+static bool dcpaud_link_busy_locked(struct dcp_audio *dcpaud)
+{
+	lockdep_assert_held(&dcpaud->link_lock);
+	return dcpaud->link_prepared || dcpaud->link_started || dcpaud->silence_running ||
+	       READ_ONCE(dcpaud->stream_dma);
+}
+
+/*
+ * As macOS: the connection gets its default link before the display's mode
+ * is set, held with silence until a stream takes it over, so the link runs
+ * through the mode set. A link first started after the mode set left a
+ * monitor recovering a clock ~1500 ppm fast (one repeated sample every ~680
+ * frames); one running through it did not. Called by the display just
+ * before it sets the mode, once the sink's elements are known; a link
+ * already held or a running stream stay as they are.
+ */
+void dcpaud_before_modeset(struct platform_device *pdev)
+{
+	struct dcp_audio *dcpaud = platform_get_drvdata(pdev);
+	unsigned int cookie;
+	bool held;
+	int ret;
+
+	if (!dcpaud || !dcpaud->native_link || !dcpaud->card)
+		return;
+	scoped_guard(mutex, &dcpaud->data_lock) {
+		if (!dcpaud->connected)
+			return;
+		cookie = dcpaud->connection_cookie;
+	}
+	scoped_guard(mutex, &dcpaud->link_lock) {
+		dcpaud_drop_stale(dcpaud);
+		if (dcpaud_link_busy_locked(dcpaud))
+			return;
+	}
+
+	scoped_guard(mutex, &dcpaud->substream->pcm->open_mutex)
+		ret = dcpaud_init_dma(dcpaud);
+	if (ret)
+		goto out;
+	ret = dcp_audiosrv_open(dcpaud->dcp_dev);
+	if (ret)
+		goto out;
+	/* The sink's elements, as a PCM open reads them. */
+	scoped_guard(mutex, &dcpaud->substream->pcm->open_mutex)
+		ret = dcpaud_read_remote_info(dcpaud);
+	held = false;
+	if (!ret) {
+		guard(mutex)(&dcpaud->link_lock);
+		if (dcpaud_link_busy_locked(dcpaud)) {
+			ret = -EBUSY;
+		} else {
+			scoped_guard(mutex, &dcpaud->data_lock)
+				ret = dcpaud->connected && dcpaud->connection_cookie == cookie ?
+					dcpaud_select_default_cookie(dcpaud) : -ENODEV;
+			if (ret > 0)
+				ret = dcpaud_hold_link_locked(dcpaud);
+			else if (!ret)
+				ret = -ENOENT;
+			held = !ret;
+		}
+	}
+	/* A held link keeps its service open, as one a stream left. */
+	if (!held)
+		dcp_audiosrv_close(dcpaud->dcp_dev);
+out:
+	if (ret && ret != -EBUSY)
+		dev_dbg(dcpaud->dev, "no link held before the mode set: %d\n", ret);
+	else if (!ret)
+		dev_dbg(dcpaud->dev, "link held before the mode set\n");
 }
 
 /*
@@ -1341,8 +1677,16 @@ static void dcpaud_report_hotplug(struct dcp_audio *dcpaud, bool connected,
 
 	if (!connected) {
 		snd_pcm_stream_lock(substream);
-		/* a stream without a sink plays on, see dcpaud_void_start() */
-		if (substream->runtime && !dcpaud->void_running)
+		/*
+		 * A stream without a sink plays on, see dcpaud_void_start(). One
+		 * suspended for a system sleep is kept: the display drops its sink
+		 * for the sleep, and the stream goes on with the sink connected
+		 * after the wake, see dcpaud_take_kept().
+		 */
+		if (substream->runtime && substream->runtime->state == SNDRV_PCM_STATE_SUSPENDED &&
+		    !dcpaud->open_unplugged)
+			WRITE_ONCE(dcpaud->kept, true);
+		else if (substream->runtime && !dcpaud->void_running)
 			snd_pcm_stop(substream, SNDRV_PCM_STATE_DISCONNECTED);
 		snd_pcm_stream_unlock(substream);
 	}
@@ -1517,6 +1861,7 @@ static int dcpaud_comp_bind(struct device *dev, struct device *main, void *data)
 	ret = devm_pm_runtime_enable(dev);
 	if (ret)
 		return dev_err_probe(dev, ret, "Failed to enable runtime PM: %d\n", ret);
+	dcpaud->rpm_enabled = true;
 
 	/* find linked DCP instance */
 	endpoint = of_graph_get_endpoint_by_regs(dev->of_node, 0, 0);
@@ -1690,7 +2035,57 @@ static __maybe_unused int dcpaud_resume(struct device *dev)
 	return 0;
 }
 
-static DEFINE_RUNTIME_DEV_PM_OPS(dcpaud_pm_ops, dcpaud_suspend, dcpaud_resume, NULL);
+/*
+ * A system sleep suspends an open stream the ALSA way: the PCM core triggers
+ * SUSPEND, which ends the stream's DMA, then sync_stop, which drains it and
+ * ends the link (stopped and completed on a native link). A link held with
+ * silence is then released as when the display goes off. The SIO channel is
+ * idle before the SIO firmware stops for the sleep, which a busy channel
+ * refuses (sio_suspend_late()). This runs at the sleep's prepare, before
+ * any device suspends: the display drops its sink in its own suspend, and
+ * finds the stream suspended, which it keeps (dcpaud_take_kept()). The PCM
+ * does not claim SNDRV_PCM_INFO_RESUME, so userspace prepares the stream
+ * again after the wake.
+ */
+static void dcpaud_sleep_quiesce(struct dcp_audio *dcpaud)
+{
+	if (!dcpaud->substream)
+		return;
+	snd_pcm_suspend_all(dcpaud->substream->pcm);
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+	if (dcpaud->native_link)
+		dcpaud_release_link(to_platform_device(dcpaud->dev), NULL);
+#endif
+}
+
+static __maybe_unused int dcpaud_pm_prepare(struct device *dev)
+{
+	dcpaud_sleep_quiesce(dev_get_drvdata(dev));
+	return 0;
+}
+
+/* Nothing is left to stop unless a link was held again since the prepare. */
+static __maybe_unused int dcpaud_system_suspend(struct device *dev)
+{
+	dcpaud_sleep_quiesce(dev_get_drvdata(dev));
+	return 0;
+}
+
+/*
+ * Runtime PM stops in the late phase and comes back in the early one, so it
+ * works through every device's .suspend and .resume. The display resumes
+ * before this device and holds its link again in its own resume, before
+ * the mode set (dcpaud_before_modeset()): the link's PM reference must
+ * power this device's domain then. A sleep entered with no link held finds
+ * the device idle, and pm_runtime_force_resume() leaves it suspended, so
+ * nothing else powers the domain.
+ */
+static const struct dev_pm_ops dcpaud_pm_ops = {
+	.prepare = pm_sleep_ptr(dcpaud_pm_prepare),
+	SYSTEM_SLEEP_PM_OPS(dcpaud_system_suspend, NULL)
+	LATE_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
+	RUNTIME_PM_OPS(dcpaud_suspend, dcpaud_resume, NULL)
+};
 
 static const struct of_device_id dcpaud_of_match[] = {
 	{ .compatible = "apple,dpaudio" },

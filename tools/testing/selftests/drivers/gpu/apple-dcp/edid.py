@@ -62,6 +62,7 @@ static unsigned diagnostic_errors,diagnostic_information,legacy_publishes;
 #define dma_rmb() ((void)0)
 #define DRM_CONNECTOR_REGISTERED 1
 #define DPAVSERV_ENDPOINT_V2 0x2a
+#define AV_AUDIO_ENDPOINT_DESKTOP 0x2b
 #define DCP_IOMFB_METHODS_H17P_EXTERNAL 2
 #define DCP_IOMFB_METHODS_H17G 7
 #define EPIC_SUBTYPE_STD_SERVICE 0xc0
@@ -69,6 +70,7 @@ static unsigned diagnostic_errors,diagnostic_information,legacy_publishes;
 #define to_platform_device(x) (x)
 #define ERR_PTR(x) ((void *)(intptr_t)(x))
 #define IS_ERR(x) ((uintptr_t)(x)>(uintptr_t)-4096)
+#define IS_ERR_OR_NULL(p) (!(p) || IS_ERR(p))
 #define lockdep_assert_held(p) assert(*(p))
 static bool *hpd_lock,*av_lock;
 static void mutex_lock(bool *p) { if(p==hpd_lock) assert(!*av_lock);assert(!*p);*p=true; }
@@ -96,11 +98,11 @@ struct apple_connector { void *dcp;bool connected,edid_invalidation_pending;stru
 struct apple_dcp {
     void *dev;int fw_compat;struct apple_dcp_afkep *dcpavservep;struct apple_connector *connector;
     bool external_physically_absent,hpd_mutex,quiescing,typec_cable_connected;u64 typec_generation;unsigned int nr_modes;
-    struct { int iomfb_method_profile; bool fw_14_7_endpoints; } hw; bool ext_dead,external_native;
+    struct { int iomfb_method_profile; bool fw_14_7_endpoints; unsigned int num_dptx_ports; } hw; bool ext_dead,external_native;
     struct { bool lock,enabled;u64 epoch;int enable_completion;struct apple_epic_service *service,*opened;
              u64 opened_epoch,close_gen,terminated_epoch,close_epoch;bool opening;struct work_struct close_wq; } dcpavserv;
 };
-'''+internal_inline(root,'dcp_fw_is_14_7')+internal_inline(root,'dcp_is_v14_7_external')+r'''struct epic_cmd { u32 retcode;u64 rxbuf,txbuf;u32 rxlen,txlen; };
+'''+internal_inline(root,'dcp_fw_is_14_7')+internal_inline(root,'dcp_is_v14_7_external')+internal_inline(root,'dcp_is_v27_external')+r'''struct epic_cmd { u32 retcode;u64 rxbuf,txbuf;u32 rxlen,txlen; };
 static unsigned int dma_frees,opens;
 
 static int open_error,open_action;
@@ -584,6 +586,7 @@ typedef int64_t s64;
 #define ERR_PTR(x) ((void *)(intptr_t)(x))
 #define PTR_ERR(x) ((int)(intptr_t)(x))
 #define IS_ERR(x) ((uintptr_t)(x) > (uintptr_t)-4096)
+#define IS_ERR_OR_NULL(p) (!(p) || IS_ERR(p))
 #define spin_lock_irqsave(p,f) do { assert(!*(p)); *(p)=true; (f)=0; } while(0)
 #define spin_unlock_irqrestore(p,f) do { (void)(f); assert(*(p)); *(p)=false; } while(0)
 #define lockdep_assert_held(p) assert(*(p))
@@ -807,6 +810,7 @@ typedef uint64_t u64;
 #define kfree(p) free(p)
 #define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))
 #define INIT_WORK(p,f) ((p)->fn=(f))
+#define IS_ERR_OR_NULL(x) (!(x) || (uintptr_t)(x) > (uintptr_t)-4096)
 #define dev_warn(...) ((void)0)
 #define DCP_FW_VER 26
 #define DCP_FW_VERSION(a,b,c) (a)
@@ -1036,6 +1040,7 @@ def startup(root):
 #define DPAVSERV_ENDPOINT_V2 0x2a
 #define DCP_FIRMWARE_V_27_0 7
 #define IS_ERR(p) ((uintptr_t)(p) > (uintptr_t)-4096)
+#define IS_ERR_OR_NULL(p) (!(p) || IS_ERR(p))
 #define PTR_ERR(p) ((int)(intptr_t)(p))
 #define ERR_PTR(e) ((void *)(intptr_t)(e))
 #define dev_warn(...) do { warnings++; } while (0)

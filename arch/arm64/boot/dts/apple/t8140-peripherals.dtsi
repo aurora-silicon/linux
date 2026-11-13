@@ -227,12 +227,11 @@
 
 	/* ADT /arm-io/dcp-exclave-mailbox. */
 	dcp_secure_mbox: mailbox@452e7c000 {
-		compatible = "apple,t8140-secure-mailbox", "apple,secure-mailbox";
+		compatible = "apple,t8140-secure-rtbuddy-proxy",
+			     "apple,secure-rtbuddy-proxy";
 		reg = <0x4 0x52e7c000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 686 IRQ_TYPE_LEVEL_HIGH>,
-		             <AIC_IRQ 683 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&dcp_dart 24>;
+		#mbox-cells = <0>;
+		power-domains = <&ps_disp_cpu>;
 		status = "disabled";
 	};
 
@@ -414,7 +413,7 @@
 		#iommu-cells = <1>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1120 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_sio_cpu>;
+		power-domains = <&ps_sio>;
 		status = "disabled";
 	};
 
@@ -474,12 +473,14 @@
 		status = "disabled";
 	};
 
+	/* Enabled by the boot loader with its firmware, through its alias. */
 	sio: dma-controller@385e00000 {
 		compatible = "apple,t8140-sio", "apple,sio";
 		/* Split the ASC bank around the separately owned mailbox window. */
 		reg = <0x3 0x85e00000 0x0 0x8000>,
 		      <0x3 0x85850000 0x0 0x4000>,
 		      <0x3 0x85e0c000 0x0 0x7c000>;
+		reg-names = "asc", "auxiliary", "asc-tail";
 		#dma-cells = <1>;
 		dma-channels = <128>;
 		mboxes = <&sio_mbox>;

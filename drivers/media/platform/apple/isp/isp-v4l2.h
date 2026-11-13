@@ -12,6 +12,7 @@ void apple_isp_free_video(struct apple_isp *isp);
 void ipc_bt_complete(struct apple_isp *isp);
 int ipc_bt_handle(struct apple_isp *isp, struct isp_channel *chan);
 
+void apple_isp_video_error(struct apple_isp *isp);
 int apple_isp_video_suspend(struct apple_isp *isp);
 int apple_isp_video_resume(struct apple_isp *isp);
 

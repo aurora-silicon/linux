@@ -1002,18 +1002,8 @@
 			<0x3 0x10000000 0x0 0x1000000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1558 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&m2_dart_apr0_0 1>, <&m2_dart_apr0_1 1>;
+		iommus = <&m2_dart_apr0_0 1>;
 		power-domains = <&ps_scodec>, <&ps_afr>;
-		status = "disabled";
-	};
-
-	m2_dart_apr0_1: iommu@311024000 {
-		compatible = "apple,t6020-dart", "apple,t8110-dart";
-		reg = <0x3 0x11024000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 0 1557 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_scodec>;
-		#iommu-cells = <1>;
 		status = "disabled";
 	};
 
@@ -1053,7 +1043,7 @@
 			<AIC_IRQ 0 1555 IRQ_TYPE_LEVEL_HIGH>,
 			<AIC_IRQ 0 1554 IRQ_TYPE_LEVEL_HIGH>,
 			<AIC_IRQ 0 1556 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&m2_dart_scdc0 0>, <&m2_dart_apr0_0 0>, <&m2_dart_apr0_1 0>;
+		iommus = <&m2_dart_scdc0 0>, <&m2_dart_apr0_0 0>;
 		power-domains = <&ps_scodec>, <&ps_afr>;
 		status = "disabled";
 	};
@@ -1158,7 +1148,7 @@
 		reg = <0x4 0xb200000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1187 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_avd_sys>;
+		power-domains = <&ps_msr0>;
 		#iommu-cells = <1>;
 		status = "disabled";
 	};
@@ -1237,6 +1227,7 @@
 		reg = <0x4 0x8d304000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1022 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext2_cpu0>;
 		#iommu-cells = <1>;
 		status = "disabled";
 	};
@@ -1246,6 +1237,7 @@
 		reg = <0x4 0x8d30c000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1022 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext2_cpu0>;
 		#iommu-cells = <1>;
 		status = "disabled";
 	};
@@ -1393,6 +1385,7 @@
 		reg = <0x5 0xd304000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1058 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext3_cpu0>;
 		#iommu-cells = <1>;
 		status = "disabled";
 	};
@@ -1402,6 +1395,7 @@
 		reg = <0x5 0xd30c000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 0 1058 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext3_cpu0>;
 		#iommu-cells = <1>;
 		status = "disabled";
 	};
@@ -1832,18 +1826,8 @@
 			<0x3 0x10000000 0x0 0x1000000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1558 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&m2_dart_apr2_0 1>, <&m2_dart_apr2_1 1>;
+		iommus = <&m2_dart_apr2_0 1>;
 		power-domains = <&ps_scodec_die1>, <&ps_afr_die1>;
-		status = "disabled";
-	};
-
-	m2_dart_apr2_1: iommu@311024000 {
-		compatible = "apple,t6020-dart", "apple,t8110-dart";
-		reg = <0x3 0x11024000 0x0 0x4000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1 1557 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_scodec_die1>;
-		#iommu-cells = <1>;
 		status = "disabled";
 	};
 
@@ -1883,7 +1867,7 @@
 			<AIC_IRQ 1 1555 IRQ_TYPE_LEVEL_HIGH>,
 			<AIC_IRQ 1 1554 IRQ_TYPE_LEVEL_HIGH>,
 			<AIC_IRQ 1 1556 IRQ_TYPE_LEVEL_HIGH>;
-		iommus = <&m2_dart_scdc1 0>, <&m2_dart_apr2_0 0>, <&m2_dart_apr2_1 0>;
+		iommus = <&m2_dart_scdc1 0>, <&m2_dart_apr2_0 0>;
 		power-domains = <&ps_scodec_die1>, <&ps_afr_die1>;
 		status = "disabled";
 	};
@@ -1977,7 +1961,7 @@
 		reg = <0x4 0xb200000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1187 IRQ_TYPE_LEVEL_HIGH>;
-		power-domains = <&ps_spi3>;
+		power-domains = <&ps_msr0_die1>;
 		#iommu-cells = <1>;
 		status = "disabled";
 	};
@@ -2056,6 +2040,7 @@
 		reg = <0x4 0x8d304000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1022 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext2_cpu0_die1>;
 		#iommu-cells = <1>;
 		status = "disabled";
 	};
@@ -2065,6 +2050,7 @@
 		reg = <0x4 0x8d30c000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1022 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext2_cpu0_die1>;
 		#iommu-cells = <1>;
 		status = "disabled";
 	};
@@ -2212,6 +2198,7 @@
 		reg = <0x5 0xd304000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1058 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext3_cpu0_die1>;
 		#iommu-cells = <1>;
 		status = "disabled";
 	};
@@ -2221,6 +2208,7 @@
 		reg = <0x5 0xd30c000 0x0 0x4000>;
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1 1058 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext3_cpu0_die1>;
 		#iommu-cells = <1>;
 		status = "disabled";
 	};

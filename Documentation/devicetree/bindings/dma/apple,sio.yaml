@@ -82,6 +82,11 @@ allOf:
               reg:
                 minItems: 3
                 maxItems: 3
+              reg-names:
+                items:
+                  - const: asc
+                  - const: auxiliary
+                  - const: asc-tail
           else:
             if:
               properties:
@@ -136,6 +141,10 @@ properties:
     description: On T6050, the coprocessor's mailbox interrupts in ADT order.
 
   status: true
+
+  reg-names:
+    minItems: 1
+    maxItems: 3
 
   '#dma-cells':
     const: 1

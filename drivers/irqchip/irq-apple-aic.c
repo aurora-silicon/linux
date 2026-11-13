@@ -56,6 +56,9 @@
 #include <linux/limits.h>
 #include <linux/of_address.h>
 #include <linux/slab.h>
+#include <linux/suspend.h>
+#include <linux/syscore_ops.h>
+#include <linux/irqchip/irq-apple-aic.h>
 #include <asm/apple_m1_pmu.h>
 #include <asm/cputype.h>
 #include <asm/exception.h>
@@ -281,6 +284,8 @@ struct aic_info {
 	 * comes online.
 	 */
 	bool siq_cfg_routing;
+	/* A firmware-driven suspend powers the controller down: aic_syscore_ops keep it. */
+	bool fw_suspend;
 };
 
 static const struct aic_info aic1_info __initconst = {
@@ -333,6 +338,15 @@ static const struct aic_info aic3_t8140_info __initconst = {
 	.fast_ipi = true,
 	.local_fast_ipi = true,
 	.siq_cfg_routing = true,
+	.fw_suspend = true,
+};
+
+static const struct aic_info aic3_t8132_info __initconst = {
+	.version = 3,
+	.irq_cfg = AIC3_IRQ_CFG,
+	.fast_ipi = true,
+	.local_fast_ipi = true,
+	.fw_suspend = true,
 };
 
 static const struct aic_info aic3_t8142_info __initconst = {
@@ -344,6 +358,10 @@ static const struct aic_info aic3_t8142_info __initconst = {
 };
 
 static const struct of_device_id aic_info_match[] = {
+	{
+		.compatible = "apple,t8132-aic3",
+		.data = &aic3_t8132_info,
+	},
 	{
 		.compatible = "apple,t8140-aic3",
 		.data = &aic3_t8140_info,
@@ -388,6 +406,8 @@ struct aic_irq_chip {
 	int nr_die;
 	int max_die;
 
+	u32 *sleep_masks;
+
 	struct aic_info info;
 };
 
@@ -408,6 +428,47 @@ static u32 aic_ic_read(struct aic_irq_chip *ic, u32 reg)
 static void aic_ic_write(struct aic_irq_chip *ic, u32 reg, u32 val)
 {
 	writel_relaxed(val, ic->base + reg);
+}
+
+/*
+ * A sleep that a firmware engine finishes waits for the CPUs to stop, and a raised
+ * line ends WFI even with interrupts off. Every line is masked for that last step.
+ */
+void aic_sleep_mask_all(void)
+{
+	struct aic_irq_chip *ic = aic_irqc;
+	u32 words = ic->max_irq >> 5, off = 0, reg, i;
+	u32 *saved = ic->sleep_masks;
+	int die;
+
+	for (die = 0; die < ic->nr_die; die++, off += ic->info.die_stride) {
+		for (i = 0; i < words; i++) {
+			reg = ic->info.mask_set + off + i * 4;
+			*saved++ = aic_ic_read(ic, reg);
+			aic_ic_write(ic, reg, U32_MAX);
+		}
+	}
+}
+
+void aic_sleep_restore(void)
+{
+	struct aic_irq_chip *ic = aic_irqc;
+	u32 words = ic->max_irq >> 5, off = 0, i;
+	u32 *saved = ic->sleep_masks;
+	int die;
+
+	for (die = 0; die < ic->nr_die; die++, off += ic->info.die_stride) {
+		for (i = 0; i < words; i++, saved++) {
+			aic_ic_write(ic, ic->info.mask_set + off + i * 4, *saved);
+			aic_ic_write(ic, ic->info.mask_clr + off + i * 4, ~*saved);
+		}
+	}
+}
+
+/* Takes the next event, which also masks its line. */
+u32 aic_sleep_ack(void)
+{
+	return readl(aic_irqc->event + aic_irqc->info.event);
 }
 
 /*
@@ -1083,6 +1144,133 @@ static void build_fiq_affinity(struct aic_irq_chip *ic, struct device_node *aff)
 	}
 }
 
+#ifdef CONFIG_PM_SLEEP
+/*
+ * A firmware-driven suspend powers the controller down and back up. How
+ * much it keeps isn't measured, and macOS saves and restores it in software. So
+ * mask everything before the commit, so that no line can end the final WFI, and
+ * put it all back after. Linux never writes IRQ_CFG or these global registers
+ * outside of config's enable bit, so they hold what the bootloader set.
+ */
+static struct {
+	u32 config;
+	u32 timeout;
+	u32 cluster_prio;
+	u32 *irq_cfg;
+	bool saved;
+} aic_sleep;
+
+static int aic_syscore_suspend(void *data)
+{
+	struct aic_irq_chip *ic = aic_irqc;
+	u32 die, i, off = 0;
+
+	if (!pm_suspend_via_firmware())
+		return 0;
+
+	aic_sleep.config = aic_ic_read(ic, AIC2_CONFIG);
+	aic_sleep.timeout = aic_ic_read(ic, AIC2_TIMEOUT);
+	aic_sleep.cluster_prio = aic_ic_read(ic, AIC2_CLUSTER_PRIO);
+
+	for (die = 0; die < ic->nr_die; die++) {
+		for (i = 0; i < ic->nr_irq; i++)
+			aic_sleep.irq_cfg[die * ic->nr_irq + i] =
+				aic_ic_read(ic, ic->info.irq_cfg + off + i * 4);
+		for (i = 0; i < BITS_TO_U32(ic->nr_irq); i++)
+			aic_ic_write(ic, ic->info.mask_set + off + i * 4, U32_MAX);
+		off += ic->info.die_stride;
+	}
+	aic_sleep.saved = true;
+
+	return 0;
+}
+
+/* The boot CPU doesn't pass through hotplug, so aic_init_cpu() doesn't rerun. */
+static void aic_resume_boot_cpu(void)
+{
+	u32 fiq = __this_cpu_read(aic_fiq_unmasked);
+
+	aic_init_cpu(smp_processor_id());
+	/*
+	 * aic_init_cpu() is for a CPU with no FIQ users yet. This one's kept theirs:
+	 * a timer left marked masked here would never be unmasked at its next EOI.
+	 */
+	__this_cpu_write(aic_fiq_unmasked, fiq);
+	if (is_kernel_in_hyp_mode()) {
+		if (fiq & BIT(AIC_TMR_EL02_PHYS))
+			aic_vm_timer_mask(VM_TMR_FIQ_ENABLE_P, false);
+		if (fiq & BIT(AIC_TMR_EL02_VIRT))
+			aic_vm_timer_mask(VM_TMR_FIQ_ENABLE_V, false);
+		isb();
+	}
+}
+
+static void aic_syscore_resume(void *data)
+{
+	struct aic_irq_chip *ic = aic_irqc;
+	u32 die, i, off = 0;
+
+	if (!aic_sleep.saved)
+		return;
+	aic_sleep.saved = false;
+
+	/* Otherwise the suspend was refused, and the controller stayed powered. */
+	if (pm_resume_via_firmware()) {
+		aic_ic_write(ic, AIC2_TIMEOUT, aic_sleep.timeout);
+		aic_ic_write(ic, AIC2_CLUSTER_PRIO, aic_sleep.cluster_prio);
+		aic_ic_write(ic, AIC2_CONFIG, aic_sleep.config);
+		aic_resume_boot_cpu();
+	}
+
+	for (die = 0; die < ic->nr_die; die++) {
+		for (i = 0; i < BITS_TO_U32(ic->nr_irq); i++) {
+			aic_ic_write(ic, ic->info.mask_set + off + i * 4, U32_MAX);
+			aic_ic_write(ic, ic->info.sw_clr + off + i * 4, U32_MAX);
+		}
+		for (i = 0; i < ic->nr_irq; i++) {
+			u32 saved = aic_sleep.irq_cfg[die * ic->nr_irq + i];
+			u32 reg = ic->info.irq_cfg + off + i * 4;
+			unsigned int virq;
+
+			if (aic_ic_read(ic, reg) != saved)
+				aic_ic_write(ic, reg, saved);
+
+			/* Restore from the IRQ core's books, not from the hardware's. */
+			virq = irq_find_mapping(ic->hw_domain, AIC_IRQ_HWIRQ(die, i));
+			if (virq && !irqd_irq_masked(irq_get_irq_data(virq)))
+				aic_ic_write(ic, ic->info.mask_clr + off + MASK_REG(i),
+					     MASK_BIT(i));
+		}
+		off += ic->info.die_stride;
+	}
+}
+
+static const struct syscore_ops aic_syscore_ops = {
+	.suspend = aic_syscore_suspend,
+	.resume = aic_syscore_resume,
+};
+
+static struct syscore aic_syscore = {
+	.ops = &aic_syscore_ops,
+};
+
+static void __init aic_sleep_init(struct aic_irq_chip *irqc)
+{
+	if (!irqc->info.fw_suspend)
+		return;
+
+	aic_sleep.irq_cfg = kcalloc(irqc->nr_die * irqc->nr_irq, sizeof(u32), GFP_KERNEL);
+	if (WARN_ON(!aic_sleep.irq_cfg))
+		return;
+
+	register_syscore(&aic_syscore);
+}
+#else
+static void __init aic_sleep_init(struct aic_irq_chip *irqc)
+{
+}
+#endif
+
 static int __init aic_of_ic_init(struct device_node *node, struct device_node *parent)
 {
 	int i, die;
@@ -1109,6 +1297,18 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 		goto err_unmap;
 
 	irqc->info = *(struct aic_info *)match->data;
+
+	/*
+	 * The VM_TMR_FIQ_ENA_EL2 write that traps on T8142 was seen under
+	 * SPTM. A loader that runs the OS at EL2 in a CTXR execute window
+	 * starts no SPTM and says so with this property, and there the
+	 * register takes writes. Masking through the EL02 controls instead
+	 * sets IMASK in the guest's own timer, which KVM then keeps as
+	 * guest state: the guest gets no timer interrupt again.
+	 */
+	if (irqc->info.vm_timer_fiq_readonly && is_kernel_in_hyp_mode() &&
+	    of_property_present(of_chosen, "aurora,ctxr-exec-window"))
+		irqc->info.vm_timer_fiq_readonly = false;
 
 	aic_irqc = irqc;
 
@@ -1168,6 +1368,11 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 
 	irqc->info.die_stride = off - start_off;
 
+	irqc->sleep_masks = kcalloc(irqc->nr_die * (irqc->max_irq >> 5),
+				    sizeof(*irqc->sleep_masks), GFP_KERNEL);
+	if (WARN_ON(!irqc->sleep_masks))
+		goto err_unmap;
+
 	irqc->hw_domain = irq_domain_create_tree(of_fwnode_handle(node),
 						 &aic_irq_domain_ops, irqc);
 	if (WARN_ON(!irqc->hw_domain))
@@ -1218,6 +1423,8 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 	cpuhp_setup_state(CPUHP_AP_IRQ_APPLE_AIC_STARTING,
 			  "irqchip/apple-aic/ipi:starting",
 			  aic_init_cpu, NULL);
+
+	aic_sleep_init(irqc);
 
 	if (is_kernel_in_hyp_mode()) {
 		struct irq_fwspec mi = {

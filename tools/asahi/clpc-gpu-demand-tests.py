@@ -25,6 +25,7 @@ def main():
     header = (ROOT / 'include/linux/soc/apple/pmc.h').read_text()
     rail_shift = re.search(r'^#define APPLE_PMC_RAIL_SHIFT\(rail\).*$', header, re.M).group(0)
     dense_samples = re.search(r'^#define APPLE_CLPC_GPU_DENSE_SAMPLES\s.*$', source, re.M).group(0)
+    reasons = '\n'.join(re.findall(r'^#define APPLE_CLPC_REASON_\w+\s.*$', source, re.M))
     types = '\n'.join(item(source, s) + ';' for s in [
         'struct apple_clpc_hw {', 'struct apple_clpc_vote {'])
     tables = '\n'.join(item(source, 'static const struct apple_clpc_hw ' + n) + ';'
@@ -56,6 +57,7 @@ typedef uint64_t u64;
 #define HZ 1000
 #define max(a,b) ((a) > (b) ? (a) : (b))
 #define GENMASK(h,l) (((1u << ((h)-(l)+1))-1) << (l))
+#define BIT(n) (1u << (n))
 #define APPLE_PMC_RAIL_SHIFT(r) ((r)*8)
 #define time_after_eq(a,b) ((long)((a)-(b)) >= 0)
 #define time_after(a,b) ((long)((a)-(b)) > 0)
@@ -108,6 +110,7 @@ struct apple_clpc {
  struct freq_qos_request ane_qos;
  unsigned int ane_qos_khz;
  unsigned long ane_until;
+ bool low_power;
 };
 static unsigned long jiffies;
 static u64 ktime_get_mono_fast_ns(void) { return jiffies * 1000000ull; }
@@ -129,7 +132,9 @@ static int apple_pmc_floor_update(void *pmc, unsigned int agent, u32 mask, u32 f
  (void)pmc; assert(agent==1 && mask==3); published=floor; return vote_error;
 }
 static void apple_clpc_queue(struct apple_clpc *c, bool idle) { (void)c; queued_idle=idle; }
-''' + dense_samples + '\n' + tables + '\n' + methods + r'''
+#define READ_ONCE(x) (x)
+static void apple_clpc_profile_limit(struct apple_clpc *c) { (void)c; }
+''' + dense_samples + '\n' + reasons + '\n' + tables + '\n' + methods + r'''
 // T8140 ANE work holds its DRAM and fabric states while it runs, a request
 // shorter than one sample is still seen once, and the hold then expires.
 static void check_t8140_ane(void) {
@@ -280,7 +285,7 @@ int main(void) {
             ('omit-host-demand', code.replace('if (apple_clpc_gpu_input_demand(clpc->hw, clpc->gpu, demand))',
                                               'if (false && apple_clpc_gpu_input_demand(clpc->hw, clpc->gpu, demand))')),            ('omit-ane-demand', code.replace('if (apple_clpc_ane_input_demand(clpc, demand))',
                                              'if (false && apple_clpc_ane_input_demand(clpc, demand))')),
-            ('omit-ane-cluster', code.replace('apple_clpc_ane_cluster(clpc, reason & 32, now);',
+            ('omit-ane-cluster', code.replace('apple_clpc_ane_cluster(clpc, reason & APPLE_CLPC_REASON_ANE, now);',
                                               '(void)apple_clpc_ane_cluster;')),
             ('ane-cluster-no-hold', code.replace('if (time_before(now, clpc->ane_until))',
                                                  'if (active)')),

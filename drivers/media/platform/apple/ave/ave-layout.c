@@ -279,7 +279,7 @@ const struct ave_fw_layout ave_layout_9003_78_0 = {
 };
 
 const struct ave_fw_layout ave_layout_26a428 = {
-	.name = "26A428 (CRC unqualified)",
+	.name = "26A428",
 	.abi = &ave_abi_9003,
 	.kind = AVE_LAYOUT_26A428,
 	.encode_ready = true,
@@ -656,7 +656,7 @@ const struct ave_fw_layout ave_layout_6070_11_1 = {
 			.h264_scaling_4x4 = 0x1060a,
 			.h264_scaling_8x8 = 0x106ca,
 			.h264_sve_count = 0x10de8,
-			.h264_multi_me = 0xfcea,
+			.multi_me = 0xfcea,
 			.h264_vui_restriction = 0x10a20,
 			.h264_vui_mv_over_boundaries = 0x10a24,
 			.h264_vui_max_bytes_denom = 0x10a28,
@@ -721,8 +721,6 @@ const struct ave_fw_layout ave_layout_6070_11_1 = {
 			.coded_h = 0x64,
 			.ref_compression = 0xfd7d,
 			.hevc_refs = 0xfd2c,
-			.hevc_rc_9604 = 0x28498,
-			.hevc_rc_9608 = 0x2849c,
 			.hevc_profile_a = 0x105d0,
 			.hevc_compat_a = 0x105d4,
 			.hevc_8bit_a = 0x105f4,
@@ -740,8 +738,10 @@ const struct ave_fw_layout ave_layout_6070_11_1 = {
 			.hevc_conf_right = 0x248e8,
 			.hevc_conf_top = 0x248ec,
 			.hevc_conf_bottom = 0x248f0,
+			.hevc_chroma_format = 0x248c8,
 			.hevc_depth_luma = 0x248f4,
 			.hevc_depth_chroma = 0x248f8,
+			.hevc_log2_max_poc_lsb_minus4 = 0x248fc,
 			.hevc_dpb_minus1 = 0x24904,
 			.hevc_reorder = 0x24920,
 			.hevc_reorder_copy = 0x10c4c,
@@ -755,6 +755,7 @@ const struct ave_fw_layout ave_layout_6070_11_1 = {
 			.hevc_num_views = { 0xff24, 0xff28 },
 			.hevc_sve_count = 0x32d9c,
 			.hevc_sve_index = 0x32dc0,
+			.multi_me = 0xfcea,
 			.hevc_vps_base_internal = 0x105b8,
 			.hevc_vps_base_available = 0x105b9,
 			.hevc_vps_temporal_nesting = 0x105c4,
@@ -777,6 +778,8 @@ const struct ave_fw_layout ave_layout_6070_11_1 = {
 			.hevc_sps_fw_header = 0x26375,
 			.hevc_sps_header_len = 0x26378,
 			.hevc_pps_extra_slice_bits = 0x2848c,
+			.hevc_pps_l0_default_active_minus1 = 0x28494,
+			.hevc_pps_l1_default_active_minus1 = 0x28498,
 			.hevc_pps_init_qp = 0x2849c,
 			.hevc_pps_cu_qp_delta = 0x284a2,
 			.hevc_pps_cu_qp_depth = 0x284a4,
@@ -856,6 +859,8 @@ const struct ave_fw_layout ave_layout_6070_11_1 = {
 		},
 		[1] = {
 			.pic_size = 0x55b0,
+			.hevc_single_transcoder = 0x6515,
+			.hevc_use_explicit_rps = 0x6504,
 			.first_process = 0x5c88,
 			.src_neighbor_info = 0x5f30,
 			.src_neighbor_pixel = 0x5f50,
@@ -946,13 +951,22 @@ const struct ave_fw_layout ave_layout_6070_11_1 = {
 const struct ave_fw_layout *ave_layout_for_crc(u32 crc)
 {
 	/*
-	 * The M4 Pro gets the same 25G83 firmware build as the A18 Pro, built
-	 * for its own chip, and speaks the same command layout.
+	 * The M4 Pro and M4 Max get the same 25G83 firmware build as the
+	 * A18 Pro, built for their own chips, and speak the same command layout.
 	 */
-	if (crc == AVE_FW_TEXT_CRC_9003_78_0 || crc == AVE_FW_TEXT_CRC_T6040_25G83)
+	if (crc == AVE_FW_TEXT_CRC_9003_78_0 || crc == AVE_FW_TEXT_CRC_T6040_25G83 ||
+	    crc == AVE_FW_TEXT_CRC_T6041_25G83)
 		return &ave_layout_9003_78_0;
 	if (crc == 0x460c7a7c || crc == 0x25bfd039)
 		return &ave_layout_6070_11_1;
-	/* 26A428 has no verified loader TEXT CRC: no placeholder or fallback. */
+	/* The macOS 27.0 build for the M5 Pro and Max. */
+	if (crc == AVE_FW_TEXT_CRC_T6050_26A428)
+		return &ave_layout_26a428;
+	/*
+	 * The macOS 27.3 beta 1 build speaks the same command layout: H.264
+	 * and HEVC encode with it on a J714s.
+	 */
+	if (crc == AVE_FW_TEXT_CRC_T6050_26C5035)
+		return &ave_layout_26a428;
 	return NULL;
 }

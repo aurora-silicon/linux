@@ -1767,6 +1767,58 @@
 &nub_spmi_a0 {
 	status = "okay";
 
+	/*
+	 * The left-back port and the MagSafe controller, as on the M4 Pro boards.
+	 * The J614c's ADT has nub-spmi-a0 hpm0 (left-back, port 1, 0xc) and hpm5
+	 * (0x8) with the J614s's event, sleep and wake interrupts.
+	 */
+	hpm0: usb-pd@c {
+		compatible = "apple,sn201202x";
+		reg = <0xc SPMI_USID>;
+		interrupts = <11 IRQ_TYPE_EDGE_RISING>,
+			     <13 IRQ_TYPE_EDGE_RISING>,
+			     <17 IRQ_TYPE_EDGE_RISING>,
+			     <19 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "select", "sleep", "wake";
+
+		typec0: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Left Back";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec0_connector_hs: endpoint {
+						remote-endpoint = <&dwc3_0_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					typec0_connector_ss: endpoint {
+						remote-endpoint = <&atcphy0_ss>;
+					};
+				};
+			};
+		};
+	};
+
+	/* MagSafe port */
+	hpm5: usb-pd@8 {
+		compatible = "apple,sn201202x";
+		reg = <0x8 SPMI_USID>;
+		interrupts = <63 IRQ_TYPE_EDGE_RISING>,
+			     <65 IRQ_TYPE_EDGE_RISING>,
+			     <69 IRQ_TYPE_EDGE_RISING>,
+			     <71 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "select", "sleep", "wake";
+	};
+
 	hpm1: usb-pd@a {
 		compatible = "apple,sn201202x";
 		reg = <0xa SPMI_USID>;
@@ -1790,6 +1842,13 @@
 					reg = <0>;
 					typec1_connector_hs: endpoint {
 						remote-endpoint = <&dwc3_1_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					typec1_connector_ss: endpoint {
+						remote-endpoint = <&atcphy1_ss>;
 					};
 				};
 			};
@@ -1825,13 +1884,104 @@
 						remote-endpoint = <&dwc3_2_hs>;
 					};
 				};
+
+				port@1 {
+					reg = <1>;
+					typec2_connector_ss: endpoint {
+						remote-endpoint = <&atcphy2_ss>;
+					};
+				};
+			};
+		};
+	};
+};
+
+/*
+ * USB 3 on the three USB-C ports. The loader appends the PHY and controller
+ * tunables from the ADT, as on the M4 Pro, and disables a port it can't tune.
+ */
+&atcphy0 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			atcphy0_ss: endpoint {
+				remote-endpoint = <&typec0_connector_ss>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			atcphy0_usb3: endpoint {
+				remote-endpoint = <&dwc3_0_ss>;
+			};
+		};
+	};
+};
+
+&atcphy0_mbox {
+	status = "okay";
+};
+
+&dwc3_0_dart_0 {
+	status = "okay";
+};
+
+&dwc3_0_dart_1 {
+	status = "okay";
+};
+
+&dwc3_0 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dwc3_0_hs: endpoint {
+				remote-endpoint = <&typec0_connector_hs>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			dwc3_0_ss: endpoint {
+				remote-endpoint = <&atcphy0_usb3>;
 			};
 		};
 	};
 };
 
 &atcphy1 {
-	apple,tunable-usb2-host = <0x8 0x7003 0x3>;
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			atcphy1_ss: endpoint {
+				remote-endpoint = <&typec1_connector_ss>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			atcphy1_usb3: endpoint {
+				remote-endpoint = <&dwc3_1_ss>;
+			};
+		};
+	};
+};
+
+&atcphy1_mbox {
 	status = "okay";
 };
 
@@ -1844,15 +1994,6 @@
 };
 
 &dwc3_1 {
-	maximum-speed = "high-speed";
-	phys = <&atcphy1 PHY_TYPE_USB2>;
-	phy-names = "usb2-phy";
-	apple,tunable-gbl-host = <0x4 0x0001ef00 0x00002f00>, <0x1c 0x00000100 0x0>,
-		<0x2c 0x000a07ff 0x000800c8>, <0x100 0x02000100 0x02000100>,
-		<0x504 0x00001000 0x0>, <0x528 0xff0000ff 0x06000006>,
-		<0x52c 0xff0000ff 0x08000008>, <0x538 0x00000800 0x00000800>,
-		<0x580 0xffffffff 0x6f000006>;
-	apple,tunable-cfg-host = <0x20 0xff 0x1b>;
 	status = "okay";
 
 	ports {
@@ -1865,11 +2006,40 @@
 				remote-endpoint = <&typec1_connector_hs>;
 			};
 		};
+
+		port@1 {
+			reg = <1>;
+			dwc3_1_ss: endpoint {
+				remote-endpoint = <&atcphy1_usb3>;
+			};
+		};
 	};
 };
 
 &atcphy2 {
-	apple,tunable-usb2-host = <0x8 0x7003 0x3>;
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			atcphy2_ss: endpoint {
+				remote-endpoint = <&typec2_connector_ss>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			atcphy2_usb3: endpoint {
+				remote-endpoint = <&dwc3_2_ss>;
+			};
+		};
+	};
+};
+
+&atcphy2_mbox {
 	status = "okay";
 };
 
@@ -1882,15 +2052,6 @@
 };
 
 &dwc3_2 {
-	maximum-speed = "high-speed";
-	phys = <&atcphy2 PHY_TYPE_USB2>;
-	phy-names = "usb2-phy";
-	apple,tunable-gbl-host = <0x4 0x0001ef00 0x00002f00>, <0x1c 0x00000100 0x0>,
-		<0x2c 0x000a07ff 0x000800c8>, <0x100 0x02000100 0x02000100>,
-		<0x504 0x00001000 0x0>, <0x528 0xff0000ff 0x06000006>,
-		<0x52c 0xff0000ff 0x08000008>, <0x538 0x00000800 0x00000800>,
-		<0x580 0xffffffff 0x6f000006>;
-	apple,tunable-cfg-host = <0x20 0xff 0x1b>;
 	status = "okay";
 
 	ports {
@@ -1901,6 +2062,13 @@
 			reg = <0>;
 			dwc3_2_hs: endpoint {
 				remote-endpoint = <&typec2_connector_hs>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			dwc3_2_ss: endpoint {
+				remote-endpoint = <&atcphy2_usb3>;
 			};
 		};
 	};
@@ -2309,12 +2477,30 @@
 	};
 };
 
-&aop_als {
-	status = "disabled";
-};
+/*
+ * The AOP's sensors, as on the M4 Pro boards (t6040.dtsi, t604x-j614-j616.dtsi).
+ * The J614c's ADT has the J614s's als, accel and gyro services under
+ * /arm-io/aop/iop-aop-nub; the loader copies the accelerometer's and
+ * gyroscope's calibration into the nodes of the same names.
+ */
+&aop {
+	aop_accel: accel {
+		compatible = "apple,t6041-aop-accel", "apple,aop-accel";
+		/* The sensor is on the logic board, in the base. */
+		label = "accel-base";
+	};
 
-&aop_las {
-	status = "disabled";
+	aop_gyro: gyro {
+		compatible = "apple,t6041-aop-gyro", "apple,aop-gyro";
+	};
+
+	aop_devmotion: devmotion6 {
+		compatible = "apple,t6041-aop-devmotion6", "apple,aop-devmotion6";
+	};
+
+	aop_temp: als-temp {
+		compatible = "apple,t6041-aop-als-temp", "apple,aop-als-temp";
+	};
 };
 
 / {
@@ -2358,11 +2544,9 @@
 
 #include "t604x-extdisp.dtsi"
 
-/delete-node/ &atcphy0_xbar;
-/delete-node/ &atcphy2_xbar;
-
 #include "t6041-j616c-hdmi.dtsi"
 #include "t6041-j616c-usbc.dtsi"
+#include "t6041-j616c-usbc-dcpext2.dtsi"
 
 /*
  * Keyboard backlight, as on the M4 Pro boards: the ADT /arm-io/pwm0 has one
@@ -2541,5 +2725,180 @@
 
 /* The QSPI controller cannot probe while its power state is disabled. */
 &ps_qspi {
+	status = "okay";
+};
+
+/*
+ * DisplayPort/HDMI audio, as on the M4 Pro boards (t6040-j616s-dpaudio.dtsi).
+ * The J614c's ADT has the J616s's: dcpext0's audio is dp-audio1 (SIO DMA
+ * channel 0x66) and dcpext1's is dp-audio2 (0x68), and the PMGR has UART_P
+ * (0x1a0) and DPA_P (0x1a8) under SIO, and DPA1 (0x238) and DPA2 (0x240)
+ * under DPA_P. The SIO stays disabled here: the loader enables it once it has
+ * reserved the firmware iBoot loaded (it finds it by the alias).
+ */
+&pmgr {
+	ps_uart_p: power-controller@1a0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1a0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "uart_p";
+		power-domains = <&ps_sio>;
+	};
+
+	ps_dpa_p: power-controller@1a8 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1a8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dpa_p";
+		power-domains = <&ps_sio>;
+		apple,always-on;
+	};
+
+	ps_dpa1: power-controller@238 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x238 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dpa1";
+		power-domains = <&ps_dpa_p>;
+	};
+
+	ps_dpa2: power-controller@240 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x240 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dpa2";
+		power-domains = <&ps_dpa_p>;
+	};
+};
+
+/ {
+	aliases {
+		sio = &sio;
+	};
+
+	dpaudio1: audio-controller-1 {
+		compatible = "apple,t6041-dpaudio", "apple,dpaudio";
+		dmas = <&sio 0x66>;
+		dma-names = "tx";
+		power-domains = <&ps_dpa1>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dpaudio1_dcpext: endpoint {
+					remote-endpoint = <&dcpext0_audio>;
+				};
+			};
+		};
+	};
+
+	dpaudio2: audio-controller-2 {
+		compatible = "apple,t6041-dpaudio", "apple,dpaudio";
+		dmas = <&sio 0x68>;
+		dma-names = "tx";
+		power-domains = <&ps_dpa2>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dpaudio2_dcpext: endpoint {
+					remote-endpoint = <&dcpext1_audio>;
+				};
+			};
+		};
+	};
+};
+
+&dcpext0 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dcpext0_audio: endpoint {
+				remote-endpoint = <&dpaudio1_dcpext>;
+			};
+		};
+	};
+};
+
+&dcpext1 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dcpext1_audio: endpoint {
+				remote-endpoint = <&dpaudio2_dcpext>;
+			};
+		};
+	};
+};
+
+/* The SIO firmware drives the SPI, UART and DP audio shims: keep their parents on. */
+&ps_sio_cpu {
+	power-domains = <&ps_sio>, <&ps_spi_p>, <&ps_uart_p>, <&ps_dpa_p>;
+	status = "okay";
+};
+
+&sio_dart {
+	status = "okay";
+};
+
+&sio_mbox {
+	status = "okay";
+};
+
+/*
+ * The Neural Engine, as on the M4 Pro boards. The J614c's ADT has ane0 with
+ * pre-loaded firmware (__TEXT;__DATA); the loader fills the reservations of
+ * t6041-j616c-ane.dtsi and the firmware IOVAs from it.
+ */
+&ane0_dart0 {
+	status = "okay";
+};
+
+&ane0_dart1 {
+	status = "okay";
+};
+
+&ane0_dart2 {
+	status = "okay";
+};
+
+&ane {
+	status = "okay";
+};
+
+/* Both JPEG engines, as on the M4 Pro boards; they have no board wiring. */
+&ps_jpg {
+	status = "okay";
+};
+
+&jpeg0_dart {
+	status = "okay";
+};
+
+&jpeg0 {
+	status = "okay";
+};
+
+&jpeg1_dart {
+	status = "okay";
+};
+
+&jpeg1 {
 	status = "okay";
 };

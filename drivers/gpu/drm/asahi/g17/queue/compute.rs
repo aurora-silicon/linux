@@ -524,6 +524,10 @@ struct Active {
     /// not by the recovery's own attribution, or a replay of spared work, which runs again from
     /// the start. A later fault report on the queue makes it guilty.
     spared_as_dropped: bool,
+    /// The command retired on its completion record without a completion stamp and its client
+    /// has its result, but the firmware may still store the stamp through its descriptor: the
+    /// descriptor stays held, and the command at the front, until the stamp covers it.
+    stamps_owed: bool,
 }
 struct Previous<B = Binding, C = Arc<Context>> {
     binding: Option<B>,
@@ -666,6 +670,9 @@ pub(crate) struct Queue {
     /// The stamp of the newest command the firmware reported failed ([`Self::note_fault`]),
     /// while it is newer than the stored stamp.
     fault_stamp: Option<u32>,
+    /// A channel error of this queue waits for the firmware to consume its acknowledgement: the
+    /// queue keeps its owner and backing until then.
+    channel_error: bool,
     /// Prepared packets of the bound owner about to publish (see [`Self::claim`]).
     claims: u32,
     last_published: u64,
@@ -745,6 +752,7 @@ impl Queue {
             ordinal: 0,
             submitted: 0,
             fault_stamp: None,
+            channel_error: false,
             claims: 0,
             last_published: 0,
             last_end: 0,
@@ -818,6 +826,13 @@ impl Queue {
 
     pub(crate) fn qid(&self) -> u8 {
         self.kick.id().qid()
+    }
+    /// The queue record the firmware runs this queue from.
+    pub(crate) fn queue_record_va(&self) -> u64 {
+        self.graph.graph.gpu_va()
+    }
+    pub(crate) fn set_channel_error(&mut self, pending: bool) {
+        self.channel_error = pending;
     }
     pub(crate) fn owner(&self) -> Option<u64> {
         self.owner
@@ -894,6 +909,7 @@ impl Queue {
                 active.observed.is_some()
             },
             failed: self.quarantined,
+            excused: active.packet.within_allowance(crate::g17::now_ns()),
         })
     }
 
@@ -1139,6 +1155,15 @@ impl Queue {
                 if recovery_state != 0 {
                     return Err(EAGAIN);
                 }
+                if front.stamps_owed {
+                    // Already reported: only the descriptor waits for the stamp.
+                    let stamp = self.graph.stamp()?;
+                    return if retirement::stamp_covers(stamp, ticket.kick) {
+                        Ok(Some(([0; 2], false)))
+                    } else {
+                        Err(EAGAIN)
+                    };
+                }
                 let recordless = if epoch != ticket.epoch {
                     crossed = true;
                     Recordless::CrossedRecovery
@@ -1175,7 +1200,8 @@ impl Queue {
                     next_end,
                     record_aged && !self.graph.m5,
                 )?;
-                if timestamps.is_some() && !retirement::stamp_covers(stamp, ticket.kick) {
+                let stampless = !retirement::stamp_covers(stamp, ticket.kick);
+                if timestamps.is_some() && stampless {
                     retirement::note_stampless(self.qid(), ticket.kick);
                 }
                 if timestamps.is_some()
@@ -1185,11 +1211,22 @@ impl Queue {
                 {
                     return Err(EIO);
                 }
-                Ok(timestamps)
+                Ok(timestamps.map(|timestamps| (timestamps, stampless)))
             })();
             oldest = false;
             match result {
-                Ok(Some(timestamps)) => {
+                Ok(Some((_, _))) if self.active.front().is_some_and(|front| front.stamps_owed) => {
+                    // The stamp now covers the held command: release its descriptor.
+                    self.submitted = self.submitted.checked_sub(1).ok_or(EIO)?;
+                    self.active.pop().ok_or(EIO)?;
+                    drop(self.previous.take());
+                    self.retirement_ready = self.active.len == 0;
+                    if self.released && self.retirement_ready {
+                        self.owner = None;
+                        self.released_at = now_ns();
+                    }
+                }
+                Ok(Some((timestamps, stampless))) => {
                     let submitted = self.submitted.checked_sub(1).ok_or(EIO)?;
                     if front.qos_pending {
                         complete_qos(self.qos_owner())?;
@@ -1219,6 +1256,18 @@ impl Queue {
                         Err(error) => Deferred::Retired(completion, Err(error)),
                     })?;
                     self.retire_pending = false;
+                    if stampless {
+                        // A completion record is no witness that the firmware is done with the
+                        // descriptor: it can still store the stamp through it. Keep the command
+                        // (and its descriptor) at the front until the stamp covers it.
+                        let _ = submitted;
+                        let front = self.active.iter_mut().next().ok_or(EIO)?;
+                        front.stamps_owed = true;
+                        if front.observed.is_some() {
+                            self.last_end = self.last_end.max(timestamps[1]);
+                        }
+                        break;
+                    }
                     self.submitted = submitted;
                     let active = self.active.pop().ok_or(EIO)?;
                     if active.observed.is_some() {
@@ -1738,7 +1787,7 @@ impl Queue {
         Ok(true)
     }
     pub(crate) fn reusable(&self) -> bool {
-        if self.growing {
+        if self.growing || self.channel_error {
             return false;
         }
         self.installed
@@ -2661,10 +2710,14 @@ impl Queue {
                 // The board's core layout sizes the operand state, as on G17P.
                 operand_region_bytes: self.graph.operand_state.bank_bytes(),
                 operand_aux_offset: self.graph.operand_state.tail_offset(),
-                operand_bytes: self.graph.operand_state.size, resource_control: plan.map_or(0x54b, |p| p.resource_flags),
+                operand_bytes: self.graph.operand_state.size, resource_control: plan.map_or(
+                    // macOS 27.0 on the J813 runs every compute program with one secondary and
+                    // one imageblock unit beside the primary one (0x0104054b).
+                    if board.j813_forms() { 0x0104_054b } else { 0x54b }, |p| p.resource_flags),
                 dispatch_control: crate::g17::fw::m5::compute::dispatch_control(board, tuple.dispatch_base),
                 auxiliary_control: tuple.auxiliary_control,
             },
+            common26_tail: board.graph.is_common26(),
             descriptor_va: descriptor_low,
             // M5 Pro's descriptors carry the ordinal as the submission sequence too, as macOS's do.
             submit_sequence: if board.completion_inputs() { u64::from(self.ordinal) } else { 0 },
@@ -2674,10 +2727,13 @@ impl Queue {
             kick_timestamp: kick_timestamp.get(),
             completion_ordinal: crate::g17::fw::m5::compute::completion_ordinal(board, self.ordinal),
             status_va: args.status_va, timestamp_va: [timestamp_va, timestamp_va + 8],
-            shared_control_va: self.pool.control_va(), event_metadata: [0;16],
-            usage_fw_va: self.graph.usage.gpu_va(), completion_identity: 1,
+            shared_control_va: self.pool.control_va(),
+            event_metadata: crate::g17::fw::m5::compute::completion_forms(board).1,
+            usage_fw_va: self.graph.usage.gpu_va(),
+            completion_identity: crate::g17::fw::m5::compute::completion_forms(board).0,
         }});
-        // Explicit dependencies take the board's explicit class; the implicit parent, last,
+        // Explicit dependencies take the board's class
+        // ([`crate::g17::fw::m5::compute::explicit_dependency`]); the implicit parent, last,
         // takes its own ([`crate::g17::fw::m5::compute::parent_dependency`]).
         let mut m5_dependency_types = [m5_board.map_or(
             crate::g17::fw::m5::compute::COMPUTE_PIPELINED_DEPENDENCY,
@@ -2727,6 +2783,7 @@ impl Queue {
                 qos_pending: false,
                 // A replay keeps its spared class: its own fault must still make it guilty.
                 spared_as_dropped: packet.completion.spared(),
+                stamps_owed: false,
             })
             .map_err(|_| EBUSY)?;
         self.retirement_ready = false;
@@ -2800,6 +2857,11 @@ impl Queue {
                     })?;
                 visible = true;
                 self.unpublished_binding = false;
+                // The J813 (common 26A428) reads the descriptor from the item ring, after
+                // the configuration, as macOS 27.0's compute ring has it.
+                if crate::g17::J813_FORMS.load(Ordering::Relaxed) {
+                    producer = self.graph.append(producer, descriptor_high, || {})?;
+                }
                 // This Active and its Packet pins now own all visible records.
                 if let Some(configuration) = self.configuration.take() { configuration.release(); }
             } else if first {
@@ -2887,7 +2949,7 @@ impl Queue {
             }
             prepared_kick.commit();
             self.submitted = self.submitted.checked_add(1).ok_or(EOVERFLOW)?;
-            let announce_va = if self.graph.m5 {
+            let announce_va = if self.graph.m5 && !crate::g17::J813_FORMS.load(Ordering::Relaxed) {
                 self.graph.record(record_slot, ANNOUNCE, 0x40,
                     crate::g17::fw::m5::queue::notification(qid, kick_timestamp)?)?
             } else { self.graph.record(record_slot, ANNOUNCE, 0x40, announce)? };

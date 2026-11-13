@@ -468,7 +468,7 @@ pub(crate) const T6041: PlatformProfile = PlatformProfile {
 /// 0x3356) on spi2 at `0x505108000`, 8 MHz, chip select 0. That is J616s's
 /// SEP, so T6040's profile with this sensor bus.
 pub(crate) const T6050: PlatformProfile = PlatformProfile {
-    name: "T6050/J714s",
+    name: "T6050/J714s, K116s",
     sensor: SensorProfile {
         controller_base: 0x5_0510_8000,
         ..T6040.sensor
@@ -500,6 +500,24 @@ pub(crate) const T8132: PlatformProfile = PlatformProfile {
     ..T8122
 };
 
+/// MacBook Air 15" M5 (J815). The J815 ADT (macOS 27.0 stub firmware) puts
+/// the Mesa sensor (`V3`, the J700/J713/J714s generation) on spi2 at
+/// `0x3a5108000`, 8 MHz, chip select 0, with power on the NUB GPIO controller
+/// (pin 36) and data-ready on AP GPIO 200. The SEP is a pre-booted
+/// `iop-sep,ascwrap-v6` (`sepfw-booted`) behind a t8110 DART whose input
+/// aperture is the BIT(40) alias (`vm-base-0` 0x10000004000, `vm-size-0`
+/// 0xffff0000): the same SoC side as T8132 and T6050 (J714s, the M5 Pro).
+/// So this is T8132's profile with the sensor bus moved. On J815 the SEP
+/// attaches with it; the sensor session itself is not tested yet.
+pub(crate) const T8142: PlatformProfile = PlatformProfile {
+    name: "T8142/J815",
+    sensor: SensorProfile {
+        controller_base: 0x3_a510_8000,
+        ..T8132.sensor
+    },
+    ..T8132
+};
+
 static_assert!(T8103.shmem_capacity == 0x30000);
 static_assert!(T6020.shmem_capacity == 0x40000);
 static_assert!(T8140.shmem_capacity == 0x40000);
@@ -520,6 +538,9 @@ static_assert!(T6040.sensor.expected_id == T8140.sensor.expected_id);
 static_assert!(T8132.sensor.controller_base == 0x3ad108000);
 static_assert!(T8132.sensor.expected_id == T8140.sensor.expected_id);
 static_assert!(T8132.nonce_session && T8132.wide_dma_mask);
+static_assert!(T8142.sensor.controller_base == 0x3a5108000);
+static_assert!(T8142.sensor.expected_id == T8132.sensor.expected_id);
+static_assert!(T8142.nonce_session && T8142.wide_dma_mask);
 
 /// Whether the machine root declares `compatible`.
 ///
@@ -682,12 +703,16 @@ fn select(
     if has(b"apple,t6041") && (has(b"apple,j616c") || has(b"apple,j614c")) {
         return Ok(&T6041);
     }
-    if has(b"apple,t6050") && has(b"apple,j714s") {
+    if has(b"apple,t6050") && (has(b"apple,j714s") || has(b"apple,k116s")) {
         return Ok(&T6050);
     }
     // Only the M4 MacBook Airs: the other T8132 Macs are unread.
     if has(b"apple,t8132") && (has(b"apple,j713") || has(b"apple,j715")) {
         return Ok(&T8132);
+    }
+    // Only the J815, whose ADT was read; the J813's sensor bus is unchecked.
+    if has(b"apple,t8142") && has(b"apple,j815") {
+        return Ok(&T8142);
     }
     Err(ENODEV)
 }
@@ -770,6 +795,7 @@ mod tests {
         assert_eq!(picked(&[b"apple,t6041"]), None);
         assert_eq!(picked(&[b"apple,j713", b"apple,t6041"]), None);
         assert_eq!(picked(&[b"apple,j714s", b"apple,t6050"]), Some(T6050.name));
+        assert_eq!(picked(&[b"apple,k116s", b"apple,t6050"]), Some(T6050.name));
         assert_eq!(picked(&[b"apple,t6050"]), None);
     }
 

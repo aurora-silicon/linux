@@ -2282,10 +2282,83 @@ static const char *const t6041_usbc_nodes[] = {
 	"/dcp@602e00000",
 };
 
-static const struct gate_staged t6041_stages[] = {
-	{ "/iommu@3a2300000", t6041_hdmi_nodes, ARRAY_SIZE(t6041_hdmi_nodes) },
-	{ "/iommu@602300000", t6041_usbc_nodes, ARRAY_SIZE(t6041_usbc_nodes) },
+static bool staged_is_route_path(const char *path)
+{
+	return strstr(path, "/typec-routes/");
+}
+
+/*
+ * J614s HDMI: its ADT has no dcpext0 and its DISPEXT0 power states are
+ * virtual, so the J616s chain above must never be powered there. HDMI is
+ * dcpext2 instead (t6040-j614s-extdisp-hdmi.dtsi): the same ATC3 PHY,
+ * crossbar and converter, behind the DISPEXT2 block. As the J616s dcpext0,
+ * it also has a route to every Type-C port, so two USB-C displays use
+ * dcpext1 and dcpext2.
+ */
+static const char *const t6041_j614s_hdmi_nodes[] = {
+	/* ATC3 power, PMP DISPEXT2 request, FAB7_SOC, DISPEXT2, AOP pins, PHY, crossbar, DARTs, mailbox, routes, dcpext2 */
+	"/power-management@502800000/power-controller@408",
+	"/power-management@508300000/power-controller@e0",
+	"/power-management@508300000/power-controller@168",
+	"/power-management@508300000/power-controller@b8",
+	"/power-management@508300000/power-controller@148",
+	"/pmp-report@5003c0000/report@13",
+	"/power-management@502800000/power-controller@488",
+	"/power-management@502800000/power-controller@4e0",
+	"/power-management@502800000/power-controller@4e8",
+	"/pinctrl@510824000",
+	"/mailbox@39b148000",
+	"/phy@39aa90000",
+	"/mux@39b24c000",
+	"/iommu@606340000",
+	"/iommu@606300000",
+	"/mailbox@606e08000",
+	"/dcp@606e00000/typec-routes/route@0",
+	"/dcp@606e00000/typec-routes/route@1",
+	"/dcp@606e00000/typec-routes/route@2",
+	"/dcp@606e00000",
 };
+
+enum { STAGED_HDMI, STAGED_USBC };
+
+/* The J614s HDMI stage replaces the J616s one in gate_t6041_staged(). */
+static struct gate_staged t6041_stages[] = {
+	[STAGED_HDMI] = { "/iommu@3a2300000", t6041_hdmi_nodes, ARRAY_SIZE(t6041_hdmi_nodes) },
+	[STAGED_USBC] = { "/iommu@602300000", t6041_usbc_nodes, ARRAY_SIZE(t6041_usbc_nodes) },
+};
+
+/*
+ * The chains this boot enables: each one whose processor the boot loader gave
+ * firmware memory. The loader hands the processors over separately (the
+ * J614s ADT has no dcpext0: its HDMI processor is dcpext2, so only dcpext1
+ * is handed over), so one missing processor must not keep the other off.
+ * Set once by gate_t6041_staged().
+ */
+static unsigned long staged_on;
+
+static bool staged_stage_on(unsigned int i)
+{
+	return test_bit(i, &staged_on);
+}
+
+/*
+ * The HDMI processor's Type-C routes (dcpext0's, or J614s's dcpext2's hybrid
+ * DP outputs) switch the Type-C crossbars, which are the USB-C chain's.
+ * Without that chain they stay disabled and the processor drives HDMI only;
+ * the crossbars are enabled for it, as its mux-controls name them.
+ */
+static const char *const t6041_hdmi_only_muxes[] = {
+	"/mux@38324c000",
+	"/mux@38b24c000",
+	"/mux@39324c000",
+};
+
+static bool staged_path_on(unsigned int i, const char *path)
+{
+	if (!staged_stage_on(i))
+		return false;
+	return !(i == STAGED_HDMI && staged_is_route_path(path) && !staged_stage_on(STAGED_USBC));
+}
 
 /* A display processor (a direct child of the root) and a Type-C display route. */
 static bool staged_is_dcp(const char *path)
@@ -2388,6 +2461,13 @@ static int staged_apply(const struct gate_staged *st, struct device_node *displa
 		ret = np ? of_changeset_update_prop_string(cs, np, "status", "okay") : -ENODEV;
 		of_node_put(np);
 	}
+	/* The Type-C crossbars the HDMI processor's mux-controls name. */
+	for (i = 0; !ret && st == &t6041_stages[STAGED_HDMI] && !staged_stage_on(STAGED_USBC) &&
+		    i < ARRAY_SIZE(t6041_hdmi_only_muxes); i++) {
+		np = of_find_node_by_path(t6041_hdmi_only_muxes[i]);
+		ret = np ? of_changeset_update_prop_string(cs, np, "status", "okay") : -ENODEV;
+		of_node_put(np);
+	}
 	if (!ret)
 		ret = of_changeset_apply(cs);
 	if (ret) {
@@ -2452,6 +2532,8 @@ static int staged_set(struct device_node *display, bool dcps, const char *dcp_st
 			const char *path = t6041_stages[i].nodes[j];
 
 			if (!(dcps && staged_is_dcp(path)) && !(routes && staged_is_route(path)))
+				continue;
+			if (!staged_path_on(i, path))
 				continue;
 			np = of_find_node_by_path(path);
 			if (np && staged_is_route(path) && route_status &&
@@ -2546,6 +2628,10 @@ static void __init staged_hold_port_controllers(void)
 {
 	struct device_node *route, *routes, *dcp, *ctrl;
 	unsigned int i, k;
+
+	/* Only dcpext1's routes are held for; without its chain nothing waits. */
+	if (!staged_stage_on(STAGED_USBC))
+		return;
 
 	for (i = 0; i < ARRAY_SIZE(t6041_usbc_nodes); i++) {
 		if (!staged_is_route(t6041_usbc_nodes[i]))
@@ -2766,7 +2852,7 @@ static const char *staged_unbound_infra(void)
 	unsigned int i, j;
 
 	for (i = 0; i < ARRAY_SIZE(t6041_stages); i++)
-		for (j = 0; j < t6041_stages[i].nr; j++) {
+		for (j = 0; staged_stage_on(i) && j < t6041_stages[i].nr; j++) {
 			const char *path = t6041_stages[i].nodes[j];
 			struct device_node *np;
 			struct device *dev;
@@ -2818,6 +2904,8 @@ static void staged_power_up(struct work_struct *work)
 	mutex_unlock(&staged_lock);
 
 	for (i = 0; !ret && i < ARRAY_SIZE(t6041_stages); i++) {
+		if (!staged_stage_on(i))
+			continue;
 		ret = staged_apply(&t6041_stages[i], staged_display);
 		if (!ret)
 			staged_info("stage %u enabled\n", i);
@@ -2929,10 +3017,25 @@ static void __init gate_t6041_staged(void)
 
 	staged_prefix = gate_soc->prefix;
 
-	/* Everything must be there and disabled, with firmware memory, before anything is changed. */
+	if (of_machine_is_compatible("apple,j614s"))
+		t6041_stages[STAGED_HDMI] = (struct gate_staged){
+			"/iommu@606300000", t6041_j614s_hdmi_nodes,
+			ARRAY_SIZE(t6041_j614s_hdmi_nodes) };
+
+	/*
+	 * Each chain must be all there and disabled, with firmware memory,
+	 * before anything of it is changed; a chain that is not stays as it is
+	 * and does not keep the other one off.
+	 */
 	for (i = 0; i < ARRAY_SIZE(t6041_stages); i++)
-		if (!staged_ready(&t6041_stages[i]))
-			return;
+		if (staged_ready(&t6041_stages[i]))
+			__set_bit(i, &staged_on);
+	if (!staged_on)
+		return;
+	if (!staged_stage_on(STAGED_USBC))
+		staged_info("Type-C chain not handed over: HDMI only, dcpext0 Type-C routes stay disabled\n");
+	else if (!staged_stage_on(STAGED_HDMI))
+		staged_info("HDMI chain not handed over: Type-C displays only\n");
 	staged_display = of_find_node_by_path("/display-subsystem");
 	staged_pmp = of_find_node_by_path("/pmp@500700000");
 	if (!staged_display || !staged_pmp || !of_device_is_available(staged_display) ||
@@ -2944,7 +3047,8 @@ static void __init gate_t6041_staged(void)
 	for (i = 0; i < ARRAY_SIZE(t6041_stages); i++) {
 		const struct gate_staged *st = &t6041_stages[i];
 
-		staged_dcps[i] = of_find_node_by_path(st->nodes[st->nr - 1]);
+		if (staged_stage_on(i))
+			staged_dcps[i] = of_find_node_by_path(st->nodes[st->nr - 1]);
 	}
 
 	/* No device exists yet: routes on, display subsystem held back until the power-up. */
@@ -2993,8 +3097,51 @@ static const char *const t6041_max_hdmi_nodes[] = {
 };
 
 static const char *const t6041_max_usbc_nodes[] = {
-	/* ATC1 mailbox and crossbar, DARTs, mailbox, route, dcpext1 */
-	"/mailbox@38b148000",
+	/*
+	 * ATC0-2 crossbars, DARTs, mailbox, a route per port, dcpext1, as the
+	 * M4 Pro's. The ATC mailboxes are the PHYs', on for USB3 whatever the
+	 * display does.
+	 */
+	"/mux@38324c000",
+	"/mux@38b24c000",
+	"/mux@39324c000",
+	"/iommu@602340000",
+	"/iommu@602300000",
+	"/mailbox@602e08000",
+	"/dcp@602e00000/typec-routes/route@0",
+	"/dcp@602e00000/typec-routes/route@1",
+	"/dcp@602e00000/typec-routes/route@2",
+	"/dcp@602e00000",
+};
+
+/*
+ * The second USB-C processor of the J614c/J616c: DARTs, mailbox, a route per
+ * port, dcpext2. It shares the ATC0-2 crossbars with dcpext1, whose chain
+ * enables them, so they are not part of this one.
+ */
+static const char *const t6041_max_usbc2_nodes[] = {
+	"/iommu@606340000",
+	"/iommu@606300000",
+	"/mailbox@606e08000",
+	"/dcp@606e00000/typec-routes/route@0",
+	"/dcp@606e00000/typec-routes/route@1",
+	"/dcp@606e00000/typec-routes/route@2",
+	"/dcp@606e00000",
+};
+
+static const struct gate_staged t6041_max_stages[] = {
+	{ "/iommu@3a2300000", t6041_max_hdmi_nodes, ARRAY_SIZE(t6041_max_hdmi_nodes) },
+	{ "/iommu@602300000", t6041_max_usbc_nodes, ARRAY_SIZE(t6041_max_usbc_nodes) },
+	{ "/iommu@606300000", t6041_max_usbc2_nodes, ARRAY_SIZE(t6041_max_usbc2_nodes) },
+};
+
+/*
+ * The J575c's typec1 chain: ATC1 crossbar, DARTs, mailbox, route, dcpext1.
+ * That port is also a USB3 port, so its device tree enables the ATC1 PHY's
+ * coprocessor mailbox, as the M4 Pro boards do: the mailbox is not part of
+ * the chain here.
+ */
+static const char *const t6041_j575c_usbc_nodes[] = {
 	"/mux@38b24c000",
 	"/iommu@602340000",
 	"/iommu@602300000",
@@ -3003,10 +3150,37 @@ static const char *const t6041_max_usbc_nodes[] = {
 	"/dcp@602e00000",
 };
 
-static const struct gate_staged t6041_max_stages[] = {
-	{ "/iommu@3a2300000", t6041_max_hdmi_nodes, ARRAY_SIZE(t6041_max_hdmi_nodes) },
-	{ "/iommu@602300000", t6041_max_usbc_nodes, ARRAY_SIZE(t6041_max_usbc_nodes) },
+static const struct gate_staged t6041_j575c_usbc = {
+	"/iommu@602300000", t6041_j575c_usbc_nodes, ARRAY_SIZE(t6041_j575c_usbc_nodes),
 };
+
+/*
+ * The J575c's HDMI chain. Its ATC3 is a USB-C port, and its HDMI port runs
+ * through the LPDPTX PHY instead (t6041-j575c-hdmi.dtsi): that PHY's power,
+ * the AOP pins (the converter's hotplug), the PHY, then dcpext0's chain.
+ */
+static const char *const t6041_j575c_hdmi_nodes[] = {
+	"/power-management@502280000/power-controller@360",
+	"/pinctrl@510824000",
+	"/phy@51c200000",
+	"/iommu@3a2340000",
+	"/iommu@3a2300000",
+	"/mailbox@3a2e08000",
+	"/dcp@3a2e00000",
+};
+
+static const struct gate_staged t6041_j575c_hdmi = {
+	"/iommu@3a2300000", t6041_j575c_hdmi_nodes, ARRAY_SIZE(t6041_j575c_hdmi_nodes),
+};
+
+static const struct gate_staged *t6041_max_stage(unsigned int i)
+{
+	if (i == 0 && of_machine_is_compatible("apple,j575c"))
+		return &t6041_j575c_hdmi;
+	if (i == 1 && of_machine_is_compatible("apple,j575c"))
+		return &t6041_j575c_usbc;
+	return &t6041_max_stages[i];
+}
 
 /* Applied, they stay: the live tree refers to them. Only the KUnit test reverts them. */
 static struct of_changeset t6041_max_cs[ARRAY_SIZE(t6041_max_stages)];
@@ -3014,7 +3188,7 @@ static struct of_changeset t6041_max_cs[ARRAY_SIZE(t6041_max_stages)];
 /* Enable every node of stage @i and put its display DART into the display subsystem's iommus. */
 static int __init t6041_max_apply(unsigned int i, struct device_node *display)
 {
-	const struct gate_staged *st = &t6041_max_stages[i];
+	const struct gate_staged *st = t6041_max_stage(i);
 	struct of_changeset *cs = &t6041_max_cs[i];
 	struct device_node *np;
 	unsigned int n;
@@ -3067,7 +3241,7 @@ static void __init gate_t6041_max_run(void)
 		return;
 	}
 	for (i = 0; i < ARRAY_SIZE(t6041_max_stages); i++) {
-		const struct gate_staged *st = &t6041_max_stages[i];
+		const struct gate_staged *st = t6041_max_stage(i);
 		const char *dcp = st->nodes[st->nr - 1];
 
 		if (!staged_ready(st))

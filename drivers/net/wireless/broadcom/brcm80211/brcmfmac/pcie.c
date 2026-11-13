@@ -8,12 +8,14 @@
 #include <linux/of.h>
 #include <linux/firmware.h>
 #include <linux/pci.h>
+#include <linux/soc/apple/radio-sleep.h>
 #include <linux/vmalloc.h>
 #include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/bcma/bcma.h>
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
+#include <linux/suspend.h>
 #include <linux/kthread.h>
 #include <linux/io.h>
 #include <linux/iommu.h>
@@ -225,6 +227,9 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 #define BRCMF_PCIE_MIN_SHARED_VERSION		5
 #define BRCMF_PCIE_MAX_SHARED_VERSION		BRCMF_PCIE_SHARED_VERSION_7
 #define BRCMF_PCIE_SHARED_VERSION_MASK		0x00FF
+#define BRCMF_PCIE_SHARED_ASSERT_BUILT		0x0100
+#define BRCMF_PCIE_SHARED_ASSERT		0x0200
+#define BRCMF_PCIE_SHARED_TRAP			0x0400
 #define BRCMF_PCIE_SHARED_DMA_INDEX		0x10000
 #define BRCMF_PCIE_SHARED_DMA_2B_IDX		0x100000
 #define BRCMF_PCIE_SHARED_USE_MAILBOX		0x2000000
@@ -285,6 +290,7 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 #define BRCMF_HOSTCAP2_DURATION_SCALE_MASK	0x3F
 
 #define BRCMF_SHARED_FLAGS_OFFSET		0
+#define BRCMF_SHARED_TRAP_ADDR_OFFSET		4
 #define BRCMF_SHARED_MAX_RXBUFPOST_OFFSET	34
 #define BRCMF_SHARED_RING_BASE_OFFSET		52
 #define BRCMF_SHARED_RX_DATAOFFSET_OFFSET	36
@@ -334,6 +340,12 @@ static const struct brcmf_firmware_mapping brcmf_pcie_fwnames[] = {
 
 #define BRCMF_PCIE_MBDATA_TIMEOUT		msecs_to_jiffies(2000)
 
+/* Stalled control requests in a row before a silent dongle counts as dead. */
+#define BRCMF_PCIE_CTL_STALL_MAX		3
+/* Firmware recoveries allowed per window before the driver gives up. */
+#define BRCMF_PCIE_RECOVERY_MAX			5
+#define BRCMF_PCIE_RECOVERY_WINDOW_S		600
+
 #define BRCMF_PCIE_CFGREG_STATUS_CMD		0x4
 #define BRCMF_PCIE_CFGREG_PM_CSR		0x4C
 #define BRCMF_PCIE_CFGREG_MSI_CAP		0x58
@@ -361,6 +373,9 @@ struct brcmf_pcie_console {
 	u32 read_idx;
 	u8 log_str[256];
 	u8 log_idx;
+	u32 scan_idx;
+	u8 scan_line[8];
+	u8 scan_len;
 };
 
 struct brcmf_pcie_shared_info {
@@ -398,6 +413,10 @@ struct brcmf_otp_params {
 
 struct brcmf_pciedev_info {
 	enum brcmf_pcie_state state;
+	/* Published only after the asynchronous firmware setup has completed. */
+	bool setup_complete;
+	/* This binding blocked reset work for the active radio transaction. */
+	bool sleep_reset_blocked;
 	bool in_irq;
 	struct pci_dev *pdev;
 	char fw_name[BRCMF_FW_NAME_LEN];
@@ -421,6 +440,12 @@ struct brcmf_pciedev_info {
 	bool irq_ready;
 	bool have_msi;
 	bool wowl_enabled;
+	bool wowl_irq;
+	bool irq_wake_enabled;
+	bool wowl_sleeping;
+	bool s2idle_d0;
+	bool wakeup_created;
+	bool wakeup_capable;
 	u8 dma_idx_sz;
 	void *idxbuf;
 	u32 idxbuf_sz;
@@ -431,6 +456,9 @@ struct brcmf_pciedev_info {
 	struct brcmf_mp_device *settings;
 	struct brcmf_otp_params otp;
 	bool fwseed;
+	bool fw_dead;
+	u32 recoveries;
+	unsigned long recovery_window;
 #ifdef DEBUG
 	u32 console_interval;
 	bool console_active;
@@ -926,6 +954,122 @@ brcmf_pcie_send_mb_data(struct brcmf_pciedev_info *devinfo, u32 htod_mb_data)
 	return 0;
 }
 
+/*
+ * The dongle firmware is dead: a halt notice, a trap or assert recorded in
+ * shared RAM or on its console, or a control ring that stopped moving. Stop
+ * using it and reset the chip the way the debugfs "reset" entry does, which
+ * reloads the firmware and registers the interfaces again. A firmware that
+ * keeps dying is left alone after BRCMF_PCIE_RECOVERY_MAX resets in
+ * BRCMF_PCIE_RECOVERY_WINDOW_S seconds.
+ */
+static void brcmf_pcie_fw_died(struct brcmf_pciedev_info *devinfo,
+			       const char *reason)
+{
+	struct device *dev = &devinfo->pdev->dev;
+	struct brcmf_bus *bus = dev_get_drvdata(dev);
+
+	if (xchg(&devinfo->fw_dead, true))
+		return;
+
+	if (!devinfo->recoveries ||
+	    time_after(jiffies, devinfo->recovery_window +
+				BRCMF_PCIE_RECOVERY_WINDOW_S * HZ)) {
+		devinfo->recovery_window = jiffies;
+		devinfo->recoveries = 0;
+	}
+	if (++devinfo->recoveries > BRCMF_PCIE_RECOVERY_MAX) {
+		brcmf_err(bus, "firmware died (%s), %d resets in %d s, not resetting again\n",
+			  reason, BRCMF_PCIE_RECOVERY_MAX,
+			  BRCMF_PCIE_RECOVERY_WINDOW_S);
+		return;
+	}
+
+	brcmf_err(bus, "firmware died (%s), resetting the chip (%u/%u)\n",
+		  reason, devinfo->recoveries, (u32)BRCMF_PCIE_RECOVERY_MAX);
+	/* Fail further firmware commands at once instead of timing out. */
+	if (bus)
+		brcmf_bus_change_state(bus, BRCMF_BUS_DOWN);
+	brcmf_fw_crashed(dev);
+}
+
+/*
+ * Look for a trap the firmware printed on its console since the last scan.
+ * Its trap handler starts the report with a line beginning "TRAP ".
+ */
+static bool brcmf_pcie_console_trapped(struct brcmf_pciedev_info *devinfo)
+{
+	struct brcmf_pcie_console *console = &devinfo->shared.console;
+	static const char marker[] = "TRAP ";
+	bool trapped = false;
+	u32 widx;
+	u8 ch;
+
+	if (!console->base_addr || !console->bufsize)
+		return false;
+	widx = brcmf_pcie_read_tcm32(devinfo, console->base_addr +
+				     BRCMF_CONSOLE_WRITEIDX_OFFSET);
+	if (widx >= console->bufsize || console->scan_idx >= console->bufsize)
+		return false;
+
+	while (console->scan_idx != widx) {
+		ch = brcmf_pcie_read_tcm8(devinfo,
+					  console->buf_addr + console->scan_idx);
+		if (++console->scan_idx == console->bufsize)
+			console->scan_idx = 0;
+		if (ch == '\n') {
+			console->scan_len = 0;
+			continue;
+		}
+		if (console->scan_len >= sizeof(marker) - 1)
+			continue;
+		if (ch != marker[console->scan_len]) {
+			/* Not at a line start any more: skip to the newline. */
+			console->scan_len = sizeof(marker) - 1;
+			continue;
+		}
+		if (++console->scan_len == sizeof(marker) - 1)
+			trapped = true;
+	}
+
+	return trapped;
+}
+
+static void brcmf_pcie_ctl_stall(struct device *dev, u32 stalls)
+{
+	struct brcmf_bus *bus = dev_get_drvdata(dev);
+	struct brcmf_pciedev_info *devinfo = bus->bus_priv.pcie->devinfo;
+	struct brcmf_pcie_shared_info *shared = &devinfo->shared;
+	const char *reason = NULL;
+	u32 flags, addr;
+
+	if (devinfo->state != BRCMFMAC_PCIE_STATE_UP || READ_ONCE(devinfo->fw_dead))
+		return;
+
+	flags = brcmf_pcie_read_tcm32(devinfo, shared->tcm_base_address +
+				      BRCMF_SHARED_FLAGS_OFFSET);
+	if (flags == ~0U) {
+		reason = "device not responding";
+	} else if (flags & BRCMF_PCIE_SHARED_TRAP) {
+		addr = brcmf_pcie_read_tcm32(devinfo, shared->tcm_base_address +
+					     BRCMF_SHARED_TRAP_ADDR_OFFSET);
+		/* trap type, then the exception pc */
+		brcmf_err(bus, "firmware trap 0x%x at 0x%08x\n",
+			  brcmf_pcie_read_tcm32(devinfo, addr),
+			  brcmf_pcie_read_tcm32(devinfo, addr + 4));
+		reason = "trap in shared RAM";
+	} else if ((flags & BRCMF_PCIE_SHARED_ASSERT_BUILT) &&
+		   (flags & BRCMF_PCIE_SHARED_ASSERT)) {
+		reason = "assert in shared RAM";
+	} else if (brcmf_pcie_console_trapped(devinfo)) {
+		reason = "trap on the firmware console";
+	} else if (stalls >= BRCMF_PCIE_CTL_STALL_MAX) {
+		reason = "no response to control requests";
+	}
+
+	if (reason)
+		brcmf_pcie_fw_died(devinfo, reason);
+}
+
 static void brcmf_pcie_handle_mb_data(struct brcmf_pciedev_info *devinfo, u32 data)
 {
 	brcmf_dbg(PCIE, "D2H_MB_DATA: 0x%04x\n", data);
@@ -943,7 +1087,7 @@ static void brcmf_pcie_handle_mb_data(struct brcmf_pciedev_info *devinfo, u32 da
 	}
 	if (data & BRCMF_D2H_DEV_FWHALT) {
 		brcmf_dbg(PCIE, "D2H_MB_DATA: FW HALT\n");
-		brcmf_fw_crashed(&devinfo->pdev->dev);
+		brcmf_pcie_fw_died(devinfo, "firmware halt notice");
 	}
 }
 
@@ -991,6 +1135,9 @@ static void brcmf_pcie_bus_console_init(struct brcmf_pciedev_info *devinfo)
 	console->buf_addr = brcmf_pcie_read_tcm32(devinfo, addr);
 	addr = console->base_addr + BRCMF_CONSOLE_BUFSIZE_OFFSET;
 	console->bufsize = brcmf_pcie_read_tcm32(devinfo, addr);
+	addr = console->base_addr + BRCMF_CONSOLE_WRITEIDX_OFFSET;
+	console->scan_idx = brcmf_pcie_read_tcm32(devinfo, addr);
+	console->scan_len = 0;
 
 	brcmf_dbg(FWCON, "Console: base %x, buf %x, size %d\n",
 		  console->base_addr, console->buf_addr, console->bufsize);
@@ -1100,6 +1247,13 @@ static irqreturn_t brcmf_pcie_isr_thread(int irq, void *arg)
 	u32 status;
 
 	devinfo->in_irq = true;
+	/*
+	 * While WoWLAN is armed the firmware only interrupts for a frame that
+	 * matched a wake filter or for a link loss: that ends the sleep, also
+	 * when it arrives before suspend_device_irqs() takes over.
+	 */
+	if (devinfo->wowl_sleeping)
+		pm_wakeup_hard_event(&devinfo->pdev->dev);
 	status = brcmf_pcie_read_pcie32(devinfo, devinfo->reginfo->mailboxint);
 	brcmf_dbg(PCIE, "Enter %x\n", status);
 	if (status) {
@@ -1125,8 +1279,10 @@ static int brcmf_pcie_request_irq(struct brcmf_pciedev_info *devinfo)
 {
 	struct pci_dev *pdev = devinfo->pdev;
 	struct brcmf_bus *bus = dev_get_drvdata(&pdev->dev);
+	int ret;
 
 	brcmf_pcie_intr_disable(devinfo);
+	bus->wowl_wake = pci_pme_capable(pdev, PCI_D3hot);
 
 	brcmf_dbg(PCIE, "Enter\n");
 
@@ -1141,8 +1297,37 @@ static int brcmf_pcie_request_irq(struct brcmf_pciedev_info *devinfo)
 		brcmf_err(bus, "Failed to request IRQ %d\n", pdev->irq);
 		return -EIO;
 	}
+
+	/* A DT wakeup source without HOST_WAKE uses the in-band MSI. */
+	if (devinfo->have_msi &&
+	    of_property_read_bool(pdev->dev.of_node, "wakeup-source") &&
+	    !of_property_present(pdev->dev.of_node, "interrupts") &&
+	    !of_property_present(pdev->dev.of_node, "interrupts-extended")) {
+		if (!device_may_wakeup(&pdev->dev)) {
+			devinfo->wakeup_capable = device_can_wakeup(&pdev->dev);
+			ret = device_init_wakeup(&pdev->dev, true);
+			if (ret) {
+				device_set_wakeup_capable(&pdev->dev,
+							  devinfo->wakeup_capable);
+				free_irq(pdev->irq, devinfo);
+				pci_disable_msi(pdev);
+				return ret;
+			}
+			devinfo->wakeup_created = true;
+		}
+		devinfo->wowl_irq = true;
+		bus->wowl_wake = true;
+	}
 	devinfo->irq_allocated = true;
 	return 0;
+}
+
+static void brcmf_pcie_disable_irq_wake(struct brcmf_pciedev_info *devinfo)
+{
+	if (devinfo->irq_wake_enabled) {
+		disable_irq_wake(devinfo->pdev->irq);
+		devinfo->irq_wake_enabled = false;
+	}
 }
 
 
@@ -1156,6 +1341,13 @@ static void brcmf_pcie_release_irq(struct brcmf_pciedev_info *devinfo)
 	if (!devinfo->irq_allocated)
 		return;
 
+	brcmf_pcie_disable_irq_wake(devinfo);
+	if (devinfo->wakeup_created) {
+		device_wakeup_disable(&pdev->dev);
+		device_set_wakeup_capable(&pdev->dev, devinfo->wakeup_capable);
+		devinfo->wakeup_created = false;
+	}
+	devinfo->wowl_irq = false;
 	brcmf_pcie_intr_disable(devinfo);
 	free_irq(pdev->irq, devinfo);
 	pci_disable_msi(pdev);
@@ -1717,16 +1909,41 @@ static int brcmf_pcie_reset(struct device *dev)
 	struct brcmf_fw_request *fwreq;
 	int err;
 
+	if (apple_radio_sleep_owned(dev))
+		return -EBUSY;
+
+	WRITE_ONCE(devinfo->setup_complete, false);
+	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
 	brcmf_pcie_intr_disable(devinfo);
+	if (devinfo->irq_allocated)
+		synchronize_irq(devinfo->pdev->irq);
+
+	/*
+	 * New firmware commands fail at once on a bus that is down; let one
+	 * already waiting for its response finish before the rings go away.
+	 */
+	brcmf_bus_change_state(bus_if, BRCMF_BUS_DOWN);
+	if (bus_if->drvr) {
+		mutex_lock(&bus_if->drvr->proto_block);
+		mutex_unlock(&bus_if->drvr->proto_block);
+	}
 
 	brcmf_pcie_bus_console_read(devinfo, true);
+
+	/*
+	 * Stop the dongle before its host buffers go away, as remove does:
+	 * firmware that is still running DMAs into the RX buffers that
+	 * brcmf_detach() unmaps.
+	 */
+	brcmf_pcie_reset_device(devinfo);
 
 	brcmf_detach(dev);
 
 	brcmf_pcie_release_irq(devinfo);
 	brcmf_pcie_release_scratchbuffers(devinfo);
 	brcmf_pcie_release_ringbuffers(devinfo);
-	brcmf_pcie_reset_device(devinfo);
+	kfree(bus_if->msgbuf->flowrings);
+	bus_if->msgbuf->flowrings = NULL;
 
 	fwreq = brcmf_pcie_prepare_fw_request(devinfo);
 	if (!fwreq) {
@@ -1756,6 +1973,7 @@ static const struct brcmf_bus_ops brcmf_pcie_bus_ops = {
 	.reset = brcmf_pcie_reset,
 	.debugfs_create = brcmf_pcie_debugfs_create,
 	.d2h_mb_rx = brcmf_pcie_d2h_mb_rx,
+	.ctl_stall = brcmf_pcie_ctl_stall,
 };
 
 
@@ -2556,6 +2774,7 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
 	if (ret)
 		goto fail;
 
+	WRITE_ONCE(devinfo->fw_dead, false);
 	devinfo->state = BRCMFMAC_PCIE_STATE_UP;
 
 	ret = brcmf_pcie_init_ringbuffers(devinfo);
@@ -2594,6 +2813,8 @@ static void brcmf_pcie_setup(struct device *dev, int ret,
 	brcmf_pcie_bus_console_read(devinfo, false);
 
 	brcmf_pcie_fwcon_timer(devinfo, true);
+	/* Publish completed firmware setup before suspend admission. */
+	smp_store_release(&devinfo->setup_complete, true);
 
 	return;
 
@@ -2958,7 +3179,8 @@ brcmf_pcie_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	bus->ops = &brcmf_pcie_bus_ops;
 	bus->proto_type = BRCMF_PROTO_MSGBUF;
 	bus->chip = devinfo->coreid;
-	bus->wowl_supported = pci_pme_capable(pdev, PCI_D3hot);
+	bus->wowl_transport = true;
+	bus->wowl_wake = pci_pme_capable(pdev, PCI_D3hot);
 	bus->fwvid = drvdata[id->driver_data].vendor;
 	devinfo->fwseed = drvdata[id->driver_data].fw_seed;
 	dev_set_drvdata(&pdev->dev, bus);
@@ -3043,6 +3265,14 @@ brcmf_pcie_remove(struct pci_dev *pdev)
 
 	brcmf_bus_cancel_reset_work(bus);
 
+	/*
+	 * Stop the dongle before its host buffers go away. Until the chip is
+	 * reset its firmware keeps running and DMAs received frames into the
+	 * RX buffers that brcmf_detach() unmaps, which the IOMMU reports as
+	 * translation faults.
+	 */
+	brcmf_pcie_reset_device(devinfo);
+
 	brcmf_detach(&pdev->dev);
 	brcmf_free(&pdev->dev);
 
@@ -3054,7 +3284,6 @@ brcmf_pcie_remove(struct pci_dev *pdev)
 	brcmf_pcie_release_irq(devinfo);
 	brcmf_pcie_release_scratchbuffers(devinfo);
 	brcmf_pcie_release_ringbuffers(devinfo);
-	brcmf_pcie_reset_device(devinfo);
 	brcmf_pcie_release_resource(devinfo);
 	release_firmware(devinfo->clm_fw);
 	release_firmware(devinfo->txcap_fw);
@@ -3071,18 +3300,136 @@ brcmf_pcie_remove(struct pci_dev *pdev)
 
 #ifdef CONFIG_PM
 
+static struct pci_driver brcmf_pciedrvr;
+
+static void brcmf_pcie_sleep_finish(struct device *dev)
+{
+	struct brcmf_pciedev_info *devinfo;
+	struct brcmf_bus *bus;
+
+	/* Async setup failure may unbind us after suspend refused admission. */
+	device_lock(dev);
+	if (dev->driver != &brcmf_pciedrvr.driver)
+		goto unlock;
+	bus = dev_get_drvdata(dev);
+	if (!bus)
+		goto unlock;
+	devinfo = bus->bus_priv.pcie->devinfo;
+	/* A replacement binding has no cleanup pending from this transaction. */
+	if (!devinfo->sleep_reset_blocked)
+		goto unlock;
+	devinfo->sleep_reset_blocked = false;
+	brcmf_bus_allow_reset_work(bus);
+unlock:
+	device_unlock(dev);
+}
+
+static int brcmf_pcie_pm_leave_D3(struct device *dev);
+
+static void brcmf_pcie_wowl_wake(struct brcmf_bus *bus,
+				 struct brcmf_pciedev_info *devinfo)
+{
+	devinfo->wowl_sleeping = false;
+	brcmf_pcie_intr_enable(devinfo);
+	brcmf_bus_change_state(bus, BRCMF_BUS_UP);
+	brcmf_msgbuf_resume(bus->drvr);
+	brcmf_pcie_fwcon_timer(devinfo, true);
+}
+
+/*
+ * WoWLAN in s2idle. The firmware stays awake in its associated low-power
+ * mode (LPAS) with the wake filters and offloads the cfg80211 layer set up,
+ * and the host is not told to sleep: after HOST_D3_INFORM the firmware
+ * raises no interrupt for a matched frame, neither the MSI nor a WAKE#
+ * line. Without it, a matched frame arrives as an ordinary D2H interrupt,
+ * so the MSI is the wake source. The function and its link stay in D0;
+ * saving the state here tells PCI PM that the driver keeps the power state.
+ */
+static int brcmf_pcie_wowl_sleep(struct device *dev)
+{
+	struct brcmf_bus *bus = dev_get_drvdata(dev);
+	struct brcmf_pciedev_info *devinfo = bus->bus_priv.pcie->devinfo;
+	int ret;
+
+	ret = enable_irq_wake(devinfo->pdev->irq);
+	if (ret) {
+		brcmf_err(bus, "Failed to arm WoWLAN IRQ: %d\n", ret);
+		goto fail;
+	}
+	devinfo->irq_wake_enabled = true;
+
+	ret = pci_save_state(devinfo->pdev);
+	if (ret) {
+		brcmf_pcie_disable_irq_wake(devinfo);
+		goto fail;
+	}
+	devinfo->wowl_sleeping = true;
+	return 0;
+
+fail:
+	/* A failing suspend callback is not resumed; the wiphy resume clears
+	 * the firmware WoWLAN policy.
+	 */
+	brcmf_pcie_wowl_wake(bus, devinfo);
+	return ret;
+}
+
+/*
+ * s2idle without WoWLAN on Apple firmware (fw_seed). cfg80211 has already
+ * left the network and the radio is off (mpc), so keep the function in D0
+ * and skip the HOST_D3_INFORM handshake. The BCM4387 firmware acknowledges
+ * D3 while a DMA is still in flight ("pciedev_d3_ack: dma in progress");
+ * after the next association its TX FIFO then stalls, the firmware traps in
+ * the reinit that follows and every command times out until reboot. This
+ * is the transport state of the WoWLAN sleep, without the wake IRQ.
+ */
+static int brcmf_pcie_s2idle_sleep(struct device *dev)
+{
+	struct brcmf_bus *bus = dev_get_drvdata(dev);
+	struct brcmf_pciedev_info *devinfo = bus->bus_priv.pcie->devinfo;
+	int ret;
+
+	ret = pci_save_state(devinfo->pdev);
+	if (ret) {
+		brcmf_bus_change_state(bus, BRCMF_BUS_UP);
+		brcmf_msgbuf_resume(bus->drvr);
+		brcmf_pcie_fwcon_timer(devinfo, true);
+		return ret;
+	}
+	devinfo->s2idle_d0 = true;
+	return 0;
+}
 
 static int brcmf_pcie_pm_enter_D3(struct device *dev)
 {
 	struct brcmf_pciedev_info *devinfo;
 	struct brcmf_bus *bus;
 	struct brcmf_if *ifp;
-	int ifidx;
+	int ifidx, ret;
 
 	brcmf_dbg(PCIE, "Enter\n");
 
 	bus = dev_get_drvdata(dev);
 	devinfo = bus->bus_priv.pcie->devinfo;
+
+	if (devinfo->wowl_irq && devinfo->wowl_enabled &&
+	    !device_may_wakeup(dev))
+		return -EINVAL;
+	if (devinfo->wowl_irq && devinfo->wowl_enabled &&
+	    pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
+		return -EOPNOTSUPP;
+
+	ret = apple_radio_sleep_endpoint_prepare(dev, brcmf_pcie_sleep_finish);
+	if (ret)
+		return ret;
+	/* Drain a recovery already running when the platform acquired its lease. */
+	if (apple_radio_sleep_owned(dev)) {
+		brcmf_bus_cancel_reset_work(bus);
+		devinfo->sleep_reset_blocked = true;
+		/* A reset can have returned while firmware loading is still async. */
+		if (!smp_load_acquire(&devinfo->setup_complete))
+			return -EBUSY;
+	}
 
 	/* Stop new packets and drain ndo_start_xmit before taking the bus down.
 	 * The BUS reason prevents completion flow control from waking the queue.
@@ -3098,6 +3445,12 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 	brcmf_pcie_fwcon_timer(devinfo, false);
 	brcmf_bus_change_state(bus, BRCMF_BUS_DOWN);
 
+	if (devinfo->wowl_irq && devinfo->wowl_enabled)
+		return brcmf_pcie_wowl_sleep(dev);
+
+	if (devinfo->fwseed && pm_suspend_target_state == PM_SUSPEND_TO_IDLE)
+		return brcmf_pcie_s2idle_sleep(dev);
+
 	devinfo->mbdata_completed = false;
 	brcmf_pcie_send_mb_data(devinfo, BRCMF_H2D_HOST_D3_INFORM);
 
@@ -3112,8 +3465,10 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 	}
 
 	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
-
-	return 0;
+	ret = apple_radio_sleep_endpoint_suspended(dev);
+	if (ret)
+		brcmf_pcie_pm_leave_D3(dev);
+	return ret;
 }
 
 
@@ -3124,11 +3479,28 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
 	struct pci_dev *pdev;
 	int err;
 
+	err = apple_radio_sleep_endpoint_resume(dev);
+	if (err)
+		return err;
 	brcmf_dbg(PCIE, "Enter\n");
 
 	bus = dev_get_drvdata(dev);
 	devinfo = bus->bus_priv.pcie->devinfo;
 	brcmf_dbg(PCIE, "Enter, dev=%p, bus=%p\n", dev, bus);
+
+	if (devinfo->wowl_sleeping) {
+		pci_restore_state(devinfo->pdev);
+		brcmf_pcie_disable_irq_wake(devinfo);
+		brcmf_pcie_wowl_wake(bus, devinfo);
+		return 0;
+	}
+
+	if (devinfo->s2idle_d0) {
+		devinfo->s2idle_d0 = false;
+		pci_restore_state(devinfo->pdev);
+		brcmf_pcie_wowl_wake(bus, devinfo);
+		return 0;
+	}
 
 	/* Check if device is still up and running, if so we are ready */
 	if (brcmf_pcie_read_pcie32(devinfo, devinfo->reginfo->intmask) != 0) {
@@ -3144,11 +3516,17 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
 		brcmf_bus_change_state(bus, BRCMF_BUS_UP);
 		brcmf_msgbuf_resume(bus->drvr);
 		brcmf_pcie_fwcon_timer(devinfo, true);
+		apple_radio_sleep_endpoint_resumed(dev, 0);
 		return 0;
 	}
 
 cleanup:
 	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
+	if (apple_radio_sleep_owned(dev)) {
+		/* Lost firmware/rings violate retention; reset/reprobe is not recovery. */
+		apple_radio_sleep_endpoint_resumed(dev, -EUCLEAN);
+		return -EUCLEAN;
+	}
 	brcmf_chip_detach(devinfo->ci);
 	devinfo->ci = NULL;
 	pdev = devinfo->pdev;
@@ -3166,6 +3544,7 @@ static const struct dev_pm_ops brcmf_pciedrvr_pm = {
 	.suspend = brcmf_pcie_pm_enter_D3,
 	.resume = brcmf_pcie_pm_leave_D3,
 	.freeze = brcmf_pcie_pm_enter_D3,
+	.thaw = brcmf_pcie_pm_leave_D3,
 	.restore = brcmf_pcie_pm_leave_D3,
 };
 

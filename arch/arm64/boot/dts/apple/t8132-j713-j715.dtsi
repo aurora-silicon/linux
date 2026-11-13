@@ -135,6 +135,8 @@
 &dcp {
 	apple,panel-width-mm = <290>;
 	apple,panel-height-mm = <188>;
+	#address-cells = <2>;
+	#size-cells = <2>;
 };
 
 /* External displays: both pipes, routed to either USB-C port. */
@@ -319,3 +321,11 @@
 #include "t8132-j713-atcphy-tunables.dtsi"
 #include "t8132-j713-usb4.dtsi"
 #include "t8132-j713-usb4-tunables.dtsi"
+
+&avd_dart {
+	status = "okay";
+};
+
+&avd {
+	status = "okay";
+};

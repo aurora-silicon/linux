@@ -1271,7 +1271,8 @@ static int brcmf_usb_probe_cb(struct brcmf_usbdev_info *devinfo,
 	bus->fwvid = fwvid;
 	bus->always_use_fws_queue = true;
 #ifdef CONFIG_PM
-	bus->wowl_supported = true;
+	bus->wowl_transport = true;
+	bus->wowl_wake = true;
 #endif
 
 	devinfo->settings = brcmf_get_module_param(bus->dev, BRCMF_BUSTYPE_USB,
