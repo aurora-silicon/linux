@@ -101,6 +101,8 @@ enum apple_smc_boot_stage {
  * @mutex: Mutex for non-atomic mode
  * @lock: Spinlock for atomic mode
  */
+struct apple_sleep_smc_policy;
+
 struct apple_smc {
 	struct device *dev;
 
@@ -116,6 +118,20 @@ struct apple_smc {
 	bool ap_notified;
 	/* Told of a coming sleep, and not yet of its end. */
 	bool sleep_warned;
+	const struct apple_sleep_smc_policy *sleep_policy;
+	u64 sleep_warn_ack;
+	bool sleep_pmvc_info;
+	/* The saved scope's pmVC after ANS (macOS writes two there), and when it was answered. */
+	bool saved_pmvc_sent;
+	u64 saved_pmvc_at;
+	/* T6050's saved-context ownership over a sleep. Protected by the
+	 * command mutex, or by the exclusive synchronized RX/PM scope. RX may
+	 * resolve only the matching pending ID; timeout never cancels SRAM use.
+	 */
+	bool saved_enabled, saved_blocked, saved_scope, saved_committed;
+	bool saved_pending, saved_recovery, saved_wake;
+	int saved_fault, saved_notice_error, saved_restore_error;
+	u64 saved_unexpected;
 	/* To be told at the noirq suspend, after the debug link's cut. */
 	bool sleep_warn_late;
 	/* In a noirq phase: replies are polled for. */
