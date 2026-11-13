@@ -19,6 +19,7 @@ mod der;
 mod diag;
 mod dt;
 mod fv;
+mod hdcp;
 mod hibe;
 mod hwrng;
 mod image;
