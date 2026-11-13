@@ -27,7 +27,7 @@ HEALTHY = {
     "xart_guard_list": "loaded", "xart_guard_refusals": "0",
     "matching": "unverified", "os_identity": "explicit", "hwrng": "registered",
     "xarm_failures": "0", "unhandled_messages": "0", "sleep": "awake",
-    "sleeps": "3", "stac": "online", "stac_onlines": "4",
+    "sleeps": "3", "stac": "online", "stac_onlines": "4", "pnon": "read",
 }
 
 
@@ -124,6 +124,24 @@ class StatusTest(unittest.TestCase):
         self.assertNotIn("stac", v)
         row = [r for r in report["checks"] if r["check"] == "endpoint-clients"][0]
         self.assertIn("stac", row["detail"])
+
+    def test_the_boot_policy_digest_is_reported(self):
+        rc, report, v = self.run_status()
+        self.assertEqual((rc, v["pnon"]), (0, "PASS"))
+        row = [r for r in report["checks"] if r["check"] == "endpoint-clients"][0]
+        self.assertIn("pnon=", row["value"])
+        self.set("pnon", "failed")
+        rc, _, v = self.run_status()
+        self.assertEqual((rc, v["pnon"]), (0, "WARN"))
+        self.set("pnon", "absent")
+        rc, _, v = self.run_status()
+        self.assertEqual((rc, v["pnon"]), (0, "INFO"))
+        # A kernel without the client lists pnon as unserved.
+        self.set("pnon", None)
+        rc, report, v = self.run_status()
+        self.assertNotIn("pnon", v)
+        row = [r for r in report["checks"] if r["check"] == "endpoint-clients"][0]
+        self.assertIn("pnon", row["detail"])
 
     def test_a_closed_key_store_fails(self):
         self.set("keystore", "closed")

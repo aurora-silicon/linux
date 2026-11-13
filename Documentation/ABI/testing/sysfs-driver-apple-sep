@@ -512,6 +512,28 @@ Description:
 		kernel log says which). stac_onlines counts the accepted
 		reports since probe, as an unsigned decimal.
 
+What:		/sys/bus/platform/devices/<unit>.sep/diag/pnon
+What:		/sys/bus/platform/devices/<unit>.sep/diag/local_policy_digest
+Date:		November 2026
+KernelVersion:	7.3
+Contact:	Ryan Murray <ryan@aurorasilicon.org>
+Description:
+		The enclave's boot-policy service (endpoint pnon). Once the
+		bring-up ends, the driver asks it once for the SHA-384
+		digest of the nonce the blessed LocalPolicy of this boot is
+		bound to, and sends it nothing else. The nonce stays in the
+		enclave and changes only when the policy is replaced, so the
+		digest is the enclave's account of which LocalPolicy admitted
+		this boot.
+		(RO) pnon reads "pending" until the read ends, then "read",
+		"absent" (the enclave does not offer the endpoint with a
+		buffer layout the driver knows, so it is left alone) or
+		"failed" (refused, malformed, unanswered or not sent; the
+		kernel log says which).
+		(RO, root only) local_policy_digest is the digest as 96
+		lowercase hex digits once pnon reads "read", and
+		"unavailable" before then.
+
 What:		/sys/bus/platform/devices/<unit>.sep/diag/xarm_failures
 Date:		November 2026
 KernelVersion:	7.3

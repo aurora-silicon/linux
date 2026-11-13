@@ -159,6 +159,8 @@ def status(live=True):
         served = dict(SERVED)
         if d("stac") is not None:
             served["stac"] = "accessory power state"
+        if d("pnon") is not None:
+            served["pnon"] = "LocalPolicy nonce digest"
         unserved = [e for e in have if e not in served]
         r.add(INFO, "endpoint-clients",
               ", ".join("%s=%s" % (e, served[e]) for e in have if e in served),
@@ -253,6 +255,20 @@ def status(live=True):
                   "as the driver knows it")
         else:
             r.add(WARN, "stac", stac, "the trusted-accessory online report has not succeeded "
+                  "(the kernel log says why)")
+
+    pnon = d("pnon")
+    if pnon is not None:
+        if pnon == "read":
+            r.add(PASS, "pnon", pnon, "the boot-policy service returned the LocalPolicy nonce digest "
+                  "(diag/local_policy_digest, root only)")
+        elif pnon == "absent":
+            r.add(INFO, "pnon", pnon, "this enclave does not offer the boot-policy endpoint "
+                  "as the driver knows it")
+        elif pnon == "pending":
+            r.add(INFO, "pnon", pnon, "the digest read has not finished yet")
+        else:
+            r.add(WARN, "pnon", pnon, "the LocalPolicy nonce digest read has not succeeded "
                   "(the kernel log says why)")
 
     for node, why in (("/dev/sep-bio", "Touch ID"), ("/dev/sep-key", "enclave keys")):
