@@ -1494,6 +1494,18 @@ static __maybe_unused int apple_isp_suspend(struct device *dev)
 	if (power_lost)
 		apple_isp_stop_resident(isp, true);
 	apple_isp_firmware_flush(isp);
+
+	/*
+	 * A stream stopped for suspend-to-idle has stopped firmware that starts
+	 * again, too. Its start from .resume never gets the firmware's first
+	 * boot message; from process context it does. Restart it there, as
+	 * after a sleep that powered the SoC down.
+	 */
+	mutex_lock(&isp->video_lock);
+	if (isp->hw->fw_restart && isp->fw_state == ISP_FW_OFF &&
+	    test_bit(ISP_STATE_SLEEPING, &isp->state))
+		isp->fw_sleep_stopped = true;
+	mutex_unlock(&isp->video_lock);
 	return 0;
 }
 
