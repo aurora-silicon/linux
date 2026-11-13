@@ -79,8 +79,6 @@ void dcp_indicator_release(struct apple_dcp *dcp)
 		return;
 	scoped_guard(mutex, &ci->ctl) {
 		fb = ci->fb;
-		if (ci->plane)
-			WRITE_ONCE(to_apple_plane(ci->plane)->indicator_fb, NULL);
 		spin_lock_irqsave(&ci->lock, flags);
 		ci->fb = NULL;
 		ci->plane = NULL;
@@ -161,8 +159,13 @@ int dcp_indicator_attach_plane(struct apple_dcp *dcp, struct drm_device *drm,
 	spin_lock_irqsave(&ci->lock, flags);
 	ci->fb = fb;
 	spin_unlock_irqrestore(&ci->lock, flags);
-	WRITE_ONCE(to_apple_plane(plane)->indicator_fb, fb);
 	return 0;
+}
+
+/* The framebuffer is the kernel's: its funcs are ours, and userspace cannot name it. */
+bool dcp_indicator_owns_fb(const struct drm_framebuffer *fb)
+{
+	return fb && fb->funcs == &dcp_indicator_fb_funcs;
 }
 
 /* The atomic state the kernel itself commits: the square, or nothing. */
@@ -337,9 +340,37 @@ static int dcp_indicator_request(struct apple_dcp *dcp)
 		dcp_indicator_end(dcp);
 		return ret;
 	}
+	/* A panel that was not ready kept the request: the display resuming asks again. */
+	spin_lock_irqsave(&ci->lock, flags);
+	ret = dcp_ind_wants_resume(&ci->state);
+	spin_unlock_irqrestore(&ci->lock, flags);
+	if (ret)
+		return 0;
 	ci->deadline = jiffies + IND_PRESENT_TIMEOUT;
 	mod_delayed_work(system_percpu_wq, &ci->watch, IND_PRESENT_TIMEOUT);
 	return 0;
+}
+
+/*
+ * The display resumed: the plane came back disabled, so whatever the square was
+ * it is OFF now, and a request that still stands is asked for again.
+ */
+void dcp_indicator_display_resumed(struct apple_dcp *dcp)
+{
+	struct dcp_camera_indicator *ci;
+	unsigned long flags;
+
+	/* A CRTC whose DCP is not bound has no drvdata. */
+	if (!dcp)
+		return;
+	ci = &dcp->camera_ind;
+	if (!ci->has_surf)
+		return;
+	spin_lock_irqsave(&ci->lock, flags);
+	dcp_ind_display_resumed(&ci->state);
+	if (ci->fb && dcp_ind_wants_resume(&ci->state))
+		schedule_work(&ci->resume);
+	spin_unlock_irqrestore(&ci->lock, flags);
 }
 
 /* After a DRM rebind: the camera still streams, so the square is asked for again. */
