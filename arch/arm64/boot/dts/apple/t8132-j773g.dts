@@ -298,3 +298,15 @@
 &avd {
 	status = "okay";
 };
+
+&dart_ave0 {
+	status = "okay";
+};
+
+&dart_ave1 {
+	status = "okay";
+};
+
+&ave {
+	status = "okay";
+};

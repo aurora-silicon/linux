@@ -109,6 +109,29 @@ const struct ave_variant ave_t6041 = {
 	.boot_qualified = true,
 };
 
+/*
+ * The M4 (T8132), as seen on the MacBook Air (J713): iBoot preloads TEXT
+ * 0x148000 and DATA 0x12c000 (ADT ave segment-ranges), TEXT CRC 9308d2ab.
+ * The capability table in that TEXT has device 26, type 24 as its default
+ * target. Started with the T6041 coprocessor registers and start sequence,
+ * from the code base the bootloader left (checked, not written), it boots
+ * as device 26, accepts the handshake for type 24 and encodes H.264 and HEVC.
+ */
+static const struct ave_variant ave_t8132 = {
+	.regs = &ave_coproc_v40,
+	.fw_text_size = 0x148000,
+	.fw_data_size = 0x12c000,
+	.boot_device_id = 26,
+	.boot_arg_value = AVE_COPROC_BOOT_ARG_VALUE,
+	.timebase_multiplier = 1,
+	.vcbar_mask = U64_MAX,
+	.vcbar_flags = AVE_COPROC_VCBAR_VALID,
+	.device_type = 24,
+	.lfs_ref_scale = 2,
+	.text_crc = AVE_FW_TEXT_CRC_T8132_25G83,
+	.boot_qualified = true,
+};
+
 static const struct ave_variant ave_t8140 = {
 	.regs = &ave_coproc_v40,
 	.fw_text_size = 0x14c000,
@@ -587,6 +610,7 @@ static const struct of_device_id ave_of_match[] = {
 	{ .compatible = "apple,t6050-ave", .data = &ave_t6050 },
 	{ .compatible = "apple,t8112-ave", .data = &ave_t8112 },
 	{ .compatible = "apple,t8140-ave", .data = &ave_t8140 },
+	{ .compatible = "apple,t8132-ave", .data = &ave_t8132 },
 	{}
 };
 MODULE_DEVICE_TABLE(of, ave_of_match);
