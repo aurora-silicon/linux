@@ -108,8 +108,20 @@ enum {
 	AV_AUDIO_ENDPOINT_DESKTOP = 0x2b,
 	DPTX_ENDPOINT = 0x2a,
 	DPTX_ENDPOINT_V2 = 0x2c,
-	HDCP_ENDPOINT = 0x2b,
+	/*
+	 * Compact desktop/M4 firmware: the panel processor advertises
+	 * dcpav-video-interface-epic on 0x2b, the external ones the audio
+	 * service (AV_AUDIO_ENDPOINT_DESKTOP).  Nothing HDCP lives here.
+	 */
+	AV_VIDEO_ENDPOINT = 0x2b,
+	/*
+	 * 0x2d is the remote allocator for the IOMFB firmware (H17P, 27.0
+	 * internal), which must be started before IOMFB.  Compact desktop/M4
+	 * firmware advertises dcpdptx-hdcp-interface on it instead, one per
+	 * processor (disp0, dispext0, dispext1).  Bind HDCP by service name.
+	 */
 	REMOTE_ALLOC_ENDPOINT = 0x2d,
+	DPTX_HDCP_ENDPOINT = 0x2d,
 	IOMFB_ENDPOINT = 0x37,
 };
 

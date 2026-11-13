@@ -3927,9 +3927,9 @@ static const struct {
 	{ DPAVSERV_ENDPOINT, "DPAVSERV" },
 	{ AV_ENDPOINT, "AV" },
 	{ DPTX_ENDPOINT, "DPTX" },
-	{ HDCP_ENDPOINT, "HDCP" },
+	{ AV_VIDEO_ENDPOINT, "AVVIDEO" },
 	{ EPIC2C_ENDPOINT, "EPIC2C" },
-	{ REMOTE_ALLOC_ENDPOINT, "REMOTEALLOC" },
+	{ DPTX_HDCP_ENDPOINT, "DPTXHDCP" },
 };
 
 static void dcp_desktop_graph_skip(struct apple_dcp *dcp, u32 endpoint,
@@ -3946,7 +3946,7 @@ static void dcp_desktop_graph_skip(struct apple_dcp *dcp, u32 endpoint,
 
 /*
  * The external processors (T6041 dcpext): DPDEV, DPAVCTRL (all four
- * controller interfaces), DPSAC, AV and REMOTEALLOC as advertised, then
+ * controller interfaces), DPSAC, AV and DPTXHDCP as advertised, then
  * with a DP PHY or a Type-C route iBoot, the DPTX port services on EPIC2C,
  * DPAVSERV for the EDID, EXPERT and EPIC25, and the DPTX connect of port 0.
  * A failure fails this processor's start; the panel is not affected.
@@ -3997,8 +3997,8 @@ static int dcp_start_desktop_external(struct apple_dcp *dcp, u32 map)
 			d->graph_started |= BIT(AV_AUDIO_ENDPOINT_DESKTOP - 0x20);
 	}
 #endif
-	ret = dcp_desktop_start_ext_ep(dcp, map, REMOTE_ALLOC_ENDPOINT,
-				       "REMOTEALLOC");
+	ret = dcp_desktop_start_ext_ep(dcp, map, DPTX_HDCP_ENDPOINT,
+				       "DPTXHDCP");
 	if (ret)
 		return ret;
 
