@@ -257,6 +257,37 @@ patternProperties:
         $ref: '#/$defs/tunable'
         description: Initialization tuples relative to this port's registers.
 
+      apple,apcie-config-tunables:
+        $ref: '#/$defs/t6050-tunable'
+        description:
+          T6050 tunables for this port's registers. The OS applies them when
+          it brings the port up itself (pwren-gpios) or restarts an adopted
+          port, before it lets the port out of reset.
+
+      apple,pcie-rc-tunables:
+        $ref: '#/$defs/t6050-tunable'
+        description:
+          T6050 tunables for this port's root complex configuration space,
+          applied right after apple,apcie-config-tunables.
+
+      apple,pcie-rc-gen3-shadow-tunables:
+        $ref: '#/$defs/t6050-tunable'
+        description:
+          T6050 root complex tunables for the Gen3 rate shadow registers,
+          applied with apple,pcie-rc-tunables.
+
+      apple,pcie-rc-gen4-shadow-tunables:
+        $ref: '#/$defs/t6050-tunable'
+        description:
+          T6050 root complex tunables for the Gen4 rate shadow registers,
+          applied with apple,pcie-rc-tunables.
+
+      apple,pcie-rc-gen5-shadow-tunables:
+        $ref: '#/$defs/t6050-tunable'
+        description:
+          T6050 root complex tunables for the Gen5 rate shadow registers,
+          applied with apple,pcie-rc-tunables.
+
     required:
       - interrupt-controller
       - "#interrupt-cells"
@@ -366,6 +397,11 @@ allOf:
         "^pci@":
           properties:
             apple,link-trained-by-bootloader: false
+            apple,apcie-config-tunables: false
+            apple,pcie-rc-tunables: false
+            apple,pcie-rc-gen3-shadow-tunables: false
+            apple,pcie-rc-gen4-shadow-tunables: false
+            apple,pcie-rc-gen5-shadow-tunables: false
   - if:
       properties:
         compatible:
