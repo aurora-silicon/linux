@@ -100,7 +100,7 @@ const FW_REGION_MAX_SIZE: u64 = 0x10_0000;
 /// The DART page size the firmware segments are mapped with.
 const FW_REGION_PAGE: u64 = 0x4000;
 const AFK_ENDPOINT_START: u8 = 0x20;
-const AFK_ENDPOINT_COUNT: u8 = 0xf;
+const AFK_ENDPOINT_COUNT: u8 = 0x11;
 const AFK_OPC_GET_BUF: u64 = 0x89;
 const AFK_OPC_INIT: u64 = 0x80;
 const AFK_OPC_INIT_RX: u64 = 0x8b;
@@ -3220,4 +3220,29 @@ module_platform_driver! {
     name: "apple_aop",
     description: "AOP driver",
     license: "Dual MIT/GPL",
+}
+
+#[kunit_tests(apple_aop)]
+mod tests {
+    use super::*;
+
+    /// Every endpoint a firmware can advertise, 0x20 to 0x30, is started. The
+    /// T6050 endpoint map ends at 0x30 and its firmware stalls at boot until
+    /// 0x2f and 0x30 are started.
+    #[test]
+    fn default_order_covers_every_advertised_endpoint() {
+        let mut order = AfkOrder::new(&[]);
+        for ep in 0x20..=0x30u8 {
+            assert_eq!(order.next(), Some(ep));
+        }
+        assert_eq!(order.next(), None);
+    }
+
+    #[test]
+    fn endpoint_index_covers_the_last_endpoint_only() {
+        assert_eq!(afk_endpoint_index(0x20), Some(0));
+        assert_eq!(afk_endpoint_index(0x30), Some(0x10));
+        assert_eq!(afk_endpoint_index(0x31), None);
+        assert_eq!(afk_endpoint_index(0x1f), None);
+    }
 }
