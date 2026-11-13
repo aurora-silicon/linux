@@ -826,7 +826,8 @@ static void isp_test_stream_failure_lights_off(struct kunit *test)
 	kunit_activate_static_stub(test, isp_cmd_ch_start, isp_test_fw_start);
 	KUNIT_EXPECT_EQ(test, apple_isp_start_capture(isp), -ETIME);
 	KUNIT_EXPECT_EQ(test, trace.set_on_at, 1);
-	KUNIT_EXPECT_EQ(test, trace.set_off_at, 2);
+	KUNIT_EXPECT_EQ(test, trace.fw_start_at, 2);
+	KUNIT_EXPECT_EQ(test, trace.set_off_at, 3);
 }
 
 static void isp_test_failed_fw_stop_lights_off(struct kunit *test)
