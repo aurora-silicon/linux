@@ -354,7 +354,11 @@ struct isp_format {
 struct apple_isp {
 	struct device *dev;
 	const struct apple_isp_hw *hw;
-	/* The DCP presenting the software camera indicator (apple,camera-indicator) */
+	/*
+	 * The DCP presenting the software camera indicator (apple,camera-indicator):
+	 * its node from probe, its device once found when a stream starts.
+	 */
+	struct device_node *dcp_np;
 	struct device *dcp;
 	enum isp_firmware_version fw_compat;
 	bool preview_26;
