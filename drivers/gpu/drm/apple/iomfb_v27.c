@@ -177,9 +177,9 @@ static const struct dcp_method_entry dcp_methods_27_2[dcpep_num_methods] = {
  * abort_swaps_dcp A530, register_dfb_surface A534, set_power_state A535,
  * pipe_query_474 A536, pipe_set_476 A538, pipe_query_478 A540). A516
  * first_client_open and A464/A465 pipe_cfg were placed by the +50 rule and by
- * their request sizes. dfb_ready_query is A384, the ID a 27.3 boot has been
- * run with; a 27.3 macOS trace shows A385 there, which is not yet tried on
- * hardware.
+ * their request sizes. dfb_ready_query has no entry, as in the 27.2 table:
+ * a 27.3 macOS trace shows A385 and a boot sent A384 without a crash, but
+ * neither is shown to be that call, so boot_5() skips it.
  */
 static const struct dcp_method_entry dcp_methods_27_3[dcpep_num_methods] = {
 	IOMFB_METHOD("A000", dcpep_late_init_signal),
