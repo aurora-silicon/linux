@@ -3408,6 +3408,7 @@ bool iomfb_apply_backlight_h17p(struct apple_dcp *dcp,
 	dcp->edr_present_sdr = present.nits;
 	iomfb_encode_backlight_h17p(wire, present.nits,
 				    dcp->brightness.maximum, !ret);
+	dcp_camind_backlight(dcp, wire, present.nits);
 	return true;
 }
 
@@ -3577,6 +3578,53 @@ static void iomfb_edr_tick(struct work_struct *work)
 
 	if (READ_ONCE(dcp->edr_ramping))
 		iomfb_backlight_kick(dcp);
+}
+
+/*
+ * The camera indicator wants on or off the panel while the compositor shows
+ * no new frame: present the frame on screen again, brightness only, and
+ * dcp_camind_prepare() adds or removes it. After a wake that waits for the
+ * compositor's first frame, which then carries it.
+ */
+static void iomfb_camind_start(struct apple_dcp *dcp,
+			       struct iomfb_transaction *transaction)
+{
+	struct iomfb_scanout_h17p *scanout = dcp->iomfb.scanout;
+	bool have_surface = false;
+	unsigned int i;
+
+	if (!dcp_camind_pending(dcp) || !READ_ONCE(dcp->mode_state.valid) ||
+	    !scanout || !dcp->connector || !dcp->connector->connected ||
+	    READ_ONCE(dcp->s2r_scanout_hold))
+		return;
+	for (i = 0; i < SWAP_SURFACES; i++)
+		have_surface |= !!scanout->fb[i];
+	if (!have_surface)
+		return;
+
+	dcp->swap.h17p = scanout->request;
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+		iomfb_present_backlight_v27(dcp);
+	else
+		iomfb_present_backlight_h17p(dcp);
+}
+
+void iomfb_camind_kick(struct apple_dcp *dcp)
+{
+	struct iomfb_transaction *transaction;
+
+	if (!iomfb_uses_queue(dcp))
+		return;
+	transaction = kzalloc_obj(*transaction);
+	if (!transaction)
+		return;
+	transaction->start = iomfb_camind_start;
+	transaction->release = iomfb_backlight_release;
+	transaction->brightness_only = true;
+	transaction->presentation = true;
+	/* -EALREADY: a queued brightness present carries it as well. */
+	if (iomfb_queue(dcp, transaction))
+		kfree(transaction);
 }
 
 int iomfb_configure_backlight_h17p(struct apple_dcp *dcp, u32 maximum,

@@ -743,8 +743,10 @@ static void dcp_report_swap_complete(struct apple_dcp *dcp, u32 id, ktime_t now)
 		dcp->crashed = true;
 		return;
 	}
-	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
 		retire = iomfb_present_complete_h17p(dcp);
+		dcp_camind_complete(dcp, id);
+	}
 #endif
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)
 	/* Late or duplicate completions cannot retire the replacement's flip. */
@@ -2243,6 +2245,9 @@ static void dcp_prepare_clear_swap(struct apple_dcp *dcp, void *request)
 {
 	typeof(DCP_FW_SWAP(dcp)) *swap = request;
 
+	/* The clear takes the camera indicator off with everything else. */
+	dcp_camind_lost(dcp);
+
 	/* Clear surfaces. */
 	memset(swap, 0, sizeof(*swap));
 
@@ -2663,6 +2668,8 @@ int DCP_FW_NAME(iomfb_s2r_power)(struct apple_dcp *dcp, bool on, bool named_call
 	/* increase refcount to ensure the receiver has a reference */
 	kref_get(&cookie->refcount);
 
+	if (!on)
+		dcp_camind_lost(dcp);
 	dcp->s2r_power_on = on;
 	dcp->s2r_power_oob = oob;
 	dcp->s2r_step = named_calls ? 0 : ARRAY_SIZE(dcp_s2r_seq) - 1;
@@ -2741,6 +2748,9 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	struct dcp_swap_cookie *cookie;
 	struct dcp_wait_cookie *poff_cookie;
 	typeof(DCP_FW_SWAP(dcp)) *swap = &DCP_FW_SWAP(dcp);
+
+	/* Whatever the panel shows next, the indicator is not on it yet. */
+	dcp_camind_lost(dcp);
 
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
 	/*
@@ -2940,6 +2950,9 @@ void DCP_FW_NAME(iomfb_sleep)(struct apple_dcp *dcp)
 #endif
 
 	struct dcp_wait_cookie *cookie;
+
+	/* Whatever the panel shows next, the indicator is not on it yet. */
+	dcp_camind_lost(dcp);
 
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
 	ret = dcp_peer_stop_v27(dcp);
@@ -3419,6 +3432,10 @@ static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 	}
 #endif
 	trace_iomfb_swap_submit(dcp, resp->swap_id);
+#if DCP_FW_H17(DCP_FW_VER)
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+		dcp_camind_prepare(dcp, &DCP_FW_SWAP(dcp), resp->swap_id);
+#endif
 	dcp_h17p_prepare_swap(dcp);
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)
 	dcp_peer_swap_submit_26_6(dcp, &DCP_FW_SWAP(dcp), resp->swap_id);
@@ -3783,6 +3800,9 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	struct dcp_color_mode *cmode = NULL;
 	int ret;
 
+	/* Whatever the panel shows next, the indicator is not on it yet. */
+	dcp_camind_lost(dcp);
+
 	if (dcp->crashed)
 		return -ENODEV;
 	/* A timed-out command still owns its channel until firmware replies. */
@@ -4041,6 +4061,9 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	bool paired = false;
 	int ret;
 
+	/* Whatever the panel shows next, the indicator is not on it yet. */
+	dcp_camind_lost(dcp);
+
 	if (!lookup_mode(dcp, &crtc_state->mode, mode)) {
 		dev_err(dcp->dev, "no match for " DRM_MODE_FMT "\n",
 			DRM_MODE_ARG(&crtc_state->mode));
@@ -4242,6 +4265,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 #endif
 
 	crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
+	dcp_camind_mode(dcp, crtc_state->mode.hdisplay, crtc_state->mode.vdisplay);
 
 	/* Reset all surfaces to defaults */
 	memset(req, 0, sizeof(*req));

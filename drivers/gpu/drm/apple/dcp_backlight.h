@@ -391,6 +391,7 @@ int dcp_backlight_configure(struct apple_dcp *dcp, u32 maximum,
 			    void (*kick)(struct apple_dcp *dcp));
 bool dcp_backlight_seed(struct apple_dcp *dcp, u32 nits);
 int dcp_backlight_dpms(struct apple_dcp *dcp, bool on);
+bool dcp_backlight_lit(struct apple_dcp *dcp);
 int dcp_backlight_prepare(struct apple_dcp *dcp, bool have_surface,
 			  struct dcp_backlight_present *present);
 bool dcp_backlight_complete(struct apple_dcp *dcp, u64 sequence, bool accepted);

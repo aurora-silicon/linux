@@ -52,6 +52,7 @@
 #include "apple_boot_display.h"
 #include "apple_resume.h"
 #include "dcp.h"
+#include "dcp-camera-indicator.h"
 #include "plane.h"
 #include "iomfb_m4.h"
 #include "t8132_ext_drm.h"
@@ -1200,6 +1201,13 @@ static int apple_probe_per_dcp(struct device *dev,
 	crtc->dcp = dcp;
 	*crtc_mask = drm_crtc_mask(&crtc->base);
 	connector_type = dcp_get_connector_type(dcp);
+
+	/* Kernel-drawn camera-in-use indicator, where the camera needs one. */
+	if (dcp_camind_eligible(dcp_data, iomfb_surfaces)) {
+		ret = dcp_camind_attach(dcp_data, drm);
+		if (ret)
+			dev_warn(dev, "no camera indicator on this panel: %d\n", ret);
+	}
 
 	/*
 	 * Type-C outputs are physical ports, not pipelines: several DCPs may be
