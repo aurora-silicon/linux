@@ -261,7 +261,9 @@ static int apple_plane_atomic_check(struct drm_plane *plane,
 		switch (dcp_ind_plane_policy(true,
 					     commit == READ_ONCE(to_apple_plane(plane)->indicator_commit),
 					     unchanged, going_off,
-					     !new_plane_state->fb && !new_plane_state->crtc)) {
+					     !new_plane_state->fb && !new_plane_state->crtc,
+					     new_plane_state->fb &&
+					     new_plane_state->fb == READ_ONCE(to_apple_plane(plane)->indicator_fb))) {
 		case DCP_IND_PLANE_REJECT:
 			return -EINVAL;
 		case DCP_IND_PLANE_RESTORE: {
