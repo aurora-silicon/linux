@@ -11,6 +11,7 @@
 #include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_reserved_mem.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
@@ -671,6 +672,27 @@ static int apple_isp_pm_notify(struct notifier_block *nb, unsigned long event,
 	return NOTIFY_DONE;
 }
 
+/*
+ * The DCP presenting the software camera indicator (apple,camera-indicator),
+ * best-effort: the camera probes and streams without it. When the node names
+ * a DCP that exists, a device reference is held for the driver's lifetime
+ * and put at remove; otherwise there is no indicator and no reference.
+ */
+static struct device *apple_isp_indicator_dcp(struct device *dev)
+{
+	struct device_node *np;
+	struct platform_device *dcp;
+
+	np = of_parse_phandle(dev->of_node, "apple,camera-indicator", 0);
+	if (!np)
+		return NULL;
+	dcp = of_find_device_by_node(np);
+	of_node_put(np);
+	if (!dcp)
+		return NULL;
+	return &dcp->dev;
+}
+
 static int apple_isp_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -692,6 +714,9 @@ static int apple_isp_probe(struct platform_device *pdev)
 
 	isp->dev = dev;
 	isp->hw = of_device_get_match_data(dev);
+	isp->dcp = apple_isp_indicator_dcp(dev);
+	if (isp->dcp)
+		dev_notice(dev, "best-effort software camera indicator via the DCP; not a privacy guarantee, the camera does not depend on it\n");
 	platform_set_drvdata(pdev, isp);
 	dev_set_drvdata(dev, isp);
 
@@ -879,6 +904,7 @@ destroy_wq:
 detach_genpd:
 	apple_isp_detach_genpd(isp);
 free_isp:
+	put_device(isp->dcp);
 	kfree(isp->sensor_configs);
 	/* Nothing else can reach it before the video device is registered. */
 	kfree(isp);
@@ -902,6 +928,7 @@ static void apple_isp_remove(struct platform_device *pdev)
 	apple_isp_free_iommu(isp);
 	destroy_workqueue(isp->wq);
 	apple_isp_detach_genpd(isp);
+	put_device(isp->dcp);
 	/* Freed now, or when the last open file is closed. */
 	v4l2_device_put(&isp->v4l2_dev);
 }

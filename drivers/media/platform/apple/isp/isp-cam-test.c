@@ -705,6 +705,145 @@ static void isp_test_call_size_capabilities(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, isp->presets[8].output_dim.y, 1536);
 }
 
+/*
+ * Camera indicator, best-effort: the DCP set(true) is requested before the
+ * firmware stream, set(false) follows the stream and the watchdog, and the
+ * camera streams whether or not the indicator came up. The DCP set wrapper
+ * and the channel commands are stubbed; the real ones are never called.
+ */
+struct isp_test_indicator_trace {
+	unsigned int order;
+	unsigned int fw_start_at;
+	unsigned int fw_stop_at;
+	unsigned int set_on_at;
+	unsigned int set_off_at;
+	int fw_start_result;
+	int set_on_result;
+};
+
+static int isp_test_indicator_set(struct device *dcp, bool on)
+{
+	struct kunit *test = kunit_get_current_test();
+	struct isp_test_indicator_trace *trace = test->priv;
+
+	if (on) {
+		trace->set_on_at = ++trace->order;
+		return trace->set_on_result;
+	}
+	trace->set_off_at = ++trace->order;
+	return 0;
+}
+
+static int isp_test_fw_start(struct apple_isp *isp, u32 chan)
+{
+	struct kunit *test = kunit_get_current_test();
+	struct isp_test_indicator_trace *trace = test->priv;
+
+	trace->fw_start_at = ++trace->order;
+	return trace->fw_start_result;
+}
+
+static int isp_test_fw_stop(struct apple_isp *isp, u32 chan)
+{
+	struct kunit *test = kunit_get_current_test();
+	struct isp_test_indicator_trace *trace = test->priv;
+
+	trace->fw_stop_at = ++trace->order;
+	return 0;
+}
+
+static int isp_test_fw_bufret(struct apple_isp *isp, u32 chan)
+{
+	return 0;
+}
+
+static struct apple_isp *isp_test_indicator_alloc(struct kunit *test)
+{
+	struct apple_isp *isp = isp_test_capture_alloc(test);
+
+	isp->dcp = isp->dev;
+	return isp;
+}
+
+static void isp_test_indicator_set_fails_still_streams(struct kunit *test)
+{
+	struct apple_isp *isp = isp_test_indicator_alloc(test);
+	struct isp_test_indicator_trace trace = { .set_on_result = -EIO };
+
+	test->priv = &trace;
+	kunit_activate_static_stub(test, apple_isp_dcp_indicator_set,
+				   isp_test_indicator_set);
+	kunit_activate_static_stub(test, isp_cmd_ch_start, isp_test_fw_start);
+	KUNIT_EXPECT_EQ(test, apple_isp_start_capture(isp), 0);
+	KUNIT_EXPECT_EQ(test, trace.set_on_at, 1);
+	KUNIT_EXPECT_EQ(test, trace.fw_start_at, 2);
+	KUNIT_EXPECT_EQ(test, trace.set_off_at, 0);
+}
+
+static void isp_test_no_indicator_still_streams(struct kunit *test)
+{
+	struct apple_isp *isp = isp_test_indicator_alloc(test);
+	struct isp_test_indicator_trace trace = {};
+
+	isp->dcp = NULL;
+	test->priv = &trace;
+	kunit_activate_static_stub(test, isp_cmd_ch_start, isp_test_fw_start);
+	KUNIT_EXPECT_EQ(test, apple_isp_start_capture(isp), 0);
+	KUNIT_EXPECT_EQ(test, trace.fw_start_at, 1);
+	KUNIT_EXPECT_EQ(test, trace.set_on_at, 0);
+}
+
+static void isp_test_indicator_on_precedes_stream(struct kunit *test)
+{
+	struct apple_isp *isp = isp_test_indicator_alloc(test);
+	struct isp_test_indicator_trace trace = {};
+
+	test->priv = &trace;
+	kunit_activate_static_stub(test, apple_isp_dcp_indicator_set,
+				   isp_test_indicator_set);
+	kunit_activate_static_stub(test, isp_cmd_ch_start, isp_test_fw_start);
+	KUNIT_EXPECT_EQ(test, apple_isp_start_capture(isp), 0);
+	KUNIT_EXPECT_EQ(test, trace.set_on_at, 1);
+	KUNIT_EXPECT_EQ(test, trace.fw_start_at, 2);
+
+	kunit_activate_static_stub(test, isp_cmd_ch_stop, isp_test_fw_stop);
+	kunit_activate_static_stub(test, isp_cmd_ch_buffer_return,
+				   isp_test_fw_bufret);
+	isp->fw_state = ISP_FW_RUNNING;
+	apple_isp_stop_capture(isp);
+	KUNIT_EXPECT_EQ(test, trace.fw_stop_at, 3);
+	KUNIT_EXPECT_EQ(test, trace.set_off_at, 4);
+}
+
+static void isp_test_stream_failure_lights_off(struct kunit *test)
+{
+	struct apple_isp *isp = isp_test_indicator_alloc(test);
+	struct isp_test_indicator_trace trace = { .fw_start_result = -ETIME };
+
+	test->priv = &trace;
+	kunit_activate_static_stub(test, apple_isp_dcp_indicator_set,
+				   isp_test_indicator_set);
+	kunit_activate_static_stub(test, isp_cmd_ch_start, isp_test_fw_start);
+	KUNIT_EXPECT_EQ(test, apple_isp_start_capture(isp), -ETIME);
+	KUNIT_EXPECT_EQ(test, trace.set_on_at, 1);
+	KUNIT_EXPECT_EQ(test, trace.set_off_at, 2);
+}
+
+static void isp_test_failed_fw_stop_lights_off(struct kunit *test)
+{
+	struct apple_isp *isp = isp_test_indicator_alloc(test);
+	struct isp_test_indicator_trace trace = {};
+
+	isp->ipc_failed = true;
+	test->priv = &trace;
+	kunit_activate_static_stub(test, apple_isp_dcp_indicator_set,
+				   isp_test_indicator_set);
+	kunit_activate_static_stub(test, isp_cmd_ch_stop, isp_test_fw_stop);
+	apple_isp_stop_capture(isp);
+	KUNIT_EXPECT_EQ(test, trace.fw_stop_at, 0);
+	KUNIT_EXPECT_EQ(test, trace.set_off_at, 1);
+}
+
 static struct kunit_case isp_cam_test_cases[] = {
 	KUNIT_CASE(isp_test_call_crop),
 	KUNIT_CASE(isp_test_call_crop_bounds),
@@ -722,6 +861,11 @@ static struct kunit_case isp_cam_test_cases[] = {
 	KUNIT_CASE(isp_test_temporal_filter_band0),
 	KUNIT_CASE(isp_test_temporal_filter_off),
 	KUNIT_CASE(isp_test_power_line_frequency),
+	KUNIT_CASE(isp_test_indicator_set_fails_still_streams),
+	KUNIT_CASE(isp_test_no_indicator_still_streams),
+	KUNIT_CASE(isp_test_indicator_on_precedes_stream),
+	KUNIT_CASE(isp_test_stream_failure_lights_off),
+	KUNIT_CASE(isp_test_failed_fw_stop_lights_off),
 	{}
 };
 
