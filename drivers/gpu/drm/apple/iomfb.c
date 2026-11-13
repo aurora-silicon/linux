@@ -3040,7 +3040,7 @@ static bool dcp_mode_settable(struct apple_dcp *dcp,
 	 * survive a modeset, so refuse the rest until they are understood.
 	 */
 	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp->external &&
-	    drm_mode_vrefresh(mode) != 120)
+	    !dcp->ext_failsafe && drm_mode_vrefresh(mode) != 120)
 		return false;
 
 	return true;
