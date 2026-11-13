@@ -6700,6 +6700,7 @@ static void apple_pcie_s2r_up_noirq(struct apple_pcie *pcie)
 {
 	struct apple_pcie_port *port;
 	unsigned long released = 0, trained = 0;
+	bool fast = false;
 	int ret;
 
 	list_for_each_entry(port, &pcie->ports, entry) {
@@ -6726,9 +6727,23 @@ static void apple_pcie_s2r_up_noirq(struct apple_pcie *pcie)
 		else
 			trained |= BIT(port->idx);
 	}
-	if (!trained)
-		return;
-	msleep(100);
+	/*
+	 * A link above 5 GT/s takes no config request before 100 ms after its training
+	 * (PCIe r5.0, 6.6.1). Up to 5 GT/s the time since PERST# is what counts, and that
+	 * has passed.
+	 */
+	list_for_each_entry(port, &pcie->ports, entry) {
+		void __iomem *dbi = pcie->cfg->win + ((resource_size_t)port->idx << 15);
+
+		if (port->idx >= BITS_PER_LONG || !(trained & BIT(port->idx)))
+			continue;
+		/* The target, not the current speed: the change of speed may still run. */
+		if ((readw_relaxed(dbi + NEO_DBI_CAP_LNKCTL2) & PCI_EXP_LNKCTL2_TLS) >
+		    PCI_EXP_LNKCTL2_TLS_5_0GT)
+			fast = true;
+	}
+	if (fast)
+		msleep(100);
 	list_for_each_entry(port, &pcie->ports, entry) {
 		if (port->idx >= BITS_PER_LONG || !(trained & BIT(port->idx)))
 			continue;
