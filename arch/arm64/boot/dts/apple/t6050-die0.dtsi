@@ -138,8 +138,13 @@
 		/* ADT info-clock_offset [0x2100, 6]: M1-style 32768 Hz ticks, as on T6040. */
 		smc_rtc: rtc {
 			compatible = "apple,smc-rtc";
-			nvmem-cells = <&rtc_offset>;
-			nvmem-cell-names = "rtc_offset";
+			nvmem-cells = <&rtc_offset>, <&rtc_ctrl>, <&rtc_alarm>,
+				<&rtc_alarm_mask>;
+			nvmem-cell-names = "rtc_offset", "rtc_ctrl", "rtc_alarm",
+				"rtc_alarm_mask";
+			/* The PMIC's RTC alarm, peripheral interrupt 2 of nub-spmi0 */
+			interrupts-extended = <&nub_spmi0 2 IRQ_TYPE_EDGE_RISING>;
+			wakeup-source;
 		};
 	};
 
@@ -220,7 +225,8 @@
 	};
 
 	/*
-	 * /arm-io/nub-spmi0: reg[0] 0x8a014000 +0x4000, generation 4 (no IRQ: the driver refuses one).
+	 * /arm-io/nub-spmi0: reg[0] 0x8a014000 +0x4000, generation 4. ADT interrupts[1] is 726, the line the
+	 * peripheral sources arrive on (inference from macOS's wake trace, not yet booted).
 	 * No power-domains: NUB_SPMI0 is critical and on (Aura talks to the PMU here every boot), and
 	 * binding the pwrstate driver would write the PS register at probe.
 	 */
@@ -229,6 +235,9 @@
 		reg = <0x2 0x8a014000 0x0 0x4000>;
 		#address-cells = <2>;
 		#size-cells = <0>;
+		interrupts = <AIC_IRQ 0 726 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
 
 		/* spmi-abbeyL1, is-primary: USID 0xe. Read-only use: cells, never a whole-device read. */
 		pmu: pmic@e {
@@ -243,6 +252,19 @@
 				/* ADT info-pm_setting: bit 0 no restore, bit 5 no power-on at connect */
 				pm_setting: pm-setting@2001 {
 					reg = <0x2001 1>;
+				};
+
+				/* ADT spmi-abbeyL1 RTC cells, as on T6030 */
+				rtc_ctrl: rtc-ctrl@2000 {
+					reg = <0x2000 1>;
+				};
+
+				rtc_alarm: rtc-alarm@2008 {
+					reg = <0x2008 4>;
+				};
+
+				rtc_alarm_mask: rtc-alarm-mask@200e {
+					reg = <0x200e 1>;
 				};
 
 				rtc_offset: rtc-offset@2100 {
