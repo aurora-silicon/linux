@@ -43,6 +43,7 @@
 #include <asm/memory.h>
 #include <asm/sections.h>
 #include <asm/setup.h>
+#include <asm/suspend.h>
 
 static bool aura_layout_fixed;
 static u64 aura_layout[2];
@@ -52,18 +53,13 @@ static phys_addr_t aura_boot_dt;
 
 /*
  * Ranges kept out of the image, in page frames. Filled once at late_initcall,
- * read by arm64's pfn_is_nosave() for reserved pages. A static table avoids
+ * read through the arm64 hibernation platform hooks. A static table avoids
  * register_nosave_region(), which allocates from memblock and is meant for
  * setup_arch() time.
  */
 #define AURA_NOSAVE_MAX 128
 static struct { unsigned long start, end; } aura_nosave[AURA_NOSAVE_MAX];
 static unsigned int aura_nosave_count;
-
-bool aura_hibernate_layout_fixed(void)
-{
-	return aura_layout_fixed;
-}
 
 /*
  * Apple silicon Macs run firmware on their coprocessors (storage, secure
@@ -82,7 +78,7 @@ static bool aura_hibernate_blocked(void)
 	return of_machine_is_compatible("apple,arm-platform") && !aura_layout_fixed;
 }
 
-bool aura_hibernate_pfn_nosave(unsigned long pfn)
+static bool aura_hibernate_pfn_nosave(unsigned long pfn)
 {
 	unsigned int i;
 
@@ -93,7 +89,7 @@ bool aura_hibernate_pfn_nosave(unsigned long pfn)
 }
 
 /* Whether the ranges kept out of the image cover all of [start, end). */
-bool aura_hibernate_range_nosave(u64 start, u64 end)
+static bool aura_hibernate_range_nosave(u64 start, u64 end)
 {
 	unsigned long pfn = PFN_DOWN(start), last = PFN_UP(end);
 	unsigned int i;
@@ -112,6 +108,73 @@ bool aura_hibernate_range_nosave(u64 start, u64 end)
 	}
 	return true;
 }
+
+/*
+ * The image restores every page to the frame it came from, so the boot that
+ * resumes it must give the kernel what the boot that wrote it did: on Apple
+ * machines at EL2 the same CTXR exec window (secondaries only execute inside
+ * it) and aura's fixed hibernation layout. They are added to the layout cookie
+ * of arm64 hibernation.
+ *
+ * aura's own image moves with the boot object, and its CPU release addresses
+ * and S2R mailbox with it, inside the range the layout keeps from Linux. The
+ * restored kernel uses neither address of the boot that wrote the image: its
+ * CPUs come back from the boot kernel's pen, a CPU started at its reset vector
+ * again finds the release target the boot kernel wrote (both kernels run at the
+ * window's fixed address), and the T6040 sleep driver takes this boot's mailbox
+ * from aura's tree after the restore. What has to match is the spin table's
+ * shape (the same CPUs, at the same offsets from the mailbox) and that this
+ * boot keeps all of it out of the image.
+ */
+static u64 aura_hibernate_layout(u64 h, struct arm64_hibernate_layout *lay)
+{
+	static const char * const chosen_props[] = {
+		"aura,hibernate-layout", "aura,hibernate-dt",
+		"aurora,ctxr-exec-window",
+	};
+	u64 mbox = 0, layout[2], win[2];
+	struct device_node *np;
+	const void *v;
+	u8 kept;
+	int i, len;
+
+	np = of_find_node_by_path("/chosen");
+	for (i = 0; np && i < ARRAY_SIZE(chosen_props); i++) {
+		v = of_get_property(np, chosen_props[i], &len);
+		if (!v)
+			continue;
+		h = arm64_hibernate_layout_mix(h, chosen_props[i], strlen(chosen_props[i]));
+		h = arm64_hibernate_layout_mix(h, v, len);
+	}
+	if (np && !of_property_read_u64(np, "aurora,s2r-mailbox", &mbox)) {
+		lay->have_base = true;
+		lay->base = mbox;
+		kept = aura_hibernate_pfn_nosave(PHYS_PFN(mbox));
+		h = arm64_hibernate_layout_mix(h, "aurora,s2r-mailbox",
+					       strlen("aurora,s2r-mailbox"));
+		h = arm64_hibernate_layout_mix(h, &kept, sizeof(kept));
+	}
+	/* aura's layout less the OS window, only where all of it is kept out of the image */
+	if (np && !of_property_read_u64_array(np, "aura,hibernate-layout", layout, 2) &&
+	    !of_property_read_u64_array(np, "aurora,ctxr-exec-window", win, 2) &&
+	    layout[0] <= win[0] && win[0] + win[1] <= layout[1]) {
+		lay->ex[lay->nex][0] = layout[0];
+		lay->ex[lay->nex][1] = win[0];
+		if (aura_hibernate_range_nosave(lay->ex[lay->nex][0], lay->ex[lay->nex][1]))
+			lay->nex++;
+		lay->ex[lay->nex][0] = win[0] + win[1];
+		lay->ex[lay->nex][1] = layout[1];
+		if (aura_hibernate_range_nosave(lay->ex[lay->nex][0], lay->ex[lay->nex][1]))
+			lay->nex++;
+	}
+	of_node_put(np);
+	return h;
+}
+
+static const struct arm64_hibernate_platform aura_hibernate_platform = {
+	.pfn_nosave = aura_hibernate_pfn_nosave,
+	.layout = aura_hibernate_layout,
+};
 
 static void __init aura_nosave_add(unsigned long s, unsigned long e)
 {
@@ -404,6 +467,7 @@ static int __init aura_hibernate_init(void)
 
 	hibernation_set_platform_check(aura_hibernate_blocked,
 				       "coprocessor firmware state is not restored from an image");
+	arm64_hibernate_set_platform(&aura_hibernate_platform);
 
 	/* Only a boot loader that keeps the layout fixed publishes it. */
 	chosen = of_find_node_by_path("/chosen");

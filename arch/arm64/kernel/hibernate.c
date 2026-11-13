@@ -18,7 +18,6 @@
 #include <linux/sched.h>
 #include <linux/set_memory.h>
 #include <linux/suspend.h>
-#include <linux/soc/apple/aura-hibernate.h>
 #include <linux/utsname.h>
 
 #include <asm/barrier.h>
@@ -96,7 +95,16 @@ static inline void arch_hdr_invariants(struct arch_hibernate_hdr_invariants *i)
 	memcpy(i->uts_version, init_utsname()->version, sizeof(i->uts_version));
 }
 
-static u64 hibernate_layout_mix(u64 h, const void *p, size_t len)
+/**
+ * arm64_hibernate_layout_mix - Mix bytes into the boot layout cookie.
+ * @h: Hash so far.
+ * @p: Bytes to mix.
+ * @len: Number of bytes.
+ *
+ * FNV-1a, for the callback of a platform to mix its boot facts into the cookie
+ * in the same way as the rest of the layout.
+ */
+u64 arm64_hibernate_layout_mix(u64 h, const void *p, size_t len)
 {
 	const u8 *b = p;
 
@@ -126,87 +134,65 @@ static u64 hibernate_mix_span(u64 h, u64 b, u64 e, u32 flags, const u64 (*ex)[2]
 	if (nex)
 		return hibernate_mix_span(h, b, e, flags, ex + 1, nex - 1);
 	size = e - b;
-	h = hibernate_layout_mix(h, &b, sizeof(b));
-	h = hibernate_layout_mix(h, &size, sizeof(size));
-	return hibernate_layout_mix(h, &flags, sizeof(flags));
+	h = arm64_hibernate_layout_mix(h, &b, sizeof(b));
+	h = arm64_hibernate_layout_mix(h, &size, sizeof(size));
+	return arm64_hibernate_layout_mix(h, &flags, sizeof(flags));
+}
+
+static const struct arm64_hibernate_platform *hibernate_platform __ro_after_init;
+
+/**
+ * arm64_hibernate_set_platform - Register the platform's hibernation hooks.
+ * @platform: Hooks of the platform; they must stay valid.
+ *
+ * Only one platform can register, at boot.
+ */
+void __init arm64_hibernate_set_platform(const struct arm64_hibernate_platform *platform)
+{
+	if (WARN_ON_ONCE(hibernate_platform))
+		return;
+	hibernate_platform = platform;
+}
+
+static bool hibernate_platform_pfn_nosave(unsigned long pfn)
+{
+	return hibernate_platform && hibernate_platform->pfn_nosave &&
+		hibernate_platform->pfn_nosave(pfn);
 }
 
 /*
  * The image restores every page to the frame it came from, so the boot that
  * resumes it must give the kernel what the boot that wrote it did: the same
- * RAM, and on Apple machines at EL2 the same CTXR exec window (secondaries only
- * execute inside it) and aura's fixed hibernation layout. A boot loader decides
- * them on every boot; the kernel build check above cannot see them.
- *
- * aura's own image moves with the boot object, and its CPU release addresses
- * and S2R mailbox with it, inside the range the layout keeps from Linux. The
- * restored kernel uses neither address of the boot that wrote the image: its
- * CPUs come back from the boot kernel's pen, a CPU started at its reset vector
- * again finds the release target the boot kernel wrote (both kernels run at the
- * window's fixed address), and the T6040 sleep driver takes this boot's mailbox
- * from aura's tree after the restore. What has to match is the spin table's
- * shape (the same CPUs, at the same offsets from the mailbox) and that this
- * boot keeps all of it out of the image.
+ * RAM, the same CPUs started the same way, and whatever fixed layout the
+ * platform's boot loader gives the kernel, which the platform's hook adds. A
+ * boot loader decides them on every boot; the kernel build check above cannot
+ * see them.
  */
 static u64 hibernate_boot_layout(void)
 {
-	static const char * const chosen_props[] = {
-		"aura,hibernate-layout", "aura,hibernate-dt",
-		"aurora,ctxr-exec-window",
-	};
-	u64 h = 0xcbf29ce484222325ULL, mbox = 0, rel, hwid;
-	u64 layout[2], win[2], ex[2][2];
+	struct arm64_hibernate_layout lay = {};
+	u64 h = 0xcbf29ce484222325ULL, rel, hwid;
 	struct memblock_region *r;
-	int nex = 0;
 	struct device_node *np;
-	bool have_mbox = false;
-	const void *v;
 	u8 kept;
-	int i, len;
 
-	np = of_find_node_by_path("/chosen");
-	for (i = 0; np && i < ARRAY_SIZE(chosen_props); i++) {
-		v = of_get_property(np, chosen_props[i], &len);
-		if (!v)
-			continue;
-		h = hibernate_layout_mix(h, chosen_props[i], strlen(chosen_props[i]));
-		h = hibernate_layout_mix(h, v, len);
-	}
-	if (np && !of_property_read_u64(np, "aurora,s2r-mailbox", &mbox)) {
-		have_mbox = true;
-		kept = aura_hibernate_pfn_nosave(PHYS_PFN(mbox));
-		h = hibernate_layout_mix(h, "aurora,s2r-mailbox", strlen("aurora,s2r-mailbox"));
-		h = hibernate_layout_mix(h, &kept, sizeof(kept));
-	}
-	/* aura's layout less the OS window, only where all of it is kept out of the image */
-	if (np && !of_property_read_u64_array(np, "aura,hibernate-layout", layout, 2) &&
-	    !of_property_read_u64_array(np, "aurora,ctxr-exec-window", win, 2) &&
-	    layout[0] <= win[0] && win[0] + win[1] <= layout[1]) {
-		ex[nex][0] = layout[0];
-		ex[nex][1] = win[0];
-		if (aura_hibernate_range_nosave(ex[nex][0], ex[nex][1]))
-			nex++;
-		ex[nex][0] = win[0] + win[1];
-		ex[nex][1] = layout[1];
-		if (aura_hibernate_range_nosave(ex[nex][0], ex[nex][1]))
-			nex++;
-	}
-	of_node_put(np);
+	if (hibernate_platform && hibernate_platform->layout)
+		h = hibernate_platform->layout(h, &lay);
 
 	for_each_of_cpu_node(np) {
 		if (of_property_read_u64(np, "cpu-release-addr", &rel))
 			continue;
 		hwid = of_get_cpu_hwid(np, 0);
-		kept = aura_hibernate_pfn_nosave(PHYS_PFN(rel));
-		if (have_mbox)
-			rel -= mbox;
-		h = hibernate_layout_mix(h, &hwid, sizeof(hwid));
-		h = hibernate_layout_mix(h, &rel, sizeof(rel));
-		h = hibernate_layout_mix(h, &kept, sizeof(kept));
+		kept = hibernate_platform_pfn_nosave(PHYS_PFN(rel));
+		if (lay.have_base)
+			rel -= lay.base;
+		h = arm64_hibernate_layout_mix(h, &hwid, sizeof(hwid));
+		h = arm64_hibernate_layout_mix(h, &rel, sizeof(rel));
+		h = arm64_hibernate_layout_mix(h, &kept, sizeof(kept));
 	}
 
 	for_each_mem_region(r)
-		h = hibernate_mix_span(h, r->base, r->base + r->size, r->flags, ex, nex);
+		h = hibernate_mix_span(h, r->base, r->base + r->size, r->flags, lay.ex, lay.nex);
 	return h;
 }
 
@@ -239,7 +225,7 @@ int pfn_is_nosave(unsigned long pfn)
 	unsigned long nosave_end_pfn = sym_to_pfn(&__nosave_end - 1);
 
 	return ((pfn >= nosave_begin_pfn) && (pfn <= nosave_end_pfn)) ||
-		crash_is_nosave(pfn) || aura_hibernate_pfn_nosave(pfn);
+		crash_is_nosave(pfn) || hibernate_platform_pfn_nosave(pfn);
 }
 
 void notrace save_processor_state(void)
