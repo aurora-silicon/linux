@@ -353,8 +353,9 @@
 
 	dptx_phy: phy@2c7540000 {
 		compatible = "apple,t8122-dptx-phy", "apple,dptx-phy";
-		reg = <0x2 0xc7540000 0x0 0x10000>,
-		      <0x2 0xc7500000 0x0 0x4000>;
+		reg = <0x2 0xc7500000 0x0 0x4000>,
+		      <0x2 0xc7540000 0x0 0x10000>;
+		reg-names = "core", "dptx";
 		power-domains = <&ps_dptx_ext_phy>;
 		#phy-cells = <0>;
 		status = "disabled";
