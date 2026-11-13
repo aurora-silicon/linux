@@ -2833,11 +2833,12 @@ void dcp_hdmi_yield_link(struct apple_dcp *dcp)
  * Release a display whose sink is inactive and request it again while HPD
  * stays: start the link again, a few times.
  */
-static void dcp_desktop_hdmi_unpark(struct apple_dcp *dcp)
+static void __dcp_desktop_hdmi_unpark(struct apple_dcp *dcp)
 {
 	struct dptx_port *dptx = &dcp->dptxport[0];
 	int tries, ret;
 
+	lockdep_assert_held(&dcp->hdmi_start_lock);
 	for (tries = 1; tries <= DCP_HDMI_START_TRIES; tries++) {
 		if (!READ_ONCE(dptx->connected) || READ_ONCE(dptx->link_configured) ||
 		    READ_ONCE(dcp->active_typec_route) || READ_ONCE(dcp->hdmi_yielded) ||
@@ -2852,6 +2853,27 @@ static void dcp_desktop_hdmi_unpark(struct apple_dcp *dcp)
 	}
 }
 
+static void dcp_desktop_hdmi_unpark(struct apple_dcp *dcp)
+{
+	guard(mutex)(&dcp->hdmi_start_lock);
+	__dcp_desktop_hdmi_unpark(dcp);
+}
+
+/*
+ * The link set up again after a sleep: the starts again run once the system
+ * is back (a freezable work item), not while the DRM resume sets its modes on
+ * the same processor. hdmi_start_lock keeps them apart from the HPD
+ * interrupt's starts; the sleep cancels a pending one before it stops the
+ * link.
+ */
+static void dcp_hdmi_unpark_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(work, struct apple_dcp,
+					     hdmi_unpark_work);
+
+	dcp_desktop_hdmi_unpark(dcp);
+}
+
 /*
  * The display behind a connected port changed, or came after the port was
  * connected: release the link and connect again, converter power-up included.
@@ -2860,12 +2882,13 @@ static void dcp_desktop_hdmi_restart(struct apple_dcp *dcp)
 {
 	int ret;
 
+	guard(mutex)(&dcp->hdmi_start_lock);
 	dev_info(dcp->dev, "HDMI: HPD changed under the connected port, link started again\n");
 	ret = dcp_desktop_dptx_disconnect_oob(dcp, 0);
 	if (ret)
 		dev_warn(dcp->dev, "HDMI link not released: %d\n", ret);
 	dcp_dptx_connect(dcp, 0);
-	dcp_desktop_hdmi_unpark(dcp);
+	__dcp_desktop_hdmi_unpark(dcp);
 }
 
 irqreturn_t dcp_desktop_dp2hdmi_hpd(struct apple_dcp *dcp)
@@ -2926,8 +2949,10 @@ irqreturn_t dcp_desktop_dp2hdmi_hpd(struct apple_dcp *dcp)
 	}
 	mutex_unlock(&dcp->hpd_mutex);
 
-	dcp_dptx_connect(dcp, 0);
-	dcp_desktop_hdmi_unpark(dcp);
+	scoped_guard(mutex, &dcp->hdmi_start_lock) {
+		dcp_dptx_connect(dcp, 0);
+		__dcp_desktop_hdmi_unpark(dcp);
+	}
 	return IRQ_HANDLED;
 }
 
@@ -4628,8 +4653,13 @@ static int __dcp_enable_dp2hdmi_hpd(struct apple_dcp *dcp, bool replay)
 
 		if (connected && !READ_ONCE(dcp->hdmi_yielded)) {
 			dcp_dptx_connect(dcp, 0);
-			if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
-				dcp_desktop_hdmi_unpark(dcp);
+			if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
+				if (replay)
+					queue_work(system_freezable_wq,
+						   &dcp->hdmi_unpark_work);
+				else
+					dcp_desktop_hdmi_unpark(dcp);
+			}
 		} else if (!connected && !replay) {
 			_dcp_poweroff(dcp);
 		}
@@ -6395,6 +6425,7 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 
 	if (dcp->hdmi_hpd_irq)
 		disable_irq(dcp->hdmi_hpd_irq);
+	cancel_work_sync(&dcp->hdmi_unpark_work);
 
 	dcp_disable_typec_work(dcp, true);
 	/* RTKit is released after this unbind callback, and can still deliver
@@ -6833,6 +6864,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 	mutex_init(&dcp->hpd_mutex);
+	mutex_init(&dcp->hdmi_start_lock);
+	INIT_WORK(&dcp->hdmi_unpark_work, dcp_hdmi_unpark_work);
 	mutex_init(&dcp->external_lock);
 	INIT_WORK(&dcp->external_stop_work, dcp_external_stop_work);
 	INIT_DELAYED_WORK(&dcp->external_stop_retry_wq, dcp_external_stop_retry);
@@ -7435,6 +7468,7 @@ static void dcp_platform_remove(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
 	if (dcp) {
+		cancel_work_sync(&dcp->hdmi_unpark_work);
 		cancel_work_sync(&dcp->s2r_prewarm_work);
 		cancel_delayed_work_sync(&dcp->s2r_prewarm_off_wq);
 	}
@@ -9725,6 +9759,7 @@ static int dcp_platform_suspend(struct device *dev)
 	if (dcp->avep)
 		av_service_disconnect(dcp);
 
+	cancel_work_sync(&dcp->hdmi_unpark_work);
 	if (dcp->hdmi_hpd_irq) {
 		disable_irq(dcp->hdmi_hpd_irq);
 		if (!dcp->active_typec_route) {
@@ -10059,6 +10094,7 @@ static void dcp_hib_stop_ext_link_work(struct apple_dcp *dcp)
 		dcp->hib_typec_disabled = true;
 	}
 	cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
+	cancel_work_sync(&dcp->hdmi_unpark_work);
 	if (dcp->hdmi_hpd_irq && !dcp->hib_irq_disabled) {
 		disable_irq(dcp->hdmi_hpd_irq);
 		dcp->hib_irq_disabled = true;

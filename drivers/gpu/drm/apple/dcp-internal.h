@@ -960,6 +960,10 @@ struct apple_dcp {
 	bool hdmi_resync;
 
 	struct mutex hpd_mutex;
+	/* One start of the fixed HDMI link at a time: HPD interrupt, unpark work. */
+	struct mutex hdmi_start_lock;
+	/* The starts again of a link set up after a sleep (dcp_desktop_hdmi_unpark()). */
+	struct work_struct hdmi_unpark_work;
 
 	u32 dptx_phy;
 	u32 dptx_die;
