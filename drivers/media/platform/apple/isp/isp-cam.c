@@ -3,6 +3,7 @@
 
 #include <linux/firmware.h>
 #include <linux/gcd.h>
+#include <linux/of_platform.h>
 #include <linux/unaligned.h>
 #include <linux/soc/apple/display.h>
 #include <kunit/static_stub.h>
@@ -1089,6 +1090,23 @@ static int apple_isp_dcp_indicator_set(struct device *dcp, bool on)
 	return apple_dcp_camera_indicator_set(dcp, on);
 }
 
+/* The DCP may probe after the ISP, so it is looked up when a stream starts. */
+static void apple_isp_indicator_bind(struct apple_isp *isp)
+{
+	struct platform_device *pdev;
+
+	if (isp->dcp || !isp->dcp_np)
+		return;
+	pdev = of_find_device_by_node(isp->dcp_np);
+	if (!pdev) {
+		dev_warn_ratelimited(isp->dev,
+				     "camera indicator: its DCP is not probed, no indicator for this stream\n");
+		return;
+	}
+	isp->dcp = &pdev->dev;
+	dev_notice(isp->dev, "best-effort software camera indicator via the DCP; not a privacy guarantee, the camera does not depend on it\n");
+}
+
 int apple_isp_start_capture(struct apple_isp *isp)
 {
 	int err;
@@ -1098,10 +1116,11 @@ int apple_isp_start_capture(struct apple_isp *isp)
 	 * is requested before the sensor may stream, but the camera does
 	 * not depend on it.
 	 */
+	apple_isp_indicator_bind(isp);
 	if (apple_isp_camera_indicator(isp)) {
 		err = apple_isp_dcp_indicator_set(isp->dcp, true);
 		if (err)
-			dev_warn_once(isp->dev, "camera indicator not shown: %d\n", err);
+			dev_warn_ratelimited(isp->dev, "camera indicator not shown: %d\n", err);
 	}
 
 	/* Serviced from before the channel starts... */
