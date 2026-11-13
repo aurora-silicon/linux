@@ -863,8 +863,8 @@ MODULE_DEVICE_TABLE(of, apple_smc_of_match);
 /*
  * The SMC keeps running through a firmware-driven suspend. It is told first and
  * stops last, and on a wake it hears first. In order, measured on T8140 and
- * unverified on other SoCs: MBSE = slpw before any other coprocessor is told;
- * MBSE = slpa and the AP power notice after all the others; on a wake the notice,
+ * unverified on other SoCs: MBSE = slpw, MBSE = slpa and the AP power notice after
+ * all the other coprocessors (slpw goes ahead of them); on a wake the notice,
  * MBSE and MBSW read, MBSE = waka. The noirq phases give that order whatever the
  * device order is, so these commands poll. What the values mean is inferred
  * from their letters.
@@ -875,15 +875,15 @@ MODULE_DEVICE_TABLE(of, apple_smc_of_match);
  * The debug link's cut, on a debug cable only, makes the SMC see a cable pulled and plugged
  * back. With the cut after slpw, the SMC woke the AP right after the commit, for USB-C_plug
  * or acdetach, in every such sleep (J700, 223 of 223), even with its outbox quiet for 500 ms
- * before the notice. A sleep that cuts the link warns the SMC only after the cut.
+ * before the notice. So the warning comes after the cut.
  */
 
 /* The gaps macOS leaves before the AP idle notice and after it. */
 #define SMC_SLEEP_ARM_MS	6
 #define SMC_SLEEP_IDLE_MS	30
 /*
- * Between a late warning (a sleep that cut the debug link) and slpa. macOS's shortest gap
- * was 770 ms; the warning at .prepare leaves 150-500 ms, and those sleeps run to the alarm.
+ * Between the warning and slpa. Sleeps with 150-500 ms between them ran to the alarm;
+ * 770 ms is known to work.
  */
 #define SMC_SLEEP_WARN_MS	200
 
@@ -1125,10 +1125,8 @@ static int apple_smc_prepare(struct device *dev)
 
 	if (!pm_suspend_via_firmware())
 		return 0;
-	if (apple_sleep_debug_link_up())
-		smc->sleep_warn_late = true;
-	else
-		apple_smc_sleep_warn(smc);
+	/* Warned with the commit, not here: see apple_smc_sleep_enter(). */
+	smc->sleep_warn_late = true;
 
 	return 0;
 }
@@ -1179,7 +1177,15 @@ static void apple_smc_outbox_poll(struct apple_smc *smc, const char *after,
 		 last, ms >= SMC_OUTBOX_SETTLE_MS ? ", still busy" : "");
 }
 
-/* The noirq suspend's part, polled: the cut, a late warning, the commit's notices. */
+/*
+ * The noirq suspend's part, polled: the cut, the warning, the commit's notices.
+ *
+ * The warning is not sent earlier, although the SMC could take it then. A T6041 SMC that
+ * was warned and then told that the sleep was off, with no commit between, stopped running
+ * the fans (0 rpm at a die temperature of 110 C) and refused a fan request, until a later
+ * sleep had completed: nothing sent to it takes the warning back. So it goes where the
+ * commit goes, after every device has had its chance to refuse.
+ */
 static int apple_smc_sleep_enter(struct apple_smc *smc)
 {
 	if (apple_sleep_debug_link_cut())
@@ -1213,7 +1219,7 @@ static int apple_smc_sleep_noirq(struct apple_smc *smc)
 {
 	int ret;
 
-	/* A sleep that stops short of the commit warns the SMC, and .complete takes that back. */
+	/* A sleep that stops short of the commit sends the SMC nothing. */
 	if ((!smc->sleep_warned && !smc->sleep_warn_late) || !apple_smc_sleep_commits())
 		return 0;
 
