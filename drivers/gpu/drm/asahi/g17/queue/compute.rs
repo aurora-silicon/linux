@@ -909,6 +909,7 @@ impl Queue {
                 active.observed.is_some()
             },
             failed: self.quarantined,
+            excused: active.packet.within_allowance(crate::g17::now_ns()),
         })
     }
 

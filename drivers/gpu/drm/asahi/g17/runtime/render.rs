@@ -1271,6 +1271,7 @@ impl Registry {
         &self,
         packet: &Arc<Packet>,
         renewals: u8,
+        excuse: crate::g17::timeout::Excuse,
     ) -> Option<crate::g17::timeout::Verdict> {
         let own = self
             .render
@@ -1291,6 +1292,7 @@ impl Registry {
             crate::g17::timeout::attribute(
                 own,
                 renewals,
+                excuse,
                 Iterator::chain(self.render_timeout_heads(), computes),
             )
         })

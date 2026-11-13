@@ -1667,6 +1667,7 @@ impl Pair {
                 published: active.published,
                 finished: false,
                 failed: self.quarantined,
+                excused: active.packet.within_allowance(crate::g17::now_ns()),
             })
     }
 

@@ -1154,8 +1154,13 @@ struct drm_asahi_queue_create {
 	 * it is fed. The driver does not shield the other clients from such a
 	 * queue: they share the GPU with it as the firmware schedules them,
 	 * and a command of another client may have to wait until a long
-	 * command ends, which can be longer than that client's own allowance
-	 * and the deferrals it gets. Userspace should ask for an allowance
+	 * command ends. The watchdog does not fail such a waiting command,
+	 * render or compute, while the earlier command it waits behind runs
+	 * inside its allowance; afterwards the usual deferrals apply. A
+	 * waiting command is excused this way for at most the longest
+	 * allowance the system permits in total, so a command that keeps
+	 * waiting behind other clients' work longer than that and its own
+	 * deferrals is still failed. Userspace should ask for an allowance
 	 * only for queues whose commands need one, and keep those commands as
 	 * short as it can.
 	 */
