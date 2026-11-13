@@ -1268,15 +1268,15 @@
 		};
 
 		/*
-		 * ADT pci-bridge3/pcie-xhci: ASM3142, PERST AP pin 7. Its
-		 * function-power_enable is SMC gP16, not described yet: iBoot
-		 * leaves it on.
+		 * ADT pci-bridge3/pcie-xhci: ASM3142, PERST AP pin 7,
+		 * function-power_enable SMC gP16
 		 */
 		port03: pci@3,0 {
 			device_type = "pci";
 			reg = <0x1800 0 0 0 0>;
 			reset-gpios = <&pinctrl 7 GPIO_ACTIVE_LOW>;
 			bus-range = <4 4>;
+			pwren-gpios = <&smc_gpio 0x16 GPIO_ACTIVE_HIGH>;
 			#address-cells = <3>;
 			#size-cells = <2>;
 			ranges;
