@@ -2021,7 +2021,53 @@ static void parser_desktop_metadata_timing(struct kunit *test)
 	drm_edid_free(edid);
 }
 
+/*
+ * The M5 internal DCP (firmware 27) crashes on any set_digital_out_mode that
+ * is not the 120 Hz boot timing (3024x1986@60 killed the co-processor).  The
+ * connector must refuse every other mode of the internal panel.
+ */
+static void parser_internal_v27_only_120hz(struct kunit *test)
+{
+	struct dcp_display_mode catalog[2] = {};
+	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
+	struct platform_device *pipeline = kunit_kzalloc(test, sizeof(*pipeline), GFP_KERNEL);
+	struct apple_connector *connector = kunit_kzalloc(test, sizeof(*connector), GFP_KERNEL);
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, dcp);
+	KUNIT_ASSERT_NOT_NULL(test, pipeline);
+	KUNIT_ASSERT_NOT_NULL(test, connector);
+	for (i = 0; i < 2; i++) {
+		struct drm_display_mode *m = &catalog[i].mode;
+
+		m->clock = i ? 523576 : 1047153;
+		m->hdisplay = 3024; m->hsync_start = 3048;
+		m->hsync_end = 3056; m->htotal = 3064;
+		m->vdisplay = 1986; m->vsync_start = 2754;
+		m->vsync_end = 2812; m->vtotal = 2848;
+		m->type = DRM_MODE_TYPE_DRIVER | (i ? 0 : DRM_MODE_TYPE_PREFERRED);
+		catalog[i].timing_mode_id = 2 + i;
+	}
+	parser_modes_init(dcp);
+	mutex_init(&dcp->dcpavserv.lock);
+	mutex_init(&dcp->hpd_mutex);
+	dcp->fw_compat = DCP_FIRMWARE_V_27_0;
+	dcp->connector = connector;
+	dcp->modes = catalog;
+	dcp->nr_modes = 2;
+	dcp->modes_admitted = true;
+	connector->dcp = pipeline;
+	platform_set_drvdata(pipeline, dcp);
+
+	KUNIT_EXPECT_EQ(test, dcp_mode_valid(&connector->base, &catalog[0].mode), MODE_OK);
+	KUNIT_EXPECT_EQ(test, dcp_mode_valid(&connector->base, &catalog[1].mode), MODE_BAD);
+	dcp->modes = NULL;
+	dcp->nr_modes = 0;
+	dcp_modes_release(dcp);
+}
+
 static struct kunit_case parser_cases[] = {
+	KUNIT_CASE(parser_internal_v27_only_120hz),
 	KUNIT_CASE(parser_panel_of_dimensions),
 	KUNIT_CASE(parser_panel_j616s_publication),
 	KUNIT_CASE(parser_panel_h17p_publication),

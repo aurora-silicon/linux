@@ -3034,6 +3034,15 @@ static bool dcp_mode_settable(struct apple_dcp *dcp,
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		return dcp_mode.mode.type & DRM_MODE_TYPE_PREFERRED;
 
+	/*
+	 * The firmware 27 internal DCP (M5) crashes on 3024x1986@60 and the
+	 * other 60 Hz timings it lists.  Only the 120 Hz timing is known to
+	 * survive a modeset, so refuse the rest until they are understood.
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp->external &&
+	    drm_mode_vrefresh(mode) != 120)
+		return false;
+
 	return true;
 }
 
