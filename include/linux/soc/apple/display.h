@@ -51,8 +51,9 @@ static inline bool apple_t6041_dcpext_v27_2(const struct device_node *np)
 /*
  * Software camera indicator (interim, not the secure indicator): a
  * kernel-owned overlay on the internal panel, requested best-effort by the
- * camera driver. set(true) returns 0 once a present carried it to the panel;
- * the camera streams regardless of the answer.
+ * camera driver. set(true) returns 0 once the request is committed, without
+ * waiting for the present; a square no present carries within 1 s is
+ * withdrawn with a warning. The camera streams regardless of the answer.
  */
 #if IS_ENABLED(CONFIG_DRM_APPLE)
 int apple_dcp_camera_indicator_set(struct device *dcp, bool on);

@@ -11,6 +11,7 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/workqueue.h>
 #include <linux/soc/apple/display.h>
 
 #include <drm/drm_atomic.h>
@@ -20,7 +21,6 @@
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_gem_framebuffer_helper.h>
-#include <drm/drm_managed.h>
 #include <drm/drm_modeset_lock.h>
 
 #include "dcp.h"
@@ -36,6 +36,8 @@
 #define IND_EDGE		0xff000000
 #define IND_PRESENT_TIMEOUT	msecs_to_jiffies(1000)
 
+static void dcp_indicator_watch(struct work_struct *work);
+
 int dcp_indicator_probe(struct apple_dcp *dcp)
 {
 	struct dcp_camera_indicator *ci = &dcp->camera_ind;
@@ -43,7 +45,7 @@ int dcp_indicator_probe(struct apple_dcp *dcp)
 
 	spin_lock_init(&ci->lock);
 	mutex_init(&ci->ctl);
-	init_completion(&ci->presented);
+	INIT_DELAYED_WORK(&ci->watch, dcp_indicator_watch);
 
 	if (of_property_read_u32(dcp->dev->of_node, "apple,camera-indicator-surface", &surf))
 		return 0;
@@ -55,16 +57,27 @@ int dcp_indicator_probe(struct apple_dcp *dcp)
 	return 0;
 }
 
-static void dcp_indicator_release(struct drm_device *drm, void *data)
+/*
+ * From the DCP's component unbind, while the DCP and the drm_device are both
+ * alive: a drmm action would run after the DCP's memory is gone. surf and
+ * has_surf come from the device tree, so the next bind builds the plane again.
+ */
+void dcp_indicator_release(struct apple_dcp *dcp)
 {
-	struct dcp_camera_indicator *ci = data;
+	struct dcp_camera_indicator *ci = &dcp->camera_ind;
+	unsigned long flags;
 
+	if (!ci->has_surf)
+		return;
+	cancel_delayed_work_sync(&ci->watch);
 	guard(mutex)(&ci->ctl);
 	if (ci->fb)
 		drm_framebuffer_put(ci->fb);
 	ci->fb = NULL;
 	ci->plane = NULL;
-	ci->has_surf = false;
+	spin_lock_irqsave(&ci->lock, flags);
+	dcp_ind_end(&ci->state);
+	spin_unlock_irqrestore(&ci->lock, flags);
 }
 
 static const struct drm_framebuffer_funcs dcp_indicator_fb_funcs = {
@@ -86,8 +99,8 @@ static void dcp_indicator_paint(u32 *px)
 
 /*
  * Reserve the plane for the kernel and build the square it shows. A failure
- * leaves the plane reserved and without a framebuffer, so userspace still
- * cannot use it and the camera cannot start.
+ * leaves the plane reserved and without a framebuffer: userspace still
+ * cannot use it, no indicator is shown, and the camera streams anyway.
  */
 int dcp_indicator_attach_plane(struct apple_dcp *dcp, struct drm_device *drm,
 			       struct drm_plane *plane)
@@ -130,8 +143,7 @@ int dcp_indicator_attach_plane(struct apple_dcp *dcp, struct drm_device *drm,
 	drm_framebuffer_unregister_private(fb);
 
 	ci->fb = fb;
-	to_apple_plane(plane)->indicator_fb = fb;
-	return drmm_add_action_or_reset(drm, dcp_indicator_release, ci);
+	return 0;
 }
 
 /* The atomic state the kernel itself commits: the square, or nothing. */
@@ -215,9 +227,36 @@ static void dcp_indicator_end(struct apple_dcp *dcp)
 }
 
 /*
- * on: returns 0 once a present carried the square to the panel, within 1 s;
- * otherwise an error and the indicator is left off. The caller streams either
- * way. off: always succeeds.
+ * One second after a request, a square that no present has carried to the
+ * panel is withdrawn and said so. Nothing waits for this: the camera streams
+ * from the moment set(true) returns.
+ */
+static void dcp_indicator_watch(struct work_struct *work)
+{
+	struct dcp_camera_indicator *ci =
+		container_of(work, struct dcp_camera_indicator, watch.work);
+	struct apple_dcp *dcp = container_of(ci, struct apple_dcp, camera_ind);
+	unsigned long flags;
+	bool pending;
+
+	guard(mutex)(&ci->ctl);
+	spin_lock_irqsave(&ci->lock, flags);
+	pending = ci->state.state == DCP_IND_PENDING;
+	spin_unlock_irqrestore(&ci->lock, flags);
+	if (!pending)
+		return;
+
+	dev_warn(dcp->dev, "camera indicator not presented within %u ms, withdrawn\n",
+		 jiffies_to_msecs(IND_PRESENT_TIMEOUT));
+	dcp_indicator_end(dcp);
+	dcp_indicator_commit(dcp, false);
+}
+
+/*
+ * on: requests the square and returns 0 once the request is committed; the
+ * present that carries it is confirmed, or withdrawn, within 1 s without
+ * blocking the caller. An error means no indicator. off: always succeeds. The
+ * caller streams either way.
  */
 int apple_dcp_camera_indicator_set(struct device *dev, bool on)
 {
@@ -232,33 +271,39 @@ int apple_dcp_camera_indicator_set(struct device *dev, bool on)
 	if (!dcp || !dev->driver)
 		return on ? -ENODEV : 0;
 	ci = &dcp->camera_ind;
+	/* Set from the device tree at probe, so a DCP that never probed it has no lock to take. */
+	if (!ci->has_surf)
+		return on ? -ENODEV : 0;
 
 	guard(mutex)(&ci->ctl);
-	if (!ci->has_surf || !ci->fb)
-		return on ? -ENODEV : 0;
 	if (!on) {
+		cancel_delayed_work(&ci->watch);
 		dcp_indicator_end(dcp);
-		ret = dcp_indicator_commit(dcp, false);
-		if (ret)
-			dev_warn(dcp->dev, "camera indicator off commit failed: %d\n", ret);
+		if (ci->fb) {
+			ret = dcp_indicator_commit(dcp, false);
+			if (ret)
+				dev_warn(dcp->dev, "camera indicator off commit failed: %d\n",
+					 ret);
+		}
 		return 0;
 	}
+	if (!ci->fb)
+		return -ENODEV;
 
 	spin_lock_irqsave(&ci->lock, flags);
 	ret = dcp_ind_begin(&ci->state);
-	reinit_completion(&ci->presented);
 	spin_unlock_irqrestore(&ci->lock, flags);
 	if (ret)
 		return ret;
 
 	ret = dcp_indicator_commit(dcp, true);
-	if (!ret && !wait_for_completion_timeout(&ci->presented, IND_PRESENT_TIMEOUT))
-		ret = -ETIMEDOUT;
 	if (ret) {
 		dcp_indicator_end(dcp);
 		dcp_indicator_commit(dcp, false);
+		return ret;
 	}
-	return ret;
+	mod_delayed_work(system_percpu_wq, &ci->watch, IND_PRESENT_TIMEOUT);
+	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_dcp_camera_indicator_set);
 
@@ -272,7 +317,5 @@ void dcp_indicator_swap_done(struct apple_dcp *dcp, struct drm_framebuffer *slot
 		return;
 	spin_lock_irqsave(&ci->lock, flags);
 	dcp_ind_present_done(&ci->state, slot_fb && slot_fb == ci->fb);
-	if (ci->state.state == DCP_IND_LIT)
-		complete(&ci->presented);
 	spin_unlock_irqrestore(&ci->lock, flags);
 }
