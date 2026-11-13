@@ -1516,24 +1516,31 @@ static int mt_resume(struct device *dev)
 }
 
 /*
- * Hibernation is refused. Its freeze phase does not call .suspend, so without
- * this the firmware would keep writing to memory while the image is saved,
- * and the restored kernel would resume with ring state the firmware of the
- * booting kernel does not have. Supporting it needs DMA retirement and a full
- * reinitialisation on restore. Returning an error here has no side effect to
- * undo: the PM core aborts hibernation before this device changes state.
+ * Hibernation freeze and poweroff stop the host interface as for
+ * suspend-to-RAM: the firmware stops its DMA and takes ownership before the
+ * image is made, so nothing writes to memory while it is saved. The freeze
+ * phase does not call .suspend, so without this the firmware would keep its
+ * rings live through the snapshot.
  */
 static int mt_freeze(struct device *dev)
 {
-	dev_err(dev, "hibernation is not supported\n");
-	return -EOPNOTSUPP;
+	return mt_hif_suspend(pci_get_drvdata(to_pci_dev(dev)));
 }
 
+/*
+ * After a dry run or an aborted hibernation the firmware kept running and
+ * mt_resume() restarts the host interface. After a restored image the chip
+ * has been through a power cycle: mt_hif_restart() finds the rings gone and
+ * mt_resume() hands the radio to the platform radio recovery, as it does after
+ * a failed suspend-to-RAM.
+ */
 static const struct dev_pm_ops mt_pm_ops = {
 	.suspend = mt_suspend,
 	.resume = mt_resume,
 	.freeze = mt_freeze,
+	.thaw = mt_resume,
 	.poweroff = mt_freeze,
+	.restore = mt_resume,
 };
 
 static const struct pci_device_id mt_ids[] = {
