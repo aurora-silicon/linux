@@ -13,8 +13,9 @@
 //! Every operation is one generic-transfer exchange (see `transfer.rs`) on the
 //! endpoint's out-of-line buffers. The opcodes below are the ones recorded on a
 //! J616s under macOS 27.0 while a keyboard was paired, enabled for Touch ID,
-//! disconnected and reconnected. The body lengths in that recording match the
-//! layouts here exactly:
+//! disconnected and reconnected, forgotten and paired again, and switched off
+//! and on. The body lengths in those recordings match the layouts here
+//! exactly:
 //!
 //! ```text
 //! op    request  reply       when
@@ -26,7 +27,15 @@
 //! 0x14  60       0           enabling the accessory for Touch ID
 //! 0x09  17       0           link down / link up
 //! 0x0b  0        20          paired list, one accessory
+//! 0x04  16       0           forgetting the accessory
+//! 0x06  81       69 + 159    per-connection session, first half
+//! 0x07  1556     0           per-connection session, second half
 //! ```
+//!
+//! The per-connection session (a manifest with `after_pairing` clear, then
+//! 0x06 and 0x07) ran when the accessory came back after being switched off.
+//! It did not run at pairing or when the accessory moved between USB and
+//! Bluetooth.
 //!
 //! Operations the recording does not contain are not defined here.
 //!
@@ -45,8 +54,14 @@ pub(crate) enum Op {
     PairingState = 0x02,
     /// Starts a pairing with the accessory's identity and ephemeral points.
     PairingBegin = 0x03,
+    /// Forgets one paired accessory.
+    Unpair = 0x04,
     /// Hands the enclave the accessory's manifest.
     Manifest = 0x05,
+    /// Starts a per-connection session with the accessory's ephemeral point.
+    SessionBegin = 0x06,
+    /// Finishes a per-connection session with the accessory's material.
+    SessionFinish = 0x07,
     /// Tells the enclave the accessory's link went down or came back.
     ConnectionState = 0x09,
     /// Lists the paired accessories.
@@ -110,6 +125,16 @@ pub(crate) const MANIFEST_FIXED: usize = ACCESSORY_ID_LEN + 1 + WORD;
 
 pub(crate) const CONNECTION_STATE_REQUEST_LEN: usize = ACCESSORY_ID_LEN + 1;
 
+pub(crate) const UNPAIR_REQUEST_LEN: usize = ACCESSORY_ID_LEN;
+
+pub(crate) const SESSION_BEGIN_REQUEST_LEN: usize = ACCESSORY_ID_LEN + PUBLIC_POINT_LEN;
+/// The reply: the enclave's ephemeral point, a length word, the attestation.
+pub(crate) const SESSION_BEGIN_REPLY_FIXED: usize = PUBLIC_POINT_LEN + WORD;
+/// The accessory's session material travels in a fixed, zero-padded slot.
+pub(crate) const SESSION_MATERIAL_SLOT: usize = 1536;
+pub(crate) const SESSION_FINISH_REQUEST_LEN: usize =
+    ACCESSORY_ID_LEN + WORD + SESSION_MATERIAL_SLOT;
+
 /// The ACM context handle travels in a fixed, zero-padded slot.
 pub(crate) const ACM_HANDLE_SLOT: usize = 32;
 pub(crate) const AUTHORIZE_FIXED: usize = WORD + ACCESSORY_ID_LEN + WORD + ACM_HANDLE_SLOT + WORD;
@@ -120,6 +145,11 @@ static_assert!(PAIRING_BEGIN_REQUEST_LEN == 146);
 static_assert!(PAIRING_FINISH_FIXED + 1994 == 3619);
 static_assert!(MANIFEST_FIXED + 2391 == 2412);
 static_assert!(CONNECTION_STATE_REQUEST_LEN == 17);
+static_assert!(UNPAIR_REQUEST_LEN == 16);
+static_assert!(SESSION_BEGIN_REQUEST_LEN == 81);
+static_assert!(SESSION_BEGIN_REPLY_FIXED + 159 == 228);
+static_assert!(SESSION_FINISH_REQUEST_LEN == 1556);
+static_assert!(SESSION_BEGIN_REPLY_FIXED == PAIRING_BEGIN_REPLY_FIXED);
 static_assert!(AUTHORIZE_FIXED == 60);
 
 /// Why a reply was not taken.
@@ -287,6 +317,49 @@ pub(crate) fn connection_state_request(
     out
 }
 
+pub(crate) fn unpair_request(id: &AccessoryId) -> [u8; UNPAIR_REQUEST_LEN] {
+    id.0
+}
+
+/// Opens a per-connection session: the accessory's identity and the fresh
+/// ephemeral point it generated for this connection.
+pub(crate) fn session_begin_request(
+    id: &AccessoryId,
+    ephemeral: &PublicPoint,
+) -> [u8; SESSION_BEGIN_REQUEST_LEN] {
+    let mut out = [0u8; SESSION_BEGIN_REQUEST_LEN];
+    out[..ACCESSORY_ID_LEN].copy_from_slice(&id.0);
+    out[ACCESSORY_ID_LEN..].copy_from_slice(&ephemeral.0);
+    out
+}
+
+/// Where the enclave's answer to a session start sits in its body. The
+/// layout is the pairing start's: a point, a length word, an attestation.
+pub(crate) type SessionBeginReply = PairingBeginReply;
+
+pub(crate) fn parse_session_begin(
+    body: &[u8],
+) -> core::result::Result<SessionBeginReply, ParseError> {
+    parse_pairing_begin(body)
+}
+
+/// Closes a per-connection session with the material the accessory answered
+/// the enclave's attestation with. The material is opaque to the host.
+pub(crate) fn session_finish_request(
+    id: &AccessoryId,
+    material: &[u8],
+) -> Result<KVec<u8>> {
+    if material.is_empty() || material.len() > SESSION_MATERIAL_SLOT {
+        return Err(EINVAL);
+    }
+    let mut out = KVec::with_capacity(SESSION_FINISH_REQUEST_LEN, GFP_KERNEL)?;
+    out.extend_from_slice(&id.0, GFP_KERNEL)?;
+    push_word(&mut out, material.len())?;
+    out.extend_from_slice(material, GFP_KERNEL)?;
+    out.resize(SESSION_FINISH_REQUEST_LEN, 0, GFP_KERNEL)?;
+    Ok(out)
+}
+
 /// Parses the paired list into `out`; returns how many identities it holds.
 pub(crate) fn parse_paired_list(
     body: &[u8],
@@ -357,7 +430,10 @@ mod tests {
         assert_eq!(Op::HostAttestationObject.opcode(), 0x01);
         assert_eq!(Op::PairingState.opcode(), 0x02);
         assert_eq!(Op::PairingBegin.opcode(), 0x03);
+        assert_eq!(Op::Unpair.opcode(), 0x04);
         assert_eq!(Op::Manifest.opcode(), 0x05);
+        assert_eq!(Op::SessionBegin.opcode(), 0x06);
+        assert_eq!(Op::SessionFinish.opcode(), 0x07);
         assert_eq!(Op::ConnectionState.opcode(), 0x09);
         assert_eq!(Op::PairedList.opcode(), 0x0b);
         assert_eq!(Op::PowerState.opcode(), crate::stac::OP_POWER_STATE);
@@ -504,6 +580,45 @@ mod tests {
         assert_eq!(authorize_request(501, &ID, &handle, &[7; 8])?.len(), 68);
         assert!(authorize_request(501, &ID, &[], &[]).is_err());
         assert!(authorize_request(501, &ID, &[0; 33], &[]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn unpair_is_the_identity() {
+        assert_eq!(unpair_request(&ID), ID.0);
+    }
+
+    #[test]
+    fn session_begin_round_trip() -> Result {
+        let req = session_begin_request(&ID, &POINT_B);
+        assert_eq!(req.len(), 81);
+        assert_eq!(&req[..16], &ID.0);
+        assert_eq!(&req[16..], &POINT_B.0);
+
+        // The recorded reply shape: 65 + 4 + 159.
+        let mut body = [0u8; 228];
+        body[65..69].copy_from_slice(&159u32.to_le_bytes());
+        let r = parse_session_begin(&body).map_err(|_| EINVAL)?;
+        assert_eq!(r.host_ephemeral, 0..65);
+        assert_eq!(r.host_attestation, 69..228);
+        assert_eq!(parse_session_begin(&body[..227]), Err(ParseError::Field));
+        assert_eq!(parse_session_begin(&body[..68]), Err(ParseError::Length));
+        Ok(())
+    }
+
+    #[test]
+    fn session_finish_layout_matches_the_recorded_length() -> Result {
+        let material = [0x3cu8; 979];
+        let req = session_finish_request(&ID, &material)?;
+        assert_eq!(req.len(), 1556);
+        assert_eq!(&req[..16], &ID.0);
+        assert_eq!(&req[16..20], &979u32.to_le_bytes());
+        assert!(req[20..20 + 979].iter().all(|&b| b == 0x3c));
+        // The material slot is zero-padded.
+        assert!(req[20 + 979..].iter().all(|&b| b == 0));
+        assert_eq!(session_finish_request(&ID, &[0; 1536])?.len(), 1556);
+        assert!(session_finish_request(&ID, &[]).is_err());
+        assert!(session_finish_request(&ID, &[0; 1537]).is_err());
         Ok(())
     }
 
