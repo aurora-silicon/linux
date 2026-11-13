@@ -19,6 +19,8 @@ struct hwx_fixture_options {
 	bool mixed, kernel;
 	/* An LC_NOTE provenance command before the symbol table. */
 	bool note;
+	/* Debugging entries after the two surface symbols. */
+	u32 stabs;
 };
 
 static u8 *fixture_command(struct hwx_fixture *f, u32 command, u32 length)
@@ -193,7 +195,17 @@ fixture_create_options(struct kunit *test, const struct hwx_fixture_options *o)
 	f->symtab = f->cursor;
 	c = fixture_command(f, 2, 24);
 	f->symbols = f->cursor;
-	f->strings = f->symbols + 2 * 16;
+	f->strings = f->symbols + (2 + o->stabs) * 16;
+	for (i = 0; i < o->stabs; i++) {
+		static const char stab[] = "float16:t5=r1;2;0";
+		u8 *symbol = f->bytes + f->symbols + (2 + i) * 16;
+
+		/* N_LSYM type descriptions and N_GSYM tensor types, section 0. */
+		put_unaligned_le32(strings_length, symbol);
+		symbol[4] = i & 1 ? 0x20 : 0x80;
+		memcpy(f->bytes + f->strings + strings_length, stab, sizeof(stab));
+		strings_length += sizeof(stab);
+	}
 	for (i = 0; i < 2; i++) {
 		u8 *symbol = f->bytes + f->symbols + i * 16;
 
@@ -205,7 +217,7 @@ fixture_create_options(struct kunit *test, const struct hwx_fixture_options *o)
 		strings_length += strlen(names[i]) + 1;
 	}
 	put_unaligned_le32(f->symbols, c + 8);
-	put_unaligned_le32(2, c + 12);
+	put_unaligned_le32(2 + o->stabs, c + 12);
 	put_unaligned_le32(f->strings, c + 16);
 	put_unaligned_le32(strings_length, c + 20);
 	f->reloc = ALIGN(f->strings + strings_length, 8);

@@ -449,6 +449,37 @@ static void hwx_symbols_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
 }
 
+/*
+ * Debugging entries carry source type descriptions: no section, no value,
+ * and names that may repeat. They are skipped, their names bounded.
+ */
+static void hwx_stabs_test(struct kunit *test)
+{
+	const struct hwx_fixture_options o = { .stabs = 3 };
+	struct hwx_fixture *f = fixture_create_options(test, &o);
+	struct ane_h16_hwx info;
+	u8 *stab;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+	KUNIT_EXPECT_EQ(test, info.surface_count, 2U);
+	stab = f->bytes + f->symbols + 2 * 16;
+	/* The same description twice is not a duplicate symbol. */
+	put_unaligned_le32(get_unaligned_le32(stab), stab + 16);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+	/* Its name still lies in the string table. */
+	put_unaligned_le32(U32_MAX, stab + 16);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	put_unaligned_le32(get_unaligned_le32(stab), stab + 16);
+	/* Without the STAB bits the same entry is an invalid symbol. */
+	stab[4] = 0x0e;
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	stab[4] = 0x80;
+	/* A surface symbol is still required: STABs do not stand in for it. */
+	f->bytes[f->symbols + 4] = 0x20;
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+}
+
 static void hwx_relocations_test(struct kunit *test)
 {
 	struct hwx_fixture *f = fixture_create(test, true, true);
@@ -759,7 +790,7 @@ static void hwx_h17_zin_test(struct kunit *test)
 	put_unaligned_le32(3, f->bytes + f->symtab + 12);
 	put_unaligned_le32(strsize + 16, f->bytes + f->symtab + 20);
 	H17_OK();
-	AS_H16(REFUSED());
+	AS_H16(H17_OK());	/* H16G compilers emit stabs too (hwx_symbols_test) */
 	put_unaligned_le64(0x1000, sym + 8);
 	REFUSED();
 	put_unaligned_le64(0, sym + 8);
@@ -830,6 +861,7 @@ static struct kunit_case hwx_cases[] = {
 	KUNIT_CASE(hwx_geometry_test),
 	KUNIT_CASE(hwx_text_flags_test),
 	KUNIT_CASE(hwx_symbols_test),
+	KUNIT_CASE(hwx_stabs_test),
 	KUNIT_CASE(hwx_relocations_test),
 	KUNIT_CASE(hwx_snapshot_test),
 	KUNIT_CASE(hwx_load_plan_test),

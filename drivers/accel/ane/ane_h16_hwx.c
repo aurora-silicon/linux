@@ -12,6 +12,7 @@
 #define HWX_SYMBOLS_MAX 4096
 #define HWX_SEGMENTS_MAX 8
 #define HWX_SG_NORELOC 0x4
+#define HWX_N_STAB 0xe0
 
 struct hwx_range {
 	u64 start, size;
@@ -441,31 +442,35 @@ static int hwx_symbols(struct hwx_parser *p)
 		u64 value = get_unaligned_le64(s + 8);
 		const struct ane_h16_hwx_section *section;
 		const char *name;
-		/*
-		 * zin_ane_compiler 10.205 (H17) adds stabs type records (N_GSYM 0x20 for each
-		 * surface, N_LSYM 0x80 for each element type) with no section and value 0.
-		 * n_desc holds the stabs type number. They name no address; their strings are
-		 * still checked below.
-		 */
 		bool h17 = p->info.subtype == ANE_HWX_SUBTYPE_H17;
-		bool stab = h17 && (s[4] == 0x20 || s[4] == 0x80);
 
-		if (strx >= p->strsize ||
-		    (stab ? s[5] || value :
-			    !s[5] || s[5] > p->section_count || (s[4] & ~1) != 0xe))
+		if (strx >= p->strsize)
+			return -ENOEXEC;
+		/*
+		 * Debugging (STAB) entries describe the source types of the
+		 * tensors (N_GSYM 0x20 for each surface, N_LSYM 0x80 for each
+		 * element type, the stabs type number in n_desc); they name no
+		 * section, have value 0 and place nothing in the image. Both
+		 * H16G and H17 compilers emit them.
+		 */
+		if (s[4] & HWX_N_STAB) {
+			if (s[5] || value)
+				return -ENOEXEC;
+			continue;
+		}
+		if (!s[5] || s[5] > p->section_count || (s[4] & ~1) != 0xe)
 			return -ENOEXEC;
 		name = p->bytes + p->stroff + strx;
 		if (!*name || strnlen(name, min_t(u32, 256, p->strsize - strx)) ==
 		    min_t(u32, 256, p->strsize - strx))
 			return -ENOEXEC;
 		for (j = 0; j < i; j++) {
-			u32 previous = get_unaligned_le32(p->bytes + p->symoff + j * 16);
+			const u8 *previous = p->bytes + p->symoff + j * 16;
 
-			if (!strcmp(name, p->bytes + p->stroff + previous))
+			if (!(previous[4] & HWX_N_STAB) &&
+			    !strcmp(name, p->bytes + p->stroff + get_unaligned_le32(previous)))
 				return -ENOEXEC;
 		}
-		if (stab)
-			continue;
 		section = &p->sections[s[5] - 1];
 		/* H17 places the empty per-core kernel objects (…_ne_N) at the section end. */
 		if (value < section->vm || value - section->vm > section->size ||
