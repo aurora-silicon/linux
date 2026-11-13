@@ -753,7 +753,8 @@ static int apple_smc_probe(struct platform_device *pdev)
 	 * or no room in its table) the noirq suspend commits, as on every other SoC.
 	 */
 	if (hw && hw->commit_at_stop &&
-	    !apple_sleep_coproc_register_first(dev, apple_smc_last_stop, smc)) {
+	    !apple_sleep_coproc_register_first(dev, APPLE_SLEEP_FIRST_SMC, apple_smc_last_stop,
+					       smc)) {
 		smc->commit_at_stop = true;
 		ret = devm_add_action_or_reset(dev, apple_smc_last_stop_unregister, smc);
 		if (ret)
@@ -1265,10 +1266,17 @@ static int apple_smc_stop_write(struct apple_smc *smc, smc_key key, const void *
  * A last stop cannot refuse, and the sleep goes on whatever the SMC answers. So does this:
  * a step that fails is logged and the rest is sent all the same, since an SMC that took
  * the warning leaves its sleep state only through the rest of the sequence and the power
- * loss. Each write waits up to SMC_ATOMIC_TIMEOUT_MS for its answer and as long again
- * for an answer still missing from the write before. The wake sends its part, as after
- * any sleep, once this has started. Returns the first failure.
+ * loss. The one exception is an SMC that does not answer at all: a write waits up to
+ * SMC_ATOMIC_TIMEOUT_MS for its answer, so after the first timeout the rest is left out
+ * instead of waiting that long again for each step. The wake sends its part, as after any
+ * sleep, once this has started. Returns the first failure.
  */
+static bool apple_smc_stop_dead(int ret)
+{
+	/* No answer within SMC_ATOMIC_TIMEOUT_MS, or the one before is still missing. */
+	return ret == -ETIMEDOUT || ret == -EBUSY;
+}
+
 static int apple_smc_last_stop(void *data)
 {
 	const u32 slpw = SMC_KEY(slpw), slpa = SMC_KEY(slpa);
@@ -1286,6 +1294,8 @@ static int apple_smc_last_stop(void *data)
 
 	err = apple_smc_stop_write(smc, SMC_KEY(MBSE), &slpw, sizeof(slpw));
 	smc->sleep_warned = true;
+	if (apple_smc_stop_dead(err))
+		goto dead;
 	apple_smc_outbox_poll(smc, "sleep warning at the last stop", SMC_SLEEP_WARN_MS, 0);
 
 	/* As in apple_smc_sleep_commit(). */
@@ -1293,9 +1303,13 @@ static int apple_smc_last_stop(void *data)
 	if (smc->wktp) {
 		ret = apple_smc_stop_write(smc, SMC_KEY(WKTP), &wktp, sizeof(wktp));
 		err = err ?: ret;
+		if (apple_smc_stop_dead(ret))
+			goto dead;
 	}
 	ret = apple_smc_stop_write(smc, SMC_KEY(MBSE), &slpa, sizeof(slpa));
 	err = err ?: ret;
+	if (apple_smc_stop_dead(ret))
+		goto dead;
 	mdelay(SMC_SLEEP_ARM_MS);
 
 	/* Not taken back if the notice fails: the sleep goes on, and its wake sends the other. */
@@ -1306,7 +1320,17 @@ static int apple_smc_last_stop(void *data)
 	else
 		mdelay(SMC_SLEEP_IDLE_MS);
 	err = err ?: ret;
+	goto out;
 
+dead:
+	/*
+	 * An SMC that answers nothing for SMC_ATOMIC_TIMEOUT_MS takes nothing more: each further
+	 * write would wait that long again, and again for the answer still missing, all with
+	 * interrupts off. The sleep goes on without the rest.
+	 */
+	dev_err(smc->dev, "SMC does not answer at the last stop, the rest is left out\n");
+	err = err ?: -ETIMEDOUT;
+out:
 	/*
 	 * The wake's commands are the usual ones. An answer that never came is given up: if
 	 * it comes after all, it fails the sequence check of the command it lands on.

@@ -522,26 +522,36 @@ static void macsmc_last_stop_refused_test(struct kunit *test)
 static void macsmc_last_stop_failed_test(struct kunit *test)
 {
 	struct macsmc_test_context *ctx = test->priv;
-	unsigned int n = 0;
 
 	macsmc_last_stop_begin(test);
 
 	/*
-	 * An SMC that answers nothing: a last stop cannot refuse, so every step is still
-	 * sent, the first failure is returned, and the wake sends its part.
+	 * An SMC that answers nothing: a last stop cannot refuse, but each further step would
+	 * wait out its timeout again with interrupts off. Only the warning is tried, nothing else
+	 * is sent, no idle notice is owed to the wake, and the first failure is returned.
 	 */
 	ctx->atomic_result = -ETIMEDOUT;
-	ctx->ap_power_result = -ETIME;
 	ctx->smc.atomic_pending = true;
 	KUNIT_EXPECT_EQ(test, apple_smc_last_stop(&ctx->smc), -ETIMEDOUT);
-	KUNIT_ASSERT_EQ(test, ctx->seen_count, 4U);
-	KUNIT_EXPECT_EQ(test, ctx->seen[n++], SMC_KEY(slpw));
-	KUNIT_EXPECT_EQ(test, ctx->seen[n++], 2U);
-	KUNIT_EXPECT_EQ(test, ctx->seen[n++], SMC_KEY(slpa));
-	KUNIT_EXPECT_EQ(test, ctx->seen[n++], (u32)MACSMC_TEST_AP_IDLE);
+	KUNIT_ASSERT_EQ(test, ctx->seen_count, 1U);
+	KUNIT_EXPECT_EQ(test, ctx->seen[0], SMC_KEY(slpw));
+	KUNIT_EXPECT_FALSE(test, ctx->smc.ap_notified);
+	KUNIT_EXPECT_FALSE(test, ctx->smc.atomic_mode);
+	KUNIT_EXPECT_FALSE(test, ctx->smc.atomic_pending);
+	KUNIT_EXPECT_TRUE(test, ctx->smc.sleep_warned);
+}
 
-	ctx->ap_power_result = 0;
-	macsmc_last_stop_wake(test, n);
+/* The same when the answer to an earlier command is still missing (-EBUSY). */
+static void macsmc_last_stop_late_test(struct kunit *test)
+{
+	struct macsmc_test_context *ctx = test->priv;
+
+	macsmc_last_stop_begin(test);
+
+	ctx->atomic_result = -EBUSY;
+	KUNIT_EXPECT_EQ(test, apple_smc_last_stop(&ctx->smc), -EBUSY);
+	KUNIT_EXPECT_EQ(test, ctx->seen_count, 1U);
+	KUNIT_EXPECT_FALSE(test, ctx->smc.ap_notified);
 }
 
 static void macsmc_notice_test(struct kunit *test)
@@ -661,6 +671,7 @@ static struct kunit_case macsmc_parser_cases[] = {
 	KUNIT_CASE(macsmc_last_stop_test),
 	KUNIT_CASE(macsmc_last_stop_refused_test),
 	KUNIT_CASE(macsmc_last_stop_failed_test),
+	KUNIT_CASE(macsmc_last_stop_late_test),
 	KUNIT_CASE(macsmc_notice_test),
 	KUNIT_CASE(macsmc_lid_wake_test),
 	KUNIT_CASE(macsmc_wake_reason_test),
