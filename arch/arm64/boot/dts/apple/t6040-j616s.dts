@@ -205,6 +205,31 @@
 };
 
 /*
+ * ProRes encoder and its DART. The engine runs with SCODEC_STREAMING (and so
+ * SCODEC) powered. The driver has built-in power-up rows for it; an optional
+ * apple/prores-t6041-init.bin replaces them.
+ */
+&ps_fab1_soc {
+	status = "okay";
+};
+
+&ps_scodec {
+	status = "okay";
+};
+
+&ps_scodec_streaming {
+	status = "okay";
+};
+
+&apr0_dart {
+	status = "okay";
+};
+
+&apr0 {
+	status = "okay";
+};
+
+/*
  * USB4/Thunderbolt on all three Type-C ports: typec0 (left back, ACIO0),
  * typec1 (left front, ACIO1) and typec2 (right, ACIO2). The loader hands
  * each router its router, adapter and NHI tuning and its DROM over. No PCIe
