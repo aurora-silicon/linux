@@ -57,6 +57,19 @@
 //! record, so the create runs in the same window ([`keybag_create_window`]).
 //! An unfinished create is sent again only if Linux's list shows it left no
 //! record behind ([`may_retry_create`]).
+//!
+//! In the initrd (`keystore_only=2`) the list is not available: it lives on
+//! the real root, which may be the very volume the initrd is opening. A
+//! password unlock there still needs the enclave's xART writes, so the initrd
+//! gets its own guard ([`Guard::open_initrd`]). Its list starts empty and is
+//! kept in memory only: every session record that existed when the initrd
+//! opened the gigalocker is refused, Linux's own included, and only records
+//! the enclave creates during the initrd are adopted. It never takes the
+//! one-time allowance or opens a policy window. When the real root completes
+//! the attach, the records the initrd adopted are added to Linux's list
+//! before the real root's guard takes its view of the gigalocker
+//! ([`Guard::carry`]), so they stay Linux's. A crash before that leaves them
+//! off the list, and later boots protect them like another OS's records.
 
 use crate::shim::StoreFile;
 use crate::xart_store::{crc32_ieee, Key};
@@ -455,6 +468,15 @@ pub(crate) struct Guard<F: ListFile = HostListFile> {
     save_previous: Option<Rewrite>,
     /// The window open now; the tests set their own.
     window: fn() -> Option<Rewrite>,
+    /// The initrd's guard: its list is in memory only, see
+    /// [`Guard::open_initrd`].
+    in_memory: bool,
+}
+
+/// The initrd's guard never sees a window open: windows belong to the real
+/// root's boot.
+fn no_window() -> Option<Rewrite> {
+    None
 }
 
 impl Guard {
@@ -471,12 +493,34 @@ impl Guard {
         guard.allowance = take_allowance();
         guard
     }
+
+    /// The guard for the initrd's key-store-only phase. It opens no host file
+    /// (the list, the allowance and the saved previous values all live on the
+    /// real root) and starts with an empty list kept in memory: every session
+    /// record in `existing` is protected, and only records the enclave creates
+    /// from now on are adopted. Never fails.
+    pub(crate) fn open_initrd(level: u8, existing: KVec<Key>) -> Guard {
+        let guard = Guard::empty(level, existing, true);
+        let sessions = guard.existed.iter().filter(|k| k.kind > 2).count();
+        let roots = if level >= 2 {
+            ", and so are the shared roots"
+        } else {
+            ""
+        };
+        pr_info_ratelimited!(
+            "xART guard level {} (initrd): {} session records exist and are protected{}; records created now are kept as Linux's\n",
+            level,
+            sessions,
+            roots
+        );
+        guard
+    }
 }
 
 impl<F: ListFile> Guard<F> {
     /// As [`Guard::open`], with the list in `file`.
-    pub(crate) fn with_file(level: u8, existing: KVec<Key>, file: Result<F>) -> Guard<F> {
-        let mut guard = Guard {
+    fn empty(level: u8, existing: KVec<Key>, in_memory: bool) -> Guard<F> {
+        Guard {
             level,
             file: None,
             end: 0,
@@ -487,8 +531,17 @@ impl<F: ListFile> Guard<F> {
             allowance: None,
             window_used: false,
             save_previous: None,
-            window: open_window,
-        };
+            window: if in_memory {
+                no_window as fn() -> Option<Rewrite>
+            } else {
+                open_window
+            },
+            in_memory,
+        }
+    }
+
+    pub(crate) fn with_file(level: u8, existing: KVec<Key>, file: Result<F>) -> Guard<F> {
+        let mut guard = Guard::empty(level, existing, false);
         // A list created this boot (or by a crashed one) is only safe to adopt
         // into once its name is durable: fsync() of the file alone does not
         // guarantee that. If the directory cannot be flushed, the file is
@@ -562,28 +615,78 @@ impl<F: ListFile> Guard<F> {
         self.level
     }
 
-    /// Whether Linux's list was loaded. Without it nothing can be adopted.
+    /// Whether Linux's list was loaded, or this is the initrd's in-memory
+    /// list. Without either nothing can be adopted.
     pub(crate) fn list_loaded(&self) -> bool {
-        self.file.is_some()
+        self.file.is_some() || self.in_memory
     }
 
     /// Entries in Linux's list now, or `None` without a list.
     pub(crate) fn listed_now(&self) -> Option<u64> {
-        self.file.as_ref().map(|_| self.end / ENTRY_SIZE as u64)
+        self.list_loaded().then(|| self.end / ENTRY_SIZE as u64)
     }
 
     /// Entries in Linux's list at load, or `None` without a list.
     pub(crate) fn listed_at_load(&self) -> Option<u64> {
-        self.file.as_ref().map(|_| self.loaded_entries)
+        self.list_loaded().then_some(self.loaded_entries)
+    }
+
+    /// Every write or delete this guard refused, the failed adoptions
+    /// included.
+    pub(crate) fn refusals(&self) -> usize {
+        self.refused
+    }
+
+    /// The session records the initrd's guard adopted, for the real root's
+    /// list; `None` for a guard with a host list.
+    pub(crate) fn initrd_adopted(&self) -> Option<&[Key]> {
+        self.in_memory.then_some(&self.owned[..])
+    }
+
+    /// Lists the records in `carried` (those the initrd's guard adopted) as
+    /// Linux's, before anything else can rewrite them. Only records that are
+    /// live now and not listed yet are added: a record the initrd created and
+    /// deleted again needs no entry. Returns how many were listed; one that
+    /// cannot be listed stays protected, as a record of another OS would be.
+    pub(crate) fn carry(&mut self, carried: &[Key]) -> usize {
+        let mut listed = 0;
+        for key in carried {
+            if key.kind <= 2 || !self.existed.contains(key) || self.owned.contains(key) {
+                continue;
+            }
+            match self.adopt(key) {
+                Ok(()) => listed += 1,
+                Err(e) => pr_warn_ratelimited!(
+                    "xART guard: could not list kind-{} record {}, which the initrd created, as Linux's ({:?}); it stays protected\n",
+                    key.kind,
+                    Id(&key.uuid),
+                    e
+                ),
+            }
+        }
+        if listed != 0 {
+            pr_info_ratelimited!(
+                "xART guard: listed {} record(s) the initrd created as Linux's\n",
+                listed
+            );
+        }
+        listed
     }
 
     fn adopt(&mut self, key: &Key) -> Result<()> {
-        let file = self.file.as_ref().ok_or(ENOENT)?;
         // The file's length, not the number of distinct keys: a torn or
         // repeated entry still counts against what load() accepts.
         if usize::try_from(self.end).map_or(true, |end| end / ENTRY_SIZE >= MAX_ENTRIES) {
             return Err(ENOSPC);
         }
+        if self.in_memory {
+            // The initrd keeps the entry until complete_attach carries it to
+            // the real root's list.
+            self.owned.push(*key, GFP_KERNEL)?;
+            self.end += ENTRY_SIZE as u64;
+            return Ok(());
+        }
+        let file = self.file.as_ref().ok_or(ENOENT)?;
         // Reserve room for the in-memory key before writing, so an entry made
         // durable is always listed in memory as well: no allocation can fail
         // after a record is written.
@@ -609,6 +712,7 @@ impl<F: ListFile> Guard<F> {
             Verdict::Adopt if !write => Ok(()),
             Verdict::Adopt => self.adopt(key).inspect_err(|e| {
                 crate::diag::xart_guard_refused();
+                self.refused += 1;
                 pr_warn_ratelimited!(
                     "xART guard: could not list a new kind-{} record as Linux's ({:?}); refusing to write it\n",
                     key.kind,
@@ -1279,5 +1383,94 @@ mod tests {
         // A create the guard refused before intents recorded the list.
         assert!(may_retry_create(Unfinished::Unmarked, Some(0)));
         assert!(!may_retry_create(Unfinished::Unmarked, Some(1)));
+    }
+    fn initrd_guard<'a>(level: u8, existing: &[Key]) -> Result<Guard<MemFile<'a>>> {
+        Ok(Guard::empty(level, keys(existing)?, true))
+    }
+
+    #[test]
+    fn the_initrd_guard_protects_every_existing_session_record() -> Result<()> {
+        // Linux's record from an earlier boot is on the real root's list, which
+        // the initrd does not have: it is protected like another OS's.
+        let (foreign, linux) = (session(1), session(2));
+        let mut guard = initrd_guard(1, &[foreign, linux])?;
+        assert!(guard.list_loaded());
+        assert_eq!(guard.check(&foreign, true), Err(EPERM));
+        assert_eq!(guard.check(&linux, true), Err(EPERM));
+        assert_eq!(guard.check(&linux, false), Err(EPERM));
+        assert_eq!(guard.refusals(), 3);
+        assert_eq!(guard.initrd_adopted(), Some(&[][..]));
+        Ok(())
+    }
+
+    #[test]
+    fn the_initrd_guard_adopts_new_records_in_memory() -> Result<()> {
+        let (foreign, created) = (session(1), session(3));
+        let mut guard = initrd_guard(1, &[foreign])?;
+        assert_eq!(guard.check(&created, true), Ok(()));
+        // Its own new record stays writable and deletable during the initrd.
+        assert_eq!(guard.check(&created, true), Ok(()));
+        assert_eq!(guard.check(&created, false), Ok(()));
+        assert_eq!(guard.initrd_adopted(), Some(&[created][..]));
+        assert_eq!(guard.listed_now(), Some(1));
+        assert_eq!(guard.refusals(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn the_initrd_guard_never_opens_a_window() -> Result<()> {
+        // The window belongs to the real root's boot: the initrd's guard
+        // never sees it open, so no existing kind-4 record is rewritten.
+        let a = session(1);
+        let mut guard = initrd_guard(1, &[a])?;
+        assert_eq!((guard.window)(), None);
+        assert_eq!(guard.check(&a, true), Err(EPERM));
+        assert_eq!(guard.take_save_previous(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn the_initrd_guard_follows_the_level_for_roots() -> Result<()> {
+        let root = Key::root(1);
+        assert_eq!(initrd_guard(1, &[root])?.check(&root, true), Ok(()));
+        assert_eq!(initrd_guard(2, &[root])?.check(&root, true), Err(EPERM));
+        Ok(())
+    }
+
+    #[test]
+    fn the_real_root_keeps_what_the_initrd_created() -> Result<()> {
+        let (foreign, created, gone) = (session(1), session(3), session(4));
+        let mut initrd = initrd_guard(1, &[foreign])?;
+        assert_eq!(initrd.check(&created, true), Ok(()));
+        assert_eq!(initrd.check(&gone, true), Ok(()));
+        assert_eq!(initrd.check(&gone, false), Ok(()));
+        let carried = keys(initrd.initrd_adopted().unwrap_or(&[]))?;
+
+        // complete_attach: the real root sees both records as existing; the
+        // carried one is listed before anything can write it.
+        let bytes = RefCell::new(KVec::new());
+        let mut root = Guard::with_file(1, keys(&[foreign, created])?, Ok(mem(&bytes)));
+        assert_eq!(root.carry(&carried), 1);
+        assert_eq!(listed(&bytes).as_slice(), &[Some(created)]);
+        assert_eq!(root.check(&created, true), Ok(()));
+        assert_eq!(root.check(&foreign, true), Err(EPERM));
+        // Carrying again lists nothing twice.
+        assert_eq!(root.carry(&carried), 0);
+        assert_eq!(listed(&bytes).as_slice(), &[Some(created)]);
+        drop(root);
+
+        // And the next boot still has it.
+        let mut next = Guard::with_file(1, keys(&[foreign, created])?, Ok(mem(&bytes)));
+        assert_eq!(next.check(&created, true), Ok(()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_carry_never_lists_a_root_or_a_record_it_cannot_write() -> Result<()> {
+        let (root, created) = (Key::root(2), session(3));
+        let mut guard = Guard::<MemFile<'_>>::with_file(1, keys(&[root, created])?, Err(ENOENT));
+        assert_eq!(guard.carry(&keys(&[root, created])?), 0);
+        assert_eq!(guard.check(&created, true), Err(EPERM));
+        Ok(())
     }
 }

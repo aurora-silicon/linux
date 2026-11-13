@@ -1079,7 +1079,6 @@ impl SepData {
             attach::initrd_xart_writes(
                 module_parameters::xart_writes.value() != 0,
                 keystore_user_bags,
-                xart_guard,
             )
         } else {
             module_parameters::xart_writes.value() != 0
@@ -1087,7 +1086,7 @@ impl SepData {
         if keystore_user_bags && !xart_writes {
             dev_info_ratelimited!(
                 dev,
-                "initrd: per-user key bags need xart_writes=1 and no xART guard; they wait for the real root\n"
+                "initrd: per-user key bags need xart_writes=1; they wait for the real root\n"
             );
         }
         // The qualified 26.6.2 lane uses only the boot-forwarded identity.
@@ -1105,6 +1104,11 @@ impl SepData {
         let store = match xart_store::Store::open_owner(xart_writes, xart_start) {
             Ok(mut store) => {
                 match xart_guard {
+                    // The real root's list is not available here: the
+                    // initrd's guard protects every record that exists now.
+                    Some(level) if store.writes_enabled() && keystore_only => {
+                        store.set_initrd_guard(level)?
+                    }
                     Some(level) if store.writes_enabled() => store.set_guard(level)?,
                     None if store.writes_enabled() => dev_info_ratelimited!(
                         dev,
@@ -2166,6 +2170,7 @@ impl SepData {
 
         let os_uuid = self.xarm.lock().os_uuid;
         let serviced = self.with_store(|store| {
+            let refusals_before = store.guard_refusals();
             let done = xarm::service(
                 req,
                 &payload,
@@ -2174,14 +2179,17 @@ impl SepData {
                 PROTECTED_DATA_AVAILABLE,
                 os_uuid,
             );
-            (done, store.writes_enabled())
+            let guard_refused = store.guard_refusals() != refusals_before;
+            (done, store.writes_enabled(), guard_refused)
         });
-        let Some((done, writable)) = serviced else {
+        let Some((done, writable, guard_refused)) = serviced else {
             self.fail_xarm(req.tag);
             return;
         };
 
-        if !writable
+        // A write the initrd's guard refused counts like one a read-only
+        // store refused: a trusted-key unseal after it fails closed.
+        if (!writable || guard_refused)
             && xarm::is_write(req.opcode)
             && done.reply.status != xarm::STATUS_OK
             && self.keystore_only.load(Relaxed)
@@ -3004,6 +3012,13 @@ impl SepData {
         let mut host = store::Store::open()?;
         let index = bio::IdentityIndex::load(&mut host)?;
         let mut store = self.store.lock();
+        // Records the enclave created in the initrd under the initrd's guard:
+        // listed as Linux's before the real root's guard looks at the store.
+        let carried = match store.as_ref().map(|store| store.initrd_adopted()) {
+            Some(Ok(keys)) => keys,
+            Some(Err(e)) => return Err(e),
+            None => KVec::new(),
+        };
         // Drop the read-only block handle before reopening the owner writable.
         // Failure leaves a usable read-only store when it can be reopened.
         *store = None;
@@ -3017,7 +3032,7 @@ impl SepData {
                     module_parameters::xart_guard.value(),
                     self.profile.xart_guard,
                 ) {
-                    new.set_guard(level)?;
+                    new.set_guard_carrying(level, &carried)?;
                 }
             }
             Ok(new)
