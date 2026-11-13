@@ -59,6 +59,9 @@ extern "C" {
     fn sep_diag_set_hwrng(registered: bool);
     fn sep_diag_set_stac(state: c_int);
     fn sep_diag_set_pnon(state: c_int, digest: *const u8, len: usize);
+    fn sep_diag_set_sse(state: c_int, protocol: u32);
+    fn sep_diag_sse_event() -> c_uint;
+    fn sep_diag_set_hibe(state: c_int);
     fn sep_diag_xarm_failed() -> c_uint;
     fn sep_diag_unhandled() -> c_uint;
     fn sep_diag_log_summary(dev: *mut c_void);
@@ -348,6 +351,46 @@ pub(crate) fn pnon(state: Pnon, digest: Option<&[u8; crate::pnon::DIGEST_LEN]>) 
     // SAFETY: `ptr` is null or points at `len` readable bytes for the call;
     // the shim copies them.
     unsafe { sep_diag_set_pnon(state as c_int, ptr, len) };
+}
+
+/// The secure-element sharing protocol query, as `SEP_DIAG_SSE_*` in
+/// `shim.h` spells it.
+#[derive(Clone, Copy)]
+pub(crate) enum Sse {
+    /// The service answered with its protocol word.
+    Ready = 1,
+    /// The enclave does not offer the endpoint as the driver knows it.
+    Absent = 2,
+    /// The query was refused, malformed, unanswered or not sent.
+    Failed = 3,
+}
+
+/// The outcome of the protocol query, with the word when it answered.
+pub(crate) fn sse(state: Sse, protocol: u32) {
+    // SAFETY: no preconditions; updates two words.
+    unsafe { sep_diag_set_sse(state as c_int, protocol) };
+}
+
+/// The secure-element sharing service announced an event. Returns how many
+/// it has announced since probe, this one included.
+pub(crate) fn sse_event() -> u32 {
+    // SAFETY: no preconditions; updates one word.
+    unsafe { sep_diag_sse_event() }
+}
+
+/// The hibernation endpoint at bring-up, as `SEP_DIAG_HIBE_*` in `shim.h`
+/// spells it.
+#[derive(Clone, Copy)]
+pub(crate) enum Hibe {
+    /// Offered as the driver knows it; nothing is sent.
+    Idle = 1,
+    /// The enclave does not offer the endpoint as the driver knows it.
+    Absent = 2,
+}
+
+pub(crate) fn hibe(state: Hibe) {
+    // SAFETY: no preconditions; updates one word.
+    unsafe { sep_diag_set_hibe(state as c_int) };
 }
 
 /// The driver answered an xART request with the failure status. Returns how

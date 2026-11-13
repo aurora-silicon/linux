@@ -111,6 +111,10 @@ static struct {
 	atomic_t stac;
 	atomic_t stac_onlines;
 	atomic_t pnon;
+	atomic_t sse;
+	atomic_t sse_protocol;
+	atomic_t sse_events;
+	atomic_t hibe;
 	atomic_t xarm_failures;
 	atomic_t unhandled;
 	atomic_t sleeps;
@@ -607,6 +611,69 @@ static ssize_t local_policy_digest_show(struct device *dev,
 }
 static DEVICE_ATTR_ADMIN_RO(local_policy_digest);
 
+static ssize_t sse_show(struct device *dev, struct device_attribute *attr,
+			char *buf)
+{
+	const char *state;
+
+	switch (atomic_read(&sep_diag.sse)) {
+	case SEP_DIAG_SSE_READY:
+		state = "ready";
+		break;
+	case SEP_DIAG_SSE_ABSENT:
+		state = "absent";
+		break;
+	case SEP_DIAG_SSE_FAILED:
+		state = "failed";
+		break;
+	default:
+		state = "pending";
+		break;
+	}
+	return sysfs_emit(buf, "%s\n", state);
+}
+static DEVICE_ATTR_RO(sse);
+
+static ssize_t sse_protocol_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	if (atomic_read(&sep_diag.sse) != SEP_DIAG_SSE_READY)
+		return sysfs_emit(buf, "unavailable\n");
+	/* Pairs with the smp_wmb() in sep_diag_set_sse(). */
+	smp_rmb();
+	return sysfs_emit(buf, "%08x\n",
+			  (unsigned int)atomic_read(&sep_diag.sse_protocol));
+}
+static DEVICE_ATTR_RO(sse_protocol);
+
+static ssize_t sse_events_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n",
+			  (unsigned int)atomic_read(&sep_diag.sse_events));
+}
+static DEVICE_ATTR_RO(sse_events);
+
+static ssize_t hibe_show(struct device *dev, struct device_attribute *attr,
+			 char *buf)
+{
+	const char *state;
+
+	switch (atomic_read(&sep_diag.hibe)) {
+	case SEP_DIAG_HIBE_IDLE:
+		state = "idle";
+		break;
+	case SEP_DIAG_HIBE_ABSENT:
+		state = "absent";
+		break;
+	default:
+		state = "pending";
+		break;
+	}
+	return sysfs_emit(buf, "%s\n", state);
+}
+static DEVICE_ATTR_RO(hibe);
+
 static ssize_t xarm_failures_show(struct device *dev,
 				  struct device_attribute *attr, char *buf)
 {
@@ -666,6 +733,10 @@ static struct attribute *sep_diag_attrs[] = {
 	&dev_attr_stac_onlines.attr,
 	&dev_attr_pnon.attr,
 	&dev_attr_local_policy_digest.attr,
+	&dev_attr_sse.attr,
+	&dev_attr_sse_protocol.attr,
+	&dev_attr_sse_events.attr,
+	&dev_attr_hibe.attr,
 	&dev_attr_xarm_failures.attr,
 	&dev_attr_unhandled_messages.attr,
 	&dev_attr_sleeps.attr,
@@ -751,6 +822,26 @@ void sep_diag_set_pnon(int state, const u8 *digest, size_t len)
 unsigned int sep_diag_xarm_failed(void)
 {
 	return (unsigned int)atomic_inc_return(&sep_diag.xarm_failures);
+}
+
+void sep_diag_set_sse(int state, u32 protocol)
+{
+	if (state == SEP_DIAG_SSE_READY) {
+		atomic_set(&sep_diag.sse_protocol, (int)protocol);
+		/* The word is visible before the state says it is there. */
+		smp_wmb();
+	}
+	atomic_set(&sep_diag.sse, state);
+}
+
+unsigned int sep_diag_sse_event(void)
+{
+	return (unsigned int)atomic_inc_return(&sep_diag.sse_events);
+}
+
+void sep_diag_set_hibe(int state)
+{
+	atomic_set(&sep_diag.hibe, state);
 }
 
 unsigned int sep_diag_unhandled(void)

@@ -161,6 +161,10 @@ def status(live=True):
             served["stac"] = "accessory power state"
         if d("pnon") is not None:
             served["pnon"] = "LocalPolicy nonce digest"
+        if d("sse") is not None:
+            served["sse"] = "secure-element sharing protocol query"
+        if d("hibe") is not None:
+            served["hibe"] = "checked at boot, nothing sent (no hibernation writer)"
         unserved = [e for e in have if e not in served]
         r.add(INFO, "endpoint-clients",
               ", ".join("%s=%s" % (e, served[e]) for e in have if e in served),
@@ -270,6 +274,31 @@ def status(live=True):
         else:
             r.add(WARN, "pnon", pnon, "the LocalPolicy nonce digest read has not succeeded "
                   "(the kernel log says why)")
+
+    sse = d("sse")
+    if sse is not None:
+        if sse == "ready":
+            r.add(PASS, "sse", sse, "the secure-element sharing service answered the protocol query "
+                  "(protocol %s)" % (d("sse_protocol") or "?"))
+        elif sse == "absent":
+            r.add(INFO, "sse", sse, "this enclave does not offer the secure-element sharing endpoint "
+                  "as the driver knows it")
+        elif sse == "pending":
+            r.add(INFO, "sse", sse, "the protocol query has not finished yet")
+        else:
+            r.add(WARN, "sse", sse, "the secure-element sharing protocol query has not succeeded "
+                  "(the kernel log says why)")
+
+    hibe = d("hibe")
+    if hibe is not None:
+        if hibe == "idle":
+            r.add(PASS, "hibe", hibe, "the hibernation endpoint is offered as the driver knows it; "
+                  "nothing is sent until Linux writes a hibernation image")
+        elif hibe == "absent":
+            r.add(INFO, "hibe", hibe, "this enclave does not offer the hibernation endpoint "
+                  "as the driver knows it")
+        else:
+            r.add(INFO, "hibe", hibe, "the bring-up has not ended yet")
 
     for node, why in (("/dev/sep-bio", "Touch ID"), ("/dev/sep-key", "enclave keys")):
         if os.path.exists(path(node)):
