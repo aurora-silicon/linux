@@ -961,5 +961,11 @@ const struct ave_fw_layout *ave_layout_for_crc(u32 crc)
 	/* The macOS 27.0 build for the M5 Pro and Max. */
 	if (crc == AVE_FW_TEXT_CRC_T6050_26A428)
 		return &ave_layout_26a428;
+	/*
+	 * The macOS 27.3 beta 1 build speaks the same command layout: H.264
+	 * and HEVC encode with it on a J714s.
+	 */
+	if (crc == AVE_FW_TEXT_CRC_T6050_26C5035)
+		return &ave_layout_26a428;
 	return NULL;
 }
