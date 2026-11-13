@@ -39,7 +39,9 @@ static const u32 ave_known_text_crc[] = {
 	0x2ce7359e, /* AppleAVE2FW 9003.78.0 */
 	0x69c54454, /* AppleAVE2FW 9003.78.0 (macOS 26.0.x) */
 	AVE_FW_TEXT_CRC_T6040_25G83, /* AppleAVE2FW 9003.78.0 / T6040 */
+	AVE_FW_TEXT_CRC_T6041_25G83, /* AppleAVE2FW 9003.78.0 / M4 Max */
 	AVE_FW_TEXT_CRC_T6050_26A428, /* AppleAVE2FW, macOS 27.0 26A428 / T6050 */
+	AVE_FW_TEXT_CRC_T6050_26C5035, /* AppleAVE2FW, macOS 27.3 26C5035r / T6050 */
 	0x460c7a7c, /* AppleAVE2FW 6070.11.1 / T6000 */
 	0x25bfd039, /* AppleAVE2FW 6070.11.1 / T8112 */
 };
@@ -152,13 +154,58 @@ int ave_fw_text_id_crc(const void *text, size_t size, u32 cell_off,
 	return 0;
 }
 
+static bool ave_fw_known_crc(u32 crc)
+{
+	for (unsigned int i = 0; i < ARRAY_SIZE(ave_known_text_crc); i++)
+		if (crc == ave_known_text_crc[i])
+			return true;
+	return false;
+}
+
+/* The TEXT CRC with the loader's per-boot word at @word_off zeroed. */
+int ave_fw_text_boot_crc(const void *text, size_t size, u32 word_off,
+			 u32 *crc)
+{
+	static const u8 zero[sizeof(u32)];
+
+	if (word_off > size || size - word_off < sizeof(zero))
+		return -EINVAL;
+	*crc = crc32_le(~0U, text, word_off);
+	*crc = crc32_le(*crc, zero, sizeof(zero));
+	*crc = crc32_le(*crc, text + word_off + sizeof(zero),
+			size - word_off - sizeof(zero));
+	*crc ^= ~0U;
+	return 0;
+}
+
+/*
+ * A known TEXT CRC (the M4 Pro build) stays as it is; any other is retried
+ * with the per-boot word zeroed (the M4 Max build).
+ */
+static int ave_fw_text_boot_id(struct ave_dev *ave, u32 *crc)
+{
+	void *va;
+	int ret;
+
+	if (ave_fw_known_crc(*crc))
+		return 0;
+	va = memremap(ave->text.phys, ave->text.size, MEMREMAP_WB);
+	if (!va)
+		return -ENOMEM;
+	ret = ave_fw_text_boot_crc(va, ave->text.size,
+				   ave->variant->text_boot_word, crc);
+	memunmap(va);
+	return ret;
+}
+
 static int ave_fw_text_id(struct ave_dev *ave, u32 *crc)
 {
 	void *va;
 	int ret;
 
 	if (!ave->variant->text_link_cell)
-		return 0;
+		return ave->variant->text_boot_word ?
+			       ave_fw_text_boot_id(ave, crc) : 0;
 	va = memremap(ave->text.phys, ave->text.size, MEMREMAP_WB);
 	if (!va)
 		return -ENOMEM;
@@ -169,6 +216,16 @@ static int ave_fw_text_id(struct ave_dev *ave, u32 *crc)
 	return ret;
 }
 
+/* The variant's build with these segment sizes, or NULL. */
+static const struct ave_fw_build *ave_fw_find_build(const struct ave_variant *v,
+						    size_t text, size_t data)
+{
+	for (unsigned int i = 0; i < v->build_count; i++)
+		if (text == v->builds[i].text_size && data == v->builds[i].data_size)
+			return &v->builds[i];
+	return NULL;
+}
+
 /*
  * Find the firmware, check that it is a build we speak to and that DATA is
  * still as the bootloader left it, and keep a copy of DATA for restarts.
@@ -176,7 +233,8 @@ static int ave_fw_text_id(struct ave_dev *ave, u32 *crc)
 int ave_fw_probe(struct ave_dev *ave)
 {
 	struct device *dev = ave->dev;
-	u32 text_crc, data_crc, want;
+	const struct ave_fw_build *build = NULL;
+	u32 text_crc, data_crc, want, want_crc = ave->variant->text_crc;
 	bool known = !ave->variant->boot_qualified;
 	int ret;
 
@@ -190,10 +248,21 @@ int ave_fw_probe(struct ave_dev *ave)
 	if (ret)
 		return dev_err_probe(dev, ret, "bad firmware reservation\n");
 
-	if (ave->text.size != ave->variant->fw_text_size ||
-	    ave->data.size != ave->variant->fw_data_size)
+	if (ave->variant->build_count) {
+		build = ave_fw_find_build(ave->variant, ave->text.size,
+					  ave->data.size);
+		if (!build)
+			return dev_err_probe(dev, -EINVAL,
+					     "unexpected firmware segment sizes (TEXT %#zx DATA %#zx)\n",
+					     ave->text.size, ave->data.size);
+		want_crc = build->text_crc;
+	} else if (ave->text.size != ave->variant->fw_text_size ||
+		   (ave->data.size != ave->variant->fw_data_size &&
+		    (!ave->variant->fw_data_size_alt ||
+		     ave->data.size != ave->variant->fw_data_size_alt))) {
 		return dev_err_probe(dev, -EINVAL,
 				     "unexpected firmware segment sizes\n");
+	}
 	if ((ave->text.phys < ave->data.phys + ave->data.size &&
 	     ave->data.phys < ave->text.phys + ave->text.size) ||
 	    (ave->text.iova < ave->data.iova + ave->data.size &&
@@ -230,15 +299,16 @@ int ave_fw_probe(struct ave_dev *ave)
 	if (ret)
 		return dev_err_probe(dev, ret,
 				     "firmware text link cell is not the DATA address\n");
-	for (unsigned int i = 0; i < ARRAY_SIZE(ave_known_text_crc); i++)
-		known |= text_crc == ave_known_text_crc[i];
-	if (!known ||
-	    (ave->variant->text_crc && text_crc != ave->variant->text_crc))
+	known |= ave_fw_known_crc(text_crc);
+	if (!known || (want_crc && text_crc != want_crc))
 		return dev_err_probe(dev, -ENODEV,
 				     "unsupported firmware (text CRC %08x)\n",
 				     text_crc);
 	ave->text_crc = text_crc;
 	ave->layout = ave_layout_for_crc(text_crc);
+	if (build)
+		dev_info(dev, "firmware build %s (TEXT %#zx CRC %08x, DATA %#zx)\n",
+			 build->name, ave->text.size, text_crc, ave->data.size);
 
 	ave->data_pristine = vmalloc(ave->data.size);
 	if (!ave->data_pristine)

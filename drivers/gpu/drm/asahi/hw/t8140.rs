@@ -25,9 +25,10 @@ pub(crate) const CONFIG: Config = Config {
     uat_oas: 42,
     // The secondary coprocessor's kernel root follows the primary one's 256 KiB of page tables.
     secondary_root_offset: Some(0x40000),
-    // The coprocessors request their crash log buffers at these addresses, in this order, and
-    // expect them to be mapped before they start.
-    crash_buffers: CrashBuffers::Fixed([
+    // Each coprocessor keeps its crash log in its own data segment and asks for it there by
+    // physical address. Without the boot loader's fw-data region the driver maps its own buffers
+    // at the low bits of those addresses, in this order, before the coprocessors start.
+    crash_buffers: CrashBuffers::FirmwareDataOrFixed([
         FixedBuffer {
             va: 0x01e1_c000,
             size: 0x8000,

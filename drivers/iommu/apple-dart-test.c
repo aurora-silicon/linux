@@ -13,6 +13,25 @@ struct apple_dart_test_window {
 	u64 size;
 };
 
+/* PARAMS read back from a window that is not a DART must not probe. */
+static void apple_dart_test_topology(struct kunit *test)
+{
+	/* T8112 DARTs: 16 KiB pages, 36-bit address space, 16 streams. */
+	KUNIT_EXPECT_TRUE(test, apple_dart_topology_valid(SZ_16K, 36, 36, 16));
+	/* T6020 PCIe-C fixed topology and the T8020 32-bit IOVA. */
+	KUNIT_EXPECT_TRUE(test, apple_dart_topology_valid(SZ_16K, 42, 42, 64));
+	KUNIT_EXPECT_TRUE(test, apple_dart_topology_valid(SZ_4K, 32, 36, 16));
+	/* A zero address width would make DMA_BIT_MASK(0). */
+	KUNIT_EXPECT_FALSE(test, apple_dart_topology_valid(SZ_16K, 0, 36, 16));
+	KUNIT_EXPECT_FALSE(test, apple_dart_topology_valid(SZ_16K, 36, 0, 16));
+	KUNIT_EXPECT_FALSE(test, apple_dart_topology_valid(SZ_16K, 65, 36, 16));
+	KUNIT_EXPECT_FALSE(test, apple_dart_topology_valid(SZ_16K, 36, 36, 0));
+	/* A page shift of 0 reads as a 1-byte page. */
+	KUNIT_EXPECT_FALSE(test, apple_dart_topology_valid(1, 36, 36, 16));
+	KUNIT_EXPECT_FALSE(test, apple_dart_topology_valid(SZ_64K, 36, 36, 16));
+	KUNIT_EXPECT_FALSE(test, apple_dart_topology_valid(0, 0, 0, 0));
+}
+
 static void apple_dart_test_iommu_specifiers(struct kunit *test)
 {
 	static const struct apple_dart_test_window windows[] = {
@@ -1153,6 +1172,7 @@ static void apple_dart_test_host_power_tables(struct kunit *test)
 
 static struct kunit_case apple_dart_test_cases[] = {
 	KUNIT_CASE(apple_dart_test_strict_engines),
+	KUNIT_CASE(apple_dart_test_topology),
 	KUNIT_CASE(apple_dart_test_iommu_specifiers),
 	KUNIT_CASE(apple_dart_test_independent_remap_roots),
 	KUNIT_CASE(apple_dart_test_before_attach),

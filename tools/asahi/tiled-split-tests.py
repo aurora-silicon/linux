@@ -21,8 +21,8 @@ FUNCTIONS = {
     'drivers/gpu/drm/apple/dcp-fabric-session.h': ['dcp_fabric_binding_request'],
     'drivers/gpu/drm/apple/dcp-fabric-core.c': ['dcp_fabric_tunnel_slot'],
     'drivers/gpu/drm/apple/dcp-fabric.c': [
-        'dcp_typec_route_no_dp_alt', 'dcp_typec_port_untileable', 'dcp_tb_split_locked',
-        'dcp_tb_dispatch_request'],
+        'dcp_typec_route_no_dp_alt', 'dcp_is_t8132_ext', 'dcp_typec_port_untileable',
+        'dcp_tb_split_locked', 'dcp_tb_dispatch_request'],
 }
 CASES = ['t6030-dpin1-alone', 't6030-dpin1-alone-before-services',
          't6030-dpin1-with-external-owner', 't6030-dpin1-then-dpin0',
@@ -49,11 +49,11 @@ MUTATIONS = [
      '\t\t    route->dcp->dptxport[1].enabled)\n\t\t\treturn false;'),
     ('empty-untileable', 'return !list_empty(&port->routes);', 'return true;'),
     ('any-external-untileable',
-     'if (!route->dcp->external &&\n\t\t    !dcp_typec_route_no_dp_alt(route) &&\n'
+     'if (!route->dcp->external &&\n\t\t    !dcp_is_t8132_ext(route->dcp) &&\n'
      '\t\t    route->dcp->fw_compat != DCP_FIRMWARE_V_27_0)\n\t\t\treturn false;',
-     'if (route->dcp->external || dcp_typec_route_no_dp_alt(route) ||\n'
+     'if (route->dcp->external || dcp_is_t8132_ext(route->dcp) ||\n'
      '\t\t    route->dcp->fw_compat == DCP_FIRMWARE_V_27_0)\n\t\t\treturn true;'),
-    ('dcpext-tileable', '!dcp_typec_route_no_dp_alt(route) &&\n', ''),
+    ('dcpext-tileable', '!dcp_is_t8132_ext(route->dcp) &&\n', ''),
     # Firmware 27 pipelines drive one DP IN each: never a tile.
     ('fw27-tileable', ' &&\n\t\t    route->dcp->fw_compat != DCP_FIRMWARE_V_27_0)', ')'),
     # DP IN 3 is a second stream, in DP IN 1's slot.
