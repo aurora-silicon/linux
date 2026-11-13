@@ -24,7 +24,7 @@ the MacBook Neo (T8140), do not carry the property.
 
 The SMC driver (macsmc-hwmon, macsmc-power) remains the source of battery
 state, current and charge information. The PTD record adds the battery
-voltage and the system power as the producer filters them.
+voltage and the battery-side power as the producer filters them.
 
 Sysfs entries
 -------------
@@ -32,9 +32,10 @@ Sysfs entries
 =============== ===== ==================================================
 in0_input       mV    battery voltage
 in0_label             ``Battery``
-power1_input    uW    system power (never negative; this is not the
-                      battery charge or discharge power)
-power1_label          ``System``
+power1_input    uW    battery-side power (never negative; it follows
+                      the SMC PPBR value, not the adapter input power
+                      and not the signed charge or discharge power)
+power1_label          ``Battery power``
 =============== ===== ==================================================
 
 The record holds both values as unsigned Q16.16 fixed point: the voltage in

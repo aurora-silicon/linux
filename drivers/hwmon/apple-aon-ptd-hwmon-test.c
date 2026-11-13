@@ -88,7 +88,7 @@ static void apple_ptd_test_stable_read_gives_up(struct kunit *test)
 
 static void apple_ptd_test_convert(struct kunit *test)
 {
-	/* Values seen on a J616s: 13095.4 mV battery, 0.4335 W system. */
+	/* Values seen on a J616s: 13095.4 mV battery, 0.4335 W battery power. */
 	struct apple_ptd_sample s = {
 		.word = {
 			[PTD_BATT_VOLT] = 858218725,

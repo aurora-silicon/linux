@@ -12,7 +12,8 @@
  * no trips.
  *
  * Read passively, the record carries battery voltage and a non-negative
- * system power figure, both already filtered by the producer, so the driver
+ * battery-side power figure (it follows the SMC battery power PPBR, not the
+ * adapter input), both already filtered by the producer, so the driver
  * adds no filtering of its own. Its other words are either zero or a
  * producer counter and are not read.
  */
@@ -172,7 +173,7 @@ static int apple_ptd_read_string(struct device *dev,
 				 enum hwmon_sensor_types type, u32 attr,
 				 int channel, const char **str)
 {
-	*str = type == hwmon_in ? "Battery" : "System";
+	*str = type == hwmon_in ? "Battery" : "Battery power";
 	return 0;
 }
 
