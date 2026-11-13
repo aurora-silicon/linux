@@ -268,11 +268,6 @@ impl PmpData {
                 dev_info!(self.dev, "PMP restore: firmware still running, left as is\n");
                 return Ok(());
             }
-            // Running before the image and halted now: the boot loader
-            // restarted the SoC under it, a cold boot, which co-processors
-            // without a run bit the AP can read (the SEP) have to know.
-            // SAFETY: no arguments; the bridge only counts.
-            unsafe { bindings::apple_pmp_note_cold_restart() };
             // Halted firmware: detach the stale session so a fresh HELLO/EPMAP
             // boot is accepted, as the NVMe ANS restore reinits its session.
             rtk.reinit()?;

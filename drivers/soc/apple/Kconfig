@@ -221,8 +221,6 @@ config APPLE_SEP
 	depends on TRUSTED_KEYS
 	depends on CRYPTO
 	depends on MFD_MACSMC || !MFD_MACSMC
-	# apple_pmp_cold_restarts(): a resume from disk on a cold boot.
-	depends on APPLE_PMP || !APPLE_PMP
 	select CRYPTO_HMAC
 	select CRYPTO_SHA256
 	select CRYPTO_AES

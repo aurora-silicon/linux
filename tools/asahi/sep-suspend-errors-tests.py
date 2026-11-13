@@ -90,6 +90,10 @@ MUTATIONS = {
                               'c->sent = true;\n\tif (pm_wakeup_pending()) return -EBUSY;'),
     'held-before-refusal': ('sep_pm_notify', 'if (event(SEP_PM_RESTORE) > 0) {',
                             'sep_diag_sleep(true);\n\t\tif (event(SEP_PM_RESTORE) > 0) {'),
+    'cold-as-warm': ('sep_pm_notify', 'if (cold) {', 'if (false) {'),
+    'unrecorded-as-warm': ('sep_pm_notify', 'if (cold < 0) {', 'if (false) {'),
+    'unrecorded-as-cold': ('sep_pm_notify', 'cold = pm_hibernate_restored_cold();',
+                            'cold = pm_hibernate_restored_cold() != 0;'),
 }
 
 C_PREFIX = r'''
@@ -169,12 +173,12 @@ enum { PM_HIBERNATION_PREPARE = 1, PM_POST_HIBERNATION, PM_SUSPEND_PREPARE, PM_P
 #define pr_err(...) ((void)0)
 static int (*sep_pm_event)(int event);
 static struct device *sep_pm_dev;
-static int sep_pm_cold_base, cold_restarts, held, sleeps_ended, reprobes;
+static int restored_cold, held, sleeps_ended, reprobes;
 static bool restored;
 static void sep_diag_sleep(bool entering) {
     if (entering) held = 1; else if (held) { held = 0; ++sleeps_ended; }
 }
-static int apple_pmp_cold_restarts(void) { return cold_restarts; }
+static int pm_hibernate_restored_cold(void) { return restored_cold; }
 static bool pm_hibernate_is_restored(void) { return restored; }
 static void sep_pm_schedule_reprobe(struct device *d) { ++reprobes; }
 static bool yes(void) { return true; }
@@ -283,7 +287,7 @@ void fixture(void) {
     resource_bytes = 4; close_gate = 1; early_gate = 0; read_error_after = 1;
     queued = consumed = 0; message_in_lock = matched_read = false; now = 0;
     fatal_armed = false; fatal_message[0] = 0; sep_pm_told = yes;
-    sep_pm_event = NULL; sep_pm_dev = &device; sep_pm_cold_base = cold_restarts = 0;
+    sep_pm_event = NULL; sep_pm_dev = &device; restored_cold = 0;
     held = sleeps_ended = reprobes = 0; restored = false;
 }
 void parameter(int which, int value) {
@@ -462,7 +466,9 @@ static void test_poll_contract(void) {
 }
 static int attached, last_event;
 static int driver_event(int event) {
-    last_event = event; return event == SEP_PM_RESTORE ? attached : 0;
+    last_event = event;
+    // The driver reports a live session to drop for a cold boot, like the real one.
+    return event == SEP_PM_RESTORE ? attached : event == SEP_PM_HIBERNATE_COLD;
 }
 static void test_notifier(void) {
     struct notifier_block nb;
@@ -478,6 +484,23 @@ static void test_notifier(void) {
     assert(sep_pm_notify(&nb, PM_RESTORE_PREPARE, NULL) == NOTIFY_OK && held);
     assert(sep_pm_notify(&nb, PM_POST_RESTORE, NULL) == NOTIFY_OK);
     assert(last_event == SEP_PM_HIBERNATE_WARM && !held && sleeps_ended == 1);
+    // The end of a hibernation: an aborted one or a hybrid sleep's wake was never restored.
+    fixture(); sep_pm_event = driver_event; restored_cold = 1;
+    assert(sep_pm_notify(&nb, PM_HIBERNATION_PREPARE, NULL) == NOTIFY_OK && held);
+    assert(sep_pm_notify(&nb, PM_POST_HIBERNATION, NULL) == NOTIFY_OK);
+    assert(last_event == SEP_PM_HIBERNATE_WARM && !held && sleeps_ended == 1 && !reprobes);
+    // Restored after a boot that loaded the image: the enclave restarted, the device is probed again.
+    restored = true; restored_cold = 1;
+    assert(sep_pm_notify(&nb, PM_POST_HIBERNATION, NULL) == NOTIFY_OK);
+    assert(last_event == SEP_PM_HIBERNATE_COLD && reprobes == 1);
+    // Restored by the kernel that wrote the image (test_resume): the enclave never restarted.
+    restored_cold = 0; reprobes = 0;
+    assert(sep_pm_notify(&nb, PM_POST_HIBERNATION, NULL) == NOTIFY_OK);
+    assert(last_event == SEP_PM_HIBERNATE_WARM && !reprobes);
+    // No record of the loading kernel: the session is dropped, no probe is queued.
+    restored_cold = -ENODATA;
+    assert(sep_pm_notify(&nb, PM_POST_HIBERNATION, NULL) == NOTIFY_OK);
+    assert(last_event == SEP_PM_HIBERNATE_COLD && !reprobes);
     // A suspend holds and releases the same way.
     assert(sep_pm_notify(&nb, PM_SUSPEND_PREPARE, NULL) == NOTIFY_OK && held);
     assert(sep_pm_notify(&nb, PM_POST_SUSPEND, NULL) == NOTIFY_OK && !held && sleeps_ended == 2);

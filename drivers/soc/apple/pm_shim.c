@@ -27,7 +27,6 @@
 #include <linux/soc/apple/aura-hibernate.h>
 #include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/mailbox.h>
-#include <linux/soc/apple/pmp.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/spinlock.h>
 #include <linux/suspend.h>
@@ -53,17 +52,6 @@ static void (*sep_pm_wake)(void);
 static bool (*sep_pm_told)(void);
 /* In the device's .suspend, the only caller that can leave the request to the sleep. */
 static bool sep_pm_suspending;
-
-/*
- * Whether the boot loader restarted the SoC under this hibernation. iBoot
- * boots sepOS anew on every boot, and the SEP has no run bit the AP can read,
- * so the PMP's restore (priority 10, ahead of this notifier) is asked: it
- * counts the resumes from disk that found the PMP halted. The count is taken
- * at registration and again at each hibernation's prepare and end, so a
- * prepare this notifier missed (registered during it) still compares with
- * the last count. Negative: no bound PMP, cold or warm cannot be told.
- */
-static int sep_pm_cold_base = -ENODEV;
 
 /* The marker dt.rs leaves on the SEP node once the registration is sent. */
 #define SEP_REGISTERED_PROP "apple,sep-shmem-registered-iova"
@@ -110,7 +98,7 @@ static int sep_pm_notify(struct notifier_block *nb, unsigned long action,
 {
 	int (*event)(int event) = READ_ONCE(sep_pm_event);
 	struct device *dev = READ_ONCE(sep_pm_dev);
-	int base, now;
+	int cold;
 
 	if (!event)
 		return NOTIFY_DONE;
@@ -126,7 +114,6 @@ static int sep_pm_notify(struct notifier_block *nb, unsigned long action,
 		return NOTIFY_OK;
 	case PM_HIBERNATION_PREPARE:
 		sep_diag_sleep(true);
-		sep_pm_cold_base = apple_pmp_cold_restarts();
 		event(SEP_PM_HIBERNATE);
 		return NOTIFY_OK;
 	case PM_RESTORE_PREPARE:
@@ -151,31 +138,30 @@ static int sep_pm_notify(struct notifier_block *nb, unsigned long action,
 		sep_diag_sleep(false);
 		/*
 		 * Ends an aborted hibernation, the wake of a hybrid sleep and a
-		 * resume from the image alike. Only a resume from the image can
-		 * have gone through a boot, and only the PMP knows whether it did
-		 * (a test resume does not): a hybrid sleep's wake is never taken
-		 * for a cold boot, even when the PMP did not come back from its
-		 * suspend-to-RAM and the PMP's restore finds it halted.
+		 * resume from the image alike. iBoot boots sepOS anew on every
+		 * boot and the SEP has no run bit the AP can read, so only a
+		 * resume from the image that another boot loaded can have gone
+		 * through a boot; the PM core knows whether it did (a test
+		 * resume does not). A hybrid sleep's wake is never taken for a
+		 * cold boot.
 		 */
-		base = sep_pm_cold_base;
-		now = apple_pmp_cold_restarts();
-		sep_pm_cold_base = now;
 		if (!pm_hibernate_is_restored()) {
 			event(SEP_PM_HIBERNATE_WARM);
 			return NOTIFY_OK;
 		}
-		if (base < 0 || now < 0) {
+		cold = pm_hibernate_restored_cold();
+		if (cold < 0) {
 			/*
 			 * Cold or warm cannot be told. Sending to a freshly booted
 			 * enclave, or registering again with a live one, are both
 			 * worse than losing Touch ID until a reboot.
 			 */
 			if (dev)
-				dev_err(dev, "hibernation: no PMP count, cannot tell a cold boot; the SEP session is dropped until a reboot\n");
+				dev_err(dev, "hibernation: no record of the boot that loaded the image, cannot tell a cold boot; the SEP session is dropped until a reboot\n");
 			event(SEP_PM_HIBERNATE_COLD);
 			return NOTIFY_OK;
 		}
-		if (now != base) {
+		if (cold) {
 			if (event(SEP_PM_HIBERNATE_COLD) > 0 && dev)
 				sep_pm_schedule_reprobe(dev);
 			return NOTIFY_OK;
@@ -189,8 +175,6 @@ static int sep_pm_notify(struct notifier_block *nb, unsigned long action,
 
 static struct notifier_block sep_pm_nb = {
 	.notifier_call = sep_pm_notify,
-	/* Below the PMP's 10, so that its restore has counted a cold boot. */
-	.priority = 0,
 };
 
 /* The enclave's own domain is the first one its node lists. */
@@ -598,7 +582,6 @@ int sep_pm_register(void *ptr, int (*event)(int event), int (*sleep)(void),
 	WRITE_ONCE(sep_pm_sleep, sleep);
 	WRITE_ONCE(sep_pm_wake, wake);
 	WRITE_ONCE(sep_pm_told, told);
-	sep_pm_cold_base = apple_pmp_cold_restarts();
 	ret = register_pm_notifier(&sep_pm_nb);
 	if (ret) {
 		WRITE_ONCE(sep_pm_event, NULL);

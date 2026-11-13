@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
-#include <linux/atomic.h>
 #include <linux/device.h>
 #include <linux/export.h>
 #include <linux/io.h>
-#include <linux/limits.h>
 #include <linux/mutex.h>
 #include <linux/notifier.h>
 #include <linux/of.h>
@@ -22,29 +20,6 @@ static const void *pmp_data;
 static struct device *pmp_device;
 /* The firmware is stopped for a system sleep. */
 static bool pmp_asleep;
-
-/* Resumes from disk whose restore found the PMP halted, see below. */
-static atomic_t pmp_cold_restarts = ATOMIC_INIT(0);
-
-void apple_pmp_note_cold_restart(void)
-{
-	atomic_inc(&pmp_cold_restarts);
-}
-
-/*
- * A co-processor that iBoot restarts on a cold boot but that has no run bit
- * the AP can read (the SEP) learns from this that the resume from disk it is
- * being notified of was a cold boot: compare the count across the
- * hibernation, from a PM notifier of lower priority than the PMP's.
- */
-int apple_pmp_cold_restarts(void)
-{
-	/* No bound PMP: no restore runs, so a count would mean nothing. */
-	if (!READ_ONCE(pmp_data))
-		return -ENODEV;
-	return atomic_read(&pmp_cold_restarts) & INT_MAX;
-}
-EXPORT_SYMBOL_GPL(apple_pmp_cold_restarts);
 
 /*
  * After a hibernation restore the boot loader has cold-restarted the PMP
