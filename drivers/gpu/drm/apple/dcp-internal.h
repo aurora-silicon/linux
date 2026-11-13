@@ -467,6 +467,8 @@ struct apple_dcp {
 	enum dcp_firmware_version fw_compat;
 	/* Bumped by every iomfb poweron; see afk_compact_slot(). */
 	u32 afk_power_gen;
+	/* Firmware 27.x: the method IDs of this build (iomfb_v27_methods()). */
+	const struct dcp_method_entry *v27_methods;
 	bool external;
 	/* A desktop 26.x external processor (apple,t6041-dcpext) */
 	bool desktop_external;
@@ -661,6 +663,11 @@ struct apple_dcp {
 	u32 edr_hm;
 	u32 edr_sdr;
 	bool edr_restart;
+	/* Firmware 27: when the headroom last moved, and short of its target. */
+	ktime_t edr_step;
+	bool edr_ramping;
+	/* SDR white in nits of the present being built (H17P backlight) */
+	u32 edr_present_sdr;
 	struct dcp_set_digital_out_mode_req mode;
 
 	/* completion for active turning true */
@@ -938,6 +945,8 @@ struct apple_dcp {
 		unsigned int callback_count;
 		struct delayed_work timeout;
 		struct delayed_work backlight_retry;
+		/* A firmware 27 panel's EDR ramp on a still frame (iomfb_edr_tick()) */
+		struct delayed_work edr_tick;
 		unsigned long deadline;
 		unsigned int queued;
 		bool stopped;
@@ -1035,6 +1044,7 @@ bool iomfb_present_brightness_only_h17p(struct apple_dcp *dcp);
 bool iomfb_present_complete_h17p(struct apple_dcp *dcp);
 void iomfb_present_failed_h17p(struct apple_dcp *dcp);
 bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp);
+bool iomfb_present_has_surface_h17p(const struct dcp_swap_submit_req_h17p *request);
 bool iomfb_apply_backlight_h17p(struct apple_dcp *dcp,
 				const struct dcp_swap_submit_req_h17p *request,
 				struct dcp_present_h17p *wire);

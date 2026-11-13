@@ -52,16 +52,23 @@
 #define AJ_PX_PLANE1_TILE_H		0x080
 #define AJ_PX_PLANE1_TILE_V		0x084
 #define AJ_PX_PLANE1_STRIDE		0x088
+#define AJ_T6050_PX_MODE		0x08c	/* T6050: the CODEC value for 4:2:0 */
 #define AJ_PIXEL_FORMAT_YUV_PLANES	4
+#define AJ_T6050_PRE_ENCODE		0x1dc	/* T6050: cleared before MODE_ENCODE */
+#define AJ_T6050_ENC_CTRL		0x334
+#define  AJ_T6050_ENC_CTRL_ENCODE	0x35
 #define AJ_JPEG_IO_FLAGS		0x1000
 #define  AJ_IO_FLAGS_ORDER		(BIT(4) | BIT(5))
 #define  AJ_IO_FLAGS_422		1
 #define  AJ_IO_FLAGS_420		2
+#define  AJ_IO_FLAGS_T6050		BIT(7)
 #define AJ_COMMAND			0x1004
 #define AJ_QTBL_SEL			0x100c
 #define  AJ_QTBL_SEL_LUMA_CHROMA	0x14	/* Y: table 0, Cb and Cr: table 1 */
 #define AJ_HUFFMAN_TABLE		0x1010
 #define  AJ_HUFFMAN_BASELINE		0x3c
+/* T6050: two-bit selectors, Y DC/AC table 0, Cb and Cr DC/AC table 1. */
+#define  AJ_HUFFMAN_T6050		0x550
 #define AJ_RST_INTERVAL			0x1014
 #define AJ_JPEG_HEIGHT			0x1018
 #define AJ_JPEG_WIDTH			0x101c
@@ -71,6 +78,8 @@
 #define  AJ_INT_STATUS_DONE		BIT(31)
 #define AJ_BITSTREAM_CORRUPTION		0x1030
 #define AJ_QTBL(t)			(0x1100 + 0x40 * (t))
+/* T6050: 64 16-bit entries per table, two per word, the earlier one high. */
+#define AJ_QTBL16(t)			(0x1100 + 0x80 * (t))
 
 #define AJ_HWREV_MASK			0xffff0fff
 /* ADT hw-type 0x101008; its stepping nibble is masked off like T8140's. */
@@ -78,10 +87,23 @@
 /* ADT hw-type of the T8122/T6030/T6031/T6032 engines (not yet read back). */
 #define AJ_HWREV_T8122			0x0f0008
 #define AJ_HWREV_T8140			0x110000
+/* ADT hw-type 0x111010, its stepping nibble masked off. */
+#define AJ_HWREV_T6050			0x110010
 
 struct apple_jpeg_write {
 	u32 offset;
 	u32 value;
+};
+
+/*
+ * Written after the reset handshake. On T6050 each DMA gets an identifier,
+ * unique across the two engines that share one DART: per_stream entries add
+ * 8 for each DART stream.
+ */
+struct apple_jpeg_dma_id {
+	u16 offset;
+	u16 value;
+	bool per_stream;
 };
 
 /* Only the control/geometry and JPEG blocks are common to both layouts. */
@@ -98,6 +120,9 @@ struct apple_jpeg_reg_layout {
 	bool reset_complete;
 	const struct apple_jpeg_write *defaults;
 	u16 num_defaults;
+	const struct apple_jpeg_dma_id *dma_ids;
+	u16 num_dma_ids;
+	bool t6050_job;		/* jobs programmed as on T6050 */
 };
 
 struct apple_jpeg_variant {
@@ -109,9 +134,16 @@ struct apple_jpeg_variant {
 
 extern const struct apple_jpeg_variant apple_jpeg_t6000;
 extern const struct apple_jpeg_variant apple_jpeg_t6041;
+extern const struct apple_jpeg_variant apple_jpeg_t6050;
 extern const struct apple_jpeg_variant apple_jpeg_t8112;
 extern const struct apple_jpeg_variant apple_jpeg_t8122;
 extern const struct apple_jpeg_variant apple_jpeg_t8140;
+
+/* T6050's 4:2:2 job programming is not known yet. */
+static inline bool apple_jpeg_has_422(const struct apple_jpeg_reg_layout *layout)
+{
+	return !layout->t6050_job;
+}
 
 static inline bool
 apple_jpeg_hwrev_supported(const struct apple_jpeg_variant *variant, u32 hwrev)
@@ -183,6 +215,8 @@ static inline u32 apple_jpeg_coded_size(u32 width, u32 height, u32 keep)
 
 void apple_jpeg_quant_tables(u32 quality, u8 luma[64], u8 chroma[64]);
 u32 apple_jpeg_timeout(u32 width, u32 height);
+int apple_jpeg_dma_ids(const struct apple_jpeg_reg_layout *layout, u32 stream,
+		       struct apple_jpeg_write *w, unsigned int max);
 int apple_jpeg_defaults(const struct apple_jpeg_reg_layout *layout, bool encode,
 			struct apple_jpeg_write *w, unsigned int max);
 int apple_jpeg_build_job(const struct apple_jpeg_reg_layout *layout,

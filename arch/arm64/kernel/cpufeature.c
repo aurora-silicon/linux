@@ -788,6 +788,7 @@ struct arm64_ftr_override __read_mostly id_aa64mmfr2_override;
 struct arm64_ftr_override __read_mostly id_aa64mmfr4_override;
 struct arm64_ftr_override __read_mostly id_aa64pfr0_override;
 struct arm64_ftr_override __read_mostly id_aa64pfr1_override;
+struct arm64_ftr_override __read_mostly id_aa64pfr2_override;
 struct arm64_ftr_override __read_mostly id_aa64zfr0_override;
 struct arm64_ftr_override __read_mostly id_aa64smfr0_override;
 struct arm64_ftr_override __read_mostly id_aa64isar1_override;
@@ -832,7 +833,8 @@ static const struct __ftr_reg_entry {
 			       &id_aa64pfr0_override),
 	ARM64_FTR_REG_OVERRIDE(SYS_ID_AA64PFR1_EL1, ftr_id_aa64pfr1,
 			       &id_aa64pfr1_override),
-	ARM64_FTR_REG(SYS_ID_AA64PFR2_EL1, ftr_id_aa64pfr2),
+	ARM64_FTR_REG_OVERRIDE(SYS_ID_AA64PFR2_EL1, ftr_id_aa64pfr2,
+			       &id_aa64pfr2_override),
 	ARM64_FTR_REG_OVERRIDE(SYS_ID_AA64ZFR0_EL1, ftr_id_aa64zfr0,
 			       &id_aa64zfr0_override),
 	ARM64_FTR_REG_OVERRIDE(SYS_ID_AA64SMFR0_EL1, ftr_id_aa64smfr0,

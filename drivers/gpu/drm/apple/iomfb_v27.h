@@ -32,9 +32,16 @@ struct dcp_swap_v27 {
 	u8 reserved_158[0x1fc];
 
 	u8 brightness_update;
-	u8 reserved_355[9];
+	u8 reserved_355[3];
+	/* As desktop 26.x: [1] limit, [2] EDR scale, [4] headroom used */
+	u8 bl_flags[6];
 	u64 brightness_nits;
-	u8 reserved_366[0x37a];
+	u8 reserved_366[0x10];
+	u64 bl_limit;
+	u64 edr_scale;
+	u8 reserved_386[0x60];
+	u64 edr_headroom;
+	u8 reserved_3ee[0x2f2];
 } __packed;
 
 struct dcp_surface_v27 {
@@ -77,6 +84,10 @@ static_assert(offsetof(struct dcp_swap_submit_req_v27, surf_iova) == 0xf90);
 static_assert(offsetof(struct dcp_swap_submit_req_v27, swap_null) == 0xfea);
 static_assert(offsetof(struct dcp_swap_v27, brightness_update) == 0x354);
 static_assert(offsetof(struct dcp_swap_v27, brightness_nits) == 0x35e);
+static_assert(offsetof(struct dcp_swap_v27, bl_flags) == 0x358);
+static_assert(offsetof(struct dcp_swap_v27, bl_limit) == 0x376);
+static_assert(offsetof(struct dcp_swap_v27, edr_scale) == 0x37e);
+static_assert(offsetof(struct dcp_swap_v27, edr_headroom) == 0x3e6);
 
 void iomfb_serialize_present_v27(struct dcp_swap_submit_req_v27 *wire,
 				const struct dcp_swap_submit_req_h17p *request);

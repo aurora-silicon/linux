@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
  * Included by audio.c: a Terminate's link release ends only the link of the
- * instance it is for, and a stopped stereo link is held between streams.
+ * instance it is for, a stopped stereo link is held between streams, and a
+ * system sleep suspends the stream and releases the link.
  * The production link lifecycle runs; the audio service's answer to which
  * instance the link is on, its link calls and the DMA channel are stubbed.
  */
@@ -549,6 +550,143 @@ static void dcpaud_hold_link_needs_channel(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&audio->dev->power.usage_count), 0);
 }
 
+static void dcpaud_hold_link_needs_power(struct kunit *test)
+{
+	struct platform_device *pdev;
+	struct dcp_audio *audio = dcpaud_link_setup(test, &pdev);
+	int ret;
+
+	/*
+	 * Runtime PM enabled at bind and off now (a system sleep in progress):
+	 * the device's domain cannot be powered, so no link is held and
+	 * nothing is sent.
+	 */
+	dcpaud_link_test_channel(test, audio);
+	audio->rpm_enabled = true;
+	scoped_guard(mutex, &audio->link_lock)
+		ret = dcpaud_hold_link_locked(audio);
+	KUNIT_EXPECT_EQ(test, ret, -EAGAIN);
+	KUNIT_EXPECT_STREQ(test, dcpaud_link_current->sequence, "");
+	KUNIT_EXPECT_FALSE(test, audio->link_prepared);
+	KUNIT_EXPECT_FALSE(test, audio->silence_running);
+	KUNIT_EXPECT_FALSE(test, audio->idle_set);
+	KUNIT_EXPECT_EQ(test, atomic_read(&audio->dev->power.usage_count), 0);
+}
+
+/* The PCM core's view of @sub for snd_pcm_suspend_all(): its PCM's only substream */
+static void dcpaud_link_test_pcm(struct kunit *test, struct dcp_audio *audio,
+				 struct snd_pcm_substream *sub)
+{
+	struct snd_pcm_group *group = &sub->self_group;
+
+	spin_lock_init(&group->lock);
+	mutex_init(&group->mutex);
+	INIT_LIST_HEAD(&group->substreams);
+	refcount_set(&group->refs, 1);
+	sub->group = group;
+	sub->ops = &dcp_native_playback_ops;
+	mutex_init(&sub->pcm->open_mutex);
+	sub->pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream = sub;
+	audio->substream = sub;
+}
+
+/* A running stream on its own link */
+static struct snd_pcm_substream *dcpaud_link_test_running(struct kunit *test,
+							   struct dcp_audio *audio)
+{
+	struct snd_pcm_substream *sub = dcpaud_link_test_open(test, audio);
+	struct snd_pcm_runtime *runtime = sub->runtime;
+
+	runtime->status = kunit_kzalloc(test, sizeof(*runtime->status), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, runtime->status);
+	init_waitqueue_head(&runtime->sleep);
+	init_waitqueue_head(&runtime->tsleep);
+	runtime->state = SNDRV_PCM_STATE_RUNNING;
+	runtime->status->state = SNDRV_PCM_STATE_RUNNING;
+	dcpaud_link_test_pcm(test, audio, sub);
+	audio->chan = &dcpaud_link_current->channel;
+	audio->link_prepared = true;
+	audio->link_started = true;
+	audio->stream_dma = true;
+	/* The stream's PM reference from its START */
+	pm_runtime_get_noresume(audio->dev);
+	return sub;
+}
+
+static void dcpaud_sleep_suspends_running_stream(struct kunit *test)
+{
+	struct platform_device *pdev;
+	struct dcp_audio *audio = dcpaud_link_setup(test, &pdev);
+	struct snd_pcm_substream *sub = dcpaud_link_test_running(test, audio);
+
+	/* SUSPEND ends the DMA, sync_stop drains it, then the link stops and completes */
+	dcpaud_sleep_quiesce(audio);
+	KUNIT_EXPECT_STREQ(test, dcpaud_link_current->sequence, "XDwSC");
+	KUNIT_EXPECT_EQ(test, (int)sub->runtime->state, (int)SNDRV_PCM_STATE_SUSPENDED);
+	KUNIT_EXPECT_FALSE(test, audio->stream_dma);
+	KUNIT_EXPECT_FALSE(test, audio->link_prepared);
+	KUNIT_EXPECT_FALSE(test, audio->link_started);
+	KUNIT_EXPECT_EQ(test, atomic_read(&audio->dev->power.usage_count), 0);
+
+	/* Already suspended: nothing more is sent */
+	dcpaud_sleep_quiesce(audio);
+	KUNIT_EXPECT_STREQ(test, dcpaud_link_current->sequence, "XDwSC");
+}
+
+static void dcpaud_sleep_releases_held_link(struct kunit *test)
+{
+	struct platform_device *pdev;
+	struct dcp_audio *audio = dcpaud_link_setup(test, &pdev);
+	struct snd_pcm_substream *sub = kunit_kzalloc(test, sizeof(*sub), GFP_KERNEL);
+	struct snd_pcm *pcm = kunit_kzalloc(test, sizeof(*pcm), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, sub);
+	KUNIT_ASSERT_NOT_NULL(test, pcm);
+	/* No stream open: the PCM's substream has no runtime */
+	sub->pcm = pcm;
+	pcm->nonatomic = true;
+	dcpaud_link_test_pcm(test, audio, sub);
+	dcpaud_link_test_channel(test, audio);
+	audio->link_prepared = true;
+	audio->link_started = true;
+	audio->silence_running = true;
+	audio->idle_set = true;
+	pm_runtime_get_noresume(audio->dev);
+
+	/* The silence ends, the channel drains, then the link stops and completes */
+	dcpaud_sleep_quiesce(audio);
+	KUNIT_EXPECT_STREQ(test, dcpaud_link_current->sequence, "iDwSC");
+	KUNIT_EXPECT_FALSE(test, audio->silence_running);
+	KUNIT_EXPECT_FALSE(test, audio->idle_set);
+	KUNIT_EXPECT_FALSE(test, audio->link_prepared);
+	KUNIT_EXPECT_EQ(test, atomic_read(&audio->dev->power.usage_count), 0);
+}
+
+static void dcpaud_sleep_ends_cleared_dma(struct kunit *test)
+{
+	struct platform_device *pdev;
+	struct dcp_audio *audio = dcpaud_link_setup(test, &pdev);
+	struct snd_pcm_substream *sub = dcpaud_link_test_open(test, audio);
+
+	/* Stopped, its DMA still playing the cleared buffer; sync_stop not run yet */
+	sub->runtime->status = kunit_kzalloc(test, sizeof(*sub->runtime->status), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, sub->runtime->status);
+	sub->runtime->state = SNDRV_PCM_STATE_SETUP;
+	sub->runtime->stop_operating = true;
+	dcpaud_link_test_pcm(test, audio, sub);
+	dcpaud_link_test_held_stop(test, audio);
+	audio->stream_dma = true;
+
+	/* sync_stop hands over to the silence, which the sleep then releases */
+	dcpaud_sleep_quiesce(audio);
+	KUNIT_EXPECT_STREQ(test, dcpaud_link_current->sequence, "IXDiDwSC");
+	KUNIT_EXPECT_FALSE(test, audio->dma_cleared);
+	KUNIT_EXPECT_FALSE(test, audio->silence_running);
+	KUNIT_EXPECT_FALSE(test, audio->idle_set);
+	KUNIT_EXPECT_FALSE(test, audio->link_prepared);
+	KUNIT_EXPECT_EQ(test, atomic_read(&audio->dev->power.usage_count), 0);
+}
+
 static struct kunit_case dcpaud_link_cases[] = {
 	KUNIT_CASE(dcpaud_link_release_instance),
 	KUNIT_CASE(dcpaud_disconnect_sync_completes_live_owner),
@@ -565,6 +703,10 @@ static struct kunit_case dcpaud_link_cases[] = {
 	KUNIT_CASE(dcpaud_hold_link_start_fails),
 	KUNIT_CASE(dcpaud_hold_link_did_start_fails),
 	KUNIT_CASE(dcpaud_hold_link_needs_channel),
+	KUNIT_CASE(dcpaud_hold_link_needs_power),
+	KUNIT_CASE(dcpaud_sleep_suspends_running_stream),
+	KUNIT_CASE(dcpaud_sleep_releases_held_link),
+	KUNIT_CASE(dcpaud_sleep_ends_cleared_dma),
 	{}
 };
 

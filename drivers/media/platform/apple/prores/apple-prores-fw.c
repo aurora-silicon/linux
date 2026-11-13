@@ -15,24 +15,35 @@
 #define APRI_BLOCK_HEADER_SIZE	8
 #define APRI_ENTRY_SIZE		12
 #define APRI_VERSION		1
-#define APRI_SOC_T6041		0x6041
 
 static_assert(APRI_T6041_FIRMWARE_SIZE ==
-	      APRI_HEADER_SIZE + APRI_BLOCK_COUNT * APRI_BLOCK_HEADER_SIZE +
+	      APRI_HEADER_SIZE + APRI_T6041_BLOCKS * APRI_BLOCK_HEADER_SIZE +
 	      (APRI_SYSTEM_COUNT + APRI_CORE_COUNT + APRI_WRAPPER_COUNT) *
 	      APRI_ENTRY_SIZE);
+static_assert(APRI_T6050_FIRMWARE_SIZE ==
+	      APRI_HEADER_SIZE + APRI_T6050_BLOCKS * APRI_BLOCK_HEADER_SIZE +
+	      (APRI_SYSTEM_COUNT + APRI_CORE_COUNT + APRI_WRAPPER_COUNT +
+	       APRI_CONTROL_COUNT) * APRI_ENTRY_SIZE);
 
-static const u32 apri_block_counts[APRI_BLOCK_COUNT] = {
-	[APRI_SYSTEM_BLOCK] = APRI_SYSTEM_COUNT,
-	[APRI_CORE_BLOCK] = APRI_CORE_COUNT,
-	[APRI_WRAPPER_BLOCK] = APRI_WRAPPER_COUNT,
+const struct apri_layout apri_t6041 = {
+	.soc = 0x6041,
+	.blocks = APRI_T6041_BLOCKS,
+	.size = APRI_T6041_FIRMWARE_SIZE,
+	.counts = { APRI_SYSTEM_COUNT, APRI_CORE_COUNT, APRI_WRAPPER_COUNT },
+	.limits = { 0x4000, 0x4000, 0x1000000 },
 };
+EXPORT_SYMBOL_IF_KUNIT(apri_t6041);
 
-static const u32 apri_offset_limits[APRI_BLOCK_COUNT] = {
-	[APRI_SYSTEM_BLOCK] = 0x4000,
-	[APRI_CORE_BLOCK] = 0x4000,
-	[APRI_WRAPPER_BLOCK] = 0x1000000,
+/* T6050 adds the SCODEC control window, applied after the system block. */
+const struct apri_layout apri_t6050 = {
+	.soc = 0x6050,
+	.blocks = APRI_T6050_BLOCKS,
+	.size = APRI_T6050_FIRMWARE_SIZE,
+	.counts = { APRI_SYSTEM_COUNT, APRI_CORE_COUNT, APRI_WRAPPER_COUNT,
+		    APRI_CONTROL_COUNT },
+	.limits = { 0x4000, 0x4000, 0x1000000, 0x4000 },
 };
+EXPORT_SYMBOL_IF_KUNIT(apri_t6050);
 
 static bool apri_offset_seen(const struct apr_init_block *block, u32 offset)
 {
@@ -45,22 +56,22 @@ static bool apri_offset_seen(const struct apr_init_block *block, u32 offset)
 	return false;
 }
 
-int apr_parse_t6041_init(const u8 *data, size_t size,
-			 struct apr_init_data *init)
+int apr_parse_init(const struct apri_layout *layout, const u8 *data,
+		   size_t size, struct apr_init_data *init)
 {
 	size_t pos = APRI_HEADER_SIZE;
 	u32 block_index;
 
-	if (!data || !init || size != APRI_T6041_FIRMWARE_SIZE)
+	if (!layout || !data || !init || size != layout->size)
 		return -EINVAL;
 	if (memcmp(data, "APRI", 4) ||
 	    get_unaligned_le32(data + 4) != APRI_VERSION ||
-	    get_unaligned_le32(data + 8) != APRI_SOC_T6041 ||
-	    get_unaligned_le32(data + 12) != APRI_BLOCK_COUNT)
+	    get_unaligned_le32(data + 8) != layout->soc ||
+	    get_unaligned_le32(data + 12) != layout->blocks)
 		return -EINVAL;
 
 	memset(init, 0, sizeof(*init));
-	for (block_index = 0; block_index < APRI_BLOCK_COUNT; block_index++) {
+	for (block_index = 0; block_index < layout->blocks; block_index++) {
 		struct apr_init_block *block = &init->blocks[block_index];
 		size_t entries_size, end;
 		u32 entry_index;
@@ -69,24 +80,24 @@ int apr_parse_t6041_init(const u8 *data, size_t size,
 		    end > size)
 			return -EINVAL;
 		if (get_unaligned_le32(data + pos) != block_index + 1 ||
-		    get_unaligned_le32(data + pos + 4) != apri_block_counts[block_index])
+		    get_unaligned_le32(data + pos + 4) != layout->counts[block_index])
 			return -EINVAL;
 		pos = end;
 
-		if (check_mul_overflow((size_t)apri_block_counts[block_index],
+		if (check_mul_overflow((size_t)layout->counts[block_index],
 				       (size_t)APRI_ENTRY_SIZE, &entries_size) ||
 		    check_add_overflow(pos, entries_size, &end) || end > size)
 			return -EINVAL;
 
 		for (entry_index = 0;
-		     entry_index < apri_block_counts[block_index]; entry_index++) {
+		     entry_index < layout->counts[block_index]; entry_index++) {
 			struct apr_tunable *entry = &block->entries[entry_index];
 
 			entry->offset = get_unaligned_le32(data + pos);
 			entry->mask = get_unaligned_le32(data + pos + 4);
 			entry->value = get_unaligned_le32(data + pos + 8);
 			if (!IS_ALIGNED(entry->offset, sizeof(u32)) ||
-			    entry->offset >= apri_offset_limits[block_index] ||
+			    entry->offset >= layout->limits[block_index] ||
 			    !entry->mask || entry->value & ~entry->mask ||
 			    apri_offset_seen(block, entry->offset))
 				return -EINVAL;
@@ -97,4 +108,4 @@ int apr_parse_t6041_init(const u8 *data, size_t size,
 
 	return pos == size ? 0 : -EINVAL;
 }
-EXPORT_SYMBOL_IF_KUNIT(apr_parse_t6041_init);
+EXPORT_SYMBOL_IF_KUNIT(apr_parse_init);

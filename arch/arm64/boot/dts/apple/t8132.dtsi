@@ -958,6 +958,35 @@
 			dma-names = "dma";
 			#sound-dai-cells = <1>;
 		};
+
+		/*
+		 * The sensor services the firmware announces; a board whose ADT
+		 * lacks one simply gets no device for it. The loader copies the
+		 * accelerometer's and gyroscope's calibration into their nodes.
+		 */
+		aop_als: als {
+			compatible = "apple,t8132-aop-als", "apple,aop-als";
+		};
+
+		aop_las: las {
+			compatible = "apple,t8132-aop-las", "apple,aop-las";
+		};
+
+		aop_accel: accel {
+			compatible = "apple,t8132-aop-accel", "apple,aop-accel";
+		};
+
+		aop_gyro: gyro {
+			compatible = "apple,t8132-aop-gyro", "apple,aop-gyro";
+		};
+
+		aop_devmotion: devmotion6 {
+			compatible = "apple,t8132-aop-devmotion6", "apple,aop-devmotion6";
+		};
+
+		aop_temp: als-temp {
+			compatible = "apple,t8132-aop-als-temp", "apple,aop-als-temp";
+		};
 	};
 
 	/* ADT lists the interrupts as 1, 0, 3, 2 of the block: send-empty is the lowest. */

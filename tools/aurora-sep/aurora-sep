@@ -156,9 +156,12 @@ def status(live=True):
             r.add(PASS, "endpoints", "%d: %s" % (len(have), names),
                   "all %d expected endpoints, as macOS lists them" % len(EXPECTED_ENDPOINTS)
                   + ("; also " + " ".join(extra) if extra else ""))
-        unserved = [e for e in have if e not in SERVED]
+        served = dict(SERVED)
+        if d("stac") is not None:
+            served["stac"] = "accessory power state"
+        unserved = [e for e in have if e not in served]
         r.add(INFO, "endpoint-clients",
-              ", ".join("%s=%s" % (e, SERVED[e]) for e in have if e in SERVED),
+              ", ".join("%s=%s" % (e, served[e]) for e in have if e in served),
               "no Linux client yet: " + " ".join(unserved) if unserved else "")
     elif count is not None:
         n = int(count) if count.isdigit() else 0
@@ -238,6 +241,19 @@ def status(live=True):
             r.add(INFO, "live", "skipped", "needs root to read /dev/hwrng")
         else:
             r.add(INFO, "live", "skipped", "the current hwrng is %s, not apple-sep" % (cur or "none"))
+
+    stac = d("stac")
+    if stac is not None:
+        onlines = d("stac_onlines") or "0"
+        if stac == "online":
+            r.add(PASS, "stac", stac, "the trusted-accessory service took the online state "
+                  "%s time(s) (boot and each enclave wake)" % onlines)
+        elif stac == "absent":
+            r.add(INFO, "stac", stac, "this enclave does not offer the trusted-accessory endpoint "
+                  "as the driver knows it")
+        else:
+            r.add(WARN, "stac", stac, "the trusted-accessory online report has not succeeded "
+                  "(the kernel log says why)")
 
     for node, why in (("/dev/sep-bio", "Touch ID"), ("/dev/sep-key", "enclave keys")):
         if os.path.exists(path(node)):

@@ -62,6 +62,13 @@ properties:
   connector:
     $ref: /schemas/connector/usb-connector.yaml#
 
+  apple,no-liquid-detection:
+    type: boolean
+    description:
+      The controller's port has no liquid detection and corrosion mitigation
+      (LDCM), as on the MagSafe 3 port, which the ADT lists with the
+      "Power In" feature only.
+
   apple,reset-inherited-usb2-connection:
     type: boolean
     description:

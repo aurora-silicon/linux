@@ -170,6 +170,10 @@ struct Active {
     abandoned_since: Option<u64>,
     /// First observation of this group executed and consumed while its stamps lagged.
     stamp_wait_since: Option<u64>,
+    /// The group retired on its pass record without completion stamps and its client has its
+    /// result, but the firmware may still store the stamps through its descriptor: the
+    /// descriptor slot stays held until stamps cover the group.
+    stamps_owed: bool,
 }
 
 /// A firmware-retired, unexecuted group must hold on two observations this far
@@ -188,6 +192,9 @@ pub(crate) struct Pair {
     /// The firmware identity of an M5 render pool, pinned while this pair
     /// uses the pool. G17P pools have fixed identities and need no pin.
     pool_pin: Option<crate::g17::freelist::PoolPin>,
+    /// A channel error of one of this pair's queues waits for the firmware to consume its
+    /// acknowledgement: the pair keeps its owner and graph until then.
+    channel_error: bool,
     kick_aliases: Option<[Option<mmu::KernelMapping>; 2]>,
     memory: KBox<memory::Memory>,
     kicks: [kick::Queue; 2],
@@ -356,10 +363,21 @@ impl Pair {
             configuration: None,
             configured_context: None,
             configured_qos: None,
+            channel_error: false,
         }))
     }
     pub(crate) fn qids(&self) -> [u8; 2] {
         self.kicks.each_ref().map(|kick| kick.id().qid())
+    }
+    /// The queue record the firmware runs physical queue `qid` of this pair from.
+    pub(crate) fn queue_record_va(&self, qid: u8) -> Option<u64> {
+        self.qids().contains(&qid).then(|| {
+            self.memory.graph.queues.gpu_va()
+                + u64::from(qid) * size_of::<crate::g17::fw::queue::QueueRecord>() as u64
+        })
+    }
+    pub(crate) fn set_channel_error(&mut self, pending: bool) {
+        self.channel_error = pending;
     }
     pub(crate) fn slot(&self) -> u8 {
         self.slot
@@ -538,6 +556,7 @@ impl Pair {
             ray_query: *ray_query,
             resources: &resources,
             ordinal,
+            pair_idle: self.active.len() == 0,
             ta: abi::RenderStage {
                 qid: qids[0],
                 descriptor_va: self.memory.graph.descriptor_client(0, ordinal)?,
@@ -1127,6 +1146,7 @@ impl Pair {
                 drained_result: None,
                 abandoned_since: None,
                 stamp_wait_since: None,
+                stamps_owed: false,
             })
             .map_err(|_| EBUSY)?;
         self.prepared = None;
@@ -1907,6 +1927,28 @@ impl Pair {
         {
             return Err(EIO);
         }
+        if front.stamps_owed {
+            // Already reported: only the descriptor slot waits for the stamps.
+            let mut observer = Observer {
+                memory: &self.memory,
+                qids,
+                host,
+            };
+            let result = retirement::poll(&mut front.ticket, &mut observer);
+            let ordinal = front.ticket.ordinal;
+            return match result {
+                Ok(retirement::Poll::Complete(_)) => {
+                    self.memory.retire(ordinal)?;
+                    self.active.pop().ok_or(EIO)?;
+                    Ok(true)
+                }
+                Ok(_) => Ok(false),
+                Err(error) => {
+                    self.quarantine(error, defer)?;
+                    Ok(false)
+                }
+            };
+        }
         let stampless = front
             .stamp_wait_since
             .is_some_and(|since| Self::stamp_wait_expired(front, since, crate::g17::now_ns()));
@@ -1967,6 +2009,13 @@ impl Pair {
             front.packet.completion.clone(),
             front.packet.check_firmware_producers().map(|()| timestamps),
         ))?;
+        if stampless {
+            // The pass record is no witness that the firmware is done with the descriptor: it
+            // can still store the completion stamps through it, and a reused slot names no
+            // stamp target. Keep the slot until stamps cover the group.
+            front.stamps_owed = true;
+            return Ok(true);
+        }
         self.memory.retire(ordinal)?;
         self.active.pop().ok_or(EIO)?;
         self.executed_generation = Some(host.generation());
@@ -2870,7 +2919,8 @@ impl Pair {
             .previous
             .as_ref()
             .is_none_or(|p| p.memory.is_none() && self.context_update && !p.ready);
-        Ok(self.owner.is_none()
+        Ok(!self.channel_error
+            && self.owner.is_none()
             && self.displaced.is_none()
             && previous_ready
             && self.idle_for_context(self.context())?)

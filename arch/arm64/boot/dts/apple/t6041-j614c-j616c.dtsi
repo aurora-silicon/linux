@@ -2477,12 +2477,30 @@
 	};
 };
 
-&aop_als {
-	status = "disabled";
-};
+/*
+ * The AOP's sensors, as on the M4 Pro boards (t6040.dtsi, t604x-j614-j616.dtsi).
+ * The J614c's ADT has the J614s's als, accel and gyro services under
+ * /arm-io/aop/iop-aop-nub; the loader copies the accelerometer's and
+ * gyroscope's calibration into the nodes of the same names.
+ */
+&aop {
+	aop_accel: accel {
+		compatible = "apple,t6041-aop-accel", "apple,aop-accel";
+		/* The sensor is on the logic board, in the base. */
+		label = "accel-base";
+	};
 
-&aop_las {
-	status = "disabled";
+	aop_gyro: gyro {
+		compatible = "apple,t6041-aop-gyro", "apple,aop-gyro";
+	};
+
+	aop_devmotion: devmotion6 {
+		compatible = "apple,t6041-aop-devmotion6", "apple,aop-devmotion6";
+	};
+
+	aop_temp: als-temp {
+		compatible = "apple,t6041-aop-als-temp", "apple,aop-als-temp";
+	};
 };
 
 / {

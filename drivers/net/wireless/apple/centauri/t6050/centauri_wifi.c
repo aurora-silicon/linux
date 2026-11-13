@@ -94,6 +94,11 @@ struct centauri_t6050_wifi {
 	u8 hw_channels[REPLY_SIZE], system_caps[REPLY_SIZE];
 	struct debugfs_blob_wrapper hw_channels_blob, system_caps_blob;
 	u8 link_status[REPLY_SIZE];
+	/* The ESS whose 6 GHz BSSes are not reported: see join_avoid_6ghz(). */
+	bool avoid_valid;
+	u8 avoid_ssid[IEEE80211_MAX_SSID_LEN];
+	size_t avoid_ssid_len;
+	unsigned long avoid_until;
 };
 
 static int query_link_status(struct centauri_t6050_wifi *wifi);
@@ -220,10 +225,26 @@ static int open_pair(struct centauri_t6050_wifi *wifi, u16 id)
 	return alpha_message(wifi, tr, sizeof(tr));
 }
 
+/* Whether a BSS of this SSID on channel is one of those not reported. */
+static bool avoided(struct centauri_t6050_wifi *wifi,
+		    const struct ieee80211_channel *channel, const u8 *ssid,
+		    size_t ssid_len)
+{
+	if (!wifi->avoid_valid)
+		return false;
+	if (time_after(jiffies, wifi->avoid_until)) {
+		wifi->avoid_valid = false;
+		return false;
+	}
+	return channel->band == NL80211_BAND_6GHZ &&
+	       ssid_len == wifi->avoid_ssid_len &&
+	       !memcmp(ssid, wifi->avoid_ssid, ssid_len);
+}
+
 static void report_beacon(struct centauri_t6050_wifi *wifi, const u8 *payload,
 			  size_t size)
 {
-	const u8 *frame, *ie, *end;
+	const u8 *frame, *ie, *end, *ssid = NULL;
 	struct ieee80211_channel *channel;
 	struct cfg80211_bss *bss;
 	u16 frame_size;
@@ -241,6 +262,8 @@ static void report_beacon(struct centauri_t6050_wifi *wifi, const u8 *payload,
 	end = frame + frame_size;
 	for (ie = frame + 36; ie + 2 <= end && ie + 2 + ie[1] <= end;
 	     ie += 2 + ie[1]) {
+		if (ie[0] == WLAN_EID_SSID && !ssid)
+			ssid = ie;
 		if ((ie[0] == WLAN_EID_DS_PARAMS ||
 		     ie[0] == WLAN_EID_HT_OPERATION) &&
 		    ie[1]) {
@@ -270,6 +293,11 @@ static void report_beacon(struct centauri_t6050_wifi *wifi, const u8 *payload,
 	signal = max_t(s8, payload[0x16], payload[0x17]);
 	if (signal >= 0 || signal < -127)
 		signal = -95;
+	if (ssid && avoided(wifi, channel, ssid + 2, ssid[1]) &&
+	    !((wifi->connecting || wifi->connected) &&
+	      ether_addr_equal(((struct ieee80211_mgmt *)frame)->bssid,
+			       wifi->bssid)))
+		return;
 	bss = cfg80211_inform_bss_frame(wifi->wiphy, channel,
 					(struct ieee80211_mgmt *)frame,
 					frame_size, signal * 100, GFP_KERNEL);
@@ -1212,53 +1240,61 @@ static int rsn_caps_offset(const u8 *body, size_t size)
 	return offset + 2 <= size ? offset : -EINVAL;
 }
 
-/* The offset of the RSN element's AKM list when it offers akm. */
-static int rsn_akm_offset(const u8 *body, size_t size, u32 akm)
+/* The offset of the AKM list (its count) in an RSN element's body. */
+static int rsn_akm_offset(const u8 *body, size_t size)
 {
-	size_t offset, end;
+	size_t offset;
 	u16 count;
-	unsigned int i;
 
 	if (size < 8 || get_unaligned_le16(body) != 1)
 		return -EINVAL;
 	count = get_unaligned_le16(body + 6);
-	if (!count)
-		return -EINVAL;
 	offset = 8 + 4 * count;
-	if (offset + 2 > size)
+	if (!count || offset + 2 > size)
 		return -EINVAL;
 	count = get_unaligned_le16(body + offset);
-	end = offset + 2 + 4 * count;
-	if (!count || end + 2 > size)
+	if (!count || offset + 2 + 4 * count > size)
 		return -EINVAL;
-	for (i = 0; i < count; i++)
-		if (get_unaligned_be32(body + offset + 2 + 4 * i) == akm)
-			return offset;
-	return -EOPNOTSUPP;
+	return offset;
 }
 
-/* The station's RSN element with akm as its only AKM. */
-static int select_rsn(const struct cfg80211_crypto_settings *crypto, u32 akm,
-		      const u8 *body, size_t size, u8 *selected)
+static bool rsn_lists_akm(const u8 *body, size_t size, u32 akm)
+{
+	int offset = rsn_akm_offset(body, size);
+	unsigned int i;
+
+	if (offset < 0)
+		return false;
+	for (i = 0; i < get_unaligned_le16(body + offset); i++)
+		if (get_unaligned_be32(body + offset + 2 + 4 * i) == akm)
+			return true;
+	return false;
+}
+
+/*
+ * The station's RSN element with akm as its only AKM. The firmware runs the
+ * handshake and builds the association request from this element, so it names
+ * the AKM of the connect command whatever the client's element listed.
+ */
+static int select_rsn(const u8 *body, size_t size, u32 akm, u8 *selected)
 {
 	size_t tail;
-	unsigned int i;
 	int offset;
 
-	for (i = 0; i < crypto->n_akm_suites; i++)
-		if (crypto->akm_suites[i] == akm)
-			break;
-	if (i == crypto->n_akm_suites)
-		return -EOPNOTSUPP;
-	offset = rsn_akm_offset(body, size, akm);
+	offset = rsn_akm_offset(body, size);
 	if (offset < 0)
 		return offset;
-
+	tail = offset + 2 + 4 * get_unaligned_le16(body + offset);
+	if (tail + 2 > size)
+		return -EINVAL;
 	if (get_unaligned_be32(body + 2) != WLAN_CIPHER_SUITE_CCMP ||
 	    get_unaligned_le16(body + 6) != 1 ||
 	    get_unaligned_be32(body + 8) != WLAN_CIPHER_SUITE_CCMP)
 		return -EOPNOTSUPP;
-	tail = offset + 2 + 4 * get_unaligned_le16(body + offset);
+	/* A PMKID names a PMKSA of the AKM the client chose, not of another. */
+	if (!rsn_lists_akm(body, size, akm) && tail + 4 <= size &&
+	    get_unaligned_le16(body + tail + 2))
+		return -EOPNOTSUPP;
 	memcpy(selected, body, offset);
 	put_unaligned_le16(1, selected + offset);
 	put_unaligned_be32(akm, selected + offset + 2);
@@ -1277,20 +1313,78 @@ static int select_rsn(const struct cfg80211_crypto_settings *crypto, u32 akm,
 #define CONNECT_AKM_PSK 4
 #define CONNECT_AKM_SAE 8
 
-/* The AKM of the client's request whose credential it supplies, SAE first. */
-static u32 connect_akm(const struct cfg80211_crypto_settings *crypto)
+/* The AKMs the connect command can name, in order of preference. */
+static const u32 connect_akms[] = { WLAN_AKM_SUITE_SAE, WLAN_AKM_SUITE_PSK };
+
+/* Whether the request offers akm and supplies its credential. */
+static bool akm_usable(const struct cfg80211_crypto_settings *crypto, u32 akm)
 {
-	bool psk = false;
 	unsigned int i;
 
-	for (i = 0; i < crypto->n_akm_suites; i++) {
-		if (crypto->akm_suites[i] == WLAN_AKM_SUITE_SAE &&
-		    crypto->sae_pwd_len)
-			return WLAN_AKM_SUITE_SAE;
-		if (crypto->akm_suites[i] == WLAN_AKM_SUITE_PSK && crypto->psk)
-			psk = true;
+	for (i = 0; i < crypto->n_akm_suites; i++)
+		if (crypto->akm_suites[i] == akm)
+			return akm == WLAN_AKM_SUITE_SAE ? crypto->sae_pwd_len :
+							   !!crypto->psk;
+	return false;
+}
+
+/*
+ * The AKM to connect with. A client that leaves the handshake to the driver
+ * offers every AKM its profile allows (wpa_supplicant: the one it selected,
+ * then the others) with the credentials it holds, and its RSN element (own)
+ * names the one it selected. That one is used when its credential came with
+ * the request. Otherwise the client selected an AKM that cannot be run for
+ * it: SAE without a password (wpa_supplicant with a 64-digit PSK on a
+ * WPA2/WPA3 transition network), or one the connect command has no code for
+ * (PSK-SHA256). Then another offered AKM with a credential is used if the
+ * target's RSN element (target, when the kernel holds its scan entry) offers
+ * it as well; SAE needs management frame protection.
+ */
+static u32 connect_akm(const struct cfg80211_crypto_settings *crypto,
+		       const u8 *own, size_t own_size, const u8 *target,
+		       size_t target_size, bool mfpc)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(connect_akms); i++)
+		if (akm_usable(crypto, connect_akms[i]) &&
+		    rsn_lists_akm(own, own_size, connect_akms[i]))
+			return connect_akms[i];
+	for (i = 0; i < ARRAY_SIZE(connect_akms); i++) {
+		if (!akm_usable(crypto, connect_akms[i]))
+			continue;
+		if (connect_akms[i] == WLAN_AKM_SUITE_SAE && !mfpc)
+			continue;
+		if (!target_size ||
+		    rsn_lists_akm(target, target_size, connect_akms[i]))
+			return connect_akms[i];
 	}
-	return psk ? WLAN_AKM_SUITE_PSK : 0;
+	return 0;
+}
+
+/* The target's RSN element, when the kernel holds its scan entry. */
+static size_t target_rsn(struct wiphy *wiphy,
+			 const struct cfg80211_connect_params *params, u8 *body)
+{
+	const struct element *element;
+	struct cfg80211_bss *bss;
+	size_t size = 0;
+
+	bss = cfg80211_get_bss(wiphy, params->channel ?: params->channel_hint,
+			       params->bssid ?: params->bssid_hint, params->ssid,
+			       params->ssid_len, IEEE80211_BSS_TYPE_ESS,
+			       IEEE80211_PRIVACY_ON);
+	if (!bss)
+		return 0;
+	rcu_read_lock();
+	element = ieee80211_bss_get_elem(bss, WLAN_EID_RSN);
+	if (element) {
+		size = element->datalen;
+		memcpy(body, element->data, size);
+	}
+	rcu_read_unlock();
+	cfg80211_put_bss(wiphy, bss);
+	return size;
 }
 
 static void append_tlv(u8 *payload, size_t *size, u16 tag, const void *data,
@@ -1331,37 +1425,56 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	struct ieee80211_channel *channel =
 		params->channel ?: params->channel_hint;
 	struct cfg80211_bss *bss;
+	struct device *dev = &wifi->control->pdev->dev;
 	const u8 *rsn;
-	u8 rsn_body[255], ssid[35];
+	u8 rsn_body[255], target[255], ssid[35];
 	u8 *payload = wifi->connect_payload;
 	size_t size = 130, rsn_size, rsn_prefix, rsn_tail;
 	int ret = 0, offset, band;
-	u32 akm = connect_akm(&params->crypto);
-	bool sae = akm == WLAN_AKM_SUITE_SAE, mfpc;
+	bool sae, mfpc;
 	u8 password[2 + SAE_PASSWORD_MAX_LEN];
+	u32 akm;
 
-	if (!params->ssid_len || params->ssid_len > 32 || !akm ||
+	if (!params->ssid_len || params->ssid_len > 32 ||
 	    params->crypto.sae_pwd_len > SAE_PASSWORD_MAX_LEN ||
 	    params->crypto.n_ciphers_pairwise != 1 ||
 	    params->crypto.ciphers_pairwise[0] != WLAN_CIPHER_SUITE_CCMP ||
 	    params->crypto.cipher_group != WLAN_CIPHER_SUITE_CCMP ||
-	    params->ie_len > sizeof(wifi->request_ie))
+	    params->ie_len > sizeof(wifi->request_ie)) {
+		dev_dbg(dev, "connect refused: %d pairwise ciphers, first %08x, group %08x, %zu bytes of elements\n",
+			params->crypto.n_ciphers_pairwise,
+			params->crypto.ciphers_pairwise[0],
+			params->crypto.cipher_group, params->ie_len);
 		return -EOPNOTSUPP;
+	}
 	rsn = cfg80211_find_ie(WLAN_EID_RSN, params->ie, params->ie_len);
-	if (!rsn)
+	if (!rsn) {
+		dev_dbg(dev, "connect refused: no RSN element\n");
 		return -EINVAL;
-	ret = select_rsn(&params->crypto, akm, rsn + 2, rsn[1], rsn_body);
-	if (ret < 0)
-		return ret;
-	rsn_size = ret;
+	}
 	/*
 	 * The station's own RSN element carries its management frame
 	 * protection to the firmware; bit 7 of its capabilities is MFPC.
 	 */
-	offset = rsn_caps_offset(rsn_body, rsn_size);
-	if (offset < 0)
+	offset = rsn_caps_offset(rsn + 2, rsn[1]);
+	if (offset < 0) {
+		dev_dbg(dev, "connect refused: RSN element %*ph\n", rsn[1], rsn + 2);
 		return -EINVAL;
-	mfpc = get_unaligned_le16(rsn_body + offset) & BIT(7);
+	}
+	mfpc = get_unaligned_le16(rsn + 2 + offset) & BIT(7);
+	akm = connect_akm(&params->crypto, rsn + 2, rsn[1], target,
+			  target_rsn(wiphy, params, target), mfpc);
+	ret = akm ? select_rsn(rsn + 2, rsn[1], akm, rsn_body) : -EOPNOTSUPP;
+	if (ret < 0) {
+		dev_dbg(dev, "connect refused (%d): AKM %08x of %d offered (%08x %08x ...), PMK %d, SAE password %d, RSN element %*ph\n",
+			ret, akm, params->crypto.n_akm_suites,
+			params->crypto.akm_suites[0], params->crypto.akm_suites[1],
+			!!params->crypto.psk, !!params->crypto.sae_pwd_len,
+			rsn[1], rsn + 2);
+		return ret;
+	}
+	rsn_size = ret;
+	sae = akm == WLAN_AKM_SUITE_SAE;
 	ret = 0;
 	mutex_lock(&wifi->lock);
 	if (READ_ONCE(wifi->stopping)) {
@@ -1395,6 +1508,8 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	ret = 0;
 	/* 6 GHz admits WPA3-Personal only with management frame protection. */
 	if (channel->band == NL80211_BAND_6GHZ && (!sae || !mfpc)) {
+		dev_dbg(dev, "connect refused: 6 GHz with AKM %08x, MFPC %d\n",
+			akm, mfpc);
 		ret = -EOPNOTSUPP;
 		goto out;
 	}
@@ -1519,13 +1634,133 @@ static void host_setup_commands(struct centauri_t6050_wifi *wifi)
 	}
 }
 
+/*
+ * The status of a failed join, from the firmware's AciWifiErrorCodeEnum (its
+ * names are in the enum table of the firmware image's "_wcl" section): 1-99
+ * is the 802.11 reason code of a deauthentication, 100-299 is 100 plus the
+ * 802.11 status code of the AP's authentication or association response, and
+ * from 300 on the firmware's own: among them the step that got no answer
+ * (Timeout...), or that it gave up for a poor link (BadRfConditions...).
+ */
+#define JOIN_STATUS_AP 100
+#define JOIN_STATUS_INTERNAL 300
+#define JOIN_TIMEOUT_PROBE 305
+#define JOIN_TIMEOUT_AUTH 306
+#define JOIN_TIMEOUT_ASSOC 308
+#define JOIN_BAD_RF_PROBE 352
+#define JOIN_BAD_RF_AUTH 353
+#define JOIN_BAD_RF_ASSOC 355
+
+/* The step a join stopped at without an answer from the AP, or -1. */
+static int join_timeout(u16 status)
+{
+	switch (status) {
+	case JOIN_TIMEOUT_PROBE:
+	case JOIN_BAD_RF_PROBE:
+		return NL80211_TIMEOUT_SCAN;
+	case JOIN_TIMEOUT_AUTH:
+	case JOIN_BAD_RF_AUTH:
+		return NL80211_TIMEOUT_AUTH;
+	case JOIN_TIMEOUT_ASSOC:
+	case JOIN_BAD_RF_ASSOC:
+		return NL80211_TIMEOUT_ASSOC;
+	}
+	return -1;
+}
+
+/*
+ * A client that picks the BSS itself (wpa_supplicant) ranks the 6 GHz BSSes
+ * of a network first and tries them one after the other. Where the firmware
+ * fails those joins, typically because the APs do not hear the station as
+ * well as it hears them, the client gives up on the network after four
+ * failures and never gets to its BSSes on the other bands. So when a 6 GHz
+ * join fails and the network has a BSS on another band, its 6 GHz BSSes are
+ * kept out of the scan results for a while: the client's next scan then
+ * offers the other bands. A successful 6 GHz join ends that at once.
+ */
+#define AVOID_SECONDS 120
+
+struct avoid_entry {
+	u8 bssid[ETH_ALEN];
+	struct ieee80211_channel *channel;
+};
+
+struct avoid_list {
+	struct centauri_t6050_wifi *wifi;
+	bool other_band;
+	unsigned int count;
+	struct avoid_entry entry[16];
+};
+
+/* Called for every BSS entry, under cfg80211's BSS lock. */
+static void avoid_collect(struct wiphy *wiphy, struct cfg80211_bss *bss,
+			  void *data)
+{
+	struct avoid_list *list = data;
+	struct centauri_t6050_wifi *wifi = list->wifi;
+	const struct element *ssid;
+	bool same;
+
+	rcu_read_lock();
+	ssid = ieee80211_bss_get_elem(bss, WLAN_EID_SSID);
+	same = ssid && ssid->datalen == wifi->ssid_len &&
+	       !memcmp(ssid->data, wifi->ssid, wifi->ssid_len);
+	rcu_read_unlock();
+	if (!same)
+		return;
+	if (bss->channel->band != NL80211_BAND_6GHZ) {
+		list->other_band = true;
+	} else if (list->count < ARRAY_SIZE(list->entry)) {
+		ether_addr_copy(list->entry[list->count].bssid, bss->bssid);
+		list->entry[list->count++].channel = bss->channel;
+	}
+}
+
+/* The 6 GHz join to wifi->bssid failed. Called with wifi->lock held. */
+static void join_avoid_6ghz(struct centauri_t6050_wifi *wifi)
+{
+	struct avoid_list list = { .wifi = wifi };
+	struct cfg80211_bss *bss;
+	unsigned int i, pass;
+
+	/* Entries can share a BSSID, and the iterator may not unlink. */
+	for (pass = 0; pass < 8; pass++) {
+		list.count = 0;
+		cfg80211_bss_iter(wifi->wiphy, NULL, avoid_collect, &list);
+		if (!list.other_band)
+			return;
+		if (!pass) {
+			memcpy(wifi->avoid_ssid, wifi->ssid, wifi->ssid_len);
+			wifi->avoid_ssid_len = wifi->ssid_len;
+			wifi->avoid_until = jiffies + AVOID_SECONDS * HZ;
+			wifi->avoid_valid = true;
+			dev_info(&wifi->control->pdev->dev,
+				 "6 GHz join to %pM failed: not reporting this network's 6 GHz BSSes for %u s\n",
+				 wifi->bssid, AVOID_SECONDS);
+		}
+		for (i = 0; i < list.count; i++) {
+			bss = cfg80211_get_bss(wifi->wiphy,
+					       list.entry[i].channel,
+					       list.entry[i].bssid, NULL, 0,
+					       IEEE80211_BSS_TYPE_ANY,
+					       IEEE80211_PRIVACY_ANY);
+			if (!bss)
+				continue;
+			cfg80211_unlink_bss(wifi->wiphy, bss);
+			cfg80211_put_bss(wifi->wiphy, bss);
+		}
+		if (!list.count)
+			break;
+	}
+}
+
 static void connect_worker(struct work_struct *work)
 {
 	struct centauri_t6050_wifi *wifi =
 		container_of(work, struct centauri_t6050_wifi, connect_work);
 	unsigned long deadline;
 	u16 slot, status;
-	int ret;
+	int ret, timeout = -1;
 
 	mutex_lock(&wifi->lock);
 	if (READ_ONCE(wifi->connect_abort) || READ_ONCE(wifi->stopping)) {
@@ -1567,13 +1802,27 @@ static void connect_worker(struct work_struct *work)
 		dev_warn(&wifi->control->pdev->dev,
 			 "Wi-Fi connect to %pM failed: firmware status %u\n",
 			 wifi->bssid, wifi->connect_status);
-	status = !ret && wifi->connect_status == 0 ?
-			 WLAN_STATUS_SUCCESS :
-			 WLAN_STATUS_UNSPECIFIED_FAILURE;
+	status = WLAN_STATUS_UNSPECIFIED_FAILURE;
+	if (!ret && !wifi->connect_status) {
+		status = WLAN_STATUS_SUCCESS;
+	} else if (!ret) {
+		/* The AP's own status code, or the step it did not answer. */
+		if (wifi->connect_status > JOIN_STATUS_AP &&
+		    wifi->connect_status < JOIN_STATUS_INTERNAL)
+			status = wifi->connect_status - JOIN_STATUS_AP;
+		timeout = join_timeout(wifi->connect_status);
+	}
+	/* The firmware failed the join, or never said how it ended. */
+	if (wifi->connect_channel->band == NL80211_BAND_6GHZ &&
+	    ((!ret && wifi->connect_status) || ret == -ETIMEDOUT ||
+	     ret == -ENOTCONN))
+		join_avoid_6ghz(wifi);
 	wifi->connecting = false;
 	wifi->connected = status == WLAN_STATUS_SUCCESS;
 	wifi->station_signal_valid = false;
 	if (wifi->connected) {
+		if (wifi->connect_channel->band == NL80211_BAND_6GHZ)
+			wifi->avoid_valid = false;
 		wifi->connected_at = jiffies;
 		wifi->station_signal_at = jiffies - HZ;
 		wifi->station_start = wifi->netdev->stats;
@@ -1584,10 +1833,11 @@ static void connect_worker(struct work_struct *work)
 					 slot * BUFFER_SIZE,
 				 BUFFER_SIZE);
 
-	if (ret == -ECANCELED || ret == -ETIMEDOUT)
+	if (ret == -ECANCELED || ret == -ETIMEDOUT || timeout >= 0)
 		cfg80211_connect_timeout(wifi->netdev, wifi->bssid,
 					 wifi->request_ie,
 					 wifi->request_ie_size, GFP_KERNEL,
+					 timeout >= 0 ? timeout :
 					 NL80211_TIMEOUT_UNSPECIFIED);
 	else
 		cfg80211_connect_bss(wifi->netdev, wifi->bssid,
@@ -2098,6 +2348,12 @@ int centauri_t6050_wifi_register(struct centauri_t6050 *c)
 	wifi->wiphy->n_cipher_suites = ARRAY_SIZE(cipher_suites);
 	wifi->wiphy->akm_suites = akm_suites;
 	wifi->wiphy->n_akm_suites = ARRAY_SIZE(akm_suites);
+	/*
+	 * A connect request may list every AKM the client's profile allows:
+	 * with the default of two, wpa_supplicant leaves out PSK, and its
+	 * PMK, when it selected PSK-SHA256 on a profile that also allows SAE.
+	 */
+	wifi->wiphy->max_num_akm_suites = CFG80211_MAX_NUM_AKM_SUITES;
 	wiphy_ext_feature_set(wifi->wiphy,
 			      NL80211_EXT_FEATURE_4WAY_HANDSHAKE_STA_PSK);
 	wiphy_ext_feature_set(wifi->wiphy, NL80211_EXT_FEATURE_SAE_OFFLOAD);

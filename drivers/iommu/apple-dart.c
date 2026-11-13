@@ -4799,6 +4799,19 @@ static void apple_dart_dapf_replay(struct apple_dart *dart, bool always)
 }
 
 /*
+ * A DART reports its page size in PARAMS1 and, on T8110, its address widths
+ * and stream count in PARAMS3/PARAMS4. A register window that is not a DART
+ * translation unit reads back a zero address width there. The DMA masks are
+ * built from these values, so refuse a block whose topology cannot be a DART.
+ */
+static bool apple_dart_topology_valid(u32 pgsize, u32 ias, u32 oas,
+				      u32 num_streams)
+{
+	return (pgsize == SZ_4K || pgsize == SZ_16K) &&
+	       ias && ias <= 64 && oas && oas <= 64 && num_streams;
+}
+
+/*
  * The setup a T8110 DART needs when nothing initialised it before Linux:
  * apple,tunable (applied at every reset), apple,bypass-sids (streams kept in
  * static bypass), apple,full-error-reporting and apple,ctc-flush. Log the
@@ -4888,7 +4901,7 @@ static bool apple_dart_is_available(struct device_node *np)
 static int apple_dart_probe(struct platform_device *pdev)
 {
 	int ret, sid;
-	u32 dart_params[4];
+	u32 dart_params[4] = {};
 	struct device_node *pd_np;
 	struct resource *res;
 	struct apple_dart *dart;
@@ -5232,6 +5245,16 @@ static int apple_dart_probe(struct platform_device *pdev)
 	}
 
 params_done:
+	if (!apple_dart_topology_valid(dart->pgsize, dart->ias, dart->oas,
+				       dart->num_streams)) {
+		ret = dev_err_probe(dev, -ENODEV,
+				    "not a DART translation unit: params %08x %08x %08x %08x (page size %#x, AS %u -> %u, %u streams)\n",
+				    dart_params[0], dart_params[1], dart_params[2],
+				    dart_params[3], dart->pgsize, dart->ias,
+				    dart->oas, dart->num_streams);
+		goto err_clk_disable;
+	}
+
 	if (!tunneled && dart->hw->type == DART_T8110) {
 		ret = apple_dart_parse_own_setup(dart, res, dart_params);
 		if (ret)

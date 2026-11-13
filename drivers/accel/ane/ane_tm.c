@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright 2022 Eileen Yoon <eyn@gmx.com> */
 
+#include <linux/bitfield.h>
 #include <linux/device.h>
 #include <linux/kobject.h>
 #include <linux/sysfs.h>
@@ -39,6 +40,8 @@ static const int TQ_PRTY_TABLE[ANE_TQ_COUNT] = { 0x1, 0x2, 0x3,	 0x4,
 #define TM_IRQ_EN2		  0x70
 
 #define TQ_STATUS(qid)		  (0x000 + ((qid) * 0x148))
+#define TQ_HW_STATUS(qid)	  (0x004 + ((qid) * 0x148))
+#define TQ_PENDING(qid)		  (0x00c + ((qid) * 0x148))
 #define TQ_PRTY(qid)		  (0x010 + ((qid) * 0x148))
 #define TQ_VACANT(qid)		  (0x014 + ((qid) * 0x148))
 #define TQ_INFO(qid)		  (0x01c + ((qid) * 0x148))
@@ -55,6 +58,30 @@ static const int TQ_PRTY_TABLE[ANE_TQ_COUNT] = { 0x1, 0x2, 0x3,	 0x4,
 
 #define TM_IS_IDLE		  0x1
 #define TM_IS_FINE		  0x22222222
+
+/*
+ * Per-queue abort. Writing a queue number with START set asks the task
+ * manager to stop that queue's in-flight descriptors; START reads back
+ * set until the command has been taken. The queue then reports hardware
+ * idle in its own status word, and its pending-descriptor count drains
+ * to zero. TQ_STATUS (+0x00) is only the software ownership word the
+ * submit path sets; it says nothing about the hardware.
+ */
+#define TM_ABORT		  0xf4
+#define TM_ABORT_QUEUE		  GENMASK(2, 0)
+#define TM_ABORT_START		  BIT(4)
+#define TQ_HW_STATUS_IDLE	  BIT(0)
+#define TQ_PENDING_TDS		  GENMASK(15, 0)
+/* Valid bit of both descriptor slots of a queue (TQ_NID1, TQ_NID2). */
+#define TQ_NID_VALID		  BIT(0)
+/* Bounds of each abort wait, polled once per millisecond. */
+#define ANE_TM_ABORT_POLL_US	  1000
+#define ANE_TM_ABORT_TIMEOUT_US	  2000000
+
+static bool tm_abort = true;
+module_param(tm_abort, bool, 0644);
+MODULE_PARM_DESC(tm_abort,
+		 "Abort a hung queue in the task manager before the recovery power cycle on T600x (default on).");
 
 #define tm_read32(ane, off)	  (readl((ane)->engine + ANE_TM_BASE + (off)))
 #define tq_read32(ane, off)	  (readl((ane)->engine + ANE_TQ_BASE + (off)))
@@ -271,6 +298,103 @@ static int ane_tm_poll_step(struct ane_device *ane, struct ane_request *req,
 	return ane_tm_collect_events(ane, req, finished);
 }
 
+static void ane_tm_log_queue(struct ane_device *ane, int qid, const char *when)
+{
+	dev_dbg(ane->dev,
+		"abort %s: q%d tq_en %#x abort %#x tm_status %#x tq %#x hw %#x pending %#x prty %#x nid1 %#x nid2 %#x (ps act %#x)\n",
+		when, qid, tm_read32(ane, TM_TQ_EN), tm_read32(ane, TM_ABORT),
+		tm_read32(ane, TM_STATUS), tq_read32(ane, TQ_STATUS(qid)),
+		tq_read32(ane, TQ_HW_STATUS(qid)),
+		tq_read32(ane, TQ_PENDING(qid)), tq_read32(ane, TQ_PRTY(qid)),
+		tq_read32(ane, TQ_NID1(qid)), tq_read32(ane, TQ_NID2(qid)),
+		ane_ps_act(ane));
+}
+
+/* Abort-wait conditions. Each pass reads the DART latch before the engine. */
+static int ane_tm_abort_taken(struct ane_device *ane)
+{
+	if (ane_dart_faulted(ane, NULL, NULL))
+		return -EIO;
+	return !(tm_read32(ane, TM_ABORT) & TM_ABORT_START);
+}
+
+static int ane_tm_queue_quiet(struct ane_device *ane, int qid)
+{
+	if (ane_dart_faulted(ane, NULL, NULL))
+		return -EIO;
+	return (tq_read32(ane, TQ_HW_STATUS(qid)) & TQ_HW_STATUS_IDLE) &&
+	       !FIELD_GET(TQ_PENDING_TDS, tq_read32(ane, TQ_PENDING(qid)));
+}
+
+/*
+ * Stop a hung queue in the task manager while the engine is still powered,
+ * so the power cycle that follows does not cut an in-flight descriptor.
+ * Abort the queue, wait for the command to be taken, then for the queue to
+ * report hardware idle with no descriptor pending. Only then give the
+ * queue back the way a completed job does: invalidate both descriptor
+ * slots, then clear the ownership word, and restore the queue priority.
+ *
+ * Returns 0 only when the task manager acknowledged every step; on any
+ * failure nothing is cleared. A task stalled below the task manager never
+ * lets the abort be taken; the power cycle is then what stops it.
+ */
+static int ane_tm_abort_queue(struct ane_device *ane, int qid)
+{
+	int ret, done;
+	u32 nid;
+
+	lockdep_assert_held(&ane->engine_lock);
+	if (qid < 0 || qid >= ANE_TQ_COUNT)
+		return -EINVAL;
+	/* pmgr reads only: no engine MMIO unless every island reads on. */
+	if (ane->ps && ane_ps_act(ane) != ANE_PS_ALL_ON)
+		return -ENODEV;
+	if (ane_dart_faulted(ane, NULL, NULL))
+		return -EIO;
+
+	ane_tm_log_queue(ane, qid, "before");
+	tm_write32(ane, TM_ABORT,
+		   TM_ABORT_START | FIELD_PREP(TM_ABORT_QUEUE, qid));
+
+	ret = read_poll_timeout(ane_tm_abort_taken, done, done,
+				ANE_TM_ABORT_POLL_US, ANE_TM_ABORT_TIMEOUT_US,
+				false, ane);
+	if (!ret && done < 0)
+		ret = done;
+	if (ret) {
+		dev_err(ane->dev, "q%d abort not taken: %d (abort %#x)\n", qid,
+			ret, ret == -EIO ? 0 : tm_read32(ane, TM_ABORT));
+		return ret;
+	}
+
+	ret = read_poll_timeout(ane_tm_queue_quiet, done, done,
+				ANE_TM_ABORT_POLL_US, ANE_TM_ABORT_TIMEOUT_US,
+				false, ane, qid);
+	if (!ret && done < 0)
+		ret = done;
+	if (ret) {
+		if (ret == -EIO)
+			dev_err(ane->dev, "q%d abort: DART fault latched\n", qid);
+		else
+			dev_err(ane->dev,
+				"q%d abort taken but queue not idle: hw %#x pending %#x\n",
+				qid, tq_read32(ane, TQ_HW_STATUS(qid)),
+				tq_read32(ane, TQ_PENDING(qid)));
+		return ret;
+	}
+
+	nid = tq_read32(ane, TQ_NID1(qid));
+	tq_write32(ane, TQ_NID1(qid), nid & ~TQ_NID_VALID);
+	nid = tq_read32(ane, TQ_NID2(qid));
+	tq_write32(ane, TQ_NID2(qid), nid & ~TQ_NID_VALID);
+	/* Both slots are invalid before the queue is handed back. */
+	wmb();
+	tq_write32(ane, TQ_STATUS(qid), 0x0);
+	tq_write32(ane, TQ_PRTY(qid), TQ_PRTY_TABLE[qid]);
+	ane_tm_log_queue(ane, qid, "after");
+	return 0;
+}
+
 /*
  * Keep the engine wedged until reboot and tell userspace: the wedged
  * attribute stays 1 (pollable), wedge_reason says why, and a change uevent
@@ -396,7 +520,7 @@ int ane_tm_execute(struct ane_device *ane, struct ane_request *req)
 	rmb();
 	tq_write32(ane, TQ_STATUS(req->qid), 0x0);
 	ane_dart_unmask(ane);
-	ane->recovery_probation = false;
+	ane->recovery_unproven = 0;
 	return 0;
 
 wedge:
@@ -409,12 +533,25 @@ wedge:
 	}
 
 	if (!ane_tm_failure_recoverable(ane->tm_retention,
-					ane->recovery_probation, err,
+					ane->recovery_unproven, err,
 					finished)) {
-		ane_tm_wedge_final(ane, ane->recovery_probation ?
-				   "the first job after a recovery hung without an event" :
-				   "a job hung without a completion event and the task manager keeps it through a power cycle");
+		ane_tm_wedge_final(ane, ane->tm_retention ?
+				   "jobs keep hanging without an event after every recovery" :
+				   "the first job after a recovery hung without an event");
 		return err;
+	}
+
+	/* Stop the hung queue cleanly first where the task manager still
+	 * takes commands; the power cycle below covers the case where it
+	 * does not.
+	 */
+	if (err == -ETIMEDOUT && ane->tm_retention && tm_abort) {
+		if (!ane_tm_abort_queue(ane, req->qid))
+			dev_info(ane->dev, "q%d hung job aborted: queue idle, nothing pending\n",
+				 req->qid);
+		else
+			dev_info(ane->dev, "q%d abort not taken; the power cycle stops the task\n",
+				 req->qid);
 	}
 
 	/* One bounded recovery attempt: stop the tm, power-cycle the engine
@@ -551,20 +688,23 @@ static int ane_pd_cycle(struct ane_device *ane)
  *     INFO/UNK1/TMST/UNK2, exactly as ane_tm_collect_events pops them;
  *     a stale backlog would make the next submit's completion poll
  *     miss its events.
- *   - the latched queue entry of the dead task. TQ_STATUS/NID1 get the
- *     same clear the normal completion path gives a finished queue.
+ *   - the latched queue entry of the dead task. Both descriptor slots
+ *     (NID1 and NID2) lose their valid bit before TQ_STATUS is cleared,
+ *     the order the normal completion path gives a finished queue.
  */
 static void ane_tm_drain_retained(struct ane_device *ane)
 {
 	int line, qid;
 
-	/* Stop the TM first: the cycle leaves the enable|halt latch set
-	 * (TQ_EN reads 0x3000). Clear both bits so the
-	 * re-arm below starts the TM from a defined stopped state.
+	/* Stop the TM first by clearing its enable (bit 12); the re-arm
+	 * below sets it again. Keep bit 13: it reads set after every power-on
+	 * and the TM does not dispatch without it. With it cleared a queued
+	 * descriptor stays pending while TM_STATUS reads idle, so every job
+	 * after the recovery timed out without an event.
 	 */
 	ane_rec_writel(ane, "TM_TQ_EN stop tm+0x0c",
 		       ane->engine + ANE_TM_BASE + TM_TQ_EN,
-		       tm_read32(ane, TM_TQ_EN) & ~0x3000U);
+		       tm_read32(ane, TM_TQ_EN) & ~0x1000U);
 
 	for (line = 0; line < 2; line++) {
 		u32 count = tm_read32(ane, TM_IRQ_EVTC(line));
@@ -610,11 +750,16 @@ static void ane_tm_drain_retained(struct ane_device *ane)
 	}
 
 	for (qid = 0; qid < ANE_TQ_COUNT; qid++) {
-		u32 nid = tq_read32(ane, TQ_NID1(qid));
+		u32 nid1 = tq_read32(ane, TQ_NID1(qid));
+		u32 nid2 = tq_read32(ane, TQ_NID2(qid));
 
+		if (nid1 & TQ_NID_VALID)
+			tq_write32(ane, TQ_NID1(qid), nid1 & ~TQ_NID_VALID);
+		if (nid2 & TQ_NID_VALID)
+			tq_write32(ane, TQ_NID2(qid), nid2 & ~TQ_NID_VALID);
+		/* Both slots are invalid before the queue is handed back. */
+		wmb();
 		tq_write32(ane, TQ_STATUS(qid), 0x0);
-		if (nid & 1)
-			tq_write32(ane, TQ_NID1(qid), nid & ~1U);
 	}
 
 	/* Log the retained state: what the dead task left in the
@@ -661,12 +806,13 @@ int ane_tm_recover(struct ane_device *ane)
 		return err;
 	}
 
-	/* On T600x the tm/tq file survives the acknowledged power-off in
-	 * retention (TQ_EN reads 0x3000 after every resume, healthy or not,
-	 * and PMGR reset pulses on the ANE domains do not clear it). Drain
-	 * the retained state there; this is what recovers a failed task
-	 * ("-5, finish lines=1"). Anything the drain cannot clear fails the
-	 * idle check below and stays wedged.
+	/* On T600x drain what the tm/tq file may still hold after the
+	 * cycle (events, error latches, queue slots); this is what recovers
+	 * a failed task ("-5, finish lines=1"). After a hang without an
+	 * event the cycle has been seen to return the file at its reset
+	 * values (no committed work, no valid slot); the drain then only
+	 * re-arms it. Anything left fails the idle check below and stays
+	 * wedged.
 	 */
 	if (ane->tm_retention)
 		ane_tm_drain_retained(ane);
@@ -698,7 +844,7 @@ int ane_tm_recover(struct ane_device *ane)
 		 */
 		ane_reclaim_preserved(ane);
 		/* Idle is all a reset can show; the next job proves it. */
-		ane->recovery_probation = true;
+		ane->recovery_unproven++;
 		dev_info(ane->dev, "tm recovered: idle, accepting work again\n");
 	}
 	return 0;

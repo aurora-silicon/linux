@@ -3,7 +3,7 @@
 #define of_device_is_compatible(...) false
 struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
-    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables;
+    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
     struct { void *usb3_dp; } tunables;
 
 	const struct atcphy_hw *hw;

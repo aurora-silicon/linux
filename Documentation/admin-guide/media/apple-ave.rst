@@ -81,10 +81,11 @@ descriptors. The M5 Pro and Max (T6050) firmware that the loader hands over
 with macOS 27.0 installed, TEXT CRC ``87279429``, selects it. On T6050,
 macOS's boot configuration, coprocessor start and handshake follow the 9003
 transport (device 28, device type 28, after clearing the SVE idle word at
-mailbox +0x118), and H.264 encodes. Where this firmware leaves an HEVC slice
-header is not known, so HEVC sessions are refused on this layout. The 26A428
-capture and the J700 capture used different OS versions; a SoC compatible
-cannot identify a command ABI.
+mailbox +0x118), and H.264 encodes. This layout's slots have no slice-header
+buffer; an HEVC slice header comes back in the slot's 16 KiB buffer, the only
+per-slot buffer its Process command carries, and must start with an Annex B
+start code. The 26A428 capture and the J700 capture used different OS
+versions; a SoC compatible cannot identify a command ABI.
 
 The public API continues to offer 8-bit NV12 and VBR/CBR. CQ and Main10
 layout facts are exercised by host tests without exposing new V4L2 modes.

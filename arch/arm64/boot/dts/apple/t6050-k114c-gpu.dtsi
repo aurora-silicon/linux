@@ -103,6 +103,14 @@
 	apple,always-on;
 };
 
+/*
+ * The G17 firmware stays live across suspend-to-idle, as the G16's does on T8132: keep
+ * GFX on in the noirq phase instead of gating it under the running firmware.
+ */
+&ps_gfx {
+	apple,sleep-retained;
+};
+
 &sgx {
 	compatible = "apple,agx-g17s";
 	/* ADT sgx reg[0]; the driver maps the first 16 MiB as "sgx" */

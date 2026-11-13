@@ -23,6 +23,7 @@
 #include <linux/overflow.h>
 #include <linux/pci.h>
 #include <linux/soc/apple/pci-apple-piodma.h>
+#include <linux/soc/apple/sleep.h>
 #include <linux/pm.h>
 #include <linux/pm_runtime.h>
 #include <linux/pm_wakeup.h>
@@ -1707,11 +1708,14 @@ static void bt7932_disarm_wakeup(struct bt7932 *bt)
  */
 static void bt7932_take_wake_reason(struct bt7932 *bt)
 {
+	/* Without the radios in the SMC's record of the wake, no report is coming. */
+	unsigned long timeout = apple_sleep_radio_woke() ?
+				msecs_to_jiffies(BT7932_WAKE_REASON_MS) : 0;
+
 	/* The interrupt thread leaves the rings alone until the restore ends. */
 	bt7932_service(bt);
 	wait_event_timeout(bt->wake_wait,
-			   !READ_ONCE(bt->wake_expected) || READ_ONCE(bt->fault),
-			   msecs_to_jiffies(BT7932_WAKE_REASON_MS));
+			   !READ_ONCE(bt->wake_expected) || READ_ONCE(bt->fault), timeout);
 	mutex_lock(&bt->lock);
 	if (bt->wake_expected && !bt->fault)
 		dev_dbg(&bt->pdev->dev, "Bluetooth did not wake the host\n");

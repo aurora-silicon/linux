@@ -43,6 +43,11 @@ pub(super) trait Queues {
     fn context_killed(&mut self, cookie: u64);
     /// The firmware failed a compute command (see [`Event::ComputeFault`]).
     fn compute_fault(&mut self, qid: u8, stamp: u32);
+    /// A 25G83 channel error (see [`Event::ChannelError`]): queue its acknowledgement.
+    fn channel_error(&mut self, engine: crate::g17::fw::channels::Engine, qid: u8, stamp: u32) -> Result;
+    /// Publish queued channel-error acknowledgements and forget consumed ones. False means
+    /// ring backpressure.
+    fn flush_channel_errors(&mut self) -> Result<bool>;
 }
 
 /// Work requested after releasing the device mutex.
@@ -85,6 +90,16 @@ fn batch<H: Host>(host: &mut H, role: Role, masks: &mut [u64; 2]) -> Result {
                 // Its queue retires or settles its quarantine on this pass.
                 masks[usize::from(qid) / 64] |= 1 << (qid % 64);
             }
+            Event::ChannelError { class, engine, qid, stamp } => {
+                crate::g17::trace::teardown(2, u64::from(qid), u64::from(stamp), u64::from(class));
+                host.channel_error(engine, qid, stamp)?;
+                if engine == crate::g17::fw::channels::Engine::Compute {
+                    host.compute_fault(qid, stamp);
+                    masks[usize::from(qid) / 64] |= 1 << (qid % 64);
+                }
+                // Nothing else is released before the firmware consumed the acknowledgement.
+                return Ok(false);
+            }
             Event::Unknown(_) => {}
         }
         Ok(true)
@@ -92,7 +107,7 @@ fn batch<H: Host>(host: &mut H, role: Role, masks: &mut [u64; 2]) -> Result {
 }
 
 pub(super) fn service<H: Host>(host: &mut H) -> Result<Pending> {
-    if !host.flush_tvb_reply()? || !host.flush_freelist_release()? {
+    if !host.flush_channel_errors()? || !host.flush_tvb_reply()? || !host.flush_freelist_release()? {
         return Ok(Pending::default());
     }
     host.observe_render_releases()?;

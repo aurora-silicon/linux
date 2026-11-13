@@ -93,6 +93,12 @@ impl event::Queues for Service<'_> {
     fn flush_tvb_reply(&mut self) -> Result<bool> {
         self.firmware.flush_tvb_reply()
     }
+    fn channel_error(&mut self, engine: crate::g17::fw::channels::Engine, qid: u8, stamp: u32) -> Result {
+        self.firmware.queue_channel_error(engine, qid, stamp)
+    }
+    fn flush_channel_errors(&mut self) -> Result<bool> {
+        self.firmware.flush_channel_errors()
+    }
     fn flush_freelist_release(&mut self) -> Result<bool> {
         self.firmware.flush_freelist_release()
     }

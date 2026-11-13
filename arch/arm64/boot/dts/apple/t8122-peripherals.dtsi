@@ -17,6 +17,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 752 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_msr>;
 		status = "disabled";
 	};
 
@@ -26,6 +27,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 744 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_jpg>;
 		status = "okay";
 	};
 
@@ -35,6 +37,7 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 747 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_jpg>;
 		status = "okay";
 	};
 

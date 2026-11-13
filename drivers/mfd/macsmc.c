@@ -794,7 +794,8 @@ static int apple_smc_wake_reason_names(u64 record, char *buf, size_t size)
 	return len;
 }
 
-static void apple_smc_notice_on(struct apple_smc *smc)
+/* Returns whether MBSW was read. */
+static bool apple_smc_notice_on(struct apple_smc *smc)
 {
 	u8 record[8] = {};
 	char names[128];
@@ -817,6 +818,8 @@ static void apple_smc_notice_on(struct apple_smc *smc)
 	apple_smc_wake_reason_names(smc->wake_record, names, sizeof(names));
 	dev_info(smc->dev, "wake record: MBSE %#x, MBSW %8ph%s%s\n", event, record,
 		 names[0] ? ": " : "", names);
+
+	return ret >= 0;
 }
 
 /* MBSW's bit for a wake reason, by its name, or -1. */
@@ -875,7 +878,10 @@ static bool apple_smc_port_reasons_only(u64 record)
 
 static void apple_smc_sleep_wake(struct apple_smc *smc)
 {
-	apple_smc_notice_on(smc);
+	/* Zero when nothing the SMC watches woke the AP: the PMU's RTC, for one. */
+	if (apple_smc_notice_on(smc))
+		apple_sleep_radio_at_wake(smc->wake_record &
+					  BIT_ULL(apple_smc_wake_reason_bit("wifibt")));
 	apple_smc_write_mbse(smc, SMC_KEY(waka));
 	smc->sleep_warned = false;
 	apple_smc_lid_wake(smc);

@@ -523,7 +523,8 @@ impl<B: Backend> Scheduler<B> {
         early: bool,
         publication: Option<super::completion::PreparedPublication>,
     ) -> Result<Fences> {
-        super::trace::schedule(&packet, 0, dependencies.len() as i32);
+        let dependency_count = dependencies.len();
+        super::trace::schedule(&packet, 0, dependency_count as i32);
         let completed = packet.completion.fence();
         let host_timestamps = packet.completion.has_timestamps();
         // Only commands which actually write timestamps become host-prefix
@@ -561,7 +562,15 @@ impl<B: Backend> Scheduler<B> {
         // All fallible scheduler setup precedes early hardware publication. The
         // scheduler still owns watchdog, credits and cancellation after push.
         let inline = early && self.backend.try_early(&packet);
-        super::trace::schedule(&packet, if inline { 1 } else { 2 }, 0);
+        // Why a command was queued instead of published inline (phase 2).
+        let queued_reason = if dependency_count != 0 {
+            2
+        } else if early {
+            3
+        } else {
+            0
+        };
+        super::trace::schedule(&packet, if inline { 1 } else { 2 }, queued_reason);
         if !inline {
             if packet.completion.needs_source_ready() {
                 packet.completion.set_source_ready(ready.clone());

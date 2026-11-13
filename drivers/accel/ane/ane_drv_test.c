@@ -101,23 +101,26 @@ static struct kunit_suite ane_submit_test_suite = {
 struct ane_recoverable_case {
 	const char *desc;
 	bool tm_retention;
-	bool probation;
+	unsigned int unproven;
 	int err;
 	u32 finished;
 	bool recoverable;
 };
 
 static const struct ane_recoverable_case ane_recoverable_cases[] = {
-	{ "T8103 timeout without events", false, false, -ETIMEDOUT, 0, true },
-	{ "T8103 timeout without events after a recovery", false, true,
+	{ "T8103 timeout without events", false, 0, -ETIMEDOUT, 0, true },
+	{ "T8103 timeout without events after a recovery", false, 1,
 	  -ETIMEDOUT, 0, false },
-	{ "T600x timeout without events", true, false, -ETIMEDOUT, 0, false },
-	{ "T600x timeout after a recovery", true, true, -ETIMEDOUT, 0, false },
-	{ "T600x timeout with one finish line", true, false, -ETIMEDOUT, 1,
-	  true },
-	{ "T600x task error with one finish line", true, false, -EIO, 1, true },
-	{ "T600x bad event count", true, false, -EIO, 0, true },
-	{ "T600x task error after a recovery", true, true, -EIO, 2, true },
+	{ "T600x timeout without events", true, 0, -ETIMEDOUT, 0, true },
+	{ "T600x timeout after a recovery", true, 1, -ETIMEDOUT, 0, true },
+	{ "T600x timeout, last recovery allowed", true,
+	  ANE_TM_RECOVERIES_MAX - 1, -ETIMEDOUT, 0, true },
+	{ "T600x timeout, too many recoveries in a row", true,
+	  ANE_TM_RECOVERIES_MAX, -ETIMEDOUT, 0, false },
+	{ "T600x timeout with one finish line", true, 0, -ETIMEDOUT, 1, true },
+	{ "T600x task error with one finish line", true, 0, -EIO, 1, true },
+	{ "T600x bad event count", true, 0, -EIO, 0, true },
+	{ "T600x task error after a recovery", true, 1, -EIO, 2, true },
 };
 
 KUNIT_ARRAY_PARAM_DESC(ane_recoverable, ane_recoverable_cases, desc);
@@ -127,7 +130,7 @@ static void ane_recoverable_test(struct kunit *test)
 	const struct ane_recoverable_case *c = test->param_value;
 
 	KUNIT_EXPECT_EQ(test, ane_tm_failure_recoverable(c->tm_retention,
-							 c->probation, c->err,
+							 c->unproven, c->err,
 							 c->finished),
 			c->recoverable);
 }

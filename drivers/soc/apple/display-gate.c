@@ -2287,9 +2287,42 @@ static bool staged_is_route_path(const char *path)
 	return strstr(path, "/typec-routes/");
 }
 
+/*
+ * J614s HDMI: its ADT has no dcpext0 and its DISPEXT0 power states are
+ * virtual, so the J616s chain above must never be powered there. HDMI is
+ * dcpext2 instead (t6040-j614s-extdisp-hdmi.dtsi): the same ATC3 PHY,
+ * crossbar and converter, behind the DISPEXT2 block. As the J616s dcpext0,
+ * it also has a route to every Type-C port, so two USB-C displays use
+ * dcpext1 and dcpext2.
+ */
+static const char *const t6041_j614s_hdmi_nodes[] = {
+	/* ATC3 power, PMP DISPEXT2 request, FAB7_SOC, DISPEXT2, AOP pins, PHY, crossbar, DARTs, mailbox, routes, dcpext2 */
+	"/power-management@502800000/power-controller@408",
+	"/power-management@508300000/power-controller@e0",
+	"/power-management@508300000/power-controller@168",
+	"/power-management@508300000/power-controller@b8",
+	"/power-management@508300000/power-controller@148",
+	"/pmp-report@5003c0000/report@13",
+	"/power-management@502800000/power-controller@488",
+	"/power-management@502800000/power-controller@4e0",
+	"/power-management@502800000/power-controller@4e8",
+	"/pinctrl@510824000",
+	"/mailbox@39b148000",
+	"/phy@39aa90000",
+	"/mux@39b24c000",
+	"/iommu@606340000",
+	"/iommu@606300000",
+	"/mailbox@606e08000",
+	"/dcp@606e00000/typec-routes/route@0",
+	"/dcp@606e00000/typec-routes/route@1",
+	"/dcp@606e00000/typec-routes/route@2",
+	"/dcp@606e00000",
+};
+
 enum { STAGED_HDMI, STAGED_USBC };
 
-static const struct gate_staged t6041_stages[] = {
+/* The J614s HDMI stage replaces the J616s one in gate_t6041_staged(). */
+static struct gate_staged t6041_stages[] = {
 	[STAGED_HDMI] = { "/iommu@3a2300000", t6041_hdmi_nodes, ARRAY_SIZE(t6041_hdmi_nodes) },
 	[STAGED_USBC] = { "/iommu@602300000", t6041_usbc_nodes, ARRAY_SIZE(t6041_usbc_nodes) },
 };
@@ -2309,10 +2342,10 @@ static bool staged_stage_on(unsigned int i)
 }
 
 /*
- * dcpext0's Type-C routes (the HDMI processor's hybrid DP outputs) switch the
- * Type-C crossbars, which are the USB-C chain's. Without that chain they stay
- * disabled and dcpext0 drives HDMI only; the crossbars are enabled for it,
- * as its mux-controls name them.
+ * The HDMI processor's Type-C routes (dcpext0's, or J614s's dcpext2's hybrid
+ * DP outputs) switch the Type-C crossbars, which are the USB-C chain's.
+ * Without that chain they stay disabled and the processor drives HDMI only;
+ * the crossbars are enabled for it, as its mux-controls name them.
  */
 static const char *const t6041_hdmi_only_muxes[] = {
 	"/mux@38324c000",
@@ -2428,6 +2461,7 @@ static int staged_apply(const struct gate_staged *st, struct device_node *displa
 		ret = np ? of_changeset_update_prop_string(cs, np, "status", "okay") : -ENODEV;
 		of_node_put(np);
 	}
+	/* The Type-C crossbars the HDMI processor's mux-controls name. */
 	for (i = 0; !ret && st == &t6041_stages[STAGED_HDMI] && !staged_stage_on(STAGED_USBC) &&
 		    i < ARRAY_SIZE(t6041_hdmi_only_muxes); i++) {
 		np = of_find_node_by_path(t6041_hdmi_only_muxes[i]);
@@ -2982,6 +3016,11 @@ static void __init gate_t6041_staged(void)
 	int ret;
 
 	staged_prefix = gate_soc->prefix;
+
+	if (of_machine_is_compatible("apple,j614s"))
+		t6041_stages[STAGED_HDMI] = (struct gate_staged){
+			"/iommu@606300000", t6041_j614s_hdmi_nodes,
+			ARRAY_SIZE(t6041_j614s_hdmi_nodes) };
 
 	/*
 	 * Each chain must be all there and disabled, with firmware memory,

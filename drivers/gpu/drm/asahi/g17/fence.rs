@@ -273,6 +273,7 @@ impl Submission {
             } else {
                 self.release_state();
             }
+            super::trace::output(fence, error);
             if fence.scoped {
                 signal_exported(fence);
             } else {
@@ -293,7 +294,7 @@ impl Aggregate {
             .as_ref()
             .expect("published aggregate has submission state")
     }
-    fn fence(&self) -> Fence {
+    pub(crate) fn fence(&self) -> Fence {
         Fence::from_fence(&self.0)
     }
     pub(crate) fn member(&self) -> Member {
@@ -505,6 +506,13 @@ impl Outputs {
     pub(crate) fn inputs(&self) -> &[SyncItem] {
         &self.syncs[..self.input_count]
     }
+    /// The fence installed, or about to be installed on error, in every output sync.
+    pub(crate) fn output_fence(&self) -> Option<Fence> {
+        self.submission
+            .as_ref()
+            .map(Aggregate::fence)
+            .or_else(|| self.fallback.as_ref().map(|fence| Fence::from_fence(fence)))
+    }
     pub(crate) fn publish(
         &mut self,
         context: Arc<Context>,
@@ -550,6 +558,10 @@ impl Drop for Outputs {
                     &Fence::from_fence(&fallback),
                 );
             }
+            super::trace::output(
+                &fallback,
+                self.result.as_ref().err().map_or(0, |error| error.to_errno()),
+            );
             fallback.signal();
             unwaited(&fallback.waited);
         }

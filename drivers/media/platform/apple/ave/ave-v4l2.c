@@ -18,6 +18,7 @@
 #include <media/v4l2-mem2mem.h>
 #include <media/videobuf2-dma-contig.h>
 
+#include "../apple-video-nr.h"
 #include "ave.h"
 #include "ave-regs.h"
 
@@ -1464,7 +1465,7 @@ int ave_v4l2_register(struct ave_dev *ave)
 	vdev->device_caps = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING;
 	video_set_drvdata(vdev, ave);
 
-	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
+	ret = video_register_device(vdev, VFL_TYPE_VIDEO, APPLE_M2M_VIDEO_NR);
 	if (ret)
 		goto err_m2m;
 	ret = ave_mctf_register(ave);

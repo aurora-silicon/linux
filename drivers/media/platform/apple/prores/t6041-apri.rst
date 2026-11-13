@@ -55,3 +55,12 @@ continues with the common T6000/T8140 initialization sequence.
 The container deliberately has no MMIO addresses, selectors, power policy,
 or arbitrary write commands.  File integrity is the responsibility of the
 package that installs the per-Mac file.
+
+T6050
+=====
+
+``apple/prores-t6050-init.bin`` is the same container with ``soc = 0x6050``,
+``block_count = 4`` and a fourth block, SCODEC control (ID 4, 12 entries,
+offsets below ``0x4000``): 2,880 bytes in all.  The driver has no built-in
+T6050 rows, so that engine probes only with the file.  The control rows are
+applied after the system rows and before the core rows.

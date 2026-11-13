@@ -34,7 +34,7 @@ def parking(root):
     parts.append(r'''
 struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
-    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables;
+    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
     struct { void *usb3_dp; } tunables;
     /* A sleep took the USB host's domains down; never set here. */
     bool sleep_dead;
@@ -1928,7 +1928,7 @@ def pipe(root):
     parts.append(r'''
 struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
-    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables;
+    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
     struct { void *usb3_dp; } tunables;
 
     bool dp_only, pd_was_off, tunnel_clock_on;
@@ -2326,7 +2326,7 @@ def unwind(root):
     parts.append(r'''
 struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
-    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables;
+    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
     struct { void *usb3_dp; } tunables;
 
     bool dp_only, pd_was_off, tunnel_clock_on;
@@ -2646,7 +2646,7 @@ typedef uint32_t u32;
 #define BIT(n) (1U << (n))
 struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
-    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables;
+    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
     struct { void *usb3_dp; } tunables;
 
     bool dp_only, pd_was_off, tunnel_clock_on;

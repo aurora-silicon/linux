@@ -100,6 +100,11 @@
 	dma-names = "dma", "spkr", "sense", "cout", "cin";
 };
 
+/* The sensor is on the logic board, in the base. */
+&aop_accel {
+	label = "accel-base";
+};
+
 &fpwm1 {
 	status = "okay";
 };

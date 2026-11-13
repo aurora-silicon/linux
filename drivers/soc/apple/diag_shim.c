@@ -108,6 +108,8 @@ static struct {
 
 	atomic_t os_identity;
 	atomic_t hwrng;
+	atomic_t stac;
+	atomic_t stac_onlines;
 	atomic_t xarm_failures;
 	atomic_t unhandled;
 	atomic_t sleeps;
@@ -534,6 +536,37 @@ static ssize_t hwrng_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(hwrng);
 
+static ssize_t stac_show(struct device *dev, struct device_attribute *attr,
+			 char *buf)
+{
+	const char *state;
+
+	switch (atomic_read(&sep_diag.stac)) {
+	case SEP_DIAG_STAC_ONLINE:
+		state = "online";
+		break;
+	case SEP_DIAG_STAC_ABSENT:
+		state = "absent";
+		break;
+	case SEP_DIAG_STAC_FAILED:
+		state = "failed";
+		break;
+	default:
+		state = "pending";
+		break;
+	}
+	return sysfs_emit(buf, "%s\n", state);
+}
+static DEVICE_ATTR_RO(stac);
+
+static ssize_t stac_onlines_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n",
+			  (unsigned int)atomic_read(&sep_diag.stac_onlines));
+}
+static DEVICE_ATTR_RO(stac_onlines);
+
 static ssize_t xarm_failures_show(struct device *dev,
 				  struct device_attribute *attr, char *buf)
 {
@@ -589,6 +622,8 @@ static struct attribute *sep_diag_attrs[] = {
 	&dev_attr_endpoint_names.attr,
 	&dev_attr_os_identity.attr,
 	&dev_attr_hwrng.attr,
+	&dev_attr_stac.attr,
+	&dev_attr_stac_onlines.attr,
 	&dev_attr_xarm_failures.attr,
 	&dev_attr_unhandled_messages.attr,
 	&dev_attr_sleeps.attr,
@@ -648,6 +683,13 @@ void sep_diag_set_hwrng(bool registered)
 {
 	atomic_set(&sep_diag.hwrng, registered ? SEP_DIAG_HWRNG_REGISTERED :
 						 SEP_DIAG_HWRNG_FAILED);
+}
+
+void sep_diag_set_stac(int state)
+{
+	if (state == SEP_DIAG_STAC_ONLINE)
+		atomic_inc(&sep_diag.stac_onlines);
+	atomic_set(&sep_diag.stac, state);
 }
 
 unsigned int sep_diag_xarm_failed(void)

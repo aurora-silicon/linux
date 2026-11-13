@@ -45,7 +45,7 @@ properties:
     maxItems: 6
 
   iommus:
-    maxItems: 3
+    maxItems: 2
 
   power-domains:
     minItems: 1

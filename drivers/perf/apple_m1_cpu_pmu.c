@@ -213,6 +213,66 @@ static unsigned long m4_pmu_event_affinity(unsigned int event)
 	}
 }
 
+/*
+ * The T6050 (M5 Pro and M5 Max) cores use the M4 counter layout and 16-bit
+ * event fields, with their own event numbers, which macOS's event database
+ * for the CPU lists. Counters 2-9 all count; the retired-instruction events
+ * below only count on counters 2-7, or only on counter 7.
+ */
+enum t6050_pmu_events {
+	T6050_PMU_PERFCTR_INST_ALL			= 0x008,
+	T6050_PMU_PERFCTR_CORE_ACTIVE_CYCLE		= 0x011,
+	T6050_PMU_PERFCTR_INST_BRANCH			= 0x021,
+	T6050_PMU_PERFCTR_BRANCH_MISPRED_NONSPEC	= 0x022,
+	T6050_PMU_PERFCTR_L1D_CACHE_MISS_LD		= 0x5a3,
+	T6050_PMU_PERFCTR_INST_INT_LD			= 0x895,
+};
+
+#define T6050_PMU_CNTR_MASK		GENMASK(9, 0)
+#define T6050_PMU_CNTR_EVT		GENMASK(9, 2)
+
+static const u16 t6050_pmu_pmc2_7_events[] = {
+	0x008, 0x021, 0x022, 0x03a, 0x88e, 0x88f, 0x890, 0x891, 0x893, 0x894,
+	0x895, 0x896, 0x898, 0x899, 0x89c, 0x8a0, 0x8a1, 0x8a2, 0x8a3, 0x8af,
+	0x8b0, 0x8b1, 0x8b2, 0x8b3, 0x8b4, 0x8b9, 0x8ba, 0x8bf, 0x8c0, 0x8c1,
+	0x8c4, 0x8c5, 0x8c6, 0x8c7, 0x8c8, 0x8ca,
+};
+
+static const u16 t6050_pmu_pmc7_events[] = {
+	0x897, 0x89a, 0x89b, 0x89f, 0x8a4,
+};
+
+static bool t6050_pmu_event_in(const u16 *list, size_t n, unsigned int event)
+{
+	for (size_t i = 0; i < n; i++)
+		if (list[i] == event)
+			return true;
+	return false;
+}
+
+static unsigned long t6050_pmu_event_affinity(unsigned int event)
+{
+	if (event == T6050_PMU_PERFCTR_CORE_ACTIVE_CYCLE)
+		return BIT(0) | T6050_PMU_CNTR_EVT;
+	if (event == T6050_PMU_PERFCTR_INST_ALL)
+		return BIT(1) | M4_PMU_CNTR_EVT;
+	if (t6050_pmu_event_in(t6050_pmu_pmc7_events,
+			       ARRAY_SIZE(t6050_pmu_pmc7_events), event))
+		return BIT(7);
+	if (t6050_pmu_event_in(t6050_pmu_pmc2_7_events,
+			       ARRAY_SIZE(t6050_pmu_pmc2_7_events), event))
+		return M4_PMU_CNTR_EVT;
+	return T6050_PMU_CNTR_EVT;
+}
+
+static const unsigned int t6050_pmu_perf_map[PERF_COUNT_HW_MAX] = {
+	PERF_MAP_ALL_UNSUPPORTED,
+	[PERF_COUNT_HW_CPU_CYCLES]		= T6050_PMU_PERFCTR_CORE_ACTIVE_CYCLE,
+	[PERF_COUNT_HW_INSTRUCTIONS]		= T6050_PMU_PERFCTR_INST_ALL,
+	[PERF_COUNT_HW_BRANCH_INSTRUCTIONS]	= T6050_PMU_PERFCTR_INST_BRANCH,
+	[PERF_COUNT_HW_BRANCH_MISSES]		= T6050_PMU_PERFCTR_BRANCH_MISPRED_NONSPEC,
+};
+
 static const unsigned int m4_pmu_perf_map[PERF_COUNT_HW_MAX] = {
 	PERF_MAP_ALL_UNSUPPORTED,
 	[PERF_COUNT_HW_CPU_CYCLES]		= M4_PMU_PERFCTR_CORE_ACTIVE_CYCLE,
@@ -248,6 +308,17 @@ static const u16 m4_pmu_pmceid_map[ARMV8_PMUV3_MAX_COMMON_EVENTS] = {
 	M4_PMUV3_EVENT_MAP(INST_RETIRED,	INST_ALL),
 	M4_PMUV3_EVENT_MAP(CPU_CYCLES,		CORE_ACTIVE_CYCLE),
 	M4_PMUV3_EVENT_MAP(BR_RETIRED,		INST_BRANCH),
+};
+
+#define T6050_PMUV3_EVENT_MAP(pmuv3_event, t6050_event)			\
+	[ARMV8_PMUV3_PERFCTR_##pmuv3_event]	= T6050_PMU_PERFCTR_##t6050_event
+
+static const u16 t6050_pmu_pmceid_map[ARMV8_PMUV3_MAX_COMMON_EVENTS] = {
+	[0 ... ARMV8_PMUV3_MAX_COMMON_EVENTS - 1]	= HW_OP_UNSUPPORTED,
+	T6050_PMUV3_EVENT_MAP(INST_RETIRED,		INST_ALL),
+	T6050_PMUV3_EVENT_MAP(CPU_CYCLES,		CORE_ACTIVE_CYCLE),
+	T6050_PMUV3_EVENT_MAP(BR_RETIRED,		INST_BRANCH),
+	T6050_PMUV3_EVENT_MAP(BR_MIS_PRED_RETIRED,	BRANCH_MISPRED_NONSPEC),
 };
 
 /* sysfs definitions */
@@ -289,6 +360,21 @@ static struct attribute *m4_pmu_event_attrs[] = {
 static const struct attribute_group m4_pmu_events_attr_group = {
 	.name = "events",
 	.attrs = m4_pmu_event_attrs,
+};
+
+static struct attribute *t6050_pmu_event_attrs[] = {
+	M1_PMU_EVENT_ATTR(cycles, T6050_PMU_PERFCTR_CORE_ACTIVE_CYCLE),
+	M1_PMU_EVENT_ATTR(instructions, T6050_PMU_PERFCTR_INST_ALL),
+	M1_PMU_EVENT_ATTR(branches, T6050_PMU_PERFCTR_INST_BRANCH),
+	M1_PMU_EVENT_ATTR(branch-misses, T6050_PMU_PERFCTR_BRANCH_MISPRED_NONSPEC),
+	M1_PMU_EVENT_ATTR(l1d-load-misses, T6050_PMU_PERFCTR_L1D_CACHE_MISS_LD),
+	M1_PMU_EVENT_ATTR(loads, T6050_PMU_PERFCTR_INST_INT_LD),
+	NULL,
+};
+
+static const struct attribute_group t6050_pmu_events_attr_group = {
+	.name = "events",
+	.attrs = t6050_pmu_event_attrs,
 };
 
 PMU_FORMAT_ATTR(event, "config:0-7");
@@ -659,6 +745,14 @@ static int m4_pmu_get_event_idx(struct pmu_hw_events *cpuc,
 	return __m1_pmu_get_event_idx(cpuc, m4_pmu_event_affinity(evtype));
 }
 
+static int t6050_pmu_get_event_idx(struct pmu_hw_events *cpuc,
+				   struct perf_event *event)
+{
+	unsigned int evtype = event->hw.config_base & M4_PMU_CFG_EVENT;
+
+	return __m1_pmu_get_event_idx(cpuc, t6050_pmu_event_affinity(evtype));
+}
+
 static void m1_pmu_clear_event_idx(struct pmu_hw_events *cpuc,
 				   struct perf_event *event)
 {
@@ -715,6 +809,12 @@ static int m4_pmu_map_event(struct perf_event *event)
 	return armpmu_map_event(event, &m4_pmu_perf_map, NULL, M4_PMU_CFG_EVENT);
 }
 
+static int t6050_pmu_map_event(struct perf_event *event)
+{
+	event->hw.flags |= ARMPMU_EVT_63BIT;
+	return armpmu_map_event(event, &t6050_pmu_perf_map, NULL, M4_PMU_CFG_EVENT);
+}
+
 static int __m1_pmu_map_pmuv3_event(const u16 *map, unsigned int eventsel)
 {
 	u16 event = HW_OP_UNSUPPORTED;
@@ -733,6 +833,11 @@ static int m1_pmu_map_pmuv3_event(unsigned int eventsel)
 static int m4_pmu_map_pmuv3_event(unsigned int eventsel)
 {
 	return __m1_pmu_map_pmuv3_event(m4_pmu_pmceid_map, eventsel);
+}
+
+static int t6050_pmu_map_pmuv3_event(unsigned int eventsel)
+{
+	return __m1_pmu_map_pmuv3_event(t6050_pmu_pmceid_map, eventsel);
 }
 
 static void m1_pmu_init_pmceid(struct arm_pmu *pmu)
@@ -867,6 +972,26 @@ static int m4_pmu_t6040_init(struct arm_pmu *cpu_pmu)
 	return m4_pmu_init(cpu_pmu);
 }
 
+static int t6050_pmu_init(struct arm_pmu *cpu_pmu)
+{
+	int ret;
+
+	ret = m4_pmu_init(cpu_pmu);
+	if (ret)
+		return ret;
+
+	cpu_pmu->name		  = "apple_t6050_pmu";
+	cpu_pmu->map_event	  = t6050_pmu_map_event;
+	cpu_pmu->get_event_idx	  = t6050_pmu_get_event_idx;
+	cpu_pmu->map_pmuv3_event  = t6050_pmu_map_pmuv3_event;
+	m1_pmu_init_pmceid(cpu_pmu);
+
+	bitmap_zero(cpu_pmu->cntr_mask, ARMPMU_MAX_HWEVENTS);
+	bitmap_from_u64(cpu_pmu->cntr_mask, T6050_PMU_CNTR_MASK);
+	cpu_pmu->attr_groups[ARMPMU_ATTR_GROUP_EVENTS] = &t6050_pmu_events_attr_group;
+	return 0;
+}
+
 static int m4_pmu_t8140_init(struct arm_pmu *cpu_pmu)
 {
 	cpu_pmu->name = "apple_t8140_pmu";
@@ -876,6 +1001,7 @@ static int m4_pmu_t8140_init(struct arm_pmu *cpu_pmu)
 static const struct of_device_id m1_pmu_of_device_ids[] = {
 	{ .compatible = "apple,t8140-pmu",	.data = m4_pmu_t8140_init, },
 	{ .compatible = "apple,t6040-pmu",	.data = m4_pmu_t6040_init, },
+	{ .compatible = "apple,t6050-pmu",	.data = t6050_pmu_init, },
 	{ .compatible = "apple,avalanche-pmu",	.data = m2_pmu_avalanche_init, },
 	{ .compatible = "apple,blizzard-pmu",	.data = m2_pmu_blizzard_init, },
 	{ .compatible = "apple,icestorm-pmu",	.data = m1_pmu_ice_init, },

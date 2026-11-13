@@ -2382,8 +2382,9 @@ impl HandoffFlush {
     }
 }
 
+/// Copies the DMA segments of `gem`, whose device mapping a caller's lease already admitted.
 fn prefetch_sgt_segments(dev: &device::Device<Bound>, gem: &gem::Object) -> Result<SgSegments> {
-    let sgt = crate::gem::held_sg_table(gem, dev)?;
+    let sgt = crate::gem::mapped_sg_table(gem, dev)?;
 
     let mut segments = KVVec::with_capacity(sgt.iter().size_hint().0, GFP_KERNEL)?;
     for sgt_entry in sgt.iter() {
@@ -2996,7 +2997,7 @@ impl Vm {
         self.wait_for_user_map_admission()?;
         // Pin and copy backing before taking BO or DMA reservation locks.
         let dev: &device::Device<device::Bound> = device.as_ref().as_ref();
-        let _bind_lease = crate::gem::held_sg_table(gem, dev)?.into_lease();
+        let _bind_lease = crate::gem::held_user_sg_table(gem, dev, prot)?.into_lease();
         let vm_bo = self
             .gpuvm
             .obtain(gem, pin_init!(VmBoData {

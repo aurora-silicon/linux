@@ -336,14 +336,14 @@ static void apr_test_output(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, apr_check_output(out, SZ_4K, &bytes), -EIO);
 }
 
-static const size_t apri_test_block_headers[APRI_BLOCK_COUNT] = {
+static const size_t apri_test_block_headers[APRI_T6041_BLOCKS] = {
 	[APRI_SYSTEM_BLOCK] = 16,
 	[APRI_CORE_BLOCK] = 16 + 8 + APRI_SYSTEM_COUNT * 12,
 	[APRI_WRAPPER_BLOCK] = 16 + 8 + APRI_SYSTEM_COUNT * 12 +
 			       8 + APRI_CORE_COUNT * 12,
 };
 
-static const size_t apri_test_entry_bases[APRI_BLOCK_COUNT] = {
+static const size_t apri_test_entry_bases[APRI_T6041_BLOCKS] = {
 	[APRI_SYSTEM_BLOCK] = 16 + 8,
 	[APRI_CORE_BLOCK] = 16 + 8 + APRI_SYSTEM_COUNT * 12 + 8,
 	[APRI_WRAPPER_BLOCK] = 16 + 8 + APRI_SYSTEM_COUNT * 12 +
@@ -352,7 +352,7 @@ static const size_t apri_test_entry_bases[APRI_BLOCK_COUNT] = {
 
 static void apri_test_build_fixture(u8 *data)
 {
-	static const u32 counts[APRI_BLOCK_COUNT] = {
+	static const u32 counts[APRI_T6041_BLOCKS] = {
 		[APRI_SYSTEM_BLOCK] = APRI_SYSTEM_COUNT,
 		[APRI_CORE_BLOCK] = APRI_CORE_COUNT,
 		[APRI_WRAPPER_BLOCK] = APRI_WRAPPER_COUNT,
@@ -363,8 +363,8 @@ static void apri_test_build_fixture(u8 *data)
 	memcpy(data, "APRI", 4);
 	put_unaligned_le32(1, data + 4);
 	put_unaligned_le32(0x6041, data + 8);
-	put_unaligned_le32(APRI_BLOCK_COUNT, data + 12);
-	for (block = 0; block < APRI_BLOCK_COUNT; block++) {
+	put_unaligned_le32(APRI_T6041_BLOCKS, data + 12);
+	for (block = 0; block < APRI_T6041_BLOCKS; block++) {
 		put_unaligned_le32(block + 1, data + apri_test_block_headers[block]);
 		put_unaligned_le32(counts[block], data + apri_test_block_headers[block] + 4);
 		for (entry = 0; entry < counts[block]; entry++) {
@@ -397,6 +397,49 @@ static void apr_test_apri_valid(struct kunit *test)
 	KUNIT_EXPECT_EQ(test,
 			init->blocks[APRI_WRAPPER_BLOCK].entries[61].offset,
 			(u32)61 * 4);
+}
+
+/* A T6050 container: T6041's three blocks, then the control block. */
+static void apr_test_apri_t6050(struct kunit *test)
+{
+	static const u32 counts[APRI_T6050_BLOCKS] = {
+		APRI_SYSTEM_COUNT, APRI_CORE_COUNT, APRI_WRAPPER_COUNT, APRI_CONTROL_COUNT,
+	};
+	struct apr_init_data *init = kunit_kzalloc(test, sizeof(*init), GFP_KERNEL);
+	u8 *data = kunit_kzalloc(test, APRI_T6050_FIRMWARE_SIZE, GFP_KERNEL);
+	size_t pos = 16;
+	u32 block, entry;
+
+	KUNIT_ASSERT_NOT_NULL(test, init);
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	memcpy(data, "APRI", 4);
+	put_unaligned_le32(1, data + 4);
+	put_unaligned_le32(0x6050, data + 8);
+	put_unaligned_le32(APRI_T6050_BLOCKS, data + 12);
+	for (block = 0; block < APRI_T6050_BLOCKS; block++) {
+		put_unaligned_le32(block + 1, data + pos);
+		put_unaligned_le32(counts[block], data + pos + 4);
+		pos += 8;
+		for (entry = 0; entry < counts[block]; entry++, pos += 12) {
+			put_unaligned_le32(entry * 4, data + pos);
+			put_unaligned_le32(0xffffffff, data + pos + 4);
+			put_unaligned_le32(entry, data + pos + 8);
+		}
+	}
+	KUNIT_ASSERT_EQ(test, pos, (size_t)APRI_T6050_FIRMWARE_SIZE);
+	KUNIT_EXPECT_EQ(test, apr_parse_init(&apri_t6050, data, pos, init), 0);
+	KUNIT_EXPECT_EQ(test, init->blocks[APRI_CONTROL_BLOCK].count,
+			(u32)APRI_CONTROL_COUNT);
+	KUNIT_EXPECT_EQ(test, init->blocks[APRI_CONTROL_BLOCK].entries[11].offset,
+			(u32)11 * 4);
+	/* Neither SoC takes the other's container. */
+	KUNIT_EXPECT_EQ(test, apr_parse_init(&apri_t6041, data, pos, init), -EINVAL);
+	put_unaligned_le32(0x6041, data + 8);
+	KUNIT_EXPECT_EQ(test, apr_parse_init(&apri_t6050, data, pos, init), -EINVAL);
+	put_unaligned_le32(0x6050, data + 8);
+	/* A control row past its window. */
+	put_unaligned_le32(0x4000, data + pos - 12);
+	KUNIT_EXPECT_EQ(test, apr_parse_init(&apri_t6050, data, pos, init), -EINVAL);
 }
 
 static void apri_test_expect_rejected(struct kunit *test, const u8 *data,
@@ -490,6 +533,7 @@ static struct kunit_case apr_test_cases[] = {
 	KUNIT_CASE(apr_test_slices),
 	KUNIT_CASE(apr_test_output),
 	KUNIT_CASE(apr_test_apri_valid),
+	KUNIT_CASE(apr_test_apri_t6050),
 	KUNIT_CASE(apr_test_apri_header_rejects),
 	KUNIT_CASE(apr_test_apri_shape_rejects),
 	KUNIT_CASE(apr_test_apri_row_rejects),

@@ -38,6 +38,7 @@ mod sensor;
 mod shim;
 mod shmem;
 mod sks;
+mod stac;
 mod store;
 mod transfer;
 mod trusted;
@@ -116,6 +117,11 @@ static_assert!(VERIFY_WORK_ID != 0);
 const LATE_ATTACH_WORK_ID: u64 = 4;
 static_assert!(LATE_ATTACH_WORK_ID != VERIFY_WORK_ID && LATE_ATTACH_WORK_ID != ENROL_WORK_ID);
 static_assert!(LATE_ATTACH_WORK_ID != SETTLE_WORK_ID && LATE_ATTACH_WORK_ID != 0);
+/// The trusted-accessory power-state report; see `stac`.
+const STAC_WORK_ID: u64 = 5;
+static_assert!(STAC_WORK_ID != LATE_ATTACH_WORK_ID && STAC_WORK_ID != VERIFY_WORK_ID);
+static_assert!(STAC_WORK_ID != ENROL_WORK_ID && STAC_WORK_ID != SETTLE_WORK_ID);
+static_assert!(STAC_WORK_ID != 0);
 
 // When an attach-time sensor bring-up falls short, one more round runs this
 // long after Touch ID was activated. A round that cannot run yet, because the
@@ -794,6 +800,18 @@ struct SepData {
 
     #[pin]
     ool_scrd: Mutex<Option<OolPair>>,
+
+    // The trusted-accessory endpoint (see `stac`): its buffers, its one
+    // exchange, and what discovery said about it.
+    #[pin]
+    ool_stac: Mutex<Option<OolPair>>,
+    #[pin]
+    stac_rx: Mutex<stac::Exchange>,
+    #[pin]
+    stac_wq: CondVar,
+    stac_named: Atomic<bool>,
+    stac_layout: Atomic<u32>,
+    stac_absent_logged: Atomic<bool>,
     #[pin]
     scrd_probe: Mutex<ScrdProbe>,
     #[pin]
@@ -966,12 +984,16 @@ struct SepData {
 
     #[pin]
     late_attach_work: DelayedWork<SepData, LATE_ATTACH_WORK_ID>,
+
+    #[pin]
+    stac_work: Work<SepData, STAC_WORK_ID>,
 }
 
 impl_has_work! {
     impl HasWork<Self, 0> for SepData { self.rx_work }
     impl HasWork<Self, ENROL_WORK_ID> for SepData { self.enrol_work }
     impl HasWork<Self, VERIFY_WORK_ID> for SepData { self.verify_work }
+    impl HasWork<Self, STAC_WORK_ID> for SepData { self.stac_work }
 }
 
 impl_has_delayed_work! {
@@ -1015,6 +1037,12 @@ impl SepData {
             proto::EP_SCRD,
             OOL_SIZE_SCRD,
             (OOL_SIZE_SCRD, OOL_SIZE_SCRD),
+        )?;
+        let ool_stac = Self::alloc_ool(
+            dev,
+            stac::EP_STAC,
+            stac::OOL_SIZE_STAC,
+            (stac::OOL_SIZE_STAC, stac::OOL_SIZE_STAC),
         )?;
         let dma_ring = dma::Coherent::<u8>::zeroed_slice(dev, DMA_RING_SIZE, GFP_KERNEL)?;
 
@@ -1172,6 +1200,12 @@ impl SepData {
                 ool_scrd <- new_mutex!(Some(ool_scrd)),
                 scrd_probe <- new_mutex!(ScrdProbe::new()),
                 scrd_wq <- new_condvar!("SepData::scrd_wq"),
+                ool_stac <- new_mutex!(Some(ool_stac)),
+                stac_rx <- new_mutex!(stac::Exchange::new()),
+                stac_wq <- new_condvar!("SepData::stac_wq"),
+                stac_named: Atomic::new(false),
+                stac_layout: Atomic::new(0),
+                stac_absent_logged: Atomic::new(false),
                 dma_ring <- new_mutex!(Some(dma_ring)),
                 sbio_exchange_lock <- new_mutex!(()),
                 sbio_rx <- new_mutex!(transfer::Reassembly::new()),
@@ -1229,6 +1263,7 @@ impl SepData {
                 verify_work <- new_work!("SepData::verify_work"),
                 settle_work <- new_delayed_work!("SepData::settle_work"),
                 late_attach_work <- new_delayed_work!("SepData::late_attach_work"),
+                stac_work <- new_work!("SepData::stac_work"),
             }),
             GFP_KERNEL,
         )
@@ -1538,7 +1573,8 @@ impl SepData {
 
     /// A refused precommit attempt was never sent; reopen normal admission.
     /// A sent request can be restarted only after actual physical sleep/wake.
-    pub(crate) fn sleep_exit(&self) {
+    /// Returns whether the enclave came back from a sleep it was told of.
+    pub(crate) fn sleep_exit(&self) -> bool {
         // Staged only: an unsent refusal releases RX without a restart.
         match pm::commit_finish(&self.dev) {
             Some(true) => self.set_sleep_gate(pm::SleepGate::Told),
@@ -1548,21 +1584,21 @@ impl SepData {
         let gate = self.sleep_gate();
         if gate == pm::SleepGate::Draining {
             self.set_sleep_gate(pm::SleepGate::Open);
-            return;
+            return false;
         }
         if !gate.needs_wake() {
-            return;
+            return false;
         }
         // SAFETY: only reads a flag.
         let real = unsafe { bindings::pm_resume_via_firmware() };
         if !real && gate == pm::SleepGate::Lost {
-            return;
+            return false;
         }
         if !real {
             // commit_finish already terminates a current sent-without-sleep case.
             // An old lost state must not cause mailbox or DART accesses here.
             self.set_sleep_gate(pm::SleepGate::Lost);
-            return;
+            return false;
         }
         let answered = self.sleep_kick();
         match answered {
@@ -1570,6 +1606,7 @@ impl SepData {
                 self.set_sleep_gate(pm::SleepGate::Open);
                 // One line per sleep it was told of: nothing else says it came back.
                 dev_info_ratelimited!(self.dev, "the enclave is back from its sleep request\n");
+                true
             }
             Err(e) => {
                 dev_err_ratelimited!(
@@ -1579,6 +1616,7 @@ impl SepData {
                 );
                 self.sleep_hold_rx();
                 self.set_sleep_gate(pm::SleepGate::Lost);
+                false
             }
         }
     }
@@ -2875,6 +2913,8 @@ impl SepData {
         }
         diag::log_summary(&this.dev);
         this.finish_bringup();
+        // As macOS does once the enclave is up.
+        Self::queue_stac_online(this.clone());
         Self::arm_settle(this);
     }
 
@@ -3010,6 +3050,8 @@ impl SepData {
 
             proto::EP_SCRD => self.on_scrd(msg),
 
+            stac::EP_STAC => self.on_stac(msg),
+
             proto::EP_BOOT => self.on_boot(msg),
 
             ep => {
@@ -3055,6 +3097,7 @@ impl SepData {
         match f.ty {
             proto::DISCOVER_TYPE_DESCRIPTOR | proto::DISCOVER_TYPE_CONFIG => {
                 let _ = table.slot(f.param);
+                self.stac_discovered(&f);
                 diag::endpoints(table.eps.len());
                 if f.ty == proto::DISCOVER_TYPE_DESCRIPTOR {
                     diag::endpoint(f.param, (msg.msg0 >> 32) as u32);
@@ -3108,18 +3151,20 @@ impl SepData {
         self.sbio_wq.notify_all();
         self.sks_wq.notify_all();
         self.scrd_wq.notify_all();
+        self.stac_wq.notify_all();
         if let Some(mut handle) = self.rng.lock().take() {
             handle.unregister();
         }
 
         *self.mbox.lock() = None;
 
-        // SAFETY: all five pointers refer to pinned work fields in `self`.
+        // SAFETY: all six pointers refer to pinned work fields in `self`.
         // Shutdown blocks requeueing, and the mailbox can no longer add work.
         unsafe {
             sep_cancel_work_sync(Work::raw_get(core::ptr::addr_of!(self.rx_work)).cast());
             sep_cancel_work_sync(Work::raw_get(core::ptr::addr_of!(self.enrol_work)).cast());
             sep_cancel_work_sync(Work::raw_get(core::ptr::addr_of!(self.verify_work)).cast());
+            sep_cancel_work_sync(Work::raw_get(core::ptr::addr_of!(self.stac_work)).cast());
             sep_cancel_delayed_work_sync(
                 DelayedWork::raw_as_work(core::ptr::addr_of!(self.settle_work)).cast(),
             );
@@ -3141,6 +3186,7 @@ impl SepData {
             &self.ool_sbio,
             &self.ool_sks,
             &self.ool_scrd,
+            &self.ool_stac,
         ] {
             if let Some(buffers) = slot.lock().take() {
                 if buffers.registered {
@@ -3329,6 +3375,14 @@ impl WorkItem<LATE_ATTACH_WORK_ID> for SepData {
 
     fn run(this: Arc<SepData>) {
         SepData::run_late_attach(&this);
+    }
+}
+
+impl WorkItem<STAC_WORK_ID> for SepData {
+    type Pointer = Arc<SepData>;
+
+    fn run(this: Arc<SepData>) {
+        this.run_stac_online();
     }
 }
 

@@ -118,13 +118,14 @@ ATC_RPM = ('atcphy_rpm_get', 'atcphy_rpm_busy', 'atcphy_rpm_sync', 'atcphy_rpm_p
 
 
 def atc_cio_helpers(source):
-    """The PIPE backend of a mode, which T8132 CIO keeps on the dummy one.
+    """The PIPE backend of a mode, which T8132 CIO keeps on the dummy one, and
+    whether a T8132 port is wired for DP alt mode.
 
-    The mux and PIPE functions call these; older sources have neither: ''.
+    The mux and PIPE functions call these; older sources have none: ''.
     """
     result = ''
     for name in ('atcphy_mode_is_cio', 'atcphy_pipe_state_for',
-                 'atcphy_usb2_sig_host'):
+                 'atcphy_usb2_sig_host', 'atcphy_t8132_dp_on'):
         marker = re.search(r'^static [^;{}()]+\b' + name + r'\([^;{}]*\)\s*\{', source, re.M)
         if marker:
             helper = block(source, marker.start())

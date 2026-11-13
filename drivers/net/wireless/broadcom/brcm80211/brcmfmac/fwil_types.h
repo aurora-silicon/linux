@@ -312,6 +312,51 @@ struct brcmf_pkt_filter_le {
 	} u;
 };
 
+/* Filter type 2: every element of a pattern list must match. */
+#define BRCMF_PKT_FILTER_TYPE_PATTERN_LIST	2
+
+/* Where a pattern-list element's offset counts from. */
+enum brcmf_pkt_filter_base {
+	BRCMF_PKT_FILTER_BASE_PKT,
+	BRCMF_PKT_FILTER_BASE_END,
+	BRCMF_PKT_FILTER_BASE_D11_H,
+	BRCMF_PKT_FILTER_BASE_D11_D,
+	BRCMF_PKT_FILTER_BASE_ETH_H,
+	BRCMF_PKT_FILTER_BASE_ETH_D,
+	BRCMF_PKT_FILTER_BASE_ARP_H,
+	BRCMF_PKT_FILTER_BASE_ARP_D,
+	BRCMF_PKT_FILTER_BASE_IP4_H,
+	BRCMF_PKT_FILTER_BASE_IP4_D,
+	BRCMF_PKT_FILTER_BASE_IP6_H,
+	BRCMF_PKT_FILTER_BASE_IP6_D,
+	BRCMF_PKT_FILTER_BASE_TCP_H,
+	BRCMF_PKT_FILTER_BASE_TCP_D,
+	BRCMF_PKT_FILTER_BASE_UDP_H,
+	BRCMF_PKT_FILTER_BASE_UDP_D,
+};
+
+/* The element matches when its masked bytes differ from the pattern. */
+#define BRCMF_PKT_FILTER_MFLAG_NEG	0x0001
+
+/* One element of a type 2 filter; size_bytes mask bytes, then the pattern. */
+struct brcmf_pkt_filter_listel_le {
+	__le16 rel_offs;
+	__le16 base_offs;
+	__le16 size_bytes;
+	__le16 match_flags;
+	u8 mask_and_data[];
+} __packed;
+
+/* Type 2 filter body, after id/type/negate_match; totsize counts this
+ * header and every element, packed back to back.
+ */
+struct brcmf_pkt_filter_list_le {
+	u8 list_cnt;
+	u8 pad;
+	__le16 totsize;
+	u8 elements[];
+} __packed;
+
 /* IOVAR "pkt_filter_enable" parameter. */
 struct brcmf_pkt_filter_enable_le {
 	__le32 id;		/* Unique filter id */

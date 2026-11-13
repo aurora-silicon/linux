@@ -852,6 +852,10 @@ static void disable_work_sync(struct work_struct *w) { (void)w; }
 #endif
 /* Nor the desktop 26.6 firmware. */
 #define DCP_FIRMWARE_V_26_6_DESKTOP (DCP_FIRMWARE_H17P + 3)
+/* Nor firmware 27, which the catalogue helpers name for its externals' parse flags. */
+#ifndef DCP_FIRMWARE_V_27_0
+#define DCP_FIRMWARE_V_27_0 (DCP_FIRMWARE_H17P + 5)
+#endif
 #define DIV_ROUND_UP(n,d) (((n)+(d)-1)/(d))
 static void dcp_update_connector_dimensions(struct apple_dcp *d,struct drm_connector *c)
 { (void)c;assert(d->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP); }

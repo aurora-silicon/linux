@@ -493,6 +493,11 @@ static int isp_ch_cache_sensor_info(struct apple_isp *isp, u32 ch)
 		goto exit;
 	}
 
+	/* Once, when the camera is detected: which one it is, and its setfile. */
+	dev_info(isp->dev, "ch %u: sensor 0x%x, %u configs, platform 0x%x, setfile %s\n",
+		 ch, fmt->version, args->num_presets, isp->platform_id,
+		 isp_setfiles[fmt->id].path);
+
 	err = isp_check_presets(isp, args->num_presets);
 	if (!err)
 		err = isp_ch_cache_sensor_configs(isp, ch, args->num_presets);

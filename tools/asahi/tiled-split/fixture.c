@@ -47,12 +47,20 @@ static void list_add_tail(struct list_head *n, struct list_head *h)
 	     pos = container_of(pos->member.next, __typeof__(*pos), member))
 
 struct mutex { int unused; };
-struct device_node { const char *compatible; };
+struct device_node { const char *compatible; bool dp_alt_mode; };
 struct device { struct device_node *of_node; };
 static bool of_device_is_compatible(const struct device_node *np, const char *compatible)
 {
 	return np && np->compatible && !strcmp(np->compatible, compatible);
 }
+
+static bool of_property_read_bool(const struct device_node *np, const char *name)
+{
+	return np && !strcmp(name, "apple,dp-alt-mode") && np->dp_alt_mode;
+}
+
+#define IS_ERR_OR_NULL(ptr) (!(ptr))
+struct phy { struct device dev; };
 struct mux_chip;
 struct mux_control { struct mux_chip *chip; };
 struct mux_chip { struct mux_control mux[3]; unsigned int controllers; };
@@ -101,6 +109,7 @@ struct apple_dcp_typec_route {
 	u64 tunnel_generation;
 	struct mux_control *dpin[DCP_FABRIC_DPIN_MAX];
 	struct mux_control *xbar;
+	struct phy *phy;
 };
 struct apple_dcp_typec_port {
 	struct dcp_fabric_port core;
