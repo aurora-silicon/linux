@@ -1791,6 +1791,30 @@ impl Pair {
         self.drain_failures
     }
 
+    /// One debugfs line for a pair that is quarantined or holds work: what keeps it.
+    pub(crate) fn write_hold(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        if !self.quarantined && self.active.len() == 0 && self.prepared.is_none() {
+            return Ok(());
+        }
+        writeln!(
+            f,
+            "render_pair slot={} context={} owner={} quarantined={} active={} owed={} prepared={} ordinal={} freelist={:?} unstamped={} killed={} kill_published={} drain_failures={}",
+            self.slot,
+            self.context().id(),
+            u8::from(self.owner.is_some()),
+            u8::from(self.quarantined),
+            self.active.len(),
+            self.active.iter().filter(|active| active.stamps_owed).count(),
+            u8::from(self.prepared.is_some()),
+            self.ordinal,
+            self.free_list.counters().ok(),
+            u8::from(self.executed_unstamped()),
+            u8::from(self.context_killed()),
+            u8::from(self.context().kill_published()),
+            self.drain_failures
+        )
+    }
+
     /// Bounded state of a pair whose settlement failed, for the log.
     pub(crate) fn report_drain(&self, host: &impl Host) {
         let stamps = host.stamps(self.qids());
