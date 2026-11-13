@@ -2641,7 +2641,7 @@ put:
 
 /*
  * A USB4/Thunderbolt mux event only takes the port into CIO while the router
- * that runs over this PHY (a node whose apple,atc-phy points here) is enabled
+ * that runs over this PHY (a node whose phys property names it) is enabled
  * in the live device tree. The default device trees keep the routers
  * disabled, so the port stays on its USB2/USB3/DP paths until a router is
  * enabled.
@@ -2651,7 +2651,7 @@ static bool t6040_cio_router_enabled(struct t6040_usb2_phy *tphy)
 	struct device_node *np;
 
 	for_each_compatible_node(np, NULL, "apple,t6040-usb4-acio") {
-		struct device_node *phy = of_parse_phandle(np, "apple,atc-phy", 0);
+		struct device_node *phy = of_parse_phandle(np, "phys", 0);
 		bool match = phy == tphy->dev->of_node && of_device_is_available(np);
 
 		of_node_put(phy);
@@ -3917,34 +3917,18 @@ static struct platform_driver t6040_usb2_driver = {
 
 /* ---- the USB4 router's view of the PHY (linux/phy/apple-t6040-cio.h) ---- */
 
-/*
- * Run @fn on the bound PHY of @phy_np with its lock held. The device lock
- * keeps the driver bound for the call.
- */
-static int t6040_cio_call(struct device_node *phy_np,
+/* Run @fn on the PHY behind @phy with its lock held. */
+static int t6040_cio_call(struct phy *phy,
 			  int (*fn)(struct t6040_usb2_phy *tphy, unsigned long arg),
 			  unsigned long arg)
 {
-	struct platform_device *pdev;
-	struct t6040_usb2_phy *tphy;
-	int ret;
+	struct t6040_usb2_phy *tphy = t6040_from_usb2_phy(phy);
 
-	if (!phy_np || !of_device_is_compatible(phy_np, "apple,t6040-atcphy"))
+	if (!tphy)
 		return -ENODEV;
-	pdev = of_find_device_by_node(phy_np);
-	if (!pdev)
-		return -EPROBE_DEFER;
-	device_lock(&pdev->dev);
-	tphy = platform_get_drvdata(pdev);
-	if (pdev->dev.driver != &t6040_usb2_driver.driver || !tphy) {
-		ret = -EPROBE_DEFER;
-	} else {
-		guard(mutex)(&tphy->lock);
-		ret = fn(tphy, arg);
-	}
-	device_unlock(&pdev->dev);
-	put_device(&pdev->dev);
-	return ret;
+
+	guard(mutex)(&tphy->lock);
+	return fn(tphy, arg);
 }
 
 static int t6040_cio_state_fn(struct t6040_usb2_phy *tphy, unsigned long arg)
@@ -3980,27 +3964,27 @@ static int t6040_cio_usb3_fn(struct t6040_usb2_phy *tphy, unsigned long on)
 	return 0;
 }
 
-int apple_t6040_cio_state(struct device_node *phy_np)
+int apple_t6040_cio_state(struct phy *phy)
 {
-	return t6040_cio_call(phy_np, t6040_cio_state_fn, 0);
+	return t6040_cio_call(phy, t6040_cio_state_fn, 0);
 }
 EXPORT_SYMBOL_GPL(apple_t6040_cio_state);
 
-int apple_t6040_cio_router_started(struct device_node *phy_np)
+int apple_t6040_cio_router_started(struct phy *phy)
 {
-	return t6040_cio_call(phy_np, t6040_cio_router_fn, 1);
+	return t6040_cio_call(phy, t6040_cio_router_fn, 1);
 }
 EXPORT_SYMBOL_GPL(apple_t6040_cio_router_started);
 
-void apple_t6040_cio_router_stopped(struct device_node *phy_np)
+void apple_t6040_cio_router_stopped(struct phy *phy)
 {
-	t6040_cio_call(phy_np, t6040_cio_router_fn, 0);
+	t6040_cio_call(phy, t6040_cio_router_fn, 0);
 }
 EXPORT_SYMBOL_GPL(apple_t6040_cio_router_stopped);
 
-int apple_t6040_cio_usb3_tunnel(struct device_node *phy_np, bool on)
+int apple_t6040_cio_usb3_tunnel(struct phy *phy, bool on)
 {
-	return t6040_cio_call(phy_np, t6040_cio_usb3_fn, on);
+	return t6040_cio_call(phy, t6040_cio_usb3_fn, on);
 }
 EXPORT_SYMBOL_GPL(apple_t6040_cio_usb3_tunnel);
 

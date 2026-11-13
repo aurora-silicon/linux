@@ -96,6 +96,7 @@
 #include <linux/notifier.h>
 #include <linux/pci-apple.h>
 #include <linux/phy/apple-t6040-cio.h>
+#include <linux/phy/phy.h>
 #include <linux/pinctrl/consumer.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
@@ -175,7 +176,7 @@ struct apple_cio_hw {
 	/* Leave the host router's TMU to its firmware; host TMU constants. */
 	bool host_tmu;
 	/*
-	 * The router runs only over its Type-C PHY in CIO mode ("apple,atc-phy")
+	 * The router runs only over its Type-C PHY in CIO mode ("phys")
 	 * and tells the PHY when it starts and stops.
 	 */
 	bool cio_phy;
@@ -408,7 +409,7 @@ enum apple_cio_sleep_stop {
  * @sleep_stop_work: Stops a port with a PCIe-C host for system sleep
  * @sleep_stop_done: Signals that @sleep_stop_work has finished
  * @sleep_stop_state: Where @sleep_stop_work stands for the PM notifier
- * @phy_np: Type-C PHY the router runs over (hw->cio_phy)
+ * @phy: Type-C PHY the router runs over (hw->cio_phy)
  */
 struct apple_cio {
 	struct device *dev;
@@ -479,7 +480,7 @@ struct apple_cio {
 	struct completion sleep_stop_done;
 	atomic_t sleep_stop_state; /* enum apple_cio_sleep_stop */
 	/* hw->cio_phy: the Type-C PHY this router runs over */
-	struct device_node *phy_np;
+	struct phy *phy;
 
 	u32 current_cable_info;
 	u32 target_cable_info;
@@ -2465,7 +2466,7 @@ static int apple_nhi_usb3_tunnel_changed(struct tb_nhi *nhi, bool on)
 {
 	struct apple_cio *acio = nhi_to_anhi(nhi)->acio;
 
-	return apple_t6040_cio_usb3_tunnel(acio->phy_np, on);
+	return apple_t6040_cio_usb3_tunnel(acio->phy, on);
 }
 
 static const struct tb_nhi_ring_layout apple_nhi_ring_layout = {
@@ -3149,7 +3150,7 @@ static void apple_cio_stop(struct apple_cio *acio)
 	 * one: give the USB controller its PIPE back before the router goes.
 	 */
 	if (acio->hw->cio_phy)
-		apple_t6040_cio_usb3_tunnel(acio->phy_np, false);
+		apple_t6040_cio_usb3_tunnel(acio->phy, false);
 	apple_cio_remove_children(acio);
 
 	/* Try to shut down and power off the co-processor gracefully */
@@ -3187,7 +3188,7 @@ static void apple_cio_stop(struct apple_cio *acio)
 	acio->link_lost_restart = false;
 	/* ACIO is off: the PHY may leave CIO now (unplug, removal, sleep). */
 	if (acio->hw->cio_phy)
-		apple_t6040_cio_router_stopped(acio->phy_np);
+		apple_t6040_cio_router_stopped(acio->phy);
 }
 
 /*
@@ -3474,20 +3475,20 @@ static int apple_cio_start(struct apple_cio *acio)
 	 * The PHY must be in CIO, tuned by its firmware, before ACIO powers up.
 	 * The Type-C controller sets the mux first and retries on its next event.
 	 */
-	ret = apple_t6040_cio_state(acio->phy_np);
+	ret = apple_t6040_cio_state(acio->phy);
 	if (ret != 1) {
 		ret = ret < 0 ? ret : -EAGAIN;
 		dev_dbg(acio->dev, "Type-C PHY is not in CIO mode (%d), not starting\n", ret);
 		return ret;
 	}
-	ret = apple_t6040_cio_router_started(acio->phy_np);
+	ret = apple_t6040_cio_router_started(acio->phy);
 	if (ret) {
 		dev_err(acio->dev, "Type-C PHY refused the router: %d\n", ret);
 		return ret;
 	}
 	ret = apple_cio_power_up(acio);
 	if (ret)
-		apple_t6040_cio_router_stopped(acio->phy_np);
+		apple_t6040_cio_router_stopped(acio->phy);
 	return ret;
 }
 
@@ -4154,12 +4155,10 @@ static int apple_cio_probe(struct platform_device *pdev)
 		return -EINVAL;
 
 	if (acio->hw->cio_phy) {
-		acio->phy_np = of_parse_phandle(acio->np, "apple,atc-phy", 0);
-		if (!acio->phy_np)
-			return dev_err_probe(dev, -EINVAL, "Missing apple,atc-phy\n");
-		ret = devm_add_action_or_reset(dev, apple_cio_of_node_put, acio->phy_np);
-		if (ret)
-			return ret;
+		acio->phy = devm_phy_get(dev, "cio");
+		if (IS_ERR(acio->phy))
+			return dev_err_probe(dev, PTR_ERR(acio->phy),
+					     "Missing or unbound Type-C PHY (phys, \"cio\")\n");
 	}
 
 	acio->type7 = acio->hw->type7;
