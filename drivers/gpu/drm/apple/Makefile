@@ -34,6 +34,7 @@ appledrm-y += iomfb_v27.o
 appledrm-y += epic/dpavservep.o
 appledrm-y += epic/panelavep.o
 appledrm-y += plane.o
+appledrm-y += dcp-indicator.o
 
 
 appledrm-$(CONFIG_TRACING) += trace.o
@@ -41,6 +42,7 @@ appledrm-$(CONFIG_TRACING) += trace.o
 obj-$(CONFIG_DRM_APPLE) += appledrm.o
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += afk_test.o
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_backlight_test.o
+obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-indicator-test.o
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-announce-test.o
 
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += afk-service-test.o
