@@ -183,7 +183,8 @@ pub(crate) fn check_reply(status: u8, len: u32, bytes: &[u8]) -> Outcome {
     if status != 0 {
         return Outcome::Refused(u32::from(status));
     }
-    if len as usize != DIGEST_REPLY_LEN || bytes.len() < DIGEST_REPLY_LEN {
+    let len = len as usize;
+    if len < HEADER_LEN || bytes.len() < HEADER_LEN || bytes.len() < len.min(DIGEST_REPLY_LEN) {
         return Outcome::Malformed;
     }
     let word =
@@ -191,9 +192,13 @@ pub(crate) fn check_reply(status: u8, len: u32, bytes: &[u8]) -> Outcome {
     if word(0) != REPLY_SIGNATURE {
         return Outcome::Malformed;
     }
+    // A refusal can come back as a header alone.
     let result = word(4);
     if result != 0 {
         return Outcome::Refused(result);
+    }
+    if len != DIGEST_REPLY_LEN || bytes.len() < DIGEST_REPLY_LEN {
+        return Outcome::Malformed;
     }
     let mut digest = [0u8; DIGEST_LEN];
     digest.copy_from_slice(&bytes[HEADER_LEN..DIGEST_REPLY_LEN]);
@@ -330,7 +335,7 @@ impl SepData {
             }
             Ok(outcome) => {
                 diag::pnon(diag::Pnon::Failed, None);
-                dev_err_ratelimited!(
+                dev_warn_ratelimited!(
                     self.dev,
                     "pnon: the boot-policy service did not return the digest ({:?})\n",
                     outcome
@@ -391,20 +396,52 @@ impl SepData {
         };
         let outcome = if status != 0 {
             check_reply(status, len, &[])
-        } else if len as usize != DIGEST_REPLY_LEN
-            || !self.ool_await_written(&self.ool_pnon, 0, DIGEST_REPLY_LEN)
+        } else if !(HEADER_LEN..=DIGEST_REPLY_LEN).contains(&(len as usize))
+            || !self.ool_await_written(&self.ool_pnon, 0, len as usize)
         {
             Outcome::Malformed
         } else {
-            match self.ool_read(&self.ool_pnon, 0, DIGEST_REPLY_LEN) {
+            match self.ool_read(&self.ool_pnon, 0, len as usize) {
                 Ok(bytes) => check_reply(status, len, &bytes),
                 Err(_) => Outcome::Malformed,
             }
         };
+        if outcome == Outcome::Malformed {
+            self.pnon_malformed(&msg);
+        }
         self.ool_repoison(&self.ool_pnon, 0, DIGEST_REPLY_LEN);
         if self.pnon_rx.lock().answer(generation, outcome) {
             self.pnon_wq.notify_all();
         }
+    }
+
+    /// Says what a reply that did not check out looked like: its word, the
+    /// reply header (signature and result, never the digest) and where the
+    /// enclave's bytes start in the receive buffer.
+    fn pnon_malformed(&self, msg: &Message) {
+        let mut header = [0u8; 8];
+        let sampled = self.ool_peek(&self.ool_pnon, 0, &mut header);
+        let mut first = None;
+        let mut chunk = [0u8; 64];
+        let mut at = 0;
+        while first.is_none() && at + chunk.len() <= 2 * SEP_PAGE {
+            if !self.ool_peek(&self.ool_pnon, at, &mut chunk) {
+                break;
+            }
+            first = chunk
+                .iter()
+                .position(|&b| b != OOL_POISON_OUTBOUND)
+                .map(|i| at + i);
+            at += chunk.len();
+        }
+        dev_info_ratelimited!(
+            self.dev,
+            "pnon: reply msg0 {:#018x}, header {:02x?} (sampled {}), first enclave byte at {:?}\n",
+            msg.msg0,
+            header,
+            sampled,
+            first
+        );
     }
 
     fn pnon_unexpected(&self, msg: &Message) {
@@ -496,6 +533,18 @@ mod tests {
         r[..HEADER_LEN].copy_from_slice(&TRACE_REQUEST);
         assert_eq!(
             check_reply(0, DIGEST_REPLY_LEN as u32, &r),
+            Outcome::Malformed
+        );
+        // A refusal that comes back as a header alone.
+        let mut r = reply(1);
+        r[4] = 9;
+        assert_eq!(
+            check_reply(0, HEADER_LEN as u32, &r[..HEADER_LEN]),
+            Outcome::Refused(9)
+        );
+        // A header alone that says success carries no digest.
+        assert_eq!(
+            check_reply(0, HEADER_LEN as u32, &reply(1)[..HEADER_LEN]),
             Outcome::Malformed
         );
         // The pairing-status reply length.
