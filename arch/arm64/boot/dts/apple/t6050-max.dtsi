@@ -199,7 +199,7 @@
 #endif
 };
 
-#if defined(T6050_J714C) || defined(T6050_J714S) || defined(T6050_J716C)
+#if defined(T6050_J714C) || defined(T6050_J714S) || defined(T6050_J716C) || defined(T6050_K114C)
 /*
  * ATC2's USB4/Thunderbolt router (ADT /arm-io/acio2, acio-cpu2 and dart-acio2), powered per
  * connection: the PHY enters CIO mode, then the router's domains come on (ATC2_CIO, _PCIE, _USB,
