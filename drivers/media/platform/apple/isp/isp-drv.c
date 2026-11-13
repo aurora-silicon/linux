@@ -673,24 +673,16 @@ static int apple_isp_pm_notify(struct notifier_block *nb, unsigned long event,
 }
 
 /*
- * The DCP presenting the software camera indicator (apple,camera-indicator),
- * best-effort: the camera probes and streams without it. When the node names
- * a DCP that exists, a device reference is held for the driver's lifetime
- * and put at remove; otherwise there is no indicator and no reference.
+ * The node of the DCP presenting the software camera indicator
+ * (apple,camera-indicator), best-effort: the camera probes and streams without
+ * it. Not looked up without the DRM driver, which has nothing to ask. The DCP
+ * device is found when a stream starts, because it may probe after the ISP.
  */
-static struct device *apple_isp_indicator_dcp(struct device *dev)
+static struct device_node *apple_isp_indicator_node(struct device *dev)
 {
-	struct device_node *np;
-	struct platform_device *dcp;
-
-	np = of_parse_phandle(dev->of_node, "apple,camera-indicator", 0);
-	if (!np)
+	if (!IS_ENABLED(CONFIG_DRM_APPLE))
 		return NULL;
-	dcp = of_find_device_by_node(np);
-	of_node_put(np);
-	if (!dcp)
-		return NULL;
-	return &dcp->dev;
+	return of_parse_phandle(dev->of_node, "apple,camera-indicator", 0);
 }
 
 static int apple_isp_probe(struct platform_device *pdev)
@@ -714,9 +706,7 @@ static int apple_isp_probe(struct platform_device *pdev)
 
 	isp->dev = dev;
 	isp->hw = of_device_get_match_data(dev);
-	isp->dcp = apple_isp_indicator_dcp(dev);
-	if (isp->dcp)
-		dev_notice(dev, "best-effort software camera indicator via the DCP; not a privacy guarantee, the camera does not depend on it\n");
+	isp->dcp_np = apple_isp_indicator_node(dev);
 	platform_set_drvdata(pdev, isp);
 	dev_set_drvdata(dev, isp);
 
@@ -905,6 +895,7 @@ detach_genpd:
 	apple_isp_detach_genpd(isp);
 free_isp:
 	put_device(isp->dcp);
+	of_node_put(isp->dcp_np);
 	kfree(isp->sensor_configs);
 	/* Nothing else can reach it before the video device is registered. */
 	kfree(isp);
@@ -929,6 +920,7 @@ static void apple_isp_remove(struct platform_device *pdev)
 	destroy_workqueue(isp->wq);
 	apple_isp_detach_genpd(isp);
 	put_device(isp->dcp);
+	of_node_put(isp->dcp_np);
 	/* Freed now, or when the last open file is closed. */
 	v4l2_device_put(&isp->v4l2_dev);
 }
