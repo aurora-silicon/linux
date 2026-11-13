@@ -6,6 +6,7 @@ config VIDEO_APPLE_ISP
 	select VIDEOBUF2_V4L2
 	select VIDEOBUF2_DMA_SG
 	select APPLE_PMP_REPORT
+	select APPLE_CAMERA_INDICATOR
 	depends on ARCH_APPLE || COMPILE_TEST
 	depends on OF_ADDRESS
 	depends on PM

@@ -5,6 +5,7 @@
 #include <linux/gcd.h>
 #include <linux/unaligned.h>
 #include <kunit/static_stub.h>
+#include <linux/soc/apple/camera-indicator.h>
 
 #include "isp-cam.h"
 #include "isp-cmd.h"
@@ -1076,6 +1077,35 @@ void apple_isp_wdt_stop(struct apple_isp *isp)
 
 	hrtimer_cancel(&isp->wdt_timer);
 	isp->wdt_running = false;
+}
+
+/*
+ * Where the ISP has a capture watchdog, the camera-in-use indicator is not a
+ * light on the sensor supply: macOS shows it on the internal panel. Ask the
+ * display to draw it there for the length of the stream. A machine whose
+ * display cannot draw it streams all the same.
+ */
+void apple_isp_indicator_request(struct apple_isp *isp)
+{
+	int err;
+
+	if (!isp->wdt || isp->indicator_held)
+		return;
+	err = apple_cam_indicator_request();
+	if (err) {
+		dev_info_once(isp->dev, "no camera-in-use indicator on screen (%d)\n",
+			      err);
+		return;
+	}
+	isp->indicator_held = true;
+}
+
+void apple_isp_indicator_release(struct apple_isp *isp)
+{
+	if (!isp->indicator_held)
+		return;
+	apple_cam_indicator_release();
+	isp->indicator_held = false;
 }
 
 int apple_isp_start_capture(struct apple_isp *isp)

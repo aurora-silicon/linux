@@ -402,6 +402,8 @@ struct apple_isp {
 	void __iomem *dapf;
 	struct hrtimer wdt_timer;
 	bool wdt_running;
+	/* The display draws the camera-in-use indicator for this stream. */
+	bool indicator_held;
 
 	struct iommu_domain *domain;
 	unsigned long shift;

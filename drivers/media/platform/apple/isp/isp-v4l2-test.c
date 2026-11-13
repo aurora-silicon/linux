@@ -29,6 +29,28 @@ static struct apple_isp *isp_test_alloc(struct kunit *test)
 	return isp;
 }
 
+/*
+ * The indicator is asked for only where the ISP has a capture watchdog, and
+ * a machine with no display to draw it is not held: the stream goes on.
+ */
+static void isp_test_indicator_request(struct kunit *test)
+{
+	struct apple_isp *isp = isp_test_alloc(test);
+
+	isp->dev = kunit_device_register(test, "apple-isp-indicator-test");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, isp->dev);
+
+	apple_isp_indicator_request(isp);
+	KUNIT_EXPECT_FALSE(test, isp->indicator_held);
+
+	isp->wdt = (void __iomem *)kunit_kzalloc(test, 0x10, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, (void __force *)isp->wdt);
+	apple_isp_indicator_request(isp);
+	KUNIT_EXPECT_FALSE(test, isp->indicator_held);
+	apple_isp_indicator_release(isp);
+	KUNIT_EXPECT_FALSE(test, isp->indicator_held);
+}
+
 /* The queue must initialise with the parameters the driver probes with. */
 static void isp_test_queue_init(struct kunit *test)
 {
@@ -527,6 +549,7 @@ static struct kunit_case isp_v4l2_test_cases[] = {
 	KUNIT_CASE(isp_test_suspended_return),
 	KUNIT_CASE(isp_test_error_wakeup),
 	KUNIT_CASE(isp_test_queue_init),
+	KUNIT_CASE(isp_test_indicator_request),
 	KUNIT_CASE(isp_test_reqbufs_limit),
 	KUNIT_CASE(isp_test_create_bufs_limit),
 	{}
