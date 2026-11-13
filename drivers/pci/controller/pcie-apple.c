@@ -3422,21 +3422,6 @@ static int apple_msi_init(struct apple_pcie *pcie)
 			default:
 				goto invalid_slice;
 			}
-		} else if (of_machine_is_compatible("apple,t6040")) {
-			aic_base = 2071;
-			switch (ecam.start) {
-			case 0x1c50000000ULL:
-				expected_base = 0x20;
-				break;
-			case 0x1c60000000ULL:
-				expected_base = 0x40;
-				break;
-			case 0x1c70000000ULL:
-				expected_base = 0x60;
-				break;
-			default:
-				goto invalid_slice;
-			}
 		} else if (of_machine_is_compatible("apple,t8132")) {
 			aic_base = 1506;
 			switch (ecam.start) {
