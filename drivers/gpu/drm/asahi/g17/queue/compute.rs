@@ -3125,6 +3125,21 @@ impl Queue {
             host.publish_outer(policy.priority(), &crate::g17::fw::channels::WorkSlot::new(DataMaster::Compute,
                 self.graph.graph.gpu_va(), self.qid(), producer.try_into()?, true)?)?;
             self.outer_started = 1 << policy.priority();
+            // The queue's host-port configuration and validity go out before the installation's
+            // doorbell, so that the queue is configured when the firmware acts on it. A
+            // publication writes its host-port transaction after its doorbell, the work
+            // notification that wakes gated cores (see the publication path); as we understand
+            // it, that order matters for the advance the transaction ends with. The
+            // installation's transaction has no advance: its ring holds no kick yet, and the first
+            // publication configures the queue again with its kick. The configuration record is
+            // already visible, so a failed host-port write must not keep the doorbell back: the
+            // doorbell alone installs the queue, as it did before.
+            if let Err(error) = crate::g17::fw::m5::queue::HardwareSubmission::configure_compute(
+                self.qid(), self.kick.low_va(), policy.priority(),
+            ).and_then(|submission| host.submit_m5(&submission)) {
+                pr_warn!("asahi: G17: M5 queue {} installs without its host-port configuration: {:?}\n",
+                    self.qid(), error);
+            }
             host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
             Err(EAGAIN)
         })();
