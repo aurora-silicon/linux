@@ -55,6 +55,7 @@
 #define APPLE_ANS_COPROC_CPU_CONTROL	 0x44
 #define APPLE_ANS_COPROC_CPU_CONTROL_RUN BIT(4)
 #define APPLE_ANS_COPROC_CPU_STATUS	 0x48
+#define APPLE_ANS_COPROC_CPU_STATUS_RESET BIT(3)
 
 #define APPLE_ANS_ACQ_DB  0x1004
 #define APPLE_ANS_IOCQ_DB 0x100c
@@ -276,6 +277,9 @@ struct apple_nvme {
 	struct reset_control *reset;
 	bool owns_rtkit;
 	bool inherited_rtkit;
+	/* apple,sart-entries: a boot stage powered ANS off and passed its SART entries on */
+	const __be64 *sart_entries;
+	int sart_entries_len;
 
 	struct dma_pool *prp_page_pool;
 	struct dma_pool *prp_small_pool;
@@ -1695,6 +1699,80 @@ static void apple_nvme_stop_crashed_session(struct apple_nvme *anv)
 	anv->ctrl.ctrl_config = 0;
 }
 
+/*
+ * Post-M4, idled and powered off by the boot stage that used it (as aura and U-Boot do
+ * between their own stages): its firmware stays in DRAM and the SART lost its entries.
+ * The stage passed them as apple,sart-entries, three 64-bit cells each: (index << 8 |
+ * flags), address and size. Write them back, then start the firmware as after a power
+ * loss: it says HELLO by itself, keeps the buffers it was given, and the endpoint map is
+ * answered with its last part masked to endpoint 0x20, as macOS does after a sleep.
+ *
+ * A power cycle leaves the CPU in its reset state and the boot status cleared. If either
+ * survived, the CPU was only stopped since it last ran and won't start from the run bit,
+ * so reset it first. A firmware that doesn't answer gets one more reset and start.
+ */
+static int apple_nvme_start_from_off(struct apple_nvme *anv)
+{
+	void __iomem *control = anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL;
+	int i, n = anv->sart_entries_len / (3 * sizeof(__be64));
+	u32 status, boot_status;
+	int ret, attempt;
+
+	for (attempt = 0;; attempt++) {
+		status = readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_STATUS);
+		boot_status = readl(anv->mmio_nvme + APPLE_ANS_BOOT_STATUS);
+		if (attempt || !(status & APPLE_ANS_COPROC_CPU_STATUS_RESET) ||
+		    boot_status == APPLE_ANS_BOOT_STATUS_OK) {
+			dev_info(anv->dev, "ANS from off: resetting it first (status %#x, boot status %#x)\n",
+				 status, boot_status);
+			writel(0, control);
+			ret = reset_control_assert(anv->reset);
+			if (!ret) {
+				usleep_range(10, 20);
+				ret = reset_control_deassert(anv->reset);
+			}
+			if (ret)
+				return ret;
+		}
+
+		for (i = 0; i < n; i++) {
+			u64 key = be64_to_cpu(anv->sart_entries[3 * i]);
+
+			ret = apple_sart_restore_entry(anv->sart, key >> 8, key & 0xff,
+						       be64_to_cpu(anv->sart_entries[3 * i + 1]),
+						       be64_to_cpu(anv->sart_entries[3 * i + 2]));
+			if (ret) {
+				dev_err(anv->dev, "ANS from off: SART entry %llu: %d\n",
+					key >> 8, ret);
+				return ret;
+			}
+		}
+
+		apple_rtkit_set_warm_epmap_mask(anv->rtk, BIT(0));
+		ret = apple_rtkit_power_cycled_return(anv->rtk, control);
+		if (!ret)
+			ret = readl_poll_timeout(anv->mmio_nvme + APPLE_ANS_BOOT_STATUS,
+						 boot_status,
+						 boot_status == APPLE_ANS_BOOT_STATUS_OK,
+						 USEC_PER_MSEC, APPLE_ANS_BOOT_TIMEOUT);
+		if (!ret || attempt || !anv->reset) {
+			if (anv->hw->sleep_traced)
+				apple_rtkit_set_warm_epmap_mask(anv->rtk,
+								anv->hw->sleep_epmap_last_mask);
+			else
+				apple_rtkit_set_warm_epmap_mask(anv->rtk, U32_MAX);
+			break;
+		}
+		dev_warn(anv->dev, "ANS from off didn't start (%d, status %#x), resetting it again\n",
+			 ret, readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_STATUS));
+	}
+	if (ret)
+		return ret;
+
+	dev_info(anv->dev, "ANS started from off, %d SART entries written back\n", n);
+	return 0;
+}
+
 static bool apple_nvme_sleep_wait_on(struct apple_nvme *anv);
 
 static void apple_nvme_reset_work(struct work_struct *work)
@@ -1741,6 +1819,12 @@ static void apple_nvme_reset_work(struct work_struct *work)
 			"RTKit has crashed without any way to recover.");
 		ret = -EIO;
 		goto out;
+	}
+
+	if (anv->sart_entries) {
+		ret = apple_nvme_start_from_off(anv);
+		anv->sart_entries = NULL;
+		goto booted;
 	}
 
 	/*
@@ -2599,6 +2683,18 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 	 * system endpoints before mailbox RX starts, otherwise inherited syslog
 	 * traffic can race the later reset work and be dropped as undiscovered.
 	 */
+	if (anv->hw->needs_ioq_registers &&
+	    !(readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL) &
+	      APPLE_ANS_COPROC_CPU_CONTROL_RUN)) {
+		anv->sart_entries = of_get_property(dev->of_node, "apple,sart-entries",
+						    &anv->sart_entries_len);
+		if (anv->sart_entries &&
+		    (!anv->sart_entries_len || anv->sart_entries_len % (3 * sizeof(__be64)))) {
+			dev_warn(dev, "malformed apple,sart-entries (%d bytes)\n",
+				 anv->sart_entries_len);
+			anv->sart_entries = NULL;
+		}
+	}
 	inherited_rtkit = apple_nvme_can_adopt_rtkit(anv);
 	/* Publish admission before the initializer enables mailbox RX. */
 	anv->inherited_rtkit = inherited_rtkit;
