@@ -7033,6 +7033,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 				dcp->v27_a407 = true;
 			}
 		}
+		dcp->swap_v27_3 = !strcmp(compat_str, "27.3.0");
 	}
 	if (fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
 		dcp->desktop = devm_kzalloc(dev, sizeof(*dcp->desktop), GFP_KERNEL);
