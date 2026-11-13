@@ -211,10 +211,15 @@ static int hwx_program(struct hwx_parser *p)
 	const u8 *c = p->bytes + p->info.program_offset;
 	struct ane_h16_hwx *info = &p->info;
 	u32 length = get_unaligned_le32(c + 4), records, record_limit, i;
-	u32 prologue = info->subtype == ANE_HWX_SUBTYPE_H17 ? 0 : 1;
+	u32 prologue = 1;
 	size_t final_end = 0;
 	u64 work_limit = 0;
 	bool mixed = length == 0x8c0;
+
+	/* H17 streams open with 0 (linked programs) or 1 (Apple's matmul and add output). */
+	if (info->subtype == ANE_HWX_SUBTYPE_H17 && info->text.size >= 4 &&
+	    !get_unaligned_le32(p->bytes + info->text.offset))
+		prologue = 0;
 	/* Nonzero cells only; every other byte is checked below. */
 	static const u16 common[] = {
 		0, 4, 8, 0xc, 0x10, 0x14, 0x20, 0x24, 0x40, 0x44,
