@@ -32,6 +32,7 @@ properties:
           - apple,t8103-usb4-dart
           - apple,t8110-dart
           - apple,t6000-dart
+          - apple,t8152-dart-gen3
       - items:
           - const: apple,t8140-ane-dart
           - const: apple,t8140-dart
@@ -81,13 +82,16 @@ properties:
           Address filter (DAPF) registers, which restrict the physical
           addresses the DART lets its masters reach, or the slice of the
           fabric filter (GAPF) that protects the power state of the
-          coprocessor CPU behind this DART, cleared to power that CPU down
+          coprocessor CPU behind this DART, cleared to power that CPU down,
+          or on a T8152 Gen3 DART its window in the SoC's TLB invalidation
+          aperture (ADT dart-tlbi-aperture plus tlbi-aperture-offset), which
+          the Gen3 DARTs share
 
   reg-names:
     minItems: 1
     items:
       - const: dart
-      - enum: [dapf, gapf, auxiliary]
+      - enum: [dapf, gapf, auxiliary, tlbi]
 
   interrupts:
     maxItems: 1
@@ -322,6 +326,35 @@ allOf:
     then:
       required:
         - reg-names
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8152-dart-gen3
+    then:
+      description:
+        The T8152 Gen3 DARTs in front of the display coprocessors and their
+        display pipes belong to the SPTM. The bootloader hands them over
+        locked, and the operating system only adds page table entries in
+        root slots that are empty at handoff. Their TLB command register
+        answers translation queries; a stream is invalidated through the
+        TLB invalidation aperture instead.
+      properties:
+        reg:
+          minItems: 2
+        reg-names:
+          items:
+            - const: dart
+            - const: tlbi
+      required:
+        - reg-names
+    else:
+      properties:
+        reg-names:
+          minItems: 1
+          items:
+            - const: dart
+            - enum: [dapf, gapf, auxiliary]
 
 additionalProperties: false
 
