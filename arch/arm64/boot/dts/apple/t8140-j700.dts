@@ -623,6 +623,12 @@
 };
 
 &dcp {
+	/*
+	 * The camera has no indicator light: the kernel shows its software
+	 * camera indicator in swap slot 2, above the surface DRM uses.
+	 */
+	apple,camera-indicator-surface = <2>;
+
 	/* 2408x1506 at 219 ppi; 525 nits peak from the backlight node */
 	panel: panel {
 		compatible = "apple,panel-j700", "apple,panel";
@@ -693,6 +699,7 @@
 &isp {
 	apple,platform-id = <0x70>;
 	apple,temporal-filter = <1>;
+	apple,camera-indicator = <&dcp>;
 };
 
 &aop_dart {
