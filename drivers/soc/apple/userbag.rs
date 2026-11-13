@@ -1304,13 +1304,17 @@ impl crate::SepData {
 
     pub(crate) fn userbag_ioctl(&self, cmd: u32, arg: usize) -> Result<crate::bio::Handled> {
         crate::bio::require_admin()?;
-        if self.profile.key_store != crate::profile::KeyStore::Variant5 {
-            // The user-bag layouts were captured on the variant-5 key store
-            // (macOS 26 on the Neo). The 13.x key store of M1/M2-generation
-            // Macs has not been captured, so nothing is sent there.
+        if !self.profile.per_user_keybags {
+            // Gate on the proven-hardware capability, NOT the create-encoding
+            // variant: the warm macOS-shared enclaves (T8112/M2, T8122/M3) use
+            // the variant-5 identity encoding yet never reply to a user-bag
+            // DESIGNATE_KEYBAG, which condemns the SKS endpoint for the boot.
+            // User-bag create/designate is proven only on the Neo (T8140) and
+            // the J616s/M4-Pro family; everything else refuses cleanly here so
+            // the enclave is never wedged. Touch ID / identity are untouched.
             dev_info_ratelimited!(
                 self.dev,
-                "userbag: per-user key bags are not supported on this key store yet (only variant 5 has been captured)\n"
+                "userbag: per-user key bags are not supported on this Mac's Secure Enclave key store\n"
             );
             return Err(EOPNOTSUPP);
         }
