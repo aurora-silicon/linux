@@ -154,14 +154,32 @@ static void sep_ta_report(void *ctx, struct apple_ta_device *ta, u8 id,
 	unsigned long flags;
 	bool taken = false;
 
+	/*
+	 * A command reply does not arrive under its own report ID. The keyboard
+	 * carries it in one of its declared input reports (the control or data
+	 * role), whose body is a one-byte length and then the reply itself with
+	 * its logical ID first:
+	 *
+	 *   [carrier report ID][u8 reply_len][reply_id][u32 step][u32 status]...
+	 *
+	 * HID core has already stripped the carrier report ID, so @id is the
+	 * carrier's and @data starts at reply_len. Match the awaited reply by
+	 * its logical ID (data[1]) and hand the client the reply alone, its ID
+	 * first, which is what sep_stac_ta_command()'s callers parse. (Observed
+	 * on the J616s Magic Keyboard; the undeclared 0x40-0x4f/0xb0-0xbf report
+	 * IDs the descriptor fix-up adds carry the larger replies and sensor
+	 * frames, handled where those are read.)
+	 */
 	spin_lock_irqsave(&sep_ta_rx.lock, flags);
-	if (sep_ta_rx.want && id == sep_ta_rx.want) {
-		if (len + 1 > sep_ta_rx.cap) {
+	if (sep_ta_rx.want && len >= 2 && data[0] >= 1 &&
+	    (size_t)data[0] + 1 <= len && data[1] == sep_ta_rx.want) {
+		size_t reply_len = data[0];
+
+		if (reply_len > sep_ta_rx.cap) {
 			sep_ta_rx.len = -EMSGSIZE;
 		} else {
-			sep_ta_rx.buf[0] = id;
-			memcpy(sep_ta_rx.buf + 1, data, len);
-			sep_ta_rx.len = len + 1;
+			memcpy(sep_ta_rx.buf, data + 1, reply_len);
+			sep_ta_rx.len = reply_len;
 		}
 		sep_ta_rx.want = 0;
 		complete(&sep_ta_rx.done);
