@@ -40,6 +40,8 @@ struct apple_rtkit_helper {
 	 * it does not list must not replace storage the firmware still owns.
 	 */
 	bool strict_buffers;
+	/* The AP idle notice waits for .suspend_late, after the HID host's packets */
+	bool idle_late;
 	/* The firmware was told the AP is going to sleep. */
 	bool ap_idle;
 	/* It was told, gave no answer, and wasn't told otherwise. */
@@ -263,6 +265,8 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	helper->dev = dev;
+	/* The M5 Pro's macOS idles MTP after its two HID packets. */
+	helper->idle_late = of_device_is_compatible(helper->dev->of_node, "apple,t6050-mtp");
 	platform_set_drvdata(pdev, helper);
 
 	helper->asc_base = devm_platform_ioremap_resource_byname(pdev, "asc");
@@ -437,9 +441,20 @@ static void apple_rtkit_helper_ap_on(struct apple_rtkit_helper *helper)
  */
 static int __maybe_unused apple_rtkit_helper_prepare(struct device *dev)
 {
-	if (!pm_suspend_via_firmware())
+	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
+
+	if (!pm_suspend_via_firmware() || helper->idle_late)
 		return 0;
-	return apple_rtkit_helper_ap_idle(dev_get_drvdata(dev));
+	return apple_rtkit_helper_ap_idle(helper);
+}
+
+static int __maybe_unused apple_rtkit_helper_suspend_late(struct device *dev)
+{
+	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
+
+	if (!pm_suspend_via_firmware() || !helper->idle_late)
+		return 0;
+	return apple_rtkit_helper_ap_idle(helper);
 }
 
 static void apple_rtkit_helper_sleep_end(struct apple_rtkit_helper *helper)
@@ -541,6 +556,7 @@ static int __maybe_unused apple_rtkit_helper_freeze(struct device *dev)
 
 static const struct dev_pm_ops apple_rtkit_helper_pm_ops = {
 	.prepare = pm_sleep_ptr(apple_rtkit_helper_prepare),
+	.suspend_late = pm_sleep_ptr(apple_rtkit_helper_suspend_late),
 	.complete = pm_sleep_ptr(apple_rtkit_helper_complete),
 	.suspend = pm_sleep_ptr(apple_rtkit_helper_suspend),
 	.resume = pm_sleep_ptr(apple_rtkit_helper_resume),

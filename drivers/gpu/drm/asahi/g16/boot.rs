@@ -285,6 +285,8 @@ static RTKIT_OPS: bindings::apple_rtkit_ops = bindings::apple_rtkit_ops {
     shmem_setup: None,
     shmem_setup_ep: Some(rtkit_shmem_setup),
     shmem_destroy: Some(rtkit_shmem_destroy),
+    early_eps: [0; 8],
+    early_ep_count: 0,
     syslog_is_debug: None,
     protocol_version: 12,
 };

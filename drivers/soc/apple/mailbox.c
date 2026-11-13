@@ -26,6 +26,7 @@
 #include <linux/iopoll.h>
 #include <linux/jiffies.h>
 #include <linux/module.h>
+#include <linux/ktime.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
@@ -428,6 +429,7 @@ int apple_mbox_ascwrap_v6_start_cpu(struct apple_mbox *mbox)
 	u32 val;
 	int ret = 0;
 
+
 	if (!mbox || !apple_mbox_has_cpu_lifecycle(mbox) || !mbox->wrapper_regs)
 		return -EOPNOTSUPP;
 	/* See the ascwrap_v8_cpu_control parameter. */
@@ -491,6 +493,7 @@ EXPORT_SYMBOL_GPL(apple_mbox_ascwrap_v6_start_cpu);
 int apple_mbox_ascwrap_v6_stop_cpu(struct apple_mbox *mbox)
 {
 	int ret = 0;
+
 
 	if (!mbox || !apple_mbox_has_cpu_lifecycle(mbox) || !mbox->wrapper_regs)
 		return -EOPNOTSUPP;
@@ -560,6 +563,7 @@ int apple_mbox_ascwrap_v6_get_cpu_state(struct apple_mbox *mbox,
 				     u32 *control, u32 *status)
 {
 	int ret = 0;
+
 
 	if (!mbox || !control || !status || !apple_mbox_has_cpu_lifecycle(mbox) ||
 	    !mbox->wrapper_regs)
@@ -721,6 +725,59 @@ static void apple_mbox_fast_rx_kick(struct apple_mbox_priv *priv)
 			      us_to_ktime(APPLE_MBOX_RX_FAST_POLL_US),
 			      HRTIMER_MODE_REL);
 }
+/* Opt-in primitives: do not inherit the normal sender/poller's wait budgets. */
+int apple_mbox_send_nowait(struct apple_mbox *mbox, struct apple_mbox_msg msg)
+{
+	unsigned long flags;
+	int ret = 0;
+
+	local_irq_save(flags);
+	if (!spin_trylock(&mbox->tx_lock)) {
+		local_irq_restore(flags);
+		return -EBUSY;
+	}
+	if (READ_ONCE(mbox->removing) || !READ_ONCE(mbox->active))
+		ret = -ENODEV;
+	else if (mbox->hw->is_ascwrap_v8)
+		ret = -EOPNOTSUPP;
+	else if (apple_mbox_tx_full(mbox,
+		 readl_relaxed(mbox->regs + mbox->hw->a2i_control)))
+		ret = -EAGAIN;
+	else
+		apple_mbox_write_msg(mbox, msg);
+	spin_unlock_irqrestore(&mbox->tx_lock, flags);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_mbox_send_nowait);
+
+int apple_mbox_recv_nowait(struct apple_mbox *mbox, struct apple_mbox_msg *msg)
+{
+	unsigned long flags;
+	int ret = 0;
+
+	local_irq_save(flags);
+	if (!spin_trylock(&mbox->rx_lock)) {
+		local_irq_restore(flags);
+		return -EBUSY;
+	}
+	if (READ_ONCE(mbox->removing) || !READ_ONCE(mbox->active) || !mbox->rx)
+		ret = -ENODEV;
+	else if (mbox->hw->is_ascwrap_v8)
+		ret = -EOPNOTSUPP;
+	else {
+		if (!apple_mbox_rx_empty(mbox,
+		    readl_relaxed(mbox->regs + mbox->hw->i2a_control))) {
+			*msg = apple_mbox_read_msg(mbox);
+			ret = 1;
+		}
+		if (mbox->hw->has_irq_controls)
+			writel_relaxed(mbox->hw->irq_bit_recv_not_empty,
+				       mbox->regs + mbox->hw->irq_ack);
+	}
+	spin_unlock_irqrestore(&mbox->rx_lock, flags);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_mbox_recv_nowait);
 
 int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 		    bool atomic)
@@ -1173,6 +1230,7 @@ int apple_mbox_start(struct apple_mbox *mbox)
 {
 	int ret = 0;
 
+
 	mutex_lock(&mbox->lifecycle_lock);
 	if (mbox->removing) {
 		ret = -ENODEV;
@@ -1241,6 +1299,7 @@ void apple_mbox_set_recv_enabled(struct apple_mbox *mbox, bool enabled)
 	unsigned long flags;
 	u32 val;
 
+
 	spin_lock_irqsave(&mbox->rx_lock, flags);
 	val = readl_relaxed(mbox->regs + mbox->hw->i2a_control);
 	val = enabled ? val | APPLE_ASC_MBOX_CONTROL_RECV_ENABLE :
@@ -1250,6 +1309,15 @@ void apple_mbox_set_recv_enabled(struct apple_mbox *mbox, bool enabled)
 }
 EXPORT_SYMBOL_GPL(apple_mbox_set_recv_enabled);
 
+int apple_mbox_ans_idle_status(struct apple_mbox *mbox, u32 *status)
+{
+	if (!of_device_is_compatible(mbox->dev->of_node, "apple,t6050-asc-mailbox"))
+		return -EOPNOTSUPP;
+	*status = readl(mbox->regs);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_mbox_ans_idle_status);
+
 /*
  * The mailbox's power domain was off while it stayed started (its consumer
  * powered its co-processor down and up again around it): set the
@@ -1258,6 +1326,7 @@ EXPORT_SYMBOL_GPL(apple_mbox_set_recv_enabled);
 int apple_mbox_restore(struct apple_mbox *mbox)
 {
 	int ret = 0;
+
 
 	mutex_lock(&mbox->lifecycle_lock);
 	if (mbox->removing || !mbox->active)
@@ -2052,3 +2121,4 @@ MODULE_DESCRIPTION("Apple Mailbox driver");
 #if IS_REACHABLE(CONFIG_KUNIT)
 #include "mailbox-g17-test.h"
 #endif
+

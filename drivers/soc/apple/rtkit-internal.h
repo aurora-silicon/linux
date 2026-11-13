@@ -7,6 +7,7 @@
 #ifndef _APPLE_RTKIT_INTERAL_H
 #define _APPLE_RTKIT_INTERAL_H
 
+#include <linux/atomic.h>
 #include <linux/bitfield.h>
 #include <linux/bitmap.h>
 #include <linux/completion.h>
@@ -47,6 +48,11 @@ struct apple_rtkit {
 	struct completion coreanalytics_completion;
 	struct completion iop_pwr_ack_completion;
 	struct completion ap_pwr_ack_completion;
+	struct completion strict_idle_done;
+	bool strict_idle_waiting, strict_idle_poisoned, strict_retained_buffers;
+	/* Firmware 27 sleep callbacks accepted, including queued work and reply ACKs. */
+	atomic_t v27_jobs;
+	bool v27_rx_failed;
 
 	int boot_result;
 	int version;
@@ -67,13 +73,38 @@ struct apple_rtkit {
 	bool oslog_echo;
 	/* A counter queued for the receive work and not yet echoed. */
 	u64 oslog_owed;
+	/* The polled idle's receipts: how many, and the last one. */
+	unsigned int polled_seen;
+	struct apple_mbox_msg polled_last;
+	/* What apple_rtkit_polled_exchange() waits for. */
+	u8 polled_ep;
+	u64 polled_mask, polled_want;
+	bool polled_matched;
 	/* Device interrupts are off: poll the mailbox while waiting. */
 	bool poll_waits;
 	/* The firmware is restarting with its buffers and rings still in place. */
 	bool warm_restart;
 	u32 warm_last_mask;
+	/* Opt-in ANS transaction; all other clients retain their old policy. */
+	bool ans_hold, ans_wake, ans_hello;
+	u8 ans_map_next;
+	int ans_error;
 	/* A port that only answers the co-processor, see apple_rtkit_port_handshake(). */
 	bool port_only;
+	/* Opt-in M5 scope; RX is synchronized/masked while active. Timeout keeps
+	 * ap_pending until an actual matching ACK, even after leaving the scope.
+	 * The preallocated queue is replayed by the ordered worker after end.
+	 */
+	struct {
+		bool active, ap_pending, tracked, notification;
+		atomic_t jobs;
+		u8 endpoint;
+		u64 (*stamp)(void);
+		unsigned int ap_target;
+		int error;
+		DECLARE_KFIFO(deferred, struct apple_mbox_msg, 64);
+		struct work_struct work;
+	} m5_saved;
 	DECLARE_KFIFO(sync_ack_fifo, struct apple_mbox_msg, 64);
 	struct work_struct sync_ack_work;
 

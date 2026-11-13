@@ -466,7 +466,8 @@ int apple_sart_replay(struct apple_sart *sart)
 {
 	int i, bad = 0;
 
-	if (sart->ops != &sart_ops_v3 || !sart->replay_valid)
+	if ((sart->ops != &sart_ops_v3 && sart->ops != &sart_ops_v4) ||
+	    !sart->replay_valid)
 		return -EOPNOTSUPP;
 
 	for (i = 0; i < APPLE_SART_MAX_ENTRIES; i++) {
@@ -494,6 +495,29 @@ int apple_sart_replay(struct apple_sart *sart)
 	return bad;
 }
 EXPORT_SYMBOL_GPL(apple_sart_replay);
+
+int apple_sart_sleep_validate(struct apple_sart *sart)
+{
+	int i;
+
+	if (sart->ops != &sart_ops_v4 || !sart->saved_valid)
+		return -EOPNOTSUPP;
+	for (i = 0; i < APPLE_SART_MAX_ENTRIES; i++) {
+		phys_addr_t paddr;
+		size_t size;
+		u8 flags;
+
+		sart->ops->get_entry(sart, i, &flags, &paddr, &size);
+		if (flags != sart->saved[i].flags || paddr != sart->saved[i].paddr ||
+		    size != sart->saved[i].size || (!!flags != !!size))
+			return -ESTALE;
+		if ((test_bit(i, &sart->protected_entries) ||
+		     test_bit(i, &sart->used_entries)) && (!flags || !size))
+			return -ESTALE;
+	}
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_sart_sleep_validate);
 
 static const struct dev_pm_ops apple_sart_pm_ops = {
 	LATE_SYSTEM_SLEEP_PM_OPS(apple_sart_suspend_late, NULL)

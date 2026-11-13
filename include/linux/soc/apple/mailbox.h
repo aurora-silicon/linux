@@ -102,11 +102,20 @@ int apple_mbox_start(struct apple_mbox *mbox);
 void apple_mbox_stop(struct apple_mbox *mbox);
 /* For a caller with interrupts off, where apple_mbox_send()'s own deadline can't pass. */
 bool apple_mbox_send_ready(struct apple_mbox *mbox);
+/* T6050 ANS only: raw native idle-status scalar, not a DMA-lifetime fence. */
+int apple_mbox_ans_idle_status(struct apple_mbox *mbox, u32 *status);
 int apple_mbox_restore(struct apple_mbox *mbox);
 int apple_mbox_poll(struct apple_mbox *mbox);
 /* Narrow no-post-callback-MMIO receive; see provider's supported transport guard. */
 bool apple_mbox_poll_one_supported(struct apple_mbox *mbox);
 int apple_mbox_poll_one(struct apple_mbox *mbox);
+/* The saved-context lane: one trylock, at most one FIFO transfer, no wait.
+ * Caller holds the consumer's PM/device scope and has synchronized/masked RX.
+ * EAGAIN/EBUSY on send guarantees that no packet was posted. ASCWrap v8 is
+ * unsupported here; its powered-window lifecycle needs a separate contract.
+ */
+int apple_mbox_send_nowait(struct apple_mbox *mbox, struct apple_mbox_msg msg);
+int apple_mbox_recv_nowait(struct apple_mbox *mbox, struct apple_mbox_msg *msg);
 /* Bit 0 of the receive control word, for firmware that powers itself down. */
 void apple_mbox_set_recv_enabled(struct apple_mbox *mbox, bool enabled);
 /*

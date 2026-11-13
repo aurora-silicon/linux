@@ -68,6 +68,19 @@ struct apple_rtkit_inherited_buffer {
 #define APPLE_RTKIT_EARLY_CRASHLOG		BIT(3)
 
 /*
+ * The co-processor places its syslog and oslog buffers itself and offers them with their IOVA
+ * (the T6050 AOP2): take each as the firmware's, without a CPU mapping, and answer nothing, as
+ * macOS does. Its log messages are still acknowledged, unread.
+ */
+#define APPLE_RTKIT_FIRMWARE_OWNED_LOGS		BIT(4)
+
+/*
+ * As XNU with the T6050 AOP: ioreport's type 0xc goes unanswered, and oslog's
+ * buffer reply carries no size.
+ */
+#define APPLE_RTKIT_XNU_AOP_MESSAGES		BIT(5)
+
+/*
  * Struct to represent implementation-specific RTKit operations.
  *
  * @flags:         Combination of APPLE_RTKIT_* flags describing the
@@ -104,6 +117,9 @@ struct apple_rtkit_inherited_buffer {
 struct apple_rtkit_ops {
 	unsigned int flags;
 	void (*crashed)(void *cookie, const void *crashlog, size_t crashlog_size);
+	/* App endpoints to start, in order, as soon as the map is complete: before IOP power. */
+	u8 early_eps[8];
+	u8 early_ep_count;
 	void (*recv_message)(void *cookie, u8 endpoint, u64 message);
 	bool (*recv_message_early)(void *cookie, u8 endpoint, u64 message);
 	int (*shmem_setup)(void *cookie, struct apple_rtkit_shmem *bfr);
@@ -261,6 +277,10 @@ int apple_rtkit_poweroff(struct apple_rtkit *rtk);
  * Put the co-processor into idle mode
  */
 int apple_rtkit_idle(struct apple_rtkit *rtk);
+/* The mailbox's receive-enable bit (I2A_CONTROL bit 0): off once a slept firmware has answered its idle. */
+void apple_rtkit_set_recv_enabled(struct apple_rtkit *rtk, bool enabled);
+int apple_rtkit_idle_strict(struct apple_rtkit *rtk);
+int apple_rtkit_warm_restart_strict(struct apple_rtkit *rtk);
 
 /*
  * Turn the mailbox off for a co-processor that has acknowledged idle, before its
@@ -288,6 +308,17 @@ void apple_rtkit_mailbox_recv_off(struct apple_rtkit *rtk);
  */
 int apple_rtkit_warm_restart(struct apple_rtkit *rtk);
 
+/* ANS owner only: hold buffer geometry across a prepared/committed sleep.
+ * prepare/release run in process context; check is read-only, usable noirq.
+ * start requires a real power-loss receipt from the caller; it does not
+ * establish one. Failed start/finish retains buffers and the hold.
+ */
+int apple_rtkit_ans_prepare(struct apple_rtkit *rtk);
+int apple_rtkit_ans_check(struct apple_rtkit *rtk);
+void apple_rtkit_ans_release(struct apple_rtkit *rtk);
+int apple_rtkit_ans_start(struct apple_rtkit *rtk, void __iomem *cpu_control);
+int apple_rtkit_ans_finish(struct apple_rtkit *rtk);
+
 /*
  * For a firmware whose last endpoint map is answered, on a warm restart, with
  * only the endpoints in @last_mask rather than an echo of all of them.
@@ -302,6 +333,26 @@ int apple_rtkit_ap_power(struct apple_rtkit *rtk, bool on);
 
 /* The same, for a noirq phase: device interrupts are off, so it polls. */
 int apple_rtkit_ap_power_noirq(struct apple_rtkit *rtk, bool on);
+
+/* The M5 Pro's AP-only saved-context lane. begin/end run in process context,
+ * with the consumer device locked throughout. Exclude every other RTKit user.
+ * begin synchronizes RX and refuses while accepted jobs are still active;
+ * it never flushes shutdown-capable notifiers under the consumer device lock. end queues lossless deferred dispatch before
+ * restoring RX; the caller must first release those locks. poll/send/AP power
+ * allocate nothing, never sleep, and need no worker. A timeout does not cancel
+ * an AP post: its matching ACK must arrive before an opposite request can post.
+ * Errors are retained; this API does not attest resumed-device recovery.
+ */
+int apple_rtkit_m5_saved_begin(struct apple_rtkit *rtk, u8 endpoint,
+				u64 (*stamp)(void));
+void apple_rtkit_m5_saved_end(struct apple_rtkit *rtk);
+bool apple_rtkit_m5_saved_notification_pending(struct apple_rtkit *rtk);
+bool apple_rtkit_m5_saved_unresolved(struct apple_rtkit *rtk);
+int apple_rtkit_m5_saved_poll(struct apple_rtkit *rtk);
+/* On any error, this send has NOT posted the packet. */
+int apple_rtkit_m5_saved_send(struct apple_rtkit *rtk, u64 message);
+int apple_rtkit_m5_saved_ap_power(struct apple_rtkit *rtk, bool on,
+				u64 *sent, u64 *ack);
 
 /*
  * Stop a co-processor for a system sleep that may remove its power: idle, wait
@@ -363,6 +414,15 @@ bool apple_rtkit_is_crashed(struct apple_rtkit *rtk);
  * sent or received from that endpoint.
  */
 int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint);
+
+/*
+ * Interrupts off, one CPU: between begin and end, send @msg on @ep and poll for an answer on it
+ * with (word & @mask) == @want; and the AP's IDLE alone, its CPU left running.
+ */
+void apple_rtkit_polled_begin(struct apple_rtkit *rtk);
+void apple_rtkit_polled_end(struct apple_rtkit *rtk);
+int apple_rtkit_polled_exchange(struct apple_rtkit *rtk, u8 ep, u64 msg, u64 mask, u64 want);
+int apple_rtkit_polled_ap_idle(struct apple_rtkit *rtk, unsigned int *us);
 
 /*
  * Send a message to the given endpoint.
@@ -434,5 +494,16 @@ void apple_rtkit_flush_rx(struct apple_rtkit *rtk);
  * @ep:             endpoint to check for
  */
 bool apple_rtkit_has_endpoint(struct apple_rtkit *rtk, u8 ep);
+/* Session inventory only, not an endpoint close or firmware-idle proof. */
+bool apple_rtkit_endpoint_started(struct apple_rtkit *rtk, u8 ep);
+/* The accepted-work counter, from publication through callback completion.
+ * Snapshot only until the owner synchronizes RX; never an IDLE ACK substitute.
+ */
+bool apple_rtkit_v27_rx_drained(struct apple_rtkit *rtk);
+
+/* The SMC's sleep constructor; tracking starts before RX admission. */
+struct apple_rtkit *devm_apple_rtkit_init_m5_saved(struct device *dev, void *cookie,
+						 const char *mbox_name, int mbox_idx,
+						 const struct apple_rtkit_ops *ops);
 
 #endif /* _LINUX_APPLE_RTKIT_H_ */

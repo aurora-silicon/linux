@@ -222,6 +222,8 @@ impl<T: Operations> RtKit<T> {
         } else {
             0
         },
+        early_eps: [0; 8],
+        early_ep_count: 0,
         syslog_is_debug: None,
         crashed: Some(crashed_callback::<T>),
         recv_message: Some(recv_message_callback::<T>),
