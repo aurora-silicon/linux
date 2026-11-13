@@ -311,6 +311,16 @@ int apple_rtkit_ap_power(struct apple_rtkit *rtk, bool on);
 int apple_rtkit_ap_power_noirq(struct apple_rtkit *rtk, bool on);
 
 /*
+ * The idle notice with interrupts off and one CPU up, where nothing can sleep and the
+ * receive work doesn't run: the mailbox is polled a bounded number of times, with no
+ * clock read, and the acknowledgment is taken in the poll. A message on one of the
+ * client's own endpoints still goes to recv_message_early; one it leaves waits for the
+ * receive work. @us is about how long the acknowledgment took. The wake's notice is
+ * apple_rtkit_ap_power() or apple_rtkit_ap_power_noirq(), as after any other.
+ */
+int apple_rtkit_ap_idle_polled(struct apple_rtkit *rtk, unsigned int *us);
+
+/*
  * Stop a co-processor for a system sleep that may remove its power: idle, wait
  * for the status that shows it has finished, then clear the run bit. On an error
  * the run bit is still set and the firmware still runs.

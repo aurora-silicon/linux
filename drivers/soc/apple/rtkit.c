@@ -2571,18 +2571,21 @@ static int apple_rtkit_polled_state(struct apple_rtkit *rtk, u8 type, unsigned i
 	return -ETIMEDOUT;
 }
 
-int apple_rtkit_sleep_idle_polled(struct apple_rtkit *rtk, void __iomem *cpu_control,
-				  unsigned int *us)
+/* The receive path while a notice is polled for, and the usual one after it. */
+static void apple_rtkit_polled_set_rx(struct apple_rtkit *rtk,
+				      void (*rx)(struct apple_mbox *mbox,
+						 struct apple_mbox_msg msg, void *cookie))
 {
 	unsigned long flags;
-	u64 owed;
-	u32 status;
-	int ret;
 
-	*us = 0;
 	spin_lock_irqsave(&rtk->mbox->rx_lock, flags);
-	rtk->mbox->rx = apple_rtkit_polled_rx;
+	rtk->mbox->rx = rx;
 	spin_unlock_irqrestore(&rtk->mbox->rx_lock, flags);
+}
+
+static void apple_rtkit_polled_owed(struct apple_rtkit *rtk)
+{
+	u64 owed;
 
 	/* What's already waiting is answered first, or the firmware may not go idle. */
 	apple_mbox_poll(rtk->mbox);
@@ -2594,6 +2597,17 @@ int apple_rtkit_sleep_idle_polled(struct apple_rtkit *rtk, void __iomem *cpu_con
 		if (!apple_rtkit_polled_send(rtk, echo))
 			dev_err(rtk->dev, "RTKit: oslog echo failed before the idle\n");
 	}
+}
+
+int apple_rtkit_sleep_idle_polled(struct apple_rtkit *rtk, void __iomem *cpu_control,
+				  unsigned int *us)
+{
+	u32 status;
+	int ret;
+
+	*us = 0;
+	apple_rtkit_polled_set_rx(rtk, apple_rtkit_polled_rx);
+	apple_rtkit_polled_owed(rtk);
 
 	ret = apple_rtkit_polled_state(rtk, APPLE_RTKIT_MGMT_SET_AP_PWR_STATE,
 				       &rtk->ap_power_state, us);
@@ -2606,13 +2620,42 @@ int apple_rtkit_sleep_idle_polled(struct apple_rtkit *rtk, void __iomem *cpu_con
 						APPLE_ASC_CPU_STATUS_DOWN,
 						APPLE_RTKIT_POLLED_STEP_US, 5000);
 
-	spin_lock_irqsave(&rtk->mbox->rx_lock, flags);
-	rtk->mbox->rx = apple_rtkit_rx;
-	spin_unlock_irqrestore(&rtk->mbox->rx_lock, flags);
+	apple_rtkit_polled_set_rx(rtk, apple_rtkit_rx);
 
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_sleep_idle_polled);
+
+/*
+ * For a co-processor that stays up: its client may still be owed a reply or an event on
+ * its own endpoints. Those go the usual way, to recv_message_early and, if it leaves
+ * them, to the receive work, which runs again after the wake.
+ */
+static void apple_rtkit_ap_polled_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg,
+				     void *cookie)
+{
+	if (msg.msg1 >= APPLE_RTKIT_APP_ENDPOINT_START)
+		apple_rtkit_rx(mbox, msg, cookie);
+	else
+		apple_rtkit_polled_rx(mbox, msg, cookie);
+}
+
+int apple_rtkit_ap_idle_polled(struct apple_rtkit *rtk, unsigned int *us)
+{
+	int ret;
+
+	*us = 0;
+	apple_rtkit_polled_set_rx(rtk, apple_rtkit_ap_polled_rx);
+	apple_rtkit_polled_owed(rtk);
+
+	ret = apple_rtkit_polled_state(rtk, APPLE_RTKIT_MGMT_SET_AP_PWR_STATE,
+				       &rtk->ap_power_state, us);
+
+	apple_rtkit_polled_set_rx(rtk, apple_rtkit_rx);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_ap_idle_polled);
 
 void apple_rtkit_mailbox_recv_off(struct apple_rtkit *rtk)
 {
