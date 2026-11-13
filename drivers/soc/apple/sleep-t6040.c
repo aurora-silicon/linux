@@ -2353,6 +2353,19 @@ static int t6040_sleep_begin(suspend_state_t state)
 	s->returned = false;
 	s->gp_saved[0] = false;
 	s->gp_saved[1] = false;
+	/*
+	 * Decide before anything is written: a refused suspend leaves the AOP islands, the SMC
+	 * rail request and the DCS power words as they were. Only a dry run or a proceeding
+	 * suspend, which both go through device suspend and .enter, needs them set up.
+	 */
+	if (begin_total && !dry) {
+		dev_info(s->dev, "suspend requested: %u live blocker(s) (%u display, cleared during device suspend)\n",
+			 live, disp);
+		t6040_sleep_log_blockers(s);
+		dev_info(s->dev, "refusing the suspend; nothing entered\n");
+		return -EOPNOTSUPP;
+	}
+
 	t6040_aop_ps_save(s);
 	t6040_sleep_pmvc(s);
 	t6040_dcs_dyn_pg(s);
@@ -2378,26 +2391,22 @@ static int t6040_sleep_begin(suspend_state_t state)
 		 live, disp);
 	t6040_sleep_log_blockers(s);
 
-	if (dry) {
-		dry = min(dry, 2U);
-		t6040_sleep_power_ops(s);
-		if (!s->power_ops)
-			dev_warn(s->dev, "dry run: no CPU parking power ops, so no hold at the commit point\n");
-		t6040_sleep_set_dry(s, dry);
-		pm_set_suspend_via_firmware();
-		secs = min(READ_ONCE(wd2_secs), WDT_MAX_SECS);
-		if (secs && s->wdt)
-			t6040_sleep_set_wd2(s, secs);
-		else
-			secs = 0;
-		dev_info(s->dev, "dry run %u: firmware-driven device sleep short of %s, refused at the commit point, WD2 %u s (0: off)\n",
-			 dry, dry >= 2 ? "the stops only a power cycle undoes" :
-			 "the last steps", secs);
-		return 0;
-	}
-
-	dev_info(s->dev, "refusing the suspend; nothing entered\n");
-	return -EOPNOTSUPP;
+	/* A dry run: the refusal case returned above. */
+	dry = min(dry, 2U);
+	t6040_sleep_power_ops(s);
+	if (!s->power_ops)
+		dev_warn(s->dev, "dry run: no CPU parking power ops, so no hold at the commit point\n");
+	t6040_sleep_set_dry(s, dry);
+	pm_set_suspend_via_firmware();
+	secs = min(READ_ONCE(wd2_secs), WDT_MAX_SECS);
+	if (secs && s->wdt)
+		t6040_sleep_set_wd2(s, secs);
+	else
+		secs = 0;
+	dev_info(s->dev, "dry run %u: firmware-driven device sleep short of %s, refused at the commit point, WD2 %u s (0: off)\n",
+		 dry, dry >= 2 ? "the stops only a power cycle undoes" :
+		 "the last steps", secs);
+	return 0;
 }
 
 /* After the device suspend, in process context. */
