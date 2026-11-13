@@ -384,7 +384,7 @@ struct dcp_camera_indicator {
 	struct dcp_indicator state;
 	spinlock_t lock;
 	struct mutex ctl;
-	struct completion presented;
+	struct delayed_work watch;
 	struct drm_plane *plane;
 	struct drm_framebuffer *fb;
 	u32 surf;
@@ -1233,6 +1233,7 @@ void dcp_trace_panel_property(struct apple_dcp *dcp, int tag, const char *key,
 void dcp_panel_edid_receive(struct apple_dcp *dcp, const void *blob, size_t len);
 
 int dcp_indicator_probe(struct apple_dcp *dcp);
+void dcp_indicator_release(struct apple_dcp *dcp);
 int dcp_indicator_attach_plane(struct apple_dcp *dcp, struct drm_device *drm,
 			       struct drm_plane *plane);
 void dcp_indicator_swap_done(struct apple_dcp *dcp, struct drm_framebuffer *slot_fb);

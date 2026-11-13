@@ -1187,7 +1187,7 @@ static int apple_probe_per_dcp(struct device *dev,
 		ret = drm_plane_create_zpos_immutable_property(ind_plane, zpos++);
 		if (ret)
 			return ret;
-		/* Without its buffer the plane stays reserved and the camera stays off. */
+		/* Without its buffer the plane stays reserved and no indicator is shown. */
 		ret = dcp_indicator_attach_plane(dcp_data, drm, ind_plane);
 		if (ret)
 			dev_err(dev, "camera indicator unavailable: %d\n", ret);
