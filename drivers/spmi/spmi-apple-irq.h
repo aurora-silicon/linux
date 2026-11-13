@@ -17,12 +17,12 @@
 /*
  * Generation 4 (T8142, T6050): ack and pending words from 0x600, the fault source
  * 263 acked at 0x620 bit 7 (traced from macOS under the hypervisor). The mask bank
- * is not found; see APPLE_SPMI_GEN4_IRQ_MASK.
+ * is at 0x400 (see APPLE_SPMI_GEN4_IRQ_MASK).
  */
 #define APPLE_SPMI_GEN4_IRQ_ACK 0x600
 #define APPLE_SPMI_GEN4_FAULT_IRQ (256 + 7)
-/* No mask bank found by toggling every word in 0x20..0x7f and 0x500..0x6ff (K114c): 0 = soft mask only */
-#define APPLE_SPMI_GEN4_IRQ_MASK 0
+/* Mask bank mirrors the ack bank 0x200 below; +0x400..0x41c toggle on K114c, +0x420 does not. */
+#define APPLE_SPMI_GEN4_IRQ_MASK 0x400
 
 static inline u32 apple_spmi_irq_reg(u32 base, u32 irq)
 {

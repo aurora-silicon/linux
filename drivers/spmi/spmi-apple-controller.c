@@ -137,17 +137,14 @@ static void apple_spmi_irq_mask_raw(struct apple_spmi *spmi, u32 irq)
 {
 	u32 __iomem *reg = spmi->regs + spmi->hw->irq_mask + (irq / 32) * 4;
 
-	/* Generation 4 has no mask bank found: sources are masked in irq_mask_cache only. */
-	if (spmi->hw->irq_mask)
-		writel(readl(reg) & ~BIT(irq % 32), reg);
+	writel(readl(reg) & ~BIT(irq % 32), reg);
 }
 
 static void apple_spmi_irq_unmask_raw(struct apple_spmi *spmi, u32 irq)
 {
 	u32 __iomem *reg = spmi->regs + spmi->hw->irq_mask + (irq / 32) * 4;
 
-	if (spmi->hw->irq_mask)
-		writel(readl(reg) | BIT(irq % 32), reg);
+	writel(readl(reg) | BIT(irq % 32), reg);
 }
 
 static void apple_spmi_irq_ack(struct irq_data *d)
@@ -547,8 +544,7 @@ static void apple_spmi_teardown_irq(void *data)
 	struct apple_spmi *spmi = data;
 
 	for (size_t offset = 0; offset < (spmi->hw->num_irqs + 32) / 8; offset += 4)
-		if (spmi->hw->irq_mask)
-			writel(0, spmi->regs + spmi->hw->irq_mask + offset);
+		writel(0, spmi->regs + spmi->hw->irq_mask + offset);
 
 	synchronize_irq(spmi->irq);
 	irq_set_chained_handler_and_data(spmi->irq, NULL, NULL);
@@ -568,8 +564,7 @@ static int apple_spmi_init_irq(struct platform_device *pdev,
 	raw_spin_lock_init(&spmi->irq_mask_lock);
 
 	for (size_t offset = 0; offset < (spmi->hw->num_irqs + 32) / 8; offset += 4) {
-		if (spmi->hw->irq_mask)
-			writel(0, spmi->regs + spmi->hw->irq_mask + offset);
+		writel(0, spmi->regs + spmi->hw->irq_mask + offset);
 		writel(U32_MAX, spmi->regs + spmi->hw->irq_ack + offset);
 	}
 
@@ -624,8 +619,17 @@ static int apple_spmi_resume_noirq(struct device *dev)
 	unsigned long flags;
 	size_t i;
 
-	if (!spmi->notify_parked)
+	if (!spmi->notify_parked) {
+		/* Gen 4 never parks the notification, but a firmware sleep entry writes the mask bank itself. */
+		if (spmi->hw->legacy_irqs || !spmi->irqd || !pm_resume_via_firmware())
+			return 0;
+		raw_spin_lock_irqsave(&spmi->irq_mask_lock, flags);
+		bitmap_to_arr32(words, spmi->irq_mask_cache, spmi->hw->num_irqs);
+		for (i = 0; i < spmi->hw->num_irqs / 32; i++)
+			writel(words[i], spmi->regs + spmi->hw->irq_mask + i * 4);
+		raw_spin_unlock_irqrestore(&spmi->irq_mask_lock, flags);
 		return 0;
+	}
 
 	guard(mutex)(&spmi->fifo_lock);
 	raw_spin_lock_irqsave(&spmi->irq_mask_lock, flags);

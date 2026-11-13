@@ -32,8 +32,11 @@ int main(void)
 	assert(apple_spmi_irq_bit(19) == BIT(19));
 	assert(apple_spmi_irq_reg(APPLE_SPMI_GEN4_IRQ_ACK, APPLE_SPMI_GEN4_FAULT_IRQ) == 0x620);
 	assert(apple_spmi_irq_bit(APPLE_SPMI_GEN4_FAULT_IRQ) == BIT(7));
-	/* no hardware mask bank for gen 4 */
-	assert(APPLE_SPMI_GEN4_IRQ_MASK == 0);
+	/* gen 4 mask bank (measured on K114c, Dj's HV trace writes +0x420), mirrors the ack bank */
+	assert(APPLE_SPMI_GEN4_IRQ_MASK == 0x400);
+	assert(apple_spmi_irq_reg(APPLE_SPMI_GEN4_IRQ_MASK, 2) == 0x400);
+	assert(apple_spmi_irq_reg(APPLE_SPMI_GEN4_IRQ_MASK, 263) == 0x420);
+	assert(APPLE_SPMI_GEN4_IRQ_ACK - APPLE_SPMI_GEN4_IRQ_MASK == 0x200);
 	/* the last peripheral source is in word 7 */
 	assert(apple_spmi_irq_reg(APPLE_SPMI_GEN4_IRQ_ACK, 255) == 0x61c);
 
