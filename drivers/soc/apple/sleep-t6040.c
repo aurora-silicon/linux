@@ -1919,12 +1919,18 @@ static void t6040_gp_port_stop(struct t6040_sleep *s, int p)
 	writel(readl(port + APCIE_PORT_INTSTAT), port + APCIE_PORT_INTSTAT);
 }
 
+/* Whether the GP host's system domain is still on; if not, there is nothing left to stop. */
+static __always_inline bool t6040_apcie_sys_gp_on(struct t6040_sleep *s)
+{
+	return FIELD_GET(PS_ACTUAL, readl(s->soc_east + PS_APCIE_SYS_GP));
+}
+
 /* The GP host's two ports, while the block's domains are all still on. */
 static void t6040_gp_ports_stop(struct t6040_sleep *s)
 {
 	int p;
 
-	if (!FIELD_GET(PS_ACTUAL, readl(s->soc_east + PS_APCIE_SYS_GP)))
+	if (!t6040_apcie_sys_gp_on(s))
 		return;
 	for (p = 0; p < ARRAY_SIZE(s->gp_port); p++)
 		t6040_gp_port_stop(s, p);
@@ -1943,7 +1949,7 @@ static void t6040_apcie_gp_lower(struct t6040_sleep *s)
 
 	sys = s->soc_east + PS_APCIE_SYS_GP;
 	gp = s->soc_east + PS_APCIE_GP;
-	if (!FIELD_GET(PS_ACTUAL, readl(sys)))
+	if (!t6040_apcie_sys_gp_on(s))
 		return;
 
 	val = readl(sys);
