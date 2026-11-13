@@ -115,7 +115,16 @@ static void combo_pipe_fault(struct t6050_dp *dp, const char *what, int ret)
 	dp->faulted = true;
 }
 
-static int combo_stop(struct t6050_dp *dp)
+static bool combo_domains_held(struct t6050_dp *dp)
+{
+	for (unsigned int i = 0; i < dp->ndomains; i++)
+		if (dp->domain[i].active)
+			return true;
+	return false;
+}
+
+/* @keep_aon leaves the always-on domain's reference, for a sleep or for the start that follows. */
+static int combo_stop(struct t6050_dp *dp, bool keep_aon)
 {
 	int ret;
 
@@ -132,17 +141,21 @@ static int combo_stop(struct t6050_dp *dp)
 		if (!ret)
 			dp->usb2_active = false;
 	}
+	/* The mode's own shutdown drops the wrapper; it is still held only if that did not run. */
+	if (!ret)
+		ret = atc_domain_set(&dp->domain[2], false);
 	if (!ret && dp->ndomains > 3)
 		ret = atc_domain_set(&dp->domain[3], false);
 	if (!ret)
 		ret = atc_domain_set(&dp->domain[1], false);
-	if (!ret)
+	if (!ret && !keep_aon)
 		ret = atc_domain_set(&dp->domain[0], false);
 	if (ret) {
 		dev_err(dp->dev, "stop failed (%d)\n", ret);
 		dp->faulted = true;
 		return ret < 0 ? ret : -EIO;
 	}
+	dp->aon_kept = keep_aon && dp->domain[0].active;
 	dp->combo_mode = COMBO_SAFE;
 	return 0;
 }
@@ -165,6 +178,7 @@ static int combo_start(struct t6050_dp *dp, enum combo_mode mode)
 	 */
 	if (!ret && dp->ndomains > 3)
 		ret = atc_domain_set(&dp->domain[3], true);
+	dp->aon_kept = false;
 	if (!ret)
 		ret = APPLE_T6050_USB_RUN(&dp->usb_platform, apple_t6050_usb2_host);
 	if (!ret)
@@ -216,7 +230,7 @@ static int combo_orientation(struct t6050_dp *dp, enum typec_orientation orienta
 		return -EINVAL;
 	if (dp->orientation == orientation)
 		return 0;
-	ret = combo_stop(dp);
+	ret = combo_stop(dp, false);
 	if (!ret) {
 		dp->orientation = orientation;
 		dp->reverse = orientation == TYPEC_ORIENTATION_REVERSE;
@@ -251,15 +265,135 @@ static int combo_mux(struct t6050_dp *dp, struct typec_mux_state *state)
 	guard(mutex)(&dp->lock);
 	if (dp->faulted)
 		return -EIO;
+	/* SAFE with a domain still held: a sleep kept it, and nothing came back on the port. */
 	if (mode == dp->combo_mode &&
-	    (mode == COMBO_SAFE || dp->usb_prepared || dp->cio_prepared || dp->enabled))
+	    (mode == COMBO_SAFE ? !combo_domains_held(dp) :
+	     dp->usb_prepared || dp->cio_prepared || dp->enabled))
 		return 0;
 	if (mode != COMBO_SAFE && dp->orientation == TYPEC_ORIENTATION_NONE)
 		return -ENOLINK;
-	ret = combo_stop(dp);
+	/* A start right after a sleep finds the always-on side as the sleep kept it. */
+	ret = combo_stop(dp, mode != COMBO_SAFE && dp->aon_kept);
 	if (ret || mode == COMBO_SAFE)
 		return ret;
 	return combo_start(dp, mode);
+}
+
+/*
+ * Before a firmware sleep, once every user of the port has suspended: the mode's shutdown with
+ * the idle form of the PHY CPU's stop, then the wrapper, USB and common domains. The always-on
+ * domain stays up for a port in use. A stop that cannot run
+ * leaves the PHY as it is, and the wake forgets it.
+ */
+static int combo_suspend_late(struct t6050_dp *dp)
+{
+	bool keep;
+	int ret;
+
+	guard(mutex)(&dp->lock);
+	dp->sleep_stopped = false;
+	dp->sleep_mode = dp->combo_mode;
+	if (dp->faulted) {
+		dev_warn(dp->dev, "faulted before the sleep: left as it is\n");
+		return 0;
+	}
+	if (dp->controller_active || dp->pipe_active) {
+		dev_warn(dp->dev, "USB controller still up at the sleep: PHY left as it is\n");
+		return 0;
+	}
+	keep = dp->aon_syscore && dp->combo_mode != COMBO_SAFE && dp->domain[0].active;
+	ret = combo_stop(dp, keep);
+	if (ret) {
+		dev_warn(dp->dev, "not stopped for the sleep (%d)\n", ret);
+		return 0;
+	}
+	dp->sleep_stopped = true;
+	if (dp->sleep_mode != COMBO_SAFE)
+		dev_info(dp->dev, "mode %d stopped for the sleep, always-on domain %s\n",
+			 dp->sleep_mode, dp->aon_kept ? "kept" : "released");
+	return 0;
+}
+
+/*
+ * After a firmware sleep the PHY core and its CPU were powered off: nothing cached describes
+ * the hardware any more, and no register is touched here. The domain references stay as they
+ * are; the next mode request releases them and starts from cold.
+ */
+static void combo_resume_noirq(struct t6050_dp *dp)
+{
+	guard(mutex)(&dp->lock);
+	dp->usb_prepared = dp->cio_prepared = dp->enabled = false;
+	dp->usb2_active = dp->pipe_active = dp->pipe_tunnel = dp->controller_active = false;
+	/* A CPU that was still running lost its power with the rest: its next start is a cold one. */
+	if (dp->fw_running) {
+		dp->fw_running = false;
+		dp->fw_cold = true;
+	}
+	dp->rate = -1;
+	memset(dp->voltage, 0, sizeof(dp->voltage));
+	memset(dp->pre, 0, sizeof(dp->pre));
+	dp->combo_mode = COMBO_SAFE;
+	dp->faulted = false;
+}
+
+/* A sleep that was stopped for and did not happen: back to the mode the stop took down. */
+static void combo_resume(struct t6050_dp *dp)
+{
+	int ret;
+
+	guard(mutex)(&dp->lock);
+	if (!dp->sleep_stopped)
+		return;
+	dp->sleep_stopped = false;
+	if (pm_resume_via_firmware() || dp->faulted ||
+	    dp->sleep_mode == COMBO_SAFE || dp->combo_mode != COMBO_SAFE)
+		return;
+	ret = combo_start(dp, dp->sleep_mode);
+	if (ret)
+		dev_warn(dp->dev, "mode %d not back after the sleep that did not happen (%d)\n",
+			 dp->sleep_mode, ret);
+	else
+		dev_info(dp->dev, "mode %d back: the sleep did not happen\n", dp->sleep_mode);
+}
+
+/*
+ * A port in use keeps its always-on domain through a deep sleep: held out of the system
+ * transition from before its prepare to after its complete, so the power domain is not
+ * counted as suspended, and asked of the sleep driver, which lowers the word otherwise.
+ */
+static int combo_pm_notify(struct notifier_block *nb, unsigned long action, void *unused)
+{
+	struct t6050_dp *dp = container_of(nb, struct t6050_dp, pm_nb);
+
+	guard(mutex)(&dp->lock);
+	switch (action) {
+	case PM_SUSPEND_PREPARE:
+		if (pm_suspend_default_s2idle() || dp->faulted || dp->aon_syscore ||
+		    dp->combo_mode == COMBO_SAFE || !dp->domain[0].active)
+			break;
+		if (!apple_sleep_usb_aon_keep(dp->port, true))
+			break;
+		dev_pm_syscore_device(dp->domain[0].dev, true);
+		dp->aon_syscore = true;
+		break;
+	case PM_POST_SUSPEND:
+		apple_sleep_usb_aon_keep(dp->port, false);
+		if (dp->aon_syscore) {
+			dev_pm_syscore_device(dp->domain[0].dev, false);
+			dp->aon_syscore = false;
+		}
+		break;
+	default:
+		break;
+	}
+	return NOTIFY_DONE;
+}
+
+static void combo_pm_notifier_remove(void *data)
+{
+	struct t6050_dp *dp = data;
+
+	unregister_pm_notifier(&dp->pm_nb);
 }
 
 static int combo_usb2_mode(struct phy *phy, enum phy_mode mode, int submode)
@@ -522,6 +656,10 @@ static int combo_setup(struct platform_device *pdev, struct t6050_dp *dp)
 			return PTR_ERR(dp->combo_phy[i]);
 		phy_set_drvdata(dp->combo_phy[i], dp);
 	}
-	return 0;
+	dp->pm_nb.notifier_call = combo_pm_notify;
+	ret = register_pm_notifier(&dp->pm_nb);
+	if (ret)
+		return ret;
+	return devm_add_action_or_reset(dev, combo_pm_notifier_remove, dp);
 }
 

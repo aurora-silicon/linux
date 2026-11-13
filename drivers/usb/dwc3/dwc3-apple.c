@@ -193,12 +193,15 @@ struct dwc3_apple {
 	bool sleep_stopped;
 	bool sleep_wakeup;
 	enum dwc3_apple_state sleep_state;
+	/* The start after a sleep may find its Type-C PHY not started yet: the role switch follows. */
+	bool sleep_phy_wait;
 
 	void __iomem *drd_regs[DWC3_APPLE_NR_DRD_REGS];
 	struct apple_tunable *tunables[DWC3_APPLE_NR_TUNABLES];
 };
 
 #define to_dwc3_apple(d) container_of((d), struct dwc3_apple, dwc)
+
 
 /*
  * Apple Silicon dwc3 vendor-specific registers
@@ -749,7 +752,10 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
 
 	ret = reset_control_deassert(appledwc->reset);
 	if (ret) {
-		dev_err(appledwc->dev, "Failed to deassert reset, err=%d\n", ret);
+		if (ret == -ENOLINK && appledwc->sleep_phy_wait)
+			dev_dbg(appledwc->dev, "PHY not started yet, reset kept\n");
+		else
+			dev_err(appledwc->dev, "Failed to deassert reset, err=%d\n", ret);
 		/* Nothing was started: drop the reference again. */
 		ret_reset = dwc3_apple_core_stop(appledwc);
 		if (ret_reset)
@@ -968,7 +974,20 @@ static int dwc3_apple_start_after_sleep(struct dwc3_apple *appledwc, enum dwc3_a
 	lockdep_assert_held(&appledwc->lock);
 	if (appledwc->fixed_hub)
 		appledwc->dwc.current_dr_role = 0;
+	/*
+	 * After a real sleep a Type-C port's PHY starts with the port controller's mode request,
+	 * and the role switch that follows it starts the controller, as at a plug-in. macOS's
+	 * controller comes after its PHY in the same way.
+	 */
+	appledwc->sleep_phy_wait = !appledwc->fixed_hub && appledwc->role_sw &&
+				   pm_resume_via_firmware();
 	ret = dwc3_apple_init(appledwc, state);
+	if (ret == -ENOLINK && appledwc->sleep_phy_wait) {
+		appledwc->sleep_phy_wait = false;
+		dev_info(appledwc->dev, "waiting for the Type-C port to start the PHY after the sleep\n");
+		return 0;
+	}
+	appledwc->sleep_phy_wait = false;
 	if (ret) {
 		dev_err(appledwc->dev, "Failed to start after sleep, err=%d\n", ret);
 		return ret;

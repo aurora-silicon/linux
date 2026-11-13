@@ -17,9 +17,11 @@
 #include "usb-t6050/apple_t6050_cio_phy.h"
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/suspend.h>
 #include <linux/soc/apple/tunable.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/dp-tunnel.h>
+#include <linux/soc/apple/sleep.h>
 #include <linux/usb/typec.h>
 #include <linux/usb/typec_mux.h>
 #include <linux/usb/typec_dp.h>
@@ -114,6 +116,7 @@ struct t6050_dp {
 	struct apple_rtkit *rtkit;
 	void __iomem *fw_data;
 	bool fw_running;
+	bool fw_cold;		/* idled for a system sleep and halted: its next start is a cold one */
 	void *fw_data_saved;	/* the firmware data SRAM as the first start found it */
 	/* USB4 DP tunnel pixel clocks: source words, gates, running link rates */
 	void __iomem *dp_clk_src;
@@ -121,6 +124,13 @@ struct t6050_dp {
 	bool dp_gates;
 	u8 tunnel_rate[ATC_DP_TUNNELS];
 	u8 tunnel_idle;		/* bit k - 1: clock k runs with no user, see below */
+	/* A combo PHY's system sleep. */
+	u32 port;
+	struct notifier_block pm_nb;
+	enum combo_mode sleep_mode;	/* the mode the sleep's stop took down */
+	bool sleep_stopped;		/* stopped for a sleep that has not been accounted for yet */
+	bool aon_syscore;		/* the always-on domain is held out of this system transition */
+	bool aon_kept;			/* the stop left the always-on domain's reference in place */
 };
 
 static int atc_domain_set(struct atc_domain *pd, bool active)
@@ -207,6 +217,14 @@ static int atc_firmware(struct t6050_dp *dp, bool start)
 	if (dp->fw_running == start)
 		return 0;
 	if (start) {
+		/* After a sleep's idle the CPU was halted: RTKit starts over, receiving on again. */
+		if (dp->fw_cold) {
+			ret = apple_rtkit_reinit(dp->rtkit);
+			if (ret)
+				goto out;
+			apple_rtkit_set_recv_enabled(dp->rtkit, true);
+			dp->fw_cold = false;
+		}
 		/*
 		 * The firmware is the boot loader's, preloaded with its data segment, and keeps
 		 * its state there: restarted on the state its last run left, it never finishes
@@ -226,6 +244,19 @@ static int atc_firmware(struct t6050_dp *dp, bool start)
 		ret = apple_rtkit_wake(dp->rtkit);
 		if (!ret)
 			ret = apple_rtkit_start_ep(dp->rtkit, 0x20);
+	} else if (pm_suspend_target_state != PM_SUSPEND_ON && pm_suspend_via_firmware()) {
+		/*
+		 * A system sleep: the PHY CPU idled, with no power-down message: AP IDLE and its
+		 * echo, IOP IDLE and its ack, receiving off, then the CPU's run bit off as at a
+		 * shutdown. The next start is cold (above).
+		 */
+		ret = apple_rtkit_idle(dp->rtkit);
+		if (!ret) {
+			apple_rtkit_set_recv_enabled(dp->rtkit, false);
+			writel((u32)~BIT(4), dp->banks[38] + 0x28);
+			dp->fw_cold = true;
+			dev_dbg(dp->dev, "PHY firmware idled for a system sleep\n");
+		}
 	} else {
 		/* The PHY mailbox Power Down message, then the RTKit power transition. */
 		ret = apple_rtkit_send_message(dp->rtkit, 0x20, BIT_ULL(56), NULL, false);
@@ -234,6 +265,7 @@ static int atc_firmware(struct t6050_dp *dp, bool start)
 		if (!ret)
 			writel((u32)~BIT(4), dp->banks[38] + 0x28);
 	}
+out:
 	if (ret)
 		dev_err(dp->dev, "PHY firmware %s failed: %d\n", start ? "start" : "stop", ret);
 	else
@@ -879,6 +911,7 @@ static int t6050_dp_probe(struct platform_device *pdev)
 		    !of_property_present(dev->of_node, "apple,guest-port-reserved") ||
 		    !of_property_present(dev->of_node, "mode-switch"))
 			return -EINVAL;
+		dp->port = port;
 	}
 	dp->typec = of_property_present(dev->of_node, "mode-switch");
 	dp->rate = -1;
@@ -1075,9 +1108,42 @@ static void t6050_dp_shutdown(struct platform_device *pdev)
 	struct t6050_dp *dp = platform_get_drvdata(pdev);
 
 	guard(mutex)(&dp->lock);
-	if (dp->combo ? combo_stop(dp) : atc_stop(dp))
+	if (dp->combo ? combo_stop(dp, false) : atc_stop(dp))
 		dev_warn(dp->dev, "PHY shutdown incomplete after an earlier error\n");
 }
+
+static int t6050_dp_suspend_late(struct device *dev)
+{
+	struct t6050_dp *dp = dev_get_drvdata(dev);
+
+	if (!dp->combo || !pm_suspend_via_firmware())
+		return 0;
+	return combo_suspend_late(dp);
+}
+
+static int t6050_dp_resume_noirq(struct device *dev)
+{
+	struct t6050_dp *dp = dev_get_drvdata(dev);
+
+	if (dp->combo && pm_resume_via_firmware())
+		combo_resume_noirq(dp);
+	return 0;
+}
+
+static int t6050_dp_resume(struct device *dev)
+{
+	struct t6050_dp *dp = dev_get_drvdata(dev);
+
+	if (dp->combo)
+		combo_resume(dp);
+	return 0;
+}
+
+static const struct dev_pm_ops t6050_dp_pm_ops = {
+	.suspend_late = pm_sleep_ptr(t6050_dp_suspend_late),
+	.resume_noirq = pm_sleep_ptr(t6050_dp_resume_noirq),
+	.resume = pm_sleep_ptr(t6050_dp_resume),
+};
 
 static const struct of_device_id t6050_dp_match[] = {
 	{ .compatible = "apple,t6050-dp-phy" },
@@ -1092,6 +1158,7 @@ static struct platform_driver t6050_dp_driver = {
 	.driver = {
 		.name = "apple-t6050-dp-phy",
 		.of_match_table = t6050_dp_match,
+		.pm = &t6050_dp_pm_ops,
 	},
 };
 module_platform_driver(t6050_dp_driver);
