@@ -1,0 +1,302 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Retained candidate-44 peripheral definitions, moved to integration's
+ * identity-mapped peripheral bus. Original authorship and definitions
+ * are retained from the T6050/J775c sources.
+ * Copyright The Asahi Linux Contributors
+ */
+/ {
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		nonposted-mmio;
+
+		dart_apcie1: iommu@411000000 {
+			compatible = "apple,t6050-dart", "apple,t8110-dart";
+			reg = <0x4 0x11000000 0x0 0x20000>;
+			interrupts = <AIC_IRQ 0 1532 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			status = "disabled";
+		};
+
+		atc0_xbar: mux@2a324c000 {
+			compatible = "apple,t6050-display-crossbar", "apple,t8142-display-crossbar";
+			reg = <0x2 0xa324c000 0x0 0x4000>;
+			#mux-control-cells = <1>;
+			power-domains = <&ps_atc0_usb_aon>, <&ps_atc0_common>;
+			power-domain-names = "usb-aon", "common";
+		};
+
+		atc1_xbar: mux@2ab24c000 {
+			compatible = "apple,t6050-display-crossbar", "apple,t8142-display-crossbar";
+			reg = <0x2 0xab24c000 0x0 0x4000>;
+			#mux-control-cells = <1>;
+			power-domains = <&ps_atc1_usb_aon>, <&ps_atc1_common>;
+			power-domain-names = "usb-aon", "common";
+		};
+
+		atc3_xbar: mux@38b24c000 {
+			compatible = "apple,t6050-display-crossbar", "apple,t8142-display-crossbar";
+			reg = <0x3 0x8b24c000 0x0 0x4000>;
+			#mux-control-cells = <1>;
+			power-domains = <&ps_atc3_usb_aon>, <&ps_atc3_common>;
+			power-domain-names = "usb-aon", "common";
+		};
+
+		pinctrl_nub: pinctrl@2881e4000 {
+			compatible = "apple,t6050-pinctrl", "apple,t8103-pinctrl";
+			reg = <0x2 0x881e4000 0x0 0x4000>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			gpio-ranges = <&pinctrl_nub 0 0 61>;
+			apple,npins = <61>;
+			gpio-reserved-ranges = <0 14>, <15 46>;
+			gpio-line-names = "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+					  "usb3hub_rst";
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 0 706 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 0 708 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 0 710 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 0 712 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 0 714 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 0 716 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 0 718 IRQ_TYPE_LEVEL_HIGH>;
+
+			usb3hub-rst-hog {
+				gpio-hog;
+				gpios = <14 GPIO_ACTIVE_LOW>;
+				output-low;
+				line-name = "usb3hub_rst";
+			};
+		};
+
+		usb_drd0_dart_0: iommu@2a2f00000 {
+			compatible = "apple,t6050-dart", "apple,t8110-dart";
+			reg = <0x2 0xa2f00000 0x0 0xc000>;
+			interrupts = <AIC_IRQ 0 1423 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_atc0_usb>;
+			#iommu-cells = <1>;
+			apple,dma-range = <0x100 0x4000 0x0 0xffff0000>;
+		};
+
+		usb_drd0_dart_1: iommu@2a2f80000 {
+			compatible = "apple,t6050-dart", "apple,t8110-dart";
+			reg = <0x2 0xa2f80000 0x0 0xc000>;
+			interrupts = <AIC_IRQ 0 1423 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_atc0_usb>;
+			#iommu-cells = <1>;
+			apple,dma-range = <0x100 0x4000 0x0 0xffff0000>;
+		};
+
+		usb_drd0: usb@2a2280000 {
+			compatible = "apple,t6050-dwc3", "apple,t8103-dwc3";
+			reg = <0x2 0xa2280000 0x0 0xcd00>,
+			      <0x2 0xa228cd00 0x0 0x4b00>,
+			      <0x2 0xa2200000 0x0 0x4000>;
+			reg-names = "dwc3-core", "dwc3-apple", "drd-cfg";
+			interrupts = <AIC_IRQ 0 1419 IRQ_TYPE_LEVEL_HIGH>;
+			dr_mode = "otg";
+			usb-role-switch;
+			role-switch-default-mode = "host";
+			iommus = <&usb_drd0_dart_0 0>, <&usb_drd0_dart_1 1>;
+			power-domains = <&ps_atc0_usb>;
+			resets = <&atc0_phy 0>;
+			phys = <&atc0_phy PHY_TYPE_USB2>, <&atc0_phy PHY_TYPE_USB3>;
+			phy-names = "usb2-phy", "usb3-phy";
+			apple,tunable-gbl-default = <0x64 0x2 0x0>, <0x10 0xfff80000 0x00680000>;
+			apple,tunable-gbl-host = <0x4 0x0001ef00 0x00002f00>, <0x1c 0x00000100 0x0>,
+				<0x2c 0x000a07ff 0x000800c8>, <0x100 0x02000100 0x02000100>,
+				<0x504 0x00001000 0x0>, <0x528 0xff0000ff 0x06000006>,
+				<0x52c 0xff0000ff 0x08000008>, <0x580 0xffffffff 0x6f000006>,
+				<0x584 0xffffffff 0x00060000>;
+			apple,tunable-dbg = <0x0 0x8 0x8>;
+			apple,tunable-cfg-host = <0x20 0xff 0x1b>;
+			apple,tunable-link = <0x10 0xff000000 0xff000000>, <0x20 0x7ff00000 0x4e900000>,
+				<0x24 0x001f8000 0x000b8000>, <0x60 0x0003ffff 0x00000600>;
+			apple,tunable-cio = <0x20 0x00ff0000 0x001e0000>;
+
+			port {
+				usb_drd0_hs: endpoint {
+					remote-endpoint = <&hpm0_hs>;
+				};
+			};
+		};
+
+		dart_dispext0_isoc: iommu@2b2180000 {
+			compatible = "apple,t6050-dart", "apple,t8110-dart";
+			reg = <0x2 0xb2180000 0x0 0x20000>;
+			interrupts = <AIC_IRQ 0 1093 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			power-domains = <&ps_dispext0_adma>;
+			apple,dma-range = <0x100 0x0 0x10 0x0>;
+		};
+
+		admac_dispext0: dma-controller@2b2140000 {
+			compatible = "apple,t6050-admac", "apple,t8140-admac";
+			reg = <0x2 0xb2140000 0x0 0x24000>;
+			dma-channels = <1>;
+			interrupts-extended = <&aic AIC_IRQ 0 1092 IRQ_TYPE_LEVEL_HIGH>,
+					      <0>, <0>, <0>;
+			#dma-cells = <1>;
+			iommus = <&dart_dispext0_isoc 30>;
+			power-domains = <&ps_dispext0_adma>;
+			apple,dma-range = <0x100 0x0 0x10 0x0>;
+		};
+
+		dcpext1_mbox: mailbox@392e08000 {
+			compatible = "apple,t6050-asc-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x3 0x92e08000 0x0 0x4000>;
+			interrupts = <AIC_IRQ 0 1195 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 0 1196 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 0 1197 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 0 1198 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "send-not-empty",
+					  "recv-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+			status = "disabled";
+		};
+
+		dcpext1: dcp@392e00000 {
+			compatible = "apple,t6050-dcpext", "apple,dcpext";
+			reg = <0x3 0x92e00000 0x0 0x4000>,
+			      <0x3 0x90000000 0x0 0x4000000>,
+			      <0x3 0x92240000 0x0 0x10000>,
+			      <0x3 0x923ac000 0x0 0x4000>,
+			      <0x3 0x92800000 0x0 0x800000>,
+			      <0x2 0x86700000 0x0 0x114000>,
+			      <0x3 0x92850000 0x0 0x4000>;
+			reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3", "disp-4", "iop-vbar";
+			mboxes = <&dcpext1_mbox>;
+			mbox-names = "mbox";
+			iommus = <&dart_dcpext1 23>;
+			/* The PMC metadata is die 0's one block, dcpext0_pmc; DISP_EXT1's slot in it */
+			apple,bw-scratch = <&dcpext0_pmc 0 5 0x30000>;
+			/* The ADT external-index (iop-dcpext1-nub), as dcpext0's 1 */
+			apple,dcp-index = <2>;
+			apple,clock-ids;
+			apple,connector-type = "HDMI-A";
+			apple,dptx-die = <0>;
+			apple,dptx-phy = <4>;
+			/*
+			 * The fixed HDMI route: the PHY (its source select picks this engine), the
+			 * converter's hotplug output (AOP GPIO 14, active high) and its two power
+			 * enables (the SMC's pcIO lines).
+			 */
+			phys = <&lpdptx_phy0>;
+			phy-names = "dp-phy";
+			hdmi-hpd-gpios = <&pinctrl_aop 14 GPIO_ACTIVE_HIGH>;
+			hdmi-pwren-gpios = <&smc_pcio 0 GPIO_ACTIVE_HIGH>;
+			dp2hdmi-pwren-gpios = <&smc_pcio 1 GPIO_ACTIVE_HIGH>;
+			status = "disabled";
+
+			piodma {
+				iommus = <&dart_dispext1 16>;
+			};
+		};
+
+		dart_dcpext1: iommu@392340000 {
+			compatible = "apple,t6050-dart", "apple,t8110-dart";
+			reg = <0x3 0x92340000 0x0 0x20000>;
+			/* dart-dcpext1 and dart-dispext1 share ADT interrupt 1142 */
+			interrupts = <AIC_IRQ 0 1142 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			/* ADT vm-base 1 TiB, vm-size 3 TiB */
+			apple,dma-range = <0x100 0x0 0x300 0x0>;
+			status = "disabled";
+		};
+
+		dart_dispext1: iommu@392300000 {
+			compatible = "apple,t6050-dart", "apple,t8110-dart";
+			/* reg[0] only, as for dart-dispext0 */
+			reg = <0x3 0x92300000 0x0 0xc000>;
+			interrupts = <AIC_IRQ 0 1142 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			apple,dma-range = <0x100 0x0 0x300 0x0>;
+			status = "disabled";
+		};
+
+		dart_dispext1_isoc: iommu@392180000 {
+			compatible = "apple,t6050-dart", "apple,t8110-dart";
+			reg = <0x3 0x92180000 0x0 0x20000>;
+			interrupts = <AIC_IRQ 0 1165 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			power-domains = <&ps_dispext1_adma>;
+			/* ADT vm-base 1 TiB, vm-size 64 GiB */
+			apple,dma-range = <0x100 0x0 0x10 0x0>;
+		};
+
+		admac_dispext1: dma-controller@392140000 {
+			compatible = "apple,t6050-admac", "apple,t8140-admac";
+			reg = <0x3 0x92140000 0x0 0x24000>;
+			/* One TX channel: Linux channel 0 */
+			dma-channels = <1>;
+			interrupts-extended = <&aic AIC_IRQ 0 1164 IRQ_TYPE_LEVEL_HIGH>,
+					      <0>, <0>, <0>;
+			#dma-cells = <1>;
+			iommus = <&dart_dispext1_isoc 30>;
+			power-domains = <&ps_dispext1_adma>;
+			apple,dma-range = <0x100 0x0 0x10 0x0>;
+		};
+
+		ane_dart0: iommu@509800000 {
+			compatible = "apple,t6050-ane-dart", "apple,t6050-dart",
+				     "apple,t8110-dart";
+			reg = <0x5 0x09800000 0x0 0xc000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 0 955 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_ane_sys>;
+			/* The firmware DVAs reach 0x100_xxxx_xxxx. */
+			apple,dma-range = <0x0 0x0 0x400 0x0>;
+			status = "disabled";
+		};
+
+		ane_dart1: iommu@509820000 {
+			compatible = "apple,t6050-ane-dart", "apple,t6050-dart",
+				     "apple,t8110-dart";
+			reg = <0x5 0x09820000 0x0 0xc000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 0 955 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_ane_sys>;
+			apple,dma-range = <0x0 0x0 0x400 0x0>;
+			status = "disabled";
+		};
+
+		ane_dart2: iommu@509840000 {
+			compatible = "apple,t6050-ane-dart", "apple,t6050-dart",
+				     "apple,t8110-dart";
+			reg = <0x5 0x09840000 0x0 0xc000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 0 955 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_ane_sys>;
+			apple,dma-range = <0x0 0x0 0x400 0x0>;
+			status = "disabled";
+		};
+
+		lpdptx_phy0: phy@29c200000 {
+			compatible = "apple,t6050-dptx-phy";
+			reg = <0x2 0x9c200000 0x0 0x4000>,
+			      <0x2 0x9c240000 0x0 0x10000>;
+			reg-names = "core", "dptx";
+			power-domains = <&ps_dptx_phy>;
+			#phy-cells = <0>;
+			#reset-cells = <0>;
+			apple,pll-dcocfg = <3>;
+			apple,pll-dtcvreg = <15>;
+			apple,pll-dtccal = <2>;
+			apple,pll-dcdadj = <16>;
+			apple,pll-dlfcfg = <3>;
+			apple,pclkdrv-select = <1>;
+			/* dcpext1's route: the crossbar's ufp endpoint 1 (source select 2) */
+			apple,ufp-endpoint = <1>;
+			/* Aura enables it with dcpext1. */
+			status = "disabled";
+		};
+	};
+};

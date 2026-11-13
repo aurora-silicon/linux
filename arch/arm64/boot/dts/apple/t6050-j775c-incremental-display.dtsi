@@ -1,0 +1,464 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Property migration from Satya Benson's 86b1f365 J775c stack.
+ * Retained board sources remain the baseline; this group is independently booted.
+ * Copyright The Asahi Linux Contributors
+ */
+&{/soc/iommu@2b2340000} {
+};
+
+&{/soc/iommu@2b2300000} {
+};
+
+&{/soc/mailbox@2b2e08000} {
+};
+
+&{/soc/dcp@2b2e00000} {
+	mboxes = <&{/soc/mailbox@2b2e08000}>;
+	iommus = <&{/soc/iommu@2b2340000} 0x17>;
+	apple,bw-scratch = <&{/soc/pmc-metadata@286700000} 0x0 0x5 0x2c000>;
+	phys = <&{/soc/phy@383000000} 0x6 &{/soc/phy@2ab000000} 0x6 &{/soc/phy@38b000000} 0x6 &{/soc/phy@2a3000000} 0x6>;
+	mux-controls = <&{/soc/mux@38324c000} 0x0 &{/soc/mux@2ab24c000} 0x0 &{/soc/mux@38b24c000} 0x0 &{/soc/mux@2a324c000} 0x0>;
+};
+
+&{/soc/dcp@2b2e00000/piodma} {
+	iommus = <&{/soc/iommu@2b2300000} 0x10>;
+};
+
+&{/soc/dcp@2b2e00000/typec-routes} {
+};
+
+&{/soc/dcp@2b2e00000/typec-routes/route@0} {
+};
+
+&{/soc/dcp@2b2e00000/typec-routes/route@0/port} {
+};
+
+&{/soc/dcp@2b2e00000/typec-routes/route@0/port/endpoint} {
+	remote-endpoint = <&{/soc/spmi@28a188000/usb-pd@8/connector/ports/port@2/endpoint}>;
+};
+
+&{/soc/dcp@2b2e00000/typec-routes/route@1} {
+};
+
+&{/soc/dcp@2b2e00000/typec-routes/route@1/port} {
+};
+
+&{/soc/dcp@2b2e00000/typec-routes/route@1/port/endpoint} {
+	remote-endpoint = <&{/soc/spmi@28a188000/usb-pd@a/connector/ports/port@2/endpoint}>;
+};
+
+&{/soc/dcp@2b2e00000/typec-routes/route@2} {
+};
+
+&{/soc/dcp@2b2e00000/typec-routes/route@2/port} {
+};
+
+&{/soc/dcp@2b2e00000/typec-routes/route@2/port/endpoint} {
+	remote-endpoint = <&{/soc/spmi@28a188000/usb-pd@6/connector/ports/port@2/endpoint}>;
+};
+
+&{/soc/dcp@2b2e00000/typec-routes/route@3} {
+};
+
+&{/soc/dcp@2b2e00000/typec-routes/route@3/port} {
+};
+
+&{/soc/dcp@2b2e00000/typec-routes/route@3/port/endpoint} {
+	remote-endpoint = <&{/soc/spmi@28a188000/usb-pd@c/connector/ports/port@2/endpoint}>;
+};
+
+&{/soc/dcp@2b2e00000/ports} {
+};
+
+&{/soc/dcp@2b2e00000/ports/port@0} {
+};
+
+&{/soc/dcp@2b2e00000/ports/port@0/endpoint} {
+	remote-endpoint = <&{/audio-controller-dispext0/ports/port@0/endpoint}>;
+};
+
+&{/soc} {
+	aux@29c260000 {
+		compatible = "apple,t6050-dptx-aux", "apple,dptx-aux";
+		reg = <0x2 0x9c260000 0x0 0x4000 0x2 0x9c260000 0x0 0x4000>;
+		power-domains = <&{/soc/power-management@280900000/power-controller@108}>;
+		status = "disabled";
+	};
+};
+
+&{/soc} {
+	aux@29c264000 {
+		compatible = "apple,t6050-dptx-aux", "apple,dptx-aux";
+		reg = <0x2 0x9c264000 0x0 0x4000 0x2 0x9c264000 0x0 0x4000>;
+		power-domains = <&{/soc/power-management@280900000/power-controller@110}>;
+		status = "disabled";
+	};
+};
+
+&{/soc} {
+	iommu@48a300000 {
+		compatible = "apple,t6050-dart", "apple,t8110-dart";
+		reg = <0x4 0x8a300000 0x0 0xc000 0x4 0x8a314000 0x0 0x4000>;
+		interrupts = <0x0 0x0 0x3de 0x4>;
+		#iommu-cells = <0x1>;
+		status = "disabled";
+	};
+};
+
+&{/soc} {
+	dcp-expert@48a3ac058 {
+		compatible = "apple,t6050-dcp-expert", "apple,dcp-expert";
+		reg = <0x4 0x8a3ac058 0x0 0x4 0x4 0x8a374000 0x0 0x40 0x4 0x8a370000 0x0 0x40 0x4 0x8a388000 0x0 0x40 0x4 0x8a38c000 0x0 0x40 0x4 0x8a394000 0x0 0x40 0x4 0x8a398000 0x0 0x40 0x4 0x8a39c000 0x0 0x40 0x4 0x8a3a0000 0x0 0x40 0x4 0x88208000 0x0 0x40 0x4 0x8820c000 0x0 0x40 0x4 0x88210000 0x0 0x40 0x4 0x88214000 0x0 0x40>;
+		interrupts = <0x0 0x0 0x3d9 0x4>;
+		status = "disabled";
+	};
+};
+
+&{/soc} {
+	mailbox@48ae08000 {
+		compatible = "apple,t6050-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x4 0x8ae08000 0x0 0x4000>;
+		interrupts = <0x0 0x0 0x413 0x4 0x0 0x0 0x414 0x4 0x0 0x0 0x415 0x4 0x0 0x0 0x416 0x4>;
+		interrupt-names = "send-empty", "send-not-empty", "recv-empty", "recv-not-empty";
+		#mbox-cells = <0x0>;
+		status = "disabled";
+	};
+};
+
+&{/soc} {
+	dcp@48ae00000 {
+		compatible = "apple,t6050-dcp", "apple,dcp";
+		reg = <0x4 0x8ae00000 0x0 0x4000 0x4 0x88000000 0x0 0x4000000 0x4 0x8a240000 0x0 0x10000 0x4 0x8a3ac000 0x0 0x4000 0x4 0x8a800000 0x0 0x800000 0x2 0x86700000 0x0 0x114000 0x4 0x8a850000 0x0 0x4000>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3", "disp-4", "iop-vbar";
+		mboxes = <&{/soc/mailbox@48ae08000}>;
+		mbox-names = "mbox";
+		iommus = <&{/soc/iommu@48a340000} 0x17>;
+		status = "disabled";
+	};
+};
+
+&{/soc/dcp@48ae00000} {
+	piodma {
+		iommus = <&{/soc/iommu@48a300000} 0x10>;
+	};
+};
+
+&{/soc} {
+	iommu@48a340000 {
+		compatible = "apple,t6050-dart", "apple,t8110-dart";
+		reg = <0x4 0x8a340000 0x0 0x20000>;
+		interrupts = <0x0 0x0 0x3de 0x4>;
+		#iommu-cells = <0x1>;
+		status = "disabled";
+	};
+};
+
+&{/soc} {
+	iommu@48a180000 {
+		compatible = "apple,t6050-dart", "apple,t8110-dart";
+		reg = <0x4 0x8a180000 0x0 0x20000>;
+		interrupts = <0x0 0x0 0x3f5 0x4>;
+		#iommu-cells = <0x1>;
+		status = "disabled";
+	};
+};
+
+&{/soc} {
+	dma-controller@48a140000 {
+		compatible = "apple,t6050-admac", "apple,t8140-admac";
+		reg = <0x4 0x8a140000 0x0 0x24000>;
+		dma-channels = <0x1>;
+		interrupts-extended = <&{/soc/interrupt-controller@280400000} 0x0 0x0 0x3f4 0x4 0 0 0>;
+		iommus = <&{/soc/iommu@48a180000} 0x1e>;
+		#dma-cells = <0x1>;
+		status = "disabled";
+	};
+};
+
+&{/soc} {
+	dma-control@48a2f4000 {
+		compatible = "apple,t6050-admac-control", "apple,admac-control";
+		reg = <0x4 0x8a2f4000 0x0 0x4000 0x4 0x8a1a0000 0x0 0x4000>;
+		interrupts = <0x0 0x0 0x3f6 0x4>;
+		status = "disabled";
+	};
+};
+
+&{/soc} {
+	dcp-expert@2b23ac058 {
+		compatible = "apple,t6050-dcp-expert", "apple,dcp-expert";
+		reg = <0x2 0xb23ac058 0x0 0x4 0x2 0xb2374000 0x0 0x40 0x2 0xb2370000 0x0 0x40>;
+		interrupts = <0x0 0x0 0x429 0x4>;
+		status = "disabled";
+	};
+};
+
+&{/soc/iommu@2b2180000} {
+	status = "okay";
+	power-domains = <&{/soc/power-management@280600000/power-controller@270}>;
+};
+
+&{/soc/dma-controller@2b2140000} {
+	interrupts-extended = <&{/soc/interrupt-controller@280400000} 0x0 0x0 0x444 0x4 0 0 0>;
+	iommus = <&{/soc/iommu@2b2180000} 0x1e>;
+	status = "okay";
+	power-domains = <&{/soc/power-management@280600000/power-controller@270}>;
+};
+
+&{/soc} {
+	dma-control@2b22f4000 {
+		compatible = "apple,t6050-admac-control", "apple,admac-control";
+		reg = <0x2 0xb22f4000 0x0 0x4000 0x2 0xb21a0000 0x0 0x4000>;
+		interrupts = <0x0 0x0 0x446 0x4>;
+		status = "disabled";
+	};
+};
+
+&{/soc} {
+	dcp-expert@3923ac058 {
+		compatible = "apple,t6050-dcp-expert", "apple,dcp-expert";
+		reg = <0x3 0x923ac058 0x0 0x4 0x3 0x92374000 0x0 0x40 0x3 0x92370000 0x0 0x40>;
+		interrupts = <0x0 0x0 0x471 0x4>;
+		status = "disabled";
+	};
+};
+
+&{/soc/mailbox@392e08000} {
+};
+
+&{/soc/dcp@392e00000} {
+	mboxes = <&{/soc/mailbox@392e08000}>;
+	iommus = <&{/soc/iommu@392340000} 0x17>;
+	apple,bw-scratch = <&{/soc/pmc-metadata@286700000} 0x0 0x5 0x30000>;
+	phys = <&{/soc/phy@29c200000}>;
+	hdmi-hpd-gpios = <&{/soc/pinctrl@290824000} 0xe 0x0>;
+	hdmi-pwren-gpios = <&{/soc/smc@28c600000/gpio} 0x0 0x0>;
+	dp2hdmi-pwren-gpios = <&{/soc/smc@28c600000/gpio} 0x1 0x0>;
+};
+
+&{/soc/dcp@392e00000/piodma} {
+	iommus = <&{/soc/iommu@392300000} 0x10>;
+};
+
+&{/soc/dcp@392e00000/ports} {
+};
+
+&{/soc/dcp@392e00000/ports/port@0} {
+};
+
+&{/soc/dcp@392e00000/ports/port@0/endpoint} {
+	remote-endpoint = <&{/audio-controller-dispext1/ports/port@0/endpoint}>;
+};
+
+&{/soc/iommu@392340000} {
+};
+
+&{/soc/iommu@392300000} {
+};
+
+&{/soc/iommu@392180000} {
+	status = "okay";
+	power-domains = <&{/soc/power-management@280600000/power-controller@2d8}>;
+};
+
+&{/soc/dma-controller@392140000} {
+	interrupts-extended = <&{/soc/interrupt-controller@280400000} 0x0 0x0 0x48c 0x4 0 0 0>;
+	iommus = <&{/soc/iommu@392180000} 0x1e>;
+	status = "okay";
+	power-domains = <&{/soc/power-management@280600000/power-controller@2d8}>;
+};
+
+&{/soc} {
+	dma-control@3922f4000 {
+		compatible = "apple,t6050-admac-control", "apple,admac-control";
+		reg = <0x3 0x922f4000 0x0 0x4000 0x3 0x921a0000 0x0 0x4000>;
+		interrupts = <0x0 0x0 0x48e 0x4>;
+		status = "disabled";
+	};
+};
+
+&{/soc} {
+	dcp-expert@3023ac058 {
+		compatible = "apple,t6050-dcp-expert", "apple,dcp-expert";
+		reg = <0x3 0x23ac058 0x0 0x4 0x3 0x2374000 0x0 0x40 0x3 0x2370000 0x0 0x40>;
+		interrupts = <0x0 0x0 0x4b9 0x4>;
+		status = "disabled";
+	};
+};
+
+&{/soc} {
+	mailbox@302e08000 {
+		compatible = "apple,t6050-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x2e08000 0x0 0x4000>;
+		interrupts = <0x0 0x0 0x4f3 0x4 0x0 0x0 0x4f4 0x4 0x0 0x0 0x4f5 0x4 0x0 0x0 0x4f6 0x4>;
+		interrupt-names = "send-empty", "send-not-empty", "recv-empty", "recv-not-empty";
+		#mbox-cells = <0x0>;
+		status = "disabled";
+	};
+};
+
+&{/soc} {
+	dcp@302e00000 {
+		compatible = "apple,t6050-dcpext", "apple,dcpext";
+		reg = <0x3 0x2e00000 0x0 0x4000 0x3 0x0 0x0 0x4000000 0x3 0x2240000 0x0 0x10000 0x3 0x23ac000 0x0 0x4000 0x3 0x2800000 0x0 0x800000 0x2 0x86700000 0x0 0x114000 0x3 0x2850000 0x0 0x4000>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3", "disp-4", "iop-vbar";
+		mboxes = <&{/soc/mailbox@302e08000}>;
+		mbox-names = "mbox";
+		iommus = <&{/soc/iommu@302340000} 0x17>;
+		status = "disabled";
+	};
+};
+
+&{/soc/dcp@302e00000} {
+	piodma {
+		iommus = <&{/soc/iommu@302300000} 0x10>;
+	};
+};
+
+&{/soc} {
+	iommu@302340000 {
+		compatible = "apple,t6050-dart", "apple,t8110-dart";
+		reg = <0x3 0x2340000 0x0 0x20000>;
+		interrupts = <0x0 0x0 0x4be 0x4>;
+		#iommu-cells = <0x1>;
+		status = "disabled";
+	};
+};
+
+&{/soc} {
+	iommu@302300000 {
+		compatible = "apple,t6050-dart", "apple,t8110-dart";
+		reg = <0x3 0x2300000 0x0 0xc000 0x3 0x2314000 0x0 0x4000>;
+		interrupts = <0x0 0x0 0x4be 0x4>;
+		#iommu-cells = <0x1>;
+		status = "disabled";
+	};
+};
+
+&{/soc} {
+	iommu@302180000 {
+		compatible = "apple,t6050-dart", "apple,t8110-dart";
+		reg = <0x3 0x2180000 0x0 0x20000>;
+		interrupts = <0x0 0x0 0x4d5 0x4>;
+		#iommu-cells = <0x1>;
+		status = "disabled";
+	};
+};
+
+&{/soc} {
+	dma-controller@302140000 {
+		compatible = "apple,t6050-admac", "apple,t8140-admac";
+		reg = <0x3 0x2140000 0x0 0x24000>;
+		dma-channels = <0x1>;
+		interrupts-extended = <&{/soc/interrupt-controller@280400000} 0x0 0x0 0x4d4 0x4 0 0 0>;
+		iommus = <&{/soc/iommu@302180000} 0x1e>;
+		#dma-cells = <0x1>;
+		status = "disabled";
+	};
+};
+
+&{/soc} {
+	dma-control@3022f4000 {
+		compatible = "apple,t6050-admac-control", "apple,admac-control";
+		reg = <0x3 0x22f4000 0x0 0x4000 0x3 0x21a0000 0x0 0x4000>;
+		interrupts = <0x0 0x0 0x4d6 0x4>;
+		status = "disabled";
+	};
+};
+
+&{/soc} {
+	dcp-expert@3063ac058 {
+		compatible = "apple,t6050-dcp-expert", "apple,dcp-expert";
+		reg = <0x3 0x63ac058 0x0 0x4 0x3 0x6374000 0x0 0x40 0x3 0x6370000 0x0 0x40>;
+		interrupts = <0x0 0x0 0x501 0x4>;
+		status = "disabled";
+	};
+};
+
+&{/soc} {
+	mailbox@306e08000 {
+		compatible = "apple,t6050-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x6e08000 0x0 0x4000>;
+		interrupts = <0x0 0x0 0x53b 0x4 0x0 0x0 0x53c 0x4 0x0 0x0 0x53d 0x4 0x0 0x0 0x53e 0x4>;
+		interrupt-names = "send-empty", "send-not-empty", "recv-empty", "recv-not-empty";
+		#mbox-cells = <0x0>;
+		status = "disabled";
+	};
+};
+
+&{/soc} {
+	dcp@306e00000 {
+		compatible = "apple,t6050-dcpext", "apple,dcpext";
+		reg = <0x3 0x6e00000 0x0 0x4000 0x3 0x4000000 0x0 0x4000000 0x3 0x6240000 0x0 0x10000 0x3 0x63ac000 0x0 0x4000 0x3 0x6800000 0x0 0x800000 0x2 0x86700000 0x0 0x114000 0x3 0x6850000 0x0 0x4000>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3", "disp-4", "iop-vbar";
+		mboxes = <&{/soc/mailbox@306e08000}>;
+		mbox-names = "mbox";
+		iommus = <&{/soc/iommu@306340000} 0x17>;
+		status = "disabled";
+	};
+};
+
+&{/soc/dcp@306e00000} {
+	piodma {
+		iommus = <&{/soc/iommu@306300000} 0x10>;
+	};
+};
+
+&{/soc} {
+	iommu@306340000 {
+		compatible = "apple,t6050-dart", "apple,t8110-dart";
+		reg = <0x3 0x6340000 0x0 0x20000>;
+		interrupts = <0x0 0x0 0x506 0x4>;
+		#iommu-cells = <0x1>;
+		status = "disabled";
+	};
+};
+
+&{/soc} {
+	iommu@306300000 {
+		compatible = "apple,t6050-dart", "apple,t8110-dart";
+		reg = <0x3 0x6300000 0x0 0xc000 0x3 0x6314000 0x0 0x4000>;
+		interrupts = <0x0 0x0 0x506 0x4>;
+		#iommu-cells = <0x1>;
+		status = "disabled";
+	};
+};
+
+&{/soc} {
+	iommu@306180000 {
+		compatible = "apple,t6050-dart", "apple,t8110-dart";
+		reg = <0x3 0x6180000 0x0 0x20000>;
+		interrupts = <0x0 0x0 0x51d 0x4>;
+		#iommu-cells = <0x1>;
+		status = "disabled";
+	};
+};
+
+&{/soc} {
+	dma-controller@306140000 {
+		compatible = "apple,t6050-admac", "apple,t8140-admac";
+		reg = <0x3 0x6140000 0x0 0x24000>;
+		dma-channels = <0x1>;
+		interrupts-extended = <&{/soc/interrupt-controller@280400000} 0x0 0x0 0x51c 0x4 0 0 0>;
+		iommus = <&{/soc/iommu@306180000} 0x1e>;
+		#dma-cells = <0x1>;
+		status = "disabled";
+	};
+};
+
+&{/soc} {
+	dma-control@3062f4000 {
+		compatible = "apple,t6050-admac-control", "apple,admac-control";
+		reg = <0x3 0x62f4000 0x0 0x4000 0x3 0x61a0000 0x0 0x4000>;
+		interrupts = <0x0 0x0 0x51e 0x4>;
+		status = "disabled";
+	};
+};
+
+&{/soc/phy@29c200000} {
+	power-domains = <&{/soc/power-management@280900000/power-controller@3f8}>;
+};
+
+&{/display-subsystem} {
+	iommus = <&{/soc/iommu@2b2300000} 0x0 &{/soc/iommu@392300000} 0x0>;
+};

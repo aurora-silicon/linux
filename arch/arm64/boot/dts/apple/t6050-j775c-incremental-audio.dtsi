@@ -1,0 +1,69 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Property migration from Satya Benson's 86b1f365 J775c stack.
+ * Retained board sources remain the baseline; this group is independently booted.
+ * Copyright The Asahi Linux Contributors
+ */
+&{/soc/i2c@505014000/codec@38} {
+	/delete-property/ ti,bclk-ratio;
+	shutdown-gpios = <&{/soc/pinctrl@29c000000} 0x6b 0x0>;
+	interrupts-extended = <&{/soc/pinctrl@29c000000} 0x6a 0x8>;
+};
+
+&{/soc/i2c@505018000/codec@4b} {
+	reset-gpios = <&{/soc/pinctrl@29c000000} 0x8b 0x0>;
+	interrupts-extended = <&{/soc/pinctrl@29c000000} 0x86 0x8>;
+};
+
+&{/sound} {
+	compatible = "apple,j775c-macaudio", "apple,macaudio";
+};
+
+&{/sound/dai-link@0} {
+};
+
+&{/sound/dai-link@0/cpu} {
+	sound-dai = <&{/soc/aop@290c00000/audio} 0x0>;
+};
+
+&{/sound/dai-link@0/codec} {
+	sound-dai = <&{/soc/i2c@505018000/codec@4b}>;
+};
+
+&{/sound/dai-link@1} {
+};
+
+&{/sound/dai-link@1/cpu} {
+	sound-dai = <&{/soc/aop@290c00000/audio} 0x3>;
+};
+
+&{/sound/dai-link@1/codec} {
+	sound-dai = <&{/soc/i2c@505014000/codec@38}>;
+};
+
+&{/audio-controller-dispext0} {
+	dmas = <&{/soc/dma-controller@2b2140000} 0x0>;
+};
+
+&{/audio-controller-dispext0/ports} {
+};
+
+&{/audio-controller-dispext0/ports/port@0} {
+};
+
+&{/audio-controller-dispext0/ports/port@0/endpoint} {
+	remote-endpoint = <&{/soc/dcp@2b2e00000/ports/port@0/endpoint}>;
+};
+
+&{/audio-controller-dispext1} {
+	dmas = <&{/soc/dma-controller@392140000} 0x0>;
+};
+
+&{/audio-controller-dispext1/ports} {
+};
+
+&{/audio-controller-dispext1/ports/port@0} {
+};
+
+&{/audio-controller-dispext1/ports/port@0/endpoint} {
+	remote-endpoint = <&{/soc/dcp@392e00000/ports/port@0/endpoint}>;
+};
