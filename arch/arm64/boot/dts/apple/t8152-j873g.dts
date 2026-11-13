@@ -69,6 +69,7 @@
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_e_opp>;
 			performance-domains = <&m6_e_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu1: cpu@1 {
@@ -79,6 +80,7 @@
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_e_opp>;
 			performance-domains = <&m6_e_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu2: cpu@2 {
@@ -89,6 +91,7 @@
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_e_opp>;
 			performance-domains = <&m6_e_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu3: cpu@3 {
@@ -99,6 +102,7 @@
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_e_opp>;
 			performance-domains = <&m6_e_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu4: cpu@4 {
@@ -109,6 +113,7 @@
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_e_opp>;
 			performance-domains = <&m6_e_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu5: cpu@5 {
@@ -119,6 +124,7 @@
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_e_opp>;
 			performance-domains = <&m6_e_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu6: cpu@10100 {
@@ -129,6 +135,7 @@
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_pm_opp>;
 			performance-domains = <&m6_pm_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu7: cpu@10101 {
@@ -139,6 +146,7 @@
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_pm_opp>;
 			performance-domains = <&m6_pm_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu8: cpu@40102 {
@@ -149,6 +157,7 @@
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_pm_opp>;
 			performance-domains = <&m6_pm_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu9: cpu@40103 {
@@ -159,6 +168,7 @@
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_pm_opp>;
 			performance-domains = <&m6_pm_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu10: cpu@40104 {
@@ -169,6 +179,7 @@
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_pm_opp>;
 			performance-domains = <&m6_pm_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu11: cpu@40105 {
@@ -179,6 +190,7 @@
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_pm_opp>;
 			performance-domains = <&m6_pm_cpufreq>;
+			#cooling-cells = <2>;
 		};
 	};
 
@@ -332,9 +344,9 @@
 						   "boot_error_count", "panic_count";
 			};
 
-			hwmon {
+			m6_smc_hwmon: hwmon {
 				compatible = "apple,smc-hwmon";
-				apple,discover-temperatures;
+				#thermal-sensor-cells = <1>;
 
 				fan-F0Ac {
 					apple,key-id = "F0Ac";
@@ -502,3 +514,4 @@
 #include "t8152-j873-usb.dtsi"
 #include "t8152-j873-ethernet.dtsi"
 #include "t8152-j873-audio.dtsi"
+#include "t8152-j873-thermal.dtsi"
