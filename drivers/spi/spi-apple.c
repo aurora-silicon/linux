@@ -327,6 +327,7 @@ static bool apple_spi_prep_transfer(struct apple_spi *spi, struct spi_transfer *
 	/* Calculate and program the clock rate */
 	cr = DIV_ROUND_UP(clk_get_rate(spi->clk), t->speed_hz);
 	cr = min_t(u32, cr, APPLE_SPI_CLKDIV_MAX);
+	cr = max(cr, 1U);
 	reg_write(spi, APPLE_SPI_CLKDIV, cr);
 	t->effective_speed_hz = clk_get_rate(spi->clk) / cr;
 
