@@ -1816,12 +1816,10 @@ impl Gpu {
             directory.read_only_file(c"hardware_data", reports::HardwareDataView(shared.clone())),
             GFP_KERNEL,
         )?;
+        let frequencies = Self::state_frequencies(dev, cfg, variant, id.num_clusters)?;
         let stats = Arc::new(
             crate::stats::StatsSnapshot {
-                g17_reader: Some(stats::Reader(
-                    shared.clone(),
-                    cfg.m5.map(|board| board.perf_states),
-                )),
+                g17_reader: Some(stats::Reader(shared.clone(), frequencies)),
                 ..Default::default()
             },
             GFP_KERNEL,
@@ -1930,6 +1928,36 @@ impl Gpu {
             .get_property::<KVec<u32>>(c_str!("apple,firmware-version"))
             .ok()?;
         cells.as_slice().try_into().ok()
+    }
+
+    /// The frequency of each performance state the firmware reports
+    /// ([`stats::reports_pstate`]): M5's from its board, the A18 Pro's from the operating
+    /// points its performance table A names. The A18 Pro's records do not name the table, but
+    /// at its top state, where it runs while work is in flight, a sustained FP32 FMA load
+    /// completes faster than table B's frequency there allows. `None` where the firmware
+    /// reports no state.
+    fn state_frequencies(
+        dev: &AsahiDrmDevice,
+        cfg: &'static Config,
+        variant: &fw::variant::Variant,
+        clusters: u32,
+    ) -> Result<Option<stats::StateFrequencies>> {
+        if !stats::reports_pstate(variant.graph, variant.m5_commands) {
+            return Ok(None);
+        }
+        if let Some(board) = cfg.m5 {
+            return Ok(stats::StateFrequencies::new(
+                board.perf_states.iter().map(|state| state.0),
+            ));
+        }
+        let perf = cfg.perf()?;
+        let opps = initdata::InitData::opps(dev, cfg.opps, clusters)?;
+        let mut mhz = [0u32; fw::initdata::PERF_STATES];
+        for (slot, &index) in mhz.iter_mut().zip(perf.states_a.iter()) {
+            let opp = opps.get(usize::from(index)).ok_or(EINVAL)?;
+            *slot = u32::try_from(opp.freq_hz / 1_000_000)?;
+        }
+        Ok(stats::StateFrequencies::new(mhz.into_iter()))
     }
 
     /// Returns the highest advertised operating-point frequency without changing table order.

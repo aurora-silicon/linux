@@ -57,15 +57,16 @@ cycles, or multiplying time by a sampled/maximum GPU frequency, would give
 incorrect frequency-weighted utilization. Per-client execution-cycle counters
 would require a separate hardware measurement source.
 
-On the M5 each engine also has the frequency keys::
+On the M5 and the A18 Pro each engine also has the frequency keys::
 
     drm-curfreq-compute: 1620000000 Hz
     drm-maxfreq-compute: 1620000000 Hz
 
 ``drm-curfreq-<engine>`` is ``achieved_frequency_hz`` of ``agx_stats`` (see
-below): the frequency of the performance state the firmware reports. It is
-absent while the firmware reports none, as when the GPU is gated.
-``drm-maxfreq-<engine>`` is the highest frequency in the board's table. One clock
+below): the frequency of the performance state the firmware reports, 0 Hz while
+the GPU cores are gated. It is absent while no state is known, as right after
+the GPU powers up. ``drm-maxfreq-<engine>`` is the highest frequency of the
+performance states. One clock
 drives the three engines, so both values are the device's, the same for every
 engine and every client. They show the clock at the time of the read and are
 not a weight for the engine times: without ``drm-cycles-*`` there is nothing to
@@ -80,9 +81,9 @@ per valid stage, with no new locks or allocations. The native backends reuse
 existing timestamp reads. Classic completion callbacks read two internal cells
 per stage; commands without application timestamps also execute two existing
 timestamp microsequence operations per stage. Reading fdinfo loads three counters
-and does not traverse queues, wait for fences or access hardware. On the M5 a
-read also takes the device mutex once and drains the statistics rings, as a read
-of ``agx_stats`` does, for the frequency keys.
+and does not traverse queues, wait for fences or access hardware. On the M5 and
+the A18 Pro a read also takes the device mutex once and drains the statistics
+rings, as a read of ``agx_stats`` does, for the frequency keys.
 
 G16S and G17P device utilisation
 ------------------------------
@@ -125,26 +126,39 @@ ring on powered cores becomes stale rather than fabricating a zero-utilisation
 sample; only gated cores read as zero. Readers
 must not convert these percentages into engine nanoseconds or cycles.
 
-M5 performance state and busy time
-----------------------------------
+Performance state and busy time on V26A428 (A18 Pro and M5)
+-----------------------------------------------------------
 
-The M5 firmware runs on the same backend and decoder, and its statistics ring
-carries more. ``agx_stats`` reports there:
+The V26A428 firmware, which the A18 Pro (T8140, G17P) and the M5 run on the same
+backend and decoder, carries more in its statistics ring. ``agx_stats`` reports
+there:
 
 * ``pstate``: the performance state in effect, from the firmware's state
   reports (tag ``0x1b``, words 1 and 3, which must agree). It is an index into
-  the board's performance state table, 1 to 13. The interval record before a
-  report (tag ``0x19``) gives its firmware timestamp. A report that names state
-  0 or a state beyond the table is not used, and ``pstate_status`` reads
-  ``stale`` while the cores are gated.
-* ``achieved_frequency_hz``: the frequency of that state in the board's table,
-  while ``pstate_status`` is ``valid``.
-* ``busy_ns``: the M5 utilisation records carry their own timestamps (words 1
-  and 2, 24 MHz ticks), so each record closes a window of known length, which
-  is credited at the record's device utilisation. A record that follows the
-  previous one by more than two 8 ms periods, or whose timestamp went back,
-  only starts a new window: time the GPU spent gated is never credited. The
-  total keeps counting across power epochs.
+  the performance state table: 1 to 10 on the A18 Pro, 1 to 13 on the M5. The
+  interval record before a report (tag ``0x19``) gives its firmware timestamp.
+  A report that names state 0 or a state beyond the table is not used. While
+  the cores are gated the GPU is off and ``pstate`` reads a valid 0; power-up
+  starts a new epoch, ``stale`` until the next report.
+* ``achieved_frequency_hz``: the frequency of that state while
+  ``pstate_status`` is ``valid``, 0 for state 0. The M5 takes it from its
+  board's table. The A18 Pro takes the device tree operating point that the
+  state's entry of its performance table A names: its records do not name the
+  table, but at its top state a sustained FP32 FMA load completes faster than
+  table B's frequency there allows.
+* ``busy_ns``: the utilisation records carry their own timestamps (words 1 and
+  2, 24 MHz ticks), one every 8 ms on the M5 and every 16 ms on the A18 Pro, so
+  each record closes a window of known length, which is credited at the
+  record's device utilisation. A record that follows the previous one by more
+  than two periods, or whose timestamp went back, only starts a new window:
+  time the GPU spent gated is never credited, and a load sparser than one
+  period reads low. The total keeps counting across power epochs.
+
+The driver asks for full performance while work is in flight, which the
+firmware takes as a floor for its state. An A18 Pro at work therefore normally
+reports its top state; a lower one is a firmware limit, such as a thermal one.
+The tag ``0x19`` records are periodic samples, not busy intervals, and do not
+contribute to ``busy_ns``.
 
 ``requested_frequency_hz``, ``power_mw`` and ``temperature_raw`` stay
 unsupported. ``busy_ns`` is device-wide, as on G13 and G14; it does not change
@@ -153,10 +167,11 @@ fdinfo's per-client ``drm-engine-*`` counters.
 Deferred shared power telemetry
 ------------------------------
 
-Current pstate and requested/achieved frequency remain unsupported for these
-firmware graphs (the M5 firmware reports its state in the statistics ring, see
-above). The shared-power snapshot ABI is not sufficiently specified
-to implement a read-only reader. For **each** of G16S and G17P, it still needs:
+Current pstate and requested/achieved frequency remain unsupported on G16S
+(V25G83); V26A428 reports its state in the statistics ring, see above. The
+shared-power snapshot ABI is not sufficiently specified to implement a
+read-only reader, which G16S would need, and which would also name the A18
+Pro's table directly. For **each** of G16S and G17P, it still needs:
 
 * The firmware-version-to-layout mapping, containing allocation and bounds,
   offsets, widths and stride of the generation/seqlock word, live pstate,
@@ -176,7 +191,7 @@ A future implementation needs bounded seqlock retries and lifecycle invalidation
 before publishing these fields. Tag ``0x10`` remains decoded for diagnostics but
 is not emitted by the currently qualified firmware graphs. A dormant pstate
 record, a host request or a command timer cannot provide achieved frequency.
-``drm-curfreq-gpu`` must wait for a qualified shared snapshot.
+On G16S, ``drm-curfreq-*`` must wait for a qualified shared snapshot.
 
 Hardware acceptance
 -------------------
