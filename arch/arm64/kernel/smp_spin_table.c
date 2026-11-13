@@ -157,6 +157,8 @@ static struct cpumask spin_table_cpus_parked;
 static struct cpumask spin_table_cpus_held;
 static struct cpumask spin_table_cpus_unpark;
 static struct cpumask spin_table_cpus_off;
+static int spin_table_hold_error[NR_CPUS];
+static u32 spin_table_hold_generation, spin_table_held_generation[NR_CPUS];
 static bool spin_table_hold_requested;
 static bool spin_table_stop_requested;
 static bool spin_table_stop_released;
@@ -186,7 +188,9 @@ static bool spin_table_all_held(bool report)
 	bool all = true;
 
 	for_each_present_cpu(cpu) {
-		if (cpu_online(cpu) || cpumask_test_cpu(cpu, &spin_table_cpus_held) ||
+		if (cpu_online(cpu) || (cpumask_test_cpu(cpu, &spin_table_cpus_held) &&
+		    smp_load_acquire(&spin_table_held_generation[cpu]) ==
+		    READ_ONCE(spin_table_hold_generation)) ||
 		    cpumask_test_cpu(cpu, &spin_table_cpus_off))
 			continue;
 		if (!report)
@@ -201,28 +205,42 @@ static bool spin_table_all_held(bool report)
 /*
  * Before a suspend's last refusal, interrupts off, other CPUs offline: every parked CPU
  * answers and waits, still parked, for spin_table_stop_parked() or
- * spin_table_unhold_parked(). Nothing is written to the hardware. Returns -ETIMEDOUT,
+ * spin_table_unhold_parked(). Optional cpu_hold prepares only reversible state. Returns -ETIMEDOUT,
  * with the hold undone, if any CPU not online is neither held nor off.
  */
 int spin_table_hold_parked(void)
 {
-	int us;
+	int us, ret;
+	unsigned int cpu;
 
+	for_each_present_cpu(cpu)
+		WRITE_ONCE(spin_table_hold_error[cpu], 0);
+	WRITE_ONCE(spin_table_hold_generation, READ_ONCE(spin_table_hold_generation) + 1);
 	WRITE_ONCE(spin_table_hold_requested, true);
 	dsb(ish);
 	sev();
 
 	for (us = 0; us < SPIN_TABLE_WAIT_US; us++) {
 		if (spin_table_all_held(false))
-			return 0;
+			goto held;
 		udelay(1);
 	}
 
 	if (spin_table_all_held(true))
-		return 0;
+		goto held;
 	spin_table_unhold_parked();
 
 	return -ETIMEDOUT;
+held:
+	smp_rmb();
+	for_each_present_cpu(cpu) {
+		ret = READ_ONCE(spin_table_hold_error[cpu]);
+		if (ret) {
+			spin_table_unhold_parked();
+			return ret;
+		}
+	}
+	return 0;
 }
 
 /*
@@ -247,10 +265,68 @@ int spin_table_stop_parked(void)
 	return -ETIMEDOUT;
 }
 
+/*
+ * One held CPU runs @fn (interrupts off, from its hold loop), for a sleep step that has to run off
+ * the boot core's cluster.
+ */
+static void (*spin_table_call_fn)(void *);
+static void *spin_table_call_arg;
+static int spin_table_call_cpu = -1;
+static struct cpumask spin_table_cpus_park_off;
+
+void spin_table_call(unsigned int cpu, void (*fn)(void *), void *arg)
+{
+	WRITE_ONCE(spin_table_call_fn, fn);
+	WRITE_ONCE(spin_table_call_arg, arg);
+	smp_wmb();
+	WRITE_ONCE(spin_table_call_cpu, cpu);
+	dsb(ish);
+	sev();
+}
+
+bool spin_table_call_done(void)
+{
+	return READ_ONCE(spin_table_call_cpu) < 0;
+}
+
+/* The held CPUs in @cpus stop and power down now, as at the commit, and stay off until the wake. */
+void spin_table_park_off(const struct cpumask *cpus)
+{
+	cpumask_copy(&spin_table_cpus_park_off, cpus);
+	dsb(ish);
+	sev();
+}
+
+/* A CPU restarted at its reset vector now waits in the holding pen instead of booting. */
+void spin_table_pen_close(void)
+{
+	write_pen_release(INVALID_HWID);
+}
+
+/* Once set, after a sleep's commit, a core waiting in the pen takes the deep-sleep WFI. */
+volatile unsigned long __section(".mmuoff.data.read") secondary_pen_deep;
+static bool spin_table_pen_deep_armed;
+
+void spin_table_pen_deep_arm(bool on)
+{
+	spin_table_pen_deep_armed = on;
+}
+
+static void spin_table_pen_deep(void)
+{
+	void *start = (void *)&secondary_pen_deep;
+
+	if (!spin_table_pen_deep_armed)
+		return;
+	secondary_pen_deep = 1;
+	dcache_clean_inval_poc((unsigned long)start, (unsigned long)start + sizeof(secondary_pen_deep));
+}
+
 /* After the commit: the stopped CPUs take their last WFI. */
 void spin_table_release_stopped(void)
 {
 	WRITE_ONCE(spin_table_stop_released, true);
+	spin_table_pen_deep();
 	dsb(ish);
 	sev();
 }
@@ -268,6 +344,7 @@ void spin_table_stop_finished(void)
 	cpumask_clear(&spin_table_cpus_parked);
 	cpumask_clear(&spin_table_cpus_held);
 	cpumask_clear(&spin_table_cpus_unpark);
+	cpumask_clear(&spin_table_cpus_park_off);
 }
 
 static int smp_rvbar_spin_table_cpu_boot(unsigned int cpu)
@@ -326,9 +403,36 @@ static void smp_rvbar_spin_table_restart(void)
 /* Held until the commit's stop, or until a refusal sends it back to the park. */
 static void smp_rvbar_spin_table_hold(unsigned int cpu, u64 mpidr)
 {
-	cpumask_set_cpu(cpu, &spin_table_cpus_held);
+	u32 generation = 0;
 
 	while (READ_ONCE(spin_table_hold_requested)) {
+		u32 requested = READ_ONCE(spin_table_hold_generation);
+
+		if (generation != requested) {
+			int ret = spin_table_power->cpu_hold ? spin_table_power->cpu_hold(mpidr) : 0;
+
+			WRITE_ONCE(spin_table_hold_error[cpu], ret);
+			generation = requested;
+			smp_store_release(&spin_table_held_generation[cpu], generation);
+			cpumask_set_cpu(cpu, &spin_table_cpus_held);
+		}
+		if (READ_ONCE(spin_table_call_cpu) == (int)cpu) {
+			smp_rmb();
+			READ_ONCE(spin_table_call_fn)(READ_ONCE(spin_table_call_arg));
+			WRITE_ONCE(spin_table_call_cpu, -1);
+			dsb(ish);
+			sev();
+		}
+		if (cpumask_test_cpu(cpu, &spin_table_cpus_park_off)) {
+			spin_table_power->cpu_stop(mpidr);
+			cpumask_set_cpu(cpu, &spin_table_cpus_off);
+			cpumask_clear_cpu(cpu, &spin_table_cpus_held);
+			cpumask_clear_cpu(cpu, &spin_table_cpus_parked);
+			dsb(ish);
+			if (spin_table_power->cpu_idle_off)
+				spin_table_power->cpu_idle_off(mpidr);
+			spin_table_power->cpu_off(mpidr);
+		}
 		if (READ_ONCE(spin_table_stop_requested)) {
 			spin_table_power->cpu_stop(mpidr);
 			cpumask_set_cpu(cpu, &spin_table_cpus_off);
@@ -342,6 +446,8 @@ static void smp_rvbar_spin_table_hold(unsigned int cpu, u64 mpidr)
 		wfe();
 	}
 
+	if (spin_table_power->cpu_restore)
+		spin_table_power->cpu_restore(mpidr);
 	cpumask_clear_cpu(cpu, &spin_table_cpus_held);
 }
 
@@ -385,7 +491,14 @@ static int smp_rvbar_spin_table_cpu_kill(unsigned int cpu)
 	return -ETIMEDOUT;
 }
 
+static void smp_rvbar_spin_table_postboot(void)
+{
+	if (READ_ONCE(spin_table_power) && spin_table_power->cpu_restore)
+		spin_table_power->cpu_restore(read_cpuid_mpidr() & MPIDR_HWID_BITMASK);
+}
+
 const struct cpu_operations smp_rvbar_spin_table_ops = {
+	.cpu_postboot = smp_rvbar_spin_table_postboot,
 	.name		= "aurora,rvbar-spin-table",
 	.cpu_init	= smp_spin_table_cpu_init,
 	.cpu_prepare	= smp_spin_table_cpu_prepare,

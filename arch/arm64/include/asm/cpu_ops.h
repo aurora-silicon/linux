@@ -59,8 +59,14 @@ struct cpu_operations {
  * Each takes the CPU's MPIDR hardware ID.
  */
 struct spin_table_power_ops {
+	/* Optional reversible per-core preparation while held/coherent. */
+	int (*cpu_hold)(u64 mpidr);
+	/* Abort in held loop, or target core after reset/secondary boot. */
+	void (*cpu_restore)(u64 mpidr);
 	void	(*cpu_stop)(u64 mpidr);
 	void	(*cpu_off)(u64 mpidr);
+	/* Optional: a held core's own runtime power-down, for spin_table_park_off() */
+	void	(*cpu_idle_off)(u64 mpidr);
 	int	(*cpu_on)(u64 mpidr);
 };
 
@@ -72,7 +78,17 @@ int spin_table_stop_parked(void);
 void spin_table_release_stopped(void);
 void spin_table_stop_finished(void);
 bool spin_table_cpus_stuck(void);
+void spin_table_call(unsigned int cpu, void (*fn)(void *), void *arg);
+bool spin_table_call_done(void);
+void spin_table_park_off(const struct cpumask *cpus);
+void spin_table_pen_close(void);
+void spin_table_pen_deep_arm(bool on);
 #else
+static inline void spin_table_call(unsigned int cpu, void (*fn)(void *), void *arg) {}
+static inline bool spin_table_call_done(void) { return true; }
+static inline void spin_table_park_off(const struct cpumask *cpus) {}
+static inline void spin_table_pen_close(void) {}
+static inline void spin_table_pen_deep_arm(bool on) {}
 static inline int spin_table_hold_parked(void)
 {
 	return -EOPNOTSUPP;
