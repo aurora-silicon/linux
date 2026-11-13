@@ -62,6 +62,7 @@ def run_measurements(command, source, binary):
 def c_layout(header, bindings, output, tag):
     keys, _ = expressions(bindings)
     capacity_tail = 'client_memory_limit;' in header.read_text()
+    queue_tail = 'compute_timeout_ms;' in header.read_text()
     # Linux 7.2 folds the historical extension structs into the base payloads.
     # Compare the same wire prefixes and offsets while keeping the C oracle frozen.
     if 'struct drm_asahi_cmd_render_with_prior {' not in header.read_text():
@@ -71,6 +72,9 @@ def c_layout(header, bindings, output, tag):
             if capacity_tail and key == 'drm_asahi_params_global:size':
                 # Compare the frozen reply prefix; validate the entire known additive tail below.
                 expr = 'offsetof(struct drm_asahi_params_global, memory_limit)'
+            if queue_tail and key == 'drm_asahi_queue_create:size':
+                # Likewise: the frozen struct is a prefix of the one with the compute time limit.
+                expr = 'offsetof(struct drm_asahi_queue_create, compute_timeout_ms)'
             if key == "drm_asahi_vm_create:pad":
                 expr = "offsetof(struct drm_asahi_vm_create, flags)"
             base = None
@@ -100,6 +104,12 @@ def c_layout(header, bindings, output, tag):
             '_Static_assert(offsetof(struct drm_asahi_params_global, client_memory_limit) == 608, "client capacity offset");',
             '_Static_assert(sizeof(((struct drm_asahi_params_global *)0)->memory_limit) == 8, "capacity width");',
             '_Static_assert(sizeof(((struct drm_asahi_params_global *)0)->client_memory_limit) == 8, "client capacity width");',
+        ]
+    if queue_tail:
+        lines[3:3] = [
+            '_Static_assert(sizeof(struct drm_asahi_queue_create) == 48, "queue time limit reply size");',
+            '_Static_assert(offsetof(struct drm_asahi_queue_create, compute_timeout_ms) == 40, "queue time limit offset");',
+            '_Static_assert(sizeof(((struct drm_asahi_queue_create *)0)->compute_timeout_ms) == 4, "queue time limit width");',
         ]
     lines += [f'printf("{key}=%llu\\n", (unsigned long long)({expr}));' for key, expr in keys]
     source.write_text('\n'.join(lines + ['return 0;', '}']) + '\n')
