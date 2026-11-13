@@ -8735,11 +8735,14 @@ static int dcp_platform_resume(struct device *dev)
 
 /*
  * Hibernation: the T8132 power-down keeps the retained session, which a
- * hibernation image cannot carry across the boot that restores it.
+ * hibernation image cannot carry across the boot that restores it. Where no
+ * image can be made (hibernation_available() is false: only pm_test dry runs
+ * reach this), the freeze is the suspend-to-idle power-down and thaw resumes
+ * the same session.
  */
 static int dcp_platform_freeze(struct device *dev)
 {
-	if (iomfb_is_m4(dev_get_drvdata(dev)))
+	if (iomfb_is_m4(dev_get_drvdata(dev)) && hibernation_available())
 		return -EBUSY;
 	return dcp_platform_suspend(dev);
 }

@@ -1089,10 +1089,17 @@ static int apple_t8140_bootstrap_resume(struct device *dev)
 	return 0;
 }
 
+/*
+ * A retained bootstrap cannot be rebuilt from a hibernation image. Without
+ * hibernation_available() only pm_test dry runs get here: the bootstrap stays
+ * as it is and the radios below it freeze and thaw on their own.
+ */
 static int apple_t8140_bootstrap_freeze(struct device *dev)
 {
 	struct apple_t8140_bootstrap *bootstrap = dev_get_drvdata(dev);
 
+	if (!hibernation_available())
+		return 0;
 	return apple_piodma_retained(apple_piodma_state(bootstrap)) ? -EOPNOTSUPP : 0;
 }
 
