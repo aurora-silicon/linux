@@ -62,6 +62,7 @@ typedef uint32_t u32;
 static unsigned reports;
 #define dev_warn(...) ((void)reports++)
 #define dev_err(...) ((void)reports++)
+#define dev_info(...) ((void)0)
 #define dev_dbg(...) ((void)0)
 #define lockdep_assert_held(...) ((void)0)
 #define guard(which) (void)
