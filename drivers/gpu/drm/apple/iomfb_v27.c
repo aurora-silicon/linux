@@ -167,15 +167,14 @@ static const struct dcp_method_entry dcp_methods_27_2[dcpep_num_methods] = {
 };
 
 /*
- * Firmware 27.3: only the methods seen, with the request and reply sizes this
- * driver uses, in a trace of the calls the macOS 27.3 display driver makes to
- * the DCP of a J716s while it starts. Three are one above their 27.2 IDs
- * (set_display_refresh_properties A526, flush_supports_power A529,
- * register_dfb_surface A534) and create_default_fb is still A504, so 27.3 has
- * one more method somewhere between those. That trace has no display client,
- * so it has no mode set, swap or power state call, and the methods it does not
- * show have no entry here. Until a trace shows them the table is incomplete
- * and the driver does not start this firmware (iomfb_v27_missing_method()).
+ * Firmware 27.3 (macOS 27.3, DCP image mBoot-20457.60.65). Each ID is the tag
+ * IOMobileFramebufferAP or UnifiedPipeline2 loads before the call in the 27.3
+ * kernelcache. It is 27.2's table with the IDs from A475 on one higher
+ * (set_display_refresh_properties A526 ... register_dfb_surface A534,
+ * set_power_state A535, isKeepOnScreen A536, set_dcp_clamshellstate A538,
+ * get_shared_disp_state A540); A516 first_client_open and A464/A465 pipe_cfg
+ * were placed by the +50 rule and by their request sizes. dfb_ready_query is
+ * A385, as macOS 27.3 sends it.
  */
 static const struct dcp_method_entry dcp_methods_27_3[dcpep_num_methods] = {
 	IOMFB_METHOD("A000", dcpep_late_init_signal),
@@ -185,6 +184,14 @@ static const struct dcp_method_entry dcp_methods_27_3[dcpep_num_methods] = {
 	IOMFB_METHOD("A390", dcpep_set_create_dfb),
 	IOMFB_METHOD("A391", iomfbep_a358_vi_set_temperature_hint),
 	IOMFB_METHOD("A451", dcpep_start_signal),
+	IOMFB_METHOD("A456", dcpep_swap_start),
+	IOMFB_METHOD("A458", dcpep_swap_submit),
+	IOMFB_METHOD("A461", dcpep_set_display_device),
+	IOMFB_METHOD("A462", dcpep_is_main_display),
+	IOMFB_METHOD("A463", dcpep_set_digital_out_mode),
+	IOMFB_METHOD("A473", iomfbep_set_matrix),
+	IOMFB_METHOD("A477", iomfbep_get_color_remap_mode),
+	IOMFB_METHOD("A500", dcpep_set_parameter_dcp),
 	IOMFB_METHOD("A504", dcpep_create_default_fb),
 	IOMFB_METHOD("A037", dcpep_get_dfb_compression_info),
 	IOMFB_METHOD("A036", dcpep_get_dfb_info),
@@ -195,8 +202,21 @@ static const struct dcp_method_entry dcp_methods_27_3[dcpep_num_methods] = {
 	IOMFB_METHOD("A035", dcpep_dfb_query),
 	IOMFB_METHOD("A385", dcpep_dfb_ready_query),
 	IOMFB_METHOD("A353", dcpep_pipe_query_353),
+	IOMFB_METHOD("A352", dcpep_pipe_set_352),
+	IOMFB_METHOD("A465", dcpep_pipe_cfg_415),
+	IOMFB_METHOD("A033", dcpep_pipe_cfg_031),
+	IOMFB_METHOD("A464", dcpep_pipe_cfg_414),
+	IOMFB_METHOD("A540", dcpep_pipe_query_478),
+	IOMFB_METHOD("A536", dcpep_pipe_query_474),
+	IOMFB_METHOD("A538", dcpep_pipe_set_476),
+	IOMFB_METHOD("A478", iomfbep_set_brightness_correction),
+	IOMFB_METHOD("A508", dcpep_enable_disable_video_power_savings),
+	IOMFB_METHOD("A516", dcpep_first_client_open),
+	IOMFB_METHOD("A517", iomfbep_last_client_close),
 	IOMFB_METHOD("A526", dcpep_set_display_refresh_properties),
 	IOMFB_METHOD("A529", dcpep_flush_supports_power),
+	IOMFB_METHOD("A530", iomfbep_abort_swaps_dcp),
+	IOMFB_METHOD("A535", dcpep_set_power_state),
 	IOMFB_METHOD("A534", dcpep_register_dfb_surface),
 };
 
