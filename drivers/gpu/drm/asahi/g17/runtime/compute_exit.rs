@@ -184,7 +184,13 @@ impl Firmware {
             }
             // A failed context's executed pairs keep their pool leases until the kill is
             // acknowledged (`Pair::firmware_drained`), so its kill cannot wait for them.
-            let result = if self.compute_failed(&context) || self.queues.render.teardown_pools_released(&context) {
+            // A context with no compute queue left to exit is killed through its render pairs
+            // instead: otherwise a quarantined pair whose last group ran but was never stamped,
+            // and whose pool lease is already released, keeps the context (and its pair) held.
+            let compute_exit = (self.compute_failed(&context)
+                || self.queues.render.teardown_pools_released(&context))
+                && self.compute_exit_pending(&context);
+            let result = if compute_exit {
                 // Only a render-only kill's wait lives on the entry; a compute kill keeps its
                 // own on the queue.
                 self.queues.teardown.clear_kill_wait(index);
@@ -474,6 +480,13 @@ impl Firmware {
     /// all of the context's render pairs idle; the pairs behind such a failure become idle when
     /// their commands have executed (`Pair::firmware_drained`), so by then nothing of the
     /// context runs any more.
+    /// A compute queue of `context` will exit, now or once its delay passed.
+    fn compute_exit_pending(&self, context: &Arc<Context>) -> bool {
+        self.queues.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref()).any(|queue| {
+            queue.exit_candidate(context, u64::MAX) || queue.exit_published(context)
+        })
+    }
+
     fn compute_failed(&self, context: &Arc<Context>) -> bool {
         self.queues.compute.iter().flatten().filter_map(|entry| entry.queue.as_deref()).any(|queue| {
             queue.context().is_some_and(|bound| Arc::ptr_eq(bound, context))
