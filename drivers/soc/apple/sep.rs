@@ -19,6 +19,7 @@ mod der;
 mod diag;
 mod dt;
 mod fv;
+mod hibe;
 mod hwrng;
 mod image;
 mod key;
@@ -26,6 +27,7 @@ mod keybag;
 mod keybag_identity;
 mod os_identity;
 mod pm;
+mod pnon;
 mod profile;
 mod proto;
 mod refkey;
@@ -37,7 +39,9 @@ mod scrd;
 mod sensor;
 mod shim;
 mod shmem;
+mod skdl;
 mod sks;
+mod sse;
 mod stac;
 mod store;
 mod transfer;
@@ -122,6 +126,11 @@ const STAC_WORK_ID: u64 = 5;
 static_assert!(STAC_WORK_ID != LATE_ATTACH_WORK_ID && STAC_WORK_ID != VERIFY_WORK_ID);
 static_assert!(STAC_WORK_ID != ENROL_WORK_ID && STAC_WORK_ID != SETTLE_WORK_ID);
 static_assert!(STAC_WORK_ID != 0);
+/// The boot-policy digest read; see `pnon`.
+const PNON_WORK_ID: u64 = 6;
+static_assert!(PNON_WORK_ID != STAC_WORK_ID && PNON_WORK_ID != LATE_ATTACH_WORK_ID);
+static_assert!(PNON_WORK_ID != VERIFY_WORK_ID && PNON_WORK_ID != ENROL_WORK_ID);
+static_assert!(PNON_WORK_ID != SETTLE_WORK_ID && PNON_WORK_ID != 0);
 
 // When an attach-time sensor bring-up falls short, one more round runs this
 // long after Touch ID was activated. A round that cannot run yet, because the
@@ -812,6 +821,27 @@ struct SepData {
     stac_named: Atomic<bool>,
     stac_layout: Atomic<u32>,
     stac_absent_logged: Atomic<bool>,
+
+    // The boot-policy endpoint (see `pnon`): its buffers, its one
+    // exchange, and what discovery said about it.
+    #[pin]
+    ool_pnon: Mutex<Option<OolPair>>,
+    #[pin]
+    pnon_rx: Mutex<pnon::Exchange>,
+    #[pin]
+    pnon_wq: CondVar,
+    pnon_named: Atomic<bool>,
+    pnon_layout: Atomic<u32>,
+    pnon_done: Atomic<bool>,
+
+    // What discovery said about the endpoints the driver checks and sends
+    // nothing to (see `sse`, `hibe`, `skdl`).
+    sse_named: Atomic<bool>,
+    sse_layout: Atomic<u32>,
+    hibe_named: Atomic<bool>,
+    hibe_layout: Atomic<u32>,
+    skdl_named: Atomic<bool>,
+    skdl_layout: Atomic<u32>,
     #[pin]
     scrd_probe: Mutex<ScrdProbe>,
     #[pin]
@@ -987,6 +1017,9 @@ struct SepData {
 
     #[pin]
     stac_work: Work<SepData, STAC_WORK_ID>,
+
+    #[pin]
+    pnon_work: Work<SepData, PNON_WORK_ID>,
 }
 
 impl_has_work! {
@@ -994,6 +1027,7 @@ impl_has_work! {
     impl HasWork<Self, ENROL_WORK_ID> for SepData { self.enrol_work }
     impl HasWork<Self, VERIFY_WORK_ID> for SepData { self.verify_work }
     impl HasWork<Self, STAC_WORK_ID> for SepData { self.stac_work }
+    impl HasWork<Self, PNON_WORK_ID> for SepData { self.pnon_work }
 }
 
 impl_has_delayed_work! {
@@ -1044,6 +1078,8 @@ impl SepData {
             stac::OOL_SIZE_STAC,
             (stac::OOL_SIZE_STAC, stac::OOL_SIZE_STAC),
         )?;
+        // Sized from the endpoint's layout before it is registered.
+        let ool_pnon = Self::alloc_ool(dev, pnon::EP_PNON, pnon::OOL_SIZE_PNON, (0, 0))?;
         let dma_ring = dma::Coherent::<u8>::zeroed_slice(dev, DMA_RING_SIZE, GFP_KERNEL)?;
 
         let keystore_only = attach::requested();
@@ -1206,6 +1242,18 @@ impl SepData {
                 stac_named: Atomic::new(false),
                 stac_layout: Atomic::new(0),
                 stac_absent_logged: Atomic::new(false),
+                ool_pnon <- new_mutex!(Some(ool_pnon)),
+                pnon_rx <- new_mutex!(pnon::Exchange::new()),
+                pnon_wq <- new_condvar!("SepData::pnon_wq"),
+                pnon_named: Atomic::new(false),
+                pnon_layout: Atomic::new(0),
+                pnon_done: Atomic::new(false),
+                sse_named: Atomic::new(false),
+                sse_layout: Atomic::new(0),
+                hibe_named: Atomic::new(false),
+                hibe_layout: Atomic::new(0),
+                skdl_named: Atomic::new(false),
+                skdl_layout: Atomic::new(0),
                 dma_ring <- new_mutex!(Some(dma_ring)),
                 sbio_exchange_lock <- new_mutex!(()),
                 sbio_rx <- new_mutex!(transfer::Reassembly::new()),
@@ -1264,6 +1312,7 @@ impl SepData {
                 settle_work <- new_delayed_work!("SepData::settle_work"),
                 late_attach_work <- new_delayed_work!("SepData::late_attach_work"),
                 stac_work <- new_work!("SepData::stac_work"),
+                pnon_work <- new_work!("SepData::pnon_work"),
             }),
             GFP_KERNEL,
         )
@@ -1968,6 +2017,32 @@ impl SepData {
             Some(reply) => Ok(reply),
             None => Err(ETIMEDOUT),
         }
+    }
+
+    /// Sets the sizes an endpoint's buffers are registered with, for an
+    /// endpoint sized from its discovery layout. Once registered, only the
+    /// same sizes are accepted.
+    fn size_ool(&self, slot: &Mutex<Option<OolPair>>, declared: (usize, usize)) -> Result<()> {
+        let mut guard = slot.lock();
+        let pair: &mut Option<OolPair> = &mut guard;
+        let b = pair.as_mut().ok_or(ENODEV)?;
+        if b.registered {
+            return if (b.declared_in, b.declared_out) == declared {
+                Ok(())
+            } else {
+                Err(EBUSY)
+            };
+        }
+        if declared.0 == 0
+            || declared.1 == 0
+            || declared.0 > b.allocated
+            || declared.1 > b.allocated
+        {
+            return Err(EINVAL);
+        }
+        b.declared_in = declared.0;
+        b.declared_out = declared.1;
+        Ok(())
     }
 
     fn register_ool(&self, slot: &Mutex<Option<OolPair>>) -> Result<()> {
@@ -2915,6 +2990,12 @@ impl SepData {
         this.finish_bringup();
         // As macOS does once the enclave is up.
         Self::queue_stac_online(this.clone());
+        // The enclave's account of the LocalPolicy that admitted this boot.
+        Self::queue_pnon_digest(this.clone());
+        // As macOS does at boot, these are checked and sent nothing.
+        this.sse_attach();
+        this.hibe_attach();
+        this.skdl_attach();
         Self::arm_settle(this);
     }
 
@@ -3052,6 +3133,14 @@ impl SepData {
 
             stac::EP_STAC => self.on_stac(msg),
 
+            pnon::EP_PNON => self.on_pnon(msg),
+
+            sse::EP_SSE => self.on_sse(msg),
+
+            hibe::EP_HIBE => self.on_hibe(msg),
+
+            skdl::EP_SKDL => self.on_skdl(msg),
+
             proto::EP_BOOT => self.on_boot(msg),
 
             ep => {
@@ -3098,6 +3187,10 @@ impl SepData {
             proto::DISCOVER_TYPE_DESCRIPTOR | proto::DISCOVER_TYPE_CONFIG => {
                 let _ = table.slot(f.param);
                 self.stac_discovered(&f);
+                self.pnon_discovered(&f);
+                self.sse_discovered(&f);
+                self.hibe_discovered(&f);
+                self.skdl_discovered(&f);
                 diag::endpoints(table.eps.len());
                 if f.ty == proto::DISCOVER_TYPE_DESCRIPTOR {
                     diag::endpoint(f.param, (msg.msg0 >> 32) as u32);
@@ -3152,19 +3245,21 @@ impl SepData {
         self.sks_wq.notify_all();
         self.scrd_wq.notify_all();
         self.stac_wq.notify_all();
+        self.pnon_wq.notify_all();
         if let Some(mut handle) = self.rng.lock().take() {
             handle.unregister();
         }
 
         *self.mbox.lock() = None;
 
-        // SAFETY: all six pointers refer to pinned work fields in `self`.
+        // SAFETY: all seven pointers refer to pinned work fields in `self`.
         // Shutdown blocks requeueing, and the mailbox can no longer add work.
         unsafe {
             sep_cancel_work_sync(Work::raw_get(core::ptr::addr_of!(self.rx_work)).cast());
             sep_cancel_work_sync(Work::raw_get(core::ptr::addr_of!(self.enrol_work)).cast());
             sep_cancel_work_sync(Work::raw_get(core::ptr::addr_of!(self.verify_work)).cast());
             sep_cancel_work_sync(Work::raw_get(core::ptr::addr_of!(self.stac_work)).cast());
+            sep_cancel_work_sync(Work::raw_get(core::ptr::addr_of!(self.pnon_work)).cast());
             sep_cancel_delayed_work_sync(
                 DelayedWork::raw_as_work(core::ptr::addr_of!(self.settle_work)).cast(),
             );
@@ -3187,6 +3282,7 @@ impl SepData {
             &self.ool_sks,
             &self.ool_scrd,
             &self.ool_stac,
+            &self.ool_pnon,
         ] {
             if let Some(buffers) = slot.lock().take() {
                 if buffers.registered {
@@ -3375,6 +3471,14 @@ impl WorkItem<LATE_ATTACH_WORK_ID> for SepData {
 
     fn run(this: Arc<SepData>) {
         SepData::run_late_attach(&this);
+    }
+}
+
+impl WorkItem<PNON_WORK_ID> for SepData {
+    type Pointer = Arc<SepData>;
+
+    fn run(this: Arc<SepData>) {
+        this.run_pnon_digest();
     }
 }
 

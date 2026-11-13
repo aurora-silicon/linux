@@ -1153,7 +1153,21 @@ static void __init gate_t6041_max_no_memory(struct kunit *test)
 	gt_max_run(test);
 	gt_max_expect_chain(test, 0, false);
 	gt_max_expect_chain(test, 1, false);
+	gt_max_expect_chain(test, 2, false);
 	gt_max_expect_display(test, 0);
+}
+
+/* With dcpext2 filled too, the second USB-C chain comes up after dcpext1's, its DART last. */
+static void __init gate_t6041_max_second_usbc(struct kunit *test)
+{
+	gt_max_fill(test, 0);
+	gt_max_fill(test, 1);
+	gt_max_fill(test, 2);
+	gt_max_run(test);
+	gt_max_expect_chain(test, 0, true);
+	gt_max_expect_chain(test, 1, true);
+	gt_max_expect_chain(test, 2, true);
+	gt_max_expect_display(test, BIT(0) | BIT(1) | BIT(2));
 }
 
 /* The other processor's chain does not wait for one that was refused. */
@@ -1222,6 +1236,7 @@ static void __init gate_t6041_max_no_display(struct kunit *test)
 static struct kunit_case gate_t6041_max_cases[] __refdata = {
 	KUNIT_CASE(gate_t6041_max_enabled),
 	KUNIT_CASE(gate_t6041_max_no_memory),
+	KUNIT_CASE(gate_t6041_max_second_usbc),
 	KUNIT_CASE(gate_t6041_max_one_processor),
 	KUNIT_CASE(gate_t6041_max_partial_memory),
 	KUNIT_CASE(gate_t6041_max_enabled_by_loader),

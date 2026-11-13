@@ -2246,8 +2246,3 @@
 &ane_dart2 {
 	status = "okay";
 };
-
-/* SIO AES engine, software keys only. */
-&aes {
-	status = "okay";
-};

@@ -167,6 +167,19 @@
 		power-domains = <&ps_sbr>;
 		status = "disabled";
 	};
+	/*
+	 * DISPEXT0_ADMA, ADT power device 68: dp-audio1's power gate, the domain of dispext0's
+	 * ADMAC and its isochronous DART. Its parent, DISPEXT0_SYS, is the engine's, which the
+	 * boot loader hands over powered (see dcpext0) and which is not described.
+	 */
+	ps_dispext0_adma: power-controller@270 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x270 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dispext0_adma";
+		status = "disabled";
+	};
 	ps_atc0_cio: power-controller@280 {
 		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x280 4>;
@@ -2696,16 +2709,26 @@
 		reg = <0x2 0xb2180000 0x0 0x20000>;
 		interrupts = <AIC_IRQ 0 1093 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_dispext0_adma>;
 		status = "disabled";
 	};
 
+	/*
+	 * dispext0's own ADMAC, which feeds its DisplayPort audio (dp-audio1): one TX channel.
+	 * Its window is the DART's ADT vm-base and vm-size (1 TiB, 64 GiB). The boot loader
+	 * copies the control block's ADT tunables into admac_dispext0_ced_ssw (by a board's
+	 * admac-dispext0-control alias).
+	 */
 	admac_dispext0: dma-controller@2b2140000 {
-		compatible = "apple,t6050-admac", "apple,t8140-admac";
+		compatible = "apple,t6050-display-admac";
 		reg = <0x2 0xb2140000 0x0 0x24000>;
 		dma-channels = <1>;
 		interrupts-extended = <&aic AIC_IRQ 0 1092 IRQ_TYPE_LEVEL_HIGH>, <0>, <0>, <0>;
 		iommus = <&dispext0_isoc_dart 30>;
 		#dma-cells = <1>;
+		power-domains = <&ps_dispext0_adma>;
+		apple,dma-range = /bits/ 64 <0x10000000000 0x1000000000>;
+		apple,admac-control = <&admac_dispext0_ced_ssw>;
 		status = "disabled";
 	};
 

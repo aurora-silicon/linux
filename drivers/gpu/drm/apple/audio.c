@@ -265,6 +265,35 @@ static void dcpaud_consult_elements(struct dcp_audio *dcpaud,
 	dev_dbg(dcpaud->dev, "elements out: %llx %x %x\n", hits->formats, hits->nchans, hits->rates);
 }
 
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+/*
+ * Firmware 27's external role takes the stream's format as its link data,
+ * not the element's ElementData: macOS 27 links stereo 24-bit 48 kHz on
+ * the M5 Pro as (1, 2, 24, 48000). @sieve is the selected element's: one
+ * channel count, sample format and rate.
+ */
+static void dcpaud_link_format(struct dcp_audio *dcpaud,
+			       const struct dcp_sound_format_mask *sieve)
+{
+	struct dcp_audio_link_format *f = (void *)&dcpaud->selected_cookie;
+	int width = snd_pcm_format_width((__force snd_pcm_format_t)__ffs64(sieve->formats));
+
+	if (!dcp_audiosrv_link_by_format(dcpaud->dcp_dev) || !sieve->formats ||
+	    !sieve->nchans || !sieve->rates || width < 0)
+		return;
+	memset(&dcpaud->selected_cookie, 0, sizeof(dcpaud->selected_cookie));
+	f->format = cpu_to_le32(1);
+	f->channels = cpu_to_le32(__ffs(sieve->nchans));
+	f->sample_size = cpu_to_le32(width);
+	f->rate = cpu_to_le32(snd_pcm_known_rates.list[__ffs(sieve->rates)]);
+}
+#else
+static void dcpaud_link_format(struct dcp_audio *dcpaud,
+			       const struct dcp_sound_format_mask *sieve)
+{
+}
+#endif
+
 static int dcpaud_select_cookie(struct dcp_audio *dcpaud,
 				 struct snd_pcm_hw_params *params)
 {
@@ -278,10 +307,14 @@ static int dcpaud_select_cookie(struct dcp_audio *dcpaud,
 		.v14_7_audio = dcpaud->native_link,
 #endif
 	};
+	int ret;
 
 	dcpaud_fill_fmt_sieve(params, &sieve);
-	return parse_sound_mode(&elements, &sieve, &dcpaud->selected_chmap,
-				&dcpaud->selected_cookie);
+	ret = parse_sound_mode(&elements, &sieve, &dcpaud->selected_chmap,
+			       &dcpaud->selected_cookie);
+	if (ret > 0)
+		dcpaud_link_format(dcpaud, &sieve);
+	return ret;
 }
 
 static int dcpaud_rule_channels(struct snd_pcm_hw_params *params,
@@ -1015,6 +1048,11 @@ static void dcpaud_link_teardown(struct dcp_audio *dcpaud)
 	live = (dcpaud->link_prepared || dcpaud->link_started) &&
 	       dcp_audiosrv_link_live(dcpaud->dcp_dev);
 	if (dcpaud->link_started && live) {
+		/* Firmware 27, as macOS: the link's state as the stream stops. */
+		ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_QUERY,
+					&dcpaud->link_cookie);
+		if (ret && ret != -ENODEV)
+			dev_err(dcpaud->dev, "audio link query failed: %d\n", ret);
 		/* As macOS: the stopping notification, then STOP, same link data. */
 		ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_WILL_STOP,
 					&dcpaud->link_cookie);
@@ -1176,21 +1214,26 @@ static int dcp_pcm_native_start(struct snd_pcm_substream *substream, int cmd)
 
 	if (!dcpaud->link_prepared)
 		return -EBADFD;
-	if (dcpaud->link_started)
-		return 0;
-	ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_START,
-				&dcpaud->link_cookie);
-	if (ret)
-		return ret;
-	/* As macOS: START, then the started notification with the same link data. */
-	ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_DID_START,
-				&dcpaud->link_cookie);
-	if (ret) {
-		dev_err(dcpaud->dev, "audio link did-start failed: %d\n", ret);
-		dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_STOP, &dcpaud->link_cookie);
-		return ret;
+	if (!dcpaud->link_started) {
+		ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_START,
+					&dcpaud->link_cookie);
+		if (ret)
+			return ret;
+		/* As macOS: START, then the started notification with the same link data. */
+		ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_DID_START,
+					&dcpaud->link_cookie);
+		if (ret) {
+			dev_err(dcpaud->dev, "audio link did-start failed: %d\n", ret);
+			dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_STOP,
+					  &dcpaud->link_cookie);
+			return ret;
+		}
+		dcpaud->link_started = true;
 	}
-	dcpaud->link_started = true;
+	/* Firmware 27, as macOS: the link's state as the stream starts. */
+	ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_QUERY, &dcpaud->link_cookie);
+	if (ret)
+		dev_err(dcpaud->dev, "audio link query failed: %d\n", ret);
 	return 0;
 }
 
@@ -1304,10 +1347,15 @@ static int dcpaud_select_default_cookie(struct dcp_audio *dcpaud)
 	for (i = 0; i < ARRAY_SIZE(rates); i++)
 		for (j = 0; j < snd_pcm_known_rates.count; j++)
 			if (snd_pcm_known_rates.list[j] == rates[i] && (hits.rates & BIT(j))) {
+				int ret;
+
 				sieve.rates = BIT(j);
 				elements.pos = 0;
-				return parse_sound_mode(&elements, &sieve, &dcpaud->selected_chmap,
-							&dcpaud->selected_cookie);
+				ret = parse_sound_mode(&elements, &sieve, &dcpaud->selected_chmap,
+						       &dcpaud->selected_cookie);
+				if (ret > 0)
+					dcpaud_link_format(dcpaud, &sieve);
+				return ret;
 			}
 	return 0;
 }

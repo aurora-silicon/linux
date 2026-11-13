@@ -3098,9 +3098,50 @@ static const char *const t6041_max_hdmi_nodes[] = {
 
 static const char *const t6041_max_usbc_nodes[] = {
 	/*
-	 * ATC1 crossbar, DARTs, mailbox, route, dcpext1. The ATC1 mailbox is
-	 * the PHY's, on for USB3 whatever the display does, as on the M4 Pro.
+	 * ATC0-2 crossbars, DARTs, mailbox, a route per port, dcpext1, as the
+	 * M4 Pro's. The ATC mailboxes are the PHYs', on for USB3 whatever the
+	 * display does.
 	 */
+	"/mux@38324c000",
+	"/mux@38b24c000",
+	"/mux@39324c000",
+	"/iommu@602340000",
+	"/iommu@602300000",
+	"/mailbox@602e08000",
+	"/dcp@602e00000/typec-routes/route@0",
+	"/dcp@602e00000/typec-routes/route@1",
+	"/dcp@602e00000/typec-routes/route@2",
+	"/dcp@602e00000",
+};
+
+/*
+ * The second USB-C processor of the J614c/J616c: DARTs, mailbox, a route per
+ * port, dcpext2. It shares the ATC0-2 crossbars with dcpext1, whose chain
+ * enables them, so they are not part of this one.
+ */
+static const char *const t6041_max_usbc2_nodes[] = {
+	"/iommu@606340000",
+	"/iommu@606300000",
+	"/mailbox@606e08000",
+	"/dcp@606e00000/typec-routes/route@0",
+	"/dcp@606e00000/typec-routes/route@1",
+	"/dcp@606e00000/typec-routes/route@2",
+	"/dcp@606e00000",
+};
+
+static const struct gate_staged t6041_max_stages[] = {
+	{ "/iommu@3a2300000", t6041_max_hdmi_nodes, ARRAY_SIZE(t6041_max_hdmi_nodes) },
+	{ "/iommu@602300000", t6041_max_usbc_nodes, ARRAY_SIZE(t6041_max_usbc_nodes) },
+	{ "/iommu@606300000", t6041_max_usbc2_nodes, ARRAY_SIZE(t6041_max_usbc2_nodes) },
+};
+
+/*
+ * The J575c's typec1 chain: ATC1 crossbar, DARTs, mailbox, route, dcpext1.
+ * That port is also a USB3 port, so its device tree enables the ATC1 PHY's
+ * coprocessor mailbox, as the M4 Pro boards do: the mailbox is not part of
+ * the chain here.
+ */
+static const char *const t6041_j575c_usbc_nodes[] = {
 	"/mux@38b24c000",
 	"/iommu@602340000",
 	"/iommu@602300000",
@@ -3109,22 +3150,33 @@ static const char *const t6041_max_usbc_nodes[] = {
 	"/dcp@602e00000",
 };
 
-static const struct gate_staged t6041_max_stages[] = {
-	{ "/iommu@3a2300000", t6041_max_hdmi_nodes, ARRAY_SIZE(t6041_max_hdmi_nodes) },
-	{ "/iommu@602300000", t6041_max_usbc_nodes, ARRAY_SIZE(t6041_max_usbc_nodes) },
+static const struct gate_staged t6041_j575c_usbc = {
+	"/iommu@602300000", t6041_j575c_usbc_nodes, ARRAY_SIZE(t6041_j575c_usbc_nodes),
 };
 
 /*
- * The J575c's typec1 chain. That port is also a USB3 port, so its device tree
- * enables the ATC1 PHY's coprocessor mailbox, as the M4 Pro boards do: the
- * mailbox is not part of the chain here, and the rest is the J616c's.
+ * The J575c's HDMI chain. Its ATC3 is a USB-C port, and its HDMI port runs
+ * through the LPDPTX PHY instead (t6041-j575c-hdmi.dtsi): that PHY's power,
+ * the AOP pins (the converter's hotplug), the PHY, then dcpext0's chain.
  */
-static const struct gate_staged t6041_j575c_usbc = {
-	"/iommu@602300000", t6041_max_usbc_nodes, ARRAY_SIZE(t6041_max_usbc_nodes),
+static const char *const t6041_j575c_hdmi_nodes[] = {
+	"/power-management@502280000/power-controller@360",
+	"/pinctrl@510824000",
+	"/phy@51c200000",
+	"/iommu@3a2340000",
+	"/iommu@3a2300000",
+	"/mailbox@3a2e08000",
+	"/dcp@3a2e00000",
+};
+
+static const struct gate_staged t6041_j575c_hdmi = {
+	"/iommu@3a2300000", t6041_j575c_hdmi_nodes, ARRAY_SIZE(t6041_j575c_hdmi_nodes),
 };
 
 static const struct gate_staged *t6041_max_stage(unsigned int i)
 {
+	if (i == 0 && of_machine_is_compatible("apple,j575c"))
+		return &t6041_j575c_hdmi;
 	if (i == 1 && of_machine_is_compatible("apple,j575c"))
 		return &t6041_j575c_usbc;
 	return &t6041_max_stages[i];
