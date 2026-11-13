@@ -281,6 +281,12 @@ struct hw_info {
 	bool tunnel_ack_on_set;
 	/* Stop the tunnel for hibernation and start it on thaw and restore. */
 	bool tunnel_hibernate;
+	/*
+	 * Internal ports with their endpoints, which a restored image or a real S2R finds
+	 * reset behind a down link: probe's bring-up runs again, see
+	 * apple_pcie_conventional_host().
+	 */
+	bool conventional_restore;
 };
 
 static const struct hw_info t8103_hw = {
@@ -292,6 +298,7 @@ static const struct hw_info t8103_hw = {
 	.port_rid2sid		= PORT_RID2SID,
 	.port_msimap		= 0,
 	.max_rid2sid		= 64,
+	.conventional_restore	= true,
 };
 
 static const struct hw_info t602x_hw = {
@@ -304,6 +311,7 @@ static const struct hw_info t602x_hw = {
 	.port_msimap		= PORT_T602X_MSIMAP,
 	/* 16 on t602x, guess for autodetect on future HW */
 	.max_rid2sid		= 512,
+	.conventional_restore	= true,
 };
 
 /*
@@ -336,6 +344,7 @@ static const struct hw_info t8152_hw = {
 	.max_rid2sid		= 512,
 	.refbuf_off		= true,
 	.pipe_rst		= true,
+	.conventional_restore	= true,
 };
 
 /*
@@ -351,6 +360,7 @@ static const struct hw_info t6050_hw = {
 	.max_rid2sid		= 64,
 	.retain_clocks		= true,
 	.adopt_link		= true,
+	.conventional_restore	= true,
 };
 
 #define T6050_ROUTE(rid, sid)	(PORT_RID2SID_VALID | \
@@ -5885,8 +5895,7 @@ static void apple_pcie_neo_save_functions(struct apple_pcie *pcie);
  */
 static bool apple_pcie_conventional_host(struct apple_pcie *pcie)
 {
-	return !pcie->hw->tunneled && !pcie->managed_sids && !pcie->piodma_supplier &&
-	       !pcie->hw->root_bus_only;
+	return pcie->hw->conventional_restore && !pcie->managed_sids;
 }
 
 /*
@@ -5933,6 +5942,26 @@ static void apple_pcie_restore_rid2sid(struct apple_pcie *pcie, struct apple_pci
 		apple_pcie_rid2sid_write(port, i, test_bit(i, port->sid_map) ?
 					 port->saved_rid2sid[i] : 0);
 	mutex_unlock(&pcie->lock);
+}
+
+/*
+ * What both ways back have in common once the port runs with its root port set: clocks gated
+ * as at probe, all port interrupts masked and cleared with the MSI routing as at probe, the
+ * RID-to-SID table, the link trained, and the interrupt mask the kernel had.
+ */
+static int apple_pcie_restore_port_finish(struct apple_pcie *pcie, struct apple_pcie_port *port)
+{
+	int ret;
+
+	apple_pcie_port_gate_clocks(pcie, port);
+	apple_pcie_tunnel_restore_irq_hw(port);
+	apple_pcie_restore_rid2sid(pcie, port);
+	ret = apple_pcie_restore_train(pcie, port);
+	if (ret)
+		return ret;
+	apple_pcie_port_writel(port, BIT(PORT_INT_LINK_UP), PORT_INTSTAT);
+	apple_pcie_port_writel(port, port->saved_intmask, PORT_INTMSK);
+	return 0;
 }
 
 static void apple_pcie_s2r_save_port(struct apple_pcie *pcie, struct apple_pcie_port *port)
@@ -6012,15 +6041,7 @@ static int apple_pcie_s2r_port_train_noirq(struct apple_pcie *pcie, struct apple
 	if (ret)
 		return ret;
 	apple_pcie_s2r_restore_rc(pcie, port);
-	apple_pcie_port_gate_clocks(pcie, port);
-	apple_pcie_tunnel_restore_irq_hw(port);
-	apple_pcie_restore_rid2sid(pcie, port);
-	ret = apple_pcie_restore_train(pcie, port);
-	if (ret)
-		return ret;
-	apple_pcie_port_writel(port, BIT(PORT_INT_LINK_UP), PORT_INTSTAT);
-	apple_pcie_port_writel(port, port->saved_intmask, PORT_INTMSK);
-	return 0;
+	return apple_pcie_restore_port_finish(pcie, port);
 }
 
 static void apple_pcie_s2r_port_failed(struct apple_pcie *pcie, struct apple_pcie_port *port,
@@ -6855,15 +6876,9 @@ static int apple_pcie_restore_port_up(struct apple_pcie *pcie, struct apple_pcie
 	ret = apple_pcie_setup_link(pcie, port, port->np);
 	if (ret)
 		return ret;
-	apple_pcie_port_gate_clocks(pcie, port);
-	/* All port interrupts masked and cleared, MSI routing as at probe. */
-	apple_pcie_tunnel_restore_irq_hw(port);
-	apple_pcie_restore_rid2sid(pcie, port);
-	ret = apple_pcie_restore_train(pcie, port);
+	ret = apple_pcie_restore_port_finish(pcie, port);
 	if (ret)
 		return ret;
-	apple_pcie_port_writel(port, BIT(PORT_INT_LINK_UP), PORT_INTSTAT);
-	apple_pcie_port_writel(port, port->saved_intmask, PORT_INTMSK);
 	/* 100 ms after the link before configuration requests (PCIe r5.0, 6.6.1). */
 	msleep(100);
 	return 0;
