@@ -379,6 +379,12 @@ bool dcp_is_typec_only(struct platform_device *pdev)
 	return !dcp->fixed_phy;
 }
 
+static bool dcp_fabric_t6040_tunnel_clock(void)
+{
+	return of_machine_is_compatible("apple,t6040") ||
+	       of_machine_is_compatible("apple,t6041");
+}
+
 static int dcp_route_clock_rate(struct apple_dcp_typec_route *route,
 				struct phy *phy, unsigned int dpin, u8 rate)
 {
@@ -397,6 +403,20 @@ static int dcp_route_clock_rate(struct apple_dcp_typec_route *route,
 			return rate ? -EOPNOTSUPP : 0;
 		ret = fn(phy, dpin + 1, rate);
 		symbol_put(apple_t6050_dp_tunnel_clock);
+		if (!ret)
+			route->tunnel_rate = rate;
+		return ret;
+	}
+
+	/* T6040: the PHY's own AUSPLL feeds the pixel clock of DP IN 0 and 1. */
+	if (dcp_fabric_t6040_tunnel_clock()) {
+		typeof(apple_t6040_dp_tunnel_rate) *fn =
+			symbol_get(apple_t6040_dp_tunnel_rate);
+
+		if (!fn)
+			return rate ? -EOPNOTSUPP : 0;
+		ret = fn(phy, dpin, rate);
+		symbol_put(apple_t6040_dp_tunnel_rate);
 		if (!ret)
 			route->tunnel_rate = rate;
 		return ret;
@@ -2196,6 +2216,9 @@ static void dcp_tunnel_prepare(struct apple_dcp_typec_route *route,
 	if (ret && ret != -EOPNOTSUPP)
 		dev_warn(dcp->dev, "DP tunnel crossbar preselect failed: %d\n", ret);
 
+	/* The clock call starts everything on T6040. */
+	if (dcp_fabric_t6040_tunnel_clock())
+		return;
 	open = symbol_get(apple_atc_dp_tunnel_open);
 	if (!open)
 		return;
@@ -2949,12 +2972,22 @@ static int dcp_tb_split_teardown_locked(struct apple_dcp_typec_port *port,
 		/* Retire the callback before dropping its clock reference. */
 		dcp->split.active = false;
 		if (dcp->phy) {
-			typeof(apple_atc_dp_tunnel_rate) *stop =
-				symbol_get(apple_atc_dp_tunnel_rate);
+			if (dcp_fabric_t6040_tunnel_clock()) {
+				typeof(apple_t6040_dp_tunnel_rate) *stop =
+					symbol_get(apple_t6040_dp_tunnel_rate);
 
-			if (stop) {
-				stop(dcp->phy, 1, 0);
-				symbol_put(apple_atc_dp_tunnel_rate);
+				if (stop) {
+					stop(dcp->phy, 1, 0);
+					symbol_put(apple_t6040_dp_tunnel_rate);
+				}
+			} else {
+				typeof(apple_atc_dp_tunnel_rate) *stop =
+					symbol_get(apple_atc_dp_tunnel_rate);
+
+				if (stop) {
+					stop(dcp->phy, 1, 0);
+					symbol_put(apple_atc_dp_tunnel_rate);
+				}
 			}
 		}
 		if (dcp->split.xbar) {

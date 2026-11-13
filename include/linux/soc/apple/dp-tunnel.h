@@ -59,6 +59,12 @@ int apple_dcp_tb_dp_event(struct device_node *connector_np, unsigned int dpin,
  */
 int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate);
 
+/*
+ * T6040 ATC PHY: the same for DP IN adapter @dpin (0 or 1), a symbol of its own because
+ * phy-apple-atc and phy-apple-t6040-usb2 can both be built.
+ */
+int apple_t6040_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate);
+
 /* T6030's external DPTX port 0 sources feed DP IN0/1 through PCLK1/2. */
 static inline int apple_dp_tunnel_t6030_pclk(unsigned int source, unsigned int dpin)
 {

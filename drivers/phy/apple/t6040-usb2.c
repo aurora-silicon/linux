@@ -2080,7 +2080,7 @@ static const struct phy_ops t6040_dp_phy_ops = {
  * whose select field divides it per link rate. DP IN adapter 0 is taken to
  * use PCLK1 and clock switch 1, adapter 1 PCLK2 and switch 2 (the PHY does
  * not choose: the index is the display controller's). Driven only by
- * appledrm through apple_atc_dp_tunnel_rate(), and only while the PHY is in
+ * appledrm through apple_t6040_dp_tunnel_rate(), and only while the PHY is in
  * CIO.
  */
 #define T6040_CORE_RCAL1		0x804	/* AUS40CMN_DIG RCAL1 */
@@ -2326,13 +2326,12 @@ static int t6040_tun_rate_locked(struct t6040_usb2_phy *tphy, unsigned int dpin,
 }
 
 /*
- * The dp-tunnel.h provider for appledrm, which looks it up with symbol_get().
- * phy-apple-atc exports the same names for the older SoCs; a kernel that
- * builds both gets them from there (and T6040 tunnels then need appledrm to
- * pick a T6040 provider instead).
+ * The pixel clock of a DP tunnel for appledrm, which looks it up with symbol_get(): start the
+ * clock of DP IN adapter @dpin (0 or 1) at DP link rate code @rate, or stop it with 0. The
+ * PHY must be in CIO. A symbol of its own, as for T6050: phy-apple-atc exports
+ * apple_atc_dp_tunnel_rate() for the older SoCs, and both can be built into one kernel.
  */
-#if !IS_ENABLED(CONFIG_PHY_APPLE_ATC)
-int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
+int apple_t6040_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 {
 	struct t6040_usb2_phy *tphy;
 
@@ -2342,17 +2341,7 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 	guard(mutex)(&tphy->lock);
 	return t6040_tun_rate_locked(tphy, dpin, rate);
 }
-EXPORT_SYMBOL_GPL(apple_atc_dp_tunnel_rate);
-
-/* The rate call does all of it, as on every SoC but t600x. */
-int apple_atc_dp_tunnel_open(struct phy *phy)
-{
-	if (!phy || phy->ops != &t6040_dp_phy_ops)
-		return -EINVAL;
-	return -EOPNOTSUPP;
-}
-EXPORT_SYMBOL_GPL(apple_atc_dp_tunnel_open);
-#endif
+EXPORT_SYMBOL_GPL(apple_t6040_dp_tunnel_rate);
 
 /* ---- CIO: USB4/Thunderbolt (PHY mode 2) ----
  *
