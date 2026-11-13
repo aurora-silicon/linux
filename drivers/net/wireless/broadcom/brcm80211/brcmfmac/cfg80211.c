@@ -5274,11 +5274,6 @@ static s32 brcmf_cfg80211_suspend(struct wiphy *wiphy,
 			 * in suspended state
 			 */
 			brcmf_link_down(vif, WLAN_REASON_UNSPECIFIED, true);
-			/* Make sure WPA_Supplicant receives all the event
-			 * generated due to DISASSOC call to the fw to keep
-			 * the state fw and WPA_Supplicant state consistent
-			 */
-			brcmf_delay(500);
 		}
 		/* Configure MPC */
 		brcmf_set_mpc(ifp, 1);
