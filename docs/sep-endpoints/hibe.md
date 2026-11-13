@@ -9,7 +9,7 @@ as protecting saved memory against disclosure, modification and replay
 ([architecture presentation](https://developer.apple.com/videos/play/wwdc2020/10686/)).
 That feature description does not publish hibe's IPC.
 
-Linux has no hibe client. It is needed for parity with secure hibernation;
+Linux checks the endpoint at boot and sends it nothing, as macOS does outside a real hibernation (`drivers/soc/apple/hibe.rs`, `diag/hibe`). It is needed for parity with secure hibernation;
 ordinary suspend-to-idle success does not satisfy this requirement. A hibe
 driver is only one prerequisite: CPU offlining/restart, cold device recovery,
 firmware memory-map compatibility, image storage and the early resume path must

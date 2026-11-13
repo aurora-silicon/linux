@@ -12,7 +12,7 @@
 		interrupt-controller;
 		#interrupt-cells = <2>;
 		#address-cells = <0>;
-		status = "disabled";
+		status = "okay";
 	};
 
 	clvr_spmi3: spmi@28e519100 {
@@ -308,10 +308,4 @@
 			     <166 IRQ_TYPE_NONE>;
 		status = "disabled";
 	};
-};
-
-
-&pmic1 {
-	interrupt-parent = <&primary_spmi_monitor>;
-	interrupts = <2 IRQ_TYPE_NONE>;
 };

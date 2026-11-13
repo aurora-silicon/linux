@@ -100,6 +100,10 @@
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/reset.h>
+#include <linux/phy/phy.h>
+#include <linux/phy/apple-atc.h>
+#include <linux/soc/apple/dart-cio.h>
+#include <linux/soc/apple/pmgr-pwrstate.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/tunable.h>
@@ -327,6 +331,10 @@ MODULE_PARM_DESC(dpin_mode_value,
 /* DP IN adapters without an interrupt are polled this often (ms). */
 #define APPLE_DPIN_POLL_MS 20
 
+static bool cio_s2r = true;
+module_param(cio_s2r, bool, 0400);
+MODULE_PARM_DESC(cio_s2r, "Enable J713 attached-dock system sleep (default: on)");
+
 struct apple_dpin_binding;
 
 /**
@@ -385,6 +393,7 @@ struct apple_cio {
 
 	struct mutex lock; /* serializes cable transitions and ACIO power up/down */
 	bool removing; /* protected by lock */
+	bool native_sleep; /* freeze cable transitions for the bound NHI */
 	struct delayed_work resume_link_work;
 	unsigned int resume_link_failures; /* protected by lock */
 	u64 resume_activity; /* snapshot before the stock resume path */
@@ -1311,6 +1320,12 @@ struct apple_nhi {
 	struct tb_nhi_ops ops;
 
 	void __iomem *nhi_base;
+	struct apple_tunable *nhi_tunable;
+	struct apple_dart_cio *cio_dart;
+	struct phy *cio_phy;
+	struct device *cio_pcie;
+	u8 cio_pd_suspended;
+	bool cio_prepared, cio_rtk_off, cio_cycled;
 	void __iomem *pdf_base;
 
 	int *tx_irqs;
@@ -1327,6 +1342,12 @@ struct apple_nhi {
 	bool dp_aux_armed;
 	unsigned int dp_aux_polls;
 };
+
+static int apple_nhi_cio_bind(struct apple_nhi *anhi);
+static int apple_nhi_cio_prepare(struct apple_nhi *anhi);
+static int apple_nhi_cio_suspend(struct apple_nhi *anhi);
+static int apple_nhi_cio_resume(struct apple_nhi *anhi);
+static void apple_nhi_cio_complete(struct apple_nhi *anhi);
 
 #define nhi_to_anhi(nhi_) container_of((nhi_), struct apple_nhi, nhi)
 
@@ -2092,7 +2113,7 @@ static void apple_dp_aux_work(struct work_struct *work)
 		return;
 
 	mutex_lock(&anhi->tb->lock);
-	if (!anhi->dp_aux_armed || !anhi->tb->root_switch)
+	if (!anhi->dp_aux_armed || !anhi->tb->root_switch || READ_ONCE(anhi->acio->native_sleep))
 		goto out_unlock;
 
 	port = &anhi->tb->root_switch->ports[anhi->dp_in_port];
@@ -2453,6 +2474,7 @@ static int apple_nhi_probe(struct platform_device *pdev)
 		ret = dev_err_probe(&pdev->dev, PTR_ERR(tunable), "Unable to load NHI tunable\n");
 		goto err;
 	}
+	anhi->nhi_tunable = tunable;
 	apple_tunable_apply(anhi->nhi_base, tunable);
 
 	/* Type 7 keeps the PDF masks in the receive ring registers only. */
@@ -2492,6 +2514,9 @@ static int apple_nhi_probe(struct platform_device *pdev)
 		anhi->ops.dp_tunnel_deactivate = apple_nhi_dp_tunnel_deactivate;
 		anhi->nhi.host_dp_policy = acio->dp->host_policy;
 	}
+	ret = apple_nhi_cio_bind(anhi);
+	if (ret)
+		goto err;
 	anhi->nhi.ops = &anhi->ops;
 	anhi->nhi.ring_layout = &apple_nhi_ring_layout;
 	anhi->nhi.iobase = anhi->nhi_base;
@@ -2689,29 +2714,51 @@ static int apple_nhi_prepare(struct device *dev)
 {
 	struct apple_nhi *anhi = dev_get_drvdata(dev);
 	struct apple_cio *acio = anhi->acio;
+	bool recovery = READ_ONCE(resume_recovery);
+	/*
+	 * Only a sleep that may cost the router its tunnels expects them back:
+	 * one with resume recovery, as before, and the J713's native deep sleep,
+	 * which power-cycles the router.
+	 */
+	bool cycles = recovery ||
+		      (anhi->cio_dart && pm_suspend_target_state == PM_SUSPEND_MEM);
+	bool expected;
+	int ret;
 
 	acio->resume_had_peer = false;
 	/* Only resume recovery reads it: don't take the domain lock otherwise. */
-	if (!READ_ONCE(resume_recovery))
-		return 0;
-	scoped_guard(mutex, &anhi->tb->lock) {
-		struct tb_port *port;
+	if (recovery) {
+		scoped_guard(mutex, &anhi->tb->lock) {
+			struct tb_port *port;
 
-		tb_switch_for_each_port(anhi->tb->root_switch, port) {
-			if (tb_port_is_null(port) &&
-			    ((port->xdomain && !port->xdomain->is_unplugged) ||
-			     (port->remote && !port->remote->sw->is_unplugged)))
-				acio->resume_had_peer = true;
+			tb_switch_for_each_port(anhi->tb->root_switch, port) {
+				if (tb_port_is_null(port) &&
+				    ((port->xdomain && !port->xdomain->is_unplugged) ||
+				     (port->remote && !port->remote->sw->is_unplugged)))
+					acio->resume_had_peer = true;
+			}
 		}
 	}
 
+	/* Worker admission and native PCIe PM ordering are required on every sleep. */
 	apple_dpin_pause_retries(acio);
 
-	guard(mutex)(&acio->pcie_tunnel_lock);
-	/* Keep an unresolved expectation across another sleep before revalidation. */
-	acio->pcie_resume_expected |= READ_ONCE(acio->pcie_tunnel_requested);
-	acio->pcie_pm_prepared = true;
-	return 0;
+	scoped_guard(mutex, &acio->pcie_tunnel_lock) {
+		expected = acio->pcie_resume_expected;
+		/* Keep an unresolved expectation until cable revalidation. */
+		if (cycles)
+			acio->pcie_resume_expected |= READ_ONCE(acio->pcie_tunnel_requested);
+		acio->pcie_pm_prepared = true;
+	}
+	ret = apple_nhi_cio_prepare(anhi);
+	if (ret) {
+		apple_dpin_resume_retries(acio);
+		scoped_guard(mutex, &acio->pcie_tunnel_lock) {
+			acio->pcie_pm_prepared = false;
+			acio->pcie_resume_expected = expected;
+		}
+	}
+	return ret;
 }
 
 /*
@@ -2754,6 +2801,8 @@ static int apple_nhi_suspend_noirq(struct device *dev)
 {
 	struct apple_nhi *anhi = dev_get_drvdata(dev);
 
+	if (anhi->cio_prepared)
+		return apple_nhi_cio_suspend(anhi);
 	anhi->nhi.quirks &= ~(QUIRK_NO_SYSTEM_SLEEP | QUIRK_KEEP_TUNNELS);
 	if (!READ_ONCE(router_sleep)) {
 		anhi->nhi.quirks |= QUIRK_NO_SYSTEM_SLEEP;
@@ -2790,6 +2839,8 @@ static int apple_nhi_resume_noirq(struct device *dev)
 {
 	struct apple_nhi *anhi = dev_get_drvdata(dev);
 
+	if (anhi->cio_prepared)
+		return apple_nhi_cio_resume(anhi);
 	anhi->acio->resume_activity = atomic64_read(&anhi->tb->remote_activity);
 	WRITE_ONCE(anhi->acio->resume_link_pending, true);
 	return tb_domain_resume_noirq(anhi->tb);
@@ -2821,6 +2872,7 @@ static void apple_nhi_complete(struct device *dev)
 	struct apple_nhi *anhi = dev_get_drvdata(dev);
 	struct apple_cio *acio = anhi->acio;
 
+	apple_nhi_cio_complete(anhi);
 	tb_domain_complete(anhi->tb);
 	apple_dpin_resume_retries(acio);
 
@@ -2933,12 +2985,12 @@ static void apple_cio_remove_children(struct apple_cio *acio)
  * While the router is off, the AP holds LSTX at the level the router last
  * drove. The pin goes back to the router once it is up again.
  */
-static void apple_cio_lstx_hold(struct apple_cio *acio, bool high)
+static int apple_cio_lstx_hold(struct apple_cio *acio, bool high)
 {
 	struct gpio_desc *gpio;
 
 	if (!acio->lstx_hold)
-		return;
+		return 0;
 	acio->lstx_high = high;
 
 	/* The pin controller is strict: release the router's mux first. */
@@ -2953,9 +3005,10 @@ static void apple_cio_lstx_hold(struct apple_cio *acio, bool high)
 		acio->lstx_high = false;
 		dev_warn(acio->dev, "failed to take the LSTX pin back: %ld\n",
 			 PTR_ERR(gpio));
-		return;
+		return PTR_ERR(gpio);
 	}
 	acio->lstx_gpio = gpio;
+	return 0;
 }
 
 static int apple_cio_lstx_release(struct apple_cio *acio)
@@ -3490,6 +3543,8 @@ static void apple_cio_resume_link_work(struct work_struct *work)
 		typec_thunderbolt_switch_notify(acio->tbt_switch);
 }
 
+#include "apple-cio-sleep.c"
+
 static int apple_cio_prepare(struct device *dev)
 {
 	struct apple_cio *acio = dev_get_drvdata(dev);
@@ -3603,6 +3658,8 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 		break;
 	}
 
+	if (acio->native_sleep)
+		return acio->target_cable_info == acio->current_cable_info ? 0 : -EBUSY;
 	/* Until resume, record changes; CD321x reapplies fresh state afterwards. */
 	if (acio->sleep_phase == APPLE_CIO_SLEEP_CLOSED)
 		return 0;

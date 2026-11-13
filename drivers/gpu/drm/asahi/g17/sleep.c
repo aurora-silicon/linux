@@ -40,6 +40,9 @@
 #define SGX_BRIDGE_ENABLE	BIT(0)
 
 #define ASC_CPU_STATUS		0x4
+/* Where the ASC's own registers hold the CPU's control: G16. */
+#define ASC_CPU_CONTROL		0x44
+#define ASC_CPU_CONTROL_RUN	BIT(4)
 
 /* The PMP's request for the GPU, where the device tree names one. */
 int asahi_g17_pmp_request(struct device *dev, bool enable)
@@ -206,7 +209,10 @@ static int asahi_g17_commit_stop(void *data)
 	for (i = 0; i < c->count; i++) {
 		c->status[i] = readl(c->cpu[i] + ASC_CPU_STATUS);
 		apple_rtkit_mailbox_recv_off(c->rtk[i]);
-		apple_mbox_ascwrap_v6_stop_cpu_atomic(c->mbox[i]);
+		if (c->mbox[i])
+			apple_mbox_ascwrap_v6_stop_cpu_atomic(c->mbox[i]);
+		else
+			writel(readl(c->cpu[i]) & ~ASC_CPU_CONTROL_RUN, c->cpu[i]);
 		if (!i && c->bridge)
 			writel(readl(c->gating) | SGX_GATING_HOLD, c->gating);
 	}
@@ -251,6 +257,9 @@ static void asahi_g17_commit_free(struct asahi_g17_commit *c)
 		apple_pmp_report_entry_commit_owned(c->request, false);
 		of_node_put(c->request);
 	}
+	/* The mapping is only this structure's on G16: G17's belongs to its mailbox. */
+	if (!c->mbox[0] && c->cpu[0])
+		iounmap(c->cpu[0]);
 	if (c->ps)
 		iounmap(c->ps);
 	if (c->bridge)
@@ -329,6 +338,47 @@ err:
 bool asahi_g17_commit_required(void)
 {
 	return apple_sleep_commit_stops_coprocs();
+}
+
+/*
+ * The same stop for G16: one firmware instance, whose control registers are the ASC's own, no
+ * bridge and no PMP request to withdraw, as its vote stays through the sleep.
+ */
+struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct apple_rtkit *rtk)
+{
+	struct asahi_g17_commit *c;
+	struct device_node *np;
+	u32 offset;
+	int ret;
+
+	c = kzalloc_obj(*c);
+	if (!c)
+		return ERR_PTR(-ENOMEM);
+	c->dev = dev;
+	c->rtk[0] = rtk;
+	c->count = 1;
+
+	ret = -ENODEV;
+	c->cpu[0] = asahi_g17_map(dev->of_node, "asc", 0, ASC_CPU_CONTROL, 8);
+	np = of_parse_phandle(dev->of_node, "power-domains", 0);
+	if (!np)
+		goto err;
+	if (!of_property_read_u32(np, "reg", &offset) && np->parent)
+		c->ps = asahi_g17_map(np->parent, NULL, 0, offset, 4);
+	of_node_put(np);
+	if (!c->cpu[0] || !c->ps)
+		goto err;
+
+	ret = apple_sleep_coproc_register_first(dev, asahi_g17_commit_stop, c);
+	if (ret)
+		goto err;
+	apple_sleep_coproc_set_ready(dev, true);
+
+	return c;
+
+err:
+	asahi_g17_commit_free(c);
+	return ERR_PTR(ret);
 }
 
 /*

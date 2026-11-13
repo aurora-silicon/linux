@@ -1409,6 +1409,8 @@
 			     <43 IRQ_TYPE_EDGE_RISING>,
 			     <45 IRQ_TYPE_EDGE_RISING>;
 		interrupt-names = "irq", "select", "sleep", "wake";
+		/* Retimer set up before Linux keeps SuperSpeed down until replugged. */
+		apple,reset-inherited-usb2-connection;
 
 		typec1: connector {
 			compatible = "usb-c-connector";
@@ -1438,6 +1440,8 @@
 			     <69 IRQ_TYPE_EDGE_RISING>,
 			     <71 IRQ_TYPE_EDGE_RISING>;
 		interrupt-names = "irq", "select", "sleep", "wake";
+		/* Retimer set up before Linux keeps SuperSpeed down until replugged. */
+		apple,reset-inherited-usb2-connection;
 
 		typec2: connector {
 			compatible = "usb-c-connector";

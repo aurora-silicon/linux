@@ -341,6 +341,14 @@ static const struct aic_info aic3_t8140_info __initconst = {
 	.fw_suspend = true,
 };
 
+static const struct aic_info aic3_t8132_info __initconst = {
+	.version = 3,
+	.irq_cfg = AIC3_IRQ_CFG,
+	.fast_ipi = true,
+	.local_fast_ipi = true,
+	.fw_suspend = true,
+};
+
 static const struct aic_info aic3_t8142_info __initconst = {
 	.version = 3,
 	.irq_cfg = AIC3_IRQ_CFG,
@@ -350,6 +358,10 @@ static const struct aic_info aic3_t8142_info __initconst = {
 };
 
 static const struct of_device_id aic_info_match[] = {
+	{
+		.compatible = "apple,t8132-aic3",
+		.data = &aic3_t8132_info,
+	},
 	{
 		.compatible = "apple,t8140-aic3",
 		.data = &aic3_t8140_info,

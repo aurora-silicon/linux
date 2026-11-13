@@ -20,6 +20,13 @@
 #define APPLE_PMP_BACKSTOP_MC 108000
 #define APPLE_PMP_FULL_COOLING_MC 115000
 #define APPLE_PMP_RELEASE_MC 106000
+/*
+ * The firmware publishes a die sensor only while its cluster has power, so an idle
+ * machine can have none valid for a moment (0.46 s the longest measured). Go on from the
+ * last reading for this long, if it was this cool. Longer or hotter is a failed sensor.
+ */
+#define APPLE_PMP_GATED_HOLD_NS 2000000000ULL
+#define APPLE_PMP_GATED_HOLD_MC 90000
 
 struct apple_pmp_cooling {
 	unsigned long long last_ns, good_ns, anchor_ns, release_ns;

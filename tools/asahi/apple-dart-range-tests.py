@@ -69,11 +69,18 @@ static int apple_dart_fw_invalidate(struct apple_dart_stream_map *stream, u64 fi
  firmware_flushes++; seen_first=first; seen_last=last; return range_error;
 }
 static int full(struct apple_dart_stream_map *stream) { fulls++; return 0; }
+/* No J713 sleep owns this DART, so writers are admitted; each must still leave. */
+static int writers;
+#define APPLE_DART_WRITER_COUNTED 1
+#define APPLE_DART_WRITER_CLOSED 2
+static int apple_dart_sleep_writer_get(struct apple_dart *dart) { writers++; return APPLE_DART_WRITER_COUNTED; }
+static void apple_dart_sleep_writer_put(struct apple_dart *dart, int gate) { assert(gate==APPLE_DART_WRITER_COUNTED && writers>0); writers--; }
+static void apple_dart_sleep_release_failed(void) { assert(!"sleep writer refused"); }
 '''
     source += production
     source += r'''
 static void reset(void) {
- assert(powered==0); power_error=sync_error=range_error=syncs=ranges=fulls=0;
+ assert(powered==0 && writers==0); power_error=sync_error=range_error=syncs=ranges=fulls=0;
  seen_first=seen_last=0; firmware_flushes=quarantines=dcp_flushes=0;
 }
 int main(void) {
@@ -126,7 +133,7 @@ int main(void) {
  assert(ranges==1 && syncs==1 && powered==0);
  reset(); domain.count=1; domain.streams[0].sidmap[0]=0;
  assert(!apple_dart_domain_flush_tlb_range(&domain,true,0x4000,0x7fff));
- assert(syncs==0 && ranges==0 && fulls==0 && powered==0);
+ assert(syncs==0 && ranges==0 && fulls==0 && powered==0 && writers==0);
  puts("PASS: device DVA, low window, legacy/unlocked fallback, sync/power/command errors and empty stream");
 }
 '''
