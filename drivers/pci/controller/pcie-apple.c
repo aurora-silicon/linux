@@ -6967,7 +6967,7 @@ static int apple_pcie_restore(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
 
-	if (!apple_pcie_conventional_host(pcie) || !pm_hibernate_is_restored())
+	if (!apple_pcie_conventional_host(pcie))
 		return 0;
 	apple_pcie_conventional_up(pcie, "resume from disk");
 	return 0;
@@ -7015,13 +7015,13 @@ static int apple_pcie_wake_noirq(struct device *dev)
 	return apple_pcie_resume_noirq(dev);
 }
 
-/* Thaw and an aborted hibernation keep every port as it was: only a restored image looks. */
+/* Thaw keeps every port as it was: only a restored image looks. */
 static int apple_pcie_restore_noirq(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
 
 	if (!pcie->hw->tunnel_hibernate) {
-		if (apple_pcie_conventional_host(pcie) && pm_hibernate_is_restored())
+		if (apple_pcie_conventional_host(pcie))
 			apple_pcie_restore_check_noirq(pcie, "resume from disk");
 		return 0;
 	}

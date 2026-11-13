@@ -755,8 +755,7 @@ static int apple_spmi_restore_early(struct device *dev)
 {
 	struct apple_spmi *spmi = dev_get_drvdata(dev);
 
-	/* Hibernation aborted before the image (PMSG_RESTORE then too): nothing restarted. */
-	if (!pm_hibernate_is_restored() || spmi->irq < 0)
+	if (spmi->irq < 0)
 		return 0;
 
 	/* Commands can run by now: none may have its reply acknowledged away. */

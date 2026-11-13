@@ -3221,8 +3221,7 @@ static int apple_nvme_restore(struct device *dev)
 	struct apple_nvme *anv = dev_get_drvdata(dev);
 	int ret;
 
-	/* Hibernation aborted before the image: the same ANS session runs on. */
-	if (anv->hw->needs_ioq_registers && pm_hibernate_is_restored()) {
+	if (anv->hw->needs_ioq_registers) {
 		ret = apple_nvme_restore_post_m4(anv);
 		if (ret)
 			return ret;

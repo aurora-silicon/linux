@@ -6814,9 +6814,6 @@ static int apple_dart_restore(struct device *dev)
 	struct apple_dart *dart = dev_get_drvdata(dev);
 	int ret;
 
-	/* Hibernation aborted before the image (PMSG_RESTORE then too): nothing restarted. */
-	if (!pm_hibernate_is_restored())
-		return apple_dart_system_resume(dev);
 	ret = pm_runtime_force_resume(dev);
 	if (ret || !dart->locked)
 		return ret;

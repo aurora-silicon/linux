@@ -811,10 +811,6 @@ static int apple_smc_restore(struct device *dev)
 	struct apple_smc *smc = dev_get_drvdata(dev);
 	int ret;
 
-	/* Hibernation aborted before the image (PMSG_RESTORE then too): nothing restarted. */
-	if (!pm_hibernate_is_restored())
-		return apple_smc_thaw(dev);
-
 	/*
 	 * The boot that loaded the image restarted the SMC. The RTKit session
 	 * in the image belongs to a firmware instance that no longer runs, and

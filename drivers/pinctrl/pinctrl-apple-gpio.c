@@ -850,9 +850,6 @@ static int apple_gpio_pinctrl_restore_early(struct device *dev)
 	struct apple_gpio_pinctrl *pctl = dev_get_drvdata(dev);
 	unsigned int i, cfg, val, restored = 0;
 
-	/* Hibernation aborted before the image: the block kept its state. */
-	if (!pm_hibernate_is_restored())
-		return 0;
 	/* Uncached: no word of the restored kernel to write back. */
 	if (!pctl->cached)
 		return 0;

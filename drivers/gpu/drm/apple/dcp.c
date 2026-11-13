@@ -10911,12 +10911,8 @@ static int dcp_platform_restore_early(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
-	/*
-	 * The power-off failed, or hibernation was aborted before the image
-	 * (devices get PMSG_RESTORE then too): the firmware ran on, .restore
-	 * thaws.
-	 */
-	if (!dcp || dcp->hib_poweroff_entered || !pm_hibernate_is_restored())
+	/* The power-off failed: the firmware ran on, .restore thaws. */
+	if (!dcp || dcp->hib_poweroff_entered)
 		return 0;
 	if (dcp_takeover_was_aborted(dcp) || READ_ONCE(dcp->ext_dead) ||
 	    !dcp_desktop_external(dcp) || !dcp_hib_can_restart(dcp) ||
@@ -10945,13 +10941,9 @@ static int dcp_platform_restore(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
-	/*
-	 * The power-off failed, or hibernation was aborted before the image:
-	 * the firmware ran on, as after a thaw.
-	 */
-	if (dcp->hib_poweroff_entered || !pm_hibernate_is_restored()) {
-		dev_info(dev, "hibernation %s: firmware session kept\n",
-			 dcp->hib_poweroff_entered ? "power-off failed" : "aborted");
+	/* The power-off failed: the firmware ran on, as after a thaw. */
+	if (dcp->hib_poweroff_entered) {
+		dev_info(dev, "hibernation power-off failed: firmware session kept\n");
 		dcp->hib_poweroff_entered = false;
 		return dcp_platform_thaw(dev);
 	}

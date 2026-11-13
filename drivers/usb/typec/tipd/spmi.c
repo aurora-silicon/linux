@@ -1055,9 +1055,6 @@ static int sn201202x_restore(struct device *dev)
 	int err;
 	const char *step;
 
-	/* Hibernation aborted before the image (PMSG_RESTORE then too): nothing restarted. */
-	if (!pm_hibernate_is_restored())
-		return sn201202x_resume(dev);
 	/*
 	 * An earlier restore left it for a new probe: freeze took no hold
 	 * and left its interrupt alone, so there is nothing to give back.

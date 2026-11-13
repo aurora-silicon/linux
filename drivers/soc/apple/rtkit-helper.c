@@ -751,10 +751,6 @@ static int apple_rtkit_helper_restore(struct device *dev)
 	struct apple_rtkit *old, *rtk;
 	int count, live;
 
-	/* Hibernation aborted before the image (PMSG_RESTORE then too): nothing restarted. */
-	if (!pm_hibernate_is_restored())
-		return apple_rtkit_helper_thaw(dev);
-
 	if (!helper->adopted)
 		return apple_rtkit_helper_restore_own(helper);
 

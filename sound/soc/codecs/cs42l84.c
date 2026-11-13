@@ -1334,10 +1334,9 @@ static int cs42l84_resume(struct device *dev)
 	return cs42l84_wake(dev, pm_resume_via_firmware());
 }
 
-/* Also after a hibernation that was given up before its image: nothing lost then. */
 static int cs42l84_restore(struct device *dev)
 {
-	return cs42l84_wake(dev, pm_hibernate_is_restored());
+	return cs42l84_wake(dev, true);
 }
 
 static const struct dev_pm_ops cs42l84_pm_ops = {

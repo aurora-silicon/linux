@@ -471,14 +471,13 @@ static int apple_pmu_rtc_poweroff(struct device *dev)
  * machine off, its event acknowledged by one of them. The RTC core still
  * counts the alarm as set. Have it go through its timers: an alarm that is due
  * is reported, a later one is written to the PMU again, and with none set the
- * PMU's alarm is stopped. Not after a hibernation given up before its image.
+ * PMU's alarm is stopped.
  */
 static int apple_pmu_rtc_restore(struct device *dev)
 {
 	struct apple_pmu_rtc *rtc = dev_get_drvdata(dev);
 
-	if (pm_hibernate_is_restored())
-		rtc_update_irq(rtc->clock, 1, RTC_IRQF | RTC_AF);
+	rtc_update_irq(rtc->clock, 1, RTC_IRQF | RTC_AF);
 	return 0;
 }
 

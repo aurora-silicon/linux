@@ -3444,10 +3444,6 @@ fn restart_after_thaw(_dev: *mut bindings::device) -> Result<()> {
 ///
 /// Called by the PM core with a bound AOP device.
 unsafe extern "C" fn aop_restore(dev: *mut bindings::device) -> c_int {
-    // SAFETY: only reads a flag.
-    if !unsafe { bindings::pm_hibernate_is_restored() } {
-        return 0;
-    }
     // SAFETY: by this function's contract.
     let data = unsafe { aop_from_dev(dev) };
     if !data.cpu_started.load(Acquire) || data.removing.load(Acquire) {

@@ -3731,9 +3731,6 @@ static int t6040_usb2_restore_early(struct device *dev)
 
 	if (!tphy)
 		return 0;
-	/* Hibernation aborted before the image (PMSG_RESTORE then too): nothing restarted. */
-	if (!pm_hibernate_is_restored())
-		return 0;
 	guard(mutex)(&tphy->lock);
 	if (tphy->powered || tphy->usb3_on || tphy->dwc3_running ||
 	    t6040_phy_count(tphy->dp))
@@ -3779,8 +3776,6 @@ static int t6040_usb2_restore(struct device *dev)
 	int ret;
 
 	if (!tphy || IS_ERR_OR_NULL(tphy->rtk))
-		return 0;
-	if (!pm_hibernate_is_restored())
 		return 0;
 	guard(mutex)(&tphy->lock);
 	if (!apple_rtkit_is_running(tphy->rtk))
