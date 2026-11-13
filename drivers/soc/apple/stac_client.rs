@@ -7,14 +7,24 @@
 //! service on the other, and the lifecycle (see `stac_lifecycle.rs`) deciding
 //! what runs next.
 //!
-//! This first part only looks. When a keyboard's channel comes up, or the
-//! service comes back online with one attached, the shim reads the keyboard's
-//! protocol tag, identity and connection nonce with three feature-report
-//! reads, and the client asks the enclave whether that accessory is paired and
-//! authorised (0x02); for an unpaired one it also logs a fingerprint of the
-//! enclave's host attestation object (0x01). Nothing is written to the
-//! keyboard. Whatever the lifecycle wants next (a per-connection session, a
-//! pairing, a connection state) is logged as held and not run.
+//! When a keyboard's channel comes up, or the service comes back online with
+//! one attached, the shim reads the keyboard's protocol tag, identity and
+//! connection nonce with three feature-report reads, and the client asks the
+//! enclave whether that accessory is paired and authorised (0x02); for an
+//! unpaired one it also logs a fingerprint of the enclave's host attestation
+//! object (0x01). Nothing is written to the keyboard on its own. Whatever the
+//! lifecycle wants next (a per-connection session, a connection state) is
+//! logged as held and not run.
+//!
+//! A pairing runs only when root writes 1 to the module's `ta_pair`
+//! parameter, and only for a keyboard the enclave reports unpaired. It relays
+//! between the keyboard (see `stac_ta_wire.rs`) and the enclave (0x01, 0x03,
+//! 0x15, 0x05) in the order a macOS pairing uses, and stops at the first
+//! answer that does not check out. The host certificate chain the keyboard
+//! wants comes from the firmware file [`HOST_CHAIN_FW`]: the Mac's own
+//! Apple-issued device attestation chain, which certifies the enclave's host
+//! object. It is checked against the enclave's object before anything is
+//! written to the keyboard.
 //!
 //! The identity, the nonce and anything else the keyboard answers are never
 //! logged.
@@ -26,11 +36,21 @@ use kernel::{
 
 use crate::stac_lifecycle::{Action, Event, Nonce, State, NONCE_LEN};
 use crate::stac_ops::{self, AccessoryId, ACCESSORY_ID_LEN};
+use crate::stac_ta_wire::{self as wire, WireError};
 use crate::SepData;
 
 type AttachFn = unsafe extern "C" fn(*mut c_void);
 type IdentifiedFn = unsafe extern "C" fn(*mut c_void, *const u8, *const u8);
 type FailedFn = unsafe extern "C" fn(*mut c_void, c_int);
+type PairFn = unsafe extern "C" fn(*mut c_void) -> c_int;
+
+/// The Mac's host certificate chain for keyboard pairing (two DER
+/// certificates), installed per machine with the other Apple data.
+pub(crate) const HOST_CHAIN_FW: &CStr = c"apple/stac-host-chain.der";
+
+/// How long the keyboard gets for a reply: its material takes about 3.5 s.
+const REPLY_MS: u32 = 2000;
+const MATERIAL_MS: u32 = 15000;
 
 extern "C" {
     fn sep_stac_ta_register(
@@ -39,9 +59,19 @@ extern "C" {
         detached: AttachFn,
         identified: IdentifiedFn,
         failed: FailedFn,
+        pair: PairFn,
     ) -> c_int;
     fn sep_stac_ta_unregister();
     fn sep_stac_ta_identify();
+    fn sep_stac_ta_command(
+        cmd: *const u8,
+        len: usize,
+        reply_id: u8,
+        reply: *mut u8,
+        cap: usize,
+        timeout_ms: c_uint,
+    ) -> isize;
+    fn sep_stac_ta_read(id: u8, buf: *mut u8, len: usize) -> isize;
 }
 
 // The lengths the shim reads into.
@@ -93,6 +123,7 @@ impl Client {
                 detached,
                 identified,
                 failed,
+                pair,
             )
         };
         if ret != 0 {
@@ -165,7 +196,214 @@ unsafe extern "C" fn failed(ctx: *mut c_void, err: c_int) {
     sep.stac_ta_event(Event::Failed);
 }
 
+/// # Safety
+/// As for [`attached`]; called with the shim's client lock held and a
+/// keyboard attached, from the writer of the `ta_pair` parameter.
+unsafe extern "C" fn pair(ctx: *mut c_void) -> c_int {
+    // SAFETY: guaranteed by the registration.
+    let sep = unsafe { &*ctx.cast::<SepData>() };
+    match sep.stac_ta_pair() {
+        Ok(()) => 0,
+        Err(e) => e.to_errno(),
+    }
+}
+
+/// Where a pairing stopped, for the log (the fields are read through
+/// `Debug`).
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+enum PairStop {
+    /// No host certificate chain installed for this Mac.
+    NoChain,
+    /// The installed chain does not certify this enclave's host object.
+    WrongChain,
+    /// The enclave did not give its host object.
+    HostObject,
+    /// The keyboard's tag or version is not the one this relay speaks.
+    Version,
+    /// The keyboard did not answer, or its answer did not check out.
+    Keyboard(u32, WireError),
+    /// The keyboard could not be written or read.
+    Transport(u32, i32),
+    /// The keyboard already holds a pairing with this host the enclave lacks.
+    KeyboardPaired,
+    /// The enclave refused or did not answer an operation.
+    Enclave(u16),
+}
+
+/// One keyboard exchange: a command and, if `reply_id` is not 0, its reply.
+fn ta_command(cmd: &[u8], reply_id: u8, cap: usize, timeout_ms: u32) -> core::result::Result<KVec<u8>, i32> {
+    let mut reply = KVec::new();
+    reply.resize(cap, 0, GFP_KERNEL).map_err(|_| -12)?;
+    // SAFETY: both buffers are live for the call; the shim stops writing to
+    // `reply` before it returns.
+    let n = unsafe {
+        sep_stac_ta_command(cmd.as_ptr(), cmd.len(), reply_id, reply.as_mut_ptr(), cap, timeout_ms)
+    };
+    if n < 0 {
+        return Err(n as i32);
+    }
+    reply.truncate(n as usize);
+    Ok(reply)
+}
+
+/// One feature-report read of at most `len` bytes, ID first.
+fn ta_read(id: u8, len: usize) -> core::result::Result<KVec<u8>, i32> {
+    let mut buf = KVec::new();
+    buf.resize(len, 0, GFP_KERNEL).map_err(|_| -12)?;
+    // SAFETY: `buf` is live and `len` bytes long for the call.
+    let n = unsafe { sep_stac_ta_read(id, buf.as_mut_ptr(), len) };
+    if n < 0 {
+        return Err(n as i32);
+    }
+    buf.truncate(n as usize);
+    Ok(buf)
+}
+
 impl SepData {
+    /// Pairs the attached keyboard with the enclave. Runs only from the
+    /// `ta_pair` trigger, for a keyboard the enclave reports unpaired.
+    fn stac_ta_pair(&self) -> Result<()> {
+        if self.shutting_down.load(Relaxed) {
+            return Err(ENODEV);
+        }
+        let state = self.stac_lc.lock().state();
+        if state != State::Unpaired {
+            dev_info!(self.dev, "stac: pairing not started: keyboard {:?}, not unpaired\n", state);
+            return Err(EBUSY);
+        }
+        dev_info!(self.dev, "stac: pairing the keyboard\n");
+        match self.stac_ta_pair_steps() {
+            Ok(id) => {
+                let q = self.stac_query_pairing(&id);
+                match q {
+                    Query::State(s) => dev_info!(
+                        self.dev,
+                        "stac: pairing done; the enclave reports paired={} authorized={}\n",
+                        s.paired,
+                        s.authorized
+                    ),
+                    other => dev_info!(self.dev, "stac: pairing done; state query failed ({:?})\n", other),
+                }
+                let paired = matches!(q, Query::State(s) if s.paired);
+                if paired {
+                    self.stac_ta_event(Event::Paired);
+                    Ok(())
+                } else {
+                    Err(EPROTO)
+                }
+            }
+            Err(stop) => {
+                dev_info!(self.dev, "stac: pairing stopped: {:?}\n", stop);
+                Err(match stop {
+                    PairStop::NoChain => ENOENT,
+                    PairStop::WrongChain => EKEYREJECTED,
+                    PairStop::Transport(_, e) => Error::from_errno(e),
+                    _ => EPROTO,
+                })
+            }
+        }
+    }
+
+    fn stac_body(&self, op: stac_ops::Op, req: &[u8], max: usize) -> core::result::Result<KVec<u8>, PairStop> {
+        match self.stac_call(op.opcode(), req, max) {
+            Ok(crate::stac::Reply::Body(b)) => Ok(b),
+            _ => Err(PairStop::Enclave(op.opcode())),
+        }
+    }
+
+    /// The pairing exchange; returns the keyboard's identity when it went
+    /// through.
+    fn stac_ta_pair_steps(&self) -> core::result::Result<AccessoryId, PairStop> {
+        use stac_ops::Op;
+        let kb = |step: u32, e: WireError| PairStop::Keyboard(step, e);
+        let io = |step: u32, e: i32| PairStop::Transport(step, e);
+
+        // Everything the keyboard will be shown is checked before the first
+        // write to it: the chain must certify this enclave's host object.
+        let fw = kernel::firmware::Firmware::request_nowarn(HOST_CHAIN_FW, &self.dev)
+            .map_err(|_| PairStop::NoChain)?;
+        let host = self.stac_body(Op::HostAttestationObject, &[], stac_ops::HOST_OBJECT_REPLY_LEN)?;
+        let len = stac_ops::parse_host_object_len(&host).map_err(|_| PairStop::HostObject)?;
+        let digest = crate::image::sha256(&host[stac_ops::WORD..stac_ops::WORD + len])
+            .map_err(|_| PairStop::HostObject)?;
+        wire::check_chain(fw.data(), &digest).map_err(|_| PairStop::WrongChain)?;
+
+        // Tag, version echo, identity, identity point, nonce.
+        let tag = ta_read(0x4b, 9).map_err(|e| io(0, e))?;
+        if tag.len() != 9 || tag[1..] != wire::VERSION_BODY[..] {
+            return Err(PairStop::Version);
+        }
+        ta_command(&wire::version_report(), 0, 0, 0).map_err(|e| io(0, e))?;
+        let uid = ta_read(0x41, 1 + ACCESSORY_ID_LEN).map_err(|e| io(0, e))?;
+        if uid.len() != 1 + ACCESSORY_ID_LEN {
+            return Err(kb(0, WireError::Length));
+        }
+        let mut id = AccessoryId([0; ACCESSORY_ID_LEN]);
+        id.0.copy_from_slice(&uid[1..]);
+        let c = wire::command(wire::cmd::IDENTITY, 1, &[]).map_err(|_| io(1, -12))?;
+        let r = ta_command(&c, wire::reply::IDENTITY, wire::POINT_REPLY_LEN, REPLY_MS).map_err(|e| io(1, e))?;
+        let identity = wire::parse_point_reply(&r, wire::reply::IDENTITY, 1).map_err(|e| kb(1, e))?;
+        ta_read(0x4c, 1 + NONCE_LEN).map_err(|e| io(1, e))?;
+
+        // Step 2: the keyboard checks the host object.
+        let c = wire::command(wire::cmd::PAIRING_CHECK, 2, &host).map_err(|_| io(2, -12))?;
+        let r = ta_command(&c, wire::reply::PAIRING_CHECK, wire::PAIRING_CHECK_REPLY_LEN, REPLY_MS)
+            .map_err(|e| io(2, e))?;
+        if wire::parse_pairing_check(&r).map_err(|e| kb(2, e))? {
+            return Err(PairStop::KeyboardPaired);
+        }
+
+        // Step 3: the keyboard's pairing ephemeral point, then 0x03.
+        let c = wire::command(wire::cmd::PAIRING_EPHEMERAL, 3, &1u32.to_le_bytes()).map_err(|_| io(3, -12))?;
+        let r = ta_command(&c, wire::reply::PAIRING_EPHEMERAL, wire::POINT_REPLY_LEN, REPLY_MS)
+            .map_err(|e| io(3, e))?;
+        let eph = wire::parse_point_reply(&r, wire::reply::PAIRING_EPHEMERAL, 3).map_err(|e| kb(3, e))?;
+        let begin = self.stac_body(
+            Op::PairingBegin,
+            &stac_ops::pairing_begin_request(&id, &identity, &eph),
+            stac_ops::PAIRING_BEGIN_REPLY_FIXED + stac_ops::ACCESSORY_ATTESTATION_SLOT,
+        )?;
+        let b = stac_ops::parse_pairing_begin(&begin).map_err(|_| PairStop::Enclave(Op::PairingBegin.opcode()))?;
+
+        // Step 4: the chain; step 5: the host object again.
+        let chain = fw.data();
+        for i in 0..wire::fragment_count(chain.len()) {
+            let f = wire::fragment(4, wire::kind::CHAIN, chain, i).map_err(|_| io(4, -22))?;
+            ta_command(&f, 0, 0, 0).map_err(|e| io(4, e))?;
+        }
+        let c = wire::command(wire::cmd::HOST_OBJECT, 5, &host).map_err(|_| io(5, -12))?;
+        let r = ta_command(&c, wire::reply::HOST_OBJECT, wire::REPLY_HEADER_LEN, REPLY_MS).map_err(|e| io(5, e))?;
+        wire::check_reply(&r, wire::reply::HOST_OBJECT, 5).map_err(|e| kb(5, e))?;
+
+        // Step 6: the enclave's attestation; step 7: host object and the
+        // enclave's point, answered with the keyboard's material.
+        let att = &begin[b.host_attestation.clone()];
+        for i in 0..wire::fragment_count(att.len()) {
+            let f = wire::fragment(6, wire::kind::ATTESTATION, att, i).map_err(|_| io(6, -22))?;
+            ta_command(&f, 0, 0, 0).map_err(|e| io(6, e))?;
+        }
+        let mut p7 = KVec::new();
+        p7.extend_from_slice(&host, GFP_KERNEL).map_err(|_| io(7, -12))?;
+        p7.extend_from_slice(&begin[b.host_ephemeral.clone()], GFP_KERNEL).map_err(|_| io(7, -12))?;
+        let c = wire::command(wire::cmd::PAIRING_FINISH, 7, &p7).map_err(|_| io(7, -12))?;
+        let r = ta_command(&c, wire::reply::ACCESSORY_MATERIAL, wire::MATERIAL_REPLY_LEN, MATERIAL_MS)
+            .map_err(|e| io(7, e))?;
+        let m = wire::parse_material(&r).map_err(|e| kb(7, e))?;
+        let finish = stac_ops::pairing_finish_request(&id, &identity, &r[m.attestation], &r[m.certificate])
+            .map_err(|_| io(7, -22))?;
+        let body = self.stac_body(Op::PairingFinish, &finish, 0)?;
+        stac_ops::expect_empty(&body).map_err(|_| PairStop::Enclave(Op::PairingFinish.opcode()))?;
+
+        // The manifest, handed to the enclave as after a pairing.
+        let r = ta_read(wire::get::MANIFEST, wire::MANIFEST_READ_LEN).map_err(|e| io(8, e))?;
+        let manifest = wire::parse_manifest(&r).map_err(|e| kb(8, e))?;
+        let req = stac_ops::manifest_request(&id, true, manifest).map_err(|_| io(8, -22))?;
+        let body = self.stac_body(Op::Manifest, &req, 0)?;
+        stac_ops::expect_empty(&body).map_err(|_| PairStop::Enclave(Op::Manifest.opcode()))?;
+        Ok(id)
+    }
+
     /// Feeds the lifecycle `first`, runs what it asks for and feeds the
     /// outcomes back until it asks for nothing this client runs.
     pub(crate) fn stac_ta_event(&self, first: Event) {

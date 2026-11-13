@@ -309,10 +309,15 @@ typedef void (*sep_stac_ta_event_fn)(void *ctx);
 typedef void (*sep_stac_ta_identified_fn)(void *ctx, const u8 *uid,
 					  const u8 *nonce);
 typedef void (*sep_stac_ta_failed_fn)(void *ctx, int err);
+typedef int (*sep_stac_ta_pair_fn)(void *ctx);
 int sep_stac_ta_register(void *ctx, sep_stac_ta_event_fn attached,
 			 sep_stac_ta_event_fn detached,
 			 sep_stac_ta_identified_fn identified,
-			 sep_stac_ta_failed_fn failed);
+			 sep_stac_ta_failed_fn failed,
+			 sep_stac_ta_pair_fn pair);
+ssize_t sep_stac_ta_command(const u8 *cmd, size_t len, u8 reply_id, u8 *reply,
+			    size_t cap, unsigned int timeout_ms);
+ssize_t sep_stac_ta_read(u8 id, u8 *buf, size_t len);
 void sep_stac_ta_unregister(void);
 void sep_stac_ta_identify(void);
 
