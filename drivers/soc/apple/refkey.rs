@@ -537,7 +537,7 @@ impl SepData {
         user: crate::sks::DesignateUser,
         acl: Option<&[u8]>,
     ) -> Result<KVec<u8>> {
-        if self.profile.key_store != profile::KeyStore::Variant5 {
+        if !self.profile.per_user_keybags {
             return Err(EOPNOTSUPP);
         }
         crate::xart_guard::close_policy_window();
@@ -601,7 +601,7 @@ impl SepData {
     /// caller has unlocked the bag with the user's password. Variant-5 key
     /// store only.
     pub(crate) fn fde_key_create(&self, user: crate::sks::DesignateUser) -> Result<KVec<u8>> {
-        if self.profile.key_store != profile::KeyStore::Variant5 {
+        if !self.profile.per_user_keybags {
             return Err(EOPNOTSUPP);
         }
         crate::xart_guard::close_policy_window();
@@ -651,7 +651,7 @@ impl SepData {
         record: &[u8],
         sealed: &[u8],
     ) -> Result<KVec<u8>> {
-        if self.profile.key_store != profile::KeyStore::Variant5 {
+        if !self.profile.per_user_keybags {
             return Err(EOPNOTSUPP);
         }
         Self::refkey_pub(record).ok_or(EINVAL)?;
