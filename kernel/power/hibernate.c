@@ -86,12 +86,12 @@ static bool hibernate_restored;
 /**
  * pm_hibernate_is_restored - Whether this kernel was just restored from an image.
  *
- * Devices get PMSG_RESTORE both in the kernel restored from a hibernation image
- * and in the kernel that hibernated when hibernation is aborted before the image
- * is created (a device failed to freeze, a wakeup event).  Only in the first case
- * did the hardware go through a boot.  True from the restore until the next
- * hibernation starts (hibernation_snapshot()); meant for the restore callbacks
- * and the PM_POST_HIBERNATION notifiers.
+ * Devices get PMSG_RESTORE in the kernel restored from a hibernation image,
+ * whose hardware went through a boot, and PMSG_RECOVER in the kernel that
+ * hibernated when hibernation is aborted before the image is created (a device
+ * failed to freeze, a wakeup event).  True from the restore until the next
+ * hibernation starts (hibernation_snapshot()); meant for code that runs after
+ * the restore, such as the PM_POST_HIBERNATION notifiers.
  */
 bool pm_hibernate_is_restored(void)
 {
@@ -458,6 +458,25 @@ __weak int arch_resume_nosmt(void)
 }
 
 /**
+ * hibernate_resume_event - Pick the event that resumes the devices frozen for an image.
+ * @error: Result of the image creation so far.
+ *
+ * Called once the image is created, restored or given up on.  in_suspend is
+ * set only in the kernel that created the image, so a clear one means either
+ * that this kernel was restored from an image (devices get PMSG_RESTORE,
+ * their hardware went through a boot) or that the hibernation was aborted
+ * before the image existed (a device failed to freeze, a wakeup event, a
+ * pm_test level): the devices were only frozen, and the right event is
+ * PMSG_RECOVER, as after any other failed freeze.
+ */
+static pm_message_t hibernate_resume_event(int error)
+{
+	if (in_suspend)
+		return error ? PMSG_RECOVER : PMSG_THAW;
+	return pm_hibernate_is_restored() ? PMSG_RESTORE : PMSG_RECOVER;
+}
+
+/**
  * create_image - Create a hibernation image.
  * @platform_mode: Whether or not to use the platform driver.
  *
@@ -538,8 +557,7 @@ static int create_image(int platform_mode)
  Platform_finish:
 	platform_finish(platform_mode);
 
-	dpm_resume_start(in_suspend ?
-		(error ? PMSG_RECOVER : PMSG_THAW) : PMSG_RESTORE);
+	dpm_resume_start(hibernate_resume_event(error));
 
 	return error;
 }
@@ -605,7 +623,7 @@ int hibernation_snapshot(int platform_mode)
 	if (error || !in_suspend)
 		swsusp_free();
 
-	msg = in_suspend ? (error ? PMSG_RECOVER : PMSG_THAW) : PMSG_RESTORE;
+	msg = hibernate_resume_event(error);
 	dpm_resume(msg);
 
 	if (error || !in_suspend)
