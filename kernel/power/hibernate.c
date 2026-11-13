@@ -101,6 +101,39 @@ bool pm_hibernate_is_restored(void)
 }
 EXPORT_SYMBOL_GPL(pm_hibernate_is_restored);
 
+/* Set while this kernel loads a hibernation image, see pm_hibernate_is_loading(). */
+static bool hibernate_loading;
+
+/**
+ * pm_hibernate_is_loading - Whether this kernel is loading a hibernation image.
+ *
+ * True from the PM_RESTORE_PREPARE notification, which starts the loading of an
+ * image (from the resume path or through the snapshot device), until the
+ * PM_POST_RESTORE notification that ends it when the image was not restored
+ * (or the notification chain refused it).  The devices of the kernel that
+ * loads an image are quiesced for the jump into the image, not frozen for an
+ * image of their own; the flag lets drivers tell the two apart in their
+ * freeze callbacks.  The kernel restored from an image reads false: the image
+ * holds the state of the kernel that created it.
+ */
+bool pm_hibernate_is_loading(void)
+{
+	return READ_ONCE(hibernate_loading);
+}
+EXPORT_SYMBOL_GPL(pm_hibernate_is_loading);
+
+/**
+ * hibernate_set_loading - Record that an image is being loaded or no longer is.
+ * @loading: New value of the flag read by pm_hibernate_is_loading().
+ *
+ * Called from the PM notifier chain helpers around PM_RESTORE_PREPARE and
+ * PM_POST_RESTORE.
+ */
+void hibernate_set_loading(bool loading)
+{
+	WRITE_ONCE(hibernate_loading, loading);
+}
+
 #ifdef CONFIG_SUSPEND
 /**
  * pm_hibernation_mode_is_suspend - Check if hibernation has been set to suspend

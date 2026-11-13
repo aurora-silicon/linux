@@ -18,7 +18,6 @@
  */
 
 #include <linux/export.h>
-#include <linux/notifier.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/string.h>
 #include <linux/suspend.h>
@@ -43,7 +42,6 @@ struct apple_rtkit_hib_slot {
 
 static struct apple_rtkit_hib_slot handoff[HANDOFF_SLOTS] __nosavedata;
 static DEFINE_SPINLOCK(handoff_lock);
-static bool restoring;
 
 /* FNV-1a over everything but the checksum itself. */
 static u32 handoff_sum(const struct apple_rtkit_hib_slot *s)
@@ -82,7 +80,7 @@ static struct apple_rtkit_hib_slot *handoff_find(const char *tag)
 
 bool apple_rtkit_hib_restoring(void)
 {
-	return READ_ONCE(restoring);
+	return pm_hibernate_is_loading();
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_hib_restoring);
 
@@ -152,36 +150,6 @@ void apple_rtkit_hib_handoff_drop(const char *tag)
 	spin_unlock_irqrestore(&handoff_lock, flags);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_hib_handoff_drop);
-
-static int apple_rtkit_hib_notify(struct notifier_block *nb,
-				  unsigned long action, void *data)
-{
-	switch (action) {
-	case PM_RESTORE_PREPARE:
-		WRITE_ONCE(restoring, true);
-		break;
-	case PM_POST_RESTORE:
-		/* The image was not restored: this kernel goes on. */
-		WRITE_ONCE(restoring, false);
-		break;
-	}
-	return NOTIFY_DONE;
-}
-
-static struct notifier_block apple_rtkit_hib_nb = {
-	.notifier_call = apple_rtkit_hib_notify,
-};
-
-static int __init apple_rtkit_hib_init(void)
-{
-	/*
-	 * A kernel restored from an image runs this only on its own first
-	 * boot, and the flag is saved false in the image: in the restored
-	 * kernel it reads false.
-	 */
-	return register_pm_notifier(&apple_rtkit_hib_nb);
-}
-core_initcall(apple_rtkit_hib_init);
 
 #else
 

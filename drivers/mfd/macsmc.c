@@ -606,26 +606,7 @@ static const struct apple_smc_wake_reason apple_smc_t8132_wake_reasons[] = {
  * it in (apple_smc_rtkit_shutdown()) and from which a wake starts a new
  * session.
  */
-static bool apple_smc_loading_image;
 static bool apple_smc_handed_over;
-
-static int apple_smc_pm_notify(struct notifier_block *nb, unsigned long action, void *unused)
-{
-	if (action == PM_RESTORE_PREPARE)
-		apple_smc_loading_image = true;
-	else if (action == PM_POST_RESTORE)
-		apple_smc_loading_image = false;
-	return NOTIFY_DONE;
-}
-
-static struct notifier_block apple_smc_pm_nb = {
-	.notifier_call = apple_smc_pm_notify,
-};
-
-static void apple_smc_pm_unregister(void *unused)
-{
-	unregister_pm_notifier(&apple_smc_pm_nb);
-}
 
 /*
  * The handshake with an SMC that was just woken, at probe and after a resume
@@ -697,16 +678,6 @@ static int apple_smc_probe(struct platform_device *pdev)
 	smc->wake_reasons = of_device_is_compatible(dev->of_node, "apple,t8132-smc") ?
 			    apple_smc_t8132_wake_reasons : apple_smc_t8140_wake_reasons;
 	smc->wktp = hw && hw->wktp;
-
-	/* First, so that a late probe still sees a resume start. */
-	if (IS_ENABLED(CONFIG_HIBERNATION)) {
-		ret = register_pm_notifier(&apple_smc_pm_nb);
-		if (ret)
-			return ret;
-		ret = devm_add_action_or_reset(dev, apple_smc_pm_unregister, NULL);
-		if (ret)
-			return ret;
-	}
 
 	mutex_init(&smc->mutex);
 	spin_lock_init(&smc->lock);
@@ -795,7 +766,7 @@ static int apple_smc_freeze(struct device *dev)
 	struct apple_smc *smc = dev_get_drvdata(dev);
 
 	/* Only the image-loading kernel, right before it enters the image. */
-	if (apple_smc_loading_image && apple_rtkit_is_running(smc->rtk)) {
+	if (pm_hibernate_is_loading() && apple_rtkit_is_running(smc->rtk)) {
 		int ret;
 
 		apple_smc_write_flag(smc, SMC_KEY(NTAP), false);
