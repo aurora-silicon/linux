@@ -2722,9 +2722,9 @@ static int dcp_desktop_dptx_connect(struct apple_dcp *dcp, u32 port)
 	 * just powered it up for.
 	 */
 	if (dcp->dp2hdmi_pwren && !dcp->dptxport[!port].connected) {
-		if (!dcp->hdmi_converter_fresh)
+		if (!READ_ONCE(dcp->hdmi_converter_fresh))
 			dcp_hdmi_converter_power(dcp, true);
-		dcp->hdmi_converter_fresh = false;
+		WRITE_ONCE(dcp->hdmi_converter_fresh, false);
 	}
 
 	reinit_completion(&dptx->linkcfg_completion);
@@ -6563,7 +6563,7 @@ static void dcp_hdmi_converter_power(struct apple_dcp *dcp, bool on)
 	gpiod_set_value_cansleep(dcp->dp2hdmi_pwren, on);
 	if (on)
 		msleep(100);
-	dcp->hdmi_converter_fresh = on;
+	WRITE_ONCE(dcp->hdmi_converter_fresh, on);
 }
 
 /*
