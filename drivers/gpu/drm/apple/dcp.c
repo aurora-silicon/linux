@@ -5293,14 +5293,45 @@ static int dcp_read_fw_version(struct device *dev, const char *name,
 	return len;
 }
 
+enum dcp_firmware_version dcp_t6041_firmware_version(const char *firmware,
+						      const char *compat)
+{
+	/* Firmware 27 is selected by its compatibility ABI, as on T6050. */
+	if (!strcmp(compat, "27.2.0"))
+		return DCP_FIRMWARE_V_27_0;
+	if (!strcmp(firmware, compat) &&
+	    (!strcmp(firmware, "26.5.2") || !strcmp(firmware, "26.6.2")))
+		return DCP_FIRMWARE_V_26_6_DESKTOP;
+	return DCP_FIRMWARE_UNKNOWN;
+}
+
+static bool dcp_v27_method_table_supported(struct device *dev,
+					    const char *compat)
+{
+	const struct dcp_method_entry *methods = iomfb_v27_methods(compat);
+	unsigned int num_missing;
+	const char *missing;
+
+	if (!methods) {
+		dev_err(dev, "DCP firmware-compat %s has no 27.x method table\n",
+			compat);
+		return false;
+	}
+	missing = iomfb_v27_missing_method(methods, &num_missing);
+	if (missing) {
+		dev_err(dev, "DCP firmware-compat %s not started: no ID known for %u methods (first: %s)\n",
+			compat, num_missing, missing);
+		return false;
+	}
+	return true;
+}
+
 static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 {
 	const struct apple_dcp_hw_data *hw = of_device_get_match_data(dev);
 	const struct dcp_v14_board *v14_board;
 	char compat_str[DCP_FW_VERSION_STR_LEN];
 	char fw_str[DCP_FW_VERSION_STR_LEN];
-	unsigned int num_missing;
-	const char *missing;
 	int ret;
 
 	/*
@@ -5317,18 +5348,12 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 
 	if (hw->firmware_compat == DCP_FIRMWARE_V_27_0) {
 		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
-		if (ret < 0 || !iomfb_v27_methods(compat_str)) {
-			dev_err(dev, "DCP firmware-compat %s has no 27.x method table\n",
-				ret < 0 ? "missing" : compat_str);
+		if (ret < 0) {
+			dev_err(dev, "DCP firmware-compat missing has no 27.x method table\n");
 			return DCP_FIRMWARE_UNKNOWN;
 		}
-		missing = iomfb_v27_missing_method(iomfb_v27_methods(compat_str),
-						   &num_missing);
-		if (missing) {
-			dev_err(dev, "DCP firmware-compat %s not started: no ID known for %u methods (first: %s)\n",
-				compat_str, num_missing, missing);
+		if (!dcp_v27_method_table_supported(dev, compat_str))
 			return DCP_FIRMWARE_UNKNOWN;
-		}
 		return DCP_FIRMWARE_V_27_0;
 	}
 
@@ -5351,11 +5376,17 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	    of_device_is_compatible(dev->of_node, "apple,t6041-dcpext")) {
 		int compat_ret = dcp_read_fw_version(dev, "apple,firmware-compat",
 						     compat_str);
+		enum dcp_firmware_version version;
 
-		if (ret >= 0 && compat_ret >= 0 && !strcmp(fw_str, compat_str) &&
-		    (!strcmp(fw_str, "26.5.2") || !strcmp(fw_str, "26.6.2")))
-			return DCP_FIRMWARE_V_26_6_DESKTOP;
-		dev_err(dev, "T6041 display not started: DCP firmware %s (compat %s) is not 26.5.2 or 26.6.2\n",
+		if (ret >= 0 && compat_ret >= 0) {
+			version = dcp_t6041_firmware_version(fw_str, compat_str);
+			if (version == DCP_FIRMWARE_V_27_0 &&
+			    !dcp_v27_method_table_supported(dev, compat_str))
+				return DCP_FIRMWARE_UNKNOWN;
+			if (version != DCP_FIRMWARE_UNKNOWN)
+				return version;
+		}
+		dev_err(dev, "T6041 display not started: unsupported DCP firmware %s (compat %s)\n",
 			ret >= 0 ? fw_str : "missing",
 			compat_ret >= 0 ? compat_str : "missing");
 		return DCP_FIRMWARE_UNKNOWN;
@@ -5812,12 +5843,14 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		panel_np = of_get_compatible_child(dev->of_node, "apple,panel");
 
 	if (panel_np) {
-		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
+		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+		    (dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+		     of_device_is_compatible(dcp->dev->of_node, "apple,t6041-dcp"))) {
 			/*
-			 * Desktop 26.x swaps carry nits, and the panel node
-			 * describes the panel whether or not the boot loader
-			 * enabled it.  Without apple,max-brightness take the
-			 * J616s panel's user-accessible SDR maximum.
+			 * The T6041 panel node has no apple,max-brightness in
+			 * either firmware lineage. Use its user-accessible SDR
+			 * maximum; firmware 27 takes the peak and EDR headroom
+			 * from ADT below.
 			 */
 			if (of_property_read_u32(panel_np, "apple,max-brightness",
 						 &dcp->brightness.maximum))
@@ -6500,6 +6533,11 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
+	/* T6041 firmware 27 is the inherited live-session path, like T6050. */
+	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    (of_device_is_compatible(dev->of_node, "apple,t6041-dcp") ||
+	     of_device_is_compatible(dev->of_node, "apple,t6041-dcpext")))
+		dcp->hw.adopt_live_session = true;
 	/*
 	 * T8142 on firmware 27 runs as the T6050's firmware-27 instance, with
 	 * the default method profile: with H17G every swap fails with status 4.
@@ -8877,7 +8915,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8132_dcpext = {
 };
 #endif
 
-/* T6041 (M4 Pro/Max), desktop 26.6 firmware */
+/* T6041 (M4 Pro/Max), selected at probe between desktop 26.x and firmware 27. */
 static const struct apple_dcp_hw_data apple_dcp_hw_t6041 = {
 	.num_dptx_ports = 2,
 };
