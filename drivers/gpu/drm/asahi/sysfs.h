@@ -22,6 +22,10 @@ struct asahi_qualified_stats {
 	u64 pstate_host_ns;
 	u64 util_samples;
 	u64 pstate_timestamp;
+	u64 busy_ns;
+	u64 achieved_frequency_hz;
+	u32 busy_status;
+	u32 pad;
 };
 
 typedef void (*asahi_stats_read_fn)(const void *snapshot, struct asahi_qualified_stats *out);

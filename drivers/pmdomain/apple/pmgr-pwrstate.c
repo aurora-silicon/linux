@@ -102,6 +102,8 @@ struct apple_pmgr_ps {
 	struct {
 		u32 offset, mask, value, saved;
 	} retention[APPLE_PMGR_PS_MAX_RETENTION];
+	/* Two bridge link words of the block behind this state, usable while it is on. */
+	void __iomem *bridge;
 };
 
 #define genpd_to_apple_pmgr_ps(_genpd) container_of(_genpd, struct apple_pmgr_ps, genpd)
@@ -453,6 +455,37 @@ static int apple_pmgr_ps_power_off(struct generic_pm_domain *genpd)
 
 	return ret;
 }
+
+/* genpd's runtime suspend callback, as it installs it in every genpd's dev_pm_domain. */
+static int (*apple_pmgr_genpd_runtime_suspend)(struct device *dev);
+
+/* Check the physical result of genpd's void syscore suspend/resume helpers. */
+int apple_pmgr_ps_verify_state(struct device *domain_dev, bool on)
+{
+	int (*genpd_suspend)(struct device *dev) = READ_ONCE(apple_pmgr_genpd_runtime_suspend);
+	struct generic_pm_domain *genpd;
+	struct apple_pmgr_ps *ps;
+	u32 value, mask = APPLE_PMGR_PS_LEVELS | APPLE_PMGR_BUSY |
+			  APPLE_PMGR_RESET | APPLE_PMGR_PS_RESET | APPLE_PMGR_DEV_DISABLE;
+
+	/* Only a genpd's dev_pm_domain is embedded in one: anything else is refused. */
+	if (!domain_dev->pm_domain || !genpd_suspend ||
+	    domain_dev->pm_domain->ops.runtime_suspend != genpd_suspend)
+		return -EINVAL;
+	genpd = pd_to_genpd(domain_dev->pm_domain);
+	if (genpd->power_on != apple_pmgr_ps_power_on ||
+	    !(genpd->flags & GENPD_FLAG_IRQ_SAFE))
+		return -EOPNOTSUPP;
+	ps = genpd_to_apple_pmgr_ps(genpd);
+	if (ps->firmware_owned || ps->inherited_on)
+		return -EPERM;
+	if (!on)
+		mask |= APPLE_PMGR_AUTO_ENABLE;
+	return regmap_read_poll_timeout_atomic(ps->regmap, ps->offset, value,
+					      (value & mask) == (on ? APPLE_PMGR_PS_ALL_ON : 0),
+					      1, APPLE_PMGR_PS_PARENT_TIMEOUT);
+}
+EXPORT_SYMBOL_GPL(apple_pmgr_ps_verify_state);
 
 /**
  * apple_pmgr_ps_cycle() - power gate a domain and turn it on again
@@ -899,6 +932,21 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, -EINVAL,
 				     "retention workaround needs a consumer switch\n");
 	}
+	if (of_property_present(node, "apple,bridge-link")) {
+		struct of_phandle_args link;
+		struct resource res;
+
+		if (!ps->consumer_switched ||
+		    of_parse_phandle_with_fixed_args(node, "apple,bridge-link", 2, 0, &link))
+			return dev_err_probe(dev, -EINVAL, "bad bridge link\n");
+		ret = of_address_to_resource(link.np, link.args[0], &res);
+		of_node_put(link.np);
+		if (ret)
+			return dev_err_probe(dev, ret, "bad bridge link block\n");
+		ps->bridge = devm_ioremap(dev, res.start + link.args[1], 8);
+		if (!ps->bridge)
+			return -ENOMEM;
+	}
 	ps->sleep_retained = of_property_read_bool(node, "apple,sleep-retained");
 	ps->sleep_driver_owned = of_property_read_bool(node, "apple,sleep-driver-owned");
 	/*
@@ -987,6 +1035,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		dev_err(dev, "pm_genpd_init failed\n");
 		return ret;
 	}
+	WRITE_ONCE(apple_pmgr_genpd_runtime_suspend, ps->genpd.domain.ops.runtime_suspend);
 
 	ret = of_genpd_add_provider_simple(node, &ps->genpd);
 	if (ret < 0) {
@@ -1081,6 +1130,22 @@ static bool apple_pmgr_ps_consumer_ready(u32 reg)
  * automatic power management while staying on, set the retention workaround,
  * then power off (clearing the history bits) and wait for it.
  */
+/* Only with the state on: the link down before its power-off, up after its power-on. */
+static void apple_pmgr_ps_bridge(struct apple_pmgr_ps *ps, bool up)
+{
+	if (!ps->bridge)
+		return;
+	for (unsigned int i = 0; i < 2; i++) {
+		u32 value = readl(ps->bridge + 4 * i);
+
+		writel(up ? value | BIT(0) : value & ~BIT(0), ps->bridge + 4 * i);
+	}
+	/* Complete the stores before the state word changes or its block is used. */
+	mb();
+	readl(ps->bridge);
+	dev_dbg(ps->dev, "PS %s: bridge link %s\n", ps->genpd.name, up ? "up" : "down");
+}
+
 static int apple_pmgr_ps_consumer_state_off(struct apple_pmgr_ps *ps)
 {
 	u32 reg, cur;
@@ -1117,6 +1182,7 @@ static int apple_pmgr_ps_consumer_state_off(struct apple_pmgr_ps *ps)
 		if (ret)
 			goto fail;
 	}
+	apple_pmgr_ps_bridge(ps, false);
 	ps->consumer_off = true;
 	reg = (reg & ~APPLE_PMGR_PS_TARGET) | APPLE_PMGR_FLAGS |
 	      FIELD_PREP(APPLE_PMGR_PS_TARGET, APPLE_PMGR_PS_PWRGATE);
@@ -1158,6 +1224,7 @@ static int apple_pmgr_ps_consumer_state_on(struct apple_pmgr_ps *ps)
 		ret = apple_pmgr_ps_wait(ps, APPLE_PMGR_PS_LEVELS, APPLE_PMGR_PS_ALL_ON, &cur);
 	if (ret)
 		goto fail;
+	apple_pmgr_ps_bridge(ps, true);
 	for (unsigned int i = 0; i < ps->nr_retention; i++) {
 		u32 mask = ps->retention[i].mask;
 
@@ -1278,12 +1345,33 @@ int apple_pmgr_ps_consumer_on(struct device *consumer)
 		return n;
 	for (int i = n - 1; i >= 0; i--) {
 		ret = apple_pmgr_ps_consumer_switch(chain[i], true);
-		if (ret)
+		/* Also a rollback after a power-off that stopped partway: skip what stayed on. */
+		if (ret && ret != -EALREADY)
 			return ret;
 	}
 	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_pmgr_ps_consumer_on);
+
+/*
+ * Whether @consumer's own state, the first of its chain, is powered off: after
+ * a power-off that stopped partway, whether its block went through reset.
+ */
+bool apple_pmgr_ps_consumer_is_off(struct device *consumer)
+{
+	struct apple_pmgr_ps *chain[APPLE_PMGR_PS_MAX_CHAIN];
+	int n = apple_pmgr_ps_consumer_chain(consumer, chain);
+	unsigned long flags;
+	bool off;
+
+	if (n < 0)
+		return false;
+	spin_lock_irqsave(&chain[0]->genpd.slock, flags);
+	off = chain[0]->consumer_off;
+	spin_unlock_irqrestore(&chain[0]->genpd.slock, flags);
+	return off;
+}
+EXPORT_SYMBOL_GPL(apple_pmgr_ps_consumer_is_off);
 
 static const struct of_device_id apple_pmgr_ps_of_match[] = {
 	{ .compatible = "apple,t8103-pmgr-pwrstate" },

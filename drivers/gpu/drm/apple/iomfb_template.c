@@ -641,16 +641,15 @@ static void dcp_external_hint_done(struct apple_dcp *dcp, void *out, void *cooki
  */
 static void dcp_external_hdr_hints(struct apple_dcp *dcp, bool pq)
 {
-	const u32 hints[][2] = {
-		{ 3, 0x10000 },
-		{ 6, pq ? 0x20000 : 0x10000 },
-	};
+	struct iomfb_property hints[2];
 	unsigned int i;
+
+	iomfb_external_hdr_hint_values(pq, hints);
 
 	for (i = 0; i < ARRAY_SIZE(hints); i++) {
 		struct dcp_set_parameter_dcp param = {
-			.param = hints[i][0],
-			.value = { hints[i][1] },
+			.param = hints[i].id,
+			.value = { hints[i].value },
 			.count = 1,
 		};
 		struct dcp_wait_cookie *cookie;

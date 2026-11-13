@@ -71,7 +71,12 @@ static inline void cpu_set_reserved_ttbr0(void)
  * The caller has installed reserved_pg_dir in TTBR0 and excludes preemption.
  * On a granule transition, complete that installation before changing TG0,
  * then synchronise the new walk geometry before installing a user root.
- * ASIDs remain unique across both granules; switching does not flush them.
+ *
+ * TG0 is one of the TCR_EL1 fields the architecture permits a TLB to cache,
+ * so ASID tagging does not keep entries walked under the old granule apart
+ * from the new one: without maintenance, EL0 and uaccess take TLB conflict
+ * aborts. Invalidate this CPU's TLB after the change; reserved_pg_dir in
+ * TTBR0 keeps anything from being walked between the write and the TLBI.
  */
 static inline void cpu_set_mm_tg0(struct mm_struct *mm)
 {
@@ -87,6 +92,7 @@ static inline void cpu_set_mm_tg0(struct mm_struct *mm)
 	isb();
 	write_sysreg((tcr & ~TCR_EL1_TG0_MASK) | tg0, tcr_el1);
 	isb();
+	local_flush_tlb_all();
 #endif
 }
 

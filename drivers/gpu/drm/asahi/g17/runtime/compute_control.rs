@@ -9,10 +9,11 @@ use kernel::{prelude::*, sync::Arc};
 impl Backend {
     /// A final retirement pass precedes bounded cross-VM timeout attribution.
     /// All completion callbacks run after releasing the device mutex.
-    pub(super) fn defer_compute_timeout(&self, packet: &Arc<Packet>, renewals: u8) -> bool {
+    pub(super) fn defer_compute_timeout(&self, packet: &Arc<Packet>, renewals: u8, excused: u32)
+        -> crate::g17::timeout::Decision {
         use crate::g17::{recovery::Class, timeout::{self, Decision}};
         let Ok(mut deferred) = DeferredBatch::worker() else {
-            return false;
+            return Decision::Own;
         };
         let result = (|| -> Result<Decision> {
             let mut state = self.shared.state.lock();
@@ -39,22 +40,25 @@ impl Backend {
                 .filter(|other| other.owner() != Some(self.owner))
                 .filter_map(|other| other.timeout_head());
             let others = Iterator::chain(computes, firmware.queues.render_timeout_heads());
-            let verdict = timeout::attribute(own, renewals, others);
+            let excuse = timeout::Excuse { used: excused, limit: timeout::excuse_limit(
+                crate::module_parameters::compute_timeout_max_ms.value()) };
+            let verdict = timeout::attribute(own, renewals, excuse, others);
             let decision = verdict.decision;
             if decision == Decision::Spare {
                 firmware.queues.compute(self.owner).ok_or(EIO)?
                     .classify(&|_| Class::Spared);
             }
-            if let Some(blocker) = verdict.reported_blocker(renewals) {
+            if let Some(blocker) = verdict.reported_blocker(renewals, excuse) {
                 dev_warn!(self.shared.dev.as_ref(),
-                    "Compute watchdog owner={} vm={} publication={} renewals={} decision={:?} behind earlier work of another VM: blocker_vm={} blocker_publication={} blocker_failed={}\n",
-                    self.owner, own.vm, own.published, renewals, decision,
-                    blocker.vm, blocker.published, u8::from(blocker.failed));
+                    "Compute watchdog owner={} vm={} publication={} renewals={} excused={} decision={:?} behind earlier work of another VM: blocker_vm={} blocker_publication={} blocker_failed={} blocker_in_allowance={}\n",
+                    self.owner, own.vm, own.published, renewals, excused, decision,
+                    blocker.vm, blocker.published, u8::from(blocker.failed),
+                    u8::from(blocker.excused));
             }
             Ok(decision)
         })();
         deferred.finish();
-        matches!(result, Ok(Decision::Defer))
+        result.unwrap_or(Decision::Own)
     }
 
     /// The older node of the packet's context ahead of its own, with its own word, when the

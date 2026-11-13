@@ -119,6 +119,16 @@ properties:
     description:
       GPIO on the pin that carries the router's LSTX sideband signal.
 
+  phys:
+    maxItems: 1
+    description:
+      The Type-C PHY whose lanes carry the router's CIO link. A host that
+      power-cycles the router for a deep sleep takes the PHY through the
+      sleep with it.
+
+  phy-names:
+    const: cio
+
   apple,pcie-tunnel:
     $ref: /schemas/types.yaml#/definitions/phandle
     description:

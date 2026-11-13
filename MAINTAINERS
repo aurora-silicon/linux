@@ -2068,7 +2068,10 @@ APPLE PCIE CONTROLLER DRIVER
 M:	Marc Zyngier <maz@kernel.org>
 L:	linux-pci@vger.kernel.org
 S:	Maintained
+F:	drivers/pci/controller/pcie-apple-radio.c
 F:	drivers/pci/controller/pcie-apple.c
+F:	include/linux/soc/apple/radio-sleep.h
+F:	tools/asahi/radio-*-tests.*
 
 APPLE SMC DRIVER
 M:	Henrik Rydberg <rydberg@bitmath.org>
@@ -2770,6 +2773,7 @@ F:	Documentation/hwmon/macsmc-hwmon.rst
 F:	Documentation/power/apple-s2idle.rst
 F:	arch/arm64/boot/dts/apple/
 F:	drivers/bluetooth/hci_bcm4377.c
+F:	tools/asahi/bcm4377-sleep-config-tests.*
 F:	drivers/clk/clk-apple-nco.c
 F:	drivers/cpufreq/apple-soc-cpufreq.c
 F:	drivers/dma/apple-admac.c
@@ -2785,6 +2789,8 @@ F:	drivers/i2c/busses/i2c-pasemi-core.c
 F:	drivers/i2c/busses/i2c-pasemi-platform.c
 F:	drivers/input/misc/macsmc-input.c
 F:	drivers/input/touchscreen/apple_z2.c
+F:	drivers/iommu/apple-dart-power.h
+F:	drivers/iommu/apple-dart-sleep.c
 F:	drivers/iommu/apple-dart-test.c
 F:	drivers/iommu/apple-dart.c
 F:	drivers/iommu/io-pgtable-dart.c
@@ -2835,6 +2841,8 @@ F:	include/uapi/drm/asahi_drm.h
 F:	include/uapi/linux/apple-sep.h
 F:	net/bluetooth/brcm.c
 F:	net/bluetooth/brcm.h
+F:	tools/asahi/dart-sleep-*-tests.*
+F:	tools/asahi/sleep_test_utils.py
 F:	tools/testing/selftests/drivers/apple/
 
 ARM/APPLE AVE VIDEO ENCODER DRIVER
@@ -5576,6 +5584,7 @@ L:	brcm80211-dev-list.pdl@broadcom.com
 S:	Supported
 F:	drivers/net/wireless/broadcom/brcm80211/
 F:	include/linux/platform_data/brcmfmac.h
+F:	tools/asahi/brcmfmac-sleep-lifetime-tests.*
 
 BROADCOM BRCMSTB GPIO DRIVER
 M:	Doug Berger <opendmb@gmail.com>

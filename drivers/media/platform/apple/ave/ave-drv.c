@@ -538,6 +538,7 @@ static int ave_runtime_resume(struct device *dev)
 static int ave_suspend(struct device *dev)
 {
 	struct ave_dev *ave = dev_get_drvdata(dev);
+	bool hung;
 	int ret;
 
 	/* Let a running job finish; the m2m core holds back new ones. */
@@ -550,8 +551,13 @@ static int ave_suspend(struct device *dev)
 	 */
 	mutex_lock(&ave->hw_lock);
 	ave_v4l2_suspend(ave);
+	hung = ave->fw_state == AVE_FW_BROKEN;
 	ret = ave_fw_shutdown(ave);
-	if (!ret && ave->layout && ave->layout->abi->transport->scratch_halt)
+	/*
+	 * A hung 6070 firmware is stopped without a confirmed Halt: its boot
+	 * memory stays mapped until the power cycle, like a session's.
+	 */
+	if (!ret && !hung && ave->layout && ave->layout->abi->transport->scratch_halt)
 		ave_fw_release_boot(ave);
 	mutex_unlock(&ave->hw_lock);
 	if (ret) {
