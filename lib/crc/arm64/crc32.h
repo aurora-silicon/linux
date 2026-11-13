@@ -28,9 +28,13 @@ asmlinkage u32 crc32_be_arm64_3way(u32 crc, unsigned char const *p, size_t nbloc
  * so works in any context without the kernel_neon_begin()/end() cost, which
  * dominates for page-sized inputs such as filesystem block checksums.
  */
+/* TEST ONLY (BTRFSCSUM A/B): 0 = old 4-way PMULL path */
+static bool crc32_arm64_3way = true;
+module_param(crc32_arm64_3way, bool, 0644);
+
 #define crc32_3way(fn, crc, p, len)					\
 do {									\
-	if (len >= CRC32_3WAY_BLOCK) {					\
+	if (len >= CRC32_3WAY_BLOCK && READ_ONCE(crc32_arm64_3way)) {					\
 		size_t __n = len / CRC32_3WAY_BLOCK;			\
 									\
 		crc = fn(crc, p, __n);					\

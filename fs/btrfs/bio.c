@@ -371,12 +371,16 @@ static void btrfs_log_dev_io_error(const struct bio *bio, struct btrfs_device *d
 		btrfs_dev_stat_inc_and_print(dev, BTRFS_DEV_STAT_FLUSH_ERRS);
 }
 
+/* TEST ONLY (BTRFSCSUM A/B): 0 = data read verification on the unbound btrfs-endio */
+static bool read_endio_percpu = true;
+module_param(read_endio_percpu, bool, 0644);
+
 static struct workqueue_struct *btrfs_end_io_wq(const struct btrfs_fs_info *fs_info,
 						const struct bio *bio)
 {
 	if (bio->bi_opf & REQ_META)
 		return fs_info->endio_meta_workers;
-	if (bio_op(bio) == REQ_OP_READ)
+	if (bio_op(bio) == REQ_OP_READ && READ_ONCE(read_endio_percpu))
 		return fs_info->endio_read_workers;
 	return fs_info->endio_workers;
 }

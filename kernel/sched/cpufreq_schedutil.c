@@ -61,6 +61,10 @@ struct sugov_cpu {
 
 static DEFINE_PER_CPU(struct sugov_cpu, sugov_cpu);
 
+/* TEST ONLY (BTRFSCSUM A/B): 0 = old per-evaluation decay */
+static bool sugov_iowait_hold = true;
+module_param(sugov_iowait_hold, bool, 0644);
+
 /************************ Governor internals ***********************/
 
 static void sugov_update_rate_limit_us(struct sugov_policy *sg_policy)
@@ -357,7 +361,7 @@ static unsigned long sugov_iowait_apply(struct sugov_cpu *sg_cpu, u64 time,
 		return 0;
 
 	if (!sg_cpu->iowait_boost_pending &&
-	    time - sg_cpu->iowait_boost_time > TICK_NSEC) {
+	    (!sugov_iowait_hold || time - sg_cpu->iowait_boost_time > TICK_NSEC)) {
 		/*
 		 * No boost requested for more than a tick; reduce the boost
 		 * value.
