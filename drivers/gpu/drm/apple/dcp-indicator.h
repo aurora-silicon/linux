@@ -75,8 +75,10 @@ struct dcp_ind_ops {
 /*
  * Commits the square on or off. The commit is nonblocking, so a flip still
  * pending on the CRTC refuses it with -EBUSY. The request stands, so that
- * refusal is queued to be asked again, never waited for: 0 means committed or
- * queued. Any other error is final and returned.
+ * refusal is queued to be asked again, never waited for. A panel that is not
+ * ready (-ENODEV: suspended, CRTC not active, DRM not bound) keeps the request
+ * too, with the square OFF, for the display resuming to ask again. 0 means
+ * committed, queued or kept. Any other error is final and returned.
  */
 static inline int dcp_ind_apply(struct dcp_indicator *ind, bool on,
 				const struct dcp_ind_ops *ops, void *ctx)
@@ -89,6 +91,11 @@ static inline int dcp_ind_apply(struct dcp_indicator *ind, bool on,
 		ops->queue_retry(ctx);
 		return 0;
 	}
+	if (ret == -ENODEV) {
+		/* Nothing is lit, and the request (wanted) is kept. */
+		ind->state = DCP_IND_OFF;
+		return 0;
+	}
 	return ret;
 }
 
@@ -99,6 +106,15 @@ static inline int dcp_ind_retry(struct dcp_indicator *ind, bool plane,
 	if (!plane || ind->retry == DCP_IND_RETRY_NONE)
 		return 0;
 	return dcp_ind_apply(ind, ind->retry == DCP_IND_RETRY_ON, ops, ctx);
+}
+
+/*
+ * The display came back (system resume): the plane returns disabled whatever it
+ * showed, so the square is OFF again and a kept request asks anew.
+ */
+static inline void dcp_ind_display_resumed(struct dcp_indicator *ind)
+{
+	dcp_ind_suspend(ind);
 }
 
 /* Wanted but not on the panel: the next present after a rebind asks again. */
@@ -122,16 +138,19 @@ enum dcp_ind_plane_action {
  * its buffer silently dropped. Carried unchanged, or disabled with the CRTC it
  * sits on (DPMS off, suspend, shutdown), the plane is left alone. The kernel's
  * own framebuffer is not userspace: suspend saves it and resume commits it
- * back, and refusing that would fail the resume, so it is put back like a clear.
+ * back, and refusing that would fail the resume, so it is put back like a clear
+ * (the display resuming then asks for the square again).
  */
 static inline enum dcp_ind_plane_action dcp_ind_plane_policy(bool reserved_plane,
 							      bool kernel_commit, bool unchanged,
-							      bool crtc_going_off, bool clearing,
-							      bool own_fb)
+							      bool crtc_going_off, bool has_fb,
+							      bool has_crtc, bool own_fb)
 {
 	if (!reserved_plane || kernel_commit || unchanged || crtc_going_off)
 		return DCP_IND_PLANE_PASS;
-	return clearing || own_fb ? DCP_IND_PLANE_RESTORE : DCP_IND_PLANE_REJECT;
+	if ((!has_fb && !has_crtc) || (own_fb && has_fb))
+		return DCP_IND_PLANE_RESTORE;
+	return DCP_IND_PLANE_REJECT;
 }
 
 #endif /* DCP_INDICATOR_H */

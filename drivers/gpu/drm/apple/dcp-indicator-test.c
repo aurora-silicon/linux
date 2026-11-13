@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
  * Behaviour of the software camera indicator state. The same file builds as
- * a KUnit suite in the kernel and as a plain program (-DDCP_IND_USERSPACE).
+ * a KUnit suite in the kernel and as a plain program (-DDCP_IND_USERSPACE):
+ *   gcc -DDCP_IND_USERSPACE -I. -o ind-test dcp-indicator-test.c && ./ind-test
  */
 #ifdef DCP_IND_USERSPACE
-#include "kunit-shim.h"
+#include "tests/kunit-shim.h"
 #else
 #include <kunit/test.h>
 #include <linux/module.h>
@@ -183,32 +184,81 @@ static void indicator_retry_ends_with_the_request(struct kunit *test)
 /*
  * Userspace never gets the reserved plane: a clear is put back, anything else
  * is refused so a compositor sees it in its TEST_ONLY commit and falls back.
+ * Arguments: reserved, kernel commit, unchanged, CRTC going off, has fb,
+ * has crtc, own fb.
  */
 static void indicator_plane_reservation(struct kunit *test)
 {
 	/* An ordinary plane is never touched. */
-	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(false, false, false, false, false, false),
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(false, false, false, false, true, true, false),
 			DCP_IND_PLANE_PASS);
 	/* The kernel's own commit may do anything. */
-	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, true, false, false, false, false),
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, true, false, false, true, true, false),
 			DCP_IND_PLANE_PASS);
 	/* Userspace: carried unchanged, or disabled with its CRTC, is left alone. */
-	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, false, true, false, false, false),
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, false, true, false, true, true, false),
 			DCP_IND_PLANE_PASS);
-	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, false, false, true, true, false),
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, false, false, true, false, false, false),
 			DCP_IND_PLANE_PASS);
 	/* A blind clear of every plane (console restore) still succeeds, undone. */
-	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, false, false, false, true, false),
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, false, false, false, false, false, false),
 			DCP_IND_PLANE_RESTORE);
 	/*
 	 * The kernel's own framebuffer, saved by suspend and committed back by
 	 * resume, is not userspace: it must not fail the resume. It is undone.
 	 */
-	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, false, false, false, false, true),
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, false, false, false, true, true, true),
 			DCP_IND_PLANE_RESTORE);
 	/* Any other userspace assignment (own fb, a move, a property) is refused. */
-	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, false, false, false, false, false),
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, false, false, false, true, true, false),
 			DCP_IND_PLANE_REJECT);
+	/* An fb without a CRTC is no clear: it is refused, never put back. */
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, false, false, false, true, false, false),
+			DCP_IND_PLANE_REJECT);
+}
+
+/*
+ * The panel is not ready (suspended, or the CRTC not yet active): a request made
+ * then is kept and asked for again when the display resumes, not dropped.
+ */
+static void indicator_survives_a_display_that_is_not_ready(struct kunit *test)
+{
+	struct dcp_indicator ind = {};
+	struct fake_drm d = { .results = { -ENODEV, -ENODEV } };
+
+	KUNIT_ASSERT_EQ(test, dcp_ind_begin(&ind), 0);
+	KUNIT_EXPECT_EQ(test, dcp_ind_apply(&ind, true, &fake_ops, &d), 0);
+	KUNIT_EXPECT_EQ(test, ind.state, DCP_IND_OFF);
+	KUNIT_EXPECT_TRUE(test, ind.wanted);
+	KUNIT_EXPECT_TRUE(test, dcp_ind_wants_resume(&ind));
+	KUNIT_EXPECT_EQ(test, d.queued, 0);
+
+	/* Nothing to take off a panel that is not lit. */
+	dcp_ind_end(&ind);
+	KUNIT_EXPECT_EQ(test, dcp_ind_apply(&ind, false, &fake_ops, &d), 0);
+	KUNIT_EXPECT_EQ(test, d.queued, 0);
+	KUNIT_EXPECT_FALSE(test, dcp_ind_wants_resume(&ind));
+}
+
+/*
+ * Lit when the system suspends: resume puts the plane back disabled, so the
+ * display resuming makes the square OFF again and the kept request asks anew.
+ */
+static void indicator_lit_across_suspend_asks_again(struct kunit *test)
+{
+	struct dcp_indicator ind = {};
+
+	KUNIT_ASSERT_EQ(test, dcp_ind_begin(&ind), 0);
+	dcp_ind_present_done(&ind, true);
+	KUNIT_ASSERT_EQ(test, ind.state, DCP_IND_LIT);
+	KUNIT_EXPECT_FALSE(test, dcp_ind_wants_resume(&ind));
+	dcp_ind_display_resumed(&ind);
+	KUNIT_EXPECT_TRUE(test, dcp_ind_wants_resume(&ind));
+	/* Stopped during the suspend: nothing to ask for. */
+	KUNIT_ASSERT_EQ(test, dcp_ind_begin(&ind), 0);
+	dcp_ind_end(&ind);
+	dcp_ind_display_resumed(&ind);
+	KUNIT_EXPECT_FALSE(test, dcp_ind_wants_resume(&ind));
 }
 
 static struct kunit_case indicator_cases[] = {
@@ -219,6 +269,8 @@ static struct kunit_case indicator_cases[] = {
 	KUNIT_CASE(indicator_resumes_only_a_kept_request),
 	KUNIT_CASE(indicator_refused_commit_is_retried),
 	KUNIT_CASE(indicator_retry_ends_with_the_request),
+	KUNIT_CASE(indicator_survives_a_display_that_is_not_ready),
+	KUNIT_CASE(indicator_lit_across_suspend_asks_again),
 	KUNIT_CASE(indicator_plane_reservation),
 	{}
 };
