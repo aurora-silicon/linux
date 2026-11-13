@@ -474,9 +474,11 @@ static inline bool pm_hibernation_mode_is_suspend(void) { return false; }
 #ifdef CONFIG_HIBERNATION
 bool pm_hibernate_is_restored(void);
 bool pm_hibernate_is_loading(void);
+int pm_hibernate_restored_cold(void);
 #else
 static inline bool pm_hibernate_is_restored(void) { return false; }
 static inline bool pm_hibernate_is_loading(void) { return false; }
+static inline int pm_hibernate_restored_cold(void) { return 0; }
 #endif
 
 int arch_resume_nosmt(void);

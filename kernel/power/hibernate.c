@@ -99,6 +99,53 @@ bool pm_hibernate_is_restored(void)
 }
 EXPORT_SYMBOL_GPL(pm_hibernate_is_restored);
 
+/*
+ * What the kernel that loads an image leaves for the kernel restored from it.
+ * It lives in the no-save section, which the image neither saves nor
+ * overwrites, so the restored kernel reads what the loading kernel wrote, as
+ * long as both are the same build loaded at the same physical address (which
+ * the image's header requires).  The record carries its own physical address
+ * and a magic: a record from a kernel loaded elsewhere, or none, reads as
+ * absent.
+ */
+struct hibernate_load_record {
+	u32 magic;
+	u32 other_boot;
+	u64 self_phys;
+};
+
+#define HIBERNATE_LOAD_MAGIC	0x484c4452	/* "HLDR" */
+
+static struct hibernate_load_record hibernate_load_record __nosavedata;
+
+/* Set while hibernate() loads the image it has just written (test_resume). */
+static bool hibernate_loading_own_image;
+
+/* Whether the restore came from another boot, see pm_hibernate_restored_cold(). */
+static int hibernate_restored_cold = -ENODATA;
+
+/**
+ * pm_hibernate_restored_cold - Whether this kernel was restored by another boot.
+ *
+ * Meaningful once pm_hibernate_is_restored() is true, under the same lifetime.
+ * The kernel that loads an image tells the kernel restored from it whether it
+ * is the kernel that wrote the image (a test_resume load: the machine did not
+ * boot) or one that was started to resume it (the boot loader and the
+ * firmware have been through a boot).  Whether a particular device lost its
+ * state across that boot is for its driver to find out.
+ *
+ * Return: 1 if the image was loaded by another boot, 0 if this kernel loaded
+ * its own image or was not restored, -ENODATA if the record of the loading
+ * kernel is missing.
+ */
+int pm_hibernate_restored_cold(void)
+{
+	if (!READ_ONCE(hibernate_restored))
+		return 0;
+	return READ_ONCE(hibernate_restored_cold);
+}
+EXPORT_SYMBOL_GPL(pm_hibernate_restored_cold);
+
 /* Set while this kernel loads a hibernation image, see pm_hibernate_is_loading(). */
 static bool hibernate_loading;
 
@@ -463,6 +510,12 @@ static int create_image(int platform_mode)
 	if (!in_suspend) {
 		events_check_enabled = false;
 		clear_or_poison_free_pages();
+		if (hibernate_load_record.magic == HIBERNATE_LOAD_MAGIC &&
+		    hibernate_load_record.self_phys == __pa_symbol(&hibernate_load_record))
+			WRITE_ONCE(hibernate_restored_cold, !!hibernate_load_record.other_boot);
+		else
+			WRITE_ONCE(hibernate_restored_cold, -ENODATA);
+		hibernate_load_record.magic = 0;
 		WRITE_ONCE(hibernate_restored, true);
 	}
 
@@ -504,6 +557,7 @@ int hibernation_snapshot(int platform_mode)
 
 	pm_suspend_clear_flags();
 	WRITE_ONCE(hibernate_restored, false);
+	WRITE_ONCE(hibernate_restored_cold, -ENODATA);
 	error = platform_begin(platform_mode);
 	if (error)
 		goto Close;
@@ -617,6 +671,9 @@ static int resume_target_kernel(bool platform_mode)
 	save_processor_state();
 	error = restore_highmem();
 	if (!error) {
+		hibernate_load_record.other_boot = !hibernate_loading_own_image;
+		hibernate_load_record.self_phys = __pa_symbol(&hibernate_load_record);
+		hibernate_load_record.magic = HIBERNATE_LOAD_MAGIC;
 		error = swsusp_arch_resume();
 		/*
 		 * The code below is only ever reached in case of a failure.
@@ -624,6 +681,7 @@ static int resume_target_kernel(bool platform_mode)
 		 * swsusp_arch_suspend() was called.
 		 */
 		BUG_ON(!error);
+		hibernate_load_record.magic = 0;
 		/*
 		 * This call to restore_highmem() reverts the changes made by
 		 * the previous one.
@@ -995,8 +1053,11 @@ int hibernate(void)
 	if (snapshot_test) {
 		pm_pr_dbg("Checking hibernation image\n");
 		error = swsusp_check(false);
-		if (!error)
+		if (!error) {
+			hibernate_loading_own_image = true;
 			error = load_image_and_restore();
+			hibernate_loading_own_image = false;
+		}
 	}
 	thaw_processes();
 
