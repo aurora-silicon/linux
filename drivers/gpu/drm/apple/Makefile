@@ -25,6 +25,7 @@ appledrm-y += iomfb_h17p.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += iomfb_h17p_test.o parser_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += iomfb_v27_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += iomfb_external_hdr_hints_test.o
+appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += iomfb_v27_3_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += apple_resume_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += apple_boot_display_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-syslog-test.o
