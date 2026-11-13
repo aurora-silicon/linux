@@ -231,6 +231,7 @@ obj-$(CONFIG_DRM_APPLE_FABRIC_CORE) += apple/dcp-fabric-core.o
 obj-$(CONFIG_DRM_APPLE_FABRIC_KUNIT_TEST) += apple/dcp-fabric-test.o
 obj-$(CONFIG_DRM_APPLE) += apple/
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += apple/iomfb-state-test.o
+obj-$(CONFIG_DRM_APPLE_DCPIB) += apple_dcpib/
 obj-$(CONFIG_DRM_ASPEED_GFX) += aspeed/
 obj-$(CONFIG_DRM_MCDE) += mcde/
 obj-$(CONFIG_DRM_TIDSS) += tidss/

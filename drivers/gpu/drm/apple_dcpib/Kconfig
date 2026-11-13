@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
+config DRM_APPLE_DCPIB
+	tristate "Apple T8152 DCP display (iBoot interface)"
+	depends on DRM && OF && ARM64
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on APPLE_RTKIT
+	depends on SPMI
+	select APERTURE_HELPERS
+	select DRM_CLIENT_SELECTION
+	select DRM_GEM_DMA_HELPER
+	select DRM_KMS_HELPER
+	help
+	  Display driver for the DCP of the Apple T8152 (Mac mini J873g) on
+	  the firmware's small iBoot interface. It takes over the displays
+	  the bootloader brought up, with the DCP's firmware session still
+	  running: a USB-C display on one of the rear ports and the HDMI port.
+
+	  To compile this driver as a module, choose M here: the module will
+	  be called apple_dcpib.
