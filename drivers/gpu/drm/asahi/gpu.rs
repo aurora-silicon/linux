@@ -1321,6 +1321,15 @@ impl GpuManager::ver {
     /// last emitted one (so the coalesced count can be surfaced). The fault is
     /// always handled and recovered regardless of whether it is logged.
     fn fault_log_ratelimit(&self) -> (bool, u32) {
+        // Anyone debugging the GPU sets VerboseFaults and wants every report, so
+        // never throttle in that case; just drain any coalesced count.
+        if debug_enabled(DebugFlags::VerboseFaults) {
+            let mut state = self.fault_log.lock();
+            let suppressed = state.suppressed;
+            state.suppressed = 0;
+            return (true, suppressed);
+        }
+
         let now = Instant::<Monotonic>::now();
         let mut state = self.fault_log.lock();
         let throttled = match &state.last {
