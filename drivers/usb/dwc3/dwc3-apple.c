@@ -1198,19 +1198,14 @@ static int dwc3_usb_role_switch_set(struct usb_role_switch *sw, enum usb_role ro
 	if (appledwc->fixed_hub)
 		return 0;
 
-	/* Stopped for a sleep: this is what comes back after it. */
-	if (appledwc->sleep_stopped) {
-		appledwc->sleep_state = dwc3_apple_state_for_role(role);
-		return 0;
-	}
-
 	/*
-	 * Kept through a sleep, with the core in reset for some of it: nothing stops or starts
-	 * until the sleep is over, see dwc3_apple_sleep_restart_end(). Nor while the core may
-	 * be unpowered after one: dwc3_apple_recover() starts what is asked for here.
+	 * Held by a sleep: this is what comes back after it. Stopped for it, or kept through it
+	 * with the core in reset for some of it, nothing stops or starts until the sleep is
+	 * over, see dwc3_apple_sleep_restart_end(). Nor while the core may be unpowered after
+	 * one: dwc3_apple_recover() starts what is asked for here.
 	 */
-	if (appledwc->sleep_in_place || appledwc->sleep_dead) {
-		appledwc->sleep_state = dwc3_apple_state_for_role_kept(role, appledwc->host_only);
+	if (appledwc->sleep_stopped || appledwc->sleep_in_place || appledwc->sleep_dead) {
+		appledwc->sleep_state = dwc3_apple_state_for_role(role, appledwc->host_only);
 		return 0;
 	}
 

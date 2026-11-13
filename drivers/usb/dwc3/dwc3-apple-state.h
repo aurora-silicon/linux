@@ -51,40 +51,26 @@ static inline int dwc3_apple_usb2_mode_before_reset(enum dwc3_apple_state target
 }
 
 /**
- * dwc3_apple_state_for_role() - state a role asks for while the core is stopped for sleep
- * @role: the role asked for
- *
- * Return: the state to bring the controller up in after the sleep.
- */
-static inline enum dwc3_apple_state dwc3_apple_state_for_role(enum usb_role role)
-{
-	switch (role) {
-	case USB_ROLE_HOST:
-		return DWC3_APPLE_HOST;
-	case USB_ROLE_DEVICE:
-		return DWC3_APPLE_DEVICE;
-	default:
-		return DWC3_APPLE_NO_CABLE;
-	}
-}
-
-/**
- * dwc3_apple_state_for_role_kept() - the same for a host kept in place through the sleep
+ * dwc3_apple_state_for_role() - state a role asks for while a sleep holds the core
  * @role: the role asked for
  * @host_only: the controller has no device mode
  *
  * Nothing is stopped or started while the sleep lasts, so what dwc3_usb_role_switch_set()
  * decides for a running controller is decided here: no device mode on a host-only port.
  *
- * Return: the state the port goes to once the sleep is over.
+ * Return: the state to bring the controller up in once the sleep is over.
  */
-static inline enum dwc3_apple_state dwc3_apple_state_for_role_kept(enum usb_role role,
-								   bool host_only)
+static inline enum dwc3_apple_state dwc3_apple_state_for_role(enum usb_role role,
+							      bool host_only)
 {
-	if (role == USB_ROLE_DEVICE && host_only)
+	switch (role) {
+	case USB_ROLE_HOST:
+		return DWC3_APPLE_HOST;
+	case USB_ROLE_DEVICE:
+		return host_only ? DWC3_APPLE_NO_CABLE : DWC3_APPLE_DEVICE;
+	default:
 		return DWC3_APPLE_NO_CABLE;
-
-	return dwc3_apple_state_for_role(role);
+	}
 }
 
 /**

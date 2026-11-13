@@ -38,24 +38,19 @@ static void dwc3_apple_non_role_test(struct kunit *test)
 	}
 }
 
-/* A role that arrives during a sleep decides what comes back after it. */
+/* A role that arrives during a sleep decides what comes back; a host-only port has no device. */
 static void dwc3_apple_role_during_sleep_test(struct kunit *test)
 {
-	KUNIT_EXPECT_EQ(test, dwc3_apple_state_for_role(USB_ROLE_HOST), DWC3_APPLE_HOST);
-	KUNIT_EXPECT_EQ(test, dwc3_apple_state_for_role(USB_ROLE_DEVICE), DWC3_APPLE_DEVICE);
-	KUNIT_EXPECT_EQ(test, dwc3_apple_state_for_role(USB_ROLE_NONE), DWC3_APPLE_NO_CABLE);
-}
-
-/* A host kept through a sleep is neither stopped nor started for a role: no device mode. */
-static void dwc3_apple_role_while_kept_test(struct kunit *test)
-{
-	KUNIT_EXPECT_EQ(test, dwc3_apple_state_for_role_kept(USB_ROLE_HOST, true), DWC3_APPLE_HOST);
-	KUNIT_EXPECT_EQ(test, dwc3_apple_state_for_role_kept(USB_ROLE_NONE, true),
-			DWC3_APPLE_NO_CABLE);
-	KUNIT_EXPECT_EQ(test, dwc3_apple_state_for_role_kept(USB_ROLE_DEVICE, true),
-			DWC3_APPLE_NO_CABLE);
-	KUNIT_EXPECT_EQ(test, dwc3_apple_state_for_role_kept(USB_ROLE_DEVICE, false),
+	KUNIT_EXPECT_EQ(test, dwc3_apple_state_for_role(USB_ROLE_HOST, false), DWC3_APPLE_HOST);
+	KUNIT_EXPECT_EQ(test, dwc3_apple_state_for_role(USB_ROLE_DEVICE, false),
 			DWC3_APPLE_DEVICE);
+	KUNIT_EXPECT_EQ(test, dwc3_apple_state_for_role(USB_ROLE_NONE, false),
+			DWC3_APPLE_NO_CABLE);
+	KUNIT_EXPECT_EQ(test, dwc3_apple_state_for_role(USB_ROLE_HOST, true), DWC3_APPLE_HOST);
+	KUNIT_EXPECT_EQ(test, dwc3_apple_state_for_role(USB_ROLE_NONE, true),
+			DWC3_APPLE_NO_CABLE);
+	KUNIT_EXPECT_EQ(test, dwc3_apple_state_for_role(USB_ROLE_DEVICE, true),
+			DWC3_APPLE_NO_CABLE);
 }
 
 /* A fixed hub's host may always be kept; a Type-C port's only by a PHY that restarts it. */
@@ -136,7 +131,6 @@ static struct kunit_case dwc3_apple_state_test_cases[] = {
 	KUNIT_CASE(dwc3_apple_device_selected_before_reset_test),
 	KUNIT_CASE(dwc3_apple_non_role_test),
 	KUNIT_CASE(dwc3_apple_role_during_sleep_test),
-	KUNIT_CASE(dwc3_apple_role_while_kept_test),
 	KUNIT_CASE(dwc3_apple_sleep_may_keep_test),
 	KUNIT_CASE(dwc3_apple_sleep_reads_mark_test),
 	KUNIT_CASE(dwc3_apple_wake_hibernated_test),
