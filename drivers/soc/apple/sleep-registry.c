@@ -15,9 +15,11 @@
 #include <linux/export.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/seq_file.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/string.h>
 
+#include <asm/barrier.h>
 #include <asm/virt.h>
 
 #include "sleep-internal.h"
@@ -213,3 +215,150 @@ bool apple_sleep_commit_stops_coprocs(void)
 	return ctl && ctl->commit_stops();
 }
 EXPORT_SYMBOL_GPL(apple_sleep_commit_stops_coprocs);
+
+/*
+ * The last thing that can fail on the way to the commit: no CPU but this one is up and
+ * interrupts are off, so no lock can be held. A coprocessor stopped here comes back only
+ * through a real sleep, so every refusal has to be behind this, and nothing after it may
+ * go back. In this order, on ANS itself: whatever its driver does last,
+ * status and control read, then 0 written twice.
+ */
+static void apple_sleep_coproc_run_off(struct apple_sleep_coproc *c)
+{
+	/* Its own last stop cleared its run bits. */
+	if (!c->asc) {
+		c->stopped = true;
+		return;
+	}
+	c->status = readl(c->asc + ASC_CPU_STATUS);
+	writel(readl(c->asc + ASC_CPU_CONTROL) & ~ASC_CPU_CONTROL_RUN, c->asc + ASC_CPU_CONTROL);
+	writel(readl(c->asc + ASC_CPU_CONTROL) & ~ASC_CPU_CONTROL_RUN, c->asc + ASC_CPU_CONTROL);
+	c->stopped = true;
+}
+
+/* A power word that a ready coprocessor's last stop lowers: on until the commit. */
+bool apple_sleep_coproc_lowers(u32 ps)
+{
+	int i;
+
+	for (i = 0; i < APPLE_SLEEP_COPROCS; i++)
+		if (apple_sleep_coprocs[i].dev && apple_sleep_coprocs[i].ready &&
+		    apple_sleep_coprocs[i].first && apple_sleep_coprocs[i].ps == ps)
+			return true;
+	return false;
+}
+
+bool apple_sleep_enclave_registered(void)
+{
+	return apple_sleep_enclave.dev;
+}
+
+void apple_sleep_registry_show(struct seq_file *s)
+{
+	int i;
+
+	guard(mutex)(&apple_sleep_coprocs_lock);
+	seq_puts(s, "coprocessors registered for the commit's last stop:\n");
+	for (i = 0; i < APPLE_SLEEP_COPROCS; i++) {
+		struct apple_sleep_coproc *c = &apple_sleep_coprocs[i];
+
+		if (!c->dev)
+			continue;
+		seq_printf(s, "  %s%s%s%s%s\n", dev_name(c->dev), c->pcie_ans ? " (ANS)" : "",
+			   c->first ? " (first)" : "", c->last_check ? ", last check" : "",
+			   c->ready ? ", ready" : "");
+	}
+	seq_printf(s, "enclave sleep request left for the last refusal: %s\n",
+		   apple_sleep_enclave.dev ? dev_name(apple_sleep_enclave.dev) : "none");
+}
+
+/* A registered coprocessor that isn't ready refuses the sleep. */
+unsigned int apple_sleep_coprocs_refuse(struct device *dev, bool *pcie_ans_idled)
+{
+	unsigned int refused = 0;
+	int i;
+
+	for (i = 0; i < APPLE_SLEEP_COPROCS; i++) {
+		struct apple_sleep_coproc *c = &apple_sleep_coprocs[i];
+
+		if (!c->dev)
+			continue;
+		if (c->ready) {
+			*pcie_ans_idled |= c->pcie_ans;
+		} else {
+			/* Nothing may lower a coprocessor's domain under its driver. */
+			dev_err(dev, "refused: %s is running and its driver has not quiesced it\n",
+				dev_name(c->dev));
+			refused++;
+		}
+	}
+
+	return refused;
+}
+
+/* The last refusals, each coprocessor's own: nothing has stopped yet. */
+int apple_sleep_coprocs_check(struct device *dev)
+{
+	int i, ret;
+
+	for (i = 0; i < APPLE_SLEEP_COPROCS; i++) {
+		struct apple_sleep_coproc *c = &apple_sleep_coprocs[i];
+
+		if (!c->dev || !c->ready || c->stopped || !c->last_check)
+			continue;
+		ret = c->last_check(c->data);
+		if (ret) {
+			dev_err(dev, "refused: %s: %d\n", dev_name(c->dev), ret);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+/* A nonzero result must mean no SLEEP was sent; post-send errors are fatal. */
+int apple_sleep_enclave_stop(struct device *dev)
+{
+	int ret;
+
+	if (!apple_sleep_enclave.stop)
+		return 0;
+	ret = apple_sleep_enclave.stop(apple_sleep_enclave.data);
+	if (ret)
+		dev_err(dev, "refused before SEP SLEEP was sent: %d\n", ret);
+
+	return ret;
+}
+
+/*
+ * In two passes, after the last refusal: from the first stop only a real sleep restarts the
+ * GPU, so a failure here goes on to the commit. Those registered first stop whole first,
+ * before the off words drop under them: the GPU withdraws its PMP request there, and the
+ * PMP has to see that before its own stop. The rest after the match. With ANS among the ready
+ * ones, @pcie_ans.
+ */
+void apple_sleep_coprocs_stop(bool first, bool *pcie_ans)
+{
+	unsigned int order;
+	int i;
+
+	if (first)
+		*pcie_ans = false;
+	/* Those registered first run by their order, the others in one pass over the table. */
+	for (order = 0; order < (first ? APPLE_SLEEP_FIRST_ORDERS : 1); order++) {
+		for (i = 0; i < APPLE_SLEEP_COPROCS; i++) {
+			struct apple_sleep_coproc *c = &apple_sleep_coprocs[i];
+
+			if (!c->dev || !c->ready || c->first != first)
+				continue;
+			if (first && c->order != order)
+				continue;
+			*pcie_ans |= c->pcie_ans;
+			if (c->stopped)
+				continue;
+			c->stop_ret = c->last_stop ? c->last_stop(c->data) : 0;
+			apple_sleep_coproc_run_off(c);
+		}
+	}
+	dsb(sy);
+}

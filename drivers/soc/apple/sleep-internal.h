@@ -320,6 +320,8 @@ unsigned int apple_sleep_coprocs_refuse(struct device *dev, bool *pcie_ans_idled
 /* Each ready coprocessor's last check: the first refusal, or 0. */
 int apple_sleep_coprocs_check(struct device *dev);
 bool apple_sleep_enclave_registered(void);
+/* A power word that a ready coprocessor's last stop lowers: on until the commit. */
+bool apple_sleep_coproc_lowers(u32 ps);
 /* The enclave's stop, last of all refusals: nonzero only if no request was sent. */
 int apple_sleep_enclave_stop(struct device *dev);
 /* The last stops, those registered first with @first and then the rest. */
