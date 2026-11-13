@@ -187,9 +187,12 @@ struct t6041_sleep {
 	void __iomem *ps_aon, *pmc;
 	void __iomem *ka[2];	/* keep-alive tables, 1 from iBoot, 0 at macOS's commit */
 	void __iomem *spmi_a0;	/* 0x509188000: nub-spmi-a0, notify mask written by macOS at -113 ms */
-	void __iomem *amcc[24];
-	void __iomem *dcs[24];	/* DCS channel blocks (ADT mcc reg 20+): 0x220200000 + 0x2000000 * g + 0x200000 * c */
-	void __iomem *amccb[6];	/* AMCC blocks (ADT mcc reg 12+): 0x220000000 + 0x2000000 * g, planes at + 0x40000 * p */
+	unsigned int ngroups;	/* AMCCs of four planes: 8 on the full T6041, 6 on the binned one */
+	void __iomem *amcc[32];
+	/* DCS channel blocks (ADT mcc reg 20+): 0x220200000 + 0x2000000 * g + 0x200000 * c */
+	void __iomem *dcs[32];
+	/* AMCC blocks (ADT mcc reg 12+): 0x220000000 + 0x2000000 * g, planes at + 0x40000 * p */
+	void __iomem *amccb[8];
 	void __iomem *wake;	/* 0x508004000: SLP_DDR +0, wake masks +0x0c..+0x2c */
 	void __iomem *perf;	/* 0x50020c000: SoC perf +0, DCS perf +0x400 */
 	void __iomem *axi2af[15];
@@ -201,7 +204,9 @@ struct t6041_sleep {
 	/* Saved as the commit starts, put back by t6041_sleep_return(). */
 	u64 cntkctl, siq_cfg;
 	u32 pre_perf[2], pre_pmc[5], pre_clk[4], pre_mask[2], pre_wake[9], pre_votes[5];
-	u32 pre_ways[24], pre_cache[24];	/* each AMCC plane's cache ways (+0x2800) and status (+0x2804) */
+	/* Each AMCC plane's cache ways (+0x2800) and status (+0x2804). */
+	u32 pre_ways[32], pre_cache[32];
+	u32 full_pre[15];	/* t6041_full_ps as the commit starts */
 	bool pre_a0;
 	/* GP PCIe ports 0/1: port block, PHY word, and what they held as the commit started. */
 	void __iomem *gp_port[2], *gp_phy[2];
@@ -225,6 +230,54 @@ static struct t6041_sleep *t6041_sleep;
 #include "t6041-apcie-tunables.h"
 /* Each register of the macOS commit-state table, mapped. */
 static void __iomem *t6041_reg_map[ARRAY_SIZE(t6041_macos_regs)];
+
+/*
+ * The full T6041 has eight AMCCs and 32 memory channels, the binned one six and 24, and the
+ * macOS commit table above is from a binned J616c. These are the PS words of the other eight
+ * channels (named from a full J614c's ADT; on the binned part they read target and actual 0),
+ * each with the value macOS has for the same kind of word: an AMCC slice 0x1000030f (AUTO,
+ * auto state 0), a DCS channel 0x1400034f (auto state 4). Left forced on, they keep fab3_soc
+ * (East +0x118) on at the commit. dcs_27 isn't among the words the J614c has on there.
+ */
+static const struct { u8 east; u16 off; u32 val; } t6041_full_ps[15] = {
+	{ 0, 0x248, 0x1000030f },	/* amcc24 */
+	{ 0, 0x250, 0x1400034f },	/* dcs_24 */
+	{ 0, 0x258, 0x1000030f },	/* amcc25 */
+	{ 0, 0x260, 0x1400034f },	/* dcs_25 */
+	{ 0, 0x268, 0x1000030f },	/* amcc26 */
+	{ 0, 0x270, 0x1400034f },	/* dcs_26 */
+	{ 0, 0x280, 0x1000030f },	/* amcc27 */
+	{ 1, 0x2c0, 0x1000030f },	/* amcc28 */
+	{ 1, 0x2c8, 0x1000030f },	/* amcc29 */
+	{ 1, 0x2d0, 0x1000030f },	/* amcc30 */
+	{ 1, 0x2d8, 0x1000030f },	/* amcc31 */
+	{ 1, 0x340, 0x1400034f },	/* dcs_28 */
+	{ 1, 0x348, 0x1400034f },	/* dcs_29 */
+	{ 1, 0x350, 0x1400034f },	/* dcs_30 */
+	{ 1, 0x358, 0x1400034f },	/* dcs_31 */
+};
+
+static void __iomem *t6041_full_reg(struct t6041_sleep *s, unsigned int i)
+{
+	return (t6041_full_ps[i].east ? s->east : s->ps) + t6041_full_ps[i].off;
+}
+
+/* On the full part only: the extra channels' words to their macOS kind, as t6041_ps_match_all(). */
+static void t6041_full_ps_match(struct t6041_sleep *s)
+{
+	const u32 mask = PS_TARGET | PS_AUTO_ENABLE | GENMASK(27, 24);
+	unsigned int i;
+
+	if (s->ngroups != 8)
+		return;
+	for (i = 0; i < ARRAY_SIZE(t6041_full_ps); i++) {
+		void __iomem *reg = t6041_full_reg(s, i);
+		u32 now = readl(reg), mac = t6041_full_ps[i].val;
+
+		if ((now & mask) != (mac & mask))
+			writel((now & ~mask) | (mac & mask), reg);
+	}
+}
 
 /* ADT cpu number: E 0-3, P0 4-8, P1 10-14. */
 static unsigned int t6041_cpu_id(u64 mpidr)
@@ -491,7 +544,7 @@ static void t6041_amcc_quiesce(struct t6041_sleep *s)
 {
 	int p, w;
 
-	for (p = 0; p < 24; p++) {
+	for (p = 0; p < 4 * s->ngroups; p++) {
 		void __iomem *a = s->amcc[p];
 
 		writel(readl(a + 0x0) & ~BIT(25), a + 0x0);
@@ -523,7 +576,7 @@ static void t6041_mcc_macos(struct t6041_sleep *s)
 	unsigned int i, p;
 	u32 v;
 
-	for (i = 0; i < 6; i++) {
+	for (i = 0; i < s->ngroups; i++) {
 		/* +0x1c0000 is the AMCC's all-planes window: macOS writes there, polls per plane. */
 		writel(1, s->amccb[i] + 0x1c082c);
 		writel(1, s->amccb[i] + 0x1c2844);
@@ -532,7 +585,7 @@ static void t6041_mcc_macos(struct t6041_sleep *s)
 						  !(v & BIT(0)), 10, 100000);
 	}
 	dsb(sy);
-	for (i = 0; i < 24; i++)
+	for (i = 0; i < 4 * s->ngroups; i++)
 		writel(readl(s->dcs[i] + 0x20) | 0x1100, s->dcs[i] + 0x20);
 	dsb(sy);
 }
@@ -690,6 +743,7 @@ static int t6041_sleep_commit(unsigned long unused)
 		udelay(100);
 	}
 	udelay(5000);
+	t6041_full_ps_match(s);
 	t6041_ps_match_all();
 	/* As macOS at its commit (dj): every PMC voter at 0, and the PMS word it has at 0. */
 	for (i = 0; i < 4; i++)
@@ -808,7 +862,7 @@ static void t6041_mcc_active(struct t6041_sleep *s)
 	unsigned int i, p;
 	u32 v;
 
-	for (i = 0; i < 6; i++) {
+	for (i = 0; i < s->ngroups; i++) {
 		writel(s->pre_ways[4 * i], s->amccb[i] + 0x1c2800);
 		for (p = 0; p < 4; p++)
 			readl_poll_timeout_atomic(s->amccb[i] + 0x40000 * p + 0x2804, v,
@@ -840,7 +894,7 @@ static void t6041_save(struct t6041_sleep *s)
 {
 	unsigned int i;
 
-	for (i = 0; i < 24; i++) {
+	for (i = 0; i < 4 * s->ngroups; i++) {
 		void __iomem *plane = s->amccb[i / 4] + 0x40000 * (i % 4);
 
 		s->pre_ways[i] = readl(plane + 0x2800);
@@ -853,6 +907,8 @@ static void t6041_save(struct t6041_sleep *s)
 	for (i = 0; i < ARRAY_SIZE(t6041_macos_regs); i++)
 		if (t6041_macos_regs[i].ps)
 			t6041_pre[i] = readl(t6041_reg_map[i]);
+	for (i = 0; i < ARRAY_SIZE(t6041_full_ps) && s->ngroups == 8; i++)
+		s->full_pre[i] = readl(t6041_full_reg(s, i));
 	s->pre_perf[0] = readl(s->perf + 0x0);
 	s->pre_perf[1] = readl(s->perf + 0x400);
 	for (i = 0; i < 4; i++)
@@ -1114,6 +1170,30 @@ static unsigned int t6041_ps_restore(struct t6041_sleep *s)
 	return late;
 }
 
+/* The full part's extra channel words back to their target and AUTO, as t6041_ps_restore(). */
+static unsigned int t6041_full_ps_restore(struct t6041_sleep *s)
+{
+	const u32 keep = ~(u32)(PS_AUTO_ENABLE | PS_FLAGS | PS_TARGET);
+	unsigned int i, late = 0;
+	u32 v;
+
+	for (i = 0; i < ARRAY_SIZE(t6041_full_ps) && s->ngroups == 8; i++) {
+		void __iomem *reg = t6041_full_reg(s, i);
+		u32 pre = s->full_pre[i], cur = readl(reg), pt = pre & PS_TARGET;
+
+		if (pt > (cur & PS_TARGET)) {
+			writel((cur & keep) | pt, reg);
+			if (readl_poll_timeout_atomic(reg, v, FIELD_GET(PS_ACTUAL, v) == pt,
+						      1, 3000))
+				late++;
+			cur = readl(reg);
+		}
+		if (pt == (cur & PS_TARGET) && ((pre ^ cur) & PS_AUTO_ENABLE))
+			writel((cur & ~(PS_AUTO_ENABLE | PS_FLAGS)) | (pre & PS_AUTO_ENABLE), reg);
+	}
+	return late;
+}
+
 static u64 t6041_ret_t0, t6041_ret_t1;
 
 /* Back on the boot core through aura's mailbox: the clusters on, the masks back, WD2 off. */
@@ -1151,6 +1231,8 @@ static void t6041_sleep_return(struct t6041_sleep *s)
 	for (i = 0; i < 9; i++)
 		writel(s->pre_wake[i], s->wake + 0xc + 4 * i);
 	s->ps_late = t6041_ps_restore(s);
+	/* Before t6041_mcc_active() touches their planes. */
+	s->ps_late += t6041_full_ps_restore(s);
 	t6041_mcc_active(s);
 	t6041_aop_wake(s);
 	t6041_gpio_restore(s);
@@ -1293,20 +1375,29 @@ static int t6041_sleep_probe(struct platform_device *pdev)
 	s->wake = devm_ioremap(dev, 0x508004000UL, 0x58);
 	if (!s->wake)
 		return -ENOMEM;
-	/* AMCC error words: 6 groups of 4 planes (amcc0-23), 0x220025000 + 0x2000000 * g + 0x40000 * p. */
-	for (i = 0; i < 24; i++) {
+	/*
+	 * The full part: amcc24's word (+0x248) and amcc28's (East +0x2c0) aren't both target and
+	 * actual 0 as on the binned one, where those channels are fused off.
+	 */
+	if (!s->ps || !s->east)
+		return -ENOMEM;
+	s->ngroups = (readl(s->ps + 0x248) & (PS_TARGET | PS_ACTUAL)) &&
+		     (readl(s->east + 0x2c0) & (PS_TARGET | PS_ACTUAL)) ? 8 : 6;
+	dev_info(dev, "%u memory channels\n", 4 * s->ngroups);
+	/* AMCC error words: groups of 4 planes, 0x220025000 + 0x2000000 * g + 0x40000 * p. */
+	for (i = 0; i < 4 * s->ngroups; i++) {
 		s->amcc[i] = devm_ioremap(dev, 0x220025000UL + 0x2000000UL * (i / 4) +
 					  0x40000UL * (i % 4), 0x40);
 		if (!s->amcc[i])
 			return -ENOMEM;
 	}
-	for (i = 0; i < 24; i++) {
+	for (i = 0; i < 4 * s->ngroups; i++) {
 		s->dcs[i] = devm_ioremap(dev, 0x220200000UL + 0x2000000UL * (i / 4) +
 					 0x200000UL * (i % 4), 0x40);
 		if (!s->dcs[i])
 			return -ENOMEM;
 	}
-	for (i = 0; i < 6; i++) {
+	for (i = 0; i < s->ngroups; i++) {
 		s->amccb[i] = devm_ioremap(dev, 0x220000000UL + 0x2000000UL * i, 0x200000);
 		if (!s->amccb[i])
 			return -ENOMEM;
