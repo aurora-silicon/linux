@@ -522,8 +522,7 @@ static int dwc3_apple_core_reinit(struct dwc3_apple *appledwc, bool phy_down)
 	if (ret)
 		dev_warn(appledwc->dev, "USB3 PHY setup failed after the sleep, USB2 only, err=%d\n",
 			 ret);
-	else if (phy_down && appledwc->usb3_phy &&
-		 of_device_is_compatible(appledwc->dev->of_node, "apple,t6040-dwc3"))
+	else if (phy_down && appledwc->usb3_phy)
 		dwc3_apple_usb3_pipe_reset(appledwc);
 
 	return 0;
