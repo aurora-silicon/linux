@@ -38,8 +38,8 @@ Each assertion is classified as:
 | hibe | HibernationService | Checked at boot, nothing sent (`diag/hibe`); no Linux hibernation writer | Secure hibernation: wrapped image key and resume authorisation | [hibe](hibe.md) |
 | hdcp | AppleSEPHDCPManager | No client | Protected display links | [hdcp](hdcp.md) |
 | pnon | No child visible | No client | Nonce service, inferred from name | [pnon](pnon.md) |
-| skdl | CoreKDLDriver / CoreKDLUserClient | No client | CoreKDL: signed kernel-extension deny-list gating Apple Pay and FairPlay (public `corekdld` manual) | [skdl](skdl.md) |
-| sse | AppleSSE / AppleSSEUserClient | Protocol query once after bring-up (`diag/sse`); no Secure Element operations | Secure Enclave to Secure Element sharing state; nfcd consumer | [sse](sse.md) |
+| skdl | CoreKDLDriver / CoreKDLUserClient | Checked at boot, nothing sent (`diag/skdl`); no receipt or protected-service consumer | CoreKDL: signed kernel-extension deny-list gating Apple Pay and FairPlay (public `corekdld` manual) | [skdl](skdl.md) |
+| sse | AppleSSE / AppleSSEUserClient | Checked at boot, nothing sent (`diag/sse`); events counted | Secure Enclave to Secure Element sharing state; nfcd consumer | [sse](sse.md) |
 | stac | AppleTrustedAccessoryManager / AppleTrustedAccessoryManagerUserClient | No client | Trusted accessories; bluetoothd consumer observed | [stac](stac.md) |
 | scrd | No child visible | Partial credential/context codec | Credential policy and biometric authorization | [scrd](scrd.md) |
 | sks | No child visible | Partial key-store codec | Keybags, enclave keys, storage encryption | [sks](sks.md) |

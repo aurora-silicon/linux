@@ -206,16 +206,13 @@ int sep_sensor_irq_wait(unsigned int timeout_ms);
 #define SEP_DIAG_PNON_FAILED		3
 #define SEP_DIAG_PNON_DIGEST_LEN	48
 
-/* Mirrored by diag.rs (Sse). */
-#define SEP_DIAG_SSE_PENDING		0
-#define SEP_DIAG_SSE_READY		1
-#define SEP_DIAG_SSE_ABSENT		2
-#define SEP_DIAG_SSE_FAILED		3
-
-/* Mirrored by diag.rs (Hibe). */
-#define SEP_DIAG_HIBE_PENDING		0
-#define SEP_DIAG_HIBE_IDLE		1
-#define SEP_DIAG_HIBE_ABSENT		2
+/* Mirrored by diag.rs (Offer): endpoints checked at bring-up, sent nothing. */
+#define SEP_DIAG_OFFER_PENDING		0
+#define SEP_DIAG_OFFER_IDLE		1
+#define SEP_DIAG_OFFER_ABSENT		2
+#define SEP_DIAG_EP_SSE			0x0c
+#define SEP_DIAG_EP_HIBE		0x14
+#define SEP_DIAG_EP_SKDL		0x17
 
 struct device;
 
@@ -245,9 +242,8 @@ void sep_diag_set_os_identity(int source);
 void sep_diag_set_hwrng(bool registered);
 void sep_diag_set_stac(int state);
 void sep_diag_set_pnon(int state, const u8 *digest, size_t len);
-void sep_diag_set_sse(int state, u32 protocol);
+void sep_diag_set_offer(u8 endpoint, int state);
 unsigned int sep_diag_sse_event(void);
-void sep_diag_set_hibe(int state);
 unsigned int sep_diag_xarm_failed(void);
 unsigned int sep_diag_unhandled(void);
 void sep_diag_sleep(bool entering);

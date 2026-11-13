@@ -59,9 +59,8 @@ extern "C" {
     fn sep_diag_set_hwrng(registered: bool);
     fn sep_diag_set_stac(state: c_int);
     fn sep_diag_set_pnon(state: c_int, digest: *const u8, len: usize);
-    fn sep_diag_set_sse(state: c_int, protocol: u32);
+    fn sep_diag_set_offer(endpoint: u8, state: c_int);
     fn sep_diag_sse_event() -> c_uint;
-    fn sep_diag_set_hibe(state: c_int);
     fn sep_diag_xarm_failed() -> c_uint;
     fn sep_diag_unhandled() -> c_uint;
     fn sep_diag_log_summary(dev: *mut c_void);
@@ -353,22 +352,52 @@ pub(crate) fn pnon(state: Pnon, digest: Option<&[u8; crate::pnon::DIGEST_LEN]>) 
     unsafe { sep_diag_set_pnon(state as c_int, ptr, len) };
 }
 
-/// The secure-element sharing protocol query, as `SEP_DIAG_SSE_*` in
-/// `shim.h` spells it.
-#[derive(Clone, Copy)]
-pub(crate) enum Sse {
-    /// The service answered with its protocol word.
-    Ready = 1,
-    /// The enclave does not offer the endpoint as the driver knows it.
-    Absent = 2,
-    /// The query was refused, malformed, unanswered or not sent.
-    Failed = 3,
+/// An endpoint the driver checks at bring-up and sends nothing to, as
+/// `SEP_DIAG_OFFER_*` in `shim.h` spells the reported states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Offer {
+    /// Discovered with its name and the layout the driver knows.
+    Idle,
+    /// Discovered with another name or layout; left alone.
+    Unknown,
+    /// Not discovered.
+    Absent,
 }
 
-/// The outcome of the protocol query, with the word when it answered.
-pub(crate) fn sse(state: Sse, protocol: u32) {
-    // SAFETY: no preconditions; updates two words.
-    unsafe { sep_diag_set_sse(state as c_int, protocol) };
+impl Offer {
+    pub(crate) fn of(present: bool, named: bool, layout_known: bool) -> Offer {
+        match (present, named && layout_known) {
+            (false, _) => Offer::Absent,
+            (true, true) => Offer::Idle,
+            (true, false) => Offer::Unknown,
+        }
+    }
+
+    fn state(self) -> c_int {
+        match self {
+            Offer::Idle => 1,
+            // Reported as absent: the driver does not use it.
+            Offer::Unknown | Offer::Absent => 2,
+        }
+    }
+}
+
+/// The secure-element sharing endpoint at bring-up (see `sse`).
+pub(crate) fn sse(offer: Offer) {
+    // SAFETY: no preconditions; updates one word.
+    unsafe { sep_diag_set_offer(crate::sse::EP_SSE, offer.state()) };
+}
+
+/// The hibernation endpoint at bring-up (see `hibe`).
+pub(crate) fn hibe(offer: Offer) {
+    // SAFETY: no preconditions; updates one word.
+    unsafe { sep_diag_set_offer(crate::hibe::EP_HIBE, offer.state()) };
+}
+
+/// The kernel deny-list endpoint at bring-up (see `skdl`).
+pub(crate) fn skdl(offer: Offer) {
+    // SAFETY: no preconditions; updates one word.
+    unsafe { sep_diag_set_offer(crate::skdl::EP_SKDL, offer.state()) };
 }
 
 /// The secure-element sharing service announced an event. Returns how many
@@ -376,21 +405,6 @@ pub(crate) fn sse(state: Sse, protocol: u32) {
 pub(crate) fn sse_event() -> u32 {
     // SAFETY: no preconditions; updates one word.
     unsafe { sep_diag_sse_event() }
-}
-
-/// The hibernation endpoint at bring-up, as `SEP_DIAG_HIBE_*` in `shim.h`
-/// spells it.
-#[derive(Clone, Copy)]
-pub(crate) enum Hibe {
-    /// Offered as the driver knows it; nothing is sent.
-    Idle = 1,
-    /// The enclave does not offer the endpoint as the driver knows it.
-    Absent = 2,
-}
-
-pub(crate) fn hibe(state: Hibe) {
-    // SAFETY: no preconditions; updates one word.
-    unsafe { sep_diag_set_hibe(state as c_int) };
 }
 
 /// The driver answered an xART request with the failure status. Returns how

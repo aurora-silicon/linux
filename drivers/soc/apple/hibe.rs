@@ -75,25 +75,6 @@ pub(crate) fn split_prepare_reply(bytes: &[u8]) -> Option<Prepared> {
     })
 }
 
-/// What the driver found at bring-up.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Offer {
-    /// Offered with the known layout; nothing is sent.
-    Idle,
-    /// Discovered with another name or layout; left alone.
-    Unknown,
-    /// Not discovered.
-    Absent,
-}
-
-pub(crate) fn offer(present: bool, named: bool, layout: u32) -> Offer {
-    match (present, named && layout == HIBE_LAYOUT) {
-        (false, _) => Offer::Absent,
-        (true, true) => Offer::Idle,
-        (true, false) => Offer::Unknown,
-    }
-}
-
 impl SepData {
     /// Records the discovery messages of the endpoint.
     pub(crate) fn hibe_discovered(&self, f: &Fields) {
@@ -110,22 +91,19 @@ impl SepData {
     /// Reports the endpoint once the bring-up has ended. Sends nothing.
     pub(crate) fn hibe_attach(&self) {
         let layout = self.hibe_layout.load(Relaxed);
-        match offer(
+        let offer = diag::Offer::of(
             self.endpoint_present(EP_HIBE),
             self.hibe_named.load(Relaxed),
-            layout,
-        ) {
-            Offer::Idle => diag::hibe(diag::Hibe::Idle),
-            Offer::Absent => diag::hibe(diag::Hibe::Absent),
-            Offer::Unknown => {
-                dev_dbg!(
-                    self.dev,
-                    "hibe: the endpoint advertises layout {:#010x}; left alone\n",
-                    layout
-                );
-                diag::hibe(diag::Hibe::Absent);
-            }
+            layout == HIBE_LAYOUT,
+        );
+        if offer == diag::Offer::Unknown {
+            dev_dbg!(
+                self.dev,
+                "hibe: the endpoint advertises layout {:#010x}; left alone\n",
+                layout
+            );
         }
+        diag::hibe(offer);
     }
 
     /// Nothing is asked of the service, so nothing it says is expected.
@@ -165,14 +143,17 @@ mod tests {
         });
         assert_eq!(f.param, EP_HIBE);
         assert_eq!(f.ty, DISCOVER_TYPE_CONFIG);
-        assert_eq!(offer(true, true, f.data_lo), Offer::Idle);
+        assert_eq!(
+            diag::Offer::of(true, true, f.data_lo == HIBE_LAYOUT),
+            diag::Offer::Idle
+        );
     }
 
     #[test]
-    fn only_the_known_layout_is_offered() {
-        assert_eq!(offer(false, false, 0), Offer::Absent);
-        assert_eq!(offer(true, false, HIBE_LAYOUT), Offer::Unknown);
-        assert_eq!(offer(true, true, 0x0202_0202), Offer::Unknown);
+    fn only_a_named_endpoint_with_the_known_layout_is_offered() {
+        assert_eq!(diag::Offer::of(false, false, false), diag::Offer::Absent);
+        assert_eq!(diag::Offer::of(true, false, true), diag::Offer::Unknown);
+        assert_eq!(diag::Offer::of(true, true, false), diag::Offer::Unknown);
     }
 
     #[test]
