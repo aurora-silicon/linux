@@ -1183,6 +1183,8 @@ static void ave_6070_gate(struct kunit *test)
 			    &ave_layout_6070_11_1);
 	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(0x25bfd039),
 			    &ave_layout_6070_11_1);
+	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(AVE_FW_TEXT_CRC_T6040_26B123),
+			    &ave_layout_26a428);
 	KUNIT_EXPECT_PTR_EQ(test, ave_layout_for_crc(0), NULL);
 	/* H.264 low delay is qualified; a short command buffer is still refused. */
 	KUNIT_EXPECT_TRUE(test, ave_layout_6070_11_1.encode_ready);
@@ -1474,6 +1476,15 @@ static void ave_t6041_text_boot_word(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, text);
 	KUNIT_EXPECT_EQ(test, off, 0x4224U);
 	KUNIT_EXPECT_EQ(test, ave_t6041.fw_data_size_alt, 0x130000U);
+	KUNIT_ASSERT_EQ(test, ave_t6041.build_count, 3U);
+	KUNIT_EXPECT_EQ(test, ave_t6041.builds[0].text_crc,
+			AVE_FW_TEXT_CRC_T6040_25G83);
+	KUNIT_EXPECT_EQ(test, ave_t6041.builds[1].text_crc,
+			AVE_FW_TEXT_CRC_T6041_25G83);
+	KUNIT_EXPECT_EQ(test, ave_t6041.builds[2].text_size, 0x154000U);
+	KUNIT_EXPECT_EQ(test, ave_t6041.builds[2].data_size, 0x12c000U);
+	KUNIT_EXPECT_EQ(test, ave_t6041.builds[2].text_crc,
+			AVE_FW_TEXT_CRC_T6040_26B123);
 	KUNIT_EXPECT_EQ(test, ave_t6041.text_link_cell, 0U);
 	for (u32 i = 0; i < size; i++)
 		text[i] = i * 7 + 3;

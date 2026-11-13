@@ -362,6 +362,9 @@ static void ave_mctf_refusal(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, cmd);
 	t_mctf_init(test, &t);
 	KUNIT_EXPECT_NULL(test, ave_mctf_layout_for_crc(0x2ce7359e));
+	/* 9013.55.1 needs its own captured MCTF command images. */
+	KUNIT_EXPECT_NULL(test,
+			  ave_mctf_layout_for_crc(AVE_FW_TEXT_CRC_T6040_26B123));
 	KUNIT_EXPECT_NULL(test, ave_mctf_qualified(0x2ce7359e));
 	KUNIT_EXPECT_NULL(test, ave_mctf_qualified(0));
 	KUNIT_ASSERT_NOT_NULL(test, m4);

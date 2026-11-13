@@ -958,8 +958,8 @@ const struct ave_fw_layout *ave_layout_for_crc(u32 crc)
 		return &ave_layout_9003_78_0;
 	if (crc == 0x460c7a7c || crc == 0x25bfd039)
 		return &ave_layout_6070_11_1;
-	/* The macOS 27.0 build for the M5 Pro and Max. */
-	if (crc == AVE_FW_TEXT_CRC_T6050_26A428)
+	/* The macOS 27 command layout, including the M4 Pro 27.2 build. */
+	if (crc == AVE_FW_TEXT_CRC_T6050_26A428 || crc == AVE_FW_TEXT_CRC_T6040_26B123)
 		return &ave_layout_26a428;
 	/*
 	 * The macOS 27.3 beta 1 build speaks the same command layout: H.264
