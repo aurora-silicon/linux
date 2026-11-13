@@ -85,7 +85,8 @@ impl Frontend {
 pub(crate) struct Queue<B: Backend> {
     dev: AsahiDevRef,
     context: Arc<Context>,
-    usage: Arc<crate::usage::Client>,
+    /// This queue's engine time: the union of its overlapping stages, charged to its file.
+    usage: Arc<crate::usage::Lane<Arc<crate::usage::Client>>>,
     backend: Arc<B>,
     render: Option<Scheduler<B>>,
     compute: Option<Scheduler<B>>,
@@ -139,7 +140,7 @@ impl<B: Backend> Queue<B> {
         Ok(Self {
             dev: dev.into(),
             context,
-            usage,
+            usage: Arc::new(crate::usage::Lane::new(usage), GFP_KERNEL)?,
             backend,
             render,
             compute: None,
