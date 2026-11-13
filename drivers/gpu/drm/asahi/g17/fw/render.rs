@@ -1741,13 +1741,14 @@ mod ta_mode_tests {
         variant::{Firmware, Variant, V25F84, V25G83, V26A428},
     };
 
-    fn selected(firmware: &Firmware) -> &'static Variant {
+    fn selected(firmware: &Firmware, os_version: [u32; 3]) -> &'static Variant {
         match firmware {
             Firmware::Fixed(variant) => variant,
-            Firmware::Identified(builds) => {
-                assert_eq!(builds.len(), 1);
-                builds[0].variant
-            }
+            Firmware::Identified(builds) => builds
+                .iter()
+                .find(|build| build.os_version == os_version)
+                .expect("firmware build must be admitted")
+                .variant,
         }
     }
 
@@ -1775,7 +1776,7 @@ mod ta_mode_tests {
     #[test]
     fn policy_is_local_to_the_admitted_t6041_builds() {
         let [f84, g83] = t6041_variants();
-        let pro = selected(&crate::hw::t6040::CONFIG.firmware);
+        let pro = selected(&crate::hw::t6040::CONFIG.firmware, [26, 6, 2]);
         assert_eq!(f84.compute, crate::g17::fw::compute::ComputeProgram::V25F84);
         assert!(f84.split_firmware_area);
         // 25G83 keeps the M4 Pro's queue and compute rules on the M4 Max.
