@@ -434,3 +434,22 @@ config APPLE_T8140_SLEEP
 	transitional
 	help
 	  Transitional config for APPLE_T8140_SLEEP to APPLE_SOC_SLEEP migration.
+
+config APPLE_CAMERA_INDICATOR
+	tristate
+	help
+	  Broker between the display driver that draws the camera-in-use
+	  indicator on the internal panel of Apple silicon machines without
+	  an indicator light on the camera supply, and the camera driver
+	  that asks for it while it streams. Selected by those drivers.
+
+config APPLE_CAMERA_INDICATOR_KUNIT_TEST
+	tristate "KUnit tests for the Apple camera-in-use indicator broker" if !KUNIT_ALL_TESTS
+	depends on KUNIT && APPLE_CAMERA_INDICATOR
+	default KUNIT_ALL_TESTS
+	help
+	  Tests the request, confirmation, timeout and release rules of the
+	  camera-in-use indicator broker with a fake display: a camera gets
+	  the indicator only from a display that confirms it, keeps it until
+	  the last user releases it, and loses it at once when the display
+	  reports a loss. Only useful for kernel developers running KUnit.

@@ -68,3 +68,6 @@ obj-$(CONFIG_APPLE_REGVIEW) += apple-regview.o
 apple-regview-y := regview.o
 
 obj-$(CONFIG_APPLE_AURORA_BOOT_SECURITY) += aurora-boot-security.o
+
+obj-$(CONFIG_APPLE_CAMERA_INDICATOR) += camera-indicator.o
+obj-$(CONFIG_APPLE_CAMERA_INDICATOR_KUNIT_TEST) += camera-indicator-test.o
