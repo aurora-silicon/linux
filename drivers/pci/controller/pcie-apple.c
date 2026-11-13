@@ -103,16 +103,16 @@ MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 #define   PHY_LANE_CFG_REFBUF_OFF	BIT(4)
 #define   PHY_LANE_CFG_REFCLKEN		(BIT(9) | BIT(10))
 #define   PHY_LANE_CFG_REFCLKCGEN	(BIT(30) | BIT(31))
-/* Bit 31 of the pair: the only one a trace of macOS shows cleared, after PERST# is asserted */
+/* Bit 31 of the pair: the only one that is cleared once PERST# is asserted */
 #define   PHY_LANE_CFG_REFCLKCGEN_B31	BIT(31)
 #define PHY_LANE_CTL			0x00004
 #define   PHY_LANE_CTL_CFGACC		BIT(15)
 
 #define PORT_LTSSMCTL			0x00080
 #define   PORT_LTSSMCTL_START		BIT(0)
-/* T6050: a trace of macOS shows 0x11 written here to send PME_Turn_Off */
+/* T6050: writing 0x11 here sends PME_Turn_Off */
 #define PORT_PME_TURN_OFF		0x00088
-/* Reads back 0 within a few reads of the write (the trace reads 0x1, then 0x10) */
+/* Reads back 0 within a few reads of the write (first 0x1, then 0x10) */
 #define   PORT_PME_TURN_OFF_SEND	BIT(0)
 /* Written with bit 0 and still set afterwards; meaning not known */
 #define   PORT_PME_TURN_OFF_BIT4	BIT(4)
@@ -144,7 +144,7 @@ MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
 #define PORT_LINKSTS			0x00208
 #define   PORT_LINKSTS_UP		BIT(0)
 #define   PORT_LINKSTS_BUSY		BIT(2)
-/* In traces of macOS: 0x9b00134d for a port that reached L2, 0x9b001001 for one that did not */
+/* Status word: 0x9b00134d for a port that reached L2, 0x9b001001 for one that did not */
 #define   PORT_LINKSTS_L2		BIT(6)
 #define PORT_LINKCMDSTS			0x00210
 #define PORT_OUTS_NPREQS		0x00284
@@ -412,14 +412,13 @@ static const struct hw_info t8132_pciec_hw = {
 };
 
 /*
- * T6040/T6041 (M4 Pro/Max) PCIe-C is the T8132 block: the platform drives it as
- * the T8132 one and only sets its own
+ * T6040/T6041 (M4 Pro/Max) PCIe-C is the T8132 block with only its own
  * register indices, so the port layout, RID2SID count and tunnel reset
- * registers are those of T8132. Two steps follow the platform rather than the T8132
- * Linux sequence: the port must report RUN before the root-port config
+ * registers are those of T8132. Two steps differ from the T8132 Linux
+ * sequence: the port must report RUN before the root-port config
  * tunables are written, and the tunneled reset acknowledgment is the
- * ACK_PEND bit being set. Like the platform, which disables the port and its
- * clocks before sleep and runs the full enable sequence on wake,
+ * ACK_PEND bit being set. The block needs its port and its clocks
+ * disabled before sleep and the full enable sequence on wake, so
  * hibernation stops the port and cold-starts it again.
  */
 static const struct hw_info t6040_pciec_hw = {
@@ -1370,7 +1369,7 @@ static int apple_pcie_tunnel_cold_init(struct apple_pcie_port *port)
 	/*
 	 * Without an m1n1 handoff, T600x/T602x ports must report RUN before
 	 * the root complex config space is written: writing the RC tunables
-	 * first hard-resets a J416c. The platform waits for RUN there on T6040 too.
+	 * first hard-resets a J416c. T6040 needs the wait for RUN there too.
 	 */
 	if (!pcie->kernel_init || pcie->hw->tunnel_ready_before_rc) {
 		ret = read_poll_timeout_atomic(apple_pcie_port_readl, stat,
@@ -1748,7 +1747,7 @@ static int apple_pcie_tunnel_stop(struct apple_pcie_port *port)
 	apple_pcie_port_rmw_set(port, PORT_TUNCTRL_PERST_ACK_REQ, apple_pcie_port_tunctrl(port));
 	/*
 	 * M1 reports an outstanding acknowledgment until ACK_PEND clears.
-	 * T6040 reports the acknowledgment by setting it, as the platform waits.
+	 * T6040 reports the acknowledgment by setting it.
 	 */
 	ret = read_poll_timeout_atomic(apple_pcie_port_readl, stat,
 				       pcie->kernel_init && !pcie->hw->tunnel_ack_on_set ?
@@ -2400,29 +2399,27 @@ static int apple_pcie_t6050_port_train(struct apple_pcie_port *port)
 #define T6050_PHY_CTRL_LANES		GENMASK(9, 8)
 #define T6050_PHY_CFG			0x4
 /*
- * Set before the PHY-IP tunables. A trace of macOS bringing the port up shows no
- * access to this bit; meaning not known.
+ * Set before the PHY-IP tunables; meaning not known.
  */
 #define T6050_PHY_CFG_BIT0		BIT(0)
 /*
- * Set after the PHY-IP tunables. A trace of macOS shows it set too, after which
- * T6050_PHY_STAT_BIT0 rises (the trace reads 0x10 seven times, then 0x11); meaning
- * not known.
+ * Set after the PHY-IP tunables, after which T6050_PHY_STAT_BIT0 rises (the status
+ * reads 0x10 several times, then 0x11); meaning not known.
  */
 #define T6050_PHY_CFG_BIT4		BIT(4)
 #define T6050_PHY_STAT			0x8
-/* Rises once T6050_PHY_CFG_BIT4 is set; polled by macOS and by m1n1; meaning not known */
+/* Rises once T6050_PHY_CFG_BIT4 is set; m1n1 polls it too; meaning not known */
 #define T6050_PHY_STAT_BIT0		BIT(0)
 /*
- * Set and held once the shared PHY is started in macOS's post-iBoot order (aura's
+ * Set and held once the shared PHY is started after iBoot (aura's
  * T6050 bring-up sets T6050_PHY_CFG_BIT4 and waits for it); meaning not known
  */
 #define T6050_PHY_STAT_BIT4		BIT(4)
 #define T6050_PHYCMN_CLK		0x0
 #define T6050_PHYCMN_CLK_MODE		GENMASK(1, 0)
 /*
- * Written before CORE_RC_CTL_RUN: a trace of macOS shows 0x140 written here, and m1n1
- * writes the same. Neither bit's meaning is known.
+ * Written before CORE_RC_CTL_RUN with 0x140, as m1n1 does. Neither bit's meaning is
+ * known.
  */
 #define CORE_RC_T6050_PRE_RUN		0x54
 #define   CORE_RC_T6050_PRE_RUN_BIT6	BIT(6)
@@ -2509,7 +2506,7 @@ static int apple_pcie_t6050_shared_phy_on(struct apple_pcie *pcie)
 					    T6050_PHY_CTRL_RESET_T8103)) == up)
 		return 0;
 	/*
-	 * A boot loader that started the PHY in macOS's order (it trained another port)
+	 * A boot loader that started the PHY already (it trained another port)
 	 * leaves status bit 4 set and the RC ready: the PHY runs, so it is not restarted
 	 * under that port's link.
 	 */
@@ -2649,7 +2646,7 @@ static int apple_pcie_t6050_cold_train(struct apple_pcie_port *port)
 /*
  * PME_Turn_Off, then wait for L2: the clock gate disabled, the message sent, and the
  * link reported in L2. Both waits are made even when the first fails (the N1 may
- * clear the send bit and never reach L2, as under macOS); the first error is returned.
+ * clear the send bit and never reach L2); the first error is returned.
  */
 static int apple_pcie_t6050_port_l2(struct apple_pcie_port *port)
 {
@@ -4608,7 +4605,7 @@ static int apple_pcie_neo_phy_clocks(void __iomem *phy)
 }
 
 /*
- * The part of the block that ANS shares, from power-off in macOS's order, measured on
+ * The part of the block that ANS shares, from power-off in the order it needs, measured on
  * one sleep. The sleep driver does it at the wake when ANS is bound, and it can't be
  * redone under a running PHY.
  */
@@ -4689,7 +4686,7 @@ static int apple_pcie_neo_cold_init(struct apple_pcie *pcie, struct apple_pcie_p
 	apple_tunable_apply(port->base, cold->port_tunable);
 	rmw_set(PORT_APPCLK_EN, port->base + PORT_APPCLK);
 
-	/* PERST# off before the PHY's clocks, as macOS has it coming from power-off. */
+	/* PERST# off before the PHY's clocks, the order the block needs coming from power-off. */
 	rmw_set(PORT_PERST_OFF, port->base + pcie->hw->port_perst);
 	ret = readl_relaxed_poll_timeout(port->base + PORT_STATUS, stat, stat & PORT_STATUS_READY,
 					 100, NEO_RC_POLL_US);
@@ -6059,7 +6056,7 @@ static int apple_pcie_neo_link_up(struct apple_pcie *pcie, struct apple_pcie_por
 	if (ret)
 		return ret;
 	released = ktime_get();
-	/* macOS starts the training right after PERST#. */
+	/* The training starts right after PERST#. */
 	ret = readl_relaxed_poll_timeout(port->base + PORT_STATUS, stat, stat & PORT_STATUS_READY,
 					 100, 250000);
 	if (ret)
@@ -6236,8 +6233,8 @@ static void apple_pcie_neo_radio_work(struct work_struct *work)
 }
 
 /*
- * The rail is the one thing that brings back a chip whose link won't train: macOS's last resort
- * for a dead chip too. A cold chip then has its firmware loaded by the probe that follows.
+ * The rail is the one thing that brings back a chip whose link won't train, a dead chip
+ * too. A cold chip then has its firmware loaded by the probe that follows.
  */
 static int apple_pcie_neo_rail_cycle(struct apple_pcie *pcie, struct apple_pcie_port *port,
 				     struct pci_dev *root)
@@ -6359,8 +6356,8 @@ out:
 }
 
 /*
- * Before the PCI core restores the functions, which need the link. macOS's host bridge
- * holds them back the same way until its radio port is enabled.
+ * Before the PCI core restores the functions, which need the link. They are held back
+ * until the radio port is enabled.
  */
 static int apple_pcie_neo_resume_noirq(struct apple_pcie *pcie)
 {

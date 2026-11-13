@@ -225,7 +225,7 @@ struct apple_nvme_hw {
 	u32 sleep_epmap_last_mask;
 	/* Higher namespaces are the firmware's, and a Flush to one faults the controller. */
 	u32 sleep_flush_max_nsid;
-	/* CC.SHN for a sleep, as read back from the OS the sleep was traced on. */
+	/* CC.SHN the controller wants for a sleep. */
 	u32 sleep_shn;
 	/* The ANS is never reset through PMGR here, so no reset is named. */
 	bool reset_optional;
@@ -2545,7 +2545,7 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 	/*
 	 * Newer ANS firmware moves the linear submission queue registers into
 	 * the NVMMU block and ends the "nvme" block before them (T6040, and
-	 * T8142 booting the macOS 27.0 stub: 0x10000, ADT ans reg[9]). A
+	 * T8142 with the 27.0 firmware stub: window of 0x10000). A
 	 * window that does not reach the doorbells means that layout.
 	 */
 	anv->lsq_in_nvmmu = anv->hw->lsq_in_nvmmu ||
@@ -2858,20 +2858,20 @@ static void apple_nvme_shutdown(struct platform_device *pdev)
 	}
 }
 
-/* macOS sees the firmware report on 68 ms after HELLO. Each try waits RTKit's timeout again. */
+/* The firmware reports on about 68 ms after HELLO. Each try waits RTKit's timeout again. */
 #define APPLE_NVME_SLEEP_ON_TRIES	15
 
 /*
  * After a real sleep ANS has lost power, and its resident firmware restarts once the run bit
- * is set. Measured on macOS under aura, the same in five runs: HELLO first and unprompted,
+ * is set. Measured under aura, the same in five runs: HELLO first and unprompted,
  * then the endpoint map, the last part answered with endpoint 0x20 only. No endpoint is
  * started and no buffer asked for. About 68 ms later the firmware reports on, and the AP state
  * follows, with the controller's registers reading 0. A refused suspend never told the
  * firmware anything, and takes a reset.
  *
- * The run bit goes in the early phase, so HELLO comes within milliseconds of the wake as on
- * macOS. The wait for on doesn't: macOS rings the SEP a few ms after ANS's HELLO, before ANS
- * reports on, so the reset work waits, after the SEP's own resume has had its turn.
+ * The run bit goes in the early phase, so HELLO comes within milliseconds of the wake. The
+ * wait for on doesn't: the SEP is rung a few ms after ANS's HELLO, before ANS reports on,
+ * so the reset work waits, after the SEP's own resume has had its turn.
  */
 static int apple_nvme_resume_early(struct device *dev)
 {
@@ -2887,7 +2887,7 @@ static int apple_nvme_resume_early(struct device *dev)
 		apple_sleep_coproc_set_ready(dev, false);
 	/* Its link doesn't come up with the pins as the sleep left them. */
 	apple_sleep_restore_pins();
-	/* macOS writes the SART's entries back again right before the run bit. */
+	/* The SART's entries go back in again right before the run bit. */
 	if (anv->sart)
 		apple_sart_replay(anv->sart);
 
@@ -3024,12 +3024,12 @@ static bool apple_nvme_sleep_wanted(struct apple_nvme *anv)
 }
 
 /*
- * As macOS sends it, from its power-state change during the device suspend: the shutdown
- * notification, waited for with interrupts on for as long as macOS allows (35 s). The
- * controller can take seconds to save its context (1.7 s in one macOS sleep). A sleep
- * refused later finds it shut down, and resume's controller reset takes it back.
+ * Sent from the device suspend: the shutdown notification, waited for with interrupts on
+ * for up to 35 s. The controller can take seconds to save its context (1.7 s in one
+ * sleep). A sleep refused later finds it shut down, and resume's controller reset takes it
+ * back.
  */
-#define APPLE_ANS_SLEEP_SHN_MACOS_TIMEOUT_US (35 * USEC_PER_SEC)
+#define APPLE_ANS_SLEEP_SHN_TIMEOUT_US (35 * USEC_PER_SEC)
 
 static int apple_nvme_sleep_send_shn(struct apple_nvme *anv)
 {
@@ -3043,7 +3043,7 @@ static int apple_nvme_sleep_send_shn(struct apple_nvme *anv)
 	writel(anv->ctrl.ctrl_config, anv->mmio_nvme + NVME_REG_CC);
 	ret = readl_poll_timeout(anv->mmio_nvme + NVME_REG_CSTS, csts,
 				 (csts & NVME_CSTS_SHST_MASK) == NVME_CSTS_SHST_CMPLT,
-				 1000, APPLE_ANS_SLEEP_SHN_MACOS_TIMEOUT_US);
+				 1000, APPLE_ANS_SLEEP_SHN_TIMEOUT_US);
 	us = ktime_us_delta(ktime_get(), start);
 	if (ret)
 		dev_err(anv->dev, "shutdown notification failed after %lld ms: CSTS %#x\n",
