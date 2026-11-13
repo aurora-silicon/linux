@@ -4121,7 +4121,7 @@ static const struct apple_sleep_soc t8132_sleep_soc = {
 	.nwake_names = ARRAY_SIZE(t8132_wake_names),
 	.wake_last_word = GENMASK(20, 0),
 };
-#if IS_ENABLED(CONFIG_APPLE_T6040_SLEEP)
+#if APPLE_SLEEP_T6040
 /* T6040 (MacBook Pro J616s): its own sequences, in sleep-t6040.c. */
 static const struct apple_sleep_soc t6040_sleep_soc = {
 	.part = &t6040_sleep_part,
@@ -4135,7 +4135,7 @@ static const struct apple_sleep_soc t6040_sleep_soc = {
 static const struct of_device_id apple_sleep_of_match[] = {
 	{ .compatible = "apple,t8140-sleep", .data = &t8140_sleep_soc },
 	{ .compatible = "apple,t8132-sleep", .data = &t8132_sleep_soc },
-#if IS_ENABLED(CONFIG_APPLE_T6040_SLEEP)
+#if APPLE_SLEEP_T6040
 	{ .compatible = "apple,t6040-sleep", .data = &t6040_sleep_soc },
 #endif
 	{ }

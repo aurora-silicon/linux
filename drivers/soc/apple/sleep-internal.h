@@ -283,7 +283,8 @@ struct apple_sleep_part {
 	unsigned int registry_flags;
 };
 
-/* sleep-t6040.c */
+/* sleep-t6040.c, built where the SMC driver is built in */
+#define APPLE_SLEEP_T6040	IS_BUILTIN(CONFIG_MFD_MACSMC)
 extern const struct apple_sleep_part t6040_sleep_part;
 
 /*

@@ -25,7 +25,7 @@ struct device_node;
 #define APPLE_SLEEP_FIRST_GPU	1
 #define APPLE_SLEEP_FIRST_ORDERS	2
 
-#if IS_ENABLED(CONFIG_APPLE_SLEEP_REGISTRY)
+#if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP)
 /*
  * A coprocessor that can't be stopped until a sleep is certain, and can't be
  * restarted without one. While one is registered and not ready, a suspend is

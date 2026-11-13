@@ -9,7 +9,7 @@
 static const char *const apple_sleep_test_tested[] = {
 	"apple,t8140-sleep",
 	"apple,t8132-sleep",
-#if IS_ENABLED(CONFIG_APPLE_T6040_SLEEP)
+#if APPLE_SLEEP_T6040
 	"apple,t6040-sleep",
 #endif
 };

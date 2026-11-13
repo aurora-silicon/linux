@@ -92,17 +92,13 @@ config APPLE_CLUSTER_PWRGATE
 	  started and PMGR never powered on, such as the boot CPU, only
 	  clock-gates in WFI.
 
-config APPLE_SLEEP_REGISTRY
-	bool
-	depends on ARM64
-
 config APPLE_SOC_SLEEP
 	bool "Apple SoC system sleep at EL2"
 	default APPLE_T8140_SLEEP
 	depends on ARM64 && (ARCH_APPLE || COMPILE_TEST)
 	depends on HOTPLUG_CPU && SUSPEND
-	select APPLE_SLEEP_REGISTRY
 	select APPLE_TUNABLE
+	select MFD_SYSCON if MFD_MACSMC=y
 	help
 	  Powers the secondary CPUs off and suspends the system to RAM on an
 	  Apple SoC whose kernel runs directly at EL2, with no monitor to ask.
@@ -110,9 +106,25 @@ config APPLE_SOC_SLEEP
 	  /chosen/aurora,s2r-mailbox.
 
 	  Only SoCs whose sleep has been measured and tested are supported,
-	  each by its match data: today T8140, T8132, and with
-	  APPLE_T6040_SLEEP the T6040. On every other SoC the driver doesn't
-	  bind, and s2idle stays the only system sleep.
+	  each by its match data: today T8140, T8132, and with MFD_MACSMC
+	  built in the T6040. On every other SoC the driver doesn't bind, and
+	  s2idle stays the only system sleep.
+
+	  The T6040 (M4 Pro) part has its own sequences and refuses first, on
+	  the boards whose device tree enables its sleep controller: its
+	  suspend handler lists every blocker in the live state (EL2, the boot
+	  object's return path, the CPUs that can park, the display power
+	  states that have to be off before a sleep). Unless
+	  t6040_sleep.allow_entry=1 is given and no blocker remains, a request
+	  for suspend-to-RAM prints the blockers and enters nothing, and
+	  suspend-to-idle stays the default sleep. With it the SoC is powered
+	  down to suspend-to-RAM and comes back through the boot object; the
+	  AON watchdog is the net over the whole cycle
+	  (t6040_sleep.sleep_wd_secs at the power-down itself,
+	  t6040_sleep.wd2_secs over a dry run). With t6040_sleep.dry_run=1
+	  every driver's firmware-driven sleep step that can be taken back
+	  runs, the CPUs park and are held, and the sleep is refused at the
+	  commit point and resumed warm.
 
 config APPLE_SOC_SLEEP_KUNIT_TEST
 	bool "KUnit tests for the Apple SoC sleep match data" if !KUNIT_ALL_TESTS
@@ -125,29 +137,6 @@ config APPLE_SOC_SLEEP_KUNIT_TEST
 	  tests touch no hardware.
 
 	  If unsure, say N.
-
-config APPLE_T6040_SLEEP
-	bool "Apple T6040 system sleep"
-	depends on APPLE_SOC_SLEEP
-	depends on MFD_MACSMC=y
-	select MFD_SYSCON
-	help
-	  The T6040 (M4 Pro) part of the Apple SoC sleep driver, on the
-	  boards whose device tree enables its sleep controller. The T6040
-	  has its own sequences and refuses first: its suspend handler lists
-	  every blocker in the live state (EL2, the boot object's return
-	  path, the CPUs that can park, the display power states that have to
-	  be off before a sleep). Unless t6040_sleep.allow_entry=1 is given
-	  and no blocker remains, a request for suspend-to-RAM prints the
-	  blockers and enters nothing, and suspend-to-idle stays the default
-	  sleep. With it the SoC is powered down to suspend-to-RAM and comes
-	  back through the boot object; the AON watchdog is the net over the
-	  whole cycle (t6040_sleep.sleep_wd_secs at the power-down itself,
-	  t6040_sleep.wd2_secs over a dry run).
-
-	  With t6040_sleep.dry_run=1 every driver's firmware-driven sleep
-	  step that can be taken back runs, the CPUs park and are held, and
-	  the sleep is refused at the commit point and resumed warm.
 
 config APPLE_RTKIT
 	tristate "Apple RTKit co-processor IPC protocol"
