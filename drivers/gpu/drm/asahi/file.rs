@@ -384,7 +384,7 @@ pub(crate) struct File {
     params_size: core::sync::atomic::AtomicU64,
     /// The device's statistics, for the GPU frequency in fdinfo.
     stats: Option<Arc<crate::stats::StatsSnapshot>>,
-    /// The queues were drained once for an exiting task.
+    /// An exiting task's close of this file began ([`File::close_on_exit`]).
     drained: AtomicBool,
 }
 
@@ -1419,19 +1419,27 @@ impl File {
         Ok(0)
     }
 
-    /// Waits for the submitted work of every queue of `file`, once, when its task exits.
+    /// Runs once, at the first GEM handle close of an exiting task's file.
     ///
-    /// An exiting or killed client's DRM file closes its GEM handles before the driver sees
-    /// the file go, and closing a handle unmaps the object at once from VMs that do not track
-    /// jobs (G13/G14). Work the client left running would then fault on the unmapped memory
-    /// and time out in the firmware. A live client unmaps only what its work no longer uses.
-    fn drain_queues_on_exit(file: &DrmFile) {
+    /// Handles close through GEM_CLOSE, which an exiting task cannot issue, or when the file is
+    /// released, so an exiting task here is releasing the file.
+    ///
+    /// Such a file closes its GEM handles before the driver sees it go. The client is gone:
+    /// its G17 VMs are marked closed first, as `File::drop` does, so work that fails once an
+    /// object leaves is unobserved teardown. Closing a handle also unmaps the object at
+    /// once from VMs that do not track jobs (G13/G14), where work left running would fault,
+    /// so the queues are drained. A live client unmaps only what its work no longer uses.
+    fn close_on_exit(file: &DrmFile) {
         // SAFETY: `current` is valid for the running task.
         let exiting =
             unsafe { (*kernel::task::Task::current_raw()).flags } & bindings::PF_EXITING != 0;
         if !exiting || file.inner().drained.swap(true, Ordering::AcqRel) {
             return;
         }
+        // M5 VMs keep their mark at file close.
+        Self::mark_clients_closed(file.inner(), |vm| {
+            vm.gpu.as_any().is::<crate::g17::Gpu>() && !vm.vm.is_m5()
+        });
         let mut index = 0;
         loop {
             // Clone since we can't hold the xarray spinlock while waiting.
@@ -1454,8 +1462,26 @@ impl File {
         }
     }
 
+    /// Tells the status of each VM `which` selects that its client is gone: nobody sees the
+    /// failures of the client's remaining work any more.
+    fn mark_clients_closed(this: Pin<&Self>, which: impl Fn(&Vm) -> bool) {
+        let mut index = 0;
+        while let Some((idx, entry)) = this.vms().find(index, usize::MAX) {
+            let vm: &Vm = entry.borrow();
+            if which(vm) {
+                if let Some(status) = vm.vm.status() {
+                    status.mark_client_closed();
+                }
+            }
+            if idx == usize::MAX {
+                break;
+            }
+            index = idx + 1;
+        }
+    }
+
     pub(crate) fn unbind_gem_object(file: &DrmFile, bo: &gem::Object) -> Result {
-        Self::drain_queues_on_exit(file);
+        Self::close_on_exit(file);
         // TODO: use iter()
         let mut index = 0;
         loop {
@@ -1898,15 +1924,6 @@ impl Drop for File {
         // closed its file. Say so before any queue goes, as a VM handle closed first did.
         // SAFETY: `drop` runs on the pinned file in place, and nothing here moves it.
         let this = unsafe { Pin::new_unchecked(&*self) };
-        let mut index = 0;
-        while let Some((idx, vm)) = this.vms().find(index, usize::MAX) {
-            if let Some(status) = vm.borrow().vm.status() {
-                status.mark_client_closed();
-            }
-            if idx == usize::MAX {
-                break;
-            }
-            index = idx + 1;
-        }
+        Self::mark_clients_closed(this, |_| true);
     }
 }
