@@ -238,7 +238,7 @@ static const struct {
 #define PMC_BOOST		0x8
 
 /*
- * The PMU over SPMI (spmi0 = 0x509014000, spmi-a0 = 0x509188000), written as on the T8140.
+ * The PMU over SPMI (spmi = 0x509014000, spmi-a0 = 0x509188000), written as on the T8140.
  * Measured on the J616s: the boot stage is set to 0x50 by an extended write to
  * PMU_BOOT_STAGE, and NOTIFY_ENABLE is 0x2000001 on both controllers' +0x40.
  */
@@ -1967,7 +1967,7 @@ static void t6040_apcie_gp_lower(struct t6040_sleep *s)
  * calls it only when no blocker remains and allow_entry is set. In order: the stopped CPUs
  * released to their last WFI, the ATC complexes and the GP PCIe ports lowered, ANS's storage
  * link quiesced, WD0 off and the AON WD2 net armed, the PMU's boot stage 0x50 and
- * NOTIFY_ENABLE over spmi0/spmi-a0, the steps of the PMGR quiesce (APSC, PLL relock,
+ * NOTIFY_ENABLE over spmi/spmi-a0, the steps of the PMGR quiesce (APSC, PLL relock,
  * TVMs, the AGX gate, the five complexes, the axi2af read-check, the clock quiesce, the
  * keep-alive bits), aura's mailbox armed with the resume entry, the fabrics and the ATC
  * ports readied for the sleep engine, the MasterMini S2R timer (0x508904000 := 1), the AIC
@@ -3062,20 +3062,20 @@ static int t6040_sleep_probe(struct platform_device *pdev)
 		     ARRAY_SIZE(((struct t6040_sleep *)0)->acc_apsc));
 	s->cpu_start = t6040_sleep_map(&pdev->dev, "cpu-start");
 	s->wdt = t6040_sleep_map(&pdev->dev, "wdt");
-	s->cluster_ctl = t6040_sleep_map(&pdev->dev, "cluster-ctl");
-	s->pwrgate = t6040_sleep_map(&pdev->dev, "soc-pwrgate");
+	s->cluster_ctl = t6040_sleep_map(&pdev->dev, "cluster");
+	s->pwrgate = t6040_sleep_map(&pdev->dev, "pwrgate");
 	s->clkgen = t6040_sleep_map(&pdev->dev, "clkgen");
-	s->spmi0 = t6040_sleep_map(&pdev->dev, "spmi0");
+	s->spmi0 = t6040_sleep_map(&pdev->dev, "spmi");
 	s->spmi_a0 = t6040_sleep_map(&pdev->dev, "spmi-a0");
 	s->mastermini = t6040_sleep_map(&pdev->dev, "mastermini");
 	s->soc_east = t6040_sleep_map_min(&pdev->dev, "soc-east", SOC_EAST_SIZE);
 	s->soc_ps = t6040_sleep_map_min(&pdev->dev, "soc-ps", SOC_PS_SIZE);
-	s->aop_global = t6040_sleep_map(&pdev->dev, "aop-global");
+	s->aop_global = t6040_sleep_map(&pdev->dev, "wake");
 	if (!s->cpu_start || !s->wdt || !s->cluster_ctl || !s->pwrgate || !s->clkgen ||
 	    !s->spmi0 || !s->spmi_a0 || !s->mastermini || !s->soc_east || !s->soc_ps ||
 	    !s->aop_global)
 		return dev_err_probe(&pdev->dev, -ENODEV,
-				     "a register block is missing or not mapped (cpu-start %d wdt %d cluster-ctl %d soc-pwrgate %d clkgen %d spmi0 %d spmi-a0 %d mastermini %d soc-east %d soc-ps %d aop-global %d)\n",
+				     "a register block is missing or not mapped (cpu-start %d wdt %d cluster %d pwrgate %d clkgen %d spmi %d spmi-a0 %d mastermini %d soc-east %d soc-ps %d wake %d)\n",
 				     !!s->cpu_start, !!s->wdt, !!s->cluster_ctl, !!s->pwrgate,
 				     !!s->clkgen, !!s->spmi0, !!s->spmi_a0, !!s->mastermini,
 				     !!s->soc_east, !!s->soc_ps, !!s->aop_global);
