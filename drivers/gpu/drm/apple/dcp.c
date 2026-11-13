@@ -6492,8 +6492,14 @@ static const struct component_ops dcp_comp_ops = {
 /* How long probe leaves a converter found powered switched off. */
 #define DCP_HDMI_POWER_OFF_MS	250
 
-/* The first probe has looked at the converter's power (one per machine). */
-static bool dcp_hdmi_power_checked;
+/*
+ * Set once the first probe has looked at the converter's power. Global on
+ * purpose: the converter belongs to the machine, not to a DCP instance, and
+ * struct apple_dcp is allocated again by every probe attempt, so a per-
+ * instance flag would let a deferred probe power-cycle the converter a second
+ * time (250 ms and a log line) after the attempt before had already powered it.
+ */
+static atomic_t dcp_hdmi_power_checked = ATOMIC_INIT(0);
 
 /*
  * Power the DP-to-HDMI converter at probe. Its rails are SMC GPIOs, and the
@@ -6511,8 +6517,7 @@ static int dcp_hdmi_power_up(struct apple_dcp *dcp)
 	bool on = false;
 	int i, ret;
 
-	if (!dcp_hdmi_power_checked) {
-		dcp_hdmi_power_checked = true;
+	if (!atomic_xchg(&dcp_hdmi_power_checked, 1)) {
 		for (i = 0; i < ARRAY_SIZE(rail); i++)
 			if (rail[i] && gpiod_get_value_cansleep(rail[i]) != 0)
 				on = true;
