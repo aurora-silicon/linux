@@ -49,6 +49,33 @@ static const u8 ane_t6050_text_pin_27_0[] = {
 	0xd1, 0xa2, 0x20, 0xd0, 0xee, 0x43, 0x8b, 0x8f,
 };
 
+/* The macOS 27.3 build (26C5035r), as iBoot 20457.60.65 preloads it on a J714s. */
+static const u8 ane_t6050_text_pin_27_3[] = {
+	0x11, 0x55, 0x75, 0x86, 0x4d, 0x4c, 0x8d, 0x02,
+	0xd4, 0x8d, 0x83, 0x07, 0x71, 0x70, 0xe7, 0xe1,
+	0x60, 0x79, 0xaa, 0xf7, 0x0d, 0xad, 0xd6, 0x08,
+	0xc7, 0x19, 0x10, 0xac, 0x66, 0xdc, 0x60, 0x66,
+};
+
+/*
+ * T6050 builds, by their ADT ane0 segment-ranges. 27.3 moved 0x2c000 bytes
+ * from DATA into TEXT; the firmware span (heap tail, pool, IPC) is unchanged.
+ */
+static const struct ane_fw_preload_build ane_t6050_builds[] = {
+	{
+		.name = "27.0",
+		.dva = { 0x10000000000, 0x100000c0000 },
+		.size = { 0xc0000, 0x2ac000 },
+		.text_pin = ane_t6050_text_pin_27_0,
+	},
+	{
+		.name = "27.3",
+		.dva = { 0x10000000000, 0x100000ec000 },
+		.size = { 0xec000, 0x280000 },
+		.text_pin = ane_t6050_text_pin_27_3,
+	},
+};
+
 const struct ane_fw_platform ane_h16_platform = {
 	.h16_profiles = ane_h16_profiles,
 	.h16_profile_count = ARRAY_SIZE(ane_h16_profiles),
@@ -175,6 +202,8 @@ const struct ane_fw_platform ane_t6050_platform = {
 	.dart_revision = 0x204,
 	.dapf_count = 5,
 	.text_pin = ane_t6050_text_pin_27_0,
+	.preload_builds = ane_t6050_builds,
+	.preload_build_count = ARRAY_SIZE(ane_t6050_builds),
 };
 
 /*
