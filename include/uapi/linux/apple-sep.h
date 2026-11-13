@@ -295,8 +295,8 @@ struct sep_bio_rearm {
  * The enclave enforces the conjunction from the key's list. Such a key is
  * used only through SEP_KEY_SIGN_PASSWORD / SEP_KEY_UNSEAL_PASSWORD, which
  * then also wait for a Touch ID match; the enclave checks the password into
- * the matched context before the one operation (EACCES when it refuses the
- * password). SEP_KEY_SIGN and SEP_KEY_UNSEAL refuse it with EINVAL before
+ * the matched context before the one operation (ENOKEY when it refuses the
+ * password; EACCES still means the finger did not match). SEP_KEY_SIGN and SEP_KEY_UNSEAL refuse it with EINVAL before
  * asking for a touch. SEP_KEY_CREATE_DEVICE_PASSCODE alone and the OR form
  * stay reserved (EOPNOTSUPP); any other combination is EINVAL.
  *

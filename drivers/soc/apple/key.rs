@@ -55,7 +55,9 @@
 //! only from one context holding both a match it saw and the bag's password
 //! credential. `SIGN_PASSWORD` / `UNSEAL_PASSWORD` on such a key wait for
 //! the match, have the enclave verify the password into that same context,
-//! then run the one operation; `SIGN` / `UNSEAL` refuse it before a touch.
+//! then run the one operation (`ENOKEY` when the enclave refuses the
+//! password; `EACCES` stays a finger that did not match); `SIGN` / `UNSEAL`
+//! refuse it before a touch.
 //!
 //! macOS's `.userPresence` (Touch ID or the password) and `.devicePasscode`
 //! need a passcode credential the enclave checks against the user's own
@@ -1184,7 +1186,7 @@ pub(crate) struct KeyTouch {
     /// lives under, verified by the enclave into the matched context right
     /// before the one operation. Taken (and wiped) at its first use.
     passcode: Option<Passcode>,
-    /// The enclave refused that password (it counted the attempt).
+    /// The enclave refused that password (it counted the attempt): `ENOKEY`.
     passcode_refused: bool,
 }
 
@@ -1788,7 +1790,7 @@ impl SepData {
                 dev_info_refusal!(self.dev, "sep-key: AND key: the password was refused by the enclave (status {})\n", verify);
                 if let Some(job) = &mut *self.key_touch.lock() {
                     job.passcode_refused = true;
-                    job.settle(GrantEnd::Done(Err(EACCES)), verify);
+                    job.settle(GrantEnd::Done(Err(ENOKEY)), verify);
                 }
                 return;
             }
@@ -1968,8 +1970,9 @@ impl SepData {
         self.key_touch_cancel.store(false, Relaxed);
         // Whatever is left of the grant goes with the job.
         let job = self.key_touch.lock().take().ok_or(EIO)?;
+        // ENOKEY, not EACCES: EACCES already means the touch did not match.
         if job.passcode_refused {
-            return Err(EACCES);
+            return Err(ENOKEY);
         }
         dev_dbg!(
             self.dev,
