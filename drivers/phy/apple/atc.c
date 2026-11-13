@@ -4393,12 +4393,22 @@ static void atcphy_restore_after_pd_off(struct apple_atcphy *atcphy)
 			atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
 		}
 		dev_dbg(atcphy->dev,
-			"power domain was off, restoring mode %d: PIPE mux=%08x lock=%08x/%08x aon=%08x nonsel=%08x\n",
+			"power domain was off, restoring mode %d: PIPE mux=%08x lock=%08x/%08x aon=%08x nonsel=%08x usb2 sig=%08x\n",
 			mode, readl(atcphy->regs.pipehandler + PIPEHANDLER_MUX_CTRL),
 			readl(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ),
 			readl(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_ACK),
 			readl(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN),
-			readl(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE));
+			readl(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE),
+			readl(atcphy->regs.usb2phy + USB2PHY_SIG));
+		/*
+		 * A USB2 PHY behind a fixed hub may have lost its registers with the
+		 * domain, and the host role with them. Put the role back before the
+		 * mode below powers the PHY on, as probe and atcphy_common_restore()
+		 * do: set later, on the running PHY, it doesn't take effect and the
+		 * hub never connects to the controller's USB2 root port.
+		 */
+		if (atcphy->fixed_usb2)
+			set32(atcphy->regs.usb2phy + USB2PHY_SIG, atcphy_usb2_sig_host(atcphy));
 	}
 
 	if (mode == APPLE_ATCPHY_MODE_OFF)
