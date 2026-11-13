@@ -388,11 +388,37 @@ struct apple_sleep_domains {
 	u32 apcie_phy_sw;
 };
 
+struct apple_sleep;
+
+/*
+ * The steps whose operations differ between SoCs, not only their values: SoCs park their
+ * clocks, stop their memory, lower their fabric and arm the cores' deep WFI each their own
+ * way. The refusals, the coprocessor stops, macOS's power words, the mailbox and the commit
+ * word are shared, and run around these.
+ */
+struct apple_sleep_ops {
+	/* What makes a core's last WFI end in a reset, after its timers are masked */
+	void (*deep_wfi_arm)(void);
+	/*
+	 * The commit, from the still-on polls to the mailbox: the SoC, memory and clusters
+	 * down. It calls sleep_ps_save() once the power words are as the wake will find them.
+	 * It can't fail, can't print, and has the engine's 33 ms to the last WFI.
+	 */
+	void (*last_mile)(struct apple_sleep *s);
+	/* Back on the boot core with the AIC restored: clusters, gates and words back up */
+	void (*wake)(struct apple_sleep *s);
+	/* Every interrupt line masked before the last WFI, one that ended it acked, restored */
+	void (*aic_mask_all)(void);
+	u32 (*aic_ack)(void);
+	void (*aic_restore)(void);
+};
+
 /*
  * What differs between SoCs. Power words are offsets in "ps", or in "ps-aon" where named
  * so, and the lists keep the order macOS was measured with.
  */
 struct apple_sleep_soc {
+	const struct apple_sleep_ops *ops;
 	struct apple_sleep_domains ps;
 	/*
 	 * In "cluster": each CPU cluster's word, E first. The commit writes them off in this
@@ -1096,12 +1122,17 @@ static u32 sleep_cpu_start_bit(u64 mpidr)
 		   sleep_cpu_core(mpidr));
 }
 
+static void t8140_deep_wfi_arm(void)
+{
+	sysreg_clear_set_s(SYS_APL_DEEP_SLEEP, 0, DEEP_SLEEP_ENABLE);
+}
+
 static void sleep_deep_wfi_arm(void)
 {
 	/* A timer left running ends the WFI, and costs power until reset. */
 	write_sysreg(ARCH_TIMER_CTRL_IT_MASK, cntp_ctl_el0);
 	write_sysreg(ARCH_TIMER_CTRL_IT_MASK, cntv_ctl_el0);
-	sysreg_clear_set_s(SYS_APL_DEEP_SLEEP, 0, DEEP_SLEEP_ENABLE);
+	apple_sleep->soc->ops->deep_wfi_arm();
 }
 
 /* A core's last instructions: nothing brings it back but a reset. */
@@ -2746,7 +2777,7 @@ static void __noreturn sleep_boot_wfi(struct apple_sleep *s)
 		dsb(sy);
 		isb();
 		wfi();
-		aic_sleep_ack();
+		s->soc->ops->aic_ack();
 		write_sysreg_s(IPI_SR_PENDING, SYS_APL_IPI_SR_EL1);
 	}
 }
@@ -2775,9 +2806,6 @@ static void apple_sleep_wait_still_on(struct apple_sleep *s)
 static int apple_sleep_commit(unsigned long unused)
 {
 	struct apple_sleep *s = apple_sleep;
-	const struct apple_sleep_soc *soc = s->soc;
-	int plane, agent, i;
-	u32 val;
 
 	/*
 	 * The other cores stop first, as on macOS. Each answered the hold in .enter, and they
@@ -2795,6 +2823,34 @@ static int apple_sleep_commit(unsigned long unused)
 		s->deep_once = true;
 		sleep_slp_ddr_set_deep_once(true);
 	}
+
+	s->soc->ops->last_mile(s);
+
+	/* aura reads this with the MMU off. */
+	s->resumes_before = READ_ONCE(s->mbox->resumes);
+	WRITE_ONCE(s->mbox->resume_pa, __pa_symbol(cpu_resume));
+	dcache_clean_poc((unsigned long)s->mbox, (unsigned long)(s->mbox + 1));
+	dsb(sy);
+
+	writel(1, s->commit);
+
+	/* As on macOS: a raised line would end the last WFI, and the engine waits for it. */
+	s->soc->ops->aic_mask_all();
+
+	/* Each core's deep WFI comes after the commit, this one last. No SPMI from here on. */
+	spin_table_release_stopped();
+	sleep_boot_wfi(s);
+}
+
+/*
+ * T8140, in macOS's order: SoC and DCS states down, MCC lanes stopped, the CPM gates, PTD
+ * and voters, the clusters off, the clock muxes parked, CLLT and DVFM, AMCC errors masked.
+ */
+static void t8140_last_mile(struct apple_sleep *s)
+{
+	const struct apple_sleep_soc *soc = s->soc;
+	int plane, agent, i;
+	u32 val;
 
 	/* The SoC comes down before memory does, as on macOS. */
 	if (sleep_perf_wait(s->clk_perf + CLK_PERF_SOC, SOC_SLEEP_STATE)) {
@@ -2851,27 +2907,11 @@ static int apple_sleep_commit(unsigned long unused)
 		writel(readl(amcc + AMCC_WORD1_ENABLE) & ~AMCC_WORD1_UNEXP_RT_HIT,
 		       amcc + AMCC_WORD1_ENABLE);
 	}
-
-	/* aura reads this with the MMU off. */
-	s->resumes_before = READ_ONCE(s->mbox->resumes);
-	WRITE_ONCE(s->mbox->resume_pa, __pa_symbol(cpu_resume));
-	dcache_clean_poc((unsigned long)s->mbox, (unsigned long)(s->mbox + 1));
-	dsb(sy);
-
-	writel(1, s->commit);
-
-	/* As on macOS: a raised line would end the last WFI, and the engine waits for it. */
-	aic_sleep_mask_all();
-
-	/* Each core's deep WFI comes after the commit, this one last. No SPMI from here on. */
-	spin_table_release_stopped();
-	sleep_boot_wfi(s);
 }
 
 /* Back on the boot core through the reset vector, MMU on, in macOS's order. */
 static void apple_sleep_return(struct apple_sleep *s)
 {
-	u32 val;
 	int i;
 
 	/*
@@ -2885,7 +2925,23 @@ static void apple_sleep_return(struct apple_sleep *s)
 	write_sysreg_s(s->siq_cfg, SYS_APL_SIQ_CFG_EL1);
 
 	spin_table_stop_finished();
-	aic_sleep_restore();
+	s->soc->ops->aic_restore();
+
+	s->soc->ops->wake(s);
+
+	dcache_inval_poc((unsigned long)s->mbox, (unsigned long)(s->mbox + 1));
+	s->resumes_after = READ_ONCE(s->mbox->resumes);
+
+	for (i = 0; i < s->soc->wake_words; i++)
+		s->wake_status[i] = readl(s->wake + s->soc->wake_status + i * 4);
+	s->returned = true;
+}
+
+/* T8140, in macOS's order: E then the other clusters, the gates, the words, the complex. */
+static void t8140_wake(struct apple_sleep *s)
+{
+	u32 val;
+	int i;
 
 	/* The E cluster first, as macOS does, then the others. */
 	writel(CLUSTER_ON, s->cluster + s->soc->cluster_cpu[0]);
@@ -2929,13 +2985,6 @@ static void apple_sleep_return(struct apple_sleep *s)
 		s->pcie_ans_on_ret = apple_sleep_raise_apcie(s);
 	s->apcie_port_down = true;
 	s->pins_lost = s->pins_saved_valid;
-
-	dcache_inval_poc((unsigned long)s->mbox, (unsigned long)(s->mbox + 1));
-	s->resumes_after = READ_ONCE(s->mbox->resumes);
-
-	for (i = 0; i < s->soc->wake_words; i++)
-		s->wake_status[i] = readl(s->wake + s->soc->wake_status + i * 4);
-	s->returned = true;
 }
 
 static int apple_sleep_enter(suspend_state_t state)
@@ -3894,7 +3943,17 @@ static const struct apple_sleep_wake_name t8140_wake_names[] = {
 	{ 231, "AOP2.TrustedOutboxNotEmpty" }, { 236, "AOP2.CPUWakeupAP" },
 };
 
+static const struct apple_sleep_ops t8140_sleep_ops = {
+	.deep_wfi_arm = t8140_deep_wfi_arm,
+	.last_mile = t8140_last_mile,
+	.wake = t8140_wake,
+	.aic_mask_all = aic_sleep_mask_all,
+	.aic_ack = aic_sleep_ack,
+	.aic_restore = aic_sleep_restore,
+};
+
 static const struct apple_sleep_soc t8140_sleep_soc = {
+	.ops = &t8140_sleep_ops,
 	/* E, P */
 	.cluster_cpu = { 0x0, 0x4 },
 	.ncluster_cpu = 2,

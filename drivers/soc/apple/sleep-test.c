@@ -104,6 +104,25 @@ static void apple_sleep_test_words(struct kunit *test)
 	}
 }
 
+/* Every matched SoC brings its own operations for each SoC-specific step. */
+static void apple_sleep_test_ops(struct kunit *test)
+{
+	const struct of_device_id *id;
+
+	for (id = apple_sleep_of_match; id->compatible[0]; id++) {
+		const struct apple_sleep_soc *soc = id->data;
+		const struct apple_sleep_ops *ops = soc->ops;
+
+		KUNIT_ASSERT_NOT_NULL_MSG(test, ops, "%s has no operations", id->compatible);
+		KUNIT_EXPECT_NOT_NULL(test, ops->deep_wfi_arm);
+		KUNIT_EXPECT_NOT_NULL(test, ops->last_mile);
+		KUNIT_EXPECT_NOT_NULL(test, ops->wake);
+		KUNIT_EXPECT_NOT_NULL(test, ops->aic_mask_all);
+		KUNIT_EXPECT_NOT_NULL(test, ops->aic_ack);
+		KUNIT_EXPECT_NOT_NULL(test, ops->aic_restore);
+	}
+}
+
 /* The books keep one bit for each stray word and one gate for each coprocessor. */
 static void apple_sleep_test_books(struct kunit *test)
 {
@@ -167,6 +186,7 @@ static void apple_sleep_test_layout(struct kunit *test)
 static struct kunit_case apple_sleep_test_cases[] = {
 	KUNIT_CASE(apple_sleep_test_layout),
 	KUNIT_CASE(apple_sleep_test_only_tested),
+	KUNIT_CASE(apple_sleep_test_ops),
 	KUNIT_CASE(apple_sleep_test_words),
 	KUNIT_CASE(apple_sleep_test_books),
 	KUNIT_CASE(apple_sleep_test_wake_names),
