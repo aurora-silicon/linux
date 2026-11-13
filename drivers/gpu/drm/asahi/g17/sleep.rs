@@ -48,6 +48,7 @@ unsafe extern "C" {
     ) -> *mut core::ffi::c_void;
     fn asahi_g17_commit_finish(commit: *mut core::ffi::c_void, saved: *mut u32) -> bool;
     fn asahi_g17_commit_required() -> bool;
+    fn asahi_g17_commit_stop() -> bool;
 }
 
 /// What `.complete` does after a sleep whose stop was left to the commit.
@@ -182,6 +183,12 @@ impl Hardware for Firmware {
     }
 
     fn gating(&mut self, enable: bool) -> Result {
+        // A target without the bridge (the M5): its core gating, written once at probe, is
+        // lost when a real sleep powers the domain off. Written again before the run bit, as
+        // macOS does after its wake.
+        if enable && !self.bridge.enabled {
+            return self.bridge.regs.enable_g17_gating();
+        }
         self.bridge.set_gating(enable)
     }
 
@@ -579,7 +586,9 @@ impl Shared {
 impl super::Gpu {
     /// Called before any device suspends. Only a sleep that powers the SoC down gets here.
     pub(crate) fn sleep_prepare(&self) -> Result {
-        if !self.cfg.sleep_restart {
+        // SAFETY: Reads the sleep driver's state: true where the commit stops the firmware.
+        let commit_stop = unsafe { asahi_g17_commit_stop() };
+        if !self.cfg.sleep_restart && !commit_stop {
             dev_warn!(
                 self.shared.dev.as_ref(),
                 "no firmware restart on this chip, refusing sleep\n"

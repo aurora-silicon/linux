@@ -16,6 +16,7 @@ struct asahi_g17_commit *asahi_g17_commit_prepare(struct device *dev,
 						  struct apple_mbox *secondary_mbox, bool bridge);
 bool asahi_g17_commit_finish(struct asahi_g17_commit *c, u32 *saved);
 bool asahi_g17_commit_required(void);
+bool asahi_g17_commit_stop(void);
 int asahi_g17_power_auto_off(struct device *dev, u32 *saved);
 int asahi_g17_power_lower(struct device *dev);
 int asahi_g17_power_raise(struct device *dev, u32 saved);
