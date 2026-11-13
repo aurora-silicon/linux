@@ -459,12 +459,13 @@ static bool afk_compact_capable(struct apple_dcp_afkep *ep)
 {
 	/*
 	 * An adopted J713 external DCP runs compact EPIC on its auxiliary
-	 * endpoints too, and the J700 (H17P) external processor on its audio
-	 * endpoint, as the desktop 26.x one does.
+	 * endpoints too, and the J700 (H17P) and firmware 27 external
+	 * processors on their audio endpoint, as the desktop 26.x one does.
 	 */
 	return ep->dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
 	       (ep->dcp->fw_compat == DCP_FIRMWARE_M4 && ep->dcp->afk_alloc) ||
-	       (ep->dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL &&
+	       ((ep->dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL ||
+		 dcp_is_v27_external(ep->dcp)) &&
 		ep->endpoint == AV_AUDIO_ENDPOINT_DESKTOP);
 }
 
