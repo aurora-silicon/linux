@@ -8,6 +8,8 @@
 #include <linux/ieee80211.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
+#include <linux/of.h>
+#include <linux/of_net.h>
 #include <linux/seq_file.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
@@ -101,6 +103,7 @@ struct centauri_wifi {
 	struct work_struct connect_work;
 	struct delayed_work link_work;
 	struct cfg80211_scan_request *scan_request;
+	bool scan_abort;
 	struct mutex lock;
 	/* The logger has its own coherent allocation. Reads/acknowledgements
 	 * must remain possible while scan/connect hold the command mutex.
@@ -812,6 +815,35 @@ static int radio_start(struct centauri_wifi *wifi)
 	return 0;
 }
 
+/* The station's RSN element (body) with PSK as its only AKM, written to selected; returns its size. */
+static int select_rsn(const u8 *body, size_t size, u8 *selected)
+{
+	size_t offset, tail;
+	u16 count;
+	unsigned int i;
+
+	if (size < 8 || get_unaligned_le16(body) != 1)
+		return -EINVAL;
+	count = get_unaligned_le16(body + 6);
+	offset = 8 + 4 * count;
+	if (!count || offset + 2 > size)
+		return -EINVAL;
+	count = get_unaligned_le16(body + offset);
+	tail = offset + 2 + 4 * count;
+	if (!count || tail > size)
+		return -EINVAL;
+	for (i = 0; i < count; i++)
+		if (get_unaligned_be32(body + offset + 2 + 4 * i) == WLAN_AKM_SUITE_PSK)
+			break;
+	if (i == count)
+		return -EOPNOTSUPP;
+	memcpy(selected, body, offset);
+	put_unaligned_le16(1, selected + offset);
+	put_unaligned_be32(WLAN_AKM_SUITE_PSK, selected + offset + 2);
+	memcpy(selected + offset + 6, body + tail, size - tail);
+	return offset + 6 + size - tail;
+}
+
 static void append_tlv(u8 *payload, size_t *size, u16 tag, const void *data, u16 length);
 
 /* Dwell times in ms for the scan request. The macOS 27 scan adapter copies
@@ -882,6 +914,12 @@ static void scan_worker(struct work_struct *work)
 			drain(wifi);
 			if (readl(wifi->a.bar + 8) != 2) {
 				ret = -EIO;
+				break;
+			}
+			if (READ_ONCE(wifi->scan_abort)) {
+				if (!stopped)
+					command(wifi, 65537, NULL, 0);
+				ret = -ECANCELED;
 				break;
 			}
 			if (!stopped && wifi->channels_seen - channels >= 8) {
@@ -979,16 +1017,44 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 	u8 *payload = wifi->connect_payload;
 	size_t size = 130, rsn_size;
 	u16 caps = 0;
-	int ret = 0, offset;
+	int ret = 0, offset, i;
 
+	/*
+	 * wpa_supplicant without SME lists every AKM the network allows
+	 * (NetworkManager's "WPA-PSK WPA-PSK-SHA256" gives PSK and PSK-SHA256).
+	 * Accept any list that offers PSK and send the firmware PSK alone, as
+	 * the T6050 driver does (select_rsn).
+	 */
+	for (i = 0; i < params->crypto.n_akm_suites; i++)
+		if (params->crypto.akm_suites[i] == WLAN_AKM_SUITE_PSK)
+			break;
 	if (!params->ssid_len || params->ssid_len > 32 || !params->crypto.psk ||
-	    params->crypto.n_akm_suites != 1 || params->crypto.akm_suites[0] != WLAN_AKM_SUITE_PSK ||
+	    i == params->crypto.n_akm_suites ||
 	    params->crypto.n_ciphers_pairwise != 1 || params->crypto.ciphers_pairwise[0] != WLAN_CIPHER_SUITE_CCMP ||
-	    params->crypto.cipher_group != WLAN_CIPHER_SUITE_CCMP || params->ie_len > sizeof(wifi->request_ie))
+	    params->crypto.cipher_group != WLAN_CIPHER_SUITE_CCMP || params->ie_len > sizeof(wifi->request_ie)) {
+		dev_info(&wifi->control->pdev->dev,
+			 "connect refused: ssid_len=%zu psk=%d akms=%d [%08x %08x] pairwise=%d [%08x] group=%08x ie_len=%zu\n",
+			 params->ssid_len, !!params->crypto.psk, params->crypto.n_akm_suites,
+			 params->crypto.n_akm_suites > 0 ? params->crypto.akm_suites[0] : 0,
+			 params->crypto.n_akm_suites > 1 ? params->crypto.akm_suites[1] : 0,
+			 params->crypto.n_ciphers_pairwise,
+			 params->crypto.n_ciphers_pairwise ? params->crypto.ciphers_pairwise[0] : 0,
+			 params->crypto.cipher_group, params->ie_len);
 		return -EOPNOTSUPP;
+	}
 	rsn = cfg80211_find_ie(WLAN_EID_RSN, params->ie, params->ie_len);
-	if (!rsn || rsn_caps_offset(rsn + 2, rsn[1]) < 0)
+	if (!rsn) {
+		dev_info(&wifi->control->pdev->dev, "connect refused: no RSN element in the request\n");
 		return -EINVAL;
+	}
+	ret = select_rsn(rsn + 2, rsn[1], rsn_body);
+	if (ret < 0 || rsn_caps_offset(rsn_body, ret) < 0) {
+		dev_info(&wifi->control->pdev->dev, "connect refused: RSN element %*ph not usable (%d)\n",
+			 rsn[1] + 2, rsn, ret);
+		return ret < 0 ? ret : -EINVAL;
+	}
+	rsn_size = ret;
+	ret = 0;
 	mutex_lock(&wifi->lock);
 	if (!wifi->configured || wifi->connecting || wifi->connected || wifi->scan_request) {
 		ret = -EBUSY;
@@ -1012,8 +1078,6 @@ static int wifi_connect(struct wiphy *wiphy, struct net_device *netdev,
 			caps = get_unaligned_le16(ap_rsn + 2 + offset);
 	}
 	rcu_read_unlock();
-	rsn_size = rsn[1];
-	memcpy(rsn_body, rsn + 2, rsn_size);
 	offset = rsn_caps_offset(rsn_body, rsn_size);
 	put_unaligned_le16(caps, rsn_body + offset);
 	pmf = !!(caps & BIT(7));
@@ -1375,6 +1439,26 @@ static int wifi_get_channel(struct wiphy *wiphy, struct wireless_dev *wdev,
 	return ret;
 }
 
+/*
+ * The factory address, which the loader copies from ADT /chosen
+ * mac-address-wifi0 into the wifi0 alias target's local-mac-address (as on
+ * T6050). A board without that node, or a loader that left the placeholder,
+ * keeps the old per-boot random address.
+ */
+static void centauri_wifi_set_address(struct net_device *netdev)
+{
+	struct device_node *np = of_find_node_by_path("wifi0");
+	u8 addr[ETH_ALEN];
+	int ret = np ? of_get_mac_address(np, addr) : -ENODEV;
+
+	of_node_put(np);
+	if (!ret && is_valid_ether_addr(addr)) {
+		eth_hw_addr_set(netdev, addr);
+		return;
+	}
+	eth_hw_addr_random(netdev);
+}
+
 static const struct cfg80211_ops wifi_ops = {
 	.scan = wifi_scan,
 	.connect = wifi_connect,
@@ -1397,6 +1481,14 @@ static int net_stop(struct net_device *netdev)
 
 	netif_stop_queue(netdev);
 	skb_queue_purge(&wifi->data_tx_queue);
+	/*
+	 * Finish a running scan before cfg80211's NETDEV_DOWN. Otherwise
+	 * cfg80211 completes it as driver-owned and stale, keeps its scan
+	 * message, and refuses every later scan with -EBUSY.
+	 */
+	WRITE_ONCE(wifi->scan_abort, true);
+	flush_work(&wifi->scan_work);
+	WRITE_ONCE(wifi->scan_abort, false);
 	return 0;
 }
 
@@ -2388,7 +2480,7 @@ int centauri_wifi_register(struct centauri *c)
 	SET_NETDEV_DEV(wifi->netdev, &c->pdev->dev);
 	strscpy(wifi->netdev->name, "wlan%d", IFNAMSIZ);
 	wifi->netdev->max_mtu = ETH_DATA_LEN;
-	eth_hw_addr_random(wifi->netdev);
+	centauri_wifi_set_address(wifi->netdev);
 	ret = register_netdev(wifi->netdev);
 	if (ret)
 		goto failed;

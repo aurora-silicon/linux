@@ -108,11 +108,17 @@ static struct {
 
 	atomic_t os_identity;
 	atomic_t hwrng;
+	atomic_t stac;
+	atomic_t stac_onlines;
+	atomic_t pnon;
 	atomic_t xarm_failures;
 	atomic_t unhandled;
 	atomic_t sleeps;
 	atomic_t sleeping;
 } sep_diag;
+
+/* Written once per probe, before pnon reads SEP_DIAG_PNON_READ. */
+static u8 sep_diag_pnon_digest[SEP_DIAG_PNON_DIGEST_LEN];
 
 static unsigned int sep_diag_sensor(void)
 {
@@ -534,6 +540,73 @@ static ssize_t hwrng_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(hwrng);
 
+static ssize_t stac_show(struct device *dev, struct device_attribute *attr,
+			 char *buf)
+{
+	const char *state;
+
+	switch (atomic_read(&sep_diag.stac)) {
+	case SEP_DIAG_STAC_ONLINE:
+		state = "online";
+		break;
+	case SEP_DIAG_STAC_ABSENT:
+		state = "absent";
+		break;
+	case SEP_DIAG_STAC_FAILED:
+		state = "failed";
+		break;
+	default:
+		state = "pending";
+		break;
+	}
+	return sysfs_emit(buf, "%s\n", state);
+}
+static DEVICE_ATTR_RO(stac);
+
+static ssize_t stac_onlines_show(struct device *dev,
+				 struct device_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "%u\n",
+			  (unsigned int)atomic_read(&sep_diag.stac_onlines));
+}
+static DEVICE_ATTR_RO(stac_onlines);
+
+static ssize_t pnon_show(struct device *dev, struct device_attribute *attr,
+			 char *buf)
+{
+	const char *state;
+
+	switch (atomic_read(&sep_diag.pnon)) {
+	case SEP_DIAG_PNON_READ:
+		state = "read";
+		break;
+	case SEP_DIAG_PNON_ABSENT:
+		state = "absent";
+		break;
+	case SEP_DIAG_PNON_FAILED:
+		state = "failed";
+		break;
+	default:
+		state = "pending";
+		break;
+	}
+	return sysfs_emit(buf, "%s\n", state);
+}
+static DEVICE_ATTR_RO(pnon);
+
+/* Root only: it identifies the machine's boot policy. */
+static ssize_t local_policy_digest_show(struct device *dev,
+					struct device_attribute *attr, char *buf)
+{
+	if (atomic_read(&sep_diag.pnon) != SEP_DIAG_PNON_READ)
+		return sysfs_emit(buf, "unavailable\n");
+	/* Pairs with the smp_wmb() in sep_diag_set_pnon(). */
+	smp_rmb();
+	return sysfs_emit(buf, "%*phN\n", SEP_DIAG_PNON_DIGEST_LEN,
+			  sep_diag_pnon_digest);
+}
+static DEVICE_ATTR_ADMIN_RO(local_policy_digest);
+
 static ssize_t xarm_failures_show(struct device *dev,
 				  struct device_attribute *attr, char *buf)
 {
@@ -589,6 +662,10 @@ static struct attribute *sep_diag_attrs[] = {
 	&dev_attr_endpoint_names.attr,
 	&dev_attr_os_identity.attr,
 	&dev_attr_hwrng.attr,
+	&dev_attr_stac.attr,
+	&dev_attr_stac_onlines.attr,
+	&dev_attr_pnon.attr,
+	&dev_attr_local_policy_digest.attr,
 	&dev_attr_xarm_failures.attr,
 	&dev_attr_unhandled_messages.attr,
 	&dev_attr_sleeps.attr,
@@ -648,6 +725,27 @@ void sep_diag_set_hwrng(bool registered)
 {
 	atomic_set(&sep_diag.hwrng, registered ? SEP_DIAG_HWRNG_REGISTERED :
 						 SEP_DIAG_HWRNG_FAILED);
+}
+
+void sep_diag_set_stac(int state)
+{
+	if (state == SEP_DIAG_STAC_ONLINE)
+		atomic_inc(&sep_diag.stac_onlines);
+	atomic_set(&sep_diag.stac, state);
+}
+
+void sep_diag_set_pnon(int state, const u8 *digest, size_t len)
+{
+	if (state == SEP_DIAG_PNON_READ) {
+		/* Never rewrite a digest a reader may be copying. */
+		if (!digest || len != SEP_DIAG_PNON_DIGEST_LEN ||
+		    atomic_read(&sep_diag.pnon) == SEP_DIAG_PNON_READ)
+			return;
+		memcpy(sep_diag_pnon_digest, digest, len);
+		/* The digest is visible before the state says it is there. */
+		smp_wmb();
+	}
+	atomic_set(&sep_diag.pnon, state);
 }
 
 unsigned int sep_diag_xarm_failed(void)

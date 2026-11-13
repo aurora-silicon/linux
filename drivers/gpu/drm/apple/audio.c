@@ -128,6 +128,8 @@ struct dcp_audio {
 	/* It holds a PM reference: its removal failed, see dcpaud_silence_stop() */
 	bool idle_pm;
 #endif
+	/* Runtime PM was enabled at bind, see dcpaud_hold_link_locked() */
+	bool rpm_enabled;
 };
 
 /* Native external audio service (DRM_APPLE_DCP_T6030_AUDIO only). */
@@ -263,6 +265,35 @@ static void dcpaud_consult_elements(struct dcp_audio *dcpaud,
 	dev_dbg(dcpaud->dev, "elements out: %llx %x %x\n", hits->formats, hits->nchans, hits->rates);
 }
 
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+/*
+ * Firmware 27's external role takes the stream's format as its link data,
+ * not the element's ElementData: macOS 27 links stereo 24-bit 48 kHz on
+ * the M5 Pro as (1, 2, 24, 48000). @sieve is the selected element's: one
+ * channel count, sample format and rate.
+ */
+static void dcpaud_link_format(struct dcp_audio *dcpaud,
+			       const struct dcp_sound_format_mask *sieve)
+{
+	struct dcp_audio_link_format *f = (void *)&dcpaud->selected_cookie;
+	int width = snd_pcm_format_width((__force snd_pcm_format_t)__ffs64(sieve->formats));
+
+	if (!dcp_audiosrv_link_by_format(dcpaud->dcp_dev) || !sieve->formats ||
+	    !sieve->nchans || !sieve->rates || width < 0)
+		return;
+	memset(&dcpaud->selected_cookie, 0, sizeof(dcpaud->selected_cookie));
+	f->format = cpu_to_le32(1);
+	f->channels = cpu_to_le32(__ffs(sieve->nchans));
+	f->sample_size = cpu_to_le32(width);
+	f->rate = cpu_to_le32(snd_pcm_known_rates.list[__ffs(sieve->rates)]);
+}
+#else
+static void dcpaud_link_format(struct dcp_audio *dcpaud,
+			       const struct dcp_sound_format_mask *sieve)
+{
+}
+#endif
+
 static int dcpaud_select_cookie(struct dcp_audio *dcpaud,
 				 struct snd_pcm_hw_params *params)
 {
@@ -276,10 +307,14 @@ static int dcpaud_select_cookie(struct dcp_audio *dcpaud,
 		.v14_7_audio = dcpaud->native_link,
 #endif
 	};
+	int ret;
 
 	dcpaud_fill_fmt_sieve(params, &sieve);
-	return parse_sound_mode(&elements, &sieve, &dcpaud->selected_chmap,
-				&dcpaud->selected_cookie);
+	ret = parse_sound_mode(&elements, &sieve, &dcpaud->selected_chmap,
+			       &dcpaud->selected_cookie);
+	if (ret > 0)
+		dcpaud_link_format(dcpaud, &sieve);
+	return ret;
 }
 
 static int dcpaud_rule_channels(struct snd_pcm_hw_params *params,
@@ -1013,6 +1048,11 @@ static void dcpaud_link_teardown(struct dcp_audio *dcpaud)
 	live = (dcpaud->link_prepared || dcpaud->link_started) &&
 	       dcp_audiosrv_link_live(dcpaud->dcp_dev);
 	if (dcpaud->link_started && live) {
+		/* Firmware 27, as macOS: the link's state as the stream stops. */
+		ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_QUERY,
+					&dcpaud->link_cookie);
+		if (ret && ret != -ENODEV)
+			dev_err(dcpaud->dev, "audio link query failed: %d\n", ret);
 		/* As macOS: the stopping notification, then STOP, same link data. */
 		ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_WILL_STOP,
 					&dcpaud->link_cookie);
@@ -1174,21 +1214,26 @@ static int dcp_pcm_native_start(struct snd_pcm_substream *substream, int cmd)
 
 	if (!dcpaud->link_prepared)
 		return -EBADFD;
-	if (dcpaud->link_started)
-		return 0;
-	ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_START,
-				&dcpaud->link_cookie);
-	if (ret)
-		return ret;
-	/* As macOS: START, then the started notification with the same link data. */
-	ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_DID_START,
-				&dcpaud->link_cookie);
-	if (ret) {
-		dev_err(dcpaud->dev, "audio link did-start failed: %d\n", ret);
-		dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_STOP, &dcpaud->link_cookie);
-		return ret;
+	if (!dcpaud->link_started) {
+		ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_START,
+					&dcpaud->link_cookie);
+		if (ret)
+			return ret;
+		/* As macOS: START, then the started notification with the same link data. */
+		ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_DID_START,
+					&dcpaud->link_cookie);
+		if (ret) {
+			dev_err(dcpaud->dev, "audio link did-start failed: %d\n", ret);
+			dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_STOP,
+					  &dcpaud->link_cookie);
+			return ret;
+		}
+		dcpaud->link_started = true;
 	}
-	dcpaud->link_started = true;
+	/* Firmware 27, as macOS: the link's state as the stream starts. */
+	ret = dcp_audiosrv_link(dcpaud->dcp_dev, DCP_AUDIO_LINK_QUERY, &dcpaud->link_cookie);
+	if (ret)
+		dev_err(dcpaud->dev, "audio link query failed: %d\n", ret);
 	return 0;
 }
 
@@ -1302,10 +1347,15 @@ static int dcpaud_select_default_cookie(struct dcp_audio *dcpaud)
 	for (i = 0; i < ARRAY_SIZE(rates); i++)
 		for (j = 0; j < snd_pcm_known_rates.count; j++)
 			if (snd_pcm_known_rates.list[j] == rates[i] && (hits.rates & BIT(j))) {
+				int ret;
+
 				sieve.rates = BIT(j);
 				elements.pos = 0;
-				return parse_sound_mode(&elements, &sieve, &dcpaud->selected_chmap,
-							&dcpaud->selected_cookie);
+				ret = parse_sound_mode(&elements, &sieve, &dcpaud->selected_chmap,
+						       &dcpaud->selected_cookie);
+				if (ret > 0)
+					dcpaud_link_format(dcpaud, &sieve);
+				return ret;
 			}
 	return 0;
 }
@@ -1326,9 +1376,16 @@ static int dcpaud_hold_link_locked(struct dcp_audio *dcpaud)
 	lockdep_assert_held(&dcpaud->link_lock);
 	if (!dcpaud->chan || !dcpaud->silence)
 		return -ENODEV;
-	if (pm_runtime_get_sync(dcpaud->dev) < 0 && pm_runtime_enabled(dcpaud->dev)) {
+	/*
+	 * The SIO channel feeds the DisplayPort audio block, in this device's
+	 * power domain: no link without it powered. Runtime PM enabled at bind
+	 * and off now is a system sleep in progress, where the device cannot be
+	 * resumed; the display holds the link again at its next mode set.
+	 */
+	ret = pm_runtime_get_sync(dcpaud->dev);
+	if (ret < 0 && (pm_runtime_enabled(dcpaud->dev) || dcpaud->rpm_enabled)) {
 		pm_runtime_put_noidle(dcpaud->dev);
-		return -EIO;
+		return ret == -EACCES ? -EAGAIN : -EIO;
 	}
 	ret = dmaengine_slave_config(dcpaud->chan, &slave_config);
 	if (!ret)
@@ -1804,6 +1861,7 @@ static int dcpaud_comp_bind(struct device *dev, struct device *main, void *data)
 	ret = devm_pm_runtime_enable(dev);
 	if (ret)
 		return dev_err_probe(dev, ret, "Failed to enable runtime PM: %d\n", ret);
+	dcpaud->rpm_enabled = true;
 
 	/* find linked DCP instance */
 	endpoint = of_graph_get_endpoint_by_regs(dev->of_node, 0, 0);
@@ -2010,13 +2068,22 @@ static __maybe_unused int dcpaud_pm_prepare(struct device *dev)
 static __maybe_unused int dcpaud_system_suspend(struct device *dev)
 {
 	dcpaud_sleep_quiesce(dev_get_drvdata(dev));
-
-	return pm_runtime_force_suspend(dev);
+	return 0;
 }
 
+/*
+ * Runtime PM stops in the late phase and comes back in the early one, so it
+ * works through every device's .suspend and .resume. The display resumes
+ * before this device and holds its link again in its own resume, before
+ * the mode set (dcpaud_before_modeset()): the link's PM reference must
+ * power this device's domain then. A sleep entered with no link held finds
+ * the device idle, and pm_runtime_force_resume() leaves it suspended, so
+ * nothing else powers the domain.
+ */
 static const struct dev_pm_ops dcpaud_pm_ops = {
 	.prepare = pm_sleep_ptr(dcpaud_pm_prepare),
-	SYSTEM_SLEEP_PM_OPS(dcpaud_system_suspend, pm_runtime_force_resume)
+	SYSTEM_SLEEP_PM_OPS(dcpaud_system_suspend, NULL)
+	LATE_SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
 	RUNTIME_PM_OPS(dcpaud_suspend, dcpaud_resume, NULL)
 };
 

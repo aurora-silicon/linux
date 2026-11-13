@@ -108,8 +108,20 @@ enum {
 	AV_AUDIO_ENDPOINT_DESKTOP = 0x2b,
 	DPTX_ENDPOINT = 0x2a,
 	DPTX_ENDPOINT_V2 = 0x2c,
-	HDCP_ENDPOINT = 0x2b,
+	/*
+	 * Compact desktop/M4 firmware: the panel processor advertises
+	 * dcpav-video-interface-epic on 0x2b, the external ones the audio
+	 * service (AV_AUDIO_ENDPOINT_DESKTOP).  Nothing HDCP lives here.
+	 */
+	AV_VIDEO_ENDPOINT = 0x2b,
+	/*
+	 * 0x2d is the remote allocator for the IOMFB firmware (H17P, 27.0
+	 * internal), which must be started before IOMFB.  Compact desktop/M4
+	 * firmware advertises dcpdptx-hdcp-interface on it instead, one per
+	 * processor (disp0, dispext0, dispext1).  Bind HDCP by service name.
+	 */
 	REMOTE_ALLOC_ENDPOINT = 0x2d,
+	DPTX_HDCP_ENDPOINT = 0x2d,
 	IOMFB_ENDPOINT = 0x37,
 };
 
@@ -1158,6 +1170,15 @@ static inline bool dcp_fw_is_14_7(const struct apple_dcp *dcp)
 static inline bool dcp_is_v14_7_external(const struct apple_dcp *dcp)
 {
 	return dcp->fw_compat == DCP_FIRMWARE_V_14_7 && dcp->external_native;
+}
+
+/*
+ * Firmware 27's external processors (the T6050 DCPEXTs): their DP/HDMI
+ * audio service is the desktop one, on endpoint 0x2b (see av.c).
+ */
+static inline bool dcp_is_v27_external(const struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_27_0 && dcp->hw.num_dptx_ports;
 }
 
 /* The 14.7 internal panel (J514S/J516S), presented through DCPLink. */

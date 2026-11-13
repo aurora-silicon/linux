@@ -196,16 +196,16 @@ MODULE_PARM_DESC(legacy_query,
  * its state machine, the DARTs kept powered), read them all back off and
  * cold-boot. 0: keep the instance quarantined until reboot.
  */
-static unsigned int hung_stop = 1;
-module_param(hung_stop, uint, 0644);
+unsigned int ane_t6021_hung_stop = 1;
+module_param_named(hung_stop, ane_t6021_hung_stop, uint, 0644);
 MODULE_PARM_DESC(hung_stop,
-		 "After a hung job leaves the ANE CPU busy: 1 power it off through its power domains and cold-boot (default), 0 keep it quarantined until reboot.");
+		 "After a hung job (T8112: ANE CPU left busy; H16: session quarantined): 1 power the ANE off through its power domains and cold-boot (default), 0 keep it quarantined until reboot.");
 
 /* How long a busy CPU may take to stop by itself before it is powered off. */
-static unsigned int hung_settle_ms = 100;
-module_param(hung_settle_ms, uint, 0644);
+unsigned int ane_t6021_hung_settle_ms = 100;
+module_param_named(hung_settle_ms, ane_t6021_hung_settle_ms, uint, 0644);
 MODULE_PARM_DESC(hung_settle_ms,
-		 "Extra wait for STOPPED after a hung job before the power-off (ms, default 100, max 60000).");
+		 "Extra wait after a hung job before the power-off (T8112: for STOPPED; H16: after RUN clear) (ms, default 100, max 60000).");
 
 /* 0 (default) skips RTKit in legacy mode, so the ANE mailbox never
  * starts: the 13.5 firmware sends no HELLO (-ETIME after
@@ -3315,7 +3315,7 @@ static int ane_rtclient_rs_contain(void *ctx)
 	u32 status;
 	int ret;
 
-	if (!hung_stop || !rs->unplanned)
+	if (!ane_t6021_hung_stop || !rs->unplanned)
 		return -EOPNOTSUPP;
 	ret = ane_rtclient_engine_accessible(ane);
 	if (ret)
@@ -3323,7 +3323,7 @@ static int ane_rtclient_rs_contain(void *ctx)
 	ret = readl_poll_timeout(ane->engine + ANE_ASC_CPU_STATUS, status,
 				 (status & ANE_ASC_CPU_STATUS_STOPPED) &&
 				 !(status & ANE_ASC_CPU_STATUS_RUNNING),
-				 1000, min(hung_settle_ms, 60000U) * 1000ULL);
+				 1000, min(ane_t6021_hung_settle_ms, 60000U) * 1000ULL);
 	if (!ret) {
 		dev_info(ane->dev, "restart: ASC stopped late (CPU_STATUS %#x)\n",
 			 status);
@@ -3661,7 +3661,7 @@ static int ane_rtclient_sleep_stop(void *ctx)
 	/* A quarantined instance (its recovery failed) cannot shut down;
 	 * with hung_stop its busy core goes off with the sleep instead.
 	 */
-	if ((!planned && !hung_stop) || ane->sleep_restart)
+	if ((!planned && !ane_t6021_hung_stop) || ane->sleep_restart)
 		return -EBUSY;
 	rs = kzalloc_obj(*rs);
 	if (!rs)
@@ -3782,7 +3782,7 @@ static int ane_rtclient_sleep_park(void *ctx)
 	/* A busy core (RUN clear, never STOPPED) is contained by the same
 	 * domain power-off the sleep performs anyway.
 	 */
-	if (ret == -ETIMEDOUT && hung_stop && !(readl(ctl) & ANE_ASC_CPU_CONTROL_RUN)) {
+	if (ret == -ETIMEDOUT && ane_t6021_hung_stop && !(readl(ctl) & ANE_ASC_CPU_CONTROL_RUN)) {
 		ane_rtclient_log_ps(ane, "suspend while unavailable: busy ASC");
 		dev_info(ane->dev,
 			 "suspend while unavailable: ASC busy (CPU_STATUS %#x); its domains go off with the sleep\n",

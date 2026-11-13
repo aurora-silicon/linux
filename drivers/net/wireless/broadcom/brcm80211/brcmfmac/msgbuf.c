@@ -302,6 +302,7 @@ struct brcmf_msgbuf {
 	u32 reqid;
 	wait_queue_head_t ioctl_resp_wait;
 	bool ctl_completed;
+	u32 ctl_stalls;
 
 	struct brcmf_msgbuf_pktids *tx_pktids;
 	struct brcmf_msgbuf_pktids *rx_pktids;
@@ -575,14 +576,20 @@ static int brcmf_msgbuf_query_dcmd_len(struct brcmf_pub *drvr, int ifidx,
 		*ret_len = 0;
 	msgbuf->ctl_completed = false;
 	err = brcmf_msgbuf_tx_ioctl(drvr, ifidx, cmd, buf, len);
-	if (err)
+	if (err) {
+		/* A full control ring means the dongle stopped consuming it. */
+		if (err == -ENOMEM)
+			brcmf_bus_ctl_stall(drvr->bus_if, ++msgbuf->ctl_stalls);
 		return err;
+	}
 
 	timeout = brcmf_msgbuf_ioctl_resp_wait(msgbuf);
 	if (!timeout) {
 		bphy_err(drvr, "Timeout on response for query command\n");
+		brcmf_bus_ctl_stall(drvr->bus_if, ++msgbuf->ctl_stalls);
 		return -EIO;
 	}
+	msgbuf->ctl_stalls = 0;
 
 	skb = brcmf_msgbuf_get_pktid(msgbuf->drvr->bus_if->dev,
 				     msgbuf->rx_pktids,

@@ -193,6 +193,19 @@ int sep_sensor_irq_wait(unsigned int timeout_ms);
 #define SEP_DIAG_HWRNG_REGISTERED	1
 #define SEP_DIAG_HWRNG_FAILED		2
 
+/* Mirrored by diag.rs (Stac). */
+#define SEP_DIAG_STAC_PENDING		0
+#define SEP_DIAG_STAC_ONLINE		1
+#define SEP_DIAG_STAC_ABSENT		2
+#define SEP_DIAG_STAC_FAILED		3
+
+/* Mirrored by diag.rs (Pnon). */
+#define SEP_DIAG_PNON_PENDING		0
+#define SEP_DIAG_PNON_READ		1
+#define SEP_DIAG_PNON_ABSENT		2
+#define SEP_DIAG_PNON_FAILED		3
+#define SEP_DIAG_PNON_DIGEST_LEN	48
+
 struct device;
 
 int sep_diag_register(struct device *dev, const char *profile,
@@ -219,6 +232,8 @@ void sep_diag_bringup_ended(void);
 void sep_diag_set_endpoint(u8 id, u32 name);
 void sep_diag_set_os_identity(int source);
 void sep_diag_set_hwrng(bool registered);
+void sep_diag_set_stac(int state);
+void sep_diag_set_pnon(int state, const u8 *digest, size_t len);
 unsigned int sep_diag_xarm_failed(void);
 unsigned int sep_diag_unhandled(void);
 void sep_diag_sleep(bool entering);

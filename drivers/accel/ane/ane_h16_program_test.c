@@ -77,6 +77,9 @@ struct prog_fw {
 	/* EXECUTE of a program or process this firmware never created fails. */
 	bool strict;
 	unsigned int replay_failed;
+	/* ops->hung calls and the error of the last one. */
+	unsigned int hung;
+	int hung_error;
 };
 
 static u64 fw_load(void *ctx, const void *p)
@@ -386,6 +389,23 @@ static const struct ane_h16_session_ops fw_session_ops = {
 	.log = fw_log,
 	.busy = fw_busy,
 	.sync = fw_sync,
+};
+
+static void fw_hung(void *ctx, int error)
+{
+	struct prog_fw *f = ctx;
+
+	f->hung++;
+	f->hung_error = error;
+}
+
+/* As fw_session_ops, with a backend that recovers a quarantined session. */
+static const struct ane_h16_session_ops fw_session_ops_hung = {
+	.map = fw_map,
+	.log = fw_log,
+	.busy = fw_busy,
+	.sync = fw_sync,
+	.hung = fw_hung,
 };
 
 static struct prog_fw *fw_create_family(struct kunit *test, unsigned int family)
@@ -2726,7 +2746,68 @@ static void program_pipeline_sleep_test(struct kunit *test)
 	ane_h16_session_sleep(&f->s, false);
 }
 
+/*
+ * A hung request quarantines the session and tells the backend once. A
+ * program closed while quarantined is kept, memory and all, until the
+ * backend booted a new firmware (ane_h16_session_recovered()), which ends
+ * the quarantine and gives that memory back; an open program is replayed and
+ * runs again behind its handle.
+ */
+static void program_hung_recovery_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL, *q = NULL;
+	struct mutex *lock = kunit_kzalloc(test, sizeof(*lock), GFP_KERNEL);
+	unsigned int replayed, spares;
+	u64 first;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, lock);
+	mutex_init(lock);
+	f->s.ops = &fw_session_ops_hung;
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &q), 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+
+	f->mode = FW_REPORT_STALL;
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, q), -ETIMEDOUT);
+	KUNIT_EXPECT_TRUE(test, f->s.quarantined);
+	KUNIT_EXPECT_EQ(test, f->hung, 1U);
+	KUNIT_EXPECT_EQ(test, f->hung_error, -ETIMEDOUT);
+	/* Later failures while quarantined do not ask again. */
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), -EIO);
+	KUNIT_EXPECT_EQ(test, f->hung, 1U);
+
+	/* Closed while quarantined: kept on the held list, not released. */
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, q), -EIO);
+	KUNIT_EXPECT_FALSE(test, q->released);
+	KUNIT_EXPECT_FALSE(test, list_empty(&f->s.held));
+	spares = f->s.spare_count;
+
+	/* The backend powered the engine off and booted a new firmware. */
+	f->s.lock = lock;
+	ane_h16_session_sleep(&f->s, true);
+	fw_cold_boot(f);
+	f->mode = FW_OK;
+	ane_h16_session_restart(&f->s);
+	ane_h16_session_recovered(&f->s);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+	KUNIT_EXPECT_FALSE(test, f->s.pending.quarantined);
+	KUNIT_EXPECT_TRUE(test, list_empty(&f->s.held));
+	KUNIT_EXPECT_GT(test, f->s.spare_count, spares);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_replay(&f->s, &replayed, &first), 0);
+	KUNIT_EXPECT_EQ(test, replayed, 1U);
+	ane_h16_session_sleep(&f->s, false);
+
+	KUNIT_EXPECT_FALSE(test, ane_h16_program_lost(&f->s, p));
+	KUNIT_EXPECT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, f->hung, 1U);
+	ane_h16_session_put(&f->s, p);
+}
+
 static struct kunit_case program_cases[] = {
+	KUNIT_CASE(program_hung_recovery_test),
 	KUNIT_CASE(program_pipeline_out_of_order_test),
 	KUNIT_CASE(program_pipeline_same_program_test),
 	KUNIT_CASE(program_pipeline_bound_test),

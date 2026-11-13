@@ -468,7 +468,7 @@ pub(crate) const T6041: PlatformProfile = PlatformProfile {
 /// 0x3356) on spi2 at `0x505108000`, 8 MHz, chip select 0. That is J616s's
 /// SEP, so T6040's profile with this sensor bus.
 pub(crate) const T6050: PlatformProfile = PlatformProfile {
-    name: "T6050/J714s",
+    name: "T6050/J714s, K116s",
     sensor: SensorProfile {
         controller_base: 0x5_0510_8000,
         ..T6040.sensor
@@ -703,7 +703,7 @@ fn select(
     if has(b"apple,t6041") && (has(b"apple,j616c") || has(b"apple,j614c")) {
         return Ok(&T6041);
     }
-    if has(b"apple,t6050") && has(b"apple,j714s") {
+    if has(b"apple,t6050") && (has(b"apple,j714s") || has(b"apple,k116s")) {
         return Ok(&T6050);
     }
     // Only the M4 MacBook Airs: the other T8132 Macs are unread.
@@ -820,6 +820,7 @@ mod tests {
         assert_eq!(picked(&[b"apple,t6041"]), None);
         assert_eq!(picked(&[b"apple,j713", b"apple,t6041"]), None);
         assert_eq!(picked(&[b"apple,j714s", b"apple,t6050"]), Some(T6050.name));
+        assert_eq!(picked(&[b"apple,k116s", b"apple,t6050"]), Some(T6050.name));
         assert_eq!(picked(&[b"apple,t6050"]), None);
     }
 

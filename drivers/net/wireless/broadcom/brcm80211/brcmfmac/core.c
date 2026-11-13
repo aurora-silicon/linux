@@ -1332,12 +1332,14 @@ static int brcmf_revinfo_read(struct seq_file *s, void *data)
  * Serialize arming from debugfs reset and brcmf_fw_crashed() against
  * teardown.  The remove path sets ->removing and drains the work while
  * holding bus_reset_lock, so a racing armer is either drained or skips it.
+ * The reset runs on a freezable workqueue so that it never overlaps a system
+ * sleep transition: one armed while devices suspend runs after the resume.
  */
 static void brcmf_bus_schedule_reset(struct brcmf_bus *bus_if)
 {
 	mutex_lock(&bus_if->bus_reset_lock);
 	if (bus_if->drvr && bus_if->drvr->bus_reset.func && !bus_if->removing)
-		schedule_work(&bus_if->drvr->bus_reset);
+		queue_work(system_freezable_wq, &bus_if->drvr->bus_reset);
 	mutex_unlock(&bus_if->bus_reset_lock);
 }
 

@@ -89,12 +89,16 @@ const struct ave_variant ave_t8112 = {
 /*
  * The M4 Pro (T6040 in the ADT, apple,t6041 in the DT) starts its encoder
  * like the A18 Pro: same coprocessor registers and boot sequence, its own
- * device ID and type.
+ * device ID and type. The M4 Max (J575c) runs its first encoder, ADT ave0
+ * with soc-id t6040, the same way; iBoot 25G83 preloads it with a 0x130000
+ * DATA and sets a word at TEXT 0x4224 differently on every boot.
  */
-static const struct ave_variant ave_t6041 = {
+const struct ave_variant ave_t6041 = {
 	.regs = &ave_coproc_v40,
 	.fw_text_size = 0x14c000,
 	.fw_data_size = 0x12c000,
+	.fw_data_size_alt = 0x130000,
+	.text_boot_word = 0x4224,
 	.boot_device_id = 27,
 	.boot_arg_value = AVE_COPROC_BOOT_ARG_VALUE,
 	.timebase_multiplier = 1,
@@ -123,12 +127,25 @@ static const struct ave_variant ave_t8140 = {
  * The M5 Pro and Max (T6050) run the macOS 27.0 (26A428) firmware build, preloaded with TEXT
  * 0x154000 and DATA 0x134000 (ADT ave0 segment-ranges). macOS starts the coprocessor as on the
  * A18 Pro, after clearing the SVE idle word at mailbox +0x118. Its boot configuration names
- * device 28, and so does its handshake's device type.
+ * device 28, and so does its handshake's device type. The macOS 27.3 beta 1 build is admitted
+ * beside it.
  */
+static const struct ave_fw_build ave_t6050_builds[] = {
+	{ "26A428", 0x154000, 0x134000, AVE_FW_TEXT_CRC_T6050_26A428 },
+	/*
+	 * macOS 27.3 beta 1 (iBoot 20457.60.65): TEXT is 0x4000 larger, DATA
+	 * keeps its size. It starts as 26A428 does and takes 26A428's command
+	 * layout (ave_layout_for_crc()).
+	 */
+	{ "26C5035", 0x158000, 0x134000, AVE_FW_TEXT_CRC_T6050_26C5035 },
+};
+
 static const struct ave_variant ave_t6050 = {
 	.regs = &ave_coproc_v40,
 	.fw_text_size = 0x154000,
 	.fw_data_size = 0x134000,
+	.builds = ave_t6050_builds,
+	.build_count = ARRAY_SIZE(ave_t6050_builds),
 	.boot_device_id = 28,
 	.boot_arg_value = AVE_COPROC_BOOT_ARG_VALUE,
 	.timebase_multiplier = 1,
