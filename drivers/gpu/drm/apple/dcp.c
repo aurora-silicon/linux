@@ -10738,6 +10738,12 @@ static void dcp_hib_restore_work(struct work_struct *work)
  * PM_POST_SUSPEND: a T6040 S2R gives the link back at prepare as well, and
  * one that failed before the firmware stopped has no wake to replay it.
  * Before the next system sleep the restart work has finished.
+ *
+ * PM_RESTORE_PREPARE is not handled: the kernel that loads an image must not
+ * have this driver bound.  The restored kernel replays its firmware session
+ * on the state the boot loader left, a DCP firmware cold-started for it, and
+ * a DCP that the loading kernel had already started would not be in that
+ * state.
  */
 static int dcp_hib_pm_notify(struct notifier_block *nb, unsigned long action,
 			     void *unused)
