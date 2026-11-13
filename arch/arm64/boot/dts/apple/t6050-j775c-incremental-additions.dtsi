@@ -878,7 +878,7 @@
 &{/soc} {
 	jpeg@2281000000 {
 		compatible = "apple,t6050-jpeg", "apple,jpeg";
-		reg = <0x22 0x81000000 0x0 0x20000>;
+		reg = <0x22 0x81000000 0x0 0x4000>;
 		interrupts = <0x0 0x0 0x54b 0x4>;
 		iommus = <&{/soc/iommu@2281020000} 0x0>;
 		power-domains = <&{/soc/power-management@2380600000/power-controller@1d0}>;
@@ -890,7 +890,7 @@
 &{/soc} {
 	jpeg@2281060000 {
 		compatible = "apple,t6050-jpeg", "apple,jpeg";
-		reg = <0x22 0x81060000 0x0 0x44000>;
+		reg = <0x22 0x81060000 0x0 0x4000>;
 		interrupts = <0x0 0x0 0x54e 0x4>;
 		iommus = <&{/soc/iommu@2281020000} 0x1>;
 		power-domains = <&{/soc/power-management@2380600000/power-controller@1d0}>;
