@@ -505,6 +505,68 @@
 };
 
 /*
+ * The first video encoder (ADT ave0, soc-id t6040), its DARTs and its power
+ * domains, as on the J614c/J616c. iBoot preloads its firmware. The second
+ * encoder (ave1, soc-id t6041) is not described.
+ */
+&ps_venc0_sys {
+	status = "okay";
+};
+
+&ps_venc0_dma {
+	status = "okay";
+};
+
+&ps_venc0_pipe4 {
+	status = "okay";
+};
+
+&ps_venc0_pipe5 {
+	status = "okay";
+};
+
+&ps_venc0_me0 {
+	status = "okay";
+};
+
+&ps_venc0_me1 {
+	status = "okay";
+};
+
+&ave0_dart0 {
+	status = "okay";
+};
+
+&ave0_dart1 {
+	status = "okay";
+};
+
+&ave {
+	status = "okay";
+};
+
+/* Both JPEG engines; they have no board wiring. */
+&ps_jpg {
+	status = "okay";
+};
+
+&jpeg0_dart {
+	status = "okay";
+};
+
+&jpeg0 {
+	status = "okay";
+};
+
+&jpeg1_dart {
+	status = "okay";
+};
+
+&jpeg1 {
+	status = "okay";
+};
+
+/*
  * Three of the four back Thunderbolt ports, with the J773s's PD controllers
  * (nub-spmi-a0 0xc, 0xa and 0x8 for ATC0-2), as on the J616c.
  * t6041-j575c-atc3.dtsi adds the fourth (hpm3 at 0x6, ATC3), and
