@@ -305,6 +305,18 @@ static inline int macsmc_hwmon_fans_request(struct device *dev, unsigned int per
 }
 #endif
 
+/*
+ * Request the VDD_CIO rail (SMC key pmVC) for a system sleep: see drivers/mfd/macsmc.c.
+ */
+#if IS_REACHABLE(CONFIG_MFD_MACSMC)
+int apple_smc_request_pmvc(struct apple_smc *smc);
+#else
+static inline int apple_smc_request_pmvc(struct apple_smc *smc)
+{
+	return -ENODEV;
+}
+#endif
+
 static inline int apple_smc_read_flag(struct apple_smc *smc, smc_key key, bool *flag)
 {
 	u8 val;

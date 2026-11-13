@@ -2226,13 +2226,9 @@ static int t6040_sleep_valid(suspend_state_t state)
 }
 
 /*
- * SMC key pmVC, the request for the VDD_CIO rail: the platform writes its enable mask | 0x100
- * (0x101 on the J616s) while an ATC port's always-on side is powered, also at sleep. Linux
- * never asks for the rail, which is power-gated otherwise (ADT vdd-cio-rail-pg), and a rail
- * the SMC drops during the sleep transition races the sleep engine's hand-over of the ATC
- * ports. Written in each .begin.
+ * The VDD_CIO rail request (SMC key pmVC) is written in each .begin; its key and value
+ * belong to the SMC driver (apple_smc_request_pmvc()).
  */
-#define T6040_PMVC_REQUEST	0x101
 
 /* The SMC node is apple,t6041-smc + apple,t8103-smc here (macsmc's match list). */
 static const struct of_device_id t6040_smc_match[] = {
@@ -2253,11 +2249,11 @@ static void t6040_sleep_pmvc(struct t6040_sleep *s)
 	of_node_put(np);
 	smc = pdev ? platform_get_drvdata(pdev) : NULL;
 	if (smc)
-		ret = apple_smc_write_u32(smc, SMC_KEY(pmVC), T6040_PMVC_REQUEST);
+		ret = apple_smc_request_pmvc(smc);
 	if (pdev)
 		put_device(&pdev->dev);
-	if (ret < 0)
-		dev_warn(s->dev, "pmVC: write %#x failed: %d\n", T6040_PMVC_REQUEST, ret);
+	if (!smc)
+		dev_warn(s->dev, "pmVC: no SMC to write to: %d\n", ret);
 }
 
 /*
