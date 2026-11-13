@@ -124,16 +124,11 @@ properties:
     description:
       The Type-C PHY whose lanes carry the router's CIO link. A host that
       power-cycles the router for a deep sleep takes the PHY through the
-      sleep with it.
+      sleep with it. On T6040 the router starts only while that PHY is in
+      CIO mode and tells it when it stops.
 
   phy-names:
     const: cio
-
-  apple,atc-phy:
-    $ref: /schemas/types.yaml#/definitions/phandle
-    description:
-      Type-C PHY of this router's port. On T6040 the router starts only while
-      that PHY is in CIO mode and tells it when it stops.
 
   apple,pcie-tunnel:
     $ref: /schemas/types.yaml#/definitions/phandle
@@ -291,7 +286,8 @@ allOf:
         - nhi@1f00000
         - interrupts
         - interrupt-names
-        - apple,atc-phy
+        - phys
+        - phy-names
     else:
       required:
         - iommu@a80000
