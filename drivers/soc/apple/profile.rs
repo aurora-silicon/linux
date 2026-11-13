@@ -892,15 +892,22 @@ mod dart_window_tests {
 }
 
 /// The owner-qualified J613 OS-firmware lane; system firmware may differ.
-pub(crate) fn j613_26_6_2() -> bool {
+///
+/// Both 26.6.2 and 27.2 are accepted. 26.6.2 (25G83) is the original
+/// qualified arm; 27.2 (26B123) selects the same variant-5 key store with
+/// the same code, so it joins the owner-qualified lane rather than silently
+/// dropping the strict host-state/xART gate when the string moves. The 26.6.2
+/// arm stays during the 27.2 rollout and is removed only once every reference
+/// machine has moved, matching the display and ISP keep-old-arms guidance.
+pub(crate) fn j613_owner_qualified() -> bool {
     machine_has(b"apple,j613")
         && chosen_string(c"asahi,os-fw-version")
             .as_deref()
-            .is_some_and(os_firmware_26_6_2)
+            .is_some_and(os_firmware_owner_qualified)
 }
 
-fn os_firmware_26_6_2(raw: &[u8]) -> bool {
-    raw == b"26.6.2" || raw == b"26.6.2\0"
+fn os_firmware_owner_qualified(raw: &[u8]) -> bool {
+    raw == b"26.6.2" || raw == b"26.6.2\0" || raw == b"27.2" || raw == b"27.2\0"
 }
 
 #[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
@@ -910,10 +917,19 @@ mod j613_firmware_tests {
 
     #[test]
     fn exact_os_firmware_only() {
-        assert!(os_firmware_26_6_2(b"26.6.2"));
-        assert!(os_firmware_26_6_2(b"26.6.2\0"));
-        for raw in [&b"14.8.3"[..], &b"26.6.20"[..], &b"27.0"[..], &b""[..]] {
-            assert!(!os_firmware_26_6_2(raw));
+        assert!(os_firmware_owner_qualified(b"26.6.2"));
+        assert!(os_firmware_owner_qualified(b"26.6.2\0"));
+        assert!(os_firmware_owner_qualified(b"27.2"));
+        assert!(os_firmware_owner_qualified(b"27.2\0"));
+        for raw in [
+            &b"14.8.3"[..],
+            &b"26.6.20"[..],
+            &b"27.0"[..],
+            &b"27.20"[..],
+            &b"27.2.1"[..],
+            &b""[..],
+        ] {
+            assert!(!os_firmware_owner_qualified(raw));
         }
     }
 }
