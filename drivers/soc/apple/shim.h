@@ -36,7 +36,6 @@ void sep_cancel_delayed_work_sync(void *work);
 int sep_pm_register(void *dev, int (*event)(int event), int (*sleep)(void),
 		    void (*wake)(void), bool (*told)(void));
 void sep_pm_unregister(void);
-void sep_pm_exit(void);
 int sep_pm_keep_domains(void *dev);
 int sep_pm_wait_gated(void *dev, unsigned int timeout_ms);
 int sep_pm_clear_dev_disable(void *dev);

@@ -347,7 +347,8 @@ static void aura_hibernate_reprobe_work(struct work_struct *work)
 	int ret;
 
 	ret = device_reprobe(rp->dev);
-	if (ret)
+	/* A failed probe is not reported by device_reprobe() itself. */
+	if (ret || !READ_ONCE(rp->dev->driver))
 		dev_err(rp->dev, "probe after the resume from disk failed: %d\n", ret);
 	put_device(rp->dev);
 	kfree(rp);

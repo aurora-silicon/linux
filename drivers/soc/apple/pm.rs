@@ -57,7 +57,6 @@ extern "C" {
         mask: u64,
     ) -> c_int;
     fn sep_pm_commit_finish(dev: *mut c_void) -> c_int;
-    fn sep_pm_exit();
     pub(crate) static sep_pm_ops: kernel::bindings::dev_pm_ops;
 }
 
@@ -68,13 +67,6 @@ const EVENT_HIBERNATE: c_int = 2;
 const EVENT_HIBERNATE_WARM: c_int = 3;
 const EVENT_HIBERNATE_COLD: c_int = 4;
 const EVENT_RESTORE: c_int = 5;
-
-/// Cancels a probe queued after a resume from disk. Called once the module
-/// goes away, before the driver is unregistered.
-pub(crate) fn exit() {
-    // SAFETY: no preconditions; waits for a running reprobe to finish.
-    unsafe { sep_pm_exit() };
-}
 
 /// Who may use the mailbox around a firmware-driven suspend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -342,8 +334,7 @@ pub(crate) fn register(sep: Arc<SepData>) -> Result<()> {
 
     // SAFETY: the shim stores the callback and registers a notifier block
     // that lives for the module's lifetime.
-    // `dev` is the bound SEP device: the shim drops it in `sep_pm_unregister`
-    // and takes its own reference for a reprobe.
+    // `dev` is the bound SEP device: the shim drops it in `sep_pm_unregister`.
     let rc = unsafe { sep_pm_register(dev, pm_event, pm_sleep, pm_wake, pm_told) };
     if rc != 0 {
         let raw = SEP.swap(core::ptr::null_mut(), Ordering::AcqRel);

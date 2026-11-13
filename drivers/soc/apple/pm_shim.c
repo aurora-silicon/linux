@@ -24,13 +24,13 @@
 #include <linux/panic.h>
 #include <linux/pm_domain.h>
 #include <linux/regmap.h>
+#include <linux/soc/apple/aura-hibernate.h>
 #include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/mailbox.h>
 #include <linux/soc/apple/pmp.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/spinlock.h>
 #include <linux/suspend.h>
-#include <linux/workqueue.h>
 
 #include <asm/virt.h>
 
@@ -71,41 +71,17 @@ static int sep_pm_cold_base = -ENODEV;
 /*
  * A resume from disk on a cold boot: the enclave runs a freshly booted sepOS
  * that has never seen this kernel's registration, so the restored session is
- * dead. The device is probed again from a work item, as at boot: probe sends
- * a new registration (the marker is gone with the session it guarded), opens
- * the xART store and loads the host state from disk again (the boot that
- * resumed this image may have changed both), and recreates /dev/sep-bio.
+ * dead. The device is probed again once the tasks are thawed, as at boot:
+ * probe sends a new registration (the marker is gone with the session it
+ * guarded), opens the xART store and loads the host state from disk again (the
+ * boot that resumed this image may have changed both), and recreates
+ * /dev/sep-bio.
  */
-static struct device *sep_reprobe_dev;
-static DEFINE_SPINLOCK(sep_reprobe_lock);
-
-static void sep_reprobe_fn(struct work_struct *work)
-{
-	struct device *dev;
-	int ret;
-
-	spin_lock(&sep_reprobe_lock);
-	dev = sep_reprobe_dev;
-	sep_reprobe_dev = NULL;
-	spin_unlock(&sep_reprobe_lock);
-	if (!dev)
-		return;
-
-	dev_info(dev, "resume from disk: attaching the restarted enclave again\n");
-	ret = device_reprobe(dev);
-	/* A failed probe is not reported by device_reprobe() itself. */
-	if (ret || !READ_ONCE(dev->driver))
-		dev_err(dev, "resume from disk: probing the SEP again failed (%d); Touch ID stays down until a reboot\n",
-			ret);
-	put_device(dev);
-}
-
-static DECLARE_WORK(sep_reprobe_work, sep_reprobe_fn);
-
 static void sep_pm_schedule_reprobe(struct device *dev)
 {
 	struct device_node *np = dev->of_node;
 	struct property *prop;
+	int ret;
 
 	/*
 	 * Only here, with the cold boot established: removing the marker on a
@@ -117,26 +93,16 @@ static void sep_pm_schedule_reprobe(struct device *dev)
 		return;
 	}
 
-	spin_lock(&sep_reprobe_lock);
-	if (!sep_reprobe_dev) {
-		sep_reprobe_dev = get_device(dev);
-		queue_work(system_dfl_wq, &sep_reprobe_work);
+	if (!IS_ENABLED(CONFIG_APPLE_AURA_HIBERNATE)) {
+		dev_err(dev, "resume from disk: no aura hibernation support to probe the SEP again; Touch ID stays down until a reboot\n");
+		return;
 	}
-	spin_unlock(&sep_reprobe_lock);
-}
 
-/* The module goes away: no probe may run from the work item after it. */
-void sep_pm_exit(void)
-{
-	struct device *dev;
-
-	cancel_work_sync(&sep_reprobe_work);
-	spin_lock(&sep_reprobe_lock);
-	dev = sep_reprobe_dev;
-	sep_reprobe_dev = NULL;
-	spin_unlock(&sep_reprobe_lock);
-	if (dev)
-		put_device(dev);
+	dev_info(dev, "resume from disk: attaching the restarted enclave again\n");
+	ret = aura_hibernate_reprobe_after_thaw(dev);
+	if (ret)
+		dev_err(dev, "resume from disk: probing the SEP again could not be queued (%d); Touch ID stays down until a reboot\n",
+			ret);
 }
 
 static int sep_pm_notify(struct notifier_block *nb, unsigned long action,

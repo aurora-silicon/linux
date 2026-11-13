@@ -3726,16 +3726,6 @@ impl Drop for SepDriver {
     }
 }
 
-/// Dropped after the driver registration (fields drop in order): a probe
-/// queued after a resume from disk must not run once the module goes away.
-struct ReprobeGuard;
-
-impl Drop for ReprobeGuard {
-    fn drop(&mut self) {
-        pm::exit();
-    }
-}
-
 #[pin_data]
 struct SepModule {
     // field-init order enables the DT nodes before the driver registers; a failure here aborts module init
@@ -3743,10 +3733,6 @@ struct SepModule {
 
     #[pin]
     _driver: driver::Registration<platform::Adapter<SepDriver>>,
-
-    // After the driver: once it is unregistered no notifier can queue a
-    // reprobe, and the one queued before is cancelled here.
-    _reprobe: ReprobeGuard,
 }
 
 impl kernel::InPlaceModule for SepModule {
@@ -3775,8 +3761,6 @@ impl kernel::InPlaceModule for SepModule {
                 <Self as kernel::ModuleMetadata>::NAME,
                 module,
             ),
-
-            _reprobe: ReprobeGuard,
         })
     }
 }
