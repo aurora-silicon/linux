@@ -40,6 +40,9 @@ mod shim;
 mod shmem;
 mod sks;
 mod stac;
+// The accessory client that drives these lands with its HID transport.
+#[allow(dead_code)]
+mod stac_ops;
 mod store;
 mod transfer;
 mod trusted;
