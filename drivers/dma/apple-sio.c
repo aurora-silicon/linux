@@ -645,6 +645,7 @@ static const struct sio_hw_data sio_hw_t6030 = {
  * the 5 of the host's mailbox call timeout is not part of the record.
  */
 static const struct sio_hw_data sio_hw_t6041 = {
+	.stop_at_commit = true,
 	.protocol = 10,
 	.fifo_threshold = 0x600,
 	.cfg_word4 = 0x800,
@@ -2150,10 +2151,15 @@ static bool sio_chan_busy(struct sio_chan *siochan)
 static __maybe_unused int sio_suspend_late(struct device *dev)
 {
 	struct sio_data *sio = dev_get_drvdata(dev);
+	bool dry;
 	int i, ret;
 
-	/* A dry run keeps the power, and an idled firmware doesn't wake with it kept. */
-	if (!apple_sleep_power_loss() || sio->asleep)
+	/*
+	 * A dry run keeps the power, and an idled firmware doesn't wake with it kept. One whose
+	 * stop is the commit's is ready there as for a real sleep: a dry run stops nothing.
+	 */
+	dry = !apple_sleep_power_loss() && sio->commit_registered && pm_suspend_via_firmware();
+	if ((!apple_sleep_power_loss() && !dry) || sio->asleep)
 		return 0;
 
 	for (i = 0; i < sio->nchannels; i++) {
@@ -2163,7 +2169,7 @@ static __maybe_unused int sio_suspend_late(struct device *dev)
 		}
 	}
 
-	if (sio->commit_registered && apple_sleep_commit_stops_coprocs()) {
+	if (sio->commit_registered && (dry || apple_sleep_commit_stops_coprocs())) {
 		apple_sleep_coproc_set_ready(dev, true);
 		sio->commit_used = true;
 		sio->asleep = true;
