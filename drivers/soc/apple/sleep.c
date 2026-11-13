@@ -1462,6 +1462,75 @@ int apple_sleep_engine_reset(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_engine_reset);
 
+/*
+ * Coprocessor CPUs on the always-on die that the device tree doesn't describe, by their ASC:
+ * the CPU's word in the ADT's PMGR devices table and the word of the SRAM holding its firmware.
+ * MTP_SRAM has MTP_CPU as a parent.
+ */
+static const struct {
+	phys_addr_t asc;
+	u32 cpu;
+	u32 sram;
+} t8140_aon_cpus[] = {
+	{ 0x314600000, 0xc028, 0xc048 },	/* MTP_CPU, MTP_SRAM */
+};
+
+/*
+ * Resets a stopped always-on coprocessor CPU in place, as the PMGR's device reset does, so the
+ * run bit starts it from its reset vector. The power state stays, so the SRAM keeps the firmware.
+ */
+int apple_sleep_aon_cpu_reset(struct device *dev)
+{
+	struct apple_sleep *s = apple_sleep;
+	void __iomem *cpu, *sram;
+	struct resource res;
+	u32 before, held, after;
+	unsigned int i;
+	int idx, ret;
+
+	if (!s || !s->ps_aon)
+		return -ENODEV;
+	idx = of_property_match_string(dev->of_node, "reg-names", "asc");
+	if (idx < 0 || of_address_to_resource(dev->of_node, idx, &res))
+		return -ENODEV;
+	for (i = 0; i < ARRAY_SIZE(t8140_aon_cpus); i++)
+		if (t8140_aon_cpus[i].asc == res.start)
+			break;
+	if (i == ARRAY_SIZE(t8140_aon_cpus))
+		return -ENODEV;
+	cpu = s->ps_aon + t8140_aon_cpus[i].cpu;
+	sram = s->ps_aon + t8140_aon_cpus[i].sram;
+
+	/* Check the targets: the PMGR's own idling can lower the actual states. */
+	before = readl(cpu);
+	if (FIELD_GET(PS_TARGET, before) != 0xf || FIELD_GET(PS_TARGET, readl(sram)) != 0xf) {
+		dev_err(dev, "CPU reset refused: CPU %#x, SRAM %#x\n", before, readl(sram));
+		return -EIO;
+	}
+
+	writel((before & ~PS_FLAGS) | PS_DEV_DISABLE, cpu);
+	ret = readl_poll_timeout_atomic(cpu, held, !(held & PS_BUSY), 1, 100);
+	if (ret) {
+		writel(readl(cpu) & ~(PS_FLAGS | PS_DEV_DISABLE), cpu);
+		dev_err(dev, "CPU reset refused: CPU %#x stayed busy\n", held);
+		return ret;
+	}
+	writel((held & ~PS_FLAGS) | PS_RESET, cpu);
+	usleep_range(10, 20);
+	held = readl(cpu);
+	writel(held & ~(PS_FLAGS | PS_RESET), cpu);
+	writel(readl(cpu) & ~(PS_FLAGS | PS_DEV_DISABLE), cpu);
+	after = readl(cpu);
+
+	dev_info(dev, "CPU reset in place: %#x before, %#x held, %#x after, SRAM %#x\n", before,
+		 held, after, readl(sram));
+	if (FIELD_GET(PS_TARGET, after) != 0xf || FIELD_GET(PS_TARGET, readl(sram)) != 0xf ||
+	    (after & (PS_RESET | PS_DEV_DISABLE)))
+		return -EIO;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_sleep_aon_cpu_reset);
+
 /* The order macOS does it in, across clusters. */
 static void sleep_dvfm_park(struct apple_sleep *s)
 {

@@ -170,6 +170,12 @@ void apple_sleep_restore_pins(void);
  * sleep engine's PMGR reset of its own domains, its DARTs kept. The caller starts it after.
  */
 int apple_sleep_engine_reset(struct device *dev);
+
+/*
+ * Resets the stopped CPU of an always-on coprocessor (the MTP) with its power state kept.
+ * -ENODEV when there's no such CPU or no sleep driver. The caller starts it after.
+ */
+int apple_sleep_aon_cpu_reset(struct device *dev);
 #else
 static inline int apple_sleep_coproc_register(struct device *dev, void __iomem *asc,
 					      bool pcie_ans, int (*last_stop)(void *data),
@@ -316,6 +322,11 @@ static inline void apple_sleep_restore_pins(void)
 static inline int apple_sleep_engine_reset(struct device *dev)
 {
 	return -EOPNOTSUPP;
+}
+
+static inline int apple_sleep_aon_cpu_reset(struct device *dev)
+{
+	return -ENODEV;
 }
 #endif
 
