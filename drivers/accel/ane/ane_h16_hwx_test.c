@@ -401,6 +401,33 @@ static void hwx_geometry_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
 }
 
+/* __TEXT may carry SG_NORELOC whether or not the program has a scratch. */
+static void hwx_text_flags_test(struct kunit *test)
+{
+	unsigned int variant;
+
+	for (variant = 0; variant < 4; variant++) {
+		struct hwx_fixture *f = fixture_create(test, variant & 1, variant & 2);
+		struct ane_h16_hwx info;
+		u8 *flags;
+
+		KUNIT_ASSERT_NOT_NULL(test, f);
+		flags = f->bytes + f->text_command + 68;
+		put_unaligned_le32(0, flags);
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+		put_unaligned_le32(4, flags);
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+		put_unaligned_le32(6, flags);
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+		put_unaligned_le32(1, flags);
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+		/* Other segments keep their exact flags. */
+		put_unaligned_le32(0, flags);
+		put_unaligned_le32(4, f->bytes + f->segment[0] + 68);
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	}
+}
+
 static void hwx_symbols_test(struct kunit *test)
 {
 	struct hwx_fixture *f = fixture_create(test, false, false);
@@ -695,7 +722,7 @@ static void hwx_h17_zin_test(struct kunit *test)
 	/* __TEXT carries relocations: flags 0 beside a scratch segment; nothing else. */
 	put_unaligned_le32(0, f->bytes + f->text_command + 68);
 	H17_OK();
-	AS_H16(REFUSED());
+	AS_H16(H17_OK());	/* hwx_text_flags_test: either flag on H16 too */
 	put_unaligned_le32(1, f->bytes + f->text_command + 68);
 	REFUSED();
 	put_unaligned_le32(4, f->bytes + f->text_command + 68);
@@ -801,6 +828,7 @@ static struct kunit_case hwx_cases[] = {
 	KUNIT_CASE(hwx_staged_counts_test),
 	KUNIT_CASE(hwx_final_task_end_test),
 	KUNIT_CASE(hwx_geometry_test),
+	KUNIT_CASE(hwx_text_flags_test),
 	KUNIT_CASE(hwx_symbols_test),
 	KUNIT_CASE(hwx_relocations_test),
 	KUNIT_CASE(hwx_snapshot_test),

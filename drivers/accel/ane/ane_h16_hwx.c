@@ -11,6 +11,7 @@
 #define HWX_COMMANDS_MAX 64
 #define HWX_SYMBOLS_MAX 4096
 #define HWX_SEGMENTS_MAX 8
+#define HWX_SG_NORELOC 0x4
 
 struct hwx_range {
 	u64 start, size;
@@ -113,16 +114,14 @@ static int hwx_segment(struct hwx_parser *p, const u8 *c, u32 length)
 		return -ENOEXEC;
 	}
 	/*
-	 * __TEXT is SG_NORELOC (4) beside a scratch segment in the MobileNet program; Apple's
-	 * zin_ane_compiler 10.205 marks it 0 there too on H17 (relocations are checked below).
+	 * SG_NORELOC on __TEXT only states that a loader relocates nothing in
+	 * the segment. Compilers set it either way, with or without a scratch
+	 * or relocations; the validator checks every relocation itself and no
+	 * mapping depends on the flag, so __TEXT takes 0 or SG_NORELOC.
 	 */
 	flags = get_unaligned_le32(c + 68);
-	if (text && p->info.subtype == ANE_HWX_SUBTYPE_H17 && p->info.scratch.size) {
-		if (flags != 4 && flags)
-			return -ENOEXEC;
-	} else if (flags != (surface ? 6 : text ? (p->info.scratch.size ? 4 : 0) : 4)) {
+	if (text ? flags & ~HWX_SG_NORELOC : flags != (surface ? 6 : 4))
 		return -ENOEXEC;
-	}
 	if ((text && (prot != 5 || nsects != 2 || p->info.text.size)) ||
 	    (kernel && (prot != 1 || nsects != 1 || p->info.kernel.size)) ||
 	    (scratch && (prot != 3 || p->info.scratch.size)) ||
