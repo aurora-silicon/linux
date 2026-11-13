@@ -2366,7 +2366,7 @@ impl Gpu {
             .is_some()
         {
             session.ceiling = Some(power::Ceiling::new(
-                pdev.as_ref().as_raw(),
+                pdev.as_ref().as_raw().cast(),
                 session.init.ppm_target()?,
             )?);
         }
