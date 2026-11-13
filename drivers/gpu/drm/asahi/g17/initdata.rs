@@ -1326,6 +1326,39 @@ impl InitData {
             .load(Ordering::Relaxed))
     }
 
+    /// Returns the native live PPM ceiling before the host controller changes it.
+    pub(super) fn ppm_target(&self) -> Result<[u32; 3]> {
+        let base = self.status_b + abi::PrimaryStatusB::POWER_STATE;
+        Ok([
+            self.object(self.cluster)?
+                .word(base + abi::PowerState::PPM_TARGET_VALID)?
+                .load(Ordering::Acquire),
+            self.object(self.cluster)?
+                .word(base + abi::PowerState::PPM_TARGET_MW)?
+                .load(Ordering::Relaxed),
+            self.object(self.cluster)?
+                .word(base + abi::PowerState::PPM_TARGET_TIMESCALE)?
+                .load(Ordering::Relaxed),
+        ])
+    }
+
+    /// Publishes a runtime PPM ceiling in the firmware's polling order.
+    pub(super) fn publish_ppm_target(&self, valid: u32, target_mw: u32, timescale: u32) -> Result {
+        let base = self.status_b + abi::PrimaryStatusB::POWER_STATE;
+        let object = self.object(self.cluster)?;
+
+        object
+            .word(base + abi::PowerState::PPM_TARGET_MW)?
+            .store(target_mw, Ordering::Relaxed);
+        object
+            .word(base + abi::PowerState::PPM_TARGET_TIMESCALE)?
+            .store(timescale, Ordering::Relaxed);
+        object
+            .word(base + abi::PowerState::PPM_TARGET_VALID)?
+            .store(valid, Ordering::Release);
+        Ok(())
+    }
+
     /// The GPU's operating points: `count` of them, each with one voltage cell for the whole
     /// GPU or one per cluster.
     pub(super) fn opps(

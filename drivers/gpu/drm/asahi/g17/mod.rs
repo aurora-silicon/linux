@@ -31,6 +31,7 @@ mod completion;
 pub(crate) mod context;
 mod data_segment;
 mod dependency;
+mod dietemp;
 mod sync_input;
 pub(crate) mod sync_output;
 mod trace;
@@ -640,6 +641,8 @@ struct Firmware {
     recovery: recovery::State,
     effort: power::Effort,
     hold: power::Hold,
+    /// PMP die-temperature effort applied through the AGX power ceiling.
+    ceiling: Option<power::Ceiling>,
     registration_power_release_pending: bool,
     variant: &'static fw::Variant,
     queues: runtime::Registry,
@@ -832,6 +835,7 @@ const IDLE_WORK: u64 = 2;
 const GROW_WORK: u64 = 3;
 const RECLAIM_WORK: u64 = 4;
 const FEED_WORK: u64 = 5;
+const DIETEMP_WORK: u64 = 6;
 
 /// Device state shared with the coprocessor callbacks and the event worker.
 #[pin_data]
@@ -882,6 +886,8 @@ struct Shared {
     #[pin]
     idle: DelayedWork<Shared, IDLE_WORK>,
     #[pin]
+    dietemp: DelayedWork<Shared, DIETEMP_WORK>,
+    #[pin]
     grow: Work<Shared, GROW_WORK>,
     #[pin]
     reclaim_work: Work<Shared, RECLAIM_WORK>,
@@ -910,6 +916,9 @@ impl_has_delayed_work! {
 }
 impl_has_delayed_work! {
     impl HasDelayedWork<Shared, IDLE_WORK> for Shared { self.idle }
+}
+impl_has_delayed_work! {
+    impl HasDelayedWork<Shared, DIETEMP_WORK> for Shared { self.dietemp }
 }
 impl_has_work! {
     impl HasWork<Shared, GROW_WORK> for Shared { self.grow }
@@ -962,6 +971,12 @@ impl WorkItem<POLL_WORK> for Shared {
     }
 }
 impl WorkItem<IDLE_WORK> for Shared {
+    type Pointer = Arc<Shared>;
+    fn run(this: Arc<Shared>) {
+        this.queue_events();
+    }
+}
+impl WorkItem<DIETEMP_WORK> for Shared {
     type Pointer = Arc<Shared>;
     fn run(this: Arc<Shared>) {
         this.queue_events();
@@ -1073,6 +1088,13 @@ impl Shared {
         let delay_ms = delay_ns.div_ceil(1_000_000).min(u64::from(u32::MAX)) as u32;
         let _ = workqueue::system_highpri()
             .enqueue_delayed::<Arc<Self>, IDLE_WORK>(self.clone(), msecs_to_jiffies(delay_ms));
+    }
+
+    fn queue_dietemp(self: &Arc<Self>) {
+        let _ = workqueue::system_highpri().enqueue_delayed::<Arc<Self>, DIETEMP_WORK>(
+            self.clone(),
+            msecs_to_jiffies((dietemp::PERIOD_NS / 1_000_000) as u32),
+        );
     }
 
     fn disable_timer<const ID: u64>(self: &Arc<Self>, timer: &DelayedWork<Self, ID>) {
@@ -1222,6 +1244,7 @@ impl Gpu {
                 housekeeping_ns: AtomicU64::new(0),
                 poll <- new_delayed_work!("g17::Shared::poll"),
                 idle <- new_delayed_work!("g17::Shared::idle"),
+                dietemp <- new_delayed_work!("g17::Shared::dietemp"),
                 grow <- new_work!("g17::Shared::grow"),
                 reclaim_work <- new_work!("g17::Shared::reclaim_work"),
                 reclaim <- new_mutex!(reclaim, "g17::Shared::reclaim"),
@@ -1405,6 +1428,7 @@ impl Gpu {
                 recovery: recovery::State::new(),
                 effort: power::Effort::new(),
                 hold: power::Hold::new(),
+                ceiling: None,
                 registration_power_release_pending: false,
                 variant: shared.variant,
                 queues <- runtime::Registry::with_waiters(
@@ -1470,6 +1494,16 @@ impl Gpu {
             }
         }
         Self::wait_for_opening(dev, &session.init, &session.primary, session.secondary.as_ref())?;
+        let node = dev.as_ref().as_ref().of_node().ok_or(EIO)?;
+        if node
+            .get_opt_property::<KVec<u32>>(c_str!("apple,fast-die-effort"))?
+            .is_some()
+        {
+            session.ceiling = Some(power::Ceiling::new(
+                pdev.as_ref().as_raw(),
+                session.init.ppm_target()?,
+            )?);
+        }
         session
             .uat
             .activate_render_context(&session._render_global)?;
@@ -1538,6 +1572,7 @@ impl Gpu {
         self.shared.stop_queues();
         self.shared.disable_timer(&self.shared.poll);
         self.shared.disable_timer(&self.shared.idle);
+        self.shared.disable_timer(&self.shared.dietemp);
         self.shared.disable_work(&self.shared.grow);
         self.shared.disable_work(&self.shared.reclaim_work);
         self.shared.disable_work(&self.shared.work);

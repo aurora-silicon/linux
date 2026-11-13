@@ -436,6 +436,20 @@ impl crate::g17::Shared {
             .filter_map(|entry| entry.queue.as_deref())
             .any(|queue| queue.in_flight());
         let in_flight = compute || firmware.queues.render_in_flight();
+        if let Some(ceiling) = firmware.ceiling.as_mut() {
+            let before = ceiling.applied();
+            ceiling.update(&firmware.init)?;
+            if before != ceiling.applied() {
+                dev_info!(
+                    self.dev.as_ref(),
+                    "G17 die-temperature ceiling: {:?} percent\n",
+                    ceiling.applied()
+                );
+            }
+        }
+        if in_flight && firmware.ceiling.is_some() {
+            self.queue_dietemp();
+        }
         let idle = firmware.idle_check(now, in_flight)?;
         // Expiries, drained pairs, exits, pool and heap trimming and teardown give back what
         // retirement freed; a completion needs none of them to retire or to signal. While work

@@ -1897,6 +1897,13 @@ pub(crate) struct PowerState(pub(crate) [u8; 0x6c0]);
 unsafe impl Zeroable for PowerState {}
 
 impl PowerState {
+    /// A nonzero runtime PPM target is ready for firmware.
+    pub(crate) const PPM_TARGET_VALID: usize = 0x128;
+    /// Runtime PPM target in milliwatts.
+    pub(crate) const PPM_TARGET_MW: usize = 0x12c;
+    /// Runtime PPM target auxiliary/timescale word.
+    pub(crate) const PPM_TARGET_TIMESCALE: usize = 0x144;
+
     fn init(&mut self) {
         fill_words(&mut self.0, POWER_STATE_WORDS);
     }

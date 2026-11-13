@@ -10,6 +10,7 @@ GPU Driver Documentation
    apple-drm-parameters
    asahi-reclaim
    asahi-m4-bringup
+   asahi-g17-host-dietemp
    apple-dcp-m4
    i915
    imagination/index
