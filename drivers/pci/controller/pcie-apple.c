@@ -572,7 +572,7 @@ struct apple_pcie {
 	/* Down already when the sleep began: a failed wake left it unprogrammed */
 	bool			neo_rc_was_down;
 	/* Functions' saved state, kept from a restore's noirq phase to its link */
-	struct list_head	hib_fns;
+	struct list_head	restore_fns;
 	const struct hw_info	*hw;
 	unsigned long		*bitmap;
 	struct list_head	ports;
@@ -623,13 +623,13 @@ struct apple_pcie_port {
 	u32			s2r_dbi[5];
 	bool			s2r_saved;
 	/* Conventional port: link up when the image was taken */
-	bool			hib_link_up;
+	bool			restore_link_up;
 	/* ... and found down by the restore: the boot that resumed did not set it up */
-	bool			hib_cold;
+	bool			restore_cold;
 };
 
 /* A function's configuration, for its link back after a resume from disk. */
-struct apple_pcie_hib_fn {
+struct apple_pcie_restore_fn {
 	struct list_head	entry;
 	struct pci_dev		*pdev;
 	struct pci_saved_state	*state;
@@ -5075,7 +5075,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 
 	mutex_init(&pcie->lock);
 	INIT_LIST_HEAD(&pcie->ports);
-	INIT_LIST_HEAD(&pcie->hib_fns);
+	INIT_LIST_HEAD(&pcie->restore_fns);
 
 	/* Resolve PM dependencies before publishing the PCI hierarchy. */
 	if (pcie->hw->tunneled) {
@@ -5873,10 +5873,305 @@ static void apple_pcie_stop_for_sleep(struct device *dev)
 }
 
 static void apple_pcie_neo_save_functions(struct apple_pcie *pcie);
-static bool apple_pcie_hib_conventional(struct apple_pcie *pcie);
-static void apple_pcie_hib_save(struct apple_pcie *pcie);
-static void apple_pcie_hib_restore_noirq(struct apple_pcie *pcie, const char *what);
-static void apple_pcie_s2r_up_noirq(struct apple_pcie *pcie);
+
+/*
+ * A conventional host (the internal ports with their radio and SD reader) keeps running
+ * through freeze and thaw. Only a kernel restored from an image finds it changed: the boot
+ * that resumed it went through the boot loader, and when its kernel did not set the ports up
+ * (a boot kernel without the GPIO drivers that probing the host takes), the endpoints sit
+ * unpowered or in reset behind a link that is down. The restore then does what probe did.
+ * A real suspend-to-RAM takes the host's power as a resume from disk does, so its ports
+ * come back the same way.
+ */
+static bool apple_pcie_conventional_host(struct apple_pcie *pcie)
+{
+	return !pcie->hw->tunneled && !pcie->managed_sids && !pcie->piodma_supplier &&
+	       !pcie->hw->root_bus_only;
+}
+
+/*
+ * Root port words the loader limits at boot (one lane at the endpoint's speed) and a reset
+ * puts back to the core's own: link capabilities, the target speed, link mode and lane count.
+ */
+static const u16 apple_pcie_s2r_dbi[] = {
+	NEO_DBI_CAP_LNKCAP, NEO_DBI_CAP_LNKCAP2, NEO_DBI_CAP_LNKCTL2,
+	NEO_DBI_PORT_LINK_CONTROL, NEO_DBI_WIDTH_SPEED_CONTROL,
+};
+
+/* Bounded like probe's wait, polled: the link interrupts stay masked meanwhile. */
+static int apple_pcie_restore_train(struct apple_pcie *pcie, struct apple_pcie_port *port)
+{
+	int attempt, attempts = port->perst ? 1 + LINK_RESET_RETRIES : 1;
+	u32 stat;
+	int ret = -ETIMEDOUT;
+
+	for (attempt = 0; attempt < attempts; attempt++) {
+		if (attempt) {
+			dev_info(pcie->dev, "%pOF link down after %dms (LTSSM %#x), resetting the endpoint\n",
+				 port->np, link_up_timeout, apple_pcie_port_ltssm(pcie, port));
+			ret = apple_pcie_port_reset_endpoint(pcie, port);
+			if (ret)
+				return ret;
+		}
+		apple_pcie_port_writel(port, PORT_LTSSMCTL_START, PORT_LTSSMCTL);
+		ret = readl_relaxed_poll_timeout(port->base + PORT_LINKSTS, stat,
+						 stat & PORT_LINKSTS_UP, 100,
+						 link_up_timeout * 1000);
+		if (!ret)
+			break;
+	}
+	return ret;
+}
+
+/* This kernel's RID-to-SID table, every other entry cleared as probe clears them. */
+static void apple_pcie_restore_rid2sid(struct apple_pcie *pcie, struct apple_pcie_port *port)
+{
+	int i;
+
+	mutex_lock(&pcie->lock);
+	for (i = 0; i < port->sid_map_sz; i++)
+		apple_pcie_rid2sid_write(port, i, test_bit(i, port->sid_map) ?
+					 port->saved_rid2sid[i] : 0);
+	mutex_unlock(&pcie->lock);
+}
+
+static void apple_pcie_s2r_save_port(struct apple_pcie *pcie, struct apple_pcie_port *port)
+{
+	void __iomem *dbi = pcie->cfg->win + ((resource_size_t)port->idx << 15);
+	int i;
+
+	BUILD_BUG_ON(ARRAY_SIZE(apple_pcie_s2r_dbi) != ARRAY_SIZE(port->s2r_dbi));
+	/* The loader's port setup writes 0x130; the port tunable has its own word. */
+	port->s2r_port_130 = apple_pcie_port_readl(port, 0x130);
+	for (i = 0; i < ARRAY_SIZE(apple_pcie_s2r_dbi); i++)
+		port->s2r_dbi[i] = readl_relaxed(dbi + apple_pcie_s2r_dbi[i]);
+	port->s2r_saved = true;
+}
+
+/* The root port part goes in once the port runs again, before the link starts. */
+static void apple_pcie_s2r_restore_rc(struct apple_pcie *pcie, struct apple_pcie_port *port)
+{
+	void __iomem *dbi = pcie->cfg->win + ((resource_size_t)port->idx << 15);
+	int i;
+
+	rmw_set(NEO_DBI_RO_WR_EN, dbi + NEO_DBI_RO_WR);
+	for (i = 0; i < ARRAY_SIZE(port->s2r_rc_tunable); i++)
+		apple_tunable_apply(dbi, port->s2r_rc_tunable[i]);
+	for (i = 0; i < ARRAY_SIZE(apple_pcie_s2r_dbi); i++) {
+		/* Link Control 2 shares its word with a status register. */
+		if (apple_pcie_s2r_dbi[i] == NEO_DBI_CAP_LNKCTL2)
+			writew_relaxed(port->s2r_dbi[i], dbi + apple_pcie_s2r_dbi[i]);
+		else
+			writel_relaxed(port->s2r_dbi[i], dbi + apple_pcie_s2r_dbi[i]);
+	}
+	/* The link goes to the target speed once it is up, as after the loader's setup. */
+	rmw_set(NEO_DBI_SPEED_CHANGE, dbi + NEO_DBI_WIDTH_SPEED_CONTROL);
+	rmw_clear(NEO_DBI_RO_WR_EN, dbi + NEO_DBI_RO_WR);
+}
+
+/*
+ * A real S2R took the port block's power: the sleep's wake side clocked the port again and
+ * the pin restore released PERST#, with the link down and every word of the port and of its
+ * root port at its reset value. Do what the loader and probe did between them, here, so that
+ * the PCI core's noirq pass finds the functions: PERST# asserted again, the port's and the
+ * root port's settings back, PERST# released, the link trained. The endpoint's power line
+ * is not touched: it is the SMC's, whose session is back only in the normal phase, and it
+ * reads on after the wake.
+ *
+ * In two steps, so that the ports share the two waits instead of each taking its own: up to
+ * the release of PERST#, and from the port's ready bit on.
+ */
+static int apple_pcie_s2r_port_release_noirq(struct apple_pcie *pcie,
+					     struct apple_pcie_port *port)
+{
+	int ret;
+
+	rmw_set(PORT_APPCLK_EN, port->base + PORT_APPCLK);
+	gpiod_set_value(port->perst_gpio, 1);
+	if (!pcie->hw->retain_clocks) {
+		ret = apple_pcie_setup_refclk(pcie, port);
+		if (ret < 0)
+			return ret;
+	}
+	apple_pcie_port_writel(port, port->s2r_port_130, 0x130);
+	apple_tunable_apply(port->base, port->s2r_port_tunable);
+	/* Tperst-clk (PCIe CEM r5.0, 2.9.2) */
+	usleep_range(100, 200);
+	rmw_set(PORT_PERST_OFF, port->base + pcie->hw->port_perst);
+	gpiod_set_value(port->perst_gpio, 0);
+	return 0;
+}
+
+static int apple_pcie_s2r_port_train_noirq(struct apple_pcie *pcie, struct apple_pcie_port *port)
+{
+	u32 stat;
+	int ret;
+
+	ret = readl_relaxed_poll_timeout(port->base + PORT_STATUS, stat,
+					 stat & PORT_STATUS_READY, 100, 250000);
+	if (ret)
+		return ret;
+	apple_pcie_s2r_restore_rc(pcie, port);
+	apple_pcie_port_gate_clocks(pcie, port);
+	apple_pcie_tunnel_restore_irq_hw(port);
+	apple_pcie_restore_rid2sid(pcie, port);
+	ret = apple_pcie_restore_train(pcie, port);
+	if (ret)
+		return ret;
+	apple_pcie_port_writel(port, BIT(PORT_INT_LINK_UP), PORT_INTSTAT);
+	apple_pcie_port_writel(port, port->saved_intmask, PORT_INTMSK);
+	return 0;
+}
+
+static void apple_pcie_s2r_port_failed(struct apple_pcie *pcie, struct apple_pcie_port *port,
+				       int ret)
+{
+	dev_warn(pcie->dev, "S2R: %pOF link not back in the noirq phase (%d, LTSSM %#x)\n",
+		 port->np, ret, apple_pcie_port_ltssm(pcie, port));
+}
+
+/* A port that does not come up here is left to the normal phase, as before. */
+static void apple_pcie_s2r_up_noirq(struct apple_pcie *pcie)
+{
+	struct apple_pcie_port *port;
+	unsigned long released = 0, trained = 0;
+	bool fast = false;
+	int ret;
+
+	list_for_each_entry(port, &pcie->ports, entry) {
+		if (!port->restore_link_up || !port->s2r_saved || !port->perst_gpio ||
+		    gpiod_cansleep(port->perst_gpio) || port->idx >= BITS_PER_LONG ||
+		    (apple_pcie_port_readl(port, PORT_LINKSTS) & PORT_LINKSTS_UP))
+			continue;
+		ret = apple_pcie_s2r_port_release_noirq(pcie, port);
+		if (ret)
+			apple_pcie_s2r_port_failed(pcie, port, ret);
+		else
+			released |= BIT(port->idx);
+	}
+	if (!released)
+		return;
+	/* 100 ms after PERST# (PCIe r5.0, 6.6.1), once for all of them. */
+	msleep(100);
+	list_for_each_entry(port, &pcie->ports, entry) {
+		if (port->idx >= BITS_PER_LONG || !(released & BIT(port->idx)))
+			continue;
+		ret = apple_pcie_s2r_port_train_noirq(pcie, port);
+		if (ret)
+			apple_pcie_s2r_port_failed(pcie, port, ret);
+		else
+			trained |= BIT(port->idx);
+	}
+	/*
+	 * A link above 5 GT/s takes no config request before 100 ms after its training
+	 * (PCIe r5.0, 6.6.1). Up to 5 GT/s the time since PERST# is what counts, and that
+	 * has passed.
+	 */
+	list_for_each_entry(port, &pcie->ports, entry) {
+		void __iomem *dbi = pcie->cfg->win + ((resource_size_t)port->idx << 15);
+
+		if (port->idx >= BITS_PER_LONG || !(trained & BIT(port->idx)))
+			continue;
+		/* The target, not the current speed: the change of speed may still run. */
+		if ((readw_relaxed(dbi + NEO_DBI_CAP_LNKCTL2) & PCI_EXP_LNKCTL2_TLS) >
+		    PCI_EXP_LNKCTL2_TLS_5_0GT)
+			fast = true;
+	}
+	if (fast)
+		msleep(100);
+	list_for_each_entry(port, &pcie->ports, entry) {
+		if (port->idx >= BITS_PER_LONG || !(trained & BIT(port->idx)))
+			continue;
+		dev_info(pcie->dev, "S2R: %pOF link back with the loader's port settings\n",
+			 port->np);
+	}
+}
+
+/* What only the port registers hold, for a restore that finds them reset. */
+static void apple_pcie_restore_save(struct apple_pcie *pcie)
+{
+	struct apple_pcie_port *port;
+	int i;
+
+	mutex_lock(&pcie->lock);
+	list_for_each_entry(port, &pcie->ports, entry) {
+		apple_pcie_s2r_save_port(pcie, port);
+		port->restore_link_up = apple_pcie_port_readl(port, PORT_LINKSTS) & PORT_LINKSTS_UP;
+		port->restore_cold = false;
+		port->saved_intmask = apple_pcie_port_readl(port, PORT_INTMSK);
+		for_each_set_bit(i, port->sid_map, port->sid_map_sz)
+			port->saved_rid2sid[i] =
+				apple_pcie_port_readl(port, port_rid2sid_offset(port, i));
+	}
+	mutex_unlock(&pcie->lock);
+}
+
+static void apple_pcie_restore_free_fns(struct apple_pcie *pcie)
+{
+	struct apple_pcie_restore_fn *fn, *tmp;
+
+	list_for_each_entry_safe(fn, tmp, &pcie->restore_fns, entry) {
+		list_del(&fn->entry);
+		kfree(fn->state);
+		pci_dev_put(fn->pdev);
+		kfree(fn);
+	}
+}
+
+/*
+ * The PCI core's noirq restore spends the functions' saved state on a link that is down
+ * ("device inaccessible"). A copy taken first goes back once the link is: the core's normal
+ * restore then restores it (pci_pm_restore() restores a function whose state is saved).
+ */
+static int apple_pcie_restore_keep_fn(struct pci_dev *pdev, void *data)
+{
+	struct apple_pcie *pcie = data;
+	struct apple_pcie_port *port;
+	struct apple_pcie_restore_fn *fn;
+
+	if (pci_is_root_bus(pdev->bus) || !pdev->state_saved)
+		return 0;
+	port = apple_pcie_get_port(pdev);
+	if (!port || !port->restore_cold)
+		return 0;
+	fn = kzalloc_obj(*fn);
+	if (!fn)
+		return 0;
+	fn->state = pci_store_saved_state(pdev);
+	if (!fn->state) {
+		kfree(fn);
+		return 0;
+	}
+	fn->pdev = pci_dev_get(pdev);
+	list_add_tail(&fn->entry, &pcie->restore_fns);
+	return 0;
+}
+
+/*
+ * Before the PCI core restores the functions. Reading the link state is what probe does on
+ * every cold boot; nothing is written to a port in this phase. Its PWREN is an SMC GPIO, and
+ * the SMC session is back only in the normal phase.
+ */
+static void apple_pcie_restore_check_noirq(struct apple_pcie *pcie, const char *what)
+{
+	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
+	struct apple_pcie_port *port;
+	bool cold = false;
+
+	apple_pcie_restore_free_fns(pcie);
+	list_for_each_entry(port, &pcie->ports, entry) {
+		if (!port->restore_link_up)
+			continue;
+		if (apple_pcie_port_readl(port, PORT_LINKSTS) & PORT_LINKSTS_UP)
+			continue;
+		port->restore_cold = true;
+		cold = true;
+		dev_info(pcie->dev, "%s: %pOF lost its link, setting it up again\n",
+			 what, port->np);
+	}
+	if (cold && bridge->bus)
+		pci_walk_bus(bridge->bus, apple_pcie_restore_keep_fn, pcie);
+}
 
 /*
  * The J716c radio drivers save PCI state without entering D3. The PCI core
@@ -5984,8 +6279,8 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 	if (!pcie->hw->tunneled) {
 		if (pm_suspend_no_platform() && pcie->num_pds)
 			return apple_pcie_hold_domains(pcie);
-		if (apple_pcie_hib_conventional(pcie) && pm_suspend_via_firmware())
-			apple_pcie_hib_save(pcie);
+		if (apple_pcie_conventional_host(pcie) && pm_suspend_via_firmware())
+			apple_pcie_restore_save(pcie);
 		return 0;
 	}
 	pcie->reset_on_resume = false;
@@ -6477,9 +6772,9 @@ static int apple_pcie_resume_noirq(struct device *dev)
 		return ret;
 	}
 	if (!pcie->hw->tunneled) {
-		if (apple_pcie_hib_conventional(pcie) && pm_resume_via_firmware()) {
+		if (apple_pcie_conventional_host(pcie) && pm_resume_via_firmware()) {
 			apple_pcie_s2r_up_noirq(pcie);
-			apple_pcie_hib_restore_noirq(pcie, "S2R");
+			apple_pcie_restore_check_noirq(pcie, "S2R");
 		}
 		return 0;
 	}
@@ -6549,6 +6844,31 @@ failed:
 	return ret;
 }
 
+/* Probe's bring-up of a conventional port, with the state this kernel had programmed. */
+static int apple_pcie_restore_port_up(struct apple_pcie *pcie, struct apple_pcie_port *port)
+{
+	int ret;
+
+	/* A port with auxiliary resets does not keep its GPIOs for a second bring-up. */
+	if (!port->perst_gpio)
+		return -EOPNOTSUPP;
+	ret = apple_pcie_setup_link(pcie, port, port->np);
+	if (ret)
+		return ret;
+	apple_pcie_port_gate_clocks(pcie, port);
+	/* All port interrupts masked and cleared, MSI routing as at probe. */
+	apple_pcie_tunnel_restore_irq_hw(port);
+	apple_pcie_restore_rid2sid(pcie, port);
+	ret = apple_pcie_restore_train(pcie, port);
+	if (ret)
+		return ret;
+	apple_pcie_port_writel(port, BIT(PORT_INT_LINK_UP), PORT_INTSTAT);
+	apple_pcie_port_writel(port, port->saved_intmask, PORT_INTMSK);
+	/* 100 ms after the link before configuration requests (PCIe r5.0, 6.6.1). */
+	msleep(100);
+	return 0;
+}
+
 static int apple_pcie_prepare(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
@@ -6568,334 +6888,6 @@ static int apple_pcie_prepare(struct device *dev)
 }
 
 /*
- * A conventional host (the internal ports with their radio and SD reader) keeps running
- * through freeze and thaw. Only a kernel restored from an image finds it changed: the boot
- * that resumed it went through the boot loader, and when its kernel did not set the ports up
- * (a boot kernel without the GPIO drivers that probing the host takes), the endpoints sit
- * unpowered or in reset behind a link that is down. The restore then does what probe did.
- * A real suspend-to-RAM takes the host's power as a resume from disk does, so its ports
- * come back the same way.
- */
-static bool apple_pcie_hib_conventional(struct apple_pcie *pcie)
-{
-	return !pcie->hw->tunneled && !pcie->managed_sids && !pcie->piodma_supplier &&
-	       !pcie->hw->root_bus_only;
-}
-
-/*
- * Root port words the loader limits at boot (one lane at the endpoint's speed) and a reset
- * puts back to the core's own: link capabilities, the target speed, link mode and lane count.
- */
-static const u16 apple_pcie_s2r_dbi[] = {
-	NEO_DBI_CAP_LNKCAP, NEO_DBI_CAP_LNKCAP2, NEO_DBI_CAP_LNKCTL2,
-	NEO_DBI_PORT_LINK_CONTROL, NEO_DBI_WIDTH_SPEED_CONTROL,
-};
-
-static int apple_pcie_hib_train(struct apple_pcie *pcie, struct apple_pcie_port *port);
-static void apple_pcie_hib_rid2sid(struct apple_pcie *pcie, struct apple_pcie_port *port);
-
-static void apple_pcie_s2r_save_port(struct apple_pcie *pcie, struct apple_pcie_port *port)
-{
-	void __iomem *dbi = pcie->cfg->win + ((resource_size_t)port->idx << 15);
-	int i;
-
-	BUILD_BUG_ON(ARRAY_SIZE(apple_pcie_s2r_dbi) != ARRAY_SIZE(port->s2r_dbi));
-	/* The loader's port setup writes 0x130; the port tunable has its own word. */
-	port->s2r_port_130 = apple_pcie_port_readl(port, 0x130);
-	for (i = 0; i < ARRAY_SIZE(apple_pcie_s2r_dbi); i++)
-		port->s2r_dbi[i] = readl_relaxed(dbi + apple_pcie_s2r_dbi[i]);
-	port->s2r_saved = true;
-}
-
-/* The root port part goes in once the port runs again, before the link starts. */
-static void apple_pcie_s2r_restore_rc(struct apple_pcie *pcie, struct apple_pcie_port *port)
-{
-	void __iomem *dbi = pcie->cfg->win + ((resource_size_t)port->idx << 15);
-	int i;
-
-	rmw_set(NEO_DBI_RO_WR_EN, dbi + NEO_DBI_RO_WR);
-	for (i = 0; i < ARRAY_SIZE(port->s2r_rc_tunable); i++)
-		apple_tunable_apply(dbi, port->s2r_rc_tunable[i]);
-	for (i = 0; i < ARRAY_SIZE(apple_pcie_s2r_dbi); i++) {
-		/* Link Control 2 shares its word with a status register. */
-		if (apple_pcie_s2r_dbi[i] == NEO_DBI_CAP_LNKCTL2)
-			writew_relaxed(port->s2r_dbi[i], dbi + apple_pcie_s2r_dbi[i]);
-		else
-			writel_relaxed(port->s2r_dbi[i], dbi + apple_pcie_s2r_dbi[i]);
-	}
-	/* The link goes to the target speed once it is up, as after the loader's setup. */
-	rmw_set(NEO_DBI_SPEED_CHANGE, dbi + NEO_DBI_WIDTH_SPEED_CONTROL);
-	rmw_clear(NEO_DBI_RO_WR_EN, dbi + NEO_DBI_RO_WR);
-}
-
-/*
- * A real S2R took the port block's power: the sleep's wake side clocked the port again and
- * the pin restore released PERST#, with the link down and every word of the port and of its
- * root port at its reset value. Do what the loader and probe did between them, here, so that
- * the PCI core's noirq pass finds the functions: PERST# asserted again, the port's and the
- * root port's settings back, PERST# released, the link trained. The endpoint's power line
- * is not touched: it is the SMC's, whose session is back only in the normal phase, and it
- * reads on after the wake.
- *
- * In two steps, so that the ports share the two waits instead of each taking its own: up to
- * the release of PERST#, and from the port's ready bit on.
- */
-static int apple_pcie_s2r_port_release_noirq(struct apple_pcie *pcie,
-					     struct apple_pcie_port *port)
-{
-	int ret;
-
-	rmw_set(PORT_APPCLK_EN, port->base + PORT_APPCLK);
-	gpiod_set_value(port->perst_gpio, 1);
-	if (!pcie->hw->retain_clocks) {
-		ret = apple_pcie_setup_refclk(pcie, port);
-		if (ret < 0)
-			return ret;
-	}
-	apple_pcie_port_writel(port, port->s2r_port_130, 0x130);
-	apple_tunable_apply(port->base, port->s2r_port_tunable);
-	/* Tperst-clk (PCIe CEM r5.0, 2.9.2) */
-	usleep_range(100, 200);
-	rmw_set(PORT_PERST_OFF, port->base + pcie->hw->port_perst);
-	gpiod_set_value(port->perst_gpio, 0);
-	return 0;
-}
-
-static int apple_pcie_s2r_port_train_noirq(struct apple_pcie *pcie, struct apple_pcie_port *port)
-{
-	u32 stat;
-	int ret;
-
-	ret = readl_relaxed_poll_timeout(port->base + PORT_STATUS, stat,
-					 stat & PORT_STATUS_READY, 100, 250000);
-	if (ret)
-		return ret;
-	apple_pcie_s2r_restore_rc(pcie, port);
-	apple_pcie_port_gate_clocks(pcie, port);
-	apple_pcie_tunnel_restore_irq_hw(port);
-	apple_pcie_hib_rid2sid(pcie, port);
-	ret = apple_pcie_hib_train(pcie, port);
-	if (ret)
-		return ret;
-	apple_pcie_port_writel(port, BIT(PORT_INT_LINK_UP), PORT_INTSTAT);
-	apple_pcie_port_writel(port, port->saved_intmask, PORT_INTMSK);
-	return 0;
-}
-
-static void apple_pcie_s2r_port_failed(struct apple_pcie *pcie, struct apple_pcie_port *port,
-				       int ret)
-{
-	dev_warn(pcie->dev, "S2R: %pOF link not back in the noirq phase (%d, LTSSM %#x)\n",
-		 port->np, ret, apple_pcie_port_ltssm(pcie, port));
-}
-
-/* A port that does not come up here is left to the normal phase, as before. */
-static void apple_pcie_s2r_up_noirq(struct apple_pcie *pcie)
-{
-	struct apple_pcie_port *port;
-	unsigned long released = 0, trained = 0;
-	bool fast = false;
-	int ret;
-
-	list_for_each_entry(port, &pcie->ports, entry) {
-		if (!port->hib_link_up || !port->s2r_saved || !port->perst_gpio ||
-		    gpiod_cansleep(port->perst_gpio) || port->idx >= BITS_PER_LONG ||
-		    (apple_pcie_port_readl(port, PORT_LINKSTS) & PORT_LINKSTS_UP))
-			continue;
-		ret = apple_pcie_s2r_port_release_noirq(pcie, port);
-		if (ret)
-			apple_pcie_s2r_port_failed(pcie, port, ret);
-		else
-			released |= BIT(port->idx);
-	}
-	if (!released)
-		return;
-	/* 100 ms after PERST# (PCIe r5.0, 6.6.1), once for all of them. */
-	msleep(100);
-	list_for_each_entry(port, &pcie->ports, entry) {
-		if (port->idx >= BITS_PER_LONG || !(released & BIT(port->idx)))
-			continue;
-		ret = apple_pcie_s2r_port_train_noirq(pcie, port);
-		if (ret)
-			apple_pcie_s2r_port_failed(pcie, port, ret);
-		else
-			trained |= BIT(port->idx);
-	}
-	/*
-	 * A link above 5 GT/s takes no config request before 100 ms after its training
-	 * (PCIe r5.0, 6.6.1). Up to 5 GT/s the time since PERST# is what counts, and that
-	 * has passed.
-	 */
-	list_for_each_entry(port, &pcie->ports, entry) {
-		void __iomem *dbi = pcie->cfg->win + ((resource_size_t)port->idx << 15);
-
-		if (port->idx >= BITS_PER_LONG || !(trained & BIT(port->idx)))
-			continue;
-		/* The target, not the current speed: the change of speed may still run. */
-		if ((readw_relaxed(dbi + NEO_DBI_CAP_LNKCTL2) & PCI_EXP_LNKCTL2_TLS) >
-		    PCI_EXP_LNKCTL2_TLS_5_0GT)
-			fast = true;
-	}
-	if (fast)
-		msleep(100);
-	list_for_each_entry(port, &pcie->ports, entry) {
-		if (port->idx >= BITS_PER_LONG || !(trained & BIT(port->idx)))
-			continue;
-		dev_info(pcie->dev, "S2R: %pOF link back with the loader's port settings\n",
-			 port->np);
-	}
-}
-
-
-/* What only the port registers hold, for a restore that finds them reset. */
-static void apple_pcie_hib_save(struct apple_pcie *pcie)
-{
-	struct apple_pcie_port *port;
-	int i;
-
-	mutex_lock(&pcie->lock);
-	list_for_each_entry(port, &pcie->ports, entry) {
-		apple_pcie_s2r_save_port(pcie, port);
-		port->hib_link_up = apple_pcie_port_readl(port, PORT_LINKSTS) & PORT_LINKSTS_UP;
-		port->hib_cold = false;
-		port->saved_intmask = apple_pcie_port_readl(port, PORT_INTMSK);
-		for_each_set_bit(i, port->sid_map, port->sid_map_sz)
-			port->saved_rid2sid[i] =
-				apple_pcie_port_readl(port, port_rid2sid_offset(port, i));
-	}
-	mutex_unlock(&pcie->lock);
-}
-
-static void apple_pcie_hib_free_fns(struct apple_pcie *pcie)
-{
-	struct apple_pcie_hib_fn *fn, *tmp;
-
-	list_for_each_entry_safe(fn, tmp, &pcie->hib_fns, entry) {
-		list_del(&fn->entry);
-		kfree(fn->state);
-		pci_dev_put(fn->pdev);
-		kfree(fn);
-	}
-}
-
-/*
- * The PCI core's noirq restore spends the functions' saved state on a link that is down
- * ("device inaccessible"). A copy taken first goes back once the link is: the core's normal
- * restore then restores it (pci_pm_restore() restores a function whose state is saved).
- */
-static int apple_pcie_hib_keep_fn(struct pci_dev *pdev, void *data)
-{
-	struct apple_pcie *pcie = data;
-	struct apple_pcie_port *port;
-	struct apple_pcie_hib_fn *fn;
-
-	if (pci_is_root_bus(pdev->bus) || !pdev->state_saved)
-		return 0;
-	port = apple_pcie_get_port(pdev);
-	if (!port || !port->hib_cold)
-		return 0;
-	fn = kzalloc_obj(*fn);
-	if (!fn)
-		return 0;
-	fn->state = pci_store_saved_state(pdev);
-	if (!fn->state) {
-		kfree(fn);
-		return 0;
-	}
-	fn->pdev = pci_dev_get(pdev);
-	list_add_tail(&fn->entry, &pcie->hib_fns);
-	return 0;
-}
-
-/*
- * Before the PCI core restores the functions. Reading the link state is what probe does on
- * every cold boot; nothing is written to a port in this phase. Its PWREN is an SMC GPIO, and
- * the SMC session is back only in the normal phase.
- */
-static void apple_pcie_hib_restore_noirq(struct apple_pcie *pcie, const char *what)
-{
-	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
-	struct apple_pcie_port *port;
-	bool cold = false;
-
-	apple_pcie_hib_free_fns(pcie);
-	list_for_each_entry(port, &pcie->ports, entry) {
-		if (!port->hib_link_up)
-			continue;
-		if (apple_pcie_port_readl(port, PORT_LINKSTS) & PORT_LINKSTS_UP)
-			continue;
-		port->hib_cold = true;
-		cold = true;
-		dev_info(pcie->dev, "%s: %pOF lost its link, setting it up again\n",
-			 what, port->np);
-	}
-	if (cold && bridge->bus)
-		pci_walk_bus(bridge->bus, apple_pcie_hib_keep_fn, pcie);
-}
-
-/* Bounded like probe's wait, polled: the link interrupts stay masked meanwhile. */
-static int apple_pcie_hib_train(struct apple_pcie *pcie, struct apple_pcie_port *port)
-{
-	int attempt, attempts = port->perst ? 1 + LINK_RESET_RETRIES : 1;
-	u32 stat;
-	int ret = -ETIMEDOUT;
-
-	for (attempt = 0; attempt < attempts; attempt++) {
-		if (attempt) {
-			dev_info(pcie->dev, "%pOF link down after %dms (LTSSM %#x), resetting the endpoint\n",
-				 port->np, link_up_timeout, apple_pcie_port_ltssm(pcie, port));
-			ret = apple_pcie_port_reset_endpoint(pcie, port);
-			if (ret)
-				return ret;
-		}
-		apple_pcie_port_writel(port, PORT_LTSSMCTL_START, PORT_LTSSMCTL);
-		ret = readl_relaxed_poll_timeout(port->base + PORT_LINKSTS, stat,
-						 stat & PORT_LINKSTS_UP, 100,
-						 link_up_timeout * 1000);
-		if (!ret)
-			break;
-	}
-	return ret;
-}
-
-/* This kernel's RID-to-SID table, every other entry cleared as probe clears them. */
-static void apple_pcie_hib_rid2sid(struct apple_pcie *pcie, struct apple_pcie_port *port)
-{
-	int i;
-
-	mutex_lock(&pcie->lock);
-	for (i = 0; i < port->sid_map_sz; i++)
-		apple_pcie_rid2sid_write(port, i, test_bit(i, port->sid_map) ?
-					 port->saved_rid2sid[i] : 0);
-	mutex_unlock(&pcie->lock);
-}
-
-/* Probe's bring-up of a conventional port, with the state this kernel had programmed. */
-static int apple_pcie_hib_port_up(struct apple_pcie *pcie, struct apple_pcie_port *port)
-{
-	int ret;
-
-	/* A port with auxiliary resets does not keep its GPIOs for a second bring-up. */
-	if (!port->perst_gpio)
-		return -EOPNOTSUPP;
-	ret = apple_pcie_setup_link(pcie, port, port->np);
-	if (ret)
-		return ret;
-	apple_pcie_port_gate_clocks(pcie, port);
-	/* All port interrupts masked and cleared, MSI routing as at probe. */
-	apple_pcie_tunnel_restore_irq_hw(port);
-	apple_pcie_hib_rid2sid(pcie, port);
-	ret = apple_pcie_hib_train(pcie, port);
-	if (ret)
-		return ret;
-	apple_pcie_port_writel(port, BIT(PORT_INT_LINK_UP), PORT_INTSTAT);
-	apple_pcie_port_writel(port, port->saved_intmask, PORT_INTMSK);
-	/* 100 ms after the link before configuration requests (PCIe r5.0, 6.6.1). */
-	msleep(100);
-	return 0;
-}
-
-/*
  * The normal phase, after the SMC's own restore (the PWREN GPIOs are its) and before the PCI
  * core's normal restore of the functions, which waits for this host as their ancestor.
  */
@@ -6903,42 +6895,42 @@ static void apple_pcie_conventional_up(struct apple_pcie *pcie, const char *what
 {
 	struct device *dev = pcie->dev;
 	struct apple_pcie_port *port;
-	struct apple_pcie_hib_fn *fn;
+	struct apple_pcie_restore_fn *fn;
 	unsigned int back = 0;
 	int ret;
 
 	list_for_each_entry(port, &pcie->ports, entry) {
-		if (!port->hib_link_up)
+		if (!port->restore_link_up)
 			continue;
-		if (!port->hib_cold) {
+		if (!port->restore_cold) {
 			/*
 			 * Up: set up by the boot that resumed, or never reset. The functions
 			 * this kernel enabled keep their mappings only if the table is its own.
 			 */
-			apple_pcie_hib_rid2sid(pcie, port);
+			apple_pcie_restore_rid2sid(pcie, port);
 			continue;
 		}
-		ret = apple_pcie_hib_port_up(pcie, port);
+		ret = apple_pcie_restore_port_up(pcie, port);
 		if (ret) {
 			dev_err(dev, "%s: %pOF link not back (%d), its functions stay unreachable\n",
 				what, port->np, ret);
-			port->hib_cold = false;
+			port->restore_cold = false;
 			continue;
 		}
 		dev_info(dev, "%s: %pOF link back, PWREN and PERST# cycled as at probe\n",
 			 what, port->np);
 		back++;
 	}
-	list_for_each_entry(fn, &pcie->hib_fns, entry) {
+	list_for_each_entry(fn, &pcie->restore_fns, entry) {
 		port = apple_pcie_get_port(fn->pdev);
-		if (!port || !port->hib_cold)
+		if (!port || !port->restore_cold)
 			continue;
 		if (pci_load_saved_state(fn->pdev, fn->state))
 			pci_warn(fn->pdev, "%s: saved configuration not taken back\n", what);
 	}
-	apple_pcie_hib_free_fns(pcie);
+	apple_pcie_restore_free_fns(pcie);
 	list_for_each_entry(port, &pcie->ports, entry)
-		port->hib_cold = false;
+		port->restore_cold = false;
 	if (back)
 		dev_dbg(dev, "%s: %u port(s) set up again\n", what, back);
 }
@@ -6947,7 +6939,7 @@ static int apple_pcie_restore(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
 
-	if (!apple_pcie_hib_conventional(pcie) || !pm_hibernate_is_restored())
+	if (!apple_pcie_conventional_host(pcie) || !pm_hibernate_is_restored())
 		return 0;
 	apple_pcie_conventional_up(pcie, "resume from disk");
 	return 0;
@@ -6958,7 +6950,7 @@ static int apple_pcie_resume(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
 
-	if (!apple_pcie_hib_conventional(pcie) || !pm_resume_via_firmware())
+	if (!apple_pcie_conventional_host(pcie) || !pm_resume_via_firmware())
 		return 0;
 	apple_pcie_conventional_up(pcie, "S2R");
 	return 0;
@@ -6969,15 +6961,15 @@ static int apple_pcie_resume(struct device *dev)
  * tunnel as a system sleep that keeps nothing does, thaw and restore start it
  * again. After a restore the controller comes back from a power cycle, so the
  * start replays the whole cold sequence. A conventional host only saves what a
- * restore over a cold boot needs, see apple_pcie_hib_conventional().
+ * restore over a cold boot needs, see apple_pcie_conventional_host().
  */
 static int apple_pcie_hibernate_noirq(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
 
 	if (!pcie->hw->tunnel_hibernate) {
-		if (apple_pcie_hib_conventional(pcie))
-			apple_pcie_hib_save(pcie);
+		if (apple_pcie_conventional_host(pcie))
+			apple_pcie_restore_save(pcie);
 		return 0;
 	}
 	pcie->reset_on_resume = false;
@@ -7001,8 +6993,8 @@ static int apple_pcie_restore_noirq(struct device *dev)
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
 
 	if (!pcie->hw->tunnel_hibernate) {
-		if (apple_pcie_hib_conventional(pcie) && pm_hibernate_is_restored())
-			apple_pcie_hib_restore_noirq(pcie, "resume from disk");
+		if (apple_pcie_conventional_host(pcie) && pm_hibernate_is_restored())
+			apple_pcie_restore_check_noirq(pcie, "resume from disk");
 		return 0;
 	}
 	return apple_pcie_resume_noirq(dev);
