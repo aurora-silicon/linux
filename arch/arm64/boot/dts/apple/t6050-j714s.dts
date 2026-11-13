@@ -621,6 +621,7 @@
 
 /* The Neural Engine, started only after the boot loader's preload hand-off */
 #include "t6050-j714s-ane.dtsi"
+#include "t6050-j714s-sleep.dtsi"
 
 /*
  * Sound through the AOP, as on J813: its audio service runs the serializers, the

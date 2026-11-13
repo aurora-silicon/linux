@@ -1,0 +1,226 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Deep sleep (suspend to RAM) on the J714s: the sleep controller and what it needs from the
+ * rest of the tree. Its blocks are the ADT's pmgr, cluster, watchdog, SPMI, PMC, PTD, clock
+ * generator and memory controller pages; the coprocessors it stops are bound by their drivers.
+ */
+
+/ {
+	aliases {
+		/* The boot loader finds the SIO by this alias and gives it its firmware and tables. */
+		sio = &sio;
+	};
+
+	sleep: sleep-controller@280600000 {
+		compatible = "apple,t6050-sleep";
+		reg = <0x2 0x80600000 0x0 0x4000>,
+		      <0x2 0x80900000 0x0 0x4000>,
+		      <0x2 0x88300000 0x0 0xc000>,
+		      <0x23 0x00e80000 0x0 0x4000>,
+		      <0x23 0x80600000 0x0 0xc000>,
+		      <0x23 0x88300000 0x0 0x4000>,
+		      <0x2 0x80760000 0x0 0x10000>,
+		      <0x2 0x807d4000 0x0 0x4000>,
+		      <0x2 0x80930000 0x0 0x4000>,
+		      <0x23 0x00e90000 0x0 0x4000>,
+		      <0x23 0x80760000 0x0 0x10000>,
+		      <0x2 0x80700000 0x0 0x20000>,
+		      <0x23 0x80700000 0x0 0x14000>,
+		      <0x2 0x807ec000 0x0 0x4000>,
+		      <0x2 0x80950000 0x0 0x4000>,
+		      <0x23 0x807dc000 0x0 0x4000>,
+		      <0x2 0x80620000 0x0 0x4000>,
+		      <0x2 0x8062c000 0x0 0x4000>,
+		      <0x2 0x80688000 0x0 0x4000>,
+		      <0x2 0x88f04000 0x0 0x4000>,
+		      <0x2 0x8836c000 0x0 0x4000>,
+		      <0x2 0x88330000 0x0 0x4000>,
+		      <0x2 0x80920000 0x0 0x4000>,
+		      <0x2 0x8a014000 0x0 0x4000>,
+		      <0x2 0x86700000 0x0 0x14000>,
+		      <0x2 0x86806000 0x0 0x3000>,
+		      <0x2 0x84240000 0x0 0x20000>,
+		      <0x2 0x803f0000 0x0 0x4000>,
+		      <0x2 0x88370000 0x0 0x4000>,
+		      <0x23 0x88370000 0x0 0x4000>,
+		      <0x2 0x10e40000 0x0 0x10000>,
+		      <0x2 0x11e40000 0x0 0x10000>,
+		      <0x2 0x12e40000 0x0 0x10000>,
+		      <0x4 0x17020000 0x0 0x4000>,
+		      <0x4 0x17980000 0x0 0x4000>,
+		      <0x2 0x80000000 0x0 0x4000>,
+		      <0x2 0x80078000 0x0 0x4000>,
+		      <0x23 0x80078000 0x0 0x4000>,
+		      <0x22 0x20200000 0x0 0x8000>,
+		      <0x22 0x20400000 0x0 0x8000>,
+		      <0x22 0x20600000 0x0 0x8000>,
+		      <0x22 0x20800000 0x0 0x8000>,
+		      <0x22 0x22200000 0x0 0x8000>,
+		      <0x2 0x88004000 0x0 0x4000>,
+		      <0x23 0x88004000 0x0 0x4000>,
+		      <0x23 0x80400000 0x0 0x4000>;
+		reg-names = "ps0", "ps1", "ps-aon", "ps-gpx", "ps-media", "ps-gfx-aon",
+			    "clk", "clk-soc", "clk1", "afr-clk", "media-clk",
+			    "perf", "media-perf", "table0", "table1", "media-table",
+			    "cluster", "pwrgate", "cpu-start", "commit", "wdt", "wdt-aux",
+			    "disp-gate", "spmi", "pmc-voters", "pmc-rails", "ptd", "gapf",
+			    "aon-clk", "media-aon-clk", "cpm0", "cpm1", "cpm2",
+			    "storage-phy", "storage-phy-ip",
+			    "clkgen", "clkgen-78", "media-clkgen-78",
+			    "mcc22", "mcc23", "mcc24", "mcc25", "mcc26",
+			    "wake", "wake-gfx", "aic-gfx";
+		apple,display-coprocessors = <&dcp>, <&dcpext0>, <&dcpext1>, <&dcpext2>, <&dcpext3>;
+		apple,spmi-buses = <&nub_spmi_a0>, <&nub_spmi2>, <&nub_spmi_a1>, <&nub_spmi3>,
+				   <&aop_spmi0>;
+		/* SEP's, PMP0's, SIO's and the DCP's DART, stopped in the sleep's last steps */
+		apple,sleep-darts = <&sep_dart>, <&pmp0_dart>, <&sio_dart>, <&dcp_dart>;
+		/* The N1's host: its link is shut down for the sleep and brought back after it */
+		apple,radio-pcie = <&pcie0>;
+		apple,pinctrl = <&pinctrl_ap>;
+		/* The audio codec's reset, driven low in the sleep entry */
+		apple,sleep-low-pins = <139>;
+		/*
+		 * Still to come from the boot loader: the AP pins to leave alone (without them no pin
+		 * is saved over the sleep), the AP wake sources (without them the wake masks stay as
+		 * iBoot left them), the PMGR clock pages' and the clusters' CPM set-up, and the radio
+		 * link's and the shared PCIe PHY's register sequences (without them the radio's link
+		 * is not shut down and the sleep is refused while its host is bound).
+		 */
+	};
+};
+
+/* The PMU's alarm wakes the SoC from a sleep; generation 4 SPMI raises no interrupt for it. */
+&pmu {
+	pmu_rtc: rtc {
+		compatible = "apple,t6050-pmu-rtc", "apple,t6041-pmu-rtc";
+		nvmem-cells = <&rtc_offset>;
+		nvmem-cell-names = "rtc_offset";
+		wakeup-source;
+	};
+};
+
+/* On through macOS's commit: the sleep stops their users in its last steps. */
+&ps_pmp {
+	apple,always-on;
+};
+
+&ps_pms_sram {
+	apple,always-on;
+};
+
+&ps_gfx {
+	apple,always-on;
+};
+
+&ps_spi_p {
+	apple,always-on;
+};
+
+&ps_atc3_usb_aon {
+	apple,always-on;
+};
+
+&ps_sio {
+	apple,always-on;
+	status = "okay";
+};
+
+&ps_sio_cpu {
+	apple,always-on;
+	status = "okay";
+};
+
+/* The port controllers macOS puts in system power state S3 before its commit, then SLEEP */
+&hpm1 {
+	apple,sleep-ssps;
+};
+
+&hpm2 {
+	apple,sleep-ssps;
+};
+
+&hpm5 {
+	apple,sleep-ssps;
+};
+
+&{/soc@200000000} {
+	/*
+	 * The cores' power-gate enables, /arm-io/pmgr reg[0] + 0x2c000, one word per core: the
+	 * boot loader leaves core 0's (the boot core's) and core 12's clear. Without them the
+	 * boot cluster never powers down, and the sleep never gets past its first sequence.
+	 */
+	cluster_pwrgate: power-gate@28062c000 {
+		compatible = "apple,t6050-cluster-pwrgate", "apple,cluster-pwrgate";
+		reg = <0x2 0x8062c000 0x0 0x4>,
+		      <0x2 0x8062c0c0 0x0 0x4>;
+	};
+};
+
+/* AOP2, which macOS has running at its commit: its ASC mailbox at the AOP2 ASC + 0x8000 */
+&{/soc@200000000} {
+	aop2_mbox: mailbox@291608000 {
+		compatible = "apple,t6050-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x2 0x91608000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 586 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 587 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 588 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 589 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+};
+
+&aop2 {
+	reg = <0x2 0x91600000 0x0 0x4000>;
+	reg-names = "asc";
+	/delete-property/ interrupts;
+	mboxes = <&aop2_mbox>;
+	mbox-names = "mbox";
+	apple,dma-range = <0x110 0x0 0x10 0x0>;
+	status = "okay";
+};
+
+/*
+ * The SIO, running until the sleep's own stop as on macOS: its ASC bank split around its
+ * mailbox, and SPI2's controller and power word for the Touch ID sensor's sleep command.
+ * The boot loader enables it with its firmware and tables.
+ */
+/delete-node/ &sio;
+
+&{/soc@200000000} {
+	sio_mbox: mailbox@505e08000 {
+		compatible = "apple,t6050-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x5 0x5e08000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 0 1391 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1392 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1393 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1394 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		power-domains = <&ps_sio_cpu>;
+		#mbox-cells = <0>;
+	};
+
+	sio: dma-controller@505e00000 {
+		compatible = "apple,t6050-sio", "apple,sio";
+		reg = <0x5 0x5e00000 0x0 0x8000>,
+		      <0x5 0x5850000 0x0 0x4000>,
+		      <0x5 0x5e0c000 0x0 0x7c000>,
+		      <0x5 0x5108000 0x0 0x4000>,
+		      <0x2 0x80900330 0x0 0x4>;
+		reg-names = "asc", "auxiliary", "asc-tail", "spi2", "spi2-ps";
+		#dma-cells = <1>;
+		dma-channels = <128>;
+		mboxes = <&sio_mbox>;
+		iommus = <&sio_dart 0>;
+		power-domains = <&ps_sio_cpu>;
+		clocks = <&peripheral_clocks 359>, <&peripheral_clocks 358>;
+		status = "disabled";
+	};
+};
+
+&sio_dart {
+	power-domains = <&ps_sio_cpu>;
+	status = "okay";
+};
