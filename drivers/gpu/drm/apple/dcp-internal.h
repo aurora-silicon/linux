@@ -1160,6 +1160,15 @@ static inline bool dcp_is_v14_7_external(const struct apple_dcp *dcp)
 	return dcp->fw_compat == DCP_FIRMWARE_V_14_7 && dcp->external_native;
 }
 
+/*
+ * Firmware 27's external processors (the T6050 DCPEXTs): their DP/HDMI
+ * audio service is the desktop one, on endpoint 0x2b (see av.c).
+ */
+static inline bool dcp_is_v27_external(const struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_27_0 && dcp->hw.num_dptx_ports;
+}
+
 /* The 14.7 internal panel (J514S/J516S), presented through DCPLink. */
 static inline bool dcp_is_v14_7_panel(const struct apple_dcp *dcp)
 {
