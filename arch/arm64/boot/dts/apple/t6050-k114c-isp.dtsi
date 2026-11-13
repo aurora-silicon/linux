@@ -1,0 +1,173 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * K114c camera (IMX958, ADT platform id 0xb9).
+ *
+ * The firmware segments are placed statically from the K114c ADT isp0
+ * segment-ranges, which iBoot fills before the kernel runs: text 0x10001228000
+ * size 0xc1c000, data 0x10002930000 size 0x13d0000, and 32 MiB of main memory
+ * at IOVA 0x100_0000_0000. There is no "isp" alias, so the loader leaves the
+ * node alone. The addresses move with iBoot: re-read them after an update.
+ * These values were read from, and booted on, one K114c.
+ *
+ * The K114c ADT has no camera-light GPIO (eic cil 1, mil 1, no cil-gpio-offset
+ * or config), so no light property is given and the driver does not wait on one.
+ */
+&{/reserved-memory} {
+	isp_fw_text: isp-firmware-text@10001228000 {
+		reg = <0x100 0x01228000 0x0 0xc1c000>;
+		iommu-addresses = <&isp0 0x100 0x0 0x0 0xc1c000>;
+		no-map;
+	};
+
+	isp_fw_data: isp-firmware-data@10002930000 {
+		reg = <0x100 0x02930000 0x0 0x13d0000>;
+		iommu-addresses = <&isp0 0x100 0xc1c000 0x0 0x13d0000>;
+		no-map;
+	};
+
+	isp_heap: isp-heap {
+		iommu-addresses = <&isp0 0x100 0x0 0x0 0x2000000>;
+	};
+};
+
+&isp0 {
+	/delete-property/ clocks;
+	compatible = "apple,t6050-isp", "apple,isp";
+	reg = <0x5 0x80000000 0 0x1604000>,
+	      <0x5 0x82924000 0 0x40>,
+	      <0x5 0x829241d0 0 0x20>,
+	      <0x5 0x82924464 0 0x10>,
+	      <0x5 0xc3b50000 0 0x8000>;
+	reg-names = "coproc", "mbox", "gpio", "mbox2", "wdt";
+	interrupts = <AIC_IRQ 0 513 IRQ_TYPE_LEVEL_HIGH>;
+	iommus = <&isp0_dart 0>, <&isp0_dart 12>,
+		 <&isp0_dart1 0>, <&isp0_dart1 12>,
+		 <&isp0_dart2 0>, <&isp0_dart2 12>;
+	power-domains = <&ps_isp_sys>, <&ps_isp_cpu>, <&ps_isp_fe>,
+			<&ps_ispsens0>, <&ps_isp_dprx>, <&ps_isp_secure>,
+			<&ps_isp_be>, <&ps_isp_clr>;
+	apple,dart-vm-size = /bits/ 64 <0xde600000>;
+	apple,platform-id = <0xb9>;
+	apple,temporal-filter = <1>;
+	apple,cam-connections-scheme = <0x10>;
+	memory-region = <&isp_fw_text>, <&isp_fw_data>, <&isp_heap>;
+	memory-region-names = "text", "data", "heap";
+	apple,camera-indicator = <&dcp>;
+	status = "okay";
+	sensor-presets {
+		preset0 {
+			apple,config-index = <6>;
+			apple,input-size = <3040 2880>;
+			apple,output-size = <1920 1080>;
+			apple,crop = <320 765 2400 1350>;
+		};
+	};
+};
+
+&isp0_dart {
+	compatible = "apple,t6050-isp-dart", "apple,t8110-dart";
+	reg = <0x5 0x828c0000 0 0xc000>, <0x5 0x828d0000 0 0x4000>;
+	reg-names = "dart", "dapf";
+	#iommu-cells = <1>;
+	interrupts = <AIC_IRQ 0 531 IRQ_TYPE_LEVEL_HIGH>;
+	power-domains = <&ps_isp_sys>;
+	apple,remap-streams = <1 0>, <6 0>, <7 0>, <10 0>, <11 0>;
+	status = "okay";
+};
+
+&isp0_dart1 {
+	compatible = "apple,t6050-isp-dart", "apple,t8110-dart";
+	reg = <0x5 0x828e0000 0 0xc000>;
+	reg-names = "dart";
+	#iommu-cells = <1>;
+	interrupts = <AIC_IRQ 0 531 IRQ_TYPE_LEVEL_HIGH>;
+	power-domains = <&ps_isp_sys>;
+	apple,remap-streams = <1 0>, <6 0>, <7 0>, <10 0>, <11 0>;
+	status = "okay";
+};
+
+&isp0_dart2 {
+	compatible = "apple,t6050-isp-dart", "apple,t8110-dart";
+	reg = <0x5 0x82900000 0 0xc000>;
+	reg-names = "dart";
+	#iommu-cells = <1>;
+	interrupts = <AIC_IRQ 0 531 IRQ_TYPE_LEVEL_HIGH>;
+	power-domains = <&ps_isp_sys>;
+	apple,remap-streams = <1 0>, <6 0>, <7 0>, <10 0>, <11 0>;
+	status = "okay";
+};
+
+&pmgr1 {
+	ps_isp_cpu: power-controller@3b0 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3b0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_cpu";
+		apple,no-auto-pm;
+		power-domains = <&ps_isp_sys>;
+	};
+	ps_isp_fe: power-controller@3b8 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3b8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_fe";
+		apple,no-auto-pm;
+		power-domains = <&ps_isp_sys>;
+	};
+	ps_isp_dprx: power-controller@3d8 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3d8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_dprx";
+		apple,no-auto-pm;
+		power-domains = <&ps_isp_sys>;
+	};
+	ps_isp_secure: power-controller@3e0 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3e0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_secure";
+		apple,no-auto-pm;
+		power-domains = <&ps_isp_sys>;
+	};
+	ps_isp_be: power-controller@3e8 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3e8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_be";
+		apple,no-auto-pm;
+		power-domains = <&ps_isp_sys>;
+	};
+	ps_isp_clr: power-controller@3f0 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3f0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_clr";
+		apple,no-auto-pm;
+		power-domains = <&ps_isp_sys>;
+	};
+};
+
+&ps_fab9_soc {
+	/delete-property/ power-domains;
+	apple,no-auto-pm;
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_isp_sys {
+	apple,no-auto-pm;
+	apple,always-on;
+	status = "okay";
+};
+
+&ps_ispsens0 {
+	apple,no-auto-pm;
+	status = "okay";
+};
