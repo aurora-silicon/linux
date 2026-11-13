@@ -607,17 +607,29 @@ int ane_h16_hwx_validate(const void *bytes, size_t size, struct ane_h16_hwx *inf
 			p->metadata = true;
 			break;
 		}
-		case 0x31:
+		case 0x31: {
+			size_t owner = strnlen(c + 8, 16);
+			u64 offset, length;
+
 			/*
-			 * LC_NOTE: zin_ane_compiler 10.205 (H17) records its runtime version
-			 * inline, offset 40 into this command, 4 bytes. It maps nothing.
+			 * LC_NOTE: compiler provenance with no authority over
+			 * mappings. The compiler stores the payload inside the
+			 * command, after the 40-byte header, and counts the
+			 * offset from the command start; the rest is zero.
+			 * zin_ane_compiler 10.205 (H17) records its runtime
+			 * version this way ("rt.version", 4 bytes at 40).
 			 */
-			if (p->info.subtype != ANE_HWX_SUBTYPE_H17 || p->note || len != 48 ||
-			    !hwx_name(c + 8, "rt.version") || get_unaligned_le64(c + 24) != 40 ||
-			    get_unaligned_le64(c + 32) != 4 || !hwx_zero(c, 44, len))
+			if (p->note || len < 40 || len > SZ_4K || !owner || owner == 16 ||
+			    !hwx_zero(c, 8 + owner, 24))
+				goto invalid;
+			offset = get_unaligned_le64(c + 24);
+			length = get_unaligned_le64(c + 32);
+			if (offset < 40 || !hwx_fits(offset, length, len) ||
+			    !hwx_zero(c, offset + length, len))
 				goto invalid;
 			p->note = true;
 			break;
+		}
 		default:
 			goto invalid;
 		}

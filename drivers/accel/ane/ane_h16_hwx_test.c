@@ -70,6 +70,50 @@ static void hwx_command_test(struct kunit *test)
 	}
 }
 
+/* A provenance note is accepted only with its payload inside the command. */
+static void hwx_note_test(struct kunit *test)
+{
+	const struct hwx_fixture_options o = { .note = true };
+	struct hwx_fixture *f = fixture_create_options(test, &o);
+	struct ane_h16_hwx info, *plain = kunit_kzalloc(test, sizeof(*plain), GFP_KERNEL);
+	u8 *note;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, plain);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+	f = fixture_create(test, false, false);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, plain), 0);
+	/* The note changes no mapping: the region table is the same. */
+	KUNIT_EXPECT_EQ(test, info.region_count, plain->region_count);
+	KUNIT_EXPECT_EQ(test, memcmp(info.regions, plain->regions, sizeof(info.regions)), 0);
+
+	f = fixture_create_options(test, &o);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	note = f->bytes + f->note;
+	/* Payload past the command end. */
+	put_unaligned_le64(0x40, note + 24);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	/* Payload overlapping the note header. */
+	put_unaligned_le64(0x20, note + 24);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	/* Wrapping length. */
+	put_unaligned_le64(0x28, note + 24);
+	put_unaligned_le64(U64_MAX, note + 32);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	put_unaligned_le64(20, note + 32);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+	/* Bytes after the payload stay zero. */
+	note[0x47] = 1;
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	note[0x47] = 0;
+	/* The owner name is terminated inside its 16 bytes. */
+	memset(note + 8, 'n', 16);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	memset(note + 8, 0, 16);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+}
+
 static void hwx_tensor_test(struct kunit *test)
 {
 	static const u32 fields[] = {
@@ -720,7 +764,8 @@ static void hwx_h17_zin_test(struct kunit *test)
 	put_unaligned_le32(get_unaligned_le32(f->bytes + 16) + 1, f->bytes + 16);
 	put_unaligned_le32(f->cursor - 32, f->bytes + 20);
 	H17_OK();
-	AS_H16(REFUSED());
+	/* A provenance note of any owner, on either form (hwx_note_test). */
+	AS_H16(H17_OK());
 	put_unaligned_le64(48, note + 24);
 	REFUSED();
 	put_unaligned_le64(40, note + 24);
@@ -728,7 +773,7 @@ static void hwx_h17_zin_test(struct kunit *test)
 	REFUSED();
 	note[44] = 0;
 	note[8] = 'R';
-	REFUSED();
+	H17_OK();
 	note[8] = 'r';
 
 	/* Everything together, as the compiler writes it. */
@@ -749,6 +794,7 @@ static struct kunit_case hwx_cases[] = {
 	KUNIT_CASE(hwx_forms_test),
 	KUNIT_CASE(hwx_header_test),
 	KUNIT_CASE(hwx_command_test),
+	KUNIT_CASE(hwx_note_test),
 	KUNIT_CASE(hwx_tensor_test),
 	KUNIT_CASE(hwx_surface_order_test),
 	KUNIT_CASE(hwx_program_test),

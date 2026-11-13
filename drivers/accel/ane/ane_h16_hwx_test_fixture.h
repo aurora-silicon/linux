@@ -11,7 +11,14 @@ struct hwx_fixture {
 	u8 *bytes;
 	size_t size, cursor;
 	u32 commands, program, tensor[2], segment[2], text_command, symtab, reloc;
-	u32 symbols, strings;
+	u32 symbols, strings, note;
+};
+
+/* Container elements that Apple's compiler adds to the plain fixture. */
+struct hwx_fixture_options {
+	bool mixed, kernel;
+	/* An LC_NOTE provenance command before the symbol table. */
+	bool note;
 };
 
 static u8 *fixture_command(struct hwx_fixture *f, u32 command, u32 length)
@@ -54,8 +61,10 @@ static void fixture_section(u8 *s, const char *segment, const char *name,
 	put_unaligned_le32(flags, s + 64);
 }
 
-static struct hwx_fixture *fixture_create(struct kunit *test, bool mixed, bool kernel)
+static struct hwx_fixture *
+fixture_create_options(struct kunit *test, const struct hwx_fixture_options *o)
 {
+	bool mixed = o->mixed, kernel = o->kernel;
 	struct hwx_fixture *f;
 	u64 surface = 0x30000000 + (mixed ? SZ_16K : 0);
 	u64 text = surface + 2 * SZ_16K, kern = text + SZ_32K;
@@ -171,6 +180,16 @@ static struct hwx_fixture *fixture_create(struct kunit *test, bool mixed, bool k
 		memcpy(c + 0xd3d, symbols[i], strlen(symbols[i]) + 1);
 		memcpy(c + shortoff, names[i], strlen(names[i]) + 1);
 	}
+	if (o->note) {
+		static const char provenance[] = "fixture model source";
+
+		f->note = f->cursor;
+		c = fixture_command(f, 0x31, 0x48);
+		strscpy(c + 8, "src model info", 16);
+		put_unaligned_le64(0x28, c + 24);
+		put_unaligned_le64(sizeof(provenance) - 1, c + 32);
+		memcpy(c + 0x28, provenance, sizeof(provenance) - 1);
+	}
 	f->symtab = f->cursor;
 	c = fixture_command(f, 2, 24);
 	f->symbols = f->cursor;
@@ -209,6 +228,13 @@ static struct hwx_fixture *fixture_create(struct kunit *test, bool mixed, bool k
 	put_unaligned_le32(f->cursor - 32, f->bytes + 20);
 	put_unaligned_le32(0x200000, f->bytes + 24);
 	return f;
+}
+
+static struct hwx_fixture *fixture_create(struct kunit *test, bool mixed, bool kernel)
+{
+	const struct hwx_fixture_options o = { .mixed = mixed, .kernel = kernel };
+
+	return fixture_create_options(test, &o);
 }
 
 #endif /* __ANE_H16_HWX_TEST_FIXTURE_H__ */
