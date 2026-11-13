@@ -98,11 +98,11 @@ struct apple_connector { void *dcp;bool connected,edid_invalidation_pending;stru
 struct apple_dcp {
     void *dev;int fw_compat;struct apple_dcp_afkep *dcpavservep;struct apple_connector *connector;
     bool external_physically_absent,hpd_mutex,quiescing,typec_cable_connected;u64 typec_generation;unsigned int nr_modes;
-    struct { int iomfb_method_profile; bool fw_14_7_endpoints; } hw; bool ext_dead,external_native;
+    struct { int iomfb_method_profile; bool fw_14_7_endpoints; unsigned int num_dptx_ports; } hw; bool ext_dead,external_native;
     struct { bool lock,enabled;u64 epoch;int enable_completion;struct apple_epic_service *service,*opened;
              u64 opened_epoch,close_gen,terminated_epoch,close_epoch;bool opening;struct work_struct close_wq; } dcpavserv;
 };
-'''+internal_inline(root,'dcp_fw_is_14_7')+internal_inline(root,'dcp_is_v14_7_external')+r'''struct epic_cmd { u32 retcode;u64 rxbuf,txbuf;u32 rxlen,txlen; };
+'''+internal_inline(root,'dcp_fw_is_14_7')+internal_inline(root,'dcp_is_v14_7_external')+internal_inline(root,'dcp_is_v27_external')+r'''struct epic_cmd { u32 retcode;u64 rxbuf,txbuf;u32 rxlen,txlen; };
 static unsigned int dma_frees,opens;
 
 static int open_error,open_action;
