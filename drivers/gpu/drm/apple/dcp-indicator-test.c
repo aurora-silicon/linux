@@ -122,18 +122,29 @@ static void indicator_off_retries_a_pending_flip(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, ind.off_pending);
 }
 
-/* A userspace change to the reserved plane is put back, never honoured. */
+/*
+ * Userspace never gets the reserved plane: a clear is put back, anything else
+ * is refused so a compositor sees it in its TEST_ONLY commit and falls back.
+ */
 static void indicator_plane_reservation(struct kunit *test)
 {
 	/* An ordinary plane is never touched. */
-	KUNIT_EXPECT_FALSE(test, dcp_ind_plane_must_restore(false, false, false, false));
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(false, false, false, false, false),
+			DCP_IND_PLANE_PASS);
 	/* The kernel's own commit may do anything. */
-	KUNIT_EXPECT_FALSE(test, dcp_ind_plane_must_restore(true, true, false, false));
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, true, false, false, false),
+			DCP_IND_PLANE_PASS);
 	/* Userspace: carried unchanged, or disabled with its CRTC, is left alone. */
-	KUNIT_EXPECT_FALSE(test, dcp_ind_plane_must_restore(true, false, true, false));
-	KUNIT_EXPECT_FALSE(test, dcp_ind_plane_must_restore(true, false, false, true));
-	/* Any other userspace change (own fb, FB_ID=0, CRTC_ID=0, move) is undone. */
-	KUNIT_EXPECT_TRUE(test, dcp_ind_plane_must_restore(true, false, false, false));
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, false, true, false, false),
+			DCP_IND_PLANE_PASS);
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, false, false, true, true),
+			DCP_IND_PLANE_PASS);
+	/* A blind clear of every plane (console restore) still succeeds, undone. */
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, false, false, false, true),
+			DCP_IND_PLANE_RESTORE);
+	/* Any other userspace assignment (own fb, a move, a property) is refused. */
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, false, false, false, false),
+			DCP_IND_PLANE_REJECT);
 }
 
 static struct kunit_case indicator_cases[] = {

@@ -258,9 +258,13 @@ static int apple_plane_atomic_check(struct drm_plane *plane,
 		bool going_off = !new_plane_state->fb && !new_plane_state->crtc &&
 				 old_crtc_new && !old_crtc_new->active;
 
-		if (dcp_ind_plane_must_restore(true,
-					       commit == READ_ONCE(to_apple_plane(plane)->indicator_commit),
-					       unchanged, going_off)) {
+		switch (dcp_ind_plane_policy(true,
+					     commit == READ_ONCE(to_apple_plane(plane)->indicator_commit),
+					     unchanged, going_off,
+					     !new_plane_state->fb && !new_plane_state->crtc)) {
+		case DCP_IND_PLANE_REJECT:
+			return -EINVAL;
+		case DCP_IND_PLANE_RESTORE: {
 			int ret = drm_atomic_set_crtc_for_plane(new_plane_state, old->crtc);
 
 			if (ret)
@@ -277,6 +281,10 @@ static int apple_plane_atomic_check(struct drm_plane *plane,
 			new_plane_state->alpha = old->alpha;
 			new_plane_state->pixel_blend_mode = old->pixel_blend_mode;
 			new_plane_state->rotation = old->rotation;
+			break;
+		}
+		case DCP_IND_PLANE_PASS:
+			break;
 		}
 	}
 
