@@ -338,7 +338,12 @@ static int apple_mcc_probe(struct platform_device *pdev)
 
 	if (t6041) {
 		ret = apple_mcc_release_t6041_stream(mcc);
-		if (ret)
+		if (ret == -ENOENT)
+			/* No PMP stream record to act on (e.g. a DTB or SoC
+			 * variant that does not carry one): nothing to release.
+			 */
+			dev_dbg(dev, "no GPU parameter-buffer stream to release\n");
+		else if (ret)
 			dev_warn(dev, "GPU parameter-buffer stream not released: %pe\n",
 				 ERR_PTR(ret));
 	}
