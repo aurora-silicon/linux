@@ -174,6 +174,8 @@ enum ave_opcode {
  */
 #define AVE_FW_TEXT_CRC_T6041_25G83 0x9a080cad
 #define AVE_FW_TEXT_CRC_T6050_26A428 0x87279429
+/* macOS 27.3 beta 1 (26C5035r) / T6050: TEXT 0x158000, DATA 0x134000. */
+#define AVE_FW_TEXT_CRC_T6050_26C5035 0xc25b4ddb
 
 struct ave_ctx;
 
@@ -188,12 +190,27 @@ struct ave_coproc_regs {
 	u32 keep_mappings;
 };
 
+/* One preloaded firmware build of a variant: its segment sizes and TEXT CRC. */
+struct ave_fw_build {
+	const char *name;
+	u32 text_size;
+	u32 data_size;
+	u32 text_crc;
+};
+
 struct ave_variant {
 	const struct ave_coproc_regs *regs;
 	u32 fw_text_size;
 	u32 fw_data_size;
 	/* A second DATA size the variant accepts (the M4 Max build), or 0 */
 	u32 fw_data_size_alt;
+	/*
+	 * When set, the builds the variant admits. They replace fw_text_size,
+	 * fw_data_size and text_crc: the segment sizes select the build, and
+	 * the build names the TEXT CRC it must have.
+	 */
+	const struct ave_fw_build *builds;
+	unsigned int build_count;
 	u32 boot_device_id;
 	u32 device_type;
 	u32 lfs_ref_scale;
