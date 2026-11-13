@@ -3207,6 +3207,17 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 		return -EPIPE;
 	}
 
+	/*
+	 * An external pipe whose sink was reported gone has no link, and the firmware
+	 * fails a mode set on it ("setmode failed", "pipe not enabled"). A resume commit
+	 * comes to this when the link was given up for the suspend and its sink has not
+	 * answered yet. The hotplug that reports the sink back brings the mode set with
+	 * it, so nothing is lost by leaving this one out.
+	 */
+	if (dcp->connector_type != DRM_MODE_CONNECTOR_eDP && dcp->connector &&
+	    !READ_ONCE(dcp->connector->connected))
+		return -EPIPE;
+
 	crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
 	if (!crtc_state)
 		return 0;
