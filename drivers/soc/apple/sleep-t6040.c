@@ -90,6 +90,9 @@
 #define PS_STRIDE		8
 #define PS_MAX_PER_GROUP	16
 #define PS_SIO_FIRST		0x150	/* SOC-East: I2C0, the first SIO peripheral word */
+/* The extent of the two power word pages the driver accesses (the DT window sizes). */
+#define SOC_EAST_SIZE		0xd000
+#define SOC_PS_SIZE		0x9000
 #define PS_SIO_LAST		0x228	/* SOC-East: UART6, the last */
 
 /*
@@ -390,13 +393,11 @@ struct t6040_sleep {
 	void __iomem *dcs[16];	/* DCS(n,k): 0x220200000 + n * 0x2000000 + k * 0x200000 */
 	void __iomem *atc_cfg[4];	/* ATCPHY_CFG(n) 0x383200000 + n * 0x8000000 */
 	void __iomem *aop_ps;	/* MiniPMGR AOP + audio island PS words 0x508304000..0x158 */
-	/* The SOC and SOC-East power word pages at their fixed addresses. */
-	void __iomem *pmgr_soc;		/* 0x502800000: fabrics, ATC commons, DCS */
-	void __iomem *pmgr_east;	/* 0x502280000: fabrics, DCS, SIO */
 	u32 sio_ps_saved[(PS_SIO_LAST - PS_SIO_FIRST) / PS_STRIDE + 1];
 	bool sio_ps_saved_valid;
-	void __iomem *soc_east;
-	void __iomem *soc_ps;
+	/* The SOC-East and SOC power word pages: fabrics, ATC commons, DCS, SIO. */
+	void __iomem *soc_east;		/* 0x502280000 */
+	void __iomem *soc_ps;		/* 0x502800000 */
 	void __iomem *aop_global;
 	void __iomem *axi2af_bridge[T6040_AXI2AF_DOMAINS];
 	struct aura_s2r_mailbox *mbox;
@@ -962,10 +963,8 @@ static void t6040_sio_ps_save(struct t6040_sleep *s)
 	unsigned int i;
 
 	s->sio_ps_saved_valid = false;
-	if (!s->pmgr_east)
-		return;
 	for (i = 0; i < ARRAY_SIZE(s->sio_ps_saved); i++)
-		s->sio_ps_saved[i] = readl(s->pmgr_east + PS_SIO_FIRST + i * PS_STRIDE);
+		s->sio_ps_saved[i] = readl(s->soc_east + PS_SIO_FIRST + i * PS_STRIDE);
 	s->sio_ps_saved_valid = true;
 }
 
@@ -979,7 +978,7 @@ static void t6040_sio_ps_restore(struct t6040_sleep *s)
 	s->sio_ps_saved_valid = false;
 	for (i = 0; i < ARRAY_SIZE(s->sio_ps_saved); i++) {
 		u32 off = PS_SIO_FIRST + i * PS_STRIDE;
-		void __iomem *w = s->pmgr_east + off;
+		void __iomem *w = s->soc_east + off;
 		u32 saved = s->sio_ps_saved[i];
 
 		if (FIELD_GET(PS_TARGET, saved) != PS_ACTIVE ||
@@ -1472,11 +1471,9 @@ static const u16 t6040_atc_common[4] = { 0x390, 0x3b8, 0x3e0, 0x408 };
 
 static void t6040_atc_commons_on(struct t6040_sleep *s)
 {
-	void __iomem *b = s->pmgr_soc;
+	void __iomem *b = s->soc_ps;
 	int i;
 
-	if (!b)
-		return;
 	t6040_ps_raise_start(b, PS_FAB2_SOC);
 	for (i = 0; i < ARRAY_SIZE(t6040_atc_common); i++)
 		t6040_ps_raise_start(b, t6040_atc_common[i]);
@@ -1546,11 +1543,9 @@ static void t6040_fabrics_on(struct t6040_sleep *s)
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(t6040_fabrics); i++) {
-		void __iomem *b = t6040_fabrics[i].east ? s->pmgr_east : s->pmgr_soc;
+		void __iomem *b = t6040_fabrics[i].east ? s->soc_east : s->soc_ps;
 		u32 off = t6040_fabrics[i].off, v;
 
-		if (!b)
-			continue;
 		v = readl(b + off);
 		if (!(v & PS_AUTO_ENABLE) || FIELD_GET(PS_TARGET, v) != PS_ACTIVE)
 			t6040_ps_raise(b, off);
@@ -1579,9 +1574,9 @@ static const struct {
 
 static void __iomem *t6040_dcs_ps_reg(struct t6040_sleep *s, int i)
 {
-	void __iomem *b = t6040_dcs_ps[i].east ? s->pmgr_east : s->pmgr_soc;
+	void __iomem *b = t6040_dcs_ps[i].east ? s->soc_east : s->soc_ps;
 
-	return b ? b + t6040_dcs_ps[i].off : NULL;
+	return b + t6040_dcs_ps[i].off;
 }
 
 /*
@@ -1596,8 +1591,6 @@ static u32 t6040_dcs_ps_auto_on(struct t6040_sleep *s)
 	for (i = 0; i < ARRAY_SIZE(t6040_dcs_ps); i++) {
 		void __iomem *r = t6040_dcs_ps_reg(s, i);
 
-		if (!r)
-			continue;
 		v = readl(r);
 		if ((v & PS_AUTO_ENABLE) && !(v & PS_MIN))
 			continue;
@@ -2864,18 +2857,26 @@ static void t6040_sleep_watch_init(struct t6040_sleep *s, unsigned int i,
 		dev_warn(s->dev, "%s: no power word to watch\n", name);
 }
 
-/* A named register block, shared with the owning driver: mapped, not claimed. Optional. */
-static void __iomem *t6040_sleep_map(struct device *dev, const char *name)
+/*
+ * A named register block, shared with the owning driver: mapped, not claimed. NULL when it is
+ * missing from the node or smaller than @min, the extent the driver accesses.
+ */
+static void __iomem *t6040_sleep_map_min(struct device *dev, const char *name, size_t min)
 {
 	struct device_node *np = dev->of_node;
 	struct resource res;
 	int index;
 
 	index = of_property_match_string(np, "reg-names", name);
-	if (index < 0 || of_address_to_resource(np, index, &res))
+	if (index < 0 || of_address_to_resource(np, index, &res) || resource_size(&res) < min)
 		return NULL;
 
 	return t6040_ioremap_np(dev, res.start, resource_size(&res));
+}
+
+static void __iomem *t6040_sleep_map(struct device *dev, const char *name)
+{
+	return t6040_sleep_map_min(dev, name, 0);
 }
 
 /*
@@ -3076,8 +3077,8 @@ static int t6040_sleep_probe(struct platform_device *pdev)
 	s->spmi0 = t6040_sleep_map(&pdev->dev, "spmi0");
 	s->spmi_a0 = t6040_sleep_map(&pdev->dev, "spmi-a0");
 	s->mastermini = t6040_sleep_map(&pdev->dev, "mastermini");
-	s->soc_east = t6040_sleep_map(&pdev->dev, "soc-east");
-	s->soc_ps = t6040_sleep_map(&pdev->dev, "soc-ps");
+	s->soc_east = t6040_sleep_map_min(&pdev->dev, "soc-east", SOC_EAST_SIZE);
+	s->soc_ps = t6040_sleep_map_min(&pdev->dev, "soc-ps", SOC_PS_SIZE);
 	s->aop_global = t6040_sleep_map(&pdev->dev, "aop-global");
 	if (!s->cpu_start || !s->wdt || !s->cluster_ctl || !s->pwrgate || !s->clkgen ||
 	    !s->spmi0 || !s->spmi_a0 || !s->mastermini || !s->soc_east || !s->soc_ps ||
@@ -3099,7 +3100,6 @@ static int t6040_sleep_probe(struct platform_device *pdev)
 				 "the wdt block is not the AON watchdog: no WD2 restart at the wake\n");
 	}
 	s->aop_ps = t6040_ioremap_np(&pdev->dev, T6040_AOP_PS_PA, 0x160);
-	s->pmgr_soc = t6040_ioremap_np(&pdev->dev, 0x502800000ULL, 0x9000);
 	for (i = 0; i < ARRAY_SIZE(s->dcs); i++)
 		s->dcs[i] = t6040_ioremap_np(&pdev->dev, 0x220200000ULL +
 					     (i / 4) * 0x2000000ULL + (i % 4) * 0x200000ULL,
@@ -3107,7 +3107,6 @@ static int t6040_sleep_probe(struct platform_device *pdev)
 	for (i = 0; i < ARRAY_SIZE(s->atc_cfg); i++)
 		s->atc_cfg[i] = t6040_ioremap_np(&pdev->dev,
 						 0x383200000ULL + i * 0x8000000ULL, 0x100);
-	s->pmgr_east = t6040_ioremap_np(&pdev->dev, 0x502280000ULL, 0xd000);
 	for (i = 0; i < T6040_AXI2AF_DOMAINS; i++)
 		s->axi2af_bridge[i] = t6040_ioremap_np(&pdev->dev,
 						       t6040_axi2af[i].bridge_pa, 0x200);
