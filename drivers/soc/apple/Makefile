@@ -14,6 +14,7 @@ obj-$(CONFIG_APPLE_PMGR_MISC)	+= apple-pmgr-misc.o
 obj-$(CONFIG_APPLE_CLUSTER_PWRGATE) += apple-cluster-pwrgate.o
 
 obj-$(CONFIG_APPLE_SOC_SLEEP) += apple-sleep.o
+obj-$(CONFIG_APPLE_SOC_SLEEP) += t6050-aop.o
 apple-sleep-y = sleep.o
 
 obj-$(CONFIG_APPLE_RTKIT) += apple-rtkit.o

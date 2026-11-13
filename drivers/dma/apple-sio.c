@@ -12,6 +12,7 @@
 #include <linux/device.h>
 #include <linux/dma/apple-sio.h>
 #include <linux/dma-mapping.h>
+#include <linux/sizes.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
@@ -32,6 +33,7 @@
 #define NCHANNELS_MAX	0x80
 
 #define REG_CPU_CONTROL	0x44
+#define SIO_T6050_SPI2_TX	0x18
 #define CPU_CONTROL_RUN BIT(4)
 
 #define SIOMSG_DATA	GENMASK(63, 32)
@@ -171,6 +173,11 @@ struct sio_hw_data {
 	bool firmware_without_tables;
 	/* macOS idles this firmware in the sleep's last step: leave it running until then. */
 	bool stop_at_commit;
+	/* Stopped by the sleep's commit, in macOS's place, not in suspend_late */
+	bool commit_stop;
+	/* The channels macOS configures at boot with no client here (SPI2's) */
+	const u8 *boot_channels;
+	unsigned int boot_channel_count;
 	/* DMA arrays owned by the driver, if not protocol 9's */
 	const struct sio_dma_arrays *arrays;
 	int (*check_boot_tables)(struct device *dev);
@@ -196,6 +203,11 @@ struct sio_data {
 	dma_addr_t responses_iova;
 	const struct sio_dma_arrays *arrays;	/* when the driver owns them */
 	struct sio_coproc_desc *shmem_desc_base;
+
+	/* T6050: SPI2's controller and power word, for macOS's sleep command to the Touch ID sensor */
+	void __iomem *spi2, *spi2_ps;
+	bool sleep_cmd;
+	struct completion sleep_report;
 	unsigned long *desc_allocated;
 
 	struct sio_tagdata {
@@ -417,6 +429,7 @@ static int sio_t6030_check_boot_tables(struct device *dev)
 #define SIO_T6041_RESPONSES		0x1cc0
 #define SIO_T6041_RESPONSE_SIZE		16
 #define SIO_T6041_KEY_CPU_POWER_GATE	0x2a
+#define SIO_T6041_KEY_TUNABLES		0x1e
 
 enum sio_t6041_kind {
 	SIO_T6041_REQUIRED,	/* an address and its exact size */
@@ -431,7 +444,7 @@ static const struct sio_t6041_param {
 } sio_t6041_params[] = {
 	{ 0x0f, SIO_T6041_REQUIRED, 0x1e000 },	/* panic buffer */
 	{ 0x1a, SIO_T6041_REQUIRED, 4 * 16 },	/* map ranges */
-	{ 0x1e, SIO_T6041_REQUIRED, 0x30 },	/* ASC-wrapper tunables */
+	{ SIO_T6041_KEY_TUNABLES, SIO_T6041_REQUIRED, 0x30 },	/* ASC-wrapper tunables */
 	{ 0x20, SIO_T6041_OPTIONAL },		/* miscellaneous tunables */
 	{ 0x24, SIO_T6041_OPTIONAL },		/* power-state registers */
 	{ 0x28, SIO_T6041_OPTIONAL },		/* SIO registers */
@@ -468,7 +481,7 @@ static int sio_t6041_param_index(u32 key, bool *size)
  */
 static int sio_t6041_collect(const u32 *params, unsigned int nparams,
 			     const struct sio_t6030_window *windows, unsigned int nwindows,
-			     u32 *addr, u32 *size)
+			     u32 *addr, u32 *size, bool no_tunables)
 {
 	unsigned long seen = 0;
 	unsigned int i, j;
@@ -501,7 +514,8 @@ static int sio_t6041_collect(const u32 *params, unsigned int nparams,
 		if (have_addr != have_size)
 			return -EINVAL;
 		if (!have_addr) {
-			if (p->kind == SIO_T6041_REQUIRED)
+			if (p->kind == SIO_T6041_REQUIRED &&
+			    !(no_tunables && p->key == SIO_T6041_KEY_TUNABLES))
 				return -EINVAL;
 			continue;
 		}
@@ -545,7 +559,9 @@ static int sio_t6041_check_node(struct device_node *np, u32 *addr, u32 *size)
 	nwindows = sio_t6030_windows(np, windows, ARRAY_SIZE(windows));
 	if (nwindows < 0)
 		return nwindows;
-	return sio_t6041_collect(params, nparams, windows, nwindows, addr, size);
+	/* T6050's ADT has none, and macOS sends no key for them. */
+	return sio_t6041_collect(params, nparams, windows, nwindows, addr, size,
+				 of_device_is_compatible(np, "apple,t6050-sio"));
 }
 
 static int sio_t6041_check_boot_tables(struct device *dev)
@@ -673,7 +689,25 @@ static const struct sio_hw_data sio_hw_t8140 = {
 	.send_dt_params = sio_t6041_send_dt_params,
 };
 
+static const u8 sio_t6050_boot_channels[] = { SIO_T6050_SPI2_TX, 0x19 };
+
+/* T6041's, less the tunables (sio_t6041_check_node); stopped and configured as macOS. */
+static const struct sio_hw_data sio_hw_t6050 = {
+	.protocol = 10,
+	.fifo_threshold = 0x600,
+	.cfg_word4 = 0x800,
+	.cfg_six_words = true,
+	.clear_period_desc = true,
+	.commit_stop = true,
+	.boot_channels = sio_t6050_boot_channels,
+	.boot_channel_count = ARRAY_SIZE(sio_t6050_boot_channels),
+	.arrays = &sio_t6041_arrays,
+	.check_boot_tables = sio_t6041_check_boot_tables,
+	.send_dt_params = sio_t6041_send_dt_params,
+};
+
 static const struct of_device_id sio_of_match[] = {
+	{ .compatible = "apple,t6050-sio", .data = &sio_hw_t6050 },
 	{ .compatible = "apple,t6041-sio", .data = &sio_hw_t6041 },
 	{ .compatible = "apple,t8140-sio", .data = &sio_hw_t8140 },
 	{ .compatible = "apple,t6030-sio", .data = &sio_hw_t6030 },
@@ -1544,6 +1578,10 @@ static void sio_recv_msg(void *cookie, u8 ep, u64 msg)
 		break;
 
 	case MSG_REPORT:
+		if (sio->sleep_cmd && sioep == SIO_T6050_SPI2_TX) {
+			complete(&sio->sleep_report);
+			break;
+		}
 		if (WARN_ON(sioep >= sio->nchannels))
 			break;
 
@@ -1838,6 +1876,27 @@ static int sio_send_v9_shmem(struct sio_data *sio,
 	return 0;
 }
 
+/* macOS's words for SPI2's two channels, the same for both. */
+static int sio_configure_boot_channels(struct sio_data *sio)
+{
+	static const struct sio_shmem_chan_config cfg = {
+		.fifo = 0x80, .threshold = 0x40, .limit = 0x80,
+	};
+	unsigned int i;
+	int ret;
+
+	for (i = 0; i < sio->hw->boot_channel_count; i++) {
+		sio_write_config(sio->hw, sio->shmem, &cfg);
+		dma_wmb();
+		ret = sio_call(sio, FIELD_PREP(SIOMSG_TYPE, MSG_CONFIGURE) |
+				    FIELD_PREP(SIOMSG_EP, sio->hw->boot_channels[i]));
+		if (ret < 1)
+			return ret ?: -EINVAL;
+	}
+
+	return 0;
+}
+
 static int sio_alloc_shmem(struct sio_data *sio)
 {
 	const struct sio_dma_arrays *arrays = sio->hw->arrays;
@@ -1936,18 +1995,7 @@ badprop:
 	return dev_err_probe(sio->dev, err, "failed to read '%s'\n", propname);
 }
 
-/* Interrupts off, one CPU: the idle pair and the closed mailbox. The caller clears the run bit. */
-static int sio_commit_stop(void *data)
-{
-	struct sio_data *sio = data;
-	unsigned int us;
-	int ret;
-
-	ret = apple_rtkit_sleep_idle_polled(sio->rtk, sio->base + REG_CPU_CONTROL, &us);
-	apple_rtkit_mailbox_recv_off(sio->rtk);
-
-	return ret ? 1 : 0;
-}
+static int sio_commit_stop(void *data);
 
 static int sio_probe(struct platform_device *pdev)
 {
@@ -1994,6 +2042,17 @@ static int sio_probe(struct platform_device *pdev)
 	sio->firmware_only = firmware_only;
 
 	sio->base = devm_platform_ioremap_resource(pdev, 0);
+	init_completion(&sio->sleep_report);
+	{
+		/* Not claimed: SPI2 has no driver here, and the PMGR's driver owns the PS page. */
+		struct resource *r = platform_get_resource_byname(pdev, IORESOURCE_MEM, "spi2");
+		struct resource *p = platform_get_resource_byname(pdev, IORESOURCE_MEM, "spi2-ps");
+
+		if (r && p) {
+			sio->spi2 = devm_ioremap(&pdev->dev, r->start, resource_size(r));
+			sio->spi2_ps = devm_ioremap(&pdev->dev, p->start, resource_size(p));
+		}
+	}
 	if (IS_ERR(sio->base))
 		return PTR_ERR(sio->base);
 
@@ -2080,6 +2139,17 @@ static int sio_probe(struct platform_device *pdev)
 	if (err < 0)
 		return err;
 
+	err = sio_configure_boot_channels(sio);
+	if (err)
+		return dev_err_probe(&pdev->dev, err, "configuring the boot channels\n");
+
+	if (hw->commit_stop) {
+		err = apple_sleep_coproc_register(&pdev->dev, sio->base, false, sio_commit_stop, sio);
+		if (err)
+			return dev_err_probe(&pdev->dev, err, "registering the sleep's stop\n");
+		apple_sleep_coproc_set_early(&pdev->dev);
+	}
+
 	err = dma_async_device_register(&sio->dma);
 	if (err)
 		return dev_err_probe(&pdev->dev, err, "failed to register DMA device\n");
@@ -2094,7 +2164,12 @@ rpm_put:
 	if (!err && hw->stop_at_commit)
 		sio->commit_registered = !apple_sleep_coproc_register(&pdev->dev, sio->base, false,
 								      sio_commit_stop, sio);
-	pm_runtime_put(&pdev->dev);
+	/*
+	 * macOS keeps SIO running until the sleep's own stop (-82 ms); a runtime suspend would let its
+	 * domain go off under the firmware.
+	 */
+	if (!hw->commit_stop)
+		pm_runtime_put(&pdev->dev);
 
 	return err;
 }
@@ -2103,7 +2178,7 @@ static void sio_remove(struct platform_device *pdev)
 {
 	struct sio_data *sio = platform_get_drvdata(pdev);
 
-	if (sio->commit_registered)
+	if (sio->commit_registered || sio->hw->commit_stop)
 		apple_sleep_coproc_unregister(&pdev->dev);
 	if (sio->firmware_only)
 		return;
@@ -2138,6 +2213,112 @@ static bool sio_chan_busy(struct sio_chan *siochan)
 	return busy;
 }
 
+/*
+ * macOS's sleep command to the Touch ID sensor on SPI2,
+ * every access in its order: SPI2 on, the controller reset, the ISSUE of 7 bytes on SPI2's TX
+ * channel, the transfer, the REPORT, the controller stopped. SPI2 goes off at the SIO stop.
+ */
+static int sio_t6050_sleep_command(struct sio_data *sio)
+{
+	static const u8 bytes[7] = { 0x80, 0x31, 0x00, 0x07, 0x00, 0x00, 0x00 };
+	void __iomem *spi = sio->spi2, *ps = sio->spi2_ps;
+	struct sio_coproc_desc *d;
+	dma_addr_t iova;
+	void *buf;
+	int ret;
+
+	if (!spi || !ps)
+		return -ENODEV;
+	buf = dma_alloc_coherent(sio->dev, SZ_16K, &iova, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	d = sio_alloc_desc(sio);
+	if (!d) {
+		dma_free_coherent(sio->dev, SZ_16K, buf, iova);
+		return -EBUSY;
+	}
+	memcpy(buf, bytes, sizeof(bytes));
+	memset(d, 0, sizeof(*d));
+	d->flag = 1;
+	d->iova = iova;
+	d->size = sizeof(bytes);
+	dma_wmb();
+
+	readl(ps);
+	writel(0xf, ps);
+	readl(ps);
+	writel(0x1000000f, ps);
+	writel(0, spi + 0x00);		/* CTRL */
+	writel(0, spi + 0x0c);		/* PIN */
+	writel(0x400023, spi + 0x08);	/* STATUS */
+	readl(spi + 0x08);
+	readl(spi + 0x08);
+
+	reinit_completion(&sio->sleep_report);
+	WRITE_ONCE(sio->sleep_cmd, true);
+	ret = sio_call(sio, FIELD_PREP(SIOMSG_EP, SIO_T6050_SPI2_TX) |
+			    FIELD_PREP(SIOMSG_TYPE, MSG_ISSUE) |
+			    FIELD_PREP(SIOMSG_DATA, sio_coproc_desc_slot(sio, d)));
+	if (ret == 1) {
+		writel(0, spi + 0x34);		/* RXCNT */
+		writel(sizeof(bytes), spi + 0x4c);	/* TXCNT */
+		readl(spi + 0x08);
+		writel(3, spi + 0x30);		/* CLKDIV */
+		writel(0, spi + 0x38);		/* WORD_DELAY */
+		writel(0x400023, spi + 0x08);
+		writel(0x40042, spi + 0x04);	/* CFG */
+		writel(readl(spi + 0x150), spi + 0x150);	/* SHIFTCFG */
+		writel(readl(spi + 0x160), spi + 0x160);	/* DELAY_PRE */
+		writel(readl(spi + 0x168), spi + 0x168);	/* DELAY_POST */
+		writel(0xd, spi + 0x00);	/* RUN, TX_RESET, RX_RESET */
+		ret = wait_for_completion_timeout(&sio->sleep_report, msecs_to_jiffies(100)) ? 0 : -ETIMEDOUT;
+	} else {
+		ret = ret ?: -EIO;
+	}
+	WRITE_ONCE(sio->sleep_cmd, false);
+	readl(spi + 0x10c);		/* FIFOSTAT */
+	readl(spi + 0x08);
+	writel(0x40002, spi + 0x04);
+	readl(spi + 0x08);
+	writel(0, spi + 0x00);
+	sio_free_desc(sio, d);
+	dma_free_coherent(sio->dev, SZ_16K, buf, iova);
+	dev_info(sio->dev, "sleep command to SPI2: %d\n", ret);
+
+	return ret;
+}
+
+/* One stopped in the commit stays up through the system suspend. */
+static __maybe_unused int sio_system_suspend(struct device *dev)
+{
+	struct sio_data *sio = dev_get_drvdata(dev);
+
+	return sio->hw->commit_stop ? 0 : pm_runtime_force_suspend(dev);
+}
+
+static __maybe_unused int sio_system_resume(struct device *dev)
+{
+	struct sio_data *sio = dev_get_drvdata(dev);
+
+	return sio->hw->commit_stop ? 0 : pm_runtime_force_resume(dev);
+}
+
+/* Interrupts off, one CPU: the idle pair and receive off. The sleep clears the run bit twice. */
+static int sio_commit_stop(void *data)
+{
+	struct sio_data *sio = data;
+	unsigned int us;
+	int ret;
+
+	/* SPI2 off before the SIO's own stop, as macOS. */
+	if (sio->spi2_ps)
+		writel(0x3f0, sio->spi2_ps);
+	ret = apple_rtkit_sleep_idle_polled(sio->rtk, sio->base + REG_CPU_CONTROL, &us);
+	apple_rtkit_mailbox_recv_off(sio->rtk);
+
+	return ret;
+}
+
 static __maybe_unused int sio_suspend_late(struct device *dev)
 {
 	struct sio_data *sio = dev_get_drvdata(dev);
@@ -2156,6 +2337,13 @@ static __maybe_unused int sio_suspend_late(struct device *dev)
 	if (sio->commit_registered && apple_sleep_commit_stops_coprocs()) {
 		apple_sleep_coproc_set_ready(dev, true);
 		sio->commit_used = true;
+		sio->asleep = true;
+		return 0;
+	}
+	if (sio->hw->commit_stop) {
+		/* A failed command is only logged: macOS's sleep doesn't wait on the sensor. */
+		sio_t6050_sleep_command(sio);
+		apple_sleep_coproc_set_ready(dev, true);
 		sio->asleep = true;
 		return 0;
 	}
@@ -2196,6 +2384,8 @@ static __maybe_unused int sio_resume_early(struct device *dev)
 			return 0;
 		}
 	}
+	if (sio->hw->commit_stop)
+		apple_sleep_coproc_set_ready(dev, false);
 	/*
 	 * A refused sleep: an idled firmware doesn't wake with its power kept, and SIO_CPU shares
 	 * SIO's switch, so it can't be power-cycled alone. The sleep engine's own PMGR reset of it
@@ -2233,7 +2423,7 @@ static __maybe_unused int sio_resume_early(struct device *dev)
 }
 
 static const struct dev_pm_ops sio_pm_ops = {
-	SYSTEM_SLEEP_PM_OPS(pm_runtime_force_suspend, pm_runtime_force_resume)
+	SYSTEM_SLEEP_PM_OPS(sio_system_suspend, sio_system_resume)
 	LATE_SYSTEM_SLEEP_PM_OPS(sio_suspend_late, sio_resume_early)
 	RUNTIME_PM_OPS(sio_suspend, sio_resume, NULL)
 };

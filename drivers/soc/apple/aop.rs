@@ -3033,6 +3033,10 @@ const HW_CFG_T8142: AopHwConfig = AopHwConfig {
 /// asks for a buffer, so boot doesn't wait for it.
 const HW_CFG_T6050: AopHwConfig = AopHwConfig {
     setup_wait_system_endpoints: false,
+    // The order its endpoints stop in for a system sleep, as macOS stops them on the M5 Pro.
+    sleep_endpoints: &[
+        0x2b, 0x2c, 0x21, 0x2a, 0x24, 0x26, 0x27, 0x25, 0x28, 0x29, 0x23, 0x20, 0x22,
+    ],
     ..HW_CFG_T8142
 };
 
