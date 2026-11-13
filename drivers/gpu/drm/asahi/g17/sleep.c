@@ -385,7 +385,7 @@ struct asahi_g17_commit *asahi_g17_commit_prepare(struct device *dev,
 	if (c->request)
 		apple_pmp_report_entry_commit_owned(c->request, true);
 
-	ret = apple_sleep_coproc_register_first(dev, asahi_g17_commit_stop, c);
+	ret = apple_sleep_coproc_register_first(dev, APPLE_SLEEP_FIRST_GPU, asahi_g17_commit_stop, c);
 	if (ret)
 		goto err;
 	apple_sleep_coproc_set_ready(dev, true);
@@ -432,7 +432,7 @@ struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct app
 	if (!c->cpu[0] || !c->ps)
 		goto err;
 
-	ret = apple_sleep_coproc_register_first(dev, asahi_g17_commit_stop, c);
+	ret = apple_sleep_coproc_register_first(dev, APPLE_SLEEP_FIRST_GPU, asahi_g17_commit_stop, c);
 	if (ret)
 		goto err;
 	apple_sleep_coproc_set_ready(dev, true);

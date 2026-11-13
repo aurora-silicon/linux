@@ -38,6 +38,7 @@ struct apple_sleep_coproc {
 	int stop_ret;
 	/* No ASC: its last stop takes it whole, power word @ps included, before the others. */
 	bool first;
+	unsigned int order;	/* among those registered first, lowest runs first */
 	u32 ps;
 };
 

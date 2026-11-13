@@ -930,20 +930,26 @@ int apple_sleep_enclave_stop(struct device *dev)
  */
 void apple_sleep_coprocs_stop(bool first, bool *pcie_ans)
 {
+	unsigned int order;
 	int i;
 
 	if (first)
 		*pcie_ans = false;
-	for (i = 0; i < SLEEP_COPROCS; i++) {
-		struct apple_sleep_coproc *c = &apple_sleep_coprocs[i];
+	/* Those registered first run by their order, the others in one pass over the table. */
+	for (order = 0; order < (first ? APPLE_SLEEP_FIRST_ORDERS : 1); order++) {
+		for (i = 0; i < SLEEP_COPROCS; i++) {
+			struct apple_sleep_coproc *c = &apple_sleep_coprocs[i];
 
-		if (!c->dev || !c->ready || c->first != first)
-			continue;
-		*pcie_ans |= c->pcie_ans;
-		if (c->stopped)
-			continue;
-		c->stop_ret = c->last_stop ? c->last_stop(c->data) : 0;
-		apple_sleep_coproc_run_off(c);
+			if (!c->dev || !c->ready || c->first != first)
+				continue;
+			if (first && c->order != order)
+				continue;
+			*pcie_ans |= c->pcie_ans;
+			if (c->stopped)
+				continue;
+			c->stop_ret = c->last_stop ? c->last_stop(c->data) : 0;
+			apple_sleep_coproc_run_off(c);
+		}
 	}
 	dsb(sy);
 }
@@ -1871,14 +1877,6 @@ bool apple_sleep_debug_link_cut(void)
 	return apple_sleep ? apple_sleep_usb_down(apple_sleep) : false;
 }
 EXPORT_SYMBOL_GPL(apple_sleep_debug_link_cut);
-
-bool apple_sleep_debug_link_up(void)
-{
-	struct apple_sleep *s = apple_sleep;
-
-	return s && !s->usb_down_ran && sleep_debug_link_up(s);
-}
-EXPORT_SYMBOL_GPL(apple_sleep_debug_link_up);
 
 /*
  * macOS takes the wake for a lid closing during the sleep as a dark one: every driver wakes,

@@ -80,6 +80,7 @@ int apple_sleep_coproc_register(struct device *dev, void __iomem *asc, bool pcie
 	c->ready = false;
 	c->stopped = false;
 	c->first = false;
+	c->order = 0;
 	c->ps = 0;
 	c->dev = dev;
 
@@ -87,15 +88,15 @@ int apple_sleep_coproc_register(struct device *dev, void __iomem *asc, bool pcie
 }
 EXPORT_SYMBOL_GPL(apple_sleep_coproc_register);
 
-int apple_sleep_coproc_register_first(struct device *dev, int (*last_stop)(void *data),
-				      void *data)
+int apple_sleep_coproc_register_first(struct device *dev, unsigned int order,
+				      int (*last_stop)(void *data), void *data)
 {
 	struct apple_sleep_coproc *c;
 	struct device_node *np;
 	u32 ps = 0;
 	int ret;
 
-	if (!last_stop)
+	if (!last_stop || order >= APPLE_SLEEP_FIRST_ORDERS)
 		return -EINVAL;
 	np = of_parse_phandle(dev->of_node, "power-domains", 0);
 	if (np) {
@@ -110,6 +111,7 @@ int apple_sleep_coproc_register_first(struct device *dev, int (*last_stop)(void 
 	c = apple_sleep_coproc_find(dev);
 	if (c) {
 		c->first = true;
+		c->order = order;
 		c->ps = ps;
 	}
 

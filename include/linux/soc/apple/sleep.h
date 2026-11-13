@@ -20,6 +20,11 @@ struct device_node;
  * (drivers/soc/apple/sleep-registry.c). The controller bound on this SoC
  * answers apple_sleep_commit_stops_coprocs() and runs the last stops.
  */
+/* Order of the coprocessors registered first (apple_sleep_coproc_register_first()). */
+#define APPLE_SLEEP_FIRST_SMC	0	/* its warning and commit come before the GPU's stop */
+#define APPLE_SLEEP_FIRST_GPU	1
+#define APPLE_SLEEP_FIRST_ORDERS	2
+
 #if IS_ENABLED(CONFIG_APPLE_SLEEP_REGISTRY)
 /*
  * A coprocessor that can't be stopped until a sleep is certain, and can't be
@@ -36,9 +41,11 @@ int apple_sleep_coproc_register(struct device *dev, void __iomem *asc, bool pcie
 /*
  * The same with no ASC to clear: @last_stop clears its own run bits and lowers its own power
  * domain, and runs before every other coprocessor's. The refusal checks leave that domain on.
+ * Those registered first run in the order of @order, an APPLE_SLEEP_FIRST_* value, not of
+ * their place in the table.
  */
-int apple_sleep_coproc_register_first(struct device *dev, int (*last_stop)(void *data),
-				      void *data);
+int apple_sleep_coproc_register_first(struct device *dev, unsigned int order,
+				      int (*last_stop)(void *data), void *data);
 void apple_sleep_coproc_unregister(struct device *dev);
 
 /*
@@ -77,7 +84,7 @@ static inline int apple_sleep_coproc_register(struct device *dev, void __iomem *
 	return -EOPNOTSUPP;
 }
 
-static inline int apple_sleep_coproc_register_first(struct device *dev,
+static inline int apple_sleep_coproc_register_first(struct device *dev, unsigned int order,
 						    int (*last_stop)(void *data), void *data)
 {
 	return -EOPNOTSUPP;
@@ -172,7 +179,6 @@ bool apple_sleep_debug_link_cut_peek(struct device *dev);
 bool apple_sleep_debug_link_cut(void);
 
 /* This sleep will end the debug link: for the SMC's driver, which warns the SMC after it. */
-bool apple_sleep_debug_link_up(void);
 
 /*
  * From the SMC's driver, in its noirq resume: the SMC woke the AP for the lid alone, and the
@@ -275,11 +281,6 @@ static inline bool apple_sleep_debug_link_cut_peek(struct device *dev)
 }
 
 static inline bool apple_sleep_debug_link_cut(void)
-{
-	return false;
-}
-
-static inline bool apple_sleep_debug_link_up(void)
 {
 	return false;
 }
