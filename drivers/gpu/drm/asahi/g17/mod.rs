@@ -2064,6 +2064,7 @@ impl Gpu {
                 effort: power::Effort::new(),
                 hold: power::Hold::new(),
                 governor: thermal::Governor::new(),
+                ceiling: None,
                 registration_power_release_pending: false,
                 variant: shared.variant,
                 queues <- runtime::Registry::with_waiters(
