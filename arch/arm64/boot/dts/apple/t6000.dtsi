@@ -184,6 +184,11 @@
 	status = "okay";
 };
 
+/* The auxiliary DMA fault reporter shares venc_sys with the codec DARTs. */
+&ave0_dma {
+	status = "okay";
+};
+
 &apr0_dart {
 	status = "okay";
 };
