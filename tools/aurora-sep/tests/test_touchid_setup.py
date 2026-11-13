@@ -53,12 +53,14 @@ def private(name, value):
     return bytes([0xff] + identifier) + der(0, body)[1:]
 
 
-def im4m(objects):
-    """An IM4M whose MANB holds `objects`: {name: {property: value element}}."""
+def im4m(objects, container=0x31):
+    """An IM4M whose MANB holds `objects`: {name: {property: value element}}, in a SET
+    as image manifests have it, or with `container` 0x30 a SEQUENCE as the J714s
+    factory seal has it."""
     body = b''.join(private(name, der(0x31, b''.join(private(key, value)
                                                       for key, value in props.items())))
                     for name, props in objects.items())
-    manb = private(b'MANB', der(0x31, body))
+    manb = private(b'MANB', der(container, body))
     return der(0x30, text(b'IM4M') + der(0x02, b'\x00') + der(0x31, manb)
                + der(0x04, b'signature') + der(0x30, der(0x30, b'')))
 
@@ -98,14 +100,14 @@ TRUST = b'trust bundle ' + bytes(64)
 OLD_TRUST = b'old trust bundle ' + bytes(64)
 
 
-def seal(payload=CALIBRATION, serial=SERIAL, extra=None):
+def seal(payload=CALIBRATION, serial=SERIAL, extra=None, container=0x31):
     objects = {b'MANP': {b'SrNm': octets(serial), b'BORD': integer(0x26)},
                b'FSC2': {b'DGST': octets(hashlib.sha384(payload).digest()),
                          b'clas': octets(b'\x00' * 4)},
                b'MSRk': {b'DGST': octets(hashlib.sha384(ROOT_KEY).digest())}}
     for name, props in (extra or {}).items():
         objects.setdefault(name, {}).update(props)
-    return im4m(objects)
+    return im4m(objects, container)
 
 
 def sealed(payload=CALIBRATION, manifest=None, trust=TRUST):
@@ -377,6 +379,39 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(expected, EXPECTED)
         self.assertEqual(evidence['trust_sha256'], hashlib.sha256(TRUST).hexdigest())
         self.assertEqual(evidence['source_sha384'], hashlib.sha384(FACTORY).hexdigest())
+
+    def test_a_seal_whose_manb_is_a_sequence_is_admitted_unchanged(self):
+        sequence = seal(container=0x30)
+        self.assertEqual(helper.manifest(sequence), helper.manifest(seal()))
+        expected, evidence = helper.admit(records(**{f'seal-{CHIP:08X}-{ECID:016X}': sequence}), IDENTITY)
+        self.assertEqual(evidence['seal_sha256'], hashlib.sha256(sequence).hexdigest())
+        self.assertIn(sequence, expected)
+        with self.assertRaises(helper.Refused):
+            helper.manifest(seal(container=0x04))
+
+    def test_a_name_repeated_in_the_sequence_admits_nothing_on_it(self):
+        def repeated(name, container):
+            objects = [(n, dict(props)) for n, props in [
+                (b'MANP', {b'SrNm': octets(SERIAL), b'BORD': integer(0x26)}),
+                (b'FSC2', {b'DGST': octets(hashlib.sha384(CALIBRATION).digest()),
+                           b'clas': octets(b'\x00' * 4)}),
+                (b'MSRk', {b'DGST': octets(hashlib.sha384(ROOT_KEY).digest())}),
+                (b'scrt', {b'DGST': octets(bytes(48))})]]
+            objects.append((name, {b'DGST': octets(bytes(48))}))
+            body = b''.join(private(n, der(0x31, b''.join(private(k, v) for k, v in props.items())))
+                            for n, props in objects)
+            return der(0x30, text(b'IM4M') + der(0x02, b'\x00') + der(0x31, private(b'MANB', der(container, body)))
+                       + der(0x04, b'signature') + der(0x30, der(0x30, b'')))
+        name = f'seal-{CHIP:08X}-{ECID:016X}'
+        objects = helper.manifest(repeated(b'scrt', 0x30))
+        self.assertEqual(objects[b'scrt'], {})
+        expected, _ = helper.admit(records(**{name: repeated(b'scrt', 0x30)}), IDENTITY)
+        self.assertEqual(helper.combined(expected)[1], TRUST)
+        for kind in (b'FSC2', b'MANP'):
+            with self.subTest(kind), self.assertRaises(helper.Refused):
+                helper.admit(records(**{name: repeated(kind, 0x30)}), IDENTITY)
+        with self.assertRaises(helper.Refused):
+            helper.manifest(repeated(b'scrt', 0x31))
 
     def test_the_current_trust_bundle_is_chosen_over_an_old_one(self):
         expected, _ = helper.admit(records(), IDENTITY)

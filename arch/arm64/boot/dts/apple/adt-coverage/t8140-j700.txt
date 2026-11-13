@@ -102,9 +102,9 @@
 /arm-io/pmgr/power-devices/PMGR_SOC_OCLA 0x300700180 -> /soc/power-management@300700000/power-controller@180
 /arm-io/pmgr/power-devices/ISPSENS0 0x300700188 -> /soc/power-management@300700000/power-controller@188
 /arm-io/pmgr/power-devices/ISPSENS1 0x300700190 -> /soc/power-management@300700000/power-controller@190
-/arm-io/pmgr/power-devices/AFIMCCNI0 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AFIMCCNI0 0x300700198 -> /soc/power-management@300700000/power-controller@198
 /arm-io/pmgr/power-devices/AP_TMM 0x3007001a0 -> /soc/power-management@300700000/power-controller@1a0
-/arm-io/pmgr/power-devices/PIOGW - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/PIOGW 0x3007001a8 -> /soc/power-management@300700000/power-controller@1a8
 /arm-io/pmgr/power-devices/AFIAFT - -> WAIVED: Virtual PMGR vote; no independent power-state register.
 /arm-io/pmgr/power-devices/AFGGFXNI0 0x3007001b8 -> /soc/power-management@300700000/power-controller@1b8
 /arm-io/pmgr/power-devices/AFCMCCNI0 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
@@ -112,15 +112,15 @@
 /arm-io/pmgr/power-devices/AMCC0_P1 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
 /arm-io/pmgr/power-devices/AMCC0_P2 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
 /arm-io/pmgr/power-devices/AMCC0_P3 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
-/arm-io/pmgr/power-devices/AFINS0 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AFINS0 0x3007001e8 -> /soc/power-management@300700000/power-controller@1e8
 /arm-io/pmgr/power-devices/GFX 0x3007001f0 -> /soc/power-management@300700000/power-controller@1f0
 /arm-io/pmgr/power-devices/DCS0 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
 /arm-io/pmgr/power-devices/DCS1 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
 /arm-io/pmgr/power-devices/DCS2 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
 /arm-io/pmgr/power-devices/DCS3 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
-/arm-io/pmgr/power-devices/AFISOCNI0 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
-/arm-io/pmgr/power-devices/AFISOCNI1 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
-/arm-io/pmgr/power-devices/AFISOCNI2 - -> WAIVED: Virtual PMGR vote; no independent power-state register.
+/arm-io/pmgr/power-devices/AFISOCNI0 0x300700218 -> /soc/power-management@300700000/power-controller@218
+/arm-io/pmgr/power-devices/AFISOCNI1 0x300700220 -> /soc/power-management@300700000/power-controller@220
+/arm-io/pmgr/power-devices/AFISOCNI2 0x300700228 -> /soc/power-management@300700000/power-controller@228
 /arm-io/pmgr/power-devices/JPG 0x300700230 -> /soc/power-management@300700000/power-controller@230
 /arm-io/pmgr/power-devices/MSR 0x300700238 -> /soc/power-management@300700000/power-controller@238
 /arm-io/pmgr/power-devices/VENC0_SYS 0x300700240 -> /soc/power-management@300700000/power-controller@240

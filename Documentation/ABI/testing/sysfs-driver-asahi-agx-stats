@@ -122,6 +122,37 @@ Description:
 		           frequency. No qualified busy-time duration, power unit
 		           or temperature field is available.
 
+		M5 firmware (the M5 command set of the shared G17 backend) uses
+		the same snapshot and keys, with these differences:
+
+		pstate_status, pstate
+		           Supported. The firmware reports the performance state
+		           in effect in tag 0x1b, words 1 and 3, which must
+		           agree: an index 1..13 into the board's performance
+		           state table. The end of the interval record before it
+		           (tag 0x19, words 1 and 2) is its firmware timestamp.
+		           A report that names state 0 or a state beyond the
+		           table removes pstate validity. The state reads stale
+		           while the GPU cores are gated.
+
+		achieved_frequency_hz
+		           The frequency of pstate in the board's performance
+		           state table, in Hz, while pstate_status is valid.
+
+		busy_ns    Cumulative u64 since the driver was bound. The tag
+		           0x13 records of this firmware carry a timestamp in
+		           24 MHz ticks (words 1 and 2). Each record credits the
+		           window since the previous record of its epoch at its
+		           device utilisation. A record more than two 8 ms
+		           periods after the previous one, or with an earlier
+		           timestamp, only starts a new window, so time the GPU
+		           spent gated is never credited. MEASURED on T6050
+		           (J716c): 871 and 863 ms for three 300 ms compute jobs
+		           at full clock (905 and 919 ms of work).
+
+		requested_frequency_hz, power_mw, temperature_raw
+		           Unsupported.
+
 		The host uses a 16 ms age/averaging-window limit for V25G83 and
 		32 ms for V26A428 (two nominal periods). These are conservative
 		host policies, not firmware guarantees about packet duration.

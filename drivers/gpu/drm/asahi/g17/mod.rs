@@ -61,6 +61,7 @@ mod recovery;
 mod replay;
 mod reports;
 mod runtime;
+mod sleep;
 pub(crate) mod stats;
 pub(crate) mod status;
 mod teardown;
@@ -235,6 +236,9 @@ pub(crate) struct Config {
     /// Enable the GPU-to-fabric bridge and dynamic core power gating before the firmware
     /// starts (A18 Pro). The M4 Pro has only run with neither written.
     pub(crate) fabric_bridge: bool,
+    /// The firmware's warm restart across a system sleep is known for this SoC. Otherwise the
+    /// driver refuses a sleep that powers the SoC down.
+    pub(crate) sleep_restart: bool,
     /// The SoC's values of region C; `None` where the firmware graph has its own (M5).
     pub(crate) region_c: Option<&'static fw::initdata::RegionCConfig>,
     pub(crate) chip: Option<&'static fw::initdata::v25g83::Chip>,
@@ -273,6 +277,11 @@ pub(crate) enum CrashBuffers {
     /// The firmware places its crash log in its own data segment, the `fw-data` reserved
     /// region, and asks for it there by physical address.
     FirmwareData,
+    /// As [`CrashBuffers::FirmwareData`] when the boot loader describes the data segment as
+    /// the `fw-data` region. A boot loader that does not gets the driver's own buffers, as
+    /// [`CrashBuffers::Fixed`], at the low bits of the physical address the firmware asks for;
+    /// the firmware does not write its crash log there.
+    FirmwareDataOrFixed([FixedBuffer; 2]),
 }
 
 /// A firmware coprocessor instance.
@@ -550,8 +559,26 @@ impl Coprocessor {
         role: Role,
     ) -> Result<Coprocessor> {
         let index = role as usize;
-        let (crash_buffer, crash_log) = match &cfg.crash_buffers {
-            CrashBuffers::Fixed(buffers) => {
+        let fixed = match &cfg.crash_buffers {
+            CrashBuffers::Fixed(buffers) => Some(buffers),
+            CrashBuffers::FirmwareData => None,
+            CrashBuffers::FirmwareDataOrFixed(buffers) => {
+                let described = data_segment::described(dev.as_ref().as_ref());
+                if role == Role::Primary {
+                    if described {
+                        dev_info!(dev.as_ref(), "G17: crash logs from the firmware data segment\n");
+                    } else {
+                        dev_info!(
+                            dev.as_ref(),
+                            "G17: no fw-data region from the boot loader, crash logs unreadable\n"
+                        );
+                    }
+                }
+                (!described).then_some(buffers)
+            }
+        };
+        let (crash_buffer, crash_log) = match fixed {
+            Some(buffers) => {
                 let buffer = &buffers[index];
                 let mut crash_buffer = KernelObject::new(
                     dev,
@@ -569,7 +596,7 @@ impl Coprocessor {
                 };
                 (Some(crash_buffer), Some((fixed, crash_map)))
             }
-            CrashBuffers::FirmwareData => (None, None),
+            None => (None, None),
         };
         let state = Arc::pin_init(
             pin_init!(RoleState {
@@ -602,7 +629,11 @@ impl Coprocessor {
     ) -> Result<rtkit::RtKit<RoleOps>> {
         for attempt in 0..RECEIVER_ATTEMPTS {
             match rtkit::RtKit::<RoleOps>::new(dev.as_ref().as_ref(), None, index, state.clone()) {
-                Ok(receiver) => return Ok(receiver),
+                Ok(receiver) => {
+                    // Its OSLOG counters stay unanswered until a soak shows echoing them is safe.
+                    receiver.set_oslog_echo(false);
+                    return Ok(receiver);
+                }
                 Err(error) if error == EINVAL || error == ETIMEDOUT => {
                     if attempt + 1 < RECEIVER_ATTEMPTS {
                         fsleep(Delta::from_millis(RECEIVER_RETRY_MS));
@@ -644,6 +675,15 @@ impl Coprocessor {
         self.rtkit.send(EP_DOORBELL, msg)
     }
 
+    /// Starts the CPU of firmware that lost power with its state intact, and waits for RTKit to
+    /// come up. No endpoint starts and no initialization: it already has both.
+    fn restart(&mut self) -> Result {
+        self.rtkit.with(|rtkit| rtkit.warm_restart())?;
+        self.cpu.start()?;
+        self.running = true;
+        self.rtkit.with(|rtkit| rtkit.boot())
+    }
+
     /// Hands the firmware the host's log buffer ([`MSG_LOG_BUFFER`]).
     fn publish_log_buffer(&self, va: u64, size: usize) -> Result {
         let msg = MSG_LOG_BUFFER
@@ -657,6 +697,14 @@ impl Coprocessor {
     fn stop(&mut self) {
         if self.running {
             self.cpu.stop();
+            self.running = false;
+        }
+    }
+
+    /// The books for a CPU that the sleep's commit stopped, with no register access.
+    fn stopped_at_commit(&mut self) {
+        if self.running {
+            self.cpu.stopped_elsewhere();
             self.running = false;
         }
     }
@@ -690,6 +738,44 @@ impl Bridge {
             regs,
             enabled: false,
         }
+    }
+
+    /// The bridge across a power-off of the GPU's domain. Nothing on a target that runs without
+    /// it. Teardown still clears it afterwards.
+    fn set(&self, enable: bool) -> Result {
+        if !self.enabled {
+            return Ok(());
+        }
+        if enable {
+            return self.regs.enable_g17_bridge();
+        }
+        self.regs.disable_g17_bridge();
+        Ok(())
+    }
+
+    /// Core gating across a power-off of the GPU's domain. Nothing on a target that runs without
+    /// the bridge.
+    fn set_gating(&self, enable: bool) -> Result {
+        if !self.enabled {
+            return Ok(());
+        }
+        if enable {
+            self.regs.enable_g17_gating()
+        } else {
+            self.regs.hold_g17_gating()
+        }
+    }
+
+    /// Both bridge words and the gating word, on a target that has them.
+    fn words(&self) -> Option<[u32; 3]> {
+        if !self.enabled {
+            return None;
+        }
+        self.regs.g17_fabric_words().ok()
+    }
+
+    fn forget(&mut self) {
+        self.enabled = false;
     }
 
     fn disable(&mut self) {
@@ -780,7 +866,10 @@ impl Firmware {
     /// held through publication and the following mailbox notification.
     fn publish_control(&mut self, record: &fw::channels::ControlRecord) -> Result<u32> {
         use recovery::Memory;
-        if self.recovery.pending() || self.init.recovery_state()? != 0 {
+        if self.primary.state.shared.sleeping()
+            || self.recovery.pending()
+            || self.init.recovery_state()? != 0
+        {
             return Err(EAGAIN);
         }
         let target = channel::Rings::publish_control(&self.init, record)?;
@@ -940,7 +1029,7 @@ impl Firmware {
 
     /// Observe a telemetry epoch boundary without changing GPU power policy.
     fn observe_statistics_power(&mut self) {
-        if self.rings.statistics_suspended() {
+        if self.rings.statistics_suspended() || self.primary.state.shared.sleeping() {
             return;
         }
         let roles = self.roles();
@@ -1117,6 +1206,14 @@ struct Shared {
     /// The M5 shared-queue resource policy (frozen device topology).
     render_policy: Option<render_resources::M5Policy>,
     crashed: AtomicBool,
+    /// The firmware is stopped, or about to be: nothing may read or publish to it.
+    sleeping: AtomicBool,
+    /// A sleep holds preparations closed, so a recovery settling meanwhile doesn't reopen them.
+    sleep_gate: AtomicBool,
+    /// The power state word as it was before the firmware stopped.
+    sleep_ps: AtomicU32,
+    /// The stop the sleep's commit makes, from `.prepare` to `.complete`; null otherwise.
+    sleep_commit: core::sync::atomic::AtomicPtr<core::ffi::c_void>,
     feed: Arc<feed::Feed>,
     #[pin]
     feed_work: Work<Shared, FEED_WORK>,
@@ -1233,6 +1330,9 @@ impl_has_work! {
 impl WorkItem<GROW_WORK> for Shared {
     type Pointer = Arc<Shared>;
     fn run(this: Arc<Shared>) {
+        if this.sleeping() {
+            return;
+        }
         if let Err(error) = this.grow_render() {
             if this.state.lock().is_some() {
                 dev_err!(
@@ -1256,6 +1356,9 @@ impl WorkItem<RECLAIM_WORK> for Shared {
 impl WorkItem<POLL_WORK> for Shared {
     type Pointer = Arc<Shared>;
     fn run(this: Arc<Shared>) {
+        if this.sleeping() {
+            return;
+        }
         let result = {
             let mut state = this.state.lock();
             match (*state).as_deref_mut() {
@@ -1656,6 +1759,10 @@ impl Gpu {
                 firmware_test: !submits,
                 render_policy,
                 crashed: AtomicBool::new(false),
+                sleeping: AtomicBool::new(false),
+                sleep_gate: AtomicBool::new(false),
+                sleep_ps: AtomicU32::new(0),
+                sleep_commit: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                 feed,
                 feed_work <- new_work!("g17::Shared::feed_work"),
                 preparations,
@@ -1711,7 +1818,10 @@ impl Gpu {
         )?;
         let stats = Arc::new(
             crate::stats::StatsSnapshot {
-                g17_reader: Some(stats::Reader(shared.clone())),
+                g17_reader: Some(stats::Reader(
+                    shared.clone(),
+                    cfg.m5.map(|board| board.perf_states),
+                )),
                 ..Default::default()
             },
             GFP_KERNEL,
@@ -1929,7 +2039,7 @@ impl Gpu {
                     shared.feed.clone(),
                 )?,
                 seen_submissions: 0,
-                rings: channel::Rings::new(shared.variant.graph)?,
+                rings: channel::Rings::new(shared.variant.graph, shared.variant.m5_commands)?,
                 recovery: recovery::State::new(),
                 effort: power::Effort::new(),
                 hold: power::Hold::new(),
@@ -2133,7 +2243,7 @@ impl Gpu {
                     shared.feed.clone(),
                 )?,
                 seen_submissions: 0,
-                rings: channel::Rings::new(shared.variant.graph)?,
+                rings: channel::Rings::new(shared.variant.graph, shared.variant.m5_commands)?,
                 recovery: recovery::State::new(),
                 effort: power::Effort::new(),
                 hold: power::Hold::new(),
@@ -2351,7 +2461,8 @@ impl gpu::Gpu for Gpu {
             u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)
                 | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS)
                 | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)
-                | sync_output::FEATURE_CUMULATIVE_SIGNALS;
+                | sync_output::FEATURE_CUMULATIVE_SIGNALS
+                | crate::file::DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT;
         let variant = self.shared.variant;
         // The M5 command set has no AS-build flag: its validation refuses one.
         if !variant.m5_commands {

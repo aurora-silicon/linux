@@ -1753,7 +1753,7 @@ static int macaudio_spk_enter_lease(struct macaudio_snd_data *ma)
 		dev_err(ma->card.dev, "software gain full scale not set: %d\n", ret);
 
 	if (!ma->spk_owner)
-		mod_delayed_work(system_wq, &ma->spk_unowned_work,
+		mod_delayed_work(system_percpu_wq, &ma->spk_unowned_work,
 				 msecs_to_jiffies(SPEAKER_LEASE_UNOWNED_MS));
 	dev_info(ma->card.dev,
 		 "Speaker protection interface: Speaker Protection (lease); Speaker Volume Unlock refused\n");
@@ -2013,7 +2013,7 @@ static void macaudio_spk_unlock(struct snd_kcontrol *kcontrol)
 		macaudio_spk_floor_ramped(ma, "owner gone");
 		/* A restarting engine takes it back in time; a dead one does not */
 		if (!ma->spk_dead)
-			mod_delayed_work(system_wq, &ma->spk_unowned_work,
+			mod_delayed_work(system_percpu_wq, &ma->spk_unowned_work,
 					 msecs_to_jiffies(SPEAKER_LEASE_UNOWNED_MS));
 	}
 	mutex_unlock(&ma->spk_mutex);
@@ -2779,6 +2779,17 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 			card->dai_link[i].num_platforms = 0;
 		else
 			card->dai_link[i].platforms->of_node = platform;
+
+		/*
+		 * A stream with more slots than amps: the front-end carries
+		 * every slot, while a back-end with a single amp would cap it
+		 * at that codec's own channel count (ASoC merges a lone
+		 * codec's channels, not several codecs'). The amp takes its
+		 * slots from its TDM mask.
+		 */
+		if (ma->cfg->speaker_fe_channels &&
+		    !strcmp(card->dai_link[i].name, "Secondary"))
+			card->dai_link[i].dpcm_merged_chan = 0;
 	}
 
 	/* Skip the speaker sense PCM link if this amp has no sense (or no speakers) */
@@ -4092,6 +4103,28 @@ struct macaudio_platform_cfg macaudio_j714_cfg = {
 	.tweeter_hpf_granted = true,
 };
 
+/*
+ * J815 (T8142, MacBook Air M5 15"): J813's AOP-fed card with six SN012776,
+ * two woofers and a tweeter per side, in ADT speaker-config order (left
+ * woofer 1, right woofer 1, left tweeter, right tweeter, left woofer 2,
+ * right woofer 2: left in even slots, right in odd), and twelve V/I sense
+ * words on the same stream. Locked to the safe level until speakersafetyd
+ * holds the volume, as on J813. Each amp's level is its apple,speaker-config
+ * from the boot loader (15 on all six in the J815 ADT).
+ */
+struct macaudio_platform_cfg macaudio_j815_cfg = {
+	.enable_speakers = true,
+	.amp = AMP_SN012776,
+	.speakers = SPKR_2W1T,
+	.stereo = true,
+	.safe_vol = -20,
+	.fe_dai_names = { "j873-pcm-0", "j873-pcm-1", "j873-pcm-2" },
+	.dai_fmt = SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_IB_NF,
+	.spk_dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC |
+		       SND_SOC_DAIFMT_GATED | SND_SOC_DAIFMT_NB_IF,
+	.spk_secondary_only = true,
+};
+
 struct macaudio_platform_cfg macaudio_j314_cfg = {
 	true,	AMP_SN012776,	SPKR_2W1T,	true,	0,	-20,
 };
@@ -4152,13 +4185,34 @@ struct macaudio_platform_cfg macaudio_j616_cfg = {
 };
 
 /*
- * J614s: the same amps and frame as the J616s, but its speakers have not
- * been brought up and have no protection profile. Keep them off entirely
- * until they get their own bring-up: the speaker link is not bound, so no
- * stream ever reaches the amps. The J604 (T8132, MacBook Pro 14" M4) has
- * the same amps, frame and chassis, and is in the same state.
+ * J614s: the same amps and frame as the J616s. Its speakers are bound like
+ * the J616s's; playback still waits for a protection lease (see
+ * macaudio_spk_admitted()), which speakerguardd v2 takes only once it has
+ * compiled and self-checked this Mac's own tuning (AID34). The legacy
+ * protection has no J614 profile, so without v2 the amps stay at the floor.
  */
 struct macaudio_platform_cfg macaudio_j614_cfg = {
+	.enable_speakers = true,
+	.amp = AMP_SN012776,
+	.speakers = SPKR_2W1T,
+	.stereo = true,
+	.safe_vol = -20,
+	.fe_dai_names = { "j616-pcm-0", "j616-pcm-1", "j616-pcm-2" },
+	.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC |
+		   SND_SOC_DAIFMT_GATED | SND_SOC_DAIFMT_NB_IF,
+	.secondary_bclk_ratio = 250,
+	.fe_cpu_is_platform = true,
+	.route_only_fes = BIT(0),
+	/* Granted, the tweeters restore their DT corner, as on the J616s */
+	.tweeter_hpf_granted = true,
+};
+
+/*
+ * J604 (T8132, MacBook Pro 14" M4): the J614s's amps, frame and chassis,
+ * but its speakers have not been brought up. Keep them off entirely: the
+ * speaker link is not bound, so no stream ever reaches the amps.
+ */
+struct macaudio_platform_cfg macaudio_j604_cfg = {
 	.enable_speakers = false,
 	.amp = AMP_SN012776,
 	.speakers = SPKR_2W1T,
@@ -4173,10 +4227,34 @@ struct macaudio_platform_cfg macaudio_j614_cfg = {
 };
 
 /*
- * J773 (Mac mini, M4 Pro) and J575c (Mac Studio, M4 Max): one SN012776 on
- * the AOP's speaker stream. Neither speaker has been brought up or has a
- * protection profile, and the J773s stream returns no V/I sense, so keep
- * them off as on the J614s: the speaker link is not bound.
+ * J575c (Mac Studio, M4 Max): the J616s stream, six 32-bit playback and
+ * twelve 16-bit sense slots in the same 250-bit frame (the firmware runs it
+ * so, although the ADT's audio-speaker lists one playback slot), with one
+ * SN012776 on the first two playback slots (it downmixes them) and the
+ * first two sense slots (current, then voltage), which speakersafetyd's
+ * J575 model reads. The front-end carries all six channels; the last four
+ * are silent.
+ */
+struct macaudio_platform_cfg macaudio_j575c_cfg = {
+	.enable_speakers = true,
+	.amp = AMP_SN012776,
+	.speakers = SPKR_1W,
+	.stereo = false,
+	.safe_vol = -20,
+	.fe_dai_names = { "j616-pcm-0", "j616-pcm-1", "j616-pcm-2" },
+	.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC |
+		   SND_SOC_DAIFMT_GATED | SND_SOC_DAIFMT_NB_IF,
+	.secondary_bclk_ratio = 250,
+	.fe_cpu_is_platform = true,
+	/* No headphone codec on this card: the jack is a card of its own. */
+	.route_only_fes = BIT(0),
+	.speaker_fe_channels = 6,
+};
+
+/*
+ * J773 (Mac mini, M4 Pro): one SN012776 on the AOP's speaker stream. The
+ * speaker has not been brought up and has no protection profile, so keep it
+ * off as on the J614s: the speaker link is not bound.
  */
 struct macaudio_platform_cfg macaudio_j575c_j773_cfg = {
 	.enable_speakers = false,
@@ -4307,14 +4385,14 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	/* j514    AID28   sn012776    15      2x 2W+1T Compat: apple,j314-macaudio */
 	/* j516    AID29   sn012776    15      2x 2W+1T Compat: apple,j316-macaudio */
 	/* j575    AID33   sn012776    15      1x 1W    Compat: apple,j375-macaudio */
-	/* j575c   -       sn012776    -       1x 1W    (AOP-fed; speaker off until bring-up) */
-	{ .compatible = "apple,j575c-macaudio", .data = &macaudio_j575c_j773_cfg },
+	/* j575c   -       sn012776    -       1x 1W    (AOP-fed) */
+	{ .compatible = "apple,j575c-macaudio", .data = &macaudio_j575c_cfg },
 	/* j575c   -       cs42l84     -       the jack, a card of its own (AOP-fed) */
 	{ .compatible = "apple,j575c-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* j613    AID20   sn012776    15      2x 1W+1T Compat: apple,j413-macaudio */
 	/* j615    AID21   sn012776    15      2x 2W+1T Compat: apple,j415-macaudio */
 	/* j604    -       sn012776    15      2x 2W+1T (AOP-fed; speakers off until bring-up) */
-	{ .compatible = "apple,j604-macaudio", .data = &macaudio_j614_cfg },
+	{ .compatible = "apple,j604-macaudio", .data = &macaudio_j604_cfg },
 	/* j604    -       cs42l84     -       the jack, a card of its own (AOP-fed) */
 	{ .compatible = "apple,j604-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* j614    AID34   sn012776    15      2x 2W+1T (AOP-fed; speakers off until bring-up) */
@@ -4348,6 +4426,8 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j873-macaudio", .data = &macaudio_j873_cfg },
 	/* j813    AID?    sn012776    15      2x 1W+1T (AOP-fed, V/I sense) */
 	{ .compatible = "apple,j813-macaudio", .data = &macaudio_j813_cfg },
+	/* j815    AID43   sn012776    15      2x 2W+1T (AOP-fed, V/I sense) */
+	{ .compatible = "apple,j815-macaudio", .data = &macaudio_j815_cfg },
 	/* Fallback, jack only */
 	{ .compatible = "apple,macaudio"},
 	{ }

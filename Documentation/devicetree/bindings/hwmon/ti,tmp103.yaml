@@ -1,0 +1,51 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/hwmon/ti,tmp103.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: TI TMP103 temperature sensor
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  Low power digital temperature sensor with a two-wire interface.
+
+  Datasheet: https://www.ti.com/product/TMP103
+
+properties:
+  compatible:
+    const: ti,tmp103
+
+  reg:
+    maxItems: 1
+
+  "#thermal-sensor-cells":
+    const: 0
+
+  read-only:
+    type: boolean
+    description:
+      The sensor is configured by another owner. The operating system only
+      reads the temperature register and never writes the configuration or
+      limit registers, including across system sleep.
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false
+
+examples:
+  - |
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        temperature-sensor@70 {
+            compatible = "ti,tmp103";
+            reg = <0x70>;
+            read-only;
+        };
+    };

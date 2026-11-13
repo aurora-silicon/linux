@@ -3,7 +3,11 @@
 #define of_device_is_compatible(...) false
 struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
-    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables;
+    bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+	/* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
+	struct {
+		bool prepared;
+	} cio_sleep;
     struct { void *usb3_dp; } tunables;
 
 	const struct atcphy_hw *hw;
@@ -86,12 +90,21 @@ struct dwc3_apple {
 	void *dev;
 	struct phy *usb2_phy, *usb3_phy;
 	bool fixed_hub, core_active, core_exit_pending, reset_pending, shutting_down;
+	/* Stopped for a deep sleep, and the state to bring back. */
+	bool sleep_stopped;
+	enum dwc3_apple_state sleep_state;
+	/* Votes sleep DDR while the host is up; the fixtures leave it off. */
+	bool sleep_ddr;
 	bool rpm_held, host_only;
 	/* T8132 only: runtime PM before the first core probe; never set here. */
 	bool pre_core_rpm;
 	bool dt_dis_u3_susphy;
 	unsigned long usb2_power_off_pending, usb3_power_off_pending;
 };
+static void __attribute__((unused)) apple_sleep_usb_slp_ddr(bool on)
+{
+	(void)on;
+}
 static unsigned int polls, fail_poll, reset_calls, reset_writes, core_writes;
 static unsigned int host_exits, clocks_disabled, callback_calls;
 static unsigned int gadget_exits, event_cleanups, legacy_suspends,
@@ -328,6 +341,11 @@ static void dwc3_apple_setup_cio(struct dwc3_apple *a)
 {
 	(void)a;
 	setup_cio++;
+}
+/* The hibernation block's register setup; teardown order doesn't depend on it. */
+static void __attribute__((unused)) dwc3_apple_setup_hibernation(struct dwc3_apple *a)
+{
+	(void)a;
 }
 static int dwc3_apple_usb2_mode_before_reset(enum dwc3_apple_state s,
 					     enum phy_mode *m)

@@ -8,8 +8,9 @@ struct dcp_peer_video_wait {
 	struct kref refs;
 	struct completion done;
 	size_t size;
-	u8 reply[sizeof(struct dcp_peer_get_video_resp_v27)];
+	u8 reply[0x80]; /* the largest paired reply: A449's 0x7c bytes */
 };
+static_assert(sizeof(struct dcp_peer_get_video_resp_v27) <= 0x80);
 
 static void dcp_peer_video_free(struct kref *ref)
 {

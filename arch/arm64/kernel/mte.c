@@ -28,6 +28,19 @@
 
 static DEFINE_PER_CPU_READ_MOSTLY(u64, mte_tcf_preferred);
 
+/*
+ * Without FEAT_MTE_ASYNC (ID_AA64PFR1_EL1.MTE_frac == NI) asynchronous tag
+ * check faults are never reported, so the asynchronous and asymmetric modes
+ * would check nothing.
+ */
+static bool system_supports_mte_async(void)
+{
+	u64 pfr1 = read_sanitised_ftr_reg(SYS_ID_AA64PFR1_EL1);
+
+	return SYS_FIELD_GET(ID_AA64PFR1_EL1, MTE_frac, pfr1) !=
+	       ID_AA64PFR1_EL1_MTE_frac_NI;
+}
+
 #ifdef CONFIG_KASAN_HW_TAGS
 /*
  * The asynchronous and asymmetric MTE modes have the same behavior for
@@ -127,6 +140,11 @@ void mte_enable_kernel_sync(void)
 
 void mte_enable_kernel_async(void)
 {
+	if (!system_supports_mte_async()) {
+		mte_enable_kernel_sync();
+		return;
+	}
+
 	__mte_enable_kernel("asynchronous", SCTLR_EL1_TCF_ASYNC);
 
 	/*
@@ -143,7 +161,7 @@ void mte_enable_kernel_async(void)
 
 void mte_enable_kernel_asymm(void)
 {
-	if (cpus_have_cap(ARM64_MTE_ASYMM)) {
+	if (cpus_have_cap(ARM64_MTE_ASYMM) && system_supports_mte_async()) {
 		__mte_enable_kernel("asymmetric", SCTLR_EL1_TCF_ASYMM);
 
 		/*
@@ -159,9 +177,9 @@ void mte_enable_kernel_asymm(void)
 			static_branch_enable(&mte_async_or_asymm_mode);
 	} else {
 		/*
-		 * If the CPU does not support MTE asymmetric mode the
-		 * kernel falls back on synchronous mode which is the
-		 * default for kasan=on.
+		 * If the CPU does not support MTE asymmetric mode, or
+		 * asynchronous tag check faults, the kernel falls back on
+		 * synchronous mode which is the default for kasan=on.
 		 */
 		mte_enable_kernel_sync();
 	}
@@ -392,8 +410,17 @@ long set_mte_ctrl(struct task_struct *task, unsigned long arg)
 	if (!system_supports_mte())
 		return 0;
 
-	if (arg & PR_MTE_TCF_ASYNC)
-		mte_ctrl |= MTE_CTRL_TCF_ASYNC;
+	/*
+	 * Without asynchronous tag check faults, refuse a request for
+	 * asynchronous mode alone; with synchronous mode also requested,
+	 * use that.
+	 */
+	if (arg & PR_MTE_TCF_ASYNC) {
+		if (system_supports_mte_async())
+			mte_ctrl |= MTE_CTRL_TCF_ASYNC;
+		else if (!(arg & PR_MTE_TCF_SYNC))
+			return -EINVAL;
+	}
 	if (arg & PR_MTE_TCF_SYNC)
 		mte_ctrl |= MTE_CTRL_TCF_SYNC;
 
@@ -404,8 +431,8 @@ long set_mte_ctrl(struct task_struct *task, unsigned long arg)
 	 * to differing or changing defaults on CPUs.
 	 */
 	if (cpus_have_cap(ARM64_MTE_ASYMM) &&
-	    (arg & PR_MTE_TCF_ASYNC) &&
-	    (arg & PR_MTE_TCF_SYNC))
+	    (mte_ctrl & MTE_CTRL_TCF_ASYNC) &&
+	    (mte_ctrl & MTE_CTRL_TCF_SYNC))
 		mte_ctrl |= MTE_CTRL_TCF_ASYMM;
 
 	if (arg & PR_MTE_STORE_ONLY)
@@ -632,11 +659,12 @@ static ssize_t mte_tcf_preferred_store(struct device *dev,
 {
 	u64 tcf;
 
-	if (sysfs_streq(buf, "async"))
+	if (system_supports_mte_async() && sysfs_streq(buf, "async"))
 		tcf = MTE_CTRL_TCF_ASYNC;
 	else if (sysfs_streq(buf, "sync"))
 		tcf = MTE_CTRL_TCF_SYNC;
-	else if (cpus_have_cap(ARM64_MTE_ASYMM) && sysfs_streq(buf, "asymm"))
+	else if (cpus_have_cap(ARM64_MTE_ASYMM) && system_supports_mte_async() &&
+		 sysfs_streq(buf, "asymm"))
 		tcf = MTE_CTRL_TCF_ASYMM;
 	else
 		return -EINVAL;
@@ -657,7 +685,8 @@ static int register_mte_tcf_preferred_sysctl(void)
 		return 0;
 
 	for_each_possible_cpu(cpu) {
-		per_cpu(mte_tcf_preferred, cpu) = MTE_CTRL_TCF_ASYNC;
+		per_cpu(mte_tcf_preferred, cpu) = system_supports_mte_async() ?
+			MTE_CTRL_TCF_ASYNC : MTE_CTRL_TCF_SYNC;
 		device_create_file(get_cpu_device(cpu),
 				   &dev_attr_mte_tcf_preferred);
 	}

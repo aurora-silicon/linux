@@ -12,6 +12,7 @@
  */
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
+#include <linux/firmware.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iommu.h>
@@ -37,6 +38,7 @@
 #include <media/v4l2-mem2mem.h>
 #include <media/videobuf2-dma-contig.h>
 
+#include "../apple-video-nr.h"
 #include "apple-prores.h"
 
 #define APR_NAME		"apple-prores"
@@ -67,12 +69,6 @@ static const struct apr_fmt apr_raw_fmts[] = {
  * Settings the engine and its AXI-to-fabric bridge need before the first
  * job, as read-modify-write (offset, mask, value), in order. T8140 values.
  */
-struct apr_tunable {
-	u32 offset;
-	u32 mask;
-	u32 value;
-};
-
 static const struct apr_tunable apr_t8140_engine_tunables[] = {
 	{ 0x008, 0x00000008, 0x00000008 },
 	{ 0x118, 0x0fff0fff, 0x00000280 },
@@ -249,6 +245,245 @@ static const struct apr_tunable apr_t6000_engine_tunables[] = {
 	{ 0x374, 0x07ff07ff, 0x06c000a0 },
 };
 
+/*
+ * T6041 (M4 Pro) power-up rows, in the order the engine needs them: the
+ * SCODEC-system window (aux), then the engine (core), then the AXI-to-fabric
+ * wrapper. Each row replaces the whole register with the value macOS 27.0
+ * writes before its first ProRes job, from an MMIO trace on a J616s.
+ */
+static const struct apr_tunable apr_t6041_aux_tunables[] = {
+	{ 0x008, 0xffffffff, 0x00000001 },
+	{ 0x00c, 0xffffffff, 0x7f7f0001 },
+	{ 0x014, 0xffffffff, 0x01100110 },
+	{ 0x018, 0xffffffff, 0x7f007f00 },
+	{ 0x01c, 0xffffffff, 0xa000003f },
+	{ 0x020, 0xffffffff, 0x001c0090 },
+	{ 0x024, 0xffffffff, 0xa000003f },
+	{ 0x028, 0xffffffff, 0x08000002 },
+	{ 0x1000, 0xffffffff, 0x00007f00 },
+	{ 0x1004, 0xffffffff, 0x00000000 },
+	{ 0x1008, 0xffffffff, 0x00000000 },
+	{ 0x100c, 0xffffffff, 0x00000000 },
+	{ 0x1010, 0xffffffff, 0x00000000 },
+	{ 0x1014, 0xffffffff, 0x00000000 },
+	{ 0x1018, 0xffffffff, 0x00000000 },
+	{ 0x101c, 0xffffffff, 0x00000000 },
+	{ 0x1020, 0xffffffff, 0x00000000 },
+	{ 0x1024, 0xffffffff, 0x00000000 },
+	{ 0x1028, 0xffffffff, 0x00000000 },
+	{ 0x102c, 0xffffffff, 0x00000000 },
+	{ 0x1030, 0xffffffff, 0x00000000 },
+	{ 0x1034, 0xffffffff, 0x00000000 },
+	{ 0x1038, 0xffffffff, 0x00000000 },
+	{ 0x103c, 0xffffffff, 0x00000000 },
+	{ 0x1040, 0xffffffff, 0x00000000 },
+	{ 0x1044, 0xffffffff, 0x00000000 },
+	{ 0x1048, 0xffffffff, 0x00000000 },
+	{ 0x104c, 0xffffffff, 0x00000000 },
+	{ 0x1050, 0xffffffff, 0x00000000 },
+	{ 0x1054, 0xffffffff, 0x00000000 },
+	{ 0x1058, 0xffffffff, 0x00000000 },
+	{ 0x105c, 0xffffffff, 0x00000000 },
+	{ 0x1060, 0xffffffff, 0x00000000 },
+	{ 0x1064, 0xffffffff, 0x00000000 },
+	{ 0x1068, 0xffffffff, 0x00000000 },
+	{ 0x106c, 0xffffffff, 0x00000000 },
+	{ 0x1070, 0xffffffff, 0x00000000 },
+	{ 0x1074, 0xffffffff, 0x00000000 },
+	{ 0x1078, 0xffffffff, 0x00007f00 },
+	{ 0x107c, 0xffffffff, 0x00000000 },
+	{ 0x1080, 0xffffffff, 0x00000000 },
+	{ 0x1084, 0xffffffff, 0x00000000 },
+	{ 0x1088, 0xffffffff, 0x00000000 },
+	{ 0x108c, 0xffffffff, 0x00000000 },
+	{ 0x1090, 0xffffffff, 0x00000000 },
+	{ 0x1094, 0xffffffff, 0x00000000 },
+	{ 0x1098, 0xffffffff, 0x00000000 },
+	{ 0x109c, 0xffffffff, 0x00000000 },
+	{ 0x10a0, 0xffffffff, 0x00000000 },
+	{ 0x10a4, 0xffffffff, 0x00000000 },
+	{ 0x10a8, 0xffffffff, 0x00000000 },
+	{ 0x10ac, 0xffffffff, 0x00000000 },
+	{ 0x10b0, 0xffffffff, 0x00000000 },
+	{ 0x10b4, 0xffffffff, 0x00000000 },
+	{ 0x10b8, 0xffffffff, 0x00000000 },
+	{ 0x10bc, 0xffffffff, 0x00000000 },
+	{ 0x10c0, 0xffffffff, 0x00000000 },
+	{ 0x10c4, 0xffffffff, 0x00000000 },
+	{ 0x10c8, 0xffffffff, 0x00000000 },
+	{ 0x10cc, 0xffffffff, 0x00000000 },
+	{ 0x10d0, 0xffffffff, 0x00000000 },
+	{ 0x10d4, 0xffffffff, 0x00000000 },
+	{ 0x10d8, 0xffffffff, 0x00000000 },
+	{ 0x10dc, 0xffffffff, 0x00000000 },
+	{ 0x10e0, 0xffffffff, 0x00000000 },
+	{ 0x10e4, 0xffffffff, 0x00000000 },
+	{ 0x10e8, 0xffffffff, 0x00000000 },
+	{ 0x10ec, 0xffffffff, 0x00000000 },
+	{ 0x10fc, 0xffffffff, 0x00000000 },
+	{ 0x1100, 0xffffffff, 0x00000000 },
+	{ 0x1104, 0xffffffff, 0x00000000 },
+	{ 0x1108, 0xffffffff, 0x00000000 },
+	{ 0x110c, 0xffffffff, 0x00000000 },
+	{ 0x1110, 0xffffffff, 0x00000000 },
+	{ 0x1114, 0xffffffff, 0x00000000 },
+	{ 0x1118, 0xffffffff, 0x00000000 },
+	{ 0x111c, 0xffffffff, 0x00000000 },
+	{ 0x1120, 0xffffffff, 0x00000000 },
+	{ 0x1124, 0xffffffff, 0x00000000 },
+	{ 0x1128, 0xffffffff, 0x00000000 },
+	{ 0x112c, 0xffffffff, 0x00000000 },
+	{ 0x1130, 0xffffffff, 0x00000000 },
+};
+
+static const struct apr_tunable apr_t6041_engine_tunables[] = {
+	{ 0x008, 0xffffffff, 0x00000008 },
+	{ 0x118, 0xffffffff, 0x00000600 },
+	{ 0x11c, 0xffffffff, 0x00000600 },
+	{ 0x148, 0xffffffff, 0x00000001 },
+	{ 0x180, 0xffffffff, 0x800a0600 },
+	{ 0x184, 0xffffffff, 0x00000001 },
+	{ 0x188, 0xffffffff, 0x09b80038 },
+	{ 0x1c0, 0xffffffff, 0x80040600 },
+	{ 0x1c4, 0xffffffff, 0x00000003 },
+	{ 0x1c8, 0xffffffff, 0x080000c0 },
+	{ 0x200, 0xffffffff, 0x80050600 },
+	{ 0x204, 0xffffffff, 0x00000002 },
+	{ 0x208, 0xffffffff, 0x08c000c0 },
+	{ 0x240, 0xffffffff, 0x800007ff },
+	{ 0x244, 0xffffffff, 0x00000007 },
+	{ 0x248, 0xffffffff, 0x00000040 },
+	{ 0x280, 0xffffffff, 0x80010600 },
+	{ 0x284, 0xffffffff, 0x00000006 },
+	{ 0x288, 0xffffffff, 0x00000080 },
+	{ 0x2c0, 0xffffffff, 0x80020600 },
+	{ 0x2c4, 0xffffffff, 0x00000005 },
+	{ 0x2c8, 0xffffffff, 0x00000040 },
+	{ 0x300, 0xffffffff, 0x80030600 },
+	{ 0x304, 0xffffffff, 0x00000004 },
+	{ 0x308, 0xffffffff, 0x00000040 },
+	{ 0x340, 0xffffffff, 0x81000047 },
+	{ 0x344, 0xffffffff, 0x0b0a0908 },
+	{ 0x348, 0xffffffff, 0x00000720 },
+	{ 0x34c, 0xffffffff, 0x00000140 },
+	{ 0x350, 0xffffffff, 0x00928170 },
+	{ 0x380, 0xffffffff, 0x800b0a00 },
+	{ 0x384, 0xffffffff, 0x0000000c },
+	{ 0x388, 0xffffffff, 0x09800038 },
+	{ 0x394, 0xffffffff, 0x00200000 },
+	{ 0x3c0, 0xffffffff, 0x800b0a00 },
+	{ 0x3c4, 0xffffffff, 0x00000019 },
+	{ 0x3c8, 0xffffffff, 0x09f00010 },
+	{ 0x4c0, 0xffffffff, 0x800b09ff },
+	{ 0x4c4, 0xffffffff, 0x0000001b },
+	{ 0x4c8, 0xffffffff, 0x09300010 },
+	{ 0x500, 0xffffffff, 0x800605ff },
+	{ 0x504, 0xffffffff, 0x0000000d },
+	{ 0x508, 0xffffffff, 0x080000a0 },
+	{ 0x540, 0xffffffff, 0x800005ff },
+	{ 0x544, 0xffffffff, 0x00000011 },
+	{ 0x548, 0xffffffff, 0x00000080 },
+	{ 0x580, 0xffffffff, 0x800105ff },
+	{ 0x584, 0xffffffff, 0x00000010 },
+	{ 0x588, 0xffffffff, 0x00000080 },
+	{ 0x5c0, 0xffffffff, 0x800205ff },
+	{ 0x5c4, 0xffffffff, 0x0000000f },
+	{ 0x5c8, 0xffffffff, 0x00000040 },
+	{ 0x600, 0xffffffff, 0x800305ff },
+	{ 0x604, 0xffffffff, 0x0000000e },
+	{ 0x608, 0xffffffff, 0x00000040 },
+	{ 0x640, 0xffffffff, 0x80070051 },
+	{ 0x644, 0xffffffff, 0x00071716 },
+	{ 0x648, 0xffffffff, 0x07ff0003 },
+	{ 0x650, 0xffffffff, 0x06000040 },
+	{ 0x680, 0xffffffff, 0x80081051 },
+	{ 0x684, 0xffffffff, 0x00071514 },
+	{ 0x688, 0xffffffff, 0x07ff0003 },
+	{ 0x690, 0xffffffff, 0x06400040 },
+	{ 0x6c0, 0xffffffff, 0x80092051 },
+	{ 0x6c4, 0xffffffff, 0x00071312 },
+	{ 0x6c8, 0xffffffff, 0x07ff0003 },
+	{ 0x6d0, 0xffffffff, 0x06800040 },
+	{ 0x700, 0xffffffff, 0x800b09ff },
+	{ 0x704, 0xffffffff, 0x00000018 },
+	{ 0x708, 0xffffffff, 0x08a00060 },
+	{ 0x714, 0xffffffff, 0x00200000 },
+	{ 0x740, 0xffffffff, 0x800b09ff },
+	{ 0x744, 0xffffffff, 0x0000001a },
+	{ 0x748, 0xffffffff, 0x09000010 },
+	{ 0x780, 0xffffffff, 0x800b09ff },
+	{ 0x784, 0xffffffff, 0x0000001c },
+	{ 0x788, 0xffffffff, 0x09100010 },
+	{ 0x7c0, 0xffffffff, 0x800b09ff },
+	{ 0x7c4, 0xffffffff, 0x0000001d },
+	{ 0x7c8, 0xffffffff, 0x09200010 },
+};
+
+static const struct apr_tunable apr_t6041_wrapper_tunables[] = {
+	{ 0x000, 0xffffffff, 0x8000001d },
+	{ 0x004, 0xffffffff, 0x801d0003 },
+	{ 0x008, 0xffffffff, 0x801d000c },
+	{ 0x00c, 0xffffffff, 0x801d0003 },
+	{ 0x010, 0xffffffff, 0x80000020 },
+	{ 0x014, 0xffffffff, 0x80000020 },
+	{ 0x018, 0xffffffff, 0x801d0003 },
+	{ 0x01c, 0xffffffff, 0x801d0003 },
+	{ 0x020, 0xffffffff, 0x80000016 },
+	{ 0x024, 0xffffffff, 0x8000001d },
+	{ 0x028, 0xffffffff, 0x801d0003 },
+	{ 0x02c, 0xffffffff, 0x801d0003 },
+	{ 0x030, 0xffffffff, 0x80000020 },
+	{ 0x034, 0xffffffff, 0x801d0003 },
+	{ 0x038, 0xffffffff, 0x801d0003 },
+	{ 0x03c, 0xffffffff, 0x80000016 },
+	{ 0x040, 0xffffffff, 0x80000016 },
+	{ 0x044, 0xffffffff, 0x80000016 },
+	{ 0x100, 0xffffffff, 0x000000ff },
+	{ 0x108, 0xffffffff, 0x00101330 },
+	{ 0x304, 0xffffffff, 0x02020000 },
+	{ 0x308, 0xffffffff, 0x00001681 },
+	{ 0x30c, 0xffffffff, 0x00001680 },
+	{ 0x310, 0xffffffff, 0x000001e0 },
+	{ 0x314, 0xffffffff, 0x800001e0 },
+	{ 0x318, 0xffffffff, 0x000005a0 },
+	{ 0x31c, 0xffffffff, 0x800005a0 },
+	{ 0x320, 0xffffffff, 0x000005a0 },
+	{ 0x324, 0xffffffff, 0x800005a0 },
+	{ 0x328, 0xffffffff, 0x0000003c },
+	{ 0x32c, 0xffffffff, 0x8000003c },
+	{ 0x330, 0xffffffff, 0x000005a0 },
+	{ 0x334, 0xffffffff, 0x000005a0 },
+	{ 0x338, 0xffffffff, 0x000005a0 },
+	{ 0x344, 0xffffffff, 0x01000005 },
+	{ 0x34c, 0xffffffff, 0x00050020 },
+	{ 0x350, 0xffffffff, 0x000a0030 },
+	{ 0x408, 0xffffffff, 0x00190031 },
+	{ 0x40c, 0xffffffff, 0x00001681 },
+	{ 0x410, 0xffffffff, 0x00001680 },
+	{ 0x414, 0xffffffff, 0x000001e0 },
+	{ 0x418, 0xffffffff, 0x000001e0 },
+	{ 0x41c, 0xffffffff, 0x000005a0 },
+	{ 0x420, 0xffffffff, 0x000005a0 },
+	{ 0x424, 0xffffffff, 0x000005a0 },
+	{ 0x428, 0xffffffff, 0x000005a0 },
+	{ 0x42c, 0xffffffff, 0x0000003c },
+	{ 0x430, 0xffffffff, 0x0000003c },
+	{ 0x434, 0xffffffff, 0x000005a0 },
+	{ 0x438, 0xffffffff, 0x000005a0 },
+	{ 0x43c, 0xffffffff, 0x000005a0 },
+	{ 0x448, 0xffffffff, 0x01000005 },
+	{ 0x748, 0xffffffff, 0x00200000 },
+	{ 0x848, 0xffffffff, 0x00100030 },
+	{ 0x948, 0xffffffff, 0x01400100 },
+	{ 0xa50, 0xffffffff, 0x01000100 },
+	{ 0xc00, 0xffffffff, 0x7fffffff },
+	{ 0x4008, 0xffffffff, 0x00000000 },
+	{ 0x400c, 0xffffffff, 0x00000001 },
+	{ 0x4014, 0xffffffff, 0x00000000 },
+	{ 0x4018, 0xffffffff, 0x00000000 },
+	{ 0x401c, 0xffffffff, 0x00000001 },
+};
+
 struct apr_stats_regs {
 	u32 lo, hi, size;
 };
@@ -261,11 +496,20 @@ struct apr_variant {
 	size_t num_engine_tunables;
 	const struct apr_tunable *wrapper_tunables;
 	size_t num_wrapper_tunables;
-	const char *reg_names[2];
+	/* SCODEC-system rows, applied to the "aux" window before the engine. */
+	const struct apr_tunable *aux_tunables;
+	size_t num_aux_tunables;
+	/* SCODEC control rows (T6050), applied to "ctrl" after the system rows. */
+	const struct apr_tunable *ctrl_tunables;
+	size_t num_ctrl_tunables;
+	const char *reg_names[4];
 	unsigned int num_regs;
 	unsigned int num_irqs;
 	u32 ring_bytes;
 	u32 desc_bytes;
+	/* Optional per-machine APRI file that replaces the built-in rows. */
+	const char *firmware_name;
+	const struct apri_layout *apri;
 };
 
 static const struct apr_variant apr_t8140 = {
@@ -297,11 +541,54 @@ static const struct apr_variant apr_t6000 = {
 	.desc_bytes = APR_DESC_BYTES,
 };
 
+static const struct apr_variant apr_t6041 = {
+	.build_desc = apr_build_desc,
+	.stats = {
+		{ APR_REG_STATS0_LO, APR_REG_STATS0_HI, APR_REG_STATS0_SIZE },
+		{ APR_REG_STATS1_LO, APR_REG_STATS1_HI, APR_REG_STATS1_SIZE },
+	},
+	.engine_tunables = apr_t6041_engine_tunables,
+	.num_engine_tunables = ARRAY_SIZE(apr_t6041_engine_tunables),
+	.wrapper_tunables = apr_t6041_wrapper_tunables,
+	.num_wrapper_tunables = ARRAY_SIZE(apr_t6041_wrapper_tunables),
+	.aux_tunables = apr_t6041_aux_tunables,
+	.num_aux_tunables = ARRAY_SIZE(apr_t6041_aux_tunables),
+	.reg_names = { "core", "wrapper", "aux" },
+	.num_regs = 3,
+	.num_irqs = 1,
+	.ring_bytes = APR_RING_BYTES,
+	.desc_bytes = APR_DESC_BYTES,
+	.firmware_name = APRI_T6041_FIRMWARE_NAME,
+	.apri = &apri_t6041,
+};
+
+/* T6041's engine plus the SCODEC control window; no built-in rows. */
+static const struct apr_variant apr_t6050 = {
+	.build_desc = apr_build_desc,
+	.stats = {
+		{ APR_REG_STATS0_LO, APR_REG_STATS0_HI, APR_REG_STATS0_SIZE },
+		{ APR_REG_STATS1_LO, APR_REG_STATS1_HI, APR_REG_STATS1_SIZE },
+	},
+	.reg_names = { "core", "wrapper", "aux", "ctrl" },
+	.num_regs = 4,
+	.num_irqs = 1,
+	.ring_bytes = APR_RING_BYTES,
+	.desc_bytes = APR_DESC_BYTES,
+	.firmware_name = APRI_T6050_FIRMWARE_NAME,
+	.apri = &apri_t6050,
+};
+
 struct apr_dev {
 	const struct apr_variant *variant;
 	struct device *dev;
 	void __iomem *regs;
 	void __iomem *wrapper;
+	void __iomem *aux;
+	void __iomem *ctrl;
+	struct apr_init_data init;
+	/* Rows applied at power-up, per APRI block: built-in or the file's. */
+	const struct apr_tunable *tunables[APRI_MAX_BLOCKS];
+	size_t num_tunables[APRI_MAX_BLOCKS];
 	struct reset_control *reset;
 	struct dev_pm_domain_list *pd_list;
 	int irq[2];
@@ -377,9 +664,17 @@ static void apr_hw_init(struct apr_dev *apr)
 
 	apr_write(apr, APR_REG_MODE, APR_MODE_OFF);
 	apr_write(apr, APR_REG_IRQ_ENABLE, 0);
-	apr_apply(apr->regs, v->engine_tunables, v->num_engine_tunables);
-	if (v->num_wrapper_tunables)
-		apr_apply(apr->wrapper, v->wrapper_tunables, v->num_wrapper_tunables);
+	if (apr->aux)
+		apr_apply(apr->aux, apr->tunables[APRI_SYSTEM_BLOCK],
+			  apr->num_tunables[APRI_SYSTEM_BLOCK]);
+	if (apr->ctrl)
+		apr_apply(apr->ctrl, apr->tunables[APRI_CONTROL_BLOCK],
+			  apr->num_tunables[APRI_CONTROL_BLOCK]);
+	apr_apply(apr->regs, apr->tunables[APRI_CORE_BLOCK],
+		  apr->num_tunables[APRI_CORE_BLOCK]);
+	if (apr->wrapper)
+		apr_apply(apr->wrapper, apr->tunables[APRI_WRAPPER_BLOCK],
+			  apr->num_tunables[APRI_WRAPPER_BLOCK]);
 	apr_write(apr, APR_REG_RING_HEAD, 0);
 	apr_write(apr, APR_REG_RING_TAIL, 0);
 	apr_write(apr, APR_REG_RING_SIZE, v->ring_bytes);
@@ -1158,11 +1453,67 @@ static void apr_cleanup(void *data)
 	v4l2_device_unregister(&apr->v4l2_dev);
 }
 
+/*
+ * Pick the power-up rows before touching the hardware. The built-in tables
+ * are the default. A variant with a firmware name also accepts a per-machine
+ * APRI file that replaces them; a file that is present but malformed fails
+ * the probe rather than silently falling back.
+ */
+static int apr_select_tunables(struct apr_dev *apr)
+{
+	const struct apr_variant *v = apr->variant;
+	const struct firmware *firmware;
+	struct device *dev = apr->dev;
+	unsigned int i;
+	int ret;
+
+	apr->tunables[APRI_SYSTEM_BLOCK] = v->aux_tunables;
+	apr->num_tunables[APRI_SYSTEM_BLOCK] = v->num_aux_tunables;
+	apr->tunables[APRI_CORE_BLOCK] = v->engine_tunables;
+	apr->num_tunables[APRI_CORE_BLOCK] = v->num_engine_tunables;
+	apr->tunables[APRI_WRAPPER_BLOCK] = v->wrapper_tunables;
+	apr->num_tunables[APRI_WRAPPER_BLOCK] = v->num_wrapper_tunables;
+	apr->tunables[APRI_CONTROL_BLOCK] = v->ctrl_tunables;
+	apr->num_tunables[APRI_CONTROL_BLOCK] = v->num_ctrl_tunables;
+
+	if (v->firmware_name &&
+	    !firmware_request_nowarn(&firmware, v->firmware_name, dev)) {
+		ret = apr_parse_init(v->apri, firmware->data, firmware->size,
+				     &apr->init);
+		release_firmware(firmware);
+		if (ret)
+			return dev_err_probe(dev, ret, "invalid %s\n",
+					     v->firmware_name);
+		for (i = 0; i < v->apri->blocks; i++) {
+			apr->tunables[i] = apr->init.blocks[i].entries;
+			apr->num_tunables[i] = apr->init.blocks[i].count;
+		}
+		dev_info(dev, "initialization rows from %s\n", v->firmware_name);
+	}
+
+	/*
+	 * A variant whose rows come only from the optional file has nothing to
+	 * program without it. The file is optional, so report its absence once
+	 * at info level and leave the engine off.
+	 */
+	if (!apr->num_tunables[APRI_CORE_BLOCK]) {
+		if (v->firmware_name) {
+			dev_info(dev, "no %s and no built-in rows, engine not used\n",
+				 v->firmware_name);
+			return -ENODEV;
+		}
+		return dev_err_probe(dev, -ENOENT,
+				     "no initialization rows for this engine\n");
+	}
+
+	return 0;
+}
+
 static int apr_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct video_device *vdev;
-	void __iomem *regs[2] = {};
+	void __iomem *regs[4] = {};
 	struct apr_dev *apr;
 	unsigned int i;
 	int ret;
@@ -1174,6 +1525,9 @@ static int apr_probe(struct platform_device *pdev)
 	apr->variant = of_device_get_match_data(dev);
 	if (!apr->variant)
 		return -ENODEV;
+	ret = apr_select_tunables(apr);
+	if (ret)
+		return ret;
 	mutex_init(&apr->vdev_lock);
 	spin_lock_init(&apr->hw_lock);
 	INIT_DELAYED_WORK(&apr->watchdog, apr_watchdog);
@@ -1187,6 +1541,8 @@ static int apr_probe(struct platform_device *pdev)
 	}
 	apr->regs = regs[0];
 	apr->wrapper = regs[1];
+	apr->aux = regs[2];
+	apr->ctrl = regs[3];
 	/*
 	 * A second power domain, "perf", is the SoC performance request the
 	 * engine needs for full speed. With more than one domain the core
@@ -1277,7 +1633,7 @@ static int apr_probe(struct platform_device *pdev)
 	vdev->vfl_dir = VFL_DIR_M2M;
 	vdev->device_caps = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING;
 	video_set_drvdata(vdev, apr);
-	return video_register_device(vdev, VFL_TYPE_VIDEO, -1);
+	return video_register_device(vdev, VFL_TYPE_VIDEO, APPLE_M2M_VIDEO_NR);
 }
 
 static void apr_remove(struct platform_device *pdev)
@@ -1289,6 +1645,8 @@ static void apr_remove(struct platform_device *pdev)
 
 static const struct of_device_id apr_of_match[] = {
 	{ .compatible = "apple,t6000-prores", .data = &apr_t6000 },
+	{ .compatible = "apple,t6041-prores", .data = &apr_t6041 },
+	{ .compatible = "apple,t6050-prores", .data = &apr_t6050 },
 	{ .compatible = "apple,t8140-prores", .data = &apr_t8140 },
 	{ }
 };
@@ -1307,3 +1665,5 @@ module_platform_driver(apr_driver);
 
 MODULE_DESCRIPTION("Apple ProRes encoder");
 MODULE_LICENSE("GPL");
+MODULE_FIRMWARE(APRI_T6041_FIRMWARE_NAME);
+MODULE_FIRMWARE(APRI_T6050_FIRMWARE_NAME);

@@ -38,7 +38,7 @@ def controls(ROOT):
     actual=actual.replace('struct connector { bool connected; };','struct encoder { unsigned possible_crtcs; };\nstruct connector { bool connected,edid_live,edid_invalidation_pending; void *dcp; struct encoder *port_encoder; unsigned candidate_crtcs; int bl_sync_wq; };\n#define apple_connector connector\nstruct mux_control { int unused; };',1)
     actual=actual.replace('struct apple_dcp { int external_lock,external_error;', '''struct apple_dcp { int external_lock,external_error;
      bool external_power_attempted,dptx_tunnel,tb_clock_ok,tb_clock_refused,fixed_route_selected;
-     int tb_lock; unsigned typec_generation,dptx_dfp_port,dptx_phy,fixed_dptx_phy,fixed_mux_index;
+     int tb_lock; unsigned typec_generation,dptx_dfp_port,dptx_phy,fixed_dptx_phy,fixed_mux_index,typec_reconnect_tries;
      void *tb_dpin_set_active,*tb_dpin_ctx,*phy,*fixed_phy;
      struct mux_control *xbar,*fixed_xbar;
      /* desktop 26.x hybrid hand-over and dual-pipe state; fw_compat is never desktop here */
@@ -59,13 +59,16 @@ def controls(ROOT):
     actual=actual.replace('static struct apple_dcp_typec_port *sole_port(void) { return &port; }',
         'static struct apple_dcp_typec_port *sole_port(void) { return &port; }\nstatic struct apple_dcp_typec_route * __attribute__((unused)) sole_route(void) { return &route; }',1)
     actual=actual.replace('bool applied_valid,safe_pending,dp_wanted,dp_hpd,hpd;', 'struct typec_altmode *applied_alt; unsigned long applied_mode; unsigned applied_status,applied_conf; bool applied_valid,safe_pending,dp_wanted,dp_hpd,hpd;',1)
-    actual=actual.replace('void *xbar; bool deactivate_xbar_done; int deactivate_error; bool selected,tunnel;', 'struct mux_control *xbar,*active_xbar; void *phy; unsigned dptx_phy,tunnel_dpin,mux_index;unsigned long long tunnel_generation;bool deactivate_xbar_done; int deactivate_error;bool xbar_up,selected,tunnel;',1)
+    actual=actual.replace('void *xbar; bool deactivate_xbar_done; int deactivate_error; bool selected,tunnel;', 'struct mux_control *xbar,*active_xbar; void *phy; unsigned dptx_phy,tunnel_dpin,mux_index;unsigned long long tunnel_generation;bool deactivate_xbar_done; int deactivate_error;bool xbar_up,selected,tunnel,sleep_parked;',1)
     extra=r'''
     /* actual DCP leaves */
     #define WRITE_ONCE(x,v) ((x)=(v))
     /* No T8132 dcpext here: every route has DP alt mode (production: the dcpext compatible). */
     struct apple_dcp_typec_route;
     static bool dcp_typec_route_no_dp_alt(const struct apple_dcp_typec_route *route) { (void)route; return false; }
+    struct apple_dcp;
+    static bool dcp_is_t8132_ext(const struct apple_dcp *dcp) { (void)dcp; return false; }
+    #define dcp_queue_typec_reconnect(dcp,delay) ((void)(dcp),(void)(delay))
     #define dev_info_once(...) ((void)0)
     #define USB_TYPEC_DP_SID 0xff01
     #define TYPEC_DP_STATE_A 10

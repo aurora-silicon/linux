@@ -62,6 +62,10 @@ use kernel::{
     new_spinlock,
     platform,
     prelude::*,
+    regulator::{
+        self,
+        Regulator, //
+    },
     soc::apple::aop::{
         from_fourcc,
         EPICService,
@@ -492,6 +496,10 @@ struct SndSocT8140AopData {
     spkr_want_run: AtomicFlag,
     /// A microphone-array stream has been triggered and not yet stopped.
     hpai_want_run: AtomicFlag,
+    /// The array's rail (ADT function-input_power_enable), held while its
+    /// service runs.
+    #[pin]
+    hpai_supply: Mutex<Option<Regulator<regulator::Enabled>>>,
     /// "Speaker Playback Volume" (REG_SPKR_VOLUME), 0..=SPKR_VOLUME_MAX.
     spkr_volume: Atomic<u32>,
     /// REG_SPKR_FULL_SCALE: the volume is below SPKR_CEILING_Q31, not the
@@ -958,7 +966,11 @@ impl SndSocT8140AopData {
         if !self.hpai_want_run.load(Relaxed) || self.hpai.running.load(Relaxed) {
             return Ok(());
         }
-        self.service_run(&self.hpai)
+        // As macOS does: the rail, then the stream. A failed start drops it again.
+        let supply = Regulator::<regulator::Enabled>::get(&self.dev, c"mic")?;
+        self.service_run(&self.hpai)?;
+        *self.hpai_supply.lock() = Some(supply);
+        Ok(())
     }
 
     /// Called from sleeping close paths: a queued start must finish before
@@ -972,7 +984,9 @@ impl SndSocT8140AopData {
 
     fn hpai_shutdown(&self) {
         self.flush_hpai_start();
-        self.service_shutdown(&self.hpai, &self.hpai_domains())
+        self.service_shutdown(&self.hpai, &self.hpai_domains());
+        // As macOS does: the stream's stop, then the rail.
+        *self.hpai_supply.lock() = None;
     }
 
     // ---- internal speakers: the spkr service on LEAP TX0 (leap-ns ADMAC
@@ -1035,6 +1049,35 @@ impl SndSocT8140AopData {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// `pw0 ` if running; the leaves stay with the stream.
+    fn service_stop(&self, svc: &Service) {
+        if svc.running.load(Relaxed) {
+            if let Err(e) = self.service_set_power(svc, SPKR_POWER_STATE_PW0) {
+                dev_err!(self.dev, "{}: pw0 failed: {:?}\n", svc.name, e);
+            }
+            svc.running.store(false, Relaxed);
+        }
+    }
+
+    /// A system sleep: nothing the firmware runs may outlast the streams, whose DMA stops with
+    /// the sleep. Each one's next prepare or start asks for it again.
+    fn sleep_stop(&self) {
+        if self.powered.xchg(false, Relaxed) {
+            if let Err(e) = self.lpai_run_put() {
+                dev_err!(self.dev, "unable to return lpai to idle: {:?}\n", e);
+            }
+        }
+        self.flush_hpai_start();
+        self.service_stop(&self.hpai);
+        *self.hpai_supply.lock() = None;
+        if let Err(e) = self.spkr_prepare() {
+            dev_err!(self.dev, "spkr: stop failed: {:?}\n", e);
+        }
+        self.service_stop(&self.tap);
+        self.service_stop(&self.cout);
+        self.service_stop(&self.cin);
     }
 
     /// Called from sleeping prepare/shutdown paths while ALSA serializes
@@ -1571,6 +1614,9 @@ fn pcm_open_dmaengine(
     if hw.formats == 0 {
         return EINVAL.to_errno();
     }
+    // A system sleep stops the services, and only a prepare starts them all again. Offer
+    // neither resume nor pause: a transfer paused by the suspend would block the next start.
+    hw.info &= !(bindings::SNDRV_PCM_INFO_PAUSE | bindings::SNDRV_PCM_INFO_RESUME);
     // SAFETY: the substream's runtime exists for the op's duration; the
     // dmaengine open attaches `chan` to it on success.
     unsafe {
@@ -2609,6 +2655,8 @@ impl AsocContext {
 
 pub(crate) struct SndSocT8140AopDriver {
     card: *mut bindings::snd_card,
+    /// The card's two microphone PCMs, null until created.
+    pcms: [*mut bindings::snd_pcm; 2],
     data: Arc<SndSocT8140AopData>,
     asoc: KBox<AsocContext>,
     asoc_registered: bool,
@@ -2664,6 +2712,7 @@ impl SndSocT8140AopDriver {
         // whatever was set up.
         let mut this = SndSocT8140AopDriver {
             card: ptr::null_mut(),
+            pcms: [ptr::null_mut(); 2],
             asoc: AsocContext::new(data.clone())?,
             data: data.clone(),
             asoc_registered: false,
@@ -2777,6 +2826,7 @@ impl SndSocT8140AopDriver {
             (*pcm).private_free = Some(pcm_free_private);
             (*pcm).info_flags = 0;
         }
+        self.pcms[device as usize] = pcm;
         // SAFETY: as above.
         copy_str(unsafe { &mut (*pcm).name }, name.to_bytes_with_nul())?;
         if device == 0 {
@@ -2795,6 +2845,21 @@ impl SndSocT8140AopDriver {
             }
         }
         Ok(())
+    }
+
+    /// A system sleep: stop the card's own streams, then whatever the firmware runs for them
+    /// and for the sound card's. Userspace prepares its streams again afterwards, since none
+    /// of them can resume.
+    pub(crate) fn sleep_stop(&self) {
+        for pcm in self.pcms.iter().copied().filter(|pcm| !pcm.is_null()) {
+            // SAFETY: the PCMs live as long as the card, and the driver core keeps
+            // unbind away from a system sleep.
+            let ret = unsafe { bindings::snd_pcm_suspend_all(pcm) };
+            if ret < 0 {
+                dev_err!(self.data.dev, "unable to suspend a PCM: {}\n", ret);
+            }
+        }
+        self.data.sleep_stop();
     }
 
     /// Undo probe: stop the reports, unregister the ASoC component and free
@@ -2889,6 +2954,9 @@ impl SndSocT8140AopDriver {
         // SAFETY: the pointer was checked above and stays valid with the child.
         let svc = unsafe { *service };
 
+        // A capture takes the array's rail, which needs the SMC's GPIOs bound.
+        Regulator::<regulator::Disabled>::get(&dev, c"mic")?;
+
         // The source ring: 512 KiB through our own IOMMU stream (dart-aop 9),
         // owned by the AOP driver because the firmware binds it once per boot.
         // SAFETY: no DMA is in flight on this device yet.
@@ -2940,6 +3008,7 @@ impl SndSocT8140AopDriver {
                 pd_rx0,
                 spkr_want_run: AtomicFlag::new(false),
                 hpai_want_run: AtomicFlag::new(false),
+                hpai_supply <- new_mutex!(None),
                 spkr_volume: Atomic::new(SPKR_VOLUME_MAX),
                 spkr_full_scale: AtomicFlag::new(false),
                 spkr_start_work <- new_work!("SndSocT8140AopData::spkr_start_work"),

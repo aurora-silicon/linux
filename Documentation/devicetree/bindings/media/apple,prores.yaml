@@ -12,7 +12,11 @@ maintainers:
 description: |
   The APR is a directly programmed ProRes engine with its own DART. Jobs are
   descriptors in a DMA ring; the engine signals completion with an
-  interrupt. It has no firmware. Its power domain also resets it.
+  interrupt. On T6041 and T6050 a per-machine initialization table,
+  apple/prores-t6041-init.bin or apple/prores-t6050-init.bin, takes the
+  place of any rows built into the driver. Other supported variants have no
+  firmware.
+  The engine's power domain also resets it.
 
 select:
   properties:
@@ -71,14 +75,22 @@ allOf:
           minItems: 2
           maxItems: 5
           description:
-            Three windows on T8132. On T6050 the ADT lists two for the first
-            ProRes instance and five for the second.
+            Three windows on T8132. On T6050 each ProRes instance has up to
+            five, named core, wrapper, aux (SCODEC system), ctrl and ctrl1
+            (SCODEC control).
+
+        reg-names:
+          minItems: 2
+          maxItems: 5
 
         interrupts:
           minItems: 2
           maxItems: 2
 
         power-domains:
+          maxItems: 1
+
+        resets:
           maxItems: 1
 
         iommus:

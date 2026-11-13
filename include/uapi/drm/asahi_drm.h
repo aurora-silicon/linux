@@ -96,6 +96,21 @@ enum drm_asahi_ioctl_id {
 
 	/** @DRM_ASAHI_GEM_MADVISE: Mark a VM-private object purgeable or needed. */
 	DRM_ASAHI_GEM_MADVISE,
+
+	/**
+	 * @DRM_ASAHI_GEM_USERPTR: Create a buffer object over the caller's own
+	 * memory (DRM_ASAHI_FEATURE_USERPTR).
+	 */
+	DRM_ASAHI_GEM_USERPTR,
+
+	/**
+	 * @DRM_ASAHI_GEM_RESIDENCY: Ask the kernel to release an object's
+	 * memory after that of the other objects of its VM when it reclaims
+	 * the VM's idle memory, or withdraw that request
+	 * (DRM_ASAHI_FEATURE_GEM_RESIDENCY). A hint, see struct
+	 * drm_asahi_gem_residency.
+	 */
+	DRM_ASAHI_GEM_RESIDENCY,
 };
 
 #define DRM_ASAHI_MAX_CLUSTERS	64
@@ -489,6 +504,26 @@ enum drm_asahi_feature {
  */
 #define DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION ((1ULL) << 34)
 
+/*
+ * DRM_ASAHI_FEATURE_GEM_RESIDENCY: DRM_IOCTL_ASAHI_GEM_RESIDENCY is
+ * available. A feature bit like those of enum drm_asahi_feature, defined
+ * here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_GEM_RESIDENCY ((1ULL) << 35)
+
+/*
+ * DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT: drm_asahi_queue_create::compute_timeout_ms
+ * sets the watchdog allowance of the queue's compute commands. A feature bit
+ * like those of enum drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT ((1ULL) << 36)
+
+/*
+ * DRM_ASAHI_FEATURE_USERPTR: DRM_IOCTL_ASAHI_GEM_USERPTR is available. A
+ * feature bit like those of enum drm_asahi_feature, defined here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_USERPTR ((1ULL) << 37)
+
 #define DRM_ASAHI_PARAM_GROUP_VM_STATUS 1
 #define DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS 2
 
@@ -671,6 +706,12 @@ enum drm_asahi_gem_flags {
 	 * @DRM_ASAHI_GEM_VM_PRIVATE: BO is private to this GPU VM (no exports).
 	 */
 	DRM_ASAHI_GEM_VM_PRIVATE = (1L << 1),
+
+	/**
+	 * @DRM_ASAHI_GEM_USERPTR_READ_ONLY: The GPU only reads the memory of a
+	 * DRM_IOCTL_ASAHI_GEM_USERPTR object. Only that ioctl accepts it.
+	 */
+	DRM_ASAHI_GEM_USERPTR_READ_ONLY = (1L << 2),
 };
 
 /**
@@ -681,6 +722,75 @@ struct drm_asahi_gem_create {
 	__u64 size;
 
 	/** @flags: Combination of drm_asahi_gem_flags flags. */
+	__u32 flags;
+
+	/**
+	 * @vm_id: VM ID to assign to the BO, if DRM_ASAHI_GEM_VM_PRIVATE is set
+	 */
+	__u32 vm_id;
+
+	/** @handle: Returned GEM handle for the BO */
+	__u32 handle;
+
+	/** @pad: MBZ */
+	__u32 pad;
+};
+
+/**
+ * struct drm_asahi_gem_userptr - Arguments passed to
+ * DRM_IOCTL_ASAHI_GEM_USERPTR
+ *
+ * Creates a buffer object whose backing is the caller's memory at
+ * [@userptr, @userptr + @size), without a copy: the CPU accesses it through
+ * the caller's own mapping, and the GPU through VM_BIND mappings of the
+ * object, as for any other object. Available when DRM_ASAHI_FEATURE_USERPTR
+ * is set; otherwise the ioctl fails with EOPNOTSUPP or EINVAL.
+ *
+ * The pages of the range are pinned when the object is created and stay
+ * pinned until it is freed: all of them or, on failure, none. They are the
+ * pages the range maps at creation; later changes to the caller's mappings
+ * (munmap, mremap, a new mapping over the range, truncating a mapped file)
+ * leave the object on those pages, which stay allocated until it is freed.
+ * After fork(), the child gets copies of the pinned anonymous pages; the
+ * object stays the parent's memory. The CPU and GPU views are coherent
+ * without cache maintenance.
+ *
+ * The pinned pages count against the caller's RLIMIT_MEMLOCK, together with
+ * its other long-term pins, unless it has CAP_IPC_LOCK (ENOMEM otherwise),
+ * and their size against the client and device limits of
+ * drm_asahi_params_global::client_memory_limit and
+ * drm_asahi_params_global::memory_limit (ENOMEM). They are never released by
+ * memory-pressure reclaim.
+ *
+ * Without DRM_ASAHI_GEM_USERPTR_READ_ONLY, the whole range must be mapped
+ * writable, and not be a shared mapping of a file whose filesystem tracks
+ * writes. With it, any readable mapping is accepted, and the object takes
+ * only GPU read-only VM_BIND mappings (a mapping with DRM_ASAHI_BIND_WRITE
+ * fails with EACCES). Pages of private mappings, file mappings included, are
+ * pinned as the caller's own copies, as a write would make them: a private
+ * file mapping is copied out of the page cache. A read-only shared file
+ * mapping pins the page-cache pages themselves, which then stay resident
+ * while the object lives. Device and PFN mappings, including CPU mappings of
+ * other buffer objects, are refused (EFAULT).
+ *
+ * The object cannot be mapped with DRM_IOCTL_ASAHI_GEM_MMAP_OFFSET, exported,
+ * given advice with DRM_IOCTL_ASAHI_GEM_MADVISE, bound with
+ * DRM_IOCTL_ASAHI_GEM_BIND_OBJECT or registered as a VM status mirror (all
+ * EINVAL).
+ */
+struct drm_asahi_gem_userptr {
+	/**
+	 * @userptr: Start of the range, aligned to both the CPU page size and
+	 * the GPU page size (16 KiB).
+	 */
+	__u64 userptr;
+
+	/** @size: Size of the range, a non-zero multiple of both page sizes. */
+	__u64 size;
+
+	/**
+	 * @flags: DRM_ASAHI_GEM_VM_PRIVATE and DRM_ASAHI_GEM_USERPTR_READ_ONLY.
+	 */
 	__u32 flags;
 
 	/**
@@ -743,6 +853,68 @@ struct drm_asahi_gem_madvise {
 
 	/** @pad: Must be zero. */
 	__u32 pad;
+};
+
+/**
+ * enum drm_asahi_gem_residency_flags - Flags for DRM_IOCTL_ASAHI_GEM_RESIDENCY
+ */
+enum drm_asahi_gem_residency_flags {
+	/**
+	 * @DRM_ASAHI_GEM_RESIDENCY_KEEP: When reclaim releases idle memory of
+	 * the object's VM, release this object's memory after that of the
+	 * VM's objects without the flag, and only if theirs was not enough.
+	 * Without the flag, the object returns to the default policy.
+	 */
+	DRM_ASAHI_GEM_RESIDENCY_KEEP = (1L << 0),
+};
+
+/**
+ * struct drm_asahi_gem_residency - Arguments passed to
+ * DRM_IOCTL_ASAHI_GEM_RESIDENCY
+ *
+ * When the system reclaims memory, the kernel may release the memory of the
+ * VM-private objects of an idle VM. It brings the memory back before the
+ * VM's next job runs, which then waits for it.
+ * DRM_ASAHI_GEM_RESIDENCY_KEEP is a priority among the objects that may be
+ * released this way. It changes the order in which they go, not whether
+ * reclaim gets to them:
+ *
+ * - Only reclaim on behalf of the whole system releases GPU memory. Reclaim
+ *   inside a memory cgroup below the root, such as that of a cgroup at its
+ *   memory limit, releases none, kept or not.
+ * - Reclaim releases memory of a VM only while the VM is idle: no job,
+ *   binding change or other use of the VM is in progress, the last one (or
+ *   the VM's creation) is at least two seconds back, and after a job had to
+ *   wait for released memory, a pause that grows with the time that took
+ *   (between 1 and 30 seconds) is over. The memory of a VM that is not idle
+ *   stays, kept or not.
+ * - Of an idle VM's objects, a reclaim pass releases those without the flag
+ *   first, and kept objects only if that left the amount the pass set out
+ *   to free unmet.
+ * - Contents userspace gave up with DRM_ASAHI_GEM_MADV_DONTNEED are purged
+ *   as before, kept or not.
+ *
+ * The request is therefore a hint. Userspace must not rely on a kept object
+ * being resident, and a client that stays active, or whose memory cgroup is
+ * the one that runs out of memory, keeps its GPU memory whether it asked or
+ * not.
+ *
+ * The request applies once this ioctl returns; memory already released stays
+ * so until the VM's next job or binding brings it back. Other objects
+ * (shared, imported or GEM_USERPTR ones) are never released and accept the
+ * flag without effect on them.
+ *
+ * Kept objects still count against the memory limits as before; the device
+ * total of their sizes is reported as user_kept in the GPU's gpu_memory
+ * sysfs file. Available when DRM_ASAHI_FEATURE_GEM_RESIDENCY is set;
+ * otherwise the ioctl fails with EOPNOTSUPP or EINVAL.
+ */
+struct drm_asahi_gem_residency {
+	/** @handle: Handle of the object. */
+	__u32 handle;
+
+	/** @flags: Combination of drm_asahi_gem_residency_flags flags. */
+	__u32 flags;
 };
 
 /**
@@ -1025,6 +1197,59 @@ struct drm_asahi_queue_create {
 	 * Requires DRM_ASAHI_FEATURE_RENDER_RAY_QUERY; zero otherwise.
 	 */
 	__u64 render_scs_layout[2];
+
+	/**
+	 * @compute_timeout_ms: Watchdog allowance of each compute command of
+	 * this queue, in milliseconds. Zero keeps the driver's default.
+	 * Requires DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT; zero otherwise.
+	 *
+	 * The driver's watchdog polls a queue every two seconds. By default it
+	 * takes a compute command that a poll finds still running at the head
+	 * of the queue (every earlier compute command of the queue has
+	 * completed) to have hung, and fails it, and the queue's VM with it.
+	 * With an allowance, the watchdog lets the command run on at each poll
+	 * until the allowance has passed. For a nonzero request the driver
+	 * raises a shorter allowance to its default of one poll, lowers a
+	 * longer one to the maximum the system allows, and returns the
+	 * allowance in effect here; a request of 0 is returned unchanged.
+	 *
+	 * This is an allowance, not a deadline:
+	 *
+	 * - The watchdog acts at its polls only, so a command may run up to
+	 *   one poll longer than its allowance.
+	 * - The start of a command is known only approximately. The time is
+	 *   counted from one poll before the first poll that finds the command
+	 *   at the head of the queue. That is no earlier than the command got
+	 *   there and may be later: commands submitted to the queue in the
+	 *   meantime postpone that poll.
+	 * - Once the allowance has passed, the deferrals the watchdog grants
+	 *   any command still apply, as they do by default: a command it takes
+	 *   to be waiting behind other clients' work, or one of a kind it
+	 *   gives extra polls, runs on until those are used up as well. The
+	 *   polls it renews any command for while the GPU keeps completing
+	 *   other work (up to 30 s in all, on the GPUs where it does that)
+	 *   run alongside the allowance, not after it: a command is renewed
+	 *   for the longer of the two.
+	 *
+	 * The allowance is per command, and nothing bounds the sum: a queue
+	 * that is kept full of long commands occupies the GPU for as long as
+	 * it is fed. The driver does not shield the other clients from such a
+	 * queue: they share the GPU with it as the firmware schedules them,
+	 * and a command of another client may have to wait until a long
+	 * command ends. The watchdog does not fail such a waiting command,
+	 * render or compute, while the earlier command it waits behind runs
+	 * inside its allowance; afterwards the usual deferrals apply. A
+	 * waiting command is excused this way for at most the longest
+	 * allowance the system permits in total, so a command that keeps
+	 * waiting behind other clients' work longer than that and its own
+	 * deferrals is still failed. Userspace should ask for an allowance
+	 * only for queues whose commands need one, and keep those commands as
+	 * short as it can.
+	 */
+	__u32 compute_timeout_ms;
+
+	/** @pad: MBZ */
+	__u32 pad;
 };
 
 /**
@@ -2193,6 +2418,8 @@ enum {
 	DRM_IOCTL_ASAHI_QUEUE_DESTROY    = DRM_IOCTL_ASAHI(W, QUEUE_DESTROY, queue_destroy),
 	DRM_IOCTL_ASAHI_SUBMIT           = DRM_IOCTL_ASAHI(W, SUBMIT, submit),
 	DRM_IOCTL_ASAHI_GEM_MADVISE      = DRM_IOCTL_ASAHI(WR, GEM_MADVISE, gem_madvise),
+	DRM_IOCTL_ASAHI_GEM_USERPTR      = DRM_IOCTL_ASAHI(WR, GEM_USERPTR, gem_userptr),
+	DRM_IOCTL_ASAHI_GEM_RESIDENCY    = DRM_IOCTL_ASAHI(W, GEM_RESIDENCY, gem_residency),
 };
 
 #if defined(__cplusplus)

@@ -80,6 +80,8 @@ enum apple_smc_boot_stage {
 	APPLE_SMC_ERROR_CRASHED
 };
 
+struct apple_smc_wake_reason;
+
 /**
  * struct apple_smc
  * @dev: Underlying device struct for the physical backend device
@@ -111,6 +113,19 @@ struct apple_smc {
 	struct blocking_notifier_head event_handlers;
 
 	struct apple_rtkit *rtk;
+
+	/* Between the AP power notices of a firmware-driven suspend. */
+	bool ap_notified;
+	/* Told of a coming sleep, and not yet of its end. */
+	bool sleep_warned;
+	/* To be told at the noirq suspend, after the debug link's cut. */
+	bool sleep_warn_late;
+	/* In a noirq phase: replies are polled for. */
+	bool polled;
+	/* MBSW at the last wake: what the SMC had woken the AP for. */
+	u64 wake_record;
+	/* MBSW's bits as this SoC numbers them, from the probe. */
+	const struct apple_smc_wake_reason *wake_reasons;
 
 	struct completion init_done;
 	enum apple_smc_boot_stage boot_stage;

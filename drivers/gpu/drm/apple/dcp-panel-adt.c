@@ -175,6 +175,8 @@ static int dcp_adt_node(struct dcp_adt_cursor *c, struct dcp_panel_adt *panel,
 			matrix_seen = true;
 		} else if (backlight && !strcmp(name, "EDRPotentialHeadroom") && size == 4)
 			panel->edr_potential_headroom = get_unaligned_le32(prop + 36);
+		else if (backlight && !strcmp(name, "LmaxProduct") && size == 4)
+			panel->lmax_product = get_unaligned_le32(prop + 36);
 		c->pos += 36 + ALIGN((size_t)size, 4);
 	}
 	if (product)

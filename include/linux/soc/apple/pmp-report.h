@@ -27,6 +27,11 @@ int apple_pmp_report_set_t6030_gfx(struct device *supplier, bool enable);
 int apple_pmp_report_wait_ready(struct device_node *entry, unsigned long timeout);
 int apple_pmp_report_fast_die_effort(const struct device_node *np,
 				     unsigned int lane, u8 *effort);
+void apple_pmp_report_sleep(struct device *pmp, bool at_commit);
+void apple_pmp_report_wake(struct device *pmp, bool lost_power);
+int apple_pmp_report_entry_request(const struct device_node *entry, bool enable);
+int apple_pmp_report_entry_commit_owned(const struct device_node *entry, bool owned);
+int apple_pmp_report_entry_withdraw_polled(const struct device_node *entry);
 /*
  * Set or clear one bit of the PMP power request word of the report bound to @report_np, under the
  * report's lock, with the acknowledge wait (see pmp-report.c).
@@ -43,6 +48,31 @@ void apple_pmp_agx_activity_end(void);
 void apple_pmp_agx_activity_release(void);
 void apple_pmp_agx_activity_resume(void);
 #else
+static inline int apple_pmp_report_entry_request(const struct device_node *entry,
+						 bool enable)
+{
+	return 0;
+}
+
+static inline int apple_pmp_report_entry_commit_owned(const struct device_node *entry,
+						      bool owned)
+{
+	return -ENODEV;
+}
+
+static inline int apple_pmp_report_entry_withdraw_polled(const struct device_node *entry)
+{
+	return 0;
+}
+
+static inline void apple_pmp_report_sleep(struct device *pmp, bool at_commit)
+{
+}
+
+static inline void apple_pmp_report_wake(struct device *pmp, bool lost_power)
+{
+}
+
 static inline int apple_pmp_report_ane_available(const struct device_node *np)
 {
 	return -EOPNOTSUPP;

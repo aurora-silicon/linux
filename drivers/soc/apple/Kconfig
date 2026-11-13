@@ -4,21 +4,6 @@ if ARCH_APPLE || COMPILE_TEST
 
 menu "Apple SoC drivers"
 
-config APPLE_SIO_AES
-	tristate "Apple SIO AES probe-time diagnostics"
-	depends on OF && HAS_IOMEM && PM && IOMMU_API
-	help
-	  Capture the S8000-family AES readiness and hardware-key disable
-	  state once at probe on T6041 and T8140. T6000 and T8112 are served
-	  by the CRYPTO_DEV_APPLE_SIO_AES skcipher driver instead. The snapshot
-	  is logged and available in a root-readable debugfs state file.
-	  Revision is reported from the SoC compatible; register words are
-	  raw diagnostics, not a claim that a hardware key is usable.
-
-	  This does not enable the engine, submit commands, handle interrupts,
-	  register crypto algorithms or provide a device node. Keep the DT
-	  node disabled except during an explicitly enabled diagnostic boot.
-
 config APPLE_DBGVIEW
 	tristate "Apple SoC read-only debug register views"
 	depends on ARCH_APPLE || COMPILE_TEST
@@ -96,6 +81,44 @@ config APPLE_PMGR_DCS_KUNIT_TEST
 	  register updates and timeout rollback with synthetic state data.
 	  Also verify that boot constraints and concurrent endpoints retain
 	  their votes, and that suspend restores the last confirmed request.
+
+config APPLE_CLUSTER_PWRGATE
+	bool "Apple SoC CPU cluster power gates"
+	depends on OF
+	default ARCH_APPLE
+	help
+	  Sets the power-gate enable of each CPU cluster the device tree
+	  lists, early in boot. Without it, a core that the boot loader
+	  started and PMGR never powered on, such as the boot CPU, only
+	  clock-gates in WFI.
+
+config APPLE_SOC_SLEEP
+	bool "Apple SoC system sleep at EL2"
+	default APPLE_T8140_SLEEP
+	depends on ARM64 && (ARCH_APPLE || COMPILE_TEST)
+	depends on HOTPLUG_CPU && SUSPEND
+	select APPLE_TUNABLE
+	help
+	  Powers the secondary CPUs off and suspends the system to RAM on an
+	  Apple SoC whose kernel runs directly at EL2, with no monitor to ask.
+	  It does nothing unless the boot object asks for it through
+	  /chosen/aurora,s2r-mailbox.
+
+	  Only SoCs whose sleep has been measured and tested are supported,
+	  each by its match data: today T8140 and T8132. On every other SoC
+	  the driver doesn't bind, and s2idle stays the only system sleep.
+
+config APPLE_SOC_SLEEP_KUNIT_TEST
+	bool "KUnit tests for the Apple SoC sleep match data" if !KUNIT_ALL_TESTS
+	depends on APPLE_SOC_SLEEP && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Checks each matched SoC's sleep data: that only tested SoCs are
+	  matched, that every list names only words of the SoC's full lists,
+	  with no duplicates, and that the lists fit the driver's books. The
+	  tests touch no hardware.
+
+	  If unsure, say N.
 
 config APPLE_RTKIT
 	tristate "Apple RTKit co-processor IPC protocol"
@@ -216,8 +239,9 @@ config APPLE_SEP_KUNIT_TEST
 	  mailbox message encoding and decoding, the shared-memory registration
 	  limits, the rules that keep a keybag's lookup identity apart from
 	  the identity the enclave reports, the format and validation of the
-	  Linux host-state store, and the xART guard's decisions and its list
-	  of Linux's records. The tests touch no hardware.
+	  Linux host-state store, the xART guard's decisions and its list
+	  of Linux's records, and how the fingerprint sensor is put to sleep.
+	  The tests touch no hardware.
 
 	  If unsure, say N.
 
@@ -285,11 +309,14 @@ config APPLE_CLPC
 	tristate "Apple host performance controller floors"
 	depends on ARCH_APPLE || COMPILE_TEST
 	depends on APPLE_PMC && CPU_FREQ
+	depends on MFD_MACSMC || !MFD_MACSMC
+	select ACPI_PLATFORM_PROFILE if ACPI
 	default ARCH_APPLE
 	help
 	  Raises the DRAM controller and SoC fabric performance floors of the
 	  host's PMC voter agent while CPU clusters are busy, and releases
-	  them at idle.
+	  them at idle. On SoCs with power modes it also offers them as
+	  platform profiles.
 
 	  Say 'y' or 'm' here if you have an Apple SoC with a PMC.
 
@@ -401,3 +428,9 @@ config APPLE_AURORA_BOOT_SECURITY_LOCKDOWN
 endmenu
 
 endif
+
+config APPLE_T8140_SLEEP
+	bool
+	transitional
+	help
+	  Transitional config for APPLE_T8140_SLEEP to APPLE_SOC_SLEEP migration.

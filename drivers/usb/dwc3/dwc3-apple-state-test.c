@@ -38,10 +38,19 @@ static void dwc3_apple_non_role_test(struct kunit *test)
 	}
 }
 
+/* A role that arrives during a sleep decides what comes back after it. */
+static void dwc3_apple_role_during_sleep_test(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, dwc3_apple_state_for_role(USB_ROLE_HOST), DWC3_APPLE_HOST);
+	KUNIT_EXPECT_EQ(test, dwc3_apple_state_for_role(USB_ROLE_DEVICE), DWC3_APPLE_DEVICE);
+	KUNIT_EXPECT_EQ(test, dwc3_apple_state_for_role(USB_ROLE_NONE), DWC3_APPLE_NO_CABLE);
+}
+
 static struct kunit_case dwc3_apple_state_test_cases[] = {
 	KUNIT_CASE(dwc3_apple_host_left_to_xhci_test),
 	KUNIT_CASE(dwc3_apple_device_selected_before_reset_test),
 	KUNIT_CASE(dwc3_apple_non_role_test),
+	KUNIT_CASE(dwc3_apple_role_during_sleep_test),
 	{}
 };
 

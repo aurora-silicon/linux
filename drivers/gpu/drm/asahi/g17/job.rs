@@ -4,7 +4,7 @@
 
 use super::{command::Validated, completion::Completion, context::Context};
 use crate::driver::AsahiDrmDevice;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
 use kernel::{
     bindings, c_str,
     cpu::CpuId,
@@ -128,6 +128,9 @@ pub(crate) struct Packet {
     cancelled: AtomicBool,
     early: AtomicI32,
     backlog: AtomicBool,
+    /// When the job's watchdog allowance ends (host ns, [`super::timeout::Allowance::end`]):
+    /// zero under the default allowance, `u64::MAX` for a longer one not yet placed.
+    allowance_end: AtomicU64,
 }
 
 impl Packet {
@@ -160,9 +163,16 @@ impl Packet {
                 cancelled: AtomicBool::new(false),
                 early: AtomicI32::new(0),
                 backlog: AtomicBool::new(false),
+                allowance_end: AtomicU64::new(0),
             },
             GFP_KERNEL,
         )?)
+    }
+
+    /// Its own watchdog still renews the job for the allowance its queue asked for at `now`
+    /// ([`super::timeout::Head::excused`]).
+    pub(crate) fn within_allowance(&self, now: u64) -> bool {
+        now < self.allowance_end.load(Ordering::Relaxed)
     }
 
     pub(crate) fn engine(&self) -> Engine {
@@ -350,8 +360,12 @@ pub(crate) trait Backend: Send + Sync {
     fn publish(&self, packet: Arc<Packet>) -> Result<Fence>;
     fn timed_out(&self, packet: Arc<Packet>) -> sched::Status;
     fn cancel(&self, packet: Arc<Packet>);
-    /// Transfer a timeout to an outstanding off-lock graph transaction, if any.
-    fn defer_timeout(&self, packet: &Arc<Packet>, renewals: u8) -> bool;
+    /// Transfer a timeout to an outstanding off-lock graph transaction, if any, or decide it
+    /// against other VMs' older work ([`super::timeout::decide`]). `renewals` and `excused`
+    /// count the job's earlier [`super::timeout::Decision::Defer`] and
+    /// [`super::timeout::Decision::Excuse`] results; the job is renewed on either.
+    fn defer_timeout(&self, packet: &Arc<Packet>, renewals: u8, excused: u32)
+        -> super::timeout::Decision;
     /// A long job of another queue is running beside `packet`.
     fn long_job_beside(&self, _packet: &Arc<Packet>) -> bool { false }
     /// A published job's deadline may be renewed while other work retires
@@ -365,13 +379,19 @@ pub(crate) trait Backend: Send + Sync {
 struct Job<B: Backend> {
     backend: Arc<B>,
     packet: Arc<Packet>,
+    /// The watchdog allowance of the job ([`super::timeout::Allowance`]), in ms.
+    allowance_ms: u32,
 }
 
 struct Timeout<B: Backend> {
     backend: Arc<B>,
     victim_renewals: u8,
+    /// Polls excused behind other VMs' live work inside its allowance
+    /// ([`super::timeout::Decision::Excuse`]).
+    excused: u32,
     execution_renewals: u8,
     shared_renewals: u8,
+    allowance: super::timeout::Allowance,
     packet: Arc<Packet>,
 }
 
@@ -395,14 +415,29 @@ impl<B: Backend> sched::JobImpl for Job<B> {
         Timeout {
             backend: self.backend.clone(),
             victim_renewals: 0,
+            excused: 0,
             execution_renewals: 0,
             shared_renewals: 0,
+            allowance: super::timeout::Allowance::new(self.allowance_ms),
             packet: self.packet.clone(),
         }
     }
 
     fn false_timeout(job: &mut Timeout<B>, finished: bool) -> bool {
         if finished || job.packet.completion.take_replay_timeout() {
+            return true;
+        }
+        // Within the allowance its queue asked for. Past it, the deferrals below still apply;
+        // the shared renewals run alongside an allowance rather than after it.
+        let placing = job.allowance.placing_after_wait(job.packet.is_published());
+        let within = job.allowance.renew(job.packet.is_published(), super::now_ns());
+        // Other VMs' watchdogs read the end to excuse work waiting behind this one.
+        if let Some(end) = job.allowance.end() {
+            job.packet.allowance_end.store(end, Ordering::Relaxed);
+        }
+        if within {
+            super::timeout::count_allowance_poll(job.allowance.asked() && !placing,
+                &mut job.shared_renewals);
             return true;
         }
         if super::timeout::renew_execution(
@@ -418,11 +453,17 @@ impl<B: Backend> sched::JobImpl for Job<B> {
         if super::timeout::renew_shared(job.packet.is_published(), shared, &mut job.shared_renewals) {
             return true;
         }
-        let deferred = job.backend.defer_timeout(&job.packet, job.victim_renewals);
-        if deferred {
-            job.victim_renewals = job.victim_renewals.saturating_add(1);
+        match job.backend.defer_timeout(&job.packet, job.victim_renewals, job.excused) {
+            super::timeout::Decision::Defer => {
+                job.victim_renewals = job.victim_renewals.saturating_add(1);
+                true
+            }
+            super::timeout::Decision::Excuse => {
+                job.excused = job.excused.saturating_add(1);
+                true
+            }
+            super::timeout::Decision::Own | super::timeout::Decision::Spare => false,
         }
-        deferred
     }
 
     fn prepare(job: &mut Self) -> Option<Fence> {
@@ -457,6 +498,7 @@ pub(crate) struct Scheduler<B: Backend> {
     entity: sched::Entity<Job<B>>,
     _scheduler: sched::Scheduler<Job<B>>,
     backend: Arc<B>,
+    allowance_ms: u32,
 }
 
 #[derive(Clone)]
@@ -486,7 +528,11 @@ impl Fences {
 }
 
 impl<B: Backend> Scheduler<B> {
-    pub(crate) fn new(dev: &AsahiDrmDevice, backend: Arc<B>, engine: Engine) -> Result<Self> {
+    /// `allowance_ms`: the watchdog allowance of each job ([`super::timeout::allowance_ms`]);
+    /// the watchdog still polls every [`TIMEOUT_MS`].
+    pub(crate) fn new(dev: &AsahiDrmDevice, backend: Arc<B>, engine: Engine, allowance_ms: u32)
+        -> Result<Self>
+    {
         let (credits, name) = match engine {
             Engine::Render => (
                 RENDER_CREDITS.checked_mul(backend.render_pairs()).ok_or(EOVERFLOW)?,
@@ -513,6 +559,7 @@ impl<B: Backend> Scheduler<B> {
             entity,
             _scheduler: scheduler,
             backend,
+            allowance_ms,
         })
     }
 
@@ -523,7 +570,8 @@ impl<B: Backend> Scheduler<B> {
         early: bool,
         publication: Option<super::completion::PreparedPublication>,
     ) -> Result<Fences> {
-        super::trace::schedule(&packet, 0, dependencies.len() as i32);
+        let dependency_count = dependencies.len();
+        super::trace::schedule(&packet, 0, dependency_count as i32);
         let completed = packet.completion.fence();
         let host_timestamps = packet.completion.has_timestamps();
         // Only commands which actually write timestamps become host-prefix
@@ -534,11 +582,15 @@ impl<B: Backend> Scheduler<B> {
         } else {
             None
         };
+        if self.allowance_ms > super::timeout::DEFAULT_ALLOWANCE_MS {
+            packet.allowance_end.store(u64::MAX, Ordering::Relaxed);
+        }
         let mut job = self.entity.new_job(
             1,
             Job {
                 backend: self.backend.clone(),
                 packet: packet.clone(),
+                allowance_ms: self.allowance_ms,
             },
         )?;
         if dependencies.len() > MERGED_DEPENDENCIES {
@@ -561,7 +613,15 @@ impl<B: Backend> Scheduler<B> {
         // All fallible scheduler setup precedes early hardware publication. The
         // scheduler still owns watchdog, credits and cancellation after push.
         let inline = early && self.backend.try_early(&packet);
-        super::trace::schedule(&packet, if inline { 1 } else { 2 }, 0);
+        // Why a command was queued instead of published inline (phase 2).
+        let queued_reason = if dependency_count != 0 {
+            2
+        } else if early {
+            3
+        } else {
+            0
+        };
+        super::trace::schedule(&packet, if inline { 1 } else { 2 }, queued_reason);
         if !inline {
             if packet.completion.needs_source_ready() {
                 packet.completion.set_source_ready(ready.clone());

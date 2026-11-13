@@ -22,6 +22,7 @@
 	brcm,board-type = "apple,hostomel";
 	/* WLAN host wake (PCIe WAKE#), active high */
 	wake-gpios = <&pinctrl 39 GPIO_ACTIVE_HIGH>;
+	wakeup-source;
 };
 
 &bluetooth0 {
@@ -37,6 +38,15 @@
 		#gpio-cells = <2>;
 		apple,output-templates = <0xe 0x00800000>;
 	};
+};
+
+/*
+ * ADT /arm-io/aon-ptd ptd_data_table: the battery record ("IFtb", layout 1,
+ * slots 0x12-0x15). Only its peek aperture is read.
+ */
+&aon_ptd {
+	apple,battery-record = <0x49467462 1 0x12 4>;
+	status = "okay";
 };
 
 &aop_spmi0 {
@@ -103,32 +113,56 @@
 	};
 };
 
+/*
+ * Panel timing controller. Its chip select is AP GPIO 34.
+ *
+ * The downstream bus stays disabled: with the panel on, the controller
+ * answers every access request with a refusal (acknowledgment 3), and
+ * with the panel off its registers read back as zero, so the TMP103
+ * panel sensors cannot be reached from the AP.
+ */
+&ps_spi4 {
+	status = "okay";
+};
+
 &spi4 {
+	cs-gpios = <&pinctrl 34 GPIO_ACTIVE_LOW>;
+	status = "okay";
+
 	tcon: panel-controller@0 {
 		compatible = "parade,dp855";
 		reg = <0>;
-		status = "disabled";
+		spi-max-frequency = <1000000>;
+		spi-cs-setup-delay-ns = <20>;
+		spi-cs-hold-delay-ns = <20>;
 
-		/* ADT display-temp-sens1..3 are downstream of the TCON. */
 		i2c {
 			#address-cells = <1>;
 			#size-cells = <0>;
+			status = "disabled";
 
 			temperature-sensor@70 {
 				compatible = "ti,tmp103";
 				reg = <0x70>;
+				read-only;
 				status = "disabled";
 			};
 
+			/*
+			 * 0x71 is also the panel source driver write-protect
+			 * endpoint on this bus, which the driver never reaches.
+			 */
 			temperature-sensor@71 {
 				compatible = "ti,tmp103";
 				reg = <0x71>;
+				read-only;
 				status = "disabled";
 			};
 
 			temperature-sensor@72 {
 				compatible = "ti,tmp103";
 				reg = <0x72>;
+				read-only;
 				status = "disabled";
 			};
 		};
@@ -167,6 +201,31 @@
 };
 
 &scaler0 {
+	status = "okay";
+};
+
+/*
+ * ProRes encoder and its DART. The engine runs with SCODEC_STREAMING (and so
+ * SCODEC) powered. The driver has built-in power-up rows for it; an optional
+ * apple/prores-t6041-init.bin replaces them.
+ */
+&ps_fab1_soc {
+	status = "okay";
+};
+
+&ps_scodec {
+	status = "okay";
+};
+
+&ps_scodec_streaming {
+	status = "okay";
+};
+
+&apr0_dart {
+	status = "okay";
+};
+
+&apr0 {
 	status = "okay";
 };
 
@@ -318,5 +377,14 @@
 };
 
 &ps_uart0 {
+	status = "okay";
+};
+
+/* SIO AES engine, software keys only. */
+&ps_aes {
+	status = "okay";
+};
+
+&aes {
 	status = "okay";
 };

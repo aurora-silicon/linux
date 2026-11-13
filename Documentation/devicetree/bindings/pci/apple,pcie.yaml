@@ -196,8 +196,7 @@ properties:
     description: Initialization tuples for the oe-fabric register region.
 
   apple,tunable-axi2af:
-    $ref: '#/$defs/t6050-tunable'
-    description: T6050 tuples for the axi2af window, applied before a train.
+    description: Register tuples for the controller's AXI bridge.
 
   apple,tunable-cio3pllcore:
     $ref: '#/$defs/t6050-tunable'
@@ -207,17 +206,22 @@ properties:
     $ref: '#/$defs/t6050-tunable'
     description: T6050 tuples for the pcieclkgen window.
 
+  apple,tunable-cio3pll:
+    $ref: '#/$defs/tunable'
+    description: Initialization tuples for the shared PHY block's PLL.
+
+  apple,tunable-clkgen:
+    $ref: '#/$defs/tunable'
+    description: Initialization tuples for the shared PHY block's clock generator.
+
   apple,tunable-phy:
-    $ref: '#/$defs/t6050-tunable'
-    description: T6050 tuples for the phy-window window.
+    description: Register tuples for the controller's PHY window.
 
   apple,tunable-phy-ip-pll:
-    $ref: '#/$defs/t6050-tunable'
-    description: T6050 PHY PLL tuples for the phy-ip window.
+    description: PLL register tuples relative to the controller's phy-ip window.
 
   apple,tunable-phy-ip-auspma:
-    $ref: '#/$defs/t6050-tunable'
-    description: T6050 PHY lane tuples for the phy-ip window.
+    description: Lane register tuples relative to the controller's phy-ip window.
 
   apple,piodma:
     $ref: /schemas/types.yaml#/definitions/phandle
@@ -236,6 +240,13 @@ patternProperties:
 
       pwren-gpios:
         description: Optional GPIO to power on the device
+        maxItems: 1
+
+      clkreq-gpios:
+        description:
+          The endpoint's CLKREQ# line. After a deep sleep has reset the pin
+          controller, the host returns the pin to an input before it trains
+          the link again.
         maxItems: 1
 
       interrupt-controller: true
@@ -315,6 +326,16 @@ allOf:
         apple,msi-vector-base:
           const: 64
         power-domains: false
+        apple,tunable-axi2af:
+          $ref: '#/$defs/t6050-tunable'
+        apple,tunable-phy:
+          $ref: '#/$defs/t6050-tunable'
+        apple,tunable-phy-ip-pll:
+          $ref: '#/$defs/t6050-tunable'
+        apple,tunable-phy-ip-auspma:
+          $ref: '#/$defs/t6050-tunable'
+        apple,tunable-cio3pll: false
+        apple,tunable-clkgen: false
       required:
         - interrupt-names
         - apple,msi-vector-base
@@ -338,12 +359,16 @@ allOf:
             - apple,link-trained-by-bootloader
     else:
       properties:
-        apple,tunable-axi2af: false
+        apple,tunable-axi2af:
+          $ref: '#/$defs/tunable'
         apple,tunable-cio3pllcore: false
         apple,tunable-pcieclkgen: false
-        apple,tunable-phy: false
-        apple,tunable-phy-ip-pll: false
-        apple,tunable-phy-ip-auspma: false
+        apple,tunable-phy:
+          $ref: '#/$defs/tunable'
+        apple,tunable-phy-ip-pll:
+          $ref: '#/$defs/tunable'
+        apple,tunable-phy-ip-auspma:
+          $ref: '#/$defs/tunable'
       patternProperties:
         "^pci@":
           properties:
@@ -482,8 +507,9 @@ allOf:
             properties:
               reg:
                 minItems: 8
-                maxItems: 8
+                maxItems: 13
               reg-names:
+                minItems: 8
                 items:
                   - const: config
                   - const: rc
@@ -493,6 +519,11 @@ allOf:
                   - const: phy0
                   - const: phy1
                   - const: phy2
+                  - const: axi2af
+                  - const: cio3pll
+                  - const: clkgen
+                  - const: phy-block
+                  - const: phy-ip
               interrupts:
                 maxItems: 3
           else:
@@ -535,22 +566,56 @@ allOf:
                   interrupts:
                     maxItems: 3
               else:
-                properties:
-                  reg:
-                    maxItems: 10
-                  reg-names:
-                    minItems: 3
-                    items:
-                      - const: config
-                      - const: rc
-                      - const: port0
-                      - const: port1
-                      - const: port2
-                      - const: port3
-                      - const: phy0
-                      - const: phy1
-                      - const: phy2
-                      - const: phy3
+                if:
+                  properties:
+                    compatible:
+                      contains:
+                        const: apple,t8132-pcie
+                then:
+                  properties:
+                    reg:
+                      minItems: 4
+                      maxItems: 9
+                    reg-names:
+                      oneOf:
+                        - minItems: 4
+                          items:
+                            - const: config
+                            - const: rc
+                            - const: port0
+                            - const: phy0
+                            - const: axi2af
+                            - const: cio3pll
+                            - const: clkgen
+                            - const: phy-block
+                            - const: phy-ip
+                        # A board that uses the third port lists it instead.
+                        - items:
+                            - const: config
+                            - const: rc
+                            - const: port0
+                            - const: phy0
+                            - const: port2
+                            - const: phy2
+                    interrupts:
+                      maxItems: 3
+                else:
+                  properties:
+                    reg:
+                      maxItems: 10
+                    reg-names:
+                      minItems: 3
+                      items:
+                        - const: config
+                        - const: rc
+                        - const: port0
+                        - const: port1
+                        - const: port2
+                        - const: port3
+                        - const: phy0
+                        - const: phy1
+                        - const: phy2
+                        - const: phy3
       patternProperties:
         "^pci@":
           properties:

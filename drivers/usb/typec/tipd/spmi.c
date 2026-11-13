@@ -391,6 +391,9 @@ static const struct sn201202x_ldcm_ops sn201202x_ldcm_ops = {
 
 static int sn201202x_ldcm_update(struct tps6598x *tps)
 {
+	if (!tps->contaminant_ops)
+		return 0;
+
 	return sn201202x_ldcm_update_state(tps, &sn201202x_ldcm_ops,
 					   tps->contaminant);
 }
@@ -749,7 +752,9 @@ static int sn201202x_probe(struct spmi_device *device)
 	mutex_init(&tps->lock);
 	tps->dev = &device->dev;
 	tps->data = data;
-	tps->contaminant_ops = &sn201202x_contaminant_ops;
+	/* A port without liquid detection (MagSafe 3) gets no LDCM commands */
+	if (!of_property_read_bool(device->dev.of_node, "apple,no-liquid-detection"))
+		tps->contaminant_ops = &sn201202x_contaminant_ops;
 	INIT_DELAYED_WORK(&sn->ldcm_work, sn201202x_ldcm_work);
 
 	init_completion(&sn->select_completion);
@@ -855,8 +860,11 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_resume(struct device *dev)
 	} else {
 		err = sn201202x_wake(sn);
 	}
-	if (!err)
+	if (!err) {
+		/* Registered before xHCI, so this is before the root port resumes. */
+		tipd_usb_wake(tps, false);
 		err = tipd_resume(tps);
+	}
 	/* The resume revalidation acknowledges events latched while asleep. */
 	if (tps->irq)
 		enable_irq(tps->irq);
@@ -906,6 +914,8 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_suspend(struct device *dev)
 		else
 			dev_warn(dev, "port state unreadable, no wakeup for an attach\n");
 	}
+	/* Registered before xHCI, so its root port has suspended by now. */
+	tipd_usb_wake(tps, true);
 	reinit_completion(&sn->sleep_completion);
 	err = spmi_command_sleep(sn->sdev);
 	if (err)
