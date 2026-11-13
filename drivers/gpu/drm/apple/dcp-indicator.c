@@ -79,6 +79,8 @@ void dcp_indicator_release(struct apple_dcp *dcp)
 		return;
 	scoped_guard(mutex, &ci->ctl) {
 		fb = ci->fb;
+		if (ci->plane)
+			WRITE_ONCE(to_apple_plane(ci->plane)->indicator_fb, NULL);
 		spin_lock_irqsave(&ci->lock, flags);
 		ci->fb = NULL;
 		ci->plane = NULL;
@@ -159,6 +161,7 @@ int dcp_indicator_attach_plane(struct apple_dcp *dcp, struct drm_device *drm,
 	spin_lock_irqsave(&ci->lock, flags);
 	ci->fb = fb;
 	spin_unlock_irqrestore(&ci->lock, flags);
+	WRITE_ONCE(to_apple_plane(plane)->indicator_fb, fb);
 	return 0;
 }
 

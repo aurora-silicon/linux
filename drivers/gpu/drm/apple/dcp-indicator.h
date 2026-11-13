@@ -120,15 +120,18 @@ enum dcp_ind_plane_action {
  * client's own framebuffer, a move, a property) is refused with -EINVAL, so a
  * compositor sees it in its TEST_ONLY commit and falls back instead of having
  * its buffer silently dropped. Carried unchanged, or disabled with the CRTC it
- * sits on (DPMS off, suspend, shutdown), the plane is left alone.
+ * sits on (DPMS off, suspend, shutdown), the plane is left alone. The kernel's
+ * own framebuffer is not userspace: suspend saves it and resume commits it
+ * back, and refusing that would fail the resume, so it is put back like a clear.
  */
 static inline enum dcp_ind_plane_action dcp_ind_plane_policy(bool reserved_plane,
 							      bool kernel_commit, bool unchanged,
-							      bool crtc_going_off, bool clearing)
+							      bool crtc_going_off, bool clearing,
+							      bool own_fb)
 {
 	if (!reserved_plane || kernel_commit || unchanged || crtc_going_off)
 		return DCP_IND_PLANE_PASS;
-	return clearing ? DCP_IND_PLANE_RESTORE : DCP_IND_PLANE_REJECT;
+	return clearing || own_fb ? DCP_IND_PLANE_RESTORE : DCP_IND_PLANE_REJECT;
 }
 
 #endif /* DCP_INDICATOR_H */

@@ -187,21 +187,27 @@ static void indicator_retry_ends_with_the_request(struct kunit *test)
 static void indicator_plane_reservation(struct kunit *test)
 {
 	/* An ordinary plane is never touched. */
-	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(false, false, false, false, false),
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(false, false, false, false, false, false),
 			DCP_IND_PLANE_PASS);
 	/* The kernel's own commit may do anything. */
-	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, true, false, false, false),
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, true, false, false, false, false),
 			DCP_IND_PLANE_PASS);
 	/* Userspace: carried unchanged, or disabled with its CRTC, is left alone. */
-	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, false, true, false, false),
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, false, true, false, false, false),
 			DCP_IND_PLANE_PASS);
-	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, false, false, true, true),
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, false, false, true, true, false),
 			DCP_IND_PLANE_PASS);
 	/* A blind clear of every plane (console restore) still succeeds, undone. */
-	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, false, false, false, true),
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, false, false, false, true, false),
+			DCP_IND_PLANE_RESTORE);
+	/*
+	 * The kernel's own framebuffer, saved by suspend and committed back by
+	 * resume, is not userspace: it must not fail the resume. It is undone.
+	 */
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, false, false, false, false, true),
 			DCP_IND_PLANE_RESTORE);
 	/* Any other userspace assignment (own fb, a move, a property) is refused. */
-	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, false, false, false, false),
+	KUNIT_EXPECT_EQ(test, dcp_ind_plane_policy(true, false, false, false, false, false),
 			DCP_IND_PLANE_REJECT);
 }
 
