@@ -2039,6 +2039,7 @@ static bool apple_drm_hold_resume_events(struct apple_drm_private *apple, u32 cr
 
 static void apple_drm_resume_outputs(struct apple_drm_private *apple)
 {
+	struct drm_crtc *crtc;
 	u32 dropped = 0;
 
 	apple->dark_held = false;
@@ -2048,6 +2049,8 @@ static void apple_drm_resume_outputs(struct apple_drm_private *apple)
 	if (dropped && apple_drm_hold_resume_events(apple, dropped))
 		dropped = 0;
 	drm_mode_config_helper_resume(&apple->drm);
+	drm_for_each_crtc(crtc, &apple->drm)
+		dcp_indicator_display_resumed(platform_get_drvdata(to_apple_crtc(crtc)->dcp));
 	if (dropped)
 		drm_kms_helper_hotplug_event(&apple->drm);
 }
