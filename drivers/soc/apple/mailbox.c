@@ -33,7 +33,6 @@
 #include <linux/soc/apple/mailbox.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
-#include <linux/workqueue.h>
 #include <uapi/linux/sched/types.h>
 
 #define APPLE_ASC_MBOX_CONTROL_FULL BIT(16)
@@ -87,15 +86,10 @@
  * (implicit services 81/82 at 0x303a15100/0x303a15200: state +0x80, ack
  * +0xbc). The provider never writes PSD registers.
  *
- * Receive side. ASCWrap v8 has no mailbox-level interrupt control, so
- * has_irq_controls is false and a level interrupt can only be masked at the
- * AIC. By default the provider therefore never enables either GPU mailbox
- * interrupt: apple_mbox_start() starts a one-jiffy receive poller, and a
- * full TX FIFO is waited out by sleeping polls. Only ascwrap_v8_rx_irq=1
- * uses the recv-not-empty line; even then a line that keeps firing with
- * nothing to read is disabled and receive falls back to the poller. Every
- * post-office receive poll is preceded by the same PSD check as the wrapper
- * accesses.
+ * ASCWrap v8 has no mailbox-level interrupt control (has_irq_controls is
+ * false): like the other ASC mailboxes, its level interrupts are masked at
+ * the AIC. Every post-office receive is preceded by the same PSD check as
+ * the wrapper accesses.
  */
 #define APPLE_ASCWRAP_V8_WRAPPER_SIZE 0x74000
 #define APPLE_ASCWRAP_V8_IOP_VBAR_SIZE 0x8
@@ -111,10 +105,6 @@
 #define APPLE_T8152_GPU_ASC_PSD_ACTIVE 2
 /* apple_mbox_ascwrap_v6_lifecycle.missing bit: CPU control not enabled. */
 #define APPLE_ASCWRAP_V8_MISSING_CPU_CONTROL_APPROVAL BIT(0)
-/* Receive poll period (poll-only mode, or after the storm guard tripped). */
-#define APPLE_ASCWRAP_V8_RX_POLL_JIFFIES 1
-/* Consecutive recv interrupts that drained nothing before the line is cut. */
-#define APPLE_ASCWRAP_V8_RX_STORM_LIMIT 1000
 
 #define APPLE_T8152_GFX_WRAPPER_BASE 0x582600000ULL
 #define APPLE_T8152_GFX_IOP_VBAR_BASE 0x582050000ULL
@@ -135,16 +125,6 @@ module_param(ascwrap_v8_cpu_control, bool, 0444);
 MODULE_PARM_DESC(ascwrap_v8_cpu_control,
 		 "Allow T8152 GPU ASCWrap v8 CPU start/stop writes (default: refuse)");
 
-/*
- * The GFX/GFX1 interrupt assignment has not been observed on hardware, and a
- * wrongly wired level line would storm with interrupts that the handler
- * cannot mask. The default services receive by polling and never enables a
- * GPU mailbox interrupt.
- */
-static bool ascwrap_v8_rx_irq;
-module_param(ascwrap_v8_rx_irq, bool, 0444);
-MODULE_PARM_DESC(ascwrap_v8_rx_irq,
-		 "Service T8152 GPU ASCWrap v8 receive with the recv-not-empty interrupt (default: poll, no GPU mailbox interrupt is enabled)");
 /* Physical T6050 GPU windows, shared by J775D and J716c. */
 #define APPLE_J775D_GFX_WRAPPER_BASE 0x2302600000ULL
 #define APPLE_J775D_GFX_IOP_VBAR_BASE 0x2302050000ULL
@@ -259,26 +239,13 @@ struct apple_mbox_priv {
 	struct apple_mbox mbox;
 	/* ASCWrap v8 only: the provider's PMGR2 PSD service block (read-only). */
 	void __iomem *psd_regs;
-	/* ASCWrap v8 only: receive by polling; fixed at probe. */
-	bool rx_poll_only;
-	/* rx_lock: recv interrupt enabled and not yet disabled again. */
-	bool rx_irq_live;
-	/* rx_lock: consecutive recv interrupts that drained nothing. */
-	unsigned int rx_irq_empty_run;
 	/* rx_lock: an unpowered-PSD receive skip was logged this activation. */
 	bool rx_psd_skip_logged;
-	struct delayed_work rx_poll_work;
 };
 
 static struct apple_mbox_priv *apple_mbox_to_priv(struct apple_mbox *mbox)
 {
 	return container_of(mbox, struct apple_mbox_priv, mbox);
-}
-
-/* Only providers allocated by apple_mbox_probe() have a receive poller. */
-static bool apple_mbox_has_rx_poller(const struct apple_mbox *mbox)
-{
-	return mbox->hw->is_ascwrap_v8;
 }
 
 /* Both ASCWrap generations share the consumer lifecycle API below. */
@@ -680,23 +647,6 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 			return -ETIMEDOUT;
 		}
 		remaining = deadline - now;
-		if (!atomic && apple_mbox_has_rx_poller(mbox) &&
-		    apple_mbox_to_priv(mbox)->rx_poll_only) {
-			/*
-			 * Poll-only v8: never enable the send-empty line.
-			 * Sleep-poll the TX status, touching MMIO only under
-			 * tx_lock so that removal cannot unmap it underneath.
-			 */
-			spin_unlock_irqrestore(&mbox->tx_lock, flags);
-			usleep_range(100, 200);
-			spin_lock_irqsave(&mbox->tx_lock, flags);
-			if (unlikely(READ_ONCE(mbox->removing))) {
-				spin_unlock_irqrestore(&mbox->tx_lock, flags);
-				return -ENODEV;
-			}
-			mbox_ctrl = readl_relaxed(mbox->regs + mbox->hw->a2i_control);
-			continue;
-		}
 		if (apple_mbox_is_g17(mbox) && !atomic && mbox->irq_send_empty < 0) {
 			/* The GPU has no send-empty IRQ. Do not busy wait with IRQs
 			 * off while dead firmware keeps its FIFO full. Recheck both
@@ -824,7 +774,7 @@ static int apple_mbox_poll_locked(struct apple_mbox *mbox)
 		if (ret) {
 			if (!priv->rx_psd_skip_logged)
 				dev_info(mbox->dev,
-					 "ASCWrap v8 PSD state=%#x ack=%#x is not powered; receive poll skipped\n",
+					 "ASCWrap v8 PSD state=%#x ack=%#x is not powered; receive skipped\n",
 					 state, ack);
 			priv->rx_psd_skip_logged = true;
 			return ret;
@@ -889,32 +839,6 @@ int apple_mbox_set_rx_util_min(struct apple_mbox *mbox, int util_min)
 }
 EXPORT_SYMBOL_GPL(apple_mbox_set_rx_util_min);
 
-/*
- * ASCWrap v8 storm guard, rx_lock held. The handler cannot mask the line at
- * the mailbox (no irq controls), so a line that keeps firing with nothing to
- * read (for example a send-empty line wired as recv-not-empty) would lock up
- * the CPU while always returning IRQ_HANDLED. Cut it at the AIC and poll.
- */
-static void apple_mbox_v8_rx_irq_guard(struct apple_mbox *mbox, int drained)
-{
-	struct apple_mbox_priv *priv = apple_mbox_to_priv(mbox);
-
-	if (drained > 0) {
-		priv->rx_irq_empty_run = 0;
-		return;
-	}
-	if (!priv->rx_irq_live ||
-	    ++priv->rx_irq_empty_run < APPLE_ASCWRAP_V8_RX_STORM_LIMIT)
-		return;
-
-	priv->rx_irq_live = false;
-	disable_irq_nosync(mbox->irq_recv_not_empty);
-	dev_err(mbox->dev,
-		"ASCWrap v8 recv-not-empty IRQ %d fired %u times without a message; disabled, receive falls back to polling\n",
-		mbox->irq_recv_not_empty, priv->rx_irq_empty_run);
-	queue_delayed_work(system_highpri_wq, &priv->rx_poll_work, 0);
-}
-
 static irqreturn_t apple_mbox_recv_irq(int irq, void *data)
 {
 	struct apple_mbox *mbox = data;
@@ -928,8 +852,6 @@ static irqreturn_t apple_mbox_recv_irq(int irq, void *data)
 	spin_lock_irqsave(&mbox->rx_lock, flags);
 	if (likely(!READ_ONCE(mbox->removing)))
 		consumed = apple_mbox_poll_locked(mbox);
-	if (mbox->hw->is_ascwrap_v8)
-		apple_mbox_v8_rx_irq_guard(mbox, consumed);
 	spin_unlock_irqrestore(&mbox->rx_lock, flags);
 
 	/* G17 uses a oneshot threaded IRQ. Leave it masked during this sleep
@@ -1007,61 +929,6 @@ out:
 }
 EXPORT_SYMBOL_GPL(apple_mbox_poll_one);
 
-/* ASCWrap v8 receive poller: poll-only mode, or after the storm guard. */
-static void apple_mbox_v8_rx_poll_work(struct work_struct *work)
-{
-	struct apple_mbox_priv *priv = container_of(to_delayed_work(work),
-						    struct apple_mbox_priv,
-						    rx_poll_work);
-	struct apple_mbox *mbox = &priv->mbox;
-
-	if (!READ_ONCE(mbox->active) || READ_ONCE(mbox->removing))
-		return;
-	apple_mbox_poll(mbox);
-	queue_delayed_work(system_highpri_wq, &priv->rx_poll_work,
-			   APPLE_ASCWRAP_V8_RX_POLL_JIFFIES);
-}
-
-/* lifecycle_lock held, mbox->active already set. */
-static void apple_mbox_v8_rx_start(struct apple_mbox *mbox)
-{
-	struct apple_mbox_priv *priv = apple_mbox_to_priv(mbox);
-	unsigned long flags;
-
-	spin_lock_irqsave(&mbox->rx_lock, flags);
-	priv->rx_irq_empty_run = 0;
-	priv->rx_psd_skip_logged = false;
-	priv->rx_irq_live = !priv->rx_poll_only;
-	spin_unlock_irqrestore(&mbox->rx_lock, flags);
-
-	if (priv->rx_poll_only)
-		queue_delayed_work(system_highpri_wq, &priv->rx_poll_work, 0);
-	else
-		enable_irq(mbox->irq_recv_not_empty);
-}
-
-/*
- * lifecycle_lock held (or removal), mbox->active already cleared. The storm
- * guard and this path each claim rx_irq_live under rx_lock, so exactly one
- * of them balances the enable_irq(). The poller re-queues itself, which
- * cancel_delayed_work_sync() handles; it never takes lifecycle_lock.
- */
-static void apple_mbox_v8_rx_stop(struct apple_mbox *mbox)
-{
-	struct apple_mbox_priv *priv = apple_mbox_to_priv(mbox);
-	unsigned long flags;
-	bool live;
-
-	spin_lock_irqsave(&mbox->rx_lock, flags);
-	live = priv->rx_irq_live;
-	priv->rx_irq_live = false;
-	spin_unlock_irqrestore(&mbox->rx_lock, flags);
-
-	if (live)
-		disable_irq(mbox->irq_recv_not_empty);
-	cancel_delayed_work_sync(&priv->rx_poll_work);
-}
-
 /* The mailbox-level enables, which the mailbox's power domain does not keep. */
 static void apple_mbox_enable_hw(struct apple_mbox *mbox)
 {
@@ -1109,10 +976,13 @@ int apple_mbox_start(struct apple_mbox *mbox)
 
 	apple_mbox_enable_hw(mbox);
 
-	if (apple_mbox_has_rx_poller(mbox)) {
-		WRITE_ONCE(mbox->active, true);
-		apple_mbox_v8_rx_start(mbox);
-		goto out_unlock;
+	if (mbox->hw->is_ascwrap_v8) {
+		unsigned long flags;
+
+		/* Log one unpowered-PSD receive skip per activation. */
+		spin_lock_irqsave(&mbox->rx_lock, flags);
+		apple_mbox_to_priv(mbox)->rx_psd_skip_logged = false;
+		spin_unlock_irqrestore(&mbox->rx_lock, flags);
 	}
 
 	if (mbox->irq_recv_not_empty >= 0)
@@ -1130,14 +1000,9 @@ static void apple_mbox_stop_locked(struct apple_mbox *mbox)
 	if (!mbox->active)
 		return;
 
-	if (apple_mbox_has_rx_poller(mbox)) {
-		WRITE_ONCE(mbox->active, false);
-		apple_mbox_v8_rx_stop(mbox);
-	} else {
-		mbox->active = false;
-		if (mbox->irq_recv_not_empty >= 0)
-			disable_irq(mbox->irq_recv_not_empty);
-	}
+	mbox->active = false;
+	if (mbox->irq_recv_not_empty >= 0)
+		disable_irq(mbox->irq_recv_not_empty);
 	pm_runtime_mark_last_busy(mbox->dev);
 	pm_runtime_put_autosuspend(mbox->dev);
 }
@@ -1234,19 +1099,14 @@ static void apple_mbox_quiesce(void *data)
 	 * inversion. The removal fence prevents any matching restart.
 	 */
 	was_active = mbox->active;
-	WRITE_ONCE(mbox->active, false);
+	mbox->active = false;
 	mutex_unlock(&mbox->lifecycle_lock);
 	if (was_active) {
-		if (apple_mbox_has_rx_poller(mbox))
-			apple_mbox_v8_rx_stop(mbox);
-		else if (mbox->irq_recv_not_empty >= 0)
+		if (mbox->irq_recv_not_empty >= 0)
 			disable_irq(mbox->irq_recv_not_empty);
 		pm_runtime_mark_last_busy(mbox->dev);
 		pm_runtime_put_autosuspend(mbox->dev);
 	}
-	/* The v8 poller also stops on the removal fence; make sure it is gone. */
-	if (apple_mbox_has_rx_poller(mbox))
-		cancel_delayed_work_sync(&apple_mbox_to_priv(mbox)->rx_poll_work);
 
 	/* Serialize once-only masking with the IRQ and send-error paths. */
 	spin_lock_irqsave(&mbox->tx_lock, flags);
@@ -1397,8 +1257,6 @@ static int apple_mbox_probe_ascwrap_v8(struct platform_device *pdev,
 	mbox->ascwrap_v6.iop_vbar_size = resource_size(iop_vbar);
 	mbox->ascwrap_v6.missing = ascwrap_v8_cpu_control ?
 		0 : APPLE_ASCWRAP_V8_MISSING_CPU_CONTROL_APPROVAL;
-	priv->rx_poll_only = !ascwrap_v8_rx_irq;
-	INIT_DELAYED_WORK(&priv->rx_poll_work, apple_mbox_v8_rx_poll_work);
 
 	mbox->wrapper_regs = devm_platform_ioremap_resource_byname(pdev, "wrapper");
 	if (IS_ERR(mbox->wrapper_regs))
@@ -1430,11 +1288,9 @@ static int apple_mbox_probe_ascwrap_v8(struct platform_device *pdev,
 		return ret;
 
 	dev_info(dev,
-		 "%s ASCWrap v8 provider: wrapper %pR, post-office window %pR, PSD %pR; CPU control %s; receive %s\n",
+		 "%s ASCWrap v8 provider: wrapper %pR, post-office window %pR, PSD %pR; CPU control %s\n",
 		 firmware_role, wrapper, window, psd,
-		 ascwrap_v8_cpu_control ? "allowed" : "refused (default)",
-		 ascwrap_v8_rx_irq ? "recv-not-empty IRQ" :
-				     "polled, no IRQ enabled (default)");
+		 ascwrap_v8_cpu_control ? "allowed" : "refused (default)");
 	return 0;
 }
 
