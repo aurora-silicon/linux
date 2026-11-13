@@ -142,6 +142,8 @@ impl drm::driver::Driver for AsahiDrmDriver {
             ioctl::AUTH | ioctl::RENDER_ALLOW, crate::file::File::gem_madvise),
         (ASAHI_GEM_USERPTR,     drm_asahi_gem_userptr,
             ioctl::AUTH | ioctl::RENDER_ALLOW, crate::file::File::gem_userptr),
+        (ASAHI_GEM_RESIDENCY,   drm_asahi_gem_residency,
+            ioctl::AUTH | ioctl::RENDER_ALLOW, crate::file::File::gem_residency),
     }
 }
 

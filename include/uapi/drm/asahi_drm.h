@@ -102,6 +102,15 @@ enum drm_asahi_ioctl_id {
 	 * memory (DRM_ASAHI_FEATURE_USERPTR).
 	 */
 	DRM_ASAHI_GEM_USERPTR,
+
+	/**
+	 * @DRM_ASAHI_GEM_RESIDENCY: Ask the kernel to release an object's
+	 * memory after that of the other objects of its VM when it reclaims
+	 * the VM's idle memory, or withdraw that request
+	 * (DRM_ASAHI_FEATURE_GEM_RESIDENCY). A hint, see struct
+	 * drm_asahi_gem_residency.
+	 */
+	DRM_ASAHI_GEM_RESIDENCY,
 };
 
 #define DRM_ASAHI_MAX_CLUSTERS	64
@@ -496,6 +505,13 @@ enum drm_asahi_feature {
 #define DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION ((1ULL) << 34)
 
 /*
+ * DRM_ASAHI_FEATURE_GEM_RESIDENCY: DRM_IOCTL_ASAHI_GEM_RESIDENCY is
+ * available. A feature bit like those of enum drm_asahi_feature, defined
+ * here like bit 32.
+ */
+#define DRM_ASAHI_FEATURE_GEM_RESIDENCY ((1ULL) << 35)
+
+/*
  * DRM_ASAHI_FEATURE_USERPTR: DRM_IOCTL_ASAHI_GEM_USERPTR is available. A
  * feature bit like those of enum drm_asahi_feature, defined here like bit 32.
  */
@@ -830,6 +846,68 @@ struct drm_asahi_gem_madvise {
 
 	/** @pad: Must be zero. */
 	__u32 pad;
+};
+
+/**
+ * enum drm_asahi_gem_residency_flags - Flags for DRM_IOCTL_ASAHI_GEM_RESIDENCY
+ */
+enum drm_asahi_gem_residency_flags {
+	/**
+	 * @DRM_ASAHI_GEM_RESIDENCY_KEEP: When reclaim releases idle memory of
+	 * the object's VM, release this object's memory after that of the
+	 * VM's objects without the flag, and only if theirs was not enough.
+	 * Without the flag, the object returns to the default policy.
+	 */
+	DRM_ASAHI_GEM_RESIDENCY_KEEP = (1L << 0),
+};
+
+/**
+ * struct drm_asahi_gem_residency - Arguments passed to
+ * DRM_IOCTL_ASAHI_GEM_RESIDENCY
+ *
+ * When the system reclaims memory, the kernel may release the memory of the
+ * VM-private objects of an idle VM. It brings the memory back before the
+ * VM's next job runs, which then waits for it.
+ * DRM_ASAHI_GEM_RESIDENCY_KEEP is a priority among the objects that may be
+ * released this way. It changes the order in which they go, not whether
+ * reclaim gets to them:
+ *
+ * - Only reclaim on behalf of the whole system releases GPU memory. Reclaim
+ *   inside a memory cgroup below the root, such as that of a cgroup at its
+ *   memory limit, releases none, kept or not.
+ * - Reclaim releases memory of a VM only while the VM is idle: no job,
+ *   binding change or other use of the VM is in progress, the last one (or
+ *   the VM's creation) is at least two seconds back, and after a job had to
+ *   wait for released memory, a pause that grows with the time that took
+ *   (between 1 and 30 seconds) is over. The memory of a VM that is not idle
+ *   stays, kept or not.
+ * - Of an idle VM's objects, a reclaim pass releases those without the flag
+ *   first, and kept objects only if that left the amount the pass set out
+ *   to free unmet.
+ * - Contents userspace gave up with DRM_ASAHI_GEM_MADV_DONTNEED are purged
+ *   as before, kept or not.
+ *
+ * The request is therefore a hint. Userspace must not rely on a kept object
+ * being resident, and a client that stays active, or whose memory cgroup is
+ * the one that runs out of memory, keeps its GPU memory whether it asked or
+ * not.
+ *
+ * The request applies once this ioctl returns; memory already released stays
+ * so until the VM's next job or binding brings it back. Other objects
+ * (shared, imported or GEM_USERPTR ones) are never released and accept the
+ * flag without effect on them.
+ *
+ * Kept objects still count against the memory limits as before; the device
+ * total of their sizes is reported as user_kept in the GPU's gpu_memory
+ * sysfs file. Available when DRM_ASAHI_FEATURE_GEM_RESIDENCY is set;
+ * otherwise the ioctl fails with EOPNOTSUPP or EINVAL.
+ */
+struct drm_asahi_gem_residency {
+	/** @handle: Handle of the object. */
+	__u32 handle;
+
+	/** @flags: Combination of drm_asahi_gem_residency_flags flags. */
+	__u32 flags;
 };
 
 /**
@@ -2281,6 +2359,7 @@ enum {
 	DRM_IOCTL_ASAHI_SUBMIT           = DRM_IOCTL_ASAHI(W, SUBMIT, submit),
 	DRM_IOCTL_ASAHI_GEM_MADVISE      = DRM_IOCTL_ASAHI(WR, GEM_MADVISE, gem_madvise),
 	DRM_IOCTL_ASAHI_GEM_USERPTR      = DRM_IOCTL_ASAHI(WR, GEM_USERPTR, gem_userptr),
+	DRM_IOCTL_ASAHI_GEM_RESIDENCY    = DRM_IOCTL_ASAHI(W, GEM_RESIDENCY, gem_residency),
 };
 
 #if defined(__cplusplus)
