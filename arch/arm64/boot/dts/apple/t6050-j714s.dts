@@ -421,6 +421,9 @@
 			63 2e 00 06 02 69 4f 53 00 00 00 00];
 };
 
+/* Left-front port (ATC1): the USB4/Thunderbolt router and its PCIe tunnel */
+#include "t6050-j714s-left-usb4.dtsi"
+
 /*
  * The PMP (ADT pmp0, /chosen, /arm-io/pmgr). iBoot loads its firmware and the driver starts it
  * with these boot arguments and the firmware properties below. Its report tells it which devices
