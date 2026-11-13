@@ -162,6 +162,22 @@ static u8 *fixture_ref(struct hwx_fixture *f, unsigned int index)
 	return NULL;
 }
 
+static u8 *fixture_kernel_segment(struct hwx_fixture *f, unsigned int index)
+{
+	size_t pos = 32;
+	unsigned int i, seen = 0;
+
+	for (i = 0; i < f->commands; i++) {
+		u8 *c = f->bytes + pos;
+
+		if (get_unaligned_le32(c) == 0x19 && !memcmp(c + 8, "__KERN_", 7) &&
+		    seen++ == index)
+			return c;
+		pos += get_unaligned_le32(c + 4);
+	}
+	return NULL;
+}
+
 static void fixture_surface_kind(struct hwx_fixture *f, unsigned int index, u32 prot)
 {
 	u8 *c = f->bytes + f->segment[index];
@@ -569,6 +585,92 @@ static void hwx_relocations_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
 }
 
+/*
+ * A large model splits its kernel data into __KERN_0..__KERN_n: contiguous
+ * in VM and in the file, one region, each section with its own base record
+ * and relocations against its own ordinal.
+ */
+static void hwx_kernel_segments_test(struct kunit *test)
+{
+	struct hwx_fixture_options o = { .mixed = true, .kernels = 4, .reloc_kernel = 2 };
+	struct hwx_fixture *f = fixture_create_options(test, &o);
+	struct ane_h16_hwx info;
+	unsigned int k;
+	u8 *program, *segment;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+	KUNIT_EXPECT_EQ(test, info.kernel_count, 4U);
+	KUNIT_EXPECT_EQ(test, info.kernel.vm, info.kernels[0].vm);
+	KUNIT_EXPECT_EQ(test, info.kernel.ordinal, 6U);
+	KUNIT_EXPECT_EQ(test, info.kernel.size, 3 * (u64)SZ_16K + 64);
+	for (k = 0; k < 4; k++) {
+		KUNIT_EXPECT_EQ(test, info.kernels[k].ordinal, 6 + k);
+		KUNIT_EXPECT_EQ(test, info.kernels[k].vm, info.kernels[0].vm + k * SZ_16K);
+	}
+	/* One kernel region of all four segments: scratch, 2 surfaces, text, kernel. */
+	KUNIT_ASSERT_EQ(test, info.region_count, 5U);
+	KUNIT_EXPECT_EQ(test, info.regions[4].kind, ANE_H16_REGION_KERNEL);
+	KUNIT_EXPECT_EQ(test, info.regions[4].size, 4 * (u64)SZ_16K);
+	KUNIT_EXPECT_EQ(test, info.regions[4].file_size, 4 * (u64)SZ_16K);
+
+	/* The relocation's addend is bounded by its own section. */
+	put_unaligned_le32(64, f->bytes + SZ_16K + 56);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	put_unaligned_le32(32, f->bytes + SZ_16K + 56);
+	/* Every kernel ordinal is a target; __TEXT,__const (5) is not. */
+	put_unaligned_le32(0x07000009, f->bytes + f->reloc + 4);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+	put_unaligned_le32(0x07000005, f->bytes + f->reloc + 4);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	put_unaligned_le32(0x0700000a, f->bytes + f->reloc + 4);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	put_unaligned_le32(0x07000008, f->bytes + f->reloc + 4);
+
+	/* Each section base has its record after the surfaces, in order. */
+	program = f->bytes + f->program;
+	put_unaligned_le64(get_unaligned_le64(program + 0xa0), program + 0xb0);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	put_unaligned_le64(info.kernels[0].vm + 2 * SZ_16K, program + 0xb0);
+	/* No record past the last kernel section. */
+	put_unaligned_le64(info.kernels[0].vm, program + 0xd0);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	put_unaligned_le64(0, program + 0xd0);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+
+	/* Segments in order: __KERN_2 may not follow __KERN_0. */
+	o.reloc_kernel = 0;
+	f = fixture_create_options(test, &o);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	segment = fixture_kernel_segment(f, 1);
+	KUNIT_ASSERT_NOT_NULL(test, segment);
+	segment[15] = '2';
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	segment[15] = '1';
+	/* A gap in VM or in the file splits the region: refused. */
+	put_unaligned_le64(get_unaligned_le64(segment + 24) + SZ_16K, segment + 24);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	put_unaligned_le64(get_unaligned_le64(segment + 24) - SZ_16K, segment + 24);
+	put_unaligned_le64(get_unaligned_le64(segment + 40) + SZ_16K, segment + 40);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	put_unaligned_le64(get_unaligned_le64(segment + 40) - SZ_16K, segment + 40);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+
+	/*
+	 * A partly file-backed segment cannot be followed by another one,
+	 * even when the next one continues in the file where it ends.
+	 */
+	o.kernels = 2;
+	f = fixture_create_options(test, &o);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	segment = fixture_kernel_segment(f, 0);
+	put_unaligned_le64(SZ_8K, segment + 48);
+	segment = fixture_kernel_segment(f, 1);
+	put_unaligned_le64(get_unaligned_le64(segment + 40) - SZ_8K, segment + 40);
+	put_unaligned_le32(get_unaligned_le32(segment + 72 + 48) - SZ_8K, segment + 72 + 48);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+}
+
 static void hwx_snapshot_test(struct kunit *test)
 {
 	struct hwx_fixture *f = fixture_create(test, false, false);
@@ -931,6 +1033,7 @@ static struct kunit_case hwx_cases[] = {
 	KUNIT_CASE(hwx_stabs_test),
 	KUNIT_CASE(hwx_symbol_scale_test),
 	KUNIT_CASE(hwx_relocations_test),
+	KUNIT_CASE(hwx_kernel_segments_test),
 	KUNIT_CASE(hwx_snapshot_test),
 	KUNIT_CASE(hwx_load_plan_test),
 	KUNIT_CASE(hwx_load_original_test),

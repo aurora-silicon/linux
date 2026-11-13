@@ -4,6 +4,7 @@
 
 /* Synthetic H16G containers shared by the HWX and program KUnit suites. */
 #include <kunit/test.h>
+#include <linux/sprintf.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
 
@@ -21,6 +22,11 @@ struct hwx_fixture_options {
 	bool note;
 	/* Debugging entries after the two surface symbols. */
 	u32 stabs;
+	/*
+	 * Kernel segments __KERN_0.. (0: one if @kernel), and the one whose
+	 * section the single relocation names.
+	 */
+	u32 kernels, reloc_kernel;
 };
 
 static u8 *fixture_command(struct hwx_fixture *f, u32 command, u32 length)
@@ -66,7 +72,9 @@ static void fixture_section(u8 *s, const char *segment, const char *name,
 static struct hwx_fixture *
 fixture_create_options(struct kunit *test, const struct hwx_fixture_options *o)
 {
-	bool mixed = o->mixed, kernel = o->kernel;
+	bool mixed = o->mixed;
+	u32 kernels = o->kernels ? o->kernels : o->kernel, k;
+	bool kernel = kernels;
 	struct hwx_fixture *f;
 	u64 surface = 0x30000000 + (mixed ? SZ_16K : 0);
 	u64 text = surface + 2 * SZ_16K, kern = text + SZ_32K;
@@ -78,7 +86,7 @@ fixture_create_options(struct kunit *test, const struct hwx_fixture_options *o)
 	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
 	if (!f)
 		return NULL;
-	f->size = kernel ? SZ_64K : SZ_32K + SZ_16K;
+	f->size = SZ_32K + SZ_16K + kernels * SZ_16K;
 	f->bytes = kunit_kzalloc(test, f->size, GFP_KERNEL);
 	if (!f->bytes)
 		return NULL;
@@ -103,10 +111,15 @@ fixture_create_options(struct kunit *test, const struct hwx_fixture_options *o)
 			14, kernel ? 0x128 : 0x28);
 	fixture_section(text_section + 80, "__TEXT", "__const", text + 64,
 			SZ_16K, SZ_16K + 64, 6, 0x26);
-	if (kernel) {
-		s = fixture_segment(f, "__KERN_0", kern, SZ_16K, SZ_32K + SZ_16K, 1, 4, 1);
-		fixture_section(s, "__KERN_0", "__kern_0", kern, 64,
-				SZ_32K + SZ_16K, 6, 0x26);
+	for (k = 0; k < kernels; k++) {
+		char segment[16], section[16];
+
+		snprintf(segment, sizeof(segment), "__KERN_%u", k);
+		snprintf(section, sizeof(section), "__kern_%u", k);
+		s = fixture_segment(f, segment, kern + k * SZ_16K, SZ_16K,
+				    SZ_32K + SZ_16K + k * SZ_16K, 1, 4, 1);
+		fixture_section(s, segment, section, kern + k * SZ_16K, 64,
+				SZ_32K + SZ_16K + k * SZ_16K, 6, 0x26);
 	}
 	for (i = 0; i < 2; i++) {
 		c = fixture_command(f, 0x40, 32);
@@ -124,8 +137,8 @@ fixture_create_options(struct kunit *test, const struct hwx_fixture_options *o)
 		put_unaligned_le64(0x30000000, c + 0x40);
 	for (i = 0; i < 2; i++)
 		put_unaligned_le64(surface + i * SZ_16K, c + 0x70 + i * 16);
-	if (kernel)
-		put_unaligned_le64(kern, c + 0x90);
+	for (k = 0; k < kernels; k++)
+		put_unaligned_le64(kern + k * SZ_16K, c + 0x90 + k * 16);
 	put_unaligned_le64(text, c + 0x810);
 	put_unaligned_le32(4, c + 0x820);
 	put_unaligned_le32(15, c + 0x824);
@@ -225,7 +238,8 @@ fixture_create_options(struct kunit *test, const struct hwx_fixture_options *o)
 		put_unaligned_le32(f->reloc, text_section + 56);
 		put_unaligned_le32(1, text_section + 60);
 		put_unaligned_le32(56, f->bytes + f->reloc);
-		put_unaligned_le32(0x07000000 | (mixed ? 6 : 5), f->bytes + f->reloc + 4);
+		put_unaligned_le32(0x07000000 | ((mixed ? 6 : 5) + o->reloc_kernel),
+				   f->bytes + f->reloc + 4);
 		put_unaligned_le32(32, f->bytes + SZ_16K + 56);
 	}
 	/* Fixed H16 task prologue: u32 1, then twelve zero bytes. */

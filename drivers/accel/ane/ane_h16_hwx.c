@@ -2,6 +2,7 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/sort.h>
+#include <linux/sprintf.h>
 #include <linux/sizes.h>
 #include <linux/vmalloc.h>
 #include <linux/uaccess.h>
@@ -17,8 +18,11 @@
  */
 #define HWX_SYMBOLS_MAX SZ_64K
 #define HWX_STRINGS_MAX SZ_8M
-#define HWX_SEGMENTS_MAX 8
+/* __PAGEZERO, __DATA, four surfaces, __TEXT and the kernel segments. */
+#define HWX_SEGMENTS_MAX (7 + ANE_H16_KERNEL_SEGMENTS)
 #define HWX_SG_NORELOC 0x4
+/* 16-byte base records of the program descriptor, +0x70 up to +0x810. */
+#define HWX_BASE_RECORDS ((0x810 - 0x70) / 16)
 #define HWX_N_STAB 0xe0
 
 struct hwx_range {
@@ -30,6 +34,8 @@ struct hwx_parser {
 	size_t size, command_end;
 	struct ane_h16_hwx info;
 	struct hwx_range vm[HWX_SEGMENTS_MAX], file[HWX_SEGMENTS_MAX + 4];
+	/* Where the next kernel segment must start, in VM and in the file. */
+	u64 kernel_vm_end, kernel_file_end;
 	struct ane_h16_hwx_section sections[ANE_H16_SECTIONS];
 	u32 tensors[ANE_H16_SURFACES], refs[ANE_H16_SURFACES];
 	u32 tensor_count, ref_count, segment_count, file_count, section_count;
@@ -48,6 +54,15 @@ static bool hwx_name(const u8 *p, const char *name)
 
 	return length < 16 && !memcmp(p, name, length) &&
 	       !memchr_inv(p + length, 0, 16 - length);
+}
+
+/* @prefix followed by the decimal @index, zero-padded to 16 bytes. */
+static bool hwx_indexed_name(const u8 *p, const char *prefix, u32 index)
+{
+	char name[16];
+
+	snprintf(name, sizeof(name), "%s%u", prefix, index);
+	return hwx_name(p, name);
 }
 
 static bool hwx_zero(const u8 *p, size_t start, size_t end)
@@ -98,7 +113,9 @@ static int hwx_segment(struct hwx_parser *p, const u8 *c, u32 length)
 	    hwx_range_add(p->vm, &p->segment_count, ARRAY_SIZE(p->vm), vm, size))
 		return -ENOEXEC;
 	text = hwx_name(c + 8, "__TEXT");
-	kernel = hwx_name(c + 8, "__KERN_0");
+	/* Kernel segments come in order: __KERN_0, __KERN_1, ... */
+	kernel = p->info.kernel_count < ANE_H16_KERNEL_SEGMENTS &&
+		 hwx_indexed_name(c + 8, "__KERN_", p->info.kernel_count);
 	scratch = hwx_name(c + 8, "__DATA");
 	surface = hwx_name(c + 8, "__FVMLIB");
 	guard = hwx_name(c + 8, "__PAGEZERO");
@@ -131,10 +148,18 @@ static int hwx_segment(struct hwx_parser *p, const u8 *c, u32 length)
 	if (text ? flags & ~HWX_SG_NORELOC : flags != (surface ? 6 : 4))
 		return -ENOEXEC;
 	if ((text && (prot != 5 || nsects != 2 || p->info.text.size)) ||
-	    (kernel && (prot != 1 || nsects != 1 || p->info.kernel.size)) ||
+	    (kernel && (prot != 1 || nsects != 1)) ||
 	    (scratch && (prot != 3 || p->info.scratch.size)) ||
 	    (surface && (prot < 1 || prot > 2 ||
 			 p->info.surface_count == ANE_H16_SURFACES)))
+		return -ENOEXEC;
+	/*
+	 * Each further kernel segment starts where the previous one ends, in
+	 * VM and in the file, and the previous one is wholly file-backed: the
+	 * segments then form one region that maps exactly like the file.
+	 */
+	if (kernel && p->info.kernel_count &&
+	    (vm != p->kernel_vm_end || file != p->kernel_file_end))
 		return -ENOEXEC;
 
 	for (i = 0; i < nsects; i++) {
@@ -183,8 +208,8 @@ static int hwx_segment(struct hwx_parser *p, const u8 *c, u32 length)
 				dest = &p->info.constants;
 			else
 				return -ENOEXEC;
-		} else if (kernel && hwx_name(s, "__kern_0")) {
-			dest = &p->info.kernel;
+		} else if (kernel && hwx_indexed_name(s, "__kern_", p->info.kernel_count)) {
+			dest = &p->info.kernels[p->info.kernel_count];
 			if (!IS_ALIGNED(section.vm, 64) || section.size > ANE_H16_SEGMENT_MAX)
 				return -ENOEXEC;
 		} else if (scratch && hwx_name(s, "__bss")) {
@@ -206,6 +231,27 @@ static int hwx_segment(struct hwx_parser *p, const u8 *c, u32 length)
 			return -ENOEXEC;
 		*dest = section;
 		p->sections[p->section_count++] = section;
+	}
+	if (kernel) {
+		const struct ane_h16_hwx_section *first = &p->info.kernels[0];
+		const struct ane_h16_hwx_section *last = &p->info.kernels[p->info.kernel_count];
+
+		p->kernel_vm_end = vm + size;
+		p->kernel_file_end = file + filesz;
+		if (p->info.kernel_count++) {
+			struct ane_h16_hwx_region *r = &p->info.regions[p->info.region_count - 1];
+
+			/* The previous segment was the kernel region's last one. */
+			if (r->kind != ANE_H16_REGION_KERNEL || r->file_size != r->size ||
+			    size > ANE_H16_SEGMENT_MAX - r->size)
+				return -ENOEXEC;
+			r->size += size;
+			r->file_size += filesz;
+		}
+		p->info.kernel = *first;
+		p->info.kernel.size = last->vm + last->size - first->vm;
+		if (p->info.kernel_count > 1)
+			return 0;
 	}
 	if (p->info.region_count == ANE_H16_REGIONS)
 		return -ENOEXEC;
@@ -271,14 +317,17 @@ static int hwx_program(struct hwx_parser *p)
 		return -ENOEXEC;
 	}
 	/*
-	 * BAR slot s takes its base from the qword at +0x10 * (s + 1). The surfaces then the
-	 * kernel fill consecutive slots from slot 6 (+0x70); Apple's zin_ane_compiler 10.205
-	 * starts the same run at slot 5 (+0x60) on H17, the task stream naming slots 5, 6, 7.
+	 * BAR slot s takes its base from the qword at +0x10 * (s + 1). The base records:
+	 * every surface base in segment order, then the base of every kernel section in
+	 * order, from slot 6 (+0x70); the remaining records are zero. Apple's
+	 * zin_ane_compiler 10.205 starts the same run at slot 5 (+0x60) on H17, the task
+	 * stream naming slots 5, 6, 7.
 	 */
 	table = info->subtype == ANE_HWX_SUBTYPE_H17 && get_unaligned_le64(c + 0x60) ? 0x60 : 0x70;
-	for (i = 0; i < 5; i++) {
+	for (i = 0; i < HWX_BASE_RECORDS; i++) {
 		u64 base = i < info->surface_count ? info->surfaces[i].section.vm :
-			   i == info->surface_count ? info->kernel.vm : 0;
+			   i - info->surface_count < info->kernel_count ?
+			   info->kernels[i - info->surface_count].vm : 0;
 
 		if (get_unaligned_le64(c + table + i * 16) != base ||
 		    get_unaligned_le64(c + table + 8 + i * 16))
@@ -300,7 +349,7 @@ static int hwx_program(struct hwx_parser *p)
 		return -ENOMEM;
 	for (i = 0; i < ARRAY_SIZE(common); i++)
 		memcpy(expected + common[i], c + common[i], 4);
-	for (i = 0; i < 5; i++)
+	for (i = 0; i < info->surface_count + info->kernel_count; i++)
 		memcpy(expected + table + i * 16, c + table + i * 16, 8);
 	put_unaligned_le32(4, expected + 0x868);
 	put_unaligned_le32(mixed ? 4 : 2, expected + 0x870);
@@ -554,6 +603,7 @@ static bool hwx_relocations_in_payload(const struct hwx_parser *p, unsigned long
 
 int ane_h16_hwx_validate(const void *bytes, size_t size, struct ane_h16_hwx *info)
 {
+	struct ane_h16_reloc_target targets[ANE_H16_KERNEL_SEGMENTS];
 	struct hwx_parser *p;
 	const void *relocations;
 	const u8 *c = bytes;
@@ -696,11 +746,17 @@ int ane_h16_hwx_validate(const void *bytes, size_t size, struct ane_h16_hwx *inf
 		}
 	}
 	relocations = p->info.text.nreloc ? p->bytes + p->info.text.reloff : NULL;
-	ret = ane_h16_relocations_validate(p->bytes + p->info.text.offset,
-					   p->info.text.size, relocations,
-					   p->info.text.nreloc, p->info.kernel.ordinal,
-					   p->info.kernel.vm, p->info.kernel.size,
-					   seen, p->info.text.size / 4);
+	for (i = 0; i < p->info.kernel_count; i++)
+		targets[i] = (struct ane_h16_reloc_target) {
+			.ordinal = p->info.kernels[i].ordinal,
+			.vm = p->info.kernels[i].vm,
+			.size = p->info.kernels[i].size,
+		};
+	ret = ane_h16_relocations_validate_targets(p->bytes + p->info.text.offset,
+						   p->info.text.size, relocations,
+						   p->info.text.nreloc, targets,
+						   p->info.kernel_count, seen,
+						   p->info.text.size / 4);
 	if (!ret && p->info.text.nreloc && !hwx_relocations_in_payload(p, seen))
 		ret = -ENOEXEC;
 	if (!ret)
