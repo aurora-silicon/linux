@@ -2150,6 +2150,13 @@ F:	tools/testing/kunit/configs/mt7932.config
 F:	tools/testing/selftests/drivers/apple/aop-las.py
 F:	tools/testing/selftests/drivers/gpu/apple-dcp/
 
+APPLE T8152 DCP DISPLAY DRIVER (IBOOT INTERFACE)
+M:	Thomas Glanzmann <thomas@glanzmann.de>
+L:	dri-devel@lists.freedesktop.org
+S:	Maintained
+F:	Documentation/devicetree/bindings/display/apple,t8152-dcp-iboot.yaml
+F:	drivers/gpu/drm/apple_dcpib/
+
 APPLETALK NETWORK LAYER
 L:	netdev@vger.kernel.org
 S:	Obsolete
