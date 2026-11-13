@@ -88,6 +88,20 @@ properties:
       backend extends the firmware's native delay with its host idle-hold
       control; an absent property preserves the native policy.
 
+  apple,fast-die-effort:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    description: |
+      PMP report region and the die-temperature effort lane whose closed-loop
+      output limits GPU power. The host converts the documented 0..255 effort
+      to an AGX integer-percent power ceiling. It restores the firmware-native
+      ceiling whenever the PMP is stopped or unavailable.
+    items:
+      - items:
+          - description: PMP report region
+          - description: Effort lane
+            minimum: 0
+            maximum: 2
+
   apple,pmp:
     $ref: /schemas/types.yaml#/definitions/phandle
     description: PMP firmware provider owning the GPU power vote and telemetry
