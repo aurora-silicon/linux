@@ -40,10 +40,11 @@ mod shim;
 mod shmem;
 mod sks;
 mod stac;
-// The accessory client that drives these lands with its HID transport.
+mod stac_client;
+// The read-only client uses the pairing-state query; the other operations
+// come with the session relay.
 #[allow(dead_code)]
 mod stac_ops;
-// Driven by the accessory client with the relay.
 #[allow(dead_code)]
 mod stac_lifecycle;
 mod store;
@@ -821,6 +822,12 @@ struct SepData {
     stac_rx: Mutex<stac::Exchange>,
     #[pin]
     stac_wq: CondVar,
+    // One stac operation at a time, whoever runs it.
+    #[pin]
+    stac_op: Mutex<()>,
+    // The keyboard's lifecycle (see `stac_client`).
+    #[pin]
+    stac_lc: Mutex<stac_lifecycle::Lifecycle>,
     stac_named: Atomic<bool>,
     stac_layout: Atomic<u32>,
     stac_absent_logged: Atomic<bool>,
@@ -1233,6 +1240,8 @@ impl SepData {
                 ool_stac <- new_mutex!(Some(ool_stac)),
                 stac_rx <- new_mutex!(stac::Exchange::new()),
                 stac_wq <- new_condvar!("SepData::stac_wq"),
+                stac_op <- new_mutex!(()),
+                stac_lc <- new_mutex!(stac_lifecycle::Lifecycle::new()),
                 stac_named: Atomic::new(false),
                 stac_layout: Atomic::new(0),
                 stac_absent_logged: Atomic::new(false),
@@ -3496,7 +3505,7 @@ impl WorkItem<VERIFY_WORK_ID> for SepData {
 }
 
 
-struct SepDriver(Arc<SepData>, attach::Attribute);
+struct SepDriver(Arc<SepData>, attach::Attribute, stac_client::Client);
 
 // Deliberately not exported as a module alias: udev must not load the driver
 // on its own. The loader service loads it once the iBoot system container's
@@ -3603,12 +3612,15 @@ impl platform::Driver for SepDriver {
                 return Err(e);
             }
         };
-        Ok(SepDriver(data, attribute))
+        // The keyboard client; the service tells it when to start.
+        let client = stac_client::Client::register(data.clone());
+        Ok(SepDriver(data, attribute, client))
     }
 }
 
 impl Drop for SepDriver {
     fn drop(&mut self) {
+        self.2.unregister();
         self.1.unregister();
         self.0.remove();
     }

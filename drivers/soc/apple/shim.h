@@ -304,4 +304,16 @@ void sep_complete_attach_unregister(struct device *dev);
 void sep_diag_keystore_ended(void);
 void sep_diag_set_xart(bool writable);
 
+/* Trusted-accessory keyboard client (stac_ta_shim.c, stac_client.rs). */
+typedef void (*sep_stac_ta_event_fn)(void *ctx);
+typedef void (*sep_stac_ta_identified_fn)(void *ctx, const u8 *uid,
+					  const u8 *nonce);
+typedef void (*sep_stac_ta_failed_fn)(void *ctx, int err);
+int sep_stac_ta_register(void *ctx, sep_stac_ta_event_fn attached,
+			 sep_stac_ta_event_fn detached,
+			 sep_stac_ta_identified_fn identified,
+			 sep_stac_ta_failed_fn failed);
+void sep_stac_ta_unregister(void);
+void sep_stac_ta_identify(void);
+
 #endif /* SEP_SHIM_H */

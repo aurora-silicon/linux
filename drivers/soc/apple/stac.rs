@@ -4,12 +4,10 @@
 //! The enclave's trusted-accessory endpoint (`stac`).
 //!
 //! The service behind it pairs and authorises accessories with their own
-//! biometric sensor, such as a keyboard with Touch ID. Linux has no such
-//! accessory stack yet, so the driver does only what the host owes the
-//! service to keep its state as macOS keeps it: it tells the service that
-//! the system is online once the enclave has come up, and again each time the
-//! enclave comes back from a sleep. Recorded on a J616s under macOS, that is
-//! one exchange right after the enclave's wake messages:
+//! biometric sensor, such as a keyboard with Touch ID. The driver tells the
+//! service that the system is online once the enclave has come up, and again
+//! each time the enclave comes back from a sleep. Recorded on a J616s under
+//! macOS, that is one exchange right after the enclave's wake messages:
 //!
 //! ```text
 //! TX 0x0000_0000_000f_fc18   endpoint 0x18, first packet, opcode 0x0f, sequence 0
@@ -21,8 +19,12 @@
 //! is a single little-endian word, 1 for online. The answer is a packet with no
 //! body and a zero status.
 //!
-//! Nothing here is reachable from userspace. No other operation of the service
-//! is sent, and a message the driver did not ask for is counted as unhandled.
+//! The accessory client (see `stac_client.rs`) runs the other operations of
+//! the service (see `stac_ops.rs`) through [`SepData::stac_call`], one at a
+//! time, each a request packet and a single-packet answer.
+//!
+//! Nothing here is reachable from userspace. A message the driver did not ask
+//! for is counted as unhandled.
 
 use super::*;
 use crate::proto::*;
@@ -71,26 +73,46 @@ static_assert!(
     encode_stac(OP_POWER_STATE, transfer::MARKER_FIRST, 0).msg0 == 0x0000_0000_000f_fc18
 );
 
+/// The message that hands the enclave a request packet for `opcode`.
+pub(crate) const fn request_message(opcode: u16) -> Message {
+    encode_stac(opcode, transfer::MARKER_FIRST, 0)
+}
+
 /// The message that hands the enclave the power-state packet.
 pub(crate) const fn power_state_message() -> Message {
-    encode_stac(OP_POWER_STATE, transfer::MARKER_FIRST, 0)
+    request_message(OP_POWER_STATE)
+}
+
+/// The largest request or answer body one packet carries in the buffers.
+pub(crate) const BODY_MAX: usize = OOL_SIZE_STAC - transfer::HEADER_LEN;
+
+/// The packet header of a request for `opcode` with a `len`-byte body.
+pub(crate) fn request_header(opcode: u16, len: usize) -> Result<[u8; transfer::HEADER_LEN]> {
+    if len > BODY_MAX {
+        return Err(EINVAL);
+    }
+    let mut out = [0u8; transfer::HEADER_LEN];
+    let packet = transfer::Packet {
+        version: transfer::VERSION,
+        total: len as u32,
+        offset: 0,
+        flags: 0,
+        err: 0,
+        opcode: u32::from(opcode),
+        chunk: len as u32,
+    };
+    packet.encode(&mut out)?;
+    Ok(out)
 }
 
 /// The out-of-line bytes of a power-state request: the packet header and the
 /// state word.
 pub(crate) fn power_state_request(state: u32) -> [u8; POWER_STATE_REQUEST_LEN] {
     let mut out = [0u8; POWER_STATE_REQUEST_LEN];
-    let packet = transfer::Packet {
-        version: transfer::VERSION,
-        total: POWER_STATE_BODY_LEN as u32,
-        offset: 0,
-        flags: 0,
-        err: 0,
-        opcode: u32::from(OP_POWER_STATE),
-        chunk: POWER_STATE_BODY_LEN as u32,
-    };
-    // The buffer is exactly one header and one word long.
-    let _ = packet.encode(&mut out);
+    // A four-byte body is well within one packet.
+    if let Ok(header) = request_header(OP_POWER_STATE, POWER_STATE_BODY_LEN) {
+        out[..transfer::HEADER_LEN].copy_from_slice(&header);
+    }
     out[transfer::HEADER_LEN..].copy_from_slice(&state.to_le_bytes());
     out
 }
@@ -123,11 +145,14 @@ pub(crate) fn classify(msg: &Message) -> Arrival {
     }
 }
 
-/// The result of one power-state exchange.
+/// The result of one exchange.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Outcome {
-    /// The service took the state.
+    /// The service took the request and answered with no body.
     Accepted,
+    /// The service answered with a body of this many bytes, in one packet
+    /// right after the header.
+    Data(usize),
     /// The enclave answered with this nonzero status, or an error report.
     Refused(u32),
     /// The answer was not the one asked for, or its header did not check out.
@@ -136,30 +161,56 @@ pub(crate) enum Outcome {
     NoReply,
 }
 
-/// Checks the answer to a power-state request. `error` is whether it came as an
-/// error report, `packet` the header the enclave wrote.
-pub(crate) fn check_reply(error: bool, packet: &transfer::Packet) -> Outcome {
+/// What [`SepData::stac_call`] got back.
+#[derive(Debug)]
+pub(crate) enum Reply {
+    /// The answer's body; empty for an operation that answers with none.
+    Body(KVec<u8>),
+    /// The enclave answered with this nonzero status, or an error report.
+    Refused(u32),
+    /// The answer was not the one asked for, or did not check out.
+    Malformed,
+    /// No answer within [`STAC_TIMEOUT_MS`].
+    NoReply,
+}
+
+/// Checks the answer to a request for `opcode`. `error` is whether it came as
+/// an error report, `packet` the header the enclave wrote. Only answers that
+/// fit one packet are taken: every answer in the recordings does.
+pub(crate) fn check_reply_for(opcode: u16, error: bool, packet: &transfer::Packet) -> Outcome {
     if error {
         // An error report carries only the status word.
         return Outcome::Refused(packet.err);
     }
-    if packet.version != transfer::VERSION || packet.opcode != u32::from(OP_POWER_STATE) {
+    if packet.version != transfer::VERSION || packet.opcode != u32::from(opcode) {
         return Outcome::Malformed;
     }
     if packet.err != 0 {
         return Outcome::Refused(packet.err);
     }
-    // The answer has no body; one that has is not this answer.
-    if packet.total != 0 || packet.chunk != 0 || packet.offset != 0 {
+    if packet.offset != 0 || packet.chunk != packet.total || packet.total as usize > BODY_MAX {
         return Outcome::Malformed;
     }
-    Outcome::Accepted
+    match packet.total {
+        0 => Outcome::Accepted,
+        n => Outcome::Data(n as usize),
+    }
+}
+
+/// Checks the answer to a power-state request, which has no body.
+pub(crate) fn check_reply(error: bool, packet: &transfer::Packet) -> Outcome {
+    match check_reply_for(OP_POWER_STATE, error, packet) {
+        // The answer has no body; one that has is not this answer.
+        Outcome::Data(_) => Outcome::Malformed,
+        outcome => outcome,
+    }
 }
 
 /// The single exchange the endpoint can have in flight.
 pub(crate) struct Exchange {
     waiting: bool,
     generation: u64,
+    opcode: u16,
     outcome: Option<Outcome>,
 }
 
@@ -168,22 +219,25 @@ impl Exchange {
         Exchange {
             waiting: false,
             generation: 0,
+            opcode: 0,
             outcome: None,
         }
     }
 
-    /// Starts an exchange; returns its number.
-    pub(crate) fn begin(&mut self) -> u64 {
+    /// Starts an exchange for `opcode`; returns its number.
+    pub(crate) fn begin(&mut self, opcode: u16) -> u64 {
         self.generation = self.generation.wrapping_add(1);
         self.waiting = true;
+        self.opcode = opcode;
         self.outcome = None;
         self.generation
     }
 
-    /// The exchange a message arriving now can answer, if one is waiting.
-    pub(crate) fn current(&self) -> Option<u64> {
+    /// The exchange a message arriving now can answer, and its opcode, if one
+    /// is waiting.
+    pub(crate) fn current(&self) -> Option<(u64, u16)> {
         if self.waiting {
-            Some(self.generation)
+            Some((self.generation, self.opcode))
         } else {
             None
         }
@@ -295,6 +349,7 @@ impl SepData {
             Ok(Outcome::Accepted) => {
                 diag::stac(diag::Stac::Online);
                 dev_dbg!(self.dev, "stac: the accessory service is online\n");
+                self.stac_ta_event(stac_lifecycle::Event::ServiceOnline);
             }
             Ok(outcome) => {
                 diag::stac(diag::Stac::Failed);
@@ -313,7 +368,8 @@ impl SepData {
     }
 
     fn stac_power_state(&self, state: u32) -> Result<Outcome> {
-        self.stac_rx.lock().begin();
+        let _one = self.stac_op.lock();
+        self.stac_rx.lock().begin(OP_POWER_STATE);
         let sent = self
             .ool_write(&self.ool_stac, 0, &power_state_request(state))
             .and_then(|()| {
@@ -324,6 +380,57 @@ impl SepData {
             self.stac_rx.lock().end();
             return Err(e);
         }
+        self.stac_wait()
+    }
+
+    /// Runs one operation of the service: `request` as the body of one
+    /// packet, and an answer of at most `reply_max` bytes. Only after the
+    /// power-state report was taken: that registers the buffers.
+    pub(crate) fn stac_call(&self, opcode: u16, request: &[u8], reply_max: usize) -> Result<Reply> {
+        if opcode == OP_POWER_STATE || reply_max > BODY_MAX {
+            return Err(EINVAL);
+        }
+        if self.shutting_down.load(Relaxed) || !self.stac_offered() {
+            return Err(ENODEV);
+        }
+        let header = request_header(opcode, request.len())?;
+        let _one = self.stac_op.lock();
+        self.stac_rx.lock().begin(opcode);
+        let sent = self
+            .ool_write(&self.ool_stac, 0, &header)
+            .and_then(|()| self.ool_write(&self.ool_stac, transfer::HEADER_LEN, request))
+            .and_then(|()| {
+                transfer::send_for_reply(&StacHeader(self), || {
+                    // Nor the last answer's body for this one's.
+                    self.ool_repoison(&self.ool_stac, transfer::HEADER_LEN, reply_max);
+                    self.send(request_message(opcode))
+                })
+            });
+        if let Err(e) = sent {
+            self.stac_rx.lock().end();
+            return Err(e);
+        }
+        Ok(match self.stac_wait()? {
+            Outcome::Accepted => Reply::Body(KVec::new()),
+            Outcome::Data(len) if len > reply_max => Reply::Malformed,
+            Outcome::Data(len) => {
+                // The header landed; the body went out before it.
+                if !self.ool_await_written(&self.ool_stac, transfer::HEADER_LEN, len) {
+                    Reply::Malformed
+                } else {
+                    let body = self.ool_read(&self.ool_stac, transfer::HEADER_LEN, len)?;
+                    self.ool_repoison(&self.ool_stac, transfer::HEADER_LEN, len);
+                    Reply::Body(body)
+                }
+            }
+            Outcome::Refused(status) => Reply::Refused(status),
+            Outcome::Malformed => Reply::Malformed,
+            Outcome::NoReply => Reply::NoReply,
+        })
+    }
+
+    /// Waits for the answer to the exchange in flight.
+    fn stac_wait(&self) -> Result<Outcome> {
 
         let mut remaining = time::msecs_to_jiffies(STAC_TIMEOUT_MS);
         let mut guard = self.stac_rx.lock();
@@ -356,11 +463,11 @@ impl SepData {
         };
         // Sampled before the header is read: an exchange that times out
         // meanwhile and is followed by another must not take this answer.
-        let Some(generation) = self.stac_rx.lock().current() else {
+        let Some((generation, expected)) = self.stac_rx.lock().current() else {
             self.stac_unexpected(&msg);
             return;
         };
-        if opcode != OP_POWER_STATE {
+        if opcode != expected {
             self.stac_unexpected(&msg);
             return;
         }
@@ -375,7 +482,8 @@ impl SepData {
             OOL_POISON_OUTBOUND,
             OOL_WRITE_POLL_ATTEMPTS,
         ) {
-            Ok(packet) => check_reply(error, &packet),
+            Ok(packet) if opcode == OP_POWER_STATE => check_reply(error, &packet),
+            Ok(packet) => check_reply_for(opcode, error, &packet),
             Err(_) => Outcome::Malformed,
         };
         if self.stac_rx.lock().answer(generation, outcome) {
@@ -536,12 +644,12 @@ mod tests {
     fn a_late_answer_does_not_complete_the_next_exchange() {
         let mut rx = Exchange::new();
         assert_eq!(rx.current(), None);
-        let first = rx.begin();
-        assert_eq!(rx.current(), Some(first));
+        let first = rx.begin(OP_POWER_STATE);
+        assert_eq!(rx.current(), Some((first, OP_POWER_STATE)));
         // The first exchange times out; a second begins before its answer lands.
         rx.end();
         assert_eq!(rx.current(), None);
-        let second = rx.begin();
+        let second = rx.begin(OP_POWER_STATE);
         assert!(!rx.answer(first, Outcome::Accepted));
         assert_eq!(rx.take(), None);
         assert!(rx.answer(second, Outcome::Accepted));
@@ -551,5 +659,62 @@ mod tests {
         assert_eq!(rx.current(), None);
         // Nothing is waiting now.
         assert!(!rx.answer(second, Outcome::Accepted));
+    }
+
+    // The pairing-state exchange in the J616s macOS 27 recording
+    // (traces/touchid/20261113-stac-decode): opcode 0x02, a 16-byte
+    // request, a 2-byte answer.
+    const OP_PAIRING_STATE: u16 = 0x02;
+
+    fn data_reply(opcode: u16, len: u32) -> transfer::Packet {
+        transfer::Packet {
+            opcode: u32::from(opcode),
+            total: len,
+            chunk: len,
+            ..ok_reply()
+        }
+    }
+
+    #[test]
+    fn the_pairing_state_request_word_matches_the_recording() -> Result {
+        assert_eq!(request_message(OP_PAIRING_STATE).msg0, 0x0000_0000_0002_fc18);
+        let header = request_header(OP_PAIRING_STATE, 16)?;
+        let packet = transfer::Packet::decode(&header)?;
+        assert_eq!(packet.opcode, 2);
+        assert_eq!(packet.total, 16);
+        assert_eq!(packet.chunk, 16);
+        assert_eq!(packet.offset, 0);
+        assert!(request_header(OP_PAIRING_STATE, BODY_MAX + 1).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn a_one_packet_answer_carries_its_body_length() {
+        let reply = data_reply(OP_PAIRING_STATE, 2);
+        assert_eq!(check_reply_for(OP_PAIRING_STATE, false, &reply), Outcome::Data(2));
+        let empty = data_reply(OP_PAIRING_STATE, 0);
+        assert_eq!(check_reply_for(OP_PAIRING_STATE, false, &empty), Outcome::Accepted);
+        // Another operation's answer, a continued one, a body past the buffer.
+        assert_eq!(check_reply_for(0x0b, false, &reply), Outcome::Malformed);
+        let continued = transfer::Packet {
+            chunk: 1,
+            ..reply
+        };
+        assert_eq!(check_reply_for(OP_PAIRING_STATE, false, &continued), Outcome::Malformed);
+        let huge = data_reply(OP_PAIRING_STATE, (BODY_MAX + 1) as u32);
+        assert_eq!(check_reply_for(OP_PAIRING_STATE, false, &huge), Outcome::Malformed);
+        let refused = transfer::Packet {
+            err: 5,
+            ..reply
+        };
+        assert_eq!(check_reply_for(OP_PAIRING_STATE, false, &refused), Outcome::Refused(5));
+    }
+
+    #[test]
+    fn an_answer_for_another_opcode_does_not_match_the_exchange() {
+        let mut rx = Exchange::new();
+        let n = rx.begin(OP_PAIRING_STATE);
+        assert_eq!(rx.current(), Some((n, OP_PAIRING_STATE)));
+        assert_ne!(rx.current().map(|(_, op)| op), Some(OP_POWER_STATE));
     }
 }
