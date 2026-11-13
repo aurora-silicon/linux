@@ -20,18 +20,24 @@
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/clpc.h>
+#include <linux/soc/apple/pmgr-pwrstate.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/suspend.h>
 
 #include "ane_fw_cold.h"
 #include "ane_fw_sleep.h"
 #include "ane_h16_accel.h"
+#include "ane_t6021_lifetime.h"
 
 #define ANE_FW_POOL_DVA 0x10000384000ULL
 #define ANE_FW_IPC_DVA 0x100003d0000ULL
 #define ANE_FW_HEAP_DVA 0x100003e4000ULL
 #define ANE_FW_ALLOC_DVA 0x10001300000ULL
 #define ANE_FW_TIMEOUT_NS (3ULL * NSEC_PER_SEC)
+/* Engine wrapper: the firmware CPU's run control and its status. */
+#define ANE_FW_WRAPPER_CONTROL 0x44
+#define ANE_FW_WRAPPER_RUN 0x10
+#define ANE_FW_WRAPPER_STATUS 0x48
 
 enum ane_fw_stage {
 	ANE_STAGE_UNVERIFIED,
@@ -120,6 +126,19 @@ struct ane_fw_backend {
 	struct work_struct start;
 	/* ANE_SYS and the child power states are on: the engine is readable. */
 	bool powered;
+	/* The program stage was reached: a quarantine can end with a new firmware. */
+	bool program_ready;
+	/* Recovery of a session quarantined at runtime (ane_fw_hung()). */
+	struct work_struct recover;
+	bool recovering;
+	/* System sleep is under way: it handles a quarantined engine itself. */
+	bool recover_blocked;
+	/* Powered off for a sleep while quarantined: booted cold on resume. */
+	bool sleep_quarantined;
+	/* A power-down outside a sleep: a stuck power word cannot wait for one. */
+	bool runtime_off;
+	unsigned int boot_retries;
+	u64 recoveries, recover_failures;
 };
 
 /* One ANE per SoC. The observer exists before platform driver registration:
@@ -544,7 +563,7 @@ static int ane_fw_ps_off(struct ane_fw_backend *b, u32 offset)
 		if (!ane_poll32(b, reg, ANE_FW_PS_OFF_MASK, 0, 1, 1000))
 			return 0;
 	}
-	if (!apple_sleep_request_deep_once())
+	if (b->runtime_off || !apple_sleep_request_deep_once())
 		return ret;
 	dev_warn(&b->pdev->dev, "H17 ANE: power word %#x still stuck, taking the deep path\n", offset);
 	return 0;
@@ -798,6 +817,14 @@ static int ane_fw_cold_cycle_boot(struct ane_fw_backend *b)
 		div_u64(b->resume_ready_ns - start, NSEC_PER_MSEC));
 	/* Every open program back behind its handle, as the application left it. */
 	ane_h16_session_restart(&b->session);
+	/*
+	 * The engine was powered off under the old firmware (its CPU power
+	 * state read back off) and booted again: a quarantine of that
+	 * firmware ends, and programs closed while it lasted are released.
+	 */
+	ane_h16_session_recovered(&b->session);
+	if (b->program_ready)
+		b->stage = ANE_STAGE_PROGRAM;
 	ret = ane_h16_session_replay(&b->session, &b->resume_replayed, &b->resume_first_ns);
 	if (ret) {
 		dev_err(dev, "H17 ANE: PROGRAM REPLAY FAILED %d after %u programs; session quarantined\n",
@@ -1002,6 +1029,196 @@ static int ane_fw_cold_cycle_down(struct ane_fw_backend *b)
 	return ane_fw_power_down(b);
 }
 
+/*
+ * Power the engine off without its firmware and boot it again from the
+ * preload, as after a sleep. The CPU and sub-block power states must read
+ * back off: that is the proof the old firmware stopped, since nothing in
+ * the wrapper can show it. With @cycle_sys ANE_SYS is power cycled through
+ * the PMGR in between; outside system sleep the PMGR clears a power-on that
+ * latched with its PS reset recovery, which it cannot run in the noirq
+ * phase of a resume.
+ */
+static int ane_fw_restart(struct ane_fw_backend *b, bool cycle_sys)
+{
+	struct device_node *np;
+	int ret;
+
+	if (b->powered) {
+		b->runtime_off = true;
+		ret = ane_fw_power_down(b);
+		b->runtime_off = false;
+		if (ret)
+			return ret;
+	} else if (b->power_ref) {
+		b->power_ref = false;
+		pm_runtime_put_sync(b->power);
+	}
+	if (cycle_sys) {
+		np = of_parse_phandle(b->pdev->dev.of_node, "power-domains", 0);
+		if (!np)
+			return -ENODEV;
+		/* -EINVAL: genpd turned ANE_SYS off, so the next power-on is a fresh one. */
+		ret = apple_pmgr_ps_cycle(np);
+		of_node_put(np);
+		if (ret && ret != -EINVAL)
+			return ret;
+	}
+	return ane_fw_cold_cycle_boot(b);
+}
+
+/*
+ * A boot from the preload failed (after a sleep, or for a request to a
+ * parked engine), typically because ANE_SYS's power-on latched in the noirq
+ * resume and genpd carried on as if it were on. Retry once with ANE_SYS
+ * power cycled; quarantine only if that fails too.
+ */
+static int ane_fw_boot_retry(struct ane_fw_backend *b, int error, const char *when)
+{
+	int ret;
+
+	dev_warn(&b->pdev->dev, "H17 ANE: boot %s failed (%d); power cycling ANE_SYS and booting again\n",
+		 when, error);
+	ret = ane_fw_restart(b, true);
+	if (ret)
+		return ret;
+	b->boot_retries++;
+	dev_info(&b->pdev->dev, "H17 ANE: recovered after a failed boot (%u so far)\n",
+		 b->boot_retries);
+	return 0;
+}
+
+/*
+ * Recovery of a session quarantined by a hung request, with the restart
+ * sequence of the T8112 and H16 paths (ane_t6021_restart_run(), unplanned):
+ * RUN cleared (halt), hung_settle_ms for the engine to drain (contain), the
+ * engine powered off without its firmware with the CPU and sub-block power
+ * states verified off (power_cycle), then booted again from the preload with
+ * every open program replayed behind its handle (boot). The wrapper status
+ * cannot prove a stop, so halt always reports a busy CPU and the verified
+ * power-off is the proof; without hung_stop the session stays quarantined.
+ * Nothing asserts a reset. Requests wait in ane_h16_session_enter() while it
+ * runs.
+ */
+static int ane_fw_rs_planned_only(void *ctx)
+{
+	return -EOPNOTSUPP;
+}
+
+static int ane_fw_rs_halt(void *ctx)
+{
+	struct ane_fw_backend *b = ctx;
+	void __iomem *wrapper = b->engine + b->soc->wrapper;
+
+	if (!b->powered)
+		return -ENODEV;
+	dev_info(&b->pdev->dev, "H17 ANE: hung engine: wrapper control %#x status %#x\n",
+		 ane_rd32(b, wrapper + ANE_FW_WRAPPER_CONTROL),
+		 ane_rd32(b, wrapper + ANE_FW_WRAPPER_STATUS));
+	ane_wr32(b, 0, wrapper + ANE_FW_WRAPPER_CONTROL);
+	dma_wmb();
+	return ANE_T6021_ASC_BUSY;
+}
+
+static int ane_fw_rs_contain(void *ctx)
+{
+	struct ane_fw_backend *b = ctx;
+	unsigned int settle = min(ane_t6021_hung_settle_ms, 60000U);
+
+	if (!ane_t6021_hung_stop)
+		return -EOPNOTSUPP;
+	msleep(settle);
+	dev_info(&b->pdev->dev,
+		 "H17 ANE: RUN cleared, wrapper status %#x after %u ms; powering the engine off\n",
+		 ane_rd32(b, b->engine + b->soc->wrapper + ANE_FW_WRAPPER_STATUS), settle);
+	return 0;
+}
+
+static int ane_fw_rs_power_cycle(void *ctx)
+{
+	struct ane_fw_backend *b = ctx;
+	int ret;
+
+	b->runtime_off = true;
+	ret = ane_fw_power_down(b);
+	b->runtime_off = false;
+	return ret;
+}
+
+static int ane_fw_rs_boot(void *ctx)
+{
+	struct ane_fw_backend *b = ctx;
+	int ret;
+
+	ret = ane_fw_cold_cycle_boot(b);
+	/* Once more with ANE_SYS power cycled, as for a failed boot after sleep. */
+	if (ret)
+		ret = ane_fw_restart(b, true);
+	return ret;
+}
+
+static const struct ane_t6021_restart_ops ane_fw_restart_ops = {
+	.power_down = ane_fw_rs_planned_only,
+	.wait_idle = ane_fw_rs_planned_only,
+	.halt = ane_fw_rs_halt,
+	.contain = ane_fw_rs_contain,
+	.power_cycle = ane_fw_rs_power_cycle,
+	.boot = ane_fw_rs_boot,
+};
+
+static void ane_fw_recover_work(struct work_struct *work)
+{
+	struct ane_fw_backend *b = container_of(work, struct ane_fw_backend, recover);
+	static const char * const stages[] = {
+		[ANE_T6021_RESTART_STOP] = "stop",
+		[ANE_T6021_RESTART_CYCLE] = "power cycle",
+		[ANE_T6021_RESTART_BOOT] = "boot",
+		[ANE_T6021_RESTART_DONE] = "done",
+	};
+	enum ane_t6021_restart_stage stage;
+	u64 start = ktime_get_ns();
+	int ret;
+
+	guard(mutex)(&b->lock);
+	if (READ_ONCE(b->recover_blocked) || b->in_sleep || b->slept || b->parked ||
+	    b->stage != ANE_STAGE_PROGRAM || !b->session.quarantined || !ane_t6021_hung_stop) {
+		WRITE_ONCE(b->recovering, false);
+		return;
+	}
+	ane_h16_session_sleep(&b->session, true);
+	b->resume_replayed = 0;
+	b->resume_first_ns = 0;
+	ret = ane_t6021_restart_run(&ane_fw_restart_ops, b, false, &stage);
+	if (ret) {
+		b->recover_failures++;
+		/* Every mapping and backing stays; the next system sleep tries again. */
+		ane_fw_quarantine(b, ret);
+		b->session.quarantined = true;
+		dev_err(&b->pdev->dev,
+			"H17 ANE: recovery after a hung request failed at the %s, error %d; quarantined until the next system sleep\n",
+			stages[stage], ret);
+	} else {
+		b->recoveries++;
+		dev_info(&b->pdev->dev,
+			 "H17 ANE: firmware recovered after a hung request in %llu ms, %u programs replayed\n",
+			 div_u64(ktime_get_ns() - start, NSEC_PER_MSEC), b->resume_replayed);
+	}
+	ane_h16_session_sleep(&b->session, false);
+	WRITE_ONCE(b->recovering, false);
+}
+
+/* Session ops->hung: may run under the session lock, so only queue. */
+static void ane_fw_hung(void *ctx, int error)
+{
+	struct ane_fw_backend *b = ctx;
+
+	if (!ane_t6021_hung_stop || READ_ONCE(b->recover_blocked) || READ_ONCE(b->recovering))
+		return;
+	WRITE_ONCE(b->recovering, true);
+	dev_warn(&b->pdev->dev, "H17 ANE: session quarantined (%d); recovering the engine\n",
+		 error);
+	queue_work(system_dfl_wq, &b->recover);
+}
+
 /* A request for a parked engine: boot it from the preload, as after a sleep. */
 static int ane_fw_session_wake(void *ctx)
 {
@@ -1017,6 +1234,8 @@ static int ane_fw_session_wake(void *ctx)
 	if (b->in_sleep)
 		return -EAGAIN;
 	ret = ane_fw_cold_cycle_boot(b);
+	if (ret)
+		ret = ane_fw_boot_retry(b, ret, "for a request");
 	WRITE_ONCE(b->parked, false);
 	WRITE_ONCE(b->session.parked, false);
 	if (ret) {
@@ -1028,45 +1247,71 @@ static int ane_fw_session_wake(void *ctx)
 	return ret;
 }
 
-static int ane_fw_sleep_prepare(struct ane_fw_backend *b)
+/* genpd's record of ANE_SYS (ane_fw_genpd_event()), from this sleep on. */
+static void ane_fw_sys_record_reset(struct ane_fw_backend *b)
 {
-	int ret;
-
-	guard(mutex)(&b->lock);
-	/* Parked: already off, with nothing to stop. */
-	if (b->parked)
-		return 0;
-	/*
-	 * A quarantined engine that never came up has nothing to lose; give
-	 * back an ANE_SYS reference a failed power-up kept.
-	 */
-	if (b->stage == ANE_STAGE_QUARANTINED && !b->powered) {
-		if (b->power_ref) {
-			b->power_ref = false;
-			pm_runtime_put_sync(b->power);
-		}
-		return 0;
-	}
-	/*
-	 * Quarantined and still powered: its state was dumped when it was
-	 * quarantined. Power it off without the firmware so that the system
-	 * can sleep; it stays quarantined and is not booted again.
-	 */
-	if (b->stage == ANE_STAGE_QUARANTINED) {
-		ret = ane_fw_power_down(b);
-		dev_info(&b->pdev->dev, "H17 ANE: quarantined engine powered off for system sleep (%d)\n",
-			 ret);
-		return ret;
-	}
-	if (b->stage != ANE_STAGE_PROGRAM)
-		return -EBUSY;
-	ane_h16_session_sleep(&b->session, true);
 	b->sys_offs = 0;
 	b->sys_ons = 0;
 	b->sys_off_ns = 0;
 	b->sys_off_at = 0;
 	b->sys_off_pmgr = 0;
 	b->sys_on_pmgr = 0;
+}
+
+static int ane_fw_sleep_prepare(struct ane_fw_backend *b)
+{
+	int ret;
+
+	guard(mutex)(&b->lock);
+	b->sleep_quarantined = false;
+	/* Parked: already off, with nothing to stop. */
+	if (b->parked)
+		return 0;
+	ane_fw_sys_record_reset(b);
+	/*
+	 * A quarantined engine that never came up has nothing to lose; give
+	 * back an ANE_SYS reference a failed power-up kept. After the program
+	 * stage, with hung_stop, the resume boots it cold again.
+	 */
+	if (b->stage == ANE_STAGE_QUARANTINED && !b->powered) {
+		if (b->power_ref) {
+			b->power_ref = false;
+			pm_runtime_put_sync(b->power);
+		}
+		if (b->program_ready && ane_t6021_hung_stop) {
+			ane_h16_session_sleep(&b->session, true);
+			b->sleep_quarantined = true;
+			b->slept = true;
+		}
+		return 0;
+	}
+	/*
+	 * Quarantined, or a session quarantined by a hung request: the state
+	 * was dumped when it was quarantined, and the firmware cannot be asked
+	 * for anything. Power it off without the firmware so that the system
+	 * can sleep. With hung_stop the resume boots it cold again; without,
+	 * a quarantined engine is kept until reboot.
+	 */
+	if (b->stage == ANE_STAGE_QUARANTINED ||
+	    (b->stage == ANE_STAGE_PROGRAM && b->session.quarantined && ane_t6021_hung_stop)) {
+		bool heal = b->program_ready && ane_t6021_hung_stop;
+
+		if (heal)
+			ane_h16_session_sleep(&b->session, true);
+		ret = ane_fw_power_down(b);
+		dev_info(&b->pdev->dev, "H17 ANE: quarantined engine powered off for system sleep (%d)\n",
+			 ret);
+		if (heal && !ret) {
+			b->sleep_quarantined = true;
+			b->slept = true;
+		} else if (heal) {
+			ane_h16_session_sleep(&b->session, false);
+		}
+		return ret;
+	}
+	if (b->stage != ANE_STAGE_PROGRAM)
+		return -EBUSY;
+	ane_h16_session_sleep(&b->session, true);
 	if (!ane_fw_sleep_warm(b)) {
 		ret = ane_fw_cold_cycle_down(b);
 		if (ret == -EBUSY) {
@@ -1142,6 +1387,7 @@ static void ane_fw_sleep_resume(struct ane_fw_backend *b)
 {
 	s64 ready, first;
 	u64 start;
+	bool warm;
 	int ret;
 
 	guard(mutex)(&b->lock);
@@ -1149,7 +1395,7 @@ static void ane_fw_sleep_resume(struct ane_fw_backend *b)
 		return;
 	b->slept = false;
 	/* Stay off until a request needs the engine, as macOS does. */
-	if (b->soc->macos_sleep && !b->session.quarantined) {
+	if (b->soc->macos_sleep && !b->session.quarantined && !b->sleep_quarantined) {
 		WRITE_ONCE(b->parked, true);
 		WRITE_ONCE(b->session.parked, true);
 		dev_info(&b->pdev->dev, "H17 ANE: resume ok: parked until the next request\n");
@@ -1159,8 +1405,10 @@ static void ane_fw_sleep_resume(struct ane_fw_backend *b)
 	b->resume_ready_ns = 0;
 	b->resume_first_ns = 0;
 	b->resume_replayed = 0;
-	ret = ane_fw_sleep_warm(b) ? ane_fw_warm_boot(b) : ane_fw_cold_cycle_boot(b);
-	if (ret && ane_fw_sleep_warm(b)) {
+	/* A quarantined engine went off without its firmware: only a cold boot. */
+	warm = ane_fw_sleep_warm(b) && !b->sleep_quarantined;
+	ret = warm ? ane_fw_warm_boot(b) : ane_fw_cold_cycle_boot(b);
+	if (ret && warm) {
 		/* Fall back to the cold cycle: off again, then boot from the preload. */
 		dev_warn(&b->pdev->dev, "H17 ANE: warm boot failed (%d); cold boot and program replay\n",
 			 ret);
@@ -1168,11 +1416,17 @@ static void ane_fw_sleep_resume(struct ane_fw_backend *b)
 		if (!ret)
 			ret = ane_fw_cold_cycle_boot(b);
 	}
+	if (ret)
+		ret = ane_fw_boot_retry(b, ret, "after system sleep");
 	if (ret) {
 		/* Every mapping and backing stays for diagnosis. */
 		ane_fw_quarantine(b, ret);
 		b->session.quarantined = true;
+	} else if (b->sleep_quarantined) {
+		b->recoveries++;
+		dev_info(&b->pdev->dev, "H17 ANE: quarantined engine recovered by system sleep\n");
 	}
+	b->sleep_quarantined = false;
 	ane_h16_session_sleep(&b->session, false);
 	/* genpd's record of the domain across this sleep (boot time, so it counts s2idle). */
 	if (!b->sys_offs || (b->sys_off_pmgr & 0xf0))
@@ -1200,6 +1454,7 @@ static int ane_fw_pm_event(struct notifier_block *nb, unsigned long event, void 
 
 	if (event == PM_POST_SUSPEND) {
 		ane_fw_sleep_resume(b);
+		WRITE_ONCE(b->recover_blocked, false);
 		WRITE_ONCE(b->in_sleep, false);
 		WRITE_ONCE(b->session.wake_blocked, false);
 		/* Requests that waited out the sleep now wake the parked engine. */
@@ -1209,10 +1464,14 @@ static int ane_fw_pm_event(struct notifier_block *nb, unsigned long event, void 
 	if (event == PM_SUSPEND_PREPARE) {
 		WRITE_ONCE(b->in_sleep, true);
 		WRITE_ONCE(b->session.wake_blocked, true);
+		/* A recovery under way finishes first; the sleep handles later ones. */
+		WRITE_ONCE(b->recover_blocked, true);
+		flush_work(&b->recover);
 	}
 	if (event == PM_SUSPEND_PREPARE && retained) {
 		if (!ane_fw_sleep_prepare(b))
 			return NOTIFY_DONE;
+		WRITE_ONCE(b->recover_blocked, false);
 		dev_warn_once(&b->pdev->dev, ANE_FW_SLEEP_REFUSED);
 		return NOTIFY_BAD;
 	}
@@ -1880,6 +2139,7 @@ static const struct ane_h16_session_ops ane_fw_session_ops = {
 	.sync = ane_fw_program_sync,
 	.busy = ane_fw_program_busy,
 	.wake = ane_fw_session_wake,
+	.hung = ane_fw_hung,
 };
 
 /*
@@ -1922,14 +2182,16 @@ static const struct file_operations ane_fw_execute_fops = {
 
 static void ane_fw_debugfs(struct ane_fw_backend *b)
 {
-	struct dentry *root = debugfs_lookup("ane-h17", NULL);
+	struct dentry *root = debugfs_lookup("ane-h17", NULL), *dir;
 	bool found = root;
 
 	if (!found)
 		root = debugfs_create_dir("ane-h17", NULL);
-	debugfs_create_file("execute", 0600,
-			    debugfs_create_dir(dev_name(&b->pdev->dev), root),
-			    &b->session, &ane_fw_execute_fops);
+	dir = debugfs_create_dir(dev_name(&b->pdev->dev), root);
+	debugfs_create_file("execute", 0600, dir, &b->session, &ane_fw_execute_fops);
+	debugfs_create_u64("recoveries", 0400, dir, &b->recoveries);
+	debugfs_create_u64("recover_failures", 0400, dir, &b->recover_failures);
+	debugfs_create_u32("boot_retries", 0400, dir, &b->boot_retries);
 	if (found)
 		dput(root);
 }
@@ -2013,6 +2275,7 @@ static int ane_fw_first_bringup(struct ane_fw_backend *b)
 	if (ret >= 0) {
 		b->transport.allow_free = true;
 		b->stage = ANE_STAGE_PROGRAM;
+		b->program_ready = true;
 		ret = 0;
 	} else {
 		b->session.quarantined = true;
@@ -2100,6 +2363,8 @@ static ssize_t ane_fw_stage_action(struct device *dev, const char *buf, size_t c
 	if (ret)
 		return ane_fw_quarantine(b, ret);
 	b->stage = next;
+	if (next == ANE_STAGE_PROGRAM)
+		b->program_ready = true;
 	return count;
 }
 
@@ -2356,6 +2621,7 @@ int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platfor
 	}
 	dev_info(&pdev->dev, "H17 ANE: loader hand-off verified; starting the engine\n");
 	INIT_WORK(&b->start, ane_fw_start_work);
+	INIT_WORK(&b->recover, ane_fw_recover_work);
 	return 0;
 fail:
 	ane_fw_observer_free(b);
@@ -2462,6 +2728,7 @@ bool ane_fw_staged_exit(void)
 	if (!b)
 		return false;
 	cancel_work_sync(&b->start);
+	cancel_work_sync(&b->recover);
 	/* A retained backend pins the module. No unload or in-place retry. */
 	if (WARN_ON(b->retained))
 		return true;
