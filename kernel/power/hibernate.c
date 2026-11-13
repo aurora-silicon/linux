@@ -138,6 +138,7 @@ bool hibernation_available(void)
 	return hibernation_generic_available() &&
 		!hibernation_platform_blocked();
 }
+EXPORT_SYMBOL_GPL(hibernation_available);
 
 static int __init hibernation_platform_report(void)
 {
