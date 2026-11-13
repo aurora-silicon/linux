@@ -83,6 +83,12 @@ int asahi_g17_pmp_request(struct device *dev, bool enable)
 	return ret;
 }
 
+/* Sleeps until the PMP has taken every held power state request, or -ETIMEDOUT. */
+int asahi_pmp_report_wait_handed(unsigned int timeout_ms)
+{
+	return apple_pmp_report_wait_handed(timeout_ms);
+}
+
 static bool asahi_g17_is_pwrstate(struct device_node *np)
 {
 	return of_device_is_compatible(np, "apple,t8103-pmgr-pwrstate") ||
