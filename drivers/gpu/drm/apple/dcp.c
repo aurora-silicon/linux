@@ -6179,6 +6179,40 @@ static bool dcp_v27_sleep_transport_supported(struct apple_dcp *dcp)
 }
 
 /*
+ * The M1/M2/M3 display processors share the T6050 firmware-27 wire generation.
+ * @compat_is answers whether a device node carries a compatible string, so the
+ * same list is used by probe and by the host test.
+ */
+bool dcp_refmac_v27_compat(dcp_compat_fn compat_is, const void *ctx)
+{
+	static const char * const compats[] = {
+		"apple,t8103-dcp",  "apple,t8103-dcpext",
+		"apple,t6000-dcp",  "apple,t6000-dcpext",
+		"apple,t8112-dcp",  "apple,t8112-dcpext",
+		"apple,t6020-dcp",  "apple,t6020-dcpext",
+		"apple,t8122-dcp",  "apple,t8122-dcpext",
+		"apple,t6030-dcp",  "apple,t6030-dcpext",
+		"apple,t6031-dcp",  "apple,t6031-dcpext",
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(compats); i++)
+		if (compat_is(ctx, compats[i]))
+			return true;
+	return false;
+}
+
+static bool dcp_node_compat_is(const void *np, const char *compat)
+{
+	return of_device_is_compatible(np, compat);
+}
+
+static bool dcp_node_is_refmac_v27(const struct device_node *np)
+{
+	return dcp_refmac_v27_compat(dcp_node_compat_is, np);
+}
+
+/*
  * Firmware 27, if firmware-compat @compat_str has a 27.x method table with an
  * ID for every method the driver calls: the firmware panics on an unknown tag.
  */
@@ -6234,6 +6268,19 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 		/* Checked by apple_t8122_dcp_v27_2(). */
 		dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
 		return dcp_v27_method_table(dev, compat_str);
+	}
+
+	/*
+	 * The M1/M2/M3 processors are one firmware-27 wire generation with the
+	 * T6050. On exact firmware-compat 27.2.0 they run that generation, so
+	 * admit it before the 14.7 board and special-profile paths below. The
+	 * older admissions stay in place for the firmware those boards still
+	 * boot.
+	 */
+	if (dcp_node_is_refmac_v27(dev->of_node)) {
+		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
+		if (ret >= 0 && !strcmp(compat_str, "27.2.0"))
+			return dcp_v27_method_table(dev, compat_str);
 	}
 
 	if (hw->firmware_compat == DCP_FIRMWARE_V_27_0) {
@@ -7994,6 +8041,15 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
 	    of_device_is_compatible(dev->of_node, "apple,t8142-dcp"))
 		dcp->hw.iomfb_method_profile = DCP_IOMFB_METHODS_DEFAULT;
+	/*
+	 * An M1/M2/M3 processor on firmware 27 inherits the live session the
+	 * boot loader handed over, like the T6050. Its match data keeps the
+	 * per-SoC port count, tunnel-flow flag and DART resources; only the
+	 * firmware-27 session adoption is version-selected here, before the
+	 * per-SoC firmware-27 profiles below, which may override it.
+	 */
+	if (fw_compat == DCP_FIRMWARE_V_27_0 && dcp_node_is_refmac_v27(dev->of_node))
+		dcp->hw.adopt_live_session = true;
 	/*
 	 * T6041 internal panel on firmware 27 adopts the running DCP session
 	 * with 41-bit firmware DMA addressing and no DPTX port services,
