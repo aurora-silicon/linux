@@ -279,6 +279,8 @@ struct apple_mbox_priv {
 	unsigned int rx_irq_empty_run;
 	/* rx_lock: an unpowered-PSD receive skip was logged this activation. */
 	bool rx_psd_skip_logged;
+	/* rx_lock: between suspend_noirq and resume_noirq, the registers may be off. */
+	bool rx_asleep;
 	struct delayed_work rx_poll_work;
 	/* Kick and fast tick write this lock-free; reads use READ_ONCE. */
 	ktime_t rx_fast_until;
@@ -892,6 +894,13 @@ static int apple_mbox_poll_locked(struct apple_mbox *mbox)
 
 	/* A stopped receiver may still have firmware traffic in its FIFO. */
 	if (!mbox->rx)
+		return 0;
+	/*
+	 * The receive pollers run from an unfreezable workqueue and a timer, so
+	 * they are still going in the noirq phase of a system sleep, after the
+	 * mailbox's power domain went off under a consumer that was active.
+	 */
+	if (apple_mbox_to_priv(mbox)->rx_asleep)
 		return 0;
 	if (mbox->hw->is_ascwrap_v8) {
 		struct apple_mbox_priv *priv = apple_mbox_to_priv(mbox);
@@ -2012,12 +2021,24 @@ MODULE_DEVICE_TABLE(of, apple_mbox_of_match);
  * keeps them in the FIFO until resume. The mailbox is a supplier of its
  * consumer, so this runs after the consumer suspended and before it resumes.
  */
+static void apple_mbox_set_rx_asleep(struct apple_mbox *mbox, bool asleep)
+{
+	unsigned long flags;
+
+	/* Under rx_lock: a poll in flight ends before the power domain goes off. */
+	spin_lock_irqsave(&mbox->rx_lock, flags);
+	apple_mbox_to_priv(mbox)->rx_asleep = asleep;
+	spin_unlock_irqrestore(&mbox->rx_lock, flags);
+}
+
 static int apple_mbox_suspend_noirq(struct device *dev)
 {
 	struct apple_mbox *mbox = dev_get_drvdata(dev);
 
 	if (mbox && mbox->hold_rx_in_sleep)
 		apple_mbox_hold_rx(mbox);
+	if (mbox && apple_mbox_has_rx_poller(mbox))
+		apple_mbox_set_rx_asleep(mbox, true);
 	return 0;
 }
 
@@ -2025,6 +2046,8 @@ static int apple_mbox_resume_noirq(struct device *dev)
 {
 	struct apple_mbox *mbox = dev_get_drvdata(dev);
 
+	if (mbox && apple_mbox_has_rx_poller(mbox))
+		apple_mbox_set_rx_asleep(mbox, false);
 	if (mbox && mbox->hold_rx_in_sleep)
 		apple_mbox_release_rx(mbox);
 	return 0;
