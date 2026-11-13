@@ -35,9 +35,11 @@
 #define IND_FILL		0xffff9500
 #define IND_EDGE		0xff000000
 #define IND_PRESENT_TIMEOUT	msecs_to_jiffies(1000)
+#define IND_OFF_RETRY		msecs_to_jiffies(50)
 
 static void dcp_indicator_watch(struct work_struct *work);
 static void dcp_indicator_resume(struct work_struct *work);
+static void dcp_indicator_off_retry(struct work_struct *work);
 
 int dcp_indicator_probe(struct apple_dcp *dcp)
 {
@@ -48,6 +50,7 @@ int dcp_indicator_probe(struct apple_dcp *dcp)
 	mutex_init(&ci->ctl);
 	INIT_DELAYED_WORK(&ci->watch, dcp_indicator_watch);
 	INIT_WORK(&ci->resume, dcp_indicator_resume);
+	INIT_DELAYED_WORK(&ci->off_retry, dcp_indicator_off_retry);
 
 	if (of_property_read_u32(dcp->dev->of_node, "apple,camera-indicator-surface", &surf))
 		return 0;
@@ -84,8 +87,9 @@ void dcp_indicator_release(struct apple_dcp *dcp)
 		if (fb)
 			drm_framebuffer_put(fb);
 	}
-	/* With no fb nothing queues them again, and both take ctl, so cancel after dropping it. */
+	/* With no fb nothing queues them again, and all take ctl, so cancel after dropping it. */
 	cancel_delayed_work_sync(&ci->watch);
+	cancel_delayed_work_sync(&ci->off_retry);
 	cancel_work_sync(&ci->resume);
 }
 
@@ -239,6 +243,41 @@ static void dcp_indicator_end(struct apple_dcp *dcp)
 }
 
 /*
+ * ctl held. The off commit is nonblocking, so a flip still pending on the CRTC
+ * refuses it. The square must still come off, so the refusal is retried from
+ * a work item until it lands, never by making the camera wait.
+ */
+static void dcp_indicator_off(struct apple_dcp *dcp)
+{
+	struct dcp_camera_indicator *ci = &dcp->camera_ind;
+	int ret = dcp_indicator_commit(dcp, false);
+
+	switch (dcp_ind_off_result(&ci->state, ret)) {
+	case DCP_IND_OFF_RETRY:
+		queue_delayed_work(system_percpu_wq, &ci->off_retry, IND_OFF_RETRY);
+		break;
+	case DCP_IND_OFF_FAILED:
+		dev_warn(dcp->dev, "camera indicator off commit failed: %d\n", ret);
+		break;
+	case DCP_IND_OFF_DONE:
+		break;
+	}
+}
+
+static void dcp_indicator_off_retry(struct work_struct *work)
+{
+	struct dcp_camera_indicator *ci =
+		container_of(work, struct dcp_camera_indicator, off_retry.work);
+	struct apple_dcp *dcp = container_of(ci, struct apple_dcp, camera_ind);
+
+	guard(mutex)(&ci->ctl);
+	/* A request made since, or the plane going away, ended the retry. */
+	if (!ci->state.off_pending || !ci->fb)
+		return;
+	dcp_indicator_off(dcp);
+}
+
+/*
  * One second after a request, a square that no present has carried to the
  * panel is withdrawn and said so. Nothing waits for this: the camera streams
  * from the moment set(true) returns.
@@ -264,7 +303,7 @@ static void dcp_indicator_watch(struct work_struct *work)
 	dev_warn(dcp->dev, "camera indicator not presented within %u ms, withdrawn\n",
 		 jiffies_to_msecs(IND_PRESENT_TIMEOUT));
 	dcp_indicator_end(dcp);
-	dcp_indicator_commit(dcp, false);
+	dcp_indicator_off(dcp);
 }
 
 /* ctl held. Commits the square and arms the watch that withdraws it if no present carries it. */
@@ -280,10 +319,10 @@ static int dcp_indicator_request(struct apple_dcp *dcp)
 	if (ret)
 		return ret;
 
+	/* A refused commit changed nothing on the plane, so there is no square to take off. */
 	ret = dcp_indicator_commit(dcp, true);
 	if (ret) {
 		dcp_indicator_end(dcp);
-		dcp_indicator_commit(dcp, false);
 		return ret;
 	}
 	ci->deadline = jiffies + IND_PRESENT_TIMEOUT;
@@ -315,14 +354,14 @@ static void dcp_indicator_resume(struct work_struct *work)
 /*
  * on: requests the square and returns 0 once the request is committed; the
  * present that carries it is confirmed, or withdrawn, within 1 s without
- * blocking the caller. An error means no indicator. off: always succeeds. The
- * caller streams either way.
+ * blocking the caller. An error means no indicator. off: always succeeds, and
+ * a commit refused for a pending flip is retried until it lands. The caller
+ * streams either way.
  */
 int apple_dcp_camera_indicator_set(struct device *dev, bool on)
 {
 	struct apple_dcp *dcp;
 	struct dcp_camera_indicator *ci;
-	int ret;
 
 	/* The device lock keeps the DCP bound, and its state alive, for the call. */
 	guard(device)(dev);
@@ -338,12 +377,8 @@ int apple_dcp_camera_indicator_set(struct device *dev, bool on)
 	if (!on) {
 		cancel_delayed_work(&ci->watch);
 		dcp_indicator_end(dcp);
-		if (ci->fb) {
-			ret = dcp_indicator_commit(dcp, false);
-			if (ret)
-				dev_warn(dcp->dev, "camera indicator off commit failed: %d\n",
-					 ret);
-		}
+		if (ci->fb)
+			dcp_indicator_off(dcp);
 		return 0;
 	}
 	if (!ci->fb)
@@ -357,14 +392,13 @@ void dcp_indicator_swap_done(struct apple_dcp *dcp, struct drm_framebuffer *slot
 {
 	struct dcp_camera_indicator *ci = &dcp->camera_ind;
 	unsigned long flags;
-	bool resume;
 
 	if (!ci->has_surf)
 		return;
 	spin_lock_irqsave(&ci->lock, flags);
 	dcp_ind_present_done(&ci->state, slot_fb && slot_fb == ci->fb);
-	resume = ci->fb && dcp_ind_wants_resume(&ci->state);
-	spin_unlock_irqrestore(&ci->lock, flags);
-	if (resume)
+	/* Queued under the lock: release drops the fb under it, so no work is queued after it. */
+	if (ci->fb && dcp_ind_wants_resume(&ci->state))
 		schedule_work(&ci->resume);
+	spin_unlock_irqrestore(&ci->lock, flags);
 }
