@@ -386,19 +386,20 @@ impl job::Backend for Backend {
             .any(|other| other.owner() != Some(self.owner) && other.long_job_running())
     }
 
-    fn defer_timeout(&self, packet: &Arc<Packet>, renewals: u8) -> bool {
+    fn defer_timeout(&self, packet: &Arc<Packet>, renewals: u8, excused: u32)
+        -> crate::g17::timeout::Decision {
         if packet.engine() == Engine::Compute {
-            return self.defer_compute_timeout(packet, renewals);
+            return self.defer_compute_timeout(packet, renewals, excused);
         }
         use crate::g17::timeout::{self, Decision};
         // As for compute, a final retirement pass precedes the attribution, and all completion
         // callbacks run after releasing the device mutex. Without a collector the attribution
         // goes ahead without that pass, as it did before it existed.
         let mut deferred = DeferredBatch::worker().ok();
-        let result = (|| -> Result<bool> {
+        let result = (|| -> Result<Decision> {
             let mut state = self.shared.state.lock();
             let Some(firmware) = (*state).as_deref_mut() else {
-                return Ok(false);
+                return Ok(Decision::Own);
             };
             if let Some(deferred) = deferred.as_mut() {
                 firmware.scan_renders(deferred)?;
@@ -409,15 +410,17 @@ impl job::Backend for Backend {
                         "Render watchdog owner={} behind its context's older node {:#x} (own {:#x}); the firmware progresses: renewed\n",
                         self.owner, older, own);
                 }
-                return Ok(true);
+                return Ok(Decision::Defer);
             }
             // Borrowed-graph and queued-retirement deferrals share the renewal bound.
             if timeout::transaction_grace(renewals)
                 && firmware.queues.defer_render_timeout(packet, ETIMEDOUT)
             {
-                return Ok(true);
+                return Ok(Decision::Defer);
             }
-            let verdict = firmware.queues.render_timeout_decision(packet, renewals);
+            let excuse = timeout::Excuse { used: excused, limit: timeout::excuse_limit(
+                crate::module_parameters::compute_timeout_max_ms.value()) };
+            let verdict = firmware.queues.render_timeout_decision(packet, renewals, excuse);
             let decision = verdict.map_or(Decision::Own, |verdict| verdict.decision);
             // As compute does: work still blocked behind another VM's older unfinished work
             // after the whole grace is innocent, so its failure must stay non-sticky. The pair's
@@ -426,19 +429,20 @@ impl job::Backend for Backend {
                 packet.completion.classify(crate::g17::recovery::Class::Spared);
             }
             if let Some(verdict) = verdict {
-                if let Some(blocker) = verdict.reported_blocker(renewals) {
+                if let Some(blocker) = verdict.reported_blocker(renewals, excuse) {
                     dev_warn!(self.shared.dev.as_ref(),
-                        "Render watchdog owner={} vm={} publication={} renewals={} decision={:?} behind earlier work of another VM: blocker_vm={} blocker_publication={} blocker_failed={}\n",
-                        self.owner, verdict.own.vm, verdict.own.published, renewals, decision,
-                        blocker.vm, blocker.published, u8::from(blocker.failed));
+                        "Render watchdog owner={} vm={} publication={} renewals={} excused={} decision={:?} behind earlier work of another VM: blocker_vm={} blocker_publication={} blocker_failed={} blocker_in_allowance={}\n",
+                        self.owner, verdict.own.vm, verdict.own.published, renewals, excused,
+                        decision, blocker.vm, blocker.published, u8::from(blocker.failed),
+                        u8::from(blocker.excused));
                 }
             }
-            Ok(decision == Decision::Defer)
+            Ok(decision)
         })();
         if let Some(deferred) = deferred.as_mut() {
             deferred.finish();
         }
-        matches!(result, Ok(true))
+        result.unwrap_or(Decision::Own)
     }
 
     fn try_early(&self, packet: &Arc<Packet>) -> bool {
