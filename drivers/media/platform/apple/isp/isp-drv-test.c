@@ -153,3 +153,29 @@ static struct kunit_suite isp_hw_test_suite = {
 };
 
 kunit_test_suite(isp_hw_test_suite);
+
+/*
+ * 27.2 prints its own string and, like every firmware from 13.5 on, selects
+ * the 64-bit set-file record: isp_cmd_ch_set_file_load() keys that choice on
+ * fw_compat >= ISP_FIRMWARE_V_13_5, so the enum must keep 27.2 above 13.5.
+ * UNKNOWN sorts below 13.5 and would wrongly pick the 12.x 32-bit record.
+ */
+static void isp_test_fw_version_27_2(struct kunit *test)
+{
+	KUNIT_EXPECT_STREQ(test, isp_fw2str(ISP_FIRMWARE_V_27_2), "27.2");
+	KUNIT_EXPECT_GT(test, (int)ISP_FIRMWARE_V_27_2, (int)ISP_FIRMWARE_V_13_5);
+	KUNIT_EXPECT_GT(test, (int)ISP_FIRMWARE_V_27_2, (int)ISP_FIRMWARE_V_26_6_2);
+	KUNIT_EXPECT_GT(test, (int)ISP_FIRMWARE_V_13_5, (int)ISP_FIRMWARE_V_UNKNOWN);
+}
+
+static struct kunit_case isp_fwver_test_cases[] = {
+	KUNIT_CASE(isp_test_fw_version_27_2),
+	{}
+};
+
+static struct kunit_suite isp_fwver_test_suite = {
+	.name = "apple-isp-fwver",
+	.test_cases = isp_fwver_test_cases,
+};
+
+kunit_test_suite(isp_fwver_test_suite);
