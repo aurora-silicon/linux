@@ -2566,6 +2566,11 @@ impl Vm {
         self.id
     }
 
+    /// Created by an M5 GPU's UAT ([`Uat::is_m5`]).
+    pub(crate) fn is_m5(&self) -> bool {
+        self.m5
+    }
+
     /// Copies `buf.len()` bytes of GPU-readable memory at `va` of this VM into `buf`, for admission
     /// checks of streams the GPU will execute (G15 stream gates).
     ///
