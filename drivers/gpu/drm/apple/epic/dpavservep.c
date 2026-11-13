@@ -11,6 +11,7 @@
 
 #include <linux/completion.h>
 #include <linux/device.h>
+#include <linux/gpio/consumer.h>
 #include <linux/types.h>
 #include <linux/unaligned.h>
 
@@ -25,7 +26,7 @@ static void dcpavserv_notify_edid(struct apple_epic_service *service)
 	struct apple_dcp *dcp = service->ep->dcp;
 	struct apple_connector *connector = READ_ONCE(dcp->connector);
 
-	if (!service->ep->wire_v2 || READ_ONCE(dcp->quiescing) || !connector ||
+	if (READ_ONCE(dcp->quiescing) || !connector ||
 	    !READ_ONCE(dcp->nr_modes) || !READ_ONCE(connector->connected) ||
 	    READ_ONCE(connector->base.registration_state) != DRM_CONNECTOR_REGISTERED ||
 	    READ_ONCE(connector->dcp) != to_platform_device(dcp->dev))
@@ -110,6 +111,7 @@ static void dcpavserv_init(struct apple_epic_service *service, const char *name,
 	struct apple_dcp *dcp = service->ep->dcp;
 	bool v2 = service->ep->wire_v2;
 	bool published = false;
+	bool late = false;
 
 	trace_dcpavserv_init(dcp, unit);
 	if (v2)
@@ -129,6 +131,8 @@ static void dcpavserv_init(struct apple_epic_service *service, const char *name,
 			service->cookie = &dcp->dcpavserv;
 			complete(&dcp->dcpavserv.enable_completion);
 			published = true;
+			late = dcp->dcpavserv.late_notify;
+			dcp->dcpavserv.late_notify = false;
 		}
 	}
 	mutex_unlock(&dcp->dcpavserv.lock);
@@ -146,6 +150,8 @@ static void dcpavserv_init(struct apple_epic_service *service, const char *name,
 	} else {
 		/* Also report announcements arriving after the discovery window. */
 		dev_dbg(dcp->dev, "DCPAVSERV: legacy EDID service published\n");
+		if (late)
+			dcpavserv_notify_edid(service);
 	}
 }
 
@@ -759,6 +765,14 @@ static const struct apple_epic_service_ops dpavservep_ops[] = {
 	{},
 };
 
+/* A sink that get_modes could read an EDID from as soon as the processor is up. */
+static bool dpavserv_sink_at_startup(struct apple_dcp *dcp)
+{
+	if (READ_ONCE(dcp->active_typec_route) || READ_ONCE(dcp->typec_cable_connected))
+		return true;
+	return dcp->hdmi_hpd && gpiod_get_value_cansleep(dcp->hdmi_hpd) > 0;
+}
+
 int dpavservep_init(struct apple_dcp *dcp)
 {
 	struct apple_dcp_afkep *ep;
@@ -793,11 +807,21 @@ int dpavservep_init(struct apple_dcp *dcp)
 		return 0;
 
 	/*
-	 * Legacy firmware need not announce an EDID service. Give it the same
-	 * discovery window so an early announcement can precede get_modes,
-	 * but absence is not an endpoint failure.
+	 * Legacy firmware need not announce an EDID service. With a sink present
+	 * at startup, give it a discovery window so an early announcement can
+	 * precede get_modes, but absence is not an endpoint failure. Without a
+	 * sink there is no EDID to read yet: a later announcement re-probes a
+	 * connected sink through dcpavserv_notify_edid(), so do not hold the
+	 * processor's start (and the display driver's registration) for it.
 	 * Only dcpavserv_init() may publish a service that actually arrived.
 	 */
+	if (!dpavserv_sink_at_startup(dcp)) {
+		mutex_lock(&dcp->dcpavserv.lock);
+		dcp->dcpavserv.late_notify = !dcp->dcpavserv.enabled;
+		mutex_unlock(&dcp->dcpavserv.lock);
+		dev_dbg(dcp->dev, "DCPAVSERV: no sink at startup, no discovery wait\n");
+		return 0;
+	}
 	if (!wait_for_completion_timeout(&dcp->dcpavserv.enable_completion,
 					 msecs_to_jiffies(1000)))
 		dev_dbg(dcp->dev, "DCPAVSERV: no legacy EDID service within 1 s\n");
