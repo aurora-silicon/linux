@@ -26,6 +26,7 @@
 //! 0x05  2412     0           after pairing (21 + 2391-byte manifest)
 //! 0x14  60       0           enabling the accessory for Touch ID
 //! 0x09  17       0           link down / link up
+//! 0x08  16       0           finalising a detach the grace period ended
 //! 0x0b  0        20          paired list, one accessory
 //! 0x04  16       0           forgetting the accessory
 //! 0x06  81       69 + 159    per-connection session, first half
@@ -62,6 +63,8 @@ pub(crate) enum Op {
     SessionBegin = 0x06,
     /// Finishes a per-connection session with the accessory's material.
     SessionFinish = 0x07,
+    /// Finalises a detach once the grace period has ended.
+    Finalize = 0x08,
     /// Tells the enclave the accessory's link went down or came back.
     ConnectionState = 0x09,
     /// Lists the paired accessories.
@@ -125,6 +128,8 @@ pub(crate) const MANIFEST_FIXED: usize = ACCESSORY_ID_LEN + 1 + WORD;
 
 pub(crate) const CONNECTION_STATE_REQUEST_LEN: usize = ACCESSORY_ID_LEN + 1;
 
+pub(crate) const FINALIZE_REQUEST_LEN: usize = ACCESSORY_ID_LEN;
+
 pub(crate) const UNPAIR_REQUEST_LEN: usize = ACCESSORY_ID_LEN;
 
 pub(crate) const SESSION_BEGIN_REQUEST_LEN: usize = ACCESSORY_ID_LEN + PUBLIC_POINT_LEN;
@@ -145,6 +150,7 @@ static_assert!(PAIRING_BEGIN_REQUEST_LEN == 146);
 static_assert!(PAIRING_FINISH_FIXED + 1994 == 3619);
 static_assert!(MANIFEST_FIXED + 2391 == 2412);
 static_assert!(CONNECTION_STATE_REQUEST_LEN == 17);
+static_assert!(FINALIZE_REQUEST_LEN == 16);
 static_assert!(UNPAIR_REQUEST_LEN == 16);
 static_assert!(SESSION_BEGIN_REQUEST_LEN == 81);
 static_assert!(SESSION_BEGIN_REPLY_FIXED + 159 == 228);
@@ -317,6 +323,12 @@ pub(crate) fn connection_state_request(
     out
 }
 
+/// Finalises a detach once the grace period has ended: the accessory's
+/// identity, nothing more.
+pub(crate) fn finalize_request(id: &AccessoryId) -> [u8; FINALIZE_REQUEST_LEN] {
+    id.0
+}
+
 pub(crate) fn unpair_request(id: &AccessoryId) -> [u8; UNPAIR_REQUEST_LEN] {
     id.0
 }
@@ -434,6 +446,7 @@ mod tests {
         assert_eq!(Op::Manifest.opcode(), 0x05);
         assert_eq!(Op::SessionBegin.opcode(), 0x06);
         assert_eq!(Op::SessionFinish.opcode(), 0x07);
+        assert_eq!(Op::Finalize.opcode(), 0x08);
         assert_eq!(Op::ConnectionState.opcode(), 0x09);
         assert_eq!(Op::PairedList.opcode(), 0x0b);
         assert_eq!(Op::PowerState.opcode(), crate::stac::OP_POWER_STATE);
@@ -581,6 +594,13 @@ mod tests {
         assert!(authorize_request(501, &ID, &[], &[]).is_err());
         assert!(authorize_request(501, &ID, &[0; 33], &[]).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn finalize_is_the_identity() {
+        let req = finalize_request(&ID);
+        assert_eq!(req.len(), 16);
+        assert_eq!(req, ID.0);
     }
 
     #[test]

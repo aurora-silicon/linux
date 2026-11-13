@@ -19,7 +19,7 @@
 use kernel::prelude::*;
 
 use crate::stac_ops::{ACCESSORY_ATTESTATION_SLOT, ACCESSORY_CERTIFICATE_MAX, MANIFEST_MAX};
-use crate::stac_ops::{PublicPoint, PUBLIC_POINT_LEN, WORD};
+use crate::stac_ops::{PublicPoint, PUBLIC_POINT_LEN, SESSION_MATERIAL_SLOT, WORD};
 
 /// Feature reports the host writes.
 pub(crate) mod cmd {
@@ -37,6 +37,11 @@ pub(crate) mod cmd {
     pub(crate) const HOST_OBJECT: u8 = 0x6b;
     /// The host object and the enclave's ephemeral point (step 7).
     pub(crate) const PAIRING_FINISH: u8 = 0x61;
+    /// Asks for the keyboard's session ephemeral point (session step 3). The
+    /// same report as [`PAIRING_EPHEMERAL`], a different body; kept apart.
+    pub(crate) const SESSION_EPHEMERAL: u8 = 0x66;
+    /// The host session material from the enclave (session step 5).
+    pub(crate) const SESSION_MATERIAL: u8 = 0x62;
 }
 
 /// Feature reports the host reads.
@@ -52,6 +57,11 @@ pub(crate) mod reply {
     pub(crate) const ACCESSORY_MATERIAL: u8 = 0x43;
     pub(crate) const PAIRING_EPHEMERAL: u8 = 0x47;
     pub(crate) const HOST_OBJECT: u8 = 0x49;
+    /// The keyboard's session ephemeral point (session step 3). The same
+    /// report as [`PAIRING_EPHEMERAL`], a different exchange; kept apart.
+    pub(crate) const SESSION_EPHEMERAL: u8 = 0x47;
+    /// The keyboard's session material (session step 5).
+    pub(crate) const SESSION_MATERIAL: u8 = 0x46;
 }
 
 /// Kinds of fragmented objects.
@@ -82,6 +92,11 @@ pub(crate) const PAIRING_CHECK_REPLY_LEN: usize = 1 + WORD + 3;
 /// fixed slot, then the certificate in a length-prefixed fixed slot.
 pub(crate) const MATERIAL_REPLY_LEN: usize =
     REPLY_HEADER_LEN + WORD + ACCESSORY_ATTESTATION_SLOT + WORD + ACCESSORY_CERTIFICATE_MAX;
+/// The session material: the header, then the accessory's session material in
+/// one length-prefixed fixed slot. Unlike the pairing material it carries no
+/// certificate.
+pub(crate) const SESSION_MATERIAL_REPLY_LEN: usize =
+    REPLY_HEADER_LEN + WORD + SESSION_MATERIAL_SLOT;
 /// The buffer for the manifest read: `[id][u32 length][manifest]`.
 pub(crate) const MANIFEST_READ_LEN: usize = 1 + WORD + MANIFEST_MAX;
 
@@ -93,6 +108,7 @@ static_assert!(FRAGMENT_CHUNK_MAX == 512);
 static_assert!(POINT_REPLY_LEN == 74);
 static_assert!(PAIRING_CHECK_REPLY_LEN == 8);
 static_assert!(MATERIAL_REPLY_LEN == 3601);
+static_assert!(SESSION_MATERIAL_REPLY_LEN == 1549);
 static_assert!(1 + WORD + 133 == 138);
 
 /// Why a keyboard reply or an object was not taken.
@@ -259,6 +275,24 @@ pub(crate) fn parse_material(report: &[u8]) -> core::result::Result<Material, Wi
         attestation: a + WORD..a + WORD + alen,
         certificate: c + WORD..c + WORD + clen,
     })
+}
+
+/// Where the keyboard's session material sits in its reply (session step 5):
+/// one length-prefixed slot after the header. The material is opaque; the
+/// host only hands it on to the enclave (0x07).
+pub(crate) fn parse_session_material(
+    report: &[u8],
+) -> core::result::Result<core::ops::Range<usize>, WireError> {
+    check_reply(report, reply::SESSION_MATERIAL, 5)?;
+    if report.len() != SESSION_MATERIAL_REPLY_LEN {
+        return Err(WireError::Length);
+    }
+    let m = REPLY_HEADER_LEN;
+    let mlen = le32(report, m)?;
+    if mlen == 0 || mlen > SESSION_MATERIAL_SLOT {
+        return Err(WireError::Field);
+    }
+    Ok(m + WORD..m + WORD + mlen)
 }
 
 /// The manifest read: `[id][u32 length][manifest]`, `n` bytes received.
@@ -477,6 +511,64 @@ mod tests {
         assert_eq!(parse_material(&material(1537, 10)), Err(WireError::Field));
         assert_eq!(parse_material(&material(10, 2049)), Err(WireError::Field));
         assert_eq!(parse_material(&r[..3600]), Err(WireError::Length));
+    }
+
+    // The session ephemeral command (session step 3): report 0x66, body the
+    // single word 4; and the session material command (step 5): report 0x62.
+    #[test]
+    fn the_session_commands_carry_their_bodies() {
+        let eph = command(cmd::SESSION_EPHEMERAL, 3, &4u32.to_le_bytes()).unwrap();
+        assert_eq!(eph.len(), 1 + WORD + WORD);
+        assert_eq!(eph[0], 0x66);
+        assert_eq!(word_at(&eph, 1), 3);
+        assert_eq!(word_at(&eph, 5), 4);
+        let mat = command(cmd::SESSION_MATERIAL, 5, &[0x7b; 159]).unwrap();
+        assert_eq!(mat.len(), 1 + WORD + 159);
+        assert_eq!(mat[0], 0x62);
+        assert_eq!(word_at(&mat, 1), 5);
+        assert!(mat[5..].iter().all(|&b| b == 0x7b));
+    }
+
+    // The session ephemeral reply (session step 3) is a point reply like the
+    // identity's, under the session report ID.
+    #[test]
+    fn the_session_ephemeral_is_a_point_reply() {
+        let mut point = [0x22u8; PUBLIC_POINT_LEN];
+        point[0] = 0x04;
+        let r = reply_of(reply::SESSION_EPHEMERAL, 3, 0, &point);
+        assert_eq!(r.len(), 74);
+        assert_eq!(parse_point_reply(&r, reply::SESSION_EPHEMERAL, 3).unwrap().0, point);
+        assert_eq!(parse_point_reply(&r, reply::IDENTITY, 3), Err(WireError::Id));
+    }
+
+    fn session_material(mlen: u32) -> KVec<u8> {
+        let mut r = reply_of(reply::SESSION_MATERIAL, 5, 0, &[]);
+        r.extend_from_slice(&mlen.to_le_bytes(), GFP_KERNEL).unwrap();
+        r.resize(SESSION_MATERIAL_REPLY_LEN, 0xb6, GFP_KERNEL).unwrap();
+        r
+    }
+
+    #[test]
+    fn the_session_material_reply_has_one_bounded_slot() {
+        let r = session_material(979);
+        let m = parse_session_material(&r).unwrap();
+        assert_eq!(m, 13..992);
+        // Together with the identity and the length word it makes the
+        // 1556-byte session finish request of the recording.
+        assert_eq!(
+            crate::stac_ops::ACCESSORY_ID_LEN + WORD + crate::stac_ops::SESSION_MATERIAL_SLOT,
+            1556
+        );
+        assert_eq!(parse_session_material(&session_material(0)), Err(WireError::Field));
+        assert_eq!(parse_session_material(&session_material(1537)), Err(WireError::Field));
+        assert_eq!(parse_session_material(&r[..1548]), Err(WireError::Length));
+        // The wrong report ID or step is refused.
+        let mut bad = session_material(979);
+        bad[0] = reply::ACCESSORY_MATERIAL;
+        assert_eq!(parse_session_material(&bad), Err(WireError::Id));
+        let mut bad = session_material(979);
+        bad[1] = 7;
+        assert_eq!(parse_session_material(&bad), Err(WireError::Step));
     }
 
     #[test]

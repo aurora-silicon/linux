@@ -832,6 +832,11 @@ struct SepData {
     stac_named: Atomic<bool>,
     stac_layout: Atomic<u32>,
     stac_absent_logged: Atomic<bool>,
+    // The per-connection session relay (see `stac_client`) is gated behind the
+    // write-only `ta_session` parameter: off until root writes 1, so by
+    // default the client only reads and holds the session, connection-state
+    // and detach-finalise steps.
+    stac_ta_session: Atomic<bool>,
 
     // The boot-policy endpoint (see `pnon`): its buffers, its one
     // exchange, and what discovery said about it.
@@ -1246,6 +1251,7 @@ impl SepData {
                 stac_named: Atomic::new(false),
                 stac_layout: Atomic::new(0),
                 stac_absent_logged: Atomic::new(false),
+                stac_ta_session: Atomic::new(false),
                 ool_pnon <- new_mutex!(Some(ool_pnon)),
                 pnon_rx <- new_mutex!(pnon::Exchange::new()),
                 pnon_wq <- new_condvar!("SepData::pnon_wq"),

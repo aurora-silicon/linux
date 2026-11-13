@@ -26,6 +26,15 @@
 //! object. It is checked against the enclave's object before anything is
 //! written to the keyboard.
 //!
+//! A per-connection session runs only when root writes 1 to the module's
+//! `ta_session` parameter, and only for a keyboard the enclave reports paired
+//! whose connection is new to the enclave. It confirms the pairing, hands the
+//! enclave the manifest as on a reconnection and relays the two session halves
+//! (0x06, 0x07) with the keyboard's session ephemeral point and material in
+//! between (see `stac_ta_wire.rs`). Once on, the connection-state (0x09) and
+//! detach-finalise (0x08) steps the lifecycle asks for run too; without it they
+//! stay held, as before. The pairing path (`ta_pair`) is untouched.
+//!
 //! The identity, the nonce and anything else the keyboard answers are never
 //! logged.
 
@@ -43,6 +52,7 @@ type AttachFn = unsafe extern "C" fn(*mut c_void);
 type IdentifiedFn = unsafe extern "C" fn(*mut c_void, *const u8, *const u8);
 type FailedFn = unsafe extern "C" fn(*mut c_void, c_int);
 type PairFn = unsafe extern "C" fn(*mut c_void) -> c_int;
+type SessionFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 
 /// The Mac's host certificate chain for keyboard pairing (two DER
 /// certificates), installed per machine with the other Apple data.
@@ -60,6 +70,7 @@ extern "C" {
         identified: IdentifiedFn,
         failed: FailedFn,
         pair: PairFn,
+        session: SessionFn,
     ) -> c_int;
     fn sep_stac_ta_unregister();
     fn sep_stac_ta_identify();
@@ -105,6 +116,17 @@ pub(crate) fn runs_read_only(action: &Action) -> bool {
     matches!(action, Action::Identify | Action::QueryPairing(_))
 }
 
+/// Whether the session relay runs `action` once the `ta_session` parameter has
+/// enabled it: the per-connection session and the connection-state and
+/// detach-finalise operations it leads to. A pairing (`NeedsPairing`) still
+/// only runs through `ta_pair`; the timers and readiness are the caller's.
+fn runs_with_session(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::BeginSession(_) | Action::ConnectionState(..) | Action::FinalizeDetach(_)
+    )
+}
+
 /// The registration with `hid-apple-ta`; holds the context alive until the
 /// shim has dropped it.
 pub(crate) struct Client {
@@ -124,6 +146,7 @@ impl Client {
                 identified,
                 failed,
                 pair,
+                session,
             )
         };
         if ret != 0 {
@@ -208,6 +231,18 @@ unsafe extern "C" fn pair(ctx: *mut c_void) -> c_int {
     }
 }
 
+/// # Safety
+/// As for [`pair`]; called with the shim's client lock held and a keyboard
+/// attached, from the writer of the `ta_session` parameter.
+unsafe extern "C" fn session(ctx: *mut c_void) -> c_int {
+    // SAFETY: guaranteed by the registration.
+    let sep = unsafe { &*ctx.cast::<SepData>() };
+    match sep.stac_ta_session() {
+        Ok(()) => 0,
+        Err(e) => e.to_errno(),
+    }
+}
+
 /// Where a pairing stopped, for the log (the fields are read through
 /// `Debug`).
 #[derive(Clone, Copy, Debug)]
@@ -227,6 +262,24 @@ enum PairStop {
     Transport(u32, i32),
     /// The keyboard already holds a pairing with this host the enclave lacks.
     KeyboardPaired,
+    /// The enclave refused or did not answer an operation.
+    Enclave(u16),
+}
+
+/// Where a per-connection session stopped, for the log (the fields are read
+/// through `Debug`).
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+enum SessionStop {
+    /// The keyboard's tag or version is not the one this relay speaks.
+    Version,
+    /// The keyboard did not answer, or its answer did not check out.
+    Keyboard(u32, WireError),
+    /// The keyboard could not be written or read.
+    Transport(u32, i32),
+    /// The enclave reports the keyboard unpaired, or the keyboard's
+    /// pairing-state check does not agree: there is no session to open.
+    NotPaired,
     /// The enclave refused or did not answer an operation.
     Enclave(u16),
 }
@@ -404,6 +457,183 @@ impl SepData {
         Ok(id)
     }
 
+    /// Turns the per-connection session on and runs it for the attached
+    /// keyboard. Runs only from the `ta_session` trigger, for a keyboard the
+    /// enclave reports paired whose connection is new to the enclave. Once on,
+    /// the connection-state and detach-finalise steps the lifecycle asks for
+    /// run too, through [`stac_ta_run`](Self::stac_ta_run).
+    fn stac_ta_session(&self) -> Result<()> {
+        if self.shutting_down.load(Relaxed) {
+            return Err(ENODEV);
+        }
+        let state = self.stac_lc.lock().state();
+        if state != State::Session {
+            dev_info!(
+                self.dev,
+                "stac: session not started: keyboard {:?}, no session wanted\n",
+                state
+            );
+            return Err(EBUSY);
+        }
+        // From now on the session, connection-state and detach-finalise steps
+        // run rather than being held.
+        self.stac_ta_session.store(true, Relaxed);
+        dev_info!(self.dev, "stac: running the per-connection session\n");
+        match self.stac_ta_session_steps() {
+            Ok(()) => {
+                // The lifecycle takes it from here (connection state 1).
+                self.stac_ta_event(Event::SessionReady);
+                Ok(())
+            }
+            Err(stop) => {
+                dev_info!(self.dev, "stac: session stopped: {:?}\n", stop);
+                self.stac_ta_event(Event::Failed);
+                Err(match stop {
+                    SessionStop::Transport(_, e) => Error::from_errno(e),
+                    _ => EPROTO,
+                })
+            }
+        }
+    }
+
+    fn stac_session_body(
+        &self,
+        op: stac_ops::Op,
+        req: &[u8],
+        max: usize,
+    ) -> core::result::Result<KVec<u8>, SessionStop> {
+        match self.stac_call(op.opcode(), req, max) {
+            Ok(crate::stac::Reply::Body(b)) => Ok(b),
+            _ => Err(SessionStop::Enclave(op.opcode())),
+        }
+    }
+
+    /// The session exchange, mirroring a macOS session after the keyboard came
+    /// back on its connection: confirm paired, hand the enclave the manifest
+    /// with `after_pairing` clear, then the two session halves (0x06, 0x07)
+    /// with the keyboard's session ephemeral point and material in between.
+    fn stac_ta_session_steps(&self) -> core::result::Result<(), SessionStop> {
+        use stac_ops::Op;
+        let kb = |step: u32, e: WireError| SessionStop::Keyboard(step, e);
+        let io = |step: u32, e: i32| SessionStop::Transport(step, e);
+
+        // The enclave's host object the keyboard checks it against: read it
+        // first, as a pairing does, before anything is written to the keyboard.
+        let host = self.stac_session_body(Op::HostAttestationObject, &[], stac_ops::HOST_OBJECT_REPLY_LEN)?;
+        stac_ops::parse_host_object_len(&host).map_err(|_| SessionStop::Enclave(Op::HostAttestationObject.opcode()))?;
+
+        // Tag, version echo, identity, identity point, nonce: the same opening
+        // the pairing uses, so the keyboard is the one this relay speaks to.
+        let tag = ta_read(0x4b, 9).map_err(|e| io(0, e))?;
+        if tag.len() != 9 || tag[1..] != wire::VERSION_BODY[..] {
+            return Err(SessionStop::Version);
+        }
+        ta_command(&wire::version_report(), 0, 0, 0).map_err(|e| io(0, e))?;
+        let uid = ta_read(0x41, 1 + ACCESSORY_ID_LEN).map_err(|e| io(0, e))?;
+        if uid.len() != 1 + ACCESSORY_ID_LEN {
+            return Err(kb(0, WireError::Length));
+        }
+        let mut id = AccessoryId([0; ACCESSORY_ID_LEN]);
+        id.0.copy_from_slice(&uid[1..]);
+        let c = wire::command(wire::cmd::IDENTITY, 1, &[]).map_err(|_| io(1, -12))?;
+        let r = ta_command(&c, wire::reply::IDENTITY, wire::POINT_REPLY_LEN, REPLY_MS).map_err(|e| io(1, e))?;
+        wire::parse_point_reply(&r, wire::reply::IDENTITY, 1).map_err(|e| kb(1, e))?;
+        ta_read(0x4c, 1 + NONCE_LEN).map_err(|e| io(1, e))?;
+
+        // Confirm paired, both at the enclave (0x02) and at the keyboard
+        // (SET 0x60 -> IN 0x42): a session only opens on a paired keyboard.
+        match self.stac_query_pairing(&id) {
+            Query::State(s) if s.paired => {}
+            _ => return Err(SessionStop::NotPaired),
+        }
+        let c = wire::command(wire::cmd::PAIRING_CHECK, 2, &host).map_err(|_| io(2, -12))?;
+        let r = ta_command(&c, wire::reply::PAIRING_CHECK, wire::PAIRING_CHECK_REPLY_LEN, REPLY_MS)
+            .map_err(|e| io(2, e))?;
+        if !wire::parse_pairing_check(&r).map_err(|e| kb(2, e))? {
+            return Err(SessionStop::NotPaired);
+        }
+
+        // The manifest, handed to the enclave as on a reconnection (not a
+        // pairing): `after_pairing` clear.
+        let r = ta_read(wire::get::MANIFEST, wire::MANIFEST_READ_LEN).map_err(|e| io(2, e))?;
+        let manifest = wire::parse_manifest(&r).map_err(|e| kb(2, e))?;
+        let req = stac_ops::manifest_request(&id, false, manifest).map_err(|_| io(2, -22))?;
+        let body = self.stac_session_body(Op::Manifest, &req, 0)?;
+        stac_ops::expect_empty(&body).map_err(|_| SessionStop::Enclave(Op::Manifest.opcode()))?;
+
+        // Session step 3: the keyboard's session ephemeral point, then 0x06.
+        let c = wire::command(wire::cmd::SESSION_EPHEMERAL, 3, &4u32.to_le_bytes()).map_err(|_| io(3, -12))?;
+        let r = ta_command(&c, wire::reply::SESSION_EPHEMERAL, wire::POINT_REPLY_LEN, REPLY_MS)
+            .map_err(|e| io(3, e))?;
+        let eph = wire::parse_point_reply(&r, wire::reply::SESSION_EPHEMERAL, 3).map_err(|e| kb(3, e))?;
+        let begin = self.stac_session_body(
+            Op::SessionBegin,
+            &stac_ops::session_begin_request(&id, &eph),
+            stac_ops::SESSION_BEGIN_REPLY_FIXED + stac_ops::SESSION_MATERIAL_SLOT,
+        )?;
+        let b = stac_ops::parse_session_begin(&begin).map_err(|_| SessionStop::Enclave(Op::SessionBegin.opcode()))?;
+
+        // Session step 5: the host session material to the keyboard, answered
+        // with the keyboard's session material; then 0x07 finishes.
+        let c = wire::command(wire::cmd::SESSION_MATERIAL, 5, &begin[b.host_attestation.clone()])
+            .map_err(|_| io(5, -12))?;
+        let r = ta_command(&c, wire::reply::SESSION_MATERIAL, wire::SESSION_MATERIAL_REPLY_LEN, MATERIAL_MS)
+            .map_err(|e| io(5, e))?;
+        let material = wire::parse_session_material(&r).map_err(|e| kb(5, e))?;
+        let finish = stac_ops::session_finish_request(&id, &r[material]).map_err(|_| io(5, -22))?;
+        let body = self.stac_session_body(Op::SessionFinish, &finish, 0)?;
+        stac_ops::expect_empty(&body).map_err(|_| SessionStop::Enclave(Op::SessionFinish.opcode()))?;
+        Ok(())
+    }
+
+    /// Runs the per-connection session the lifecycle asked for by driving the
+    /// `ta_session` relay again for this connection. Returns the event to feed
+    /// back: ready on success, failed otherwise.
+    fn stac_run_session(&self, _id: &AccessoryId) -> Event {
+        match self.stac_ta_session_steps() {
+            Ok(()) => Event::SessionReady,
+            Err(stop) => {
+                dev_info!(self.dev, "stac: session stopped: {:?}\n", stop);
+                Event::Failed
+            }
+        }
+    }
+
+    /// Tells the enclave the keyboard's link went up or down (0x09). On an
+    /// acknowledged link-up the lifecycle moves on; a link-down answers
+    /// nothing.
+    fn stac_run_connection_state(&self, id: &AccessoryId, up: bool) -> Option<Event> {
+        let req = stac_ops::connection_state_request(id, up);
+        match self.stac_call(stac_ops::Op::ConnectionState.opcode(), &req, 0) {
+            Ok(crate::stac::Reply::Body(body)) if stac_ops::expect_empty(&body).is_ok() => {
+                up.then_some(Event::Connected)
+            }
+            other => {
+                dev_info!(
+                    self.dev,
+                    "stac: connection state {} not acknowledged ({})\n",
+                    u8::from(up),
+                    if other.is_ok() { "refused or malformed" } else { "no reply" }
+                );
+                Some(Event::Failed)
+            }
+        }
+    }
+
+    /// Finalises a detach the grace period ended (0x08). It answers nothing and
+    /// feeds no event back.
+    fn stac_run_finalize(&self, id: &AccessoryId) {
+        let req = stac_ops::finalize_request(id);
+        match self.stac_call(stac_ops::Op::Finalize.opcode(), &req, 0) {
+            Ok(crate::stac::Reply::Body(body)) if stac_ops::expect_empty(&body).is_ok() => {}
+            other => dev_info!(
+                self.dev,
+                "stac: detach finalise not acknowledged ({})\n",
+                if other.is_ok() { "refused or malformed" } else { "no reply" }
+            ),
+        }
+    }
+
     /// Feeds the lifecycle `first`, runs what it asks for and feeds the
     /// outcomes back until it asks for nothing this client runs.
     pub(crate) fn stac_ta_event(&self, first: Event) {
@@ -426,12 +656,14 @@ impl SepData {
         if self.shutting_down.load(Relaxed) {
             return None;
         }
-        if !runs_read_only(action) {
+        let session_on = self.stac_ta_session.load(Relaxed);
+        if !runs_read_only(action) && !(session_on && runs_with_session(action)) {
             dev_info!(
                 self.dev,
-                "stac: keyboard {:?}: next step {} held (read-only client)\n",
+                "stac: keyboard {:?}: next step {} held ({})\n",
                 state,
-                action_name(action)
+                action_name(action),
+                if session_on { "read-only client" } else { "ta_session off" }
             );
             return None;
         }
@@ -439,6 +671,12 @@ impl SepData {
             Action::Identify => {
                 // SAFETY: no preconditions; queues the shim's read.
                 unsafe { sep_stac_ta_identify() };
+                None
+            }
+            Action::BeginSession(id) => Some(self.stac_run_session(id)),
+            Action::ConnectionState(id, up) => self.stac_run_connection_state(id, *up),
+            Action::FinalizeDetach(id) => {
+                self.stac_run_finalize(id);
                 None
             }
             Action::QueryPairing(id) => {
@@ -564,6 +802,33 @@ mod tests {
             Action::BiometricReady(ID, true),
         ] {
             assert!(!runs_read_only(&held));
+        }
+    }
+
+    // With ta_session on, the session relay also runs the per-connection
+    // session and the connection-state and detach-finalise steps it leads to,
+    // but never a pairing, the grace timers or the readiness notice.
+    #[test]
+    fn the_session_relay_runs_only_its_own_steps() {
+        for run in [
+            Action::BeginSession(ID),
+            Action::ConnectionState(ID, true),
+            Action::ConnectionState(ID, false),
+            Action::FinalizeDetach(ID),
+        ] {
+            assert!(runs_with_session(&run));
+            // A read is a read either way; the session steps are not reads.
+            assert!(!runs_read_only(&run));
+        }
+        for held in [
+            Action::Identify,
+            Action::QueryPairing(ID),
+            Action::StartGrace,
+            Action::CancelGrace,
+            Action::NeedsPairing(ID),
+            Action::BiometricReady(ID, true),
+        ] {
+            assert!(!runs_with_session(&held));
         }
     }
 

@@ -8,10 +8,12 @@
  * connection nonce). Their bodies go to the Rust side and are never logged.
  *
  * Pairing writes to the keyboard and runs only when root asks for it through
- * the write-only ta_pair parameter (off unless written). The Rust side then
- * drives the exchange through sep_stac_ta_command() and sep_stac_ta_read(),
- * under the client lock, so the keyboard cannot go away in the middle. Input
- * reports arriving while no reply is awaited are counted and dropped.
+ * the write-only ta_pair parameter (off unless written). The per-connection
+ * session, the same way, runs only through the write-only ta_session
+ * parameter. The Rust side then drives the exchange through
+ * sep_stac_ta_command() and sep_stac_ta_read(), under the client lock, so the
+ * keyboard cannot go away in the middle. Input reports arriving while no reply
+ * is awaited are counted and dropped.
  *
  * Copyright 2026 Ryan Murray
  */
@@ -52,6 +54,7 @@ static struct {
 	sep_stac_ta_identified_fn identified;
 	sep_stac_ta_failed_fn failed;
 	sep_stac_ta_pair_fn pair;
+	sep_stac_ta_session_fn session;
 	struct work_struct identify;
 	atomic_t dropped;
 	bool registered;
@@ -265,6 +268,36 @@ static const struct kernel_param_ops sep_ta_pair_ops = {
 module_param_cb(ta_pair, &sep_ta_pair_ops, NULL, 0200);
 MODULE_PARM_DESC(ta_pair, "Write 1 to pair the attached Magic Keyboard with Touch ID");
 
+/*
+ * Writing 1 to /sys/module/apple_sep/parameters/ta_session runs the
+ * per-connection session for the attached keyboard, if the enclave reports it
+ * paired but has no session for this connection. Nothing runs otherwise.
+ */
+static int sep_ta_session_set(const char *val, const struct kernel_param *kp)
+{
+	bool go;
+	int ret;
+
+	ret = kstrtobool(val, &go);
+	if (ret || !go)
+		return ret;
+	if (!sep_ta.registered)
+		return -ENODEV;
+	ret = mutex_lock_interruptible(&sep_ta.lock);
+	if (ret)
+		return ret;
+	ret = sep_ta.ta ? sep_ta.session(sep_ta.ctx) : -ENODEV;
+	mutex_unlock(&sep_ta.lock);
+	return ret;
+}
+
+static const struct kernel_param_ops sep_ta_session_ops = {
+	.set = sep_ta_session_set,
+};
+module_param_cb(ta_session, &sep_ta_session_ops, NULL, 0200);
+MODULE_PARM_DESC(ta_session,
+		 "Write 1 to run the per-connection session for the attached Magic Keyboard with Touch ID");
+
 static const struct apple_ta_client_ops sep_ta_ops = {
 	.attach = sep_ta_attach,
 	.detach = sep_ta_detach,
@@ -275,7 +308,8 @@ int sep_stac_ta_register(void *ctx, sep_stac_ta_event_fn attached,
 			 sep_stac_ta_event_fn detached,
 			 sep_stac_ta_identified_fn identified,
 			 sep_stac_ta_failed_fn failed,
-			 sep_stac_ta_pair_fn pair)
+			 sep_stac_ta_pair_fn pair,
+			 sep_stac_ta_session_fn session)
 {
 	int ret;
 
@@ -284,6 +318,7 @@ int sep_stac_ta_register(void *ctx, sep_stac_ta_event_fn attached,
 	INIT_WORK(&sep_ta.identify, sep_ta_identify_work);
 	init_completion(&sep_ta_rx.done);
 	sep_ta.pair = pair;
+	sep_ta.session = session;
 	sep_ta.ctx = ctx;
 	sep_ta.attached = attached;
 	sep_ta.detached = detached;
@@ -318,7 +353,8 @@ int sep_stac_ta_register(void *ctx, sep_stac_ta_event_fn attached,
 			 sep_stac_ta_event_fn detached,
 			 sep_stac_ta_identified_fn identified,
 			 sep_stac_ta_failed_fn failed,
-			 sep_stac_ta_pair_fn pair)
+			 sep_stac_ta_pair_fn pair,
+			 sep_stac_ta_session_fn session)
 {
 	return -EOPNOTSUPP;
 }
