@@ -13,6 +13,7 @@ struct macsmc_test_context {
 	u32 seen[12];
 	unsigned int seen_count;
 	int ap_power_result;
+	int atomic_result;
 	u64 record;
 };
 
@@ -285,7 +286,7 @@ static void macsmc_sleep_warn_late_test(struct kunit *test)
 	ctx->result = 8;
 	ctx->smc.wktp = true;
 
-	/* slpw comes at the noirq suspend, right before the commit. */
+	/* Without last stops, slpw comes at the noirq suspend, right before the commit. */
 	ctx->smc.sleep_warn_late = true;
 	KUNIT_EXPECT_EQ(test, apple_smc_sleep_enter(&ctx->smc), 0);
 	KUNIT_EXPECT_FALSE(test, ctx->smc.sleep_warn_late);
@@ -383,8 +384,9 @@ static void macsmc_sleep_refused_late_test(struct kunit *test)
 	ctx->smc.wktp = true;
 
 	/*
-	 * A real sleep that something refuses after the commit: no power loss, and
-	 * the SMC gets what a wake sends, in a wake's order and once.
+	 * A real sleep, committed in the noirq suspend, that something refuses after the
+	 * commit: no power loss, and the SMC gets what a wake sends, in a wake's order and
+	 * once.
 	 */
 	apple_smc_sleep_warn(&ctx->smc);
 	KUNIT_EXPECT_EQ(test, apple_smc_sleep_noirq(&ctx->smc), 0);
@@ -406,6 +408,140 @@ static void macsmc_sleep_refused_late_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ctx->seen[n++], SMC_KEY(waka));
 	KUNIT_EXPECT_EQ(test, ctx->seen[n++], SMC_KEY(MSLD));
 	KUNIT_EXPECT_EQ(test, ctx->seen[n++], 0U);
+}
+
+/* The atomic writes of the sleep controller's last stop: no mutex, and only in atomic mode. */
+static int macsmc_test_write_atomic(struct apple_smc *smc, smc_key key, const void *buf,
+				    size_t size)
+{
+	struct macsmc_test_context *ctx = container_of(smc, struct macsmc_test_context, smc);
+
+	KUNIT_EXPECT_TRUE(kunit_get_current_test(), smc->atomic_mode);
+	KUNIT_EXPECT_FALSE(kunit_get_current_test(), mutex_is_locked(&smc->mutex));
+	if (ctx->seen_count < ARRAY_SIZE(ctx->seen))
+		ctx->seen[ctx->seen_count++] = size == sizeof(u8) ? *(const u8 *)buf :
+			get_unaligned((const u32 *)buf);
+	return ctx->atomic_result;
+}
+
+static bool macsmc_test_at_stop(struct apple_smc *smc)
+{
+	return true;
+}
+
+/* A sleep on a controller that runs last stops, up to where the noirq suspend has passed. */
+static void macsmc_last_stop_begin(struct kunit *test)
+{
+	struct macsmc_test_context *ctx = test->priv;
+
+	kunit_activate_static_stub(test, apple_smc_ap_power, macsmc_test_ap_power);
+	kunit_activate_static_stub(test, apple_smc_outbox_poll, macsmc_test_outbox_poll);
+	kunit_activate_static_stub(test, apple_smc_sleep_commits, macsmc_test_commit);
+	kunit_activate_static_stub(test, apple_smc_commits_at_stop, macsmc_test_at_stop);
+	kunit_activate_static_stub(test, apple_smc_write_atomic, macsmc_test_write_atomic);
+	ctx->result = 8;
+	ctx->smc.wktp = true;
+
+	/* The noirq suspend sends nothing and leaves the warning for the last stop. */
+	ctx->smc.sleep_warn_late = true;
+	KUNIT_EXPECT_EQ(test, apple_smc_sleep_noirq(&ctx->smc), 0);
+	KUNIT_EXPECT_TRUE(test, ctx->smc.sleep_warn_late);
+	KUNIT_EXPECT_FALSE(test, ctx->smc.sleep_warned);
+	KUNIT_EXPECT_FALSE(test, ctx->smc.ap_notified);
+	KUNIT_EXPECT_FALSE(test, ctx->smc.wake_silent);
+	KUNIT_EXPECT_EQ(test, ctx->seen_count, 0U);
+}
+
+/* The wake after a last stop: a wake's commands in a wake's order, with the mutex again. */
+static void macsmc_last_stop_wake(struct kunit *test, unsigned int n)
+{
+	struct macsmc_test_context *ctx = test->priv;
+
+	KUNIT_EXPECT_TRUE(test, ctx->smc.ap_notified);
+	KUNIT_EXPECT_TRUE(test, ctx->smc.wake_silent);
+	KUNIT_EXPECT_FALSE(test, ctx->smc.atomic_mode);
+	KUNIT_EXPECT_FALSE(test, ctx->smc.atomic_pending);
+	apple_smc_wake_noirq(&ctx->smc);
+	KUNIT_EXPECT_FALSE(test, ctx->smc.ap_notified);
+	apple_smc_sleep_end(&ctx->smc);
+	KUNIT_EXPECT_FALSE(test, ctx->smc.sleep_warned);
+	KUNIT_EXPECT_FALSE(test, ctx->smc.wake_silent);
+	KUNIT_ASSERT_EQ(test, ctx->seen_count, n + 6);
+	KUNIT_EXPECT_EQ(test, ctx->seen[n++], (u32)MACSMC_TEST_AP_ON);
+	KUNIT_EXPECT_EQ(test, ctx->seen[n++], SMC_KEY(MBSE));
+	KUNIT_EXPECT_EQ(test, ctx->seen[n++], SMC_KEY(MBSW));
+	KUNIT_EXPECT_EQ(test, ctx->seen[n++], SMC_KEY(waka));
+	KUNIT_EXPECT_EQ(test, ctx->seen[n++], SMC_KEY(MSLD));
+	KUNIT_EXPECT_EQ(test, ctx->seen[n++], 0U);
+}
+
+static void macsmc_last_stop_test(struct kunit *test)
+{
+	struct macsmc_test_context *ctx = test->priv;
+	unsigned int n = 0;
+
+	macsmc_last_stop_begin(test);
+
+	/* The whole sequence comes from the last stop, in the noirq suspend's order, once. */
+	KUNIT_EXPECT_EQ(test, apple_smc_last_stop(&ctx->smc), 0);
+	KUNIT_EXPECT_EQ(test, apple_smc_last_stop(&ctx->smc), 0);
+	KUNIT_EXPECT_FALSE(test, ctx->smc.sleep_warn_late);
+	KUNIT_EXPECT_TRUE(test, ctx->smc.sleep_warned);
+	KUNIT_ASSERT_EQ(test, ctx->seen_count, 4U);
+	KUNIT_EXPECT_EQ(test, ctx->seen[n++], SMC_KEY(slpw));
+	KUNIT_EXPECT_EQ(test, ctx->seen[n++], 2U);
+	KUNIT_EXPECT_EQ(test, ctx->seen[n++], SMC_KEY(slpa));
+	KUNIT_EXPECT_EQ(test, ctx->seen[n++], (u32)MACSMC_TEST_AP_IDLE);
+
+	macsmc_last_stop_wake(test, n);
+}
+
+static void macsmc_last_stop_refused_test(struct kunit *test)
+{
+	struct macsmc_test_context *ctx = test->priv;
+
+	macsmc_last_stop_begin(test);
+
+	/*
+	 * Refused after the noirq suspend and before the last stops, as by a wake event or
+	 * the enclave: the SMC was sent nothing, and the resume sends it nothing.
+	 */
+	apple_smc_wake_noirq(&ctx->smc);
+	apple_smc_sleep_end(&ctx->smc);
+	KUNIT_EXPECT_FALSE(test, ctx->smc.sleep_warn_late);
+	KUNIT_EXPECT_FALSE(test, ctx->smc.sleep_warned);
+	KUNIT_EXPECT_FALSE(test, ctx->smc.ap_notified);
+	KUNIT_EXPECT_FALSE(test, ctx->smc.wake_silent);
+	KUNIT_EXPECT_EQ(test, ctx->seen_count, 0U);
+
+	/* A last stop with nothing left for it sends nothing either. */
+	KUNIT_EXPECT_EQ(test, apple_smc_last_stop(&ctx->smc), 0);
+	KUNIT_EXPECT_EQ(test, ctx->seen_count, 0U);
+}
+
+static void macsmc_last_stop_failed_test(struct kunit *test)
+{
+	struct macsmc_test_context *ctx = test->priv;
+	unsigned int n = 0;
+
+	macsmc_last_stop_begin(test);
+
+	/*
+	 * An SMC that answers nothing: a last stop cannot refuse, so every step is still
+	 * sent, the first failure is returned, and the wake sends its part.
+	 */
+	ctx->atomic_result = -ETIMEDOUT;
+	ctx->ap_power_result = -ETIME;
+	ctx->smc.atomic_pending = true;
+	KUNIT_EXPECT_EQ(test, apple_smc_last_stop(&ctx->smc), -ETIMEDOUT);
+	KUNIT_ASSERT_EQ(test, ctx->seen_count, 4U);
+	KUNIT_EXPECT_EQ(test, ctx->seen[n++], SMC_KEY(slpw));
+	KUNIT_EXPECT_EQ(test, ctx->seen[n++], 2U);
+	KUNIT_EXPECT_EQ(test, ctx->seen[n++], SMC_KEY(slpa));
+	KUNIT_EXPECT_EQ(test, ctx->seen[n++], (u32)MACSMC_TEST_AP_IDLE);
+
+	ctx->ap_power_result = 0;
+	macsmc_last_stop_wake(test, n);
 }
 
 static void macsmc_notice_test(struct kunit *test)
@@ -522,6 +658,9 @@ static struct kunit_case macsmc_parser_cases[] = {
 	KUNIT_CASE(macsmc_sleep_refused_wktp_test),
 	KUNIT_CASE(macsmc_sleep_dry_test),
 	KUNIT_CASE(macsmc_sleep_refused_late_test),
+	KUNIT_CASE(macsmc_last_stop_test),
+	KUNIT_CASE(macsmc_last_stop_refused_test),
+	KUNIT_CASE(macsmc_last_stop_failed_test),
 	KUNIT_CASE(macsmc_notice_test),
 	KUNIT_CASE(macsmc_lid_wake_test),
 	KUNIT_CASE(macsmc_wake_reason_test),

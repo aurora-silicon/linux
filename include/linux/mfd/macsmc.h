@@ -126,6 +126,8 @@ struct apple_smc {
 	bool wktp;
 	/* In a noirq phase: replies are polled for. */
 	bool polled;
+	/* Registered with the sleep controller, whose last stops can send the sleep commit. */
+	bool commit_at_stop;
 	/* MBSW at the last wake: what the SMC had woken the AP for. */
 	u64 wake_record;
 	/* MBSW's bits as this SoC numbers them, from the probe. */
