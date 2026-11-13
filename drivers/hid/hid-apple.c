@@ -1040,6 +1040,16 @@ static int apple_probe(struct hid_device *hdev,
 		return ret;
 	}
 
+	/*
+	 * The Touch ID interface of a Magic Keyboard with Touch ID carries the
+	 * Secure Enclave's channel to the keyboard's sensor. Leave it to
+	 * hid-apple-ta, which keeps it away from hidraw.
+	 */
+	if (hdev->bus == BUS_USB && hdev->maxcollection > 0 &&
+	    hdev->collection[0].usage == 0xff00004b &&
+	    apple_has_touchid_key(hdev))
+		return -ENODEV;
+
 	ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT);
 	if (ret) {
 		hid_err(hdev, "hw start failed\n");
