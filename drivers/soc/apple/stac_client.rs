@@ -11,9 +11,10 @@
 //! service comes back online with one attached, the shim reads the keyboard's
 //! protocol tag, identity and connection nonce with three feature-report
 //! reads, and the client asks the enclave whether that accessory is paired and
-//! authorised (0x02). Nothing is written to the keyboard. Whatever the
-//! lifecycle wants next (a per-connection session, a pairing, a connection
-//! state) is logged as held and not run.
+//! authorised (0x02); for an unpaired one it also logs a fingerprint of the
+//! enclave's host attestation object (0x01). Nothing is written to the
+//! keyboard. Whatever the lifecycle wants next (a per-connection session, a
+//! pairing, a connection state) is logged as held and not run.
 //!
 //! The identity, the nonce and anything else the keyboard answers are never
 //! logged.
@@ -217,9 +218,53 @@ impl SepData {
                         other
                     ),
                 }
+                if let Query::State(st) = q {
+                    if !st.paired {
+                        self.stac_host_object_fingerprint();
+                    }
+                }
                 Some(query_event(q))
             }
             _ => None,
+        }
+    }
+
+    /// Logs a short fingerprint of the enclave's host attestation object
+    /// (0x01): the object a pairing presents to the keyboard, which an
+    /// Apple-issued certificate must cover. Comparing it with the object the
+    /// other OS on this Mac presents tells whether that certificate can serve
+    /// here. Reads only; the object itself is not logged.
+    fn stac_host_object_fingerprint(&self) {
+        let reply = self.stac_call(
+            stac_ops::Op::HostAttestationObject.opcode(),
+            &[],
+            stac_ops::HOST_OBJECT_REPLY_LEN,
+        );
+        let body = match reply {
+            Ok(crate::stac::Reply::Body(body)) => body,
+            other => {
+                dev_info!(
+                    self.dev,
+                    "stac: host attestation object: no usable reply ({})\n",
+                    if other.is_ok() { "refused or malformed" } else { "no reply" }
+                );
+                return;
+            }
+        };
+        let len = match stac_ops::parse_host_object_len(&body) {
+            Ok(len) => len,
+            Err(_) => {
+                dev_info!(self.dev, "stac: host attestation object: malformed\n");
+                return;
+            }
+        };
+        match crate::image::sha256(&body[stac_ops::WORD..stac_ops::WORD + len]) {
+            Ok(d) => dev_info!(
+                self.dev,
+                "stac: host attestation object: {} bytes, sha256 {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}\n",
+                len, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]
+            ),
+            Err(_) => dev_info!(self.dev, "stac: host attestation object: {} bytes (no digest)\n", len),
         }
     }
 

@@ -102,7 +102,7 @@ impl core::fmt::Debug for PublicPoint {
 
 pub(crate) const ACCESSORY_ID_LEN: usize = 16;
 pub(crate) const PUBLIC_POINT_LEN: usize = 65;
-const WORD: usize = 4;
+pub(crate) const WORD: usize = 4;
 
 /// The host attestation object reply: a length word and a fixed slot.
 pub(crate) const HOST_OBJECT_SLOT: usize = 129;
