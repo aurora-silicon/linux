@@ -10,11 +10,13 @@
 #include <linux/pci.h>
 #include <linux/soc/apple/radio-sleep.h>
 #include <linux/vmalloc.h>
+#include <linux/workqueue.h>
 #include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/bcma/bcma.h>
 #include <linux/sched.h>
 #include <linux/sched/signal.h>
+#include <linux/slab.h>
 #include <linux/suspend.h>
 #include <linux/kthread.h>
 #include <linux/io.h>
@@ -3479,6 +3481,69 @@ static int brcmf_pcie_pm_enter_D3(struct device *dev)
 }
 
 
+static struct pci_driver brcmf_pciedrvr;
+static struct workqueue_struct *brcmf_pcie_restart_wq;
+
+struct brcmf_pcie_restart {
+	struct work_struct work;
+	struct pci_dev *pdev;
+};
+
+static void brcmf_pcie_restart_work(struct work_struct *work)
+{
+	struct brcmf_pcie_restart *restart =
+		container_of(work, struct brcmf_pcie_restart, work);
+	struct pci_dev *pdev = restart->pdev;
+	int err;
+
+	/* The resume callback that queued this still holds the lock; so does an unbind. */
+	device_lock(&pdev->dev);
+	if (pdev->dev.driver == &brcmf_pciedrvr.driver && dev_get_drvdata(&pdev->dev)) {
+		brcmf_pcie_remove(pdev);
+		err = brcmf_pcie_probe(pdev, NULL);
+		if (err)
+			__brcmf_err(NULL, __func__, "probe after resume failed, err=%d\n",
+				    err);
+	}
+	device_unlock(&pdev->dev);
+	pci_dev_put(pdev);
+	kfree(restart);
+}
+
+/* Whether the remove and probe of a function back from a power loss were queued. */
+static bool brcmf_pcie_restart_queue(struct pci_dev *pdev)
+{
+	struct brcmf_pcie_restart *restart;
+
+	if (!brcmf_pcie_restart_wq)
+		return false;
+	restart = kzalloc(sizeof(*restart), GFP_KERNEL);
+	if (!restart)
+		return false;
+	INIT_WORK(&restart->work, brcmf_pcie_restart_work);
+	restart->pdev = pci_dev_get(pdev);
+	queue_work(brcmf_pcie_restart_wq, &restart->work);
+	return true;
+}
+
+/* The next sleep finds the function probed again, not in the middle of it. */
+static int brcmf_pcie_restart_pm(struct notifier_block *nb, unsigned long action, void *data)
+{
+	switch (action) {
+	case PM_SUSPEND_PREPARE:
+	case PM_HIBERNATION_PREPARE:
+	case PM_RESTORE_PREPARE:
+		if (brcmf_pcie_restart_wq)
+			flush_workqueue(brcmf_pcie_restart_wq);
+		break;
+	}
+	return NOTIFY_DONE;
+}
+
+static struct notifier_block brcmf_pcie_restart_nb = {
+	.notifier_call = brcmf_pcie_restart_pm,
+};
+
 static int brcmf_pcie_pm_leave_D3(struct device *dev)
 {
 	struct brcmf_pciedev_info *devinfo;
@@ -3549,6 +3614,13 @@ cleanup:
 	brcmf_chip_detach(devinfo->ci);
 	devinfo->ci = NULL;
 	pdev = devinfo->pdev;
+	/*
+	 * A function that lost its power in a firmware suspend starts over. Taking the
+	 * interfaces and the wiphy down takes about 550 ms, and everything that follows
+	 * this device in the resume waits for it, so do it right behind the resume.
+	 */
+	if (pm_resume_via_firmware() && brcmf_pcie_restart_queue(pdev))
+		return 0;
 	brcmf_pcie_remove(pdev);
 
 	err = brcmf_pcie_probe(pdev, NULL);
@@ -3639,13 +3711,45 @@ static struct pci_driver brcmf_pciedrvr = {
 
 int brcmf_pcie_register(void)
 {
+	int ret;
+
 	brcmf_dbg(PCIE, "Enter\n");
-	return pci_register_driver(&brcmf_pciedrvr);
+#ifdef CONFIG_PM
+	/*
+	 * Without it the restart stays in the resume callback. Freezable: the work then
+	 * starts once the resume of every device is over. Run during it, the removal of
+	 * the wiphy only moves the wait to the wiphy's own resume.
+	 */
+	brcmf_pcie_restart_wq = alloc_ordered_workqueue("brcmf_pcie_restart", WQ_FREEZABLE);
+	if (brcmf_pcie_restart_wq)
+		register_pm_notifier(&brcmf_pcie_restart_nb);
+#endif
+	ret = pci_register_driver(&brcmf_pciedrvr);
+#ifdef CONFIG_PM
+	if (ret && brcmf_pcie_restart_wq) {
+		unregister_pm_notifier(&brcmf_pcie_restart_nb);
+		destroy_workqueue(brcmf_pcie_restart_wq);
+		brcmf_pcie_restart_wq = NULL;
+	}
+#endif
+	return ret;
 }
 
 
 void brcmf_pcie_exit(void)
 {
 	brcmf_dbg(PCIE, "Enter\n");
+#ifdef CONFIG_PM
+	if (brcmf_pcie_restart_wq) {
+		unregister_pm_notifier(&brcmf_pcie_restart_nb);
+		flush_workqueue(brcmf_pcie_restart_wq);
+	}
+#endif
 	pci_unregister_driver(&brcmf_pciedrvr);
+#ifdef CONFIG_PM
+	if (brcmf_pcie_restart_wq) {
+		destroy_workqueue(brcmf_pcie_restart_wq);
+		brcmf_pcie_restart_wq = NULL;
+	}
+#endif
 }
