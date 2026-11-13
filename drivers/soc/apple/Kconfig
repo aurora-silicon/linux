@@ -355,7 +355,8 @@ config APPLE_DISPLAY_GATE
 
 	  On T6041 (M4 Pro) device trees it enables the internal display nodes
 	  only when the boot loader has handed the running display coprocessor
-	  over (apple,t6041-handoff, 26.6.2 display firmware), and powers up
+	  over (apple,t6041-handoff, qualified 26.6.2 or 27.2 display firmware),
+	  and powers up
 	  the J616s external display chain (HDMI, Type-C DisplayPort) once the
 	  boot loader has given the external display processors their
 	  firmware memory. Without these, or with nomodeset, it does nothing.
