@@ -181,3 +181,104 @@ int main(void)
     return 0;
 }
 '''
+
+
+def firmware_selection(root):
+    """DCP firmware interface selection by SoC and firmware-compat build."""
+    source = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
+    versions = (root / 'drivers/gpu/drm/apple/version_utils.h').read_text()
+    enum = block(versions, 'enum dcp_firmware_version {') + ';\n'
+    return r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+typedef uint32_t u32;
+#define DCP_FW_VERSION_STR_LEN 20
+#define EINVAL 22
+#define IS_ERR(p) ((uintptr_t)(p) >= (uintptr_t)-4095)
+''' + enum + r'''
+struct device_node { const char *compatible; u32 compat[3]; int compat_cells; };
+struct device { struct device_node *of_node; const void *data; };
+struct apple_dcp_hw_data { enum dcp_firmware_version firmware_compat; };
+struct dcp_method_entry { const char *tag; };
+struct dcp_v14_board { int unused; };
+static const struct dcp_method_entry complete[1] = { { "A000" } }, partial[1] = { { "" } };
+static bool table_27_2_complete = true;
+static unsigned errors;
+static const void *of_device_get_match_data(struct device *dev) { return dev->data; }
+static bool of_device_is_compatible(struct device_node *n, const char *s) { return !strcmp(n->compatible, s); }
+static int dcp_read_fw_version(struct device *dev, const char *name, char *out)
+{
+    struct device_node *n = dev->of_node;
+    assert(!strcmp(name, "apple,firmware-compat") || !strcmp(name, "apple,firmware-version"));
+    if (n->compat_cells != 3)
+        return -EINVAL;
+    return snprintf(out, DCP_FW_VERSION_STR_LEN, "%u.%u.%u", n->compat[0], n->compat[1], n->compat[2]);
+}
+static int of_property_read_u32_index(struct device_node *n, const char *name, u32 index, u32 *out)
+{
+    assert(!strcmp(name, "apple,firmware-compat") && index == 0);
+    if (n->compat_cells != 3)
+        return -EINVAL;
+    *out = n->compat[0];
+    return 0;
+}
+static const struct dcp_method_entry *iomfb_v27_methods(const char *compat)
+{
+    if (!strcmp(compat, "27.0.0") || !strcmp(compat, "27.3.0"))
+        return complete;
+    if (!strcmp(compat, "27.2.0"))
+        return table_27_2_complete ? complete : partial;
+    return NULL;
+}
+static const char *iomfb_v27_missing_method(const struct dcp_method_entry *m, unsigned int *count)
+{
+    *count = m[0].tag[0] ? 0 : 1;
+    return m[0].tag[0] ? NULL : "some_method";
+}
+static bool of_property_present(struct device_node *n, const char *s) { (void)n; (void)s; return false; }
+static bool apple_t8122_25g83_board(void) { return false; }
+static int of_property_read_u32(struct device_node *n, const char *s, u32 *v) { (void)n; (void)s; (void)v; return -EINVAL; }
+static int of_property_read_string(struct device_node *n, const char *s, const char **v) { (void)n; (void)s; (void)v; return -EINVAL; }
+static const struct dcp_v14_board *iomfb_v14_7_board(struct device *dev) { (void)dev; return NULL; }
+static __attribute__((unused)) const char *iomfb_v14_7_board_name(const struct dcp_v14_board *b) { (void)b; return "none"; }
+#define dev_err(dev, ...) do { (void)(dev); errors++; } while (0)
+#define dev_warn(dev, ...) do { (void)(dev); } while (0)
+''' + block(source, 'static enum dcp_firmware_version dcp_check_firmware_27(') + '\n' \
+    + block(source, 'static enum dcp_firmware_version dcp_check_firmware_version(') + r'''
+static enum dcp_firmware_version pick(const char *compatible, enum dcp_firmware_version pinned,
+                                      u32 a, u32 b, u32 c)
+{
+    struct device_node n = { compatible, { a, b, c }, 3 };
+    struct apple_dcp_hw_data hw = { pinned };
+    struct device dev = { &n, &hw };
+    errors = 0;
+    return dcp_check_firmware_version(&dev);
+}
+int main(void)
+{
+    assert(pick("apple,t8140-dcp", DCP_FIRMWARE_H17P, 26, 6, 2) == DCP_FIRMWARE_H17P && !errors);
+    assert(pick("apple,t8140-dcp", DCP_FIRMWARE_H17P, 26, 5, 0) == DCP_FIRMWARE_H17P && !errors);
+    puts("PASS T8140 keeps the H17P interface on 26.x firmware");
+    assert(pick("apple,t8140-dcp", DCP_FIRMWARE_H17P, 27, 2, 0) == DCP_FIRMWARE_V_27_0 && !errors);
+    puts("PASS T8140 drives 27.2 firmware as firmware 27");
+    table_27_2_complete = false;
+    assert(pick("apple,t8140-dcp", DCP_FIRMWARE_H17P, 27, 2, 0) == DCP_FIRMWARE_UNKNOWN && errors == 1);
+    table_27_2_complete = true;
+    puts("PASS T8140 27.2 is not started with an incomplete method table");
+    assert(pick("apple,t8140-dcp", DCP_FIRMWARE_H17P, 27, 0, 0) == DCP_FIRMWARE_UNKNOWN && errors == 1);
+    assert(pick("apple,t8140-dcp", DCP_FIRMWARE_H17P, 27, 3, 0) == DCP_FIRMWARE_UNKNOWN && errors == 1);
+    assert(pick("apple,t8140-dcp", DCP_FIRMWARE_H17P, 28, 0, 0) == DCP_FIRMWARE_UNKNOWN && errors == 1);
+    puts("PASS T8140 never drives other 27+ builds through H17P");
+    assert(pick("apple,t8140-dcpext", DCP_FIRMWARE_H17P, 27, 2, 0) == DCP_FIRMWARE_H17P);
+    puts("PASS T8140 dcpext selection is unchanged (its probe admits 26.6.2 only)");
+    assert(pick("apple,t8142-dcp", DCP_FIRMWARE_H17P, 27, 0, 0) == DCP_FIRMWARE_V_27_0);
+    assert(pick("apple,t8142-dcp", DCP_FIRMWARE_H17P, 26, 6, 2) == DCP_FIRMWARE_H17P);
+    assert(pick("apple,t6050-dcp", DCP_FIRMWARE_V_27_0, 27, 2, 0) == DCP_FIRMWARE_V_27_0 && !errors);
+    assert(pick("apple,t6050-dcp", DCP_FIRMWARE_V_27_0, 26, 6, 2) == DCP_FIRMWARE_UNKNOWN && errors == 1);
+    puts("PASS T8142 and T6050 selection unchanged");
+    return 0;
+}
+'''

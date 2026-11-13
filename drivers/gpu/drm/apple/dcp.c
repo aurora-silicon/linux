@@ -5269,14 +5269,37 @@ static int dcp_read_fw_version(struct device *dev, const char *name,
 	return len;
 }
 
+/* Firmware 27: start it only with a complete method table for its build. */
+static enum dcp_firmware_version dcp_check_firmware_27(struct device *dev)
+{
+	char compat_str[DCP_FW_VERSION_STR_LEN];
+	const struct dcp_method_entry *methods;
+	unsigned int num_missing;
+	const char *missing;
+	int ret;
+
+	ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
+	methods = ret < 0 ? NULL : iomfb_v27_methods(compat_str);
+	if (!methods) {
+		dev_err(dev, "DCP firmware-compat %s has no 27.x method table\n",
+			ret < 0 ? "missing" : compat_str);
+		return DCP_FIRMWARE_UNKNOWN;
+	}
+	missing = iomfb_v27_missing_method(methods, &num_missing);
+	if (missing) {
+		dev_err(dev, "DCP firmware-compat %s not started: no ID known for %u methods (first: %s)\n",
+			compat_str, num_missing, missing);
+		return DCP_FIRMWARE_UNKNOWN;
+	}
+	return DCP_FIRMWARE_V_27_0;
+}
+
 static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 {
 	const struct apple_dcp_hw_data *hw = of_device_get_match_data(dev);
 	const struct dcp_v14_board *v14_board;
 	char compat_str[DCP_FW_VERSION_STR_LEN];
 	char fw_str[DCP_FW_VERSION_STR_LEN];
-	unsigned int num_missing;
-	const char *missing;
 	int ret;
 
 	/*
@@ -5291,22 +5314,28 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 			return DCP_FIRMWARE_V_27_0;
 	}
 
-	if (hw->firmware_compat == DCP_FIRMWARE_V_27_0) {
+	/*
+	 * T8140 (J700) runs H17P firmware up to 26.6.2. Its 27.2 DCP firmware
+	 * is driven as firmware 27, like T8142 on 27.0. Any other 27.x build
+	 * is not started: the H17P interface is not used on firmware 27.
+	 */
+	if (of_device_is_compatible(dev->of_node, "apple,t8140-dcp")) {
+		u32 major;
+
 		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
-		if (ret < 0 || !iomfb_v27_methods(compat_str)) {
-			dev_err(dev, "DCP firmware-compat %s has no 27.x method table\n",
-				ret < 0 ? "missing" : compat_str);
+		if (ret >= 0 && !strcmp(compat_str, "27.2.0"))
+			return dcp_check_firmware_27(dev);
+		if (ret >= 0 &&
+		    !of_property_read_u32_index(dev->of_node, "apple,firmware-compat",
+						0, &major) && major >= 27) {
+			dev_err(dev, "T8140 display not started: DCP firmware-compat %s is not 27.2.0\n",
+				compat_str);
 			return DCP_FIRMWARE_UNKNOWN;
 		}
-		missing = iomfb_v27_missing_method(iomfb_v27_methods(compat_str),
-						   &num_missing);
-		if (missing) {
-			dev_err(dev, "DCP firmware-compat %s not started: no ID known for %u methods (first: %s)\n",
-				compat_str, num_missing, missing);
-			return DCP_FIRMWARE_UNKNOWN;
-		}
-		return DCP_FIRMWARE_V_27_0;
 	}
+
+	if (hw->firmware_compat == DCP_FIRMWARE_V_27_0)
+		return dcp_check_firmware_27(dev);
 
 	/*
 	 * SoCs introduced with H17-generation firmware pin its interface; the
@@ -6477,11 +6506,13 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		return ret;
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
 	/*
-	 * T8142 on firmware 27 runs as the T6050's firmware-27 instance, with
-	 * the default method profile: with H17G every swap fails with status 4.
+	 * T8142 and T8140 on firmware 27 run as the T6050's firmware-27
+	 * instance, with the default method profile: with H17G every swap
+	 * fails with status 4 (T8142).
 	 */
 	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
-	    of_device_is_compatible(dev->of_node, "apple,t8142-dcp"))
+	    (of_device_is_compatible(dev->of_node, "apple,t8142-dcp") ||
+	     of_device_is_compatible(dev->of_node, "apple,t8140-dcp")))
 		dcp->hw.iomfb_method_profile = DCP_IOMFB_METHODS_DEFAULT;
 	/* The display such a processor finds at boot is its first sink. */
 	if (dcp_sink_metadata(dcp))
