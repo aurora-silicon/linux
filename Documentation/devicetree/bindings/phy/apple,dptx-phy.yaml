@@ -11,10 +11,9 @@ maintainers:
 
 description: |
   Hardware resources of the Apple Silicon DisplayPort transmitter PHY.
-  The interface is described for discovery and must remain disabled until
-  its ownership, initialization and shutdown are supported. Register windows
-  are listed in hardware resource order; firmware configuration and tuning
-  data are supplied by the boot firmware rather than this binding.
+  Register windows are listed in hardware resource order; firmware
+  configuration and tuning data are supplied by the boot firmware rather
+  than this binding.
 
 select:
   properties:
@@ -72,6 +71,7 @@ patternProperties:
 required:
   - compatible
   - reg
+  - reg-names
   - power-domains
   - '#phy-cells'
 
