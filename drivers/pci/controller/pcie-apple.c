@@ -5935,13 +5935,26 @@ static int apple_pcie_restore_train(struct apple_pcie *pcie, struct apple_pcie_p
 /* This kernel's RID-to-SID table, every other entry cleared as probe clears them. */
 static void apple_pcie_restore_rid2sid(struct apple_pcie *pcie, struct apple_pcie_port *port)
 {
-	int i;
+	u32 val, got, want = 0, bad = 0, first = 0;
+	int i, first_idx = -1;
 
 	mutex_lock(&pcie->lock);
-	for (i = 0; i < port->sid_map_sz; i++)
-		apple_pcie_rid2sid_write(port, i, test_bit(i, port->sid_map) ?
-					 port->saved_rid2sid[i] : 0);
+	for (i = 0; i < port->sid_map_sz; i++) {
+		val = test_bit(i, port->sid_map) ? port->saved_rid2sid[i] : 0;
+		got = apple_pcie_rid2sid_write(port, i, val);
+		if (got == val)
+			continue;
+		if (!bad++) {
+			first_idx = i;
+			want = val;
+			first = got;
+		}
+	}
 	mutex_unlock(&pcie->lock);
+	if (bad)
+		dev_warn(pcie->dev,
+			 "%pOF: %u RID-to-SID word(s) did not read back as written after the restore (first: entry %d wrote %#x, read %#x)\n",
+			 port->np, bad, first_idx, want, first);
 }
 
 /*
