@@ -9,6 +9,8 @@
 #include <linux/slab.h>
 #include <linux/soc/apple/pmp-report.h>
 
+#include "dietemp.h"
+
 struct asahi_g17_dietemp {
 	struct device_node *report;
 	unsigned int lane;

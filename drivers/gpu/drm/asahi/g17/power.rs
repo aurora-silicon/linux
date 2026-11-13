@@ -9,7 +9,7 @@ use super::dietemp;
 
 unsafe extern "C" {
     fn asahi_g17_dietemp_get(
-        dev: *mut kernel::bindings::device,
+        dev: *mut c_void,
         out: *mut *mut c_void,
     ) -> core::ffi::c_int;
     fn asahi_g17_dietemp_sample(source: *mut c_void, effort: *mut u8) -> core::ffi::c_int;
@@ -20,7 +20,7 @@ unsafe extern "C" {
 struct DieTempSource(NonNull<c_void>);
 
 impl DieTempSource {
-    fn new(dev: *mut kernel::bindings::device) -> kernel::error::Result<Self> {
+    fn new(dev: *mut c_void) -> kernel::error::Result<Self> {
         let mut source = core::ptr::null_mut();
         // SAFETY: `dev` is live and `source` is writable. C returns one owned
         // reference to the DT report node, released by Drop.
@@ -61,7 +61,7 @@ pub(super) struct Ceiling {
 
 impl Ceiling {
     pub(super) fn new(
-        dev: *mut kernel::bindings::device,
+        dev: *mut c_void,
         native: [u32; 3],
     ) -> kernel::error::Result<Self> {
         Ok(Self {
