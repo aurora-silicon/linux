@@ -2061,6 +2061,12 @@ static void parser_internal_v27_only_120hz(struct kunit *test)
 
 	KUNIT_EXPECT_EQ(test, dcp_mode_valid(&connector->base, &catalog[0].mode), MODE_OK);
 	KUNIT_EXPECT_EQ(test, dcp_mode_valid(&connector->base, &catalog[1].mode), MODE_BAD);
+
+	/* An external dcpext (T6050 Studio Display) keeps every mode it lists. */
+	dcp->ext_failsafe = true;
+	KUNIT_EXPECT_EQ(test, dcp_mode_valid(&connector->base, &catalog[0].mode), MODE_OK);
+	KUNIT_EXPECT_EQ(test, dcp_mode_valid(&connector->base, &catalog[1].mode), MODE_OK);
+	dcp->ext_failsafe = false;
 	dcp->modes = NULL;
 	dcp->nr_modes = 0;
 	dcp_modes_release(dcp);
