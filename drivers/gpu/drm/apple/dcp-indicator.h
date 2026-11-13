@@ -12,6 +12,11 @@
 
 #include <linux/types.h>
 #include <linux/errno.h>
+#ifndef DCP_IND_USERSPACE
+#include <drm/drm_crtc.h>
+#include <drm/drm_framebuffer.h>
+#include <drm/drm_plane.h>
+#endif
 
 enum dcp_ind_state {
 	DCP_IND_OFF,
@@ -109,12 +114,18 @@ static inline int dcp_ind_retry(struct dcp_indicator *ind, bool plane,
 }
 
 /*
- * The display came back (system resume): the plane returns disabled whatever it
- * showed, so the square is OFF again and a kept request asks anew.
+ * The display came back (system resume) and the resume commit is done. A plane
+ * that came back dark shows no square, so it is OFF again and a kept request
+ * asks anew. A plane that came back with the square (suspend saved it, resume
+ * committed it) is carried by a present that confirms it: resetting that state
+ * would make the new request an unchanged plane, no swap would follow, and the
+ * watch would withdraw the square. The same holds for a request that landed
+ * after the resume commit.
  */
-static inline void dcp_ind_display_resumed(struct dcp_indicator *ind)
+static inline void dcp_ind_display_resumed(struct dcp_indicator *ind, bool plane_dark)
 {
-	dcp_ind_suspend(ind);
+	if (plane_dark)
+		dcp_ind_suspend(ind);
 }
 
 /* Wanted but not on the panel: the next present after a rebind asks again. */
@@ -151,6 +162,30 @@ static inline enum dcp_ind_plane_action dcp_ind_plane_policy(bool reserved_plane
 	if ((!has_fb && !has_crtc) || (own_fb && has_fb))
 		return DCP_IND_PLANE_RESTORE;
 	return DCP_IND_PLANE_REJECT;
+}
+
+/*
+ * Gathers what dcp_ind_plane_policy() needs from the plane states of a commit.
+ * old_crtc_state is the new state of the CRTC the plane sat on, or NULL when the
+ * commit does not touch it.
+ */
+static inline enum dcp_ind_plane_action
+dcp_ind_plane_check(const struct drm_plane_state *old, const struct drm_plane_state *new,
+		    const struct drm_crtc_state *old_crtc_state, bool kernel_commit,
+		    const struct drm_framebuffer_funcs *own_fb_funcs)
+{
+	bool unchanged = new->fb == old->fb && new->crtc == old->crtc &&
+			 new->crtc_x == old->crtc_x && new->crtc_y == old->crtc_y &&
+			 new->crtc_w == old->crtc_w && new->crtc_h == old->crtc_h &&
+			 new->src_x == old->src_x && new->src_y == old->src_y &&
+			 new->src_w == old->src_w && new->src_h == old->src_h &&
+			 new->alpha == old->alpha &&
+			 new->pixel_blend_mode == old->pixel_blend_mode &&
+			 new->rotation == old->rotation;
+	bool going_off = !new->fb && !new->crtc && old_crtc_state && !old_crtc_state->active;
+
+	return dcp_ind_plane_policy(true, kernel_commit, unchanged, going_off, new->fb,
+				    new->crtc, new->fb && new->fb->funcs == own_fb_funcs);
 }
 
 #endif /* DCP_INDICATOR_H */

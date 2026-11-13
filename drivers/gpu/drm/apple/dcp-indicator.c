@@ -54,6 +54,11 @@ int dcp_indicator_probe(struct apple_dcp *dcp)
 
 	if (of_property_read_u32(dcp->dev->of_node, "apple,camera-indicator-surface", &surf))
 		return 0;
+	/* The swap_done hook that confirms the square is on the non-H17G presents only. */
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G) {
+		dev_warn(dcp->dev, "no camera indicator: this DCP profile has no swap_done hook\n");
+		return 0;
+	}
 	if (surf >= SWAP_SURFACES || test_bit(surf, dcp->iomfb_surfaces))
 		return dev_err_probe(dcp->dev, -EINVAL,
 				     "camera indicator surface %u is not free\n", surf);
@@ -93,7 +98,8 @@ void dcp_indicator_release(struct apple_dcp *dcp)
 	cancel_work_sync(&ci->resume);
 }
 
-static const struct drm_framebuffer_funcs dcp_indicator_fb_funcs = {
+/* Its funcs name the kernel's own framebuffer; userspace cannot create one with them. */
+const struct drm_framebuffer_funcs dcp_indicator_fb_funcs = {
 	.destroy = drm_gem_fb_destroy,
 	.create_handle = drm_gem_fb_create_handle,
 };
@@ -160,12 +166,6 @@ int dcp_indicator_attach_plane(struct apple_dcp *dcp, struct drm_device *drm,
 	ci->fb = fb;
 	spin_unlock_irqrestore(&ci->lock, flags);
 	return 0;
-}
-
-/* The framebuffer is the kernel's: its funcs are ours, and userspace cannot name it. */
-bool dcp_indicator_owns_fb(const struct drm_framebuffer *fb)
-{
-	return fb && fb->funcs == &dcp_indicator_fb_funcs;
 }
 
 /* The atomic state the kernel itself commits: the square, or nothing. */
@@ -344,21 +344,27 @@ static int dcp_indicator_request(struct apple_dcp *dcp)
 	spin_lock_irqsave(&ci->lock, flags);
 	ret = dcp_ind_wants_resume(&ci->state);
 	spin_unlock_irqrestore(&ci->lock, flags);
-	if (ret)
+	if (ret) {
+		dev_dbg(dcp->dev, "camera indicator kept: the panel is not ready\n");
 		return 0;
+	}
 	ci->deadline = jiffies + IND_PRESENT_TIMEOUT;
 	mod_delayed_work(system_percpu_wq, &ci->watch, IND_PRESENT_TIMEOUT);
 	return 0;
 }
 
 /*
- * The display resumed: the plane came back disabled, so whatever the square was
- * it is OFF now, and a request that still stands is asked for again.
+ * The display resumed and the resume commit is done: a plane that came back
+ * dark has no square, so it is OFF now and a request that still stands is asked
+ * for again. A plane that came back lit is left alone (see dcp_ind_display_resumed).
+ * ctl and the plane lock are taken in the order dcp_indicator_commit takes them,
+ * so a request cannot land between reading the plane and resetting the state.
  */
 void dcp_indicator_display_resumed(struct apple_dcp *dcp)
 {
 	struct dcp_camera_indicator *ci;
 	unsigned long flags;
+	bool dark;
 
 	/* A CRTC whose DCP is not bound has no drvdata. */
 	if (!dcp)
@@ -366,8 +372,14 @@ void dcp_indicator_display_resumed(struct apple_dcp *dcp)
 	ci = &dcp->camera_ind;
 	if (!ci->has_surf)
 		return;
+	guard(mutex)(&ci->ctl);
+	if (!ci->plane)
+		return;
+	drm_modeset_lock(&ci->plane->mutex, NULL);
+	dark = !ci->plane->state || !ci->plane->state->fb;
+	drm_modeset_unlock(&ci->plane->mutex);
 	spin_lock_irqsave(&ci->lock, flags);
-	dcp_ind_display_resumed(&ci->state);
+	dcp_ind_display_resumed(&ci->state, dark);
 	if (ci->fb && dcp_ind_wants_resume(&ci->state))
 		schedule_work(&ci->resume);
 	spin_unlock_irqrestore(&ci->lock, flags);

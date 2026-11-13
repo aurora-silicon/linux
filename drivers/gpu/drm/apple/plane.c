@@ -242,27 +242,10 @@ static int apple_plane_atomic_check(struct drm_plane *plane,
 		struct drm_plane_state *old = drm_atomic_get_old_plane_state(commit, plane);
 		struct drm_crtc_state *old_crtc_new = old->crtc ?
 			drm_atomic_get_new_crtc_state(commit, old->crtc) : NULL;
-		bool unchanged = new_plane_state->fb == old->fb &&
-				 new_plane_state->crtc == old->crtc &&
-				 new_plane_state->crtc_x == old->crtc_x &&
-				 new_plane_state->crtc_y == old->crtc_y &&
-				 new_plane_state->crtc_w == old->crtc_w &&
-				 new_plane_state->crtc_h == old->crtc_h &&
-				 new_plane_state->src_x == old->src_x &&
-				 new_plane_state->src_y == old->src_y &&
-				 new_plane_state->src_w == old->src_w &&
-				 new_plane_state->src_h == old->src_h &&
-				 new_plane_state->alpha == old->alpha &&
-				 new_plane_state->pixel_blend_mode == old->pixel_blend_mode &&
-				 new_plane_state->rotation == old->rotation;
-		bool going_off = !new_plane_state->fb && !new_plane_state->crtc &&
-				 old_crtc_new && !old_crtc_new->active;
 
-		switch (dcp_ind_plane_policy(true,
-					     commit == READ_ONCE(to_apple_plane(plane)->indicator_commit),
-					     unchanged, going_off,
-					     new_plane_state->fb, new_plane_state->crtc,
-					     dcp_indicator_owns_fb(new_plane_state->fb))) {
+		switch (dcp_ind_plane_check(old, new_plane_state, old_crtc_new,
+					    commit == READ_ONCE(to_apple_plane(plane)->indicator_commit),
+					    &dcp_indicator_fb_funcs)) {
 		case DCP_IND_PLANE_REJECT:
 			return -EINVAL;
 		case DCP_IND_PLANE_RESTORE: {
