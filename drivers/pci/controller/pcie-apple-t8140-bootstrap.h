@@ -118,6 +118,8 @@ void apple_piodma_bootstrap_admitted(struct device *supplier);
 bool apple_piodma_bootstrap_retained(struct device *supplier);
 void apple_piodma_bootstrap_set_sleep(struct device *supplier, bool armed);
 int apple_piodma_bootstrap_power_lost(struct device *supplier);
+void apple_piodma_bootstrap_radio_pending(struct device *supplier);
+void apple_piodma_bootstrap_radio_done(struct device *supplier);
 int apple_piodma_bootstrap_radio_stop(struct device *supplier, struct pci_dev *pdev);
 void apple_piodma_bootstrap_set_recover(struct device *supplier, void (*recover)(void *data),
 					void *data);
@@ -158,6 +160,14 @@ static inline void apple_piodma_bootstrap_set_sleep(struct device *supplier, boo
 static inline int apple_piodma_bootstrap_power_lost(struct device *supplier)
 {
 	return -ENODEV;
+}
+
+static inline void apple_piodma_bootstrap_radio_pending(struct device *supplier)
+{
+}
+
+static inline void apple_piodma_bootstrap_radio_done(struct device *supplier)
+{
 }
 
 static inline int apple_piodma_bootstrap_radio_stop(struct device *supplier, struct pci_dev *pdev)

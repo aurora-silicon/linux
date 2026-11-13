@@ -7,10 +7,9 @@ T6041 ProRes initialization data
 The driver can carry ProRes initialization rows built in, and on T6041 a
 machine may override them with ``apple/prores-t6041-init.bin``, an APRI
 container generated for that Mac from its own macOS and not distributed with
-Linux.  T6041 has no built-in rows yet, so until they are added the device
-binds only when the file is present.  Without it, the driver logs one info
-line and returns -ENODEV before any register is mapped.  T6000 and T8140 use
-their built-in rows and do not request this file.
+Linux.  Without the file, T6041 uses its built-in rows: the 82, 80 and 62
+values macOS writes to the three windows before its first job.  T6000 and
+T8140 use their built-in rows and do not request this file.
 
 When the file is present, the driver reads and validates the whole of it
 before mapping device registers.  An invalid file makes the device fail to
@@ -55,3 +54,12 @@ continues with the common T6000/T8140 initialization sequence.
 The container deliberately has no MMIO addresses, selectors, power policy,
 or arbitrary write commands.  File integrity is the responsibility of the
 package that installs the per-Mac file.
+
+T6050
+=====
+
+``apple/prores-t6050-init.bin`` is the same container with ``soc = 0x6050``,
+``block_count = 4`` and a fourth block, SCODEC control (ID 4, 12 entries,
+offsets below ``0x4000``): 2,880 bytes in all.  The driver has no built-in
+T6050 rows, so that engine probes only with the file.  The control rows are
+applied after the system rows and before the core rows.

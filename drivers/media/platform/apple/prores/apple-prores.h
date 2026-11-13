@@ -55,16 +55,32 @@
 
 #define APRI_T6041_FIRMWARE_NAME	"apple/prores-t6041-init.bin"
 #define APRI_T6041_FIRMWARE_SIZE	2728
+#define APRI_T6050_FIRMWARE_NAME	"apple/prores-t6050-init.bin"
+#define APRI_T6050_FIRMWARE_SIZE	2880
 #define APRI_SYSTEM_COUNT	82
 #define APRI_CORE_COUNT		80
 #define APRI_WRAPPER_COUNT	62
+#define APRI_CONTROL_COUNT	12
 #define APRI_MAX_COUNT		APRI_SYSTEM_COUNT
 
 enum apri_block_index {
 	APRI_SYSTEM_BLOCK,
 	APRI_CORE_BLOCK,
 	APRI_WRAPPER_BLOCK,
-	APRI_BLOCK_COUNT,
+	APRI_CONTROL_BLOCK,	/* T6050 only */
+	APRI_MAX_BLOCKS,
+};
+
+#define APRI_T6041_BLOCKS	3
+#define APRI_T6050_BLOCKS	4
+
+/* The fixed shape of one SoC's APRI container. */
+struct apri_layout {
+	u32 soc;
+	u32 blocks;
+	size_t size;
+	u32 counts[APRI_MAX_BLOCKS];
+	u32 limits[APRI_MAX_BLOCKS];
 };
 
 struct apr_tunable {
@@ -79,7 +95,7 @@ struct apr_init_block {
 };
 
 struct apr_init_data {
-	struct apr_init_block blocks[APRI_BLOCK_COUNT];
+	struct apr_init_block blocks[APRI_MAX_BLOCKS];
 };
 
 /* Quantisation tables the engine holds, in register order. */
@@ -148,7 +164,15 @@ u32 apr_slice_count(u32 width, u32 height, u32 log2_slice);
 int apr_build_desc(const struct apr_frame *f, u8 *desc);
 int apr_build_desc_v0(const struct apr_frame *f, u8 *desc);
 int apr_check_output(const u8 *out, size_t capacity, u32 *frame_bytes);
-int apr_parse_t6041_init(const u8 *data, size_t size,
-			 struct apr_init_data *init);
+extern const struct apri_layout apri_t6041;
+extern const struct apri_layout apri_t6050;
+int apr_parse_init(const struct apri_layout *layout, const u8 *data,
+		   size_t size, struct apr_init_data *init);
+
+static inline int apr_parse_t6041_init(const u8 *data, size_t size,
+				       struct apr_init_data *init)
+{
+	return apr_parse_init(&apri_t6041, data, size, init);
+}
 
 #endif

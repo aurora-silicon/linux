@@ -33,6 +33,14 @@ struct apple_crtc {
 
 	/* External scanout keeps the fabric up while the CRTC is active. */
 	bool fabric_held;
+
+	/*
+	 * DCP has no vblank interrupt or counter. Flip-complete events carry
+	 * a sequence estimated from the flip time and the mode's refresh
+	 * rate. Protected by the DRM event_lock.
+	 */
+	u64 flip_seq;
+	ktime_t flip_seq_time;
 };
 
 #define to_apple_crtc(x) container_of(x, struct apple_crtc, base)
@@ -80,6 +88,7 @@ int dcp_get_connector_type(struct platform_device *pdev);
 bool dcp_fw_compat_is_12_x(struct platform_device *pdev);
 bool dcp_fw_compat_is_14_7(struct platform_device *pdev);
 bool dcp_fw_compat_is_desktop(struct platform_device *pdev);
+bool dcp_fw_compat_panel_edr(struct platform_device *pdev);
 unsigned int dcp_gamma_lut_size(struct platform_device *pdev);
 /* T6041 external display processors may join the DRM device. */
 bool dcp_t6041_ext_enabled(void);

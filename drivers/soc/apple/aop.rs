@@ -2675,7 +2675,18 @@ impl AopData {
     /// sensor answers property reads and accepts its reporting interval but
     /// never reports; the trusted side does not start it. A missing file is
     /// not an error: the AOP's other services work without it.
+    ///
+    /// Only firmware that asks for the ALS endpoint's setup buffer takes its
+    /// calibration this way: T8140's fixed endpoint set includes it, and where
+    /// the EPMAP is read it has to be among the endpoints announced. Elsewhere
+    /// the ALS driver sends the sensor its calibration as a property.
     fn setup_als_calibration(&self) -> Result<()> {
+        {
+            let st = self.setup.lock();
+            if !st.expected[..st.expected_count].contains(&SETUP_ALS_EP) {
+                return Ok(());
+            }
+        }
         let Some(name) = self
             .dev
             .fwnode()

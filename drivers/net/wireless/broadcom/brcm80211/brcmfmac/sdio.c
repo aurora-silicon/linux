@@ -4030,11 +4030,14 @@ brcmf_sdio_probe_attach(struct brcmf_sdio *bus)
 	/* wowl can be supported when KEEP_POWER is true and (WAKE_SDIO_IRQ
 	 * is true or when platform data OOB irq is true).
 	 */
-	if (IS_ENABLED(CONFIG_PM_SLEEP) &&
-	    (sdio_get_host_pm_caps(sdiodev->func1) & MMC_PM_KEEP_POWER) &&
-	    ((sdio_get_host_pm_caps(sdiodev->func1) & MMC_PM_WAKE_SDIO_IRQ) ||
-	     (sdiodev->settings->bus.sdio.oob_irq_supported)))
-		sdiodev->bus_if->wowl_supported = true;
+	if (IS_ENABLED(CONFIG_PM_SLEEP)) {
+		sdiodev->bus_if->wowl_transport =
+			sdio_get_host_pm_caps(sdiodev->func1) & MMC_PM_KEEP_POWER;
+		sdiodev->bus_if->wowl_wake =
+			(sdio_get_host_pm_caps(sdiodev->func1) &
+			 MMC_PM_WAKE_SDIO_IRQ) ||
+			sdiodev->settings->bus.sdio.oob_irq_supported;
+	}
 
 	if (brcmf_sdio_kso_init(bus)) {
 		brcmf_err("error enabling KSO\n");

@@ -213,6 +213,12 @@ struct dcp_method_entry {
 	char tag_h17g[4];
 };
 
+/* The IOMFB method table of a firmware 27.x build, by its compat string; NULL if unknown. */
+const struct dcp_method_entry *iomfb_v27_methods(const char *compat);
+/* The first method of a firmware 27.x table that has no ID, NULL if none. */
+const char *iomfb_v27_missing_method(const struct dcp_method_entry *methods,
+				     unsigned int *count);
+
 #define IOMFB_MAX_CB (1000)
 
 bool iomfb_validate_callback_h17p(int tag, u32 in_len, u32 out_len);
@@ -352,6 +358,12 @@ struct iomfb_property {
 	u32 id;
 	u32 value;
 } __packed;
+
+/*
+ * The two IOMFB parameters macOS sends to an external display after each mode
+ * set (see dcp_external_hdr_hints()).  Split out so it can be unit tested.
+ */
+void iomfb_external_hdr_hint_values(bool pq, struct iomfb_property out[2]);
 
 struct iomfb_get_color_remap_mode_req {
 	u32 mode;

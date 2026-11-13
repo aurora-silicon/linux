@@ -70,6 +70,13 @@ fn can_submit_inline(dependencies_ready: bool, previous_status: Option<i32>) -> 
 
 /// Trait implemented by all versioned queues.
 pub(crate) trait Queue: Send + Sync {
+    /// Sets the watchdog allowance of the queue's compute commands to `requested_ms`
+    /// (`drm_asahi_queue_create::compute_timeout_ms`, nonzero) and returns the allowance in
+    /// effect. Only queues of GPUs that advertise DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT take one.
+    fn set_compute_timeout(&mut self, _requested_ms: u32) -> Result<u32> {
+        Err(EINVAL)
+    }
+
     fn reserve_render_scs(&mut self, layouts: [u64; 2]) -> Result {
         if layouts != [0; 2] {
             return Err(EINVAL);

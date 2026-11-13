@@ -32,7 +32,8 @@ struct scheduler { bool stopped; unsigned pauses, restarts; };
 struct ave_transport { bool scratch_halt; };
 struct ave_abi { const struct ave_transport *transport; };
 struct ave_layout { const struct ave_abi *abi; };
-struct ave_dev { struct scheduler *m2m_dev; int hw_lock; const struct ave_layout *layout; };
+enum ave_fw_state { AVE_FW_OFF, AVE_FW_RUNNING, AVE_FW_HALTED, AVE_FW_BROKEN };
+struct ave_dev { struct scheduler *m2m_dev; int hw_lock; const struct ave_layout *layout; enum ave_fw_state fw_state; };
 struct device { struct ave_dev *data; };
 static int shutdown_error;
 static unsigned closes, halts, releases, wakes;
@@ -50,7 +51,11 @@ static void ave_v4l2_suspend(struct ave_dev *a) {
 }
 static int ave_fw_shutdown(struct ave_dev *a) {
     assert(a->hw_lock && a->m2m_dev->stopped && closes > halts);
-    halts++; return shutdown_error;
+    halts++;
+    /* A hung 6070 firmware that could be stopped ends up halted, unconfirmed. */
+    if (!shutdown_error && a->fw_state == AVE_FW_BROKEN)
+        a->fw_state = AVE_FW_HALTED;
+    return shutdown_error;
 }
 /* A scratch-halt firmware (6070) gives its boot buffers back after a halt. */
 static __attribute__((unused)) void ave_fw_release_boot(struct ave_dev *a) {
@@ -97,7 +102,14 @@ int main(void) {
     shutdown_error = 0;
     assert(ave_suspend(&d) == 0 && releases == 1);
     assert(ave_resume(&d) == 0 && wakes == 5);
-    puts("AVE PM: normal/repeated sleep, halt refusal, error propagation, rollback, retry and boot-buffer release passed");
+    /* A hung firmware stopped without a confirmed Halt keeps its boot buffers mapped. */
+    a.fw_state = AVE_FW_BROKEN;
+    assert(ave_suspend(&d) == 0 && releases == 1);
+    assert(ave_resume(&d) == 0 && wakes == 6);
+    a.fw_state = AVE_FW_HALTED;
+    assert(ave_suspend(&d) == 0 && releases == 2);
+    assert(ave_resume(&d) == 0 && wakes == 7);
+    puts("AVE PM: normal/repeated sleep, halt refusal, error propagation, rollback, retry, boot-buffer release and hung-stop retention passed");
 }
 '''
 

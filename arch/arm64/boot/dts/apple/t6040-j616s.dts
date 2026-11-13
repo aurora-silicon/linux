@@ -22,6 +22,7 @@
 	brcm,board-type = "apple,hostomel";
 	/* WLAN host wake (PCIe WAKE#), active high */
 	wake-gpios = <&pinctrl 39 GPIO_ACTIVE_HIGH>;
+	wakeup-source;
 };
 
 &bluetooth0 {
@@ -37,6 +38,15 @@
 		#gpio-cells = <2>;
 		apple,output-templates = <0xe 0x00800000>;
 	};
+};
+
+/*
+ * ADT /arm-io/aon-ptd ptd_data_table: the battery record ("IFtb", layout 1,
+ * slots 0x12-0x15). Only its peek aperture is read.
+ */
+&aon_ptd {
+	apple,battery-record = <0x49467462 1 0x12 4>;
+	status = "okay";
 };
 
 &aop_spmi0 {
@@ -191,6 +201,31 @@
 };
 
 &scaler0 {
+	status = "okay";
+};
+
+/*
+ * ProRes encoder and its DART. The engine runs with SCODEC_STREAMING (and so
+ * SCODEC) powered. The driver has built-in power-up rows for it; an optional
+ * apple/prores-t6041-init.bin replaces them.
+ */
+&ps_fab1_soc {
+	status = "okay";
+};
+
+&ps_scodec {
+	status = "okay";
+};
+
+&ps_scodec_streaming {
+	status = "okay";
+};
+
+&apr0_dart {
+	status = "okay";
+};
+
+&apr0 {
 	status = "okay";
 };
 

@@ -299,7 +299,7 @@
  *   ATC0 usb-drd0 left-back  hpm0 nub-spmi-a0 0x0c (the debug port, not described)
  *   ATC1 usb-drd1 left-front hpm1 nub-spmi-a0 0x0a
  *   ATC2 usb-drd2 right      hpm2 nub-spmi-a1 0x0c
- *   hpm5 nub-spmi-a0 0x08 (MagSafe, not a USB-C connector)
+ *   hpm5 nub-spmi-a0 0x08 (MagSafe 3, power in only: no connector node)
  * There is no usb-drd3 and no nub-spmi-a2, so ATC3's USB chain and that bus stay
  * off. Both described ports are wired as on J716s.
  */
@@ -359,6 +359,18 @@
 			};
 		};
 	};
+
+	/*
+	 * The MagSafe 3 port's PD controller (ADT hpm5, port-type 0x11). It has no USB data
+	 * path, so it gets no connector node; tipd registers a Type-C port and a power supply
+	 * for it, as on J616s. Its ADT features-supported is <3>, "Power In" only: no liquid
+	 * detection (LDCM, feature 2 of the USB-C ports' <1 2 3>).
+	 */
+	hpm5: usb-pd@8 {
+		compatible = "apple,sn201202x";
+		reg = <0x8 SPMI_USID>;
+		apple,no-liquid-detection;
+	};
 };
 
 &usb_drd1 {
@@ -380,12 +392,20 @@
 /*
  * Right port (ATC2): hpm2 on nub-spmi-a1, with USB and the USB4/Thunderbolt router. The
  * inventory's nub-spmi-a1 has the generation 4 bus's three register windows and IRQ (ADT
- * nub-spmi-a1); the driver polls it and refuses an interrupt, so it takes the first window only.
+ * nub-spmi-a1). The driver polls it and refuses an interrupt, so it takes the command window
+ * and the fault queue's (ADT reg[0] and reg[1]), as for nub-spmi-a0 below.
  */
 &nub_spmi_a1 {
-	reg = <0x2 0x8a1a8000 0x0 0x4000>;
+	reg = <0x2 0x8a1a8000 0x0 0x4000>,
+	      <0x2 0x8a1a4000 0x0 0x4000>;
 	/delete-property/ interrupts;
 	status = "okay";
+};
+
+/* nub-spmi-a0's fault queue window (ADT reg[1]), which macOS empties when the controller starts */
+&nub_spmi_a0 {
+	reg = <0x2 0x8a188000 0x0 0x4000>,
+	      <0x2 0x8a184000 0x0 0x4000>;
 };
 
 #include "t6050-max-atc2.dtsi"
@@ -400,6 +420,9 @@
 			05 8a 09 01 00 0e 01 41 70 70 6c 65 2c 20 49 6e
 			63 2e 00 06 02 69 4f 53 00 00 00 00];
 };
+
+/* Left-front port (ATC1): the USB4/Thunderbolt router and its PCIe tunnel */
+#include "t6050-j714s-left-usb4.dtsi"
 
 /*
  * The PMP (ADT pmp0, /chosen, /arm-io/pmgr). iBoot loads its firmware and the driver starts it
@@ -511,6 +534,48 @@
 	};
 };
 
+/*
+ * The ProRes engine (apr0) and its DART, in the SCODEC power state. Its
+ * parent fab7-soc also feeds the display pipeline, so it is left to the
+ * firmware, as fab0-piogw is.
+ */
+&ps_fab7_soc {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_scodec {
+	status = "okay";
+};
+
+&apr0_dart {
+	status = "okay";
+};
+
+&apr0 {
+	status = "okay";
+};
+
+/*
+ * Both JPEG engines and their shared DART, under the media fabric that the
+ * video encoder above already enables.
+ */
+&ps_jpg {
+	status = "okay";
+};
+
+&jpeg0_dart {
+	status = "okay";
+};
+
+&jpeg0 {
+	status = "okay";
+};
+
+&jpeg1 {
+	status = "okay";
+};
+
 #include "t6050-j714s-pmp-tunables.dtsi"
 
 /*
@@ -548,11 +613,76 @@
 /* The same T6050 camera as J716c (J714sAP ADT); the loader sets the J714s sensor type. */
 #include "t6050-j716c-isp.dtsi"
 
+/*
+ * The J714s camera sizes: sensor config 6 (two stacked 3040x2880 frames; the ISP processes
+ * the first) cropped and scaled by the ISP per size. Each crop is centred on that frame;
+ * the landscape sizes take two-thirds of its width, the portrait sizes the same length of
+ * its height and the square that side.
+ */
+&isp0 {
+	/delete-node/ sensor-presets;
+
+	sensor-presets {
+		/* 1920x1080 */
+		preset0 {
+			apple,config-index = <6>;
+			apple,input-size = <3040 5760>;
+			apple,output-size = <1920 1080>;
+			apple,crop = <506 870 2026 1140>;
+		};
+		/* 640x480 */
+		preset1 {
+			apple,config-index = <6>;
+			apple,input-size = <3040 5760>;
+			apple,output-size = <640 480>;
+			apple,crop = <506 680 2026 1520>;
+		};
+		/* 1280x720 */
+		preset2 {
+			apple,config-index = <6>;
+			apple,input-size = <3040 5760>;
+			apple,output-size = <1280 720>;
+			apple,crop = <506 870 2026 1140>;
+		};
+		/* 1760x1328 */
+		preset3 {
+			apple,config-index = <6>;
+			apple,input-size = <3040 5760>;
+			apple,output-size = <1760 1328>;
+			apple,crop = <506 676 2026 1528>;
+		};
+		/* 1328x1760 */
+		preset4 {
+			apple,config-index = <6>;
+			apple,input-size = <3040 5760>;
+			apple,output-size = <1328 1760>;
+			apple,crop = <756 426 1528 2026>;
+		};
+		/* 1552x1552 */
+		preset5 {
+			apple,config-index = <6>;
+			apple,input-size = <3040 5760>;
+			apple,output-size = <1552 1552>;
+			apple,crop = <506 426 2026 2026>;
+		};
+		/* 1080x1920 */
+		preset6 {
+			apple,config-index = <6>;
+			apple,input-size = <3040 5760>;
+			apple,output-size = <1080 1920>;
+			apple,crop = <950 426 1140 2026>;
+		};
+	};
+};
+
 /* The GPU and the internal panel, for the boot loader's handoff */
 #include "t6050-j714s-gpu-panel.dtsi"
 
 /* External displays, on the left-front and right ports */
 #include "t6050-j714s-display.dtsi"
+
+/* DisplayPort audio of dcpext0's displays */
+#include "t6050-j714s-dpaudio.dtsi"
 
 /* The Neural Engine, started only after the boot loader's preload hand-off */
 #include "t6050-j714s-ane.dtsi"

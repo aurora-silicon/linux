@@ -105,14 +105,14 @@ struct brcmf_if *brcmf_get_ifp(struct brcmf_pub *drvr, int ifidx)
 	return ifp;
 }
 
-void brcmf_configure_arp_nd_offload(struct brcmf_if *ifp, bool enable)
+int brcmf_configure_arp_nd_offload(struct brcmf_if *ifp, bool enable)
 {
-	s32 err;
+	s32 err, ret = 0;
 	u32 mode;
 
 	if (enable && brcmf_is_apmode_operating(ifp->drvr->wiphy)) {
 		brcmf_dbg(TRACE, "Skip ARP/ND offload enable when soft AP is running\n");
-		return;
+		return 0;
 	}
 
 	if (enable)
@@ -124,11 +124,13 @@ void brcmf_configure_arp_nd_offload(struct brcmf_if *ifp, bool enable)
 	/* is simply not supported and err 0 will be returned                 */
 	err = brcmf_fil_iovar_int_set(ifp, "arp_ol", mode);
 	if (err) {
+		ret = err;
 		brcmf_dbg(TRACE, "failed to set ARP offload mode to 0x%x, err = %d\n",
 			  mode, err);
 	} else {
 		err = brcmf_fil_iovar_int_set(ifp, "arpoe", enable);
 		if (err) {
+			ret = err;
 			brcmf_dbg(TRACE, "failed to configure (%d) ARP offload err = %d\n",
 				  enable, err);
 		} else {
@@ -139,12 +141,16 @@ void brcmf_configure_arp_nd_offload(struct brcmf_if *ifp, bool enable)
 
 	err = brcmf_fil_iovar_int_set(ifp, "ndoe", enable);
 	if (err) {
+		if (!ret)
+			ret = err;
 		brcmf_dbg(TRACE, "failed to configure (%d) ND offload err = %d\n",
 			  enable, err);
 	} else {
 		brcmf_dbg(TRACE, "successfully configured (%d) ND offload to 0x%x\n",
 			  enable, mode);
 	}
+
+	return ret;
 }
 
 static void _brcmf_set_multicast_list(struct work_struct *work)
@@ -1326,12 +1332,14 @@ static int brcmf_revinfo_read(struct seq_file *s, void *data)
  * Serialize arming from debugfs reset and brcmf_fw_crashed() against
  * teardown.  The remove path sets ->removing and drains the work while
  * holding bus_reset_lock, so a racing armer is either drained or skips it.
+ * The reset runs on a freezable workqueue so that it never overlaps a system
+ * sleep transition: one armed while devices suspend runs after the resume.
  */
 static void brcmf_bus_schedule_reset(struct brcmf_bus *bus_if)
 {
 	mutex_lock(&bus_if->bus_reset_lock);
 	if (bus_if->drvr && bus_if->drvr->bus_reset.func && !bus_if->removing)
-		schedule_work(&bus_if->drvr->bus_reset);
+		queue_work(system_freezable_wq, &bus_if->drvr->bus_reset);
 	mutex_unlock(&bus_if->bus_reset_lock);
 }
 
@@ -1339,7 +1347,8 @@ void brcmf_bus_cancel_reset_work(struct brcmf_bus *bus_if)
 {
 	mutex_lock(&bus_if->bus_reset_lock);
 	bus_if->removing = true;
-	if (bus_if->drvr)
+	/* Set up only by brcmf_attach(), once the firmware has loaded. */
+	if (bus_if->drvr && bus_if->drvr->bus_reset.func)
 		cancel_work_sync(&bus_if->drvr->bus_reset);
 	mutex_unlock(&bus_if->bus_reset_lock);
 }

@@ -1,0 +1,60 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J714s DisplayPort audio on dcpext0, as macOS 27 has it: dp-audio1 belongs to dcpext0 and
+ * takes its samples from dispext0's own ADMAC (admac-dispext0, behind dart-dispext0-isoc),
+ * all in DISPEXT0_ADMA. The DCP side starts unless appledrm.hdmi_audio=0. dcpext0's other
+ * engines' audio (dp-audio2 and on) is not described. The boot loader finds the ADMAC's
+ * control block by its alias and copies the block's ADT tunables into it.
+ */
+
+/ {
+	aliases {
+		admac-dispext0-control = &admac_dispext0_ced_ssw;
+	};
+
+	dpaudio1: audio-controller-1 {
+		compatible = "apple,t6050-dpaudio", "apple,dpaudio";
+		dmas = <&admac_dispext0 0>;
+		dma-names = "tx";
+		power-domains = <&ps_dispext0_adma>;
+		status = "okay";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dpaudio1_dcpext0: endpoint {
+					remote-endpoint = <&dcpext0_audio>;
+				};
+			};
+		};
+	};
+};
+
+&dcpext0 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dcpext0_audio: endpoint {
+				remote-endpoint = <&dpaudio1_dcpext0>;
+			};
+		};
+	};
+};
+
+&ps_dispext0_adma {
+	status = "okay";
+};
+
+&dispext0_isoc_dart {
+	status = "okay";
+};
+
+&admac_dispext0 {
+	status = "okay";
+};

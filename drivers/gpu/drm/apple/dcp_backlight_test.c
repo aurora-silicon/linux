@@ -760,6 +760,54 @@ static void edr_start_ramp_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, dcp_edr_next(hm, DCP_EDR_UNITY, 6, 6), DCP_EDR_UNITY);
 }
 
+/* Swaps @us apart from @from to @to; returns their number, each step checked. */
+static unsigned int edr_timed_ramp(struct kunit *test, u32 from, u32 to, u32 us,
+				   u32 lo, u32 hi)
+{
+	u32 cap = max(from, to), hm = from;
+	unsigned int swaps = 0;
+
+	while (hm != to) {
+		u32 next = dcp_edr_next_timed(hm, to, cap, 60, 60, us);
+		u32 ratio = div_u64((u64)next * 100000, hm);
+
+		/* Each step's ratio x100000, but for the last one. */
+		if (next != to) {
+			KUNIT_EXPECT_GE(test, ratio, lo);
+			KUNIT_EXPECT_LE(test, ratio, hi);
+		}
+		hm = next;
+		KUNIT_ASSERT_LT(test, ++swaps, 1000U);
+	}
+	return swaps;
+}
+
+static void edr_timed_ramp_test(struct kunit *test)
+{
+	/* macOS's ramp up: x1.0555 per 24 Hz frame, 1.2 to 16 in 2.0 s. */
+	KUNIT_EXPECT_EQ(test, edr_timed_ramp(test, 1200, 16000, 41667, 105450, 105650), 49U);
+	/* Down: x0.9893 per 120 Hz refresh, 16 to 1.2 in 2.0 s. */
+	KUNIT_EXPECT_EQ(test, edr_timed_ramp(test, 16000, 1200, 8333, 98800, 98980), 237U);
+	/* The rate is in time: 1.0 to 16 in about 2.15 s at any cadence. */
+	KUNIT_EXPECT_EQ(test, edr_timed_ramp(test, 1000, 16000, 12000, 101400, 101700), 181U);
+	KUNIT_EXPECT_EQ(test, edr_timed_ramp(test, 1000, 16000, DCP_EDR_HOLDOFF_US,
+					     106600, 106700), 43U);
+	/* No time yet: still one step. */
+	KUNIT_EXPECT_EQ(test, dcp_edr_next_timed(1000, 16000, 16000, 60, 60, 0), 1001U);
+	KUNIT_EXPECT_EQ(test, dcp_edr_next_timed(16000, 1000, 16000, 60, 60, 0), 15999U);
+	KUNIT_EXPECT_EQ(test, dcp_edr_next_timed(16000, 16000, 16000, 60, 60, 8333), 16000U);
+}
+
+static void edr_timed_limits_test(struct kunit *test)
+{
+	/* Above what the peak leaves, at once: SDR white rose to 200 nits. */
+	KUNIT_EXPECT_EQ(test, dcp_edr_next_timed(16000, 8000, 8000, 60, 200, 8333), 8000U);
+	KUNIT_EXPECT_EQ(test, dcp_edr_next_timed(12000, 1000, 8000, 60, 200, 8333), 8000U);
+	/* SDR white falling mid-ramp holds the panel level, up to the target. */
+	KUNIT_EXPECT_EQ(test, dcp_edr_next_timed(4000, 16000, 16000, 60, 50, 8333), 4800U);
+	KUNIT_EXPECT_EQ(test, dcp_edr_next_timed(15000, 16000, 16000, 60, 30, 8333), 16000U);
+}
+
 static struct kunit_case backlight_cases[] = {
 	KUNIT_CASE(backlight_reports_keep_target_test),
 	KUNIT_CASE(backlight_millinits_takeover_test),
@@ -786,6 +834,8 @@ static struct kunit_case backlight_cases[] = {
 	KUNIT_CASE(edr_low_end_steady_test),
 	KUNIT_CASE(edr_fade_monotonic_test),
 	KUNIT_CASE(edr_start_ramp_test),
+	KUNIT_CASE(edr_timed_ramp_test),
+	KUNIT_CASE(edr_timed_limits_test),
 	{}
 };
 

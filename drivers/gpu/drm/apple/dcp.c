@@ -282,6 +282,29 @@ static int dcp_secure_port_init(struct apple_dcp *dcp)
 	return devm_add_action_or_reset(dev, dcp_release_secure_rtkit, dcp);
 }
 
+/*
+ * Stopping the firmware (DPMS off and system sleep with hw.s2r or hw.s2r_ext) powers the
+ * display domains through apple,display-power, and the internal DCP only takes IOP idle
+ * once its secure port has gone idle. A device tree without those keeps the firmware
+ * running: DPMS is the backlight alone and the display stays up across a sleep.
+ */
+static void dcp_s2r_check_dt(struct apple_dcp *dcp)
+{
+	struct device_node *np = dcp->dev->of_node;
+	bool power = of_property_present(np, "apple,display-power");
+	bool secure = of_property_match_string(np, "mbox-names", "secure") >= 0;
+
+	if (dcp->hw.s2r && (!power || !secure)) {
+		dev_info(dcp->dev, "no %s in the device tree, the firmware keeps running\n",
+			 !power ? "apple,display-power" : "secure mailbox");
+		dcp->hw.s2r = false;
+	}
+	if (dcp->hw.s2r_ext && !power) {
+		dev_info(dcp->dev, "no apple,display-power in the device tree, the firmware keeps running\n");
+		dcp->hw.s2r_ext = false;
+	}
+}
+
 static void dcp_release_rtkit(void *data)
 {
 	struct apple_dcp *dcp = data;
@@ -642,6 +665,30 @@ static void send_vblank_event(struct drm_device *dev,
  * outputs.
  * This might be a difference between dcp and dcpext.
  */
+/*
+ * Advance the CRTC's flip sequence by the number of refresh periods since the
+ * previous flip (at least one), so that userspace sees a non-zero, increasing
+ * vblank sequence. Without a known refresh rate every flip counts as one.
+ */
+static u64 dcp_crtc_next_flip_seq(struct apple_crtc *crtc, ktime_t flip)
+{
+	int hz = drm_mode_vrefresh(&crtc->base.mode);
+	u64 frames = 1;
+
+	if (hz > 0 && crtc->flip_seq_time) {
+		s64 ns = ktime_to_ns(ktime_sub(flip, crtc->flip_seq_time));
+		u64 frame_ns = div_u64(NSEC_PER_SEC, hz);
+
+		if (ns > 0)
+			frames = max_t(u64, 1,
+				       div64_u64(ns + frame_ns / 2, frame_ns));
+	}
+	crtc->flip_seq += frames;
+	crtc->flip_seq_time = flip;
+
+	return crtc->flip_seq;
+}
+
 static void dcp_crtc_send_page_flip_event(struct apple_crtc *crtc,
 					  struct drm_pending_vblank_event *e,
 					  ktime_t now, ktime_t start)
@@ -651,7 +698,6 @@ static void dcp_crtc_send_page_flip_event(struct apple_crtc *crtc,
 	unsigned int pipe = drm_crtc_index(&crtc->base);
 	ktime_t flip;
 
-	seq = 0;
 	if (start != KTIME_MIN) {
 		s64 delta = ktime_us_delta(now, start);
 		if (delta <= 500)
@@ -663,6 +709,7 @@ static void dcp_crtc_send_page_flip_event(struct apple_crtc *crtc,
 	} else {
 		flip = now;
 	}
+	seq = dcp_crtc_next_flip_seq(crtc, flip);
 	e->pipe = pipe;
 	send_vblank_event(dev, e, seq, flip);
 }
@@ -1132,8 +1179,21 @@ static void dcp_panel_read_adt(struct apple_dcp *dcp)
 	if (dcp->panel_identity)
 		dcp->panel_identity->adt = panel.identity;
 	dcp->panel.color_target = ret ? NULL : dcp_panel_gamut_color_space(panel.gamut);
-	if (desktop)
+	if (desktop || dcp->fw_compat == DCP_FIRMWARE_V_27_0)
 		dcp->panel.edr_ceiling = dcp_edr_ceiling(panel.edr_potential_headroom);
+	/*
+	 * Firmware 27 reports no peak (desktop 26.x: res_max_panel_brightness()).
+	 * The ADT's LmaxProduct gives it (1600 nits on the M5 Pro).  Only a peak
+	 * above the SDR range gives headroom.
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+		u32 peak = panel.lmax_product >> 16;
+
+		if (peak > dcp->brightness.maximum && peak <= 10000) {
+			dev_info(dcp->dev, "panel peak luminance %u nits (ADT)\n", peak);
+			WRITE_ONCE(dcp->panel.peak_nits, peak);
+		}
+	}
 	dev_info(dcp->dev, "panel ADT: %s, panel node %s, dimensions %ux%u mm\n",
 		 ret ? "unavailable" : "parsed", panel.found ? "present" : "absent",
 		 dcp->panel.width_mm, dcp->panel.height_mm);
@@ -3693,6 +3753,15 @@ bool dcp_fw_compat_is_desktop(struct platform_device *pdev)
 	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
 }
 
+/* Firmware whose panel shows PQ content as EDR (dcp_panel_edr_supported()). */
+bool dcp_fw_compat_panel_edr(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+	       dcp->fw_compat == DCP_FIRMWARE_V_27_0;
+}
+
 bool dcp_fw_compat_is_14_7(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
@@ -3905,9 +3974,9 @@ static const struct {
 	{ DPAVSERV_ENDPOINT, "DPAVSERV" },
 	{ AV_ENDPOINT, "AV" },
 	{ DPTX_ENDPOINT, "DPTX" },
-	{ HDCP_ENDPOINT, "HDCP" },
+	{ AV_VIDEO_ENDPOINT, "AVVIDEO" },
 	{ EPIC2C_ENDPOINT, "EPIC2C" },
-	{ REMOTE_ALLOC_ENDPOINT, "REMOTEALLOC" },
+	{ DPTX_HDCP_ENDPOINT, "DPTXHDCP" },
 };
 
 static void dcp_desktop_graph_skip(struct apple_dcp *dcp, u32 endpoint,
@@ -3924,7 +3993,7 @@ static void dcp_desktop_graph_skip(struct apple_dcp *dcp, u32 endpoint,
 
 /*
  * The external processors (T6041 dcpext): DPDEV, DPAVCTRL (all four
- * controller interfaces), DPSAC, AV and REMOTEALLOC as advertised, then
+ * controller interfaces), DPSAC, AV and DPTXHDCP as advertised, then
  * with a DP PHY or a Type-C route iBoot, the DPTX port services on EPIC2C,
  * DPAVSERV for the EDID, EXPERT and EPIC25, and the DPTX connect of port 0.
  * A failure fails this processor's start; the panel is not affected.
@@ -3975,8 +4044,8 @@ static int dcp_start_desktop_external(struct apple_dcp *dcp, u32 map)
 			d->graph_started |= BIT(AV_AUDIO_ENDPOINT_DESKTOP - 0x20);
 	}
 #endif
-	ret = dcp_desktop_start_ext_ep(dcp, map, REMOTE_ALLOC_ENDPOINT,
-				       "REMOTEALLOC");
+	ret = dcp_desktop_start_ext_ep(dcp, map, DPTX_HDCP_ENDPOINT,
+				       "DPTXHDCP");
 	if (ret)
 		return ret;
 
@@ -4310,6 +4379,10 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_27_0:
 		iomfb_poweroff_v27(dcp);
+		if (dcp->edr_hm)
+			dcp->edr_restart = true;
+		WRITE_ONCE(dcp->edr_ramping, false);
+		cancel_delayed_work(&dcp->iomfb.edr_tick);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
@@ -5226,6 +5299,8 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	const struct dcp_v14_board *v14_board;
 	char compat_str[DCP_FW_VERSION_STR_LEN];
 	char fw_str[DCP_FW_VERSION_STR_LEN];
+	unsigned int num_missing;
+	const char *missing;
 	int ret;
 
 	/*
@@ -5242,8 +5317,18 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 
 	if (hw->firmware_compat == DCP_FIRMWARE_V_27_0) {
 		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
-		if (ret < 0 || strcmp(compat_str, "27.0.0"))
+		if (ret < 0 || !iomfb_v27_methods(compat_str)) {
+			dev_err(dev, "DCP firmware-compat %s has no 27.x method table\n",
+				ret < 0 ? "missing" : compat_str);
 			return DCP_FIRMWARE_UNKNOWN;
+		}
+		missing = iomfb_v27_missing_method(iomfb_v27_methods(compat_str),
+						   &num_missing);
+		if (missing) {
+			dev_err(dev, "DCP firmware-compat %s not started: no ID known for %u methods (first: %s)\n",
+				compat_str, num_missing, missing);
+			return DCP_FIRMWARE_UNKNOWN;
+		}
 		return DCP_FIRMWARE_V_27_0;
 	}
 
@@ -5887,6 +5972,7 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 	ret = devm_add_action_or_reset(dev, dcp_release_rtkit, dcp);
 	if (ret)
 		goto err_piodma;
+	dcp_s2r_check_dt(dcp);
 	/* After a warm restart its log counters need echoing, or it refuses its next idle. */
 	if (dcp->hw.s2r || dcp->hw.s2r_ext)
 		apple_rtkit_set_oslog_echo(dcp->rtk, true);
@@ -6364,6 +6450,13 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 			if (!dcp->panel_identity)
 				return -ENOMEM;
 		}
+	}
+	if (fw_compat == DCP_FIRMWARE_V_27_0) {
+		char compat_str[DCP_FW_VERSION_STR_LEN];
+
+		/* Checked by dcp_check_firmware_version(). */
+		dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
+		dcp->v27_methods = iomfb_v27_methods(compat_str);
 	}
 	if (fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
 		dcp->desktop = devm_kzalloc(dev, sizeof(*dcp->desktop), GFP_KERNEL);
@@ -8536,8 +8629,9 @@ static int dcp_platform_suspend(struct device *dev)
 	/*
 	 * T8132: setPowerState powers the display down; the coprocessor keeps
 	 * running and its power domains stay on, as below, unless the internal
-	 * display is blanked with appledrm.power_gate_ms set: then the
-	 * coprocessor and its domains are powered down too (iomfb_m4_suspend()).
+	 * display is blanked and this is a deep sleep, or appledrm.power_gate_ms
+	 * is set: then the coprocessor and its domains are powered down too
+	 * (iomfb_m4_suspend()).
 	 */
 	if (iomfb_is_m4(dcp)) {
 		int ret = iomfb_m4_suspend(dcp);
@@ -8580,6 +8674,15 @@ static int dcp_platform_suspend(struct device *dev)
 			dcp_enable_typec_work(dcp);
 			return ret;
 		}
+		/*
+		 * The crossbar shares the ATC power domain, which an s2idle can take
+		 * down too: with deep sleep selected, the USB controller stops for any
+		 * sleep and stops holding it. The crossbar then wakes with its route
+		 * lost, while the mux core still holds the selection, and the link
+		 * never trains again (DEVICE_NOT_RESPONDING). Take the output down
+		 * while it has power and select it again on resume, as s2r does.
+		 */
+		dcp_typec_route_park(dcp);
 		device_set_wakeup_path(dev);
 		return 0;
 	}
@@ -8636,6 +8739,9 @@ static int dcp_platform_resume(struct device *dev)
 	dcp->link_recovery_tries = 0;
 	dcp_release_after_sleep(dcp);
 	iomfb_v14_7_backlight_resume(dcp);
+	/* Its crossbar output, parked by the suspend, before the link connects again. */
+	if (dcp_is_external_h17p(dcp))
+		dcp_typec_route_unpark(dcp);
 	dcp_enable_typec_work(dcp);
 	/* The HDMI output's PHY and crossbar may have lost their setup in sleep. */
 	if (dcp->external_native)

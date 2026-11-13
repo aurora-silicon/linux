@@ -108,8 +108,20 @@ enum {
 	AV_AUDIO_ENDPOINT_DESKTOP = 0x2b,
 	DPTX_ENDPOINT = 0x2a,
 	DPTX_ENDPOINT_V2 = 0x2c,
-	HDCP_ENDPOINT = 0x2b,
+	/*
+	 * Compact desktop/M4 firmware: the panel processor advertises
+	 * dcpav-video-interface-epic on 0x2b, the external ones the audio
+	 * service (AV_AUDIO_ENDPOINT_DESKTOP).  Nothing HDCP lives here.
+	 */
+	AV_VIDEO_ENDPOINT = 0x2b,
+	/*
+	 * 0x2d is the remote allocator for the IOMFB firmware (H17P, 27.0
+	 * internal), which must be started before IOMFB.  Compact desktop/M4
+	 * firmware advertises dcpdptx-hdcp-interface on it instead, one per
+	 * processor (disp0, dispext0, dispext1).  Bind HDCP by service name.
+	 */
 	REMOTE_ALLOC_ENDPOINT = 0x2d,
+	DPTX_HDCP_ENDPOINT = 0x2d,
 	IOMFB_ENDPOINT = 0x37,
 };
 
@@ -467,6 +479,8 @@ struct apple_dcp {
 	enum dcp_firmware_version fw_compat;
 	/* Bumped by every iomfb poweron; see afk_compact_slot(). */
 	u32 afk_power_gen;
+	/* Firmware 27.x: the method IDs of this build (iomfb_v27_methods()). */
+	const struct dcp_method_entry *v27_methods;
 	bool external;
 	/* A desktop 26.x external processor (apple,t6041-dcpext) */
 	bool desktop_external;
@@ -661,6 +675,11 @@ struct apple_dcp {
 	u32 edr_hm;
 	u32 edr_sdr;
 	bool edr_restart;
+	/* Firmware 27: when the headroom last moved, and short of its target. */
+	ktime_t edr_step;
+	bool edr_ramping;
+	/* SDR white in nits of the present being built (H17P backlight) */
+	u32 edr_present_sdr;
 	struct dcp_set_digital_out_mode_req mode;
 
 	/* completion for active turning true */
@@ -938,6 +957,8 @@ struct apple_dcp {
 		unsigned int callback_count;
 		struct delayed_work timeout;
 		struct delayed_work backlight_retry;
+		/* A firmware 27 panel's EDR ramp on a still frame (iomfb_edr_tick()) */
+		struct delayed_work edr_tick;
 		unsigned long deadline;
 		unsigned int queued;
 		bool stopped;
@@ -1035,6 +1056,7 @@ bool iomfb_present_brightness_only_h17p(struct apple_dcp *dcp);
 bool iomfb_present_complete_h17p(struct apple_dcp *dcp);
 void iomfb_present_failed_h17p(struct apple_dcp *dcp);
 bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp);
+bool iomfb_present_has_surface_h17p(const struct dcp_swap_submit_req_h17p *request);
 bool iomfb_apply_backlight_h17p(struct apple_dcp *dcp,
 				const struct dcp_swap_submit_req_h17p *request,
 				struct dcp_present_h17p *wire);
@@ -1148,6 +1170,15 @@ static inline bool dcp_fw_is_14_7(const struct apple_dcp *dcp)
 static inline bool dcp_is_v14_7_external(const struct apple_dcp *dcp)
 {
 	return dcp->fw_compat == DCP_FIRMWARE_V_14_7 && dcp->external_native;
+}
+
+/*
+ * Firmware 27's external processors (the T6050 DCPEXTs): their DP/HDMI
+ * audio service is the desktop one, on endpoint 0x2b (see av.c).
+ */
+static inline bool dcp_is_v27_external(const struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_27_0 && dcp->hw.num_dptx_ports;
 }
 
 /* The 14.7 internal panel (J514S/J516S), presented through DCPLink. */

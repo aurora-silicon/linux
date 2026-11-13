@@ -2235,6 +2235,15 @@ static int apple_nvme_alloc_tagsets(struct apple_nvme *anv)
 	anv->tagset.numa_node = NUMA_NO_NODE;
 	anv->tagset.cmd_size = sizeof(struct apple_nvme_iod);
 	anv->tagset.driver_data = &anv->ioq;
+	/*
+	 * ANS has one I/O queue, so the block layer would default it to
+	 * mq-deadline like any single-queue device. With a scheduler attached,
+	 * every unplugged request (O_DIRECT sync reads, for instance) is
+	 * dispatched from a kblockd worker instead of the submitting task,
+	 * which adds a context switch to each I/O. Start without a scheduler,
+	 * as PCIe NVMe controllers do; one can still be selected through sysfs.
+	 */
+	anv->tagset.flags = BLK_MQ_F_NO_SCHED_BY_DEFAULT;
 
 	ret = blk_mq_alloc_tag_set(&anv->tagset);
 	if (ret)
@@ -3125,6 +3134,11 @@ static const struct apple_nvme_hw apple_nvme_t8132_hw = {
 	.needs_ioq_registers = true,
 	.cold_reset = true,
 	.max_queue_depth = 64,
+	/* T8140's values: T8132's sleep path hasn't been traced. */
+	.sleep_traced = true,
+	.sleep_epmap_last_mask = BIT(0),
+	.sleep_flush_max_nsid = 1,
+	.sleep_shn = NVME_CC_SHN_MASK,
 	/* Explicit flushes are required for writes to survive a reset on J713. */
 	.quirks = NVME_QUIRK_BROKEN_FUA,
 };
