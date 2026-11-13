@@ -836,6 +836,10 @@ struct apple_dcp {
 
 	struct dptx_port dptxport[2];
 
+	/* firmware 27 panel: its AV and DP service endpoints, by endpoint - 0x20 */
+	struct apple_dcp_afkep *panelav[0x20];
+	struct workqueue_struct *panelav_wq;
+
 	/* debugfs entries */
 	struct dentry *ep_debugfs[0x20];
 
