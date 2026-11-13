@@ -313,6 +313,48 @@ fn ta_read(id: u8, len: usize) -> core::result::Result<KVec<u8>, i32> {
     Ok(buf)
 }
 
+/// Sends one logical report to the keyboard (`report[0]` its logical ID, the
+/// rest its body), fragmenting it over the `0xfe` transport when the body is
+/// too large for a direct feature SET. A short body goes direct, as before.
+///
+/// A fragmented report's logical reply still arrives once, after the last
+/// frame; between the earlier frames the keyboard names a feature report for
+/// the host to read first (see [`wire::parse_fragment_notification`]), which
+/// is read and discarded — a read never changes the keyboard. If `reply_id`
+/// is not 0 the reply is awaited after the last frame and returned; otherwise
+/// the report is fire-and-forget and an empty vector is returned.
+fn ta_set_logical(
+    report: &[u8],
+    reply_id: u8,
+    cap: usize,
+    timeout_ms: u32,
+) -> core::result::Result<KVec<u8>, i32> {
+    if report.is_empty() {
+        return Err(-22);
+    }
+    let body = &report[1..];
+    if body.len() <= wire::XFE_DIRECT_MAX {
+        return ta_command(report, reply_id, cap, timeout_ms);
+    }
+    let logical_id = report[0];
+    let n = wire::xfe_frame_count(body.len());
+    for k in 0..n {
+        let frame = wire::xfe_frame(logical_id, body, k).map_err(|_| -22i32)?;
+        if k + 1 == n && reply_id != 0 {
+            // The last frame of a reply-bearing report: the logical reply
+            // follows it and covers the whole object.
+            return ta_command(&frame, reply_id, cap, timeout_ms);
+        }
+        // Between frames the keyboard asks the host to read one feature report.
+        let notif = ta_command(&frame, wire::XFE_REPORT, wire::XFE_NOTIFY_LEN, REPLY_MS)?;
+        let (fid, flen) = wire::parse_fragment_notification(&notif).map_err(|_| -71i32)?;
+        if flen != 0 {
+            ta_read(fid, flen)?;
+        }
+    }
+    Ok(KVec::new())
+}
+
 impl SepData {
     /// Pairs the attached keyboard with the enclave. Runs only from the
     /// `ta_pair` trigger, for a keyboard the enclave reports unpaired.
@@ -399,9 +441,12 @@ impl SepData {
         let identity = wire::parse_point_reply(&r, wire::reply::IDENTITY, 1).map_err(|e| kb(1, e))?;
         ta_read(0x4c, 1 + NONCE_LEN).map_err(|e| io(1, e))?;
 
-        // Step 2: the keyboard checks the host object.
+        // Step 2: the keyboard checks the host object. Its 137-byte body is
+        // too large for a direct SET on USB, so it goes over the 0xfe
+        // transport; a fresh pairing uses that form, not a direct SET 0x60
+        // (which is the already-paired session's).
         let c = wire::command(wire::cmd::PAIRING_CHECK, 2, &host).map_err(|_| io(2, -12))?;
-        let r = ta_command(&c, wire::reply::PAIRING_CHECK, wire::PAIRING_CHECK_REPLY_LEN, REPLY_MS)
+        let r = ta_set_logical(&c, wire::reply::PAIRING_CHECK, wire::PAIRING_CHECK_REPLY_LEN, REPLY_MS)
             .map_err(|e| io(2, e))?;
         if wire::parse_pairing_check(&r).map_err(|e| kb(2, e))? {
             return Err(PairStop::KeyboardPaired);
@@ -423,10 +468,10 @@ impl SepData {
         let chain = fw.data();
         for i in 0..wire::fragment_count(chain.len()) {
             let f = wire::fragment(4, wire::kind::CHAIN, chain, i).map_err(|_| io(4, -22))?;
-            ta_command(&f, 0, 0, 0).map_err(|e| io(4, e))?;
+            ta_set_logical(&f, 0, 0, 0).map_err(|e| io(4, e))?;
         }
         let c = wire::command(wire::cmd::HOST_OBJECT, 5, &host).map_err(|_| io(5, -12))?;
-        let r = ta_command(&c, wire::reply::HOST_OBJECT, wire::REPLY_HEADER_LEN, REPLY_MS).map_err(|e| io(5, e))?;
+        let r = ta_set_logical(&c, wire::reply::HOST_OBJECT, wire::REPLY_HEADER_LEN, REPLY_MS).map_err(|e| io(5, e))?;
         wire::check_reply(&r, wire::reply::HOST_OBJECT, 5).map_err(|e| kb(5, e))?;
 
         // Step 6: the enclave's attestation; step 7: host object and the
@@ -434,13 +479,13 @@ impl SepData {
         let att = &begin[b.host_attestation.clone()];
         for i in 0..wire::fragment_count(att.len()) {
             let f = wire::fragment(6, wire::kind::ATTESTATION, att, i).map_err(|_| io(6, -22))?;
-            ta_command(&f, 0, 0, 0).map_err(|e| io(6, e))?;
+            ta_set_logical(&f, 0, 0, 0).map_err(|e| io(6, e))?;
         }
         let mut p7 = KVec::new();
         p7.extend_from_slice(&host, GFP_KERNEL).map_err(|_| io(7, -12))?;
         p7.extend_from_slice(&begin[b.host_ephemeral.clone()], GFP_KERNEL).map_err(|_| io(7, -12))?;
         let c = wire::command(wire::cmd::PAIRING_FINISH, 7, &p7).map_err(|_| io(7, -12))?;
-        let r = ta_command(&c, wire::reply::ACCESSORY_MATERIAL, wire::MATERIAL_REPLY_LEN, MATERIAL_MS)
+        let r = ta_set_logical(&c, wire::reply::ACCESSORY_MATERIAL, wire::MATERIAL_REPLY_LEN, MATERIAL_MS)
             .map_err(|e| io(7, e))?;
         let m = wire::parse_material(&r).map_err(|e| kb(7, e))?;
         let finish = stac_ops::pairing_finish_request(&id, &identity, &r[m.attestation], &r[m.certificate])

@@ -13,6 +13,16 @@
 //! most 512 bytes, the rest zero. Fragments are not answered one by one; the
 //! next command's reply covers them.
 //!
+//! Those are the *logical* reports. On USB the transport under them carries
+//! only short feature reports, so a logical report whose body is over
+//! [`XFE_DIRECT_MAX`] bytes does not go in one feature SET: it is sliced into
+//! fixed 44-byte feature reports on report ID `0xfe` (see [`xfe_frame`]). The
+//! 532-byte `0x6a` fragments above are themselves carried this way, so a large
+//! object travels two layers: logical `0x6a` records, then `0xfe` frames.
+//! Between consecutive `0xfe` frames the keyboard asks the host to read one
+//! feature report (see [`parse_fragment_notification`]); the logical reply
+//! still arrives once, after the last frame.
+//!
 //! This module only encodes and checks bytes. It logs nothing: identities,
 //! points, attestations and certificates are opaque here.
 
@@ -186,6 +196,93 @@ pub(crate) fn fragment(
     out[1 + FRAGMENT_HEADER_LEN..1 + FRAGMENT_HEADER_LEN + chunk]
         .copy_from_slice(&object[offset..offset + chunk]);
     Ok(out)
+}
+
+/// The `0xfe` USB transport under the logical reports. A logical report's
+/// body (the bytes after its ID) that does not fit a direct feature SET is
+/// sliced into these fixed 44-byte feature reports:
+///
+///   `[0xfe][logical id][u16 segment word][40-byte chunk]`
+///
+/// The last chunk is zero-padded; every frame is the full length. The carried
+/// logical ID is repeated in every frame and is neither part of a chunk nor
+/// counted in the body length.
+pub(crate) const XFE_REPORT: u8 = 0xfe;
+/// The feature report length, the ID byte included.
+pub(crate) const XFE_FRAME_LEN: usize = 44;
+/// The ID, the logical ID and the two-byte segment word before the chunk.
+pub(crate) const XFE_HEADER_LEN: usize = 4;
+/// The body bytes one frame carries.
+pub(crate) const XFE_CHUNK: usize = XFE_FRAME_LEN - XFE_HEADER_LEN;
+/// The largest logical body a single direct feature SET carries on this USB
+/// path; a larger body is fragmented over `0xfe`.
+pub(crate) const XFE_DIRECT_MAX: usize = 43;
+/// The keyboard's between-frame notification, delivered logical-ID first:
+/// `[0xfe][target feature id][0xff][u16 target length]`.
+pub(crate) const XFE_NOTIFY_LEN: usize = 5;
+
+/// The segment word tags the frame in its top two bits; the low 14 bits carry
+/// a count, an index or a valid-byte length.
+const XFE_FIRST: u16 = 0x4000; // low 14 bits: total frame count N (>= 2).
+const XFE_LAST: u16 = 0x8000; // low 14 bits: valid bytes in the last chunk.
+const XFE_COUNT_MAX: usize = 0x3fff; // the 14-bit field's bound.
+/// The marker between the feature ID and the length in a notification.
+const XFE_NOTIFY_MARKER: u8 = 0xff;
+
+static_assert!(XFE_CHUNK == 40);
+
+/// How many `0xfe` frames a logical body of `len` bytes takes. Meaningful only
+/// for a body that is fragmented (`len > XFE_DIRECT_MAX`), where it is >= 2.
+pub(crate) fn xfe_frame_count(len: usize) -> usize {
+    len.div_ceil(XFE_CHUNK)
+}
+
+/// Frame `index` of `body` on the `0xfe` transport, carrying `logical_id`, as
+/// one 44-byte feature report, the ID first and the tail after the chunk zero.
+/// Refuses a body that fits a direct SET, a frame count past the 14-bit field,
+/// or an index past the end.
+pub(crate) fn xfe_frame(
+    logical_id: u8,
+    body: &[u8],
+    index: usize,
+) -> Result<[u8; XFE_FRAME_LEN]> {
+    let n = xfe_frame_count(body.len());
+    if body.len() <= XFE_DIRECT_MAX || n < 2 || n > XFE_COUNT_MAX || index >= n {
+        return Err(EINVAL);
+    }
+    let offset = index * XFE_CHUNK;
+    let chunk = core::cmp::min(XFE_CHUNK, body.len() - offset);
+    let word: u16 = if index == 0 {
+        XFE_FIRST | n as u16
+    } else if index == n - 1 {
+        XFE_LAST | chunk as u16
+    } else {
+        index as u16
+    };
+    let mut out = [0u8; XFE_FRAME_LEN];
+    out[0] = XFE_REPORT;
+    out[1] = logical_id;
+    out[2..XFE_HEADER_LEN].copy_from_slice(&word.to_le_bytes());
+    out[XFE_HEADER_LEN..XFE_HEADER_LEN + chunk].copy_from_slice(&body[offset..offset + chunk]);
+    Ok(out)
+}
+
+/// The keyboard's between-frame notification (delivered logical-ID first by the
+/// shim): which feature report the host must read, and how many bytes, before
+/// the next `0xfe` frame. Returns the feature ID and the length.
+pub(crate) fn parse_fragment_notification(
+    reply: &[u8],
+) -> core::result::Result<(u8, usize), WireError> {
+    if reply.len() != XFE_NOTIFY_LEN {
+        return Err(WireError::Length);
+    }
+    if reply[0] != XFE_REPORT {
+        return Err(WireError::Id);
+    }
+    if reply[2] != XFE_NOTIFY_MARKER {
+        return Err(WireError::Field);
+    }
+    Ok((reply[1], u16::from_le_bytes([reply[3], reply[4]]) as usize))
 }
 
 /// Checks a reply's ID, step and status, and returns its payload.
@@ -433,6 +530,154 @@ mod tests {
         assert!(fragment(4, kind::CHAIN, &[], 0).is_err());
         let big = obj(FRAGMENTED_MAX + 1);
         assert!(fragment(4, kind::CHAIN, &big, 0).is_err());
+    }
+
+    // A fail-closed reassembler: the keyboard's side of the 0xfe transport,
+    // here only so the encoder's output can be checked end to end and its
+    // rejection cases pinned. Every rule is from the envelope spec.
+    fn xfe_reassemble(
+        logical_id: u8,
+        frames: &[[u8; XFE_FRAME_LEN]],
+    ) -> core::result::Result<KVec<u8>, WireError> {
+        if frames.len() < 2 || frames.len() > XFE_COUNT_MAX {
+            return Err(WireError::Length);
+        }
+        let n = frames.len();
+        let mut out = KVec::new();
+        for (k, f) in frames.iter().enumerate() {
+            if f[0] != XFE_REPORT || f[1] != logical_id {
+                return Err(WireError::Id);
+            }
+            let word = u16::from_le_bytes([f[2], f[3]]);
+            let tag = word & 0xc000;
+            let low = (word & 0x3fff) as usize;
+            let chunk = if k == 0 {
+                // FIRST: the count must be the real frame count.
+                if tag != XFE_FIRST || low != n {
+                    return Err(WireError::Field);
+                }
+                XFE_CHUNK
+            } else if k == n - 1 {
+                // LAST: 1..=40 valid bytes, nothing after it.
+                if tag != XFE_LAST || low == 0 || low > XFE_CHUNK {
+                    return Err(WireError::Field);
+                }
+                low
+            } else {
+                // CONT: its own index, no gap or overlap.
+                if tag != 0 || low != k {
+                    return Err(WireError::Field);
+                }
+                XFE_CHUNK
+            };
+            out.extend_from_slice(&f[XFE_HEADER_LEN..XFE_HEADER_LEN + chunk], GFP_KERNEL)
+                .unwrap();
+        }
+        Ok(out)
+    }
+
+    fn xfe_frames(logical_id: u8, body: &[u8]) -> KVec<[u8; XFE_FRAME_LEN]> {
+        let mut v = KVec::new();
+        for i in 0..xfe_frame_count(body.len()) {
+            v.push(xfe_frame(logical_id, body, i).unwrap(), GFP_KERNEL).unwrap();
+        }
+        v
+    }
+
+    // The four fragmented pairing reports of the recording, with the exact
+    // frame counts and segment words the capture shows, each reassembling to
+    // the body it was sliced from.
+    #[test]
+    fn the_0xfe_transport_slices_and_tags() {
+        // report, body length, frame count, every segment word.
+        let cases: &[(u8, usize, usize, &[u16])] = &[
+            (cmd::PAIRING_CHECK, 137, 4, &[0x4004, 0x0001, 0x0002, 0x8011]),
+            (
+                cmd::FRAGMENT,
+                532,
+                14,
+                &[
+                    0x400e, 0x0001, 0x0002, 0x0003, 0x0004, 0x0005, 0x0006, 0x0007, 0x0008,
+                    0x0009, 0x000a, 0x000b, 0x000c, 0x800c,
+                ],
+            ),
+            (cmd::HOST_OBJECT, 137, 4, &[0x4004, 0x0001, 0x0002, 0x8011]),
+            (cmd::PAIRING_FINISH, 202, 6, &[0x4006, 0x0001, 0x0002, 0x0003, 0x0004, 0x8002]),
+        ];
+        for &(id, len, n, words) in cases {
+            let body = obj(len);
+            assert_eq!(xfe_frame_count(len), n);
+            let frames = xfe_frames(id, &body);
+            assert_eq!(frames.len(), n);
+            for (k, f) in frames.iter().enumerate() {
+                assert_eq!(f.len(), XFE_FRAME_LEN);
+                assert_eq!(f[0], XFE_REPORT);
+                assert_eq!(f[1], id);
+                assert_eq!(u16::from_le_bytes([f[2], f[3]]), words[k]);
+                // The last chunk's tail is zero.
+                if k == n - 1 {
+                    let valid = len - XFE_CHUNK * (n - 1);
+                    assert!(f[XFE_HEADER_LEN + valid..].iter().all(|&b| b == 0));
+                }
+            }
+            assert!(xfe_reassemble(id, &frames).unwrap().as_slice() == body.as_slice());
+        }
+    }
+
+    #[test]
+    fn the_0xfe_transport_refuses_small_bodies_and_bad_indices() {
+        // A body that fits a direct SET is never fragmented.
+        assert!(xfe_frame(cmd::PAIRING_CHECK, &obj(XFE_DIRECT_MAX), 0).is_err());
+        // The boundary: 44 bytes is the first fragmented length (two frames).
+        assert_eq!(xfe_frame_count(XFE_DIRECT_MAX + 1), 2);
+        assert!(xfe_frame(cmd::PAIRING_CHECK, &obj(XFE_DIRECT_MAX + 1), 0).is_ok());
+        // An index past the last frame.
+        let body = obj(137);
+        assert!(xfe_frame(cmd::PAIRING_CHECK, &body, 4).is_err());
+    }
+
+    #[test]
+    fn the_0xfe_reassembler_fails_closed() {
+        let body = obj(137);
+        let good = xfe_frames(cmd::PAIRING_CHECK, &body);
+        assert!(xfe_reassemble(cmd::PAIRING_CHECK, &good).is_ok());
+        // A frame for another logical report.
+        assert_eq!(xfe_reassemble(cmd::HOST_OBJECT, &good), Err(WireError::Id));
+        // A dropped continuation frame leaves a gap (frame 2 now reads index 3).
+        let mut gap = KVec::new();
+        gap.push(good[0], GFP_KERNEL).unwrap();
+        gap.push(good[1], GFP_KERNEL).unwrap();
+        gap.push(good[3], GFP_KERNEL).unwrap();
+        // FIRST still says four frames, but only three are present.
+        assert_eq!(xfe_reassemble(cmd::PAIRING_CHECK, &gap), Err(WireError::Field));
+        // The first frame not tagged FIRST.
+        let mut nofirst = xfe_frames(cmd::PAIRING_CHECK, &body);
+        nofirst[0][2] = 0x01;
+        nofirst[0][3] = 0x00;
+        assert_eq!(xfe_reassemble(cmd::PAIRING_CHECK, &nofirst), Err(WireError::Field));
+        // The last frame claiming more valid bytes than a chunk holds.
+        let mut biglast = xfe_frames(cmd::PAIRING_CHECK, &body);
+        let last = biglast.len() - 1;
+        biglast[last][2] = 0x29; // 0x8029 = 41 valid bytes
+        biglast[last][3] = 0x80;
+        assert_eq!(xfe_reassemble(cmd::PAIRING_CHECK, &biglast), Err(WireError::Field));
+        // A single frame is never a fragmented object.
+        assert_eq!(xfe_reassemble(cmd::PAIRING_CHECK, &good[..1]), Err(WireError::Length));
+    }
+
+    #[test]
+    fn the_fragment_notification_parses() {
+        // [0xfe][feature id][0xff][u16 length], logical-ID first.
+        let n = [XFE_REPORT, 0x43, 0xff, 0x11, 0x0e];
+        assert_eq!(parse_fragment_notification(&n), Ok((0x43, 0x0e11)));
+        // The wrong transport ID, a missing marker, or the wrong length.
+        let mut bad = n;
+        bad[0] = 0x20;
+        assert_eq!(parse_fragment_notification(&bad), Err(WireError::Id));
+        let mut bad = n;
+        bad[2] = 0x00;
+        assert_eq!(parse_fragment_notification(&bad), Err(WireError::Field));
+        assert_eq!(parse_fragment_notification(&n[..4]), Err(WireError::Length));
     }
 
     fn reply_of(id: u8, step: u32, status: u32, payload: &[u8]) -> KVec<u8> {
