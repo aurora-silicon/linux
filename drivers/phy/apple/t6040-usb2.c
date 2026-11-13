@@ -368,6 +368,7 @@ struct t6040_usb2_phy {
 	bool cio_up;		/* PHY in mode 2, holds a runtime PM reference */
 	bool pipe_tunneled;	/* the controller's PIPE runs on the USB4 router */
 	u8 tun_rate[2];		/* DP tunnel link rate per DP IN adapter, 0 = off */
+	bool tun_pre;		/* switch 1 is held for DP IN 1 alone */
 	bool tun_pll;		/* AUSPLL programmed for DP tunnels */
 	bool router_running;	/* the USB4 router runs on this port's CIO link */
 	bool usb3_tunnel_req;	/* the router carries USB3 for the controller */
@@ -2128,9 +2129,10 @@ static int t6040_tun_select(u8 rate)
 	}
 }
 
+/* DP IN 1 runs on PCLK2 and needs PCLK1 as well: without it its video stops. */
 static u32 t6040_tun_enables(struct t6040_usb2_phy *tphy)
 {
-	return (tphy->tun_rate[0] ? t6040_tun_pclk[0].en : 0) |
+	return ((tphy->tun_rate[0] || tphy->tun_rate[1]) ? t6040_tun_pclk[0].en : 0) |
 	       (tphy->tun_rate[1] ? t6040_tun_pclk[1].en : 0);
 }
 
@@ -2220,18 +2222,23 @@ static int t6040_tun_pll_start(struct t6040_usb2_phy *tphy)
 	return 0;
 }
 
+static void t6040_tun_select_field(u32 *v, const struct t6040_tun_pclk *p, int sel, bool en)
+{
+	if (!!(*v & p->en) != en || ((*v >> p->sel_shift) & 0xf) != sel)
+		*v = (*v & ~(p->en | (0xf << p->sel_shift))) | (sel << p->sel_shift);
+}
+
 /* The DP 1.4 tunnel update for one pclk: select with its enable off, then the enables. */
 static void t6040_tun_select_write(struct t6040_usb2_phy *tphy, unsigned int dpin, int sel)
 {
-	const struct t6040_tun_pclk *p = &t6040_tun_pclk[dpin];
 	void __iomem *ctrl0 = t6040_core(tphy) + T6040_CORE_TX_DP_CTRL0;
 	u32 v = readl(ctrl0);
 
-	if (!!(v & p->en) != !!tphy->tun_rate[dpin] ||
-	    ((v >> p->sel_shift) & 0xf) != sel) {
-		v = (v & ~(p->en | (0xf << p->sel_shift))) | (sel << p->sel_shift);
-		writel(v, ctrl0);
-	}
+	t6040_tun_select_field(&v, &t6040_tun_pclk[dpin], sel, !!tphy->tun_rate[dpin]);
+	/* PCLK1 is DP IN 1's prerequisite at its own rate, unless DP IN 0 runs on it. */
+	if (dpin == 1 && !tphy->tun_rate[0])
+		t6040_tun_select_field(&v, &t6040_tun_pclk[0], sel, true);
+	writel(v, ctrl0);
 	writel((v & ~T6040_CORE_TX_DP_CTRL0_ENABLES) | t6040_tun_enables(tphy), ctrl0);
 }
 
@@ -2276,6 +2283,10 @@ static void t6040_tun_stop_all_locked(struct t6040_usb2_phy *tphy)
 		tphy->tun_rate[dpin] = 0;
 		t6040_tun_switch(tphy, dpin, false);
 	}
+	if (tphy->tun_pre) {
+		tphy->tun_pre = false;
+		t6040_tun_switch(tphy, 0, false);
+	}
 	t6040_tun_pll_stop(tphy);
 	dev_info(tphy->dev, "DP tunnel clocks off\n");
 }
@@ -2290,9 +2301,19 @@ static int t6040_tun_rate_locked(struct t6040_usb2_phy *tphy, unsigned int dpin,
 		if (!old)
 			return 0;
 		tphy->tun_rate[dpin] = 0;
-		t6040_tun_switch(tphy, dpin, false);
-		t6040_usb2_clear32(t6040_core(tphy) + T6040_CORE_TX_DP_CTRL0,
-				   t6040_tun_pclk[dpin].en);
+		if (dpin == 0 && tphy->tun_rate[1]) {
+			/* DP IN 1 keeps PCLK1 and its switch, now at its own rate. */
+			tphy->tun_pre = true;
+			t6040_tun_select_write(tphy, 1, t6040_tun_select(tphy->tun_rate[1]));
+		} else {
+			t6040_tun_switch(tphy, dpin, false);
+			if (dpin == 1 && tphy->tun_pre) {
+				tphy->tun_pre = false;
+				t6040_tun_switch(tphy, 0, false);
+			}
+		}
+		t6040_usb2_mask32(t6040_core(tphy) + T6040_CORE_TX_DP_CTRL0,
+				  T6040_CORE_TX_DP_CTRL0_ENABLES, t6040_tun_enables(tphy));
 		if (!tphy->tun_rate[!dpin])
 			t6040_tun_pll_stop(tphy);
 		dev_dbg(tphy->dev, "DP tunnel %u off\n", dpin);
@@ -2312,7 +2333,17 @@ static int t6040_tun_rate_locked(struct t6040_usb2_phy *tphy, unsigned int dpin,
 	}
 	tphy->tun_rate[dpin] = rate;
 	t6040_tun_select_write(tphy, dpin, sel);
+	/* DP IN 1 alone: switch 1 passes PCLK1, its prerequisite. */
+	if (dpin == 1 && !tphy->tun_rate[0] && !tphy->tun_pre) {
+		ret = t6040_tun_switch(tphy, 0, true);
+		if (ret)
+			goto switch_failed;
+		tphy->tun_pre = true;
+	} else if (dpin == 0) {
+		tphy->tun_pre = false;	/* DP IN 0 owns switch 1 again */
+	}
 	ret = t6040_tun_switch(tphy, dpin, true);
+switch_failed:
 	if (ret) {
 		dev_err(tphy->dev, "DP tunnel %u: clock switch timed out (ctrl %#x status %#x)\n",
 			dpin, readl(t6040_cfg(tphy) + T6040_CFG_DP_CLKSWITCH_CTRL),
