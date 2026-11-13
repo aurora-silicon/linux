@@ -499,6 +499,7 @@ impl crate::g17::Shared {
     /// callbacks are finished. Shutdown can detach Firmware during an off-lock
     /// boundary; the collector itself still owns every deferred completion.
     pub(in crate::g17) fn run_runtime_events(self: &Arc<Self>) {
+        let pass = crate::g17::latency::Pass::begin();
         // The way back queues a pass, which also handles a crash noticed meanwhile.
         if self.sleeping() {
             return;
@@ -519,9 +520,11 @@ impl crate::g17::Shared {
             };
             deferred
         };
+        deferred.latency = pass.map(crate::g17::latency::Pass::locked);
         crate::g17::trace::event(0);
         let result = self.runtime_event_turn(&mut deferred);
         deferred.finish();
+        deferred.latency = None;
         crate::g17::trace::event(2);
         self.queue_feed();
         if let Some(firmware) = (*self.state.lock()).as_deref_mut() {

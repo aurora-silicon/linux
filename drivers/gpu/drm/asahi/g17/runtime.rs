@@ -1349,6 +1349,8 @@ pub(super) struct DeferredBatch {
     render: KVVec<super::freelist::RenderBacking>,
     /// Tiler-heap extensions removed from idle heaps, with their aliases.
     tvb: KVVec<super::buffer::TvbRelease>,
+    /// Measurement only: the event pass this worker collector serves (latency.rs).
+    latency: Option<super::latency::Pass>,
 }
 impl DeferredBatch {
     const DEPTH: usize = if crate::hw::t8140::queues::RENDER_DEPTH as usize
@@ -1381,6 +1383,7 @@ impl DeferredBatch {
             vacated: KVVec::with_capacity(detached, GFP_KERNEL)?,
             render: KVVec::with_capacity(render_slots, GFP_KERNEL)?,
             tvb: KVVec::with_capacity(render_slots, GFP_KERNEL)?,
+            latency: None,
         })
     }
     /// Keeps the detached owner's unmapping and VM teardown out of the device
@@ -1482,8 +1485,12 @@ impl DeferredBatch {
             }
         }
         self.has_source_completions = false;
+        let latency = self.latency;
         for value in self.values.drain_all() {
-            value.finish();
+            match latency {
+                Some(pass) => super::latency::finish(pass, value),
+                None => value.finish(),
+            }
         }
         for binding in self.bindings.drain_all() {
             drop(binding);

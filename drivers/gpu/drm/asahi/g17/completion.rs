@@ -400,6 +400,9 @@ pub(crate) struct Completion {
     interrupted: AtomicBool,
     firmware_consumer: AtomicBool,
     class: AtomicU8,
+    /// Measurement only: the counter at this command's doorbell and the gap since its engine's
+    /// previous fence signal (see `latency`).
+    latency: [AtomicU64; 2],
 }
 
 impl Completion {
@@ -467,9 +470,19 @@ impl Completion {
                 interrupted: AtomicBool::new(false),
                 firmware_consumer: AtomicBool::new(false),
                 class: AtomicU8::new(0),
+                latency: [AtomicU64::new(0), AtomicU64::new(0)],
             }),
             GFP_KERNEL,
         )
+    }
+
+    /// Measurement only: the latency record's words (see `latency`).
+    pub(crate) fn latency(&self) -> &[AtomicU64; 2] {
+        &self.latency
+    }
+
+    pub(crate) fn is_compute(&self) -> bool {
+        self.is_compute
     }
 
     pub(crate) fn fence(&self) -> Fence {

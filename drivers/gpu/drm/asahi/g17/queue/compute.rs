@@ -3029,6 +3029,9 @@ impl Queue {
             // publication does: pipe 2 (compute) in bits 1:0, priority class in
             // bits 3:2. The generic work doorbell left the firmware to find the
             // ring itself and delayed dispatch.
+            if crate::g17::opt(crate::g17::OPT_LATENCY) {
+                crate::g17::latency::doorbell(&packet.completion);
+            }
             fence(Ordering::SeqCst);
             host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
             if self.graph.m5 {

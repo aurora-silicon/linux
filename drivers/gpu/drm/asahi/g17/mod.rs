@@ -51,6 +51,7 @@ mod ids;
 mod initdata;
 mod job;
 mod kick;
+mod latency;
 mod object;
 mod port;
 pub(crate) mod power;
@@ -457,6 +458,9 @@ impl rtkit::Operations for RoleOps {
         }
         if !is_events_message(ep, msg) {
             return false;
+        }
+        if opt(OPT_LATENCY) {
+            latency::irq();
         }
         data.shared.queue_event_records();
         true
@@ -1181,6 +1185,9 @@ pub(crate) fn opt(bit: u32) -> bool {
     let enabled = unsafe { asahi_g17_gpubench_opt() };
     enabled & bit != 0
 }
+
+/// Records each job's completion-path points (latency.rs, `aurora.gpubench_lat`).
+pub(crate) const OPT_LATENCY: u32 = 1 << 8;
 
 /// Event work item ID.
 const EVENT_WORK: u64 = 0;
