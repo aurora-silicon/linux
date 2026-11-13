@@ -608,6 +608,7 @@ impl crate::g17::Shared {
                     .load(core::sync::atomic::Ordering::Relaxed),
             ) >= HOUSEKEEPING_NS;
         let mut lingers = None;
+        let mut drains = None;
         let mut pools = None;
         let mut shrinking = false;
         if housekeeping {
@@ -616,7 +617,7 @@ impl crate::g17::Shared {
             if !firmware.recovery.pending() {
                 lingers = firmware.expire_render_lingers(now)?;
             }
-            firmware.reclaim_drained_renders(deferred)?;
+            drains = firmware.reclaim_drained_renders(deferred)?;
             firmware.service_compute_exit(deferred)?;
             pools = firmware.service_compute_pools(deferred, now)?;
             if !firmware.recovery.pending() {
@@ -648,8 +649,9 @@ impl crate::g17::Shared {
             idle
         };
         // A retained compute pool gives its backing back when it expires, and
-        // so does an idle render free-list registration.
-        let idle = [pools, lingers]
+        // so does an idle render free-list registration. A drained render pair
+        // whose settlement failed is retried when its backoff ends.
+        let idle = [pools, lingers, drains]
             .into_iter()
             .fold(idle, |idle, expiry| match (idle, expiry) {
                 (Some(delay), Some(expiry)) => Some(delay.min(expiry)),
