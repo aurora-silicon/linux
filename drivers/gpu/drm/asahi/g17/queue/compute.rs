@@ -615,6 +615,19 @@ pub(crate) struct Growth {
     phase: PoolPhase,
 }
 
+/// See [`Queue::admission_state`]. Its fields are read only through `Debug`, by the report.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct AdmissionState {
+    installed: bool,
+    m5_install_end: Option<u32>,
+    consumer: Option<u32>,
+    configuration: bool,
+    ordinal: u32,
+    quarantined: bool,
+    awaiting_witness: bool,
+}
+
 pub(crate) struct Queue {
     owner: Option<u64>,
     /// Scheduler/work pages of an exited last owner whose context was dropped;
@@ -3058,6 +3071,21 @@ impl Queue {
             if self.released { self.owner = None; }
         }
         Ok(())
+    }
+
+    /// The installation and health state a timed-out publication reports (diagnostics):
+    /// whether the queue was installed, the item an M5 installation waits for the firmware to
+    /// consume and how far it got, an outstanding configuration, and quarantine.
+    pub(crate) fn admission_state(&self) -> AdmissionState {
+        AdmissionState {
+            installed: self.installed,
+            m5_install_end: self.m5_install,
+            consumer: self.graph.cursors().ok().map(|cursors| cursors.consumer),
+            configuration: self.configuration.is_some(),
+            ordinal: self.ordinal,
+            quarantined: self.quarantined,
+            awaiting_witness: self.awaiting_witness,
+        }
     }
 
     fn install_m5(&mut self, packet: &Arc<Packet>, host: &mut impl Host) -> Result {
