@@ -3945,6 +3945,19 @@ void iomfb_shutdown(struct apple_dcp *dcp)
 	}
 }
 
+/*
+ * The IOMFB parameters macOS sends to an external display after each mode set,
+ * in 16.16 fixed point: parameter 3 at 1.0, and parameter 6 at 1.0 for an SDR
+ * colour mode or 2.0 for a PQ (HDR) one.  Fills @out[0] and @out[1].
+ */
+void iomfb_external_hdr_hint_values(bool pq, struct iomfb_property out[2])
+{
+	out[0].id = 3;
+	out[0].value = 1U << 16;			/* 1.0 */
+	out[1].id = 6;
+	out[1].value = pq ? (2U << 16) : (1U << 16);	/* 2.0 PQ, 1.0 SDR */
+}
+
 #if IS_ENABLED(CONFIG_DRM_APPLE_PARSER_KUNIT_TEST)
 #include "iomfb-parser-test.c"
 #endif
