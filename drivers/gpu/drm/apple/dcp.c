@@ -9506,9 +9506,9 @@ static int dcp_t6041_s2r_stop(struct apple_dcp *dcp)
 		goto lost;
 	}
 	dcp_t6041_s2r_afk(dcp, false);
-	/* The IOP may answer 0x201 with 1 or 2, asleep with its memory kept: -EINVAL is that. */
+	/* The IOP may answer 0x201 with 1 or 2, asleep with its memory kept: not an error. */
 	ret = apple_rtkit_idle(dcp->rtk);
-	if (ret && ret != -EINVAL) {
+	if (ret && ret != APPLE_RTKIT_IDLE_RETAINED) {
 		dev_err(dcp->dev, "firmware did not go idle: %d, the display stays off\n", ret);
 		goto lost;
 	}

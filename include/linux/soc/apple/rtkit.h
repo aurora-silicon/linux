@@ -12,6 +12,7 @@
 
 #include <linux/bits.h>
 #include <linux/device.h>
+#include <linux/errno.h>
 #include <linux/types.h>
 #include <linux/mailbox_client.h>
 
@@ -263,6 +264,13 @@ int apple_rtkit_poweroff(struct apple_rtkit *rtk);
  * released may still run: the caller has to stop it.
  */
 int apple_rtkit_cold_restart(struct apple_rtkit *rtk, int (*start)(void *), void *ctx);
+
+/*
+ * Returned by apple_rtkit_idle() and apple_rtkit_idle_with() when the AP side is idle
+ * and the IOP acknowledged a power state other than idle: it is asleep with its memory
+ * kept. No other error carries this value.
+ */
+#define APPLE_RTKIT_IDLE_RETAINED	(-EALREADY)
 
 /*
  * Put the co-processor into idle mode

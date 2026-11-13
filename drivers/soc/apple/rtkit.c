@@ -2203,8 +2203,9 @@ static int apple_rtkit_set_ap_power_state(struct apple_rtkit *rtk,
 	return 0;
 }
 
-static int apple_rtkit_set_iop_power_state(struct apple_rtkit *rtk,
-					   unsigned int state)
+/* Ask the IOP for a power state and wait for its acknowledgment; the caller judges the state. */
+static int apple_rtkit_send_iop_power_state(struct apple_rtkit *rtk,
+					    unsigned int state)
 {
 	u64 msg;
 	int ret;
@@ -2217,7 +2218,15 @@ static int apple_rtkit_set_iop_power_state(struct apple_rtkit *rtk,
 	if (ret)
 		return ret;
 
-	ret = apple_rtkit_wait(rtk, &rtk->iop_pwr_ack_completion);
+	return apple_rtkit_wait(rtk, &rtk->iop_pwr_ack_completion);
+}
+
+static int apple_rtkit_set_iop_power_state(struct apple_rtkit *rtk,
+					   unsigned int state)
+{
+	int ret;
+
+	ret = apple_rtkit_send_iop_power_state(rtk, state);
 	if (ret)
 		return ret;
 
@@ -2355,10 +2364,15 @@ int apple_rtkit_idle_with(struct apple_rtkit *rtk, void (*after_ap)(void *data),
 	if (after_ap)
 		after_ap(data);
 
-	ret = apple_rtkit_set_iop_power_state(rtk, APPLE_RTKIT_PWR_STATE_IDLE);
+	ret = apple_rtkit_send_iop_power_state(rtk, APPLE_RTKIT_PWR_STATE_IDLE);
 	if (ret) {
 		dev_err(rtk->dev, "RTKit: IOP idle not acknowledged: %d\n", ret);
 		return ret;
+	}
+	if (rtk->iop_power_state != APPLE_RTKIT_PWR_STATE_IDLE) {
+		dev_dbg(rtk->dev, "RTKit: IOP acknowledged %#x instead of idle\n",
+			rtk->iop_power_state);
+		return APPLE_RTKIT_IDLE_RETAINED;
 	}
 
 	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_IDLE;
