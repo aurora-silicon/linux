@@ -1,0 +1,269 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Property migration from Satya Benson's 86b1f365 J775c stack.
+ * Retained board sources remain the baseline; this group is independently booted.
+ * Copyright The Asahi Linux Contributors
+ */
+&{/soc/power-management@2380600000} {
+	status = "disabled";
+};
+
+&{/soc/power-management@2380600000/power-controller@1b0} {
+	/delete-property/ apple,always-on;
+	status = "disabled";
+};
+
+&{/soc/power-management@2380600000/power-controller@1d8} {
+	power-domains = <&{/soc/power-management@2380600000/power-controller@1b0}>;
+	status = "disabled";
+};
+
+&{/soc/power-management@2380600000} {
+	power-controller@1a0 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1a0 0x4>;
+		#power-domain-cells = <0x0>;
+		#reset-cells = <0x0>;
+		label = "fab1-piogw";
+		status = "disabled";
+	};
+};
+
+&{/soc/power-management@2380600000} {
+	power-controller@1a8 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1a8 0x4>;
+		#power-domain-cells = <0x0>;
+		#reset-cells = <0x0>;
+		label = "fab0-soc";
+		power-domains = <&{/soc/power-management@2380600000/power-controller@1a0}>;
+		status = "disabled";
+	};
+};
+
+&{/soc/power-management@2380600000} {
+	power-controller@1b8 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1b8 0x4>;
+		#power-domain-cells = <0x0>;
+		#reset-cells = <0x0>;
+		label = "fab2-soc";
+		power-domains = <&{/soc/power-management@2380600000/power-controller@1a0}>;
+		status = "disabled";
+	};
+};
+
+&{/soc/power-management@2380600000} {
+	power-controller@1c0 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1c0 0x4>;
+		#power-domain-cells = <0x0>;
+		#reset-cells = <0x0>;
+		label = "venc0-sys";
+		power-domains = <&{/soc/power-management@2380600000/power-controller@1a8}>;
+		status = "disabled";
+	};
+};
+
+&{/soc/power-management@2380600000} {
+	power-controller@1c8 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1c8 0x4>;
+		#power-domain-cells = <0x0>;
+		#reset-cells = <0x0>;
+		label = "msr0";
+		power-domains = <&{/soc/power-management@2380600000/power-controller@1a8}>;
+		status = "disabled";
+	};
+};
+
+&{/soc/power-management@2380600000} {
+	power-controller@1d0 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1d0 0x4>;
+		#power-domain-cells = <0x0>;
+		#reset-cells = <0x0>;
+		label = "jpg";
+		power-domains = <&{/soc/power-management@2380600000/power-controller@1a8}>;
+		status = "disabled";
+	};
+};
+
+&{/soc/power-management@2380600000} {
+	power-controller@1e0 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1e0 0x4>;
+		#power-domain-cells = <0x0>;
+		#reset-cells = <0x0>;
+		label = "prores";
+		power-domains = <&{/soc/power-management@2380600000/power-controller@1b0}>;
+		status = "disabled";
+	};
+};
+
+&{/soc/power-management@2380600000} {
+	power-controller@1f0 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1f0 0x4>;
+		#power-domain-cells = <0x0>;
+		#reset-cells = <0x0>;
+		label = "venc1-sys";
+		power-domains = <&{/soc/power-management@2380600000/power-controller@1b8}>;
+		status = "disabled";
+	};
+};
+
+&{/soc/power-management@2380600000} {
+	power-controller@1f8 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1f8 0x4>;
+		#power-domain-cells = <0x0>;
+		#reset-cells = <0x0>;
+		label = "msr1";
+		power-domains = <&{/soc/power-management@2380600000/power-controller@1b8}>;
+		status = "disabled";
+	};
+};
+
+&{/soc/power-management@2380600000} {
+	power-controller@200 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x200 0x4>;
+		#power-domain-cells = <0x0>;
+		#reset-cells = <0x0>;
+		label = "msr0-ase-core";
+		power-domains = <&{/soc/power-management@2380600000/power-controller@1c8}>;
+		status = "disabled";
+	};
+};
+
+&{/soc/power-management@2380600000} {
+	power-controller@208 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x208 0x4>;
+		#power-domain-cells = <0x0>;
+		#reset-cells = <0x0>;
+		label = "msr1-ase-core";
+		power-domains = <&{/soc/power-management@2380600000/power-controller@1f8}>;
+		status = "disabled";
+	};
+};
+
+&{/soc/power-management@2380600000} {
+	power-controller@8000 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8000 0x4>;
+		#power-domain-cells = <0x0>;
+		#reset-cells = <0x0>;
+		label = "venc0-dma";
+		power-domains = <&{/soc/power-management@2380600000/power-controller@1c0}>;
+		status = "disabled";
+	};
+};
+
+&{/soc/power-management@2380600000} {
+	power-controller@8008 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8008 0x4>;
+		#power-domain-cells = <0x0>;
+		#reset-cells = <0x0>;
+		label = "venc0-pipe4";
+		power-domains = <&{/soc/power-management@2380600000/power-controller@8000}>;
+		status = "disabled";
+	};
+};
+
+&{/soc/power-management@2380600000} {
+	power-controller@8010 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8010 0x4>;
+		#power-domain-cells = <0x0>;
+		#reset-cells = <0x0>;
+		label = "venc0-pipe5";
+		power-domains = <&{/soc/power-management@2380600000/power-controller@8000}>;
+		status = "disabled";
+	};
+};
+
+&{/soc/power-management@2380600000} {
+	power-controller@8018 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8018 0x4>;
+		#power-domain-cells = <0x0>;
+		#reset-cells = <0x0>;
+		label = "venc0-me0";
+		power-domains = <&{/soc/power-management@2380600000/power-controller@8000}>;
+		status = "disabled";
+	};
+};
+
+&{/soc/power-management@2380600000} {
+	power-controller@8020 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8020 0x4>;
+		#power-domain-cells = <0x0>;
+		#reset-cells = <0x0>;
+		label = "venc0-me1";
+		power-domains = <&{/soc/power-management@2380600000/power-controller@8018}>;
+		status = "disabled";
+	};
+};
+
+&{/soc/power-management@2380600000} {
+	power-controller@8028 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8028 0x4>;
+		#power-domain-cells = <0x0>;
+		#reset-cells = <0x0>;
+		label = "venc1-dma";
+		power-domains = <&{/soc/power-management@2380600000/power-controller@1f0}>;
+		status = "disabled";
+	};
+};
+
+&{/soc/power-management@2380600000} {
+	power-controller@8030 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8030 0x4>;
+		#power-domain-cells = <0x0>;
+		#reset-cells = <0x0>;
+		label = "venc1-pipe4";
+		power-domains = <&{/soc/power-management@2380600000/power-controller@8028}>;
+		status = "disabled";
+	};
+};
+
+&{/soc/power-management@2380600000} {
+	power-controller@8038 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8038 0x4>;
+		#power-domain-cells = <0x0>;
+		#reset-cells = <0x0>;
+		label = "venc1-pipe5";
+		power-domains = <&{/soc/power-management@2380600000/power-controller@8028}>;
+		status = "disabled";
+	};
+};
+
+&{/soc/power-management@2380600000} {
+	power-controller@8040 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8040 0x4>;
+		#power-domain-cells = <0x0>;
+		#reset-cells = <0x0>;
+		label = "venc1-me0";
+		power-domains = <&{/soc/power-management@2380600000/power-controller@8028}>;
+		status = "disabled";
+	};
+};
+
+&{/soc/power-management@2380600000} {
+	power-controller@8048 {
+		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8048 0x4>;
+		#power-domain-cells = <0x0>;
+		#reset-cells = <0x0>;
+		label = "venc1-me1";
+		power-domains = <&{/soc/power-management@2380600000/power-controller@8040}>;
+		status = "disabled";
+	};
+};
