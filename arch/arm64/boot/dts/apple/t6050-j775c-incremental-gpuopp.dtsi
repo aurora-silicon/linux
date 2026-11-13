@@ -1,0 +1,277 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Property migration from Satya Benson's 86b1f365 J775c stack.
+ * Retained board sources remain the baseline; this group is independently booted.
+ * Copyright The Asahi Linux Contributors
+ */
+&{/opp-table-gpu} {
+};
+
+&{/opp-table-gpu/opp00} {
+};
+
+&{/opp-table-gpu/opp01} {
+};
+
+&{/opp-table-gpu/opp02} {
+};
+
+&{/opp-table-gpu/opp03} {
+};
+
+&{/opp-table-gpu/opp04} {
+};
+
+&{/opp-table-gpu/opp05} {
+};
+
+&{/opp-table-gpu/opp06} {
+};
+
+&{/opp-table-gpu/opp07} {
+};
+
+&{/opp-table-gpu/opp08} {
+};
+
+&{/opp-table-gpu/opp09} {
+};
+
+&{/opp-table-gpu/opp10} {
+};
+
+&{/opp-table-gpu/opp11} {
+};
+
+&{/opp-table-gpu/opp12} {
+};
+
+&{/opp-table-gpu/opp13} {
+};
+
+&{/} {
+	opp-table-gpuafr {
+		compatible = "operating-points-v2";
+	};
+};
+
+&{/opp-table-gpuafr} {
+	opp00 {
+		opp-hz = <0x0 0x0>;
+		opp-microvolt = <0x0>;
+	};
+};
+
+&{/opp-table-gpuafr} {
+	opp01 {
+		opp-hz = <0x0 0x0>;
+		opp-microvolt = <0x0>;
+	};
+};
+
+&{/opp-table-gpuafr} {
+	opp02 {
+		opp-hz = <0x0 0x0>;
+		opp-microvolt = <0x0>;
+	};
+};
+
+&{/opp-table-gpuafr} {
+	opp03 {
+		opp-hz = <0x0 0x0>;
+		opp-microvolt = <0x0>;
+	};
+};
+
+&{/opp-table-gpuafr} {
+	opp04 {
+		opp-hz = <0x0 0x0>;
+		opp-microvolt = <0x0>;
+	};
+};
+
+&{/opp-table-gpuafr} {
+	opp05 {
+		opp-hz = <0x0 0x0>;
+		opp-microvolt = <0x0>;
+	};
+};
+
+&{/opp-table-gpuafr} {
+	opp06 {
+		opp-hz = <0x0 0x0>;
+		opp-microvolt = <0x0>;
+	};
+};
+
+&{/opp-table-gpuafr} {
+	opp07 {
+		opp-hz = <0x0 0x0>;
+		opp-microvolt = <0x0>;
+	};
+};
+
+&{/opp-table-gpuafr} {
+	opp08 {
+		opp-hz = <0x0 0x0>;
+		opp-microvolt = <0x0>;
+	};
+};
+
+&{/opp-table-gpuafr} {
+	opp09 {
+		opp-hz = <0x0 0x0>;
+		opp-microvolt = <0x0>;
+	};
+};
+
+&{/opp-table-gpuafr} {
+	opp10 {
+		opp-hz = <0x0 0x0>;
+		opp-microvolt = <0x0>;
+	};
+};
+
+&{/opp-table-gpuafr} {
+	opp11 {
+		opp-hz = <0x0 0x0>;
+		opp-microvolt = <0x0>;
+	};
+};
+
+&{/opp-table-gpuafr} {
+	opp12 {
+		opp-hz = <0x0 0x0>;
+		opp-microvolt = <0x0>;
+	};
+};
+
+&{/opp-table-gpuafr} {
+	opp13 {
+		opp-hz = <0x0 0x0>;
+		opp-microvolt = <0x0>;
+	};
+};
+
+&{/} {
+	opp-table-gpucs {
+		compatible = "operating-points-v2";
+	};
+};
+
+&{/opp-table-gpucs} {
+	opp00 {
+		opp-hz = <0x0 0x0>;
+		opp-microvolt = <0x0>;
+	};
+};
+
+&{/opp-table-gpucs} {
+	opp01 {
+		opp-hz = <0x0 0x0>;
+		opp-microvolt = <0x0>;
+	};
+};
+
+&{/opp-table-gpucs} {
+	opp02 {
+		opp-hz = <0x0 0x0>;
+		opp-microvolt = <0x0>;
+	};
+};
+
+&{/opp-table-gpucs} {
+	opp03 {
+		opp-hz = <0x0 0x0>;
+		opp-microvolt = <0x0>;
+	};
+};
+
+&{/opp-table-gpucs} {
+	opp04 {
+		opp-hz = <0x0 0x0>;
+		opp-microvolt = <0x0>;
+	};
+};
+
+&{/opp-table-gpucs} {
+	opp05 {
+		opp-hz = <0x0 0x0>;
+		opp-microvolt = <0x0>;
+	};
+};
+
+&{/opp-table-gpucs} {
+	opp06 {
+		opp-hz = <0x0 0x0>;
+		opp-microvolt = <0x0>;
+	};
+};
+
+&{/opp-table-gpucs} {
+	opp07 {
+		opp-hz = <0x0 0x0>;
+		opp-microvolt = <0x0>;
+	};
+};
+
+&{/opp-table-gpucs} {
+	opp08 {
+		opp-hz = <0x0 0x0>;
+		opp-microvolt = <0x0>;
+	};
+};
+
+&{/opp-table-gpucs} {
+	opp09 {
+		opp-hz = <0x0 0x0>;
+		opp-microvolt = <0x0>;
+	};
+};
+
+&{/opp-table-gpucs} {
+	opp10 {
+		opp-hz = <0x0 0x0>;
+		opp-microvolt = <0x0>;
+	};
+};
+
+&{/opp-table-gpucs} {
+	opp11 {
+		opp-hz = <0x0 0x0>;
+		opp-microvolt = <0x0>;
+	};
+};
+
+&{/opp-table-gpucs} {
+	opp12 {
+		opp-hz = <0x0 0x0>;
+		opp-microvolt = <0x0>;
+	};
+};
+
+&{/opp-table-gpucs} {
+	opp13 {
+		opp-hz = <0x0 0x0>;
+		opp-microvolt = <0x0>;
+	};
+};
+
+&{/soc@2300000000/gpu@2302600000} {
+	/delete-property/ apple,idleoff-standby-timer;
+	compatible = "apple,agx-g17c", "apple,agx-g17s";
+	mboxes = <&{/soc@2300000000/mailbox@2302600000} &{/soc@2300000000/mailbox@2302e00000}>;
+	power-domains = <&{/soc@2300000000/power-management@2300e80000/power-controller@110}>;
+	apple,clpc = <&{/soc/power-management@286806000/performance-controller@1}>;
+	memory-region = <&{/reserved-memory/uat-ttbs} &{/reserved-memory/uat-pagetables} &{/reserved-memory/uat-handoff} &{/reserved-memory/gpu-fw-data} &{/reserved-memory/uat-l2-pagetables} &{/reserved-memory/gpu-fw-text}>;
+	operating-points-v2 = <&{/opp-table-gpu}>;
+	apple,afr-opp = <&{/opp-table-gpuafr}>;
+	apple,cs-opp = <&{/opp-table-gpucs}>;
+};
+
+&{/soc@2300000000/mailbox@2302600000} {
+	power-domains = <&{/soc@2300000000/power-management@2300e80000/power-controller@110}>;
+};
+
+&{/soc@2300000000/mailbox@2302e00000} {
+	power-domains = <&{/soc@2300000000/power-management@2300e80000/power-controller@110}>;
+};

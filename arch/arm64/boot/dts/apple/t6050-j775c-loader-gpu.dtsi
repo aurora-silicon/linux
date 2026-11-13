@@ -1,0 +1,98 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Retained candidate44 definitions at installed Aura GPU handoff paths. */
+/ {
+	soc@2300000000 {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges = <0x23 0 0x23 0 0 0x4000000>;
+		nonposted-mmio;
+
+		gpu: gpu@2302600000 {
+			compatible = "apple,agx-g17c", "apple,agx-g17s", "apple,agx-t6050";
+			reg = <0x23 0x02600000 0x0 0x88000>,
+			      <0x23 0x00000000 0x0 0x4000000>;
+			reg-names = "asc", "sgx";
+			mboxes = <&gfx_mbox>, <&gfx1_mbox>;
+			power-domains = <&ps_gfx>;
+			memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>,
+					<&gpu_fw_data>, <&uat_l2_pagetables>, <&gpu_fw_text>;
+			memory-region-names = "ttbs", "pagetables", "handoff", "fw-data",
+					      "l2-pagetables", "fw-text";
+			operating-points-v2 = <&gpu_opp>;
+			apple,afr-opp = <&gpu_afr_opp>;
+			apple,cs-opp = <&gpu_cs_opp>;
+			/* Submissions hold the memory and fabric floor while the GPU has work. */
+			apple,clpc = <&clpc>;
+			apple,csafr-min-sram-microvolt = <0>;
+			/* The six AON power-telemetry records the firmware samples: FourCC and two words each. */
+			apple,aon-ptd = <0 0 0  0 0 0  0 0 0  0 0 0  0 0 0  0 0 0>;
+			status = "disabled";
+		};
+
+		gfx_mbox: mailbox@2302600000 {
+			compatible = "apple,t6050-j775d-ascwrap-v6";
+			reg = <0x23 0x02600000 0x0 0x88000>,
+			      <0x23 0x02050000 0x0 0x8>;
+			reg-names = "wrapper", "iop-vbar";
+			interrupts = <AIC_IRQ 0 2797 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 0 2800 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "recv-not-empty";
+			apple,firmware-role = "GFX";
+			power-domains = <&ps_gfx>;
+			#mbox-cells = <0>;
+			status = "disabled";
+		};
+
+		gfx1_mbox: mailbox@2302e00000 {
+			compatible = "apple,t6050-j775d-ascwrap-v6";
+			reg = <0x23 0x02e00000 0x0 0x88000>,
+			      <0x23 0x02850000 0x0 0x8>;
+			reg-names = "wrapper", "iop-vbar";
+			interrupts = <AIC_IRQ 0 2801 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 0 2804 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "recv-not-empty";
+			apple,firmware-role = "GFX1";
+			power-domains = <&ps_gfx>;
+			#mbox-cells = <0>;
+			status = "disabled";
+		};
+
+		pmgr3: power-management@2300e80000 {
+			compatible = "apple,t6050-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+			reg = <0x23 0x00e80000 0x0 0x4000>;
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			ps_gpx: power-controller@0 {
+				compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+				reg = <0x0 4>;
+				label = "gpx";
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				apple,always-on;
+				status = "disabled";
+			};
+
+			ps_afr: power-controller@100 {
+				compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+				reg = <0x100 4>;
+				label = "afr";
+				#power-domain-cells = <0>;
+				#reset-cells = <0>;
+				apple,always-on;
+				status = "disabled";
+			};
+
+			ps_gfx: power-controller@110 {
+				compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+				reg = <0x110 4>;
+				label = "gfx";
+				#power-domain-cells = <0>;
+				power-domains = <&ps_afr>, <&ps_gpx>;
+				#reset-cells = <0>;
+				status = "disabled";
+			};
+		};
+	};
+};
