@@ -1753,7 +1753,7 @@ impl AopData {
         }
         self.sleeping.store(false, Release);
         if was_idle {
-            dev_dbg!(self.dev, "AP on notice sent and endpoints restarted after a sleep\n");
+            dev_info!(self.dev, "AP on notice sent and endpoints restarted after a sleep (diag)\n");
         }
     }
 
@@ -1769,6 +1769,7 @@ impl AopData {
             self.sleeping.store(true, Release);
             return Ok(());
         }
+        dev_info!(self.dev, "sleep enter (diag)\n");
         self.sleeping.store(true, Release);
         // Any call in progress finishes first; new ones see `sleeping`.
         for turn in &self.call_turn {
@@ -1802,7 +1803,7 @@ impl AopData {
         if result.is_err() {
             self.sleep_undo();
         } else {
-            dev_dbg!(self.dev, "Endpoints stopped and AP idle notice answered for a sleep\n");
+            dev_info!(self.dev, "Endpoints stopped and AP idle notice answered for a sleep (diag)\n");
         }
         result
     }

@@ -3265,6 +3265,9 @@ static void apple_sleep_report(void)
 
 	dev_info(s->dev, "back from sleep, boot object resumes %llu -> %llu\n",
 		 s->resumes_before, s->resumes_after);
+	for (i = 0; i < WAKE_WORDS; i++)
+		dev_info(s->dev, "diag wake word %d armed %08x status %08x\n", i,
+			 s->wake_armed[i], s->wake_status[i]);
 	for (i = 0; i < s->ps_unlatched_count; i++)
 		dev_warn(s->dev, "power word %#x was off with BUSY latched at the commit: %#x\n",
 			 s->ps_unlatched[i].offset, s->ps_unlatched[i].val);
