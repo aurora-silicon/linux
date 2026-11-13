@@ -69,8 +69,8 @@ impl kernel::debugfs::Writer for View {
         // locks. Never take a VM/TTBAT lock with the device mutex held here.
         // The retained UAT owns valid allocator metadata even during shutdown.
         writeln!(f, "execution_contexts used={} total={}", uat.execution_contexts_used(), crate::mmu::MAX_EXECUTION_CONTEXTS)?;
-        let (fenced, overruns) = uat.execution_contexts_fenced(super::channel::control_witnessed());
-        writeln!(f, "execution_contexts_fenced free_waiting={} overruns={}", fenced, overruns)?;
+        let (fenced, waits) = uat.execution_contexts_fenced(super::channel::control_witnessed());
+        writeln!(f, "execution_contexts_fenced free_waiting={} waits={}", fenced, waits)?;
         let [kept, fallbacks] = super::completion::window_counters();
         writeln!(f, "timestamp_window firmware={} host_fallbacks={}", kept, fallbacks)?;
         let upper = uat.kernel_dynamic_range();

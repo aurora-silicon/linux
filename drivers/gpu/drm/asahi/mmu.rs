@@ -1331,7 +1331,7 @@ impl Drop for ExecutionRoot {
 
 /// A firmware-visible record (a queue record, a work list keyed by context) that names an
 /// application context. The TTBAT root goes with [`ExecutionContext::release`], but while a
-/// hold remains the identity is handed to a new owner only if no other context is free.
+/// hold remains the identity is not handed to a new owner.
 /// Once the firmware saw the identity, the last hold fences it: it is reused only after the
 /// firmware shows the progress the hold's fence source reported when it dropped.
 pub(crate) struct ContextHold {
@@ -1994,8 +1994,8 @@ struct UatShared {
     /// Firmware-visible records still naming each context (see [`ContextHold`]).
     context_holds: [u32; UAT_NUM_CTX],
     context_clock: u64,
-    /// Allocations that had to take a context still held or waiting for its fence.
-    context_fence_overruns: u64,
+    /// Queue creations that found every free context still held or waiting for its fence.
+    context_fence_waits: u64,
     /// Firmware-observed incarnations of application roots installed by the VM slot allocator.
     binding_generations: [u64; UAT_NUM_CTX],
     binding_published: [bool; UAT_NUM_CTX],
@@ -2020,6 +2020,16 @@ impl UatShared {
             }
         }
         fences
+    }
+
+    /// What a new owner finds among the application contexts (see [`context_room`]).
+    fn context_room(&self, witnessed: u64) -> ContextRoom {
+        context_room(
+            !self.execution_contexts & EXECUTION_CONTEXT_MASK,
+            &self.context_returns,
+            &self.effective_fences(),
+            witnessed,
+        )
     }
 
     /// Takes the handoff lock, where this SoC uses it.
@@ -3565,7 +3575,7 @@ impl Uat {
                         context_fences: [0; UAT_NUM_CTX],
                         context_holds: [0; UAT_NUM_CTX],
                         context_clock: 0,
-                        context_fence_overruns: 0,
+                        context_fence_waits: 0,
                         binding_generations: [0; UAT_NUM_CTX],
                         binding_published: [false; UAT_NUM_CTX],
                         owned_user_roots: [0; UAT_NUM_CTX],
@@ -3863,8 +3873,10 @@ impl Uat {
     /// The firmware keys work by context, and installed records may still name a returned
     /// context: a context is handed out again only once no [`ContextHold`] remains and the
     /// firmware showed progress `witnessed` past its fence, and among those the one returned
-    /// longest ago is taken. Only when every free context still waits is the one with the
-    /// oldest fence taken (counted as an overrun) rather than failing a live client.
+    /// longest ago is taken. When every free context still waits none is taken, whatever the
+    /// demand: handed to a new owner while an installed queue record still named the previous
+    /// one, such a context faulted the GPU in the new owner's work. The caller waits for
+    /// [`Uat::execution_context_room`] to report a ready context.
     pub(crate) fn new_execution_context(
         &self,
         vm: &Vm,
@@ -3885,19 +3897,8 @@ impl Uat {
         }
         let (id, generation) = {
             let mut inner = self.inner.lock();
-            let free = !inner.execution_contexts & EXECUTION_CONTEXT_MASK;
-            if free == 0 {
+            let ContextRoom::Ready(id) = inner.context_room(witnessed) else {
                 return Err(ENOSPC);
-            }
-            let fences = inner.effective_fences();
-            let candidates = (0..UAT_NUM_CTX).filter(|&id| free & (1u64 << id) != 0);
-            let id = match pick_returned(candidates, &inner.context_returns, &fences, witnessed) {
-                Some((id, true)) => id,
-                Some((id, false)) => {
-                    inner.context_fence_overruns += 1;
-                    id
-                }
-                None => return Err(ENOSPC),
             };
             inner.execution_contexts |= 1u64 << id;
             // On M5 a slot's reuse generation is never zero, which M5's context token reserves
@@ -4173,7 +4174,7 @@ impl Uat {
                         context_fences: [0; UAT_NUM_CTX],
                         context_holds: [0; UAT_NUM_CTX],
                         context_clock: 0,
-                        context_fence_overruns: 0,
+                        context_fence_waits: 0,
                         binding_generations: [0; UAT_NUM_CTX],
                         binding_published: [false; UAT_NUM_CTX],
                         owned_user_roots: [0; UAT_NUM_CTX],
@@ -4371,7 +4372,7 @@ impl Uat {
     }
 
     /// Free application contexts still held or waiting for firmware progress `witnessed`,
-    /// and the allocations that had to take such a context.
+    /// and the queue creations that found only such contexts.
     pub(crate) fn execution_contexts_fenced(&self, witnessed: u64) -> (u32, u64) {
         let inner = self.inner.lock();
         let free = !inner.execution_contexts & EXECUTION_CONTEXT_MASK;
@@ -4379,14 +4380,51 @@ impl Uat {
         let waiting = (0..UAT_NUM_CTX)
             .filter(|&id| free & (1u64 << id) != 0 && fences[id] > witnessed)
             .count() as u32;
-        (waiting, inner.context_fence_overruns)
+        (waiting, inner.context_fence_waits)
+    }
+
+    /// Whether [`Uat::new_execution_context`] has a context for a new owner at firmware
+    /// progress `witnessed`. Holds and fences clear at any time, but only an allocation
+    /// takes a ready context away: the answer stays good for a caller that serializes
+    /// allocations.
+    pub(crate) fn execution_context_room(&self, witnessed: u64) -> ContextRoom {
+        self.inner.lock().context_room(witnessed)
+    }
+
+    /// Counts a queue creation that found every free context still held or fenced.
+    pub(crate) fn note_execution_context_wait(&self) {
+        self.inner.lock().context_fence_waits += 1;
+    }
+}
+
+/// What a new owner finds among the application contexts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ContextRoom {
+    /// This context is free, no record names it and the firmware passed its fence.
+    Ready(usize),
+    /// Contexts are free, but each is still named by a record or waits for its fence.
+    Waiting,
+    /// No context is free.
+    Full,
+}
+
+/// Chooses the application context a new owner may take among the `free` ones: the one
+/// returned longest ago whose fence `witnessed` meets. `fences` are the effective ones, a
+/// held context waiting indefinitely. A context that still waits is never chosen.
+fn context_room(free: u64, returns: &[u64], fences: &[u64], witnessed: u64) -> ContextRoom {
+    let candidates = (0..UAT_NUM_CTX).filter(|&id| free & (1u64 << id) != 0);
+    match pick_returned(candidates, returns, fences, witnessed) {
+        Some((id, true)) => ContextRoom::Ready(id),
+        Some((_, false)) => ContextRoom::Waiting,
+        None => ContextRoom::Full,
     }
 }
 
 /// Picks a returned identity for a new owner, shared by the finite firmware identity
 /// spaces (application contexts here, the G17 QoS IDs): among `free`, the one returned
 /// longest ago whose fence `witnessed` meets; if none does, the one with the oldest fence.
-/// The flag says whether the fence was met. The slot allocator orders VM slots the same way.
+/// The flag says whether the fence was met; an application context is taken only if it was
+/// ([`context_room`]). The slot allocator orders VM slots the same way.
 pub(crate) fn pick_returned(
     free: impl Iterator<Item = usize>,
     returns: &[u64],
@@ -4453,5 +4491,25 @@ mod execution_context_tests {
         fences[7] = u64::MAX;
         assert_eq!(pick(only, &returns, &fences, 11), (9, false));
         assert!(pick_returned(core::iter::empty(), &returns, &fences, 0).is_none());
+    }
+
+    #[test]
+    fn a_waiting_context_is_never_handed_out() {
+        let returns = [0; UAT_NUM_CTX];
+        let mut fences = [0; UAT_NUM_CTX];
+        let only = (1u64 << 7) | (1u64 << 9);
+        assert_eq!(context_room(0, &returns, &fences, 0), ContextRoom::Full);
+        // Context 7 is still named by a queue record, context 9 waits for its fence.
+        fences[7] = u64::MAX;
+        fences[9] = 12;
+        assert_eq!(context_room(only, &returns, &fences, 11), ContextRoom::Waiting);
+        assert_eq!(context_room(1 << 7, &returns, &fences, u64::MAX - 1), ContextRoom::Waiting);
+        // The firmware passed context 9's fence; the held one stays out however long it waits.
+        assert_eq!(context_room(only, &returns, &fences, 12), ContextRoom::Ready(9));
+        assert_eq!(context_room(1 << 7, &returns, &fences, 12), ContextRoom::Waiting);
+        // Its last record went with firmware progress 20 pending.
+        fences[7] = 21;
+        assert_eq!(context_room(1 << 7, &returns, &fences, 20), ContextRoom::Waiting);
+        assert_eq!(context_room(1 << 7, &returns, &fences, 21), ContextRoom::Ready(7));
     }
 }
