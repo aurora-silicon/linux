@@ -21,7 +21,7 @@ struct device {
 	void *data;
 };
 struct brcmf_pciedev_info {
-	bool setup_complete, sleep_reset_blocked, mbdata_completed;
+	bool setup_complete, sleep_reset_blocked, mbdata_completed, reset_wanted;
 	bool wowl_irq, wowl_enabled, fwseed;
 	int state, mbdata_resp_wait;
 };
@@ -47,7 +47,7 @@ static struct device endpoint = { .lock = PTHREAD_MUTEX_INITIALIZER };
 static _Thread_local bool endpoint_locked;
 static bool owned;
 static void (*finish_callback)(struct device *dev);
-static unsigned int allows, cancels;
+static unsigned int allows, cancels, schedules;
 
 /* Synchronize the two overlap cases without sleeps or scheduler assumptions. */
 static pthread_mutex_t sync_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -92,6 +92,13 @@ static void brcmf_bus_allow_reset_work(struct brcmf_bus *bus)
 	pthread_mutex_unlock(&sync_lock);
 	bus->removing = false;
 	allows++;
+}
+
+/* A replayed reset must be armed after the block is lifted, or it is dropped again. */
+static void brcmf_bus_schedule_reset(struct brcmf_bus *bus)
+{
+	assert(endpoint_locked && bus == endpoint.data && !bus->removing);
+	schedules++;
 }
 
 static void brcmf_bus_cancel_reset_work(struct brcmf_bus *bus)
@@ -139,6 +146,7 @@ static int brcmf_pcie_pm_leave_D3(struct device *dev)
 #define brcmf_err(...) ((void)0)
 /* The asynchronous setup publication is supplied before the callback starts. */
 #define smp_load_acquire(p) (*(p))
+#define READ_ONCE(x) (x)
 #define wait_event_timeout(wait, condition, timeout) \
 	((void)(wait), (void)(condition), (void)(timeout))
 static void brcmf_txflowblock_if(struct brcmf_if *ifp, int reason, bool block)
@@ -231,7 +239,7 @@ static void fresh(bool setup_complete)
 	assert(!endpoint.data);
 	watch_lock = lock_attempted = pause_allow = in_allow = release_allow =
 		false;
-	allows = cancels = 0;
+	allows = cancels = schedules = 0;
 	finish_callback = NULL;
 	owned = true;
 	device_lock(&endpoint);
@@ -359,7 +367,16 @@ int main(void)
 	assert(!suspend_endpoint());
 	host_complete();
 	host_complete();
-	assert(allows == 1);
+	assert(allows == 1 && !schedules);
+	remove_thread(NULL);
+
+	/* A firmware death during the sleep gets its dropped reset back once. */
+	fresh(true);
+	assert(!suspend_endpoint());
+	((struct brcmf_bus *)endpoint.data)->bus_priv.pcie->devinfo->reset_wanted = true;
+	host_complete();
+	host_complete();
+	assert(allows == 1 && schedules == 1);
 	remove_thread(NULL);
 
 	/* Other hosts do not acquire a deferred reset-work cleanup. */
@@ -369,6 +386,6 @@ int main(void)
 	host_complete();
 	assert(!allows);
 	remove_thread(NULL);
-	puts("PASS: Wi-Fi abort, binding replacement and overlapping remove/finish");
+	puts("PASS: Wi-Fi abort, binding replacement, overlapping remove/finish and reset replay");
 	return 0;
 }

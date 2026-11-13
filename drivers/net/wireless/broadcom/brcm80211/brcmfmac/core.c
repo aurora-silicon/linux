@@ -1335,7 +1335,7 @@ static int brcmf_revinfo_read(struct seq_file *s, void *data)
  * The reset runs on a freezable workqueue so that it never overlaps a system
  * sleep transition: one armed while devices suspend runs after the resume.
  */
-static void brcmf_bus_schedule_reset(struct brcmf_bus *bus_if)
+void brcmf_bus_schedule_reset(struct brcmf_bus *bus_if)
 {
 	mutex_lock(&bus_if->bus_reset_lock);
 	if (bus_if->drvr && bus_if->drvr->bus_reset.func && !bus_if->removing)

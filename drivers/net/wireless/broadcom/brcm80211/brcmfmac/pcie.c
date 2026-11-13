@@ -457,6 +457,8 @@ struct brcmf_pciedev_info {
 	struct brcmf_otp_params otp;
 	bool fwseed;
 	bool fw_dead;
+	/* A firmware death asked for a reset that has not run yet. */
+	bool reset_wanted;
 	u32 recoveries;
 	unsigned long recovery_window;
 #ifdef DEBUG
@@ -989,6 +991,7 @@ static void brcmf_pcie_fw_died(struct brcmf_pciedev_info *devinfo,
 	/* Fail further firmware commands at once instead of timing out. */
 	if (bus)
 		brcmf_bus_change_state(bus, BRCMF_BUS_DOWN);
+	WRITE_ONCE(devinfo->reset_wanted, true);
 	brcmf_fw_crashed(dev);
 }
 
@@ -1912,6 +1915,7 @@ static int brcmf_pcie_reset(struct device *dev)
 	if (apple_radio_sleep_owned(dev))
 		return -EBUSY;
 
+	WRITE_ONCE(devinfo->reset_wanted, false);
 	WRITE_ONCE(devinfo->setup_complete, false);
 	devinfo->state = BRCMFMAC_PCIE_STATE_DOWN;
 	brcmf_pcie_intr_disable(devinfo);
@@ -3320,6 +3324,9 @@ static void brcmf_pcie_sleep_finish(struct device *dev)
 		goto unlock;
 	devinfo->sleep_reset_blocked = false;
 	brcmf_bus_allow_reset_work(bus);
+	/* The sleep dropped the reset of a firmware that died during it. */
+	if (READ_ONCE(devinfo->reset_wanted))
+		brcmf_bus_schedule_reset(bus);
 unlock:
 	device_unlock(dev);
 }
