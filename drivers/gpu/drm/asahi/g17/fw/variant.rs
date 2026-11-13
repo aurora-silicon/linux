@@ -34,6 +34,8 @@ pub(crate) enum InitGraph {
     G17P,
     /// One instance carrying both roles, with the 25G83 layouts ([`super::initdata::v25g83`]).
     V25G83,
+    /// One G16S instance carrying both roles, with the packed macOS 27.2 layouts.
+    G16S26B123,
 }
 
 /// The InitData layouts of an M5 firmware build ([`super::m5::initdata`]). The 27.2 and later
@@ -188,6 +190,13 @@ pub(crate) const V25G83: Variant = Variant {
     m5_layouts: None,
 };
 
+/// The M4 Pro macOS 27.2 build: G16 commands with the 26A-generation runtime rules and the
+/// G16S-specific 26B123 packed initialization graph.
+pub(crate) const V26B123_G16S: Variant = Variant {
+    graph: InitGraph::G16S26B123,
+    ..V26A428
+};
+
 /// The 26A428 firmware of the M5 GPUs, which runs the M5 protocol (the M5 graph, queues and
 /// command set).
 pub(crate) const V26A428_M5: Variant = Variant {
@@ -216,5 +225,6 @@ pub(crate) const V25F84: Variant = Variant {
 const _: () = {
     assert!(super::queue::PointerBlock::valid_layout(&V26A428.pointers));
     assert!(super::queue::PointerBlock::valid_layout(&V25G83.pointers));
+    assert!(super::queue::PointerBlock::valid_layout(&V26B123_G16S.pointers));
     assert!(super::queue::PointerBlock::valid_layout(&V25F84.pointers));
 };

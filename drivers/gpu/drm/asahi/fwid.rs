@@ -442,6 +442,9 @@ mod tests {
             panic!("T6040 must identify its loaded firmware");
         };
         let build = builds.iter().find(|b| b.os_version == [26, 6, 2]).unwrap();
+        assert!(core::ptr::eq(build.variant, &crate::g17::fw::variant::V25G83));
+        assert_eq!(build.images.len(), 3);
+        assert!(build.images.iter().all(|image| image.boot_filled.is_empty()));
         let digests = [
             [
                 0x03, 0xdf, 0x75, 0x48, 0x4a, 0x7f, 0xdd, 0x6e, 0x4b, 0x47, 0x7f, 0x95, 0x6c, 0xaa,
@@ -467,6 +470,21 @@ mod tests {
             assert!(lookup(build.images, 0x60001, 0x138000, |_| Some(digest)).is_none());
         }
         assert!(measured(build.images, 0x138000, &[[0x59839, 0x5991c]], [0; 32]).is_none());
+
+        let build = builds.iter().find(|b| b.os_version == [27, 2, 0]).unwrap();
+        assert!(core::ptr::eq(
+            build.variant,
+            &crate::g17::fw::variant::V26B123_G16S
+        ));
+        let image = &build.images[0];
+        let found = lookup(build.images, image.text_size, image.data_size, |measured| {
+            (measured.entropy == image.entropy && measured.boot_filled == image.boot_filled)
+                .then_some(image.text_sha256)
+        })
+        .unwrap();
+        assert!(core::ptr::eq(found, image));
+        assert_eq!(image.boot_filled.len(), 4);
+        assert!(lookup(build.images, image.text_size, 0xc4000, |_| Some(image.text_sha256)).is_none());
     }
 
     #[test]

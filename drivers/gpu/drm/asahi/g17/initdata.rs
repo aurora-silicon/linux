@@ -1188,6 +1188,13 @@ impl InitData {
         if variant.graph == super::fw::variant::InitGraph::V25G83 {
             return self.build_25g83(&env, cfg, metrics, active_cores, variant);
         }
+        if variant.graph == super::fw::variant::InitGraph::G16S26B123 {
+            dev_err!(
+                dev.as_ref(),
+                "G16S 26B123 firmware identified, but its packed InitData graph is unavailable\n"
+            );
+            return Err(EINVAL);
+        }
         self.map_register_windows(&env, cfg.windows)?;
         let tables = self.build_descriptor_tables(&env, abi::private::SIZE)?;
         self.build_render_free_lists(&env)?;

@@ -64,8 +64,33 @@ pub(crate) const CONFIG: Config = Config {
     recovery_slot_keys: None,
     // Userspace drives this GPU as a G16 part.
     gpu_generation: GpuGen::G16,
-    // The macOS 26.6.2 boot firmware (iBoot mBoot-18000.161.10) loads the 25G83 GPU firmware.
-    firmware: fw::variant::Firmware::Identified(&[fw::variant::Build {
+    firmware: fw::variant::Firmware::Identified(&[
+        fw::variant::Build {
+            os_version: [27, 2, 0],
+            name: "macOS 27.2 (26B123, iBoot mBoot-20457.41.3)",
+            images: &[crate::fwid::FirmwareBuild {
+                name: "Apple GFX 26B123 for T6040 B1 (normalized loaded image)",
+                text_size: 0x64000,
+                // iBoot places __DATA and the following shared-RO segment contiguously.
+                data_size: 0xcc000,
+                entropy: &[[0x5d88c, 0x5d96f]],
+                boot_filled: &[
+                    (0x224, 4),
+                    (0x23c, 8),
+                    (0x5d88c, 0x231),
+                    (0x5dabd, 0x6a0),
+                ],
+                text_sha256: [
+                    0x29, 0x42, 0x03, 0x31, 0xda, 0xfb, 0xee, 0x7d, 0xa3, 0x38, 0x4d, 0x03, 0xa5,
+                    0xa3, 0x00, 0x90, 0xc0, 0xc9, 0xa9, 0x39, 0xd2, 0x65, 0x63, 0xe5, 0xe9, 0x60,
+                    0x63, 0x4d, 0x54, 0x23, 0xe5, 0x4d,
+                ],
+            }],
+            variant: &fw::variant::V26B123_G16S,
+            config: None,
+        },
+        // The macOS 26.6.2 boot firmware (iBoot mBoot-18000.161.10) loads 25G83.
+        fw::variant::Build {
         os_version: [26, 6, 2],
         name: "macOS 26.6.2 (25G83, iBoot mBoot-18000.161.10)",
         images: &[
@@ -108,7 +133,8 @@ pub(crate) const CONFIG: Config = Config {
         ],
         variant: &fw::variant::V25G83,
         config: None,
-    }]),
+        },
+    ]),
     // Measured on the 20-core M4 Pro; the alternative below remains experimental.
     core_layout: CoreLayout {
         cores: Some((2, 20)),

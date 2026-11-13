@@ -51,7 +51,7 @@ impl Reader {
 pub(super) const fn max_age_ns(graph: InitGraph) -> u64 {
     match graph {
         InitGraph::V25G83 => 16_000_000,
-        InitGraph::G17P => 32_000_000,
+        InitGraph::G17P | InitGraph::G16S26B123 => 32_000_000,
     }
 }
 
@@ -61,7 +61,7 @@ pub(super) const fn max_age_ns(graph: InitGraph) -> u64 {
 /// that is shown to emit it gets `true` here and reports valid or stale.
 pub(super) const fn reports_pstate(graph: InitGraph) -> bool {
     match graph {
-        InitGraph::V25G83 | InitGraph::G17P => false,
+        InitGraph::V25G83 | InitGraph::G17P | InitGraph::G16S26B123 => false,
     }
 }
 

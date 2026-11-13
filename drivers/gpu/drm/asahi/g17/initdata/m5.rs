@@ -139,10 +139,17 @@ impl InitData {
         }
     }
 
-    pub(crate) fn build_m5(&mut self, dev: &AsahiDrmDevice, uat: &mmu::Uat,
-        id: &crate::regs::G17Id, board: &m::Board) -> Result {
+    pub(crate) fn build_m5(
+        &mut self,
+        dev: &AsahiDrmDevice,
+        uat: &mmu::Uat,
+        id: &crate::regs::G17Id,
+        board: &m::Board,
+        variant: &crate::g17::fw::Variant,
+    ) -> Result {
         use mmu::{PROT_FW_SHARED_RW as RW, PROT_FW_SHARED_RO as RO,
                   PROT_GPU_SHARED_RW as GPU};
+        self.set_m5_policy_layouts(variant.m5_layouts.ok_or(EINVAL)?);
         self.m5 = true;
         self.graph = board.graph;
         let common26 = board.graph.is_common26();
