@@ -137,11 +137,14 @@ config APPLE_T6040_SLEEP
 	  has its own sequences and refuses first: its suspend handler lists
 	  every blocker in the live state (EL2, the boot object's return
 	  path, the CPUs that can park, the display power states that have to
-	  be off before a sleep). Unless t6040_sleep.allow_entry=1 is given
-	  and no blocker remains, a request for suspend-to-RAM prints the
-	  blockers and enters nothing, and suspend-to-idle stays the default
-	  sleep. With it the SoC is powered down to suspend-to-RAM and comes
-	  back through the boot object; the AON watchdog is the net over the
+	  be off before a sleep). Suspend-to-RAM is offered, and becomes the
+	  default sleep, on a boot that can take it: the kernel at EL2, the
+	  boot object's mailbox and storage-apcie windows in the device tree,
+	  every secondary CPU able to park. Otherwise suspend-to-idle stays
+	  the default sleep. A request for suspend-to-RAM with a blocker left
+	  prints the blockers and enters nothing. Without one the SoC is
+	  powered down to suspend-to-RAM and comes back through the boot
+	  object; the AON watchdog is the net over the
 	  whole cycle (t6040_sleep.sleep_wd_secs at the power-down itself,
 	  t6040_sleep.wd2_secs over a dry run).
 

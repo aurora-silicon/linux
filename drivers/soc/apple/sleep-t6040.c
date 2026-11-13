@@ -18,9 +18,12 @@
  *  - It binds below EL2 and without the boot object's mailbox as well, and shows both as
  *    blockers in debugfs t6040-sleep/preflight, next to the CPUs that can park and the
  *    display power states macOS checks before it sleeps (device-check-ps-b4-sleep).
- *  - It offers suspend-to-RAM only to a system booted with t6040_sleep.allow_entry=1.
- *    Without it suspend-to-idle stays the default sleep, and it passes through here
- *    untouched either way.
+ *  - It offers suspend-to-RAM, and makes it the default sleep, only when the boot can
+ *    take it: the kernel at EL2, the boot object's mailbox, ANS's storage-apcie windows
+ *    and the commit and wake blocks in the device tree, and every secondary CPU able to
+ *    park (t6040_sleep_ready). Otherwise suspend-to-idle stays the default sleep. Either
+ *    way suspend-to-idle passes through here untouched; mem_sleep_default=s2idle keeps it
+ *    the default on a boot that could take suspend-to-RAM.
  *  - Its suspend_ops .begin computes the blocker list of a suspend-to-RAM. With a blocker
  *    left it prints every one and returns an error before any device suspends.
  *  - Dry runs (t6040_sleep.dry_run, also writable at runtime):
@@ -34,8 +37,8 @@
  *         shutdown notification it sent at its suspend).
  *    The AON watchdog's WD2 is armed from .begin to .end of a dry run
  *    (t6040_sleep.wd2_secs, 0 to leave it off).
- *  - The real commit (t6040_sleep_commit) runs only when no blocker remains,
- *    t6040_sleep.allow_entry=1 is given and no dry run is asked for. The AON
+ *  - The real commit (t6040_sleep_commit) runs only when no blocker remains
+ *    and no dry run is asked for. The AON
  *    watchdog's WD2 is its net (t6040_sleep.sleep_wd_secs), and over the device
  *    suspend and resume around it.
  *
@@ -443,11 +446,6 @@ module_param(dry_run, uint, 0644);
 MODULE_PARM_DESC(dry_run,
 		 "Dry run level: 1 firmware-driven device sleep refused at the commit point, 2 also the last steps");
 
-static bool allow_entry;
-module_param(allow_entry, bool, 0444);
-MODULE_PARM_DESC(allow_entry,
-		 "Reach the real commit if no blocker remains");
-
 /*
  * The AON WD2 net armed at the commit. macOS arms 5 s for its reconfig; a longer
  * net tells "the SoC never slept" (reset at the net) from "it slept and the wake
@@ -621,6 +619,20 @@ static unsigned int t6040_sleep_log_groups(struct t6040_sleep *s)
 	}
 
 	return blockers;
+}
+
+/*
+ * Whether this boot can take a suspend to RAM at all: the blockers that do not change while
+ * the system runs (EL2, the boot object's mailbox, the CPUs that can park) are clear, and the
+ * device tree gave every block the commit and the wake write, ANS's storage-apcie windows
+ * included. The board enables the controller in its device tree; the boot chain decides the
+ * rest, so an older boot object keeps suspend-to-idle as the only sleep.
+ */
+static bool t6040_sleep_ready(struct t6040_sleep *s)
+{
+	return is_kernel_in_hyp_mode() && s->mbox && s->apcie_st.valid && s->cpu_start &&
+	       s->cluster_ctl && s->pwrgate && s->mastermini && s->spmi0 && s->soc_east &&
+	       s->aop_global && t6040_sleep_parkable(NULL) == num_possible_cpus() - 1;
 }
 
 /* Log the blockers outside the display, for a refused or dry .begin. */
@@ -1307,8 +1319,8 @@ static int t6040_sleep_preflight_show(struct seq_file *m, void *unused)
 	apple_sleep_registry_show(m);
 	t6040_axi2af_show(s, m);
 	seq_printf(m, "verdict: %u live blocker(s)\n", live);
-	seq_printf(m, "dry_run %u, wd2_secs %u, allow_entry %d, parking ops %s\n",
-		   READ_ONCE(dry_run), READ_ONCE(wd2_secs), allow_entry,
+	seq_printf(m, "dry_run %u, wd2_secs %u, suspend-to-RAM offered %s, parking ops %s\n",
+		   READ_ONCE(dry_run), READ_ONCE(wd2_secs), t6040_sleep_ready(s) ? "yes" : "no",
 		   s->power_ops ? "registered" : "not registered");
 	if (s->cluster_ctl) {
 		static const char * const nm[] = {
@@ -2006,7 +2018,7 @@ static void t6040_apcie_gp_lower(struct t6040_sleep *s)
 
 /*
  * The real commit (t6040_sleep_commit, reached through cpu_suspend): t6040_sleep_enter
- * calls it only when no blocker remains and allow_entry is set. In order: the stopped CPUs
+ * calls it only when no blocker remains. In order: the stopped CPUs
  * released to their last WFI, the ATC complexes and the GP PCIe ports lowered, ANS's storage
  * link quiesced, WD0 off and the AON WD2 net armed, the PMU's boot stage 0x50 and
  * NOTIFY_ENABLE over spmi0/spmi-a0, the steps of macOS's PMGR quiesce (APSC, PLL relock,
@@ -2270,12 +2282,13 @@ static void t6040_sleep_return(struct t6040_sleep *s)
 }
 
 /*
- * Offer "deep" only when the system was booted with allow_entry: without it
- * every suspend to RAM is refused, so mem_sleep keeps s2idle as its default.
+ * Offer "deep" only on a boot that can take it (t6040_sleep_ready). suspend_set_ops() then
+ * makes it the default sleep, unless mem_sleep_default= chose another; otherwise mem_sleep
+ * keeps s2idle as its only state.
  */
 static int t6040_sleep_valid(suspend_state_t state)
 {
-	return state == PM_SUSPEND_MEM && READ_ONCE(allow_entry);
+	return state == PM_SUSPEND_MEM && t6040_sleep && t6040_sleep_ready(t6040_sleep);
 }
 
 /*
@@ -2314,10 +2327,10 @@ static void t6040_sleep_pmvc(struct t6040_sleep *s)
 }
 
 /*
- * The refusal-first gate of a suspend to RAM, which t6040_sleep_valid() offers only with
- * allow_entry. With a blocker left, print the blocker list and return an error here, before
- * any device suspends, so nothing is entered. A dry run proceeds and refuses at .enter. No
- * blocker and no dry run: the path that reaches the commit.
+ * The refusal-first gate of a suspend to RAM, which t6040_sleep_valid() offers only on a
+ * boot that can take it. With a blocker left, print the blocker list and return an error
+ * here, before any device suspends, so nothing is entered. A dry run proceeds and refuses
+ * at .enter. No blocker and no dry run: the path that reaches the commit.
  */
 static int t6040_sleep_begin(suspend_state_t state)
 {
@@ -3178,13 +3191,15 @@ static int t6040_sleep_probe(struct platform_device *pdev)
 
 	/*
 	 * The CPU power ops act only when a commit stops the parked secondaries, and a dry run
-	 * needs them for the hold. Both are suspends to RAM, offered only with allow_entry, so
-	 * only then are they registered (.begin tries again if this failed). Without it kexec
-	 * keeps refusing parking CPUs as before. Parking itself needs no power ops.
+	 * needs them for the hold. Both are suspends to RAM, offered only on a boot that can
+	 * take one, so only then are they registered (.begin tries again if this failed).
+	 * Otherwise kexec keeps refusing parking CPUs as before. Parking itself needs no power
+	 * ops.
 	 */
-	if (allow_entry)
+	if (t6040_sleep_ready(s))
 		t6040_sleep_power_ops(s);
 
+	/* Then deep becomes the default sleep, unless mem_sleep_default= chose another. */
 	suspend_set_ops(&t6040_sleep_ops);
 	dev_info(&pdev->dev,
 		 "refusal-first: %u display groups, cpu-start %s, wdt %s, commit/wake blocks %s, storage-apcie %s, s2r-mailbox %s, parking ops %s, dry run %u\n",
@@ -3195,6 +3210,10 @@ static int t6040_sleep_probe(struct platform_device *pdev)
 		 s->apcie_st.valid ? "mapped" : "absent",
 		 s->mbox ? "present" : "absent",
 		 s->power_ops ? "registered" : "not registered", READ_ONCE(dry_run));
+	dev_info(&pdev->dev, "deep sleep %s\n",
+		 !t6040_sleep_ready(s) ? "not offered by this boot" :
+		 mem_sleep_current == PM_SUSPEND_MEM ? "is the default" :
+		 "available, not the default");
 	t6040_sleep_log_s2r_state(s, "probe");
 
 	return 0;
