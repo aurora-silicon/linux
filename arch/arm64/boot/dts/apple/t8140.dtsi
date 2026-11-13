@@ -876,7 +876,7 @@
 			compatible = "apple,t8140-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
 			#address-cells = <1>;
 			#size-cells = <1>;
-			reg = <0x3 0x8280000 0 0xc000>;
+			reg = <0x3 0x8280000 0 0x10000>;
 			/* child nodes are added in t8140-pmgr.dtsi */
 		};
 
@@ -1144,11 +1144,20 @@
 			compatible = "apple,t8140-mtp", "apple,t8140-rtk-helper-asc4",
 				     "apple,mtp", "apple,rtk-helper-asc4";
 			reg = <0x3 0x14600000 0x0 0x4000>,
-			      <0x3 0x14050000 0x0 0x4000>;
-			reg-names = "asc", "sram";
+			      <0x3 0x14050000 0x0 0x4000>,
+			      <0x3 0x14c00000 0x0 0x100000>;
+			reg-names = "asc", "sram", "firmware";
 			mboxes = <&mtp_mbox>;
 			iommus = <&mtp_dart 0>;
 			#helper-cells = <0>;
+			/*
+			 * The always-on PMGR words of its power chain, parents first:
+			 * MTP_FABRIC, MTP_PERIPH, MTP_SCM_FABRIC, MTP_CPU, MTP_SRAM
+			 * (child of both MTP_SCM_FABRIC and MTP_CPU), MTP_DMA.
+			 */
+			apple,aon-pmgr = <&pmgr_mini>;
+			apple,aon-power-words = <0xc000 0xc018 0xc030 0xc028 0xc048 0xc050>;
+			apple,aon-cpu-word = <0xc028>;
 			status = "disabled";
 		};
 

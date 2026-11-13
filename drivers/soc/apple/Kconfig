@@ -136,6 +136,8 @@ config APPLE_RTKIT_HELPER
 	tristate "Apple Generic RTKit helper co-processor"
 	depends on APPLE_RTKIT
 	depends on ARCH_APPLE || COMPILE_TEST
+	select CRC32
+	select MFD_SYSCON
 	help
 	  Apple SoCs such as the M1 come with various co-processors running
 	  their proprietary RTKit operating system. This option enables support
