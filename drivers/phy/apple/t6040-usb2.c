@@ -685,30 +685,43 @@ static int t6040_usb3_wake(struct t6040_usb2_phy *tphy)
 	return 0;
 }
 
+/* The fixed DPTX tunable writes (apply_dptx_tunables, shared with USB3). */
+static const struct { u32 off, clear, set; } t6040_dptx_tunables[] = {
+	{ 0x00800, 0x000003f0, 0x000001c0 },	/* AUS40CMN_DIG RCAL0 */
+	{ 0x00818, 0x0000f000, 0x00003000 },	/* AUS40CMN_DIG RCAL5 */
+	{ 0x03888, 0x000000ff, 0x00000027 },	/* CIO4PLL FREQDESCRIPTOR_0_C */
+	{ 0x28004, 0x00000038, 0x00000008 },	/* AUX_LDO_CTRL */
+	{ 0x03adc, 0x00003ff0, 0x00001760 },	/* CIO4PLL CFG_FRACN_FUNC */
+	/* The lane entries, T6040_DPTX_LANE_TUNABLES of them, come last. */
+	{ 0x0e0cc, 0x01f80000, 0x00380000 },	/* LANE0 TX_EQ_CTRL_REG11 */
+	{ 0x1e0cc, 0x01f80000, 0x00380000 },	/* LANE1 TX_EQ_CTRL_REG11 */
+	{ 0x0d090, 0x01f80000, 0x00380000 },	/* LANE0 RX_CFG TX_EQ_CTRL_REG11 */
+	{ 0x1d090, 0x01f80000, 0x00380000 },	/* LANE1 RX_CFG TX_EQ_CTRL_REG11 */
+};
+
+#define T6040_DPTX_LANE_TUNABLES	4
+
+static void t6040_dp_fixed_tunables(void __iomem *core)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(t6040_dptx_tunables); i++)
+		t6040_usb2_mask32(core + t6040_dptx_tunables[i].off, t6040_dptx_tunables[i].clear,
+				  t6040_dptx_tunables[i].set);
+}
+
 /*
  * B1: the tables, then apply_dptx_tunables' fixed writes (atc-phy reg[] offsets
  * relative to the core) and AUSPLL_CORE once more.
  */
 static void t6040_usb3_tunables(struct t6040_usb2_phy *tphy)
 {
-	static const struct { u32 off, clear, set; } dptx[] = {
-		{ 0x00800, 0x000003f0, 0x000001c0 },	/* AUS40CMN_DIG RCAL0 */
-		{ 0x00818, 0x0000f000, 0x00003000 },	/* AUS40CMN_DIG RCAL5 */
-		{ 0x03888, 0x000000ff, 0x00000027 },	/* CIO4PLL FREQDESCRIPTOR_0_C */
-		{ 0x28004, 0x00000038, 0x00000008 },	/* AUX_LDO_CTRL */
-		{ 0x03adc, 0x00003ff0, 0x00001760 },	/* CIO4PLL CFG_FRACN_FUNC */
-		{ 0x0e0cc, 0x01f80000, 0x00380000 },	/* LANE0 TX_EQ_CTRL_REG11 */
-		{ 0x1e0cc, 0x01f80000, 0x00380000 },	/* LANE1 TX_EQ_CTRL_REG11 */
-		{ 0x0d090, 0x01f80000, 0x00380000 },	/* LANE0 RX_CFG TX_EQ_CTRL_REG11 */
-		{ 0x1d090, 0x01f80000, 0x00380000 },	/* LANE1 RX_CFG TX_EQ_CTRL_REG11 */
-	};
 	size_t i;
 
 	for (i = 0; i < T6040_USB3_NR_TUNABLES; i++)
 		apple_tunable_apply(tphy->regs[t6040_usb3_tunable_list[i].region],
 				    tphy->tunables[i]);
-	for (i = 0; i < ARRAY_SIZE(dptx); i++)
-		t6040_usb2_mask32(t6040_core(tphy) + dptx[i].off, dptx[i].clear, dptx[i].set);
+	t6040_dp_fixed_tunables(t6040_core(tphy));
 	apple_tunable_apply(t6040_core(tphy), tphy->tunables[T6040_USB3_TUNABLE_AUSPLL]);
 }
 
@@ -1458,31 +1471,6 @@ static void t6040_usb3_switch_unregister(void *sw)
  * the "cfg" window. Pin assignment D shares USB3's running PHY and uses
  * the two-lane group link sequences below.
  */
-
-/* The fixed DPTX tunable writes (apply_dptx_tunables, shared with USB3). */
-static const struct { u32 off, clear, set; } t6040_dptx_tunables[] = {
-	{ 0x00800, 0x000003f0, 0x000001c0 },	/* AUS40CMN_DIG RCAL0 */
-	{ 0x00818, 0x0000f000, 0x00003000 },	/* AUS40CMN_DIG RCAL5 */
-	{ 0x03888, 0x000000ff, 0x00000027 },	/* CIO4PLL FREQDESCRIPTOR_0_C */
-	{ 0x28004, 0x00000038, 0x00000008 },	/* AUX_LDO_CTRL */
-	{ 0x03adc, 0x00003ff0, 0x00001760 },	/* CIO4PLL CFG_FRACN_FUNC */
-	/* The lane entries, T6040_DPTX_LANE_TUNABLES of them, come last. */
-	{ 0x0e0cc, 0x01f80000, 0x00380000 },	/* LANE0 TX_EQ_CTRL_REG11 */
-	{ 0x1e0cc, 0x01f80000, 0x00380000 },	/* LANE1 TX_EQ_CTRL_REG11 */
-	{ 0x0d090, 0x01f80000, 0x00380000 },	/* LANE0 RX_CFG TX_EQ_CTRL_REG11 */
-	{ 0x1d090, 0x01f80000, 0x00380000 },	/* LANE1 RX_CFG TX_EQ_CTRL_REG11 */
-};
-
-#define T6040_DPTX_LANE_TUNABLES	4
-
-static void t6040_dp_fixed_tunables(void __iomem *core)
-{
-	size_t i;
-
-	for (i = 0; i < ARRAY_SIZE(t6040_dptx_tunables); i++)
-		t6040_usb2_mask32(core + t6040_dptx_tunables[i].off, t6040_dptx_tunables[i].clear,
-				  t6040_dptx_tunables[i].set);
-}
 
 /* aciophy_xbar_config for PHY mode 3 (DP on all four lanes). */
 static void t6040_dp_xbar_config(struct t6040_usb2_phy *tphy, bool flip)
