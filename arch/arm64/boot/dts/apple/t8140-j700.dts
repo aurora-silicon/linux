@@ -1806,6 +1806,8 @@
 };
 
 &gpu {
+	/* PACC/ANE lane selected by the J700 PMP control-effort map. */
+	apple,fast-die-effort = <&pmp_report 1>;
 	status = "okay";
 };
 
