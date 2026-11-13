@@ -10,22 +10,24 @@ maintainers:
   - Diljit Singh <hey@djdev.me>
 
 description: |
-  One PMGR word per CPU cluster, whose top bit lets the cluster's cores power
-  down in WFI. A core that PMGR powers on comes up allowed to, but the boot CPU
-  was started by the boot ROM and only follows the word, which the boot loader
-  may leave clear. The words are set early in boot, in the order listed.
+  PMGR words whose top bit lets a CPU power down in WFI: one per cluster on
+  T8140, one per core on T6050. A core that PMGR powers on comes up allowed to,
+  but the boot CPU was started by the boot ROM and only follows its word, which
+  the boot loader may leave clear. The words are set early in boot, in the order
+  listed.
 
 properties:
   compatible:
     items:
       - enum:
+          - apple,t6050-cluster-pwrgate
           - apple,t8140-cluster-pwrgate
       - const: apple,cluster-pwrgate
 
   reg:
     minItems: 1
     maxItems: 8
-    description: One word per cluster.
+    description: The words to set, one per cluster or per core.
 
 required:
   - compatible
