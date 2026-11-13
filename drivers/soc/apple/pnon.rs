@@ -66,16 +66,11 @@ impl Layout {
     }
 }
 
-/// The layouts the endpoint advertises on every SEP we have booted: four
-/// pages at most each way on M1 Pro, M2 and A18 Pro, seven on M4 Pro (whose
-/// SEP asks for five at least). The driver talks to the endpoint only when
-/// it advertises one of these.
-pub(crate) const LAYOUT_4: Layout = Layout {
-    send_min: 2,
-    receive_min: 2,
-    send_max: 4,
-    receive_max: 4,
-};
+/// The layout the endpoint advertises on M4 Pro: five to seven pages each
+/// way. The driver talks to the endpoint only when it advertises this one.
+/// M1 Pro, M2 and A18 Pro advertise two to four pages; the A18 Pro answers
+/// the recorded request there with a one-byte reply and writes nothing, so
+/// those SEPs speak another version of the service and are left alone.
 pub(crate) const LAYOUT_7: Layout = Layout {
     send_min: 5,
     receive_min: 5,
@@ -83,12 +78,12 @@ pub(crate) const LAYOUT_7: Layout = Layout {
     receive_max: 7,
 };
 
-/// The buffer sizes registered for a known layout: the largest send buffer
-/// and the smallest receive buffer the layout allows, which is what macOS
+/// The buffer sizes registered for the known layout: the largest send
+/// buffer and the smallest receive buffer it allows, which is what macOS
 /// registers on the M4 Pro (seven pages out, five back).
 pub(crate) fn ool_sizes(word: u32) -> Option<(usize, usize)> {
     let layout = Layout::from_word(word);
-    if layout != LAYOUT_4 && layout != LAYOUT_7 {
+    if layout != LAYOUT_7 {
         return None;
     }
     Some((
@@ -304,7 +299,7 @@ impl SepData {
         }
         let Some(sizes) = self.pnon_offered() else {
             if self.endpoint_present(EP_PNON) {
-                dev_info_ratelimited!(
+                dev_dbg!(
                     self.dev,
                     "pnon: the endpoint advertises layout {:#010x}; left alone\n",
                     self.pnon_layout.load(Relaxed)
@@ -577,16 +572,21 @@ mod tests {
         assert_eq!(name.param, EP_PNON);
         assert_eq!(name.ty, DISCOVER_TYPE_DESCRIPTOR);
         assert_eq!(name.data_lo, PNON_NAME);
-        for (w, sizes) in [
-            (DISCOVER_LAYOUT_4, (0x10000, 0x8000)),
-            (DISCOVER_LAYOUT_7, (0x1c000, 0x14000)),
-        ] {
-            let f = decode(&Message { msg0: w, msg1: 0 });
-            assert_eq!(f.param, EP_PNON);
-            assert_eq!(f.ty, DISCOVER_TYPE_CONFIG);
-            assert_eq!(ool_sizes(f.data_lo), Some(sizes));
-            assert!(sizes.0 <= OOL_SIZE_PNON && sizes.1 <= OOL_SIZE_PNON);
-        }
+        let f = decode(&Message {
+            msg0: DISCOVER_LAYOUT_7,
+            msg1: 0,
+        });
+        assert_eq!(f.param, EP_PNON);
+        assert_eq!(f.ty, DISCOVER_TYPE_CONFIG);
+        assert_eq!(ool_sizes(f.data_lo), Some((0x1c000, 0x14000)));
+        assert_eq!(OOL_SIZE_PNON, 0x1c000);
+        // The two-to-four-page layout of M1 Pro, M2 and A18 Pro is left alone.
+        let f = decode(&Message {
+            msg0: DISCOVER_LAYOUT_4,
+            msg1: 0,
+        });
+        assert_eq!(f.param, EP_PNON);
+        assert_eq!(ool_sizes(f.data_lo), None);
     }
 
     #[test]
