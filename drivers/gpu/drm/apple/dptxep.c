@@ -732,6 +732,8 @@ static int dptxport_call_set_tiled_display_hint(struct apple_epic_service *servi
 		dptx->tiles_v = min(v, 255U);
 		dptx->tile_x = min(x, 255U);
 		dptx->tile_y = min(y, 255U);
+		dptx->tile_width = get_unaligned_le32(hint + DPTX_TILE_HINT_WIDTH);
+		dptx->tile_height = get_unaligned_le32(hint + DPTX_TILE_HINT_HEIGHT);
 		/* Only the two horizontal tiles carried by these two ports fit. */
 		smp_store_release(&dptx->tile_hint,
 				  h == 2 && v == 1 && x == dptx->unit && y == 0 &&

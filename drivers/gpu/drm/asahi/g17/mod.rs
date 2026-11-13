@@ -277,6 +277,11 @@ pub(crate) enum CrashBuffers {
     /// The firmware places its crash log in its own data segment, the `fw-data` reserved
     /// region, and asks for it there by physical address.
     FirmwareData,
+    /// As [`CrashBuffers::FirmwareData`] when the boot loader describes the data segment as
+    /// the `fw-data` region. A boot loader that does not gets the driver's own buffers, as
+    /// [`CrashBuffers::Fixed`], at the low bits of the physical address the firmware asks for;
+    /// the firmware does not write its crash log there.
+    FirmwareDataOrFixed([FixedBuffer; 2]),
 }
 
 /// A firmware coprocessor instance.
@@ -554,8 +559,26 @@ impl Coprocessor {
         role: Role,
     ) -> Result<Coprocessor> {
         let index = role as usize;
-        let (crash_buffer, crash_log) = match &cfg.crash_buffers {
-            CrashBuffers::Fixed(buffers) => {
+        let fixed = match &cfg.crash_buffers {
+            CrashBuffers::Fixed(buffers) => Some(buffers),
+            CrashBuffers::FirmwareData => None,
+            CrashBuffers::FirmwareDataOrFixed(buffers) => {
+                let described = data_segment::described(dev.as_ref().as_ref());
+                if role == Role::Primary {
+                    if described {
+                        dev_info!(dev.as_ref(), "G17: crash logs from the firmware data segment\n");
+                    } else {
+                        dev_info!(
+                            dev.as_ref(),
+                            "G17: no fw-data region from the boot loader, crash logs unreadable\n"
+                        );
+                    }
+                }
+                (!described).then_some(buffers)
+            }
+        };
+        let (crash_buffer, crash_log) = match fixed {
+            Some(buffers) => {
                 let buffer = &buffers[index];
                 let mut crash_buffer = KernelObject::new(
                     dev,
@@ -573,7 +596,7 @@ impl Coprocessor {
                 };
                 (Some(crash_buffer), Some((fixed, crash_map)))
             }
-            CrashBuffers::FirmwareData => (None, None),
+            None => (None, None),
         };
         let state = Arc::pin_init(
             pin_init!(RoleState {
@@ -1795,7 +1818,10 @@ impl Gpu {
         )?;
         let stats = Arc::new(
             crate::stats::StatsSnapshot {
-                g17_reader: Some(stats::Reader(shared.clone())),
+                g17_reader: Some(stats::Reader(
+                    shared.clone(),
+                    cfg.m5.map(|board| board.perf_states),
+                )),
                 ..Default::default()
             },
             GFP_KERNEL,
@@ -2013,7 +2039,7 @@ impl Gpu {
                     shared.feed.clone(),
                 )?,
                 seen_submissions: 0,
-                rings: channel::Rings::new(shared.variant.graph)?,
+                rings: channel::Rings::new(shared.variant.graph, shared.variant.m5_commands)?,
                 recovery: recovery::State::new(),
                 effort: power::Effort::new(),
                 hold: power::Hold::new(),
@@ -2217,7 +2243,7 @@ impl Gpu {
                     shared.feed.clone(),
                 )?,
                 seen_submissions: 0,
-                rings: channel::Rings::new(shared.variant.graph)?,
+                rings: channel::Rings::new(shared.variant.graph, shared.variant.m5_commands)?,
                 recovery: recovery::State::new(),
                 effort: power::Effort::new(),
                 hold: power::Hold::new(),
@@ -2435,7 +2461,8 @@ impl gpu::Gpu for Gpu {
             u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)
                 | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS)
                 | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)
-                | sync_output::FEATURE_CUMULATIVE_SIGNALS;
+                | sync_output::FEATURE_CUMULATIVE_SIGNALS
+                | crate::file::DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT;
         let variant = self.shared.variant;
         // The M5 command set has no AS-build flag: its validation refuses one.
         if !variant.m5_commands {

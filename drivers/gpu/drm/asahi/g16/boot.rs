@@ -186,7 +186,10 @@ unsafe extern "C" fn rtkit_recv(cookie: *mut c_void, endpoint: u8, message: u64)
         endpoint,
         message
     );
-    shared.fail_stop(eproto());
+    // What a firmware says while it comes back from a sleep isn't known yet.
+    if !shared.sleeping.load(Ordering::Acquire) {
+        shared.fail_stop(eproto());
+    }
 }
 
 /// EP 0x20 ring-service request, in the mailbox interrupt: wake only. The drain and the
@@ -323,9 +326,26 @@ impl Rtkit {
         }
     }
 
-    fn wake(&mut self) -> Result {
+    pub(crate) fn wake(&mut self) -> Result {
         // SAFETY: `rtk` is live by the type invariant.
         to_result(unsafe { bindings::apple_rtkit_wake(self.rtk) })
+    }
+
+    /// The C handle, for the stop at a sleep's commit.
+    pub(crate) fn as_raw(&self) -> *mut bindings::apple_rtkit {
+        self.rtk
+    }
+
+    /// Prepares for HELLO from firmware restarting warm, which keeps its buffers and rings.
+    pub(crate) fn warm_restart(&mut self) -> Result {
+        // SAFETY: `rtk` is live by the type invariant.
+        to_result(unsafe { bindings::apple_rtkit_warm_restart(self.rtk) })
+    }
+
+    /// Waits for the firmware to report in, and sets the AP on.
+    pub(crate) fn boot(&mut self) -> Result {
+        // SAFETY: `rtk` is live by the type invariant.
+        to_result(unsafe { bindings::apple_rtkit_boot(self.rtk) })
     }
 
     fn running(&self) -> bool {

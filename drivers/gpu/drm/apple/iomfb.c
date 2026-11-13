@@ -1421,8 +1421,22 @@ bool dcp_connector_connected(struct apple_connector *connector)
 	struct platform_device *pdev = READ_ONCE(connector->dcp);
 	struct apple_dcp *dcp = pdev ? platform_get_drvdata(pdev) : NULL;
 
-	if (!dcp || !dcp_announce_gated(dcp, connector))
+	if (!dcp || !dcp_announce_gated(dcp, connector)) {
+		/*
+		 * A display behind a Thunderbolt tunnel whose catalog has no
+		 * usable timing (every colour element virtual: no pixel clock
+		 * yet) is not reported: compositors abort on a connected output
+		 * without a mode. The catalog that brings modes ends with the
+		 * firmware's hotplug notification, which probes again.
+		 */
+		if (dcp && READ_ONCE(connector->connected) && dcp_is_usb4_output(dcp) &&
+		    !READ_ONCE(dcp->nr_modes)) {
+			dev_dbg_ratelimited(dcp->dev,
+					    "tunnel display without usable modes: reported disconnected\n");
+			return false;
+		}
 		return READ_ONCE(connector->connected);
+	}
 
 	guard(mutex)(&dcp->hpd_mutex);
 	dcp_announce_poll(dcp, connector, false);
@@ -2145,6 +2159,11 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 		ctx->pq_dsc = dcp->fw_compat == DCP_FIRMWARE_V_27_0;
 	}
 	ctx->zero_vrr_range_fallback = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
+	if (dcp->fixed_connector_type != DRM_MODE_CONNECTOR_eDP &&
+	    smp_load_acquire(&dcp->dptxport[0].tile_hint)) {
+		ctx->tiled_width = dcp->dptxport[0].tile_width;
+		ctx->tiled_height = dcp->dptxport[0].tile_height;
+	}
 	modes = enumerate_modes(ctx, &nr_modes, dcp->width_mm, dcp->height_mm,
 				dcp->notch_height,
 				dcp->fixed_connector_type == DRM_MODE_CONNECTOR_eDP,
@@ -4076,6 +4095,19 @@ void iomfb_shutdown(struct apple_dcp *dcp)
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
 	}
+}
+
+/*
+ * The IOMFB parameters macOS sends to an external display after each mode set,
+ * in 16.16 fixed point: parameter 3 at 1.0, and parameter 6 at 1.0 for an SDR
+ * colour mode or 2.0 for a PQ (HDR) one.  Fills @out[0] and @out[1].
+ */
+void iomfb_external_hdr_hint_values(bool pq, struct iomfb_property out[2])
+{
+	out[0].id = 3;
+	out[0].value = 1U << 16;			/* 1.0 */
+	out[1].id = 6;
+	out[1].value = pq ? (2U << 16) : (1U << 16);	/* 2.0 PQ, 1.0 SDR */
 }
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_PARSER_KUNIT_TEST)

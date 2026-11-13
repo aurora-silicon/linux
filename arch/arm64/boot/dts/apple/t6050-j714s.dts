@@ -421,6 +421,9 @@
 			63 2e 00 06 02 69 4f 53 00 00 00 00];
 };
 
+/* Left-front port (ATC1): the USB4/Thunderbolt router and its PCIe tunnel */
+#include "t6050-j714s-left-usb4.dtsi"
+
 /*
  * The PMP (ADT pmp0, /chosen, /arm-io/pmgr). iBoot loads its firmware and the driver starts it
  * with these boot arguments and the firmware properties below. Its report tells it which devices
@@ -610,11 +613,76 @@
 /* The same T6050 camera as J716c (J714sAP ADT); the loader sets the J714s sensor type. */
 #include "t6050-j716c-isp.dtsi"
 
+/*
+ * The J714s camera sizes: sensor config 6 (two stacked 3040x2880 frames; the ISP processes
+ * the first) cropped and scaled by the ISP per size. Each crop is centred on that frame;
+ * the landscape sizes take two-thirds of its width, the portrait sizes the same length of
+ * its height and the square that side.
+ */
+&isp0 {
+	/delete-node/ sensor-presets;
+
+	sensor-presets {
+		/* 1920x1080 */
+		preset0 {
+			apple,config-index = <6>;
+			apple,input-size = <3040 5760>;
+			apple,output-size = <1920 1080>;
+			apple,crop = <506 870 2026 1140>;
+		};
+		/* 640x480 */
+		preset1 {
+			apple,config-index = <6>;
+			apple,input-size = <3040 5760>;
+			apple,output-size = <640 480>;
+			apple,crop = <506 680 2026 1520>;
+		};
+		/* 1280x720 */
+		preset2 {
+			apple,config-index = <6>;
+			apple,input-size = <3040 5760>;
+			apple,output-size = <1280 720>;
+			apple,crop = <506 870 2026 1140>;
+		};
+		/* 1760x1328 */
+		preset3 {
+			apple,config-index = <6>;
+			apple,input-size = <3040 5760>;
+			apple,output-size = <1760 1328>;
+			apple,crop = <506 676 2026 1528>;
+		};
+		/* 1328x1760 */
+		preset4 {
+			apple,config-index = <6>;
+			apple,input-size = <3040 5760>;
+			apple,output-size = <1328 1760>;
+			apple,crop = <756 426 1528 2026>;
+		};
+		/* 1552x1552 */
+		preset5 {
+			apple,config-index = <6>;
+			apple,input-size = <3040 5760>;
+			apple,output-size = <1552 1552>;
+			apple,crop = <506 426 2026 2026>;
+		};
+		/* 1080x1920 */
+		preset6 {
+			apple,config-index = <6>;
+			apple,input-size = <3040 5760>;
+			apple,output-size = <1080 1920>;
+			apple,crop = <950 426 1140 2026>;
+		};
+	};
+};
+
 /* The GPU and the internal panel, for the boot loader's handoff */
 #include "t6050-j714s-gpu-panel.dtsi"
 
 /* External displays, on the left-front and right ports */
 #include "t6050-j714s-display.dtsi"
+
+/* DisplayPort audio of dcpext0's displays */
+#include "t6050-j714s-dpaudio.dtsi"
 
 /* The Neural Engine, started only after the boot loader's preload hand-off */
 #include "t6050-j714s-ane.dtsi"

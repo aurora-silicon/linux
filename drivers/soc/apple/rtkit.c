@@ -14,6 +14,7 @@
 #include <linux/of.h>
 #include <linux/overflow.h>
 #include <linux/sizes.h>
+#include <linux/soc/apple/dart.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/suspend.h>
 
@@ -853,6 +854,23 @@ static void apple_rtkit_memcpy(struct apple_rtkit *rtk, void *dst,
 }
 
 /*
+ * Where a DVA of the crash buffer lands: in a mapping Linux made, or else in one the
+ * firmware kept from the bootloader in a root its DART inherited (the T8140 AOP's own
+ * slot). 0 when neither translates it.
+ */
+static phys_addr_t apple_rtkit_crashlog_phys(struct apple_rtkit *rtk,
+					     struct iommu_domain *domain, dma_addr_t iova)
+{
+	phys_addr_t phys = iommu_iova_to_phys(domain, iova);
+
+	if (!phys && IS_REACHABLE(CONFIG_APPLE_DART) &&
+	    apple_dart_fw_remote(rtk->dev, iova, false, &phys))
+		phys = 0;
+
+	return phys;
+}
+
+/*
  * The buffer a crashing firmware placed at its own address, mapped if its IOMMU
  * translates every page of it to one contiguous range, and acknowledged as a placed
  * buffer is. The firmware doesn't run again until a reboot.
@@ -869,9 +887,9 @@ static int apple_rtkit_crashlog_map(struct apple_rtkit *rtk, u64 msg)
 
 	if (!domain || !iova || !size)
 		return -ENODEV;
-	phys = iommu_iova_to_phys(domain, iova);
+	phys = apple_rtkit_crashlog_phys(rtk, domain, iova);
 	for (off = 0; phys && off < size; off += PAGE_SIZE) {
-		page = iommu_iova_to_phys(domain, iova + off);
+		page = apple_rtkit_crashlog_phys(rtk, domain, iova + off);
 		if (page != phys + off) {
 			dev_err(rtk->dev, "RTKit: crash log at %pad isn't contiguous at +%#zx\n",
 				&iova, off);
@@ -994,6 +1012,12 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 			if (rtk->ops->crashed)
 				rtk->ops->crashed(rtk->cookie, NULL, 0);
 		}
+		/* The log follows the acknowledgment, maybe with no message after it. */
+		if (!ret) {
+			rtk->crashlog_late_polls = 0;
+			queue_delayed_work(rtk->wq, &rtk->crashlog_late_work,
+					   msecs_to_jiffies(APPLE_RTKIT_CRASHLOG_LATE_POLL_MS));
+		}
 		return;
 	}
 
@@ -1020,6 +1044,8 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 	}
 
 	dev_err(rtk->dev, "RTKit: co-processor has crashed\n");
+	/* The log is read here, not by the poll a placed buffer started. */
+	cancel_delayed_work(&rtk->crashlog_late_work);
 
 	/* A firmware-owned crash buffer has no CPU mapping to read the log from. */
 	if (!rtk->crashlog_buffer.buffer && !rtk->crashlog_buffer.iomem) {
@@ -2033,10 +2059,10 @@ int apple_rtkit_port_restart(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_port_restart);
 
-int apple_rtkit_reinit(struct apple_rtkit *rtk)
+/* Everything of a firmware session but the mailbox hardware. */
+static void apple_rtkit_reset_session(struct apple_rtkit *rtk)
 {
 	unsigned long flags;
-	int ret;
 
 	/* make sure we don't handle any messages while reinitializing */
 	apple_rtkit_detach_rx(rtk);
@@ -2082,7 +2108,13 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	WRITE_ONCE(rtk->shutting_down, false);
 	rtk->mbox->rx = apple_rtkit_rx;
 	spin_unlock_irqrestore(&rtk->mbox->rx_lock, flags);
+}
 
+int apple_rtkit_reinit(struct apple_rtkit *rtk)
+{
+	int ret;
+
+	apple_rtkit_reset_session(rtk);
 	ret = apple_mbox_start(rtk->mbox);
 	if (ret) {
 		apple_rtkit_detach_rx(rtk);
@@ -2311,6 +2343,30 @@ int apple_rtkit_ap_power_noirq(struct apple_rtkit *rtk, bool on)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_ap_power_noirq);
+
+/* Power is back, the CPU is stopped, and poweroff() discarded the old session. */
+int apple_rtkit_cold_restart(struct apple_rtkit *rtk, int (*start)(void *), void *ctx)
+{
+	int ret;
+
+	/* A fresh boot: no warm or port-only restart may answer its endpoint map. */
+	apple_rtkit_reset_session(rtk);
+	rtk->warm_restart = false;
+	rtk->port_only = false;
+	rtk->warm_last_mask = U32_MAX;
+	/* The mailbox registers may only be clocked once @start has run. */
+	ret = start(ctx);
+	if (!ret)
+		ret = apple_mbox_start(rtk->mbox);
+	if (ret) {
+		apple_rtkit_detach_rx(rtk);
+		flush_workqueue(rtk->wq);
+		return ret;
+	}
+	apple_mbox_set_recv_enabled(rtk->mbox, true);
+	return apple_rtkit_boot(rtk);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_cold_restart);
 
 int apple_rtkit_quiesce(struct apple_rtkit *rtk)
 {

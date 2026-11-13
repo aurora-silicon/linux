@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright 2026 Ryan Murray
 """Actual mux prepare/set and TPS removal ordering; firmware/PHY leaves are mocks."""
-from common import block, atc_function, atc_cio_helpers, fabric_core, fabric_rebalance
+from common import block, atc_function, atc_cio_helpers, atc_mux_noop, fabric_core, fabric_rebalance
 
 def make_unit(source, parent=False, reference=None):
  reference=source if reference is None else reference
@@ -130,7 +130,8 @@ static void gpiod_set_value_cansleep(void *p,int v) { (void)p;assert(v==1);gpio_
  if not parent:functions+=block(core,'static void tps6598x_drop_partner(')+'\n'+block(core,'static int tps6598x_set_data_role(')+'\n'
  # The fixed-hub SuperSpeed handover moved the locked mux body to atcphy_mux_switch();
  # atcphy_mux_set_locked() also reports whether a SuperSpeed port may come back up.
- split=[atc_cio_helpers(atc)]+[atc_function(atc,name) for name in ('atcphy_usb3_port_ready','atcphy_mux_check','atcphy_mux_park','atcphy_mux_switch')]
+ split=[atc_cio_helpers(atc)]+[atc_function(atc,name) for name in ('atcphy_usb3_port_ready','atcphy_mux_check','atcphy_mux_park')]
+ split+=[atc_mux_noop(atc),atc_function(atc,'atcphy_mux_switch')]
  functions+=block(core,'static '+('void' if parent else 'int')+' tps6598x_disconnect(')+'\n'+block(core,'static '+('void' if parent else 'int')+' cd321x_remove(')+'\n'+block(core,'void tipd_remove(')+'\n'
  ordinary_phy=r'''
 /* Actual ordinary-port ATC power-off, mux recheck and USB2 init; MMIO leaves. */
@@ -154,6 +155,8 @@ struct apple_atcphy {
  bool t8103_dummy_pending,t8103_usb3_retry,t8103_usb3_workaround;
  enum atcphy_mode mode,typec_mode;
  enum atcphy_pipehandler_state pipe_state;
+ /* A CIO sleep is T8132's, covered by tools/asahi/atc-cio-sleep-tests.py. */
+ struct { bool prepared; } cio_sleep;
 };
 struct phy { struct apple_atcphy *data; };
 #define phy_get_drvdata(p) ((p)->data)

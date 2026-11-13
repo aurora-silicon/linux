@@ -85,6 +85,8 @@ struct dptx_port {
 	 */
 	bool tile_hint;
 	u8 tiles_h, tiles_v, tile_x, tile_y;
+	/* The whole tiled display's size in pixels; valid with tile_hint. */
+	u32 tile_width, tile_height;
 };
 
 int dptxport_validate_connection(struct apple_epic_service *service, u8 core,
