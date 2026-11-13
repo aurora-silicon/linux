@@ -437,11 +437,10 @@ bool dcp_t6041_ext_enabled(void)
 #include "dcp-peer-probe-v27.inc"
 
 /*
- * The backlight maximum of a desktop 26.x panel whose node has no
- * apple,max-brightness: the J616s panel's user-accessible SDR maximum (ADT
- * user-accessible-max-nits, 0x02580000 in 16.16).
+ * The backlight maximum of a T6041 panel whose node has no
+ * apple,max-brightness: the J616s panel's user-accessible SDR maximum.
  */
-#define DCP_DESKTOP_MAX_NITS	600
+#define DCP_T6041_MAX_NITS	600
 
 static bool dcp_desktop_external(struct apple_dcp *dcp)
 {
@@ -5854,7 +5853,7 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 			 */
 			if (of_property_read_u32(panel_np, "apple,max-brightness",
 						 &dcp->brightness.maximum))
-				dcp->brightness.maximum = DCP_DESKTOP_MAX_NITS;
+				dcp->brightness.maximum = DCP_T6041_MAX_NITS;
 		} else if (of_device_is_available(panel_np)) {
 			ret = of_property_read_u32(panel_np, "apple,max-brightness",
 						   &dcp->brightness.maximum);
@@ -5864,7 +5863,7 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 
 		dcp_panel_read_dimensions(dcp, panel_np);
 		of_node_put(panel_np);
-		/* Read target metadata for H17P and desktop firmware alike. */
+		/* Read target metadata for firmware 27 and desktop firmware alike. */
 		dcp_panel_read_adt(dcp);
 		dcp->fixed_connector_type = DRM_MODE_CONNECTOR_eDP;
 		dcp->connector_type = DRM_MODE_CONNECTOR_eDP;
@@ -6434,7 +6433,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	fw_compat = dcp_check_firmware_version(dev);
 	if (fw_compat == DCP_FIRMWARE_UNKNOWN)
 		return -ENODEV;
-	if (fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
+	if (of_device_is_compatible(dev->of_node, "apple,t6041-dcp")) {
 		ret = dcp_validate_t6041_dt(dev);
 		if (ret)
 			return ret;
