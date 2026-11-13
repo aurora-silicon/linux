@@ -68,10 +68,10 @@ SYM_CODE_START(swsusp_arch_suspend_exit)
 
 	add	x1, x10, #PAGE_SIZE
 	/*
-	 * Clean the copied page to PoC, not only PoU: on Apple SoCs the
-	 * coprocessors (GPU UAT walker, DCP, ...) are not cache coherent and
-	 * read the restored pages from DRAM. Clean+invalidate to PoC also
-	 * covers what caches_clean_inval_pou() did for the I-side.
+	 * Clean the copied page to PoC, not only PoU: non-coherent DMA
+	 * masters (the coprocessors of some SoCs) read the restored pages
+	 * from DRAM. Clean+invalidate to PoC also covers what
+	 * caches_clean_inval_pou() did for the I-side.
 	 */
 	raw_dcache_line_size x2, x3
 	sub	x3, x2, #1

@@ -2751,14 +2751,13 @@ static void *get_buffer(struct memory_bitmap *bm, struct chain_allocator *ca)
 	return pbe->address;
 }
 
-#ifdef CONFIG_ARM64
+#ifdef CONFIG_ARCH_HIBERNATION_CLEAN_IMAGE
 /*
  * Most image pages are loaded straight into their original frames through
  * the cacheable linear map (only conflicting pages go through restore_pblist).
- * Non-coherent DMA masters (on Apple SoCs: the GPU page table walker, DCP,
- * every RTKit co-processor, the NVMe queues) read DRAM, and a later eviction
- * of a dirty line would overwrite what a device wrote since. Clean and
- * invalidate every image page to the PoC before the jump.
+ * Where devices read memory without snooping the CPU caches, a later eviction
+ * of a dirty line would overwrite what a device wrote since: let the
+ * architecture clean every image page before the jump.
  */
 static void swsusp_clean_restored_image(void)
 {
@@ -2767,27 +2766,16 @@ static void swsusp_clean_restored_image(void)
 	memory_bm_position_reset(&orig_bm);
 	for (pfn = memory_bm_next_pfn(&orig_bm); pfn != BM_END_OF_MAP;
 	     pfn = memory_bm_next_pfn(&orig_bm)) {
-		unsigned long va;
-
 		if (!pfn_valid(pfn))
 			continue;
-		/*
-		 * Not in the boot kernel's linear map (for example the linear
-		 * alias of the kernel image, which faults when touched):
-		 * nothing was loaded there through the linear map. Such frames
-		 * are restored by the restore_pblist copy, which cleans each
-		 * copied page itself.
-		 */
-		if (!kernel_page_present(pfn_to_page(pfn))) {
+		if (!arch_hibernate_clean_image_page(pfn)) {
 			skipped++;
 			continue;
 		}
-		va = (unsigned long)page_address(pfn_to_page(pfn));
-		dcache_clean_inval_poc(va, va + PAGE_SIZE);
 		if (!(++n & 0xffff))
 			cond_resched();
 	}
-	pr_debug("%lu image pages cleaned to PoC, %lu outside the linear map left to the copy\n",
+	pr_debug("%lu image pages cleaned, %lu left to the restore_pblist copy\n",
 		 n, skipped);
 }
 #else

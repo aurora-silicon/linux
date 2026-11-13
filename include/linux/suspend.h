@@ -431,6 +431,23 @@ int hibernate_resume_nonboot_cpu_disable(void);
 int arch_hibernation_header_save(void *addr, unsigned int max_size);
 int arch_hibernation_header_restore(void *addr);
 
+#ifdef CONFIG_ARCH_HIBERNATION_CLEAN_IMAGE
+/**
+ * arch_hibernate_clean_image_page - Make a loaded image page visible to devices.
+ * @pfn: Valid page frame of the image.
+ *
+ * Provided by an architecture that sets ARCH_HIBERNATION_CLEAN_IMAGE.
+ * Called once for every valid page frame of the image after the whole image
+ * has been loaded, while the list of those frames is still intact, so that
+ * the architecture can clean the caches for devices that do not snoop them.
+ *
+ * Return: 1 when the page was cleaned, 0 when it was left alone because
+ * nothing was loaded into it through the linear map (the frame is restored
+ * from restore_pblist).
+ */
+int arch_hibernate_clean_image_page(unsigned long pfn);
+#endif
+
 #else /* CONFIG_HIBERNATION */
 static inline void register_nosave_region(unsigned long b, unsigned long e) {}
 static inline int swsusp_page_is_forbidden(struct page *p) { return 0; }
