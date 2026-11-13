@@ -282,6 +282,29 @@ static int dcp_secure_port_init(struct apple_dcp *dcp)
 	return devm_add_action_or_reset(dev, dcp_release_secure_rtkit, dcp);
 }
 
+/*
+ * Stopping the firmware (DPMS off and system sleep with hw.s2r or hw.s2r_ext) powers the
+ * display domains through apple,display-power, and the internal DCP only takes IOP idle
+ * once its secure port has gone idle. A device tree without those keeps the firmware
+ * running: DPMS is the backlight alone and the display stays up across a sleep.
+ */
+static void dcp_s2r_check_dt(struct apple_dcp *dcp)
+{
+	struct device_node *np = dcp->dev->of_node;
+	bool power = of_property_present(np, "apple,display-power");
+	bool secure = of_property_match_string(np, "mbox-names", "secure") >= 0;
+
+	if (dcp->hw.s2r && (!power || !secure)) {
+		dev_info(dcp->dev, "no %s in the device tree, the firmware keeps running\n",
+			 !power ? "apple,display-power" : "secure mailbox");
+		dcp->hw.s2r = false;
+	}
+	if (dcp->hw.s2r_ext && !power) {
+		dev_info(dcp->dev, "no apple,display-power in the device tree, the firmware keeps running\n");
+		dcp->hw.s2r_ext = false;
+	}
+}
+
 static void dcp_release_rtkit(void *data)
 {
 	struct apple_dcp *dcp = data;
@@ -5925,6 +5948,7 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 	ret = devm_add_action_or_reset(dev, dcp_release_rtkit, dcp);
 	if (ret)
 		goto err_piodma;
+	dcp_s2r_check_dt(dcp);
 	/* After a warm restart its log counters need echoing, or it refuses its next idle. */
 	if (dcp->hw.s2r || dcp->hw.s2r_ext)
 		apple_rtkit_set_oslog_echo(dcp->rtk, true);
