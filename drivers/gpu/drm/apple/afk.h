@@ -7,6 +7,7 @@
 #ifndef _DRM_APPLE_DCP_AFK_H
 #define _DRM_APPLE_DCP_AFK_H
 
+#include <linux/atomic.h>
 #include <linux/bitmap.h>
 #include <linux/completion.h>
 #include <linux/errno.h>
@@ -501,6 +502,12 @@ struct apple_dcp_afkep {
 
 	struct completion started;
 	struct completion stopped;
+	/* The firmware 27 sleep's control exchange. A timeout poisons it until a new boot. */
+	struct completion sleep_done;
+	u8 sleep_expected;
+	bool sleep_waiting;
+	bool sleep_poisoned;
+	bool sleep_closed;
 
 	void *bfr;
 	u16 bfr_tag;
@@ -532,6 +539,8 @@ struct apple_dcp_afkep {
 	bool compact_tx_desync;
 	/* Replies to firmware calls, see afk_compact_reply_worker(). */
 	struct workqueue_struct *tx_wq;
+	/* Accepted RX and queued replies, until each worker has returned. */
+	atomic_t sleep_jobs;
 	struct mutex compact_tx_lock;
 	struct afk_fragment_state compact_rx;
 	void *compact_rx_data;
@@ -559,6 +568,8 @@ static inline void afk_ep_init_state(struct apple_dcp_afkep *ep)
 	mutex_init(&ep->compact_tx_lock);
 	init_completion(&ep->started);
 	init_completion(&ep->stopped);
+	init_completion(&ep->sleep_done);
+	atomic_set(&ep->sleep_jobs, 0);
 	for (i = 0; i < AFK_MAX_CHANNEL; i++)
 		spin_lock_init(&ep->services[i].lock);
 }
@@ -568,6 +579,8 @@ struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 int afk_v2_copy_owned(struct apple_epic_service *service, u64 dva,
 		      void *buffer, size_t size, bool to_peer);
 int afk_start(struct apple_dcp_afkep *ep);
+int afk_v27_sleep_control(struct apple_dcp_afkep *ep, bool open);
+int afk_v27_sleep_check(struct apple_dcp_afkep *ep);
 int afk_start_service(struct apple_epic_service *service);
 void afk_cancel_commands(struct apple_dcp_afkep *ep);
 bool afk_compact_orphans_wait(struct apple_dcp_afkep *ep, unsigned long timeout);

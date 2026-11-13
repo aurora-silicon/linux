@@ -111,6 +111,7 @@ static const struct dcp_method_entry dcp_methods_27_0[dcpep_num_methods] = {
 	IOMFB_METHOD("A478", dcpep_flush_supports_power),
 	IOMFB_METHOD("A479", iomfbep_abort_swaps_dcp),
 	IOMFB_METHOD("A484", dcpep_set_power_state),
+	IOMFB_METHOD("A500", dcpep_unnamed_500),
 	IOMFB_METHOD("A483", dcpep_register_dfb_surface),
 };
 

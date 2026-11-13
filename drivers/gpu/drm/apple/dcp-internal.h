@@ -284,6 +284,9 @@ struct apple_dcp_hw_data {
 	 */
 	bool s2r;
 	bool s2r_ext;
+	/* A firmware 27 sleep in progress, and how it ended */
+	bool v27_sleep_protocol;
+	bool v27_sleep_recovery;
 };
 
 enum dcp_test_point {
@@ -695,6 +698,11 @@ struct apple_dcp {
 	bool rx_held;
 
 	/* A firmware-driven suspend stops the firmware, see dcp_s2r_suspend(). */
+	struct apple_dcp_afkep *sleep_v27_ep[0x20];
+	struct dcp_v27_sleep *sleep_v27;
+	bool sleep_v27_closed;
+	/* Unhandled application traffic permanently invalidates the sleep's inventory. */
+	bool sleep_v27_unhandled;
 	bool s2r_active;
 	bool s2r_stopped;
 	/* DPMS off stopped the firmware and lowered the domains; DPMS on brings them back. */

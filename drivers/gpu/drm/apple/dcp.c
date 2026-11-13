@@ -29,6 +29,7 @@
 #include <linux/iopoll.h>
 #include <linux/of_platform.h>
 #include <linux/suspend.h>
+#include <linux/soc/apple/dcp-v27-sleep.h>
 #include <linux/property.h>
 #include <linux/random.h>
 #include <linux/slab.h>
@@ -43,6 +44,7 @@
 #include <linux/workqueue.h>
 
 #include <drm/drm_color_mgmt.h>
+#include <drm/drm_atomic.h>
 #include <drm/drm_edid.h>
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_file.h>
@@ -1437,6 +1439,10 @@ static void dcp_delayed_vblank(struct work_struct *work)
 
 static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
 {
+	if (IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) &&
+	    dcp->fw_compat == DCP_FIRMWARE_V_27_0 && endpoint >= 0x20 && endpoint < 0x40 &&
+	    READ_ONCE(dcp->sleep_v27_ep[endpoint - 0x20]))
+		return READ_ONCE(dcp->sleep_v27_ep[endpoint - 0x20]);
 	/* The auxiliary endpoints of a desktop 26.x processor. */
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
 	    endpoint >= 0x20 && endpoint < 0x40) {
@@ -1571,6 +1577,7 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 {
 	struct apple_dcp *dcp = cookie;
 	struct apple_dcp_afkep *ep;
+	int ret;
 
 	if (READ_ONCE(dcp->quiescing))
 		return;
@@ -1580,6 +1587,11 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 	/* A failed T8122 dcpext: its firmware may still talk, nobody listens. */
 	if (READ_ONCE(dcp->ext_dead))
 		return;
+	/* Include traffic hidden by the fail-stop logging branch below. */
+	if (IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) &&
+	    dcp->fw_compat == DCP_FIRMWARE_V_27_0 && endpoint >= 0x20 &&
+	    endpoint != IOMFB_ENDPOINT && !dcp_afkep(dcp, endpoint))
+		WRITE_ONCE(dcp->sleep_v27_unhandled, true);
 
 	/*
 	 * H17P starts endpoints that have no AFK instance behind them (the
@@ -1605,7 +1617,10 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 		return;
 	}
 
-	afk_receive_message(ep, message);
+	ret = afk_receive_message(ep, message);
+	if (ret && IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) &&
+	    dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+		WRITE_ONCE(dcp->sleep_v27_unhandled, true);
 }
 
 static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_size)
@@ -6031,6 +6046,8 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 
 	if (!dcp)
 		return;
+	if (IS_ENABLED(CONFIG_APPLE_SOC_SLEEP))
+		apple_sleep_v27_unregister(dev);
 	dcp_peer_forget(dcp);
 	/*
 	 * Stop the native initializer before looking up its owner, including
@@ -7037,6 +7054,9 @@ static void dcp_platform_remove(struct platform_device *pdev)
 		cancel_work_sync(&dcp->s2r_prewarm_work);
 		cancel_delayed_work_sync(&dcp->s2r_prewarm_off_wq);
 	}
+	/* Registration pins callback/provider lifetimes until same-task scope end. */
+	if (IS_ENABLED(CONFIG_APPLE_SOC_SLEEP))
+		apple_sleep_v27_unregister(&pdev->dev);
 
 	if (dcp && dcp->external && !dcp->external_native) {
 		/* Enabled for the external start at probe. No component unbind. */
@@ -7248,10 +7268,18 @@ static const char *dcp_external_sleep_vetoed(struct apple_dcp *dcp)
  * Veto early so Thunderbolt cannot tear down a working tunnel first. The
  * same HPD lock serializes this gate against explicit firmware startup.
  */
+static bool dcp_v27_sleep_selected(struct apple_dcp *dcp);
+static void dcp_v27_sleep_invalidate(struct apple_dcp *dcp);
+
 static int dcp_platform_prepare(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 	const char *why;
+
+	if (pm_suspend_via_firmware() && dcp_v27_sleep_selected(dcp)) {
+		dcp_v27_sleep_invalidate(dcp);
+		return 0;
+	}
 
 	/*
 	 * J713: a T8132 external DCP refuses system sleep only for what cannot
@@ -8576,6 +8604,8 @@ bool dcp_s2r_firmware_stopped(struct platform_device *pdev)
 	return READ_ONCE(dcp->s2r_fw_down);
 }
 
+#include "dcp-v27-sleep.inc"
+
 static int dcp_platform_suspend(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
@@ -8588,6 +8618,9 @@ static int dcp_platform_suspend(struct device *dev)
 	flush_work(&dcp->s2r_prewarm_work);
 	cancel_delayed_work_sync(&dcp->s2r_prewarm_off_wq);
 	dcp->s2r_prewarmed = false;
+
+	if (pm_suspend_via_firmware() && dcp_v27_sleep_selected(dcp))
+		return dcp_v27_sleep_suspend(dcp);
 
 	if (pm_suspend_via_firmware() && dcp_s2r_capable(dcp)) {
 		int ret = dcp_s2r_suspend(dcp);
@@ -8702,6 +8735,9 @@ static int dcp_platform_resume(struct device *dev)
 
 	if (dcp_takeover_was_aborted(dcp))
 		return 0;
+
+	if (dcp_v27_sleep_selected(dcp) && READ_ONCE(dcp->sleep_v27_closed))
+		return dcp_v27_sleep_resume(dcp);
 
 	if (dcp->s2r_stopped)
 		return dcp_s2r_resume(dcp);
@@ -8864,6 +8900,9 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6041_dcpext = {
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t6050 = {
+	.v27_sleep_protocol = true,
+	/* False until exact merged-base real/aborted-wake recovery is qualified. */
+	.v27_sleep_recovery = false,
 	.firmware_dma_bits = 41,
 	.num_dptx_ports = 0,
 	.adopt_live_session = true,
@@ -8871,6 +8910,10 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6050 = {
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t6050_dcpext = {
+	/* AFK transport implemented; inactive display-DART/GAPF proof missing. */
+	.v27_sleep_protocol = false,
+	/* False until exact merged-base real/aborted-wake recovery is qualified. */
+	.v27_sleep_recovery = false,
 	.firmware_dma_bits = 41,
 	.num_dptx_ports = 2,
 	.adopt_live_session = true,

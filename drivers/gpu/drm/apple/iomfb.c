@@ -786,7 +786,9 @@ int iomfb_queue_settle(struct apple_dcp *dcp, unsigned long timeout)
 		}
 		idle = !dcp->iomfb.active && !dcp->iomfb.queued &&
 		       list_empty(&dcp->iomfb.pending) &&
-		       !dcp->present_state_h17p.pending && iomfb_channels_idle(dcp);
+		       !dcp->present_state_h17p.pending && iomfb_channels_idle(dcp) &&
+		       (!READ_ONCE(dcp->sleep_v27_closed) ||
+			!READ_ONCE(dcp->iomfb.callback_count));
 		mutex_unlock(&dcp->iomfb.lock);
 		if (idle)
 			return 0;
@@ -796,6 +798,9 @@ int iomfb_queue_settle(struct apple_dcp *dcp, unsigned long timeout)
 	}
 }
 
+static void iomfb_v27_sleep_start(struct apple_dcp *dcp,
+				  struct iomfb_transaction *transaction);
+
 int iomfb_queue(struct apple_dcp *dcp, struct iomfb_transaction *transaction)
 {
 	int ret = 0;
@@ -803,6 +808,9 @@ int iomfb_queue(struct apple_dcp *dcp, struct iomfb_transaction *transaction)
 	mutex_lock(&dcp->iomfb.lock);
 	if (READ_ONCE(dcp->crashed) || dcp->iomfb.stopped) {
 		ret = -EIO;
+	} else if (READ_ONCE(dcp->sleep_v27_closed) &&
+		   transaction->start != iomfb_v27_sleep_start) {
+		ret = -EBUSY;
 	} else if (transaction->presentation && dcp->iomfb.presentation_paused) {
 		ret = -EAGAIN;
 	} else if (transaction->brightness_only && dcp->iomfb.backlight_queued) {
@@ -817,6 +825,116 @@ int iomfb_queue(struct apple_dcp *dcp, struct iomfb_transaction *transaction)
 		schedule_work(&dcp->iomfb.work);
 	}
 	mutex_unlock(&dcp->iomfb.lock);
+	return ret;
+}
+
+/* Firmware 27 sleep RPCs have no callback chain after a timed-out wait. The queue
+ * owns one reference until actual completion or teardown; the waiter owns one.
+ * No stack completion and no resetting stacks/rings on timeout.
+ */
+struct iomfb_v27_sleep_rpc {
+	struct iomfb_transaction transaction;
+	struct kref ref;
+	struct completion done;
+	struct dcp_method_entry method;
+	u8 data[16];
+	u32 input, output, status, power_state;
+	bool oob, flags_form;
+};
+
+static void iomfb_v27_sleep_free(struct kref *ref)
+{
+	kfree(container_of(ref, struct iomfb_v27_sleep_rpc, ref));
+}
+
+static void iomfb_v27_sleep_release(struct iomfb_transaction *transaction)
+{
+	struct iomfb_v27_sleep_rpc *rpc = container_of(transaction,
+		struct iomfb_v27_sleep_rpc, transaction);
+
+	kref_put(&rpc->ref, iomfb_v27_sleep_free);
+}
+
+static void iomfb_v27_sleep_done(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	struct iomfb_v27_sleep_rpc *rpc = cookie;
+
+	rpc->status = rpc->output ? (out ? get_unaligned_le32(out + 4) : ~0U) : 0;
+	/* The commit's flags form answers 01 aa aa aa, not the state. */
+	if (rpc->output && !rpc->status && !rpc->flags_form) {
+		if (get_unaligned_le32(out) != rpc->power_state)
+			rpc->status = ~0U;
+	}
+	complete(&rpc->done);
+}
+
+static void iomfb_v27_sleep_start(struct apple_dcp *dcp,
+				  struct iomfb_transaction *transaction)
+{
+	struct iomfb_v27_sleep_rpc *rpc = container_of(transaction,
+		struct iomfb_v27_sleep_rpc, transaction);
+
+	dcp_push(dcp, rpc->oob, &rpc->method, rpc->input, rpc->output,
+		 rpc->data, iomfb_v27_sleep_done, rpc);
+}
+
+int iomfb_v27_sleep_rpc(struct apple_dcp *dcp, bool a500, bool on)
+{
+	struct iomfb_v27_sleep_rpc *rpc;
+	int ret;
+
+	if (!IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) ||
+	    dcp->fw_compat != DCP_FIRMWARE_V_27_0 ||
+	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G)
+		return -EOPNOTSUPP;
+	rpc = kzalloc_obj(*rpc);
+	if (!rpc)
+		return -ENOMEM;
+	kref_init(&rpc->ref);
+	init_completion(&rpc->done);
+	rpc->status = ~0U;
+	rpc->transaction.start = iomfb_v27_sleep_start;
+	rpc->transaction.release = iomfb_v27_sleep_release;
+	rpc->method = (struct dcp_method_entry) {
+		.name = a500 ? "v27_sleep_500" : "v27_sleep_power",
+	};
+	memcpy(rpc->method.tag, a500 ? "A500" : "A484", 4);
+	/*
+	 * Off, the forms macOS sends each DCP and DCPEXT before its sleep idle: A484 with the
+	 * restartable-sleep flags, u32 0x01000001 and u8 1, then A500 00 01 aa aa. On, after the
+	 * wake: A500 in its wake form, then A484 with the flags.
+	 */
+	if (a500) {
+		rpc->input = 4;
+		put_unaligned_le32(on ? 0xaaaa0000 : 0xaaaa0100, rpc->data);
+	} else {
+		rpc->input = 16;
+		rpc->output = sizeof(struct dcp_set_power_state_resp);
+		rpc->oob = true;
+		rpc->power_state = on;
+		put_unaligned_le64(on, rpc->data);
+		/*
+		 * The firmware keeps a hard and a soft power state, and the flags form moves the hard
+		 * one. macOS pairs the forms: state 0 with the flags before the sleep, state 1 with
+		 * the flags after the wake. The plain form after a flags-form off answers ok and
+		 * changes nothing: the panel stays dark and the next swap times out.
+		 */
+		put_unaligned_le32(0x01000001, rpc->data + 8);
+		rpc->data[12] = 1;
+		rpc->flags_form = true;
+		memset(rpc->data + 13, 0xaa, 3);
+	}
+	kref_get(&rpc->ref);
+	ret = iomfb_queue(dcp, &rpc->transaction);
+	if (ret)
+		iomfb_v27_sleep_release(&rpc->transaction);
+	else if (!wait_for_completion_timeout(&rpc->done, msecs_to_jiffies(1000)))
+		ret = -ETIMEDOUT;
+	else if (rpc->status)
+		ret = -EREMOTEIO;
+	else if (rpc->output)
+		WRITE_ONCE(dcp->pipe_enabled_h17p, !!rpc->power_state);
+	kref_put(&rpc->ref, iomfb_v27_sleep_free);
 	return ret;
 }
 
