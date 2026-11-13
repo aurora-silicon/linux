@@ -2,6 +2,7 @@
 #ifndef MT7932_PROTOCOL_H
 #define MT7932_PROTOCOL_H
 
+#include <linux/ctype.h>
 #include <linux/types.h>
 #include <linux/string.h>
 #include <linux/errno.h>

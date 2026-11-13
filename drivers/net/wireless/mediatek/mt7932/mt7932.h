@@ -108,6 +108,7 @@ struct mt7932 {
 	bool six_ghz_valid;
 	bool stof_supported;
 	u8 phy_cap[12];
+	u16 join_length;
 	u8 antenna_mask;
 	struct wiphy *wiphy;
 	struct ieee80211_supported_band band2;

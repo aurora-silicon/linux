@@ -997,8 +997,14 @@ static int mt_firmware_gate(struct mt7932 *m)
 			dev_err(&m->pdev->dev, "local input mediatek/mt7932/IZUBA_W7932_2.bin has invalid region %d\n", i);
 			goto out;
 		}
-	dev_dbg(&m->pdev->dev, "stock containers patch=%zu/%d regions RAM=%zu/%d regions\n",
-		patch->size, patches, ram->size, regions);
+	ret = mt7932_join_length(ram->data, ram->size);
+	if (ret < 0) {
+		dev_err(&m->pdev->dev, "local input mediatek/mt7932/IZUBA_W7932_2.bin has no build date\n");
+		goto out;
+	}
+	m->join_length = ret;
+	dev_dbg(&m->pdev->dev, "stock containers patch=%zu/%d regions RAM=%zu/%d regions join=%u\n",
+		patch->size, patches, ram->size, regions, m->join_length);
 	phase = "patch semaphore command/reply";
 	put_unaligned_le32(2, request);
 	ret = mt_command(m, 0x10, request, 4);
