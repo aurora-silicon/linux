@@ -616,6 +616,9 @@
 /* External displays, on the left-front and right ports */
 #include "t6050-j714s-display.dtsi"
 
+/* DisplayPort audio of dcpext0's displays */
+#include "t6050-j714s-dpaudio.dtsi"
+
 /* The Neural Engine, started only after the boot loader's preload hand-off */
 #include "t6050-j714s-ane.dtsi"
 
