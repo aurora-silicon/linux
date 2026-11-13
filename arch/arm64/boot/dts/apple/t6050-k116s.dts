@@ -415,31 +415,13 @@
 	apple,dma-range = <0x100 0x0 0x300 0x0>;
 };
 
-/* The DCP firmware's clocks: ADT disp0 clock-ids; the loader fills the rates */
-/ {
-	dcp_clk_361: clock-dcp-firmware-361 {
-		compatible = "fixed-clock";
-		#clock-cells = <0>;
-		clock-frequency = <0>;
-	};
-
-	dcp_clk_458: clock-dcp-firmware-458 {
-		compatible = "fixed-clock";
-		#clock-cells = <0>;
-		clock-frequency = <0>;
-	};
-};
-
 &dcp {
 	/*
-	 * The bandwidth request scratch: the PMC metadata (disp-4, register window
-	 * 5) at the slot of PMGR bandwidth agent DISP_INT (ADT bwr-agent index 0,
-	 * BIRQ 0x96 = disp0 function-bw_req_interrupt0): 0x20000 + 0 * 0x4000.
+	 * ADT disp0 clock-ids. The loader adds the clock nodes, "clocks" and the
+	 * bandwidth request scratch ("apple,bw-scratch") when it hands the panel
+	 * over, as on the J714s, and refuses a tree that already has them.
 	 */
-	apple,bw-scratch = <&dcpext0_pmc 0 5 0x20000>;
-	/* ADT disp0 clock-ids */
 	apple,clock-ids = <361 458>;
-	clocks = <&dcp_clk_361>, <&dcp_clk_458>;
 
 	/*
 	 * The 16.2-inch 3456x2234 tandem OLED panel. The ADT carries no dimensions;
