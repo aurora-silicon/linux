@@ -19,9 +19,11 @@
 //! fixed 44-byte feature reports on report ID `0xfe` (see [`xfe_frame`]). The
 //! 532-byte `0x6a` fragments above are themselves carried this way, so a large
 //! object travels two layers: logical `0x6a` records, then `0xfe` frames.
-//! Between consecutive `0xfe` frames the keyboard asks the host to read one
-//! feature report (see [`parse_fragment_notification`]); the logical reply
-//! still arrives once, after the last frame.
+//! The frames of one logical report are streamed back to back; the logical
+//! reply arrives once, after the last frame. On other transports the macOS
+//! relay reads a feature report the keyboard names between frames (see
+//! [`parse_fragment_notification`]); this USB keyboard sends nothing between
+//! frames, so that parser is kept for the documented path and the tests only.
 //!
 //! This module only encodes and checks bytes. It logs nothing: identities,
 //! points, attestations and certificates are opaque here.
@@ -269,7 +271,10 @@ pub(crate) fn xfe_frame(
 
 /// The keyboard's between-frame notification (delivered logical-ID first by the
 /// shim): which feature report the host must read, and how many bytes, before
-/// the next `0xfe` frame. Returns the feature ID and the length.
+/// the next `0xfe` frame. Returns the feature ID and the length. This USB
+/// keyboard never sends one (the pairing flow streams frames), so this decodes
+/// the documented macOS lower-transport path and is exercised by the tests.
+#[allow(dead_code)]
 pub(crate) fn parse_fragment_notification(
     reply: &[u8],
 ) -> core::result::Result<(u8, usize), WireError> {

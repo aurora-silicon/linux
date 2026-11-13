@@ -317,10 +317,13 @@ fn ta_read(id: u8, len: usize) -> core::result::Result<KVec<u8>, i32> {
 /// rest its body), fragmenting it over the `0xfe` transport when the body is
 /// too large for a direct feature SET. A short body goes direct, as before.
 ///
-/// A fragmented report's logical reply still arrives once, after the last
-/// frame; between the earlier frames the keyboard names a feature report for
-/// the host to read first (see [`wire::parse_fragment_notification`]), which
-/// is read and discarded — a read never changes the keyboard. If `reply_id`
+/// The frames of one logical report are streamed back to back as feature
+/// SETs: the keyboard reassembles them and answers only after the last frame,
+/// with the single logical reply that covers the whole object. This keyboard
+/// sends nothing between frames — the macOS relay's between-frame feature
+/// request (see [`wire::parse_fragment_notification`]) is a lower-transport
+/// path this USB keyboard does not use, and waiting for it here deadlocked the
+/// host against a keyboard already waiting for the next frame. If `reply_id`
 /// is not 0 the reply is awaited after the last frame and returned; otherwise
 /// the report is fire-and-forget and an empty vector is returned.
 fn ta_set_logical(
@@ -340,17 +343,14 @@ fn ta_set_logical(
     let n = wire::xfe_frame_count(body.len());
     for k in 0..n {
         let frame = wire::xfe_frame(logical_id, body, k).map_err(|_| -22i32)?;
-        if k + 1 == n && reply_id != 0 {
-            // The last frame of a reply-bearing report: the logical reply
-            // follows it and covers the whole object.
+        if k + 1 == n {
+            // The last frame completes the logical report: its reply, if any,
+            // covers the whole object and follows this frame.
             return ta_command(&frame, reply_id, cap, timeout_ms);
         }
-        // Between frames the keyboard asks the host to read one feature report.
-        let notif = ta_command(&frame, wire::XFE_REPORT, wire::XFE_NOTIFY_LEN, REPLY_MS)?;
-        let (fid, flen) = wire::parse_fragment_notification(&notif).map_err(|_| -71i32)?;
-        if flen != 0 {
-            ta_read(fid, flen)?;
-        }
+        // Earlier frames are streamed with no reply awaited; the keyboard
+        // answers only after the last one.
+        ta_command(&frame, 0, 0, 0)?;
     }
     Ok(KVec::new())
 }
