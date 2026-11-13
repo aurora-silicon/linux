@@ -291,11 +291,27 @@ static void apple_isp_select_hw(struct apple_isp *isp)
 	*hw = *isp->hw;
 	isp->hw = hw;
 
-	if (!hw->resident_fallback)
-		return;
-
 	struct device_node *dart __free(device_node) =
 		of_parse_phandle(dev->of_node, "iommus", 0);
+
+	/*
+	 * Resident firmware that starts again (hw->fw_restart) runs from its own
+	 * memory, but after a power-down it reaches its MMIO only once the first
+	 * DART has replayed the boot loader's address filter. Without
+	 * apple,dapf-ranges on that DART it keeps running, as it ran before.
+	 */
+	if (hw->fw_restart &&
+	    !(dart && of_property_present(dart, "apple,dapf-ranges"))) {
+		dev_info(dev, "no address filter replay in the device tree, keeping the firmware resident\n");
+		hw->fw_restart = false;
+		hw->deferred_start = false;
+		hw->coproc_quiesce = 0;
+		hw->fw_idle_ms = 0;
+		return;
+	}
+
+	if (!hw->resident_fallback)
+		return;
 
 	if (dart && of_property_match_string(dart, "reg-names", "dapf") >= 0 &&
 	    isp_of_fw_data_region(dev) >= 0)
