@@ -36,4 +36,3 @@ The controller does not read the dormant J700 lifetime-target entry, the old
 ``+0xc000`` report area, the report write alias, a high qword, or any sparse
 firmware word.  It does not write the AGX fast-die target or release fields;
 the independent firmware limiter keeps those native values.
-
