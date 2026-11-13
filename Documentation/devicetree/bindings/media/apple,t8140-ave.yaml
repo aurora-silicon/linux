@@ -138,6 +138,7 @@ allOf:
                           - apple,t6022-ave
                           - apple,t6030-ave
                           - apple,t6031-ave
+                          - apple,t6050-ave
                           - apple,t8103-ave
                           - apple,t8122-ave
                       - const: apple,ave
@@ -234,7 +235,6 @@ allOf:
                       contains:
                         enum:
                           - apple,t6041-ave
-                          - apple,t6050-ave
                           - apple,t8140-ave
                           - apple,t8142-ave
                 then:
