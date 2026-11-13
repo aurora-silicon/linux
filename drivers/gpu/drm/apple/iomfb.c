@@ -966,8 +966,8 @@ static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G &&
 	    call->tag_h17g[0])
 		memcpy(resolved.tag, call->tag_h17g, sizeof(resolved.tag));
-	if (dcp->swap_v27_3 && !memcmp(call->tag, dcp->v27_methods[dcpep_swap_submit].tag, sizeof(call->tag)) &&
-	    in_len == DCP_V27_REQ_SIZE) {
+	if (dcp->swap_v27_3 && in_len == DCP_V27_REQ_SIZE &&
+	    !memcmp(call->tag, dcp->v27_methods[dcpep_swap_submit].tag, sizeof(call->tag))) {
 		swap_27_3 = kmalloc(DCP_V27_3_REQ_SIZE, GFP_ATOMIC);
 		if (!swap_27_3) {
 			WRITE_ONCE(dcp->crashed, true);

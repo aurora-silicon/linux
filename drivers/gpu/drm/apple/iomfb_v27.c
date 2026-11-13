@@ -7,6 +7,7 @@
 
 #include "dcp-link.h"
 #include "iomfb_v27.h"
+#include "iomfb_v27_3_swap.h"
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
 #include "version_utils.h"
@@ -68,6 +69,8 @@ static_assert(offsetof(struct dc_swap_complete_resp_h17p, swap_id) == 0);
 static_assert(offsetof(struct dcp_swap_v27, brightness_update) == 0x354);
 static_assert(offsetof(struct dcp_swap_v27, brightness_nits) == 0x35e);
 static_assert(sizeof(struct dcp_swap_v27) == 0x6e0);
+static_assert(sizeof(struct dcp_swap_v27) == DCP_V27_SWAP_SIZE);
+static_assert(sizeof(struct dcp_swap_submit_req_v27) == DCP_V27_REQ_SIZE);
 
 /* Firmware 27.0, the build Aurora's t6050-gpu table was written for. */
 static const struct dcp_method_entry dcp_methods_27_0[dcpep_num_methods] = {
@@ -169,12 +172,14 @@ static const struct dcp_method_entry dcp_methods_27_2[dcpep_num_methods] = {
 /*
  * Firmware 27.3 (macOS 27.3, DCP image mBoot-20457.60.65). Each ID is the tag
  * IOMobileFramebufferAP or UnifiedPipeline2 loads before the call in the 27.3
- * kernelcache. It is 27.2's table with the IDs from A475 on one higher
- * (set_display_refresh_properties A526 ... register_dfb_surface A534,
- * set_power_state A535, isKeepOnScreen A536, set_dcp_clamshellstate A538,
- * get_shared_disp_state A540); A516 first_client_open and A464/A465 pipe_cfg
- * were placed by the +50 rule and by their request sizes. dfb_ready_query is
- * A385, as macOS 27.3 sends it.
+ * kernelcache. It is 27.2's table with eight IDs one higher, from 27.2's A525
+ * on (set_display_refresh_properties A526, flush_supports_power A529,
+ * abort_swaps_dcp A530, register_dfb_surface A534, set_power_state A535,
+ * pipe_query_474 A536, pipe_set_476 A538, pipe_query_478 A540). A516
+ * first_client_open and A464/A465 pipe_cfg were placed by the +50 rule and by
+ * their request sizes. dfb_ready_query is A384, the ID a 27.3 boot has been
+ * run with; a 27.3 macOS trace shows A385 there, which is not yet tried on
+ * hardware.
  */
 static const struct dcp_method_entry dcp_methods_27_3[dcpep_num_methods] = {
 	IOMFB_METHOD("A000", dcpep_late_init_signal),
@@ -200,7 +205,7 @@ static const struct dcp_method_entry dcp_methods_27_3[dcpep_num_methods] = {
 	IOMFB_METHOD("A104", dcpep_set_dfb_dimensions),
 	IOMFB_METHOD("A105", dcpep_commit_dfb_info),
 	IOMFB_METHOD("A035", dcpep_dfb_query),
-	IOMFB_METHOD("A385", dcpep_dfb_ready_query),
+	IOMFB_METHOD("A384", dcpep_dfb_ready_query),
 	IOMFB_METHOD("A353", dcpep_pipe_query_353),
 	IOMFB_METHOD("A352", dcpep_pipe_set_352),
 	IOMFB_METHOD("A465", dcpep_pipe_cfg_415),
