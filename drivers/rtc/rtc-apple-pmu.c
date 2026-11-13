@@ -434,9 +434,11 @@ static int apple_pmu_rtc_prepare(struct device *dev)
 	/*
 	 * A firmware-driven suspend programs the wake sources itself, and the
 	 * alarm stays armed in the PMU, which stays powered. Only a sleep state
-	 * without either has no way to bring the alarm back.
+	 * without either has no way to bring the alarm back. Hibernation is not
+	 * a suspend state (the target stays PM_SUSPEND_ON) and needs no alarm.
 	 */
-	if (pm_suspend_target_state != PM_SUSPEND_TO_IDLE && !pm_suspend_via_firmware())
+	if (pm_suspend_target_state != PM_SUSPEND_ON &&
+	    pm_suspend_target_state != PM_SUSPEND_TO_IDLE && !pm_suspend_via_firmware())
 		return -EBUSY;
 	return 0;
 }
