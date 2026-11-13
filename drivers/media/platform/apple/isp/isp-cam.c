@@ -4,6 +4,7 @@
 #include <linux/firmware.h>
 #include <linux/gcd.h>
 #include <linux/unaligned.h>
+#include <linux/soc/apple/display.h>
 #include <kunit/static_stub.h>
 
 #include "isp-cam.h"
@@ -1078,29 +1079,57 @@ void apple_isp_wdt_stop(struct apple_isp *isp)
 	isp->wdt_running = false;
 }
 
+/*
+ * The DCP contract function is implemented by the DRM side. This wrapper is
+ * the seam the KUnit tests stub, and the only caller of the contract.
+ */
+static int apple_isp_dcp_indicator_set(struct device *dcp, bool on)
+{
+	KUNIT_STATIC_STUB_REDIRECT(apple_isp_dcp_indicator_set, dcp, on);
+	return apple_dcp_camera_indicator_set(dcp, on);
+}
+
 int apple_isp_start_capture(struct apple_isp *isp)
 {
 	int err;
+
+	/*
+	 * Best-effort software indicator, not a privacy guarantee: the dot
+	 * is requested before the sensor may stream, but the camera does
+	 * not depend on it.
+	 */
+	if (apple_isp_camera_indicator(isp)) {
+		err = apple_isp_dcp_indicator_set(isp->dcp, true);
+		if (err)
+			dev_warn_once(isp->dev, "camera indicator not shown: %d\n", err);
+	}
 
 	/* Serviced from before the channel starts... */
 	apple_isp_wdt_start(isp);
 
 	err = isp_cmd_ch_start(isp, 0); // TODO channel mask
-	if (err)
+	if (err) {
 		apple_isp_wdt_stop(isp);
+		if (apple_isp_camera_indicator(isp))
+			apple_isp_dcp_indicator_set(isp->dcp, false);
+	}
 
 	return err;
 }
 
 void apple_isp_stop_capture(struct apple_isp *isp)
 {
-	if (isp->ipc_failed || isp->fw_state != ISP_FW_RUNNING)
-		return;
-	if (!isp_cmd_ch_stop(isp, 0)) /* TODO channel mask */
-		isp_cmd_ch_buffer_return(isp, isp->current_ch);
+	if (!isp->ipc_failed && isp->fw_state == ISP_FW_RUNNING) {
+		if (!isp_cmd_ch_stop(isp, 0)) /* TODO channel mask */
+			isp_cmd_ch_buffer_return(isp, isp->current_ch);
 
-	/* ... until its buffers are back. */
-	apple_isp_wdt_stop(isp);
+		/* ... until its buffers are back. */
+		apple_isp_wdt_stop(isp);
+	}
+
+	/* The indicator follows the stream off, however the stream stopped. */
+	if (apple_isp_camera_indicator(isp))
+		apple_isp_dcp_indicator_set(isp->dcp, false);
 }
 
 #if IS_ENABLED(CONFIG_VIDEO_APPLE_ISP_KUNIT_TEST)
