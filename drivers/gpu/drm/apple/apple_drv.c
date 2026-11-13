@@ -1049,7 +1049,7 @@ static int apple_connector_create(struct drm_device *drm,
 	if (ret)
 		goto err_cleanup;
 	ret = apple_connector_attach_hdr(&connector->base,
-					 dcp_fw_compat_is_desktop(dcp));
+					 dcp_fw_compat_panel_edr(dcp));
 	if (ret)
 		goto err_cleanup;
 

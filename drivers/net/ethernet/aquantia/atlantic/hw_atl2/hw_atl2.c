@@ -759,9 +759,32 @@ static int hw_atl2_hw_ring_tx_init(struct aq_hw_s *self,
 static int hw_atl2_hw_packet_filter_set(struct aq_hw_s *self,
 					unsigned int packet_filter)
 {
+	struct hw_atl2_priv *priv = self->priv;
+	struct aq_nic_cfg_s *cfg = self->aq_nic_cfg;
+	u32 base = priv->l2_filters_base_index;
+	unsigned int i;
+	int err;
+
 	hw_atl2_hw_new_rx_filter_promisc(self, IS_FILTER_ENABLED(IFF_PROMISC));
 
-	return hw_atl_b0_hw_packet_filter_set(self, packet_filter);
+	err = hw_atl_b0_hw_packet_filter_set(self, packet_filter);
+	if (err)
+		return err;
+
+	/* hw_atl_b0 enables its unicast filters as if the own address were in
+	 * filter 0 and the multicast list from 1. Here they start at the base
+	 * the firmware reports (hw_atl2_hw_mac_addr_set() and
+	 * hw_atl2_hw_multicast_list_set()), so with a base other than 0 it
+	 * turns the own address's filter off and unicast frames are dropped.
+	 */
+	for (i = HW_ATL2_MAC_MIN; i < HW_ATL2_MAC_MAX; i++)
+		hw_atl_rpfl2_uc_flr_en_set(self,
+					   i == base ||
+					   (cfg->is_mc_list_enabled && i > base &&
+					    i <= base + cfg->mc_list_count),
+					   i);
+
+	return aq_hw_err_from_flags(self);
 }
 
 #undef IS_FILTER_ENABLED
@@ -777,7 +800,7 @@ static int hw_atl2_hw_multicast_list_set(struct aq_hw_s *self,
 	struct aq_nic_cfg_s *cfg = self->aq_nic_cfg;
 	int err = 0;
 
-	if (count > (HW_ATL2_MAC_MAX - HW_ATL2_MAC_MIN)) {
+	if (count > HW_ATL2_MAC_MAX - base_location) {
 		err = -EBADRQC;
 		goto err_exit;
 	}

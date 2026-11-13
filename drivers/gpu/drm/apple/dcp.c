@@ -1132,8 +1132,21 @@ static void dcp_panel_read_adt(struct apple_dcp *dcp)
 	if (dcp->panel_identity)
 		dcp->panel_identity->adt = panel.identity;
 	dcp->panel.color_target = ret ? NULL : dcp_panel_gamut_color_space(panel.gamut);
-	if (desktop)
+	if (desktop || dcp->fw_compat == DCP_FIRMWARE_V_27_0)
 		dcp->panel.edr_ceiling = dcp_edr_ceiling(panel.edr_potential_headroom);
+	/*
+	 * Firmware 27 reports no peak (desktop 26.x: res_max_panel_brightness()).
+	 * The ADT's LmaxProduct gives it (1600 nits on the M5 Pro).  Only a peak
+	 * above the SDR range gives headroom.
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+		u32 peak = panel.lmax_product >> 16;
+
+		if (peak > dcp->brightness.maximum && peak <= 10000) {
+			dev_info(dcp->dev, "panel peak luminance %u nits (ADT)\n", peak);
+			WRITE_ONCE(dcp->panel.peak_nits, peak);
+		}
+	}
 	dev_info(dcp->dev, "panel ADT: %s, panel node %s, dimensions %ux%u mm\n",
 		 ret ? "unavailable" : "parsed", panel.found ? "present" : "absent",
 		 dcp->panel.width_mm, dcp->panel.height_mm);
@@ -3693,6 +3706,15 @@ bool dcp_fw_compat_is_desktop(struct platform_device *pdev)
 	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
 }
 
+/* Firmware whose panel shows PQ content as EDR (dcp_panel_edr_supported()). */
+bool dcp_fw_compat_panel_edr(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	return dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+	       dcp->fw_compat == DCP_FIRMWARE_V_27_0;
+}
+
 bool dcp_fw_compat_is_14_7(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
@@ -4310,6 +4332,10 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_27_0:
 		iomfb_poweroff_v27(dcp);
+		if (dcp->edr_hm)
+			dcp->edr_restart = true;
+		WRITE_ONCE(dcp->edr_ramping, false);
+		cancel_delayed_work(&dcp->iomfb.edr_tick);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
@@ -5226,6 +5252,8 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	const struct dcp_v14_board *v14_board;
 	char compat_str[DCP_FW_VERSION_STR_LEN];
 	char fw_str[DCP_FW_VERSION_STR_LEN];
+	unsigned int num_missing;
+	const char *missing;
 	int ret;
 
 	/*
@@ -5242,8 +5270,18 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 
 	if (hw->firmware_compat == DCP_FIRMWARE_V_27_0) {
 		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
-		if (ret < 0 || strcmp(compat_str, "27.0.0"))
+		if (ret < 0 || !iomfb_v27_methods(compat_str)) {
+			dev_err(dev, "DCP firmware-compat %s has no 27.x method table\n",
+				ret < 0 ? "missing" : compat_str);
 			return DCP_FIRMWARE_UNKNOWN;
+		}
+		missing = iomfb_v27_missing_method(iomfb_v27_methods(compat_str),
+						   &num_missing);
+		if (missing) {
+			dev_err(dev, "DCP firmware-compat %s not started: no ID known for %u methods (first: %s)\n",
+				compat_str, num_missing, missing);
+			return DCP_FIRMWARE_UNKNOWN;
+		}
 		return DCP_FIRMWARE_V_27_0;
 	}
 
@@ -6364,6 +6402,13 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 			if (!dcp->panel_identity)
 				return -ENOMEM;
 		}
+	}
+	if (fw_compat == DCP_FIRMWARE_V_27_0) {
+		char compat_str[DCP_FW_VERSION_STR_LEN];
+
+		/* Checked by dcp_check_firmware_version(). */
+		dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
+		dcp->v27_methods = iomfb_v27_methods(compat_str);
 	}
 	if (fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
 		dcp->desktop = devm_kzalloc(dev, sizeof(*dcp->desktop), GFP_KERNEL);
@@ -8580,6 +8625,15 @@ static int dcp_platform_suspend(struct device *dev)
 			dcp_enable_typec_work(dcp);
 			return ret;
 		}
+		/*
+		 * The crossbar shares the ATC power domain, which an s2idle can take
+		 * down too: with deep sleep selected, the USB controller stops for any
+		 * sleep and stops holding it. The crossbar then wakes with its route
+		 * lost, while the mux core still holds the selection, and the link
+		 * never trains again (DEVICE_NOT_RESPONDING). Take the output down
+		 * while it has power and select it again on resume, as s2r does.
+		 */
+		dcp_typec_route_park(dcp);
 		device_set_wakeup_path(dev);
 		return 0;
 	}
@@ -8636,6 +8690,9 @@ static int dcp_platform_resume(struct device *dev)
 	dcp->link_recovery_tries = 0;
 	dcp_release_after_sleep(dcp);
 	iomfb_v14_7_backlight_resume(dcp);
+	/* Its crossbar output, parked by the suspend, before the link connects again. */
+	if (dcp_is_external_h17p(dcp))
+		dcp_typec_route_unpark(dcp);
 	dcp_enable_typec_work(dcp);
 	/* The HDMI output's PHY and crossbar may have lost their setup in sleep. */
 	if (dcp->external_native)

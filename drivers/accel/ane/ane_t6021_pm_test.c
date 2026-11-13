@@ -11,8 +11,8 @@ struct ane_sleep_test {
 	/* Models the driver command mutex. */
 	struct mutex fw_lock;
 	struct ane_t6021_pm pm;
-	unsigned int stops, restarts;
-	int stop_error, restart_error;
+	unsigned int stops, restarts, deferred_restarts, parks;
+	int stop_error, restart_error, deferred_error, park_error;
 };
 
 static struct ane_t6021_pm *ane_sleep_get_pm(struct device *dev)
@@ -44,9 +44,31 @@ static int ane_sleep_restart(void *data)
 	return ctx->restart_error;
 }
 
+static int ane_sleep_restart_deferred(void *data)
+{
+	struct ane_sleep_test *ctx = data;
+
+	KUNIT_EXPECT_TRUE(ctx->test, mutex_is_locked(&ctx->fw_lock));
+	KUNIT_EXPECT_EQ(ctx->test, ane_t6021_pm_submit_error(ctx->pm.state), -EHOSTDOWN);
+	ctx->deferred_restarts++;
+	return ctx->deferred_error;
+}
+
+static int ane_sleep_park(void *data)
+{
+	struct ane_sleep_test *ctx = data;
+
+	KUNIT_EXPECT_TRUE(ctx->test, mutex_is_locked(&ctx->fw_lock));
+	KUNIT_EXPECT_EQ(ctx->test, ctx->pm.state, ANE_T6021_PM_FAILED);
+	ctx->parks++;
+	return ctx->park_error;
+}
+
 static const struct ane_t6021_pm_ops ane_sleep_ops = {
 	.stop = ane_sleep_stop,
 	.restart = ane_sleep_restart,
+	.restart_deferred = ane_sleep_restart_deferred,
+	.park = ane_sleep_park,
 };
 
 static int ane_sleep_init(struct kunit *test)
@@ -85,7 +107,8 @@ static void ane_sleep_cycles_test(struct kunit *test)
 		KUNIT_EXPECT_FALSE(test, mutex_is_locked(&ctx->fw_lock));
 		KUNIT_EXPECT_EQ(test, ctx->pm.state, ANE_T6021_PM_SUSPENDED);
 		KUNIT_EXPECT_EQ(test, ane_t6021_pm_submit_error(ctx->pm.state), -EHOSTDOWN);
-		KUNIT_EXPECT_EQ(test, ane_sleep_dev_pm_suspend(&ctx->dev), -EHOSTDOWN);
+		KUNIT_EXPECT_EQ(test, ane_sleep_dev_pm_suspend(&ctx->dev), 0);
+		KUNIT_EXPECT_EQ(test, ctx->pm.state, ANE_T6021_PM_SUSPENDED);
 		KUNIT_EXPECT_EQ(test, ctx->stops, i + 1);
 		KUNIT_ASSERT_EQ(test, ane_sleep_dev_pm_resume(&ctx->dev), 0);
 		KUNIT_EXPECT_FALSE(test, mutex_is_locked(&ctx->fw_lock));
@@ -103,9 +126,14 @@ static void ane_sleep_stop_failure_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&ctx->fw_lock));
 	KUNIT_EXPECT_EQ(test, ctx->pm.state, ANE_T6021_PM_FAILED);
 	KUNIT_EXPECT_EQ(test, ane_t6021_pm_submit_error(ctx->pm.state), -EHOSTDOWN);
-	KUNIT_EXPECT_EQ(test, ane_sleep_dev_pm_resume(&ctx->dev), -EHOSTDOWN);
-	KUNIT_EXPECT_EQ(test, ane_sleep_dev_pm_suspend(&ctx->dev), -EHOSTDOWN);
+	/* Unavailable until reboot, but later sleeps go through (parked). */
+	KUNIT_EXPECT_EQ(test, ane_sleep_dev_pm_resume(&ctx->dev), 0);
+	KUNIT_EXPECT_EQ(test, ane_sleep_dev_pm_suspend(&ctx->dev), 0);
+	KUNIT_EXPECT_EQ(test, ane_sleep_dev_pm_resume(&ctx->dev), 0);
+	KUNIT_EXPECT_EQ(test, ctx->pm.state, ANE_T6021_PM_FAILED);
+	KUNIT_EXPECT_EQ(test, ane_t6021_pm_submit_error(ctx->pm.state), -EHOSTDOWN);
 	KUNIT_EXPECT_EQ(test, ctx->stops, 1U);
+	KUNIT_EXPECT_EQ(test, ctx->parks, 1U);
 	KUNIT_EXPECT_EQ(test, ctx->restarts, 0U);
 }
 
@@ -119,8 +147,84 @@ static void ane_sleep_restart_failure_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, mutex_is_locked(&ctx->fw_lock));
 	KUNIT_EXPECT_EQ(test, ctx->pm.state, ANE_T6021_PM_FAILED);
 	KUNIT_EXPECT_EQ(test, ane_t6021_pm_submit_error(ctx->pm.state), -EHOSTDOWN);
-	KUNIT_EXPECT_EQ(test, ane_sleep_dev_pm_resume(&ctx->dev), -EHOSTDOWN);
+	KUNIT_EXPECT_EQ(test, ane_sleep_dev_pm_resume(&ctx->dev), 0);
 	KUNIT_EXPECT_EQ(test, ctx->restarts, 1U);
+	/* Every later sleep: park, no stop, no restart; the device stays out. */
+	for (unsigned int i = 0; i < 6; i++) {
+		KUNIT_EXPECT_EQ(test, ane_sleep_dev_pm_suspend(&ctx->dev), 0);
+		KUNIT_EXPECT_EQ(test, ane_sleep_dev_pm_resume(&ctx->dev), 0);
+	}
+	KUNIT_EXPECT_EQ(test, ctx->parks, 6U);
+	KUNIT_EXPECT_EQ(test, ctx->stops, 1U);
+	KUNIT_EXPECT_EQ(test, ctx->restarts, 1U);
+	KUNIT_EXPECT_EQ(test, ctx->pm.state, ANE_T6021_PM_FAILED);
+}
+
+/* A park that cannot prove the CPU safe refuses only that sleep. */
+static void ane_sleep_park_failure_test(struct kunit *test)
+{
+	struct ane_sleep_test *ctx = test->priv;
+
+	ctx->stop_error = -EBUSY;
+	KUNIT_EXPECT_EQ(test, ane_sleep_dev_pm_suspend(&ctx->dev), -EBUSY);
+	ctx->park_error = -EBUSY;
+	KUNIT_EXPECT_EQ(test, ane_sleep_dev_pm_suspend(&ctx->dev), -EBUSY);
+	ctx->park_error = 0;
+	KUNIT_EXPECT_EQ(test, ane_sleep_dev_pm_suspend(&ctx->dev), 0);
+	KUNIT_EXPECT_EQ(test, ctx->parks, 2U);
+	KUNIT_EXPECT_EQ(test, ctx->stops, 1U);
+	KUNIT_EXPECT_EQ(test, ctx->pm.state, ANE_T6021_PM_FAILED);
+}
+
+/* Resume without the power cycle: restart deferred, then finished. */
+static void ane_sleep_deferred_test(struct kunit *test)
+{
+	struct ane_sleep_test *ctx = test->priv;
+
+	KUNIT_ASSERT_EQ(test, ane_sleep_dev_pm_suspend(&ctx->dev), 0);
+	ctx->restart_error = ANE_T6021_PM_RESTART_DEFERRED;
+	KUNIT_EXPECT_EQ(test, ane_sleep_dev_pm_resume(&ctx->dev), 0);
+	KUNIT_EXPECT_EQ(test, ctx->pm.state, ANE_T6021_PM_SUSPENDED);
+	KUNIT_EXPECT_EQ(test, ane_t6021_pm_submit_error(ctx->pm.state), -EHOSTDOWN);
+
+	/* Another sleep before the deferred restart ran: nothing to stop,
+	 * and this time the power cycle happened, so resume restarts.
+	 */
+	KUNIT_EXPECT_EQ(test, ane_sleep_dev_pm_suspend(&ctx->dev), 0);
+	KUNIT_EXPECT_EQ(test, ctx->stops, 1U);
+	ctx->restart_error = 0;
+	ctx->stops++;		/* the pending stop is the one this restart ends */
+	KUNIT_EXPECT_EQ(test, ane_sleep_dev_pm_resume(&ctx->dev), 0);
+	KUNIT_EXPECT_EQ(test, ctx->pm.state, ANE_T6021_PM_ACTIVE);
+	mutex_lock(&ctx->fw_lock);
+	KUNIT_EXPECT_EQ(test, ane_t6021_pm_restart_deferred(&ctx->pm), 0);
+	mutex_unlock(&ctx->fw_lock);
+	KUNIT_EXPECT_EQ(test, ctx->deferred_restarts, 0U);
+
+	/* Deferred again, then finished outside system PM. */
+	ctx->stops = ctx->restarts;
+	KUNIT_ASSERT_EQ(test, ane_sleep_dev_pm_suspend(&ctx->dev), 0);
+	ctx->restart_error = ANE_T6021_PM_RESTART_DEFERRED;
+	KUNIT_EXPECT_EQ(test, ane_sleep_dev_pm_resume(&ctx->dev), 0);
+	mutex_lock(&ctx->fw_lock);
+	KUNIT_EXPECT_EQ(test, ane_t6021_pm_restart_deferred(&ctx->pm), 0);
+	mutex_unlock(&ctx->fw_lock);
+	KUNIT_EXPECT_EQ(test, ctx->deferred_restarts, 1U);
+	KUNIT_EXPECT_EQ(test, ctx->pm.state, ANE_T6021_PM_ACTIVE);
+	KUNIT_EXPECT_EQ(test, ane_t6021_pm_submit_error(ctx->pm.state), 0);
+
+	/* A failed deferred restart leaves the device out but sleep working. */
+	ctx->stops = ctx->restarts;
+	KUNIT_ASSERT_EQ(test, ane_sleep_dev_pm_suspend(&ctx->dev), 0);
+	KUNIT_EXPECT_EQ(test, ane_sleep_dev_pm_resume(&ctx->dev), 0);
+	ctx->deferred_error = -ETIMEDOUT;
+	mutex_lock(&ctx->fw_lock);
+	KUNIT_EXPECT_EQ(test, ane_t6021_pm_restart_deferred(&ctx->pm), -ETIMEDOUT);
+	mutex_unlock(&ctx->fw_lock);
+	KUNIT_EXPECT_EQ(test, ctx->pm.state, ANE_T6021_PM_FAILED);
+	KUNIT_EXPECT_EQ(test, ane_sleep_dev_pm_suspend(&ctx->dev), 0);
+	KUNIT_EXPECT_EQ(test, ane_sleep_dev_pm_resume(&ctx->dev), 0);
+	KUNIT_EXPECT_EQ(test, ctx->parks, 1U);
 }
 
 static void ane_sleep_abort_test(struct kunit *test)
@@ -156,6 +260,8 @@ static struct kunit_case ane_sleep_cases[] = {
 	KUNIT_CASE(ane_sleep_cycles_test),
 	KUNIT_CASE(ane_sleep_stop_failure_test),
 	KUNIT_CASE(ane_sleep_restart_failure_test),
+	KUNIT_CASE(ane_sleep_park_failure_test),
+	KUNIT_CASE(ane_sleep_deferred_test),
 	KUNIT_CASE(ane_sleep_abort_test),
 	KUNIT_CASE(ane_sleep_callback_mapping_test),
 	{}

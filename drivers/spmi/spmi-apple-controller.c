@@ -54,6 +54,15 @@
 #define SPMI_ACT_FIFO_FLUSH BIT(0)
 #define SPMI_RX_FIFO_EMPTY BIT(24)
 
+/*
+ * Generation 4 queues fault records in its second register window, a FIFO laid out as the
+ * reply FIFO. macOS acks the controller's fault interrupt (source 263, after the 256
+ * peripheral sources; ack words from 0x600) and empties the queue when the controller starts.
+ */
+#define SPMI_GEN4_IRQ_ACK_BASE 0x600
+#define SPMI_GEN4_FAULT_IRQ (SPMI_MAX_PERIPHERAL_IRQS + 7)
+#define SPMI_FAULT_QUEUE_MAX 64
+
 #define REG_POLL_INTERVAL_US 10000
 #define REG_POLL_TIMEOUT_US (REG_POLL_INTERVAL_US * 5)
 
@@ -94,6 +103,8 @@ static const struct apple_spmi_hw apple_spmi_gen4 = {
 
 struct apple_spmi {
 	void __iomem *regs;
+	void __iomem *faults;
+	unsigned int nfaults;
 	const struct apple_spmi_hw *hw;
 	struct mutex fifo_lock;
 	struct completion fifo_rx;
@@ -163,6 +174,26 @@ static inline u32 apple_spmi_pack_cmd(u8 opc, u8 sid, u16 param)
 	return opc | sid << 8 | (u32)param << 16 | (1 << 15);
 }
 
+/* Ack the fault interrupt, then pop and log every queued fault record */
+static void apple_spmi_drain_faults(struct device *dev, struct apple_spmi *spmi)
+{
+	void __iomem *ack = spmi->regs + SPMI_GEN4_IRQ_ACK_BASE + (SPMI_GEN4_FAULT_IRQ / 32) * 4;
+	u32 bit = BIT(SPMI_GEN4_FAULT_IRQ % 32), fault;
+	int i;
+
+	if (!spmi->faults)
+		return;
+	if (readl(ack) & bit)
+		writel(bit, ack);
+	for (i = 0; i < SPMI_FAULT_QUEUE_MAX; i++) {
+		if (readl(spmi->faults + spmi->hw->status) & spmi->hw->rx_empty)
+			return;
+		fault = readl(spmi->faults + spmi->hw->reply);
+		spmi->nfaults++;
+		dev_warn_ratelimited(dev, "fault %#010x (%u so far)\n", fault, spmi->nfaults);
+	}
+}
+
 /* Wait for Rx FIFO to have something */
 static int apple_spmi_wait_rx_not_empty(struct spmi_controller *ctrl)
 {
@@ -195,16 +226,14 @@ static int apple_spmi_wait_rx_not_empty(struct spmi_controller *ctrl)
 	return 0;
 }
 
-static int spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid, u16 param,
-			const u8 *buf_wr, size_t len_wr, u8 *buf_rd, size_t len_rd)
+static int __spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid, u16 param,
+			  const u8 *buf_wr, size_t len_wr, u8 *buf_rd, size_t len_rd)
 {
 	struct apple_spmi *spmi = spmi_controller_get_drvdata(ctrl);
 	u32 spmi_cmd = apple_spmi_pack_cmd(opc, sid, param);
 	u32 reply, rsp;
 	size_t i = 0, j;
 	int ret;
-
-	guard(mutex)(&spmi->fifo_lock);
 
 	if (spmi->prev_fail) {
 		/* Do not consume a late reply as the reply to a new command. */
@@ -267,6 +296,20 @@ static int spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid, u16 param,
 		return -EIO;
 	}
 	return 0;
+}
+
+/* Logs the fault queue's records after a failed command */
+static int spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid, u16 param,
+			const u8 *buf_wr, size_t len_wr, u8 *buf_rd, size_t len_rd)
+{
+	struct apple_spmi *spmi = spmi_controller_get_drvdata(ctrl);
+	int ret;
+
+	guard(mutex)(&spmi->fifo_lock);
+	ret = __spmi_raw_cmd(ctrl, opc, sid, param, buf_wr, len_wr, buf_rd, len_rd);
+	if (ret)
+		apple_spmi_drain_faults(&ctrl->dev, spmi);
+	return ret;
 }
 
 /* Send a raw command with 1..16 input data frames */
@@ -611,6 +654,13 @@ static int apple_spmi_probe(struct platform_device *pdev)
 	spmi->regs = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(spmi->regs))
 		return PTR_ERR(spmi->regs);
+
+	if (!spmi->hw->legacy_irqs && platform_get_resource(pdev, IORESOURCE_MEM, 1)) {
+		spmi->faults = devm_platform_ioremap_resource(pdev, 1);
+		if (IS_ERR(spmi->faults))
+			return PTR_ERR(spmi->faults);
+		apple_spmi_drain_faults(&pdev->dev, spmi);
+	}
 
 	ctrl->dev.of_node = pdev->dev.of_node;
 

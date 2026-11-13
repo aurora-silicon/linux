@@ -78,6 +78,12 @@ properties:
       is down (the PCIe WAKE# signal of the WLAN function). PCIe devices
       only; SDIO devices use the host-wake interrupt instead.
 
+  wakeup-source:
+    description:
+      The device can wake the host in response to WLAN activity. PCIe devices
+      without an out-of-band host-wake interrupt use their in-band interrupt.
+    type: boolean
+
   brcm,drive-strength:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Drive strength used for the SDIO pins on the device in mA.

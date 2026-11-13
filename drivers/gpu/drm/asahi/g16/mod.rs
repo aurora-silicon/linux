@@ -437,6 +437,10 @@ impl Gpu {
 impl Firmware {
     /// Builds the graphs and the engine after READY. On failure the firmware stays at READY,
     /// retained as an orphan of `shared`.
+    ///
+    /// Out of line, like [`boot::admit`] and [`boot::start`]: each of [`Gpu::new`]'s phases
+    /// has a large frame, and the probe's stack holds them only one at a time.
+    #[inline(never)]
     fn start_backend(
         dev: &AsahiDrmDevice,
         booted: boot::Booted,

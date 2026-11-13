@@ -22,15 +22,34 @@ enum ane_t6021_pm_state {
  * cold-start/handshake/program-replay path as timeout recovery, returning
  * success only once existing public IDs are usable again.
  *
- * These callbacks hold the existing firmware mutex. Neither callback may use
- * runtime-PM force/cycle helpers while system PM has disabled runtime PM.
- * Supplier and DART system callbacks perform power removal/restoration around
- * these consumer callbacks. RX shutdown and restoration belong to the shared
- * lifetime implementation along with the firmware state.
+ * The firmware may only cold-start on a CPU whose power domain went off
+ * after the stop. A suspend that aborts before the domains are powered off
+ * (a wake event during the device phase, or pm_test=devices) still runs
+ * every resume callback. restart then returns ANE_T6021_PM_RESTART_DEFERRED:
+ * the CPU stays stopped, the device stays SUSPENDED (submissions refused)
+ * and restart_deferred() later power-cycles the domains through runtime PM
+ * and boots, once system PM has released its references.
+ *
+ * park is optional. It runs when a FAILED device is suspended and must leave
+ * its CPU safe to lose power (proven stopped, already unpowered, or a busy
+ * core after a hung job that the driver lets the domain power-off contain);
+ * an error aborts only that suspend. A FAILED device stays unavailable until reboot
+ * but never blocks system sleep by itself.
+ *
+ * These callbacks hold the existing firmware mutex. stop, restart and park
+ * may not use runtime-PM force/cycle helpers while system PM has disabled
+ * runtime PM. Supplier and DART system callbacks perform power
+ * removal/restoration around these consumer callbacks. RX shutdown and
+ * restoration belong to the shared lifetime implementation along with the
+ * firmware state.
  */
+#define ANE_T6021_PM_RESTART_DEFERRED	1
+
 struct ane_t6021_pm_ops {
 	int (*stop)(void *ctx);
 	int (*restart)(void *ctx);
+	int (*restart_deferred)(void *ctx);
+	int (*park)(void *ctx);
 };
 
 struct ane_t6021_pm {
@@ -48,41 +67,68 @@ static inline int ane_t6021_pm_submit_error(enum ane_t6021_pm_state state)
 
 static inline int ane_t6021_pm_suspend(struct ane_t6021_pm *pm)
 {
-	int ret = -EHOSTDOWN;
+	int ret = 0;
 
 	/* Drains the current synchronous command and its finish event, then
 	 * fences queued submitters before handing off to the shared stop path.
 	 */
 	mutex_lock(pm->fw_lock);
-	if (pm->state != ANE_T6021_PM_ACTIVE)
-		goto out;
-	pm->state = ANE_T6021_PM_FAILED;
-	ret = pm->ops->stop(pm->ctx);
-	if (!ret)
-		pm->state = ANE_T6021_PM_SUSPENDED;
-out:
+	switch (pm->state) {
+	case ANE_T6021_PM_ACTIVE:
+		pm->state = ANE_T6021_PM_FAILED;
+		ret = pm->ops->stop(pm->ctx);
+		if (!ret)
+			pm->state = ANE_T6021_PM_SUSPENDED;
+		break;
+	case ANE_T6021_PM_SUSPENDED:
+		/* Stopped by an earlier suspend; its restart is still deferred. */
+		break;
+	case ANE_T6021_PM_FAILED:
+		if (pm->ops->park)
+			ret = pm->ops->park(pm->ctx);
+		break;
+	}
 	mutex_unlock(pm->fw_lock);
 	return ret;
 }
 
 static inline int ane_t6021_pm_resume(struct ane_t6021_pm *pm)
 {
-	int ret = -EHOSTDOWN;
+	int ret = 0;
 
 	mutex_lock(pm->fw_lock);
-	/* PM core may unwind before it reached this device's suspend. */
-	if (pm->state == ANE_T6021_PM_ACTIVE) {
-		ret = 0;
-		goto out;
-	}
+	/* ACTIVE: PM core may unwind before it reached this device's suspend.
+	 * FAILED: unavailable until reboot; the failure was reported once.
+	 */
 	if (pm->state != ANE_T6021_PM_SUSPENDED)
 		goto out;
 	pm->state = ANE_T6021_PM_FAILED;
 	ret = pm->ops->restart(pm->ctx);
-	if (!ret)
+	if (ret == ANE_T6021_PM_RESTART_DEFERRED) {
+		pm->state = ANE_T6021_PM_SUSPENDED;
+		ret = 0;
+	} else if (!ret) {
 		pm->state = ANE_T6021_PM_ACTIVE;
+	}
 out:
 	mutex_unlock(pm->fw_lock);
+	return ret;
+}
+
+/* Finish a restart that resume deferred. The caller holds the firmware
+ * mutex, runs outside system PM transitions and has runtime PM available.
+ */
+static inline int ane_t6021_pm_restart_deferred(struct ane_t6021_pm *pm)
+{
+	int ret;
+
+	lockdep_assert_held(pm->fw_lock);
+	if (pm->state != ANE_T6021_PM_SUSPENDED)
+		return 0;
+	pm->state = ANE_T6021_PM_FAILED;
+	ret = pm->ops->restart_deferred(pm->ctx);
+	if (!ret)
+		pm->state = ANE_T6021_PM_ACTIVE;
 	return ret;
 }
 

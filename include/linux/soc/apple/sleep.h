@@ -139,6 +139,18 @@ void apple_sleep_lid_at_wake(bool closed);
 int apple_sleep_lid_closed_at_wake(void);
 
 /*
+ * From the SMC's driver, in its noirq resume: whether the SMC's record of the wake has the
+ * radios' source.
+ */
+void apple_sleep_radio_at_wake(bool woke);
+
+/*
+ * For the radios: 1 if the SMC's record of this wake has their source, 0 if it was read
+ * without it, -ENODATA if it wasn't read.
+ */
+int apple_sleep_radio_woke(void);
+
+/*
  * From the SMC's driver, in its noirq resume: the SMC woke the AP for the port alone. If
  * this sleep cut the debug link and nothing else woke the SoC, it's a dark wake.
  */
@@ -272,6 +284,15 @@ static inline void apple_sleep_lid_at_wake(bool closed)
 }
 
 static inline int apple_sleep_lid_closed_at_wake(void)
+{
+	return -ENODATA;
+}
+
+static inline void apple_sleep_radio_at_wake(bool woke)
+{
+}
+
+static inline int apple_sleep_radio_woke(void)
 {
 	return -ENODATA;
 }

@@ -416,17 +416,23 @@ allOf:
             - description: GFX coprocessor mailbox
             - description: GFX1 coprocessor mailbox
         memory-region:
+          minItems: 3
           items:
             - description: Region containing GPU MMU TTBs
             - description: Region containing GPU MMU page tables
             - description:
                 Region containing a shared handoff structure for VM
                 management coordination
+            - description:
+                Data segments of both GPU firmware roles, where each keeps
+                its crash log
         memory-region-names:
+          minItems: 3
           items:
             - const: ttbs
             - const: pagetables
             - const: handoff
+            - const: fw-data
       required:
         - power-domains
         - operating-points-v2

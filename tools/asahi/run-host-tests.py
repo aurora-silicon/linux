@@ -81,6 +81,7 @@ ASAHI_TESTS = {
     'apple-dart-dapf-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('missing-guard', 'ignore-replay', 'ignore-orphan'), out()),
     'apple-dart-fw-tests.py': [(out(), PASS)],
+    'apple-dart-fw-harness-tests.py': [([], PASS)],
     'apple-dart-range-tests.py': [([], PASS)],
     'asahi-stats-raw-tests.py': [([], PASS)],
     'agx-stats-busy-tests.py': [([], PASS), (['--negative-control'], PASS)],
@@ -112,7 +113,9 @@ ASAHI_TESTS = {
         + [(out() + ['--ref', '9260e1f021e075713931f3c23c0a5fa1da936b0b'], KILL)],
     'brcmf-suspend-tests.py': [(out(), PASS)]
         + mutations('--mutation', ('country-gate', 'queue-reasons', 'worker-gate',
-                                   'resume-order', 'tx-drain'), out()),
+                                   'resume-order', 'tx-drain', 'lpas-resume'), out()),
+    'brcmf-wowl-filter-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('base-order', 'mask-last', 'totsize', 'no-track'), out()),
     'brcmfmac-scan-timeout-tests.py': [(out('--output'), PASS)],
     'clpc-gpu-demand-tests.py': [([], PASS)],
     # The old policy always disabled compute preemption.

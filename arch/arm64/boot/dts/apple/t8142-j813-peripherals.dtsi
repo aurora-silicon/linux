@@ -62,6 +62,11 @@
 			label = "pmp";
 			/* The PMP's SRAM, which the driver reads first. */
 			power-domains = <&ps_pms_sram>;
+			/*
+			 * As on T8140/T8132: the PMP firmware keeps running. If genpd
+			 * gates this domain at s2idle, the PMP crashes on its own MMIO.
+			 */
+			apple,always-on;
 		};
 
 		ps_pms_sram: power-controller@5a0 {
