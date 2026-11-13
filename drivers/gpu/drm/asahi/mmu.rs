@@ -1299,16 +1299,12 @@ impl ExecutionRoot {
         if self.inner.reserved_stale() {
             // The TTBAT is not the host's until it is written from the shadow: release the
             // shadow entry only, which keeps the context out of that rewrite.
-            let vm = if inner.execution_roots[id] == (self.low, self.high) {
+            if inner.execution_roots[id] == (self.low, self.high) {
                 inner.execution_roots[id] = (0, 0);
                 inner.execution_contexts &= !(1u64 << id);
-                inner.execution_vms[id].take()
             } else {
                 pr_err!("MMU: application context {} changed owners while leased\n", id);
-                None
-            };
-            drop(inner);
-            drop(vm);
+            }
             return;
         }
         let release = {
@@ -1327,12 +1323,7 @@ impl ExecutionRoot {
         };
         drop(inner);
         if release {
-            let vm = {
-                let mut inner = self.inner.lock();
-                inner.execution_roots[id] = (0, 0);
-                inner.execution_vms[id].take()
-            };
-            drop(vm);
+            self.inner.lock().execution_roots[id] = (0, 0);
         }
         if release {
             mem::sync();
@@ -2034,10 +2025,6 @@ struct UatShared {
     /// the host's record of what it published, for a TTBAT that a resume from disk did not
     /// restore ([`Uat::reset_after_cold_boot`]).
     execution_roots: [(u64, u64); UAT_NUM_CTX],
-    /// The VM of every live execution context, for the cache maintenance after a hibernation
-    /// restore ([`Uat::clean_poc_after_restore`]). Never outlives the context's own reference:
-    /// taken out at release and dropped after this lock.
-    execution_vms: [Option<Vm>; UAT_NUM_CTX],
     /// Kernel root of the secondary firmware instance, if there is one.
     secondary_ttb1: Option<PhysicalAddr>,
     map_kernel_to_user: bool,
@@ -3617,7 +3604,6 @@ impl Uat {
                         binding_published: [false; UAT_NUM_CTX],
                         owned_user_roots: [0; UAT_NUM_CTX],
                         execution_roots: [(0, 0); UAT_NUM_CTX],
-                        execution_vms: [const { None }; UAT_NUM_CTX],
                         secondary_ttb1: None,
                         map_kernel_to_user,
                         handoff_rgn,
@@ -3986,7 +3972,6 @@ impl Uat {
                     return Err(EBUSY);
                 }
                 inner.execution_roots[id] = (low, high);
-                inner.execution_vms[id] = Some(vm.clone());
                 return Ok(context);
             }
             let roots = &inner.ttbs()[id];
@@ -3997,7 +3982,6 @@ impl Uat {
             roots.ttb1.store(high, Ordering::Release);
             inner.publish_slot(id);
             inner.execution_roots[id] = (low, high);
-            inner.execution_vms[id] = Some(vm.clone());
         }
         mem::sync();
         mem::tlbi_asid(id as u8);
@@ -4302,45 +4286,6 @@ impl Uat {
         .count()
     }
 
-    /// Cleans to the point of coherency every RAM page-table page and every RAM page mapped by
-    /// the kernel VM, the kernel-lower VM, `extra` (the global render VM) and every live
-    /// execution context's client root, after a hibernation restore: the restore copies pages
-    /// back through the CPU caches (the arm64 restore of this tree now cleans every image page
-    /// to the point of coherency, `swsusp_clean_restored_image`; this pass stays as a second
-    /// guard for kernels without it), while the
-    /// T6040 UAT walker and GPU do not snoop (`UatQuirks::clean_tables`). Covers every
-    /// firmware-visible object, queue and context page and every client buffer the GPU can
-    /// reach. Call with the device mutex held, publication closed and the GPU idle.
-    pub(crate) fn clean_poc_after_restore(&self, extra: &[&Vm]) -> Result<pgtable::CleanStats> {
-        let mut vms = KVec::new();
-        vms.push(self.kernel_vm.clone(), GFP_KERNEL)?;
-        vms.push(self.kernel_lower_vm.clone(), GFP_KERNEL)?;
-        for vm in extra {
-            vms.push((*vm).clone(), GFP_KERNEL)?;
-        }
-        {
-            let inner = self.inner.lock();
-            for vm in inner.execution_vms.iter().flatten() {
-                vms.push(vm.clone(), GFP_KERNEL)?;
-            }
-        }
-        let mut stats = pgtable::CleanStats::default();
-        let result = (|| -> Result {
-            for vm in vms.iter() {
-                // Each VM's lock excludes its mapping changes (and table frees) during the
-                // walk; userspace runs again by now.
-                let inner = vm.gpuvm.lock_inner();
-                // SAFETY: The VM lock is held, so no table of this tree is freed.
-                unsafe { inner.page_table.clean_poc_tree(&mut stats) }?;
-            }
-            Ok(())
-        })();
-        pgtable::poc_barrier();
-        // Dropped after every lock: a context released meanwhile may hold the last reference.
-        drop(vms);
-        result.map(|()| stats)
-    }
-
     /// Stores again the descriptors the kernel VM placed in the firmware's no-map kernel-window
     /// table (see `UatPageTable::relink_reserved`). Call after the firmware booted and rebuilt
     /// its root, as the first boot maps the graph after it; returns `(stored, recorded)`.
@@ -4451,7 +4396,6 @@ impl Uat {
                         binding_published: [false; UAT_NUM_CTX],
                         owned_user_roots: [0; UAT_NUM_CTX],
                         execution_roots: [(0, 0); UAT_NUM_CTX],
-                        execution_vms: [const { None }; UAT_NUM_CTX],
                         secondary_ttb1: None,
                         map_kernel_to_user: false,
                         handoff_rgn,

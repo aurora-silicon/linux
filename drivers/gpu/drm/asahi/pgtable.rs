@@ -248,94 +248,6 @@ unsafe fn with_table<T>(
     page.with_pointer_into_page(offset, len, f)
 }
 
-/// What [`clean_tree_poc`] cleaned.
-#[derive(Default, Copy, Clone)]
-pub(crate) struct CleanStats {
-    /// Table pages in RAM.
-    pub(crate) tables: usize,
-    /// Mapped leaf pages in RAM (an aliased page counts once per mapping).
-    pub(crate) pages: usize,
-    /// Leaves that are not System RAM (MMIO windows, no-map regions): not touched.
-    pub(crate) skipped: usize,
-}
-
-/// Cleans to the point of coherency every RAM table page of the tree rooted at `root` and
-/// every RAM page its leaves map, for a UAT walker that does not snoop the CPU caches, after
-/// a hibernation restore copied those pages back through the CPU caches. Tables in a
-/// `reserved` region are read through its mapping but not cleaned (they are not in the image).
-/// The caller completes the maintenance with [`poc_barrier`].
-///
-/// # Safety
-///
-/// Every table of the tree must stay allocated while this runs, and no page may be freed: the
-/// device mutex is held with publication closed and the GPU idle.
-pub(crate) unsafe fn clean_tree_poc(
-    reserved: Option<&ReservedTables>,
-    root: PhysicalAddr,
-    oas_mask: u64,
-    stats: &mut CleanStats,
-) -> Result {
-    // SAFETY: Forwarded from the caller.
-    unsafe { clean_table_poc(reserved, root, UAT_LEVELS - 1, oas_mask, stats) }
-}
-
-/// # Safety
-///
-/// See [`clean_tree_poc`].
-unsafe fn clean_table_poc(
-    reserved: Option<&ReservedTables>,
-    table: PhysicalAddr,
-    level: usize,
-    oas_mask: u64,
-    stats: &mut CleanStats,
-) -> Result {
-    let in_reserved = reserved.is_some_and(|r| r.contains(table));
-    if in_reserved && reserved.is_some_and(|r| r.stale()) {
-        // Not the host's contents; [`UatPageTable::clean_poc_tree`] uses the recorded links.
-        return Ok(());
-    }
-    let mut walk = |p: *mut u8| -> Result {
-        for index in 0..UAT_NPTE {
-            // SAFETY: `p` covers the whole table page; entries are aligned u64s.
-            let pte = unsafe { &*(p.add(index * PTE_SIZE) as *const AtomicU64) }
-                .load(Ordering::Relaxed);
-            if pte & 1 == 0 {
-                continue;
-            }
-            let phys = pte & oas_mask & (!UAT_PGMSK as u64);
-            if level > 0 {
-                if pte & PTE_TYPE_BITS == PTE_TYPE_LEAF_TABLE {
-                    // SAFETY: Forwarded: a table the tree names stays allocated.
-                    unsafe { clean_table_poc(reserved, phys, level - 1, oas_mask, stats) }?;
-                }
-                continue;
-            }
-            // SAFETY: Only looks the page up; System RAM with a struct page is mapped.
-            match unsafe { Page::borrow_phys(&phys) } {
-                Some(page) => {
-                    page.with_pointer_into_page(0, UAT_PGSZ, |leaf| {
-                        clean_poc(leaf, UAT_PGSZ);
-                        Ok(())
-                    })?;
-                    stats.pages += 1;
-                }
-                None => stats.skipped += 1,
-            }
-        }
-        if !in_reserved {
-            clean_poc(p, UAT_PGSZ);
-            stats.tables += 1;
-        }
-        Ok(())
-    };
-    if let Some(base) = reserved.and_then(|r| r.lookup(table)) {
-        return walk(base);
-    }
-    // SAFETY: Only looks the page up.
-    let page = unsafe { Page::borrow_phys(&table) }.ok_or(EIO)?;
-    page.with_pointer_into_page(0, UAT_PGSZ, walk)
-}
-
 /// Runs `f` on the first `count` top-level entries of the root page table at `ttb`.
 ///
 /// # Safety
@@ -675,32 +587,6 @@ impl UatPageTable {
 
     pub(crate) fn ttb(&self) -> PhysicalAddr {
         self.ttb
-    }
-
-    /// [`clean_tree_poc`] for this tree. While the reserved regions are stale their tables are
-    /// not read: the host-owned subtrees are reached through the recorded links instead.
-    ///
-    /// # Safety
-    ///
-    /// See [`clean_tree_poc`]; the caller holds this VM's lock.
-    pub(crate) unsafe fn clean_poc_tree(&self, stats: &mut CleanStats) -> Result {
-        let reserved = self.reserved.as_deref();
-        if reserved.is_some_and(|r| r.stale()) {
-            for &(parent, _, descriptor) in self.reserved_links.iter() {
-                let child = descriptor & self.oas_mask & (!UAT_PGMSK as u64);
-                let level = if parent == self.ttb { UAT_LEVELS - 2 } else { UAT_LEVELS - 3 };
-                // SAFETY: Forwarded; a recorded child is a host table in RAM.
-                unsafe { clean_table_poc(reserved, child, level, self.oas_mask, stats) }?;
-            }
-            if !reserved.is_some_and(|r| r.contains(self.ttb)) {
-                // A RAM root below which only some tables hang in reserved parents.
-                // SAFETY: Forwarded.
-                unsafe { clean_table_poc(reserved, self.ttb, UAT_LEVELS - 1, self.oas_mask, stats) }?;
-            }
-            return Ok(());
-        }
-        // SAFETY: Forwarded.
-        unsafe { clean_tree_poc(reserved, self.ttb, self.oas_mask, stats) }
     }
 
     /// Stores again every table descriptor this page table placed in a reserved-region table

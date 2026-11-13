@@ -1070,21 +1070,10 @@ impl Firmware {
     /// - The host mirrors of those contents return to their post-boot values: receive-ring
     ///   policy, recovery handshake, effort, idle hold, the port's QoS charges, generation and
     ///   effort flag.
-    fn reinit_shared_contents(&mut self, dev: &AsahiDrmDevice) -> Result {
-        // The UAT walker and the firmware read memory at the point of coherency. The arm64
-        // restore now cleans every image page there (swsusp_clean_restored_image); this pass
-        // stays as a second guard (a restore that cleans only to the point of unification).
-        let started = now_ns();
-        let stats = self.uat.clean_poc_after_restore(&[&self._render_global])?;
-        dev_info!(
-            dev.as_ref(),
-            "GPU republish: cleaned {} table pages and {} mapped pages ({} MiB) to PoC in {} us, {} non-RAM leaves skipped\n",
-            stats.tables,
-            stats.pages,
-            (stats.tables + stats.pages) * mmu::UAT_PGSZ / (1024 * 1024),
-            now_ns().saturating_sub(started) / 1000,
-            stats.skipped
-        );
+    fn reinit_shared_contents(&mut self) -> Result {
+        // The UAT walker and the firmware read memory at the point of coherency: the arm64
+        // restore cleaned every image page there before the jump (swsusp_clean_restored_image,
+        // and the restore_pblist copy), page tables and every page they map included.
         self.uat.reset_after_cold_boot()?;
         self.init.restore_pristine()?;
         self.port.reset_after_cold_boot()?;
@@ -1146,7 +1135,7 @@ impl Firmware {
         // (1) Host RTKit and CPU-start state of the cold coprocessor.
         self.reinit_mailboxes(dev)?;
         // (2) What the firmware reads at boot, while it cannot run.
-        self.reinit_shared_contents(dev)?;
+        self.reinit_shared_contents()?;
         // (2b) As the first boot does before it starts the CPUs (`Gpu::boot`): the
         // GPU-to-fabric bridge. A cold boot by the boot loader resets the GPU block, and the
         // coprocessors and cores cannot reach memory without it. Idempotent.
