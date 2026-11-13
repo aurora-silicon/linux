@@ -19,6 +19,7 @@ appledrm-y += iomfb_v14_7.o iomfb_v14_7_link.o
 appledrm-$(CONFIG_DRM_APPLE_DCP_T8132) += iomfb_m4.o t8132_ext_drm.o
 appledrm-y += iomfb_h17p.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += iomfb_h17p_test.o parser_test.o
+appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += iomfb_external_hdr_hints_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += apple_resume_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += apple_boot_display_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-syslog-test.o
