@@ -53,6 +53,9 @@
 #include <linux/sysfs.h>
 #include <linux/types.h>
 
+#include <asm/kvm_arm.h>
+#include <asm/virt.h>
+
 #include "dma-iommu.h"
 
 #if IS_ENABLED(CONFIG_APPLE_DART_KUNIT_TEST)
@@ -1856,9 +1859,21 @@ apple_dart_gen3_hw_invalidate_tlb(struct apple_dart_stream_map *stream_map)
 {
 	struct apple_dart *dart = stream_map->dart;
 	unsigned long flags;
+	u64 hcr = 0;
 	int sid;
 
 	spin_lock_irqsave(&dart->lock, flags);
+	/*
+	 * The DART snoops an EL1&0 TLBI, as iBoot and aura (EL2 without VHE)
+	 * issue it. A VHE kernel's TLBI VALE1OS targets EL2&0 while
+	 * HCR_EL2.TGE is set, so clear TGE around it, as KVM does to reach
+	 * the EL1&0 regime.
+	 */
+	if (is_kernel_in_hyp_mode()) {
+		hcr = read_sysreg(hcr_el2);
+		write_sysreg(hcr & ~HCR_TGE, hcr_el2);
+		isb();
+	}
 	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
 		u64 lo = DART_GEN3_TLBI_VALID |
 			 FIELD_PREP(DART_GEN3_TLBI_ROUTE_FIELD, dart->tlbi_route) |
@@ -1870,6 +1885,10 @@ apple_dart_gen3_hw_invalidate_tlb(struct apple_dart_stream_map *stream_map)
 			     ".inst 0xd50881bf\n" /* tlbi vale1os, xzr */
 			     "dsb osh\n"
 			     : : "r"(lo), "r"(dart->tlbi) : "memory");
+	}
+	if (is_kernel_in_hyp_mode()) {
+		write_sysreg(hcr, hcr_el2);
+		isb();
 	}
 	spin_unlock_irqrestore(&dart->lock, flags);
 
