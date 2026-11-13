@@ -43,6 +43,9 @@ mod stac;
 // The accessory client that drives these lands with its HID transport.
 #[allow(dead_code)]
 mod stac_ops;
+// Driven by the accessory client with the relay.
+#[allow(dead_code)]
+mod stac_lifecycle;
 mod store;
 mod transfer;
 mod trusted;
