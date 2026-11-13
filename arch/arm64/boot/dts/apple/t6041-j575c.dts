@@ -1409,6 +1409,8 @@
 			     <43 IRQ_TYPE_EDGE_RISING>,
 			     <45 IRQ_TYPE_EDGE_RISING>;
 		interrupt-names = "irq", "select", "sleep", "wake";
+		/* Retimer set up before Linux keeps SuperSpeed down until replugged. */
+		apple,reset-inherited-usb2-connection;
 
 		typec1: connector {
 			compatible = "usb-c-connector";
@@ -1438,6 +1440,8 @@
 			     <69 IRQ_TYPE_EDGE_RISING>,
 			     <71 IRQ_TYPE_EDGE_RISING>;
 		interrupt-names = "irq", "select", "sleep", "wake";
+		/* Retimer set up before Linux keeps SuperSpeed down until replugged. */
+		apple,reset-inherited-usb2-connection;
 
 		typec2: connector {
 			compatible = "usb-c-connector";
@@ -1993,11 +1997,9 @@
 #include "t6041-j575c-atc3.dtsi"
 #include "t6041-j575c-usb3.dtsi"
 #include "t6041-j575c-usbc.dtsi"
+#include "t6041-j575c-hdmi.dtsi"
 
-/*
- * Not described: HDMI (dcpext0 through display-crossbar0 to the lpdptx PHY
- * and a DP-to-HDMI converter on i2c8) and the SEP (no Touch ID sensor).
- */
+/* Not described: the SEP (no Touch ID sensor). */
 
 /*
  * The PMP, as the M4 Max MacBook Pros run it. The pmp alias lets the loader

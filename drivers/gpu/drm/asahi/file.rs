@@ -102,6 +102,10 @@ pub(crate) const DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION: u64 =
 /// command may wait for it in firmware.
 pub(crate) const DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION: u32 =
     uapi::drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION as u32;
+/// Queues take a watchdog allowance for their compute commands
+/// (`drm_asahi_queue_create::compute_timeout_ms`).
+pub(crate) const DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT: u64 =
+    uapi::DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT as u64;
 /// The tiling half waits only on the render and compute prefixes of the command's stage-prefix
 /// fields, its fragment half on the whole ones.
 #[allow(dead_code)]
@@ -378,6 +382,8 @@ pub(crate) struct File {
     /// Largest size this file has asked GET_PARAMS for the global parameters with
     /// ([`gpu::Gpu::admit_vm`]).
     params_size: core::sync::atomic::AtomicU64,
+    /// The device's statistics, for the GPU frequency in fdinfo.
+    stats: Option<Arc<crate::stats::StatsSnapshot>>,
     /// The queues were drained once for an exiting task.
     drained: AtomicBool,
 }
@@ -401,9 +407,10 @@ impl drm::file::DriverFile for File {
             let user_range = gpu.user_range();
             let mem = memacct::Client::new()?;
             let usage = Arc::new(crate::usage::Client::new(), GFP_KERNEL)?;
+            let stats = gpu.stats_snapshot();
 
             mod_dev_dbg!(device, "[File {}]: DRM device opened\n", id);
-            KBox::pin_init(File::new(id, user_range, mem, usage), GFP_KERNEL)
+            KBox::pin_init(File::new(id, user_range, mem, usage, stats), GFP_KERNEL)
         })
     }
 
@@ -428,6 +435,11 @@ impl drm::file::DriverFile for File {
         }
     }
 
+    /// One clock drives every engine.
+    fn engine_frequency(&self) -> Option<(Option<u64>, u64)> {
+        self.stats.as_ref()?.engine_frequency()
+    }
+
     fn as_raw(&self) -> *mut bindings::drm_file {
         todo!()
     }
@@ -442,6 +454,7 @@ impl File {
         user_range: Range<u64>,
         mem: Arc<memacct::Client>,
         usage: Arc<crate::usage::Client>,
+        stats: Option<Arc<crate::stats::StatsSnapshot>>,
     ) -> impl PinInit<Self, Error> {
         // SAFETY: The initializer supplies aligned, pinned storage for Self.
         // XArray::new is infallible; each pinned array is initialized in place,
@@ -473,6 +486,7 @@ impl File {
                 addr_of_mut!((*slot).mem).write(mem);
                 addr_of_mut!((*slot).usage).write(usage);
                 addr_of_mut!((*slot).params_size).write(core::sync::atomic::AtomicU64::new(0));
+                addr_of_mut!((*slot).stats).write(stats);
                 addr_of_mut!((*slot).drained).write(AtomicBool::new(false));
                 Ok(())
             })
@@ -567,6 +581,9 @@ impl File {
         params.features |= gpu.feature_flags();
         if Self::supports_user_memory(reg_data) {
             params.features |= uapi::DRM_ASAHI_FEATURE_USERPTR as u64;
+        }
+        if Self::supports_residency_control(reg_data) {
+            params.features |= uapi::DRM_ASAHI_FEATURE_GEM_RESIDENCY as u64;
         }
 
         let size = core::mem::size_of::<uapi::drm_asahi_params_global>().min(data.size.try_into()?);
@@ -994,6 +1011,34 @@ impl File {
             data.handle
         );
 
+        Ok(0)
+    }
+
+    /// Whether this GPU takes residency requests (DRM_IOCTL_ASAHI_GEM_RESIDENCY): only G17 user
+    /// VMs release idle memory under pressure.
+    fn supports_residency_control(reg_data: &driver::AsahiDrmRegistrationData<'_>) -> bool {
+        reg_data.gpu.as_any().is::<crate::g17::Gpu>()
+    }
+
+    /// IOCTL: gem_residency: Keep an object's memory resident, or return it to the default
+    /// policy.
+    pub(crate) fn gem_residency(
+        _device: &AsahiDrmDevice,
+        reg_data: &driver::AsahiDrmRegistrationData<'_>,
+        data: &mut uapi::drm_asahi_gem_residency,
+        file: &DrmFile,
+    ) -> Result<u32> {
+        if !Self::supports_residency_control(reg_data) {
+            return Err(EOPNOTSUPP);
+        }
+        if data.flags & !uapi::drm_asahi_gem_residency_flags_DRM_ASAHI_GEM_RESIDENCY_KEEP != 0 {
+            return Err(EINVAL);
+        }
+        let gem = gem::Object::lookup_handle(file, data.handle)?;
+        gem::set_keep_resident(
+            &gem,
+            data.flags & uapi::drm_asahi_gem_residency_flags_DRM_ASAHI_GEM_RESIDENCY_KEEP != 0,
+        )?;
         Ok(0)
     }
 
@@ -1584,6 +1629,10 @@ impl File {
             data.flags,
         );
 
+        if data.pad != 0 {
+            cls_pr_debug!(Errors, "queue_create: Invalid arguments\n");
+            return Err(EINVAL);
+        }
         if data.flags != 0 || data.priority > uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_REALTIME {
             cls_pr_debug!(Errors, "queue_create: Invalid arguments\n");
             return Err(EINVAL);
@@ -1655,6 +1704,9 @@ impl File {
         )?;
 
         queue.reserve_render_scs(data.render_scs_layout)?;
+        if data.compute_timeout_ms != 0 {
+            data.compute_timeout_ms = queue.set_compute_timeout(data.compute_timeout_ms)?;
+        }
 
         data.queue_id = resv.index().try_into()?;
         resv.fill(Arc::pin_init(

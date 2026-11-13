@@ -146,7 +146,7 @@ mod g17 {
     impl State {
         fn lock(&self)->std::sync::MutexGuard<'_,Option<Box<Firmware>>> { self.0.lock().unwrap() }
     }
-    struct Variant { graph:fw::variant::InitGraph }
+    struct Variant { graph:fw::variant::InitGraph, m5_commands:bool }
     struct Shared { state:State, dev:crate::device::Device, variant:Variant, crashed:std::sync::atomic::AtomicBool }
     mod reports;
 '''
@@ -154,10 +154,10 @@ RUST_TESTS = r'''
     fn reader(graph:fw::variant::InitGraph)->stats::Reader {
         stats::Reader(std::sync::Arc::new(Shared {
             state:State(std::sync::Mutex::new(Some(Box::new(Firmware {
-                rings:channel::Rings::new(graph).unwrap(),
+                rings:channel::Rings::new(graph,false).unwrap(),
                 init:initdata::InitData::new(),powered:true,epoch:0,recovery:Recovery(false),
-            })))),dev:crate::device::Device,variant:Variant { graph },crashed:false.into(),
-        }))
+            })))),dev:crate::device::Device,variant:Variant { graph, m5_commands:false },crashed:false.into(),
+        }),None)
     }
 
     #[test]
@@ -255,11 +255,11 @@ RUST_TESTS = r'''
         let dev=crate::device::Device;
         for graph in [InitGraph::V25G83,InitGraph::G17P] {
             let init=initdata::InitData::new();
-            let mut rings=Rings::new(graph).unwrap();
+            let mut rings=Rings::new(graph,false).unwrap();
             for words in [HIST_IDLE,HIST_ACTIVE,HIST_OTHER,TRANSITION] {
                 init.push(Secondary,words);
                 rings.drain_statistics(&dev,&init,Secondary);
-                assert_eq!(rings.read_statistics(1),telemetry::Readout::default());
+                assert_eq!(rings.read_statistics(1),telemetry::Readout { busy_status:telemetry::UNSUPPORTED,..Default::default() });
                 assert!(report(&rings).contains(&format!("words={:08x?}",words)));
             }
         }
@@ -271,7 +271,7 @@ RUST_TESTS = r'''
         let dev=crate::device::Device;
         for start in [0,5,7] {
             let init=initdata::InitData::new();
-            let mut rings=Rings::new(InitGraph::G17P).unwrap();
+            let mut rings=Rings::new(InitGraph::G17P,false).unwrap();
             for &role in &[Primary,Secondary] {
                 for cursor in &init.cursors[role as usize] { cursor.store(start,Ordering::Relaxed); }
                 for words in [HIST_OTHER,HIST_ACTIVE,TRANSITION] { init.push(role,words); }
@@ -286,7 +286,7 @@ RUST_TESTS = r'''
                 let line=text.lines().find(|line|line.starts_with(&format!("role={} tag={:#x} ",role,tag))).unwrap();
                 assert!(line.contains("count=2 host_ns=1 admitted=1 last_admitted=true"),"{}",line);
             } }
-            assert_eq!(rings.read_statistics(1),telemetry::Readout::default());
+            assert_eq!(rings.read_statistics(1),telemetry::Readout { busy_status:telemetry::UNSUPPORTED,..Default::default() });
         }
     }
 
@@ -295,7 +295,7 @@ RUST_TESTS = r'''
         use {channel::Rings,fw::variant::InitGraph,Role::*};
         let dev=crate::device::Device;
         let init=initdata::InitData::new();
-        let mut rings=Rings::new(InitGraph::G17P).unwrap();
+        let mut rings=Rings::new(InitGraph::G17P,false).unwrap();
         let util=[0x13,0,0,8,97,0,97,0,0,0,0,0,0,0,0,0,0,0];
         let pstate=[0x10,0x2500,0,0,0,0,6,0,0,0,0,0,0,0,0,0,0,0];
         rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],true,1);
@@ -326,21 +326,22 @@ RUST_TESTS = r'''
         use {channel::Rings,fw::variant::InitGraph,Role::*};
         let dev=crate::device::Device;
         for graph in [InitGraph::V25G83,InitGraph::G17P] {
-            assert!(!stats::reports_pstate(graph));
-            let empty=stats::qualify(graph,telemetry::Readout::default());
+            assert!(!stats::reports_pstate(graph,false));
+            assert!(stats::reports_pstate(graph,true));
+            let empty=stats::qualify(graph,false,telemetry::Readout::default());
             assert_eq!((empty.util_status,empty.pstate_status),(telemetry::UNAVAILABLE,telemetry::UNSUPPORTED));
             let init=initdata::InitData::new();
-            let mut rings=Rings::new(graph).unwrap();
+            let mut rings=Rings::new(graph,false).unwrap();
             init.push(Primary,[0x13,0,0,8,97,0,97,0,0,0,0,0,0,0,0,0,0,0]);
             // Even a decodable tag 0x10 does not override the firmware's match data.
             init.push(Primary,[0x10,0x2500,0,0,0,0,6,0,0,0,0,0,0,0,0,0,0,0]);
             rings.drain_statistics(&dev,&init,Primary);
             assert_eq!(rings.read_statistics(1).pstate_status,telemetry::VALID);
-            let view=stats::qualify(graph,rings.read_statistics(1));
+            let view=stats::qualify(graph,false,rings.read_statistics(1));
             assert_eq!((view.util_status,view.device,view.pstate_status,view.pstate,view.pstate_timestamp),
                        (telemetry::VALID,97,telemetry::UNSUPPORTED,0,0));
             rings.invalidate_statistics();
-            let view=stats::qualify(graph,rings.read_statistics(1));
+            let view=stats::qualify(graph,false,rings.read_statistics(1));
             assert_eq!((view.util_status,view.pstate_status),(telemetry::STALE,telemetry::UNSUPPORTED));
         }
     }
@@ -350,7 +351,7 @@ RUST_TESTS = r'''
         use {channel::Rings,fw::variant::InitGraph,Role::*};
         let dev=crate::device::Device;
         let init=initdata::InitData::new();
-        let mut rings=Rings::new(InitGraph::V25G83).unwrap();
+        let mut rings=Rings::new(InitGraph::V25G83,false).unwrap();
         let util=[0x13,0,0,8,97,0,97,0,0,0,0,0,0,0,0,0,0,0];
         // Three 8 ms records per producer update, one update every 24 ms.
         for n in 0..3u64 {
@@ -370,7 +371,7 @@ RUST_TESTS = r'''
         use {channel::Rings,fw::variant::InitGraph,Role::*};
         let dev=crate::device::Device;
         let init=initdata::InitData::new();
-        let mut rings=Rings::new(InitGraph::G17P).unwrap();
+        let mut rings=Rings::new(InitGraph::G17P,false).unwrap();
         rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],false,0);
         init.push(Secondary,HIST_IDLE);
         rings.drain_statistics(&dev,&init,Secondary);
@@ -390,13 +391,13 @@ RUST_TESTS = r'''
         let graph=InitGraph::G17P;
         let dev=crate::device::Device;
         let init=initdata::InitData::new();
-        let mut rings=Rings::new(graph).unwrap();
+        let mut rings=Rings::new(graph,false).unwrap();
         init.push(Secondary,HIST_IDLE);
         rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],true,1);
         init.push(Secondary,HIST_ACTIVE);
         let shared=std::sync::Arc::new(Shared { state:State(std::sync::Mutex::new(Some(Box::new(Firmware {
             rings,init:initdata::InitData::new(),powered:true,epoch:0,recovery:Recovery(false),
-        })))),dev,variant:Variant { graph },crashed:false.into() });
+        })))),dev,variant:Variant { graph, m5_commands:false },crashed:false.into() });
         let view=reports::View(shared.clone());
         struct View<'a>(&'a reports::View);
         impl std::fmt::Display for View<'_> {
@@ -414,7 +415,7 @@ RUST_TESTS = r'''
         use {channel::Rings,fw::variant::InitGraph,Role::*};
         let dev=crate::device::Device;
         let init=initdata::InitData::new();
-        let mut rings=Rings::new(InitGraph::G17P).unwrap();
+        let mut rings=Rings::new(InitGraph::G17P,false).unwrap();
         let sample=|ta,render,device|[0x13,0,0,ta,render,0xdeadbeef,device,0,0,0,0,0,0,0,0,0,0,0];
         init.push(Primary,sample(25,75,50));
         init.push(Secondary,sample(35,85,65));
@@ -438,7 +439,7 @@ RUST_TESTS = r'''
         use {channel::Rings,fw::variant::InitGraph,Role::*};
         let dev=crate::device::Device;
         let init=initdata::InitData::new();
-        let mut rings=Rings::new(InitGraph::V25G83).unwrap();
+        let mut rings=Rings::new(InitGraph::V25G83,false).unwrap();
         let words=[0x13,0,0,25,75,0,50,0,0,0,0,0,0,0,0,0,0,0];
         init.push(Primary,words);
         rings.drain_statistics(&dev,&init,Primary);
@@ -467,7 +468,7 @@ RUST_TESTS = r'''
         use {channel::Rings,fw::variant::InitGraph,Role::*};
         let dev=crate::device::Device;
         let init=initdata::InitData::new();
-        let mut rings=Rings::new(InitGraph::G17P).unwrap();
+        let mut rings=Rings::new(InitGraph::G17P,false).unwrap();
         init.push(Primary,[0x10,0x1000,0,0,0,0,4,0,0,0,0,0,0,0,0,0,0,0]);
         init.push(Secondary,[0x10,0x2500,0,0,0,0,6,0,0,0,0,0,0,0,0,0,0,0]);
         rings.drain_statistics(&dev,&init,Primary);
@@ -687,7 +688,9 @@ fn write_power(_: &super::Firmware, f:&mut kernel::fmt::Formatter<'_>)->kernel::
     header = (RUST_HEADER.replace('M5_STATISTICS_TYPES', m5_types).replace('M5_ASSERTS_GPU_POWER', m5_power)
               .replace('INITDATA_FAMILY', family))
 
-    reader_rs = 'pub(crate) struct Reader(pub(super) Arc<Shared>);\n' + item(stats_rs, 'impl Reader')
+    reader_rs = ('pub(crate) struct Reader(pub(super) Arc<Shared>, '
+                 'pub(super) Option<&\'static [(u32, [u32; 8], [u32; 8]); 14]>);\n'
+                 + item(stats_rs, 'impl Reader').replace('super::fw::m5::initdata::M5PerfState', '(u32, [u32; 8], [u32; 8])'))
     (work / 'rings.rs').write_text(header + 'mod stats { use super::{fw::variant::InitGraph, telemetry::Readout, Shared};\n'
                                   + 'use std::sync::{Arc,atomic::Ordering};\n' + reader_rs + '\n'
                                   + policy + '\n}\nmod telemetry;\nmod channel;\n' + RUST_TESTS)
