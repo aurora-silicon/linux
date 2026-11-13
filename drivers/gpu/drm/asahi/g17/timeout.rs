@@ -107,12 +107,23 @@ impl Allowance {
         now.saturating_sub(since) < u64::from(self.ms) * 1_000_000
     }
 
+    /// Whether the queue asked for an allowance longer than the default.
+    pub(crate) fn asked(&self) -> bool {
+        self.ms > DEFAULT_ALLOWANCE_MS
+    }
+
+    /// Whether a [`Self::renew`] at an expiry that finds the job `published` places it after a
+    /// wait in publication: the one poll even the default allowance renews.
+    pub(crate) fn placing_after_wait(&self, published: bool) -> bool {
+        published && self.waited && self.head_since.is_none()
+    }
+
     /// When the allowance ends (host ns), once an expiry placed the job, for an allowance
     /// longer than the default: until then the watchdog renews the job for the asking. A
     /// default allowance renews at most the poll after a wait in publication and excuses
     /// nobody ([`Head::excused`]).
     pub(crate) fn end(&self) -> Option<u64> {
-        let since = self.head_since.filter(|_| self.ms > DEFAULT_ALLOWANCE_MS)?;
+        let since = self.head_since.filter(|_| self.asked())?;
         Some(since.saturating_add(u64::from(self.ms) * 1_000_000))
     }
 }
@@ -169,6 +180,19 @@ pub(crate) fn renew_shared(published: bool, shared: bool, renewals: &mut u8) -> 
     }
     *renewals += 1;
     true
+}
+
+/// Counts a poll that an allowance renewed beyond what the default allowance renews
+/// (`beyond_default`) as one of the job's shared renewals. The two run from the same start
+/// instead of one after the other: where [`renew_shared`] applies, a job is renewed for the
+/// longer of its allowance and the thirty seconds sharing gives any job, not for their sum (58 s
+/// with the default maximum). The one poll every allowance renews after a wait in publication
+/// ([`Allowance::placing_after_wait`]) is not counted, so that asking never leaves a job fewer
+/// polls than the default.
+pub(crate) fn count_allowance_poll(beyond_default: bool, renewals: &mut u8) {
+    if beyond_default {
+        *renewals = renewals.saturating_add(1).min(SHARED_RENEWALS);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -466,6 +490,62 @@ mod tests {
         }
         assert!(!renew_shared(true, true, &mut renewals));
         assert_eq!(POLL_MS * (u32::from(renewals) + 1), 30_000);
+    }
+    /// When an ordinary job that never finishes is failed (ms), on a GPU that is `shared`
+    /// throughout or not at all, by the allowance and the shared renewals in the order the
+    /// watchdog applies them, with no execution renewal or deferral. With `waited`, the expiry
+    /// at 2 s finds it still in publication (a deferral keeps it) and the next one published.
+    fn fails_at(allowance_ms: u32, shared: bool, waited: bool) -> u32 {
+        let mut allowance = Allowance::new(allowance_ms);
+        let mut renewals = 0;
+        let mut expiry = POLL_MS;
+        if waited {
+            assert!(!allowance.renew(false, u64::from(expiry) * MS));
+            expiry += POLL_MS;
+        }
+        loop {
+            let placing = allowance.placing_after_wait(true);
+            if allowance.renew(true, u64::from(expiry) * MS) {
+                count_allowance_poll(allowance.asked() && !placing, &mut renewals);
+            } else if !renew_shared(true, shared, &mut renewals) {
+                return expiry;
+            }
+            expiry += POLL_MS;
+            assert!(expiry < 1_000_000);
+        }
+    }
+    #[test]
+    fn an_allowance_and_the_shared_renewals_overlap() {
+        // Under the default allowance: one poll alone, thirty seconds on a shared GPU.
+        assert_eq!(fails_at(DEFAULT_ALLOWANCE_MS, false, false), 2_000);
+        assert_eq!(fails_at(DEFAULT_ALLOWANCE_MS, true, false), 30_000);
+        // The longest allowance is the limit with or without sharing: not 30 s + 28 s.
+        assert_eq!(fails_at(30_000, false, false), 30_000);
+        assert_eq!(fails_at(30_000, true, false), 30_000);
+        // A shorter one never leaves a job worse off than the default on a shared GPU.
+        assert_eq!(fails_at(6_000, false, false), 6_000);
+        assert_eq!(fails_at(6_000, true, false), 30_000);
+        assert_eq!(fails_at(20_000, true, false), 30_000);
+        assert_eq!(fails_at(2_001, true, false), 30_000);
+        // Above thirty seconds (a raised maximum) the allowance is the limit.
+        assert_eq!(fails_at(40_000, true, false), 40_000);
+        // After a wait in publication every allowance is placed at the first published expiry
+        // (4 s), and the poll renewed there is not counted: still never fewer than the default.
+        assert_eq!(fails_at(DEFAULT_ALLOWANCE_MS, false, true), 6_000);
+        assert_eq!(fails_at(DEFAULT_ALLOWANCE_MS, true, true), 34_000);
+        for ms in [2_001, 6_000, 20_000, 30_000] {
+            assert_eq!(fails_at(ms, true, true), 34_000);
+        }
+        assert_eq!(fails_at(6_000, false, true), 10_000);
+        assert_eq!(fails_at(30_000, false, true), 34_000);
+        // Nothing is counted for a poll the default renews too.
+        let mut renewals = 0;
+        count_allowance_poll(false, &mut renewals);
+        assert_eq!(renewals, 0);
+        for _ in 0..40 {
+            count_allowance_poll(true, &mut renewals);
+        }
+        assert_eq!(renewals, SHARED_RENEWALS);
     }
     #[test]
     fn a_stopped_gpu_or_unpublished_job_keeps_the_deadline() {

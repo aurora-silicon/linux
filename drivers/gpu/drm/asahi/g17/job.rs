@@ -427,13 +427,17 @@ impl<B: Backend> sched::JobImpl for Job<B> {
         if finished || job.packet.completion.take_replay_timeout() {
             return true;
         }
-        // Within the allowance its queue asked for. Past it, the deferrals below still apply.
+        // Within the allowance its queue asked for. Past it, the deferrals below still apply;
+        // the shared renewals run alongside an allowance rather than after it.
+        let placing = job.allowance.placing_after_wait(job.packet.is_published());
         let within = job.allowance.renew(job.packet.is_published(), super::now_ns());
         // Other VMs' watchdogs read the end to excuse work waiting behind this one.
         if let Some(end) = job.allowance.end() {
             job.packet.allowance_end.store(end, Ordering::Relaxed);
         }
         if within {
+            super::timeout::count_allowance_poll(job.allowance.asked() && !placing,
+                &mut job.shared_renewals);
             return true;
         }
         if super::timeout::renew_execution(

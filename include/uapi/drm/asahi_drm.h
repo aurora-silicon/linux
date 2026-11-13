@@ -1147,7 +1147,11 @@ struct drm_asahi_queue_create {
 	 * - Once the allowance has passed, the deferrals the watchdog grants
 	 *   any command still apply, as they do by default: a command it takes
 	 *   to be waiting behind other clients' work, or one of a kind it
-	 *   gives extra polls, runs on until those are used up as well.
+	 *   gives extra polls, runs on until those are used up as well. The
+	 *   polls it renews any command for while the GPU keeps completing
+	 *   other work (up to 30 s in all, on the GPUs where it does that)
+	 *   run alongside the allowance, not after it: a command is renewed
+	 *   for the longer of the two.
 	 *
 	 * The allowance is per command, and nothing bounds the sum: a queue
 	 * that is kept full of long commands occupies the GPU for as long as
