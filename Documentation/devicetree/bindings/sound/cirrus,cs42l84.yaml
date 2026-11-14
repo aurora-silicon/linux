@@ -32,6 +32,13 @@ properties:
   '#sound-dai-cells':
     const: 0
 
+  apple,init-writes:
+    description:
+      Register writes the machine's own driver makes once the device ID is
+      verified, as (register, value) pairs applied in order.
+    $ref: /schemas/types.yaml#/definitions/uint16-array
+    maxItems: 64
+
 required:
   - compatible
   - reg
