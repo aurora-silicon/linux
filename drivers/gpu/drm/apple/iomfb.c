@@ -42,6 +42,7 @@
 #include "iomfb_internal.h"
 #include "iomfb_m4.h"
 #include "parser.h"
+#include "iomfb_v27_3_swap.h"
 #include "trace.h"
 
 struct dcp_identity_trace {
@@ -949,6 +950,7 @@ static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 			     u32 out_len, void *data, dcp_callback_t cb, void *cookie)
 {
 	struct dcp_method_entry resolved = *call;
+	u8 *swap_27_3 = NULL;
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_KUNIT_TEST)
 	/* A KUnit test answers for the firmware. */
@@ -964,6 +966,17 @@ static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G &&
 	    call->tag_h17g[0])
 		memcpy(resolved.tag, call->tag_h17g, sizeof(resolved.tag));
+	if (dcp->swap_v27_3 && in_len == DCP_V27_REQ_SIZE &&
+	    !memcmp(call->tag, dcp->v27_methods[dcpep_swap_submit].tag, sizeof(call->tag))) {
+		swap_27_3 = kmalloc(DCP_V27_3_REQ_SIZE, GFP_ATOMIC);
+		if (!swap_27_3) {
+			WRITE_ONCE(dcp->crashed, true);
+			return;
+		}
+		dcp_v27_3_swap_req(swap_27_3, data);
+		data = swap_27_3;
+		in_len = DCP_V27_3_REQ_SIZE;
+	}
 	call = &resolved;
 
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
@@ -990,6 +1003,7 @@ static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 			       DCP_PACKET_ALIGNMENT))) {
 		dev_err(dcp->dev, "invalid IOMFB command envelope\n");
 		WRITE_ONCE(dcp->crashed, true);
+		kfree(swap_27_3);
 		return;
 	}
 	depth = dcp_push_depth(&ch->depth);
@@ -1003,6 +1017,7 @@ static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 
 	if (in_len > 0)
 		memcpy(out_data, data, in_len);
+	kfree(swap_27_3);
 	/* An unwritten status must not look like a successful response. */
 	if (out_len)
 		memset(out_data + in_len, 0xff, out_len);
@@ -1764,6 +1779,9 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	}
 
 	tag = dcp_parse_tag(hdr->tag);
+	/* 27.3 reports the intent-gated swap completion (27.0 D596, in 20 out 0) as D590 */
+	if (dcp->swap_v27_3 && tag == 590 && hdr->in_len == 0x14 && !hdr->out_len)
+		tag = 596;
 
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
 	    (!iomfb_check_callback_v26_6_desktop(tag, hdr->in_len, hdr->out_len) ||

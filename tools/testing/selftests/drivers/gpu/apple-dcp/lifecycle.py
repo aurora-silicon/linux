@@ -2065,7 +2065,7 @@ struct apple_dcp {
     struct { int iomfb_method_profile; } hw;
     struct device *dev;
     int fw_compat;
-    bool crashed;
+    bool crashed, swap_v27_3;
     bool (**cb_handlers)(struct apple_dcp *, int, void *, void *);
     unsigned long unknown_callbacks[16];
     int start_done;
