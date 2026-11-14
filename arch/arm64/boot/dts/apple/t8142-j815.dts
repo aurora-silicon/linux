@@ -20,6 +20,7 @@
 /dts-v1/;
 
 #include "t8142.dtsi"
+#include <dt-bindings/thermal/thermal.h>
 
 / {
 	compatible = "apple,j815", "apple,t8142", "apple,arm-platform";
@@ -44,63 +45,139 @@
 			status = "disabled";
 		};
 	};
+
+	/*
+	 * The J815 has no fan. One zone on the hottest SoC die reading (the 26
+	 * apple,soc-die-keys below) slows the CPU clusters as the die heats,
+	 * with the power allocator and the clusters' energy model.
+	 *
+	 * Sustainable power is an estimate to be tuned by a soak: the J815
+	 * ADT's clpc pkg-sustainable-power-target is 12.5 W (0xc8000, 16.16),
+	 * the J700's 5.5 W, where macOS holds the J700 CPUs at 4.1-4.3 W
+	 * (about 76%, the J700 zones' 4200). The same share of 12.5 W gives
+	 * the 9000 mW here. The control point is held below the 105 C the
+	 * fanless J700 runs at, until a J815 soak under macOS gives its own
+	 * value; the PMP and SMC still enforce the hardware limits.
+	 */
+	thermal-zones {
+		soc-die-thermal {
+			polling-delay-passive = <500>;
+			polling-delay = <1000>;
+			thermal-sensors = <&smc_hwmon 1000>;
+			sustainable-power = <9000>;
+
+			trips {
+				soc_die_alert: trip-alert {
+					temperature = <60000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				soc_die_control: trip-control {
+					temperature = <100000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <115000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map-p {
+					trip = <&soc_die_control>;
+					cooling-device =
+						<&cpu6 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu7 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu8 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu9 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <1024>;
+				};
+
+				map-e {
+					trip = <&soc_die_control>;
+					cooling-device =
+						<&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu4 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu5 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <3072>;
+				};
+			};
+		};
+	};
 };
 
 &cpu0 {
+	#cooling-cells = <2>;
 	operating-points-v2 = <&ecluster_opp>;
 	performance-domains = <&cpufreq_e>;
 	status = "okay";
 };
 
 &cpu1 {
+	#cooling-cells = <2>;
 	operating-points-v2 = <&ecluster_opp>;
 	performance-domains = <&cpufreq_e>;
 	status = "okay";
 };
 
 &cpu2 {
+	#cooling-cells = <2>;
 	operating-points-v2 = <&ecluster_opp>;
 	performance-domains = <&cpufreq_e>;
 	status = "okay";
 };
 
 &cpu3 {
+	#cooling-cells = <2>;
 	operating-points-v2 = <&ecluster_opp>;
 	performance-domains = <&cpufreq_e>;
 	status = "okay";
 };
 
 &cpu4 {
+	#cooling-cells = <2>;
 	operating-points-v2 = <&ecluster_opp>;
 	performance-domains = <&cpufreq_e>;
 	status = "okay";
 };
 
 &cpu5 {
+	#cooling-cells = <2>;
 	operating-points-v2 = <&ecluster_opp>;
 	performance-domains = <&cpufreq_e>;
 	status = "okay";
 };
 
 &cpu6 {
+	#cooling-cells = <2>;
 	operating-points-v2 = <&pcluster_opp>;
 	performance-domains = <&cpufreq_p>;
 	status = "okay";
 };
 
 &cpu7 {
+	#cooling-cells = <2>;
 	operating-points-v2 = <&pcluster_opp>;
 	performance-domains = <&cpufreq_p>;
 	status = "okay";
 };
 
 &cpu8 {
+	#cooling-cells = <2>;
 	operating-points-v2 = <&pcluster_opp>;
 	performance-domains = <&cpufreq_p>;
 	status = "okay";
 };
 
 &cpu9 {
+	#cooling-cells = <2>;
 	operating-points-v2 = <&pcluster_opp>;
 	performance-domains = <&cpufreq_p>;
 	status = "okay";
@@ -226,7 +303,9 @@
  * thermal zone.
  */
 &smc {
-	hwmon {
+	smc_hwmon: hwmon {
+		/* Sensor 1000 is the hottest of the die keys (soc-die-thermal). */
+		#thermal-sensor-cells = <1>;
 		apple,soc-die-keys = "Te04", "Te08", "Te0C", "Te0R",
 				     "Tp00", "Tp04", "Tp0C", "Tp0G", "Tp0O",
 				     "Tp0R", "Tp0X", "Tp0a", "Tp0p", "Tp0u",
