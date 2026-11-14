@@ -3,8 +3,8 @@
 //! Context-local work-state identities. The low six bits address a node;
 //! the complete sequence distinguishes its owner until exact retirement.
 
-use core::sync::atomic::{AtomicU32, Ordering};
-use kernel::prelude::*;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use kernel::{prelude::*, sync::Arc};
 
 pub(super) const FREE: u32 = u32::MAX;
 pub(super) const STATE_COUNT: usize = 63;
@@ -27,11 +27,46 @@ pub(super) const fn may_take(free: usize, held: u32) -> bool {
     free > 1 || (free == 1 && held == 0)
 }
 
+/// Work-state words of the contexts sharing one execution context. Commands name that context
+/// with a word, so the sharers draw their words from one sequence and no two of their live nodes
+/// have the same index (a word's low six bits): an identity and word pair stays unique, as it is
+/// for an unshared context.
+pub(crate) struct SharedStates {
+    next: AtomicU32,
+    /// Indices of the sharers' live nodes.
+    claims: AtomicU64,
+    /// The sharers' live words by index, for [`WorkStates::older_live`].
+    words: [AtomicU32; 64],
+}
+impl SharedStates {
+    pub(crate) fn new() -> Result<Arc<Self>> {
+        Ok(Arc::new(
+            Self {
+                next: AtomicU32::new(0x40),
+                claims: AtomicU64::new(0),
+                words: [const { AtomicU32::new(FREE) }; 64],
+            },
+            GFP_KERNEL,
+        )?)
+    }
+}
+
+/// The outcome of claiming a node index among the sharers.
+enum Claim {
+    Taken,
+    /// Another sharer holds the index.
+    Busy,
+    /// [`may_take`] refuses at the claim.
+    Refused,
+}
+
 pub(super) struct WorkStates {
     next: AtomicU32,
     live: [AtomicU32; 64],
     /// Nodes taken by each engine's admissions and not yet released.
     held: [AtomicU32; ENGINES],
+    /// Set when the execution context is shared with other contexts.
+    shared: Option<Arc<SharedStates>>,
 }
 impl WorkStates {
     pub(super) const fn new() -> Self {
@@ -41,6 +76,38 @@ impl WorkStates {
             next: AtomicU32::new(0x40),
             live: [const { AtomicU32::new(FREE) }; 64],
             held: [const { AtomicU32::new(0) }; ENGINES],
+            shared: None,
+        }
+    }
+    /// Work states of a context whose execution context `shared` describes.
+    pub(super) fn shared(shared: Arc<SharedStates>) -> Self {
+        Self {
+            shared: Some(shared),
+            ..Self::new()
+        }
+    }
+    /// Claims `index` among the sharers for an engine holding `held` nodes; always taken for an
+    /// unshared context. Sharers allocate concurrently, so [`may_take`] is decided again on the
+    /// claims as they were at this claim: two sharers holding nodes never both take the last
+    /// free ones.
+    fn claim(&self, index: usize, held: u32) -> Claim {
+        let Some(shared) = &self.shared else {
+            return Claim::Taken;
+        };
+        let bit = 1u64 << index;
+        let before = shared.claims.fetch_or(bit, Ordering::AcqRel);
+        if before & bit != 0 {
+            return Claim::Busy;
+        }
+        if !may_take(STATE_COUNT.saturating_sub(before.count_ones() as usize), held) {
+            shared.claims.fetch_and(!bit, Ordering::AcqRel);
+            return Claim::Refused;
+        }
+        Claim::Taken
+    }
+    fn unclaim(&self, index: usize) {
+        if let Some(shared) = &self.shared {
+            shared.claims.fetch_and(!(1u64 << index), Ordering::AcqRel);
         }
     }
     /// Takes a node for `engine`, or none when [`may_take`] refuses. Callers serialize
@@ -50,17 +117,29 @@ impl WorkStates {
         if !may_take(STATE_COUNT.saturating_sub(self.used()), held.load(Ordering::Acquire)) {
             return None;
         }
+        let next = self.shared.as_ref().map_or(&self.next, |shared| &shared.next);
         for _ in 0..64 {
-            let word = self.next.fetch_add(1, Ordering::Relaxed);
+            let word = next.fetch_add(1, Ordering::Relaxed);
             let index = (word & 63) as usize;
-            if index != STATE_COUNT
-                && self.live[index]
-                    .compare_exchange(FREE, word, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
+            if index == STATE_COUNT {
+                continue;
+            }
+            match self.claim(index, held.load(Ordering::Acquire)) {
+                Claim::Taken => {}
+                Claim::Busy => continue,
+                Claim::Refused => return None,
+            }
+            if self.live[index]
+                .compare_exchange(FREE, word, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
             {
+                if let Some(shared) = &self.shared {
+                    shared.words[index].store(word, Ordering::Release);
+                }
                 held.fetch_add(1, Ordering::AcqRel);
                 return Some(word);
             }
+            self.unclaim(index);
         }
         None
     }
@@ -71,6 +150,10 @@ impl WorkStates {
                 .compare_exchange(word, FREE, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok();
         if released {
+            if let Some(shared) = &self.shared {
+                shared.words[index].store(FREE, Ordering::Release);
+            }
+            self.unclaim(index);
             if let Some(held) = self.held.get(engine) {
                 held.fetch_sub(1, Ordering::AcqRel);
             }
@@ -256,16 +339,22 @@ impl WorkStates {
     /// The oldest node in use that the firmware lists ahead of `word`: a live word older than
     /// it by the signed 32-bit difference the firmware sorts by. Its ioctl was submitted
     /// earlier ([`Order`]), and until that node drains the firmware withholds every stamp of
-    /// `word`'s node behind it.
+    /// `word`'s node behind it. With a shared execution context, the nodes of every sharer
+    /// count: their words come from one sequence and name the one context.
     pub(super) fn older_live(&self, word: u32) -> Option<u32> {
-        self.live
+        let words = self.shared.as_ref().map_or(&self.live, |shared| &shared.words);
+        words
             .iter()
             .map(|live| live.load(Ordering::Acquire))
             .filter(|&live| live != FREE && (live.wrapping_sub(word) as i32) < 0)
             .min_by_key(|&live| live.wrapping_sub(word) as i32)
     }
 
+    /// Nodes in use, by every sharer of the execution context.
     pub(super) fn used(&self) -> usize {
+        if let Some(shared) = &self.shared {
+            return shared.claims.load(Ordering::Acquire).count_ones() as usize;
+        }
         self.live.iter().filter(|word| word.load(Ordering::Acquire) != FREE).count()
     }
 }
@@ -312,6 +401,63 @@ mod tests {
         assert!(states.allocate(0).is_none());
         assert!(states.release(compute, 1));
         assert!(states.allocate(1).is_some());
+    }
+
+    #[test]
+    fn sharers_never_hold_one_index() {
+        let shared = SharedStates::new().unwrap();
+        let sharers = [WorkStates::shared(shared.clone()), WorkStates::shared(shared)];
+        let mut words: [KVec<u32>; 2] = [KVec::new(), KVec::new()];
+        let mut taken = 0u64;
+        for _ in 0..STATE_COUNT {
+            for (states, own) in sharers.iter().zip(words.iter_mut()) {
+                if let Some(word) = states.allocate(1) {
+                    let bit = 1u64 << (word & 63);
+                    assert_eq!(taken & bit, 0);
+                    taken |= bit;
+                    own.push(word, GFP_KERNEL).unwrap();
+                }
+            }
+        }
+        // Both hold nodes, so the last free node stays (may_take) and is counted for both.
+        assert_eq!(taken.count_ones() as usize, STATE_COUNT - 1);
+        assert_eq!(sharers[0].used(), STATE_COUNT - 1);
+        assert_eq!(sharers[1].used(), STATE_COUNT - 1);
+        // A node is returned only by its owner, and then either sharer may take its index.
+        let word = words[0].pop().unwrap();
+        assert!(!sharers[1].release(word, 1));
+        assert!(sharers[0].release(word, 1));
+        let again = sharers[1].allocate(1).unwrap();
+        assert_eq!(taken & (1u64 << (again & 63)) & !(1u64 << (word & 63)), 0);
+    }
+
+    #[test]
+    fn sharers_see_each_others_older_nodes() {
+        let shared = SharedStates::new().unwrap();
+        let sharers = [WorkStates::shared(shared.clone()), WorkStates::shared(shared)];
+        let first = sharers[0].allocate(1).unwrap();
+        let second = sharers[1].allocate(1).unwrap();
+        assert_eq!(sharers[1].older_live(second), Some(first));
+        assert_eq!(sharers[0].older_live(first), None);
+        assert!(sharers[0].release(first, 1));
+        assert_eq!(sharers[1].older_live(second), None);
+    }
+
+    #[test]
+    fn a_sharer_holding_nodes_leaves_the_last_free_one() {
+        let shared = SharedStates::new().unwrap();
+        let sharers = [WorkStates::shared(shared.clone()), WorkStates::shared(shared)];
+        // Sharer 0 takes every node but the last two, with its render engine.
+        for _ in 0..STATE_COUNT - 2 {
+            assert!(sharers[0].allocate(0).is_some());
+        }
+        // Sharer 1's compute engine holds none: it takes one of the two.
+        assert!(sharers[1].allocate(1).is_some());
+        // Each now holds a node, so neither takes the last one.
+        assert!(sharers[0].allocate(0).is_none());
+        assert!(sharers[1].allocate(1).is_none());
+        // An engine holding none still may.
+        assert!(sharers[1].allocate(0).is_some());
     }
 
     #[test]

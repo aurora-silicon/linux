@@ -88,7 +88,7 @@ pub(crate) struct RenderAddresses {
 pub(crate) struct PublicationLease {
     pub(crate) free_list_generation: u64,
     pub(crate) buffer_token: u64,
-    /// Hardware context for which the M5 token was selected.
+    /// Owner (`Context::buffer_owner`) for which the M5 token was selected.
     pub(crate) buffer_context: Option<u32>,
 }
 
@@ -781,7 +781,7 @@ impl Pair {
             {
                 self.identity_update = true;
             }
-            if lease.buffer_context.is_some_and(|bound| bound != context_id) {
+            if lease.buffer_context.is_some_and(|bound| bound != packet.context.buffer_owner()) {
                 return Err(EBUSY);
             }
         }
