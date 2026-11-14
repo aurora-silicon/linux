@@ -159,6 +159,34 @@ static const struct ave_variant ave_t6050 = {
 };
 
 /*
+ * The M5 (T8142) with the macOS 27.0 stub runs the 26A428 build of the
+ * firmware compiled for its chip (AppleAVE2FW_H17G, 9013.45.1, the version
+ * T6050 runs): TEXT 0x154000 and DATA 0x12c000, TEXT CRC 8a3784bd.
+ *
+ * The chip identity comes from AppleAVE2's soc-id table (ADT ave soc-id
+ * "t8142"): device 27, generation 16. The 26A428 firmware carries the same
+ * device table, and on T6050 (device 28 in both) the traced boot
+ * configuration and handshake both name that number. Generation 16 shares
+ * T6050's SVE register block, so the idle word at mailbox +0x118 is cleared
+ * before the start as there. The coprocessor is the A18 Pro's.
+ */
+static const struct ave_variant ave_t8142 = {
+	.regs = &ave_coproc_v40,
+	.fw_text_size = 0x154000,
+	.fw_data_size = 0x12c000,
+	.boot_device_id = 27,
+	.boot_arg_value = AVE_COPROC_BOOT_ARG_VALUE,
+	.timebase_multiplier = 1,
+	.vcbar_mask = U64_MAX,
+	.vcbar_flags = AVE_COPROC_VCBAR_VALID,
+	.device_type = 27,
+	.lfs_ref_scale = 2,
+	.text_crc = AVE_FW_TEXT_CRC_T8142_26A428,
+	.mbox_idle = 0x118,
+	.boot_qualified = true,
+};
+
+/*
  * debugfs: apple-ave/last_start_{h264,hevc} hold the last Start built and
  * last_process0_{h264,hevc} the first Process of the last session, so the
  * generated commands can be compared with reference captures.
@@ -538,6 +566,7 @@ static int ave_runtime_resume(struct device *dev)
 static int ave_suspend(struct device *dev)
 {
 	struct ave_dev *ave = dev_get_drvdata(dev);
+	bool hung;
 	int ret;
 
 	/* Let a running job finish; the m2m core holds back new ones. */
@@ -550,8 +579,13 @@ static int ave_suspend(struct device *dev)
 	 */
 	mutex_lock(&ave->hw_lock);
 	ave_v4l2_suspend(ave);
+	hung = ave->fw_state == AVE_FW_BROKEN;
 	ret = ave_fw_shutdown(ave);
-	if (!ret && ave->layout && ave->layout->abi->transport->scratch_halt)
+	/*
+	 * A hung 6070 firmware is stopped without a confirmed Halt: its boot
+	 * memory stays mapped until the power cycle, like a session's.
+	 */
+	if (!ret && !hung && ave->layout && ave->layout->abi->transport->scratch_halt)
 		ave_fw_release_boot(ave);
 	mutex_unlock(&ave->hw_lock);
 	if (ret) {
@@ -587,6 +621,7 @@ static const struct of_device_id ave_of_match[] = {
 	{ .compatible = "apple,t6050-ave", .data = &ave_t6050 },
 	{ .compatible = "apple,t8112-ave", .data = &ave_t8112 },
 	{ .compatible = "apple,t8140-ave", .data = &ave_t8140 },
+	{ .compatible = "apple,t8142-ave", .data = &ave_t8142 },
 	{}
 };
 MODULE_DEVICE_TABLE(of, ave_of_match);

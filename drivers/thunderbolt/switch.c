@@ -3751,6 +3751,38 @@ void tb_switch_suspend(struct tb_switch *sw, bool runtime)
 		tb_lc_set_sleep(sw);
 }
 
+/* The CIO host uses its own enter-sleep command after its children sleep. */
+int tb_switch_suspend_cio(struct tb_switch *sw)
+{
+	struct tb_port *port;
+	unsigned int wake = 0;
+	int ret;
+
+	/* It returns the CL states it disabled. */
+	ret = tb_switch_clx_disable(sw);
+	if (ret < 0)
+		return ret;
+	ret = tb_plug_events_active(sw, false);
+	if (ret)
+		return ret;
+	tb_switch_for_each_port(sw, port) {
+		if (port->xdomain)
+			return -EOPNOTSUPP;
+		if (!tb_port_has_remote(port))
+			continue;
+		ret = tb_switch_suspend_cio(port->remote->sw);
+		if (ret)
+			return ret;
+	}
+	if (device_may_wakeup(&sw->dev))
+		wake = TB_WAKE_ON_CONNECT | TB_WAKE_ON_DISCONNECT |
+		       TB_WAKE_ON_USB4 | TB_WAKE_ON_USB3 | TB_WAKE_ON_PCIE;
+	ret = tb_switch_set_wake(sw, wake, false);
+	if (ret || !tb_route(sw))
+		return ret;
+	return tb_switch_is_usb4(sw) ? usb4_switch_set_sleep(sw) : tb_lc_set_sleep(sw);
+}
+
 /**
  * tb_switch_query_dp_resource() - Query availability of DP resource
  * @sw: Switch whose DP resource is queried

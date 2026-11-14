@@ -359,6 +359,12 @@ struct iomfb_property {
 	u32 value;
 } __packed;
 
+/*
+ * The two IOMFB parameters macOS sends to an external display after each mode
+ * set (see dcp_external_hdr_hints()).  Split out so it can be unit tested.
+ */
+void iomfb_external_hdr_hint_values(bool pq, struct iomfb_property out[2]);
+
 struct iomfb_get_color_remap_mode_req {
 	u32 mode;
 	u8 mode_null;

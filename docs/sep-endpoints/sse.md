@@ -13,7 +13,7 @@ distinguishes the Secure Element from the Secure Enclave and describes protected
 authorization between them on iPhone. It does not establish the Mac sse wire
 protocol, available hardware, or payment functionality on Linux.
 
-Linux has no sse client at the [source pin](README.md). Full endpoint parity
+Linux checks the endpoint at boot and sends it nothing (`drivers/soc/apple/sse.rs`, `diag/sse`); events the service announces are counted in `diag/sse_events`. Full endpoint parity
 requires resolving it. Feature parity is conditional on actual Mac hardware and
 service availability; neither NFC transactions nor a Wallet feature can be
 declared supported from this endpoint's presence alone. It must not be confused

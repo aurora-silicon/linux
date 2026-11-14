@@ -176,10 +176,15 @@ impl crate::g17::Firmware {
         Ok(())
     }
 
+    /// Settles every pair the firmware drained (`Pair::needs_drain`). A pair whose settlement
+    /// fails is retried with a doubling backoff and, after `DRAIN_RETRY_LIMIT` failures, left
+    /// out of service and re-checked rarely: its clients already failed with the quarantine.
+    /// Each episode is logged at its first failure and when the pair is left out of service.
+    /// Returns the delay to the next retry that waits for its backoff.
     pub(in crate::g17) fn reclaim_drained_renders(
         &mut self,
         deferred: &mut DeferredBatch,
-    ) -> Result {
+    ) -> Result<Option<u64>> {
         if self.recovery.pending()
             || self
                 .primary
@@ -188,27 +193,83 @@ impl crate::g17::Firmware {
                 .crashed
                 .load(core::sync::atomic::Ordering::Acquire)
         {
-            return Ok(());
+            return Ok(None);
         }
+        let now = crate::g17::now_ns();
         let mut serviced = false;
+        let mut next: Option<u64> = None;
         for slot in 1..self.queues.render.entries.len() {
-            if !self.queues.render.entries[slot]
+            let Some(pair) = self.queues.render.entries[slot]
                 .as_ref()
                 .and_then(|entry| entry.pair.as_ref())
-                .is_some_and(|pair| pair.needs_drain())
-            {
+                .filter(|pair| pair.needs_drain())
+            else {
+                continue;
+            };
+            if !pair.drain_due(now) {
+                if let Some(delay) = pair.drain_delay(now) {
+                    next = Some(next.map_or(delay, |next| next.min(delay)));
+                }
                 continue;
             }
-            if let Err(error) = self.drain_render_slot(slot, &mut serviced, deferred) {
-                dev_warn!(
-                    self.primary.state.shared.dev.as_ref(),
-                    "Could not settle drained render pair {}: {:?}\n",
-                    slot,
-                    error
-                );
+            let failures = pair.drain_failures();
+            match self.drain_render_slot(slot, &mut serviced, deferred) {
+                Ok(()) => {
+                    let settled = self.queues.render.entries[slot]
+                        .as_ref()
+                        .and_then(|entry| entry.pair.as_ref())
+                        .is_none_or(|pair| !pair.needs_drain());
+                    if failures != 0 && settled {
+                        SETTLE_RECOVERED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        dev_info!(
+                            self.primary.state.shared.dev.as_ref(),
+                            "G17: render pair {} settled after {} failed attempts\n",
+                            slot,
+                            failures
+                        );
+                    }
+                }
+                Err((step, error)) => {
+                    SETTLE_FAILURES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    let Some(pair) = self.queues.render.entries[slot]
+                        .as_mut()
+                        .and_then(|entry| entry.pair.as_mut())
+                    else {
+                        continue;
+                    };
+                    let failures = pair.note_drain_failure(now);
+                    if let Some(delay) = pair.drain_delay(now) {
+                        next = Some(next.map_or(delay, |next| next.min(delay)));
+                    }
+                    if failures == 1 {
+                        dev_warn!(
+                            self.primary.state.shared.dev.as_ref(),
+                            "G17: could not settle drained render pair {} ({}: {:?}); retrying with backoff\n",
+                            slot,
+                            step,
+                            error
+                        );
+                    } else if failures == crate::g17::queue::render::DRAIN_RETRY_LIMIT {
+                        SETTLE_PARKED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        dev_err!(
+                            self.primary.state.shared.dev.as_ref(),
+                            "G17: drained render pair {} still not settled after {} attempts ({}: {:?}); it stays out of service\n",
+                            slot,
+                            failures,
+                            step,
+                            error
+                        );
+                    } else {
+                        continue;
+                    }
+                    let _ = self.with_render(slot, |pair, host| {
+                        pair.report_drain(host);
+                        Ok(())
+                    });
+                }
             }
         }
-        Ok(())
+        Ok(next)
     }
 
     fn drain_render_slot(
@@ -216,12 +277,17 @@ impl crate::g17::Firmware {
         slot: usize,
         serviced: &mut bool,
         deferred: &mut DeferredBatch,
-    ) -> Result {
-        if !self.with_render(slot, |pair, host| pair.firmware_drained(host))? {
+    ) -> core::result::Result<(), (&'static str, Error)> {
+        let at = |step: &'static str| move |error: Error| (step, error);
+        if !self
+            .with_render(slot, |pair, host| pair.firmware_drained(host))
+            .map_err(at("drain proof"))?
+        {
             return Ok(());
         }
         if !*serviced {
-            self.service_runtime_events(deferred)?;
+            self.service_runtime_events(deferred)
+                .map_err(at("event service"))?;
             *serviced = true;
         }
         if self.recovery.pending()
@@ -235,13 +301,15 @@ impl crate::g17::Firmware {
             return Ok(());
         }
         loop {
-            let accounted = self.with_render(slot, |pair, host| pair.account_drained(host))?;
+            let accounted = self
+                .with_render(slot, |pair, host| pair.account_drained(host))
+                .map_err(at("accounting"))?;
             if !accounted {
                 break;
             }
             match self.release_render_lists() {
                 Err(error) if error == EAGAIN => {}
-                result => result?,
+                result => result.map_err(at("free-list release"))?,
             }
         }
         if self.recovery.pending()
@@ -256,7 +324,20 @@ impl crate::g17::Firmware {
         }
         self.with_render(slot, |pair, host| {
             pair.release_witnessed(host, &mut |event| deferred.push(event))
-        })?;
-        self.queues.render.collect_retired(slot)
+        })
+        .map_err(at("release"))?;
+        self.queues
+            .render
+            .collect_retired(slot)
+            .map_err(at("binding collection"))
     }
 }
+
+/// Device-lifetime counts of drained-pair settlement failures, of pairs that settled after
+/// failing, and of pairs left out of service; diagnostics only (debugfs `capacity`).
+pub(in crate::g17) static SETTLE_FAILURES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub(in crate::g17) static SETTLE_RECOVERED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub(in crate::g17) static SETTLE_PARKED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);

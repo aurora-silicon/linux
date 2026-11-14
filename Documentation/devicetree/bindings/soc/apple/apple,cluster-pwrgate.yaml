@@ -19,6 +19,7 @@ properties:
   compatible:
     items:
       - enum:
+          - apple,t8132-cluster-pwrgate
           - apple,t8140-cluster-pwrgate
       - const: apple,cluster-pwrgate
 

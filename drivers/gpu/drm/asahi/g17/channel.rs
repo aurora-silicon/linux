@@ -92,11 +92,16 @@ pub(crate) struct Rings {
 }
 
 impl Rings {
-    pub(crate) fn new(graph: super::fw::variant::InitGraph) -> Result<Self> {
+    /// `m5`: the firmware runs the M5 protocol, whose statistics records are decoded too.
+    pub(crate) fn new(graph: super::fw::variant::InitGraph, m5: bool) -> Result<Self> {
         Ok(Self {
             quarantined: [[false; 2]; 2],
             reports: super::reports::Reports::new()?,
-            telemetry: super::telemetry::Telemetry::default(),
+            telemetry: if m5 {
+                super::telemetry::Telemetry::m5()
+            } else {
+                super::telemetry::Telemetry::default()
+            },
             max_age_ns: super::stats::max_age_ns(graph),
             suspended: false,
             discard_statistics: [false; 2],
