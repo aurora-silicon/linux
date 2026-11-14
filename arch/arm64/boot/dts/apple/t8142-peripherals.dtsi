@@ -149,6 +149,73 @@
 		status = "disabled";
 	};
 
+	/*
+	 * The Neural Engine's three DARTs (ADT dart-ane, one interrupt for all):
+	 * revision 0x204, 16 streams; SIDs 1-7 are the exclave's and 10/13
+	 * bypass. The cold profile leaves every inherited stream alone and
+	 * gives the kernel only SID0.
+	 */
+	ane_dart0: iommu@421800000 {
+		compatible = "apple,t8142-ane-dart", "apple,t8142-dart",
+			     "apple,t8110-dart";
+		reg = <0x4 0x21800000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupts = <AIC_IRQ 752 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_ane_sys>;
+		/* The firmware DVAs reach 0x100_xxxx_xxxx. */
+		apple,dma-range = <0x0 0x0 0x400 0x0>;
+		status = "disabled";
+	};
+
+	ane_dart1: iommu@421820000 {
+		compatible = "apple,t8142-ane-dart", "apple,t8142-dart",
+			     "apple,t8110-dart";
+		reg = <0x4 0x21820000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupts = <AIC_IRQ 752 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_ane_sys>;
+		apple,dma-range = <0x0 0x0 0x400 0x0>;
+		status = "disabled";
+	};
+
+	ane_dart2: iommu@421840000 {
+		compatible = "apple,t8142-ane-dart", "apple,t8142-dart",
+			     "apple,t8110-dart";
+		reg = <0x4 0x21840000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupts = <AIC_IRQ 752 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_ane_sys>;
+		apple,dma-range = <0x0 0x0 0x400 0x0>;
+		status = "disabled";
+	};
+
+	/*
+	 * The Neural Engine (ADT /arm-io/ane, "ane,t8132exclave", ane-type 0x210):
+	 * the H17 engine, exclave-assigned, with firmware that iBoot preloads; the
+	 * boot loader hands the preload over as firmware-text and firmware-data.
+	 * PWGATE is the ADT's reg[2] (PMGR +0x24000) + 0x3640, measured under
+	 * macOS 27.2.1.
+	 */
+	ane: ane@420000000 {
+		compatible = "apple,t8142-ane";
+		reg = <0x4 0x20000000 0x0 0x2000000>,
+		      <0x3 0x80700000 0x0 0x18000>,
+		      <0x3 0x80727640 0x0 0x34>;
+		reg-names = "engine", "pmgr", "pwgate";
+		interrupts = <AIC_IRQ 751 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 764 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&ane_dart0 0>, <&ane_dart1 0>, <&ane_dart2 0>;
+		power-domains = <&ps_ane_sys>;
+		apple,firmware-preloaded;
+		apple,firmware-iovas = /bits/ 64 <0x10000000000 0x100000c0000>;
+		/* Inclusive SID0 identity windows from the ADT's dart-ane dapf-instance-0. */
+		apple,dapf-ranges = /bits/ 64 <0x4a1668000 0x4a1668003
+					     0x3807002e8 0x3807002eb
+					     0x38070c008 0x38070c00b
+					     0x582668000 0x582668003>;
+		status = "disabled";
+	};
+
 	scaler0_dart: iommu@305260000 {
 		compatible = "apple,t8142-dart", "apple,t8110-dart";
 		reg = <0x3 0x5260000 0x0 0x20000>;
@@ -462,6 +529,16 @@
 };
 
 &pmgr {
+	/* ADT pmgr device ANE_SYS (id 73), parent AFISOCNI3 (no power state). */
+	ps_ane_sys: power-controller@2e8 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2e8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ane_sys";
+		status = "disabled";
+	};
+
 	ps_msr: power-controller@2a8 {
 		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x2a8 4>;

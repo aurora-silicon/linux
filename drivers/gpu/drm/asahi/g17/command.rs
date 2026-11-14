@@ -492,6 +492,8 @@ pub(crate) enum Validated {
         sampler_heap_va: u64,
         sampler_count: u32,
         timestamps: uapi::drm_asahi_timestamps,
+        /// The buffers the dispatch writes, from the compute attachment list.
+        attachments: Attachments,
     },
 }
 
@@ -504,6 +506,21 @@ impl Validated {
     pub(crate) fn allow_long_job(&mut self) {
         match self {
             Self::Render { long_job, .. } | Self::Compute { long_job, .. } => *long_job = true,
+        }
+    }
+    /// The command traces rays: it carries intersection tables or traversal scratch, in
+    /// either stage of a render or as a compute command.
+    pub(crate) fn traces_rays(&self) -> bool {
+        match self {
+            Self::Render { ray_query, .. } => ray_query
+                .iter()
+                .any(|stage| stage.intersection.enabled() || stage.scratch.enabled()),
+            Self::Compute { intersection, scratch, m5_intersection, m5_scratch, .. } => {
+                intersection.enabled()
+                    || scratch.enabled()
+                    || m5_intersection.enabled()
+                    || m5_scratch.enabled()
+            }
         }
     }
 }
@@ -795,6 +812,7 @@ impl Payload {
                     sampler_heap_va: cmd.sampler_heap,
                     sampler_count: cmd.sampler_count,
                     timestamps: cmd.ts,
+                    attachments: *attachments,
                 })
             }
         }

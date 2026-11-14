@@ -107,6 +107,19 @@ struct apple_epic_service_ops {
 	bool reusable;
 	/* EOPNOTSUPP from prepare means intentional absence only for this role. */
 	bool optional;
+	/*
+	 * At most one instance of this service (a given name and unit) is ever
+	 * live. The firmware re-announces it under a fresh interface on every
+	 * DP relink, without closing the old one, so a new announcement always
+	 * supersedes the enabled one it matches, even within a power
+	 * generation: afk_compact_slot() replaces it in place and reclaims the
+	 * slot. Without this a relink across every suspend would consume a new
+	 * channel each time until the endpoint runs out (the external DCP's
+	 * dcpav-audio/cec/video interfaces on AV_AUDIO_ENDPOINT_DESKTOP).
+	 * Services that announce legitimate same-name siblings in one
+	 * generation (DPAVCTRL) must leave this clear.
+	 */
+	bool singleton;
 
 	/*
 	 * Optional admission, before OPEN/publication. Must not retain service

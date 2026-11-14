@@ -103,6 +103,8 @@ impl kernel::InPlaceModule for DriverModule {
         unsafe { binding::init() };
         // SAFETY: Module init runs once, before either adapter is registered below.
         unsafe { queue_share::init() };
+        // SAFETY: Module init runs once, before either adapter is registered below.
+        unsafe { g17::exec_share::init() };
         try_pin_init!(Self {
             // Initialize the queue first, before registration can invoke probe.
             _cleanup: cleanup::QueueOwner::new()?,

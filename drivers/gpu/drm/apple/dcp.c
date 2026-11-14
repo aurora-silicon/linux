@@ -391,6 +391,20 @@ module_param(fw27_panel_boot_mode, int, 0644);
 MODULE_PARM_DESC(fw27_panel_boot_mode,
 		 "FW27 internal panel: -1 keep the boot mode for a single fixed timing (default), 0 always mode-set, 1 always keep the boot mode");
 
+/*
+ * update_notify_clients_dcp (A031 on H17P, A033 on H17G) form in the H17
+ * client-open sequence:
+ *    0 client numbers in the first slots, 9 states (default)
+ *    1 client flags (clients[c] = 1), 9 states: none, 6, 7, 8, 10, 11, 12,
+ *      25, 26
+ *    2 client flags, 14 states: the 9, then 13, 14, 15, 16, 17
+ * fw27 firmware expects the flag form.
+ */
+int notify_clients_form;
+module_param(notify_clients_form, int, 0644);
+MODULE_PARM_DESC(notify_clients_form,
+		 "H17 update_notify_clients_dcp: 0 client numbers (default), 1 client flags, 9 states, 2 client flags, 14 states");
+
 static bool unstable_edid = true;
 module_param(unstable_edid, bool, 0644);
 MODULE_PARM_DESC(unstable_edid, "Enable unstable EDID retrival support");
@@ -7492,6 +7506,16 @@ static void dcp_drain_for_sleep(struct apple_dcp *dcp)
 		if (READ_ONCE(dcp->crashed) || READ_ONCE(dcp->iomfb.stopped))
 			return;
 		if (!dcp_backlight_active(dcp) || !dcp_backlight_pending(dcp))
+			return;
+		/*
+		 * The consumer blanks the panel before this runs, so a change
+		 * left pending while the panel is not lit is the blank itself,
+		 * or a level set while DPMS was off: the firmware will not take
+		 * it until the CRTC is active again, and resume restores it on
+		 * the enable swap. It need not reach the firmware before the
+		 * mailbox suspends, so stop here rather than wait it out.
+		 */
+		if (!dcp_backlight_lit(dcp))
 			return;
 	}
 	dev_warn(dcp->dev, "brightness change still pending at suspend\n");

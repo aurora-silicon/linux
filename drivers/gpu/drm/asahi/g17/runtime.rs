@@ -16,6 +16,7 @@ mod events;
 mod feed;
 mod render;
 pub(super) mod teardown;
+pub(super) mod traversal;
 
 pub(super) use super::now_ns;
 use super::{
@@ -772,7 +773,7 @@ impl Backend {
         // sleeping, and nothing of the new queue is visible yet.
         const RETAINED_CONTEXT_WAIT_NS: u64 = 4 * WORK_RING_WAIT_NS;
         let started = now_ns();
-        let (lease, uat, pool, qos, execution, slot) = loop {
+        let (lease, uat, pool, qos, execution, slot, share) = loop {
             let observed = shared.queues.observe();
             let lease = shared.preparations.enter(true)?;
             let mut state = shared.state.lock();
@@ -795,16 +796,20 @@ impl Backend {
             }
             // The new context may reuse a pooled scheduler page: clear released QoS rows first.
             firmware.queues.qos_ids.forget_released(|ids| firmware.port.qos_forget(ids));
-            let attempt = if firmware.uat.execution_contexts_used() < crate::mmu::MAX_EXECUTION_CONTEXTS {
+            // G17P queues of one VM join its live execution context (super::exec_share).
+            let joined = if firmware.uat.is_m5() { None } else { super::exec_share::join(vm) };
+            let attempt = if let Some((execution, share)) = joined {
+                Ok((execution, admission.reserve_queue()?, Some(share)))
+            } else if firmware.uat.execution_contexts_used() < crate::mmu::MAX_EXECUTION_CONTEXTS {
                 // Creators hold the device mutex, so neither check above can
                 // have changed; the slot only fails on a broken invariant.
                 let slot = admission.reserve_queue()?;
-                firmware.uat.new_execution_context(vm, super::channel::control_witnessed()).map(|execution| (execution, slot))
+                firmware.uat.new_execution_context(vm, super::channel::control_witnessed()).map(|execution| (execution, slot, None))
             } else {
                 Err(ENOSPC)
             };
             match attempt {
-                Ok((execution, slot)) => {
+                Ok((execution, slot, share)) => {
                     break (
                         lease,
                         firmware.uat.clone(),
@@ -812,6 +817,7 @@ impl Backend {
                         firmware.queues.qos_ids.clone(),
                         execution,
                         slot,
+                        share,
                     )
                 }
                 Err(error) if error == ENOSPC => {
@@ -844,6 +850,11 @@ impl Backend {
         };
         let owner_pid =
             u32::try_from(kernel::current!().group_leader().pid()).map_err(|_| EOVERFLOW)?;
+        let share = match share {
+            Some(share) => Some(share),
+            None if !uat.is_m5() => Some(super::exec_share::offer(vm, &execution)?),
+            None => None,
+        };
         let context = Arc::new(
             Context::new(
                 &alloc,
@@ -854,6 +865,7 @@ impl Backend {
                 policy,
                 shared.renders.clone(),
                 shared.progress.clone(),
+                share,
             )?,
             GFP_KERNEL,
         )?;
@@ -1292,6 +1304,7 @@ impl Backend {
                     self.shared.m5_board,
                     self.shared.variant.compute,
                     alloc.uat.is_m5(),
+                    self.shared.variant.mcache,
                 )?;
                 Ok(KBox::new(queue, GFP_KERNEL)?)
             })();
@@ -1654,7 +1667,8 @@ impl super::Firmware {
         let mut native: KVec<super::sync_input::NativeWait> =
             KVec::with_capacity(sources.sources.len(), GFP_KERNEL)?;
         // M5 shared-ring queues have no completion-wait records: the consumer's kick entry names
-        // the source's kick, and the firmware orders it.
+        // the source's kick, and the firmware orders it. So is a G17P source of the consumer's
+        // own execution context: one context needs no write-back between the two kicks.
         let m5 = self.init.is_m5();
         let mut waited: u128 = 0;
         for source in &sources.sources {
@@ -1662,15 +1676,15 @@ impl super::Firmware {
             let found = self.queues.compute.iter_mut().flatten()
                 .filter_map(|entry| entry.queue.as_deref_mut())
                 .find_map(|mut queue| match queue.source_dependency(source, packet.completion.status(),
-                    self.recovery.generation()) {
+                    self.recovery.generation(), &packet.context) {
                     Ok(None) => None,
                     result => Some(result),
                 }).ok_or(EAGAIN)??;
-            let Some((sequence, dependency, stamp_va, event_slot, hold)) = found else {
+            let Some((sequence, dependency, stamp_va, event_slot, hold, same_execution)) = found else {
                 return Err(EAGAIN);
             };
             waited |= 1u128 << dependency.qid();
-            if m5 {
+            if m5 || same_execution {
                 merged.insert(sequence, dependency)?;
                 holds.push(hold, GFP_KERNEL)?;
                 continue;
@@ -2231,6 +2245,10 @@ impl Backend {
     /// wait leaves the command, unpublished, to its scheduler.
     pub(super) fn try_compute_early(&self, packet: &Arc<super::job::Packet>) -> bool {
         if self.compute_backlog.load(Ordering::Acquire) != 0 || packet.has_dependencies() {
+            return false;
+        }
+        // A command the ray-traversal rule could hold now is left to its scheduler.
+        if !self.traversal_inline(packet) {
             return false;
         }
         if !packet.begin_publication() {

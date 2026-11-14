@@ -10,6 +10,7 @@
 #include <linux/of_address.h>
 #include <linux/of_irq.h>
 #include <linux/platform_device.h>
+#include <crypto/sha2.h>
 
 #include "ane_fw_cold.h"
 #include "ane_fw_platform.h"
@@ -175,6 +176,65 @@ const struct ane_fw_platform ane_t6050_platform = {
 	.dart_revision = 0x204,
 	.dapf_count = 5,
 	.text_pin = ane_t6050_text_pin_27_0,
+};
+
+/*
+ * The M5 (T8142, J813/J815) ANE: "ane,t8132exclave", ane-type 0x210,
+ * exclave-assigned and preloaded by iBoot. From the T8142 ADT: ANE_SYS at
+ * PMGR +0x2e8 (pmgr device 73, parent AFISOCNI3), ANE_CPU +0xc000 and
+ * ANE_TDBASE +0xc008 as on T8140; four DAPF records. The macOS 27.0 (26A428)
+ * stub's iBoot preloads TEXT 0xc0000 and DATA 0x2ac000 at T8140's IOVAs,
+ * measured on a J815 under aura with TEXT sha256 1212c260...b6d4e3 (the 27.2
+ * host's preload is 0xbc000/0x2b0000 at 0x100_000b_c000).
+ *
+ * Measured under aura's hypervisor on a J815 running macOS 27.2.1 (cold
+ * model load, power-up and power-down traced): the PWGATE window at PMGR
+ * +0x27640 (request +0xc, acknowledge +0x30, as on T8140), the scratch
+ * cells from +0x1880028 (as on T6050), DART revision 0x204 (PARAMS_8
+ * 0x2a2a0204) and the four DAPF records. macOS powers the engine down in
+ * T8140's order: sub-block, PWGATE request 3, acknowledge 0, CPU, then
+ * ANE_SYS. So sleep and the parked start follow T8140.
+ */
+static const u8 ane_t8142_text_26a428[] = {
+	0x12, 0x12, 0xc2, 0x60, 0x6e, 0xf8, 0xca, 0xce,
+	0x51, 0xfd, 0x95, 0x1e, 0x60, 0xbc, 0xce, 0x75,
+	0xbe, 0x8e, 0x65, 0xd5, 0xf0, 0xfe, 0x19, 0x37,
+	0xac, 0x3b, 0x58, 0x07, 0x49, 0xd6, 0xb4, 0xe3,
+};
+
+const struct ane_fw_platform ane_t8142_platform = {
+	.soc = 0x8142,
+	.chip_family = 17,
+	.ane_type = 0x210,
+	.hwx_subtype = 9,
+	.task_generation = 19,
+	.interrupt_count = 2,
+	.owner = ANE_FW_OWNER_EXCLAVE,
+	.reg_names = ane_h17_reg_names,
+	.reg_sizes = ane_h17_reg_sizes,
+	.reg_count = ARRAY_SIZE(ane_h17_reg_names),
+	.wrapper = 0x1600000,
+	.mailbox = 0x1608000,
+	.scratch = 0x1880028,
+	.doorbell = 0x1884000,
+	.irq_status = 0x188c000,
+	.irq_ack = 0x1890000,
+	.preload_dva = { 0x10000000000, 0x100000c0000 },
+	.preload_size = { 0xc0000, 0x2ac000 },
+	.stream_mask = BIT(0),
+	.firmware_preloaded = true,
+	.safe_reset = false,
+	/* Exclave mode at boot, cold sleep cycle and parked start, as on T8140. */
+	.exclave_mode_stop = true,
+	.macos_sleep = true,
+	.sleep_warm = false,
+	.pmgr_sys = 0x2e8,
+	.pmgr_cpu = 0xc000,
+	.pmgr_subblock = 0xc008,
+	.dart_compatible = "apple,t8142-ane-dart",
+	.dart_revision = 0x204,
+	.dapf_count = 4,
+	.text_pin = ane_t8142_text_26a428,
 };
 
 /*
