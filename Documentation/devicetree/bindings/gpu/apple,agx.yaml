@@ -252,8 +252,7 @@ allOf:
   - if:
       properties:
         compatible:
-          contains:
-            const: apple,agx-g17s
+          const: apple,agx-g17s
     then:
       description:
         The M5 Pro GPU uses one MMIO range and two firmware mailbox roles.
@@ -323,7 +322,7 @@ allOf:
       properties:
         compatible:
           contains:
-            const: apple,agx-g17s
+            const: apple,agx-g17c
     then:
       properties:
         reg:
@@ -536,7 +535,6 @@ allOf:
                 - apple,agx-t6050
                 - apple,agx-t8132
                 - apple,agx-t8140
-                - apple,agx-g17s
     then:
       properties:
         reg:
