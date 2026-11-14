@@ -50,6 +50,20 @@
 		#mbox-cells = <0>;
 	};
 
+	/*
+	 * The internal display's power words for a DCP firmware stop (DPMS off):
+	 * /arm-io/pmgr reg[34] (pwrgate: DISP_CPU's retention words 0x11cc and
+	 * 0x11f0, the pmgr's retention_config_ff/_mem) and reg[32] (ps: DISP_CPU
+	 * 0x10000, DISP_FE 0x318, DISP_SYS 0x290). T8142's PMC keeps no count of
+	 * powered DCPs, so there is no pmc-dcp word.
+	 */
+	dcp_power: display-power@380724000 {
+		compatible = "apple,t8142-display-power";
+		reg = <3 0x80724000 0 0x2000>,
+		      <3 0x80700000 0 0x14000>;
+		reg-names = "pwrgate", "ps";
+	};
+
 	dcp: dcp@286e00000 {
 		compatible = "apple,t8142-dcp", "apple,dcp";
 		mboxes = <&dcp_mbox>;
@@ -66,6 +80,7 @@
 		      <2 0x86850000 0 0x4000>;
 		apple,bw-scratch = <&pmgr_dcp 0 5 0>;
 		apple,bw-doorbell = <&pmgr_dcp 1 6>;
+		apple,display-power = <&dcp_power>;
 		/* Scan out the primary plane on IOMFB surface 2. */
 		apple,iomfb-surfaces = <0 0 1 0>;
 		/*
@@ -108,7 +123,19 @@
 	apple,dma-range = <0x100 0x0 0x10 0x0>;
 };
 
+/*
+ * ps-wr-dis: the DCP DART's PS write-disable bit, which T8142 has instead
+ * of T8140's GAPF slice. ADT dart-dcp clock-protection-wr-dis-id
+ * <0x1f 0xff>, /chosen/dart-ps-wr-dis-entries[0x1f] = offset 0x3fdc in
+ * /arm-io/pmgr reg[1] (0x380714000), bit 6. Set, the fabric rejects writes
+ * to DISP_CPU's power word; the DART driver clears it while the DCP is
+ * stopped.
+ */
 &dcp_dart {
+	reg = <2 0x86340000 0 0x20000>,
+	      <3 0x80717fdc 0 0x4>;
+	reg-names = "dart", "ps-wr-dis";
+	apple,ps-wr-dis-bit = <6>;
 	apple,dma-range = <0x100 0x0 0x10 0x0>;
 	status = "okay";
 };
