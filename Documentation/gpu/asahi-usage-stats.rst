@@ -44,9 +44,14 @@ the classic backend uses its hardware configuration's timer frequency.
 
 These are firmware stage envelopes, not hardware shader occupancy measurements.
 They can include firmware scheduling, preemption and stalls between the stage's
-start and end operations. Intervals are summed without attempting to merge
-overlapping commands on the same engine. Missing, zero-start or reversed intervals
-are ignored. Failed or cancelled commands do not contribute incomplete intervals;
+start and end operations. The shared G17 backend runs several commands of one
+queue at once, so their stages overlap. It charges each engine of a queue the
+union of that queue's stage intervals (exact, because a queue's stages retire in
+the order they started), so a queue never counts more than the wall time on one
+engine. Queues of one file still add up. The other backends sum their intervals
+without merging overlapping commands on the same engine. Missing, zero-start or
+reversed intervals are ignored. Failed or cancelled commands do not contribute
+incomplete intervals;
 successful stages that retired before a later failure remain counted. An
 unexecuted G17 replay contributes only when it eventually retires successfully.
 There is no submit-to-completion wall-time fallback in the current backends.
@@ -75,9 +80,11 @@ scale. Other GPUs print neither key.
 Accounting cost
 ---------------
 
-Each file allocates one three-counter ledger. Queues and pending completions
-retain references to it. Retirement adds one relaxed, saturating atomic update
-per valid stage, with no new locks or allocations. The native backends reuse
+Each file allocates one three-counter ledger, and each G17 queue one three-mark
+lane in front of it. Queues and pending completions retain references to them.
+Retirement adds one relaxed, saturating atomic update per valid stage, after one
+compare-and-swap of the lane's mark on G17, with no new locks or allocations.
+The native backends reuse
 existing timestamp reads. Classic completion callbacks read two internal cells
 per stage; commands without application timestamps also execute two existing
 timestamp microsequence operations per stage. Reading fdinfo loads three counters
