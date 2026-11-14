@@ -479,7 +479,7 @@ void centauri_t6050_free_ipc(struct centauri_t6050 *c)
 
 	if (!ipc)
 		return;
-	if (ipc->owned[2])
+	if (ipc->owned[2] && !c->firmware_sleep)
 		device_release_driver(&ipc->function[2]->dev);
 	centauri_t6050_wifi_unregister(c);
 	centauri_t6050_free_irqs(&c->alpha_irqs);
