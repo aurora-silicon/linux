@@ -459,6 +459,20 @@ bool dcp_backlight_pending(struct apple_dcp *dcp)
 	return pending;
 }
 
+/* The panel is showing a level now, so a pending change can be presented. */
+bool dcp_backlight_lit(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+	bool lit;
+
+	if (!dcp_backlight_active(dcp))
+		return false;
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	lit = dcp_bl_lit(&dcp->backlight.state);
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+	return lit;
+}
+
 /*
  * Called from the receive path, which must not queue a transaction itself;
  * the caller schedules the update worker when this returns true.  Requests
