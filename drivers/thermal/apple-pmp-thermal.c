@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * J713 CPU/GPU thermal policy using read-only samples from the PMP owner.
+ * T8132 CPU/GPU thermal policy using read-only samples from the PMP owner.
  * The policy and thresholds are carried from the existing M4 implementation;
  * these are Linux operating limits, not inferred Apple hardware safety limits.
  * Guards are installed before cpufreq relinquishes its unmanaged ceiling.
@@ -684,16 +684,23 @@ static int apple_pmp_add_cluster(unsigned int index, unsigned int cpu,
 static int apple_pmp_thermal_setup(void)
 {
 	struct thermal_zone_device *zone;
+	unsigned long p_members = BIT(0) | GENMASK(9, 7);
+	unsigned long e_members = GENMASK(6, 1);
 	unsigned int i;
 	int ret;
 
+	/* J773g numbers the four P cores 0,3-5 and the six E cores 1-2,6-9. */
+	if (of_machine_is_compatible("apple,j773g")) {
+		p_members = BIT(0) | GENMASK(5, 3);
+		e_members = GENMASK(2, 1) | GENMASK(9, 6);
+	}
 	apple_pmp_power_init(&pmp_thermal.power);
 	apple_pmp_cooling_init(&pmp_thermal.cooling);
 	pmp_thermal.guard_level = 8;
-	ret = apple_pmp_add_cluster(0, 0, BIT(0) | GENMASK(9, 7));
+	ret = apple_pmp_add_cluster(0, 0, p_members);
 	if (ret)
 		goto fail;
-	ret = apple_pmp_add_cluster(1, 1, GENMASK(6, 1));
+	ret = apple_pmp_add_cluster(1, 1, e_members);
 	if (ret)
 		goto fail;
 	zone = thermal_zone_device_register_with_trips("apple-pmp-die", apple_pmp_trips,
@@ -736,7 +743,7 @@ static int apple_pmp_thermal_setup(void)
 		if (ret)
 			goto fail;
 	}
-	pr_info("apple-pmp-thermal: J713 provisional policy: CPU/GPU cooling from 106 C, target 110 C, full protection 115 C, three >=120 C samples for shutdown, 5 ms sampling from 95 C or while cooling (100 ms below), 100 ms governor, shared measured-rail power budget\n");
+	pr_info("apple-pmp-thermal: T8132 provisional policy: CPU/GPU cooling from 106 C, target 110 C, full protection 115 C, three >=120 C samples for shutdown, 5 ms sampling from 95 C or while cooling (100 ms below), 100 ms governor, shared measured-rail power budget\n");
 	pmp_thermal.ready = true;
 	return 0;
 fail:
