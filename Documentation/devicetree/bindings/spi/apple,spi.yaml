@@ -27,6 +27,7 @@ properties:
               - apple,t8122-spi
               - apple,t8132-spi
               - apple,t8140-spi
+              - apple,t8142-spi
           - const: apple,t8103-spi
       - items:
           - enum:
