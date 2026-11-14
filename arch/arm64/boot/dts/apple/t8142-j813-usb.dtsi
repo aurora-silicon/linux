@@ -132,6 +132,7 @@
 		power-domains = <&ps_atc0_usb>;
 		#iommu-cells = <1>;
 		apple,dma-range = <0x100 0x4000 0 0xffff0000>;
+		status = "okay";
 	};
 
 	dwc3_0_dart_1: iommu@402f80000 {
@@ -278,6 +279,7 @@
 		power-domains = <&ps_atc1_usb>;
 		#iommu-cells = <1>;
 		apple,dma-range = <0x100 0x4000 0 0xffff0000>;
+		status = "okay";
 	};
 
 	dwc3_1_dart_1: iommu@40af80000 {
