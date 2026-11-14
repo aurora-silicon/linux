@@ -543,12 +543,14 @@ impl crate::g17::Shared {
             .housekeeping
             .swap(false, core::sync::atomic::Ordering::AcqRel);
         // M5: completions first (see `Shared::completion_first`).
-        let first = self.completion_first();
+        let first = self.completion_part(crate::g17::OPT_REPORTS_LAST);
+        let again = self.completion_part(crate::g17::OPT_RESERVICE);
+        let handoff = self.completion_part(crate::g17::OPT_HANDOFF);
         let mut masks = [0; 2];
         let mut signalled = false;
         let mut services = 0;
         let (recover, quiet) = loop {
-            if first {
+            if again {
                 // A notification from here on is for records this service may not reach. The
                 // flag only saves a pass: the notification also queued the next one.
                 let _ = self.records.swap(false, core::sync::atomic::Ordering::AcqRel);
@@ -565,7 +567,7 @@ impl crate::g17::Shared {
                     // publisher. Joining builders must happen after unlocking.
                     self.preparations.close();
                 }
-                (recover, batch, first && !firmware.work_in_flight())
+                (recover, batch, handoff && !firmware.work_in_flight())
             };
             masks[0] |= batch[0];
             masks[1] |= batch[1];
@@ -576,7 +578,7 @@ impl crate::g17::Shared {
             // the pass's reports, replays, render observation and housekeeping, not after them
             // in the next pass. Bounded, so that the rest of the pass still runs.
             if recover
-                || !first
+                || !again
                 || services > EXTRA_SERVICES
                 || !self.records.load(core::sync::atomic::Ordering::Acquire)
             {
@@ -590,7 +592,7 @@ impl crate::g17::Shared {
         }
         // The signals woke a client whose next publication is all the GPU will have: the rest
         // of this pass lets it take the device mutex first.
-        let mut yield_ns = if first && signalled && quiet && !recover {
+        let mut yield_ns = if handoff && signalled && quiet && !recover {
             PUBLISHER_YIELD_NS
         } else {
             0

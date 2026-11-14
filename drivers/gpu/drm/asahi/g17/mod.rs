@@ -1188,6 +1188,12 @@ pub(crate) fn opt(bit: u32) -> bool {
 
 /// Records each job's completion-path points (latency.rs, `aurora.gpubench_lat`).
 pub(crate) const OPT_LATENCY: u32 = 1 << 8;
+/// M5 completion path (measurement switches; all off is the unchanged driver): an event pass
+/// drains its reports after its render observation (20), services records notified during it
+/// before the rest of it (21), and hands the device mutex to a woken publication (22).
+pub(crate) const OPT_REPORTS_LAST: u32 = 1 << 20;
+pub(crate) const OPT_RESERVICE: u32 = 1 << 21;
+pub(crate) const OPT_HANDOFF: u32 = 1 << 22;
 
 /// Event work item ID.
 const EVENT_WORK: u64 = 0;
@@ -1510,10 +1516,15 @@ impl Shared {
         self.completion_first
     }
 
+    /// Measurement only: whether part `bit` of [`Self::completion_first`] is switched on.
+    pub(super) fn completion_part(&self, bit: u32) -> bool {
+        self.completion_first() && opt(bit)
+    }
+
     /// The device mutex for a submit ioctl's publication. While it waits, an event pass whose
     /// signals left nothing in flight takes no further hold ([`Self::yield_to_publishers`]).
     pub(super) fn lock_for_publication(&self) -> kernel::sync::MutexGuard<'_, Option<KBox<Firmware>>> {
-        if !self.completion_first() {
+        if !self.completion_part(OPT_HANDOFF) {
             return self.state.lock();
         }
         self.publishers.fetch_add(1, Ordering::AcqRel);
