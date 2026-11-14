@@ -85,7 +85,13 @@ fn enable_als(
         // to report it too.
         match Firmware::request_nowarn(c_str!("apple/aop-als-cal.bin"), dev.as_ref()) {
             Ok(fw) => {
-                set_als_property(aop, svc, ALS_PROP_CALIBRATION, fw.data())?;
+                let status = set_als_property(aop, svc, ALS_PROP_CALIBRATION, fw.data())?;
+                dev_info!(
+                    dev.as_ref(),
+                    "calibration property 0x0b sent: {} bytes, status {:#x}\n",
+                    fw.data().len(),
+                    status
+                );
             }
             Err(e) => dev_warn!(
                 dev.as_ref(),
@@ -93,7 +99,9 @@ fn enable_als(
                 e
             ),
         }
-        set_als_property(aop, svc, ALS_PROP_INTERVAL, &ALS_INTERVAL_US.to_le_bytes())?;
+        let status =
+            set_als_property(aop, svc, ALS_PROP_INTERVAL, &ALS_INTERVAL_US.to_le_bytes())?;
+        dev_info!(dev.as_ref(), "interval property sent: status {:#x}\n", status);
         return Ok(());
     }
 
