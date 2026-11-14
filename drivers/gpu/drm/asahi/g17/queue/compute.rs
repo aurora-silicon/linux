@@ -3530,6 +3530,7 @@ impl Queue {
         source: &crate::g17::sync_input::Source,
         status: &Arc<VmStatus>,
         epoch: u64,
+        consumer: &crate::g17::context::Context,
     ) -> Result<Option<SourceDependency>> {
         for active in self.active.iter() {
             if !active.packet.completion.is_input_source(&source.submission) {
@@ -3562,6 +3563,7 @@ impl Queue {
                 self.graph.support.gpu_va() + STAMP as u64,
                 u32::from(self.qid()),
                 hold,
+                active.packet.context.shares_execution(consumer),
             )));
         }
         Ok(None)
@@ -3579,11 +3581,13 @@ impl Queue {
     }
 }
 
-/// Publication, dependency, stamp address, queue and the retained source hold.
+/// Publication, dependency, stamp address, queue, the retained source hold and whether the
+/// source shares the consumer's execution context.
 pub(crate) type SourceDependency = (
     u64,
     crate::g17::fw::kick::KickDependency,
     u64,
     u32,
     crate::g17::sync_input::Hold,
+    bool,
 );

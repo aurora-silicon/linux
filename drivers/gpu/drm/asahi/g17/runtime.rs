@@ -1666,7 +1666,8 @@ impl super::Firmware {
         let mut native: KVec<super::sync_input::NativeWait> =
             KVec::with_capacity(sources.sources.len(), GFP_KERNEL)?;
         // M5 shared-ring queues have no completion-wait records: the consumer's kick entry names
-        // the source's kick, and the firmware orders it.
+        // the source's kick, and the firmware orders it. So is a G17P source of the consumer's
+        // own execution context: one context needs no write-back between the two kicks.
         let m5 = self.init.is_m5();
         let mut waited: u128 = 0;
         for source in &sources.sources {
@@ -1674,15 +1675,15 @@ impl super::Firmware {
             let found = self.queues.compute.iter_mut().flatten()
                 .filter_map(|entry| entry.queue.as_deref_mut())
                 .find_map(|mut queue| match queue.source_dependency(source, packet.completion.status(),
-                    self.recovery.generation()) {
+                    self.recovery.generation(), &packet.context) {
                     Ok(None) => None,
                     result => Some(result),
                 }).ok_or(EAGAIN)??;
-            let Some((sequence, dependency, stamp_va, event_slot, hold)) = found else {
+            let Some((sequence, dependency, stamp_va, event_slot, hold, same_execution)) = found else {
                 return Err(EAGAIN);
             };
             waited |= 1u128 << dependency.qid();
-            if m5 {
+            if m5 || same_execution {
                 merged.insert(sequence, dependency)?;
                 holds.push(hold, GFP_KERNEL)?;
                 continue;

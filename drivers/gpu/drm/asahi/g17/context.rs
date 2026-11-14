@@ -433,6 +433,10 @@ impl Context {
             None => self.execution.release(),
         }
     }
+    /// `other` runs in this context's shared execution context.
+    pub(crate) fn shares_execution(&self, other: &Context) -> bool {
+        self.share.is_some() && core::ptr::eq(&*self.execution, &*other.execution)
+    }
     pub(crate) fn scheduler_generation(&self) -> u32 {
         self.scheduler_generation
     }
