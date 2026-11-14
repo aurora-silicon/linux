@@ -504,7 +504,7 @@ allOf:
             properties:
               reg:
                 minItems: 8
-                maxItems: 8
+                maxItems: 9
               interrupts:
                 minItems: 6
                 maxItems: 6

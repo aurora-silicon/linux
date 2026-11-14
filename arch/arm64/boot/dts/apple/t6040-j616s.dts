@@ -71,8 +71,22 @@
 	adj-height-mm = <216>;
 };
 
+/*
+ * The AOP firmware reports the lid angle to the SMC once a second on its own,
+ * and every report on this mailbox ends a suspend-to-idle period: keep its
+ * messages in the FIFO across system sleep.
+ */
+&aop_mbox {
+	apple,hold-rx-in-sleep;
+};
+
 &aop_audio {
 	apple,chassis-name = "J616";
+};
+
+/* Suspend-to-RAM through the boot object has been tested on this board. */
+&t6040_sleep {
+	status = "okay";
 };
 
 &sound {
@@ -387,4 +401,103 @@
 
 &aes {
 	status = "okay";
+};
+
+/*
+ * The ProRes encoder: the shared codec power state (below the always-on
+ * fabric domain), its DART and the PMP soc-device record SCODEC0 (27).
+ * No reset: the shared codec's reset also clears the DART's translations,
+ * so the driver refuses a hung engine instead.
+ */
+&ps_fab1_soc {
+	status = "okay";
+};
+
+&ps_scodec {
+	status = "okay";
+};
+
+&pmp_report {
+	pmp_report_scodec: report@1b {
+		compatible = "apple,t6041-pmp-v2-report-entry",
+			     "apple,t6000-pmp-v2-report-entry";
+		reg = <0x1b>;
+		label = "pmp-scodec";
+		#power-domain-cells = <0>;
+		power-domains = <&ps_scodec>;
+	};
+};
+
+&apr0_dart {
+	status = "okay";
+};
+
+&apr0 {
+	power-domains = <&ps_scodec>, <&pmp_report_scodec>;
+	power-domain-names = "core", "perf";
+	/delete-property/ resets;
+	status = "okay";
+};
+
+/*
+ * The JPEG engines share the PMP soc-device record JPEG0 (26): hold it as
+ * their performance request while an engine runs.
+ */
+&pmp_report {
+	pmp_report_jpg: report@1a {
+		compatible = "apple,t6041-pmp-v2-report-entry",
+			     "apple,t6000-pmp-v2-report-entry";
+		reg = <0x1a>;
+		label = "pmp-jpg";
+		#power-domain-cells = <0>;
+		power-domains = <&ps_jpg>;
+	};
+};
+
+&jpeg0 {
+	power-domains = <&ps_jpg>, <&pmp_report_jpg>;
+	power-domain-names = "core", "perf";
+};
+
+&jpeg1 {
+	power-domains = <&ps_jpg>, <&pmp_report_jpg>;
+	power-domain-names = "core", "perf";
+};
+
+/*
+ * DP/HDMI audio: the clients behind dcpext0/dcpext1, their power states and
+ * the SIO the boot loader publishes. Neither side may hold the other at
+ * probe: audio needs the SIO only when a stream opens, and the external
+ * displays must come up whether the audio clients bind or not. Only
+ * properties are added to the display processors: their status belongs to
+ * the display gate.
+ */
+&ps_dpa_p {
+	status = "okay";
+};
+
+&ps_dpa1 {
+	status = "okay";
+};
+
+&ps_dpa2 {
+	status = "okay";
+};
+
+&dpaudio1 {
+	post-init-providers = <&sio>;
+	status = "okay";
+};
+
+&dpaudio2 {
+	post-init-providers = <&sio>;
+	status = "okay";
+};
+
+&dcpext0 {
+	post-init-providers = <&dpaudio1>;
+};
+
+&dcpext1 {
+	post-init-providers = <&dpaudio2>;
 };

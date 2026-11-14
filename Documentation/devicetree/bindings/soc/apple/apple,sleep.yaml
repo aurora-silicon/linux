@@ -1,0 +1,262 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,sleep.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple SoC system sleep controls
+
+maintainers:
+  - Diljit Singh <hey@djdev.me>
+  - František Balázsy <frantisekbalazsy@gmail.com>
+
+description: |
+  The registers a kernel running directly at EL2 on an Apple SoC writes to enter
+  and return from suspend-to-RAM and to power its secondary CPUs off. They belong
+  to several hardware blocks, some of which other drivers also use, so this node
+  overlaps those drivers' register ranges and the driver does not claim them.
+  Each SoC has its own compatible, as its power domains differ. Blocks that
+  several SoCs have are named alike.
+
+  On the T6040 the sleep engine waits for the display pipes, so the node lists
+  the power states that have to be off before a sleep, as the ADT's
+  device-check-ps-b4-sleep table does. Each entry names a PMGR register block,
+  the offset of a display pipe's CPU power state and the offset of its last
+  sub-block; the states in between are 8 bytes apart. All of the T6040's
+  register blocks are needed to enter a suspend and to undo it.
+
+properties:
+  compatible:
+    enum:
+      - apple,t6040-sleep
+      - apple,t8132-sleep
+      - apple,t8140-sleep
+
+  reg:
+    minItems: 11
+    maxItems: 28
+
+  reg-names:
+    minItems: 11
+    maxItems: 28
+
+  apple,wake-enable:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      The wake source IDs left enabled across suspend-to-RAM. Every other
+      source is masked.
+
+  apple,apcie:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The PCIe host whose shared registers and tunables the storage controller's
+      link depends on. They are needed even with that host disabled. On the
+      T6040 the boot loader adds it, with those registers and tunables on the
+      host's node; without it the storage controller can't be stopped for a
+      sleep.
+
+  apple,pinctrl:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The pin controller whose pins a deep sleep resets. Its pins are saved
+      before a sleep and put back after it, before the storage controller
+      starts.
+
+  apple,pinctrl-skip-pins:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description:
+      Pins of that controller to leave alone across a sleep, neither saved nor
+      put back.
+
+  apple,debug-port:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The USB-C port controller that carries the debug link, stopped for a sleep.
+
+  apple,display-coprocessors:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    description:
+      The DCP and the external DCPs, which must be off before a commit, in that
+      order.
+
+  apple,check-ps-b4-sleep:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    description:
+      The display pipes whose power states have to be off before a sleep, one
+      entry per pipe.
+    items:
+      items:
+        - description: PMGR syscon
+        - description: offset of the pipe's CPU power state
+        - description: offset of its last sub-block's power state
+
+  apple,check-ps-b4-sleep-names:
+    $ref: /schemas/types.yaml#/definitions/string-array
+    description: One name per apple,check-ps-b4-sleep entry.
+
+required:
+  - compatible
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          const: apple,t6040-sleep
+    then:
+      properties:
+        reg:
+          items:
+            - description: CPU start/stop block (pmgr + 0x88000)
+            - description: AON watchdog
+            - description: control words of the three CPU complexes
+            - description: SoC power gate, wake and retention voters
+            - description: clock generator, the clock mux park words
+            - description: SPMI controller of the PMU (boot stage, notify, hibernate)
+            - description: second SPMI controller's notify word
+            - description: MasterMini block with the S2R timer
+            - description: SOC-East page with retention, fabric, DCS, SIO and other power words
+            - description: SOC page with the west axi2af, ATC, fabric and DCS power words
+            - description: AOP global block, S2R control and wake masks
+        reg-names:
+          items:
+            - const: cpu-start
+            - const: wdt
+            - const: cluster
+            - const: pwrgate
+            - const: clkgen
+            - const: spmi
+            - const: spmi-a0
+            - const: mastermini
+            - const: soc-east
+            - const: soc-ps
+            - const: wake
+        apple,wake-enable: false
+        apple,pinctrl: false
+        apple,pinctrl-skip-pins: false
+        apple,debug-port: false
+        apple,display-coprocessors: false
+      required:
+        - reg
+        - reg-names
+        - apple,check-ps-b4-sleep
+        - apple,check-ps-b4-sleep-names
+
+  - if:
+      properties:
+        compatible:
+          const: apple,t8132-sleep
+    then:
+      properties:
+        reg:
+          minItems: 25
+          maxItems: 26
+        reg-names:
+          minItems: 25
+          items:
+            - const: ps
+            - const: pwrgate
+            - const: cpu-start
+            - const: cllt
+            - const: cluster
+            - const: commit
+            - const: wdt
+            - const: aon-misc
+            - const: wake
+            - const: amcc0
+            - const: amcc1
+            - const: pmc-dcp
+            - const: dvfm-e
+            - const: dvfm-p
+            - const: spmi
+            - const: pmc-voters
+            - const: dcs
+            - const: ps-aon
+            - const: spmi-a0
+            - const: clk-mux
+            - const: mcc0
+            - const: mcc1
+            - const: ptd
+            - const: clk-perf
+            - const: cluster-dcs
+            - const: ps-prot
+        apple,check-ps-b4-sleep: false
+        apple,check-ps-b4-sleep-names: false
+      required:
+        - reg
+        - reg-names
+        - apple,display-coprocessors
+
+  - if:
+      properties:
+        compatible:
+          const: apple,t8140-sleep
+    then:
+      properties:
+        reg:
+          minItems: 28
+        reg-names:
+          items:
+            - const: ps
+            - const: pwrgate
+            - const: cpu-start
+            - const: cllt
+            - const: cluster
+            - const: commit
+            - const: wdt
+            - const: aon-misc
+            - const: wake
+            - const: amcc0
+            - const: amcc1
+            - const: amcc2
+            - const: amcc3
+            - const: pmc-dcp
+            - const: dvfm-e
+            - const: dvfm-p
+            - const: spmi
+            - const: pmc-voters
+            - const: dcs
+            - const: ps-aon
+            - const: spmi-a0
+            - const: clk-mux
+            - const: mcc0
+            - const: mcc1
+            - const: mcc2
+            - const: ptd
+            - const: clk-perf
+            - const: cluster-dcs
+        apple,check-ps-b4-sleep: false
+        apple,check-ps-b4-sleep-names: false
+      required:
+        - reg
+        - reg-names
+        - apple,wake-enable
+        - apple,display-coprocessors
+
+additionalProperties: false
+
+examples:
+  - |
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        sleep-controller@502888000 {
+            compatible = "apple,t6040-sleep";
+            reg = <0x5 0x02888000 0x0 0x20>,
+                  <0x5 0x0836c000 0x0 0x4000>,
+                  <0x5 0x02820000 0x0 0x20>,
+                  <0x5 0x0282c000 0x0 0x1000>,
+                  <0x5 0x00000000 0x0 0x80000>,
+                  <0x5 0x09014000 0x0 0x1000>,
+                  <0x5 0x09188000 0x0 0x1000>,
+                  <0x5 0x08900000 0x0 0x8000>,
+                  <0x5 0x02280000 0x0 0xd000>,
+                  <0x5 0x02800000 0x0 0x9000>,
+                  <0x5 0x08004000 0x0 0x1000>;
+            reg-names = "cpu-start", "wdt", "cluster", "pwrgate",
+                        "clkgen", "spmi", "spmi-a0", "mastermini",
+                        "soc-east", "soc-ps", "wake";
+            apple,check-ps-b4-sleep = <&pmgr_disp 0x0 0x58>;
+            apple,check-ps-b4-sleep-names = "disp";
+        };
+    };

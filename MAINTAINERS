@@ -2093,7 +2093,9 @@ F:	drivers/soc/apple/pmp.rs
 F:	include/linux/mt7932.h
 F:	include/linux/soc/apple/pmp-report.h
 F:	Documentation/devicetree/bindings/chosen/apple,dcp-rtkit-quiesced.yaml
+F:	Documentation/devicetree/bindings/chosen/aura,hibernate.yaml
 F:	Documentation/devicetree/bindings/chosen/aurora,ctxr-exec-window.yaml
+F:	Documentation/devicetree/bindings/chosen/aurora,s2r-mailbox.yaml
 F:	Documentation/devicetree/bindings/display/apple,dcp.yaml
 F:	Documentation/devicetree/bindings/display/apple,display-subsystem.yaml
 F:	Documentation/devicetree/bindings/display/apple,t8140-display-power.yaml
@@ -2110,10 +2112,10 @@ F:	Documentation/devicetree/bindings/rtc/apple,j700-pmu-rtc.yaml
 F:	Documentation/devicetree/bindings/serial/apple,dockchannel-uart.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,dockchannel.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,rtk-helper-asc4.yaml
+F:	Documentation/devicetree/bindings/soc/apple/apple,sleep.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,t6041-aop.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,t8140-aop.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,t8140-mcc.yaml
-F:	Documentation/devicetree/bindings/soc/apple/apple,t8140-sleep.yaml
 F:	Documentation/devicetree/bindings/sound/apple,t6041-aop-audio.yaml
 F:	Documentation/devicetree/bindings/sound/apple,t8140-aop-audio.yaml
 F:	Documentation/devicetree/bindings/usb/vialab,vl122.yaml
@@ -2136,6 +2138,7 @@ F:	drivers/rtc/rtc-apple-pmu.c
 F:	drivers/soc/apple/aop.rs
 F:	drivers/soc/apple/mcc.c
 F:	drivers/soc/apple/sleep*.c
+F:	drivers/soc/apple/sleep-internal.h
 F:	drivers/tty/serial/apple_dockchannel*
 F:	include/linux/soc/apple/pci-apple-piodma.h
 F:	include/linux/soc/apple/sleep.h

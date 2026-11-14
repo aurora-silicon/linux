@@ -124,7 +124,8 @@ properties:
     description:
       The Type-C PHY whose lanes carry the router's CIO link. A host that
       power-cycles the router for a deep sleep takes the PHY through the
-      sleep with it.
+      sleep with it. On T6040 the router starts only while that PHY is in
+      CIO mode and tells it when it stops.
 
   phy-names:
     const: cio
@@ -285,6 +286,8 @@ allOf:
         - nhi@1f00000
         - interrupts
         - interrupt-names
+        - phys
+        - phy-names
     else:
       required:
         - iommu@a80000
