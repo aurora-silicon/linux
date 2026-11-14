@@ -521,10 +521,12 @@ static void iomfb_queue_timeout(struct work_struct *work)
 	} else if (dcp->iomfb.active) {
 		WRITE_ONCE(dcp->crashed, true);
 		dev_err(dcp->dev,
-			"IOMFB transaction timed out: cmd=%u oob=%u present=%u accepted=%u swap=%u\n",
+			"IOMFB transaction timed out: cmd=%u oob=%u present=%u accepted=%u swap=%u wd_pending=%d wd_due_ms=%d\n",
 			dcp->ch_cmd.depth, dcp->ch_oobcmd.depth,
 			dcp->present_state_h17p.pending, dcp->present_state_h17p.accepted,
-			dcp->present_state_h17p.swap_id);
+			dcp->present_state_h17p.swap_id,
+			delayed_work_pending(&dcp->swap_watchdog_wq),
+			jiffies_to_msecs(dcp->swap_watchdog_deadline - jiffies));
 		if (dcp->ch_cmd.depth && dcp->ch_cmd.depth <= DCP_MAX_CALL_DEPTH) {
 			const struct dcp_packet_header *h =
 				&dcp->ch_cmd.header[dcp->ch_cmd.depth - 1];

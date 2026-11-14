@@ -1293,6 +1293,9 @@ VISIBLE_IF_KUNIT void dcp_swap_watchdog(struct work_struct *work)
 		container_of(to_delayed_work(work), struct apple_dcp,
 			     swap_watchdog_wq);
 
+	dev_info(dcp->dev, "w88-wd: swap watchdog fired, present %u pending=%d accepted=%d\n",
+		 dcp->present_state_h17p.swap_id, dcp->present_state_h17p.pending,
+		 dcp->present_state_h17p.accepted);
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
 		if (time_before(jiffies, dcp->swap_watchdog_deadline) ||
 		    !xchg(&dcp->desktop->present_pending, false))
