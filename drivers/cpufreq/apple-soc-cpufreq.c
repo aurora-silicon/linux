@@ -29,6 +29,7 @@
 #include <linux/slab.h>
 #include <linux/suspend.h>
 #include <linux/soc/apple/cpufreq-thermal.h>
+#include <linux/soc/apple/cpuidle.h>
 #include <linux/soc/apple/pmp-report.h>
 #include <linux/spinlock.h>
 #include <linux/tick.h>
@@ -255,7 +256,20 @@ struct apple_cpu_priv {
 	/* A failure the verify timer has yet to report, and its command. */
 	bool failure_unreported;
 	u64 failure_command;
+	/*
+	 * Idle parking, see "Idle parking" below; protected by @lock. @park is
+	 * set at init and never changes.
+	 */
+	bool park;
+	bool parked;
+	unsigned int park_pstate;
+	unsigned int park_wanted;
+	struct cpumask park_cpus;
+	struct cpumask park_idle;
 };
+
+/* The cluster of each CPU whose cluster can be parked, or NULL. */
+static DEFINE_PER_CPU(struct apple_cpu_priv *, apple_park_priv);
 
 static struct cpufreq_driver apple_soc_cpufreq_driver;
 
@@ -418,7 +432,10 @@ static unsigned int apple_soc_cpufreq_get_rate(unsigned int cpu)
 
 	priv = policy->driver_data;
 
-	if (priv->info->cur_pstate_mask) {
+	/* A parked cluster reports the state it returns to, see "Idle parking". */
+	if (priv->park && READ_ONCE(priv->parked)) {
+		pstate = READ_ONCE(priv->park_wanted);
+	} else if (priv->info->cur_pstate_mask) {
 		u32 reg = readl_relaxed(priv->reg_base + APPLE_DVFS_STATUS);
 
 		pstate = (reg & priv->info->cur_pstate_mask) >>  priv->info->cur_pstate_shift;
@@ -517,12 +534,131 @@ static int apple_soc_cpufreq_request(struct cpufreq_policy *policy,
 	struct apple_cpu_priv *priv = policy->driver_data;
 	unsigned int pstate = policy->freq_table[index].driver_data;
 
+	unsigned long flags;
+	int ret;
+
 	/* OPP level is a hardware ID, not the frequency-table array index. */
 	if (pstate < priv->info->min_pstate || pstate > priv->info->max_pstate)
 		return -EINVAL;
 
-	return apple_soc_cpufreq_set_pstate(priv, pstate);
+	if (!priv->park)
+		return apple_soc_cpufreq_set_pstate(priv, pstate);
+
+	/*
+	 * A parked cluster takes the request when its first CPU wakes. A
+	 * waited-for request on a lazy_verify SoC is applied and verified now.
+	 */
+	raw_spin_lock_irqsave(&priv->lock, flags);
+	priv->park_wanted = pstate;
+	if (priv->parked && !priv->info->lazy_verify) {
+		ret = 0;
+	} else {
+		priv->parked = false;
+		ret = apple_soc_cpufreq_set_pstate(priv, pstate);
+	}
+	raw_spin_unlock_irqrestore(&priv->lock, flags);
+	return ret;
 }
+
+static int apple_soc_cpufreq_lazy_set(struct apple_cpu_priv *priv,
+				      unsigned int pstate);
+
+/*
+ * Idle parking
+ *
+ * The cluster keeps the performance state it was last asked for while all
+ * of its CPUs are idle, and its voltage follows that state. schedutil only
+ * runs from scheduler events on the cluster's CPUs, so it does not lower the
+ * request of an idle cluster: the last request stays until the next wakeup.
+ * Real-time tasks run with uclamp_min 1024 by default, so a short periodic
+ * one (an audio thread, a threaded interrupt handler) keeps an otherwise idle
+ * cluster at its fastest state. Measured on the M1 Pro at idle, that costs
+ * about 0.3 W of a 3.3 W system, which macOS, whose idle clusters sit at
+ * their lowest state, does not pay.
+ *
+ * The idle states that can afford a transition on wakeup (see
+ * cpuidle-apple.c) call apple_soc_cpufreq_park_enter() and _exit(). Once every
+ * online CPU of the cluster is in such a state, the cluster is moved to its
+ * slowest state; the first CPU to leave restores the last request, the
+ * transition running while that CPU starts up. Requests made while the
+ * cluster is parked, from another cluster's CPU, are recorded and applied
+ * when it wakes. The cpufreq request stays what the governor asked for, and
+ * so does the frequency reported for the cluster.
+ *
+ * On lazy_verify SoCs the park request becomes the expected state; the
+ * request that restores the cluster verifies it, see "Lazy verification".
+ * A cluster does not park while waited-for requests own it, while a request
+ * is pending, or once a transition has failed. Other SoCs that verify
+ * transitions do not park.
+ */
+static void apple_soc_cpufreq_park_enter(unsigned int cpu)
+{
+	struct apple_cpu_priv *priv = READ_ONCE(per_cpu(apple_park_priv, cpu));
+	unsigned long flags;
+	unsigned int c;
+	u64 reg;
+
+	if (!priv)
+		return;
+
+	raw_spin_lock_irqsave(&priv->lock, flags);
+	cpumask_set_cpu(cpu, &priv->park_idle);
+	if (priv->parked)
+		goto out;
+	if (priv->info->lazy_verify) {
+		if (priv->waited || priv->transition_failed || priv->pending_pstate >= 0)
+			goto out;
+		priv->park_wanted = priv->expected_pstate;
+	}
+	if (priv->park_wanted <= priv->park_pstate)
+		goto out;
+	for_each_cpu_and(c, &priv->park_cpus, cpu_online_mask)
+		if (!cpumask_test_cpu(c, &priv->park_idle))
+			goto out;
+
+	/* A transition still running: leave the cluster as it is this time. */
+	reg = readq_relaxed(priv->reg_base + APPLE_DVFS_CMD);
+	if (reg & APPLE_DVFS_CMD_BUSY)
+		goto out;
+	if (priv->info->lazy_verify) {
+		/* Not what was last requested: the verify timer reports it. */
+		if (FIELD_GET(APPLE_DVFS_CMD_PS1, reg) != priv->expected_pstate)
+			goto out;
+		priv->expected_pstate = priv->park_pstate;
+		priv->write_time = ktime_get();
+		priv->verify_deadline = ktime_add_us(priv->write_time,
+						     apple_soc_cpufreq_timeout(priv->info));
+	}
+	apple_soc_cpufreq_write(priv, reg, priv->park_pstate);
+	priv->parked = true;
+out:
+	raw_spin_unlock_irqrestore(&priv->lock, flags);
+}
+
+static void apple_soc_cpufreq_park_exit(unsigned int cpu)
+{
+	struct apple_cpu_priv *priv = READ_ONCE(per_cpu(apple_park_priv, cpu));
+	unsigned long flags;
+
+	if (!priv)
+		return;
+
+	raw_spin_lock_irqsave(&priv->lock, flags);
+	cpumask_clear_cpu(cpu, &priv->park_idle);
+	if (priv->parked) {
+		priv->parked = false;
+		if (priv->info->lazy_verify)
+			apple_soc_cpufreq_lazy_set(priv, priv->park_wanted);
+		else
+			apple_soc_cpufreq_set_pstate(priv, priv->park_wanted);
+	}
+	raw_spin_unlock_irqrestore(&priv->lock, flags);
+}
+
+static const struct apple_cpuidle_park_ops apple_soc_cpufreq_park_ops = {
+	.enter = apple_soc_cpufreq_park_enter,
+	.exit = apple_soc_cpufreq_park_exit,
+};
 
 /*
  * Lazy verification (lazy_verify SoCs)
@@ -727,6 +863,12 @@ static unsigned int apple_soc_cpufreq_lazy_request(struct cpufreq_policy *policy
 		pstate = priv->cap_pstate;
 		freq = priv->cap_freq;
 	}
+	/* A parked cluster takes it when its first CPU wakes. */
+	if (priv->parked) {
+		priv->park_wanted = pstate;
+		raw_spin_unlock_irqrestore(&priv->lock, flags);
+		return freq;
+	}
 	ret = apple_soc_cpufreq_lazy_set(priv, pstate);
 	raw_spin_unlock_irqrestore(&priv->lock, flags);
 	return ret ? 0 : freq;
@@ -760,7 +902,12 @@ static int apple_soc_cpufreq_lazy_cap(struct apple_cpu_priv *priv,
 	requested = priv->pending_pstate >= 0 ? priv->pending_pstate :
 						priv->expected_pstate;
 	pstate = min(priv->asked_pstate, cap);
-	if (!priv->waited && pstate != requested &&
+	if (priv->parked) {
+		if (!priv->waited && pstate != priv->park_wanted) {
+			priv->park_wanted = pstate;
+			moved = pstate;
+		}
+	} else if (!priv->waited && pstate != requested &&
 	    !apple_soc_cpufreq_lazy_set(priv, pstate))
 		moved = pstate;
 	raw_spin_unlock_irqrestore(&priv->lock, flags);
@@ -1540,6 +1687,22 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 	policy->fast_switch_possible = !info->verify_transition || info->lazy_verify;
 	policy->suspend_freq = freq_table[0].frequency;
 
+	if (!info->verify_transition || info->lazy_verify) {
+		unsigned int slowest = UINT_MAX;
+
+		cpufreq_for_each_valid_entry(p, freq_table)
+			if (p->frequency < slowest) {
+				slowest = p->frequency;
+				priv->park_pstate = p->driver_data;
+			}
+		cpumask_copy(&priv->park_cpus, policy->related_cpus);
+		priv->park = true;
+		for_each_cpu(i, policy->related_cpus) {
+			/* Pairs with the idle hooks' READ_ONCE(): priv is set up. */
+			smp_store_release(&per_cpu(apple_park_priv, i), priv);
+		}
+	}
+
 	return 0;
 
 out_clear_policy:
@@ -1568,6 +1731,16 @@ static void apple_soc_cpufreq_exit(struct cpufreq_policy *policy)
 	 * timer, report a failure it had yet to report, drop a pending request.
 	 */
 	apple_soc_cpufreq_drain(priv);
+	/*
+	 * The idle hooks are gone by now (module exit clears them before the
+	 * driver goes); drop the pointers so no later registration sees priv.
+	 */
+	if (priv->park) {
+		unsigned int cpu;
+
+		for_each_cpu(cpu, &priv->park_cpus)
+			WRITE_ONCE(per_cpu(apple_park_priv, cpu), NULL);
+	}
 	/* Drain firmware-limit updates before releasing the OPP tables. */
 	apple_fast_die_exit(priv);
 
@@ -1653,15 +1826,25 @@ static int __init apple_soc_cpufreq_module_init(void)
 	}
 
 	ret = cpufreq_register_driver(&apple_soc_cpufreq_driver);
-	if (ret && apple_fast_die_hp_state > 0)
-		cpuhp_remove_state_nocalls(apple_fast_die_hp_state);
+	if (ret) {
+		if (apple_fast_die_hp_state > 0)
+			cpuhp_remove_state_nocalls(apple_fast_die_hp_state);
+		return ret;
+	}
 
-	return ret;
+	/* Without the idle hooks the clusters are simply never parked. */
+	ret = apple_cpuidle_set_park_ops(&apple_soc_cpufreq_park_ops);
+	if (ret && ret != -ENODEV)
+		pr_warn("apple-cpufreq: idle parking unavailable (%d)\n", ret);
+
+	return 0;
 }
 module_init(apple_soc_cpufreq_module_init);
 
 static void __exit apple_soc_cpufreq_module_exit(void)
 {
+	/* Returns once no CPU is in an idle hook; no cluster is left parked. */
+	apple_cpuidle_clear_park_ops(&apple_soc_cpufreq_park_ops);
 	cpufreq_unregister_driver(&apple_soc_cpufreq_driver);
 	if (apple_fast_die_hp_state > 0)
 		cpuhp_remove_state_nocalls(apple_fast_die_hp_state);
