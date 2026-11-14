@@ -145,7 +145,8 @@ ane_fw_sleep_path(const struct ane_fw_platform *platform)
 	return platform ? ANE_SLEEP_FW_BACKEND : ANE_SLEEP_RTCLIENT;
 }
 
-extern const struct ane_fw_platform ane_h16_platform, ane_h17_platform, ane_t6050_platform;
+extern const struct ane_fw_platform ane_h16_platform, ane_h17_platform, ane_t6050_platform,
+				    ane_t8142_platform;
 int ane_fw_platform_preflight(struct platform_device *pdev,
 			      const struct ane_fw_platform *soc);
 

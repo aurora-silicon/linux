@@ -5172,7 +5172,8 @@ static int apple_dart_probe(struct platform_device *pdev)
 	dart->dev = dev;
 	dart->hw = of_device_get_match_data(dev);
 	dart->tunneled = tunneled;
-	dart->cold_ane = of_device_is_compatible(dev->of_node, "apple,t8140-ane-dart");
+	dart->cold_ane = of_device_is_compatible(dev->of_node, "apple,t8140-ane-dart") ||
+			 of_device_is_compatible(dev->of_node, "apple,t8142-ane-dart");
 	if (dart->cold_ane && !IS_BUILTIN(CONFIG_APPLE_DART))
 		return -EOPNOTSUPP;
 	dart->isp_host = of_device_is_compatible(dev->of_node, "apple,t6050-isp-dart");
@@ -5643,8 +5644,12 @@ params_done:
 		/* No reset, TCR/TTBR clear, global enable, remap or IRQ ACK.
 		 * Cold acquisition is checked by the staged ANE backend before
 		 * it attaches a private SID0 domain. Even bypass SIDs stay intact.
+		 * T8140's ANE DARTs are revision 0x203, T8142's 0x204.
 		 */
-		if (dart->locked || dart->version != 0x203 || dart->num_streams != 16 ||
+		u32 cold_version = of_device_is_compatible(dev->of_node, "apple,t8142-ane-dart") ?
+				   0x204 : 0x203;
+
+		if (dart->locked || dart->version != cold_version || dart->num_streams != 16 ||
 		    !bitmap_empty(dart->remapped, DART_MAX_STREAMS)) {
 			ret = -EPERM;
 			goto err_clk_disable;
