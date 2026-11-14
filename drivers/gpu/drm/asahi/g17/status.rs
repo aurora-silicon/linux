@@ -68,6 +68,16 @@ impl VmStatus {
         self.error.load(Ordering::Acquire)
     }
 
+    /// The process that created the VM: its name and thread-group ID.
+    pub(crate) fn client(&self) -> (&BStr, Pid) {
+        let len = self
+            .comm
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.comm.len());
+        (BStr::from_bytes(&self.comm[..len]), self.tgid)
+    }
+
     pub(crate) fn note_recovery_guilty(&self) {
         self.recovery_guilty.store(true, Ordering::Release);
     }
