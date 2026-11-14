@@ -107,6 +107,10 @@
 	status = "okay";
 };
 
+&cpu_pmu {
+	status = "okay";
+};
+
 &dockchannel {
 	status = "okay";
 };
@@ -184,3 +188,52 @@
 };
 
 /* Unexposed chassis port instances remain described and disabled. */
+
+/*
+ * aura (mcc_init_m5) turns the system level cache on; the driver confirms it
+ * and flushes on shutdown.
+ */
+&mcc {
+	status = "okay";
+};
+
+/*
+ * Video encoder: ADT ave ("ave2", pre-loaded) behind dart-ave, the same
+ * addresses, interrupts and power states as on the J815. aura hands over the
+ * preloaded firmware or disables the node.
+ */
+&ps_venc_sys {
+	status = "okay";
+};
+
+&ps_venc_dma {
+	status = "okay";
+};
+
+&ps_venc_pipe4 {
+	status = "okay";
+};
+
+&ps_venc_pipe5 {
+	status = "okay";
+};
+
+&ps_venc_me0 {
+	status = "okay";
+};
+
+&ps_venc_me1 {
+	status = "okay";
+};
+
+&ave_dart0 {
+	status = "okay";
+};
+
+&ave_dart1 {
+	status = "okay";
+};
+
+&ave {
+	status = "okay";
+};

@@ -1011,8 +1011,10 @@ static void ave_6070_hevc_contract(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_num_views[0]),
 			1U);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_sve_count), 1U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(start + sl->multi_me), 1U);
 	KUNIT_EXPECT_EQ(test, start[sl->hevc_vps_temporal_nesting], 1U);
 	KUNIT_EXPECT_EQ(test, start[sl->hevc_sps_temporal_nesting], 1U);
+	KUNIT_EXPECT_EQ(test, start[sl->hevc_sps_tmvp], 0U);
 	KUNIT_EXPECT_EQ(test, start[sl->hevc_sps_fw_header], 1U);
 	KUNIT_EXPECT_EQ(test, start[sl->hevc_pps_fw_header], 1U);
 	KUNIT_EXPECT_EQ(test,
@@ -1106,6 +1108,7 @@ static void ave_6070_hevc_contract(struct kunit *test)
 	memset(start, 0, 0x32dc8);
 	KUNIT_ASSERT_EQ(test, ave_build_start(ctx, start, 0x32dc8), 0);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(start + sl->hevc_rps), 4U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(start + sl->multi_me), 0U);
 	for (u32 i = 0; i < 4; i++) {
 		u32 entry = sl->hevc_rps + 4 + i * 0x164;
 

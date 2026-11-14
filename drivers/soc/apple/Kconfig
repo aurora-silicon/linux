@@ -105,8 +105,8 @@ config APPLE_SOC_SLEEP
 	  /chosen/aurora,s2r-mailbox.
 
 	  Only SoCs whose sleep has been measured and tested are supported,
-	  each by its match data: today T8140. On every other SoC the driver
-	  doesn't bind, and s2idle stays the only system sleep.
+	  each by its match data: today T8140 and T8132. On every other SoC
+	  the driver doesn't bind, and s2idle stays the only system sleep.
 
 config APPLE_SOC_SLEEP_KUNIT_TEST
 	bool "KUnit tests for the Apple SoC sleep match data" if !KUNIT_ALL_TESTS

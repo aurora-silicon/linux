@@ -511,6 +511,12 @@ int dcp_typec_phy_on(struct apple_dcp *dcp)
 	route = READ_ONCE(dcp->active_typec_route);
 	if (!route)
 		return 0;
+	/*
+	 * A Thunderbolt DP tunnel does not use the PHY's DP lanes: the port is
+	 * in USB4 mode and a DP-alt PHY refuses it (T6040: -EBUSY while CIO is up).
+	 */
+	if (route->tunnel)
+		return 0;
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
 	    route->deactivate_xbar_done)
 		return -ENODEV;

@@ -393,10 +393,10 @@ properties:
               - apple,panel
               - apple,panel-mini-led
           - items:
-              - pattern: '^apple,panel-j[0-9]+$'
+              - pattern: '^apple,panel-[jk][0-9]+$'
               - const: apple,panel
           - items:
-              - pattern: '^apple,panel-j[0-9]+$'
+              - pattern: '^apple,panel-[jk][0-9]+$'
               - const: apple,panel-mini-led
               - const: apple,panel
       width-mm:

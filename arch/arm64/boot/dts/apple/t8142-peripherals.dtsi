@@ -479,6 +479,70 @@
 		power-domains = <&ps_msr>;
 		status = "disabled";
 	};
+
+	/*
+	 * The video encoder's power states (J815 ADT pmgr): VENC_SYS (id 63,
+	 * parent AFISOCNI0, no power state) feeds VENC_DMA, which feeds the two
+	 * pipes and ME0; ME1 sits under ME0. The same tree as one A18 Pro encoder.
+	 */
+	ps_venc_sys: power-controller@298 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x298 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc_sys";
+		status = "disabled";
+	};
+
+	ps_venc_dma: power-controller@8000 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8000 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc_dma";
+		power-domains = <&ps_venc_sys>;
+		status = "disabled";
+	};
+
+	ps_venc_pipe4: power-controller@8008 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8008 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc_pipe4";
+		power-domains = <&ps_venc_dma>;
+		status = "disabled";
+	};
+
+	ps_venc_pipe5: power-controller@8010 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8010 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc_pipe5";
+		power-domains = <&ps_venc_dma>;
+		status = "disabled";
+	};
+
+	ps_venc_me0: power-controller@8018 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8018 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc_me0";
+		power-domains = <&ps_venc_dma>;
+		status = "disabled";
+	};
+
+	ps_venc_me1: power-controller@8020 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8020 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc_me1";
+		power-domains = <&ps_venc_me0>;
+		status = "disabled";
+	};
 };
 
 &{/soc} {
@@ -540,6 +604,53 @@
 		      <0x2 0x10000000 0x0 0xff4000>;
 		#clock-cells = <1>;
 		apple,pmgr = <&pmgr>;
+		status = "disabled";
+	};
+
+	/*
+	 * The video encoder (ADT ave, "ave2", soc-id t8142): the A18 Pro's
+	 * encoder at 0x281000000 instead of 0x285000000. Its firmware is
+	 * preloaded by iBoot and handed over by the boot loader, which adds the
+	 * memory regions. dart-ave is two DARTs (DART and CPUDART) on one IRQ;
+	 * stream 12 carries the temporal filter engines and must translate
+	 * through the encoder's domain, not bypass.
+	 */
+	ave_dart0: iommu@281080000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <0x2 0x81080000 0x0 0xc000>;
+		interrupts = <AIC_IRQ 1096 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc_sys>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x00004000 0x0 0xffffc000>;
+		status = "disabled";
+	};
+
+	ave_dart1: iommu@2810a0000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <0x2 0x810a0000 0x0 0xc000>;
+		interrupts = <AIC_IRQ 1096 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc_sys>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x00004000 0x0 0xffffc000>;
+		status = "disabled";
+	};
+
+	ave: video-codec@281100000 {
+		compatible = "apple,t8142-ave";
+		reg = <0x2 0x81100000 0x0 0x45c000>,
+		      <0x2 0x81050000 0x0 0x4000>,
+		      <0x2 0x81800000 0x0 0x800000>;
+		reg-names = "codec", "mailbox", "coproc";
+		interrupts = <AIC_IRQ 1099 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1093 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1092 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1095 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1094 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_venc_dma>, <&ps_venc_pipe4>,
+				<&ps_venc_pipe5>, <&ps_venc_me0>, <&ps_venc_me1>;
+		power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
+		iommus = <&ave_dart0 0>, <&ave_dart0 12>,
+			 <&ave_dart1 0>, <&ave_dart1 12>;
 		status = "disabled";
 	};
 

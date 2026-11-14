@@ -111,6 +111,8 @@ struct tb_nhi_ring_layout {
  *	       Lets the NHI recover a port whose link went down while the
  *	       cable stays attached.
  * @init_interrupts: NHI specific interrupt initialization hook
+ * @router_sleep: Enter host-router sleep with the control channel running
+ * @router_wake: Start the host router's links again after its controller restarted
  * @reset_interface: Resets the host interface
  */
 struct tb_nhi_ops {
@@ -143,6 +145,8 @@ struct tb_nhi_ops {
 	bool (*dp_tunnel_awaits_display)(struct tb_nhi *nhi, struct tb_port *in);
 	int (*init_interrupts)(struct tb_nhi *nhi);
 	void (*reset_interface)(struct tb_nhi *nhi);
+	int (*router_sleep)(struct tb_nhi *nhi);
+	int (*router_wake)(struct tb_nhi *nhi);
 };
 
 /*

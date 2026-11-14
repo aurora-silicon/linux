@@ -204,7 +204,9 @@ properties:
       power domain of this DART. Its consumer may power that domain down: the
       DART's streams are then disabled and flushed, and the slice disabled,
       before the domain powers off, and the slice is enabled again when it
-      powers up. Only the J713 internal display DARTs use it.
+      powers up. On the J713 the internal display DARTs use it for their DCP's
+      power-down, and the ACIO, tunneled PCIe and external display DARTs for a
+      deep sleep, in which their hosts save and restore them.
 
   apple,manual-availability:
     type: boolean

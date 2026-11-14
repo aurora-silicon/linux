@@ -1,0 +1,155 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * K116s GPU (AGX G17S, ADT /arm-io/sgx "gpu,t6050") for the boot loader hand-off.
+ *
+ * It is the GPU half of t6050-j714s-gpu-panel.dtsi (integration/aurora 06c3db9c3752); the
+ * K116s tree already has its own display half. Everything stays disabled: a loader with the
+ * G17S hand-off fills the six reservations from the ADT and enables the GPU PMGR, GPX, AFR,
+ * GFX, both mailboxes and the GPU, the GPU last. Without such a loader (the enrolled aura
+ * 58d65df0 has none for this layout) this file changes nothing at run time except the two
+ * always-on marks, which sit on disabled nodes.
+ *
+ * Every value below was checked against the K116s 27.2 ADT. arm-io ranges add 0x2_0000_0000
+ * to the 0x21_xxxx_xxxx bus addresses (bus 0x20_2000_0000 -> parent 0x22_2000_0000).
+ */
+
+/ {
+	aliases {
+		/* The loader finds the GPU through this alias */
+		gpu = &sgx;
+	};
+
+	reserved-memory {
+		/*
+		 * Filled and enabled by the loader from the ADT. K116s 27.2 values, for
+		 * reference only (never hard-code: iBoot places them):
+		 *   gpu-fw-text       0x100_00ff8000 + 0xa4000  gfx-asc __TEXT 0x50000, then
+		 *                                               gfx1-asc __TEXT 0x54000 at
+		 *                                               0x100_01048000
+		 *   gpu-fw-data       0x100_0251c000 + 0x184000 sgx gfx-data-base .. end of
+		 *                                               gfx1-data-shared-ro
+		 *   uat-ttbs          0x10f_fffa8000 + 0x4000   sgx gpu-region-base/-size
+		 *   uat-pagetables    0x10f_fff28000 + 0x80000  sgx gfx-shared-region-*
+		 *   uat-l2-pagetables 0x10f_fff24000 + 0x4000   sgx gfx-shared-l2-region-*
+		 *   uat-handoff       0x10f_fff20000 + 0x4000   sgx gfx-handoff-*
+		 * The four UAT ranges are the J714s's (aura ec204ea50b5d message); the firmware
+		 * segments differ (J714s 27.0: fw-text 0x100_00fd4000, fw-data 0x100_024f4000).
+		 */
+		gpu_fw_text: gpu-fw-text {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		gpu_fw_data: gpu-fw-data {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		uat_ttbs: uat-ttbs {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		uat_pagetables: uat-pagetables {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		uat_l2_pagetables: uat-l2-pagetables {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+
+		uat_handoff: uat-handoff {
+			reg = <0 0 0 0>;
+			no-map;
+			status = "disabled";
+		};
+	};
+};
+
+/* The inventory ASC nodes; the mailboxes below describe the same windows. */
+/delete-node/ &gfx_asc;
+/delete-node/ &gfx1_asc;
+
+&{/soc} {
+	/*
+	 * ADT gfx-asc: reg 0x21_02600000 + 0x88000 (wrapper), 0x21_02050000 + 8 (iop-vbar);
+	 * interrupts [2798, 2797, 2800, 2799], of which the second and third are send-empty
+	 * and recv-not-empty; role "GFX"; power-gates [614] = GFX_ASC. As J714s.
+	 */
+	gfx_mbox: mailbox@2302600000 {
+		compatible = "apple,t6050-j775d-ascwrap-v6";
+		reg = <0x23 0x2600000 0x0 0x88000>,
+		      <0x23 0x2050000 0x0 0x8>;
+		reg-names = "wrapper", "iop-vbar";
+		interrupts = <AIC_IRQ 0 2797 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 2800 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "recv-not-empty";
+		apple,firmware-role = "GFX";
+		power-domains = <&ps_gfx>;
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	/*
+	 * ADT gfx1-asc: reg 0x21_02e00000 + 0x88000, 0x21_02850000 (ADT size 0x60000; the
+	 * driver uses the first 8 bytes as on J714s); interrupts [2802, 2801, 2804, 2803];
+	 * role "GFX1"; power-gates [657] = GFX_ASC1.
+	 */
+	gfx1_mbox: mailbox@2302e00000 {
+		compatible = "apple,t6050-j775d-ascwrap-v6";
+		reg = <0x23 0x2e00000 0x0 0x88000>,
+		      <0x23 0x2850000 0x0 0x8>;
+		reg-names = "wrapper", "iop-vbar";
+		interrupts = <AIC_IRQ 0 2801 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 2804 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "recv-not-empty";
+		apple,firmware-role = "GFX1";
+		power-domains = <&ps_gfx>;
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+};
+
+/*
+ * ADT pmgr devices: GPX (id 359, reg +0x0), AFR (id 360, +0x100) and GFX (id 362, +0x110)
+ * in the GPU PMGR (pmgr reg[51] 0x21_00e80000). The K116s ADT marks GPX and AFR critical,
+ * GFX not, as the J714s file states for its board.
+ */
+&ps_gpx {
+	apple,always-on;
+};
+
+&ps_afr {
+	apple,always-on;
+};
+
+&sgx {
+	/*
+	 * "apple,agx-g17s" is what the loader checks and the driver binds
+	 * (drivers/gpu/drm/asahi/driver.rs). The driver uses the J714 tables for it,
+	 * 5 mV below this unit's ADT voltages at eight of the fourteen states.
+	 */
+	compatible = "apple,agx-g17s";
+	/* ADT sgx reg[0] 0x21_00000000 + 0x3fdc000; the driver maps the first 16 MiB as "sgx" */
+	reg = <0x23 0x0 0x0 0x3fdc000>;
+	reg-names = "sgx";
+	/delete-property/ interrupts;
+	mboxes = <&gfx_mbox>, <&gfx1_mbox>;
+	memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>,
+			<&gpu_fw_data>, <&uat_l2_pagetables>, <&gpu_fw_text>;
+	memory-region-names = "ttbs", "pagetables", "handoff", "fw-data",
+			      "l2-pagetables", "fw-text";
+	/*
+	 * As t6050-j714s.dts: the GPU on the PMP's GFX report entry (report@f, on ps_gfx),
+	 * so the PMP is told the GPU is on only while it is powered. The K116s already
+	 * runs the PMP with its report (t6050-k116s.dts &pmp0_report).
+	 */
+	power-domains = <&pmp0_gfx>;
+};

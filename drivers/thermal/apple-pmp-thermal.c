@@ -28,6 +28,7 @@
 #include <linux/soc/apple/pmp-cooling.h>
 #include <linux/soc/apple/pmp-power-policy.h>
 #include <linux/soc/apple/t8132.h>
+#include <linux/suspend.h>
 #include <linux/thermal.h>
 #include <linux/workqueue.h>
 
@@ -39,6 +40,8 @@
  */
 #define APPLE_PMP_HYST_MC		2000
 #define APPLE_PMP_POLL_MS		5
+/* Inside the cooling slope window (50-250 ms); used while cool and idle. */
+#define APPLE_PMP_SLOW_POLL_MS		100
 #define APPLE_PMP_GOVERNOR_NS	100000000ULL
 
 struct apple_pmp_cluster {
@@ -65,6 +68,9 @@ static struct {
 	bool enabled;
 	long cached_mc;
 	int cached_error;
+	/* The last reading from a sensor that was valid, and when. */
+	u64 valid_ns;
+	long valid_mc;
 	u64 governor_ns;
 	unsigned long long sample_count, governor_count;
 	struct apple_pmp_confirmation critical;
@@ -72,9 +78,11 @@ static struct {
 	struct hrtimer poll_timer;
 	struct work_struct poll_work;
 	bool polling;
+	bool fast_poll;
 	bool owner; /* apple-soc-cpufreq's unmanaged cap is released */
 	bool critical_dumped;
 	bool ready;
+	bool sleep_paused;
 } pmp_thermal = {
 	.lock = __MUTEX_INITIALIZER(pmp_thermal.lock),
 };
@@ -363,6 +371,15 @@ static int apple_pmp_sample(void)
 	old_level = pmp_thermal.guard_level;
 	old_reason = cooling->reason;
 	ret = apple_pmp_sample_all(&snapshot, &value);
+	if (!ret) {
+		pmp_thermal.valid_ns = snapshot.finished_ns;
+		pmp_thermal.valid_mc = value;
+	} else if (ret == -ENODATA && pmp_thermal.valid_ns &&
+		   snapshot.finished_ns - pmp_thermal.valid_ns < APPLE_PMP_GATED_HOLD_NS &&
+		   pmp_thermal.valid_mc < APPLE_PMP_GATED_HOLD_MC) {
+		value = pmp_thermal.valid_mc;
+		ret = 0;
+	}
 	was_confirmed = pmp_thermal.critical.confirmed;
 	apple_pmp_confirmation_sample(&pmp_thermal.critical, value, ret,
 				      snapshot.finished_ns);
@@ -380,6 +397,7 @@ static int apple_pmp_sample(void)
 				DIV_ROUND_UP(state * 8, cdev->max_state));
 	}
 	level = apple_pmp_cooling_level(cooling);
+	WRITE_ONCE(pmp_thermal.fast_poll, apple_pmp_cooling_fast(cooling, value, ret));
 	/* Never release startup/fault protection with disabled or unbound cooling. */
 	if (!pmp_thermal.enabled)
 		level = 8;
@@ -490,7 +508,9 @@ static enum hrtimer_restart apple_pmp_poll_timer(struct hrtimer *timer)
 	 * One work item coalesces missed ticks; no burst of stale confirmations.
 	 */
 	queue_work(system_highpri_wq, &pmp_thermal.poll_work);
-	hrtimer_forward_now(timer, ms_to_ktime(APPLE_PMP_POLL_MS));
+	hrtimer_forward_now(timer, ms_to_ktime(READ_ONCE(pmp_thermal.fast_poll) ?
+					     APPLE_PMP_POLL_MS :
+					     APPLE_PMP_SLOW_POLL_MS));
 	return HRTIMER_RESTART;
 }
 
@@ -501,6 +521,7 @@ static int apple_pmp_change_mode(struct thermal_zone_device *zone,
 	pmp_thermal.enabled = mode == THERMAL_DEVICE_ENABLED;
 	apple_pmp_gpu_publish(pmp_thermal.sensors, 0, 8, 0);
 	apple_pmp_cooling_init(&pmp_thermal.cooling);
+	WRITE_ONCE(pmp_thermal.fast_poll, true);
 	return apple_pmp_guard(8);
 }
 
@@ -704,6 +725,7 @@ static int apple_pmp_thermal_setup(void)
 	pmp_thermal.power_polling = true;
 	schedule_delayed_work(&pmp_thermal.power_work, msecs_to_jiffies(500));
 	pmp_thermal.polling = true;
+	pmp_thermal.fast_poll = true;
 	hrtimer_start(&pmp_thermal.poll_timer, ms_to_ktime(APPLE_PMP_POLL_MS),
 		      HRTIMER_MODE_REL);
 	/* Both guards start at the minimum frequency: hand over the cpufreq cap. */
@@ -714,7 +736,7 @@ static int apple_pmp_thermal_setup(void)
 		if (ret)
 			goto fail;
 	}
-	pr_info("apple-pmp-thermal: J713 provisional policy: CPU/GPU cooling from 106 C, target 110 C, full protection 115 C, three >=120 C samples for shutdown, 5 ms sampling/100 ms governor, shared measured-rail power budget\n");
+	pr_info("apple-pmp-thermal: J713 provisional policy: CPU/GPU cooling from 106 C, target 110 C, full protection 115 C, three >=120 C samples for shutdown, 5 ms sampling from 95 C or while cooling (100 ms below), 100 ms governor, shared measured-rail power budget\n");
 	pmp_thermal.ready = true;
 	return 0;
 fail:
@@ -748,6 +770,7 @@ static int apple_pmp_thermal_probe(struct platform_device *pdev)
 	pmp_thermal.sensors = sensors;
 	pmp_thermal.cached_error = -EAGAIN;
 	pmp_thermal.power_error = -EAGAIN;
+	pmp_thermal.valid_ns = 0;
 	pmp_thermal.critical = (struct apple_pmp_confirmation) {};
 	pmp_thermal.shutdown_requested = false;
 	pmp_thermal.critical_dumped = false;
@@ -761,6 +784,52 @@ static int apple_pmp_thermal_probe(struct platform_device *pdev)
 	return 0;
 }
 
+/*
+ * A deep sleep stops the PMP: sampling on through it would read its sensors stopped and
+ * restrict the CPUs and the GPU for seconds after the wake. Nothing runs to heat the die
+ * from the first device callback to the last, so neither sampler runs in between.
+ */
+static int apple_pmp_thermal_prepare(struct device *dev)
+{
+	if (!pm_suspend_via_firmware())
+		return 0;
+	if (pmp_thermal.polling) {
+		hrtimer_cancel(&pmp_thermal.poll_timer);
+		cancel_work_sync(&pmp_thermal.poll_work);
+	}
+	if (pmp_thermal.power_polling)
+		cancel_delayed_work_sync(&pmp_thermal.power_work);
+	pmp_thermal.sleep_paused = true;
+	return 0;
+}
+
+static void apple_pmp_thermal_complete(struct device *dev)
+{
+	struct apple_pmp_power_policy *p = &pmp_thermal.power;
+
+	if (!pmp_thermal.sleep_paused)
+		return;
+	pmp_thermal.sleep_paused = false;
+	scoped_guard(mutex, &pmp_thermal.lock) {
+		/* The sleep is no telemetry gap, nor cool time to refill the bucket. */
+		if (p->last_ns)
+			p->last_ns = ktime_get_ns();
+		if (p->active & BIT(2))
+			apple_pmp_gpu_publish(pmp_thermal.sensors, pmp_thermal.gpu_epoch,
+					      p->level[2], p->last_ns);
+	}
+	if (pmp_thermal.power_polling)
+		schedule_delayed_work(&pmp_thermal.power_work, msecs_to_jiffies(500));
+	if (pmp_thermal.polling)
+		hrtimer_start(&pmp_thermal.poll_timer, ms_to_ktime(APPLE_PMP_POLL_MS),
+			      HRTIMER_MODE_REL);
+}
+
+static const struct dev_pm_ops apple_pmp_thermal_pm_ops = {
+	.prepare = apple_pmp_thermal_prepare,
+	.complete = apple_pmp_thermal_complete,
+};
+
 static void apple_pmp_thermal_remove(struct platform_device *pdev)
 {
 	cancel_delayed_work_sync(&pmp_thermal.setup_work);
@@ -772,6 +841,7 @@ static struct platform_driver apple_pmp_thermal_driver = {
 	.remove = apple_pmp_thermal_remove,
 	.driver = {
 		.name = "apple-pmp-thermal",
+		.pm = pm_sleep_ptr(&apple_pmp_thermal_pm_ops),
 	},
 };
 module_platform_driver(apple_pmp_thermal_driver);

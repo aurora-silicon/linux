@@ -35,6 +35,8 @@ def parking(root):
 struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
     bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+    /* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
+    struct { bool prepared; } cio_sleep;
     /* dp_lioa/dp_common_config: T8142's banked DisplayPort calibration. */
     struct { void *usb3_dp, *dp_lioa, *dp_common_config; } tunables;
     /* A sleep took the USB host's domains down; never set here. */
@@ -1932,6 +1934,8 @@ def pipe(root):
 struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
     bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+    /* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
+    struct { bool prepared; } cio_sleep;
     struct { void *usb3_dp, *dp_lioa, *dp_common_config; } tunables;
 
     bool dp_only, pd_was_off, tunnel_clock_on;
@@ -2330,6 +2334,8 @@ def unwind(root):
 struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
     bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+    /* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
+    struct { bool prepared; } cio_sleep;
     struct { void *usb3_dp, *dp_lioa, *dp_common_config; } tunables;
 
     bool dp_only, pd_was_off, tunnel_clock_on;
@@ -2651,6 +2657,8 @@ typedef uint32_t u32;
 struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
     bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
+    /* A CIO sleep is T8132's too, covered by tools/asahi/atc-cio-sleep-tests.py. */
+    struct { bool prepared; } cio_sleep;
     struct { void *usb3_dp, *dp_lioa, *dp_common_config; } tunables;
 
     bool dp_only, pd_was_off, tunnel_clock_on;

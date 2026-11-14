@@ -708,16 +708,12 @@ dptxport_call_get_supports_downspread(struct apple_epic_service *service,
 	return 0;
 }
 
-static int dptxport_call_set_tiled_display_hint(struct apple_epic_service *service,
-						 const void *data, size_t data_size,
-						 void *reply_, size_t reply_size)
+/* Remember which tile of a tiled sink this port carries (dcp_tb_split_*). */
+static void dptxport_note_tile_hint(struct apple_epic_service *service,
+				    const void *data, size_t data_size)
 {
-	struct dptxport_apcall_set_tiled *reply = reply_;
 	struct dptx_port *dptx = service->cookie;
 	const u8 *hint = data;
-
-	if (reply_size < sizeof(*reply))
-		return -EINVAL;
 
 	if (dptx)
 		smp_store_release(&dptx->tile_hint, false);
@@ -731,6 +727,8 @@ static int dptxport_call_set_tiled_display_hint(struct apple_epic_service *servi
 		dptx->tiles_v = min(v, 255U);
 		dptx->tile_x = min(x, 255U);
 		dptx->tile_y = min(y, 255U);
+		dptx->tile_width = get_unaligned_le32(hint + DPTX_TILE_HINT_WIDTH);
+		dptx->tile_height = get_unaligned_le32(hint + DPTX_TILE_HINT_HEIGHT);
 		/* Only the two horizontal tiles carried by these two ports fit. */
 		smp_store_release(&dptx->tile_hint,
 				  h == 2 && v == 1 && x == dptx->unit && y == 0 &&
@@ -743,7 +741,17 @@ static int dptxport_call_set_tiled_display_hint(struct apple_epic_service *servi
 				 get_unaligned_le32(hint + DPTX_TILE_HINT_WIDTH),
 				 get_unaligned_le32(hint + DPTX_TILE_HINT_HEIGHT));
 	}
+}
 
+static int dptxport_call_set_tiled_display_hint(struct apple_epic_service *service,
+						 const void *data, size_t data_size,
+						 void *reply_, size_t reply_size)
+{
+	struct dptxport_apcall_set_tiled *reply = reply_;
+
+	if (reply_size < sizeof(*reply))
+		return -EINVAL;
+	dptxport_note_tile_hint(service, data, data_size);
 	reply->retcode = cpu_to_le32(1);
 	return 0;
 }
@@ -975,6 +983,14 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 	case DPTX_APCALL_SET_TILED_DISPLAY_HINTS: {
 		int ret;
 
+		/*
+		 * A tiled sink behind a Thunderbolt tunnel (Studio Display over
+		 * TB3: two 2560x2880 tiles) takes its second tile on dpin1, so
+		 * the hint is recorded on the desktop 26.6 path as well.
+		 */
+		if (service->ep->dcp->dptx_tunnel &&
+		    service->ep->dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
+			dptxport_note_tile_hint(service, data, data_size);
 		if (dptxport_dual_pipe_alloc(service, data, data_size, reply,
 					     reply_size))
 			return 0;

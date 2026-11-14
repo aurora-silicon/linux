@@ -803,6 +803,40 @@ static u64 calculate_clock(struct dimension *horiz, struct dimension *vert)
 	return DIV_ROUND_CLOSEST_ULL(clock >> 16, 1000);
 }
 
+/* Is this timing the full size of the tiled display the sink reported? */
+static bool timing_is_tiled_size(const struct dcp_parse_ctx *handle)
+{
+	struct dcp_parse_ctx scan = *handle;
+	struct iterator it;
+	s64 width = -1, height = -1;
+
+	if (iterator_begin(&scan, &it, true))
+		return false;
+	for (; it.idx < it.len; it.idx++) {
+		struct dimension dim;
+		char *key = parse_string(&scan);
+		int ret;
+
+		if (IS_ERR(key))
+			return false;
+		if (!strcmp(key, "HorizontalAttributes")) {
+			ret = parse_dimension(&scan, &dim, false);
+			if (!ret)
+				width = dim.active;
+		} else if (!strcmp(key, "VerticalAttributes")) {
+			ret = parse_dimension(&scan, &dim, false);
+			if (!ret)
+				height = dim.active;
+		} else {
+			ret = skip(&scan);
+		}
+		kfree(key);
+		if (ret)
+			return false;
+	}
+	return width == handle->tiled_width && height == handle->tiled_height;
+}
+
 static int parse_mode(struct dcp_parse_ctx *handle,
 		      struct dcp_display_mode *out, s64 *score, int width_mm,
 		      int height_mm, unsigned notch_height, bool internal, bool external_sdr)
@@ -852,6 +886,8 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		limits_known = !ret;
 		ret = 0;
 	}
+	if (!internal && handle->tiled_width && timing_is_tiled_size(handle))
+		limits.dsc_required.count = 0;
 	ret = iterator_begin(handle, &it, true);
 	if (ret)
 		return ret;

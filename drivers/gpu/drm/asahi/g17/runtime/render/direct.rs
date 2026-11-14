@@ -284,6 +284,9 @@ impl Backend {
             || packet.cancel_requested()
             || packet.completion.status().get() != 0
             || packet.order.wait_through[1].unwrap_or(0) != 0
+            // Only the device-mutex path resolves a staged render's tiling prefixes.
+            || matches!(&packet.command, crate::g17::command::Validated::Render { pass, .. }
+                if pass.stage_prefixes)
             || self.admission_open().is_err()
         {
             return None;
