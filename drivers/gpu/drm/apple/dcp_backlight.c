@@ -429,9 +429,16 @@ int dcp_backlight_prepare(struct apple_dcp *dcp, bool have_surface,
 
 	spin_lock_irqsave(&dcp->backlight.lock, flags);
 	ret = dcp_bl_prepare(&dcp->backlight.state, have_surface, present);
-	/* No reservation: carry the last completed level on an ordinary present. */
-	if (ret == -EALREADY)
+	/*
+	 * No reservation: carry the last completed level on an ordinary
+	 * present, and on one without a surface, which cannot apply a new
+	 * level. A pending level waits for the next present with a surface.
+	 */
+	if (ret == -EALREADY ||
+	    (ret == -ENODATA && !have_surface && dcp->backlight.state.ready)) {
 		present->nits = dcp->backlight.state.actual;
+		ret = -EALREADY;
+	}
 	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
 	return ret;
 }
