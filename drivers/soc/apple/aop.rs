@@ -125,14 +125,9 @@ const EPIC_SUBTYPE_FAKEHID_REPORT: u16 = 0xc4;
 /// these report subtypes; they carry the same payload as a fake-HID report.
 const EPIC_SUBTYPE_GYRO_REPORT: u16 = 0xc1;
 const EPIC_SUBTYPE_ACCEL_REPORT: u16 = 0xc2;
-const EPIC_SUBTYPE_RETCODE: u16 = 0x84;
-const EPIC_SUBTYPE_RETCODE_PAYLOAD: u16 = 0xa0;
-const EPIC_SUBTYPE_STRING: u16 = 0x8a;
-/// Replies to the client-open (25) and client-close (26) commands. As with
-/// the other replies, the subtype is the request's with bit 7 set, and the
-/// body starts with the return code.
-const EPIC_SUBTYPE_CLIENT_OPEN_REPLY: u16 = 0x99;
-const EPIC_SUBTYPE_CLIENT_CLOSE_REPLY: u16 = 0x9a;
+/// A reply's subtype is the request's with bit 7 set, and its body starts with
+/// the return code: 0x84, 0xa0, 0x8a, 0x99 (client open), 0x81 (HID descriptor).
+const EPIC_SUBTYPE_REPLY_BIT: u16 = 0x80;
 const QE_MAGIC1: u32 = from_fourcc(b" POI");
 const QE_MAGIC2: u32 = from_fourcc(b" POA");
 /// Bound on the wait for the reply to an EPIC call. The firmware can stop
@@ -813,12 +808,7 @@ impl AFKEndpoint {
             // A report nobody listens for.
             return Err(ENOENT);
         } else if ehdr.category == EPIC_CATEGORY_REPLY {
-            if subtype == EPIC_SUBTYPE_RETCODE_PAYLOAD
-                || subtype == EPIC_SUBTYPE_RETCODE
-                || subtype == EPIC_SUBTYPE_STRING
-                || subtype == EPIC_SUBTYPE_CLIENT_OPEN_REPLY
-                || subtype == EPIC_SUBTYPE_CLIENT_CLOSE_REPLY
-            {
+            if subtype & EPIC_SUBTYPE_REPLY_BIT != 0 {
                 if data.len() < mem::size_of::<u32>() {
                     return Err(EMSGSIZE);
                 }

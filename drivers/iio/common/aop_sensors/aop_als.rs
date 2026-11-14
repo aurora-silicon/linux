@@ -149,12 +149,12 @@ fn enable_als(
     let mut req = KVec::new();
     req.resize(8, 0, GFP_KERNEL)?;
     match aop.epic_call_ret(svc, EPIC_SUBTYPE_HID_DESCRIPTOR, &req, 256) {
-        Ok((status, desc)) => dev_info!(
-            dev.as_ref(),
-            "HID descriptor: status {:#x} head {:02x?}\n",
-            status,
-            &desc[..desc.len().min(32)]
-        ),
+        Ok((status, desc)) => {
+            dev_info!(dev.as_ref(), "HID descriptor: status {:#x} len {}\n", status, desc.len());
+            for (i, row) in desc.chunks(64).enumerate() {
+                dev_info!(dev.as_ref(), "HID descriptor +{:#05x}: {:02x?}\n", i * 64, row);
+            }
+        }
         Err(e) => dev_info!(dev.as_ref(), "HID descriptor: {:?}\n", e),
     }
     Ok(())
