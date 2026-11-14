@@ -227,6 +227,24 @@ struct dcp_panel {
 };
 
 /*
+ * The internal display's power words for hw.s2r, see dcp_s2r_domains_off(): its domains'
+ * offsets in "ps", its retention controls in "pwrgate" (the PMGR's per-device "retention"
+ * words: flip-flops 3 off / 0 on, memories 0 off / 1 on), and the DART streams its firmware
+ * and scanout use.
+ */
+struct dcp_s2r_layout {
+	u32 disp_cpu;
+	u32 disp_fe;
+	u32 disp_sys;
+	u32 ret_ff;
+	u32 ret_mem;
+	u32 dcp_streams;
+	u32 disp_streams;
+	/* "pmc-dcp" counts the powered DCPs: T8132 and T8140 only */
+	bool pmc_dcp;
+};
+
+/*
  * Identity of a fixed internal panel, for the EDID published on its
  * connector.  Any processor with an internal panel allocates it; the boot
  * loader's ADT supplies the fallback, and firmware metadata or a raw panel
@@ -286,6 +304,15 @@ struct apple_dcp_hw_data {
 	bool s2r_ext;
 	/* The firmware crashes on any mode but the 120 Hz boot timing, see dcp_mode_settable(). */
 	bool only_120hz_modes;
+	/* Required with @s2r */
+	const struct dcp_s2r_layout *s2r_layout;
+	/* @s2r with derived power words: off unless appledrm.s2r_untested is set */
+	bool s2r_untested;
+	/*
+	 * @s2r without a secure mailbox: the SoC's ADT has no dcp-exclave-mailbox (T8142, on
+	 * firmware 27.0 and 27.2.1), so there is no secure port to idle before the IOP.
+	 */
+	bool s2r_no_secure_port;
 };
 
 enum dcp_test_point {
