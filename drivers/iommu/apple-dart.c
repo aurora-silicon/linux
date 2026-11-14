@@ -4664,6 +4664,14 @@ static irqreturn_t apple_dart_irq(int irq, void *dev)
 
 static bool apple_dart_is_locked(struct apple_dart *dart)
 {
+	/*
+	 * apple,retain-translation: the bootloader left live stream tables
+	 * that a co-processor's firmware depends on, but did not set the lock
+	 * bit (T8152 dart-sbr: AOP and audio ADMAC streams). Treat it as
+	 * locked so the tables are inherited rather than reset.
+	 */
+	if (of_property_read_bool(dart->dev->of_node, "apple,retain-translation"))
+		return true;
 	return !!(apple_dart_readl(dart, dart->hw->lock) & dart->hw->lock_bit);
 }
 

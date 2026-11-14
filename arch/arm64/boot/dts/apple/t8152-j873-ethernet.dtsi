@@ -1,0 +1,72 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J873g internal PCIe (apcie) port 2: the on-board 10GbE NIC (ADT
+ * /arm-io/apcie/pci-bridge2/lan0; the ADT names an aqc107, the device has
+ * PCI ID 10ec:8127 and identifies as a Realtek RTL8125CP, XID 0x708).
+ * iBoot leaves the APCIE power domains on and
+ * the root complex enabled, but the AUS5 PHY gated and the lanes assigned
+ * to port 0; the loader ungates the PHY, writes the ADT lane-cfg and applies
+ * the dart-apcie2 tunables first. Port setup follows the T602x/T8122
+ * register layout. Port 0 (N1) is bus 1, port 2 is bus 2.
+ * Resources are from the 26A434 ADT: apcie, dart-apcie2, gpio0.
+ */
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	aliases {
+		ethernet0 = &ethernet0;
+	};
+};
+
+/*
+ * dart-apcie2, described in t8152-peripherals.dtsi. The ADT window is
+ * 0x20000; keep the 0xc000 this port was brought up with, the size that
+ * pcie0_dart has in t8152-j873-n1.dtsi.
+ */
+&pcie2_dart {
+	reg = <0x3 0x8a000000 0x0 0xc000>;
+	status = "okay";
+};
+
+&pcie {
+	reg = <0x1c 0xb0000000 0x0 0x1000000>,	/* config */
+	      <0x3 0x8c000000 0x0 0x4000>,	/* rc */
+	      <0x3 0x88028000 0x0 0x4000>,	/* port0 */
+	      <0x3 0x8f010000 0x0 0x4000>,	/* phy0 */
+	      <0x3 0x8a028000 0x0 0x4000>,	/* port2 */
+	      <0x3 0x8f018000 0x0 0x4000>;	/* phy2 */
+	reg-names = "config", "rc", "port0", "phy0", "port2", "phy2";
+	/* One per root port, indexed by the port number. */
+	interrupts = <AIC_IRQ 1571 IRQ_TYPE_LEVEL_HIGH>,
+		     <AIC_IRQ 1579 IRQ_TYPE_LEVEL_HIGH>,
+		     <AIC_IRQ 1587 IRQ_TYPE_LEVEL_HIGH>;
+	iommu-map = <0x100 &pcie0_dart 1 1>,
+		    <0x101 &pcie0_dart 2 1>,
+		    <0x102 &pcie0_dart 3 1>,
+		    <0x200 &pcie2_dart 1 1>;
+	bus-range = <0 7>;
+
+	port02: pci@2,0 {
+		device_type = "pci";
+		reg = <0x1000 0x0 0x0 0x0 0x0>;
+		reset-gpios = <&pinctrl_ap 5 GPIO_ACTIVE_LOW>;
+		bus-range = <2 2>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		interrupt-controller;
+		#interrupt-cells = <1>;
+		interrupt-map-mask = <0 0 0 7>;
+		interrupt-map = <0 0 0 1 &port02 0 0 0 0>,
+				<0 0 0 2 &port02 0 0 0 1>,
+				<0 0 0 3 &port02 0 0 0 2>,
+				<0 0 0 4 &port02 0 0 0 3>;
+
+		ethernet0: ethernet@0,0 {
+			reg = <0x20000 0x0 0x0 0x0 0x0>;
+			/* Filled in by the loader from the ADT. */
+			local-mac-address = [00 00 00 00 00 00];
+		};
+	};
+};

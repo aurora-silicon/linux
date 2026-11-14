@@ -10,6 +10,7 @@
 
 #include <dt-bindings/interrupt-controller/apple-aic.h>
 #include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/spmi/spmi.h>
 
 / {
 	compatible = "apple,j873g", "apple,t8152", "apple,arm-platform";
@@ -68,6 +69,7 @@
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_e_opp>;
 			performance-domains = <&m6_e_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu1: cpu@1 {
@@ -78,6 +80,7 @@
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_e_opp>;
 			performance-domains = <&m6_e_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu2: cpu@2 {
@@ -88,6 +91,7 @@
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_e_opp>;
 			performance-domains = <&m6_e_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu3: cpu@3 {
@@ -98,6 +102,7 @@
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_e_opp>;
 			performance-domains = <&m6_e_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu4: cpu@4 {
@@ -108,6 +113,7 @@
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_e_opp>;
 			performance-domains = <&m6_e_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu5: cpu@5 {
@@ -118,6 +124,7 @@
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_e_opp>;
 			performance-domains = <&m6_e_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu6: cpu@10100 {
@@ -128,6 +135,7 @@
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_pm_opp>;
 			performance-domains = <&m6_pm_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu7: cpu@10101 {
@@ -138,6 +146,7 @@
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_pm_opp>;
 			performance-domains = <&m6_pm_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu8: cpu@40102 {
@@ -148,6 +157,7 @@
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_pm_opp>;
 			performance-domains = <&m6_pm_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu9: cpu@40103 {
@@ -158,6 +168,7 @@
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_pm_opp>;
 			performance-domains = <&m6_pm_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu10: cpu@40104 {
@@ -168,6 +179,7 @@
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_pm_opp>;
 			performance-domains = <&m6_pm_cpufreq>;
+			#cooling-cells = <2>;
 		};
 
 		cpu11: cpu@40105 {
@@ -178,6 +190,7 @@
 			cpu-release-addr = <0 0>; /* Filled by the loader. */
 			operating-points-v2 = <&m6_pm_opp>;
 			performance-domains = <&m6_pm_cpufreq>;
+			#cooling-cells = <2>;
 		};
 	};
 
@@ -192,6 +205,26 @@
 			opp-hz = /bits/ 64 <1152000000>;
 			opp-level = <3>;
 		};
+		opp-1584000000 {
+			opp-hz = /bits/ 64 <1584000000>;
+			opp-level = <4>;
+		};
+		opp-1980000000 {
+			opp-hz = /bits/ 64 <1980000000>;
+			opp-level = <5>;
+		};
+		opp-2304000000 {
+			opp-hz = /bits/ 64 <2304000000>;
+			opp-level = <6>;
+		};
+		opp-2640000000 {
+			opp-hz = /bits/ 64 <2640000000>;
+			opp-level = <7>;
+		};
+		opp-2940000000 {
+			opp-hz = /bits/ 64 <2940000000>;
+			opp-level = <8>;
+		};
 	};
 	m6_pm_opp: opp-table-pm {
 		compatible = "operating-points-v2";
@@ -204,7 +237,88 @@
 			opp-hz = /bits/ 64 <1728000000>;
 			opp-level = <3>;
 		};
+		opp-2040000000 {
+			opp-hz = /bits/ 64 <2040000000>;
+			opp-level = <4>;
+		};
+		opp-2340000000 {
+			opp-hz = /bits/ 64 <2340000000>;
+			opp-level = <5>;
+		};
+		opp-2640000000 {
+			opp-hz = /bits/ 64 <2640000000>;
+			opp-level = <6>;
+		};
+		opp-2940000000 {
+			opp-hz = /bits/ 64 <2940000000>;
+			opp-level = <7>;
+		};
+		opp-3216000000 {
+			opp-hz = /bits/ 64 <3216000000>;
+			opp-level = <8>;
+		};
+		opp-3468000000 {
+			opp-hz = /bits/ 64 <3468000000>;
+			opp-level = <9>;
+		};
+		opp-3696000000 {
+			opp-hz = /bits/ 64 <3696000000>;
+			opp-level = <10>;
+		};
+		opp-3924000000 {
+			opp-hz = /bits/ 64 <3924000000>;
+			opp-level = <11>;
+		};
+		opp-4092000000 {
+			opp-hz = /bits/ 64 <4092000000>;
+			opp-level = <12>;
+		};
+		opp-4272000000 {
+			opp-hz = /bits/ 64 <4272000000>;
+			opp-level = <13>;
+		};
+		opp-4416000000 {
+			opp-hz = /bits/ 64 <4416000000>;
+			opp-level = <14>;
+		};
+		opp-4476000000 {
+			opp-hz = /bits/ 64 <4476000000>;
+			opp-level = <15>;
+		};
+		opp-4512000000 {
+			opp-hz = /bits/ 64 <4512000000>;
+			opp-level = <16>;
+		};
+		opp-4536000000 {
+			opp-hz = /bits/ 64 <4536000000>;
+			opp-level = <17>;
+		};
+		opp-4584000000 {
+			opp-hz = /bits/ 64 <4584000000>;
+			opp-level = <18>;
+		};
+		opp-4644000000 {
+			opp-hz = /bits/ 64 <4644000000>;
+			opp-level = <19>;
+		};
+		opp-4692000000 {
+			opp-hz = /bits/ 64 <4692000000>;
+			opp-level = <20>;
+		};
+		opp-4788000000 {
+			opp-hz = /bits/ 64 <4788000000>;
+			opp-level = <21>;
+		};
 	};
+
+	/* The 24 MHz timebase (ADT timebase-frequency), as on T8103. */
+	clkref: clock-ref {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <24000000>;
+		clock-output-names = "clkref";
+	};
+
 	timer {
 		compatible = "arm,armv8-timer";
 		interrupts = <AIC_FIQ AIC_TMR_GUEST_PHYS IRQ_TYPE_LEVEL_HIGH>,
@@ -241,6 +355,62 @@
 			#performance-domain-cells = <0>;
 		};
 
+		/*
+		 * ADT /arm-io/nub-spmi0 (gen 4) and its primary PMU, pmu-main
+		 * ("woodcote", slave 0xe). The boot flags live in the legacy
+		 * scratchpad (info-leg_scrpad = 0xf800), laid out as on T8103
+		 * and T8140; boot_stage read 0x30 (kernel started) here.
+		 */
+		nub_spmi0: spmi@308714000 {
+			/*
+			 * Gen 4: FIFO registers at 0x200 (the block is 0x4000
+			 * long); polled, so no interrupts are described yet.
+			 */
+			compatible = "apple,t8152-spmi", "apple,t8142-spmi";
+			reg = <0x3 0x08714000 0x0 0x4000>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+
+			pmic@e {
+				compatible = "apple,woodcote-pmic", "apple,spmi-nvmem";
+				reg = <0xe SPMI_USID>;
+
+				nvmem-layout {
+					compatible = "fixed-layout";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					boot_stage: boot-stage@f801 {
+						reg = <0xf801 0x1>;
+					};
+
+					boot_error_count: boot-error-count@f802,0 {
+						reg = <0xf802 0x1>;
+						bits = <0 4>;
+					};
+
+					panic_count: panic-count@f802,4 {
+						reg = <0xf802 0x1>;
+						bits = <4 4>;
+					};
+
+					/* Set before off1, or the machine powers back on. */
+					shutdown_flag: shutdown-flag@f80f,3 {
+						reg = <0xf80f 0x1>;
+						bits = <3 1>;
+					};
+				};
+			};
+		};
+
+		/* ADT /arm-io/wdt (wdt,t8152): restart fallback and /dev/watchdog. */
+		wdt: watchdog@3082b0000 {
+			compatible = "apple,t8152-wdt", "apple,t8103-wdt";
+			reg = <3 0x082b0000 0 0x4000>;
+			clocks = <&clkref>;
+			interrupts = <AIC_IRQ 447 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
 		smc_mbox: mailbox@30c710080 {
 			compatible = "apple,t8152-smc-mailbox";
 			reg = <3 0x0c710080 0 0x80>;
@@ -257,14 +427,25 @@
 			reg-names = "smc", "sram";
 			mboxes = <&smc_mbox>;
 
-			hwmon {
+			/* Power off (MBSE = off1) and restart (MBSE = phra). */
+			smc_reboot: reboot {
+				compatible = "apple,smc-reboot";
+				nvmem-cells = <&shutdown_flag>, <&boot_stage>,
+					      <&boot_error_count>, <&panic_count>;
+				nvmem-cell-names = "shutdown_flag", "boot_stage",
+						   "boot_error_count", "panic_count";
+			};
+
+			m6_smc_hwmon: hwmon {
 				compatible = "apple,smc-hwmon";
-				apple,discover-temperatures;
+				#thermal-sensor-cells = <1>;
 
 				fan-F0Ac {
 					apple,key-id = "F0Ac";
 					apple,fan-minimum = "F0Mn";
 					apple,fan-maximum = "F0Mx";
+					apple,fan-target = "F0Tg";
+					apple,fan-mode = "F0md";
 					label = "Fan";
 				};
 			};
@@ -293,12 +474,6 @@
 &dwc3_0_dart {
 	reg = <0x4 0x3020000 0x0 0xc000>,
 	      <0x4 0x3040000 0x0 0xc000>;
-};
-
-/* Retain the register view published by this board's live hardware capture. */
-&dwc3_1_dart {
-	reg = <0x4 0xb020000 0x0 0xc000>,
-	      <0x4 0xb040000 0x0 0xc000>;
 };
 
 /* Retain the register view published by this board's live hardware capture. */
@@ -423,10 +598,12 @@
 	      <0x3 0xa0000000 0x0 0x8000>;
 };
 
-/* Unexposed chassis port instances remain described and disabled. */
-
-/* Retain the register view published by this board's live hardware capture. */
-&dwc3_2_dart {
-	reg = <0x3 0x83020000 0x0 0xc000>,
-	      <0x3 0x83040000 0x0 0xc000>;
-};
+/*
+ * The J873g fragments enable and refine nodes of t8152-peripherals.dtsi
+ * (the USB, apcie port 2 and dart-sbr DARTs), so they come after it.
+ */
+#include "t8152-j873-nvme.dtsi"
+#include "t8152-j873-usb.dtsi"
+#include "t8152-j873-ethernet.dtsi"
+#include "t8152-j873-audio.dtsi"
+#include "t8152-j873-thermal.dtsi"
