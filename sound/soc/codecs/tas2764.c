@@ -981,6 +981,13 @@ static int tas2764_read_die_temp(struct tas2764_priv *tas2764, long *result)
 	int ret, reg;
 
 	ret = regmap_read(tas2764->regmap, TAS2764_TEMP, &reg);
+	/*
+	 * The regmap is cache-only while the amp cannot be reached (SDZ low
+	 * before the component probe and after its removal, system sleep):
+	 * there is no reading then, as in software shutdown below.
+	 */
+	if (ret == -EBUSY)
+		return -ENODATA;
 	if (ret)
 		return ret;
 	/*
@@ -1108,6 +1115,9 @@ static int tas2764_codec_probe(struct snd_soc_component *component)
 
 	usleep_range(1000, 2000);
 
+	/* SDZ is high: the amp answers on the bus from here on */
+	regcache_cache_only(tas2764->regmap, false);
+
 	tas2764_reset(tas2764);
 	regmap_reinit_cache(tas2764->regmap, &tas2764_i2c_regmap);
 
@@ -1230,6 +1240,7 @@ static int tas2764_codec_probe(struct snd_soc_component *component)
 
 err_sdz:
 	/* Undo the power-up: ASoC doesn't call the remove after a failed probe */
+	regcache_cache_only(tas2764->regmap, true);
 	if (tas2764->sdz_gpio)
 		gpiod_set_value_cansleep(tas2764->sdz_gpio, 0);
 	/* As in the remove: no supply to drop with a GPIO SDZ, none left in a failed group */
@@ -1248,6 +1259,9 @@ static void tas2764_codec_remove(struct snd_soc_component *component)
 	}
 
 	tas2764_flush_shutdown(tas2764);
+
+	/* As before the probe: nothing reaches the amp once its SDZ vote is gone */
+	regcache_cache_only(tas2764->regmap, true);
 
 	/* A failed group's supply was forced off: there is no enable left to balance. */
 	if (tas2764_group_failed(tas2764))
@@ -1657,6 +1671,14 @@ static int tas2764_i2c_probe(struct i2c_client *client)
 					result);
 		return result;
 	}
+
+	/*
+	 * The amp is held in hardware shutdown (SDZ low) until the component
+	 * probe and does not acknowledge its address: keep everything that can
+	 * run before that, such as a read of the hwmon device registered below,
+	 * off the bus.
+	 */
+	regcache_cache_only(tas2764->regmap, true);
 
 	if (client->dev.of_node) {
 		result = tas2764_parse_dt(&client->dev, tas2764);
