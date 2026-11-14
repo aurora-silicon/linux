@@ -92,6 +92,9 @@ struct tas2764_priv {
 	bool deferred_shutdown;
 	/* apple,shutdown-dance: the hidden-page writes around software shutdown */
 	bool shutdown_dance;
+	/* apple,init-writes: (page, register, value) triples applied after the init quirks */
+	u8 init_writes[3 * TAS2764_INIT_WRITES_MAX];
+	int n_init_writes;
 	/* Muted at a stream's end, until the next one: the bus clock may stop */
 	bool stream_stopped;
 	struct delayed_work shutdown_work;
@@ -987,6 +990,14 @@ static int tas2764_apply_init_quirks(struct tas2764_priv *tas2764)
 			return ret;
 	}
 
+	for (i = 0; i < tas2764->n_init_writes; i++) {
+		const u8 *w = &tas2764->init_writes[3 * i];
+
+		ret = regmap_write(tas2764->regmap, TAS2764_REG(w[0], w[1]), w[2]);
+		if (ret < 0)
+			return ret;
+	}
+
 	return 0;
 }
 
@@ -1406,6 +1417,7 @@ static bool tas2764_writeable_register(struct device *dev, unsigned int reg)
 {
 	switch (reg) {
 	case TAS2764_REG(0x0, 0x00) ... TAS2764_REG(0x0, 0x7f):
+	case TAS2764_REG(0x1, 0x19):
 	case TAS2764_REG(0x1, 0x33):
 	case TAS2764_REG(0x1, 0x37):
 	case TAS2764_SDOUT_HIZ_1 ... TAS2764_SDOUT_HIZ_9:
@@ -1460,6 +1472,40 @@ static int tas2764_parse_bop_config(struct device *dev, struct tas2764_priv *tas
 	of_property_read_u8_array(dev->of_node, "apple,bop-config",
 				  tas2764->bop_config, TAS2764_BOP_CFG_LEN);
 	tas2764->have_bop_config = true;
+	return 0;
+}
+
+/*
+ * apple,init-writes: register writes Apple's driver makes at initialisation
+ * that no built-in quirk covers, as (page, register, value) byte triples,
+ * applied after the init quirks. Each one must be a register the driver may
+ * write (tas2764_writeable_register): a write to a reserved register can
+ * hang the bus.
+ */
+static int tas2764_parse_init_writes(struct device *dev, struct tas2764_priv *tas2764)
+{
+	int len, i, ret;
+
+	tas2764->n_init_writes = 0;
+	len = of_property_count_u8_elems(dev->of_node, "apple,init-writes");
+	if (len == -EINVAL)
+		return 0;
+	if (len <= 0 || len % 3 || len > (int)sizeof(tas2764->init_writes))
+		return dev_err_probe(dev, -EINVAL, "apple,init-writes: %d bytes\n", len);
+	ret = of_property_read_u8_array(dev->of_node, "apple,init-writes",
+					tas2764->init_writes, len);
+	if (ret)
+		return ret;
+	for (i = 0; i < len; i += 3) {
+		unsigned int reg = TAS2764_REG(tas2764->init_writes[i],
+						 tas2764->init_writes[i + 1]);
+
+		if (!tas2764->init_writes[i + 1] || !tas2764_writeable_register(dev, reg))
+			return dev_err_probe(dev, -EINVAL,
+					     "apple,init-writes: page 0x%02x register 0x%02x not writeable\n",
+					     tas2764->init_writes[i], tas2764->init_writes[i + 1]);
+	}
+	tas2764->n_init_writes = len / 3;
 	return 0;
 }
 
@@ -1623,6 +1669,9 @@ static int tas2764_parse_dt(struct device *dev, struct tas2764_priv *tas2764)
 							   "apple,deferred-shutdown");
 	tas2764->shutdown_dance = of_property_read_bool(dev->of_node,
 							"apple,shutdown-dance");
+	ret = tas2764_parse_init_writes(dev, tas2764);
+	if (ret)
+		return ret;
 
 	ret = tas2764_parse_bop_config(dev, tas2764);
 	if (ret)
