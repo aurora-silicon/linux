@@ -2055,6 +2055,77 @@ static int dcp_t8132_wait_teardown_answers(struct apple_dcp *dcp, u32 port,
 }
 
 /*
+ * Has the Thunderbolt DP tunnel feeding DPTX port @port been taken down?
+ * Port 0 carries the tunnel this pipeline was handed; port 1 carries only
+ * the second tile of a tiled split, fed by its own tunnel. The tunnel's
+ * provider knows at once, while the detach that follows waits for the
+ * connect in progress on this pipeline.
+ */
+static bool dcp_tb_tunnel_withdrawn(struct apple_dcp *dcp, u32 port)
+{
+	typeof(apple_dp_tunnel_binding_live) *live;
+	bool gone = false;
+	void *binding;
+
+	guard(mutex)(&dcp->tb_lock);
+	binding = port ? dcp->split.binding : dcp->tb_dpin_ctx;
+	if (!binding)
+		return false;
+	live = symbol_get(apple_dp_tunnel_binding_live);
+	if (live) {
+		gone = !live(binding);
+		symbol_put(apple_dp_tunnel_binding_live);
+	}
+	return gone;
+}
+
+/*
+ * Only T6050 is known to need the tunnel watched: a Thunderbolt 5 dock
+ * there withdraws a fresh tunnel right after DCP starts on it. Elsewhere
+ * the wait stays as it was until the watch is tested there.
+ */
+static bool dcp_watches_tunnel_withdrawal(void)
+{
+	return of_machine_is_compatible("apple,t6050");
+}
+
+#define DCP_LINKCFG_POLL_MS	50
+
+/*
+ * Wait up to @timeout for DCP's link configuration of @port, returning what
+ * wait_for_completion_timeout() would. With @watch_tunnel, a Thunderbolt
+ * tunnel taken down meanwhile ends the wait at once and sets *@withdrawn:
+ * no link comes on it, and DCP keeps retrying it until released. A release
+ * sent late, after the full timeout, is more likely to go unanswered and
+ * leave the pipeline held, so release it as soon as the tunnel goes.
+ */
+static unsigned long dcp_dptx_wait_linkcfg(struct apple_dcp *dcp, u32 port,
+					   unsigned long timeout, bool watch_tunnel,
+					   bool *withdrawn)
+{
+	unsigned long deadline = jiffies + timeout;
+	long left;
+
+	*withdrawn = false;
+	if (!watch_tunnel)
+		return wait_for_completion_timeout(&dcp->dptxport[port].linkcfg_completion,
+						   timeout);
+	for (;;) {
+		left = (long)(deadline - jiffies);
+		if (left <= 0)
+			return 0;
+		if (wait_for_completion_timeout(&dcp->dptxport[port].linkcfg_completion,
+						min_t(unsigned long, left,
+						      msecs_to_jiffies(DCP_LINKCFG_POLL_MS))))
+			return max_t(long, (long)(deadline - jiffies), 1);
+		if (dcp_tb_tunnel_withdrawn(dcp, port)) {
+			*withdrawn = true;
+			return 0;
+		}
+	}
+}
+
+/*
  * Connect DPTX port @port. On failure, @retryable (if given) tells whether
  * the attempt left nothing outstanding in the firmware, so that a later
  * connection may simply try again: the service was not published yet, or a
@@ -2069,7 +2140,7 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 	/* T8122 dcpext: HPD only after the link wait, see dcp_ext_dptx_607() */
 	bool late_hpd = dcp_ext_dptx_607(dcp);
 	bool t8132 = dcp_is_t8132_ext(dcp);
-	bool compact;
+	bool compact, withdrawn;
 	unsigned long timeout;
 	u64 generation;
 	u8 dfp_port;
@@ -2217,12 +2288,20 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 	}
 	timeout = dcp_uses_t6020_tunnel_flow(dcp) ?
 		  DPTX_TUNNEL_CONNECT_TIMEOUT : DPTX_CONNECT_TIMEOUT;
-	ret = wait_for_completion_timeout(&dcp->dptxport[port].linkcfg_completion,
-					  timeout);
+	ret = dcp_dptx_wait_linkcfg(dcp, port, timeout,
+				    !compact && !late_hpd &&
+				    dcp_watches_tunnel_withdrawal(),
+				    &withdrawn);
 	/* A revoked wait must not disconnect or publish readiness for a new session. */
 	if (!dcp_connect_session_valid(dcp, session, cable, recovery))
 		return -ESTALE;
-	if (!ret && compact) {
+	if (!ret && withdrawn) {
+		dev_info(dcp->dev,
+			 "dcp_dptx_connect: port %u: the DP tunnel went before link configuration\n",
+			 port);
+		ret = -ENOLINK;
+		goto out_withdraw;
+	} else if (!ret && compact) {
 		/* Without a sink the link is configured once one arrives. */
 		dev_dbg(dcp->dev,
 			"dcp_dptx_connect: no link configuration on port %u yet\n", port);
