@@ -144,7 +144,8 @@ impl job::Backend for Backend {
         // queue in submission order: a source of its own is either published there ahead of the
         // consumer or still queued ahead of it here. So its own sources need no publication
         // check under the device mutex; publication confirms that ring order covers them.
-        let ring_ordered = self.shared.m5_board.is_some_and(|board| board.completion_inputs());
+        let ring_ordered = sync_input::local_inputs_enabled()
+            && self.shared.m5_board.is_some_and(|board| board.completion_inputs());
         let mut heads = KVec::new();
         let mut sources: KVec<sync_input::Source> = KVec::new();
         let mut publication_waits = KVec::new();

@@ -17,6 +17,13 @@ unsafe extern "C" {
     fn asahi_g17_put_fence(fence: *mut bindings::dma_fence);
     fn asahi_g17_merge_fences(fences: *const *mut bindings::dma_fence, count: usize)
         -> *mut bindings::dma_fence;
+    fn asahi_g17_local_inputs() -> u32;
+}
+
+/// Measurement only: `aurora.gpubench_local_inputs`, the switch of own-queue ring ordering.
+pub(super) fn local_inputs_enabled() -> bool {
+    // SAFETY: Reads a module parameter word.
+    unsafe { asahi_g17_local_inputs() != 0 }
 }
 
 /// One fence that signals once all of `fences` have (see `job::MERGED_DEPENDENCIES`).

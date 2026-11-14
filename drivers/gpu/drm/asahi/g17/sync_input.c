@@ -2,6 +2,7 @@
 #include <linux/dma-fence.h>
 #include <linux/dma-fence-unwrap.h>
 #include <linux/errno.h>
+#include <linux/moduleparam.h>
 #include <linux/slab.h>
 #include "sync_input.h"
 #include "sync_scope.h"
@@ -100,4 +101,19 @@ struct dma_fence *asahi_g17_merge_fences(struct dma_fence *const *fences, size_t
 	merged = __dma_fence_unwrap_merge(count, (struct dma_fence **)fences, cursors);
 	kfree(cursors);
 	return merged;
+}
+
+/*
+ * Measurement only: whether a compute input from the consumer's own queue is
+ * ordered by ring order (1) or takes the general firmware-source path (0, the
+ * driver before that change). Read once per source lookup, so it may change at
+ * any time and both arms run on one boot.
+ */
+static unsigned int gpubench_local_inputs;
+module_param(gpubench_local_inputs, uint, 0644);
+MODULE_PARM_DESC(gpubench_local_inputs, "Measurement: order own-queue compute inputs by ring order (0: off)");
+
+unsigned int asahi_g17_local_inputs(void)
+{
+	return READ_ONCE(gpubench_local_inputs);
 }
