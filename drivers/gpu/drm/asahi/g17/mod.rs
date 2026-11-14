@@ -2561,6 +2561,13 @@ impl gpu::Gpu for Gpu {
         true
     }
 
+    /// A published submission's output fence takes its error only in
+    /// `fence::Submission::member_done`, and a SUBMIT that fails before publication installs
+    /// its error fence through `fence::Outputs`; both count it in the VM status first.
+    fn supports_vm_fence_error_count(&self) -> bool {
+        true
+    }
+
     /// The G17 runtime never programs fault_control into the firmware, so unmapped reads are not
     /// guaranteed to return zero. Advertising soft faults made Mesa point out-of-bounds vec3/vec4
     /// vertex fetches at address 0 and skip bounds checks on bounded loads; on T6040 those reads
