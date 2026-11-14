@@ -167,7 +167,19 @@ impl Rings {
     }
 
     pub(super) fn read_statistics(&self, now_ns: u64) -> super::telemetry::Readout {
-        self.telemetry.read(now_ns, self.max_age_ns)
+        let mut view = self.telemetry.read(now_ns, self.max_age_ns);
+        // A quarantined statistics ring adds nothing more: the total is no longer current.
+        if view.busy_status == super::telemetry::VALID && self.statistics_quarantined() {
+            view.busy_status = super::telemetry::STALE;
+        }
+        view
+    }
+
+    /// Either role's statistics ring is quarantined, which stops both roles' exports.
+    fn statistics_quarantined(&self) -> bool {
+        self.quarantined
+            .iter()
+            .any(|rings| rings[ReportRing::Statistics as usize])
     }
 
     pub(super) fn write_reports(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
@@ -198,13 +210,13 @@ impl Rings {
             return;
         }
         let statistics = matches!(ring, ReportRing::Statistics);
-        let accept = !self.suspended
-            && self.statistics_powered
+        // Suspend, a real invalidation's discard and quarantine keep every record out.
+        let accept_busy = !self.suspended
             && !self.discard_statistics[role as usize]
-            && !self
-                .quarantined
-                .iter()
-                .any(|rings| rings[ReportRing::Statistics as usize]);
+            && !self.statistics_quarantined();
+        // A power boundary also keeps the records before it out of the averaging epoch;
+        // their own timestamps still place them for busy time (Telemetry::record_busy).
+        let accept = accept_busy && self.statistics_powered;
         if let Err(error) = Self::consume_report(
             init,
             role,
@@ -213,6 +225,7 @@ impl Rings {
             &mut self.telemetry,
             self.max_age_ns,
             accept,
+            accept_busy,
             &mut self.statistics_cutoff[role as usize],
         ) {
             self.stop_report(dev, role, ring, error);
@@ -243,6 +256,7 @@ impl Rings {
         telemetry: &mut super::telemetry::Telemetry,
         max_age_ns: u64,
         accept_statistics: bool,
+        accept_busy: bool,
         statistics_cutoff: &mut Option<u32>,
     ) -> Result {
         let (state, entries, capacity, allowed_types) = ring.geometry(init);
@@ -282,6 +296,8 @@ impl Rings {
                 reports.record(role, words, host_ns, allowed_types, admitted);
                 if admitted {
                     telemetry.record(&words, host_ns, max_age_ns);
+                } else if accept_busy {
+                    telemetry.record_busy(&words);
                 }
             }
             consumer = (consumer + 1) & (capacity - 1);
