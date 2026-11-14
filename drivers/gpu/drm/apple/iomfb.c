@@ -3054,7 +3054,13 @@ static bool dcp_mode_settable(struct apple_dcp *dcp,
 {
 	struct dcp_display_mode dcp_mode;
 
-	if (!lookup_mode(dcp, mode, &dcp_mode))
+	bool found = lookup_mode(dcp, mode, &dcp_mode);
+
+	dev_info(dcp->dev,
+		 "w88-gate: mode %dx%d@%d found:%d external:%d ext_failsafe:%d fw_compat:%d\n",
+		 mode->hdisplay, mode->vdisplay, drm_mode_vrefresh(mode), found,
+		 dcp->external, dcp->ext_failsafe, dcp->fw_compat);
+	if (!found)
 		return false;
 
 	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
@@ -3068,8 +3074,11 @@ static bool dcp_mode_settable(struct apple_dcp *dcp,
 	 * survive a modeset, so refuse the rest until they are understood.
 	 */
 	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp->external &&
-	    !dcp->ext_failsafe && drm_mode_vrefresh(mode) != 120)
+	    !dcp->ext_failsafe && drm_mode_vrefresh(mode) != 120) {
+		dev_info(dcp->dev, "w88-gate: dropped %dx%d@%d\n", mode->hdisplay,
+			 mode->vdisplay, drm_mode_vrefresh(mode));
 		return false;
+	}
 
 	return true;
 }
