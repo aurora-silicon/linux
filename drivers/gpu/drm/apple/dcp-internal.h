@@ -296,6 +296,8 @@ struct apple_dcp_hw_data {
 	/* A firmware 27 sleep in progress, and how it ended */
 	bool v27_sleep_protocol;
 	bool v27_sleep_recovery;
+	/* The firmware blends the X byte of XRGB8888 as alpha: offer alpha formats only. */
+	bool xrgb_is_alpha;
 };
 
 enum dcp_test_point {
