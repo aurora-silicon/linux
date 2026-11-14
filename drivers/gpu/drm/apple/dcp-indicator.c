@@ -184,6 +184,14 @@ retry:
 		if (ret)
 			goto out;
 		drm_atomic_set_fb_for_plane(ps, NULL);
+		/*
+		 * Alone, the removal is a swap with no surface, which flush
+		 * sends as a clear, and the firmware rejects that with -1.
+		 * Present the other planes with it.
+		 */
+		ret = drm_atomic_add_affected_planes(state, crtc);
+		if (ret)
+			goto out;
 	}
 	WRITE_ONCE(to_apple_plane(ci->plane)->indicator_commit, state);
 	ret = drm_atomic_commit(state);
