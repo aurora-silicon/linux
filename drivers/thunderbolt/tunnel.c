@@ -1306,7 +1306,9 @@ static int tb_dp_bandwidth_alloc_mode_enable(struct tb_tunnel *tunnel)
 	 * never been observed to generate that notification: link training
 	 * and a full DCP frame complete with this field (DP_STATUS
 	 * allocated-bandwidth) still reading 0 and no picture.
-	 * On that one route only, grant the already-computed non-reduced
+	 * On the routes that tb_dp_apple_dpin_needs_bw_grant() names (that
+	 * adapter, and every DP IN adapter of a host with
+	 * TB_HOST_DP_GRANT_EVERY_DPIN), grant the already-computed non-reduced
 	 * bandwidth immediately, capped at what the connection manager
 	 * already reserved for this tunnel (estimated_bw), instead of
 	 * waiting indefinitely for a request that does not arrive.
