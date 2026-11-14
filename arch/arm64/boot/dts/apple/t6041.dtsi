@@ -367,6 +367,19 @@
 		power-domains = <&ps_gfx>;
 		#mbox-cells = <0>;
 	};
+
+	/* ADT aop-spmi0 (J575c), at the T6040's address and IRQ */
+	aop_spmi0: spmi@510914000 {
+		compatible = "apple,t6041-spmi", "apple,t8103-spmi";
+		reg = <0x5 0x10914000 0x0 0x100>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		#interrupt-cells = <2>;
+		interrupt-controller;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 738 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
 };
 
 &ps_afr {
