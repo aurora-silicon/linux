@@ -24,6 +24,20 @@ enum ane_fw_irq_role {
 	ANE_FW_IRQ_CHANNELS,
 };
 
+/*
+ * One firmware build the loader may preload: the device addresses and sizes
+ * of its TEXT and DATA segments and the digest of its TEXT. Apple moves the
+ * TEXT/DATA split between macOS releases (T6050: 27.0 TEXT 0xc0000 and DATA
+ * 0x2ac000, 27.3 TEXT 0xec000 and DATA 0x280000, both ending at 0x36c000),
+ * so the handed-off layout selects the build and the build its TEXT pin.
+ */
+struct ane_fw_preload_build {
+	const char *name;
+	u64 dva[2];
+	u64 size[2];
+	const u8 *text_pin;
+};
+
 /* Later firmware generations must never enter the H14 staging path. */
 struct ane_fw_platform {
 	const struct ane_h16_profile *h16_profiles;
@@ -99,11 +113,17 @@ struct ane_fw_platform {
 	u16 dart_revision;
 	u8 dapf_count;
 	const u8 *text_pin;
+	/*
+	 * The preloaded builds this SoC admits. When set, they replace
+	 * preload_dva, preload_size and text_pin for the hand-off checks.
+	 */
+	const struct ane_fw_preload_build *preload_builds;
+	u8 preload_build_count;
 };
 
 /* Pure range check: the boot loader supplies the physical addresses. */
 static inline bool
-ane_fw_preload_ranges_valid(const struct ane_fw_platform *soc, const u64 phys[2],
+ane_fw_preload_layout_match(const u64 want_dva[2], const u64 want_size[2], const u64 phys[2],
 			    const u64 size[2], const u64 dva[2])
 {
 	u64 end[2];
@@ -111,12 +131,49 @@ ane_fw_preload_ranges_valid(const struct ane_fw_platform *soc, const u64 phys[2]
 
 	for (i = 0; i < 2; i++) {
 		if (!phys[i] || !IS_ALIGNED(phys[i], SZ_16K) ||
-		    size[i] != soc->preload_size[i] ||
-		    dva[i] != soc->preload_dva[i] ||
+		    size[i] != want_size[i] ||
+		    dva[i] != want_dva[i] ||
 		    check_add_overflow(phys[i], size[i], &end[i]))
 			return false;
 	}
 	return end[0] <= phys[1] || end[1] <= phys[0];
+}
+
+/* The admitted build whose layout the loader handed off, or NULL. */
+static inline const struct ane_fw_preload_build *
+ane_fw_preload_build(const struct ane_fw_platform *soc, const u64 phys[2],
+		     const u64 size[2], const u64 dva[2])
+{
+	unsigned int i;
+
+	for (i = 0; i < soc->preload_build_count; i++)
+		if (ane_fw_preload_layout_match(soc->preload_builds[i].dva,
+						soc->preload_builds[i].size, phys, size, dva))
+			return &soc->preload_builds[i];
+	return NULL;
+}
+
+static inline bool
+ane_fw_preload_ranges_valid(const struct ane_fw_platform *soc, const u64 phys[2],
+			    const u64 size[2], const u64 dva[2])
+{
+	if (soc->preload_build_count)
+		return ane_fw_preload_build(soc, phys, size, dva);
+	return ane_fw_preload_layout_match(soc->preload_dva, soc->preload_size, phys, size, dva);
+}
+
+/* The TEXT digest the handed-off layout must carry, or NULL for none. */
+static inline const u8 *
+ane_fw_preload_text_pin(const struct ane_fw_platform *soc, const u64 phys[2],
+			const u64 size[2], const u64 dva[2])
+{
+	const struct ane_fw_preload_build *build;
+
+	if (!soc->preload_build_count)
+		return ane_fw_preload_layout_match(soc->preload_dva, soc->preload_size, phys,
+						   size, dva) ? soc->text_pin : NULL;
+	build = ane_fw_preload_build(soc, phys, size, dva);
+	return build ? build->text_pin : NULL;
 }
 
 /*
