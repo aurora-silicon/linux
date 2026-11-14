@@ -1312,12 +1312,12 @@ impl crate::SepData {
         Some(handle)
     }
 
-    /// The subject of an enrolment for the Unix account `uid` (13.5 store):
-    /// that user's own domain when their bag is loaded. Refused while it is
-    /// loaded but not unlocked by the password since its last lock, as macOS
-    /// asks for the password to add a finger. None (no bag) keeps the
+    /// The subject of an enrolment or a verify for the Unix account `uid`
+    /// (13.5 store): that user's own domain when their bag is loaded. Refused
+    /// while it is loaded but not unlocked by the password since its last
+    /// lock, as macOS asks for the password then. None (no bag) keeps the
     /// configured user.
-    pub(crate) fn userbag_enrol_subject(&self, uid: u32) -> Result<Option<crate::BioSubject>> {
+    pub(crate) fn userbag_bio_subject(&self, uid: u32) -> Result<Option<crate::BioSubject>> {
         if !self.userbag_sepos13() || uid < MIN_UID {
             return Ok(None);
         }

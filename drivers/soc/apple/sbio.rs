@@ -2712,10 +2712,38 @@ impl SepData {
     }
 
     pub(crate) fn run_verify(&self) {
+        // A verify for an account whose bag is loaded matches in that user's
+        // own domain; one whose bag is locked needs the password first. A
+        // key touch already runs under its key's subject.
+        let account = if self.key_touch_active.load(Relaxed) {
+            None
+        } else {
+            bio::verify_account(&self.bio_session.lock())
+        };
+        let subject = match account.map(|uid| self.userbag_bio_subject(uid)) {
+            Some(Err(_)) => {
+                dev_info_refusal!(self.dev, "verify: the account's key bag is locked; refusing without a capture until its password unlocks it\n");
+                self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_LOCKOUT), [0u8; bio::TOKEN_LEN]);
+                return;
+            }
+            Some(Ok(Some(subject))) => Some(crate::SubjectScope::new(self, subject)),
+            _ => None,
+        };
+        // The gates below are the configured user's. A bag user's own lock
+        // and the enclave's per-user count stand in for them.
+        let bag_user = subject.is_some();
+        // A bag user with nothing enrolled cannot match, and the enclave
+        // refuses a match against them: answer no match without a capture,
+        // as an empty index is answered. fprintd's duplicate check before a
+        // first enrolment asks exactly this.
+        if bag_user && self.enclave_identities_for(self.bio_user()).is_some_and(|ids| ids.is_empty()) {
+            self.finish_verify(bio::VerifyOutcome::NoMatch, [0u8; bio::TOKEN_LEN]);
+            return;
+        }
         // Asked to wait for the first password since boot, as macOS does
         // after a restart: nothing is wrong with the finger or the enclave,
         // so refuse at once, before any capture.
-        if self.bio_after_boot.load(Relaxed) {
+        if !bag_user && self.bio_after_boot.load(Relaxed) {
             if !self.bio_lockout_logged.xchg(true, Relaxed) {
                 dev_info_refusal!(
                     self.dev,
@@ -2730,7 +2758,7 @@ impl SepData {
         }
         // A capture now would only be refused at MATCH_RESULT again, so do
         // not ask the user to touch the sensor for it.
-        if self.bio_lockout.load(Relaxed) {
+        if !bag_user && self.bio_lockout.load(Relaxed) {
             if !self.bio_lockout_logged.xchg(true, Relaxed) {
                 dev_info_refusal!(
                     self.dev,
@@ -3349,7 +3377,7 @@ impl SepData {
         // user's own domain (13.5 store); one whose bag is locked waits for
         // the password.
         let account = bio::enrol_account(&self.bio_session.lock());
-        let _subject = match account.map(|uid| self.userbag_enrol_subject(uid)) {
+        let _subject = match account.map(|uid| self.userbag_bio_subject(uid)) {
             Some(Err(_)) => {
                 dev_info_ratelimited!(self.dev, "enrol: the account's key bag is locked; its password is needed to add a finger\n");
                 self.finish_enrolment(Err(ENROL_STATUS_ENCLAVE));
@@ -6021,6 +6049,7 @@ impl SepData {
                 index: &index,
                 sensor_present,
                 live_identity_count,
+                verify_account: self.profile.per_user_keybags,
             };
             bio::ioctl(&mut ctx, cmd, arg)?
         };

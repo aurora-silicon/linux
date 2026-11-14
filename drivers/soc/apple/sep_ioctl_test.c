@@ -400,12 +400,21 @@ static void sep_bio_session_rules(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, sep_ioctl_map(test, &m), 0);
 	bio = sep_kunit_bio_new();
 	KUNIT_ASSERT_NOT_NULL(test, bio);
-	/* VERIFY_START: flags and reserved must be zero. */
-	req[0] = 1;
+	/*
+	 * VERIFY_START: no flag but VERIFY_ACCOUNT, and an account only with
+	 * it. (This session offers VERIFY_ACCOUNT.)
+	 */
+	req[0] = 2;
 	put(test, &m, 1, req, 40);
 	KUNIT_EXPECT_EQ(test, sep_kunit_bio_ioctl(bio, SB_VERIFY_START, m.base + 1), -EINVAL);
 	memset(req, 0, sizeof(req));
 	req[4] = 1;
+	put(test, &m, 1, req, 40);
+	KUNIT_EXPECT_EQ(test, sep_kunit_bio_ioctl(bio, SB_VERIFY_START, m.base + 1), -EINVAL);
+	/* VERIFY_ACCOUNT with the reserved "no account" uid. */
+	memset(req, 0, sizeof(req));
+	req[0] = 1;
+	memset(req + 4, 0xff, 4);
 	put(test, &m, 1, req, 40);
 	KUNIT_EXPECT_EQ(test, sep_kunit_bio_ioctl(bio, SB_VERIFY_START, m.base + 1), -EINVAL);
 	/* ENROL_START: finger 0, 11, a label without the FP1- form. */

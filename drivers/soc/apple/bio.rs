@@ -161,9 +161,14 @@ struct EnrolPoll {
 #[repr(C)]
 struct VerifyStart {
     flags: u32,
-    reserved: u32,
+    account_uid: u32,
     nonce: [u8; NONCE_LEN],
 }
+
+/// `VerifyStart.flags`: `account_uid` is the Unix account to match for.
+const VERIFY_ACCOUNT: u32 = 1;
+/// `Info.reserved[0]`: this kernel takes `VERIFY_ACCOUNT`.
+const INFO_VERIFY_ACCOUNT: u32 = 2;
 
 #[repr(C)]
 #[derive(Default)]
@@ -529,6 +534,8 @@ enum Op {
     },
     Verify {
         nonce: [u8; NONCE_LEN],
+        /// The Unix account to match for (`VERIFY_ACCOUNT`), if named.
+        account: Option<u32>,
         terminal: Option<VerifyOutcome>,
         guidance: Guidance,
     },
@@ -608,6 +615,9 @@ pub(crate) struct Context<'a> {
     pub(crate) index: &'a IdentityIndex,
     pub(crate) sensor_present: bool,
     pub(crate) live_identity_count: Option<usize>,
+    /// Whether a verify may name a Unix account: only where per-user key
+    /// bags exist (`PlatformProfile::per_user_keybags`).
+    pub(crate) verify_account: bool,
 }
 
 pub(crate) struct Handled {
@@ -680,7 +690,8 @@ fn get_info(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
         // when SEP itself successfully answered LIST_IDENTITIES; older
         // kernels and unavailable SEP contexts leave this flag clear.
         reserved: [
-            u32::from(ctx.live_identity_count.is_some()),
+            u32::from(ctx.live_identity_count.is_some())
+                | if ctx.verify_account { INFO_VERIFY_ACCOUNT } else { 0 },
             ctx.live_identity_count.unwrap_or(0) as u32,
             0,
         ],
@@ -858,6 +869,14 @@ fn enrol_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
 }
 
 /// The account of the enrolment the worker runs, if it runs one.
+/// The account a running verify names (`VERIFY_ACCOUNT`), if any.
+pub(crate) fn verify_account(session: &Session) -> Option<u32> {
+    match session.op {
+        Op::Verify { account, terminal: None, .. } => account,
+        _ => None,
+    }
+}
+
 pub(crate) fn enrol_account(session: &Session) -> Option<u32> {
     match session.op {
         Op::Enrol { account_uid, terminal: None, .. } => Some(account_uid),
@@ -1047,19 +1066,26 @@ fn verify_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     let request: VerifyStart = UserSlice::new(user, core::mem::size_of::<VerifyStart>())
         .reader()
         .read()?;
-    if request.flags != 0 || request.reserved != 0 {
-        return Err(EINVAL);
-    }
+    // VERIFY_ACCOUNT names the Unix account in `account_uid`: the match runs
+    // in that user's own domain when their key bag is loaded.
+    let account = match request.flags {
+        0 if request.account_uid == 0 => None,
+        VERIFY_ACCOUNT if ctx.verify_account && request.account_uid != u32::MAX => Some(request.account_uid),
+        _ => return Err(EINVAL),
+    };
     require_sensor(ctx.sensor_present)?;
 
     if ctx.session.worker_epoch.is_some() || !ctx.session.op.may_start() {
         return Err(EBUSY);
     }
 
-    if ctx.index.total() == 0 {
+    // The index holds the configured user's templates only; an account's
+    // own templates are in the enclave, so it is never empty for them here.
+    if account.is_none() && ctx.index.total() == 0 {
         ctx.session.token = None;
         ctx.session.op = Op::Verify {
             nonce: request.nonce,
+            account: None,
             terminal: Some(VerifyOutcome::NoMatch),
             guidance: Guidance::None,
         };
@@ -1078,6 +1104,7 @@ fn verify_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     ctx.session.token = None;
     ctx.session.op = Op::Verify {
         nonce: request.nonce,
+        account,
         terminal: None,
         guidance: Guidance::Place,
     };
@@ -1155,7 +1182,7 @@ fn verify_poll(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     match &ctx.session.op {
         Op::Idle => out.state = State::Idle,
         Op::Enrol { .. } => return Err(EBUSY),
-        Op::Verify { nonce, terminal, guidance } => {
+        Op::Verify { nonce, terminal, guidance, .. } => {
             out.guidance = *guidance;
             match terminal {
                 None => {
@@ -1361,6 +1388,7 @@ pub unsafe extern "C" fn sep_kunit_bio_ioctl(bio: *mut c_void, cmd: c_uint, arg:
         index: &bio.index,
         sensor_present: true,
         live_identity_count: Some(0),
+        verify_account: true,
     };
     match ioctl(&mut ctx, cmd, arg as usize) {
         Ok(h) => h.ret as c_long,
