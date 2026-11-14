@@ -2157,16 +2157,25 @@ impl Backend {
         // The steady state: this owner's channel is bound and installed.
         if packet.completion.sources().is_none() {
             if let Some(cell) = self.direct.lock().clone() {
-                let bound = cell.lock().is_some_and(|mut queue| {
-                    let bound = queue.installed()
-                        && !queue.spared_pending()
-                        && queue.pool_fits(required)
-                        && matches!(queue.matches(self.owner, queue.qid(), &self.context), Ok(true));
-                    if bound {
-                        queue.claim();
-                    }
-                    bound
-                });
+                // A claim is queue state that a hibernation freeze and the cold reset after
+                // the resume both require to be absent: it is taken only through the
+                // preparation gate, which they close and join.
+                let bound = match self.shared.preparations.admit_claim(|| {
+                    cell.lock().is_some_and(|mut queue| {
+                        let bound = queue.installed()
+                            && !queue.spared_pending()
+                            && queue.pool_fits(required)
+                            && matches!(queue.matches(self.owner, queue.qid(), &self.context), Ok(true));
+                        if bound {
+                            queue.claim();
+                        }
+                        bound
+                    })
+                }) {
+                    Ok(bound) => bound,
+                    Err(error) if error == EAGAIN => return Readiness::Progress,
+                    Err(_) => return Readiness::Ready,
+                };
                 if bound {
                     self.hold_claim(Some(cell));
                     if !self.context.is_m5() {

@@ -196,6 +196,16 @@ impl Gate {
         }
     }
 
+    /// Runs `claim` under a lease, so that a closure (recovery, hibernation freeze) joins it
+    /// before it inspects queue state; a closed gate refuses it with `EAGAIN` without running
+    /// it. For claims taken without the device mutex. Called with no existing lease.
+    pub(super) fn admit_claim<T>(self: &Arc<Self>, claim: impl FnOnce() -> T) -> Result<T> {
+        let lease = self.try_enter()?;
+        let result = claim();
+        drop(lease);
+        Ok(result)
+    }
+
     /// Wait only for a temporary recovery closure. Called with no device lock or existing lease.
     pub(super) fn enter(self: &Arc<Self>, interruptible: bool) -> Result<Lease> {
         match self.try_enter() {
@@ -419,6 +429,40 @@ mod growth_gate_tests {
         let growth = gate.enter(false).unwrap();
         assert!(growth.is_current());
         drop(growth);
+    }
+}
+
+#[kunit_tests(asahi_g17_claim_gate)]
+mod claim_gate_tests {
+    use super::*;
+
+    #[test]
+    fn a_freeze_joins_an_admitted_claim() {
+        let gate = Gate::new().unwrap();
+        let claimed = gate.admit_claim(|| {
+            // A freeze that closes the gate meanwhile cannot confirm until the claim is in.
+            gate.close_for_hibernation();
+            let soon = super::super::now_ns() + 5_000_000;
+            assert_eq!(gate.wait_drained_until(soon), Err(ETIMEDOUT));
+            true
+        });
+        assert_eq!(claimed, Ok(true));
+        let soon = super::super::now_ns() + 5_000_000;
+        assert_eq!(gate.wait_drained_until(soon), Ok(()));
+        assert!(gate.reopen());
+    }
+
+    #[test]
+    fn a_closed_gate_refuses_a_claim_without_running_it() {
+        let gate = Gate::new().unwrap();
+        // Closed from the freeze until the republish after a cold resume has finished.
+        gate.close_for_hibernation();
+        let mut ran = false;
+        assert!(matches!(gate.admit_claim(|| ran = true), Err(error) if error == EAGAIN));
+        assert!(!ran);
+        assert_eq!(gate.state.load(Ordering::Acquire) & COUNT_MASK, 0);
+        assert!(gate.reopen());
+        assert_eq!(gate.admit_claim(|| 7), Ok(7));
     }
 }
 
