@@ -1151,6 +1151,21 @@ static void cd321x_update_work(struct work_struct *work)
 			new_role = USB_ROLE_DEVICE;
 		else
 			new_role = USB_ROLE_HOST;
+	} else if (new_connected && !cd321x->tbt_switch &&
+		   device_is_compatible(tps->dev, "apple,t8132-sn201202x") &&
+		   (st.data_status & (TPS_DATA_STATUS_TBT_CONNECTION |
+				      CD321X_DATA_STATUS_USB4_CONNECTION))) {
+		/*
+		 * In Thunderbolt 3 alt mode the controller reports neither a
+		 * USB2 nor a USB3 connection. With a USB4/Thunderbolt router,
+		 * the partner's USB is tunnelled through it. A T8132 port
+		 * without a router has nothing to tunnel through, and a T8132
+		 * PHY without the CIO calibration serves the partner's USB 2.0
+		 * on D+/D- instead of the link. Give the port the USB role of
+		 * its Type-C data role, or its USB controller never starts.
+		 */
+		new_role = TPS_STATUS_TO_TYPEC_DATAROLE(st.status) == TYPEC_HOST ?
+			   USB_ROLE_HOST : USB_ROLE_DEVICE;
 	}
 
 	if (new_connected) {
