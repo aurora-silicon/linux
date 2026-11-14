@@ -456,6 +456,7 @@ struct apple_cio {
 		bool hpd;		/* HPD level last seen, under lock */
 		unsigned int irq_count;
 		struct apple_nhi *diag_anhi;	/* set at tunnel activation, read by the IRQ diagnostics */
+		unsigned int diag_count;	/* sink IRQ_HPD events logged, on dp_wq only */
 	} dpin[APPLE_DPIN_MAX];
 };
 
@@ -788,7 +789,7 @@ static void apple_dpin_event_fn(struct work_struct *work)
 		static const unsigned int at_ms[] = { 25, 50, 100, 125, 150, 175, 200, 300 };
 		unsigned int i, t = 0;
 
-		if (c->irq_count > 3)
+		if (c->diag_count++ >= 3)
 			return;
 		apple_dpin_diag(c, 0);
 		for (i = 0; i < ARRAY_SIZE(at_ms); i++) {
@@ -2252,6 +2253,7 @@ static int apple_nhi_dp_tunnel_post_activate(struct tb_nhi *nhi,
 			if (!apple_dpin_request(c, generation, true))
 				return -ESTALE;
 			WRITE_ONCE(c->diag_anhi, anhi);
+			c->diag_count = 0;
 		}
 	}
 
