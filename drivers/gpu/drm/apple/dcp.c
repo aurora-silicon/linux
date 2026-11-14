@@ -396,7 +396,7 @@ MODULE_PARM_DESC(fw27_panel_boot_mode,
  *    1 client flags (clients[c] = 1), 9 states: none, 6, 7, 8, 10, 11, 12,
  *      25, 26
  *    2 client flags, 14 states: the 9, then 13, 14, 15, 16, 17
- * macOS on fw27 sends the flag form (M5 capture).
+ * fw27 firmware expects the flag form.
  */
 int notify_clients_form;
 module_param(notify_clients_form, int, 0644);

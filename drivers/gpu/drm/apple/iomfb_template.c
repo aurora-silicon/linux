@@ -4587,8 +4587,8 @@ static void dcp_client_open_run(struct apple_dcp *dcp, void *out, void *cookie)
 		 * notification clients and adds one, so state n has n
 		 * clients. The step re-queues itself until every state is
 		 * sent. notify_clients_form 0 writes the client numbers into
-		 * the first slots; 1 and 2 write the flag form macOS sends on
-		 * fw27, a 1 at each client's index (9 or 14 states).
+		 * the first slots; 1 and 2 write the flag form fw27 firmware
+		 * expects, a 1 at each client's index (9 or 14 states).
 		 */
 		static const u8 notify_clients[9][8] = {
 			{},
@@ -4601,7 +4601,7 @@ static void dcp_client_open_run(struct apple_dcp *dcp, void *out, void *cookie)
 			{ 6, 7, 8, 10, 11, 12, 25 },
 			{ 6, 7, 8, 10, 11, 12, 25, 26 },
 		};
-		/* the order macOS adds clients in, state n has the first n */
+		/* the order clients are added in, state n has the first n */
 		static const u8 notify_client_order[] = {
 			6, 7, 8, 10, 11, 12, 25, 26, 13, 14, 15, 16, 17,
 		};
