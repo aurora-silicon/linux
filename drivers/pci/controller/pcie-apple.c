@@ -275,6 +275,12 @@ struct hw_info {
 	bool pipe_rst;
 	bool no_port_reset;
 	bool mps_timers;
+	/*
+	 * Keep endpoints at their reset Max_Read_Request_Size (512 bytes).
+	 * On T8152 an RTL8127 at MRRS 4096 (what r8169 asks for) transmits
+	 * 9000-byte frames at 7.0 Gbit/s; at 512 it reaches 9.93.
+	 */
+	bool no_inc_mrrs;
 };
 
 static const struct hw_info t8103_hw = {
@@ -330,6 +336,7 @@ static const struct hw_info t8152_hw = {
 	.max_rid2sid		= 512,
 	.refbuf_off		= true,
 	.pipe_rst		= true,
+	.no_inc_mrrs		= true,
 };
 
 /*
@@ -4931,6 +4938,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "Failed to attach power domains\n");
 
+	bridge->no_inc_mrrs = hw->no_inc_mrrs;
 	if (of_property_present(dev->of_node, "apple,managed-sids")) {
 		u32 ids[15];
 		int count = of_property_count_u32_elems(dev->of_node, "apple,managed-sids");

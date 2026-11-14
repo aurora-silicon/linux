@@ -284,6 +284,17 @@ properties:
       and filtering state without a separate page-table root. Source and
       destination must differ, and both must exist on the controller.
 
+  apple,retain-translation:
+    type: boolean
+    description: >
+      The bootloader hands this DART over translating, with stream page
+      tables that a co-processor's firmware keeps using, but without setting
+      the hardware lock. The operating system then treats the DART as locked:
+      it does not reset it or replace the inherited stream roots, adds its
+      own mappings only in root entries that are empty at handoff, and on
+      detach clears only the entries it added. The entries present at handoff
+      stay owned by the firmware, which may keep using them at any time.
+
 required:
   - compatible
   - reg

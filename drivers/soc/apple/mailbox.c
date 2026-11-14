@@ -226,6 +226,10 @@ struct apple_mbox_hw {
 	unsigned int num_ascwrap_v6_roles;
 	/* T8152 GPU ASCWrap v8: wrapper + iop-vbar + post-office window + PSD. */
 	bool is_ascwrap_v8;
+	/* No interrupts are described; receive and send are polled. */
+	bool rx_poll_required;
+	/* J873 post-office window a polled provider must sit at. */
+	u64 j873_window;
 	/* Status word counts RX occupancy and free TX slots; paired transfers. */
 	bool counted_fifo;
 	bool ap_initializes_mailboxes;
@@ -259,7 +263,7 @@ struct apple_mbox_priv {
 	struct apple_mbox mbox;
 	/* ASCWrap v8 only: the provider's PMGR2 PSD service block (read-only). */
 	void __iomem *psd_regs;
-	/* ASCWrap v8 only: receive by polling; fixed at probe. */
+	/* ASCWrap v8 and polled providers: receive by polling; fixed at probe. */
 	bool rx_poll_only;
 	/* rx_lock: recv interrupt enabled and not yet disabled again. */
 	bool rx_irq_live;
@@ -278,7 +282,7 @@ static struct apple_mbox_priv *apple_mbox_to_priv(struct apple_mbox *mbox)
 /* Only providers allocated by apple_mbox_probe() have a receive poller. */
 static bool apple_mbox_has_rx_poller(const struct apple_mbox *mbox)
 {
-	return mbox->hw->is_ascwrap_v8;
+	return mbox->hw->is_ascwrap_v8 || mbox->hw->rx_poll_required;
 }
 
 /* Both ASCWrap generations share the consumer lifecycle API below. */
@@ -1524,6 +1528,16 @@ static int apple_mbox_probe(struct platform_device *pdev)
 			return ret;
 	} else {
 		res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+		/*
+		 * A polled provider must be exactly its own 0x80-byte window of
+		 * the J873 post-office bank; the rest belongs to other roles.
+		 */
+		if (mbox->hw->rx_poll_required &&
+		    (!of_machine_is_compatible("apple,j873g") || !res ||
+		     res->start != mbox->hw->j873_window ||
+		     resource_size(res) != APPLE_ASCWRAP_V8_MBOX_SIZE))
+			return dev_err_probe(dev, -EINVAL,
+					     "post-office window does not match the J873 profile\n");
 		if (!res || resource_size(res) < mbox->hw->reg_offset +
 						mbox->hw->i2a_recv1 + sizeof(u64))
 			return dev_err_probe(dev, -EINVAL,
@@ -1533,6 +1547,21 @@ static int apple_mbox_probe(struct platform_device *pdev)
 		if (IS_ERR(mbox->regs))
 			return PTR_ERR(mbox->regs);
 		mbox->regs = (u8 __iomem *)mbox->regs + mbox->hw->reg_offset;
+	}
+
+	if (mbox->hw->rx_poll_required) {
+		mbox->rx_util_min = -1;
+		mbox->rx_util_min_applied = -1;
+		spin_lock_init(&mbox->rx_lock);
+		spin_lock_init(&mbox->tx_lock);
+		mutex_init(&mbox->lifecycle_lock);
+		init_completion(&mbox->tx_empty);
+		priv->rx_poll_only = true;
+		INIT_DELAYED_WORK(&priv->rx_poll_work, apple_mbox_v8_rx_poll_work);
+		mbox->irq_recv_not_empty = -ENXIO;
+		mbox->irq_send_empty = -ENXIO;
+		dev_info(dev, "J873 post-office: paired transfers, bounded polling, no IRQ claim\n");
+		goto setup_pm;
 	}
 
 	if (mbox->hw->polled) {
@@ -1594,6 +1623,7 @@ static int apple_mbox_probe(struct platform_device *pdev)
 			return ret;
 	}
 
+setup_pm:
 	ret = devm_pm_runtime_enable(dev);
 	if (ret)
 		return ret;
@@ -1887,8 +1917,31 @@ static const struct apple_mbox_hw apple_mbox_t8152_smc_hw = {
 	.has_irq_controls = false,
 };
 
+/*
+ * T8152 ANS: msgbox-mailbox-num 3 in the non-alias post-office bank, the
+ * same counted FIFO as the SMC mailbox. Its interrupt ordering is not known,
+ * so no interrupt is described and both directions are polled.
+ */
+static const struct apple_mbox_hw apple_mbox_t8152_ans_hw = {
+	.rx_poll_required = true,
+	.j873_window = 0x316010300ULL,
+	.counted_fifo = true,
+	.control_full = GENMASK(11, 8), /* free TX slots */
+	.control_empty = GENMASK(3, 0), /* RX occupancy */
+	.a2i_control = 0x20,
+	.a2i_send0 = 0x10,
+	.a2i_send1 = 0x18,
+	.i2a_control = 0x20,
+	.i2a_recv0 = 0x00,
+	.i2a_recv1 = 0x08,
+	.has_irq_controls = false,
+};
+
 static const struct of_device_id apple_mbox_of_match[] = {
 	{ .compatible = "apple,t8152-smc-mailbox", .data = &apple_mbox_t8152_smc_hw },
+	/* The AOP's ASC wrapper mailbox has the SMC mailbox's counted FIFOs. */
+	{ .compatible = "apple,t8152-ascwrap-v8-mailbox", .data = &apple_mbox_t8152_smc_hw },
+	{ .compatible = "apple,t8152-ans-mailbox", .data = &apple_mbox_t8152_ans_hw },
 	{ .compatible = "apple,t6031-agx-asc-mailbox", .data = &apple_mbox_asc_hw },
 	{ .compatible = "apple,t8122-agx-asc-mailbox", .data = &apple_mbox_asc_hw },
 	{ .compatible = "apple,t8152-gfx-ascwrap-v8", .data = &apple_mbox_t8152_gfx_ascwrap_v8_hw },
