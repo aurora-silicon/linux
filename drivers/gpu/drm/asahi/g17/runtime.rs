@@ -469,6 +469,30 @@ impl Registry {
         queue.bind_owner(owner, context.clone())
     }
 
+    /// Under backing pressure, detaches idle open owners from their compute
+    /// channels, as `rebind_compute` does when physical QIDs run short, so that
+    /// `vacate_idle_pools` can give their pools back. An open owner otherwise
+    /// keeps a pool sized for its largest dispatch for as long as it lives, and
+    /// a few idle ones can hold the shared lower window that another queue is
+    /// waiting for. A detached owner binds a channel again on its next dispatch.
+    /// `except` is the owner waiting for the capacity.
+    pub(super) fn share_idle_for_backing(&mut self, except: u64) -> Result<usize> {
+        let teardown = &self.teardown;
+        let mut shared = 0;
+        for mut queue in self.compute.iter_mut().flatten().filter_map(|entry| entry.queue.as_deref_mut()) {
+            if queue.owner() == Some(except) || !queue.shareable() {
+                continue;
+            }
+            if queue.context().is_some_and(|bound| teardown.releasing(bound)) {
+                continue;
+            }
+            if queue.share_idle()? {
+                shared += 1;
+            }
+        }
+        Ok(shared)
+    }
+
     /// Delay before retrying pools a turn could not release.
     const POOL_RETRY_NS: u64 = 100_000_000;
     /// Publishes releases for the oldest idle retained pools beyond `cap` and
@@ -2931,6 +2955,7 @@ impl Backend {
                 firmware.queues.reclaim_idle_render_pools(&firmware.init, &mut deferred)?;
             }
             if reclaim_backing && !firmware.render_control_backpressured() {
+                firmware.queues.share_idle_for_backing(self.owner)?;
                 let (published, _) = firmware.queues.vacate_idle_pools(&firmware.init, 0, now_ns(), 0)?;
                 if published != 0 { firmware.primary.notify(super::MSG_CONTROL_NOTIFY)?; }
             }

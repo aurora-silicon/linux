@@ -362,6 +362,7 @@ impl Backend {
             }
             let mut published = 0;
             if !firmware.render_control_backpressured() {
+                firmware.queues.share_idle_for_backing(self.owner)?;
                 (published, _) = firmware.queues.vacate_idle_pools(
                     &firmware.init,
                     0,
