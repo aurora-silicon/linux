@@ -36,6 +36,7 @@
 #include <linux/hid-debug.h>
 #include <linux/hidraw.h>
 #include "usbhid.h"
+#include "../hid-ids.h"
 #include "hid-pidff.h"
 
 /*
@@ -1079,6 +1080,36 @@ err:
 	return ret;
 }
 
+/*
+ * Interfaces that declare a HID report descriptor but deliver their input
+ * reports on a bulk IN endpoint, with no interrupt IN. The Touch ID interface
+ * of the Magic Keyboards with Touch ID is one: its reports are up to 650 bytes
+ * and arrive as one bulk transfer each, ended by a short packet.
+ */
+static const struct usb_device_id usbhid_bulk_in_ids[] = {
+	{ USB_DEVICE(USB_VENDOR_ID_APPLE, USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_FINGERPRINT_2021) },
+	{ USB_DEVICE(USB_VENDOR_ID_APPLE, USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_NUMPAD_2021) },
+	{ USB_DEVICE(USB_VENDOR_ID_APPLE, USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_FINGERPRINT_2024) },
+	{ USB_DEVICE(USB_VENDOR_ID_APPLE, USB_DEVICE_ID_APPLE_MAGIC_KEYBOARD_NUMPAD_2024) },
+	{ }
+};
+
+/*
+ * The endpoint input reports arrive on: the first interrupt IN, or, for an
+ * interface listed above that has none, its first bulk IN.
+ */
+static int usbhid_find_in_endpoint(struct usb_interface *intf,
+				   struct usb_endpoint_descriptor **ep)
+{
+	struct usb_host_interface *alt = intf->cur_altsetting;
+
+	if (!usb_find_int_in_endpoint(alt, ep))
+		return 0;
+	if (!usb_match_id(intf, usbhid_bulk_in_ids))
+		return -ENXIO;
+	return usb_find_bulk_in_endpoint(alt, ep);
+}
+
 static int usbhid_start(struct hid_device *hid)
 {
 	struct usb_interface *intf = to_usb_interface(hid->dev.parent);
@@ -1169,6 +1200,27 @@ static int usbhid_start(struct hid_device *hid)
 			usbhid->urbout->transfer_dma = usbhid->outbuf_dma;
 			usbhid->urbout->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
 		}
+	}
+
+	if (!usbhid->urbin) {
+		struct usb_endpoint_descriptor *endpoint;
+
+		/* usbhid_probe() found an input endpoint, so this is bulk. */
+		ret = usbhid_find_in_endpoint(to_usb_interface(hid->dev.parent),
+					      &endpoint);
+		if (ret || !usb_endpoint_xfer_bulk(endpoint)) {
+			ret = -ENODEV;
+			goto fail;
+		}
+		ret = -ENOMEM;
+		usbhid->urbin = usb_alloc_urb(0, GFP_KERNEL);
+		if (!usbhid->urbin)
+			goto fail;
+		usb_fill_bulk_urb(usbhid->urbin, dev,
+				  usb_rcvbulkpipe(dev, endpoint->bEndpointAddress),
+				  usbhid->inbuf, insize, hid_irq_in, hid);
+		usbhid->urbin->transfer_dma = usbhid->inbuf_dma;
+		usbhid->urbin->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
 	}
 
 	usbhid->urbctrl = usb_alloc_urb(0, GFP_KERNEL);
@@ -1375,7 +1427,7 @@ static int usbhid_probe(struct usb_interface *intf, const struct usb_device_id *
 	dbg_hid("HID probe called for ifnum %d\n",
 			intf->altsetting->desc.bInterfaceNumber);
 
-	ret = usb_find_int_in_endpoint(interface, &ep);
+	ret = usbhid_find_in_endpoint(intf, &ep);
 	if (ret) {
 		hid_err(intf, "couldn't find an input interrupt endpoint\n");
 		return -ENODEV;

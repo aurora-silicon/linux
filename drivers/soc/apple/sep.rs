@@ -43,6 +43,14 @@ mod skdl;
 mod sks;
 mod sse;
 mod stac;
+mod stac_client;
+mod stac_ta_wire;
+// The read-only client uses the pairing-state query; the other operations
+// come with the session relay.
+#[allow(dead_code)]
+mod stac_ops;
+#[allow(dead_code)]
+mod stac_lifecycle;
 mod store;
 mod transfer;
 mod trusted;
@@ -818,9 +826,25 @@ struct SepData {
     stac_rx: Mutex<stac::Exchange>,
     #[pin]
     stac_wq: CondVar,
+    // One stac operation at a time, whoever runs it.
+    #[pin]
+    stac_op: Mutex<()>,
+    // The keyboard's lifecycle (see `stac_client`).
+    #[pin]
+    stac_lc: Mutex<stac_lifecycle::Lifecycle>,
+    // The current physical attach's handshake result and live command sequence
+    // (see `stac_client`): set once on identify, reused by a later pairing or
+    // session, cleared on detach.
+    #[pin]
+    stac_attach: Mutex<Option<stac_client::Attach>>,
     stac_named: Atomic<bool>,
     stac_layout: Atomic<u32>,
     stac_absent_logged: Atomic<bool>,
+    // The per-connection session relay (see `stac_client`) is gated behind the
+    // write-only `ta_session` parameter: off until root writes 1, so by
+    // default the client only reads and holds the session, connection-state
+    // and detach-finalise steps.
+    stac_ta_session: Atomic<bool>,
 
     // The boot-policy endpoint (see `pnon`): its buffers, its one
     // exchange, and what discovery said about it.
@@ -1239,9 +1263,13 @@ impl SepData {
                 ool_stac <- new_mutex!(Some(ool_stac)),
                 stac_rx <- new_mutex!(stac::Exchange::new()),
                 stac_wq <- new_condvar!("SepData::stac_wq"),
+                stac_op <- new_mutex!(()),
+                stac_lc <- new_mutex!(stac_lifecycle::Lifecycle::new()),
+                stac_attach <- new_mutex!(Option::<stac_client::Attach>::None),
                 stac_named: Atomic::new(false),
                 stac_layout: Atomic::new(0),
                 stac_absent_logged: Atomic::new(false),
+                stac_ta_session: Atomic::new(false),
                 ool_pnon <- new_mutex!(Some(ool_pnon)),
                 pnon_rx <- new_mutex!(pnon::Exchange::new()),
                 pnon_wq <- new_condvar!("SepData::pnon_wq"),
@@ -3521,7 +3549,7 @@ impl WorkItem<VERIFY_WORK_ID> for SepData {
 }
 
 
-struct SepDriver(Arc<SepData>, attach::Attribute);
+struct SepDriver(Arc<SepData>, attach::Attribute, stac_client::Client);
 
 // Deliberately not exported as a module alias: udev must not load the driver
 // on its own. The loader service loads it once the iBoot system container's
@@ -3628,12 +3656,15 @@ impl platform::Driver for SepDriver {
                 return Err(e);
             }
         };
-        Ok(SepDriver(data, attribute))
+        // The keyboard client; the service tells it when to start.
+        let client = stac_client::Client::register(data.clone());
+        Ok(SepDriver(data, attribute, client))
     }
 }
 
 impl Drop for SepDriver {
     fn drop(&mut self) {
+        self.2.unregister();
         self.1.unregister();
         self.0.remove();
     }

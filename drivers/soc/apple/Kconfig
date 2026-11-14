@@ -203,6 +203,7 @@ config APPLE_SEP
 	depends on TRUSTED_KEYS
 	depends on CRYPTO
 	depends on MFD_MACSMC || !MFD_MACSMC
+	depends on HID_APPLE_TA || !HID_APPLE_TA
 	select CRYPTO_HMAC
 	select CRYPTO_SHA256
 	select CRYPTO_AES

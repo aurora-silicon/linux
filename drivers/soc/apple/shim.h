@@ -314,4 +314,24 @@ void sep_complete_attach_unregister(struct device *dev);
 void sep_diag_keystore_ended(void);
 void sep_diag_set_xart(bool writable);
 
+/* Trusted-accessory keyboard client (stac_ta_shim.c, stac_client.rs). */
+typedef void (*sep_stac_ta_event_fn)(void *ctx);
+/* Runs the accessory handshake and feeds the lifecycle; the Rust side drives
+ * the reads and the two protocol-handshake writes through the command/read
+ * entry points below, under the client lock the identify work holds.
+ */
+typedef void (*sep_stac_ta_identify_fn)(void *ctx);
+typedef int (*sep_stac_ta_pair_fn)(void *ctx);
+typedef int (*sep_stac_ta_session_fn)(void *ctx);
+int sep_stac_ta_register(void *ctx, sep_stac_ta_event_fn attached,
+			 sep_stac_ta_event_fn detached,
+			 sep_stac_ta_identify_fn identify,
+			 sep_stac_ta_pair_fn pair,
+			 sep_stac_ta_session_fn session);
+ssize_t sep_stac_ta_command(const u8 *cmd, size_t len, u8 reply_id, u8 *reply,
+			    size_t cap, unsigned int timeout_ms);
+ssize_t sep_stac_ta_read(u8 id, u8 *buf, size_t len);
+void sep_stac_ta_unregister(void);
+void sep_stac_ta_identify(void);
+
 #endif /* SEP_SHIM_H */

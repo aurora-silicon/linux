@@ -146,6 +146,19 @@ config HID_APPLE
 	Say Y here if you want support for keyboards of	Apple iBooks, PowerBooks,
 	MacBooks, MacBook Pros and Apple Aluminum.
 
+config HID_APPLE_TA
+	tristate "Touch ID channel of the Magic Keyboards with Touch ID"
+	depends on HID_APPLE && USB_HID
+	help
+	  Support for the trusted-accessory channel of the Magic Keyboards
+	  with Touch ID over USB. The channel carries pairing, session and
+	  sensor traffic between the keyboard's Touch ID sensor and the
+	  Secure Enclave of an Apple silicon Mac; the driver relays it to the
+	  enclave driver and never exposes it to user space.
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called hid-apple-ta.
+
 config HID_APPLE_MTP_HAPTIC
 	tristate "Apple MTP Haptic Actuator support"
 	depends on HID
