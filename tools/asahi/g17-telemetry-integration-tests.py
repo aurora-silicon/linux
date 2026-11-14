@@ -378,11 +378,12 @@ RUST_TESTS = r'''
         assert_eq!((view.util_status,view.device,view.pstate_status,view.busy_status,view.busy_ns),
                    (telemetry::VALID,50,telemetry::UNAVAILABLE,telemetry::VALID,0));
         assert_eq!(reader.frequency(),Some((None,1_578_000_000)));
-        // 8 ms (192_000 ticks) at 50% -> 4 ms busy; 16 ms (384_000 ticks) at 100% -> +16 ms; >384_000 ticks gap ignored.
+        // 8 ms (192_000 ticks) at 50% -> 4 ms busy; 16 ms (384_000 ticks) at 100% -> +16 ms; after a
+        // >384_000 ticks gap only the record's own 8 ms period at 100% -> +8 ms.
         push([0x13,100_000+192_000,0,20,40,0,50,0,0,0,0,0,0,0,0,0,0,0]);
         push([0x13,100_000+192_000+384_000,0,100,100,0,100,0,0,0,0,0,0,0,0,0,0,0]);
         push([0x13,100_000+192_000+384_000+384_001,0,100,100,0,100,0,0,0,0,0,0,0,0,0,0,0]);
-        assert_eq!(reader.read().busy_ns,20_000_000);
+        assert_eq!(reader.read().busy_ns,28_000_000);
         // Tag 0x10 is ignored when Protocol::PSTATE_8MS is active.
         push([0x10,0x2500,0,0,0,0,6,0,0,0,0,0,0,0,0,0,0,0]);
         assert_eq!(reader.read().pstate_status,telemetry::UNAVAILABLE);
@@ -574,6 +575,47 @@ RUST_TESTS = r'''
             rings.drain_statistics(&dev,&init,Primary);
             assert_eq!(rings.read_statistics(1).util_status,telemetry::VALID);
         }
+    }
+    #[test]
+    fn m5_busy_time_takes_records_a_power_boundary_kept_out() {
+        use {channel::Rings,fw::variant::InitGraph,Role::*};
+        let dev=crate::device::Device;
+        let init=initdata::InitData::new();
+        let mut rings=Rings::new(InitGraph::G17P,telemetry::Protocol::PSTATE_8MS,13).unwrap();
+        // 8 ms windows at 100%, timestamps in words 1 and 2.
+        let util=|ticks:u32|[0x13,ticks,0x59,0,0,100,100,0,0,0,0,0,0,0,0,0,0,0];
+        init.push(Primary,util(0));
+        rings.drain_statistics(&dev,&init,Primary);
+        assert_eq!(rings.read_statistics(1).busy_ns,0);
+        // Queued at a gate: cut off from the average, still busy time.
+        init.push(Primary,util(192_000));
+        rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],false,1);
+        rings.drain_statistics(&dev,&init,Primary);
+        assert_eq!(rings.read_statistics(1).busy_ns,8_000_000);
+        // Drained while gated, from the other role: the same.
+        init.push(Secondary,util(384_000));
+        rings.drain_statistics(&dev,&init,Secondary);
+        assert_eq!(rings.read_statistics(1).busy_ns,16_000_000);
+        // Powered again: one record per epoch keeps counting, a repeat does not.
+        rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],true,2);
+        init.push(Primary,util(576_000));
+        init.push(Secondary,util(576_000));
+        rings.drain_statistics(&dev,&init,Primary);
+        rings.drain_statistics(&dev,&init,Secondary);
+        assert_eq!(rings.read_statistics(1).busy_ns,24_000_000);
+        assert_eq!(rings.read_statistics(1).busy_status,telemetry::VALID);
+        // Suspend's discard keeps queued records out.
+        init.push(Primary,util(768_000));
+        rings.suspend_statistics(true);
+        rings.drain_statistics(&dev,&init,Primary);
+        rings.suspend_statistics(false);
+        rings.drain_statistics(&dev,&init,Primary);
+        assert_eq!(rings.read_statistics(1).busy_ns,24_000_000);
+        // Quarantine stops the total: it reads stale.
+        init.cursors[1][1].store(fw::channels::STATISTICS_SLOTS,Ordering::Relaxed);
+        rings.drain_statistics(&dev,&init,Secondary);
+        let view=rings.read_statistics(1);
+        assert_eq!((view.busy_status,view.busy_ns),(telemetry::STALE,24_000_000));
     }
     #[test]
     fn pstate_uses_drain_order_without_role_deduplication() {
@@ -799,6 +841,11 @@ def main():
     # Compile the production transport and decoder; only MMIO/shared memory,
     # kernel logging and allocation adapters are replaced by host fixtures.
     channel = '\n'.join(line for line in channel.splitlines() if not line.startswith('//!'))
+    # The fixture's firmware ring has 8 slots (fw::channels below), so drop the kernel's
+    # check that the decoder's ring size matches the real 256-slot ring.
+    ring_check = 'const _: () = assert!(super::telemetry::STATISTICS_RING_RECORDS == STATISTICS_SLOTS);'
+    assert ring_check in channel
+    channel = channel.replace(ring_check, '', 1)
     (work / 'channel.rs').write_text(channel)
     reports = (DRIVER / 'g17/reports.rs').read_text()
     store = reports.split('/// The view owns the session')[0]

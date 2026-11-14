@@ -132,7 +132,7 @@ static ssize_t agx_qualified_stats_show(struct asahi_stats_attribute *stats, cha
 		n += sysfs_emit_at(buf, n, "busy_ns %llu\n",
 				   (unsigned long long)snap.busy_ns);
 	else if (snap.busy_status == 2)
-		/* M5: the total stopped (a statistics ring was quarantined). */
+		/* The total stopped (a statistics ring was quarantined). */
 		n += sysfs_emit_at(buf, n, "busy_ns stale\n");
 	else
 		n += sysfs_emit_at(buf, n, "busy_ns unsupported\n");
