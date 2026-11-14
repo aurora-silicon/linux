@@ -262,6 +262,16 @@ def main():
         'shared.queues.block(observed, wait_ms, true)?;',
     )]
     assert order == sorted(order), order
+    # A compute queue that changes owner keeps the exited owner's pages, and with them the
+    # hold on its context, until a publication made after the rebind has retired
+    # (g17-capacity-fault-tests.py runs the witness paths).
+    compute = (DRIVER / 'g17/queue/compute.rs').read_text()
+    rebind = item(compute, 'pub(crate) fn bind_owner(')
+    assert 'self.supersede_retained();' in rebind and 'self.retained_owner = None;' not in rebind
+    retire = item(compute, 'pub(crate) fn retire(')
+    assert retire.count('drop(self.previous.take());\n                    Superseded::retire_witnessed(&mut self.superseded);') == 2
+    publish = item(compute, 'pub(in crate::g17) fn publish_with_native_waits(')
+    assert publish.index('self.published_config = Some(identity);') < publish.index('superseded.published = true;')
     assert 'pub(super) const TIMEOUT_MS: kernel::time::Msecs = super::timeout::POLL_MS;' in job
     poll_ms = re.search(r'pub\(crate\) const POLL_MS: u32 = (\d+);', timeout).group(1)
 

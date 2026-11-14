@@ -317,6 +317,7 @@ impl Queue {
         }
         // The acknowledged kill and command settlement replace the ordinary
         // drain witness, including a failed first publication after rebinding.
+        super::Superseded::retire_witnessed(&mut self.superseded);
         super::Previous::retire_witnessed(&mut self.previous);
         self.exit.as_mut().ok_or(EIO)?.phase = Phase::Released;
         self.quarantined = true;
