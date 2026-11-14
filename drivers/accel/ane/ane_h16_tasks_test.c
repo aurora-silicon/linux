@@ -118,7 +118,7 @@ static void ane_h16_relocation_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ret, -ENOEXEC);
 }
 
-/* H17 streams open with 0, and the last task may end the section unpadded. */
+/* An H17 stream opens with 0 or 1 (the caller names which), and the last task may end the section unpadded. */
 static void ane_h17_prologue_test(struct kunit *test)
 {
 	u8 text[60] = {};
@@ -130,6 +130,8 @@ static void ane_h17_prologue_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_h16_task_stream_validate(text, sizeof(text), 1), -ENOEXEC);
 	put_unaligned_le32(1, text);
 	KUNIT_EXPECT_EQ(test, ane_h16_task_stream_validate(text, sizeof(text), 1), 0);
+	KUNIT_EXPECT_EQ(test, ane_hx_task_stream_validate(text, sizeof(text), 1, 1), 0);
+	KUNIT_EXPECT_EQ(test, ane_hx_task_stream_validate(text, sizeof(text), 1, 0), -ENOEXEC);
 	/* A task that overruns the section is still refused. */
 	put_unaligned_le32(12 << 16, text + 16);
 	KUNIT_EXPECT_EQ(test, ane_h16_task_stream_validate(text, sizeof(text), 1), -ENOEXEC);

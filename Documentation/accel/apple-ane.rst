@@ -69,7 +69,8 @@ absolute session deadline and a bounded 64-bit mailbox transport.
 H16 task streams begin with little-endian ``u32 1`` and twelve reserved zero
 bytes. This marker precedes the first aligned task; it is not a task count.
 The initial H16 gate rejects a zero marker, other values and nonzero reserved
-bytes. The public H16 encoder fixes this prologue at commit
+bytes. H17 streams open with 0 or 1; the gate refuses every other value.
+The public H16 encoder fixes this prologue at commit
 ``927013f5480768b07c8e62a866e1514c41aba778`` of
 ``joshuaswarren/mil-hwx-compiler``, in
 ``plugins/H16G/Encoding/H16GALUEncoder.mm``.
