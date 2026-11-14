@@ -502,6 +502,47 @@ RUST_TESTS = r'''
         }
     }
     #[test]
+    fn m5_busy_time_takes_records_a_power_boundary_kept_out() {
+        use {channel::Rings,fw::variant::InitGraph,Role::*};
+        let dev=crate::device::Device;
+        let init=initdata::InitData::new();
+        let mut rings=Rings::new(InitGraph::G17P,true).unwrap();
+        // 8 ms windows at 100%, timestamps in words 1 and 2.
+        let util=|ticks:u32|[0x13,ticks,0x59,0,0,100,100,0,0,0,0,0,0,0,0,0,0,0];
+        init.push(Primary,util(0));
+        rings.drain_statistics(&dev,&init,Primary);
+        assert_eq!(rings.read_statistics(1).busy_ns,0);
+        // Queued at a gate: cut off from the average, still busy time.
+        init.push(Primary,util(192_000));
+        rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],false,1);
+        rings.drain_statistics(&dev,&init,Primary);
+        assert_eq!(rings.read_statistics(1).busy_ns,8_000_000);
+        // Drained while gated, from the other role: the same.
+        init.push(Secondary,util(384_000));
+        rings.drain_statistics(&dev,&init,Secondary);
+        assert_eq!(rings.read_statistics(1).busy_ns,16_000_000);
+        // Powered again: one record per epoch keeps counting, a repeat does not.
+        rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],true,2);
+        init.push(Primary,util(576_000));
+        init.push(Secondary,util(576_000));
+        rings.drain_statistics(&dev,&init,Primary);
+        rings.drain_statistics(&dev,&init,Secondary);
+        assert_eq!(rings.read_statistics(1).busy_ns,24_000_000);
+        assert_eq!(rings.read_statistics(1).busy_status,telemetry::VALID);
+        // Suspend's discard keeps queued records out.
+        init.push(Primary,util(768_000));
+        rings.suspend_statistics(true);
+        rings.drain_statistics(&dev,&init,Primary);
+        rings.suspend_statistics(false);
+        rings.drain_statistics(&dev,&init,Primary);
+        assert_eq!(rings.read_statistics(1).busy_ns,24_000_000);
+        // Quarantine stops the total: it reads stale.
+        init.cursors[1][1].store(fw::channels::STATISTICS_SLOTS,Ordering::Relaxed);
+        rings.drain_statistics(&dev,&init,Secondary);
+        let view=rings.read_statistics(1);
+        assert_eq!((view.busy_status,view.busy_ns),(telemetry::STALE,24_000_000));
+    }
+    #[test]
     fn pstate_uses_drain_order_without_role_deduplication() {
         use {channel::Rings,fw::variant::InitGraph,Role::*};
         let dev=crate::device::Device;

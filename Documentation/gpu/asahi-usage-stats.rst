@@ -156,10 +156,16 @@ there:
 * ``busy_ns``: the utilisation records carry their own timestamps (words 1 and
   2, 24 MHz ticks), one every 8 ms on the M5 and every 16 ms on the A18 Pro, so
   each record closes a window of known length, which is credited at the
-  record's device utilisation. A record that follows the previous one by more
-  than two periods, or whose timestamp went back, only starts a new window:
-  time the GPU spent gated is never credited, and a load sparser than one
-  period reads low. The total keeps counting across power epochs.
+  record's device utilisation. Records are credited in timestamp order, from
+  both roles and across power epochs: the driver keeps the timestamp up to
+  which it has counted, and a record at or before it adds nothing. A record
+  within two periods of that mark closes the window since it; after a longer
+  gap it closes only its own period, so time the GPU spent gated is never
+  credited. Under a frame-paced load the cores gate many times a second, often
+  with one record per power epoch, so the records a power boundary keeps out of
+  the utilisation average still count here. Suspend, recovery and quarantine
+  keep them out, and ``busy_ns`` reads ``stale`` once a statistics ring is
+  quarantined.
 
 The driver asks for full performance while work is in flight, which the
 firmware takes as a floor for its state. An A18 Pro at work therefore normally
