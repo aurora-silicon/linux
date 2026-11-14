@@ -1217,7 +1217,20 @@ impl Backend {
                 };
                 match rebound {
                     Rebind::Done => return Ok(()),
-                    Rebind::Grow => { drop(state); drop(lease); return self.grow_compute(required, admission); }
+                    Rebind::Grow => {
+                        drop(state);
+                        drop(lease);
+                        // Larger backing that does not fit yet waits like a fresh queue's:
+                        // idle pools are given back and the growth is retried. The queue is
+                        // unchanged when the new backing cannot be placed.
+                        match self.grow_compute(required, admission) {
+                            Err(error) if error == ENOSPC => {
+                                self.wait_channels(observed, admission, true)?;
+                                continue;
+                            }
+                            result => return result,
+                        }
+                    }
                     Rebind::Rearm(qid) => (firmware.uat.clone(), firmware.pool.clone(), Err(qid)),
                     Rebind::Fresh => {
                         let reservation = match firmware.queues.reserve_compute(self.owner) {
