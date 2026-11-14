@@ -353,6 +353,47 @@ properties:
       loader. Without this property and apple,sleep-power-args the
       coprocessor refuses the sleep.
 
+  apple,sleep-display-power-args:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 8
+    maxItems: 8
+    description:
+      Firmware 27 system sleep, internal panel. The eight bytes that follow
+      the power state in the set_power_state (A484) request that turns the
+      display itself off before the sleep's power-down, and on again after
+      the wake's power-up. Set by the boot loader. Without this property and
+      apple,sleep-display-stage-args the display's own state is left alone
+      across the sleep and only the requests of apple,sleep-power-args are
+      made.
+
+  apple,sleep-display-stage-args:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 12
+    maxItems: 12
+    description:
+      Firmware 27 system sleep, internal panel. The arguments of the two
+      calls with arguments that precede the request of
+      apple,sleep-display-power-args in either direction, the eight-byte
+      argument of A414, then the four-byte argument of A487. Set by the boot
+      loader. Without this property and apple,sleep-display-power-args
+      neither call is made.
+
+  apple,panel-hdcp-open-arg:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      Firmware 27, internal panel. The fifth 32-bit word of the call made to
+      the panel's HDCP interface when that interface opens; the call's other
+      words are zero. Set by the boot loader. Without this property the word
+      is zero too.
+
+  apple,panel-video-open-delay-us:
+    maxItems: 1
+    description:
+      Firmware 27, internal panel. The wait, in microseconds, between the
+      firmware's announcement of the panel's video interface and the opening
+      of that interface. Set by the boot loader. Without this property the
+      interface is opened as it is announced.
+
   mux-controls:
     $ref: /schemas/types.yaml#/definitions/phandle-array
     minItems: 1
@@ -593,6 +634,18 @@ allOf:
       properties:
         apple,sleep-power-args: false
         apple,sleep-a500-args: false
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              const: apple,t6050-dcp
+    then:
+      properties:
+        apple,sleep-display-power-args: false
+        apple,sleep-display-stage-args: false
+        apple,panel-hdcp-open-arg: false
+        apple,panel-video-open-delay-us: false
   - if:
       not:
         properties:
