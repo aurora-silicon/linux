@@ -21,6 +21,9 @@ const HOUSEKEEPING_NS: u64 = 1_000_000;
 /// M5: services an event pass may add, before the rest of the pass, for records notified while
 /// it serviced and signalled.
 const EXTRA_SERVICES: u32 = 3;
+/// M5: the longest an event pass waits, in all, for publications that wait for the device
+/// mutex once its signals left the GPU with nothing in flight. About two publication holds.
+const PUBLISHER_YIELD_NS: u64 = 20_000;
 
 struct Service<'a> {
     firmware: &'a mut Firmware,
@@ -356,6 +359,17 @@ impl Firmware {
         }
     }
 
+    /// Published work has not retired: a compute queue or a render pair has work in flight.
+    fn work_in_flight(&self) -> bool {
+        self.queues
+            .compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+            .any(|queue| queue.in_flight())
+            || self.queues.render_in_flight()
+    }
+
     /// A step of the event pass is waiting on the firmware with no event to wake it.
     fn runtime_polling(&self, now: u64) -> bool {
         self.render_control_backpressured()
@@ -528,14 +542,15 @@ impl crate::g17::Shared {
         // M5: completions first (see `Shared::completion_first`).
         let first = self.completion_first();
         let mut masks = [0; 2];
+        let mut signalled = false;
         let mut services = 0;
-        let recover = loop {
+        let (recover, quiet) = loop {
             if first {
                 // A notification from here on is for records this service may not reach. The
                 // flag only saves a pass: the notification also queued the next one.
                 let _ = self.records.swap(false, core::sync::atomic::Ordering::AcqRel);
             }
-            let (recover, batch) = {
+            let (recover, batch, quiet) = {
                 let mut state = self.state.lock();
                 let Some(firmware) = (*state).as_deref_mut() else {
                     return Ok(());
@@ -547,10 +562,11 @@ impl crate::g17::Shared {
                     // publisher. Joining builders must happen after unlocking.
                     self.preparations.close();
                 }
-                (recover, batch)
+                (recover, batch, first && !firmware.work_in_flight())
             };
             masks[0] |= batch[0];
             masks[1] |= batch[1];
+            signalled |= deferred.pending() != 0;
             deferred.finish();
             services += 1;
             // Records that arrived while this pass serviced and signalled are retired before
@@ -561,7 +577,7 @@ impl crate::g17::Shared {
                 || services > EXTRA_SERVICES
                 || !self.records.load(core::sync::atomic::Ordering::Acquire)
             {
-                break recover;
+                break (recover, quiet);
             }
         };
         crate::g17::trace::event(1);
@@ -569,6 +585,14 @@ impl crate::g17::Shared {
             self.preparations
                 .wait_drained_until(super::now_ns().saturating_add(super::WORK_RING_WAIT_NS))?;
         }
+        // The signals woke a client whose next publication is all the GPU will have: the rest
+        // of this pass lets it take the device mutex first.
+        let mut yield_ns = if first && signalled && quiet && !recover {
+            PUBLISHER_YIELD_NS
+        } else {
+            0
+        };
+        self.yield_to_publishers(&mut yield_ns);
         let mut state = self.state.lock();
         let Some(firmware) = (*state).as_deref_mut() else {
             return Ok(());
@@ -598,7 +622,9 @@ impl crate::g17::Shared {
         firmware.replay_compute(deferred)?;
         firmware.replay_render(deferred)?;
         drop(state);
+        self.yield_to_publishers(&mut yield_ns);
         self.observe_renders(masks, deferred)?;
+        self.yield_to_publishers(&mut yield_ns);
         let mut state = self.state.lock();
         let Some(firmware) = (*state).as_deref_mut() else {
             return Ok(());
@@ -612,14 +638,7 @@ impl crate::g17::Shared {
             firmware.drain_reports();
         }
         let now = super::now_ns();
-        let compute = firmware
-            .queues
-            .compute
-            .iter()
-            .flatten()
-            .filter_map(|entry| entry.queue.as_deref())
-            .any(|queue| queue.in_flight());
-        let in_flight = compute || firmware.queues.render_in_flight();
+        let in_flight = firmware.work_in_flight();
         let idle = firmware.idle_check(now, in_flight)?;
         // Expiries, drained pairs, exits, pool and heap trimming and teardown give back what
         // retirement freed; a completion needs none of them to retire or to signal. While work

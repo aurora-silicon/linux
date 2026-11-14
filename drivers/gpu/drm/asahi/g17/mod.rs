@@ -1241,12 +1241,14 @@ struct Shared {
     /// The next event pass runs every housekeeping step: set by every [`Self::queue_events`]
     /// request, not by the firmware's event notification ([`Self::queue_event_records`]).
     housekeeping: AtomicBool,
-    /// M5: an event pass signals its completions before the rest of its work
-    /// ([`Self::completion_first`]).
+    /// M5: an event pass signals completions before the rest of its work, and lets the
+    /// publication its signals woke take the device mutex first ([`Self::completion_first`]).
     completion_first: bool,
     /// Records were notified since the running event pass last began a service: it services
     /// again before the rest of the pass (M5).
     records: AtomicBool,
+    /// Submit-path publications waiting for the device mutex ([`Self::lock_for_publication`]).
+    publishers: AtomicU32,
     /// When an event pass last ran every housekeeping step, in ns.
     housekeeping_ns: AtomicU64,
     #[pin]
@@ -1479,13 +1481,43 @@ impl Shared {
     }
 
     /// M5: an event pass retires and signals the records notified while it serviced before the
-    /// rest of its work (its reports, replays, render observation and housekeeping), and drains
-    /// its report rings after its render observation, so that the renders it retires are
-    /// signalled before the reports are read. A client that waits for each job before it
-    /// submits the next leaves the GPU idle from the job's end to its next publication, and
-    /// none of that work is a scheduling input.
+    /// rest of its work (its reports, replays, render observation and housekeeping), drains its
+    /// report rings after its render observation, so that the renders it retires are signalled
+    /// before the reports are read, and lets the publication its signals woke take the device
+    /// mutex before that work when they left nothing else in flight. A client that waits for
+    /// each job before it submits the next leaves the GPU idle from the job's end to its next
+    /// publication, and none of that work is a scheduling input.
     pub(super) fn completion_first(&self) -> bool {
         self.completion_first
+    }
+
+    /// The device mutex for a submit ioctl's publication. While it waits, an event pass whose
+    /// signals left nothing in flight takes no further hold ([`Self::yield_to_publishers`]).
+    pub(super) fn lock_for_publication(&self) -> kernel::sync::MutexGuard<'_, Option<KBox<Firmware>>> {
+        if !self.completion_first() {
+            return self.state.lock();
+        }
+        self.publishers.fetch_add(1, Ordering::AcqRel);
+        let state = self.state.lock();
+        self.publishers.fetch_sub(1, Ordering::AcqRel);
+        state
+    }
+
+    /// Called by an event pass, holding nothing, before a device-mutex hold that follows its
+    /// signals: waits while publications wait for the mutex, for at most `budget_ns` over the
+    /// pass, so that they take it first. The pass's remaining work signals nothing a client is
+    /// waiting for; the publication is what the idle GPU waits for. A zero budget returns at once.
+    pub(super) fn yield_to_publishers(&self, budget_ns: &mut u64) {
+        if *budget_ns == 0 || self.publishers.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let start = now_ns();
+        let mut spent = 0;
+        while self.publishers.load(Ordering::Acquire) != 0 && spent < *budget_ns {
+            kernel::processor::cpu_relax();
+            spent = now_ns().saturating_sub(start);
+        }
+        *budget_ns = budget_ns.saturating_sub(spent.max(1));
     }
 
     fn queue_grow(self: &Arc<Self>) {
@@ -1799,6 +1831,7 @@ impl Gpu {
                 housekeeping: AtomicBool::new(true),
                 completion_first: m5,
                 records: AtomicBool::new(false),
+                publishers: AtomicU32::new(0),
                 housekeeping_ns: AtomicU64::new(0),
                 poll <- new_delayed_work!("g17::Shared::poll"),
                 idle <- new_delayed_work!("g17::Shared::idle"),

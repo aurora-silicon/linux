@@ -2307,7 +2307,7 @@ impl Backend {
         {
             return Err(render::FALLBACK);
         }
-        let mut state = self.shared.state.lock();
+        let mut state = self.shared.lock_for_publication();
         let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
         if !lease.is_current()
             || self.shared.crashed.load(Ordering::Acquire)
