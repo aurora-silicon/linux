@@ -1615,6 +1615,14 @@ static const struct apple_clpc_hw apple_clpc_hw_t8142 = {
 		[APPLE_CLPC_SOC] = { 1, 2, 3, 4 },
 	},
 	.gpu_input = true,
+	/*
+	 * The J815's ADT has macOS's Low Power mode CPU ceiling,
+	 * cpu-low-power-frequency-max = 2220 MHz (macOS 27.0 and 27.2.1 ADTs).
+	 * macOS's package target in that mode is not measured here, so the
+	 * profile has the ceiling only. The J813's value is not checked.
+	 */
+	.low_power_khz = 2220000,
+	.low_power_machine = "apple,j815",
 };
 
 #if IS_BUILTIN(CONFIG_KUNIT) && !defined(MODULE)
