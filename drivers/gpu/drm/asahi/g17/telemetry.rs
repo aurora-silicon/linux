@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
 //! Qualified V25G83/V26A428 statistics, decoded from complete copied records.
-//! No record of these firmwares measures busy time, power, temperature or achieved
-//! frequency. A/B table selection is absent, so neither nominal candidate is exported
-//! as a requested or achieved frequency.
+//! No record of these firmwares measures power or temperature.
 //!
-//! M5 firmware reports the performance state the GPU runs at (tags 0x19 and 0x1b), and
-//! its utilisation records carry their own timestamps, from which busy time is
-//! integrated. All state is protected by the device mutex.
+//! The 26A428 firmware (the A18 Pro's, and the M5's) reports the performance state the
+//! GPU runs at (tags 0x19 and 0x1b), and its utilisation records carry their own
+//! timestamps, from which busy time is integrated ([`Protocol`]). 25G83 sends neither.
+//! All state is protected by the device mutex.
 
 pub(super) const UNAVAILABLE: u32 = 0;
 pub(super) const VALID: u32 = 1;
@@ -31,10 +30,10 @@ pub(crate) struct Readout {
     pub(crate) util_samples: u64,
     pub(crate) pstate_timestamp: u64,
     /// Utilisation-weighted busy time since the device was created, while `busy_status` is
-    /// [`VALID`] (M5 only).
+    /// [`VALID`] ([`Protocol::util_period_ticks`]).
     pub(crate) busy_ns: u64,
-    /// Frequency of `pstate` while `pstate_status` is [`VALID`], from the board's performance
-    /// state table ([`super::stats::Reader`]); zero where the table is unknown.
+    /// Frequency of `pstate` while `pstate_status` is [`VALID`], from the frequency of each
+    /// state ([`super::stats::Reader`]); zero for state 0 or where it is unknown.
     pub(crate) achieved_frequency_hz: u64,
     pub(crate) busy_status: u32,
     pub(crate) _pad: u32,
@@ -46,14 +45,51 @@ const _: () = {
     assert!(core::mem::size_of::<Readout>() == 80);
 };
 
-/// Interval of the M5 utilisation record (tag 0x13), in timer ticks: 8 ms at 24 MHz.
-const M5_UTIL_PERIOD_TICKS: u64 = 192_000;
-/// A utilisation record more than two intervals after the previous one follows a gap
-/// the firmware did not report (gated or lost records): it only sets the baseline.
-const M5_UTIL_MAX_WINDOW_TICKS: u64 = 2 * M5_UTIL_PERIOD_TICKS;
-/// Highest M5 performance state: the device tree's operating points 1 to 13 (0 is off).
-const M5_MAX_PSTATE: u32 = 13;
 const TIMER_HZ: u64 = 24_000_000;
+
+/// What a firmware reports beyond utilisation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Protocol {
+    /// Highest performance state its state records (tags 0x19 and 0x1b) name; zero where it
+    /// sends none. State 0 is off.
+    pub(crate) max_pstate: u32,
+    /// Interval of its utilisation record (tag 0x13), in timer ticks, whose timestamps busy
+    /// time is integrated from; zero where it is not integrated.
+    pub(crate) util_period_ticks: u64,
+}
+
+impl Protocol {
+    /// 25G83: utilisation only.
+    pub(crate) const NONE: Self = Self {
+        max_pstate: 0,
+        util_period_ticks: 0,
+    };
+    /// M5: the device tree's operating points 1 to 13, utilisation every 8 ms.
+    pub(crate) const M5: Self = Self {
+        max_pstate: 13,
+        util_period_ticks: 192_000,
+    };
+    /// A18 Pro: states 1 to 10 of its eleven-state performance tables, utilisation every
+    /// 16 ms.
+    pub(crate) const A18_PRO: Self = Self {
+        max_pstate: 10,
+        util_period_ticks: 384_000,
+    };
+
+    pub(crate) const fn reports_pstate(self) -> bool {
+        self.max_pstate != 0
+    }
+
+    fn integrates_busy(self) -> bool {
+        self.util_period_ticks != 0
+    }
+
+    /// A utilisation record more than two intervals after the previous one follows a gap the
+    /// firmware did not report (gated or lost records): it only sets the baseline.
+    fn max_window_ticks(self) -> u64 {
+        2 * self.util_period_ticks
+    }
+}
 
 #[derive(Default)]
 pub(super) struct Telemetry {
@@ -71,21 +107,21 @@ pub(super) struct Telemetry {
     /// gates them a few milliseconds after the last work completes and emits no
     /// utilisation record while gated, so a gated GPU is idle, not unknown.
     gated: bool,
-    /// The M5 firmware's records are decoded ([`Self::m5`]).
-    m5: bool,
-    /// Timestamp of the latest M5 utilisation record in this epoch: the start of the window
-    /// the next one closes.
+    /// The records decoded beyond utilisation.
+    protocol: Protocol,
+    /// Timestamp of the latest utilisation record in this epoch: the start of the window the
+    /// next one closes.
     busy_ts: Option<u64>,
     busy_ns: u64,
-    /// End of the latest M5 performance state interval (tag 0x19), in timer ticks.
+    /// End of the latest performance state interval (tag 0x19), in timer ticks.
     pstate_interval_end: Option<u64>,
 }
 
 impl Telemetry {
-    /// Decoder for M5 firmware: its performance state and busy time records.
-    pub(super) fn m5() -> Self {
+    /// Decoder for a firmware that also sends `protocol`'s records.
+    pub(super) fn new(protocol: Protocol) -> Self {
         Self {
-            m5: true,
+            protocol,
             ..Self::default()
         }
     }
@@ -170,7 +206,7 @@ impl Telemetry {
                 for (sum, value) in self.sums.iter_mut().zip(values) {
                     *sum += u64::from(value);
                 }
-                if self.m5 {
+                if self.protocol.integrates_busy() {
                     self.integrate_busy(
                         u64::from(words[1]) | (u64::from(words[2]) << 32),
                         words[6],
@@ -183,7 +219,9 @@ impl Telemetry {
                 self.view.renderer = (self.sums[1] / self.view.util_samples) as u32;
                 self.view.device = (self.sums[2] / self.view.util_samples) as u32;
             }
-            0x10 => {
+            // The logical pstate record, which no current firmware emits. A firmware that
+            // reports its state in tags 0x19 and 0x1b never has it decoded.
+            0x10 if !self.protocol.reports_pstate() => {
                 let timestamp = u64::from(words[1]) | (u64::from(words[2]) << 32);
                 if self.timestamp.is_some_and(|last| timestamp < last) {
                     self.invalidate();
@@ -197,17 +235,16 @@ impl Telemetry {
                 self.view.pstate_status = if words[6] <= 10 { VALID } else { UNAVAILABLE };
                 self.view.pstate = words[6];
             }
-            // M5: the interval [words 3-4, words 1-2] that just ended, run at the state in
-            // word 8. Its end timestamps the state report that follows it.
-            0x19 if self.m5 => {
+            // 26A428: the interval [words 3-4, words 1-2] that just ended. Its end
+            // timestamps the state report that follows it.
+            0x19 if self.protocol.reports_pstate() => {
                 self.pstate_interval_end = Some(u64::from(words[1]) | (u64::from(words[2]) << 32));
             }
-            // M5: the performance state now in effect, an index into the device tree's
-            // operating points, in words 1 and 3. A report whose two words differ is not
-            // used.
-            0x1b if self.m5 => {
+            // 26A428: the performance state now in effect, in words 1 and 3. A report whose
+            // two words differ is not used.
+            0x1b if self.protocol.reports_pstate() => {
                 let pstate = words[1];
-                if pstate != words[3] || pstate == 0 || pstate > M5_MAX_PSTATE {
+                if pstate != words[3] || pstate == 0 || pstate > self.protocol.max_pstate {
                     self.view.pstate_status = UNAVAILABLE;
                     return;
                 }
@@ -220,15 +257,15 @@ impl Telemetry {
         }
     }
 
-    /// Credits the window an M5 utilisation record closes, at its device utilisation. The
-    /// window starts at the previous record of the epoch; a record after a longer gap than
-    /// [`M5_UTIL_MAX_WINDOW_TICKS`] (the GPU was gated or records were lost) or one whose
+    /// Credits the window a utilisation record closes, at its device utilisation. The window
+    /// starts at the previous record of the epoch; a record after a longer gap than
+    /// [`Protocol::max_window_ticks`] (the GPU was gated or records were lost) or one whose
     /// timestamp went back only sets the baseline, so an idle gap is never credited.
     fn integrate_busy(&mut self, timestamp: u64, device: u32) {
         if let Some(last) = self.busy_ts {
             let window = timestamp.wrapping_sub(last);
-            if timestamp > last && window <= M5_UTIL_MAX_WINDOW_TICKS {
-                // At most 384000 ticks x 100: no overflow.
+            if timestamp > last && window <= self.protocol.max_window_ticks() {
+                // At most two 16 ms periods (768000 ticks) x 100 x 10^9: no overflow.
                 let ns = window * u64::from(device) * 1_000_000_000 / (100 * TIMER_HZ);
                 self.busy_ns = self.busy_ns.saturating_add(ns);
             }
@@ -254,8 +291,13 @@ impl Telemetry {
         }
         // A pstate report describes a state transition, with no qualified
         // cadence. Its validity ends on replacement or epoch invalidation,
-        // rather than an invented periodic-report deadline.
-        if self.m5 {
+        // rather than an invented periodic-report deadline. Gated cores run
+        // at no state: off (0) is a measurement here, as idle is above.
+        if self.gated && self.protocol.reports_pstate() {
+            view.pstate_status = VALID;
+            view.pstate = 0;
+        }
+        if self.protocol.integrates_busy() {
             view.busy_status = VALID;
             view.busy_ns = self.busy_ns;
         } else {
@@ -491,7 +533,7 @@ mod tests {
 
     #[test]
     fn m5_state_reports_give_the_pstate() {
-        let mut stats = Telemetry::m5();
+        let mut stats = Telemetry::new(Protocol::M5);
         stats.record(&M5_INTERVAL, 100, AGE);
         assert_eq!(stats.read(100, AGE).pstate_status, UNAVAILABLE);
         stats.record(&M5_STATE, 101, AGE);
@@ -510,15 +552,19 @@ mod tests {
             stats.record(&words, 103, AGE);
             assert_eq!(stats.read(103, AGE).pstate_status, UNAVAILABLE);
         }
-        // Gating ends the epoch: the state is no longer current.
+        // Gated cores are off: state 0. Power-up ends the epoch: the state before it is
+        // no longer current.
         stats.record(&M5_STATE, 104, AGE);
         stats.gate();
-        assert_eq!(stats.read(105, AGE).pstate_status, STALE);
+        let view = stats.read(105, AGE);
+        assert_eq!((view.pstate_status, view.pstate), (VALID, 0));
+        stats.invalidate();
+        assert_eq!(stats.read(106, AGE).pstate_status, STALE);
     }
 
     #[test]
     fn m5_busy_time_integrates_utilisation_windows() {
-        let mut stats = Telemetry::m5();
+        let mut stats = Telemetry::new(Protocol::M5);
         assert_eq!(
             (stats.read(0, AGE).busy_status, stats.read(0, AGE).busy_ns),
             (VALID, 0)
@@ -554,6 +600,57 @@ mod tests {
         // An epoch boundary keeps the total.
         stats.invalidate();
         assert_eq!(stats.read(107, AGE).busy_ns, before);
+    }
+
+    #[test]
+    fn a18_pro_state_reports_give_the_pstate() {
+        let mut stats = Telemetry::new(Protocol::A18_PRO);
+        let mut interval = M5_INTERVAL;
+        let mut state = M5_STATE;
+        (state[1], state[3]) = (10, 10);
+        stats.record(&interval, 100, AGE);
+        stats.record(&state, 101, AGE);
+        let view = stats.read(101, AGE);
+        assert_eq!((view.pstate_status, view.pstate), (VALID, 10));
+        assert_eq!(view.pstate_timestamp, 0x59_3c04_2f8f);
+        // Its table ends at state 10.
+        (state[1], state[3]) = (11, 11);
+        stats.record(&state, 102, AGE);
+        assert_eq!(stats.read(102, AGE).pstate_status, UNAVAILABLE);
+        // Tag 0x10 is not this firmware's state report.
+        interval[1] += 1;
+        stats.record(&interval, 103, AGE);
+        stats.record(&P1, 103, AGE);
+        assert_eq!(stats.read(103, AGE).pstate_status, UNAVAILABLE);
+        (state[1], state[3]) = (1, 1);
+        stats.record(&state, 104, AGE);
+        assert_eq!(stats.read(104, AGE).pstate, 1);
+        // Gated cores are off.
+        stats.gate();
+        let view = stats.read(105, AGE);
+        assert_eq!((view.pstate_status, view.pstate), (VALID, 0));
+    }
+
+    #[test]
+    fn a18_pro_busy_time_integrates_16_ms_windows() {
+        let mut stats = Telemetry::new(Protocol::A18_PRO);
+        let mut words = M5_U[0];
+        stats.record(&words, 100, AGE);
+        // One full 16 ms window at 100%, then one at 25%.
+        words[1] += 384_000;
+        stats.record(&words, 101, AGE);
+        assert_eq!(stats.read(101, AGE).busy_ns, 16_000_000);
+        words[1] += 384_000;
+        words[6] = 25;
+        stats.record(&words, 102, AGE);
+        assert_eq!(stats.read(102, AGE).busy_ns, 20_000_000);
+        // Up to two periods is one window; longer is a gap the GPU spent gated.
+        words[1] += 768_000;
+        stats.record(&words, 103, AGE);
+        assert_eq!(stats.read(103, AGE).busy_ns, 28_000_000);
+        words[1] += 768_001;
+        stats.record(&words, 104, AGE);
+        assert_eq!(stats.read(104, AGE).busy_ns, 28_000_000);
     }
 
     #[test]

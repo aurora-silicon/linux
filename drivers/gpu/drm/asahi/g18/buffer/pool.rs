@@ -675,12 +675,10 @@ impl G18UmaPoolMemory {
         if !self.render || self.scratch.len() != crate::g18::uapi::render_policy::uma_blocks() as usize { return Err(EINVAL); }
         let mut pages = 0;
         let mut audit = |high: u64, low: u64, bytes: usize| -> Result {
-            for offset in (0..bytes).step_by(mmu::UAT_PGSZ) {
-                let pa = uat.kernel_vm().translate_iova(high + offset as u64)?;
-                if vm.translate_iova(low + offset as u64)? != pa
-                    || uat.kernel_lower_vm().translate_iova(low + offset as u64)? != pa { return Err(EFAULT); }
-                pages += 1;
-            }
+            let pa = uat.kernel_vm().translate_pages(high, bytes)?;
+            if vm.translate_pages(low, bytes)? != pa
+                || uat.kernel_lower_vm().translate_pages(low, bytes)? != pa { return Err(EFAULT); }
+            pages += pa.len();
             Ok(())
         };
         for (i, page) in self.directory.iter().enumerate() {
