@@ -389,6 +389,20 @@ module_param(fw27_panel_boot_mode, int, 0644);
 MODULE_PARM_DESC(fw27_panel_boot_mode,
 		 "FW27 internal panel: -1 keep the boot mode for a single fixed timing (default), 0 always mode-set, 1 always keep the boot mode");
 
+/*
+ * update_notify_clients_dcp (A031 on H17P, A033 on H17G) form in the H17
+ * client-open sequence:
+ *    0 client numbers in the first slots, 9 states (default)
+ *    1 client flags (clients[c] = 1), 9 states: none, 6, 7, 8, 10, 11, 12,
+ *      25, 26
+ *    2 client flags, 14 states: the 9, then 13, 14, 15, 16, 17
+ * macOS on fw27 sends the flag form (M5 capture).
+ */
+int notify_clients_form;
+module_param(notify_clients_form, int, 0644);
+MODULE_PARM_DESC(notify_clients_form,
+		 "H17 update_notify_clients_dcp: 0 client numbers (default), 1 client flags, 9 states, 2 client flags, 14 states");
+
 static bool unstable_edid = true;
 module_param(unstable_edid, bool, 0644);
 MODULE_PARM_DESC(unstable_edid, "Enable unstable EDID retrival support");
