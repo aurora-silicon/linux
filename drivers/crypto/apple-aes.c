@@ -699,6 +699,7 @@ static const struct of_device_id apple_sio_aes_of_match[] = {
 	{ .compatible = "apple,t8112-aes", .data = &apple_sio_aes_v3 },
 	{ .compatible = "apple,t6041-aes", .data = &apple_sio_aes_v5 },
 	{ .compatible = "apple,t8140-aes", .data = &apple_sio_aes_v5 },
+	{ .compatible = "apple,t8142-aes", .data = &apple_sio_aes_v5 },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, apple_sio_aes_of_match);
