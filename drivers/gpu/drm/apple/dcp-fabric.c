@@ -46,6 +46,11 @@ module_param(tb_forward_irq_hpd, bool, 0644);
 MODULE_PARM_DESC(tb_forward_irq_hpd,
 		 "Pass a Thunderbolt DP sink IRQ_HPD to the display firmware (default: on)");
 
+static bool tb_drop_replay;
+module_param(tb_drop_replay, bool, 0644);
+MODULE_PARM_DESC(tb_drop_replay,
+		 "Drop the sink IRQ_HPD replayed after a mode set instead of passing it (default: off)");
+
 /*
  * The hybrid pipeline (dcpext0: fixed HDMI PHY + Type-C routes) normally
  * comes last for a Type-C port, kept for an HDMI display.  On the J616s it
@@ -3330,7 +3335,7 @@ void dcp_tb_event_work(struct work_struct *work)
 	struct dptx_port *dptx = &dcp->dptxport[0];
 	struct apple_epic_service *service;
 	struct apple_dcp_typec_route *route;
-	bool irq, changed, hpd, valid;
+	bool irq, changed, hpd, valid, replayed;
 	ktime_t now = ktime_get();
 	int ret;
 
@@ -3345,6 +3350,9 @@ void dcp_tb_event_work(struct work_struct *work)
 		irq = false;
 		dev_info(dcp->dev, "DP tunnel: sink IRQ_HPD held until the mode set completes\n");
 	}
+	replayed = irq && dcp->tb_irq_replayed;
+	if (irq)
+		dcp->tb_irq_replayed = false;
 	if ((!irq && !changed) || !route)
 		return;
 	scoped_guard(mutex, &dcp->tb_lock)
@@ -3380,7 +3388,10 @@ void dcp_tb_event_work(struct work_struct *work)
 		scoped_guard(spinlock_irqsave, &dcp->relink_lock)
 			dcp_relink_link_up(&dcp->relink,
 					   READ_ONCE(dcp->typec_generation), jiffies);
-		if (tb_forward_irq_hpd) {
+		if (replayed && tb_drop_replay) {
+			dev_info(dcp->dev, "DP tunnel: replayed sink IRQ_HPD (#%u, %lld ms after the last) dropped (tb_drop_replay=1)\n",
+				 dcp->tb_irq_hpd_count, since);
+		} else if (tb_forward_irq_hpd) {
 			ret = dptxport_sink_irq(service);
 			dev_info(dcp->dev, "DP tunnel: sink IRQ_HPD (#%u, %lld ms after the last) passed to the firmware: %d\n",
 				 dcp->tb_irq_hpd_count, since, ret);
@@ -3408,6 +3419,8 @@ void dcp_tb_modeset_end(struct apple_dcp *dcp)
 	scoped_guard(mutex, &dcp->tb_event_lock) {
 		WRITE_ONCE(dcp->tb_modeset_busy, false);
 		held = test_bit(DCP_TB_EVENT_IRQ_HPD, &dcp->tb_events);
+		if (held)
+			dcp->tb_irq_replayed = true;
 	}
 	if (held) {
 		dev_info(dcp->dev, "DP tunnel: replaying the held sink IRQ_HPD\n");
