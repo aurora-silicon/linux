@@ -493,6 +493,8 @@ struct sn201202x {
 	struct cd321x cd;
 	bool polled;
 	bool select_polled;
+	/* Sleeps while idle: its event interrupt stays live while it sleeps */
+	bool idle_sleep;
 	struct completion select_completion;
 	struct completion sleep_completion;
 	struct completion wake_completion;
