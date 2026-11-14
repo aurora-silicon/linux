@@ -67,7 +67,10 @@
 		mboxes = <&dcpext0_mbox>;
 		mbox-names = "mbox";
 		iommus = <&dcpext0_dart 23>;
-		clocks = <&clkref>;
+		/* The firmware's clocks: /arm-io/dispext0 clock-ids, as on disp0. */
+		apple,clock-ids = <369 432>;
+		clocks = <&clkref>, <&dcpext_fw_clk369>, <&dcpext_fw_clk432>;
+		clock-names = "clock-154", "firmware-0", "firmware-1";
 		apple,bw-scratch = <&pmgr_dcpext0 0 5 0>;
 		apple,bw-doorbell = <&pmgr_dcpext0 1 6>;
 		apple,iomfb-surfaces = <0 0 1 0>;
@@ -133,7 +136,10 @@
 		mboxes = <&dcpext1_mbox>;
 		mbox-names = "mbox";
 		iommus = <&dcpext1_dart 23>;
-		clocks = <&clkref>;
+		/* The firmware's clocks: /arm-io/dispext1 clock-ids, as on disp0. */
+		apple,clock-ids = <372 433>;
+		clocks = <&clkref>, <&dcpext_fw_clk372>, <&dcpext_fw_clk433>;
+		clock-names = "clock-154", "firmware-0", "firmware-1";
 		apple,bw-scratch = <&pmgr_dcpext1 0 5 0>;
 		apple,bw-doorbell = <&pmgr_dcpext1 1 6>;
 		apple,iomfb-surfaces = <0 0 1 0>;
@@ -253,4 +259,42 @@
 
 &dcpext1_dart {
 	apple,dma-range = <0x100 0x0 0x10 0x0>;
+};
+
+/ {
+	/*
+	 * The external DCP firmware's clocks (/arm-io/dispext0 clock-ids 369 and
+	 * 432, dispext1 372 and 433; the same on the J813 and the J815). Their
+	 * rates are /arm-io clock-frequencies entries 0x71 and 0x74 (ids 0x100
+	 * up), as 712 MHz is entry 0x49 for disp0's 585: 300 MHz and
+	 * 468.75 MHz. 432 and 433 have no entry, as disp0's 431 has none.
+	 * Firmware 27 reads only the first one (see dcp_fw_clk585).
+	 */
+	dcpext_fw_clk369: clock-dcpext-firmware-369 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <300000000>;
+		clock-output-names = "dcpext_firmware_369";
+	};
+
+	dcpext_fw_clk432: clock-dcpext-firmware-432 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <0>;
+		clock-output-names = "dcpext_firmware_432";
+	};
+
+	dcpext_fw_clk372: clock-dcpext-firmware-372 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <468750000>;
+		clock-output-names = "dcpext_firmware_372";
+	};
+
+	dcpext_fw_clk433: clock-dcpext-firmware-433 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <0>;
+		clock-output-names = "dcpext_firmware_433";
+	};
 };
