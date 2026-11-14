@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * T8132 J604 power channels published by the SMC.
+ * T8132 J604 power, voltage and current channels published by the SMC.
  *
- * Every readable float power key the J604's SMC updates on an idle macOS
+ * Every readable float power, voltage and current key the J604's SMC updates on an idle macOS
  * desktop (macOS 26B123 key sweep: flt, 4 bytes, flags 0x85, value moving
  * between two reads 20 s apart) that the common laptop files do not list.
  * Only the backlight's consumer is proven on this machine: PBLR follows the
@@ -203,5 +203,280 @@
 	power-Pb0f {
 		apple,key-id = "Pb0f";
 		label = "SMC Pb0f";
+	};
+
+	voltage-VDMM {
+		apple,key-id = "VDMM";
+		label = "SMC VDMM";
+	};
+
+	voltage-VDMS {
+		apple,key-id = "VDMS";
+		label = "SMC VDMS";
+	};
+
+	voltage-VP0R {
+		apple,key-id = "VP0R";
+		label = "PMU VP0R";
+	};
+
+	voltage-VP0b {
+		apple,key-id = "VP0b";
+		label = "PMU VP0b";
+	};
+
+	voltage-VP1b {
+		apple,key-id = "VP1b";
+		label = "PMU VP1b";
+	};
+
+	voltage-VP2b {
+		apple,key-id = "VP2b";
+		label = "PMU VP2b";
+	};
+
+	voltage-VP3b {
+		apple,key-id = "VP3b";
+		label = "PMU VP3b";
+	};
+
+	voltage-VP4b {
+		apple,key-id = "VP4b";
+		label = "PMU VP4b";
+	};
+
+	voltage-VP7b {
+		apple,key-id = "VP7b";
+		label = "PMU VP7b";
+	};
+
+	voltage-VP9b {
+		apple,key-id = "VP9b";
+		label = "PMU VP9b";
+	};
+
+	voltage-VP9l {
+		apple,key-id = "VP9l";
+		label = "PMU VP9l";
+	};
+
+	voltage-VPbb {
+		apple,key-id = "VPbb";
+		label = "PMU VPbb";
+	};
+
+	voltage-VPeb {
+		apple,key-id = "VPeb";
+		label = "PMU VPeb";
+	};
+
+	voltage-VR4l {
+		apple,key-id = "VR4l";
+		label = "Rail VR4l";
+	};
+
+	voltage-VR5b {
+		apple,key-id = "VR5b";
+		label = "Rail VR5b";
+	};
+
+	voltage-VR6b {
+		apple,key-id = "VR6b";
+		label = "Rail VR6b";
+	};
+
+	voltage-VR8b {
+		apple,key-id = "VR8b";
+		label = "Rail VR8b";
+	};
+
+	voltage-VR9l {
+		apple,key-id = "VR9l";
+		label = "Rail VR9l";
+	};
+
+	voltage-VRab {
+		apple,key-id = "VRab";
+		label = "Rail VRab";
+	};
+
+	voltage-VRcb {
+		apple,key-id = "VRcb";
+		label = "Rail VRcb";
+	};
+
+	voltage-VReb {
+		apple,key-id = "VReb";
+		label = "Rail VReb";
+	};
+
+	voltage-Vb0f {
+		apple,key-id = "Vb0f";
+		label = "SMC Vb0f";
+	};
+
+	voltage-Vb1f {
+		apple,key-id = "Vb1f";
+		label = "SMC Vb1f";
+	};
+
+	current-IBLR {
+		apple,key-id = "IBLR";
+		label = "SMC IBLR";
+	};
+
+	current-IIDR {
+		apple,key-id = "IIDR";
+		label = "SMC IIDR";
+	};
+
+	current-IMVC {
+		apple,key-id = "IMVC";
+		label = "SMC IMVC";
+	};
+
+	current-IMVR {
+		apple,key-id = "IMVR";
+		label = "SMC IMVR";
+	};
+
+	current-IO5R {
+		apple,key-id = "IO5R";
+		label = "SMC IO5R";
+	};
+
+	current-IP0b {
+		apple,key-id = "IP0b";
+		label = "PMU IP0b";
+	};
+
+	current-IP1b {
+		apple,key-id = "IP1b";
+		label = "PMU IP1b";
+	};
+
+	current-IP1l {
+		apple,key-id = "IP1l";
+		label = "PMU IP1l";
+	};
+
+	current-IP2b {
+		apple,key-id = "IP2b";
+		label = "PMU IP2b";
+	};
+
+	current-IP4b {
+		apple,key-id = "IP4b";
+		label = "PMU IP4b";
+	};
+
+	current-IP5l {
+		apple,key-id = "IP5l";
+		label = "PMU IP5l";
+	};
+
+	current-IP7b {
+		apple,key-id = "IP7b";
+		label = "PMU IP7b";
+	};
+
+	current-IP8l {
+		apple,key-id = "IP8l";
+		label = "PMU IP8l";
+	};
+
+	current-IP9b {
+		apple,key-id = "IP9b";
+		label = "PMU IP9b";
+	};
+
+	current-IPMR {
+		apple,key-id = "IPMR";
+		label = "SMC IPMR";
+	};
+
+	current-IPSR {
+		apple,key-id = "IPSR";
+		label = "SMC IPSR";
+	};
+
+	current-IPal {
+		apple,key-id = "IPal";
+		label = "PMU IPal";
+	};
+
+	current-IPbb {
+		apple,key-id = "IPbb";
+		label = "PMU IPbb";
+	};
+
+	current-IPbl {
+		apple,key-id = "IPbl";
+		label = "PMU IPbl";
+	};
+
+	current-IPdb {
+		apple,key-id = "IPdb";
+		label = "PMU IPdb";
+	};
+
+	current-IPeb {
+		apple,key-id = "IPeb";
+		label = "PMU IPeb";
+	};
+
+	current-IPkl {
+		apple,key-id = "IPkl";
+		label = "PMU IPkl";
+	};
+
+	current-IR4l {
+		apple,key-id = "IR4l";
+		label = "Rail IR4l";
+	};
+
+	current-IR5b {
+		apple,key-id = "IR5b";
+		label = "Rail IR5b";
+	};
+
+	current-IRab {
+		apple,key-id = "IRab";
+		label = "Rail IRab";
+	};
+
+	current-IReb {
+		apple,key-id = "IReb";
+		label = "Rail IReb";
+	};
+
+	current-IRfb {
+		apple,key-id = "IRfb";
+		label = "Rail IRfb";
+	};
+
+	current-IU5R {
+		apple,key-id = "IU5R";
+		label = "SMC IU5R";
+	};
+
+	current-IU5r {
+		apple,key-id = "IU5r";
+		label = "SMC IU5r";
+	};
+
+	current-IW3C {
+		apple,key-id = "IW3C";
+		label = "SMC IW3C";
+	};
+
+	current-Ib0f {
+		apple,key-id = "Ib0f";
+		label = "SMC Ib0f";
+	};
+
+	current-Ib8f {
+		apple,key-id = "Ib8f";
+		label = "SMC Ib8f";
 	};
 };
