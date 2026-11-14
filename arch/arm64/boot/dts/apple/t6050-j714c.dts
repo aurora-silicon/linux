@@ -39,6 +39,7 @@
 			reg = <0 0 0 0>; /* To be filled by the loader */
 			/* Format properties will be added by the loader */
 			status = "disabled";
+			apple,internal-panel; /* simpledrm reports it as eDP */
 		};
 	};
 };
