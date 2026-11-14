@@ -578,6 +578,22 @@ static const struct apr_variant apr_t6050 = {
 	.apri = &apri_t6050,
 };
 
+/* T6050's engine and windows; the rows come from the Mac's own file. */
+static const struct apr_variant apr_t8142 = {
+	.build_desc = apr_build_desc,
+	.stats = {
+		{ APR_REG_STATS0_LO, APR_REG_STATS0_HI, APR_REG_STATS0_SIZE },
+		{ APR_REG_STATS1_LO, APR_REG_STATS1_HI, APR_REG_STATS1_SIZE },
+	},
+	.reg_names = { "core", "wrapper", "aux", "ctrl" },
+	.num_regs = 4,
+	.num_irqs = 1,
+	.ring_bytes = APR_RING_BYTES,
+	.desc_bytes = APR_DESC_BYTES,
+	.firmware_name = APRI_T8142_FIRMWARE_NAME,
+	.apri = &apri_t8142,
+};
+
 struct apr_dev {
 	const struct apr_variant *variant;
 	struct device *dev;
@@ -1648,6 +1664,7 @@ static const struct of_device_id apr_of_match[] = {
 	{ .compatible = "apple,t6041-prores", .data = &apr_t6041 },
 	{ .compatible = "apple,t6050-prores", .data = &apr_t6050 },
 	{ .compatible = "apple,t8140-prores", .data = &apr_t8140 },
+	{ .compatible = "apple,t8142-prores", .data = &apr_t8142 },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, apr_of_match);
@@ -1667,3 +1684,4 @@ MODULE_DESCRIPTION("Apple ProRes encoder");
 MODULE_LICENSE("GPL");
 MODULE_FIRMWARE(APRI_T6041_FIRMWARE_NAME);
 MODULE_FIRMWARE(APRI_T6050_FIRMWARE_NAME);
+MODULE_FIRMWARE(APRI_T8142_FIRMWARE_NAME);

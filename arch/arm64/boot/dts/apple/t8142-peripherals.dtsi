@@ -171,8 +171,33 @@
 		compatible = "apple,t8142-dart", "apple,t8110-dart";
 		reg = <0x3 0xa1020000 0x0 0xc000>,
 		      <0x3 0xa1034000 0x0 0x4000>;
+		/* ADT dart-apr instances DARTRT and SMMU. */
+		reg-names = "dart", "auxiliary";
 		interrupts = <AIC_IRQ 1381 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_scodec>;
+		/* ADT vm-base 0x100_0000_0000, vm-size 0x300_0000_0000 */
+		apple,dma-range = <0x100 0x0 0x300 0x0>;
+		status = "disabled";
+	};
+
+	/*
+	 * ProRes encoder (ADT /arm-io/apr, "apr,l0"): T6050's five windows at the
+	 * same offsets. macOS 27.2.1 drives it through SID 1.
+	 */
+	apr: prores@3a1000000 {
+		compatible = "apple,t8142-prores", "apple,prores";
+		reg = <0x3 0xa1000000 0x0 0x4000>,
+		      <0x3 0xa0000000 0x0 0x1000000>,
+		      <0x3 0xa10c0000 0x0 0x4000>,
+		      <0x3 0xa1070000 0x0 0x4000>,
+		      <0x3 0xa1071000 0x0 0x4000>;
+		reg-names = "core", "wrapper", "aux", "ctrl", "ctrl1";
+		interrupts = <AIC_IRQ 1382 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1419 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&apr_dart 1>;
+		power-domains = <&ps_scodec>;
+		resets = <&ps_scodec>;
 		status = "disabled";
 	};
 
@@ -462,6 +487,16 @@
 };
 
 &pmgr {
+	/* ADT pmgr device SCODEC (id 336): the ProRes engine and its DART. */
+	ps_scodec: power-controller@2c0 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2c0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "scodec";
+		status = "disabled";
+	};
+
 	ps_msr: power-controller@2a8 {
 		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x2a8 4>;

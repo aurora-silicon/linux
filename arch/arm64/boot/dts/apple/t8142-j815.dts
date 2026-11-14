@@ -180,3 +180,16 @@
 &ave {
 	status = "okay";
 };
+
+/* The ProRes encoder; it probes only with the Mac's own apple/prores-t8142-init.bin. */
+&ps_scodec {
+	status = "okay";
+};
+
+&apr_dart {
+	status = "okay";
+};
+
+&apr {
+	status = "okay";
+};
