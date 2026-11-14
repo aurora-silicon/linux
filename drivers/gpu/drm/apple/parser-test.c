@@ -1476,7 +1476,8 @@ static void parser_adt_synthetic_matrix(__le32 matrix[10], s32 offset)
 
 static size_t parser_adt_color_fixture(u8 *out, size_t capacity,
 				       const void *gamut, u32 gamut_size,
-				       const void *matrix, u32 matrix_size)
+				       const void *matrix, u32 matrix_size,
+				       const char *ideal)
 {
 	const char root[] = "device-tree", product[] = "product";
 	size_t pos = 0, used;
@@ -1490,7 +1491,7 @@ static size_t parser_adt_color_fixture(u8 *out, size_t capacity,
 	if (!used || capacity - pos - used < 8)
 		return 0;
 	pos += used;
-	put_unaligned_le32(3, out + pos);
+	put_unaligned_le32(2 + !!gamut + !!ideal, out + pos);
 	put_unaligned_le32(0, out + pos + 4);
 	pos += 8;
 	used = parser_adt_property(out + pos, capacity - pos, "name", product,
@@ -1498,11 +1499,21 @@ static size_t parser_adt_color_fixture(u8 *out, size_t capacity,
 	if (!used)
 		return 0;
 	pos += used;
-	used = parser_adt_property(out + pos, capacity - pos, "artwork-display-gamut",
-				   gamut, gamut_size);
-	if (!used)
-		return 0;
-	pos += used;
+	if (ideal) {
+		used = parser_adt_property(out + pos, capacity - pos,
+					   "ideal-screen-colorspace", ideal,
+					   strlen(ideal) + 1);
+		if (!used)
+			return 0;
+		pos += used;
+	}
+	if (gamut) {
+		used = parser_adt_property(out + pos, capacity - pos,
+					   "artwork-display-gamut", gamut, gamut_size);
+		if (!used)
+			return 0;
+		pos += used;
+	}
 	used = parser_adt_property(out + pos, capacity - pos,
 				   "primary-calibration-matrix", matrix, matrix_size);
 	return used ? pos + used : 0;
@@ -1524,7 +1535,7 @@ static void parser_panel_adt_color_target(struct kunit *test)
 
 	parser_adt_synthetic_matrix(matrix, 1 << 20);
 	size = parser_adt_color_fixture(adt, sizeof(adt), "P3", sizeof("P3"),
-					matrix, sizeof(matrix));
+					matrix, sizeof(matrix), NULL);
 	KUNIT_ASSERT_GT(test, size, (size_t)0);
 	KUNIT_ASSERT_EQ(test, dcp_panel_adt_parse(adt, size, &panel), 0);
 	KUNIT_EXPECT_EQ(test, panel.gamut, DCP_PANEL_GAMUT_DISPLAY_P3);
@@ -1536,7 +1547,7 @@ static void parser_panel_adt_color_target(struct kunit *test)
 
 	parser_adt_synthetic_matrix(matrix, -(1 << 19));
 	size = parser_adt_color_fixture(adt, sizeof(adt), "sRGB", sizeof("sRGB"),
-					matrix, sizeof(matrix));
+					matrix, sizeof(matrix), NULL);
 	panel = (struct dcp_panel_adt) {};
 	KUNIT_ASSERT_EQ(test, dcp_panel_adt_parse(adt, size, &panel), 0);
 	KUNIT_EXPECT_EQ(test, panel.gamut, DCP_PANEL_GAMUT_SRGB);
@@ -1567,16 +1578,45 @@ static void parser_panel_adt_color_target(struct kunit *test)
 			matrix[6] = matrix[3];
 		}
 		size = parser_adt_color_fixture(adt, sizeof(adt), name, name_size,
-						matrix, matrix_size);
+						matrix, matrix_size, NULL);
 		panel = (struct dcp_panel_adt) { .gamut = DCP_PANEL_GAMUT_DISPLAY_P3 };
 		KUNIT_ASSERT_EQ(test, dcp_panel_adt_parse(adt, size, &panel), 0);
 		KUNIT_EXPECT_EQ(test, panel.gamut, DCP_PANEL_GAMUT_UNSPECIFIED);
 	}
 
+	/*
+	 * A "P3A" ideal colour space names Display P3 when the artwork tag is
+	 * missing or "Rec2020"; any other tag, a wrong ideal or a bad matrix
+	 * leaves the target unknown.
+	 */
+	for (unsigned int c = 0; c < 6; c++) {
+		static const char * const artwork[] = {
+			"Rec2020", NULL, "AdobeRGB", "Rec2020", "sRGB", "Rec2020",
+		};
+		static const char * const ideal[] = {
+			"P3A", "P3A", "P3A", "sRGBA", "P3A", "P3A",
+		};
+		static const enum dcp_panel_gamut want[] = {
+			DCP_PANEL_GAMUT_DISPLAY_P3, DCP_PANEL_GAMUT_DISPLAY_P3,
+			DCP_PANEL_GAMUT_UNSPECIFIED, DCP_PANEL_GAMUT_UNSPECIFIED,
+			DCP_PANEL_GAMUT_SRGB, DCP_PANEL_GAMUT_UNSPECIFIED,
+		};
+
+		parser_adt_synthetic_matrix(matrix, 1 << 20);
+		if (c == 5)
+			matrix[0] = cpu_to_le32(2);
+		size = parser_adt_color_fixture(adt, sizeof(adt), artwork[c],
+						artwork[c] ? strlen(artwork[c]) + 1 : 0,
+						matrix, sizeof(matrix), ideal[c]);
+		panel = (struct dcp_panel_adt) {};
+		KUNIT_ASSERT_EQ(test, dcp_panel_adt_parse(adt, size, &panel), 0);
+		KUNIT_EXPECT_EQ(test, panel.gamut, want[c]);
+	}
+
 	/* Every truncation is rejected transactionally. */
 	parser_adt_synthetic_matrix(matrix, 1 << 20);
 	size = parser_adt_color_fixture(adt, sizeof(adt), "P3", sizeof("P3"),
-					matrix, sizeof(matrix));
+					matrix, sizeof(matrix), NULL);
 	for (size_t cut = 0; cut < size; cut++) {
 		struct dcp_panel_adt before;
 
@@ -1717,7 +1757,7 @@ static void parser_panel_publication(struct kunit *test,
 	KUNIT_ASSERT_EQ(test, ret, 0);
 	parser_adt_synthetic_matrix(matrix, 1 << 20);
 	adt_size = parser_adt_color_fixture(adt, sizeof(adt), gamut, strlen(gamut) + 1,
-					    matrix, sizeof(matrix));
+					    matrix, sizeof(matrix), NULL);
 	KUNIT_ASSERT_GT(test, adt_size, (size_t)0);
 	ret = dcp_panel_adt_parse(adt, adt_size, &panel);
 	KUNIT_ASSERT_EQ(test, ret, 0);

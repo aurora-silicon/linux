@@ -63,6 +63,11 @@ static enum dcp_panel_gamut dcp_adt_gamut(const u8 *value, u32 size)
 	return DCP_PANEL_GAMUT_UNSPECIFIED;
 }
 
+static bool dcp_adt_is(const u8 *value, u32 size, const char *name)
+{
+	return size == strlen(name) + 1 && !memcmp(value, name, size);
+}
+
 static const u8 *dcp_adt_bytes(struct dcp_adt_cursor *c, size_t size)
 {
 	const u8 *p;
@@ -123,6 +128,7 @@ static int dcp_adt_node(struct dcp_adt_cursor *c, struct dcp_panel_adt *panel,
 	char node_name[33] = {};
 	enum dcp_panel_gamut gamut = DCP_PANEL_GAMUT_UNSPECIFIED;
 	bool gamut_seen = false, matrix_seen = false, matrix_valid = false;
+	bool artwork_wide = false, ideal_seen = false, ideal_p3 = false;
 	bool product, selected, backlight;
 
 	if (IS_ERR(header))
@@ -166,9 +172,14 @@ static int dcp_adt_node(struct dcp_adt_cursor *c, struct dcp_panel_adt *panel,
 		else if (product && !strcmp(name, "artwork-display-gamut")) {
 			if (gamut_seen)
 				gamut = DCP_PANEL_GAMUT_UNSPECIFIED;
-			else
+			else {
 				gamut = dcp_adt_gamut(prop + 36, size);
+				artwork_wide = dcp_adt_is(prop + 36, size, "Rec2020");
+			}
 			gamut_seen = true;
+		} else if (product && !strcmp(name, "ideal-screen-colorspace")) {
+			ideal_p3 = !ideal_seen && dcp_adt_is(prop + 36, size, "P3A");
+			ideal_seen = true;
 		} else if (product && !strcmp(name, "primary-calibration-matrix")) {
 			matrix_valid = !matrix_seen &&
 				dcp_adt_calibration_matrix(prop + 36, size);
@@ -177,8 +188,17 @@ static int dcp_adt_node(struct dcp_adt_cursor *c, struct dcp_panel_adt *panel,
 			panel->edr_potential_headroom = get_unaligned_le32(prop + 36);
 		c->pos += 36 + ALIGN((size_t)size, 4);
 	}
+	/*
+	 * Newer boards tag the artwork gamut "Rec2020" and name Display P3 only
+	 * as the ideal colour space. A missing or "Rec2020" artwork tag with a
+	 * "P3A" ideal gets the Display P3 target; any other tag stays unknown.
+	 */
+	if (product && gamut == DCP_PANEL_GAMUT_UNSPECIFIED && ideal_p3 &&
+	    (!gamut_seen || artwork_wide))
+		gamut = DCP_PANEL_GAMUT_DISPLAY_P3;
 	if (product)
-		panel->gamut = gamut_seen && matrix_seen && matrix_valid ?
+		panel->gamut = matrix_seen && matrix_valid &&
+			       gamut != DCP_PANEL_GAMUT_UNSPECIFIED ?
 			gamut : DCP_PANEL_GAMUT_UNSPECIFIED;
 	/* A valid ADT may have neither panel node; retain the OF defaults. */
 	panel->found |= selected;
