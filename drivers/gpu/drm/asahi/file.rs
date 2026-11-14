@@ -163,7 +163,8 @@ impl Drop for Vm {
         self.vm.close_idle_reclaim();
         if let Some(status) = self.vm.status() {
             // Retained graphs may keep this status alive; the client's mirror
-            // object must not outlive the client's VM handle.
+            // objects (status and fence-error count) must not outlive the
+            // client's VM handle.
             status.release_mirror();
         }
         if self.vm.status().is_some() {
@@ -536,6 +537,13 @@ impl File {
             uapi::DRM_ASAHI_PARAM_GROUP_VM_STATUS_MIRROR if gpu.supports_vm_status() => {
                 return Self::register_vm_status_mirror(data, file);
             }
+            uapi::DRM_ASAHI_PARAM_GROUP_VM_FENCE_ERROR_MIRROR => {
+                // Only backends whose failed output fences are all counted (g17).
+                if !gpu.supports_vm_status() || !gpu.supports_vm_fence_error_count() {
+                    return Err(EOPNOTSUPP);
+                }
+                return Self::register_vm_fence_error_mirror(data, file);
+            }
             uapi::DRM_ASAHI_PARAM_GROUP_QUEUE_LIMITS => {
                 if data.pad != 0
                     || data.size < core::mem::size_of::<uapi::drm_asahi_queue_limits>() as u64
@@ -646,6 +654,46 @@ impl File {
         let status = Self::vm_status(file, vm_id)?;
         let owner = gem::ObjectRef::new(gem::Object::lookup_handle(file, handle)?);
         status.attach_mirror(owner, offset as usize)?;
+        Ok(0)
+    }
+
+    /// Register a file-owned GEM word as the mirror of a file-owned VM's fence-error count.
+    fn register_vm_fence_error_mirror(
+        data: &uapi::drm_asahi_get_params,
+        file: &DrmFile,
+    ) -> Result<u32> {
+        type Request = uapi::drm_asahi_vm_fence_error_mirror;
+        kernel::static_assert!(core::mem::size_of::<Request>() == 24);
+        kernel::static_assert!(core::mem::offset_of!(Request, handle) == 4);
+        kernel::static_assert!(core::mem::offset_of!(Request, offset) == 8);
+        kernel::static_assert!(core::mem::offset_of!(Request, flags) == 16);
+        let size = core::mem::size_of::<Request>();
+        if data.pad != 0 || data.size < size as u64 || data.size > 4096 {
+            return Err(EINVAL);
+        }
+        let user = UserPtr::from_addr(data.pointer as usize);
+        let mut reader = UserSlice::new(user, data.size as usize).reader();
+        let [ids, offset, flags] = reader.read::<[u64; 3]>()?;
+        // A longer request is a newer struct: fields this kernel does not know must be zero.
+        let mut tail = [0u8; 64];
+        while !reader.is_empty() {
+            let chunk = &mut tail[..reader.len().min(64)];
+            reader.read_slice(chunk)?;
+            if chunk.iter().any(|&byte| byte != 0) {
+                return Err(EINVAL);
+            }
+        }
+        // vm_id and handle share the first 8 bytes, in memory order.
+        let ids = ids.to_ne_bytes();
+        let vm_id = u32::from_ne_bytes([ids[0], ids[1], ids[2], ids[3]]);
+        let handle = u32::from_ne_bytes([ids[4], ids[5], ids[6], ids[7]]);
+        if flags != 0 || handle == 0 || offset % core::mem::align_of::<u64>() as u64 != 0 {
+            return Err(EINVAL);
+        }
+        let offset = usize::try_from(offset).map_err(|_| EINVAL)?;
+        let status = Self::vm_status(file, vm_id)?;
+        let owner = gem::ObjectRef::new(gem::Object::lookup_handle(file, handle)?);
+        status.attach_fence_error_mirror(owner, offset)?;
         Ok(0)
     }
 

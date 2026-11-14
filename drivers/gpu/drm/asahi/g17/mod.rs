@@ -2577,6 +2577,13 @@ impl gpu::Gpu for Gpu {
         true
     }
 
+    /// A published submission's output fence takes its error only in
+    /// `fence::Submission::member_done`, and a SUBMIT that fails before publication installs
+    /// its error fence through `fence::Outputs`; both count it in the VM status first.
+    fn supports_vm_fence_error_count(&self) -> bool {
+        true
+    }
+
     /// The G17 firmware takes no fault_control. Its own fault mode gives soft faults: a shader
     /// load of an unmapped client address returns zero and a store or atomic to one is dropped,
     /// with no fault reported (measured on the M4 Pro, firmware 25G83). The driver gives every
