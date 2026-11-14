@@ -21,6 +21,7 @@ use core::{ffi::c_void, ptr::NonNull};
 use kernel::{device, prelude::*, sync::aref::ARef};
 
 use super::fw::initdata::globals;
+use super::params;
 use super::recovery::now_ns;
 use super::regs::wmb;
 use super::Firmware;
@@ -269,12 +270,22 @@ impl Firmware {
                 limit
             );
         }
+        // g16_selectors = 1: publish what macOS publishes, the full value whenever the cooling
+        // ceiling allows the top state, and only the cooling ceiling otherwise; the host
+        // utilization governor no longer lowers the firmware's states.
+        let macos = params::selectors_macos();
+        let target = if macos { limit } else { target };
         if target == self.power.effective {
             return Ok(());
         }
+        let value = if macos && target >= PSTATE_MAX {
+            globals::MACOS_SELECTOR
+        } else {
+            target * 100
+        };
         let globals = self.init.globals.as_ref().ok_or(ENODEV)?;
         for offset in globals::PSTATE_SELECTORS {
-            globals.w32(offset, target * 100)?;
+            globals.w32(offset, value)?;
         }
         wmb();
         self.power.effective = target;

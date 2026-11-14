@@ -277,5 +277,9 @@ module! {
             default: 1,
             description: "G16: validate CDM/VDM stream records",
         },
+        g16_selectors: u32 {
+            default: 1,
+            description: "G16: perf selectors (1: 1000 as macOS at top state; 0: governor x 100)",
+        },
     },
 }

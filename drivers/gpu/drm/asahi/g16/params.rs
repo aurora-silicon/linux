@@ -48,6 +48,13 @@ pub(crate) fn stream_gate() -> bool {
     module_parameters::g16_stream_gate.value() != 0
 }
 
+/// Whether the three Globals performance selectors carry what macOS keeps in them (1000, the
+/// firmware chooses its state) whenever the cooling ceiling allows the top state, instead of
+/// the host utilization governor's state.
+pub(crate) fn selectors_macos() -> bool {
+    module_parameters::g16_selectors.value() != 0
+}
+
 /// Fragment-only dependency publication has not been qualified on this backend.
 pub(crate) fn early_tiling() -> bool {
     false

@@ -81,6 +81,10 @@ pub(crate) mod control {
 pub(crate) mod globals {
     pub(crate) const SIZE: usize = super::OBJECT_SIZE[super::id::GLOBALS];
     pub(crate) const PSTATE_SELECTORS: [usize; 3] = [0x88, 0x8c, 0x98];
+    /// What macOS 26B123 keeps in all three selectors on the J604 (its +0x8c/+0x90/+0x9c, 4 bytes
+    /// above ours): 1000 at init, during video playback, at idle and at a benchmark start. The G17
+    /// backends call the same words "required 1000". The firmware then picks the state itself.
+    pub(crate) const MACOS_SELECTOR: u32 = 1000;
 }
 pub(crate) mod hwdata {
     pub(crate) const SIZE: usize = super::OBJECT_SIZE[super::id::MAIN];
