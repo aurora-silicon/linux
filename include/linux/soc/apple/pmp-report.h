@@ -47,7 +47,13 @@ void apple_pmp_agx_activity_begin(void);
 void apple_pmp_agx_activity_end(void);
 void apple_pmp_agx_activity_release(void);
 void apple_pmp_agx_activity_resume(void);
+int apple_pmp_report_gpu_effort(u32 *percent);
 #else
+static inline int apple_pmp_report_gpu_effort(u32 *percent)
+{
+	return -ENODEV;
+}
+
 static inline int apple_pmp_report_entry_request(const struct device_node *entry,
 						 bool enable)
 {

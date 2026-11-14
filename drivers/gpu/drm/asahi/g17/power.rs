@@ -7,6 +7,89 @@ use core::sync::atomic::AtomicU32;
 
 pub(super) const FULL_EFFORT: u32 = 0x10000;
 pub(super) const IDLE_HOLD_NS: u64 = 16_000_000;
+/// The lifetime-servo cadence published by the PMP runtime policy.
+pub(super) const PMP_REPORT_PERIOD_NS: u64 = 5_000_000;
+/// The largest PMP GPU lifetime-control effort, in percent.
+const PMP_EFFORT_MAX: u32 = 100;
+
+/// Converts a PMP GPU lifetime-control effort (integer percent) to the
+/// percent ceiling of the native power target: an effort of `e` leaves
+/// `100 - e` percent.
+pub(super) fn pmp_effort_to_ceiling(effort: u32) -> Option<u32> {
+    PMP_EFFORT_MAX.checked_sub(effort)
+}
+
+fn pmp_sample_to_ceiling(sample: Option<u32>) -> Option<u32> {
+    sample.and_then(pmp_effort_to_ceiling)
+}
+
+/// Runtime PMP ceiling applied through the firmware-polled PPM target words.
+pub(super) struct Ceiling {
+    native: [u32; 3],
+    applied: Option<u32>,
+    /// The ceiling last logged, so the log follows steps of [`CEILING_LOG_STEP`] percent.
+    logged: Option<u32>,
+}
+
+/// A logged ceiling change: engaging, releasing, or moving this many percent from the last log.
+const CEILING_LOG_STEP: u32 = 5;
+
+fn ceiling_log_due(logged: Option<u32>, desired: Option<u32>) -> bool {
+    match (logged, desired) {
+        (None, None) => false,
+        (Some(a), Some(b)) => a.abs_diff(b) >= CEILING_LOG_STEP,
+        _ => true,
+    }
+}
+
+impl Ceiling {
+    pub(super) fn new(native: [u32; 3]) -> Self {
+        Self {
+            native,
+            applied: None,
+            logged: None,
+        }
+    }
+
+    /// Samples the PMP report's effort entry and restores native policy when
+    /// the report is absent, the PMP is not running or the effort is invalid.
+    pub(super) fn update(&mut self, init: &super::initdata::InitData) -> kernel::error::Result {
+        let mut effort = 0;
+        // SAFETY: `effort` is writable for one u32. The report driver looks
+        // the region up under RCU and reads only its documented entries.
+        let ret = unsafe { kernel::bindings::apple_pmp_report_gpu_effort(&mut effort) };
+        let desired = pmp_sample_to_ceiling((ret == 0).then_some(effort))
+            .filter(|ceiling| *ceiling < 100 && self.native[1] != 0);
+        if desired == self.applied {
+            return Ok(());
+        }
+
+        if let Some(ceiling) = desired {
+            let target_mw = (u64::from(self.native[1]) * u64::from(ceiling) / 100) as u32;
+            init.publish_ppm_target(1, target_mw, self.native[2])?;
+        } else if self.applied.is_some() {
+            init.publish_ppm_target(self.native[0], self.native[1], self.native[2])?;
+        }
+        self.applied = desired;
+        if ceiling_log_due(self.logged, desired) {
+            match desired {
+                Some(ceiling) => kernel::pr_info!(
+                    "asahi: PMP GPU effort {}%: power ceiling {}% of {} mW\n",
+                    effort,
+                    ceiling,
+                    self.native[1]
+                ),
+                None => kernel::pr_info!(
+                    "asahi: PMP GPU power ceiling released (effort {}%, status {})\n",
+                    effort,
+                    ret
+                ),
+            }
+            self.logged = desired;
+        }
+        Ok(())
+    }
+}
 
 /// The firmware's idle power-off delay as measured on T6040/25G83: the cores power off 2 ms after
 /// the last job. Not measured on other firmware; at or below it the hold stays off.
@@ -294,6 +377,33 @@ pub(super) fn release<C: Control>(control: &mut C) -> kernel::error::Result {
 #[cfg_attr(not(test), kernel::macros::kunit_tests(asahi_g17_idle_hold))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pmp_effort_maps_to_the_integer_ceiling() {
+        assert_eq!(pmp_effort_to_ceiling(0), Some(100));
+        assert_eq!(pmp_effort_to_ceiling(1), Some(99));
+        assert_eq!(pmp_effort_to_ceiling(25), Some(75));
+        assert_eq!(pmp_effort_to_ceiling(50), Some(50));
+        assert_eq!(pmp_effort_to_ceiling(100), Some(0));
+        assert_eq!(pmp_effort_to_ceiling(101), None);
+        assert_eq!(pmp_effort_to_ceiling(u32::MAX), None);
+    }
+
+    #[test]
+    fn ceiling_changes_are_logged_in_steps() {
+        assert!(!ceiling_log_due(None, None));
+        assert!(ceiling_log_due(None, Some(99)));
+        assert!(ceiling_log_due(Some(99), None));
+        assert!(!ceiling_log_due(Some(90), Some(94)));
+        assert!(ceiling_log_due(Some(90), Some(95)));
+        assert!(ceiling_log_due(Some(90), Some(85)));
+    }
+
+    #[test]
+    fn absent_sample_withdraws_the_ceiling() {
+        assert_eq!(pmp_sample_to_ceiling(None), None);
+        assert_eq!(pmp_sample_to_ceiling(Some(101)), None);
+    }
 
     #[test]
     fn dt_idle_delay_is_bounded_and_absence_preserves_native_policy() {

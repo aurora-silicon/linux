@@ -12,6 +12,17 @@ static void pmp_range(u8 *table, u32 id, u32 base, u32 count)
 	put_unaligned_le32(count, table + 8);
 }
 
+static void pmp_gpu_effort_percent(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, apple_pmp_gpu_effort_percent(0), 0);
+	KUNIT_EXPECT_EQ(test, apple_pmp_gpu_effort_percent(1), 1);
+	KUNIT_EXPECT_EQ(test, apple_pmp_gpu_effort_percent(37), 37);
+	KUNIT_EXPECT_EQ(test, apple_pmp_gpu_effort_percent(100), 100);
+	KUNIT_EXPECT_EQ(test, apple_pmp_gpu_effort_percent(101), -EPROTO);
+	KUNIT_EXPECT_EQ(test, apple_pmp_gpu_effort_percent(BIT_ULL(32)), -EPROTO);
+	KUNIT_EXPECT_EQ(test, apple_pmp_gpu_effort_percent(U64_MAX), -EPROTO);
+}
+
 static void pmp_request_word_replay(struct kunit *test)
 {
 	/* A request an entry withdrew stays off; one nobody here owns stays on. */
@@ -299,6 +310,7 @@ static void pmp_dvfs_words(struct kunit *test)
 }
 
 static struct kunit_case apple_pmp_report_cases[] = {
+	KUNIT_CASE(pmp_gpu_effort_percent),
 	KUNIT_CASE(pmp_ranges_t6030),
 	KUNIT_CASE(pmp_request_word_replay),
 	KUNIT_CASE(pmp_ranges_t8122),

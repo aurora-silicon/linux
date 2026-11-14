@@ -98,7 +98,7 @@ struct generic_pm_domain {
 		(*power_off)(struct generic_pm_domain *);
 };
 struct apple_pmp_report_offsets {
-	u32 tgt_read, tgt_write, actual, status, fast_die, fast_die_lanes;
+	u32 tgt_read, tgt_write, actual, status, fast_die, fast_die_lanes, gpu_effort;
 	u32 update, dvfs_first, dvfs_count;
 	bool starts_pmp;
 	const char *name, *fallback, *pwrstate;
