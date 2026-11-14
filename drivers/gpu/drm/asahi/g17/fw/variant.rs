@@ -77,6 +77,10 @@ pub(crate) struct Variant {
     /// Tiling descriptors report whether the fragment queue still had earlier kicks
     /// outstanding (`fragment_busy`).
     pub(crate) fragment_busy: bool,
+    /// The host may grow the tiler heap of a render pair with work in flight ahead of a
+    /// render, by appending blocks to its inventory as a firmware grow request does. The
+    /// firmware takes the new blocks without a grow reply.
+    pub(crate) busy_heap_growth: bool,
     /// Render item rings carry lead commands: InitBufferManager before the first tiling pass
     /// of a buffer manager.
     pub(crate) lead_commands: bool,
@@ -138,6 +142,7 @@ pub(crate) const V26A428: Variant = Variant {
     traversal_exclusion: true,
     render_ray_query: true,
     fragment_busy: true,
+    busy_heap_growth: true,
     lead_commands: false,
     programs: super::render::RegisterPrograms::G17P,
     ta_mode_1: false,
@@ -176,6 +181,8 @@ pub(crate) const V25G83: Variant = Variant {
     // When a tiling pass runs out of memory with this set, the firmware resumes it without
     // adding memory and the tiler stops silently; macOS always writes 0.
     fragment_busy: false,
+    // Not measured on this firmware.
+    busy_heap_growth: false,
     lead_commands: true,
     programs: super::render::RegisterPrograms::V25G83,
     ta_mode_1: false,
@@ -194,6 +201,8 @@ pub(crate) const V26A428_M5: Variant = Variant {
     traversal_exclusion: false,
     render_ray_query: false,
     registration_power_hold: false,
+    // M5 heaps have their own geometry and are never shrunk.
+    busy_heap_growth: false,
     ..V26A428
 };
 

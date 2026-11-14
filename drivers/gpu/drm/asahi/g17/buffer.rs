@@ -332,6 +332,36 @@ fn automatic_target_for(used_pages: usize, current: usize, pages: usize, maximum
     )
 }
 
+unsafe extern "C" {
+    /// `aurora.g17_busy_tvb_grow` (g17/busy_tvb_grow.c).
+    fn asahi_g17_busy_tvb_grow() -> u32;
+}
+
+/// Whether the host grows a busy pair's heap ahead of a render
+/// (`aurora.g17_busy_tvb_grow`, read on every use).
+pub(crate) fn busy_growth_enabled() -> bool {
+    // SAFETY: Reads a module parameter; no other effect.
+    let value = unsafe { asahi_g17_busy_tvb_grow() };
+    value != 0
+}
+
+/// Whether `bytes` more kernel memory keeps the device's GPU memory more than an
+/// eighth below the device limit, and `client`'s committed memory more than an
+/// eighth below the per-client limit (`memacct`). A busy pair's growth is only
+/// ahead of need, so it never takes the device or a client close to a limit;
+/// firmware grow requests still serve the pair.
+fn busy_growth_admitted(bytes: u64, client: Option<&Arc<crate::memacct::Client>>) -> bool {
+    let ledger = &crate::memacct::LEDGER;
+    let within = |used: u64, limit: u64| limit == 0 || used.saturating_add(bytes) <= limit - limit / 8;
+    within(
+        ledger.user_committed.load(Ordering::Relaxed)
+            .saturating_add(ledger.kernel_resident.load(Ordering::Relaxed)),
+        ledger.limit.load(Ordering::Relaxed),
+    ) && client.is_none_or(|client| {
+        within(client.committed(), ledger.client_limit.load(Ordering::Relaxed))
+    })
+}
+
 use super::object::{CpuMap, KernelObject};
 use crate::{driver::AsahiDrmDevice, mmu};
 use core::ops::Range;
@@ -741,6 +771,14 @@ struct Shrink {
     window: [u32; SHRINK_WINDOW],
     window_next: usize,
     busy_peak: u32,
+    /// Blocks before the first growth the host made while the pair was busy,
+    /// since the last idle growth or the shrink that gave it back (0: none).
+    /// An idle shrink may return to this size: that growth only serves
+    /// renders overlapping in flight.
+    busy_base: usize,
+    /// Host ns before which a busy pair is not grown again after a growth
+    /// was refused or failed.
+    busy_retry: u64,
 }
 
 pub(crate) struct Submitted<'a> {
@@ -952,6 +990,47 @@ impl Manager {
         Ok(automatic_target_for(pages as usize, self.blocks(), self.tvb.geometry.pages(),
             self.layout.normal_blocks))
     }
+    /// The growth of a pair with work in flight ahead of a render that needs
+    /// `required` blocks at `now`: the layout's blocks, or the automatic target
+    /// from the page high-water since the last sample, which is read without
+    /// requesting its reset (the idle growth check and the shrink period own the
+    /// samples). None keeps the heap: the growth is not needed, waits for a
+    /// retry after a refusal, or would take the device or `client` within an
+    /// eighth of a memory limit (it is then retried a shrink period later).
+    pub(crate) fn busy_target(
+        &mut self,
+        required: usize,
+        now: u64,
+        client: Option<&Arc<crate::memacct::Client>>,
+    ) -> Result<Option<usize>> {
+        if self.tvb.geometry != BlockGeometry::NEO || now < self.shrink.busy_retry {
+            return Ok(None);
+        }
+        let max_pages = self
+            .graph
+            .word(self.layout.control + core::mem::offset_of!(fw::Control, max_pages))?;
+        fence(Ordering::Acquire);
+        let pages = max_pages.load(Ordering::Relaxed) as usize;
+        let current = self.blocks();
+        let feedback = automatic_target_for(pages, current, self.tvb.geometry.pages(),
+            self.layout.normal_blocks).unwrap_or(0);
+        let target = required.max(feedback).min(self.max_blocks());
+        if target <= current {
+            return Ok(None);
+        }
+        let bytes = Tvb::backing_bytes(self.tvb.geometry, target - current)? as u64;
+        if !busy_growth_admitted(bytes, client) {
+            self.defer_busy_growth(now);
+            super::trace::heap(super::trace::HEAP_HOST_BUSY, false, current, current);
+            return Ok(None);
+        }
+        Ok(Some(target))
+    }
+    /// A busy pair's growth was refused or failed at `now`: retry a shrink
+    /// period later.
+    pub(crate) fn defer_busy_growth(&mut self, now: u64) {
+        self.shrink.busy_retry = now.saturating_add(SHRINK_PERIOD_NS);
+    }
     /// Records the blocks a pass layout requires, the floor of any shrink.
     /// A pass is being prepared at `now`; the heap counts as busy.
     pub(crate) fn note_required(&mut self, blocks: usize, now: u64) {
@@ -965,7 +1044,22 @@ impl Manager {
         let recent = (self.shrink.busy_peak as usize)
             .saturating_mul(2)
             .div_ceil(cfg::TVB_PAGES_PER_BLOCK);
-        self.tvb.primary_blocks().max(self.shrink.required).max(recent)
+        let minimum = self.tvb.primary_blocks().max(self.shrink.required);
+        // Growth made while the pair was busy goes back down to the size it had
+        // before, also below the recent peak, which counts renders in flight
+        // together.
+        let busy = if self.shrink.busy_base != 0 {
+            minimum.max(self.shrink.busy_base)
+        } else {
+            usize::MAX
+        };
+        minimum.max(recent).min(busy)
+    }
+    /// The host grew this heap from `previous` blocks while the pair was busy.
+    pub(crate) fn note_busy_growth(&mut self, previous: usize) {
+        if self.shrink.busy_base == 0 {
+            self.shrink.busy_base = previous;
+        }
     }
     /// Whether the heap holds growth beyond its primary backing.
     /// M5 heaps are never shrunk.
@@ -1208,6 +1302,8 @@ impl Manager {
             write(at + 4, 0);
         }
         if descriptor.is_some() {
+            // An idle growth sizes the heap for the recent load, busy growth included.
+            self.shrink.busy_base = 0;
             for (entry, value) in rebuilt.into_iter().enumerate() {
                 write(self.layout.pages + entry * 4, value);
             }
@@ -1323,6 +1419,10 @@ impl Manager {
             }
         }
         self.shrink.credit = self.shrink.credit.saturating_sub(blocks - kept);
+        if kept <= self.shrink.busy_base {
+            self.shrink.busy_base = 0;
+        }
+        super::trace::heap(super::trace::HEAP_SHRINK, true, blocks, kept);
         Ok(Some((
             fw::reload_descriptor(descriptor, self.page_list_client, pages),
             release,

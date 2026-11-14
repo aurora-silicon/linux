@@ -8,4 +8,4 @@ aurora-$(CONFIG_DRM_ASAHI_G15) += g15/glue.o
 
 aurora-$(CONFIG_DRM_ASAHI_G16) += g16/glue.o
 
-aurora-y += retain.o cpu_capacity.o
+aurora-y += retain.o cpu_capacity.o g17/busy_tvb_grow.o
