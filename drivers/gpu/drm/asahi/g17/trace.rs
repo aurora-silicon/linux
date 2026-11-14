@@ -16,6 +16,7 @@ unsafe extern "C" {
         gpu_start: u64, gpu_end: u64);
     fn asahi_g17_trace_bind(engine: u8, qid: u8, ctx: u32, kind: u8);
     fn asahi_g17_trace_message(kind: u8, value: u64);
+    fn asahi_g17_trace_message_enabled() -> bool;
     fn asahi_g17_trace_doorbell_enabled() -> bool;
     fn asahi_g17_trace_doorbell(engine: u8, power: u32);
     fn asahi_g17_trace_event(phase: u8);
@@ -113,6 +114,35 @@ pub(super) fn heap(source: u8, grew: bool, before: usize, after: usize) {
     let blocks = |blocks: usize| (blocks as u64) & 0xff_ffff;
     message(HEAP, u64::from(source) << 56 | u64::from(grew) << 48 | blocks(before) << 24
         | blocks(after));
+}
+
+/// `message` kind of a retired render's stage split ([`render_stages`]).
+pub(super) const RENDER_STAGES: u8 = 4;
+
+/// TEST ONLY: a retired render's tiling and fragment durations, in its stage
+/// timestamps' ticks, as a `message` of kind [`RENDER_STAGES`]:
+/// `tiling << 32 | fragment`, each saturated to 32 bits. With the `complete`
+/// event's span (tiling start, fragment end) it gives all four boundaries.
+/// Only M5 stage timestamps carry the split; other chips report 0 for tiling.
+pub(super) fn render_stages(timestamps: [u64; 4]) {
+    let span = |from: u64, to: u64| to.saturating_sub(from).min(u64::from(u32::MAX));
+    message(RENDER_STAGES, span(timestamps[0], timestamps[1]) << 32
+        | span(timestamps[2], timestamps[3]));
+}
+
+/// `message` kind of a retired render's tiler heap state ([`render_heap`]).
+pub(super) const RENDER_HEAP: u8 = 5;
+
+/// TEST ONLY: whether `message` events are recorded (a static-key test).
+pub(super) fn message_enabled() -> bool {
+    // SAFETY: Pure static-key query.
+    unsafe { asahi_g17_trace_message_enabled() }
+}
+
+/// TEST ONLY: a retired render's tiler heap, as a `message` of kind [`RENDER_HEAP`]:
+/// `blocks << 32 | high-water pages`, the high-water read without requesting its reset.
+pub(super) fn render_heap(blocks: usize, max_pages: u32) {
+    message(RENDER_HEAP, ((blocks as u64) & 0xffff_ffff) << 32 | u64::from(max_pages));
 }
 
 /// Failed-context teardown: 1 compute fault (qid, stamp), 2 unstamped render retire (slot,

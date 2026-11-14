@@ -972,6 +972,15 @@ impl Manager {
             next: word.load(Ordering::Relaxed).wrapping_add(1),
         })
     }
+    /// TEST ONLY: the firmware page high-water since its last reset, read
+    /// without requesting another reset.
+    pub(crate) fn peek_max_pages(&self) -> Result<u32> {
+        let max_pages = self
+            .graph
+            .word(self.layout.control + core::mem::offset_of!(fw::Control, max_pages))?;
+        fence(Ordering::Acquire);
+        Ok(max_pages.load(Ordering::Relaxed))
+    }
     /// Reads the firmware page high-water and requests its reset. Both the
     /// growth check and the shrink period see every sample.
     fn sample_max_pages(&mut self) -> Result<u32> {

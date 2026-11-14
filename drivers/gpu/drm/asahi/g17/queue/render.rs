@@ -2153,6 +2153,12 @@ impl Pair {
             &front.packet,
             [timestamps[0], timestamps[3]],
         );
+        crate::g17::trace::render_stages(timestamps);
+        if crate::g17::trace::message_enabled() {
+            if let Ok(pages) = self.memory.manager.peek_max_pages() {
+                crate::g17::trace::render_heap(self.memory.manager.blocks(), pages);
+            }
+        }
         defer(Deferred::Retired(
             front.packet.completion.clone(),
             front.packet.check_firmware_producers().map(|()| timestamps),
