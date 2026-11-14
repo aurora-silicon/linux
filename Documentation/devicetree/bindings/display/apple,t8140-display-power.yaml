@@ -4,7 +4,7 @@
 $id: http://devicetree.org/schemas/display/apple,t8140-display-power.yaml#
 $schema: http://devicetree.org/meta-schemas/core.yaml#
 
-title: Apple T8140 display power words
+title: Apple T8140 and T8142 display power words
 
 maintainers:
   - Diljit Singh <hey@djdev.me>
@@ -17,24 +17,55 @@ description:
 
 properties:
   compatible:
-    const: apple,t8140-display-power
+    enum:
+      - apple,t8140-display-power
+      - apple,t8142-display-power
 
   reg:
-    items:
-      - description: the display PMC word that counts the powered coprocessors
-      - description: the power manager's power state words
-      - description: the power manager's power gate words
+    minItems: 2
+    maxItems: 3
 
   reg-names:
-    items:
-      - const: pmc-dcp
-      - const: ps
-      - const: pwrgate
+    minItems: 2
+    maxItems: 3
 
 required:
   - compatible
   - reg
   - reg-names
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          const: apple,t8140-display-power
+    then:
+      properties:
+        reg:
+          items:
+            - description: the display PMC word that counts the powered coprocessors
+            - description: the power manager's power state words
+            - description: the power manager's power gate words
+        reg-names:
+          items:
+            - const: pmc-dcp
+            - const: ps
+            - const: pwrgate
+  - if:
+      properties:
+        compatible:
+          const: apple,t8142-display-power
+    then:
+      # T8142's PMC keeps no count of the powered coprocessors: no pmc-dcp word.
+      properties:
+        reg:
+          items:
+            - description: the power manager's power gate words
+            - description: the power manager's power state words
+        reg-names:
+          items:
+            - const: pwrgate
+            - const: ps
 
 additionalProperties: false
 
@@ -50,5 +81,18 @@ examples:
                   <0x3 0x00700000 0x0 0x14000>,
                   <0x3 0x00724000 0x0 0x1000>;
             reg-names = "pmc-dcp", "ps", "pwrgate";
+        };
+    };
+
+  - |
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        display-power@380724000 {
+            compatible = "apple,t8142-display-power";
+            reg = <0x3 0x80724000 0x0 0x2000>,
+                  <0x3 0x80700000 0x0 0x14000>;
+            reg-names = "pwrgate", "ps";
         };
     };
