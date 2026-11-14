@@ -91,6 +91,8 @@ struct tas2764_priv {
 
 	/* apple,deferred-shutdown: software shutdown waits for the bus clock to stop */
 	bool deferred_shutdown;
+	/* apple,shutdown-dance: the hidden-page writes around software shutdown */
+	bool shutdown_dance;
 	/* Muted at a stream's end, until the next one: the bus clock may stop */
 	bool stream_stopped;
 	struct delayed_work shutdown_work;
@@ -317,6 +319,17 @@ static void tas2764_reset(struct tas2764_priv *tas2764)
 	usleep_range(1000, 2000);
 }
 
+/*
+ * Apple's shutdown dance (tas2764-quirks.h): on for every amplifier when
+ * ENABLED_APPLE_QUIRKS has it, else on an SN012776 whose node carries
+ * apple,shutdown-dance, as macOS does on that machine.
+ */
+static bool tas2764_shutdown_dance(struct tas2764_priv *tas2764)
+{
+	return (ENABLED_APPLE_QUIRKS & TAS2764_SHUTDOWN_DANCE) ||
+	       (tas2764->shutdown_dance && tas2764->devid == DEVID_SN012776);
+}
+
 static int tas2764_update_pwr_ctrl(struct tas2764_priv *tas2764)
 {
 	struct snd_soc_component *component = tas2764->component;
@@ -332,7 +345,7 @@ static int tas2764_update_pwr_ctrl(struct tas2764_priv *tas2764)
 	else
 		val = TAS2764_PWR_CTRL_SHUTDOWN;
 
-	if (ENABLED_APPLE_QUIRKS & TAS2764_SHUTDOWN_DANCE)
+	if (tas2764_shutdown_dance(tas2764))
 		return tas2764_do_quirky_pwr_ctrl_change(tas2764, val);
 
 	ret = snd_soc_component_update_bits(component, TAS2764_PWR_CTRL,
@@ -1040,7 +1053,8 @@ static int tas2764_apply_init_quirks(struct tas2764_priv *tas2764)
 		if (!init_seq->seq)
 			continue;
 
-		if (!(BIT(i) & ENABLED_APPLE_QUIRKS))
+		if (!(BIT(i) & ENABLED_APPLE_QUIRKS) &&
+		    !(BIT(i) == TAS2764_SHUTDOWN_DANCE && tas2764_shutdown_dance(tas2764)))
 			continue;
 
 		ret = regmap_multi_reg_write(tas2764->regmap, init_seq->seq,
@@ -1684,6 +1698,8 @@ static int tas2764_parse_dt(struct device *dev, struct tas2764_priv *tas2764)
 
 	tas2764->deferred_shutdown = of_property_read_bool(dev->of_node,
 							   "apple,deferred-shutdown");
+	tas2764->shutdown_dance = of_property_read_bool(dev->of_node,
+							"apple,shutdown-dance");
 
 	ret = tas2764_parse_bop_config(dev, tas2764);
 	if (ret)
