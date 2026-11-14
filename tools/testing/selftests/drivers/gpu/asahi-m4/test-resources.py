@@ -68,7 +68,7 @@ pub mod sync {
     }
 
     pub struct Arc<T>{inner:std::sync::Arc<T>}
-    impl<T>Arc<T>{pub fn new(v:T,_:u32)->crate::Result<Self>{Ok(Self{inner:std::sync::Arc::new(v)})}pub fn strong_count(v:&Self)->usize{std::sync::Arc::strong_count(&v.inner)}}
+    impl<T>Arc<T>{pub fn new(v:T,_:u32)->crate::Result<Self>{Ok(Self{inner:std::sync::Arc::new(v)})}pub fn strong_count(v:&Self)->usize{std::sync::Arc::strong_count(&v.inner)}pub fn ptr_eq(a:&Self,b:&Self)->bool{std::sync::Arc::ptr_eq(&a.inner,&b.inner)}}
     impl<T>Clone for Arc<T>{fn clone(&self)->Self{Self{inner:self.inner.clone()}}}
     impl<T>std::ops::Deref for Arc<T>{type Target=T;fn deref(&self)->&T{&self.inner}}
     pub mod aref {pub struct ARef<T>(T);impl From<&crate::device::Device>for ARef<crate::device::Device>{fn from(v:&crate::device::Device)->Self{Self(v.clone())}}}
@@ -372,6 +372,28 @@ pub mod g16 {
         slots.retire_binding(0,&a).unwrap();assert_eq!(sync::Arc::strong_count(&a),2);
         b.check_assignment(0).unwrap();b.expose();assert_eq!(sync::Arc::strong_count(&a),2);
         slots.retire_binding(0,&b).unwrap();assert_eq!(sync::Arc::strong_count(&a),1);
+    }
+    #[test]fn pb_reuse_needs_the_same_binding_vm_and_a_completed_render_and_holds_nothing(){
+        let one=vm(1);let two=vm(2);let factory=g16::object::Factory;let budget=g16::budget::Budget::new().unwrap();
+        let a=g16::pools::PbEpoch::new(&factory,&one,g16::budget::Budget::reserve(&budget,1).unwrap().take().unwrap()).unwrap();
+        a.prepare(0,0x70c0000000).unwrap();a.check_assignment(0).unwrap();a.expose();
+        let mut p=g16::pools::Pools::new(&driver::AsahiDrmDevice(device::Device));
+        let n=p.bind(0,false);p.retire_binding(0,&a).unwrap();p.retire_epoch(true,0,n,true);
+        assert_eq!(sync::Arc::strong_count(&a),2,"only the owner lease");
+        let r=p.reusable(true,0,&one).unwrap();assert!(sync::Arc::ptr_eq(&r,&a));drop(r);
+        assert_eq!(sync::Arc::strong_count(&a),2);
+        assert!(p.reusable(false,0,&one).is_none(),"g16_pb_reuse=0");
+        assert!(p.reusable(true,0,&two).is_none(),"another VM");assert!(p.reusable(true,1,&one).is_none(),"another slot");
+        assert_eq!(p.bind(0,true),n);p.retire_epoch(true,0,n,true);assert!(p.reusable(true,0,&one).is_some());
+        p.retire_epoch(true,0,n,false);assert!(p.reusable(true,0,&one).is_none(),"failed render");
+        p.retire_epoch(true,0,n,true);p.forget(0);assert!(p.reusable(true,0,&one).is_none(),"aborted render");
+        let m=p.bind(0,false);assert_ne!(m,n);p.retire_epoch(true,0,n,true);
+        assert!(p.reusable(true,0,&one).is_none(),"a stale binding after a fresh one");
+        p.retire_epoch(true,0,m,true);assert!(p.reusable(true,0,&one).is_some());
+        p.invalidate();assert!(p.reusable(true,0,&one).is_none(),"recovery");
+        p.retire_epoch(true,0,m,true);assert!(p.reusable(true,0,&one).is_none(),"a render retiring after recovery");
+        assert_eq!(p.bind(0,true),m.wrapping_add(1));
+        assert_eq!(sync::Arc::strong_count(&a),2);
     }
 
 }
