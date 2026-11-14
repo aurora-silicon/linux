@@ -284,6 +284,8 @@ struct apple_dcp_hw_data {
 	 */
 	bool s2r;
 	bool s2r_ext;
+	/* The firmware blends the X byte of XRGB8888 as alpha: offer alpha formats only. */
+	bool xrgb_is_alpha;
 };
 
 enum dcp_test_point {
