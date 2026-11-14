@@ -201,9 +201,12 @@ impl Vm {
     }
 
     pub(crate) fn translate_iova(&self, address: u64) -> Result<u64> {
-        lock_vm(&self.gpuvm, None, false)?
-            .page_table
-            .translate_iova(address)
+        // SAFETY: See `lock_vm()`. A page-table read needs only the VM's own reservation, not
+        // every external object's: G18 translates each page of a job's mappings on every
+        // submission, and locking all external objects made each translation cost O(external
+        // objects).
+        let mut vm_exec = unsafe { self.gpuvm.exec_lock_vm(None, false)? };
+        vm_exec.unique_gpuvm.data().page_table.translate_iova(address)
     }
 
     /// [`Self::translate_iova`] of `address + k * UAT_PGSZ` for each `k` below

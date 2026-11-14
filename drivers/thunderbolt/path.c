@@ -359,6 +359,7 @@ void tb_path_free(struct tb_path *path)
 		}
 	}
 
+	kfree(path->sleep_hops);
 	kfree(path);
 }
 
@@ -479,6 +480,8 @@ void tb_path_deactivate(struct tb_path *path)
 	__tb_path_deallocate_nfc(path, 0);
 	path->activated = false;
 }
+
+#include "path-sleep.c"
 
 /**
  * tb_path_activate() - activate a path

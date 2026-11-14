@@ -176,6 +176,8 @@ enum ave_opcode {
 #define AVE_FW_TEXT_CRC_T6050_26A428 0x87279429
 /* macOS 27.3 beta 1 (26C5035r) / T6050: TEXT 0x158000, DATA 0x134000. */
 #define AVE_FW_TEXT_CRC_T6050_26C5035 0xc25b4ddb
+/* The M5 (T8142) build of the same 26A428 firmware (AppleAVE2FW 9013.45.1). */
+#define AVE_FW_TEXT_CRC_T8142_26A428 0x8a3784bd
 
 struct ave_ctx;
 

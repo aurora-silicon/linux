@@ -568,7 +568,14 @@ impl Payload {
         let attachment_rule = if m5 { AttachmentRule::Hint } else { AttachmentRule::Mapped };
         match self {
             Self::Render(cmd, _, attachments, ray_query, resources) => {
-                if cmd.flags & !(if m5 { RENDER_FLAGS } else { RENDER_FLAGS & !M5_RENDER_FLAGS }) != 0
+                let flags = if m5 {
+                    RENDER_FLAGS
+                } else if variant.render_stage_prefixes {
+                    RENDER_FLAGS & !(M5_RENDER_FLAGS & !STAGE_PREFIXES)
+                } else {
+                    RENDER_FLAGS & !M5_RENDER_FLAGS
+                };
+                if cmd.flags & !flags != 0
                     || (!m5 && resources.is_some())
                     || !(1..=MAX_DIMENSION).contains(&cmd.width_px)
                     || !(1..=MAX_DIMENSION).contains(&cmd.height_px)

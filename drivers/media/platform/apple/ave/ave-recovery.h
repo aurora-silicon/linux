@@ -28,6 +28,13 @@ static inline bool ave_recovery_allow(struct ave_recovery_history *h, unsigned l
 	return true;
 }
 
+/* A session that ended cleanly proves the firmware works again. */
+static inline void ave_recovery_reset(struct ave_recovery_history *h)
+{
+	h->next = 0;
+	h->count = 0;
+}
+
 /*
  * The encoder may only run on a strict translating DMA domain: an unmap
  * invalidates the DART before the pages go back. A flush queue (DMA-FQ),

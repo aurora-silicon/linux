@@ -44,6 +44,12 @@ struct dcp_parse_ctx {
 	 * as needing DSC itself, so such an element is usable for PQ.
 	 */
 	bool pq_dsc;
+	/*
+	 * Size of the tiled display the sink reported (0 when untiled). Its
+	 * full-size timing needs DSC, which DCP runs itself, so that timing
+	 * keeps its DSC-required color modes.
+	 */
+	u32 tiled_width, tiled_height;
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
 	/*
 	 * T6030 external processor audio elements (DCP firmware 14.7, external
