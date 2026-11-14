@@ -182,14 +182,22 @@ const struct ane_fw_platform ane_t6050_platform = {
  * The M5 (T8142, J813/J815) ANE: "ane,t8132exclave", ane-type 0x210,
  * exclave-assigned and preloaded by iBoot. From the T8142 ADT: ANE_SYS at
  * PMGR +0x2e8 (pmgr device 73, parent AFISOCNI3), ANE_CPU +0xc000 and
- * ANE_TDBASE +0xc008 as on T8140; four DAPF records; TEXT 0xbc000 and DATA
- * 0x2b0000 at 0x100_0000_0000 and 0x100_000b_c000 (the macOS 27.2 host's
- * preload). Not measured yet: the PWGATE window, the scratch cells and the
- * DART revision (T8140's values below), and the TEXT pin, so the zero pin
- * never matches: the hand-off is checked and its TEXT digest logged, and the
- * engine is left alone.
+ * ANE_TDBASE +0xc008 as on T8140; four DAPF records. The macOS 27.0 (26A428)
+ * stub's iBoot preloads TEXT 0xc0000 and DATA 0x2ac000 at T8140's IOVAs,
+ * measured on a J815 under aura with TEXT sha256 1212c260...b6d4e3 (the 27.2
+ * host's preload is 0xbc000/0x2b0000 at 0x100_000b_c000). Not measured yet:
+ * the PWGATE window, the scratch cells and the DART revision (T8140's values
+ * below). Until they are, the zero pin never matches: the hand-off is checked
+ * and logged and the engine is left alone. ane_t8142_text_26a428 is the pin
+ * to use then.
  */
 static const u8 ane_t8142_text_pin_unmeasured[SHA256_DIGEST_SIZE];
+static const u8 ane_t8142_text_26a428[] __maybe_unused = {
+	0x12, 0x12, 0xc2, 0x60, 0x6e, 0xf8, 0xca, 0xce,
+	0x51, 0xfd, 0x95, 0x1e, 0x60, 0xbc, 0xce, 0x75,
+	0xbe, 0x8e, 0x65, 0xd5, 0xf0, 0xfe, 0x19, 0x37,
+	0xac, 0x3b, 0x58, 0x07, 0x49, 0xd6, 0xb4, 0xe3,
+};
 
 const struct ane_fw_platform ane_t8142_platform = {
 	.soc = 0x8142,
@@ -208,8 +216,8 @@ const struct ane_fw_platform ane_t8142_platform = {
 	.doorbell = 0x1884000,
 	.irq_status = 0x188c000,
 	.irq_ack = 0x1890000,
-	.preload_dva = { 0x10000000000, 0x100000bc000 },
-	.preload_size = { 0xbc000, 0x2b0000 },
+	.preload_dva = { 0x10000000000, 0x100000c0000 },
+	.preload_size = { 0xc0000, 0x2ac000 },
 	.stream_mask = BIT(0),
 	.firmware_preloaded = true,
 	.safe_reset = false,
