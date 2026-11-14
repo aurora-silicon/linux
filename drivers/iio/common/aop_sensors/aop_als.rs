@@ -26,11 +26,12 @@ const ALS_PROP_RAW_INTERVAL: u32 = 0x5c;
 const ALS_PROP_VERBOSITY: u32 = 0xe1;
 
 /*
- * The CT817 starts reporting on the zero to non-zero transition of its
- * report interval, and it accepts that transition only once its batch and
- * raw interval properties have been written. Despite their names these two
- * are not intervals; they are the values the sensor is configured with on
- * the T8140. The sensor answers every one of these writes with a
+ * The ALS starts reporting on the zero to non-zero transition of its report
+ * interval, and it accepts that transition only once its batch and raw
+ * interval properties have been written. Despite their names these two are
+ * not intervals; they are the values the CT817 is configured with on the
+ * T8140, and macOS runs the VD6286 of the M5 Max with the same batch value
+ * and verbosity. The CT817 answers every one of these writes with a
  * not-permitted status and applies them regardless, so the status is only
  * logged.
  */
@@ -93,8 +94,6 @@ fn enable_als(
                 e
             ),
         }
-        set_als_property(aop, svc, ALS_PROP_INTERVAL, &ALS_INTERVAL_US.to_le_bytes())?;
-        return Ok(());
     }
 
     // The CT817 gets its calibration from the AOP driver over the setup port,
