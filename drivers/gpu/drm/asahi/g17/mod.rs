@@ -52,6 +52,7 @@ mod ids;
 mod initdata;
 mod job;
 mod kick;
+mod latency;
 mod object;
 mod port;
 pub(crate) mod power;
@@ -458,6 +459,9 @@ impl rtkit::Operations for RoleOps {
         }
         if !is_events_message(ep, msg) {
             return false;
+        }
+        if opt(OPT_LATENCY) {
+            latency::irq();
         }
         data.shared.queue_event_records();
         true
@@ -1171,6 +1175,27 @@ const RETIRED_FEATURES: u64 = (uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE
     | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES) as u64;
 const _: () = assert!(M5_FEATURES & RETIRED_FEATURES == 0);
 
+unsafe extern "C" {
+    fn asahi_g17_gpubench_opt() -> u32;
+}
+
+/// Measurement only: whether submission-path change `bit` is on (`aurora.gpubench_opt`). Each
+/// user reads its bit once per publication or event pass, so the mask may change at any time.
+pub(crate) fn opt(bit: u32) -> bool {
+    // SAFETY: Reads a module parameter word.
+    let enabled = unsafe { asahi_g17_gpubench_opt() };
+    enabled & bit != 0
+}
+
+/// Records each job's completion-path points (latency.rs, `aurora.gpubench_lat`).
+pub(crate) const OPT_LATENCY: u32 = 1 << 8;
+/// M5 completion path (measurement switches; all off is the unchanged driver): an event pass
+/// drains its reports after its render observation (20), services records notified during it
+/// before the rest of it (21), and hands the device mutex to a woken publication (22).
+pub(crate) const OPT_REPORTS_LAST: u32 = 1 << 20;
+pub(crate) const OPT_RESERVICE: u32 = 1 << 21;
+pub(crate) const OPT_HANDOFF: u32 = 1 << 22;
+
 /// Event work item ID.
 const EVENT_WORK: u64 = 0;
 /// Short control/retirement polls do not wait behind the longer idle deadline.
@@ -1242,6 +1267,14 @@ struct Shared {
     /// The next event pass runs every housekeeping step: set by every [`Self::queue_events`]
     /// request, not by the firmware's event notification ([`Self::queue_event_records`]).
     housekeeping: AtomicBool,
+    /// M5: an event pass signals completions before the rest of its work, and lets the
+    /// publication its signals woke take the device mutex first ([`Self::completion_first`]).
+    completion_first: bool,
+    /// Records were notified since the running event pass last began a service: it services
+    /// again before the rest of the pass (M5).
+    records: AtomicBool,
+    /// Submit-path publications waiting for the device mutex ([`Self::lock_for_publication`]).
+    publishers: AtomicU32,
     /// When an event pass last ran every housekeeping step, in ns.
     housekeeping_ns: AtomicU64,
     #[pin]
@@ -1442,6 +1475,9 @@ impl Shared {
         if !self.submission_enabled {
             return;
         }
+        // A running pass that has signalled what it serviced looks at this before the rest of
+        // its work.
+        self.records.store(true, Ordering::Release);
         // Already queued if this fails, which is just as good.
         let _ = match self.submitter() {
             Some(cpu) => self.events.enqueue_on::<Arc<Shared>, EVENT_WORK>(cpu, self.clone()),
@@ -1468,6 +1504,51 @@ impl Shared {
 
     fn submitter(&self) -> Option<kernel::cpu::CpuId> {
         kernel::cpu::CpuId::from_u32(self.submitter.load(Ordering::Relaxed))
+    }
+
+    /// M5: an event pass retires and signals the records notified while it serviced before the
+    /// rest of its work (its reports, replays, render observation and housekeeping), drains its
+    /// report rings after its render observation, so that the renders it retires are signalled
+    /// before the reports are read, and lets the publication its signals woke take the device
+    /// mutex before that work when they left nothing else in flight. A client that waits for
+    /// each job before it submits the next leaves the GPU idle from the job's end to its next
+    /// publication, and none of that work is a scheduling input.
+    pub(super) fn completion_first(&self) -> bool {
+        self.completion_first
+    }
+
+    /// Measurement only: whether part `bit` of [`Self::completion_first`] is switched on.
+    pub(super) fn completion_part(&self, bit: u32) -> bool {
+        self.completion_first() && opt(bit)
+    }
+
+    /// The device mutex for a submit ioctl's publication. While it waits, an event pass whose
+    /// signals left nothing in flight takes no further hold ([`Self::yield_to_publishers`]).
+    pub(super) fn lock_for_publication(&self) -> kernel::sync::MutexGuard<'_, Option<KBox<Firmware>>> {
+        if !self.completion_part(OPT_HANDOFF) {
+            return self.state.lock();
+        }
+        self.publishers.fetch_add(1, Ordering::AcqRel);
+        let state = self.state.lock();
+        self.publishers.fetch_sub(1, Ordering::AcqRel);
+        state
+    }
+
+    /// Called by an event pass, holding nothing, before a device-mutex hold that follows its
+    /// signals: waits while publications wait for the mutex, for at most `budget_ns` over the
+    /// pass, so that they take it first. The pass's remaining work signals nothing a client is
+    /// waiting for; the publication is what the idle GPU waits for. A zero budget returns at once.
+    pub(super) fn yield_to_publishers(&self, budget_ns: &mut u64) {
+        if *budget_ns == 0 || self.publishers.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let start = now_ns();
+        let mut spent = 0;
+        while self.publishers.load(Ordering::Acquire) != 0 && spent < *budget_ns {
+            kernel::processor::cpu_relax();
+            spent = now_ns().saturating_sub(start);
+        }
+        *budget_ns = budget_ns.saturating_sub(spent.max(1));
     }
 
     fn queue_grow(self: &Arc<Self>) {
@@ -1779,6 +1860,9 @@ impl Gpu {
                 compute_demand: AtomicU32::new(0),
                 work <- new_work!("g17::Shared::work"),
                 housekeeping: AtomicBool::new(true),
+                completion_first: m5,
+                records: AtomicBool::new(false),
+                publishers: AtomicU32::new(0),
                 housekeeping_ns: AtomicU64::new(0),
                 poll <- new_delayed_work!("g17::Shared::poll"),
                 idle <- new_delayed_work!("g17::Shared::idle"),

@@ -1462,6 +1462,9 @@ impl Pair {
             host.activate_render_pool(self.free_list.id(), free_list_generation)?;
             host.publish_retained_pair(priority, fragment_slot, tiling_slot, outer_next)?;
             self.active.back_mut().ok_or(EIO)?.outer_published = true;
+            if crate::g17::opt(crate::g17::OPT_LATENCY) {
+                crate::g17::latency::doorbell(&packet.completion);
+            }
             host.notify_render(priority)?;
             crate::g17::trace::publish(
                 crate::g17::trace::RENDER,
