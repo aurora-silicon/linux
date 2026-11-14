@@ -1147,9 +1147,11 @@ static int apple_probe_per_dcp(struct device *dev,
 			 * The T8142 runs macOS 27.0's DCP firmware as firmware
 			 * 27, outside the H17G profile, and blends XRGB's X
 			 * byte as alpha all the same (GPU-rendered alacritty
-			 * showed wrong colours on the panel).
+			 * showed wrong colours on the panel).  The T6050
+			 * internal DCP does the same (hw.xrgb_is_alpha).
 			 */
 			bool xrgb_is_alpha =
+				dcp_data->hw.xrgb_is_alpha ||
 				dcp_data->hw.iomfb_method_profile ==
 					DCP_IOMFB_METHODS_H17G ||
 				(dcp_data->fw_compat == DCP_FIRMWARE_V_27_0 &&
