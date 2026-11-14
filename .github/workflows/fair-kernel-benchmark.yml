@@ -1,0 +1,82 @@
+name: Controlled x86 kernel cache benchmark
+
+on:
+  push:
+    branches: [bench/fair-kernel-x86-20261114]
+    paths:
+      - '.github/benchmarks/kernel-cache/**'
+      - '.github/workflows/fair-kernel-benchmark.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: controlled-kernel-cache-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/benchmarks/kernel-cache
+
+      - name: Reserve capacity on this disposable runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          df -B1 /
+          # Completed, preinstalled SDK caches on this job's fresh runner.
+          # Neither benchmark sources nor outputs have been created yet.
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache
+          df -B1 /
+          test "$(df -B1 --output=avail / | tail -1)" -ge 48318382080
+          mkdir -p .fair-kernel/ccache
+
+      - name: Restore persistent compiler cache
+        id: cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .fair-kernel/ccache
+          key: controlled-kernel-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/benchmarks/kernel-cache/**') }}
+
+      - name: Run the matched warm-up and fresh-output cached builds
+        shell: bash
+        env:
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          image=debian:13@sha256:bfc36aecdece0387418759dba474aa856c026ca8087da3606b41b90ab0509c99
+          docker pull "$image"
+          docker image inspect "$image" --format '{{json .RepoDigests}}' | tee .fair-kernel/container-image.json
+          docker run --rm --platform linux/amd64 \
+            -e BENCHMARK_MACHINE=github-x86 -e GITHUB_RUN_ID -e RUNNER_NAME \
+            -v "$PWD/.fair-kernel:/work/aurora-kernel-bench-20261114" \
+            -v "$PWD/.github/benchmarks/kernel-cache:/benchmark:ro" \
+            "$image" bash -euo pipefail -c \
+            'bash /benchmark/install-dependencies.sh; python3 /benchmark/benchmark.py'
+
+      - name: Save compiler cache for later controlled runs
+        if: success() && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .fair-kernel/ccache
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+      - name: Retain timing, configuration and cache evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: controlled-kernel-cache-${{ github.run_id }}
+          path: |
+            .fair-kernel/results/
+            .fair-kernel/container-image.json
+            .fair-kernel/out/.config
+            .fair-kernel/out/arch/arm64/boot/Image
+          if-no-files-found: warn
+          retention-days: 14

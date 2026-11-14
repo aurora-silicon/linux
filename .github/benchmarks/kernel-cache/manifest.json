@@ -1,0 +1,27 @@
+{
+  "schema": 1,
+  "source_url": "https://github.com/aurora-silicon/linux.git",
+  "source_commit": "7c71d6df6563fb35a07fb1a5262951d1e6579380",
+  "config_sha256": "1b30b37535ef0de1ad9ff7900332370da14ea151abfbe5f53434984c30dcbdd8",
+  "debian_image": "debian:13@sha256:bfc36aecdece0387418759dba474aa856c026ca8087da3606b41b90ab0509c99",
+  "root": "/work/aurora-kernel-bench-20261114",
+  "cache_max_size": "8G",
+  "targets": ["Image", "modules", "dtbs"],
+  "expected_packages": {
+    "cargo": "1.85.1+dfsg1-1+deb13u1",
+    "ccache": "4.11.2-2",
+    "clang-19": "1:19.1.7-3+b1",
+    "dwarves": "1.30-1",
+    "gcc": "4:14.2.0-1",
+    "libclang-19-dev": "1:19.1.7-3+b1",
+    "libelf-dev": "0.192-4",
+    "libssl-dev": "3.5.7-1~deb13u3",
+    "lld-19": "1:19.1.7-3+b1",
+    "llvm-19": "1:19.1.7-3+b1",
+    "make": "4.4.1-2",
+    "python3": "3.13.5-1",
+    "rust-src": "1.85.1+dfsg1-1+deb13u1",
+    "rustc": "1.85.1+dfsg1-1+deb13u1",
+    "rustfmt": "1.85.1+dfsg1-1+deb13u1"
+  }
+}
