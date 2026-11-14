@@ -67,6 +67,11 @@ void asahi_g17_trace_message(u8 kind, u64 value)
 		trace_asahi_g17_message(kind, value, __arch_counter_get_cntvct());
 }
 
+bool asahi_g17_trace_message_enabled(void)
+{
+	return trace_asahi_g17_message_enabled();
+}
+
 void asahi_g17_trace_event(u8 phase)
 {
 	if (trace_asahi_g17_event_enabled())

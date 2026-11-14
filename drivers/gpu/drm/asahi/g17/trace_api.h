@@ -22,6 +22,7 @@ void asahi_g17_trace_bind(u8 engine, u8 qid, u32 ctx, u8 kind);
 bool asahi_g17_trace_doorbell_enabled(void);
 void asahi_g17_trace_doorbell(u8 engine, u32 power);
 void asahi_g17_trace_message(u8 kind, u64 value);
+bool asahi_g17_trace_message_enabled(void);
 void asahi_g17_trace_event(u8 phase);
 void asahi_g17_trace_teardown(u8 kind, u64 a, u64 b, u64 c);
 
