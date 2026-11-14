@@ -869,7 +869,7 @@ static int dptxport_call_link_config(struct apple_epic_service *service, bool la
 	return ret;
 }
 
-static int dptxport_call_inner(struct apple_epic_service *service, u32 idx,
+static int dptxport_call(struct apple_epic_service *service, u32 idx,
 			 const void *data, size_t data_size, void *reply,
 			 size_t reply_size)
 {
@@ -1042,25 +1042,6 @@ static int dptxport_call_inner(struct apple_epic_service *service, u32 idx,
 			memset(reply, 0, 4);
 		return 0;
 	}
-}
-
-/* w86 probe: the reply of every DPTX apcall (return code and first 16 reply bytes), for external DCPs. */
-static int dptxport_call(struct apple_epic_service *service, u32 idx,
-			 const void *data, size_t data_size, void *reply,
-			 size_t reply_size)
-{
-	struct apple_dcp *dcp = service->ep->dcp;
-	u8 req[32] = {};
-	int ret;
-
-	memcpy(req, data, min(data_size, sizeof(req)));
-	ret = dptxport_call_inner(service, idx, data, data_size, reply, reply_size);
-
-	dev_info(dcp->dev, "w86-dptx: apcall %u size %zu req %*ph -> ret %d reply %*ph lane_count %d\n",
-		 idx, data_size, (int)min(data_size, (size_t)32), req, ret,
-		 (int)min(reply_size, (size_t)16), reply,
-		 ((struct dptx_port *)service->cookie)->lane_count);
-	return ret;
 }
 
 static int dptxport_prepare(struct apple_epic_service *service, const char *name,

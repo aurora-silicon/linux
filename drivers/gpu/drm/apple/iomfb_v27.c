@@ -161,8 +161,6 @@ static bool trampoline_get_frequency_v27(struct apple_dcp *dcp, int tag,
 		rate = clk_get_rate(dcp->firmware_clocks[index].clk);
 	else
 		rate = (u64)dcp->mode_clock_khz * 1000 / 2;
-	dev_info(dcp->dev, "w86-clk: D408 index %u declared %u -> %llu Hz\n",
-		 index, dcp->num_firmware_clocks, rate);
 	*(__le64 *)out = cpu_to_le64(rate);
 	return true;
 }
@@ -172,8 +170,6 @@ static bool trampoline_hotplug_h17p(struct apple_dcp *dcp, int tag,
 {
 	const struct dcp_h17p_hotplug_request *request = in;
 
-	dev_info(dcp->dev, "w86-d575: hotplug connected=%llu tiled_null=%u\n",
-		 le64_to_cpu(request->connected), request->tiled_display_null);
 	/* The opt-in peer allocator needs the firmware's tiling metadata to verify
 	 * the VFTG relationship before implementing its framebuffer lifecycle.
 	 * Keep both halves: the endpoint IDs are at the end of this payload.
@@ -241,13 +237,6 @@ static bool trampoline_get_data_prop_v27(struct apple_dcp *dcp, int tag,
 	const struct property *prop;
 	u32 cap = min_t(u32, le32_to_cpu(req->length), sizeof(resp->data));
 
-	/* w86 probe, remove after the keys are known */
-	dev_info(dcp->dev, "w86-d400: obj=%.4s key=%.*s want=%u found=%d len=%d\n", req->obj,
-		 (int)strnlen(req->key, sizeof(req->key)), req->key, le32_to_cpu(req->length),
-		 !!of_find_property(dcp->dev->of_node, req->key, NULL),
-		 of_find_property(dcp->dev->of_node, req->key, NULL) ?
-		 of_find_property(dcp->dev->of_node, req->key, NULL)->length : -1);
-
 	if (memcmp(req->obj, "VORP", sizeof(req->obj)) ||
 	    strnlen(req->key, sizeof(req->key)) == sizeof(req->key))
 		return true;
@@ -270,10 +259,6 @@ static bool trampoline_get_uint_prop_v27(struct apple_dcp *dcp, int tag, void *o
 	struct dcp_get_uint_prop_resp *resp = out;
 	const struct property *prop;
 
-	/* w86 probe, remove after the keys are known */
-	dev_info(dcp->dev, "w86-d401: obj=%.4s key=%.*s null=%u\n", req->obj,
-		 (int)strnlen(req->key, sizeof(req->key)), req->key, req->value_null);
-
 	if (!memcmp(req->obj, "VORP", sizeof(req->obj)) &&
 	    strnlen(req->key, sizeof(req->key)) < sizeof(req->key)) {
 		prop = of_find_property(dcp->dev->of_node, req->key, NULL);
@@ -285,19 +270,6 @@ static bool trampoline_get_uint_prop_v27(struct apple_dcp *dcp, int tag, void *o
 	}
 	return trampoline_get_uint_prop(dcp, tag, out, in);
 }
-
-/* w86 probe, remove after the keys are known: log the object and key of the property setters. */
-#define W86_LOG_SET(name, orig)							\
-static bool name(struct apple_dcp *dcp, int tag, void *out, void *in)		\
-{										\
-	const char *obj = in;							\
-										\
-	dev_info(dcp->dev, "w86-set: D%d obj=%.4s key=%.*s\n", tag, obj,	\
-		 (int)strnlen(obj + 4, 0x40), obj + 4);				\
-	return orig(dcp, tag, out, in);						\
-}
-W86_LOG_SET(w86_set_nop, trampoline_nop)
-W86_LOG_SET(w86_set_int, trampoline_sr_set_property_int)
 
 struct dcp_allocate_buffer_req_v27 {
 	__le32 options;
@@ -471,8 +443,8 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[6] = trampoline_set_frame_sync_props_h17p,
 	[100] = iomfbep_cb_match_pmu_service,
 	[101] = trampoline_zero,
-	[102] = w86_set_nop,
-	[104] = w86_set_nop,
+	[102] = trampoline_nop,
+	[104] = trampoline_nop,
 	[106] = trampoline_nop,
 	[107] = iomfbep_cb_w86_service,
 	[108] = iomfbep_cb_w86_service,
@@ -510,12 +482,12 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[300] = trampoline_pr_publish,
 	[400] = trampoline_get_data_prop_v27,
 	[401] = trampoline_get_uint_prop_v27,
-	[404] = w86_set_nop,
+	[404] = trampoline_nop,
 	[406] = trampoline_set_fx_prop,
 	[408] = trampoline_get_frequency_v27,
 	[411] = trampoline_map_reg,
 	[413] = trampoline_true,
-	[414] = w86_set_int,
+	[414] = trampoline_sr_set_property_int,
 	[415] = trampoline_true,
 	[451] = trampoline_allocate_buffer_v27,
 	[452] = trampoline_buffer_lifecycle_v27,

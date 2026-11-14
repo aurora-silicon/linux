@@ -358,30 +358,6 @@ DCP_THUNK_OUT(dcp_finish_wake, dcpep_pipe_query_474, u32);
 IOMFB_THUNK_INOUT(abort_swaps_dcp);
 #endif
 
-#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
-/* w86 probe: nonzero 32-byte rows of the wire swap request, for the first 3 swaps after each 20 s gap. */
-static void dcp_w86_dump_swap(struct apple_dcp *dcp, const void *wire, size_t len)
-{
-	const u8 *p = wire;
-	size_t off;
-	u32 n = ++dcp->w86_swap_count;
-
-	if (time_after(jiffies, dcp->w86_swap_last + 20 * HZ))
-		dcp->w86_swap_budget = 3;
-	dcp->w86_swap_last = jiffies;
-	if (!dcp->w86_swap_budget)
-		return;
-	dcp->w86_swap_budget--;
-	dev_info(dcp->dev, "w86-swap: #%u len %zu\n", n, len);
-	for (off = 0; off < len; off += 32) {
-		size_t row = min_t(size_t, 32, len - off);
-
-		if (memchr_inv(p + off, 0, row))
-			dev_info(dcp->dev, "w86-swap: #%u +%04zx %*ph\n", n, off, (int)row, p + off);
-	}
-}
-#endif
-
 #if DCP_FW_H17(DCP_FW_VER)
 static void dcp_swap_submit(struct apple_dcp *dcp, bool oob,
 			    struct dcp_swap_submit_req_h17p *request,
@@ -403,7 +379,6 @@ static void dcp_swap_submit(struct apple_dcp *dcp, bool oob,
 		dcp->present_v27.swap.brightness_nits =
 			get_unaligned_le64(dcp->present_h17p.swap + 0x35e);
 		data = &dcp->present_v27;
-		dcp_w86_dump_swap(dcp, &dcp->present_v27, sizeof(dcp->present_v27));
 #else
 		data = &dcp->present_h17p;
 #endif
@@ -554,7 +529,7 @@ struct dcp_pipe_set_352_req {
 	__le32 value;
 } __packed;
 DCP_THUNK_INOUT(dcp_pipe_set_352, dcpep_pipe_set_352, struct dcp_pipe_set_352_req, u32);
-/* w86 probe: macOS sends A400 and A379 (twice) at first client open, 0 bytes in, 4 bytes out. */
+/* macOS sends A400 and A379 (twice) at first client open, 0 bytes in, 4 bytes out. */
 DCP_THUNK_OUT(dcp_pipe_query_400, dcpep_pipe_query_400, u32);
 DCP_THUNK_OUT(dcp_pipe_query_379, dcpep_pipe_query_379, u32);
 /* macOS A378: 44 bytes in (length word 0x28, rest zero), 40 bytes out (panel limits 50/100/20/30 seen). */
@@ -573,7 +548,6 @@ static void dcp_a352_7c_second(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	struct dcp_pipe_set_352_req req = { .key = cpu_to_le32(0x7c), .value = cpu_to_le32(1) };
 
-	dev_info(dcp->dev, "w86-a352: key 0x7c value 0 answered, sending value 1\n");
 	dcp_pipe_set_352(dcp, false, &req, dcp_started_next, cookie);
 }
 #endif
@@ -788,7 +762,6 @@ static void complete_vi_set_temperature_hint(struct apple_dcp *dcp, void *out, v
 
 static bool iomfbep_cb_match_pmu_service(struct apple_dcp *dcp, int tag, void *out, void *in)
 {
-	dev_info(dcp->dev, "w86-d100: match_pmu_service\n");
 	trace_iomfb_callback(dcp, tag, __func__);
 	iomfb_a358_vi_set_temperature_hint(dcp, false,
 					   complete_vi_set_temperature_hint,
@@ -866,8 +839,6 @@ static void complete_dfb_surface(struct apple_dcp *dcp, void *out, void *cookie)
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
 	struct dcp_channel *ch = &dcp->ch_cb;
 
-	dev_info(dcp->dev, "w86-d582: A472 register_dfb_surface result %u\n",
-		 out ? get_unaligned_le32(out) : 0xdead);
 	*(u8 *)ch->output[ch->depth - 1] = out && !get_unaligned_le32(out);
 	dcp_ack(dcp, DCP_CONTEXT_CB);
 #else
@@ -881,8 +852,6 @@ static bool iomfbep_cb_create_dfb_surface(struct apple_dcp *dcp, int tag,
 	struct dcp_h17p_dfb_surface_req *req;
 
 	trace_iomfb_callback(dcp, tag, __func__);
-	dev_info(dcp->dev, "w86-d582: create_dfb_surface request, dim %ux%u\n",
-		 get_unaligned_le32(in), get_unaligned_le32(in + 4));
 
 	/*
 	 * The request is too large for the stack this deep in the RTKit
@@ -947,7 +916,6 @@ static void complete_pmu_service_matched(struct apple_dcp *dcp, void *out, void 
 
 	*succ = true;
 
-	dev_info(dcp->dev, "w86-svc: A136 pmu_service_matched done\n");
 	// ack D206 cb_match_pmu_service_2
 	dcp_ack(dcp, DCP_CONTEXT_CB);
 }
@@ -955,7 +923,6 @@ static void complete_pmu_service_matched(struct apple_dcp *dcp, void *out, void 
 static bool iomfbep_cb_match_pmu_service_2(struct apple_dcp *dcp, int tag, void *out, void *in)
 {
 	trace_iomfb_callback(dcp, tag, __func__);
-	dev_info(dcp->dev, "w86-svc: D206 match_pmu_service_2 -> send A136\n");
 
 	iomfb_a131_pmu_service_matched(dcp, false, complete_pmu_service_matched,
 				       out);
@@ -971,7 +938,6 @@ static void complete_backlight_service_matched(struct apple_dcp *dcp, void *out,
 
 	*succ = true;
 
-	dev_info(dcp->dev, "w86-svc: A137 backlight_service_matched done\n");
 	// ack D206 cb_match_backlight_service
 	dcp_ack(dcp, DCP_CONTEXT_CB);
 }
@@ -979,8 +945,6 @@ static void complete_backlight_service_matched(struct apple_dcp *dcp, void *out,
 static bool iomfbep_cb_match_backlight_service(struct apple_dcp *dcp, int tag, void *out, void *in)
 {
 	trace_iomfb_callback(dcp, tag, __func__);
-	dev_info(dcp->dev, "w86-svc: D207 match_backlight_service has_panel=%d\n",
-		 dcp_has_panel(dcp));
 
 	if (!dcp_has_panel(dcp)) {
 		u8 *succ = out;
@@ -996,9 +960,6 @@ static bool iomfbep_cb_match_backlight_service(struct apple_dcp *dcp, int tag, v
 
 static void iomfb_cb_pr_publish(struct apple_dcp *dcp, struct iomfb_property *prop)
 {
-	/* w86 probe: D300 id/value; macOS makes about 191 of these before the panel stage */
-	dev_info(dcp->dev, "w86-d300: pr_publish id %u value %u has_panel %d\n",
-		 prop->id, prop->value, dcp_has_panel(dcp));
 	switch (prop->id) {
 #if !DCP_FW_DESKTOP_26(DCP_FW_VER)
 	/* The desktop 26.x firmware publishes no panel level here. */
@@ -1050,10 +1011,6 @@ dcpep_cb_get_uint_prop(struct apple_dcp *dcp, struct dcp_get_uint_prop_req *req)
 		resp.ret = true;
 	    }
 	}
-
-	dev_info(dcp->dev, "w86-d401: reply obj=%.4s key=%.*s ret=%u value=%llu has_mini_led=%d\n",
-		 req->obj, (int)strnlen(req->key, sizeof(req->key)), req->key, resp.ret,
-		 (u64)resp.value, dcp->panel.has_mini_led);
 	return resp;
 }
 
@@ -1495,10 +1452,6 @@ dcpep_cb_read_edt_data(struct apple_dcp *dcp, struct dcp_read_edt_data_req *req)
 		const struct property *prop = of_find_property(dcp->dev->of_node, req->key, NULL);
 		dcp_read_edt_data_resp_t resp = { .ret = 0 };
 
-		/* w86 probe, remove after the keys are known */
-		dev_info(dcp->dev, "w86-edt: key=%.*s count=%u found=%d len=%d\n",
-			 (int)strnlen(req->key, sizeof(req->key)), req->key, req->count,
-			 !!prop, prop ? prop->length : -1);
 		/* shortcut: first boot answers one key; widen once the color read is confirmed */
 		if (prop && !strncmp(req->key, "color-accuracy-index", sizeof(req->key)) &&
 		    prop->length == req->count * sizeof(u32)) {
@@ -3205,8 +3158,6 @@ static bool iomfbep_cb_w86_service(struct apple_dcp *dcp, int tag, void *out, vo
 	bool reply = tag == 111 ? dcpep_cb_create_backlight_service(dcp) : true;
 
 	*succ = reply;
-	dev_info(dcp->dev, "w86-svc: D%d service reply %d (has_panel %d connector_type %d)\n",
-		 tag, reply, dcp_has_panel(dcp), dcp->connector_type);
 	return true;
 }
 #endif
@@ -3259,21 +3210,17 @@ static void dcp_w86_send_a352(struct apple_dcp *dcp)
 	u32 nits = dcp->edr_present_sdr;
 	struct dcp_pipe_set_352_req req;
 
-	if (!nits && dcp->w86_last_nits) {
-		dev_info(dcp->dev, "w86-a352: nits 0 clamped to %u\n", dcp->w86_last_nits);
+	if (!nits)
 		nits = dcp->w86_last_nits;
-	} else if (nits) {
+	else
 		dcp->w86_last_nits = nits;
-	}
 	req.key = cpu_to_le32(0x14);
 	req.value = cpu_to_le32(nits << 16);
-	dev_info(dcp->dev, "w86-a352: key 0x14 nits %u\n", nits);
 	dcp_pipe_set_352(dcp, false, &req, NULL, NULL);
 }
 
 static void dcp_w86_after_378(struct apple_dcp *dcp, void *out, void *cookie)
 {
-	dev_info(dcp->dev, "w86-a378: reply %*ph\n", out ? 40 : 0, out);
 	dcp_w86_send_a352(dcp);
 }
 
@@ -3281,20 +3228,17 @@ static void dcp_w86_after_379b(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	struct dcp_w86_378_req req = {};
 
-	dev_info(dcp->dev, "w86-a379: second reply %u\n", out ? get_unaligned_le32(out) : 0xdead);
 	req.data[0] = 0x28;
 	dcp_pipe_query_378(dcp, false, &req, dcp_w86_after_378, NULL);
 }
 
 static void dcp_w86_after_379a(struct apple_dcp *dcp, void *out, void *cookie)
 {
-	dev_info(dcp->dev, "w86-a379: first reply %u\n", out ? get_unaligned_le32(out) : 0xdead);
 	dcp_pipe_query_379(dcp, false, dcp_w86_after_379b, NULL);
 }
 
 static void dcp_w86_after_400(struct apple_dcp *dcp, void *out, void *cookie)
 {
-	dev_info(dcp->dev, "w86-a400: reply %u\n", out ? get_unaligned_le32(out) : 0xdead);
 	dcp_pipe_query_379(dcp, false, dcp_w86_after_379a, NULL);
 }
 #endif
@@ -3335,7 +3279,6 @@ static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 	    dcp->present_v27.swap.brightness_update) {
 		if (!dcp->w86_client_open_queries_sent) {
 			dcp->w86_client_open_queries_sent = true;
-			dev_info(dcp->dev, "w86-a400: sending A400\n");
 			dcp_pipe_query_400(dcp, false, dcp_w86_after_400, NULL);
 		} else {
 			dcp_w86_send_a352(dcp);
@@ -4628,7 +4571,6 @@ static void dcp_started(struct apple_dcp *dcp, void *data, void *cookie)
 	if (dcp_a352_enable_7c && dcp->tags_27_3 && dcp_has_panel(dcp)) {
 		struct dcp_pipe_set_352_req req = { .key = cpu_to_le32(0x7c) };
 
-		dev_info(dcp->dev, "w86-a352: key 0x7c value 0 before the first swap\n");
 		dcp_pipe_set_352(dcp, false, &req, dcp_a352_7c_second, cookie);
 		return;
 	}

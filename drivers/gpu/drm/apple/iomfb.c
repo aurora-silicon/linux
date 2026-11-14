@@ -977,15 +977,6 @@ static void dcp_push_context(struct apple_dcp *dcp, enum dcp_context_id context,
 			if (!swap_27_3) {
 				WRITE_ONCE(dcp->crashed, true);
 				return;
-		/* w86 probe, remove after the layout is known: swap with brightness_update set (27.0 +0x354) */
-		if (((const u8 *)data)[0x354] & 1) {
-			dev_info(dcp->dev, "w86-swap-bl: nits=%016llx\n",
-				 get_unaligned_le64((const u8 *)data + 0x35e));
-			print_hex_dump(KERN_INFO, "w86-swap-src: ", DUMP_PREFIX_OFFSET, 16, 1,
-				       (const u8 *)data + 0x350, 0xa0, false);
-			print_hex_dump(KERN_INFO, "w86-swap-dst: ", DUMP_PREFIX_OFFSET, 16, 1,
-				       swap_27_3 + 0x350, 0xe0, false);
-		}
 			}
 			dcp_v27_3_swap_req(swap_27_3, data);
 			data = swap_27_3;
@@ -3460,7 +3451,6 @@ bool iomfb_apply_backlight_h17p(struct apple_dcp *dcp,
 		if (!dcp->brightness.maximum)
 			return false;
 		dcp->edr_present_sdr = 0;
-		dev_info(dcp->dev, "w86-nits: source backlight inactive -> 0\n");
 		iomfb_encode_backlight_h17p(wire, 0,
 					    dcp->brightness.maximum, false);
 		return true;
@@ -3477,8 +3467,6 @@ bool iomfb_apply_backlight_h17p(struct apple_dcp *dcp,
 		transaction->backlight_reserved = true;
 	}
 	dcp->edr_present_sdr = present.nits;
-	dev_info(dcp->dev, "w86-nits: source dcp_backlight_prepare ret %d nits %u surface %d\n",
-		 ret, present.nits, have_surface);
 	iomfb_encode_backlight_h17p(wire, present.nits,
 				    dcp->brightness.maximum, !ret);
 	return true;
