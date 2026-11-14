@@ -1584,7 +1584,7 @@ static u8 dcpep_cb_prop_start(struct apple_dcp *dcp, u32 *length)
 	} else {
 		dcp_firmware_metadata_begin(dcp);
 	}
-	dcp->chunks.data = kzalloc(*length, GFP_KERNEL);
+	dcp->chunks.data = kvzalloc(*length, GFP_KERNEL);
 
 	if (!dcp->chunks.data) {
 		dev_warn(dcp->dev, "failed to allocate chunks\n");
@@ -1668,7 +1668,7 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 		ret = dcp_modes_replace(dcp, &ctx, dcp->chunks.modes_generation);
 		if (ret) {
 			if (ret == -ESTALE) {
-				kfree(dcp->chunks.data);
+				kvfree(dcp->chunks.data);
 				dcp->chunks.data = NULL;
 				dcp->chunks.length = 0;
 			}
@@ -1697,7 +1697,7 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 		ret = dcp_attributes_replace(dcp, &ctx, dcp->chunks.modes_generation);
 		if (ret) {
 			if (ret == -ESTALE) {
-				kfree(dcp->chunks.data);
+				kvfree(dcp->chunks.data);
 				dcp->chunks.data = NULL;
 				dcp->chunks.length = 0;
 			}
@@ -1730,7 +1730,7 @@ static u8 dcpep_cb_prop_end(struct apple_dcp *dcp,
 	u8 resp;
 
 	if (!dcp_property_key_valid(req->key, sizeof(req->key))) {
-		kfree(dcp->chunks.data);
+		kvfree(dcp->chunks.data);
 		dcp->chunks.data = NULL;
 		dcp->chunks.length = 0;
 		return false;
