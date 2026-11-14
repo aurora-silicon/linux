@@ -43,6 +43,7 @@
 #include "dcp-peer-frames-v27.h"
 #include "epic/dpavservep.h"
 #include "version_utils.h"
+#include "dcp-swap-pace.h"
 
 #define DCP_MAX_PLANES 4
 /* Bounds the CRTC power cycles a rebuilt T6020 tunnel may trigger. */
@@ -909,6 +910,7 @@ struct apple_dcp {
 		unsigned int callback_count;
 		struct delayed_work timeout;
 		struct delayed_work backlight_retry;
+		struct delayed_work keepalive;
 		unsigned long deadline;
 		unsigned int queued;
 		bool stopped;
@@ -1133,6 +1135,8 @@ static inline bool dcp_is_v14_7_panel(const struct apple_dcp *dcp)
 void dcp_external_audio_start(struct apple_dcp *dcp);
 
 extern bool dcp_a352_enable_7c;
+extern unsigned int dcp_swap_ts_mode;
+extern unsigned int dcp_keepalive_ms;
 
 /*
  * The T8122 dcpext connects its DPTX port as AsahiLinux/linux#607 does,

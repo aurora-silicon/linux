@@ -263,6 +263,20 @@ TRACE_EVENT(iomfb_swap_submit,
 		      __entry->swap_id)
 );
 
+TRACE_EVENT(iomfb_keepalive,
+	    TP_PROTO(struct apple_dcp *dcp, unsigned int delay_ms),
+	    TP_ARGS(dcp, delay_ms),
+	    TP_STRUCT__entry(
+			     __field(u64, dcp)
+			     __field(unsigned int, delay_ms)
+	    ),
+	    TP_fast_assign(
+			   __entry->dcp = (u64)dcp;
+			   __entry->delay_ms = delay_ms;
+	    ),
+	    TP_printk("dcp=%llx, delay_ms=%u", __entry->dcp, __entry->delay_ms)
+);
+
 TRACE_EVENT(iomfb_vrr_timestamps,
 	    TP_PROTO(struct apple_dcp *dcp, bool enabled, u64 timestamp,
 		     u64 submit_timestamp),

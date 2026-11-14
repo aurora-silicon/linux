@@ -664,6 +664,8 @@ static void iomfb_callback_work(struct work_struct *work)
 	mutex_unlock(&dcp->iomfb.lock);
 }
 
+static void iomfb_keepalive_work(struct work_struct *work);
+
 void iomfb_queue_init(struct apple_dcp *dcp)
 {
 	mutex_init(&dcp->iomfb.lock);
@@ -675,6 +677,7 @@ void iomfb_queue_init(struct apple_dcp *dcp)
 	INIT_WORK(&dcp->iomfb.callback_work, iomfb_callback_work);
 	INIT_DELAYED_WORK(&dcp->iomfb.timeout, iomfb_queue_timeout);
 	INIT_DELAYED_WORK(&dcp->iomfb.backlight_retry, iomfb_backlight_retry);
+	INIT_DELAYED_WORK(&dcp->iomfb.keepalive, iomfb_keepalive_work);
 	atomic_set(&dcp->iomfb.opaque_x_state, IOMFB_OPAQUE_X_WAITING);
 }
 
@@ -698,6 +701,7 @@ void iomfb_queue_stop(struct apple_dcp *dcp)
 		kfree(item);
 	cancel_delayed_work_sync(&dcp->iomfb.timeout);
 	cancel_delayed_work_sync(&dcp->iomfb.backlight_retry);
+	cancel_delayed_work_sync(&dcp->iomfb.keepalive);
 }
 
 /*
@@ -3483,6 +3487,20 @@ void iomfb_present_failed_h17p(struct apple_dcp *dcp)
 	}
 }
 
+/*
+ * keepalive_ms: after a frame swap completes, present the same frame once more
+ * if no other frame completes within the delay.  The repeat is brightness-only,
+ * so it makes no flip event and never re-arms itself.
+ */
+static void iomfb_keepalive_arm(struct apple_dcp *dcp)
+{
+	unsigned int ms = dcp_keepalive_delay_ms(READ_ONCE(dcp_keepalive_ms));
+
+	if (ms)
+		mod_delayed_work(system_dfl_wq, &dcp->iomfb.keepalive,
+				 msecs_to_jiffies(ms));
+}
+
 bool iomfb_present_complete_h17p(struct apple_dcp *dcp)
 {
 	struct iomfb_transaction *transaction = dcp->iomfb.active;
@@ -3503,6 +3521,7 @@ bool iomfb_present_complete_h17p(struct apple_dcp *dcp)
 		if (transaction->brightness_only)
 			return false;
 	}
+	iomfb_keepalive_arm(dcp);
 	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0)
 		atomic_cmpxchg(&dcp->iomfb.opaque_x_state, IOMFB_OPAQUE_X_WAITING,
 			       IOMFB_OPAQUE_X_NEEDED);
@@ -3599,22 +3618,27 @@ VISIBLE_IF_KUNIT void iomfb_scanout_put_h17p(struct apple_dcp *dcp,
 	iomfb_scanout_release_h17p(scanout);
 }
 
+static bool iomfb_scanout_presentable(struct apple_dcp *dcp)
+{
+	struct iomfb_scanout_h17p *scanout = dcp->iomfb.scanout;
+	unsigned int i;
+
+	if (!READ_ONCE(dcp->mode_state.valid) || !scanout || !dcp->connector ||
+	    !dcp->connector->connected)
+		return false;
+	for (i = 0; i < SWAP_SURFACES; i++)
+		if (scanout->fb[i])
+			return true;
+	return false;
+}
+
 static void iomfb_backlight_start(struct apple_dcp *dcp,
 				  struct iomfb_transaction *transaction)
 {
-	struct iomfb_scanout_h17p *scanout = dcp->iomfb.scanout;
-	bool have_surface = false;
-	unsigned int i;
-
-	if (!dcp_backlight_pending(dcp) || !READ_ONCE(dcp->mode_state.valid) || !scanout ||
-	    !dcp->connector || !dcp->connector->connected)
-		return;
-	for (i = 0; i < SWAP_SURFACES; i++)
-		have_surface |= !!scanout->fb[i];
-	if (!have_surface)
+	if (!dcp_backlight_pending(dcp) || !iomfb_scanout_presentable(dcp))
 		return;
 
-	dcp->swap.h17p = scanout->request;
+	dcp->swap.h17p = dcp->iomfb.scanout->request;
 	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0)
 		iomfb_present_backlight_v27(dcp);
 	else
@@ -3634,6 +3658,36 @@ static void iomfb_backlight_kick(struct apple_dcp *dcp)
 	if (!transaction)
 		return;
 	transaction->start = iomfb_backlight_start;
+	transaction->release = iomfb_backlight_release;
+	transaction->brightness_only = true;
+	transaction->presentation = true;
+	if (iomfb_queue(dcp, transaction))
+		kfree(transaction);
+}
+
+static void iomfb_keepalive_start(struct apple_dcp *dcp,
+				  struct iomfb_transaction *transaction)
+{
+	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0 || !iomfb_scanout_presentable(dcp))
+		return;
+
+	trace_iomfb_keepalive(dcp, dcp_keepalive_delay_ms(READ_ONCE(dcp_keepalive_ms)));
+	dcp->swap.h17p = dcp->iomfb.scanout->request;
+	iomfb_present_keepalive_v27(dcp);
+}
+
+static void iomfb_keepalive_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(to_delayed_work(work), struct apple_dcp,
+					  iomfb.keepalive);
+	struct iomfb_transaction *transaction;
+
+	if (READ_ONCE(dcp->crashed) || READ_ONCE(dcp->iomfb.stopped))
+		return;
+	transaction = kzalloc_obj(*transaction);
+	if (!transaction)
+		return;
+	transaction->start = iomfb_keepalive_start;
 	transaction->release = iomfb_backlight_release;
 	transaction->brightness_only = true;
 	transaction->presentation = true;

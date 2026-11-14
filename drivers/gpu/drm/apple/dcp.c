@@ -214,6 +214,14 @@ bool dcp_a352_enable_7c;
 module_param_named(a352_enable_7c, dcp_a352_enable_7c, bool, 0644);
 MODULE_PARM_DESC(a352_enable_7c, "send A352 key 0x7c value 0 then 1 at boot, before the first swap (27.3 probe)");
 
+unsigned int dcp_swap_ts_mode;
+module_param_named(swap_ts_mode, dcp_swap_ts_mode, uint, 0644);
+MODULE_PARM_DESC(swap_ts_mode, "swap timestamps: 0 clock values (default), 1 constant 120 as on M4, 2 ts[1] one 120 Hz frame before ts[0] for a lone swap, 3 all zero");
+
+unsigned int dcp_keepalive_ms;
+module_param_named(keepalive_ms, dcp_keepalive_ms, uint, 0644);
+MODULE_PARM_DESC(keepalive_ms, "0 = off. N = present the last frame again, with new timestamps, N ms after the last swap (v27 only, max 1000)");
+
 /*
  * DP/HDMI audio of external displays, on by default as on macOS: a display
  * that takes audio, over HDMI or DisplayPort (USB-C alt mode included),
@@ -6870,6 +6878,7 @@ static void dcp_drain_for_sleep(struct apple_dcp *dcp)
 		dcp_backlight_finish_fade(dcp);
 	for (pass = 0; pass < 4; pass++) {
 		flush_delayed_work(&dcp->iomfb.backlight_retry);
+		cancel_delayed_work_sync(&dcp->iomfb.keepalive);
 		if (dcp_has_panel(dcp))
 			flush_work(&dcp->bl_update_wq);
 		if (!iomfb_queue_drain(dcp, msecs_to_jiffies(500))) {

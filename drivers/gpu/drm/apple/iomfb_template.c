@@ -3200,6 +3200,24 @@ static u64 __maybe_unused dcp_swap_prev_time(u64 now, u64 prev)
 }
 
 /*
+ * Sets swap timestamps 1, 2 and 7 (swap_ts_mode, dcp-swap-pace.h). A present
+ * built earlier has stale ones, so the keepalive present sets them again.
+ */
+static void __maybe_unused dcp_swap_stamp(struct apple_dcp *dcp,
+					  typeof(DCP_FW_SWAP(dcp)) *req)
+{
+	u64 now = dcp_swap_time();
+	u64 prev = dcp_swap_prev_time(now, dcp->swap_submit_timestamp);
+	struct dcp_swap_ts ts = dcp_swap_ts_pick(READ_ONCE(dcp_swap_ts_mode), now, prev,
+						 DCP_V27_TIMEBASE_HZ / 120);
+
+	req->swap.timestamp[0] = ts.ts0;
+	req->swap.timestamp[1] = ts.ts1;
+	req->swap.timestamp[6] = ts.ts6;
+	trace_iomfb_vrr_timestamps(dcp, dcp->vrr_enabled, ts.ts0, ts.ts1);
+}
+
+/*
  * Callback for swap requests. If a swap failed, we'll never get a swap
  * complete event so we need to fake a vblank event early to avoid a hang.
  */
@@ -3508,6 +3526,16 @@ static bool dcp_gamma_update(struct apple_dcp *dcp, struct drm_crtc_state *crtc_
 #if DCP_FW_H17(DCP_FW_VER)
 void iomfb_present_backlight_h17p(struct apple_dcp *dcp)
 {
+	do_swap(dcp, NULL, NULL);
+}
+#endif
+
+#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
+/* Presents the request in DCP_FW_SWAP again, with fresh timestamps. */
+void iomfb_present_keepalive_h17p(struct apple_dcp *dcp)
+{
+	if (dcp->use_timestamps || dcp->vrr_enabled)
+		dcp_swap_stamp(dcp, &DCP_FW_SWAP(dcp));
 	do_swap(dcp, NULL, NULL);
 }
 #endif
@@ -4250,23 +4278,14 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	}
 #else
 	if (has_surface && (dcp->use_timestamps || dcp->vrr_enabled)) {
-		u64 timestamp = dcp_swap_time();
-		u64 submit_timestamp =
-			dcp_swap_prev_time(timestamp, dcp->swap_submit_timestamp);
-
 		/*
 		 * The firmware takes continuous-time values here, in its own
-		 * timebase (see dcp_swap_time()). Empirical
-		 * testing shows that using the current submission time together
-		 * with the previous accepted swap makes DCP follow swap pacing.
+		 * timebase (see dcp_swap_time()). Empirical testing shows that
+		 * using the current submission time together with the previous
+		 * accepted swap makes DCP follow swap pacing. Firmware 12.x and
+		 * 13.x require timestamp types 1, 2 and 7.
 		 */
-		/* Firmware 12.x/13.x requires timestamp types 1, 2, and 7. */
-		req->swap.timestamp[0] = timestamp;
-		req->swap.timestamp[1] = submit_timestamp;
-		req->swap.timestamp[6] = timestamp;
-
-		trace_iomfb_vrr_timestamps(dcp, dcp->vrr_enabled, timestamp,
-					   submit_timestamp);
+		dcp_swap_stamp(dcp, req);
 	}
 #endif
 
