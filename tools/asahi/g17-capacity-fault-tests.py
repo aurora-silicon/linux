@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
-"""Exercise production compute close/retirement/recycle methods with fake MMIO.
+"""Exercise production compute close/retirement/recycle/rebind methods with fake MMIO.
 
 No firmware behavior is inferred from these controls. The actual cursor/stamp
 predicate is compiled too; allocation and asynchronous notification are stubs.
@@ -28,12 +28,15 @@ def fixture():
     source = (ROOT / 'queue/compute.rs').read_text()
     retirement = (ROOT / 'queue/compute/retirement.rs').read_text()
     previous = item(source, 'struct Previous<') + '\n' + item(source, 'impl<B, C> Previous<B, C>')
+    previous += '\n' + item(source, 'struct Superseded<').replace('crate::g17::context::FirmwarePages', 'Pages')
+    previous += '\n' + item(source, 'impl<P> Superseded<P>')
     methods = '\n'.join(item(source, sig) for sig in [
-        'fn witness_stamp(', 'pub(crate) fn release_owner(', 'pub(crate) fn reusable(',
+        'fn witness_stamp(', 'fn supersede_retained(', 'pub(crate) fn release_owner(', 'pub(crate) fn reusable(',
         'pub(crate) fn recycle_quarantined_idle(', 'pub(crate) fn recycle_killed(',
         'fn recycle_settled(', 'fn release_witnessed_inner(', 'pub(crate) fn share_idle(', 'pub(crate) fn shareable(', 'pub(crate) fn can_rearm(', 'pub(crate) fn recycled_pending('])
     exit_source = (ROOT / 'queue/compute/exit.rs').read_text()
     methods += '\n' + (item(exit_source, 'pub(crate) fn settle_exit(').replace('super::Previous', 'Previous')
+                        .replace('super::Superseded', 'Superseded')
                         .replace('crate::g17::qos::Owner', 'qos::Owner').replace('super::retirement::', 'retirement::'))
     drain = item((ROOT / 'mod.rs').read_text(), 'fn drain_reclaims(')
     proof = item(retirement, 'pub(crate) const fn stamp_newer(') + '\n' + item(retirement, 'pub(crate) const fn stamp_covers(') + '\n' + item(retirement, 'pub(crate) fn quarantined_retired(')
@@ -52,10 +55,15 @@ const EINVAL: Error = -22;
 const ENODATA: Error = -61;
 const ECANCELED: Error = -125;
 fn now_ns() -> u64 { 123 }
+/// Firmware pages an installed queue keeps for an exited owner, counted while retained.
+static PAGES: AtomicUsize = AtomicUsize::new(0);
+struct Pages;
+impl Pages { fn new() -> Self { PAGES.fetch_add(1, Ordering::SeqCst); Self } }
+impl Drop for Pages { fn drop(&mut self) { PAGES.fetch_sub(1, Ordering::SeqCst); } }
 struct Context { id: u64, live: Arc<AtomicUsize>, killed: AtomicU32 }
 impl Context {
     fn note_compute_binding(&self, _: bool) {}
-    fn retain_firmware_pages(&self) {}
+    fn retain_firmware_pages(&self) -> Pages { Pages::new() }
     fn new(id: u64, live: &Arc<AtomicUsize>) -> Arc<Self> {
         live.fetch_add(1, Ordering::SeqCst);
         Arc::new(Self { id, live: live.clone(), killed: AtomicU32::new(1) })
@@ -118,7 +126,7 @@ struct Queue {
     retire_pending: bool, retirement_proved: bool, replay_retirement: bool,
     replay_error: Option<Error>, replay_prepared: bool, submitted: u32, kick: Kick,
     config_cache: Option<()>, source_hint: ReaderHint, source_readers: AtomicU32, claims: u32, fault_stamp: Option<u32>,
-    configuration: Option<()>, retained_owner: Option<()>, timed_out_at: u64,
+    configuration: Option<()>, retained_owner: Option<Pages>, superseded: Option<Superseded>, timed_out_at: u64,
     m5_install: Option<()>, published_config: Option<()>, outer_started: u32, ordinal: u64,
     channel_error: bool,
 }
@@ -141,7 +149,7 @@ fn idle(live: &Arc<AtomicUsize>) -> Queue {
         retire_pending: false, retirement_proved: false, replay_retirement: false,
         replay_error: None, replay_prepared: false, submitted: 0, kick: Kick,
         fault_stamp: None, config_cache: None, source_hint: ReaderHint { possible: false }, source_readers: AtomicU32::new(0), claims: 0,
-        configuration: None, retained_owner: None, timed_out_at: 0,
+        configuration: None, retained_owner: None, superseded: None, timed_out_at: 0,
         m5_install: None, published_config: None, outer_started: 0, ordinal: 0,
     }
 }
@@ -279,6 +287,41 @@ fn main() {
     assert!(queue.reusable());
     drop(queue);
     assert_eq!(live.load(Ordering::SeqCst), 0);
+    assert_eq!(PAGES.load(Ordering::SeqCst), 0);
+    // A detached queue's next owner: the firmware's configuration names the exited owner
+    // until a publication made after the rebind is witnessed, by the drain or by a kill.
+    for kill in [false, true] {
+        for published in [false, true] {
+            let mut queue = fault(&live);
+            queue.retained_owner = Some(Pages::new());
+            queue.supersede_retained();
+            assert!(queue.retained_owner.is_none() && queue.superseded.is_some());
+            assert_eq!(PAGES.load(Ordering::SeqCst), 1);
+            queue.superseded.as_mut().unwrap().published = published;
+            queue.release_owner().unwrap();
+            if kill {
+                queue.exit = Some(Exit { phase: Phase::Acknowledged });
+                queue.settle_exit(true, &mut |_| Ok(()), &mut |_| Ok(())).unwrap();
+            } else {
+                queue.release_witnessed_inner(0, false, |_| Ok(()), &mut |_| Ok(())).unwrap();
+            }
+            assert!(queue.previous.is_none());
+            assert_eq!(queue.superseded.is_some(), !published, "kill {kill} published {published}");
+            assert_eq!(PAGES.load(Ordering::SeqCst), usize::from(!published));
+            drop(queue);
+            assert_eq!(PAGES.load(Ordering::SeqCst), 0);
+        }
+    }
+    // An older configuration still waiting keeps its place; the pages retained since go.
+    let mut queue = idle(&live);
+    queue.retained_owner = Some(Pages::new());
+    queue.supersede_retained();
+    queue.retained_owner = Some(Pages::new());
+    queue.supersede_retained();
+    assert!(queue.retained_owner.is_none() && queue.superseded.is_some());
+    assert_eq!(PAGES.load(Ordering::SeqCst), 1);
+    drop(queue);
+    assert_eq!(PAGES.load(Ordering::SeqCst), 0);
     println!("PASS 512 fault/close and 512 acknowledged-kill cycles: baseline resources restored; stale stamp, cursor, recovery and collector controls preserve ownership; unpublished rollback preserved");
 }
 '''
@@ -302,6 +345,8 @@ def main():
                 ('missing-fault-release', source.replace(fault_fix, '', 1), False),
                 ('missing-kill-release', source.replace('Previous::retire_witnessed(&mut self.previous);\n        self.exit', 'self.exit'), False),
                 ('missing-reclaim-wake', source.replace('self.queue_events();', ''), False),
+                ('superseded-dropped-at-rebind', mutate(r'self\.superseded = Some\(Superseded \{ _pages: pages, published: false \}\);', 'drop(pages);'), False),
+                ('superseded-retired-unpublished', mutate(r'superseded\.as_ref\(\)\.is_some_and\(\|s\| s\.published\)', 'superseded.is_some()'), False),
                 ('share-before-retirement', mutate(r'(&&\s*self\.owner\.is_some\(\))\s*&&\s*self\.retirement_ready', r'\1'), False),
                 ('share-during-kill', mutate(r'&&\s*self\.exit\.is_none\(\)\s*(?=&&\s*self\.active\.len)', ''), False)]
     with tempfile.TemporaryDirectory(prefix='g17-capacity-') as tmp:
