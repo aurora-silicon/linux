@@ -1549,6 +1549,13 @@ static void macsmc_hwmon_populate_fan_configs(u32 *configs, const struct macsmc_
  */
 #if IS_ENABLED(CONFIG_THERMAL)
 #define MACSMC_SOC_DIE_ZONE	"macsmc_soc_die"
+/*
+ * The thermal sensor ID of the SoC die zone for a device tree thermal zone, on
+ * a node that discovers its temperatures and is a thermal sensor provider. It
+ * must stay above every temperature channel index the hwmon core registers;
+ * discovered channels are not bounded at build time, so probe checks it.
+ */
+#define MACSMC_SOC_DIE_SENSOR_ID	1000
 
 static int macsmc_hwmon_die_hottest(struct macsmc_hwmon *hwmon, int *temp)
 {
@@ -1616,6 +1623,27 @@ static int macsmc_hwmon_die_register(struct macsmc_hwmon *hwmon)
 		if (hwmon->temp.sensors[i].die)
 			len += scnprintf(keys + len, sizeof(keys) - len, " %c%c%c%c",
 					 key >> 24, (key >> 16) & 0xff, (key >> 8) & 0xff, key & 0xff);
+	}
+
+	/*
+	 * A board with a device tree zone on the die sensor gets that zone, with its trips and
+	 * cooling maps. Its lifetime is managed by the OF helper. The named zone below
+	 * is registered either way: the GPU drivers' governors look it up by its name.
+	 */
+	if (of_property_present(hwmon->dev->of_node, "#thermal-sensor-cells") &&
+	    hwmon->temp.count >= MACSMC_SOC_DIE_SENSOR_ID) {
+		dev_warn(hwmon->dev, "%u temperature channels reach the SoC die sensor ID %u\n",
+			 hwmon->temp.count, MACSMC_SOC_DIE_SENSOR_ID);
+	} else if (of_property_present(hwmon->dev->of_node, "#thermal-sensor-cells")) {
+		tz = devm_thermal_of_zone_register(hwmon->dev, MACSMC_SOC_DIE_SENSOR_ID, hwmon,
+						   &macsmc_hwmon_die_ops);
+		if (!IS_ERR(tz))
+			dev_info(hwmon->dev, "SoC die zone %s (device tree): hottest of%s (%u of %u keys)\n",
+				 thermal_zone_device_type(tz), keys, hwmon->die_count,
+				 hwmon->die_listed);
+		else if (PTR_ERR(tz) != -ENODEV)
+			dev_warn(hwmon->dev,
+				 "cannot register the device tree SoC die zone (%pe)\n", tz);
 	}
 
 	if (hwmon->fan_assist_valid) {
