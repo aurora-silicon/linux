@@ -56,6 +56,7 @@ def mutations(flag, names, base, expect=KILL):
 ASAHI_TESTS = {
     'm3-stamp-admission-tests.py': [(out(), PASS),
                                      (out() + ['--mutation', 'live-reseed'], KILL)],
+    'hardware-defaults-tests.py': [([], PASS)],
     'j613-mtp-s2idle-tests.py': [([], PASS)],
     # 11eccbedc3ed writes frames without a transport-wide lock.
     'mtp-tx-frame-tests.py': [(out(), PASS),
