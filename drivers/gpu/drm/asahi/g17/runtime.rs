@@ -32,6 +32,30 @@ use kernel::{prelude::*, sync::Arc};
 const QIDS: usize = 128;
 const FIRST_COMPUTE_QID: u8 = 4;
 const WORK_RING_WAIT_NS: u64 = super::job::TIMEOUT_MS as u64 * 1_000_000;
+/// How long a queue creator waits for an application context it may take.
+const RETAINED_CONTEXT_WAIT_NS: u64 = 4 * WORK_RING_WAIT_NS;
+/// A waiting context becomes ready without a notification (see [`context_wait_ms`]).
+const WAITING_CONTEXT_POLL_MS: u32 = 10;
+
+/// How long a queue creator that found no application context to take blocks before it
+/// looks again, `waited_ns` after it started; `None` refuses the queue.
+///
+/// Without a free context the creator waits for the `closing` queues, whose contexts return
+/// with a notification. A free context that is still named by a queue record, or whose fence
+/// the firmware has not passed, is never taken (`mmu::ContextHold`): it becomes ready when
+/// the record is replaced and the firmware consumes its next control record, neither of
+/// which notifies, so the creator polls.
+fn context_wait_ms(room: crate::mmu::ContextRoom, closing: u32, waited_ns: u64) -> Option<u32> {
+    if waited_ns >= RETAINED_CONTEXT_WAIT_NS {
+        return None;
+    }
+    let left = (RETAINED_CONTEXT_WAIT_NS - waited_ns).div_ceil(1_000_000) as u32;
+    match room {
+        crate::mmu::ContextRoom::Waiting => Some(left.min(WAITING_CONTEXT_POLL_MS)),
+        _ if closing != 0 => Some(left),
+        _ => None,
+    }
+}
 
 /// Pending admission keeps exactly retired compute backing available for reuse.
 /// The guard spans retries and disappears on publication, cancellation or error.
@@ -766,12 +790,14 @@ impl Backend {
         policy: super::fw::queue::Policy,
     ) -> Result<(Arc<Self>, admission::QueueSlot)> {
         // A closed queue keeps its application context until its scheduler
-        // release is consumed and the context is returned. When only such
-        // contexts block this one, wait (bounded) for the teardown instead of
-        // failing a live client; the preparation lease is not held while
-        // sleeping, and nothing of the new queue is visible yet.
-        const RETAINED_CONTEXT_WAIT_NS: u64 = 4 * WORK_RING_WAIT_NS;
+        // release is consumed and the context is returned, and a returned
+        // context is not taken while a queue record still names it or the
+        // firmware has not passed its fence. When only such contexts block
+        // this one, wait (bounded) instead of failing a live client; the
+        // preparation lease is not held while sleeping, and nothing of the
+        // new queue is visible yet.
         let started = now_ns();
+        let mut counted = false;
         let (lease, uat, pool, qos, execution, slot) = loop {
             let observed = shared.queues.observe();
             let lease = shared.preparations.enter(true)?;
@@ -795,11 +821,19 @@ impl Backend {
             }
             // The new context may reuse a pooled scheduler page: clear released QoS rows first.
             firmware.queues.qos_ids.forget_released(|ids| firmware.port.qos_forget(ids));
-            let attempt = if firmware.uat.execution_contexts_used() < crate::mmu::MAX_EXECUTION_CONTEXTS {
-                // Creators hold the device mutex, so neither check above can
-                // have changed; the slot only fails on a broken invariant.
+            // The firmware consumes control records without an event: sample how far it
+            // got, which is what the fences of returned contexts wait for.
+            fence(Ordering::Acquire);
+            let consumer = firmware.init.control_consumer()?.load(Ordering::Relaxed);
+            let producer = firmware.init.control_producer()?.load(Ordering::Relaxed);
+            super::channel::observe_control(consumer, producer);
+            let witnessed = super::channel::control_witnessed();
+            let room = firmware.uat.execution_context_room(witnessed);
+            let attempt = if matches!(room, crate::mmu::ContextRoom::Ready(_)) {
+                // Creators hold the device mutex, so no check above can have
+                // changed; the slot only fails on a broken invariant.
                 let slot = admission.reserve_queue()?;
-                firmware.uat.new_execution_context(vm, super::channel::control_witnessed()).map(|execution| (execution, slot))
+                firmware.uat.new_execution_context(vm, witnessed).map(|execution| (execution, slot))
             } else {
                 Err(ENOSPC)
             };
@@ -819,8 +853,13 @@ impl Backend {
                     // slot or context any more.
                     let open = firmware.queues.admission.queues();
                     let closing = firmware.uat.execution_contexts_used().saturating_sub(open);
-                    if closing == 0 || now_ns().saturating_sub(started) >= RETAINED_CONTEXT_WAIT_NS {
+                    let waited = now_ns().saturating_sub(started);
+                    let Some(wait_ms) = context_wait_ms(room, closing, waited) else {
                         return Err(super::capacity::refused(super::capacity::Site::ExecutionContexts));
+                    };
+                    if room == crate::mmu::ContextRoom::Waiting && !counted {
+                        counted = true;
+                        firmware.uat.note_execution_context_wait();
                     }
                     drop(state);
                     drop(lease);
@@ -828,11 +867,12 @@ impl Backend {
                     if kernel::current!().signal_pending() {
                         return Err(ERESTARTSYS);
                     }
+                    // The pass detaches exited owners from idle queues and
+                    // publishes what the firmware has yet to consume.
                     shared.queue_events();
                     // A closing queue returns its context when its release
                     // is reclaimed; that reclaim wakes this creator.
-                    let left = RETAINED_CONTEXT_WAIT_NS.saturating_sub(now_ns().saturating_sub(started));
-                    shared.queues.block(observed, left.div_ceil(1_000_000) as u32, true)?;
+                    shared.queues.block(observed, wait_ms, true)?;
                 }
                 Err(error) => return Err(error),
             }

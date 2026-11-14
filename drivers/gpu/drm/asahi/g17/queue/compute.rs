@@ -547,6 +547,27 @@ impl<B, C> Previous<B, C> {
     }
 }
 
+/// Pages of an exited owner whose context the firmware's configuration of this queue still
+/// names. The queue record was rewritten for a newer owner, but a queue's context, scheduler
+/// page and QoS ID also reach the firmware in the configuration a publication carries, and
+/// the last one it ran names the old owner until it has run a publication made after the
+/// rewrite. Until then the pages stay mapped and out of reuse, and keep their hold on the
+/// context, which is not handed to another queue.
+struct Superseded<P = crate::g17::context::FirmwarePages> {
+    _pages: P,
+    /// A publication of the newer owner went out since the rewrite.
+    published: bool,
+}
+impl<P> Superseded<P> {
+    /// The witness that retires a [`Previous`] covers the newer configuration too. Without a
+    /// publication since the rewrite the firmware still has the old one.
+    fn retire_witnessed(superseded: &mut Option<Self>) {
+        if superseded.as_ref().is_some_and(|s| s.published) {
+            drop(superseded.take());
+        }
+    }
+}
+
 /// Per-queue addresses of the bound owner, read under the publication preflight.
 struct BindingAddresses {
     preempt: u64,
@@ -620,6 +641,8 @@ pub(crate) struct Queue {
     /// Scheduler/work pages of an exited last owner whose context was dropped;
     /// the installed queue record still names them until the next owner binds.
     retained_owner: Option<crate::g17::context::FirmwarePages>,
+    /// The exited owner the firmware's configuration still names after a newer owner bound.
+    superseded: Option<Superseded>,
     pool_phase: PoolPhase,
     release_sent_ns: Option<u64>,
     growing: bool,
@@ -720,6 +743,7 @@ impl Queue {
         Ok(Self {
             owner: Some(owner),
             retained_owner: None,
+            superseded: None,
             pool_phase: PoolPhase::Populated,
             release_sent_ns: None,
             growing: false,
@@ -1220,6 +1244,7 @@ impl Queue {
                     self.submitted = self.submitted.checked_sub(1).ok_or(EIO)?;
                     self.active.pop().ok_or(EIO)?;
                     drop(self.previous.take());
+                    Superseded::retire_witnessed(&mut self.superseded);
                     self.retirement_ready = self.active.len == 0;
                     if self.released && self.retirement_ready {
                         self.owner = None;
@@ -1274,6 +1299,7 @@ impl Queue {
                         self.last_end = self.last_end.max(timestamps[1]);
                     }
                     drop(self.previous.take());
+                    Superseded::retire_witnessed(&mut self.superseded);
                     self.retirement_ready = self.active.len == 0;
                     if self.released && self.retirement_ready {
                         self.owner = None;
@@ -1435,6 +1461,7 @@ impl Queue {
         // Keeping its predecessor only on the fault path prevents recycling
         // forever: neither another retirement nor an exit kill can release it.
         Previous::retire_witnessed(&mut self.previous);
+        Superseded::retire_witnessed(&mut self.superseded);
         if self.spared_quarantine {
             self.spared_quarantine = false;
             self.quarantine_error = None;
@@ -1881,7 +1908,7 @@ impl Queue {
                 publication: None,
                 moved: true,
             });
-            self.retained_owner = None;
+            self.supersede_retained();
         }
         context.mark_published();
         context.note_compute_binding(true);
@@ -1898,6 +1925,17 @@ impl Queue {
         self.retirement_ready = false;
         self.retired_by_teardown = false;
         Ok(())
+    }
+    /// The record now names a new owner, but the firmware's configuration of this queue names
+    /// the retained owner's context until the new owner's first publication has run
+    /// ([`Superseded`]). An older configuration still waiting for that keeps its place: pages
+    /// retained since belong to an owner that never published here.
+    fn supersede_retained(&mut self) {
+        if let Some(pages) = self.retained_owner.take() {
+            if self.superseded.is_none() {
+                self.superseded = Some(Superseded { _pages: pages, published: false });
+            }
+        }
     }
     /// True allows the registry to cancel the never-published QID and drop this graph. An
     /// installed graph remains retained even after the logical owner exits without work.
@@ -3012,6 +3050,9 @@ impl Queue {
                     previous.publication = Some((packet.order.sequence, epoch));
                 }
             }
+            if let Some(superseded) = self.superseded.as_mut() {
+                superseded.published = true;
+            }
             // Every publication rings its own pipe and priority class, as render
             // publication does: pipe 2 (compute) in bits 1:0, priority class in
             // bits 3:2. The generic work doorbell left the firmware to find the
@@ -3217,10 +3258,11 @@ impl Queue {
 
 impl Queue {
     pub(crate) fn write_capacity(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
-        write!(f, "compute_queue qid={} owned={} released={} reusable={} quarantined={} awaiting_witness={} previous={} exit={} growing={} pool={:?} active={} total={} ",
+        write!(f, "compute_queue qid={} owned={} released={} reusable={} quarantined={} awaiting_witness={} previous={} exit={} growing={} pool={:?} active={} total={} retained={} superseded={} ",
                self.qid(), u8::from(self.owner.is_some()), u8::from(self.released), u8::from(self.reusable()),
                u8::from(self.quarantined), u8::from(self.awaiting_witness), u8::from(self.previous.is_some()),
-               u8::from(self.exit.is_some()), u8::from(self.growing), self.pool_phase, self.active.len, IN_FLIGHT)?;
+               u8::from(self.exit.is_some()), u8::from(self.growing), self.pool_phase, self.active.len, IN_FLIGHT,
+               u8::from(self.retained_owner.is_some()), u8::from(self.superseded.is_some()))?;
         match self.graph.cursors() {
             Ok(cursors) if cursors.count != 0 => writeln!(
                 f,
@@ -3302,6 +3344,20 @@ mod fault_ownership_tests {
     #[test]
     fn unpublished_replacements_survive_until_rollback() {
         faulting_clients(None);
+    }
+
+    #[test]
+    fn superseded_pages_wait_for_a_publication_after_the_rebind() {
+        let used = Arc::new(AtomicUsize::new(0), GFP_KERNEL).unwrap();
+        let mut superseded = Some(Superseded { _pages: Lease::new(&used), published: false });
+        // A witness without a publication since the rebind: the firmware still has the
+        // old configuration.
+        Superseded::retire_witnessed(&mut superseded);
+        assert_eq!(used.load(Ordering::Relaxed), 1);
+        superseded.as_mut().unwrap().published = true;
+        Superseded::retire_witnessed(&mut superseded);
+        assert!(superseded.is_none());
+        assert_eq!(used.load(Ordering::Relaxed), 0);
     }
 
     #[test]

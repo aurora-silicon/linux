@@ -160,6 +160,9 @@ ASAHI_TESTS = {
     'g17-capacity-backoff-tests.py': [([], PASS)],
     'g17-capacity-fault-tests.py': [([], PASS)],
     'g17-compute-constructor-tests.py': [([], PASS)],
+    # The mutations hand out a context a queue record still names, and wait without a bound.
+    'g17-context-reuse-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('take-waiting', 'ignore-holds', 'wait-past-deadline'), out()),
     'g17-compute-deadline-tests.py': [([], PASS)],
     'g17-compute-growth-deadline-tests.py': [([], PASS)],
     'g17-firmware-selection-tests.py': [([], PASS)],
