@@ -63,14 +63,17 @@
 		interrupt-parent = <&pinctrl_ap>;
 		interrupts = <173 IRQ_TYPE_LEVEL_LOW>;
 		#sound-dai-cells = <0>;
-		cirrus,ts-inv = <1>;
 		sound-name-prefix = "Jack";
 	};
 };
 
 / {
 	sound: sound {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
 		dai-link@1 {
+			reg = <1>;
 			link-name = "Headphone Jack";
 
 			cpu {
