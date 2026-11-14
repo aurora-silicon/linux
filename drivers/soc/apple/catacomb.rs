@@ -9,13 +9,43 @@
 use crate::shim;
 use crate::store::crc16_ccitt_false;
 use kernel::prelude::*;
+use kernel::str::CString;
 
 const MAGIC: [u8; 8] = *b"SEPCTMB1";
 /// magic(8) + len(4, LE) + crc(2, LE) + pad(2)
 const HEADER: usize = 16;
 const MAX_CATACOMB: usize = 1 << 20;
 
-fn path_for(kind: u8) -> Option<&'static CStr> {
+/// Where a catacomb lives: one of the fixed machine components, or the
+/// biometric user of a Unix user's own key bag (`userbag`), one file per uid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Slot {
+    Kind(u8),
+    BagUser(u32),
+}
+
+impl From<u8> for Slot {
+    fn from(kind: u8) -> Self {
+        Slot::Kind(kind)
+    }
+}
+
+enum Path {
+    Fixed(&'static CStr),
+    Owned(CString),
+}
+
+impl core::ops::Deref for Path {
+    type Target = CStr;
+    fn deref(&self) -> &CStr {
+        match self {
+            Path::Fixed(p) => p,
+            Path::Owned(p) => p,
+        }
+    }
+}
+
+fn fixed_path(kind: u8) -> Option<&'static CStr> {
     Some(match kind {
         crate::PRIVATE_TYPE_CATACOMB_MASTER => c"/var/lib/apple-sep-catacomb-master.bin",
         crate::PRIVATE_TYPE_CATACOMB_OWNER => c"/var/lib/apple-sep-catacomb-owner.bin",
@@ -24,13 +54,22 @@ fn path_for(kind: u8) -> Option<&'static CStr> {
     })
 }
 
-pub(crate) fn is_kind(kind: u8) -> bool {
-    path_for(kind).is_some()
+fn path_for(slot: impl Into<Slot>) -> Option<Path> {
+    match slot.into() {
+        Slot::Kind(kind) => fixed_path(kind).map(Path::Fixed),
+        Slot::BagUser(uid) => CString::try_from_fmt(fmt!("/var/lib/apple-sep-catacomb-bag-{}.bin", uid))
+            .ok()
+            .map(Path::Owned),
+    }
 }
 
-pub(crate) fn writable(kind: u8) -> bool {
-    path_for(kind)
-        .and_then(|path| shim::StoreFile::open_writable_existing(path).ok())
+pub(crate) fn is_kind(slot: impl Into<Slot>) -> bool {
+    path_for(slot).is_some()
+}
+
+pub(crate) fn writable(slot: impl Into<Slot>) -> bool {
+    path_for(slot)
+        .and_then(|path| shim::StoreFile::open_writable_existing(&path).ok())
         .is_some()
 }
 
@@ -38,7 +77,7 @@ pub(crate) fn writable(kind: u8) -> bool {
 /// A corrupt existing file is never truncated here: it is failure evidence.
 pub(crate) fn prepare_missing_owner() -> Result<()> {
     let path = path_for(crate::PRIVATE_TYPE_CATACOMB_OWNER).ok_or(EINVAL)?;
-    let (file, created) = shim::StoreFile::open_host(path)?;
+    let (file, created) = shim::StoreFile::open_host(&path)?;
     if !created {
         return Err(ENODATA);
     }
@@ -46,8 +85,8 @@ pub(crate) fn prepare_missing_owner() -> Result<()> {
     file.sync_parent()
 }
 
-pub(crate) fn write(kind: u8, blob: &[u8]) -> Result<()> {
-    let path = path_for(kind).ok_or(EINVAL)?;
+pub(crate) fn write(slot: impl Into<Slot>, blob: &[u8]) -> Result<()> {
+    let path = path_for(slot).ok_or(EINVAL)?;
     if blob.len() > MAX_CATACOMB {
         return Err(ENOSPC);
     }
@@ -56,7 +95,7 @@ pub(crate) fn write(kind: u8, blob: &[u8]) -> Result<()> {
     head[8..12].copy_from_slice(&(blob.len() as u32).to_le_bytes());
     head[12..14].copy_from_slice(&crc16_ccitt_false(blob).to_le_bytes());
 
-    let file = shim::StoreFile::open_trunc(path)?;
+    let file = shim::StoreFile::open_trunc(&path)?;
     file.write_all(0, &head)?;
     if !blob.is_empty() {
         file.write_all(HEADER as u64, blob)?;
@@ -67,9 +106,9 @@ pub(crate) fn write(kind: u8, blob: &[u8]) -> Result<()> {
 /// `Ok(None)` only when the file is missing. A file that exists but cannot be
 /// read or fails validation is an error: "cannot tell" must never read as
 /// "nothing saved", or a caller may select a fresh context over a saved one.
-pub(crate) fn read(kind: u8) -> Result<Option<KVec<u8>>> {
-    let path = path_for(kind).ok_or(EINVAL)?;
-    let file = match shim::StoreFile::open_readonly(path) {
+pub(crate) fn read(slot: impl Into<Slot>) -> Result<Option<KVec<u8>>> {
+    let path = path_for(slot).ok_or(EINVAL)?;
+    let file = match shim::StoreFile::open_readonly(&path) {
         Ok(file) => file,
         Err(e) if e == ENOENT => return Ok(None),
         Err(e) => return Err(e),
@@ -98,11 +137,11 @@ pub(crate) fn read(kind: u8) -> Result<Option<KVec<u8>>> {
 }
 
 /// True only for a present, valid file.
-pub(crate) fn is_saved(kind: u8) -> bool {
-    matches!(read(kind), Ok(Some(_)))
+pub(crate) fn is_saved(slot: impl Into<Slot>) -> bool {
+    matches!(read(slot), Ok(Some(_)))
 }
 
 /// True only when the file is provably missing.
-pub(crate) fn is_absent(kind: u8) -> bool {
-    matches!(read(kind), Ok(None))
+pub(crate) fn is_absent(slot: impl Into<Slot>) -> bool {
+    matches!(read(slot), Ok(None))
 }

@@ -911,6 +911,23 @@ pub(crate) enum TouchOp {
 /// operation with. Only an outright refusal by the enclave (`EKEYREJECTED`:
 /// it performed nothing) hands the grant back, once, for the one retry
 /// the verify makes after it completes the evaluation.
+/// Routes Touch ID to a bag user while a touch-gated call waits; the
+/// configured user again when it ends, on every path.
+struct SubjectScope<'a>(&'a SepData);
+
+impl<'a> SubjectScope<'a> {
+    fn new(sep: &'a SepData, subject: crate::BioSubject) -> Self {
+        *sep.bio_subject.lock() = Some(subject);
+        SubjectScope(sep)
+    }
+}
+
+impl Drop for SubjectScope<'_> {
+    fn drop(&mut self) {
+        *self.0.bio_subject.lock() = None;
+    }
+}
+
 pub(crate) struct KeyGrant {
     op: TouchOp,
     /// The user bag the record lives under (`HANDLE_USER_BAG`), if any.
@@ -1605,6 +1622,15 @@ impl SepData {
         // with each other, and with every other touch-gated call: one job,
         // one grant, one context at a time.
         let _writer = self.catacomb_writer.lock();
+        // A key under a user's bag is matched in that user's domain, and
+        // only after its password unlocked the bag (13.5 store).
+        let _subject = match job.grant.as_ref().and_then(|g| g.bag()) {
+            Some(uid) => match self.userbag_touch_subject(uid)? {
+                Some(subject) => Some(SubjectScope::new(self, subject)),
+                None => None,
+            },
+            None => None,
+        };
         *self.key_touch.lock() = Some(job);
         self.key_touch_cancel.store(false, Relaxed);
         self.key_touch_active.store(true, Relaxed);
@@ -1703,7 +1729,7 @@ impl SepData {
     /// A fresh tracked context for `uid`; with `secret`, a passcode
     /// credential from `bag`'s verify-secret is added. Returns the context
     /// and the verify status (0 when none was asked).
-    fn key_context_for(
+    pub(crate) fn key_context_for(
         &self,
         uid: i32,
         cred: Option<(crate::sks::SpecialHandle, &[u8])>,

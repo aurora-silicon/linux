@@ -294,6 +294,17 @@ enum LockState {
     Unlocked,
 }
 
+/// A Unix user's own biometric user: the designation of its key bag
+/// (`userbag::bag_designation`) and the uid whose catacomb file it uses.
+/// A Touch ID match for one of that bag's keys runs in this user's domain,
+/// as macOS matches against the logged-in user's catacomb: a match against
+/// another user's templates does not satisfy the key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BioSubject {
+    pub(crate) user: i32,
+    pub(crate) uid: u32,
+}
+
 impl LockState {
     const fn wire(self) -> i32 {
         match self {
@@ -742,6 +753,11 @@ struct SepData {
     // logout (see `userbag::LoadedBags`).
     #[pin]
     user_bags: Mutex<userbag::LoadedBags>,
+
+    // The biometric user a match addresses while a touch-gated call on a
+    // user-bag key waits (see `BioSubject`); none means the configured user.
+    #[pin]
+    bio_subject: Mutex<Option<BioSubject>>,
 
     // The sensor stayed powered and registered after the last verify, so the
     // next verify captures without a new bring-up, as macOS does. Cleared by
@@ -1223,6 +1239,7 @@ impl SepData {
                 match_context_generation: Atomic::new(0),
                 cold_match_contexts <- new_mutex!(KVec::new()),
                 user_bags <- new_mutex!(userbag::LoadedBags::new()),
+                bio_subject <- new_mutex!(None),
                 sensor_kept: Atomic::new(false),
                 sensor_reset_in_capture: Atomic::new(false),
                 bg_ops_ready: Atomic::new(false),

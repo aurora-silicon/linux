@@ -1021,7 +1021,37 @@ impl SepData {
         new_identity
     }
 
+    /// The biometric user the current match or enrolment addresses.
+    pub(crate) fn bio_user(&self) -> i32 {
+        self.bio_subject.lock().map_or(SBIO_PROBE_USER_ID, |s| s.user)
+    }
+
+    /// Where that user's catacomb is kept.
+    fn bio_user_slot(&self) -> crate::catacomb::Slot {
+        match *self.bio_subject.lock() {
+            Some(s) => crate::catacomb::Slot::BagUser(s.uid),
+            None => crate::catacomb::Slot::Kind(PRIVATE_TYPE_CATACOMB_USER),
+        }
+    }
+
+    /// A matched identity belongs to the user the match addressed: one of
+    /// the configured user's indexed templates, or one the enclave lists for
+    /// the bag user.
+    fn bio_identity_known(&self, identity: &[u8; bio::UUID_LEN]) -> bool {
+        let subject = *self.bio_subject.lock();
+        match subject {
+            None => self.bio_index.lock().contains_uuid(identity),
+            Some(s) => self
+                .enclave_identities_for(s.user)
+                .is_some_and(|ids| ids.iter().any(|id| id == identity)),
+        }
+    }
+
     fn reconcile_identities(&self) {
+        // The configured user's index; a bag user's identities are not in it.
+        if self.bio_subject.lock().is_some() {
+            return;
+        }
         let Some(listed) = self.enclave_identities_for(SBIO_PROBE_USER_ID) else {
             return;
         };
@@ -1060,7 +1090,7 @@ impl SepData {
         }
     }
 
-    fn enclave_identities_for(&self, user_id: i32) -> Option<KVec<[u8; bio::UUID_LEN]>> {
+    pub(crate) fn enclave_identities_for(&self, user_id: i32) -> Option<KVec<[u8; bio::UUID_LEN]>> {
         let op = crate::sbio::sbio_list_identities();
         let SbioOutcome::Ok(reply) = self.sbio_call(&op) else {
             return None;
@@ -1503,7 +1533,7 @@ impl SepData {
         user_ok && lockout
     }
 
-    fn read_component_states(&self) -> Option<KVec<u8>> {
+    pub(crate) fn read_component_states(&self) -> Option<KVec<u8>> {
         let op = crate::sbio::sbio_context_state();
         let SbioOutcome::Ok(reply) = self.sbio_call(&op) else {
             return None;
@@ -1516,11 +1546,11 @@ impl SepData {
         Some(reply)
     }
 
-    fn restore_catacomb(
+    pub(crate) fn restore_catacomb(
         &self,
         state: Option<u32>,
         id: i32,
-        kind: u8,
+        kind: impl Into<crate::catacomb::Slot>,
         what: &CStr,
     ) -> RestoreOutcome {
         let Some(state) = state else {
@@ -1723,7 +1753,16 @@ impl SepData {
 
     /// `Ok(None)` means provably not stored; any read failure is an error so
     /// it cannot be mistaken for a missing file.
-    fn read_stored(&self, kind: u8, what: &CStr) -> Result<Option<KVec<u8>>> {
+    fn read_stored(&self, kind: impl Into<crate::catacomb::Slot>, what: &CStr) -> Result<Option<KVec<u8>>> {
+        let kind = match kind.into() {
+            crate::catacomb::Slot::Kind(kind) => kind,
+            // A bag user's catacomb lives only in its own file.
+            slot @ crate::catacomb::Slot::BagUser(_) => {
+                return crate::catacomb::read(slot).inspect_err(|e| {
+                    dev_err_ratelimited!(self.dev, "restore: cannot read {}: {:?}\n", what, e);
+                });
+            }
+        };
         if crate::catacomb::is_kind(kind) {
             match crate::catacomb::read(kind) {
                 Ok(Some(blob)) => return Ok(Some(blob)),
@@ -1875,12 +1914,12 @@ impl SepData {
         for (who, kind, what) in [
             (
                 crate::sbio::CatacombUser::enrolling(user),
-                PRIVATE_TYPE_CATACOMB_USER,
+                self.bio_user_slot(),
                 c"post-match user catacomb",
             ),
             (
                 crate::sbio::CatacombUser::MASTER,
-                PRIVATE_TYPE_CATACOMB_MASTER,
+                crate::catacomb::Slot::Kind(PRIVATE_TYPE_CATACOMB_MASTER),
                 c"post-match master catacomb",
             ),
         ] {
@@ -1920,7 +1959,8 @@ impl SepData {
         true
     }
 
-    fn save_catacomb(&self, who: crate::sbio::CatacombUser, kind: u8, what: &CStr) -> bool {
+    fn save_catacomb(&self, who: crate::sbio::CatacombUser, kind: impl Into<crate::catacomb::Slot>, what: &CStr) -> bool {
+        let kind = kind.into();
         let selector = crate::sbio::SaveSelector::new(who);
 
         let save = match self.sbio_transfer(&crate::sbio::sbio_save_catacomb(&selector)) {
@@ -2622,7 +2662,7 @@ impl SepData {
             dev_err_ratelimited!(
                 self.dev,
                 "verify: the enclave reports the Touch ID catacomb of user {} damaged; refusing before the capture. This is not a non-matching finger: the enrolment needs repair\n",
-                SBIO_PROBE_USER_ID
+                self.bio_user()
             );
             self.finish_verify(
                 bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE),
@@ -2644,7 +2684,7 @@ impl SepData {
         }
 
         if self.match_scope_gen.load(Relaxed) != self.bio_open_gen.load(Relaxed) {
-            if let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) {
+            if let Some(user) = crate::sbio::UserId::new(self.bio_user()) {
                 self.settle_owed_enclave_failures(user);
             }
         }
@@ -2702,7 +2742,7 @@ impl SepData {
         // Each verify matches under its own unlock evaluation: a context whose
         // preflight leaves a biometric match outstanding, carried in the image
         // init and completed after an enrolled match.
-        let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+        let Some(user) = crate::sbio::UserId::new(self.bio_user()) else {
             self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE), token_bytes);
             return;
         };
@@ -2965,7 +3005,7 @@ impl SepData {
             bio::VerifyOutcome::Matched(_) | bio::VerifyOutcome::NoMatch
         );
         if definitive {
-            let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+            let Some(user) = crate::sbio::UserId::new(self.bio_user()) else {
                 if !reported_early {
                     let failed = bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
                     self.finish_verify(failed, token_bytes);
@@ -3000,7 +3040,7 @@ impl SepData {
     // "unspecified error", which cannot tell a sensor fault from a refused
     // match step.
     fn verify_one_image(&self) -> bio::VerifyOutcome {
-        let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+        let Some(user) = crate::sbio::UserId::new(self.bio_user()) else {
             dev_err_ratelimited!(self.dev, "verify: invalid probe user id\n");
             return bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };
@@ -3194,7 +3234,7 @@ impl SepData {
 
         // match result: user id groups templates, UUID at offset 0x04 identifies one
         let identity = *parsed.identity_uuid();
-        let known = self.bio_index.lock().contains_uuid(&identity);
+        let known = self.bio_identity_known(&identity);
 
         dev_info_ratelimited!(
             self.dev,
@@ -4650,7 +4690,7 @@ impl SepData {
     /// and matching stays off.
     fn persist_template_update(&self) -> bool {
         self.persistence_owed.store(true, Relaxed);
-        let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+        let Some(user) = crate::sbio::UserId::new(self.bio_user()) else {
             return false;
         };
         let user_c = crate::sbio::CatacombUser::enrolling(user);
@@ -4658,7 +4698,7 @@ impl SepData {
             dev_err_ratelimited!(self.dev, "sbio: template update: the user catacomb never became save-pending\n");
             return false;
         }
-        if !self.save_catacomb(user_c, PRIVATE_TYPE_CATACOMB_USER, c"user catacomb after a template update") {
+        if !self.save_catacomb(user_c, self.bio_user_slot(), c"user catacomb after a template update") {
             return false;
         }
         self.finish_owed_persistence()
@@ -4670,13 +4710,13 @@ impl SepData {
         if !self.persistence_owed.load(Relaxed) {
             return true;
         }
-        let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+        let Some(user) = crate::sbio::UserId::new(self.bio_user()) else {
             return false;
         };
         let user_c = crate::sbio::CatacombUser::enrolling(user);
         // A user save left pending by an earlier failure goes first.
         if self.component_state(user_c).is_some_and(|s| s & crate::sbio::COMPONENT_STATE_SAVE_PENDING != 0)
-            && !self.save_catacomb(user_c, PRIVATE_TYPE_CATACOMB_USER, c"user catacomb after a template update")
+            && !self.save_catacomb(user_c, self.bio_user_slot(), c"user catacomb after a template update")
         {
             return false;
         }

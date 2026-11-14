@@ -183,6 +183,10 @@ fn main(){
 
 CATACOMB = r'''
 const MAGIC:[u8;8]=*b"SEPCTMB1";const HEADER:usize=16;const MAX_CATACOMB:usize=1<<20;
+struct CString(std::ffi::CString);
+impl CString{fn try_from_fmt(s:String)->Result<Self>{Ok(Self(std::ffi::CString::new(s).unwrap()))}}
+impl Deref for CString{type Target=CStr;fn deref(&self)->&CStr{&self.0}}
+macro_rules! fmt {($($x:tt)*)=>{format!($($x)*)};}
 const PRIVATE_TYPE_CATACOMB_MASTER:u8=1;const PRIVATE_TYPE_CATACOMB_OWNER:u8=2;const PRIVATE_TYPE_CATACOMB_USER:u8=3;
 thread_local!{static OPEN:Cell<i32>=const{Cell::new(0)};static IMAGE:RefCell<Vec<u8>>=const{RefCell::new(Vec::new())};}
 mod shim{
@@ -233,8 +237,11 @@ thread_local!{
 }
 mod catacomb{
  use super::*;
+ pub enum Slot{Kind(u8),BagUser(u32)}
+ impl From<u8> for Slot{fn from(kind:u8)->Self{Slot::Kind(kind)}}
  pub fn is_kind(_:u8)->bool{true}
- pub fn read(kind:u8)->Result<Option<KVec<u8>>>{
+ pub fn read(slot:impl Into<Slot>)->Result<Option<KVec<u8>>>{
+  let Slot::Kind(kind)=slot.into() else {return Ok(None)};
   match FILE.with(|f|f.borrow()[(kind-PRIVATE_TYPE_CATACOMB_MASTER) as usize]){
    0=>Ok(Some(KVec(vec![1,0,0,0]))),ENOENT=>Ok(None),e=>Err(e)}
  }
@@ -341,8 +348,11 @@ class Preservation(unittest.TestCase):
 
     def test_catacomb_read_error_is_not_absence(self):
         text=(ROOT/'catacomb.rs').read_text()
-        method=body(text,'pub(crate) fn read(kind: u8)')
-        path=body(text,'fn path_for(kind: u8)').replace('crate::','')
+        method=body(text,'pub(crate) fn read(slot: impl Into<Slot>)')
+        path='\n'.join(body(text,item) for item in (
+            'pub(crate) enum Slot {','impl From<u8> for Slot {','enum Path {',
+            'impl core::ops::Deref for Path {','fn fixed_path(kind: u8)',
+            'fn path_for(slot: impl Into<Slot>)')).replace('crate::','')
         crc=body((ROOT/'store.rs').read_text(),'pub(crate) const fn crc16_ccitt_false(')
         make=lambda m:CATACOMB.replace('METHOD',m).replace('PATH',path).replace('@@CRC@@',crc)
         self.run_rust(make(method))
@@ -353,7 +363,7 @@ class Preservation(unittest.TestCase):
     def test_callers_refuse_unreadable_catacombs(self):
         cat=(ROOT/'catacomb.rs').read_text();sb=(ROOT/'sbio.rs').read_text()
         parts={'IS_SAVED':body(cat,'pub(crate) fn is_saved('),'IS_ABSENT':body(cat,'pub(crate) fn is_absent('),
-               'RESTORE':body(sb,'    fn restore_catacomb('),'READ_STORED':body(sb,'    fn read_stored('),
+               'RESTORE':body(sb,'fn restore_catacomb('),'READ_STORED':body(sb,'    fn read_stored('),
                'PROBE':body(sb,'    fn probe_owner_export(')}
         def make(**over):
             text=CALLERS
@@ -362,7 +372,7 @@ class Preservation(unittest.TestCase):
             return text
         self.run_rust(make())
         restore=parts['RESTORE'].replace('Err(_) => return RestoreOutcome::Failed,','Err(_) => return RestoreOutcome::NoStoredFile,',1)
-        absent=parts['IS_ABSENT'].replace('matches!(read(kind), Ok(None))','!matches!(read(kind), Ok(Some(_)))',1)
+        absent=parts['IS_ABSENT'].replace('matches!(read(slot), Ok(None))','!matches!(read(slot), Ok(Some(_)))',1)
         for name,old in (('RESTORE',restore),('IS_ABSENT',absent)):
             self.assertNotEqual(old,parts[name])
             self.run_rust(make(**{name:old}),should_pass=False)
