@@ -10,7 +10,7 @@
 static unsigned char keystore_only;
 module_param(keystore_only, byte, 0444);
 MODULE_PARM_DESC(keystore_only,
-	"Initrd attach: 1 = trusted keys only, 2 = also per-user key bags for a password unlock; defer persistent host state and Touch ID until complete_attach");
+	"Initrd attach: 1 = trusted keys only, 2 = also per-user key bags for a password unlock (under the xART guard too); defer persistent host state and Touch ID until complete_attach");
 
 bool sep_keystore_only(void)
 {
