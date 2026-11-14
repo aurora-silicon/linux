@@ -22,6 +22,7 @@ select:
           - apple,t6020-aop-las
           - apple,t6050-aop-las
           - apple,t8112-aop-las
+          - apple,t8142-aop-las
   required:
     - compatible
 
@@ -32,6 +33,7 @@ properties:
           - apple,t6020-aop-las
           - apple,t6050-aop-las
           - apple,t8112-aop-las
+          - apple,t8142-aop-las
       - const: apple,aop-las
 
 required:

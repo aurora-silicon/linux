@@ -8,17 +8,12 @@
  */
 /dts-v1/;
 
-#include <dt-bindings/interrupt-controller/apple-aic.h>
-#include <dt-bindings/interrupt-controller/irq.h>
+#include "t8142.dtsi"
 
 / {
 	compatible = "apple,j813", "apple,t8142", "apple,arm-platform";
 	model = "Apple MacBook Air (13-inch, M5, 2026)";
 	chassis-type = "laptop";
-
-	#address-cells = <2>;
-	#size-cells = <2>;
-	interrupt-parent = <&aic>;
 
 	aliases {
 		serial0 = &dockchannel;
@@ -39,173 +34,85 @@
 		};
 	};
 
-	reserved-memory {
-		#address-cells = <2>;
-		#size-cells = <2>;
-		ranges;
-		/* Filled by the loader. */
-	};
-
 	memory@10000000000 {
-		device_type = "memory";
 		reg = <0x100 0 0x4 0>; /* Filled by the loader. */
 	};
+};
 
-	cpus {
-		#address-cells = <2>;
-		#size-cells = <0>;
+&cpu0 {
+	operating-points-v2 = <&ecluster_opp>;
+	performance-domains = <&cpufreq_e>;
+	status = "okay";
+};
 
-		cpu0: cpu@0 {
-			compatible = "apple,t8142-e";
-			device_type = "cpu";
-			reg = <0 0x0>;
-			operating-points-v2 = <&ecluster_opp>;
-			performance-domains = <&cpufreq_e>;
-			enable-method = "spin-table";
-			cpu-release-addr = <0 0>; /* Filled by the loader. */
-		};
+&cpu1 {
+	operating-points-v2 = <&ecluster_opp>;
+	performance-domains = <&cpufreq_e>;
+	status = "okay";
+};
 
-		cpu1: cpu@1 {
-			compatible = "apple,t8142-e";
-			device_type = "cpu";
-			reg = <0 0x1>;
-			operating-points-v2 = <&ecluster_opp>;
-			performance-domains = <&cpufreq_e>;
-			enable-method = "spin-table";
-			cpu-release-addr = <0 0>; /* Filled by the loader. */
-		};
+&cpu2 {
+	operating-points-v2 = <&ecluster_opp>;
+	performance-domains = <&cpufreq_e>;
+	status = "okay";
+};
 
-		cpu2: cpu@2 {
-			compatible = "apple,t8142-e";
-			device_type = "cpu";
-			reg = <0 0x2>;
-			operating-points-v2 = <&ecluster_opp>;
-			performance-domains = <&cpufreq_e>;
-			enable-method = "spin-table";
-			cpu-release-addr = <0 0>; /* Filled by the loader. */
-		};
+&cpu3 {
+	operating-points-v2 = <&ecluster_opp>;
+	performance-domains = <&cpufreq_e>;
+	status = "okay";
+};
 
-		cpu3: cpu@3 {
-			compatible = "apple,t8142-e";
-			device_type = "cpu";
-			reg = <0 0x3>;
-			operating-points-v2 = <&ecluster_opp>;
-			performance-domains = <&cpufreq_e>;
-			enable-method = "spin-table";
-			cpu-release-addr = <0 0>; /* Filled by the loader. */
-		};
+&cpu4 {
+	operating-points-v2 = <&ecluster_opp>;
+	performance-domains = <&cpufreq_e>;
+	status = "okay";
+};
 
-		cpu4: cpu@4 {
-			compatible = "apple,t8142-e";
-			device_type = "cpu";
-			reg = <0 0x4>;
-			operating-points-v2 = <&ecluster_opp>;
-			performance-domains = <&cpufreq_e>;
-			enable-method = "spin-table";
-			cpu-release-addr = <0 0>; /* Filled by the loader. */
-		};
+&cpu5 {
+	operating-points-v2 = <&ecluster_opp>;
+	performance-domains = <&cpufreq_e>;
+	status = "okay";
+};
 
-		cpu5: cpu@5 {
-			compatible = "apple,t8142-e";
-			device_type = "cpu";
-			reg = <0 0x5>;
-			operating-points-v2 = <&ecluster_opp>;
-			performance-domains = <&cpufreq_e>;
-			enable-method = "spin-table";
-			cpu-release-addr = <0 0>; /* Filled by the loader. */
-		};
+&cpu6 {
+	operating-points-v2 = <&pcluster_opp>;
+	performance-domains = <&cpufreq_p>;
+	status = "okay";
+};
 
-		cpu6: cpu@10100 {
-			compatible = "apple,t8142-p";
-			device_type = "cpu";
-			reg = <0 0x10100>;
-			operating-points-v2 = <&pcluster_opp>;
-			performance-domains = <&cpufreq_p>;
-			enable-method = "spin-table";
-			cpu-release-addr = <0 0>; /* Filled by the loader. */
-		};
+&cpu7 {
+	operating-points-v2 = <&pcluster_opp>;
+	performance-domains = <&cpufreq_p>;
+	status = "okay";
+};
 
-		cpu7: cpu@10101 {
-			compatible = "apple,t8142-p";
-			device_type = "cpu";
-			reg = <0 0x10101>;
-			operating-points-v2 = <&pcluster_opp>;
-			performance-domains = <&cpufreq_p>;
-			enable-method = "spin-table";
-			cpu-release-addr = <0 0>; /* Filled by the loader. */
-		};
+&cpu8 {
+	operating-points-v2 = <&pcluster_opp>;
+	performance-domains = <&cpufreq_p>;
+	status = "okay";
+};
 
-		cpu8: cpu@10102 {
-			compatible = "apple,t8142-p";
-			device_type = "cpu";
-			reg = <0 0x10102>;
-			operating-points-v2 = <&pcluster_opp>;
-			performance-domains = <&cpufreq_p>;
-			enable-method = "spin-table";
-			cpu-release-addr = <0 0>; /* Filled by the loader. */
-		};
+&cpu9 {
+	operating-points-v2 = <&pcluster_opp>;
+	performance-domains = <&cpufreq_p>;
+	status = "okay";
+};
 
-		cpu9: cpu@10103 {
-			compatible = "apple,t8142-p";
-			device_type = "cpu";
-			reg = <0 0x10103>;
-			operating-points-v2 = <&pcluster_opp>;
-			performance-domains = <&cpufreq_p>;
-			enable-method = "spin-table";
-			cpu-release-addr = <0 0>; /* Filled by the loader. */
-		};
-	};
+&{/timer} {
+	status = "okay";
+};
 
-	timer {
-		compatible = "arm,armv8-timer";
-		interrupts = <AIC_FIQ AIC_TMR_GUEST_PHYS IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_FIQ AIC_TMR_GUEST_VIRT IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_FIQ AIC_TMR_HV_PHYS IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_FIQ AIC_TMR_HV_VIRT IRQ_TYPE_LEVEL_HIGH>;
-		interrupt-names = "phys", "virt", "hyp-phys", "hyp-virt";
-	};
+&aic {
+	status = "okay";
+};
 
-	clkref: clock-ref {
-		compatible = "fixed-clock";
-		#clock-cells = <0>;
-		clock-frequency = <24000000>;
-	};
+&cpu_pmu {
+	status = "okay";
+};
 
-	soc {
-		compatible = "simple-bus";
-		#address-cells = <2>;
-		#size-cells = <2>;
-		ranges;
-		nonposted-mmio;
-
-		aic: interrupt-controller@381000000 {
-			compatible = "apple,t8142-aic3", "apple,t8122-aic3";
-			interrupt-controller;
-			#interrupt-cells = <3>;
-			reg = <3 0x81000000 0 0x1cc000>,
-			      <3 0x81040000 0 0x4000>;
-			reg-names = "core", "event";
-		};
-
-		serial0: serial@3a5200000 {
-			compatible = "apple,s5l-uart";
-			reg = <3 0xa5200000 0 0x4000>;
-			reg-io-width = <4>;
-			interrupts = <AIC_IRQ 1231 IRQ_TYPE_LEVEL_HIGH>;
-			clocks = <&clkref>, <&clkref>;
-			clock-names = "uart", "clk_uart_baud0";
-			status = "disabled";
-		};
-
-		dockchannel: serial@38812c000 {
-			compatible = "apple,dockchannel-uart";
-			reg = <3 0x8812c000 0 0x4000>,
-			      <3 0x88128000 0 0x4000>,
-			      <3 0x8810c000 0 0x1000>;
-			reg-names = "data", "config", "irq";
-			interrupts = <AIC_IRQ 571 IRQ_TYPE_LEVEL_HIGH>;
-		};
-	};
+&dockchannel {
+	status = "okay";
 };
 
 #include "t8142-j813-display.dtsi"
@@ -218,7 +125,68 @@
 #include "t8142-j813-n1.dtsi"
 #include "t8142-j813-audio.dtsi"
 
-#include "t8142-peripherals.dtsi"
+/*
+ * Ambient light sensor, the AOP's "als" service: an ST VD6286, as on J815
+ * (same ADT node, /arm-io/aop/iop-aop-nub/als). aop_als sends it the
+ * per-device calibration (apple/aop-als-cal.bin). No firmware-name: that
+ * names the CT817 setup-port message, which this sensor does not take.
+ */
+&aop {
+	aop_als: als {
+		compatible = "apple,t8142-aop-als", "apple,aop-als";
+	};
+
+	/*
+	 * Lid angle: the J813 AOP firmware announces a "las" service, as the
+	 * J815's does, and aop_las reads the hinge angle from it.
+	 */
+	aop_las: las {
+		compatible = "apple,t8142-aop-las", "apple,aop-las";
+	};
+};
+
+/*
+ * N1 functions behind apcie port 0 (0000:00:00.0 -> 01:00.{0,1,2}), so the
+ * loader has somewhere to put the factory addresses: it copies ADT /chosen
+ * mac-address-wifi0 and mac-address-bluetooth0 into the wifi0/bluetooth0
+ * alias targets. Same nodes as t8142-j815.dts (same N1, same PCI IDs).
+ */
+/ {
+	aliases {
+		wifi0 = &n1_alpha;
+		bluetooth0 = &n1_beta;
+	};
+};
+
+&pcie0 {
+	n1_port: pci@0,0 {
+		device_type = "pci";
+		reg = <0x0 0x0 0x0 0x0 0x0>;
+		bus-range = <1 1>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		n1_control: control@0,0 {
+			compatible = "apple,t8142-centauri-control", "pci106b,1900";
+			reg = <0x10000 0x0 0x0 0x0 0x0>;
+		};
+
+		n1_alpha: wifi@0,1 {
+			compatible = "pci106b,1902";
+			reg = <0x10100 0x0 0x0 0x0 0x0>;
+			/* Filled by the loader */
+			local-mac-address = [00 00 00 00 00 00];
+		};
+
+		n1_beta: bluetooth@0,2 {
+			compatible = "pci106b,1903";
+			reg = <0x10200 0x0 0x0 0x0 0x0>;
+			/* Filled by the loader */
+			local-bd-address = [00 00 00 00 00 00];
+		};
+	};
+};
 
 &mtp_hid {
 	multi-touch {
@@ -227,3 +195,52 @@
 };
 
 /* Unexposed chassis port instances remain described and disabled. */
+
+/*
+ * aura (mcc_init_m5) turns the system level cache on; the driver confirms it
+ * and flushes on shutdown.
+ */
+&mcc {
+	status = "okay";
+};
+
+/*
+ * Video encoder: ADT ave ("ave2", pre-loaded) behind dart-ave, the same
+ * addresses, interrupts and power states as on the J815. aura hands over the
+ * preloaded firmware or disables the node.
+ */
+&ps_venc_sys {
+	status = "okay";
+};
+
+&ps_venc_dma {
+	status = "okay";
+};
+
+&ps_venc_pipe4 {
+	status = "okay";
+};
+
+&ps_venc_pipe5 {
+	status = "okay";
+};
+
+&ps_venc_me0 {
+	status = "okay";
+};
+
+&ps_venc_me1 {
+	status = "okay";
+};
+
+&ave_dart0 {
+	status = "okay";
+};
+
+&ave_dart1 {
+	status = "okay";
+};
+
+&ave {
+	status = "okay";
+};
