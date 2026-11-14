@@ -255,7 +255,34 @@ pub(crate) struct Pair {
     configured_context: Option<u32>,
     /// QoS slot named by those configurations.
     configured_qos: Option<u8>,
+    /// Failed attempts to settle this pair after the firmware drained it, and when the next
+    /// attempt is due (host ns); see [`Pair::note_drain_failure`].
+    drain_failures: u32,
+    drain_retry_at: u64,
 }
+
+/// First delay after a failed settlement of a drained pair; each further failure doubles it up
+/// to [`DRAIN_RETRY_MAX_NS`].
+const DRAIN_RETRY_MIN_NS: u64 = 1_000_000;
+const DRAIN_RETRY_MAX_NS: u64 = 1_000_000_000;
+/// After this many failed attempts (about 7 s) the pair is left out of service: its clients
+/// already failed with the quarantine, and it is re-checked only every
+/// [`DRAIN_PARKED_RETRY_NS`], silently.
+pub(crate) const DRAIN_RETRY_LIMIT: u32 = 16;
+const DRAIN_PARKED_RETRY_NS: u64 = 10_000_000_000;
+
+/// The wait after the `failures`th consecutive failed settlement of a drained pair.
+pub(crate) fn drain_retry_delay(failures: u32) -> u64 {
+    if failures >= DRAIN_RETRY_LIMIT {
+        DRAIN_PARKED_RETRY_NS
+    } else {
+        DRAIN_RETRY_MIN_NS
+            .checked_shl(failures.saturating_sub(1))
+            .unwrap_or(DRAIN_RETRY_MAX_NS)
+            .min(DRAIN_RETRY_MAX_NS)
+    }
+}
+
 impl Pair {
     #[inline(never)]
     #[expect(
@@ -363,6 +390,8 @@ impl Pair {
             configuration: None,
             configured_context: None,
             configured_qos: None,
+            drain_failures: 0,
+            drain_retry_at: 0,
             channel_error: false,
         }))
     }
@@ -1725,8 +1754,98 @@ impl Pair {
         Ok((required > self.memory.manager.blocks()).then_some(required))
     }
 
+    /// A quarantined pair, or a closed owner's pair that holds only groups whose stamps are
+    /// owed (`Active::stamps_owed`): those already reported to their clients, and nothing but
+    /// the stamps (or a kill of the context) releases their descriptors.
     pub(crate) fn needs_drain(&self) -> bool {
-        self.quarantined
+        self.quarantined || self.holds_only_owed_stamps()
+    }
+
+    fn holds_only_owed_stamps(&self) -> bool {
+        self.owner.is_none()
+            && self.prepared.is_none()
+            && self.active.len() != 0
+            && self.active.iter().all(|active| active.stamps_owed)
+    }
+
+    /// Whether a settlement attempt of this drained pair is due at `now`.
+    pub(crate) fn drain_due(&self, now: u64) -> bool {
+        now >= self.drain_retry_at
+    }
+
+    /// Host ns until the next settlement attempt, if one is waiting for its backoff.
+    pub(crate) fn drain_delay(&self, now: u64) -> Option<u64> {
+        (self.drain_failures != 0 && self.drain_retry_at > now).then(|| self.drain_retry_at - now)
+    }
+
+    /// Records a failed settlement at `now` and returns the number of consecutive failures.
+    /// The next attempt waits `DRAIN_RETRY_MIN_NS << (failures - 1)`, at most
+    /// `DRAIN_RETRY_MAX_NS`; from `DRAIN_RETRY_LIMIT` on, `DRAIN_PARKED_RETRY_NS`.
+    pub(crate) fn note_drain_failure(&mut self, now: u64) -> u32 {
+        self.drain_failures = self.drain_failures.saturating_add(1);
+        self.drain_retry_at = now.saturating_add(drain_retry_delay(self.drain_failures));
+        self.drain_failures
+    }
+
+    /// Consecutive failed settlements since the pair last settled.
+    pub(crate) fn drain_failures(&self) -> u32 {
+        self.drain_failures
+    }
+
+    /// One debugfs line for a pair that is quarantined or holds work: what keeps it.
+    pub(crate) fn write_hold(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        if !self.quarantined && self.active.len() == 0 && self.prepared.is_none() {
+            return Ok(());
+        }
+        writeln!(
+            f,
+            "render_pair slot={} context={} owner={} quarantined={} active={} owed={} prepared={} ordinal={} freelist={:?} unstamped={} killed={} kill_published={} drain_failures={}",
+            self.slot,
+            self.context().id(),
+            u8::from(self.owner.is_some()),
+            u8::from(self.quarantined),
+            self.active.len(),
+            self.active.iter().filter(|active| active.stamps_owed).count(),
+            u8::from(self.prepared.is_some()),
+            self.ordinal,
+            self.free_list.counters().ok(),
+            u8::from(self.executed_unstamped()),
+            u8::from(self.context_killed()),
+            u8::from(self.context().kill_published()),
+            self.drain_failures
+        )
+    }
+
+    /// Bounded state of a pair whose settlement failed, for the log.
+    pub(crate) fn report_drain(&self, host: &impl Host) {
+        let stamps = host.stamps(self.qids());
+        pr_warn!(
+            "G17: drained render slot={} qids={:?} owner={} quarantined={} active={} prepared={} stamps={:?} freelist={:?} killed={} unstamped={}\n",
+            self.slot,
+            self.qids(),
+            self.owner.is_some(),
+            self.quarantined,
+            self.active.len(),
+            self.prepared.is_some(),
+            stamps,
+            self.free_list.counters(),
+            self.context_killed(),
+            self.executed_unstamped()
+        );
+        for active in self.active.iter().take(4) {
+            pr_warn!(
+                "G17: drained render slot={} ordinal={} owned={} published={} flist={} qos={} failed={} stamps_owed={} drained={:?}\n",
+                self.slot,
+                active.ticket.ordinal,
+                self.memory.owns(active.ticket.ordinal),
+                active.outer_published,
+                active.flist_completed,
+                active.qos_completed,
+                active.failed,
+                active.stamps_owed,
+                active.drained_result.map(|result| result.err())
+            );
+        }
     }
 
     pub(crate) fn oldest_spared(&self) -> Option<bool> {
@@ -1842,6 +1961,11 @@ impl Pair {
         }
         for active in self.active.iter_mut() {
             active.packet.completion.quarantine_render();
+            if active.stamps_owed {
+                // Already reported to its client: only its descriptor is still held.
+                active.failed = true;
+                continue;
+            }
             if !active.failed {
                 defer(Deferred::FailedOwned(
                     active.packet.completion.clone(),
@@ -2420,8 +2544,11 @@ impl Pair {
     /// the firmware's job list, so neither the stamp proof nor the abandoned-group proof
     /// ever holds and the pair would stay quarantined, keeping its context, until the
     /// processors stop.
+    ///
+    /// A closed owner's pair that holds only groups whose stamps are owed counts too: they
+    /// ran and were reported, and only the stamps they never got hold their descriptors.
     fn executed_unstamped(&self) -> bool {
-        self.quarantined
+        (self.quarantined || self.holds_only_owed_stamps())
             // Only for a closed owner: a live owner would go on publishing into a context
             // whose work list still links the unstamped node.
             && self.owner.is_none()
@@ -2508,13 +2635,20 @@ impl Pair {
             return Ok(());
         }
         while let Some(active) = self.active.front() {
-            let result = active.drained_result.ok_or(EIO)?;
-            defer(Deferred::Drained(active.packet.completion.clone(), result))?;
+            // A group retired on its pass record was reported then (`stamps_owed`): the pair-wide
+            // proof above covers its stamps too (or the kill of its context), so only its
+            // descriptor is released. It has no drained result of its own.
+            if !active.stamps_owed {
+                let result = active.drained_result.ok_or(EIO)?;
+                defer(Deferred::Drained(active.packet.completion.clone(), result))?;
+            }
             let ordinal = active.ticket.ordinal;
             self.memory.retire(ordinal)?;
             self.active.pop().ok_or(EIO)?;
         }
         self.quarantined = false;
+        self.drain_failures = 0;
+        self.drain_retry_at = 0;
         self.resync();
         Ok(())
     }
@@ -3163,5 +3297,31 @@ mod completion_noted_tests {
         let mut both = bit(3);
         both[1] |= bit(68)[1];
         assert!(completion_noted([3, 68], both));
+    }
+}
+
+#[kunit_tests(asahi_g17_render_drain_retry)]
+mod drain_retry_tests {
+    use super::{drain_retry_delay, DRAIN_RETRY_LIMIT};
+
+    #[test]
+    fn backoff_doubles_from_a_millisecond_to_a_second() {
+        assert_eq!(drain_retry_delay(1), 1_000_000);
+        assert_eq!(drain_retry_delay(2), 2_000_000);
+        assert_eq!(drain_retry_delay(10), 512_000_000);
+        assert_eq!(drain_retry_delay(11), 1_000_000_000);
+        assert_eq!(drain_retry_delay(DRAIN_RETRY_LIMIT - 1), 1_000_000_000);
+    }
+
+    #[test]
+    fn a_pair_left_out_of_service_is_checked_every_ten_seconds() {
+        assert_eq!(drain_retry_delay(DRAIN_RETRY_LIMIT), 10_000_000_000);
+        assert_eq!(drain_retry_delay(u32::MAX), 10_000_000_000);
+    }
+
+    #[test]
+    fn the_limit_is_reached_within_ten_seconds() {
+        let total: u64 = (1..DRAIN_RETRY_LIMIT).map(drain_retry_delay).sum();
+        assert!(total < 10_000_000_000);
     }
 }

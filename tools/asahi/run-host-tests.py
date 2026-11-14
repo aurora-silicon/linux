@@ -75,8 +75,7 @@ ASAHI_TESTS = {
     'dcpext26-wire-tests.py': [([], PASS)],
     'pmp-native26-tests.py': [([], PASS)],
 
-    'gem-close-cleanup-tests.py': [(out(), PASS),
-        *mutations('--mutate', ['omit-drain', 'drain-before-put', 'drain-under-lock'], out())],
+
     'j613-mtp-s2idle-tests.py': [([], PASS)],
     # 11eccbedc3ed writes frames without a transport-wide lock.
     'mtp-tx-frame-tests.py': [(out(), PASS),

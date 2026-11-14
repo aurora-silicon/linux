@@ -7,12 +7,44 @@ use super::{fw::variant::InitGraph, telemetry::Readout, Shared};
 use core::sync::atomic::Ordering;
 use kernel::sync::Arc;
 
-/// The device's shared state, and the M5 board's performance states, whose frequency a
-/// reported state index runs at.
-pub(crate) struct Reader(
-    pub(super) Arc<Shared>,
-    pub(super) Option<&'static [super::fw::m5::initdata::M5PerfState; 14]>,
-);
+/// Frequency of each performance state the firmware reports, in MHz; state 0 is off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StateFrequencies {
+    mhz: [u32; Self::MAX],
+    states: usize,
+}
+
+impl StateFrequencies {
+    const MAX: usize = 16;
+
+    /// `mhz` holds states 0 to `mhz.len() - 1`; `None` for more than [`Self::MAX`] states.
+    pub(crate) fn new(mhz: impl ExactSizeIterator<Item = u32>) -> Option<Self> {
+        let states = mhz.len();
+        if states > Self::MAX {
+            return None;
+        }
+        let mut table = [0; Self::MAX];
+        for (slot, value) in table.iter_mut().zip(mhz) {
+            *slot = value;
+        }
+        Some(Self { mhz: table, states })
+    }
+
+    /// The frequency of `pstate` in Hz; `None` beyond the table or where it is unknown (0).
+    fn hz(&self, pstate: u32) -> Option<u64> {
+        let mhz = *self.mhz[..self.states].get(pstate as usize)?;
+        (mhz != 0).then_some(u64::from(mhz) * 1_000_000)
+    }
+
+    fn max_hz(&self) -> Option<u64> {
+        let mhz = *self.mhz[..self.states].iter().max()?;
+        (mhz != 0).then_some(u64::from(mhz) * 1_000_000)
+    }
+}
+
+/// The device's shared state, and the frequency of each performance state the firmware
+/// reports.
+pub(crate) struct Reader(pub(super) Arc<Shared>, pub(super) Option<StateFrequencies>);
 
 impl Reader {
     pub(crate) fn read(&self) -> Readout {
@@ -20,20 +52,21 @@ impl Reader {
         if view.pstate_status == super::telemetry::VALID {
             view.achieved_frequency_hz = self
                 .1
-                .and_then(|states| states.get(view.pstate as usize))
-                .map_or(0, |state| u64::from(state.0) * 1_000_000);
+                .as_ref()
+                .and_then(|states| states.hz(view.pstate))
+                .unwrap_or(0);
         }
         view
     }
 
     /// The frequency of the state the GPU runs at, while the firmware reports one, and the
-    /// highest frequency of the board's states, in Hz; `None` without the board's performance
-    /// states.
+    /// highest frequency of its states, in Hz; `None` without the states' frequencies.
     pub(crate) fn frequency(&self) -> Option<(Option<u64>, u64)> {
-        let max = u64::from(self.1?.iter().map(|state| state.0).max()?) * 1_000_000;
+        let max = self.1.as_ref()?.max_hz()?;
         let view = self.read();
+        // State 0 is off: the gated GPU runs at no frequency.
         let current = (view.pstate_status == super::telemetry::VALID
-            && view.achieved_frequency_hz != 0)
+            && (view.achieved_frequency_hz != 0 || view.pstate == 0))
             .then_some(view.achieved_frequency_hz);
         Some((current, max))
     }
@@ -85,16 +118,23 @@ pub(super) const fn max_age_ns(graph: InitGraph) -> u64 {
     }
 }
 
-/// Whether the firmware reports its performance state. V25G83 and V26A428
-/// accept the logical pstate record (tag 0x10) but never emit it, and no other
-/// record of theirs carries the current pstate, so it is unsupported by these
-/// firmwares. M5 firmware (`m5`) reports it in its own records
-/// ([`super::telemetry`]). A firmware that is shown to report it gets `true`
-/// here and reports valid or stale.
-pub(super) const fn reports_pstate(graph: InitGraph, m5: bool) -> bool {
+/// The records `graph`'s firmware sends beyond utilisation; `m5`: it runs the M5 protocol,
+/// with M5's performance states.
+pub(super) const fn protocol(graph: InitGraph, m5: bool) -> super::telemetry::Protocol {
     match graph {
-        InitGraph::V25G83 | InitGraph::G17P => m5,
+        InitGraph::G17P if m5 => super::telemetry::Protocol::M5,
+        InitGraph::G17P => super::telemetry::Protocol::A18_PRO,
+        InitGraph::V25G83 => super::telemetry::Protocol::NONE,
     }
+}
+
+/// Whether the firmware reports its performance state. V25G83 and V26A428 accept
+/// the logical pstate record (tag 0x10) but never emit it. V26A428, on the A18 Pro
+/// as on M5, reports the state in its own records instead (tags 0x19 and 0x1b,
+/// [`protocol`]); V25G83 sends no record carrying it, so it is unsupported there.
+/// A firmware that reports it reads valid or stale.
+pub(super) const fn reports_pstate(graph: InitGraph, m5: bool) -> bool {
+    protocol(graph, m5).reports_pstate()
 }
 
 /// Apply the firmware's static capabilities to a decoded readout. The decoder

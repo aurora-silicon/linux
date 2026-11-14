@@ -2566,6 +2566,11 @@ impl Vm {
         self.id
     }
 
+    /// Created by an M5 GPU's UAT ([`Uat::is_m5`]).
+    pub(crate) fn is_m5(&self) -> bool {
+        self.m5
+    }
+
     /// Copies `buf.len()` bytes of GPU-readable memory at `va` of this VM into `buf`, for admission
     /// checks of streams the GPU will execute (G15 stream gates).
     ///
@@ -3253,12 +3258,10 @@ impl Vm {
                 self.untrack_shared_object(gem);
             }
             mod_dev_dbg!(self.dev, "MMU: bo_unmap done\n");
-            // The final BO put queues its GEM reference for deferred cleanup.
-            // Release reservations and the temporary BO reference before draining,
-            // including when an earlier unmap step failed.
+            // BO release can drain unrelated deferred GEMs, including on an
+            // unmap error. Always release reservations before dropping it.
             core::mem::drop(vm_exec);
             core::mem::drop(bo);
-            self.bo_deferred_cleanup();
             if result == Err(ENOMEM) {
                 return self.drop_mappings_low_memory(gem);
             }

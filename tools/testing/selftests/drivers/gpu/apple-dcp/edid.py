@@ -808,6 +808,8 @@ typedef uint64_t u64;
 #define GFP_KERNEL 0
 #define kzalloc(n,f) calloc(1,n)
 #define kfree(p) free(p)
+#define kvzalloc(n,f) calloc(1,n)
+#define kvfree(p) free(p)
 #define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))
 #define INIT_WORK(p,f) ((p)->fn=(f))
 #define IS_ERR_OR_NULL(x) (!(x) || (uintptr_t)(x) > (uintptr_t)-4096)

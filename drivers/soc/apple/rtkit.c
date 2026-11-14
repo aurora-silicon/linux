@@ -1839,8 +1839,14 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 	rtk->handshake_timeout_ms = APPLE_RTKIT_HANDSHAKE_TIMEOUT_MS;
 	rtk->sync_syslog_ack =
 		of_property_read_bool(dev->of_node, "apple,sync-syslog-ack");
-	/* As macOS does; a driver whose firmware shouldn't get them turns it off. */
-	rtk->oslog_echo = of_machine_is_compatible("apple,t8140");
+	/*
+	 * As macOS does; a driver whose firmware shouldn't get them turns it off. T8142 too:
+	 * its MTP left a counter unechoed after the first sleep's resume, then took no AP
+	 * idle notice for the next one (J815, -ETIME at prepare) and asserted on the one
+	 * after ("Invalid AP power").
+	 */
+	rtk->oslog_echo = of_machine_is_compatible("apple,t8140") ||
+			  of_machine_is_compatible("apple,t8142");
 	INIT_KFIFO(rtk->sync_ack_fifo);
 	INIT_WORK(&rtk->sync_ack_work, apple_rtkit_sync_ack_work);
 

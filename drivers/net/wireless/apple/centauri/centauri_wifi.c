@@ -896,51 +896,93 @@ static void scan_worker(struct work_struct *work)
 	struct cfg80211_scan_request *request;
 	u8 scan[14 + 4 + 1 + 4 * 13 + 4 + 5];
 	size_t scan_size;
-	unsigned int chunk;
+	unsigned int chunk, chunks = DIV_ROUND_UP(13 + ARRAY_SIZE(five_ghz), 13);
+	u32 channels_start, beacons_start;
 	int ret = 0;
 
 	mutex_lock(&wifi->lock);
-	for (chunk = 0; chunk < 3 && !ret; chunk++) {
-		u32 channels = wifi->channels_seen, done = wifi->scans_done;
-		bool stopped = false;
-		unsigned long deadline;
+	channels_start = wifi->channels_seen;
+	beacons_start = wifi->beacons_seen;
+	for (chunk = 0; chunk < chunks && !ret; chunk++) {
+		u32 channels = wifi->channels_seen, done = wifi->scans_done, seen = channels;
+		unsigned int count = min_t(unsigned int, 13,
+					   13 + ARRAY_SIZE(five_ghz) - chunk * 13);
+		unsigned long deadline, progress;
+		bool stopped = false, refused = false;
 
 		scan_size = build_scan(wifi, chunk, scan);
 		ret = command(wifi, 65551, scan, scan_size);
 		if (ret)
 			break;
-		deadline = jiffies + msecs_to_jiffies(8000);
+		/*
+		 * The firmware reports every channel it finishes (event 0x30) and then the scan
+		 * (event 0x05). This loop used to stop each chunk after its 8th channel, so a scan
+		 * covered 24 of the 38 channels (J815 boot 2d103457: "channels=24"): 2.4 GHz 9-13,
+		 * 5 GHz 100-116 and 153-165 were never scanned and 149 was the last one kept. A
+		 * 5 GHz BSS there came and went between scans, and the supplicant joined 2.4 GHz.
+		 * The chunk now runs to its own end. It's stopped only once all of its channels
+		 * have reported without a scan event, when it goes quiet for a second after some
+		 * progress (a channel the firmware skips under the country rules), at its
+		 * deadline, or on an abort. A chunk that ends early keeps what it found.
+		 */
+		deadline = jiffies +
+			   msecs_to_jiffies(max(8000U, count * 2 * SCAN_PASSIVE_DWELL_MS + 2000));
+		progress = jiffies;
 		do {
 			drain(wifi);
 			if (readl(wifi->a.bar + 8) != 2) {
 				ret = -EIO;
 				break;
 			}
+			if (wifi->scans_done != done)
+				break;
 			if (READ_ONCE(wifi->scan_abort)) {
 				if (!stopped)
 					command(wifi, 65537, NULL, 0);
 				ret = -ECANCELED;
 				break;
 			}
-			if (!stopped && wifi->channels_seen - channels >= 8) {
-				stopped = true;
-				ret = command(wifi, 65537, NULL, 0);
-				if (ret)
-					break;
+			if (wifi->channels_seen != seen) {
+				seen = wifi->channels_seen;
+				progress = jiffies;
 			}
-			if (stopped && wifi->scans_done > done)
-				break;
+			if (!stopped &&
+			    (seen - channels >= count ||
+			     (seen != channels &&
+			      time_after(jiffies, progress + msecs_to_jiffies(1000))))) {
+				stopped = true;
+				/*
+				 * A refused stop (firmware status 342 on J815) means the chunk
+				 * had ended already: keep its results and go on.
+				 */
+				if (command(wifi, 65537, NULL, 0)) {
+					dev_dbg(&wifi->control->pdev->dev,
+						"Wi-Fi scan chunk %u: stop refused (status %u), chunk over\n",
+						chunk, wifi->reply_status);
+					refused = true;
+					break;
+				}
+				/* The stop's own scan event ends the wait. */
+				deadline = jiffies + msecs_to_jiffies(1000);
+			}
 			usleep_range(1000, 2000);
 		} while (time_before(jiffies, deadline));
-		if (!ret && wifi->scans_done == done)
-			ret = -ETIMEDOUT;
+		if (!ret && !refused && wifi->scans_done == done) {
+			dev_warn(&wifi->control->pdev->dev,
+				 "Wi-Fi scan chunk %u: %u of %u channels, no scan event%s\n", chunk,
+				 wifi->channels_seen - channels, count,
+				 stopped ? " after the stop" : "");
+			if (!stopped)
+				command(wifi, 65537, NULL, 0);
+		}
 	}
 	info.aborted = !!ret;
 	request = wifi->scan_request;
 	wifi->scan_request = NULL;
 	mutex_unlock(&wifi->lock);
-	dev_info(&wifi->control->pdev->dev, "Wi-Fi scan finished: rc=%d channels=%u beacons=%u\n",
-		 ret, wifi->channels_seen, wifi->beacons_seen);
+	dev_info(&wifi->control->pdev->dev, "Wi-Fi scan finished: rc=%d channels=%u of %zu beacons=%u\n",
+		 ret, wifi->channels_seen - channels_start, 13 + ARRAY_SIZE(five_ghz),
+		 wifi->beacons_seen - beacons_start);
 	if (request)
 		cfg80211_scan_done(request, &info);
 }

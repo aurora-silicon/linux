@@ -139,3 +139,44 @@
 &mcc {
 	status = "okay";
 };
+
+/*
+ * Video encoder: ADT ave behind dart-ave (DART + CPUDART). aura hands over the
+ * preloaded 26A428 firmware (memory regions, CRCs in /chosen) or disables the
+ * node when the ADT has no preload.
+ */
+&ps_venc_sys {
+	status = "okay";
+};
+
+&ps_venc_dma {
+	status = "okay";
+};
+
+&ps_venc_pipe4 {
+	status = "okay";
+};
+
+&ps_venc_pipe5 {
+	status = "okay";
+};
+
+&ps_venc_me0 {
+	status = "okay";
+};
+
+&ps_venc_me1 {
+	status = "okay";
+};
+
+&ave_dart0 {
+	status = "okay";
+};
+
+&ave_dart1 {
+	status = "okay";
+};
+
+&ave {
+	status = "okay";
+};

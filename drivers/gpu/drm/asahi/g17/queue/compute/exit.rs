@@ -94,7 +94,9 @@ impl Queue {
     /// traversal the firmware reported failed no longer runs (see `fault_pending`).
     fn active_traversal(&self) -> bool {
         self.active.iter().any(|active| {
-            matches!(
+            // A command whose stamp is owed finished: it no longer runs.
+            !active.stamps_owed
+                && matches!(
                 &active.packet.command,
                 crate::g17::command::Validated::Compute { scratch, .. } if scratch.enabled()
             )
@@ -106,13 +108,22 @@ impl Queue {
             && self.active.len != 0
             && self.exit.is_none()
             && (!self.active_traversal() || self.fault_pending())
-            && (self.quarantined || self.retired_by_teardown)
+            && (self.quarantined || self.retired_by_teardown || self.holds_only_owed_stamp())
             && age
                 >= if self.quarantined {
                     QUARANTINED_DELAY_NS
                 } else {
                     CANCELLED_DELAY_NS
                 }
+    }
+    /// The owner closed and every retained command retired on its completion record without
+    /// a completion stamp (`Active::stamps_owed`): each was reported to its client, and only
+    /// the stamp holds its descriptor. No later command of the closed owner can bring that
+    /// stamp, so without a kill of the context the queue, its QID and its pool backing stay
+    /// held until the processors stop. After the acknowledged kill the firmware no longer
+    /// walks the context's work, as for the render pairs a kill releases.
+    fn holds_only_owed_stamp(&self) -> bool {
+        self.released && self.active.len != 0 && self.active.iter().all(|active| active.stamps_owed)
     }
     /// M5: the watchdog failed this queue's command, and nothing has killed it yet. Its
     /// commands may never retire on their own (a dispatch that does not terminate), so a kill
@@ -291,14 +302,17 @@ impl Queue {
                 self.active.iter_mut().next().ok_or(EIO)?.qos_pending = false;
             }
             let active = self.active.front().ok_or(EIO)?;
-            defer(Deferred::Retired(
-                active.packet.completion.clone(),
-                Err(if self.spared_deferred {
-                    ENODATA
-                } else {
-                    ECANCELED
-                }),
-            ))?;
+            // A command whose stamp was owed was reported when it retired.
+            if !active.stamps_owed {
+                defer(Deferred::Retired(
+                    active.packet.completion.clone(),
+                    Err(if self.spared_deferred {
+                        ENODATA
+                    } else {
+                        ECANCELED
+                    }),
+                ))?;
+            }
             drop(self.active.pop());
         }
         // The acknowledged kill and command settlement replace the ordinary
