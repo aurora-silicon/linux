@@ -187,10 +187,17 @@ struct macaudio_platform_cfg {
 	 * No voltage or current sense reaches the AP, so no protection daemon
 	 * can govern the speakers, and there is no sense PCM. "Speaker Volume
 	 * Unlock" does not apply: the SN012776 volumes stay at the floor until
-	 * a "Speaker Protection" lease is granted, which runs them at
-	 * safe_vol, its operating gain and their ceiling.
+	 * the interface is on the "Speaker Protection" lease, and playback
+	 * starts only after a grant, which runs them at safe_vol, its
+	 * operating gain and their ceiling.
 	 */
 	bool spk_fixed_ceiling;
+	/*
+	 * With spk_fixed_ceiling: the amp level safe_vol was computed for. At
+	 * any other level the same volume drives the speaker differently, so
+	 * the speakers stay off.
+	 */
+	int spk_ceiling_level;
 };
 
 static const char *volume_control_names[] = {
@@ -2426,10 +2433,21 @@ static int macaudio_sn012776_level(struct device_node *amp)
 }
 
 /*
+ * A fixed ceiling holds only at the amp level it was computed for.
+ */
+static bool macaudio_sn012776_level_allowed(const struct macaudio_platform_cfg *cfg,
+					    int level)
+{
+	return level >= 0 && (!cfg->spk_fixed_ceiling || level == cfg->spk_ceiling_level);
+}
+
+/*
  * Speakers on SN012776 amps run only when every amp has its level from the
- * Mac; a boot loader that does not pass it leaves them off.
+ * Mac, and under a fixed ceiling only at the level that ceiling was computed
+ * for; otherwise they stay off.
  */
 static bool macaudio_sn012776_levels_present(struct device *dev,
+					     const struct macaudio_platform_cfg *cfg,
 					     struct device_node *codec)
 {
 	struct of_phandle_args args;
@@ -2444,8 +2462,13 @@ static bool macaudio_sn012776_levels_present(struct device *dev,
 		if (level < 0)
 			dev_err(dev, "%pOF: %s amp level from the boot loader\n", args.np,
 				level == -ENOENT ? "no" : "out-of-range");
+		else if (!macaudio_sn012776_level_allowed(cfg, level))
+			dev_err(dev, "%pOF: amp level %d, the fixed ceiling holds only at %d\n",
+				args.np, level, cfg->spk_ceiling_level);
+		else if (cfg->spk_fixed_ceiling)
+			dev_info(dev, "%pOF: amp level %d from the boot loader\n", args.np, level);
 		of_node_put(args.np);
-		if (level < 0)
+		if (!macaudio_sn012776_level_allowed(cfg, level))
 			return false;
 	}
 	return n > 0;
@@ -2685,11 +2708,12 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 			if (ma->cfg->amp == AMP_SN012776) {
 				struct device_node *spk_codec = of_get_child_by_name(np, "codec");
 				bool levels = spk_codec &&
-					macaudio_sn012776_levels_present(card->dev, spk_codec);
+					macaudio_sn012776_levels_present(card->dev, ma->cfg,
+									 spk_codec);
 
 				of_node_put(spk_codec);
 				if (!levels) {
-					dev_err(card->dev, "the boot loader passed no amp levels, disabling speakers\n");
+					dev_err(card->dev, "no usable amp levels from the boot loader, disabling speakers\n");
 					continue;
 				}
 			}
@@ -4075,16 +4099,25 @@ struct macaudio_platform_cfg macaudio_j700_cfg = {
  */
 struct macaudio_platform_cfg macaudio_j873_cfg = {
 	/*
-	 * No qualified speaker protection exists for J873 yet (no verified
-	 * sense path, thermal model or power budget), and there is no safe
-	 * level: macaudio_speakers_allowed() keeps the speaker off. The jack
-	 * is unaffected.
+	 * The firmware's speaker stream has no receive side (its ADT stream
+	 * descriptor has no RX slots, and the amp's speaker-protection is 0):
+	 * the amp's V/I sense never reaches the AP, so no protection daemon
+	 * can run. The speaker plays only under a "Speaker Protection" lease,
+	 * which speakerguardd holds with its J873 no-sense model, and then at
+	 * a fixed ceiling (macaudio_spk_lease_only()). At the
+	 * ADT's amp level 15 (18.5 dBV), -16 dB keeps the worst signal, a
+	 * full-scale square wave, at 0.77 W into 4.6 ohms (a sine at 0.39 W).
+	 * speakersafetyd's Mac mini (J274) model settles at 123 C under it,
+	 * below its 140 C limit, which it reaches at 0.94 W. That holds only
+	 * at level 15: at any other level the speaker stays off.
 	 */
-	.enable_speakers = false,
+	.enable_speakers = true,
 	.amp = AMP_SN012776,
 	.speakers = SPKR_1W,
 	.stereo = false,
-	.safe_vol = 0,
+	.safe_vol = -16,
+	.spk_fixed_ceiling = true,
+	.spk_ceiling_level = 15,
 	.fe_dai_names = { "j873-pcm-0", "j873-pcm-1", "j873-pcm-2" },
 	/* jack: a one-BCLK sync pulse, data launched on the rising edge */
 	.dai_fmt = SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_IB_NF,
@@ -4103,8 +4136,8 @@ struct macaudio_platform_cfg macaudio_j873_cfg = {
  * no RX (sense) slot, so the speaker can only be run under a protection lease
  * held by speakerguardd with a no-sense model, as on the J773g; that model
  * does not exist for these machines yet. Until it does there is no safe
- * level: macaudio_speakers_allowed() keeps the speaker off, as on the J873.
- * The jack is unaffected.
+ * level: macaudio_speakers_allowed() keeps the speaker off. The jack is
+ * unaffected.
  */
 struct macaudio_platform_cfg macaudio_j775_cfg = {
 	.enable_speakers = false,
@@ -4489,7 +4522,7 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j773-macaudio", .data = &macaudio_j575c_j773_cfg },
 	/* j773    -       cs42l84     -       the jack, a card of its own (AOP-fed) */
 	{ .compatible = "apple,j773-macaudio-jack", .data = &macaudio_j616_jack_cfg },
-	/* j873    AID48   sn012776    15      1x 1W    (AOP-fed, no protection) */
+	/* j873    AID48   sn012776    15      1x 1W    (AOP-fed, no sense: fixed ceiling) */
 	{ .compatible = "apple,j873-macaudio", .data = &macaudio_j873_cfg },
 	/* j775c   -       sn012776    -       1x 1W    (AOP-fed, no sense: speaker off) */
 	{ .compatible = "apple,j775c-macaudio", .data = &macaudio_j775_cfg },

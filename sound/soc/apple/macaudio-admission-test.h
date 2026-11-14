@@ -11,10 +11,14 @@ static void macaudio_admission_needs_a_safe_level(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&macaudio_j45x_cfg));
 	KUNIT_EXPECT_TRUE(test, macaudio_speakers_allowed(&macaudio_j413_cfg));
 	KUNIT_EXPECT_TRUE(test, macaudio_speakers_allowed(&macaudio_j700_cfg));
-	/* The AOP-fed machines: J714 and J813 with their safe level, J873 without one */
+	/*
+	 * The AOP-fed machines: J714 and J813 with their safe level, J873 at
+	 * its ceiling and only under a lease
+	 */
 	KUNIT_EXPECT_TRUE(test, macaudio_speakers_allowed(&macaudio_j714_cfg));
 	KUNIT_EXPECT_TRUE(test, macaudio_speakers_allowed(&macaudio_j813_cfg));
-	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&macaudio_j873_cfg));
+	KUNIT_EXPECT_TRUE(test, macaudio_speakers_allowed(&macaudio_j873_cfg));
+	KUNIT_EXPECT_TRUE(test, macaudio_spk_lease_only(&macaudio_j873_cfg));
 	/* The Mac Studio M5: no sense and no protection owner yet, speaker off */
 	KUNIT_EXPECT_FALSE(test, macaudio_speakers_allowed(&macaudio_j775_cfg));
 	cfg = macaudio_j413_cfg;
