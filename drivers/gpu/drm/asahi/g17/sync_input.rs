@@ -17,6 +17,13 @@ unsafe extern "C" {
     fn asahi_g17_put_fence(fence: *mut bindings::dma_fence);
     fn asahi_g17_merge_fences(fences: *const *mut bindings::dma_fence, count: usize)
         -> *mut bindings::dma_fence;
+    fn asahi_g17_local_inputs() -> u32;
+}
+
+/// Measurement only: `aurora.gpubench_local_inputs`, the switch of own-queue ring ordering.
+pub(super) fn local_inputs_enabled() -> bool {
+    // SAFETY: Reads a module parameter word.
+    unsafe { asahi_g17_local_inputs() != 0 }
 }
 
 /// One fence that signals once all of `fences` have (see `job::MERGED_DEPENDENCIES`).
@@ -70,6 +77,11 @@ use kernel::{new_mutex, sync::{Arc, Mutex}};
 
 pub(super) struct Source {
     pub(super) submission: Arc<Submission>,
+    /// Published by the consumer's own logical queue, on a board where that queue's next kick
+    /// holds for its ring parent until the parent completes: while the source is live on the
+    /// queue, ring order alone puts the consumer after it, so publication gives it no kick-entry
+    /// dependency or binding loan.
+    pub(super) local: bool,
 }
 
 /// The counter is independent of a physical queue's allocation and survives
@@ -187,6 +199,11 @@ impl NativeWait {
 static NATIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub(super) fn note_native(count: usize) { NATIVE.fetch_add(count as u64, Ordering::Relaxed); }
 pub(super) fn native_count() -> u64 { NATIVE.load(Ordering::Relaxed) }
+
+/// Live local sources that ring order covered at publication, without a kick-entry dependency.
+static LOCAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub(super) fn note_local(count: usize) { LOCAL.fetch_add(count as u64, Ordering::Relaxed); }
+pub(super) fn local_count() -> u64 { LOCAL.load(Ordering::Relaxed) }
 
 #[kunit_tests(asahi_g17_input_wait)]
 mod tests {

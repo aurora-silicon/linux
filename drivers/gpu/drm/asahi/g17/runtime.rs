@@ -1649,17 +1649,43 @@ impl super::Firmware {
         }
         let sources = packet.completion.sources().ok_or(EINVAL)?.clone();
         sources.check()?;
-        let mut merged = super::dependency::Frontier::new();
-        for dependency in dependencies { merged.insert(0, *dependency)?; }
-        let mut holds = KVec::with_capacity(sources.sources.len(), GFP_KERNEL)?;
-        let mut native: KVec<super::sync_input::NativeWait> =
-            KVec::with_capacity(sources.sources.len(), GFP_KERNEL)?;
         // M5 shared-ring queues have no completion-wait records: the consumer's kick entry names
         // the source's kick, and the firmware orders it.
         let m5 = self.init.is_m5();
+        // A local source live on this owner's queue (not quarantined, nothing to replay, published
+        // in this epoch) is ahead of the kick published below, which takes that queue's next
+        // slot. The queue then holds an unretired kick, so that kick's parent takes the
+        // completion class: ring order alone puts it after the source, which therefore needs no
+        // kick-entry dependency and no binding loan. Bit n stands for source n. Any other source,
+        // and a local one ring order does not cover now, takes the general path below.
+        let mut ordered = 0u64;
+        if m5 && sources.sources.iter().any(|source| source.local) {
+            if let Some(queue) = self.queues.compute(owner) {
+                let epoch = self.recovery.generation();
+                for (index, source) in sources.sources.iter().enumerate().take(64) {
+                    if source.local
+                        && queue.has_input_source(&source.submission, packet.completion.status(),
+                            epoch)
+                    {
+                        ordered |= 1u64 << index;
+                    }
+                }
+            }
+        }
+        let mut merged = super::dependency::Frontier::new();
+        for dependency in dependencies { merged.insert(0, *dependency)?; }
+        let unordered = sources.sources.len() - ordered.count_ones() as usize;
+        let mut holds = KVec::with_capacity(unordered, GFP_KERNEL)?;
+        let mut native: KVec<super::sync_input::NativeWait> =
+            KVec::with_capacity(unordered, GFP_KERNEL)?;
+        let mut local = 0;
         let mut waited: u128 = 0;
-        for source in &sources.sources {
+        for (index, source) in sources.sources.iter().enumerate() {
             if source.submission.source_status()? { continue; }
+            if index < 64 && ordered & (1u64 << index) != 0 {
+                local += 1;
+                continue;
+            }
             let found = self.queues.compute.iter_mut().flatten()
                 .filter_map(|entry| entry.queue.as_deref_mut())
                 .find_map(|mut queue| match queue.source_dependency(source, packet.completion.status(),
@@ -1700,6 +1726,7 @@ impl super::Firmware {
             sources.set_holds(holds);
             super::sync_input::note_published();
             super::sync_input::note_native(native.len());
+            super::sync_input::note_local(local);
         }
         result
     }
