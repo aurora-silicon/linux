@@ -1063,6 +1063,8 @@ bool iomfb_apply_backlight_h17p(struct apple_dcp *dcp,
 void iomfb_apply_opaque_x_h17p(struct apple_dcp *dcp, dcp_callback_t callback,
 			       void *cookie);
 void iomfb_opaque_x_reset_h17p(struct apple_dcp *dcp);
+void iomfb_apply_property_h17p(struct apple_dcp *dcp, u32 id, u32 value,
+			       dcp_callback_t callback, void *cookie);
 int iomfb_configure_backlight_h17p(struct apple_dcp *dcp, u32 maximum,
 				   bool inherited_valid, u32 inherited,
 				   bool default_valid, u32 default_nits);
