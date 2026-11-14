@@ -614,13 +614,16 @@ int main(void) {
         assert(strstr(now,"power_mw unsupported\n"));
         assert(strstr(now,"temperature_raw unsupported\n"));
         assert(strstr(now,"requested_frequency_hz unsupported\n"));
-        assert(strstr(now,"achieved_frequency_hz unsupported\n"));
         if(status==1) {
+            /* A valid state with no frequency in the board's table. */
+            assert(strstr(now,"achieved_frequency_hz unsupported\n"));
             assert(strstr(now,"util_tiler_percent 30\nutil_renderer_percent 80\nutil_device_percent 57\n"));
             assert(strstr(now,"pstate 6\n"));
         } else {
+            /* Not valid: the pstate and its frequency say why. */
+            assert(strstr(now,status==2?"pstate stale\n":"pstate unavailable\n"));
+            assert(strstr(now,status==2?"achieved_frequency_hz stale\n":"achieved_frequency_hz unavailable\n"));
             assert(strstr(now,"util_device_percent unsupported\n"));
-            assert(strstr(now,"pstate unsupported\n"));
             assert(strstr(now,status==2?"pstate_status stale\n":"pstate_status unavailable\n"));
             assert(strstr(now,status==2?"utilisation_status stale\n":"utilisation_status unavailable\n"));
         }
@@ -634,7 +637,11 @@ int main(void) {
     assert(strstr(now,"pstate 0\nrequested_frequency_hz unsupported\nachieved_frequency_hz 0\n"));
     current.pstate_status=2;
     agx_stats_show(NULL,&stats.attr,now);
-    assert(strstr(now,"pstate unsupported\nrequested_frequency_hz unsupported\nachieved_frequency_hz unsupported\n"));
+    assert(strstr(now,"pstate stale\nrequested_frequency_hz unsupported\nachieved_frequency_hz stale\n"));
+    /* M5: a stopped busy total reads stale. */
+    current=(struct asahi_qualified_stats){.util_status=1,.pstate_status=1,.pstate=6,.busy_status=2,.busy_ns=77};
+    agx_stats_show(NULL,&stats.attr,now);
+    assert(strstr(now,"busy_ns stale\n") && !strstr(now,"busy_ns 77"));
     /* G16S: pstate unsupported by firmware, utilisation still valid. */
     current=(struct asahi_qualified_stats){.util_status=1,.pstate_status=3,.tiler=30,.renderer=80,.device=57,.pstate=0,
                                           .util_samples=19,.util_host_ns=123};

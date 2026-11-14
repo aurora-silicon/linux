@@ -93,8 +93,13 @@ Description:
 		           its state in other records (see below).
 		           utilisation_status is never unsupported on these
 		           firmwares. Numeric metrics are printed only while
-		           their capability is valid; otherwise their value is
-		           the string unsupported.
+		           their capability is valid. Otherwise utilisation
+		           values read unsupported; pstate and
+		           achieved_frequency_hz read pstate_status (stale,
+		           unavailable or unsupported), and achieved_frequency_hz
+		           reads unsupported for a valid state with no
+		           frequency in the board's table; busy_ns reads stale
+		           when its total stopped and unsupported otherwise.
 
 		util_tiler_percent, util_renderer_percent, util_device_percent
 		           Unsigned integer percent (0..100), from tag 0x13
