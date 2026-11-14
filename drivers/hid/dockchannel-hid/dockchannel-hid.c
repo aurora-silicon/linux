@@ -225,9 +225,13 @@ struct dockchannel_hid {
 	struct gpio_desc *afe_reset;
 
 	struct mutex ring_mutex;
+	/* The T8132 transport changes reset and GPIO handling as well as receives. */
 	bool use_ring;
+	/* Receive through a host-memory ring while keeping the local reset paths. */
+	bool use_rx_ring;
 	bool ring_registered;
 	int ring_error;
+	size_t ring_size;
 	void *ring;
 	dma_addr_t ring_dma;
 	u32 ring_read;
@@ -588,29 +592,40 @@ static int dchid_register_ring(struct dockchannel_hid *dchid)
 	} __packed msg = {
 		.cmd = CMD_REGISTER_RING,
 		.addr = dchid->ring_dma,
-		.size = DCHID_RING_SIZE,
+		.size = dchid->ring_size,
 	};
 	/* Observed in both macOS and standalone T8132 bringup before 0x91. */
 	u8 prepare[] = { 0xc1, 0x02 };
 	int ret = 0;
+	bool refused;
+	bool *registered = &dchid->ring_registered;
+	int *error = &dchid->ring_error;
 
-	if (!dchid->use_ring)
+	if (!dchid->use_rx_ring)
 		return 0;
 
 	mutex_lock(&dchid->ring_mutex);
 	ret = dchid->ring_error;
 	if (!dchid->ring_registered) {
-		ret = dchid_comm_cmd(dchid, prepare, sizeof(prepare));
-		if (ret < 0) {
-			mutex_unlock(&dchid->ring_mutex);
-			return ret;
-		}
+		int cmd_ret = dchid_comm_cmd(dchid, prepare, sizeof(prepare));
+
 		/* The registration ACK itself arrives through the ring. */
 		dma_wmb();
-		WRITE_ONCE(dchid->ring_registered, true);
-		ret = dchid_comm_cmd(dchid, &msg, sizeof(msg));
-		dchid->ring_error = ret;
+		ret = dchid_ring_registration_result(cmd_ret, registered,
+						     error, &refused);
+		if (refused) {
+			dev_warn(dchid->dev,
+				 "receive ring refused (%d), staying on FIFO\n", cmd_ret);
+			goto unlock;
+		}
+		cmd_ret = dchid_comm_cmd(dchid, &msg, sizeof(msg));
+		ret = dchid_ring_registration_result(cmd_ret, registered,
+						     error, &refused);
+		if (refused)
+			dev_warn(dchid->dev,
+				 "receive ring refused (%d), staying on FIFO\n", cmd_ret);
 	}
+unlock:
 	mutex_unlock(&dchid->ring_mutex);
 	return ret;
 }
@@ -1590,7 +1605,7 @@ static int dchid_dispatch(struct dockchannel_hid *dchid, struct dchid_hdr *hdr,
 		return 0;
 	}
 
-	if (dchid->use_ring && hdr->channel == DCHID_CHANNEL_NOTIFY) {
+	if (dchid->use_rx_ring && hdr->channel == DCHID_CHANNEL_NOTIFY) {
 		/* A FIFO notification has no application subheader or report ID. */
 		return fifo && !hdr->length && hdr->iface == IFACE_COMM;
 	}
@@ -1636,7 +1651,7 @@ static void dchid_ring_copy(struct dockchannel_hid *dchid, void *dst,
 			    u32 offset, size_t length)
 {
 	size_t first = min_t(size_t, length,
-			     DCHID_RING_SIZE - DCHID_RING_HEADER_SIZE - offset);
+			     dchid->ring_size - DCHID_RING_HEADER_SIZE - offset);
 	void *data = dchid->ring + DCHID_RING_HEADER_SIZE;
 
 	memcpy(dst, data + offset, first);
@@ -1645,7 +1660,7 @@ static void dchid_ring_copy(struct dockchannel_hid *dchid, void *dst,
 
 static int dchid_drain_ring(struct dockchannel_hid *dchid)
 {
-	const u32 capacity = DCHID_RING_SIZE - DCHID_RING_HEADER_SIZE;
+	const u32 capacity = dchid->ring_size - DCHID_RING_HEADER_SIZE;
 	u32 *indices = dchid->ring;
 	u32 producer, consumer, available;
 	int size;
@@ -1802,6 +1817,14 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	mutex_init(&dchid->ring_mutex);
 	/* The M4 Pro (J616s) MTP uses the same 26.6.2 firmware transport as T8132. */
 	dchid->use_ring = of_device_is_compatible(dev->of_node, "apple,t6041-dockchannel-hid");
+	/*
+	 * The M5 MTP keeps this platform's reset and GPIO paths, but macOS gives
+	 * its large raw touch reports a 20 MiB host read FIFO. Try that receive
+	 * transport and fall back to the MMIO FIFO if the firmware refuses it.
+	 */
+	dchid->use_rx_ring = dchid->use_ring || of_machine_is_compatible("apple,t6050");
+	dchid->ring_size = of_machine_is_compatible("apple,t6050") ?
+		20 * SZ_1M : DCHID_RING_SIZE;
 
 	ret = dchid_bind_afe_smc(dchid);
 	if (ret)
@@ -1922,8 +1945,8 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	if (ret)
 		dev_warn(dev, "Failed to set up wakeup: %d\n", ret);
 
-	if (dchid->use_ring) {
-		dchid->ring = dmam_alloc_coherent(dev, DCHID_RING_SIZE, &dchid->ring_dma,
+	if (dchid->use_rx_ring) {
+		dchid->ring = dmam_alloc_coherent(dev, dchid->ring_size, &dchid->ring_dma,
 						  GFP_KERNEL);
 		if (!dchid->ring)
 			return -ENOMEM;

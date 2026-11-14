@@ -62,11 +62,45 @@ static void dchid_pm2_power_off_test(struct kunit *test)
 	KUNIT_EXPECT_MEMEQ(test, cmd, expected, sizeof(expected));
 }
 
+static void dchid_ring_refusal_keeps_fifo_test(struct kunit *test)
+{
+	bool registered = false;
+	bool refused = false;
+	int error = -ETIMEDOUT;
+	int ret;
+
+	ret = dchid_ring_registration_result(-ETIMEDOUT, &registered,
+					     &error, &refused);
+
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_TRUE(test, registered);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	KUNIT_EXPECT_TRUE(test, refused);
+}
+
+static void dchid_ring_success_clears_error_test(struct kunit *test)
+{
+	bool registered = false;
+	bool refused = true;
+	int error = -EIO;
+	int ret;
+
+	ret = dchid_ring_registration_result(0, &registered, &error,
+					     &refused);
+
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_TRUE(test, registered);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	KUNIT_EXPECT_FALSE(test, refused);
+}
+
 static struct kunit_case dchid_protocol_test_cases[] = {
 	KUNIT_CASE(dchid_pm1_command_test),
 	KUNIT_CASE(dchid_pm2_will_change_test),
 	KUNIT_CASE(dchid_pm2_has_changed_test),
 	KUNIT_CASE(dchid_pm2_power_off_test),
+	KUNIT_CASE(dchid_ring_refusal_keeps_fifo_test),
+	KUNIT_CASE(dchid_ring_success_clears_error_test),
 	{}
 };
 
