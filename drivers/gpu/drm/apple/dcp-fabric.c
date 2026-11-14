@@ -1091,6 +1091,7 @@ static bool dcp_typec_move_starved_locked(void)
 			continue;
 		list_for_each_entry(route, &port->routes, port_link) {
 			if (route != owner && route->dcp->fixed_phy &&
+			    !route->core.tunnel_only &&
 			    dcp_typec_route_available(route)) {
 				to = route;
 				break;
@@ -1138,6 +1139,7 @@ static bool dcp_typec_move_off_hybrid_locked(struct apple_dcp_typec_port *port,
 		return false;
 	list_for_each_entry(route, &port->routes, port_link) {
 		if (route != owner && !route->dcp->fixed_phy && route->dcp->crtc &&
+		    !route->core.tunnel_only &&
 		    dcp_typec_route_available(route)) {
 			to = route;
 			break;
@@ -4292,6 +4294,25 @@ bool dcp_typec_port_has_candidate(unsigned int idx, struct platform_device *pdev
 	return false;
 }
 
+/* Is @pdev's route to port @idx for DP tunnels only (apple,tunnel-only)? */
+bool dcp_typec_port_tunnel_only(unsigned int idx, struct platform_device *pdev)
+{
+	struct apple_dcp_typec_port *port;
+	struct apple_dcp_typec_route *route;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+
+	port = dcp_typec_port_by_index(idx);
+	if (!port)
+		return false;
+
+	list_for_each_entry(route, &port->routes, port_link)
+		if (route->dcp->dev == &pdev->dev)
+			return route->core.tunnel_only;
+
+	return false;
+}
+
 /*
  * Is every pipeline that can drive port @idx unusable (a failed T8122
  * dcpext, or a T8132 dcpext, whose DRM outputs are its own, see
@@ -4552,6 +4573,10 @@ static int dcp_register_typec_routes_present(void *data)
 		if (ret)
 			return dev_err_probe(dev, ret, "%pOF: missing crossbar state\n",
 					     route_np);
+
+		/* A route for USB4 DP tunnels only is never given a DP-alt stream. */
+		route->core.tunnel_only =
+			of_property_read_bool(route_np, "apple,tunnel-only");
 
 		ret = of_property_read_u32_index(dev->of_node, "apple,typec-dptx-phys",
 						 route_index, &route->dptx_phy);
@@ -4990,6 +5015,7 @@ static bool dcp_typec_hdmi_reclaim(struct apple_dcp *dcp)
 		return false;
 	list_for_each_entry(route, &port->routes, port_link) {
 		if (route == owner || !route->dcp->crtc ||
+		    (!owner->tunnel && route->core.tunnel_only) ||
 		    !dcp_typec_route_available(route) ||
 		    (owner->tunnel && !dcp_typec_tunnel_ctl(route, owner->tunnel_dpin)) ||
 		    (port->split_dcp == dcp && !dcp_follow_split_fits(route)))

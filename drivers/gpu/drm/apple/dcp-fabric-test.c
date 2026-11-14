@@ -2108,6 +2108,77 @@ static void fabric_per_dpin_slot_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_slot(&port, 3, true), -EBUSY);
 }
 
+/* A tunnel-only route never takes a direct DP-alt stream. */
+static void fabric_tunnel_only_test(struct kunit *test)
+{
+	struct fabric_fixture f;
+	int error;
+
+	/* Pipeline 1 would win: the hybrid pipeline 0 is kept for HDMI. */
+	fabric_init(&f, false);
+	f.route[0][1].tunnel_only = true;
+	KUNIT_EXPECT_PTR_EQ(test, dcp_fabric_free_route(&f.port[0], &f.policy),
+			    &f.route[0][0]);
+	/* not even as the port's last route */
+	f.port[0].preferred = &f.route[0][1];
+	KUNIT_EXPECT_PTR_EQ(test, dcp_fabric_free_route(&f.port[0], &f.policy),
+			    &f.route[0][0]);
+	/* It still carries a tunnel. */
+	KUNIT_EXPECT_PTR_EQ(test,
+			    dcp_fabric_tunnel_candidate(&f.port[0], &f.policy, NULL,
+							false, 0, true, &error),
+			    &f.route[0][1]);
+	f.route[0][0].tunnel_only = true;
+	KUNIT_EXPECT_PTR_EQ(test, dcp_fabric_free_route(&f.port[0], &f.policy),
+			    NULL);
+
+	/* The pairing plan passes it over for a direct stream only. */
+	fabric_init(&f, true);
+	f.route[0][0].tunnel_only = true;
+	f.port[0].wanted = true;
+	f.port[0].hpd = true;
+	dcp_fabric_plan(f.pipeline, f.port, NULL, 0);
+	KUNIT_EXPECT_PTR_EQ(test, f.plan[0].target[0], &f.route[0][1]);
+	f.port[0].wanted = false;
+	dcp_fabric_plan(f.pipeline, f.port, &f.port[0], 0);
+	KUNIT_EXPECT_PTR_EQ(test, f.plan[0].target[0], &f.route[0][0]);
+
+	/* A tunnel in a per-DP IN slot makes the port's stream a tunnel. */
+	fabric_init(&f, true);
+	f.route[0][0].tunnel_only = true;
+	f.port[0].wanted = true;
+	f.port[0].hpd = true;
+	f.route[1][1].tunnel = true;
+	f.port[0].owner[2] = &f.route[1][1];
+	dcp_fabric_plan(f.pipeline, f.port, NULL, 0);
+	KUNIT_EXPECT_PTR_EQ(test, f.plan[0].target[0], &f.route[0][0]);
+
+	/* A direct stream does not follow its CRTC onto it; a tunnel does. */
+	fabric_init(&f, false);
+	f.route[0][1].tunnel_only = true;
+	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(&f.route[0][0], &f.route[0][1],
+						NULL, NULL, false, &f.policy),
+			DCP_FABRIC_FOLLOW_REFUSE);
+	f.route[0][0].tunnel = true;
+	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(&f.route[0][0], &f.route[0][1],
+						NULL, NULL, false, &f.policy),
+			DCP_FABRIC_FOLLOW_MOVE);
+	/* nor is a direct holder swapped onto one */
+	f.route[1][0].tunnel_only = true;
+	f.pipeline[1].owned = true;
+	f.route[0][0].tunnel_only = false;
+	f.route[0][1].tunnel_only = false;
+	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(&f.route[0][0], &f.route[0][1],
+						&f.route[1][1], &f.route[1][0], true,
+						&f.policy),
+			DCP_FABRIC_FOLLOW_REFUSE);
+	f.route[1][0].tunnel_only = false;
+	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(&f.route[0][0], &f.route[0][1],
+						&f.route[1][1], &f.route[1][0], true,
+						&f.policy),
+			DCP_FABRIC_FOLLOW_SWAP);
+}
+
 static void fabric_t6030_follow_test(struct kunit *test)
 {
 	struct fabric_fixture f;
@@ -2433,6 +2504,7 @@ static struct kunit_case fabric_tests[] = {
 	KUNIT_CASE(fabric_t6030_plan_test),
 	KUNIT_CASE(fabric_t6030_follow_test),
 	KUNIT_CASE(fabric_per_dpin_slot_test),
+	KUNIT_CASE(fabric_tunnel_only_test),
 	KUNIT_CASE(fabric_reclaim_transaction_test),
 	KUNIT_CASE_PARAM(fabric_shared_wiring_test, fabric_wiring_gen_params),
 	KUNIT_CASE(fabric_binding_cookie_test),

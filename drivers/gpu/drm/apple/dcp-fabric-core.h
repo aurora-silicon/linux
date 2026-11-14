@@ -65,6 +65,8 @@ struct dcp_fabric_route {
 	unsigned int dpin;
 	/* DP IN adapters this source cannot clock; direct DP is unaffected. */
 	u8 tunnel_clock_blocked;
+	/* Carries DP tunnels only, never a direct DP-alt stream. */
+	bool tunnel_only;
 };
 
 struct dcp_fabric_plan {

@@ -186,7 +186,8 @@ dcp_fabric_free_route(const struct dcp_fabric_port *port,
 	for (route = port->routes; route; route = route->next) {
 		unsigned int score;
 
-		if (!dcp_fabric_available(route->pipeline, policy))
+		if (route->tunnel_only ||
+		    !dcp_fabric_available(route->pipeline, policy))
 			continue;
 		score = dcp_fabric_score(route->pipeline, policy);
 		if (score < best_score) {
@@ -194,7 +195,8 @@ dcp_fabric_free_route(const struct dcp_fabric_port *port,
 			best_score = score;
 		}
 	}
-	if (!last || !dcp_fabric_available(last->pipeline, policy))
+	if (!last || last->tunnel_only ||
+	    !dcp_fabric_available(last->pipeline, policy))
 		return best;
 	if (!policy->dual_stream && best &&
 	    best_score < dcp_fabric_score(last->pipeline, policy))
@@ -213,6 +215,17 @@ dcp_fabric_port_route(const struct dcp_fabric_port *port,
 		if (route->pipeline == pipeline)
 			return route;
 	return NULL;
+}
+
+/* Does a DP tunnel hold any of @port's owner slots? */
+static bool dcp_fabric_port_tunneled(const struct dcp_fabric_port *port)
+{
+	unsigned int i;
+
+	for (i = 0; i < DCP_FABRIC_DPIN_MAX; i++)
+		if (port->owner[i] && port->owner[i]->tunnel)
+			return true;
+	return false;
 }
 
 static void dcp_fabric_plan_pipeline(struct dcp_fabric_pipeline *pipeline,
@@ -242,10 +255,11 @@ static void dcp_fabric_plan_pipeline(struct dcp_fabric_pipeline *pipeline,
 			      BIT(pipeline->crtc_index)))
 				continue;
 			route = dcp_fabric_port_route(port, pipeline);
-			tunnel = stream || (port->owner[0] && port->owner[0]->tunnel) ||
+			tunnel = stream || dcp_fabric_port_tunneled(port) ||
 				 (port == arriving && dpin == 0);
 			if (!route || (tunnel &&
-				       (route->tunnel_clock_blocked & BIT(stream))))
+				       (route->tunnel_clock_blocked & BIT(stream))) ||
+			    (!tunnel && route->tunnel_only))
 				continue;
 			port->plan->target[stream] = route;
 			return;
@@ -397,6 +411,10 @@ dcp_fabric_follow(const struct dcp_fabric_route *from,
 	    (holder && holder->tunnel && holder_back &&
 		(holder->dpin >= DCP_FABRIC_DPIN_MAX ||
 		 (holder_back->tunnel_clock_blocked & BIT(holder->dpin)))))
+		return DCP_FABRIC_FOLLOW_REFUSE;
+	/* A direct stream never moves onto a tunnel-only route. */
+	if ((!from->tunnel && to->tunnel_only) ||
+	    (holder && !holder->tunnel && holder_back && holder_back->tunnel_only))
 		return DCP_FABRIC_FOLLOW_REFUSE;
 	pipeline = to->pipeline;
 	if (!pipeline->bound || pipeline->fixed_busy || pipeline->terminal ||
