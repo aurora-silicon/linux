@@ -886,6 +886,22 @@ static int __attribute__((unused)) dcp_direct_crossbar_link(struct apple_dcp *d,
     # The desktop 26.6 VRR filter is gone once that firmware takes adaptive sync.
     vrr_filter = block(iomfb,'static bool dcp_mode_vrr_supported(')+'\n' if 'static bool dcp_mode_vrr_supported(' in iomfb else ''
     publication = block(iomfb,'static void dcp_clear_connector_edid(')+'\n'+block(iomfb,'static void dcp_consume_edid_invalidation(')+mode_helpers+vrr_filter+block(iomfb,'int dcp_get_modes(')+block(iomfb,'bool lookup_mode(')
+    if 'dcp_edid_sdr(' in publication:
+        # Keep extracting the real publication path, including its SDR helper.
+        # Model only kernel allocation/DRM ownership at the host boundary.
+        sdr = '\n'.join(line for line in (base / 'dcp-sdr-edid.h').read_text().splitlines()
+                        if not line.startswith('#include'))
+        publication = sdr + r"""
+static void *kmemdup(const void *data,size_t size,int gfp) {
+    (void)gfp;void *copy=malloc(size);if(copy)memcpy(copy,data,size);return copy;
+}
+static const struct drm_edid *drm_edid_alloc(const void *data,size_t size) {
+    assert(size<=sizeof(transport_edid.data));
+    struct drm_edid *e=calloc(1,sizeof(*e));
+    if(e) { memcpy(e->data,data,size);raw_allocations++; }
+    return e;
+}
+""" + publication
     # Drive malformed replacements through the same chunk/end ingress as firmware.
     # The dictionary cache is a boundary substitute and takes ownership of the blob.
     receipt = r'''

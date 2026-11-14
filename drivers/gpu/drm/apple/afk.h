@@ -505,6 +505,8 @@ struct apple_dcp_afkep {
 	void *bfr;
 	u16 bfr_tag;
 	size_t bfr_size;
+	size_t ext26_command_bytes;
+	unsigned int ext26_command_count;
 	dma_addr_t bfr_dma;
 
 	struct afk_ringbuffer txbfr;
@@ -570,6 +572,9 @@ int afk_v2_copy_owned(struct apple_epic_service *service, u64 dva,
 int afk_start(struct apple_dcp_afkep *ep);
 int afk_start_service(struct apple_epic_service *service);
 void afk_cancel_commands(struct apple_dcp_afkep *ep);
+/* A sampled host boundary, never a remote-producer or DMA fence. */
+bool afk_host_idle(struct apple_dcp_afkep *ep);
+
 bool afk_compact_orphans_wait(struct apple_dcp_afkep *ep, unsigned long timeout);
 unsigned int afk_compact_orphans_drop(struct apple_dcp_afkep *ep);
 bool afk_compact_orphans_pending(struct apple_dcp_afkep *ep);

@@ -121,6 +121,10 @@ u8 dcp_crtc_eotf(struct apple_dcp *dcp, struct drm_crtc *crtc,
 int dcp_crtc_check_hdr(struct apple_dcp *dcp, struct drm_crtc *crtc,
 		       struct drm_atomic_commit *commit);
 void dcp_hdr_metadata_forget(struct apple_dcp *dcp);
+int iomfb_ext26_blank(struct apple_dcp *dcp);
+bool iomfb_ext26_backing_fresh(struct apple_dcp *dcp, struct drm_framebuffer *fb);
+int iomfb_ext26_retain_epoch(struct apple_dcp *dcp);
+bool iomfb_ext26_control_complete(struct apple_dcp *dcp, u32 id, bool aborted);
 int dcp_push_nested(struct apple_dcp *dcp, enum dcp_context_id origin,
 		    const struct dcp_method_entry *call, u32 in_len, u32 out_len,
 		    void *data, dcp_callback_t cb, void *cookie);

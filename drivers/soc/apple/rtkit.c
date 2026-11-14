@@ -9,6 +9,7 @@
 
 #include <linux/iommu.h>
 #include <linux/iopoll.h>
+#include <linux/ktime.h>
 #include <linux/jiffies.h>
 #include <linux/of.h>
 #include <linux/overflow.h>
@@ -143,6 +144,7 @@ struct apple_rtkit_rx_work {
 	struct apple_rtkit *rtk;
 	u8 ep;
 	u64 msg;
+	u64 received_ns;
 	struct work_struct work;
 };
 
@@ -1373,7 +1375,10 @@ static void apple_rtkit_rx_work(struct work_struct *work)
 		apple_rtkit_oslog_rx(rtk, rtk_work->msg);
 		break;
 	case APPLE_RTKIT_APP_ENDPOINT_START ... 0xff:
-		if (rtk->ops->recv_message)
+		if (rtk->ops->recv_message_timed)
+			rtk->ops->recv_message_timed(rtk->cookie, rtk_work->ep,
+						     rtk_work->msg, rtk_work->received_ns);
+		else if (rtk->ops->recv_message)
 			rtk->ops->recv_message(rtk->cookie, rtk_work->ep,
 					       rtk_work->msg);
 		else
@@ -1440,6 +1445,7 @@ static void apple_rtkit_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 	struct apple_rtkit *rtk = cookie;
 	struct apple_rtkit_rx_work *work;
 	u8 ep = msg.msg1;
+	u64 received_ns = ktime_get_ns();
 
 	if (READ_ONCE(rtk->shutting_down))
 		return;
@@ -1491,6 +1497,7 @@ static void apple_rtkit_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 	work->rtk = rtk;
 	work->ep = ep;
 	work->msg = msg.msg0;
+	work->received_ns = received_ns;
 	INIT_WORK(&work->work, apple_rtkit_rx_work);
 	queue_work(rtk->wq, &work->work);
 }
