@@ -8,11 +8,11 @@ struct apple_atcphy {
 	struct {
 		bool prepared;
 	} cio_sleep;
-    struct { void *usb3_dp; } tunables;
+    struct { void *usb3_dp, *dp_lioa, *dp_common_config; } tunables;
 
 	const struct atcphy_hw *hw;
 	struct {
-		unsigned char *core, *lpdptx, *pipehandler, *usb2phy;
+		unsigned char *core, *lpdptx, *pipehandler, *usb2phy, *lioa;
 	} regs;
 	struct reset_controller_dev rcdev;
 	void *dev;
@@ -244,6 +244,8 @@ static void atcphy_usb2_power_on(struct apple_atcphy *p)
 {
 	(void)p;
 }
+/* The modeled PHYs have no banked DisplayPort calibration (dp_banked_tunables). */
+static inline void apple_tunable_apply(void *regs, void *tunable) { (void)regs; (void)tunable; }
 static void atcphy_apply_tunables(struct apple_atcphy *p, enum atcphy_mode m)
 {
 	(void)p;

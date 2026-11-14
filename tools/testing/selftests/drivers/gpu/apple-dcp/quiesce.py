@@ -123,7 +123,14 @@ static void gpiod_set_value_cansleep(void *p,int v) { (void)p;assert(v==1);gpio_
 '''.replace('REMOVE_RETURN','void' if parent else 'int')
  policy=block(mux,'bool typec_mux_safe_after_role(')+'\n' if 'bool typec_mux_safe_after_role(' in mux else ''
  functions=policy+'\n'.join(block(mux, marker) for marker in ('static void typec_mux_unlock(', 'void typec_mux_abort(', 'int typec_mux_begin(', 'int typec_mux_apply(', 'int typec_mux_end(', 'int typec_mux_prepare(')) if not parent else block((reference/'drivers/usb/typec/mux.c').read_text(),'int typec_mux_prepare(')+'\n'
- functions+=block(mux,'int typec_mux_set(')+'\n'+block(dcp,'static int dcp_typec_route_prepare(')+'\n'+block(dcp,'static int dcp_typec_route_finish(')+'\n'+block(dcp,'static void dcp_typec_route_commit(')+'\n'
+ functions+='''
+/* The modeled processors are not T8142 externals: the route order is unchanged. */
+static bool dcp_t8142_ext(struct apple_dcp *dcp) { (void)dcp; return false; }
+/* DCP_T8142_ROUTE_APPLY_STUB */
+static int dcp_typec_route_apply(struct typec_mux_dev *mux, struct typec_mux_state *state)
+{ (void)mux; (void)state; return 0; }
+/* DCP_T8142_ROUTE_APPLY_STUB_END */
+'''+block(mux,'int typec_mux_set(')+'\n'+block(dcp,'static int dcp_typec_route_prepare(')+'\n'+block(dcp,'static int dcp_typec_route_finish(')+'\n'+block(dcp,'static void dcp_typec_route_commit(')+'\n'
  functions+=fabric_rebalance(dcp)
  if 'static bool tps6598x_safe_after_role(' in core:
   functions+=block(core,'static bool tps6598x_safe_after_role(')+'\n'
@@ -146,10 +153,10 @@ enum atcphy_pipehandler_state { ATCPHY_PIPEHANDLER_STATE_DUMMY, ATCPHY_PIPEHANDL
 GENERATION_ENUM
 struct atcphy_hw { GENERATION_FIELD bool has_usb4,has_t8140_dp,dp_t8122; u32 usb2phy_sig_host; };
 struct apple_atcphy {
- struct { void *usb3_dp; } tunables;
+ struct { void *usb3_dp, *dp_lioa, *dp_common_config; } tunables;
  void *dev; int lock;
  const struct atcphy_hw *hw;
- struct { void *usb2phy; } regs;
+ struct { void *usb2phy, *lioa; } regs;
  bool fixed_usb2,host_active,mode_dirty,pipe_pending,usb_off_pending,ss_tunables,dp_tunables,cio_tunables,t8132_dp_alt;
  bool usb3_port_off,park_owed,dp_only,pd_was_off;
  bool t8103_dummy_pending,t8103_usb3_retry,t8103_usb3_workaround;

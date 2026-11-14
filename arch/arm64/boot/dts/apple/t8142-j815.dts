@@ -2,12 +2,20 @@
 /*
  * Apple MacBook Air (15-inch, M5), J815.
  *
- * Boots on the T8142 inventory with the resources its ADT (25G83) shares
- * with J813: CPUs, timer, AIC, DockChannel UART, PMGR, CPU performance
- * states, PMC, SMC, the MTP keyboard and trackpad, ANS NVMe, watchdog and
- * PMU. The loader supplies usable memory, CPU release addresses and
- * framebuffer geometry. Audio, display, USB, camera, GPU and radios are not
- * described yet: their J815 wiring has not been checked.
+ * J815 is the 15-inch sibling of J813 on the same T8142 die. It uses the
+ * J813 board fragments and overrides what the J815 ADT shows to be
+ * different:
+ *
+ *  - /chosen board-id 0x26 (J813: 0x24)
+ *  - 15.3" 2880x1864 panel (2880x1800 below the notch), 326 x 211 mm
+ *  - six SN012776 speaker amplifiers on i2c3 (0x38-0x3d: two tweeters and
+ *    four force-cancelling woofers); J813 has four
+ *  - ISP sensor-type 0x72 (J813: 0x71)
+ *  - MTP hid-merge-personality C1FD3,3 (J813: C1FD1,4)
+ *
+ * The rest of the J813/J815 ADT difference is firmware selection (AOP
+ * j815aop, acoustic-id 0x2b), ADMAC speaker channel counts and higher
+ * CLPC package power limits.
  */
 /dts-v1/;
 
@@ -114,17 +122,17 @@
 	status = "okay";
 };
 
-&pmgr {
-	status = "okay";
-};
-
-&mtp_dart {
-	/* Keep host allocations clear of firmware's low IOVA mappings. */
-	apple,dma-range = <0 0x02000000 0 0x10000000>;
-	status = "okay";
-};
-
+#include "t8142-j813-display.dtsi"
+#include "t8142-j813-gpu.dtsi"
+#include "t8142-j813-peripherals.dtsi"
 #include "t8142-j813-j815.dtsi"
+#include "t8142-j813-usb.dtsi"
+#include "t8142-j813-dcpext.dtsi"
+#include "t8142-j813-dpaudio.dtsi"
+#include "t8142-j813-avd.dtsi"
+#include "t8142-j813-isp.dtsi"
+#include "t8142-j813-n1.dtsi"
+#include "t8142-j813-audio.dtsi"
 
 &mtp_hid {
 	multi-touch {
@@ -133,7 +141,241 @@
 	};
 };
 
-/* Unexposed chassis port instances remain described and disabled. */
+&pmp {
+	/* ADT /chosen board-id (J815) */
+	apple,board-id = <38>;
+};
+
+&panel {
+	compatible = "apple,panel-j815", "apple,panel";
+	width-mm = <326>;
+	height-mm = <211>;
+	adj-height-mm = <204>;
+};
+
+&isp {
+	/* J815 ADT /arm-io/isp sensor-type */
+	apple,platform-id = <0x72>;
+};
+
+/*
+ * Ambient light sensor, the AOP's "als" service: an ST VD6286, as on the
+ * M4 Pro, not T8140's CT817. aop_als sends it the per-device calibration
+ * (apple/aop-als-cal.bin) as its calibration property. There is no
+ * firmware-name: that names the CT817 setup-port message, which this sensor
+ * does not take.
+ */
+&aop {
+	aop_als: als {
+		compatible = "apple,t8142-aop-als", "apple,aop-als";
+	};
+};
+
+/*
+ * N1 functions behind apcie port 0 (0000:00:00.0 -> 01:00.{0,1,2}), so the
+ * loader has somewhere to put the factory addresses: it copies ADT /chosen
+ * mac-address-wifi0 and mac-address-bluetooth0 into the wifi0/bluetooth0
+ * alias targets, as on T6050 (t6050-j716s.dts).
+ */
+/ {
+	aliases {
+		wifi0 = &n1_alpha;
+		bluetooth0 = &n1_beta;
+		/*
+		 * The loader finds the SEP through this alias: it reserves SEPFW
+		 * and copies the boot's local-policy and iBoot manifests onto
+		 * the node.
+		 */
+		sep = &sep;
+	};
+};
+
+&pcie0 {
+	n1_port: pci@0,0 {
+		device_type = "pci";
+		reg = <0x0 0x0 0x0 0x0 0x0>;
+		bus-range = <1 1>;
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		n1_control: control@0,0 {
+			compatible = "apple,t8142-centauri-control", "pci106b,1900";
+			reg = <0x10000 0x0 0x0 0x0 0x0>;
+		};
+
+		n1_alpha: wifi@0,1 {
+			compatible = "pci106b,1902";
+			reg = <0x10100 0x0 0x0 0x0 0x0>;
+			/* Filled by the loader */
+			local-mac-address = [00 00 00 00 00 00];
+		};
+
+		n1_beta: bluetooth@0,2 {
+			compatible = "pci106b,1903";
+			reg = <0x10200 0x0 0x0 0x0 0x0>;
+			/* Filled by the loader */
+			local-bd-address = [00 00 00 00 00 00];
+		};
+	};
+};
+
+/*
+ * SMC sensors beyond the discovered temperatures. Only non-temperature nodes
+ * may be added here: a temperature-* node would stop
+ * apple,discover-temperatures. Keys the SMC lacks are skipped at probe. The
+ * die key list is J704's (same T8142): the listed keys form the SoC die
+ * thermal zone.
+ */
+&smc {
+	hwmon {
+		apple,soc-die-keys = "Te04", "Te08", "Te0C", "Te0R",
+				     "Tp00", "Tp04", "Tp0C", "Tp0G", "Tp0O",
+				     "Tp0R", "Tp0X", "Tp0a", "Tp0p", "Tp0u",
+				     "Tp0y", "Tp12", "Tp16", "Tp1E",
+				     "Tg0U", "Tg0X", "Tg0d", "Tg0g", "Tg0j",
+				     "Tg1Y", "Tg1c", "Tg1g";
+		apple,thermal-pressure-key = "mTPL";
+
+		power-PSTR {
+			apple,key-id = "PSTR";
+			label = "Total System Power";
+		};
+
+		power-PDTR {
+			apple,key-id = "PDTR";
+			label = "AC Input Power";
+		};
+
+		power-PMVR {
+			apple,key-id = "PMVR";
+			label = "3.8 V Rail Power";
+		};
+
+		voltage-VD0R {
+			apple,key-id = "VD0R";
+			label = "AC Input Voltage";
+		};
+
+		voltage-SBAV {
+			apple,key-id = "SBAV";
+			label = "Battery Voltage";
+		};
+
+		current-ID0R {
+			apple,key-id = "ID0R";
+			label = "AC Input Current";
+		};
+	};
+};
+
+/*
+ * Secure Enclave and the Touch ID sensor. All values are from the J815 ADT
+ * (macOS 27.0):
+ *  - sep: iop-sep,ascwrap-v6 at 0x30a600000 (0x88000), pre-booted by iBoot
+ *    (sepfw-booted), so apple_sep warm-attaches; its mailbox is the ASC
+ *    mailbox at +0x8000, AIC 445-448 (ADT order 446,445,448,447 as on the
+ *    AOP: send-empty..recv-not-empty ascending).
+ *  - dart-sep: t8110 at 0x308b80000, irq 455; input aperture vm-base-0
+ *    0x10000004000 + vm-size-0 0xffff0000 (the BIT(40) alias, as T8132).
+ *  - spi2 at 0x3a5108000, irq 0x4d9; PMGR device SPI2 at +0x440, parent
+ *    SPI_P (id 94).
+ *  - mesa: "biosensor,mesa", sensor-id V3, 8 MHz, CS0; power
+ *    function-mesa_pwr = NUB GPIO pin 36; data-ready interrupt on AP
+ *    GPIO pin 200.
+ * The SEP and its DART stay disabled here: apple_sep enables them at module
+ * init (drivers/soc/apple/dt.rs).
+ */
+&pmgr {
+	ps_spi2: power-controller@440 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x440 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_spi_p>;
+		label = "spi2";
+	};
+};
+
+&{/soc} {
+	sep: sep@30a600000 {
+		compatible = "apple,sep";
+		reg = <0x3 0x0a600000 0x0 0x88000>;
+		mboxes = <&sep_mbox>;
+		mbox-names = "mbox";
+		iommus = <&sep_dart 0>;
+		status = "disabled";
+	};
+
+	sep_mbox: mbox@30a608000 {
+		compatible = "apple,t8142-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x0a608000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 445 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 446 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 447 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 448 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		status = "okay";
+	};
+
+	spi2: spi@3a5108000 {
+		compatible = "apple,t8142-spi", "apple,t8103-spi";
+		reg = <0x3 0xa5108000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1241 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clkref>;
+		power-domains = <&ps_spi2>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "okay";
+
+		mesa: fingerprint@0 {
+			compatible = "apple,mesa-fingerprint";
+			reg = <0>;
+			spi-max-frequency = <8000000>;
+			spi-cpol;
+			spi-cs-setup-delay-ns = <20>;
+			spi-cs-hold-delay-ns = <20>;
+			enable-gpios = <&pinctrl_nub 36 GPIO_ACTIVE_HIGH>;
+			interrupt-parent = <&pinctrl_ap>;
+			interrupts = <200 IRQ_TYPE_EDGE_RISING>;
+			/* Per-device files, built from the Mac's own factory records. */
+			firmware-name = "apple/mesacal-j815.bin", "apple/msrk-j815.bin";
+			status = "okay";
+		};
+	};
+};
+
+&sep_dart {
+	apple,dma-range = /bits/ 64 <0x10000004000 0xffff0000>;
+	apple,dma-offset = /bits/ 64 <0x0>;
+};
+
+/* Expose the sensor's two pins next to the ones sound uses. */
+&pinctrl_ap {
+	gpio-reserved-ranges = <0 100>, <101 49>, <152 48>, <201 23>;
+};
+
+&pinctrl_nub {
+	gpio-reserved-ranges = <0 18>, <19 17>, <37 3>;
+};
+
+/*
+ * J815 has six speaker amplifiers, not J813's four. Keep J813's sound card
+ * and the AOP audio service off until the J815 speaker layout is described.
+ */
+&aop_audio {
+	status = "disabled";
+};
+
+/ {
+	sound {
+		status = "disabled";
+	};
+};
 
 /* aura (mcc_init_m5) turns the system level cache on; the driver confirms it and flushes on shutdown. */
 &mcc {

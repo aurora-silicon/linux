@@ -1,0 +1,300 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * External displays of the T8142 MacBook Airs (J813, J815): DisplayPort alt
+ * mode on the two USB-C ports.
+ *
+ * iBoot preloads both external display processors with the internal DCP's
+ * image and leaves them running idle. The boot loader checks each one and
+ * hands it over: it reserves the firmware, publishes its version and enables
+ * the processor, its mailbox, its DARTs and its Type-C route together. Until
+ * then everything here stays disabled and the ports are plain USB.
+ *
+ * dcpext0 serves the front port (ATC0), dcpext1 the rear port (ATC1): one
+ * processor per port, so two displays need no arbitration. Crossbar source
+ * numbers are twice the ADT dp-switch-ufp-endpoint (dcpext0 1, dcpext1 2).
+ * Addresses and interrupts are from the J815AP ADT (the J813AP 27.0 ADT is
+ * identical in every node used here); the bandwidth scratch
+ * slots are the /arm-io/pmgr bwr-agent indexes of DISP_EXT0 (3) and DISP_EXT1
+ * (4) at 0x20000 + n * 0x4000. The T8142 topology follows the J704's.
+ */
+
+/ {
+	aliases {
+		dcpext0 = &dcpext0;
+		dcpext1 = &dcpext1;
+	};
+};
+
+&{/soc} {
+	pmgr_dcpext0: power-management@38272c000 {
+		reg = <3 0x8272c000 0 0x8>, <3 0x827b0000 0 0x4>;
+		reg-names = "dcp-bw-scratch", "dcp-bw-doorbell";
+		#apple,bw-scratch-cells = <3>;
+		#apple,bw-doorbell-cells = <2>;
+	};
+
+	pmgr_dcpext1: power-management@382730000 {
+		reg = <3 0x82730000 0 0x8>, <3 0x827b4000 0 0x4>;
+		reg-names = "dcp-bw-scratch", "dcp-bw-doorbell";
+		#apple,bw-scratch-cells = <3>;
+		#apple,bw-doorbell-cells = <2>;
+	};
+
+	dcpext0_mbox: mailbox@506e08000 {
+		compatible = "apple,t8142-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <5 0x06e08000 0 0x4000>;
+		interrupts = <AIC_IRQ 853 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 854 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 855 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 856 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	dcpext0: dcp@506e00000 {
+		compatible = "apple,t8142-dcpext", "apple,dcpext";
+		reg = <5 0x06e00000 0 0x4000>,
+		      <5 0x04000000 0 0xb1c000>,
+		      <5 0x06240000 0 0x10000>,
+		      <5 0x063ac000 0 0x4000>,
+		      <5 0x06800000 0 0x800000>,
+		      <3 0x82700000 0 0x114000>,
+		      <5 0x06850000 0 0x4000>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2",
+			    "disp-3", "disp-4", "iop-vbar";
+		mboxes = <&dcpext0_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcpext0_dart 23>;
+		/* The firmware's clocks: /arm-io/dispext0 clock-ids, as on disp0. */
+		apple,clock-ids = <369 432>;
+		clocks = <&clkref>, <&dcpext_fw_clk369>, <&dcpext_fw_clk432>;
+		clock-names = "clock-154", "firmware-0", "firmware-1";
+		apple,bw-scratch = <&pmgr_dcpext0 0 5 0>;
+		apple,bw-doorbell = <&pmgr_dcpext0 1 6>;
+		apple,iomfb-surfaces = <0 0 1 0>;
+		apple,dcp-index = <1>;
+		apple,connector-type = "USB-C";
+		apple,typec-dptx-phys = <0>;
+		apple,typec-mux-indices = <2>;
+		phys = <&atcphy0 PHY_TYPE_DP>;
+		phy-names = "typec0";
+		mux-controls = <&dpxbar0 0>;
+		mux-control-names = "typec0";
+		/* Enabled by the boot loader once it has checked the session. */
+		status = "disabled";
+		#address-cells = <2>;
+		#size-cells = <2>;
+
+		piodma {
+			iommus = <&dispext0_dart 16>;
+		};
+
+		typec-routes {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			route@0 {
+				reg = <0>;
+				mode-switch;
+				status = "disabled";
+
+				port {
+					dcpext0_typec0: endpoint {
+						remote-endpoint = <&typec0_display>;
+					};
+				};
+			};
+		};
+	};
+
+	dcpext1_mbox: mailbox@3aae08000 {
+		compatible = "apple,t8142-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <3 0xaae08000 0 0x4000>;
+		interrupts = <AIC_IRQ 925 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 926 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 927 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 928 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	dcpext1: dcp@3aae00000 {
+		compatible = "apple,t8142-dcpext", "apple,dcpext";
+		reg = <3 0xaae00000 0 0x4000>,
+		      <3 0xa8000000 0 0xb1c000>,
+		      <3 0xaa240000 0 0x10000>,
+		      <3 0xaa3ac000 0 0x4000>,
+		      <3 0xaa800000 0 0x800000>,
+		      <3 0x82700000 0 0x114000>,
+		      <3 0xaa850000 0 0x4000>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2",
+			    "disp-3", "disp-4", "iop-vbar";
+		mboxes = <&dcpext1_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcpext1_dart 23>;
+		/* The firmware's clocks: /arm-io/dispext1 clock-ids, as on disp0. */
+		apple,clock-ids = <372 433>;
+		clocks = <&clkref>, <&dcpext_fw_clk372>, <&dcpext_fw_clk433>;
+		clock-names = "clock-154", "firmware-0", "firmware-1";
+		apple,bw-scratch = <&pmgr_dcpext1 0 5 0>;
+		apple,bw-doorbell = <&pmgr_dcpext1 1 6>;
+		apple,iomfb-surfaces = <0 0 1 0>;
+		apple,dcp-index = <2>;
+		apple,connector-type = "USB-C";
+		apple,typec-dptx-phys = <1>;
+		apple,typec-mux-indices = <4>;
+		phys = <&atcphy1 PHY_TYPE_DP>;
+		phy-names = "typec0";
+		mux-controls = <&dpxbar1 0>;
+		mux-control-names = "typec0";
+		/* Enabled by the boot loader once it has checked the session. */
+		status = "disabled";
+		#address-cells = <2>;
+		#size-cells = <2>;
+
+		piodma {
+			iommus = <&dispext1_dart 16>;
+		};
+
+		typec-routes {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			route@0 {
+				reg = <0>;
+				mode-switch;
+				status = "disabled";
+
+				port {
+					dcpext1_typec1: endpoint {
+						remote-endpoint = <&typec1_display>;
+					};
+				};
+			};
+		};
+	};
+
+	/* Each ATC's display crossbar sits behind its PHY's core window. */
+	dpxbar0: mux-controller@40304c000 {
+		compatible = "apple,t8142-display-crossbar";
+		reg = <4 0x0304c000 0 0x4000>;
+		#mux-control-cells = <1>;
+		power-domains = <&ps_atc0_usb>;
+	};
+
+	dpxbar1: mux-controller@40b04c000 {
+		compatible = "apple,t8142-display-crossbar";
+		reg = <4 0x0b04c000 0 0x4000>;
+		#mux-control-cells = <1>;
+		power-domains = <&ps_atc1_usb>;
+	};
+};
+
+/*
+ * DisplayPort needs the LIOA bank (in the AXI2AF window) for the calibration
+ * the boot loader copies from the ADT. Without both, the PHY stays USB only.
+ */
+&atcphy0 {
+	reg = <4 0x03000000 0 0x4c000>,
+	      <4 0x03050000 0 0x8000>,
+	      <4 0x00000000 0 0x8000>,
+	      <4 0x02a90000 0 0x4000>,
+	      <4 0x02a84000 0 0x4000>,
+	      <4 0x00020000 0 0x4000>;
+	reg-names = "core", "lpdptx", "axi2af", "usb2phy", "pipehandler", "lioa";
+};
+
+&atcphy1 {
+	reg = <4 0x0b000000 0 0x4c000>,
+	      <4 0x0b050000 0 0x8000>,
+	      <4 0x08000000 0 0x8000>,
+	      <4 0x0aa90000 0 0x4000>,
+	      <4 0x0aa84000 0 0x4000>,
+	      <4 0x08020000 0 0x4000>;
+	reg-names = "core", "lpdptx", "axi2af", "usb2phy", "pipehandler", "lioa";
+};
+
+&typec0 {
+	ports {
+		port@3 {
+			reg = <3>;
+
+			typec0_display: endpoint {
+				remote-endpoint = <&dcpext0_typec0>;
+			};
+		};
+	};
+};
+
+&typec1 {
+	ports {
+		port@3 {
+			reg = <3>;
+
+			typec1_display: endpoint {
+				remote-endpoint = <&dcpext1_typec1>;
+			};
+		};
+	};
+};
+
+/* Scanout and PIODMA share the first register window, as on disp0. */
+&dispext0_dart {
+	reg = <5 0x06300000 0 0xc000>;
+	apple,dma-range = <0x100 0x0 0x10 0x0>;
+};
+
+&dcpext0_dart {
+	apple,dma-range = <0x100 0x0 0x10 0x0>;
+};
+
+&dispext1_dart {
+	reg = <3 0xaa300000 0 0xc000>;
+	apple,dma-range = <0x100 0x0 0x10 0x0>;
+};
+
+&dcpext1_dart {
+	apple,dma-range = <0x100 0x0 0x10 0x0>;
+};
+
+/ {
+	/*
+	 * The external DCP firmware's clocks (/arm-io/dispext0 clock-ids 369 and
+	 * 432, dispext1 372 and 433; the same on the J813 and the J815). Their
+	 * rates are /arm-io clock-frequencies entries 0x71 and 0x74 (ids 0x100
+	 * up), as 712 MHz is entry 0x49 for disp0's 585: 300 MHz and
+	 * 468.75 MHz. 432 and 433 have no entry, as disp0's 431 has none.
+	 * Firmware 27 reads only the first one (see dcp_fw_clk585).
+	 */
+	dcpext_fw_clk369: clock-dcpext-firmware-369 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <300000000>;
+		clock-output-names = "dcpext_firmware_369";
+	};
+
+	dcpext_fw_clk432: clock-dcpext-firmware-432 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <0>;
+		clock-output-names = "dcpext_firmware_432";
+	};
+
+	dcpext_fw_clk372: clock-dcpext-firmware-372 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <468750000>;
+		clock-output-names = "dcpext_firmware_372";
+	};
+
+	dcpext_fw_clk433: clock-dcpext-firmware-433 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <0>;
+		clock-output-names = "dcpext_firmware_433";
+	};
+};

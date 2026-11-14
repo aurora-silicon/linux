@@ -77,7 +77,7 @@ static unsigned reports;
 
 STUBS = r'''
 struct atcphy_hw { enum atcphy_generation gen;
-    bool has_t8140_dp, dp_t8122, has_usb4, park_pipe_unlocked, park_dummy_phy, usb2_only; };
+    bool has_t8140_dp, dp_t8122, has_usb4, park_pipe_unlocked, park_dummy_phy, clear_boot_hold, usb2_only; };
 struct device_node { const char *const *compatible; unsigned int count; };
 static bool of_device_is_compatible(const struct device_node *root, const char *compatible) {
     if (!root) return false;

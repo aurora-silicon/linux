@@ -974,7 +974,7 @@ static int av_desktop_audio_prepare(struct apple_epic_service *service, const ch
 	struct apple_dcp *dcp = service->ep->dcp;
 
 	if (!av_desktop_audio_role(dcp) ||
-	    service->ep->endpoint != AV_AUDIO_ENDPOINT_DESKTOP || !name)
+	    service->ep->endpoint != dcp_av_audio_endpoint(dcp) || !name)
 		return -EINVAL;
 	if (!strcmp(name, av_desktop_ops[0].name) && unit == 0)
 		return 0;
@@ -1405,7 +1405,7 @@ int avep_init(struct apple_dcp *dcp)
 		if (!av_desktop_audio_role(dcp))
 			return -EOPNOTSUPP;
 		ops = av_desktop_ops;
-		av_endpoint = AV_AUDIO_ENDPOINT_DESKTOP;
+		av_endpoint = dcp_av_audio_endpoint(dcp);
 #else
 		return -EOPNOTSUPP;
 #endif

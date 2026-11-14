@@ -1766,12 +1766,30 @@ static int dcp_typec_route_prepare(struct typec_mux_dev *mux,
 	return 0;
 }
 
+/*
+ * A T8142 external processor (firmware 27) behind a Type-C PHY of the T8122
+ * generation: the firmware probes AUX as soon as its route is offered, so the
+ * route is applied only once the PHY has finished its own mode change.
+ */
+static bool dcp_t8142_ext(struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+	       of_device_is_compatible(dcp->dev->of_node, "apple,t8142-dcpext");
+}
+
+static int dcp_typec_route_apply(struct typec_mux_dev *mux,
+				 struct typec_mux_state *state);
+
 static int dcp_typec_route_finish(struct typec_mux_dev *mux,
 				  struct typec_mux_state *state)
 {
-	struct apple_dcp_typec_port *port =
-		((struct apple_dcp_typec_route *)typec_mux_get_drvdata(mux))->port;
+	struct apple_dcp_typec_route *route = typec_mux_get_drvdata(mux);
+	struct apple_dcp_typec_port *port = route->port;
 	int ret;
+
+	/* Every provider's set phase (including the PHY) has completed. */
+	if (dcp_t8142_ext(route->dcp) && state->mode != TYPEC_STATE_SAFE)
+		return dcp_typec_route_apply(mux, state);
 
 	guard(mutex)(&dcp_typec_fabric_lock);
 	if (state->mode != TYPEC_STATE_SAFE || !port->safe_pending ||
@@ -1829,7 +1847,7 @@ static int dcp_typec_port_busy(struct apple_dcp_typec_port *port,
 	return -ENOSPC;
 }
 
-static int dcp_typec_route_set(struct typec_mux_dev *mux,
+static int dcp_typec_route_apply(struct typec_mux_dev *mux,
 			       struct typec_mux_state *state)
 {
 	struct apple_dcp_typec_route *route = typec_mux_get_drvdata(mux);
@@ -1901,7 +1919,8 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 		 * another port is refused as busy. The route is taken again
 		 * when HPD returns.
 		 */
-		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
+		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+		    dcp_t8142_ext(dcp)) {
 			port->preferred_route = port->owner;
 			port->hpd = false;
 			/*
@@ -2026,7 +2045,8 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	 * would otherwise hold it against the port that has one.
 	 */
 	if (!port->owner && !hpd &&
-	    route->dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
+	    (route->dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+	     dcp_t8142_ext(route->dcp))) {
 		port->applied_valid = true;
 		return 0;
 	}
@@ -2092,6 +2112,16 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	port->applied_valid = true;
 
 	return 0;
+}
+
+static int dcp_typec_route_set(struct typec_mux_dev *mux,
+			       struct typec_mux_state *state)
+{
+	struct apple_dcp_typec_route *route = typec_mux_get_drvdata(mux);
+
+	if (dcp_t8142_ext(route->dcp) && state->mode != TYPEC_STATE_SAFE)
+		return 0;
+	return dcp_typec_route_apply(mux, state);
 }
 
 /* The T8142-layout crossbar (one per ATC on T6050) */
@@ -2439,6 +2469,25 @@ static int dcp_direct_crossbar_link_t6050(struct apple_dcp *dcp, bool up)
 	 * output's mux (or NULL on a Type-C-only pipeline). */
 	xbar = dcp->active_typec_route ?
 		dcp->active_typec_route->active_xbar : dcp->xbar;
+	/*
+	 * T8142's Type-C PHYs are of the T8122 generation and have no link
+	 * report: they always drive PCLK1 with 8b/10b coding (as on the J704).
+	 */
+	if (dcp_t8142_ext(dcp)) {
+		if (dcp->dptx_tunnel || !xbar)
+			return 0;
+		if (!up)
+			return dcp_dpxbar_link(xbar, false);
+		configure = symbol_get(apple_dpxbar_link_configure);
+		if (!configure)
+			return -ENODEV;
+		ret = configure(xbar, 1, false);
+		symbol_put(apple_dpxbar_link_configure);
+		/* A link that is already up keeps its configuration. */
+		if (ret == -EBUSY)
+			return 0;
+		return ret ? ret : dcp_dpxbar_link(xbar, true);
+	}
 	if (dcp->dptx_tunnel || !dcp->phy || !xbar)
 		return 0;
 	get_config = symbol_get(apple_dp_phy_link_config);

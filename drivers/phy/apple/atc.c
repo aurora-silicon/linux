@@ -530,6 +530,8 @@ enum atcphy_lane_mode {
 #define PIPEHANDLER_NONSELECTED_OVERRIDE 0x20
 #define PIPEHANDLER_NATIVE_RESET BIT(12)
 #define PIPEHANDLER_DUMMY_PHY_EN BIT(15)
+/* Boot-owned PIPE hold, released before selecting the dummy backend. */
+#define PIPEHANDLER_NONSELECTED_BOOT_HOLD BIT(16)
 #define PIPEHANDLER_NATIVE_POWER_DOWN GENMASK(3, 0)
 
 #define PIPEHANDLER_LOCK_ACK_TIMEOUT_US 1000
@@ -687,6 +689,8 @@ struct apple_atcphy;
  *                     generation has none) and the SuperSpeed tunables; USB2
  *                     still works without the latter
  * @park_pipe_unlocked: A stopped controller may park without a PIPE handshake
+ * @clear_boot_hold: Release the boot PIPE hold before dummy backend selection
+ * @dp_banked_tunables: DisplayPort requires separate LIOA/common calibration
  * @dp_t8122: DisplayPort runs the T8122 AUX, AUSPLL and lane sequences
  * @park_dummy_phy: Enable the dummy PIPE backend whenever the PIPE is parked on
  *                  it; the lock handshake that starts the next PIPE change is
@@ -714,8 +718,10 @@ struct atcphy_hw {
 	bool optional_tunables;
 	bool has_t8140_dp;
 	bool dp_t8122;
+	bool dp_banked_tunables;
 	bool park_pipe_unlocked;
 	bool park_dummy_phy;
+	bool clear_boot_hold;
 	bool restore_after_pd_off;
 	bool idle_power_off;
 };
@@ -864,6 +870,8 @@ struct apple_atcphy {
 		struct apple_tunable *lane_usb4[2];
 		struct apple_tunable *usb2phy_reg_dflt;
 		struct apple_tunable *usb3_dp;
+		struct apple_tunable *dp_lioa;
+		struct apple_tunable *dp_common_config;
 		struct apple_tunable *dp_common_pre;
 		struct apple_tunable *dp_lpdptx;
 		struct apple_tunable *dp_common_post;
@@ -975,11 +983,13 @@ struct apple_atcphy {
 		void __iomem *pipehandler;
 		void __iomem *lpdptx;
 		void __iomem *pwrctl;
+		void __iomem *lioa;
 	} regs;
 
 	struct {
 		struct resource *core;
 		struct resource *lpdptx;
+		struct resource *lioa;
 		struct resource *axi2af;
 		struct resource *usb2phy_reg;
 	} res;
@@ -1820,6 +1830,9 @@ static int atcphy_configure_pipehandler_usb4(struct apple_atcphy *atcphy)
  */
 static void atcphy_enable_dummy_phy(struct apple_atcphy *atcphy)
 {
+	if (atcphy->hw->clear_boot_hold)
+		clear32(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE,
+			PIPEHANDLER_NONSELECTED_BOOT_HOLD);
 	set32(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE,
 	      PIPEHANDLER_DUMMY_PHY_EN);
 }
@@ -4174,7 +4187,8 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 		if (ret)
 			return ret;
 	}
-	if (atcphy->hw->has_t8140_dp && atcphy_modes[mode].enable_dp_aux &&
+	if ((atcphy->hw->has_t8140_dp || atcphy->hw->dp_banked_tunables) &&
+		    atcphy_modes[mode].enable_dp_aux &&
 	    !atcphy->dp_tunables)
 		return -EOPNOTSUPP;
 	if (atcphy->hw->has_t8140_dp &&
@@ -4245,6 +4259,10 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 	}
 
 	atcphy_apply_tunables(atcphy, mode);
+	if (atcphy->hw->dp_banked_tunables && atcphy_modes[mode].enable_dp_aux) {
+		apple_tunable_apply(atcphy->regs.lioa, atcphy->tunables.dp_lioa);
+		apple_tunable_apply(atcphy->regs.lpdptx, atcphy->tunables.dp_common_config);
+	}
 	atcphy->hw->configure_post_tunable(atcphy, mode);
 
 	/* Setup AUX channel if DP altmode is requested */
@@ -4836,6 +4854,14 @@ static int atcphy_dpphy_validate(struct phy *phy, enum phy_mode mode, int submod
 		return -EINVAL;
 	if (submode != 0 && !atcphy_t8132_dp_on(atcphy))
 		return -EINVAL;
+
+	/* The Type-C mux owns lane setup; validate observes its completed epoch. */
+	guard(mutex)(&atcphy->lock);
+	if (atcphy->hw->dp_t8122 &&
+	    (atcphy->mode_dirty || !atcphy->dp_t8122.aux)) {
+		opts->lanes = 0;
+		return 0;
+	}
 
 	switch (atcphy->mode) {
 	case APPLE_ATCPHY_MODE_USB3_DP:
@@ -6278,6 +6304,36 @@ static int atcphy_load_t8132_tunables(struct apple_atcphy *atcphy)
 	return 0;
 }
 
+static int atcphy_load_dp_banks(struct apple_atcphy *atcphy)
+{
+	struct apple_tunable *lioa, *common;
+
+	if (!atcphy->res.lioa) {
+		atcphy->dp_tunables = false;
+		return 0;
+	}
+
+	lioa = devm_apple_tunable_parse(atcphy->dev, atcphy->np,
+				      "apple,tunable-dp-lioa", atcphy->res.lioa);
+	common = devm_apple_tunable_parse(atcphy->dev, atcphy->np,
+					"apple,tunable-dp-common-config", atcphy->res.lpdptx);
+	if (IS_ERR(lioa) || IS_ERR(common)) {
+		int ret = IS_ERR(lioa) ? PTR_ERR(lioa) : PTR_ERR(common);
+
+		if ((IS_ERR(lioa) && PTR_ERR(lioa) != -ENOENT) ||
+		    (IS_ERR(common) && PTR_ERR(common) != -ENOENT))
+			return ret == -ENOENT ? PTR_ERR(common) : ret;
+		atcphy->dp_tunables = false;
+		dev_warn(atcphy->dev, "DisplayPort bank calibration missing; DP disabled\n");
+		return 0;
+	}
+	if (!lioa->sz || !common->sz)
+		return -EINVAL;
+	atcphy->tunables.dp_lioa = lioa;
+	atcphy->tunables.dp_common_config = common;
+	return 0;
+}
+
 static int atcphy_load_tunables(struct apple_atcphy *atcphy)
 {
 	size_t tunable_count;
@@ -6390,6 +6446,12 @@ static int atcphy_load_tunables(struct apple_atcphy *atcphy)
 	atcphy->ss_tunables = !ss_missing;
 	if (atcphy->hw->dp_t8122)
 		atcphy->dp_tunables = !common_missing;
+	if (atcphy->hw->dp_banked_tunables) {
+		int ret = atcphy_load_dp_banks(atcphy);
+
+		if (ret)
+			return ret;
+	}
 	if (atcphy->dp_only && !atcphy->dp_tunables)
 		dev_warn(atcphy->dev, "Calibration tunables missing, DisplayPort disabled\n");
 	else if (ss_missing && atcphy->dp_tunables && !atcphy->dp_only)
@@ -6473,6 +6535,21 @@ static int atcphy_map_resources(struct platform_device *pdev, struct apple_atcph
 		*resources[i].addr = addr;
 		if (resources[i].res)
 			*resources[i].res = res;
+	}
+
+	/*
+	 * Device trees written before DisplayPort was supported have no LIOA
+	 * bank: the PHY then serves USB as before, without DisplayPort.
+	 */
+	res = atcphy->hw->dp_banked_tunables ?
+	      platform_get_resource_byname(pdev, IORESOURCE_MEM, "lioa") : NULL;
+	if (res) {
+		addr = devm_ioremap_resource(&pdev->dev, res);
+		if (IS_ERR(addr))
+			return dev_err_probe(atcphy->dev, PTR_ERR(addr),
+					     "Unable to map LIOA bank\n");
+		atcphy->res.lioa = res;
+		atcphy->regs.lioa = addr;
 	}
 
 	if (atcphy->hw->has_usb2phy_reg) {
@@ -7846,6 +7923,11 @@ static const struct atcphy_hw atcphy_hw_t8142 = {
 	.pipe_mux_clk = PIPEHANDLER_MUX_CTRL_CLK_T8142,
 	.pipe_mux_data = PIPEHANDLER_MUX_CTRL_DATA_T8142,
 	.has_usb4 = true,
+	.dp_t8122 = true,
+	.dp_banked_tunables = true,
+	.park_dummy_phy = true,
+	.restore_after_pd_off = true,
+	.clear_boot_hold = true,
 };
 
 static const struct of_device_id atcphy_match[] = {

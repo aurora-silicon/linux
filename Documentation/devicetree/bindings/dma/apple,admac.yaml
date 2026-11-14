@@ -60,6 +60,11 @@ properties:
           A T6050 display engine's own ADMAC (ADT "self-actuated"), which
           feeds the engine's DisplayPort audio.
         const: apple,t6050-display-admac
+      - description:
+          A T8142 external display engine's own ADMAC, the T6050 design.
+        items:
+          - const: apple,t8142-display-admac
+          - const: apple,t6050-display-admac
 
   reg:
     maxItems: 1
