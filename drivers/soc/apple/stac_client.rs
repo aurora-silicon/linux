@@ -64,6 +64,42 @@ pub(crate) const HOST_CHAIN_FW: &CStr = c"apple/stac-host-chain.der";
 const REPLY_MS: u32 = 2000;
 const MATERIAL_MS: u32 = 15000;
 
+/// The first command sequence of a physical attach. The keyboard numbers the
+/// host's commands within one attach transaction from here: the identity
+/// request the handshake sends takes this value, the pairing-state check the
+/// one after it.
+const FIRST_COMMAND_SEQUENCE: u32 = 1;
+
+/// What the attach handshake learned about the keyboard, kept for the life of
+/// one physical attach. The handshake runs once (on identify, see
+/// [`stac_ta_handshake`]); a later pairing or session reuses this rather than
+/// running the handshake again. It carries the live command sequence forward:
+/// the identity request consumed the first value, so the counter here is the
+/// next one a command takes, which is what the pairing-state check must send.
+/// Re-running the handshake instead would re-send the identity request with
+/// the first sequence, a replay within the attach the keyboard rejects.
+#[derive(Clone, Copy)]
+pub(crate) struct Attach {
+    /// The sequence the next command in this attach takes. After the one
+    /// identity request this is the pairing-state check's, the second value.
+    next_seq: u32,
+    /// The accessory's identity, its public point and its connection nonce,
+    /// read once by the handshake.
+    id: AccessoryId,
+    identity: PublicPoint,
+    nonce: Nonce,
+}
+
+impl Attach {
+    /// Takes the sequence for the next command and advances the counter, as
+    /// the keyboard expects one command per step within the attach.
+    fn next_sequence(&mut self) -> u32 {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        seq
+    }
+}
+
 extern "C" {
     fn sep_stac_ta_register(
         ctx: *mut c_void,
@@ -188,6 +224,9 @@ unsafe extern "C" fn attached(ctx: *mut c_void) {
 unsafe extern "C" fn detached(ctx: *mut c_void) {
     // SAFETY: guaranteed by the registration.
     let sep = unsafe { &*ctx.cast::<SepData>() };
+    // The attach context belongs to the physical attach that just ended; the
+    // next attach runs its own handshake.
+    *sep.stac_attach.lock() = None;
     sep.stac_ta_event(Event::Detached);
 }
 
@@ -378,11 +417,15 @@ impl TaChannel for ShimChannel {
 /// The two SETs are the only writes and carry no pairing or enclave state. A
 /// keyboard the other OS already handed off answers the reads without them, but
 /// one powered on cold comes up idle and stalls the identity read until the
-/// handoff, so the handshake always issues them. Returns the identity, its
-/// point and the nonce.
-fn stac_ta_handshake<C: TaChannel>(
-    ch: &mut C,
-) -> core::result::Result<(AccessoryId, PublicPoint, Nonce), HandshakeStop> {
+/// handoff, so the handshake always issues them.
+///
+/// The identity request takes the attach's first command sequence
+/// ([`FIRST_COMMAND_SEQUENCE`]). The returned [`Attach`] holds that identity,
+/// its point and the nonce, and the next command sequence (one past the
+/// identity's), so a later pairing or session continues the same attach
+/// transaction instead of re-running the handshake and replaying the first
+/// sequence. The handshake runs once per attach.
+fn stac_ta_handshake<C: TaChannel>(ch: &mut C) -> core::result::Result<Attach, HandshakeStop> {
     let kb = |step: u32, e: WireError| HandshakeStop::Keyboard(step, e);
     let io = |step: u32, e: i32| HandshakeStop::Transport(step, e);
 
@@ -400,20 +443,29 @@ fn stac_ta_handshake<C: TaChannel>(
     }
     let mut id = AccessoryId([0; ACCESSORY_ID_LEN]);
     id.0.copy_from_slice(&uid[1..]);
-    // 4. The identity point.
-    let c = wire::command(wire::cmd::IDENTITY, 1, &[]).map_err(|_| io(1, -12))?;
+    // 4. The identity point, the attach's first command. Advancing the counter
+    // leaves `next_seq` at the pairing-state check's sequence.
+    let mut next_seq = FIRST_COMMAND_SEQUENCE;
+    let seq = next_seq;
+    next_seq += 1;
+    let c = wire::command(wire::cmd::IDENTITY, seq, &[]).map_err(|_| io(seq, -12))?;
     let r = ch
         .command(&c, wire::reply::IDENTITY, wire::POINT_REPLY_LEN, REPLY_MS)
-        .map_err(|e| io(1, e))?;
-    let point = wire::parse_point_reply(&r, wire::reply::IDENTITY, 1).map_err(|e| kb(1, e))?;
+        .map_err(|e| io(seq, e))?;
+    let point = wire::parse_point_reply(&r, wire::reply::IDENTITY, seq).map_err(|e| kb(seq, e))?;
     // 5. The fresh connection nonce.
-    let nr = ch.read(wire::get::NONCE, 1 + NONCE_LEN).map_err(|e| io(1, e))?;
+    let nr = ch.read(wire::get::NONCE, 1 + NONCE_LEN).map_err(|e| io(seq, e))?;
     if nr.len() != 1 + NONCE_LEN {
-        return Err(kb(1, WireError::Length));
+        return Err(kb(seq, WireError::Length));
     }
     let mut nonce = Nonce([0; NONCE_LEN]);
     nonce.0.copy_from_slice(&nr[1..]);
-    Ok((id, point, nonce))
+    Ok(Attach {
+        next_seq,
+        id,
+        identity: point,
+        nonce,
+    })
 }
 
 /// Sends one logical report to the keyboard (`report[0]` its logical ID, the
@@ -467,8 +519,16 @@ impl SepData {
     /// reads did before.
     fn stac_ta_identify_run(&self) {
         match stac_ta_handshake(&mut ShimChannel) {
-            Ok((id, _point, nonce)) => self.stac_ta_event(Event::Identified(id, nonce)),
+            Ok(attach) => {
+                let (id, nonce) = (attach.id, attach.nonce);
+                // Keep the attach context (identity, point, nonce and the live
+                // command sequence) so a later pairing or session continues
+                // this attach rather than running the handshake again.
+                *self.stac_attach.lock() = Some(attach);
+                self.stac_ta_event(Event::Identified(id, nonce));
+            }
             Err(stop) => {
+                *self.stac_attach.lock() = None;
                 match stop {
                     HandshakeStop::Transport(_, e) => dev_info_ratelimited!(
                         self.dev,
@@ -554,28 +614,37 @@ impl SepData {
             .map_err(|_| PairStop::HostObject)?;
         wire::check_chain(fw.data(), &digest).map_err(|_| PairStop::WrongChain)?;
 
-        // The accessory handshake: tag, protocol handoff, identity, identity
-        // point, nonce (see [`stac_ta_handshake`]). Its stops fold into this
-        // relay's through `From`. The nonce is unused here; the pairing binds
-        // to the enclave's object, not this read.
-        let (id, identity, _nonce) = stac_ta_handshake(&mut ShimChannel)?;
+        // The attach handshake ran once on identify (see
+        // [`stac_ta_identify_run`]); reuse its identity, point and live command
+        // sequence rather than running it again, which would replay the
+        // identity request within this attach — the replay the keyboard rejects
+        // at the step-2 commit. The counter here is the pairing check's
+        // sequence, one past the identity's. The nonce is unused here; the
+        // pairing binds to the enclave's object, not that read.
+        let mut attach = match *self.stac_attach.lock() {
+            Some(attach) => attach,
+            None => return Err(PairStop::Transport(FIRST_COMMAND_SEQUENCE, ENODEV.to_errno())),
+        };
+        let (id, identity) = (attach.id, attach.identity);
 
-        // Step 2: the keyboard checks the host object. Its 137-byte body is
-        // too large for a direct SET on USB, so it goes over the 0xfe
-        // transport; a fresh pairing uses that form, not a direct SET 0x60
-        // (which is the already-paired session's).
-        let c = wire::command(wire::cmd::PAIRING_CHECK, 2, &host).map_err(|_| io(2, -12))?;
+        // Step 2: the keyboard checks the host object, at the sequence carried
+        // from the identity. Its 137-byte body is too large for a direct SET on
+        // USB, so it goes over the 0xfe transport; a fresh pairing uses that
+        // form, not a direct SET 0x60 (which is the already-paired session's).
+        let check_seq = attach.next_sequence();
+        let c = wire::command(wire::cmd::PAIRING_CHECK, check_seq, &host).map_err(|_| io(check_seq, -12))?;
         let r = ta_set_logical(&c, wire::reply::PAIRING_CHECK, wire::PAIRING_CHECK_REPLY_LEN, REPLY_MS)
-            .map_err(|e| io(2, e))?;
-        if wire::parse_pairing_check(&r).map_err(|e| kb(2, e))? {
+            .map_err(|e| io(check_seq, e))?;
+        if wire::parse_pairing_check(&r).map_err(|e| kb(check_seq, e))? {
             return Err(PairStop::KeyboardPaired);
         }
 
         // Step 3: the keyboard's pairing ephemeral point, then 0x03.
-        let c = wire::command(wire::cmd::PAIRING_EPHEMERAL, 3, &1u32.to_le_bytes()).map_err(|_| io(3, -12))?;
+        let eph_seq = attach.next_sequence();
+        let c = wire::command(wire::cmd::PAIRING_EPHEMERAL, eph_seq, &1u32.to_le_bytes()).map_err(|_| io(eph_seq, -12))?;
         let r = ta_command(&c, wire::reply::PAIRING_EPHEMERAL, wire::POINT_REPLY_LEN, REPLY_MS)
-            .map_err(|e| io(3, e))?;
-        let eph = wire::parse_point_reply(&r, wire::reply::PAIRING_EPHEMERAL, 3).map_err(|e| kb(3, e))?;
+            .map_err(|e| io(eph_seq, e))?;
+        let eph = wire::parse_point_reply(&r, wire::reply::PAIRING_EPHEMERAL, eph_seq).map_err(|e| kb(eph_seq, e))?;
         let begin = self.stac_body(
             Op::PairingBegin,
             &stac_ops::pairing_begin_request(&id, &identity, &eph),
@@ -585,28 +654,32 @@ impl SepData {
 
         // Step 4: the chain; step 5: the host object again.
         let chain = fw.data();
+        let chain_seq = attach.next_sequence();
         for i in 0..wire::fragment_count(chain.len()) {
-            let f = wire::fragment(4, wire::kind::CHAIN, chain, i).map_err(|_| io(4, -22))?;
-            ta_set_logical(&f, 0, 0, 0).map_err(|e| io(4, e))?;
+            let f = wire::fragment(chain_seq, wire::kind::CHAIN, chain, i).map_err(|_| io(chain_seq, -22))?;
+            ta_set_logical(&f, 0, 0, 0).map_err(|e| io(chain_seq, e))?;
         }
-        let c = wire::command(wire::cmd::HOST_OBJECT, 5, &host).map_err(|_| io(5, -12))?;
-        let r = ta_set_logical(&c, wire::reply::HOST_OBJECT, wire::REPLY_HEADER_LEN, REPLY_MS).map_err(|e| io(5, e))?;
-        wire::check_reply(&r, wire::reply::HOST_OBJECT, 5).map_err(|e| kb(5, e))?;
+        let host_seq = attach.next_sequence();
+        let c = wire::command(wire::cmd::HOST_OBJECT, host_seq, &host).map_err(|_| io(host_seq, -12))?;
+        let r = ta_set_logical(&c, wire::reply::HOST_OBJECT, wire::REPLY_HEADER_LEN, REPLY_MS).map_err(|e| io(host_seq, e))?;
+        wire::check_reply(&r, wire::reply::HOST_OBJECT, host_seq).map_err(|e| kb(host_seq, e))?;
 
         // Step 6: the enclave's attestation; step 7: host object and the
         // enclave's point, answered with the keyboard's material.
         let att = &begin[b.host_attestation.clone()];
+        let att_seq = attach.next_sequence();
         for i in 0..wire::fragment_count(att.len()) {
-            let f = wire::fragment(6, wire::kind::ATTESTATION, att, i).map_err(|_| io(6, -22))?;
-            ta_set_logical(&f, 0, 0, 0).map_err(|e| io(6, e))?;
+            let f = wire::fragment(att_seq, wire::kind::ATTESTATION, att, i).map_err(|_| io(att_seq, -22))?;
+            ta_set_logical(&f, 0, 0, 0).map_err(|e| io(att_seq, e))?;
         }
+        let finish_seq = attach.next_sequence();
         let mut p7 = KVec::new();
-        p7.extend_from_slice(&host, GFP_KERNEL).map_err(|_| io(7, -12))?;
-        p7.extend_from_slice(&begin[b.host_ephemeral.clone()], GFP_KERNEL).map_err(|_| io(7, -12))?;
-        let c = wire::command(wire::cmd::PAIRING_FINISH, 7, &p7).map_err(|_| io(7, -12))?;
+        p7.extend_from_slice(&host, GFP_KERNEL).map_err(|_| io(finish_seq, -12))?;
+        p7.extend_from_slice(&begin[b.host_ephemeral.clone()], GFP_KERNEL).map_err(|_| io(finish_seq, -12))?;
+        let c = wire::command(wire::cmd::PAIRING_FINISH, finish_seq, &p7).map_err(|_| io(finish_seq, -12))?;
         let r = ta_set_logical(&c, wire::reply::ACCESSORY_MATERIAL, wire::MATERIAL_REPLY_LEN, MATERIAL_MS)
-            .map_err(|e| io(7, e))?;
-        let m = wire::parse_material(&r).map_err(|e| kb(7, e))?;
+            .map_err(|e| io(finish_seq, e))?;
+        let m = wire::parse_material(&r).map_err(|e| kb(finish_seq, e))?;
         let finish = stac_ops::pairing_finish_request(&id, &identity, &r[m.attestation], &r[m.certificate])
             .map_err(|_| io(7, -22))?;
         let body = self.stac_body(Op::PairingFinish, &finish, 0)?;
@@ -686,21 +759,31 @@ impl SepData {
         let host = self.stac_session_body(Op::HostAttestationObject, &[], stac_ops::HOST_OBJECT_REPLY_LEN)?;
         stac_ops::parse_host_object_len(&host).map_err(|_| SessionStop::Enclave(Op::HostAttestationObject.opcode()))?;
 
-        // The accessory handshake, the same opening the pairing uses, so the
-        // keyboard is the one this relay speaks to (see [`stac_ta_handshake`]).
-        // Its stops fold into this relay's through `From`.
-        let (id, _identity, _nonce) = stac_ta_handshake(&mut ShimChannel)?;
+        // The attach handshake ran once on identify (see
+        // [`stac_ta_identify_run`]); reuse its identity and carry its live
+        // command sequence rather than running the handshake again, as the
+        // pairing does. A session only runs after an identify, so the context
+        // is present.
+        let mut attach = match *self.stac_attach.lock() {
+            Some(attach) => attach,
+            None => return Err(SessionStop::Transport(FIRST_COMMAND_SEQUENCE, ENODEV.to_errno())),
+        };
+        let id = attach.id;
 
         // Confirm paired, both at the enclave (0x02) and at the keyboard
-        // (SET 0x60 -> IN 0x42): a session only opens on a paired keyboard.
+        // (SET 0x60 -> IN 0x42): a session only opens on a paired keyboard. The
+        // check takes the sequence carried from the identity. The session's
+        // later steps (0x06 step 3, 0x07 step 5) reuse the recording's fixed
+        // message indices, not a running counter, so they stay as named steps.
         match self.stac_query_pairing(&id) {
             Query::State(s) if s.paired => {}
             _ => return Err(SessionStop::NotPaired),
         }
-        let c = wire::command(wire::cmd::PAIRING_CHECK, 2, &host).map_err(|_| io(2, -12))?;
+        let check_seq = attach.next_sequence();
+        let c = wire::command(wire::cmd::PAIRING_CHECK, check_seq, &host).map_err(|_| io(check_seq, -12))?;
         let r = ta_command(&c, wire::reply::PAIRING_CHECK, wire::PAIRING_CHECK_REPLY_LEN, REPLY_MS)
-            .map_err(|e| io(2, e))?;
-        if !wire::parse_pairing_check(&r).map_err(|e| kb(2, e))? {
+            .map_err(|e| io(check_seq, e))?;
+        if !wire::parse_pairing_check(&r).map_err(|e| kb(check_seq, e))? {
             return Err(SessionStop::NotPaired);
         }
 
@@ -951,6 +1034,10 @@ mod tests {
     /// keyboard. The identity reads back as all 7s, the nonce as all 9s.
     struct Recorder {
         ops: KVec<Op>,
+        /// The (report id, command sequence) of every stepped command, so the
+        /// sequence the identity request and the pairing check carry can be
+        /// checked. The version echo carries no sequence and is not recorded.
+        cmd_seqs: KVec<(u8, u32)>,
         good_tag: bool,
     }
 
@@ -958,6 +1045,7 @@ mod tests {
         fn new() -> Self {
             Recorder {
                 ops: KVec::new(),
+                cmd_seqs: KVec::new(),
                 good_tag: true,
             }
         }
@@ -991,6 +1079,12 @@ mod tests {
             _timeout_ms: u32,
         ) -> core::result::Result<KVec<u8>, i32> {
             self.ops.push(Op::Command(cmd[0], reply_id), GFP_KERNEL).unwrap();
+            // Record the sequence of every stepped command (a report id and a
+            // little-endian step word); the version echo carries no step.
+            if cmd[0] != wire::cmd::VERSION && cmd.len() >= 1 + stac_ops::WORD {
+                let step = u32::from_le_bytes([cmd[1], cmd[2], cmd[3], cmd[4]]);
+                self.cmd_seqs.push((cmd[0], step), GFP_KERNEL).unwrap();
+            }
             if reply_id == 0 {
                 return Ok(KVec::new());
             }
@@ -1008,11 +1102,12 @@ mod tests {
 
     // The attach handshake runs exactly the macOS order: GET 0x4b, SET 0x68,
     // GET 0x41, SET 0x67 answered by IN 0x40, GET 0x4c — and returns the
-    // identity, its point and the nonce the reads carried.
+    // identity, its point and the nonce the reads carried, plus the live
+    // command sequence one past the identity request's.
     #[test]
     fn the_attach_handshake_follows_the_macos_order() {
         let mut ch = Recorder::new();
-        let (id, point, nonce) = stac_ta_handshake(&mut ch).unwrap();
+        let attach = stac_ta_handshake(&mut ch).unwrap();
         assert_eq!(
             &ch.ops[..],
             &[
@@ -1023,9 +1118,40 @@ mod tests {
                 Op::Read(wire::get::NONCE),                          // GET 0x4c
             ]
         );
-        assert_eq!(id.0, [7; ACCESSORY_ID_LEN]);
-        assert_eq!(nonce.0, [9; NONCE_LEN]);
-        assert_eq!(point.0[0], 0x04);
+        assert_eq!(attach.id.0, [7; ACCESSORY_ID_LEN]);
+        assert_eq!(attach.nonce.0, [9; NONCE_LEN]);
+        assert_eq!(attach.identity.0[0], 0x04);
+        // The identity request took the attach's first command sequence, so the
+        // next live sequence — the pairing check's — is the one after it.
+        assert_eq!(attach.next_seq, FIRST_COMMAND_SEQUENCE + 1);
+    }
+
+    // The sequence rule (t-6717): the attach handshake issues the identity
+    // request exactly once, at the first command sequence; the step-2 pairing
+    // check then takes the live sequence carried forward (the second), never a
+    // replayed first. Re-running the handshake before the pairing would send
+    // the identity request's sequence twice within the attach, which the
+    // keyboard rejects at the step-2 commit.
+    #[test]
+    fn the_pairing_check_carries_the_sequence_after_one_identity() {
+        let mut ch = Recorder::new();
+        let mut attach = stac_ta_handshake(&mut ch).unwrap();
+        // Exactly one identity request, carrying the first command sequence.
+        let mut identities = 0;
+        for &(id, step) in ch.cmd_seqs.iter() {
+            if id == wire::cmd::IDENTITY {
+                identities += 1;
+                assert_eq!(step, FIRST_COMMAND_SEQUENCE);
+            }
+        }
+        assert_eq!(identities, 1);
+        // The pairing check, which reuses this context, draws the next live
+        // sequence and builds a step-2 command (the recording's sequence 2).
+        let check_seq = attach.next_sequence();
+        assert_eq!(check_seq, FIRST_COMMAND_SEQUENCE + 1);
+        let c = wire::command(wire::cmd::PAIRING_CHECK, check_seq, &[0u8; 133]).unwrap();
+        assert_eq!(c.len(), 138);
+        assert_eq!(u32::from_le_bytes([c[1], c[2], c[3], c[4]]), 2);
     }
 
     // A keyboard whose protocol tag is not the one this relay speaks stops at

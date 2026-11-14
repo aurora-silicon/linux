@@ -829,6 +829,11 @@ struct SepData {
     // The keyboard's lifecycle (see `stac_client`).
     #[pin]
     stac_lc: Mutex<stac_lifecycle::Lifecycle>,
+    // The current physical attach's handshake result and live command sequence
+    // (see `stac_client`): set once on identify, reused by a later pairing or
+    // session, cleared on detach.
+    #[pin]
+    stac_attach: Mutex<Option<stac_client::Attach>>,
     stac_named: Atomic<bool>,
     stac_layout: Atomic<u32>,
     stac_absent_logged: Atomic<bool>,
@@ -1248,6 +1253,7 @@ impl SepData {
                 stac_wq <- new_condvar!("SepData::stac_wq"),
                 stac_op <- new_mutex!(()),
                 stac_lc <- new_mutex!(stac_lifecycle::Lifecycle::new()),
+                stac_attach <- new_mutex!(Option::<stac_client::Attach>::None),
                 stac_named: Atomic::new(false),
                 stac_layout: Atomic::new(0),
                 stac_absent_logged: Atomic::new(false),
