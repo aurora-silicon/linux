@@ -803,8 +803,13 @@ static int sn201202x_probe(struct spmi_device *device)
 	/*
 	 * In system sleep only the event interrupt stays live. Register access
 	 * then has to poll, which a select notification would not.
+	 *
+	 * T6041 (M4 Max) has a select notification, and its event interrupt
+	 * stays live with the controller asleep as on T8132, so its four
+	 * controllers sleep while idle too.
 	 */
-	if (!sn->polled && sn->select_polled)
+	if (!sn->polled &&
+	    (sn->select_polled || of_machine_is_compatible("apple,t6041")))
 		tps->sleep_event = sn201202x_sleep_event;
 
 	spmi_device_set_drvdata(device, tps);
