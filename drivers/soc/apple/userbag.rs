@@ -265,6 +265,9 @@ struct LoadedBag {
     user: i32,
     handle: crate::sks::KeyBagHandle,
     touch: Option<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>,
+    /// The user's catacomb was loaded since this bag was (see
+    /// `userbag_restore_13`).
+    restored: bool,
 }
 
 impl LoadedBags {
@@ -288,7 +291,7 @@ impl LoadedBags {
         if self.get(user).is_some() {
             return Err(EBUSY);
         }
-        self.0.push(LoadedBag { user, handle, touch: None }, GFP_KERNEL)?;
+        self.0.push(LoadedBag { user, handle, touch: None, restored: false }, GFP_KERNEL)?;
         Ok(())
     }
 
@@ -1236,6 +1239,13 @@ impl crate::SepData {
         out.reply.status == 0 && self.sks_uuid_from_reply(&out) == Some(loaded)
     }
 
+    /// Ends a bag user's Touch ID preparation: deletes its unlock evaluation
+    /// in the enclave and wipes the handle.
+    fn userbag_dispose_touch(&self, mut handle: [u8; crate::scrd::SCRD_ACM_HANDLE_LEN]) {
+        let _ = self.delete_unlock_evaluation(&handle);
+        crate::image::wipe(&mut handle);
+    }
+
     pub(crate) fn userbag_sepos13(&self) -> bool {
         matches!(self.profile.key_store, crate::profile::KeyStore::Sepos13 { .. })
     }
@@ -1257,19 +1267,81 @@ impl crate::SepData {
             self.userbag_transition(user, TransitionState::Unlocked, 0, secret)?;
         }
         // The password is accepted; Touch ID for this user is a bonus that
-        // never fails the unlock. Prepared without `user_bags` held: a touch
-        // takes `catacomb_writer` before `user_bags`, so this must not take
-        // them the other way round.
+        // never fails the unlock.
+        self.userbag_refresh_touch_13(user, secret);
+        Ok(())
+    }
+
+    /// Makes a fresh Touch ID preparation for `user` after its password was
+    /// accepted (a bag unlock, or a bag context's password authentication).
+    ///
+    /// Loading the user's catacomb resets the enclave's biometry lockout for
+    /// that user, which invalidates a preparation made before it. So the
+    /// catacomb is loaded first (`userbag_writer_for_restore`); only if that
+    /// fails does the first touch find the preparation stale (see
+    /// `userbag_touch_subject`).
+    pub(crate) fn userbag_refresh_touch_13(&self, user: crate::sks::DesignateUser, secret: &[u8]) {
+        if !self.userbag_sepos13() {
+            return;
+        }
+        let uid = u32::try_from(-user.special_handle().value())
+            .ok()
+            .and_then(|id| id.checked_sub(USER_BAG_BASE));
+        if let Some(uid) = uid {
+            if let Some(_writer) = self.userbag_writer_for_restore(user, uid) {
+                let mut bags = self.user_bags.lock();
+                let _ = self.userbag_restore_13(&mut bags, user, uid);
+            }
+        }
+        // Prepared without `user_bags` held: a touch takes `catacomb_writer`
+        // before `user_bags`, so this must not take them the other way round.
         let touch = self.userbag_prepare_touch_13(user, secret);
         let mut bags = self.user_bags.lock();
         if let Some(entry) = bags.entry(user.special_handle().value()) {
             if let Some(old) = core::mem::replace(&mut entry.touch, touch) {
-                let _ = self.delete_unlock_evaluation(&old);
+                self.userbag_dispose_touch(old);
             }
         } else if let Some(t) = touch {
-            let _ = self.delete_unlock_evaluation(&t);
+            self.userbag_dispose_touch(t);
         }
-        Ok(())
+    }
+
+    /// `catacomb_writer`, to load `uid`'s catacomb before a password makes
+    /// their Touch ID preparation. A fingerprint wait holds the lock for as
+    /// long as its prompt lasts, and a lock screen runs that prompt beside
+    /// the password one; loading the catacomb later, at the first touch,
+    /// makes the preparation stale, and that touch would need the password
+    /// once more. So on the first password since the bag was loaded, a
+    /// waiting capture is ended as a cancel ends it (fprintd may retry) and
+    /// the lock is awaited for at most `WORKER_EXIT_WAIT_MS`. A key's touch
+    /// is not ended. None when nothing is left to load or the lock stayed
+    /// held.
+    fn userbag_writer_for_restore(&self, user: crate::sks::DesignateUser, uid: u32) -> Option<kernel::sync::MutexGuard<'_, ()>> {
+        let pending = self.user_bags.lock().entry(user.special_handle().value()).is_some_and(|e| !e.restored);
+        if !pending {
+            return None;
+        }
+        if let Some(writer) = self.catacomb_writer.try_lock() {
+            return Some(writer);
+        }
+        if crate::catacomb::is_absent(crate::catacomb::Slot::BagUser(uid)) || self.key_touch_active.load(kernel::sync::atomic::Relaxed) {
+            return None;
+        }
+        if self.bio_cancel_capture() {
+            dev_dbg!(self.dev, "userbag: ended a waiting fingerprint prompt to load uid {}'s templates\n", uid);
+        }
+        let mut waited: u32 = 0;
+        while waited < crate::WORKER_EXIT_WAIT_MS {
+            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(20));
+            waited += 20;
+            if let Some(writer) = self.catacomb_writer.try_lock() {
+                return Some(writer);
+            }
+        }
+        dev_info_ratelimited!(self.dev,
+            "userbag: a capture still held Touch ID after {} ms; uid {} needs the password once more\n",
+            crate::WORKER_EXIT_WAIT_MS, uid);
+        None
     }
 
     /// After a password unlock on the 13.5 store: loads the user's catacomb
@@ -1280,36 +1352,60 @@ impl crate::SepData {
         user: crate::sks::DesignateUser,
         secret: &[u8],
     ) -> Option<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]> {
+        // The catacomb was loaded before this (`userbag_refresh_touch_13`),
+        // or is loaded at the first Touch ID use under `catacomb_writer`.
         let id = -user.special_handle().value();
         let uid = u32::try_from(id).ok()?.checked_sub(USER_BAG_BASE)?;
-        {
-            let _writer = self.catacomb_writer.lock();
-            let raw = self.read_component_states()?;
-            let state = crate::sbio::ComponentStates::new(&raw).state_for(id);
-            let slot = crate::catacomb::Slot::BagUser(uid);
-            // A user who never enrolled has neither a component nor a file:
-            // nothing to load, and the preparation still authorizes the first
-            // enrolment. Either one without the other is not that.
-            let fresh = state.is_none() && crate::catacomb::is_absent(slot);
-            if !fresh {
-                let outcome = self.restore_catacomb(state, id, slot, c"bag user catacomb");
-                if !matches!(outcome, crate::RestoreOutcome::AlreadyActive | crate::RestoreOutcome::Restored) {
-                    dev_info_ratelimited!(self.dev, "userbag: no Touch ID for uid {}: its catacomb did not load ({:?})\n", uid, outcome);
-                    return None;
-                }
-            }
-        }
         let (handle, status) = self.key_context_for(id, Some((user.special_handle(), secret))).ok()?;
         let ready = status == 0
             && matches!(self.scrd_command(&crate::scrd::scrd_verify_touchid_enrollment(&handle)),
                 Some((0, ref reply)) if reply.get(..4) == Some(&1u32.to_le_bytes()));
         if !ready {
-            let _ = self.delete_unlock_evaluation(&handle);
+            self.userbag_dispose_touch(handle);
             dev_info_ratelimited!(self.dev, "userbag: no Touch ID for uid {}: the preparation was refused\n", uid);
             return None;
         }
-        dev_info_ratelimited!(self.dev, "userbag: Touch ID and enrolment ready for uid {}\n", uid);
+        dev_dbg!(self.dev, "userbag: Touch ID and enrolment ready for uid {}\n", uid);
         Some(handle)
+    }
+
+    /// Loads a bag user's catacomb from its file once per load of their bag.
+    /// Called with `catacomb_writer` held, before their first match or
+    /// enrolment. A user who never enrolled has neither a component nor a
+    /// file: nothing to load. Either one without the other is not that.
+    fn userbag_restore_13(&self, bags: &mut LoadedBags, user: crate::sks::DesignateUser, uid: u32) -> bool {
+        let Some(entry) = bags.entry(user.special_handle().value()) else {
+            return false;
+        };
+        if entry.restored {
+            return true;
+        }
+        let id = -user.special_handle().value();
+        let Some(raw) = self.read_component_states() else {
+            return false;
+        };
+        let state = crate::sbio::ComponentStates::new(&raw).state_for(id);
+        let slot = crate::catacomb::Slot::BagUser(uid);
+        if !(state.is_none() && crate::catacomb::is_absent(slot)) {
+            let outcome = self.restore_catacomb(state, id, slot, c"bag user catacomb");
+            if !matches!(outcome, crate::RestoreOutcome::AlreadyActive | crate::RestoreOutcome::Restored) {
+                dev_info_ratelimited!(self.dev, "userbag: no Touch ID for uid {}: its catacomb did not load ({:?})\n", uid, outcome);
+                return false;
+            }
+            // Loading it resets the enclave's biometry lockout for the user,
+            // which invalidates a Touch ID preparation made before it: that
+            // one goes, and the next password makes a valid one
+            // (`userbag_refresh_touch_13`).
+            if matches!(outcome, crate::RestoreOutcome::Restored) {
+                if let Some(t) = entry.touch.take() {
+                    self.userbag_dispose_touch(t);
+                    dev_info_ratelimited!(self.dev,
+                        "userbag: Touch ID for uid {} needs the password once more: its templates loaded after the unlock\n", uid);
+                }
+            }
+        }
+        entry.restored = true;
+        true
     }
 
     /// The subject of an enrolment or a verify for the Unix account `uid`
@@ -1322,11 +1418,11 @@ impl crate::SepData {
             return Ok(None);
         }
         let user = bag_designation(uid)?;
-        let bags = self.user_bags.lock();
+        let mut bags = self.user_bags.lock();
         if bags.get(user.special_handle().value()).is_none() {
             return Ok(None);
         }
-        if bags.touch(user.special_handle().value()).is_none() {
+        if bags.touch(user.special_handle().value()).is_none() || !self.userbag_restore_13(&mut bags, user, uid) {
             return Err(EACCES);
         }
         Ok(Some(crate::BioSubject { user: -user.special_handle().value(), uid }))
@@ -1346,8 +1442,20 @@ impl crate::SepData {
             return Ok(None);
         }
         let user = bag_designation(uid)?;
-        let Some(handle) = self.user_bags.lock().touch(user.special_handle().value()) else {
-            return Err(EACCES);
+        let handle = {
+            let mut bags = self.user_bags.lock();
+            let Some(handle) = bags.touch(user.special_handle().value()) else {
+                return Err(EACCES);
+            };
+            if !self.userbag_restore_13(&mut bags, user, uid) {
+                return Err(EACCES);
+            }
+            // Loading the catacomb just now dropped a preparation it made
+            // stale (`userbag_restore_13`).
+            if bags.touch(user.special_handle().value()).is_none() {
+                return Err(EACCES);
+            }
+            handle
         };
         let ready = matches!(self.scrd_command(&crate::scrd::scrd_verify_touchid_enrollment(&handle)),
             Some((0, ref reply)) if reply.get(..4) == Some(&1u32.to_le_bytes()));
@@ -1395,7 +1503,7 @@ impl crate::SepData {
         };
         // Touch ID ends with the lock, whatever the store answers.
         if let Some(t) = touch {
-            let _ = self.delete_unlock_evaluation(&t);
+            self.userbag_dispose_touch(t);
         }
         self.userbag_transition(user, TransitionState::Locked, flags, &[])?;
         self.userbag_loaded_lock_state_13(bag, TransitionState::Locked, &[])?;
@@ -1431,7 +1539,7 @@ impl crate::SepData {
         let removed = self.user_bags.lock().remove(user.special_handle().value());
         if let Some((bag, touch)) = removed {
             if let Some(t) = touch {
-                let _ = self.delete_unlock_evaluation(&t);
+                self.userbag_dispose_touch(t);
             }
             let unloaded = self.sks_send(self.sks_req_unload_keybag(bag));
             if !matches!(unloaded, Some(ref out) if out.reply.status == 0) {
@@ -1728,7 +1836,11 @@ impl crate::SepData {
             return Err(EOPNOTSUPP);
         }
         let user_ptr = UserPtr::from_addr(arg);
-        if cmd != IOC_STATE && !crate::bio::idle_for_mutation(&self.bio_session.lock()) {
+        // Create, import, export, unlock and lock leave the Touch ID session
+        // alone. A lock screen runs its password and fingerprint prompts at
+        // once, so a login must not wait for a fingerprint wait to end.
+        let reads_or_opens = matches!(cmd, IOC_STATE | IOC_CREATE | IOC_EXPORT | IOC_IMPORT | IOC_UNLOCK | IOC_LOCK);
+        if !reads_or_opens && !crate::bio::idle_for_mutation(&self.bio_session.lock()) {
             return Err(EBUSY);
         }
         match cmd {
