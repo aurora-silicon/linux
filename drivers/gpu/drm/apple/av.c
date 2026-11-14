@@ -318,7 +318,8 @@ bool dcp_audiosrv_native_link(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
-	return dcp_is_v14_7_external(dcp) || av_desktop_audio_role(dcp);
+	return dcp_is_v14_7_external(dcp) || av_desktop_audio_role(dcp) ||
+	       dcp->fw_compat == DCP_FIRMWARE_V_27_0;
 }
 
 /* The 14.7 external role's audio service calls; KUnit stubs them. */
@@ -395,7 +396,10 @@ int dcp_audiosrv_open(struct device *dev)
 		/* Open: a zero body; status at +0, the opened Boolean at +16. */
 		memset(reply, 0, sizeof(reply));
 		ret = av_audiosrv_call(srv, asrv->cmds.open, NULL, 0, 32, reply, sizeof(reply));
-		if (!ret && (get_unaligned_le32(reply) || !get_unaligned_le64(reply + 16))) {
+		/* Firmware 27 does not require the 14.7 opened Boolean at +16. */
+		if (!ret && (get_unaligned_le32(reply) ||
+		    (dcp->fw_compat != DCP_FIRMWARE_V_27_0 &&
+		     !get_unaligned_le64(reply + 16)))) {
 			dev_err(dev, "audiosrv: open answered %#x, opened %llu\n",
 				get_unaligned_le32(reply), get_unaligned_le64(reply + 16));
 			ret = -EIO;
@@ -1395,7 +1399,8 @@ int avep_init(struct apple_dcp *dcp)
 	struct device *dev = dcp->dev;
 	struct device_node *endpoint, *audio_node = NULL;
 	const struct apple_epic_service_ops *ops = avep_ops;
-	u32 av_endpoint = AV_ENDPOINT;
+	u32 av_endpoint = dcp->fw_compat == DCP_FIRMWARE_V_27_0 ?
+			  AV_ENDPOINT_V27 : AV_ENDPOINT;
 	int ret;
 
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
@@ -1459,11 +1464,11 @@ int avep_init(struct apple_dcp *dcp)
 	default:
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
 		/*
-		 * The 14.7 external role (T6030 external processor) numbers its
+		 * The 14.7 external role and firmware 27 number their
 		 * methods as 13.5 does: open 4, close 5, prepare 6, start 7,
 		 * stop 10, complete 11, elements 1/16, product attributes 1/18.
 		 */
-		if (dcp_is_v14_7_external(dcp)) {
+		if (dcp_is_v14_7_external(dcp) || dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
 			audiosrv_data->cmds = dcp_av_audio_cmds_v13_5;
 			break;
 		}
