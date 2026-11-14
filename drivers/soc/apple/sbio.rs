@@ -984,7 +984,7 @@ impl SepData {
 
     fn stash_enrol_identity(&self, record: &[u8]) {
         let mut found: KVec<[u8; bio::UUID_LEN]> = KVec::new();
-        crate::sbio::enrol_identity_candidates(record, SBIO_PROBE_USER_ID, |_at, uuid| {
+        crate::sbio::enrol_identity_candidates(record, self.bio_user(), |_at, uuid| {
             let _ = found.push(uuid, GFP_KERNEL);
         });
         *self.enrol_identity_candidates.lock() = found;
@@ -992,7 +992,7 @@ impl SepData {
 
     fn identity_just_enrolled(&self) -> Option<[u8; bio::UUID_LEN]> {
         let candidates = core::mem::take(&mut *self.enrol_identity_candidates.lock());
-        let listed = self.enclave_identities_for(SBIO_PROBE_USER_ID)?;
+        let listed = self.enclave_identities_for(self.bio_user())?;
 
         let mut confirmed: KVec<[u8; bio::UUID_LEN]> = KVec::new();
         for uuid in candidates.iter() {
@@ -1112,6 +1112,19 @@ impl SepData {
     }
 
     fn finish_enrolment(&self, outcome: core::result::Result<[u8; bio::UUID_LEN], u32>) {
+        // A bag user's identities are not the configured user's: the shared
+        // index (reconciled against the configured user) never holds them.
+        // Matches check them against the enclave's own list for that user.
+        if self.bio_subject.lock().is_some() {
+            let mut scratch = bio::IdentityIndex::new();
+            let filed = bio::enrol_finish(
+                &mut self.bio_session.lock(), self.capture_epoch.load(Relaxed), &mut scratch, outcome,
+            );
+            if filed {
+                self.bio_wake();
+            }
+            return;
+        }
         let filed = {
             let mut session = self.bio_session.lock();
             let mut index = self.bio_index.lock();
@@ -1188,6 +1201,9 @@ impl SepData {
     }
 
     fn open_enrolment_context(&self, user: crate::sbio::UserId) -> bool {
+        if self.bio_subject.lock().is_some() {
+            return self.open_bag_user_context(user);
+        }
         let listed = match self.enclave_identities_for(SBIO_PROBE_USER_ID) {
             Some(list) => list.len(),
             None => {
@@ -1207,6 +1223,24 @@ impl SepData {
         }
 
         self.open_fresh_context(user, &proof)
+    }
+
+    /// A bag user's enrolment context. Their first enrolment selects a
+    /// context scoped to that user alone, proved by zero identities; never
+    /// SYSTEM, which would also reselect the shared master. Later ones
+    /// activate the component their unlock restored.
+    fn open_bag_user_context(&self, user: crate::sbio::UserId) -> bool {
+        let Some(ids) = self.enclave_identities_for(user.value()) else {
+            return false;
+        };
+        if let Some(proof) = crate::sbio::NoExistingCatacomb::from_zero_identities(ids.len()) {
+            let select = crate::sbio::sbio_select_context(crate::sbio::ContextScope::user(user), &proof);
+            if self.sbio_enrol_step(&select).is_none() {
+                dev_err_ratelimited!(self.dev, "enrol: selecting user {}'s first context was refused\n", user.value());
+                return false;
+            }
+        }
+        self.activate_protected_config(user)
     }
 
     fn enrol_into_existing_context(&self, user: crate::sbio::UserId) -> bool {
@@ -1366,18 +1400,21 @@ impl SepData {
             let _ = self.sbio_call(&crate::sbio::sbio_cancel_operation());
         }
 
-        let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+        let bag_user = self.bio_subject.lock().is_some();
+        let Some(user) = crate::sbio::UserId::new(self.bio_user()) else {
             dev_err_ratelimited!(self.dev, "enrol: invalid probe user id\n");
             return None;
         };
 
         // 0x03 answers -3 until a user key bag is designated
-        if !self.keybag_designated.load(Relaxed) {
+        // A bag user's enrolment is authorized by their own password unlock,
+        // not by the identity bag's material.
+        if !bag_user && !self.keybag_designated.load(Relaxed) {
             dev_err_ratelimited!(self.dev, "enrol: no user keybag was designated\n");
             return None;
         }
 
-        if self.enrol_material.lock().is_none() {
+        if !bag_user && self.enrol_material.lock().is_none() {
             dev_err_ratelimited!(self.dev, "enrol: no enrolment material is held\n");
             return None;
         }
@@ -1388,7 +1425,12 @@ impl SepData {
             return None;
         }
 
-        let Some(acm_handle) = self.establish_passcode_validated_context(user) else {
+        let credential = if bag_user {
+            self.userbag_subject_credential()
+        } else {
+            self.establish_passcode_validated_context(user)
+        };
+        let Some(acm_handle) = credential else {
             dev_err_ratelimited!(
                 self.dev,
                 "enrol: could not establish the PasscodeValidated SCRD credential; not falling back to a transient SKS token (a catacomb sealed under one does not survive a reboot)\n"
@@ -1753,6 +1795,51 @@ impl SepData {
 
     /// `Ok(None)` means provably not stored; any read failure is an error so
     /// it cannot be mistaken for a missing file.
+    /// After a bag user's enrolment: their own catacomb first, then any
+    /// other dirty user, the shared master, and the lockout record. Nothing
+    /// is reported saved while any component is still save-pending.
+    fn save_bag_user_components(&self, user: crate::sbio::UserId) -> bool {
+        let Some(configured) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+            return false;
+        };
+        for (who, slot, required, what) in [
+            (crate::sbio::CatacombUser::enrolling(user), self.bio_user_slot(), true, c"bag user catacomb"),
+            (crate::sbio::CatacombUser::enrolling(configured), crate::catacomb::Slot::Kind(PRIVATE_TYPE_CATACOMB_USER), false, c"user catacomb"),
+            (crate::sbio::CatacombUser::OWNER, crate::catacomb::Slot::Kind(PRIVATE_TYPE_CATACOMB_OWNER), false, c"owner catacomb"),
+            (crate::sbio::CatacombUser::MASTER, crate::catacomb::Slot::Kind(PRIVATE_TYPE_CATACOMB_MASTER), true, c"master catacomb"),
+        ] {
+            let Some(raw) = self.read_component_states() else {
+                return false;
+            };
+            let state = crate::sbio::ComponentStates::new(&raw).state_for(who.value());
+            let Some(state) = state else {
+                if required {
+                    dev_err_ratelimited!(self.dev, "enrol: the {} is absent after the enrolment\n", what);
+                    return false;
+                }
+                continue;
+            };
+            if (required || state & crate::sbio::COMPONENT_STATE_SAVE_PENDING != 0)
+                && !self.save_catacomb(who, slot, what)
+            {
+                dev_err_ratelimited!(self.dev, "enrol: saving the {} failed\n", what);
+                return false;
+            }
+            if required && !crate::catacomb::is_saved(slot) {
+                return false;
+            }
+        }
+        let Some(raw) = self.read_component_states() else {
+            return false;
+        };
+        let states = crate::sbio::ComponentStates::new(&raw);
+        if (0..states.count()).any(|i| states.pair(i).is_some_and(|(_, st)| st & crate::sbio::COMPONENT_STATE_SAVE_PENDING != 0)) {
+            dev_err_ratelimited!(self.dev, "enrol: a component is still save-pending after the bag user's enrolment\n");
+            return false;
+        }
+        self.save_lockout()
+    }
+
     fn read_stored(&self, kind: impl Into<crate::catacomb::Slot>, what: &CStr) -> Result<Option<KVec<u8>>> {
         let kind = match kind.into() {
             crate::catacomb::Slot::Kind(kind) => kind,
@@ -1784,6 +1871,9 @@ impl SepData {
     }
 
     fn save_all_components(&self, user: crate::sbio::UserId) -> bool {
+        if self.bio_subject.lock().is_some() {
+            return self.save_bag_user_components(user);
+        }
         if self.profile.persistent_enrol || module_parameters::j414s_persistent_enrol.value() != 0 {
             return self.save_all_components_user_first(user);
         }
@@ -3255,6 +3345,19 @@ impl SepData {
     }
 
     pub(crate) fn run_enrolment(&self) {
+        // An enrolment for a Unix account whose bag is loaded goes into that
+        // user's own domain (13.5 store); one whose bag is locked waits for
+        // the password.
+        let account = bio::enrol_account(&self.bio_session.lock());
+        let _subject = match account.map(|uid| self.userbag_enrol_subject(uid)) {
+            Some(Err(_)) => {
+                dev_info_ratelimited!(self.dev, "enrol: the account's key bag is locked; its password is needed to add a finger\n");
+                self.finish_enrolment(Err(ENROL_STATUS_ENCLAVE));
+                return;
+            }
+            Some(Ok(Some(subject))) => Some(crate::SubjectScope::new(self, subject)),
+            _ => None,
+        };
         self.end_match_scope(c"an enrolment");
         self.enrol_frames_accepted.store(0, Relaxed);
         self.sensor_kept.store(false, Relaxed);
@@ -3367,7 +3470,7 @@ impl SepData {
         if enrolment_completed {
             open.completed();
 
-            if let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) {
+            if let Some(user) = crate::sbio::UserId::new(self.bio_user()) {
                 if !self.save_all_components(user) {
                     dev_err_ratelimited!(
                         self.dev,
@@ -4251,7 +4354,7 @@ impl SepData {
         // as it has it, while the enclave processes the frame.
         self.pause_after_touch(c"enrol");
 
-        let Some(user) = crate::sbio::UserId::new(SBIO_PROBE_USER_ID) else {
+        let Some(user) = crate::sbio::UserId::new(self.bio_user()) else {
             dev_err_ratelimited!(self.dev, "enrol: invalid user id before image processing\n");
             return ImageOutcome::Failed(ENROL_STATUS_ENCLAVE);
         };

@@ -520,6 +520,8 @@ enum Op {
     Idle,
     Enrol {
         label: [u8; LABEL_LEN],
+        /// The resolved Unix account the enrolment is for.
+        account_uid: u32,
         stage: u32,
         terminal: Option<EnrolOutcome>,
         guidance: Guidance,
@@ -757,6 +759,7 @@ mod enrol_request_tests {
         session.start_worker().unwrap();
         session.op = Op::Enrol {
             label: [0; LABEL_LEN],
+            account_uid: 1000,
             stage: 0,
             terminal: None,
             guidance: Guidance::Place,
@@ -835,6 +838,7 @@ fn enrol_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     ctx.session.start_worker()?;
     ctx.session.op = Op::Enrol {
         label: request.label,
+        account_uid: request.account_uid,
         stage: 0,
         terminal: None,
         guidance: Guidance::Place,
@@ -851,6 +855,14 @@ fn enrol_start(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
         delete_identity: None,
         delete_identities: KVec::new(),
     })
+}
+
+/// The account of the enrolment the worker runs, if it runs one.
+pub(crate) fn enrol_account(session: &Session) -> Option<u32> {
+    match session.op {
+        Op::Enrol { account_uid, terminal: None, .. } => Some(account_uid),
+        _ => None,
+    }
 }
 
 pub(crate) fn enrol_advance(

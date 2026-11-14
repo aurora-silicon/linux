@@ -305,6 +305,24 @@ pub(crate) struct BioSubject {
     pub(crate) uid: u32,
 }
 
+/// Routes Touch ID to a bag user while a touch-gated call or an enrolment
+/// runs, under `catacomb_writer`; the configured user again when it ends, on
+/// every path.
+pub(crate) struct SubjectScope<'a>(&'a SepData);
+
+impl<'a> SubjectScope<'a> {
+    pub(crate) fn new(sep: &'a SepData, subject: BioSubject) -> Self {
+        *sep.bio_subject.lock() = Some(subject);
+        SubjectScope(sep)
+    }
+}
+
+impl Drop for SubjectScope<'_> {
+    fn drop(&mut self) {
+        *self.0.bio_subject.lock() = None;
+    }
+}
+
 impl LockState {
     const fn wire(self) -> i32 {
         match self {

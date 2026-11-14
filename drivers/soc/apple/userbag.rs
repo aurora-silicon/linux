@@ -1286,14 +1286,18 @@ impl crate::SepData {
             let _writer = self.catacomb_writer.lock();
             let raw = self.read_component_states()?;
             let state = crate::sbio::ComponentStates::new(&raw).state_for(id);
-            let outcome = self.restore_catacomb(state, id, crate::catacomb::Slot::BagUser(uid), c"bag user catacomb");
-            if !matches!(outcome, crate::RestoreOutcome::AlreadyActive | crate::RestoreOutcome::Restored) {
-                dev_info_ratelimited!(self.dev, "userbag: no Touch ID for uid {}: its catacomb did not load ({:?})\n", uid, outcome);
-                return None;
+            let slot = crate::catacomb::Slot::BagUser(uid);
+            // A user who never enrolled has neither a component nor a file:
+            // nothing to load, and the preparation still authorizes the first
+            // enrolment. Either one without the other is not that.
+            let fresh = state.is_none() && crate::catacomb::is_absent(slot);
+            if !fresh {
+                let outcome = self.restore_catacomb(state, id, slot, c"bag user catacomb");
+                if !matches!(outcome, crate::RestoreOutcome::AlreadyActive | crate::RestoreOutcome::Restored) {
+                    dev_info_ratelimited!(self.dev, "userbag: no Touch ID for uid {}: its catacomb did not load ({:?})\n", uid, outcome);
+                    return None;
+                }
             }
-        }
-        if self.enclave_identities_for(id).is_none_or(|ids| ids.is_empty()) {
-            return None;
         }
         let (handle, status) = self.key_context_for(id, Some((user.special_handle(), secret))).ok()?;
         let ready = status == 0
@@ -1304,8 +1308,34 @@ impl crate::SepData {
             dev_info_ratelimited!(self.dev, "userbag: no Touch ID for uid {}: the preparation was refused\n", uid);
             return None;
         }
-        dev_info_ratelimited!(self.dev, "userbag: Touch ID ready for uid {}\n", uid);
+        dev_info_ratelimited!(self.dev, "userbag: Touch ID and enrolment ready for uid {}\n", uid);
         Some(handle)
+    }
+
+    /// The subject of an enrolment for the Unix account `uid` (13.5 store):
+    /// that user's own domain when their bag is loaded. Refused while it is
+    /// loaded but not unlocked by the password since its last lock, as macOS
+    /// asks for the password to add a finger. None (no bag) keeps the
+    /// configured user.
+    pub(crate) fn userbag_enrol_subject(&self, uid: u32) -> Result<Option<crate::BioSubject>> {
+        if !self.userbag_sepos13() || uid < MIN_UID {
+            return Ok(None);
+        }
+        let user = bag_designation(uid)?;
+        let bags = self.user_bags.lock();
+        if bags.get(user.special_handle().value()).is_none() {
+            return Ok(None);
+        }
+        if bags.touch(user.special_handle().value()).is_none() {
+            return Err(EACCES);
+        }
+        Ok(Some(crate::BioSubject { user: -user.special_handle().value(), uid }))
+    }
+
+    /// The current subject's password-verified credential, for BEGIN_ENROL.
+    pub(crate) fn userbag_subject_credential(&self) -> Option<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]> {
+        let subject = (*self.bio_subject.lock())?;
+        self.user_bags.lock().touch(-subject.user)
     }
 
     /// Touch ID for a key under `uid`'s bag (13.5 store): the preparation
