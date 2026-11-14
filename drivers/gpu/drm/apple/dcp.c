@@ -1808,6 +1808,8 @@ static int dcp_t8132_wait_teardown_answers(struct apple_dcp *dcp, u32 port,
  * With a @session, every step checks that it is still the live one, and a
  * revoked session returns -ESTALE without touching the new one's state.
  */
+static bool dcp_tunnel_relinks(struct apple_dcp *dcp);
+
 static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable,
 				const struct dcp_fabric_session *session, bool cable,
 				bool recovery)
@@ -2024,7 +2026,8 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		av_service_connect(dcp);
 
 	/* Do not timestamp a new attachment after an older link wait. */
-	if (!port && dcp_is_typec_output(dcp) && !dcp_is_usb4_output(dcp) &&
+	if (!port && dcp_is_typec_output(dcp) &&
+	    (!dcp_is_usb4_output(dcp) || dcp_tunnel_relinks(dcp)) &&
 	    dcp->fw_compat != DCP_FIRMWARE_H17P && !dcp->external_native &&
 	    !dcp_is_external_h17p(dcp)) {
 		guard(mutex)(&dcp->hpd_mutex);
@@ -3035,8 +3038,10 @@ static int dcp_dptx_connect_attached(struct apple_dcp *dcp, u32 port)
  */
 /*
  * A T6050 tunnel keeps its Thunderbolt binding and its HPD when the firmware
- * drops the sink after servicing its IRQ_HPD (see dcp_tb_event_work()):
- * nothing else connects it again. Other tunnels are left to their owners.
+ * drops the sink, after servicing its IRQ_HPD (see dcp_tb_event_work()) or
+ * when the sink's USB hub comes up: nothing else connects it again.
+ * tb_event_hpd is true until the tunnel reports HPD low. Other tunnels are
+ * left to their owners.
  */
 static bool dcp_tunnel_relinks(struct apple_dcp *dcp)
 {
@@ -6213,6 +6218,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 			  dcp_typec_reconnect_work);
 	INIT_DELAYED_WORK(&dcp->link_recovery_wq, dcp_link_recovery_work);
 	mutex_init(&dcp->tb_event_lock);
+	dcp->tb_event_hpd = true;
 	INIT_WORK(&dcp->tb_event_work, dcp_tb_event_work);
 	INIT_DELAYED_WORK(&dcp->placeholder_edid_wq,
 			  dcp_placeholder_edid_work);

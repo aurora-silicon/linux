@@ -437,6 +437,7 @@ static void dcp_tb_events_retire(struct apple_dcp *dcp)
 		dcp->tb_events = 0;
 		dcp->tb_event_route = NULL;
 		dcp->tb_event_generation = 0;
+		WRITE_ONCE(dcp->tb_event_hpd, true);
 	}
 	cancel_work_sync(&dcp->tb_event_work);
 }
