@@ -1341,11 +1341,21 @@ static const struct apple_isp_hw apple_isp_hw_t8142 = {
 	.mbox2_offset = 0x410,
 	.mbox_irq_route = true,
 	.coproc_control = ISP_COPROC_CONTROL_T8140,
+	.coproc_status = ISP_COPROC_STATUS_T8140,
+	.coproc_quiesce = ISP_COPROC_QUIESCE_T8140,
 	.fw_mmio = apple_isp_fw_mmio_t8142,
 	.num_fw_mmio = ARRAY_SIZE(apple_isp_fw_mmio_t8142),
 	.boot_mode = 1,
 	.capture_meta_size = ISP_CAPTURE_META_SIZE_T8140,
 	.resident_fw = true,
+	/*
+	 * As on T6040: the firmware starts at probe to detect the camera and
+	 * stops again, each stream starts it from its own memory, and it stays
+	 * up for 5 s after a stream. The coprocessor is quiesced before its
+	 * domains go off.
+	 */
+	.fw_restart = true,
+	.fw_idle_ms = 5000,
 	/* The J813 IMX958 runs the xx24 setfile 2224_01, as T6040 does. */
 	.setfile_stride_fixup = true,
 };
