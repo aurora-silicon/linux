@@ -1102,15 +1102,16 @@ impl SepData {
                 "initrd: per-user key bags need xart_writes=1 and no xART guard; they wait for the real root\n"
             );
         }
-        // The qualified 26.6.2 lane uses only the boot-forwarded identity.
-        // Check before opening the shared xART store writable.
-        if profile::j613_26_6_2() && xart_writes {
+        // The owner-qualified J613 lane (26.6.2 or 27.2) uses only the
+        // boot-forwarded identity. Check before opening the shared xART store
+        // writable.
+        if profile::j613_owner_qualified() && xart_writes {
             if dt::preboot_uuid().is_none()
                 || module_parameters::os_uuid_hi.value() != 0
                 || module_parameters::os_uuid_lo.value() != 0
                 || xart_guard.is_none()
             {
-                dev_err_ratelimited!(dev, "J613 26.6.2 requires a DT identity and xART guard\n");
+                dev_err_ratelimited!(dev, "J613 owner lane requires a DT identity and xART guard\n");
                 return Err(EINVAL);
             }
         }
@@ -1157,8 +1158,8 @@ impl SepData {
             match store::Store::open() {
                 Ok(store) => Some(store),
                 Err(e) => {
-                    if profile::j613_26_6_2() {
-                        dev_err_ratelimited!(dev, "J613 26.6.2 host-state store unavailable: {:?}\n", e);
+                    if profile::j613_owner_qualified() {
+                        dev_err_ratelimited!(dev, "J613 owner lane host-state store unavailable: {:?}\n", e);
                         return Err(e);
                     }
                     dev_warn_ratelimited!(dev, "Linux host-state store unavailable: {:?}\n", e);
@@ -1169,7 +1170,7 @@ impl SepData {
 
         let bio_index = match host_store.as_mut().map(bio::IdentityIndex::load) {
             Some(Ok(index)) => index,
-            Some(Err(e)) if profile::j613_26_6_2() => return Err(e),
+            Some(Err(e)) if profile::j613_owner_qualified() => return Err(e),
             Some(Err(_)) => bio::IdentityIndex::new(),
             None => bio::IdentityIndex::new(),
         };
