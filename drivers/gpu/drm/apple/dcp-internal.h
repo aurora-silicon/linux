@@ -961,6 +961,8 @@ struct apple_dcp {
 	unsigned int tb_irq_hpd_count;
 	unsigned int tb_hpd_count;
 	ktime_t tb_irq_hpd_last;
+	/* A mode set is in flight: hold IRQ_HPD; see dcp_tb_modeset_begin(). */
+	bool tb_modeset_busy;
 
 	/* Kept last: the template instances share the layout above. */
 	struct dcp_desktop_state *desktop;

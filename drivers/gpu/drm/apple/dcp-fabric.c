@@ -3334,6 +3334,11 @@ void dcp_tb_event_work(struct work_struct *work)
 	irq = test_and_clear_bit(DCP_TB_EVENT_IRQ_HPD, &dcp->tb_events);
 	changed = test_and_clear_bit(DCP_TB_EVENT_HPD, &dcp->tb_events);
 	hpd = dcp->tb_event_hpd;
+	if (irq && READ_ONCE(dcp->tb_modeset_busy)) {
+		set_bit(DCP_TB_EVENT_IRQ_HPD, &dcp->tb_events);
+		irq = false;
+		dev_info(dcp->dev, "DP tunnel: sink IRQ_HPD held until the mode set completes\n");
+	}
 	if ((!irq && !changed) || !route)
 		return;
 	scoped_guard(mutex, &dcp->tb_lock)
@@ -3372,6 +3377,30 @@ void dcp_tb_event_work(struct work_struct *work)
 		ret = dptxport_sink_irq(service);
 		dev_info(dcp->dev, "DP tunnel: sink IRQ_HPD (#%u, %lld ms after the last) passed to the firmware: %d\n",
 			 dcp->tb_irq_hpd_count, since, ret);
+	}
+}
+
+/*
+ * On the T6050 dcpext, a sink IRQ_HPD passed to the firmware during the link
+ * training of a mode set ends with IOAVVideoInterface terminated about 110 ms
+ * later. Hold it until the mode set returns, then replay it.
+ */
+void dcp_tb_modeset_begin(struct apple_dcp *dcp)
+{
+	WRITE_ONCE(dcp->tb_modeset_busy, true);
+}
+
+void dcp_tb_modeset_end(struct apple_dcp *dcp)
+{
+	bool held;
+
+	scoped_guard(mutex, &dcp->tb_event_lock) {
+		WRITE_ONCE(dcp->tb_modeset_busy, false);
+		held = test_bit(DCP_TB_EVENT_IRQ_HPD, &dcp->tb_events);
+	}
+	if (held) {
+		dev_info(dcp->dev, "DP tunnel: replaying the held sink IRQ_HPD\n");
+		queue_work(system_dfl_wq, &dcp->tb_event_work);
 	}
 }
 

@@ -4055,6 +4055,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 
 	dcp->swap_submit_timestamp = 0;
 
+	dcp_tb_modeset_begin(dcp);
 	if (DCP_INHERIT_BOOT_MODE &&
 	    dcp->hw.iomfb_method_profile !=
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
@@ -4087,6 +4088,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	 */
 	ret = wait_for_completion_timeout(&cookie->done,
 					  msecs_to_jiffies(8500));
+	dcp_tb_modeset_end(dcp);
 
 	dev_info(dcp->dev, "set_digital_out_mode finished:%d\n", ret);
 
