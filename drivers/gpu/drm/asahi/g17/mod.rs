@@ -1244,6 +1244,9 @@ struct Shared {
     /// M5: an event pass signals its completions before the rest of its work
     /// ([`Self::completion_first`]).
     completion_first: bool,
+    /// Records were notified since the running event pass last began a service: it services
+    /// again before the rest of the pass (M5).
+    records: AtomicBool,
     /// When an event pass last ran every housekeeping step, in ns.
     housekeeping_ns: AtomicU64,
     #[pin]
@@ -1444,6 +1447,9 @@ impl Shared {
         if !self.submission_enabled {
             return;
         }
+        // A running pass that has signalled what it serviced looks at this before the rest of
+        // its work.
+        self.records.store(true, Ordering::Release);
         // Already queued if this fails, which is just as good.
         let _ = match self.submitter() {
             Some(cpu) => self.events.enqueue_on::<Arc<Shared>, EVENT_WORK>(cpu, self.clone()),
@@ -1472,10 +1478,12 @@ impl Shared {
         kernel::cpu::CpuId::from_u32(self.submitter.load(Ordering::Relaxed))
     }
 
-    /// M5: an event pass drains its report rings after its render observation, so that the
-    /// renders it retires are signalled before the reports are read. A client that waits for
-    /// each job before it submits the next leaves the GPU idle from the job's end to its next
-    /// publication, and the reports are no scheduling input.
+    /// M5: an event pass retires and signals the records notified while it serviced before the
+    /// rest of its work (its reports, replays, render observation and housekeeping), and drains
+    /// its report rings after its render observation, so that the renders it retires are
+    /// signalled before the reports are read. A client that waits for each job before it
+    /// submits the next leaves the GPU idle from the job's end to its next publication, and
+    /// none of that work is a scheduling input.
     pub(super) fn completion_first(&self) -> bool {
         self.completion_first
     }
@@ -1790,6 +1798,7 @@ impl Gpu {
                 work <- new_work!("g17::Shared::work"),
                 housekeeping: AtomicBool::new(true),
                 completion_first: m5,
+                records: AtomicBool::new(false),
                 housekeeping_ns: AtomicU64::new(0),
                 poll <- new_delayed_work!("g17::Shared::poll"),
                 idle <- new_delayed_work!("g17::Shared::idle"),

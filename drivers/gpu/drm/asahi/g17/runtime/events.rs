@@ -18,6 +18,9 @@ const SHRINK_WAKE_NS: u64 = 1_000_000_000;
 /// Longest interval between two event passes that run every housekeeping step while
 /// completion records alone keep the worker busy.
 const HOUSEKEEPING_NS: u64 = 1_000_000;
+/// M5: services an event pass may add, before the rest of the pass, for records notified while
+/// it serviced and signalled.
+const EXTRA_SERVICES: u32 = 3;
 
 struct Service<'a> {
     firmware: &'a mut Firmware,
@@ -524,21 +527,43 @@ impl crate::g17::Shared {
             .swap(false, core::sync::atomic::Ordering::AcqRel);
         // M5: completions first (see `Shared::completion_first`).
         let first = self.completion_first();
-        let (recover, masks) = {
-            let mut state = self.state.lock();
-            let Some(firmware) = (*state).as_deref_mut() else {
-                return Ok(());
-            };
-            let (pending, masks) = firmware.service_runtime_events(deferred)?;
-            let recover = pending.recovery || firmware.recovery.pending();
-            if recover {
-                // Epoch closure and event consumption are serialized with every
-                // publisher. Joining builders must happen after unlocking.
-                self.preparations.close();
+        let mut masks = [0; 2];
+        let mut services = 0;
+        let recover = loop {
+            if first {
+                // A notification from here on is for records this service may not reach. The
+                // flag only saves a pass: the notification also queued the next one.
+                let _ = self.records.swap(false, core::sync::atomic::Ordering::AcqRel);
             }
-            (recover, masks)
+            let (recover, batch) = {
+                let mut state = self.state.lock();
+                let Some(firmware) = (*state).as_deref_mut() else {
+                    return Ok(());
+                };
+                let (pending, batch) = firmware.service_runtime_events(deferred)?;
+                let recover = pending.recovery || firmware.recovery.pending();
+                if recover {
+                    // Epoch closure and event consumption are serialized with every
+                    // publisher. Joining builders must happen after unlocking.
+                    self.preparations.close();
+                }
+                (recover, batch)
+            };
+            masks[0] |= batch[0];
+            masks[1] |= batch[1];
+            deferred.finish();
+            services += 1;
+            // Records that arrived while this pass serviced and signalled are retired before
+            // the pass's reports, replays, render observation and housekeeping, not after them
+            // in the next pass. Bounded, so that the rest of the pass still runs.
+            if recover
+                || !first
+                || services > EXTRA_SERVICES
+                || !self.records.load(core::sync::atomic::Ordering::Acquire)
+            {
+                break recover;
+            }
         };
-        deferred.finish();
         crate::g17::trace::event(1);
         if recover {
             self.preparations
