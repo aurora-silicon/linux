@@ -91,8 +91,8 @@ static ssize_t agx_qualified_stats_show(struct asahi_stats_attribute *stats, cha
 	}
 	/*
 	 * unsupported comes from the firmware match data (g17::stats): V25G83
-	 * and V26A428 never emit a pstate record, so it is not a transient
-	 * state. unavailable keeps meaning "no qualified sample yet".
+	 * never emits a pstate record, so it is not a transient state.
+	 * unavailable keeps meaning "no qualified sample yet".
 	 */
 	n += sysfs_emit_at(buf, n, "pstate_status %s\n",
 			   asahi_stats_quality(snap.pstate_status));
@@ -100,10 +100,13 @@ static ssize_t agx_qualified_stats_show(struct asahi_stats_attribute *stats, cha
 		n += sysfs_emit_at(buf, n, "pstate %u\n", snap.pstate);
 	else
 		n += sysfs_emit_at(buf, n, "pstate unsupported\n");
-	/* No A/B selector, measured power or temperature. */
+	/* No host frequency request, measured power or temperature. */
 	n += sysfs_emit_at(buf, n, "requested_frequency_hz unsupported\n");
-	/* M5 reports the state the GPU runs at: its frequency is the achieved one. */
-	if (snap.pstate_status == 1 && snap.achieved_frequency_hz)
+	/*
+	 * V26A428 reports the state the GPU runs at: its frequency is the
+	 * achieved one. State 0 is off (gated cores) and runs at 0 Hz.
+	 */
+	if (snap.pstate_status == 1 && (snap.achieved_frequency_hz || !snap.pstate))
 		n += sysfs_emit_at(buf, n, "achieved_frequency_hz %llu\n",
 				   (unsigned long long)snap.achieved_frequency_hz);
 	else
