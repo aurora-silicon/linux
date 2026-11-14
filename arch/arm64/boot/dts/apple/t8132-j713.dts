@@ -78,6 +78,36 @@
 	apple,machine-kind = "MacBook Air";
 };
 
+/* Deep sleep has been brought up and tested on this machine only. */
+&sleep {
+	status = "okay";
+};
+
+/* Deep sleep needs both CPU clusters' power gates; iBoot enables E's only. */
+&cluster_pwrgate {
+	status = "okay";
+};
+
+/* The enclave must take the sleep request, so its driver has to bind. */
+&sep_dart {
+	status = "okay";
+};
+
+/* Only named: the sleep's last refusal reads its state to see the enclave gate. */
+&ps_sep {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&sep {
+	/*
+	 * Without a domain the driver tells the enclave at .suspend, and a sleep
+	 * refused after that finds it gated with its mailbox gone.
+	 */
+	power-domains = <&ps_sep>, <&ps_gpio>;
+	status = "okay";
+};
+
 /*
  * The four SN012776 speaker amps, held in hardware shutdown until the sound
  * card enables them (ADT /arm-io/i2c3/audio-speaker at 0x38 and its
@@ -165,4 +195,101 @@
 
 &dcp {
 	apple,pmc-interface = <&pmc_disp0>;
+};
+
+/*
+ * Each external DCP powers its CPU, front-end and system domains off around
+ * a deep sleep. The system domains have a bus bridge in front of their
+ * block: its link words are 0x800104 past the start of the block's disp-3
+ * registers (reg 4 of the external DCP).
+ */
+&ps_dispext0_sys {
+	apple,consumer-switched;
+	apple,bridge-link = <&dcpext0 4 0x800104>;
+};
+
+&ps_dispext0_fe {
+	apple,consumer-switched;
+};
+
+&ps_dispext0_cpu {
+	apple,consumer-switched;
+	/* Power-gate retention workaround, as macOS sets it while off. */
+	apple,retention-workaround = <0x256cc 0x3 0x3>, <0x256f0 0x3 0x0>;
+};
+
+&ps_dispext1_sys {
+	apple,consumer-switched;
+	apple,bridge-link = <&dcpext1 4 0x800104>;
+};
+
+&ps_dispext1_fe {
+	apple,consumer-switched;
+};
+
+&ps_dispext1_cpu {
+	apple,consumer-switched;
+	/* Power-gate retention workaround, as macOS sets it while off. */
+	apple,retention-workaround = <0x25b4c 0x3 0x3>, <0x25b70 0x3 0x0>;
+};
+
+/*
+ * A deep sleep with a dock attached powers these off: their hosts (the ACIO
+ * NHIs, the tunneled PCIe ports and the external DCPs) take them down and
+ * restore them, with these clock protection slices.
+ */
+&usb4_0_dart {
+	apple,clock-protection = <&ps_prot 15>;
+};
+
+&usb4_1_dart {
+	apple,clock-protection = <&ps_prot 19>;
+};
+
+&usb4_0_pcie_dart {
+	apple,clock-protection = <&ps_prot 14>;
+};
+
+&usb4_1_pcie_dart {
+	apple,clock-protection = <&ps_prot 18>;
+};
+
+&dcpext0_dart {
+	apple,clock-protection = <&ps_prot 5>;
+};
+
+&dispext0_dart {
+	apple,clock-protection = <&ps_prot 4>;
+};
+
+&dcpext1_dart {
+	apple,clock-protection = <&ps_prot 30>;
+};
+
+&dispext1_dart {
+	apple,clock-protection = <&ps_prot 29>;
+};
+
+/* Native radio recovery is required before admitting system sleep. */
+&pcie0 {
+	status = "okay";
+};
+
+&dart_apcie0 {
+	status = "okay";
+};
+
+&port00 {
+	clkreq-gpios = <&pinctrl_ap 160 GPIO_ACTIVE_LOW>;
+};
+
+/* Each ACIO host powers its Type-C PHY down and up around a deep sleep with a dock. */
+&usb4_0_acio {
+	phys = <&atcphy0 PHY_TYPE_USB3>;
+	phy-names = "cio";
+};
+
+&usb4_1_acio {
+	phys = <&atcphy1 PHY_TYPE_USB3>;
+	phy-names = "cio";
 };

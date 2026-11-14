@@ -47,6 +47,7 @@ struct parser_record {
 	bool bad_score_type;
 	bool vrr;
 	bool vrr_zero;
+	bool dsc_required;
 };
 
 enum parser_missing {
@@ -129,7 +130,7 @@ static void blob_color(struct parser_blob *blob, s64 id, s64 score,
 
 static void blob_record(struct parser_blob *blob, const struct parser_record *record)
 {
-	unsigned int count = 6 + (record->vrr ? 2 : 0);
+	unsigned int count = 6 + (record->vrr ? 2 : 0) + record->dsc_required;
 
 	count -= !!(record->missing & MISSING_SCORE);
 	count -= !!(record->missing & MISSING_COLORS);
@@ -154,6 +155,16 @@ static void blob_record(struct parser_blob *blob, const struct parser_record *re
 			   record->color_missing, record->first_format);
 		blob_color(blob, 101, record->color_score,
 			   record->second_color_missing, DCP_COLOR_FORMAT_RGB);
+	}
+	if (record->dsc_required) {
+		blob_key(blob, "DSCRequiredColorElementIDs");
+		blob_tag(blob, 2, 2);
+		blob_tag(blob, 4, 0);
+		put_unaligned_le64(100, blob->data + blob->size);
+		blob->size += 8;
+		blob_tag(blob, 4, 0);
+		put_unaligned_le64(101, blob->data + blob->size);
+		blob->size += 8;
 	}
 	if (record->vrr) {
 		blob_int(blob, "MinimumVariableRefreshRate", record->vrr_zero ? 0 : 48 << 16);
@@ -196,6 +207,50 @@ static struct dcp_display_mode *parse_blob(struct parser_blob *blob,
 		return ERR_PTR(ret);
 	ctx.dcp = &parser_dcp;
 	return enumerate_modes(&ctx, count, 500, 300, notch, internal, false);
+}
+
+static struct dcp_display_mode *parse_blob_tiled(struct parser_blob *blob,
+						 unsigned int *count, u32 width, u32 height)
+{
+	struct dcp_parse_ctx ctx;
+	int ret = parse(blob->data, blob->size, &ctx);
+
+	if (ret)
+		return ERR_PTR(ret);
+	ctx.dcp = &parser_dcp;
+	ctx.tiled_width = width;
+	ctx.tiled_height = height;
+	return enumerate_modes(&ctx, count, 500, 300, 0, false, false);
+}
+
+static void parser_tiled_size_keeps_dsc_modes(struct kunit *test)
+{
+	struct parser_record record = valid_record(7, 10);
+	struct dcp_display_mode *modes;
+	struct parser_blob *blob;
+	unsigned int count;
+
+	record.dsc_required = true;
+	blob = make_blob(test, &record, 1);
+	KUNIT_ASSERT_NOT_NULL(test, blob);
+
+	modes = parse_blob_tiled(blob, &count, 0, 0);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, modes);
+	KUNIT_ASSERT_EQ(test, count, 1U);
+	KUNIT_EXPECT_FALSE(test, modes[0].sdr_usable);
+	kfree(modes);
+
+	modes = parse_blob_tiled(blob, &count, 3840, 2160);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, modes);
+	KUNIT_ASSERT_EQ(test, count, 1U);
+	KUNIT_EXPECT_FALSE(test, modes[0].sdr_usable);
+	kfree(modes);
+
+	modes = parse_blob_tiled(blob, &count, 1920, 1080);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, modes);
+	KUNIT_ASSERT_EQ(test, count, 1U);
+	KUNIT_EXPECT_TRUE(test, modes[0].sdr_usable);
+	kfree(modes);
 }
 
 static void parser_score_presence(struct kunit *test)
@@ -1978,6 +2033,7 @@ static struct kunit_case parser_cases[] = {
 	KUNIT_CASE(parser_panel_identity),
 	KUNIT_CASE(parser_panel_color_target),
 	KUNIT_CASE(parser_panel_adt_color_target),
+	KUNIT_CASE(parser_tiled_size_keeps_dsc_modes),
 	KUNIT_CASE(parser_score_presence),
 	KUNIT_CASE(parser_legacy_ties),
 	KUNIT_CASE(parser_color_presence),

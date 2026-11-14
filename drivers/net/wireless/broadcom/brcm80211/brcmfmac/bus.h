@@ -196,6 +196,7 @@ struct brcmf_bus {
 	struct list_head list;
 };
 
+void brcmf_bus_schedule_reset(struct brcmf_bus *bus_if);
 void brcmf_bus_cancel_reset_work(struct brcmf_bus *bus_if);
 void brcmf_bus_allow_reset_work(struct brcmf_bus *bus_if);
 

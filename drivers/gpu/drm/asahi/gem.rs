@@ -31,6 +31,7 @@ use kernel::{
 
 use core::ops::Range;
 use core::sync::atomic::{
+    AtomicBool,
     AtomicI64,
     AtomicU64,
     AtomicUsize,
@@ -65,6 +66,10 @@ pub(crate) struct AsahiObject {
     kernel_mappings: AtomicU64,
     /// Memory accounting and process attribution of the held backing.
     charge: memacct::Charge,
+    /// Userspace asked to keep the backing resident (DRM_IOCTL_ASAHI_GEM_RESIDENCY): idle
+    /// reclaim of the object's VM releases it after the VM's other objects, and only if those
+    /// did not meet the scan target. Changed and read under the object's reservation.
+    keep_resident: AtomicBool,
     /// The pinned pages of a user-memory object (DRM_IOCTL_ASAHI_GEM_USERPTR), its backing.
     /// The shmem layer unmaps them from the device before this is dropped.
     user_memory: Option<UserPages>,
@@ -602,6 +607,7 @@ impl DriverObject for AsahiObject {
             exportable: args.exportable,
             kernel: args.kernel,
             kernel_mappings: AtomicU64::new(0),
+            keep_resident: AtomicBool::new(false),
             charge: args.charge,
             user_memory: args.user_memory,
             timestamp_lock <- new_mutex!((), "Asahi timestamp stores"),
@@ -692,6 +698,16 @@ impl AsahiObject {
             && self.kernel_mappings.load(Ordering::Acquire) == 0
     }
 
+    /// Whether userspace asked to keep this object's backing resident. Idle reclaim releases
+    /// the backing of such an object after the VM's other objects, and only if those did not
+    /// meet the scan target. Purge of contents userspace advised away does not look at this:
+    /// the advice says the contents are not needed.
+    ///
+    /// The caller holds the object's reservation.
+    pub(crate) fn keep_resident(&self) -> bool {
+        self.keep_resident.load(Ordering::Relaxed)
+    }
+
     /// Whether this object is backed by the creating process's own memory.
     pub(crate) fn is_user_memory(&self) -> bool {
         self.user_memory.is_some()
@@ -725,6 +741,28 @@ pub(crate) fn madvise(gem: &Object, dontneed: bool) -> Result<u32> {
         return Err(EINVAL);
     }
     Ok(u32::from(gem.madvise(i32::from(dontneed))))
+}
+
+/// Keep (or stop keeping) the backing of a user object resident: once this returns, idle reclaim
+/// treats the object as kept (released after the VM's other objects, where those did not meet
+/// the scan target) or as any other. This is an order among the objects idle reclaim may
+/// release, not an exemption. Backing already released stays released until the VM's next job
+/// or binding restores it. Kernel objects are refused.
+pub(crate) fn set_keep_resident(gem: &Object, keep: bool) -> Result {
+    if gem.kernel {
+        return Err(EINVAL);
+    }
+    // SAFETY: A live object's reservation pointer is set at creation and never changes.
+    let resv = unsafe { (*gem.as_raw()).resv };
+    // SAFETY: The reservation of a live object. Idle reclaim tests the flag while it holds the
+    // reservation of the object's VM, which a VM-private object shares, so after the unlock no
+    // reclaim pass can still act on the old value; other objects are never reclaimed.
+    unsafe { kernel::bindings::dma_resv_lock(resv, core::ptr::null_mut()) };
+    gem.keep_resident.store(keep, Ordering::Relaxed);
+    gem.charge.set_kept(keep);
+    // SAFETY: Locked above.
+    unsafe { kernel::bindings::dma_resv_unlock(resv) };
+    Ok(())
 }
 
 /// Large user BOs may release clean page cache but never swap out the rest of the

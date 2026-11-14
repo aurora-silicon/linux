@@ -7,13 +7,42 @@ use super::{fw::variant::InitGraph, telemetry::Readout, Shared};
 use core::sync::atomic::Ordering;
 use kernel::sync::Arc;
 
-pub(crate) struct Reader(pub(super) Arc<Shared>);
+/// The device's shared state, and the M5 board's performance states, whose frequency a
+/// reported state index runs at.
+pub(crate) struct Reader(
+    pub(super) Arc<Shared>,
+    pub(super) Option<&'static [super::fw::m5::initdata::M5PerfState; 14]>,
+);
 
 impl Reader {
     pub(crate) fn read(&self) -> Readout {
+        let mut view = self.read_firmware();
+        if view.pstate_status == super::telemetry::VALID {
+            view.achieved_frequency_hz = self
+                .1
+                .and_then(|states| states.get(view.pstate as usize))
+                .map_or(0, |state| u64::from(state.0) * 1_000_000);
+        }
+        view
+    }
+
+    /// The frequency of the state the GPU runs at, while the firmware reports one, and the
+    /// highest frequency of the board's states, in Hz; `None` without the board's performance
+    /// states.
+    pub(crate) fn frequency(&self) -> Option<(Option<u64>, u64)> {
+        let max = u64::from(self.1?.iter().map(|state| state.0).max()?) * 1_000_000;
+        let view = self.read();
+        let current = (view.pstate_status == super::telemetry::VALID
+            && view.achieved_frequency_hz != 0)
+            .then_some(view.achieved_frequency_hz);
+        Some((current, max))
+    }
+
+    fn read_firmware(&self) -> Readout {
+        let m5 = self.0.variant.m5_commands;
         let mut state = self.0.state.lock();
         let Some(firmware) = state.as_deref_mut() else {
-            return qualify(self.0.variant.graph, Readout::default());
+            return qualify(self.0.variant.graph, m5, Readout::default());
         };
         if self.0.crashed.load(Ordering::Acquire) || firmware.recovery.pending() {
             firmware.rings.invalidate_statistics();
@@ -34,6 +63,7 @@ impl Reader {
         }
         qualify(
             self.0.variant.graph,
+            m5,
             firmware.rings.read_statistics(super::now_ns()),
         )
     }
@@ -55,13 +85,15 @@ pub(super) const fn max_age_ns(graph: InitGraph) -> u64 {
     }
 }
 
-/// Whether the firmware emits the logical pstate record (tag 0x10). V25G83
-/// and V26A428 accept the tag but never emit it, and no other record carries
-/// the current pstate, so it is unsupported by these firmwares. A firmware
-/// that is shown to emit it gets `true` here and reports valid or stale.
-pub(super) const fn reports_pstate(graph: InitGraph) -> bool {
+/// Whether the firmware reports its performance state. V25G83 and V26A428
+/// accept the logical pstate record (tag 0x10) but never emit it, and no other
+/// record of theirs carries the current pstate, so it is unsupported by these
+/// firmwares. M5 firmware (`m5`) reports it in its own records
+/// ([`super::telemetry`]). A firmware that is shown to report it gets `true`
+/// here and reports valid or stale.
+pub(super) const fn reports_pstate(graph: InitGraph, m5: bool) -> bool {
     match graph {
-        InitGraph::V25G83 | InitGraph::G17P => false,
+        InitGraph::V25G83 | InitGraph::G17P => m5,
     }
 }
 
@@ -69,9 +101,10 @@ pub(super) const fn reports_pstate(graph: InitGraph) -> bool {
 /// and the debugfs diagnostic still keep any tag 0x10 that does arrive.
 pub(super) fn qualify(
     graph: InitGraph,
+    m5: bool,
     mut view: super::telemetry::Readout,
 ) -> super::telemetry::Readout {
-    if !reports_pstate(graph) {
+    if !reports_pstate(graph, m5) {
         view.pstate_status = super::telemetry::UNSUPPORTED;
         view.pstate = 0;
         view.pstate_host_ns = 0;

@@ -549,6 +549,29 @@ static void apple_smc_disable_notifications(void *data)
 	apple_smc_write_flag(smc, SMC_KEY(NTAP), false);
 }
 
+struct apple_smc_wake_reason {
+	u8 bit;
+	const char *name;
+};
+
+/*
+ * MBSW's bits, as the smc-pmu node's event_name properties number them, each list ending at an
+ * entry without a name. Only the SoCs with a deep sleep read MBSW.
+ */
+static const struct apple_smc_wake_reason apple_smc_t8140_wake_reasons[] = {
+	{ 0, "pwrbtn" }, { 9, "ipd_touch" }, { 10, "lid" }, { 16, "ipd_kbd" },
+	{ 18, "charger" }, { 23, "wifibt" }, { 40, "acattach" }, { 41, "acdetach" },
+	{ 42, "USB-C_plug" }, { 43, "USB2_plug" }, { 44, "USB2_wake" }, { 45, "aupo" },
+	{ 48, "rtc" }, { }
+};
+
+/* The J713's */
+static const struct apple_smc_wake_reason apple_smc_t8132_wake_reasons[] = {
+	{ 0, "pwrbtn" }, { 8, "lid" }, { 11, "charger" }, { 12, "ipd" }, { 13, "wifibt" },
+	{ 40, "acattach" }, { 41, "acdetach" }, { 42, "USB-C_plug" }, { 43, "USB2_plug" },
+	{ 44, "USB2_wake" }, { 45, "aupo" }, { 48, "rtc" }, { }
+};
+
 static int apple_smc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -560,6 +583,8 @@ static int apple_smc_probe(struct platform_device *pdev)
 	smc = devm_kzalloc(dev, sizeof(*smc), GFP_KERNEL);
 	if (!smc)
 		return -ENOMEM;
+	smc->wake_reasons = of_device_is_compatible(dev->of_node, "apple,t8132-smc") ?
+			    apple_smc_t8132_wake_reasons : apple_smc_t8140_wake_reasons;
 
 	mutex_init(&smc->mutex);
 	spin_lock_init(&smc->lock);
@@ -770,26 +795,16 @@ static int apple_smc_sleep_commit(struct apple_smc *smc)
 	return ret;
 }
 
-/* MBSW's bits, as smc-pmu's event_name properties number them on T8140. Other SoCs differ. */
-static const struct {
-	u8 bit;
-	const char *name;
-} apple_smc_wake_reasons[] = {
-	{ 0, "pwrbtn" }, { 9, "ipd_touch" }, { 10, "lid" }, { 16, "ipd_kbd" },
-	{ 18, "charger" }, { 23, "wifibt" }, { 40, "acattach" }, { 41, "acdetach" },
-	{ 42, "USB-C_plug" }, { 43, "USB2_plug" }, { 44, "USB2_wake" }, { 45, "aupo" },
-	{ 48, "rtc" },
-};
-
-static int apple_smc_wake_reason_names(u64 record, char *buf, size_t size)
+static int apple_smc_wake_reason_names(const struct apple_smc *smc, u64 record, char *buf,
+				       size_t size)
 {
-	int i, len = 0;
+	const struct apple_smc_wake_reason *r;
+	int len = 0;
 
 	buf[0] = 0;
-	for (i = 0; i < ARRAY_SIZE(apple_smc_wake_reasons); i++)
-		if (record & BIT_ULL(apple_smc_wake_reasons[i].bit))
-			len += scnprintf(buf + len, size - len, "%s%s", len ? " " : "",
-					 apple_smc_wake_reasons[i].name);
+	for (r = smc->wake_reasons; r->name; r++)
+		if (record & BIT_ULL(r->bit))
+			len += scnprintf(buf + len, size - len, "%s%s", len ? " " : "", r->name);
 
 	return len;
 }
@@ -815,7 +830,7 @@ static bool apple_smc_notice_on(struct apple_smc *smc)
 		dev_warn(smc->dev, "Failed to read MBSW after a wake: %d\n", ret);
 
 	smc->wake_record = get_unaligned_le64(record);
-	apple_smc_wake_reason_names(smc->wake_record, names, sizeof(names));
+	apple_smc_wake_reason_names(smc, smc->wake_record, names, sizeof(names));
 	dev_info(smc->dev, "wake record: MBSE %#x, MBSW %8ph%s%s\n", event, record,
 		 names[0] ? ": " : "", names);
 
@@ -823,13 +838,13 @@ static bool apple_smc_notice_on(struct apple_smc *smc)
 }
 
 /* MBSW's bit for a wake reason, by its name, or -1. */
-static int apple_smc_wake_reason_bit(const char *name)
+static int apple_smc_wake_reason_bit(const struct apple_smc *smc, const char *name)
 {
-	int i;
+	const struct apple_smc_wake_reason *r;
 
-	for (i = 0; i < ARRAY_SIZE(apple_smc_wake_reasons); i++)
-		if (!strcmp(apple_smc_wake_reasons[i].name, name))
-			return apple_smc_wake_reasons[i].bit;
+	for (r = smc->wake_reasons; r->name; r++)
+		if (!strcmp(r->name, name))
+			return r->bit;
 
 	return -1;
 }
@@ -840,7 +855,7 @@ static int apple_smc_wake_reason_bit(const char *name)
  */
 static void apple_smc_lid_wake(struct apple_smc *smc)
 {
-	int bit = apple_smc_wake_reason_bit("lid");
+	int bit = apple_smc_wake_reason_bit(smc, "lid");
 	bool lid_alone = bit >= 0 && smc->wake_record == BIT_ULL(bit);
 	u8 lid = 0;
 	int ret;
@@ -861,14 +876,14 @@ static void apple_smc_lid_wake(struct apple_smc *smc)
 }
 
 /* Only what a cable pulled and plugged back reports: what the debug link's cut makes. */
-static bool apple_smc_port_reasons_only(u64 record)
+static bool apple_smc_port_reasons_only(const struct apple_smc *smc, u64 record)
 {
 	static const char * const names[] = { "acattach", "acdetach", "USB-C_plug" };
 	u64 port = 0;
 	int i, bit;
 
 	for (i = 0; i < ARRAY_SIZE(names); i++) {
-		bit = apple_smc_wake_reason_bit(names[i]);
+		bit = apple_smc_wake_reason_bit(smc, names[i]);
 		if (bit >= 0)
 			port |= BIT_ULL(bit);
 	}
@@ -881,11 +896,11 @@ static void apple_smc_sleep_wake(struct apple_smc *smc)
 	/* Zero when nothing the SMC watches woke the AP: the PMU's RTC, for one. */
 	if (apple_smc_notice_on(smc))
 		apple_sleep_radio_at_wake(smc->wake_record &
-					  BIT_ULL(apple_smc_wake_reason_bit("wifibt")));
+					  BIT_ULL(apple_smc_wake_reason_bit(smc, "wifibt")));
 	apple_smc_write_mbse(smc, SMC_KEY(waka));
 	smc->sleep_warned = false;
 	apple_smc_lid_wake(smc);
-	if (apple_smc_port_reasons_only(smc->wake_record))
+	if (apple_smc_port_reasons_only(smc, smc->wake_record))
 		apple_sleep_debug_link_cut_wake();
 	/* A dark wake isn't one: with wakeup_count in use, it would abort the sleep after it. */
 	if (smc->wake_record && !pm_dark_wake())
