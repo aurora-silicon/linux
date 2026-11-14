@@ -508,6 +508,8 @@ struct sn201202x {
 	bool ldcm_mitigated;
 	/* ldcm_mitigated matches the controller (unknown after a reset) */
 	bool ldcm_mitigation_known;
+	/* A mitigation was requested since the controller's last reset */
+	bool ldcm_requested;
 };
 
 extern const struct tipd_data *tipd_hw_variants[];
