@@ -7189,6 +7189,16 @@ static void dcp_drain_for_sleep(struct apple_dcp *dcp)
 			return;
 		if (!dcp_backlight_active(dcp) || !dcp_backlight_pending(dcp))
 			return;
+		/*
+		 * The consumer blanks the panel before this runs, so a change
+		 * left pending while the panel is not lit is the blank itself,
+		 * or a level set while DPMS was off: the firmware will not take
+		 * it until the CRTC is active again, and resume restores it on
+		 * the enable swap. It need not reach the firmware before the
+		 * mailbox suspends, so stop here rather than wait it out.
+		 */
+		if (!dcp_backlight_lit(dcp))
+			return;
 	}
 	dev_warn(dcp->dev, "brightness change still pending at suspend\n");
 }
