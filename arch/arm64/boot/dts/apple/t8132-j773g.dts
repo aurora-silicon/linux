@@ -22,6 +22,11 @@
 	model = "Apple Mac mini (M4, 2024)";
 	chassis-type = "desktop";
 
+	aliases {
+		/* The loader and the display DART find the PIODMA stream by it. */
+		disp0_piodma = &disp0_piodma;
+	};
+
 	/*
 	 * The speaker amp's shutdown line (SDZ, AP GPIO 15, the ADT
 	 * function-reset; low = shutdown).
@@ -63,6 +68,9 @@
 &dcp {
 	/* iBoot leaves DISP_CPU in auto mode; Linux must not switch it. */
 	/delete-property/ power-domains;
+	/* Its PIODMA child owns iommu-addresses entries in /reserved-memory. */
+	#address-cells = <2>;
+	#size-cells = <2>;
 	apple,connector-type = "HDMI-A";
 	apple,dptx-phy = <4>;
 	phys = <&dptx_phy>;
@@ -77,6 +85,14 @@
 };
 
 &display {
+	status = "okay";
+};
+
+/*
+ * The DPTX PHY's domain: the J713 PMGR policy keeps it from Linux, and the
+ * PHY (and the DCP that waits on it) would never probe.
+ */
+&ps_dptx_phy {
 	status = "okay";
 };
 
