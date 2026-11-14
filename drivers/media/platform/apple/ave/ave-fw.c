@@ -43,6 +43,7 @@ static const u32 ave_known_text_crc[] = {
 	AVE_FW_TEXT_CRC_T6050_26A428, /* AppleAVE2FW, macOS 27.0 26A428 / T6050 */
 	AVE_FW_TEXT_CRC_T6050_26C5035, /* AppleAVE2FW, macOS 27.3 26C5035r / T6050 */
 	AVE_FW_TEXT_CRC_T8142_26A428, /* AppleAVE2FW 9013.45.1, macOS 27.0 26A428 / T8142 */
+	AVE_FW_TEXT_CRC_T8142_26B123, /* AppleAVE2FW 9013.55.1, macOS 27.2 26B123 / T8142 */
 	0x460c7a7c, /* AppleAVE2FW 6070.11.1 / T6000 */
 	0x25bfd039, /* AppleAVE2FW 6070.11.1 / T8112 */
 };
@@ -217,12 +218,16 @@ static int ave_fw_text_id(struct ave_dev *ave, u32 *crc)
 	return ret;
 }
 
-/* The variant's build with these segment sizes, or NULL. */
+/*
+ * The variant's build with these segment sizes and, unless crc is 0, this
+ * TEXT CRC, or NULL. Builds may share segment sizes; the CRC tells them apart.
+ */
 static const struct ave_fw_build *ave_fw_find_build(const struct ave_variant *v,
-						    size_t text, size_t data)
+						    size_t text, size_t data, u32 crc)
 {
 	for (unsigned int i = 0; i < v->build_count; i++)
-		if (text == v->builds[i].text_size && data == v->builds[i].data_size)
+		if (text == v->builds[i].text_size && data == v->builds[i].data_size &&
+		    (!crc || crc == v->builds[i].text_crc))
 			return &v->builds[i];
 	return NULL;
 }
@@ -251,7 +256,7 @@ int ave_fw_probe(struct ave_dev *ave)
 
 	if (ave->variant->build_count) {
 		build = ave_fw_find_build(ave->variant, ave->text.size,
-					  ave->data.size);
+					  ave->data.size, 0);
 		if (!build)
 			return dev_err_probe(dev, -EINVAL,
 					     "unexpected firmware segment sizes (TEXT %#zx DATA %#zx)\n",
@@ -301,6 +306,16 @@ int ave_fw_probe(struct ave_dev *ave)
 		return dev_err_probe(dev, ret,
 				     "firmware text link cell is not the DATA address\n");
 	known |= ave_fw_known_crc(text_crc);
+	if (build) {
+		const struct ave_fw_build *same_size =
+			ave_fw_find_build(ave->variant, ave->text.size,
+					  ave->data.size, text_crc);
+
+		if (same_size) {
+			build = same_size;
+			want_crc = build->text_crc;
+		}
+	}
 	if (!known || (want_crc && text_crc != want_crc))
 		return dev_err_probe(dev, -ENODEV,
 				     "unsupported firmware (text CRC %08x)\n",

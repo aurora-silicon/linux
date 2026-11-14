@@ -973,5 +973,11 @@ const struct ave_fw_layout *ave_layout_for_crc(u32 crc)
 	 */
 	if (crc == AVE_FW_TEXT_CRC_T6050_26C5035)
 		return &ave_layout_26a428;
+	/*
+	 * The M5's macOS 27.2 build (9013.55.1), between 26A428 and the 27.3
+	 * beta, is taken to speak the same layout; not encoded with yet.
+	 */
+	if (crc == AVE_FW_TEXT_CRC_T8142_26B123)
+		return &ave_layout_26a428;
 	return NULL;
 }
