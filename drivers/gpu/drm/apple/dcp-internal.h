@@ -265,6 +265,8 @@ struct apple_dcp_hw_data {
 	 * (desktop 26.x), see dcp_sink_metadata().
 	 */
 	bool sink_metadata_edid;
+	/* The firmware blends the X byte of XRGB8888 as alpha: offer alpha formats only. */
+	bool xrgb_is_alpha;
 };
 
 enum dcp_test_point {

@@ -1138,6 +1138,7 @@ static int apple_probe_per_dcp(struct device *dev,
 			planes[zpos] = apple_plane_init(drm, 1U << num, surf,
 							supports_l10r,
 							supports_xrgb2101010,
+							dcp_data->hw.xrgb_is_alpha ||
 							dcp_data->hw.iomfb_method_profile ==
 								DCP_IOMFB_METHODS_H17G,
 							plane_type, interchange,
