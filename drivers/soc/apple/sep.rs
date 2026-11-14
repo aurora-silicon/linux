@@ -738,6 +738,11 @@ struct SepData {
     #[pin]
     cold_match_contexts: Mutex<KVec<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>>,
 
+    // Per-user bags the 13.5 key store keeps loaded between import and
+    // logout (see `userbag::LoadedBags`).
+    #[pin]
+    user_bags: Mutex<userbag::LoadedBags>,
+
     // The sensor stayed powered and registered after the last verify, so the
     // next verify captures without a new bring-up, as macOS does. Cleared by
     // anything that powers the sensor off or resets it.
@@ -1215,6 +1220,7 @@ impl SepData {
                 match_context <- new_mutex!(None),
                 match_context_generation: Atomic::new(0),
                 cold_match_contexts <- new_mutex!(KVec::new()),
+                user_bags <- new_mutex!(userbag::LoadedBags::new()),
                 sensor_kept: Atomic::new(false),
                 sensor_reset_in_capture: Atomic::new(false),
                 bg_ops_ready: Atomic::new(false),
