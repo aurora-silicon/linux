@@ -2012,19 +2012,17 @@
 #include "t604x-extdisp.dtsi"
 
 /*
- * Only typec1 carries an external display chain here. ATC3 is the fourth
- * back Type-C port, not the J616c's HDMI PHY: drop that description, and
- * t6041-j575c-atc3.dtsi describes the port instead.
+ * ATC3 is the fourth back Type-C port, not the J616c's HDMI PHY: drop that
+ * description, and t6041-j575c-atc3.dtsi describes the port instead. Its
+ * display crossbar (atcphy3_xbar) is the port's and stays.
  */
-/delete-node/ &atcphy0_xbar;
-/delete-node/ &atcphy2_xbar;
-/delete-node/ &atcphy3_xbar;
 /delete-node/ &atcphy3;
 /delete-node/ &atcphy3_mbox;
 
 #include "t6041-j575c-atc3.dtsi"
 #include "t6041-j575c-usb3.dtsi"
 #include "t6041-j575c-usbc.dtsi"
+#include "t6041-j575c-usbc-dcpext2.dtsi"
 #include "t6041-j575c-hdmi.dtsi"
 
 /* Not described: the SEP (no Touch ID sensor). */
