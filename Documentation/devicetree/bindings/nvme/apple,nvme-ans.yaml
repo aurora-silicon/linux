@@ -23,6 +23,7 @@ properties:
               - apple,t8122-nvme-ans2
           - const: apple,t8103-nvme-ans2
       - const: apple,t8132-nvme-ans2
+      - const: apple,t8152-nvme-ans2
       - items:
           - const: apple,t8132-nvme-ans2
           - const: apple,t8103-nvme-ans2
@@ -118,6 +119,20 @@ allOf:
             contains:
               enum:
                 - apple,t6050-nvme-ans2
+                - apple,t8152-nvme-ans2
+    then:
+      required:
+        - resets
+        - power-domains
+        - power-domain-names
+
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              enum:
+                - apple,t6050-nvme-ans2
                 - apple,t8132-nvme-ans2
                 - apple,t8140-nvme-ans2
     then:
@@ -183,11 +198,6 @@ allOf:
         resets: false
         power-domains: false
         power-domain-names: false
-    else:
-      required:
-        - resets
-        - power-domains
-        - power-domain-names
 
 required:
   - compatible
