@@ -520,10 +520,16 @@
 };
 
 &spi4 {
+	cs-gpios = <&pinctrl_ap 100 GPIO_ACTIVE_LOW>;
+	status = "okay";
+
+	/* No panel temperature sensors sit behind the controller on this board. */
 	panel_controller: panel-timing-controller@0 {
 		compatible = "parade,dp855";
 		reg = <0>;
-		status = "disabled";
+		spi-max-frequency = <1000000>;
+		spi-cs-setup-delay-ns = <20>;
+		spi-cs-hold-delay-ns = <20>;
 	};
 };
 

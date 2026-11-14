@@ -665,6 +665,30 @@ static void send_vblank_event(struct drm_device *dev,
  * outputs.
  * This might be a difference between dcp and dcpext.
  */
+/*
+ * Advance the CRTC's flip sequence by the number of refresh periods since the
+ * previous flip (at least one), so that userspace sees a non-zero, increasing
+ * vblank sequence. Without a known refresh rate every flip counts as one.
+ */
+static u64 dcp_crtc_next_flip_seq(struct apple_crtc *crtc, ktime_t flip)
+{
+	int hz = drm_mode_vrefresh(&crtc->base.mode);
+	u64 frames = 1;
+
+	if (hz > 0 && crtc->flip_seq_time) {
+		s64 ns = ktime_to_ns(ktime_sub(flip, crtc->flip_seq_time));
+		u64 frame_ns = div_u64(NSEC_PER_SEC, hz);
+
+		if (ns > 0)
+			frames = max_t(u64, 1,
+				       div64_u64(ns + frame_ns / 2, frame_ns));
+	}
+	crtc->flip_seq += frames;
+	crtc->flip_seq_time = flip;
+
+	return crtc->flip_seq;
+}
+
 static void dcp_crtc_send_page_flip_event(struct apple_crtc *crtc,
 					  struct drm_pending_vblank_event *e,
 					  ktime_t now, ktime_t start)
@@ -674,7 +698,6 @@ static void dcp_crtc_send_page_flip_event(struct apple_crtc *crtc,
 	unsigned int pipe = drm_crtc_index(&crtc->base);
 	ktime_t flip;
 
-	seq = 0;
 	if (start != KTIME_MIN) {
 		s64 delta = ktime_us_delta(now, start);
 		if (delta <= 500)
@@ -686,6 +709,7 @@ static void dcp_crtc_send_page_flip_event(struct apple_crtc *crtc,
 	} else {
 		flip = now;
 	}
+	seq = dcp_crtc_next_flip_seq(crtc, flip);
 	e->pipe = pipe;
 	send_vblank_event(dev, e, seq, flip);
 }
@@ -8605,8 +8629,9 @@ static int dcp_platform_suspend(struct device *dev)
 	/*
 	 * T8132: setPowerState powers the display down; the coprocessor keeps
 	 * running and its power domains stay on, as below, unless the internal
-	 * display is blanked with appledrm.power_gate_ms set: then the
-	 * coprocessor and its domains are powered down too (iomfb_m4_suspend()).
+	 * display is blanked and this is a deep sleep, or appledrm.power_gate_ms
+	 * is set: then the coprocessor and its domains are powered down too
+	 * (iomfb_m4_suspend()).
 	 */
 	if (iomfb_is_m4(dcp)) {
 		int ret = iomfb_m4_suspend(dcp);
@@ -8868,6 +8893,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6050 = {
 	.num_dptx_ports = 0,
 	.adopt_live_session = true,
 	.firmware_compat = DCP_FIRMWARE_V_27_0,
+	.only_120hz_modes = true,
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t6050_dcpext = {

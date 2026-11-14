@@ -142,6 +142,8 @@ impl drm::driver::Driver for AsahiDrmDriver {
             ioctl::AUTH | ioctl::RENDER_ALLOW, crate::file::File::gem_madvise),
         (ASAHI_GEM_USERPTR,     drm_asahi_gem_userptr,
             ioctl::AUTH | ioctl::RENDER_ALLOW, crate::file::File::gem_userptr),
+        (ASAHI_GEM_RESIDENCY,   drm_asahi_gem_residency,
+            ioctl::AUTH | ioctl::RENDER_ALLOW, crate::file::File::gem_residency),
     }
 }
 
@@ -249,7 +251,7 @@ asahi_of_device_table!(
 #[cfg(CONFIG_DRM_ASAHI_G15)]
 asahi_of_device_table!();
 
-struct SleepOps(bindings::dev_pm_ops);
+pub(crate) struct SleepOps(pub(crate) bindings::dev_pm_ops);
 
 // SAFETY: Immutable: the callbacks are plain functions.
 unsafe impl Sync for SleepOps {}
