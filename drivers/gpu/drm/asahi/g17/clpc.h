@@ -6,4 +6,5 @@ struct apple_clpc_gpu;
 int asahi_clpc_gpu_get(void *dev, struct apple_clpc_gpu **out);
 void asahi_clpc_gpu_set_active(struct apple_clpc_gpu *gpu, bool active);
 void asahi_clpc_gpu_put(struct apple_clpc_gpu *gpu);
+void asahi_clpc_gpu_set_busy(struct apple_clpc_gpu *gpu, unsigned int permille);
 #endif

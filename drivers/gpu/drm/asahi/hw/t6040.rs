@@ -110,6 +110,7 @@ pub(crate) const CONFIG: Config = Config {
         config: None,
     }]),
     // Measured on the 20-core M4 Pro; the alternative below remains experimental.
+    light_effort: None,
     core_layout: CoreLayout {
         cores: Some((2, 20)),
         // Admit two clusters of ten slots with eight enabled cores in each cluster.

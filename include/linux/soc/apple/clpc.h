@@ -12,6 +12,7 @@ struct apple_clpc_ane;
 #if IS_REACHABLE(CONFIG_APPLE_CLPC)
 int apple_clpc_gpu_get(struct device *dev, struct apple_clpc_gpu **out);
 void apple_clpc_gpu_set_active(struct apple_clpc_gpu *gpu, bool active);
+void apple_clpc_gpu_set_busy(struct apple_clpc_gpu *gpu, unsigned int permille);
 void apple_clpc_gpu_put(struct apple_clpc_gpu *gpu);
 /* Optional, single-publisher input: success with NULL means no provider. */
 int apple_clpc_ane_get(struct device *dev, struct apple_clpc_ane **out);
@@ -24,6 +25,7 @@ static inline int apple_clpc_gpu_get(struct device *dev, struct apple_clpc_gpu *
 	return device_property_present(dev, "apple,clpc") ? -ENODEV : 0;
 }
 static inline void apple_clpc_gpu_set_active(struct apple_clpc_gpu *gpu, bool active) {}
+static inline void apple_clpc_gpu_set_busy(struct apple_clpc_gpu *gpu, unsigned int permille) {}
 static inline void apple_clpc_gpu_put(struct apple_clpc_gpu *gpu) {}
 
 /* ANE remains usable when the optional floor provider is not reachable. */

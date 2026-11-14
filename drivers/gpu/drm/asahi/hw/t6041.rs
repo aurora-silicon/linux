@@ -53,6 +53,14 @@ pub(super) const BASE: Config = Config {
     recovery_slot_keys: None,
     gpu_generation: GpuGen::G16,
     firmware: fw::variant::Firmware::Identified(&[]),
+    // Measured on the M4 Max only: scrolling 24.9 -> 22.1 W with the T6041 CLPC table.
+    light_effort: Some(crate::g17::power::LightEffort {
+        effort: 0x8000,
+        enter_permille: 350,
+        exit_permille: 750,
+        job_enter_us: 3000,
+        job_exit_us: 7000,
+    }),
     core_layout: CoreLayout {
         cores: Some((4, 40)),
         alternate_core_masks: None,
