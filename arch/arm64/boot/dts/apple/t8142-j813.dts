@@ -135,6 +135,14 @@
 	aop_als: als {
 		compatible = "apple,t8142-aop-als", "apple,aop-als";
 	};
+
+	/*
+	 * Lid angle: the J813 AOP firmware announces a "las" service, as the
+	 * J815's does, and aop_las reads the hinge angle from it.
+	 */
+	aop_las: las {
+		compatible = "apple,t8142-aop-las", "apple,aop-las";
+	};
 };
 
 /*
