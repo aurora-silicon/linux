@@ -825,10 +825,10 @@ static void appledrm_connector_cleanup(struct drm_connector *connector)
 	cancel_work_sync(&apple_connector->bl_commit_wq);
 	mutex_destroy(&apple_connector->bl_lock);
 	drm_connector_cleanup(connector);
-	kfree(apple_connector->color_elements.data);
-	kfree(apple_connector->timing_elements.data);
-	kfree(apple_connector->display_attributes.data);
-	kfree(apple_connector->transport.data);
+	kvfree(apple_connector->color_elements.data);
+	kvfree(apple_connector->timing_elements.data);
+	kvfree(apple_connector->display_attributes.data);
+	kvfree(apple_connector->transport.data);
 	kfree(apple_connector);
 }
 
@@ -2120,7 +2120,9 @@ MODULE_LICENSE("Dual MIT/GPL");
  * crossbar. Without this, initramfs generators leave it out, it loads only
  * from the root filesystem, and a DCP probe that waits past the deferred
  * probe timeout (an encrypted root's passphrase prompt) gives up its routes.
+ * The same holds for the routes' PHYs: on T6050 they are the combo PHYs of
+ * atc-t6050-dp, which appledrm does not otherwise depend on.
  * DCP also asks for the battery temperature once while it starts (see
  * dcp_pmu_temperature()), so have the SMC battery registered by then.
  */
-MODULE_SOFTDEP("pre: mux-apple-display-crossbar macsmc-power");
+MODULE_SOFTDEP("pre: mux-apple-display-crossbar atc-t6050-dp macsmc-power");

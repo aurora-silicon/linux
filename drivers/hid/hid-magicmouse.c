@@ -28,6 +28,10 @@
 
 static bool emulate_3button = true;
 module_param(emulate_3button, bool, 0644);
+
+static bool dump_tp26_frames;
+module_param(dump_tp26_frames, bool, 0644);
+MODULE_PARM_DESC(dump_tp26_frames, "Log every Trackpad26 multi-touch frame as hex (debugging)");
 MODULE_PARM_DESC(emulate_3button, "Emulate a middle button");
 
 static int middle_button_start = -350;
@@ -171,6 +175,8 @@ MODULE_PARM_DESC(haptic_pulse_gap_ms, "milliseconds between pulses when more tha
 #define SPI_REPORT_ID      0x02
 #define SPI_RESET_REPORT_ID 0x60
 #define MTP_REPORT_ID      0x75
+/* HID product of the MTP trackpad that sends Trackpad26 frames (K116s) */
+#define MTP_TP26_PRODUCT_ID 0x0362
 #define SENSOR_DIMENSIONS_REPORT_ID 0xd9
 #define USB_BATTERY_TIMEOUT_SEC 60
 
@@ -262,9 +268,12 @@ struct effect_job {
  * @input: Input device through which we report events.
  * @quirks: Currently unused.
  * @query_dimensions: Whether to query and update dimensions on first open
+ * @mtp_tp26: Whether the MTP trackpad sends the Trackpad26 frame format.
+ * @tp26_button: Button state of the last Trackpad26 frame.
  * @mtp_c1fe: Whether the MTP trackpad sends the J700 C1FE report layout.
  * @mtp_palms: Whether the controller's contact classes are trusted for palms
- *             on the standard MTP report (T6041).
+ *             on the standard MTP report (T6041, J616s).
+ * @mtp_palm_size: Whether a tool area alone marks an MTP contact as a palm.
  * @mtp_palm_ids: MTP contact IDs reported as palms until they lift.
  * @ntouches: Number of touches in most recent touch report.
  * @scroll_accel: Number of consecutive scroll motions.
@@ -292,8 +301,11 @@ struct magicmouse_sc {
 	struct input_dev *input;
 	unsigned long quirks;
 	bool query_dimensions;
+	bool mtp_tp26;
+	bool tp26_button;
 	bool mtp_c1fe;
 	bool mtp_palms;
+	bool mtp_palm_size;
 	DECLARE_BITMAP(mtp_palm_ids, U8_MAX + 1);
 
 	int ntouches;
@@ -1004,7 +1016,7 @@ static void magicmouse_mtp_update_palms(struct magicmouse_sc *msc,
 		id = magicmouse_mtp_contact_id(f);
 		class = le16_to_cpu(f->unknown2) & 0xff;
 		tool = le16_to_int(f->tool_major);
-		if (tool > MAGICMOUSE_MTP_PALM_TOOL_MAJOR ||
+		if ((msc->mtp_palm_size && tool > MAGICMOUSE_MTP_PALM_TOOL_MAJOR) ||
 		    (class >= MAGICMOUSE_MTP_PALM_CLASS_MIN &&
 		     tool > MAGICMOUSE_MTP_CLASSED_PALM_TOOL_MAJOR) ||
 		    test_bit(id, msc->mtp_palm_ids))
@@ -1035,6 +1047,226 @@ static void report_finger_data(struct input_dev *input, int slot,
 	input_report_abs(input, ABS_MT_POSITION_Y, pos->y);
 }
 
+/*
+ * The K116s (M5 Pro) trackpad firmware ("SensingAlgsTrackpad26C") does not
+ * send the MTP report above. Its descriptor declares one unnumbered vendor
+ * report and every frame starts with the bytes 0x5a 0x01, then a frame type.
+ * Type 1 declares the streams the firmware will send (a version string and
+ * their 16-byte ids), type 2 carries data at 125 Hz while contacts are on the
+ * pad, with a 64-bit microsecond timestamp at offset 7 and 23, a 16-bit
+ * sequence number at offset 15, and from offset 31 a list of records, each
+ * 0x02, a 16-byte stream id, 0x02, two type bytes, a little-endian 16-bit
+ * length and the payload.
+ *
+ * The contact stream's payload is a 32-bit contact count, 32 bits of frame
+ * flags and one 48-byte record per contact: an id, a state (1 new, 2 and 3
+ * settling, 4 touching, 5 lifting, 7 gone), the controller's class (1 thumb,
+ * 2 and 3 fingers, 7 a palm), an unknown byte, then IEEE 754 single floats:
+ * x in micrometres from the centre, y in micrometres from the bottom edge,
+ * velocity in micrometres per second, the major and minor axes in
+ * micrometres, the orientation in radians with pi/2 along y, two unknown
+ * values near 1.0 on a finger, the force in grams, and a zero. The button
+ * stream's payload is one 32-bit word, 1 while the pad is clicked.
+ */
+static bool magicmouse_haptic_click(struct magicmouse_sc *msc, u32 pressure,
+				    bool firmware_button);
+
+#define MAGICMOUSE_TP26_MAGIC0		0x5a
+#define MAGICMOUSE_TP26_MAGIC1		0x01
+#define MAGICMOUSE_TP26_FRAME_DATA	2
+#define MAGICMOUSE_TP26_HEADER_SIZE	31
+#define MAGICMOUSE_TP26_RECORD_HDR	22
+#define MAGICMOUSE_TP26_STREAM_ID_LEN	16
+
+#define MAGICMOUSE_TP26_STATE_SETTLING	3
+#define MAGICMOUSE_TP26_STATE_TOUCHING	4
+#define MAGICMOUSE_TP26_STATE_LIFTING	5
+#define MAGICMOUSE_TP26_CLASS_PALM	7
+
+/* The pad is about 160 by 100 mm; positions are reported in 10 um units. */
+#define MAGICMOUSE_TP26_UM_PER_UNIT	10
+#define MAGICMOUSE_TP26_MAX_X		8000
+#define MAGICMOUSE_TP26_MAX_Y		10000
+#define MAGICMOUSE_TP26_RES		100	/* units per mm */
+#define MAGICMOUSE_TP26_MAX_SIZE	20000
+#define MAGICMOUSE_TP26_MAX_FORCE	6000
+#define MAGICMOUSE_TP26_MAX_ORIENTATION	90
+
+static const u8 magicmouse_tp26_contacts_id[MAGICMOUSE_TP26_STREAM_ID_LEN] = {
+	0x91, 0x62, 0x0e, 0x00, 0x8a, 0x5d, 0x81, 0xd5,
+	0x7e, 0xde, 0x54, 0xa8, 0x63, 0x1f, 0xdf, 0x17,
+};
+
+static const u8 magicmouse_tp26_button_id[MAGICMOUSE_TP26_STREAM_ID_LEN] = {
+	0x91, 0x62, 0x0e, 0x00, 0x8a, 0x5d, 0x81, 0xd5,
+	0xc2, 0x87, 0x93, 0x63, 0x28, 0x29, 0xc8, 0xbf,
+};
+
+struct tp26_contact {
+	u8 id;
+	u8 state;
+	u8 class;
+	u8 unknown;
+	__le32 x;
+	__le32 y;
+	__le32 vel_x;
+	__le32 vel_y;
+	__le32 major;
+	__le32 minor;
+	__le32 orientation;
+	__le32 unknown2;
+	__le32 unknown3;
+	__le32 force;
+	__le32 unknown4;
+} __packed;
+
+static bool magicmouse_tp26_frame(const u8 *data, int size)
+{
+	return size >= 2 && data[0] == MAGICMOUSE_TP26_MAGIC0 &&
+	       data[1] == MAGICMOUSE_TP26_MAGIC1;
+}
+
+/*
+ * An IEEE 754 single times @mul, truncated towards zero. The kernel does not
+ * use the FPU, so the mantissa is scaled by hand. Infinities and NaNs clamp.
+ */
+static s32 magicmouse_tp26_float(__le32 raw, u32 mul)
+{
+	u32 v = le32_to_cpu(raw);
+	int exp = ((v >> 23) & 0xff) - 127;
+	u64 r;
+
+	if (((v >> 23) & 0xff) == 0)
+		return 0;
+	if (((v >> 23) & 0xff) == 0xff || exp > 40)
+		r = S32_MAX;
+	else if (exp >= 23)
+		r = ((u64)((v & 0x7fffff) | BIT(23)) * mul) << (exp - 23);
+	else
+		r = ((u64)((v & 0x7fffff) | BIT(23)) * mul) >> (23 - exp);
+	r = min_t(u64, r, S32_MAX);
+	return v & BIT(31) ? -(s32)r : (s32)r;
+}
+
+static bool magicmouse_tp26_touching(const struct tp26_contact *c)
+{
+	return c->state >= MAGICMOUSE_TP26_STATE_SETTLING &&
+	       c->state <= MAGICMOUSE_TP26_STATE_LIFTING;
+}
+
+static void magicmouse_tp26_report_contact(struct magicmouse_sc *msc,
+					   const struct tp26_contact *c)
+{
+	struct input_dev *input = msc->input;
+	int slot, orientation;
+	s32 x, y;
+
+	slot = input_mt_get_slot_by_key(input, c->id);
+	if (slot < 0)
+		return;
+
+	x = magicmouse_tp26_float(c->x, 1) / MAGICMOUSE_TP26_UM_PER_UNIT;
+	y = magicmouse_tp26_float(c->y, 1) / MAGICMOUSE_TP26_UM_PER_UNIT;
+	/* Radians to degrees, with 0 along y. */
+	orientation = (magicmouse_tp26_float(c->orientation, 1000) - 1571) * 180 / 3142;
+
+	input_mt_slot(input, slot);
+	input_mt_report_slot_state(input,
+				   c->class == MAGICMOUSE_TP26_CLASS_PALM ?
+				   MT_TOOL_PALM : MT_TOOL_FINGER, true);
+	input_report_abs(input, ABS_MT_POSITION_X,
+			 clamp(x, -MAGICMOUSE_TP26_MAX_X, MAGICMOUSE_TP26_MAX_X));
+	/* y grows towards the top edge; the Y axis is inverted as above. */
+	input_report_abs(input, ABS_MT_POSITION_Y,
+			 clamp(-y, -MAGICMOUSE_TP26_MAX_Y, 0));
+	input_report_abs(input, ABS_MT_TOUCH_MAJOR,
+			 magicmouse_tp26_float(c->major, 1) / MAGICMOUSE_TP26_UM_PER_UNIT);
+	input_report_abs(input, ABS_MT_TOUCH_MINOR,
+			 magicmouse_tp26_float(c->minor, 1) / MAGICMOUSE_TP26_UM_PER_UNIT);
+	input_report_abs(input, ABS_MT_WIDTH_MAJOR,
+			 magicmouse_tp26_float(c->major, 1) / MAGICMOUSE_TP26_UM_PER_UNIT);
+	input_report_abs(input, ABS_MT_WIDTH_MINOR,
+			 magicmouse_tp26_float(c->minor, 1) / MAGICMOUSE_TP26_UM_PER_UNIT);
+	input_report_abs(input, ABS_MT_ORIENTATION,
+			 clamp(orientation, -MAGICMOUSE_TP26_MAX_ORIENTATION,
+			       MAGICMOUSE_TP26_MAX_ORIENTATION));
+	input_report_abs(input, ABS_MT_PRESSURE,
+			 clamp(magicmouse_tp26_float(c->force, 1), 0,
+			       MAGICMOUSE_TP26_MAX_FORCE));
+}
+
+static int magicmouse_raw_event_tp26(struct hid_device *hdev, u8 *data, int size)
+{
+	struct magicmouse_sc *msc = hid_get_drvdata(hdev);
+	struct input_dev *input = msc->input;
+	const u8 *contacts = NULL;
+	u32 ncontacts = 0, pressure = 0;
+	bool button = msc->tp26_button;
+	int pos, i;
+
+	if (dump_tp26_frames) {
+		hid_info(hdev, "tp26 frame %d bytes\n", size);
+		print_hex_dump(KERN_INFO, "tp26: ", DUMP_PREFIX_OFFSET, 32, 1,
+			       data, size, false);
+	}
+
+	if (size < MAGICMOUSE_TP26_HEADER_SIZE ||
+	    data[2] != MAGICMOUSE_TP26_FRAME_DATA)
+		return -1;
+
+	for (pos = MAGICMOUSE_TP26_HEADER_SIZE;
+	     pos + MAGICMOUSE_TP26_RECORD_HDR <= size;) {
+		const u8 *id = data + pos + 1;
+		const u8 *payload = data + pos + MAGICMOUSE_TP26_RECORD_HDR;
+		u16 len = get_unaligned_le16(data + pos + 20);
+
+		if (data[pos] != 0x02 || data[pos + 17] != 0x02 ||
+		    payload + len > data + size) {
+			hid_dbg(hdev, "malformed tp26 record at %d\n", pos);
+			break;
+		}
+		if (!memcmp(id, magicmouse_tp26_contacts_id, sizeof(magicmouse_tp26_contacts_id)) &&
+		    len >= 8) {
+			ncontacts = get_unaligned_le32(payload);
+			if (ncontacts > MAX_CONTACTS ||
+			    len < 8 + ncontacts * sizeof(struct tp26_contact)) {
+				hid_warn(hdev, "unexpected number of touches (%u) for report\n",
+					 ncontacts);
+				return -1;
+			}
+			contacts = payload + 8;
+		} else if (!memcmp(id, magicmouse_tp26_button_id,
+				   sizeof(magicmouse_tp26_button_id)) &&
+			   len >= 4) {
+			button = get_unaligned_le32(payload) & 1;
+		}
+		pos += MAGICMOUSE_TP26_RECORD_HDR + len;
+	}
+
+	if (!contacts)
+		return -1;
+
+	for (i = 0; i < ncontacts; i++) {
+		const struct tp26_contact *c = (const void *)(contacts + i * sizeof(*c));
+
+		if (!magicmouse_tp26_touching(c))
+			continue;
+		magicmouse_tp26_report_contact(msc, c);
+		pressure += max(magicmouse_tp26_float(c->force, 1), 0);
+	}
+
+	input_mt_sync_frame(input);
+	msc->tp26_button = button;
+	input_report_key(input, BTN_MOUSE,
+			 magicmouse_haptic_click(msc, pressure, button));
+	input_sync(input);
+	/*
+	 * Stop here: the descriptor's single report is far longer than any
+	 * frame, so the core would only warn that the data is too short.
+	 */
+	return -1;
+}
+
 static int magicmouse_raw_event_mtp(struct hid_device *hdev,
 		struct hid_report *report, u8 *data, int size)
 {
@@ -1049,9 +1281,8 @@ static int magicmouse_raw_event_mtp(struct hid_device *hdev,
 	const size_t touch_sz = sizeof(struct tp_finger);
 	u8 map_contacs[MAX_CONTACTS];
 
-	// hid_warn(hdev, "%s\n", __func__);
-	// print_hex_dump_debug("appleft ev: ", DUMP_PREFIX_OFFSET, 16, 1, data,
-	// 		     size, false);
+	if (magicmouse_tp26_frame(data, size))
+		return magicmouse_raw_event_tp26(hdev, data, size);
 
 	if (msc->mtp_c1fe) {
 		if (!magicmouse_c1fe_report_valid(data, size))
@@ -1356,6 +1587,13 @@ static int magicmouse_setup_input_mtp(struct input_dev *input,
 	struct magicmouse_sc *msc = hid_get_drvdata(hdev);
 
 	__set_bit(INPUT_PROP_BUTTONPAD, input->propbit);
+	/*
+	 * An MTP trackpad is a pointer, never a direct-touch surface. The K116s
+	 * firmware's descriptor makes hid-input set INPUT_PROP_DIRECT, which
+	 * udev and libinput then take for a touchscreen.
+	 */
+	__set_bit(INPUT_PROP_POINTER, input->propbit);
+	__clear_bit(INPUT_PROP_DIRECT, input->propbit);
 	/* The C1FE controller reports no force: it is not a pressure pad. */
 	if (!msc->mtp_c1fe)
 		__set_bit(INPUT_PROP_PRESSUREPAD, input->propbit);
@@ -1376,9 +1614,9 @@ static int magicmouse_setup_input_mtp(struct input_dev *input,
 	 */
 	if (!msc->mtp_c1fe) {
 		/*
-		 * A palm's tool area on the T6041 trackpad exceeds 5000 once
-		 * scaled, so allow the full range of the record's 16-bit fields
-		 * there.
+		 * A palm's tool area on the T6041 and J616s trackpads exceeds
+		 * 5000 once scaled, so allow the full range of the record's
+		 * 16-bit fields there.
 		 */
 		int area_max = msc->mtp_palms ? 2 * S16_MAX : 5000;
 
@@ -1405,28 +1643,51 @@ static int magicmouse_setup_input_mtp(struct input_dev *input,
 				     J314_TP_MAX_FINGER_ORIENTATION, 0, 0);
 	}
 
-	/* The T6041 controller classifies palms. */
-	if (msc->mtp_palms)
+	/* The T6041, J616s and Trackpad26 controllers classify palms. */
+	if (msc->mtp_palms || msc->mtp_tp26)
 		input_set_abs_params(input, ABS_MT_TOOL_TYPE, 0, MT_TOOL_MAX,
 				     0, 0);
 
-	/* Note: Touch Y position from the device is inverted relative
-	 * to how pointer motion is reported (and relative to how USB
-	 * HID recommends the coordinates work).  This driver keeps
-	 * the origin at the same position, and just uses the additive
-	 * inverse of the reported Y.
-	 */
+	if (msc->mtp_tp26) {
+		/* Sizes and positions in 10 um units, orientation in degrees. */
+		input_set_abs_params(input, ABS_MT_TOUCH_MAJOR, 0, MAGICMOUSE_TP26_MAX_SIZE, 0, 0);
+		input_set_abs_params(input, ABS_MT_TOUCH_MINOR, 0, MAGICMOUSE_TP26_MAX_SIZE, 0, 0);
+		input_set_abs_params(input, ABS_MT_WIDTH_MAJOR, 0, MAGICMOUSE_TP26_MAX_SIZE, 0, 0);
+		input_set_abs_params(input, ABS_MT_WIDTH_MINOR, 0, MAGICMOUSE_TP26_MAX_SIZE, 0, 0);
+		input_abs_set_res(input, ABS_MT_TOUCH_MAJOR, MAGICMOUSE_TP26_RES);
+		input_abs_set_res(input, ABS_MT_TOUCH_MINOR, MAGICMOUSE_TP26_RES);
+		input_abs_set_res(input, ABS_MT_WIDTH_MAJOR, MAGICMOUSE_TP26_RES);
+		input_abs_set_res(input, ABS_MT_WIDTH_MINOR, MAGICMOUSE_TP26_RES);
+		input_set_abs_params(input, ABS_MT_ORIENTATION,
+				     -MAGICMOUSE_TP26_MAX_ORIENTATION,
+				     MAGICMOUSE_TP26_MAX_ORIENTATION, 0, 0);
+		input_set_abs_params(input, ABS_MT_PRESSURE, 0, MAGICMOUSE_TP26_MAX_FORCE, 0, 0);
+		input_abs_set_res(input, ABS_MT_PRESSURE, 1);
+		input_set_abs_params(input, ABS_MT_POSITION_X, -MAGICMOUSE_TP26_MAX_X,
+				     MAGICMOUSE_TP26_MAX_X, 0, 0);
+		input_set_abs_params(input, ABS_MT_POSITION_Y, -MAGICMOUSE_TP26_MAX_Y, 0,
+				     0, 0);
+		input_abs_set_res(input, ABS_MT_POSITION_X, MAGICMOUSE_TP26_RES);
+		input_abs_set_res(input, ABS_MT_POSITION_Y, MAGICMOUSE_TP26_RES);
+	} else {
+		/* Note: Touch Y position from the device is inverted relative
+		 * to how pointer motion is reported (and relative to how USB
+		 * HID recommends the coordinates work).  This driver keeps
+		 * the origin at the same position, and just uses the additive
+		 * inverse of the reported Y.
+		 */
 
-	/* finger position */
-	input_set_abs_params(input, ABS_MT_POSITION_X, J314_TP_MIN_X, J314_TP_MAX_X,
-			     0, 0);
-	/* Y axis is inverted */
-	input_set_abs_params(input, ABS_MT_POSITION_Y, -J314_TP_MAX_Y, -J314_TP_MIN_Y,
-			     0, 0);
+		/* finger position */
+		input_set_abs_params(input, ABS_MT_POSITION_X, J314_TP_MIN_X, J314_TP_MAX_X,
+				     0, 0);
+		/* Y axis is inverted */
+		input_set_abs_params(input, ABS_MT_POSITION_Y, -J314_TP_MAX_Y, -J314_TP_MIN_Y,
+				     0, 0);
 
-	/* X/Y resolution */
-	input_abs_set_res(input, ABS_MT_POSITION_X, J314_TP_RES_X);
-	input_abs_set_res(input, ABS_MT_POSITION_Y, J314_TP_RES_Y);
+		/* X/Y resolution */
+		input_abs_set_res(input, ABS_MT_POSITION_X, J314_TP_RES_X);
+		input_abs_set_res(input, ABS_MT_POSITION_Y, J314_TP_RES_Y);
+	}
 
 	input_set_events_per_packet(input, 60);
 
@@ -2395,9 +2656,24 @@ static int magicmouse_probe(struct hid_device *hdev,
 		/* The J700 trackpad sends a different report layout. */
 		np = of_get_child_by_name(dev_of_node(hdev->dev.parent), "multi-touch");
 		msc->mtp_c1fe = of_device_is_compatible(np, "apple,j700-multitouch");
-		msc->mtp_palms = !msc->mtp_c1fe &&
-				 of_machine_is_compatible("apple,t6041");
+		msc->mtp_palm_size = !msc->mtp_c1fe &&
+				     of_machine_is_compatible("apple,t6041");
+		/*
+		 * The J616s controller classes contacts the same way, but its
+		 * fingers reach a tool area of 2475, so only the class marks its
+		 * palms there.
+		 */
+		msc->mtp_palms = msc->mtp_palm_size ||
+				 (!msc->mtp_c1fe &&
+				  of_machine_is_compatible("apple,j616s"));
 		of_node_put(np);
+
+		/*
+		 * The Trackpad26 firmware (K116s) is told apart by its HID
+		 * product. Every other MTP trackpad keeps report 0x75.
+		 */
+		msc->mtp_tp26 = !msc->mtp_c1fe &&
+				hdev->product == MTP_TP26_PRODUCT_ID;
 
 		msc->input_ops.raw_event = magicmouse_raw_event_mtp;
 		msc->input_ops.setup_input = magicmouse_setup_input_mtp;
@@ -2485,7 +2761,19 @@ static int magicmouse_probe(struct hid_device *hdev,
 	default:
 		switch (id->bus) {
 		case BUS_HOST:
-			report = hid_register_report(hdev, HID_INPUT_REPORT, MTP_REPORT_ID, 0);
+			/*
+			 * The Trackpad26 descriptor declares a single
+			 * unnumbered vendor report: registering 0x75 there
+			 * would switch the HID core to numbered lookups and
+			 * drop every frame as an undefined report ID (the
+			 * first byte of the frame, 0x5a). Use the report the
+			 * descriptor declared.
+			 */
+			if (msc->mtp_tp26)
+				report = hdev->report_enum[HID_INPUT_REPORT].report_id_hash[0];
+			else
+				report = hid_register_report(hdev, HID_INPUT_REPORT,
+							     MTP_REPORT_ID, 0);
 			break;
 		case BUS_SPI:
 			report = hid_register_report(hdev, HID_INPUT_REPORT, SPI_REPORT_ID, 0);
@@ -2503,7 +2791,9 @@ static int magicmouse_probe(struct hid_device *hdev,
 		ret = -ENOMEM;
 		goto err_stop_hw;
 	}
-	report->size = 6;
+	/* The Trackpad26 report keeps the size its descriptor declared. */
+	if (!msc->mtp_tp26)
+		report->size = 6;
 
 	/* MTP devices do not need the MT enable, this is handled by the MTP driver */
 	if (id->bus == BUS_HOST)

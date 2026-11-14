@@ -656,7 +656,7 @@ const struct ave_fw_layout ave_layout_6070_11_1 = {
 			.h264_scaling_4x4 = 0x1060a,
 			.h264_scaling_8x8 = 0x106ca,
 			.h264_sve_count = 0x10de8,
-			.h264_multi_me = 0xfcea,
+			.multi_me = 0xfcea,
 			.h264_vui_restriction = 0x10a20,
 			.h264_vui_mv_over_boundaries = 0x10a24,
 			.h264_vui_max_bytes_denom = 0x10a28,
@@ -755,6 +755,7 @@ const struct ave_fw_layout ave_layout_6070_11_1 = {
 			.hevc_num_views = { 0xff24, 0xff28 },
 			.hevc_sve_count = 0x32d9c,
 			.hevc_sve_index = 0x32dc0,
+			.multi_me = 0xfcea,
 			.hevc_vps_base_internal = 0x105b8,
 			.hevc_vps_base_available = 0x105b9,
 			.hevc_vps_temporal_nesting = 0x105c4,
@@ -950,15 +951,27 @@ const struct ave_fw_layout ave_layout_6070_11_1 = {
 const struct ave_fw_layout *ave_layout_for_crc(u32 crc)
 {
 	/*
-	 * The M4 Pro gets the same 25G83 firmware build as the A18 Pro, built
-	 * for its own chip, and speaks the same command layout.
+	 * The M4 Pro and M4 Max get the same 25G83 firmware build as the
+	 * A18 Pro, built for their own chips, and speak the same command layout.
 	 */
-	if (crc == AVE_FW_TEXT_CRC_9003_78_0 || crc == AVE_FW_TEXT_CRC_T6040_25G83)
+	if (crc == AVE_FW_TEXT_CRC_9003_78_0 || crc == AVE_FW_TEXT_CRC_T6040_25G83 ||
+	    crc == AVE_FW_TEXT_CRC_T6041_25G83)
 		return &ave_layout_9003_78_0;
 	if (crc == 0x460c7a7c || crc == 0x25bfd039)
 		return &ave_layout_6070_11_1;
-	/* The macOS 27.0 build for the M5 Pro and Max. */
-	if (crc == AVE_FW_TEXT_CRC_T6050_26A428)
+	/*
+	 * The macOS 27.0 build for the M5 Pro and Max, and the M5's build of the
+	 * same firmware version (9013.45.1): one AppleAVE2 kext builds the
+	 * commands for both.
+	 */
+	if (crc == AVE_FW_TEXT_CRC_T6050_26A428 ||
+	    crc == AVE_FW_TEXT_CRC_T8142_26A428)
+		return &ave_layout_26a428;
+	/*
+	 * The macOS 27.3 beta 1 build speaks the same command layout: H.264
+	 * and HEVC encode with it on a J714s.
+	 */
+	if (crc == AVE_FW_TEXT_CRC_T6050_26C5035)
 		return &ave_layout_26a428;
 	return NULL;
 }

@@ -2291,10 +2291,12 @@ static bool staged_is_route_path(const char *path)
  * J614s HDMI: its ADT has no dcpext0 and its DISPEXT0 power states are
  * virtual, so the J616s chain above must never be powered there. HDMI is
  * dcpext2 instead (t6040-j614s-extdisp-hdmi.dtsi): the same ATC3 PHY,
- * crossbar and converter, behind the DISPEXT2 block.
+ * crossbar and converter, behind the DISPEXT2 block. As the J616s dcpext0,
+ * it also has a route to every Type-C port, so two USB-C displays use
+ * dcpext1 and dcpext2.
  */
 static const char *const t6041_j614s_hdmi_nodes[] = {
-	/* ATC3 power, PMP DISPEXT2 request, FAB7_SOC, DISPEXT2, AOP pins, PHY, crossbar, DARTs, mailbox, dcpext2 */
+	/* ATC3 power, PMP DISPEXT2 request, FAB7_SOC, DISPEXT2, AOP pins, PHY, crossbar, DARTs, mailbox, routes, dcpext2 */
 	"/power-management@502800000/power-controller@408",
 	"/power-management@508300000/power-controller@e0",
 	"/power-management@508300000/power-controller@168",
@@ -2311,6 +2313,9 @@ static const char *const t6041_j614s_hdmi_nodes[] = {
 	"/iommu@606340000",
 	"/iommu@606300000",
 	"/mailbox@606e08000",
+	"/dcp@606e00000/typec-routes/route@0",
+	"/dcp@606e00000/typec-routes/route@1",
+	"/dcp@606e00000/typec-routes/route@2",
 	"/dcp@606e00000",
 };
 
@@ -2337,10 +2342,10 @@ static bool staged_stage_on(unsigned int i)
 }
 
 /*
- * dcpext0's Type-C routes (the HDMI processor's hybrid DP outputs) switch the
- * Type-C crossbars, which are the USB-C chain's. Without that chain they stay
- * disabled and dcpext0 drives HDMI only; the crossbars are enabled for it,
- * as its mux-controls name them.
+ * The HDMI processor's Type-C routes (dcpext0's, or J614s's dcpext2's hybrid
+ * DP outputs) switch the Type-C crossbars, which are the USB-C chain's.
+ * Without that chain they stay disabled and the processor drives HDMI only;
+ * the crossbars are enabled for it, as its mux-controls name them.
  */
 static const char *const t6041_hdmi_only_muxes[] = {
 	"/mux@38324c000",
@@ -2456,8 +2461,8 @@ static int staged_apply(const struct gate_staged *st, struct device_node *displa
 		ret = np ? of_changeset_update_prop_string(cs, np, "status", "okay") : -ENODEV;
 		of_node_put(np);
 	}
-	/* dcpext0's Type-C crossbars; J614s's dcpext2 has no Type-C routes. */
-	for (i = 0; !ret && st->nodes == t6041_hdmi_nodes && !staged_stage_on(STAGED_USBC) &&
+	/* The Type-C crossbars the HDMI processor's mux-controls name. */
+	for (i = 0; !ret && st == &t6041_stages[STAGED_HDMI] && !staged_stage_on(STAGED_USBC) &&
 		    i < ARRAY_SIZE(t6041_hdmi_only_muxes); i++) {
 		np = of_find_node_by_path(t6041_hdmi_only_muxes[i]);
 		ret = np ? of_changeset_update_prop_string(cs, np, "status", "okay") : -ENODEV;
@@ -3093,9 +3098,50 @@ static const char *const t6041_max_hdmi_nodes[] = {
 
 static const char *const t6041_max_usbc_nodes[] = {
 	/*
-	 * ATC1 crossbar, DARTs, mailbox, route, dcpext1. The ATC1 mailbox is
-	 * the PHY's, on for USB3 whatever the display does, as on the M4 Pro.
+	 * ATC0-2 crossbars, DARTs, mailbox, a route per port, dcpext1, as the
+	 * M4 Pro's. The ATC mailboxes are the PHYs', on for USB3 whatever the
+	 * display does.
 	 */
+	"/mux@38324c000",
+	"/mux@38b24c000",
+	"/mux@39324c000",
+	"/iommu@602340000",
+	"/iommu@602300000",
+	"/mailbox@602e08000",
+	"/dcp@602e00000/typec-routes/route@0",
+	"/dcp@602e00000/typec-routes/route@1",
+	"/dcp@602e00000/typec-routes/route@2",
+	"/dcp@602e00000",
+};
+
+/*
+ * The second USB-C processor of the J614c/J616c: DARTs, mailbox, a route per
+ * port, dcpext2. It shares the ATC0-2 crossbars with dcpext1, whose chain
+ * enables them, so they are not part of this one.
+ */
+static const char *const t6041_max_usbc2_nodes[] = {
+	"/iommu@606340000",
+	"/iommu@606300000",
+	"/mailbox@606e08000",
+	"/dcp@606e00000/typec-routes/route@0",
+	"/dcp@606e00000/typec-routes/route@1",
+	"/dcp@606e00000/typec-routes/route@2",
+	"/dcp@606e00000",
+};
+
+static const struct gate_staged t6041_max_stages[] = {
+	{ "/iommu@3a2300000", t6041_max_hdmi_nodes, ARRAY_SIZE(t6041_max_hdmi_nodes) },
+	{ "/iommu@602300000", t6041_max_usbc_nodes, ARRAY_SIZE(t6041_max_usbc_nodes) },
+	{ "/iommu@606300000", t6041_max_usbc2_nodes, ARRAY_SIZE(t6041_max_usbc2_nodes) },
+};
+
+/*
+ * The J575c's typec1 chain: ATC1 crossbar, DARTs, mailbox, route, dcpext1.
+ * That port is also a USB3 port, so its device tree enables the ATC1 PHY's
+ * coprocessor mailbox, as the M4 Pro boards do: the mailbox is not part of
+ * the chain here.
+ */
+static const char *const t6041_j575c_usbc_nodes[] = {
 	"/mux@38b24c000",
 	"/iommu@602340000",
 	"/iommu@602300000",
@@ -3104,22 +3150,33 @@ static const char *const t6041_max_usbc_nodes[] = {
 	"/dcp@602e00000",
 };
 
-static const struct gate_staged t6041_max_stages[] = {
-	{ "/iommu@3a2300000", t6041_max_hdmi_nodes, ARRAY_SIZE(t6041_max_hdmi_nodes) },
-	{ "/iommu@602300000", t6041_max_usbc_nodes, ARRAY_SIZE(t6041_max_usbc_nodes) },
+static const struct gate_staged t6041_j575c_usbc = {
+	"/iommu@602300000", t6041_j575c_usbc_nodes, ARRAY_SIZE(t6041_j575c_usbc_nodes),
 };
 
 /*
- * The J575c's typec1 chain. That port is also a USB3 port, so its device tree
- * enables the ATC1 PHY's coprocessor mailbox, as the M4 Pro boards do: the
- * mailbox is not part of the chain here, and the rest is the J616c's.
+ * The J575c's HDMI chain. Its ATC3 is a USB-C port, and its HDMI port runs
+ * through the LPDPTX PHY instead (t6041-j575c-hdmi.dtsi): that PHY's power,
+ * the AOP pins (the converter's hotplug), the PHY, then dcpext0's chain.
  */
-static const struct gate_staged t6041_j575c_usbc = {
-	"/iommu@602300000", t6041_max_usbc_nodes, ARRAY_SIZE(t6041_max_usbc_nodes),
+static const char *const t6041_j575c_hdmi_nodes[] = {
+	"/power-management@502280000/power-controller@360",
+	"/pinctrl@510824000",
+	"/phy@51c200000",
+	"/iommu@3a2340000",
+	"/iommu@3a2300000",
+	"/mailbox@3a2e08000",
+	"/dcp@3a2e00000",
+};
+
+static const struct gate_staged t6041_j575c_hdmi = {
+	"/iommu@3a2300000", t6041_j575c_hdmi_nodes, ARRAY_SIZE(t6041_j575c_hdmi_nodes),
 };
 
 static const struct gate_staged *t6041_max_stage(unsigned int i)
 {
+	if (i == 0 && of_machine_is_compatible("apple,j575c"))
+		return &t6041_j575c_hdmi;
 	if (i == 1 && of_machine_is_compatible("apple,j575c"))
 		return &t6041_j575c_usbc;
 	return &t6041_max_stages[i];

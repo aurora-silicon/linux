@@ -885,3 +885,31 @@
 &clpc {
 	/delete-property/ apple,smc;
 };
+
+/*
+ * The video decoder (K116sAP ADT avd0), its DART and power states, as on the J714s.
+ * ADT: avd0 reg[0] 0x2108000000 + 0x1404000, interrupts 2417/2418; dart-avd0 at
+ * 0x2109020000, interrupt 2424; FAB1_SOC at offset 0x1b0 and AVD_SYS at 0x1d8 of
+ * the pmgr's reg[46] (0x2180600000).
+ */
+&pmgr4 {
+	status = "okay";
+};
+
+/* macOS turns FAB1_SOC on once at boot and never gates it. */
+&ps_fab1_soc {
+	apple,always-on;
+	status = "okay";
+};
+
+&ps_avd_sys {
+	status = "okay";
+};
+
+&avd_dart {
+	status = "okay";
+};
+
+&avd {
+	status = "okay";
+};

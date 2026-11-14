@@ -100,7 +100,7 @@ const FW_REGION_MAX_SIZE: u64 = 0x10_0000;
 /// The DART page size the firmware segments are mapped with.
 const FW_REGION_PAGE: u64 = 0x4000;
 const AFK_ENDPOINT_START: u8 = 0x20;
-const AFK_ENDPOINT_COUNT: u8 = 0xf;
+const AFK_ENDPOINT_COUNT: u8 = 0x11;
 const AFK_OPC_GET_BUF: u64 = 0x89;
 const AFK_OPC_INIT: u64 = 0x80;
 const AFK_OPC_INIT_RX: u64 = 0x8b;
@@ -2675,7 +2675,18 @@ impl AopData {
     /// sensor answers property reads and accepts its reporting interval but
     /// never reports; the trusted side does not start it. A missing file is
     /// not an error: the AOP's other services work without it.
+    ///
+    /// Only firmware that asks for the ALS endpoint's setup buffer takes its
+    /// calibration this way: T8140's fixed endpoint set includes it, and where
+    /// the EPMAP is read it has to be among the endpoints announced. Elsewhere
+    /// the ALS driver sends the sensor its calibration as a property.
     fn setup_als_calibration(&self) -> Result<()> {
+        {
+            let st = self.setup.lock();
+            if !st.expected[..st.expected_count].contains(&SETUP_ALS_EP) {
+                return Ok(());
+            }
+        }
         let Some(name) = self
             .dev
             .fwnode()

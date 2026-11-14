@@ -47,6 +47,7 @@ struct parser_record {
 	bool bad_score_type;
 	bool vrr;
 	bool vrr_zero;
+	bool dsc_required;
 };
 
 enum parser_missing {
@@ -129,7 +130,7 @@ static void blob_color(struct parser_blob *blob, s64 id, s64 score,
 
 static void blob_record(struct parser_blob *blob, const struct parser_record *record)
 {
-	unsigned int count = 6 + (record->vrr ? 2 : 0);
+	unsigned int count = 6 + (record->vrr ? 2 : 0) + record->dsc_required;
 
 	count -= !!(record->missing & MISSING_SCORE);
 	count -= !!(record->missing & MISSING_COLORS);
@@ -154,6 +155,16 @@ static void blob_record(struct parser_blob *blob, const struct parser_record *re
 			   record->color_missing, record->first_format);
 		blob_color(blob, 101, record->color_score,
 			   record->second_color_missing, DCP_COLOR_FORMAT_RGB);
+	}
+	if (record->dsc_required) {
+		blob_key(blob, "DSCRequiredColorElementIDs");
+		blob_tag(blob, 2, 2);
+		blob_tag(blob, 4, 0);
+		put_unaligned_le64(100, blob->data + blob->size);
+		blob->size += 8;
+		blob_tag(blob, 4, 0);
+		put_unaligned_le64(101, blob->data + blob->size);
+		blob->size += 8;
 	}
 	if (record->vrr) {
 		blob_int(blob, "MinimumVariableRefreshRate", record->vrr_zero ? 0 : 48 << 16);
@@ -196,6 +207,50 @@ static struct dcp_display_mode *parse_blob(struct parser_blob *blob,
 		return ERR_PTR(ret);
 	ctx.dcp = &parser_dcp;
 	return enumerate_modes(&ctx, count, 500, 300, notch, internal, false);
+}
+
+static struct dcp_display_mode *parse_blob_tiled(struct parser_blob *blob,
+						 unsigned int *count, u32 width, u32 height)
+{
+	struct dcp_parse_ctx ctx;
+	int ret = parse(blob->data, blob->size, &ctx);
+
+	if (ret)
+		return ERR_PTR(ret);
+	ctx.dcp = &parser_dcp;
+	ctx.tiled_width = width;
+	ctx.tiled_height = height;
+	return enumerate_modes(&ctx, count, 500, 300, 0, false, false);
+}
+
+static void parser_tiled_size_keeps_dsc_modes(struct kunit *test)
+{
+	struct parser_record record = valid_record(7, 10);
+	struct dcp_display_mode *modes;
+	struct parser_blob *blob;
+	unsigned int count;
+
+	record.dsc_required = true;
+	blob = make_blob(test, &record, 1);
+	KUNIT_ASSERT_NOT_NULL(test, blob);
+
+	modes = parse_blob_tiled(blob, &count, 0, 0);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, modes);
+	KUNIT_ASSERT_EQ(test, count, 1U);
+	KUNIT_EXPECT_FALSE(test, modes[0].sdr_usable);
+	kfree(modes);
+
+	modes = parse_blob_tiled(blob, &count, 3840, 2160);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, modes);
+	KUNIT_ASSERT_EQ(test, count, 1U);
+	KUNIT_EXPECT_FALSE(test, modes[0].sdr_usable);
+	kfree(modes);
+
+	modes = parse_blob_tiled(blob, &count, 1920, 1080);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, modes);
+	KUNIT_ASSERT_EQ(test, count, 1U);
+	KUNIT_EXPECT_TRUE(test, modes[0].sdr_usable);
+	kfree(modes);
 }
 
 static void parser_score_presence(struct kunit *test)
@@ -1966,7 +2021,59 @@ static void parser_desktop_metadata_timing(struct kunit *test)
 	drm_edid_free(edid);
 }
 
+/*
+ * The M5 internal DCP (firmware 27) crashes on any set_digital_out_mode that
+ * is not the 120 Hz boot timing (3024x1986@60 killed the co-processor).  The
+ * connector must refuse every other mode of the internal panel.
+ */
+static void parser_internal_v27_only_120hz(struct kunit *test)
+{
+	struct dcp_display_mode catalog[2] = {};
+	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
+	struct platform_device *pipeline = kunit_kzalloc(test, sizeof(*pipeline), GFP_KERNEL);
+	struct apple_connector *connector = kunit_kzalloc(test, sizeof(*connector), GFP_KERNEL);
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, dcp);
+	KUNIT_ASSERT_NOT_NULL(test, pipeline);
+	KUNIT_ASSERT_NOT_NULL(test, connector);
+	for (i = 0; i < 2; i++) {
+		struct drm_display_mode *m = &catalog[i].mode;
+
+		m->clock = i ? 523576 : 1047153;
+		m->hdisplay = 3024; m->hsync_start = 3048;
+		m->hsync_end = 3056; m->htotal = 3064;
+		m->vdisplay = 1986; m->vsync_start = 2754;
+		m->vsync_end = 2812; m->vtotal = 2848;
+		m->type = DRM_MODE_TYPE_DRIVER | (i ? 0 : DRM_MODE_TYPE_PREFERRED);
+		catalog[i].timing_mode_id = 2 + i;
+	}
+	parser_modes_init(dcp);
+	mutex_init(&dcp->dcpavserv.lock);
+	mutex_init(&dcp->hpd_mutex);
+	dcp->fw_compat = DCP_FIRMWARE_V_27_0;
+	dcp->hw.only_120hz_modes = true;
+	dcp->connector = connector;
+	dcp->modes = catalog;
+	dcp->nr_modes = 2;
+	dcp->modes_admitted = true;
+	connector->dcp = pipeline;
+	platform_set_drvdata(pipeline, dcp);
+
+	KUNIT_EXPECT_EQ(test, dcp_mode_valid(&connector->base, &catalog[0].mode), MODE_OK);
+	KUNIT_EXPECT_EQ(test, dcp_mode_valid(&connector->base, &catalog[1].mode), MODE_BAD);
+
+	/* The T8142 Air internal DCP (60 Hz panel, firmware 27.0) and the T6050 dcpext keep every mode. */
+	dcp->hw.only_120hz_modes = false;
+	KUNIT_EXPECT_EQ(test, dcp_mode_valid(&connector->base, &catalog[0].mode), MODE_OK);
+	KUNIT_EXPECT_EQ(test, dcp_mode_valid(&connector->base, &catalog[1].mode), MODE_OK);
+	dcp->modes = NULL;
+	dcp->nr_modes = 0;
+	dcp_modes_release(dcp);
+}
+
 static struct kunit_case parser_cases[] = {
+	KUNIT_CASE(parser_internal_v27_only_120hz),
 	KUNIT_CASE(parser_panel_of_dimensions),
 	KUNIT_CASE(parser_panel_j616s_publication),
 	KUNIT_CASE(parser_panel_h17p_publication),
@@ -1978,6 +2085,7 @@ static struct kunit_case parser_cases[] = {
 	KUNIT_CASE(parser_panel_identity),
 	KUNIT_CASE(parser_panel_color_target),
 	KUNIT_CASE(parser_panel_adt_color_target),
+	KUNIT_CASE(parser_tiled_size_keeps_dsc_modes),
 	KUNIT_CASE(parser_score_presence),
 	KUNIT_CASE(parser_legacy_ties),
 	KUNIT_CASE(parser_color_presence),

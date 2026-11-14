@@ -167,7 +167,17 @@ enum ave_opcode {
 #define AVE_FW_TEXT_CRC_9003_78_0 0x69c54454
 /* The M4 Pro (T6040) build of the same 25G83 firmware. */
 #define AVE_FW_TEXT_CRC_T6040_25G83 0x68d5f9f6
+/*
+ * The M4 Max (J575c) build of AppleAVE2FW 9003.78.0, as iBoot 25G83 loads it:
+ * DATA is 0x130000, and the loader writes a per-boot word at TEXT 0x4224, so
+ * this is the TEXT CRC with that word zeroed.
+ */
+#define AVE_FW_TEXT_CRC_T6041_25G83 0x9a080cad
 #define AVE_FW_TEXT_CRC_T6050_26A428 0x87279429
+/* macOS 27.3 beta 1 (26C5035r) / T6050: TEXT 0x158000, DATA 0x134000. */
+#define AVE_FW_TEXT_CRC_T6050_26C5035 0xc25b4ddb
+/* The M5 (T8142) build of the same 26A428 firmware (AppleAVE2FW 9013.45.1). */
+#define AVE_FW_TEXT_CRC_T8142_26A428 0x8a3784bd
 
 struct ave_ctx;
 
@@ -182,10 +192,27 @@ struct ave_coproc_regs {
 	u32 keep_mappings;
 };
 
+/* One preloaded firmware build of a variant: its segment sizes and TEXT CRC. */
+struct ave_fw_build {
+	const char *name;
+	u32 text_size;
+	u32 data_size;
+	u32 text_crc;
+};
+
 struct ave_variant {
 	const struct ave_coproc_regs *regs;
 	u32 fw_text_size;
 	u32 fw_data_size;
+	/* A second DATA size the variant accepts (the M4 Max build), or 0 */
+	u32 fw_data_size_alt;
+	/*
+	 * When set, the builds the variant admits. They replace fw_text_size,
+	 * fw_data_size and text_crc: the segment sizes select the build, and
+	 * the build names the TEXT CRC it must have.
+	 */
+	const struct ave_fw_build *builds;
+	unsigned int build_count;
 	u32 boot_device_id;
 	u32 device_type;
 	u32 lfs_ref_scale;
@@ -199,6 +226,12 @@ struct ave_variant {
 	 * address; it is zero in the firmware image. 0 when there is none.
 	 */
 	u32 text_link_cell;
+	/*
+	 * TEXT offset of a 32-bit word the loader sets differently on every
+	 * boot; a TEXT CRC that is not a known build is retried with it zeroed.
+	 * 0 when there is none.
+	 */
+	u32 text_boot_word;
 	/*
 	 * Mailbox offset of the SVE idle (clock gating) word that must read 0
 	 * before the firmware starts, or 0 when the variant has none.
@@ -516,13 +549,15 @@ static inline struct ave_ctx *ave_file_to_ctx(struct file *file)
 	return container_of(file_to_v4l2_fh(file), struct ave_ctx, fh);
 }
 
-extern const struct ave_variant ave_t6000, ave_t8112;
+extern const struct ave_variant ave_t6000, ave_t6041, ave_t8112;
 
 /* ave-fw.c */
 u64 ave_fw_vcbar(const struct ave_variant *variant, u64 text_iova);
 int ave_fw_probe(struct ave_dev *ave);
 int ave_fw_text_id_crc(const void *text, size_t size, u32 cell_off,
 		       u64 data_iova, u32 *crc);
+int ave_fw_text_boot_crc(const void *text, size_t size, u32 word_off,
+			 u32 *crc);
 void ave_fw_remove(struct ave_dev *ave);
 int ave_fw_ensure_running(struct ave_dev *ave);
 int ave_dart_audit(struct ave_dev *ave, const char *when);

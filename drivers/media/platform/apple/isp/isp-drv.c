@@ -291,11 +291,27 @@ static void apple_isp_select_hw(struct apple_isp *isp)
 	*hw = *isp->hw;
 	isp->hw = hw;
 
-	if (!hw->resident_fallback)
-		return;
-
 	struct device_node *dart __free(device_node) =
 		of_parse_phandle(dev->of_node, "iommus", 0);
+
+	/*
+	 * Resident firmware that starts again (hw->fw_restart) runs from its own
+	 * memory, but after a power-down it reaches its MMIO only once the first
+	 * DART has replayed the boot loader's address filter. Without
+	 * apple,dapf-ranges on that DART it keeps running, as it ran before.
+	 */
+	if (hw->fw_restart &&
+	    !(dart && of_property_present(dart, "apple,dapf-ranges"))) {
+		dev_info(dev, "no address filter replay in the device tree, keeping the firmware resident\n");
+		hw->fw_restart = false;
+		hw->deferred_start = false;
+		hw->coproc_quiesce = 0;
+		hw->fw_idle_ms = 0;
+		return;
+	}
+
+	if (!hw->resident_fallback)
+		return;
 
 	if (dart && of_property_match_string(dart, "reg-names", "dapf") >= 0 &&
 	    isp_of_fw_data_region(dev) >= 0)
@@ -1160,6 +1176,12 @@ static const struct isp_mmio_window apple_isp_fw_mmio_t6040[] = {
  * map) and as aurora's m1n1 proxy captures with it: no coprocessor reset,
  * four broadcast-clear windows in eight slots, the scaler 1 output path and
  * no capture metadata pool or watchdog.
+ *
+ * Its firmware starts again from its own memory, as T8140's does, so the
+ * ISP is powered only while the camera is in use: the firmware starts at
+ * probe to detect the camera and stops again, and each stream starts it.
+ * It stays up for 5 s after a stream, as on T8140, and the coprocessor is
+ * quiesced before its domains go off.
  */
 static const struct apple_isp_hw apple_isp_hw_t6040 = {
 	.gen = ISP_GEN_T6040,
@@ -1192,9 +1214,13 @@ static const struct apple_isp_hw apple_isp_hw_t6040 = {
 	.num_fw_mmio = ARRAY_SIZE(apple_isp_fw_mmio_t6040),
 
 	.coproc_control = ISP_COPROC_CONTROL_T8140,
+	.coproc_status = ISP_COPROC_STATUS_T8140,
+	.coproc_quiesce = ISP_COPROC_QUIESCE_T8140,
 	.boot_mode = 1,
 	.shared_size = 0xde600000,
 	.resident_fw = true,
+	.fw_restart = true,
+	.fw_idle_ms = 5000,
 	.meta_exposure = true,
 };
 
@@ -1478,6 +1504,18 @@ static __maybe_unused int apple_isp_suspend(struct device *dev)
 	if (power_lost)
 		apple_isp_stop_resident(isp, true);
 	apple_isp_firmware_flush(isp);
+
+	/*
+	 * A stream stopped for suspend-to-idle has stopped firmware that starts
+	 * again, too. Its start from .resume never gets the firmware's first
+	 * boot message; from process context it does. Restart it there, as
+	 * after a sleep that powered the SoC down.
+	 */
+	mutex_lock(&isp->video_lock);
+	if (isp->hw->fw_restart && isp->fw_state == ISP_FW_OFF &&
+	    test_bit(ISP_STATE_SLEEPING, &isp->state))
+		isp->fw_sleep_stopped = true;
+	mutex_unlock(&isp->video_lock);
 	return 0;
 }
 

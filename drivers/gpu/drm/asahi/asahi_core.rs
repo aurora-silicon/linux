@@ -182,6 +182,10 @@ module! {
             default: 512,
             description: "G13/G14: GPU event-drain utilization minimum (0..1024)",
         },
+        compute_timeout_max_ms: u32 {
+            default: 30000,
+            description: "G17: longest compute watchdog allowance a queue may set, ms (floor 2000)",
+        },
         g15_deadline_ms: u32 {
             default: 5000,
             description: "G15: host deadline of a published prefix without progress, ms (min 100)",

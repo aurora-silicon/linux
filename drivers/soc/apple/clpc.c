@@ -105,6 +105,8 @@ enum apple_clpc_rail {
  *	from a deferrable timer
  * @low_power_khz: CPU frequency ceiling of the low-power platform profile,
  *	taken up to the next table frequency; 0 for no platform profile
+ * @low_power_machine: the machine compatible @low_power_khz was read for; SoCs
+ *	sharing this CLPC without it get no low-power profile. NULL for any
  * @low_power_mw: package power (the SMC's PHPC key) the low-power profile
  *	holds the CPU clusters to; 0 for none
  */
@@ -125,6 +127,7 @@ struct apple_clpc_hw {
 	const char *ane_cluster_machine;
 	bool idle_on_time;
 	unsigned int low_power_khz;
+	const char *low_power_machine;
 	unsigned int low_power_mw;
 };
 
@@ -229,6 +232,8 @@ struct apple_clpc {
 	/* The platform profile and, for its power target, the SMC */
 	enum platform_profile_option profile;
 	bool low_power;
+	/* hw->low_power_khz where it applies to this machine, else 0 */
+	unsigned int low_power_khz;
 	struct device_node *smc_np;
 	struct apple_smc *smc;
 	unsigned long power_next;
@@ -839,7 +844,7 @@ static void apple_clpc_profile_limit(struct apple_clpc *clpc)
 	unsigned int i, khz, pick_khz = 0;
 	int mw, step = 0, pick = -1;
 
-	if (!clpc->hw->low_power_khz || time_before(jiffies, clpc->power_next))
+	if (!clpc->low_power_khz || time_before(jiffies, clpc->power_next))
 		return;
 	clpc->power_next = jiffies + msecs_to_jiffies(APPLE_CLPC_POWER_MS);
 	if (low && clpc->hw->low_power_mw) {
@@ -866,8 +871,8 @@ static void apple_clpc_profile_limit(struct apple_clpc *clpc)
 					 FREQ_QOS_MAX_DEFAULT_VALUE) < 0)
 			clpc->update_errors++;
 		/* The top: the first table frequency at or above hw->low_power_khz */
-		cl->top_khz = apple_clpc_step_khz(policy[i], clpc->hw->low_power_khz - 1, true);
-		if (cl->top_khz < clpc->hw->low_power_khz)
+		cl->top_khz = apple_clpc_step_khz(policy[i], clpc->low_power_khz - 1, true);
+		if (cl->top_khz < clpc->low_power_khz)
 			cl->top_khz = policy[i]->cpuinfo.max_freq;
 		if (!low)
 			cl->max_khz = 0;
@@ -1036,7 +1041,7 @@ static int apple_clpc_status_show(struct seq_file *s, void *unused)
 	}
 	seq_printf(s, "samples: %lu update errors: %lu\n", clpc->samples,
 		   clpc->update_errors);
-	if (clpc->hw->low_power_khz) {
+	if (clpc->low_power_khz) {
 		seq_printf(s, "profile: %s power %d mW (%lu new of %lu readings) ceilings (kHz):",
 			   clpc->profile == PLATFORM_PROFILE_LOW_POWER ? "low-power" :
 			   clpc->profile == PLATFORM_PROFILE_PERFORMANCE ? "performance" :
@@ -1426,7 +1431,9 @@ static int apple_clpc_probe(struct platform_device *pdev)
 
 	clpc->profile = PLATFORM_PROFILE_BALANCED;
 	clpc->power_next = jiffies;
-	if (clpc->hw->low_power_khz && IS_REACHABLE(CONFIG_ACPI_PLATFORM_PROFILE)) {
+	if (!clpc->hw->low_power_machine || of_machine_is_compatible(clpc->hw->low_power_machine))
+		clpc->low_power_khz = clpc->hw->low_power_khz;
+	if (clpc->low_power_khz && IS_REACHABLE(CONFIG_ACPI_PLATFORM_PROFILE)) {
 		struct device *ppdev;
 
 		/* The SMC is optional: without it the low-power profile has only its ceiling. */
@@ -1581,6 +1588,14 @@ static const struct apple_clpc_hw apple_clpc_hw_t6040 = {
 	.ane_cluster = 2,
 	.ane_cluster_khz = 3756000,
 	.ane_cluster_machine = "apple,t6040",
+	/*
+	 * The M4 Max's ADT has macOS's Low Power mode CPU ceiling,
+	 * cpu-low-power-frequency-max = 2808 MHz, as T6050's does. macOS's package
+	 * target in that mode is not measured here, so the profile has the
+	 * ceiling only. The M4 Pro's value is not checked: not for it yet.
+	 */
+	.low_power_khz = 2808000,
+	.low_power_machine = "apple,t6041",
 };
 
 /*

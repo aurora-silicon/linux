@@ -641,16 +641,15 @@ static void dcp_external_hint_done(struct apple_dcp *dcp, void *out, void *cooki
  */
 static void dcp_external_hdr_hints(struct apple_dcp *dcp, bool pq)
 {
-	const u32 hints[][2] = {
-		{ 3, 0x10000 },
-		{ 6, pq ? 0x20000 : 0x10000 },
-	};
+	struct iomfb_property hints[2];
 	unsigned int i;
+
+	iomfb_external_hdr_hint_values(pq, hints);
 
 	for (i = 0; i < ARRAY_SIZE(hints); i++) {
 		struct dcp_set_parameter_dcp param = {
-			.param = hints[i][0],
-			.value = { hints[i][1] },
+			.param = hints[i].id,
+			.value = { hints[i].value },
 			.count = 1,
 		};
 		struct dcp_wait_cookie *cookie;
@@ -1585,7 +1584,7 @@ static u8 dcpep_cb_prop_start(struct apple_dcp *dcp, u32 *length)
 	} else {
 		dcp_firmware_metadata_begin(dcp);
 	}
-	dcp->chunks.data = kzalloc(*length, GFP_KERNEL);
+	dcp->chunks.data = kvzalloc(*length, GFP_KERNEL);
 
 	if (!dcp->chunks.data) {
 		dev_warn(dcp->dev, "failed to allocate chunks\n");
@@ -1669,7 +1668,7 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 		ret = dcp_modes_replace(dcp, &ctx, dcp->chunks.modes_generation);
 		if (ret) {
 			if (ret == -ESTALE) {
-				kfree(dcp->chunks.data);
+				kvfree(dcp->chunks.data);
 				dcp->chunks.data = NULL;
 				dcp->chunks.length = 0;
 			}
@@ -1698,7 +1697,7 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 		ret = dcp_attributes_replace(dcp, &ctx, dcp->chunks.modes_generation);
 		if (ret) {
 			if (ret == -ESTALE) {
-				kfree(dcp->chunks.data);
+				kvfree(dcp->chunks.data);
 				dcp->chunks.data = NULL;
 				dcp->chunks.length = 0;
 			}
@@ -1731,7 +1730,7 @@ static u8 dcpep_cb_prop_end(struct apple_dcp *dcp,
 	u8 resp;
 
 	if (!dcp_property_key_valid(req->key, sizeof(req->key))) {
-		kfree(dcp->chunks.data);
+		kvfree(dcp->chunks.data);
 		dcp->chunks.data = NULL;
 		dcp->chunks.length = 0;
 		return false;

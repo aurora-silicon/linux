@@ -890,11 +890,13 @@ const HW_CFG_T6050: PmpHwConfig = PmpHwConfig {
     sram_backup: None,
 };
 
+/// T8132: the sleep engine reloads `__TEXT` from DRAM at the wake, and only `__DATA`
+/// (the ADT's second segment) has to be kept.
 const HW_CFG_T8132: PmpHwConfig = PmpHwConfig {
     dma_mask: None,
     check_bootargs_uuid: false,
     coreanalytics: Ep7::RetainedBoard,
-    sram_backup: None,
+    sram_backup: Some((0x3c000, 0x68000)),
 };
 
 impl Drop for PmpDriver {

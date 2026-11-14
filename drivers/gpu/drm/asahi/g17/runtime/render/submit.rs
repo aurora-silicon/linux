@@ -318,8 +318,11 @@ impl Backend {
         self.shared.queue_events();
         self.admission_open()?;
         let started = super::super::now_ns();
+        // Backing frees only as other owners' pairs and pools are released, which takes far
+        // longer than one poll under concurrent clients: wait as long as a compute queue
+        // waits for capacity (and a render channel for its retirement).
         let remaining = self
-            .wait_deadline(clock, super::super::WORK_RING_WAIT_NS)?
+            .wait_deadline(clock, crate::g17::preparation::QUEUE_WAIT_NS)?
             .saturating_sub(started);
         if remaining == 0 {
             return Err(EBUSY);
