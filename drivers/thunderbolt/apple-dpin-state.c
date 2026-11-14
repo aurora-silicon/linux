@@ -66,7 +66,8 @@ const struct apple_dpin_policy apple_dpin_m5 = {
 	.capacity_retry = true,
 	.setup_irqs = true,
 	.defer_new_bringup = true,
-	.host_policy = TB_HOST_DP_NOTIFY | TB_HOST_DP_KEEP_DPRX_TIMEOUT,
+	.host_policy = TB_HOST_DP_NOTIFY | TB_HOST_DP_KEEP_DPRX_TIMEOUT |
+		       TB_HOST_DP_GRANT_EVERY_DPIN,
 	.lazy_idle = true,
 };
 

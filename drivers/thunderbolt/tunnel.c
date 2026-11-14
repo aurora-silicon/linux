@@ -1184,7 +1184,9 @@ static bool tb_dp_is_apple_t602x_right_dpin(const struct tb_port *in)
 
 static bool tb_dp_apple_dpin_needs_bw_grant(const struct tb_port *in)
 {
-	return tb_dp_is_apple_t602x_right_dpin(in);
+	return tb_dp_is_apple_t602x_right_dpin(in) ||
+	       (tb_port_is_dpin(in) && in->sw->tb &&
+		tb_host_dp_policy(in->sw->tb->nhi, TB_HOST_DP_GRANT_EVERY_DPIN));
 }
 
 static int tb_dp_bandwidth_alloc_mode_enable(struct tb_tunnel *tunnel)

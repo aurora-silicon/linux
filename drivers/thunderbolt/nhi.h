@@ -251,6 +251,11 @@ struct tb_nhi_ops {
  * being set up again at HBR2 first.
  */
 #define TB_HOST_DP_SHARED_RATE		BIT(6)
+/*
+ * Grant the initial DP bandwidth on every DP IN adapter of the host, not only
+ * on the M2 Pro right-hand one (TB_HOST_DP_INITIAL_BW_GRANT is that route).
+ */
+#define TB_HOST_DP_GRANT_EVERY_DPIN	BIT(7)
 
 /*
  * Minimal number of vectors when we use MSI-X. Two for control channel
