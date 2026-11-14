@@ -34,6 +34,7 @@ mod completion;
 pub(crate) mod context;
 mod data_segment;
 mod dependency;
+pub(crate) mod exec_share;
 mod sync_input;
 pub(crate) mod sync_output;
 mod trace;

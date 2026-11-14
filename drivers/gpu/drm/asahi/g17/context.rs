@@ -7,6 +7,7 @@
 //! fence has already been signalled. Context-local accounting never waits for GPU work.
 
 mod identity;
+pub(crate) use identity::SharedStates;
 use super::{
     freelist::{RenderIds, RenderPool},
     fw::{context as fw, queue::Policy},
@@ -238,6 +239,15 @@ pub(crate) struct Context {
     /// Fixed for the context's life. Physical queues bound to it carry this
     /// profile in every record, ring, doorbell and registration.
     policy: Policy,
+    /// This context's use of an execution context shared with other contexts of its VM.
+    share: Option<super::exec_share::Use>,
+}
+impl Drop for Context {
+    fn drop(&mut self) {
+        if let Some(share) = &self.share {
+            share.drop_context(self.is_published());
+        }
+    }
 }
 impl Context {
     #[expect(
@@ -253,6 +263,7 @@ impl Context {
         policy: Policy,
         state_returns: Arc<super::availability::Availability>,
         compute_returns: Arc<super::availability::Availability>,
+        share: Option<super::exec_share::Use>,
     ) -> Result<Self> {
         let status = execution.vm().status().ok_or(EINVAL)?.clone();
         let hold = execution.hold(super::channel::control_fence)?;
@@ -335,7 +346,10 @@ impl Context {
             render_seen: AtomicBool::new(false),
             qos,
             owner_pid,
-            states: WorkStates::new(),
+            states: match &share {
+                Some(share) => WorkStates::shared(share.states().clone()),
+                None => WorkStates::new(),
+            },
             state_returns,
             compute_returns,
             order,
@@ -345,6 +359,7 @@ impl Context {
             render_blocks: AtomicUsize::new(super::fw::freelist::RENDER_BLOCKS),
             compute_timestamps: super::completion::ComputeTimestampCache::new()?,
             policy,
+            share,
         })
     }
     pub(crate) fn vm(&self) -> &Vm {
@@ -379,8 +394,10 @@ impl Context {
     pub(crate) fn generation(&self) -> u8 {
         self.execution.generation()
     }
+    /// False once this context released its execution identity, even while other contexts
+    /// sharing it keep it.
     pub(crate) fn is_current(&self) -> bool {
-        self.execution.is_current()
+        self.share.as_ref().is_none_or(|share| !share.released()) && self.execution.is_current()
     }
     /// Claim the context's hardware identity for one published M5 command until it retires.
     pub(crate) fn pin(&self) -> Result<mmu::ContextPin> {
@@ -420,7 +437,18 @@ impl Context {
     /// Scheduler release and command retirement have both been witnessed.
     /// Keep installed storage alive while returning the finite TTBAT identity.
     pub(crate) fn release_execution(&self) {
-        self.execution.release();
+        match &self.share {
+            Some(share) => share.release_execution(),
+            None => self.execution.release(),
+        }
+    }
+    /// The owner an M5 parameter-buffer token is bound to: the execution identity, or this
+    /// context alone when it shares that identity.
+    pub(crate) fn buffer_owner(&self) -> u32 {
+        match &self.share {
+            Some(_) => 0x8000_0000 | (self.scheduler_generation & 0x7fff_ffff),
+            None => self.id(),
+        }
     }
     pub(crate) fn scheduler_generation(&self) -> u32 {
         self.scheduler_generation

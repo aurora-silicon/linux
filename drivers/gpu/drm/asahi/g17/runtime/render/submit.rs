@@ -794,7 +794,7 @@ impl crate::g17::Firmware {
         let pool = pair.pool().clone();
         let buffer_id = pair.buffer_id();
         // An M5 PB token is bound to the hardware context and PB state it names.
-        let buffer_context = pair.m5_pb_state_va().map(|pb_va| (packet.context.id(), pb_va));
+        let buffer_context = pair.m5_pb_state_va().map(|pb_va| (packet.context.buffer_owner(), pb_va));
         let (buffer_id, buffer_token) = match buffer_context {
             Some((context, pb_va)) => {
                 self.queues.buffers.acquire_owner_bound(buffer_id, context, pb_va)?

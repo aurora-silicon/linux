@@ -773,7 +773,9 @@ impl Backend {
         // sleeping, and nothing of the new queue is visible yet.
         const RETAINED_CONTEXT_WAIT_NS: u64 = 4 * WORK_RING_WAIT_NS;
         let started = now_ns();
-        let (lease, uat, pool, qos, execution, slot) = loop {
+        // Read once: a queue's sharing never changes under it (super::exec_share).
+        let share_on = super::exec_share::enabled();
+        let (lease, uat, pool, qos, execution, slot, share) = loop {
             let observed = shared.queues.observe();
             let lease = shared.preparations.enter(true)?;
             let mut state = shared.state.lock();
@@ -796,16 +798,25 @@ impl Backend {
             }
             // The new context may reuse a pooled scheduler page: clear released QoS rows first.
             firmware.queues.qos_ids.forget_released(|ids| firmware.port.qos_forget(ids));
-            let attempt = if firmware.uat.execution_contexts_used() < crate::mmu::MAX_EXECUTION_CONTEXTS {
+            let shares = share_on && firmware.uat.is_m5();
+            let joined = if shares { super::exec_share::join(vm) } else { None };
+            let attempt = if let Some((execution, share)) = joined {
+                let slot = admission.reserve_queue()?;
+                Ok((execution, slot, Some(share)))
+            } else if firmware.uat.execution_contexts_used() < crate::mmu::MAX_EXECUTION_CONTEXTS {
                 // Creators hold the device mutex, so neither check above can
                 // have changed; the slot only fails on a broken invariant.
                 let slot = admission.reserve_queue()?;
-                firmware.uat.new_execution_context(vm, super::channel::control_witnessed()).map(|execution| (execution, slot))
+                firmware.uat.new_execution_context(vm, super::channel::control_witnessed()).and_then(|execution| {
+                    // Offered under the device mutex, so later creators of this VM join it.
+                    let share = if shares { Some(super::exec_share::offer(&execution)?) } else { None };
+                    Ok((execution, slot, share))
+                })
             } else {
                 Err(ENOSPC)
             };
             match attempt {
-                Ok((execution, slot)) => {
+                Ok((execution, slot, share)) => {
                     break (
                         lease,
                         firmware.uat.clone(),
@@ -813,6 +824,7 @@ impl Backend {
                         firmware.queues.qos_ids.clone(),
                         execution,
                         slot,
+                        share,
                     )
                 }
                 Err(error) if error == ENOSPC => {
@@ -855,6 +867,7 @@ impl Backend {
                 policy,
                 shared.renders.clone(),
                 shared.progress.clone(),
+                share,
             )?,
             GFP_KERNEL,
         )?;
