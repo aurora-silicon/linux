@@ -4315,6 +4315,7 @@ void dcp_poweron(struct platform_device *pdev)
 		cancel_work_sync(&dcp->external_stop_work);
 		cancel_delayed_work_sync(&dcp->external_stop_retry_wq);
 		guard(mutex)(&dcp->external_lock);
+		iomfb_retire_unplugged_present_h17p(dcp);
 		ret = dcp_external_start_locked(dcp);
 		if (!ret)
 			dcp->external_crtc_generation = dcp->external_generation;

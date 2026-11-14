@@ -3510,21 +3510,14 @@ bool iomfb_present_complete_h17p(struct apple_dcp *dcp)
  * false if the present ended or a newer one re-armed the watchdog in the
  * meantime.  Other firmware has no present state.
  */
-bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp)
+static bool iomfb_retire_present_locked_h17p(struct apple_dcp *dcp)
 {
 	struct dcp_present_state_h17p *state = &dcp->present_state_h17p;
-	u32 swap_id;
+	u32 swap_id = state->swap_id;
 
-	if (!iomfb_uses_queue(dcp))
-		return true;
-
-	guard(mutex)(&dcp->iomfb.lock);
-	swap_id = state->swap_id;
-	if (time_before(jiffies, dcp->swap_watchdog_deadline) ||
-	    !state->pending || !state->accepted)
-		return false;
+	lockdep_assert_held(&dcp->iomfb.lock);
 	if (!dcp_present_retire_h17p(state, swap_id))
-		return true;
+		return false;
 
 	iomfb_present_failed_h17p(dcp);
 	if (!iomfb_present_brightness_only_h17p(dcp)) {
@@ -3537,6 +3530,43 @@ bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp)
 	}
 	iomfb_queue_advance(dcp);
 	return true;
+}
+
+bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp)
+{
+	struct dcp_present_state_h17p *state = &dcp->present_state_h17p;
+
+	if (!iomfb_uses_queue(dcp))
+		return true;
+
+	guard(mutex)(&dcp->iomfb.lock);
+	if (time_before(jiffies, dcp->swap_watchdog_deadline) ||
+	    !state->pending || !state->accepted)
+		return false;
+	iomfb_retire_present_locked_h17p(dcp);
+	return true;
+}
+
+/*
+ * The external pipe was unplugged and is being powered on again.  The
+ * firmware swallows an accepted present that the unplug caught ("swallowed
+ * swap ID n as fControllerPowerState is 0"): it never completes, and the
+ * queue holds the power-on and mode set behind it until the 10 s transaction
+ * timeout marks the coprocessor crashed.  Retire it now instead of waiting
+ * for the swap watchdog, which did not fire on the 14 Nov M5 boot.
+ */
+void iomfb_retire_unplugged_present_h17p(struct apple_dcp *dcp)
+{
+	struct dcp_present_state_h17p *state = &dcp->present_state_h17p;
+
+	if (!iomfb_uses_queue(dcp))
+		return;
+
+	guard(mutex)(&dcp->iomfb.lock);
+	if (state->pending && state->accepted &&
+	    iomfb_retire_present_locked_h17p(dcp))
+		dev_warn(dcp->dev, "retired present %u swallowed by the unplug\n",
+			 state->swap_id);
 }
 
 /* Release a present's scanout unless it is displayed or was dropped. */
