@@ -327,6 +327,10 @@
 	multi-touch {
 		firmware-name = "apple/tpmtfw-j604.bin";
 	};
+
+	/* J604 ADT /arm-io/dockchannel-mtp/mtp-transport/actuator: Force Touch */
+	actuator {
+	};
 };
 
 /*

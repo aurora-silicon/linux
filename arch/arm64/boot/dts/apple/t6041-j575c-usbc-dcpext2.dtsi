@@ -1,0 +1,219 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * A second USB-C DisplayPort processor on the J575c: dcpext2, with a route to
+ * each of the four back Type-C ports (typec0-3), next to dcpext1. Two USB-C
+ * displays then run at the same time, one on each processor, beside HDMI on
+ * dcpext0.
+ *
+ * The node is the J614c/J616c's (t6041-j616c-usbc-dcpext2.dtsi) with the
+ * fourth route added: the J575c ADT has dcpext2 at the same address
+ * (/arm-io/dcpext2 0x406e00000 + 0x2_0000_0000) and iBoot preloads and starts
+ * it here too (iop-dcpext2-nub). As dcpext1, no PMP and no DISPEXT2 power
+ * domain is described: the chain runs as iBoot left it powered.
+ *
+ * Everything here is disabled. The boot loader fills dcpext2's firmware
+ * memory from this boot's ADT (aura t6041_exts) and the display gate enables
+ * the chain once it has.
+ */
+
+/ {
+	aliases {
+		dcpext2 = &dcpext2;
+	};
+
+	reserved-memory {
+		dcpext2_text: dcpext2-text {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+
+		dcpext2_data: dcpext2-data {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+
+		dcpext2_heap: dcpext2-heap {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+	};
+
+	dcpext2: dcp@606e00000 {
+		compatible = "apple,t6041-dcpext", "apple,dcpext";
+		reg = <0x6 0x06e00000 0x0 0x4000>,
+		      <0x6 0x04000000 0x0 0x4000000>,
+		      <0x6 0x06240000 0x0 0x10000>,
+		      <0x6 0x063a8000 0x0 0x4000>,
+		      <0x6 0x06800000 0x0 0x800000>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3";
+		mboxes = <&dcpext2_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcpext2_dart 23>;
+		/*
+		 * PMGR bandwidth agent scratch: the bwr-agent the ADT dispext2
+		 * function-bw_req_interrupt0 (0x90) names, 0x20000 + 5 * 0x4000.
+		 */
+		apple,bw-scratch = <&pmgr_dcp 0 4 0x34000>;
+		/* ADT iop-dcpext2-nub external-index */
+		apple,dcp-endpoint = <3>;
+		/* as dcpext0/1: without it apple-dcp's probe fails with -EINVAL */
+		apple,iomfb-surfaces = <1 1 0 0>;
+		apple,connector-type = "USB-C";
+		phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>,
+		       <&atcphy2 PHY_TYPE_DP>, <&atcphy3 PHY_TYPE_DP>;
+		phy-names = "typec0", "typec1", "typec2", "typec3";
+		mux-controls = <&atcphy0_xbar 0>, <&atcphy1_xbar 0>,
+			       <&atcphy2_xbar 0>, <&atcphy3_xbar 0>;
+		mux-control-names = "typec0", "typec1", "typec2", "typec3";
+		/*
+		 * indexed by route; crossbar state = 2 * dp-switch-ufp-endpoint
+		 * (2) + port (0), as the J614s's dcpext2 (#1654)
+		 */
+		apple,typec-dptx-phys = <0 1 2 3>;
+		apple,typec-mux-indices = <4 4 4 4>;
+		memory-region = <&dcpext2_text>, <&dcpext2_data>, <&dcpext2_heap>;
+		memory-region-names = "text", "data", "heap";
+		status = "disabled";
+
+		dispext2_piodma: piodma {
+			iommus = <&dispext2_dart 16>;
+		};
+
+		typec-routes {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			route@0 {
+				reg = <0>;
+				mode-switch;
+				status = "disabled";
+
+				port {
+					dcpext2_typec0: endpoint {
+						remote-endpoint = <&typec0_dcpext2>;
+					};
+				};
+			};
+
+			route@1 {
+				reg = <1>;
+				mode-switch;
+				status = "disabled";
+
+				port {
+					dcpext2_typec1: endpoint {
+						remote-endpoint = <&typec1_dcpext2>;
+					};
+				};
+			};
+
+			route@2 {
+				reg = <2>;
+				mode-switch;
+				status = "disabled";
+
+				port {
+					dcpext2_typec2: endpoint {
+						remote-endpoint = <&typec2_dcpext2>;
+					};
+				};
+			};
+
+			route@3 {
+				reg = <3>;
+				mode-switch;
+				status = "disabled";
+
+				port {
+					dcpext2_typec3: endpoint {
+						remote-endpoint = <&typec3_dcpext2>;
+					};
+				};
+			};
+		};
+	};
+
+	dcpext2_mbox: mailbox@606e08000 {
+		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x6 0x06e08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1362 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1363 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1364 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1365 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	dispext2_dart: iommu@606300000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x6 0x06300000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1309 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	dcpext2_dart: iommu@606340000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x6 0x06340000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1309 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+};
+
+&typec0 {
+	ports {
+		port@3 {
+			typec0_dcpext2: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext2_typec0>;
+			};
+		};
+	};
+};
+
+&typec1 {
+	ports {
+		port@3 {
+			typec1_dcpext2: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext2_typec1>;
+			};
+		};
+	};
+};
+
+&typec2 {
+	ports {
+		port@3 {
+			typec2_dcpext2: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext2_typec2>;
+			};
+		};
+	};
+};
+
+&typec3 {
+	ports {
+		port@3 {
+			typec3_dcpext2: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext2_typec3>;
+			};
+		};
+	};
+};

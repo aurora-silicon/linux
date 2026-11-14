@@ -1304,7 +1304,18 @@ impl RenderState {
         writeln!(f, "retired_render_bindings used={} total={}", self.retired.len(), self.retired.capacity())?;
         writeln!(f, "firmware_linked_render_graphs kept={} leaked={}", self.kept_graphs.len(),
                  teardown::LEAKED_GRAPHS.load(core::sync::atomic::Ordering::Relaxed))?;
+        let unsettled = self.entries.iter().flatten()
+            .filter_map(|entry| entry.pair.as_ref())
+            .filter(|pair| pair.drain_failures() != 0)
+            .count();
+        writeln!(f, "drained_render_pairs unsettled={} failures={} recovered={} out_of_service={}", unsettled,
+                 settle::SETTLE_FAILURES.load(core::sync::atomic::Ordering::Relaxed),
+                 settle::SETTLE_RECOVERED.load(core::sync::atomic::Ordering::Relaxed),
+                 settle::SETTLE_PARKED.load(core::sync::atomic::Ordering::Relaxed))?;
         self.pools.write_capacity(f)?;
+        for pair in self.entries.iter().flatten().filter_map(|entry| entry.pair.as_ref()) {
+            pair.write_hold(f)?;
+        }
         for (slot, entry) in self.entries.iter().enumerate() {
             if let Some(context) = entry.as_ref().and_then(|entry| entry.context.as_ref()) {
                 context.write_capacity(f, "render", slot)?;

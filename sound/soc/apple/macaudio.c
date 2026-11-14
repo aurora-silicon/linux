@@ -183,6 +183,13 @@ struct macaudio_platform_cfg {
 	 * front-end owns the DMA channel of one serializer (AOP-fed models).
 	 */
 	bool spk_secondary_only;
+	/*
+	 * No voltage or current sense reaches the AP, so no protection daemon
+	 * can govern the speakers: their SN012776 volumes stay under safe_vol,
+	 * locked, unlocked or granted alike, and there is no sense PCM. A
+	 * granted lease runs them at safe_vol, its operating gain.
+	 */
+	bool spk_fixed_ceiling;
 };
 
 static const char *volume_control_names[] = {
@@ -527,7 +534,9 @@ static void macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
 			max = 1; //TAS5770_DB(ma->cfg->safe_vol);
 		break;
 	case AMP_SN012776:
-		if (unlock)
+		if (ma->cfg->spk_fixed_ceiling)
+			max = SN012776_DB(ma->cfg->safe_vol);
+		else if (unlock)
 			max = SN012776_0DB;
 		else
 			max = 1; //SN012776_DB(ma->cfg->safe_vol);
@@ -1026,7 +1035,11 @@ static long macaudio_spk_gain(const struct macaudio_snd_data *ma, bool granted)
 	case AMP_TAS5770:
 		return granted ? TAS5770_0DB : 0;
 	case AMP_SN012776:
-		return granted ? SN012776_0DB : 0;
+		if (!granted)
+			return 0;
+		/* The volumes' limit is the ceiling, so is the operating gain */
+		return ma->cfg->spk_fixed_ceiling ? SN012776_DB(ma->cfg->safe_vol) :
+						    SN012776_0DB;
 	case AMP_MAX98360A:
 		return granted ? MAX98360A_0DB : MAX98360A_DB(ma->cfg->safe_vol);
 	default:
@@ -1156,6 +1169,10 @@ static void macaudio_spk_ramp_down(struct macaudio_snd_data *ma, ktime_t deadlin
 	lockdep_assert_held(&ma->spk_mutex);
 
 	for (i = 0; i < ARRAY_SIZE(macaudio_spk_ramp_db); i++) {
+		/* A fixed ceiling is the operating gain: start below it */
+		if (ma->cfg->spk_fixed_ceiling &&
+		    macaudio_spk_ramp_db[i] >= ma->cfg->safe_vol)
+			continue;
 		if (!ktime_before(ktime_get(), deadline))
 			return;
 		/* A failure here is the floor's to catch; it notifies the end */
@@ -2657,7 +2674,8 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 				}
 			}
 			ma->has_speakers = 1;
-			if (ma->cfg->amp != AMP_SSM3515 && ma->cfg->safe_vol != 0)
+			if (ma->cfg->amp != AMP_SSM3515 && ma->cfg->safe_vol != 0 &&
+			    !ma->cfg->spk_fixed_ceiling)
 				ma->has_sense = 1;
 		}
 
@@ -4412,6 +4430,8 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j700-macaudio", .data = &macaudio_j700_cfg },
 	/* j714    -       sn012776    15      2x 2W+1T (AOP-fed, V/I sense) */
 	{ .compatible = "apple,j714-macaudio", .data = &macaudio_j714_cfg },
+	/* k116    -       sn012776    15      2x 2W+1T (AOP-fed, V/I sense; the 16" PROLED chassis, J714's amps and frame) */
+	{ .compatible = "apple,k116-macaudio", .data = &macaudio_j714_cfg },
 	/* j713    -       sn012776    15      2x 1W+1T (AOP-fed, one serializer) */
 	{ .compatible = "apple,j713-macaudio", .data = &macaudio_j713_cfg },
 	/* The J713 jack runs on the AOP like the J616s one. */

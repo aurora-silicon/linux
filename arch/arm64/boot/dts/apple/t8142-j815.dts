@@ -180,3 +180,27 @@
 &ave {
 	status = "okay";
 };
+
+/*
+ * The Neural Engine. It stays off until the first request: the firmware is
+ * started then, from the preload, and system sleep cycles it cold.
+ */
+&ps_ane_sys {
+	status = "okay";
+};
+
+&ane_dart0 {
+	status = "okay";
+};
+
+&ane_dart1 {
+	status = "okay";
+};
+
+&ane_dart2 {
+	status = "okay";
+};
+
+&ane {
+	status = "okay";
+};

@@ -284,6 +284,8 @@ struct apple_dcp_hw_data {
 	 */
 	bool s2r;
 	bool s2r_ext;
+	/* The firmware crashes on any mode but the 120 Hz boot timing, see dcp_mode_settable(). */
+	bool only_120hz_modes;
 };
 
 enum dcp_test_point {
@@ -1117,6 +1119,7 @@ int dcp_backlight_update(struct apple_dcp *dcp);
 s32 dcp_ext_backlight_value(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
 extern int fw27_panel_boot_mode;
+extern int notify_clients_form;
 
 /*
  * The desktop 26.6 panel takes VRR_ENABLED on its live mode, through the

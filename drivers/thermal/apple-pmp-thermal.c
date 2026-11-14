@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * J713 CPU/GPU thermal policy using read-only samples from the PMP owner.
+ * T8132 CPU/GPU thermal policy using read-only samples from the PMP owner.
  * The policy and thresholds are carried from the existing M4 implementation;
  * these are Linux operating limits, not inferred Apple hardware safety limits.
  * Guards are installed before cpufreq relinquishes its unmanaged ceiling.
@@ -40,6 +40,8 @@
  */
 #define APPLE_PMP_HYST_MC		2000
 #define APPLE_PMP_POLL_MS		5
+/* Inside the cooling slope window (50-250 ms); used while cool and idle. */
+#define APPLE_PMP_SLOW_POLL_MS		100
 #define APPLE_PMP_GOVERNOR_NS	100000000ULL
 
 struct apple_pmp_cluster {
@@ -76,6 +78,7 @@ static struct {
 	struct hrtimer poll_timer;
 	struct work_struct poll_work;
 	bool polling;
+	bool fast_poll;
 	bool owner; /* apple-soc-cpufreq's unmanaged cap is released */
 	bool critical_dumped;
 	bool ready;
@@ -394,6 +397,7 @@ static int apple_pmp_sample(void)
 				DIV_ROUND_UP(state * 8, cdev->max_state));
 	}
 	level = apple_pmp_cooling_level(cooling);
+	WRITE_ONCE(pmp_thermal.fast_poll, apple_pmp_cooling_fast(cooling, value, ret));
 	/* Never release startup/fault protection with disabled or unbound cooling. */
 	if (!pmp_thermal.enabled)
 		level = 8;
@@ -504,7 +508,9 @@ static enum hrtimer_restart apple_pmp_poll_timer(struct hrtimer *timer)
 	 * One work item coalesces missed ticks; no burst of stale confirmations.
 	 */
 	queue_work(system_highpri_wq, &pmp_thermal.poll_work);
-	hrtimer_forward_now(timer, ms_to_ktime(APPLE_PMP_POLL_MS));
+	hrtimer_forward_now(timer, ms_to_ktime(READ_ONCE(pmp_thermal.fast_poll) ?
+					     APPLE_PMP_POLL_MS :
+					     APPLE_PMP_SLOW_POLL_MS));
 	return HRTIMER_RESTART;
 }
 
@@ -515,6 +521,7 @@ static int apple_pmp_change_mode(struct thermal_zone_device *zone,
 	pmp_thermal.enabled = mode == THERMAL_DEVICE_ENABLED;
 	apple_pmp_gpu_publish(pmp_thermal.sensors, 0, 8, 0);
 	apple_pmp_cooling_init(&pmp_thermal.cooling);
+	WRITE_ONCE(pmp_thermal.fast_poll, true);
 	return apple_pmp_guard(8);
 }
 
@@ -677,16 +684,23 @@ static int apple_pmp_add_cluster(unsigned int index, unsigned int cpu,
 static int apple_pmp_thermal_setup(void)
 {
 	struct thermal_zone_device *zone;
+	unsigned long p_members = BIT(0) | GENMASK(9, 7);
+	unsigned long e_members = GENMASK(6, 1);
 	unsigned int i;
 	int ret;
 
+	/* J773g numbers the four P cores 0,3-5 and the six E cores 1-2,6-9. */
+	if (of_machine_is_compatible("apple,j773g")) {
+		p_members = BIT(0) | GENMASK(5, 3);
+		e_members = GENMASK(2, 1) | GENMASK(9, 6);
+	}
 	apple_pmp_power_init(&pmp_thermal.power);
 	apple_pmp_cooling_init(&pmp_thermal.cooling);
 	pmp_thermal.guard_level = 8;
-	ret = apple_pmp_add_cluster(0, 0, BIT(0) | GENMASK(9, 7));
+	ret = apple_pmp_add_cluster(0, 0, p_members);
 	if (ret)
 		goto fail;
-	ret = apple_pmp_add_cluster(1, 1, GENMASK(6, 1));
+	ret = apple_pmp_add_cluster(1, 1, e_members);
 	if (ret)
 		goto fail;
 	zone = thermal_zone_device_register_with_trips("apple-pmp-die", apple_pmp_trips,
@@ -718,6 +732,7 @@ static int apple_pmp_thermal_setup(void)
 	pmp_thermal.power_polling = true;
 	schedule_delayed_work(&pmp_thermal.power_work, msecs_to_jiffies(500));
 	pmp_thermal.polling = true;
+	pmp_thermal.fast_poll = true;
 	hrtimer_start(&pmp_thermal.poll_timer, ms_to_ktime(APPLE_PMP_POLL_MS),
 		      HRTIMER_MODE_REL);
 	/* Both guards start at the minimum frequency: hand over the cpufreq cap. */
@@ -728,7 +743,7 @@ static int apple_pmp_thermal_setup(void)
 		if (ret)
 			goto fail;
 	}
-	pr_info("apple-pmp-thermal: J713 provisional policy: CPU/GPU cooling from 106 C, target 110 C, full protection 115 C, three >=120 C samples for shutdown, 5 ms sampling/100 ms governor, shared measured-rail power budget\n");
+	pr_info("apple-pmp-thermal: T8132 provisional policy: CPU/GPU cooling from 106 C, target 110 C, full protection 115 C, three >=120 C samples for shutdown, 5 ms sampling from 95 C or while cooling (100 ms below), 100 ms governor, shared measured-rail power budget\n");
 	pmp_thermal.ready = true;
 	return 0;
 fail:

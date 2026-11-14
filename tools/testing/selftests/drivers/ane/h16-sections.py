@@ -45,7 +45,7 @@ OPERATION_REFS_MAX = (OPERATION_RECORD - 0x0c) // 8
 RESOURCE_KERNEL = 1007
 FIRST_OUTPUT_ID = 4
 # Mach-O CPU subtype to the u32 that opens the task stream.
-PROLOGUE = {7: 1, 9: 0}
+PROLOGUE = {7: (1,), 9: (0, 1)}
 SECTION_NAMES = ("generic.bin", "operation.bin", "procedure.bin", "text-properties.bin")
 # Byte ranges of the H16 register image that task records may name.
 REGISTERS = ((0x0000, 0x005c), (0x4100, 0x41a4), (0x44d0, 0x44d4), (0x4500, 0x453c),
@@ -129,7 +129,7 @@ def register_valid(word):
 
 def walk(stream, prologue):
     """Count the tasks and collect the BAR slots their records reference."""
-    if len(stream) < 16 or len(stream) % 4 or u32(stream, 0) != prologue or any(stream[4:16]):
+    if len(stream) < 16 or len(stream) % 4 or u32(stream, 0) not in prologue or any(stream[4:16]):
         raise HwxError("task stream lacks the prologue of its target")
     pos, tasks, slots = 16, 0, set()
     while pos < len(stream):

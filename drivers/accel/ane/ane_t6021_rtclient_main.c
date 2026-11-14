@@ -4422,6 +4422,10 @@ static const struct ane_t602x_soc ane_t6050_soc = {
 	.platform = &ane_t6050_platform,
 };
 
+static const struct ane_t602x_soc ane_t8142_soc = {
+	.platform = &ane_t8142_platform,
+};
+
 static const struct of_device_id ane_rtclient_of_match[] = {
 	{ .compatible = "apple,t6020-ane", .data = &ane_t6020_soc },
 	{ .compatible = "apple,t6021-ane", .data = &ane_t6021_soc },
@@ -4430,6 +4434,7 @@ static const struct of_device_id ane_rtclient_of_match[] = {
 	{ .compatible = "apple,t6041-ane", .data = &ane_h16_soc },
 	{ .compatible = "apple,t8140-ane", .data = &ane_h17_soc },
 	{ .compatible = "apple,t6050-ane", .data = &ane_t6050_soc },
+	{ .compatible = "apple,t8142-ane", .data = &ane_t8142_soc },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, ane_rtclient_of_match);

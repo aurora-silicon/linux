@@ -21,6 +21,29 @@ const REMOVED: u64 = CLOSED << 1;
 const FAILED: u64 = CLOSED << 2;
 const EPOCH: u64 = CLOSED << 3;
 
+/// The waits of a compute publication, by what they wait for. Diagnostics only: the time an
+/// admission spends in each is reported when its budget runs out.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum AdmissionWait {
+    /// The firmware sources of the packet's dependencies.
+    Sources = 0,
+    /// A compute channel for this owner, including its drain-witness waits.
+    Channel = 1,
+    /// The preparation gate, which only a recovery closes.
+    Preparation = 2,
+    /// A free work state of this context.
+    WorkState = 3,
+    /// A pending recovery.
+    Recovery = 4,
+    /// Room on the shared work ring.
+    OuterRoom = 5,
+    /// Publication backpressure, including the first installation of an M5 queue.
+    Publication = 6,
+}
+
+/// Number of [`AdmissionWait`] kinds.
+pub(super) const ADMISSION_WAITS: usize = 7;
+
 /// One ready packet's monotonic compute-admission budget. The callback checks
 /// packet cancellation, logical close, VM status and device loss even when no
 /// capacity/recovery event arrives. Wakes and nested constructors never renew it.
@@ -28,6 +51,8 @@ pub(super) struct Admission<'a> {
     deadline: Cell<u64>,
     started: u64,
     check: &'a dyn Fn() -> Result,
+    /// Nanoseconds spent in each [`AdmissionWait`] (diagnostics).
+    spent: [Cell<u64>; ADMISSION_WAITS],
 }
 
 /// Bound for a compute publication's waits: a physical compute queue, or room on the shared
@@ -36,7 +61,32 @@ pub(super) const QUEUE_WAIT_NS: u64 = 30_000_000_000;
 
 impl<'a> Admission<'a> {
     pub(super) fn new(deadline: u64, check: &'a dyn Fn() -> Result) -> Self {
-        Self { deadline: Cell::new(deadline), started: super::now_ns(), check }
+        Self {
+            deadline: Cell::new(deadline),
+            started: super::now_ns(),
+            check,
+            spent: core::array::from_fn(|_| Cell::new(0)),
+        }
+    }
+
+    /// Runs one wait of kind `wait`, adding its duration to that kind's total.
+    pub(super) fn timed<T>(&self, wait: AdmissionWait, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let start = super::now_ns();
+        let result = f();
+        let spent = &self.spent[wait as usize];
+        spent.set(spent.get().saturating_add(super::now_ns().saturating_sub(start)));
+        result
+    }
+
+    /// The budget has run out: an EBUSY from this admission's waits is its deadline.
+    pub(super) fn expired(&self) -> bool {
+        super::now_ns() >= self.deadline.get()
+    }
+
+    /// Milliseconds since the start, and in each [`AdmissionWait`] (diagnostics).
+    pub(super) fn spent_ms(&self) -> (u64, [u64; ADMISSION_WAITS]) {
+        let total = super::now_ns().saturating_sub(self.started) / 1_000_000;
+        (total, core::array::from_fn(|wait| self.spent[wait].get() / 1_000_000))
     }
 
     /// A recovery is pending or this owner's spared work drains: wait as long as the

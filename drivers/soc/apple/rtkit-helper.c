@@ -44,6 +44,8 @@ struct apple_rtkit_helper {
 	bool ap_idle;
 	/* It was told, gave no answer, and wasn't told otherwise. */
 	bool idle_unanswered;
+	/* An idle notice that still had no answer when its sleep ended. */
+	bool idle_pending;
 	/* Ends a sleep whose .prepare failed, which gets no .complete. */
 	struct notifier_block pm_nb;
 
@@ -414,6 +416,25 @@ static int apple_rtkit_helper_ap_idle(struct apple_rtkit_helper *helper)
 
 	if (helper->ap_idle)
 		return 0;
+	/*
+	 * A firmware that never answered the last idle notice still holds it: T8142's MTP
+	 * asserts on a second ("Invalid AP power") and takes the keyboard and trackpad with
+	 * it. Refuse this sleep instead, unless the answer has come since; then the AP on
+	 * the last sleep's end skipped goes first.
+	 */
+	if (helper->idle_pending) {
+		if (apple_rtkit_is_running(helper->rtk)) {
+			dev_err(helper->dev, "the last AP idle notice is still unanswered: no sleep\n");
+			return -EBUSY;
+		}
+		helper->idle_pending = false;
+		dev_info(helper->dev, "the last AP idle notice was answered late, sending AP on first\n");
+		if (apple_rtkit_ap_power(helper->rtk, true)) {
+			dev_err(helper->dev, "AP on after the late answer not answered: no sleep\n");
+			helper->idle_pending = true;
+			return -EBUSY;
+		}
+	}
 	ret = apple_rtkit_helper_ap_power(helper, false);
 	if (ret)
 		return ret;
@@ -452,6 +473,8 @@ static void apple_rtkit_helper_sleep_end(struct apple_rtkit_helper *helper)
 			 late ? "its answer came late, sending AP on" :
 				"still no answer, nothing sent");
 		helper->ap_idle = late;
+		/* Its answer may still come: the next sleep looks again before sending another. */
+		helper->idle_pending = !late;
 	}
 	apple_rtkit_helper_ap_on(helper);
 }
