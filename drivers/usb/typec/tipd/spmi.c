@@ -25,6 +25,8 @@
 /* Failed tries to sleep before it waits for the next access */
 #define SN201202X_SLEEP_TRIES		3
 
+#define SN201202X_REG_VID		0x00
+#define SN201202X_REG_POWER_STATE	0x20
 #define SN201202X_REG_LDCM_STATUS	0x74
 #define SN201202X_LDCM_MITIGATE		BIT(6)
 #define SN201202X_LDCM_DETECTED		BIT(2)
@@ -558,6 +560,12 @@ static int sn201202x_wake(struct sn201202x *sn)
 	return sn201202x_wake_poll(sn, sn->polled);
 }
 
+/* For the commands the core gives only to a controller just woken */
+static int sn201202x_cmd_wake(struct tps6598x *tps)
+{
+	return sn201202x_wake(tps_to_sn(tps));
+}
+
 VISIBLE_IF_KUNIT int __maybe_unused sn201202x_runtime_suspend(struct device *dev)
 {
 	struct tps6598x *tps = dev_get_drvdata(dev);
@@ -711,6 +719,55 @@ static bool sn201202x_sleep_event(struct tps6598x *tps)
 	return true;
 }
 
+/*
+ * On the J714s, the board this has run on, a controller with no connector (its MagSafe one,
+ * hpm5) only follows the system's sleep: woken, SSPS 3 and SLEEP before the commit, SSPS 0 and
+ * SLEEP at the wake, and asleep between them. No Type-C port, power supply or poller is
+ * registered for it. On every other machine, other boards with the same SoC included, such a
+ * controller is probed as before, and the two lines below (the probe's and the sleep command's
+ * result) are not printed.
+ */
+static bool sn201202x_j714s(void)
+{
+	return of_machine_is_compatible("apple,j714s");
+}
+
+static int sn201202x_sleep_only_probe(struct sn201202x *sn)
+{
+	struct tps6598x *tps = &sn->cd.tps;
+	u32 vid = 0;
+	u8 state = 0xff;
+	int ret;
+
+	ret = tps6598x_block_read(tps, SN201202X_REG_VID, &vid, sizeof(vid));
+	if (!ret)
+		ret = tps6598x_block_read(tps, SN201202X_REG_POWER_STATE, &state, 1);
+	spmi_command_sleep(sn->sdev);
+	if (ret || !vid)
+		return dev_err_probe(tps->dev, ret ?: -ENODEV, "no connector: vendor ID %#x\n", vid);
+	dev_info(tps->dev, "no connector: vendor ID %#x, power state %u; sleep state only\n",
+		 vid, state);
+	return 0;
+}
+
+static int sn201202x_sleep_only_state(struct sn201202x *sn, u8 target)
+{
+	struct tps6598x *tps = &sn->cd.tps;
+	int ret, sleep_ret;
+
+	if (!pm_suspend_via_firmware() || !device_property_read_bool(tps->dev, "apple,sleep-ssps"))
+		return 0;
+	ret = sn201202x_wake(sn);
+	if (!ret) {
+		guard(mutex)(&tps->lock);
+		ret = tps->data->switch_power_state(tps, target);
+	}
+	sleep_ret = spmi_command_sleep(sn->sdev);
+	/* As SSPS on the ports: a failure only logs. */
+	dev_info(tps->dev, "system power state %u: %d, SLEEP %d\n", target, ret, sleep_ret);
+	return 0;
+}
+
 static int sn201202x_probe(struct spmi_device *device)
 {
 	const struct of_device_id *match;
@@ -747,6 +804,7 @@ static int sn201202x_probe(struct spmi_device *device)
 	if (!sn)
 		return -ENOMEM;
 	sn->sdev = device;
+	sn->sleep_only = !fwnode && sn201202x_j714s();
 	tps = &sn->cd.tps;
 
 	mutex_init(&tps->lock);
@@ -807,6 +865,7 @@ static int sn201202x_probe(struct spmi_device *device)
 	if (!sn->polled && sn->select_polled)
 		tps->sleep_event = sn201202x_sleep_event;
 
+	tps->wake = sn201202x_cmd_wake;
 	spmi_device_set_drvdata(device, tps);
 	tps->regmap = devm_regmap_init_sn201202x(device, &tps6598x_regmap_config);
 	if (IS_ERR(tps->regmap))
@@ -815,6 +874,8 @@ static int sn201202x_probe(struct spmi_device *device)
 	ret = sn201202x_wake(sn);
 	if (ret)
 		return ret;
+	if (sn->sleep_only)
+		return sn201202x_sleep_only_probe(sn);
 
 	ret = tipd_init(tps);
 	if (ret) {
@@ -828,6 +889,8 @@ static int sn201202x_probe(struct spmi_device *device)
 	tps->data->irq_handler(tps->irq, tps);
 
 	sn201202x_idle_sleep_start(tps);
+	if (sn201202x_j714s())
+		dev_info(tps->dev, "port controller ready%s\n", sn->polled ? ", polled" : "");
 	return 0;
 }
 
@@ -836,6 +899,9 @@ static void sn201202x_remove(struct spmi_device *device)
 	struct tps6598x *tps = spmi_device_get_drvdata(device);
 	struct sn201202x *sn = tps_to_sn(tps);
 
+	/* Asleep since its probe or its last sleep transition */
+	if (sn->sleep_only)
+		return;
 	sn201202x_idle_sleep_stop(tps);
 	tipd_remove(tps);
 	spmi_command_sleep(sn->sdev);
@@ -847,6 +913,8 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_resume(struct device *dev)
 	struct sn201202x *sn = tps_to_sn(tps);
 	int err;
 
+	if (sn->sleep_only)
+		return sn201202x_sleep_only_state(sn, TPS_SYSTEM_POWER_STATE_S0);
 	if (READ_ONCE(sn->sleep_watch)) {
 		/* Waits for a running sleep_event() */
 		disable_irq(tps->irq);
@@ -880,6 +948,8 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_suspend(struct device *dev)
 	bool watch;
 	int err, ret;
 
+	if (sn->sleep_only)
+		return sn201202x_sleep_only_state(sn, TPS_SYSTEM_POWER_STATE_S3);
 	/*
 	 * A sleeping controller cannot be read, so its events must not be
 	 * handled until it is awake again. An interrupt arriving meanwhile is
@@ -918,6 +988,8 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_suspend(struct device *dev)
 	tipd_usb_wake(tps, true);
 	reinit_completion(&sn->sleep_completion);
 	err = spmi_command_sleep(sn->sdev);
+	if (pm_suspend_via_firmware() && sn201202x_j714s())
+		dev_info(dev, "SLEEP: %d\n", err);
 	if (err)
 		goto out_resume;
 	if (!sn->polled &&
@@ -952,6 +1024,8 @@ static int sn201202x_prepare(struct device *dev)
 	struct sn201202x *sn = tps_to_sn(tps);
 	int ret;
 
+	if (sn->sleep_only)
+		return 0;
 	cancel_delayed_work_sync(&sn->ldcm_work);
 	mutex_lock(&tps->lock);
 	ret = sn201202x_ldcm_update(tps);
@@ -968,13 +1042,21 @@ static int sn201202x_prepare(struct device *dev)
 		dev_warn(tps->dev,
 			 "connector state unavailable; entering sleep mitigated: %d\n",
 			 ret);
-	return tipd_prepare(dev);
+	ret = tipd_prepare(dev);
+	/* Refused there and completed again: the detector's snapshot as after a wake. */
+	if (ret) {
+		scoped_guard(mutex, &tps->lock)
+			sn201202x_ldcm_refresh(tps);
+	}
+	return ret;
 }
 
 static void sn201202x_complete(struct device *dev)
 {
 	struct tps6598x *tps = dev_get_drvdata(dev);
 
+	if (tps_to_sn(tps)->sleep_only)
+		return;
 	/* Refresh the detector snapshot before cable revalidation is thawed. */
 	scoped_guard(mutex, &tps->lock)
 		sn201202x_ldcm_refresh(tps);
