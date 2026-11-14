@@ -19,6 +19,7 @@ mod der;
 mod diag;
 mod dt;
 mod fv;
+mod hibe;
 mod hwrng;
 mod image;
 mod key;
@@ -38,7 +39,9 @@ mod scrd;
 mod sensor;
 mod shim;
 mod shmem;
+mod skdl;
 mod sks;
+mod sse;
 mod stac;
 mod store;
 mod transfer;
@@ -830,6 +833,15 @@ struct SepData {
     pnon_named: Atomic<bool>,
     pnon_layout: Atomic<u32>,
     pnon_done: Atomic<bool>,
+
+    // What discovery said about the endpoints the driver checks and sends
+    // nothing to (see `sse`, `hibe`, `skdl`).
+    sse_named: Atomic<bool>,
+    sse_layout: Atomic<u32>,
+    hibe_named: Atomic<bool>,
+    hibe_layout: Atomic<u32>,
+    skdl_named: Atomic<bool>,
+    skdl_layout: Atomic<u32>,
     #[pin]
     scrd_probe: Mutex<ScrdProbe>,
     #[pin]
@@ -1236,6 +1248,12 @@ impl SepData {
                 pnon_named: Atomic::new(false),
                 pnon_layout: Atomic::new(0),
                 pnon_done: Atomic::new(false),
+                sse_named: Atomic::new(false),
+                sse_layout: Atomic::new(0),
+                hibe_named: Atomic::new(false),
+                hibe_layout: Atomic::new(0),
+                skdl_named: Atomic::new(false),
+                skdl_layout: Atomic::new(0),
                 dma_ring <- new_mutex!(Some(dma_ring)),
                 sbio_exchange_lock <- new_mutex!(()),
                 sbio_rx <- new_mutex!(transfer::Reassembly::new()),
@@ -2974,6 +2992,10 @@ impl SepData {
         Self::queue_stac_online(this.clone());
         // The enclave's account of the LocalPolicy that admitted this boot.
         Self::queue_pnon_digest(this.clone());
+        // As macOS does at boot, these are checked and sent nothing.
+        this.sse_attach();
+        this.hibe_attach();
+        this.skdl_attach();
         Self::arm_settle(this);
     }
 
@@ -3113,6 +3135,12 @@ impl SepData {
 
             pnon::EP_PNON => self.on_pnon(msg),
 
+            sse::EP_SSE => self.on_sse(msg),
+
+            hibe::EP_HIBE => self.on_hibe(msg),
+
+            skdl::EP_SKDL => self.on_skdl(msg),
+
             proto::EP_BOOT => self.on_boot(msg),
 
             ep => {
@@ -3160,6 +3188,9 @@ impl SepData {
                 let _ = table.slot(f.param);
                 self.stac_discovered(&f);
                 self.pnon_discovered(&f);
+                self.sse_discovered(&f);
+                self.hibe_discovered(&f);
+                self.skdl_discovered(&f);
                 diag::endpoints(table.eps.len());
                 if f.ty == proto::DISCOVER_TYPE_DESCRIPTOR {
                     diag::endpoint(f.param, (msg.msg0 >> 32) as u32);

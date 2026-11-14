@@ -19,4 +19,10 @@ int apple_pcie_tunnel_restore(struct device *dev);
 int apple_pcie_tunnel_check_state(struct device *dev);
 bool apple_pcie_tunnel_link_kept(struct device *dev);
 
+/* NHI prepares/finishes; PCIe device noirq callbacks own the port and DART. */
+int apple_pcie_tunnel_cio_prepare(struct device *dev);
+bool apple_pcie_tunnel_cio_stopped(struct device *dev);
+void apple_pcie_tunnel_cio_lost(struct device *dev);
+int apple_pcie_tunnel_cio_finish(struct device *dev);
+
 #endif /* _LINUX_PCI_APPLE_H */

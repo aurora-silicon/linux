@@ -80,6 +80,8 @@ enum apple_smc_boot_stage {
 	APPLE_SMC_ERROR_CRASHED
 };
 
+struct apple_smc_wake_reason;
+
 /**
  * struct apple_smc
  * @dev: Underlying device struct for the physical backend device
@@ -122,6 +124,8 @@ struct apple_smc {
 	bool polled;
 	/* MBSW at the last wake: what the SMC had woken the AP for. */
 	u64 wake_record;
+	/* MBSW's bits as this SoC numbers them, from the probe. */
+	const struct apple_smc_wake_reason *wake_reasons;
 
 	struct completion init_done;
 	enum apple_smc_boot_stage boot_stage;

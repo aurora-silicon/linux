@@ -100,7 +100,7 @@ const FW_REGION_MAX_SIZE: u64 = 0x10_0000;
 /// The DART page size the firmware segments are mapped with.
 const FW_REGION_PAGE: u64 = 0x4000;
 const AFK_ENDPOINT_START: u8 = 0x20;
-const AFK_ENDPOINT_COUNT: u8 = 0xf;
+const AFK_ENDPOINT_COUNT: u8 = 0x11;
 const AFK_OPC_GET_BUF: u64 = 0x89;
 const AFK_OPC_INIT: u64 = 0x80;
 const AFK_OPC_INIT_RX: u64 = 0x8b;

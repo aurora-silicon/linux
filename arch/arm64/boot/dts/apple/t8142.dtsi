@@ -128,6 +128,14 @@
 		interrupt-names = "phys", "virt", "hyp-phys", "hyp-virt";
 	};
 
+	cpu_pmu: pmu {
+		status = "disabled";
+		compatible = "apple,t8142-pmu";
+		interrupt-parent = <&aic>;
+		/* The AIC raises both clusters' PMU FIQs as this one, as on T8140. */
+		interrupts = <AIC_FIQ AIC_CPU_PMU_P IRQ_TYPE_LEVEL_HIGH>;
+	};
+
 	clkref: clock-ref {
 		compatible = "fixed-clock";
 		#clock-cells = <0>;

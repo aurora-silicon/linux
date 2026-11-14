@@ -9,6 +9,8 @@
  * Copyright The Asahi Linux Contributors
  */
 
+/* Defined before the includes: t6050-max.dtsi guards the ATC2 router on it. */
+#define T6050_K114C
 #include "t6050-k114-k116.dtsi"
 
 / {
@@ -20,7 +22,6 @@
 	firmware-name = "apple/tpmtfw-k114c.bin";
 };
 
-#define T6050_K114C
 #include "t6050-peripherals.dtsi"
 
 / {
@@ -432,14 +433,14 @@
 };
 
 /*
- * ==== The right USB-C port (ATC2), USB only ====
+ * ==== The right USB-C port (ATC2) ====
  *
  * ADT /arm-io/nub-spmi-a1/hpm2 (SN201202x, SPMI address 0xc, port-number 3, port-location
  * "right", acio-parent acio2), with atc-phy2, usb-drd2 and dart-usb2. The HPM is on its own
  * bus, nub-spmi-a1, and nothing hands the port off, so the power domains, the PHY mailbox, the
  * PHY, the DWC3 and its DARTs are enabled outright, as t6050-max-atc2.dtsi does for the J714c
- * and J716c. The USB4/Thunderbolt router (acio2), the PCIe tunnel and the DisplayPort route
- * are not described; the PHY runs in USB mode.
+ * and J716c. Its USB4/Thunderbolt router (acio2) and PCIe tunnel are
+ * t6050-max-atc2-router.dtsi, included below; the DisplayPort route is not described.
  */
 / {
 	aliases {
@@ -530,4 +531,53 @@
 			};
 		};
 	};
+};
+
+#include "t6050-max-atc2-router.dtsi"
+
+/* The host DROM from the K114cAP ADT (/arm-io/acio2 thunderbolt-drom); the boot loader replaces it */
+&acio2_nhi {
+	apple,thunderbolt-drom = [fd 02 00 00 00 00 00 00 00 90 19 c3 8c 00 5c 00
+			00 00 00 00 00 00 08 81 82 02 82 00 00 00 08 82
+			92 01 82 00 00 00 03 83 20 08 84 00 00 00 00 00
+			00 08 85 00 00 00 00 00 00 05 86 09 01 00 08 87
+			00 00 00 00 00 00 05 88 09 01 00 05 89 09 01 00
+			05 8a 09 01 00 0e 01 41 70 70 6c 65 2c 20 49 6e
+			63 2e 00 06 02 69 4f 53 00 00 00 00];
+};
+
+/* The right router's suppliers, disabled in the inventory (as t6050-j714s-display.dtsi enables them) */
+&ps_atc2_cio {
+	status = "okay";
+};
+
+&ps_atc2_cio_pcie {
+	status = "okay";
+};
+
+&ps_atc2_cio_usb {
+	status = "okay";
+};
+
+&ps_atc2_cio_auss {
+	status = "okay";
+};
+
+&ps_atc2_pcie {
+	status = "okay";
+};
+
+/*
+ * The router and its mailbox are on, with all five domains and the PCIe tunnel, whether or not
+ * t6050-max.dtsi leaves acio2 disabled and without the fifth domain for boards outside its list.
+ */
+&acio2_mbox {
+	status = "okay";
+};
+
+&acio2 {
+	status = "okay";
+	power-domains = <&ps_atc2_cio>, <&ps_atc2_cio_pcie>,
+			<&ps_atc2_cio_usb>, <&ps_atc2_cio_auss>, <&ps_atc2_pcie>;
+	apple,pcie-tunnel = <&acio2_pcie_tunnel>;
 };

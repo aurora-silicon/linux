@@ -62,6 +62,10 @@ pub(crate) struct Variant {
     pub(crate) mcache: bool,
     /// Renders may set the few-primitives auxiliary framebuffer flag.
     pub(crate) few_primitives: bool,
+    /// Renders may carry DRM_ASAHI_RENDER_STAGE_PREFIXES: the tiling kick waits on its own,
+    /// narrower render and compute prefixes, the fragment kick on the whole ones. The M5
+    /// command set accepts them in its own validation.
+    pub(crate) render_stage_prefixes: bool,
     /// The firmware runs ray-traversal work (ray queries and intersection programs).
     pub(crate) ray_traversal: bool,
     /// Renders may carry ray-query stages. The M5 command set has none: it encodes no render
@@ -126,6 +130,7 @@ pub(crate) const V26A428: Variant = Variant {
     registration: QueueRegistration::PoweredRenderPairs,
     mcache: true,
     few_primitives: true,
+    render_stage_prefixes: true,
     ray_traversal: true,
     render_ray_query: true,
     fragment_busy: true,
@@ -158,6 +163,8 @@ pub(crate) const V25G83: Variant = Variant {
     mcache: false,
     // A fragment stage with the few-primitives flag hangs.
     few_primitives: false,
+    // Not measured on this firmware.
+    render_stage_prefixes: false,
     ray_traversal: true,
     render_ray_query: true,
     // When a tiling pass runs out of memory with this set, the firmware resumes it without

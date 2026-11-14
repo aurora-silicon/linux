@@ -45,6 +45,20 @@ static void ave_recovery_wrap_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, ave_recovery_allow(&h, start + AVE_RECOVERY_WINDOW));
 }
 
+/* A clean session end gives the next hang the full budget again. */
+static void ave_recovery_reset_test(struct kunit *test)
+{
+	struct ave_recovery_history h = {};
+
+	for (unsigned int i = 0; i < AVE_RECOVERY_ATTEMPTS; i++)
+		KUNIT_ASSERT_TRUE(test, ave_recovery_allow(&h, i));
+	KUNIT_ASSERT_FALSE(test, ave_recovery_allow(&h, AVE_RECOVERY_ATTEMPTS));
+	ave_recovery_reset(&h);
+	for (unsigned int i = 0; i < AVE_RECOVERY_ATTEMPTS; i++)
+		KUNIT_EXPECT_TRUE(test, ave_recovery_allow(&h, 10 + i));
+	KUNIT_EXPECT_FALSE(test, ave_recovery_allow(&h, 20));
+}
+
 static void ave_recovery_domain_test(struct kunit *test)
 {
 	KUNIT_EXPECT_TRUE(test, ave_domain_type_safe(IOMMU_DOMAIN_DMA));
@@ -89,6 +103,7 @@ static struct kunit_case ave_recovery_cases[] = {
 	KUNIT_CASE(ave_recovery_witness_dart_test),
 	KUNIT_CASE(ave_recovery_domain_test),
 	KUNIT_CASE(ave_recovery_limit_test),
+	KUNIT_CASE(ave_recovery_reset_test),
 	KUNIT_CASE(ave_recovery_sliding_test),
 	KUNIT_CASE(ave_recovery_wrap_test),
 	{}
