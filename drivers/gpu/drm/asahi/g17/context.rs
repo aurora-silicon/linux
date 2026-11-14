@@ -238,6 +238,9 @@ pub(crate) struct Context {
     /// Fixed for the context's life. Physical queues bound to it carry this
     /// profile in every record, ring, doorbell and registration.
     policy: Policy,
+    /// This logical queue's use of the execution context its VM's queues share
+    /// (`super::exec_share`); `None` on M5.
+    share: Option<super::exec_share::Use>,
 }
 impl Context {
     #[expect(
@@ -253,6 +256,7 @@ impl Context {
         policy: Policy,
         state_returns: Arc<super::availability::Availability>,
         compute_returns: Arc<super::availability::Availability>,
+        share: Option<super::exec_share::Use>,
     ) -> Result<Self> {
         let status = execution.vm().status().ok_or(EINVAL)?.clone();
         let hold = execution.hold(super::channel::control_fence)?;
@@ -335,7 +339,10 @@ impl Context {
             render_seen: AtomicBool::new(false),
             qos,
             owner_pid,
-            states: WorkStates::new(),
+            states: match &share {
+                Some(share) => WorkStates::shared(share.claims().clone()),
+                None => WorkStates::new(),
+            },
             state_returns,
             compute_returns,
             order,
@@ -345,6 +352,7 @@ impl Context {
             render_blocks: AtomicUsize::new(super::fw::freelist::RENDER_BLOCKS),
             compute_timestamps: super::completion::ComputeTimestampCache::new()?,
             policy,
+            share,
         })
     }
     pub(crate) fn vm(&self) -> &Vm {
@@ -420,7 +428,10 @@ impl Context {
     /// Scheduler release and command retirement have both been witnessed.
     /// Keep installed storage alive while returning the finite TTBAT identity.
     pub(crate) fn release_execution(&self) {
-        self.execution.release();
+        match &self.share {
+            Some(share) => share.release_execution(),
+            None => self.execution.release(),
+        }
     }
     pub(crate) fn scheduler_generation(&self) -> u32 {
         self.scheduler_generation
