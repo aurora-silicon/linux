@@ -372,6 +372,72 @@ bool iomfb_channels_idle(struct apple_dcp *dcp)
 	       !dcp->ch_async.depth && !dcp->ch_oobasync.depth;
 }
 
+/* w86 lever: send the opaque-X property on firmware 27 and apply_property on demand. */
+static unsigned int w88_opaque_x_v27;
+module_param_named(w88_opaque_x_v27, w88_opaque_x_v27, uint, 0644);
+MODULE_PARM_DESC(w88_opaque_x_v27, "Send the opaque-X property on firmware 27 internal DCPs (default 0)");
+
+static struct apple_dcp *w88_prop_dcp;
+
+struct w88_prop_transaction {
+	struct iomfb_transaction transaction;
+	u32 id;
+	u32 value;
+};
+
+static void w88_prop_complete(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	struct w88_prop_transaction *prop = cookie;
+	u32 status = out ? *(u32 *)out : ~0U;
+
+	dev_info(dcp->dev, "w88-prop: id 0x%x value 0x%x status %u\n",
+		 prop->id, prop->value, status);
+}
+
+static void w88_prop_start(struct apple_dcp *dcp, struct iomfb_transaction *transaction)
+{
+	struct w88_prop_transaction *prop = container_of(transaction,
+							 struct w88_prop_transaction,
+							 transaction);
+
+	iomfb_apply_property_h17p(dcp, prop->id, prop->value, w88_prop_complete, prop);
+}
+
+static void w88_prop_release(struct iomfb_transaction *transaction)
+{
+	kfree(container_of(transaction, struct w88_prop_transaction, transaction));
+}
+
+static int w88_prop_send_set(const char *val, const struct kernel_param *kp)
+{
+	struct apple_dcp *dcp = READ_ONCE(w88_prop_dcp);
+	struct w88_prop_transaction *prop;
+	unsigned int id, value;
+	int ret;
+
+	if (sscanf(val, "%i %i", &id, &value) != 2)
+		return -EINVAL;
+	if (!dcp)
+		return -ENODEV;
+	prop = kzalloc_obj(*prop);
+	if (!prop)
+		return -ENOMEM;
+	prop->id = id;
+	prop->value = value;
+	prop->transaction.start = w88_prop_start;
+	prop->transaction.release = w88_prop_release;
+	ret = iomfb_queue(dcp, &prop->transaction);
+	if (ret)
+		kfree(prop);
+	return ret;
+}
+
+static const struct kernel_param_ops w88_prop_send_ops = {
+	.set = w88_prop_send_set,
+};
+module_param_cb(w88_prop_send, &w88_prop_send_ops, NULL, 0200);
+MODULE_PARM_DESC(w88_prop_send, "Write \"<id> <value>\" to send one apply_property to the internal DCP (debug)");
+
 enum iomfb_opaque_x_state {
 	IOMFB_OPAQUE_X_WAITING,
 	IOMFB_OPAQUE_X_NEEDED,
@@ -396,7 +462,7 @@ static int iomfb_enqueue_opaque_x(struct apple_dcp *dcp)
 	if (dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		return 0;
-	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 ||
+	if ((dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !w88_opaque_x_v27) ||
 	    atomic_read(&dcp->iomfb.opaque_x_state) != IOMFB_OPAQUE_X_NEEDED)
 		return 0;
 	if (dcp->iomfb.queued >= 32)
@@ -482,6 +548,8 @@ static void iomfb_queue_work(struct work_struct *work)
 	struct apple_dcp *dcp = container_of(work, struct apple_dcp, iomfb.work);
 	struct iomfb_transaction *transaction;
 
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17P_EXTERNAL)
+		WRITE_ONCE(w88_prop_dcp, dcp);
 	mutex_lock(&dcp->iomfb.lock);
 	if (READ_ONCE(dcp->crashed) || dcp->iomfb.stopped) {
 		iomfb_discard_pending(dcp);
