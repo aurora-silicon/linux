@@ -47,6 +47,18 @@
 //! reserved: under the identity bag the only passcode is the identity bag's
 //! secret, which root holds.
 //!
+//! With `FEATURE_USER_POLICIES`, `CREATE_USER` also makes the other macOS
+//! policies under the user's bag: `.biometryCurrentSet` / `.biometryAny`
+//! (Touch ID only; the password calls refuse the key) and
+//! `.biometry* | .and | .devicePasscode` (`CREATE_AND`): a flat two-of-two
+//! constraint (`pkofn` 2 over `cbio` and `cup`) that the enclave satisfies
+//! only from one context holding both a match it saw and the bag's password
+//! credential. `SIGN_PASSWORD` / `UNSEAL_PASSWORD` on such a key wait for
+//! the match, have the enclave verify the password into that same context,
+//! then run the one operation (`ENOKEY` when the enclave refuses the
+//! password; `EACCES` stays a finger that did not match); `SIGN` / `UNSEAL`
+//! refuse it before a touch.
+//!
 //! macOS's `.userPresence` (Touch ID or the password) and `.devicePasscode`
 //! need a passcode credential the enclave checks against the user's own
 //! secret. On Linux the only passcode the enclave knows today is the identity
@@ -83,6 +95,10 @@ pub(crate) const FEATURE_PASSWORD: u32 = 4;
 /// enclave keeps no anti-replay record for it), so a FIDO PIN retry budget
 /// built on it would not be root-proof. aurora-fido offers no PIN without it.
 pub(crate) const FEATURE_PERSISTENT_ATTEMPTS: u32 = 8;
+/// `INFO.features` (with `FEATURE_PASSWORD`): `CREATE_USER` also takes the
+/// biometric policies (`CREATE_BIOMETRY_*`) and macOS's
+/// `.biometry* | .and | .devicePasscode` (`CREATE_USER_AND_FLAGS`).
+pub(crate) const FEATURE_USER_POLICIES: u32 = 0x10;
 /// The longest password `SIGN_PASSWORD` / `UNSEAL_PASSWORD` take, as the
 /// key-bag ioctls.
 pub(crate) const PASSWORD_MAX: usize = crate::userbag::SECRET_MAX;
@@ -108,12 +124,66 @@ pub(crate) const CREATE_BIOMETRY_ANY: u32 = 2;
 /// password (see the module comment).
 pub(crate) const CREATE_USER_PRESENCE: u32 = 4;
 pub(crate) const CREATE_DEVICE_PASSCODE: u32 = 8;
+/// `CREATE_USER` flag (`FEATURE_USER_POLICIES`): macOS's `.and`. Taken only
+/// as `CREATE_BIOMETRY_* | CREATE_DEVICE_PASSCODE | CREATE_AND`: every use
+/// needs a Touch ID match and the bag's password in the same context.
+pub(crate) const CREATE_AND: u32 = 0x10;
 const CREATE_FLAGS: u32 = CREATE_BIOMETRY_CURRENT_SET | CREATE_BIOMETRY_ANY;
-/// `CREATE_USER` flags (version 4): `.userPresence` under the user's bag;
-/// 0 makes a key with no list there, usable exactly while the bag is unlocked.
-const CREATE_USER_FLAGS: u32 = CREATE_USER_PRESENCE;
+/// Every bit `CREATE_USER` knows.
+const CREATE_USER_FLAGS: u32 = CREATE_FLAGS | CREATE_USER_PRESENCE | CREATE_DEVICE_PASSCODE | CREATE_AND;
 const CREATE_USER_PLAIN: u32 = 0;
 const CREATE_RESERVED: u32 = CREATE_USER_PRESENCE | CREATE_DEVICE_PASSCODE;
+
+/// The access policy a `CREATE_USER` request asks for, under the user's bag.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum UserPolicy {
+    /// Flags 0: no list; usable exactly while the bag is unlocked.
+    Plain,
+    /// `.userPresence`: Touch ID or the bag's password.
+    Presence,
+    /// `.biometryCurrentSet` / `.biometryAny`: Touch ID only.
+    Biometry { any: bool },
+    /// `.biometry* | .and | .devicePasscode`: Touch ID and the bag's password.
+    BiometryAndPasscode { any: bool },
+}
+
+/// Parses `CREATE_USER` flags. `user_policies` is whether this kernel takes
+/// the biometric and AND policies (`FEATURE_USER_POLICIES`). `.devicePasscode`
+/// alone and the OR form stay reserved (`EOPNOTSUPP`).
+pub(crate) fn create_user_policy(flags: u32, user_policies: bool) -> Result<UserPolicy> {
+    const AND_CURRENT: u32 = CREATE_BIOMETRY_CURRENT_SET | CREATE_DEVICE_PASSCODE | CREATE_AND;
+    const AND_ANY: u32 = CREATE_BIOMETRY_ANY | CREATE_DEVICE_PASSCODE | CREATE_AND;
+    if flags & !CREATE_USER_FLAGS != 0 {
+        return Err(EINVAL);
+    }
+    let p = match flags {
+        CREATE_USER_PLAIN => return Ok(UserPolicy::Plain),
+        CREATE_USER_PRESENCE => return Ok(UserPolicy::Presence),
+        CREATE_BIOMETRY_CURRENT_SET => UserPolicy::Biometry { any: false },
+        CREATE_BIOMETRY_ANY => UserPolicy::Biometry { any: true },
+        AND_CURRENT => UserPolicy::BiometryAndPasscode { any: false },
+        AND_ANY => UserPolicy::BiometryAndPasscode { any: true },
+        CREATE_DEVICE_PASSCODE => return Err(EOPNOTSUPP),
+        _ => return Err(EINVAL),
+    };
+    if !user_policies {
+        return Err(EOPNOTSUPP);
+    }
+    Ok(p)
+}
+
+/// The version-2 handle flags for a key made with `policy`.
+pub(crate) fn user_handle_flags(policy: UserPolicy) -> u8 {
+    HANDLE_USER_BAG
+        | match policy {
+            UserPolicy::Plain => HANDLE_USER_PLAIN,
+            UserPolicy::Presence => 0,
+            UserPolicy::Biometry { any } => HANDLE_BIOMETRY | if any { HANDLE_BIOMETRY_ANY } else { 0 },
+            UserPolicy::BiometryAndPasscode { any } => {
+                HANDLE_BIOMETRY | HANDLE_AND_PASSCODE | if any { HANDLE_BIOMETRY_ANY } else { 0 }
+            }
+        }
+}
 
 /// The access policy a `CREATE` request asks for: at most one policy bit.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -157,6 +227,10 @@ pub(crate) const HANDLE_USER_BAG: u8 = 0x04;
 /// works with no touch and no password, but only while the bag is unlocked
 /// (protection class 9: the enclave refuses while it is locked).
 pub(crate) const HANDLE_USER_PLAIN: u8 = 0x08;
+/// Handle flag, with `HANDLE_USER_BAG | HANDLE_BIOMETRY` only: the list
+/// needs a Touch ID match and the bag's password together (`pkofn` 2).
+/// `HANDLE_BIOMETRY` alone under a user bag is a biometric-only list.
+pub(crate) const HANDLE_AND_PASSCODE: u8 = 0x10;
 const HANDLE_VERSION_USER: u8 = 2;
 const HANDLE_HEADER_USER: usize = 16;
 /// The largest enclave record a handle can carry.
@@ -324,6 +398,22 @@ pub(crate) const SELFTEST_USERBAG_KEY_MAKE: u32 = 11;
 /// password is the NUL-padded `digest` (at most 32 bytes). `result` = the
 /// signature, `result2` = the verify-secret status.
 pub(crate) const SELFTEST_USERBAG_KEY_USE: u32 = 12;
+/// The three-arm check of an AND key (`.biometry* | .and | .devicePasscode`
+/// under a user's bag; its version-2 handle in the handle buffer). Each
+/// one-credential arm must be refused by the enclave itself; the kernel's
+/// own refusal of `SIGN` on such a key is bypassed here. Arm C (both
+/// credentials) is the production `SIGN_PASSWORD` path.
+/// Arm A, needs a finger: one Touch ID match into a fresh context, no
+/// password, then sign. `result`/`enclave_status` = the signature.
+pub(crate) const SELFTEST_AND_MATCH_ONLY: u32 = 13;
+/// Arm B, no finger: a fresh context for the bag's user holding only the
+/// bag's password credential (the password is the NUL-padded `digest`;
+/// the kernel wipes it), then sign a fixed digest. `result2` = the
+/// verify-secret status (must be 0 for the arm to count), `result` /
+/// `enclave_status` = the signature.
+pub(crate) const SELFTEST_AND_PASSWORD_ONLY: u32 = 14;
+/// Control, no finger: a fresh context with neither credential, then sign.
+pub(crate) const SELFTEST_AND_NEITHER: u32 = 15;
 /// One touch: sign in the matched context, then sign again in the same,
 /// still open context (`result2`). Measures whether one match lets the
 /// enclave do more than one operation (needs a finger).
@@ -559,18 +649,38 @@ pub(crate) fn check_unseal(req: &Seal) -> Result<(Handle<'_>, &[u8])> {
     Ok((h, sealed))
 }
 
-pub(crate) fn check_create_user(req: &CreateUser) -> Result<bool> {
-    if req.reserved != [0; 3] || req.flags & !CREATE_USER_FLAGS != 0 {
+/// The request's shape only; whether this kernel offers the biometric and
+/// AND policies is checked when it runs (`FEATURE_USER_POLICIES`).
+pub(crate) fn check_create_user(req: &CreateUser) -> Result<UserPolicy> {
+    if req.reserved != [0; 3] {
         return Err(EINVAL);
     }
+    let policy = create_user_policy(req.flags, true)?;
     bag_user(req.uid)?;
-    Ok(req.flags == CREATE_USER_PLAIN)
+    Ok(policy)
 }
 
-/// A password call takes only a user-presence key under a user's bag.
+/// A key whose list needs a Touch ID match and the password together.
+pub(crate) fn is_and_handle(h: &Handle<'_>) -> bool {
+    h.uid.is_some() && h.flags & HANDLE_AND_PASSCODE != 0
+}
+
+/// `SIGN` and `UNSEAL` carry no password, so an AND key's list can never be
+/// satisfied by them: refused before a touch is asked for (use
+/// `SIGN_PASSWORD` / `UNSEAL_PASSWORD`, which take both).
+fn refuse_and_without_password(h: &Handle<'_>) -> Result<()> {
+    if is_and_handle(h) {
+        return Err(EINVAL);
+    }
+    Ok(())
+}
+
+/// A password call takes a user-presence key (Touch ID or the password) or
+/// an AND key (Touch ID and the password) under a user's bag; never a key
+/// with no list or a biometric-only one, whose list has no password clause.
 fn check_password_handle(h: &Handle<'_>) -> Result<u32> {
     let uid = h.uid.ok_or(EINVAL)?;
-    if h.flags & HANDLE_USER_PLAIN != 0 {
+    if h.flags != HANDLE_USER_BAG && !is_and_handle(h) {
         return Err(EINVAL);
     }
     Ok(uid)
@@ -598,7 +708,7 @@ pub(crate) fn read_request(cmd: u32, arg: usize) -> Result<KeyRequest> {
         }
         IOC_SIGN => {
             let req = read_user_boxed::<Sign>(user)?;
-            check_sign(&req)?;
+            refuse_and_without_password(&check_sign(&req)?)?;
             KeyRequest::Sign(req)
         }
         IOC_PUBLIC => {
@@ -613,7 +723,7 @@ pub(crate) fn read_request(cmd: u32, arg: usize) -> Result<KeyRequest> {
         }
         IOC_UNSEAL => {
             let req = read_user_boxed::<Seal>(user)?;
-            check_unseal(&req)?;
+            refuse_and_without_password(&check_unseal(&req)?.0)?;
             KeyRequest::Unseal(req)
         }
         IOC_SELFTEST => KeyRequest::Selftest(read_user_boxed::<Selftest>(user)?),
@@ -646,7 +756,7 @@ pub(crate) fn info() -> Info {
 pub(crate) fn info_for(user_bags: bool) -> Info {
     let mut i = info_base();
     if user_bags {
-        i.features |= FEATURE_PASSWORD;
+        i.features |= FEATURE_PASSWORD | FEATURE_USER_POLICIES;
     }
     i
 }
@@ -680,8 +790,33 @@ pub(crate) fn encode_handle(blob: &[u8], flags: u8, out: &mut [u8; HANDLE_MAX]) 
     Ok(HANDLE_HEADER + blob.len())
 }
 
+/// The version-2 flag sets `user_handle_flags` makes.
+fn user_handle_flags_valid(flags: u8) -> bool {
+    [
+        UserPolicy::Plain,
+        UserPolicy::Presence,
+        UserPolicy::Biometry { any: false },
+        UserPolicy::Biometry { any: true },
+        UserPolicy::BiometryAndPasscode { any: false },
+        UserPolicy::BiometryAndPasscode { any: true },
+    ]
+    .iter()
+    .any(|p| user_handle_flags(*p) == flags)
+}
+
 /// Writes a version-2 handle for a record under `uid`'s bag.
 pub(crate) fn encode_user_handle(blob: &[u8], uid: u32, plain: bool, out: &mut [u8; HANDLE_MAX]) -> Result<usize> {
+    let policy = if plain { UserPolicy::Plain } else { UserPolicy::Presence };
+    encode_user_handle_for(blob, uid, policy, out)
+}
+
+/// Writes a version-2 handle for a record made with `policy` under `uid`'s bag.
+pub(crate) fn encode_user_handle_for(
+    blob: &[u8],
+    uid: u32,
+    policy: UserPolicy,
+    out: &mut [u8; HANDLE_MAX],
+) -> Result<usize> {
     if blob.is_empty() || blob.len() > HANDLE_MAX - HANDLE_HEADER_USER {
         return Err(EINVAL);
     }
@@ -689,7 +824,7 @@ pub(crate) fn encode_user_handle(blob: &[u8], uid: u32, plain: bool, out: &mut [
     out.fill(0);
     out[..4].copy_from_slice(HANDLE_MAGIC);
     out[4] = HANDLE_VERSION_USER;
-    out[5] = HANDLE_USER_BAG | (if plain { HANDLE_USER_PLAIN } else { 0 });
+    out[5] = user_handle_flags(policy);
     out[8..12].copy_from_slice(&len.to_le_bytes());
     out[12..16].copy_from_slice(&uid.to_le_bytes());
     out[HANDLE_HEADER_USER..HANDLE_HEADER_USER + blob.len()].copy_from_slice(blob);
@@ -713,7 +848,7 @@ pub(crate) fn decode_any_handle(handle: &[u8; HANDLE_MAX], len: u32) -> Result<H
     let len = len as usize;
     if !(HANDLE_HEADER_USER + 1..=HANDLE_MAX).contains(&len)
         || &handle[..4] != HANDLE_MAGIC
-        || (handle[5] != HANDLE_USER_BAG && handle[5] != HANDLE_USER_BAG | HANDLE_USER_PLAIN)
+        || !user_handle_flags_valid(handle[5])
         || handle[6] != 0
         || handle[7] != 0
     {
@@ -863,6 +998,25 @@ pub(crate) struct BioAcl {
 pub(crate) const UNSEAL_ACL_OP: &[u8] = b"ock";
 
 pub(crate) fn bio_acl(catacomb: &[u8; 16], enrolled_hash: Option<&[u8; 32]>) -> Result<BioAcl> {
+    bio_acl_with(catacomb, enrolled_hash, false)
+}
+
+/// The list of a key made with macOS's `.privateKeyUsage | .biometry* |
+/// .and | .devicePasscode`: the same operations as `bio_acl`, each needing
+/// one constraint that names two credential clauses, the biometric one
+/// (`cbio`) and the user passcode (`cup` true), and how many of them must
+/// hold (`pkofn` 2: both). The flags builder writes this flat K-of-N map
+/// (OR is the same map with `pkofn` 1); it is not a nested list. The enclave
+/// evaluates it against one context, which must hold a match it saw and a
+/// `VERIFY_SECRET` credential from the key's own bag.
+pub(crate) fn bio_and_passcode_acl(catacomb: &[u8; 16], enrolled_hash: Option<&[u8; 32]>) -> Result<BioAcl> {
+    bio_acl_with(catacomb, enrolled_hash, true)
+}
+
+/// Required credential count of an AND constraint: biometry and passcode.
+const AND_REQUIRED: u32 = 2;
+
+fn bio_acl_with(catacomb: &[u8; 16], enrolled_hash: Option<&[u8; 32]>, and_passcode: bool) -> Result<BioAcl> {
     let cbio = match enrolled_hash {
         Some(hash) => crate::der::encode_refkey_set(&[
             (b"pbioc".as_slice(), RV::Octets(catacomb)),
@@ -870,7 +1024,15 @@ pub(crate) fn bio_acl(catacomb: &[u8; 16], enrolled_hash: Option<&[u8; 32]>) -> 
         ])?,
         None => crate::der::encode_refkey_set(&[(b"pbioc".as_slice(), RV::Octets(catacomb))])?,
     };
-    let constraint = crate::der::encode_refkey_set(&[(b"cbio".as_slice(), RV::Der(&cbio))])?;
+    let constraint = if and_passcode {
+        crate::der::encode_refkey_set(&[
+            (b"cbio".as_slice(), RV::Der(&cbio)),
+            (b"cup".as_slice(), RV::Bool(true)),
+            (b"pkofn".as_slice(), RV::Integer(AND_REQUIRED)),
+        ])?
+    } else {
+        crate::der::encode_refkey_set(&[(b"cbio".as_slice(), RV::Der(&cbio))])?
+    };
     let acl = crate::der::encode_refkey_set(&[
         (b"oa".as_slice(), RV::Bool(true)),
         (b"ock".as_slice(), RV::Der(&constraint)),
@@ -1020,6 +1182,32 @@ pub(crate) struct KeyTouch {
     probe: Option<Probe>,
     again: Option<Result<crate::Secret>>,
     again_status: i32,
+    /// An AND key's second credential: the password of the bag the key
+    /// lives under, verified by the enclave into the matched context right
+    /// before the one operation. Taken (and wiped) at its first use.
+    passcode: Option<Passcode>,
+    /// The enclave refused that password (it counted the attempt): `ENOKEY`.
+    passcode_refused: bool,
+}
+
+/// A password held for one AND operation; wiped when dropped.
+pub(crate) struct Passcode {
+    bag: crate::sks::SpecialHandle,
+    bytes: KVec<u8>,
+}
+
+impl Passcode {
+    pub(crate) fn new(bag: crate::sks::SpecialHandle, pw: &[u8]) -> Result<Passcode> {
+        let mut bytes = KVec::new();
+        bytes.extend_from_slice(pw, GFP_KERNEL)?;
+        Ok(Passcode { bag, bytes })
+    }
+}
+
+impl Drop for Passcode {
+    fn drop(&mut self) {
+        crate::image::wipe(&mut self.bytes);
+    }
 }
 
 impl KeyTouch {
@@ -1050,6 +1238,8 @@ impl KeyTouch {
             probe: None,
             again: None,
             again_status: 0,
+            passcode: None,
+            passcode_refused: false,
         })
     }
 
@@ -1183,7 +1373,7 @@ mod tests {
     fn version_four_lists_cancel_seal_and_password() {
         let i = info();
         assert_eq!(i.version, 4);
-        assert_eq!(info_for(true).features, i.features | FEATURE_PASSWORD);
+        assert_eq!(info_for(true).features, i.features | FEATURE_PASSWORD | FEATURE_USER_POLICIES);
         assert_eq!(info_for(true).features & FEATURE_PERSISTENT_ATTEMPTS, 0);
         assert_eq!(i.features, FEATURE_CANCEL | FEATURE_SEAL);
         assert_eq!(IOC_CANCEL, 0xb125);
@@ -1314,6 +1504,114 @@ mod tests {
     }
 
     #[test]
+    fn create_user_takes_the_macos_policy_combinations_only() {
+        let and = CREATE_DEVICE_PASSCODE | CREATE_AND;
+        assert_eq!(create_user_policy(0, true).unwrap(), UserPolicy::Plain);
+        assert_eq!(create_user_policy(CREATE_USER_PRESENCE, true).unwrap(), UserPolicy::Presence);
+        assert_eq!(
+            create_user_policy(CREATE_BIOMETRY_CURRENT_SET, true).unwrap(),
+            UserPolicy::Biometry { any: false }
+        );
+        assert_eq!(create_user_policy(CREATE_BIOMETRY_ANY, true).unwrap(), UserPolicy::Biometry { any: true });
+        assert_eq!(
+            create_user_policy(CREATE_BIOMETRY_CURRENT_SET | and, true).unwrap(),
+            UserPolicy::BiometryAndPasscode { any: false }
+        );
+        assert_eq!(
+            create_user_policy(CREATE_BIOMETRY_ANY | and, true).unwrap(),
+            UserPolicy::BiometryAndPasscode { any: true }
+        );
+        // Without FEATURE_USER_POLICIES only the version-4 pair.
+        assert_eq!(create_user_policy(CREATE_BIOMETRY_ANY, false).unwrap_err(), EOPNOTSUPP);
+        assert_eq!(create_user_policy(CREATE_BIOMETRY_ANY | and, false).unwrap_err(), EOPNOTSUPP);
+        assert_eq!(create_user_policy(CREATE_USER_PRESENCE, false).unwrap(), UserPolicy::Presence);
+        // .devicePasscode alone stays reserved; half an AND, OR forms and
+        // unknown bits are malformed.
+        assert_eq!(create_user_policy(CREATE_DEVICE_PASSCODE, true).unwrap_err(), EOPNOTSUPP);
+        for bad in [
+            CREATE_AND,
+            CREATE_BIOMETRY_ANY | CREATE_AND,
+            CREATE_BIOMETRY_ANY | CREATE_DEVICE_PASSCODE,
+            CREATE_BIOMETRY_ANY | CREATE_BIOMETRY_CURRENT_SET,
+            CREATE_BIOMETRY_ANY | CREATE_BIOMETRY_CURRENT_SET | and,
+            CREATE_USER_PRESENCE | CREATE_BIOMETRY_ANY,
+            CREATE_USER_PRESENCE | and,
+            0x20,
+            0x8000_0000,
+        ] {
+            assert_eq!(create_user_policy(bad, true).unwrap_err(), EINVAL);
+        }
+        // CREATE (identity bag) is unchanged: AND is not one of its bits.
+        assert_eq!(create_policy(CREATE_AND).unwrap_err(), EINVAL);
+    }
+
+    #[test]
+    fn and_list_is_the_flat_two_of_n_map() {
+        let and = bio_and_passcode_acl(&[0x11; 16], Some(&[0x22; 32])).unwrap();
+        let bio = bio_acl(&[0x11; 16], Some(&[0x22; 32])).unwrap();
+        let cbio_seq = bio.constraint.len() - 2;
+        // SET { SEQ { "cbio", ... }, SEQ { "cup", BOOLEAN true }, SEQ { "pkofn", INTEGER 2 } }
+        let cup = b"\x30\x08\x0c\x03cup\x01\x01\x01";
+        let pkofn = b"\x30\x0a\x0c\x05pkofn\x02\x01\x02";
+        assert_eq!(and.constraint.len(), 2 + cbio_seq + cup.len() + pkofn.len());
+        assert_eq!(and.constraint[0], 0x31);
+        assert_eq!(and.constraint[1] as usize, and.constraint.len() - 2);
+        // Members in key order: the biometric clause exactly as the
+        // biometric-only list has it, then the passcode clause, then the count.
+        assert_eq!(&and.constraint[2..2 + cbio_seq], &bio.constraint[2..]);
+        assert_eq!(&and.constraint[2 + cbio_seq..2 + cbio_seq + cup.len()], cup);
+        assert_eq!(&and.constraint[2 + cbio_seq + cup.len()..], pkofn);
+        // The same constraint on ock, okd and osgn; oa and odel stay free.
+        assert_eq!(and.ed.windows(and.constraint.len()).filter(|w| *w == &and.constraint[..]).count(), 3);
+        assert_eq!(and.ed.windows(5).filter(|w| *w == b"pkofn").count(), 3);
+        assert!(!and.ed.windows(4).any(|w| w == b"oecd"));
+        // biometry-any AND passcode drops only the enrolled-set hash.
+        let any = bio_and_passcode_acl(&[0x11; 16], None).unwrap();
+        assert!(!any.ed.windows(5).any(|w| w == b"pbioh"));
+        assert_eq!(any.ed.windows(5).filter(|w| *w == b"pkofn").count(), 3);
+    }
+
+    #[test]
+    fn user_policy_handles_round_trip_and_gate_the_password_calls() {
+        let b = blob();
+        let policies = [
+            (UserPolicy::Plain, false),
+            (UserPolicy::Presence, true),
+            (UserPolicy::Biometry { any: false }, false),
+            (UserPolicy::Biometry { any: true }, false),
+            (UserPolicy::BiometryAndPasscode { any: false }, true),
+            (UserPolicy::BiometryAndPasscode { any: true }, true),
+        ];
+        for (policy, password) in policies {
+            let mut h = [0u8; HANDLE_MAX];
+            let n = encode_user_handle_for(&b, 60124, policy, &mut h).unwrap() as u32;
+            let d = decode_any_handle(&h, n).unwrap();
+            assert_eq!((d.flags, d.uid, d.blob), (user_handle_flags(policy), Some(60124), &b[..]));
+            assert_eq!(check_password_handle(&d).is_ok(), password);
+            let and = matches!(policy, UserPolicy::BiometryAndPasscode { .. });
+            assert_eq!(is_and_handle(&d), and);
+            assert_eq!(refuse_and_without_password(&d).is_err(), and);
+        }
+        // Flag sets no policy makes are refused.
+        for f in [
+            HANDLE_USER_BAG | HANDLE_AND_PASSCODE,
+            HANDLE_USER_BAG | HANDLE_BIOMETRY_ANY,
+            HANDLE_USER_BAG | HANDLE_USER_PLAIN | HANDLE_BIOMETRY,
+            HANDLE_USER_BAG | HANDLE_USER_PLAIN | HANDLE_AND_PASSCODE | HANDLE_BIOMETRY,
+            HANDLE_USER_BAG | 0x20,
+        ] {
+            let mut h = [0u8; HANDLE_MAX];
+            let n = encode_user_handle_for(&b, 60124, UserPolicy::Presence, &mut h).unwrap() as u32;
+            h[5] = f;
+            assert!(decode_any_handle(&h, n).is_err());
+        }
+        // An identity-bag (version 1) handle never takes the AND path.
+        let mut v1 = [0u8; HANDLE_MAX];
+        let n1 = encode_handle(&b, HANDLE_BIOMETRY, &mut v1).unwrap() as u32;
+        assert!(!is_and_handle(&decode_any_handle(&v1, n1).unwrap()));
+    }
+
+    #[test]
     fn version_4_ioctls_have_their_sizes() {
         assert_eq!(IOC_CREATE_USER & 0xff, 0x28);
         assert_eq!(IOC_SIGN_PASSWORD >> 16 & 0x3fff, (2164 + 8 + PASSWORD_MAX) as u32);
@@ -1369,11 +1667,22 @@ impl SepData {
     }
 
     fn key_bio_acl(&self, any: bool) -> Result<BioAcl> {
+        self.key_user_acl(false, any)
+    }
+
+    /// The biometric list (`and_passcode`: the biometry AND passcode list)
+    /// for this install's catacomb and, unless `any`, its enrolled set.
+    fn key_user_acl(&self, and_passcode: bool, any: bool) -> Result<BioAcl> {
         if !self.touchid_started.load(Relaxed) {
             return Err(ENODEV);
         }
         let (catacomb, enrolled) = self.catacomb_binding()?;
-        bio_acl(&catacomb, (!any).then_some(&enrolled))
+        let hash = (!any).then_some(&enrolled);
+        if and_passcode {
+            bio_and_passcode_acl(&catacomb, hash)
+        } else {
+            bio_acl(&catacomb, hash)
+        }
     }
 
     /// Evaluates the signing constraint on the fresh context before the
@@ -1458,15 +1767,34 @@ impl SepData {
     /// it: the second call finds no grant unless the first was refused
     /// outright, so at most one operation ever runs per match.
     pub(crate) fn key_touch_sign(&self, evaluation: &[u8; crate::scrd::SCRD_ACM_HANDLE_LEN], when: &CStr) {
-        let grant = match &mut *self.key_touch.lock() {
-            Some(job) => job.take_grant(),
-            None => None,
+        let (grant, passcode) = match &mut *self.key_touch.lock() {
+            Some(job) => (job.take_grant(), job.passcode.take()),
+            None => (None, None),
         };
         let Some(grant) = grant else {
             return;
         };
         let op = grant.op();
         let bag = grant.bag();
+        // An AND key: the enclave saw the match; now it checks the bag's
+        // password into the same context, so the context holds both
+        // credentials the key's list asks for. The password goes once (a
+        // retry after a refusal finds it already in the context).
+        if let Some(pc) = passcode {
+            let verify = match self.sks_send(self.sks_req_verify_secret(pc.bag, &pc.bytes, evaluation)) {
+                Some(out) => out.reply.status as i32,
+                None => -(EIO.to_errno()),
+            };
+            drop(pc);
+            if verify != 0 {
+                dev_info_refusal!(self.dev, "sep-key: AND key: the password was refused by the enclave (status {})\n", verify);
+                if let Some(job) = &mut *self.key_touch.lock() {
+                    job.passcode_refused = true;
+                    job.settle(GrantEnd::Done(Err(ENOKEY)), verify);
+                }
+                return;
+            }
+        }
         let end = grant.run(|op, blob, digest, sealed| self.key_op_in(bag, op, blob, digest, sealed, Some(evaluation)));
         let status = self.last_key_status.load(Relaxed) as i32;
         let ok = matches!(end, GrantEnd::Done(Ok(_)));
@@ -1562,7 +1890,7 @@ impl SepData {
     /// match in it, the signature, and the context deleted, all inside this
     /// call. Waits about a minute for a finger.
     fn key_sign_with_touch(&self, blob: &[u8], flags: u8, digest: &[u8; DIGEST_LEN]) -> Result<KeyTouch> {
-        self.key_touch_run(blob, flags, TouchOp::Sign, digest, &[], None, None)
+        self.key_touch_run(blob, flags, TouchOp::Sign, digest, &[], None, None, None)
     }
 
     /// A touch-gated operation (see `key_sign_with_touch`). `CANCEL` ends
@@ -1577,14 +1905,19 @@ impl SepData {
         sealed: &[u8],
         probe: Option<Probe>,
         bag: Option<u32>,
+        passcode: Option<Passcode>,
     ) -> Result<KeyTouch> {
-        let constraint = if bag.is_some() {
+        let any = flags & HANDLE_BIOMETRY_ANY != 0;
+        let constraint = if bag.is_some() && flags & HANDLE_BIOMETRY == 0 {
             presence_constraint()?
+        } else if flags & HANDLE_AND_PASSCODE != 0 {
+            self.key_user_acl(true, any)?.constraint
         } else {
-            self.key_bio_acl(flags & HANDLE_BIOMETRY_ANY != 0)?.constraint
+            self.key_bio_acl(any)?.constraint
         };
         let mut job = KeyTouch::new_in(op, blob, digest, sealed, constraint, bag)?;
         job.probe = probe;
+        job.passcode = passcode;
         // Serialises with /dev/sep-bio's enrol and verify work, as they do
         // with each other, and with every other touch-gated call: one job,
         // one grant, one context at a time.
@@ -1637,6 +1970,10 @@ impl SepData {
         self.key_touch_cancel.store(false, Relaxed);
         // Whatever is left of the grant goes with the job.
         let job = self.key_touch.lock().take().ok_or(EIO)?;
+        // ENOKEY, not EACCES: EACCES already means the touch did not match.
+        if job.passcode_refused {
+            return Err(ENOKEY);
+        }
         dev_dbg!(
             self.dev,
             "sep-key: touch-gated {:?} ended: {:?}, result {}\n",
@@ -2120,6 +2457,63 @@ impl SepData {
         r
     }
 
+    /// One arm of the AND key check (`SELFTEST_AND_*`).
+    fn key_and_arm(&self, req: &mut Selftest) -> Result<()> {
+        let (blob, flags, uid) = {
+            let h = decode_any_handle(&req.handle, req.handle_len)?;
+            if !is_and_handle(&h) {
+                return Err(EINVAL);
+            }
+            let mut b = KVec::new();
+            b.extend_from_slice(h.blob, GFP_KERNEL)?;
+            (b, h.flags, h.uid.ok_or(EINVAL)?)
+        };
+        let bag = bag_user(uid)?;
+        // Arm B signs this digest, so the password is never signed over.
+        let fixed = [0x5a; DIGEST_LEN];
+        self.last_key_status.store(0, Relaxed);
+        let enclave = |r: Result<KVec<u8>>, s: &SepData| -> (i32, i32) {
+            (r.err().map(|e| e.to_errno()).unwrap_or(0), s.last_key_status.load(Relaxed) as i32)
+        };
+        let (result, status, verify) = match req.mode {
+            SELFTEST_AND_MATCH_ONLY => {
+                let digest = req.digest;
+                let job = self.key_touch_run(&blob, flags, TouchOp::Sign, &digest, &[], None, Some(uid), None)?;
+                (errno_of(&job.result), job.status, 0)
+            }
+            SELFTEST_AND_PASSWORD_ONLY => {
+                let n = req.digest.iter().position(|&b| b == 0).unwrap_or(DIGEST_LEN);
+                if n == 0 {
+                    return Err(EINVAL);
+                }
+                let (handle, verify) =
+                    self.key_context_for(designated_id(bag), Some((bag.special_handle(), &req.digest[..n])))?;
+                let ctx = OwnedContext::new(self, handle);
+                let (r, s) = enclave(self.key_op_in(Some(uid), TouchOp::Sign, &blob, &fixed, &[], Some(ctx.handle())), self);
+                (r, s, verify)
+            }
+            _ => {
+                let (handle, _) = self.key_context_for(designated_id(bag), None)?;
+                let ctx = OwnedContext::new(self, handle);
+                let (r, s) = enclave(self.key_op_in(Some(uid), TouchOp::Sign, &blob, &fixed, &[], Some(ctx.handle())), self);
+                (r, s, 0)
+            }
+        };
+        req.result = result;
+        req.enclave_status = status;
+        req.result2 = verify;
+        req.enclave_status2 = 0;
+        dev_info_ratelimited!(
+            self.dev,
+            "sep-key: self-test AND arm {}: {} (enclave status {}, password verify {})\n",
+            req.mode,
+            (if result == 0 { "SIGNED" } else { "refused" }),
+            status,
+            verify
+        );
+        Ok(())
+    }
+
     fn key_selftest(&self, req: &mut Selftest) -> Result<()> {
         if crate::module_parameters::key_selftest.value() == 0 {
             return Err(EPERM);
@@ -2145,6 +2539,12 @@ impl SepData {
         }
         if req.mode == SELFTEST_UNSEAL_CONTEXT_PROBE {
             return self.key_unseal_context_probe(req);
+        }
+        if matches!(req.mode, SELFTEST_AND_MATCH_ONLY | SELFTEST_AND_PASSWORD_ONLY | SELFTEST_AND_NEITHER) {
+            let r = self.key_and_arm(req);
+            // Arm B carried the password in the digest buffer.
+            crate::image::wipe(&mut req.digest);
+            return r;
         }
         let (blob, flags) = decode_handle(&req.handle, req.handle_len)?;
         if flags & HANDLE_BIOMETRY == 0 {
@@ -2185,7 +2585,7 @@ impl SepData {
                     #[cfg(CONFIG_APPLE_SEP_KEY_RESEARCH)]
                     then: None,
                 };
-                let job = self.key_touch_run(&owned, flags, TouchOp::Sign, &digest, &[], Some(probe), None)?;
+                let job = self.key_touch_run(&owned, flags, TouchOp::Sign, &digest, &[], Some(probe), None, None)?;
                 req.result2 = errno_of(&job.again);
                 req.enclave_status2 = job.again_status;
                 (errno_of(&job.result), job.status)
@@ -2205,7 +2605,7 @@ impl SepData {
                     after_delete: false,
                     then: Some(if two { TouchOp::Sign } else { TouchOp::Unseal }),
                 };
-                let job = self.key_touch_run(&owned, flags, TouchOp::Sign, &digest, &sealed, Some(probe), None)?;
+                let job = self.key_touch_run(&owned, flags, TouchOp::Sign, &digest, &sealed, Some(probe), None, None)?;
                 req.result2 = match &job.again {
                     Some(Ok(secret)) if !two && secret[..] == digest[..] => 0,
                     Some(Ok(_)) if !two => EIO.to_errno(),
@@ -2270,7 +2670,7 @@ impl SepData {
                     if h.flags & HANDLE_USER_PLAIN != 0 {
                         crate::Secret(self.key_op_in(h.uid, TouchOp::Sign, h.blob, &digest, &[], None)?)
                     } else if h.flags & (HANDLE_BIOMETRY | HANDLE_USER_BAG) != 0 {
-                        self.key_touch_run(h.blob, h.flags, TouchOp::Sign, &digest, &[], None, h.uid)?
+                        self.key_touch_run(h.blob, h.flags, TouchOp::Sign, &digest, &[], None, h.uid, None)?
                             .into_result()?
                     } else {
                         crate::Secret(self.user_key_sign(h.blob, &digest, None)?)
@@ -2312,7 +2712,7 @@ impl SepData {
                     if h.flags & HANDLE_USER_PLAIN != 0 {
                         crate::Secret(self.key_op_in(h.uid, TouchOp::Unseal, h.blob, &[0; DIGEST_LEN], sealed, None)?)
                     } else {
-                        self.key_touch_run(h.blob, h.flags, TouchOp::Unseal, &[0; DIGEST_LEN], sealed, None, h.uid)?
+                        self.key_touch_run(h.blob, h.flags, TouchOp::Unseal, &[0; DIGEST_LEN], sealed, None, h.uid, None)?
                             .into_result()?
                     }
                 };
@@ -2326,17 +2726,35 @@ impl SepData {
             }
             KeyRequest::CreateUser(mut req) => {
                 require_admin_or(req.uid)?;
-                let plain = check_create_user(&req)?;
+                let policy = check_create_user(&req)?;
+                // FEATURE_USER_POLICIES comes with the per-user bags (variant 5).
+                if !matches!(policy, UserPolicy::Plain | UserPolicy::Presence)
+                    && self.profile.key_store != crate::profile::KeyStore::Variant5
+                {
+                    return Err(EOPNOTSUPP);
+                }
                 let bag = bag_user(req.uid)?;
-                let ed = if plain { None } else { Some(presence_acl()?) };
+                let ed = match policy {
+                    UserPolicy::Plain => None,
+                    UserPolicy::Presence => Some(presence_acl()?),
+                    UserPolicy::Biometry { any } => Some(self.key_user_acl(false, any)?.ed),
+                    UserPolicy::BiometryAndPasscode { any } => Some(self.key_user_acl(true, any)?.ed),
+                };
                 // The enclave refuses while the bag is locked or absent.
                 let blob = self.user_key_create_in_bag(bag, ed.as_deref())?;
                 req.public_key = SepData::user_key_public(&blob)?;
-                req.handle_len = encode_user_handle(&blob, req.uid, plain, &mut req.handle)? as u32;
+                req.handle_len = encode_user_handle_for(&blob, req.uid, policy, &mut req.handle)? as u32;
                 dev_info_ratelimited!(
                     self.dev,
                     "sep-key: {} key under uid {}'s bag\n",
-                    (if plain { "bag-unlocked-only" } else { "user-presence" }),
+                    match policy {
+                        UserPolicy::Plain => "bag-unlocked-only",
+                        UserPolicy::Presence => "user-presence",
+                        UserPolicy::Biometry { any: false } => "biometry-current-set",
+                        UserPolicy::Biometry { any: true } => "biometry-any",
+                        UserPolicy::BiometryAndPasscode { any: false } => "biometry-current-set and passcode",
+                        UserPolicy::BiometryAndPasscode { any: true } => "biometry-any and passcode",
+                    },
                     req.uid
                 );
                 write_user(user, &*req)
@@ -2348,7 +2766,13 @@ impl SepData {
                     require_admin_or(uid)?;
                     let pw = check_password(&req.password)?;
                     let digest = req.sign.digest;
-                    crate::Secret(self.key_op_with_password(uid, h.blob, TouchOp::Sign, &digest, &[], pw)?)
+                    if is_and_handle(&h) {
+                        let pc = Passcode::new(bag_user(uid)?.special_handle(), pw)?;
+                        self.key_touch_run(h.blob, h.flags, TouchOp::Sign, &digest, &[], None, h.uid, Some(pc))?
+                            .into_result()?
+                    } else {
+                        crate::Secret(self.key_op_with_password(uid, h.blob, TouchOp::Sign, &digest, &[], pw)?)
+                    }
                 };
                 put_signature(&sig, &mut req.sign)?;
                 // `req` wipes the password when it drops.
@@ -2360,7 +2784,13 @@ impl SepData {
                     let uid = check_password_handle(&h)?;
                     require_admin_or(uid)?;
                     let pw = check_password(&req.password)?;
-                    crate::Secret(self.key_op_with_password(uid, h.blob, TouchOp::Unseal, &[0; DIGEST_LEN], sealed, pw)?)
+                    if is_and_handle(&h) {
+                        let pc = Passcode::new(bag_user(uid)?.special_handle(), pw)?;
+                        self.key_touch_run(h.blob, h.flags, TouchOp::Unseal, &[0; DIGEST_LEN], sealed, None, h.uid, Some(pc))?
+                            .into_result()?
+                    } else {
+                        crate::Secret(self.key_op_with_password(uid, h.blob, TouchOp::Unseal, &[0; DIGEST_LEN], sealed, pw)?)
+                    }
                 };
                 put_secret(&secret, &mut req.seal)?;
                 // `secret` and `req` wipe the plaintext and password when they drop.
