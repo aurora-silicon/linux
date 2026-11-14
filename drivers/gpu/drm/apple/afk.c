@@ -824,10 +824,15 @@ afk_compact_slot(struct apple_dcp_afkep *ep,
 	 * the previous one. The DPDEV, DPAVSERV and AV endpoints (0x27-0x29)
 	 * also do so after an external hotplug without a poweron. Replace an
 	 * enabled service with the same binding, name and unit in place when
-	 * it comes from an earlier poweron, or from any announcement on the
-	 * hotplug endpoints. Services announced since the latest poweron stay:
-	 * DPAVCTRL announces several services with the same name and no unit
-	 * in one generation, and those are siblings, not replacements.
+	 * it comes from an earlier poweron, from any announcement on the
+	 * hotplug endpoints, or when the service is a singleton (one that is
+	 * re-announced on every DP relink and of which only one is ever live,
+	 * such as the external DCP's AV interfaces on AV_AUDIO_ENDPOINT_DESKTOP
+	 * (0x2b), which a relink across suspend would otherwise pile up until
+	 * the endpoint has no slot left). Services announced since the latest
+	 * poweron stay: DPAVCTRL announces several services with the same name
+	 * and no unit in one generation, and those are siblings, not
+	 * replacements.
 	 */
 	hotplug = ep->endpoint >= 0x27 && ep->endpoint <= 0x29;
 	for (i = 0; i < ep->num_channels; i++) {
@@ -835,7 +840,7 @@ afk_compact_slot(struct apple_dcp_afkep *ep,
 		if (!service->enabled || service->ops != ops ||
 		    service->unit != unit || strcmp(service->name, name))
 			continue;
-		if (!hotplug && service->power_gen == gen)
+		if (!hotplug && !ops->singleton && service->power_gen == gen)
 			continue;
 		dev_info(ep->dcp->dev,
 			 "AFK[ep:%02x]: replacing compact service %s interface %u\n",
