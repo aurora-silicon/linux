@@ -71,6 +71,22 @@
 		reg = <0x3 0xa5060000 0x0 0x20000>;
 		interrupts = <AIC_IRQ 1259 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_sio>;
+		status = "disabled";
+	};
+
+	/*
+	 * ADT /arm-io/aes (aes,s8000, aes-version 5): the engine, shared control
+	 * and auxiliary control windows; DART-SIO mapper-aes is stream 1.
+	 */
+	aes: crypto@3a500c000 {
+		compatible = "apple,t8142-aes", "apple,aes";
+		reg = <0x3 0xa500c000 0x0 0x4000>,
+		      <0x3 0x882dc000 0x0 0x8000>,
+		      <0x3 0x88078000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 1246 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_aes>;
+		iommus = <&sio_dart 1>;
 		status = "disabled";
 	};
 
@@ -529,6 +545,28 @@
 };
 
 &pmgr {
+	/* ADT pmgr device SIO (id 66). Owned by the firmware that runs the SIO. */
+	ps_sio: power-controller@2b0 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2b0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "sio";
+		apple,firmware-owned;
+		status = "disabled";
+	};
+
+	/* ADT pmgr device AES (id 96), the SIO AES engine. */
+	ps_aes: power-controller@3a0 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3a0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aes";
+		power-domains = <&ps_sio>;
+		status = "disabled";
+	};
+
 	/* ADT pmgr device ANE_SYS (id 73), parent AFISOCNI3 (no power state). */
 	ps_ane_sys: power-controller@2e8 {
 		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
