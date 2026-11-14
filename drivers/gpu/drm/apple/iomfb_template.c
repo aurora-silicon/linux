@@ -4525,6 +4525,8 @@ static void init_3(struct apple_dcp *dcp, void *out, void *cookie)
  *
  *   A445 A411 A445 A415 A450 A031 x9 A414 A478 A457 A474 A478 A476 A478 A412
  *
+ * (A031 x14 with notify_clients_form=2: see DCP_STEP_A031.)
+ *
  * A412 is not in the table: its result feeds res_is_main_display(), so it
  * stays on the existing path.
  */
@@ -4537,9 +4539,7 @@ enum dcp_client_step_kind {
 static const u8 dcp_client_open_seq[] = {
 	DCP_STEP_A445, DCP_STEP_A411, DCP_STEP_A445, DCP_STEP_A415,
 	DCP_STEP_A450,
-	DCP_STEP_A031, DCP_STEP_A031, DCP_STEP_A031, DCP_STEP_A031,
-	DCP_STEP_A031, DCP_STEP_A031, DCP_STEP_A031, DCP_STEP_A031,
-	DCP_STEP_A031,
+	DCP_STEP_A031,	/* repeats itself once per notify-clients state */
 	DCP_STEP_A414, DCP_STEP_A478, DCP_STEP_A457, DCP_STEP_A474,
 	DCP_STEP_A478, DCP_STEP_A476, DCP_STEP_A478,
 };
@@ -4583,9 +4583,12 @@ static void dcp_client_open_run(struct apple_dcp *dcp, void *out, void *cookie)
 	}
 	case DCP_STEP_A031: {
 		/*
-		 * Nine cumulative states: each call repeats the previous set
-		 * of notification clients and adds one, so state n lists n
-		 * clients.
+		 * Cumulative states: each call repeats the previous set of
+		 * notification clients and adds one, so state n has n
+		 * clients. The step re-queues itself until every state is
+		 * sent. notify_clients_form 0 writes the client numbers into
+		 * the first slots; 1 and 2 write the flag form fw27 firmware
+		 * expects, a 1 at each client's index (9 or 14 states).
 		 */
 		static const u8 notify_clients[9][8] = {
 			{},
@@ -4598,15 +4601,34 @@ static void dcp_client_open_run(struct apple_dcp *dcp, void *out, void *cookie)
 			{ 6, 7, 8, 10, 11, 12, 25 },
 			{ 6, 7, 8, 10, 11, 12, 25, 26 },
 		};
+		/* the order clients are added in, state n has the first n */
+		static const u8 notify_client_order[] = {
+			6, 7, 8, 10, 11, 12, 25, 26, 13, 14, 15, 16, 17,
+		};
 		struct dcp_pipe_cfg_031 cfg = {};
+		int form = READ_ONCE(notify_clients_form);
+		unsigned int states = form == 2 ? 14 : 9;
 		unsigned int step = dcp->a031_step;
 		unsigned int i;
 
-		if (step >= ARRAY_SIZE(notify_clients))
-			step = ARRAY_SIZE(notify_clients) - 1;
-		for (i = 0; i < step; i++)
-			cfg.clients[i] = cpu_to_le32(notify_clients[step][i]);
+		if (step >= states)
+			step = states - 1;
+		if (form == 1 || form == 2) {
+			for (i = 0; i < step && i < ARRAY_SIZE(notify_client_order); i++)
+				cfg.clients[notify_client_order[i]] = cpu_to_le32(1);
+		} else {
+			for (i = 0; i < step; i++)
+				cfg.clients[i] = cpu_to_le32(notify_clients[step][i]);
+		}
+		dev_dbg(dcp->dev, "notify clients state %u of %u, form %d\n",
+			step, states, form);
 		dcp->a031_step++;
+		/* the next state, or the step after A031 once all are sent */
+		if (dcp->a031_step < states)
+			ncookie = (void *)idx;
+		else
+			dev_info(dcp->dev, "notify clients: form %d, %u states\n",
+				 form, states);
 
 		dcp_pipe_cfg_031(dcp, false, &cfg, next, ncookie);
 		break;
