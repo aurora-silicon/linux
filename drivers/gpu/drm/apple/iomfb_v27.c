@@ -119,9 +119,9 @@ static const struct dcp_method_entry dcp_methods_27_0[dcpep_num_methods] = {
  * A400/A401, so IOMobileFramebufferAP moved up by 50 (start_signal A451,
  * get_color_remap_mode A477), and set_create_DFB and vi_set_temperature_hint
  * up by one. The UPPipe A0xx and A1xx IDs are unchanged. The firmware rejects
- * an unknown tag with a panic ("link_rpc_lookup callback not found"), so
- * dfb_ready_query, whose 27.2 tag has not been seen in a call, has no entry
- * here and is not sent to this build (boot_5()).
+ * an unknown tag with a panic ("link_rpc_lookup callback not found").
+ * dfb_ready_query is A385, one above its 27.0 ID: the 27.3 trace sends it
+ * there, and the J813's DCP answers it at A385 on 27.2.
  */
 static const struct dcp_method_entry dcp_methods_27_2[dcpep_num_methods] = {
 	IOMFB_METHOD("A000", dcpep_late_init_signal),
@@ -147,6 +147,7 @@ static const struct dcp_method_entry dcp_methods_27_2[dcpep_num_methods] = {
 	IOMFB_METHOD("A104", dcpep_set_dfb_dimensions),
 	IOMFB_METHOD("A105", dcpep_commit_dfb_info),
 	IOMFB_METHOD("A035", dcpep_dfb_query),
+	IOMFB_METHOD("A385", dcpep_dfb_ready_query),
 	IOMFB_METHOD("A353", dcpep_pipe_query_353),
 	IOMFB_METHOD("A352", dcpep_pipe_set_352),
 	IOMFB_METHOD("A465", dcpep_pipe_cfg_415),

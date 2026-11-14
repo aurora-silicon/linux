@@ -33,6 +33,18 @@
 			reg = <0x100 0x02444000 0x0 0x184000>;
 		};
 
+		/*
+		 * Both roles' __TEXT, contiguous (ADT gfx-asc and gfx1-asc segment-ranges),
+		 * which the driver identifies before it starts the firmware. Fixed at the
+		 * macOS 27.0 address like fw-data, until the bootloader fills it in; under
+		 * 27.2 (26B123) iBoot loads it at 0x100_00e5_4000 and the DATA at
+		 * 0x100_0245_8000.
+		 */
+		gpu_fw_text: fw-text {
+			reg = <0x100 0x00e44000 0x0 0x9c000>;
+			no-map;
+		};
+
 		uat_handoff: uat-handoff {
 			reg = <0 0 0 0>;
 		};
@@ -105,9 +117,10 @@
 		power-domains = <&ps_gfx>;
 		memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>,
 				<&uat_l2_pagetables>, <&gfx_data>, <&gfx1_data>,
-				<&gpu_fw_data>;
+				<&gpu_fw_data>, <&gpu_fw_text>;
 		memory-region-names = "ttbs", "pagetables", "handoff",
-				      "shared-l2", "gfx-data", "gfx1-data", "fw-data";
+				      "shared-l2", "gfx-data", "gfx1-data", "fw-data",
+				      "fw-text";
 		operating-points-v2 = <&gpu_opp>;
 		/* Holds the DCS and fabric floor while GPU work is in flight. */
 		apple,clpc = <&clpc>;

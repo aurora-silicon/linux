@@ -590,4 +590,32 @@ mod tests {
             assert!(admit(t, d, &e[..1], h).is_none());
         }
     }
+
+    #[test]
+    fn t8142_identifies_each_build() {
+        use crate::g17::fw::m5::initdata::RootProfile;
+        let crate::g17::fw::variant::Firmware::Identified(builds) = crate::hw::t8142::CONFIG.firmware
+        else {
+            panic!("the J813 must identify its loaded firmware");
+        };
+        assert_eq!(builds.len(), 2);
+        // Same TEXT and DATA sizes for both builds, so each is told apart by its digest at its
+        // own record offsets.
+        t6050_admits_only(builds);
+        let [a428, b123] = [&builds[0].images[0], &builds[1].images[0]];
+        for (image, other) in [(a428, builds[1].images), (b123, builds[0].images)] {
+            assert!(lookup(other, image.text_size, image.data_size, |_| {
+                Some(image.text_sha256)
+            })
+            .is_none());
+        }
+        // 26A428 runs the board as probed; 26B123 runs it on the 26B123 graph.
+        assert!(builds[0].config.is_none());
+        let config = builds[1].config.unwrap();
+        assert_eq!(config.m5.unwrap().graph.profile, RootProfile::J873G18G26B123);
+        assert_eq!(
+            crate::hw::t8142::CONFIG.m5.unwrap().graph.profile,
+            RootProfile::J873G18G26A428
+        );
+    }
 }
