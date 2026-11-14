@@ -455,6 +455,7 @@ struct apple_cio {
 		unsigned int events;	/* APPLE_DP_TUNNEL_*, under lock */
 		bool hpd;		/* HPD level last seen, under lock */
 		unsigned int irq_count;
+		struct apple_nhi *diag_anhi;	/* set at tunnel activation, read by the IRQ diagnostics */
 	} dpin[APPLE_DPIN_MAX];
 };
 
@@ -749,6 +750,8 @@ static void apple_dpin_irq_stop(struct apple_dpin_ctx *c)
 		cancel_delayed_work(&c->poll);
 }
 
+static void apple_dpin_diag(struct apple_dpin_ctx *c, unsigned int ms);
+
 /* On dp_wq, ordered with bring-up and teardown: the binding is stable. */
 static void apple_dpin_event_fn(struct work_struct *work)
 {
@@ -777,6 +780,23 @@ static void apple_dpin_event_fn(struct work_struct *work)
 	if (ret)
 		dev_info(c->acio->dev, "dpin%u: display did not take events %#x: %d\n",
 			 c->idx, events, ret);
+	/*
+	 * w88 diagnostic: the DP IN adapter while the sink's request is held
+	 * and after it reaches the firmware. Sleeps on dp_wq; first 3 only.
+	 */
+	if (events & APPLE_DP_TUNNEL_IRQ_HPD) {
+		static const unsigned int at_ms[] = { 25, 50, 100, 125, 150, 175, 200, 300 };
+		unsigned int i, t = 0;
+
+		if (c->irq_count > 3)
+			return;
+		apple_dpin_diag(c, 0);
+		for (i = 0; i < ARRAY_SIZE(at_ms); i++) {
+			msleep(at_ms[i] - t);
+			t = at_ms[i];
+			apple_dpin_diag(c, t);
+		}
+	}
 }
 
 static void apple_dpin_request_mask_irqs(void *data)
@@ -1919,6 +1939,33 @@ static void apple_dp_dump_adapter(struct tb_port *port, const char *tag)
 		     !!(w[13] & ADP_DP_CS_13_DPTX_DISCOVERY_MODE));
 }
 
+static void apple_dpin_diag(struct apple_dpin_ctx *c, unsigned int ms)
+{
+	struct apple_nhi *anhi = READ_ONCE(c->diag_anhi);
+	u32 w[9], st = 0, irq = 0, en = 0, ctl = 0;
+	struct tb_port *in;
+	int i;
+
+	if (!anhi || !anhi->tb || !anhi->tb->root_switch)
+		return;
+	in = &anhi->tb->root_switch->ports[anhi->dp_in_port];
+	for (i = 0; i <= 8; i++)
+		if (tb_port_read(in, &w[i], TB_CFG_PORT, in->cap_adap + i, 1))
+			w[i] = 0xffffffff;
+	scoped_guard(mutex, &c->lock) {
+		if (c->regs && c->state.alive) {
+			st = readl(c->regs + APPLE_DPIN_STATUS);
+			irq = readl(c->regs + APPLE_DPIN_IRQ_STATUS);
+			en = readl(c->regs + APPLE_DPIN_IRQ_ENABLE);
+			ctl = readl(c->regs + APPLE_DPIN_CTRL);
+		}
+	}
+	dev_info(anhi->dev,
+		 "w88-dpin%u +%ums: CS0=%08x CS1=%08x CS2=%08x CS3=%08x LOCAL=%08x REMOTE=%08x STAT=%08x COMMON=%08x CS8=%08x MMIO status=%08x irq=%08x en=%08x ctrl=%08x\n",
+		 c->idx, ms, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8],
+		 st, irq, en, ctl);
+}
+
 static void apple_dp_dump_host_adapters(struct apple_nhi *anhi)
 {
 	struct tb_port *port;
@@ -2204,6 +2251,7 @@ static int apple_nhi_dp_tunnel_post_activate(struct tb_nhi *nhi,
 		scoped_guard(mutex, &c->lock) {
 			if (!apple_dpin_request(c, generation, true))
 				return -ESTALE;
+			WRITE_ONCE(c->diag_anhi, anhi);
 		}
 	}
 
