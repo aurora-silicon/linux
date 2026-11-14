@@ -58,6 +58,12 @@ pub(crate) mod cmd {
 
 /// Feature reports the host reads.
 pub(crate) mod get {
+    /// The accessory's protocol tag and version (`TACP`), read first on attach.
+    pub(crate) const TAG: u8 = 0x4b;
+    /// The accessory's identity.
+    pub(crate) const UID: u8 = 0x41;
+    /// The fresh connection nonce the host-object operation binds to.
+    pub(crate) const NONCE: u8 = 0x4c;
     /// The accessory's manifest, after a pairing.
     pub(crate) const MANIFEST: u8 = 0x45;
 }

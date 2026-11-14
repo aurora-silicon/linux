@@ -306,15 +306,16 @@ void sep_diag_set_xart(bool writable);
 
 /* Trusted-accessory keyboard client (stac_ta_shim.c, stac_client.rs). */
 typedef void (*sep_stac_ta_event_fn)(void *ctx);
-typedef void (*sep_stac_ta_identified_fn)(void *ctx, const u8 *uid,
-					  const u8 *nonce);
-typedef void (*sep_stac_ta_failed_fn)(void *ctx, int err);
+/* Runs the accessory handshake and feeds the lifecycle; the Rust side drives
+ * the reads and the two protocol-handshake writes through the command/read
+ * entry points below, under the client lock the identify work holds.
+ */
+typedef void (*sep_stac_ta_identify_fn)(void *ctx);
 typedef int (*sep_stac_ta_pair_fn)(void *ctx);
 typedef int (*sep_stac_ta_session_fn)(void *ctx);
 int sep_stac_ta_register(void *ctx, sep_stac_ta_event_fn attached,
 			 sep_stac_ta_event_fn detached,
-			 sep_stac_ta_identified_fn identified,
-			 sep_stac_ta_failed_fn failed,
+			 sep_stac_ta_identify_fn identify,
 			 sep_stac_ta_pair_fn pair,
 			 sep_stac_ta_session_fn session);
 ssize_t sep_stac_ta_command(const u8 *cmd, size_t len, u8 reply_id, u8 *reply,

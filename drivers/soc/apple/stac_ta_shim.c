@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
  * The keyboard side of the enclave's trusted-accessory client (see
- * stac_client.rs): registers with hid-apple-ta as its one client and reads
+ * stac_client.rs): registers with hid-apple-ta as its one client and drives
  * what identifies a Magic Keyboard with Touch ID.
  *
- * On attach it only reads: three feature reports (protocol tag, identity,
- * connection nonce). Their bodies go to the Rust side and are never logged.
+ * On attach it runs the accessory handshake on the Rust side (the identify
+ * callback), under the client lock this work holds: the Rust code reads the
+ * protocol tag, identity and connection nonce and writes the two
+ * protocol-handshake reports that bring a cold keyboard to where it answers.
+ * Those bodies go to the Rust side and are never logged.
  *
  * Pairing writes to the keyboard and runs only when root asks for it through
  * the write-only ta_pair parameter (off unless written). The per-connection
@@ -27,21 +30,9 @@
 #include <linux/mutex.h>
 #include <linux/printk.h>
 #include <linux/string.h>
-#include <linux/unaligned.h>
 #include <linux/workqueue.h>
 
 #include "shim.h"
-
-/* Feature reports of the Touch ID collection, each answered with its ID first. */
-#define SEP_TA_REPORT_TAG	0x4b	/* protocol tag and version */
-#define SEP_TA_REPORT_UID	0x41	/* the accessory's identity */
-#define SEP_TA_REPORT_NONCE	0x4c	/* the connection nonce */
-
-#define SEP_TA_TAG		"TACP"
-#define SEP_TA_TAG_LEN		8	/* the tag and a version word */
-#define SEP_TA_VERSION		1
-#define SEP_TA_UID_LEN		16
-#define SEP_TA_NONCE_LEN	16
 
 #if IS_REACHABLE(CONFIG_HID_APPLE_TA)
 
@@ -51,11 +42,10 @@ static struct {
 	void *ctx;
 	sep_stac_ta_event_fn attached;
 	sep_stac_ta_event_fn detached;
-	sep_stac_ta_identified_fn identified;
-	sep_stac_ta_failed_fn failed;
+	sep_stac_ta_identify_fn identify;
 	sep_stac_ta_pair_fn pair;
 	sep_stac_ta_session_fn session;
-	struct work_struct identify;
+	struct work_struct identify_work;
 	atomic_t dropped;
 	bool registered;
 } sep_ta = {
@@ -74,53 +64,16 @@ static struct {
 	.lock = __SPIN_LOCK_UNLOCKED(sep_ta_rx.lock),
 };
 
-static int sep_ta_read(struct apple_ta_device *ta, u8 id, u8 *out, size_t len)
-{
-	u8 buf[1 + SEP_TA_UID_LEN];
-	int ret;
-
-	if (len + 1 > sizeof(buf))
-		return -EINVAL;
-	buf[0] = id;
-	ret = apple_ta_get(ta, buf, len + 1);
-	if (ret >= 0 && (ret != (int)(len + 1) || buf[0] != id))
-		ret = -EPROTO;
-	if (ret >= 0) {
-		memcpy(out, buf + 1, len);
-		ret = 0;
-	}
-	memzero_explicit(buf, sizeof(buf));
-	return ret;
-}
-
 static void sep_ta_identify_work(struct work_struct *work)
 {
-	u8 tag[SEP_TA_TAG_LEN], uid[SEP_TA_UID_LEN], nonce[SEP_TA_NONCE_LEN];
-	struct apple_ta_device *ta;
-	int ret;
-
+	/*
+	 * The Rust identify callback runs the accessory handshake through
+	 * sep_stac_ta_command()/sep_stac_ta_read() (which assert this lock) and
+	 * feeds the lifecycle. Under the lock a detach waits until it is done.
+	 */
 	mutex_lock(&sep_ta.lock);
-	ta = sep_ta.ta;
-	if (!ta)
-		goto out;
-
-	ret = sep_ta_read(ta, SEP_TA_REPORT_TAG, tag, sizeof(tag));
-	if (!ret && (memcmp(tag, SEP_TA_TAG, 4) ||
-		     get_unaligned_le32(tag + 4) != SEP_TA_VERSION))
-		ret = -EPROTONOSUPPORT;
-	if (!ret)
-		ret = sep_ta_read(ta, SEP_TA_REPORT_UID, uid, sizeof(uid));
-	if (!ret)
-		ret = sep_ta_read(ta, SEP_TA_REPORT_NONCE, nonce, sizeof(nonce));
-
-	/* Under the lock: a detach waits until the enclave has the answer. */
-	if (ret)
-		sep_ta.failed(sep_ta.ctx, ret);
-	else
-		sep_ta.identified(sep_ta.ctx, uid, nonce);
-	memzero_explicit(uid, sizeof(uid));
-	memzero_explicit(nonce, sizeof(nonce));
-out:
+	if (sep_ta.ta)
+		sep_ta.identify(sep_ta.ctx);
 	mutex_unlock(&sep_ta.lock);
 }
 
@@ -324,8 +277,7 @@ static const struct apple_ta_client_ops sep_ta_ops = {
 
 int sep_stac_ta_register(void *ctx, sep_stac_ta_event_fn attached,
 			 sep_stac_ta_event_fn detached,
-			 sep_stac_ta_identified_fn identified,
-			 sep_stac_ta_failed_fn failed,
+			 sep_stac_ta_identify_fn identify,
 			 sep_stac_ta_pair_fn pair,
 			 sep_stac_ta_session_fn session)
 {
@@ -333,15 +285,14 @@ int sep_stac_ta_register(void *ctx, sep_stac_ta_event_fn attached,
 
 	if (sep_ta.registered)
 		return -EBUSY;
-	INIT_WORK(&sep_ta.identify, sep_ta_identify_work);
+	INIT_WORK(&sep_ta.identify_work, sep_ta_identify_work);
 	init_completion(&sep_ta_rx.done);
 	sep_ta.pair = pair;
 	sep_ta.session = session;
 	sep_ta.ctx = ctx;
 	sep_ta.attached = attached;
 	sep_ta.detached = detached;
-	sep_ta.identified = identified;
-	sep_ta.failed = failed;
+	sep_ta.identify = identify;
 	sep_ta.registered = true;
 	ret = apple_ta_register_client(&sep_ta_ops, ctx);
 	if (ret)
@@ -355,22 +306,21 @@ void sep_stac_ta_unregister(void)
 		return;
 	/* Detaches every keyboard; the work then finds none. */
 	apple_ta_unregister_client(&sep_ta_ops);
-	cancel_work_sync(&sep_ta.identify);
+	cancel_work_sync(&sep_ta.identify_work);
 	sep_ta.registered = false;
 }
 
 void sep_stac_ta_identify(void)
 {
 	if (sep_ta.registered)
-		queue_work(system_freezable_wq, &sep_ta.identify);
+		queue_work(system_freezable_wq, &sep_ta.identify_work);
 }
 
 #else /* !IS_REACHABLE(CONFIG_HID_APPLE_TA) */
 
 int sep_stac_ta_register(void *ctx, sep_stac_ta_event_fn attached,
 			 sep_stac_ta_event_fn detached,
-			 sep_stac_ta_identified_fn identified,
-			 sep_stac_ta_failed_fn failed,
+			 sep_stac_ta_identify_fn identify,
 			 sep_stac_ta_pair_fn pair,
 			 sep_stac_ta_session_fn session)
 {

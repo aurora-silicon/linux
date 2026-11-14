@@ -8,11 +8,14 @@
 //! what runs next.
 //!
 //! When a keyboard's channel comes up, or the service comes back online with
-//! one attached, the shim reads the keyboard's protocol tag, identity and
-//! connection nonce with three feature-report reads, and the client asks the
-//! enclave whether that accessory is paired and authorised (0x02); for an
-//! unpaired one it also logs a fingerprint of the enclave's host attestation
-//! object (0x01). Nothing is written to the keyboard on its own. Whatever the
+//! one attached, the client runs the accessory handshake (see
+//! [`stac_ta_handshake`]) to learn the keyboard's identity and connection
+//! nonce, then asks the enclave whether that accessory is paired and
+//! authorised (0x02); for an unpaired one it also logs a fingerprint of the
+//! enclave's host attestation object (0x01). The handshake writes only the two
+//! protocol-handshake reports a keyboard needs before it will answer its
+//! identity (so a keyboard powered on cold, which comes up idle, is brought to
+//! where it identifies); it changes no pairing or enclave state. Whatever the
 //! lifecycle wants next (a per-connection session, a connection state) is
 //! logged as held and not run.
 //!
@@ -44,13 +47,12 @@ use kernel::{
 };
 
 use crate::stac_lifecycle::{Action, Event, Nonce, State, NONCE_LEN};
-use crate::stac_ops::{self, AccessoryId, ACCESSORY_ID_LEN};
+use crate::stac_ops::{self, AccessoryId, PublicPoint, ACCESSORY_ID_LEN};
 use crate::stac_ta_wire::{self as wire, WireError};
 use crate::SepData;
 
 type AttachFn = unsafe extern "C" fn(*mut c_void);
-type IdentifiedFn = unsafe extern "C" fn(*mut c_void, *const u8, *const u8);
-type FailedFn = unsafe extern "C" fn(*mut c_void, c_int);
+type IdentifyFn = unsafe extern "C" fn(*mut c_void);
 type PairFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 type SessionFn = unsafe extern "C" fn(*mut c_void) -> c_int;
 
@@ -67,8 +69,7 @@ extern "C" {
         ctx: *mut c_void,
         attached: AttachFn,
         detached: AttachFn,
-        identified: IdentifiedFn,
-        failed: FailedFn,
+        identify: IdentifyFn,
         pair: PairFn,
         session: SessionFn,
     ) -> c_int;
@@ -143,8 +144,7 @@ impl Client {
                 Arc::as_ptr(&sep).cast_mut().cast(),
                 attached,
                 detached,
-                identified,
-                failed,
+                identify,
                 pair,
                 session,
             )
@@ -192,31 +192,12 @@ unsafe extern "C" fn detached(ctx: *mut c_void) {
 }
 
 /// # Safety
-/// As for [`attached`]; `uid` and `nonce` point to 16 bytes each.
-unsafe extern "C" fn identified(ctx: *mut c_void, uid: *const u8, nonce: *const u8) {
+/// As for [`attached`]; called on the shim's identify work with the client
+/// lock held and a keyboard attached, so the keyboard cannot go away mid-way.
+unsafe extern "C" fn identify(ctx: *mut c_void) {
     // SAFETY: guaranteed by the registration.
     let sep = unsafe { &*ctx.cast::<SepData>() };
-    let mut id = AccessoryId([0; ACCESSORY_ID_LEN]);
-    let mut n = Nonce([0; NONCE_LEN]);
-    // SAFETY: the shim passes two 16-byte buffers it owns for the call.
-    unsafe {
-        id.0.copy_from_slice(core::slice::from_raw_parts(uid, ACCESSORY_ID_LEN));
-        n.0.copy_from_slice(core::slice::from_raw_parts(nonce, NONCE_LEN));
-    }
-    sep.stac_ta_event(Event::Identified(id, n));
-}
-
-/// # Safety
-/// As for [`attached`].
-unsafe extern "C" fn failed(ctx: *mut c_void, err: c_int) {
-    // SAFETY: guaranteed by the registration.
-    let sep = unsafe { &*ctx.cast::<SepData>() };
-    dev_info_ratelimited!(
-        sep.dev,
-        "stac: the keyboard did not identify itself ({})\n",
-        err
-    );
-    sep.stac_ta_event(Event::Failed);
+    sep.stac_ta_identify_run();
 }
 
 /// # Safety
@@ -284,6 +265,40 @@ enum SessionStop {
     Enclave(u16),
 }
 
+/// Where the accessory handshake stopped. Steps 0 and 1 mirror the pairing's:
+/// the tag, handoff and identity are step 0; the identity point and nonce are
+/// step 1. The pairing and session relays fold these into their own stops.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
+enum HandshakeStop {
+    /// The keyboard's tag or version is not the one this relay speaks.
+    Version,
+    /// The keyboard did not answer, or its answer did not check out.
+    Keyboard(u32, WireError),
+    /// The keyboard could not be written or read.
+    Transport(u32, i32),
+}
+
+impl From<HandshakeStop> for PairStop {
+    fn from(h: HandshakeStop) -> Self {
+        match h {
+            HandshakeStop::Version => PairStop::Version,
+            HandshakeStop::Keyboard(step, e) => PairStop::Keyboard(step, e),
+            HandshakeStop::Transport(step, e) => PairStop::Transport(step, e),
+        }
+    }
+}
+
+impl From<HandshakeStop> for SessionStop {
+    fn from(h: HandshakeStop) -> Self {
+        match h {
+            HandshakeStop::Version => SessionStop::Version,
+            HandshakeStop::Keyboard(step, e) => SessionStop::Keyboard(step, e),
+            HandshakeStop::Transport(step, e) => SessionStop::Transport(step, e),
+        }
+    }
+}
+
 /// One keyboard exchange: a command and, if `reply_id` is not 0, its reply.
 fn ta_command(cmd: &[u8], reply_id: u8, cap: usize, timeout_ms: u32) -> core::result::Result<KVec<u8>, i32> {
     let mut reply = KVec::new();
@@ -311,6 +326,94 @@ fn ta_read(id: u8, len: usize) -> core::result::Result<KVec<u8>, i32> {
     }
     buf.truncate(n as usize);
     Ok(buf)
+}
+
+/// The accessory channel the handshake and the pairing steps drive: one
+/// feature-report read (ID first), and one feature-report command that, when
+/// `reply_id` is not 0, awaits the keyboard's reply. The live channel talks to
+/// the keyboard through the shim; the tests record the order and feed canned
+/// replies, so the handshake order is checked without hardware.
+trait TaChannel {
+    fn read(&mut self, id: u8, len: usize) -> core::result::Result<KVec<u8>, i32>;
+    fn command(
+        &mut self,
+        cmd: &[u8],
+        reply_id: u8,
+        cap: usize,
+        timeout_ms: u32,
+    ) -> core::result::Result<KVec<u8>, i32>;
+}
+
+/// The live channel: the shim's feature-report read and command, run with the
+/// client lock held.
+struct ShimChannel;
+
+impl TaChannel for ShimChannel {
+    fn read(&mut self, id: u8, len: usize) -> core::result::Result<KVec<u8>, i32> {
+        ta_read(id, len)
+    }
+    fn command(
+        &mut self,
+        cmd: &[u8],
+        reply_id: u8,
+        cap: usize,
+        timeout_ms: u32,
+    ) -> core::result::Result<KVec<u8>, i32> {
+        ta_command(cmd, reply_id, cap, timeout_ms)
+    }
+}
+
+/// The accessory handshake every attach runs before the host knows whether to
+/// pair, in order:
+///
+///   1. GET the protocol tag and version (`get::TAG`), which must be the ones
+///      this relay speaks;
+///   2. SET the protocol handoff ([`wire::version_report`], `cmd::VERSION`):
+///      echo the tag back to select the protocol;
+///   3. GET the accessory identity (`get::UID`);
+///   4. SET the identity-point request (`cmd::IDENTITY`, step 1), answered by
+///      the keyboard's identity point (`reply::IDENTITY`);
+///   5. GET the fresh connection nonce (`get::NONCE`).
+///
+/// The two SETs are the only writes and carry no pairing or enclave state. A
+/// keyboard the other OS already handed off answers the reads without them, but
+/// one powered on cold comes up idle and stalls the identity read until the
+/// handoff, so the handshake always issues them. Returns the identity, its
+/// point and the nonce.
+fn stac_ta_handshake<C: TaChannel>(
+    ch: &mut C,
+) -> core::result::Result<(AccessoryId, PublicPoint, Nonce), HandshakeStop> {
+    let kb = |step: u32, e: WireError| HandshakeStop::Keyboard(step, e);
+    let io = |step: u32, e: i32| HandshakeStop::Transport(step, e);
+
+    // 1. The protocol tag and version.
+    let tag = ch.read(wire::get::TAG, 1 + wire::VERSION_BODY.len()).map_err(|e| io(0, e))?;
+    if tag.len() != 1 + wire::VERSION_BODY.len() || tag[1..] != wire::VERSION_BODY[..] {
+        return Err(HandshakeStop::Version);
+    }
+    // 2. Echo it back as the protocol handoff.
+    ch.command(&wire::version_report(), 0, 0, 0).map_err(|e| io(0, e))?;
+    // 3. The accessory identity.
+    let uid = ch.read(wire::get::UID, 1 + ACCESSORY_ID_LEN).map_err(|e| io(0, e))?;
+    if uid.len() != 1 + ACCESSORY_ID_LEN {
+        return Err(kb(0, WireError::Length));
+    }
+    let mut id = AccessoryId([0; ACCESSORY_ID_LEN]);
+    id.0.copy_from_slice(&uid[1..]);
+    // 4. The identity point.
+    let c = wire::command(wire::cmd::IDENTITY, 1, &[]).map_err(|_| io(1, -12))?;
+    let r = ch
+        .command(&c, wire::reply::IDENTITY, wire::POINT_REPLY_LEN, REPLY_MS)
+        .map_err(|e| io(1, e))?;
+    let point = wire::parse_point_reply(&r, wire::reply::IDENTITY, 1).map_err(|e| kb(1, e))?;
+    // 5. The fresh connection nonce.
+    let nr = ch.read(wire::get::NONCE, 1 + NONCE_LEN).map_err(|e| io(1, e))?;
+    if nr.len() != 1 + NONCE_LEN {
+        return Err(kb(1, WireError::Length));
+    }
+    let mut nonce = Nonce([0; NONCE_LEN]);
+    nonce.0.copy_from_slice(&nr[1..]);
+    Ok((id, point, nonce))
 }
 
 /// Sends one logical report to the keyboard (`report[0]` its logical ID, the
@@ -356,6 +459,33 @@ fn ta_set_logical(
 }
 
 impl SepData {
+    /// The accessory handshake, run on the shim's identify work (so the client
+    /// lock is held): bring the keyboard to where it answers its identity, read
+    /// its identity and nonce, then feed the lifecycle the result. Only the two
+    /// protocol-handshake reports are written; no pairing or enclave state
+    /// changes. A keyboard that will not answer feeds `Failed`, as the plain
+    /// reads did before.
+    fn stac_ta_identify_run(&self) {
+        match stac_ta_handshake(&mut ShimChannel) {
+            Ok((id, _point, nonce)) => self.stac_ta_event(Event::Identified(id, nonce)),
+            Err(stop) => {
+                match stop {
+                    HandshakeStop::Transport(_, e) => dev_info_ratelimited!(
+                        self.dev,
+                        "stac: the keyboard did not identify itself ({})\n",
+                        e
+                    ),
+                    other => dev_info_ratelimited!(
+                        self.dev,
+                        "stac: the keyboard did not identify itself ({:?})\n",
+                        other
+                    ),
+                }
+                self.stac_ta_event(Event::Failed);
+            }
+        }
+    }
+
     /// Pairs the attached keyboard with the enclave. Runs only from the
     /// `ta_pair` trigger, for a keyboard the enclave reports unpaired.
     fn stac_ta_pair(&self) -> Result<()> {
@@ -424,22 +554,11 @@ impl SepData {
             .map_err(|_| PairStop::HostObject)?;
         wire::check_chain(fw.data(), &digest).map_err(|_| PairStop::WrongChain)?;
 
-        // Tag, version echo, identity, identity point, nonce.
-        let tag = ta_read(0x4b, 9).map_err(|e| io(0, e))?;
-        if tag.len() != 9 || tag[1..] != wire::VERSION_BODY[..] {
-            return Err(PairStop::Version);
-        }
-        ta_command(&wire::version_report(), 0, 0, 0).map_err(|e| io(0, e))?;
-        let uid = ta_read(0x41, 1 + ACCESSORY_ID_LEN).map_err(|e| io(0, e))?;
-        if uid.len() != 1 + ACCESSORY_ID_LEN {
-            return Err(kb(0, WireError::Length));
-        }
-        let mut id = AccessoryId([0; ACCESSORY_ID_LEN]);
-        id.0.copy_from_slice(&uid[1..]);
-        let c = wire::command(wire::cmd::IDENTITY, 1, &[]).map_err(|_| io(1, -12))?;
-        let r = ta_command(&c, wire::reply::IDENTITY, wire::POINT_REPLY_LEN, REPLY_MS).map_err(|e| io(1, e))?;
-        let identity = wire::parse_point_reply(&r, wire::reply::IDENTITY, 1).map_err(|e| kb(1, e))?;
-        ta_read(0x4c, 1 + NONCE_LEN).map_err(|e| io(1, e))?;
+        // The accessory handshake: tag, protocol handoff, identity, identity
+        // point, nonce (see [`stac_ta_handshake`]). Its stops fold into this
+        // relay's through `From`. The nonce is unused here; the pairing binds
+        // to the enclave's object, not this read.
+        let (id, identity, _nonce) = stac_ta_handshake(&mut ShimChannel)?;
 
         // Step 2: the keyboard checks the host object. Its 137-byte body is
         // too large for a direct SET on USB, so it goes over the 0xfe
@@ -567,23 +686,10 @@ impl SepData {
         let host = self.stac_session_body(Op::HostAttestationObject, &[], stac_ops::HOST_OBJECT_REPLY_LEN)?;
         stac_ops::parse_host_object_len(&host).map_err(|_| SessionStop::Enclave(Op::HostAttestationObject.opcode()))?;
 
-        // Tag, version echo, identity, identity point, nonce: the same opening
-        // the pairing uses, so the keyboard is the one this relay speaks to.
-        let tag = ta_read(0x4b, 9).map_err(|e| io(0, e))?;
-        if tag.len() != 9 || tag[1..] != wire::VERSION_BODY[..] {
-            return Err(SessionStop::Version);
-        }
-        ta_command(&wire::version_report(), 0, 0, 0).map_err(|e| io(0, e))?;
-        let uid = ta_read(0x41, 1 + ACCESSORY_ID_LEN).map_err(|e| io(0, e))?;
-        if uid.len() != 1 + ACCESSORY_ID_LEN {
-            return Err(kb(0, WireError::Length));
-        }
-        let mut id = AccessoryId([0; ACCESSORY_ID_LEN]);
-        id.0.copy_from_slice(&uid[1..]);
-        let c = wire::command(wire::cmd::IDENTITY, 1, &[]).map_err(|_| io(1, -12))?;
-        let r = ta_command(&c, wire::reply::IDENTITY, wire::POINT_REPLY_LEN, REPLY_MS).map_err(|e| io(1, e))?;
-        wire::parse_point_reply(&r, wire::reply::IDENTITY, 1).map_err(|e| kb(1, e))?;
-        ta_read(0x4c, 1 + NONCE_LEN).map_err(|e| io(1, e))?;
+        // The accessory handshake, the same opening the pairing uses, so the
+        // keyboard is the one this relay speaks to (see [`stac_ta_handshake`]).
+        // Its stops fold into this relay's through `From`.
+        let (id, _identity, _nonce) = stac_ta_handshake(&mut ShimChannel)?;
 
         // Confirm paired, both at the enclave (0x02) and at the keyboard
         // (SET 0x60 -> IN 0x42): a session only opens on a paired keyboard.
@@ -831,6 +937,109 @@ mod tests {
 
     const ID: AccessoryId = AccessoryId([7; ACCESSORY_ID_LEN]);
     const NONCE: Nonce = Nonce([9; NONCE_LEN]);
+
+    /// One exchange the recording channel logged: a read of a report, or a
+    /// command of a report awaiting the given reply ID (0 for none).
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Op {
+        Read(u8),
+        Command(u8, u8),
+    }
+
+    /// A [`TaChannel`] that records the order of exchanges and answers each
+    /// with a canned reply, so the handshake order is checked without a
+    /// keyboard. The identity reads back as all 7s, the nonce as all 9s.
+    struct Recorder {
+        ops: KVec<Op>,
+        good_tag: bool,
+    }
+
+    impl Recorder {
+        fn new() -> Self {
+            Recorder {
+                ops: KVec::new(),
+                good_tag: true,
+            }
+        }
+    }
+
+    impl TaChannel for Recorder {
+        fn read(&mut self, id: u8, _len: usize) -> core::result::Result<KVec<u8>, i32> {
+            self.ops.push(Op::Read(id), GFP_KERNEL).unwrap();
+            let mut v = KVec::new();
+            v.push(id, GFP_KERNEL).unwrap();
+            match id {
+                wire::get::TAG => {
+                    let mut body = wire::VERSION_BODY;
+                    if !self.good_tag {
+                        body[0] ^= 0xff; // no longer the tag this relay speaks
+                    }
+                    v.extend_from_slice(&body, GFP_KERNEL).unwrap();
+                }
+                wire::get::UID => v.resize(1 + ACCESSORY_ID_LEN, 7, GFP_KERNEL).unwrap(),
+                wire::get::NONCE => v.resize(1 + NONCE_LEN, 9, GFP_KERNEL).unwrap(),
+                _ => {}
+            }
+            Ok(v)
+        }
+
+        fn command(
+            &mut self,
+            cmd: &[u8],
+            reply_id: u8,
+            _cap: usize,
+            _timeout_ms: u32,
+        ) -> core::result::Result<KVec<u8>, i32> {
+            self.ops.push(Op::Command(cmd[0], reply_id), GFP_KERNEL).unwrap();
+            if reply_id == 0 {
+                return Ok(KVec::new());
+            }
+            // The identity point reply: [id][u32 step 1][u32 status 0][point],
+            // the point led by the uncompressed-point byte.
+            let mut r = KVec::new();
+            r.push(reply_id, GFP_KERNEL).unwrap();
+            r.extend_from_slice(&1u32.to_le_bytes(), GFP_KERNEL).unwrap();
+            r.extend_from_slice(&0u32.to_le_bytes(), GFP_KERNEL).unwrap();
+            r.push(0x04, GFP_KERNEL).unwrap();
+            r.resize(wire::POINT_REPLY_LEN, 0x11, GFP_KERNEL).unwrap();
+            Ok(r)
+        }
+    }
+
+    // The attach handshake runs exactly the macOS order: GET 0x4b, SET 0x68,
+    // GET 0x41, SET 0x67 answered by IN 0x40, GET 0x4c — and returns the
+    // identity, its point and the nonce the reads carried.
+    #[test]
+    fn the_attach_handshake_follows_the_macos_order() {
+        let mut ch = Recorder::new();
+        let (id, point, nonce) = stac_ta_handshake(&mut ch).unwrap();
+        assert_eq!(
+            &ch.ops[..],
+            &[
+                Op::Read(wire::get::TAG),                             // GET 0x4b
+                Op::Command(wire::cmd::VERSION, 0),                   // SET 0x68
+                Op::Read(wire::get::UID),                            // GET 0x41
+                Op::Command(wire::cmd::IDENTITY, wire::reply::IDENTITY), // SET 0x67 / IN 0x40
+                Op::Read(wire::get::NONCE),                          // GET 0x4c
+            ]
+        );
+        assert_eq!(id.0, [7; ACCESSORY_ID_LEN]);
+        assert_eq!(nonce.0, [9; NONCE_LEN]);
+        assert_eq!(point.0[0], 0x04);
+    }
+
+    // A keyboard whose protocol tag is not the one this relay speaks stops at
+    // the first read, before the handoff or any other write.
+    #[test]
+    fn the_handshake_refuses_a_foreign_tag_before_writing() {
+        let mut ch = Recorder::new();
+        ch.good_tag = false;
+        assert!(matches!(
+            stac_ta_handshake(&mut ch),
+            Err(HandshakeStop::Version)
+        ));
+        assert_eq!(&ch.ops[..], &[Op::Read(wire::get::TAG)]);
+    }
 
     #[test]
     fn only_reads_run() {
