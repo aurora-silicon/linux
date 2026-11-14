@@ -56,6 +56,8 @@ struct cs42l84_private {
 	bool dsp_a;
 	int hs_type;
 	bool remote_active;
+	/* macOS's detect scheme: plug state from ring sense, tip sense masked */
+	bool ring_detect;
 	unsigned int remote_btn1_prev;
 	unsigned int remote_short_prev;
 	struct delayed_work remote_poll_work;
@@ -1010,6 +1012,33 @@ static irqreturn_t cs42l84_irq_thread(int irq, void *data)
 				irq_params_table[i].mask;
 	}
 
+	if (cs42l84->ring_detect) {
+		regmap_read(cs42l84->regmap, CS42L84_TSRS_PLUG_STATUS, &reg);
+		current_ring_state = (((char)reg) &
+		      (CS42L84_RS_PLUG | CS42L84_RS_UNPLUG)) >>
+		      CS42L84_RS_PLUG_SHIFT;
+		if (current_ring_state == cs42l84->ring_state)
+			return IRQ_HANDLED;
+		cs42l84->ring_state = current_ring_state;
+		switch (current_ring_state) {
+		case CS42L84_PLUG:
+			dev_dbg(cs42l84->dev, "Plug event (ring sense)\n");
+			cs42l84->tip_state = CS42L84_PLUG;
+			cs42l84_detect_hs(cs42l84);
+			break;
+		case CS42L84_UNPLUG:
+			dev_dbg(cs42l84->dev, "Unplug event (ring sense)\n");
+			cs42l84->tip_state = CS42L84_UNPLUG;
+			cs42l84_revert_hs(cs42l84);
+			cs42l84->hs_type = 0;
+			snd_soc_jack_report(cs42l84->jack, 0, SND_JACK_HEADSET);
+			break;
+		default:
+			break;
+		}
+		return IRQ_HANDLED;
+	}
+
 	/* When handling plug sene IRQs, we only care about EITHER tip OR ring.
 	 * Ring is useless on remove, and is only useful on insert for
 	 * detecting if the plug state has changed AFTER we have handled the
@@ -1179,6 +1208,12 @@ static int cs42l84_apply_init_writes(struct cs42l84_private *cs42l84)
 	}
 
 	dev_dbg(dev, "%d init writes\n", n / 2);
+	/*
+	 * macOS's probe sequence leaves the codec in macOS's detect setup,
+	 * where macOS takes plug state from ring sense and keeps tip sense
+	 * masked. Follow it there (see cs42l84_i2c_probe()).
+	 */
+	cs42l84->ring_detect = true;
 	return 0;
 }
 
@@ -1275,8 +1310,25 @@ static int cs42l84_i2c_probe(struct i2c_client *i2c_client)
 	/* Setup plug detection */
 	cs42l84_setup_plug_detect(cs42l84);
 
-	/* Mask ring sense interrupts */
-	cs42l84_set_interrupt_masks(cs42l84, CS42L84_RS_PLUG | CS42L84_RS_UNPLUG);
+	/*
+	 * Mask what macOS masks. With its probe sequence macOS writes
+	 * TSRS_PLUG_INT_MASK = 0xfc: ring sense on, tip sense off. In that
+	 * setup tip sense keeps re-asserting with nothing plugged in (on the
+	 * J604 about 1000 interrupts and 2000 I2C transfers a second), so the
+	 * plug state comes from ring sense instead. Otherwise keep ring sense
+	 * masked until tip sense reports a plug.
+	 */
+	if (cs42l84->ring_detect) {
+		regmap_read(cs42l84->regmap, CS42L84_TSRS_PLUG_STATUS, &reg);
+		cs42l84->ring_state = (((char)reg) &
+		      (CS42L84_RS_PLUG | CS42L84_RS_UNPLUG)) >>
+		      CS42L84_RS_PLUG_SHIFT;
+		cs42l84_set_interrupt_masks(cs42l84,
+					    CS42L84_TS_PLUG | CS42L84_TS_UNPLUG);
+	} else {
+		cs42l84_set_interrupt_masks(cs42l84,
+					    CS42L84_RS_PLUG | CS42L84_RS_UNPLUG);
+	}
 
 	/* Register codec for machine driver */
 	ret = devm_snd_soc_register_component(&i2c_client->dev,
