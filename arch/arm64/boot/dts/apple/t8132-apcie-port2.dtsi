@@ -4,9 +4,9 @@
  * pci-bridge2, with its own DART dart-apcie2): the J604 SD card reader
  * and the J773g Ethernet. Values from the J604 and J773g ADTs.
  *
- * The controller runs the managed radio contract, which admits port 0
- * only, so the port and its DART stay disabled until it admits a second
- * port and its stream.
+ * The managed radio contract admits only port 0, so this port and its
+ * DART stay disabled by default. The J773g enables both by opting out of
+ * the contract and mapping the Ethernet controller to this DART.
  *
  * Copyright The Asahi Linux Contributors
  */
