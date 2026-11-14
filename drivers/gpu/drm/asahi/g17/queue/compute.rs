@@ -180,7 +180,7 @@ impl Graph {
         let ring = DescriptorRing::new(alloc, objects)?;
         let preempt = alloc.kernel(0x4000, page, prot, cpu)?;
         let usage = alloc.kernel(mmu::UAT_PGSZ, page, prot, cpu)?;
-        let operand = alloc.lower(operand_state.size, page, prot, cpu)?;
+        let operand = alloc.lower_small(operand_state.size, page, prot, cpu)?;
         // The M5 support page is firmware-only; the GPU has no access to it.
         let support_prot = if m5 { mmu::PROT_FW_SHARED_RW } else { prot };
         let mut support = alloc.kernel(if m5 { mmu::UAT_PGSZ } else { 0xc000 }, page, support_prot, cpu)?;
@@ -225,7 +225,7 @@ impl Graph {
             graph.write(0, QueueRecord::new(&record))?;
         }
         let (context_low, context_high) = if m5 { (None, None) } else {
-            (Some(alloc.lower(CONTEXT_SIZE, page, prot, cpu)?),
+            (Some(alloc.lower_small(CONTEXT_SIZE, page, prot, cpu)?),
              Some(alloc.kernel(CONTEXT_SIZE, page, prot, cpu)?))
         };
         let records = alloc.kernel(RECORD_SLOTS * RECORD_STRIDE, page, prot, cpu)?;
