@@ -114,6 +114,15 @@ properties:
       must not enter software shutdown until the bus has stopped. One shut
       down while the bus still runs can leave garbage in its sense slots.
 
+  apple,init-writes:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 3
+    maxItems: 48
+    description:
+      SN012776 only. Register writes the vendor's driver makes when it
+      initialises this amplifier and that no built-in quirk covers, as
+      (page, register, value) triples, applied after the built-in quirks.
+
   apple,shutdown-dance:
     type: boolean
     description:
