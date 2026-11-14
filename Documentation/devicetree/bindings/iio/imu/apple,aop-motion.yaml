@@ -29,6 +29,7 @@ properties:
               - apple,t6041-aop-accel
               - apple,t8112-aop-accel
               - apple,t8132-aop-accel
+              - apple,t8142-aop-accel
           - const: apple,aop-accel
       - items:
           - enum:
@@ -36,6 +37,7 @@ properties:
               - apple,t6041-aop-gyro
               - apple,t8112-aop-gyro
               - apple,t8132-aop-gyro
+              - apple,t8142-aop-gyro
           - const: apple,aop-gyro
 
   label:

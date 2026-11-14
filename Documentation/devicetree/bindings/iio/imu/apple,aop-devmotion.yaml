@@ -20,6 +20,7 @@ properties:
       - enum:
           - apple,t6041-aop-devmotion6
           - apple,t8132-aop-devmotion6
+          - apple,t8142-aop-devmotion6
       - const: apple,aop-devmotion6
 
 required:
