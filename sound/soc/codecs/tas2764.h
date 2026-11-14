@@ -15,6 +15,9 @@
 #define TAS2764_BOOKCTL_REG	127
 #define TAS2764_REG(page, reg)	((page * 128) + reg)
 
+/* apple,init-writes: at most this many (page, register, value) triples */
+#define TAS2764_INIT_WRITES_MAX	16
+
 /* Page */
 #define TAS2764_PAGE		TAS2764_REG(0X0, 0x00)
 #define TAS2764_PAGE_PAGE_MASK	255
