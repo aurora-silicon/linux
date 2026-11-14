@@ -1013,6 +1013,13 @@ static irqreturn_t cs42l84_irq_thread(int irq, void *data)
 	}
 
 	if (cs42l84->ring_detect) {
+		/*
+		 * macOS's probe writes unmask two more sources in 0x1480 (bits
+		 * 5 and 6); their status latches in REMOTE_BUTTON_STATUS1 and is
+		 * cleared by reading it, which macOS's handler does. Unread, it
+		 * holds the interrupt line asserted for good.
+		 */
+		regmap_read(cs42l84->regmap, CS42L84_REMOTE_BUTTON_STATUS1, &reg);
 		regmap_read(cs42l84->regmap, CS42L84_TSRS_PLUG_STATUS, &reg);
 		current_ring_state = (((char)reg) &
 		      (CS42L84_RS_PLUG | CS42L84_RS_UNPLUG)) >>
@@ -1306,6 +1313,9 @@ static int cs42l84_i2c_probe(struct i2c_client *i2c_client)
 	ret = cs42l84_apply_init_writes(cs42l84);
 	if (ret)
 		goto err_shutdown;
+	/* The sources they unmask come up latched (0x60): clear them now. */
+	if (cs42l84->ring_detect)
+		regmap_read(cs42l84->regmap, CS42L84_REMOTE_BUTTON_STATUS1, &reg);
 
 	/* Setup plug detection */
 	cs42l84_setup_plug_detect(cs42l84);
