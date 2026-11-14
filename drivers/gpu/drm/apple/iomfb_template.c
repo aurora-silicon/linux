@@ -741,11 +741,41 @@ static void dcp_peer_queue_completion(struct apple_dcp *owner, u32 id, ktime_t t
 }
 #endif
 
+#if DCP_FW_H17(DCP_FW_VER) && !DCP_FW_DESKTOP_26(DCP_FW_VER)
+/*
+ * Diagnostic: log the D590 fields the driver does not decode, to find
+ * which one tells a swap that reached the panel from one that did not.
+ */
+static void dcp_swap_complete_dbg(struct apple_dcp *dcp,
+				  const struct DCP_FW_NAME(dc_swap_complete_resp) *resp,
+				  ktime_t now)
+{
+	u32 n = min_t(u32, resp->swap_info_count, 2);
+	u32 i;
+
+	dev_dbg(dcp->dev,
+		"swap_done: id %u t %lld b %u hol %u/%u [%u %u %u %u] arg %u disp %#llx nd %u cnt %u cf %u dnull %u\n",
+		resp->swap_id, ktime_to_ns(now), resp->unkbool,
+		resp->hol_valid, resp->hol_count, resp->hol_swap_ids[0],
+		resp->hol_swap_ids[1], resp->hol_swap_ids[2],
+		resp->hol_swap_ids[3], resp->hol_arg,
+		(unsigned long long)resp->displayed_data,
+		resp->notify_displayed, resp->swap_info_count,
+		resp->completion_flag, resp->swap_data_null);
+	for (i = 0; i < n; i++)
+		print_hex_dump_debug("swap_info: ", DUMP_PREFIX_OFFSET, 32, 8,
+				     resp->swap_info[i], 0xe0, false);
+}
+#endif
+
 static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 				   struct DCP_FW_NAME(dc_swap_complete_resp) *resp)
 {
 	ktime_t now = ktime_get();
 	trace_iomfb_swap_complete(dcp, resp->swap_id);
+#if DCP_FW_H17(DCP_FW_VER) && !DCP_FW_DESKTOP_26(DCP_FW_VER)
+	dcp_swap_complete_dbg(dcp, resp, now);
+#endif
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
 	if (dcp_peer_swap_complete_v27(dcp, resp->swap_id, now, dcp_peer_queue_completion))
 		return;
