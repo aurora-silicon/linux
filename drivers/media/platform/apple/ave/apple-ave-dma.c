@@ -6,6 +6,7 @@
 #include <linux/io.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 
 #define AVE_DMA_ERROR_STATUS		0x40
 #define AVE_DMA_ERROR_PENDING		BIT(31)
@@ -51,7 +52,7 @@ static irqreturn_t apple_ave_dma_irq(int irq, void *data)
 static int apple_ave_dma_probe(struct platform_device *pdev)
 {
 	struct apple_ave_dma *dma;
-	int irq;
+	int irq, ret;
 
 	dma = devm_kzalloc(&pdev->dev, sizeof(*dma), GFP_KERNEL);
 	if (!dma)
@@ -66,8 +67,35 @@ static int apple_ave_dma_probe(struct platform_device *pdev)
 	if (irq < 0)
 		return irq;
 
-	return devm_request_irq(&pdev->dev, irq, apple_ave_dma_irq,
-				IRQF_SHARED, dev_name(&pdev->dev), dma);
+	/*
+	 * This reporter sits in the venc_sys power domain, which the encoder
+	 * and its DARTs gate whenever the codec is idle. Enable runtime PM and
+	 * leave it runtime-suspended so it does not vote the domain on; without
+	 * this genpd treats the bound device as active and pins ps_venc_sys
+	 * forever, defeating the encoder's idle power saving. A DMA fault can
+	 * only be raised - and the interrupt it shares with the codec DARTs
+	 * only asserted - while the encoder runs, so the handler always touches
+	 * registers in a powered domain. The domain is live at bind (the codec
+	 * DARTs are already up), so start active and drop the vote once the
+	 * handler is in place.
+	 */
+	pm_runtime_get_noresume(&pdev->dev);
+	pm_runtime_set_active(&pdev->dev);
+	ret = devm_pm_runtime_enable(&pdev->dev);
+	if (ret) {
+		pm_runtime_put_noidle(&pdev->dev);
+		return ret;
+	}
+
+	ret = devm_request_irq(&pdev->dev, irq, apple_ave_dma_irq,
+			       IRQF_SHARED, dev_name(&pdev->dev), dma);
+	if (ret) {
+		pm_runtime_put_noidle(&pdev->dev);
+		return ret;
+	}
+
+	pm_runtime_put(&pdev->dev);
+	return 0;
 }
 
 static const struct of_device_id apple_ave_dma_of_match[] = {
