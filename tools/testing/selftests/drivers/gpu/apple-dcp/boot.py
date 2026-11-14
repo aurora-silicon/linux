@@ -92,9 +92,10 @@ def syslog(root):
     dcp = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
     header = (root / 'drivers/gpu/drm/apple/dcp-syslog.h').read_text()
     helper = header[header.index('static inline bool'):header.index('\n#endif')]
-    # The policy belongs only to the external H17P transport. Other RTKit
-    # clients, including the panel and older DCP firmware, keep info logging.
-    assert '.syslog_is_debug' not in block(dcp, 'static struct apple_rtkit_ops rtkit_ops =')
+    # The policy covers both DCP transports, the internal panel's and the
+    # external H17P one. It demotes only the known records it matches, so other
+    # records, other firmware and other RTKit clients keep info logging.
+    assert '.syslog_is_debug = dcp_rtk_syslog_is_debug' in block(dcp, 'static struct apple_rtkit_ops rtkit_ops =')
     assert '.syslog_is_debug = dcp_rtk_syslog_is_debug' in block(dcp, 'static const struct apple_rtkit_ops external_h17p_rtkit_ops =')
     return r'''
 #include <assert.h>
