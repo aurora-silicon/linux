@@ -375,6 +375,28 @@ static void announce_new_connection_sleep_again_test(struct kunit *test)
 	announce_test_sleep_again(test, false, DCP_ANNOUNCE_TIMEOUT_MS);
 }
 
+/*
+ * A wedged external DCP: the reported connection ends and a hotplug event
+ * goes out, so that a compositor drops the output.  The connection does not
+ * come back when the CRTC is released.
+ */
+static void announce_wedged_test(struct kunit *test)
+{
+	struct announce_test *t = announce_test_init(test);
+
+	t->dcp.announce.announced = true;
+	dcp_external_wedged(&t->dcp);
+	flush_work(&t->con.hotplug_wq);
+
+	KUNIT_EXPECT_TRUE(test, READ_ONCE(t->dcp.crashed));
+	KUNIT_EXPECT_GT(test, atomic_read(&t->events), 0);
+	KUNIT_EXPECT_FALSE(test, announce_test_detect(t));
+	KUNIT_EXPECT_TRUE(test, t->dcp.announce.withdrawn);
+	dcp_external_crtc_released(&t->dcp);
+	flush_work(&t->con.hotplug_wq);
+	KUNIT_EXPECT_FALSE(test, announce_test_detect(t));
+}
+
 static struct kunit_case external_announce_cases[] = {
 	KUNIT_CASE(announce_cold_timeout_probe_test),
 	KUNIT_CASE(announce_timer_probe_once_test),
@@ -385,6 +407,7 @@ static struct kunit_case external_announce_cases[] = {
 	KUNIT_CASE(announce_release_while_stopped_test),
 	KUNIT_CASE(announce_resume_hold_sleep_again_test),
 	KUNIT_CASE(announce_new_connection_sleep_again_test),
+	KUNIT_CASE(announce_wedged_test),
 	{}
 };
 

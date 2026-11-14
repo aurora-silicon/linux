@@ -2539,6 +2539,7 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 
 	if (ret == 0) {
 		dev_warn(dcp->dev, "wait for power timed out, connector will be broken\n");
+		dcp_external_wedged(dcp);
 	} else if (ret > 0) {
 		int msecs = jiffies_to_msecs(ret);
 		if (msecs > 6000)

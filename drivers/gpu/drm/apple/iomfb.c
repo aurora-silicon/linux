@@ -537,6 +537,7 @@ static void iomfb_queue_timeout(struct work_struct *work)
 		}
 		iomfb_discard_pending(dcp);
 		schedule_work(&dcp->vblank_wq);
+		dcp_external_wedged(dcp);
 	}
 	mutex_unlock(&dcp->iomfb.lock);
 }
@@ -1375,8 +1376,8 @@ dcp_announce_eval(struct apple_dcp *dcp, struct apple_connector *connector,
 		.generation = dcp->typec_generation,
 		.connected = READ_ONCE(connector->connected),
 		.present = !READ_ONCE(dcp->external_physically_absent),
-		.failed = READ_ONCE(dcp->external_error) || READ_ONCE(dcp->crashed),
-		.lost = dcp_announce_lost(a, dcp->typec_generation),
+		.failed = READ_ONCE(dcp->external_error),
+		.lost = dcp_announce_lost(a, dcp->typec_generation) || READ_ONCE(dcp->crashed),
 	};
 	enum dcp_announce_status status;
 	unsigned long now = jiffies;
@@ -1450,6 +1451,23 @@ bool dcp_connector_connected(struct apple_connector *connector)
 	guard(mutex)(&dcp->hpd_mutex);
 	dcp_announce_poll(dcp, connector, false);
 	return dcp->announce.announced;
+}
+
+/*
+ * The external coprocessor stopped answering: a transaction or a power-on
+ * timed out.  Its connection is no longer reported (dcp_announce_eval()
+ * treats a crashed DCP as lost), and the hotplug worker tells userspace, so
+ * that a compositor stops drawing to an output that cannot show a frame.
+ */
+void dcp_external_wedged(struct apple_dcp *dcp)
+{
+	struct apple_connector *con = READ_ONCE(dcp->connector);
+
+	if (!con || !dcp_announce_gated(dcp, con))
+		return;
+	WRITE_ONCE(dcp->crashed, true);
+	dev_warn(dcp->dev, "external display wedged: reporting it disconnected\n");
+	schedule_work(&con->hotplug_wq);
 }
 
 /* The CRTC userspace keeps active on @connector while its link is down. */
