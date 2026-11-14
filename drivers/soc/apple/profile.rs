@@ -500,17 +500,17 @@ pub(crate) const T8132: PlatformProfile = PlatformProfile {
     ..T8122
 };
 
-/// MacBook Air 15" M5 (J815). The J815 ADT (macOS 27.0 stub firmware) puts
+/// MacBook Air M5 (J813 and J815). Their ADTs (macOS 27.0 stub firmware) put
 /// the Mesa sensor (`V3`, the J700/J713/J714s generation) on spi2 at
 /// `0x3a5108000`, 8 MHz, chip select 0, with power on the NUB GPIO controller
 /// (pin 36) and data-ready on AP GPIO 200. The SEP is a pre-booted
 /// `iop-sep,ascwrap-v6` (`sepfw-booted`) behind a t8110 DART whose input
 /// aperture is the BIT(40) alias (`vm-base-0` 0x10000004000, `vm-size-0`
 /// 0xffff0000): the same SoC side as T8132 and T6050 (J714s, the M5 Pro).
-/// So this is T8132's profile with the sensor bus moved. On J815 the SEP
-/// attaches with it; the sensor session itself is not tested yet.
+/// So this is T8132's profile with the sensor bus moved. J813 was tested
+/// with explicit xart_guard=1; the inherited guard policy is unchanged.
 pub(crate) const T8142: PlatformProfile = PlatformProfile {
-    name: "T8142/J815",
+    name: "T8142/J813, J815",
     sensor: SensorProfile {
         controller_base: 0x3_a510_8000,
         ..T8132.sensor
@@ -710,8 +710,9 @@ fn select(
     if has(b"apple,t8132") && (has(b"apple,j713") || has(b"apple,j715")) {
         return Ok(&T8132);
     }
-    // Only the J815, whose ADT was read; the J813's sensor bus is unchecked.
-    if has(b"apple,t8142") && has(b"apple,j815") {
+    // The J815 and the J813, whose ADTs were read (macOS 27.0 stub firmware):
+    // the J813's SEP, its DART, spi2 and the Mesa node carry the J815's values.
+    if has(b"apple,t8142") && (has(b"apple,j815") || has(b"apple,j813")) {
         return Ok(&T8142);
     }
     Err(ENODEV)
@@ -721,6 +722,30 @@ fn select(
 #[::kernel::macros::kunit_tests(apple_sep_profile)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn t8142_sensor_boards_require_the_matching_soc() {
+        assert_eq!(T8142.xart_guard, 1);
+        let cases: [(&[u8], &[u8], bool); 8] = [
+            (b"apple,t8142", b"apple,j813", true),
+            (b"apple,t8142", b"apple,j815", true),
+            (b"apple,t8142", b"apple,j814", false),
+            (b"apple,t8142", b"apple,j704", false),
+            (b"apple,t8142", b"", false),
+            (b"", b"apple,j813", false),
+            (b"apple,t8132", b"apple,j813", false),
+            (b"apple,t6050", b"apple,j815", false),
+        ];
+        for (soc, board, admitted) in cases {
+            let has = |c: &[u8]| c == soc || c == board;
+            let selected = select(&has, &|| &T6020);
+            if admitted {
+                assert!(matches!(selected, Ok(profile) if profile.name == T8142.name));
+            } else {
+                assert!(selected.is_err());
+            }
+        }
+    }
 
     #[test]
     fn old_firmware_uses_the_legacy_key_store() {
@@ -807,7 +832,7 @@ mod tests {
     /// profile naming one of the known Mesa revisions.
     #[test]
     fn every_touch_id_mac_gets_a_sensor_the_shared_path_decodes() {
-        let macs: [&[&[u8]]; 15] = [
+        let macs: [&[&[u8]]; 17] = [
             &[b"apple,j313", b"apple,t8103"],
             &[b"apple,j316s", b"apple,t6000"],
             &[b"apple,j316c", b"apple,t6001"],
@@ -823,6 +848,8 @@ mod tests {
             &[b"apple,j713", b"apple,t8132"],
             &[b"apple,j700", b"apple,t8140"],
             &[b"apple,j714s", b"apple,t6050"],
+            &[b"apple,j813", b"apple,t8142"],
+            &[b"apple,j815", b"apple,t8142"],
         ];
         for compatibles in macs {
             let has = |c: &[u8]| compatibles.iter().any(|x| *x == c);
@@ -884,6 +911,7 @@ mod dart_window_tests {
             &T6041,
             &T6050,
             &T8132,
+            &T8142,
         ] {
             assert_eq!(offset(profile.dart_window), 1 << 40);
             assert_eq!(range(profile.dart_window), (0, 1 << 32));

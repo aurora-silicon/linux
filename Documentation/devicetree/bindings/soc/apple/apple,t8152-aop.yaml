@@ -75,6 +75,29 @@ properties:
     description: The lid angle sensor service.
     unevaluatedProperties: false
 
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8142-aop
+    then:
+      properties:
+        als:
+          properties:
+            compatible:
+              items:
+                - const: apple,t8142-aop-als
+                - const: apple,aop-als
+    else:
+      properties:
+        als:
+          properties:
+            compatible:
+              not:
+                contains:
+                  const: apple,t8142-aop-als
+
 required:
   - compatible
   - reg
