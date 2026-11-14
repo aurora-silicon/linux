@@ -5307,14 +5307,67 @@ static int dcp_read_fw_version(struct device *dev, const char *name,
 	return len;
 }
 
+/*
+ * The M1/M2/M3 display processors share the T6050 firmware-27 wire generation.
+ * @compat_is answers whether a device node carries a compatible string, so the
+ * same list is used by probe and by the host test.
+ */
+bool dcp_refmac_v27_compat(dcp_compat_fn compat_is, const void *ctx)
+{
+	static const char * const compats[] = {
+		"apple,t8103-dcp",  "apple,t8103-dcpext",
+		"apple,t6000-dcp",  "apple,t6000-dcpext",
+		"apple,t8112-dcp",  "apple,t8112-dcpext",
+		"apple,t6020-dcp",  "apple,t6020-dcpext",
+		"apple,t8122-dcp",  "apple,t8122-dcpext",
+		"apple,t6030-dcp",  "apple,t6030-dcpext",
+		"apple,t6031-dcp",  "apple,t6031-dcpext",
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(compats); i++)
+		if (compat_is(ctx, compats[i]))
+			return true;
+	return false;
+}
+
+static bool dcp_node_compat_is(const void *np, const char *compat)
+{
+	return of_device_is_compatible(np, compat);
+}
+
+static bool dcp_node_is_refmac_v27(const struct device_node *np)
+{
+	return dcp_refmac_v27_compat(dcp_node_compat_is, np);
+}
+
+static bool dcp_v27_method_table_supported(struct device *dev,
+					   const char *compat)
+{
+	const struct dcp_method_entry *methods = iomfb_v27_methods(compat);
+	unsigned int num_missing;
+	const char *missing;
+
+	if (!methods) {
+		dev_err(dev, "DCP firmware-compat %s has no 27.x method table\n",
+			compat);
+		return false;
+	}
+	missing = iomfb_v27_missing_method(methods, &num_missing);
+	if (missing) {
+		dev_err(dev, "DCP firmware-compat %s not started: no ID known for %u methods (first: %s)\n",
+			compat, num_missing, missing);
+		return false;
+	}
+	return true;
+}
+
 static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 {
 	const struct apple_dcp_hw_data *hw = of_device_get_match_data(dev);
 	const struct dcp_v14_board *v14_board;
 	char compat_str[DCP_FW_VERSION_STR_LEN];
 	char fw_str[DCP_FW_VERSION_STR_LEN];
-	unsigned int num_missing;
-	const char *missing;
 	int ret;
 
 	/*
@@ -5329,18 +5382,27 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 			return DCP_FIRMWARE_V_27_0;
 	}
 
+	/*
+	 * The M1/M2/M3 processors are one firmware-27 wire generation with the
+	 * T6050. On exact firmware-compat 27.2.0 they run that generation, so
+	 * admit it before the 14.7 board and special-profile paths below. The
+	 * older admissions stay in place for the firmware those boards still
+	 * boot.
+	 */
+	if (dcp_node_is_refmac_v27(dev->of_node)) {
+		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
+		if (ret >= 0 && !strcmp(compat_str, "27.2.0")) {
+			if (!dcp_v27_method_table_supported(dev, compat_str))
+				return DCP_FIRMWARE_UNKNOWN;
+			return DCP_FIRMWARE_V_27_0;
+		}
+	}
+
 	if (hw->firmware_compat == DCP_FIRMWARE_V_27_0) {
 		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
-		if (ret < 0 || !iomfb_v27_methods(compat_str)) {
-			dev_err(dev, "DCP firmware-compat %s has no 27.x method table\n",
-				ret < 0 ? "missing" : compat_str);
-			return DCP_FIRMWARE_UNKNOWN;
-		}
-		missing = iomfb_v27_missing_method(iomfb_v27_methods(compat_str),
-						   &num_missing);
-		if (missing) {
-			dev_err(dev, "DCP firmware-compat %s not started: no ID known for %u methods (first: %s)\n",
-				compat_str, num_missing, missing);
+		if (ret < 0 || !dcp_v27_method_table_supported(dev, compat_str)) {
+			if (ret < 0)
+				dev_err(dev, "DCP firmware-compat missing has no 27.x method table\n");
 			return DCP_FIRMWARE_UNKNOWN;
 		}
 		return DCP_FIRMWARE_V_27_0;
@@ -6521,6 +6583,14 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
 	    of_device_is_compatible(dev->of_node, "apple,t8142-dcp"))
 		dcp->hw.iomfb_method_profile = DCP_IOMFB_METHODS_DEFAULT;
+	/*
+	 * An M1/M2/M3 processor on firmware 27 inherits the live session the
+	 * boot loader handed over, like the T6050. Its match data keeps the
+	 * per-SoC port count, tunnel-flow flag and DART resources; only the
+	 * firmware-27 session adoption is version-selected here.
+	 */
+	if (fw_compat == DCP_FIRMWARE_V_27_0 && dcp_node_is_refmac_v27(dev->of_node))
+		dcp->hw.adopt_live_session = true;
 	/* The display such a processor finds at boot is its first sink. */
 	if (dcp_sink_metadata(dcp))
 		dcp_desktop_metadata_new_sink(dcp);

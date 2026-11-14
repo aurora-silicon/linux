@@ -90,6 +90,13 @@ bool dcp_fw_compat_is_14_7(struct platform_device *pdev);
 bool dcp_fw_compat_is_desktop(struct platform_device *pdev);
 bool dcp_fw_compat_panel_edr(struct platform_device *pdev);
 unsigned int dcp_gamma_lut_size(struct platform_device *pdev);
+/*
+ * The M1/M2/M3 display processors admitted into the firmware-27 wire
+ * generation. @compat_is answers whether a context (a device node in the
+ * driver, a fixture in the test) carries a compatible string.
+ */
+typedef bool (*dcp_compat_fn)(const void *ctx, const char *compat);
+bool dcp_refmac_v27_compat(dcp_compat_fn compat_is, const void *ctx);
 /* T6041 external display processors may join the DRM device. */
 bool dcp_t6041_ext_enabled(void);
 void dcp_backlight_takeover_registered(struct platform_device *pdev);
