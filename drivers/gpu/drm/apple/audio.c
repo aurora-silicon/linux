@@ -21,6 +21,8 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
+#include <linux/sizes.h>
+#include <linux/slab.h>
 #include <linux/suspend.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_eld.h>
@@ -37,11 +39,15 @@
 #include "audio.h"
 #include "parser.h"
 
-#define DCPAUD_ELEMENTS_MAXSIZE		16384
+/*
+ * The element catalog capacity, on every firmware. Elements that do not
+ * fit come back cut off at the buffer's end with a used size of 0: a TV
+ * behind a USB-C to HDMI adapter has 17312 bytes of them. macOS 13 asks
+ * for up to 256 KiB.
+ */
+#define DCPAUD_ELEMENTS_MAXSIZE		SZ_256K
 #define DCPAUD_PRODUCTATTRS_MAXSIZE	1024
 #define DCPAUD_ELD_SIZE			MAX_ELD_BYTES
-/* The native element catalog capacity (14.7 external role). */
-#define DCPAUD_ELEMENTS_V14_7		SZ_256K
 
 /*
  * SIO takes one of its 64 descriptor slots per period, shared by all its
@@ -97,6 +103,8 @@ struct dcp_audio {
 	ktime_t void_start;
 	u64 void_periods;
 	struct delayed_work void_work;
+	/* The stream holds a runtime PM reference, put in sync_stop; stream lock */
+	bool pm_held;
 	void *elements;
 	void *productattrs;
 
@@ -140,11 +148,6 @@ static inline bool dcpaud_native_link(struct dcp_audio *dcpaud)
 #else
 	return false;
 #endif
-}
-
-static inline size_t dcpaud_elements_size(struct dcp_audio *dcpaud)
-{
-	return dcpaud_native_link(dcpaud) ? DCPAUD_ELEMENTS_V14_7 : DCPAUD_ELEMENTS_MAXSIZE;
 }
 
 static const struct snd_pcm_hardware dcp_pcm_hw = {
@@ -195,7 +198,7 @@ static int dcpaud_read_remote_info(struct dcp_audio *dcpaud)
 	int ret;
 
 	ret = dcp_audiosrv_get_elements(dcpaud->dcp_dev, dcpaud->elements,
-					dcpaud_elements_size(dcpaud));
+					DCPAUD_ELEMENTS_MAXSIZE);
 	if (ret < 0)
 		return ret;
 
@@ -252,7 +255,7 @@ static void dcpaud_consult_elements(struct dcp_audio *dcpaud,
 	struct dcp_parse_ctx elements = {
 		.dcp = dev_get_drvdata(dcpaud->dcp_dev),
 		.blob = dcpaud->elements + 4,
-		.len = dcpaud_elements_size(dcpaud) - 4,
+		.len = DCPAUD_ELEMENTS_MAXSIZE - 4,
 		.pos = 0,
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
 		.v14_7_audio = dcpaud->native_link,
@@ -301,7 +304,7 @@ static int dcpaud_select_cookie(struct dcp_audio *dcpaud,
 	struct dcp_parse_ctx elements = {
 		.dcp = dev_get_drvdata(dcpaud->dcp_dev),
 		.blob = dcpaud->elements + 4,
-		.len = dcpaud_elements_size(dcpaud) - 4,
+		.len = DCPAUD_ELEMENTS_MAXSIZE - 4,
 		.pos = 0,
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
 		.v14_7_audio = dcpaud->native_link,
@@ -682,7 +685,11 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		if (dcpaud->open_unplugged || !dcpaud_connection_up(dcpaud))
 			return dcpaud_void_start(substream);
 
-		WARN_ON(pm_runtime_get_sync(dcpaud->dev) < 0);
+		/* A START can follow a failed one before sync_stop ran */
+		if (!dcpaud->pm_held) {
+			WARN_ON(pm_runtime_get_sync(dcpaud->dev) < 0);
+			dcpaud->pm_held = true;
+		}
 		ret = dcp_audiosrv_startlink(dcpaud->dcp_dev,
 					     &dcpaud->selected_cookie);
 		if (ret < 0)
@@ -715,9 +722,8 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
+		/* The runtime PM reference goes in sync_stop */
 		ret = dcp_audiosrv_stoplink(dcpaud->dcp_dev);
-		pm_runtime_mark_last_busy(dcpaud->dev);
-		__pm_runtime_put_autosuspend(dcpaud->dev);
 		if (ret < 0)
 			return ret;
 		break;
@@ -727,14 +733,32 @@ static int dcp_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 }
 
 /*
- * ALSA calls this once a stream has stopped, outside the stream lock, before
- * the next hw_params, prepare or hw_free and at close.
+ * ALSA calls this once a stream has stopped (STOP, SUSPEND, or the STOP that
+ * undoes a failed START), outside the stream lock, before the next
+ * hw_params, prepare or hw_free, at close, at system suspend and at
+ * disconnect. The DMA terminate STOP started is asynchronous: putting the
+ * runtime PM reference in STOP powered the DPA's domain (ps_dpa*) down while
+ * SIO still ran DMA towards it, and SIO crashed ("Shim DMA unavailable", the
+ * TERMINATE timing out after it), taking DP audio down on every output until
+ * a reboot. Wait for the terminate first.
  */
 static int dcp_pcm_sync_stop(struct snd_pcm_substream *substream)
 {
 	struct dcp_audio *dcpaud = substream->pcm->private_data;
+	bool held;
 
 	cancel_delayed_work_sync(&dcpaud->void_work);
+	snd_dmaengine_pcm_sync_stop(substream);
+
+	snd_pcm_stream_lock_irq(substream);
+	held = dcpaud->pm_held;
+	dcpaud->pm_held = false;
+	snd_pcm_stream_unlock_irq(substream);
+
+	if (held) {
+		pm_runtime_mark_last_busy(dcpaud->dev);
+		__pm_runtime_put_autosuspend(dcpaud->dev);
+	}
 
 	return 0;
 }
@@ -814,7 +838,7 @@ static int dcpaud_pin_rate_format(struct dcp_audio *dcpaud,
 	struct dcp_parse_ctx elements = {
 		.dcp = dev_get_drvdata(dcpaud->dcp_dev),
 		.blob = dcpaud->elements + 4,
-		.len = dcpaud_elements_size(dcpaud) - 4,
+		.len = DCPAUD_ELEMENTS_MAXSIZE - 4,
 		.pos = 0,
 		.v14_7_audio = dcpaud->native_link,
 	};
@@ -1337,7 +1361,7 @@ static int dcpaud_select_default_cookie(struct dcp_audio *dcpaud)
 	struct dcp_parse_ctx elements = {
 		.dcp = dev_get_drvdata(dcpaud->dcp_dev),
 		.blob = dcpaud->elements + 4,
-		.len = dcpaud_elements_size(dcpaud) - 4,
+		.len = DCPAUD_ELEMENTS_MAXSIZE - 4,
 		.pos = 0,
 		.v14_7_audio = dcpaud->native_link,
 	};
@@ -1896,16 +1920,9 @@ static int dcpaud_comp_bind(struct device *dev, struct device *main, void *data)
 	dcpaud->dcp_dev = &dcp_pdev->dev;
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
-	/* Native external roles share the link lifecycle and element catalog. */
-	if (dcp_audiosrv_native_link(dcpaud->dcp_dev)) {
-		void *elements = devm_kzalloc(dev, DCPAUD_ELEMENTS_V14_7, GFP_KERNEL);
-
-		if (!elements)
-			goto rpm_put;
-		devm_kfree(dev, dcpaud->elements);
-		dcpaud->elements = elements;
+	/* Native external roles share the link lifecycle. */
+	if (dcp_audiosrv_native_link(dcpaud->dcp_dev))
 		dcpaud->native_link = true;
-	}
 #endif
 
 	dma_pdev = of_find_device_by_node(dma_spec.np);
@@ -1928,7 +1945,7 @@ static int dcpaud_comp_bind(struct device *dev, struct device *main, void *data)
 		dcpaud_expose_debugfs_blob(dcpaud, "selected_cookie", &dcpaud->selected_cookie,
 					sizeof(dcpaud->selected_cookie));
 		dcpaud_expose_debugfs_blob(dcpaud, "elements", dcpaud->elements,
-					dcpaud_elements_size(dcpaud));
+					DCPAUD_ELEMENTS_MAXSIZE);
 		dcpaud_expose_debugfs_blob(dcpaud, "product_attrs", dcpaud->productattrs,
 					DCPAUD_PRODUCTATTRS_MAXSIZE);
 	}
@@ -1980,18 +1997,27 @@ static const struct component_ops dcpaud_comp_ops = {
 	.unbind	= dcpaud_comp_unbind,
 };
 
+static void dcpaud_free_elements(void *elements)
+{
+	kvfree(elements);
+}
+
 static int dcpaud_probe(struct platform_device *pdev)
 {
 	struct dcp_audio *dcpaud;
+	int ret;
 
 	dcpaud = devm_kzalloc(&pdev->dev, sizeof(*dcpaud), GFP_KERNEL);
 	if (!dcpaud)
 		return -ENOMEM;
 
-	dcpaud->elements = devm_kzalloc(&pdev->dev, DCPAUD_ELEMENTS_MAXSIZE,
-					GFP_KERNEL);
+	dcpaud->elements = kvzalloc(DCPAUD_ELEMENTS_MAXSIZE, GFP_KERNEL);
 	if (!dcpaud->elements)
 		return -ENOMEM;
+	ret = devm_add_action_or_reset(&pdev->dev, dcpaud_free_elements,
+				       dcpaud->elements);
+	if (ret)
+		return ret;
 
 	dcpaud->productattrs = devm_kzalloc(&pdev->dev, DCPAUD_PRODUCTATTRS_MAXSIZE,
 					    GFP_KERNEL);
@@ -2115,6 +2141,7 @@ void dcp_audio_unregister(void)
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)
 #include "audio-no-sio-test.c"
+#include "audio-legacy-test.c"
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
 #include "audio-link-test.c"
 #endif
