@@ -225,6 +225,76 @@ struct t6041_sleep {
 
 static struct t6041_sleep *t6041_sleep;
 
+
+/*
+ * Hardware power management for the memory channels and fabrics, as macOS
+ * sets it at boot. ApplePMGR::start turns every ADT pmgr device that has
+ * flag bit 2 clear on with AUTO_ENABLE: target f, wait for f, then bit 28.
+ * iBoot does this for the AMCC slices and leaves the DCS channels and these
+ * fabrics forced on, so under Linux they never gate when idle. macOS does
+ * it before it starts the PMP; done later, on a running system with the PMP
+ * up, it froze the Max. So this runs at arch_initcall, long before the PMP
+ * driver (a module) loads. t6041_mem_auto=0 on the command line skips it.
+ */
+static bool t6041_mem_auto __initdata = true;
+
+static int __init t6041_mem_auto_setup(char *s)
+{
+	return kstrtobool(s, &t6041_mem_auto) ? -EINVAL : 1;
+}
+__setup("t6041_mem_auto=", t6041_mem_auto_setup);
+
+/* In macOS's boot order: pmgr group 0, then group 2 (East), then nub. */
+static const u64 t6041_mem_auto_regs[] __initconst = {
+	0x502800168,					/* fab0_soc */
+	0x502800188, 0x5028001a0, 0x5028001b0, 0x5028001c0,	/* dcs_00-03 */
+	0x5028001d0, 0x5028001e0, 0x5028001f0, 0x502800200,	/* dcs_08-11 */
+	0x502800210, 0x502800220, 0x502800230, 0x502800240,	/* dcs_16-19 */
+	0x502800288, 0x502800290, 0x502800298,		/* fab_gw_0, fab_gw_1, fab_afr */
+	0x5028002d0, 0x502800338, 0x502800440,		/* fab1, fab2, fab5 */
+	0x502800480, 0x502800488,			/* fab6, fab7 */
+	0x502280118, 0x502280128,			/* fab3, fab4 */
+	0x5022802e0, 0x5022802e8, 0x5022802f0, 0x5022802f8,	/* dcs_04-07 */
+	0x502280300, 0x502280308, 0x502280310, 0x502280318,	/* dcs_12-15 */
+	0x502280320, 0x502280328, 0x502280330, 0x502280338,	/* dcs_20-23 */
+	0x508300100,					/* nub_fabric */
+};
+
+static int __init t6041_mem_auto_init(void)
+{
+	unsigned int i, done = 0, late = 0;
+
+	if (!t6041_mem_auto || !of_machine_is_compatible("apple,t6041"))
+		return 0;
+
+	for (i = 0; i < ARRAY_SIZE(t6041_mem_auto_regs); i++) {
+		void __iomem *reg = ioremap(t6041_mem_auto_regs[i], 4);
+		u32 v;
+
+		if (!reg)
+			continue;
+		v = readl(reg);
+		/* Fused off or not forced on (target not f), or already AUTO. */
+		if ((v & PS_TARGET) != PS_TARGET || (v & PS_AUTO_ENABLE)) {
+			iounmap(reg);
+			continue;
+		}
+		writel((v & ~(PS_FLAGS | PS_TARGET)) | PS_TARGET, reg);
+		if (readl_poll_timeout_atomic(reg, v, FIELD_GET(PS_ACTUAL, v) == 0xf, 1, 10000)) {
+			late++;
+			iounmap(reg);
+			continue;
+		}
+		writel((v & ~PS_FLAGS) | PS_AUTO_ENABLE, reg);
+		done++;
+		iounmap(reg);
+	}
+	pr_info("t6041-sleep: memory and fabric power management: %u words on AUTO, %u late\n",
+		done, late);
+	return 0;
+}
+arch_initcall(t6041_mem_auto_init);
+
 #include "t6041-macos-regs.h"
 #include "t6041-ps-order.h"
 #include "t6041-apcie-tunables.h"
