@@ -540,9 +540,26 @@ mod tests {
         for (i, digest) in digests.into_iter().enumerate() {
             let found = measured(builds, 0x13c000, &[[0x5c8df, 0x5c9c2]], digest).unwrap();
             assert!(core::ptr::eq(found, &builds[i]));
+            assert!(builds[i].boot_filled.is_empty());
             assert!(measured(builds, 0x138000, &[[0x5c8df, 0x5c9c2]], digest).is_none());
         }
         assert!(measured(builds, 0x13c000, &[[0x5c8df, 0x5c9c2]], [0; 32]).is_none());
+    }
+
+    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    #[test]
+    fn j773g_accepts_its_loaded_image() {
+        let builds = crate::g16::hw::t8132::CONFIG.firmware;
+        let digest = [
+            0x91, 0x54, 0xc7, 0xf8, 0x4b, 0xce, 0x32, 0x15, 0x1e, 0x8a, 0x97, 0x41, 0x7d, 0x6a,
+            0x20, 0x7a, 0x9e, 0xaf, 0x03, 0x54, 0xb4, 0xb8, 0xd6, 0xf0, 0x2a, 0xf5, 0x29, 0x95,
+            0x40, 0xd3, 0xe8, 0x5a,
+        ];
+        let found = measured(builds, 0x13c000, &[[0x5c8df, 0x5c9c2]], digest).unwrap();
+        assert!(core::ptr::eq(found, &builds[3]));
+        // The header word and the DILS record's 8 bytes, outside both entropy records.
+        assert_eq!(found.boot_filled, &[(0x224, 4), (0x5c917, 8)]);
+        assert!(measured(builds, 0x138000, &[[0x5c8df, 0x5c9c2]], digest).is_none());
     }
 
     #[test]

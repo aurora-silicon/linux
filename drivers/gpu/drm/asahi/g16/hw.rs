@@ -20,7 +20,7 @@ pub(crate) struct HwId {
 
 pub(crate) use crate::fwid::FirmwareBuild;
 
-/// The J713/T8132 configuration. Hardware admission also checks the exact TEXT image.
+/// The J713/J773g T8132 configuration. Hardware admission also checks the exact TEXT image.
 pub(crate) mod t8132 {
     use super::super::Config;
     use super::{FirmwareBuild, HwId};
@@ -77,6 +77,21 @@ pub(crate) mod t8132 {
                     0xd9, 0x61, 0x42, 0xd1, 0xef, 0x52, 0xaf, 0x13, 0x25, 0x08, 0xca, 0x06, 0xb7,
                     0xd0, 0x14, 0x58, 0xe2, 0x91, 0x0b, 0x85, 0xc8, 0xd7, 0x55, 0x78, 0xbf, 0x01,
                     0xc8, 0x29, 0x86, 0x8b, 0xc9, 0xcf,
+                ],
+            },
+            FirmwareBuild {
+                // The 25G83 image as loaded by iBoot on a J773g (Mac mini). iBoot also rewrites
+                // the header word at 0x224 and the 8 bytes of the DILS record at 0x5c90f on
+                // every boot there; they are zeroed before hashing.
+                name: "Apple GFX 25G83 (normalized loaded image, J773g)",
+                text_size: 0x60000,
+                data_size: 0x13c000,
+                entropy: &[[0x5c8df, 0x5c9c2]],
+                boot_filled: &[(0x224, 4), (0x5c917, 8)],
+                text_sha256: [
+                    0x91, 0x54, 0xc7, 0xf8, 0x4b, 0xce, 0x32, 0x15, 0x1e, 0x8a, 0x97, 0x41, 0x7d,
+                    0x6a, 0x20, 0x7a, 0x9e, 0xaf, 0x03, 0x54, 0xb4, 0xb8, 0xd6, 0xf0, 0x2a, 0xf5,
+                    0x29, 0x95, 0x40, 0xd3, 0xe8, 0x5a,
                 ],
             },
         ],

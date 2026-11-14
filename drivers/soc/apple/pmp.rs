@@ -800,7 +800,7 @@ impl rtkit::Operations for PmpData {
     fn recv_message(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, _ep: u8, msg: u64) {
         let ret = data.recv_message(msg);
         if let Err(e) = ret {
-            // Only the retained J713 bridge latches a message it cannot
+            // Only the retained T8132 bridge latches a message it cannot
             // handle as fatal. Other boards log it and keep power commands.
             // SAFETY: read-only board identity check.
             if unsafe { bindings::apple_pmp_display_retained_board() } {
@@ -840,7 +840,7 @@ struct PmpHwConfig {
 enum Ep7 {
     /// Never started.
     No,
-    /// Only on the retained J713 board.
+    /// Only on T8132 boards with a retained, qualified PMP session.
     RetainedBoard,
     /// On every board with this SoC.
     Always,
@@ -924,7 +924,7 @@ impl platform::Driver for PmpDriver {
     type Data<'bound> = PmpDriver;
 
     fn suppress_bind_attrs() -> bool {
-        // Retained J713 power votes have no teardown path, and an unbound T8140 PMP still runs.
+        // Retained T8132 power votes have no teardown path, and an unbound T8140 PMP still runs.
         // SAFETY: read-only machine identity checks; other machines remain unchanged.
         unsafe { bindings::apple_pmp_keep_bound() }
     }
@@ -970,7 +970,7 @@ impl platform::Driver for PmpDriver {
         }
         data.patch_bootargs(&pmp_mmio, &patches, cfg.check_bootargs_uuid)?;
         // EP7 is a startup dependency on every T6041 PMP, and on the
-        // retained J713 PMP among the T8132 boards.
+        // retained, qualified PMP session among the T8132 boards.
         let needs_coreanalytics = match cfg.coreanalytics {
             Ep7::No => false,
             Ep7::Always => true,

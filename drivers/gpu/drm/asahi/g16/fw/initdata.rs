@@ -324,12 +324,15 @@ pub(crate) fn loader_encode(slot: usize, va: u64, record: &mut [u8]) -> Result<(
     put64(out, 0x20, u64::from(e.mode))
 }
 
-pub(crate) const PERF_STATES: usize = 10;
+/// Capacity for the largest qualified table: J713 has ten rows, J773g eleven.
+pub(crate) const PERF_STATES: usize = 11;
 
 /// Machine-specific values selected from the original ADT before firmware publication.
 /// Frequencies are exact MHz, voltages are millivolts. No reference-bin defaults exist.
+/// Only the first `count` rows are used; the rest are zero.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Performance {
+    pub(crate) count: usize,
     pub(crate) frequency: [u32; PERF_STATES],
     pub(crate) auxiliary: [u32; PERF_STATES],
     pub(crate) voltage: [u32; PERF_STATES],
@@ -338,7 +341,19 @@ pub(crate) struct Performance {
 
 impl Performance {
     pub(crate) fn valid(&self) -> bool {
-        for i in 0..PERF_STATES {
+        if !(2..=PERF_STATES).contains(&self.count) {
+            return false;
+        }
+        for i in self.count..PERF_STATES {
+            if self.frequency[i] != 0
+                || self.auxiliary[i] != 0
+                || self.voltage[i] != 0
+                || self.sram[i] != 0
+            {
+                return false;
+            }
+        }
+        for i in 0..self.count {
             if self.frequency[i] > 3000
                 || self.auxiliary[i] > self.frequency[i]
                 || ((i == 0) != (self.frequency[i] == 0))
@@ -445,8 +460,8 @@ pub(crate) fn encode(
     input: &Input,
     ceiling: u32,
 ) -> Result<(), ()> {
-    if !(1..=9).contains(&ceiling)
-        || !input.performance.valid()
+    if !input.performance.valid()
+        || !(1..input.performance.count as u32).contains(&ceiling)
         || !object_va(input.scratch, 0x8000)
         || !bootstrap_alias(input.lower_uma)
         || !bootstrap_alias(input.lower_parameter)
@@ -542,7 +557,7 @@ pub(crate) fn encode(
         (0xed0, 24000),
         (0xed4, 1),
         (0xed8, 8),
-        (0xfc0, 10),
+        (0xfc0, input.performance.count as u32),
         (0x259c, 1),
         (0x2544, 4),
         (0x2548, 6),
