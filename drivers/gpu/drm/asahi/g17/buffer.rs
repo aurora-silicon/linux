@@ -335,13 +335,18 @@ fn automatic_target_for(used_pages: usize, current: usize, pages: usize, maximum
 unsafe extern "C" {
     /// `aurora.g17_busy_tvb_grow` (g17/busy_tvb_grow.c).
     fn asahi_g17_busy_tvb_grow() -> u32;
+    /// `aurora.g17_m5_busy_tvb_grow` (g17/busy_tvb_grow.c).
+    fn asahi_g17_m5_busy_tvb_grow() -> u32;
 }
 
-/// Whether the host grows a busy pair's heap ahead of a render
-/// (`aurora.g17_busy_tvb_grow`, read on every use).
-pub(crate) fn busy_growth_enabled() -> bool {
+/// Whether the host grows a busy pair's heap ahead of a render: for an M5
+/// heap `aurora.g17_m5_busy_tvb_grow`, otherwise `aurora.g17_busy_tvb_grow`,
+/// read on every use.
+pub(crate) fn busy_growth_enabled(m5: bool) -> bool {
     // SAFETY: Reads a module parameter; no other effect.
-    let value = unsafe { asahi_g17_busy_tvb_grow() };
+    let value = unsafe {
+        if m5 { asahi_g17_m5_busy_tvb_grow() } else { asahi_g17_busy_tvb_grow() }
+    };
     value != 0
 }
 
@@ -1003,7 +1008,10 @@ impl Manager {
         now: u64,
         client: Option<&Arc<crate::memacct::Client>>,
     ) -> Result<Option<usize>> {
-        if self.tvb.geometry != BlockGeometry::NEO || now < self.shrink.busy_retry {
+        // The M5 geometry grows the same way; its heaps are never shrunk, so
+        // busy growth stays, as idle growth does.
+        let m5 = self.tvb.geometry.base == BlockGeometry::M5_COMPACT.start;
+        if (self.tvb.geometry != BlockGeometry::NEO && !m5) || now < self.shrink.busy_retry {
             return Ok(None);
         }
         let max_pages = self

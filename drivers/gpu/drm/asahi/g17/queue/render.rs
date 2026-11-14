@@ -1749,8 +1749,7 @@ impl Pair {
         if self.in_flight() {
             if !self.variant.busy_heap_growth
                 || self.quarantined
-                || layout.is_m5()
-                || !buffer::busy_growth_enabled()
+                || !buffer::busy_growth_enabled(layout.is_m5())
             {
                 return Ok(None);
             }

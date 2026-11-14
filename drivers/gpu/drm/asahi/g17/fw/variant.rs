@@ -201,8 +201,11 @@ pub(crate) const V26A428_M5: Variant = Variant {
     traversal_exclusion: false,
     render_ray_query: false,
     registration_power_hold: false,
-    // M5 heaps have their own geometry and are never shrunk.
-    busy_heap_growth: false,
+    // Appended to the same inventory ring as an A18 Pro busy growth. Not yet
+    // measured on the M5 firmware, so aurora.g17_m5_busy_tvb_grow keeps it off
+    // until switched on at run time. M5 heaps are never shrunk, so the growth
+    // stays, as idle growth does.
+    busy_heap_growth: true,
     ..V26A428
 };
 
