@@ -434,6 +434,7 @@ static const struct hw_info t6050_pciec_hw = {
 	.tunnel_intr2axi	= true,
 	.no_port_reset		= true,
 	.msimap_by_vector	= true,
+	.s2idle_hold_domain	= true,
 	.mps_timers		= true,
 };
 
