@@ -315,6 +315,7 @@
 };
 
 #include "t8142-j704-display.dtsi"
+#include "t8142-j704-gpu.dtsi"
 #include "t8142-j704-peripherals.dtsi"
 #include "t8142-j704-usb.dtsi"
 #include "t8142-j704-avd.dtsi"
