@@ -166,7 +166,12 @@ def main():
     # Older receivers have no LOG constant or inherited field writes.
     if not re.search(r'#define APPLE_RTKIT_OSLOG_LOG\s', constants):
         constants += '\n#define APPLE_RTKIT_OSLOG_LOG 2\n'
-    bodies = '\n'.join(function(source, name) for name in ['apple_rtkit_oslog_rx', 'apple_rtkit_mark_running', 'apple_rtkit_reinit'])
+    # The session reset reinit() and a cold restart share, where the driver has one.
+    names = ['apple_rtkit_oslog_rx', 'apple_rtkit_mark_running']
+    if 'static void apple_rtkit_reset_session(' in source:
+        names.append('apple_rtkit_reset_session')
+    names.append('apple_rtkit_reinit')
+    bodies = '\n'.join(function(source, name) for name in names)
     if args.mutate == 'admission':
         bodies = bodies.replace('(!rtk->oslog_buffer.size && !rtk->oslog_inherited)', 'false')
     elif args.mutate == 'channel':
@@ -179,7 +184,7 @@ def main():
         bodies = bodies.replace('apple_rtkit_free_buffer(rtk, &rtk->oslog_buffer);', '')
     # A mutation that no longer matches the driver would test nothing.
     assert not args.mutate or bodies != '\n'.join(
-        function(source, name) for name in ['apple_rtkit_oslog_rx', 'apple_rtkit_mark_running', 'apple_rtkit_reinit']), \
+        function(source, name) for name in names), \
         'stale mutation: ' + args.mutate
     code = PREFIX.replace('struct apple_rtkit_shmem', constants + '\nstruct apple_rtkit_shmem', 1) + bodies + MAIN
 

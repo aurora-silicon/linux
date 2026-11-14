@@ -288,6 +288,8 @@ impl ParkedPair {
             configuration: None,
             configured_context: None,
             configured_qos: None,
+            drain_failures: 0,
+            drain_retry_at: 0,
             channel_error: false,
         }))
     }

@@ -64,6 +64,21 @@ pub(crate) mod t8132 {
                     0x4d, 0x34, 0xd0, 0x65, 0x24, 0x8b,
                 ],
             },
+            FirmwareBuild {
+                // The same 25G83 image as loaded by iBoot on a 10-core J713 (Mac16,12, 24 GB):
+                // same sizes and entropy records as the 8-core entry, a different iBoot-filled
+                // block (issue #1704).
+                name: "Apple GFX 25G83 (normalized loaded image, 10-core J713)",
+                text_size: 0x60000,
+                data_size: 0x13c000,
+                entropy: &[[0x5c8df, 0x5c9c2]],
+                boot_filled: &[],
+                text_sha256: [
+                    0xd9, 0x61, 0x42, 0xd1, 0xef, 0x52, 0xaf, 0x13, 0x25, 0x08, 0xca, 0x06, 0xb7,
+                    0xd0, 0x14, 0x58, 0xe2, 0x91, 0x0b, 0x85, 0xc8, 0xd7, 0x55, 0x78, 0xbf, 0x01,
+                    0xc8, 0x29, 0x86, 0x8b, 0xc9, 0xcf,
+                ],
+            },
         ],
     };
 }

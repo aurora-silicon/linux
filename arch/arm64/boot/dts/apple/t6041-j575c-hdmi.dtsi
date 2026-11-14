@@ -1,0 +1,95 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The J575c's HDMI port: the LPDPTX PHY (ADT /arm-io/lpdptx-phy0, the display
+ * crossbar's output 4) and the on-board DP-to-HDMI converter, whose hotplug
+ * and power pins are the J616c's (ADT /arm-io/dp2hdmi-gpio0: AOP GPIO 0x24,
+ * SMC gP0f and gP1a).
+ *
+ * macOS drives this port from the internal DCP, which aura's Stage 1 puts to
+ * sleep on this board. The crossbar has no registers: the PHY's source select
+ * picks the engine, so dcpext0 (crossbar input 0) drives it here, as on the
+ * M2 Max Mac Studio (t6021-j475c.dts).
+ *
+ * Every node is disabled. The boot loader fills dcpext0's firmware memory and
+ * the display gate (drivers/soc/apple/display-gate.c) then enables the chain.
+ */
+
+/ {
+	aliases {
+		dcpext0 = &dcpext0;
+	};
+
+	reserved-memory {
+		/* Filled by the boot loader, as dcpext1's (t6041-j575c-usbc.dtsi). */
+		dcpext0_text: dcpext0-text {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+
+		dcpext0_data: dcpext0-data {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+
+		dcpext0_heap: dcpext0-heap {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+	};
+
+	/*
+	 * ADT /arm-io/lpdptx-phy0 (dptx-phy,t8132): the T6050 layout, a core
+	 * bank and a dptx bank, and the T8132 PLL calibration. FD0FD1SWAP and
+	 * RODCOROLEAKCOMP are 0xffffffff (unset) in the ADT.
+	 */
+	lpdptx_phy0: phy@51c200000 {
+		compatible = "apple,t6041-dptx-phy", "apple,t6050-dptx-phy";
+		reg = <0x5 0x1c200000 0x0 0x4000>,
+		      <0x5 0x1c240000 0x0 0x10000>;
+		reg-names = "core", "dptx";
+		power-domains = <&ps_dptx_phy>;
+		#phy-cells = <0>;
+		#reset-cells = <0>;
+		/* dispext0: source-select-offset 1 puts it at source select 1 */
+		apple,ufp-endpoint = <0>;
+		apple,pll-dcocfg = <0x4>;
+		apple,pll-dtcvreg = <0xf>;
+		apple,pll-dtccal = <0x2>;
+		apple,pll-dcdadj = <0x10>;
+		apple,pll-dlfcfg = <0x3>;
+		status = "disabled";
+	};
+};
+
+/* ADT /arm-io/pmgr DPTX_PHY: pmgr + 0x360 (its parents SBR and FAB5_SOC are not described) */
+&pmgr {
+	ps_dptx_phy: power-controller@360 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x360 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dptx_phy";
+		status = "disabled";
+	};
+};
+
+&dcpext0 {
+	/delete-property/ apple,typec-hybrid-first;
+	apple,iomfb-surfaces = <1 1 0 0>;
+	apple,connector-type = "HDMI-A";
+	hdmi-hpd-gpios = <&pinctrl_aop 36 GPIO_ACTIVE_HIGH>;
+	hdmi-pwren-gpios = <&smc_gpio 15 GPIO_ACTIVE_HIGH>;
+	dp2hdmi-pwren-gpios = <&smc_gpio 26 GPIO_ACTIVE_HIGH>;
+	phys = <&lpdptx_phy0>;
+	phy-names = "dp-phy";
+	/* the crossbar's output 4 (ADT lpdptx-phy0 dp-switch-dfp-endpoint) */
+	apple,dptx-phy = <4>;
+	memory-region = <&dcpext0_text>, <&dcpext0_data>, <&dcpext0_heap>;
+	memory-region-names = "text", "data", "heap";
+};

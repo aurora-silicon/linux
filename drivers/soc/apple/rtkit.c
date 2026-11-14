@@ -2058,10 +2058,10 @@ int apple_rtkit_port_restart(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_port_restart);
 
-int apple_rtkit_reinit(struct apple_rtkit *rtk)
+/* Everything of a firmware session but the mailbox hardware. */
+static void apple_rtkit_reset_session(struct apple_rtkit *rtk)
 {
 	unsigned long flags;
-	int ret;
 
 	/* make sure we don't handle any messages while reinitializing */
 	apple_rtkit_detach_rx(rtk);
@@ -2107,7 +2107,13 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	WRITE_ONCE(rtk->shutting_down, false);
 	rtk->mbox->rx = apple_rtkit_rx;
 	spin_unlock_irqrestore(&rtk->mbox->rx_lock, flags);
+}
 
+int apple_rtkit_reinit(struct apple_rtkit *rtk)
+{
+	int ret;
+
+	apple_rtkit_reset_session(rtk);
 	ret = apple_mbox_start(rtk->mbox);
 	if (ret) {
 		apple_rtkit_detach_rx(rtk);
@@ -2336,6 +2342,30 @@ int apple_rtkit_ap_power_noirq(struct apple_rtkit *rtk, bool on)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_ap_power_noirq);
+
+/* Power is back, the CPU is stopped, and poweroff() discarded the old session. */
+int apple_rtkit_cold_restart(struct apple_rtkit *rtk, int (*start)(void *), void *ctx)
+{
+	int ret;
+
+	/* A fresh boot: no warm or port-only restart may answer its endpoint map. */
+	apple_rtkit_reset_session(rtk);
+	rtk->warm_restart = false;
+	rtk->port_only = false;
+	rtk->warm_last_mask = U32_MAX;
+	/* The mailbox registers may only be clocked once @start has run. */
+	ret = start(ctx);
+	if (!ret)
+		ret = apple_mbox_start(rtk->mbox);
+	if (ret) {
+		apple_rtkit_detach_rx(rtk);
+		flush_workqueue(rtk->wq);
+		return ret;
+	}
+	apple_mbox_set_recv_enabled(rtk->mbox, true);
+	return apple_rtkit_boot(rtk);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_cold_restart);
 
 int apple_rtkit_quiesce(struct apple_rtkit *rtk)
 {

@@ -19,41 +19,16 @@ description: |
 properties:
   compatible:
     enum:
+      - apple,t8132-sleep
       - apple,t8140-sleep
 
   reg:
+    minItems: 25
     maxItems: 28
 
   reg-names:
-    items:
-      - const: ps
-      - const: pwrgate
-      - const: cpu-start
-      - const: cllt
-      - const: cluster
-      - const: commit
-      - const: wdt
-      - const: aon-misc
-      - const: wake
-      - const: amcc0
-      - const: amcc1
-      - const: amcc2
-      - const: amcc3
-      - const: pmc-dcp
-      - const: dvfm-e
-      - const: dvfm-p
-      - const: spmi
-      - const: pmc-voters
-      - const: dcs
-      - const: ps-aon
-      - const: spmi-a0
-      - const: clk-mux
-      - const: mcc0
-      - const: mcc1
-      - const: mcc2
-      - const: ptd
-      - const: clk-perf
-      - const: cluster-dcs
+    minItems: 25
+    maxItems: 28
 
   apple,wake-enable:
     $ref: /schemas/types.yaml#/definitions/uint32-array
@@ -88,14 +63,96 @@ properties:
   apple,display-coprocessors:
     $ref: /schemas/types.yaml#/definitions/phandle-array
     description:
-      The DCP and the external DCP, which must be off before a commit, in that
+      The DCP and the external DCPs, which must be off before a commit, in that
       order.
 
 required:
   - compatible
   - reg
   - reg-names
-  - apple,wake-enable
   - apple,display-coprocessors
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8140-sleep
+    then:
+      required:
+        - apple,wake-enable
+      properties:
+        reg:
+          minItems: 28
+          maxItems: 28
+        reg-names:
+          items:
+            - const: ps
+            - const: pwrgate
+            - const: cpu-start
+            - const: cllt
+            - const: cluster
+            - const: commit
+            - const: wdt
+            - const: aon-misc
+            - const: wake
+            - const: amcc0
+            - const: amcc1
+            - const: amcc2
+            - const: amcc3
+            - const: pmc-dcp
+            - const: dvfm-e
+            - const: dvfm-p
+            - const: spmi
+            - const: pmc-voters
+            - const: dcs
+            - const: ps-aon
+            - const: spmi-a0
+            - const: clk-mux
+            - const: mcc0
+            - const: mcc1
+            - const: mcc2
+            - const: ptd
+            - const: clk-perf
+            - const: cluster-dcs
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8132-sleep
+    then:
+      properties:
+        reg:
+          minItems: 25
+          maxItems: 26
+        reg-names:
+          minItems: 25
+          items:
+            - const: ps
+            - const: pwrgate
+            - const: cpu-start
+            - const: cllt
+            - const: cluster
+            - const: commit
+            - const: wdt
+            - const: aon-misc
+            - const: wake
+            - const: amcc0
+            - const: amcc1
+            - const: pmc-dcp
+            - const: dvfm-e
+            - const: dvfm-p
+            - const: spmi
+            - const: pmc-voters
+            - const: dcs
+            - const: ps-aon
+            - const: spmi-a0
+            - const: clk-mux
+            - const: mcc0
+            - const: mcc1
+            - const: ptd
+            - const: clk-perf
+            - const: cluster-dcs
+            - const: ps-prot
 
 additionalProperties: false

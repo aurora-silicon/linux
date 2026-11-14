@@ -27,6 +27,7 @@ properties:
           - apple,t6040-pmu
           - apple,t6050-pmu
           - apple,t8140-pmu
+          - apple,t8142-pmu
           - arm,armv8-pmuv3 # Only for s/w models
           - arm,arm1136-pmu
           - arm,arm1176-pmu

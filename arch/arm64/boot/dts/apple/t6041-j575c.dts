@@ -5,8 +5,8 @@
  * target-type: J575c
  *
  * The J616c's T6041 wiring with the desktop layout of the J773s and the
- * other Mac Studio trees. There is no J575c ADT yet: values marked "guess"
- * follow those boards.
+ * other Mac Studio trees, checked against the J575c ADT (macOS 27.0.1,
+ * 26A434). Comments name the ADT node a value comes from.
  *
  * Copyright The Asahi Linux Contributors
  */
@@ -967,7 +967,7 @@
 	status = "okay";
 };
 
-/* guess: the J616c's CPU keys, and two fans as on the J575d */
+/* The J616c's CPU keys and two fans, all read back on a J575c */
 &smc_hwmon {
 	temperature-TCMz {
 		apple,key-id = "TCMz";
@@ -1058,11 +1058,6 @@
 		apple,key-id = "Tex3";
 		label = "CPU Tex3";
 	};
-
-	temperature-TW0P {
-		apple,key-id = "TW0P";
-		label = "WiFi/BT Module Temp";
-	};
 };
 
 #include "hwmon-common.dtsi"
@@ -1075,7 +1070,7 @@
 		pinmux = <APPLE_PINMUX(0, 1)>;
 	};
 
-	/* guess: port N's CLKREQ is AP pin N, as on the J616c and J773s */
+	/* ADT pci-bridge0..3 function-clkreq: port N's CLKREQ is AP pin N */
 	sd_clkreq_pins: sd-clkreq-pins {
 		pinmux = <APPLE_PINMUX(1, 1)>;
 	};
@@ -1126,7 +1121,7 @@
 };
 
 / {
-	/* The DART of port 1, the SD reader (J616c ADT dart-apcie1). */
+	/* ADT dart-apcie1: the DART of port 1, the SD reader */
 	apcie1_dart: iommu@411000000 {
 		compatible = "apple,t6041-dart", "apple,t8110-dart";
 		reg = <0x4 0x11000000 0x0 0x20000>;
@@ -1135,7 +1130,7 @@
 		interrupts = <AIC_IRQ 1733 IRQ_TYPE_LEVEL_HIGH>;
 	};
 
-	/* guess: the DART of port 3, after those of ports 0 to 2 */
+	/* ADT dart-apcie3: the DART of port 3 */
 	apcie3_dart: iommu@413000000 {
 		compatible = "apple,t6041-dart", "apple,t8110-dart";
 		reg = <0x4 0x13000000 0x0 0x20000>;
@@ -1206,7 +1201,7 @@
 				compatible = "pci14e4,5f72";
 				reg = <0x100 0 0 0 0>;
 				local-bd-address = [00 00 00 00 00 00];
-				/* guess: the J575d's Wi-Fi island */
+				/* ADT wlan module-instance "aruba" */
 				brcm,board-type = "apple,aruba";
 				status = "okay";
 			};
@@ -1219,7 +1214,10 @@
 			};
 		};
 
-		/* guess: the J616c's GL9755 reader, its power and reset */
+		/*
+		 * ADT pci-bridge1/pcie-sdreader: GL9755, PERST AP pin 5,
+		 * sd_pwr_en SMC gP19
+		 */
 		port01: pci@1,0 {
 			device_type = "pci";
 			reg = <0x800 0 0 0 0>;
@@ -1245,7 +1243,7 @@
 			};
 		};
 
-		/* guess: the J773s's Ethernet port */
+		/* ADT pci-bridge2/lan-10gb: AQC113, PERST AP pin 6, no power */
 		port02: pci@2,0 {
 			device_type = "pci";
 			reg = <0x1000 0 0 0 0>;
@@ -1269,12 +1267,16 @@
 			};
 		};
 
-		/* guess: PERST is AP pin 7, by the other ports; no power switch */
+		/*
+		 * ADT pci-bridge3/pcie-xhci: ASM3142, PERST AP pin 7,
+		 * function-power_enable SMC gP16
+		 */
 		port03: pci@3,0 {
 			device_type = "pci";
 			reg = <0x1800 0 0 0 0>;
 			reset-gpios = <&pinctrl 7 GPIO_ACTIVE_LOW>;
 			bus-range = <4 4>;
+			pwren-gpios = <&smc_gpio 0x16 GPIO_ACTIVE_HIGH>;
 			#address-cells = <3>;
 			#size-cells = <2>;
 			ranges;
@@ -1409,6 +1411,8 @@
 			     <43 IRQ_TYPE_EDGE_RISING>,
 			     <45 IRQ_TYPE_EDGE_RISING>;
 		interrupt-names = "irq", "select", "sleep", "wake";
+		/* Retimer set up before Linux keeps SuperSpeed down until replugged. */
+		apple,reset-inherited-usb2-connection;
 
 		typec1: connector {
 			compatible = "usb-c-connector";
@@ -1438,6 +1442,8 @@
 			     <69 IRQ_TYPE_EDGE_RISING>,
 			     <71 IRQ_TYPE_EDGE_RISING>;
 		interrupt-names = "irq", "select", "sleep", "wake";
+		/* Retimer set up before Linux keeps SuperSpeed down until replugged. */
+		apple,reset-inherited-usb2-connection;
 
 		typec2: connector {
 			compatible = "usb-c-connector";
@@ -1574,7 +1580,7 @@
 	};
 };
 
-/* guess: the J616c's operating points, binned per device */
+/* The boot loader fills opp-hz and opp-microvolt from the ADT perf-states */
 / {
 	reserved-memory {
 		#address-cells = <2>;
@@ -1899,7 +1905,7 @@
 	};
 };
 
-/* guess: the J616c's and J773s's CS42L84 wiring */
+/* ADT i2c2/audio-codec-output: CS42L84 at 0x4b, reset nub pin 58, IRQ 106 */
 &i2c2 {
 	status = "okay";
 
@@ -1993,11 +1999,9 @@
 #include "t6041-j575c-atc3.dtsi"
 #include "t6041-j575c-usb3.dtsi"
 #include "t6041-j575c-usbc.dtsi"
+#include "t6041-j575c-hdmi.dtsi"
 
-/*
- * Not described: HDMI (dcpext0 through display-crossbar0 to the lpdptx PHY
- * and a DP-to-HDMI converter on i2c8) and the SEP (no Touch ID sensor).
- */
+/* Not described: the SEP (no Touch ID sensor). */
 
 /*
  * The PMP, as the M4 Max MacBook Pros run it. The pmp alias lets the loader
