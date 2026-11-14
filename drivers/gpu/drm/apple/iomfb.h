@@ -215,6 +215,8 @@ struct dcp_method_entry {
 
 /* The IOMFB method table of a firmware 27.x build, by its compat string; NULL if unknown. */
 const struct dcp_method_entry *iomfb_v27_methods(const char *compat);
+const struct dcp_method_entry *iomfb_v27_methods_j714s(struct device *dev,
+						       const struct dcp_method_entry *methods);
 /* The first method of a firmware 27.x table that has no ID, NULL if none. */
 const char *iomfb_v27_missing_method(const struct dcp_method_entry *methods,
 				     unsigned int *count);
@@ -224,6 +226,8 @@ const char *iomfb_v27_missing_method(const struct dcp_method_entry *methods,
 bool iomfb_validate_callback_h17p(int tag, u32 in_len, u32 out_len);
 struct apple_dcp;
 bool iomfb_channels_idle(struct apple_dcp *dcp);
+int iomfb_v27_sleep_rpc(struct apple_dcp *dcp, bool a500, bool on);
+bool iomfb_v27_sleep_described(struct apple_dcp *dcp);
 bool iomfb_check_callback_h17p(struct apple_dcp *dcp, int tag, u32 in_len,
 			       u32 out_len);
 /* Desktop 26.6: does the record hold what the tag's handler reads and writes? */
