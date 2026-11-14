@@ -116,6 +116,9 @@ void dcp_ack(struct apple_dcp *dcp, enum dcp_context_id context);
 bool lookup_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode,
 		 struct dcp_display_mode *out);
 
+/* One line for an external display's link, sink and mode, after a mode set. */
+void dcp_link_report(struct apple_dcp *dcp, const struct drm_display_mode *mode);
+
 u8 dcp_crtc_eotf(struct apple_dcp *dcp, struct drm_crtc *crtc,
 		 struct drm_atomic_commit *commit);
 int dcp_crtc_check_hdr(struct apple_dcp *dcp, struct drm_crtc *crtc,

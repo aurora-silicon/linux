@@ -567,6 +567,8 @@ struct apple_dcp_afkep {
 	struct dentry *debugfs_entry;
 
 	bool match_epic_name;
+	/* Firmware 27: this endpoint's services end with the firmware's closed report. */
+	bool v27_closed_teardown;
 };
 
 /*
@@ -596,6 +598,7 @@ int afk_v2_copy_owned(struct apple_epic_service *service, u64 dva,
 int afk_start(struct apple_dcp_afkep *ep);
 int afk_v27_sleep_control(struct apple_dcp_afkep *ep, bool open);
 int afk_v27_sleep_check(struct apple_dcp_afkep *ep);
+unsigned int afk_v27_sleep_unanswered(struct apple_dcp_afkep *ep);
 int afk_start_service(struct apple_epic_service *service);
 int afk_service_open(struct apple_epic_service *service);
 void afk_cancel_commands(struct apple_dcp_afkep *ep);

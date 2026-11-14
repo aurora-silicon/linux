@@ -441,6 +441,32 @@ module_param(wake_light, bool, 0644);
 MODULE_PARM_DESC(wake_light,
 		 "With wake_prewarm_ms, also power the internal panel at resume if the lid is open (default 1)");
 
+/*
+ * T6050: a firmware sleep with a display on a USB-C port, and the external display
+ * processors' wake. 1: the display is released before the sleep as an unplugged one is and
+ * comes back after the wake as a newly plugged one, and every external display processor
+ * gets the wake's two calls (A500's wake form, then the power state with the sleep's flags),
+ * as macOS does. Without them the firmware's hard power state stays off and a display
+ * plugged in after the wake stays dark. 0: such a sleep is refused and the external
+ * processors get no wake call.
+ */
+static int t6050_ext_sleep = 1;
+module_param(t6050_ext_sleep, int, 0644);
+MODULE_PARM_DESC(t6050_ext_sleep,
+		 "T6050: release a USB-C display for a firmware sleep and plug it again after the wake (default 1; 0: refuse the sleep)");
+
+/*
+ * What a T6050 external display processor gained outside the firmware 27 sleep itself (the
+ * Type-C reconnect skipped for a crashed one, a crashed one refusing a deep sleep before
+ * anything is stopped, the link line) is in force on the board it has run on, the J714s.
+ * Elsewhere, other boards with the same SoC included, these are as before.
+ */
+static bool dcp_j714s_ext(struct device *dev)
+{
+	return of_machine_is_compatible("apple,j714s") &&
+	       of_device_is_compatible(dev->of_node, "apple,t6050-dcpext");
+}
+
 bool dcp_t6041_ext_enabled(void)
 {
 	return t6041_dcpext;
@@ -1800,7 +1826,33 @@ static void dcp_rtk_shmem_destroy(void *cookie, struct apple_rtkit_shmem *bfr)
 		dma_free_coherent(dcp->dev, bfr->size, bfr->buffer, bfr->iova);
 }
 
+/*
+ * The firmware names its own choice in the line of every mode set it makes, "... DSC=YES VRR=NO
+ * link: 1": kept for the link report. The line stays at info.
+ */
+static bool dcp_rtk_syslog_mode_set(void *cookie, const char *context, const char *message)
+{
+	struct apple_dcp *dcp = cookie;
+
+	if (strstr(message, "mode_set_gated")) {
+		if (strstr(message, "DSC=YES"))
+			WRITE_ONCE(dcp->link_dsc, 1);
+		else if (strstr(message, "DSC=NO"))
+			WRITE_ONCE(dcp->link_dsc, 2);
+	}
+	return false;
+}
+
 static struct apple_rtkit_ops rtkit_ops = {
+	.crashed = dcp_rtk_crashed,
+	.recv_message = dcp_recv_msg,
+	.shmem_setup = dcp_rtk_shmem_setup,
+	.shmem_destroy = dcp_rtk_shmem_destroy,
+};
+
+/* For a processor with the link report (hw.link_report): its log lines are searched. */
+static const struct apple_rtkit_ops link_report_rtkit_ops = {
+	.syslog_is_debug = dcp_rtk_syslog_mode_set,
 	.crashed = dcp_rtk_crashed,
 	.recv_message = dcp_recv_msg,
 	.shmem_setup = dcp_rtk_shmem_setup,
@@ -3184,6 +3236,15 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 	struct dcp_fabric_session session;
 	int ret;
 
+	/*
+	 * A crashed processor answers nothing: each call of a connect would run to its limit
+	 * (five tries, a dozen seconds of them). Its port is left alone instead, once and said.
+	 */
+	if (READ_ONCE(dcp->crashed) && dcp_j714s_ext(dcp->dev)) {
+		dev_warn(dcp->dev, "Type-C DPTX connect skipped: the display processor has crashed; its port is left alone until a reboot\n");
+		return;
+	}
+
 	/* A route following its CRTC hands the link over itself. */
 	if ((dcp->external && dcpext_scanout_terminal(dcp)) ||
 	    !READ_ONCE(dcp->typec_cable_connected) ||
@@ -3586,6 +3647,8 @@ int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 	}
 
 	if (dcp_is_typec_output(dcp)) {
+		/* A display again: the one released for a firmware sleep, or a new one. */
+		WRITE_ONCE(dcp->sleep_v27_torn, false);
 		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 		guard(mutex)(&dcp->hpd_mutex);
 		dcp_typec_attach_locked(dcp);
@@ -6005,6 +6068,8 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		dcp->rtk = apple_rtkit_init(dev, dcp, "mbox", 0,
 					    &external_h17p_rtkit_ops);
+	else if (dcp->hw.link_report)
+		dcp->rtk = apple_rtkit_init(dev, dcp, "mbox", 0, &link_report_rtkit_ops);
 	else
 		dcp->rtk = apple_rtkit_init(dev, dcp, "mbox", 0, &rtkit_ops);
 	if (IS_ERR(dcp->rtk)) {
@@ -6556,6 +6621,9 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
+	/* The link report: on the board it has run on (dcp_j714s_ext()). */
+	if (!dcp_j714s_ext(dev))
+		dcp->hw.link_report = false;
 	/*
 	 * T8142 on firmware 27 runs as the T6050's firmware-27 instance, with
 	 * the default method profile: with H17G every swap fails with status 4.
@@ -7394,6 +7462,9 @@ static void dcp_platform_complete(struct device *dev)
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
 	dcp_s2r_dark_finish(dcp);
+	/* Every device has resumed, the DRM device among them: its saved state is spent. */
+	if (!pm_dark_wake())
+		WRITE_ONCE(dcp->sleep_v27_torn, false);
 	/* The sleep failed, or wasn't one that stops the firmware: it still times out. */
 	if (READ_ONCE(dcp->s2r_wake_lit))
 		mod_delayed_work(system_freezable_wq, &dcp->s2r_prewarm_off_wq,
@@ -8437,6 +8508,17 @@ static int dcp_s2r_pm_notify(struct notifier_block *nb, unsigned long action, vo
 
 	if (action == PM_POST_SUSPEND)
 		dcp_s2r_dark_finish(dcp);
+	/*
+	 * A J714s external display processor that has crashed cannot take its sleep calls, and
+	 * the SoC cannot power down around it: the sleep is refused here, before the tasks
+	 * freeze and before any device or port controller is told of it, so nothing has to be
+	 * brought back. The processor stays as it is until a reboot.
+	 */
+	if (action == PM_SUSPEND_PREPARE && dcp_j714s_ext(dcp->dev) &&
+	    !pm_suspend_default_s2idle() && READ_ONCE(dcp->crashed)) {
+		dev_warn(dcp->dev, "the external display processor has crashed: sleep refused before anything is stopped (a reboot brings it back)\n");
+		return notifier_from_errno(-EBUSY);
+	}
 
 	return NOTIFY_DONE;
 }
@@ -8452,7 +8534,7 @@ static int dcp_s2r_pm_register(struct apple_dcp *dcp)
 {
 	int ret;
 
-	if (!dcp_s2r_ext_capable(dcp))
+	if (!dcp_s2r_ext_capable(dcp) && !dcp_j714s_ext(dcp->dev))
 		return 0;
 	dcp->s2r_pm_nb.notifier_call = dcp_s2r_pm_notify;
 	ret = register_pm_notifier(&dcp->s2r_pm_nb);
@@ -8994,6 +9076,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6050_dcpext = {
 	.adopt_live_session = true,
 	.firmware_compat = DCP_FIRMWARE_V_27_0,
 	.sink_metadata_edid = true,
+	.link_report = true,
 };
 
 static const struct of_device_id of_match[] = {

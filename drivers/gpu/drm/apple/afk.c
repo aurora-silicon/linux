@@ -1466,7 +1466,11 @@ int afk_v27_sleep_check(struct apple_dcp_afkep *ep)
 			ret = -EBUSY;
 	}
 	spin_unlock_irqrestore(&ep->lock, flags);
-	for (i = 0; !ret && i < ep->num_channels; i++) {
+	/*
+	 * An external processor's AV and DP interfaces are the firmware's to end: one that has
+	 * not answered does not hold the sleep (afk_v27_sleep_unanswered() counts them).
+	 */
+	for (i = 0; !ret && !ep->v27_closed_teardown && i < ep->num_channels; i++) {
 		struct apple_epic_service *srv = &ep->services[i];
 
 		spin_lock_irqsave(&srv->lock, flags);
@@ -1476,6 +1480,25 @@ int afk_v27_sleep_check(struct apple_dcp_afkep *ep)
 		spin_unlock_irqrestore(&srv->lock, flags);
 	}
 	return ret;
+}
+
+/* The interfaces of @ep with a call not answered or an opening not finished. */
+unsigned int afk_v27_sleep_unanswered(struct apple_dcp_afkep *ep)
+{
+	unsigned long flags;
+	unsigned int i, n = 0;
+
+	if (!ep)
+		return 0;
+	for (i = 0; i < ep->num_channels; i++) {
+		struct apple_epic_service *srv = &ep->services[i];
+
+		spin_lock_irqsave(&srv->lock, flags);
+		if (!bitmap_empty(srv->cmd_map, MAX_PENDING_CMDS) || srv->pending_open)
+			n++;
+		spin_unlock_irqrestore(&srv->lock, flags);
+	}
+	return n;
 }
 
 int afk_v27_sleep_control(struct apple_dcp_afkep *ep, bool open)
@@ -2327,7 +2350,8 @@ static void afk_v2_receive(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 			afk_recv_handle_init(ep, frame.interface, (void *)frame.payload,
 					     frame.payload_size);
 		else if ((frame.type == AFKV2_CLOSE && frame.interface_flags == 1) ||
-			 ((ep == ep->dcp->dcpavservep || afk_is_panelav(ep)) &&
+			 ((ep == ep->dcp->dcpavservep || afk_is_panelav(ep) ||
+			   ep->v27_closed_teardown) &&
 			  afkv2_closed_report(&frame)))
 			afk_recv_handle_teardown(ep, frame.interface);
 		return;
