@@ -3,6 +3,7 @@
 #include <linux/hex.h>
 
 #include "association.h"
+#include "firmware.h"
 
 static void mt_sae_pmk_vectors_test(struct kunit *test)
 {
@@ -450,7 +451,60 @@ static void mt_bss_heard_test(struct kunit *test)
 						 2000, 1000));
 }
 
+static int mt_join_length_of(const char *date, bool terminated, size_t size)
+{
+	u8 ram[96];
+
+	memset(ram, 0x5a, sizeof(ram));
+	memcpy(ram + sizeof(ram) - 19, date, 14);
+	ram[sizeof(ram) - 5] = terminated ? 0 : '0';
+	return mt7932_join_length(ram + sizeof(ram) - size, size);
+}
+
+/* The connect request length follows the RAM image's trailer build date. */
+static void mt_join_length_test(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, mt_join_length_of("20250115083000", true, 96), MT7932_JOIN_BODY);
+	KUNIT_EXPECT_EQ(test, mt_join_length_of("20260630235959", true, 96), MT7932_JOIN_BODY);
+	KUNIT_EXPECT_EQ(test, mt_join_length_of("20260701000000", true, 96),
+			MT7932_JOIN_BODY_SECROAM);
+	KUNIT_EXPECT_EQ(test, mt_join_length_of("20271201120000", true, 36),
+			MT7932_JOIN_BODY_SECROAM);
+	KUNIT_EXPECT_EQ(test, mt_join_length_of("2026070100000x", true, 96), -EINVAL);
+	KUNIT_EXPECT_EQ(test, mt_join_length_of("20260701000000", false, 96), -EINVAL);
+	KUNIT_EXPECT_EQ(test, mt_join_length_of("20260701000000", true, 35), -EINVAL);
+	KUNIT_EXPECT_EQ(test, MT7932_JOIN_BODY_MAX, 868);
+}
+
+/* The longer request keeps the earlier fields in place and a zero tail. */
+static void mt_join_tail_test(struct kunit *test)
+{
+	struct mt7932_peer_ids ids = { .station = { 1, 2 }, .wtbl = { 3, 4, 5, 6 } };
+	static const u8 bssid[6] = { 2, 0, 0, 0, 0, 1 };
+	u8 pmk[32], *body, *legacy;
+	unsigned int i;
+
+	memset(pmk, 0x11, sizeof(pmk));
+	body = kunit_kzalloc(test, MT7932_JOIN_BODY_MAX, GFP_KERNEL);
+	legacy = kunit_kzalloc(test, MT7932_JOIN_BODY, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, body);
+	KUNIT_ASSERT_NOT_NULL(test, legacy);
+	KUNIT_ASSERT_EQ(test, mt7932_connect_body(legacy, MT7932_JOIN_BODY, "IEEE", 4, pmk, bssid,
+						  NL80211_BAND_5GHZ, 149, 20, 2, &ids, false,
+						  NULL, 0, false), MT7932_JOIN_BODY);
+	memset(body, 0xa5, MT7932_JOIN_BODY_MAX);
+	memset(body + MT7932_JOIN_BODY, 0, MT7932_JOIN_BODY_MAX - MT7932_JOIN_BODY);
+	KUNIT_ASSERT_EQ(test, mt7932_connect_body(body, MT7932_JOIN_BODY_MAX, "IEEE", 4, pmk, bssid,
+						  NL80211_BAND_5GHZ, 149, 20, 2, &ids, false,
+						  NULL, 0, false), MT7932_JOIN_BODY);
+	KUNIT_EXPECT_MEMEQ(test, body, legacy, MT7932_JOIN_BODY);
+	for (i = MT7932_JOIN_BODY; i < MT7932_JOIN_BODY_MAX; i++)
+		KUNIT_EXPECT_EQ(test, body[i], 0);
+}
+
 static struct kunit_case mt_association_test_cases[] = {
+	KUNIT_CASE(mt_join_length_test),
+	KUNIT_CASE(mt_join_tail_test),
 	KUNIT_CASE(mt_owe_body_bounds_test),
 	KUNIT_CASE(mt_owe_connect_auth_test),
 	KUNIT_CASE(mt_sae_pmk_vectors_test),
