@@ -352,6 +352,7 @@
 #include "hwmon-common.dtsi"
 #include "hwmon-laptop.dtsi"
 #include "hwmon-fan-dual.dtsi"
+#include "t8132-j604-hwmon-rails.dtsi"
 
 /*
  * The PMGR domains of the USB-C ports this board wires beyond ATC0/ATC1, as

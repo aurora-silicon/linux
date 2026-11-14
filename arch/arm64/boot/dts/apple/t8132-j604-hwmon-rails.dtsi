@@ -1,0 +1,207 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * T8132 J604 power channels published by the SMC.
+ *
+ * Every readable float power key the J604's SMC updates on an idle macOS
+ * desktop (macOS 26B123 key sweep: flt, 4 bytes, flags 0x85, value moving
+ * between two reads 20 s apart) that the common laptop files do not list.
+ * Only the backlight's consumer is proven on this machine: PBLR follows the
+ * panel content and level (about 0.28 W on a full black and 2.2 W on a full
+ * white window at the same level, 6.6 W at a high level). The other keys
+ * are labelled "PMU <key>" for the PMU outputs (PPxy), "Rail <key>" for the
+ * second regulator family (PRxy) and "SMC <key>" otherwise, until their
+ * consumers are mapped on this machine. A key the running SMC firmware does
+ * not offer is skipped by the driver. Linux only reads these keys.
+ */
+
+&smc_hwmon {
+	power-PBLR {
+		apple,key-id = "PBLR";
+		label = "Backlight Power";
+	};
+
+	power-PHPS {
+		apple,key-id = "PHPS";
+		label = "SMC PHPS";
+	};
+
+	power-PIDR {
+		apple,key-id = "PIDR";
+		label = "SMC PIDR";
+	};
+
+	power-PO5R {
+		apple,key-id = "PO5R";
+		label = "SMC PO5R";
+	};
+
+	power-PP0b {
+		apple,key-id = "PP0b";
+		label = "PMU PP0b";
+	};
+
+	power-PP1b {
+		apple,key-id = "PP1b";
+		label = "PMU PP1b";
+	};
+
+	power-PP1l {
+		apple,key-id = "PP1l";
+		label = "PMU PP1l";
+	};
+
+	power-PP2b {
+		apple,key-id = "PP2b";
+		label = "PMU PP2b";
+	};
+
+	power-PP3b {
+		apple,key-id = "PP3b";
+		label = "PMU PP3b";
+	};
+
+	power-PP4b {
+		apple,key-id = "PP4b";
+		label = "PMU PP4b";
+	};
+
+	power-PP5l {
+		apple,key-id = "PP5l";
+		label = "PMU PP5l";
+	};
+
+	power-PP7b {
+		apple,key-id = "PP7b";
+		label = "PMU PP7b";
+	};
+
+	power-PP8l {
+		apple,key-id = "PP8l";
+		label = "PMU PP8l";
+	};
+
+	power-PP9b {
+		apple,key-id = "PP9b";
+		label = "PMU PP9b";
+	};
+
+	power-PPBR {
+		apple,key-id = "PPBR";
+		label = "SMC PPBR";
+	};
+
+	power-PPMR {
+		apple,key-id = "PPMR";
+		label = "SMC PPMR";
+	};
+
+	power-PPSR {
+		apple,key-id = "PPSR";
+		label = "SMC PPSR";
+	};
+
+	power-PPal {
+		apple,key-id = "PPal";
+		label = "PMU PPal";
+	};
+
+	power-PPbb {
+		apple,key-id = "PPbb";
+		label = "PMU PPbb";
+	};
+
+	power-PPbl {
+		apple,key-id = "PPbl";
+		label = "PMU PPbl";
+	};
+
+	power-PPdb {
+		apple,key-id = "PPdb";
+		label = "PMU PPdb";
+	};
+
+	power-PPeb {
+		apple,key-id = "PPeb";
+		label = "PMU PPeb";
+	};
+
+	power-PPkl {
+		apple,key-id = "PPkl";
+		label = "PMU PPkl";
+	};
+
+	power-PR4l {
+		apple,key-id = "PR4l";
+		label = "Rail PR4l";
+	};
+
+	power-PR5b {
+		apple,key-id = "PR5b";
+		label = "Rail PR5b";
+	};
+
+	power-PR8b {
+		apple,key-id = "PR8b";
+		label = "Rail PR8b";
+	};
+
+	power-PRab {
+		apple,key-id = "PRab";
+		label = "Rail PRab";
+	};
+
+	power-PRcb {
+		apple,key-id = "PRcb";
+		label = "Rail PRcb";
+	};
+
+	power-PReb {
+		apple,key-id = "PReb";
+		label = "Rail PReb";
+	};
+
+	power-PRfb {
+		apple,key-id = "PRfb";
+		label = "Rail PRfb";
+	};
+
+	power-PU5R {
+		apple,key-id = "PU5R";
+		label = "SMC PU5R";
+	};
+
+	power-PU5r {
+		apple,key-id = "PU5r";
+		label = "SMC PU5r";
+	};
+
+	power-PW3C {
+		apple,key-id = "PW3C";
+		label = "SMC PW3C";
+	};
+
+	power-PZC0 {
+		apple,key-id = "PZC0";
+		label = "SMC PZC0";
+	};
+
+	power-PZC1 {
+		apple,key-id = "PZC1";
+		label = "SMC PZC1";
+	};
+
+	power-PZCU {
+		apple,key-id = "PZCU";
+		label = "SMC PZCU";
+	};
+
+	power-PZD1 {
+		apple,key-id = "PZD1";
+		label = "SMC PZD1";
+	};
+
+	power-Pb0f {
+		apple,key-id = "Pb0f";
+		label = "SMC Pb0f";
+	};
+};
