@@ -2733,6 +2733,15 @@ static void dcp_external_stop_retry(struct work_struct *work)
 		dcp_external_stop_locked(dcp, dcp->external_generation);
 }
 
+/* A wedged Type-C pipe: tell DRM its display is gone, see dcp_external_wedged(). */
+static void dcp_wedged_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(work, struct apple_dcp, wedged_work);
+
+	dev_warn(dcp->dev, "display wedged: reporting it disconnected\n");
+	dcp_external_report_disconnected(dcp);
+}
+
 static void dcp_external_stop_work(struct work_struct *work)
 {
 	struct apple_dcp *dcp = container_of(work, struct apple_dcp, external_stop_work);
@@ -4312,13 +4321,22 @@ void dcp_poweron(struct platform_device *pdev)
 		return;
 	}
 
+	/*
+	 * The unplug of a Type-C display powers the pipe off under a present
+	 * the firmware already accepted, and swallows it: it never completes.
+	 * dcp_poweroff() cancels the swap watchdog, so nothing else retires it,
+	 * and the queue starts no power-on command behind a pending present
+	 * until the 10 s transaction timeout marks the coprocessor crashed.
+	 */
+	if (dcp_is_typec_output(dcp) || dcp_is_external_h17p(dcp))
+		iomfb_retire_unplugged_present_h17p(dcp);
+
 	if (dcp_is_external_h17p(dcp)) {
 		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
 		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 		cancel_work_sync(&dcp->external_stop_work);
 		cancel_delayed_work_sync(&dcp->external_stop_retry_wq);
 		guard(mutex)(&dcp->external_lock);
-		iomfb_retire_unplugged_present_h17p(dcp);
 		ret = dcp_external_start_locked(dcp);
 		if (!ret)
 			dcp->external_crtc_generation = dcp->external_generation;
@@ -5220,6 +5238,7 @@ VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release
 	disable_delayed_work_sync(&dcp->typec_relink_wq);
 	disable_delayed_work_sync(&dcp->announce_wq);
 	cancel_work_sync(&dcp->external_stop_work);
+	cancel_work_sync(&dcp->wedged_work);
 	cancel_delayed_work_sync(&dcp->external_stop_retry_wq);
 	disable_delayed_work_sync(&dcp->hdmi_settle_wq);
 	disable_delayed_work_sync(&dcp->hdmi_recheck_wq);
@@ -6176,6 +6195,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	mutex_init(&dcp->hpd_mutex);
 	mutex_init(&dcp->external_lock);
 	INIT_WORK(&dcp->external_stop_work, dcp_external_stop_work);
+	INIT_WORK(&dcp->wedged_work, dcp_wedged_work);
 	INIT_DELAYED_WORK(&dcp->external_stop_retry_wq, dcp_external_stop_retry);
 	mutex_init(&dcp->tb_lock);
 	dcp_fabric_init(dcp);

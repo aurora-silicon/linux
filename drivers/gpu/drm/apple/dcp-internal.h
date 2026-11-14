@@ -466,6 +466,7 @@ struct apple_dcp {
 	unsigned int external_stop_retries;
 	int external_error;
 	struct work_struct external_stop_work;
+	struct work_struct wedged_work;
 	struct delayed_work external_stop_retry_wq;
 
 

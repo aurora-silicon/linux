@@ -1455,16 +1455,23 @@ bool dcp_connector_connected(struct apple_connector *connector)
 
 /*
  * The external coprocessor stopped answering: a transaction or a power-on
- * timed out.  Its connection is no longer reported (dcp_announce_eval()
- * treats a crashed DCP as lost), and the hotplug worker tells userspace, so
- * that a compositor stops drawing to an output that cannot show a frame.
+ * timed out.  A connection that DRM learns about through the announcement
+ * (dcp_announce_eval() treats a crashed DCP as lost) is reported gone by the
+ * hotplug worker.  Any other Type-C output is reported gone by a work item.
+ * Either way a compositor stops drawing to an output that cannot show a
+ * frame.
  */
 void dcp_external_wedged(struct apple_dcp *dcp)
 {
 	struct apple_connector *con = READ_ONCE(dcp->connector);
 
-	if (!con || !dcp_announce_gated(dcp, con))
+	if (!con)
 		return;
+	if (!dcp_announce_gated(dcp, con)) {
+		if (dcp_is_typec_output(dcp))
+			schedule_work(&dcp->wedged_work);
+		return;
+	}
 	WRITE_ONCE(dcp->crashed, true);
 	dev_warn(dcp->dev, "external display wedged: reporting it disconnected\n");
 	schedule_work(&con->hotplug_wq);
