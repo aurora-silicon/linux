@@ -168,7 +168,7 @@
 		      <0x2 0x94c00000 0x0 0xc4000>;
 		reg-names = "asc", "sram";
 		mboxes = <&mtp_mbox>;
-		iommus = <&mtp_dart 0>;
+		iommus = <&mtp_dart 0>, <&mtp_dart 1>;
 		#helper-cells = <0>;
 	};
 
