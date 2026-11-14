@@ -465,24 +465,20 @@ static_assert!(ENROL_STATUS_RETRY != ENROL_STATUS_SENSOR);
 // this, so the stages cannot run out before the budget does.
 const ENROL_MAX_CAPTURES: u32 = 36;
 
-const ENROL_POLL_MS: u32 = 2;
-
-// Interrupt-driven capture blocks on the data-ready line rather than polling
-// SPI status. This is the maximum a single wait blocks before re-reading status
-// as a backstop; the interrupt wakes it far sooner when a frame is ready.
+// Capture blocks on the sensor's data-ready interrupt. This is the longest a
+// single wait blocks before status is read again, which bounds a missed edge;
+// the interrupt wakes it as soon as the sensor has something.
 const ENROL_IRQ_WAIT_MS: u32 = 250;
 
 const ENROL_CAPTURE_TIMEOUT_MS: u32 = 60_000;
-const ENROL_POLL_ATTEMPTS: u32 = ENROL_CAPTURE_TIMEOUT_MS / ENROL_POLL_MS;
-static_assert!(ENROL_POLL_ATTEMPTS * ENROL_POLL_MS == ENROL_CAPTURE_TIMEOUT_MS);
 
 // How long the next capture waits for the last touch's finger to be lifted
 // before it arms anyway: as long as a capture waits for a finger.
 const LIFT_WAIT_MS: u32 = ENROL_CAPTURE_TIMEOUT_MS;
 
-// The backstop interval of that wait. The sensor's interrupt wakes it at the
+// The longest one wait of that blocks on the interrupt, which wakes it at the
 // lift; this bounds a missed edge (macOS arms within 2 ms of the lift).
-const LIFT_POLL_MS: u32 = 20;
+const LIFT_IRQ_WAIT_MS: u32 = 20;
 
 const PATCH_POLL_MS: u32 = 20;
 const PATCH_POLL_ATTEMPTS: u32 = 250;

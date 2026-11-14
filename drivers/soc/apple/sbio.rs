@@ -906,10 +906,12 @@ impl SepData {
         if paused_at == 0 {
             return true;
         }
-        let use_irq = sensor::irq_available();
-        if use_irq {
-            sensor::irq_arm();
+        // Bring-up does not finish without the data-ready interrupt.
+        if !sensor::irq_available() {
+            self.forget_finger_lift();
+            return true;
         }
+        sensor::irq_arm();
         let started = shim::boottime_ns();
         let deadline = started.saturating_add(u64::from(LIFT_WAIT_MS) * 1_000_000);
         let mut dropped: u32 = 0;
@@ -972,13 +974,8 @@ impl SepData {
                 let _ = sensor::idle();
                 return true;
             }
-            if use_irq {
-                let _ = sensor::irq_wait(LIFT_POLL_MS);
-                sensor::irq_arm();
-            } else {
-                let poll = kernel::time::Delta::from_millis(i64::from(LIFT_POLL_MS));
-                kernel::time::delay::fsleep(poll);
-            }
+            let _ = sensor::irq_wait(LIFT_IRQ_WAIT_MS);
+            sensor::irq_arm();
         }
     }
 
@@ -2274,25 +2271,26 @@ impl SepData {
             diag::sensor_brought_up(bind, false);
             return false;
         }
-        let ok = match parameters {
+        let mut ok = match parameters {
             Some(parameters) => self.finish_sensor_setup(patch, parameters),
             None => self.complete_bringup(patch),
         };
-        diag::sensor_brought_up(bind, ok);
         // The sensor is patched and idle here -- the only safe moment to
         // configure the data-ready interrupt, which is then left alone for the
-        // driver's life. Interrupt capture is the default; a machine that does
-        // not describe a data-ready line falls back to SPI polling.
+        // driver's life. Capture waits on it, so a sensor without one cannot
+        // capture.
         if ok && !sensor::irq_available() {
             if sensor::irq_setup() {
-                dev_info_ratelimited!(self.dev, "sensor: interrupt-driven capture\n");
+                dev_info_ratelimited!(self.dev, "sensor: data-ready interrupt configured\n");
             } else {
-                dev_warn_ratelimited!(
+                dev_err_ratelimited!(
                     self.dev,
-                    "sensor: no data-ready interrupt (describe it in DT); capture falls back to SPI polling\n"
+                    "sensor: no data-ready interrupt; the device tree must describe the sensor's data-ready line\n"
                 );
+                ok = false;
             }
         }
+        diag::sensor_brought_up(bind, ok);
         ok
     }
 
@@ -4292,28 +4290,27 @@ impl SepData {
     }
 
     fn await_capture(&self) -> CaptureWait {
-        self.await_capture_within(u64::from(ENROL_POLL_ATTEMPTS) * u64::from(ENROL_POLL_MS))
+        self.await_capture_within(u64::from(ENROL_CAPTURE_TIMEOUT_MS))
     }
 
     fn await_capture_within(&self, wait_ms: u64) -> CaptureWait {
         let mut previous: Option<[u8; sensor::STATUS_LEN]> = None;
         let mut armed_reported = false;
 
-        // Interrupt-driven capture blocks on the data-ready line instead of
-        // polling; the SPI status read below still gates every frame, so a
-        // missed or spurious interrupt costs at most one backstop interval. A
-        // machine with no data-ready line falls back to SPI polling.
-        let use_irq = sensor::irq_available();
-        if use_irq {
-            sensor::irq_arm();
+        // Capture blocks on the data-ready interrupt; the SPI status read below
+        // still gates every frame, so a missed or spurious interrupt costs at
+        // most one wait. Bring-up does not finish without the interrupt.
+        if !sensor::irq_available() {
+            dev_err_ratelimited!(self.dev, "capture: the sensor has no data-ready interrupt\n");
+            return CaptureWait::Abandon;
         }
+        sensor::irq_arm();
 
         // Bound the wait by wall-clock time, not a fixed iteration count. The
         // data-ready interrupt can wake early on a stray edge (the sensor
         // toggles the line as the finger moves between enrol frames); a fixed
         // attempt budget would then be spent in milliseconds and time the
-        // capture out before the frame lands. Time-bounding degrades, at worst,
-        // to the same duration as the poll path.
+        // capture out before the frame lands.
         let deadline_ns = crate::shim::monotonic_ns().saturating_add(wait_ms.saturating_mul(1_000_000));
         let mut attempt: u32 = 0;
         loop {
@@ -4364,15 +4361,10 @@ impl SepData {
                 break;
             }
 
-            if use_irq {
-                // Block on the data-ready line; the interrupt wakes this the
-                // instant a frame is ready, and the backstop bounds a missed
-                // edge. Re-arm for the next frame.
-                let _ = sensor::irq_wait(ENROL_IRQ_WAIT_MS);
-                sensor::irq_arm();
-            } else {
-                kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(ENROL_POLL_MS)));
-            }
+            // Block on the data-ready line; the interrupt wakes this the
+            // instant a frame is ready. Re-arm for the next frame.
+            let _ = sensor::irq_wait(ENROL_IRQ_WAIT_MS);
+            sensor::irq_arm();
             attempt = attempt.saturating_add(1);
         }
         let _ = sensor::status();
