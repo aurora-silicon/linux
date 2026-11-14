@@ -118,6 +118,9 @@
 		SDZ-supply = <&speaker_sdz>;
 		apple,sdz-group-fail-closed;
 		apple,deferred-shutdown;
+		apple,shutdown-dance;
+		/* macOS 26B123 at boot (q7-tb-bus-1): SDZ mode, then page 1 0x19 and 0x47 */
+		apple,init-writes = /bits/ 8 <0x00 0x07 0x68  0x01 0x19 0x40  0x01 0x47 0x02>;
 		#sound-dai-cells = <0>;
 		sound-name-prefix = "Left Woofer 1";
 		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
@@ -131,6 +134,9 @@
 		SDZ-supply = <&speaker_sdz>;
 		apple,sdz-group-fail-closed;
 		apple,deferred-shutdown;
+		apple,shutdown-dance;
+		/* macOS 26B123 at boot (q7-tb-bus-1): SDZ mode, then page 1 0x19 and 0x47 */
+		apple,init-writes = /bits/ 8 <0x00 0x07 0x68  0x01 0x19 0x40  0x01 0x47 0x02>;
 		#sound-dai-cells = <0>;
 		sound-name-prefix = "Left Woofer 2";
 		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
@@ -144,6 +150,9 @@
 		SDZ-supply = <&speaker_sdz>;
 		apple,sdz-group-fail-closed;
 		apple,deferred-shutdown;
+		apple,shutdown-dance;
+		/* macOS 26B123 at boot (q7-tb-bus-1): SDZ mode, then page 1 0x19 and 0x47 */
+		apple,init-writes = /bits/ 8 <0x00 0x07 0x68  0x01 0x19 0x40  0x01 0x47 0x02>;
 		#sound-dai-cells = <0>;
 		sound-name-prefix = "Left Tweeter";
 		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
@@ -157,6 +166,9 @@
 		SDZ-supply = <&speaker_sdz>;
 		apple,sdz-group-fail-closed;
 		apple,deferred-shutdown;
+		apple,shutdown-dance;
+		/* macOS 26B123 at boot (q7-tb-bus-1): SDZ mode, then page 1 0x19 and 0x47 */
+		apple,init-writes = /bits/ 8 <0x00 0x07 0x68  0x01 0x19 0x40  0x01 0x47 0x02>;
 		#sound-dai-cells = <0>;
 		sound-name-prefix = "Right Woofer 1";
 		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
@@ -170,6 +182,9 @@
 		SDZ-supply = <&speaker_sdz>;
 		apple,sdz-group-fail-closed;
 		apple,deferred-shutdown;
+		apple,shutdown-dance;
+		/* macOS 26B123 at boot (q7-tb-bus-1): SDZ mode, then page 1 0x19 and 0x47 */
+		apple,init-writes = /bits/ 8 <0x00 0x07 0x68  0x01 0x19 0x40  0x01 0x47 0x02>;
 		#sound-dai-cells = <0>;
 		sound-name-prefix = "Right Woofer 2";
 		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
@@ -183,6 +198,9 @@
 		SDZ-supply = <&speaker_sdz>;
 		apple,sdz-group-fail-closed;
 		apple,deferred-shutdown;
+		apple,shutdown-dance;
+		/* macOS 26B123 at boot (q7-tb-bus-1): SDZ mode, then page 1 0x19 and 0x47 */
+		apple,init-writes = /bits/ 8 <0x00 0x07 0x68  0x01 0x19 0x40  0x01 0x47 0x02>;
 		#sound-dai-cells = <0>;
 		sound-name-prefix = "Right Tweeter";
 		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
