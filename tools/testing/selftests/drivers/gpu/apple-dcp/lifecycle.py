@@ -1450,6 +1450,7 @@ def readiness(root):
          + function(drm, 'struct apple_dcp_start_work {') + ';\n'
          + function(drm, 'static void apple_dcp_start_fn('))
         if 'static void apple_dcp_start_fn(' in drm else '',
+        function(drm, 'static bool apple_drm_has_output('),
         function(drm, 'static int apple_drm_init_dcp('),
         'static int publish_provider(struct platform_device *pdev, struct apple_dcp *dcp)\n'
         '{\n\tstruct device *dev = &pdev->dev;\n\tint ret;\n'
@@ -1494,6 +1495,11 @@ struct apple_dcp {
     struct { int iomfb_method_profile; } hw;
     struct work_struct external_audio_work;
 };
+/* This J700 fixture has neither a T8132 main DCP nor its fixed HDMI path. */
+static bool __attribute__((unused)) dcp_t8132_main_external(struct device_node *n)
+{ (void)n; return false; }
+static bool __attribute__((unused)) apple_t8132_main_external_present(void)
+{ return false; }
 /* This readiness fixture has no AV owner or native audio initializer. */
 static void av_audiosrv_quiesce(struct apple_dcp *d)
 { assert(!d->external_native); }
@@ -1516,6 +1522,8 @@ static bool __attribute__((unused)) dcp_t6041_ext_enabled(void)
 static void __attribute__((unused)) iomfb_v14_7_external_refuse(struct apple_dcp *d, const char *why)
 { (void)d; (void)why; assert(!"T6030 external processor in a J700 scenario"); }
 struct drm_device { int unused; };
+struct drm_crtc { int unused; };
+#define drm_for_each_crtc(crtc, drm) for ((void)(drm), (crtc) = NULL; (crtc); )
 struct drm_encoder { int unused; };
 /* Not a J713: production registers no T8132 external outputs and returns 0. */
 static int __attribute__((unused)) t8132_ext_drm_init(struct drm_device *drm) { (void)drm; return 0; }

@@ -5470,6 +5470,13 @@ static int dcp_connector_type_from_dt(struct device_node *np)
 	return DRM_MODE_CONNECTOR_Unknown;
 }
 
+/* A T8132 main DCP can serve a fixed external output instead of a panel. */
+bool dcp_t8132_main_external(struct device_node *np)
+{
+	return np && of_device_is_compatible(np, "apple,t8132-dcp") &&
+		dcp_connector_type_from_dt(np) == DRM_MODE_CONNECTOR_HDMIA;
+}
+
 /*
  * The fixed route's crossbar selection and Type-C mux are taken at probe and
  * must be released with the device: a crossbar left selected blocks the next
@@ -6352,6 +6359,47 @@ static int dcp_desktop_probe_routes(struct apple_dcp *dcp)
 }
 
 /*
+ * A fixed HDMI main DCP reaches its sink through a T8122-style DPTX PHY and
+ * two converter power GPIOs. Require every resource and leave it powered for
+ * the retained firmware session.
+ */
+static int dcp_m4_hdmi_prepare(struct apple_dcp *dcp)
+{
+	struct device *dev = dcp->dev;
+	int ret;
+
+	dcp->hw.num_dptx_ports = 1;
+	dcp->phy = devm_phy_get(dev, "dp-phy");
+	if (IS_ERR(dcp->phy))
+		return dev_err_probe(dev, PTR_ERR(dcp->phy),
+				     "HDMI DP PHY unavailable\n");
+	dcp->fixed_phy = dcp->phy;
+	ret = phy_init(dcp->phy);
+	if (ret)
+		return dev_err_probe(dev, ret, "HDMI DP PHY init failed\n");
+	ret = phy_power_on(dcp->phy);
+	if (ret) {
+		phy_exit(dcp->phy);
+		return dev_err_probe(dev, ret, "HDMI DP PHY power failed\n");
+	}
+	ret = devm_add_action_or_reset(dev, dcp_desktop_phy_off, dcp->phy);
+	if (ret)
+		return ret;
+
+	dcp->hdmi_pwren = devm_gpiod_get(dev, "hdmi-pwren", GPIOD_OUT_HIGH);
+	if (IS_ERR(dcp->hdmi_pwren))
+		return dev_err_probe(dev, PTR_ERR(dcp->hdmi_pwren),
+				     "HDMI power GPIO unavailable\n");
+	dcp->dp2hdmi_pwren = devm_gpiod_get(dev, "dp2hdmi-pwren", GPIOD_OUT_HIGH);
+	if (IS_ERR(dcp->dp2hdmi_pwren))
+		return dev_err_probe(dev, PTR_ERR(dcp->dp2hdmi_pwren),
+				     "DP2HDMI power GPIO unavailable\n");
+	msleep(100);
+	dev_info(dev, "fixed HDMI PHY and converter rails prepared\n");
+	return 0;
+}
+
+/*
  * An adopted T8132 dcpext offers its Type-C routes. It is no component of
  * the DRM device (its outputs are added by t8132_ext_drm.c): the routes
  * follow the port modes, refuse DP alt mode and get no apple_connector (see
@@ -6595,8 +6643,18 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		return ret;
 
 	if (iomfb_is_m4(dcp)) {
-		dcp->fixed_connector_type = DRM_MODE_CONNECTOR_eDP;
-		dcp->connector_type = DRM_MODE_CONNECTOR_eDP;
+		bool main_external = dcp_t8132_main_external(dev->of_node);
+
+		if (main_external) {
+			dcp->fixed_connector_type = DRM_MODE_CONNECTOR_HDMIA;
+			dcp->connector_type = DRM_MODE_CONNECTOR_HDMIA;
+			ret = dcp_m4_hdmi_prepare(dcp);
+			if (ret)
+				return ret;
+		} else {
+			dcp->fixed_connector_type = DRM_MODE_CONNECTOR_eDP;
+			dcp->connector_type = DRM_MODE_CONNECTOR_eDP;
+		}
 		bitmap_zero(dcp->iomfb_surfaces, DCP_MAX_PLANES);
 		set_bit(0, dcp->iomfb_surfaces);
 		ret = iomfb_m4_init(dcp);
@@ -6606,11 +6664,20 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		 * An external DCP is no component of the DRM device. Once
 		 * adoption starts, its session outlives the device.
 		 */
-		if (of_device_is_compatible(dev->of_node, "apple,t8132-dcpext")) {
+		if (of_device_is_compatible(dev->of_node, "apple,t8132-dcpext") ||
+		    main_external) {
 			ret = dcp_pin_live_session(dcp);
 			if (!ret)
 				ret = iomfb_m4_adopt_external(dcp);
-			if (!ret)
+			if (!ret && main_external) {
+				ret = dcp_desktop_dptx_connect(dcp, 0);
+				if (ret) {
+					dev_warn(dev, "initial HDMI DPTX connect failed: %d\n",
+						 ret);
+					ret = 0;
+				}
+			}
+			if (!ret && !main_external)
 				dcp_t8132_ext_routes(dcp);
 			return ret;
 		}
@@ -7093,7 +7160,8 @@ static void dcp_platform_remove(struct platform_device *pdev)
 	if (dcp)
 		av_audiosrv_quiesce(dcp);
 	/* An adopted external DCP never joined the DRM device. */
-	if (of_device_is_compatible(pdev->dev.of_node, "apple,t8132-dcpext")) {
+	if (of_device_is_compatible(pdev->dev.of_node, "apple,t8132-dcpext") ||
+	    dcp_t8132_main_external(pdev->dev.of_node)) {
 		/* Enabled with its Type-C routes, see dcp_t8132_ext_routes(). */
 		if (dcp)
 			disable_delayed_work_sync(&dcp->typec_reconnect_wq);

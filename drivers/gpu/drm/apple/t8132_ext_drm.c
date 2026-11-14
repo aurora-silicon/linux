@@ -48,6 +48,7 @@
 #include <drm/drm_simple_kms_helper.h>
 #include <drm/drm_vblank.h>
 
+#include "dcp.h"
 #include "iomfb_m4.h"
 #include "t8132_ext_drm.h"
 
@@ -1044,7 +1045,8 @@ static int t8132_ext_out_init(struct drm_device *drm, struct platform_device *pd
 		goto err_crtc;
 	out->encoder.possible_crtcs = drm_crtc_mask(&out->crtc);
 	ret = drm_connector_init(drm, &out->connector, &t8132_ext_connector_funcs,
-				 DRM_MODE_CONNECTOR_DisplayPort);
+				 dcp_t8132_main_external(pdev->dev.of_node) ?
+				 DRM_MODE_CONNECTOR_HDMIA : DRM_MODE_CONNECTOR_DisplayPort);
 	if (ret)
 		goto err_encoder;
 	drm_connector_helper_add(&out->connector, &t8132_ext_connector_helpers);
@@ -1120,6 +1122,31 @@ int t8132_ext_drm_init(struct drm_device *drm)
 			count++;
 		put_device(&pdev->dev);
 		ret = ret ?: err;
+	}
+	/* A main DCP can describe a fixed external output instead of a panel. */
+	if (count < T8132_EXT_MAX) {
+		struct platform_device *pdev;
+
+		np = of_find_compatible_node(NULL, NULL, "apple,t8132-dcp");
+		if (dcp_t8132_main_external(np) && of_device_is_available(np)) {
+			pdev = of_find_device_by_node(np);
+			if (pdev) {
+				if (!device_is_bound(&pdev->dev)) {
+					ret = ret ?: -EPROBE_DEFER;
+				} else {
+					err = t8132_ext_out_init(drm, pdev, mine);
+					if (err)
+						dev_err(&pdev->dev,
+							"no main external DRM output: %d\n",
+							 err);
+					else
+						count++;
+					ret = ret ?: err;
+				}
+				put_device(&pdev->dev);
+			}
+		}
+		of_node_put(np);
 	}
 	/*
 	 * After the outputs, not under the registry lock (see there);
