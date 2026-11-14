@@ -1292,6 +1292,7 @@ impl Backend {
                     self.shared.m5_board,
                     self.shared.variant.compute,
                     alloc.uat.is_m5(),
+                    self.shared.variant.mcache,
                 )?;
                 Ok(KBox::new(queue, GFP_KERNEL)?)
             })();

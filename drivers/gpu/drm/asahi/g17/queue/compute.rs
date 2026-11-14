@@ -158,6 +158,8 @@ struct Graph {
     /// The M5 board, whose part selects the M5 descriptor words.
     board: Option<&'static Board>,
     program: ComputeProgram,
+    /// The firmware takes MCache tables in compute kick entries.
+    mcache: bool,
 }
 
 impl Graph {
@@ -170,6 +172,7 @@ impl Graph {
         board: Option<&'static Board>,
         program: ComputeProgram,
         m5: bool,
+        mcache: bool,
     ) -> Result<Self> {
         let page = mmu::UAT_PGSZ as u64;
         let prot = mmu::PROT_GPU_FW_SHARED_RW;
@@ -256,6 +259,7 @@ impl Graph {
             operand_state,
             board,
             program,
+            mcache,
         })
     }
 
@@ -720,10 +724,12 @@ impl Queue {
         board: Option<&'static Board>,
         program: ComputeProgram,
         m5: bool,
+        mcache: bool,
     ) -> Result<Self> {
         let Backing { mut pool, mut kick } = backing;
         let (active, replays) = (Fifo::new()?, Fifo::new()?);
-        let mut graph = Graph::new(alloc, objects, &context, pointers, operand_state, board, program, m5)?;
+        let mut graph =
+            Graph::new(alloc, objects, &context, pointers, operand_state, board, program, m5, mcache)?;
         let kick_alias = kick.map_client(context.vm())?;
         let pool_alias = pool.map_client(context.vm())?;
         let binding = graph.bind(context.clone(), kick_alias, pool_alias)?;
@@ -2571,6 +2577,7 @@ impl Queue {
             cdm_end_va,
             sampler_heap_va,
             sampler_count,
+            attachments,
             ..
         } = &packet.command
         else {
@@ -2597,6 +2604,15 @@ impl Queue {
         let ordinal = self.ordinal.checked_add(1).ok_or(EOVERFLOW)?;
         let (descriptor_high, descriptor_low) =
             self.graph.descriptor_vas(kick_timestamp.slot() as u8)?;
+        // The kick names the buffers the dispatch writes in an MCache table, as a fragment
+        // kick names its attachments.
+        let mcache_writes = if self.graph.mcache && !self.graph.m5 {
+            attachments.as_slice()
+        } else {
+            &[][..]
+        };
+        let mcache_context: u8 = packet.context.id().try_into()?;
+        let mcache = ComputeDescriptor::mcache_table(descriptor_low, mcache_writes.len())?;
         let first = self.ordinal == 0 && (self.graph.m5 || !self.installed);
         // The first prototype only waits on an installed consumer channel.
         // A retry without a published source falls back to completion on CPU.
@@ -2768,7 +2784,7 @@ impl Queue {
                 slot: identity.qos,
                 class: COMPUTE_QOS_CLASS,
             },
-            mcache: None,
+            mcache,
             event_mask: match m5_board {
                 Some(board) => crate::g17::fw::m5::compute::kick_event_mask(board, identity.context)?,
                 None => COMPUTE_KICK_EVENT_MASK,
@@ -2811,7 +2827,10 @@ impl Queue {
                 object.initialize::<crate::g17::fw::m5::compute::Descriptor>(offset,
                     |descriptor| descriptor.write_zeroed(m5_args))?;
             } else {
-                object.initialize::<ComputeDescriptor>(offset, |descriptor| descriptor.write_zeroed(&args))?;
+                object.initialize::<ComputeDescriptor>(offset, |descriptor| {
+                    descriptor.write_zeroed(&args)?;
+                    descriptor.write_mcache(mcache_writes, mcache_context)
+                })?;
             }
             if !self.graph.m5 && first {
                 self.graph.context_high.as_mut().ok_or(EINVAL)?.write(

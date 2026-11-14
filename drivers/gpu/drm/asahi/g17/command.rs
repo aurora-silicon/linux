@@ -492,6 +492,8 @@ pub(crate) enum Validated {
         sampler_heap_va: u64,
         sampler_count: u32,
         timestamps: uapi::drm_asahi_timestamps,
+        /// The buffers the dispatch writes, from the compute attachment list.
+        attachments: Attachments,
     },
 }
 
@@ -795,6 +797,7 @@ impl Payload {
                     sampler_heap_va: cmd.sampler_heap,
                     sampler_count: cmd.sampler_count,
                     timestamps: cmd.ts,
+                    attachments: *attachments,
                 })
             }
         }
