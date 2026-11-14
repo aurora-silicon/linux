@@ -1534,15 +1534,11 @@ static const struct apple_pmc_hw apple_pmc_hw_t6050 = {
  * A system sleep that reached the hardware may have taken the enables and floors
  * with it. Put back what the driver's books say: these are no-ops if they stayed.
  */
-static int apple_pmc_resume_early(struct device *dev)
+static int apple_pmc_restore_state(struct apple_pmc *pmc)
 {
-	struct apple_pmc *pmc = dev_get_drvdata(dev);
 	unsigned long flags;
 	unsigned int rail;
 	int ret = 0, err;
-
-	if (!pm_resume_via_firmware() || !pmc)
-		return 0;
 
 	raw_spin_lock_irqsave(&pmc->lock, flags);
 	for (rail = 0; rail < pmc->hw->rails; rail++) {
@@ -1554,14 +1550,49 @@ static int apple_pmc_resume_early(struct device *dev)
 		}
 	}
 	raw_spin_unlock_irqrestore(&pmc->lock, flags);
+
+	return ret;
+}
+
+static int apple_pmc_resume_early(struct device *dev)
+{
+	struct apple_pmc *pmc = dev_get_drvdata(dev);
+	int ret;
+
+	if (!pm_resume_via_firmware() || !pmc)
+		return 0;
+
+	ret = apple_pmc_restore_state(pmc);
 	if (ret)
 		dev_err(dev, "state not restored after sleep: %d\n", ret);
 
 	return 0;
 }
 
+/*
+ * The kernel restored from a hibernation image runs after a boot loader that
+ * started from a reset PMC: every agent is off on every rail again, so the
+ * floors of the agents this driver enabled (the CPU performance controller's
+ * DCS and fabric votes among them) are no longer honoured. Restore always.
+ */
+static int apple_pmc_restore_early(struct device *dev)
+{
+	struct apple_pmc *pmc = dev_get_drvdata(dev);
+	int ret;
+
+	if (!pmc)
+		return 0;
+
+	ret = apple_pmc_restore_state(pmc);
+	if (ret)
+		dev_err(dev, "state not restored after resume from disk: %d\n", ret);
+
+	return 0;
+}
+
 static const struct dev_pm_ops apple_pmc_pm_ops = {
-	LATE_SYSTEM_SLEEP_PM_OPS(NULL, apple_pmc_resume_early)
+	.resume_early = pm_sleep_ptr(apple_pmc_resume_early),
+	.restore_early = pm_sleep_ptr(apple_pmc_restore_early),
 };
 
 static const struct of_device_id apple_pmc_of_match[] = {
