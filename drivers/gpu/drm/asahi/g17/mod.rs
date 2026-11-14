@@ -1098,18 +1098,29 @@ impl Firmware {
     /// the TTBAT. Compute queues without an owner go to `retired`.
     fn reregister_live_work(
         &mut self,
+        dev: &AsahiDrmDevice,
         retired: &mut runtime::RetiredCompute,
         reclaim: &mut runtime::teardown::ReclaimBatch,
     ) -> Result<(usize, usize, usize)> {
-        self.init.reset_compute_after_cold_boot()?;
-        let compute = self
-            .queues
-            .reset_compute_after_cold_boot(&self.init, retired)?;
-        let render = self.queues.reset_render_after_cold_boot(&self.init)?;
+        republish_step(dev, "compute state replay", self.init.reset_compute_after_cold_boot())?;
+        let compute = republish_step(
+            dev,
+            "compute queue reset",
+            self.queues.reset_compute_after_cold_boot(&self.init, retired),
+        )?;
+        let render = republish_step(
+            dev,
+            "render pair reset",
+            self.queues.reset_render_after_cold_boot(&self.init),
+        )?;
         // The cores lost power with the cold boot: the next command on each pair installs it again.
         self.queues.forget_render_registrations();
         // Contexts closed after the drain: their releases are settled host-side.
-        let settled = self.settle_teardown_after_cold_boot(reclaim)?;
+        let settled = republish_step(
+            dev,
+            "closed context settle",
+            self.settle_teardown_after_cold_boot(reclaim),
+        )?;
         Ok((compute, render, settled))
     }
 
@@ -1136,14 +1147,14 @@ impl Firmware {
         }
         let pristine = self.init.pristine_size();
         // (1) Host RTKit and CPU-start state of the cold coprocessor.
-        self.reinit_mailboxes(dev)?;
+        republish_step(dev, "mailbox reset", self.reinit_mailboxes(dev))?;
         // (2) What the firmware reads at boot, while it cannot run.
-        self.reinit_shared_contents()?;
+        republish_step(dev, "shared contents reset", self.reinit_shared_contents())?;
         // (2b) As the first boot does before it starts the CPUs (`Gpu::boot`): the
         // GPU-to-fabric bridge. A cold boot by the boot loader resets the GPU block, and the
         // coprocessors and cores cannot reach memory without it. Idempotent.
         if self.cfg.fabric_bridge {
-            self.bridge.regs.enable_g17_bridge()?;
+            republish_step(dev, "fabric bridge", self.bridge.regs.enable_g17_bridge())?;
         }
         // (2c) The PMP was cold-restarted with the GPU and starts about two seconds
         // after its restore; its report region is reset when it starts, so the GPU's pmp-gfx
@@ -1166,16 +1177,17 @@ impl Firmware {
         }
         // (3) Start the CPU: RTKit boot handshake; the firmware rebuilds its own root and
         // kernel-window tables.
-        self.restart_coprocessors()?;
+        republish_step(dev, "coprocessor start", self.restart_coprocessors())?;
         // (4) As `init.build` mapped the graph after the firmware booted: store again the
         // kernel-window descriptors the host placed in the firmware's no-map table.
-        let (relinked, links) = self.uat.relink_after_cold_boot()?;
+        let (relinked, links) =
+            republish_step(dev, "kernel-window relink", self.uat.relink_after_cold_boot())?;
         // Contexts released since the TTBAT rewrite changed only the shadow.
         self.uat.thaw_reserved_state();
         // (5) Opening handshake on the restored root.
-        self.open_firmware(dev, shared)?;
+        republish_step(dev, "opening handshake", self.open_firmware(dev, shared))?;
         // (6) Live queues become fresh installs.
-        let (compute, render, settled) = self.reregister_live_work(retired, reclaim)?;
+        let (compute, render, settled) = self.reregister_live_work(dev, retired, reclaim)?;
         dev_info!(
             dev.as_ref(),
             "GPU republish: graph {} KiB restored, {}/{} kernel-window links stored, {} compute queues and {} render pairs reset, {} idle compute queues retired, {} closed contexts settled\n",
@@ -1511,6 +1523,15 @@ const RECLAIM_WORK: u64 = 4;
 const FEED_WORK: u64 = 5;
 const GOVERNOR_WORK: u64 = 6;
 const RESTORE_WORK: u64 = 7;
+
+/// A step of [`Firmware::republish_after_cold_boot`]: logs which one failed, so that a lost
+/// device after a resume from disk names the step.
+fn republish_step<T>(dev: &AsahiDrmDevice, step: &str, result: Result<T>) -> Result<T> {
+    if let Err(error) = &result {
+        dev_err!(dev.as_ref(), "GPU republish: {} failed: {:?}\n", step, error);
+    }
+    result
+}
 
 /// The device lock ([`Shared::state`]) with the barrier of a post-hibernation restore.
 ///
