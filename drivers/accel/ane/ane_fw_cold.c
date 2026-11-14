@@ -118,6 +118,8 @@ struct ane_fw_backend {
 	bool retained;
 	/* Brings the engine up to the program stage after a loader hand-off. */
 	struct work_struct start;
+	/* Parks the engine after idle_park_ms without a request (ane_fw_idle_park()). */
+	struct delayed_work idle_park;
 	/* ANE_SYS and the child power states are on: the engine is readable. */
 	bool powered;
 };
@@ -1002,14 +1004,79 @@ static int ane_fw_cold_cycle_down(struct ane_fw_backend *b)
 	return ane_fw_power_down(b);
 }
 
+static unsigned int idle_park_ms = 5000;
+module_param(idle_park_ms, uint, 0644);
+MODULE_PARM_DESC(idle_park_ms,
+		 "Park the H17 ANE (firmware stopped, powered off) after this many ms without a request; 0: never");
+
+/* After a request: park the engine once it has been idle for idle_park_ms. */
+static void ane_fw_idle_arm(struct ane_fw_backend *b)
+{
+	unsigned int ms = READ_ONCE(idle_park_ms);
+
+	if (ms && b->soc->macos_sleep)
+		mod_delayed_work(system_wq, &b->idle_park, msecs_to_jiffies(ms));
+}
+
+/*
+ * Idle: the way down a system sleep takes, then parked as after a wake. The
+ * next request boots the engine from the preload and replays every open
+ * program (ane_fw_session_wake()). macOS keeps the ANE off without a client
+ * in the same way. Outside a system sleep there is no deep path to fall back
+ * on, so a stop that fails quarantines the engine, as a failed sleep does.
+ */
+static void ane_fw_idle_park(struct work_struct *work)
+{
+	struct ane_fw_backend *b = container_of(to_delayed_work(work), struct ane_fw_backend,
+						idle_park);
+	int ret;
+
+	guard(mutex)(&b->lock);
+	if (b->parked || READ_ONCE(b->in_sleep) || b->stage != ANE_STAGE_PROGRAM ||
+	    b->session.quarantined || !b->soc->macos_sleep || ane_fw_sleep_warm(b))
+		return;
+	/* Closes admission and waits for every request in flight. */
+	ane_h16_session_sleep(&b->session, true);
+	ret = -EBUSY;
+	for (unsigned int ch = 0; ch < ANE_FW_CHANNELS; ch++)
+		if (b->transport.pending[ch].active)
+			goto busy;
+	ret = ane_fw_clean_stop(b) ? ane_fw_firmware_stop(b) : 0;
+	if (!ret)
+		ret = ane_fw_power_down(b);
+	if (ret) {
+		ane_fw_quarantine(b, ret);
+		b->session.quarantined = true;
+		ane_h16_session_sleep(&b->session, false);
+		dev_err(&b->pdev->dev, "H17 ANE: idle park failed (%d): quarantined\n", ret);
+		return;
+	}
+	WRITE_ONCE(b->parked, true);
+	WRITE_ONCE(b->session.parked, true);
+	ane_h16_session_sleep(&b->session, false);
+	dev_info(&b->pdev->dev, "H17 ANE: idle %u ms: parked until the next request\n",
+		 READ_ONCE(idle_park_ms));
+	return;
+busy:
+	/* Something is still pending on a ring: try again later. */
+	ane_h16_session_sleep(&b->session, false);
+	ane_fw_idle_arm(b);
+}
+
 /* A request for a parked engine: boot it from the preload, as after a sleep. */
 static int ane_fw_session_wake(void *ctx)
 {
 	struct ane_fw_backend *b = ctx;
 	int ret;
 
-	if (READ_ONCE(b->stage) == ANE_STAGE_PROBED)
-		return READ_ONCE(b->in_sleep) ? -EAGAIN : ane_fw_first_bringup(b);
+	if (READ_ONCE(b->stage) == ANE_STAGE_PROBED) {
+		if (READ_ONCE(b->in_sleep))
+			return -EAGAIN;
+		ret = ane_fw_first_bringup(b);
+		if (!ret)
+			ane_fw_idle_arm(b);
+		return ret;
+	}
 	guard(mutex)(&b->lock);
 	if (!b->parked)
 		return 0;
@@ -1025,6 +1092,8 @@ static int ane_fw_session_wake(void *ctx)
 	}
 	ane_h16_session_sleep(&b->session, false);
 	dev_info(&b->pdev->dev, "H17 ANE: up for a request%s\n", ret ? " FAILED" : "");
+	if (!ret)
+		ane_fw_idle_arm(b);
 	return ret;
 }
 
@@ -1209,6 +1278,8 @@ static int ane_fw_pm_event(struct notifier_block *nb, unsigned long event, void 
 	if (event == PM_SUSPEND_PREPARE) {
 		WRITE_ONCE(b->in_sleep, true);
 		WRITE_ONCE(b->session.wake_blocked, true);
+		/* The sleep parks the engine itself; a park that already began finishes first. */
+		cancel_delayed_work_sync(&b->idle_park);
 	}
 	if (event == PM_SUSPEND_PREPARE && retained) {
 		if (!ane_fw_sleep_prepare(b))
@@ -1872,6 +1943,11 @@ static void ane_fw_program_busy(void *ctx, bool busy)
 	struct ane_fw_backend *b = ctx;
 
 	apple_clpc_ane_set_active(b->clpc, busy);
+	/* Under the session lock: only (re)arm or cancel, never wait for the park. */
+	if (busy)
+		cancel_delayed_work(&b->idle_park);
+	else
+		ane_fw_idle_arm(b);
 }
 
 static const struct ane_h16_session_ops ane_fw_session_ops = {
@@ -2367,6 +2443,7 @@ int ane_fw_staged_init(struct platform_device *pdev, const struct ane_fw_platfor
 	}
 	dev_info(&pdev->dev, "H17 ANE: loader hand-off verified; starting the engine\n");
 	INIT_WORK(&b->start, ane_fw_start_work);
+	INIT_DELAYED_WORK(&b->idle_park, ane_fw_idle_park);
 	return 0;
 fail:
 	ane_fw_observer_free(b);
