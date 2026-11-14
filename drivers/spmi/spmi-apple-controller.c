@@ -26,6 +26,7 @@
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
+#include <linux/soc/apple/spmi-fifo.h>
 #include <linux/spinlock.h>
 #include <linux/spmi.h>
 #include <linux/suspend.h>
@@ -705,6 +706,31 @@ static struct platform_driver apple_spmi_driver = {
 		.pm	= pm_sleep_ptr(&apple_spmi_pm_ops),
 	},
 };
+
+/*
+ * For the sleep controller's by-hand PMU commands, sent where this driver's own exchange (a
+ * mutex, a sleeping poll) can't run. The lock is only tried: a holder means an exchange of
+ * ours is under way, and the caller keeps off the bus.
+ */
+int apple_spmi_fifo_trylock(struct device *dev)
+{
+	struct apple_spmi *spmi;
+
+	if (dev->driver != &apple_spmi_driver.driver)
+		return -ENODEV;
+	spmi = dev_get_drvdata(dev);
+	return mutex_trylock(&spmi->fifo_lock) ? 0 : -EBUSY;
+}
+EXPORT_SYMBOL_GPL(apple_spmi_fifo_trylock);
+
+void apple_spmi_fifo_unlock(struct device *dev)
+{
+	struct apple_spmi *spmi = dev_get_drvdata(dev);
+
+	mutex_unlock(&spmi->fifo_lock);
+}
+EXPORT_SYMBOL_GPL(apple_spmi_fifo_unlock);
+
 module_platform_driver(apple_spmi_driver);
 
 MODULE_AUTHOR("Jean-Francois Bortolotti <jeff@borto.fr>");
