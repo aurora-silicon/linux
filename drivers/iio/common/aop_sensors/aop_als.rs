@@ -13,8 +13,10 @@ use kernel::{
     prelude::*,
     soc::apple::aop::{EPICService, FakehidRegistration, AOP},
     sync::Arc,
+    time::{delay::fsleep, Delta},
 };
 
+const EPIC_SUBTYPE_HID_DESCRIPTOR: u16 = 0x1;
 const EPIC_SUBTYPE_GET_AOP_PROPERTY: u16 = 0xa;
 const EPIC_SUBTYPE_SET_ALS_PROPERTY: u16 = 0x4;
 
@@ -30,16 +32,19 @@ const ALS_PROP_VERBOSITY: u32 = 0xe1;
  * interval, and it accepts that transition only once its batch and raw
  * interval properties have been written. Despite their names these two are
  * not intervals; they are the values the CT817 is configured with on the
- * T8140, and macOS runs the VD6286 of the M5 Max with the same batch value
- * and verbosity. The CT817 answers every one of these writes with a
- * not-permitted status and applies them regardless, so the status is only
- * logged.
+ * T8140. macOS sends batch, raw and interval in that order on every report
+ * interval change and keeps only the interval's status. The CT817 answers
+ * the batch and raw writes with a not-permitted status and applies them
+ * regardless, so the status is only logged. macOS sends verbosity only with
+ * a logging boot argument, so the VD6286 does not get it.
  */
 const ALS_BATCH_INTERVAL: u32 = 1;
 const ALS_RAW_INTERVAL: u32 = 0;
 const ALS_VERBOSITY: u32 = 6;
 /// The reporting interval in microseconds.
 const ALS_INTERVAL_US: u32 = 200000;
+/// The VD6286 reporting interval macOS uses, in microseconds.
+const VD6286_INTERVAL_US: u32 = 197380;
 const LUX_OFFSET_CT720: usize = 0x1d;
 // These offsets address the fake-HID EPIC payload, not a host HID event.
 const LUX_OFFSET_VD6286: usize = 0x28;
@@ -104,10 +109,9 @@ fn enable_als(
 
     // The CT817 gets its calibration from the AOP driver over the setup port,
     // not as an ALS property. Only the transport can fail here; the sensor's
-    // status words are logged, see the property comments above. Do not fetch
-    // the HID report descriptor (subtype 0x01) on this endpoint: the AOP never
-    // answers it, and do not write the MODE (0xd7) or 0xe4 properties: either
-    // wedges the AOP for the rest of the boot.
+    // status words are logged, see the property comments above. Do not write
+    // the MODE (0xd7) or 0xe4 properties: either wedges the AOP for the rest
+    // of the boot.
     let set = |tag: u32, val: u32, what: &str| -> Result<()> {
         let status = set_als_property(aop, svc, tag, &val.to_le_bytes())?;
         dev_info!(
@@ -119,7 +123,10 @@ fn enable_als(
         );
         Ok(())
     };
-    set(ALS_PROP_VERBOSITY, ALS_VERBOSITY, "verbosity")?;
+    let ct817 = offset == LUX_OFFSET_CT817;
+    if ct817 {
+        set(ALS_PROP_VERBOSITY, ALS_VERBOSITY, "verbosity")?;
+    }
     set(
         ALS_PROP_BATCH_INTERVAL,
         ALS_BATCH_INTERVAL,
@@ -128,7 +135,29 @@ fn enable_als(
     set(ALS_PROP_RAW_INTERVAL, ALS_RAW_INTERVAL, "raw interval")?;
     // The interval is zero at probe, so this is the transition that arms the
     // sensor.
-    set(ALS_PROP_INTERVAL, ALS_INTERVAL_US, "interval")
+    let interval = if ct817 { ALS_INTERVAL_US } else { VD6286_INTERVAL_US };
+    set(ALS_PROP_INTERVAL, interval, "interval")?;
+    if ct817 {
+        return Ok(());
+    }
+    // macOS writes the interval as zero at power-off and again at power-on.
+    set(ALS_PROP_INTERVAL, 0, "interval at power-off")?;
+    set(ALS_PROP_INTERVAL, interval, "interval at power-on")?;
+    // shortcut: comb4f probe for the macOS HID open; drop or keep once the M5 log shows which step starts reports.
+    // On epic_v4 an unanswered call blocks the endpoint, so the descriptor request is the last call.
+    fsleep(Delta::from_millis(2000));
+    let mut req = KVec::new();
+    req.resize(8, 0, GFP_KERNEL)?;
+    match aop.epic_call_ret(svc, EPIC_SUBTYPE_HID_DESCRIPTOR, &req, 256) {
+        Ok((status, desc)) => dev_info!(
+            dev.as_ref(),
+            "HID descriptor: status {:#x} head {:02x?}\n",
+            status,
+            &desc[..desc.len().min(32)]
+        ),
+        Err(e) => dev_info!(dev.as_ref(), "HID descriptor: {:?}\n", e),
+    }
+    Ok(())
 }
 
 fn get_aop_property(
