@@ -41,6 +41,11 @@ MODULE_PARM_DESC(tiled_split,
 static bool typec_follow_crtc = true;
 module_param(typec_follow_crtc, bool, 0444);
 
+static bool tb_forward_irq_hpd = true;
+module_param(tb_forward_irq_hpd, bool, 0644);
+MODULE_PARM_DESC(tb_forward_irq_hpd,
+		 "Pass a Thunderbolt DP sink IRQ_HPD to the display firmware (default: on)");
+
 /*
  * The hybrid pipeline (dcpext0: fixed HDMI PHY + Type-C routes) normally
  * comes last for a Type-C port, kept for an HDMI display.  On the J616s it
@@ -3375,9 +3380,14 @@ void dcp_tb_event_work(struct work_struct *work)
 		scoped_guard(spinlock_irqsave, &dcp->relink_lock)
 			dcp_relink_link_up(&dcp->relink,
 					   READ_ONCE(dcp->typec_generation), jiffies);
-		ret = dptxport_sink_irq(service);
-		dev_info(dcp->dev, "DP tunnel: sink IRQ_HPD (#%u, %lld ms after the last) passed to the firmware: %d\n",
-			 dcp->tb_irq_hpd_count, since, ret);
+		if (tb_forward_irq_hpd) {
+			ret = dptxport_sink_irq(service);
+			dev_info(dcp->dev, "DP tunnel: sink IRQ_HPD (#%u, %lld ms after the last) passed to the firmware: %d\n",
+				 dcp->tb_irq_hpd_count, since, ret);
+		} else {
+			dev_info(dcp->dev, "DP tunnel: sink IRQ_HPD (#%u, %lld ms after the last) not passed (tb_forward_irq_hpd=0)\n",
+				 dcp->tb_irq_hpd_count, since);
+		}
 	}
 }
 
