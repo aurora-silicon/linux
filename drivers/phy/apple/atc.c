@@ -5729,10 +5729,24 @@ static enum atcphy_mode atcphy_typec_target_mode(struct apple_atcphy *atcphy,
 	 * its USB on the other wires: USB2 next to four DP lanes (pin
 	 * assignments C and E), USB3 next to two (D). Serve that USB rather
 	 * than refuse the mode, which would leave the port without USB at all.
+	 *
+	 * The same goes for USB4 and Thunderbolt on a port without the CIO
+	 * calibration, such as those of the Mac mini (J773g). Its port
+	 * controller enters USB4 or Thunderbolt 3 by itself with a USB4 dock
+	 * or another Mac, and USB 2.0 on D+/D- does not depend on that link.
+	 * Do this first, so that the DisplayPort fallback below starts from
+	 * the mode actually served rather than putting USB4 back.
 	 */
 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8132) {
-		enum atcphy_mode usb_mode = target_mode;
+		enum atcphy_mode usb_mode;
 
+		if (atcphy_mode_is_cio(target_mode) && !atcphy->cio_tunables) {
+			dev_info(atcphy->dev,
+				 "USB4/Thunderbolt is not available on this port: serving its USB2 only\n");
+			target_mode = APPLE_ATCPHY_MODE_USB2;
+		}
+
+		usb_mode = target_mode;
 		/* 4-lane DP stays DP only on a port wired for DP alt mode */
 		if (target_mode == APPLE_ATCPHY_MODE_DP && !atcphy_t8132_dp_on(atcphy))
 			usb_mode = APPLE_ATCPHY_MODE_USB2;

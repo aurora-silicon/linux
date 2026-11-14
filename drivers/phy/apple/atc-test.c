@@ -104,6 +104,40 @@ static void atcphy_test_target_mode_t8132(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_OFF);
 }
 
+/* Without the CIO calibration, a T8132 port serves a USB4 or TBT partner's USB2 */
+static void atcphy_test_target_mode_t8132_cio(struct kunit *test)
+{
+	struct typec_altmode tbt = { .svid = USB_TYPEC_TBT_SID };
+	struct enter_usb_data eusb = {
+		.eudo = FIELD_PREP(EUDO_USB_MODE_MASK, EUDO_USB_MODE_USB4),
+	};
+	struct typec_mux_state state = { .mode = TYPEC_MODE_USB4, .data = &eusb };
+	struct apple_atcphy *atcphy = atcphy_test_alloc_dev(test, false);
+
+	atcphy->hw = &atcphy_hw_t8132;
+	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB2);
+	state.alt = &tbt;
+	state.mode = TYPEC_TBT_MODE;
+	state.data = NULL;
+	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB2);
+	/* The same on a SuperSpeed port. */
+	atcphy->t8132_ss = true;
+	atcphy->ss_tunables = true;
+	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB2);
+	state.alt = NULL;
+	state.mode = TYPEC_MODE_USB4;
+	state.data = &eusb;
+	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB2);
+
+	/* With the calibration, the link itself is served. */
+	atcphy->cio_tunables = true;
+	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB4);
+	state.alt = &tbt;
+	state.mode = TYPEC_TBT_MODE;
+	state.data = NULL;
+	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_TBT);
+}
+
 static void atcphy_test_noop_same_mode(struct kunit *test)
 {
 	struct apple_atcphy *atcphy = atcphy_test_alloc(test, true);
@@ -1391,6 +1425,7 @@ static struct kunit_case atcphy_mux_test_cases[] = {
 	KUNIT_CASE(atcphy_test_target_mode),
 	KUNIT_CASE(atcphy_test_target_mode_fixed_hub),
 	KUNIT_CASE(atcphy_test_target_mode_t8132),
+	KUNIT_CASE(atcphy_test_target_mode_t8132_cio),
 	KUNIT_CASE(atcphy_test_noop_same_mode),
 	KUNIT_CASE(atcphy_test_noop_needs_work),
 	KUNIT_CASE(atcphy_test_usb3_port_ready),

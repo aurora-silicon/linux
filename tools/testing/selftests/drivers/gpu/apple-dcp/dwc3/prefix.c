@@ -28,6 +28,7 @@ static void warning(const char *message)
 		generic_warnings++;
 }
 #define dev_warn(d, message, ...) warning(message)
+#define dev_info(...) ((void)0)
 #define dev_err(...) ((void)0)
 #define dev_dbg(...) ((void)0)
 #define lockdep_assert_held(p) assert(*(p))
