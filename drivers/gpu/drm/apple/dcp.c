@@ -4273,7 +4273,7 @@ int dcp_start(struct platform_device *pdev)
 				 ret);
 
 		if (dcp->hw.iomfb_method_profile ==
-		    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
+		    DCP_IOMFB_METHODS_H17P_EXTERNAL || dcp->hw.dptx_controller) {
 			ret = dptx_controller_init(dcp);
 			if (ret)
 				return dev_err_probe(dcp->dev, ret,

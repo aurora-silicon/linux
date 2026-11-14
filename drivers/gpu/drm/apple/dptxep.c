@@ -1383,7 +1383,8 @@ int dptx_controller_init(struct apple_dcp *dcp)
 	if (IS_ERR(ep))
 		return PTR_ERR(ep);
 	/* Controller interfaces require the same OPEN handshake as the port. */
-	ep->wire_v2 = dcp->hw.iomfb_method_profile ==
+	ep->wire_v2 = dcp->fw_compat == DCP_FIRMWARE_V_27_0 ||
+		dcp->hw.iomfb_method_profile ==
 		DCP_IOMFB_METHODS_H17P_EXTERNAL;
 	dcp->dptx_controller_ep = ep;
 
@@ -1412,7 +1413,8 @@ int dptxep_init(struct apple_dcp *dcp)
 	init_completion(&dcp->dptxport[0].linkcfg_completion);
 	init_completion(&dcp->dptxport[1].linkcfg_completion);
 
-	ep = afk_init(dcp, wire_v2 ? DPTX_ENDPOINT_V2 : DPTX_ENDPOINT, dptxep_ops);
+	ep = afk_init(dcp, dcp->hw.dptx_endpoint ?:
+		      (wire_v2 ? DPTX_ENDPOINT_V2 : DPTX_ENDPOINT), dptxep_ops);
 	if (IS_ERR(ep))
 		return PTR_ERR(ep);
 	ep->wire_v2 = wire_v2;

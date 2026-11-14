@@ -278,6 +278,17 @@ struct apple_dcp_hw_data {
 	 */
 	bool sink_metadata_edid;
 	/*
+	 * The endpoint the DPTX port services are announced on, where it is not
+	 * the firmware's default (DPTX_ENDPOINT_V2 on firmware 27): the T8142
+	 * dcpext announces them on DPTX_ENDPOINT. 0: the default.
+	 */
+	u8 dptx_endpoint;
+	/*
+	 * Open the DPTX controller endpoint before the ports, as for H17P
+	 * externals: the T8142 dcpext announces AppleDCPDPTXController there.
+	 */
+	bool dptx_controller;
+	/*
 	 * With H17P firmware: a firmware-driven system sleep stops the internal processor's
 	 * firmware and powers it down, as DPMS off does, then restarts it warm, see
 	 * dcp_s2r_suspend(). @s2r_ext: the same for an external one, see dcp_s2r_ext_suspend().
