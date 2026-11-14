@@ -204,3 +204,20 @@
 &ane {
 	status = "okay";
 };
+
+/* Both JPEG engines and their DART. */
+&ps_jpg {
+	status = "okay";
+};
+
+&jpeg_dart {
+	status = "okay";
+};
+
+&jpeg0 {
+	status = "okay";
+};
+
+&jpeg1 {
+	status = "okay";
+};
