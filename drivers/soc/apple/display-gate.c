@@ -2092,10 +2092,10 @@ static void __init gate_run(void)
 /*
  * T6041 internal display. The handoff describes the DCP that iBoot left
  * running: the DCP, the display subsystem and the DCP's piodma child carry
- * the marker, the DCP names the 26.6.2 firmware the desktop IOMFB instance is
- * written for, and the DCP, display and piodma streams sit on the expected
- * DARTs. The display nodes are enabled only when all of that checks out and
- * the DCP is running.
+ * the marker, the DCP names a qualified 26.6.2 or 27.2 firmware interface,
+ * and the DCP, display and piodma streams sit on the expected DARTs. The
+ * display nodes are enabled only when all of that checks out and the DCP is
+ * running.
  */
 #define T6041_DCP_SID		23
 #define T6041_DISP_SID		0
@@ -2114,6 +2114,12 @@ static const int t6041_enable[] __initconst = { T6041_DCP_DART, T6041_DISP_DART,
 
 /* Applied, it stays: the live tree refers to it. */
 static struct of_changeset t6041_gate;
+
+static bool __init gate_t6041_firmware_compat(const u32 version[3])
+{
+	return (version[0] == 26 && version[1] == 6 && version[2] == 2) ||
+	       (version[0] == 27 && version[1] == 2 && version[2] == 0);
+}
 
 static void __init gate_t6041_internal(void)
 {
@@ -2139,10 +2145,10 @@ static void __init gate_t6041_internal(void)
 	    !gate_marked(nodes[T6041_PIODMA]))
 		goto out;
 
-	/* The desktop IOMFB instance is written for the 26.6.2 firmware only. */
+	/* Admit the transition desktop ABI and the firmware-27 ABI. */
 	if (of_property_count_u32_elems(nodes[T6041_DCP], "apple,firmware-compat") != 3 ||
 	    of_property_read_u32_array(nodes[T6041_DCP], "apple,firmware-compat", version, 3) ||
-	    version[0] != 26 || version[1] != 6 || version[2] != 2)
+	    !gate_t6041_firmware_compat(version))
 		goto out;
 
 	nodes[T6041_DCP_DART] = gate_target(nodes[T6041_DCP], "iommus", "#iommu-cells",
