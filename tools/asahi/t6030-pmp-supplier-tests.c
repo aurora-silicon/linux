@@ -403,6 +403,14 @@ static int apple_pmp_report_set_t6030_gfx(struct device *dev, bool enabled)
 	gfx_set_calls++;
 	return 0;
 }
+/* The T8112 readiness path is outside this T6030 model. */
+static int apple_pmp_report_wait_t8112_ready(struct apple_pmp_report *rep,
+					     unsigned int timeout_ms)
+{
+	(void)rep;
+	(void)timeout_ms;
+	__builtin_trap();
+}
 #include "t6030-pmp-production.h"
 
 static void balanced(void)

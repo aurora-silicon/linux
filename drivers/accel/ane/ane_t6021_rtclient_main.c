@@ -68,6 +68,7 @@
 #include <linux/of_address.h>
 #include <linux/of_platform.h>
 #include <linux/overflow.h>
+#include <linux/soc/apple/pmp.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
@@ -76,6 +77,7 @@
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
+#include <linux/soc/apple/pmp-report.h>
 #include <linux/types.h>
 #include <linux/uaccess.h>
 #include <linux/unaligned.h>
@@ -234,6 +236,7 @@ MODULE_PARM_DESC(stats,
  */
 #define ANE_LEGACY_ALLOCS 8192
 #define ANE_LEGACY_BYTES SZ_512M
+#define ANE_PMP_HOLD_MS 32
 
 struct ane_t6021_fd;
 
@@ -264,6 +267,9 @@ struct ane_rtclient_restart;
 
 struct ane_rtclient {
 	struct device *dev;
+	struct device_node *pmp_report;
+	struct delayed_work pmp_release;
+	bool pmp_held;
 	void __iomem *engine;
 	void __iomem *pmgr;
 	void __iomem *set;
@@ -330,6 +336,56 @@ struct ane_rtclient {
 	struct ane_stats_ring stats_ring;
 	struct ane_stats_ring_entry *stats_slots;
 };
+
+static void ane_t6021_pmp_release_work(struct work_struct *work)
+{
+	struct ane_rtclient *ane = container_of(to_delayed_work(work),
+						 struct ane_rtclient, pmp_release);
+
+	apple_pmp_t8112_set_constraint(ane->pmp_report,
+				       APPLE_PMP_T8112_DVFS_ENTRY(APPLE_PMP_T8112_ANE0),
+				       APPLE_PMP_T8112_CONSTRAINT_ANE, 0, 0);
+	WRITE_ONCE(ane->pmp_held, false);
+}
+
+static void ane_t6021_pmp_begin(struct ane_rtclient *ane)
+{
+	int ret;
+
+	if (!ane->pmp_report)
+		return;
+	cancel_delayed_work_sync(&ane->pmp_release);
+	ret = apple_pmp_t8112_set_constraint(ane->pmp_report,
+					     APPLE_PMP_T8112_DVFS_ENTRY(APPLE_PMP_T8112_ANE0),
+					     APPLE_PMP_T8112_CONSTRAINT_ANE,
+					     APPLE_PMP_T8112_DCS_MAX,
+					     APPLE_PMP_T8112_SOC_MAX);
+	if (!ret)
+		WRITE_ONCE(ane->pmp_held, true);
+	else if (ret != -EAGAIN)
+		dev_warn_once(ane->dev, "PMP memory/fabric vote unavailable (%d)\n", ret);
+}
+
+static void ane_t6021_pmp_end(struct ane_rtclient *ane)
+{
+	if (READ_ONCE(ane->pmp_held))
+		mod_delayed_work(system_wq, &ane->pmp_release,
+				 msecs_to_jiffies(ANE_PMP_HOLD_MS));
+}
+
+static void ane_t6021_pmp_cleanup(void *data)
+{
+	struct ane_rtclient *ane = data;
+
+	cancel_delayed_work_sync(&ane->pmp_release);
+	if (ane->pmp_report) {
+		apple_pmp_t8112_set_constraint(ane->pmp_report,
+					       APPLE_PMP_T8112_DVFS_ENTRY(APPLE_PMP_T8112_ANE0),
+					       APPLE_PMP_T8112_CONSTRAINT_ANE, 0, 0);
+		of_node_put(ane->pmp_report);
+		ane->pmp_report = NULL;
+	}
+}
 
 /* Per-open BO ownership (drm_file->driver_priv). Handles live in the
  * fd's list; closing the fd drops its handles (postclose). The
@@ -2219,12 +2275,14 @@ static int ane_rtclient_procedure_call(struct ane_rtclient *ane,
 		 * the fw starts reading them.
 		 */
 		wmb();
+		ane_t6021_pmp_begin(ane);
 		ret = ane_rtclient_command(ane, command,
 					   cmd_size,
 							       CSNE_CMD_PROCEDURE_CALL,
 							       1,
 							       user->timeout_ms ?
 							       user->timeout_ms : 5000);
+		ane_t6021_pmp_end(ane);
 	}
 unlock:
 	/* Command failures latch quarantine before these final puts. */
@@ -3515,7 +3573,8 @@ static int ane_rtclient_rs_prepare(struct ane_rtclient_restart *rs)
 	struct ane_rtclient *ane = rs->ane;
 	struct ane_t6021 *a = ane->fw;
 	struct ane_rtclient_pd *pd;
-	unsigned int domains = ane->soc->soc == 0x8112 ? 7 : 8;
+	/* T8112 has seven ANE domains, plus its PMP report entry when linked. */
+	unsigned int domains = ane->soc->soc != 0x8112 ? 8 : ane->pmp_report ? 8 : 7;
 
 	lockdep_assert_held(&ane_t6021_fw_lock);
 	if (!ane->registered)
@@ -3920,6 +3979,14 @@ static int ane_rtclient_probe_inner(struct platform_device *pdev,
 	if (!ane->legacy_buffers)
 		return -ENOMEM;
 	ane->dev = dev;
+	INIT_DELAYED_WORK(&ane->pmp_release, ane_t6021_pmp_release_work);
+	/* T8112: hold the PMP memory/fabric floors while a request runs. */
+	if (of_device_is_compatible(dev->of_node, "apple,t8112-ane"))
+		ane->pmp_report = of_parse_phandle(dev->of_node,
+						   "apple,performance-controller", 0);
+	ret = devm_add_action_or_reset(dev, ane_t6021_pmp_cleanup, ane);
+	if (ret)
+		return ret;
 	INIT_LIST_HEAD(&ane->h16_processes);
 	ane->soc = of_device_get_match_data(dev);
 	platform_set_drvdata(pdev, ane);

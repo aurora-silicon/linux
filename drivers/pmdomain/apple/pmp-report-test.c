@@ -34,6 +34,31 @@ static void pmp_ranges_t6030(struct kunit *test)
 							0x1000, 0x10800, 0x1080));
 }
 
+/* Older PMPs have distinct PTD apertures; neither uses the M3 layout. */
+static void pmp_ranges_t6000(struct kunit *test)
+{
+	u8 table[2 * PMP_PTD_RANGE_SIZE];
+
+	pmp_range(table, PMP_PTD_RANGE_REQUEST, 0xf8, 8);
+	pmp_range(table + PMP_PTD_RANGE_SIZE, PMP_PTD_RANGE_ACK, 0x100, 8);
+	KUNIT_EXPECT_TRUE(test, apple_pmp_ranges_valid(table, sizeof(table),
+						       0xf80, 0x107c0, 0x1000));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_ranges_valid(table, sizeof(table),
+							0xa00, 0x10500, 0xa40));
+}
+
+static void pmp_ranges_t8112(struct kunit *test)
+{
+	u8 table[2 * PMP_PTD_RANGE_SIZE];
+
+	pmp_range(table, PMP_PTD_RANGE_REQUEST, 0xa0, 4);
+	pmp_range(table + PMP_PTD_RANGE_SIZE, PMP_PTD_RANGE_ACK, 0xa4, 4);
+	KUNIT_EXPECT_TRUE(test, apple_pmp_ranges_valid(table, sizeof(table),
+						       0xa00, 0x10500, 0xa40));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_ranges_valid(table, sizeof(table),
+							0xf80, 0x107c0, 0x1000));
+}
+
 static void pmp_ranges_t8122(struct kunit *test)
 {
 	u8 table[2 * PMP_PTD_RANGE_SIZE];
@@ -298,7 +323,57 @@ static void pmp_dvfs_words(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, apple_pmp_dvfs_word(0, NULL, 0, NULL));
 }
 
+/* Expected T8112 constraint word, built from the named lane fields. */
+static u64 pmp_t8112_expected_word(u32 dcs, u32 soc)
+{
+	const u32 lane = PMP_T8112_CONSTRAINT_DCS_CLASS - PMP_DVFS_CLASS_FIRST;
+
+	return PMP_DVFS_VALID | soc |
+	       (u64)dcs << (PMP_DVFS_CLASS_SHIFT + PMP_DVFS_CLASS_BITS * lane);
+}
+
+static void pmp_t8112_constraint_words(struct kunit *test)
+{
+	u32 dcs, soc;
+	u64 word;
+
+	for (dcs = 0; dcs <= PMP_T8112_CONSTRAINT_DCS_MAX; dcs++) {
+		for (soc = 0; soc <= PMP_T8112_CONSTRAINT_SOC_MAX; soc++) {
+			KUNIT_ASSERT_TRUE(test, apple_pmp_t8112_constraint_word(dcs, soc, &word));
+			KUNIT_EXPECT_EQ(test, word, pmp_t8112_expected_word(dcs, soc));
+		}
+	}
+	/* The release word keeps only the valid bit. */
+	KUNIT_ASSERT_TRUE(test, apple_pmp_t8112_constraint_word(0, 0, &word));
+	KUNIT_EXPECT_EQ(test, word, PMP_DVFS_VALID);
+	KUNIT_EXPECT_FALSE(test, apple_pmp_t8112_constraint_word(PMP_T8112_CONSTRAINT_DCS_MAX + 1,
+								  0, &word));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_t8112_constraint_word(0, PMP_T8112_CONSTRAINT_SOC_MAX + 1,
+								  &word));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_t8112_constraint_word(0, 0, NULL));
+}
+
+static void pmp_t8112_state_words(struct kunit *test)
+{
+	bool valid;
+	u64 word;
+	u32 level;
+
+	for (level = 0; level <= PMP_T8112_CONSTRAINT_DCS_MAX; level++) {
+		valid = apple_pmp_t8112_state_word(level, PMP_T8112_CONSTRAINT_DCS_MAX, &word);
+		KUNIT_ASSERT_TRUE(test, valid);
+		KUNIT_EXPECT_EQ(test, word, PMP_DVFS_VALID | level);
+	}
+	valid = apple_pmp_t8112_state_word(PMP_T8112_CONSTRAINT_DCS_MAX + 1,
+					   PMP_T8112_CONSTRAINT_DCS_MAX, &word);
+	KUNIT_EXPECT_FALSE(test, valid);
+	valid = apple_pmp_t8112_state_word(0, PMP_T8112_CONSTRAINT_SOC_MAX, NULL);
+	KUNIT_EXPECT_FALSE(test, valid);
+}
+
 static struct kunit_case apple_pmp_report_cases[] = {
+	KUNIT_CASE(pmp_ranges_t6000),
+	KUNIT_CASE(pmp_ranges_t8112),
 	KUNIT_CASE(pmp_ranges_t6030),
 	KUNIT_CASE(pmp_request_word_replay),
 	KUNIT_CASE(pmp_ranges_t8122),
@@ -313,6 +388,8 @@ static struct kunit_case apple_pmp_report_cases[] = {
 	KUNIT_CASE(pmp_bootargs_reject_truncation),
 	KUNIT_CASE(pmp_bootargs_reject_integer_width),
 	KUNIT_CASE(pmp_dvfs_words),
+	KUNIT_CASE(pmp_t8112_constraint_words),
+	KUNIT_CASE(pmp_t8112_state_words),
 	{}
 };
 

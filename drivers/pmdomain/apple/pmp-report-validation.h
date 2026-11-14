@@ -3,6 +3,7 @@
 #define _APPLE_PMP_REPORT_VALIDATION_H
 
 #include <linux/bitops.h>
+#include <linux/array_size.h>
 #include <linux/errno.h>
 #include <linux/types.h>
 #include <linux/unaligned.h>
@@ -19,6 +20,15 @@
 #define PMP_DVFS_CLASS_BITS		4
 /* <class level> pairs, each class at most once */
 #define PMP_DVFS_CLASS_CELLS_MAX	(2 * PMP_DVFS_CLASS_COUNT)
+
+/*
+ * T8112 CPU-cluster and ANE constraint word: the SoC fabric level is the main
+ * level (bits 4:0) and the memory (DCS) level is request class 0x21's lane
+ * (bits 35:32). The highest qualified levels are DCS 4 and SoC 2.
+ */
+#define PMP_T8112_CONSTRAINT_DCS_CLASS	0x21
+#define PMP_T8112_CONSTRAINT_DCS_MAX	4
+#define PMP_T8112_CONSTRAINT_SOC_MAX	2
 
 #define PMP_SOC_DEVICE_SIZE	0x7c
 #define PMP_SOC_DEVICE_ACK	BIT(1)
@@ -69,6 +79,23 @@ static inline bool apple_pmp_dvfs_word(u32 main_level, const u32 *class_levels,
 	}
 	*word = value;
 	return true;
+}
+
+static inline bool apple_pmp_t8112_constraint_word(u32 dcs, u32 soc, u64 *word)
+{
+	const u32 class_levels[] = { PMP_T8112_CONSTRAINT_DCS_CLASS, dcs };
+
+	if (dcs > PMP_T8112_CONSTRAINT_DCS_MAX || soc > PMP_T8112_CONSTRAINT_SOC_MAX)
+		return false;
+	return apple_pmp_dvfs_word(soc, class_levels, ARRAY_SIZE(class_levels), word);
+}
+
+/* T8112's direct DCS and SoC domain floors use the main request level. */
+static inline bool apple_pmp_t8112_state_word(u32 level, u32 max, u64 *word)
+{
+	if (level > max)
+		return false;
+	return apple_pmp_dvfs_word(level, NULL, 0, word);
 }
 
 /* The PTD request read, request update and acknowledgment apertures. */
