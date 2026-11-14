@@ -269,10 +269,12 @@ impl job::Backend for Backend {
     /// Compute and render admission wait for their shared capacity here, as a
     /// fence.
     fn prepare(&self, packet: &Arc<Packet>) -> Option<Fence> {
-        match packet.engine() {
+        let capacity = match packet.engine() {
             Engine::Compute => self.prepare_compute(packet),
             Engine::Render => self.admit_render(packet),
-        }
+        };
+        // Capacity first: a command is held for ray-traversal work only once it could run.
+        capacity.or_else(|| self.traversal_admission(packet))
     }
 
     fn publish(&self, packet: Arc<Packet>) -> Result<Fence> {

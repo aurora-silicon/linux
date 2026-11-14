@@ -68,6 +68,7 @@ mod teardown;
 pub(crate) mod telemetry;
 mod thermal;
 mod timeout;
+mod traversal;
 mod validation;
 
 use core::any::Any;
@@ -1231,6 +1232,8 @@ struct Shared {
     /// returns, an owner closes, a teardown parks, and on every event pass
     /// while a render publisher waits (firmware consumption has no event).
     renders: Arc<availability::Availability>,
+    /// Which commands may enter the GPU beside a command that traces rays.
+    traversal: Arc<runtime::traversal::Gate>,
     /// Unbound compute publishers which can reuse a retired channel.
     compute_demand: AtomicU32,
     #[pin]
@@ -1701,6 +1704,7 @@ impl Gpu {
         let queues = availability::Availability::new()?;
         let preparations = preparation::Gate::with_waiters(Some(progress.clone()))?;
         let renders = availability::Availability::new()?;
+        let traversal = runtime::traversal::Gate::new()?;
         let reclaim = runtime::teardown::ReclaimBatch::new()?;
         let feed = feed::Feed::new(m5)?;
         let alternate = cfg.core_layout.cores.is_some_and(|(clusters, cores)| {
@@ -1770,6 +1774,7 @@ impl Gpu {
                 progress,
                 queues,
                 renders,
+                traversal,
                 compute_demand: AtomicU32::new(0),
                 work <- new_work!("g17::Shared::work"),
                 housekeeping: AtomicBool::new(true),
