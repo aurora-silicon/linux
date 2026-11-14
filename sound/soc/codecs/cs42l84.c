@@ -1143,6 +1143,43 @@ static void cs42l84_setup_plug_detect(struct cs42l84_private *cs42l84)
 
 }
 
+/*
+ * Register writes the platform's own driver makes right after the device ID
+ * check, from the device tree's apple,init-writes: 16-bit (register, value)
+ * pairs, applied in order. Machines without the property are unchanged.
+ */
+#define CS42L84_INIT_WRITES_MAX 32
+
+static int cs42l84_apply_init_writes(struct cs42l84_private *cs42l84)
+{
+	struct device *dev = cs42l84->dev;
+	u16 seq[CS42L84_INIT_WRITES_MAX * 2];
+	int n, i, ret;
+
+	n = device_property_count_u16(dev, "apple,init-writes");
+	if (n <= 0)
+		return 0;
+	if (n % 2 || n > ARRAY_SIZE(seq))
+		return dev_err_probe(dev, -EINVAL, "apple,init-writes: %d entries\n", n);
+
+	ret = device_property_read_u16_array(dev, "apple,init-writes", seq, n);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < n; i += 2) {
+		if (seq[i] > CS42L84_REVID || seq[i + 1] > 0xff)
+			return dev_err_probe(dev, -EINVAL,
+					     "apple,init-writes: bad pair %#x %#x\n",
+					     seq[i], seq[i + 1]);
+		ret = regmap_write(cs42l84->regmap, seq[i], seq[i + 1]);
+		if (ret)
+			return ret;
+	}
+
+	dev_dbg(dev, "%d init writes\n", n / 2);
+	return 0;
+}
+
 static int cs42l84_i2c_probe(struct i2c_client *i2c_client)
 {
 	struct cs42l84_private *cs42l84;
@@ -1228,6 +1265,10 @@ static int cs42l84_i2c_probe(struct i2c_client *i2c_client)
 
 	dev_info(&i2c_client->dev,
 		 "Cirrus Logic CS42L84, Revision: %02X\n", reg & 0xFF);
+
+	ret = cs42l84_apply_init_writes(cs42l84);
+	if (ret)
+		goto err_shutdown;
 
 	/* Setup plug detection */
 	cs42l84_setup_plug_detect(cs42l84);
