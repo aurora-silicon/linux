@@ -42,8 +42,8 @@ struct dcp_v14_board {
 	/*
 	 * The panel's swaps carry the constant timestamp
 	 * DCP_V14_SWAP_TIMESTAMP_VALUE in slots 0, 1 and 6. With zero
-	 * timestamps this board's firmware completes at most one swap per
-	 * 16.7 ms, so a 120 Hz panel presents at 60 fps.
+	 * timestamps the firmware completes at most one swap per 16.7 ms, so a
+	 * 120 Hz panel presents at 60 fps: set wherever promotion is.
 	 */
 	bool swap_timestamps;
 	/* This board has a qualified panel level block; machine admission is separate. */
