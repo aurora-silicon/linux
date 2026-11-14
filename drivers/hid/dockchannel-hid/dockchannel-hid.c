@@ -877,10 +877,48 @@ static void dchid_close(struct hid_device *hdev)
 	WRITE_ONCE(iface->open, false);
 }
 
+/*
+ * The K116s MTP firmware (AppleMTPFirmwareMac-6310.85.7) describes the
+ * multi-touch interface's one input report with a 4-byte Report Size of
+ * 0x80000 bits (64 KiB), which the HID core refuses (16384 bits at most), so
+ * no driver can bind and the firmware upload a bind triggers never happens.
+ * The report's size is not used by the transport: the MTP's reports arrive
+ * through raw_event with their own framing. Clamp any such item to the
+ * maximum the core accepts, in place, so the item layout stays the same.
+ */
+static void dchid_clamp_report_size(struct hid_device *hdev, u8 *desc, size_t len)
+{
+	size_t i = 0;
+
+	while (i < len) {
+		u8 hdr = desc[i], size = hdr & 3, type = (hdr >> 2) & 3, tag = hdr >> 4;
+
+		if (hdr == 0xfe) { /* long item */
+			if (i + 2 >= len)
+				return;
+			i += 3 + desc[i + 1];
+			continue;
+		}
+		if (size == 3)
+			size = 4;
+		/* Global item, Report Size, 4-byte value */
+		if (type == 1 && tag == 7 && size == 4 && i + 4 < len) {
+			u32 val = get_unaligned_le32(&desc[i + 1]);
+
+			if (val > 16384) {
+				hid_info(hdev, "clamping report size %u to 16384 bits\n", val);
+				put_unaligned_le32(16384, &desc[i + 1]);
+			}
+		}
+		i += 1 + size;
+	}
+}
+
 static int dchid_parse(struct hid_device *hdev)
 {
 	struct dchid_iface *iface = hdev->driver_data;
 
+	dchid_clamp_report_size(hdev, iface->hid_desc, iface->hid_desc_len);
 	return hid_parse_report(hdev, iface->hid_desc, iface->hid_desc_len);
 }
 
