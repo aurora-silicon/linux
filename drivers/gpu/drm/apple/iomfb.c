@@ -2608,6 +2608,7 @@ static int dcp_takeover_adopt(struct apple_dcp *dcp, const struct drm_display_mo
 		.color_mode_id = sel.color_mode_id,
 		.timing_mode_id = sel.timing_mode_id,
 	};
+	dcp->mode_clock_khz = sel.mode.clock;
 	dcp->use_timestamps = sel.needs_timestamps;
 	dcp->vrr_enabled = false;
 	d->mode_live = true;

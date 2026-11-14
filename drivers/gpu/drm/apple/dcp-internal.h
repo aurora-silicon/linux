@@ -680,6 +680,8 @@ struct apple_dcp {
 	u32 edr_sdr;
 	bool edr_restart;
 	struct dcp_set_digital_out_mode_req mode;
+	/* Pixel clock (kHz) of @mode; the firmware asks for its video clock. */
+	u32 mode_clock_khz;
 
 	/* completion for active turning true */
 	struct completion start_done;

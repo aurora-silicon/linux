@@ -141,25 +141,26 @@ static bool trampoline_rt_bandwidth_h17p(struct apple_dcp *dcp, int tag,
 	return true;
 }
 
-/* Probe: rate answered for a clock the DT does not declare; 0 keeps the old reply. */
-static unsigned long w86_undeclared_clk_hz;
-module_param_named(w86_undeclared_clk_hz, w86_undeclared_clk_hz, ulong, 0644);
-MODULE_PARM_DESC(w86_undeclared_clk_hz, "Rate (Hz) answered for an undeclared DCP provider clock");
-
+/*
+ * A T6050 dcpext declares no provider clocks, yet at each mode set the
+ * firmware asks for clock 0 and gives up on the mode's frequencies unless
+ * the rate covers its video clock, half the pixel clock ("program_frame_size:
+ * pixel_clock 237600000, vid0 118800000").  0 Hz and 810 MHz for a 468 MHz
+ * video clock both drop the sink; the exact video clock does not.
+ * shortcut: two pixels per video clock is read off the 1440p and 5K logs;
+ * revisit if a mode logs another vid0.
+ */
 static bool trampoline_get_frequency_v27(struct apple_dcp *dcp, int tag,
 					void *out, void *in)
 {
 	const struct apple_dcp_h17p_clock_request *request = in;
 	u32 index = le32_to_cpu(request->clock_id);
-	u64 rate = 0;
+	u64 rate;
 
-	if (index < dcp->num_firmware_clocks) {
+	if (index < dcp->num_firmware_clocks)
 		rate = clk_get_rate(dcp->firmware_clocks[index].clk);
-	} else {
-		rate = w86_undeclared_clk_hz;
-		dev_err(dcp->dev, "DCP requested undeclared provider clock index %u\n",
-			index);
-	}
+	else
+		rate = (u64)dcp->mode_clock_khz * 1000 / 2;
 	dev_info(dcp->dev, "w86-clk: D408 index %u declared %u -> %llu Hz\n",
 		 index, dcp->num_firmware_clocks, rate);
 	*(__le64 *)out = cpu_to_le64(rate);

@@ -3780,6 +3780,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		.color_mode_id = mode->color_mode_id,
 		.timing_mode_id = mode->timing_mode_id
 	};
+	dcp->mode_clock_khz = mode->mode.clock;
 	dcp->output_pq = dcp->pq_requested && mode->pq.score >= 0;
 
 	/* VRR modes need swap timestamps, see iomfb_flush(); ProMotion fixed 120 too. */
@@ -4035,6 +4036,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		.color_mode_id = mode->color_mode_id,
 		.timing_mode_id = mode->timing_mode_id
 	};
+	dcp->mode_clock_khz = mode->mode.clock;
 	dcp->output_pq = dcp->pq_requested && mode->pq.score >= 0;
 
 	/* Built-in ProMotion panels require timestamps even in fixed-120 mode. */
