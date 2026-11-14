@@ -68,6 +68,9 @@ pub(crate) struct Variant {
     pub(crate) render_stage_prefixes: bool,
     /// The firmware runs ray-traversal work (ray queries and intersection programs).
     pub(crate) ray_traversal: bool,
+    /// Ray-traversal commands run for one client at a time, with other clients' compute
+    /// commands kept out meanwhile ([`crate::g17::traversal`]).
+    pub(crate) traversal_exclusion: bool,
     /// Renders may carry ray-query stages. The M5 command set has none: it encodes no render
     /// ray-query state.
     pub(crate) render_ray_query: bool,
@@ -132,6 +135,7 @@ pub(crate) const V26A428: Variant = Variant {
     few_primitives: true,
     render_stage_prefixes: true,
     ray_traversal: true,
+    traversal_exclusion: true,
     render_ray_query: true,
     fragment_busy: true,
     lead_commands: false,
@@ -166,6 +170,8 @@ pub(crate) const V25G83: Variant = Variant {
     // Not measured on this firmware.
     render_stage_prefixes: false,
     ray_traversal: true,
+    // Not measured on this firmware.
+    traversal_exclusion: false,
     render_ray_query: true,
     // When a tiling pass runs out of memory with this set, the firmware resumes it without
     // adding memory and the tiler stops silently; macOS always writes 0.
@@ -184,6 +190,8 @@ pub(crate) const V25G83: Variant = Variant {
 /// command set).
 pub(crate) const V26A428_M5: Variant = Variant {
     m5_commands: true,
+    // Not measured on the M5 firmware.
+    traversal_exclusion: false,
     render_ray_query: false,
     registration_power_hold: false,
     ..V26A428

@@ -566,6 +566,10 @@ impl Backend {
         if self.backlog.load(Ordering::Acquire) != 0 || packet.has_dependencies() {
             return false;
         }
+        // As for compute: a render that traces rays is admitted by its scheduler.
+        if !self.traversal_inline(packet) {
+            return false;
+        }
         let admission = match self.admission.try_acquire_render(self.owner, self.pairs.into(), Request::of(packet)) {
             Ok(Some(lease)) => lease,
             _ => return false,

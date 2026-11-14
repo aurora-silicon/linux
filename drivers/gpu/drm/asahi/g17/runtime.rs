@@ -16,6 +16,7 @@ mod events;
 mod feed;
 mod render;
 pub(super) mod teardown;
+pub(super) mod traversal;
 
 pub(super) use super::now_ns;
 use super::{
@@ -2231,6 +2232,10 @@ impl Backend {
     /// wait leaves the command, unpublished, to its scheduler.
     pub(super) fn try_compute_early(&self, packet: &Arc<super::job::Packet>) -> bool {
         if self.compute_backlog.load(Ordering::Acquire) != 0 || packet.has_dependencies() {
+            return false;
+        }
+        // A command the ray-traversal rule could hold now is left to its scheduler.
+        if !self.traversal_inline(packet) {
             return false;
         }
         if !packet.begin_publication() {

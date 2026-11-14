@@ -238,7 +238,7 @@ ASAHI_TESTS = {
 # Rust unit-test files built with `rustc --test`, and shell drivers.
 ASAHI_RUST = ['m3-batching-tests.rs', 'm3-runtime-tests.rs', 'pmp-bootargs-tests.rs', 'pmp-power-tests.rs',
               'usage-tests.rs']
-ASAHI_SHELL = ['g17-ray-query-timeout-tests.sh']
+ASAHI_SHELL = ['g17-ray-query-timeout-tests.sh', 'g17-traversal-admission-tests.sh']
 
 # Production G17 decoder vectors also build directly with rustc --test.
 ASAHI_RUST += ['g17-telemetry-tests.rs', 'legacy-frequency-tests.rs']
