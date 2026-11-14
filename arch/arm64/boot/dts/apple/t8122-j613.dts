@@ -10,12 +10,22 @@
 /dts-v1/;
 
 #include "t8122.dtsi"
+#include "t8122-usb4.dtsi"
 #include "t8122-j613-j615.dtsi"
 #include <dt-bindings/thermal/thermal.h>
 
 / {
 	compatible = "apple,j613", "apple,t8122", "apple,arm-platform";
 	model = "Apple MacBook Air (13-inch, M3, 2024)";
+
+	aliases {
+		usb4_0_pcie = &usb4_0_pcie;
+		usb4_0_pcie_port = &usb4_0_pcie_port;
+		usb4_1_pcie = &usb4_1_pcie;
+		usb4_1_pcie_port = &usb4_1_pcie_port;
+		usb4_0_pcie_adapter = &usb4_0_acio;
+		usb4_1_pcie_adapter = &usb4_1_acio;
+	};
 
 	/*
 	 * Fanless: every die sensor throttles both clusters, E weighted 3:1
@@ -432,3 +442,6 @@
 	/* Per-device factory data from this Mac's own iBoot system container. */
 	firmware-name = "apple/mesacal-j613.bin";
 };
+
+/* Older Stage 2 loaders prune the shared ATC0 suppliers of this unused node. */
+/delete-node/ &usb_otg0;

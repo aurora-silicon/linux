@@ -1591,8 +1591,10 @@
 		usb4_0_acio: cio@701ac0000 {
 			compatible = "apple,t8122-usb4-acio", "apple,t8103-usb4-acio";
 			reg = <0x7 0x01ac0000 0x0 0xc000>,
-				<0x7 0x01080000 0x0 0x20000>;
-			reg-names = "rc", "sram";
+				<0x7 0x01080000 0x0 0x20000>,
+				<0x7 0x01e44000 0x0 0x4000>,
+				<0x7 0x01100000 0x0 0x4000>;
+			reg-names = "rc", "sram", "pcie-adapter", "cpu";
 
 			mboxes = <&usb4_0_mbox>;
 			resets = <&cio_reset 0>;
@@ -1758,8 +1760,10 @@
 		usb4_1_acio: cio@b01ac0000 {
 			compatible = "apple,t8122-usb4-acio", "apple,t8103-usb4-acio";
 			reg = <0xb 0x01ac0000 0x0 0xc000>,
-				<0xb 0x01080000 0x0 0x20000>;
-			reg-names = "rc", "sram";
+				<0xb 0x01080000 0x0 0x20000>,
+				<0xb 0x01e44000 0x0 0x4000>,
+				<0xb 0x01100000 0x0 0x4000>;
+			reg-names = "rc", "sram", "pcie-adapter", "cpu";
 
 			mboxes = <&usb4_1_mbox>;
 			resets = <&cio_reset 1>;

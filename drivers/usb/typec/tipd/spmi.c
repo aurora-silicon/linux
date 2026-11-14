@@ -990,6 +990,11 @@ static const struct dev_pm_ops sn201202x_pm_ops = {
 	SET_RUNTIME_PM_OPS(sn201202x_runtime_suspend, sn201202x_runtime_resume, NULL)
 };
 
+static void sn201202x_shutdown(struct spmi_device *sdev)
+{
+	tipd_shutdown(dev_get_drvdata(&sdev->dev));
+}
+
 static struct spmi_driver sn201202x_driver = {
 	.driver = {
 		.name = "sn201202x",
@@ -1003,6 +1008,7 @@ static struct spmi_driver sn201202x_driver = {
 	},
 	.probe = sn201202x_probe,
 	.remove = sn201202x_remove,
+	.shutdown = sn201202x_shutdown,
 };
 module_spmi_driver(sn201202x_driver);
 

@@ -1095,6 +1095,31 @@ err_remove:
 	return ret;
 }
 
+/* A reset witness, not a request to override another consumer's vote. */
+int apple_pmgr_ps_verify_off(struct device *consumer)
+{
+	struct generic_pm_domain *genpd;
+	struct apple_pmgr_ps *ps;
+	u32 val;
+	int ret;
+
+	if (!consumer->pm_domain)
+		return -ENODEV;
+	genpd = pd_to_genpd(consumer->pm_domain);
+	if (genpd->power_off != apple_pmgr_ps_power_off)
+		return -EOPNOTSUPP;
+	ps = genpd_to_apple_pmgr_ps(genpd);
+	ret = regmap_read(ps->regmap, ps->offset, &val);
+	if (ret)
+		return ret;
+	if (val & (APPLE_PMGR_PS_LEVELS | APPLE_PMGR_BUSY | APPLE_PMGR_AUTO_ENABLE)) {
+		dev_err(consumer, "reset boundary not reached: PMGR %#x\n", val);
+		return -EBUSY;
+	}
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_pmgr_ps_verify_off);
+
 static struct platform_driver apple_pmgr_ps_driver;
 
 /* Wait for the masked state word to read @want; @cur gets the last value. */

@@ -105,9 +105,11 @@
 #include <linux/soc/apple/dart-cio.h>
 #include <linux/soc/apple/pmgr-pwrstate.h>
 #include <linux/soc/apple/rtkit.h>
+#include <linux/soc/apple/pmgr-pwrstate.h>
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/tunable.h>
 #include <linux/spinlock.h>
+#include <linux/spmi.h>
 #include <linux/types.h>
 #include <linux/usb/pd.h>
 #include <linux/usb/typec_mux.h>
@@ -135,6 +137,7 @@
 #define APPLE_MXWRAP_CPU_CTRL 0x28
 #define APPLE_MXWRAP_CPU_CTRL_RUN BIT(4)
 #define APPLE_MXWRAP_CPU_STATUS 0x44
+#define APPLE_CIO_T8122_LINK_CHECK_MS 8000
 
 /* DP IN adapter blocks a host router may have (T6050 has four) */
 #define APPLE_DPIN_MAX 4
@@ -142,6 +145,7 @@
 struct apple_cio_hw {
 	/* DP IN adapter blocks of the router; 0 means the two of t8103 */
 	unsigned int dpin_count;
+	bool strict_power_cycle;
 	bool mxwrap;
 	bool lstx_explicit;
 	/* Leave MxWrap RUN alone: the CIO reconfig restarts the CPU. */
@@ -184,6 +188,15 @@ static const struct apple_cio_hw apple_cio_t6030_hw = {
 	.lstx_explicit = true,
 	.strict_fw_ready = true,
 	.dp = &apple_dpin_m3,
+};
+
+/* T8122 shares the T6030 MxWrap/PHY generation; DP is unqualified. */
+static const struct apple_cio_hw apple_cio_t8122_hw = {
+	.strict_power_cycle = true,
+	.mxwrap = true,
+	.lstx_explicit = true,
+	.strict_fw_ready = true,
+	.dp = &apple_dpin_disabled,
 };
 
 /*
@@ -390,6 +403,8 @@ struct apple_cio {
 	struct reset_control *reset;
 
 	struct dev_pm_domain_list *pd_list;
+	unsigned int pd_held;
+	bool reset_failed;
 
 	struct mutex lock; /* serializes cable transitions and ACIO power up/down */
 	bool removing; /* protected by lock */
@@ -2403,6 +2418,48 @@ static const struct tb_nhi_ring_layout apple_nhi_ring_layout = {
 	.options_stride = APPLE_CIO_NHI_RING_STRIDE,
 };
 
+/*
+ * PD owns session shutdown. Put it after the dynamic NHI, and the NHI after
+ * the role/PHY suppliers, so device_shutdown visits the coordinator first.
+ * Stateless links are purged by device_del of this per-attach NHI.
+ */
+static int apple_nhi_shutdown_order(struct apple_cio *acio, struct device *nhi)
+{
+	struct device_node *np;
+	struct spmi_device *pd;
+	int ret = 0;
+
+	if (!acio->hw->strict_power_cycle)
+		return 0;
+	if (!IS_REACHABLE(CONFIG_SPMI))
+		return -EOPNOTSUPP;
+	np = of_get_parent(acio->connector_np);
+	pd = spmi_find_device_by_of_node(np);
+	of_node_put(np);
+	if (!pd)
+		return -EPROBE_DEFER;
+	for (unsigned int port = 0; port < 2; port++) {
+		struct platform_device *supplier;
+
+		np = of_graph_get_remote_node(acio->connector_np, port, -1);
+		supplier = of_find_device_by_node(np);
+		of_node_put(np);
+		if (!supplier) {
+			ret = -EPROBE_DEFER;
+			break;
+		}
+		if (!device_link_add(nhi, &supplier->dev, DL_FLAG_STATELESS))
+			ret = -EINVAL;
+		put_device(&supplier->dev);
+		if (ret)
+			break;
+	}
+	if (!ret && !device_link_add(&pd->dev, nhi, DL_FLAG_STATELESS))
+		ret = -EINVAL;
+	put_device(&pd->dev);
+	return ret;
+}
+
 static int apple_nhi_probe(struct platform_device *pdev)
 {
 	struct apple_cio *acio = dev_get_drvdata(pdev->dev.parent);
@@ -2612,6 +2669,11 @@ static int apple_nhi_probe(struct platform_device *pdev)
 
 	mutex_unlock(&anhi->tb->lock);
 
+	ret = apple_nhi_shutdown_order(acio, &pdev->dev);
+	if (ret) {
+		mutex_lock(&anhi->tb->lock);
+		goto err_unlock_tb_domain;
+	}
 	WRITE_ONCE(acio->nhi_pdev, pdev);
 	acio->nhi_boot_status = 0;
 	complete(&acio->nhi_boot_completion);
@@ -3053,6 +3115,37 @@ static void apple_cio_cpu_halt(struct apple_cio *acio)
 	       acio->cpu_base + APPLE_MXWRAP_CPU_CTRL);
 }
 
+/* Release exactly the references we own, children first, then witness PMGR. */
+static void apple_cio_power_down(struct apple_cio *acio)
+{
+	int i, ret;
+
+	for (i = acio->pd_list->num_pds - 1; i >= 0; i--) {
+		if (acio->pd_list->pd_links[i])
+			device_link_del(acio->pd_list->pd_links[i]);
+		acio->pd_list->pd_links[i] = NULL;
+		dev_pm_syscore_device(acio->pd_list->pd_devs[i], false);
+	}
+	if (!acio->hw->strict_power_cycle)
+		return;
+	while (acio->pd_held) {
+		struct device *pd = acio->pd_list->pd_devs[--acio->pd_held];
+
+		ret = pm_runtime_put_sync_suspend(pd);
+		if (ret < 0)
+			acio->reset_failed = true;
+	}
+	for (i = 0; i < acio->pd_list->num_pds; i++) {
+		ret = apple_pmgr_ps_verify_off(acio->pd_list->pd_devs[i]);
+		if (ret)
+			acio->reset_failed = true;
+	}
+	if (acio->reset_failed)
+		dev_err(acio->dev, "ACIO reset boundary unproven; restart quarantined until reboot\n");
+	else
+		dev_info(acio->dev, "ACIO reset boundary: PMGR domains off\n");
+}
+
 /**
  * apple_cio_stop - Stop and power down the ACIO complex
  * @acio: ACIO complex to stop
@@ -3063,7 +3156,7 @@ static void apple_cio_cpu_halt(struct apple_cio *acio)
  */
 static void apple_cio_stop(struct apple_cio *acio)
 {
-	int ret, i;
+	int ret;
 
 	lockdep_assert_held(&acio->lock);
 	if (!acio->current_cable_info)
@@ -3086,12 +3179,7 @@ static void apple_cio_stop(struct apple_cio *acio)
 				     APPLE_CIO_LSTX_CTRL_LEVEL));
 
 	/* Finally, remove the links to the PD domains to power everything off */
-	for (i = 0; i < acio->pd_list->num_pds; i++) {
-		if (acio->pd_list->pd_links[i])
-			device_link_del(acio->pd_list->pd_links[i]);
-		acio->pd_list->pd_links[i] = NULL;
-		dev_pm_syscore_device(acio->pd_list->pd_devs[i], false);
-	}
+	apple_cio_power_down(acio);
 
 	acio->current_cable_info = 0;
 	acio->resume_link_failed = false;
@@ -3173,10 +3261,20 @@ static int apple_cio_start(struct apple_cio *acio)
 		dev_info(acio->dev, "PCIe-C reset before ACIO start\n");
 	}
 
+	if (acio->reset_failed)
+		return -EHOSTDOWN;
+
 	/* Create device links to the power domains in order to power them on */
 	for (i = 0; i < acio->pd_list->num_pds; i++) {
+		if (acio->hw->strict_power_cycle) {
+			ret = pm_runtime_resume_and_get(acio->pd_list->pd_devs[i]);
+			if (ret < 0)
+				goto remove_links;
+			acio->pd_held++;
+		}
 		link = device_link_add(acio->dev, acio->pd_list->pd_devs[i],
-				       DL_FLAG_STATELESS | DL_FLAG_PM_RUNTIME | DL_FLAG_RPM_ACTIVE);
+			acio->hw->strict_power_cycle ? DL_FLAG_STATELESS :
+			DL_FLAG_STATELESS | DL_FLAG_PM_RUNTIME | DL_FLAG_RPM_ACTIVE);
 		if (!link) {
 			ret = -ENODEV;
 			goto remove_links;
@@ -3337,6 +3435,11 @@ static int apple_cio_start(struct apple_cio *acio)
 
 	acio->current_cable_info = acio->target_cable_info;
 	acio->start_gen++;
+	if (acio->hw->strict_power_cycle) {
+		acio->link_lost_gen = acio->start_gen;
+		mod_delayed_work(system_freezable_wq, &acio->link_lost_work,
+				 msecs_to_jiffies(APPLE_CIO_T8122_LINK_CHECK_MS));
+	}
 	return 0;
 
 err_depopulate:
@@ -3352,12 +3455,7 @@ remove_links:
 	acio->rtk = NULL;
 	apple_cio_cpu_halt(acio);
 	/* Cut power to reset the entire block  */
-	for (i = 0; i < acio->pd_list->num_pds; i++) {
-		if (acio->pd_list->pd_links[i])
-			device_link_del(acio->pd_list->pd_links[i]);
-		acio->pd_list->pd_links[i] = NULL;
-		dev_pm_syscore_device(acio->pd_list->pd_devs[i], false);
-	}
+	apple_cio_power_down(acio);
 	return ret;
 }
 
@@ -3455,6 +3553,15 @@ static bool apple_cio_has_peer(struct apple_cio *acio, u64 *activity)
 		tb_switch_for_each_port(anhi->tb->root_switch, port) {
 			if (!tb_port_is_null(port))
 				continue;
+			if (acio->hw->strict_power_cycle) {
+				u32 lane;
+				int err = tb_port_read(port, &lane, TB_CFG_PORT,
+						       port->cap_phy + LANE_ADP_CS_1, 1);
+
+				dev_info(acio->dev, "attach health generation %u lane %u: %d state %#x activity %llu\n",
+					 acio->start_gen, port->port, err, err ? 0 : lane,
+					 *activity);
+			}
 			if ((port->xdomain && !port->xdomain->is_unplugged) ||
 			    (port->remote && !port->remote->sw->is_unplugged))
 				peer = true;
@@ -3603,11 +3710,45 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 {
 	struct apple_cio *acio = typec_thunderbolt_switch_get_drvdata(sw);
 
+	if (data->state == TYPEC_THUNDERBOLT_SWITCH_SLEEP) {
+		cancel_delayed_work_sync(&acio->link_lost_work);
+		cancel_delayed_work_sync(&acio->resume_link_work);
+	}
+
 	guard(mutex)(&acio->lock);
 
 	/* Removal turns the cable off itself; only refuse to start new work. */
 	if (acio->removing)
 		return data->state == TYPEC_THUNDERBOLT_SWITCH_OFF ? 0 : -ESHUTDOWN;
+
+	if (data->state == TYPEC_THUNDERBOLT_SWITCH_WAKE) {
+		acio->sleep_phase = APPLE_CIO_SLEEP_OPEN;
+		acio->sleep_restart_owed = false;
+		return 0;
+	}
+
+	if (data->state == TYPEC_THUNDERBOLT_SWITCH_SLEEP) {
+		struct platform_device *pdev = READ_ONCE(acio->nhi_pdev);
+		struct apple_nhi *anhi;
+		int ret;
+
+		if (!acio->hw->strict_power_cycle)
+			return -EOPNOTSUPP;
+		if (acio->current_cable_info) {
+			if (!pdev)
+				return -EBUSY;
+			anhi = platform_get_drvdata(pdev);
+			if (!anhi)
+				return -EBUSY;
+			ret = tb_apple_sleep_quiesce(anhi->tb);
+			if (ret)
+				return ret;
+			acio->sleep_restart_owed = true;
+			apple_cio_stop(acio);
+		}
+		acio->sleep_phase = APPLE_CIO_SLEEP_CLOSED;
+		return acio->reset_failed ? -EHOSTDOWN : 0;
+	}
 
 	dev_dbg(acio->dev, "set cable state: %d\n", data->state);
 
@@ -3786,6 +3927,9 @@ static int apple_cio_pm_notify(struct notifier_block *nb, unsigned long event,
 	struct apple_cio *acio = container_of(nb, struct apple_cio, pm_notifier);
 	bool owed, early;
 
+	if (acio->hw->strict_power_cycle)
+		return NOTIFY_DONE;
+
 	/* Teardown off and no restart owed from an earlier sleep: nothing to do. */
 	if (!READ_ONCE(s2idle_teardown) && !READ_ONCE(acio->sleep_restart_owed))
 		return NOTIFY_DONE;
@@ -3857,6 +4001,10 @@ static int apple_cio_probe(struct platform_device *pdev)
 	acio->dev = &pdev->dev;
 	acio->np = dev->of_node;
 	acio->hw = of_device_get_match_data(dev);
+	/* Only J613 has qualified the T8122 router policy and resources. */
+	if (acio->hw == &apple_cio_t8122_hw &&
+	    !of_machine_is_compatible("apple,j613"))
+		acio->hw = &apple_cio_t8103_hw;
 	if (!acio->hw)
 		return -EINVAL;
 
@@ -4089,6 +4237,24 @@ static int apple_cio_probe(struct platform_device *pdev)
 	return 0;
 }
 
+static void apple_cio_shutdown(struct platform_device *pdev)
+{
+	struct apple_cio *acio = platform_get_drvdata(pdev);
+
+	if (!acio->hw->strict_power_cycle)
+		return;
+
+	scoped_guard(mutex, &acio->lock)
+		acio->removing = true;
+	disable_delayed_work_sync(&acio->sleep_restart_work);
+	disable_delayed_work_sync(&acio->resume_link_work);
+	disable_delayed_work_sync(&acio->link_lost_work);
+	disable_delayed_work_sync(&acio->pcie_tunnel_work);
+	guard(mutex)(&acio->lock);
+	acio->target_cable_info = 0;
+	apple_cio_stop(acio);
+}
+
 static void apple_cio_remove(struct platform_device *pdev)
 {
 	struct apple_cio *acio = platform_get_drvdata(pdev);
@@ -4116,6 +4282,10 @@ static void apple_cio_remove(struct platform_device *pdev)
 
 
 static const struct of_device_id apple_acio_match[] = {
+	{
+		.compatible = "apple,t8122-usb4-acio",
+		.data = &apple_cio_t8122_hw,
+	},
 	{
 		.compatible = "apple,t6040-usb4-acio",
 		.data = &apple_cio_t6040_hw,
@@ -4156,6 +4326,7 @@ static struct platform_driver apple_cio_driver = {
 	},
 	.probe = apple_cio_probe,
 	.remove = apple_cio_remove,
+	.shutdown = apple_cio_shutdown,
 };
 
 static struct platform_driver * const apple_cio_drivers[] = {
