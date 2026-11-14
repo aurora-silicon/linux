@@ -182,6 +182,11 @@ enum ave_opcode {
 #define AVE_FW_TEXT_CRC_T8132_26B123 0x99fc929a
 /* The M3 (T8122) build preloaded by the macOS 27.2 (26B123) stub. */
 #define AVE_FW_TEXT_CRC_T8122_26B123 0x918d70d3
+/*
+ * The M5 build of macOS 27.2 (26B123; 27.2.1 26B131 ships it unchanged),
+ * AppleAVE2FW 9013.55.1: TEXT 0x154000, DATA 0x12c000, as 26A428's.
+ */
+#define AVE_FW_TEXT_CRC_T8142_26B123 0x24eb4625
 
 struct ave_ctx;
 
