@@ -2993,7 +2993,9 @@ impl Queue {
                 None => self.graph.append(producer, announce_va, || {})?,
             };
             fence(Ordering::SeqCst);
-            if entry_signal && !self.graph.m5 {
+            // Only the first kick installs a predecessor record. A later kick that names another
+            // queue's kick depends on it through the kick entry alone.
+            if first && !self.graph.m5 {
                 let predecessor_va =
                     self.graph
                         .record(record_slot, PREDECESSOR, 0x400, predecessor)?;
