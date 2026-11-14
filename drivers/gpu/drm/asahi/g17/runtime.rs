@@ -1053,9 +1053,12 @@ impl Backend {
         {
             let state = self.shared.state.lock();
             let firmware = state.as_ref().ok_or(ENODEV)?;
-            if firmware.queues.compute(self.owner).is_some_and(|queue| queue.pool_fits(required)) {
-                return Ok(());
-            }
+            match firmware.queues.compute(self.owner) {
+                Some(queue) if queue.pool_fits(required) => return Ok(()),
+                // Shared away already: build_compute binds a channel, so allocate nothing here.
+                None => return Err(EAGAIN),
+                Some(_) => {}
+            };
         }
         let lease = self.shared.preparations.enter_until(admission)?;
         let dev = self.shared.drm()?;
@@ -1066,6 +1069,11 @@ impl Backend {
         let mut alias = Some(pages.as_mut().ok_or(EIO)?.map_client(self.context.vm())?);
         let mut deferred = DeferredBatch::publication()?;
         let mut growth = None;
+        // Set when the owner holds no queue any more. Until growth begins, its queue is an idle
+        // channel that another owner's admission may share away (`share_idle`); only
+        // build_compute binds a channel again, so no progress this loop waits for can end that
+        // wait.
+        let mut unbound = false;
         let result = (|| loop {
             // Growth waits for this queue's retirement and for firmware to consume the pool
             // release; both are progress the event worker reports.
@@ -1077,7 +1085,10 @@ impl Backend {
                 if !lease.is_current() { return Err(EAGAIN); }
                 if self.shared.crashed.load(Ordering::Acquire) { return Err(EIO); }
                 firmware.scan_compute(None, &mut deferred)?;
-                let mut queue = firmware.queues.compute_mut(self.owner).ok_or(EAGAIN)?;
+                let Some(mut queue) = firmware.queues.compute_mut(self.owner) else {
+                    unbound = true;
+                    return Err(EAGAIN);
+                };
                 if queue.pool_fits(required) { return Ok(None); }
                 if growth.is_none() {
                     let notify = queue.begin_growth(&firmware.init, required)?;
@@ -1094,6 +1105,8 @@ impl Backend {
             deferred.finish();
             match result {
                 Ok(old) => { drop(old); return Ok(()); }
+                // ensure_compute retries EAGAIN through build_compute, which binds a channel.
+                Err(error) if error == EAGAIN && unbound => return Err(error),
                 Err(error) if error == EAGAIN && lease.is_current() => {
                     self.shared.queue_events();
                     self.wait_release(&self.shared.progress, observed, admission)?;
