@@ -1132,6 +1132,8 @@
 		compatible = "apple,t8132-pmp-v2-report";
 		reg = <0x3 0x803c0000 0x0 0x20000>;
 		power-domains = <&ps_pms_sram>;
+		#address-cells = <1>;
+		#size-cells = <0>;
 		status = "disabled";
 	};
 
