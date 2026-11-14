@@ -6055,6 +6055,7 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 
 	if (!dcp)
 		return;
+	dcp_indicator_release(dcp);
 	dcp_peer_forget(dcp);
 	/*
 	 * Stop the native initializer before looking up its owner, including
@@ -6667,6 +6668,13 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	    !of_property_read_u32(dev->of_node, "apple,iomfb-surfaces", &surf_en) &&
 	    surf_en == 0)
 		set_bit(0, dcp->iomfb_surfaces);
+
+	{
+		int ret_ind = dcp_indicator_probe(dcp);
+
+		if (ret_ind)
+			return ret_ind;
+	}
 
 	if (dcp->phy) {
 		int ret;
