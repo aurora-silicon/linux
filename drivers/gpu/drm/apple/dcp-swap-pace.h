@@ -60,6 +60,6 @@ static inline unsigned int dcp_keepalive_delay_ms(unsigned int param)
 
 /* Boot values of the two parameters. A change here flips the default; the parameters stay as the runtime rollback. */
 #define DCP_SWAP_TS_MODE_DEFAULT DCP_SWAP_TS_CURRENT
-#define DCP_KEEPALIVE_MS_DEFAULT 0
+#define DCP_KEEPALIVE_MS_DEFAULT 25
 
 #endif
