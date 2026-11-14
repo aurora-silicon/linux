@@ -1,0 +1,168 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * DisplayPort audio of the T8142 MacBook Airs' external displays, as macOS
+ * 27.2 has it on a J815: each external display engine feeds its DisplayPort
+ * audio from its own ADMAC, one TX channel (macOS AudioDMAController
+ * "DAX0TX"), behind its isochronous DART (mapper-dispextN-dpa, stream 30),
+ * all in DISPEXTn_ADMA (parent DISPEXTn_SYS, which the running display
+ * processor keeps up). dp-audio1 belongs to dcpext0 (front port),
+ * dp-audio2 to dcpext1 (rear port); dp-audio0 is disp0's, whose panel has
+ * no audio sink, and stays off. This is the T6050 (J714s) design with
+ * T8142's addresses: /arm-io offsets plus 0x2_1000_0000, interrupts and
+ * PMGR states from the J815AP ADT; the J813AP 27.0 ADT has the same nodes.
+ *
+ * The boot loader copies each ADMAC control block's ADT tunables
+ * (admac-dispextN-ced-ssw ced-tunables, ssw-tunables) into the node it finds
+ * by the admac-dispextN-control alias. The DCP side starts unless
+ * appledrm.hdmi_audio=0, and only for a processor the boot loader handed
+ * over.
+ */
+
+/ {
+	aliases {
+		admac-dispext0-control = &admac_dispext0_ced_ssw;
+		admac-dispext1-control = &admac_dispext1_ced_ssw;
+	};
+
+	dpaudio1: audio-controller-1 {
+		compatible = "apple,t8142-dpaudio", "apple,dpaudio";
+		dmas = <&admac_dispext0 0>;
+		dma-names = "tx";
+		power-domains = <&ps_dispext0_adma>;
+		status = "okay";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dpaudio1_dcpext0: endpoint {
+					remote-endpoint = <&dcpext0_audio>;
+				};
+			};
+		};
+	};
+
+	dpaudio2: audio-controller-2 {
+		compatible = "apple,t8142-dpaudio", "apple,dpaudio";
+		dmas = <&admac_dispext1 0>;
+		dma-names = "tx";
+		power-domains = <&ps_dispext1_adma>;
+		status = "okay";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dpaudio2_dcpext1: endpoint {
+					remote-endpoint = <&dcpext1_audio>;
+				};
+			};
+		};
+	};
+};
+
+&pmgr {
+	/* ADT pmgr DISPEXT0_ADMA (id 112), parent DISPEXT0_SYS */
+	ps_dispext0_adma: power-controller@420 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x420 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dispext0_adma";
+	};
+
+	/* ADT pmgr DISPEXT1_ADMA (id 98), parent DISPEXT1_SYS */
+	ps_dispext1_adma: power-controller@3b0 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3b0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dispext1_adma";
+	};
+};
+
+&{/soc} {
+	/*
+	 * Its window is the isochronous DART's ADT vm-base and vm-size (1 TiB,
+	 * 64 GiB), as on T6050.
+	 */
+	admac_dispext0: dma-controller@506140000 {
+		compatible = "apple,t8142-display-admac", "apple,t6050-display-admac";
+		reg = <0x5 0x06140000 0x0 0x24000>;
+		dma-channels = <1>;
+		interrupts-extended = <&aic AIC_IRQ 894 IRQ_TYPE_LEVEL_HIGH>, <0>, <0>, <0>;
+		iommus = <&dispext0_isoc_dart 30>;
+		#dma-cells = <1>;
+		power-domains = <&ps_dispext0_adma>;
+		apple,dma-range = /bits/ 64 <0x10000000000 0x1000000000>;
+		apple,admac-control = <&admac_dispext0_ced_ssw>;
+	};
+
+	admac_dispext0_ced_ssw: dma-control@5062f4000 {
+		compatible = "apple,t8142-admac-control", "apple,admac-control";
+		reg = <0x5 0x062f4000 0x0 0x4000>,
+		      <0x5 0x061a0000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 896 IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	admac_dispext1: dma-controller@3aa140000 {
+		compatible = "apple,t8142-display-admac", "apple,t6050-display-admac";
+		reg = <0x3 0xaa140000 0x0 0x24000>;
+		dma-channels = <1>;
+		interrupts-extended = <&aic AIC_IRQ 969 IRQ_TYPE_LEVEL_HIGH>, <0>, <0>, <0>;
+		iommus = <&dispext1_isoc_dart 30>;
+		#dma-cells = <1>;
+		power-domains = <&ps_dispext1_adma>;
+		apple,dma-range = /bits/ 64 <0x10000000000 0x1000000000>;
+		apple,admac-control = <&admac_dispext1_ced_ssw>;
+	};
+
+	admac_dispext1_ced_ssw: dma-control@3aa2f4000 {
+		compatible = "apple,t8142-admac-control", "apple,admac-control";
+		reg = <0x3 0xaa2f4000 0x0 0x4000>,
+		      <0x3 0xaa1a0000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 971 IRQ_TYPE_LEVEL_HIGH>;
+	};
+};
+
+&dispext0_isoc_dart {
+	power-domains = <&ps_dispext0_adma>;
+	status = "okay";
+};
+
+&dispext1_isoc_dart {
+	power-domains = <&ps_dispext1_adma>;
+	status = "okay";
+};
+
+&dcpext0 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dcpext0_audio: endpoint {
+				remote-endpoint = <&dpaudio1_dcpext0>;
+			};
+		};
+	};
+};
+
+&dcpext1 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dcpext1_audio: endpoint {
+				remote-endpoint = <&dpaudio2_dcpext1>;
+			};
+		};
+	};
+};
