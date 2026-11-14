@@ -158,6 +158,12 @@ static const struct dcp_method_entry dcp_methods_27_0[dcpep_num_methods] = {
 	IOMFB_METHOD("A479", iomfbep_abort_swaps_dcp),
 	IOMFB_METHOD("A484", dcpep_set_power_state),
 	IOMFB_METHOD("A483", dcpep_register_dfb_surface),
+	/*
+	 * The AP link's release, unnamed: H17P's and 26.6's A500, (0x4, 0). The 27.0 firmware
+	 * still dispatches it as A500 (t8142dcp 1317.1.1: cmp 'A500', then 'A500' | 1), unlike
+	 * the IOMFB calls around it; 27.2 moved both to A550/A551.
+	 */
+	IOMFB_METHOD("A500", dcpep_unnamed_500),
 };
 
 /*
@@ -264,10 +270,10 @@ const struct dcp_method_entry *iomfb_v27_methods(const char *compat)
 
 /*
  * The 27.0 table for the J714s, the board the firmware 27 sleep has run on (dcp->v27_j714s): a
- * copy with the sleep's A500 added. The shared table keeps the methods it had, so every other
- * machine sends what it sent, and a 27.2 or 27.3 build is judged against the same list as
- * before (iomfb_v27_missing_method()). NULL if @methods is not the 27.0 table or the copy
- * cannot be made.
+ * copy with the sleep's A500 set. The shared table names A500 too, for T8142's DPMS stop; only
+ * a firmware stop sends it, and iomfb_v27_missing_method() skips it, so a 27.2 or 27.3 build
+ * is judged against the same list as before. NULL if @methods is not the 27.0 table or the
+ * copy cannot be made.
  */
 const struct dcp_method_entry *iomfb_v27_methods_j714s(struct device *dev,
 						       const struct dcp_method_entry *methods)
@@ -302,8 +308,9 @@ const char *iomfb_v27_missing_method(const struct dcp_method_entry *methods,
 
 	*count = 0;
 	for (i = 0; i < dcpep_num_methods; i++) {
+		/* Only a firmware sleep sends unnamed_500, and it checks the build's table. */
 		if (!dcp_methods_27_0[i].tag[0] || methods[i].tag[0] ||
-		    i == dcpep_dfb_ready_query)
+		    i == dcpep_dfb_ready_query || i == dcpep_unnamed_500)
 			continue;
 		if (!first)
 			first = dcp_methods_27_0[i].name;
@@ -323,6 +330,8 @@ const char *iomfb_v27_missing_method(const struct dcp_method_entry *methods,
 #define iomfb_shutdown_h17p iomfb_shutdown_v27
 #define iomfb_present_backlight_h17p iomfb_present_backlight_v27
 #define iomfb_present_matrix_h17p iomfb_present_matrix_v27
+#define iomfb_s2r_500_h17p iomfb_s2r_500_v27
+#define iomfb_s2r_power_h17p iomfb_s2r_power_v27
 #define DCP_FW h17p
 #define DCP_FW_VER DCP_FW_VERSION(27, 0, 0)
 
@@ -355,6 +364,21 @@ static bool trampoline_get_frequency_v27(struct apple_dcp *dcp, int tag,
 			index);
 	*(__le64 *)out = cpu_to_le64(rate);
 	return true;
+}
+
+/*
+ * D572, as on H17P: the firmware powers the display DART's streams with it, 0 when it's done
+ * with the display. Only a sleep's stop acts on it (dcp_s2r_dart_power()).
+ */
+static bool trampoline_dart_power_v27(struct apple_dcp *dcp, int tag,
+				      void *out, void *in)
+{
+	const struct dcp_packet_header *header = in - sizeof(*header);
+
+	if (header->in_len >= sizeof(u32))
+		dcp_s2r_dart_power(dcp, get_unaligned_le32(in));
+
+	return trampoline_zero(dcp, tag, out, in);
 }
 
 static bool trampoline_hotplug_h17p(struct apple_dcp *dcp, int tag,
@@ -669,7 +693,7 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[565] = trampoline_true,
 	[567] = trampoline_true,
 	[569] = trampoline_set_boolean_property_v27,
-	[572] = trampoline_zero,
+	[572] = trampoline_dart_power_v27, /* powerUpDART */
 	[574] = iomfbep_cb_video_range_h17p,
 	[575] = trampoline_hotplug_h17p,
 	[576] = trampoline_nop,
