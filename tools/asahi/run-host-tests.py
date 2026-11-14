@@ -24,6 +24,7 @@ import concurrent.futures
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -299,17 +300,33 @@ def jobs(work, conf, dtc):
     return result
 
 
+def kill_group(p):
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
 def run(job, timeout):
     label, cmd, cwd, expect, d, extra = job
     (d / 'tmp').mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, TMPDIR=str(d / 'tmp'), **extra)
     start = time.monotonic()
+    # Each test runs in its own session: a timeout (or an interrupted run) stops the test and everything it started, such
+    # as a compiler or a `git show` of an old revision, which would otherwise outlive it, re-parented to init.
+    p = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True, errors='replace', start_new_session=True)
     try:
-        p = subprocess.run(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           text=True, errors='replace', timeout=timeout)
-        rc, text = p.returncode, p.stdout
-    except subprocess.TimeoutExpired as e:
-        rc, text = 'timeout', (e.stdout or b'').decode(errors='replace') if isinstance(e.stdout, bytes) else (e.stdout or '')
+        text, _ = p.communicate(timeout=timeout)
+        rc = p.returncode
+    except subprocess.TimeoutExpired:
+        kill_group(p)
+        text, _ = p.communicate()
+        rc = 'timeout'
+    except BaseException:
+        kill_group(p)
+        p.wait()
+        raise
     took = time.monotonic() - start
     (d / 'log').write_text(f'$ {shlex.join(cmd)}\n{text}\nexit: {rc}\n')
     if expect == PASS:
