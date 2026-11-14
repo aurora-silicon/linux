@@ -24,6 +24,13 @@ extern void secondary_holding_pen(void);
 volatile unsigned long __section(".mmuoff.data.read")
 secondary_holding_pen_release = INVALID_HWID;
 
+/*
+ * Once set, after a sleep's commit, a core that the SoC restarts at its reset vector and that
+ * comes back to the holding pen takes the deep-sleep WFI there instead of spinning (head.S),
+ * as macOS's parked cores do. Read with the MMU off.
+ */
+volatile unsigned long __section(".mmuoff.data.read") secondary_pen_deep;
+
 static phys_addr_t cpu_release_addr[NR_CPUS];
 
 /*
@@ -265,10 +272,27 @@ int spin_table_stop_parked(void)
 	return -ETIMEDOUT;
 }
 
+static bool spin_table_pen_deep_armed;
+
+void spin_table_pen_deep_arm(bool on)
+{
+	spin_table_pen_deep_armed = on;
+}
+
+static void spin_table_pen_deep_set(unsigned long on)
+{
+	void *start = (void *)&secondary_pen_deep;
+
+	secondary_pen_deep = on;
+	dcache_clean_inval_poc((unsigned long)start, (unsigned long)start + sizeof(secondary_pen_deep));
+}
+
 /* After the commit: the stopped CPUs take their last WFI. */
 void spin_table_release_stopped(void)
 {
 	WRITE_ONCE(spin_table_stop_released, true);
+	if (spin_table_pen_deep_armed)
+		spin_table_pen_deep_set(1);
 	dsb(ish);
 	sev();
 }
@@ -279,6 +303,9 @@ void spin_table_release_stopped(void)
  */
 void spin_table_stop_finished(void)
 {
+	/* Before any CPU is started again: the pen must let them boot. */
+	if (secondary_pen_deep)
+		spin_table_pen_deep_set(0);
 	WRITE_ONCE(spin_table_hold_requested, false);
 	WRITE_ONCE(spin_table_stop_requested, false);
 	WRITE_ONCE(spin_table_stop_released, false);
