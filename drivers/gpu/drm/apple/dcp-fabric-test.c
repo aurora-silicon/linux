@@ -69,7 +69,7 @@ static int fabric_tunnel(struct fabric_fixture *f, unsigned int p,
 	struct dcp_fabric_route *route;
 	int error;
 
-	error = dcp_fabric_tunnel_slot(&f->port[p], dpin);
+	error = dcp_fabric_tunnel_slot(&f->port[p], dpin, false);
 	if (error)
 		return error > 0 ? 0 : error;
 	route = dcp_fabric_tunnel_candidate(&f->port[p], &f->policy, NULL,
@@ -370,14 +370,14 @@ static void fabric_scenario_test(struct kunit *test)
 	case 17:
 		KUNIT_ASSERT_EQ(test, fabric_tunnel(&f, 0, 0), 0);
 		f.route[0][1].dpin = 1;
-		KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_slot(&f.port[0], 0),
+		KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_slot(&f.port[0], 0, false),
 				-EADDRINUSE);
 		fabric_init(&f, false);
 		KUNIT_ASSERT_EQ(test, fabric_direct(&f, 0), 0);
-		KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_slot(&f.port[0], 1),
+		KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_slot(&f.port[0], 1, false),
 				-EBUSY);
 		/* Preserve the original occupied-primary errno in this extraction. */
-		KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_slot(&f.port[0], 0),
+		KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_slot(&f.port[0], 0, false),
 				-EADDRINUSE);
 		break;
 	case 18:
@@ -2063,6 +2063,51 @@ static void fabric_t6030_plan_test(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, f.plan[0].target[1], NULL);
 }
 
+/* T6050: each pipeline takes one DP IN, so DP IN 2 and 3 own slots of their own. */
+static void fabric_per_dpin_slot_test(struct kunit *test)
+{
+	struct dcp_fabric_pipeline pipeline[3] = {};
+	struct dcp_fabric_route route[3] = {};
+	struct dcp_fabric_port port = {};
+	unsigned int i;
+
+	KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_owner(0, false), 0);
+	KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_owner(2, false), 0);
+	KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_owner(3, false), 1);
+	KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_owner(1, true), 1);
+	KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_owner(2, true), 2);
+	KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_owner(3, true), 3);
+
+	for (i = 0; i < 3; i++) {
+		route[i].pipeline = &pipeline[i];
+		route[i].tunnel = true;
+		route[i].dpin = i;
+	}
+
+	/* A dock's three displays: DP IN 0, 1 and 2 each get a slot. */
+	for (i = 0; i < 3; i++) {
+		KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_slot(&port, i, true), 0);
+		port.owner[dcp_fabric_tunnel_owner(i, true)] = &route[i];
+	}
+	KUNIT_EXPECT_PTR_EQ(test, port.owner[2], &route[2]);
+	/* the handed stream repeats; DP IN 3 is still free */
+	KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_slot(&port, 2, true), 1);
+	KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_slot(&port, 3, true), 0);
+	KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_slot(&port, DCP_FABRIC_DPIN_MAX, true),
+			-EINVAL);
+
+	/* Elsewhere DP IN 2 shares DP IN 0's occupied slot. */
+	port.owner[2] = NULL;
+	KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_slot(&port, 2, false), -EADDRINUSE);
+
+	/* A direct DP-alt display holds the port against every DP IN. */
+	memset(&port, 0, sizeof(port));
+	route[0].tunnel = false;
+	port.owner[0] = &route[0];
+	KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_slot(&port, 2, true), -EBUSY);
+	KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_slot(&port, 3, true), -EBUSY);
+}
+
 static void fabric_t6030_follow_test(struct kunit *test)
 {
 	struct fabric_fixture f;
@@ -2387,6 +2432,7 @@ static struct kunit_case fabric_tests[] = {
 	KUNIT_CASE(fabric_t6030_clock_header_parity_test),
 	KUNIT_CASE(fabric_t6030_plan_test),
 	KUNIT_CASE(fabric_t6030_follow_test),
+	KUNIT_CASE(fabric_per_dpin_slot_test),
 	KUNIT_CASE(fabric_reclaim_transaction_test),
 	KUNIT_CASE_PARAM(fabric_shared_wiring_test, fabric_wiring_gen_params),
 	KUNIT_CASE(fabric_binding_cookie_test),

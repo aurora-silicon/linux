@@ -288,11 +288,18 @@ void dcp_fabric_plan(struct dcp_fabric_pipeline *pipelines,
 }
 EXPORT_SYMBOL_GPL(dcp_fabric_plan);
 
-/* 1 means an already handed, matching stream; zero admits allocation. */
+/*
+ * 1 means an already handed, matching stream; zero admits allocation.
+ * @per_dpin: DP IN 2 and 3 have owner slots of their own.
+ */
 int dcp_fabric_tunnel_slot(const struct dcp_fabric_port *port,
-			   unsigned int dpin)
+			   unsigned int dpin, bool per_dpin)
 {
-	const struct dcp_fabric_route *slot = port->owner[dcp_fabric_dpin_slot(dpin)];
+	const struct dcp_fabric_route *slot;
+
+	if (dpin >= DCP_FABRIC_DPIN_MAX)
+		return -EINVAL;
+	slot = port->owner[dcp_fabric_tunnel_owner(dpin, per_dpin)];
 
 	if (slot)
 		return slot->tunnel && slot->dpin == dpin ? 1 : -EADDRINUSE;
