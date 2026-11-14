@@ -96,10 +96,16 @@ static ssize_t agx_qualified_stats_show(struct asahi_stats_attribute *stats, cha
 	 */
 	n += sysfs_emit_at(buf, n, "pstate_status %s\n",
 			   asahi_stats_quality(snap.pstate_status));
+	/*
+	 * A pstate that is not valid reads its status word, so stale or
+	 * unavailable is not mistaken for a missing feature. Where it is
+	 * unsupported, the output is unchanged.
+	 */
 	if (snap.pstate_status == 1)
 		n += sysfs_emit_at(buf, n, "pstate %u\n", snap.pstate);
 	else
-		n += sysfs_emit_at(buf, n, "pstate unsupported\n");
+		n += sysfs_emit_at(buf, n, "pstate %s\n",
+				   asahi_stats_quality(snap.pstate_status));
 	/* No host frequency request, measured power or temperature. */
 	n += sysfs_emit_at(buf, n, "requested_frequency_hz unsupported\n");
 	/*
@@ -109,11 +115,18 @@ static ssize_t agx_qualified_stats_show(struct asahi_stats_attribute *stats, cha
 	if (snap.pstate_status == 1 && (snap.achieved_frequency_hz || !snap.pstate))
 		n += sysfs_emit_at(buf, n, "achieved_frequency_hz %llu\n",
 				   (unsigned long long)snap.achieved_frequency_hz);
-	else
+	else if (snap.pstate_status == 1)
+		/* A valid state with no frequency in the board's table. */
 		n += sysfs_emit_at(buf, n, "achieved_frequency_hz unsupported\n");
+	else
+		n += sysfs_emit_at(buf, n, "achieved_frequency_hz %s\n",
+				   asahi_stats_quality(snap.pstate_status));
 	if (snap.busy_status == 1)
 		n += sysfs_emit_at(buf, n, "busy_ns %llu\n",
 				   (unsigned long long)snap.busy_ns);
+	else if (snap.busy_status == 2)
+		/* M5: the total stopped (a statistics ring was quarantined). */
+		n += sysfs_emit_at(buf, n, "busy_ns stale\n");
 	else
 		n += sysfs_emit_at(buf, n, "busy_ns unsupported\n");
 	n += sysfs_emit_at(buf, n, "power_mw unsupported\n"

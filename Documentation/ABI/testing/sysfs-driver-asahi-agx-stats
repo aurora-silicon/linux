@@ -93,8 +93,13 @@ Description:
 		           its state in other records (see below).
 		           utilisation_status is never unsupported on these
 		           firmwares. Numeric metrics are printed only while
-		           their capability is valid; otherwise their value is
-		           the string unsupported.
+		           their capability is valid. Otherwise utilisation
+		           values read unsupported; pstate and
+		           achieved_frequency_hz read pstate_status (stale,
+		           unavailable or unsupported), and achieved_frequency_hz
+		           reads unsupported for a valid state with no
+		           frequency in the board's table; busy_ns reads stale
+		           when its total stopped and unsupported otherwise.
 
 		util_tiler_percent, util_renderer_percent, util_device_percent
 		           Unsigned integer percent (0..100), from tag 0x13
@@ -154,18 +159,26 @@ Description:
 		busy_ns    Cumulative u64 since the driver was bound. The tag
 		           0x13 records of this firmware carry a timestamp in
 		           24 MHz ticks (words 1 and 2), one every 8 ms on M5
-		           and every 16 ms on the A18 Pro. Each record credits
-		           the window since the previous record of its epoch at
-		           its device utilisation. A record more than two
-		           periods after the previous one, or with an earlier
-		           timestamp, only starts a new window, so time the GPU
-		           spent gated is never credited, and a load sparser
-		           than one period reads low. MEASURED on T6050
-		           (J716c): 871 and 863 ms for three 300 ms compute jobs
-		           at full clock (905 and 919 ms of work). MEASURED on
-		           T8140 (J700), 24 traces of GPU stress loads: within
-		           about 20% of the union of the commands' own execution
-		           intervals for loads busy more than half the time.
+		           and every 16 ms on the A18 Pro, and are credited in
+		           that order at their device utilisation, from both
+		           roles and across power epochs. The driver keeps the
+		           timestamp up to which it has credited busy time; a
+		           record at or before it gets nothing, so no interval
+		           is credited twice. A later record credits the window
+		           since that mark when it is at most two periods, and
+		           only its own period after a longer gap, so time the
+		           GPU spent gated is never credited. Records a power
+		           boundary keeps out of the utilisation average (see
+		           below) still count here; suspend, a real epoch
+		           invalidation's discard and quarantine keep them out.
+		           busy_ns reads stale once a statistics ring is
+		           quarantined. MEASURED on T6050 (J716c): 871 and 863
+		           ms for three 300 ms compute jobs at full clock (905
+		           and 919 ms of work). MEASURED on T8140 (J700), 24
+		           traces of GPU stress loads, with windows that ended
+		           at each power epoch: within about 20% of the union
+		           of the commands' own execution intervals for loads
+		           busy more than half the time.
 
 		requested_frequency_hz, power_mw, temperature_raw
 		           Unsupported.
@@ -187,15 +200,17 @@ Description:
 		Suspend/resume, restart, statistics-ring quarantine, observed
 		core gating and teardown end validity. After an epoch boundary,
 		each ring's already queued records are discarded before new
-		baselines are accepted. A quarantined statistics ring disables
-		both roles' exports until reprobe; a trace-ring error does not.
+		baselines are accepted; where busy_ns is integrated, those a
+		power boundary kept out still reach it, as described there. A
+		quarantined statistics ring disables both roles' exports until
+		reprobe; a trace-ring error does not.
 
 		Reads take the device mutex and do not wake the GPU. The
 		firmware_reports debugfs view retains per-role raw packets,
 		counts and host monotonic receive times, plus capability status,
-		policy, timestamp and diagnostic tick deltas. Tick deltas are
-		never accumulated as GPU busy time. Firmware role streams are
-		merged in drain order without deduplication.
+		policy, timestamp and diagnostic tick deltas. The tag 0x10 tick
+		deltas are never accumulated as GPU busy time. Firmware role
+		streams are merged in drain order without deduplication.
 		The diagnostic also identifies the platform device, records the
 		transport-admitted count and last-admission decision per role/tag,
 		and shows suspension, queued-record discard and quarantine state.

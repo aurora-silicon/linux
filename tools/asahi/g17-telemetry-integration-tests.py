@@ -502,6 +502,47 @@ RUST_TESTS = r'''
         }
     }
     #[test]
+    fn m5_busy_time_takes_records_a_power_boundary_kept_out() {
+        use {channel::Rings,fw::variant::InitGraph,Role::*};
+        let dev=crate::device::Device;
+        let init=initdata::InitData::new();
+        let mut rings=Rings::new(InitGraph::G17P,true).unwrap();
+        // 8 ms windows at 100%, timestamps in words 1 and 2.
+        let util=|ticks:u32|[0x13,ticks,0x59,0,0,100,100,0,0,0,0,0,0,0,0,0,0,0];
+        init.push(Primary,util(0));
+        rings.drain_statistics(&dev,&init,Primary);
+        assert_eq!(rings.read_statistics(1).busy_ns,0);
+        // Queued at a gate: cut off from the average, still busy time.
+        init.push(Primary,util(192_000));
+        rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],false,1);
+        rings.drain_statistics(&dev,&init,Primary);
+        assert_eq!(rings.read_statistics(1).busy_ns,8_000_000);
+        // Drained while gated, from the other role: the same.
+        init.push(Secondary,util(384_000));
+        rings.drain_statistics(&dev,&init,Secondary);
+        assert_eq!(rings.read_statistics(1).busy_ns,16_000_000);
+        // Powered again: one record per epoch keeps counting, a repeat does not.
+        rings.observe_statistics_power(&dev,&init,&[Primary,Secondary],true,2);
+        init.push(Primary,util(576_000));
+        init.push(Secondary,util(576_000));
+        rings.drain_statistics(&dev,&init,Primary);
+        rings.drain_statistics(&dev,&init,Secondary);
+        assert_eq!(rings.read_statistics(1).busy_ns,24_000_000);
+        assert_eq!(rings.read_statistics(1).busy_status,telemetry::VALID);
+        // Suspend's discard keeps queued records out.
+        init.push(Primary,util(768_000));
+        rings.suspend_statistics(true);
+        rings.drain_statistics(&dev,&init,Primary);
+        rings.suspend_statistics(false);
+        rings.drain_statistics(&dev,&init,Primary);
+        assert_eq!(rings.read_statistics(1).busy_ns,24_000_000);
+        // Quarantine stops the total: it reads stale.
+        init.cursors[1][1].store(fw::channels::STATISTICS_SLOTS,Ordering::Relaxed);
+        rings.drain_statistics(&dev,&init,Secondary);
+        let view=rings.read_statistics(1);
+        assert_eq!((view.busy_status,view.busy_ns),(telemetry::STALE,24_000_000));
+    }
+    #[test]
     fn pstate_uses_drain_order_without_role_deduplication() {
         use {channel::Rings,fw::variant::InitGraph,Role::*};
         let dev=crate::device::Device;
@@ -614,13 +655,16 @@ int main(void) {
         assert(strstr(now,"power_mw unsupported\n"));
         assert(strstr(now,"temperature_raw unsupported\n"));
         assert(strstr(now,"requested_frequency_hz unsupported\n"));
-        assert(strstr(now,"achieved_frequency_hz unsupported\n"));
         if(status==1) {
+            /* A valid state with no frequency in the board's table. */
+            assert(strstr(now,"achieved_frequency_hz unsupported\n"));
             assert(strstr(now,"util_tiler_percent 30\nutil_renderer_percent 80\nutil_device_percent 57\n"));
             assert(strstr(now,"pstate 6\n"));
         } else {
+            /* Not valid: the pstate and its frequency say why. */
+            assert(strstr(now,status==2?"pstate stale\n":"pstate unavailable\n"));
+            assert(strstr(now,status==2?"achieved_frequency_hz stale\n":"achieved_frequency_hz unavailable\n"));
             assert(strstr(now,"util_device_percent unsupported\n"));
-            assert(strstr(now,"pstate unsupported\n"));
             assert(strstr(now,status==2?"pstate_status stale\n":"pstate_status unavailable\n"));
             assert(strstr(now,status==2?"utilisation_status stale\n":"utilisation_status unavailable\n"));
         }
@@ -634,7 +678,11 @@ int main(void) {
     assert(strstr(now,"pstate 0\nrequested_frequency_hz unsupported\nachieved_frequency_hz 0\n"));
     current.pstate_status=2;
     agx_stats_show(NULL,&stats.attr,now);
-    assert(strstr(now,"pstate unsupported\nrequested_frequency_hz unsupported\nachieved_frequency_hz unsupported\n"));
+    assert(strstr(now,"pstate stale\nrequested_frequency_hz unsupported\nachieved_frequency_hz stale\n"));
+    /* M5: a stopped busy total reads stale. */
+    current=(struct asahi_qualified_stats){.util_status=1,.pstate_status=1,.pstate=6,.busy_status=2,.busy_ns=77};
+    agx_stats_show(NULL,&stats.attr,now);
+    assert(strstr(now,"busy_ns stale\n") && !strstr(now,"busy_ns 77"));
     /* G16S: pstate unsupported by firmware, utilisation still valid. */
     current=(struct asahi_qualified_stats){.util_status=1,.pstate_status=3,.tiler=30,.renderer=80,.device=57,.pstate=0,
                                           .util_samples=19,.util_host_ns=123};
