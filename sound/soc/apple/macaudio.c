@@ -4055,16 +4055,21 @@ struct macaudio_platform_cfg macaudio_j700_cfg = {
  */
 struct macaudio_platform_cfg macaudio_j873_cfg = {
 	/*
-	 * No qualified speaker protection exists for J873 yet (no verified
-	 * sense path, thermal model or power budget), and there is no safe
-	 * level: macaudio_speakers_allowed() keeps the speaker off. The jack
-	 * is unaffected.
+	 * The firmware's speaker stream has no receive side (its ADT stream
+	 * descriptor has no RX slots, and the amp's speaker-protection is 0):
+	 * the amp's V/I sense never reaches the AP, so no protection daemon
+	 * can run. The speaker plays under a fixed ceiling instead. At the
+	 * ADT's amp level 15 (18.5 dBV), -16 dB keeps the worst signal, a
+	 * full-scale square wave, at 0.77 W into 4.6 ohms (a sine at 0.39 W).
+	 * speakersafetyd's Mac mini (J274) model settles at 123 C under it,
+	 * below its 140 C limit, which it reaches at 0.94 W.
 	 */
-	.enable_speakers = false,
+	.enable_speakers = true,
 	.amp = AMP_SN012776,
 	.speakers = SPKR_1W,
 	.stereo = false,
-	.safe_vol = 0,
+	.safe_vol = -16,
+	.spk_fixed_ceiling = true,
 	.fe_dai_names = { "j873-pcm-0", "j873-pcm-1", "j873-pcm-2" },
 	/* jack: a one-BCLK sync pulse, data launched on the rising edge */
 	.dai_fmt = SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_IB_NF,
@@ -4443,7 +4448,7 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j773-macaudio", .data = &macaudio_j575c_j773_cfg },
 	/* j773    -       cs42l84     -       the jack, a card of its own (AOP-fed) */
 	{ .compatible = "apple,j773-macaudio-jack", .data = &macaudio_j616_jack_cfg },
-	/* j873    AID48   sn012776    15      1x 1W    (AOP-fed, no protection) */
+	/* j873    AID48   sn012776    15      1x 1W    (AOP-fed, no sense: fixed ceiling) */
 	{ .compatible = "apple,j873-macaudio", .data = &macaudio_j873_cfg },
 	/* j813    AID?    sn012776    15      2x 1W+1T (AOP-fed, V/I sense) */
 	{ .compatible = "apple,j813-macaudio", .data = &macaudio_j813_cfg },
