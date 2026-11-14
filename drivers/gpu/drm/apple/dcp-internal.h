@@ -286,6 +286,9 @@ struct apple_dcp_hw_data {
 	bool s2r_ext;
 	/* The firmware crashes on any mode but the 120 Hz boot timing, see dcp_mode_settable(). */
 	bool only_120hz_modes;
+	/* A firmware 27 sleep in progress, and how it ended */
+	bool v27_sleep_protocol;
+	bool v27_sleep_recovery;
 };
 
 enum dcp_test_point {
@@ -697,6 +700,17 @@ struct apple_dcp {
 	bool rx_held;
 
 	/* A firmware-driven suspend stops the firmware, see dcp_s2r_suspend(). */
+	struct apple_dcp_afkep *sleep_v27_ep[0x20];
+	/*
+	 * Firmware 27.0 on the J714s, the board the firmware 27 sleep and what it needs of the
+	 * shared paths have run on. Every other machine on firmware 27, other T6050 boards and
+	 * T8142 included, takes the paths it took before.
+	 */
+	bool v27_j714s;
+	struct dcp_v27_sleep *sleep_v27;
+	bool sleep_v27_closed;
+	/* Unhandled application traffic permanently invalidates the sleep's inventory. */
+	bool sleep_v27_unhandled;
 	bool s2r_active;
 	bool s2r_stopped;
 	/* DPMS off stopped the firmware and lowered the domains; DPMS on brings them back. */

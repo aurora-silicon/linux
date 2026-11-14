@@ -212,6 +212,28 @@ const struct dcp_method_entry *iomfb_v27_methods(const char *compat)
 }
 
 /*
+ * The 27.0 table for the J714s, the board the firmware 27 sleep has run on (dcp->v27_j714s): a
+ * copy with the sleep's A500 added. The shared table keeps the methods it had, so every other
+ * machine sends what it sent, and a 27.2 or 27.3 build is judged against the same list as
+ * before (iomfb_v27_missing_method()). NULL if @methods is not the 27.0 table or the copy
+ * cannot be made.
+ */
+const struct dcp_method_entry *iomfb_v27_methods_j714s(struct device *dev,
+						       const struct dcp_method_entry *methods)
+{
+	static const struct dcp_method_entry a500 = { "dcpep_unnamed_500", { 'A', '5', '0', '0' } };
+	struct dcp_method_entry *table;
+
+	if (methods != dcp_methods_27_0)
+		return NULL;
+	table = devm_kmemdup(dev, dcp_methods_27_0, sizeof(dcp_methods_27_0), GFP_KERNEL);
+	if (!table)
+		return NULL;
+	table[dcpep_unnamed_500] = a500;
+	return table;
+}
+
+/*
  * The driver sends every method of the 27.0 table. dfb_ready_query is the one
  * it leaves out for a build whose table has no ID for it (boot_5()). Return
  * the name of the first other method @methods has no ID for, with their number
