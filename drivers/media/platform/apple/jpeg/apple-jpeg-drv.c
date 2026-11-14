@@ -889,6 +889,8 @@ static const struct of_device_id aj_of_match[] = {
 	{ .compatible = "apple,t6041-jpeg", .data = &apple_jpeg_t6041 },
 	{ .compatible = "apple,t8132-jpeg", .data = &apple_jpeg_t6041 },
 	{ .compatible = "apple,t6050-jpeg", .data = &apple_jpeg_t6050 },
+	/* T6050's revision, reset image and job programming (traced on a J815). */
+	{ .compatible = "apple,t8142-jpeg", .data = &apple_jpeg_t6050 },
 	{ .compatible = "apple,t8140-jpeg", .data = &apple_jpeg_t8140 },
 	{ }
 };

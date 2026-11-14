@@ -24,12 +24,15 @@ apple,t8112-jpeg      wide64     0x0e0008
 apple,t8122-jpeg      wide64     0x0f0008
 apple,t8132-jpeg      wide64     0x100008
 apple,t8140-jpeg      wide64     0x110000
+apple,t8142-jpeg      wide64     0x110010
 ===================  =========  ========================
 
 On the wide64 engines the HWREV readback equals the hardware description's
 ``hw-type`` with the stepping nibble masked (read back on T8112 and T6041), so
 the T8122 and T8132 rows use their ``hw-type``. T8132 has the T6041
-identity and shares its data. The T8103 engines report the legacy selector
+identity and shares its data. T8142 (read back on a J815) has the T6050
+identity and shares its data: macOS 27.2.1 programs its engines with T6050's
+reset image and job sequence, write for write. The T8103 engines report the legacy selector
 0x0a0103 there, which is not a HWREV, so T8103 has no row yet.
 
 Identification powers the domain, writes MODE=0x147 and reads the selected
