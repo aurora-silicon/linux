@@ -209,6 +209,45 @@ impl Vm {
         vm_exec.unique_gpuvm.data().page_table.translate_iova(address)
     }
 
+    /// [`Self::translate_iova`] of `address + k * UAT_PGSZ` for each `k` below
+    /// `bytes.div_ceil(UAT_PGSZ)`, under one lock and one page-table walk.
+    pub(crate) fn translate_pages(&self, address: u64, bytes: usize) -> Result<KVec<u64>> {
+        let offset = address & UAT_PGMSK as u64;
+        let start = address - offset;
+        let pages = bytes.div_ceil(UAT_PGSZ);
+        let end = start.checked_add((pages as u64) << UAT_PGBIT).ok_or(EINVAL)?;
+        let mut physical = KVec::from_elem(0u64, pages, GFP_KERNEL)?;
+        if pages == 0 {
+            return Ok(physical);
+        }
+        {
+            // SAFETY: See `lock_vm()`, and `translate_iova()` for why the VM's reservation
+            // suffices.
+            let mut vm_exec = unsafe { self.gpuvm.exec_lock_vm(None, false)? };
+            vm_exec
+                .unique_gpuvm
+                .data()
+                .page_table
+                .translate_pages(start..end, &mut physical)?;
+        }
+        for frame in physical.iter_mut() {
+            *frame |= offset;
+        }
+        Ok(physical)
+    }
+
+    /// [`Self::translate_iova`] for each of `addresses`, under one lock.
+    pub(crate) fn translate_each(&self, addresses: &[u64]) -> Result<KVec<u64>> {
+        let mut physical = KVec::with_capacity(addresses.len(), GFP_KERNEL)?;
+        // SAFETY: As in `translate_pages()`.
+        let mut vm_exec = unsafe { self.gpuvm.exec_lock_vm(None, false)? };
+        let page_table = &mut vm_exec.unique_gpuvm.data().page_table;
+        for &address in addresses {
+            physical.push(page_table.translate_iova(address)?, GFP_KERNEL)?;
+        }
+        Ok(physical)
+    }
+
     /// Requires a job mapping guard before validating or installing these views.
     pub(crate) fn install_job_context_aliases(&self) -> Result {
         let context = self.context_bindings.as_ref().ok_or(EINVAL)?;
