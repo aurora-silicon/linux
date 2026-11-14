@@ -10,6 +10,7 @@
 #include <linux/of_address.h>
 #include <linux/of_irq.h>
 #include <linux/platform_device.h>
+#include <crypto/sha2.h>
 
 #include "ane_fw_cold.h"
 #include "ane_fw_platform.h"
@@ -175,6 +176,51 @@ const struct ane_fw_platform ane_t6050_platform = {
 	.dart_revision = 0x204,
 	.dapf_count = 5,
 	.text_pin = ane_t6050_text_pin_27_0,
+};
+
+/*
+ * The M5 (T8142, J813/J815) ANE: "ane,t8132exclave", ane-type 0x210,
+ * exclave-assigned and preloaded by iBoot. From the T8142 ADT: ANE_SYS at
+ * PMGR +0x2e8 (pmgr device 73, parent AFISOCNI3), ANE_CPU +0xc000 and
+ * ANE_TDBASE +0xc008 as on T8140; four DAPF records; TEXT 0xbc000 and DATA
+ * 0x2b0000 at 0x100_0000_0000 and 0x100_000b_c000 (the macOS 27.2 host's
+ * preload). Not measured yet: the PWGATE window, the scratch cells and the
+ * DART revision (T8140's values below), and the TEXT pin, so the zero pin
+ * never matches: the hand-off is checked and its TEXT digest logged, and the
+ * engine is left alone.
+ */
+static const u8 ane_t8142_text_pin_unmeasured[SHA256_DIGEST_SIZE];
+
+const struct ane_fw_platform ane_t8142_platform = {
+	.soc = 0x8142,
+	.chip_family = 17,
+	.ane_type = 0x210,
+	.hwx_subtype = 9,
+	.task_generation = 19,
+	.interrupt_count = 2,
+	.owner = ANE_FW_OWNER_EXCLAVE,
+	.reg_names = ane_h17_reg_names,
+	.reg_sizes = ane_h17_reg_sizes,
+	.reg_count = ARRAY_SIZE(ane_h17_reg_names),
+	.wrapper = 0x1600000,
+	.mailbox = 0x1608000,
+	.scratch = 0x1880020,
+	.doorbell = 0x1884000,
+	.irq_status = 0x188c000,
+	.irq_ack = 0x1890000,
+	.preload_dva = { 0x10000000000, 0x100000bc000 },
+	.preload_size = { 0xbc000, 0x2b0000 },
+	.stream_mask = BIT(0),
+	.firmware_preloaded = true,
+	.safe_reset = false,
+	.sleep_warm = false,
+	.pmgr_sys = 0x2e8,
+	.pmgr_cpu = 0xc000,
+	.pmgr_subblock = 0xc008,
+	.dart_compatible = "apple,t8142-dart",
+	.dart_revision = 0x203,
+	.dapf_count = 4,
+	.text_pin = ane_t8142_text_pin_unmeasured,
 };
 
 /*
