@@ -58,4 +58,8 @@ static inline unsigned int dcp_keepalive_delay_ms(unsigned int param)
 	return min_t(unsigned int, param, DCP_KEEPALIVE_MAX_MS);
 }
 
+/* Boot values of the two parameters. A change here flips the default; the parameters stay as the runtime rollback. */
+#define DCP_SWAP_TS_MODE_DEFAULT DCP_SWAP_TS_CURRENT
+#define DCP_KEEPALIVE_MS_DEFAULT 0
+
 #endif
