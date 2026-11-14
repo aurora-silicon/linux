@@ -34,8 +34,14 @@
 #include "ane_t6021_lifetime.h"
 
 #define ANE_H16_TX_WORDS 272
-/* Private program window above the SHAREDMALLOC range; host policy. */
-#define ANE_H16_PROGRAM_WINDOW SZ_1G
+/*
+ * Private program window above the SHAREDMALLOC range; host policy. Program
+ * DVAs are never reused before a firmware reset, so the window bounds the sum
+ * of every program loaded in one boot. 16G holds programs with several
+ * hundred megabytes of constants each next to the many small ones a pipeline
+ * keeps resident; the DART aperture is 4T.
+ */
+#define ANE_H16_PROGRAM_WINDOW SZ_16G
 
 struct ane_h16_mapping {
 	struct list_head node;
@@ -82,8 +88,14 @@ struct ane_h16_device {
 	bool irq_wait;
 	bool irq_armed;
 	unsigned long irq_seq;
+	/*
+	 * How the armed sleeps ended: on the channel IRQ, or on the timer that
+	 * bounds each of them to the polled cadence. A reply that takes longer
+	 * than one such sleep runs several timers out before its IRQ comes, so
+	 * the second count grows in normal operation and is no error count.
+	 */
 	u64 irq_wakeups;
-	u64 irq_timeouts;
+	u64 timer_wakeups;
 	struct ane_fw_rtk rtk;
 	struct {
 		u64 word0;
@@ -204,7 +216,7 @@ static void ane_h16_quarantine(void *ctx, int error)
 }
 
 /*
- * System sleep the macOS way (SPEC-ANE-SLEEP.md sections 4.1, 4.2 and 5.1):
+ * System sleep:
  * suspend the firmware with SUSPEND (0x24), power gate the engine through
  * the PM domains it holds (DARTs first, then base, td, mpm, cpu, sys), and
  * after resume power it back up in order, let the DARTs restore their
@@ -624,6 +636,16 @@ static bool ane_h16_slept_off(struct ane_h16_device *h)
 	return h->powered != 0;
 }
 
+/*
+ * System sleep cycles the engine cold: it is powered off under the running
+ * firmware, booted again from the preload and every program replayed. The
+ * other sleep path keeps the firmware and falls back to this one.
+ */
+static bool ane_h16_sleep_cold(const struct ane_h16_device *h)
+{
+	return h->boot.soc->sleep_cold && !h->boot.soc->sleep_warm;
+}
+
 static int ane_h16_sleep_prepare(struct ane_h16_device *h)
 {
 	int ret;
@@ -636,6 +658,25 @@ static int ane_h16_sleep_prepare(struct ane_h16_device *h)
 		h->genpd[i].off_ns = 0;
 	}
 	h->sleep_quarantined = false;
+	/*
+	 * An engine quarantined at bring-up (its firmware stopped part way
+	 * through every startup restart allowed) has no program session: there
+	 * is nothing to suspend, replay or boot again. It must not refuse every
+	 * later sleep of the boot. With hung_stop, power it off like a
+	 * quarantined engine below, DARTs held until its domains are off, and
+	 * leave it off and quarantined, after the resume as after an abort.
+	 */
+	if (!h->program_ready && h->boot.quarantined && ane_t6021_hung_stop) {
+		if (h->engine_on) {
+			unsigned int held = ane_h16_hold_darts(h);
+
+			ane_h16_power_down(h);
+			ane_h16_release_darts(h, held);
+		}
+		dev_info_once(h->dev, "H16 ANE: quarantined engine left off for the sleep\n");
+		WRITE_ONCE(h->slept, true);
+		return 0;
+	}
 	if (!h->program_ready || (h->boot.quarantined && !ane_t6021_hung_stop))
 		return -EBUSY;
 	/* Without hung_stop a quarantined session stays so across the sleep. */
@@ -659,7 +700,7 @@ static int ane_h16_sleep_prepare(struct ane_h16_device *h)
 		return 0;
 	}
 	ane_h16_session_sleep(&h->session, true);
-	if (!h->boot.soc->sleep_warm) {
+	if (ane_h16_sleep_cold(h)) {
 		/* Cold cycle: nothing in flight, then power off under the firmware. */
 		for (unsigned int ch = 0; ch < ANE_FW_CHANNELS; ch++) {
 			if (h->boot.transport.pending[ch].active) {
@@ -694,11 +735,16 @@ static void ane_h16_sleep_resume(struct ane_h16_device *h)
 	guard(mutex)(&ane_h16_lock);
 	if (!h->slept)
 		return;
+	if (!h->program_ready) {
+		/* Quarantined at bring-up: it stays off and quarantined. */
+		WRITE_ONCE(h->slept, false);
+		return;
+	}
 	start = ktime_get_ns();
 	h->resume_ready_ns = 0;
 	h->resume_first_ns = 0;
 	h->resume_replayed = 0;
-	h->resume_cold = !h->boot.soc->sleep_warm || h->sleep_quarantined;
+	h->resume_cold = ane_h16_sleep_cold(h) || h->sleep_quarantined;
 	h->resume_restarts = 0;
 	if (h->sleep_quarantined && !ane_h16_slept_off(h)) {
 		/* Not proven off: the old firmware may still run. Keep it. */
@@ -744,6 +790,7 @@ static int ane_h16_pm_event(struct notifier_block *nb, unsigned long event, void
 {
 	struct ane_h16_device *h = container_of(nb, struct ane_h16_device, pm_notifier);
 	bool pinned = READ_ONCE(h->pinned);
+	bool cold = ane_h16_sleep_cold(h);
 
 	/* Without a sleep path on this platform, every sleep is refused as before. */
 	if (!h->boot.soc->sleep_warm && !h->boot.soc->sleep_cold) {
@@ -751,12 +798,23 @@ static int ane_h16_pm_event(struct notifier_block *nb, unsigned long event, void
 			dev_warn_once(h->dev, ANE_FW_SLEEP_REFUSED);
 		return ane_fw_sleep_event(event, pinned);
 	}
-	if (event == PM_POST_SUSPEND) {
+	/*
+	 * Hibernation takes the cold cycle: the engine is powered down before
+	 * the snapshot and, after the image is restored (or the attempt is
+	 * aborted), booted again from the preload with every program replayed.
+	 * The preload stays out of the image, the verified DATA copy in it.
+	 * A restore kernel that booted the engine powers it down the same way
+	 * before it jumps into the image. The warm path keeps refusing it.
+	 */
+	if (event == PM_POST_SUSPEND ||
+	    (cold && (event == PM_POST_HIBERNATION || event == PM_POST_RESTORE))) {
 		ane_h16_sleep_resume(h);
 		WRITE_ONCE(h->recover_blocked, false);
 		return NOTIFY_DONE;
 	}
-	if (event == PM_SUSPEND_PREPARE && pinned) {
+	if (pinned && (event == PM_SUSPEND_PREPARE ||
+		       (cold && (event == PM_HIBERNATION_PREPARE ||
+				 event == PM_RESTORE_PREPARE)))) {
 		/* A recovery under way finishes first; sleep handles later ones. */
 		WRITE_ONCE(h->recover_blocked, true);
 		flush_work(&h->recover);
@@ -766,7 +824,7 @@ static int ane_h16_pm_event(struct notifier_block *nb, unsigned long event, void
 		dev_warn_once(h->dev, ANE_FW_SLEEP_REFUSED);
 		return NOTIFY_BAD;
 	}
-	/* Hibernation and restore stay refused. */
+	/* Hibernation and restore on the warm path stay refused. */
 	if (ane_fw_sleep_refused_cycle(event, pinned, true)) {
 		dev_warn_once(h->dev, ANE_FW_SLEEP_REFUSED);
 		return NOTIFY_BAD;
@@ -1156,7 +1214,7 @@ static void ane_h16_irq_pause(struct ane_h16_device *h, u64 waited_ns)
 				   us_to_ktime(min_us));
 	scoped_guard(spinlock_irqsave, &h->irq_lock) {
 		if (ret)
-			h->irq_timeouts++;
+			h->timer_wakeups++;
 		else
 			h->irq_wakeups++;
 	}
@@ -2081,7 +2139,7 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 	debugfs_create_file("stage", 0600, h->debugfs, h, &ane_h16_stage_fops);
 	debugfs_create_file("execute", 0600, h->debugfs, h, &ane_h16_execute_fops);
 	debugfs_create_u64("irq_wakeups", 0400, h->debugfs, &h->irq_wakeups);
-	debugfs_create_u64("irq_timeouts", 0400, h->debugfs, &h->irq_timeouts);
+	debugfs_create_u64("timer_wakeups", 0400, h->debugfs, &h->timer_wakeups);
 	debugfs_create_u64("recoveries", 0400, h->debugfs, &h->recoveries);
 	debugfs_create_u64("recover_failures", 0400, h->debugfs, &h->recover_failures);
 	platform_set_drvdata(pdev, h);

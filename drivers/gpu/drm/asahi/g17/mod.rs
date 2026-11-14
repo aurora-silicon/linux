@@ -13,13 +13,14 @@
 //! # Locking
 //!
 //! `Shared::state` is the device lock. It serializes binding, recovery, the event worker and all
-//! firmware-shared state that has no narrower owner. Steady-state compute publication into a
-//! bound queue takes only that queue's cell lock and the port's locks ([`port`]), reached under
-//! a preparation lease. Completions are signalled after dropping the device lock. Lock order:
+//! firmware-shared state that has no narrower owner. After a resume from disk it also waits for the
+//! firmware's re-boot, which runs in a work item (`DeviceLock`). Steady-state compute publication
+//! into a bound queue takes only that queue's cell lock and the port's locks ([`port`]), reached
+//! under a preparation lease. Completions are signalled after dropping the device lock. Lock order:
 //! `Shared::state` -> compute queue cell (one at a time) -> port locks -> availability domains;
-//! `Shared::state` -> UAT shared state -> VM exec lock -> GEM reservation. `RoleState::ack`
-//! nests inside nothing. Capacity waits block on an availability domain signalled by the
-//! release that provides the capacity, never on a sleep.
+//! `Shared::state` -> UAT shared state -> VM exec lock -> GEM reservation. `RoleState::ack` nests
+//! inside nothing. Capacity waits block on an availability domain signalled by the release that
+//! provides the capacity, never on a sleep.
 
 pub(crate) mod availability;
 mod buffer;
@@ -98,7 +99,8 @@ use kernel::{
         aref::ARef,
         Arc,
         CondVar,
-        Mutex, //
+        Mutex,
+        MutexGuard, //
     },
     time::{
         delay::fsleep,
@@ -354,6 +356,16 @@ const OPENING_RETIRE_POLLS: usize = 100;
 /// One-millisecond polls for a firmware that acknowledges its initialization only in status A
 /// ([`fw::variant::InitAck::Status`]).
 const INIT_ACCEPT_POLLS: usize = 3000;
+
+/// Bound of the hibernation drain: submitted work retires and the firmware's outstanding
+/// acknowledgements arrive within it, or the hibernation is refused.
+const HIBERNATE_DRAIN_NS: u64 = 5_000_000_000;
+/// Bound of one closed-publication confirmation inside the drain.
+const HIBERNATE_SETTLE_NS: u64 = 200_000_000;
+/// Poll interval of the drain.
+const HIBERNATE_DRAIN_POLL_MS: i64 = 2;
+/// Bound for builders to leave a closed gate before publication reopens.
+const HIBERNATE_REOPEN_NS: u64 = 1_000_000_000;
 
 /// Address bits of a buffer the coprocessor places itself; the coprocessor sets higher bits in
 /// its buffer requests.
@@ -710,6 +722,50 @@ impl Coprocessor {
             self.running = false;
         }
     }
+
+    /// Whether the boot loader left this coprocessor halted: the run request of its CPU
+    /// control word is clear. Returns the control and status words for the log.
+    fn halted(&self) -> Result<(bool, u32, u32)> {
+        let (control, status) = self.cpu.state()?;
+        Ok((control & regs::CpuControl::CONTROL_RUN == 0, control, status))
+    }
+
+    /// Returns the host side of a coprocessor that a resume from disk found halted to the state
+    /// [`Self::new`] leaves, so that [`Self::boot`] runs a cold RTKit handshake again.
+    ///
+    /// The image restored `running`, the provider's run flag and the RTKit session of the
+    /// firmware instance that ran before hibernation; the boot loader has since cold-restarted
+    /// the coprocessor and reset its mailbox. The provider refuses to start a CPU it believes
+    /// running, so the stop below (a no-op write of the run bit on the halted CPU) also returns
+    /// the runtime-PM reference the start took. `apple_rtkit_reinit` then detaches and drains
+    /// RX, frees the buffers the old firmware asked for, clears the endpoint map, the crashed
+    /// flag and the power states, and restarts the mailbox. Nothing waits on `ack` here: the
+    /// device mutex excludes every boot and init waiter.
+    fn reset_for_cold_boot(&mut self, dev: &AsahiDrmDevice) -> Result {
+        // Before RTKit can deliver a message of the new session (reinit restarts the mailbox).
+        self.state.crashed.store(false, Ordering::Release);
+        // SAFETY: `ack` is initialized and pinned in the Arc; no waiter can exist (see above),
+        // so reinitializing the completion cannot strand one.
+        unsafe { kernel::bindings::init_completion(self.state.ack.get()) };
+        let before = self.cpu.state()?;
+        // The provider ignores a stop of a CPU it believes stopped. On a halted CPU the stop
+        // writes the run bit it already reads clear, and clears control bit 5 (the provider's
+        // second stop write), which is the only register change beyond a first boot.
+        self.cpu.stop();
+        self.running = false;
+        let after = self.cpu.state()?;
+        dev_info!(
+            dev.as_ref(),
+            "GPU coprocessor {:?} cold reset: cpu control {:#x} -> {:#x}, status {:#x} -> {:#x}\n",
+            self.state.role,
+            before.0,
+            after.0,
+            before.1,
+            after.1
+        );
+        self.rtkit.with(|rtkit| rtkit.reinit())?;
+        Ok(())
+    }
 }
 
 impl Drop for Coprocessor {
@@ -817,6 +873,12 @@ struct Firmware {
     governor: thermal::Governor,
     registration_power_release_pending: bool,
     variant: &'static fw::Variant,
+    /// The static board configuration, kept so the post-hibernation republish can re-run the
+    /// firmware-facing boot tail without routing it back through the probe path.
+    cfg: &'static Config,
+    /// Drained for hibernation ([`Shared::freeze_for_hibernation`]): publication is closed
+    /// and the event worker publishes nothing until the thaw.
+    frozen: bool,
     queues: runtime::Registry,
     pool: Arc<object::Pool>,
     /// Render kick ring storage, kept and reused for the life of the device.
@@ -862,6 +924,282 @@ impl Firmware {
         } else {
             &[Role::Primary]
         }
+    }
+
+    /// Restarts both coprocessor CPUs and drops the CPU's cached view of the reserved tables
+    /// the firmware rebuilds as it boots.
+    ///
+    /// Can be run again: it starts hardware and touches no host allocation. On the cold-republish
+    /// path the caller MUST have reset the host RTKit state first (see
+    /// [`Self::reinit_mailboxes`]); the surviving `Coprocessor::running` flag and the stale
+    /// `apple_rtkit` boot state would otherwise make `primary.boot()` race a dead handshake.
+    fn restart_coprocessors(&mut self) -> Result {
+        self.primary.boot()?;
+        if let Some(secondary) = self.secondary.as_mut() {
+            secondary.boot()?;
+        }
+        // The firmware built its root and kernel-window tables while booting.
+        self.uat.invalidate_reserved_tables();
+        Ok(())
+    }
+
+    /// The firmware-facing opening handshake, shared by the cold-boot path ([`Gpu::boot`]) and
+    /// the post-hibernation republish ([`Self::republish_after_cold_boot`]).
+    ///
+    /// It attaches the port views (once: on a republish the port is already attached to views
+    /// of the same graph objects and the same pinned mailbox), mirrors the secondary root,
+    /// enables fabric gating, hands the firmware its initialization root, drives the
+    /// init/opening acknowledgements and activates the global render context. It allocates
+    /// nothing. The graph must hold its post-build contents: [`Gpu::boot`] has just built it,
+    /// the republish has restored it ([`Self::reinit_shared_contents`]).
+    fn open_firmware(&mut self, dev: &AsahiDrmDevice, shared: &Shared) -> Result {
+        if !self.port.attached() {
+            let mailbox: *const Mailbox = &*self.primary.rtkit;
+            self.port.attach(
+                self.init.port_views(mailbox)?,
+                self.bridge.regs.clone(),
+                shared.variant.registration,
+                !shared.variant.m5_commands,
+            )?;
+        }
+        self.uat.mirror_secondary_root()?;
+        if self.cfg.fabric_bridge {
+            self.bridge.regs.enable_g17_gating()?;
+        }
+        let ack = shared.variant.init_ack;
+        let root_va = self.init.root_va(Role::Primary)?;
+        dev_dbg!(
+            dev.as_ref(),
+            "bring-up: initialization data built, publishing root {:#x}\n",
+            root_va
+        );
+        self.primary.init(root_va, ack)?;
+        if ack == fw::variant::InitAck::Status {
+            Gpu::wait_for_init_accepted(dev, &self.init, &self.primary)?;
+        }
+        dev_dbg!(dev.as_ref(), "bring-up: initialization data accepted\n");
+        if let Some(secondary) = self.secondary.as_mut() {
+            secondary.init(self.init.root_va(Role::Secondary)?, ack)?;
+        }
+        if shared.variant.power_on_done {
+            self.primary.notify(MSG_POWER_ON_DONE)?;
+            if let Some(secondary) = self.secondary.as_mut() {
+                secondary.notify(MSG_POWER_ON_DONE)?;
+            }
+        }
+        if shared.variant.opening_record {
+            Gpu::wait_for_opening(dev, &self.init, &self.primary, self.secondary.as_ref())?;
+            dev_dbg!(dev.as_ref(), "bring-up: opening record retired\n");
+        } else {
+            dev_dbg!(
+                dev.as_ref(),
+                "bring-up: no opening record staged; device-control counters {:?}\n",
+                self.init.control_counters()?
+            );
+        }
+        self.uat.activate_render_context(&self._render_global)?;
+        dev_dbg!(dev.as_ref(), "bring-up: firmware running\n");
+        Ok(())
+    }
+
+    /// Whether the firmware must be re-booted after a hibernation transition: a coprocessor
+    /// was found halted, or the no-map handoff/TTBAT no longer hold the host's words (a second
+    /// witness that cannot survive a cold boot; see `mmu::Uat::reserved_state_mismatches`).
+    /// Any doubt is cold: the cold path stops the CPU before it restarts it.
+    fn firmware_cold(&self, dev: &AsahiDrmDevice) -> Result<bool> {
+        let halted = self.coprocessors_halted(dev);
+        let mismatches = self.uat.reserved_state_mismatches();
+        dev_info!(
+            dev.as_ref(),
+            "GPU after hibernation: coprocessors {}, {} handoff/TTBAT words differ from the host's\n",
+            match halted {
+                Ok(true) => "halted",
+                Ok(false) => "running",
+                Err(_) => "mixed or unreadable",
+            },
+            mismatches
+        );
+        Ok(halted.unwrap_or(true) || mismatches != 0)
+    }
+
+    /// Whether every coprocessor of this GPU was found halted (see [`Coprocessor::halted`]);
+    /// logs the CPU words. A mix of halted and running instances is `EIO`.
+    fn coprocessors_halted(&self, dev: &AsahiDrmDevice) -> Result<bool> {
+        let mut halted = None;
+        for coprocessor in Iterator::chain(core::iter::once(&self.primary), self.secondary.as_ref()) {
+            let (stopped, control, status) = coprocessor.halted()?;
+            dev_info!(
+                dev.as_ref(),
+                "GPU coprocessor {:?} after hibernation: cpu control {:#x} status {:#x} ({})\n",
+                coprocessor.state.role,
+                control,
+                status,
+                if stopped { "halted" } else { "running" }
+            );
+            match halted {
+                None => halted = Some(stopped),
+                Some(previous) if previous != stopped => return Err(EIO),
+                Some(_) => {}
+            }
+        }
+        halted.ok_or(EIO)
+    }
+
+    /// (1) Returns each coprocessor's RTKit session and CPU-start bookkeeping to the state
+    /// before its first boot ([`Coprocessor::reset_for_cold_boot`]), so that the following
+    /// [`Self::restart_coprocessors`] runs the cold HELLO/EPMAP handshake again.
+    fn reinit_mailboxes(&mut self, dev: &AsahiDrmDevice) -> Result {
+        self.primary.reset_for_cold_boot(dev)?;
+        if let Some(secondary) = self.secondary.as_mut() {
+            secondary.reset_for_cold_boot(dev)?;
+        }
+        Ok(())
+    }
+
+    /// (2) Before the coprocessor starts: returns every host/firmware-shared structure the
+    /// firmware reads at boot to its first-boot contents, in place (nothing is reallocated or
+    /// remapped; client VMs keep resolving the fixed addresses).
+    ///
+    /// - The no-map handoff region and TTBAT, which the image does not hold, are rewritten from
+    ///   host state ([`mmu::Uat::reset_after_cold_boot`]): the kernel contexts, the kernel
+    ///   alias in context 1 and every live execution context.
+    /// - Every graph object gets its post-build bytes back ([`initdata::InitData::
+    ///   restore_pristine`]): the initialization root, main configuration, hardware data,
+    ///   power configuration, region C (effort, power-assert tally), status A/B (boot words,
+    ///   recovery handshake), the event/trace/statistics ring states, the device-control ring
+    ///   with its staged opening record, the work-ring cursors, descriptor tables, free-list
+    ///   controls and states, completion rings, stamp pages, QoS table and views.
+    /// - The host mirrors of those contents return to their post-boot values: receive-ring
+    ///   policy, recovery handshake, effort, idle hold, the port's QoS charges, generation and
+    ///   effort flag.
+    fn reinit_shared_contents(&mut self) -> Result {
+        // The UAT walker and the firmware read memory at the point of coherency: the arm64
+        // restore cleaned every image page there before the jump (swsusp_clean_restored_image,
+        // and the restore_pblist copy), page tables and every page they map included.
+        self.uat.reset_after_cold_boot()?;
+        self.init.restore_pristine()?;
+        self.port.reset_after_cold_boot()?;
+        self.rings.reset_after_cold_boot(self.port.statistics_epoch());
+        self.recovery.reset_after_cold_boot()?;
+        self.effort = power::Effort::new();
+        self.hold = power::Hold::new();
+        self.registration_power_release_pending = false;
+        self.seen_submissions = self.port.submissions();
+        Ok(())
+    }
+
+    /// (5) After the opening handshake, before publication reopens: makes every live queue a
+    /// fresh, uninstalled one for the new firmware, which installs it with the owner's next
+    /// command (the queue's install configuration, first descriptor and QID publication run
+    /// again); see `runtime::Registry::reset_compute_after_cold_boot` and
+    /// `Firmware::reset_render_after_cold_boot`. Device-global compute state written after the
+    /// build is replayed first ([`initdata::InitData::reset_compute_after_cold_boot`]). User
+    /// VMs need nothing: their page tables are in RAM and their execution contexts are back in
+    /// the TTBAT. Compute queues without an owner go to `retired`.
+    fn reregister_live_work(
+        &mut self,
+        dev: &AsahiDrmDevice,
+        retired: &mut runtime::RetiredCompute,
+        reclaim: &mut runtime::teardown::ReclaimBatch,
+    ) -> Result<(usize, usize, usize)> {
+        republish_step(dev, "compute state replay", self.init.reset_compute_after_cold_boot())?;
+        let compute = republish_step(
+            dev,
+            "compute queue reset",
+            self.queues.reset_compute_after_cold_boot(&self.init, retired),
+        )?;
+        let render = republish_step(
+            dev,
+            "render pair reset",
+            self.queues.reset_render_after_cold_boot(&self.init),
+        )?;
+        // The cores lost power with the cold boot: the next command on each pair installs it again.
+        self.queues.forget_render_registrations();
+        // Contexts closed after the drain: their releases are settled host-side.
+        let settled = republish_step(
+            dev,
+            "closed context settle",
+            self.settle_teardown_after_cold_boot(reclaim),
+        )?;
+        Ok((compute, render, settled))
+    }
+
+    /// Re-boots a coprocessor that the boot loader cold-restarted while this kernel was
+    /// restored from a hibernation image, against the restored host state, in the order of
+    /// the first boot ([`Gpu::boot`]) with the one-shot allocation and build replaced by
+    /// in-place resets. Called from the restore work that `PM_POST_HIBERNATION` queues after
+    /// the PMP restore, with the device mutex held and its restore barrier closed
+    /// ([`DeviceLock`]), and with publication closed since the freeze (the GPU was idle then).
+    ///
+    /// On error the caller loses the device; nothing is half-published: the publication gate
+    /// stays closed and every later command fails.
+    fn republish_after_cold_boot(
+        &mut self,
+        dev: &AsahiDrmDevice,
+        shared: &Shared,
+        retired: &mut runtime::RetiredCompute,
+        reclaim: &mut runtime::teardown::ReclaimBatch,
+    ) -> Result {
+        // A firmware root whose entries the host adopts and confirms around the build
+        // (A18 Pro) would need that step replayed; only the M4 Pro path is implemented.
+        if self.cfg.adopt_root_entries {
+            return Err(EINVAL);
+        }
+        let pristine = self.init.pristine_size();
+        // (1) Host RTKit and CPU-start state of the cold coprocessor.
+        republish_step(dev, "mailbox reset", self.reinit_mailboxes(dev))?;
+        // (2) What the firmware reads at boot, while it cannot run.
+        republish_step(dev, "shared contents reset", self.reinit_shared_contents())?;
+        // (2b) As the first boot does before it starts the CPUs (`Gpu::boot`): the
+        // GPU-to-fabric bridge. A cold boot by the boot loader resets the GPU block, and the
+        // coprocessors and cores cannot reach memory without it. Idempotent.
+        if self.cfg.fabric_bridge {
+            republish_step(dev, "fabric bridge", self.bridge.regs.enable_g17_bridge())?;
+        }
+        // (2c) The PMP was cold-restarted with the GPU and starts about two seconds
+        // after its restore; its report region is reset when it starts, so the GPU's pmp-gfx
+        // power request is handed again only once it runs (pmp-report). Do not let the
+        // firmware ask for core power before then. Bounded: a PMP that never comes back
+        // leaves the GPU in the state the first-boot path would have had without it.
+        let started = now_ns();
+        match power::wait_pmp_handover(PMP_HANDOVER_MS) {
+            Ok(()) => dev_dbg!(
+                dev.as_ref(),
+                "GPU republish: PMP requests acknowledged after {} ms\n",
+                now_ns().saturating_sub(started) / 1_000_000
+            ),
+            Err(error) => dev_warn!(
+                dev.as_ref(),
+                "GPU republish: PMP requests not acknowledged after {} ms ({:?}); starting anyway\n",
+                now_ns().saturating_sub(started) / 1_000_000,
+                error
+            ),
+        }
+        // (3) Start the CPU: RTKit boot handshake; the firmware rebuilds its own root and
+        // kernel-window tables.
+        republish_step(dev, "coprocessor start", self.restart_coprocessors())?;
+        // (4) As `init.build` mapped the graph after the firmware booted: store again the
+        // kernel-window descriptors the host placed in the firmware's no-map table.
+        let (relinked, links) =
+            republish_step(dev, "kernel-window relink", self.uat.relink_after_cold_boot())?;
+        // Contexts released since the TTBAT rewrite changed only the shadow.
+        self.uat.thaw_reserved_state();
+        // (5) Opening handshake on the restored root.
+        republish_step(dev, "opening handshake", self.open_firmware(dev, shared))?;
+        // (6) Live queues become fresh installs.
+        let (compute, render, settled) = self.reregister_live_work(dev, retired, reclaim)?;
+        dev_info!(
+            dev.as_ref(),
+            "GPU republish: graph {} KiB restored, {}/{} kernel-window links stored, {} compute queues and {} render pairs reset, {} idle compute queues retired, {} closed contexts settled\n",
+            pristine / 1024,
+            relinked,
+            links,
+            compute,
+            render,
+            retired.len(),
+            settled
+        );
+        Ok(())
     }
 
     /// Publishes controls only while the restart handshake is closed. The device mutex remains
@@ -1171,6 +1509,10 @@ const RETIRED_FEATURES: u64 = (uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE
     | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES) as u64;
 const _: () = assert!(M5_FEATURES & RETIRED_FEATURES == 0);
 
+/// Upper bound of the wait for the PMP to take its requests again after a resume from
+/// hibernation; on the M4 Pro it starts about two seconds after its restore.
+const PMP_HANDOVER_MS: u32 = 10_000;
+
 /// Event work item ID.
 const EVENT_WORK: u64 = 0;
 /// Short control/retirement polls do not wait behind the longer idle deadline.
@@ -1180,6 +1522,93 @@ const GROW_WORK: u64 = 3;
 const RECLAIM_WORK: u64 = 4;
 const FEED_WORK: u64 = 5;
 const GOVERNOR_WORK: u64 = 6;
+const RESTORE_WORK: u64 = 7;
+
+/// A step of [`Firmware::republish_after_cold_boot`]: logs which one failed, so that a lost
+/// device after a resume from disk names the step.
+fn republish_step<T>(dev: &AsahiDrmDevice, step: &str, result: Result<T>) -> Result<T> {
+    if let Err(error) = &result {
+        dev_err!(dev.as_ref(), "GPU republish: {} failed: {:?}\n", step, error);
+    }
+    result
+}
+
+/// The device lock ([`Shared::state`]) with the barrier of a post-hibernation restore.
+///
+/// After a resume from disk the boot loader has cold-restarted the firmware, and it is
+/// re-booted against the restored host state ([`Shared::restore_after_hibernation`]) in a work
+/// item, not in the PM notifier: the restore waits for the PMP to run again, about two
+/// seconds. Userspace is already thawed then. While the restore runs, [`Self::lock`] does not
+/// return: whoever takes the device lock (admission, the event worker, runtime PM, sysfs and
+/// debugfs readers, a new sleep) waits for the restore to finish, exactly as it waited for the
+/// mutex when the notifier held it for the whole restore. The barrier is closed and opened
+/// only with the mutex held, and checked with it held, so no locker sees the cold firmware.
+///
+/// Only the restore work bypasses the barrier ([`Self::lock_for_restore`]); it holds the mutex
+/// for the whole restore, so nothing it calls takes the lock again. The barrier is closed only
+/// on a device that was drained for hibernation: no preparation lease is held, so no builder
+/// sleeps on [`Shared::changed`] with this mutex's guard (such a wait reacquires the mutex
+/// without passing the barrier).
+#[pin_data]
+struct DeviceLock {
+    #[pin]
+    inner: Mutex<Option<KBox<Firmware>>>,
+    #[pin]
+    restored: CondVar,
+    /// A post-hibernation restore owns the firmware. Written with `inner` held; read with it
+    /// held, except by [`Self::lock_unless_restoring`]'s first look.
+    restoring: AtomicBool,
+}
+
+impl DeviceLock {
+    fn new() -> impl PinInit<Self> {
+        pin_init!(Self {
+            inner <- new_mutex!(None, "g17::Shared::state"),
+            restored <- new_condvar!("g17::Shared::state::restored"),
+            restoring: AtomicBool::new(false),
+        })
+    }
+
+    /// The device lock, once no post-hibernation restore owns the firmware.
+    fn lock(&self) -> MutexGuard<'_, Option<KBox<Firmware>>> {
+        let mut guard = self.inner.lock();
+        while self.restoring.load(Ordering::Relaxed) {
+            self.restored.wait(&mut guard);
+        }
+        guard
+    }
+
+    /// The device lock, or `None` while a post-hibernation restore owns the firmware. Does not
+    /// wait for the mutex that the restore holds.
+    fn lock_unless_restoring(&self) -> Option<MutexGuard<'_, Option<KBox<Firmware>>>> {
+        if self.restoring.load(Ordering::Acquire) {
+            return None;
+        }
+        let guard = self.inner.lock();
+        (!self.restoring.load(Ordering::Relaxed)).then_some(guard)
+    }
+
+    /// The device lock for the restore work, which owns the firmware while the barrier is
+    /// closed.
+    fn lock_for_restore(&self) -> MutexGuard<'_, Option<KBox<Firmware>>> {
+        self.inner.lock()
+    }
+
+    /// Closes the barrier; `_held` is this lock's guard.
+    fn close_for_restore(&self, _held: &MutexGuard<'_, Option<KBox<Firmware>>>) {
+        self.restoring.store(true, Ordering::Release);
+    }
+
+    /// Opens the barrier and wakes its waiters; `_held` is this lock's guard. Whether it was
+    /// closed.
+    fn open_after_restore(&self, _held: &MutexGuard<'_, Option<KBox<Firmware>>>) -> bool {
+        let closed = self.restoring.swap(false, Ordering::Release);
+        if closed {
+            self.restored.notify_all();
+        }
+        closed
+    }
+}
 
 /// Device state shared with the coprocessor callbacks and the event worker.
 #[pin_data]
@@ -1280,7 +1709,12 @@ struct Shared {
     stop: Mutex<()>,
     /// The device lock. `None` before boot completes and after detachment.
     #[pin]
-    state: Mutex<Option<KBox<Firmware>>>,
+    state: DeviceLock,
+    /// Re-boots a cold firmware after a resume from disk ([`Self::restore_after_hibernation`]).
+    #[pin]
+    restore: Work<Shared, RESTORE_WORK>,
+    /// When the thaw that queued [`Self::restore`] began, in ns.
+    restore_ns: AtomicU64,
     /// M5: the CPU frequency ceiling the thermal governor shares the SoC's heat with, and the
     /// fan boost. Never taken with `state` held.
     #[pin]
@@ -1381,6 +1815,15 @@ impl WorkItem<POLL_WORK> for Shared {
         }
     }
 }
+impl_has_work! {
+    impl HasWork<Shared, RESTORE_WORK> for Shared { self.restore }
+}
+impl WorkItem<RESTORE_WORK> for Shared {
+    type Pointer = Arc<Shared>;
+    fn run(this: Arc<Shared>) {
+        this.restore_after_hibernation();
+    }
+}
 impl WorkItem<IDLE_WORK> for Shared {
     type Pointer = Arc<Shared>;
     fn run(this: Arc<Shared>) {
@@ -1406,6 +1849,289 @@ impl Shared {
         // the reference-slot mutex held.
         let retired = self.drm.lock().take();
         drop(retired);
+    }
+
+    /// Polls [`Firmware::quiescent`] until it holds or `deadline` passes, running event passes
+    /// in between so retirement, releases and teardown progress. Called without the device
+    /// mutex.
+    fn wait_quiescent(self: &Arc<Self>, deadline: u64) -> Result<bool> {
+        loop {
+            {
+                let mut state = self.state.lock();
+                let Some(firmware) = state.as_deref_mut() else {
+                    return Err(ENODEV);
+                };
+                if firmware.quiescent(now_ns())? {
+                    return Ok(true);
+                }
+            }
+            if self.crashed.load(Ordering::Acquire) {
+                return Err(ENODEV);
+            }
+            if now_ns() >= deadline {
+                return Ok(false);
+            }
+            self.queue_events();
+            fsleep(Delta::from_millis(HIBERNATE_DRAIN_POLL_MS));
+        }
+    }
+
+    /// Reopens publication after a freeze that did not complete, or after a thaw. A builder
+    /// that did not leave the closed gate keeps it closed; as for a recovery that cannot join
+    /// its builders, the device is then lost.
+    fn reopen_after_freeze(self: &Arc<Self>) {
+        if self.preparations.reopen() {
+            self.queue_events();
+            return;
+        }
+        let deadline = now_ns().saturating_add(HIBERNATE_REOPEN_NS);
+        if self.preparations.wait_drained_until(deadline).is_ok() && self.preparations.reopen() {
+            self.queue_events();
+            return;
+        }
+        if !self.crashed.load(Ordering::Acquire) {
+            dev_err!(
+                self.dev.as_ref(),
+                "GPU submission could not be reopened after hibernation\n"
+            );
+            self.lose_device_quietly();
+        }
+    }
+
+    /// `PM_HIBERNATION_PREPARE`: drains the GPU so that the image holds no submission in
+    /// execution, or refuses the hibernation with `EBUSY`.
+    ///
+    /// Submitted work first retires with publication open (a render can need a grow reply,
+    /// which is published through a preparation lease). Publication is then closed: the
+    /// preparation gate makes every off-lock builder and publisher wait, as during a firmware
+    /// recovery, and the closure is confirmed under the device mutex. The gate stays closed in
+    /// the image; [`Self::thaw_after_hibernation`] reopens it. The coprocessor is not stopped:
+    /// an aborted hibernation, and the image write in this kernel, keep a running firmware.
+    pub(crate) fn freeze_for_hibernation(self: &Arc<Self>) -> Result {
+        // A second hibernation right after a resume: the previous restore finishes first.
+        self.finish_restore();
+        if self.crashed.load(Ordering::Acquire) {
+            dev_info!(self.dev.as_ref(), "GPU lost; hibernating without a drain\n");
+            return Ok(());
+        }
+        {
+            let state = self.state.lock();
+            let firmware = state.as_deref().ok_or(ENODEV)?;
+            if !firmware.init.has_pristine() || firmware.cfg.adopt_root_entries {
+                dev_warn!(
+                    self.dev.as_ref(),
+                    "Refusing hibernation: no cold restore for this GPU session\n"
+                );
+                return Err(EBUSY);
+            }
+        }
+        let started = now_ns();
+        let deadline = started.saturating_add(HIBERNATE_DRAIN_NS);
+        loop {
+            let settled = match self.wait_quiescent(deadline) {
+                Ok(settled) => settled,
+                // Lost while draining: nothing to protect, and nothing is closed yet.
+                Err(_) if self.crashed.load(Ordering::Acquire) => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            if settled {
+                self.preparations.close_for_hibernation();
+                // Every exit from here on either freezes or reopens the gate.
+                match self.confirm_freeze(deadline) {
+                    Ok(true) => {
+                        dev_info!(
+                            self.dev.as_ref(),
+                            "GPU drained for hibernation in {} us\n",
+                            now_ns().saturating_sub(started) / 1000
+                        );
+                        return Ok(());
+                    }
+                    Ok(false) => self.reopen_after_freeze(),
+                    Err(error) => {
+                        self.reopen_after_freeze();
+                        if self.crashed.load(Ordering::Acquire) {
+                            return Ok(());
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            if self.crashed.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            if now_ns() >= deadline {
+                let state = self.state.lock();
+                if let Some(firmware) = state.as_deref() {
+                    firmware.log_busy(self.dev.as_ref());
+                }
+                drop(state);
+                dev_warn!(
+                    self.dev.as_ref(),
+                    "Refusing hibernation: GPU did not go idle in {} ms\n",
+                    HIBERNATE_DRAIN_NS / 1_000_000
+                );
+                return Err(EBUSY);
+            }
+        }
+    }
+
+    /// With publication closed: joins builders and confirms the drain under the device mutex,
+    /// then marks the session frozen and the no-map UAT state stale (the image will not hold
+    /// it). `Ok(false)` if work appeared; the caller reopens the gate on every non-`Ok(true)`.
+    fn confirm_freeze(self: &Arc<Self>, deadline: u64) -> Result<bool> {
+        let settle = now_ns().saturating_add(HIBERNATE_SETTLE_NS).min(deadline);
+        if self.preparations.wait_drained_until(settle).is_err() || !self.wait_quiescent(settle)? {
+            return Ok(false);
+        }
+        let mut state = self.state.lock();
+        let firmware = state.as_deref_mut().ok_or(ENODEV)?;
+        if !firmware.quiescent(now_ns())? {
+            return Ok(false);
+        }
+        firmware.frozen = true;
+        firmware.uat.set_reserved_stale(true);
+        Ok(true)
+    }
+
+    /// `PM_POST_HIBERNATION`, after the PMP restore notifier. A firmware that kept running
+    /// (aborted hibernation, failed image write) only gets its stale-marked UAT state synced
+    /// and publication back. A firmware that the boot loader cold-restarted while this kernel
+    /// was restored from disk is re-booted against the restored host state
+    /// ([`Self::restore_after_hibernation`]) in a work item, so that the notifier, and with it
+    /// the hibernation, returns without waiting for the PMP; the device lock's restore barrier
+    /// ([`DeviceLock`]) keeps every other locker out until the firmware is republished.
+    ///
+    /// On any failure the device is lost: outstanding and future work fails and the firmware
+    /// is not reachable half-published.
+    pub(crate) fn thaw_after_hibernation(self: &Arc<Self>) {
+        let dev_ref = match self.drm() {
+            Ok(dev) => dev,
+            Err(_) => return,
+        };
+        let dev: &AsahiDrmDevice = &dev_ref;
+        if self.crashed.load(Ordering::Acquire) {
+            // Lost: no republish, but the freeze must not outlive the transition, or the
+            // reclaim worker would hold detached mappings forever. The no-map tables stay
+            // marked stale (nothing relinked them); walks keep using the recorded links.
+            if let Some(firmware) = self.state.lock().as_deref_mut() {
+                firmware.frozen = false;
+            }
+            self.preparations.end_hibernation();
+            self.queue_reclaims();
+            return;
+        }
+        let started = now_ns();
+        let mut state = self.state.lock();
+        let Some(firmware) = state.as_deref_mut() else {
+            return;
+        };
+        let frozen = core::mem::replace(&mut firmware.frozen, false);
+        if !frozen {
+            // Not frozen by this device (e.g. the device was lost at the freeze).
+            return;
+        }
+        let result = match firmware.firmware_cold(dev) {
+            Ok(false) => {
+                dev_info!(dev.as_ref(), "GPU firmware kept running; resuming submission\n");
+                // Mappings and contexts changed while the UAT state was marked stale were
+                // tracked host-side only: store them now.
+                firmware
+                    .uat
+                    .relink_after_cold_boot()
+                    .map(|_| firmware.uat.thaw_reserved_state())
+                    .map(|()| false)
+            }
+            Ok(true) => {
+                dev_info!(dev.as_ref(), "GPU firmware cold after resume; re-booting it\n");
+                // Closed before the mutex is dropped: from here until the restore work has
+                // republished the firmware, no other locker gets the device lock.
+                self.state.close_for_restore(&state);
+                self.restore_ns.store(started, Ordering::Relaxed);
+                drop(state);
+                // Not queued yet: every freeze and shutdown flushes it first.
+                let _ = workqueue::system_long().enqueue::<Arc<Self>, RESTORE_WORK>(self.clone());
+                return;
+            }
+            Err(error) => Err(error),
+        };
+        drop(state);
+        self.complete_thaw(dev, runtime::RetiredCompute::new(), result, started);
+    }
+
+    /// The restore work queued by [`Self::thaw_after_hibernation`] for a cold firmware: re-boots
+    /// it under the device lock ([`Firmware::republish_after_cold_boot`]), then opens the
+    /// lock's restore barrier, on success and on failure alike.
+    fn restore_after_hibernation(self: &Arc<Self>) {
+        let started = self.restore_ns.load(Ordering::Relaxed);
+        let mut retired = runtime::RetiredCompute::new();
+        let dev_ref = self.drm();
+        let mut state = self.state.lock_for_restore();
+        let result = match (&dev_ref, state.as_deref_mut()) {
+            (Ok(dev), Some(firmware)) => {
+                let mut reclaim = self.reclaim.lock();
+                let result = firmware
+                    .republish_after_cold_boot(dev, self, &mut retired, &mut reclaim)
+                    .map(|()| true);
+                drop(reclaim);
+                // The notifier's end of the sleep's statistics epoch found the barrier closed
+                // and left it to this work (see `stats::Reader::suspend`).
+                firmware.rings.suspend_statistics(false);
+                result
+            }
+            _ => Err(ENODEV),
+        };
+        self.state.open_after_restore(&state);
+        drop(state);
+        match dev_ref {
+            Ok(dev) => self.complete_thaw(&dev, retired, result, started),
+            // Shutdown flushes this work before it releases the DRM device.
+            Err(_) => self.lose_device_quietly(),
+        }
+    }
+
+    /// The end of a thaw, without the device mutex: destroys the queues the cold firmware
+    /// never knew, and reopens publication, or loses the device on failure. `result` is whether
+    /// the firmware was re-booted.
+    fn complete_thaw(
+        self: &Arc<Self>,
+        dev: &AsahiDrmDevice,
+        retired: runtime::RetiredCompute,
+        result: Result<bool>,
+        started: u64,
+    ) {
+        // Queues the cold firmware never knew are destroyed without the device mutex.
+        let finished = retired.finish(self);
+        let result = result.and_then(|cold| finished.map(|()| cold));
+        match result {
+            Ok(cold) => {
+                if cold {
+                    dev_info!(
+                        dev.as_ref(),
+                        "GPU firmware republished after resume in {} ms\n",
+                        now_ns().saturating_sub(started) / 1_000_000
+                    );
+                }
+                self.reopen_after_freeze();
+                // Teardown held while frozen.
+                self.queue_reclaims();
+            }
+            Err(error) => {
+                dev_err!(
+                    dev.as_ref(),
+                    "GPU firmware republish after resume failed: {:?}; device lost\n",
+                    error
+                );
+                self.lose_device_quietly();
+            }
+        }
+    }
+
+    /// Waits for a queued post-hibernation restore and the end of its thaw. Called before a
+    /// new sleep, freeze or restore begins, and before shutdown.
+    fn finish_restore(&self) {
+        // SAFETY: `restore` is this Shared's initialized pinned work field; flushing waits for
+        // a pending or running callback and leaves the work item usable.
+        unsafe { kernel::bindings::flush_work(Work::raw_get(&self.restore)) };
     }
 
     /// Wakes the waiters for a returned pair, binding or capacity change.
@@ -1479,6 +2205,11 @@ impl Shared {
     }
 
     fn drain_reclaims(self: &Arc<Self>) {
+        // Frozen for hibernation: detached mappings stay until the thaw, which queues this
+        // again; their kernel-VM unmaps would otherwise walk the stale no-map tables.
+        if self.state.lock().as_deref().is_some_and(|firmware| firmware.frozen) {
+            return;
+        }
         let mut reclaimed = false;
         loop {
             let next = self.reclaim.lock().take_one();
@@ -1793,7 +2524,9 @@ impl Gpu {
                 reclaim_work <- new_work!("g17::Shared::reclaim_work"),
                 reclaim <- new_mutex!(reclaim, "g17::Shared::reclaim"),
                 stop <- new_mutex!((), "g17::Shared::stop"),
-                state <- new_mutex!(None, "g17::Shared::state"),
+                state <- DeviceLock::new(),
+                restore <- new_work!("g17::Shared::restore"),
+                restore_ns: AtomicU64::new(0),
                 actuators <- new_mutex!(thermal::Actuators::new(), "g17::Shared::actuators"),
                 changed <- new_condvar!("g17::Shared::changed"),
                 port: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
@@ -2080,6 +2813,8 @@ impl Gpu {
                 governor: thermal::Governor::new(),
                 registration_power_release_pending: false,
                 variant: shared.variant,
+                cfg,
+                frozen: false,
                 queues <- runtime::Registry::with_waiters(
                     shared.clusters,
                     shared.deflake,
@@ -2284,6 +3019,8 @@ impl Gpu {
                 governor: thermal::Governor::new(),
                 registration_power_release_pending: false,
                 variant: shared.variant,
+                cfg,
+                frozen: false,
                 queues <- runtime::Registry::with_waiters(
                     shared.clusters,
                     shared.deflake,
@@ -2303,12 +3040,8 @@ impl Gpu {
             GFP_KERNEL,
         )?;
         let session = &mut *firmware;
-        session.primary.boot()?;
-        if let Some(secondary) = session.secondary.as_mut() {
-            secondary.boot()?;
-        }
-        // The firmware built its root and kernel-window tables while booting.
-        session.uat.invalidate_reserved_tables();
+        // Start the CPUs and let the firmware rebuild its own root/kernel-window tables.
+        session.restart_coprocessors()?;
         let root_entries = match cfg.adopt_root_entries {
             true => Some(session.uat.adopt_firmware_root_entries()?),
             false => None,
@@ -2326,57 +3059,8 @@ impl Gpu {
         if let Some(root_entries) = root_entries {
             session.uat.confirm_firmware_root_entries(root_entries)?;
         }
-        let mailbox: *const Mailbox = &*session.primary.rtkit;
-        session.port.attach(
-            session.init.port_views(mailbox)?,
-            session.bridge.regs.clone(),
-            shared.variant.registration,
-            !shared.variant.m5_commands,
-        )?;
-        session.uat.mirror_secondary_root()?;
-        if cfg.fabric_bridge {
-            session.bridge.regs.enable_g17_gating()?;
-        }
-        let ack = shared.variant.init_ack;
-        let root_va = session.init.root_va(Role::Primary)?;
-        dev_dbg!(
-            dev.as_ref(),
-            "bring-up: initialization data built, publishing root {:#x}\n",
-            root_va
-        );
-        session.primary.init(root_va, ack)?;
-        if ack == fw::variant::InitAck::Status {
-            Self::wait_for_init_accepted(dev, &session.init, &session.primary)?;
-        }
-        dev_dbg!(dev.as_ref(), "bring-up: initialization data accepted\n");
-        if let Some(secondary) = session.secondary.as_mut() {
-            secondary.init(session.init.root_va(Role::Secondary)?, ack)?;
-        }
-        if shared.variant.power_on_done {
-            session.primary.notify(MSG_POWER_ON_DONE)?;
-            if let Some(secondary) = session.secondary.as_mut() {
-                secondary.notify(MSG_POWER_ON_DONE)?;
-            }
-        }
-        if shared.variant.opening_record {
-            Self::wait_for_opening(
-                dev,
-                &session.init,
-                &session.primary,
-                session.secondary.as_ref(),
-            )?;
-            dev_dbg!(dev.as_ref(), "bring-up: opening record retired\n");
-        } else {
-            dev_dbg!(
-                dev.as_ref(),
-                "bring-up: no opening record staged; device-control counters {:?}\n",
-                session.init.control_counters()?
-            );
-        }
-        session
-            .uat
-            .activate_render_context(&session._render_global)?;
-        dev_dbg!(dev.as_ref(), "bring-up: firmware running\n");
+        // The firmware-facing opening handshake is shared with the post-hibernation republish.
+        session.open_firmware(dev, shared)?;
         Ok(firmware)
     }
 
@@ -2437,6 +3121,9 @@ impl Gpu {
 
     /// Stops the firmware and releases everything it used.
     pub(crate) fn shutdown(&self) {
+        // A post-hibernation restore still running ends before anything is torn down; the PM
+        // notifiers that queue it are already unregistered.
+        self.shared.finish_restore();
         self.shared.feed.begin_shutdown();
         self.shared.preparations.remove();
         self.shared.stop_queues();
@@ -2451,6 +3138,13 @@ impl Gpu {
         self.shared.disable_work(&self.shared.reclaim_work);
         self.shared.disable_work(&self.shared.work);
         self.shared.disable_work(&self.shared.feed_work);
+        self.shared.disable_work(&self.shared.restore);
+        // A restore cancelled before it ran leaves the barrier closed: open it, the cold
+        // firmware is lost.
+        let abandoned = self.shared.state.open_after_restore(&self.shared.state.lock_for_restore());
+        if abandoned {
+            self.shared.lose_device_quietly();
+        }
         self.shared.feed.shutdown();
         self.shared.drain_reclaims();
         self.shared.release_drm();

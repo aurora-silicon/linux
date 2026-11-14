@@ -1176,6 +1176,113 @@ impl Registry {
         }
     }
 
+    /// Whether every render pair can be taken over by a cold-restarted firmware (see
+    /// [`Self::reset_render_after_cold_boot`]): none is lent out, under construction, growing
+    /// or carrying work, and no grow reply or free-list release is outstanding.
+    pub(in crate::g17) fn render_cold_ready(&self) -> bool {
+        let render = &self.render;
+        render.grow.reply.is_none()
+            && render.grow.active.is_none()
+            && render.grow.requests.is_empty()
+            && render.entries.iter().flatten().all(|entry| {
+                // borrowed_active is only meaningful while a preparation or growth has the
+                // pair out (see render_in_flight()); it is not cleared on return. Both of
+                // those already block on their own.
+                entry.preparing.is_none()
+                    && !entry.constructing
+                    && !entry.growing
+                    && entry.pending_error.is_none()
+                    && entry.pair.as_ref().is_none_or(|pair| pair.cold_resettable())
+                    && entry.parked.as_ref().is_none_or(|parked| parked.cold_resettable())
+            })
+    }
+
+    /// Logs every render entry that keeps [`Self::render_cold_ready`] false, with the failing
+    /// conditions: entry bits (1 preparing, 2 lent out, 4 constructing, 8 growing, 0x10
+    /// pending error) and the pair's and parked pair's (`Pair::cold_blockers`).
+    pub(in crate::g17) fn log_render_cold_blockers(&self, dev: &kernel::device::Device) {
+        let render = &self.render;
+        if render.grow.reply.is_some() || render.grow.active.is_some() || !render.grow.requests.is_empty() {
+            dev_warn!(dev, "hibernation blocker: render grow reply/active/requests outstanding\n");
+        }
+        for (slot, entry) in render.entries.iter().enumerate() {
+            let Some(entry) = entry.as_ref() else {
+                continue;
+            };
+            let flags = [
+                entry.preparing.is_some(),
+                (entry.preparing.is_some() || entry.growing) && entry.borrowed_active,
+                entry.constructing,
+                entry.growing,
+                entry.pending_error.is_some(),
+            ]
+            .iter()
+            .enumerate()
+            .fold(0u32, |bits, (bit, set)| if *set { bits | 1 << bit } else { bits });
+            let pair = entry.pair.as_ref().map_or(0, |pair| pair.cold_blockers());
+            let parked = entry.parked.as_ref().map_or(0, |parked| u32::from(!parked.cold_resettable()));
+            if flags != 0 || pair != 0 || parked != 0 {
+                dev_warn!(
+                    dev,
+                    "hibernation blocker: render slot {} entry {:#x} pair {:#x} parked {:#x}\n",
+                    slot,
+                    flags,
+                    pair,
+                    parked
+                );
+            }
+        }
+    }
+
+    /// Returns every render pair to a state a cold-restarted firmware can take over, after
+    /// the graph was restored and before any render publication: each pair and parked pair
+    /// is reset to a fresh install in place (`Pair::reset_after_cold_boot`), its context
+    /// pages are rewritten, its completion stamps are seeded with the value of its last
+    /// command and its parameter-buffer descriptor row is restaged. The free-list
+    /// registrations start over, so the next command of each pool stages its page-pool
+    /// descriptor row again; the grow state is cleared. Returns the number of pairs reset.
+    pub(in crate::g17) fn reset_render_after_cold_boot(
+        &mut self,
+        init: &crate::g17::initdata::InitData,
+    ) -> Result<usize> {
+        use core::sync::atomic::Ordering;
+        if !self.render_cold_ready() {
+            return Err(EBUSY);
+        }
+        let render = &mut self.render;
+        let descriptors = init.pb_descriptor_table()?;
+        let mut reset = 0;
+        for entry in render.entries.iter_mut().flatten() {
+            entry.event_masks = [0; 2];
+            entry.missed_event = false;
+            entry.pending_timeout = false;
+            if let Some(context) = entry.context.as_ref() {
+                context.reset_after_cold_boot()?;
+            }
+            if let Some(pair) = entry.pair.as_mut() {
+                pair.context().reset_after_cold_boot()?;
+                pair.reset_after_cold_boot()?;
+                pair.cold_descriptor(descriptors)?;
+                let stamp = pair.cold_stamp();
+                for qid in pair.qids() {
+                    init.stamp(qid)?.store(stamp, Ordering::Relaxed);
+                }
+                reset += 1;
+            }
+            if let Some(parked) = entry.parked.as_mut() {
+                let (qids, stamp) = parked.reset_after_cold_boot()?;
+                for qid in qids {
+                    init.stamp(qid)?.store(stamp, Ordering::Relaxed);
+                }
+                reset += 1;
+            }
+        }
+        render.pools = pools::Pools::new()?;
+        render.grow = grow::Grow::new()?;
+        core::sync::atomic::fence(Ordering::SeqCst);
+        Ok(reset)
+    }
+
     pub(in crate::g17) fn render_in_flight(&self) -> bool {
         self.render.entries.iter().flatten().any(|entry| {
             entry.pair.as_ref().map_or(

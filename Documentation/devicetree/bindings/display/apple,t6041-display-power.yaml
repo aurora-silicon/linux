@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/display/apple,t6041-display-power.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T6040 display power words
+
+maintainers:
+  - František Balázsy <frantisekbalazsy@gmail.com>
+
+description: |
+  The words a T6040 (M4 Pro) display coprocessor's driver writes to lower
+  its power domains after it stops the firmware for a suspend-to-RAM and to
+  raise them again on the wake. A display coprocessor names this node in its
+  apple,display-power property. The words belong to the power manager and
+  the display block, so no driver binds it.
+
+  The internal display coprocessor has its power-state words in the SoC's
+  east power manager block, the external ones in the west block, each at its
+  own offsets; the display PMC word that counts the powered coprocessors is
+  shared by all three. The boot loader publishes one node for the internal
+  coprocessor and one that both external coprocessors name.
+
+properties:
+  compatible:
+    const: apple,t6041-display-power
+
+  reg:
+    items:
+      - description: a register window, named by reg-names
+      - description: a register window, named by reg-names
+
+  reg-names:
+    description:
+      pmc-dcp is the display PMC word that counts the powered coprocessors,
+      ps the power manager block that holds the coprocessors' power-state
+      words. The two may come in either order.
+    oneOf:
+      - items:
+          - const: pmc-dcp
+          - const: ps
+      - items:
+          - const: ps
+          - const: pmc-dcp
+
+required:
+  - compatible
+  - reg
+  - reg-names
+
+additionalProperties: false
+
+examples:
+  - |
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        display-power@5048a9c14 {
+            compatible = "apple,t6041-display-power";
+            reg = <0x5 0x048a9c14 0x0 0x8>,
+                  <0x5 0x02280000 0x0 0x14000>;
+            reg-names = "pmc-dcp", "ps";
+        };
+
+        display-power@502800000 {
+            compatible = "apple,t6041-display-power";
+            reg = <0x5 0x02800000 0x0 0x14000>,
+                  <0x5 0x048a9c14 0x0 0x8>;
+            reg-names = "ps", "pmc-dcp";
+        };
+    };

@@ -1,13 +1,15 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * Apple Silicon DWC3 glue: controller states and the USB2 PHY role choice,
- * kept in a header so that the choice can be tested without the hardware.
+ * Apple Silicon DWC3 glue: controller states, the USB2 PHY role choice and
+ * the decisions of a sleep with the host kept in place, in a header so that
+ * they can be tested without the hardware.
  */
 
 #ifndef __DWC3_APPLE_STATE_H
 #define __DWC3_APPLE_STATE_H
 
 #include <linux/errno.h>
+#include <linux/phy/apple-atc.h>
 #include <linux/phy/phy.h>
 #include <linux/usb/role.h>
 
@@ -49,20 +51,99 @@ static inline int dwc3_apple_usb2_mode_before_reset(enum dwc3_apple_state target
 }
 
 /**
- * dwc3_apple_state_for_role() - state a role asks for while the core is stopped for sleep
+ * dwc3_apple_state_for_role() - state a role asks for while a sleep holds the core
  * @role: the role asked for
+ * @host_only: the controller has no device mode
  *
- * Return: the state to bring the controller up in after the sleep.
+ * Nothing is stopped or started while the sleep lasts, so what dwc3_usb_role_switch_set()
+ * decides for a running controller is decided here: no device mode on a host-only port.
+ *
+ * Return: the state to bring the controller up in once the sleep is over.
  */
-static inline enum dwc3_apple_state dwc3_apple_state_for_role(enum usb_role role)
+static inline enum dwc3_apple_state dwc3_apple_state_for_role(enum usb_role role,
+							      bool host_only)
 {
 	switch (role) {
 	case USB_ROLE_HOST:
 		return DWC3_APPLE_HOST;
 	case USB_ROLE_DEVICE:
-		return DWC3_APPLE_DEVICE;
+		return host_only ? DWC3_APPLE_NO_CABLE : DWC3_APPLE_DEVICE;
 	default:
 		return DWC3_APPLE_NO_CABLE;
+	}
+}
+
+/**
+ * dwc3_apple_sleep_may_keep() - whether a deep sleep may find the host kept in place
+ * @fixed_hub: the controller serves a fixed hub
+ * @phy_restart: a Type-C port whose PHY keeps the host by the core's reset
+ * @state: the controller's state
+ * @shutting_down: the glue is going away
+ * @dead: the core didn't come back from an earlier sleep
+ *
+ * The glue's side of the question. The PHY then has the last word, as only it knows what
+ * runs on the port's lanes (apple_typec_phy_sleep_prepare()).
+ *
+ * Return: true if the PHY is to be asked.
+ */
+static inline bool dwc3_apple_sleep_may_keep(bool fixed_hub, bool phy_restart,
+					     enum dwc3_apple_state state, bool shutting_down,
+					     bool dead)
+{
+	return (fixed_hub || phy_restart) && state == DWC3_APPLE_HOST &&
+	       !shutting_down && !dead;
+}
+
+/**
+ * dwc3_apple_sleep_reads_mark() - whether the core's mark says anything after the sleep
+ * @phy: what the PHY says of the sleep (apple_typec_phy_sleep_result())
+ *
+ * The mark is a value written to a scratch register of the core before the sleep. After an
+ * error the core may be unpowered and must not be read, and a core the PHY took through its
+ * reset has lost the mark whatever the SoC did.
+ *
+ * Return: true if the register may be read and its value counts.
+ */
+static inline bool dwc3_apple_sleep_reads_mark(int phy)
+{
+	return !phy || phy == -EBUSY || phy == APPLE_ATCPHY_SLEEP_POWER_LOST;
+}
+
+/* What the host's resume does after a sleep in place, see dwc3_apple_sleep_wake_plan(). */
+enum dwc3_apple_wake {
+	DWC3_APPLE_WAKE_AS_IS,		/* Nothing was lost: xHCI resumes as usual */
+	DWC3_APPLE_WAKE_RESTORE,	/* The core is set up again, xHCI restores its state */
+	DWC3_APPLE_WAKE_START_OVER,	/* The core is set up again, xHCI starts over */
+	DWC3_APPLE_WAKE_PHY_START_OVER,	/* The same, and the PHY comes back after the core */
+	DWC3_APPLE_WAKE_FAILED,		/* xHCI must not resume, nor anything touch the core */
+};
+
+/**
+ * dwc3_apple_sleep_wake_plan() - what the host's resume does after a sleep in place
+ * @phy: what the PHY says of the sleep (apple_typec_phy_sleep_result())
+ * @core_kept: the core still holds its mark; false where dwc3_apple_sleep_reads_mark()
+ *	       says not to read it
+ *
+ * A sleep refused before the PHY did anything (-EBUSY) left all as it was. A PHY that took
+ * the core through hibernation brings it back with its registers (0), or without them if a
+ * power domain went off under it: xHCI's saved state then still counts unless the core's
+ * always-on side lost power as well. A PHY that held the core in reset says so, and the
+ * host starts over whatever the mark reads.
+ *
+ * Return: the plan.
+ */
+static inline enum dwc3_apple_wake dwc3_apple_sleep_wake_plan(int phy, bool core_kept)
+{
+	switch (phy) {
+	case APPLE_ATCPHY_SLEEP_RESET:
+		return DWC3_APPLE_WAKE_PHY_START_OVER;
+	case APPLE_ATCPHY_SLEEP_POWER_LOST:
+		return core_kept ? DWC3_APPLE_WAKE_AS_IS : DWC3_APPLE_WAKE_START_OVER;
+	case 0:
+	case -EBUSY:
+		return core_kept ? DWC3_APPLE_WAKE_AS_IS : DWC3_APPLE_WAKE_RESTORE;
+	default:
+		return DWC3_APPLE_WAKE_FAILED;
 	}
 }
 

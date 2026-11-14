@@ -3306,6 +3306,41 @@ static int cd321x_reset_inherited_connection(struct tps6598x *tps, u32 *status)
 	return 0;
 }
 
+/*
+ * The controller's system power state S0, and application firmware running: the patch is
+ * loaded if the controller waits for one (@patched, if given, says so). What a probe and a
+ * resume from disk both start from.
+ *
+ * Return: the controller's mode after the check (0 once a patch was loaded), or a negative
+ * error code.
+ */
+static int tipd_start_application(struct tps6598x *tps, bool *patched)
+{
+	int ret;
+
+	if (patched)
+		*patched = false;
+	if (tps->data->switch_power_state) {
+		ret = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
+		if (ret)
+			return ret;
+	}
+
+	ret = tps6598x_check_mode(tps);
+	if (ret < 0)
+		return ret;
+
+	if (ret == TPS_MODE_PTCH) {
+		if (patched)
+			*patched = true;
+		ret = tps->data->init(tps);
+		if (ret)
+			return ret;
+	}
+
+	return ret;
+}
+
 int tipd_init(struct tps6598x *tps)
 {
 	struct fwnode_handle *fwnode;
@@ -3332,23 +3367,9 @@ int tipd_init(struct tps6598x *tps)
 		}
 	}
 
-	if (tps->data->switch_power_state) {
-		ret = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
-		if (ret)
-			return ret;
-	}
-
-	/* Make sure the controller has application firmware running */
-	ret = tps6598x_check_mode(tps);
+	ret = tipd_start_application(tps, &patch_loaded);
 	if (ret < 0)
 		return ret;
-
-	if (ret == TPS_MODE_PTCH) {
-		patch_loaded = true;
-		ret = tps->data->init(tps);
-		if (ret)
-			return ret;
-	}
 
 	/*
 	 * A controller found in "DBMa" is used as it is. Nothing below issues a
@@ -3630,6 +3651,24 @@ int tipd_suspend(struct tps6598x *tps)
 }
 EXPORT_SYMBOL_GPL(tipd_suspend);
 
+/* Give back what tipd_suspend() took: the interrupt, the reset line, the poll. */
+static void tipd_resume_events(struct tps6598x *tps)
+{
+	if (tps->wakeup) {
+		if (!tps->sleep_event) {
+			disable_irq_wake(tps->irq);
+			enable_irq(tps->irq);
+		}
+	} else if (tps->reset) {
+		gpiod_set_value_cansleep(tps->reset, 0);
+		msleep(TPS_SETUP_MS);
+	}
+
+	if (!tps->irq)
+		queue_delayed_work(system_power_efficient_wq, &tps->wq_poll,
+				   msecs_to_jiffies(POLL_INTERVAL));
+}
+
 int tipd_resume(struct tps6598x *tps)
 {
 	int ret;
@@ -3647,23 +3686,60 @@ int tipd_resume(struct tps6598x *tps)
 			return ret;
 	}
 
-	if (tps->wakeup) {
-		if (!tps->sleep_event) {
-			disable_irq_wake(tps->irq);
-			enable_irq(tps->irq);
-		}
-	} else if (tps->reset) {
-		gpiod_set_value_cansleep(tps->reset, 0);
-		msleep(TPS_SETUP_MS);
-	}
-
-	if (!tps->irq)
-		queue_delayed_work(system_power_efficient_wq, &tps->wq_poll,
-				   msecs_to_jiffies(POLL_INTERVAL));
+	tipd_resume_events(tps);
 
 	return 0;
 }
 EXPORT_SYMBOL_GPL(tipd_resume);
+
+/*
+ * Bring a controller that went through a cold boot (a resume from disk) back
+ * to the state its probe leaves it in, without registering anything again:
+ * system power state S0, application firmware running (patch loaded if it
+ * waits for one) and the interrupt mask the driver uses. The image was made
+ * after tipd_suspend(), so what that took is given back as in tipd_resume().
+ * The port state is read afresh by the revalidation that follows.
+ */
+int tipd_reinit_after_cold_boot(struct tps6598x *tps)
+{
+	int ret;
+
+	ret = tipd_start_application(tps, NULL);
+	if (ret < 0)
+		return ret;
+	ret = tps6598x_write64(tps, TPS_REG_INT_MASK1, cd321x_irq_mask(tps));
+	if (ret)
+		return ret;
+
+	tipd_resume_events(tps);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(tipd_reinit_after_cold_boot);
+
+/*
+ * Look the connector's USB role switch up again. After a resume from disk the
+ * USB controller that provides it was bound again, which registered a new
+ * switch; the old one is unregistered and only refuses requests.
+ */
+int tipd_refresh_role_switch(struct tps6598x *tps)
+{
+	struct fwnode_handle *fwnode;
+	struct usb_role_switch *sw, *old;
+
+	fwnode = device_get_named_child_node(tps->dev, "connector");
+	sw = fwnode_usb_role_switch_get(fwnode);
+	fwnode_handle_put(fwnode);
+	if (IS_ERR(sw))
+		return PTR_ERR(sw);
+	scoped_guard(mutex, &tps->lock) {
+		old = tps->role_sw;
+		tps->role_sw = sw;
+	}
+	usb_role_switch_put(old);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(tipd_refresh_role_switch);
 
 /* Freezable cable work has drained before device PM calls prepare. */
 int tipd_prepare(struct device *dev)

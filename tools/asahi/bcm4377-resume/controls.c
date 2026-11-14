@@ -1,9 +1,116 @@
 // SPDX-License-Identifier: GPL-2.0-only
 static bool timeout_during_resume;
-static int hci_resume_sync(struct hci_dev *h) { if(timeout_during_resume)hci_cmd_timeout(&h->cmd_timer.work);return resume_error; }
+static int resume_frames;
+static char bars[2];
+
+static int send(struct hci_dev *h, int type)
+{
+	unsigned char data[4] = {};
+	struct sk_buff skb = { .pkt_type = type, .data = data, .len = sizeof(data) };
+
+	return bcm4377_hci_send_frame(h, &skb);
+}
+
+/*
+ * The core resumes a controller it marked suspended, once: it sends its resume commands
+ * through the driver and carries on after one that fails.
+ */
+static int hci_resume_sync(struct hci_dev *h)
+{
+	int i;
+
+	if (!h->suspended)
+		return 0;
+	h->suspended = false;
+	if (timeout_during_resume)
+		hci_cmd_timeout(&h->cmd_timer.work);
+	for (i = 0; i < resume_frames; i++)
+		send(h, HCI_COMMAND_PKT);
+	return resume_error;
+}
+
+/*
+ * The sleep control register answers through BAR0. The firmware's status words are only
+ * there through the windows the driver sets, never through the ones a sleep reset.
+ */
+static int ioread32(void *addr)
+{
+	struct bcm4377_data *b = active;
+	char *vars = b->bar2 + b->hw->bar2_offset;
+
+	if (addr == b->bar0 + BCM4377_BAR0_SLEEP_CONTROL)
+		return 0;
+	assert(!memcmp(cfg, cfg_probe, sizeof(cfg)));
+	if (addr == vars + BCM4377_BAR2_BOOTSTAGE)
+		return fw_bootstage;
+	assert(addr == vars + BCM4377_BAR2_RTI_STATUS);
+	return fw_rti_status;
+}
+
+/* What probe leaves in the function's private windows. */
+static void probe_cfg(struct bcm4377_data *b)
+{
+	memset(cfg, 0, sizeof(cfg));
+	assert(!bcm4377_init_cfg(b));
+	memcpy(cfg_probe, cfg, sizeof(cfg));
+	cfg_reads = 0;
+	cfg_writes = 0;
+}
+
+/* A sleep that takes the function's power: a J616s reads window 1 as 0x19328000 after it. */
+static void power_loss(void)
+{
+	memset(cfg, 0, sizeof(cfg));
+	cfg[BCM4377_PCIECFG_BAR0_WINDOW1 / 4] = 0x19328000;
+	fw_bootstage = 0;
+	fw_rti_status = 0;
+}
+
+static int cold_cycle(struct device *dev)
+{
+	assert(!bcm4377_suspend(dev));
+	power_loss();
+	return bcm4377_resume(dev);
+}
+
+static void j616s(struct bcm4377_hw *hw, struct bcm4377_data *b)
+{
+	board_j493 = false;
+	board_j616s = true;
+	*hw = bcm4377_hw_variants[BCM4388];
+	probe_cfg(b);
+}
+
+static int power_on(struct hci_dev *h)
+{
+	int ret;
+
+	req_locked = true;
+	ret = hci_dev_open_sync(h);
+	req_locked = false;
+	return ret;
+}
+
 static int hci_dev_close_sync(struct hci_dev *h) {assert(req_locked);h->flags&=~HCI_UP;return bcm4377_hci_close(h);}
 static int hci_dev_open_sync(struct hci_dev *h) {assert(req_locked);int e=bcm4377_hci_open(h);if(!e)e=bcm4377_hci_post_init(h);if(!e)h->flags|=HCI_UP;return e;}
 static void deliver_work(struct bcm4377_data *b) {if(b->resume_work.queued){b->resume_work.queued=0;bcm4377_resume_recovery_work(&b->resume_work);}}
+
+/* The work that resumes the core after the open that booted the firmware. */
+static void deliver_hci_resume(struct bcm4377_data *b)
+{
+	if (b->hci_resume_work.queued) {
+		b->hci_resume_work.queued = 0;
+		bcm4377_hci_resume_work(&b->hci_resume_work);
+	}
+}
+
+/* The whole recovery a cold resume queued: reset, open, then the core's resume. */
+static void cold_recover(struct bcm4377_data *b)
+{
+	deliver_work(b);
+	run_request(b->hdev);
+	deliver_hci_resume(b);
+}
 static void resume_cycle(struct device *dev) {assert(!bcm4377_suspend(dev));assert(!bcm4377_resume(dev));}
 static void recover(struct bcm4377_data *b) {hci_cmd_timeout(&b->hdev->cmd_timer.work);deliver_work(b);run_request(b->hdev);}
 static void *active_callback(void *data) {run_request(data);return NULL;}
@@ -13,6 +120,9 @@ int main(int argc,char **argv) {
  struct bcm4377_hw hw=bcm4377_hw_variants[BCM4378];struct pci_dev pci={};
  struct bcm4377_data b={.hw=&hw,.pdev=&pci};struct hci_dev h={.data=&b,.flags=HCI_UP|HCI_RUNNING};b.hdev=&h;active=&b;pci.data=&b;struct device dev={.pci=&pci};pthread_mutex_init(&b.resume_lock,NULL);if(bcm4377_resume_recovery_supported(&b))h.reset=bcm4377_hci_timeout;
  bdaddr_t own={{2,3,4,5,6,7}},setup={{8,9,10,11,12,13}},pub={{14,15,16,17,18,19}};b.bdaddr=own;h.setup_addr=setup;h.public_addr=pub;
+	b.bar0 = bars;
+	b.bar2 = bars + 1;
+	probe_cfg(&b);
  switch(atoi(argv[1])) {
  case 0: resume_cycle(&dev);recover(&b);assert(reset_count==1&&cal_count==1&&ptb_count==1&&addr_count==1&&!bacmp(&h.bdaddr,&own)&&(h.flags&HCI_UP)&&!b.cal_needed);break;
  case 1: timeout_during_resume=true;resume_cycle(&dev);deliver_work(&b);run_request(&h);assert(reset_count==1);break;
@@ -108,11 +218,348 @@ int main(int argc,char **argv) {
 		recover(&b);
 		assert(rebind_count == 1);
 		break;
+	/*
+	 * J616s: the BCM4388 is back from the sleep with its windows reset and no firmware.
+	 * Nothing is sent to it: the resume queues the recovery, once, and leaves the core
+	 * suspended. The core resumes after the open that booted the firmware.
+	 */
+	case 46:
+		j616s(&hw, &b);
+		resume_frames = 2;
+		assert(!cold_cycle(&dev));
+		assert(!unquiesces && !b.quiesced);
+		assert(b.needs_reset && b.resume_cold && !memcmp(cfg, cfg_probe, sizeof(cfg)));
+		assert(!h.stat.err_tx && !h.stat.cmd_tx && !enqueued && !skbs_freed);
+		assert(h.suspended && b.hci_resume_owed && !b.hci_resume_work.queues);
+		assert(b.resume_work.queues == 1 && !reset_count && !request.fn);
+		hci_cmd_timeout(&h.cmd_timer.work);
+		assert(b.resume_work.queues == 1);
+		deliver_work(&b);
+		run_request(&h);
+		assert(reset_count == 1 && cal_count == 1 && ptb_count == 1 && addr_count == 1);
+		assert(!bacmp(&h.bdaddr, &own) && (h.flags & HCI_UP) && !b.cal_needed);
+		assert(!b.needs_reset && !b.resume_cold);
+		assert(h.suspended && b.hci_resume_owed && !enqueued);
+		assert(b.hci_resume_work.queues == 1);
+		deliver_hci_resume(&b);
+		assert(!h.suspended && !b.hci_resume_owed);
+		assert(enqueued == 2 && skbs_freed == 2 && !h.stat.err_tx);
+		assert(!send(&h, HCI_COMMAND_PKT) && enqueued == 3 && skbs_freed == 3);
+		recover(&b);
+		assert(reset_count == 1 && b.hci_resume_work.queues == 1);
+		break;
+	/* A cold resume succeeds whatever the core's resume returns; a warm one reports it. */
+	case 47:
+		j616s(&hw, &b);
+		resume_error = -EIO;
+		assert(!cold_cycle(&dev));
+		assert(b.resume_work.queues == 1);
+		cold_recover(&b);
+		assert(reset_count == 1 && (h.flags & HCI_UP) && !h.suspended);
+		assert(!bcm4377_suspend(&dev));
+		assert(bcm4377_resume(&dev) == -EIO);
+		assert(unquiesces == 1 && !b.resume_cold && b.resume_work.queues == 1);
+		break;
+	/*
+	 * A controller that was not powered gets no recovery and was never suspended: its
+	 * next open resets the function, and the core has nothing to resume after it.
+	 */
+	case 48:
+		j616s(&hw, &b);
+		h.flags = 0;
+		resume_frames = 2;
+		assert(!cold_cycle(&dev));
+		assert(b.needs_reset && b.resume_cold);
+		assert(!unquiesces && !b.resume_work.queues && !b.hci_resume_owed);
+		recover(&b);
+		assert(!reset_count && send(&h, HCI_COMMAND_PKT) == -ENODEV);
+		assert(!power_on(&h));
+		assert(reset_count == 1 && cal_count == 1 && addr_count == 1 && (h.flags & HCI_UP));
+		assert(!b.hci_resume_work.queues);
+		assert(!b.resume_cold && !send(&h, HCI_COMMAND_PKT) && enqueued == 1);
+		break;
+	/* A command timeout in the core's resume after the reset starts no second recovery. */
+	case 49:
+		j616s(&hw, &b);
+		timeout_during_resume = true;
+		assert(!cold_cycle(&dev));
+		assert(b.resume_work.queues == 1);
+		cold_recover(&b);
+		assert(reset_count == 1 && !b.resume_cold && !h.suspended);
+		assert(b.resume_work.queues == 1);
+		recover(&b);
+		assert(reset_count == 1);
+		break;
+	/* Windows the sleep reset over a firmware that still runs: put back, then as before. */
+	case 50:
+		j616s(&hw, &b);
+		resume_frames = 2;
+		assert(!bcm4377_suspend(&dev));
+		power_loss();
+		fw_bootstage = 2;
+		fw_rti_status = 2;
+		assert(!bcm4377_resume(&dev));
+		assert(unquiesces == 1 && !misdirected && !b.needs_reset && !b.resume_cold);
+		assert(!b.resume_work.queues && enqueued == 2 && !h.stat.err_tx);
+		assert(!h.suspended && !b.hci_resume_owed);
+		recover(&b);
+		assert(reset_count == 1 && !b.hci_resume_work.queues);
+		break;
+	/* Windows the sleep left alone: nothing is written, resume and recovery as before. */
+	case 51:
+		j616s(&hw, &b);
+		resume_frames = 2;
+		resume_cycle(&dev);
+		assert(!cfg_writes && unquiesces == 1 && !b.needs_reset && !b.resume_cold);
+		assert(!b.resume_work.queues && enqueued == 2 && !h.stat.err_tx);
+		recover(&b);
+		assert(reset_count == 1 && cal_count == 1 && addr_count == 1);
+		break;
+	/* Either status word alone says no firmware runs, and each such sleep is recovered. */
+	case 52:
+		j616s(&hw, &b);
+		assert(!bcm4377_suspend(&dev));
+		power_loss();
+		fw_bootstage = 2;
+		assert(!bcm4377_resume(&dev));
+		assert(b.resume_cold && !unquiesces);
+		cold_recover(&b);
+		assert(!bcm4377_suspend(&dev));
+		power_loss();
+		fw_rti_status = 2;
+		assert(!bcm4377_resume(&dev));
+		assert(b.resume_cold && !unquiesces);
+		cold_recover(&b);
+		assert(reset_count == 2 && cal_count == 2 && addr_count == 2);
+		assert(b.resume_work.queues == 2 && !b.resume_cold);
+		assert(b.hci_resume_work.queues == 2 && !h.suspended);
+		break;
+	/* The J493 pair takes the same path. */
+	case 53:
+		resume_frames = 2;
+		assert(!cold_cycle(&dev));
+		assert(!unquiesces && b.resume_cold && b.resume_work.queues == 1);
+		assert(!h.stat.err_tx && !enqueued);
+		cold_recover(&b);
+		assert(reset_count == 1 && cal_count == 1 && ptb_count == 1 && addr_count == 1);
+		assert((h.flags & HCI_UP) && !b.resume_cold);
+		assert(enqueued == 2 && !h.suspended);
+		break;
+	/* Any other chip and board pair is not looked at: its resume is the one before. */
+	case 54:
+		hw = bcm4377_hw_variants[BCM4388];
+		probe_cfg(&b);
+		assert(!cold_cycle(&dev));
+		assert(!cfg_reads && !cfg_writes && unquiesces == 1);
+		assert(!b.needs_reset && !b.resume_cold && !send(&h, HCI_COMMAND_PKT));
+		board_j493 = false;
+		board_j616s = true;
+		hw = bcm4377_hw_variants[BCM4378];
+		probe_cfg(&b);
+		assert(!cold_cycle(&dev));
+		assert(!cfg_reads && !cfg_writes && unquiesces == 2);
+		assert(!b.needs_reset && !b.resume_cold && !send(&h, HCI_COMMAND_PKT));
+		recover(&b);
+		assert(!reset_count && !b.resume_work.queues && !b.hci_resume_work.queues);
+		break;
+	/* Windows that cannot be written back: no status word is read, the function is reset. */
+	case 55:
+		j616s(&hw, &b);
+		assert(!bcm4377_suspend(&dev));
+		power_loss();
+		cfg_error = -EIO;
+		assert(!bcm4377_resume(&dev));
+		cfg_error = 0;
+		assert(!unquiesces && b.needs_reset && b.resume_cold && b.resume_work.queues == 1);
+		cold_recover(&b);
+		assert(reset_count == 1 && !b.resume_cold && !h.suspended);
+		break;
+	/* The next suspend fences the recovery a cold resume queued, as work and as request. */
+	case 56:
+		j616s(&hw, &b);
+		assert(!cold_cycle(&dev));
+		assert(b.resume_work.queued);
+		assert(!cold_cycle(&dev));
+		assert(!request.fn && b.resume_work.queues == 2);
+		deliver_work(&b);
+		assert(request.fn);
+		assert(!cold_cycle(&dev));
+		assert(!request.fn && b.resume_work.queues == 3 && quiesces == 3 && !unquiesces);
+		assert(!reset_count && b.resume_cold && b.hci_resume_owed && h.suspended);
+		cold_recover(&b);
+		assert(reset_count == 1 && !b.resume_cold && (h.flags & HCI_UP));
+		assert(b.hci_resume_work.queues == 1 && !h.suspended && !b.hci_resume_owed);
+		break;
+	/*
+	 * A power-off before the queued recovery runs invalidates it; the next open resets,
+	 * and the core resumes after that open.
+	 */
+	case 57:
+		j616s(&hw, &b);
+		resume_frames = 2;
+		assert(!cold_cycle(&dev));
+		deliver_work(&b);
+		assert(request.fn);
+		h.flags &= ~HCI_UP;
+		bcm4377_hci_close(&h);
+		run_request(&h);
+		assert(!reset_count && b.resume_cold && b.needs_reset);
+		assert(b.hci_resume_owed && h.suspended && !b.hci_resume_work.queues);
+		assert(!power_on(&h));
+		assert(reset_count == 1 && !b.resume_cold && (h.flags & HCI_UP));
+		assert(b.hci_resume_work.queues == 1 && !enqueued);
+		deliver_hci_resume(&b);
+		assert(enqueued == 2 && !h.stat.err_tx && !h.suspended && !b.hci_resume_owed);
+		break;
+	/* The send callback: each frame reaches its ring, and none does while cold. */
+	case 58:
+		j616s(&hw, &b);
+		assert(!send(&h, HCI_COMMAND_PKT) && enqueued_ring == &b.hci_h2d_ring);
+		assert(!send(&h, HCI_ACLDATA_PKT) && enqueued_ring == &b.acl_h2d_ring);
+		assert(!send(&h, HCI_SCODATA_PKT) && enqueued_ring == &b.sco_h2d_ring);
+		assert(enqueued == 3 && skbs_freed == 3 && h.stat.byte_tx == 12 && !h.stat.err_tx);
+		assert(h.stat.cmd_tx == 1 && h.stat.acl_tx == 1 && h.stat.sco_tx == 1);
+		assert(!cold_cycle(&dev));
+		assert(send(&h, HCI_COMMAND_PKT) == -ENODEV);
+		assert(send(&h, HCI_ACLDATA_PKT) == -ENODEV);
+		assert(send(&h, HCI_SCODATA_PKT) == -ENODEV);
+		/* The core frees a frame the driver refused. */
+		assert(enqueued == 3 && skbs_freed == 3 && h.stat.byte_tx == 12);
+		assert(h.stat.err_tx == 3 && h.stat.cmd_tx == 1 && h.stat.acl_tx == 1);
+		assert(h.stat.sco_tx == 1);
+		cold_recover(&b);
+		assert(!send(&h, HCI_COMMAND_PKT) && enqueued == 4 && skbs_freed == 4);
+		break;
+	/*
+	 * A reset that fails leaves the function cold, the controller down and the core
+	 * suspended; the open that succeeds ends all three.
+	 */
+	case 59:
+		j616s(&hw, &b);
+		resume_frames = 2;
+		assert(!cold_cycle(&dev));
+		reset_error = -EIO;
+		cold_recover(&b);
+		assert(reset_count == 1 && !(h.flags & HCI_UP) && b.needs_reset && b.resume_cold);
+		assert(b.hci_resume_owed && h.suspended && !b.hci_resume_work.queues);
+		reset_error = 0;
+		assert(!power_on(&h));
+		assert(reset_count == 2 && !b.resume_cold && (h.flags & HCI_UP));
+		assert(b.hci_resume_work.queues == 1 && !enqueued && !h.stat.err_tx);
+		deliver_hci_resume(&b);
+		assert(enqueued == 2 && !h.stat.err_tx && !h.suspended && !b.hci_resume_owed);
+		assert(!send(&h, HCI_COMMAND_PKT));
+		break;
+	/* Armed for wake: no QUIESCE went out, and the cold resume is the same. */
+	case 60:
+		j616s(&hw, &b);
+		fixture_wakeup = true;
+		assert(!cold_cycle(&dev));
+		assert(!quiesces && !unquiesces && !b.wake_armed);
+		assert(b.resume_cold && b.resume_work.queues == 1);
+		cold_recover(&b);
+		assert(reset_count == 1 && !b.resume_cold && !h.suspended);
+		break;
+	/* A sleep that leaves the windows alone does not end the cold state an earlier one left. */
+	case 61:
+		j616s(&hw, &b);
+		assert(!cold_cycle(&dev));
+		assert(b.resume_work.queued);
+		resume_cycle(&dev);
+		assert(b.resume_cold && b.needs_reset && !unquiesces);
+		assert(b.resume_work.queues == 2);
+		cold_recover(&b);
+		assert(reset_count == 1 && !b.resume_cold && (h.flags & HCI_UP));
+		assert(!h.suspended && !b.hci_resume_owed);
+		break;
+	/* A setup retry the suspend held back is queued again by a cold resume too. */
+	case 62:
+		j616s(&hw, &b);
+		h.flags = HCI_SETUP | HCI_AUTO_OFF;
+		cal_failures = 1;
+		assert(bcm4377_hci_setup(&h) == -ETIMEDOUT);
+		bcm4377_hci_close(&h);
+		assert(b.setup_retry_pending && b.setup_retry_work.work.queued);
+		assert(!cold_cycle(&dev));
+		assert(b.resume_cold && !b.resume_work.queues && !b.hci_resume_owed);
+		assert(b.setup_retry_pending && b.setup_retry_work.work.queued);
+		break;
+	/*
+	 * A controller powered off between the reset and the core's resume keeps its turn:
+	 * the core resumes after the next open, which needs no reset.
+	 */
+	case 63:
+		j616s(&hw, &b);
+		resume_frames = 2;
+		assert(!cold_cycle(&dev));
+		deliver_work(&b);
+		run_request(&h);
+		assert(reset_count == 1 && b.hci_resume_work.queued);
+		h.flags &= ~HCI_UP;
+		bcm4377_hci_close(&h);
+		deliver_hci_resume(&b);
+		assert(h.suspended && b.hci_resume_owed && !enqueued && !h.stat.err_tx);
+		assert(!power_on(&h));
+		assert(reset_count == 1 && b.hci_resume_work.queues == 2);
+		deliver_hci_resume(&b);
+		assert(enqueued == 2 && !h.stat.err_tx && !h.suspended && !b.hci_resume_owed);
+		assert(!power_on(&h));
+		assert(b.hci_resume_work.queues == 2);
+		break;
+	/*
+	 * The next suspend fences a queued resume of the core, so it cannot run against the
+	 * function the next sleep leaves cold: it follows that sleep's reset.
+	 */
+	case 64:
+		j616s(&hw, &b);
+		resume_frames = 2;
+		assert(!cold_cycle(&dev));
+		deliver_work(&b);
+		run_request(&h);
+		assert(reset_count == 1 && b.hci_resume_work.queued);
+		assert(!cold_cycle(&dev));
+		assert(!b.hci_resume_work.queued && b.hci_resume_owed && h.suspended);
+		assert(!enqueued && !h.stat.err_tx);
+		cold_recover(&b);
+		assert(reset_count == 2 && enqueued == 2 && !h.stat.err_tx);
+		assert(!h.suspended && !b.hci_resume_owed);
+		break;
+	/* After the reset, a sleep that keeps the firmware resumes the core itself. */
+	case 65:
+		j616s(&hw, &b);
+		resume_frames = 2;
+		assert(!cold_cycle(&dev));
+		deliver_work(&b);
+		run_request(&h);
+		assert(reset_count == 1 && b.hci_resume_work.queued);
+		resume_cycle(&dev);
+		assert(unquiesces == 1 && !b.hci_resume_work.queued);
+		assert(enqueued == 2 && !h.stat.err_tx && !h.suspended && !b.hci_resume_owed);
+		break;
+	/* An open that ends behind the suspend fence queues nothing; the resume does it. */
+	case 66:
+		j616s(&hw, &b);
+		resume_frames = 2;
+		assert(!cold_cycle(&dev));
+		deliver_work(&b);
+		h.flags &= ~HCI_UP;
+		bcm4377_hci_close(&h);
+		run_request(&h);
+		assert(!bcm4377_suspend(&dev));
+		assert(!power_on(&h));
+		assert(reset_count == 1 && !b.resume_cold && (h.flags & HCI_UP));
+		assert(b.hci_resume_owed && !b.hci_resume_work.queues && !enqueued);
+		assert(!bcm4377_resume(&dev));
+		assert(unquiesces == 1 && enqueued == 2 && !h.stat.err_tx);
+		assert(!h.suspended && !b.hci_resume_owed && !b.hci_resume_work.queues);
+		break;
  default:abort();
  }
 	if (atoi(argv[1]) == 6 || atoi(argv[1]) == 44 || atoi(argv[1]) == 45)
 		assert(rebind_count == 1);
 	else
 		assert(!rebind_count);
+	/* Every queued resume of the core was delivered or fenced. */
+	assert(!b.hci_resume_work.queued);
  assert(!request.fn);printf("case %s passed\n",argv[1]);return 0;
 }

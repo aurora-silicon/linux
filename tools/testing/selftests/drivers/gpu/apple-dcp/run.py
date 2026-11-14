@@ -154,6 +154,9 @@ def main():
                           '#define iomfb_is_m4(...) false\n'
                           '#define iomfb_m4_get_mode(...) (-95)\n'
                           '#define iomfb_m4_blank(...) (-95)\n')
+                # No fixture here resumes from disk: the firmware restart gates nothing.
+                prefix += ('#define dcp_hib_gated(...) false\n'
+                           '#define dcp_hib_tx_gated(...) false\n')
                 if 'dcp_fail_stop(' in unit:
                     # Firmware 27 fail-stops like H17P; no fixture here runs firmware 27.
                     prefix += ('struct apple_dcp;\n'

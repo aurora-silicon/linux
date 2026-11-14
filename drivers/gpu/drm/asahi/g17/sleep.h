@@ -9,6 +9,7 @@ struct asahi_g17_commit;
 struct device;
 
 int asahi_g17_pmp_request(struct device *dev, bool enable);
+int asahi_pmp_report_wait_handed(unsigned int timeout_ms);
 struct asahi_g17_commit *asahi_g17_commit_prepare(struct device *dev,
 						  struct apple_rtkit *primary_rtk,
 						  struct apple_mbox *primary_mbox,

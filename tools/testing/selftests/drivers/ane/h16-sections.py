@@ -17,9 +17,17 @@ derives them from the HWX alone:
 - operation: one record whose BAR references bind every slot the task
   stream references. A slot takes its base from the program descriptor
   qword at +0x10 * (slot + 1); a surface base binds that surface's buffer
-  ID, the __DATA base binds the scratch ID, the __KERN_0 base binds the
-  kernel resource index 1007, and a zero base (a config-word slot) stays
-  unbound.
+  ID, the __DATA base binds the scratch ID, and a zero base (a config-word
+  slot) stays unbound. Index 1007 names what LOAD slot 1 carries: the one
+  __KERN_0 section of a program in the slot-1 kernel form, otherwise the
+  __TEXT,__const constants (BAR slot 1).
+- kernel buffers: a program whose kernel data are split over __KERN_0..n,
+  or whose stream reads both a kernel section and the constants, needs a
+  base per section. Its generic section lists every kernel section after
+  the surfaces and the scratch, as an input of the section size with the
+  next input IDs, each kernel base binds its ID, slot 1 carries the
+  constants and the constants base binds 1007. The kernel decides the form
+  from the generic section alone.
 - procedure: the fixed one-procedure form.
 - text properties: one segment covering the whole __TEXT,__text stream,
   with one block per task.
@@ -28,11 +36,15 @@ The section layouts follow libane's section builder (omarchy-ane, MIT,
 Copyright 2026 Joshua Warren) and the H16/H17 program facts; the kernel
 validates the generic section against the HWX before LOAD.
 
-  h16-sections.py --hwx program.hwx --out-dir DIR
+  h16-sections.py --hwx program.hwx --out-dir DIR [--no-constants-ref]
+
+--no-constants-ref leaves BAR slot 1 (__TEXT,__const) unbound in a program
+without kernel data, as earlier versions of this tool did.
 """
 
 import argparse
 import pathlib
+import re
 import struct
 import sys
 
@@ -73,7 +85,8 @@ def parse(hwx):
     """Surfaces in segment order, the text and kernel sections, the program descriptor."""
     if len(hwx) < 32 or u32(hwx, 0) != 0xbeefface or u32(hwx, 8) not in PROLOGUE:
         raise HwxError("not an H16G or H17 HWX")
-    surfaces, text, kernel, scratch, descriptor, tensors = [], None, None, None, None, {}
+    surfaces, text, constants, scratch, descriptor, tensors = [], None, None, None, None, {}
+    kernels = []
     pos = 32
     for _ in range(u32(hwx, 16)):
         cmd, size = u32(hwx, pos), u32(hwx, pos + 4)
@@ -93,8 +106,12 @@ def parse(hwx):
                     surfaces.append({"vm": svm, "allocation": vmsize, "direction": prot})
                 elif segment == "__TEXT" and name == "__text":
                     text = (svm, ssize, soff)
-                elif segment == "__KERN_0" and name == "__kern_0":
-                    kernel = (svm, ssize, soff)
+                elif segment == "__TEXT" and name == "__const":
+                    constants = svm
+                elif (re.fullmatch(r"__KERN_(\d+)", segment) and
+                      name == "__kern_%d" % len(kernels) and
+                      segment == "__KERN_%d" % len(kernels)):
+                    kernels.append((svm, ssize, soff))
                 elif segment == "__DATA" and name == "__bss":
                     if prot != 3:
                         raise HwxError("scratch segment is not read/write")
@@ -120,7 +137,7 @@ def parse(hwx):
         s["span"] = span
     if sum(s["direction"] == 2 for s in surfaces) != 1:
         raise HwxError("an H16 program has exactly one output")
-    return surfaces, text, kernel, scratch, descriptor
+    return surfaces, text, constants, kernels, scratch, descriptor
 
 
 def register_valid(word):
@@ -163,11 +180,17 @@ def walk(stream, prologue):
     return tasks, slots
 
 
-def build(hwx):
+def build(hwx, constants_ref=True):
     """Return the four sections, in H16_LOAD kind order, and the buffer IDs."""
-    surfaces, (text_vm, text_size, text_off), kernel, scratch, descriptor = parse(hwx)
+    surfaces, (text_vm, text_size, text_off), constants, kernels, scratch, descriptor = \
+        parse(hwx)
     stream = hwx[text_off:text_off + text_size]
     tasks, slots = walk(stream, PROLOGUE[u32(hwx, 8)])
+    bases = {slot: u64(hwx, descriptor + 0x10 * (slot + 1)) for slot in slots}
+    kernel_bases = [k[0] for k in kernels]
+    # One LOAD slot is one BAR base: several kernel sections, or a kernel
+    # section next to the constants, travel as EXECUTE buffers.
+    kernel_buffers = len(kernels) > 1 or (bool(kernels) and constants in bases.values())
 
     inputs = iter(range(FIRST_OUTPUT_ID + 1, 0x3d))
     for s in surfaces:
@@ -177,6 +200,11 @@ def build(hwx):
     if scratch:
         scratch_id = next(inputs)
         entries.append((scratch_id, 1, scratch[1]))
+    kernel_ids = []
+    if kernel_buffers:
+        for vm, size, _ in kernels:
+            kernel_ids.append(next(inputs))
+            entries.append((kernel_ids[-1], 1, size))
 
     generic = bytearray(GENERIC_HEADER + GENERIC_ENTRY * len(entries))
     struct.pack_into("<II", generic, 0, GENERIC_MAGIC, GENERIC_VERSION)
@@ -190,7 +218,7 @@ def build(hwx):
 
     refs = []
     for slot in sorted(slots):
-        base = u64(hwx, descriptor + 0x10 * (slot + 1))
+        base = bases[slot]
         if not base:
             continue
         hit = [s["id"] for s in surfaces if s["vm"] == base]
@@ -198,11 +226,16 @@ def build(hwx):
             refs.append((slot, hit[0]))
         elif scratch and base == scratch[0]:
             refs.append((slot, scratch_id))
-        elif kernel and base == kernel[0]:
-            refs.append((slot, RESOURCE_KERNEL))
+        elif base in kernel_bases:
+            refs.append((slot, kernel_ids[kernel_bases.index(base)] if kernel_buffers
+                         else RESOURCE_KERNEL))
+        elif base == constants and slot == 1 and (kernel_buffers or not kernels):
+            # Slot 1 carries the constants: bind them unless asked not to.
+            if constants_ref or kernel_buffers:
+                refs.append((slot, RESOURCE_KERNEL))
         else:
-            raise HwxError("BAR slot %d base %#x names no surface, scratch or kernel" %
-                       (slot, base))
+            raise HwxError("BAR slot %d base %#x names no surface, scratch, kernel "
+                           "or constants" % (slot, base))
     if not refs or len(refs) > OPERATION_REFS_MAX:
         raise HwxError("program binds no buffer through a BAR slot")
     operation = bytearray(4 + OPERATION_RECORD)
@@ -223,6 +256,8 @@ def build(hwx):
     ids = {s["name"]: s["id"] for s in surfaces}
     if scratch:
         ids["scratch"] = scratch_id
+    for k, ident in enumerate(kernel_ids):
+        ids["__kern_%d" % k] = ident
     return sections, ids, refs, tasks
 
 
@@ -231,9 +266,12 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--hwx", type=pathlib.Path, required=True)
     parser.add_argument("--out-dir", type=pathlib.Path, required=True)
+    parser.add_argument("--no-constants-ref", action="store_true",
+                        help="leave BAR slot 1 (__TEXT,__const) unbound without kernel data")
     args = parser.parse_args()
     try:
-        sections, ids, refs, tasks = build(args.hwx.read_bytes())
+        sections, ids, refs, tasks = build(args.hwx.read_bytes(),
+                                           constants_ref=not args.no_constants_ref)
     except HwxError as e:
         print(f"FAIL: {e}")
         return 1

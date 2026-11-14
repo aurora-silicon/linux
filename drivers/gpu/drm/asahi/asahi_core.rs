@@ -95,6 +95,8 @@ struct DriverModule {
     _cleanup: cleanup::QueueOwner,
     #[cfg(CONFIG_DRM_ASAHI_G15)]
     _g15_ready: (),
+    // Last: the hibernation gate outlives every driver that counts its devices.
+    _hibernate_gate: sysfs_exports::HibernateGate,
 }
 
 impl kernel::InPlaceModule for DriverModule {
@@ -106,6 +108,7 @@ impl kernel::InPlaceModule for DriverModule {
         // SAFETY: Module init runs once, before either adapter is registered below.
         unsafe { g17::exec_share::init() };
         try_pin_init!(Self {
+            _hibernate_gate: sysfs_exports::HibernateGate::new()?,
             // Initialize the queue first, before registration can invoke probe.
             _cleanup: cleanup::QueueOwner::new()?,
             _legacy_rx: legacy_rx::QueueOwner::new()?,

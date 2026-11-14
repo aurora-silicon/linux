@@ -98,7 +98,12 @@ ASAHI_TESTS = {
     'bcm4377-id-tests.py': [(out() + ['--old-ref', '87ddae1397f6f70817cb57df76477a86bdf96424'], PASS)],
     # These mutations are caught inside the test, which then exits 0.
     'bcm4377-resume-tests.py': [(out(), PASS)]
-        + mutations('--mutation', ('epoch', 'close', 'producer-fence', 'active-fence', 'board'), out(), PASS),
+        + mutations('--mutation', ('epoch', 'close', 'producer-fence', 'active-fence', 'board', 'board-j616s',
+                                   'cold-gate', 'cold-windows', 'cold-running-fw', 'cold-rti', 'cold-unquiesce',
+                                   'cold-reset', 'cold-send', 'cold-queue', 'cold-unarmed', 'cold-rearm',
+                                   'cold-error', 'cold-sticky', 'cold-setup-retry', 'cold-defer',
+                                   'cold-open-queue', 'cold-owed-kept', 'cold-resume-fence',
+                                   'cold-queue-fence'), out(), PASS),
     'bcm4377-sleep-config-tests.py': [([], PASS)],
     'brcmf-assoc-tests.py': [(out('--output'), PASS)]
         + mutations('--mutation', ('short-ie', 'header-length', 'skb-capacity', 'cmplt-header'), out('--output')),
@@ -195,7 +200,9 @@ ASAHI_TESTS = {
                                    'omit-before-send', 'leak-prepared', 'sent-error-return',
                                    'accept-unanswered-gate', 'ignore-result', 'ignore-gate-timeout',
                                    'finish-without-physical', 'poll-after-callback', 'poll-unsupported',
-                                   'stale-observation', 'drain-two', 'post-send-wake-refusal'), out()),
+                                   'stale-observation', 'drain-two', 'post-send-wake-refusal',
+                                   'held-before-refusal', 'cold-as-warm', 'unrecorded-as-warm',
+                                   'unrecorded-as-cold'), out()),
     'pmp-agx-vote-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
     'pmp-j613-floor-tests.py': [([], PASS)] + mutations('--mutant', ['no-hold', 'no-rate', 'no-streak', 'bad-word', 'foreign-ok', 'no-names', 'no-sum', 'no-board', 'no-default', 'no-disable'], []),
     'pmp-j613-hwmon-tests.py': [([], PASS)],
@@ -203,7 +210,7 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('ack-clobber', 'arm-ack', 'offset-seconds',
                                    'offset-sign', 'event-bit', 'wrong-control',
                                    'maverick-event', 'stowe-offset', 'baku-limit',
-                                   'set-no-round', 'set-negative'), out()),
+                                   'set-no-round', 'set-negative', 'restore-nothing'), out()),
     'perf-mmap-alias-lifecycle-tests.py': [([], PASS)],
     'qspi-nvram-tests.py': [(out('--output'), PASS)],
     'radio-pm-tests.py': [([], PASS)],

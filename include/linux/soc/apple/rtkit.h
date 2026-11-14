@@ -12,6 +12,7 @@
 
 #include <linux/bits.h>
 #include <linux/device.h>
+#include <linux/errno.h>
 #include <linux/types.h>
 #include <linux/mailbox_client.h>
 
@@ -265,6 +266,13 @@ int apple_rtkit_poweroff(struct apple_rtkit *rtk);
 int apple_rtkit_cold_restart(struct apple_rtkit *rtk, int (*start)(void *), void *ctx);
 
 /*
+ * Returned by apple_rtkit_idle() and apple_rtkit_idle_with() when the AP side is idle
+ * and the IOP acknowledged a power state other than idle: it is asleep with its memory
+ * kept. No other error carries this value.
+ */
+#define APPLE_RTKIT_IDLE_RETAINED	(-EALREADY)
+
+/*
  * Put the co-processor into idle mode
  */
 int apple_rtkit_idle(struct apple_rtkit *rtk);
@@ -309,6 +317,16 @@ int apple_rtkit_ap_power(struct apple_rtkit *rtk, bool on);
 
 /* The same, for a noirq phase: device interrupts are off, so it polls. */
 int apple_rtkit_ap_power_noirq(struct apple_rtkit *rtk, bool on);
+
+/*
+ * The idle notice with interrupts off and one CPU up, where nothing can sleep and the
+ * receive work doesn't run: the mailbox is polled a bounded number of times, with no
+ * clock read, and the acknowledgment is taken in the poll. A message on one of the
+ * client's own endpoints still goes to recv_message_early; one it leaves waits for the
+ * receive work. @us is about how long the acknowledgment took. The wake's notice is
+ * apple_rtkit_ap_power() or apple_rtkit_ap_power_noirq(), as after any other.
+ */
+int apple_rtkit_ap_idle_polled(struct apple_rtkit *rtk, unsigned int *us);
 
 /*
  * Stop a co-processor for a system sleep that may remove its power: idle, wait
@@ -441,5 +459,61 @@ void apple_rtkit_flush_rx(struct apple_rtkit *rtk);
  * @ep:             endpoint to check for
  */
 bool apple_rtkit_has_endpoint(struct apple_rtkit *rtk, u8 ep);
+
+/*
+ * A shared buffer of a running session, as the co-processor addresses it.
+ * @kind is one of APPLE_RTKIT_BUF_*.
+ */
+#define APPLE_RTKIT_BUF_IOREPORT	0
+#define APPLE_RTKIT_BUF_COREANALYTICS	1
+#define APPLE_RTKIT_BUF_CRASHLOG	2
+#define APPLE_RTKIT_BUF_OSLOG		3
+#define APPLE_RTKIT_BUF_KDEBUG0		4
+#define APPLE_RTKIT_BUF_KDEBUG1		5
+#define APPLE_RTKIT_BUF_PMP_AUX		6
+#define APPLE_RTKIT_BUF_SYSLOG		7
+#define APPLE_RTKIT_BUF_COUNT		8
+
+struct apple_rtkit_buffer_desc {
+	u32 kind;
+	u32 is_mapped;
+	u64 iova;
+	u64 size;
+};
+
+/*
+ * Describe the shared buffers the co-processor currently holds, in a fixed
+ * order. Returns the number of entries written, or -ENOSPC if @max is too
+ * small.
+ */
+int apple_rtkit_describe_buffers(struct apple_rtkit *rtk,
+				 struct apple_rtkit_buffer_desc *desc,
+				 unsigned int max);
+
+/*
+ * Take over, in place, a firmware instance that another kernel started and
+ * left running with its shared buffers at the IOVAs this session already
+ * holds (the caller must have checked that with apple_rtkit_describe_buffers()
+ * against the other kernel's description). Only host-side transient state is
+ * reset; no message is sent to the co-processor.
+ */
+int apple_rtkit_readopt(struct apple_rtkit *rtk);
+
+/*
+ * Resume from disk. The kernel that loads a hibernation image (the boot
+ * kernel) can leave a few bytes for the kernel restored from that image in
+ * memory that the image does not overwrite. Only available with RTKit
+ * built in; elsewhere put() fails and take() finds nothing.
+ *
+ * apple_rtkit_hib_restoring(): true in the boot kernel between
+ * PM_RESTORE_PREPARE and the jump into the image (or PM_POST_RESTORE),
+ * i.e. while its devices are quiesced for the image, not frozen for one.
+ */
+#define APPLE_RTKIT_HIB_HANDOFF_MAX	256
+
+bool apple_rtkit_hib_restoring(void);
+int apple_rtkit_hib_handoff_put(const char *tag, const void *data, size_t len);
+int apple_rtkit_hib_handoff_take(const char *tag, void *data, size_t len);
+void apple_rtkit_hib_handoff_drop(const char *tag);
 
 #endif /* _LINUX_APPLE_RTKIT_H_ */

@@ -12,8 +12,11 @@
 #define pr_fmt(x) "hibernate: " x
 #include <linux/cpu.h>
 #include <linux/kvm_host.h>
+#include <linux/memblock.h>
+#include <linux/of.h>
 #include <linux/pm.h>
 #include <linux/sched.h>
+#include <linux/set_memory.h>
 #include <linux/suspend.h>
 #include <linux/utsname.h>
 
@@ -81,6 +84,9 @@ static struct arch_hibernate_hdr {
 	phys_addr_t	__hyp_stub_vectors;
 
 	u64		sleep_cpu_mpidr;
+
+	/* What the boot loader decided for the boot that wrote the image. */
+	u64		boot_layout;
 } resume_hdr;
 
 static inline void arch_hdr_invariants(struct arch_hibernate_hdr_invariants *i)
@@ -89,13 +95,137 @@ static inline void arch_hdr_invariants(struct arch_hibernate_hdr_invariants *i)
 	memcpy(i->uts_version, init_utsname()->version, sizeof(i->uts_version));
 }
 
+/**
+ * arm64_hibernate_layout_mix - Mix bytes into the boot layout cookie.
+ * @h: Hash so far.
+ * @p: Bytes to mix.
+ * @len: Number of bytes.
+ *
+ * FNV-1a, for the callback of a platform to mix its boot facts into the cookie
+ * in the same way as the rest of the layout.
+ */
+u64 arm64_hibernate_layout_mix(u64 h, const void *p, size_t len)
+{
+	const u8 *b = p;
+
+	while (len--) {
+		h ^= *b++;
+		h *= 0x100000001b3ULL;		/* FNV-1a */
+	}
+	return h;
+}
+
+/*
+ * Mix one memory span less the parts in @ex, ranges that this boot keeps out of
+ * the image. iBoot's no-map allocations inside aura's fixed layout (the DCP
+ * oslogs, ANS firmware) move with the boot object and split memblock's regions
+ * differently on every boot; what lies there never holds an image page.
+ */
+static u64 hibernate_mix_span(u64 h, u64 b, u64 e, u32 flags, const u64 (*ex)[2], int nex)
+{
+	u64 size;
+
+	if (b >= e)
+		return h;
+	if (nex && e > ex[0][0] && b < ex[0][1]) {
+		h = hibernate_mix_span(h, b, ex[0][0], flags, ex + 1, nex - 1);
+		return hibernate_mix_span(h, ex[0][1], e, flags, ex + 1, nex - 1);
+	}
+	if (nex)
+		return hibernate_mix_span(h, b, e, flags, ex + 1, nex - 1);
+	size = e - b;
+	h = arm64_hibernate_layout_mix(h, &b, sizeof(b));
+	h = arm64_hibernate_layout_mix(h, &size, sizeof(size));
+	return arm64_hibernate_layout_mix(h, &flags, sizeof(flags));
+}
+
+static const struct arm64_hibernate_platform *hibernate_platform __ro_after_init;
+
+/**
+ * arm64_hibernate_set_platform - Register the platform's hibernation hooks.
+ * @platform: Hooks of the platform; they must stay valid.
+ *
+ * Only one platform can register, at boot.
+ */
+void __init arm64_hibernate_set_platform(const struct arm64_hibernate_platform *platform)
+{
+	if (WARN_ON_ONCE(hibernate_platform))
+		return;
+	hibernate_platform = platform;
+}
+
+static bool hibernate_platform_pfn_nosave(unsigned long pfn)
+{
+	return hibernate_platform && hibernate_platform->pfn_nosave &&
+		hibernate_platform->pfn_nosave(pfn);
+}
+
+/*
+ * The image restores every page to the frame it came from, so the boot that
+ * resumes it must give the kernel what the boot that wrote it did: the same
+ * RAM, the same CPUs started the same way, and whatever fixed layout the
+ * platform's boot loader gives the kernel, which the platform's hook adds. A
+ * boot loader decides them on every boot; the kernel build check above cannot
+ * see them.
+ */
+static u64 hibernate_boot_layout(void)
+{
+	struct arm64_hibernate_layout lay = {};
+	u64 h = 0xcbf29ce484222325ULL, rel, hwid;
+	struct memblock_region *r;
+	struct device_node *np;
+	u8 kept;
+
+	if (hibernate_platform && hibernate_platform->layout)
+		h = hibernate_platform->layout(h, &lay);
+
+	for_each_of_cpu_node(np) {
+		if (of_property_read_u64(np, "cpu-release-addr", &rel))
+			continue;
+		hwid = of_get_cpu_hwid(np, 0);
+		kept = hibernate_platform_pfn_nosave(PHYS_PFN(rel));
+		if (lay.have_base)
+			rel -= lay.base;
+		h = arm64_hibernate_layout_mix(h, &hwid, sizeof(hwid));
+		h = arm64_hibernate_layout_mix(h, &rel, sizeof(rel));
+		h = arm64_hibernate_layout_mix(h, &kept, sizeof(kept));
+	}
+
+	for_each_mem_region(r)
+		h = hibernate_mix_span(h, r->base, r->base + r->size, r->flags, lay.ex, lay.nex);
+	return h;
+}
+
+/*
+ * Most image pages are loaded straight into their original frames through the
+ * cacheable linear map. Non-coherent DMA masters (on Apple SoCs: the GPU page
+ * table walker, DCP, every RTKit co-processor, the NVMe queues) read DRAM, and
+ * a later eviction of a dirty line would overwrite what a device wrote since.
+ * Clean and invalidate the page to the PoC before the jump.
+ *
+ * A frame that is not in the boot kernel's linear map (for example the linear
+ * alias of the kernel image, which faults when touched) had nothing loaded
+ * through the linear map: such frames are restored by the restore_pblist copy,
+ * which cleans each copied page itself.
+ */
+int arch_hibernate_clean_image_page(unsigned long pfn)
+{
+	unsigned long va;
+
+	if (!kernel_page_present(pfn_to_page(pfn)))
+		return 0;
+	va = (unsigned long)page_address(pfn_to_page(pfn));
+	dcache_clean_inval_poc(va, va + PAGE_SIZE);
+	return 1;
+}
+
 int pfn_is_nosave(unsigned long pfn)
 {
 	unsigned long nosave_begin_pfn = sym_to_pfn(&__nosave_begin);
 	unsigned long nosave_end_pfn = sym_to_pfn(&__nosave_end - 1);
 
 	return ((pfn >= nosave_begin_pfn) && (pfn <= nosave_end_pfn)) ||
-		crash_is_nosave(pfn);
+		crash_is_nosave(pfn) || hibernate_platform_pfn_nosave(pfn);
 }
 
 void notrace save_processor_state(void)
@@ -129,8 +259,9 @@ int arch_hibernation_header_save(void *addr, unsigned int max_size)
 		return -ENODEV;
 	}
 	hdr->sleep_cpu_mpidr = cpu_logical_map(sleep_cpu);
-	pr_info("Hibernating on CPU %d [mpidr:0x%llx]\n", sleep_cpu,
-		hdr->sleep_cpu_mpidr);
+	hdr->boot_layout = hibernate_boot_layout();
+	pr_info("Hibernating on CPU %d [mpidr:0x%llx], boot layout %016llx\n", sleep_cpu,
+		hdr->sleep_cpu_mpidr, hdr->boot_layout);
 
 	return 0;
 }
@@ -138,6 +269,7 @@ EXPORT_SYMBOL(arch_hibernation_header_save);
 
 int arch_hibernation_header_restore(void *addr)
 {
+	u64 layout;
 	int ret;
 	struct arch_hibernate_hdr_invariants invariants;
 	struct arch_hibernate_hdr *hdr = addr;
@@ -145,6 +277,12 @@ int arch_hibernation_header_restore(void *addr)
 	arch_hdr_invariants(&invariants);
 	if (memcmp(&hdr->invariants, &invariants, sizeof(invariants))) {
 		pr_crit("Hibernate image not generated by this kernel!\n");
+		return -EINVAL;
+	}
+	layout = hibernate_boot_layout();
+	if (hdr->boot_layout != layout) {
+		pr_crit("Hibernate image written under another boot layout (%016llx, this boot %016llx): not restored\n",
+			hdr->boot_layout, layout);
 		return -EINVAL;
 	}
 
@@ -337,7 +475,7 @@ int swsusp_arch_suspend(void)
 	unsigned long flags;
 	struct sleep_stack_data state;
 
-	if (cpus_are_stuck_in_kernel() || spin_table_cpus_stuck()) {
+	if (cpus_are_stuck_in_kernel() || spin_table_hibernate_cpus_stuck()) {
 		pr_err("Can't hibernate: no mechanism to offline secondary CPUs.\n");
 		return -EBUSY;
 	}
@@ -385,6 +523,9 @@ int swsusp_arch_suspend(void)
 
 		sleep_cpu = -EINVAL;
 		__cpu_suspend_exit();
+
+		/* The boot kernel's secondaries are in its pen, not where the image parked them. */
+		spin_table_hibernate_restored();
 
 		/*
 		 * Just in case the boot kernel did turn the SSBD
@@ -489,10 +630,19 @@ int __nocfi swsusp_arch_resume(void)
 
 int hibernate_resume_nonboot_cpu_disable(void)
 {
+	int ret;
+
 	if (sleep_cpu < 0) {
 		pr_err("Failing to resume from hibernate on an unknown CPU.\n");
 		return -ENODEV;
 	}
 
-	return freeze_secondary_cpus(sleep_cpu);
+	/* Parking spin-table CPUs wait outside the image while it is restored. */
+	ret = spin_table_hibernate_pen_begin(resume_hdr.ttbr1_el1, sleep_cpu);
+	if (ret)
+		return ret;
+	ret = freeze_secondary_cpus(sleep_cpu);
+	spin_table_hibernate_pen_end(!ret);
+
+	return ret;
 }

@@ -36,6 +36,7 @@
 #include <asm/mmu_context.h>
 #include <asm/tlbflush.h>
 #include <asm/io.h>
+#include <asm/cacheflush.h>
 
 #include "power.h"
 
@@ -2750,6 +2751,37 @@ static void *get_buffer(struct memory_bitmap *bm, struct chain_allocator *ca)
 	return pbe->address;
 }
 
+#ifdef CONFIG_ARCH_HIBERNATION_CLEAN_IMAGE
+/*
+ * Most image pages are loaded straight into their original frames through
+ * the cacheable linear map (only conflicting pages go through restore_pblist).
+ * Where devices read memory without snooping the CPU caches, a later eviction
+ * of a dirty line would overwrite what a device wrote since: let the
+ * architecture clean every image page before the jump.
+ */
+static void swsusp_clean_restored_image(void)
+{
+	unsigned long pfn, n = 0, skipped = 0;
+
+	memory_bm_position_reset(&orig_bm);
+	for (pfn = memory_bm_next_pfn(&orig_bm); pfn != BM_END_OF_MAP;
+	     pfn = memory_bm_next_pfn(&orig_bm)) {
+		if (!pfn_valid(pfn))
+			continue;
+		if (!arch_hibernate_clean_image_page(pfn)) {
+			skipped++;
+			continue;
+		}
+		if (!(++n & 0xffff))
+			cond_resched();
+	}
+	pr_debug("%lu image pages cleaned, %lu left to the restore_pblist copy\n",
+		 n, skipped);
+}
+#else
+static inline void swsusp_clean_restored_image(void) {}
+#endif
+
 /**
  * snapshot_write_next - Get the address to store the next image page.
  * @handle: Snapshot handle structure to guide the writing.
@@ -2871,6 +2903,8 @@ int snapshot_write_finalize(struct snapshot_handle *handle)
 	error = hibernate_restore_protect_page(handle->buffer);
 	/* Do that only if we have loaded the image entirely */
 	if (handle->cur > 1 && handle->cur > nr_meta_pages + nr_copy_pages + nr_zero_pages) {
+		/* while orig_bm still lists the image: recycling overwrites it */
+		swsusp_clean_restored_image();
 		memory_bm_recycle(&orig_bm);
 		free_highmem_data();
 	}

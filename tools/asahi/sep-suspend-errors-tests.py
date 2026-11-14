@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
 """Compile actual SEP commit/error paths with host-only dependency stubs.
 
-Extract current C stop/finish/prepare/noirq, provider poll-one and registration,
-Rust wrappers/enter/leave/exit/kick, and the kernel polling macros verbatim.
+Extract current C stop/finish/prepare/noirq, the PM notifier, provider poll-one and
+registration, Rust wrappers/enter/leave/exit/kick, and the kernel polling macros verbatim.
 C fatal paths are observed wholly within C, never by unwinding a Rust frame.
 Virtual time/MMIO only test AP control decisions, not firmware timing or safety.
 No target access or kernel build occurs.
@@ -88,6 +88,12 @@ MUTATIONS = {
                   'msg = apple_mbox_read_msg(mbox);\n\t\tmbox->rx(mbox, msg, mbox->cookie);\n\t\tret = 2;'),
     'post-send-wake-refusal': ('sep_pm_commit_stop', 'c->sent = true;',
                               'c->sent = true;\n\tif (pm_wakeup_pending()) return -EBUSY;'),
+    'held-before-refusal': ('sep_pm_notify', 'if (event(SEP_PM_RESTORE) > 0) {',
+                            'sep_diag_sleep(true);\n\t\tif (event(SEP_PM_RESTORE) > 0) {'),
+    'cold-as-warm': ('sep_pm_notify', 'if (cold) {', 'if (false) {'),
+    'unrecorded-as-warm': ('sep_pm_notify', 'if (cold < 0) {', 'if (false) {'),
+    'unrecorded-as-cold': ('sep_pm_notify', 'cold = pm_hibernate_restored_cold();',
+                            'cold = pm_hibernate_restored_cold() != 0;'),
 }
 
 C_PREFIX = r'''
@@ -138,7 +144,12 @@ static struct regmap regmap;
 static struct apple_mbox_hw hw;
 static struct apple_mbox mbox;
 static int apple_sleep_coprocs_lock;
-static void *apple_sleep;
+#define APPLE_SLEEP_REG_ENCLAVE_ANY BIT(0)
+#define APPLE_SLEEP_REG_BOUND BIT(8)
+#define APPLE_SLEEP_REG_READY BIT(9)
+/* The T8140 controller as its probe leaves the registry: bound, then ready. */
+static unsigned int apple_sleep_reg = APPLE_SLEEP_REG_BOUND | APPLE_SLEEP_REG_READY;
+static unsigned int apple_sleep_dry;
 static struct {
     struct device *dev; int (*stop)(void *); void *data;
 } apple_sleep_enclave;
@@ -154,6 +165,22 @@ static struct apple_mbox_msg queue[4];
 static unsigned queued, consumed;
 static ktime_t now;
 static bool (*sep_pm_told)(void);
+/* The PM notifier: its events go to the driver, and the diag state shows a sleep held. */
+struct notifier_block { int unused; };
+enum { NOTIFY_DONE, NOTIFY_OK, NOTIFY_BAD = 0x8002 };
+enum { PM_HIBERNATION_PREPARE = 1, PM_POST_HIBERNATION, PM_SUSPEND_PREPARE, PM_POST_SUSPEND,
+       PM_RESTORE_PREPARE, PM_POST_RESTORE };
+#define pr_err(...) ((void)0)
+static int (*sep_pm_event)(int event);
+static struct device *sep_pm_dev;
+static int restored_cold, held, sleeps_ended, reprobes;
+static bool restored;
+static void sep_diag_sleep(bool entering) {
+    if (entering) held = 1; else if (held) { held = 0; ++sleeps_ended; }
+}
+static int pm_hibernate_restored_cold(void) { return restored_cold; }
+static bool pm_hibernate_is_restored(void) { return restored; }
+static void sep_pm_schedule_reprobe(struct device *d) { ++reprobes; }
 static bool yes(void) { return true; }
 static bool no(void) { return false; }
 static bool pm_suspend_via_firmware(void) { return firmware; }
@@ -251,7 +278,7 @@ void fixture(void) {
     memset(&hw, 0, sizeof(hw));
     mbox = (struct apple_mbox){ .regs = &hw, .hw = &hw, .rx = foreign_rx, .cookie = &device };
     config_enabled = hyp = sep_pm_suspending = dart_present = dart_ready = map_ok = true;
-    firmware = tx_ready = true; apple_sleep = &device;
+    firmware = tx_ready = true; apple_sleep_reg = APPLE_SLEEP_REG_BOUND | APPLE_SLEEP_REG_READY;
     real_wake = pending_wake = late_wake = sleep_refuse_before_send = false;
     domain_error = property_error = address_error = read_error = gate_after = reads = 0;
     put_refs = maps = unmaps = lookups = prepares = restores = sends = closes = 0;
@@ -260,13 +287,15 @@ void fixture(void) {
     resource_bytes = 4; close_gate = 1; early_gate = 0; read_error_after = 1;
     queued = consumed = 0; message_in_lock = matched_read = false; now = 0;
     fatal_armed = false; fatal_message[0] = 0; sep_pm_told = yes;
+    sep_pm_event = NULL; sep_pm_dev = &device; restored_cold = 0;
+    held = sleeps_ended = reprobes = 0; restored = false;
 }
 void parameter(int which, int value) {
     switch (which) {
     case 0: config_enabled = value; break; case 1: hyp = value; break;
     case 2: sep_pm_suspending = value; break; case 3: dart_present = value; break;
     case 4: map_ok = value; break; case 5: domain_error = value; break;
-    case 6: read_error = value; break; case 7: apple_sleep = value ? &device : NULL; break;
+    case 6: read_error = value; break; case 7: apple_sleep_reg = APPLE_SLEEP_REG_BOUND | (value ? APPLE_SLEEP_REG_READY : 0); break;
     case 8: gate_after = value; break; case 9: sep_pm_commit.registered = value; break;
     case 10: read_error_after = value; break; case 11: dart_ready = value; break;
     case 12: real_wake = value; break; case 13: hw.is_ascwrap_v8 = value; break;
@@ -435,8 +464,50 @@ static void test_poll_contract(void) {
     fixture(); sep_pm_told = NULL; assert(noirq() == 0 && !lookups);
     fixture(); sep_pm_told = no; assert(noirq() == 0 && !lookups);
 }
+static int attached, last_event;
+static int driver_event(int event) {
+    last_event = event;
+    // The driver reports a live session to drop for a cold boot, like the real one.
+    return event == SEP_PM_RESTORE ? attached : event == SEP_PM_HIBERNATE_COLD;
+}
+static void test_notifier(void) {
+    struct notifier_block nb;
+    // No driver registered: the chain goes on untouched.
+    fixture(); assert(sep_pm_notify(&nb, PM_RESTORE_PREPARE, NULL) == NOTIFY_DONE && !held);
+    // A kernel that attached the enclave refuses to load an image. The PM core sends no
+    // PM_POST_RESTORE to the notifier that refused, so nothing may be left held.
+    fixture(); sep_pm_event = driver_event; attached = 1;
+    assert(sep_pm_notify(&nb, PM_RESTORE_PREPARE, NULL) == NOTIFY_BAD);
+    assert(last_event == SEP_PM_RESTORE && !held && !sleeps_ended);
+    // One that did not goes on, and the end of the restore ends the hold.
+    attached = 0;
+    assert(sep_pm_notify(&nb, PM_RESTORE_PREPARE, NULL) == NOTIFY_OK && held);
+    assert(sep_pm_notify(&nb, PM_POST_RESTORE, NULL) == NOTIFY_OK);
+    assert(last_event == SEP_PM_HIBERNATE_WARM && !held && sleeps_ended == 1);
+    // The end of a hibernation: an aborted one or a hybrid sleep's wake was never restored.
+    fixture(); sep_pm_event = driver_event; restored_cold = 1;
+    assert(sep_pm_notify(&nb, PM_HIBERNATION_PREPARE, NULL) == NOTIFY_OK && held);
+    assert(sep_pm_notify(&nb, PM_POST_HIBERNATION, NULL) == NOTIFY_OK);
+    assert(last_event == SEP_PM_HIBERNATE_WARM && !held && sleeps_ended == 1 && !reprobes);
+    // Restored after a boot that loaded the image: the enclave restarted, the device is probed again.
+    restored = true; restored_cold = 1;
+    assert(sep_pm_notify(&nb, PM_POST_HIBERNATION, NULL) == NOTIFY_OK);
+    assert(last_event == SEP_PM_HIBERNATE_COLD && reprobes == 1);
+    // Restored by the kernel that wrote the image (test_resume): the enclave never restarted.
+    restored_cold = 0; reprobes = 0;
+    assert(sep_pm_notify(&nb, PM_POST_HIBERNATION, NULL) == NOTIFY_OK);
+    assert(last_event == SEP_PM_HIBERNATE_WARM && !reprobes);
+    // No record of the loading kernel: the session is dropped, no probe is queued.
+    restored_cold = -ENODATA;
+    assert(sep_pm_notify(&nb, PM_POST_HIBERNATION, NULL) == NOTIFY_OK);
+    assert(last_event == SEP_PM_HIBERNATE_COLD && !reprobes);
+    // A suspend holds and releases the same way.
+    assert(sep_pm_notify(&nb, PM_SUSPEND_PREPARE, NULL) == NOTIFY_OK && held);
+    assert(sep_pm_notify(&nb, PM_POST_SUSPEND, NULL) == NOTIFY_OK && !held && sleeps_ended == 2);
+}
 int main(void) {
     test_prepare_and_cleanup(); test_unsent(); test_provider(); test_sent(); test_poll_contract();
+    test_notifier();
     puts("SEP C commit controls passed"); return 0;
 }
 #endif
@@ -446,7 +517,7 @@ RUST_PREFIX = r'''
 #![allow(dead_code, unused_imports, unused_variables)]
 use std::cell::{Cell, RefCell, RefMut};
 use std::ffi::{c_int, c_void};
-use std::sync::atomic::{AtomicU32, Ordering, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering, Ordering::Relaxed};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)] struct Error(i32);
 impl Error { fn from_errno(n: i32) -> Self { assert!(n < 0); Self(n) } }
 type Result<T = ()> = std::result::Result<T, Error>;
@@ -529,13 +600,15 @@ const PHASE_READY: u32 = 1;
 struct SepData {
     dev: kernel::device::Device, phase: AtomicU32, control: Lock<Control>, mbox: Lock<Option<Mbox>>,
     gate: Cell<pm::SleepGate>, sleep_rx_held: Flag, endpoint: Cell<bool>, control_wq: Wq,
+    session_gone: AtomicBool,
 }
 impl SepData {
     fn new() -> Self {
         Self { dev: kernel::device::Device, phase: AtomicU32::new(PHASE_READY),
             control: Lock(RefCell::new(Control { busy: false, wake_ok: true })),
             mbox: Lock(RefCell::new(Some(Mbox))), gate: Cell::new(pm::SleepGate::Open),
-            sleep_rx_held: Flag(Cell::new(false)), endpoint: Cell::new(true), control_wq: Wq }
+            sleep_rx_held: Flag(Cell::new(false)), endpoint: Cell::new(true), control_wq: Wq,
+            session_gone: AtomicBool::new(false) }
     }
     fn endpoint_present(&self, _: u32) -> bool { self.endpoint.get() }
     fn sleep_gate(&self) -> pm::SleepGate { self.gate.get() }
@@ -659,21 +732,27 @@ def sources(source, contracts, mutation):
     pm = (source / 'drivers/soc/apple/pm.rs').read_text()
     sep = (source / 'drivers/soc/apple/sep.rs').read_text()
     shim = (source / 'drivers/soc/apple/pm_shim.c').read_text()
+    events = re.findall(r'^#define SEP_PM_[A-Z_]+\s+\d+$',
+                        (source / 'drivers/soc/apple/shim.h').read_text(), re.M)
+    assert len(events) == 6, events
     mailbox = (source / 'drivers/soc/apple/mailbox.c').read_text()
     sleep = (source / 'drivers/soc/apple/sleep.c').read_text()
+    registry = (source / 'drivers/soc/apple/sleep-registry.c').read_text()
     iopoll = (contracts / 'include/linux/iopoll.h').read_text()
     names = {
         'shim': ['sep_pm_wait_gated', 'sep_pm_clear_dev_disable', 'sep_pm_dart_restore',
                  'sep_pm_commit_rx', 'sep_pm_commit_take_rx', 'sep_pm_commit_stop',
-                 'sep_pm_commit_prepare', 'sep_pm_commit_finish', 'sep_pm_suspend_noirq'],
+                 'sep_pm_commit_prepare', 'sep_pm_commit_finish', 'sep_pm_suspend_noirq',
+                 'sep_pm_notify'],
         'mailbox': ['apple_mbox_poll_one_supported', 'apple_mbox_poll_one'],
-        'sleep': ['apple_sleep_commit_stops_coprocs', 'apple_sleep_enclave_register',
-                  'apple_sleep_enclave_unregister'],
+        'sleep': ['apple_sleep_power_loss'],
+        'registry': ['apple_sleep_commit_stops_coprocs', 'apple_sleep_enclave_register',
+                     'apple_sleep_enclave_unregister'],
         'pm': ['leave_for_commit', 'commit_finish', 'clear_dev_disable', 'dart_restore'],
         'sep': ['sleep_enter', 'sleep_leave_for_commit', 'sleep_hold_rx', 'sleep_release_rx',
                 'sleep_exit', 'sleep_kick'],
     }
-    texts = dict(shim=shim, mailbox=mailbox, sleep=sleep, pm=pm, sep=sep)
+    texts = dict(shim=shim, mailbox=mailbox, sleep=sleep, registry=registry, pm=pm, sep=sep)
     bodies = {n: function(texts[k], n) for k, group in names.items() for n in group}
     if mutation:
         name, before, after = MUTATIONS[mutation]
@@ -683,11 +762,12 @@ def sources(source, contracts, mutation):
     c = C_PREFIX + '\n' + '\n'.join(macro(iopoll, n) for n in macros)
     c += '\n' + '\n'.join(re.search(r'^#define ' + n + r'\s+.*$', shim, re.M).group()
                             for n in ['SEP_PM_POLL_US', 'SEP_PM_TIMEOUT_US'])
+    c += '\n' + '\n'.join(events)
     start = shim.index('static struct sep_pm_commit {')
     c += '\n' + shim[start:shim.index('} sep_pm_commit;', start) + len('} sep_pm_commit;')]
     # Use the actual provider helper, with only removal/capability dependency state
     # injected by send for the post-send negative-poll scenarios.
-    c += '\n' + '\n'.join(bodies[n] for group in ['mailbox', 'sleep', 'shim'] for n in names[group])
+    c += '\n' + '\n'.join(bodies[n] for group in ['mailbox', 'sleep', 'registry', 'shim'] for n in names[group])
     c += '\n' + C_CONTROLS
     gate_start = pm.index('#[derive(Clone, Copy, Debug, PartialEq, Eq)]')
     gate_end = pm.index('/// Stages `request`', gate_start)

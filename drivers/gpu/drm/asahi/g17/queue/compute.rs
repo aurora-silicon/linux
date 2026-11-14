@@ -263,6 +263,54 @@ impl Graph {
         })
     }
 
+    /// Rewrites the firmware-visible storage of this QID to its construction contents for
+    /// `context` (the bound owner's, which the queue record names after an owner change),
+    /// in place: zero cursors, a fresh queue record, job list and support words, and zero
+    /// scratch. For a cold-restarted firmware that never saw this queue; GPU idle.
+    fn reset_after_cold_boot(&mut self, context: &Context) -> Result {
+        let page = mmu::UAT_PGSZ as u64;
+        let pointers = self.pointers;
+        let graph_va = self.graph.gpu_va();
+        self.graph.bytes_mut().fill(0);
+        self.graph.initialize::<GraphLayout>(0, |view| {
+            view.queue = QueueRecord::new(&QueueRecordArgs {
+                pointers_va: graph_va + CURSORS as u64,
+                items_va: graph_va + ITEMS as u64,
+                job_list_va: context.work_head_va(),
+                scheduler_va: context.scheduler_va(),
+                owner_pid: context.owner_pid(),
+                policy: context.policy(),
+            });
+            view.pointers = PointerBlock::new(&pointers)?;
+            view.jobs = JobListHead::new(graph_va + 0x200);
+            Ok(())
+        })?;
+        self.graph.initialize::<PointerBlock>(CURSORS, |view| {
+            *view = PointerBlock::new(&pointers)?;
+            Ok(())
+        })?;
+        let support_va = self.support.gpu_va();
+        self.support.bytes_mut().fill(0);
+        self.support.write(0, support_va + page)?;
+        self.support.write(0x100, support_va + page + 4)?;
+        self.support.write(0x110, 0x50u32)?;
+        self.support.write(mmu::UAT_PGSZ + 4, 1u32)?;
+        for object in [&mut self.preempt, &mut self.usage, &mut self.operand, &mut self.records] {
+            object.bytes_mut().fill(0);
+        }
+        for object in [self.context_low.as_mut(), self.context_high.as_mut()].into_iter().flatten() {
+            object.bytes_mut().fill(0);
+        }
+        self.cached_records.bytes_mut().fill(0);
+        if let Some(ring) = self.ring.as_mut() {
+            ring.object.bytes_mut().fill(0);
+        }
+        self.record_ends = [None; RECORD_SLOTS];
+        self.reclaimed = 0;
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
+
     /// All fallible mapping work finishes before replacing a physical queue's logical owner.
     fn bind(
         &mut self,
@@ -541,6 +589,11 @@ struct Previous<B = Binding, C = Arc<Context>> {
     /// so a rollback leaves the queue detached instead of restoring them.
     moved: bool,
 }
+
+/// A previous binding a cold reset dropped (its replacement was never published, and the
+/// cold-restarted firmware knew neither owner): its aliases into the old VM and its context
+/// reference, dropped by the caller after the device mutex is released.
+pub(crate) struct RetiredPrevious(#[allow(dead_code)] Previous);
 impl<B, C> Previous<B, C> {
     /// The exact drain witness covers the replacement publication even when
     /// its public fence failed. An unpublished replacement still needs rollback.
@@ -791,6 +844,95 @@ impl Queue {
             source_hint: crate::g17::sync_input::ReaderHint::new(),
         })
     }
+    /// Whether a cold-restarted firmware can take this queue over as a first install
+    /// ([`Self::reset_after_cold_boot`]): bound to a live owner, idle, with nothing the
+    /// previous firmware still owed it (release, kill, witness, replay, growth).
+    ///
+    /// A previous binding whose replacement (the new owner's first command) was never
+    /// published owes the firmware nothing; the cold reset drops it (no rollback target).
+    pub(crate) fn cold_resettable(&self) -> bool {
+        self.cold_blockers() == 0
+    }
+
+    /// The [`Self::cold_resettable`] conditions that fail, as bits (logged by a refused
+    /// hibernation): 1 no owner, 2 no binding, 4 published owner change not witnessed,
+    /// 8 active, 0x10 replays, 0x20 exit, 0x40 claims, 0x80 quarantined, 0x100 terminal,
+    /// 0x200 growing, 0x400 awaiting witness, 0x800 retire pending, 0x1000 needs fresh
+    /// backing, 0x2000 release sent, 0x4000 pool not populated, 0x8000 no ring.
+    pub(crate) fn cold_blockers(&self) -> u32 {
+        let checks = [
+            self.owner.is_none(),
+            self.binding.is_none(),
+            self.previous.as_ref().is_some_and(|p| p.publication.is_some()),
+            self.active.len != 0,
+            self.replays.len != 0,
+            self.exit.is_some(),
+            self.claims != 0,
+            self.quarantined,
+            self.terminal.is_some(),
+            self.growing,
+            self.awaiting_witness,
+            self.retire_pending,
+            self.needs_fresh_backing,
+            self.release_sent_ns.is_some(),
+            !self.pool.populated(),
+            self.graph.ring.is_none(),
+        ];
+        checks
+            .iter()
+            .enumerate()
+            .fold(0, |bits, (bit, failed)| if *failed { bits | 1 << bit } else { bits })
+    }
+
+    /// Returns a [`Self::cold_resettable`] queue to the state [`Self::new`] leaves, without
+    /// reallocating or remapping anything: the next command installs the queue with the
+    /// cold-restarted firmware (install configuration, first descriptor, predecessor, QID
+    /// publication). Its ordinal restarts with its kick ring. The caller rewrites the pool's
+    /// page-pool descriptor row with the returned `(slot, page list, blocks)` and marks the
+    /// QID unpublished.
+    ///
+    /// A never-published owner change has nothing to roll back to: the cold firmware never
+    /// ran either owner. Its previous binding is taken out and returned for an off-lock drop,
+    /// so a release of the new owner before its first command takes the cancel path.
+    pub(crate) fn reset_after_cold_boot(
+        &mut self,
+    ) -> Result<((u16, u64, usize), Option<RetiredPrevious>)> {
+        if !self.cold_resettable() {
+            return Err(EBUSY);
+        }
+        let context = self.binding.as_ref().ok_or(EIO)?.context.clone();
+        self.graph.reset_after_cold_boot(&context)?;
+        self.kick.reset_after_cold_boot()?;
+        let blocks = self.pool.reset_after_cold_boot()?;
+        let row = (self.pool.id(), self.pool.page_list_va()?, blocks);
+        self.installed = false;
+        self.outer_started = 0;
+        self.published_config = None;
+        self.config_cache = None;
+        self.unpublished_binding = true;
+        self.free_list_generation = 0;
+        self.ordinal = 0;
+        self.submitted = 0;
+        self.fault_stamp = None;
+        self.kill_wait = None;
+        self.released = false;
+        self.retirement_ready = false;
+        self.retired_by_teardown = false;
+        self.spared_quarantine = false;
+        self.spared_deferred = false;
+        self.quarantine_error = None;
+        self.failure_status_pending = false;
+        self.retirement_proved = false;
+        self.replay_retirement = false;
+        self.replay_error = None;
+        self.replay_prepared = false;
+        self.pool_phase = PoolPhase::Populated;
+        self.retained_owner = None;
+        // cold_resettable() admits only an unpublished previous.
+        let previous = self.previous.take().map(RetiredPrevious);
+        Ok((row, previous))
+    }
+
     /// The firmware failed the command whose completion stamp is `stamp`. It writes a
     /// zero-duration completion record for it, which quarantines the queue, but stores no
     /// stamp: without this the quarantine would wait for its retirement witness forever and

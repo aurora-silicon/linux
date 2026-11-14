@@ -33,7 +33,6 @@
 #include <linux/ktime.h>
 #include <linux/security.h>
 #include <linux/secretmem.h>
-#include <linux/of.h>
 #include <trace/events/power.h>
 
 #include "power.h"
@@ -81,6 +80,105 @@ static const struct platform_hibernation_ops *hibernation_ops;
 
 static atomic_t hibernate_atomic = ATOMIC_INIT(1);
 
+/* Set when swsusp_arch_suspend() returned in a kernel restored from an image. */
+static bool hibernate_restored;
+
+/**
+ * pm_hibernate_is_restored - Whether this kernel was just restored from an image.
+ *
+ * Devices get PMSG_RESTORE in the kernel restored from a hibernation image,
+ * whose hardware went through a boot, and PMSG_RECOVER in the kernel that
+ * hibernated when hibernation is aborted before the image is created (a device
+ * failed to freeze, a wakeup event).  True from the restore until the next
+ * hibernation starts (hibernation_snapshot()); meant for code that runs after
+ * the restore, such as the PM_POST_HIBERNATION notifiers.
+ */
+bool pm_hibernate_is_restored(void)
+{
+	return READ_ONCE(hibernate_restored);
+}
+EXPORT_SYMBOL_GPL(pm_hibernate_is_restored);
+
+/*
+ * What the kernel that loads an image leaves for the kernel restored from it.
+ * It lives in the no-save section, which the image neither saves nor
+ * overwrites, so the restored kernel reads what the loading kernel wrote, as
+ * long as both are the same build loaded at the same physical address (which
+ * the image's header requires).  The record carries its own physical address
+ * and a magic: a record from a kernel loaded elsewhere, or none, reads as
+ * absent.
+ */
+struct hibernate_load_record {
+	u32 magic;
+	u32 other_boot;
+	u64 self_phys;
+};
+
+#define HIBERNATE_LOAD_MAGIC	0x484c4452	/* "HLDR" */
+
+static struct hibernate_load_record hibernate_load_record __nosavedata;
+
+/* Set while hibernate() loads the image it has just written (test_resume). */
+static bool hibernate_loading_own_image;
+
+/* Whether the restore came from another boot, see pm_hibernate_restored_cold(). */
+static int hibernate_restored_cold = -ENODATA;
+
+/**
+ * pm_hibernate_restored_cold - Whether this kernel was restored by another boot.
+ *
+ * Meaningful once pm_hibernate_is_restored() is true, under the same lifetime.
+ * The kernel that loads an image tells the kernel restored from it whether it
+ * is the kernel that wrote the image (a test_resume load: the machine did not
+ * boot) or one that was started to resume it (the boot loader and the
+ * firmware have been through a boot).  Whether a particular device lost its
+ * state across that boot is for its driver to find out.
+ *
+ * Return: 1 if the image was loaded by another boot, 0 if this kernel loaded
+ * its own image or was not restored, -ENODATA if the record of the loading
+ * kernel is missing.
+ */
+int pm_hibernate_restored_cold(void)
+{
+	if (!READ_ONCE(hibernate_restored))
+		return 0;
+	return READ_ONCE(hibernate_restored_cold);
+}
+EXPORT_SYMBOL_GPL(pm_hibernate_restored_cold);
+
+/* Set while this kernel loads a hibernation image, see pm_hibernate_is_loading(). */
+static bool hibernate_loading;
+
+/**
+ * pm_hibernate_is_loading - Whether this kernel is loading a hibernation image.
+ *
+ * True from the PM_RESTORE_PREPARE notification, which starts the loading of an
+ * image (from the resume path or through the snapshot device), until the
+ * PM_POST_RESTORE notification that ends it when the image was not restored
+ * (or the notification chain refused it).  The devices of the kernel that
+ * loads an image are quiesced for the jump into the image, not frozen for an
+ * image of their own; the flag lets drivers tell the two apart in their
+ * freeze callbacks.  The kernel restored from an image reads false: the image
+ * holds the state of the kernel that created it.
+ */
+bool pm_hibernate_is_loading(void)
+{
+	return READ_ONCE(hibernate_loading);
+}
+EXPORT_SYMBOL_GPL(pm_hibernate_is_loading);
+
+/**
+ * hibernate_set_loading - Record that an image is being loaded or no longer is.
+ * @loading: New value of the flag read by pm_hibernate_is_loading().
+ *
+ * Called from the PM notifier chain helpers around PM_RESTORE_PREPARE and
+ * PM_POST_RESTORE.
+ */
+void hibernate_set_loading(bool loading)
+{
+	WRITE_ONCE(hibernate_loading, loading);
+}
+
 #ifdef CONFIG_SUSPEND
 /**
  * pm_hibernation_mode_is_suspend - Check if hibernation has been set to suspend
@@ -107,23 +205,36 @@ bool hibernation_in_progress(void)
 	return !atomic_read(&hibernate_atomic);
 }
 
-/*
- * Apple silicon Macs run firmware on their coprocessors (storage, secure
- * enclave, display, always-on processor, system controller, GPU and more).
- * Restoring an image means a cold boot through the platform boot chain, which
- * restarts that firmware, but most of the Linux drivers have no
- * freeze/poweroff/restore path that rebuilds their mailbox, ring and DMA state
- * from a cold start. The restored kernel would keep using stale state, so
- * writing and restoring images stays disabled on these machines.
+static bool (*hibernation_platform_blocked_fn)(void);
+static const char *hibernation_platform_blocked_reason;
+
+/**
+ * hibernation_set_platform_check - Let platform code refuse hibernation.
+ * @blocked: Tells whether hibernation is refused on this platform at the time.
+ * @reason: Why it is refused, for the log.
+ *
+ * A platform whose drivers cannot yet restore their devices from an image
+ * registers a check that is true until the platform has what it needs.  While
+ * it is true, writing and restoring images stays disabled
+ * (hibernation_available() is false) and @reason is logged at the end of the
+ * boot.  Only one check can be registered.
  *
  * pm_test dry runs are allowed (see hibernate()): every pm_test level stops
  * before create_image() takes a snapshot, so no image is written or restored.
  * They exercise the freezer and the device freeze/thaw callbacks that a real
  * implementation needs.
  */
+void hibernation_set_platform_check(bool (*blocked)(void), const char *reason)
+{
+	if (WARN_ON_ONCE(hibernation_platform_blocked_fn))
+		return;
+	hibernation_platform_blocked_reason = reason;
+	hibernation_platform_blocked_fn = blocked;
+}
+
 static bool hibernation_platform_blocked(void)
 {
-	return of_machine_is_compatible("apple,arm-platform");
+	return hibernation_platform_blocked_fn && hibernation_platform_blocked_fn();
 }
 
 static bool hibernation_generic_available(void)
@@ -142,7 +253,7 @@ bool hibernation_available(void)
 static int __init hibernation_platform_report(void)
 {
 	if (hibernation_platform_blocked())
-		pr_info("disabled on this platform: coprocessor firmware state is not restored from an image\n");
+		pr_info("disabled on this platform: %s\n", hibernation_platform_blocked_reason);
 	return 0;
 }
 late_initcall(hibernation_platform_report);
@@ -347,6 +458,25 @@ __weak int arch_resume_nosmt(void)
 }
 
 /**
+ * hibernate_resume_event - Pick the event that resumes the devices frozen for an image.
+ * @error: Result of the image creation so far.
+ *
+ * Called once the image is created, restored or given up on.  in_suspend is
+ * set only in the kernel that created the image, so a clear one means either
+ * that this kernel was restored from an image (devices get PMSG_RESTORE,
+ * their hardware went through a boot) or that the hibernation was aborted
+ * before the image existed (a device failed to freeze, a wakeup event, a
+ * pm_test level): the devices were only frozen, and the right event is
+ * PMSG_RECOVER, as after any other failed freeze.
+ */
+static pm_message_t hibernate_resume_event(int error)
+{
+	if (in_suspend)
+		return error ? PMSG_RECOVER : PMSG_THAW;
+	return pm_hibernate_is_restored() ? PMSG_RESTORE : PMSG_RECOVER;
+}
+
+/**
  * create_image - Create a hibernation image.
  * @platform_mode: Whether or not to use the platform driver.
  *
@@ -399,6 +529,13 @@ static int create_image(int platform_mode)
 	if (!in_suspend) {
 		events_check_enabled = false;
 		clear_or_poison_free_pages();
+		if (hibernate_load_record.magic == HIBERNATE_LOAD_MAGIC &&
+		    hibernate_load_record.self_phys == __pa_symbol(&hibernate_load_record))
+			WRITE_ONCE(hibernate_restored_cold, !!hibernate_load_record.other_boot);
+		else
+			WRITE_ONCE(hibernate_restored_cold, -ENODATA);
+		hibernate_load_record.magic = 0;
+		WRITE_ONCE(hibernate_restored, true);
 	}
 
 	platform_leave(platform_mode);
@@ -420,8 +557,7 @@ static int create_image(int platform_mode)
  Platform_finish:
 	platform_finish(platform_mode);
 
-	dpm_resume_start(in_suspend ?
-		(error ? PMSG_RECOVER : PMSG_THAW) : PMSG_RESTORE);
+	dpm_resume_start(hibernate_resume_event(error));
 
 	return error;
 }
@@ -438,6 +574,8 @@ int hibernation_snapshot(int platform_mode)
 	int error;
 
 	pm_suspend_clear_flags();
+	WRITE_ONCE(hibernate_restored, false);
+	WRITE_ONCE(hibernate_restored_cold, -ENODATA);
 	error = platform_begin(platform_mode);
 	if (error)
 		goto Close;
@@ -485,7 +623,7 @@ int hibernation_snapshot(int platform_mode)
 	if (error || !in_suspend)
 		swsusp_free();
 
-	msg = in_suspend ? (error ? PMSG_RECOVER : PMSG_THAW) : PMSG_RESTORE;
+	msg = hibernate_resume_event(error);
 	dpm_resume(msg);
 
 	if (error || !in_suspend)
@@ -551,6 +689,9 @@ static int resume_target_kernel(bool platform_mode)
 	save_processor_state();
 	error = restore_highmem();
 	if (!error) {
+		hibernate_load_record.other_boot = !hibernate_loading_own_image;
+		hibernate_load_record.self_phys = __pa_symbol(&hibernate_load_record);
+		hibernate_load_record.magic = HIBERNATE_LOAD_MAGIC;
 		error = swsusp_arch_resume();
 		/*
 		 * The code below is only ever reached in case of a failure.
@@ -558,6 +699,7 @@ static int resume_target_kernel(bool platform_mode)
 		 * swsusp_arch_suspend() was called.
 		 */
 		BUG_ON(!error);
+		hibernate_load_record.magic = 0;
 		/*
 		 * This call to restore_highmem() reverts the changes made by
 		 * the previous one.
@@ -774,6 +916,18 @@ static int load_image_and_restore(void)
 	}
 
 	error = swsusp_read(&flags);
+	if (!error) {
+		/*
+		 * The image is in memory now. Clear its on-disk signature
+		 * before the device restore, so that a restore which hangs
+		 * (for example a co-processor that does not come back after
+		 * the cold boot) cannot leave a valid image for the next boot
+		 * to resume into the same hang. swsusp_close() releases the
+		 * resume device, so do it while that is still open.
+		 */
+		if (swsusp_invalidate_sig())
+			pr_warn("could not invalidate the image signature; a failed restore may repeat\n");
+	}
 	swsusp_close();
 	if (!error)
 		error = hibernation_restore(flags & SF_PLATFORM_MODE);
@@ -917,8 +1071,11 @@ int hibernate(void)
 	if (snapshot_test) {
 		pm_pr_dbg("Checking hibernation image\n");
 		error = swsusp_check(false);
-		if (!error)
+		if (!error) {
+			hibernate_loading_own_image = true;
 			error = load_image_and_restore();
+			hibernate_loading_own_image = false;
+		}
 	}
 	thaw_processes();
 

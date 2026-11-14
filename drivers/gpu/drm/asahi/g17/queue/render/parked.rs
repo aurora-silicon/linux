@@ -42,6 +42,39 @@ pub(crate) struct ParkedPair {
     vm: u64,
 }
 
+impl ParkedPair {
+    /// Whether a cold-restarted firmware can take this parked pair over: no prior context
+    /// still awaits its replacement witness.
+    /// A retired or never-published retained binding owes it nothing (see
+    /// [`RetiredBinding::cold_safe`]).
+    pub(crate) fn cold_resettable(&self) -> bool {
+        self.previous.as_ref().is_none_or(RetiredBinding::cold_safe)
+    }
+
+    /// Returns the install state of this parked pair to a fresh pair's, for a firmware
+    /// cold-restarted against the restored graph: its next commit builds new queue records
+    /// and installs both queues again. Returns its QIDs and the completion stamp they held
+    /// after its last command (see `Pair::cold_stamp`).
+    pub(crate) fn reset_after_cold_boot(&mut self) -> Result<([u8; 2], u32)> {
+        if !self.cold_resettable() {
+            return Err(EBUSY);
+        }
+        self.installed = [false; 2];
+        self.registered = None;
+        self.outer_started = 0;
+        self.executed = 0;
+        if let Some(kicks) = self.kicks.as_mut() {
+            for kick in kicks.iter_mut() {
+                kick.reset_after_cold_boot()?;
+            }
+        }
+        Ok((
+            self.ids.map(|id| id.qid()),
+            crate::g17::fw::stamp_value(self.ordinal as u32),
+        ))
+    }
+}
+
 /// All new graph ownership stays separate from the installed kick storage until commit.
 pub(crate) struct Prepared {
     pool_pin: Option<crate::g17::freelist::PoolPin>,

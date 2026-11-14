@@ -162,6 +162,10 @@ mod cleanup {
     pub struct QueueOwner;
     impl QueueOwner { pub fn new() -> crate::Result<Self> { Ok(Self) } }
 }
+mod sysfs_exports {
+    pub struct HibernateGate;
+    impl HibernateGate { pub fn new() -> crate::Result<Self> { Ok(Self) } }
+}
 mod legacy_rx {
     pub struct QueueOwner;
     impl QueueOwner { pub fn new() -> crate::Result<Self> { Ok(Self) } }

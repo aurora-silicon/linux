@@ -129,6 +129,11 @@ pub(crate) fn poc_barrier() {
 pub(crate) struct ReservedTables {
     regions: KVec<kernel::io::mem::Mem>,
     starts: KVec<PhysicalAddr>,
+    /// The regions' contents are not the host's: set when a hibernation freeze completes,
+    /// cleared once the cold republish relinked them (or at a warm thaw). A hibernation image
+    /// does not hold no-map memory. While set, walks through a reserved parent follow the
+    /// recorded links instead of the parent entries and never install a new one.
+    stale: core::sync::atomic::AtomicBool,
 }
 
 // SAFETY: The mappings are plain write-back memory owned for the lifetime of this object; table
@@ -142,7 +147,18 @@ impl ReservedTables {
         Self {
             regions: KVec::new(),
             starts: KVec::new(),
+            stale: core::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// See [`ReservedTables::stale`].
+    pub(crate) fn set_stale(&self, stale: bool) {
+        self.stale.store(stale, Ordering::SeqCst);
+    }
+
+    /// See [`ReservedTables::stale`].
+    pub(crate) fn stale(&self) -> bool {
+        self.stale.load(Ordering::SeqCst)
     }
 
     /// Adds a reserved region, mapped write-back.
@@ -442,6 +458,14 @@ pub(crate) struct UatPageTable {
     /// firmware, so only the tables recorded here are ever freed. `None` if the driver owns the
     /// tables below the root, as with the handoff firmware interface.
     driver_tables: Option<KVec<PhysicalAddr>>,
+    /// The table descriptors this page table stored in a reserved-region table (`parent page,
+    /// entry index, descriptor`), which a cold-restarted firmware does not keep: reserved
+    /// regions are not in a hibernation image ([`Self::relink_reserved`]).
+    reserved_links: KVec<(PhysicalAddr, usize, u64)>,
+    /// Tables unmapped while the reserved regions were stale (`parent page, entry index,
+    /// descriptor, table`): the parent entry may still name the table, so it stays allocated
+    /// until [`Self::relink_reserved`] clears a matching entry and frees it.
+    stale_detaches: KVec<(PhysicalAddr, usize, u64, PhysicalAddr)>,
     va_range: Range<u64>,
     ias_mask: u64,
     oas_mask: u64,
@@ -462,6 +486,8 @@ impl UatPageTable {
             reserved: None,
             native_gpu: false,
             driver_tables: None,
+            reserved_links: KVec::new(),
+            stale_detaches: KVec::new(),
             va_range: 0..(1u64 << ias),
             ias_mask: (1u64 << ias) - 1,
             oas_mask: (1u64 << oas) - 1,
@@ -544,6 +570,8 @@ impl UatPageTable {
             reserved,
             native_gpu: false,
             driver_tables: shared_tables.then(KVec::new),
+            reserved_links: KVec::new(),
+            stale_detaches: KVec::new(),
             va_range,
             ias_mask: (1u64 << ias) - 1,
             oas_mask: (1u64 << oas) - 1,
@@ -559,6 +587,85 @@ impl UatPageTable {
 
     pub(crate) fn ttb(&self) -> PhysicalAddr {
         self.ttb
+    }
+
+    /// Stores again every table descriptor this page table placed in a reserved-region table
+    /// ([`Self::reserved_links`]) and cleans it to the point of coherency. For a firmware that
+    /// was cold-restarted under a host state restored from a hibernation image: the reserved
+    /// regions were not in the image, while the tables the descriptors name (RAM) were.
+    ///
+    /// An entry that holds another table descriptor belongs to the firmware or the boot loader
+    /// now and is not overwritten: `EIO`. Returns the number of descriptors stored.
+    pub(crate) fn relink_reserved(&mut self) -> Result<usize> {
+        let reserved = self.reserved.clone().ok_or(EINVAL)?;
+        let oas_mask = self.oas_mask;
+        let cleans = self.cleans_poc();
+        let mut stored = 0;
+        while let Some((parent, index, descriptor, table)) = self.stale_detaches.pop() {
+            let clear = |p: *mut u8| -> Result {
+                // SAFETY: with_table() bounds this access to one aligned PTE of a live table.
+                let pte = unsafe { &*(p as *const AtomicU64) };
+                if pte.load(Ordering::Acquire) == descriptor {
+                    pte.store(0, Ordering::Release);
+                    if cleans {
+                        clean_poc(p, PTE_SIZE);
+                    }
+                }
+                Ok(())
+            };
+            // SAFETY: The parent is a page of a reserved region, which stays reserved.
+            unsafe { with_table(Some(&reserved), parent, index * PTE_SIZE, PTE_SIZE, clear) }?;
+            if cleans {
+                poc_barrier();
+            }
+            crate::mem::sync();
+            // SAFETY: The table came from Page::into_phys() and no entry names it any more.
+            unsafe { Page::from_phys(table) };
+        }
+        for &(parent, index, descriptor) in self.reserved_links.iter() {
+            let relink = |p: *mut u8| -> Result<bool> {
+                // SAFETY: with_table() bounds this access to one aligned PTE of a live table.
+                let pte = unsafe { &*(p as *const AtomicU64) };
+                let current = pte.load(Ordering::Acquire);
+                if current == descriptor {
+                    return Ok(false);
+                }
+                if current != 0
+                    && current & PTE_TYPE_BITS == PTE_TYPE_LEAF_TABLE
+                    && current & oas_mask & (!UAT_PGMSK as u64)
+                        != descriptor & oas_mask & (!UAT_PGMSK as u64)
+                {
+                    pr_err!(
+                        "UATPageTable::relink_reserved: entry {} of {:#x} is {:#x}, not {:#x}\n",
+                        index,
+                        parent,
+                        current,
+                        descriptor
+                    );
+                    return Err(EIO);
+                }
+                pte.store(descriptor, Ordering::Release);
+                if cleans {
+                    clean_poc(p, PTE_SIZE);
+                }
+                Ok(true)
+            };
+            // SAFETY: The parent is a page of a reserved region, which stays reserved; the
+            // child table is owned by this page table.
+            if unsafe { with_table(Some(&reserved), parent, index * PTE_SIZE, PTE_SIZE, relink) }? {
+                stored += 1;
+            }
+        }
+        if cleans {
+            poc_barrier();
+        }
+        crate::mem::sync();
+        Ok(stored)
+    }
+
+    /// Number of descriptors [`Self::relink_reserved`] restores.
+    pub(crate) fn reserved_link_count(&self) -> usize {
+        self.reserved_links.len()
     }
 
     /// Walks the leaves of `iova_range` without changing them.
@@ -672,9 +779,29 @@ impl UatPageTable {
                         as usize;
                     mod_pr_debug!("UATPageTable::with_pages: borrowed phys {:#x}\n", phys);
                     let driver_tables = &mut self.driver_tables;
+                    let reserved_links = &mut self.reserved_links;
+                    let parent_reserved = reserved.as_ref().is_some_and(|r| r.contains(phys));
+                    let parent_stale =
+                        parent_reserved && reserved.as_ref().is_some_and(|r| r.stale());
                     let oas_mask = self.oas_mask;
                     let firmware_tree = reserved.as_deref();
                     let entry = |p: *mut u8| -> Result<Option<PhysicalAddr>> {
+                        if parent_stale {
+                            // The parent holds what the boot loader or a cold firmware left
+                            // there, not the host's entry: follow the recorded link, and defer
+                            // a new table until the republish relinked the parent.
+                            let link = reserved_links
+                                .iter()
+                                .find(|&&(page, index, _)| page == phys && index == upidx)
+                                .map(|&(_, _, descriptor)| {
+                                    descriptor & oas_mask & (!UAT_PGMSK as u64)
+                                });
+                            return match link {
+                                Some(table) => Ok(Some(table)),
+                                None if alloc => Err(EAGAIN),
+                                None => Ok(None),
+                            };
+                        }
                         let uptep = p.cast_const().cast::<Pte>();
                         // SAFETY: with_table() ensures the pointer is valid, and our index is
                         // aligned so it is safe to deref as an AtomicU64.
@@ -695,8 +822,21 @@ impl UatPageTable {
                                     Ok(())
                                 })?;
                             }
+                            // Record the reserved-parent link first: a later failure pops it, so
+                            // a table dropped on ENOMEM is never left in either list.
+                            if parent_reserved {
+                                reserved_links.push(
+                                    (phys, upidx, pt_page.phys() | PTE_TYPE_LEAF_TABLE),
+                                    GFP_KERNEL,
+                                )?;
+                            }
                             if let Some(tables) = driver_tables.as_mut() {
-                                tables.push(pt_page.phys(), GFP_KERNEL)?;
+                                if let Err(error) = tables.push(pt_page.phys(), GFP_KERNEL) {
+                                    if parent_reserved {
+                                        reserved_links.pop();
+                                    }
+                                    return Err(error.into());
+                                }
                             }
                             let pt_paddr = Page::into_phys(pt_page);
                             upte_val = pt_paddr | PTE_TYPE_LEAF_TABLE;
@@ -831,6 +971,32 @@ impl UatPageTable {
         if !owned {
             return Ok(());
         }
+        let parent_stale = parent.is_some_and(|(parent_phys, _)| {
+            self.reserved
+                .as_ref()
+                .is_some_and(|r| r.contains(parent_phys) && r.stale())
+        });
+        if let Some((parent_phys, parent_index)) = parent.filter(|_| parent_stale) {
+            // The stale parent's entry is not trusted, nor written: drop the recorded link so
+            // the republish never stores it again, and keep the table allocated until the
+            // relink clears an entry that may still name it (warm thaw).
+            let descriptor = phys | PTE_TYPE_LEAF_TABLE;
+            self.stale_detaches
+                .push((parent_phys, parent_index, descriptor, phys), GFP_KERNEL)?;
+            if let Some(tables) = self.driver_tables.as_mut() {
+                if let Some(index) = tables.iter().position(|&table| table == phys) {
+                    tables.swap_remove(index);
+                }
+            }
+            if let Some(index) = self
+                .reserved_links
+                .iter()
+                .position(|&(page, entry, _)| page == parent_phys && entry == parent_index)
+            {
+                self.reserved_links.swap_remove(index);
+            }
+            return Ok(());
+        }
         if let Some((parent_phys, parent_index)) = parent {
             let oas_mask = self.oas_mask;
             let in_reserved = self
@@ -875,6 +1041,15 @@ impl UatPageTable {
         if let Some(tables) = self.driver_tables.as_mut() {
             let index = tables.iter().position(|&table| table == phys).ok_or(EIO)?;
             tables.swap_remove(index);
+        }
+        if let Some((parent_phys, parent_index)) = parent {
+            if let Some(index) = self
+                .reserved_links
+                .iter()
+                .position(|&(page, entry, _)| page == parent_phys && entry == parent_index)
+            {
+                self.reserved_links.swap_remove(index);
+            }
         }
         if self.cleans_poc() {
             // Complete the parent descriptor clear before its detached child can be reused.

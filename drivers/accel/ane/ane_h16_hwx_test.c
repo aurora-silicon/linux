@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 #include <kunit/test.h>
 #include <linux/module.h>
+#include <linux/sprintf.h>
 
 #include "ane_h16_hwx.h"
 #include "ane_h16_tasks.h"
@@ -70,6 +71,50 @@ static void hwx_command_test(struct kunit *test)
 	}
 }
 
+/* A provenance note is accepted only with its payload inside the command. */
+static void hwx_note_test(struct kunit *test)
+{
+	const struct hwx_fixture_options o = { .note = true };
+	struct hwx_fixture *f = fixture_create_options(test, &o);
+	struct ane_h16_hwx info, *plain = kunit_kzalloc(test, sizeof(*plain), GFP_KERNEL);
+	u8 *note;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, plain);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+	f = fixture_create(test, false, false);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, plain), 0);
+	/* The note changes no mapping: the region table is the same. */
+	KUNIT_EXPECT_EQ(test, info.region_count, plain->region_count);
+	KUNIT_EXPECT_EQ(test, memcmp(info.regions, plain->regions, sizeof(info.regions)), 0);
+
+	f = fixture_create_options(test, &o);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	note = f->bytes + f->note;
+	/* Payload past the command end. */
+	put_unaligned_le64(0x40, note + 24);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	/* Payload overlapping the note header. */
+	put_unaligned_le64(0x20, note + 24);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	/* Wrapping length. */
+	put_unaligned_le64(0x28, note + 24);
+	put_unaligned_le64(U64_MAX, note + 32);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	put_unaligned_le64(20, note + 32);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+	/* Bytes after the payload stay zero. */
+	note[0x47] = 1;
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	note[0x47] = 0;
+	/* The owner name is terminated inside its 16 bytes. */
+	memset(note + 8, 'n', 16);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	memset(note + 8, 0, 16);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+}
+
 static void hwx_tensor_test(struct kunit *test)
 {
 	static const u32 fields[] = {
@@ -111,6 +156,22 @@ static u8 *fixture_ref(struct hwx_fixture *f, unsigned int index)
 		u8 *c = f->bytes + pos;
 
 		if (get_unaligned_le32(c) == 0x40 && seen++ == index)
+			return c;
+		pos += get_unaligned_le32(c + 4);
+	}
+	return NULL;
+}
+
+static u8 *fixture_kernel_segment(struct hwx_fixture *f, unsigned int index)
+{
+	size_t pos = 32;
+	unsigned int i, seen = 0;
+
+	for (i = 0; i < f->commands; i++) {
+		u8 *c = f->bytes + pos;
+
+		if (get_unaligned_le32(c) == 0x19 && !memcmp(c + 8, "__KERN_", 7) &&
+		    seen++ == index)
 			return c;
 		pos += get_unaligned_le32(c + 4);
 	}
@@ -188,6 +249,48 @@ static void hwx_surface_order_test(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, f);
 	fixture_surface_kind(f, 1, 1);
 	put_unaligned_le32(1, f->bytes + f->tensor[1] + 0x14);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+}
+
+/*
+ * Names longer than 7 bytes travel in 0x28-byte buffer references; the
+ * reference, the tensor and the symbol must still agree on the whole name.
+ */
+static void hwx_long_names_test(struct kunit *test)
+{
+	const struct hwx_fixture_options o = { .long_names = true };
+	struct hwx_fixture *f = fixture_create_options(test, &o);
+	struct ane_h16_hwx info;
+	u8 *ref;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+	KUNIT_EXPECT_STREQ(test, info.surfaces[0].name, "input_features");
+	KUNIT_EXPECT_STREQ(test, info.surfaces[1].name, "encoder_hidden");
+	ref = fixture_ref(f, 1);
+	KUNIT_ASSERT_NOT_NULL(test, ref);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(ref + 4), 0x28U);
+	/* A prefix of the tensor's name is a different name. */
+	ref[0x18 + 7] = 0;
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	ref[0x18 + 7] = 'r';
+	/* The name is terminated inside the reference, padding zero. */
+	memset(ref + 0x18, 'n', 16);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	memset(ref + 0x18, 0, 16);
+	strscpy(ref + 0x18, "encoder_hidden", 16);
+	ref[0x18 + 15] = 'x';
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	ref[0x18 + 15] = 0;
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+	/* Reference lengths: at least 32 bytes, at most a 32-byte name field. */
+	put_unaligned_le32(0x18 + ANE_H16_NAME_MAX + 8, ref + 4);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	put_unaligned_le32(0x28, ref + 4);
+	f = fixture_create(test, false, false);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	ref = fixture_ref(f, 0);
+	put_unaligned_le32(24, ref + 4);
 	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
 }
 
@@ -357,6 +460,33 @@ static void hwx_geometry_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
 }
 
+/* __TEXT may carry SG_NORELOC whether or not the program has a scratch. */
+static void hwx_text_flags_test(struct kunit *test)
+{
+	unsigned int variant;
+
+	for (variant = 0; variant < 4; variant++) {
+		struct hwx_fixture *f = fixture_create(test, variant & 1, variant & 2);
+		struct ane_h16_hwx info;
+		u8 *flags;
+
+		KUNIT_ASSERT_NOT_NULL(test, f);
+		flags = f->bytes + f->text_command + 68;
+		put_unaligned_le32(0, flags);
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+		put_unaligned_le32(4, flags);
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+		put_unaligned_le32(6, flags);
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+		put_unaligned_le32(1, flags);
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+		/* Other segments keep their exact flags. */
+		put_unaligned_le32(0, flags);
+		put_unaligned_le32(4, f->bytes + f->segment[0] + 68);
+		KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	}
+}
+
 static void hwx_symbols_test(struct kunit *test)
 {
 	struct hwx_fixture *f = fixture_create(test, false, false);
@@ -375,6 +505,103 @@ static void hwx_symbols_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
 	f->bytes[f->symbols + 5] = 1;
 	f->bytes[f->strings + 1] = 'X';
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+}
+
+/*
+ * A whole model has one section symbol per kernel blob. Move the table to
+ * the end of a larger copy and give it @count constant symbols besides the
+ * two surface symbols.
+ */
+static u8 *fixture_many_symbols(struct kunit *test, struct hwx_fixture *f, u32 count,
+				size_t *size)
+{
+	u32 symoff = f->size, nsyms = count + 2, stroff = symoff + nsyms * 16, strx = 1, i;
+	size_t total = stroff + 1 + 2 * 8 + (size_t)count * 8;
+	u8 *bytes = kunit_kzalloc(test, total, GFP_KERNEL), *c;
+
+	if (!bytes)
+		return NULL;
+	memcpy(bytes, f->bytes, f->size);
+	for (i = 0; i < nsyms; i++) {
+		u8 *symbol = bytes + symoff + i * 16;
+		char name[8];
+
+		if (i < 2) {
+			memcpy(symbol, f->bytes + f->symbols + i * 16, 16);
+			strscpy(name, i ? "out" : "in", sizeof(name));
+		} else {
+			/* __TEXT,__const of the plain form is section 4. */
+			symbol[4] = 0xf;
+			symbol[5] = 4;
+			put_unaligned_le64(0x30008000 + 64, symbol + 8);
+			snprintf(name, sizeof(name), "k%u", i);
+		}
+		put_unaligned_le32(strx, symbol);
+		strscpy(bytes + stroff + strx, name, sizeof(name));
+		strx += strlen(name) + 1;
+	}
+	c = bytes + f->symtab;
+	put_unaligned_le32(symoff, c + 8);
+	put_unaligned_le32(nsyms, c + 12);
+	put_unaligned_le32(stroff, c + 16);
+	put_unaligned_le32(strx, c + 20);
+	*size = total;
+	return bytes;
+}
+
+static void hwx_symbol_scale_test(struct kunit *test)
+{
+	struct hwx_fixture *f = fixture_create(test, false, false);
+	struct ane_h16_hwx info;
+	size_t size;
+	u8 *bytes, *table;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	bytes = fixture_many_symbols(test, f, 30000, &size);
+	KUNIT_ASSERT_NOT_NULL(test, bytes);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(bytes, size, &info), 0);
+	KUNIT_EXPECT_EQ(test, info.surface_count, 2U);
+	/* Two names far apart in the table are still found equal. */
+	table = bytes + get_unaligned_le32(bytes + f->symtab + 8);
+	put_unaligned_le32(get_unaligned_le32(table + 17 * 16), table + 29001 * 16);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(bytes, size, &info), -ENOEXEC);
+	/* A constant symbol may not reuse a surface name. */
+	put_unaligned_le32(get_unaligned_le32(table + 1 * 16), table + 29001 * 16);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(bytes, size, &info), -ENOEXEC);
+	/* The table bounds stay: more than 64K entries refuse. */
+	put_unaligned_le32(SZ_64K + 1, bytes + f->symtab + 12);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(bytes, size, &info), -ENOEXEC);
+}
+
+/*
+ * Debugging entries carry source type descriptions: no section, no value,
+ * and names that may repeat. They are skipped, their names bounded.
+ */
+static void hwx_stabs_test(struct kunit *test)
+{
+	const struct hwx_fixture_options o = { .stabs = 3 };
+	struct hwx_fixture *f = fixture_create_options(test, &o);
+	struct ane_h16_hwx info;
+	u8 *stab;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+	KUNIT_EXPECT_EQ(test, info.surface_count, 2U);
+	stab = f->bytes + f->symbols + 2 * 16;
+	/* The same description twice is not a duplicate symbol. */
+	put_unaligned_le32(get_unaligned_le32(stab), stab + 16);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+	/* Its name still lies in the string table. */
+	put_unaligned_le32(U32_MAX, stab + 16);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	put_unaligned_le32(get_unaligned_le32(stab), stab + 16);
+	/* Without the STAB bits the same entry is an invalid symbol. */
+	stab[4] = 0x0e;
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	stab[4] = 0x80;
+	/* A surface symbol is still required: STABs do not stand in for it. */
+	f->bytes[f->symbols + 4] = 0x20;
 	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
 }
 
@@ -397,6 +624,92 @@ static void hwx_relocations_test(struct kunit *test)
 	put_unaligned_le32(20, f->bytes + f->reloc);
 	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
 	put_unaligned_le32(4, f->bytes + f->reloc);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+}
+
+/*
+ * A large model splits its kernel data into __KERN_0..__KERN_n: contiguous
+ * in VM and in the file, one region, each section with its own base record
+ * and relocations against its own ordinal.
+ */
+static void hwx_kernel_segments_test(struct kunit *test)
+{
+	struct hwx_fixture_options o = { .mixed = true, .kernels = 4, .reloc_kernel = 2 };
+	struct hwx_fixture *f = fixture_create_options(test, &o);
+	struct ane_h16_hwx info;
+	unsigned int k;
+	u8 *program, *segment;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+	KUNIT_EXPECT_EQ(test, info.kernel_count, 4U);
+	KUNIT_EXPECT_EQ(test, info.kernel.vm, info.kernels[0].vm);
+	KUNIT_EXPECT_EQ(test, info.kernel.ordinal, 6U);
+	KUNIT_EXPECT_EQ(test, info.kernel.size, 3 * (u64)SZ_16K + 64);
+	for (k = 0; k < 4; k++) {
+		KUNIT_EXPECT_EQ(test, info.kernels[k].ordinal, 6 + k);
+		KUNIT_EXPECT_EQ(test, info.kernels[k].vm, info.kernels[0].vm + k * SZ_16K);
+	}
+	/* One kernel region of all four segments: scratch, 2 surfaces, text, kernel. */
+	KUNIT_ASSERT_EQ(test, info.region_count, 5U);
+	KUNIT_EXPECT_EQ(test, info.regions[4].kind, ANE_H16_REGION_KERNEL);
+	KUNIT_EXPECT_EQ(test, info.regions[4].size, 4 * (u64)SZ_16K);
+	KUNIT_EXPECT_EQ(test, info.regions[4].file_size, 4 * (u64)SZ_16K);
+
+	/* The relocation's addend is bounded by its own section. */
+	put_unaligned_le32(64, f->bytes + SZ_16K + 56);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	put_unaligned_le32(32, f->bytes + SZ_16K + 56);
+	/* Every kernel ordinal is a target; __TEXT,__const (5) is not. */
+	put_unaligned_le32(0x07000009, f->bytes + f->reloc + 4);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+	put_unaligned_le32(0x07000005, f->bytes + f->reloc + 4);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	put_unaligned_le32(0x0700000a, f->bytes + f->reloc + 4);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	put_unaligned_le32(0x07000008, f->bytes + f->reloc + 4);
+
+	/* Each section base has its record after the surfaces, in order. */
+	program = f->bytes + f->program;
+	put_unaligned_le64(get_unaligned_le64(program + 0xa0), program + 0xb0);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	put_unaligned_le64(info.kernels[0].vm + 2 * SZ_16K, program + 0xb0);
+	/* No record past the last kernel section. */
+	put_unaligned_le64(info.kernels[0].vm, program + 0xd0);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	put_unaligned_le64(0, program + 0xd0);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+
+	/* Segments in order: __KERN_2 may not follow __KERN_0. */
+	o.reloc_kernel = 0;
+	f = fixture_create_options(test, &o);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	segment = fixture_kernel_segment(f, 1);
+	KUNIT_ASSERT_NOT_NULL(test, segment);
+	segment[15] = '2';
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	segment[15] = '1';
+	/* A gap in VM or in the file splits the region: refused. */
+	put_unaligned_le64(get_unaligned_le64(segment + 24) + SZ_16K, segment + 24);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	put_unaligned_le64(get_unaligned_le64(segment + 24) - SZ_16K, segment + 24);
+	put_unaligned_le64(get_unaligned_le64(segment + 40) + SZ_16K, segment + 40);
+	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
+	put_unaligned_le64(get_unaligned_le64(segment + 40) - SZ_16K, segment + 40);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), 0);
+
+	/*
+	 * A partly file-backed segment cannot be followed by another one,
+	 * even when the next one continues in the file where it ends.
+	 */
+	o.kernels = 2;
+	f = fixture_create_options(test, &o);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	segment = fixture_kernel_segment(f, 0);
+	put_unaligned_le64(SZ_8K, segment + 48);
+	segment = fixture_kernel_segment(f, 1);
+	put_unaligned_le64(get_unaligned_le64(segment + 40) - SZ_8K, segment + 40);
+	put_unaligned_le32(get_unaligned_le32(segment + 72 + 48) - SZ_8K, segment + 72 + 48);
 	KUNIT_EXPECT_EQ(test, ane_h16_hwx_validate(f->bytes, f->size, &info), -ENOEXEC);
 }
 
@@ -464,6 +777,59 @@ static void hwx_load_plan_test(struct kunit *test)
 			}
 		}
 	}
+}
+
+/*
+ * The load budget bounds the sum of all mapped regions, not one segment.
+ * __TEXT maps 1G here and the kernel segment, moved after it, the rest; both
+ * are file-backed only for their first pages, so the file stays small.
+ */
+static struct ane_h16_hwx_snapshot *fixture_budget(struct kunit *test, u64 kernel_size)
+{
+	const struct hwx_fixture_options o = { .mixed = true, .kernel = true };
+	struct hwx_fixture *f = fixture_create_options(test, &o);
+	u8 *text, *kernel;
+	u64 kern;
+
+	if (!f)
+		return NULL;
+	text = f->bytes + f->text_command;
+	kernel = fixture_kernel_segment(f, 0);
+	kern = get_unaligned_le64(text + 24) + SZ_1G;
+	put_unaligned_le64(SZ_1G, text + 32);
+	put_unaligned_le64(kern, kernel + 24);
+	put_unaligned_le64(kernel_size, kernel + 32);
+	put_unaligned_le64(kern, kernel + 72 + 32);
+	put_unaligned_le64(kern, f->bytes + f->program + 0x90);
+	return fixture_snapshot(test, f);
+}
+
+static void hwx_load_budget_test(struct kunit *test)
+{
+	/* Scratch plus two surfaces are 48K. */
+	const u64 small = 3 * SZ_16K;
+	struct ane_h16_hwx_snapshot *snapshot;
+	struct ane_h16_load_plan plan;
+
+	snapshot = fixture_budget(test, SZ_512M);
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	KUNIT_ASSERT_EQ(test, ane_h16_load_plan_create(snapshot, &plan), 0);
+	KUNIT_EXPECT_EQ(test, plan.count, 5U);
+	KUNIT_EXPECT_EQ(test, plan.total, small + SZ_1G + SZ_512M);
+
+	/* Exactly the budget loads, one page more refuses and leaves the plan alone. */
+	snapshot = fixture_budget(test, ANE_H16_LOAD_BYTES_MAX - SZ_1G - small);
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	KUNIT_ASSERT_EQ(test, ane_h16_load_plan_create(snapshot, &plan), 0);
+	KUNIT_EXPECT_EQ(test, plan.total, (u64)ANE_H16_LOAD_BYTES_MAX);
+	snapshot = fixture_budget(test, ANE_H16_LOAD_BYTES_MAX - SZ_1G - small + SZ_16K);
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	plan.count = 0x1234;
+	KUNIT_EXPECT_EQ(test, ane_h16_load_plan_create(snapshot, &plan), -E2BIG);
+	KUNIT_EXPECT_EQ(test, plan.count, 0x1234U);
+
+	/* Each segment keeps its own bound. */
+	KUNIT_EXPECT_NULL(test, fixture_budget(test, ANE_H16_SEGMENT_MAX + SZ_16K));
 }
 
 static void hwx_load_original_test(struct kunit *test)
@@ -651,7 +1017,7 @@ static void hwx_h17_zin_test(struct kunit *test)
 	/* __TEXT carries relocations: flags 0 beside a scratch segment; nothing else. */
 	put_unaligned_le32(0, f->bytes + f->text_command + 68);
 	H17_OK();
-	AS_H16(REFUSED());
+	AS_H16(H17_OK());	/* hwx_text_flags_test: either flag on H16 too */
 	put_unaligned_le32(1, f->bytes + f->text_command + 68);
 	REFUSED();
 	put_unaligned_le32(4, f->bytes + f->text_command + 68);
@@ -688,7 +1054,7 @@ static void hwx_h17_zin_test(struct kunit *test)
 	put_unaligned_le32(3, f->bytes + f->symtab + 12);
 	put_unaligned_le32(strsize + 16, f->bytes + f->symtab + 20);
 	H17_OK();
-	AS_H16(REFUSED());
+	AS_H16(H17_OK());	/* H16G compilers emit stabs too (hwx_symbols_test) */
 	put_unaligned_le64(0x1000, sym + 8);
 	REFUSED();
 	put_unaligned_le64(0, sym + 8);
@@ -720,7 +1086,8 @@ static void hwx_h17_zin_test(struct kunit *test)
 	put_unaligned_le32(get_unaligned_le32(f->bytes + 16) + 1, f->bytes + 16);
 	put_unaligned_le32(f->cursor - 32, f->bytes + 20);
 	H17_OK();
-	AS_H16(REFUSED());
+	/* A provenance note of any owner, on either form (hwx_note_test). */
+	AS_H16(H17_OK());
 	put_unaligned_le64(48, note + 24);
 	REFUSED();
 	put_unaligned_le64(40, note + 24);
@@ -728,7 +1095,7 @@ static void hwx_h17_zin_test(struct kunit *test)
 	REFUSED();
 	note[44] = 0;
 	note[8] = 'R';
-	REFUSED();
+	H17_OK();
 	note[8] = 'r';
 
 	/* Everything together, as the compiler writes it. */
@@ -749,16 +1116,23 @@ static struct kunit_case hwx_cases[] = {
 	KUNIT_CASE(hwx_forms_test),
 	KUNIT_CASE(hwx_header_test),
 	KUNIT_CASE(hwx_command_test),
+	KUNIT_CASE(hwx_note_test),
 	KUNIT_CASE(hwx_tensor_test),
 	KUNIT_CASE(hwx_surface_order_test),
+	KUNIT_CASE(hwx_long_names_test),
 	KUNIT_CASE(hwx_program_test),
 	KUNIT_CASE(hwx_staged_counts_test),
 	KUNIT_CASE(hwx_final_task_end_test),
 	KUNIT_CASE(hwx_geometry_test),
+	KUNIT_CASE(hwx_text_flags_test),
 	KUNIT_CASE(hwx_symbols_test),
+	KUNIT_CASE(hwx_stabs_test),
+	KUNIT_CASE(hwx_symbol_scale_test),
 	KUNIT_CASE(hwx_relocations_test),
+	KUNIT_CASE(hwx_kernel_segments_test),
 	KUNIT_CASE(hwx_snapshot_test),
 	KUNIT_CASE(hwx_load_plan_test),
+	KUNIT_CASE(hwx_load_budget_test),
 	KUNIT_CASE(hwx_load_original_test),
 	KUNIT_CASE(hwx_load_resources_test),
 	KUNIT_CASE(hwx_import_bounds_test),

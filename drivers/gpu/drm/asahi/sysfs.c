@@ -4,18 +4,19 @@
 // driver. The attribute wrapper is removed and its readers drained before
 // that Arc is dropped. Atomic fields may reflect different sample instants.
 
+#include <linux/atomic.h>
 #include <linux/device.h>
+#include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/export.h>
 #include <linux/module.h>
-#include <linux/notifier.h>
-#include <linux/suspend.h>
 #include <linux/slab.h>
 #include <linux/stddef.h>
 #include <linux/string.h>
 #include <linux/sysfs.h>
 #include <linux/types.h>
 
+#include "g17/hibernate.h"
 #include "sysfs.h"
 
 /* Legacy prefix of repr(C) Rust atomics; READ_ONCE accesses current values. */
@@ -52,9 +53,10 @@ struct asahi_stats_attribute {
 	const struct asahi_gpu_memory *memory;
 	bool export_enabled;
 	asahi_stats_read_fn read;
-	asahi_stats_suspend_fn suspend;
 	asahi_stats_frequency_fn frequency;
-	struct notifier_block pm_notifier;
+	asahi_stats_hibernate_fn hibernate;
+	/* System sleep and hibernation notifiers (g17/hibernate.c), NULL without suspend. */
+	void *pm_hooks;
 };
 
 /* 0: unavailable, 1: valid, 2: stale, 3: unsupported; matches g17::telemetry. */
@@ -124,26 +126,6 @@ static ssize_t agx_qualified_stats_show(struct asahi_stats_attribute *stats, cha
 			   (unsigned long long)snap.util_samples,
 			   (unsigned long long)snap.util_host_ns);
 	return n;
-}
-
-static int asahi_stats_pm_notify(struct notifier_block *nb, unsigned long action, void *unused)
-{
-	struct asahi_stats_attribute *stats =
-		container_of(nb, struct asahi_stats_attribute, pm_notifier);
-
-	switch (action) {
-	case PM_SUSPEND_PREPARE:
-	case PM_HIBERNATION_PREPARE:
-	case PM_RESTORE_PREPARE:
-		stats->suspend(stats->snapshot, true);
-		break;
-	case PM_POST_SUSPEND:
-	case PM_POST_HIBERNATION:
-	case PM_POST_RESTORE:
-		stats->suspend(stats->snapshot, false);
-		break;
-	}
-	return NOTIFY_OK;
 }
 
 static ssize_t agx_stats_show(struct device *dev,
@@ -234,13 +216,14 @@ static ssize_t gpu_memory_show(struct device *dev,
 int asahi_sysfs_register(struct device *dev, const void *snapshot,
 			 int export_enabled, const void *memory, void **handle,
 			 asahi_stats_read_fn read, asahi_stats_suspend_fn suspend,
-			 asahi_stats_frequency_fn frequency)
+			 asahi_stats_frequency_fn frequency,
+			 asahi_stats_hibernate_fn hibernate)
 {
 	struct asahi_stats_attribute *stats;
 	int ret;
 
 	if (!dev || !handle || !memory || ((export_enabled || read) && !snapshot) ||
-	    (!!read != !!suspend))
+	    (!!read != !!suspend) || (hibernate && !suspend))
 		return -ENODEV;
 
 	BUILD_BUG_ON(offsetof(struct asahi_qualified_stats, util_host_ns) != 24);
@@ -267,16 +250,22 @@ int asahi_sysfs_register(struct device *dev, const void *snapshot,
 	stats->snapshot = snapshot;
 	stats->export_enabled = export_enabled;
 	stats->read = read;
-	stats->suspend = suspend;
 	stats->frequency = frequency;
-	if (suspend) {
-		stats->pm_notifier.notifier_call = asahi_stats_pm_notify;
-		ret = register_pm_notifier(&stats->pm_notifier);
-		if (ret) {
-			kfree(stats);
-			return ret;
-		}
+	stats->hibernate = hibernate;
+	stats->pm_hooks = asahi_pm_hooks_register(snapshot, suspend, hibernate);
+	if (IS_ERR(stats->pm_hooks)) {
+		ret = PTR_ERR(stats->pm_hooks);
+		kfree(stats);
+		return ret;
 	}
+
+	/*
+	 * Counted by the gate (30) only once both notifiers are in the chain: a
+	 * hibernation the gate lets through between the two would reach the stats
+	 * notifier (-10, which marks the late prepare) without the drain (20), and
+	 * the image would hold a GPU that was never drained.
+	 */
+	asahi_hibernate_device_bound(hibernate);
 
 	sysfs_attr_init(&stats->memory_attr.attr);
 	stats->memory_attr.attr.name = "gpu_memory";
@@ -286,8 +275,8 @@ int asahi_sysfs_register(struct device *dev, const void *snapshot,
 
 	ret = device_create_file(dev, &stats->attr);
 	if (ret) {
-		if (stats->suspend)
-			unregister_pm_notifier(&stats->pm_notifier);
+		asahi_hibernate_device_unbound(hibernate);
+		asahi_pm_hooks_unregister(stats->pm_hooks);
 		kfree(stats);
 		return ret;
 	}
@@ -295,8 +284,8 @@ int asahi_sysfs_register(struct device *dev, const void *snapshot,
 	ret = device_create_file(dev, &stats->memory_attr);
 	if (ret) {
 		device_remove_file(dev, &stats->attr);
-		if (stats->suspend)
-			unregister_pm_notifier(&stats->pm_notifier);
+		asahi_hibernate_device_unbound(hibernate);
+		asahi_pm_hooks_unregister(stats->pm_hooks);
 		kfree(stats);
 		return ret;
 	}
@@ -353,9 +342,10 @@ void asahi_sysfs_unregister(struct device *dev, void *handle)
 	if (!dev || !stats)
 		return;
 
+	/* Out of the gate first: the reverse of asahi_sysfs_register(). */
+	asahi_hibernate_device_unbound(stats->hibernate);
 	/* Both notifier removal and file removal join readers of the Rust Arc. */
-	if (stats->suspend)
-		unregister_pm_notifier(&stats->pm_notifier);
+	asahi_pm_hooks_unregister(stats->pm_hooks);
 	/* Removal drains active show callbacks before either allocation dies. */
 	device_remove_file(dev, &stats->memory_attr);
 	device_remove_file(dev, &stats->attr);

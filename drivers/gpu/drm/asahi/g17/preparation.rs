@@ -100,6 +100,17 @@ impl<'a> Admission<'a> {
         }
     }
 
+    /// Publication is closed across a hibernation: the budget restarts, so a packet that waited
+    /// for the freeze, the image and the republish still has the whole recovery allowance
+    /// once publication reopens.
+    pub(super) fn restart_for_hibernation(&self) {
+        let limit = super::now_ns()
+            .saturating_add(u64::from(super::timeout::RECOVERY_WAIT_MS) * 1_000_000);
+        if self.deadline.get() < limit {
+            self.deadline.set(limit);
+        }
+    }
+
     pub(super) fn check(&self) -> Result {
         (self.check)()?;
         if super::now_ns() >= self.deadline.get() { return Err(EBUSY); }
@@ -118,6 +129,8 @@ impl<'a> Admission<'a> {
 #[pin_data]
 pub(super) struct Gate {
     state: AtomicU64,
+    /// Closed by a hibernation freeze ([`Self::close_for_hibernation`]) until it reopens.
+    hibernating: core::sync::atomic::AtomicBool,
     #[pin]
     wait: Mutex<()>,
     #[pin]
@@ -139,6 +152,7 @@ impl Gate {
         Arc::pin_init(
             pin_init!(Self {
                 state: AtomicU64::new(EPOCH),
+                hibernating: core::sync::atomic::AtomicBool::new(false),
                 wait <- new_mutex!((), "g17::Gate::wait"),
                 changed <- new_condvar!("g17::Gate::changed"),
                 available,
@@ -182,6 +196,16 @@ impl Gate {
         }
     }
 
+    /// Runs `claim` under a lease, so that a closure (recovery, hibernation freeze) joins it
+    /// before it inspects queue state; a closed gate refuses it with `EAGAIN` without running
+    /// it. For claims taken without the device mutex. Called with no existing lease.
+    pub(super) fn admit_claim<T>(self: &Arc<Self>, claim: impl FnOnce() -> T) -> Result<T> {
+        let lease = self.try_enter()?;
+        let result = claim();
+        drop(lease);
+        Ok(result)
+    }
+
     /// Wait only for a temporary recovery closure. Called with no device lock or existing lease.
     pub(super) fn enter(self: &Arc<Self>, interruptible: bool) -> Result<Lease> {
         match self.try_enter() {
@@ -210,14 +234,14 @@ impl Gate {
     pub(super) fn enter_until(self: &Arc<Self>, admission: &Admission<'_>) -> Result<Lease> {
         admission.check()?;
         match self.try_enter() {
-            Err(error) if error == EAGAIN => admission.extend_for_recovery(),
+            Err(error) if error == EAGAIN => self.extend(admission),
             result => return result,
         }
         let mut wait = self.wait.lock();
         loop {
             admission.check()?;
             match self.try_enter() {
-                Err(error) if error == EAGAIN => admission.extend_for_recovery(),
+                Err(error) if error == EAGAIN => self.extend(admission),
                 result => return result,
             }
             let _ = self.changed.wait_timeout(
@@ -245,6 +269,27 @@ impl Gate {
                 Err(current) => previous = current,
             }
         }
+    }
+
+    fn extend(&self, admission: &Admission<'_>) {
+        if self.hibernating.load(Ordering::Acquire) {
+            admission.restart_for_hibernation();
+        } else {
+            admission.extend_for_recovery();
+        }
+    }
+
+    /// Closes publication for a hibernation freeze; admissions waiting on it keep restarting
+    /// their budget until [`Self::reopen`].
+    pub(super) fn close_for_hibernation(&self) {
+        self.hibernating.store(true, Ordering::Release);
+        self.close();
+    }
+
+    /// Ends a hibernation closure that will not reopen (the device was lost meanwhile):
+    /// admissions stop restarting their budget, so they fail at their deadline.
+    pub(super) fn end_hibernation(&self) {
+        self.hibernating.store(false, Ordering::Release);
     }
 
     /// Also wakes publishers in wait_closure(); they then block in enter().
@@ -332,6 +377,7 @@ impl Gate {
                 Ordering::Acquire,
             ) {
                 Ok(_) => {
+                    self.hibernating.store(false, Ordering::Release);
                     self.changed.notify_all();
                     drop(wait);
                     self.wake_waiters();
@@ -383,6 +429,40 @@ mod growth_gate_tests {
         let growth = gate.enter(false).unwrap();
         assert!(growth.is_current());
         drop(growth);
+    }
+}
+
+#[kunit_tests(asahi_g17_claim_gate)]
+mod claim_gate_tests {
+    use super::*;
+
+    #[test]
+    fn a_freeze_joins_an_admitted_claim() {
+        let gate = Gate::new().unwrap();
+        let claimed = gate.admit_claim(|| {
+            // A freeze that closes the gate meanwhile cannot confirm until the claim is in.
+            gate.close_for_hibernation();
+            let soon = super::super::now_ns() + 5_000_000;
+            assert_eq!(gate.wait_drained_until(soon), Err(ETIMEDOUT));
+            true
+        });
+        assert_eq!(claimed, Ok(true));
+        let soon = super::super::now_ns() + 5_000_000;
+        assert_eq!(gate.wait_drained_until(soon), Ok(()));
+        assert!(gate.reopen());
+    }
+
+    #[test]
+    fn a_closed_gate_refuses_a_claim_without_running_it() {
+        let gate = Gate::new().unwrap();
+        // Closed from the freeze until the republish after a cold resume has finished.
+        gate.close_for_hibernation();
+        let mut ran = false;
+        assert!(matches!(gate.admit_claim(|| ran = true), Err(error) if error == EAGAIN));
+        assert!(!ran);
+        assert_eq!(gate.state.load(Ordering::Acquire) & COUNT_MASK, 0);
+        assert!(gate.reopen());
+        assert_eq!(gate.admit_claim(|| 7), Ok(7));
     }
 }
 

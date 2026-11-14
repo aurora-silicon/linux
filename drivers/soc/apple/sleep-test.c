@@ -9,6 +9,9 @@
 static const char *const apple_sleep_test_tested[] = {
 	"apple,t8140-sleep",
 	"apple,t8132-sleep",
+#if APPLE_SLEEP_T6040
+	"apple,t6040-sleep",
+#endif
 };
 
 static bool apple_sleep_test_has(const struct apple_sleep_words *all, u32 offset)
@@ -77,6 +80,9 @@ static void apple_sleep_test_words(struct kunit *test)
 		};
 		int i;
 
+		/* A SoC with its own sequences has no lists. */
+		if (soc->part)
+			continue;
 		apple_sleep_test_full(test, c, "ps_all", all);
 		apple_sleep_test_full(test, c, "ps_aon_all", aon);
 		for (i = 0; i < ARRAY_SIZE(named); i++)
@@ -114,6 +120,9 @@ static void apple_sleep_test_ops(struct kunit *test)
 		const struct apple_sleep_soc *soc = id->data;
 		const struct apple_sleep_ops *ops = soc->ops;
 
+		/* A SoC with a part of its own (T6040) brings its sequences there. */
+		if (soc->part)
+			continue;
 		KUNIT_ASSERT_NOT_NULL_MSG(test, ops, "%s has no operations", id->compatible);
 		KUNIT_EXPECT_NOT_NULL(test, ops->deep_wfi_arm);
 		KUNIT_EXPECT_NOT_NULL(test, ops->lower_io);
@@ -134,6 +143,8 @@ static void apple_sleep_test_books(struct kunit *test)
 	for (id = apple_sleep_of_match; id->compatible[0]; id++) {
 		const struct apple_sleep_soc *soc = id->data;
 
+		if (soc->part)
+			continue;
 		KUNIT_EXPECT_LE(test, soc->nstray, BITS_PER_LONG);
 		KUNIT_EXPECT_LE(test, soc->ngate_coprocs,
 				ARRAY_SIZE(((struct apple_sleep *)0)->gate));
@@ -148,6 +159,8 @@ static void apple_sleep_test_wake_names(struct kunit *test)
 		const struct apple_sleep_soc *soc = id->data;
 		int i, j;
 
+		if (soc->part)
+			continue;
 		KUNIT_EXPECT_NE(test, soc->wake_last_word, 0);
 		for (i = 0; i < soc->nwake_names; i++) {
 			u32 n = soc->wake_names[i].id;
@@ -171,6 +184,8 @@ static void apple_sleep_test_layout(struct kunit *test)
 	for (id = apple_sleep_of_match; id->compatible[0]; id++) {
 		const struct apple_sleep_soc *soc = id->data;
 
+		if (soc->part)
+			continue;
 		KUNIT_EXPECT_GE(test, soc->ncluster_cpu, 1);
 		KUNIT_EXPECT_LE(test, soc->ncluster_cpu, SLEEP_CPU_CLUSTERS_MAX);
 		KUNIT_EXPECT_GT(test, soc->cpu_start_stride, 0);

@@ -9,6 +9,10 @@
 
 /* Blocks and properties the T6041 tree does not describe yet. */
 / {
+	aliases {
+		sio = &sio;
+	};
+
 	opp_p0: opp-table-p0 {
 		compatible = "operating-points-v2";
 		opp-shared;
@@ -241,8 +245,69 @@
 	pmgr_disp: power-management@502290000 {
 		compatible = "apple,t6041-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
 		reg = <0x5 0x02290000 0x0 0x4000>;
+		/* DISP_CPU's power word takes non-posted accesses (nGnRnE). */
+		nonposted-mmio;
 		#address-cells = <1>;
 		#size-cells = <1>;
+	};
+
+	t6040_sleep: sleep-controller@502888000 {
+		compatible = "apple,t6040-sleep";
+		/*
+		 * The SoC blocks the commit and wake
+		 * write, all shared read/write with their owning drivers and
+		 * touched only once no blocker remains:
+		 *   cpu-start   pmgr reg0 + 0x88000 (misc-cores): CPU start/stop
+		 *   wdt         the AON watchdog, the sleep's WD2 safety net
+		 *   cluster     0x502820000: the three CPU complexes E/P0/P1
+		 *   pwrgate     0x50282c000: wake + CPM retention voters
+		 *   clkgen      0x500000000: the clk-mux park words
+		 *   spmi        0x509014000: the PMU boot-stage + NOTIFY + go-hib
+		 *   spmi-a0     0x509188000: the second SPMI NOTIFY
+		 *   mastermini  0x508900000: the S2R timer at +0x4000 (the commit)
+		 *   soc-east    0x502280000: SOC-East page, retention + east power words
+		 *   soc-ps      0x502800000: SOC page, the west axi2af power words
+		 *   wake        0x508004000: the S2R control + wake masks/status
+		 * The handler refuses before touching any of them.
+		 */
+		reg = <0x5 0x02888000 0x0 0x20>,
+		      <0x5 0x0836c000 0x0 0x4000>,
+		      <0x5 0x02820000 0x0 0x20>,
+		      <0x5 0x0282c000 0x0 0x1000>,
+		      <0x5 0x00000000 0x0 0x80000>,
+		      <0x5 0x09014000 0x0 0x1000>,
+		      <0x5 0x09188000 0x0 0x1000>,
+		      <0x5 0x08900000 0x0 0x8000>,
+		      <0x5 0x02280000 0x0 0xd000>,
+		      <0x5 0x02800000 0x0 0x9000>,
+		      <0x5 0x08004000 0x0 0x1000>;
+		reg-names = "cpu-start", "wdt", "cluster", "pwrgate",
+			    "clkgen", "spmi", "spmi-a0", "mastermini",
+			    "soc-east", "soc-ps", "wake";
+		/*
+		 * ADT pmgr device-check-ps-b4-sleep (check-ps-b4-sleep = 0x1f): per
+		 * display pipe its CPU and its last sub-block, 8 bytes apart.
+		 */
+		apple,check-ps-b4-sleep = <&pmgr_disp 0x0 0x58>, <&pmgr_aux 0x350 0x388>,
+					  <&pmgr_aux 0x4a0 0x4d8>, <&pmgr_aux 0x4f0 0x528>,
+					  <&pmgr_aux 0x2e8 0x320>;
+		apple,check-ps-b4-sleep-names = "disp", "dispext0", "dispext1", "dispext2",
+						"dispext3";
+		/*
+		 * apple,apcie, for the sleep of ANS's storage PCIe link (two ST lanes
+		 * and a shared PHY), comes from the boot loader. From the ADT's
+		 * /arm-io/apcie0 it adds it here and puts the axi2af, cio3pll, clkgen,
+		 * phy-block and phy-ip windows and the apple,tunable-* arrays on the
+		 * internal PCIe host (apple,t6020-pcie, the one with an "rc"
+		 * reg-name), in the single-lane T8140 shape. It leaves a node that
+		 * already has apple,apcie alone, so this tree must give neither
+		 * apple,apcie nor an apcie-storage node. Without it a sleep with ANS
+		 * stopped is refused, and suspend-to-idle stays the default. The ST
+		 * power words (ps_ans, ps_apcie_st0/st1, ps_apcie_sys_st0/st1) are in
+		 * SOC-East and are driven through the soc-east window.
+		 */
+		/* Only on a board whose sleep has been tested. */
+		status = "disabled";
 	};
 };
 

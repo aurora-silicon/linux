@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/chosen/aura,hibernate.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Memory layout a boot object keeps the same on every boot
+
+maintainers:
+  - František Balázsy <frantisekbalazsy@gmail.com>
+
+description: |
+  A hibernation image puts every saved page back into the frame it was taken
+  from, so the boot that resumes an image has to give the kernel the same RAM,
+  and keep the same ranges from it, as the boot that wrote the image. On Apple
+  silicon the boot firmware loads the boot object at an address that changes
+  from boot to boot, and what the boot object keeps alive after the hand-off
+  moves with it. A boot object that instead keeps everything from the start of
+  RAM up to a fixed end from the kernel, at the same addresses on every boot,
+  says so with aura,hibernate-layout. Without it the kernel neither hibernates
+  nor resumes.
+
+  The boot firmware still places some firmware segments anew on every boot,
+  inside that range, and a kernel restored from an image holds the device tree
+  of the boot that wrote the image. The boot object therefore puts the device
+  tree of every boot at one address inside the range, given in
+  aura,hibernate-dt. The image does not contain that memory, so the restored
+  kernel reads there what the resuming boot placed.
+
+  The properties are named after aura, the boot loader that defined them and
+  whose released versions publish them.
+
+select:
+  properties:
+    $nodename:
+      const: chosen
+  required:
+    - $nodename
+
+properties:
+  $nodename:
+    const: chosen
+
+  aura,hibernate-layout:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    description:
+      The range of RAM that is kept from the kernel and laid out the same on
+      every boot.
+    items:
+      - description: Physical address of the start of RAM.
+      - description: Physical address of the end of the range, exclusive.
+
+  aura,hibernate-dt:
+    $ref: /schemas/types.yaml#/definitions/uint64
+    description:
+      Physical address, inside the range of aura,hibernate-layout, of the
+      device tree the kernel is started with. The kernel reads at most 2 MiB
+      there.
+
+dependencies:
+  aura,hibernate-dt: [ 'aura,hibernate-layout' ]
+
+additionalProperties: true
+...

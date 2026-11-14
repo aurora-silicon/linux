@@ -42,7 +42,7 @@ def controls(ROOT):
      void *tb_dpin_set_active,*tb_dpin_ctx,*phy,*fixed_phy;
      struct mux_control *xbar,*fixed_xbar;
      /* desktop 26.x hybrid hand-over and dual-pipe state; fw_compat is never desktop here */
-     bool peer_starved,typec_narrow,hdmi_yielded;
+     bool peer_starved,typec_narrow,hdmi_yielded; unsigned wake_list_sig;
      struct apple_dcp_typec_route *active_typec_route,*typec_routes;
      struct connector *connector,*fixed_connector;int connector_type,fixed_connector_type;
      struct mux_control *direct_xbar_up; bool external_native, ext_dead; int fw_compat; unsigned long long tb_generation;
@@ -415,7 +415,7 @@ static int cd321x_reset_inherited_connection(struct tps6598x *t,u32 *s) { (void)
 """
     helpers += '\n#define of_machine_is_compatible(name) (!strcmp((name), \"apple,t8140\"))\n#define BIT_ULL(n) (1ULL << (n))\n#define SN201202X_INT_DP_SID_UPDATE BIT_ULL(37)\n'
     helpers += block(core, 'static bool cd321x_uses_dp_sid(') + '\n' + block(core, 'static u64 cd321x_irq_mask(') + '\n'
-    unit += helpers + block(core, 'int tipd_init(') + r"""
+    unit += helpers + block(core, 'static int tipd_start_application(') + '\n' + block(core, 'int tipd_init(') + r"""
 static void probe_initial(struct cd321x *c) {
  initial(c);ordinary_port=true;phy_provider.safe_after_role=true;c->tps.irq=1;data.register_port=register_port;data.read_data_status=read_data_status;data.read_power_status=tps6598x_read_power_status;data.connect=connect;
  connect_error=irq_error=register_error=node_puts=mux_get_error=0;

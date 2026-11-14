@@ -40,7 +40,8 @@ def fixture():
         ensure = ensure.replace(old, new)
     admission = (item(preparation, "pub(super) struct Admission<'a>") + '\n' +
                  item(preparation, "impl<'a> Admission<'a>")).replace('pub(super) ', '').replace('super::now_ns()', 'now_ns()').replace('super::timeout::', '')
-    gate = item(preparation, 'pub(super) fn enter_until(').replace('pub(super) ', '')
+    gate = (item(preparation, 'pub(super) fn enter_until(') + '\n' +
+            item(preparation, 'fn extend(')).replace('pub(super) ', '')
     waits = '#[derive(Clone,Copy,Debug,PartialEq)]\n' + item(preparation, 'pub(super) enum AdmissionWait').replace('pub(super) ', '')
     waits += '\n' + next(line for line in preparation.splitlines() if 'const ADMISSION_WAITS:' in line).replace('pub(super) ', '')
     queue_wait = next(line for line in preparation.splitlines() if 'const QUEUE_WAIT_NS:' in line).replace('pub(super) ', '')
@@ -71,7 +72,7 @@ struct Wait;
 impl Wait{fn lock(&self){}}
 struct Changed;
 impl Changed{fn wait_timeout(&self,_:&mut (),_:u32){advance(1_000_000);assert!(now_ns()<=RECOVERY_WAIT_NS,"gate wake storm must remain bounded");}}
-struct Gate{wait:Wait,changed:Changed}
+struct Gate{wait:Wait,changed:Changed,hibernating:AtomicBool}
 struct Lease;
 impl Lease{fn is_current(&self)->bool{true}}
 impl Gate{
@@ -140,7 +141,7 @@ impl Backend{
 ''' + ensure + '\n' + packet + r'''
 }
 fn main(){
- let b=Backend{owner:1,context:Context,shared:Shared{compute_blocks:21,active_cores:1,progress:Available,preparations:Arc::new(Gate{wait:Wait,changed:Changed}),state:State(Mutex::new(Some(Box::new(Firmware{recovery:Recovery,init:Init,queues:Queues,port:()})))),crashed:AtomicBool::new(false)}};
+ let b=Backend{owner:1,context:Context,shared:Shared{compute_blocks:21,active_cores:1,progress:Available,preparations:Arc::new(Gate{wait:Wait,changed:Changed,hibernating:AtomicBool::new(false)}),state:State(Mutex::new(Some(Box::new(Firmware{recovery:Recovery,init:Init,queues:Queues,port:()})))),crashed:AtomicBool::new(false)}};
  let p=Arc::new(Packet{command:Validated::Compute{scratch:Scratch},completion:Completion});
  for mode in 0..4 {
   MODE.store(mode,Ordering::SeqCst);NOW.store(0,Ordering::SeqCst);CALLS.store(0,Ordering::SeqCst);REPORTED.store(usize::MAX,Ordering::SeqCst);

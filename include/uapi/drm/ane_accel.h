@@ -308,10 +308,10 @@ struct drm_ane_h16_section {
  * The kernel validates the HWX, places every section in its own private
  * mapping, then loads the program and creates its process. The program
  * belongs to this file and is unloaded when the file closes. The HWX must
- * be compiled for the engine that GET_CAPS reports. On H17 a firmware boot
- * accepts any number of programs, one per file. On H16 a firmware boot
- * accepts one program: a second H16_LOAD fails with -EBUSY, also after the
- * first program closed, and a reboot starts a new firmware boot.
+ * be compiled for the engine that GET_CAPS reports. A firmware boot accepts
+ * any number of programs, one per file, loaded at the same time or one after
+ * another; the firmware allocates program and process IDs from its own
+ * pools and the kernel queues the first request after every switch.
  */
 struct drm_ane_h16_load {
 	__u64 hwx_ptr;

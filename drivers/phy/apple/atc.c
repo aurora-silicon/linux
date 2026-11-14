@@ -4584,11 +4584,12 @@ static int atcphy_rpm_usb2_set_mode(struct phy *phy, enum phy_mode mode, int sub
 	return ret;
 }
 
-static const struct phy_ops apple_atc_usb2_phy_ops = {
+const struct phy_ops apple_atc_usb2_phy_ops = {
 	.owner = THIS_MODULE,
 	.init = atcphy_rpm_usb2_init,
 	.set_mode = atcphy_rpm_usb2_set_mode,
 };
+EXPORT_SYMBOL_GPL(apple_atc_usb2_phy_ops);
 
 static int atcphy_usb3_power_off(struct phy *phy)
 {

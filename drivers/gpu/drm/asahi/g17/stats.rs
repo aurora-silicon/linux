@@ -101,10 +101,34 @@ impl Reader {
         )
     }
 
+    /// Starts (`PM_*_PREPARE`) or ends (`PM_POST_*`) a sleep's statistics epoch.
     pub(crate) fn suspend(&self, suspended: bool) {
-        if let Some(firmware) = self.0.state.lock().as_deref_mut() {
+        let mut state = if suspended {
+            // No sleep begins while a post-hibernation restore runs.
+            self.0.finish_restore();
+            self.0.state.lock()
+        } else {
+            // `PM_POST_HIBERNATION` does not wait for the restore it just queued: the restore
+            // ends the epoch itself once the firmware is republished.
+            let Some(state) = self.0.state.lock_unless_restoring() else {
+                return;
+            };
+            state
+        };
+        if let Some(firmware) = state.as_deref_mut() {
             firmware.rings.suspend_statistics(suspended);
         }
+    }
+
+    /// PM_HIBERNATION_PREPARE: drain the GPU, or refuse the hibernation.
+    pub(crate) fn freeze(&self) -> kernel::error::Result {
+        self.0.freeze_for_hibernation()
+    }
+
+    /// PM_POST_HIBERNATION: re-boot a cold firmware against the restored host session, or
+    /// resume a firmware that kept running.
+    pub(crate) fn thaw(&self) {
+        self.0.thaw_after_hibernation();
     }
 }
 

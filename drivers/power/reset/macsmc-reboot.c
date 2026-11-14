@@ -127,15 +127,33 @@ static int macsmc_prepare_atomic(struct sys_off_data *data)
 static int macsmc_power_off(struct sys_off_data *data)
 {
 	struct macsmc_reboot *reboot = data->cb_data;
+	int ret, i;
 
 	dev_info(reboot->dev, "Issuing power off (off1)\n");
 
-	if (apple_smc_write_u32_atomic(reboot->smc, SMC_KEY(MBSE), SMC_KEY(off1)) < 0) {
-		dev_err(reboot->dev, "Failed to issue MBSE = off1 (power_off)\n");
-	} else {
+	/*
+	 * This is the only power-off path when Linux runs at EL2 without a
+	 * monitor, and where a PSCI SYSTEM_OFF follows, a monitor without a
+	 * power-off path resets the machine instead. So a slow or refused
+	 * off1 must not fall through after only 100 ms: retry a refused
+	 * command and give an accepted one time to take effect, and say on
+	 * the console which of the two happened.
+	 */
+	for (i = 0; i < 3; i++) {
+		ret = apple_smc_write_u32_atomic(reboot->smc, SMC_KEY(MBSE), SMC_KEY(off1));
+		if (ret >= 0)
+			break;
+		dev_warn(reboot->dev, "MBSE = off1 refused (%d), attempt %d\n", ret, i + 1);
 		mdelay(100);
-		WARN_ONCE(1, "Unable to power off system\n");
 	}
+	if (ret < 0) {
+		dev_err(reboot->dev, "Failed to issue MBSE = off1 (power_off)\n");
+		return NOTIFY_OK;
+	}
+	dev_dbg(reboot->dev, "off1 accepted, waiting for the power to drop\n");
+	for (i = 0; i < 50; i++)
+		mdelay(100);
+	WARN_ONCE(1, "Unable to power off system: off1 accepted, power still on after 5 s\n");
 
 	return NOTIFY_OK;
 }

@@ -14,6 +14,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_wakeup.h>
 #include <linux/soc/apple/dockchannel.h>
+#include <linux/suspend.h>
 #include <linux/unaligned.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
@@ -43,6 +44,13 @@
 #define DATA_RX32		0x28
 #define DATA_RX_COUNT		0x2c
 
+/* Bits of dockchannel::armed: the interrupt is enabled and has not fired since. */
+#define DOCKCHANNEL_TX_ARMED	0
+#define DOCKCHANNEL_RX_ARMED	1
+
+/* Receive interrupts below the threshold in a row before they are handled anyway. */
+#define DOCKCHANNEL_RX_SPURIOUS_MAX	16
+
 struct dockchannel {
 	struct device *dev;
 	int tx_irq;
@@ -55,6 +63,20 @@ struct dockchannel {
 	bool awaiting;
 	struct completion tx_comp;
 	struct completion rx_comp;
+
+	/*
+	 * Each interrupt is enabled by whoever arms it and disabled exactly once
+	 * afterwards, by its hard handler or by whoever gives up waiting, so the
+	 * enable depth stays balanced.
+	 */
+	unsigned long armed;
+	/* The receive threshold last programmed. */
+	u32 rx_thresh;
+	unsigned int rx_spurious;
+	/* Receive was stopped by dockchannel_await(..., 0) from outside the callback. */
+	bool rx_stopped;
+	/* The receive interrupt thread, which runs the client callback. */
+	struct task_struct *rx_thread;
 
 	void *cookie;
 	void (*data_available)(void *cookie, size_t avail);
@@ -70,23 +92,77 @@ struct dockchannel_common {
 
 /* Dockchannel FIFO functions */
 
+static void dockchannel_arm(struct dockchannel *dockchannel, int bit, int irq)
+{
+	if (!test_and_set_bit(bit, &dockchannel->armed))
+		enable_irq(irq);
+}
+
+/*
+ * Never disable_irq() here: a client's receive callback runs in the receive
+ * interrupt thread and waits for data from it, and disable_irq() would wait
+ * for that thread to finish, i.e. for itself.
+ */
+static void dockchannel_disarm(struct dockchannel *dockchannel, int bit, int irq)
+{
+	if (test_and_clear_bit(bit, &dockchannel->armed))
+		disable_irq_nosync(irq);
+}
+
 static irqreturn_t dockchannel_tx_irq(int irq, void *data)
 {
 	struct dockchannel *dockchannel = data;
 
+	/* Not armed: a sender giving up disables it. */
+	if (!test_and_clear_bit(DOCKCHANNEL_TX_ARMED, &dockchannel->armed))
+		return IRQ_HANDLED;
 	disable_irq_nosync(irq);
 	complete(&dockchannel->tx_comp);
 
 	return IRQ_HANDLED;
 }
 
+/*
+ * An interrupt with less data than the threshold that was programmed means
+ * that the FIFO does not hold that threshold: after a resume from disk the
+ * configuration registers hold what the boot loader or the boot kernel left,
+ * while the restored interrupt state says that receive is armed. Program it
+ * again and keep waiting, instead of waking a client to read data that is
+ * not there. Only a kernel restored from an image is in that position: any
+ * other takes every receive interrupt as it comes.
+ */
+static bool dockchannel_rx_spurious(struct dockchannel *dockchannel)
+{
+	u32 thresh = READ_ONCE(dockchannel->rx_thresh);
+
+	if (!pm_hibernate_is_restored())
+		return false;
+	if (readl_relaxed(dockchannel->data_base + DATA_RX_COUNT) >= thresh)
+		goto real;
+	writel_relaxed(thresh, dockchannel->config_base + CONFIG_RX_THRESH);
+	if (readl_relaxed(dockchannel->data_base + DATA_RX_COUNT) >= thresh)
+		goto real;
+	if (++dockchannel->rx_spurious <= DOCKCHANNEL_RX_SPURIOUS_MAX)
+		return true;
+	dev_warn_once(dockchannel->dev,
+		      "receive interrupt keeps firing below its threshold (%u)\n", thresh);
+real:
+	dockchannel->rx_spurious = 0;
+	return false;
+}
+
 static irqreturn_t dockchannel_rx_irq(int irq, void *data)
 {
 	struct dockchannel *dockchannel = data;
 
+	if (dockchannel_rx_spurious(dockchannel))
+		return IRQ_HANDLED;
+	/* Not armed: whoever is disarming it disables it. */
+	if (!test_and_clear_bit(DOCKCHANNEL_RX_ARMED, &dockchannel->armed))
+		return IRQ_HANDLED;
 	disable_irq_nosync(irq);
 
-	if (dockchannel->awaiting) {
+	if (READ_ONCE(dockchannel->awaiting)) {
 		return IRQ_WAKE_THREAD;
 	} else {
 		complete(&dockchannel->rx_comp);
@@ -97,9 +173,15 @@ static irqreturn_t dockchannel_rx_irq(int irq, void *data)
 static irqreturn_t dockchannel_rx_irq_thread(int irq, void *data)
 {
 	struct dockchannel *dockchannel = data;
-	size_t avail = readl_relaxed(dockchannel->data_base + DATA_RX_COUNT);
+	size_t avail;
 
-	dockchannel->awaiting = false;
+	WRITE_ONCE(dockchannel->rx_thread, current);
+	/* Woken just before a stop: the client asked for nothing more. */
+	if (READ_ONCE(dockchannel->rx_stopped) || !dockchannel->data_available)
+		return IRQ_HANDLED;
+
+	avail = readl_relaxed(dockchannel->data_base + DATA_RX_COUNT);
+	WRITE_ONCE(dockchannel->awaiting, false);
 	dockchannel->data_available(dockchannel->cookie, avail);
 
 	return IRQ_HANDLED;
@@ -119,11 +201,12 @@ int dockchannel_send(struct dockchannel *dockchannel, const void *buf, size_t co
 
 			writel_relaxed(threshold, dockchannel->config_base + CONFIG_TX_THRESH);
 			reinit_completion(&dockchannel->tx_comp);
-			enable_irq(dockchannel->tx_irq);
+			dockchannel_arm(dockchannel, DOCKCHANNEL_TX_ARMED, dockchannel->tx_irq);
 
 			if (!wait_for_completion_timeout(&dockchannel->tx_comp,
                                                  msecs_to_jiffies(DOCKCHANNEL_TX_TIMEOUT_MS))) {
-				disable_irq(dockchannel->tx_irq);
+				dockchannel_disarm(dockchannel, DOCKCHANNEL_TX_ARMED,
+						   dockchannel->tx_irq);
 				return -ETIMEDOUT;
 			}
 
@@ -147,6 +230,11 @@ int dockchannel_send(struct dockchannel *dockchannel, const void *buf, size_t co
 }
 EXPORT_SYMBOL(dockchannel_send);
 
+/*
+ * Called by the client's receive callback, in the receive interrupt thread:
+ * waiting for the rest of a frame here re-arms the receive interrupt, whose
+ * hard handler then completes the wait instead of waking the thread.
+ */
 int dockchannel_recv(struct dockchannel *dockchannel, void *buf, size_t count)
 {
 	size_t left = count;
@@ -159,13 +247,15 @@ int dockchannel_recv(struct dockchannel *dockchannel, void *buf, size_t count)
 		if (avail == 0) {
 			size_t threshold = min((size_t)(dockchannel->fifo_size / 2), left);
 
+			WRITE_ONCE(dockchannel->rx_thresh, threshold);
 			writel_relaxed(threshold, dockchannel->config_base + CONFIG_RX_THRESH);
 			reinit_completion(&dockchannel->rx_comp);
-			enable_irq(dockchannel->rx_irq);
+			dockchannel_arm(dockchannel, DOCKCHANNEL_RX_ARMED, dockchannel->rx_irq);
 
 			if (!wait_for_completion_timeout(&dockchannel->rx_comp,
                                                  msecs_to_jiffies(DOCKCHANNEL_RX_TIMEOUT_MS))) {
-				disable_irq(dockchannel->rx_irq);
+				dockchannel_disarm(dockchannel, DOCKCHANNEL_RX_ARMED,
+						   dockchannel->rx_irq);
 				return -ETIMEDOUT;
 			}
 
@@ -189,6 +279,24 @@ int dockchannel_recv(struct dockchannel *dockchannel, void *buf, size_t count)
 }
 EXPORT_SYMBOL(dockchannel_recv);
 
+/*
+ * Stop receiving. From outside the callback this also waits for a callback
+ * that is running to return, and undoes the re-arm it may have done meanwhile;
+ * the thread does not call the client again until receive is restarted.
+ */
+static void dockchannel_rx_stop(struct dockchannel *dockchannel)
+{
+	WRITE_ONCE(dockchannel->rx_stopped, true);
+	WRITE_ONCE(dockchannel->awaiting, false);
+	dockchannel_disarm(dockchannel, DOCKCHANNEL_RX_ARMED, dockchannel->rx_irq);
+	if (current == READ_ONCE(dockchannel->rx_thread))
+		return;
+
+	synchronize_irq(dockchannel->rx_irq);
+	WRITE_ONCE(dockchannel->awaiting, false);
+	dockchannel_disarm(dockchannel, DOCKCHANNEL_RX_ARMED, dockchannel->rx_irq);
+}
+
 int dockchannel_await(struct dockchannel *dockchannel,
 			    void (*callback)(void *cookie, size_t avail),
 			    void *cookie, size_t count)
@@ -196,16 +304,24 @@ int dockchannel_await(struct dockchannel *dockchannel,
 	size_t threshold = min((size_t)dockchannel->fifo_size, count);
 
 	if (!count) {
-		dockchannel->awaiting = false;
-		disable_irq(dockchannel->rx_irq);
+		dockchannel_rx_stop(dockchannel);
 		return 0;
+	}
+
+	if (current == READ_ONCE(dockchannel->rx_thread)) {
+		/* The callback re-arms itself; a stop that came meanwhile wins. */
+		if (READ_ONCE(dockchannel->rx_stopped))
+			return 0;
+	} else {
+		WRITE_ONCE(dockchannel->rx_stopped, false);
 	}
 
 	dockchannel->data_available = callback;
 	dockchannel->cookie = cookie;
-	dockchannel->awaiting = true;
+	WRITE_ONCE(dockchannel->awaiting, true);
+	WRITE_ONCE(dockchannel->rx_thresh, threshold);
 	writel_relaxed(threshold, dockchannel->config_base + CONFIG_RX_THRESH);
-	enable_irq(dockchannel->rx_irq);
+	dockchannel_arm(dockchannel, DOCKCHANNEL_RX_ARMED, dockchannel->rx_irq);
 
 	return threshold;
 }
@@ -415,6 +531,33 @@ static void dockchannel_remove(struct platform_device *pdev)
 	writel_relaxed(~0, dcc->irq_base + IRQ_FLAG);
 }
 
+/*
+ * After a resume from disk the interrupt mask register holds what the boot
+ * kernel left in it (nothing, if it never loaded this driver), while the
+ * restored interrupt descriptors still describe the image's state. Write the
+ * image's state back before the channel clients restore; an unmasked receive
+ * interrupt that the hardware has masked would never fire.
+ */
+static int dockchannel_restore_noirq(struct device *dev)
+{
+	struct dockchannel_common *dcc = dev_get_drvdata(dev);
+	u32 mask = 0;
+	int hwirq;
+
+	for (hwirq = 0; hwirq < DOCKCHANNEL_MAX_IRQ; hwirq++) {
+		unsigned int virq = irq_find_mapping(dcc->domain, hwirq);
+
+		if (virq && !irqd_irq_masked(irq_get_irq_data(virq)))
+			mask |= BIT(hwirq);
+	}
+	writel_relaxed(mask, dcc->irq_base + IRQ_MASK);
+	return 0;
+}
+
+static const struct dev_pm_ops dockchannel_pm_ops = {
+	.restore_noirq = pm_sleep_ptr(dockchannel_restore_noirq),
+};
+
 static const struct of_device_id dockchannel_of_match[] = {
 	{ .compatible = "apple,dockchannel" },
 	{},
@@ -425,6 +568,7 @@ static struct platform_driver dockchannel_driver = {
 	.driver = {
 		.name = "dockchannel",
 		.of_match_table = dockchannel_of_match,
+		.pm = pm_sleep_ptr(&dockchannel_pm_ops),
 	},
 	.probe = dockchannel_probe,
 	.remove = dockchannel_remove,

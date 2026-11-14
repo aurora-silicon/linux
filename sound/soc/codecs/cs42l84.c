@@ -23,7 +23,9 @@
 #include <linux/slab.h>
 #include <linux/acpi.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
 #include <linux/property.h>
+#include <linux/suspend.h>
 #include <linux/regulator/consumer.h>
 #include <linux/gpio/consumer.h>
 #include <linux/of_device.h>
@@ -1256,6 +1258,96 @@ err_disable_noreset:
 	return ret;
 }
 
+/*
+ * System sleep. The interrupt is level low and its thread reads the codec over
+ * I2C, so it is off from the suspend until the codec is set up again. A real
+ * S2R cuts the codec's power, and a resume from disk went through a boot: the
+ * codec comes back with its reset defaults, or with what the kernel that
+ * loaded the image set up. Its registers are then written again from the
+ * cache, and a jack that was seen before is reported gone; one still plugged
+ * in raises the plug interrupt again.
+ */
+static int cs42l84_suspend(struct device *dev)
+{
+	struct cs42l84_private *cs42l84 = dev_get_drvdata(dev);
+	struct i2c_client *i2c_client = to_i2c_client(dev);
+
+	if (i2c_client->irq)
+		disable_irq(i2c_client->irq);
+	scoped_guard(mutex, &cs42l84->irq_lock)
+		cs42l84_remote_stop(cs42l84);
+	cancel_delayed_work_sync(&cs42l84->remote_poll_work);
+	regcache_cache_only(cs42l84->regmap, true);
+
+	return 0;
+}
+
+static int cs42l84_wake(struct device *dev, bool lost)
+{
+	struct cs42l84_private *cs42l84 = dev_get_drvdata(dev);
+	struct i2c_client *i2c_client = to_i2c_client(dev);
+	int ret = 0;
+
+	regcache_cache_only(cs42l84->regmap, false);
+	if (lost) {
+		if (cs42l84->reset_gpio) {
+			gpiod_set_value_cansleep(cs42l84->reset_gpio, 0);
+			usleep_range(1000, 2000);
+			gpiod_set_value_cansleep(cs42l84->reset_gpio, 1);
+		}
+		usleep_range(CS42L84_BOOT_TIME_US, CS42L84_BOOT_TIME_US * 2);
+
+		scoped_guard(mutex, &cs42l84->irq_lock) {
+			regcache_mark_dirty(cs42l84->regmap);
+			/* LATCH_TO_VP first, as the plug detection set-up writes it. */
+			ret = regcache_sync_region(cs42l84->regmap, CS42L84_MIC_DET_CTL4,
+						   CS42L84_MIC_DET_CTL4);
+			if (!ret)
+				ret = regcache_sync(cs42l84->regmap);
+			if (ret)
+				dev_err(dev, "registers not restored after the sleep: %d\n", ret);
+
+			if (cs42l84->tip_state != CS42L84_UNPLUG) {
+				cs42l84->tip_state = CS42L84_UNPLUG;
+				cs42l84->ring_state = CS42L84_UNPLUG;
+				cs42l84->hs_type = 0;
+				cs42l84_revert_hs(cs42l84);
+				if (cs42l84->jack)
+					snd_soc_jack_report(cs42l84->jack, 0, SND_JACK_HEADSET);
+				cs42l84_set_interrupt_masks(cs42l84,
+							    CS42L84_RS_PLUG | CS42L84_RS_UNPLUG);
+			}
+		}
+	} else if (cs42l84->hs_type == SND_JACK_HEADSET) {
+		/* The headset is still there: poll its buttons again. */
+		scoped_guard(mutex, &cs42l84->irq_lock)
+			cs42l84_remote_start(cs42l84);
+	}
+	if (i2c_client->irq)
+		enable_irq(i2c_client->irq);
+
+	return ret;
+}
+
+static int cs42l84_resume(struct device *dev)
+{
+	return cs42l84_wake(dev, pm_resume_via_firmware());
+}
+
+static int cs42l84_restore(struct device *dev)
+{
+	return cs42l84_wake(dev, true);
+}
+
+static const struct dev_pm_ops cs42l84_pm_ops = {
+	.suspend = pm_sleep_ptr(cs42l84_suspend),
+	.resume = pm_sleep_ptr(cs42l84_resume),
+	.freeze = pm_sleep_ptr(cs42l84_suspend),
+	.thaw = pm_sleep_ptr(cs42l84_resume),
+	.poweroff = pm_sleep_ptr(cs42l84_suspend),
+	.restore = pm_sleep_ptr(cs42l84_restore),
+};
+
 static void cs42l84_i2c_remove(struct i2c_client *i2c_client)
 {
 	struct cs42l84_private *cs42l84 = i2c_get_clientdata(i2c_client);
@@ -1284,6 +1376,7 @@ static struct i2c_driver cs42l84_i2c_driver = {
 	.driver = {
 		.name = "cs42l84",
 		.of_match_table = cs42l84_of_match,
+		.pm = pm_sleep_ptr(&cs42l84_pm_ops),
 	},
 	.id_table = cs42l84_id,
 	.probe = cs42l84_i2c_probe,

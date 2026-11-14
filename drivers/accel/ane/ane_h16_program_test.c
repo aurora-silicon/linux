@@ -875,6 +875,247 @@ static void program_kernel_slots_test(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, slots[i].present, i != 5 && i < 7);
 }
 
+/*
+ * Generic section of the kernel-buffer form: generic_fill(), then one input
+ * entry per kernel section with the next IDs. Operation section that binds
+ * BAR slot 1 (__TEXT,__const) to 1007 and each kernel base to its ID.
+ */
+static size_t generic_fill_kernels(u8 *g, const struct ane_h16_hwx *hwx, u32 base)
+{
+	unsigned int first = hwx->surface_count + !!hwx->scratch.size, k;
+	size_t size = generic_fill(g, hwx, base);
+
+	for (k = 0; k < hwx->kernel_count; k++) {
+		u8 *e = g + size + k * ANE_H16_GENERIC_ENTRY;
+
+		memset(e, 0, ANE_H16_GENERIC_ENTRY);
+		put_unaligned_le32(1, e);
+		put_unaligned_le32(base + first + k, e + 4);
+		put_unaligned_le32(1, e + 0x10);
+		put_unaligned_le64(hwx->kernels[k].size, e + 0x20);
+		put_unaligned_le32(0xffff, e + 0x28);
+	}
+	put_unaligned_le32(first + hwx->kernel_count, g + ANE_H16_GENERIC_COUNT);
+	return size + hwx->kernel_count * ANE_H16_GENERIC_ENTRY;
+}
+
+static size_t operation_fill_kernels(u8 *o, const struct ane_h16_hwx_snapshot *snapshot,
+				     const struct ane_h16_hwx *hwx, u32 base)
+{
+	const u8 *c = (const u8 *)snapshot->bytes + hwx->program_offset;
+	unsigned int first = hwx->surface_count + !!hwx->scratch.size, slot, i, refs = 0;
+
+	memset(o, 0, 4 + ANE_H16_OPERATION_RECORD);
+	put_unaligned_le32(1, o);
+	for (slot = 0; slot < 64; slot++) {
+		u64 vm = get_unaligned_le64(c + 0x10 * (slot + 1));
+		u32 tag = 0;
+
+		if (!vm)
+			continue;
+		if (vm == hwx->constants.vm)
+			tag = ANE_H16_RESOURCE_KERNEL;
+		if (hwx->scratch.size && vm == hwx->scratch.vm)
+			tag = base + hwx->surface_count;
+		for (i = 0; i < hwx->surface_count; i++)
+			if (vm == hwx->surfaces[i].section.vm)
+				tag = base + i;
+		for (i = 0; i < hwx->kernel_count; i++)
+			if (vm == hwx->kernels[i].vm)
+				tag = base + first + i;
+		if (!tag)
+			continue;
+		put_unaligned_le32(slot, o + 4 + 0xc + refs * 8);
+		put_unaligned_le32(tag, o + 4 + 0x10 + refs * 8);
+		refs++;
+	}
+	put_unaligned_le32(refs, o + 4 + 8);
+	return 4 + ANE_H16_OPERATION_RECORD;
+}
+
+static struct ane_h16_hwx_snapshot *fw_snapshot_options(struct kunit *test,
+							const struct hwx_fixture_options *o)
+{
+	struct hwx_fixture *x = fixture_create_options(test, o);
+	struct ane_h16_hwx_snapshot *snapshot;
+
+	if (!x)
+		return NULL;
+	snapshot = kunit_kzalloc(test, sizeof(*snapshot), GFP_KERNEL);
+	if (!snapshot || ane_h16_hwx_snapshot_create(x->bytes, x->size, snapshot) ||
+	    kunit_add_action_or_reset(test, snapshot_free, snapshot))
+		return NULL;
+	return snapshot;
+}
+
+/*
+ * A program with kernel data in four sections and a constant operand on BAR
+ * slot 1: LOAD slot 1 carries __TEXT,__const at its sub-page address, and
+ * every EXECUTE binds each kernel section at its place in the kernel region.
+ */
+static void program_kernel_buffers_test(struct kunit *test)
+{
+	const struct hwx_fixture_options o = { .mixed = true, .kernels = 4, .reloc_kernel = 3 };
+	struct ane_h16_hwx_snapshot *snapshot = fw_snapshot_options(test, &o);
+	struct ane_h16_hwx *hwx = kunit_kzalloc(test, sizeof(*hwx), GFP_KERNEL);
+	struct ane_h16_program *p = NULL;
+	struct prog_fw *f = fw_create(test);
+	unsigned int i, text, kernel;
+	const u8 *d;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	KUNIT_ASSERT_NOT_NULL(test, hwx);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(snapshot->bytes, snapshot->size, hwx), 0);
+	KUNIT_ASSERT_EQ(test, hwx->kernel_count, 4U);
+	test_aux_size[ANE_H16_AUX_GENERIC] =
+		generic_fill_kernels(test_aux[ANE_H16_AUX_GENERIC], hwx, TEST_GENERIC_BASE);
+	test_aux_size[ANE_H16_AUX_OPERATION] =
+		operation_fill_kernels(test_aux[ANE_H16_AUX_OPERATION], snapshot, hwx,
+				       TEST_GENERIC_BASE);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_load(&f->s, snapshot, test_aux_ptr,
+						   test_aux_size, &p), 0);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	for (i = 0, text = kernel = p->plan.count; i < p->plan.count; i++) {
+		if (p->plan.regions[i].kind == ANE_H16_REGION_TEXT)
+			text = i;
+		if (p->plan.regions[i].kind == ANE_H16_REGION_KERNEL)
+			kernel = i;
+	}
+	KUNIT_ASSERT_LT(test, text, p->plan.count);
+	KUNIT_ASSERT_LT(test, kernel, p->plan.count);
+	expect_slot(test, f->load, 1, 1007, 3,
+		    p->regions[text].dva + (hwx->constants.vm - p->plan.regions[text].vm),
+		    hwx->constants.size);
+	expect_slot(test, f->load, 2, 1006, 4,
+		    p->regions[text].dva + (hwx->text.vm - p->plan.regions[text].vm),
+		    hwx->text.size);
+	/* Read-only: only the output and the scratch are device-writable. */
+	KUNIT_EXPECT_EQ(test, f->writable_maps, 2);
+
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	/* Two surfaces, the scratch, then the four kernel sections. */
+	KUNIT_ASSERT_EQ(test, get_unaligned_le32(f->exec + 0x28), 7);
+	for (i = 0; i < 4; i++) {
+		d = f->exec + 0x60 + (3 + i) * 0x30;
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 4), TEST_GENERIC_BASE + 3 + i);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le32(d + 8), 0);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x18),
+				p->regions[kernel].dva + i * SZ_16K);
+		KUNIT_EXPECT_EQ(test, get_unaligned_le64(d + 0x20), 64);
+	}
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
+}
+
+/* Which resource 1007 names, and when several kernel sections must be buffers. */
+static void program_kernel_binding_rules_test(struct kunit *test)
+{
+	const struct hwx_fixture_options four = { .kernels = 4 }, one = { .kernel = true };
+	struct ane_h16_hwx_snapshot *snapshot = fw_snapshot_options(test, &four);
+	struct ane_h16_hwx *hwx = kunit_kzalloc(test, sizeof(*hwx), GFP_KERNEL);
+	struct ane_h16_process_binding bindings[ANE_H16_SURFACES], scratch, kernels[16];
+	unsigned int count, kernel_count;
+	u8 *g = test_aux[ANE_H16_AUX_GENERIC], *o = test_aux[ANE_H16_AUX_OPERATION];
+	size_t gs, os;
+	u8 *entry;
+	u32 refs;
+	int ret;
+
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	KUNIT_ASSERT_NOT_NULL(test, hwx);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(snapshot->bytes, snapshot->size, hwx), 0);
+	/* Four kernel sections in the slot-1 form: one slot, one base, refused. */
+	gs = generic_fill(g, hwx, TEST_GENERIC_BASE);
+	os = operation_fill(o, snapshot, hwx, TEST_GENERIC_BASE);
+	ret = ane_h16_process_bindings_kernels(hwx, g, gs, bindings, &count, &scratch, kernels,
+					       &kernel_count);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_EXPECT_EQ(test, kernel_count, 0U);
+	ret = ane_h16_operation_validate_kernels(snapshot, hwx, o, os, bindings, count, &scratch,
+						 kernels, 0);
+	KUNIT_EXPECT_EQ(test, ret, -ENOEXEC);
+	/* As buffers they bind, each through its own ID. */
+	gs = generic_fill_kernels(g, hwx, TEST_GENERIC_BASE);
+	os = operation_fill_kernels(o, snapshot, hwx, TEST_GENERIC_BASE);
+	KUNIT_EXPECT_EQ(test, ane_h16_process_bindings(hwx, g, gs, bindings, &count, &scratch),
+			-ENOEXEC);
+	ret = ane_h16_process_bindings_kernels(hwx, g, gs, bindings, &count, &scratch, kernels,
+					       &kernel_count);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_ASSERT_EQ(test, kernel_count, 4U);
+	KUNIT_EXPECT_EQ(test, kernels[2].hwx_vm, hwx->kernels[2].vm);
+	ret = ane_h16_operation_validate_kernels(snapshot, hwx, o, os, bindings, count, &scratch,
+						 kernels, 4);
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	/* Every kernel section must be bound: drop the last pair. */
+	refs = get_unaligned_le32(o + 4 + 8);
+	put_unaligned_le32(refs - 1, o + 4 + 8);
+	ret = ane_h16_operation_validate_kernels(snapshot, hwx, o, os, bindings, count, &scratch,
+						 kernels, 4);
+	KUNIT_EXPECT_EQ(test, ret, -ENOEXEC);
+	put_unaligned_le32(refs, o + 4 + 8);
+	/* A kernel ID must name its own section's base. */
+	put_unaligned_le32(TEST_GENERIC_BASE + 2 + 1, o + 4 + 0x10 + (refs - 1) * 8);
+	ret = ane_h16_operation_validate_kernels(snapshot, hwx, o, os, bindings, count, &scratch,
+						 kernels, 4);
+	KUNIT_EXPECT_EQ(test, ret, -ENOEXEC);
+	/* A kernel entry is an input of the section size, up to its pages. */
+	entry = g + ANE_H16_GENERIC_HEADER + 3 * ANE_H16_GENERIC_ENTRY;
+	put_unaligned_le64(SZ_16K + 1, entry + 0x20);
+	ret = ane_h16_process_bindings_kernels(hwx, g, gs, bindings, &count, &scratch, kernels,
+					       &kernel_count);
+	KUNIT_EXPECT_EQ(test, ret, -ENOEXEC);
+	put_unaligned_le64(64, entry + 0x20);
+	put_unaligned_le32(1, entry + 8);
+	ret = ane_h16_process_bindings_kernels(hwx, g, gs, bindings, &count, &scratch, kernels,
+					       &kernel_count);
+	KUNIT_EXPECT_EQ(test, ret, -ENOEXEC);
+	put_unaligned_le32(0, entry + 8);
+	/* IDs stay unique across surfaces and kernel sections. */
+	put_unaligned_le32(TEST_GENERIC_BASE, entry + 4);
+	ret = ane_h16_process_bindings_kernels(hwx, g, gs, bindings, &count, &scratch, kernels,
+					       &kernel_count);
+	KUNIT_EXPECT_EQ(test, ret, -ENOEXEC);
+
+	/*
+	 * One kernel section in the slot-1 form: 1007 names the kernel, so a
+	 * pair binding the constants base to it is refused.
+	 */
+	snapshot = fw_snapshot_options(test, &one);
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(snapshot->bytes, snapshot->size, hwx), 0);
+	gs = generic_fill(g, hwx, TEST_GENERIC_BASE);
+	os = operation_fill(o, snapshot, hwx, TEST_GENERIC_BASE);
+	KUNIT_ASSERT_EQ(test, ane_h16_process_bindings(hwx, g, gs, bindings, &count, NULL), 0);
+	KUNIT_ASSERT_EQ(test, ane_h16_operation_validate(snapshot, hwx, o, os, bindings, count,
+							 NULL), 0);
+	refs = get_unaligned_le32(o + 4 + 8);
+	put_unaligned_le32(1, o + 4 + 0xc + refs * 8);
+	put_unaligned_le32(ANE_H16_RESOURCE_KERNEL, o + 4 + 0x10 + refs * 8);
+	put_unaligned_le32(refs + 1, o + 4 + 8);
+	KUNIT_EXPECT_EQ(test, ane_h16_operation_validate(snapshot, hwx, o, os, bindings, count,
+							 NULL), -ENOEXEC);
+
+	/* Without a kernel section slot 1 carries the constants: 1007 binds BAR 1. */
+	snapshot = fw_snapshot(test, false, false);
+	KUNIT_ASSERT_NOT_NULL(test, snapshot);
+	KUNIT_ASSERT_EQ(test, ane_h16_hwx_validate(snapshot->bytes, snapshot->size, hwx), 0);
+	gs = generic_fill(g, hwx, TEST_GENERIC_BASE);
+	os = operation_fill(o, snapshot, hwx, TEST_GENERIC_BASE);
+	KUNIT_ASSERT_EQ(test, ane_h16_process_bindings(hwx, g, gs, bindings, &count, NULL), 0);
+	refs = get_unaligned_le32(o + 4 + 8);
+	put_unaligned_le32(1, o + 4 + 0xc + refs * 8);
+	put_unaligned_le32(ANE_H16_RESOURCE_KERNEL, o + 4 + 0x10 + refs * 8);
+	put_unaligned_le32(refs + 1, o + 4 + 8);
+	KUNIT_EXPECT_EQ(test, ane_h16_operation_validate(snapshot, hwx, o, os, bindings, count,
+							 NULL), 0);
+	/* ...and only BAR slot 1: the text base on slot 0 is not the constants. */
+	put_unaligned_le32(0, o + 4 + 0xc + refs * 8);
+	KUNIT_EXPECT_EQ(test, ane_h16_operation_validate(snapshot, hwx, o, os, bindings, count,
+							 NULL), -ENOEXEC);
+}
+
 static void program_replies_test(struct kunit *test)
 {
 	struct ane_h16_load_slot slots[ANE_H16_LOAD_SLOTS] = {};
@@ -1030,7 +1271,7 @@ static void program_session_test(struct kunit *test)
 	};
 	static const u32 gates[] = { 0, 0, 0, 0, 1, 0, 0, 1 };
 	struct prog_fw *f = fw_create(test);
-	struct ane_h16_program *p = NULL, *second = NULL;
+	struct ane_h16_program *p = NULL, *second = NULL, *third = NULL;
 	unsigned int i;
 
 	KUNIT_ASSERT_NOT_NULL(test, f);
@@ -1098,6 +1339,18 @@ static void program_session_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), ANE_H16_EXECUTE_FLAG_QUEUED);
 	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, second), 0);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), 0);
+	/* H16 keeps several programs resident: a LOAD while one is loaded. */
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &third), 0);
+	KUNIT_ASSERT_NOT_NULL(test, third);
+	KUNIT_EXPECT_NE(test, third->key.program, second->key.program);
+	/* Each switch between the resident programs is queued. */
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, third), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), ANE_H16_EXECUTE_FLAG_QUEUED);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, second), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), ANE_H16_EXECUTE_FLAG_QUEUED);
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, second), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(f->exec + 0x30), 0);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, third), 0);
 
 	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, second), 0);
 	/* Closing the first program's file late is harmless. */
@@ -1877,6 +2130,34 @@ static void program_h17_switch_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, fw_load_program(f, &c), -ENOEXEC);
 	KUNIT_EXPECT_EQ(test, f->count, sent);
 	KUNIT_EXPECT_PTR_EQ(test, c, NULL);
+	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
+}
+
+/*
+ * H16 runs the same declared-size check as H17: a descriptor smaller than the
+ * buffer the generic section declared asserts in the firmware. A section
+ * smaller than its declared buffer (Apple-compiled HWX: 0x400 of 0x4000)
+ * sends the declared size; a larger section keeps the section size.
+ */
+static void program_h16_declared_size_test(struct kunit *test)
+{
+	struct prog_fw *f = fw_create(test);
+	struct ane_h16_program *p = NULL;
+	u64 grown;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_EQ(test, fw_load_program(f, &p), 0);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	/* The Apple shape: the section holds only the tensor span. */
+	grown = p->hwx.surfaces[0].allocation;
+	KUNIT_ASSERT_LT(test, p->hwx.surfaces[0].span, grown);
+	p->hwx.surfaces[0].section.size = p->hwx.surfaces[0].span;
+	p->declared[0] = grown;
+	KUNIT_ASSERT_EQ(test, ane_h16_session_execute(&f->s, p), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(f->exec + 0x60 + 0x20), grown);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(f->exec + 0x90 + 0x20),
+			p->hwx.surfaces[1].section.size);
+	KUNIT_EXPECT_EQ(test, ane_h16_session_close(&f->s, p), 0);
 	KUNIT_EXPECT_FALSE(test, f->s.quarantined);
 }
 
@@ -2832,9 +3113,12 @@ static struct kunit_case program_cases[] = {
 	KUNIT_CASE(program_failed_close_keeps_test),
 	KUNIT_CASE(program_busy_test),
 	KUNIT_CASE(program_cached_sync_test),
+	KUNIT_CASE(program_h16_declared_size_test),
 	KUNIT_CASE(program_h17_no_custom_bar_test),
 	KUNIT_CASE(program_add128_slots_test),
 	KUNIT_CASE(program_kernel_slots_test),
+	KUNIT_CASE(program_kernel_buffers_test),
+	KUNIT_CASE(program_kernel_binding_rules_test),
 	KUNIT_CASE(program_add128_hwx_test),
 	KUNIT_CASE(program_replies_test),
 	KUNIT_CASE(program_deny_list_test),

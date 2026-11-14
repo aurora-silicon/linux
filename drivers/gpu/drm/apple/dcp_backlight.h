@@ -35,6 +35,8 @@ struct dcp_backlight_state {
 	bool suspended;
 	bool dirty;
 	bool in_flight;
+	/* The firmware asked for the level while a present was in flight. */
+	bool resend_after;
 	/* Fade between lit levels instead of jumping to them. */
 	bool fade;
 	/* A fade from fade_from to target is running. */
@@ -249,14 +251,21 @@ static inline int dcp_bl_dpms(struct dcp_backlight_state *state, bool on)
 
 /*
  * The firmware asked for the level again.  Re-send the effective level once
- * Linux controls it and knows it, unless a present already carries or will
- * carry it.  A default level is never sent this way.
+ * Linux controls it and knows it, unless a present will carry it.  A default
+ * level is never sent this way.  The present in flight does not count: the
+ * firmware asks when it has just enabled the backlight, and drops a level
+ * that reached it before ("Received brightness update when backlight is
+ * disabled"), so the level goes again once that present completes.
  */
 static inline bool dcp_bl_resend(struct dcp_backlight_state *state)
 {
 	if (!state->ready || !state->controlled || !state->level_known ||
-	    state->dirty || state->in_flight)
+	    state->dirty)
 		return false;
+	if (state->in_flight) {
+		state->resend_after = true;
+		return false;
+	}
 	state->dirty = true;
 	return true;
 }
@@ -305,6 +314,10 @@ static inline bool dcp_bl_complete(struct dcp_backlight_state *state,
 		state->dirty = true;
 		if (state->retries < 4)
 			state->retries++;
+	}
+	if (state->resend_after) {
+		state->resend_after = false;
+		state->dirty = true;
 	}
 	return true;
 }

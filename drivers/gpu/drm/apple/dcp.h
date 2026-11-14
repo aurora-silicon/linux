@@ -66,6 +66,7 @@ void dcp_poweroff(struct platform_device *pdev);
 int dcp_typec_prepare_route(struct apple_dcp *dcp);
 void dcp_poweron(struct platform_device *pdev);
 void dcp_external_recover(struct platform_device *pdev);
+bool dcp_external_pipe_off(struct platform_device *pdev);
 int dcp_peer_hints_v27(struct apple_dcp *dcp, struct dptx_port *port,
 		      const void *data, size_t size, void *reply, size_t reply_size);
 bool dcp_peer_tiling_state_v27(struct apple_dcp *dcp, bool write,
@@ -178,8 +179,11 @@ bool apple_t8122_25g83_board(void);
 void dcp_typec_hybrid_first_dt(void);
 void dcp_fabric_hdmi_unplugged(struct apple_dcp *dcp);
 void dcp_fabric_hybrid_kick(struct apple_dcp *dcp, unsigned int delay_ms);
+void dcp_fabric_hybrid_woken(struct apple_dcp *dcp);
 void dcp_hdmi_yield_link(struct apple_dcp *dcp);
 void dcp_link_recovery_schedule(struct apple_dcp *dcp);
+void dcp_wake_list_check(struct apple_dcp *dcp);
+bool dcp_wake_reread_pending(struct apple_dcp *dcp);
 
 /* Desktop 26.6 dual-pipe peer (dcp-peer-v26_6.inc, included from dcp.c) */
 struct dptx_port;

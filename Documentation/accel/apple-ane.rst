@@ -139,7 +139,8 @@ Validated metadata retains whole-segment geometry and file extents, so one
 TEXT allocation covers both task and constant sections. Scratch and external
 surfaces have zero file bytes. The load planner reparses the authenticated
 original instead of trusting cached metadata, rounds allocations to 16 KiB
-and applies a 512 MiB aggregate host ceiling before any DMA allocation.
+and applies a 2 GiB aggregate host ceiling (twice the segment limit) before
+any DMA allocation.
 
 The resource geometry helper requires one backend-owned mapping per planned
 segment and one binding per external surface, resolved by the backend from
@@ -367,20 +368,32 @@ The validator consumes one kernel-owned immutable snapshot of the complete
 HWX. It requires subtype 7 and bounded, exactly consumed load commands;
 rejects unknown command kinds, duplicate descriptors, overlapping segments,
 sections and file regions; and validates symbols against the complete
-section-ordinal table. Tensor names, directions, normalized fp16 dimensions,
-overflow-checked strides and full batched spans must agree with their
-surfaces and buffer references. There must be at least one input and one
-output, with the single output last.
+section-ordinal table. Section symbol names are unique (checked in sorted
+order: a whole model names tens of thousands of kernel blobs); STAB
+entries, which describe source types, are skipped after a bound check of
+their name. One compiler annotation (command 8) and one LC_NOTE provenance
+note, whose payload lies inside the command after its 40-byte header, are
+accepted and grant nothing. __TEXT may carry SG_NORELOC or no flags.
+Tensor names, directions, normalized fp16 dimensions, overflow-checked
+strides and full batched spans must agree with their surfaces and buffer
+references; a reference holds a terminated name of up to 31 bytes after
++0x18 (32-byte commands for short names, 0x28 bytes for up to 15). There
+must be at least one input and exactly one output.
+
+Kernel data may be split over __KERN_0 to __KERN_15, in order, each with one
+section __kern_n. Each further segment starts where the previous one ends in
+VM and in the file, after a wholly file-backed one, so the segments form one
+kernel region within the segment limit.
 
 The linear and scratch program descriptors have exact fixed fields and
-zero reserved bytes. All five 16-byte aperture records must equal whole
-surface segment bases in order, followed by the optional kernel base;
-reserved halves and unused records are zero. Interior, duplicate, reordered
-and scratch/text aperture addresses are refused. Task counts and word counts
-must agree with the independent stream walk. Relocations use the actual
-kernel section ordinal, unique bounded offsets and valid addends, and may
-patch only packed-record payload words. Headers, register selectors and
-padding remain immutable.
+zero reserved bytes. The 16-byte aperture records from +0x70 must equal the
+whole surface segment bases in order, followed by every kernel section base
+in order; reserved halves and unused records are zero. Interior, duplicate,
+reordered and scratch/text aperture addresses are refused. Task counts and
+word counts must agree with the independent stream walk. Each relocation
+names one kernel section ordinal, uses a unique bounded offset and an addend
+below that section's size, and may patch only packed-record payload words.
+Headers, register selectors and padding remain immutable.
 
 SHA-256 covers the entire original snapshot, including load commands and
 padding. The snapshot digest is rechecked before execution. Validation
@@ -865,7 +878,19 @@ with the kernel slot index 1007. The uapi header names these indices.
 
 Slot 1 carries the ``__KERN_0`` kernel section when the program has one and
 otherwise the ``__TEXT,__const`` constants, which macOS loads in every
-program.
+program. Index 1007 in an operation pair names whatever slot 1 carries, so
+BAR slot 1 (the constants) binds to it in a program without kernel data.
+
+One slot gives one BAR base. A program whose kernel data are split over
+several sections reads each through its own BAR, and a program with kernel
+data and constant operands needs both bases. Such a program lists every
+kernel section in the generic section after the surfaces and the scratch,
+as a read-only input of the section size with its own ID, and binds each
+kernel base to that ID; EXECUTE then carries one buffer per kernel section
+at its offset in the kernel region mapping, and slot 1 carries the
+constants. The driver takes this form when the generic section has the
+kernel entries; the slot-1 kernel form accepts only one kernel section.
+How the firmware treats the buffer form has not been run on hardware.
 
 EXECUTE resources come from a kernel-owned map. The class follows the
 resource usage mapping (inputs 0, the output 1). Each descriptor names its
@@ -887,14 +912,18 @@ ID, a malformed report or a timeout quarantines the session. Reports with
 an unknown UUID never complete a request. Closing the file sends TERMINATE
 then UNLOAD. Mappings stay until reboot.
 
-One program lifetime per firmware boot is mandatory. On this firmware
-family the first EXECUTE of a newly loaded program can write into the
-previous program's output buffer when the buffer counts match, and a larger
-output overruns that mapping. A second H16_LOAD therefore fails with -EBUSY
-and the log line ``H16 one program per firmware boot; reboot required``,
-also after the first program closed. The transport never publishes the
-secure-mode commands 0x27, 0x28 and 0x34 or the exclave commands 0x30 and
-0x31.
+Several programs may be loaded in one firmware boot and executed in any
+order. On this firmware family a direct (ISR) EXECUTE after a program change
+can write into the previous program's output buffer when the buffer counts
+match, and a larger output overruns that mapping. The first EXECUTE after
+every change of program or process therefore carries request flag bit 0,
+which the firmware's program manager (CAneProgramManagerHx) uses to refuse
+the direct path and queue the request on the execution loop, as regular
+traffic does. Program and process IDs are allocated by the firmware
+from FIFO pools of 144 and 288 entries, so an UNLOADed ID is not reissued
+until the pool wraps; the driver treats IDs as opaque. The transport never
+publishes the secure-mode commands 0x27, 0x28 and 0x34 or the exclave
+commands 0x30 and 0x31.
 
 The ``ane-h16-program`` KUnit suite covers add-128 and synthetic slot
 packing, LOAD/CREATE/TERMINATE/UNLOAD bodies and replies, the deny list,

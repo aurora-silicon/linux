@@ -26,7 +26,14 @@ void sep_cancel_delayed_work_sync(void *work);
 
 /* -- pm_shim.c ---------------------------------------------------------- */
 
-int sep_pm_register(void *dev, void (*event)(bool entering), int (*sleep)(void),
+/* Sleep events for sep_pm_register()'s callback; mirrored in pm.rs. */
+#define SEP_PM_SLEEP		0
+#define SEP_PM_WAKE		1
+#define SEP_PM_HIBERNATE	2
+#define SEP_PM_HIBERNATE_WARM	3
+#define SEP_PM_HIBERNATE_COLD	4
+#define SEP_PM_RESTORE		5
+int sep_pm_register(void *dev, int (*event)(int event), int (*sleep)(void),
 		    void (*wake)(void), bool (*told)(void));
 void sep_pm_unregister(void);
 int sep_pm_keep_domains(void *dev);

@@ -508,6 +508,18 @@ struct sn201202x {
 	bool ldcm_mitigated;
 	/* ldcm_mitigated matches the controller (unknown after a reset) */
 	bool ldcm_mitigation_known;
+	/* Restored from disk: left untouched until it is probed again. */
+	bool cold_restored;
+	/* Restored from disk: revalidation waits for the new USB role switch. */
+	bool roles_pending;
+	/* Restored from disk in place, as hib_resume reports it (tps.lock) */
+	bool hib_in_place;
+	/* Looks the role switch up again when a USB controller binds */
+	struct notifier_block role_nb;
+	struct work_struct role_work;
+	bool role_watch;
+	/* Restored from disk: register selections are polled until it is set up again. */
+	bool cold_polled;
 };
 
 extern const struct tipd_data *tipd_hw_variants[];
@@ -519,6 +531,8 @@ int tipd_prepare(struct device *dev);
 void tipd_complete(struct device *dev);
 int tipd_suspend(struct tps6598x *tps);
 int tipd_resume(struct tps6598x *tps);
+int tipd_refresh_role_switch(struct tps6598x *tps);
+int tipd_reinit_after_cold_boot(struct tps6598x *tps);
 
 /* Internal to tps6598x-core */
 int tps6598x_block_read(struct tps6598x *tps, u8 reg, void *val, size_t len);

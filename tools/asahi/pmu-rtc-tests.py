@@ -28,6 +28,8 @@ MUTATIONS = {
     'baku-limit': ('.max_delay = U32_MAX,', '.max_delay = APPLE_PMU_RTC_MAX_DELAY,'),
     'set-no-round': ('(counter + BIT(APPLE_PMU_RTC_HZ_SHIFT - 1))', '(counter)'),
     'set-negative': ('if (offset < 0 || offset', 'if (offset'),
+    'restore-nothing': ('rtc_update_irq(rtc->clock, 1, RTC_IRQF | RTC_AF);',
+                        'if (false) rtc_update_irq(rtc->clock, 1, RTC_IRQF | RTC_AF);'),
 }
 
 PRELUDE = r'''
@@ -57,6 +59,8 @@ typedef uint64_t __le64;
 #define kfree free
 #define guard(x) (void)
 #define dev_err(...) ((void)0)
+#define dev_warn(...) ((void)0)
+#define PM_SUSPEND_ON 0
 #define PM_SUSPEND_TO_IDLE 1
 #define RTC_IRQF 0x80
 #define RTC_AF 0x20
@@ -333,7 +337,18 @@ static void run_variant(int v) {
     firmware_suspend = true;
     assert(!apple_pmu_rtc_prepare(&dev));
     firmware_suspend = false;
+    /* Hibernation is accepted. A platform power-off stops the alarm, and goes on if that fails. */
+    pm_suspend_target_state = PM_SUSPEND_ON;
+    assert(!apple_pmu_rtc_prepare(&dev));
+    assert(!apple_pmu_rtc_set_alarm(&dev, &alarm) && (map.bytes[map.ctrl] & 0x40));
+    assert(!apple_pmu_rtc_poweroff(&dev));
+    assert(!(map.bytes[map.ctrl] & 0x40) && (map.bytes[map.mask] & 1));
+    map.ops = 0; map.fail = 1;
+    assert(!apple_pmu_rtc_poweroff(&dev));
     pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
+    /* After a resume from disk the RTC core goes through its alarm again, without a PMU access of the driver's own. */
+    reset(v);
+    assert(!apple_pmu_rtc_restore(&dev) && clock_model.events == 1 && map.ops == 0);
 }
 int main(void) {
     run_variant(BAKU); run_variant(ABBEY); run_variant(STOWE); run_variant(MAVERICK);

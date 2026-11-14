@@ -11,7 +11,8 @@
 
 /*
  * The one LOAD slot table. Slot 1 carries the HWX kernel section, or the
- * __TEXT,__const constants when the program has no kernel section, and slot 2
+ * __TEXT,__const constants when the program has no kernel section or binds
+ * its kernel sections as EXECUTE buffers, and slot 2
  * the task stream. macOS populated slot 1 in every captured load, with at
  * least 0x4000 bytes at a sub-page DVA, which is the constants section of a
  * program without a kernel. Slots 1 and 2 carry a per-program pair with
@@ -94,7 +95,7 @@ int ane_h16_load_slots(const struct ane_h16_hwx *hwx,
 		case ANE_H16_SLOT_EMPTY:
 			continue;
 		case ANE_H16_SLOT_KERNEL:
-			if (hwx->kernel.size)
+			if (hwx->kernel.size && !layout->kernel_buffers)
 				ret = h16_section_dva(plan, layout, ANE_H16_REGION_KERNEL,
 						      &hwx->kernel, slot, true);
 			else
@@ -283,53 +284,80 @@ EXPORT_SYMBOL_GPL(ane_h16_id_reply);
  * kernel IDs 2 and 3. The class follows the round 5 usage mapping (input
  * usage 1, output usage 2).
  *
- * A program with a __DATA scratch has one more entry, last: the scratch,
- * typed as an input (type 0, direction 1) of exactly the __bss size. Linked
- * programs keep the DRAM edges between their tasks there; the measured H17
- * MobileNet run bound it this way.
+ * A program with a __DATA scratch has one more entry after the surfaces: the
+ * scratch, typed as an input (type 0, direction 1) of exactly the __bss size.
+ * Linked programs keep the DRAM edges between their tasks there; the
+ * measured H17 MobileNet run bound it this way.
+ *
+ * One LOAD slot gives one BAR base, but a program whose kernel data are split
+ * over several sections addresses each section through its own BAR, and a
+ * program that also reads __TEXT,__const needs slot 1 for the constants.
+ * Such a program lists every kernel section after that, in order, typed as
+ * an input of the section size (up to its 16 KiB pages), and EXECUTE binds
+ * each to its place in the kernel region. Without @kernels only the form
+ * without kernel entries is accepted.
  */
-int ane_h16_process_bindings(const struct ane_h16_hwx *hwx, const void *generic,
-			     size_t generic_size,
-			     struct ane_h16_process_binding *bindings,
-			     unsigned int *count,
-			     struct ane_h16_process_binding *scratch)
+int ane_h16_process_bindings_kernels(const struct ane_h16_hwx *hwx, const void *generic,
+				     size_t generic_size,
+				     struct ane_h16_process_binding *bindings,
+				     unsigned int *count,
+				     struct ane_h16_process_binding *scratch,
+				     struct ane_h16_process_binding *kernels,
+				     unsigned int *kernel_count)
 {
 	const u8 *g = generic;
-	unsigned int i, j, entries;
+	unsigned int i, base, entries, split;
 	u32 seen[2] = {};
+	u64 ids = 0;
 
 	if (!hwx || !g || !bindings || !count || hwx->surface_count < 2 ||
-	    hwx->surface_count > ANE_H16_SURFACES || (hwx->scratch.size && !scratch))
+	    hwx->surface_count > ANE_H16_SURFACES || (hwx->scratch.size && !scratch) ||
+	    !kernels != !kernel_count || hwx->kernel_count > ANE_H16_KERNEL_SEGMENTS)
 		return -EINVAL;
-	entries = hwx->surface_count + !!hwx->scratch.size;
-	if (generic_size != ANE_H16_GENERIC_HEADER + entries * ANE_H16_GENERIC_ENTRY ||
+	base = hwx->surface_count + !!hwx->scratch.size;
+	if (generic_size < ANE_H16_GENERIC_HEADER)
+		return -ENOEXEC;
+	entries = get_unaligned_le32(g + ANE_H16_GENERIC_COUNT);
+	split = kernels && hwx->kernel_count && entries == base + hwx->kernel_count;
+	if (entries != (split ? base + hwx->kernel_count : base) ||
+	    generic_size != ANE_H16_GENERIC_HEADER + entries * ANE_H16_GENERIC_ENTRY ||
 	    get_unaligned_le32(g) != ANE_H16_GENERIC_MAGIC ||
 	    !get_unaligned_le32(g + 4) ||
-	    get_unaligned_le32(g + 4) > ANE_H16_GENERIC_VERSION ||
-	    get_unaligned_le32(g + ANE_H16_GENERIC_COUNT) != entries)
+	    get_unaligned_le32(g + 4) > ANE_H16_GENERIC_VERSION)
 		return -ENOEXEC;
 	for (i = 0; i < entries; i++) {
 		const u8 *e = g + ANE_H16_GENERIC_HEADER + i * ANE_H16_GENERIC_ENTRY;
-		bool is_scratch = i == hwx->surface_count;
-		u32 direction = is_scratch ? 1 : hwx->surfaces[i].direction;
+		bool is_scratch = hwx->scratch.size && i == hwx->surface_count;
+		bool is_kernel = i >= base;
+		u32 direction = is_scratch || is_kernel ? 1 : hwx->surfaces[i].direction;
 		u32 id = get_unaligned_le32(e + 4);
 		u64 bytes = get_unaligned_le64(e + 0x20);
+		const struct ane_h16_hwx_section *k = is_kernel ? &hwx->kernels[i - base] : NULL;
 
 		if (direction < 1 || direction > 2)
 			return -ENOEXEC;
 		if (get_unaligned_le32(e) != 1 || id == 2 || id == 3 ||
-		    id > ANE_H16_GENERIC_ID_MAX ||
+		    id > ANE_H16_GENERIC_ID_MAX || (ids & BIT_ULL(id)) ||
 		    get_unaligned_le32(e + 8) != direction - 1 ||
 		    get_unaligned_le32(e + 0x10) != direction)
 			return -ENOEXEC;
+		ids |= BIT_ULL(id);
 		/* The scratch entry may round __bss up to its 16 KiB mapping. */
 		if (is_scratch ? bytes < hwx->scratch.size ||
 				 bytes > ALIGN(hwx->scratch.size, SZ_16K) :
+		    is_kernel ? bytes < k->size || bytes > ALIGN(k->size, SZ_16K) ||
+				bytes > hwx->kernel.vm + ALIGN(hwx->kernel.size, SZ_16K) - k->vm :
 		    bytes < hwx->surfaces[i].span || bytes > hwx->surfaces[i].allocation)
 			return -ENOEXEC;
-		for (j = 0; j < i && j < hwx->surface_count; j++)
-			if (bindings[j].index == id)
-				return -ENOEXEC;
+		if (is_kernel) {
+			kernels[i - base] = (struct ane_h16_process_binding) {
+				.hwx_vm = k->vm,
+				.index = id,
+				.class = ane_h16_usage_class(direction),
+				.bytes = bytes,
+			};
+			continue;
+		}
 		if (is_scratch) {
 			*scratch = (struct ane_h16_process_binding) {
 				.hwx_vm = hwx->scratch.vm,
@@ -351,34 +379,63 @@ int ane_h16_process_bindings(const struct ane_h16_hwx *hwx, const void *generic,
 	if (scratch && !hwx->scratch.size)
 		*scratch = (struct ane_h16_process_binding) {};
 	*count = hwx->surface_count;
+	if (kernel_count)
+		*kernel_count = split ? hwx->kernel_count : 0;
 	return 0;
+}
+EXPORT_SYMBOL_GPL(ane_h16_process_bindings_kernels);
+
+int ane_h16_process_bindings(const struct ane_h16_hwx *hwx, const void *generic,
+			     size_t generic_size,
+			     struct ane_h16_process_binding *bindings,
+			     unsigned int *count,
+			     struct ane_h16_process_binding *scratch)
+{
+	return ane_h16_process_bindings_kernels(hwx, generic, generic_size, bindings, count,
+						scratch, NULL, NULL);
 }
 EXPORT_SYMBOL_GPL(ane_h16_process_bindings);
 
 /*
  * The operation section binds BAR slots to resources: per record, a count at
- * +8 and (slot, tag) pairs from +0xc. A tag is a generic-section ID, or the
- * kernel resource index for a __KERN_0 program. BAR slot s takes its base
- * from the program descriptor qword at +0x10 * (s + 1), so every pair must
- * name the resource whose HWX address is that base. Kernel programs must bind
- * the kernel: the legacy tag 2 instead makes the H17 firmware assert and stop
- * answering (H17 harness facts, kernel-table programs).
+ * +8 and (slot, tag) pairs from +0xc. A tag is a generic-section ID or the
+ * index 1007 of whatever LOAD slot 1 carries. BAR slot s takes its base from
+ * the program descriptor qword at +0x10 * (s + 1), so every pair must name
+ * the resource whose HWX address is that base: 1007 names the kernel section
+ * when slot 1 carries it, otherwise __TEXT,__const (BAR slot 1 of every
+ * program, which compilers use for constant operands). The firmware programs
+ * a BAR only from these pairs: the kernel table of a linked program on BAR 8
+ * is read only through its 1007 pair.
+ *
+ * In the slot 1 kernel form the program has one kernel section and must bind
+ * it: the legacy tag 2 instead makes the H17 firmware assert and stop
+ * answering (H17 harness facts, kernel-table programs). With kernel buffers
+ * (@kernel_count of them, see ane_h16_process_bindings_kernels()) every
+ * kernel section is bound through its own ID.
  */
-int ane_h16_operation_validate(const struct ane_h16_hwx_snapshot *snapshot,
-			       const struct ane_h16_hwx *hwx, const void *operation,
-			       size_t operation_size,
-			       const struct ane_h16_process_binding *bindings,
-			       unsigned int count,
-			       const struct ane_h16_process_binding *scratch)
+int ane_h16_operation_validate_kernels(const struct ane_h16_hwx_snapshot *snapshot,
+				       const struct ane_h16_hwx *hwx, const void *operation,
+				       size_t operation_size,
+				       const struct ane_h16_process_binding *bindings,
+				       unsigned int count,
+				       const struct ane_h16_process_binding *scratch,
+				       const struct ane_h16_process_binding *kernels,
+				       unsigned int kernel_count)
 {
 	const u8 *o = operation, *c;
 	unsigned int r, records, i, j;
+	bool slot_kernel = hwx && hwx->kernel.size && !kernel_count;
 	bool kernel_bound = false;
+	u32 kernels_bound = 0;
 	int ret;
 
 	if (!hwx || !o || !bindings || count != hwx->surface_count ||
-	    (hwx->scratch.size && !scratch))
+	    (hwx->scratch.size && !scratch) || (kernel_count && !kernels) ||
+	    (kernel_count && kernel_count != hwx->kernel_count))
 		return -EINVAL;
+	/* One LOAD slot is one BAR base: it cannot serve several sections. */
+	if (slot_kernel && hwx->kernel_count != 1)
+		return -ENOEXEC;
 	ret = ane_h16_hwx_snapshot_check(snapshot);
 	if (ret)
 		return ret;
@@ -409,21 +466,40 @@ int ane_h16_operation_validate(const struct ane_h16_hwx_snapshot *snapshot,
 				return -ENOEXEC;
 			seen |= BIT_ULL(slot);
 			base = get_unaligned_le64(c + 0x10 * (slot + 1));
-			if (tag == ANE_H16_RESOURCE_KERNEL && hwx->kernel.size) {
-				want = hwx->kernel.vm;
-				kernel_bound = true;
+			if (tag == ANE_H16_RESOURCE_KERNEL) {
+				want = slot_kernel ? hwx->kernel.vm : hwx->constants.vm;
+				kernel_bound |= slot_kernel;
 			} else if (scratch && hwx->scratch.size && tag == scratch->index) {
 				want = scratch->hwx_vm;
 			} else {
 				for (j = 0; j < count; j++)
 					if (tag == bindings[j].index)
 						want = bindings[j].hwx_vm;
+				for (j = 0; j < kernel_count; j++)
+					if (tag == kernels[j].index) {
+						want = kernels[j].hwx_vm;
+						kernels_bound |= BIT(j);
+					}
 			}
 			if (!want || base != want)
 				return -ENOEXEC;
 		}
 	}
-	return hwx->kernel.size && !kernel_bound ? -ENOEXEC : 0;
+	if (slot_kernel && !kernel_bound)
+		return -ENOEXEC;
+	return kernel_count && kernels_bound != BIT(kernel_count) - 1 ? -ENOEXEC : 0;
+}
+EXPORT_SYMBOL_GPL(ane_h16_operation_validate_kernels);
+
+int ane_h16_operation_validate(const struct ane_h16_hwx_snapshot *snapshot,
+			       const struct ane_h16_hwx *hwx, const void *operation,
+			       size_t operation_size,
+			       const struct ane_h16_process_binding *bindings,
+			       unsigned int count,
+			       const struct ane_h16_process_binding *scratch)
+{
+	return ane_h16_operation_validate_kernels(snapshot, hwx, operation, operation_size,
+						  bindings, count, scratch, NULL, 0);
 }
 EXPORT_SYMBOL_GPL(ane_h16_operation_validate);
 
@@ -792,7 +868,8 @@ static int h16_map(struct ane_h16_session *s, size_t size, bool write,
 struct h16_program_binds {
 	struct ane_h16_process_binding bindings[ANE_H16_SURFACES];
 	struct ane_h16_process_binding scratch;
-	unsigned int count;
+	struct ane_h16_process_binding kernels[ANE_H16_KERNEL_SEGMENTS];
+	unsigned int count, kernel_count;
 };
 
 /* Pure checks of the program and its process descriptors; nothing is mapped. */
@@ -803,14 +880,16 @@ static int h16_program_bind(const struct ane_h16_program *p,
 {
 	int ret;
 
-	ret = ane_h16_process_bindings(&p->hwx, aux[ANE_H16_AUX_GENERIC],
-				       aux_size[ANE_H16_AUX_GENERIC], b->bindings,
-				       &b->count, &b->scratch);
+	ret = ane_h16_process_bindings_kernels(&p->hwx, aux[ANE_H16_AUX_GENERIC],
+					       aux_size[ANE_H16_AUX_GENERIC], b->bindings,
+					       &b->count, &b->scratch, b->kernels,
+					       &b->kernel_count);
 	if (!ret)
-		ret = ane_h16_operation_validate(&p->snapshot, &p->hwx,
-						 aux[ANE_H16_AUX_OPERATION],
-						 aux_size[ANE_H16_AUX_OPERATION],
-						 b->bindings, b->count, &b->scratch);
+		ret = ane_h16_operation_validate_kernels(&p->snapshot, &p->hwx,
+							 aux[ANE_H16_AUX_OPERATION],
+							 aux_size[ANE_H16_AUX_OPERATION],
+							 b->bindings, b->count, &b->scratch,
+							 b->kernels, b->kernel_count);
 	return ret;
 }
 
@@ -887,6 +966,31 @@ static int h16_program_map(struct ane_h16_session *s, struct ane_h16_program *p,
 			.size = hwx->scratch.size,
 		};
 		p->has_scratch = true;
+	}
+	if (b->kernel_count) {
+		for (j = 0; j < p->plan.count; j++)
+			if (p->plan.regions[j].kind == ANE_H16_REGION_KERNEL)
+				break;
+		if (j == p->plan.count || p->plan.regions[j].permissions != 1)
+			return -ENOEXEC;
+		for (i = 0; i < b->kernel_count; i++) {
+			u64 offset = hwx->kernels[i].vm - p->plan.regions[j].vm;
+
+			if (hwx->kernels[i].vm < p->plan.regions[j].vm ||
+			    offset > p->regions[j].size ||
+			    b->kernels[i].bytes > p->regions[j].size - offset)
+				return -ENOEXEC;
+			p->kernels[i] = (struct ane_h16_execute_buffer) {
+				.index = b->kernels[i].index,
+				.class = b->kernels[i].class,
+				.mapping_dva = p->regions[j].dva,
+				.mapping_size = p->regions[j].size,
+				.offset = offset,
+				.size = b->kernels[i].bytes,
+			};
+		}
+		p->kernel_buffer_count = b->kernel_count;
+		layout->kernel_buffers = true;
 	}
 	ret = ane_h16_load_slots(hwx, &p->plan, layout, p->slots);
 	if (ret)
@@ -1318,7 +1422,7 @@ static int h16_execute_room(struct ane_h16_session *s, struct ane_h16_program *p
  */
 static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 {
-	struct ane_h16_execute_buffer buffers[ANE_H16_SURFACES + 1];
+	struct ane_h16_execute_buffer buffers[ANE_H16_SURFACES + 1 + ANE_H16_KERNEL_SEGMENTS];
 	struct h16_request r = { .trace.last_state = U32_MAX };
 	struct ane_h16_pending *request = &r.pending;
 	struct h16_execute_trace *trace = &r.trace;
@@ -1351,18 +1455,24 @@ static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 	 * H17 checks each descriptor against the size the generic section
 	 * declared for its buffer at LOAD and asserts in its program manager
 	 * when it is smaller (relu64: section 0x1000 of a declared 0x4000
-	 * surface), so H17 descriptors carry the declared size. H16 keeps the
-	 * whole HWX section, which is what ran MobileNet on the J616s; the two
-	 * agree there (0x4c000). The declared size lies between the tensor span
-	 * and the mapped allocation. Userspace still sees and copies the span.
+	 * surface), so H17 descriptors carry the declared size. The H16
+	 * firmware runs the same check: an HWX whose surface section is smaller
+	 * than its declared buffer (0x400 of 0x4000) asserts there too. H16
+	 * keeps the whole HWX section when it is the larger one, which is what
+	 * ran MobileNet on the J616s. The declared size lies between the tensor
+	 * span and the mapped allocation. Userspace still sees and copies the
+	 * span.
 	 */
 	for (i = 0; i < p->resource_count; i++) {
 		buffers[i] = p->resources[i].buffer;
 		buffers[i].size = s->transport->soc->chip_family >= 17 ? p->declared[i] :
-				  p->hwx.surfaces[i].section.size;
+				  max_t(u64, p->declared[i],
+					p->hwx.surfaces[i].section.size);
 	}
 	if (p->has_scratch)
 		buffers[i++] = p->scratch;
+	memcpy(&buffers[i], p->kernels, p->kernel_buffer_count * sizeof(*buffers));
+	i += p->kernel_buffer_count;
 	length = ANE_H16_EXECUTE_BASE_SIZE + p->bar_count * ANE_H16_CUSTOM_BAR_STRIDE;
 	ret = h16_execute_room(s, p);
 	if (ret)
@@ -1391,7 +1501,7 @@ static int h16_execute(struct ane_h16_session *s, struct ane_h16_program *p)
 		goto fail;
 	call.key = request->key;
 	call.buffers = buffers;
-	call.buffer_count = p->resource_count + (p->has_scratch ? 1 : 0);
+	call.buffer_count = i;
 	/*
 	 * The first request of a program on the engine, the first one after boot
 	 * included, takes the queued path once: only EXELOOP sets up the BAR

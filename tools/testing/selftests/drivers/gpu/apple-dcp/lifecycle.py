@@ -1080,6 +1080,9 @@ def teardown(root):
     role = 'static inline enum dwc3_apple_state dwc3_apple_state_for_role('
     if role in files['state']:
         decls.append(block(files['state'], files['state'].index(role)))
+    kept = 'static inline enum dwc3_apple_state dwc3_apple_state_for_role_kept('
+    if kept in files['state']:
+        decls.append(block(files['state'], files['state'].index(kept)))
     start = files['atc'].index('static const struct {\n\tconst struct atcphy_mode_configuration normal;')
     end = files['atc'].index('\n};', start) + 3
     decls.append(files['atc'][start:end])

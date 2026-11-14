@@ -672,6 +672,46 @@ static int apple_pmgr_ps_resume_noirq(struct device *dev)
 	return 0;
 }
 
+/*
+ * After a resume from disk genpd still records the domains as they were when
+ * the image was taken, but the cold boot behind the resume left the hardware
+ * in the boot loader's state, and genpd powers on only the domains it recorded
+ * as off. A domain recorded on but found gated would make its consumers'
+ * restore touch an unpowered block. Bring each such domain up, parents first.
+ */
+static void apple_pmgr_ps_restore_hw(struct apple_pmgr_ps *ps, unsigned int depth)
+{
+	struct gpd_link *link;
+	u32 reg;
+
+	if (depth > 16)
+		return;
+	list_for_each_entry(link, &ps->genpd.child_links, child_node)
+		if (link->parent->power_on == apple_pmgr_ps_power_on)
+			apple_pmgr_ps_restore_hw(genpd_to_apple_pmgr_ps(link->parent), depth + 1);
+
+	if (ps->firmware_owned || ps->inherited_on || ps->sleep_driver_owned ||
+	    ps->genpd.status != GENPD_STATE_ON)
+		return;
+	if (regmap_read(ps->regmap, ps->offset, &reg))
+		return;
+	if (FIELD_GET(APPLE_PMGR_PS_ACTUAL, reg) == APPLE_PMGR_PS_ACTIVE)
+		return;
+	dev_dbg(ps->dev, "PS %s: on in the image, gated after the cold boot (0x%x): powering on\n",
+		ps->genpd.name, reg);
+	apple_pmgr_ps_set(&ps->genpd, APPLE_PMGR_PS_ACTIVE,
+			  !ps->no_auto_enable && !ps->no_auto_pm);
+}
+
+static int apple_pmgr_ps_restore_noirq(struct device *dev)
+{
+	struct apple_pmgr_ps *ps = dev_get_drvdata(dev);
+
+	if (ps)
+		apple_pmgr_ps_restore_hw(ps, 0);
+	return 0;
+}
+
 static int apple_pmgr_reset_assert(struct reset_controller_dev *rcdev, unsigned long id)
 {
 	struct apple_pmgr_ps *ps = rcdev_to_apple_pmgr_ps(rcdev);
@@ -1383,7 +1423,13 @@ MODULE_DEVICE_TABLE(of, apple_pmgr_ps_of_match);
 
 static const struct dev_pm_ops apple_pmgr_ps_pm_ops = {
 	LATE_SYSTEM_SLEEP_PM_OPS(apple_pmgr_ps_suspend_late, apple_pmgr_ps_resume_early)
-	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_pmgr_ps_suspend_noirq, apple_pmgr_ps_resume_noirq)
+	.suspend_noirq = pm_sleep_ptr(apple_pmgr_ps_suspend_noirq),
+	.freeze_noirq = pm_sleep_ptr(apple_pmgr_ps_suspend_noirq),
+	.poweroff_noirq = pm_sleep_ptr(apple_pmgr_ps_suspend_noirq),
+	/* Suspend-to-RAM resyncs after the sleep engine; a resume from disk after the cold boot. */
+	.resume_noirq = pm_sleep_ptr(apple_pmgr_ps_resume_noirq),
+	.thaw_noirq = pm_sleep_ptr(apple_pmgr_ps_resume_noirq),
+	.restore_noirq = pm_sleep_ptr(apple_pmgr_ps_restore_noirq),
 };
 
 static struct platform_driver apple_pmgr_ps_driver = {

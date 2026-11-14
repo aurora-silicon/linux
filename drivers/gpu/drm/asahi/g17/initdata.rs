@@ -219,6 +219,29 @@ pub(super) struct InitData {
     render_pages: Option<usize>,
     render_runs: Option<usize>,
     render_blocks: core::ops::Range<usize>,
+    /// The post-build contents of the graph, for a firmware that a resume from disk found
+    /// cold-restarted ([`Self::restore_pristine`]). `None` until a build completed.
+    pristine: Option<Pristine>,
+    /// Write back restored bytes to the point of coherency (`UatQuirks::clean_tables`).
+    clean_poc: bool,
+}
+
+/// Granule of [`Pristine`]: chunks of this size that are zero after the build are not stored.
+const PRISTINE_CHUNK: usize = 0x1000;
+
+/// The contents of every firmware-visible object of the graph as [`InitData::build`] left them,
+/// before the firmware ever saw the root: each object's non-zero [`PRISTINE_CHUNK`]s, in order.
+///
+/// The render-pool blocks are the exception (see [`InitData::pristine_skips`]): they are the
+/// tiler's parameter memory, which the build leaves zero and no boot step reads, and they are
+/// a fifth of the graph's size.
+struct Pristine {
+    /// Index into `InitData::objects` of every restored object, in order.
+    objects: KVec<usize>,
+    /// `(object position in objects, byte offset)` of every stored chunk, in order.
+    chunks: KVec<(u32, u32)>,
+    /// The stored chunks back to back.
+    bytes: KVVec<u8>,
 }
 
 /// Placement inputs shared by the build steps.
@@ -323,7 +346,177 @@ impl InitData {
             render_pages: None,
             render_runs: None,
             render_blocks: 0..0,
+            pristine: None,
+            clean_poc: false,
         }
+    }
+
+    /// Whether `index` is a render-pool block that [`Pristine`] does not keep: every block
+    /// but the one holding the compute page list, which the build fills.
+    fn pristine_skips(&self, index: usize) -> bool {
+        self.render_blocks.contains(&index)
+            && index != self.render_blocks.start + low::COMPUTE_PAGE_LIST_BLOCK
+    }
+
+    /// Keeps the post-build contents of the graph (see [`Pristine`]). Called at the end of a
+    /// successful build, while the host is still the graph's only user. Best effort: without
+    /// the copy only hibernation is refused ([`Self::has_pristine`]), never the probe.
+    fn capture_pristine(&mut self, dev: &AsahiDrmDevice) {
+        let started = super::now_ns();
+        match self.copy_out_pristine() {
+            Ok(pristine) => {
+                dev_info!(
+                    dev.as_ref(),
+                    "GPU graph post-build copy: {} KiB in {} chunks of {} objects ({} us)\n",
+                    pristine.bytes.len() / 1024,
+                    pristine.chunks.len(),
+                    pristine.objects.len(),
+                    super::now_ns().saturating_sub(started) / 1000
+                );
+                self.pristine = Some(pristine);
+            }
+            Err(error) => {
+                dev_warn!(
+                    dev.as_ref(),
+                    "GPU graph post-build copy failed: {:?}; hibernation will be refused\n",
+                    error
+                );
+                self.pristine = None;
+            }
+        }
+    }
+
+    /// Whether a chunk holds any non-zero byte: one pass of aligned 64-bit loads, which the
+    /// write-combined mappings serve far faster than byte loads.
+    fn chunk_nonzero(chunk: &[u8]) -> bool {
+        let words = chunk.len() / 8;
+        let pointer = chunk.as_ptr();
+        if pointer as usize % 8 == 0 {
+            for index in 0..words {
+                // SAFETY: In bounds and aligned (the chunk starts on a page-aligned object).
+                if unsafe { pointer.cast::<u64>().add(index).read() } != 0 {
+                    return true;
+                }
+            }
+            return chunk[words * 8..].iter().any(|&byte| byte != 0);
+        }
+        chunk.iter().any(|&byte| byte != 0)
+    }
+
+    fn copy_out_pristine(&mut self) -> Result<Pristine> {
+        let mut objects = KVec::new();
+        let mut chunks = KVec::new();
+        let mut copy = KVVec::new();
+        for index in 0..self.objects.len() {
+            if self.pristine_skips(index) {
+                continue;
+            }
+            let position = u32::try_from(objects.len())?;
+            objects.push(index, GFP_KERNEL)?;
+            let bytes = self.objects[index].bytes_mut();
+            for (number, chunk) in bytes.chunks(PRISTINE_CHUNK).enumerate() {
+                if !Self::chunk_nonzero(chunk) {
+                    continue;
+                }
+                chunks.push(
+                    (position, u32::try_from(number * PRISTINE_CHUNK)?),
+                    GFP_KERNEL,
+                )?;
+                copy.extend_from_slice(chunk, GFP_KERNEL)?;
+            }
+        }
+        Ok(Pristine {
+            objects,
+            chunks,
+            bytes: copy,
+        })
+    }
+
+    /// Whether the post-build copy exists; a hibernation freeze refuses without it.
+    pub(super) fn has_pristine(&self) -> bool {
+        self.pristine.is_some()
+    }
+
+    /// Size of the kept post-build contents, in bytes, for the log.
+    pub(super) fn pristine_size(&self) -> usize {
+        self.pristine.as_ref().map_or(0, |pristine| pristine.bytes.len())
+    }
+
+    /// Returns every firmware-visible object of the graph to its post-build contents, in place:
+    /// the objects keep their backing, GPU addresses and aliases, which client VMs resolve
+    /// against. Host state that mirrors graph contents is reset with them: the compute global
+    /// state is written again by the next [`Self::activate_compute`], and the event-ring check
+    /// starts over.
+    ///
+    /// Only for a firmware that is not running (a resume from disk found it halted): nothing
+    /// else accesses the graph concurrently, so plain copies are used.
+    pub(super) fn restore_pristine(&mut self) -> Result {
+        let pristine = self.pristine.take().ok_or(ENODEV)?;
+        let result = self.copy_pristine(&pristine);
+        self.pristine = Some(pristine);
+        result?;
+        self.compute_active.set(false);
+        for checked in &self.event_ring_checked {
+            checked.set((0, 0, 0));
+        }
+        Ok(())
+    }
+
+    /// After [`Self::restore_pristine`], before any compute publication: replays the
+    /// device-global compute state that the first compute build wrote after the graph was
+    /// built, without allocating. The prepared aperture is installed again (its boot
+    /// free-list switch is back at build values); the global scheduler page is initialized
+    /// again in place; the compute global state follows on the next [`Self::activate_compute`].
+    pub(super) fn reset_compute_after_cold_boot(&mut self) -> Result {
+        if let Some(shared) = self.compute_shared.take() {
+            self.install_compute_shared(shared)?;
+        }
+        if let Some(scheduler) = self.compute_scheduler.as_mut() {
+            scheduler.object.bytes_mut().fill(0);
+            scheduler
+                .object
+                .initialize::<super::fw::context::Scheduler>(0, |state| {
+                    state.init();
+                    Ok(())
+                })?;
+            if self.clean_poc {
+                let bytes = scheduler.object.bytes_mut();
+                crate::pgtable::clean_poc(bytes.as_ptr(), bytes.len());
+                crate::pgtable::poc_barrier();
+            }
+        }
+        self.compute_active.set(false);
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn copy_pristine(&mut self, pristine: &Pristine) -> Result {
+        for &index in pristine.objects.iter() {
+            self.object_mut(index)?.bytes_mut().fill(0);
+        }
+        let mut source = 0usize;
+        for &(position, offset) in pristine.chunks.iter() {
+            let index = *pristine.objects.get(position as usize).ok_or(EINVAL)?;
+            let offset = offset as usize;
+            let bytes = self.object_mut(index)?.bytes_mut();
+            let length = PRISTINE_CHUNK.min(bytes.len().checked_sub(offset).ok_or(EINVAL)?);
+            let end = source.checked_add(length).ok_or(EINVAL)?;
+            bytes[offset..offset + length]
+                .copy_from_slice(pristine.bytes.get(source..end).ok_or(EINVAL)?);
+            source = end;
+        }
+        if source != pristine.bytes.len() {
+            return Err(EINVAL);
+        }
+        if self.clean_poc {
+            for &index in pristine.objects.iter() {
+                let bytes = self.object_mut(index)?.bytes_mut();
+                crate::pgtable::clean_poc(bytes.as_ptr(), bytes.len());
+            }
+            crate::pgtable::poc_barrier();
+        }
+        fence(Ordering::SeqCst);
+        Ok(())
     }
 
     pub(super) fn pm_metrics_va(&self) -> u64 {
@@ -1182,8 +1375,11 @@ impl InitData {
             dynamic: t8140::dynamic::upper(range.clone()),
             clusters,
         };
+        self.clean_poc = cfg.uat_quirks.clean_tables;
         if variant.graph == super::fw::variant::InitGraph::V25G83 {
-            return self.build_25g83(&env, cfg, metrics, active_cores, variant);
+            self.build_25g83(&env, cfg, metrics, active_cores, variant)?;
+            self.capture_pristine(dev);
+            return Ok(());
         }
         self.map_register_windows(&env, cfg.windows)?;
         let tables = self.build_descriptor_tables(&env, abi::private::SIZE)?;
@@ -1191,7 +1387,10 @@ impl InitData {
         let first_block = self.build_render_pool(&env)?;
         self.build_compute_pools(&env, first_block)?;
         let bundle = self.build_bundle(&env, cfg, metrics)?;
-        self.initialize_firmware_objects(&env, cfg, &tables, &bundle)
+        self.initialize_firmware_objects(&env, cfg, &tables, &bundle)?;
+        // Before the firmware sees the root: these are the bytes a cold firmware expects.
+        self.capture_pristine(dev);
+        Ok(())
     }
 
     fn map_register_windows(

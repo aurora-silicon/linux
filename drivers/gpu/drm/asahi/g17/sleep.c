@@ -44,13 +44,37 @@
 #define ASC_CPU_CONTROL		0x44
 #define ASC_CPU_CONTROL_RUN	BIT(4)
 
+/*
+ * The GPU's PMP report entry: the one apple,pmp-report-entry names, or the GPU's
+ * power domain where that is the entry itself (T6040: pmp-gfx).
+ */
+static struct device_node *asahi_g17_pmp_entry(struct device *dev, bool *domain)
+{
+	struct device_node *np;
+
+	if (domain)
+		*domain = false;
+	np = of_parse_phandle(dev->of_node, "apple,pmp-report-entry", 0);
+	if (np)
+		return np;
+	np = of_parse_phandle(dev->of_node, "power-domains", 0);
+	if (np && of_device_is_compatible(np, "apple,t6000-pmp-v2-report-entry")) {
+		if (domain)
+			*domain = true;
+		return np;
+	}
+	of_node_put(np);
+
+	return NULL;
+}
+
 /* The PMP's request for the GPU, where the device tree names one. */
 int asahi_g17_pmp_request(struct device *dev, bool enable)
 {
 	struct device_node *np;
 	int ret;
 
-	np = of_parse_phandle(dev->of_node, "apple,pmp-report-entry", 0);
+	np = asahi_g17_pmp_entry(dev, NULL);
 	if (!np)
 		return 0;
 	ret = apple_pmp_report_entry_request(np, enable);
@@ -59,14 +83,51 @@ int asahi_g17_pmp_request(struct device *dev, bool enable)
 	return ret;
 }
 
-static int asahi_g17_ps(struct device *dev, struct regmap **regmap, u32 *offset)
+/* Sleeps until the PMP has taken every held power state request, or -ETIMEDOUT. */
+int asahi_pmp_report_wait_handed(unsigned int timeout_ms)
 {
-	struct device_node *np;
-	int ret;
+	return apple_pmp_report_wait_handed(timeout_ms);
+}
+
+static bool asahi_g17_is_pwrstate(struct device_node *np)
+{
+	return of_device_is_compatible(np, "apple,t8103-pmgr-pwrstate") ||
+	       of_device_is_compatible(np, "apple,pmgr-pwrstate");
+}
+
+/*
+ * The GPU's PMGR state word. Where a PMP report entry stands in front of it (T6040:
+ * power-domains = pmp-gfx, whose own domain is the PMGR's gfx), follow that entry's
+ * domain down to the word.
+ */
+static struct device_node *asahi_g17_ps_node(struct device *dev)
+{
+	struct device_node *np, *next;
+	int hops;
 
 	np = of_parse_phandle(dev->of_node, "power-domains", 0);
+	for (hops = 0; np && hops < 2 && !asahi_g17_is_pwrstate(np); hops++) {
+		next = of_parse_phandle(np, "power-domains", 0);
+		of_node_put(np);
+		np = next;
+	}
 	if (!np)
-		return -EINVAL;
+		return ERR_PTR(-EINVAL);
+	if (!asahi_g17_is_pwrstate(np)) {
+		of_node_put(np);
+		return ERR_PTR(-ENODEV);
+	}
+
+	return np;
+}
+
+static int asahi_g17_ps(struct device *dev, struct regmap **regmap, u32 *offset)
+{
+	struct device_node *np = asahi_g17_ps_node(dev);
+	int ret;
+
+	if (IS_ERR(np))
+		return PTR_ERR(np);
 	ret = of_property_read_u32(np, "reg", offset);
 	if (!ret) {
 		*regmap = np->parent ? syscon_node_to_regmap(np->parent) : ERR_PTR(-EINVAL);
@@ -179,6 +240,8 @@ struct asahi_g17_commit {
 	void __iomem *bridge;
 	void __iomem *ps;
 	struct device_node *request;
+	/* The power domain is the PMP's entry: the sleep controller lowers the word behind it. */
+	bool entry_domain;
 
 	bool ran;
 	int idle[2];
@@ -217,6 +280,8 @@ static int asahi_g17_commit_stop(void *data)
 			writel(readl(c->gating) | SGX_GATING_HOLD, c->gating);
 	}
 	c->request_ret = c->request ? apple_pmp_report_entry_withdraw_polled(c->request) : 0;
+	if (c->entry_domain)
+		return (c->idle[0] || c->idle[1] || c->request_ret) ? 1 : 0;
 
 	c->saved = readl(c->ps);
 	writel(c->saved & ~(PS_AUTO_ENABLE | PS_BUSY | PS_FLAGS), c->ps);
@@ -304,10 +369,12 @@ struct asahi_g17_commit *asahi_g17_commit_prepare(struct device *dev,
 			goto err;
 	}
 
-	ret = -ENODEV;
-	np = of_parse_phandle(dev->of_node, "power-domains", 0);
-	if (!np)
+	np = asahi_g17_ps_node(dev);
+	if (IS_ERR(np)) {
+		ret = PTR_ERR(np);
 		goto err;
+	}
+	ret = -ENODEV;
 	if (!of_property_read_u32(np, "reg", &offset) && np->parent)
 		c->ps = asahi_g17_map(np->parent, NULL, 0, offset, 4);
 	of_node_put(np);
@@ -317,12 +384,14 @@ struct asahi_g17_commit *asahi_g17_commit_prepare(struct device *dev,
 					  4 * SGX_BRIDGE_WORDS);
 	if (!c->ps || !c->gating || (bridge && !c->bridge))
 		goto err;
+	/* The word as it is before the sleep, for the raise after it if the stop leaves it. */
+	c->saved = readl(c->ps);
 
-	c->request = of_parse_phandle(dev->of_node, "apple,pmp-report-entry", 0);
+	c->request = asahi_g17_pmp_entry(dev, &c->entry_domain);
 	if (c->request)
 		apple_pmp_report_entry_commit_owned(c->request, true);
 
-	ret = apple_sleep_coproc_register_first(dev, asahi_g17_commit_stop, c);
+	ret = apple_sleep_coproc_register_first(dev, APPLE_SLEEP_FIRST_GPU, asahi_g17_commit_stop, c);
 	if (ret)
 		goto err;
 	apple_sleep_coproc_set_ready(dev, true);
@@ -369,7 +438,7 @@ struct asahi_g17_commit *asahi_g16_commit_prepare(struct device *dev, struct app
 	if (!c->cpu[0] || !c->ps)
 		goto err;
 
-	ret = apple_sleep_coproc_register_first(dev, asahi_g17_commit_stop, c);
+	ret = apple_sleep_coproc_register_first(dev, APPLE_SLEEP_FIRST_GPU, asahi_g17_commit_stop, c);
 	if (ret)
 		goto err;
 	apple_sleep_coproc_set_ready(dev, true);

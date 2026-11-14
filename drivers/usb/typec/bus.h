@@ -22,6 +22,7 @@ struct altmode {
 	const struct attribute_group	*groups[2];
 
 	struct altmode			*partner;
+	bool				owner_held;	/* holds the driver's module */
 	struct altmode			*plug[2];
 };
 

@@ -169,14 +169,25 @@ int pm_notifier_call_chain_robust(unsigned long val_up, unsigned long val_down)
 {
 	int ret;
 
+	if (val_up == PM_RESTORE_PREPARE)
+		hibernate_set_loading(true);
+
 	ret = blocking_notifier_call_chain_robust(&pm_chain_head, val_up, val_down, NULL);
+
+	if (ret && val_up == PM_RESTORE_PREPARE)
+		hibernate_set_loading(false);
 
 	return notifier_to_errno(ret);
 }
 
 int pm_notifier_call_chain(unsigned long val)
 {
-	return blocking_notifier_call_chain(&pm_chain_head, val, NULL);
+	int ret = blocking_notifier_call_chain(&pm_chain_head, val, NULL);
+
+	if (val == PM_POST_RESTORE)
+		hibernate_set_loading(false);
+
+	return ret;
 }
 
 /* If set, devices may be suspended and resumed asynchronously. */

@@ -107,6 +107,16 @@ impl Rings {
         })
     }
 
+    /// For a cold-restarted firmware: its rings are back at their post-build cursors with the
+    /// graph. A ring quarantined for an error of the previous firmware instance is accepted
+    /// again; telemetry restarts at the new `epoch`. Suspension (host policy) and the report
+    /// history are kept.
+    pub(super) fn reset_after_cold_boot(&mut self, epoch: u64) {
+        self.quarantined = [[false; 2]; 2];
+        self.invalidate_statistics();
+        self.statistics_epoch = epoch;
+    }
+
     pub(super) fn invalidate_statistics(&mut self) {
         self.telemetry.invalidate();
         // The packets have no epoch marker. Discard each role's already

@@ -67,19 +67,24 @@ SYM_CODE_START(swsusp_arch_suspend_exit)
 	copy_page	x0, x1, x2, x3, x4, x5, x6, x7, x8, x9
 
 	add	x1, x10, #PAGE_SIZE
-	/* Clean the copied page to PoU - based on caches_clean_inval_pou() */
+	/*
+	 * Clean the copied page to PoC, not only PoU: non-coherent DMA
+	 * masters (the coprocessors of some SoCs) read the restored pages
+	 * from DRAM. Clean+invalidate to PoC also covers what
+	 * caches_clean_inval_pou() did for the I-side.
+	 */
 	raw_dcache_line_size x2, x3
 	sub	x3, x2, #1
 	bic	x4, x10, x3
 2:	/* clean D line / unified line */
-alternative_insn "dc cvau, x4",  "dc civac, x4",  ARM64_WORKAROUND_CLEAN_CACHE
+	dc	civac, x4
 	add	x4, x4, x2
 	cmp	x4, x1
 	b.lo	2b
 
 	ldr	x19, [x19, #HIBERN_PBE_NEXT]
 	cbnz	x19, 1b
-	dsb	ish		/* wait for PoU cleaning to finish */
+	dsb	ish		/* wait for PoC cleaning to finish */
 
 	/* switch to the restored kernels page tables */
 	break_before_make_ttbr_switch	x25, x21, x6, x8

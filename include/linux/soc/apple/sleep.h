@@ -9,10 +9,21 @@
 #include <linux/compiler_types.h>
 #include <linux/errno.h>
 #include <linux/kconfig.h>
+#include <linux/suspend.h>
 #include <linux/types.h>
 
 struct device;
 struct device_node;
+
+/*
+ * The coprocessor and enclave registry, shared by the sleep controllers
+ * (drivers/soc/apple/sleep-registry.c). The controller bound on this SoC
+ * answers apple_sleep_commit_stops_coprocs() and runs the last stops.
+ */
+/* Order of the coprocessors registered first (apple_sleep_coproc_register_first()). */
+#define APPLE_SLEEP_FIRST_SMC	0	/* its warning and commit come before the GPU's stop */
+#define APPLE_SLEEP_FIRST_GPU	1
+#define APPLE_SLEEP_FIRST_ORDERS	2
 
 #if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP)
 /*
@@ -30,16 +41,12 @@ int apple_sleep_coproc_register(struct device *dev, void __iomem *asc, bool pcie
 /*
  * The same with no ASC to clear: @last_stop clears its own run bits and lowers its own power
  * domain, and runs before every other coprocessor's. The refusal checks leave that domain on.
+ * Those registered first run in the order of @order, an APPLE_SLEEP_FIRST_* value, not of
+ * their place in the table.
  */
-int apple_sleep_coproc_register_first(struct device *dev, int (*last_stop)(void *data),
-				      void *data);
+int apple_sleep_coproc_register_first(struct device *dev, unsigned int order,
+				      int (*last_stop)(void *data), void *data);
 void apple_sleep_coproc_unregister(struct device *dev);
-
-/*
- * During a suspend: a driver left something the DRAM-kept wake would stall on, so this
- * sleep takes the deep path. False if no sleep driver can do that.
- */
-bool apple_sleep_request_deep_once(void);
 
 /*
  * For a registered coprocessor: the last of its stop that may still refuse the sleep, run
@@ -69,6 +76,61 @@ bool apple_sleep_coproc_stopped(struct device *dev);
  * registered refuses the sleep: stopped any earlier, a later refusal would strand it.
  */
 bool apple_sleep_commit_stops_coprocs(void);
+#else
+static inline int apple_sleep_coproc_register(struct device *dev, void __iomem *asc,
+					      bool pcie_ans, int (*last_stop)(void *data),
+					      void *data)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int apple_sleep_coproc_register_first(struct device *dev, unsigned int order,
+						    int (*last_stop)(void *data), void *data)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void apple_sleep_coproc_unregister(struct device *dev)
+{
+}
+
+static inline int apple_sleep_coproc_set_last_check(struct device *dev,
+						    int (*last_check)(void *data))
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int apple_sleep_enclave_register(struct device *dev, int (*tell)(void *data),
+					       void *data)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline void apple_sleep_enclave_unregister(struct device *dev)
+{
+}
+
+static inline void apple_sleep_coproc_set_ready(struct device *dev, bool ready)
+{
+}
+
+static inline bool apple_sleep_coproc_stopped(struct device *dev)
+{
+	return false;
+}
+
+static inline bool apple_sleep_commit_stops_coprocs(void)
+{
+	return false;
+}
+#endif
+
+#if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP)
+/*
+ * During a suspend: a driver left something the DRAM-kept wake would stall on, so this
+ * sleep takes the deep path. False if no sleep driver can do that.
+ */
+bool apple_sleep_request_deep_once(void);
 
 /*
  * The USB host sleeps in place for this sleep, as macOS's does: its always-on domain stays
@@ -117,7 +179,6 @@ bool apple_sleep_debug_link_cut_peek(struct device *dev);
 bool apple_sleep_debug_link_cut(void);
 
 /* This sleep will end the debug link: for the SMC's driver, which warns the SMC after it. */
-bool apple_sleep_debug_link_up(void);
 
 /*
  * From the SMC's driver, in its noirq resume: the SMC woke the AP for the lid alone, and the
@@ -171,54 +232,8 @@ void apple_sleep_restore_pins(void);
  */
 int apple_sleep_engine_reset(struct device *dev);
 #else
-static inline int apple_sleep_coproc_register(struct device *dev, void __iomem *asc,
-					      bool pcie_ans, int (*last_stop)(void *data),
-					      void *data)
-{
-	return -EOPNOTSUPP;
-}
-
-static inline int apple_sleep_coproc_register_first(struct device *dev,
-						    int (*last_stop)(void *data), void *data)
-{
-	return -EOPNOTSUPP;
-}
-
+/* Without the T8140 controller no sleep goes deep: false, as with no sleep driver. */
 static inline bool apple_sleep_request_deep_once(void)
-{
-	return false;
-}
-
-static inline void apple_sleep_coproc_unregister(struct device *dev)
-{
-}
-
-static inline int apple_sleep_coproc_set_last_check(struct device *dev,
-						    int (*last_check)(void *data))
-{
-	return -EOPNOTSUPP;
-}
-
-static inline int apple_sleep_enclave_register(struct device *dev, int (*tell)(void *data),
-					       void *data)
-{
-	return -EOPNOTSUPP;
-}
-
-static inline void apple_sleep_enclave_unregister(struct device *dev)
-{
-}
-
-static inline void apple_sleep_coproc_set_ready(struct device *dev, bool ready)
-{
-}
-
-static inline bool apple_sleep_coproc_stopped(struct device *dev)
-{
-	return false;
-}
-
-static inline bool apple_sleep_commit_stops_coprocs(void)
 {
 	return false;
 }
@@ -270,11 +285,6 @@ static inline bool apple_sleep_debug_link_cut(void)
 	return false;
 }
 
-static inline bool apple_sleep_debug_link_up(void)
-{
-	return false;
-}
-
 static inline void apple_sleep_lid_closed_wake(void)
 {
 }
@@ -316,6 +326,24 @@ static inline void apple_sleep_restore_pins(void)
 static inline int apple_sleep_engine_reset(struct device *dev)
 {
 	return -EOPNOTSUPP;
+}
+#endif
+
+/*
+ * Whether this firmware-driven suspend may end in a real power loss of the SoC, so that a
+ * driver may stop what only a power cycle brings back. A dry run, which the T6040 has, sets
+ * pm_suspend_via_firmware() to run every sleep step that can still be taken back and then
+ * refuses before the commit: there this is false, and such a stop has to be left out. The
+ * SMC's sleep commit is one of them: an SMC that took it stays in its sleep state until the
+ * SoC has lost its power and come back.
+ * Everywhere else it is pm_suspend_via_firmware().
+ */
+#if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP)
+bool apple_sleep_power_loss(void);
+#else
+static inline bool apple_sleep_power_loss(void)
+{
+	return pm_suspend_via_firmware();
 }
 #endif
 

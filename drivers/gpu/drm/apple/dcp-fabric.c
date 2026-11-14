@@ -153,6 +153,8 @@ static LIST_HEAD(dcp_typec_ports);
 static unsigned long dcp_hybrid_moved;
 /* failed takes of the hybrid since the last success or Type-C DP exit */
 static unsigned int dcp_hybrid_fails;
+/* when a wake last connected an external display again, 0 if never; lockless */
+static unsigned long dcp_hybrid_woken;
 #define DCP_HYBRID_MAX_FAILS	2
 /* Current DTs wire the same stream capacity on every physical port. */
 static atomic_t dcp_dual_stream_routes = ATOMIC_INIT(0);
@@ -377,6 +379,12 @@ bool dcp_is_typec_only(struct platform_device *pdev)
 	return !dcp->fixed_phy;
 }
 
+static bool dcp_fabric_t6040_tunnel_clock(void)
+{
+	return of_machine_is_compatible("apple,t6040") ||
+	       of_machine_is_compatible("apple,t6041");
+}
+
 static int dcp_route_clock_rate(struct apple_dcp_typec_route *route,
 				struct phy *phy, unsigned int dpin, u8 rate)
 {
@@ -395,6 +403,20 @@ static int dcp_route_clock_rate(struct apple_dcp_typec_route *route,
 			return rate ? -EOPNOTSUPP : 0;
 		ret = fn(phy, dpin + 1, rate);
 		symbol_put(apple_t6050_dp_tunnel_clock);
+		if (!ret)
+			route->tunnel_rate = rate;
+		return ret;
+	}
+
+	/* T6040: the PHY's own AUSPLL feeds the pixel clock of DP IN 0 and 1. */
+	if (dcp_fabric_t6040_tunnel_clock()) {
+		typeof(apple_t6040_dp_tunnel_rate) *fn =
+			symbol_get(apple_t6040_dp_tunnel_rate);
+
+		if (!fn)
+			return rate ? -EOPNOTSUPP : 0;
+		ret = fn(phy, dpin, rate);
+		symbol_put(apple_t6040_dp_tunnel_rate);
 		if (!ret)
 			route->tunnel_rate = rate;
 		return ret;
@@ -531,6 +553,27 @@ static void dcp_typec_route_phy_off(struct apple_dcp_typec_route *route)
 	phy_power_off(route->phy);
 	phy_exit(route->phy);
 }
+
+#ifdef CONFIG_PM_SLEEP
+/*
+ * Before a sleep that loses the PHY's state (a hibernation, a T6040 S2R): give
+ * the active route's DP PHY back as a route deactivation does, so that it is
+ * recorded off (the T6040 PHY has no PM ops and comes back reset).  The route, its
+ * crossbar selection and the cable stay; the next connect powers the PHY
+ * again through dcp_typec_phy_on().  Returns whether it was powered.
+ */
+bool dcp_typec_phy_release(struct apple_dcp *dcp)
+{
+	struct apple_dcp_typec_route *route;
+
+	guard(mutex)(&dcp->tb_lock);
+	route = READ_ONCE(dcp->active_typec_route);
+	if (!route || !route->phy_powered)
+		return false;
+	dcp_typec_route_phy_off(route);
+	return true;
+}
+#endif
 
 static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 				    struct mux_control *xbar)
@@ -694,6 +737,8 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 
 	WRITE_ONCE(dcp->peer_starved, false);
 	WRITE_ONCE(dcp->typec_narrow, false);
+	/* Nor is its list a wake's to compare: another display comes here. */
+	WRITE_ONCE(dcp->wake_list_sig, 0);
 	/* A peer reserved for this route's display is not needed any more. */
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP)
 		dcp_peer_release_26_6(dcp);
@@ -2171,6 +2216,9 @@ static void dcp_tunnel_prepare(struct apple_dcp_typec_route *route,
 	if (ret && ret != -EOPNOTSUPP)
 		dev_warn(dcp->dev, "DP tunnel crossbar preselect failed: %d\n", ret);
 
+	/* The clock call starts everything on T6040. */
+	if (dcp_fabric_t6040_tunnel_clock())
+		return;
 	open = symbol_get(apple_atc_dp_tunnel_open);
 	if (!open)
 		return;
@@ -2924,12 +2972,22 @@ static int dcp_tb_split_teardown_locked(struct apple_dcp_typec_port *port,
 		/* Retire the callback before dropping its clock reference. */
 		dcp->split.active = false;
 		if (dcp->phy) {
-			typeof(apple_atc_dp_tunnel_rate) *stop =
-				symbol_get(apple_atc_dp_tunnel_rate);
+			if (dcp_fabric_t6040_tunnel_clock()) {
+				typeof(apple_t6040_dp_tunnel_rate) *stop =
+					symbol_get(apple_t6040_dp_tunnel_rate);
 
-			if (stop) {
-				stop(dcp->phy, 1, 0);
-				symbol_put(apple_atc_dp_tunnel_rate);
+				if (stop) {
+					stop(dcp->phy, 1, 0);
+					symbol_put(apple_t6040_dp_tunnel_rate);
+				}
+			} else {
+				typeof(apple_atc_dp_tunnel_rate) *stop =
+					symbol_get(apple_atc_dp_tunnel_rate);
+
+				if (stop) {
+					stop(dcp->phy, 1, 0);
+					symbol_put(apple_atc_dp_tunnel_rate);
+				}
 			}
 		}
 		if (dcp->split.xbar) {
@@ -5036,6 +5094,22 @@ void dcp_fabric_hybrid_kick(struct apple_dcp *dcp, unsigned int delay_ms)
 	mod_delayed_work(system_freezable_wq, &dcp->hybrid_wq, msecs_to_jiffies(delay_ms));
 }
 
+/*
+ * A wake connects every external display again, and a display that its link
+ * has just woken can list the modes of its standby first: a monitor showing
+ * two inputs side by side lists its full width then and asks for both pipes.
+ * dcp_wake_list_check() reads such a display again.  Until then, and until an
+ * HDMI display is back that the wake found behind a converter without power,
+ * the pipes stay with the displays the sleep found on them: the wake counts
+ * as a hand-over, and the next one waits for the cooldown.
+ */
+void dcp_fabric_hybrid_woken(struct apple_dcp *dcp)
+{
+	if (dcp->fw_compat != DCP_FIRMWARE_V_26_6_DESKTOP)
+		return;
+	WRITE_ONCE(dcp_hybrid_woken, jiffies ?: 1);
+}
+
 /* typec_hybrid_first was written: apply it now, past any cooldown. */
 static void dcp_fabric_hybrid_policy_changed(void)
 {
@@ -5043,6 +5117,7 @@ static void dcp_fabric_hybrid_policy_changed(void)
 	struct apple_dcp_typec_route *route;
 
 	guard(mutex)(&dcp_typec_fabric_lock);
+	WRITE_ONCE(dcp_hybrid_woken, 0);
 	dcp_hybrid_moved = 0;
 	dcp_hybrid_fails = 0;
 	list_for_each_entry(port, &dcp_typec_ports, link)
@@ -5078,6 +5153,7 @@ static void dcp_hybrid_work(struct work_struct *work)
 	struct apple_dcp *self = container_of(to_delayed_work(work), struct apple_dcp,
 					      hybrid_wq);
 	unsigned long cooldown = msecs_to_jiffies(DCP_HYBRID_COOLDOWN_MS);
+	unsigned long woken = READ_ONCE(dcp_hybrid_woken);
 	bool typec_first = dcp_typec_hybrid_first();
 	struct apple_dcp_typec_port *port;
 	bool unyielded = false;
@@ -5086,6 +5162,11 @@ static void dcp_hybrid_work(struct work_struct *work)
 	if (dcp_hybrid_moved && time_before(jiffies, dcp_hybrid_moved + cooldown)) {
 		mod_delayed_work(system_freezable_wq, &self->hybrid_wq,
 				 dcp_hybrid_moved + cooldown - jiffies);
+		return;
+	}
+	if (woken && time_before(jiffies, woken + cooldown)) {
+		mod_delayed_work(system_freezable_wq, &self->hybrid_wq,
+				 woken + cooldown - jiffies);
 		return;
 	}
 
@@ -5161,6 +5242,21 @@ static void dcp_hybrid_work(struct work_struct *work)
 			port->typec_yielded = true;
 			WRITE_ONCE(hyb->peer_starved, false);
 			if (!dcp_dptx_disconnect(hyb, 0))
+				dcp_dptx_connect(hyb, 0);
+			dcp_hybrid_moved = jiffies ?: 1;
+			return;
+		}
+
+		/*
+		 * The HDMI display made room for this one, which fits one pipe
+		 * after all (it listed other modes when it was read again):
+		 * the HDMI display takes its pipeline back.
+		 */
+		if (typec_first && READ_ONCE(hyb->hdmi_yielded) &&
+		    !READ_ONCE(owner->dcp->peer_starved) && !hyb->active_typec_route) {
+			dev_info(hyb->dev, "Type-C display fits one pipe: the HDMI display keeps the hybrid\n");
+			WRITE_ONCE(hyb->hdmi_yielded, false);
+			if (hyb->active && hdmi)
 				dcp_dptx_connect(hyb, 0);
 			dcp_hybrid_moved = jiffies ?: 1;
 			return;

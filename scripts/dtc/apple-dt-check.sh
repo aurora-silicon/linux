@@ -2,7 +2,9 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # apple-dt-check.sh BASE HEAD WORKDIR: run CHECK_DTBS on every Apple device tree at BASE and at HEAD
 # and fail when HEAD has a warning BASE does not. Also runs dt_binding_check on every binding HEAD
-# changes. Phandle values in the messages are masked, so renumbering is not a new warning.
+# changes. Phandle values in the messages are masked, so renumbering is not a new warning, and so
+# is the pattern list of a "does not match any of the regexes" message, which grows with every
+# vendor prefix the bindings add.
 # Needs dtschema (dt-validate), clang/lld (LLVM=1), flex, bison. Prints a summary.
 set -u
 BASE=$1 HEAD=$2 W=$3
@@ -17,7 +19,7 @@ warnings() { # rev tag
 	local rc=$?
 	grep -E '\.dtb: |[Ww]arning|rror' "$W/$2.log" | grep -v '^  ' |
 		sed -E "s#$t/##g; s#$o/##g" |
-		perl -pe 's{(\[\[[^:]*?\]\])}{(my $x = $1) =~ s/\d+/N/g; $x}ge; s{b\x27(?:\\.|[^\x27])*\x27}{b\x27N\x27}g' |
+		perl -pe 's{(\[\[[^:]*?\]\])}{(my $x = $1) =~ s/\d+/N/g; $x}ge; s{b\x27(?:\\.|[^\x27])*\x27}{b\x27N\x27}g; s{( not match any of the regexes): .*}{$1: ...}' |
 		sort -u > "$W/$2.warn"
 	echo "$2: make rc=$rc, $(wc -l < "$W/$2.warn") warning lines, $(echo $dtbs | wc -w) DTBs"
 	return $rc

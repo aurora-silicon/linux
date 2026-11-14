@@ -215,13 +215,17 @@ struct apple_nvme_hw {
 	bool needs_ioq_registers;
 	/* T8132 needs a PMGR reset when starting a stopped coprocessor. */
 	bool cold_reset;
-	/* Firmware-driven suspend has been traced on this controller. */
-	bool sleep_traced;
-	/* The last endpoint map reply from that trace */
+	/*
+	 * The sleep controller takes this ANS through a firmware-driven suspend:
+	 * flush, quiesce and shutdown notification at the device suspend, the
+	 * polled idle at the commit and a warm restart after the wake.
+	 */
+	bool sleep_coproc;
+	/* The last endpoint map reply of that warm restart; 0: the whole map again. */
 	u32 sleep_epmap_last_mask;
 	/* Higher namespaces are the firmware's, and a Flush to one faults the controller. */
 	u32 sleep_flush_max_nsid;
-	/* CC.SHN for a sleep, as read back from the OS the sleep was traced on. */
+	/* CC.SHN the controller wants for a sleep. */
 	u32 sleep_shn;
 	/* The ANS is never reset through PMGR here, so no reset is named. */
 	bool reset_optional;
@@ -2399,6 +2403,9 @@ static void apple_nvme_free_rtkit(void *data)
 
 	apple_nvme_set_reset_ready(anv, false);
 	guard(mutex)(&anv->disable_lock);
+	/* A failed hibernation restore leaves no session behind. */
+	if (!anv->rtk)
+		return;
 	if (anv->hw->needs_ioq_registers)
 		apple_rtkit_free_retaining_buffers(anv->rtk);
 	else
@@ -2426,6 +2433,24 @@ static void apple_nvme_flush_work(struct work_struct *work)
 	} else {
 		anv->last_flush = jiffies;
 	}
+}
+
+/*
+ * What a new RTKit object is told about this controller: at probe, and when a
+ * hibernation restore replaces the object with one for the session the boot
+ * loader started.
+ */
+static void apple_nvme_rtkit_configure(struct apple_nvme *anv)
+{
+	/*
+	 * The T6050 ANS firmware handed over by iBoot can take about 3 s to
+	 * answer the power-state and endpoint-map handshake.
+	 */
+	if (of_device_is_compatible(anv->dev->of_node, "apple,t6050-nvme-ans2"))
+		apple_rtkit_set_handshake_timeout(anv->rtk,
+						  APPLE_NVME_T6050_HANDSHAKE_TIMEOUT_MS);
+	if (anv->hw->sleep_coproc)
+		apple_rtkit_set_warm_epmap_mask(anv->rtk, anv->hw->sleep_epmap_last_mask);
 }
 
 static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
@@ -2520,7 +2545,7 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 	/*
 	 * Newer ANS firmware moves the linear submission queue registers into
 	 * the NVMMU block and ends the "nvme" block before them (T6040, and
-	 * T8142 booting the macOS 27.0 stub: 0x10000, ADT ans reg[9]). A
+	 * T8142 with the 27.0 firmware stub: window of 0x10000). A
 	 * window that does not reach the doorbells means that layout.
 	 */
 	anv->lsq_in_nvmmu = anv->hw->lsq_in_nvmmu ||
@@ -2627,13 +2652,7 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		goto out_detach_genpd;
 	}
 
-	/*
-	 * The T6050 ANS firmware handed over by iBoot can take about 3 s to
-	 * answer the power-state and endpoint-map handshake.
-	 */
-	if (of_device_is_compatible(dev->of_node, "apple,t6050-nvme-ans2"))
-		apple_rtkit_set_handshake_timeout(anv->rtk,
-						  APPLE_NVME_T6050_HANDSHAKE_TIMEOUT_MS);
+	apple_nvme_rtkit_configure(anv);
 
 	ret = devm_add_action_or_reset(dev, apple_nvme_free_rtkit, anv);
 	if (ret)
@@ -2742,7 +2761,7 @@ static int apple_nvme_probe(struct platform_device *pdev)
 
 	INIT_DELAYED_WORK(&anv->flush_dwork, apple_nvme_flush_work);
 
-	if (anv->hw->sleep_traced) {
+	if (anv->hw->sleep_coproc) {
 		anv->sleep_registered =
 			!apple_sleep_coproc_register(anv->dev, anv->mmio_coproc, true,
 						     apple_nvme_sleep_last_stop, anv);
@@ -2752,7 +2771,6 @@ static int apple_nvme_probe(struct platform_device *pdev)
 			apple_sleep_coproc_unregister(anv->dev);
 			anv->sleep_registered = false;
 		}
-		apple_rtkit_set_warm_epmap_mask(anv->rtk, anv->hw->sleep_epmap_last_mask);
 	}
 
 	apple_nvme_set_reset_ready(anv, true);
@@ -2840,20 +2858,20 @@ static void apple_nvme_shutdown(struct platform_device *pdev)
 	}
 }
 
-/* macOS sees the firmware report on 68 ms after HELLO. Each try waits RTKit's timeout again. */
+/* The firmware reports on about 68 ms after HELLO. Each try waits RTKit's timeout again. */
 #define APPLE_NVME_SLEEP_ON_TRIES	15
 
 /*
  * After a real sleep ANS has lost power, and its resident firmware restarts once the run bit
- * is set. Measured on macOS under aura, the same in five runs: HELLO first and unprompted,
+ * is set. Measured under aura, the same in five runs: HELLO first and unprompted,
  * then the endpoint map, the last part answered with endpoint 0x20 only. No endpoint is
  * started and no buffer asked for. About 68 ms later the firmware reports on, and the AP state
  * follows, with the controller's registers reading 0. A refused suspend never told the
  * firmware anything, and takes a reset.
  *
- * The run bit goes in the early phase, so HELLO comes within milliseconds of the wake as on
- * macOS. The wait for on doesn't: macOS rings the SEP a few ms after ANS's HELLO, before ANS
- * reports on, so the reset work waits, after the SEP's own resume has had its turn.
+ * The run bit goes in the early phase, so HELLO comes within milliseconds of the wake. The
+ * wait for on doesn't: the SEP is rung a few ms after ANS's HELLO, before ANS reports on,
+ * so the reset work waits, after the SEP's own resume has had its turn.
  */
 static int apple_nvme_resume_early(struct device *dev)
 {
@@ -2869,7 +2887,7 @@ static int apple_nvme_resume_early(struct device *dev)
 		apple_sleep_coproc_set_ready(dev, false);
 	/* Its link doesn't come up with the pins as the sleep left them. */
 	apple_sleep_restore_pins();
-	/* macOS writes the SART's entries back again right before the run bit. */
+	/* The SART's entries go back in again right before the run bit. */
 	if (anv->sart)
 		apple_sart_replay(anv->sart);
 
@@ -3006,12 +3024,12 @@ static bool apple_nvme_sleep_wanted(struct apple_nvme *anv)
 }
 
 /*
- * As macOS sends it, from its power-state change during the device suspend: the shutdown
- * notification, waited for with interrupts on for as long as macOS allows (35 s). The
- * controller can take seconds to save its context (1.7 s in one macOS sleep). A sleep
- * refused later finds it shut down, and resume's controller reset takes it back.
+ * Sent from the device suspend: the shutdown notification, waited for with interrupts on
+ * for up to 35 s. The controller can take seconds to save its context (1.7 s in one
+ * sleep). A sleep refused later finds it shut down, and resume's controller reset takes it
+ * back.
  */
-#define APPLE_ANS_SLEEP_SHN_MACOS_TIMEOUT_US (35 * USEC_PER_SEC)
+#define APPLE_ANS_SLEEP_SHN_TIMEOUT_US (35 * USEC_PER_SEC)
 
 static int apple_nvme_sleep_send_shn(struct apple_nvme *anv)
 {
@@ -3025,7 +3043,7 @@ static int apple_nvme_sleep_send_shn(struct apple_nvme *anv)
 	writel(anv->ctrl.ctrl_config, anv->mmio_nvme + NVME_REG_CC);
 	ret = readl_poll_timeout(anv->mmio_nvme + NVME_REG_CSTS, csts,
 				 (csts & NVME_CSTS_SHST_MASK) == NVME_CSTS_SHST_CMPLT,
-				 1000, APPLE_ANS_SLEEP_SHN_MACOS_TIMEOUT_US);
+				 1000, APPLE_ANS_SLEEP_SHN_TIMEOUT_US);
 	us = ktime_us_delta(ktime_get(), start);
 	if (ret)
 		dev_err(anv->dev, "shutdown notification failed after %lld ms: CSTS %#x\n",
@@ -3107,8 +3125,122 @@ static int apple_nvme_suspend(struct device *dev)
 	return ret;
 }
 
+/*
+ * Hibernation restore on post-M4. The machine cold-booted since .freeze:
+ * the boot firmware restarted ANS, the boot stages kept it running, and the
+ * resume kernel adopted that session to read the image (its own queues, and
+ * its .freeze cleared CC.EN before jumping here). anv->rtk therefore
+ * describes a firmware instance that no longer exists, and the live session
+ * on the mailbox has never been adopted by this kernel. Unlike
+ * apple_nvme_can_adopt_rtkit(), accept a disabled controller: it was just
+ * disabled below, and RUN + BOOT_STATUS_OK + !CFS are what survive.
+ */
+static bool apple_nvme_can_adopt_restored_rtkit(struct apple_nvme *anv)
+{
+	u32 csts;
+
+	if (!(readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL) &
+	      APPLE_ANS_COPROC_CPU_CONTROL_RUN) ||
+	    readl(anv->mmio_nvme + APPLE_ANS_BOOT_STATUS) != APPLE_ANS_BOOT_STATUS_OK)
+		return false;
+	csts = readl(anv->mmio_nvme + NVME_REG_CSTS);
+	if (csts & NVME_CSTS_CFS)
+		return false;
+	return !(readl(anv->mmio_nvme + NVME_REG_CC) & NVME_CC_ENABLE) &&
+	       !(csts & NVME_CSTS_RDY);
+}
+
+static int apple_nvme_restore_post_m4(struct apple_nvme *anv)
+{
+	struct apple_rtkit *rtk;
+	int ret;
+
+	guard(mutex)(&anv->disable_lock);
+	if (READ_ONCE(anv->quarantined))
+		return -EIO;
+	dev_dbg(anv->dev,
+		"hibernation restore: CPU_CONTROL=%#x BOOT_STATUS=%#x CC=%#x CSTS=%#x\n",
+		readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL),
+		readl(anv->mmio_nvme + APPLE_ANS_BOOT_STATUS),
+		readl(anv->mmio_nvme + NVME_REG_CC),
+		readl(anv->mmio_nvme + NVME_REG_CSTS));
+
+	/*
+	 * Stop the controller first: until CC.EN is clear the firmware may
+	 * still fetch from the resume kernel's queues, whose memory is now
+	 * this kernel's. This is the owned-session reset path.
+	 */
+	ret = apple_nvme_disable_locked(anv, false);
+	if (ret)
+		return ret;
+
+	/*
+	 * Our firmware instance ended with the power-off. No shutdown
+	 * handshake: the new instance would receive it. Shared buffers are
+	 * retained as in apple_nvme_free_rtkit().
+	 */
+	apple_nvme_set_reset_ready(anv, false);
+	apple_rtkit_free_retaining_buffers(anv->rtk);
+	anv->rtk = NULL;
+	anv->owns_rtkit = false;
+
+	if (!apple_nvme_can_adopt_restored_rtkit(anv)) {
+		dev_err(anv->dev, "hibernation restore: no adoptable ANS session\n");
+		apple_nvme_quarantine(anv, -EIO);
+		return -EIO;
+	}
+
+	/* Publish admission before the initializer enables mailbox RX. */
+	anv->inherited_rtkit = true;
+	rtk = apple_rtkit_init_adopted(anv->dev, anv, NULL, 0,
+				       &apple_nvme_rtkit_ops);
+	if (IS_ERR(rtk)) {
+		ret = PTR_ERR(rtk);
+		dev_err(anv->dev, "hibernation restore: RTKit init failed: %d\n", ret);
+		apple_nvme_quarantine(anv, ret);
+		return ret;
+	}
+	anv->rtk = rtk;
+	apple_nvme_rtkit_configure(anv);
+	ret = apple_rtkit_adopt_running(rtk);
+	if (ret) {
+		dev_err(anv->dev, "hibernation restore: RTKit adoption failed: %d\n", ret);
+		apple_nvme_quarantine(anv, ret);
+		return ret;
+	}
+	/* Owned: reset_work takes the live-session path, as after s2idle. */
+	anv->owns_rtkit = true;
+	apple_nvme_set_reset_ready(anv, true);
+	dev_info(anv->dev,
+		 "hibernation restore: adopted the boot loader's ANS session\n");
+	return 0;
+}
+
+static int apple_nvme_restore(struct device *dev)
+{
+	struct apple_nvme *anv = dev_get_drvdata(dev);
+	int ret;
+
+	if (anv->hw->needs_ioq_registers) {
+		ret = apple_nvme_restore_post_m4(anv);
+		if (ret)
+			return ret;
+	}
+	return apple_nvme_resume(dev);
+}
+
+/*
+ * freeze and poweroff disable the controller and keep the session, like
+ * suspend; thaw (image not written) is a resume. Only restore differs. The
+ * early resume restarts ANS only after a firmware-driven suspend idled it.
+ */
 static const struct dev_pm_ops apple_nvme_pm_ops = {
-	SYSTEM_SLEEP_PM_OPS(apple_nvme_suspend, apple_nvme_resume)
+	.suspend = pm_sleep_ptr(apple_nvme_suspend),
+	.resume = pm_sleep_ptr(apple_nvme_resume),
+	.freeze = pm_sleep_ptr(apple_nvme_suspend),
+	.thaw = pm_sleep_ptr(apple_nvme_resume),
+	.poweroff = pm_sleep_ptr(apple_nvme_suspend),
+	.restore = pm_sleep_ptr(apple_nvme_restore),
 	LATE_SYSTEM_SLEEP_PM_OPS(NULL, apple_nvme_resume_early)
 };
 
@@ -3135,7 +3267,7 @@ static const struct apple_nvme_hw apple_nvme_t8132_hw = {
 	.cold_reset = true,
 	.max_queue_depth = 64,
 	/* T8140's values: T8132's sleep path hasn't been traced. */
-	.sleep_traced = true,
+	.sleep_coproc = true,
 	.sleep_epmap_last_mask = BIT(0),
 	.sleep_flush_max_nsid = 1,
 	.sleep_shn = NVME_CC_SHN_MASK,
@@ -3148,7 +3280,7 @@ static const struct apple_nvme_hw apple_nvme_t8140_hw = {
 	.has_separate_nvmmu = true,
 	.needs_ioq_registers = true,
 	.max_queue_depth = 64,
-	.sleep_traced = true,
+	.sleep_coproc = true,
 	.sleep_epmap_last_mask = BIT(0),
 	.sleep_flush_max_nsid = 1,
 	.sleep_shn = NVME_CC_SHN_MASK,
@@ -3183,6 +3315,26 @@ static const struct apple_nvme_hw apple_nvme_t6040_hw = {
 	.needs_ioq_registers = true,
 	.lsq_in_nvmmu = true,
 	.max_queue_depth = 64,
+	/*
+	 * The sleep controller takes this ANS through a firmware-driven suspend
+	 * as on T8140: flush, quiesce and the shutdown notification at the
+	 * device suspend, the firmware idled at the commit, its storage link
+	 * quiesced behind it and brought up again on wake, then the SART replay,
+	 * the warm RTKit restart and a controller reset. A sleep taken back
+	 * before the commit has flushed, quiesced and notified too, and resets
+	 * the controller like any refused sleep.
+	 *
+	 * The firmware takes the shutdown notification with both CC.SHN bits set
+	 * and answers with CSTS.SHST complete. It owns every namespace above 1,
+	 * as on T8140, so only namespace 1 is flushed.
+	 *
+	 * After a sleep that cut the power it takes the whole endpoint map
+	 * echoed as the last reply of the warm restart, RTKit's default:
+	 * sleep_epmap_last_mask stays 0.
+	 */
+	.sleep_coproc = true,
+	.sleep_flush_max_nsid = 1,
+	.sleep_shn = NVME_CC_SHN_MASK,
 	.quirks = NVME_QUIRK_NO_APST,
 };
 

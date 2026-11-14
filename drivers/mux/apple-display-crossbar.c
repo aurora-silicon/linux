@@ -110,6 +110,8 @@ struct apple_dpxbar_hw {
 	bool runtime_pm;
 	/* T8142 layout: a connection status still busy after its poll is only logged */
 	bool status_log_only;
+	/* DP IN tunnels enable the ATC at 0x38; 0x34 selects UHBR (T604X) */
+	bool t604x_dpin_atc;
 };
 
 struct apple_dpxbar {
@@ -236,6 +238,14 @@ static void t602x_dump(struct apple_dpxbar *xbar, const char *tag)
 #define T602X_DISPEXT_ENABLE 0x02c
 #define T602X_MUX_SELECT 0x030
 #define T602X_ATC_ENABLE 0x034
+/*
+ * T604X, when a connection comes up: 0x34 holds a per-clock UHBR select
+ * (bit n set when the link rate is UHBR, cleared when it is not) and the ATC
+ * is enabled at 0x38 (its bit ORed in); neither is cleared at teardown. Used
+ * for DP IN tunnels only: the DP alt mode output keeps the T6030 write.
+ */
+#define T604X_ATC_UHBR_SELECT 0x034
+#define T604X_ATC_ENABLE 0x038
 
 /*
  * Field of a T6030 output in the gate, select and enable registers. DP IN 0,
@@ -285,7 +295,13 @@ static void apple_dpxbar_t6030_link(struct apple_dpxbar *xbar,
 		dpxbar_set32(xbar, T602X_FIFO_WR_DPTX_CLK_EN, u);
 		dpxbar_set32(xbar, rd, u);
 		dpxbar_set32(xbar, out, d);
-		dpxbar_set32(xbar, T602X_ATC_ENABLE, d);
+		if (xbar->hw->t604x_dpin_atc && index != MUX_DPPHY) {
+			/* DP IN tunnels carry DP 1.x rates only: no UHBR select. */
+			dpxbar_clear32(xbar, T604X_ATC_UHBR_SELECT, d);
+			dpxbar_set32(xbar, T604X_ATC_ENABLE, d);
+		} else {
+			dpxbar_set32(xbar, T602X_ATC_ENABLE, d);
+		}
 		dpxbar_set32(xbar, T602X_DISPEXT_ENABLE, u);
 	} else {
 		dpxbar_clear32(xbar, T602X_DISPEXT_ENABLE, u);
@@ -1380,6 +1396,9 @@ static int apple_dpxbar_resume(struct device *dev)
 		u32 shift = apple_dpxbar_t6030_shift(i);
 		u32 mask = (0xfU << shift) | (0xfU << (shift + 12));
 		u32 route = (state << shift) | (state << (shift + 12));
+		/* Where apple_dpxbar_t6030_link() set the ATC enable of this output. */
+		u32 atc_enable_reg = xbar->hw->t604x_dpin_atc && i != MUX_DPPHY ?
+				     T604X_ATC_ENABLE : T602X_ATC_ENABLE;
 
 		if (state < 0)
 			continue;
@@ -1388,7 +1407,7 @@ static int apple_dpxbar_resume(struct device *dev)
 			restored |= BIT(i);
 		}
 		if (xbar->tunnel_link_up[i] &&
-		    (!(readl(xbar->regs + T602X_ATC_ENABLE) & BIT(shift)) ||
+		    (!(readl(xbar->regs + atc_enable_reg) & BIT(shift)) ||
 		     !(readl(xbar->regs + T602X_DISPEXT_ENABLE) & BIT(state)))) {
 			xbar->tunnel_link_up[i] = false;
 			restored |= BIT(i);
@@ -1445,6 +1464,7 @@ static const struct apple_dpxbar_hw apple_dpxbar_hw_t6041 = {
 	.ops = &apple_dpxbar_t602x_ops,
 	.t6030_flow = true,
 	.no_tunable = true,
+	.t604x_dpin_atc = true,
 };
 
 /*

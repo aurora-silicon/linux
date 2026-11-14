@@ -6,6 +6,7 @@
 #include <linux/iopoll.h>
 #include <linux/of_device.h>
 #include <linux/of_irq.h>
+#include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/property.h>
 #include <linux/regmap.h>
@@ -51,7 +52,7 @@ static int regmap_sn201202x_select_reg(struct spmi_device *sdev, u8 reg)
 	if (err)
 		return err;
 
-	if (sn->polled || sn->select_polled) {
+	if (sn->polled || sn->select_polled || READ_ONCE(sn->cold_polled)) {
 		int poll_err;
 
 		if (sn->atomic)
@@ -66,8 +67,13 @@ static int regmap_sn201202x_select_reg(struct spmi_device *sdev, u8 reg)
 		return err ?: poll_err;
 	}
 
-	if (!wait_for_completion_timeout(&sn->select_completion, msecs_to_jiffies(100)))
-		return -ETIMEDOUT;
+	if (!wait_for_completion_timeout(&sn->select_completion, msecs_to_jiffies(100))) {
+		/* The selection may have completed without its interrupt. */
+		err = spmi_register_read(sdev, 0, &val);
+		if (!err && val == reg)
+			return 0;
+		return err ?: -ETIMEDOUT;
+	}
 
 	while (--attempts) {
 		err = spmi_register_read(sdev, 0, &val);
@@ -504,6 +510,10 @@ static const struct of_device_id sn201202x_of_match[] = {
 /*
  * In system sleep the wake interrupt is suspended, so the controller is
  * polled as without interrupts.
+ *
+ * A controller that is awake answers a WAKEUP with no interrupt. One whose
+ * wake interrupt has come since it was sent to sleep woke by itself: it is
+ * checked at once, as when polled, instead of waited for.
  */
 static int sn201202x_wake_poll(struct sn201202x *sn, bool poll)
 {
@@ -514,6 +524,8 @@ static int sn201202x_wake_poll(struct sn201202x *sn, bool poll)
 	u8 size;
 	int ret;
 
+	if (completion_done(&sn->wake_completion))
+		poll = true;
 	reinit_completion(&sn->wake_completion);
 	ret = spmi_command_wakeup(sn->sdev);
 	if (ret)
@@ -579,6 +591,8 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_runtime_suspend(struct device *dev
 		return -EBUSY;
 
 	reinit_completion(&sn->sleep_completion);
+	/* A wake interrupt from here on is its own, see sn201202x_wake_poll() */
+	reinit_completion(&sn->wake_completion);
 	if (spmi_command_sleep(sn->sdev))
 		goto retry;
 	if (!sn->polled &&
@@ -711,6 +725,60 @@ static bool sn201202x_sleep_event(struct tps6598x *tps)
 	return true;
 }
 
+/*
+ * A port restored from disk is revalidated once its USB role switch is there.
+ * The USB controller that provides it does not come through a resume from disk
+ * bound, and its new probe registers a new switch: the one looked up before
+ * the image was made is unregistered and only refuses requests. Take the new
+ * one and let the port read its cable afresh, without taking the port, or a
+ * display on it, down.
+ *
+ * Return: 0 once the port revalidates, or why the switch could not be taken.
+ */
+static int sn201202x_roles_finish(struct sn201202x *sn)
+{
+	struct tps6598x *tps = &sn->cd.tps;
+	int ret;
+
+	ret = tipd_refresh_role_switch(tps);
+	if (ret)
+		return ret;
+	scoped_guard(mutex, &tps->lock) {
+		if (!sn->roles_pending)
+			return 0;
+		WRITE_ONCE(sn->roles_pending, false);
+		/* Refresh the detector snapshot before cable revalidation is thawed. */
+		sn201202x_ldcm_refresh(tps);
+	}
+	tipd_complete(tps->dev);
+	dev_dbg(tps->dev, "resume from disk: USB role switch looked up again, port revalidates\n");
+	return 0;
+}
+
+static void sn201202x_role_work(struct work_struct *work)
+{
+	struct sn201202x *sn = container_of(work, struct sn201202x, role_work);
+
+	if (READ_ONCE(sn->roles_pending))
+		sn201202x_roles_finish(sn);
+}
+
+/*
+ * A USB controller has bound, and its probe registers its role switch: a port
+ * that waits for one after a resume from disk looks again.
+ */
+static int sn201202x_role_notify(struct notifier_block *nb, unsigned long action, void *data)
+{
+	struct sn201202x *sn = container_of(nb, struct sn201202x, role_nb);
+
+	if (action != BUS_NOTIFY_BOUND_DRIVER || !READ_ONCE(sn->roles_pending) ||
+	    !device_property_present(data, "usb-role-switch"))
+		return NOTIFY_DONE;
+
+	queue_work(system_freezable_wq, &sn->role_work);
+	return NOTIFY_OK;
+}
+
 static int sn201202x_probe(struct spmi_device *device)
 {
 	const struct of_device_id *match;
@@ -756,6 +824,7 @@ static int sn201202x_probe(struct spmi_device *device)
 	if (!of_property_read_bool(device->dev.of_node, "apple,no-liquid-detection"))
 		tps->contaminant_ops = &sn201202x_contaminant_ops;
 	INIT_DELAYED_WORK(&sn->ldcm_work, sn201202x_ldcm_work);
+	INIT_WORK(&sn->role_work, sn201202x_role_work);
 
 	init_completion(&sn->select_completion);
 	init_completion(&sn->sleep_completion);
@@ -828,6 +897,12 @@ static int sn201202x_probe(struct spmi_device *device)
 	tps->data->irq_handler(tps->irq, tps);
 
 	sn201202x_idle_sleep_start(tps);
+
+	sn->role_nb.notifier_call = sn201202x_role_notify;
+	ret = bus_register_notifier(&platform_bus_type, &sn->role_nb);
+	if (ret)
+		dev_warn(&device->dev, "cannot watch for the USB role switch: %d\n", ret);
+	sn->role_watch = !ret;
 	return 0;
 }
 
@@ -836,6 +911,12 @@ static void sn201202x_remove(struct spmi_device *device)
 	struct tps6598x *tps = spmi_device_get_drvdata(device);
 	struct sn201202x *sn = tps_to_sn(tps);
 
+	if (sn->role_watch)
+		bus_unregister_notifier(&platform_bus_type, &sn->role_nb);
+	disable_work_sync(&sn->role_work);
+	/* The hold freeze took on one the restore left alone */
+	if (sn->cold_restored)
+		pm_runtime_put_noidle(tps->dev);
 	sn201202x_idle_sleep_stop(tps);
 	tipd_remove(tps);
 	spmi_command_sleep(sn->sdev);
@@ -847,10 +928,16 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_resume(struct device *dev)
 	struct sn201202x *sn = tps_to_sn(tps);
 	int err;
 
+	/* Its suspend left it alone too: interrupt masked, still held awake */
+	if (sn->cold_restored)
+		return 0;
+
 	if (READ_ONCE(sn->sleep_watch)) {
 		/* Waits for a running sleep_event() */
 		disable_irq(tps->irq);
 		WRITE_ONCE(sn->sleep_watch, false);
+		/* The watch woke it and sent it to sleep again: not its own wake */
+		reinit_completion(&sn->wake_completion);
 	}
 	/* One that slept on from idle sleep wakes through runtime PM */
 	if (pm_runtime_status_suspended(dev)) {
@@ -879,6 +966,10 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_suspend(struct device *dev)
 	struct sn201202x *sn = tps_to_sn(tps);
 	bool watch;
 	int err, ret;
+
+	/* A controller a resume from disk left dead waits for its new probe. */
+	if (sn->cold_restored)
+		return 0;
 
 	/*
 	 * A sleeping controller cannot be read, so its events must not be
@@ -917,6 +1008,8 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_suspend(struct device *dev)
 	/* Registered before xHCI, so its root port has suspended by now. */
 	tipd_usb_wake(tps, true);
 	reinit_completion(&sn->sleep_completion);
+	/* A wake interrupt from here on is its own, see sn201202x_wake_poll() */
+	reinit_completion(&sn->wake_completion);
 	err = spmi_command_sleep(sn->sdev);
 	if (err)
 		goto out_resume;
@@ -946,11 +1039,87 @@ out_put:
 }
 EXPORT_SYMBOL_IF_KUNIT(sn201202x_suspend);
 
+/*
+ * A resume from hibernation is a cold boot: the boot loader and the kernel
+ * that loaded the image have taken the controller through their own bring-up,
+ * so the state saved in the image (its sleep, the latched events) no longer
+ * exists. Wake the controller and set it up again in place, as its probe
+ * would; its port is revalidated once the connector's USB role switch is
+ * there, see sn201202x_roles_finish(). A controller that does not take this
+ * is left alone, with its event interrupt still disabled, for a new probe.
+ */
+static int sn201202x_restore(struct device *dev)
+{
+	struct tps6598x *tps = dev_get_drvdata(dev);
+	struct sn201202x *sn = tps_to_sn(tps);
+	int err;
+	const char *step;
+
+	/*
+	 * An earlier restore left it for a new probe: freeze took no hold
+	 * and left its interrupt alone, so there is nothing to give back.
+	 */
+	if (sn->cold_restored)
+		return 0;
+
+	/*
+	 * The cold boot left the controller awake, so a wakeup command raises
+	 * no wake interrupt: it is woken polled. Until it is set up again its
+	 * register selections are polled as well, as on a controller without
+	 * interrupts.
+	 */
+	WRITE_ONCE(sn->cold_polled, true);
+	step = "wake";
+	err = sn201202x_wake_poll(sn, true);
+	if (!err) {
+		step = "set-up";
+		err = tipd_reinit_after_cold_boot(tps);
+	}
+	if (err) {
+		/*
+		 * Interrupt still masked and held awake from freeze: nothing
+		 * reads a dead chip, and it does not sleep while idle.
+		 */
+		sn->cold_restored = true;
+		dev_warn(dev, "resume from disk: restore failed at %s (%d), controller left for a new probe\n",
+			 step, err);
+		return 0;
+	}
+	/* The cold boot reset the controller, which also removed its mitigation. */
+	scoped_guard(mutex, &tps->lock)
+		sn201202x_ldcm_invalidate(tps);
+	/* Set up as after probe: from here on by its interrupts again. */
+	WRITE_ONCE(sn->cold_polled, false);
+	if (tps->irq)
+		enable_irq(tps->irq);
+	/* Give back the hold freeze took, as resume does */
+	pm_runtime_put_autosuspend(dev);
+	scoped_guard(mutex, &tps->lock) {
+		WRITE_ONCE(sn->roles_pending, true);
+		sn->hib_in_place = true;
+	}
+	dev_dbg(dev, "resume from disk: controller restored, port revalidation waits for the USB role switch\n");
+	return 0;
+}
+
+/*
+ * A port still waiting for its role switch at the next system sleep gives up
+ * the wait: that sleep's resume revalidates it with whatever switch is there (a
+ * missing one only refuses). A controller the restore from disk left for a new
+ * probe is not asked for its connector state.
+ */
 static int sn201202x_prepare(struct device *dev)
 {
 	struct tps6598x *tps = dev_get_drvdata(dev);
 	struct sn201202x *sn = tps_to_sn(tps);
 	int ret;
+
+	scoped_guard(mutex, &tps->lock) {
+		WRITE_ONCE(sn->roles_pending, false);
+		sn->hib_in_place = false;
+	}
+	if (sn->cold_restored)
+		return tipd_prepare(dev);
 
 	cancel_delayed_work_sync(&sn->ldcm_work);
 	mutex_lock(&tps->lock);
@@ -974,19 +1143,77 @@ static int sn201202x_prepare(struct device *dev)
 static void sn201202x_complete(struct device *dev)
 {
 	struct tps6598x *tps = dev_get_drvdata(dev);
+	struct sn201202x *sn = tps_to_sn(tps);
 
+	/* A controller the restore from disk left alone is probed again instead. */
+	if (sn->cold_restored)
+		return;
+	/*
+	 * A port restored from disk waits for its USB role switch: now, if the
+	 * USB controller is bound, or when sn201202x_role_notify() sees it bind.
+	 */
+	if (READ_ONCE(sn->roles_pending)) {
+		sn201202x_roles_finish(sn);
+		return;
+	}
 	/* Refresh the detector snapshot before cable revalidation is thawed. */
 	scoped_guard(mutex, &tps->lock)
 		sn201202x_ldcm_refresh(tps);
 	tipd_complete(dev);
 }
 
+/*
+ * hib_resume: how the last resume from disk left the controller: "none",
+ * "roles-pending" (restored in place) or "failed" (to be probed again). The
+ * kernel revalidates a port restored in place by itself; writing "roles" only
+ * takes note of it, after which the attribute reads "none".
+ */
+static ssize_t hib_resume_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct tps6598x *tps = dev_get_drvdata(dev);
+	struct sn201202x *sn = tps_to_sn(tps);
+
+	guard(mutex)(&tps->lock);
+	return sysfs_emit(buf, "%s\n", sn->cold_restored ? "failed" :
+			  sn->hib_in_place ? "roles-pending" : "none");
+}
+
+static ssize_t hib_resume_store(struct device *dev, struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct tps6598x *tps = dev_get_drvdata(dev);
+	struct sn201202x *sn = tps_to_sn(tps);
+
+	if (!sysfs_streq(buf, "roles"))
+		return -EINVAL;
+	scoped_guard(mutex, &tps->lock) {
+		if (!sn->hib_in_place)
+			return -EALREADY;
+		sn->hib_in_place = false;
+	}
+	/* A port that still waits looks again, as this write used to make it. */
+	queue_work(system_freezable_wq, &sn->role_work);
+	return count;
+}
+static DEVICE_ATTR_RW(hib_resume);
+
+static struct attribute *sn201202x_attrs[] = {
+	&dev_attr_hib_resume.attr,
+	NULL
+};
+ATTRIBUTE_GROUPS(sn201202x);
+
 MODULE_DEVICE_TABLE(of, sn201202x_of_match);
 
 static const struct dev_pm_ops sn201202x_pm_ops = {
 	.prepare = pm_sleep_ptr(sn201202x_prepare),
 	.complete = pm_sleep_ptr(sn201202x_complete),
-	SET_SYSTEM_SLEEP_PM_OPS(sn201202x_suspend, sn201202x_resume)
+	.suspend = pm_sleep_ptr(sn201202x_suspend),
+	.resume = pm_sleep_ptr(sn201202x_resume),
+	.freeze = pm_sleep_ptr(sn201202x_suspend),
+	.thaw = pm_sleep_ptr(sn201202x_resume),
+	.poweroff = pm_sleep_ptr(sn201202x_suspend),
+	.restore = pm_sleep_ptr(sn201202x_restore),
 	SET_RUNTIME_PM_OPS(sn201202x_runtime_suspend, sn201202x_runtime_resume, NULL)
 };
 
@@ -1000,6 +1227,7 @@ static struct spmi_driver sn201202x_driver = {
 		 * port; let the ports of one machine probe at the same time.
 		 */
 		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
+		.dev_groups = sn201202x_groups,
 	},
 	.probe = sn201202x_probe,
 	.remove = sn201202x_remove,

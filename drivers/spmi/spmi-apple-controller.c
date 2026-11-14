@@ -532,6 +532,15 @@ static void apple_spmi_irq_handler(struct irq_desc *desc)
 	chained_irq_exit(chip, desc);
 }
 
+/* Every interrupt masked, the notification included, and what is latched dropped. */
+static void apple_spmi_irq_reset(struct apple_spmi *spmi)
+{
+	for (size_t offset = 0; offset < (spmi->hw->num_irqs + 32) / 8; offset += 4) {
+		writel(0, spmi->regs + SPMI_IRQ_MASK_BASE + offset);
+		writel(U32_MAX, spmi->regs + SPMI_IRQ_ACK_BASE + offset);
+	}
+}
+
 static void apple_spmi_teardown_irq(void *data)
 {
 	struct apple_spmi *spmi = data;
@@ -556,10 +565,7 @@ static int apple_spmi_init_irq(struct platform_device *pdev,
 
 	raw_spin_lock_init(&spmi->irq_mask_lock);
 
-	for (size_t offset = 0; offset < (spmi->hw->num_irqs + 32) / 8; offset += 4) {
-		writel(0, spmi->regs + SPMI_IRQ_MASK_BASE + offset);
-		writel(U32_MAX, spmi->regs + SPMI_IRQ_ACK_BASE + offset);
-	}
+	apple_spmi_irq_reset(spmi);
 
 	spmi->irqd = devm_irq_domain_instantiate(&pdev->dev, &info);
 	if (IS_ERR(spmi->irqd))
@@ -614,6 +620,23 @@ static int apple_spmi_resume_noirq(struct device *dev)
 		return 0;
 
 	guard(mutex)(&spmi->fifo_lock);
+	/*
+	 * Firmware and the platform's sleep code use this queue while Linux is
+	 * away. Every command of ours was answered before the suspend, so any
+	 * reply waiting now is someone else's, and would be read as the reply
+	 * to our next command.
+	 */
+	if (pm_resume_via_firmware()) {
+		unsigned int stale = 0;
+
+		while (!(readl(spmi->regs + spmi->hw->status) & spmi->hw->rx_empty) &&
+		       stale < 64) {
+			readl(spmi->regs + spmi->hw->reply);
+			stale++;
+		}
+		if (stale)
+			dev_info(dev, "dropped %u stale reply words after the wake\n", stale);
+	}
 	raw_spin_lock_irqsave(&spmi->irq_mask_lock, flags);
 	/* Whether the enables survive a real sleep has not been measured. */
 	if (pm_resume_via_firmware()) {
@@ -629,9 +652,6 @@ static int apple_spmi_resume_noirq(struct device *dev)
 
 	return 0;
 }
-
-static DEFINE_NOIRQ_DEV_PM_OPS(apple_spmi_pm_ops, apple_spmi_suspend_noirq,
-			       apple_spmi_resume_noirq);
 
 static int apple_spmi_probe(struct platform_device *pdev)
 {
@@ -687,6 +707,73 @@ static int apple_spmi_probe(struct platform_device *pdev)
 
 	return 0;
 }
+
+/*
+ * After a resume from disk the controller holds the boot kernel's masks and
+ * pending interrupts, not this kernel's: drop the pending ones and rewrite
+ * the masks from the cache the mask/unmask paths keep, notification IRQ
+ * included.
+ */
+static void apple_spmi_hib_resync_irqs(struct apple_spmi *spmi)
+{
+	u32 nirq = spmi->hw->num_irqs;
+	unsigned long flags;
+
+	raw_spin_lock_irqsave(&spmi->irq_mask_lock, flags);
+	/*
+	 * As at probe, drop what is latched: interrupts the boot kernel left
+	 * pending complete a register selection of a device restored now
+	 * before its own answer arrives. The devices read their state afresh.
+	 */
+	apple_spmi_irq_reset(spmi);
+	for (size_t offset = 0; offset < (nirq + 32) / 8; offset += 4) {
+		u32 val = 0;
+
+		if (offset < nirq / 8)
+			val = bitmap_read(spmi->irq_mask_cache, offset * 8, 32);
+		else if (spmi->notify_irq && offset == (nirq / 32) * 4)
+			val = BIT(nirq % 32);
+		writel(val, spmi->regs + SPMI_IRQ_MASK_BASE + offset);
+	}
+	raw_spin_unlock_irqrestore(&spmi->irq_mask_lock, flags);
+}
+
+/*
+ * Left alone, the masks stay as the boot kernel left them, everything masked
+ * but the interrupts of the drivers it loaded, and the IRQ core does not write
+ * them again (it disables lazily and unmasks only an IRQ it recorded as
+ * masked). A device whose driver the boot kernel did not load, such as a
+ * Type-C port controller on nub_spmi_a0/a1, would raise no event after the
+ * restore.
+ *
+ * In the early restore, for every controller alike: one in a PM domain gets no
+ * restore_noirq of its own, as genpd calls the driver's resume_noirq there
+ * (outside a wakeup path), and genpd does not wrap the early restore. It still
+ * runs before the devices on the bus are restored.
+ */
+static int apple_spmi_restore_early(struct device *dev)
+{
+	struct apple_spmi *spmi = dev_get_drvdata(dev);
+
+	if (spmi->irq < 0)
+		return 0;
+
+	/* Commands can run by now: none may have its reply acknowledged away. */
+	scoped_guard(mutex, &spmi->fifo_lock)
+		apple_spmi_hib_resync_irqs(spmi);
+	dev_dbg(dev, "resume from disk: interrupt masks rewritten in the early restore\n");
+
+	return 0;
+}
+
+/*
+ * Suspend-to-RAM parks the notification queue; a resume from disk rewrites the
+ * masks in the early restore.
+ */
+static const struct dev_pm_ops apple_spmi_pm_ops = {
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_spmi_suspend_noirq, apple_spmi_resume_noirq)
+	.restore_early = pm_sleep_ptr(apple_spmi_restore_early),
+};
 
 static const struct of_device_id apple_spmi_match_table[] = {
 	{ .compatible = "apple,t8142-spmi", .data = &apple_spmi_gen4 },

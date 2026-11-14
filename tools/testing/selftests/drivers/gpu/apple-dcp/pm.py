@@ -481,6 +481,7 @@ def probe(root):
 #define IS_ERR(p) ((intptr_t)(p)<0)
 #define ERR_PTR(e) ((void *)(intptr_t)(e))
 #define dev_info(...) ((void)0)
+#define dev_dbg(...) ((void)0)
 #define PTR_ERR(p) ((int)(intptr_t)(p))
 #define IS_ERR_OR_NULL(p) (!(p)||IS_ERR(p))
 #define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))

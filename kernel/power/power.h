@@ -77,6 +77,7 @@ static inline void enable_restore_image_protection(void) {}
 #endif /* CONFIG_STRICT_KERNEL_RWX */
 
 extern bool hibernation_in_progress(void);
+void hibernate_set_loading(bool loading);
 
 #else /* !CONFIG_HIBERNATION */
 
@@ -84,6 +85,7 @@ static inline void hibernate_reserved_size_init(void) {}
 static inline void hibernate_image_size_init(void) {}
 
 static inline bool hibernation_in_progress(void) { return false; }
+static inline void hibernate_set_loading(bool loading) {}
 #endif /* !CONFIG_HIBERNATION */
 
 #define power_attr(_name) \
@@ -201,6 +203,7 @@ extern void swsusp_free(void);
 extern int swsusp_read(unsigned int *flags_p);
 extern int swsusp_write(unsigned int flags);
 void swsusp_close(void);
+int swsusp_invalidate_sig(void);
 #ifdef CONFIG_SUSPEND
 extern int swsusp_unmark(void);
 #else

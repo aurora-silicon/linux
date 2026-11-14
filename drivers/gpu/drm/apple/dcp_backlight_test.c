@@ -240,8 +240,12 @@ static void backlight_resend_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, dcp_bl_resend(&state));
 	KUNIT_ASSERT_EQ(test, dcp_bl_prepare(&state, true, &present), 0);
 	KUNIT_EXPECT_EQ(test, present.nits, 140U);
-	/* The present in flight already carries the level. */
+	/* Asked while a present is in flight: the level goes again after it. */
 	KUNIT_EXPECT_FALSE(test, dcp_bl_resend(&state));
+	KUNIT_EXPECT_TRUE(test, dcp_bl_complete(&state, present.sequence, true));
+	KUNIT_EXPECT_TRUE(test, state.dirty);
+	KUNIT_ASSERT_EQ(test, dcp_bl_prepare(&state, true, &present), 0);
+	KUNIT_EXPECT_EQ(test, present.nits, 140U);
 	KUNIT_EXPECT_TRUE(test, dcp_bl_complete(&state, present.sequence, true));
 	KUNIT_EXPECT_FALSE(test, state.dirty);
 

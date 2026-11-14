@@ -15,6 +15,7 @@
 #include <linux/iopoll.h>
 #include <linux/ktime.h>
 #include <linux/math.h>
+#include <linux/math64.h>
 #include <linux/mfd/core.h>
 #include <linux/mfd/macsmc.h>
 #include <linux/notifier.h>
@@ -23,6 +24,7 @@
 #include <linux/overflow.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
+#include <linux/property.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/suspend.h>
@@ -87,6 +89,26 @@ static const struct mfd_cell apple_smc_described_devs[] = {
 static const struct mfd_cell apple_smc_t6050_described_devs[] = {
 	MFD_CELL_OF("macsmc-reboot", NULL, NULL, 0, 0, "apple,smc-reboot"),
 	MFD_CELL_OF("macsmc-rtc", NULL, NULL, 0, 0, "apple,smc-rtc"),
+};
+
+/* What this driver has to know of one SoC's SMC that the others do not share. */
+struct apple_smc_hw {
+	/*
+	 * The SMC takes the WKTP key at the sleep request and once a wake is a
+	 * full one: see apple_smc_sleep_commit() and apple_smc_wake_full().
+	 */
+	bool wktp;
+	/*
+	 * This SoC's sleep controller stops its coprocessors at the commit, behind
+	 * every refusal, and the SMC's sleep commit goes with them: see
+	 * apple_smc_last_stop().
+	 */
+	bool commit_at_stop;
+};
+
+static const struct apple_smc_hw apple_smc_t6041_hw = {
+	.wktp = true,
+	.commit_at_stop = true,
 };
 
 static int apple_smc_add_described_devices(struct apple_smc *smc, const struct mfd_cell *cells,
@@ -356,11 +378,13 @@ EXPORT_SYMBOL(apple_smc_enter_atomic);
 
 int apple_smc_write_atomic(struct apple_smc *smc, smc_key key, const void *buf, size_t size)
 {
+	if (IS_ENABLED(CONFIG_MFD_MACSMC_KUNIT_TEST))
+		KUNIT_STATIC_STUB_REDIRECT(apple_smc_write_atomic, smc, key, buf, size);
+
 	guard(spinlock_irqsave)(&smc->lock);
 	u8 result;
 	int ret, poll_ret;
-	u64 msg;
-	ktime_t t0;
+	u64 msg, t0;
 	s64 us;
 
 	if (size > SMC_MAX_SIZE || size == 0)
@@ -404,12 +428,13 @@ int apple_smc_write_atomic(struct apple_smc *smc, smc_key key, const void *buf, 
 		return ret;
 	}
 
-	t0 = ktime_get();
+	/* A sleep's last stop writes with timekeeping suspended, which ktime_get() warns of. */
+	t0 = ktime_get_mono_fast_ns();
 	ret = read_poll_timeout_atomic(apple_rtkit_poll, poll_ret,
 				       poll_ret < 0 || !smc->atomic_pending,
 				       100, SMC_ATOMIC_TIMEOUT_MS * USEC_PER_MSEC,
 				       false, smc->rtk);
-	us = ktime_us_delta(ktime_get(), t0);
+	us = div_u64(ktime_get_mono_fast_ns() - t0, NSEC_PER_USEC);
 	if (us > 100 * USEC_PER_MSEC || ret < 0 || smc->atomic_pending)
 		dev_warn(smc->dev, "atomic: key %p4ch reply after %lld us (ret %d)\n",
 			 &key, us, ret);
@@ -572,11 +597,78 @@ static const struct apple_smc_wake_reason apple_smc_t8132_wake_reasons[] = {
 	{ 44, "USB2_wake" }, { 45, "aupo" }, { 48, "rtc" }, { }
 };
 
+/*
+ * The kernel that loads a hibernation image binds this driver like any boot
+ * and so holds a live RTKit session with the SMC when it jumps into the image.
+ * The restored kernel then asks the firmware to start again (IOP power INIT)
+ * and waits for a HELLO that a firmware already in a session never sends. So
+ * the loading kernel hands the SMC over quiesced, the state an unbind leaves
+ * it in (apple_smc_rtkit_shutdown()) and from which a wake starts a new
+ * session.
+ */
+static bool apple_smc_handed_over;
+
+/*
+ * The handshake with an SMC that was just woken, at probe and after a resume
+ * from disk alike: its endpoint, the initialization and the key count. The
+ * firmware is a new instance each time, and nothing says that its key table is
+ * the one of the instance before.
+ */
+static int apple_smc_handshake(struct apple_smc *smc)
+{
+	struct device *dev = smc->dev;
+	__be32 count = 0;
+	int ret;
+
+	ret = apple_rtkit_start_ep(smc->rtk, SMC_ENDPOINT);
+	if (ret) {
+		dev_err(dev, "Failed to start SMC endpoint: %d\n", ret);
+		return ret;
+	}
+
+	ret = apple_rtkit_send_message(smc->rtk, SMC_ENDPOINT,
+				       FIELD_PREP(SMC_MSG, SMC_MSG_INITIALIZE), NULL, false);
+	if (ret) {
+		dev_err(dev, "Failed to send init message: %d\n", ret);
+		return ret;
+	}
+
+	if (wait_for_completion_timeout(&smc->init_done, msecs_to_jiffies(SMC_TIMEOUT_MS)) == 0) {
+		dev_err(dev, "Timed out initializing SMC\n");
+		return -ETIMEDOUT;
+	}
+
+	if (smc->boot_stage != APPLE_SMC_INITIALIZED) {
+		dev_err(dev, "SMC failed to boot successfully, boot stage=%d\n", smc->boot_stage);
+		return -EIO;
+	}
+
+	ret = apple_smc_read(smc, SMC_KEY(#KEY), &count, sizeof(count));
+	if (ret >= 0 && ret != sizeof(count))
+		ret = -EIO;
+	if (ret < 0) {
+		dev_err(dev, "Failed to get key count: %d\n", ret);
+		return ret;
+	}
+	smc->key_count = be32_to_cpu(count);
+
+	return 0;
+}
+
+static int apple_smc_last_stop(void *data);
+
+static void apple_smc_last_stop_unregister(void *data)
+{
+	struct apple_smc *smc = data;
+
+	apple_sleep_coproc_unregister(smc->dev);
+}
+
 static int apple_smc_probe(struct platform_device *pdev)
 {
+	const struct apple_smc_hw *hw = device_get_match_data(&pdev->dev);
 	struct device *dev = &pdev->dev;
 	struct apple_smc *smc;
-	__be32 count = 0;
 	bool t6050;
 	int ret;
 
@@ -585,6 +677,7 @@ static int apple_smc_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	smc->wake_reasons = of_device_is_compatible(dev->of_node, "apple,t8132-smc") ?
 			    apple_smc_t8132_wake_reasons : apple_smc_t8140_wake_reasons;
+	smc->wktp = hw && hw->wktp;
 
 	mutex_init(&smc->mutex);
 	spin_lock_init(&smc->lock);
@@ -606,39 +699,14 @@ static int apple_smc_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	ret = apple_rtkit_start_ep(smc->rtk, SMC_ENDPOINT);
-	if (ret)
-		return dev_err_probe(dev, ret, "Failed to start SMC endpoint");
-
 	init_completion(&smc->init_done);
 	init_completion(&smc->cmd_done);
-
-	ret = apple_rtkit_send_message(smc->rtk, SMC_ENDPOINT,
-				       FIELD_PREP(SMC_MSG, SMC_MSG_INITIALIZE), NULL, false);
-	if (ret)
-		return dev_err_probe(dev, ret, "Failed to send init message");
-
-	if (wait_for_completion_timeout(&smc->init_done, msecs_to_jiffies(SMC_TIMEOUT_MS)) == 0) {
-		dev_err(dev, "Timed out initializing SMC");
-		return -ETIMEDOUT;
-	}
-
-	if (smc->boot_stage != APPLE_SMC_INITIALIZED) {
-		dev_err(dev, "SMC failed to boot successfully, boot stage=%d\n", smc->boot_stage);
-		return -EIO;
-	}
-
 	dev_set_drvdata(&pdev->dev, smc);
 	BLOCKING_INIT_NOTIFIER_HEAD(&smc->event_handlers);
 
-	ret = apple_smc_read(smc, SMC_KEY(#KEY), &count, sizeof(count));
-	if (ret >= 0 && ret != sizeof(count)) {
-		count = 0;
-		ret = -EIO;
-	}
-	if (ret < 0)
-		return dev_err_probe(smc->dev, ret, "Failed to get key count");
-	smc->key_count = be32_to_cpu(count);
+	ret = apple_smc_handshake(smc);
+	if (ret)
+		return ret;
 
 	/* Notifications, GPIO and power management are not qualified on T8152. */
 	if (of_device_is_compatible(dev->of_node, "apple,t8152-smc"))
@@ -650,6 +718,19 @@ static int apple_smc_probe(struct platform_device *pdev)
 	ret = devm_device_init_wakeup(dev);
 	if (ret)
 		return ret;
+
+	/*
+	 * Without the registration (no sleep controller with last stops for this kernel,
+	 * or no room in its table) the noirq suspend commits, as on every other SoC.
+	 */
+	if (hw && hw->commit_at_stop &&
+	    !apple_sleep_coproc_register_first(dev, APPLE_SLEEP_FIRST_SMC, apple_smc_last_stop,
+					       smc)) {
+		smc->commit_at_stop = true;
+		ret = devm_add_action_or_reset(dev, apple_smc_last_stop_unregister, smc);
+		if (ret)
+			return ret;
+	}
 
 	/* Enable notifications */
 	apple_smc_write_flag(smc, SMC_KEY(NTAP), true);
@@ -678,9 +759,101 @@ static int apple_smc_probe(struct platform_device *pdev)
 					       ARRAY_SIZE(apple_smc_t6050_described_devs));
 }
 
+static int apple_smc_restore(struct device *dev);
+
+static int apple_smc_freeze(struct device *dev)
+{
+	struct apple_smc *smc = dev_get_drvdata(dev);
+
+	/* Only the image-loading kernel, right before it enters the image. */
+	if (pm_hibernate_is_loading() && apple_rtkit_is_running(smc->rtk)) {
+		int ret;
+
+		apple_smc_write_flag(smc, SMC_KEY(NTAP), false);
+		ret = apple_rtkit_quiesce(smc->rtk);
+		if (ret) {
+			/*
+			 * Failing here would abandon the image, whose signature is
+			 * already gone, and leave this kernel without a session: enter
+			 * the image anyway, its restore tries a new session.
+			 */
+			dev_err(dev, "could not quiesce the SMC for the image: %d\n", ret);
+			return 0;
+		}
+		apple_smc_handed_over = true;
+		dev_info(dev, "SMC quiesced for the restored kernel\n");
+		return 0;
+	}
+
+	/*
+	 * Hibernating: the SMC keeps running, and with it thermal and power
+	 * management, while the image is written and until the power-off
+	 * (.poweroff shares this). Nothing is saved: the boot that loads the
+	 * image restarts the SMC, and apple_smc_restore() starts a new session.
+	 */
+	return 0;
+}
+
+static int apple_smc_thaw(struct device *dev)
+{
+	/* The image could not be entered after the hand-over: start a new session. */
+	if (apple_smc_handed_over) {
+		apple_smc_handed_over = false;
+		return apple_smc_restore(dev);
+	}
+
+	/* The image was written or abandoned: .freeze left the session running. */
+	return 0;
+}
+
+static int apple_smc_restore(struct device *dev)
+{
+	struct apple_smc *smc = dev_get_drvdata(dev);
+	int ret;
+
+	/*
+	 * The boot that loaded the image restarted the SMC. The RTKit session
+	 * in the image belongs to a firmware instance that no longer runs, and
+	 * its power state still reads running, which apple_rtkit_wake()
+	 * refuses. Reset the transport to the state probe starts from (power
+	 * state off, no endpoints, mailbox receive restarted) and repeat
+	 * probe's handshake with the new instance.
+	 */
+	ret = apple_rtkit_reinit(smc->rtk);
+	if (ret) {
+		dev_err(dev, "Failed to reinit RTKit on restore: %d\n", ret);
+		return ret;
+	}
+
+	smc->boot_stage = APPLE_SMC_BOOTING;
+
+	ret = apple_rtkit_wake(smc->rtk);
+	if (ret) {
+		dev_err(dev, "Failed to wake up SMC on restore: %d\n", ret);
+		return ret;
+	}
+
+	reinit_completion(&smc->init_done);
+	reinit_completion(&smc->cmd_done);
+
+	ret = apple_smc_handshake(smc);
+	if (ret)
+		return ret;
+
+	/*
+	 * Re-enable the firmware-side notification flag. The event_handlers
+	 * notifier chain and the sub-device registrations on it survive in the
+	 * restored image, so only the firmware flag has to be re-armed.
+	 */
+	apple_smc_write_flag(smc, SMC_KEY(NTAP), true);
+
+	return 0;
+}
+
 static const struct of_device_id apple_smc_of_match[] = {
 	{ .compatible = "apple,t8152-smc" },
 	{ .compatible = "apple,t6050-smc" },
+	{ .compatible = "apple,t6041-smc", .data = &apple_smc_t6041_hw },
 	{ .compatible = "apple,t8103-smc" },
 	{ .compatible = "apple,smc" },
 	{},
@@ -690,8 +863,8 @@ MODULE_DEVICE_TABLE(of, apple_smc_of_match);
 /*
  * The SMC keeps running through a firmware-driven suspend. It is told first and
  * stops last, and on a wake it hears first. In order, measured on T8140 and
- * unverified on other SoCs: MBSE = slpw before any other coprocessor is told;
- * MBSE = slpa and the AP power notice after all the others; on a wake the notice,
+ * unverified on other SoCs: MBSE = slpw, MBSE = slpa and the AP power notice after
+ * all the other coprocessors (slpw goes ahead of them); on a wake the notice,
  * MBSE and MBSW read, MBSE = waka. The noirq phases give that order whatever the
  * device order is, so these commands poll. What the values mean is inferred
  * from their letters.
@@ -702,15 +875,22 @@ MODULE_DEVICE_TABLE(of, apple_smc_of_match);
  * The debug link's cut, on a debug cable only, makes the SMC see a cable pulled and plugged
  * back. With the cut after slpw, the SMC woke the AP right after the commit, for USB-C_plug
  * or acdetach, in every such sleep (J700, 223 of 223), even with its outbox quiet for 500 ms
- * before the notice. A sleep that cuts the link warns the SMC only after the cut.
+ * before the notice. So the warning comes after the cut.
+ *
+ * A T6041 SMC takes neither the warning nor the commit back: see apple_smc_sleep_enter() and
+ * apple_smc_sleep_commits(). After the noirq suspend a sleep can still be refused: by a wake
+ * event, by a CPU that does not park, by the sleep controller's checks at its commit, by the
+ * enclave before its sleep request. So where the controller stops coprocessors at its commit,
+ * with interrupts off, one CPU up and every refusal behind it, the whole sequence is sent
+ * from there, ahead of the other coprocessors' stops: apple_smc_last_stop().
  */
 
 /* The gaps macOS leaves before the AP idle notice and after it. */
 #define SMC_SLEEP_ARM_MS	6
 #define SMC_SLEEP_IDLE_MS	30
 /*
- * Between a late warning (a sleep that cut the debug link) and slpa. macOS's shortest gap
- * was 770 ms; the warning at .prepare leaves 150-500 ms, and those sleeps run to the alarm.
+ * Between the warning and slpa. Sleeps with 150-500 ms between them ran to the alarm;
+ * 770 ms is known to work.
  */
 #define SMC_SLEEP_WARN_MS	200
 
@@ -720,8 +900,14 @@ MODULE_DEVICE_TABLE(of, apple_smc_of_match);
 
 static int apple_smc_ap_power(struct apple_smc *smc, bool on)
 {
+	unsigned int us;
+
 	if (IS_ENABLED(CONFIG_MFD_MACSMC_KUNIT_TEST))
 		KUNIT_STATIC_STUB_REDIRECT(apple_smc_ap_power, smc, on);
+
+	/* With interrupts off there is only the idle notice: see apple_smc_last_stop(). */
+	if (smc->atomic_mode)
+		return on ? -EINVAL : apple_rtkit_ap_idle_polled(smc->rtk, &us);
 
 	return smc->polled ? apple_rtkit_ap_power_noirq(smc->rtk, on) :
 			     apple_rtkit_ap_power(smc->rtk, on);
@@ -749,6 +935,36 @@ static void apple_smc_write_mbse(struct apple_smc *smc, smc_key value)
 	if (ret)
 		dev_err(smc->dev, "Failed to issue MBSE = %p4ch: %d\n", &value, ret);
 }
+
+/*
+ * SMC key pmVC, the request for the VDD_CIO rail: the enable mask | 0x100
+ * (0x101 on the J616s), written while an ATC port's always-on side is powered, also at sleep. Linux
+ * never asks for the rail, which is power-gated otherwise (ADT vdd-cio-rail-pg), and a rail
+ * the SMC drops during the sleep transition races the sleep engine's hand-over of the ATC
+ * ports.
+ */
+#define SMC_PMVC_REQUEST	0x101
+
+/**
+ * apple_smc_request_pmvc() - ask the SMC to keep the VDD_CIO rail up
+ * @smc: the SMC
+ *
+ * Writes pmVC at the moment the caller picks; it does not hook the SMC's own suspend
+ * callbacks, so a sleep controller that has to issue it ahead of the device suspend
+ * phase keeps that order.
+ *
+ * Return: 0 on success, a negative errno otherwise.
+ */
+int apple_smc_request_pmvc(struct apple_smc *smc)
+{
+	int ret;
+
+	ret = apple_smc_write_u32(smc, __SMC_KEY('p', 'm', 'V', 'C'), SMC_PMVC_REQUEST);
+	if (ret < 0)
+		dev_warn(smc->dev, "pmVC: write %#x failed: %d\n", SMC_PMVC_REQUEST, ret);
+	return ret;
+}
+EXPORT_SYMBOL(apple_smc_request_pmvc);
 
 static void apple_smc_sleep_warn(struct apple_smc *smc)
 {
@@ -780,10 +996,26 @@ static int apple_smc_notice_idle(struct apple_smc *smc)
 	return ret;
 }
 
+/*
+ * WKTP, one byte, the value for power state 0. It goes first at the sleep request,
+ * ahead of the other sleep keys ('slpa' among them) and the AP idle notice. Only for
+ * an SMC known to take it: T6041's.
+ */
+#define SMC_WKTP_SLEEP		2
+/* And once a wake is a full one: see apple_smc_wake_full(). */
+#define SMC_WKTP_AWAKE		0
+
 static int apple_smc_sleep_commit(struct apple_smc *smc)
 {
 	int ret;
 
+	/* Whatever is written here, the SMC runs the wake after this silent until it is told. */
+	smc->wake_silent = true;
+	if (smc->wktp) {
+		ret = apple_smc_write_u8(smc, SMC_KEY(WKTP), SMC_WKTP_SLEEP);
+		if (ret)
+			dev_err(smc->dev, "Failed to write WKTP = %u: %d\n", SMC_WKTP_SLEEP, ret);
+	}
 	apple_smc_write_mbse(smc, SMC_KEY(slpa));
 	/* Device interrupts are off here. */
 	mdelay(SMC_SLEEP_ARM_MS);
@@ -793,6 +1025,26 @@ static int apple_smc_sleep_commit(struct apple_smc *smc)
 		mdelay(SMC_SLEEP_IDLE_MS);
 
 	return ret;
+}
+
+/*
+ * WKTP once a wake is a full one: 0, where a wake that stays dark keeps the key nonzero,
+ * Without the 0 the SMC treats all the time awake as a power nap, whether
+ * the sleep wrote its 2 or not: it keeps its own fan policy against a manual fan request
+ * (the mode request times out), and under thermal load it requests a sleep once a second.
+ */
+static void apple_smc_wake_full(struct apple_smc *smc)
+{
+	int ret;
+
+	if (!smc->wake_silent)
+		return;
+	smc->wake_silent = false;
+	if (!smc->wktp)
+		return;
+	ret = apple_smc_write_u8(smc, SMC_KEY(WKTP), SMC_WKTP_AWAKE);
+	if (ret)
+		dev_err(smc->dev, "Failed to write WKTP = %u: %d\n", SMC_WKTP_AWAKE, ret);
 }
 
 static int apple_smc_wake_reason_names(const struct apple_smc *smc, u64 record, char *buf,
@@ -902,6 +1154,9 @@ static void apple_smc_sleep_wake(struct apple_smc *smc)
 	apple_smc_lid_wake(smc);
 	if (apple_smc_port_reasons_only(smc, smc->wake_record))
 		apple_sleep_debug_link_cut_wake();
+	/* A dark wake sleeps again, and its commit writes the key anyway. */
+	if (!pm_dark_wake())
+		apple_smc_wake_full(smc);
 	/* A dark wake isn't one: with wakeup_count in use, it would abort the sleep after it. */
 	if (smc->wake_record && !pm_dark_wake())
 		pm_wakeup_event(smc->dev, 0);
@@ -913,29 +1168,35 @@ static int apple_smc_prepare(struct device *dev)
 
 	if (!pm_suspend_via_firmware())
 		return 0;
-	if (apple_sleep_debug_link_up())
-		smc->sleep_warn_late = true;
-	else
-		apple_smc_sleep_warn(smc);
+	/* Warned with the commit, not here: see apple_smc_sleep_enter(). */
+	smc->sleep_warn_late = true;
 
 	return 0;
 }
 
 /* Warned, and a refusal came before the notice: tell it the sleep is off. */
-static void apple_smc_complete(struct device *dev)
+static void apple_smc_sleep_end(struct apple_smc *smc)
 {
-	struct apple_smc *smc = dev_get_drvdata(dev);
-
+	if (smc->commit_at_stop)
+		apple_sleep_coproc_set_ready(smc->dev, false);
 	smc->sleep_warn_late = false;
 	if (smc->sleep_warned) {
 		apple_smc_write_mbse(smc, SMC_KEY(waka));
 		smc->sleep_warned = false;
 	}
+	/* A commit the SMC refused, or dark wakes that ended in a refusal. */
+	apple_smc_wake_full(smc);
+}
+
+static void apple_smc_complete(struct device *dev)
+{
+	apple_smc_sleep_end(dev_get_drvdata(dev));
 }
 
 /*
  * For at least @min_ms, then until the outbox is quiet for @quiet_ms. The events go to their
- * handlers as usual, through the RTKit worker.
+ * handlers as usual, through the RTKit worker. With interrupts off, in atomic mode, that
+ * worker runs them once the sleep is over.
  */
 static void apple_smc_outbox_poll(struct apple_smc *smc, const char *after,
 				  unsigned int min_ms, unsigned int quiet_ms)
@@ -955,18 +1216,147 @@ static void apple_smc_outbox_poll(struct apple_smc *smc, const char *after,
 		} else {
 			quiet++;
 		}
-		usleep_range(1000, 1200);
+		if (smc->atomic_mode)
+			mdelay(1);
+		else
+			usleep_range(1000, 1200);
 	}
 	/* A debug cable only. */
 	dev_info(smc->dev, "%s: %u messages in %u ms, the last at %u ms%s\n", after, count, ms,
 		 last, ms >= SMC_OUTBOX_SETTLE_MS ? ", still busy" : "");
 }
 
-/* The noirq suspend's part, polled: the cut, a late warning, the commit's notices. */
+/*
+ * Whether the sleep controller's last stops send this sleep's commit: the SMC is registered
+ * for one, and the controller runs them for this sleep.
+ */
+static bool apple_smc_commits_at_stop(struct apple_smc *smc)
+{
+	if (IS_ENABLED(CONFIG_MFD_MACSMC_KUNIT_TEST))
+		KUNIT_STATIC_STUB_REDIRECT(apple_smc_commits_at_stop, smc);
+
+	return smc->commit_at_stop && apple_sleep_commit_stops_coprocs();
+}
+
+static int apple_smc_stop_write(struct apple_smc *smc, smc_key key, const void *buf, size_t size)
+{
+	int ret = apple_smc_write_atomic(smc, key, buf, size);
+
+	if (ret < 0)
+		dev_err(smc->dev, "Failed to write %p4ch at the last stop: %d\n", &key, ret);
+
+	return ret < 0 ? ret : 0;
+}
+
+/*
+ * The warning and the commit as one of the sleep controller's last stops: interrupts are
+ * off, one CPU is up, the enclave has its sleep request and nothing can refuse any more. So
+ * an SMC that got any of this also gets the power loss that brings it out of its sleep
+ * state. The order and the gaps are the noirq suspend's: apple_smc_sleep_enter() and
+ * apple_smc_sleep_commit().
+ *
+ * Nothing sleeps here and the RTKit worker does not run, so the writes are the atomic ones
+ * and the idle notice's answer is polled for. Every other user of the SMC is suspended, and
+ * the mutex is not taken. An event the SMC sends meanwhile is taken from its outbox and
+ * reaches its handler after the wake.
+ *
+ * A last stop cannot refuse, and the sleep goes on whatever the SMC answers. So does this:
+ * a step that fails is logged and the rest is sent all the same, since an SMC that took
+ * the warning leaves its sleep state only through the rest of the sequence and the power
+ * loss. The one exception is an SMC that does not answer at all: a write waits up to
+ * SMC_ATOMIC_TIMEOUT_MS for its answer, so after the first timeout the rest is left out
+ * instead of waiting that long again for each step. The wake sends its part, as after any
+ * sleep, once this has started. Returns the first failure.
+ */
+static bool apple_smc_stop_dead(int ret)
+{
+	/* No answer within SMC_ATOMIC_TIMEOUT_MS, or the one before is still missing. */
+	return ret == -ETIMEDOUT || ret == -EBUSY;
+}
+
+static int apple_smc_last_stop(void *data)
+{
+	const u32 slpw = SMC_KEY(slpw), slpa = SMC_KEY(slpa);
+	const u8 wktp = SMC_WKTP_SLEEP;
+	struct apple_smc *smc = data;
+	int ret, err;
+
+	/* Not left for here: the noirq suspend sent it, or this suspend is not a sleep. */
+	if (!smc->sleep_warn_late)
+		return 0;
+	smc->sleep_warn_late = false;
+
+	scoped_guard(spinlock_irqsave, &smc->lock)
+		smc->atomic_mode = true;
+
+	err = apple_smc_stop_write(smc, SMC_KEY(MBSE), &slpw, sizeof(slpw));
+	smc->sleep_warned = true;
+	if (apple_smc_stop_dead(err))
+		goto dead;
+	apple_smc_outbox_poll(smc, "sleep warning at the last stop", SMC_SLEEP_WARN_MS, 0);
+
+	/* As in apple_smc_sleep_commit(). */
+	smc->wake_silent = true;
+	if (smc->wktp) {
+		ret = apple_smc_stop_write(smc, SMC_KEY(WKTP), &wktp, sizeof(wktp));
+		err = err ?: ret;
+		if (apple_smc_stop_dead(ret))
+			goto dead;
+	}
+	ret = apple_smc_stop_write(smc, SMC_KEY(MBSE), &slpa, sizeof(slpa));
+	err = err ?: ret;
+	if (apple_smc_stop_dead(ret))
+		goto dead;
+	mdelay(SMC_SLEEP_ARM_MS);
+
+	/* Not taken back if the notice fails: the sleep goes on, and its wake sends the other. */
+	smc->ap_notified = true;
+	ret = apple_smc_ap_power(smc, false);
+	if (ret)
+		dev_err(smc->dev, "SMC did not take the sleep notice at the last stop: %d\n", ret);
+	else
+		mdelay(SMC_SLEEP_IDLE_MS);
+	err = err ?: ret;
+	goto out;
+
+dead:
+	/*
+	 * An SMC that answers nothing for SMC_ATOMIC_TIMEOUT_MS takes nothing more: each further
+	 * write would wait that long again, and again for the answer still missing, all with
+	 * interrupts off. The sleep goes on without the rest.
+	 */
+	dev_err(smc->dev, "SMC does not answer at the last stop, the rest is left out\n");
+	err = err ?: -ETIMEDOUT;
+out:
+	/*
+	 * The wake's commands are the usual ones. An answer that never came is given up: if
+	 * it comes after all, it fails the sequence check of the command it lands on.
+	 */
+	scoped_guard(spinlock_irqsave, &smc->lock) {
+		smc->atomic_pending = false;
+		smc->atomic_mode = false;
+	}
+
+	return err;
+}
+
+/*
+ * The noirq suspend's part, polled: the cut, the warning, the commit's notices. Where the
+ * sleep controller's last stops send the warning and the commit, only the cut is left here:
+ * it sleeps, and it has to come before the warning.
+ *
+ * The warning is not sent earlier, although the SMC could take it then. A T6041 SMC that
+ * was warned and then told that the sleep was off, with no commit between, stopped running
+ * the fans (0 rpm at a die temperature of 110 C) and refused a fan request, until a later
+ * sleep had completed: nothing sent to it takes the warning back. So it goes where the
+ * commit goes, after every device has had its chance to refuse.
+ */
 static int apple_smc_sleep_enter(struct apple_smc *smc)
 {
 	if (apple_sleep_debug_link_cut())
 		apple_smc_outbox_poll(smc, "debug link cut", 0, SMC_OUTBOX_QUIET_MS);
+	if (apple_smc_commits_at_stop(smc))
+		return 0;
 	if (smc->sleep_warn_late) {
 		smc->sleep_warn_late = false;
 		apple_smc_sleep_warn(smc);
@@ -976,12 +1366,36 @@ static int apple_smc_sleep_enter(struct apple_smc *smc)
 	return apple_smc_sleep_commit(smc);
 }
 
-static int apple_smc_suspend_noirq(struct device *dev)
+/*
+ * Whether this suspend goes on to the SoC's power loss. Only then is the SMC given its sleep
+ * commit, which nothing sent to it takes back: a T6041 SMC that took the commit and then saw
+ * no power loss kept every sensor report at its last value until a later sleep had completed,
+ * although it got the notices of a wake as after any sleep. So the commit is among the stops
+ * that only a power cycle undoes, and a dry run, which ends short of the power loss by
+ * design, leaves it out.
+ */
+static bool apple_smc_sleep_commits(void)
 {
-	struct apple_smc *smc = dev_get_drvdata(dev);
+	if (IS_ENABLED(CONFIG_MFD_MACSMC_KUNIT_TEST))
+		KUNIT_STATIC_STUB_REDIRECT(apple_smc_sleep_commits);
+
+	return apple_sleep_power_loss();
+}
+
+static int apple_smc_sleep_noirq(struct apple_smc *smc)
+{
 	int ret;
 
 	if (!smc->sleep_warned && !smc->sleep_warn_late)
+		return 0;
+	/*
+	 * Nothing of the SMC's is in the way of the sleep controller's stops, in a dry run's
+	 * checks as in a sleep. Its last stop runs only where a sleep is committed.
+	 */
+	if (smc->commit_at_stop)
+		apple_sleep_coproc_set_ready(smc->dev, true);
+	/* A sleep that stops short of the commit sends the SMC nothing. */
+	if (!apple_smc_sleep_commits())
 		return 0;
 
 	apple_smc_set_polled(smc, true);
@@ -991,22 +1405,49 @@ static int apple_smc_suspend_noirq(struct device *dev)
 	return ret;
 }
 
+static int apple_smc_suspend_noirq(struct device *dev)
+{
+	return apple_smc_sleep_noirq(dev_get_drvdata(dev));
+}
+
+static void apple_smc_wake_noirq(struct apple_smc *smc)
+{
+	if (!smc->ap_notified)
+		return;
+
+	/*
+	 * Committed, and no power loss followed: a check that comes after this device's
+	 * suspend refused the sleep, or a wake event got in first. The SMC gets the notices
+	 * of a wake all the same, which is all there is to send, but it leaves its sleep
+	 * state only through a power loss: see apple_smc_sleep_commits(). A commit sent from
+	 * the sleep controller's last stop has every refusal behind it.
+	 */
+	if (!pm_resume_via_firmware())
+		dev_warn(smc->dev, "sleep refused after the SMC's commit: its sensor reports may stand still until a sleep completes\n");
+
+	apple_smc_set_polled(smc, true);
+	apple_smc_sleep_wake(smc);
+	apple_smc_set_polled(smc, false);
+}
+
 static int apple_smc_resume_noirq(struct device *dev)
 {
-	struct apple_smc *smc = dev_get_drvdata(dev);
-
-	if (smc->ap_notified) {
-		apple_smc_set_polled(smc, true);
-		apple_smc_sleep_wake(smc);
-		apple_smc_set_polled(smc, false);
-	}
+	apple_smc_wake_noirq(dev_get_drvdata(dev));
 
 	return 0;
 }
 
+/*
+ * Suspend-to-RAM commits in the noirq phase or from the sleep controller's last stop;
+ * hibernation restarts the session in the normal one.
+ */
 static const struct dev_pm_ops apple_smc_pm_ops = {
 	.prepare = pm_sleep_ptr(apple_smc_prepare),
 	.complete = pm_sleep_ptr(apple_smc_complete),
+	.freeze = pm_sleep_ptr(apple_smc_freeze),
+	.thaw = pm_sleep_ptr(apple_smc_thaw),
+	.poweroff = pm_sleep_ptr(apple_smc_freeze),
+	.restore = pm_sleep_ptr(apple_smc_restore),
 	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_smc_suspend_noirq, apple_smc_resume_noirq)
 };
 

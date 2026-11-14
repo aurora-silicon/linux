@@ -7,9 +7,19 @@
 #include <crypto/sha2.h>
 
 #define ANE_H16_SURFACES 4
-#define ANE_H16_SECTIONS 8
+/*
+ * Kernel segments __KERN_0..__KERN_15. The compiler splits the kernel data
+ * of a large model into segments of at most 128 MiB, each addressed through
+ * its own BAR; the region they form stays within ANE_H16_SEGMENT_MAX.
+ */
+#define ANE_H16_KERNEL_SEGMENTS 16
+/* __bss, four surfaces, __text, __const and the kernel sections. */
+#define ANE_H16_SECTIONS (7 + ANE_H16_KERNEL_SEGMENTS)
 #define ANE_H16_REGIONS 7
-#define ANE_H16_HWX_MAX (SZ_256M + SZ_1M)
+/* Surface names with their terminator, as a buffer reference holds them. */
+#define ANE_H16_NAME_MAX 32
+#define ANE_H16_SEGMENT_MAX SZ_1G
+#define ANE_H16_HWX_MAX (ANE_H16_SEGMENT_MAX + SZ_1M)
 /* Mach-O CPU subtypes of the two targets that share this container form. */
 #define ANE_HWX_SUBTYPE_H16 7
 #define ANE_HWX_SUBTYPE_H17 9
@@ -29,7 +39,7 @@ struct ane_h16_hwx_surface {
 	u64 span;
 	u32 direction;
 	u32 symbol_offset;
-	char name[8];
+	char name[ANE_H16_NAME_MAX];
 };
 
 enum ane_h16_region_kind {
@@ -50,7 +60,13 @@ struct ane_h16_hwx_region {
 };
 
 struct ane_h16_hwx {
+	/*
+	 * @kernel spans every kernel section: from the start of __kern_0 to
+	 * the end of the last one, with the ordinal of __kern_0.
+	 */
 	struct ane_h16_hwx_section text, constants, kernel, scratch;
+	struct ane_h16_hwx_section kernels[ANE_H16_KERNEL_SEGMENTS];
+	u32 kernel_count;
 	/* Target; a backend accepts only its own engine's subtype. */
 	u32 subtype;
 	struct ane_h16_hwx_surface surfaces[ANE_H16_SURFACES];

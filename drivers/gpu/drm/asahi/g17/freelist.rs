@@ -1092,6 +1092,9 @@ impl ComputePool {
     pub(crate) fn descriptor(&self) -> Result<PoolDescriptor> {
         self.pages.as_ref().ok_or(EAGAIN)?.descriptor(self.id)
     }
+    pub(crate) fn page_list_va(&self) -> Result<u64> {
+        self.pages.as_ref().map(Pages::page_list_va).ok_or(EAGAIN)
+    }
     pub(crate) fn completed_submissions(&self) -> Result<u64> {
         Ok(u64::from_le_bytes(self.completed_bytes()?))
     }
@@ -1160,6 +1163,29 @@ impl ComputePool {
         Self::initialize_control(&mut self.control, pages, self.id, self.state.gpu_va(), completed)?;
         fence(Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Returns a populated pool to its construction state for a cold-restarted firmware that
+    /// never saw it: page and run tables repopulated, a fresh control header (completed
+    /// counter zero) and a zero state (submitted counter zero). Returns the block count for
+    /// the page-pool descriptor row the caller rewrites. Only with the GPU idle.
+    pub(crate) fn reset_after_cold_boot(&mut self) -> Result<usize> {
+        let pages = self.pages.as_ref().ok_or(EAGAIN)?;
+        let PageLayout::Neo { blocks, .. } = pages.layout else { return Err(EINVAL); };
+        pages.repopulate()?;
+        let header = FreeListControl::compute(&FreeListArgs {
+            buffer_slot: u32::from(self.id),
+            class: FreeListClass::One,
+            page_list_va: pages.page_list_va(),
+            run_list_va: pages.run_list_va(),
+            blocks: blocks as u32,
+            state_va: self.state.gpu_va(),
+        });
+        self.control.bytes_mut().fill(0);
+        self.control.write(0, header)?;
+        self.state.bytes_mut().fill(0);
+        fence(Ordering::SeqCst);
+        Ok(blocks)
     }
 
     /// EPERM for a VM other than the one the backing serves.

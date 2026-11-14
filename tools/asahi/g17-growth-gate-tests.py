@@ -21,7 +21,7 @@ def fixture():
     methods='\n'.join(item(gate,sig) for sig in ['pub(super) fn try_enter(', 'pub(super) fn enter(', 'fn invalidate(', 'pub(super) fn close(', 'pub(super) fn wait_drained(', 'pub(super) fn reopen(']).replace('pub(super) ','')
     handoff=re.search(r'Rebind::Grow => \{([^}]+)\}',(ROOT/'runtime.rs').read_text()).group(1)
     return r'''
-use std::sync::{Arc,Mutex as StdMutex,Condvar as StdCondvar,atomic::{AtomicU64,Ordering},mpsc};
+use std::sync::{Arc,Mutex as StdMutex,Condvar as StdCondvar,atomic::{AtomicBool,AtomicU64,Ordering},mpsc};
 type Result<T=()>=std::result::Result<T,i32>;
 const ENODEV:i32=-19;const EAGAIN:i32=-11;const ENOSPC:i32=-28;const ERESTARTSYS:i32=-512;
 const COUNT_BITS:u32=20;const COUNT_MASK:u64=(1<<COUNT_BITS)-1;
@@ -35,7 +35,7 @@ impl CondVar {
  fn wait_interruptible(&self,g:&mut Guard<'_>)->bool{self.wait(g);false}
  fn notify_all(&self){self.0.notify_all();}
 }
-struct Gate{state:AtomicU64,wait:Mutex,changed:CondVar}
+struct Gate{state:AtomicU64,hibernating:AtomicBool,wait:Mutex,changed:CondVar}
 struct Lease{gate:Arc<Gate>,epoch:u64}
 impl Gate {
  fn wake_waiters(&self) {}
@@ -53,7 +53,7 @@ impl Backend {
  }
 }
 fn main(){for _ in 0..128 {
- let gate=Arc::new(Gate{state:AtomicU64::new(EPOCH),wait:Mutex(StdMutex::new(())),changed:CondVar(StdCondvar::new())});
+ let gate=Arc::new(Gate{state:AtomicU64::new(EPOCH),hibernating:AtomicBool::new(false),wait:Mutex(StdMutex::new(())),changed:CondVar(StdCondvar::new())});
  let (ready_tx,ready_rx)=mpsc::channel();let (go_tx,go_rx)=mpsc::channel();
  let b=Backend{gate:gate.clone(),ready:ready_tx,proceed:StdMutex::new(go_rx)};
  let builder=std::thread::spawn(move||b.handoff(40));

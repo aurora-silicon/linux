@@ -5,21 +5,22 @@
 #include <linux/align.h>
 #include <linux/bitfield.h>
 #include <linux/bitmap.h>
-#include <linux/clk.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
+#include <linux/dma-map-ops.h>
 #include <linux/dma-mapping.h>
-#include <linux/iommu.h>
-#include <linux/kref.h>
+#include <linux/jhash.h>
 #include <linux/module.h>
 #include <linux/of_device.h>
 #include <linux/power_supply.h>
 #include <linux/ratelimit.h>
 #include <linux/slab.h>
 #include <linux/sched.h>
-#include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/unaligned.h>
+#include <linux/vmalloc.h>
+
+#include <asm/cacheflush.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
@@ -1599,6 +1600,74 @@ void dcp_route_failure_notify(struct apple_connector *connector)
 	schedule_work(&connector->hotplug_wq);
 }
 
+/*
+ * A sink that drops its link and raises IRQ_HPD after every training (a
+ * dual-pipe monitor can, after a modeset from the kernel console) turns each
+ * hotplug into a retrain and each retrain into a hotplug, every 0.4-1.2 s,
+ * until the Type-C controller gives up on the cable.  The worker retrains at
+ * most DCP_HOTPLUG_RETRAIN_MAX times in a DCP_HOTPLUG_RETRAIN_WINDOW that
+ * starts with its first retrain and is not extended by refused requests, so a
+ * storm is bounded to that rate and never stops the retrains for good.  Past
+ * the limit the link status stays BAD (userspace still gets every hotplug
+ * event and may set a mode); when the window ends, one more retrain is tried
+ * if the sink is still connected.
+ *
+ * A disconnect lasting DCP_HOTPLUG_REPLUG_GAP or longer is a real replug and
+ * starts a fresh window.  A completed modeset does not: in the storm every
+ * compositor modeset completed before the sink dropped the link again.
+ */
+#define DCP_HOTPLUG_RETRAIN_MAX		5
+#define DCP_HOTPLUG_RETRAIN_WINDOW	(30 * HZ)
+#define DCP_HOTPLUG_REPLUG_GAP		(3 * HZ)
+
+static void dcp_hotplug_retrain_reset(struct apple_dcp *dcp, const char *why)
+{
+	if (dcp->hotplug_retrain_stopped)
+		dev_info(dcp->dev, "hotplug: link retrains resumed (%s)\n", why);
+	dcp->hotplug_retrain_stopped = false;
+	dcp->hotplug_retrains = 0;
+}
+
+/* Called from the connector's hotplug work only, which serializes it. */
+static void dcp_hotplug_retrain_note(struct apple_dcp *dcp, bool connected)
+{
+	unsigned long now = jiffies;
+
+	if (!connected) {
+		if (!dcp->hotplug_disconnect_at)
+			dcp->hotplug_disconnect_at = now ?: 1;
+		return;
+	}
+	if (dcp->hotplug_disconnect_at &&
+	    time_after_eq(now, dcp->hotplug_disconnect_at + DCP_HOTPLUG_REPLUG_GAP))
+		dcp_hotplug_retrain_reset(dcp, "replug");
+	dcp->hotplug_disconnect_at = 0;
+}
+
+static bool dcp_hotplug_retrain_allowed(struct apple_dcp *dcp)
+{
+	unsigned long now = jiffies;
+
+	if (dcp->hotplug_retrains &&
+	    time_after_eq(now, dcp->hotplug_retrain_since + DCP_HOTPLUG_RETRAIN_WINDOW))
+		dcp_hotplug_retrain_reset(dcp, "window over");
+	if (dcp->hotplug_retrain_stopped)
+		return false;
+	if (!dcp->hotplug_retrains)
+		dcp->hotplug_retrain_since = now;
+	if (++dcp->hotplug_retrains > DCP_HOTPLUG_RETRAIN_MAX) {
+		dcp->hotplug_retrain_stopped = true;
+		dev_warn(dcp->dev,
+			 "hotplug: %u link retrains within %u s, the sink keeps dropping the link; next kernel retrain when the window ends\n",
+			 DCP_HOTPLUG_RETRAIN_MAX,
+			 jiffies_to_msecs(DCP_HOTPLUG_RETRAIN_WINDOW) / 1000);
+		mod_delayed_work(system_freezable_wq, &dcp->hotplug_retrain_retry_wq,
+				 dcp->hotplug_retrain_since + DCP_HOTPLUG_RETRAIN_WINDOW - now);
+		return false;
+	}
+	return true;
+}
+
 void dcp_hotplug(struct work_struct *work)
 {
 	struct apple_connector *connector;
@@ -1640,6 +1709,9 @@ void dcp_hotplug(struct work_struct *work)
 		if (!READ_ONCE(connector->connected))
 			dcp_clear_connector_edid(connector);
 	}
+	dcp_hotplug_retrain_note(dcp, READ_ONCE(connector->connected));
+	if (READ_ONCE(connector->connected))
+		dcp_wake_list_check(dcp);
 
 	gated = dcp_announce_gated(dcp, connector);
 	if (gated) {
@@ -1677,6 +1749,8 @@ void dcp_hotplug(struct work_struct *work)
 		    * again, and that wake does the same, forever.
 		    */
 		   !READ_ONCE(dcp->typec_crtc_off) &&
+		   /* Nor for a list that is being read again after a wake. */
+		   !dcp_wake_reread_pending(dcp) &&
 		   (!dcp_uses_t6020_tunnel_flow(dcp) ||
 		    dcp->tunnel_power_cycles < DCP_TUNNEL_POWER_CYCLES)) {
 		bool power_cycle = dcp_uses_t6020_tunnel_flow(dcp);
@@ -1698,7 +1772,8 @@ void dcp_hotplug(struct work_struct *work)
 		 * link.  Re-apply the active CRTC state once the DPTX link-config
 		 * callback has completed.
 		 */
-		ret = dcp_retrain_active_crtc(connector, dcp, power_cycle);
+		ret = dcp_hotplug_retrain_allowed(dcp) ?
+		      dcp_retrain_active_crtc(connector, dcp, power_cycle) : 0;
 		if (ret) {
 			dev_warn(dcp->dev,
 				 "failed to retrain active CRTC after hotplug: %d\n",
@@ -2977,6 +3052,24 @@ int dcp_crtc_check_hdr(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	}
 }
 
+/*
+ * The modes a display lists, as one word that is never 0 and does not depend
+ * on their order: for telling whether it lists the same ones later.
+ */
+u32 dcp_modes_signature(struct apple_dcp *dcp)
+{
+	unsigned int i;
+	u32 sig = 0;
+
+	guard(mutex)(&dcp->modes_lock);
+	for (i = 0; i < dcp->nr_modes; i++) {
+		const struct drm_display_mode *m = &dcp->modes[i].mode;
+
+		sig += jhash_3words(m->hdisplay, m->vdisplay, m->clock, 0);
+	}
+	return sig ?: 1;
+}
+
 /* The user may own drm_display_mode, so we need to search for our copy */
 bool lookup_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode,
 		 struct dcp_display_mode *out)
@@ -3088,6 +3181,10 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 		return ret ? ret : drm_mode_equal(&crtc_state->mode, &fixed) ? 0 : -EINVAL;
 	}
 
+	/* Resume from disk: the restart sets the mode (see dcp_hib_recommit()). */
+	if (dcp_hib_gated(dcp))
+		return 0;
+
 	/* Disconnect cannot pass the admission check before these RPCs finish. */
 	guard(mutex)(&dcp->external_lock);
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL &&
@@ -3105,6 +3202,17 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 		}
 		return -EPIPE;
 	}
+
+	/*
+	 * An external pipe whose sink was reported gone has no link, and the firmware
+	 * fails a mode set on it ("setmode failed", "pipe not enabled"). A resume commit
+	 * comes to this when the link was given up for the suspend and its sink has not
+	 * answered yet. The hotplug that reports the sink back brings the mode set with
+	 * it, so nothing is lost by leaving this one out.
+	 */
+	if (dcp->connector_type != DRM_MODE_CONNECTOR_eDP && dcp->connector &&
+	    !READ_ONCE(dcp->connector->connected))
+		return -EPIPE;
 
 	crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
 	if (!crtc_state)
@@ -3729,6 +3837,16 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 	}
 
 	/*
+	 * Resume from disk: the firmware session the flip would go to is gone
+	 * and the new one is not up yet (or never came up).  Complete the
+	 * flip without a swap; the restart re-commits the mode and the frame.
+	 */
+	if (dcp_hib_gated(dcp)) {
+		schedule_work(&dcp->vblank_wq);
+		return;
+	}
+
+	/*
 	 * Desktop 26.x external display replugged while the compositor kept
 	 * its CRTC active: no atomic enable follows, and the firmware, which
 	 * powered the pipe off with the unplug, swallows every swap.  Run the
@@ -3897,6 +4015,34 @@ void iomfb_recv_msg(struct apple_dcp *dcp, u64 message)
 	mutex_unlock(&dcp->iomfb.lock);
 }
 
+/*
+ * Resume from disk: the image restore wrote the arena's pages through the
+ * cacheable linear map and cleaned them only to the PoU
+ * (arch/arm64/kernel/hibernate-asm.S).  The DCP is not DMA-coherent (no
+ * dma-coherent in its node), its arena is mapped non-cacheable, and a dirty
+ * line of the linear alias could be written back over what the host writes
+ * through that mapping, or hold what the firmware should read.  Clean the
+ * linear alias to the PoC before the arena is cleared and handed over.
+ */
+static void iomfb_hib_clean_shmem(struct apple_dcp *dcp)
+{
+	size_t off;
+
+	if (dev_is_dma_coherent(dcp->dev))
+		return;
+	for (off = 0; off < DCP_SHMEM_SIZE; off += PAGE_SIZE) {
+		void *va = dcp->shmem + off;
+		struct page *page = is_vmalloc_addr(va) ? vmalloc_to_page(va) :
+							  virt_to_page(va);
+		unsigned long lin;
+
+		if (!page)
+			continue;
+		lin = (unsigned long)page_address(page);
+		dcache_clean_poc(lin, lin + PAGE_SIZE);
+	}
+}
+
 int iomfb_start_rtkit(struct apple_dcp *dcp)
 {
 	dma_addr_t shmem_iova;
@@ -3931,10 +4077,27 @@ int iomfb_start_rtkit(struct apple_dcp *dcp)
 			return ret;
 	}
 
+	/*
+	 * Firmware restarted in place after a resume from disk: the arena and
+	 * its mapping are in the restored image, only the firmware's binding
+	 * is gone.  Give it the same arena, cleared as a new one would be.
+	 */
+	if (IS_ENABLED(CONFIG_HIBERNATION) && dcp->shmem &&
+	    READ_ONCE(dcp->hib_phase) == DCP_HIB_RESTARTING) {
+		iomfb_hib_clean_shmem(dcp);
+		memset(dcp->shmem, 0, DCP_SHMEM_SIZE);
+		/* The firmware reads the arena only after set_shmem. */
+		wmb();
+		dcp_send_message(dcp, IOMFB_ENDPOINT,
+				 dcpep_set_shmem(dcp->shmem_iova));
+		return 0;
+	}
+
 	dcp->shmem = dma_alloc_coherent(dcp->dev, DCP_SHMEM_SIZE, &shmem_iova,
 					GFP_KERNEL);
 	if (!dcp->shmem)
 		return -ENOMEM;
+	dcp->shmem_iova = shmem_iova;
 
 	dcp_send_message(dcp, IOMFB_ENDPOINT, dcpep_set_shmem(shmem_iova));
 

@@ -9,6 +9,7 @@ use core::ffi::{c_int, c_void};
 type ReadStats = unsafe extern "C" fn(*const c_void, *mut Readout);
 type SuspendStats = unsafe extern "C" fn(*const c_void, bool);
 type ReadFrequency = unsafe extern "C" fn(*const c_void, u32, *mut u64) -> bool;
+type HibernateStats = unsafe extern "C" fn(*const c_void, c_int) -> c_int;
 
 extern "C" {
     fn asahi_sysfs_register(
@@ -20,8 +21,37 @@ extern "C" {
         read: Option<ReadStats>,
         suspend: Option<SuspendStats>,
         frequency: Option<ReadFrequency>,
+        hibernate: Option<HibernateStats>,
     ) -> c_int;
     fn asahi_sysfs_unregister(dev: *mut c_void, handle: *mut c_void);
+}
+
+extern "C" {
+    fn asahi_hibernate_gate_init() -> c_int;
+    fn asahi_hibernate_gate_exit();
+}
+
+/// The hibernation gate notifier, in the PM notifier chain from module load to unload.
+/// Declare it after every field that registers a device: they are dropped first.
+pub(crate) struct HibernateGate(());
+
+impl HibernateGate {
+    pub(crate) fn new() -> kernel::error::Result<Self> {
+        // SAFETY: Module init, once, before any device is bound.
+        let ret = unsafe { asahi_hibernate_gate_init() };
+        if ret < 0 {
+            Err(kernel::error::Error::from_errno(ret))
+        } else {
+            Ok(Self(()))
+        }
+    }
+}
+
+impl Drop for HibernateGate {
+    fn drop(&mut self) {
+        // SAFETY: Registered by `new`; the drivers that count devices are gone (field order).
+        unsafe { asahi_hibernate_gate_exit() };
+    }
 }
 
 extern "C" {
@@ -58,6 +88,7 @@ pub(crate) fn register(
         None,
         None,
         Some(read_frequency),
+        None,
     )
 }
 
@@ -75,6 +106,7 @@ pub(crate) fn register_g17(
         Some(read_g17),
         Some(suspend_g17),
         None,
+        Some(hibernate_g17),
     )
 }
 
@@ -128,6 +160,40 @@ unsafe extern "C" fn suspend_g17(snapshot: *const c_void, suspended: bool) {
     }
 }
 
+/// `ASAHI_HIBERNATE_FREEZE` in `sysfs.h`.
+const HIBERNATE_FREEZE: c_int = 1;
+/// `ASAHI_HIBERNATE_THAW` in `sysfs.h`.
+const HIBERNATE_THAW: c_int = 2;
+
+/// Hibernation phases of a G17 GPU: drain it before the image (`HIBERNATE_FREEZE`, may refuse
+/// with a negative errno), and after the transition re-boot a cold firmware against the
+/// restored host state or resume a live one (`HIBERNATE_THAW`).
+///
+/// # Safety
+///
+/// `snapshot` must name a live StatsSnapshot retained by the registration. The caller joins
+/// this callback (notifier unregister) before releasing the owning Arc.
+unsafe extern "C" fn hibernate_g17(snapshot: *const c_void, phase: c_int) -> c_int {
+    // SAFETY: C calls this only while registration retains the snapshot Arc.
+    let Some(reader) = unsafe { &*snapshot.cast::<StatsSnapshot>() }
+        .g17_reader
+        .as_ref()
+    else {
+        return 0;
+    };
+    match phase {
+        HIBERNATE_FREEZE => match reader.freeze() {
+            Ok(()) => 0,
+            Err(error) => error.to_errno(),
+        },
+        HIBERNATE_THAW => {
+            reader.thaw();
+            0
+        }
+        _ => kernel::error::code::EINVAL.to_errno(),
+    }
+}
+
 fn register_with_callbacks(
     dev: *mut kernel::bindings::device,
     snapshot: *const StatsSnapshot,
@@ -135,6 +201,7 @@ fn register_with_callbacks(
     read: Option<ReadStats>,
     suspend: Option<SuspendStats>,
     frequency: Option<ReadFrequency>,
+    hibernate: Option<HibernateStats>,
 ) -> kernel::error::Result<*mut c_void> {
     let mut handle = core::ptr::null_mut();
     // SAFETY: The bound driver keeps the device and optional snapshot alive until
@@ -149,6 +216,7 @@ fn register_with_callbacks(
             read,
             suspend,
             frequency,
+            hibernate,
         )
     };
     if ret < 0 {

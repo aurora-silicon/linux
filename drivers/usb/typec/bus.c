@@ -535,10 +535,16 @@ static int typec_probe(struct device *dev)
 	}
 
 	ret = drv->probe(adev);
-	if (ret)
+	if (ret) {
 		typec_altmode_remove_links(altmode);
+		return ret;
+	}
 
-	return ret;
+	/* A mode that was activated before this driver bound pins it now. */
+	if (adev->active && !altmode->owner_held)
+		altmode->owner_held = try_module_get(dev->driver->owner);
+
+	return 0;
 }
 
 static void typec_remove(struct device *dev)

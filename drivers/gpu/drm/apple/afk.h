@@ -548,6 +548,9 @@ struct apple_dcp_afkep {
 	struct mutex compact_tx_lock;
 	struct afk_fragment_state compact_rx;
 	void *compact_rx_data;
+	/* An internal packet (interface 0) answered: AFK_INTERNAL_*_DONE awaited. */
+	struct completion internal_done;
+	u8 internal_wait;
 
 	const struct apple_epic_service_ops *ops;
 	struct apple_epic_service services[AFK_MAX_CHANNEL];
@@ -570,6 +573,7 @@ static inline void afk_ep_init_state(struct apple_dcp_afkep *ep)
 	INIT_LIST_HEAD(&ep->compact_cmds);
 	init_waitqueue_head(&ep->compact_orphan_wq);
 	mutex_init(&ep->compact_tx_lock);
+	init_completion(&ep->internal_done);
 	init_completion(&ep->started);
 	init_completion(&ep->stopped);
 	for (i = 0; i < AFK_MAX_CHANNEL; i++)
@@ -587,6 +591,8 @@ bool afk_compact_orphans_wait(struct apple_dcp_afkep *ep, unsigned long timeout)
 unsigned int afk_compact_orphans_drop(struct apple_dcp_afkep *ep);
 bool afk_compact_orphans_pending(struct apple_dcp_afkep *ep);
 void afk_shutdown(struct apple_dcp_afkep *ep);
+int afk_pause(struct apple_dcp_afkep *ep, unsigned int timeout_ms);
+int afk_resume(struct apple_dcp_afkep *ep, unsigned int timeout_ms);
 void afk_quiesce(struct apple_dcp_afkep *ep);
 int afk_receive_message(struct apple_dcp_afkep *ep, u64 message);
 int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,

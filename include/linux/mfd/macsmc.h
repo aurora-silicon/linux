@@ -120,8 +120,14 @@ struct apple_smc {
 	bool sleep_warned;
 	/* To be told at the noirq suspend, after the debug link's cut. */
 	bool sleep_warn_late;
+	/* A sleep was committed, and the wake after it has not been declared a full one. */
+	bool wake_silent;
+	/* This SoC's SMC is told of a sleep and of a full wake through WKTP as well. */
+	bool wktp;
 	/* In a noirq phase: replies are polled for. */
 	bool polled;
+	/* Registered with the sleep controller, whose last stops can send the sleep commit. */
+	bool commit_at_stop;
 	/* MBSW at the last wake: what the SMC had woken the AP for. */
 	u64 wake_record;
 	/* MBSW's bits as this SoC numbers them, from the probe. */
@@ -294,6 +300,18 @@ int macsmc_hwmon_fans_request(struct device *dev, unsigned int permille,
 #else
 static inline int macsmc_hwmon_fans_request(struct device *dev, unsigned int permille,
 					    unsigned int min_step_rpm)
+{
+	return -ENODEV;
+}
+#endif
+
+/*
+ * Request the VDD_CIO rail (SMC key pmVC) for a system sleep: see drivers/mfd/macsmc.c.
+ */
+#if IS_REACHABLE(CONFIG_MFD_MACSMC)
+int apple_smc_request_pmvc(struct apple_smc *smc);
+#else
+static inline int apple_smc_request_pmvc(struct apple_smc *smc)
 {
 	return -ENODEV;
 }

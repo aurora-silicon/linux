@@ -349,6 +349,18 @@ static const struct aic_info aic3_t8132_info __initconst = {
 	.fw_suspend = true,
 };
 
+/*
+ * The same AICv3 as T8140's across a firmware-driven suspend: the CONFIG,
+ * TIMEOUT and CLUSTER_PRIO words and the IRQ_CFG array are lost with its power.
+ */
+static const struct aic_info aic3_t6041_info __initconst = {
+	.version = 3,
+	.irq_cfg = AIC3_IRQ_CFG,
+	.fast_ipi = true,
+	.local_fast_ipi = true,
+	.fw_suspend = true,
+};
+
 static const struct aic_info aic3_t8142_info __initconst = {
 	.version = 3,
 	.irq_cfg = AIC3_IRQ_CFG,
@@ -365,6 +377,10 @@ static const struct of_device_id aic_info_match[] = {
 	{
 		.compatible = "apple,t8140-aic3",
 		.data = &aic3_t8140_info,
+	},
+	{
+		.compatible = "apple,t6041-aic3",
+		.data = &aic3_t6041_info,
 	},
 	{
 		.compatible = "apple,t8142-aic3",
@@ -1165,7 +1181,8 @@ static int aic_syscore_suspend(void *data)
 	struct aic_irq_chip *ic = aic_irqc;
 	u32 die, i, off = 0;
 
-	if (!pm_suspend_via_firmware())
+	/* Registered for the resume from disk alone where the SoC has no such suspend. */
+	if (!ic->info.fw_suspend || !pm_suspend_via_firmware())
 		return 0;
 
 	aic_sleep.config = aic_ic_read(ic, AIC2_CONFIG);
@@ -1205,13 +1222,45 @@ static void aic_resume_boot_cpu(void)
 	}
 }
 
+/*
+ * After a resume from disk the controller holds what the boot kernel left: its
+ * init masked every IRQ and it unmasked only the ones it used itself. The IRQ
+ * core disables lazily and unmasks only an IRQ it recorded as masked, so on
+ * its own it never unmasks the restored kernel's other IRQs again. Make every
+ * hardware mask match the restored descriptor: unmasked unless the core
+ * recorded it masked (a lazily disabled IRQ was unmasked in hardware when the
+ * image was taken), and masked when this kernel has no mapping for it.
+ */
+static void aic_resync_masks(struct aic_irq_chip *ic)
+{
+	unsigned int die, i;
+
+	for (die = 0; die < ic->nr_die; die++) {
+		for (i = 0; i < ic->nr_irq; i++) {
+			irq_hw_number_t hwirq = AIC_IRQ_HWIRQ(die, i);
+			unsigned int virq = irq_find_mapping(ic->hw_domain, hwirq);
+			struct irq_data *d = virq ? irq_get_irq_data(virq) : NULL;
+			u32 off = die * ic->info.die_stride;
+
+			if (d && !irqd_irq_masked(d))
+				aic_ic_write(ic, ic->info.mask_clr + off + MASK_REG(i), MASK_BIT(i));
+			else
+				aic_ic_write(ic, ic->info.mask_set + off + MASK_REG(i), MASK_BIT(i));
+		}
+	}
+}
+
 static void aic_syscore_resume(void *data)
 {
 	struct aic_irq_chip *ic = aic_irqc;
 	u32 die, i, off = 0;
 
-	if (!aic_sleep.saved)
+	if (!aic_sleep.saved) {
+		/* No firmware-driven suspend: only a resume from disk has lost the masks. */
+		if (pm_hibernate_is_restored())
+			aic_resync_masks(ic);
 		return;
+	}
 	aic_sleep.saved = false;
 
 	/* Otherwise the suspend was refused, and the controller stayed powered. */
@@ -1254,14 +1303,21 @@ static struct syscore aic_syscore = {
 	.ops = &aic_syscore_ops,
 };
 
+/*
+ * The save across a firmware-driven suspend is for the SoCs that have one. The
+ * mask resync after a resume from disk is for every SoC: whatever the AIC, the
+ * kernel that loaded the image left its own masks in it.
+ */
 static void __init aic_sleep_init(struct aic_irq_chip *irqc)
 {
-	if (!irqc->info.fw_suspend)
+	if (!irqc->info.fw_suspend && !IS_ENABLED(CONFIG_HIBERNATION))
 		return;
 
-	aic_sleep.irq_cfg = kcalloc(irqc->nr_die * irqc->nr_irq, sizeof(u32), GFP_KERNEL);
-	if (WARN_ON(!aic_sleep.irq_cfg))
-		return;
+	if (irqc->info.fw_suspend) {
+		aic_sleep.irq_cfg = kcalloc(irqc->nr_die * irqc->nr_irq, sizeof(u32), GFP_KERNEL);
+		if (WARN_ON(!aic_sleep.irq_cfg))
+			return;
+	}
 
 	register_syscore(&aic_syscore);
 }

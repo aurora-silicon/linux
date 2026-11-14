@@ -48,6 +48,12 @@ struct apple_rtkit_helper {
 	bool idle_pending;
 	/* Ends a sleep whose .prepare failed, which gets no .complete. */
 	struct notifier_block pm_nb;
+	/* Boot kernel of a resume from disk: RX held for the image. */
+	bool rx_held;
+	/* This restore took over the session the boot kernel started. */
+	bool readopted;
+	/* This restore found the co-processor of our own session halted. */
+	bool halted_underneath;
 
 	void __iomem *asc_base;
 
@@ -62,6 +68,22 @@ bool apple_rtkit_helper_preserves_input(struct device *dev)
 	return helper && helper->preserved;
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_helper_preserves_input);
+
+bool apple_rtkit_helper_readopted(struct device *dev)
+{
+	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
+
+	return helper && helper->readopted;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_helper_readopted);
+
+bool apple_rtkit_helper_halted_underneath(struct device *dev)
+{
+	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
+
+	return helper && helper->halted_underneath;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_helper_halted_underneath);
 
 static int apple_rtkit_helper_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 {
@@ -119,9 +141,19 @@ static const struct apple_rtkit_ops apple_rtkit_helper_ops = {
 	.shmem_destroy = apple_rtkit_helper_shmem_destroy,
 };
 
-static void apple_rtkit_helper_release(void *rtk)
+/* Whether the coprocessor's CPU runs: halted, nothing answers on its mailbox. */
+static bool apple_rtkit_helper_cpu_running(struct apple_rtkit_helper *helper)
 {
-	apple_rtkit_free_retaining_buffers(rtk);
+	return readl_relaxed(helper->asc_base + APPLE_ASC_CPU_CONTROL) &
+	       APPLE_ASC_CPU_CONTROL_RUN;
+}
+
+static void apple_rtkit_helper_release(void *data)
+{
+	struct apple_rtkit_helper *helper = data;
+
+	/* The current session object: a hibernation restore may have replaced it. */
+	apple_rtkit_free_retaining_buffers(helper->rtk);
 }
 
 /*
@@ -147,8 +179,7 @@ static int apple_rtkit_helper_live(struct apple_rtkit_helper *helper)
 		return -EINVAL;
 	}
 
-	if (!(readl_relaxed(helper->asc_base + APPLE_ASC_CPU_CONTROL) &
-	      APPLE_ASC_CPU_CONTROL_RUN)) {
+	if (!apple_rtkit_helper_cpu_running(helper)) {
 		dev_warn(helper->dev, "RTKit handoff without a running CPU\n");
 		return -ENODEV;
 	}
@@ -246,6 +277,21 @@ static int apple_rtkit_helper_inherit_buffers(
 	return count;
 }
 
+/*
+ * Whether an adopted session refuses buffers its inventory does not list. With
+ * an inventory, and on T8132 and the J614s without one, no new allocation is
+ * safe: the firmware still uses what it negotiated with its first host.
+ * Producers that predate the inventory (T8140) keep mapping IOVAs inside the
+ * SRAM region. Probe and the restore after a hibernation adopt by this rule.
+ */
+static bool apple_rtkit_helper_strict(struct device *dev, int count)
+{
+	return count > 0 ||
+	       of_device_is_compatible(dev->of_node, "apple,t8132-mtp") ||
+	       (of_machine_is_compatible("apple,j614s") &&
+		of_device_is_compatible(dev->of_node, "apple,t6041-mtp"));
+}
+
 static int apple_rtkit_helper_pm_register(struct apple_rtkit_helper *helper);
 
 static int apple_rtkit_helper_probe(struct platform_device *pdev)
@@ -330,16 +376,9 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 	}
 
 	if (live) {
-		/*
-		 * Set before RX starts: with an inventory, or on T8132, no new
-		 * buffer allocation is safe here. Producers that predate the
-		 * inventory (T8140) keep mapping IOVAs inside the SRAM region.
-		 */
+		/* Set before RX starts, which may bring a buffer request. */
 		helper->adopted = true;
-		helper->strict_buffers = count > 0 ||
-			of_device_is_compatible(dev->of_node, "apple,t8132-mtp") ||
-			(of_machine_is_compatible("apple,j614s") &&
-			 of_device_is_compatible(dev->of_node, "apple,t6041-mtp"));
+		helper->strict_buffers = apple_rtkit_helper_strict(dev, count);
 		helper->rtk = apple_rtkit_init_adopted_with_buffers(
 			dev, helper, NULL, 0, &apple_rtkit_helper_ops, buffers, count);
 		if (IS_ERR(helper->rtk))
@@ -347,7 +386,7 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 					     "Failed to adopt RTKit\n");
 
 		ret = devm_add_action_or_reset(dev, apple_rtkit_helper_release,
-					       helper->rtk);
+					       helper);
 		if (ret)
 			return ret;
 		ret = apple_rtkit_helper_pm_register(helper);
@@ -387,6 +426,17 @@ static void apple_rtkit_helper_remove(struct platform_device *pdev)
 	/* An inherited session would not come back from QUIESCED. */
 	if (helper->adopted || helper->preserved)
 		return;
+
+	/*
+	 * After a resume from disk the boot loader left the coprocessor halted
+	 * with fresh firmware loaded, while the restored host session still
+	 * believes it runs: nothing would answer the quiesce. Drop the session
+	 * without a handshake so that the next probe starts the CPU again.
+	 */
+	if (!apple_rtkit_helper_cpu_running(helper)) {
+		dev_info(&pdev->dev, "co-processor halted underneath (resume from disk): removed without quiesce\n");
+		return;
+	}
 
 	if (apple_rtkit_is_running(helper->rtk))
 		apple_rtkit_quiesce(helper->rtk);
@@ -554,12 +604,194 @@ static int __maybe_unused apple_rtkit_helper_resume(struct device *dev)
 	return 0;
 }
 
-static int __maybe_unused apple_rtkit_helper_freeze(struct device *dev)
+/*
+ * What the boot kernel of a resume from disk leaves for the restored kernel
+ * about a session it started itself: the shared buffers the firmware holds.
+ */
+struct apple_rtkit_helper_hib {
+	u32 count;
+	u32 reserved;
+	struct apple_rtkit_buffer_desc buf[APPLE_RTKIT_BUF_COUNT];
+};
+static_assert(sizeof(struct apple_rtkit_helper_hib) <= APPLE_RTKIT_HIB_HANDOFF_MAX);
+
+static void apple_rtkit_helper_hib_tag(struct device *dev, char *tag, size_t len)
+{
+	snprintf(tag, len, "rtkh:%s", dev_name(dev));
+}
+
+/*
+ * Hibernation of an adopted session. The image is written while the firmware
+ * keeps running; its buffers live in SRAM or in no-map reserved RAM, so they
+ * are not part of the image and the host side has nothing to quiesce. The
+ * restore re-adopts the instance the boot loader started for the resume boot,
+ * exactly as probe adopted the first one.
+ *
+ * A session this driver started itself is left running as well: the MTP
+ * firmware does not come back from QUIESCED (it does not answer the endpoint
+ * discovery of the next start). When this is the boot kernel of a resume from
+ * disk (it started MTP so that the disk passphrase can be typed), it hands
+ * the running firmware to the image: mailbox RX is held, so that what the
+ * firmware sends now stays queued for the restored kernel, the messages
+ * already received are handled, and the shared buffers are described for the
+ * restored kernel, which can only take the session over if its own buffers
+ * sit at the same IOVAs (the firmware keeps writing to the IOVAs it was
+ * given, and after the restore the DART translates them through the image's
+ * page tables).
+ */
+static int apple_rtkit_helper_freeze(struct device *dev)
 {
 	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
+	struct apple_rtkit_helper_hib rec = {};
+	char tag[32];
+	int n, ret;
 
-	/* A hibernation image cannot recreate the firmware's live DMA ownership. */
-	return helper->adopted ? -EBUSY : 0;
+	helper->readopted = false;
+	helper->halted_underneath = false;
+	if (helper->adopted || !apple_rtkit_hib_restoring())
+		return 0;
+	if (!apple_rtkit_helper_cpu_running(helper) ||
+	    !apple_rtkit_is_running(helper->rtk))
+		return 0;
+
+	apple_rtkit_hold_rx(helper->rtk);
+	apple_rtkit_flush_rx(helper->rtk);
+	helper->rx_held = true;
+
+	n = apple_rtkit_describe_buffers(helper->rtk, rec.buf, ARRAY_SIZE(rec.buf));
+	if (n < 0) {
+		dev_warn(dev, "resume from disk: cannot describe the RTKit buffers: %d\n", n);
+		return 0;
+	}
+	rec.count = n;
+	apple_rtkit_helper_hib_tag(dev, tag, sizeof(tag));
+	ret = apple_rtkit_hib_handoff_put(tag, &rec, sizeof(rec));
+	if (ret)
+		dev_warn(dev, "resume from disk: no hand-off record for the image: %d\n", ret);
+	else
+		dev_dbg(dev, "resume from disk: RTKit session left running for the image (%d buffers)\n",
+			n);
+	return 0;
+}
+
+static int apple_rtkit_helper_thaw(struct device *dev)
+{
+	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
+	char tag[32];
+
+	/* The jump into the image failed: this kernel keeps the session. */
+	if (helper->rx_held) {
+		helper->rx_held = false;
+		apple_rtkit_helper_hib_tag(dev, tag, sizeof(tag));
+		apple_rtkit_hib_handoff_drop(tag);
+		apple_rtkit_resume_rx(helper->rtk);
+	}
+	return 0;
+}
+
+/*
+ * A session this driver started itself, after a resume from disk. Taken over
+ * in place when the boot kernel left it running and its buffers match ours;
+ * otherwise left as before (stale until the driver is reloaded).
+ */
+static int apple_rtkit_helper_restore_own(struct apple_rtkit_helper *helper)
+{
+	struct device *dev = helper->dev;
+	struct apple_rtkit_helper_hib rec = {}, own = {};
+	char tag[32];
+	int i, n, ret;
+
+	apple_rtkit_helper_hib_tag(dev, tag, sizeof(tag));
+	ret = apple_rtkit_hib_handoff_take(tag, &rec, sizeof(rec));
+	if (ret < 0) {
+		if (apple_rtkit_helper_cpu_running(helper)) {
+			dev_warn(dev, "resume from disk: co-processor runs without a hand-off from the boot kernel (%d): not taken over\n",
+				 ret);
+		} else {
+			helper->halted_underneath = true;
+			dev_info(dev, "resume from disk: self-started RTKit session left for a reload\n");
+		}
+		return 0;
+	}
+	if (!apple_rtkit_helper_cpu_running(helper)) {
+		helper->halted_underneath = true;
+		dev_warn(dev, "resume from disk: hand-off present but the co-processor is halted: not taken over\n");
+		return 0;
+	}
+
+	n = apple_rtkit_describe_buffers(helper->rtk, own.buf, ARRAY_SIZE(own.buf));
+	own.count = n < 0 ? 0 : n;
+	if (n < 0 || rec.count > ARRAY_SIZE(rec.buf) || own.count != rec.count ||
+	    memcmp(own.buf, rec.buf, rec.count * sizeof(rec.buf[0]))) {
+		dev_err(dev, "resume from disk: RTKit buffers of the boot kernel differ from the image's: not taken over\n");
+		for (i = 0; i < min_t(u32, rec.count, ARRAY_SIZE(rec.buf)); i++)
+			dev_err(dev, "  boot  kind %u iova %#llx size %#llx\n",
+				rec.buf[i].kind, rec.buf[i].iova, rec.buf[i].size);
+		for (i = 0; i < own.count; i++)
+			dev_err(dev, "  image kind %u iova %#llx size %#llx\n",
+				own.buf[i].kind, own.buf[i].iova, own.buf[i].size);
+		return 0;
+	}
+
+	ret = apple_rtkit_readopt(helper->rtk);
+	if (ret) {
+		dev_err(dev, "resume from disk: RTKit session not taken over: %d\n", ret);
+		return 0;
+	}
+	helper->readopted = true;
+	dev_dbg(dev, "resume from disk: took over the RTKit session the boot kernel started (%d buffers at the same IOVAs)\n",
+		n);
+	return 0;
+}
+
+static int apple_rtkit_helper_restore(struct device *dev)
+{
+	struct apple_rtkit_helper *helper = dev_get_drvdata(dev);
+	struct apple_rtkit_inherited_buffer buffers[APPLE_RTKIT_HELPER_MAX_BUFFERS] = {};
+	struct apple_rtkit *old, *rtk;
+	int count, live;
+
+	if (!helper->adopted)
+		return apple_rtkit_helper_restore_own(helper);
+
+	/*
+	 * The restored tree still carries the handoff the image's boot stage
+	 * wrote. The resume boot's loader hands the same firmware over at the
+	 * same SRAM and no-map addresses (the inventory comes from the firmware
+	 * carveouts, not from the kernel allocator), so re-read it and check
+	 * that a CPU is running behind it.
+	 */
+	live = apple_rtkit_helper_live(helper);
+	if (live < 0) {
+		dev_err(dev, "hibernation restore: invalid live RTKit handoff: %d\n", live);
+		return live;
+	}
+	if (!live) {
+		dev_err(dev, "hibernation restore: no live RTKit session to re-adopt\n");
+		return -ENODEV;
+	}
+	count = apple_rtkit_helper_inherit_buffers(helper, buffers);
+	if (count < 0) {
+		dev_err(dev, "hibernation restore: invalid inherited RTKit buffers: %d\n", count);
+		return count;
+	}
+
+	/* As at probe, before the new session's RX starts. */
+	helper->strict_buffers = apple_rtkit_helper_strict(dev, count);
+	rtk = apple_rtkit_init_adopted_with_buffers(dev, helper, NULL, 0,
+						    &apple_rtkit_helper_ops, buffers, count);
+	if (IS_ERR(rtk)) {
+		dev_err(dev, "hibernation restore: failed to re-adopt RTKit: %pe\n", rtk);
+		return PTR_ERR(rtk);
+	}
+
+	/* The old object described an instance that no longer exists. */
+	old = helper->rtk;
+	helper->rtk = rtk;
+	apple_rtkit_free_retaining_buffers(old);
+	dev_dbg(dev, "re-adopted the running RTKit session after hibernation (%d retained buffers)\n",
+		count);
+	return 0;
 }
 
 static const struct dev_pm_ops apple_rtkit_helper_pm_ops = {
@@ -569,6 +801,8 @@ static const struct dev_pm_ops apple_rtkit_helper_pm_ops = {
 	.resume = pm_sleep_ptr(apple_rtkit_helper_resume),
 	.freeze = pm_sleep_ptr(apple_rtkit_helper_freeze),
 	.poweroff = pm_sleep_ptr(apple_rtkit_helper_freeze),
+	.thaw = pm_sleep_ptr(apple_rtkit_helper_thaw),
+	.restore = pm_sleep_ptr(apple_rtkit_helper_restore),
 };
 
 static const struct of_device_id apple_rtkit_helper_of_match[] = {
