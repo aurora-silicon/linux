@@ -2247,7 +2247,8 @@ impl SepData {
         }
         let user = UserPtr::from_addr(arg);
         match read_request(cmd, arg)? {
-            KeyRequest::Info => write_user(user, &info_for(self.profile.key_store == crate::profile::KeyStore::Variant5)),
+            // Password keys live in per-user bags (see `userbag`).
+            KeyRequest::Info => write_user(user, &info_for(self.profile.per_user_keybags)),
             KeyRequest::Create(mut req, policy) => {
                 may_create_machine_key(crate::shim::capable_admin(), crate::shim::current_euid())?;
                 let (acl, flags) = match policy {

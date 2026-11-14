@@ -537,8 +537,10 @@ impl SepData {
     }
 
     /// Test only (`key_selftest`): a ref-key under the designated user bag
-    /// `user` (outer handle `-uid`), which the caller has unlocked. Variant-5
-    /// key store only.
+    /// `user` (outer handle `-uid`), which the caller has unlocked. The key
+    /// type follows the key store, as for identity-bag keys: the 13.5 store
+    /// makes EC type 4 under a designated user bag as it does under the
+    /// identity bag.
     pub(crate) fn user_key_create_in_bag(
         &self,
         user: crate::sks::DesignateUser,
@@ -547,8 +549,12 @@ impl SepData {
         if !self.profile.per_user_keybags {
             return Err(EOPNOTSUPP);
         }
+        let key_type = match self.profile.key_store {
+            profile::KeyStore::Sepos13 { .. } => 4,
+            profile::KeyStore::Variant5 => 5,
+        };
         crate::xart_guard::close_policy_window();
-        self.sks_create_refkey_at(user.special_handle().value(), 9, 5, acl).ok_or(EIO)
+        self.sks_create_refkey_at(user.special_handle().value(), 9, key_type, acl).ok_or(EIO)
     }
 
     /// Unseal (enclave `ock` + kernel decrypt, as `user_key_unseal`) with a
