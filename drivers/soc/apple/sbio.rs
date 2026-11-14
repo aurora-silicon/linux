@@ -1158,6 +1158,16 @@ impl SepData {
         }
     }
 
+    /// Ends an enrolment or verify in progress as a CANCEL does: its caller
+    /// sees a failure it can retry. Returns whether one was ended.
+    pub(crate) fn bio_cancel_capture(&self) -> bool {
+        let woke = bio::abort_capture(&mut self.bio_session.lock());
+        if woke {
+            self.bio_wake();
+        }
+        woke
+    }
+
     pub(crate) fn attach_sensor(&self) {
         if let Err(e) = sensor::register_driver() {
             dev_err_ratelimited!(
