@@ -377,6 +377,13 @@ pub(crate) trait Gpu: Send + Sync {
     fn supports_vm_status(&self) -> bool {
         false
     }
+    /// Whether every submission of a user VM whose output fence ends with an error is counted
+    /// in its VM status before that fence is installed or signals, failed SUBMITs included,
+    /// so the count can be mirrored (DRM_ASAHI_FEATURE_VM_FENCE_ERROR_COUNT). A cumulative
+    /// output may also carry an earlier point's error, counted by that point's submission.
+    fn supports_vm_fence_error_count(&self) -> bool {
+        false
+    }
     /// Limits for independently executing queues, if supported by this GPU.
     fn queue_limits(&self) -> Option<uapi::drm_asahi_queue_limits> {
         None
@@ -387,6 +394,9 @@ pub(crate) trait Gpu: Send + Sync {
         if self.supports_vm_status() {
             flags |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS)
                 | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS_MIRROR);
+        }
+        if self.supports_vm_status() && self.supports_vm_fence_error_count() {
+            flags |= uapi::DRM_ASAHI_FEATURE_VM_FENCE_ERROR_COUNT as u64;
         }
         if self.queue_limits().is_some() {
             flags |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES);
