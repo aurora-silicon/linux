@@ -408,11 +408,26 @@ SYM_FUNC_START(secondary_holding_pen)
 	mov_q	x1, MPIDR_HWID_BITMASK
 	and	x2, x2, x1
 	adr_l	x3, secondary_holding_pen_release
+	adr_l	x6, secondary_pen_deep
 pen:	ldr	x4, [x3]
 	cmp	x4, x2
 	b.eq	secondary_startup
+	ldr	x5, [x6]
+	cbnz	x5, 1f
 	wfe
 	b	pen
+	/*
+	 * Restarted after a system sleep's commit: the Apple deep-sleep bits, then WFI, as
+	 * macOS's parked cores do. A core spinning here would keep its cluster from powering down.
+	 */
+1:	mrs_s	x4, sys_reg(3, 5, 15, 6, 2)
+	orr	x4, x4, #1
+	orr	x4, x4, #0x8000000000000000
+	msr_s	sys_reg(3, 5, 15, 6, 2), x4
+2:	dsb	sy
+	isb
+	wfi
+	b	2b
 SYM_FUNC_END(secondary_holding_pen)
 
 	/*
