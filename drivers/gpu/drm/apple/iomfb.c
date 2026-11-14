@@ -1697,6 +1697,11 @@ void dcp_hotplug(struct work_struct *work)
 		connected = READ_ONCE(connector->connected);
 	}
 
+	dev_info(dcp->dev,
+		 "w88-hp: gated:%d notify_only:%d state:%d connected:%d valid:%d crtc_off:%d t6020:%d cycles:%u\n",
+		 gated, notify_only, !!connector->base.state, connected,
+		 READ_ONCE(dcp->mode_state.valid), READ_ONCE(dcp->typec_crtc_off),
+		 dcp_uses_t6020_tunnel_flow(dcp), dcp->tunnel_power_cycles);
 	/*
 	 * DCP defers link training until we set a display mode. But we set
 	 * display modes from atomic_flush, so userspace needs to trigger a
