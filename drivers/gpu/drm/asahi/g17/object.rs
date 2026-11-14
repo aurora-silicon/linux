@@ -400,6 +400,28 @@ impl Allocator<'_> {
         )
     }
 
+    /// [`Self::lower`] for small objects that live as long as their queue. They are placed
+    /// at the top of the window: best fit puts them right after the free-list backing
+    /// allocated just before them, and once that backing is freed they would split the
+    /// region that free-list backing (hundreds of MiB, one contiguous block) needs.
+    pub(crate) fn lower_small(
+        &self,
+        size: usize,
+        align: u64,
+        prot: mmu::Prot,
+        cpu: CpuMap,
+    ) -> Result<KernelObject> {
+        let mut object = KernelObject::backing(self.dev, size, cpu)?;
+        let mapping = self.uat.kernel_lower_vm().map_in_range_highest(
+            &object.obj.gem, 0..object.size, align, self.uat.kernel_lower_dynamic_range(), prot,
+            mmu::UAT_PGSZ,
+        ).map_err(|error| if error == ENOSPC {
+            super::capacity::refused(super::capacity::Site::LowerVa)
+        } else { error })?;
+        object.mapping = Some(mapping);
+        Ok(object)
+    }
+
     /// [`Self::lower`] write-combined backing that is not counted as kernel memory: the
     /// caller charges it to a client ([`crate::memacct::Charge::user`]).
     pub(crate) fn lower_user_charged(

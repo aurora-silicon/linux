@@ -2785,6 +2785,28 @@ impl Vm {
         )
     }
 
+    /// Highest-address placement, for small objects that must not split the
+    /// large free region that big backings are placed in.
+    pub(crate) fn map_in_range_highest(
+        &self,
+        gem: &gem::Object,
+        object_range: Range<usize>,
+        alignment: u64,
+        range: Range<u64>,
+        prot: Prot,
+        guard_size: usize,
+    ) -> Result<KernelMapping> {
+        self.map_in_range_with_mode(
+            gem,
+            object_range,
+            alignment,
+            range,
+            prot,
+            guard_size,
+            mm::InsertMode::High,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn map_in_range_with_mode(
         &self,
