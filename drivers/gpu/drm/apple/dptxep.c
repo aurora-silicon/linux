@@ -260,7 +260,13 @@ int dptxport_set_hpd_timeout(struct apple_epic_service *service, bool hpd,
 
 int dptxport_set_hpd(struct apple_epic_service *service, bool hpd)
 {
-	return dptxport_set_hpd_timeout(service, hpd, MSEC_PER_SEC);
+	/*
+	 * A firmware 27 plug that never reported its display answers the HPD low only once
+	 * its own waits have run out (dcp_v27_ext_withdraw()).
+	 */
+	unsigned int ms = hpd ? 0 : READ_ONCE(service->ep->dcp->v27_hpd_low_ms);
+
+	return dptxport_set_hpd_timeout(service, hpd, ms ?: MSEC_PER_SEC);
 }
 
 /* The sink raised IRQ_HPD: the firmware services the request as a DP source. */

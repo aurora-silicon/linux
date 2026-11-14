@@ -7,6 +7,7 @@
 #include <linux/bitmap.h>
 #include <linux/clk.h>
 #include <linux/completion.h>
+#include <linux/crc32.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/iommu.h>
@@ -2539,6 +2540,70 @@ void dcp_modes_release(void *data)
 	dcp->modes = NULL;
 	dcp->nr_modes = 0;
 }
+/* Under mode_config.mutex, in get_modes: the identity of the EDID being published. */
+static void dcp_note_edid(struct apple_connector *connector, const struct drm_edid *drm_edid)
+{
+	const struct edid *edid = drm_edid_raw(drm_edid);
+
+	if (!edid)
+		return;
+	WRITE_ONCE(connector->edid_maker, get_unaligned_be16(edid->mfg_id));
+	WRITE_ONCE(connector->edid_product, get_unaligned_le16(edid->prod_code));
+	WRITE_ONCE(connector->edid_crc, crc32_le(~0, (const u8 *)edid, EDID_LENGTH));
+}
+
+/*
+ * An external display after a mode set: the link the firmware trained (the rate and lane count
+ * of its last link configuration), whether its mode set used DSC (its own line says so; "?"
+ * before the first), the size of its mode list, the published EDID's maker, product and CRC,
+ * and the mode. Printed once per connection and again when any of it changes, so that a
+ * display that returns from a sleep with another link, list or mode shows in the log.
+ * Only for a processor whose hardware description asks for it (T6050's external ones).
+ */
+void dcp_link_report(struct apple_dcp *dcp, const struct drm_display_mode *mode)
+{
+	static const char dsc[] = { '?', 'y', 'n' };
+	struct apple_connector *connector = dcp->connector;
+	u32 code = 0, lanes = 0, rate;
+	char line[sizeof(dcp->link_line)];
+	u64 generation;
+	unsigned int i;
+
+	if (!dcp->hw.link_report || !connector || dcp_has_panel(dcp))
+		return;
+	for (i = 0; i < ARRAY_SIZE(dcp->dptxport); i++) {
+		if (!READ_ONCE(dcp->dptxport[i].link_rate))
+			continue;
+		code = READ_ONCE(dcp->dptxport[i].link_rate);
+		lanes = READ_ONCE(dcp->dptxport[i].lane_count);
+		break;
+	}
+	switch (code) {
+	case LINK_RATE_UHBR10:
+		rate = 10000;
+		break;
+	case LINK_RATE_UHBR20:
+		rate = 20000;
+		break;
+	default:
+		/* The DPCD code: units of 270 Mb/s per lane */
+		rate = code * 270;
+	}
+	generation = READ_ONCE(connector->drm_edid_generation);
+	scnprintf(line, sizeof(line),
+		  "link %u Mb/s x %u, DSC %c, %u modes, EDID %04x:%04x crc %08x%s, mode %ux%u@%d",
+		  rate, lanes, dsc[READ_ONCE(dcp->link_dsc) % ARRAY_SIZE(dsc)],
+		  READ_ONCE(dcp->nr_modes), READ_ONCE(connector->edid_maker),
+		  READ_ONCE(connector->edid_product), READ_ONCE(connector->edid_crc),
+		  READ_ONCE(connector->drm_edid_firmware_derived) ? " (from the firmware's metadata)" : "",
+		  mode->hdisplay, mode->vdisplay, drm_mode_vrefresh(mode));
+	if (generation == dcp->link_line_generation && !strcmp(line, dcp->link_line))
+		return;
+	strscpy(dcp->link_line, line, sizeof(dcp->link_line));
+	dcp->link_line_generation = generation;
+	dev_info(dcp->dev, "ext %u: %s\n", dcp->index ? dcp->index - 1 : 0, line);
+}
+
 int dcp_get_modes(struct drm_connector *connector)
 {
 	struct apple_connector *apple_connector = to_apple_connector(connector);
@@ -2673,6 +2738,8 @@ int dcp_get_modes(struct drm_connector *connector)
 			dcp_clear_connector_edid(apple_connector);
 		} else {
 			apple_connector->drm_edid_firmware_derived = false;
+			if (dcp->hw.link_report)
+				dcp_note_edid(apple_connector, apple_connector->drm_edid);
 		}
 	} else {
 		u64 generation = 0;
@@ -2689,6 +2756,8 @@ int dcp_get_modes(struct drm_connector *connector)
 			apple_connector->drm_edid_firmware_derived = true;
 			apple_connector->drm_edid_generation = generation;
 			update = drm_edid_connector_update(connector, derived);
+			if (!update && dcp->hw.link_report)
+				dcp_note_edid(apple_connector, derived);
 			drm_edid_free(derived);
 			if (update || !(panel ? dcp_panel_metadata_current(dcp, generation) :
 				       dcp_firmware_metadata_current(dcp, generation))) {
@@ -3496,6 +3565,9 @@ bool dcp_crtc_mode_fixup(struct drm_crtc *crtc,
 
 	/* Can't be lit: a resume then restores its CRTC disabled, not failing every output. */
 	if (READ_ONCE(dcp->crashed))
+		return false;
+	/* Likewise the CRTC of a display released for a firmware sleep, until it is back. */
+	if (READ_ONCE(dcp->sleep_v27_torn))
 		return false;
 
 	if (iomfb_is_m4(dcp)) {

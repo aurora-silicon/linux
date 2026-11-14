@@ -4228,6 +4228,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL ||
 	    (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp_has_panel(dcp) && !paired))
 		dcp_external_hdr_hints(dcp, dcp->output_pq);
+	dcp_link_report(dcp, &crtc_state->mode);
 
 	return 0;
 }
