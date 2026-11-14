@@ -522,6 +522,8 @@ impl crate::g17::Shared {
         let requested = self
             .housekeeping
             .swap(false, core::sync::atomic::Ordering::AcqRel);
+        // M5: completions first (see `Shared::completion_first`).
+        let first = self.completion_first();
         let (recover, masks) = {
             let mut state = self.state.lock();
             let Some(firmware) = (*state).as_deref_mut() else {
@@ -549,7 +551,7 @@ impl crate::g17::Shared {
         if self.crashed.load(core::sync::atomic::Ordering::Acquire) {
             return Err(EIO);
         }
-        if firmware.init.is_m5() {
+        if firmware.init.is_m5() && (!first || recover) {
             // The completions above are signalled; the reports that arrived with them come after.
             firmware.drain_reports();
         }
@@ -578,6 +580,11 @@ impl crate::g17::Shared {
         };
         if self.crashed.load(core::sync::atomic::Ordering::Acquire) {
             return Err(EIO);
+        }
+        if firmware.init.is_m5() && first && !recover {
+            // M5: every completion of this pass is signalled now, the renders observed above
+            // too, so the reports that came with them no longer delay a render's fence.
+            firmware.drain_reports();
         }
         let now = super::now_ns();
         let compute = firmware

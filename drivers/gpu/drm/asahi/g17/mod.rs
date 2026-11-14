@@ -1241,6 +1241,9 @@ struct Shared {
     /// The next event pass runs every housekeeping step: set by every [`Self::queue_events`]
     /// request, not by the firmware's event notification ([`Self::queue_event_records`]).
     housekeeping: AtomicBool,
+    /// M5: an event pass signals its completions before the rest of its work
+    /// ([`Self::completion_first`]).
+    completion_first: bool,
     /// When an event pass last ran every housekeeping step, in ns.
     housekeeping_ns: AtomicU64,
     #[pin]
@@ -1467,6 +1470,14 @@ impl Shared {
 
     fn submitter(&self) -> Option<kernel::cpu::CpuId> {
         kernel::cpu::CpuId::from_u32(self.submitter.load(Ordering::Relaxed))
+    }
+
+    /// M5: an event pass drains its report rings after its render observation, so that the
+    /// renders it retires are signalled before the reports are read. A client that waits for
+    /// each job before it submits the next leaves the GPU idle from the job's end to its next
+    /// publication, and the reports are no scheduling input.
+    pub(super) fn completion_first(&self) -> bool {
+        self.completion_first
     }
 
     fn queue_grow(self: &Arc<Self>) {
@@ -1778,6 +1789,7 @@ impl Gpu {
                 compute_demand: AtomicU32::new(0),
                 work <- new_work!("g17::Shared::work"),
                 housekeeping: AtomicBool::new(true),
+                completion_first: m5,
                 housekeeping_ns: AtomicU64::new(0),
                 poll <- new_delayed_work!("g17::Shared::poll"),
                 idle <- new_delayed_work!("g17::Shared::idle"),
