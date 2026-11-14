@@ -284,6 +284,8 @@ struct apple_dcp_hw_data {
 	 */
 	bool s2r;
 	bool s2r_ext;
+	/* The firmware crashes on any mode but the 120 Hz boot timing, see dcp_mode_settable(). */
+	bool only_120hz_modes;
 };
 
 enum dcp_test_point {

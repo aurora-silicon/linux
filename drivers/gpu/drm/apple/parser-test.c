@@ -2052,6 +2052,7 @@ static void parser_internal_v27_only_120hz(struct kunit *test)
 	mutex_init(&dcp->dcpavserv.lock);
 	mutex_init(&dcp->hpd_mutex);
 	dcp->fw_compat = DCP_FIRMWARE_V_27_0;
+	dcp->hw.only_120hz_modes = true;
 	dcp->connector = connector;
 	dcp->modes = catalog;
 	dcp->nr_modes = 2;
@@ -2062,11 +2063,10 @@ static void parser_internal_v27_only_120hz(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, dcp_mode_valid(&connector->base, &catalog[0].mode), MODE_OK);
 	KUNIT_EXPECT_EQ(test, dcp_mode_valid(&connector->base, &catalog[1].mode), MODE_BAD);
 
-	/* An external dcpext (T6050 Studio Display) keeps every mode it lists. */
-	dcp->ext_failsafe = true;
+	/* The T8142 Air internal DCP (60 Hz panel, firmware 27.0) and the T6050 dcpext keep every mode. */
+	dcp->hw.only_120hz_modes = false;
 	KUNIT_EXPECT_EQ(test, dcp_mode_valid(&connector->base, &catalog[0].mode), MODE_OK);
 	KUNIT_EXPECT_EQ(test, dcp_mode_valid(&connector->base, &catalog[1].mode), MODE_OK);
-	dcp->ext_failsafe = false;
 	dcp->modes = NULL;
 	dcp->nr_modes = 0;
 	dcp_modes_release(dcp);
