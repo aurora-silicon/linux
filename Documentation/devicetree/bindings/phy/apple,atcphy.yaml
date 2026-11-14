@@ -115,32 +115,62 @@ allOf:
             required:
               - power-domains
       else:
-        properties:
-          reg:
-            minItems: 5
-            items:
-              - description: Common controls for all PHYs (USB2/3/4, DisplayPort, TBT)
-              - description: DisplayPort Alternate Mode PHY specific controls
-              - description: Type-C PHY AXI to Apple Fabric interconnect controls
-              - description: USB2 PHY specific controls
-              - description: USB3 PIPE interface controls
-              - description: Secondary eUSB2 PHY register bank (T8140)
-              - description:
-                  Power and hibernation control of the USB controller the PHY
-                  serves (T8140). The PHY drives that controller's reset and
-                  takes it through hibernation for a system sleep.
-          reg-names:
-            minItems: 5
-            items:
-              - const: core
-              - const: lpdptx
-              - const: axi2af
-              - const: usb2phy
-              - const: pipehandler
-              - const: usb2phy-reg
-              - const: pwrctl
-        required:
-          - power-domains
+        if:
+          properties:
+            compatible:
+              contains:
+                const: apple,t8142-atcphy
+        then:
+          properties:
+            reg:
+              minItems: 5
+              items:
+                - description: Common controls for all PHYs (USB2/3/4, DisplayPort, TBT)
+                - description: DisplayPort Alternate Mode PHY specific controls
+                - description: Type-C PHY AXI to Apple Fabric interconnect controls
+                - description: USB2 PHY specific controls
+                - description: USB3 PIPE interface controls
+                - description:
+                    Local IO address translation controls, for the DisplayPort
+                    calibration. Without it the PHY offers USB only.
+            reg-names:
+              minItems: 5
+              items:
+                - const: core
+                - const: lpdptx
+                - const: axi2af
+                - const: usb2phy
+                - const: pipehandler
+                - const: lioa
+          required:
+            - power-domains
+        else:
+          properties:
+            reg:
+              minItems: 5
+              items:
+                - description: Common controls for all PHYs (USB2/3/4, DisplayPort, TBT)
+                - description: DisplayPort Alternate Mode PHY specific controls
+                - description: Type-C PHY AXI to Apple Fabric interconnect controls
+                - description: USB2 PHY specific controls
+                - description: USB3 PIPE interface controls
+                - description: Secondary eUSB2 PHY register bank (T8140)
+                - description:
+                    Power and hibernation control of the USB controller the PHY
+                    serves (T8140). The PHY drives that controller's reset and
+                    takes it through hibernation for a system sleep.
+            reg-names:
+              minItems: 5
+              items:
+                - const: core
+                - const: lpdptx
+                - const: axi2af
+                - const: usb2phy
+                - const: pipehandler
+                - const: usb2phy-reg
+                - const: pwrctl
+          required:
+            - power-domains
   - if:
       properties:
         compatible:
@@ -168,6 +198,7 @@ allOf:
               enum:
                 - apple,t8132-atcphy
                 - apple,t8140-atcphy
+                - apple,t8142-atcphy
     then:
       properties:
         reg:
