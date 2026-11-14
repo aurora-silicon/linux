@@ -10,14 +10,16 @@ maintainers:
   - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
 
 description: |
-  The LLT escalation detector of a T6050 display engine's ADMAC. The ADMAC
+  The LLT escalation detector of a T6050 or T8142 display engine's ADMAC. The ADMAC
   driver sets it up through the ADMAC's apple,admac-control phandle, with
   the ADT's tunables, which the boot loader copies into the node.
 
 properties:
   compatible:
     items:
-      - const: apple,t6050-admac-control
+      - enum:
+          - apple,t6050-admac-control
+          - apple,t8142-admac-control
       - const: apple,admac-control
 
   reg:
