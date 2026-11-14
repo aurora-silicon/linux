@@ -434,6 +434,37 @@ fn decode_change_secret(body: &[u8]) -> Option<ChangeSecret<'_>> {
     })
 }
 
+/// The 13.5 store's change-secret request (opcode 7): version 1, then the
+/// variant-5 fields without its last word, as macOS 13 sends it: client,
+/// handle, the old and new secrets, two further blobs (empty, as in the
+/// variant-5 capture), a u8 flag widened to a word (0xff, as captured) and
+/// the generation option (0).
+const CHANGE_VARIANT_13: u32 = 1;
+
+fn encode_change_secret_13(user_handle: i32, old: &[u8], new: &[u8]) -> Result<crate::image::Body> {
+    if user_handle >= 0 || old.is_empty() || new.is_empty() {
+        return Err(EINVAL);
+    }
+    let mut body = crate::image::Body::new();
+    body.put_u32(CHANGE_VARIANT_13)?;
+    body.put_u64(CLIENT)?;
+    body.put_i32(user_handle)?;
+    body.put_blob(old)?;
+    body.put_blob(new)?;
+    body.put_blob(&[])?;
+    body.put_blob(&[])?;
+    body.put_u32(CHANGE_TRAILER)?;
+    body.put_u32(0)?;
+    Ok(body)
+}
+
+/// The 13.5 reply: version 1, then zero words (the generation out-value).
+fn decode_change_secret_reply_13(body: &[u8]) -> bool {
+    body.len() >= 4
+        && body[..4] == CHANGE_VARIANT_13.to_le_bytes()
+        && body[4..].iter().all(|b| *b == 0)
+}
+
 fn decode_change_secret_reply(body: &[u8]) -> bool {
     body == [3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
 }
@@ -1324,18 +1355,24 @@ impl crate::SepData {
         new: &[u8],
     ) -> Result<()> {
         let handle = user.special_handle().value();
+        let sepos13 = self.userbag_sepos13();
         let out = self
             .sks_step(crate::sks::SKS_CHANGE_SECRET_NAME, |_healthy| {
                 self.userbag_request(
                     crate::sks::SKS_CHANGE_SECRET_NAME,
-                    encode_change_secret(handle, old, new)?,
+                    if sepos13 {
+                        encode_change_secret_13(handle, old, new)?
+                    } else {
+                        encode_change_secret(handle, old, new)?
+                    },
                     |seq, len| Ok(crate::sks::encode_sks_change_secret(seq, len)),
                 )
             })
             .ok_or(EACCES)?;
         let body = self.userbag_body(crate::sks::SKS_CHANGE_SECRET_NAME, &out)?;
-        if !decode_change_secret_reply(body) {
-            return Err(EPROTO);
+        let ok = if sepos13 { decode_change_secret_reply_13(body) } else { decode_change_secret_reply(body) };
+        if !ok {
+            return Err(self.userbag_refused("change secret", body));
         }
         Ok(())
     }
@@ -1540,12 +1577,12 @@ impl crate::SepData {
             return Err(EOPNOTSUPP);
         }
         // Variant 5 (macOS 26 on the Neo) has every layout. The 13.5 store of
-        // M1/M2-generation Macs has create, import/export, unlock and lock;
-        // its password change, state query and FDE sealing are not captured.
+        // M1/M2-generation Macs has create, import/export, unlock, lock and
+        // password change; its state query and FDE sealing are not captured.
         let supported = match self.profile.key_store {
             crate::profile::KeyStore::Variant5 => true,
             crate::profile::KeyStore::Sepos13 { .. } => {
-                matches!(cmd, IOC_CREATE | IOC_IMPORT | IOC_EXPORT | IOC_UNLOCK | IOC_LOCK)
+                matches!(cmd, IOC_CREATE | IOC_IMPORT | IOC_EXPORT | IOC_UNLOCK | IOC_LOCK | IOC_CHANGE)
             }
         };
         if !supported {
@@ -1798,6 +1835,26 @@ mod tests {
         assert!(decode_create_reply_13(&[1, 0, 0, 0, 0xff, 0xff, 0xff, 0xff]).is_none());
         assert!(decode_create_reply_13(&[1, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0]).is_none());
         assert!(decode_create_reply(&[1, 0, 0, 0, 7, 0, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn sepos13_change_secret_layout_golden() {
+        let body = encode_change_secret_13(USER_HANDLE, b"ol", b"nw").expect("change");
+        let mut golden = [0u8; 52];
+        golden[0..4].copy_from_slice(&1u32.to_le_bytes());
+        golden[4..12].copy_from_slice(&CLIENT_LE);
+        golden[12..16].copy_from_slice(&USER_HANDLE.to_le_bytes());
+        golden[16..20].copy_from_slice(&2u32.to_le_bytes());
+        golden[20..22].copy_from_slice(b"ol");
+        golden[24..28].copy_from_slice(&2u32.to_le_bytes());
+        golden[28..30].copy_from_slice(b"nw");
+        // two empty blobs at 32 and 36
+        golden[40..44].copy_from_slice(&0xffu32.to_le_bytes());
+        assert_eq!(&body.as_slice()[..44], &golden[..44]);
+        assert_eq!(body.as_slice().len(), 48);
+        assert!(decode_change_secret_reply_13(&[1, 0, 0, 0, 0, 0, 0, 0]));
+        assert!(!decode_change_secret_reply_13(&[3, 0, 0, 0, 0, 0, 0, 0]));
+        assert!(!decode_change_secret_reply_13(&[1, 0, 0, 0, 5, 0, 0, 0]));
     }
 
     #[test]
