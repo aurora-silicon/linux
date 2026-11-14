@@ -72,6 +72,15 @@
 #define APPLE_ANS_LINEAR_ASQ_DB	 0x2490c
 #define APPLE_ANS_LINEAR_IOSQ_DB 0x24910
 
+/*
+ * ADT nvme-secure-reg-layout (T8152, macOS AppleANS2NVMeController with its
+ * 0x92a flag set): AQA/ASQ/ACQ and the I/O queue registers move up by
+ * 0x4000 and LINEAR_SQ_CTRL moves into the NVMMU block. CC/CSTS, the
+ * doorbells and the NVMMU TCB registers stay where they are.
+ */
+#define APPLE_ANS_SECURE_QREG_SHIFT	 0x4000
+#define APPLE_ANS_SECURE_LINEAR_SQ_CTRL	 0x2813c
+
 #define APPLE_NVMMU_NUM_TCBS	  0x28100
 #define APPLE_NVMMU_ASQ_TCB_BASE  0x28108
 #define APPLE_NVMMU_IOSQ_TCB_BASE 0x28110
@@ -225,6 +234,9 @@ struct apple_nvme_hw {
 	u32 sleep_shn;
 	/* The ANS is never reset through PMGR here, so no reset is named. */
 	bool reset_optional;
+	bool secure_reg_layout;
+	/* Also send the NVMe shutdown notification (CC.SHN) on removal. */
+	bool shutdown_notify;
 	u32 max_queue_depth;
 	unsigned long quirks;
 };
@@ -405,6 +417,17 @@ static int apple_nvme_read_handoff(struct apple_nvme *anv)
 		return -EINVAL;
 	anv->handoff_disabled = true;
 	return apple_nvme_can_adopt_rtkit(anv) ? 0 : -EIO;
+}
+
+static u32 apple_nvme_qreg(const struct apple_nvme *anv, u32 reg)
+{
+	return anv->hw->secure_reg_layout ? reg + APPLE_ANS_SECURE_QREG_SHIFT : reg;
+}
+
+static u32 apple_nvme_lsq_ctrl(const struct apple_nvme *anv)
+{
+	return anv->hw->secure_reg_layout ? APPLE_ANS_SECURE_LINEAR_SQ_CTRL :
+					     APPLE_ANS_LINEAR_SQ_CTRL;
 }
 
 static inline struct apple_nvme *queue_to_apple_nvme(struct apple_nvme_queue *q)
@@ -1383,10 +1406,13 @@ static int apple_nvme_disable_locked(struct apple_nvme *anv, bool shutdown)
 	 * The final system shutdown is the exception for SHN: without it the
 	 * controller counts every Linux shutdown as unsafe (SMART
 	 * unsafe_shutdowns) and recovers on the next start, which slows the
-	 * loader and the first seconds of I/O. A failed SHN changes nothing:
-	 * the CC.EN clear below still runs.
+	 * loader and the first seconds of I/O. Where the firmware handles it,
+	 * removal sends it too. A failed SHN changes nothing: the CC.EN clear
+	 * below still runs.
 	 */
-	if (READ_ONCE(anv->final_shutdown) && !apple_rtkit_is_crashed(anv->rtk)) {
+	if ((READ_ONCE(anv->final_shutdown) ||
+	     (shutdown && anv->hw->shutdown_notify && READ_ONCE(anv->removing))) &&
+	    !apple_rtkit_is_crashed(anv->rtk)) {
 		ret = nvme_disable_ctrl(&anv->ctrl, true);
 		if (ret)
 			dev_warn(anv->dev, "shutdown notification failed: %d\n", ret);
@@ -1922,10 +1948,10 @@ rtkit_ready:
 		 */
 		if (!anv->lsq_in_nvmmu) {
 			writel(APPLE_ANS_LINEAR_SQ_EN,
-			       anv->mmio_nvme + APPLE_ANS_LINEAR_SQ_CTRL);
+			       anv->mmio_nvme + apple_nvme_lsq_ctrl(anv));
 			if (anv->hw->needs_ioq_registers) {
 				u32 lsq_ctrl = readl(anv->mmio_nvme +
-						     APPLE_ANS_LINEAR_SQ_CTRL);
+						     apple_nvme_lsq_ctrl(anv));
 
 				if (!(lsq_ctrl & APPLE_ANS_LINEAR_SQ_EN)) {
 					dev_err(anv->dev,
@@ -1948,9 +1974,11 @@ rtkit_ready:
 		if (anv->hw->needs_ioq_registers)
 			ioqa_depth--;
 		ioqa = ioqa_depth | (ioqa_depth << 16);
-		writel(ioqa, anv->mmio_nvme + APPLE_ANS_MAX_PEND_CMDS_CTRL);
+		writel(ioqa, anv->mmio_nvme +
+			     apple_nvme_qreg(anv, APPLE_ANS_MAX_PEND_CMDS_CTRL));
 		if (anv->hw->needs_ioq_registers &&
-		    readl(anv->mmio_nvme + APPLE_ANS_MAX_PEND_CMDS_CTRL) != ioqa) {
+		    readl(anv->mmio_nvme +
+			  apple_nvme_qreg(anv, APPLE_ANS_MAX_PEND_CMDS_CTRL)) != ioqa) {
 			dev_err(anv->dev, "failed to program I/O queue aperture\n");
 			ret = -EIO;
 			goto out;
@@ -1964,11 +1992,11 @@ rtkit_ready:
 	/* Setup the admin queue */
 	aqa = APPLE_NVME_AQ_DEPTH - 1;
 	aqa |= aqa << 16;
-	writel(aqa, anv->mmio_nvme + NVME_REG_AQA);
+	writel(aqa, anv->mmio_nvme + apple_nvme_qreg(anv, NVME_REG_AQA));
 	apple_nvme_writeq(anv, anv->adminq.sq_dma_addr,
-			  anv->mmio_nvme + NVME_REG_ASQ);
+			  anv->mmio_nvme + apple_nvme_qreg(anv, NVME_REG_ASQ));
 	apple_nvme_writeq(anv, anv->adminq.cq_dma_addr,
-			  anv->mmio_nvme + NVME_REG_ACQ);
+			  anv->mmio_nvme + apple_nvme_qreg(anv, NVME_REG_ACQ));
 
 	if (anv->hw->has_lsq_nvmmu) {
 		/* Setup NVMMU for both queues */
@@ -2035,10 +2063,10 @@ rtkit_ready:
 		 * dedicated registers. Without them it crashes and its crash log
 		 * reports null I/O SQ and CQ addresses.
 		 */
-		apple_nvme_writeq(anv, anv->ioq.cq_dma_addr,
-				  anv->mmio_nvme + APPLE_ANS_IOCQ_REGISTER);
-		apple_nvme_writeq(anv, anv->ioq.sq_dma_addr,
-				  anv->mmio_nvme + APPLE_ANS_IOSQ_REGISTER);
+		apple_nvme_writeq(anv, anv->ioq.cq_dma_addr, anv->mmio_nvme +
+				  apple_nvme_qreg(anv, APPLE_ANS_IOCQ_REGISTER));
+		apple_nvme_writeq(anv, anv->ioq.sq_dma_addr, anv->mmio_nvme +
+				  apple_nvme_qreg(anv, APPLE_ANS_IOSQ_REGISTER));
 	}
 	nr_io_queues = 1;
 	if (anv->hw->has_queue_count) {
@@ -3203,6 +3231,22 @@ static const struct apple_nvme_hw apple_nvme_t6050_hw = {
 	.quirks = NVME_QUIRK_NO_APST | NVME_QUIRK_BROKEN_FUA,
 };
 
+/*
+ * T8152 uses the post-M4 queue setup, but its NVMe registers and NVMMU share
+ * one window (0x325cc0000 on J873) like T8103, with the secure register
+ * layout. There is no T8152 PMGR driver yet, so the controller has no reset
+ * line in the DT.
+ */
+static const struct apple_nvme_hw apple_nvme_t8152_hw = {
+	.has_lsq_nvmmu = true,
+	.needs_ioq_registers = true,
+	.reset_optional = true,
+	.secure_reg_layout = true,
+	.shutdown_notify = true,
+	.max_queue_depth = 64,
+	.quirks = NVME_QUIRK_BROKEN_FUA,
+};
+
 static const struct of_device_id apple_nvme_of_match[] = {
 	{ .compatible = "apple,t6041-nvme-ans2", .data = &apple_nvme_t6040_hw },
 	{ .compatible = "apple,t6050-nvme-ans2", .data = &apple_nvme_t6050_hw },
@@ -3211,6 +3255,7 @@ static const struct of_device_id apple_nvme_of_match[] = {
 	{ .compatible = "apple,t8132-nvme-ans2", .data = &apple_nvme_t8132_hw },
 	{ .compatible = "apple,t8140-nvme-ans2", .data = &apple_nvme_t8140_hw },
 	{ .compatible = "apple,t8142-nvme-ans2", .data = &apple_nvme_t8142_hw },
+	{ .compatible = "apple,t8152-nvme-ans2", .data = &apple_nvme_t8152_hw },
 	{ .compatible = "apple,nvme-ans2", .data = &apple_nvme_t8103_hw },
 	{},
 };
