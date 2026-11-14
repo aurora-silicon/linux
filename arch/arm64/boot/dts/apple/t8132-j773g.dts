@@ -260,6 +260,33 @@
 	brcm,board-type = "apple,sakhalin";
 };
 
+/*
+ * The built-in PCIe controller serves two endpoints here: the radio on
+ * port 0 and the AQC113 Ethernet on port 2 (ADT pci-bridge2, with its own
+ * DART dart-apcie2). The managed radio contract admits port 0 only, so
+ * this board does not use it: Linux owns the controller and both DARTs,
+ * and maps the Ethernet's requester ID to dart-apcie2 stream 1 (ADT
+ * mapper-apcie2).
+ */
+&dart_apcie0 {
+	/delete-property/ apple,managed-sids;
+	/delete-property/ apple,dma-range;
+};
+
+&dart_apcie2 {
+	status = "okay";
+};
+
+&pcie0 {
+	/delete-property/ apple,managed-sids;
+	iommu-map = <0x100 &dart_apcie0 1 2>,
+		    <0x200 &dart_apcie2 1 1>;
+};
+
+&port02 {
+	status = "okay";
+};
+
 #include "hwmon-common.dtsi"
 #include "hwmon-mini.dtsi"
 
