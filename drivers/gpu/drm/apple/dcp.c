@@ -4219,7 +4219,7 @@ int dcp_start(struct platform_device *pdev)
 				 ret);
 
 		if (dcp->hw.iomfb_method_profile ==
-		    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
+		    DCP_IOMFB_METHODS_H17P_EXTERNAL || dcp->hw.dptx_controller) {
 			ret = dptx_controller_init(dcp);
 			if (ret)
 				return dev_err_probe(dcp->dev, ret,
@@ -8882,13 +8882,20 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6050_dcpext = {
 /*
  * T8142's external processors (dcpext0/1: the Airs' two USB-C ports, the
  * J704's HDMI) run the internal DCP's firmware 27 image and are left running
- * idle by iBoot, like T6050's. One DPTX port each, behind an ATC PHY.
+ * idle by iBoot, like T6050's. Their services sit where macOS 27.2 binds
+ * them on a J815 (IORegistry under iop-dcpextN-nub): AppleDCPDPTXController
+ * (dcpav-/dcpdp-controller-epic, units 0 and 1) on DPTX_CONTROLLER_ENDPOINT,
+ * and AppleDCPDPTXRemotePort (dcpdptx-port-epic, units 0 and 1) on
+ * DPTX_ENDPOINT, not on firmware 27's DPTX_ENDPOINT_V2. The J704's tree
+ * (dmitzsaz) opens the same ones. Type-C uses port 0.
  */
 static const struct apple_dcp_hw_data apple_dcp_hw_t8142_dcpext = {
-	.num_dptx_ports = 1,
+	.num_dptx_ports = 2,
 	.adopt_live_session = true,
 	.firmware_compat = DCP_FIRMWARE_V_27_0,
 	.sink_metadata_edid = true,
+	.dptx_endpoint = DPTX_ENDPOINT,
+	.dptx_controller = true,
 };
 
 static const struct of_device_id of_match[] = {
