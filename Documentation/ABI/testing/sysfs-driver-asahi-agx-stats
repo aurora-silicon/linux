@@ -86,14 +86,15 @@ Description:
 		           older than the age limit below or its epoch ended.
 		           unsupported is a fixed property of the firmware,
 		           taken from the driver's per-firmware match data, and
-		           never changes at runtime: the V25G83 and V26A428
-		           firmwares accept tag 0x10 but never emit it, and no
-		           other record carries the current pstate, so
-		           pstate_status always reads unsupported on G16S and
-		           G17P. utilisation_status is never unsupported on
-		           these firmwares. Numeric metrics are printed only
-		           while their capability is valid; otherwise their
-		           value is the string unsupported.
+		           never changes at runtime: the V25G83 firmware accepts
+		           tag 0x10 but never emits it, and no other record of
+		           it carries the current pstate, so pstate_status
+		           always reads unsupported on G16S. V26A428 reports
+		           its state in other records (see below).
+		           utilisation_status is never unsupported on these
+		           firmwares. Numeric metrics are printed only while
+		           their capability is valid; otherwise their value is
+		           the string unsupported.
 
 		util_tiler_percent, util_renderer_percent, util_device_percent
 		           Unsigned integer percent (0..100), from tag 0x13
@@ -107,7 +108,9 @@ Description:
 
 		pstate     Logical selector 0..10 from tag 0x10 word 6, on a
 		           firmware whose match data says it emits tag 0x10
-		           (none of the current G16S/G17P firmwares do). Words 1
+		           (none of the current G16S/G17P firmwares do). A
+		           firmware that reports its state in tags 0x19 and
+		           0x1b (V26A428) never has tag 0x10 decoded. Words 1
 		           and 2 form a little-endian u64 firmware timestamp.
 		           The first timestamp establishes a baseline. Invalid
 		           selectors and backwards timestamps remove pstate
@@ -116,39 +119,53 @@ Description:
 
 		requested_frequency_hz, achieved_frequency_hz, busy_ns,
 		power_mw, temperature_raw
-		           Always unsupported on these firmwares. The statistics
-		           packet does not identify performance table A or B;
-		           a selector is neither a host request nor a measured
-		           frequency. No qualified busy-time duration, power unit
-		           or temperature field is available.
+		           Always unsupported on V25G83 (G16S). No record of it
+		           carries a state, a qualified busy-time duration, a
+		           power unit or a temperature.
 
-		M5 firmware (the M5 command set of the shared G17 backend) uses
-		the same snapshot and keys, with these differences:
+		The V26A428 firmware, which the A18 Pro (T8140, G17P) and M5
+		run, uses the same snapshot and keys, with these differences:
 
 		pstate_status, pstate
 		           Supported. The firmware reports the performance state
 		           in effect in tag 0x1b, words 1 and 3, which must
-		           agree: an index 1..13 into the board's performance
-		           state table. The end of the interval record before it
-		           (tag 0x19, words 1 and 2) is its firmware timestamp.
-		           A report that names state 0 or a state beyond the
-		           table removes pstate validity. The state reads stale
-		           while the GPU cores are gated.
+		           agree: an index into the performance state table,
+		           1..10 on the A18 Pro, 1..13 on M5. The end of the
+		           interval record before it (tag 0x19, words 1 and 2)
+		           is its firmware timestamp. A report that names state
+		           0 or a state beyond the table removes pstate
+		           validity. While the GPU cores are gated, pstate reads
+		           valid 0: the GPU is off. Power-up starts a new epoch,
+		           stale until the next report. The driver asks for full
+		           performance while work is in flight, which the
+		           firmware takes as a floor, so an A18 Pro at work
+		           normally reads its top state, 10; a lower state there
+		           is a firmware limit, such as a thermal one.
 
 		achieved_frequency_hz
-		           The frequency of pstate in the board's performance
-		           state table, in Hz, while pstate_status is valid.
+		           The frequency of pstate in Hz, while pstate_status is
+		           valid, and 0 for state 0. M5: the board's performance
+		           state table. A18 Pro: the device tree operating point
+		           that the state's entry of performance table A names.
+		           Its records do not name the table; at its top state a
+		           sustained FP32 FMA load completes faster than table
+		           B's frequency there allows, so it runs table A.
 
 		busy_ns    Cumulative u64 since the driver was bound. The tag
 		           0x13 records of this firmware carry a timestamp in
-		           24 MHz ticks (words 1 and 2). Each record credits the
-		           window since the previous record of its epoch at its
-		           device utilisation. A record more than two 8 ms
+		           24 MHz ticks (words 1 and 2), one every 8 ms on M5
+		           and every 16 ms on the A18 Pro. Each record credits
+		           the window since the previous record of its epoch at
+		           its device utilisation. A record more than two
 		           periods after the previous one, or with an earlier
 		           timestamp, only starts a new window, so time the GPU
-		           spent gated is never credited. MEASURED on T6050
+		           spent gated is never credited, and a load sparser
+		           than one period reads low. MEASURED on T6050
 		           (J716c): 871 and 863 ms for three 300 ms compute jobs
-		           at full clock (905 and 919 ms of work).
+		           at full clock (905 and 919 ms of work). MEASURED on
+		           T8140 (J700), 24 traces of GPU stress loads: within
+		           about 20% of the union of the commands' own execution
+		           intervals for loads busy more than half the time.
 
 		requested_frequency_hz, power_mw, temperature_raw
 		           Unsupported.
