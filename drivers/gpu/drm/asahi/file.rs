@@ -568,6 +568,9 @@ impl File {
         if Self::supports_user_memory(reg_data) {
             params.features |= uapi::DRM_ASAHI_FEATURE_USERPTR as u64;
         }
+        if Self::supports_residency_control(reg_data) {
+            params.features |= uapi::DRM_ASAHI_FEATURE_GEM_RESIDENCY as u64;
+        }
 
         let size = core::mem::size_of::<uapi::drm_asahi_params_global>().min(data.size.try_into()?);
 
@@ -994,6 +997,34 @@ impl File {
             data.handle
         );
 
+        Ok(0)
+    }
+
+    /// Whether this GPU takes residency requests (DRM_IOCTL_ASAHI_GEM_RESIDENCY): only G17 user
+    /// VMs release idle memory under pressure.
+    fn supports_residency_control(reg_data: &driver::AsahiDrmRegistrationData<'_>) -> bool {
+        reg_data.gpu.as_any().is::<crate::g17::Gpu>()
+    }
+
+    /// IOCTL: gem_residency: Keep an object's memory resident, or return it to the default
+    /// policy.
+    pub(crate) fn gem_residency(
+        _device: &AsahiDrmDevice,
+        reg_data: &driver::AsahiDrmRegistrationData<'_>,
+        data: &mut uapi::drm_asahi_gem_residency,
+        file: &DrmFile,
+    ) -> Result<u32> {
+        if !Self::supports_residency_control(reg_data) {
+            return Err(EOPNOTSUPP);
+        }
+        if data.flags & !uapi::drm_asahi_gem_residency_flags_DRM_ASAHI_GEM_RESIDENCY_KEEP != 0 {
+            return Err(EINVAL);
+        }
+        let gem = gem::Object::lookup_handle(file, data.handle)?;
+        gem::set_keep_resident(
+            &gem,
+            data.flags & uapi::drm_asahi_gem_residency_flags_DRM_ASAHI_GEM_RESIDENCY_KEEP != 0,
+        )?;
         Ok(0)
     }
 

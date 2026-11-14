@@ -42,6 +42,7 @@ struct asahi_gpu_memory {
 	u64 refused;
 	u64 limit;
 	u64 client_limit;
+	u64 user_kept;
 };
 
 struct asahi_stats_attribute {
@@ -182,7 +183,11 @@ static ssize_t agx_stats_show(struct device *dev,
 /*
  * GPU memory held by the driver, in bytes: user objects created (committed)
  * and held by the GPU (resident), held kernel objects, the limits that admit
- * user objects (0: none) and the number of refused creations.
+ * user objects (0: none), the number of refused creations, and the size of
+ * the user objects that userspace asked to keep resident (user_kept), whether
+ * their memory is held at the moment or not. The request is a hint: when
+ * reclaim releases idle memory of a VM, its kept objects go after the others
+ * (see DRM_IOCTL_ASAHI_GEM_RESIDENCY).
  */
 static ssize_t gpu_memory_show(struct device *dev,
 			       struct device_attribute *attr, char *buf)
@@ -204,6 +209,8 @@ static ssize_t gpu_memory_show(struct device *dev,
 		       (unsigned long long)READ_ONCE(mem->client_limit));
 	n += scnprintf(buf + n, PAGE_SIZE - n, "refused %llu\n",
 		       (unsigned long long)READ_ONCE(mem->refused));
+	n += scnprintf(buf + n, PAGE_SIZE - n, "user_kept %llu\n",
+		       (unsigned long long)READ_ONCE(mem->user_kept));
 
 	return n;
 }
@@ -228,7 +235,8 @@ int asahi_sysfs_register(struct device *dev, const void *snapshot,
 	BUILD_BUG_ON(sizeof(struct asahi_qualified_stats) != 56);
 	BUILD_BUG_ON(offsetof(struct asahi_gpu_memory, refused) != 24);
 	BUILD_BUG_ON(offsetof(struct asahi_gpu_memory, client_limit) != 40);
-	BUILD_BUG_ON(sizeof(struct asahi_gpu_memory) != 48);
+	BUILD_BUG_ON(offsetof(struct asahi_gpu_memory, user_kept) != 48);
+	BUILD_BUG_ON(sizeof(struct asahi_gpu_memory) != 56);
 
 	BUILD_BUG_ON(offsetof(struct asahi_stats_snapshot, pstate) != 16);
 	BUILD_BUG_ON(offsetof(struct asahi_stats_snapshot, busy_ns) != 40);
