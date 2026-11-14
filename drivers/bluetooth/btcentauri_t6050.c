@@ -77,6 +77,8 @@ struct cen_bt {
 	u16 le_rx_head, le_rx_post;
 	struct cen_aux_state aux[ARRAY_SIZE(cen_aux_specs)];
 	bool ipc_requested, running;
+	/* Released for a sleep: the N1 is reset and Function 2 enumerated again after it */
+	bool asleep;
 	u8 native_startup_steps;
 	bool connection_command_supported, connection_status_pending;
 };
@@ -923,6 +925,9 @@ stop:
 static void cen_remove(struct pci_dev *pdev)
 {
 	struct cen_bt *bt = pci_get_drvdata(pdev);
+
+	if (bt->asleep)
+		return;
 	hci_unregister_dev(bt->hdev);
 	cen_hci_close(bt->hdev);
 	cen_free_irqs(bt);
@@ -931,13 +936,47 @@ static void cen_remove(struct pci_dev *pdev)
 	cen_stop(bt);
 }
 
+/*
+ * A firmware sleep (every N1 DMA mapping is released before the link goes down, the firmware
+ * told nothing): the HCI device goes away and the arena is freed. The firmware never masters this
+ * arena again: Function 2's bus mastering stays off (the PCI core saves Command after this), and
+ * the N1 is warm-reset after the wake before any new boot hands out a new arena.
+ */
 static int cen_suspend(struct device *dev)
 {
-	return pci_save_state(to_pci_dev(dev));
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct cen_bt *bt = pci_get_drvdata(pdev);
+	u16 command;
+	int ret;
+
+	if (!bt->asleep && apple_centauri_sleep_reboot(pdev)) {
+		hci_unregister_dev(bt->hdev);
+		cen_hci_close(bt->hdev);
+		cen_free_irqs(bt);
+		cancel_work_sync(&bt->io_work);
+		hci_free_dev(bt->hdev);
+		bt->hdev = NULL;
+		pci_clear_master(pdev);
+		ret = pci_read_config_word(pdev, PCI_COMMAND, &command);
+		if (ret || (command & PCI_COMMAND_MASTER) ||
+		    !pci_wait_for_pending_transaction(pdev))
+			dev_warn(dev, "Beta before the sleep: DMA not stopped; retaining DMA arena\n");
+		else
+			dma_free_coherent(dev, CEN_ARENA_SIZE, bt->arena, bt->dma);
+		bt->arena = NULL;
+		bt->asleep = true;
+		dev_dbg(dev, "Beta down for the sleep\n");
+	}
+	return pci_save_state(pdev);
 }
 
 static int cen_resume(struct device *dev)
 {
+	struct cen_bt *bt = pci_get_drvdata(to_pci_dev(dev));
+
+	/* Normally queued by Control's resume; for a suspend stopped before Control's */
+	if (bt->asleep)
+		apple_centauri_sleep_rewake(to_pci_dev(dev));
 	return 0;
 }
 
