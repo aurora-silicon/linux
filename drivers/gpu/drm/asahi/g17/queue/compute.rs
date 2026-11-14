@@ -615,6 +615,19 @@ pub(crate) struct Growth {
     phase: PoolPhase,
 }
 
+/// See [`Queue::admission_state`]. Its fields are read only through `Debug`, by the report.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct AdmissionState {
+    installed: bool,
+    m5_install_end: Option<u32>,
+    consumer: Option<u32>,
+    configuration: bool,
+    ordinal: u32,
+    quarantined: bool,
+    awaiting_witness: bool,
+}
+
 pub(crate) struct Queue {
     owner: Option<u64>,
     /// Scheduler/work pages of an exited last owner whose context was dropped;
@@ -3060,6 +3073,21 @@ impl Queue {
         Ok(())
     }
 
+    /// The installation and health state a timed-out publication reports (diagnostics):
+    /// whether the queue was installed, the item an M5 installation waits for the firmware to
+    /// consume and how far it got, an outstanding configuration, and quarantine.
+    pub(crate) fn admission_state(&self) -> AdmissionState {
+        AdmissionState {
+            installed: self.installed,
+            m5_install_end: self.m5_install,
+            consumer: self.graph.cursors().ok().map(|cursors| cursors.consumer),
+            configuration: self.configuration.is_some(),
+            ordinal: self.ordinal,
+            quarantined: self.quarantined,
+            awaiting_witness: self.awaiting_witness,
+        }
+    }
+
     fn install_m5(&mut self, packet: &Arc<Packet>, host: &mut impl Host) -> Result {
         // Installed, configuration released and a kick published: nothing to check, and no
         // reads of shared memory under the device mutex.
@@ -3097,6 +3125,21 @@ impl Queue {
             host.publish_outer(policy.priority(), &crate::g17::fw::channels::WorkSlot::new(DataMaster::Compute,
                 self.graph.graph.gpu_va(), self.qid(), producer.try_into()?, true)?)?;
             self.outer_started = 1 << policy.priority();
+            // The queue's host-port configuration and validity go out before the installation's
+            // doorbell, so that the queue is configured when the firmware acts on it. A
+            // publication writes its host-port transaction after its doorbell, the work
+            // notification that wakes gated cores (see the publication path); as we understand
+            // it, that order matters for the advance the transaction ends with. The
+            // installation's transaction has no advance: its ring holds no kick yet, and the first
+            // publication configures the queue again with its kick. The configuration record is
+            // already visible, so a failed host-port write must not keep the doorbell back: the
+            // doorbell alone installs the queue, as it did before.
+            if let Err(error) = crate::g17::fw::m5::queue::HardwareSubmission::configure_compute(
+                self.qid(), self.kick.low_va(), policy.priority(),
+            ).and_then(|submission| host.submit_m5(&submission)) {
+                pr_warn!("asahi: G17: M5 queue {} installs without its host-port configuration: {:?}\n",
+                    self.qid(), error);
+            }
             host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
             Err(EAGAIN)
         })();

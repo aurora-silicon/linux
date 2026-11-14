@@ -25,7 +25,7 @@ use super::{
     kick, qos,
     queue::{self, admission, compute},
 };
-use super::preparation::Admission;
+use super::preparation::{Admission, AdmissionWait, ADMISSION_WAITS};
 use core::sync::atomic::{fence, Ordering};
 use kernel::{prelude::*, sync::Arc};
 
@@ -2384,112 +2384,167 @@ impl Backend {
         let admission = Admission::new(deadline, &check);
         let progress = &self.shared.progress;
         let outer = self.outer_domain();
-        loop {
-            admission.check()?;
-            let observed = progress.observe();
-            let claimed = outer.as_ref().map(|domain| domain.observe());
-            if !self.sources_published(packet)? {
-                let recovering = self.shared.state.lock().as_deref().is_some_and(|firmware| {
-                    firmware.recovery.pending()
-                        || super::recovery::Memory::recovery_state(&firmware.init).unwrap_or(0) != 0
-                });
-                if recovering {
-                    admission.extend_for_recovery();
-                }
-                self.shared.queue_events();
-                self.wait_release(progress, observed, &admission)?;
-                continue;
-            }
-            // All DRM dependencies were satisfied before this scheduler callback.
-            // Recheck on every retry: pressure may yield an idle binding between
-            // admission and publication without changing this logical queue.
-            if !bound {
-                demand.get_or_insert_with(|| ComputeDemand::new(&self.shared));
-                Backend::ensure_compute(self, required, &admission)?;
+        // The waits below share one budget. When it runs out, the report names where it went.
+        let result = (|| -> Result {
+            loop {
                 admission.check()?;
-            }
-            let lease = self.shared.preparations.enter_until(&admission)?;
-            // Work states free as this context's earlier commands retire.
-            match packet.completion.work_state()?.acquire(crate::g17::job::Engine::Compute) {
-                Err(error) if error == EBUSY => {
-                    drop(lease);
+                let observed = progress.observe();
+                let claimed = outer.as_ref().map(|domain| domain.observe());
+                if !self.sources_published(packet)? {
+                    let recovering = self.shared.state.lock().as_deref().is_some_and(|firmware| {
+                        firmware.recovery.pending()
+                            || super::recovery::Memory::recovery_state(&firmware.init).unwrap_or(0) != 0
+                    });
+                    if recovering {
+                        admission.extend_for_recovery();
+                    }
                     self.shared.queue_events();
-                    self.wait_release(progress, observed, &admission)?;
+                    let wait = if recovering { AdmissionWait::Recovery } else { AdmissionWait::Sources };
+                    admission.timed(wait, || self.wait_release(progress, observed, &admission))?;
                     continue;
                 }
-                result => {
-                    result?;
+                // All DRM dependencies were satisfied before this scheduler callback.
+                // Recheck on every retry: pressure may yield an idle binding between
+                // admission and publication without changing this logical queue.
+                if !bound {
+                    demand.get_or_insert_with(|| ComputeDemand::new(&self.shared));
+                    admission.timed(AdmissionWait::Channel, || {
+                        Backend::ensure_compute(self, required, &admission)
+                    })?;
+                    admission.check()?;
                 }
-            }
-            let mut state = self.shared.state.lock();
-            let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
-            if !lease.is_current() {
-                drop(state);
-                continue;
-            }
-            admission.check()?;
-            if self
-                .shared
-                .crashed
-                .load(core::sync::atomic::Ordering::Acquire)
-            {
-                return Err(EIO);
-            }
-            let recovery_state = super::recovery::Memory::recovery_state(&firmware.init)?;
-            if firmware.recovery.pending() || recovery_state != 0 {
-                admission.extend_for_recovery();
-                drop(state);
-                drop(lease);
-                self.shared.queue_events();
-                self.wait_release(progress, observed, &admission)?;
-                continue;
-            }
-            firmware.replay_compute(deferred)?;
-            if !firmware.init.compute_vm_cached(self.context.vm())
-                || !firmware.queues.compute_bound(self.owner, &self.context, required)?
-            {
-                bound = false;
-                drop(state);
-                drop(lease);
-                continue;
-            }
-            let held = self.claim_outer(firmware, crate::g17::job::Engine::Compute)?;
-            if let (false, Some(domain), Some(claimed)) = (held, &outer, claimed) {
-                // The shared work ring has no unclaimed room: consumption or returned claims
-                // free it.
-                drop(state);
-                drop(lease);
-                self.shared.queue_events();
-                self.wait_release(domain, claimed, &admission)?;
-                continue;
-            }
-            let dependencies = firmware.queues.render_prefix(self.owner, packet)?;
-            admission.check()?;
-            let result = self.publish_claimed(firmware, packet, dependencies.as_slice(), deferred);
-            if !packet.is_published()
-                && (matches!(result, Err(EAGAIN))
-                    || (matches!(result, Err(EBUSY))
-                        && (firmware.recovery.pending()
-                            || super::recovery::Memory::recovery_state(&firmware.init)? != 0)))
-            {
-                // Recovery or backpressure: nothing is firmware-visible. Other
-                // queues keep submitting and the event worker retires meanwhile.
-                if firmware.recovery.pending()
-                    || super::recovery::Memory::recovery_state(&firmware.init)? != 0
+                let lease = admission.timed(AdmissionWait::Preparation, || {
+                    self.shared.preparations.enter_until(&admission)
+                })?;
+                // Work states free as this context's earlier commands retire.
+                match packet.completion.work_state()?.acquire(crate::g17::job::Engine::Compute) {
+                    Err(error) if error == EBUSY => {
+                        drop(lease);
+                        self.shared.queue_events();
+                        admission.timed(AdmissionWait::WorkState, || {
+                            self.wait_release(progress, observed, &admission)
+                        })?;
+                        continue;
+                    }
+                    result => {
+                        result?;
+                    }
+                }
+                let mut state = self.shared.state.lock();
+                let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
+                if !lease.is_current() {
+                    drop(state);
+                    continue;
+                }
+                admission.check()?;
+                if self
+                    .shared
+                    .crashed
+                    .load(core::sync::atomic::Ordering::Acquire)
                 {
-                    admission.extend_for_recovery();
+                    return Err(EIO);
                 }
-                drop(state);
-                drop(lease);
-                self.shared.queue_events();
-                self.wait_release(progress, observed, &admission)?;
-                continue;
+                let recovery_state = super::recovery::Memory::recovery_state(&firmware.init)?;
+                if firmware.recovery.pending() || recovery_state != 0 {
+                    admission.extend_for_recovery();
+                    drop(state);
+                    drop(lease);
+                    self.shared.queue_events();
+                    admission.timed(AdmissionWait::Recovery, || {
+                        self.wait_release(progress, observed, &admission)
+                    })?;
+                    continue;
+                }
+                firmware.replay_compute(deferred)?;
+                if !firmware.init.compute_vm_cached(self.context.vm())
+                    || !firmware.queues.compute_bound(self.owner, &self.context, required)?
+                {
+                    bound = false;
+                    drop(state);
+                    drop(lease);
+                    continue;
+                }
+                let held = self.claim_outer(firmware, crate::g17::job::Engine::Compute)?;
+                if let (false, Some(domain), Some(claimed)) = (held, &outer, claimed) {
+                    // The shared work ring has no unclaimed room: consumption or returned claims
+                    // free it.
+                    drop(state);
+                    drop(lease);
+                    self.shared.queue_events();
+                    admission.timed(AdmissionWait::OuterRoom, || {
+                        self.wait_release(domain, claimed, &admission)
+                    })?;
+                    continue;
+                }
+                let dependencies = firmware.queues.render_prefix(self.owner, packet)?;
+                admission.check()?;
+                let result = self.publish_claimed(firmware, packet, dependencies.as_slice(), deferred);
+                if !packet.is_published()
+                    && (matches!(result, Err(EAGAIN))
+                        || (matches!(result, Err(EBUSY))
+                            && (firmware.recovery.pending()
+                                || super::recovery::Memory::recovery_state(&firmware.init)? != 0)))
+                {
+                    // Recovery or backpressure: nothing is firmware-visible. Other
+                    // queues keep submitting and the event worker retires meanwhile.
+                    let recovering = firmware.recovery.pending()
+                        || super::recovery::Memory::recovery_state(&firmware.init)? != 0;
+                    if recovering {
+                        admission.extend_for_recovery();
+                    }
+                    drop(state);
+                    drop(lease);
+                    self.shared.queue_events();
+                    let wait = if recovering { AdmissionWait::Recovery } else { AdmissionWait::Publication };
+                    admission.timed(wait, || self.wait_release(progress, observed, &admission))?;
+                    continue;
+                }
+                if result.is_ok() {
+                    self.remember_direct(&firmware.queues);
+                }
+                return result;
             }
-            if result.is_ok() {
-                self.remember_direct(&firmware.queues);
-            }
-            return result;
+        })();
+        if matches!(result, Err(error) if error == EBUSY) && !packet.is_published() && admission.expired() {
+            self.report_admission_expiry(&admission);
         }
+        result
+    }
+
+    /// Warns about a compute publication whose admission budget ran out, so that the lost
+    /// device it causes can be attributed: the time spent in each wait, the owner's queue
+    /// installation state and the recovery state. Rate-limited to the first few per boot.
+    fn report_admission_expiry(&self, admission: &Admission<'_>) {
+        static REPORTS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        const ADMISSION_REPORTS: u32 = 8;
+        const NAMES: [&str; ADMISSION_WAITS] =
+            ["sources", "channel", "preparation", "work state", "recovery", "outer room", "publication"];
+        if REPORTS.load(Ordering::Relaxed) >= ADMISSION_REPORTS {
+            return;
+        }
+        let (total, spent) = admission.spent_ms();
+        // Read under the device mutex, print after it is released.
+        let (queue, pending, recovery_state) = {
+            let state = self.shared.state.lock();
+            let Some(firmware) = (*state).as_deref() else {
+                return;
+            };
+            (
+                firmware.queues.compute(self.owner).map(|queue| queue.admission_state()),
+                firmware.recovery.pending(),
+                super::recovery::Memory::recovery_state(&firmware.init),
+            )
+        };
+        if REPORTS.fetch_add(1, Ordering::Relaxed) >= ADMISSION_REPORTS {
+            return;
+        }
+        pr_warn!(
+            "asahi: G17: compute publication of owner {} gave up after {} ms; ms by wait: {}={} {}={} {}={} {}={} {}={} {}={} {}={}; queue {:?}; recovery pending {}, state {:?}\n",
+            self.owner, total,
+            NAMES[0], spent[0], NAMES[1], spent[1], NAMES[2], spent[2], NAMES[3], spent[3],
+            NAMES[4], spent[4], NAMES[5], spent[5], NAMES[6], spent[6],
+            queue, pending, recovery_state,
+        );
     }
 }
 
