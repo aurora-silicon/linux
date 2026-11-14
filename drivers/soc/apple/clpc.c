@@ -105,11 +105,18 @@ enum apple_clpc_rail {
  *	from a deferrable timer
  * @low_power_khz: CPU frequency ceiling of the low-power platform profile,
  *	taken up to the next table frequency; 0 for no platform profile
- * @low_power_machine: the machine compatible @low_power_khz was read for; SoCs
- *	sharing this CLPC without it get no low-power profile. NULL for any
+ * @low_power_machines: per-machine ceilings, first match wins, ended by an
+ *	empty entry; a machine matching none gets no low-power profile. NULL
+ *	for @low_power_khz on any machine
  * @low_power_mw: package power (the SMC's PHPC key) the low-power profile
  *	holds the CPU clusters to; 0 for none
  */
+/* A machine's low-power CPU ceiling, from its ADT's cpu-low-power-frequency-max */
+struct apple_clpc_low_power {
+	const char *machine;
+	unsigned int khz;
+};
+
 struct apple_clpc_hw {
 	unsigned int rail[APPLE_CLPC_RAILS];
 	unsigned int sustain;
@@ -127,7 +134,7 @@ struct apple_clpc_hw {
 	const char *ane_cluster_machine;
 	bool idle_on_time;
 	unsigned int low_power_khz;
-	const char *low_power_machine;
+	const struct apple_clpc_low_power *low_power_machines;
 	unsigned int low_power_mw;
 };
 
@@ -1288,6 +1295,28 @@ static const struct platform_profile_ops apple_clpc_profile_ops = {
 	.profile_set = apple_clpc_profile_set,
 };
 
+static bool apple_clpc_machine_is(const char *compatible)
+{
+	return of_machine_is_compatible(compatible);
+}
+
+/*
+ * The low-power ceiling for this machine: the first of hw->low_power_machines
+ * the machine is compatible with, or hw->low_power_khz without a table.
+ */
+static unsigned int apple_clpc_low_power_khz(const struct apple_clpc_hw *hw,
+					     bool (*compatible)(const char *))
+{
+	const struct apple_clpc_low_power *lp;
+
+	if (!hw->low_power_machines)
+		return hw->low_power_khz;
+	for (lp = hw->low_power_machines; lp->machine; lp++)
+		if (compatible(lp->machine))
+			return lp->khz;
+	return 0;
+}
+
 static int apple_clpc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -1431,8 +1460,7 @@ static int apple_clpc_probe(struct platform_device *pdev)
 
 	clpc->profile = PLATFORM_PROFILE_BALANCED;
 	clpc->power_next = jiffies;
-	if (!clpc->hw->low_power_machine || of_machine_is_compatible(clpc->hw->low_power_machine))
-		clpc->low_power_khz = clpc->hw->low_power_khz;
+	clpc->low_power_khz = apple_clpc_low_power_khz(clpc->hw, apple_clpc_machine_is);
 	if (clpc->low_power_khz && IS_REACHABLE(CONFIG_ACPI_PLATFORM_PROFILE)) {
 		struct device *ppdev;
 
@@ -1549,6 +1577,17 @@ static const struct apple_clpc_hw apple_clpc_hw_t8140 = {
 };
 
 /*
+ * macOS's Low Power mode CPU ceiling, the ADT's cpu-low-power-frequency-max:
+ * 2616 MHz on the 14" J614c, 2808 MHz on the 16" J616c (as on T6050). Other
+ * M4 Max machines keep the J616c's value.
+ */
+static const struct apple_clpc_low_power apple_clpc_t6041_low_power[] = {
+	{ "apple,j614c", 2616000 },
+	{ "apple,t6041", 2808000 },
+	{ }
+};
+
+/*
  * T6040: DCS states 0-5 on rail 0, fabric states 0-2 on rail 1. No cluster
  * runs below a quarter of its maximum (P 1260 of 4512 MHz, E 1020 of
  * 2592 MHz), so the first column only completes the table. A busy cluster
@@ -1589,13 +1628,11 @@ static const struct apple_clpc_hw apple_clpc_hw_t6040 = {
 	.ane_cluster_khz = 3756000,
 	.ane_cluster_machine = "apple,t6040",
 	/*
-	 * The M4 Max's ADT has macOS's Low Power mode CPU ceiling,
-	 * cpu-low-power-frequency-max = 2808 MHz, as T6050's does. macOS's package
-	 * target in that mode is not measured here, so the profile has the
-	 * ceiling only. The M4 Pro's value is not checked: not for it yet.
+	 * macOS's package target in Low Power mode is not measured here, so the
+	 * profile has the CPU ceiling only. The M4 Pro's value is not checked:
+	 * not for it yet.
 	 */
-	.low_power_khz = 2808000,
-	.low_power_machine = "apple,t6041",
+	.low_power_machines = apple_clpc_t6041_low_power,
 };
 
 /*
@@ -1903,7 +1940,48 @@ static void apple_clpc_ane_wake_removal_test(struct kunit *test)
 	apple_clpc_ane_put(ane);
 }
 
+/* The machine compatibles apple_clpc_low_power_khz() sees in the test below */
+static const char *const *apple_clpc_test_machine;
+
+static bool apple_clpc_test_machine_is(const char *compatible)
+{
+	const char *const *c;
+
+	for (c = apple_clpc_test_machine; *c; c++)
+		if (!strcmp(*c, compatible))
+			return true;
+	return false;
+}
+
+static void apple_clpc_low_power_machine_test(struct kunit *test)
+{
+	static const char *const j614c[] = { "apple,j614c", "apple,t6041", NULL };
+	static const char *const j616c[] = { "apple,j616c", "apple,t6041", NULL };
+	static const char *const j575c[] = { "apple,j575c", "apple,t6041", NULL };
+	static const char *const j614s[] = { "apple,j614s", "apple,t6040", NULL };
+	static const struct apple_clpc_hw any = { .low_power_khz = 2808000 };
+
+	/* The ADTs' cpu-low-power-frequency-max: 2616 MHz (J614c), 2808 MHz (J616c). */
+	apple_clpc_test_machine = j614c;
+	KUNIT_EXPECT_EQ(test, apple_clpc_low_power_khz(&apple_clpc_hw_t6040,
+						       apple_clpc_test_machine_is), 2616000u);
+	apple_clpc_test_machine = j616c;
+	KUNIT_EXPECT_EQ(test, apple_clpc_low_power_khz(&apple_clpc_hw_t6040,
+						       apple_clpc_test_machine_is), 2808000u);
+	apple_clpc_test_machine = j575c;
+	KUNIT_EXPECT_EQ(test, apple_clpc_low_power_khz(&apple_clpc_hw_t6040,
+						       apple_clpc_test_machine_is), 2808000u);
+	/* The M4 Pro shares the CLPC but gets no profile. */
+	apple_clpc_test_machine = j614s;
+	KUNIT_EXPECT_EQ(test, apple_clpc_low_power_khz(&apple_clpc_hw_t6040,
+						       apple_clpc_test_machine_is), 0u);
+	/* Without a table, the ceiling applies to any machine (T6050). */
+	KUNIT_EXPECT_EQ(test, apple_clpc_low_power_khz(&any, apple_clpc_test_machine_is),
+			2808000u);
+}
+
 static struct kunit_case apple_clpc_cases[] = {
+	KUNIT_CASE(apple_clpc_low_power_machine_test),
 	KUNIT_CASE(apple_clpc_ane_demand_hold_test),
 	KUNIT_CASE(apple_clpc_ane_states_test),
 	KUNIT_CASE(apple_clpc_ane_cluster_test),

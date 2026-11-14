@@ -27,9 +27,11 @@ def main():
     dense_samples = re.search(r'^#define APPLE_CLPC_GPU_DENSE_SAMPLES\s.*$', source, re.M).group(0)
     reasons = '\n'.join(re.findall(r'^#define APPLE_CLPC_REASON_\w+\s.*$', source, re.M))
     types = '\n'.join(item(source, s) + ';' for s in [
-        'struct apple_clpc_hw {', 'struct apple_clpc_vote {'])
-    tables = '\n'.join(item(source, 'static const struct apple_clpc_hw ' + n) + ';'
-                       for n in ['apple_clpc_hw_t8132', 'apple_clpc_hw_t8140', 'apple_clpc_hw_t6040'])
+        'struct apple_clpc_low_power {', 'struct apple_clpc_hw {', 'struct apple_clpc_vote {'])
+    tables = '\n'.join(
+        [item(source, 'static const struct apple_clpc_low_power apple_clpc_t6041_low_power[]') + ';'] +
+        [item(source, 'static const struct apple_clpc_hw ' + n) + ';'
+         for n in ['apple_clpc_hw_t8132', 'apple_clpc_hw_t8140', 'apple_clpc_hw_t6040']])
     methods = '\n'.join(item(source, s) for s in [
         'static unsigned int apple_clpc_vote(', 'static u32 apple_clpc_floor(',
         'static bool apple_clpc_gpu_streaming(',
