@@ -226,6 +226,12 @@ fn register_channels<const N: usize>(
     offset: usize,
     types: [u32; N],
 ) -> Result<(FakehidRegistration, IIORegistration<MsgProc, N>)> {
+    dev_info!(
+        pdev.as_ref(),
+        "w86 ALS service: ep={:#04x} ch={:#x}",
+        service.endpoint,
+        service.channel
+    );
     let data = AopSensorData::new_channels(pdev.as_ref().into(), types, MsgProc(offset))?;
     let listener = FakehidRegistration::new(aop.clone(), service, data.clone())?;
     enable_als(aop.as_ref(), pdev, &service, offset)?;

@@ -775,6 +775,24 @@ impl AFKEndpoint {
             );
         }
         if ehdr.category == EPIC_CATEGORY_REPORT {
+            // w86 debug (M5 ALS ENODATA): the first 24 reports per endpoint and channel.
+            {
+                use core::sync::atomic::{AtomicU8, Ordering::Relaxed};
+                static LOGGED: [AtomicU8; 4096] = [const { AtomicU8::new(0) }; 4096];
+                let slot = &LOGGED[(usize::from(self.index) << 4) | (qhdr.channel as usize & 0xf)];
+                if slot.load(Relaxed) < 24 {
+                    slot.fetch_add(1, Relaxed);
+                    dev_info!(
+                        client.dev,
+                        "w86 report: ep={:#04x} ch={:#x} subtype={:#x} len={} head={:02x?}",
+                        self.index,
+                        qhdr.channel,
+                        subtype,
+                        data.len(),
+                        &data[..data.len().min(0x30)]
+                    );
+                }
+            }
             if subtype == EPIC_SUBTYPE_STD_SERVICE {
                 if data.len() < EPIC_ANNOUNCE_LEN {
                     return Err(EMSGSIZE);
