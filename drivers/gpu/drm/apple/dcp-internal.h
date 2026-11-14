@@ -289,6 +289,11 @@ struct apple_dcp_hw_data {
 	 */
 	bool dptx_controller;
 	/*
+	 * The endpoint the DP/HDMI audio interface (dcpav-audio-interface-epic)
+	 * is announced on, where it is not AV_AUDIO_ENDPOINT_DESKTOP. 0: that.
+	 */
+	u8 av_audio_endpoint;
+	/*
 	 * With H17P firmware: a firmware-driven system sleep stops the internal processor's
 	 * firmware and powers it down, as DPMS off does, then restarts it warm, see
 	 * dcp_s2r_suspend(). @s2r_ext: the same for an external one, see dcp_s2r_ext_suspend().
@@ -1198,6 +1203,12 @@ static inline bool dcp_is_v27_external(const struct apple_dcp *dcp)
 static inline bool dcp_is_v14_7_panel(const struct apple_dcp *dcp)
 {
 	return dcp->fw_compat == DCP_FIRMWARE_V_14_7 && !dcp->external;
+}
+
+/* The endpoint of a desktop/firmware-27 external's audio interface. */
+static inline u32 dcp_av_audio_endpoint(const struct apple_dcp *dcp)
+{
+	return dcp->hw.av_audio_endpoint ?: AV_AUDIO_ENDPOINT_DESKTOP;
 }
 
 /* Native external pipe: start its audio endpoint, once, after the first EDID. */

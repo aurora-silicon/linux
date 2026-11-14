@@ -466,7 +466,7 @@ static bool afk_compact_capable(struct apple_dcp_afkep *ep)
 	       (ep->dcp->fw_compat == DCP_FIRMWARE_M4 && ep->dcp->afk_alloc) ||
 	       ((ep->dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL ||
 		 dcp_is_v27_external(ep->dcp)) &&
-		ep->endpoint == AV_AUDIO_ENDPOINT_DESKTOP);
+		ep->endpoint == dcp_av_audio_endpoint(ep->dcp));
 }
 
 static u32 afk_compact_next_status(struct apple_epic_service *service)

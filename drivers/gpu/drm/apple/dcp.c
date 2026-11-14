@@ -8922,6 +8922,15 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8142_dcpext = {
 	.sink_metadata_edid = true,
 	.dptx_endpoint = DPTX_ENDPOINT,
 	.dptx_controller = true,
+	/*
+	 * The firmware's endpoint name table (t8142dcp, 27.2) runs
+	 * dcpav-controller-ep (0x24), -power, -sac, -device, -service,
+	 * dcpav-interface-ep (0x29), dcpdptx-port-ep (0x2a), dcpdptx-hdcp-ep
+	 * (0x2b): the dcpav-*-interface-epic services, audio among them, are
+	 * on 0x29, and 0x2b carries HDCP (macOS 27.2 binds
+	 * dcpdptx-hdcp-interface there on a J815).
+	 */
+	.av_audio_endpoint = AV_ENDPOINT,
 };
 
 static const struct of_device_id of_match[] = {
