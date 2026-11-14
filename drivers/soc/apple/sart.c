@@ -506,6 +506,10 @@ static const struct of_device_id apple_sart_of_match[] = {
 		.data = &sart_ops_v4,
 	},
 	{
+		.compatible = "apple,t8152-sart",
+		.data = &sart_ops_v4,
+	},
+	{
 		.compatible = "apple,t6000-sart",
 		.data = &sart_ops_v3,
 	},

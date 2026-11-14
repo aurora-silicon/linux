@@ -1,0 +1,249 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/display/apple,t8152-dcp-iboot.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T8152 DCP on the iBoot display interface
+
+maintainers:
+  - Thomas Glanzmann <thomas@glanzmann.de>
+
+description: |
+  The Display Coprocessor (DCP) of the Apple T8152 SoC runs RTKit firmware
+  that offers a small iBoot display interface (disp0-service) next to the
+  full IOMobileFramebuffer protocol. This binding describes the DCP driven
+  through that interface, together with the DisplayPort PHY its DPTX port
+  is routed to. The DCP fetches through its own DART, the display pipe
+  scans out through another one, which sees each scanout buffer at the same
+  address.
+
+properties:
+  compatible:
+    const: apple,t8152-dcp-iboot
+
+  apple,afk-active-endpoints:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 65535
+    description:
+      Runtime handoff from the bootloader. Bit N records that AFK endpoint
+      0x20 + N is running and must acknowledge shutdown before a new session
+      starts. A zero bit means stopped. The bootloader inserts this only
+      for controllers whose complete endpoint state it owns, and reserves
+      the old session's buffers. The driver refuses takeover if absent.
+      This property must not be hard-coded in a board device tree.
+
+  reg:
+    minItems: 2
+    maxItems: 7
+
+  reg-names:
+    oneOf:
+      - items:
+          - const: coproc
+          - const: atc
+          - const: dp-clock
+          - const: atc-ps
+          - const: atc-psd
+          - const: aux
+          - const: aux-ps
+        minItems: 5
+        description:
+          DCP coprocessor, ATC DisplayPort PHY (USB-C), the PMGR clock
+          control of its DisplayPort link, the PMGR power states the PHY
+          depends on, and optionally the AP DisplayPort AUX controller that
+          reads the sink's EDID with its PMGR power state
+      - items:
+          - const: coproc
+          - const: phy-core
+          - const: phy-apb
+          - const: aux
+          - const: aux-ps
+          - const: phy-ps
+          - const: coproc-ps
+        description:
+          DCP coprocessor, the HDMI dptx-phy blocks, the AP
+          DisplayPort AUX controller that reads the sink's EDID with its
+          PMGR power state, and the read-only PMGR power states for the
+          HDMI PHY and DCPEXT CPU. The driver only adopts the bootloader's
+          powered link and must check these states before accessing the PHY.
+      - items:
+          - const: coproc
+          - const: dp-clock
+          - const: aux
+          - const: aux-ps
+        minItems: 2
+        description:
+          DCP coprocessor, the PMGR clock control of the ATC DisplayPort
+          link (shared by the ports), and optionally the AP DisplayPort AUX
+          controller with its PMGR power state; the USB-C ports follow as
+          usb-c child nodes
+
+  apple,tunable-pre:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: register offset in the ATC PHY block
+        - description: mask
+        - description: value
+    description:
+      ATC PHY tunables (ADT ACIOPHY_CMN and CIOPLL_CORE defaults), applied
+      before the lane crossbar setup when the PHY starts from cold.
+
+  apple,tunable-post:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: register offset in the ATC PHY block
+        - description: mask
+        - description: value
+    description:
+      ATC PHY tunables (ADT ATC_FABRIC, DPPLL and AUX defaults), applied
+      after the lane crossbar setup.
+
+  apple,hdmi:
+    type: boolean
+    description:
+      The DCP drives the HDMI port through the dedicated dptx-phy and an
+      on-board DisplayPort-to-HDMI converter, instead of an ATC USB-C PHY.
+
+  apple,usb-pd:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The USB-C port's PD controller (SPMI), polled for the DisplayPort alt
+      mode connection and the plug orientation.
+
+  hpd-gpios:
+    maxItems: 1
+    description:
+      Hot plug detect line of the connector, if the AP can read it (J873g
+      HDMI); without it the sink is assumed to stay connected.
+
+  mboxes:
+    maxItems: 1
+
+  iommus:
+    maxItems: 1
+    description: DCP DART stream
+
+  scanout:
+    type: object
+    additionalProperties: false
+    description:
+      The display pipe's scanout stream. Its DART is locked with its own
+      root, so it is a separate device that sees each scanout buffer at the
+      DCP's address.
+    properties:
+      iommus:
+        maxItems: 1
+      dma-coherent: true
+    required:
+      - iommus
+
+  dma-coherent: true
+
+  apple,die:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: Die of the DPTX connection target, 0 if absent.
+
+  "#address-cells":
+    const: 2
+
+  "#size-cells":
+    const: 2
+
+  ranges: true
+
+patternProperties:
+  "^usb-c@[0-9a-f]+$":
+    type: object
+    additionalProperties: false
+    description:
+      A USB-C port whose ATC PHY the DCP can drive. The DCP drives one port
+      at a time, the one a DisplayPort sink is plugged into.
+    properties:
+      reg:
+        maxItems: 3
+      reg-names:
+        items:
+          - const: atc
+          - const: atc-ps
+          - const: atc-psd
+        description:
+          ATC DisplayPort PHY, the PMGR power states it depends on (DP_0,
+          DP_1 and USB_AON) and its common power domain (PSD)
+      apple,dfp-endpoint:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        description: The ATC's display-crossbar0 DFP endpoint (ATC instance).
+      apple,usb-pd:
+        $ref: /schemas/types.yaml#/definitions/phandle
+        description: The port's PD controller (SPMI).
+      apple,tunable-pre:
+        $ref: /schemas/types.yaml#/definitions/uint32-matrix
+        description: As the node's apple,tunable-pre, for this port's PHY.
+      apple,tunable-post:
+        $ref: /schemas/types.yaml#/definitions/uint32-matrix
+        description: As the node's apple,tunable-post, for this port's PHY.
+    required:
+      - reg
+      - reg-names
+      - apple,dfp-endpoint
+      - apple,usb-pd
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - mboxes
+  - iommus
+  - scanout
+
+additionalProperties: false
+
+examples:
+  - |
+    soc {
+      #address-cells = <2>;
+      #size-cells = <2>;
+
+      display@286e00000 {
+        compatible = "apple,t8152-dcp-iboot";
+        reg = <0x2 0x86e00000 0x0 0x74000>,
+              <0x4 0x13000000 0x0 0x84000>,
+              <0x3 0x0002005c 0x0 0x4>,
+              <0x3 0x082900c0 0x0 0x104>,
+              <0x3 0x03a13a00 0x0 0xc0>;
+        reg-names = "coproc", "atc", "dp-clock", "atc-ps", "atc-psd";
+        mboxes = <&dcp_mbox>;
+        iommus = <&dcp_dart 23>;
+
+        scanout {
+          iommus = <&disp0_dart 0>;
+        };
+      };
+
+      display@296e00000 {
+        compatible = "apple,t8152-dcp-iboot";
+        reg = <0x2 0x96e00000 0x0 0x74000>,
+              <0x3 0x0002005c 0x0 0x4>;
+        reg-names = "coproc", "dp-clock";
+        #address-cells = <2>;
+        #size-cells = <2>;
+        ranges;
+        mboxes = <&dcp_mbox>;
+        iommus = <&dcp_dart 23>;
+
+        scanout {
+          iommus = <&disp0_dart 0>;
+        };
+
+        usb-c@413000000 {
+          reg = <0x4 0x13000000 0x0 0x84000>,
+                <0x3 0x082900c0 0x0 0x104>,
+                <0x3 0x03a13a00 0x0 0xc0>;
+          reg-names = "atc", "atc-ps", "atc-psd";
+          apple,dfp-endpoint = <3>;
+          apple,usb-pd = <&hpm3>;
+        };
+      };
+    };
