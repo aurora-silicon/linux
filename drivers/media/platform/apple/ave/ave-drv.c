@@ -161,7 +161,8 @@ static const struct ave_variant ave_t6050 = {
 /*
  * The M5 (T8142) with the macOS 27.0 stub runs the 26A428 build of the
  * firmware compiled for its chip (AppleAVE2FW_H17G, 9013.45.1, the version
- * T6050 runs): TEXT 0x154000 and DATA 0x12c000, TEXT CRC 8a3784bd.
+ * T6050 runs): TEXT 0x154000 and DATA 0x12c000, TEXT CRC 8a3784bd. The 27.2
+ * stub's build (9013.55.1) has the same segment sizes, so its CRC selects it.
  *
  * The chip identity comes from AppleAVE2's soc-id table (ADT ave soc-id
  * "t8142"): device 27, generation 16. The 26A428 firmware carries the same
@@ -170,10 +171,18 @@ static const struct ave_variant ave_t6050 = {
  * T6050's SVE register block, so the idle word at mailbox +0x118 is cleared
  * before the start as there. The coprocessor is the A18 Pro's.
  */
+static const struct ave_fw_build ave_t8142_builds[] = {
+	{ "26A428", 0x154000, 0x12c000, AVE_FW_TEXT_CRC_T8142_26A428 },
+	/* macOS 27.2 (and 27.2.1): CRC from the image, 26A428's command layout. */
+	{ "26B123", 0x154000, 0x12c000, AVE_FW_TEXT_CRC_T8142_26B123 },
+};
+
 static const struct ave_variant ave_t8142 = {
 	.regs = &ave_coproc_v40,
 	.fw_text_size = 0x154000,
 	.fw_data_size = 0x12c000,
+	.builds = ave_t8142_builds,
+	.build_count = ARRAY_SIZE(ave_t8142_builds),
 	.boot_device_id = 27,
 	.boot_arg_value = AVE_COPROC_BOOT_ARG_VALUE,
 	.timebase_multiplier = 1,
