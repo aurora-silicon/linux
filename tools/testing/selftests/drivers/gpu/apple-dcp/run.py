@@ -34,6 +34,7 @@ import boot
 import m4
 import display
 import colorimetry
+import external_vrr
 
 
 def parking_unit(root):
@@ -56,6 +57,8 @@ def main():
                                        'orientation-faults', 'backend-change', 'safe-first',
                                        'failed-flip-return', 'live-park'))
     tests = [
+        ('display', 'external-vrr-callbacks', external_vrr.callbacks, ((),), ()),
+        ('rate', 'external-vrr-publication', external_vrr.publication, ((),), ()),
         ('display', 'panel-colorimetry', lambda r: colorimetry.panel(r, output), ((),), ('-Wno-unused-function', '-Wno-unused-const-variable')),
         ('audio', 'compact-audio-reply-bounds', audio.reply_bounds, ((),), ()),
         ('display', 'desktop-gamma', desktop.gamma, ((),), ()),
@@ -126,7 +129,7 @@ def main():
         ('lifecycle', 'resource-profile', lifecycle.profile, ((),), ('-Wno-sign-compare',)),
         ('lifecycle', 'firmware-provider', lifecycle.firmware, ((),), ()),
         ('lifecycle', 'readiness', lifecycle.readiness, ((),), ()),
-        ('lifecycle', 'vrr-rejection', lifecycle.vrr, ((),), ()),
+        ('lifecycle', 'vrr-admission', lifecycle.vrr, ((),), ()),
         ('lifecycle', 'power-reply', lifecycle.power_reply, ((),), ()),
         ('lifecycle', 'dispatcher-scope', lifecycle.dispatcher, ((),), ()),
     ]
@@ -147,7 +150,8 @@ def main():
             elif isinstance(unit, tuple):
                 unit, cases = unit
             if unit is not None and name in ('provider-admission', 'ordered-rx',
-                    'publication-hpd', 'panel-dimensions', 'stale-crtc-poweroff', 'readiness'):
+                    'publication-hpd', 'external-vrr-publication', 'panel-dimensions',
+                    'stale-crtc-poweroff', 'readiness'):
                 # These fixtures select older external-display backends. The M4
                 # transport is covered by the separate m4 group, not mocked here.
                 prefix = ('#include <stdbool.h>\n#include <assert.h>\n'

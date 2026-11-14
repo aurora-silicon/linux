@@ -660,6 +660,15 @@ struct apple_dcp {
 	bool typec_hpd_held;
 	bool use_timestamps;
 	bool vrr_enabled;
+	/* Serialized with H17P external mode/flush transactions. */
+	struct {
+		bool requested;
+		bool savings_valid;
+		u32 savings;
+		dcp_callback_t next;
+		void *cookie;
+		struct iomfb_set_matrix_req matrix;
+	} external_vrr;
 	/*
 	 * The mode set asks for a PQ signal; output_pq: the one set carries it;
 	 * output_edr: a panel shows the PQ content as EDR, edr_sent: swaps
