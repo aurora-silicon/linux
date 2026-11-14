@@ -839,6 +839,17 @@ static int apple_dpin_dcp_set_active(void *data, bool active)
 	return ret;
 }
 
+bool apple_dp_tunnel_binding_live(void *data)
+{
+	const struct apple_dpin_binding *binding = data;
+	struct apple_dpin_ctx *c = binding->ctx;
+
+	guard(mutex)(&c->lock);
+	return c->state.alive &&
+	       apple_dpin_token_access(&c->tokens, binding->generation);
+}
+EXPORT_SYMBOL_GPL(apple_dp_tunnel_binding_live);
+
 static bool apple_dpin_provider_get(void *data)
 {
 	struct apple_dpin_binding *binding = data;
