@@ -157,8 +157,12 @@ static int mux_control_deselect(struct mux_control *m) { (void)m;event('C');xbar
     '''+available
     actual=actual.replace(block(actual,'static bool dcp_typec_route_available('), 'static bool dcp_typec_route_fixed_output_busy(struct apple_dcp_typec_route *r) { (void)r;return false; }\n'+available+block(dcp,'static bool dcp_typec_route_available('),1)
     actual=actual.replace(block(actual,'static int dcp_typec_route_deactivate('),block(dcp,dcp.rindex('static int dcp_typec_route_deactivate(')),1)
+    if '/* DCP_T8142_ROUTE_APPLY_STUB */' in actual:
+        # The real route application below replaces the quiesce fixture's stub.
+        k=actual.index('/* DCP_T8142_ROUTE_APPLY_STUB */')
+        actual=actual[:k]+'static int dcp_typec_route_apply(struct typec_mux_dev *mux, struct typec_mux_state *state);'+actual[actual.index('/* DCP_T8142_ROUTE_APPLY_STUB_END */')+len('/* DCP_T8142_ROUTE_APPLY_STUB_END */'):]
     pos=actual.index('static struct typec_mux_dev phy_provider')
-    actual=actual[:pos]+block(dcp,'static bool dcp_typec_route_is_dp(')+'\n'+block(dcp,'static int dcp_typec_route_set(')+'\n'+actual[pos:]
+    actual=actual[:pos]+('' if 'static bool dcp_t8142_ext(' in actual else 'static bool dcp_t8142_ext(struct apple_dcp *dcp) { (void)dcp; return false; }\n')+'static int dcp_typec_route_apply(struct typec_mux_dev *mux, struct typec_mux_state *state);\n'+block(dcp,'static bool dcp_typec_route_is_dp(')+'\n'+block(dcp,'static int dcp_typec_route_set(')+'\n'+block(dcp,dcp.rindex('static int dcp_typec_route_apply('))+'\n'+actual[pos:]
     actual=actual.replace(block(actual,'static int display_set('),'''static int display_set(struct typec_mux_dev *m,struct typec_mux_state *s) { event('S');return dcp_typec_route_set(m,s); }''',1)
     actual=actual.replace("(void)m;assert(s->mode==TYPEC_STATE_SAFE);event('L');", "(void)m;(void)s;event('L');",1)
     actual=actual.replace('connector=(struct connector){.connected=true};','connector=(struct connector){.connected=true};',1)

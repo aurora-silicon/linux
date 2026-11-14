@@ -35,12 +35,13 @@ def parking(root):
 struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
     bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
-    struct { void *usb3_dp; } tunables;
+    /* dp_lioa/dp_common_config: T8142's banked DisplayPort calibration. */
+    struct { void *usb3_dp, *dp_lioa, *dp_common_config; } tunables;
     /* A sleep took the USB host's domains down; never set here. */
     bool sleep_dead;
 
     const struct atcphy_hw *hw;
-    struct { unsigned char *core, *lpdptx, *pipehandler, *usb2phy; } regs;
+    struct { unsigned char *core, *lpdptx, *pipehandler, *usb2phy, *lioa; } regs;
     struct reset_controller_dev rcdev;
     void *dev;
     int lock, dp_link_rate;
@@ -133,6 +134,8 @@ static void clear32(void *p, u32 v) { mask32(p, v, 0); }
 #define readl_poll_timeout readl_poll_timeout_atomic
 /* Observation is read-only and separately tested; retain production caller control flow. */
 static void atcphy_usb2_power_on(struct apple_atcphy *p) { (void)p; usb2_on++; }
+/* The modeled PHYs have no banked DisplayPort calibration (dp_banked_tunables). */
+static inline void apple_tunable_apply(void *regs, void *tunable) { (void)regs; (void)tunable; }
 static void atcphy_apply_tunables(struct apple_atcphy *p, enum atcphy_mode mode)
 { (void)p; (void)mode; }
 static void atc_tunnel_stop_t8103(struct apple_atcphy *p) { (void)p; }
@@ -1929,13 +1932,13 @@ def pipe(root):
 struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
     bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
-    struct { void *usb3_dp; } tunables;
+    struct { void *usb3_dp, *dp_lioa, *dp_common_config; } tunables;
 
     bool dp_only, pd_was_off, tunnel_clock_on;
     unsigned int tunnel_rate, tunnel_users;
     struct { bool aux, pll; unsigned int pairs, rate; } dp_t8122;
     const struct atcphy_hw *hw;
-    struct { unsigned char *core, *pipehandler; } regs;
+    struct { unsigned char *core, *pipehandler, *lioa; } regs;
     void *dev;
     int lock;
     bool fixed_usb2, host_active, ss_tunables, dp_tunables, mode_dirty;
@@ -2327,13 +2330,13 @@ def unwind(root):
 struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
     bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
-    struct { void *usb3_dp; } tunables;
+    struct { void *usb3_dp, *dp_lioa, *dp_common_config; } tunables;
 
     bool dp_only, pd_was_off, tunnel_clock_on;
     unsigned int tunnel_rate, tunnel_users;
     struct { bool aux, pll; unsigned int pairs, rate; } dp_t8122;
     const struct atcphy_hw *hw;
-    struct { unsigned char *core, *lpdptx; } regs;
+    struct { unsigned char *core, *lpdptx, *lioa; } regs;
     void *dev;
     int lock, dp_link_rate;
     bool fixed_usb2, host_active, swap_lanes, ss_tunables, dp_tunables;
@@ -2388,6 +2391,7 @@ static void clear32(void *p, u32 v) { mask32(p, v, 0); }
        polls == fail_poll || !(condition) ? -ETIMEDOUT : 0; })
 #define readl_poll_timeout readl_poll_timeout_atomic
 static void atcphy_usb2_power_on(struct apple_atcphy *p) { (void)p; usb2_on++; }
+static inline void apple_tunable_apply(void *regs, void *tunable) { (void)regs; (void)tunable; }
 static void atcphy_apply_tunables(struct apple_atcphy *p, enum atcphy_mode mode)
 { (void)p; (void)mode; }
 static void atc_tunnel_stop_t8103(struct apple_atcphy *p) { (void)p; }
@@ -2647,11 +2651,11 @@ typedef uint32_t u32;
 struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
     bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
-    struct { void *usb3_dp; } tunables;
+    struct { void *usb3_dp, *dp_lioa, *dp_common_config; } tunables;
 
     bool dp_only, pd_was_off, tunnel_clock_on;
     unsigned int tunnel_rate, tunnel_users;
-    struct { bool aux, pll; unsigned int pairs, rate; } dp_t8122; struct { unsigned char *core; } regs; bool aux_power_requested; };
+    struct { bool aux, pll; unsigned int pairs, rate; } dp_t8122; struct { unsigned char *core, *lioa; } regs; bool aux_power_requested; };
 struct event { u32 offset, mask, value; } events[32];
 static u32 registers[0x18000 / 4];
 static unsigned int writes, reject;

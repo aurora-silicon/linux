@@ -4,11 +4,11 @@
 struct apple_atcphy {
     /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
     bool t8132_ss, t8132_common_owned, t8132_failed, cio_tunables, t8132_dp_alt;
-    struct { void *usb3_dp; } tunables;
+    struct { void *usb3_dp, *dp_lioa, *dp_common_config; } tunables;
 
 	const struct atcphy_hw *hw;
 	struct {
-		unsigned char *core, *lpdptx, *pipehandler, *usb2phy;
+		unsigned char *core, *lpdptx, *pipehandler, *usb2phy, *lioa;
 	} regs;
 	struct reset_controller_dev rcdev;
 	void *dev;
@@ -240,6 +240,8 @@ static void atcphy_usb2_power_on(struct apple_atcphy *p)
 {
 	(void)p;
 }
+/* The modeled PHYs have no banked DisplayPort calibration (dp_banked_tunables). */
+static inline void apple_tunable_apply(void *regs, void *tunable) { (void)regs; (void)tunable; }
 static void atcphy_apply_tunables(struct apple_atcphy *p, enum atcphy_mode m)
 {
 	(void)p;
