@@ -257,6 +257,7 @@ static int apple_plane_atomic_check(struct drm_plane *plane,
 				 old_crtc_new && !old_crtc_new->active;
 
 		if (!dcp_ind_plane_ok(true,
+				      commit->duplicated ||
 				      commit == READ_ONCE(to_apple_plane(plane)->indicator_commit),
 				      unchanged, going_off))
 			return -EINVAL;
