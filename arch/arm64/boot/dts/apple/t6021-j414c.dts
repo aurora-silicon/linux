@@ -9,6 +9,12 @@
 
 /dts-v1/;
 
+/*
+ * Let the bootloader start the PMP so it can manage the fabric and DCS
+ * p-states. The bootloader needs room for the PMP tunables.
+ */
+#define APPLE_USE_PMP
+
 #include "t6021.dtsi"
 #include "t602x-j414-j416.dtsi"
 #include "t6021-display2.dtsi"
