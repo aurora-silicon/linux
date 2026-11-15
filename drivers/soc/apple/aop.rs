@@ -807,7 +807,7 @@ impl AFKEndpoint {
                 || subtype == EPIC_SUBTYPE_GYRO_REPORT
                 || subtype == EPIC_SUBTYPE_ACCEL_REPORT
             {
-                return client.process_fakehid_report(self, qhdr.channel, data);
+                return client.process_fakehid_report(self, qhdr.channel, subtype, data);
             } else if client.process_report(self, qhdr.channel, subtype, data)? {
                 return Ok(());
             }
@@ -1600,6 +1600,16 @@ impl AopData {
             channel,
             endpoint: ep.index,
         };
+        // Every announcement, the ones without a driver too: which channel a
+        // sensor's reports should arrive on (J815 motion bring-up).
+        dev_info!(
+            self.dev,
+            "service {:?} on endpoint {:#04x} channel {} ({:#x})\n",
+            core::str::from_utf8(name).unwrap_or("?"),
+            ep.index,
+            channel,
+            channel
+        );
         let dev_name = match name {
             b"aop-audio" => c_str!("audio"),
             b"las" => c_str!("las"),
@@ -1638,7 +1648,13 @@ impl AopData {
         Ok(false)
     }
 
-    fn process_fakehid_report(&self, ep: &AFKEndpoint, ch: u32, data: &[u8]) -> Result<()> {
+    fn process_fakehid_report(
+        &self,
+        ep: &AFKEndpoint,
+        ch: u32,
+        subtype: u16,
+        data: &[u8],
+    ) -> Result<()> {
         let guard = self.hid_listeners.lock();
         for entry in &*guard {
             if entry.svc.endpoint == ep.index && entry.svc.channel == ch {
@@ -1648,13 +1664,18 @@ impl AopData {
         drop(guard);
         // A sensor report for no listener is dropped; name the first few, so
         // that a service reporting on another channel than it announced shows.
-        if UNCLAIMED_SENSOR_REPORTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 4 {
+        // J815 (27.2): with the motion services armed, one 16-byte report per
+        // start arrives on channel 0x10000017; its subtype and bytes say what it is.
+        if UNCLAIMED_SENSOR_REPORTS.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 12 {
             dev_info!(
                 self.dev,
-                "sensor report for no listener: endpoint {:#04x} channel {}, {} bytes\n",
+                "sensor report for no listener: endpoint {:#04x} channel {} ({:#x}) subtype {:#x}, {} bytes: {:02x?}\n",
                 ep.index,
                 ch,
-                data.len()
+                ch,
+                subtype,
+                data.len(),
+                &data[..data.len().min(32)]
             );
         }
         Ok(())

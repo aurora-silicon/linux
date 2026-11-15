@@ -260,7 +260,7 @@ impl Control {
         for (prop, value) in ARMING {
             let status = self.write(prop, &value.to_le_bytes())?;
             if status != 0 {
-                dev_dbg!(self.dev, "property {:#x} = {}: status {:#x}\n", prop, value, status);
+                dev_info!(self.dev, "property {:#x} = {}: status {:#x}\n", prop, value, status);
             }
         }
         self.set(PROP_INTERVAL, &INTERVAL_US.to_le_bytes())
