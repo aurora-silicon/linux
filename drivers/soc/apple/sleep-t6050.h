@@ -149,6 +149,8 @@ struct apple_sleep_region_state {
 	u32 pmu_reads[8][2], npmu_reads, spmi_order[5], nspmi_order, spmi_gap_us;
 	/* nub-spmi0's interrupt mask at run time */
 	u32 spmi_runtime_mask;
+	/* nub-spmi0's status word holding the PMU's interrupt sources, and their bits (the DT's) */
+	u32 spmi_pmu_status, spmi_pmu_bits;
 	/* From the SMC's idle notice to the timer: every step of the schedule is nearer the timer */
 	u32 runway_us;
 	/* The PMU RTC's control after the timer, the complex requests, the floor steps */
@@ -432,6 +434,8 @@ static void sleep_region_replay(struct apple_sleep *s)
 #define M5_SPMI_IRQ_EN 0x420
 #define M5_SPMI_IRQ_STATUS 0x620
 #define M5_SPMI_IRQ_DONE BIT(0)
+/* The peripheral sources' status words, below the controller's own: write 1 to clear */
+#define M5_SPMI_SRC_STATUS 0x600
 #define M5_PMU_SID 0x0e
 /* The PMU's RTC: control (bit 1 alarm fired, bit 6 alarm armed), counter, compare, mask */
 #define T6050_RTC_CTL		0x2000
@@ -1191,6 +1195,13 @@ static int t6050_sleep_map_data(struct apple_sleep *s)
 	r->spmi_gap_us = min(r->spmi_gap_us, 2000U);
 	r->spmi_runtime_mask = 0;
 	of_property_read_u32(np, "apple,spmi-runtime-mask", &r->spmi_runtime_mask);
+	/* One of nub-spmi0's peripheral status words, with at least one bit: else none acked */
+	r->spmi_pmu_bits = 0;
+	if (t6050_u32s(s, "apple,spmi-pmu-sources", v, 2) == 2 && v[1] &&
+	    v[0] >= M5_SPMI_SRC_STATUS && v[0] < M5_SPMI_IRQ_STATUS && !(v[0] % 4)) {
+		r->spmi_pmu_status = v[0];
+		r->spmi_pmu_bits = v[1];
+	}
 	r->pmu_wake_stage_valid = !of_property_read_u32(np, "apple,pmu-wake-stage",
 							&r->pmu_wake_stage) && r->pmu_wake_stage <= 0xff;
 	r->alarm_rearm_valid = t6050_u32s(s, "apple,pmu-alarm-rearm", r->alarm_rearm, 2) == 2 &&
@@ -2231,9 +2242,33 @@ static void t6050_sleep_entry_lower(struct apple_sleep *s)
 }
 
 /*
+ * nub-spmi0 latches each interrupt the PMU sends (its alarm's among them) in a peripheral status
+ * word, and a latched source that is enabled holds the controller's interrupt output up: an AP
+ * wake source, which the sleep keeps armed. No driver takes the PMU's interrupts on this
+ * controller, so nothing acknowledged them: after the first alarm, each later sleep woke right
+ * after its commit. The DT names the PMU's sources. They are acknowledged at each wake, before
+ * the run-time mask is back, as macOS does; and before the sleep's masks, for one latched while
+ * the system ran (an alarm that fired after an earlier wake). An event after that wakes the
+ * sleep, as it should. Returns the word as found, before the acknowledgement.
+ */
+static u32 t6050_spmi_pmu_ack(struct apple_sleep *s)
+{
+	struct apple_sleep_region_state *r = s->region;
+	u32 status;
+
+	if (!r->spmi_pmu_bits)
+		return 0;
+	status = readl(s->spmi + r->spmi_pmu_status);
+	if (status & r->spmi_pmu_bits)
+		writel(status & r->spmi_pmu_bits, s->spmi + r->spmi_pmu_status);
+	return status;
+}
+
+/*
  * Past the point of no return, between ANS's stop and SIO's: ATC2_USB_AON, pmVC, ATC1_USB_AON,
  * pmVC, the watchdog service, the PMU's boot stage and the DT's PMU reads, I2C3/I2C1/I2C2/I2C6,
- * the SPMI buses' sleep masks (nub-spmi0 first, then the DT's order and spacing), SPI4, SPI2.
+ * the PMU's latched interrupts acknowledged, the SPMI buses' sleep masks (nub-spmi0 first,
+ * then the DT's order and spacing), SPI4, SPI2.
  */
 static void t6050_sleep_after_ans(struct apple_sleep *s)
 {
@@ -2267,6 +2302,7 @@ static void t6050_sleep_after_ans(struct apple_sleep *s)
 		t6050_late_lower(s, i);
 	r->spmi_mask[0] = readl(s->spmi + M5_SPMI_IRQ_EN);
 	/* nub-spmi0 first: its interrupt outputs are AP wake sources. */
+	t6050_spmi_pmu_ack(s);
 	writel(readl(s->spmi + M5_SPMI_IRQ_STATUS), s->spmi + M5_SPMI_IRQ_STATUS);
 	writel(s->soc->spmi_notify_sleep, s->spmi + M5_SPMI_IRQ_EN);
 	for (i = 0; i < r->nspmi_order; i++) {
@@ -3224,6 +3260,8 @@ static void t6050_sleep_wake_regs(struct apple_sleep *s)
 	u32 value;
 
 	if (r->spmi_masked) {
+		/* What the PMU sent while the SoC slept (its wake), before the run-time mask */
+		t6050_spmi_pmu_ack(s);
 		writel(r->spmi_mask[0], s->spmi + M5_SPMI_IRQ_EN);
 		for (i = 0; i < ARRAY_SIZE(r->spmi_bus); i++)
 			if (r->spmi_bus[i])

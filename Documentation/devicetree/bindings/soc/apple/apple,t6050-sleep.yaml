@@ -236,6 +236,20 @@ properties:
       nub-spmi0's interrupt mask through the sleep's own PMU commands before
       the masks; without it, what the boot left there.
 
+  apple,spmi-pmu-sources:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    items:
+      - description: |
+          Offset in the spmi block of the nub-spmi0 peripheral status word
+          (0x600 to 0x61c) that holds the PMU's interrupt sources.
+      - description: The PMU's source bits in that word.
+    description: |
+      The PMU's interrupt sources on nub-spmi0. A source the PMU raised stays
+      latched, and holds an AP wake source up, until it is acknowledged; no
+      driver takes these interrupts. The sleep acknowledges them (writes 1 to
+      the latched bits) before its SPMI masks and again at the wake. Without
+      it, nothing is acknowledged.
+
   apple,seq-stage:
     $ref: "#/$defs/register-sequence"
     description: |
