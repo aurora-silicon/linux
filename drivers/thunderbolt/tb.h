@@ -1181,6 +1181,7 @@ static inline bool tb_port_is_apple_host_dpin(const struct tb_port *port)
 }
 
 bool tb_has_apple_host_dp_tunnel(struct tb *tb);
+int tb_dp_host_rebuild(struct tb *tb, u8 in_port, u64 generation);
 
 /* Host DP IN adapter whose bandwidth allocation runs as TB_HOST_DP_BW_HELD_ACK says. */
 static inline bool tb_port_dp_bw_held_ack(const struct tb_port *port)

@@ -2783,6 +2783,73 @@ static void tb_dp_relink_replay(struct tb *tb)
 		tb_dp_relink_arm(tb, 0);
 }
 
+struct tb_dp_rebuild {
+	struct work_struct work;
+	struct tb *tb;
+	u8 in_port;
+	u64 generation;
+};
+
+/*
+ * Takes the host DP tunnel of DP IN adapter @in_port down and sets it up
+ * again between the same adapters. Other tunnels (USB3, PCIe) stay. A tunnel
+ * that is gone, or has another generation, is left alone.
+ */
+static void tb_dp_rebuild_work(struct work_struct *work)
+{
+	struct tb_dp_rebuild *r = container_of(work, struct tb_dp_rebuild, work);
+	struct tb *tb = r->tb;
+	struct tb_cm *tcm = tb_priv(tb);
+	struct tb_tunnel *tunnel;
+
+	if (pm_runtime_resume_and_get(&tb->dev) < 0)
+		goto out;
+
+	mutex_lock(&tb->lock);
+	if (tcm->hotplug_active && tb->root_switch) {
+		list_for_each_entry(tunnel, &tcm->tunnel_list, list) {
+			if (!tb_tunnel_is_host_dp(tunnel) ||
+			    tunnel->src_port->port != r->in_port ||
+			    tunnel->host_dp_generation != r->generation)
+				continue;
+			tb_dp_host_relink(tb, tunnel, tunnel->host_rate_limit,
+					  "display link lost");
+			break;
+		}
+	}
+	mutex_unlock(&tb->lock);
+
+	pm_runtime_mark_last_busy(&tb->dev);
+	pm_runtime_put_autosuspend(&tb->dev);
+out:
+	tb_domain_put(tb);
+	kfree(r);
+}
+
+/*
+ * Queues the rebuild on the domain queue. Does not take the domain lock: the
+ * caller may hold a lock that tunnel notifications take.
+ */
+int tb_dp_host_rebuild(struct tb *tb, u8 in_port, u64 generation)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+	struct tb_dp_rebuild *r;
+
+	if (!READ_ONCE(tcm->hotplug_active))
+		return -ENODEV;
+	r = kzalloc(sizeof(*r), GFP_KERNEL);
+	if (!r)
+		return -ENOMEM;
+	INIT_WORK(&r->work, tb_dp_rebuild_work);
+	r->tb = tb;
+	r->in_port = in_port;
+	r->generation = generation;
+	tb_domain_get(tb);
+	queue_work(tb->wq, &r->work);
+	return 0;
+}
+EXPORT_SYMBOL_FOR_MODULES(tb_dp_host_rebuild, "thunderbolt_apple");
+
 static void tb_tunnel_dp(struct tb *tb)
 {
 	struct tb_cm *tcm = tb_priv(tb);

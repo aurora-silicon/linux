@@ -2475,6 +2475,25 @@ static void apple_nhi_dp_tunnel_deactivate(struct tb_nhi *nhi,
 	dev_info(anhi->dev, "DP IN tunnel routing: tunnel down\n");
 }
 
+/*
+ * appledrm, with the binding it was handed: take the DP tunnel of this
+ * adapter down and set it up again. Queues only: the teardown notifies
+ * appledrm, which may hold the lock this is called under.
+ */
+int apple_dp_tunnel_rebuild(void *data)
+{
+	struct apple_dpin_binding *binding = data;
+	struct apple_dpin_ctx *c = binding->ctx;
+
+	guard(mutex)(&c->lock);
+	if (!apple_dpin_token_access(&c->tokens, binding->generation))
+		return -ESTALE;
+	if (!c->diag_anhi)
+		return -ENOTCONN;
+	return tb_dp_host_rebuild(c->diag_anhi->tb, c->diag_port, binding->generation);
+}
+EXPORT_SYMBOL_GPL(apple_dp_tunnel_rebuild);
+
 static void apple_nhi_dp_tunnel_changed(struct tb_nhi *nhi, u8 in_port,
 					u64 generation, bool active)
 {

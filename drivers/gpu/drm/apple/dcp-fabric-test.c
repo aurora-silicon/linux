@@ -2473,6 +2473,29 @@ static void relink_running_test(struct kunit *test)
 }
 
 /* Three relinks per attachment or wake; a new attachment starts afresh. */
+/* Only the second and later relinks of an attachment rebuild, and only so many. */
+static void relink_escalate_test(struct kunit *test)
+{
+	struct dcp_relink_state s;
+	unsigned int i;
+
+	relink_fresh(&s, 5, 100000);
+	s.tries = 1;
+	KUNIT_EXPECT_FALSE(test, dcp_relink_escalate(&s));
+	s.tries = 2;
+	for (i = 0; i < DCP_RELINK_REBUILDS; i++)
+		KUNIT_EXPECT_TRUE(test, dcp_relink_escalate(&s));
+	KUNIT_EXPECT_FALSE(test, dcp_relink_escalate(&s));
+
+	/* The rebuild's new attachment restarts the tries, not the rebuilds. */
+	dcp_relink_attach(&s, 6);
+	KUNIT_EXPECT_EQ(test, s.tries, 0U);
+	KUNIT_EXPECT_EQ(test, s.rebuilds, (u32)DCP_RELINK_REBUILDS);
+
+	dcp_relink_wake(&s, 6, 100000);
+	KUNIT_EXPECT_EQ(test, s.rebuilds, 0U);
+}
+
 static void relink_budget_test(struct kunit *test)
 {
 	unsigned long t = 100000;
@@ -2625,6 +2648,7 @@ static struct kunit_case fabric_tests[] = {
 	KUNIT_CASE(relink_unplug_test),
 	KUNIT_CASE(relink_running_test),
 	KUNIT_CASE(relink_budget_test),
+	KUNIT_CASE(relink_escalate_test),
 	KUNIT_CASE(relink_disabled_test),
 	KUNIT_CASE(relink_stamp_test),
 	KUNIT_CASE(fabric_t6030_dual_policy_test),

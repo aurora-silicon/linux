@@ -46,6 +46,16 @@ int apple_dcp_tb_dp_tunnel(struct device_node *connector_np, unsigned int dpin,
  */
 bool apple_dp_tunnel_binding_live(void *binding);
 
+/*
+ * Thunderbolt glue: take the DP tunnel held by @binding (the cookie handed to
+ * apple_dcp_tb_dp_tunnel()) down and set it up again between the same
+ * adapters, from the domain queue. The USB3 and PCIe tunnels stay. Returns
+ * at once; -ESTALE if @binding is not current, -ENOTCONN if its tunnel is
+ * not active. The teardown notifies appledrm, so the caller must not hold
+ * any lock the notification takes, other than the one that protects @binding.
+ */
+int apple_dp_tunnel_rebuild(void *binding);
+
 /* The sink raised IRQ_HPD on the tunnel's DP IN adapter. */
 #define APPLE_DP_TUNNEL_IRQ_HPD		BIT(0)
 /* The HPD level of the tunnel's DP IN adapter changed to @hpd. */

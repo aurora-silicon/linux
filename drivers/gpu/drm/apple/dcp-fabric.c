@@ -3487,6 +3487,20 @@ int apple_dcp_tb_dp_tunnel(struct device_node *connector_np, unsigned int dpin,
 }
 EXPORT_SYMBOL_GPL(apple_dcp_tb_dp_tunnel);
 
+/* Set this dcpext's DP tunnel up again, without touching the other tunnels. */
+int dcp_tb_dp_rebuild(struct apple_dcp *dcp)
+{
+	typeof(&apple_dp_tunnel_rebuild) rebuild = symbol_get(apple_dp_tunnel_rebuild);
+	int ret;
+
+	if (!rebuild)
+		return -ENODEV;
+	scoped_guard(mutex, &dcp->tb_lock)
+		ret = dcp->tb_dpin_ctx ? rebuild(dcp->tb_dpin_ctx) : -ENOTCONN;
+	symbol_put(apple_dp_tunnel_rebuild);
+	return ret;
+}
+
 enum {
 	DCP_TB_EVENT_IRQ_HPD,
 	DCP_TB_EVENT_HPD,

@@ -15,6 +15,8 @@
 /* relinks per attachment or DPMS wake */
 #define DCP_RELINK_RETRIES	3
 #define DCP_RELINK_UNPLUG_MS	1000
+/* DP tunnel rebuilds per boot or DPMS wake; a replug does not refill them */
+#define DCP_RELINK_REBUILDS	3
 /*
  * DCP drops such a sink about 2 s after HPD was asserted for it. A sink it
  * drops later, with HPD still high (a TV behind a DP-to-HDMI adapter that
@@ -26,6 +28,7 @@ struct dcp_relink_state {
 	u64 generation;		/* the Type-C attachment described */
 	unsigned long linked;	/* when HPD was last asserted for it, 0: unknown */
 	u32 tries;
+	u32 rebuilds;		/* DP tunnel rebuilds used, kept across attachments */
 	bool active;		/* a relink is queued or runs */
 	bool enabled;		/* relinks may be queued */
 };
@@ -85,6 +88,19 @@ static inline bool dcp_relink_unplug(struct dcp_relink_state *s, u64 generation,
 }
 
 /*
+ * From the second relink of an attachment on, the DP tunnel is set up again
+ * instead of the sink attached again, @rebuilds times. The rebuild makes a
+ * new attachment, which restarts the tries, so the budget outlives them.
+ */
+static inline bool dcp_relink_escalate(struct dcp_relink_state *s)
+{
+	if (s->tries < 2 || s->rebuilds >= DCP_RELINK_REBUILDS)
+		return false;
+	s->rebuilds++;
+	return true;
+}
+
+/*
  * The relink attached the sink again, as @generation, @now. It keeps the
  * retries of the attachment it replays.
  */
@@ -106,6 +122,7 @@ static inline void dcp_relink_wake(struct dcp_relink_state *s, u64 generation,
 {
 	dcp_relink_sync(s, generation);
 	s->tries = 0;
+	s->rebuilds = 0;
 	s->linked = dcp_relink_stamp(now);
 }
 

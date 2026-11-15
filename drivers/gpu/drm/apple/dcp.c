@@ -363,6 +363,10 @@ bool dcp_h17p_external_ready(struct device_node *np)
 	return ready;
 }
 
+static bool relink_rebuild = true;
+module_param(relink_rebuild, bool, 0644);
+MODULE_PARM_DESC(relink_rebuild, "from the second Type-C relink of an attachment on a Thunderbolt display, set the DP tunnel up again instead of attaching the sink again (default on)");
+
 static bool show_notch;
 module_param(show_notch, bool, 0644);
 MODULE_PARM_DESC(show_notch, "Use the full display height and show the notch (also when /chosen/asahi,show-notch is \"1\")");
@@ -3548,6 +3552,7 @@ static void dcp_typec_relink_work(struct work_struct *work)
 	struct platform_device *pdev = to_platform_device(dcp->dev);
 	unsigned long flags;
 	u64 generation;
+	u32 tries;
 	bool run;
 
 	scoped_guard(mutex, &dcp->hpd_mutex) {
@@ -3569,6 +3574,34 @@ static void dcp_typec_relink_work(struct work_struct *work)
 	 * under one hold of hpd_mutex, so that neither can come in between.
 	 */
 	cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
+
+	/*
+	 * Not under hpd_mutex: the tunnel's teardown and setup call back into
+	 * this driver. A real unplug or replug that came meanwhile takes over,
+	 * as below; the rebuild's own new attachment needs no check.
+	 */
+	if (relink_rebuild && dcp_tunnel_relinks(dcp)) {
+		bool rebuild = false;
+		int ret;
+
+		scoped_guard(mutex, &dcp->hpd_mutex) {
+			spin_lock_irqsave(&dcp->relink_lock, flags);
+			if (dcp->typec_generation == generation + 1)
+				rebuild = dcp_relink_escalate(&dcp->relink);
+			tries = dcp->relink.tries;
+			spin_unlock_irqrestore(&dcp->relink_lock, flags);
+		}
+		if (rebuild) {
+			dev_info(dcp->dev, "DCP relink %u/%u: rebuilding the DP tunnel\n",
+				 tries, DCP_RELINK_RETRIES);
+			ret = dcp_tb_dp_rebuild(dcp);
+			if (!ret)
+				goto out;
+			dev_warn(dcp->dev,
+				 "DP tunnel rebuild failed (%d), attaching the sink again\n", ret);
+		}
+	}
+
 	scoped_guard(mutex, &dcp->hpd_mutex) {
 		if (dcp->typec_generation != generation + 1)
 			goto out;

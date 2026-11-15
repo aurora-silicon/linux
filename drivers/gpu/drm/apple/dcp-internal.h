@@ -82,6 +82,7 @@ void dcp_retry_placeholder_edid(struct apple_dcp *dcp,
 				const struct drm_edid *drm_edid);
 bool dcp_typec_relink(struct apple_dcp *dcp);
 bool dcp_typec_sink_relink(struct apple_dcp *dcp);
+int dcp_tb_dp_rebuild(struct apple_dcp *dcp);
 
 struct dcpav_service_epic;
 
