@@ -102,8 +102,6 @@ enum apple_clpc_rail {
  * @gpu_input: the GPU driver reports its work in flight through
  *	apple_clpc_gpu_get(); while there is some, both rails go to the top
  *	of @map
- * @idle_on_time: sample every period even with no vote held, instead of
- *	from a deferrable timer
  * @low_power_khz: CPU frequency ceiling of the low-power platform profile,
  *	taken up to the next table frequency; 0 for no platform profile
  * @low_power_machine: the machine compatible @low_power_khz was read for; SoCs
@@ -129,7 +127,6 @@ struct apple_clpc_hw {
 	unsigned int ane_cluster;
 	unsigned int ane_cluster_khz;
 	const char *ane_cluster_machine;
-	bool idle_on_time;
 	unsigned int low_power_khz;
 	const char *low_power_machine;
 	unsigned int low_power_mw;
@@ -180,7 +177,7 @@ struct apple_clpc {
 	struct device *pmc;
 	const struct apple_clpc_hw *hw;
 	unsigned int agent;
-	/* Samples while a vote is held; idle_work defers to busy CPUs. */
+	/* Samples while a vote is held; idle_work runs with no vote held. */
 	struct delayed_work work;
 	struct delayed_work idle_work;
 	struct mutex sample_lock;
@@ -265,8 +262,10 @@ void apple_clpc_gpu_set_active(struct apple_clpc_gpu *gpu, bool active)
 	if (!gpu)
 		return;
 	spin_lock_irqsave(&gpu->lock, flags);
-	/* A cold GPU publisher must not wait for a deferrable CPU-idle timer.
-	 * Removal clears wake under this same lock before draining work.
+	/*
+	 * A cold GPU publisher wakes sampling immediately rather than waiting
+	 * for the next sampling period. Removal clears wake under this same
+	 * lock before draining work.
 	 */
 	if (active && !gpu->active && gpu->wake)
 		mod_delayed_work(system_freezable_power_efficient_wq, gpu->wake, 0);
@@ -598,14 +597,9 @@ static void apple_clpc_queue(struct apple_clpc *clpc, bool idle)
 		return;
 
 	/*
-	 * A held vote has to be sampled on time so that it drops once demand
-	 * stops; with no vote held, sampling can wait for a CPU that wakes up
-	 * anyway rather than waking an idle one every period, unless the SoC
-	 * samples on time (@idle_on_time).
-	 */
-	idle = idle && !clpc->hw->idle_on_time;
-	/* A demand edge can queue work while the deferrable pass is pending.
-	 * Keep one sampling cadence once the serialized pass settles.
+	 * A demand edge can queue &clpc->work while &clpc->idle_work is
+	 * pending. Cancel the other item so one sampling cadence remains once
+	 * the serialized pass settles.
 	 */
 	cancel_delayed_work(idle ? &clpc->work : &clpc->idle_work);
 	queue_delayed_work(system_freezable_power_efficient_wq,
@@ -1464,7 +1458,12 @@ static int apple_clpc_probe(struct platform_device *pdev)
 	clpc->next_scan = jiffies + HZ;
 	mutex_init(&clpc->sample_lock);
 	INIT_DELAYED_WORK(&clpc->work, apple_clpc_work);
-	INIT_DEFERRABLE_WORK(&clpc->idle_work, apple_clpc_idle_work);
+	/*
+	 * Keep idle sampling on a regular timer: with one busy core and the
+	 * remaining CPUs idle, a deferrable timer waits for whichever idle CPU
+	 * holds it, leaving single-threaded memory loads at DCS state 0.
+	 */
+	INIT_DELAYED_WORK(&clpc->idle_work, apple_clpc_idle_work);
 	/* Sample at a cold publication only where that publication is the demand.
 	 * Dense counting needs no extra sample, and one taken as each frame of a
 	 * frame-paced client starts finds its CPUs busy and votes their fabric.
@@ -2031,7 +2030,6 @@ static const struct apple_clpc_hw apple_clpc_hw_t6050 = {
 	.gpu = { [APPLE_CLPC_DCS] = 6, [APPLE_CLPC_SOC] = 2 },
 	.sustain = 3,
 	.gpu_input = true,
-	.idle_on_time = true,
 	.low_power_khz = 2808000,
 	.low_power_mw = 15000,
 	/* High Power mode's record, as macOS 27.0 writes it on the 14-inch M5 Pro */
