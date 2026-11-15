@@ -1557,13 +1557,7 @@ impl SepData {
         }
         match self.sleep_gate() {
             // A failed earlier wake is not repaired by another precommit attempt.
-            pm::SleepGate::Lost => {
-                dev_err!(
-                    self.dev,
-                    "deep sleep refused: the enclave did not come back from a sleep earlier this boot\n"
-                );
-                return Err(EBUSY);
-            }
+            pm::SleepGate::Lost => return Err(EIO),
             pm::SleepGate::Open => {}
             _ => return Err(EBUSY),
         }
@@ -1577,7 +1571,7 @@ impl SepData {
         }
         // Refused here, at once, rather than at the commit after its send wait.
         if !self.mailbox_drains() {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "deep sleep refused: the enclave isn't taking messages (its mailbox stays full)\n"
             );
@@ -1617,7 +1611,7 @@ impl SepData {
     /// for in suspend_noirq). A deep sleep commits only over an enclave that is asleep.
     fn sleep_enter_at_suspend(&self) -> Result<()> {
         if self.sleep_unanswered.load(Relaxed) {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "deep sleep refused: the enclave did not answer a sleep request or wake earlier this boot\n"
             );
@@ -1627,7 +1621,7 @@ impl SepData {
             // Gated already at an earlier, refused sleep: it stays asleep until a real wake.
             pm::SleepGate::Lost if self.sleep_at_suspend.load(Relaxed) => return Ok(()),
             pm::SleepGate::Lost => {
-                dev_err!(
+                dev_err_ratelimited!(
                     self.dev,
                     "deep sleep refused: the enclave did not come back from a sleep earlier this boot\n"
                 );
@@ -1638,14 +1632,14 @@ impl SepData {
         }
         // One that didn't come up still runs: a commit over it resets the SoC.
         if self.phase.load(Relaxed) != PHASE_READY || !self.endpoint_present(proto::EP_CONTROL) {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "deep sleep refused: the enclave did not finish coming up, so it can't be put to sleep\n"
             );
             return Err(EBUSY);
         }
         if !self.mailbox_drains() {
-            dev_err!(
+            dev_err_ratelimited!(
                 self.dev,
                 "deep sleep refused: the enclave isn't taking messages (its mailbox stays full)\n"
             );
@@ -1660,13 +1654,20 @@ impl SepData {
             |ms| kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(ms))),
         );
         if !idle {
-            dev_err!(self.dev, "sleep refused: a request is still waiting for its reply\n");
+            dev_err_ratelimited!(
+                self.dev,
+                "sleep refused: a request is still waiting for its reply\n"
+            );
             self.set_sleep_gate(pm::SleepGate::Open);
             return Err(EBUSY);
         }
 
         if let Err(e) = pm::dart_prepare(&self.dev) {
-            dev_err!(self.dev, "sleep refused: its DART could not be saved ({:?})\n", e);
+            dev_err_ratelimited!(
+                self.dev,
+                "sleep refused: its DART could not be saved ({:?})\n",
+                e
+            );
             self.set_sleep_gate(pm::SleepGate::Open);
             return Err(e);
         }
@@ -1683,7 +1684,11 @@ impl SepData {
                 Ok(())
             }
             Err(e) => {
-                dev_err!(self.dev, "sleep refused: no answer to the sleep request ({:?})\n", e);
+                dev_err_ratelimited!(
+                    self.dev,
+                    "sleep refused: no answer to the sleep request ({:?})\n",
+                    e
+                );
                 self.sleep_unanswered.store(true, Relaxed);
                 // A request that timed out may still have been taken.
                 self.set_sleep_gate(pm::SleepGate::Told);
@@ -1735,13 +1740,13 @@ impl SepData {
         } else if pm::wait_gated(&self.dev) {
             self.sleep_hold_rx();
             self.set_sleep_gate(pm::SleepGate::Lost);
-            dev_warn!(
+            dev_warn_ratelimited!(
                 self.dev,
                 "the enclave stays asleep until the next real sleep or a reboot\n"
             );
             return false;
         } else {
-            dev_warn!(self.dev, "the enclave never gated its power domain\n");
+            dev_warn_ratelimited!(self.dev, "the enclave never gated its power domain\n");
             self.sleep_probe()
         };
         match answered {
@@ -1749,11 +1754,15 @@ impl SepData {
                 self.sleep_at_suspend.store(false, Relaxed);
                 self.set_sleep_gate(pm::SleepGate::Open);
                 // One line per sleep it was told of: nothing else says it came back.
-                dev_info!(self.dev, "the enclave is back from its sleep request\n");
+                dev_info_ratelimited!(self.dev, "the enclave is back from its sleep request\n");
                 true
             }
             Err(e) => {
-                dev_err!(self.dev, "the enclave did not come back ({:?}); it stays unused\n", e);
+                dev_err_ratelimited!(
+                    self.dev,
+                    "the enclave did not come back ({:?}); it stays unused\n",
+                    e
+                );
                 self.sleep_unanswered.store(true, Relaxed);
                 self.sleep_hold_rx();
                 self.set_sleep_gate(pm::SleepGate::Lost);
