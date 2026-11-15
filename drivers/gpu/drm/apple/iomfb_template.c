@@ -4208,7 +4208,8 @@ static bool dcp_vrr_update(struct apple_dcp *dcp, struct drm_crtc_state *crtc_st
 
 	if (!dcp->vrr_enabled || !d->vrr_min_on)
 		return false;
-	min = crtc_state->vrr_enabled ? d->vrr_min_on : d->vrr_min_off;
+	min = crtc_state->vrr_enabled ? d->vrr_min_on :
+	      (READ_ONCE(w3_min_off) ?: d->vrr_min_off);
 	{
 		int w3 = READ_ONCE(w3_fixed);
 		u32 tgt = (!crtc_state->vrr_enabled && (w3 == 1 || w3 == 2)) ? d->vrr_min_off : 0;

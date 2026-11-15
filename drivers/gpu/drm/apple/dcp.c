@@ -394,6 +394,10 @@ int w3_fixed;
 module_param(w3_fixed, int, 0644);
 MODULE_PARM_DESC(w3_fixed, "W3 test: 0 minRR only, 1 +mediaTargetRate=mode, 2 +target, minRR 0, 3 modeset adaptive off, 4 minRR 0 live");
 
+uint w3_min_off;
+module_param(w3_min_off, uint, 0644);
+MODULE_PARM_DESC(w3_min_off, "W3 test: adaptive minimum (16.16 Hz) with VRR_ENABLED off, 0 = the mode rate");
+
 static bool unstable_edid = true;
 module_param(unstable_edid, bool, 0644);
 MODULE_PARM_DESC(unstable_edid, "Enable unstable EDID retrival support");
