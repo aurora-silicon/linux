@@ -3250,7 +3250,7 @@ static void __maybe_unused dcp_swap_stamp(struct apple_dcp *dcp,
 	u64 now = dcp_swap_time();
 	u64 prev = dcp_swap_prev_time(now, dcp->swap_submit_timestamp);
 	u64 start = active && active->queued_counter ?
-		min(dcp_swap_ticks(active->queued_counter), now) : now;
+		dcp_swap_ticks(active->queued_counter) : now;
 	struct dcp_swap_ts ts = dcp_swap_ts_pick(READ_ONCE(dcp_swap_ts_mode), now, prev,
 						 start, DCP_V27_TIMEBASE_HZ);
 

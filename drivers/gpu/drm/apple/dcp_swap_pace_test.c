@@ -31,6 +31,8 @@ static void swap_ts_desktop_is_the_constant(struct kunit *test)
 
 	KUNIT_EXPECT_EQ(test, ts.ts0, 120ULL);
 	KUNIT_EXPECT_EQ(test, ts.ts1, 120ULL);
+	KUNIT_EXPECT_EQ(test, ts.ts3, 0ULL);
+	KUNIT_EXPECT_EQ(test, ts.ts4, 0ULL);
 	KUNIT_EXPECT_EQ(test, ts.ts6, 120ULL);
 }
 
@@ -41,6 +43,8 @@ static void swap_ts_lone_frame_backs_up_one_frame(struct kunit *test)
 
 	KUNIT_EXPECT_EQ(test, lone.ts0, 5000000ULL);
 	KUNIT_EXPECT_EQ(test, lone.ts1, 5000000ULL - FRAME);
+	KUNIT_EXPECT_EQ(test, lone.ts3, 0ULL);
+	KUNIT_EXPECT_EQ(test, lone.ts4, 0ULL);
 	KUNIT_EXPECT_EQ(test, lone.ts6, 5000000ULL);
 	KUNIT_EXPECT_EQ(test, burst.ts1, 4900000ULL);
 }
@@ -78,6 +82,16 @@ static void swap_ts_macos_target_is_100us_after_update_start(struct kunit *test)
 	struct dcp_swap_ts ts = dcp_swap_ts_pick(DCP_SWAP_TS_MACOS, 5000000, 4900000, 4999000, TB_HZ);
 
 	KUNIT_EXPECT_EQ(test, ts.ts0, 4999000ULL + TB_HZ / 10000);
+}
+
+/* A commit stamped after the submit read (counter skew) must not put the update start in the future. */
+static void swap_ts_macos_clamps_a_start_after_submit(struct kunit *test)
+{
+	struct dcp_swap_ts ts = dcp_swap_ts_pick(DCP_SWAP_TS_MACOS, 5000000, 4900000, 5000500, TB_HZ);
+
+	KUNIT_EXPECT_EQ(test, ts.ts1, 5000000ULL);
+	KUNIT_EXPECT_EQ(test, ts.ts3, 5000000ULL);
+	KUNIT_EXPECT_EQ(test, ts.ts0, 5000000ULL + TB_HZ / 10000);
 }
 
 static void swap_ts_unknown_mode_is_current(struct kunit *test)
@@ -144,6 +158,7 @@ static struct kunit_case dcp_swap_pace_test_cases[] = {
 	KUNIT_CASE(swap_ts_off_is_all_zero),
 	KUNIT_CASE(swap_ts_macos_targets_an_eighth_frame_before_submit),
 	KUNIT_CASE(swap_ts_macos_target_is_100us_after_update_start),
+	KUNIT_CASE(swap_ts_macos_clamps_a_start_after_submit),
 	KUNIT_CASE(swap_ts_unknown_mode_is_current),
 	KUNIT_CASE(keepalive_delay_is_off_or_bounded),
 	KUNIT_CASE(band_hold_waits_past_the_grid_frame),

@@ -39,7 +39,8 @@ struct dcp_swap_ts {
 /*
  * prev is the previous accepted swap's time, or now when there is none or it
  * is stale (dcp_swap_prev_time()). A swap whose prev is now follows idle.
- * start is when the driver got the commit. hz is the timebase of all of them.
+ * start is when the driver got the commit; mode 4 clamps it to now. hz is
+ * the timebase of all of them.
  */
 static inline struct dcp_swap_ts dcp_swap_ts_pick(unsigned int mode, u64 now,
 						  u64 prev, u64 start, u64 hz)
@@ -59,6 +60,7 @@ static inline struct dcp_swap_ts dcp_swap_ts_pick(unsigned int mode, u64 now,
 		ts = (struct dcp_swap_ts) {};
 		break;
 	case DCP_SWAP_TS_MACOS:
+		start = min(start, now);
 		ts = (struct dcp_swap_ts) {
 			.ts0 = max(now > frame_ticks / 8 ? now - frame_ticks / 8 : 0,
 				   start + hz / 10000),
