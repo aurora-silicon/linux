@@ -1923,6 +1923,15 @@ void dcp_hotplug(struct work_struct *work)
 		    * again, and that wake does the same, forever.
 		    */
 		   !READ_ONCE(dcp->typec_crtc_off) &&
+		   /*
+		    * Nor while a Type-C CRTC enable runs: dcp_poweron() reconnects
+		    * the link, and the HPD that answers it comes before the mode
+		    * set of that enable, not after a failed one. A bad link there
+		    * makes wlroots destroy the output it is enabling, which
+		    * disables the CRTC, and the next enable does the same, forever.
+		    */
+		   !READ_ONCE(dcp->typec_enable_pending) &&
+		   !READ_ONCE(dcp->mode_state.changing) &&
 		   (!dcp_uses_t6020_tunnel_flow(dcp) ||
 		    dcp->tunnel_power_cycles < DCP_TUNNEL_POWER_CYCLES)) {
 		bool power_cycle = dcp_uses_t6020_tunnel_flow(dcp);

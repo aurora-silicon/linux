@@ -942,6 +942,8 @@ struct apple_dcp {
 	u64 typec_follow_gen;
 	/* dcp_poweron() reconnects DPTX; its own modeset follows the HPD */
 	bool typec_poweron_hpd;
+	/* A Type-C CRTC enable runs: its own mode set follows, the link is not bad */
+	bool typec_enable_pending;
 	/* IOMFB reports its video interface ready after DPTX link training. */
 	struct completion typec_iomfb_hpd_ready;
 	struct delayed_work typec_reconnect_wq;
