@@ -368,6 +368,14 @@ static void macsmc_wake_reason_test(struct kunit *test)
 	KUNIT_EXPECT_STREQ(test, names, "lid wifibt");
 	KUNIT_EXPECT_EQ(test, apple_smc_wake_reason_bit(&ctx->smc, "lid"), 8);
 	KUNIT_EXPECT_EQ(test, apple_smc_wake_reason_bit(&ctx->smc, "ipd_touch"), -1);
+
+	/* The J714s's: T8132's lid and radio bits, its SD reader at bit 9. */
+	ctx->smc.wake_reasons = apple_smc_j714s_wake_reasons;
+	apple_smc_wake_reason_names(&ctx->smc, BIT_ULL(8) | BIT_ULL(9) | BIT_ULL(10) | BIT_ULL(13),
+				    names, sizeof(names));
+	KUNIT_EXPECT_STREQ(test, names, "lid sdconn wifibt");
+	KUNIT_EXPECT_EQ(test, apple_smc_wake_reason_bit(&ctx->smc, "lid"), 8);
+	KUNIT_EXPECT_EQ(test, apple_smc_wake_reason_bit(&ctx->smc, "wifibt"), 13);
 }
 
 static void macsmc_port_reasons_test(struct kunit *test)
