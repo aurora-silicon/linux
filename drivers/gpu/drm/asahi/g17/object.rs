@@ -528,8 +528,8 @@ struct PoolInner {
     kept_reserved: usize,
     /// Objects returned so far, ordering the reuse cache.
     returns: u64,
-    /// Reuses that had to take an object whose fence the firmware had not met yet.
-    fence_overruns: u64,
+    /// Reuses that had to take an object whose fence the firmware had not met yet, per family.
+    fence_overruns: [u64; POOL_FAMILIES],
 }
 
 /// Retained objects past this many are still retained, with one warning.
@@ -612,7 +612,7 @@ impl Pool {
             pin_init!(Self {
                 inner <- kernel::new_mutex!(PoolInner {
                     returned, reserved: [0; POOL_FAMILIES], bytes: 0, stopped: false, kept: KVec::new(),
-                    kept_bytes: 0, kept_reserved: 0, returns: 0, fence_overruns: 0,
+                    kept_bytes: 0, kept_reserved: 0, returns: 0, fence_overruns: [0; POOL_FAMILIES],
                 }, "g17::object::Pool"),
             }),
             GFP_KERNEL,
@@ -666,7 +666,7 @@ impl Pool {
             match oldest {
                 Some((index, _, ready)) if ready || !room => {
                     if !ready {
-                        inner.fence_overruns += 1;
+                        inner.fence_overruns[family_index] += 1;
                     }
                     inner.returned[index].take()
                 }
@@ -856,17 +856,20 @@ impl Pool {
 impl Pool {
     pub(crate) fn write_capacity(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
         let inner = self.inner.lock();
+        let witnessed = super::channel::control_witnessed();
         for family in 0..POOL_FAMILIES {
             let entries = &inner.returned[family * POOL_SLOTS..(family + 1) * POOL_SLOTS];
-            writeln!(f, "cached_objects_{} used={} total={} returned={} poisoned={}", family,
-                     inner.reserved[family], POOL_SLOTS, entries.iter().flatten().count(),
-                     entries.iter().flatten().filter(|entry| entry.poisoned).count())?;
+            writeln!(f, concat!("cached_objects_{} used={} total={} returned={} poisoned={} ",
+                                "waiting={} overruns={}"),
+                     family, inner.reserved[family], POOL_SLOTS, entries.iter().flatten().count(),
+                     entries.iter().flatten().filter(|entry| entry.poisoned).count(),
+                     entries.iter().flatten().filter(|entry| entry.fence > witnessed).count(),
+                     inner.fence_overruns[family])?;
         }
         writeln!(f, "cached_object_bytes used={} total={}", inner.bytes, POOL_BYTES)?;
-        let witnessed = super::channel::control_witnessed();
         writeln!(f, "cached_objects_fenced waiting={} overruns={}",
                  inner.returned.iter().flatten().filter(|entry| entry.fence > witnessed).count(),
-                 inner.fence_overruns)?;
+                 inner.fence_overruns.iter().sum::<u64>())?;
         writeln!(f, "firmware_linked_objects kept={} bytes={}", inner.kept.len(), inner.kept_bytes)
     }
 }
