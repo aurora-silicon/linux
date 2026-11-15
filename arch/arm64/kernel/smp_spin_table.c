@@ -170,6 +170,18 @@ int spin_table_set_power_ops(const struct spin_table_power_ops *ops)
 	return cmpxchg(&spin_table_power, NULL, ops) ? -EBUSY : 0;
 }
 
+/*
+ * Power operations with a per-core preparation (cpu_hold): each hold is a new generation that
+ * every held core answers, with the preparation's result. Without one, a hold is the core's
+ * answer alone, as it always was.
+ */
+static bool spin_table_prepared(void)
+{
+	const struct spin_table_power_ops *ops = READ_ONCE(spin_table_power);
+
+	return ops && ops->cpu_hold;
+}
+
 /* A refused suspend: the held CPUs go back to the park. */
 void spin_table_unhold_parked(void)
 {
@@ -189,8 +201,9 @@ static bool spin_table_all_held(bool report)
 
 	for_each_present_cpu(cpu) {
 		if (cpu_online(cpu) || (cpumask_test_cpu(cpu, &spin_table_cpus_held) &&
-		    smp_load_acquire(&spin_table_held_generation[cpu]) ==
-		    READ_ONCE(spin_table_hold_generation)) ||
+		    (!spin_table_prepared() ||
+		     smp_load_acquire(&spin_table_held_generation[cpu]) ==
+		     READ_ONCE(spin_table_hold_generation))) ||
 		    cpumask_test_cpu(cpu, &spin_table_cpus_off))
 			continue;
 		if (!report)
@@ -210,12 +223,15 @@ static bool spin_table_all_held(bool report)
  */
 int spin_table_hold_parked(void)
 {
+	bool prepared = spin_table_prepared();
 	int us, ret;
 	unsigned int cpu;
 
-	for_each_present_cpu(cpu)
-		WRITE_ONCE(spin_table_hold_error[cpu], 0);
-	WRITE_ONCE(spin_table_hold_generation, READ_ONCE(spin_table_hold_generation) + 1);
+	if (prepared) {
+		for_each_present_cpu(cpu)
+			WRITE_ONCE(spin_table_hold_error[cpu], 0);
+		WRITE_ONCE(spin_table_hold_generation, READ_ONCE(spin_table_hold_generation) + 1);
+	}
 	WRITE_ONCE(spin_table_hold_requested, true);
 	dsb(ish);
 	sev();
@@ -232,6 +248,8 @@ int spin_table_hold_parked(void)
 
 	return -ETIMEDOUT;
 held:
+	if (!prepared)
+		return 0;
 	smp_rmb();
 	for_each_present_cpu(cpu) {
 		ret = READ_ONCE(spin_table_hold_error[cpu]);
@@ -341,10 +359,37 @@ static void smp_rvbar_spin_table_restart(void)
 }
 #endif
 
+/* The commit's stop: the core's last steps, then its WFI. */
+static void smp_rvbar_spin_table_held_stop(unsigned int cpu, u64 mpidr)
+{
+	spin_table_power->cpu_stop(mpidr);
+	cpumask_set_cpu(cpu, &spin_table_cpus_off);
+	cpumask_clear_cpu(cpu, &spin_table_cpus_held);
+	cpumask_clear_cpu(cpu, &spin_table_cpus_parked);
+
+	while (!READ_ONCE(spin_table_stop_released))
+		wfe();
+	spin_table_power->cpu_off(mpidr);
+}
+
 /* Held until the commit's stop, or until a refusal sends it back to the park. */
 static void smp_rvbar_spin_table_hold(unsigned int cpu, u64 mpidr)
 {
 	u32 generation = 0;
+
+	/* Without a per-core preparation: the hold as it always was, the answer alone. */
+	if (!spin_table_prepared()) {
+		cpumask_set_cpu(cpu, &spin_table_cpus_held);
+
+		while (READ_ONCE(spin_table_hold_requested)) {
+			if (READ_ONCE(spin_table_stop_requested))
+				smp_rvbar_spin_table_held_stop(cpu, mpidr);
+			wfe();
+		}
+
+		cpumask_clear_cpu(cpu, &spin_table_cpus_held);
+		return;
+	}
 
 	while (READ_ONCE(spin_table_hold_requested)) {
 		u32 requested = READ_ONCE(spin_table_hold_generation);
@@ -357,16 +402,8 @@ static void smp_rvbar_spin_table_hold(unsigned int cpu, u64 mpidr)
 			smp_store_release(&spin_table_held_generation[cpu], generation);
 			cpumask_set_cpu(cpu, &spin_table_cpus_held);
 		}
-		if (READ_ONCE(spin_table_stop_requested)) {
-			spin_table_power->cpu_stop(mpidr);
-			cpumask_set_cpu(cpu, &spin_table_cpus_off);
-			cpumask_clear_cpu(cpu, &spin_table_cpus_held);
-			cpumask_clear_cpu(cpu, &spin_table_cpus_parked);
-
-			while (!READ_ONCE(spin_table_stop_released))
-				wfe();
-			spin_table_power->cpu_off(mpidr);
-		}
+		if (READ_ONCE(spin_table_stop_requested))
+			smp_rvbar_spin_table_held_stop(cpu, mpidr);
 		wfe();
 	}
 
