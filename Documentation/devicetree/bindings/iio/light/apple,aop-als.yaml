@@ -34,6 +34,10 @@ properties:
           - apple,t8112-aop-als
       - const: apple,aop-als
 
+  firmware-name:
+    maxItems: 1
+    description: Calibration file the driver sends the sensor over the AOP setup port.
+
 required:
   - compatible
 

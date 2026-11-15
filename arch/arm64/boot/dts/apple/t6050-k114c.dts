@@ -312,6 +312,15 @@
 };
 
 /*
+ * This board's AOP firmware asks for the sensor's setup buffer and starts the sensor only once the
+ * setup port has had its calibration: the 193-byte blob the driver sends again as the sensor's
+ * property later. Boards whose firmware never asks (the 14-inch M5 Pro) must not name one.
+ */
+&aop_als {
+	firmware-name = "apple/aop-als-cal.bin";
+};
+
+/*
  * The microphone array: ADT audio-hp-mic, three microphones on leap-s RX0 through the
  * proxy ADMAC (Linux channel 1, as on J813), captured by the AOP audio service's own card.
  */
