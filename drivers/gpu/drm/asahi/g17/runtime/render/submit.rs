@@ -341,7 +341,9 @@ impl Backend {
     /// Gives idle render backing back under capacity pressure. Returns whether
     /// anything was returned, in which case the caller retries at once.
     fn reclaim_render_capacity(&self) -> Result<bool> {
-        let mut deferred = DeferredBatch::publication()?;
+        let mut deferred = DeferredBatch::reclaim()?;
+        // Idle pools go back only while the shared window is short.
+        let pools = self.lower_window_short();
         let result: Result<bool> = (|| {
             let lease = self.shared.preparations.try_enter()?;
             let mut state = self.shared.state.lock();
@@ -355,7 +357,9 @@ impl Backend {
                 return Ok(false);
             }
             firmware.queues.observe_pool_releases(&firmware.init, &mut deferred)?;
-            firmware.queues.reclaim_idle_render_pools(&firmware.init, &mut deferred)?;
+            if pools {
+                firmware.queues.reclaim_idle_render_pools(&firmware.init, &mut deferred)?;
+            }
             let mut published = 0;
             if !firmware.render_control_backpressured() {
                 (published, _) = firmware.queues.vacate_idle_pools(
