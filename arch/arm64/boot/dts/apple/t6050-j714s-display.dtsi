@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * J714s external displays: DisplayPort alt mode on the left-front and right ports and USB4
- * DisplayPort tunnels on the right port. dcpext0 and dcpext2 drive the routes; dcpext1 and
- * dcpext3 are their pairs for modes that need two pipelines. The left-back port (ATC0) is the
- * debug port and is not described. Addresses and interrupts are from the J714sAP ADT. The boot
- * loader hands each engine over: it enables the engine, its mailbox and DARTs, publishes its
- * bandwidth scratch and adds its display DART to the display subsystem.
+ * J714s external displays: DisplayPort alt mode and USB4 DisplayPort tunnels on the left-front
+ * and right ports. dcpext0 and dcpext2 drive the routes; dcpext1 and dcpext3 are their pairs for
+ * modes that need two pipelines. The left-back port (ATC0) is the debug port and is not
+ * described. Addresses and interrupts are from the J714sAP ADT. The boot loader hands each engine
+ * over: it enables the engine, its mailbox and DARTs, publishes its bandwidth scratch and adds its
+ * display DART to the display subsystem.
  */
 
 &dcpext1 {
@@ -239,6 +239,13 @@
 &acio2 {
 	interrupts = <AIC_IRQ 0 1667 IRQ_TYPE_LEVEL_HIGH>, <AIC_IRQ 0 1668 IRQ_TYPE_LEVEL_HIGH>,
 		     <AIC_IRQ 0 1673 IRQ_TYPE_LEVEL_HIGH>, <AIC_IRQ 0 1674 IRQ_TYPE_LEVEL_HIGH>;
+	interrupt-names = "dpin0", "dpin1", "dpin2", "dpin3";
+};
+
+/* The left-front router's DP IN interrupts (atc1-dpin0..3, as in the T6050 inventory and J716c) */
+&acio1 {
+	interrupts = <AIC_IRQ 0 1635 IRQ_TYPE_LEVEL_HIGH>, <AIC_IRQ 0 1636 IRQ_TYPE_LEVEL_HIGH>,
+		     <AIC_IRQ 0 1641 IRQ_TYPE_LEVEL_HIGH>, <AIC_IRQ 0 1642 IRQ_TYPE_LEVEL_HIGH>;
 	interrupt-names = "dpin0", "dpin1", "dpin2", "dpin3";
 };
 
