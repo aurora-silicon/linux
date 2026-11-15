@@ -535,6 +535,8 @@ struct apple_pcie {
 	u32			t6050_warm_writes[2 * APPLE_PCIE_T6050_WARM_WRITES];
 	unsigned int		t6050_warm_count;
 	bool			t6050_warm_done;
+	/* When this wake's bring-up of that port had the link up and its 100 ms over; 0 before */
+	ktime_t			t6050_link_up;
 	/* The endpoint requests a warm reset after link shutdown; no radio wake is armed. */
 	bool			t6050_reset_before_sleep;
 	unsigned long		t6050_parked;
@@ -5241,6 +5243,7 @@ static int apple_pcie_t6050_pm_notify(struct notifier_block *nb, unsigned long a
 	pcie->t6050_woke = false;
 	/* A suspend that never shuts the link down gives no reset: the last wake's doesn't count */
 	pcie->t6050_warm_done = false;
+	pcie->t6050_link_up = 0;
 	pcie->t6050_reset_before_sleep = false;
 	/*
 	 * The DART wasn't bound when this host probed. Looked up here, before the freezer and any
@@ -5453,6 +5456,7 @@ static int apple_pcie_t6050_sleep_up(struct apple_pcie *pcie, bool noirq)
 	apple_pcie_port_writel(port, ~0, PORT_INTSTAT);
 	apple_pcie_port_writel(port, port->saved_intmask, PORT_INTMSK);
 	WRITE_ONCE(port->link_failed, false);
+	pcie->t6050_link_up = ktime_get();
 	WRITE_ONCE(pcie->t6050_down, false);
 	dev_info(pcie->dev, "port %d: link up again after the sleep in %lld ms, status %#x\n",
 		 port->idx, ktime_ms_delta(ktime_get(), start),
@@ -5499,6 +5503,21 @@ bool apple_pcie_t6050_warm_reset_done(struct pci_dev *bridge)
 	return pcie && pcie->t6050_warm_done;
 }
 EXPORT_SYMBOL_GPL(apple_pcie_t6050_warm_reset_done);
+
+/*
+ * For the endpoint's driver: when this host's last bring-up of the port had the link up, with
+ * the 100 ms after the training over (see apple_pcie_t6050_port_train()); 0 when the port is
+ * not up from such a bring-up.
+ */
+ktime_t apple_pcie_t6050_link_up_time(struct pci_dev *bridge)
+{
+	struct apple_pcie *pcie = apple_pcie_t6050_from_bridge(bridge);
+
+	if (!pcie || READ_ONCE(pcie->t6050_down) || pcie->t6050_lost)
+		return 0;
+	return pcie->t6050_link_up;
+}
+EXPORT_SYMBOL_GPL(apple_pcie_t6050_link_up_time);
 
 /*
  * For the endpoint's driver, from its suspend: nothing below the port is to wake the system

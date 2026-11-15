@@ -2,6 +2,8 @@
 #ifndef _LINUX_PCI_APPLE_H
 #define _LINUX_PCI_APPLE_H
 
+#include <linux/types.h>
+
 struct device;
 struct device_node;
 struct notifier_block;
@@ -31,16 +33,23 @@ int apple_pcie_tunnel_cio_finish(struct device *dev);
  * endpoint its warm reset at this wake, before the link came up; and, for a link that never
  * went down, the port taken down, the reset given, the port brought up again. From the
  * endpoint's suspend, when nothing below the port is to wake the system from this sleep:
- * request a warm-reset replay after link shutdown, before the sleep.
+ * request a warm-reset replay after link shutdown, before the sleep. When the host's last
+ * bring-up of the port had its link up, or 0.
  */
 #if IS_REACHABLE(CONFIG_PCIE_APPLE)
 bool apple_pcie_t6050_warm_reset_done(struct pci_dev *bridge);
+ktime_t apple_pcie_t6050_link_up_time(struct pci_dev *bridge);
 int apple_pcie_t6050_port_recycle(struct pci_dev *bridge);
 void apple_pcie_t6050_sleep_reset(struct pci_dev *bridge);
 #else
 static inline bool apple_pcie_t6050_warm_reset_done(struct pci_dev *bridge)
 {
 	return false;
+}
+
+static inline ktime_t apple_pcie_t6050_link_up_time(struct pci_dev *bridge)
+{
+	return 0;
 }
 
 static inline int apple_pcie_t6050_port_recycle(struct pci_dev *bridge)

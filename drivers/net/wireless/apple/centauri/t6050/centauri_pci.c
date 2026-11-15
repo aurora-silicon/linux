@@ -560,8 +560,8 @@ static void centauri_t6050_rewake_worker(struct work_struct *work)
 	struct centauri_t6050_rewake *rw = container_of(work, struct centauri_t6050_rewake, work);
 	struct pci_dev *bridge = rw->bridge, *fn;
 	struct pci_bus *bus = bridge->subordinate;
-	s64 down_ms = -1, up_ms = -1;
-	ktime_t start;
+	s64 down_ms = -1, up_ms = -1, wait_ms;
+	ktime_t begin, start, up_at;
 	u16 lnksta = 0, first = 0;
 	int i, ret;
 
@@ -599,23 +599,33 @@ static void centauri_t6050_rewake_worker(struct work_struct *work)
 			ret);
 		goto unlock;
 	}
-	start = ktime_get();
+	/*
+	 * The watch's times are from the host's bring-up of the port: in the wake's noirq resume
+	 * the link trained long before this work runs, once tasks run again. A host that can't
+	 * say: from now.
+	 */
+	begin = ktime_get();
+	start = apple_pcie_t6050_link_up_time(bridge) ?: begin;
+	up_at = start;
 	pcie_capability_read_word(bridge, PCI_EXP_LNKSTA, &first);
 	/*
 	 * The link is normally up and stays up: the reset came before it trained. A link that
-	 * still goes down in the first second must train again by itself.
+	 * still goes down in the first second after it trained must train again by itself. It is
+	 * looked at once at least, however late this work runs.
 	 */
-	while (ktime_ms_delta(ktime_get(), start) < 1000) {
+	for (;;) {
 		if (!centauri_t6050_link_active(bridge)) {
 			down_ms = ktime_ms_delta(ktime_get(), start);
 			break;
 		}
+		if (ktime_ms_delta(ktime_get(), start) >= 1000)
+			break;
 		usleep_range(1000, 2000);
 	}
 	if (down_ms >= 0) {
 		while (!centauri_t6050_link_active(bridge)) {
-			/* 10 s in all: a later suspend's freezer waits for this work */
-			if (ktime_ms_delta(ktime_get(), start) > 10000) {
+			/* 10 s in all from this work's start: a later suspend's freezer waits for it */
+			if (ktime_ms_delta(ktime_get(), begin) > 10000) {
 				pcie_capability_read_word(bridge, PCI_EXP_LNKSTA, &lnksta);
 				pci_err(bridge, "N1 after the warm reset: LNKSTA %#x then down at %lld ms, not back in 10 s (LNKSTA %#x)\n",
 					first, down_ms, lnksta);
@@ -624,9 +634,12 @@ static void centauri_t6050_rewake_worker(struct work_struct *work)
 			usleep_range(5000, 6000);
 		}
 		up_ms = ktime_ms_delta(ktime_get(), start);
+		up_at = ktime_get();
 	}
-	/* The PCIe wait from link up to configuration requests (the ADT's perst-to-config) */
-	msleep(100);
+	/* The PCIe wait from link up to configuration requests (the ADT's perst-to-config): its rest */
+	wait_ms = 100 - ktime_ms_delta(ktime_get(), up_at);
+	if (wait_ms > 0)
+		msleep(wait_ms);
 	pcie_capability_read_word(bridge, PCI_EXP_LNKSTA, &lnksta);
 	pci_rescan_bus(bus);
 	fn = pci_get_slot(bus, PCI_DEVFN(rw->slot, 0));
