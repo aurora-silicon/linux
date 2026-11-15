@@ -529,6 +529,8 @@ struct apple_pcie {
 	bool			t6050_lost;
 	/* Ports Linux powers and trains, parked over a firmware sleep: their functions removed */
 	struct notifier_block	t6050_pm_nb;
+	/* Those ports back, and their functions looked for, once the resume is over */
+	struct work_struct	t6050_unpark_work;
 	/* The endpoint's warm reset, given by this host while the port is down */
 	struct platform_device	*t6050_smc;
 	u32			t6050_warm_key;
@@ -5094,6 +5096,12 @@ static int apple_pcie_t6050_cold_wake(struct apple_pcie *pcie, struct apple_pcie
 			apple_dart_quiesce_commands(port->cold_dart);
 		apple_pcie_t6050_port_park(port, false);
 	}
+	if (!ret) {
+		/* Under the lock, as a restart's shutdown reads them: a port up is no longer parked */
+		WRITE_ONCE(pcie->t6050_cold_lost, pcie->t6050_cold_lost & ~BIT(port->idx));
+		pcie->t6050_parked &= ~BIT(port->idx);
+		pcie->t6050_rescan |= BIT(port->idx);
+	}
 	mutex_unlock(&pcie->lock);
 	if (ret) {
 		dev_err(pcie->dev, "port %d: not back after the sleep: %d, status %#x; %s\n",
@@ -5102,9 +5110,6 @@ static int apple_pcie_t6050_cold_wake(struct apple_pcie *pcie, struct apple_pcie
 			"it stays parked until a restart");
 		return ret;
 	}
-	WRITE_ONCE(pcie->t6050_cold_lost, pcie->t6050_cold_lost & ~BIT(port->idx));
-	pcie->t6050_parked &= ~BIT(port->idx);
-	pcie->t6050_rescan |= BIT(port->idx);
 	rp = early ? pci_get_domain_bus_and_slot(pci_domain_nr(bridge->bus), 0,
 						  PCI_DEVFN(port->idx, 0)) : NULL;
 	if (rp) {
@@ -5191,9 +5196,9 @@ static void apple_pcie_t6050_unpark_cold_early(struct apple_pcie *pcie)
 
 /*
  * After a suspend, with every device resumed and the tasks thawed (the park ran before the
- * freeze): the ports still parked come back, and the functions of every port that is back are
- * found again. Also after a suspend that was abandoned, where the port was parked and nothing
- * was lost.
+ * freeze), from apple_pcie_t6050_unpark_work(): the ports still parked come back, and the
+ * functions of every port that is back are found again. Also after a suspend that was
+ * abandoned, where the port was parked and nothing was lost.
  */
 static void apple_pcie_t6050_unpark_cold(struct apple_pcie *pcie)
 {
@@ -5229,17 +5234,34 @@ static void apple_pcie_t6050_unpark_cold(struct apple_pcie *pcie)
 	}
 }
 
+/*
+ * From a work, not from the PM notifier chain: the rescan takes the PCI rescan lock, which the
+ * radio's driver holds through its own new enumeration after the wake (more than a second), and
+ * every notifier after this one, and the end of the system's resume, waited for it there. The
+ * work is freezable, so a later system sleep's freezer waits for it as well as the next
+ * PM_SUSPEND_PREPARE; a restart's shutdown cancels it, see apple_pcie_shutdown().
+ */
+static void apple_pcie_t6050_unpark_work(struct work_struct *work)
+{
+	struct apple_pcie *pcie = container_of(work, struct apple_pcie, t6050_unpark_work);
+
+	if (pcie->t6050_parked || pcie->t6050_rescan)
+		apple_pcie_t6050_unpark_cold(pcie);
+}
+
 static int apple_pcie_t6050_pm_notify(struct notifier_block *nb, unsigned long action, void *unused)
 {
 	struct apple_pcie *pcie = container_of(nb, struct apple_pcie, t6050_pm_nb);
 
 	if (action == PM_POST_SUSPEND) {
 		if (pcie->t6050_parked || pcie->t6050_rescan)
-			apple_pcie_t6050_unpark_cold(pcie);
+			queue_work(system_freezable_wq, &pcie->t6050_unpark_work);
 		return NOTIFY_DONE;
 	}
 	if (action != PM_SUSPEND_PREPARE)
 		return NOTIFY_DONE;
+	/* The last wake's ports are back, or stay parked, before this sleep parks them again */
+	flush_work(&pcie->t6050_unpark_work);
 	pcie->t6050_woke = false;
 	/* A suspend that never shuts the link down gives no reset: the last wake's doesn't count */
 	pcie->t6050_warm_done = false;
@@ -5361,6 +5383,7 @@ static void apple_pcie_t6050_sleep_probe(struct platform_device *pdev, struct ap
 	if (list_entry_is_head(port, &pcie->ports, entry))
 		return;
 	pcie->t6050_port = port;
+	INIT_WORK(&pcie->t6050_unpark_work, apple_pcie_t6050_unpark_work);
 	pcie->t6050_pm_nb.notifier_call = apple_pcie_t6050_pm_notify;
 	if (register_pm_notifier(&pcie->t6050_pm_nb))
 		pcie->t6050_pm_nb.notifier_call = NULL;
@@ -6307,6 +6330,9 @@ static void apple_pcie_shutdown(struct platform_device *pdev)
 	struct pci_dev *rp;
 	u32 value;
 
+	/* A parked port's return after a wake: over, or never started, before the ports are held */
+	if (pcie->t6050_port)
+		cancel_work_sync(&pcie->t6050_unpark_work);
 	/* A port a failed wake left down is held already, and may not answer */
 	if (!pcie->hw->adopt_link || READ_ONCE(pcie->t6050_down))
 		return;
