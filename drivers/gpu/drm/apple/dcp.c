@@ -224,7 +224,7 @@ MODULE_PARM_DESC(keepalive_ms, "0 = off. N = present the last frame again, with 
 
 bool dcp_swap_band_hold = DCP_SWAP_BAND_HOLD_DEFAULT;
 module_param_named(swap_band_hold, dcp_swap_band_hold, bool, 0644);
-MODULE_PARM_DESC(swap_band_hold, "hold a presentation that would reach an idle panel 3-8.5 ms before its next grid frame until just after that frame (default off)");
+MODULE_PARM_DESC(swap_band_hold, "hold a presentation that would reach an idle panel 3-8.5 ms before its next grid frame until just after that frame (default on)");
 
 /*
  * DP/HDMI audio of external displays, on by default as on macOS: a display

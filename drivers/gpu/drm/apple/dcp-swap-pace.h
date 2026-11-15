@@ -123,6 +123,6 @@ static inline u64 dcp_band_hold_ns(const u64 *frames, u64 now)
 /* Boot values of the parameters. A change here flips the default; the parameters stay as the runtime rollback. */
 #define DCP_SWAP_TS_MODE_DEFAULT DCP_SWAP_TS_CURRENT
 #define DCP_KEEPALIVE_MS_DEFAULT 25
-#define DCP_SWAP_BAND_HOLD_DEFAULT false
+#define DCP_SWAP_BAND_HOLD_DEFAULT true
 
 #endif
