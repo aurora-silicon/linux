@@ -998,6 +998,7 @@
 		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x178 4>;
 		label = "atc2_usb_aon";
+		apple,always-on; /* The ATC PHY loses its state without it */
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		status = "disabled";
@@ -1029,6 +1030,7 @@
 		compatible = "apple,t6050-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x190 4>;
 		label = "atc3_usb_aon";
+		apple,always-on; /* The ATC PHY loses its state without it */
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 	};
