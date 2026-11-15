@@ -9,6 +9,9 @@
 #include <linux/sizes.h>
 #include <linux/types.h>
 
+/* DAPF records: four on T6041 and T8140, five on T6050 and T8132. */
+#define ANE_FW_DAPF_MAX 5
+
 struct device_node;
 struct platform_device;
 struct ane_h16_profile;
@@ -101,6 +104,8 @@ struct ane_fw_platform {
 	u16 dart_revision;
 	u8 dapf_count;
 	const u8 *text_pin;
+	/* H16: an aux-3 window, which the build's XL tunables go to. */
+	bool has_xl;
 };
 
 /* Pure range check: the boot loader supplies the physical addresses. */

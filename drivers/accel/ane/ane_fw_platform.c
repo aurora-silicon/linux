@@ -38,6 +38,11 @@ static const u32 ane_h16_power_words[] = {
 	0x3c0, 0xc008, 0xc000, 0xc010, 0xc018,
 };
 
+/* The same five domains; ANE_SYS sits at +0x570 in the T8132 PMGR. */
+static const u32 ane_t8132_power_words[] = {
+	0x570, 0xc008, 0xc000, 0xc010, 0xc018,
+};
+
 static const char * const ane_h17_reg_names[] = { "engine", "pmgr", "pwgate" };
 static const u32 ane_h17_reg_sizes[] = { 0x2000000, 0x18000, 0x34 };
 
@@ -68,6 +73,8 @@ const struct ane_fw_platform ane_h16_platform = {
 	.dapf_dart = 0,
 	.dapf_offset = 0x10000,
 	.dapf_size = SZ_16K,
+	.dapf_count = 4,
+	.has_xl = true,
 	/* The DT compatible is t6041 on the M4 Max and the M4 Pro (T6040) alike. */
 	.soc = 0x6040,
 	.chip_family = 16,
@@ -106,30 +113,48 @@ const struct ane_fw_platform ane_h16_platform = {
 };
 
 /*
- * M4: resource metadata from the public T8132 J773/J604/J713 ADTs.
- * The shared H16 path is selected, but T6041's firmware profiles, MMIO
- * tables, power sequence and second-engine window are not qualified here.
- * Keep boot_qualified false until an owner validates a T8132 preload and
- * the backend handles its single engine, two IRQs and five DAPF records.
+ * M4: the H16 engine and firmware interface of the T6041, with one engine
+ * (no aux-3 window), its own engine writes and firmware builds, ANE_SYS at
+ * PMGR +0x570 and five DAPF records. The backend polls the F2H channels.
  */
 const struct ane_fw_platform ane_t8132_platform = {
+	.h16_profiles = ane_t8132_profiles,
+	.h16_profile_count = ARRAY_SIZE(ane_t8132_profiles),
+	.h16_mmio = ane_h16_mmio_t6041,
+	.h16_mmio_count = ARRAY_SIZE(ane_h16_mmio_t6041),
+	.dart_params = 0x8,
 	.soc = 0x8132,
 	.chip_family = 16,
 	.ane_type = 0x100,
+	.hwx_subtype = 7,
+	.task_generation = 17,
 	.interrupt_count = 2,
 	.irq_role = ANE_FW_IRQ_UNKNOWN,
 	.owner = ANE_FW_OWNER_AP,
 	.reg_names = ane_t8132_reg_names,
 	.reg_sizes = ane_t8132_reg_sizes,
 	.reg_count = ARRAY_SIZE(ane_t8132_reg_names),
+	.wrapper = 0x1600000,
+	.mailbox = 0x1608000,
+	.scratch = 0x1880020,
+	.doorbell = 0x1884000,
+	.irq_status = 0x188c000,
+	.irq_ack = 0x1890000,
+	.power_words = ane_t8132_power_words,
+	.power_count = ARRAY_SIZE(ane_t8132_power_words),
 	.dapf_dart = 0,
 	.dapf_offset = 0x10000,
 	.dapf_size = SZ_16K,
 	.dapf_count = 5,
 	.preload_dva = { 0x10000000000, 0x100000c0000 },
 	.preload_size = { 0xc0000, 0x2ac000 },
-	.boot_qualified = false,
+	.stream_mask = BIT(0) | BIT(11),
+	/* System sleep cycles the engine cold and replays every program, as on T6041. */
+	.sleep_cold = true,
+	.boot_qualified = true,
 	.firmware_preloaded = true,
+	.safe_reset = false,
+	.pmp_report = "apple,t8132-pmp-v2-report",
 };
 
 const struct ane_fw_platform ane_h17_platform = {
@@ -398,7 +423,8 @@ int ane_fw_platform_preflight(struct platform_device *pdev,
 			"H16 requires bootloader-reserved no-map TEXT/DATA preload ranges\n");
 
 	if (!soc->h16_profile_count || !soc->h16_mmio_count || soc->dapf_dart >= 3 ||
-	    !soc->dapf_size || of_property_count_u64_elems(np, "apple,dapf-ranges") != 8)
+	    !soc->dapf_size || !soc->dapf_count || soc->dapf_count > ANE_FW_DAPF_MAX ||
+	    of_property_count_u64_elems(np, "apple,dapf-ranges") != soc->dapf_count * 2)
 		return -ENODATA;
 	return 0;
 }
