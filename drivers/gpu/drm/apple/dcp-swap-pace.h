@@ -18,23 +18,34 @@ enum dcp_swap_ts_mode {
 	DCP_SWAP_TS_LONE_FRAME,
 	/* No timestamps. */
 	DCP_SWAP_TS_OFF,
+	/*
+	 * The four types macOS 26.6.2 sets (QuartzCore finish_update): a target
+	 * of max(target - frame/8, update start + 100 us), the compose start,
+	 * the update start and the submit time. The commit time stands in for
+	 * update and compose start, and the submit time for the target.
+	 */
+	DCP_SWAP_TS_MACOS,
 };
 
-/* Types 1, 2 and 7 of IOMobileFramebuffer: swap.timestamp[0], [1] and [6]. */
+/* Types 1, 2, 4, 5 and 7 of IOMobileFramebuffer: swap.timestamp[0], [1], [3], [4] and [6]. */
 struct dcp_swap_ts {
 	u64 ts0;
 	u64 ts1;
+	u64 ts3;
+	u64 ts4;
 	u64 ts6;
 };
 
 /*
  * prev is the previous accepted swap's time, or now when there is none or it
  * is stale (dcp_swap_prev_time()). A swap whose prev is now follows idle.
+ * start is when the driver got the commit. hz is the timebase of all of them.
  */
 static inline struct dcp_swap_ts dcp_swap_ts_pick(unsigned int mode, u64 now,
-						  u64 prev, u64 frame_ticks)
+						  u64 prev, u64 start, u64 hz)
 {
 	struct dcp_swap_ts ts = { .ts0 = now, .ts1 = prev, .ts6 = now };
+	u64 frame_ticks = hz / 120;
 
 	switch (mode) {
 	case DCP_SWAP_TS_DESKTOP:
@@ -46,6 +57,15 @@ static inline struct dcp_swap_ts dcp_swap_ts_pick(unsigned int mode, u64 now,
 		break;
 	case DCP_SWAP_TS_OFF:
 		ts = (struct dcp_swap_ts) {};
+		break;
+	case DCP_SWAP_TS_MACOS:
+		ts = (struct dcp_swap_ts) {
+			.ts0 = max(now > frame_ticks / 8 ? now - frame_ticks / 8 : 0,
+				   start + hz / 10000),
+			.ts1 = start,
+			.ts3 = start,
+			.ts4 = now,
+		};
 		break;
 	}
 	return ts;

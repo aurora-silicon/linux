@@ -3206,16 +3206,20 @@ static bool iomfbep_cb_w86_service(struct apple_dcp *dcp, int tag, void *out, vo
  */
 #define DCP_V27_TIMEBASE_HZ 24000000U
 
-static u64 __maybe_unused dcp_swap_time(void)
+static u64 __maybe_unused dcp_swap_ticks(u64 counter)
 {
-	u64 now = arch_timer_read_counter();
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
 	u32 rate = arch_timer_get_cntfrq();
 
 	if (rate && rate != DCP_V27_TIMEBASE_HZ)
-		return mul_u64_u32_div(now, DCP_V27_TIMEBASE_HZ, rate);
+		return mul_u64_u32_div(counter, DCP_V27_TIMEBASE_HZ, rate);
 #endif
-	return now;
+	return counter;
+}
+
+static u64 __maybe_unused dcp_swap_time(void)
+{
+	return dcp_swap_ticks(arch_timer_read_counter());
 }
 
 /*
@@ -3235,19 +3239,25 @@ static u64 __maybe_unused dcp_swap_prev_time(u64 now, u64 prev)
 }
 
 /*
- * Sets swap timestamps 1, 2 and 7 (swap_ts_mode, dcp-swap-pace.h). A present
- * built earlier has stale ones, so the keepalive present sets them again.
+ * Sets swap timestamps 1, 2, 4, 5 and 7 (swap_ts_mode, dcp-swap-pace.h). A
+ * present built earlier has stale ones, so the keepalive present sets them
+ * again. The active transaction's queue time is the update start.
  */
 static void __maybe_unused dcp_swap_stamp(struct apple_dcp *dcp,
 					  typeof(DCP_FW_SWAP(dcp)) *req)
 {
+	struct iomfb_transaction *active = dcp->iomfb.active;
 	u64 now = dcp_swap_time();
 	u64 prev = dcp_swap_prev_time(now, dcp->swap_submit_timestamp);
+	u64 start = active && active->queued_counter ?
+		min(dcp_swap_ticks(active->queued_counter), now) : now;
 	struct dcp_swap_ts ts = dcp_swap_ts_pick(READ_ONCE(dcp_swap_ts_mode), now, prev,
-						 DCP_V27_TIMEBASE_HZ / 120);
+						 start, DCP_V27_TIMEBASE_HZ);
 
 	req->swap.timestamp[0] = ts.ts0;
 	req->swap.timestamp[1] = ts.ts1;
+	req->swap.timestamp[3] = ts.ts3;
+	req->swap.timestamp[4] = ts.ts4;
 	req->swap.timestamp[6] = ts.ts6;
 	trace_iomfb_vrr_timestamps(dcp, dcp->vrr_enabled, ts.ts0, ts.ts1);
 }

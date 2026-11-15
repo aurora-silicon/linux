@@ -21,6 +21,8 @@
 #include <linux/soc/apple/rtkit.h>
 #include <linux/unaligned.h>
 
+#include <clocksource/arm_arch_timer.h>
+
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_color_mgmt.h>
@@ -821,6 +823,7 @@ int iomfb_queue(struct apple_dcp *dcp, struct iomfb_transaction *transaction)
 		if (transaction->brightness_only)
 			dcp->iomfb.backlight_queued = true;
 		dcp->iomfb.queued++;
+		transaction->queued_counter = arch_timer_read_counter();
 		list_add_tail(&transaction->link, &dcp->iomfb.pending);
 		schedule_work(&dcp->iomfb.work);
 	}

@@ -73,6 +73,8 @@ struct iomfb_transaction {
 	bool brightness_only;
 	bool presentation;
 	bool completed;
+	/* arch timer counter when iomfb_queue() took it: the update start */
+	u64 queued_counter;
 };
 struct apple_dcp_typec_port;
 
