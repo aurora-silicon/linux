@@ -1039,10 +1039,10 @@ static void dcp_firmware_metadata_notify(struct apple_dcp *dcp)
 	unsigned long flags;
 	bool ready;
 
+	/* The sink's identity is enough: a timing that fits a descriptor is optional. */
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
-	ready = dcp->metadata.attributes_valid && dcp->metadata.timing_valid &&
-		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.attributes_ticket) &&
-		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.timing_ticket);
+	ready = dcp->metadata.attributes_valid &&
+		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.attributes_ticket);
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	if (ready && dcp->connector && READ_ONCE(dcp->connector->connected))
 		schedule_work(&dcp->connector->hotplug_wq);
@@ -1094,8 +1094,13 @@ void dcp_firmware_metadata_timing(struct apple_dcp *dcp)
 	 */
 	for (i = 0; i < dcp->nr_modes; i++) {
 		const struct dcp_display_mode *m = &dcp->modes[i];
+		struct drm_display_mode timing = m->mode;
 
 		if (!m->metadata_timing_valid)
+			continue;
+		/* A descriptor holds at most 655.35 MHz: faster modes are left to the list. */
+		timing.flags |= m->metadata_sync_flags;
+		if (!dcp_metadata_timing_fits(&timing))
 			continue;
 		if (best == UINT_MAX || (m->mode.type & DRM_MODE_TYPE_PREFERRED) ||
 		    (!(dcp->modes[best].mode.type & DRM_MODE_TYPE_PREFERRED) &&
@@ -1128,29 +1133,35 @@ bool dcp_firmware_metadata_current(struct apple_dcp *dcp, u64 generation)
 	return valid;
 }
 
-const struct drm_edid *dcp_firmware_edid(struct apple_dcp *dcp, u64 *generation)
+const struct drm_edid *dcp_firmware_edid(struct apple_dcp *dcp, u64 *generation,
+					 u32 *defaults)
 {
 	struct dcp_display_metadata attributes;
 	struct drm_display_mode preferred;
 	const struct drm_edid *edid;
 	unsigned long flags;
-	bool valid;
+	bool valid, timing = false;
 
 	if (!dcp_firmware_metadata_enabled(dcp))
 		return ERR_PTR(-ENODEV);
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
-	valid = dcp->metadata.attributes_valid && dcp->metadata.timing_valid &&
-		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.attributes_ticket) &&
-		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.timing_ticket);
+	valid = dcp->metadata.attributes_valid &&
+		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.attributes_ticket);
 	if (valid) {
 		attributes = dcp->metadata.attributes;
-		preferred = dcp->metadata.preferred;
+		timing = dcp->metadata.timing_valid &&
+			 dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.timing_ticket);
+		if (timing)
+			preferred = dcp->metadata.preferred;
 		*generation = dcp->metadata.epoch.generation;
 	}
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	if (!valid)
 		return ERR_PTR(-ENODATA);
-	edid = dcp_metadata_edid(&attributes, &preferred);
+	if (!timing)
+		attributes.defaults |= DCP_METADATA_DEFAULT_TIMING;
+	*defaults = attributes.defaults;
+	edid = dcp_metadata_edid(&attributes, timing ? &preferred : NULL);
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
 	valid = !dcp->metadata.epoch.invalidated && dcp->metadata.epoch.connected &&
 		*generation == dcp->metadata.epoch.generation;
