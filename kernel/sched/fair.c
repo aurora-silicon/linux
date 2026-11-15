@@ -87,6 +87,12 @@ static unsigned int normalized_sysctl_sched_base_slice	= 700000ULL;
 
 __read_mostly unsigned int sysctl_sched_migration_cost	= 500000UL;
 
+/*
+ * MISFIT_RUNTIME: continuous execution after which a task on a smaller CPU
+ * counts as misfit. (default: 8 msec, units: nanoseconds)
+ */
+__read_mostly unsigned int sysctl_sched_misfit_runtime	= 8000000UL;
+
 static int __init setup_sched_thermal_decay_shift(char *str)
 {
 	pr_warn("Ignoring the deprecated sched_thermal_decay_shift= option\n");
@@ -6337,6 +6343,36 @@ static inline int task_fits_cpu(struct task_struct *p, int cpu)
 	return (util_fits_cpu(util, uclamp_min, uclamp_max, cpu) > 0);
 }
 
+/*
+ * A new or newly woken task starts with a utilization well below a small
+ * CPU's capacity, and PELT needs tens of milliseconds of execution before
+ * task_fits_cpu() fails. A CPU-bound task placed on a small CPU therefore
+ * stays there for that long even when a bigger CPU is idle. With
+ * MISFIT_RUNTIME, a task that has run without sleeping or migrating for
+ * sysctl_sched_misfit_runtime on a CPU smaller than its maximum allowed
+ * capacity is a misfit as well. Tasks capped by uclamp_max at or below this
+ * CPU's capacity, SCHED_IDLE tasks and kernel threads are left alone.
+ */
+static inline bool task_misfit_runtime(struct task_struct *p, int cpu)
+{
+	unsigned long cap = arch_scale_cpu_capacity(cpu);
+
+	if (!sched_feat(MISFIT_RUNTIME))
+		return false;
+
+	if (cap >= p->max_allowed_capacity || (p->flags & PF_KTHREAD) ||
+	    task_has_idle_policy(p) || uclamp_eff_value(p, UCLAMP_MAX) <= cap)
+		return false;
+
+	return p->se.sum_exec_runtime - p->burst_runtime >=
+	       sysctl_sched_misfit_runtime;
+}
+
+static inline bool task_is_misfit(struct task_struct *p, int cpu)
+{
+	return !task_fits_cpu(p, cpu) || task_misfit_runtime(p, cpu);
+}
+
 static inline void update_misfit_status(struct task_struct *p, struct rq *rq)
 {
 	int cpu = cpu_of(rq);
@@ -6350,7 +6386,7 @@ static inline void update_misfit_status(struct task_struct *p, struct rq *rq)
 	 */
 	if (!p || (p->nr_cpus_allowed == 1) ||
 	    (arch_scale_cpu_capacity(cpu) == p->max_allowed_capacity) ||
-	    task_fits_cpu(p, cpu)) {
+	    !task_is_misfit(p, cpu)) {
 
 		rq->misfit_task_load = 0;
 		if (p)
@@ -8221,8 +8257,10 @@ enqueue_task_fair(struct rq *rq, struct task_struct *p, int flags)
 	unsigned long weight;
 	bool curr;
 
-	if (flags & ENQUEUE_WAKEUP)
+	if (flags & ENQUEUE_WAKEUP) {
 		p->misfit_runtime = se->sum_exec_runtime;
+		p->burst_runtime = se->sum_exec_runtime;
+	}
 
 	if (task_is_throttled(p) && enqueue_throttled_task(p))
 		return;
@@ -10004,6 +10042,7 @@ static void migrate_task_rq_fair(struct task_struct *p, int new_cpu)
 	struct sched_entity *se = &p->se;
 
 	p->misfit_runtime = se->sum_exec_runtime;
+	p->burst_runtime = se->sum_exec_runtime;
 
 	if (!task_on_rq_migrating(p)) {
 		remove_entity_load_avg(se);
@@ -11397,7 +11436,7 @@ static int detach_tasks(struct lb_env *env)
 
 		case migrate_misfit:
 			/* This is not a misfit task */
-			if (task_fits_cpu(p, env->src_cpu))
+			if (!task_is_misfit(p, env->src_cpu))
 				goto next;
 
 			env->imbalance = 0;
@@ -15083,7 +15122,7 @@ static void misfit_rotate_work(struct work_struct *work)
 
 	/* The task may have moved, slept or shrunk since the tick. */
 	if (task_cpu(p) != src_cpu || !task_on_rq_queued(p) ||
-	    !misfit_rotate_candidate(p) || task_fits_cpu(p, src_cpu))
+	    !misfit_rotate_candidate(p) || !task_is_misfit(p, src_cpu))
 		goto out;
 
 	rcu_read_lock();

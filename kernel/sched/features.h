@@ -142,6 +142,13 @@ SCHED_FEAT(UTIL_EST, true)
  */
 SCHED_FEAT(MISFIT_ROTATE, true)
 
+/*
+ * On asymmetric CPU capacity systems, treat a task that has run without
+ * sleeping for misfit_runtime_ns on a CPU smaller than it may use as a
+ * misfit, before its PELT utilization has grown past the smaller CPU.
+ */
+SCHED_FEAT(MISFIT_RUNTIME, false)
+
 SCHED_FEAT(LATENCY_WARN, false)
 
 /*

@@ -3158,6 +3158,7 @@ static inline void attach_one_task(struct rq *rq, struct task_struct *p)
 
 extern __read_mostly unsigned int sysctl_sched_nr_migrate;
 extern __read_mostly unsigned int sysctl_sched_migration_cost;
+extern __read_mostly unsigned int sysctl_sched_misfit_runtime;
 
 extern unsigned int sysctl_sched_base_slice;
 
