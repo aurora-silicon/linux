@@ -32,7 +32,9 @@ properties:
     oneOf:
       - const: apple,dockchannel-hid
       - items:
-          - const: apple,t6041-dockchannel-hid
+          - enum:
+              - apple,t6041-dockchannel-hid
+              - apple,t6050-dockchannel-hid
           - const: apple,dockchannel-hid
 
   reg:
