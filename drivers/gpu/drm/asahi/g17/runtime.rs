@@ -475,6 +475,30 @@ impl Registry {
     /// for every pool released at least `expiry` before `now`, at most four
     /// per pass. Returns the number published and the delay until the next
     /// retained pool expires or a retry is due.
+    /// Under backing pressure, detaches idle open owners from their compute
+    /// channels, as `rebind_compute` does when physical QIDs run short, so that
+    /// `vacate_idle_pools` can give their pools back. An open owner otherwise
+    /// keeps a pool sized for its largest dispatch for as long as it lives, and
+    /// a few idle ones can hold the shared lower window that another queue is
+    /// waiting for. A detached owner binds a channel again on its next dispatch.
+    /// `except` is the owner waiting for the capacity.
+    pub(super) fn share_idle_for_backing(&mut self, except: u64) -> Result<usize> {
+        let teardown = &self.teardown;
+        let mut shared = 0;
+        for mut queue in self.compute.iter_mut().flatten().filter_map(|entry| entry.queue.as_deref_mut()) {
+            if queue.owner() == Some(except) || !queue.shareable() {
+                continue;
+            }
+            if queue.context().is_some_and(|bound| teardown.releasing(bound)) {
+                continue;
+            }
+            if queue.share_idle()? {
+                shared += 1;
+            }
+        }
+        Ok(shared)
+    }
+
     pub(super) fn vacate_idle_pools(
         &mut self,
         init: &super::initdata::InitData,
@@ -1217,7 +1241,20 @@ impl Backend {
                 };
                 match rebound {
                     Rebind::Done => return Ok(()),
-                    Rebind::Grow => { drop(state); drop(lease); return self.grow_compute(required, admission); }
+                    Rebind::Grow => {
+                        drop(state);
+                        drop(lease);
+                        // Larger backing that does not fit yet waits like a fresh queue's:
+                        // idle pools are given back and the growth is retried. The queue is
+                        // unchanged when the new backing cannot be placed.
+                        match self.grow_compute(required, admission) {
+                            Err(error) if error == ENOSPC => {
+                                self.wait_channels(observed, admission, true)?;
+                                continue;
+                            }
+                            result => return result,
+                        }
+                    }
                     Rebind::Rearm(qid) => (firmware.uat.clone(), firmware.pool.clone(), Err(qid)),
                     Rebind::Fresh => {
                         let reservation = match firmware.queues.reserve_compute(self.owner) {
@@ -3089,6 +3126,7 @@ impl Backend {
                 firmware.queues.reclaim_idle_render_pools(&firmware.init, &mut deferred)?;
             }
             if reclaim_backing && !firmware.render_control_backpressured() {
+                firmware.queues.share_idle_for_backing(self.owner)?;
                 let (published, _) = firmware.queues.vacate_idle_pools(&firmware.init, 0, now_ns(), 0)?;
                 if published != 0 { firmware.primary.notify(super::MSG_CONTROL_NOTIFY)?; }
             }

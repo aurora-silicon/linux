@@ -3,7 +3,6 @@
 """Close recovery exactly between the production growth handoff and re-entry."""
 from pathlib import Path
 import os
-import re
 import subprocess
 import tempfile
 ROOT=Path(__file__).resolve().parents[2]/'drivers/gpu/drm/asahi/g17'
@@ -19,7 +18,8 @@ def item(text,sig):
 def fixture():
     gate=(ROOT/'preparation.rs').read_text()
     methods='\n'.join(item(gate,sig) for sig in ['pub(super) fn try_enter(', 'pub(super) fn enter(', 'fn invalidate(', 'pub(super) fn close(', 'pub(super) fn wait_drained(', 'pub(super) fn reopen(']).replace('pub(super) ','')
-    handoff=re.search(r'Rebind::Grow => \{([^}]+)\}',(ROOT/'runtime.rs').read_text()).group(1)
+    arm=item((ROOT/'runtime.rs').read_text(),'Rebind::Grow => {')
+    handoff=arm[arm.index('{')+1:-1]
     return r'''
 use std::sync::{Arc,Mutex as StdMutex,Condvar as StdCondvar,atomic::{AtomicBool,AtomicU64,Ordering},mpsc};
 type Result<T=()>=std::result::Result<T,i32>;
@@ -43,9 +43,14 @@ impl Gate {
 struct Backend {gate:Arc<Gate>,ready:mpsc::Sender<()>,proceed:StdMutex<mpsc::Receiver<()>>}
 impl Backend {
  fn handoff(&self,required:usize)->Result{
-  let lease=self.gate.try_enter()?;let state=();let admission=&();
+  // The arm runs inside build_compute's retry loop; growth that does not fit
+  // waits for capacity and retries.
+  loop {
+  let observed=();let lease=self.gate.try_enter()?;let state=();let admission=&();
 ''' + handoff + r'''
+  }
  }
+ fn wait_channels(&self,_:(),_:&(),_:bool)->Result{Ok(())}
  fn grow_compute(&self,_:usize,_:&())->Result {
   self.ready.send(()).unwrap();self.proceed.lock().unwrap().recv().unwrap();
   let _growth=self.gate.enter(false)?;
