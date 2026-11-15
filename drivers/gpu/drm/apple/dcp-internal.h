@@ -278,6 +278,13 @@ struct apple_dcp_hw_data {
 	 */
 	bool sink_metadata_edid;
 	/*
+	 * One info line per connection of an external display with its link, sink and mode,
+	 * see dcp_link_report(). With it come a search of every firmware log line and the
+	 * EDID's CRC at get_modes; without it none of the three is done. Cleared at probe on
+	 * every board but the one it has run on (dcp.c, dcp_j714s_ext()).
+	 */
+	bool link_report;
+	/*
 	 * With H17P firmware: a firmware-driven system sleep stops the internal processor's
 	 * firmware and powers it down, as DPMS off does, then restarts it warm, see
 	 * dcp_s2r_suspend(). @s2r_ext: the same for an external one, see dcp_s2r_ext_suspend().
@@ -286,6 +293,9 @@ struct apple_dcp_hw_data {
 	bool s2r_ext;
 	/* The firmware crashes on any mode but the 120 Hz boot timing, see dcp_mode_settable(). */
 	bool only_120hz_modes;
+	/* A firmware 27 sleep in progress, and how it ended */
+	bool v27_sleep_protocol;
+	bool v27_sleep_recovery;
 };
 
 enum dcp_test_point {
@@ -568,6 +578,14 @@ struct apple_dcp {
 	struct dcp_swap_submit_req_v27 present_v27;
 	/* Both paired wire records belong to the primary endpoint lock. */
 	struct dcp_swap_submit_req_v27 peer_present_v27;
+	/*
+	 * Swaps go out as A407 with its longer request, from these records: on the J714s with
+	 * the 27.0 method table, where A407 has run (v27_methods is then the J714s's copy of
+	 * that table). Everywhere else A408 and the records above, as before.
+	 */
+	bool v27_a407;
+	struct dcp_swap_submit_req_v27_a407 present_v27_a407;
+	struct dcp_swap_submit_req_v27_a407 peer_present_v27_a407;
 
 	/* DCP shared memory */
 	void *shmem;
@@ -697,6 +715,25 @@ struct apple_dcp {
 	bool rx_held;
 
 	/* A firmware-driven suspend stops the firmware, see dcp_s2r_suspend(). */
+	struct apple_dcp_afkep *sleep_v27_ep[0x20];
+	/*
+	 * Firmware 27.0 on the J714s, the board the firmware 27 sleep and what it needs of the
+	 * shared paths have run on. Every other machine on firmware 27, other T6050 boards and
+	 * T8142 included, takes the paths it took before.
+	 */
+	bool v27_j714s;
+	struct dcp_v27_sleep *sleep_v27;
+	bool sleep_v27_closed;
+	/*
+	 * Its display on a USB-C port was released for a firmware sleep and the DRM device
+	 * has not resumed since: the CRTC's saved mode is not restored (it resumes disabled,
+	 * and the display's return has user space set a mode again).
+	 */
+	bool sleep_v27_torn;
+	/* V27 sleep: the wait for an HPD low's answer while a display that never returned is let go */
+	unsigned int v27_hpd_low_ms;
+	/* Unhandled application traffic permanently invalidates the sleep's inventory. */
+	bool sleep_v27_unhandled;
 	bool s2r_active;
 	bool s2r_stopped;
 	/* DPMS off stopped the firmware and lowered the domains; DPMS on brings them back. */
@@ -821,6 +858,19 @@ struct apple_dcp {
 	bool dpav_ctrl_open;
 
 	struct dptx_port dptxport[2];
+	/* The last link report, and the connection it was for; DSC as the firmware last named it */
+	char link_line[120];
+	u64 link_line_generation;
+	u8 link_dsc;
+
+	/* V27 sleep: the panel's next mode set is the mode it already has */
+	bool v27_keep_mode;
+	/* V27 sleep: the output area of the call being pushed holds this (an in/out word) */
+	const void *push_out_prefill;
+
+	/* firmware 27 panel: its AV and DP service endpoints, by endpoint - 0x20 */
+	struct apple_dcp_afkep *panelav[0x20];
+	struct workqueue_struct *panelav_wq;
 
 	/* debugfs entries */
 	struct dentry *ep_debugfs[0x20];
@@ -1054,6 +1104,7 @@ const struct drm_edid *dcp_firmware_edid(struct apple_dcp *dcp, u64 *generation)
 
 void iomfb_scanout_complete_h17p(struct apple_dcp *dcp);
 void iomfb_present_backlight_h17p(struct apple_dcp *dcp);
+void iomfb_present_matrix_h17p(struct apple_dcp *dcp);
 bool iomfb_present_brightness_only_h17p(struct apple_dcp *dcp);
 bool iomfb_present_complete_h17p(struct apple_dcp *dcp);
 void iomfb_present_failed_h17p(struct apple_dcp *dcp);

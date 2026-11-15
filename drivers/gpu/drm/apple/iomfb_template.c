@@ -432,6 +432,24 @@ static void dcp_swap_submit(struct apple_dcp *dcp, bool oob,
 			return;
 		}
 #if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
+		if (dcp->v27_a407) {
+			/* The statements below on the A407 record. */
+			iomfb_serialize_present_v27_a407(&dcp->present_v27_a407, request);
+			dcp->present_v27_a407.swap.brightness_update =
+				dcp->present_h17p.swap[0x354] & 1;
+			dcp->present_v27_a407.swap.brightness_nits =
+				get_unaligned_le64(dcp->present_h17p.swap + 0x35e);
+			dcp_external_stamp_submit(dcp, &dcp->present_v27_a407.swap);
+			if (dcp_has_panel(dcp) && iomfb_present_has_surface_h17p(request))
+				dcp_edr_prepare_v27(dcp, &dcp->present_v27_a407.swap,
+						    dcp->present_v27_a407.swap.brightness_update,
+						    dcp->edr_present_sdr);
+			dcp_push(dcp, oob, &dcp_methods[dcpep_swap_submit],
+				 sizeof(struct dcp_swap_submit_req_v27_a407),
+				 sizeof(struct dcp_swap_submit_resp_h17p),
+				 &dcp->present_v27_a407, cb, cookie);
+			return;
+		}
 		iomfb_serialize_present_v27(&dcp->present_v27, request);
 		dcp->present_v27.swap.brightness_update =
 			dcp->present_h17p.swap[0x354] & 1;
@@ -3608,6 +3626,19 @@ void iomfb_present_backlight_h17p(struct apple_dcp *dcp)
 {
 	do_swap(dcp, NULL, NULL);
 }
+
+static void dcp_set_matrix_done(struct apple_dcp *dcp, void *out, void *cookie);
+
+/* The swap after the colour matrix and its brightness correction, as after a power-on. */
+void iomfb_present_matrix_h17p(struct apple_dcp *dcp)
+{
+	struct iomfb_set_matrix_req mat = {
+		.location = 9,
+	};
+
+	dcp_ctm_to_fw(mat.matrix, NULL);
+	iomfb_set_matrix(dcp, false, &mat, dcp_set_matrix_done, NULL);
+}
 #endif
 
 /* After the colour matrix: the gamma table where there is one, then the swap. */
@@ -4038,6 +4069,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	struct dcp_wait_cookie *cookie;
 	struct dcp_color_mode *cmode = NULL;
 	bool paired = false;
+	bool keep_mode = false;
 	int ret;
 
 	if (!lookup_mode(dcp, &crtc_state->mode, mode)) {
@@ -4074,6 +4106,16 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 			cmode->format, cmode->colorimetry, cmode->eotf,
 			cmode->range, mode->vrr);
 
+#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
+	/*
+	 * After a V27 sleep the panel's firmware brings its link and its mode back
+	 * itself once frames arrive; macOS sends no mode set then, and one
+	 * sent before the link is up waits out the firmware's timeout.
+	 */
+	keep_mode = dcp->v27_j714s && xchg(&dcp->v27_keep_mode, false) &&
+		    dcp->mode.color_mode_id == mode->color_mode_id &&
+		    dcp->mode.timing_mode_id == mode->timing_mode_id;
+#endif
 	dcp->mode = (struct dcp_set_digital_out_mode_req){
 		.color_mode_id = mode->color_mode_id,
 		.timing_mode_id = mode->timing_mode_id
@@ -4096,7 +4138,10 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 
 	dcp->swap_submit_timestamp = 0;
 
-	if ((DCP_INHERIT_BOOT_MODE || DCP_FW_NAME(dcp_fw27_keep_panel_mode)(dcp)) &&
+	if (keep_mode) {
+		dev_info(dcp->dev, "keeping the panel's mode after the sleep\n");
+		complete_set_digital_out_mode(dcp, NULL, cookie);
+	} else if ((DCP_INHERIT_BOOT_MODE || DCP_FW_NAME(dcp_fw27_keep_panel_mode)(dcp)) &&
 	    dcp->hw.iomfb_method_profile !=
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
 		dev_info(dcp->dev, "inheriting the bootloader's display mode (%u fixed timing(s))\n",
@@ -4183,6 +4228,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL ||
 	    (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp_has_panel(dcp) && !paired))
 		dcp_external_hdr_hints(dcp, dcp->output_pq);
+	dcp_link_report(dcp, &crtc_state->mode);
 
 	return 0;
 }

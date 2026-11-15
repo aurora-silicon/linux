@@ -161,6 +161,7 @@ int dptxep_init_desktop(struct apple_dcp *dcp, u32 endpoint);
 int dptx_controller_init(struct apple_dcp *dcp);
 int ibootep_init(struct apple_dcp *dcp);
 int dpavservep_init(struct apple_dcp *dcp);
+int panelavep_init(struct apple_dcp *dcp);
 int avep_init(struct apple_dcp *dcp);
 
 

@@ -4,6 +4,8 @@
 #include <linux/apple-centauri.h>
 #include <linux/dma-mapping.h>
 #include <linux/firmware.h>
+#include <linux/mfd/macsmc.h>
+#include <linux/of_platform.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
@@ -11,7 +13,11 @@
 #include <linux/of.h>
 #include <linux/property.h>
 #include <linux/pci.h>
+#include <linux/pci-apple.h>
+#include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/sizes.h>
+#include <linux/suspend.h>
 #include <linux/unaligned.h>
 
 #include "centauri_t6050.h"
@@ -91,6 +97,9 @@ static void centauri_t6050_free_boot(struct centauri_t6050 *c)
 		return;
 	}
 
+	/* Already released for a deep sleep: the function may be off the bus by now */
+	if (c->firmware_sleep && !c->ipc && !c->irqs.pdev && !c->firmware && !c->descriptor)
+		return;
 	centauri_t6050_free_ipc(c);
 	centauri_t6050_free_irqs(&c->irqs);
 	if (c->ipc || !centauri_t6050_stop_dma(c->pdev)) {
@@ -389,19 +398,321 @@ static void centauri_t6050_remove(struct pci_dev *pdev)
 	mutex_unlock(&c->boot_lock);
 }
 
+/*
+ * A firmware sleep takes the N1's power state with it, and its firmware does not survive one:
+ * the N1 is reset after the wake and boots from its ROM again, as at power-on.
+ * - Before the sleep, every DMA mapping of the N1's three functions is released and the firmware
+ *   is told nothing: Bluetooth tears itself down in its own suspend, then this function's
+ *   suspend takes Wi-Fi and every IPC and boot buffer down. The root port's
+ *   "apple,endpoint-sleep-smc-writes", if any, are written after that.
+ * - The host gives the warm reset in its noirq resume, while the port is still down (see
+ *   pcie-apple). This resume writes the port's "apple,endpoint-wake-smc-writes", if any; once
+ *   tasks run again, a work item removes the three functions and enumerates them again.
+ * - After a suspend that was abandoned before the host's shutdown the link never went down. The
+ *   work item then has the host take the port down and up around the reset.
+ * Only when the root port names the warm reset ("apple,function-warm-reset") and the SMC is
+ * bound. Each SMC write is four cells: the key, the eight value bytes as two cells, each from
+ * its most significant byte down, and the wait after the write in microseconds.
+ */
+#define CEN_SMC_WRITES_MAX 4
+
+/* Freezable and ordered: rewakes run once tasks run again, one at a time; drained on unload */
+static struct workqueue_struct *cen_rewake_wq;
+/* One N1 per machine: a dark wake resumes and suspends again before tasks run */
+static atomic_t cen_rewake_queued = ATOMIC_INIT(0);
+
+/*
+ * The root port's "apple,function-warm-reset" names the SMC: the SMC, if bound (a reference on
+ * its device in *smc_pdev).
+ */
+static struct apple_smc *centauri_t6050_smc(struct pci_dev *bridge,
+					    struct platform_device **smc_pdev)
+{
+	struct of_phandle_args fn;
+	struct apple_smc *smc;
+
+	*smc_pdev = NULL;
+	if (!IS_REACHABLE(CONFIG_MFD_MACSMC))
+		return NULL;
+	if (!bridge || of_parse_phandle_with_fixed_args(pci_device_to_OF_node(bridge),
+							"apple,function-warm-reset", 2, 0, &fn))
+		return NULL;
+	*smc_pdev = of_find_device_by_node(fn.np);
+	of_node_put(fn.np);
+	if (!*smc_pdev)
+		return NULL;
+	smc = platform_get_drvdata(*smc_pdev);
+	if (!smc) {
+		put_device(&(*smc_pdev)->dev);
+		*smc_pdev = NULL;
+		return NULL;
+	}
+	return smc;
+}
+
+/* The root port's list @name of SMC writes, in order; no list is no error. */
+static int centauri_t6050_smc_writes(struct pci_dev *bridge, const char *name)
+{
+	struct device_node *np = bridge ? pci_device_to_OF_node(bridge) : NULL;
+	u32 cells[4 * CEN_SMC_WRITES_MAX];
+	struct platform_device *smc_pdev;
+	struct apple_smc *smc;
+	int count, i, ret = 0;
+
+	count = np ? of_property_count_u32_elems(np, name) : -EINVAL;
+	if (count == -EINVAL)
+		return 0;
+	if (count <= 0 || count % 4 || count > ARRAY_SIZE(cells) ||
+	    of_property_read_u32_array(np, name, cells, count))
+		return -EINVAL;
+	smc = centauri_t6050_smc(bridge, &smc_pdev);
+	if (!smc)
+		return -ENODEV;
+	for (i = 0; i < count && !ret; i += 4) {
+		__be32 value[2] = { cpu_to_be32(cells[i + 1]), cpu_to_be32(cells[i + 2]) };
+
+		ret = apple_smc_write(smc, cells[i], value, sizeof(value));
+		if (!ret && cells[i + 3])
+			fsleep(cells[i + 3]);
+	}
+	put_device(&smc_pdev->dev);
+	return ret;
+}
+
+bool apple_centauri_sleep_reboot(struct pci_dev *fn)
+{
+	struct platform_device *smc_pdev;
+
+	if (!pm_suspend_via_firmware() || !fn->bus->self)
+		return false;
+	if (!centauri_t6050_smc(fn->bus->self, &smc_pdev))
+		return false;
+	put_device(&smc_pdev->dev);
+	return true;
+}
+EXPORT_SYMBOL_GPL(apple_centauri_sleep_reboot);
+
+struct centauri_t6050_rewake {
+	struct work_struct work;
+	struct pci_dev *bridge;
+	unsigned int slot;
+};
+
+static bool centauri_t6050_link_active(struct pci_dev *bridge)
+{
+	u16 lnksta;
+
+	return !pcie_capability_read_word(bridge, PCI_EXP_LNKSTA, &lnksta) &&
+	       (lnksta & PCI_EXP_LNKSTA_DLLLA);
+}
+
+static struct pci_driver centauri_t6050_driver;
+
+/*
+ * A suspend given up after Bluetooth's teardown and before this function's own suspend leaves
+ * function 0 as it ran: Wi-Fi registered, and its IPC holding interrupt vectors and DMA buffers
+ * of functions 1 and 2. Removed in that state, function 1 goes with those vectors still
+ * allocated, and function 0's removal then frees them on a device that no longer has any: a
+ * NULL dereference under the rescan lock, which the PCI host's resume notifier then waits for
+ * without end. So function 0 is taken down here first, as its suspend takes it down, while all
+ * three functions exist; its removal then finds nothing left, as after a completed suspend.
+ */
+static void centauri_t6050_rewake_teardown(struct pci_bus *bus, unsigned int slot)
+{
+	struct pci_dev *fn = pci_get_slot(bus, PCI_DEVFN(slot, 0));
+	struct centauri_t6050 *c;
+
+	if (!fn)
+		return;
+	device_lock(&fn->dev);
+	c = fn->dev.driver == &centauri_t6050_driver.driver ? pci_get_drvdata(fn) : NULL;
+	if (c && !c->firmware_sleep) {
+		/* No boot step runs from here on: the functions are removed next */
+		WRITE_ONCE(c->removing, true);
+		cancel_delayed_work_sync(&c->boot_work);
+		mutex_lock(&c->boot_lock);
+		c->firmware_sleep = true;
+		/* Pairs with the readers of ready: nothing of the boot is used from here on */
+		smp_store_release(&c->ready, false);
+		centauri_t6050_wifi_unregister(c);
+		centauri_t6050_free_boot(c);
+		c->boot_phase = CEN_BOOT_STOPPED;
+		mutex_unlock(&c->boot_lock);
+		pci_info(fn, "N1 after a suspend given up before its own: Wi-Fi and IPC released before the functions are removed%s\n",
+			 c->ipc || c->firmware || c->descriptor ? "; DMA still held" : "");
+	}
+	device_unlock(&fn->dev);
+	pci_dev_put(fn);
+}
+
+/*
+ * The functions are removed while their link is still up, then the warm reset, then the link
+ * (if it went down, until it is back), then a new enumeration, all under the rescan lock: no
+ * device exists below the bridge meanwhile, so nothing reads one while a link is down (a read
+ * then latches pcie-apple's link_failed).
+ */
+static void centauri_t6050_rewake_worker(struct work_struct *work)
+{
+	struct centauri_t6050_rewake *rw = container_of(work, struct centauri_t6050_rewake, work);
+	struct pci_dev *bridge = rw->bridge, *fn;
+	struct pci_bus *bus = bridge->subordinate;
+	s64 down_ms = -1, up_ms = -1;
+	ktime_t start;
+	u16 lnksta = 0, first = 0;
+	int i, ret;
+
+	if (!bus)
+		goto out;
+	/*
+	 * The bridge stays active to the new enumeration: with its functions removed it is
+	 * idle, and a runtime suspend that starts while the host has the port down for the
+	 * reset finds the bridge unreachable and leaves the link down after it.
+	 */
+	pm_runtime_get_sync(&bridge->dev);
+	pci_lock_rescan_remove();
+	centauri_t6050_rewake_teardown(bus, rw->slot);
+	for (i = 2; i >= 0; i--) {
+		fn = pci_get_slot(bus, PCI_DEVFN(rw->slot, i));
+		if (fn)
+			pci_stop_and_remove_bus_device(fn);
+		pci_dev_put(fn);
+	}
+	/*
+	 * The host resets the N1 in its noirq resume, while the port is still down. A reset given
+	 * here, on a trained link, would take the link down for good: after a suspend that kept the
+	 * link the host takes the port down and up around the reset instead.
+	 */
+	if (apple_pcie_t6050_warm_reset_done(bridge)) {
+		pci_dbg(bridge, "N1 after the sleep: reset by the host before its port came up\n");
+		ret = 0;
+	} else {
+		ret = apple_pcie_t6050_port_recycle(bridge);
+		if (!ret)
+			pci_dbg(bridge, "N1 after a suspend that kept its link: port cycled by the host for the reset\n");
+	}
+	if (ret) {
+		pci_err(bridge, "N1 after the sleep: no warm reset (%d); Wi-Fi and Bluetooth stay down\n",
+			ret);
+		goto unlock;
+	}
+	start = ktime_get();
+	pcie_capability_read_word(bridge, PCI_EXP_LNKSTA, &first);
+	/*
+	 * The link is normally up and stays up: the reset came before it trained. A link that
+	 * still goes down in the first second must train again by itself.
+	 */
+	while (ktime_ms_delta(ktime_get(), start) < 1000) {
+		if (!centauri_t6050_link_active(bridge)) {
+			down_ms = ktime_ms_delta(ktime_get(), start);
+			break;
+		}
+		usleep_range(1000, 2000);
+	}
+	if (down_ms >= 0) {
+		while (!centauri_t6050_link_active(bridge)) {
+			/* 10 s in all: a later suspend's freezer waits for this work */
+			if (ktime_ms_delta(ktime_get(), start) > 10000) {
+				pcie_capability_read_word(bridge, PCI_EXP_LNKSTA, &lnksta);
+				pci_err(bridge, "N1 after the warm reset: LNKSTA %#x then down at %lld ms, not back in 10 s (LNKSTA %#x)\n",
+					first, down_ms, lnksta);
+				goto unlock;
+			}
+			usleep_range(5000, 6000);
+		}
+		up_ms = ktime_ms_delta(ktime_get(), start);
+	}
+	/* The PCIe wait from link up to configuration requests (the ADT's perst-to-config) */
+	msleep(100);
+	pcie_capability_read_word(bridge, PCI_EXP_LNKSTA, &lnksta);
+	pci_rescan_bus(bus);
+	fn = pci_get_slot(bus, PCI_DEVFN(rw->slot, 0));
+	if (fn)
+		pci_dbg(bridge, "N1 reset after the sleep: LNKSTA %#x, link down at %lld ms, up at %lld ms (-1: not seen), LNKSTA %#x; enumerated again: %s\n",
+			first, down_ms, up_ms, lnksta, pci_name(fn));
+	else
+		pci_err(bridge, "N1 reset after the sleep: nothing enumerated (LNKSTA %#x); Wi-Fi and Bluetooth stay down\n",
+			lnksta);
+	pci_dev_put(fn);
+unlock:
+	pci_unlock_rescan_remove();
+	pm_runtime_put(&bridge->dev);
+out:
+	pci_dev_put(bridge);
+	kfree(rw);
+	atomic_set(&cen_rewake_queued, 0);
+}
+
+static void centauri_t6050_queue_rewake(struct pci_dev *fn)
+{
+	struct centauri_t6050_rewake *rw;
+
+	if (!fn->bus->self || atomic_cmpxchg(&cen_rewake_queued, 0, 1))
+		return;
+	rw = kzalloc_obj(*rw, GFP_KERNEL);
+	if (!rw) {
+		atomic_set(&cen_rewake_queued, 0);
+		return;
+	}
+	INIT_WORK(&rw->work, centauri_t6050_rewake_worker);
+	rw->bridge = pci_dev_get(fn->bus->self);
+	rw->slot = PCI_SLOT(fn->devfn);
+	queue_work(cen_rewake_wq, &rw->work);
+}
+
+/* Bluetooth's resume: a suspend stopped after Bluetooth's teardown, before this function's */
+void apple_centauri_sleep_rewake(struct pci_dev *fn)
+{
+	centauri_t6050_queue_rewake(fn);
+}
+EXPORT_SYMBOL_GPL(apple_centauri_sleep_rewake);
+
 static int centauri_t6050_suspend(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct centauri_t6050 *c = pci_get_drvdata(pdev);
+	int ret;
 
 	guard(mutex)(&c->boot_lock);
-	if (c->boot_phase != CEN_BOOT_READY)
+	/* Down since an earlier suspend (a dark wake, or a warm reset not run yet or failed) */
+	if (c->firmware_sleep) {
+		centauri_t6050_smc_writes(pdev->bus->self, "apple,endpoint-sleep-smc-writes");
+		return pci_save_state(pdev);
+	}
+	/* A boot that failed is taken down too: the warm reset after the wake boots the N1 again */
+	if (c->boot_phase != CEN_BOOT_READY && c->boot_phase != CEN_BOOT_FAILED)
 		return -EBUSY;
+	if (!apple_centauri_sleep_reboot(pdev))
+		return c->boot_phase == CEN_BOOT_READY ? pci_save_state(pdev) : -EBUSY;
+
+	/* Bluetooth (Function 2, a consumer of this one) has already stopped itself */
+	c->firmware_sleep = true;
+	/* Pairs with the readers of ready: nothing of the boot is used from here on */
+	smp_store_release(&c->ready, false);
+	centauri_t6050_wifi_unregister(c);
+	centauri_t6050_free_boot(c);
+	if (c->ipc || c->firmware || c->descriptor)
+		dev_warn(dev, "N1 before the sleep: DMA still held\n");
+	c->boot_phase = CEN_BOOT_STOPPED;
+	ret = centauri_t6050_smc_writes(pdev->bus->self, "apple,endpoint-sleep-smc-writes");
+	if (ret)
+		dev_warn(dev, "N1 before the sleep: SMC writes: %d\n", ret);
+	dev_dbg(dev, "N1 down for the sleep: Wi-Fi and IPC released\n");
 	return pci_save_state(pdev);
 }
 
 static int centauri_t6050_resume(struct device *dev)
 {
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct centauri_t6050 *c = pci_get_drvdata(pdev);
+	int ret;
+
+	if (!c->firmware_sleep)
+		return 0;
+	ret = centauri_t6050_smc_writes(pdev->bus->self, "apple,endpoint-wake-smc-writes");
+	if (ret)
+		dev_warn(dev, "N1 after the sleep: SMC writes: %d\n", ret);
+	/* The removal, the warm reset and the new enumeration run once tasks run again */
+	centauri_t6050_queue_rewake(pdev);
 	return 0;
 }
 
@@ -423,6 +734,26 @@ static struct pci_driver centauri_t6050_driver = {
 	.driver.pm = pm_sleep_ptr(&centauri_t6050_pm_ops),
 };
 
-module_pci_driver(centauri_t6050_driver);
+static int __init centauri_t6050_init(void)
+{
+	int ret;
+
+	cen_rewake_wq = alloc_ordered_workqueue("centauri_t6050_rewake", WQ_FREEZABLE);
+	if (!cen_rewake_wq)
+		return -ENOMEM;
+	ret = pci_register_driver(&centauri_t6050_driver);
+	if (ret)
+		destroy_workqueue(cen_rewake_wq);
+	return ret;
+}
+module_init(centauri_t6050_init);
+
+static void __exit centauri_t6050_exit(void)
+{
+	pci_unregister_driver(&centauri_t6050_driver);
+	/* Drains a pending rewake before the module's code goes */
+	destroy_workqueue(cen_rewake_wq);
+}
+module_exit(centauri_t6050_exit);
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Apple N1 Centauri PCI firmware and ACIPC transport");

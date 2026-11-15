@@ -8,6 +8,7 @@
  *  - dwc3-of-simple.c Copyright (c) 2015 Texas Instruments Incorporated - https://www.ti.com
  */
 
+#include <linux/completion.h>
 #include <linux/delay.h>
 #include <linux/devm-helpers.h>
 #include <linux/iopoll.h>
@@ -27,6 +28,7 @@
 #include <linux/usb.h>
 #include <linux/usb/hcd.h>
 #include <linux/usb/phy.h>
+#include <linux/workqueue.h>
 
 #include "dwc3-apple-state.h"
 #include "glue.h"
@@ -193,6 +195,30 @@ struct dwc3_apple {
 	bool sleep_stopped;
 	bool sleep_wakeup;
 	enum dwc3_apple_state sleep_state;
+	/*
+	 * A host's stop for a deep sleep disconnects its devices, and a driver may unregister a PM
+	 * notifier as its device goes (r8152 does, when its interface closes): inside the notifier
+	 * chain that never returns. So the stop runs from a work. The chain waits a moment for it;
+	 * what is left then ends behind the chain, and the controller's prepare waits for that.
+	 */
+	struct work_struct sleep_stop_work;
+	struct completion sleep_stop_done;
+	int sleep_stop_ret;
+	ktime_t sleep_stop_start, sleep_stop_end;
+	/*
+	 * A running host's glue is a syscore device, for which the PM core calls no prepare.
+	 * The chain lifted that mark when it left the stop running (the stop lifts it itself
+	 * at its end), so that the prepare below is called.
+	 */
+	bool sleep_stop_syscore;
+	/* The start after a sleep whose stop the chain left running: it follows that stop. */
+	struct work_struct sleep_start_work;
+	/* The chain left the stop running. Only the suspending task reads and writes this. */
+	bool sleep_stop_behind;
+	/* The start after a sleep may find its Type-C PHY not started yet: the role switch follows. */
+	bool sleep_phy_wait;
+	/* The start after a sleep was left to the role switch, which may also come too early. */
+	bool sleep_phy_pending;
 
 	void __iomem *drd_regs[DWC3_APPLE_NR_DRD_REGS];
 	struct apple_tunable *tunables[DWC3_APPLE_NR_TUNABLES];
@@ -749,7 +775,10 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
 
 	ret = reset_control_deassert(appledwc->reset);
 	if (ret) {
-		dev_err(appledwc->dev, "Failed to deassert reset, err=%d\n", ret);
+		if (ret == -ENOLINK && appledwc->sleep_phy_wait)
+			dev_dbg(appledwc->dev, "PHY not started yet, reset kept\n");
+		else
+			dev_err(appledwc->dev, "Failed to deassert reset, err=%d\n", ret);
 		/* Nothing was started: drop the reference again. */
 		ret_reset = dwc3_apple_core_stop(appledwc);
 		if (ret_reset)
@@ -957,6 +986,17 @@ static void dwc3_apple_check_hub_later(struct dwc3_apple *appledwc)
 }
 
 /*
+ * Two things are in force on the board they have run on, the J714s: a running host is stopped
+ * for a deep sleep from a work instead of inside the PM notifier chain, and a Type-C port's
+ * PHY that is not started after a sleep is waited for. Elsewhere, other boards with the same
+ * SoC included, both are as before.
+ */
+static bool dwc3_apple_sleep_board(void)
+{
+	return of_machine_is_compatible("apple,j714s");
+}
+
+/*
  * Bring a controller up again after a sleep that stopped it or lost it. A fixed-hub host
  * starts as at probe, where the core has no role yet, so dwc3_core_soft_reset() runs too:
  * rebinding the driver brought the J700's hub back where a restart without it didn't.
@@ -968,7 +1008,25 @@ static int dwc3_apple_start_after_sleep(struct dwc3_apple *appledwc, enum dwc3_a
 	lockdep_assert_held(&appledwc->lock);
 	if (appledwc->fixed_hub)
 		appledwc->dwc.current_dr_role = 0;
+	/*
+	 * After a real sleep a Type-C port's PHY starts with the port controller's mode request,
+	 * and the role switch that follows it starts the controller, as at a plug-in.
+	 * A sleep given up after the port controllers went to their sleep state leaves the PHY
+	 * stopped in the same way, so this doesn't ask whether the sleep was a real one: a PHY
+	 * that kept running never reports -ENOLINK. On the board that has run on; elsewhere
+	 * the error is an error, as before.
+	 */
+	appledwc->sleep_phy_wait = !appledwc->fixed_hub && appledwc->role_sw &&
+				   dwc3_apple_sleep_board();
 	ret = dwc3_apple_init(appledwc, state);
+	if (ret == -ENOLINK && appledwc->sleep_phy_wait) {
+		appledwc->sleep_phy_wait = false;
+		appledwc->sleep_phy_pending = true;
+		dev_info(appledwc->dev, "waiting for the Type-C port to start the PHY after the sleep\n");
+		return 0;
+	}
+	appledwc->sleep_phy_wait = false;
+	appledwc->sleep_phy_pending = false;
 	if (ret) {
 		dev_err(appledwc->dev, "Failed to start after sleep, err=%d\n", ret);
 		return ret;
@@ -1171,11 +1229,21 @@ static int dwc3_usb_role_switch_set(struct usb_role_switch *sw, enum usb_role ro
 	switch (role) {
 	case USB_ROLE_NONE:
 		/* Nothing to do if no cable is connected */
+		appledwc->sleep_phy_pending = false;
 		return 0;
 	case USB_ROLE_HOST:
-		return dwc3_apple_init(appledwc, DWC3_APPLE_HOST);
 	case USB_ROLE_DEVICE:
-		return dwc3_apple_init(appledwc, DWC3_APPLE_DEVICE);
+		/*
+		 * While the start after a sleep waits for the PHY, a role switch can still come
+		 * before the port controller's mode request. The error goes back as it is, so the
+		 * port controller tries again, without a line in the log.
+		 */
+		appledwc->sleep_phy_wait = appledwc->sleep_phy_pending;
+		ret = dwc3_apple_init(appledwc, dwc3_apple_state_for_role(role));
+		appledwc->sleep_phy_wait = false;
+		if (ret != -ENOLINK)
+			appledwc->sleep_phy_pending = false;
+		return ret;
 	default:
 		dev_err(appledwc->dev, "Invalid target role: %d\n", role);
 		return -EINVAL;
@@ -1296,13 +1364,70 @@ static bool dwc3_apple_sleep_kept(struct dwc3_apple *appledwc)
 	return false;
 }
 
+/* The stop for a deep sleep: what comes back after it, then the controller down. */
+static int dwc3_apple_sleep_stop(struct dwc3_apple *appledwc)
+{
+	int ret;
+
+	lockdep_assert_held(&appledwc->lock);
+	if (appledwc->shutting_down)
+		return 0;
+	appledwc->sleep_state = appledwc->state;
+	ret = dwc3_apple_exit(appledwc);
+	if (ret)
+		return ret;
+	/* A wakeup path would keep the domain on, and it's going away. */
+	appledwc->sleep_wakeup = device_may_wakeup(appledwc->dev);
+	device_set_wakeup_enable(appledwc->dev, false);
+	appledwc->sleep_stopped = true;
+	return 0;
+}
+
+/* How long the notifier chain waits for a host's stop, and the controller's prepare after it. */
+#define DWC3_APPLE_SLEEP_STOP_CHAIN_MS		300
+#define DWC3_APPLE_SLEEP_STOP_PREPARE_MS	5000
+
+static void dwc3_apple_sleep_stop_work(struct work_struct *work)
+{
+	struct dwc3_apple *appledwc = container_of(work, struct dwc3_apple, sleep_stop_work);
+	int ret;
+
+	scoped_guard(mutex, &appledwc->lock)
+		ret = dwc3_apple_sleep_stop(appledwc);
+	appledwc->sleep_stop_ret = ret;
+	appledwc->sleep_stop_end = ktime_get();
+	complete(&appledwc->sleep_stop_done);
+}
+
+static int dwc3_apple_pm_notify_locked(struct dwc3_apple *appledwc, unsigned long action,
+				       bool in_place, bool *finish, bool *kept, bool *stop_host);
+
+/*
+ * After a sleep, or one given up, whose stop the notifier chain left running: the start waits
+ * for that stop here, never in the chain, which may still be what the stop waits for.
+ */
+static void dwc3_apple_sleep_start_work(struct work_struct *work)
+{
+	struct dwc3_apple *appledwc = container_of(work, struct dwc3_apple, sleep_start_work);
+	bool finish = false, kept = false, stop_host = false;
+
+	flush_work(&appledwc->sleep_stop_work);
+	dev_info(appledwc->dev, "USB host stop for the sleep had ended %lld ms after it began (%d): the start follows, %lld ms after that\n",
+		 ktime_ms_delta(appledwc->sleep_stop_end, appledwc->sleep_stop_start),
+		 appledwc->sleep_stop_ret,
+		 ktime_ms_delta(ktime_get(), appledwc->sleep_stop_end));
+	scoped_guard(mutex, &appledwc->lock)
+		dwc3_apple_pm_notify_locked(appledwc, PM_POST_SUSPEND, false, &finish, &kept,
+					    &stop_host);
+}
+
 /*
  * Runs before the freezer, when the sleep's real target isn't known yet, so this goes by the
  * state "mem" means now. Writing "freeze" with deep selected costs a USB restart and nothing else.
  * A stop that fails refuses the sleep. PM_POST_SUSPEND follows an abandoned sleep as well.
  */
 static int dwc3_apple_pm_notify_locked(struct dwc3_apple *appledwc, unsigned long action,
-				       bool in_place, bool *finish, bool *kept)
+				       bool in_place, bool *finish, bool *kept, bool *stop_host)
 {
 	struct device *dev = appledwc->dev;
 	int ret;
@@ -1331,14 +1456,17 @@ static int dwc3_apple_pm_notify_locked(struct dwc3_apple *appledwc, unsigned lon
 			apple_sleep_usb_set_wake_ports(dwc3_apple_hub_wake_ports(appledwc));
 			break;
 		}
-		appledwc->sleep_state = appledwc->state;
-		ret = dwc3_apple_exit(appledwc);
+		/*
+		 * A host's devices are not disconnected inside this chain: see sleep_stop_work.
+		 * On the board that has run on; elsewhere the stop stays in the chain.
+		 */
+		if (appledwc->state == DWC3_APPLE_HOST && dwc3_apple_sleep_board()) {
+			*stop_host = true;
+			break;
+		}
+		ret = dwc3_apple_sleep_stop(appledwc);
 		if (ret)
 			return notifier_from_errno(ret);
-		/* A wakeup path would keep the domain on, and it's going away. */
-		appledwc->sleep_wakeup = device_may_wakeup(dev);
-		device_set_wakeup_enable(dev, false);
-		appledwc->sleep_stopped = true;
 		break;
 	case PM_POST_SUSPEND:
 		if (appledwc->sleep_in_place) {
@@ -1371,14 +1499,28 @@ static int dwc3_apple_pm_notify_locked(struct dwc3_apple *appledwc, unsigned lon
 static int dwc3_apple_pm_notify(struct notifier_block *nb, unsigned long action, void *unused)
 {
 	struct dwc3_apple *appledwc = container_of(nb, struct dwc3_apple, pm_nb);
-	bool in_place = false, finish = false, kept = false;
+	bool in_place = false, finish = false, kept = false, stop_host = false;
 	int ret;
 
 	/*
+	 * The stop may still be running, waiting for this chain or holding the glue's lock: the
+	 * start is left to a work that waits for it. PM_POST_SUSPEND also comes inside the chain
+	 * of a PM_SUSPEND_PREPARE that another notifier refused.
+	 */
+	if (action == PM_POST_SUSPEND && appledwc->sleep_stop_behind) {
+		appledwc->sleep_stop_behind = false;
+		queue_work(system_dfl_wq, &appledwc->sleep_start_work);
+		return NOTIFY_DONE;
+	}
+
+	/*
 	 * The last wake's SuperSpeed restore ends before this sleep looks at the PHY. The hub
-	 * check takes the glue's lock, and has nothing to look at until the sleep is over.
+	 * check takes the glue's lock, and has nothing to look at until the sleep is over. A start
+	 * left to the work after the last sleep ends first: its stop is long over.
 	 */
 	if (action == PM_SUSPEND_PREPARE) {
+		flush_work(&appledwc->sleep_start_work);
+		appledwc->sleep_stop_behind = false;
 		apple_atcphy_sleep_finish_flush(appledwc->usb2_phy);
 		cancel_delayed_work_sync(&appledwc->hub_check);
 	}
@@ -1390,7 +1532,32 @@ static int dwc3_apple_pm_notify(struct notifier_block *nb, unsigned long action,
 	}
 
 	scoped_guard(mutex, &appledwc->lock)
-		ret = dwc3_apple_pm_notify_locked(appledwc, action, in_place, &finish, &kept);
+		ret = dwc3_apple_pm_notify_locked(appledwc, action, in_place, &finish, &kept,
+						  &stop_host);
+
+	if (stop_host) {
+		reinit_completion(&appledwc->sleep_stop_done);
+		appledwc->sleep_stop_ret = 0;
+		appledwc->sleep_stop_start = ktime_get();
+		appledwc->sleep_stop_behind = true;
+		queue_work(system_dfl_wq, &appledwc->sleep_stop_work);
+		if (wait_for_completion_timeout(&appledwc->sleep_stop_done,
+						msecs_to_jiffies(DWC3_APPLE_SLEEP_STOP_CHAIN_MS))) {
+			appledwc->sleep_stop_behind = false;
+			if (appledwc->sleep_stop_ret)
+				ret = notifier_from_errno(appledwc->sleep_stop_ret);
+		} else {
+			/*
+			 * The glue of a running host is a syscore device: its prepare is not
+			 * called, and nothing else would wait for the stop.
+			 */
+			appledwc->sleep_stop_syscore = appledwc->dev->power.syscore;
+			dev_pm_syscore_device(appledwc->dev, false);
+			dev_warn(appledwc->dev,
+				 "USB host stop for the sleep still running after %d ms (a driver of its devices may wait for this notifier chain): it ends behind the chain, the controller's prepare waits for it\n",
+				 DWC3_APPLE_SLEEP_STOP_CHAIN_MS);
+		}
+	}
 
 	/*
 	 * After a wake, user space doesn't wait for SuperSpeed: it comes back in the background,
@@ -1410,6 +1577,42 @@ static void dwc3_apple_pm_notifier_remove(void *data)
 
 	unregister_pm_notifier(&appledwc->pm_nb);
 }
+
+/*
+ * After the notifier chain and the freezer, before any device suspends: a host's stop that the
+ * chain left running has had the chain's end to finish. One that has not, or that failed,
+ * refuses the sleep; PM_POST_SUSPEND then starts the host again once the stop is over.
+ */
+static int dwc3_apple_pm_prepare(struct device *dev)
+{
+	struct dwc3_apple *appledwc = to_dwc3_apple(dev_get_drvdata(dev));
+	int ret;
+
+	if (!appledwc->sleep_stop_behind)
+		return 0;
+	if (!wait_for_completion_timeout(&appledwc->sleep_stop_done,
+					 msecs_to_jiffies(DWC3_APPLE_SLEEP_STOP_PREPARE_MS))) {
+		dev_err(dev, "USB host stop for the sleep not over %lld ms after it began: sleep refused, the host starts again when the stop ends\n",
+			ktime_ms_delta(ktime_get(), appledwc->sleep_stop_start));
+		return -EBUSY;
+	}
+	ret = appledwc->sleep_stop_ret;
+	dev_info(dev, "USB host stop for the sleep ended behind the notifier chain, %lld ms after it began (waited for until %lld ms): %d%s\n",
+		 ktime_ms_delta(appledwc->sleep_stop_end, appledwc->sleep_stop_start),
+		 ktime_ms_delta(ktime_get(), appledwc->sleep_stop_start), ret,
+		 ret ? ": sleep refused" : "");
+	/* A stop that failed with the core still up leaves the glue as it was. */
+	if (ret && appledwc->sleep_stop_syscore) {
+		guard(mutex)(&appledwc->lock);
+		if (appledwc->core_active)
+			dev_pm_syscore_device(dev, true);
+	}
+	return ret;
+}
+
+static const struct dev_pm_ops dwc3_apple_pm_ops = {
+	.prepare = pm_sleep_ptr(dwc3_apple_pm_prepare),
+};
 
 /* A fixed hub's node gives the root port it sits on in its reg, 1 if it doesn't. */
 static bool dwc3_apple_has_fixed_hub(struct device *dev, u32 *port)
@@ -1508,6 +1711,13 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	 */
 	appledwc->state = DWC3_APPLE_PROBE_PENDING;
 	ret = devm_delayed_work_autocancel(dev, &appledwc->hub_check, dwc3_apple_hub_check);
+	if (ret)
+		return ret;
+	init_completion(&appledwc->sleep_stop_done);
+	ret = devm_work_autocancel(dev, &appledwc->sleep_stop_work, dwc3_apple_sleep_stop_work);
+	if (ret)
+		return ret;
+	ret = devm_work_autocancel(dev, &appledwc->sleep_start_work, dwc3_apple_sleep_start_work);
 	if (ret)
 		return ret;
 	appledwc->pm_nb.notifier_call = dwc3_apple_pm_notify;
@@ -1612,6 +1822,7 @@ static struct platform_driver dwc3_apple_driver = {
 	.driver		= {
 		.name	= "dwc3-apple",
 		.of_match_table	= dwc3_apple_of_match,
+		.pm	= pm_sleep_ptr(&dwc3_apple_pm_ops),
 	},
 };
 
