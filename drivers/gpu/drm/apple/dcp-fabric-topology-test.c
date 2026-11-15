@@ -164,10 +164,159 @@ static void topology_unbind_test(struct kunit *test)
 	}
 }
 
+/* The J714s's display fabric: three ports, three pipelines, the second tunnel-only */
+enum { TOPO_RIGHT, TOPO_LEFT_FRONT, TOPO_LEFT_BACK, TOPO_PORTS };
+enum { TOPO_DCPEXT0, TOPO_DCPEXT1, TOPO_DCPEXT2, TOPO_PIPES };
+#define TOPO_PAIR(port, pipe)	((port) * TOPO_PIPES + (pipe))
+
+struct topology_j714s {
+	struct apple_dcp_typec_port port[TOPO_PORTS];
+	struct apple_dcp_typec_route route[TOPO_PORTS][TOPO_PIPES];
+	struct apple_dcp dcp[TOPO_PIPES];
+	struct platform_device *pdev[TOPO_PIPES];
+	unsigned int first;
+	/* The passes the ports already registered (a real J714s's) take */
+	unsigned int passes;
+};
+
+static void topology_j714s_unlist(void *data)
+{
+	struct topology_j714s *t = data;
+	unsigned int p;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+	for (p = 0; p < TOPO_PORTS; p++)
+		list_del(&t->port[p].link);
+}
+
+static struct topology_j714s *topology_j714s_init(struct kunit *test)
+{
+	struct topology_j714s *t;
+	unsigned int p, i;
+
+	t = kunit_kzalloc(test, sizeof(*t), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, t);
+	kunit_activate_static_stub(test, dcp_typec_fixed_crtcs, topology_fixed_crtcs);
+	for (i = 0; i < TOPO_PIPES; i++) {
+		t->pdev[i] = kunit_platform_device_alloc(test, "dcp-j714s", PLATFORM_DEVID_AUTO);
+		KUNIT_ASSERT_NOT_ERR_OR_NULL(test, t->pdev[i]);
+		t->dcp[i].dev = &t->pdev[i]->dev;
+	}
+	t->first = dcp_typec_nr_ports();
+	t->passes = dcp_typec_nr_passes();
+	scoped_guard(mutex, &dcp_typec_fabric_lock) {
+		for (p = 0; p < TOPO_PORTS; p++) {
+			INIT_LIST_HEAD(&t->port[p].routes);
+			for (i = 0; i < TOPO_PIPES; i++) {
+				struct apple_dcp_typec_route *route = &t->route[p][i];
+
+				route->dcp = &t->dcp[i];
+				route->port = &t->port[p];
+				route->core.tunnel_only = i == TOPO_DCPEXT1;
+				list_add_tail(&route->port_link, &t->port[p].routes);
+			}
+			list_add_tail(&t->port[p].link, &dcp_typec_ports);
+		}
+	}
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, topology_j714s_unlist, t), 0);
+	return t;
+}
+
+/*
+ * Lists the connectors of the first @nr_ports ports in
+ * apple_probe_typec_ports()'s order, as TOPO_PAIR(port, pipeline), and
+ * returns how many. It mirrors that loop: passes outermost, then pipelines
+ * (dcp[idx / nr_ports]), then ports (idx % nr_ports).
+ */
+static unsigned int topology_connector_order(struct topology_j714s *t, unsigned int nr_ports,
+					     unsigned int *order)
+{
+	unsigned int pass, i, p, n = 0;
+
+	for (pass = 0; pass < dcp_typec_nr_passes(); pass++)
+		for (i = 0; i < TOPO_PIPES; i++)
+			for (p = 0; p < nr_ports; p++)
+				if (dcp_typec_port_has_candidate(t->first + p, t->pdev[i]) &&
+				    dcp_typec_port_pass(t->first + p, t->pdev[i]) == pass)
+					order[n++] = TOPO_PAIR(p, i);
+	return n;
+}
+
+/* The passes with @passes needed by the fixture's own routes */
+static unsigned int topology_passes(struct topology_j714s *t, unsigned int passes)
+{
+	return max(t->passes, passes);
+}
+
+/*
+ * The J714s's connector names: DP-1..DP-6 for the right and left-front ports
+ * as before the left-back port was added, whose routes are in connector group
+ * 1 and get DP-7..DP-9. In group 0 they would take DP-3 and push the rest on.
+ */
+static void topology_connector_group_test(struct kunit *test)
+{
+	static const unsigned int two_ports[] = {
+		TOPO_PAIR(TOPO_RIGHT, TOPO_DCPEXT0),		/* DP-1 */
+		TOPO_PAIR(TOPO_LEFT_FRONT, TOPO_DCPEXT0),	/* DP-2 */
+		TOPO_PAIR(TOPO_RIGHT, TOPO_DCPEXT2),		/* DP-3 */
+		TOPO_PAIR(TOPO_LEFT_FRONT, TOPO_DCPEXT2),	/* DP-4 */
+		TOPO_PAIR(TOPO_RIGHT, TOPO_DCPEXT1),		/* DP-5 */
+		TOPO_PAIR(TOPO_LEFT_FRONT, TOPO_DCPEXT1),	/* DP-6 */
+	};
+	static const unsigned int three_ports[] = {
+		TOPO_PAIR(TOPO_RIGHT, TOPO_DCPEXT0),
+		TOPO_PAIR(TOPO_LEFT_FRONT, TOPO_DCPEXT0),
+		TOPO_PAIR(TOPO_RIGHT, TOPO_DCPEXT2),
+		TOPO_PAIR(TOPO_LEFT_FRONT, TOPO_DCPEXT2),
+		TOPO_PAIR(TOPO_RIGHT, TOPO_DCPEXT1),
+		TOPO_PAIR(TOPO_LEFT_FRONT, TOPO_DCPEXT1),
+		TOPO_PAIR(TOPO_LEFT_BACK, TOPO_DCPEXT0),	/* DP-7 */
+		TOPO_PAIR(TOPO_LEFT_BACK, TOPO_DCPEXT2),	/* DP-8 */
+		TOPO_PAIR(TOPO_LEFT_BACK, TOPO_DCPEXT1),	/* DP-9 */
+	};
+	struct topology_j714s *t = topology_j714s_init(test);
+	unsigned int order[TOPO_PORTS * TOPO_PIPES], i, n;
+
+	/* Everything in group 0: two passes */
+	KUNIT_EXPECT_EQ(test, dcp_typec_nr_passes(), topology_passes(t, 2));
+	n = topology_connector_order(t, 2, order);
+	KUNIT_ASSERT_EQ(test, n, ARRAY_SIZE(two_ports));
+	KUNIT_EXPECT_MEMEQ(test, order, two_ports, sizeof(two_ports));
+
+	/* The left-back port in group 0 too: its first pair would be DP-3 */
+	n = topology_connector_order(t, 3, order);
+	KUNIT_ASSERT_EQ(test, n, ARRAY_SIZE(three_ports));
+	KUNIT_EXPECT_EQ(test, order[2], TOPO_PAIR(TOPO_LEFT_BACK, TOPO_DCPEXT0));
+
+	/* In group 1, as the J714s DT has it */
+	for (i = 0; i < TOPO_PIPES; i++)
+		t->route[TOPO_LEFT_BACK][i].connector_group = 1;
+	KUNIT_EXPECT_EQ(test, dcp_typec_nr_passes(), topology_passes(t, 4));
+	KUNIT_EXPECT_EQ(test, dcp_typec_port_pass(t->first + TOPO_LEFT_BACK,
+						  t->pdev[TOPO_DCPEXT0]), 2);
+	KUNIT_EXPECT_EQ(test, dcp_typec_port_pass(t->first + TOPO_LEFT_BACK,
+						  t->pdev[TOPO_DCPEXT1]), 3);
+	/* A port's shared connector (no fixed CRTCs) takes its group's first pass */
+	KUNIT_EXPECT_EQ(test, dcp_typec_port_pass(t->first + TOPO_LEFT_BACK, NULL), 2);
+	KUNIT_EXPECT_EQ(test, dcp_typec_port_pass(t->first + TOPO_RIGHT, NULL), 0);
+	n = topology_connector_order(t, 3, order);
+	KUNIT_ASSERT_EQ(test, n, ARRAY_SIZE(three_ports));
+	KUNIT_EXPECT_MEMEQ(test, order, three_ports, sizeof(three_ports));
+
+	/* A later group adds passes; the order is the same */
+	for (i = 0; i < TOPO_PIPES; i++)
+		t->route[TOPO_LEFT_BACK][i].connector_group = 3;
+	KUNIT_EXPECT_EQ(test, dcp_typec_nr_passes(), topology_passes(t, 8));
+	n = topology_connector_order(t, 3, order);
+	KUNIT_ASSERT_EQ(test, n, ARRAY_SIZE(three_ports));
+	KUNIT_EXPECT_MEMEQ(test, order, three_ports, sizeof(three_ports));
+}
+
 static struct kunit_case dcp_topology_cases[] = {
 	KUNIT_CASE(topology_pipeline_identity_test),
 	KUNIT_CASE(topology_adopt_release_test),
 	KUNIT_CASE(topology_unbind_test),
+	KUNIT_CASE(topology_connector_group_test),
 	{}
 };
 

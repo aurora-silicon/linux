@@ -4444,23 +4444,59 @@ bool dcp_typec_port_has_candidate(unsigned int idx, struct platform_device *pdev
 	return false;
 }
 
-/* Is @pdev's route to port @idx for DP tunnels only (apple,tunnel-only)? */
-bool dcp_typec_port_tunnel_only(unsigned int idx, struct platform_device *pdev)
+static unsigned int dcp_typec_route_pass(const struct apple_dcp_typec_route *route)
+{
+	return 2 * route->connector_group + (route->core.tunnel_only ? 1 : 0);
+}
+
+/*
+ * The number of passes in which the connectors are created: two (the other
+ * routes', then the tunnel-only ones') per apple,connector-group, up to the
+ * largest group any route has.
+ */
+unsigned int dcp_typec_nr_passes(void)
 {
 	struct apple_dcp_typec_port *port;
 	struct apple_dcp_typec_route *route;
+	u32 groups = 1;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+
+	list_for_each_entry(port, &dcp_typec_ports, link)
+		list_for_each_entry(route, &port->routes, port_link)
+			groups = max(groups, route->connector_group + 1);
+
+	return 2 * groups;
+}
+
+/*
+ * The pass in which the connector of @pdev's route to port @idx is created:
+ * connectors come group by group (apple,connector-group), and in a group a
+ * tunnel-only route's (apple,tunnel-only) after the others'. A port added to
+ * a board in the next group gets the next connector names, and the existing
+ * connectors keep theirs. With @pdev NULL (a port whose routes share its
+ * connectors), the port's: its largest group's first pass.
+ */
+unsigned int dcp_typec_port_pass(unsigned int idx, struct platform_device *pdev)
+{
+	struct apple_dcp_typec_port *port;
+	struct apple_dcp_typec_route *route;
+	u32 group = 0;
 
 	guard(mutex)(&dcp_typec_fabric_lock);
 
 	port = dcp_typec_port_by_index(idx);
 	if (!port)
-		return false;
+		return 0;
 
-	list_for_each_entry(route, &port->routes, port_link)
-		if (route->dcp->dev == &pdev->dev)
-			return route->core.tunnel_only;
+	list_for_each_entry(route, &port->routes, port_link) {
+		if (!pdev)
+			group = max(group, route->connector_group);
+		else if (route->dcp->dev == &pdev->dev)
+			return dcp_typec_route_pass(route);
+	}
 
-	return false;
+	return 2 * group;
 }
 
 /*
@@ -4731,6 +4767,15 @@ static int dcp_register_typec_routes_present(void *data)
 		/* A route for USB4 DP tunnels only is never given a DP-alt stream. */
 		route->core.tunnel_only =
 			of_property_read_bool(route_np, "apple,tunnel-only");
+		ret = of_property_read_u32(route_np, "apple,connector-group",
+					   &route->connector_group);
+		if (ret == -EINVAL)
+			route->connector_group = 0;
+		else if (ret)
+			return dev_err_probe(dev, ret, "%pOF: invalid connector group\n", route_np);
+		if (route->connector_group >= DCP_TYPEC_CONNECTOR_GROUPS)
+			return dev_err_probe(dev, -EINVAL, "%pOF: invalid connector group %u\n",
+					     route_np, route->connector_group);
 
 		ret = of_property_read_u32_index(dev->of_node, "apple,typec-dptx-phys",
 						 route_index, &route->dptx_phy);
