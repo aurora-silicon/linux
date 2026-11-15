@@ -15179,12 +15179,61 @@ out:
 	put_task_struct(p);
 }
 
+/*
+ * With MISFIT_RUNTIME, an idle bigger CPU would pick up the misfit task only
+ * at its next newly-idle or nohz idle balance, which is skipped by chance
+ * (NI_RANDOM) or waits for the domain's balance interval. Push the task from
+ * its own tick instead, through the stopper that active load balancing uses.
+ */
+static bool misfit_push_idle(struct rq *rq, struct task_struct *p)
+{
+	unsigned long best_cap = arch_scale_cpu_capacity(cpu_of(rq));
+	int cpu, dst_cpu = -1;
+	unsigned long flags;
+	bool push = false;
+
+	for_each_cpu_and(cpu, p->cpus_ptr, cpu_active_mask) {
+		unsigned long cap = arch_scale_cpu_capacity(cpu);
+
+		if (cap > best_cap && idle_cpu(cpu)) {
+			best_cap = cap;
+			dst_cpu = cpu;
+		}
+	}
+	if (dst_cpu < 0)
+		return false;
+
+	raw_spin_rq_lock_irqsave(rq, flags);
+	if (rq->curr == p && p->on_rq && !rq->active_balance &&
+	    rq->misfit_task_load) {
+		rq->active_balance = 1;
+		rq->push_cpu = dst_cpu;
+		push = true;
+	}
+	preempt_disable();
+	raw_spin_rq_unlock_irqrestore(rq, flags);
+	if (push)
+		stop_one_cpu_nowait(cpu_of(rq), active_load_balance_cpu_stop, rq,
+				    &rq->active_balance_work);
+	preempt_enable();
+
+	return push;
+}
+
 /* Called from the tick on this CPU, so current is rq->curr. */
 static void misfit_rotate_trigger(struct rq *rq)
 {
 	struct task_struct *p = current;
 
-	if (!sched_feat(MISFIT_ROTATE) || !sched_asym_cpucap_active())
+	if (!sched_asym_cpucap_active())
+		return;
+
+	if (sched_feat(MISFIT_RUNTIME) && READ_ONCE(rq->misfit_task_load) &&
+	    READ_ONCE(rq->nr_running) == 1 && misfit_rotate_candidate(p) &&
+	    misfit_push_idle(rq, p))
+		return;
+
+	if (!sched_feat(MISFIT_ROTATE))
 		return;
 
 	if (!READ_ONCE(rq->misfit_task_load) ||
