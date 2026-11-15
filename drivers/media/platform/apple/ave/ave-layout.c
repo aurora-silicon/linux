@@ -961,11 +961,12 @@ const struct ave_fw_layout *ave_layout_for_crc(u32 crc)
 		return &ave_layout_6070_11_1;
 	/*
 	 * The macOS 27.0 build for the M5 Pro and Max, and the M5's build of the
-	 * same firmware version (9013.45.1): one AppleAVE2 kext builds the
-	 * commands for both.
+	 * same firmware version (9013.45.1), plus the Neo's 27.2 build: one
+	 * AppleAVE2 kext builds the commands for all three.
 	 */
 	if (crc == AVE_FW_TEXT_CRC_T6050_26A428 ||
-	    crc == AVE_FW_TEXT_CRC_T8142_26A428)
+	    crc == AVE_FW_TEXT_CRC_T8142_26A428 ||
+	    crc == AVE_FW_TEXT_CRC_T8140_26B123)
 		return &ave_layout_26a428;
 	/*
 	 * The macOS 27.3 beta 1 build speaks the same command layout: H.264

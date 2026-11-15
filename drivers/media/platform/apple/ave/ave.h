@@ -173,6 +173,8 @@ enum ave_opcode {
  * this is the TEXT CRC with that word zeroed.
  */
 #define AVE_FW_TEXT_CRC_T6041_25G83 0x9a080cad
+/* macOS 27.2 (26B123) / T8140: AppleAVE2FW 9013.55.1. */
+#define AVE_FW_TEXT_CRC_T8140_26B123 0xa945c267
 #define AVE_FW_TEXT_CRC_T6050_26A428 0x87279429
 /* macOS 27.3 beta 1 (26C5035r) / T6050: TEXT 0x158000, DATA 0x134000. */
 #define AVE_FW_TEXT_CRC_T6050_26C5035 0xc25b4ddb
@@ -549,7 +551,7 @@ static inline struct ave_ctx *ave_file_to_ctx(struct file *file)
 	return container_of(file_to_v4l2_fh(file), struct ave_ctx, fh);
 }
 
-extern const struct ave_variant ave_t6000, ave_t6041, ave_t8112;
+extern const struct ave_variant ave_t6000, ave_t6041, ave_t8112, ave_t8140;
 
 /* ave-fw.c */
 u64 ave_fw_vcbar(const struct ave_variant *variant, u64 text_iova);
