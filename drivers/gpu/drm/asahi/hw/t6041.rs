@@ -340,14 +340,31 @@ const CHIP: v25g83::Chip = v25g83::Chip {
     cs_perf_table: false,
 };
 
-/// [`CHIP`] for 25G83: its hardware data has 0 at `+0x2610`.
+/// [`CHIP`] for 25G83: its hardware data has 0 at `+0x2610`, and its power configuration keeps
+/// the 25G83 starting values of the performance limiter ([`POWER_CONFIG_WORDS_25G83`]).
 ///
 /// 25F84 runs with 1 there. On 25G83 the 40-core J614C then accepts work and marks it done,
 /// but the GPU never runs it: no completion, no fault, every job times out. With 0, which is
 /// also what the J616C's 25G83 contents have, compute and render work run.
 const CHIP_25G83: v25g83::Chip = v25g83::Chip {
     hw_data_words: HW_DATA_WORDS_25G83,
+    power_config_words: POWER_CONFIG_WORDS_25G83,
     ..CHIP
+};
+
+/// [`POWER_CONFIG_WORDS`] without its first three words, `+0x0 = 1`, `+0x44 = 0xc` and
+/// `+0x9c = 338.0`.
+///
+/// They are state the firmware writes into its performance limiter while it runs (it sets
+/// `+0x44` to 0xc itself, and `+0x9c` reaches 338.0 once the limit is at its floor), measured
+/// from a running 25F84. Started with them, the 25G83 firmware lowers the limit at `+0x48`
+/// (1000 at boot) on cold GPU power-ups and never raises it again: on the 40-core J575C it
+/// reached 162 after 6,000 short Vulkan clients and the GPU ran at 46 % of its speed until a
+/// reboot. With the 25G83 starting values (`+0x44 = 1`, as the M4 Pro and the J616C run),
+/// the limit stays at 1000.
+const POWER_CONFIG_WORDS_25G83: &[(usize, u32, usize)] = match POWER_CONFIG_WORDS {
+    [(0x0, 0x1, 1), (0x44, 0xc, 1), (0x9c, 0x43a9_0000, 1), rest @ ..] => rest,
+    _ => panic!("the first T6041 power configuration words must be +0x0, +0x44 and +0x9c"),
 };
 
 /// [`HW_DATA_WORDS`] without its last word, `+0x2610 = 1`.
