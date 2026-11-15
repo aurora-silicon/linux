@@ -767,6 +767,25 @@ static int avd_vp9_alloc_bufs(struct avd_ctx *ctx, struct avd_vp9_bank *bank)
 	return 0;
 }
 
+/*
+ * Only VP9 profiles 0 and 2 (4:2:0, 8 and 10 bits) decode. A profile 1
+ * frame (4:2:2 or 4:4:4) is never completed: it times out and the whole
+ * decoder is reset, failing every other stream's frames too. Refuse
+ * profiles 1 and 3, and 12-bit frames (no capture format), when the
+ * control is set and again when the frame runs, so they never reach the
+ * decoder.
+ */
+static int avd_vp9_validate_frame(struct avd_ctx *ctx,
+				  const struct v4l2_ctrl_vp9_frame *frame)
+{
+	if (frame->profile != 0 && frame->profile != 2)
+		return -EINVAL;
+	if (frame->bit_depth != (frame->profile == 2 ? 10 : 8))
+		return -EINVAL;
+
+	return 0;
+}
+
 static int avd_vp9_run_preamble(struct avd_ctx *ctx, struct avd_vp9_run *run)
 {
 	struct v4l2_ctrl *ctrl;
@@ -791,6 +810,11 @@ static int avd_vp9_run_preamble(struct avd_ctx *ctx, struct avd_vp9_run *run)
 	dec_params = ctrl->p_cur.p;
 
 	ret = validate_dec_params(ctx, dec_params);
+	if (ret)
+		return ret;
+
+	/* The frame may have been set, unchecked, while another codec was selected. */
+	ret = avd_vp9_validate_frame(ctx, dec_params);
 	if (ret)
 		return ret;
 
@@ -1164,24 +1188,6 @@ static enum avd_image_fmt avd_vp9_get_image_fmt(struct avd_ctx *ctx,
 	/* avd_vp9_try_ctrl() admits only 4:2:0 (profiles 0 and 2). */
 	return BIT_DEPTH(420);
 #undef BIT_DEPTH
-}
-
-/*
- * Only VP9 profiles 0 and 2 (4:2:0, 8 and 10 bits) decode. A profile 1
- * frame (4:2:2 or 4:4:4) is never completed: it times out and the whole
- * decoder is reset, failing every other stream's frames too. Refuse
- * profiles 1 and 3, and 12-bit frames (no capture format), when the
- * control is set, so they never reach the decoder.
- */
-static int avd_vp9_validate_frame(struct avd_ctx *ctx,
-				  const struct v4l2_ctrl_vp9_frame *frame)
-{
-	if (frame->profile != 0 && frame->profile != 2)
-		return -EINVAL;
-	if (frame->bit_depth != (frame->profile ? 10 : 8))
-		return -EINVAL;
-
-	return 0;
 }
 
 static int avd_vp9_try_ctrl(struct avd_ctx *ctx, struct v4l2_ctrl *ctrl)

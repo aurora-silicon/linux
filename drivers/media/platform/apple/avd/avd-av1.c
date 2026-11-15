@@ -1425,6 +1425,32 @@ static int avd_av1_check_tiles(struct avd_ctx *ctx, struct avd_av1_run *run,
 	return 0;
 }
 
+/*
+ * Only the AV1 Main profile at 4:2:0 (8 and 10 bits) decodes. A High
+ * profile (4:4:4) frame is never completed: it times out and the whole
+ * decoder is reset, failing every other stream's frames too. Professional
+ * (4:2:2, 12-bit) has no capture format. Refuse anything but Main 4:2:0
+ * when the sequence is set and again when a frame runs, so it never
+ * reaches the decoder.
+ */
+static int avd_av1_validate_sequence(struct avd_ctx *ctx,
+				     const struct v4l2_ctrl_av1_sequence *seq)
+{
+	const u32 subsampling = V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_X |
+				V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y;
+
+	if (seq->seq_profile != 0)
+		return -EINVAL;
+	if (seq->bit_depth != 8 && seq->bit_depth != 10)
+		return -EINVAL;
+	if (seq->flags & V4L2_AV1_SEQUENCE_FLAG_MONO_CHROME)
+		return -EINVAL; /* monochrome (4:0:0) is refused */
+	if ((seq->flags & subsampling) != subsampling)
+		return -EINVAL;
+
+	return 0;
+}
+
 static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 {
 	struct v4l2_ctrl *ctrl;
@@ -1438,6 +1464,11 @@ static int avd_av1_run_preamble(struct avd_ctx *ctx, struct avd_av1_run *run)
 	if (WARN_ON(!ctrl))
 		return -EINVAL;
 	run->seq = ctrl->p_cur.p;
+
+	/* The sequence may have been set, unchecked, while another codec was selected. */
+	ret = avd_av1_validate_sequence(ctx, run->seq);
+	if (ret)
+		return ret;
 
 	ctrl = v4l2_ctrl_find(&ctx->ctrl_hdl, V4L2_CID_STATELESS_AV1_FRAME);
 	if (WARN_ON(!ctrl))
@@ -1900,31 +1931,6 @@ static void avd_av1_adjust_decoded_fmt(struct avd_ctx *ctx,
 		ALIGN(avd_color_size(pix_mp->width, pix_mp->height), AVD_ALIGN);
 	pix_mp->plane_fmt[0].sizeimage +=
 		avd_av1_seg_size(pix_mp->width, pix_mp->height);
-}
-
-/*
- * Only the AV1 Main profile at 4:2:0 (8 and 10 bits) decodes. A High
- * profile (4:4:4) frame is never completed: it times out and the whole
- * decoder is reset, failing every other stream's frames too. Professional
- * (4:2:2, 12-bit) has no capture format. Refuse anything but Main 4:2:0
- * when the sequence is set, so it never reaches the decoder.
- */
-static int avd_av1_validate_sequence(struct avd_ctx *ctx,
-				     struct v4l2_ctrl_av1_sequence *seq)
-{
-	const u32 subsampling = V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_X |
-				V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y;
-
-	if (seq->seq_profile != 0)
-		return -EINVAL;
-	if (seq->bit_depth != 8 && seq->bit_depth != 10)
-		return -EINVAL;
-	if (seq->flags & V4L2_AV1_SEQUENCE_FLAG_MONO_CHROME)
-		return -EINVAL; /* 4:0:0 (not supported?) */
-	if ((seq->flags & subsampling) != subsampling)
-		return -EINVAL;
-
-	return 0;
 }
 
 static int avd_av1_try_ctrl(struct avd_ctx *ctx, struct v4l2_ctrl *ctrl)
