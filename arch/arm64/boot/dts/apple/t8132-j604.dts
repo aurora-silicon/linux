@@ -351,7 +351,7 @@
 
 #include "hwmon-common.dtsi"
 #include "hwmon-laptop.dtsi"
-#include "hwmon-fan-dual.dtsi"
+#include "hwmon-fan.dtsi"
 #include "t8132-j604-hwmon-rails.dtsi"
 
 /*
