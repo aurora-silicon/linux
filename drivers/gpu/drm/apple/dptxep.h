@@ -40,6 +40,8 @@ enum dptx_apcall {
 #define DCPDPTX_REMOTE_PORT_DIE GENMASK(11, 8)
 #define DCPDPTX_REMOTE_PORT_CONNECTED BIT(15)
 #define DCPDPTX_REMOTE_PORT_SUPPORTS_HPD BIT(8)
+/* Connection attributes of a T6050 tunnel: the DP IN it starts at, 1..4 */
+#define DCPDPTX_REMOTE_PORT_DPIN GENMASK(15, 13)
 
 enum dptx_link_rate {
 	LINK_RATE_RBR = 0x06,
