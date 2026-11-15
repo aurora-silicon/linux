@@ -5,7 +5,8 @@
 //! The Always-On Processor reads the machine's inertial sensor and reports
 //! acceleration and angular rate as two services, one fake-HID report per
 //! sample. A service starts reporting once it has been sent the machine's
-//! three calibration packets and a report interval.
+//! three calibration packets, its verbosity, batch and raw interval
+//! properties, and a report interval.
 //!
 //! The reports run only while someone reads them: while a buffer is enabled,
 //! or for the length of one direct read. With nobody reading they stay off,
@@ -40,6 +41,20 @@ const SUBTYPE_SET_PROPERTY: u16 = 4;
 const PROP_INTERVAL: u32 = 0;
 /// 50 Hz.
 const INTERVAL_US: u32 = 20_000;
+/*
+ * The properties a sensor service wants before the zero to non-zero step of
+ * its report interval, as for the light sensor (aop_als): verbosity, batch
+ * interval and raw interval. macOS's HID event system pushes BatchInterval 1
+ * and LogLevel 6 to every service (HIDEventServiceProperties), and its accel
+ * and gyro stream once their driver's ReportInterval is set after them (J815,
+ * macOS 27.2, tools/macos/spu-motion-probe.py). On T8142 the services took the
+ * calibration and the interval and never reported without them. Their status
+ * is logged, not checked: the ALS answers them not-permitted and applies them.
+ */
+const PROP_BATCH_INTERVAL: u32 = 0x16;
+const PROP_RAW_INTERVAL: u32 = 0x5c;
+const PROP_VERBOSITY: u32 = 0xe1;
+const ARMING: [(u32, u32); 3] = [(PROP_VERBOSITY, 6), (PROP_BATCH_INTERVAL, 1), (PROP_RAW_INTERVAL, 0)];
 /// How long a direct read waits for the first report of a fresh start.
 const FIRST_SAMPLE_MS: i64 = 200;
 const FIRST_SAMPLE_POLL_MS: i64 = 5;
@@ -241,6 +256,12 @@ impl Control {
                 held,
                 CALIBRATION.len()
             );
+        }
+        for (prop, value) in ARMING {
+            let status = self.write(prop, &value.to_le_bytes())?;
+            if status != 0 {
+                dev_dbg!(self.dev, "property {:#x} = {}: status {:#x}\n", prop, value, status);
+            }
         }
         self.set(PROP_INTERVAL, &INTERVAL_US.to_le_bytes())
     }
