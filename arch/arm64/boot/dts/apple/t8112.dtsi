@@ -1552,11 +1552,10 @@
 				compatible = "apple,smc-hwmon";
 				#thermal-sensor-cells = <1>;
 				/*
-				 * The GPU keys read a fixed low value while the GPU
-				 * is idle, then the CPU die keys.
+				 * The CPU die keys. The GPU keys are separate channels
+				 * below: while the GPU is off they read a low placeholder.
 				 */
-				apple,soc-die-keys = "Tg0f", "Tg0n", "Tg0r", "Te05",
-						     "Tp01", "Tp05", "Tp09", "Tp0D";
+				apple,soc-die-keys = "Te05", "Tp01", "Tp05", "Tp09", "Tp0D";
 
 				/* SoC die temperatures, first: thermal zones index them. */
 				temperature-TCMz {
@@ -1587,6 +1586,24 @@
 				temperature-Tp0D {
 					apple,key-id = "Tp0D";
 					label = "P-core 3 Temperature";
+				};
+
+				temperature-Tg0f {
+					apple,key-id = "Tg0f";
+					label = "GPU Tg0f";
+					apple,no-data-below-millicelsius = <10000>;
+				};
+
+				temperature-Tg0n {
+					apple,key-id = "Tg0n";
+					label = "GPU Tg0n";
+					apple,no-data-below-millicelsius = <10000>;
+				};
+
+				temperature-Tg0r {
+					apple,key-id = "Tg0r";
+					label = "GPU Tg0r";
+					apple,no-data-below-millicelsius = <10000>;
 				};
 			};
 
