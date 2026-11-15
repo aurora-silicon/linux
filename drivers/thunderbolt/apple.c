@@ -457,6 +457,7 @@ struct apple_cio {
 		unsigned int irq_count;
 		struct apple_nhi *diag_anhi;	/* set at tunnel activation, read by the IRQ diagnostics */
 		unsigned int diag_count;	/* sink IRQ_HPD events logged, on dp_wq only */
+		u8 diag_port;		/* the DP IN adapter's port number for the diagnostics */
 	} dpin[APPLE_DPIN_MAX];
 };
 
@@ -1954,7 +1955,7 @@ static void apple_dpin_diag(struct apple_dpin_ctx *c, unsigned int ms)
 
 	if (!anhi || !anhi->tb || !anhi->tb->root_switch)
 		return;
-	in = &anhi->tb->root_switch->ports[anhi->dp_in_port];
+	in = &anhi->tb->root_switch->ports[READ_ONCE(c->diag_port)];
 	for (i = 0; i <= 8; i++)
 		if (tb_port_read(in, &w[i], TB_CFG_PORT, in->cap_adap + i, 1))
 			w[i] = 0xffffffff;
@@ -2258,6 +2259,7 @@ static int apple_nhi_dp_tunnel_post_activate(struct tb_nhi *nhi,
 			if (!apple_dpin_request(c, generation, true))
 				return -ESTALE;
 			WRITE_ONCE(c->diag_anhi, anhi);
+			c->diag_port = in->port;
 			c->diag_count = 0;
 		}
 	}
@@ -2368,6 +2370,9 @@ static void apple_nhi_dp_tunnel_changed(struct tb_nhi *nhi, u8 in_port,
 		/* Publish cookie, powered retirement and lifecycle event under one lock. */
 		if (!apple_dpin_request(c, generation, active))
 			return;
+		WRITE_ONCE(c->diag_anhi, active ? anhi : NULL);
+		c->diag_port = in_port;
+		c->diag_count = 0;
 	}
 	queue_work(acio->dp_wq, &acio->dpin[dpin].work);
 }

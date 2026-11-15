@@ -1581,6 +1581,10 @@ void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message)
 	if (READ_ONCE(dcp->quiescing))
 		return;
 	trace_dcp_send_msg(dcp, endpoint, message);
+	if (READ_ONCE(dcp->tb_irq_log_until) &&
+	    time_before(jiffies, READ_ONCE(dcp->tb_irq_log_until)))
+		dev_info(dcp->dev, "w88-ap2fw +%lld us: ep %02x msg %016llx\n",
+			 ktime_us_delta(ktime_get(), dcp->tb_irq_log_t0), endpoint, message);
 	/*
 	 * The adopted T6030 14.7 session shares this mailbox with the panel
 	 * link. A non-sleeping send fails while that FIFO is full, and the

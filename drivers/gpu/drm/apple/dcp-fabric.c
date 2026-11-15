@@ -51,6 +51,11 @@ module_param(tb_drop_replay, bool, 0644);
 MODULE_PARM_DESC(tb_drop_replay,
 		 "Drop the sink IRQ_HPD replayed after a mode set instead of passing it (default: off)");
 
+static unsigned int tb_irq_log_ms = 2000;
+module_param(tb_irq_log_ms, uint, 0644);
+MODULE_PARM_DESC(tb_irq_log_ms,
+		 "Log each message sent to the display firmware for this long after a sink IRQ_HPD is passed (default: 2000, 0 = off)");
+
 /*
  * The hybrid pipeline (dcpext0: fixed HDMI PHY + Type-C routes) normally
  * comes last for a Type-C port, kept for an HDMI display.  On the J616s it
@@ -3392,6 +3397,11 @@ void dcp_tb_event_work(struct work_struct *work)
 			dev_info(dcp->dev, "DP tunnel: replayed sink IRQ_HPD (#%u, %lld ms after the last) dropped (tb_drop_replay=1)\n",
 				 dcp->tb_irq_hpd_count, since);
 		} else if (tb_forward_irq_hpd) {
+			if (tb_irq_log_ms) {
+				dcp->tb_irq_log_t0 = ktime_get();
+				WRITE_ONCE(dcp->tb_irq_log_until,
+					   jiffies + msecs_to_jiffies(tb_irq_log_ms) + 1);
+			}
 			ret = dptxport_sink_irq(service);
 			dev_info(dcp->dev, "DP tunnel: sink IRQ_HPD (#%u, %lld ms after the last) passed to the firmware: %d\n",
 				 dcp->tb_irq_hpd_count, since, ret);
