@@ -101,7 +101,8 @@ properties:
     description:
       The power states the engine needs, five on T8103, six on T6000 with
       ANE level control (including PMP report SRAM), eight on
-      T602x, seven on T8112 and one system domain on T8132 and T8140.
+      T602x, seven on T8112, five on T6041 and T8132 (system, CPU, MPM, TD
+      and base) and one system domain on T8140.
       T6041 may add a sixth, "perf", a performance floor (such as the SoC rail floor)
       that the driver holds only while requests are in flight.
     minItems: 1
@@ -355,7 +356,8 @@ allOf:
             - const: aux-2
             - const: aux-4
         power-domains:
-          maxItems: 1
+          minItems: 5
+          maxItems: 5
         apple,ane-type:
           const: 0x100
         apple,dapf-ranges:
@@ -659,7 +661,8 @@ examples:
             interrupts = <AIC_IRQ 629 IRQ_TYPE_LEVEL_HIGH>,
                          <AIC_IRQ 642 IRQ_TYPE_LEVEL_HIGH>;
             iommus = <&ane_dart0 0>, <&ane_dart1 0>, <&ane_dart2 0>;
-            power-domains = <&ps_ane_sys>;
+            power-domains = <&ps_ane_sys>, <&ps_ane_cpu>, <&ps_ane_mpm>,
+                            <&ps_ane_td>, <&ps_ane_base>;
             apple,ane-type = <0x100>;
             apple,firmware-preloaded;
             apple,dapf-ranges = /bits/ 64 <0x48d668000 0x48d668003>,
