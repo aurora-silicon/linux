@@ -169,12 +169,20 @@ static int ave_sess_params(struct ave_ctx *ctx, struct ave_params *p)
 	/*
 	 * HEVC Main 10 encodes P010 input; Main encodes NV12. The firmware
 	 * takes 16-bit samples for Main 10 (macOS converts 8-bit input to that
-	 * first), so other pairings are refused rather than converted.
+	 * first), so other pairings are refused rather than converted. S_FMT
+	 * sets the profile from the raw format, so only a profile set after it
+	 * gets here.
 	 */
 	if ((p->codec == AVE_CODEC_HEVC &&
 	     ctx->hevc_profile == V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10) !=
-	    (p->sample_bytes == 2))
+	    (p->sample_bytes == 2)) {
+		dev_info_ratelimited(ctx->ave->dev, "%s%s does not take %s input\n",
+				     p->codec == AVE_CODEC_HEVC ? "HEVC " : "H.264",
+				     p->codec != AVE_CODEC_HEVC ? "" :
+				     p->sample_bytes == 2 ? "Main" : "Main 10",
+				     p->sample_bytes == 2 ? "10-bit P010" : "8-bit NV12");
 		return -EINVAL;
+	}
 	if (ctx->ave->layout->kind == AVE_LAYOUT_6070 && p->sample_bytes != 1)
 		return -EOPNOTSUPP;
 	/*
