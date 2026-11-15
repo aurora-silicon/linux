@@ -5125,10 +5125,17 @@ int apple_atc_dp_tunnel_open(struct phy *phy)
 {
 	struct apple_atcphy *atcphy;
 
-	if (!phy || phy->ops != &apple_atc_dp_phy_ops)
+	if (!phy)
 		return -EINVAL;
+	/*
+	 * Everything but t600x has nothing to open, whichever driver provides
+	 * the PHY: T6050's tunnel clocks belong to atc-t6050-dp.c, whose PHY
+	 * this driver does not know, and start from the link rate alone.
+	 */
 	if (!apple_atc_tunnel_is_t600x())
 		return -EOPNOTSUPP;
+	if (phy->ops != &apple_atc_dp_phy_ops)
+		return -EINVAL;
 	atcphy = phy_get_drvdata(phy);
 	guard(mutex)(&atcphy->lock);
 	if (atcphy->mode != APPLE_ATCPHY_MODE_USB4 && atcphy->mode != APPLE_ATCPHY_MODE_TBT)
