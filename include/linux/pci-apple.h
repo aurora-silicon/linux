@@ -29,11 +29,14 @@ int apple_pcie_tunnel_cio_finish(struct device *dev);
 /*
  * T6050, for the driver of the endpoint below root port @bridge. Whether the host gave the
  * endpoint its warm reset at this wake, before the link came up; and, for a link that never
- * went down, the port taken down, the reset given, the port brought up again.
+ * went down, the port taken down, the reset given, the port brought up again. From the
+ * endpoint's suspend, when nothing below the port is to wake the system from this sleep:
+ * request a warm-reset replay after link shutdown, before the sleep.
  */
 #if IS_REACHABLE(CONFIG_PCIE_APPLE)
 bool apple_pcie_t6050_warm_reset_done(struct pci_dev *bridge);
 int apple_pcie_t6050_port_recycle(struct pci_dev *bridge);
+void apple_pcie_t6050_sleep_reset(struct pci_dev *bridge);
 #else
 static inline bool apple_pcie_t6050_warm_reset_done(struct pci_dev *bridge)
 {
@@ -43,6 +46,10 @@ static inline bool apple_pcie_t6050_warm_reset_done(struct pci_dev *bridge)
 static inline int apple_pcie_t6050_port_recycle(struct pci_dev *bridge)
 {
 	return -ENODEV;
+}
+
+static inline void apple_pcie_t6050_sleep_reset(struct pci_dev *bridge)
+{
 }
 #endif
 

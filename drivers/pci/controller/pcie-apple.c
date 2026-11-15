@@ -535,6 +535,8 @@ struct apple_pcie {
 	u32			t6050_warm_writes[2 * APPLE_PCIE_T6050_WARM_WRITES];
 	unsigned int		t6050_warm_count;
 	bool			t6050_warm_done;
+	/* The endpoint requests a warm reset after link shutdown; no radio wake is armed. */
+	bool			t6050_reset_before_sleep;
 	unsigned long		t6050_parked;
 	/* Parked ports whose registers a firmware sleep has taken: not even their root port answers */
 	unsigned long		t6050_cold_lost;
@@ -5239,6 +5241,7 @@ static int apple_pcie_t6050_pm_notify(struct notifier_block *nb, unsigned long a
 	pcie->t6050_woke = false;
 	/* A suspend that never shuts the link down gives no reset: the last wake's doesn't count */
 	pcie->t6050_warm_done = false;
+	pcie->t6050_reset_before_sleep = false;
 	/*
 	 * The DART wasn't bound when this host probed. Looked up here, before the freezer and any
 	 * device callback: a device link added in the noirq phase would reorder this host in the
@@ -5296,9 +5299,10 @@ drop:
 /*
  * With the port down. In the noirq resume the SMC's reply is polled for: the one SMC write
  * outside the interrupt-driven path, because the port has to be up before the PCI core's noirq
- * restore of the root port and the functions, and the reset has to come before the port.
+ * restore of the root port and the functions, and the reset has to come before the port. A
+ * reset requested before sleep uses the same path after the link's shutdown.
  */
-static void apple_pcie_t6050_warm_reset(struct apple_pcie *pcie, bool noirq)
+static int apple_pcie_t6050_warm_reset(struct apple_pcie *pcie, bool noirq)
 {
 	struct apple_smc *smc;
 	unsigned int i;
@@ -5306,11 +5310,11 @@ static void apple_pcie_t6050_warm_reset(struct apple_pcie *pcie, bool noirq)
 
 	pcie->t6050_warm_done = false;
 	if (!IS_REACHABLE(CONFIG_MFD_MACSMC) || !pcie->t6050_warm_count)
-		return;
+		return -ENODEV;
 	smc = platform_get_drvdata(pcie->t6050_smc);
 	if (!smc) {
 		dev_warn(pcie->dev, "no warm reset: the SMC isn't bound\n");
-		return;
+		return -ENODEV;
 	}
 	for (i = 0; i < pcie->t6050_warm_count && !ret; i++) {
 		__be32 value = cpu_to_be32(pcie->t6050_warm_writes[2 * i]);
@@ -5334,6 +5338,7 @@ static void apple_pcie_t6050_warm_reset(struct apple_pcie *pcie, bool noirq)
 		dev_err(pcie->dev, "endpoint warm reset before the port comes up: %d\n", ret);
 	else
 		dev_dbg(pcie->dev, "endpoint warm reset before the port comes up\n");
+	return ret;
 }
 
 /*
@@ -5494,6 +5499,49 @@ bool apple_pcie_t6050_warm_reset_done(struct pci_dev *bridge)
 	return pcie && pcie->t6050_warm_done;
 }
 EXPORT_SYMBOL_GPL(apple_pcie_t6050_warm_reset_done);
+
+/*
+ * For the endpoint's driver, from its suspend: nothing below the port is to wake the system
+ * from this sleep. Firmware left running on the endpoint once its host is gone can ask for the
+ * system some time later. Replay its warm-reset sequence after link shutdown, before
+ * sleeping. This does not implement selective radio wake or hold a reset signal asserted.
+ * The wake resets the endpoint again before the link comes up.
+ */
+void apple_pcie_t6050_sleep_reset(struct pci_dev *bridge)
+{
+	struct apple_pcie *pcie = apple_pcie_t6050_from_bridge(bridge);
+
+	if (pcie && pcie->t6050_warm_count)
+		pcie->t6050_reset_before_sleep = true;
+}
+EXPORT_SYMBOL_GPL(apple_pcie_t6050_sleep_reset);
+
+/* In the noirq suspend, the link just shut down for the sleep. */
+static int apple_pcie_t6050_reset_for_sleep(struct apple_pcie *pcie)
+{
+	int ret;
+
+	pcie->t6050_reset_before_sleep = false;
+	ret = apple_pcie_t6050_warm_reset(pcie, true);
+	if (ret) {
+		/*
+		 * The PM core skips noirq resume for the device whose suspend failed.
+		 * Restore the host here before its children resume. If recovery fails,
+		 * the existing lost-port path blocks their config-space accesses.
+		 */
+		apple_pcie_t6050_sleep_up(pcie, true);
+		pcie->t6050_woke = !READ_ONCE(pcie->t6050_down) && !pcie->t6050_lost &&
+				   pcie->t6050_warm_done;
+		dev_err(pcie->dev, "port %d: sleep refused after endpoint reset failed: %d\n",
+			pcie->t6050_port->idx, ret);
+		return ret;
+	}
+	dev_info(pcie->dev, "port %d: endpoint warm reset replayed before sleep\n",
+		 pcie->t6050_port->idx);
+	/* The wake's reset, not this one, is what the endpoint's driver asks about. */
+	pcie->t6050_warm_done = false;
+	return 0;
+}
 
 /*
  * For the endpoint's driver after a suspend that was abandoned before this host's shutdown:
@@ -6567,7 +6615,10 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 		if (pm_suspend_via_firmware()) {
 			/* The root ports below are suspended: from here a parked port's is not read */
 			WRITE_ONCE(pcie->t6050_cold_lost, pcie->t6050_parked);
-			return apple_pcie_t6050_sleep_down(pcie);
+			ret = apple_pcie_t6050_sleep_down(pcie);
+			if (!ret && pcie->t6050_reset_before_sleep)
+				ret = apple_pcie_t6050_reset_for_sleep(pcie);
+			return ret;
 		}
 		ret = apple_pcie_check_adopted_s2idle(pcie);
 

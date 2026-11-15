@@ -806,12 +806,13 @@ static void apple_smc_set_polled(struct apple_smc *smc, bool polled)
 }
 
 /*
- * A key write from another driver's noirq resume. SMC traffic is interrupt driven everywhere
- * else; this is the one exception, for a write that has to come before a device's bring-up that
- * itself has to be done in the noirq phase (an endpoint's reset given while its PCIe port is
- * still down, before the PCI core restores the port). The mailbox's interrupt is off there, so
- * the reply is fetched, as this driver fetches its own in its noirq callbacks. The caller is
- * ordered after this device's noirq resume by a device link, and must not sleep around the call.
+ * A key write from another driver's noirq callbacks. SMC traffic is interrupt driven everywhere
+ * else; this is the one exception, for a write that has to be made while a device's PCIe port is
+ * down in the noirq phase (an endpoint's reset given before the PCI core restores the port, or
+ * one replayed after the port's shutdown before sleep). The mailbox's interrupt is off there, so
+ * the reply is fetched, as this driver fetches its own in its noirq callbacks. A device link
+ * orders the caller's noirq suspend before this device's and its noirq resume after it; the
+ * caller must not sleep around the call.
  */
 int apple_smc_write_noirq(struct apple_smc *smc, smc_key key, const void *buf, size_t size)
 {
