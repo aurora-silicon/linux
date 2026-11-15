@@ -39,7 +39,7 @@
 #define AVD_QUIRK_NO_PIPE_STATE	 BIT(1)
 /* HEVC DMA configuration and extended scratch-address table. */
 #define AVD_QUIRK_HEVC_V5_HEADER	BIT(2)
-/* T8140: pace only HEVC submissions, with a shorter back-off. */
+/* v5 tier-0 firmware (T8140): pace submissions by limiting frames in flight. */
 #define AVD_QUIRK_V5_QUEUE_PACING	BIT(3)
 /* H.264 co-located motion vectors take 128 bytes per macroblock, not 64. */
 #define AVD_QUIRK_H264_MV_128	BIT(4)

@@ -19,11 +19,23 @@
 #define AVD_STORM_WINDOW msecs_to_jiffies(60000)
 #define AVD_RETRY_DELAY msecs_to_jiffies(1)
 #define AVD_PROGRAM_SIZE SZ_2M
+/*
+ * The v5 tier-0 firmware (T8140) can leave a submitted frame uncompleted when
+ * the host keeps its instruction queue full of back-to-back submissions; the
+ * frame watchdog then recovers it as a decoder reset. Pace that firmware by
+ * keeping fewer frames in flight than its FIFO count allows. Variants that
+ * tolerate a full queue are unaffected (AVD_QUIRK_V5_QUEUE_PACING is unset).
+ */
+#define AVD_V5_PACE_MAX_INFLIGHT 2
 
 /* PM test fixtures use backends without a transport. */
 static unsigned int avd_max_inflight(struct avd_dev *avd)
 {
-	return avd->backend->max_inflight ? avd->backend->max_inflight(avd) : 1;
+	unsigned int n = avd->backend->max_inflight ? avd->backend->max_inflight(avd) : 1;
+
+	if (avd->variant->quirks & AVD_QUIRK_V5_QUEUE_PACING)
+		n = min(n, (unsigned int)AVD_V5_PACE_MAX_INFLIGHT);
+	return n;
 }
 
 bool avd_backend_is_apple(const struct avd_dev *avd)
