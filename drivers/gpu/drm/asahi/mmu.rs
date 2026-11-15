@@ -402,6 +402,14 @@ impl Drop for MappingMutation {
     }
 }
 
+/// The most bytes of the client-private window one VM has had mapped at a time.
+static CLIENT_PRIVATE_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
+
+/// See [`CLIENT_PRIVATE_HIGH_WATER`] (diagnostics).
+pub(crate) fn client_private_high_water() -> u64 {
+    CLIENT_PRIVATE_HIGH_WATER.load(Ordering::Relaxed)
+}
+
 /// Where client-private aliases are placed: [`layout::CLIENT_PRIVATE_RANGE`] on M5,
 /// outside every Mesa window; the A18 Pro's arena otherwise.
 pub(crate) fn client_private_range(m5: bool) -> Range<u64> {
@@ -1200,6 +1208,8 @@ pub(crate) struct Vm {
     gpuvm: ARef<gpuvm::GpuVm<VmInner>>,
     dummy_obj: ARef<gem::Object>,
     binding: Arc<Mutex<VmBinding>>,
+    /// Bytes of the client-private window ([`client_private_range`]) this VM has mapped.
+    private_bytes: Arc<AtomicU64>,
 }
 no_debug!(Vm);
 
@@ -1466,6 +1476,8 @@ pub(crate) struct KernelMappingInner {
     prot: Prot,
     offset: usize,
     mapped_size: usize,
+    /// The owning VM's count of client-private bytes, for a mapping placed in that window.
+    private: Option<Arc<AtomicU64>>,
 }
 
 /// A kernel CPU mapping of a timestamp buffer's GEM backing. Dropping it takes the object's
@@ -1975,6 +1987,9 @@ impl Drop for KernelMapping {
         owner.tlbi_contexts_naming_root(self.iova(), self.size());
         drop(_mutation);
         drop(owner);
+        if let Some(private) = self.0.private.as_ref() {
+            private.fetch_sub(self.0.mapped_size as u64, Ordering::Relaxed);
+        }
         // SAFETY: Every normal path reaches this exactly once, after all GPUVM locks have
         // been released. Uncertain M4 paths return earlier, retaining the node and its pins.
         unsafe { ManuallyDrop::drop(&mut self.0) };
@@ -2525,6 +2540,7 @@ impl Vm {
             memory: None,
             dummy_obj: dummy_obj.gem.clone(),
             binding,
+            private_bytes: Arc::new(AtomicU64::new(0), GFP_KERNEL)?,
         })
     }
 
@@ -2847,6 +2863,8 @@ impl Vm {
                 _gem: None,
                 offset: object_range.start,
                 mapped_size: size,
+                private: (range == client_private_range(self.m5))
+                    .then(|| self.private_bytes.clone()),
             },
             reserved_size as u64,
             alignment,
@@ -2880,6 +2898,10 @@ impl Vm {
             return Err(ret.err().unwrap_or(EIO));
         }
         ret?;
+        if let Some(private) = node.private.as_ref() {
+            let used = private.fetch_add(size as u64, Ordering::Relaxed) + size as u64;
+            CLIENT_PRIVATE_HIGH_WATER.fetch_max(used, Ordering::Relaxed);
+        }
         Ok(KernelMapping(ManuallyDrop::new(node)))
     }
 
@@ -2952,6 +2974,7 @@ impl Vm {
                 _gem: None,
                 offset: 0,
                 mapped_size: size,
+                private: None,
             },
             addr,
             reserved_size as u64,
@@ -3125,6 +3148,7 @@ impl Vm {
                 _gem: None,
                 offset: 0,
                 mapped_size: size,
+                private: None,
             },
             iova,
             size as u64,
