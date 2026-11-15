@@ -5780,6 +5780,26 @@ static enum atcphy_mode atcphy_typec_target_mode(struct apple_atcphy *atcphy,
 		}
 	}
 
+	/*
+	 * T8142 runs DisplayPort only with the boot loader's LIOA and common
+	 * configuration banks, and the mode switch refuses a DP mode without
+	 * them. Serve a DP Alt Mode partner's USB then, as on T8132: USB2 next
+	 * to four DP lanes, USB3 next to two.
+	 */
+	if (atcphy->hw->dp_banked_tunables && !atcphy->dp_tunables) {
+		enum atcphy_mode usb_mode = target_mode;
+
+		if (target_mode == APPLE_ATCPHY_MODE_DP)
+			usb_mode = APPLE_ATCPHY_MODE_USB2;
+		else if (target_mode == APPLE_ATCPHY_MODE_USB3_DP)
+			usb_mode = APPLE_ATCPHY_MODE_USB3;
+		if (usb_mode != target_mode) {
+			dev_warn(atcphy->dev,
+				 "DisplayPort calibration missing: serving the partner's USB only\n");
+			target_mode = usb_mode;
+		}
+	}
+
 	if (atcphy->hw->usb2_only &&
 	    (!atcphy->t8132_ss || !atcphy->ss_tunables) &&
 	    (target_mode == APPLE_ATCPHY_MODE_USB3 || target_mode == APPLE_ATCPHY_MODE_USB3_DP))
