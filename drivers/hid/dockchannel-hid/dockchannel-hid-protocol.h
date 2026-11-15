@@ -73,4 +73,39 @@ static inline bool dchid_ring_stays_on_fifo(bool prepared, int ret, bool fifo_fa
 	return prepared && dchid_ring_refused(ret, fifo_fallback);
 }
 
+#define DCHID_IFACE_COMM		0
+
+/*
+ * Whether a received frame is the FIFO doorbell for the receive ring: a
+ * zero-length NOTIFY frame on the FIFO. The firmware may address it to the
+ * interface whose frame was queued, so the interface is not part of the test.
+ */
+static inline bool dchid_notify_wants_drain(bool fifo, u8 iface, u32 length)
+{
+	return fifo && !length;
+}
+
+/*
+ * A doorbell that finds the ring empty is looked at once more at once. One
+ * that stops on a frame still being written is looked at again up to
+ * DCHID_RING_RECHECKS times, DCHID_RING_RECHECK_US apart, before the frame is
+ * left for the next doorbell. Only the second case sleeps: an empty ring is
+ * the common case after a doorbell that the previous drain already served, and
+ * a timer wakeup for each of those would add to the IRQ thread's load.
+ */
+#define DCHID_RING_RECHECKS		2
+#define DCHID_RING_RECHECK_US		100
+
+static inline bool dchid_ring_retry_needed(int frames, bool partial, int tries)
+{
+	if (partial)
+		return tries < DCHID_RING_RECHECKS;
+	return frames == 0 && tries < 1;
+}
+
+static inline unsigned int dchid_ring_recheck_delay_us(bool partial)
+{
+	return partial ? DCHID_RING_RECHECK_US : 0;
+}
+
 #endif /* _DOCKCHANNEL_HID_PROTOCOL_H */

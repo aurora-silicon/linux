@@ -50,7 +50,7 @@ struct dchid_hdr {
 	u16 pad;
 } __packed;
 
-#define IFACE_COMM 0
+#define IFACE_COMM DCHID_IFACE_COMM
 
 #define FLAGS_GROUP GENMASK(7, 6)
 #define FLAGS_REQ GENMASK(5, 0)
@@ -1480,7 +1480,9 @@ static int dchid_dispatch(struct dockchannel_hid *dchid, struct dchid_hdr *hdr,
 
 	if (dchid->use_rx_ring && hdr->channel == DCHID_CHANNEL_NOTIFY) {
 		/* A FIFO notification has no application subheader or report ID. */
-		return fifo && !hdr->length && hdr->iface == IFACE_COMM;
+		dev_dbg(dchid->dev, "notify fifo=%d iface=%u length=%u\n",
+			fifo, hdr->iface, hdr->length);
+		return dchid_notify_wants_drain(fifo, hdr->iface, hdr->length);
 	}
 
 	if (hdr->iface >= MAX_INTERFACES || hdr->length < sizeof(struct dchid_subhdr))
@@ -1531,13 +1533,14 @@ static void dchid_ring_copy(struct dockchannel_hid *dchid, void *dst,
 	memcpy(dst + first, data, length - first);
 }
 
-static int dchid_drain_ring(struct dockchannel_hid *dchid)
+static int dchid_drain_ring(struct dockchannel_hid *dchid, bool *partial)
 {
 	const u32 capacity = dchid->ring_size - DCHID_RING_HEADER_SIZE;
 	u32 *indices = dchid->ring;
 	u32 producer, consumer, available;
-	int size;
+	int size, frames = 0;
 
+	*partial = false;
 	if (!READ_ONCE(dchid->ring_registered)) {
 		/* The firmware can notify before it has the ring address: nothing to read. */
 		dev_dbg(dchid->dev, "Ring notification before registration\n");
@@ -1554,15 +1557,19 @@ static int dchid_drain_ring(struct dockchannel_hid *dchid)
 		dma_rmb();
 		available = producer >= consumer ? producer - consumer :
 			    capacity - consumer + producer;
-		if (available < sizeof(struct dchid_hdr))
-			return 0;
+		if (available < sizeof(struct dchid_hdr)) {
+			*partial = !!available;
+			return frames;
+		}
 		dchid_ring_copy(dchid, dchid->pkt_buf, consumer,
 				sizeof(struct dchid_hdr));
 		size = dchid_frame_size((void *)dchid->pkt_buf);
 		if (size < 0)
 			return size;
-		if (available < size)
-			return 0;
+		if (available < size) {
+			*partial = true;
+			return frames;
+		}
 		dchid_ring_copy(dchid, dchid->pkt_buf, consumer, size);
 		dchid_dispatch(dchid, (void *)dchid->pkt_buf,
 			       dchid->pkt_buf + sizeof(struct dchid_hdr), false);
@@ -1570,19 +1577,50 @@ static int dchid_drain_ring(struct dockchannel_hid *dchid)
 		if (consumer >= capacity)
 			consumer -= capacity;
 		dchid->ring_read = consumer;
+		frames++;
 		/* All frame reads must complete before the producer can reuse it. */
 		mb();
 		WRITE_ONCE(indices[1], consumer);
 		cond_resched();
 	}
-	return 0;
+	return frames;
+}
+
+/*
+ * Drain after a doorbell. The firmware can ring the doorbell before the
+ * producer index (or the whole frame) is visible, and the doorbell is not
+ * repeated: the frame would then wait for the next one. Look again a bounded
+ * number of times while the ring looks empty or the last frame is incomplete.
+ */
+static void dchid_drain_ring_rechecked(struct dockchannel_hid *dchid)
+{
+	int tries = 0;
+	bool partial = false;
+	unsigned int delay;
+	int frames;
+
+	do {
+		frames = dchid_drain_ring(dchid, &partial);
+		if (frames < 0) {
+			dev_err(dchid->dev, "Receive ring failed: %d\n", frames);
+			return;
+		}
+		dev_dbg(dchid->dev, "drain: try %d frames %d partial %d producer %u consumer %u\n",
+			tries, frames, partial,
+			READ_ONCE(((u32 *)dchid->ring)[0]),
+			READ_ONCE(((u32 *)dchid->ring)[1]));
+		if (!dchid_ring_retry_needed(frames, partial, tries++))
+			return;
+		delay = dchid_ring_recheck_delay_us(partial);
+		if (delay)
+			fsleep(delay);
+	} while (!READ_ONCE(dchid->stopping));
 }
 
 static void dchid_handle_packet(void *cookie, size_t avail)
 {
 	struct dockchannel_hid *dchid = cookie;
 	struct dchid_hdr hdr;
-	int ret;
 
 	if (READ_ONCE(dchid->stopping))
 		return;
@@ -1600,11 +1638,8 @@ static void dchid_handle_packet(void *cookie, size_t avail)
 		goto done;
 	}
 
-	if (dchid_dispatch(dchid, &hdr, dchid->pkt_buf, true)) {
-		ret = dchid_drain_ring(dchid);
-		if (ret < 0)
-			dev_err(dchid->dev, "Receive ring failed: %d\n", ret);
-	}
+	if (dchid_dispatch(dchid, &hdr, dchid->pkt_buf, true))
+		dchid_drain_ring_rechecked(dchid);
 
 done:
 	if (!READ_ONCE(dchid->stopping))

@@ -196,6 +196,14 @@ static void dchid_unaligned_checksum_test(struct kunit *test)
 	}
 }
 
+/* dchid_drain_ring() also reports whether it stopped on a partial frame; these tests do not look at that. */
+static int dchid_test_drain(struct dockchannel_hid *dchid)
+{
+	bool partial;
+
+	return dchid_drain_ring(dchid, &partial);
+}
+
 /* A ring whose next frame straddles the end of the data area. */
 static void *dchid_test_ring(struct kunit *test, u32 consumer, u32 producer)
 {
@@ -240,7 +248,7 @@ static void dchid_ring_wrap_test(struct kunit *test)
 	memcpy(data + consumer, &frame, 12);
 	memcpy(data, (u8 *)&frame + 12, sizeof(frame) - 12);
 
-	KUNIT_EXPECT_EQ(test, dchid_drain_ring(iface->dchid), 0);
+	KUNIT_EXPECT_EQ(test, dchid_test_drain(iface->dchid), 1);
 	/* The frame arrived whole: its acknowledgment matched the pending command. */
 	KUNIT_EXPECT_TRUE(test, completion_done(&iface->out_complete));
 	KUNIT_EXPECT_EQ(test, iface->dchid->ring_read, sizeof(frame) - 12);
@@ -254,7 +262,7 @@ static void dchid_ring_bad_header_test(struct kunit *test)
 	u8 *data = dchid_test_ring(test, 0, 16);
 
 	memcpy(data, &hdr, sizeof(hdr));
-	KUNIT_EXPECT_EQ(test, dchid_drain_ring(iface->dchid), -EPROTO);
+	KUNIT_EXPECT_EQ(test, dchid_test_drain(iface->dchid), -EPROTO);
 	KUNIT_EXPECT_EQ(test, iface->dchid->ring_read, 0U);
 }
 

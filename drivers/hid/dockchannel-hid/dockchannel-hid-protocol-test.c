@@ -79,6 +79,38 @@ static void dchid_ring_success_is_not_a_refusal_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, dchid_ring_refused(0, true));
 }
 
+static void dchid_ring_doorbell_any_iface_test(struct kunit *test)
+{
+	/* The firmware may address the doorbell to the interface whose frame is queued. */
+	KUNIT_EXPECT_TRUE(test, dchid_notify_wants_drain(true, 0, 0));
+	KUNIT_EXPECT_TRUE(test, dchid_notify_wants_drain(true, 2, 0));
+	KUNIT_EXPECT_TRUE(test, dchid_notify_wants_drain(true, 7, 0));
+	/* A frame with a payload is not a doorbell, and ring frames never are. */
+	KUNIT_EXPECT_FALSE(test, dchid_notify_wants_drain(true, 2, 4));
+	KUNIT_EXPECT_FALSE(test, dchid_notify_wants_drain(false, 0, 0));
+}
+
+static void dchid_ring_empty_doorbell_rechecked_test(struct kunit *test)
+{
+	/* A doorbell that finds nothing is looked at once more, without sleeping. */
+	KUNIT_EXPECT_TRUE(test, dchid_ring_retry_needed(0, false, 0));
+	KUNIT_EXPECT_FALSE(test, dchid_ring_retry_needed(0, false, 1));
+	KUNIT_EXPECT_EQ(test, dchid_ring_recheck_delay_us(false), 0);
+}
+
+static void dchid_ring_partial_frame_rechecked_test(struct kunit *test)
+{
+	int tries;
+
+	/* Frames drained but the next one is still being written: wait and look again. */
+	for (tries = 0; tries < DCHID_RING_RECHECKS; tries++)
+		KUNIT_EXPECT_TRUE(test, dchid_ring_retry_needed(3, true, tries));
+	KUNIT_EXPECT_FALSE(test, dchid_ring_retry_needed(3, true, DCHID_RING_RECHECKS));
+	KUNIT_EXPECT_EQ(test, dchid_ring_recheck_delay_us(true), DCHID_RING_RECHECK_US);
+	/* A clean full drain needs no retry. */
+	KUNIT_EXPECT_FALSE(test, dchid_ring_retry_needed(3, false, 0));
+}
+
 static void dchid_ring_failed_prepare_is_not_a_refusal_test(struct kunit *test)
 {
 	/* CMD_REGISTER_RING was never sent, so the ring is not refused: stay unregistered and retry. */
@@ -102,6 +134,9 @@ static struct kunit_case dchid_protocol_test_cases[] = {
 	KUNIT_CASE(dchid_ring_success_is_not_a_refusal_test),
 	KUNIT_CASE(dchid_ring_failed_prepare_is_not_a_refusal_test),
 	KUNIT_CASE(dchid_ring_refused_register_stays_on_fifo_test),
+	KUNIT_CASE(dchid_ring_doorbell_any_iface_test),
+	KUNIT_CASE(dchid_ring_empty_doorbell_rechecked_test),
+	KUNIT_CASE(dchid_ring_partial_frame_rechecked_test),
 	{}
 };
 
