@@ -1762,10 +1762,6 @@ static int dwc3_apple_suspend(struct device *dev)
 	return 0;
 }
 
-static const struct dev_pm_ops dwc3_apple_pm_ops = {
-	.suspend = pm_sleep_ptr(dwc3_apple_suspend),
-};
-
 static void dwc3_apple_pm_notifier_remove(void *data)
 {
 	struct dwc3_apple *appledwc = data;
@@ -1801,6 +1797,7 @@ static int dwc3_apple_pm_prepare(struct device *dev)
 
 static const struct dev_pm_ops dwc3_apple_pm_ops = {
 	.prepare = pm_sleep_ptr(dwc3_apple_pm_prepare),
+	.suspend = pm_sleep_ptr(dwc3_apple_suspend),
 };
 
 /* A fixed hub's node gives the root port it sits on in its reg, 1 if it doesn't. */
