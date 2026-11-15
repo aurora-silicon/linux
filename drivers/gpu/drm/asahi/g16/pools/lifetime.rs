@@ -66,7 +66,7 @@ impl Lifetime {
                 State::Retired => counts.retired += 1,
                 State::Quarantined => counts.quarantined += 1,
             }
-            counts.reusable += self.available(k) as u32;
+            counts.reusable += u32::from(self.available(k));
         }
         counts
     }

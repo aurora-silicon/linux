@@ -118,14 +118,15 @@ brcmf_get_prepped_struct_for_ibss_v1(struct brcmf_cfg80211_info *cfg,
 }
 
 static void
-brcmf_joinscan_set_common_v0v1_params(struct brcmf_join_scan_params_le *scan_le,
-				      bool have_channel)
+brcmf_joinscan_set_common_v0v1_params(struct brcmf_cfg80211_info *cfg,
+				      struct brcmf_join_scan_params_le *scan_le)
 {
 	/* Set up join scan parameters */
 	scan_le->scan_type = 0;
 	scan_le->home_time = cpu_to_le32(-1);
 
-	if (have_channel) {
+	/* Let firmware budget the scan around AWDL availability windows. */
+	if (cfg->channel && !brcmf_has_awdl_interface(cfg->pub)) {
 		/* Increase dwell time to receive probe response or detect
 		 * beacon from target AP at a noisy air only during connect
 		 * command.
@@ -166,8 +167,7 @@ brcmf_get_struct_for_connect_v0(struct brcmf_cfg80211_info *cfg,
 	}
 	brcmf_joinscan_set_ssid(&ext_v0->ssid_le, params->ssid,
 				params->ssid_len);
-	brcmf_joinscan_set_common_v0v1_params(&ext_v0->scan_le,
-					      cfg->channel != 0);
+	brcmf_joinscan_set_common_v0v1_params(cfg, &ext_v0->scan_le);
 	brcmf_joinscan_set_bssid(ext_v0->assoc_le.bssid, params->bssid);
 	if (cfg->channel) {
 		struct ieee80211_channel *chan = params->channel_hint ?
@@ -201,8 +201,7 @@ brcmf_get_struct_for_connect_v1(struct brcmf_cfg80211_info *cfg,
 	ext_v1->assoc_le.version = cpu_to_le16(1);
 	brcmf_joinscan_set_ssid(&ext_v1->ssid_le, params->ssid,
 				params->ssid_len);
-	brcmf_joinscan_set_common_v0v1_params(&ext_v1->scan_le,
-					      cfg->channel != 0);
+	brcmf_joinscan_set_common_v0v1_params(cfg, &ext_v1->scan_le);
 	brcmf_joinscan_set_bssid(ext_v1->assoc_le.bssid, params->bssid);
 	if (cfg->channel) {
 		struct ieee80211_channel *chan = params->channel_hint ?

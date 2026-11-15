@@ -8,6 +8,9 @@
 
 #include "debug.h"
 
+/* Firmware error codes (positive values; firmware returns their negatives). */
+#define BRCMF_FW_BUSY				16
+
 /*******************************************************************************
  * Dongle command codes that are interpreted by firmware
  ******************************************************************************/
@@ -115,6 +118,11 @@ s32 brcmf_fil_cmd_int_query(struct brcmf_if *ifp, u32 cmd, u32 *data)
 	return brcmf_fil_cmd_int_get(ifp, cmd, data);
 }
 
+/* Like brcmf_fil_iovar_data_set(), also returning the firmware status.
+ * The status is zero when the command could not be sent or transport failed.
+ */
+s32 brcmf_fil_iovar_data_set_fwerr(struct brcmf_if *ifp, const char *name,
+				   const void *data, u32 len, s32 *fwerr);
 s32 brcmf_fil_iovar_data_set(struct brcmf_if *ifp, const char *name,
 			     const void *data, u32 len);
 s32 brcmf_fil_iovar_data_get(struct brcmf_if *ifp, const char *name, void *data,

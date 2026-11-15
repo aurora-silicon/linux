@@ -3476,7 +3476,11 @@ void set_task_cpu(struct task_struct *p, unsigned int new_cpu)
 }
 #endif /* CONFIG_SMP */
 
-#ifdef CONFIG_NUMA_BALANCING
+#ifdef CONFIG_SMP
+/*
+ * Swapping two running tasks is used by NUMA balancing and by misfit
+ * rotation on asymmetric CPU capacity systems.
+ */
 static void __migrate_swap_task(struct task_struct *p, int cpu)
 {
 	if (task_on_rq_queued(p)) {
@@ -3574,13 +3578,15 @@ int migrate_swap(struct task_struct *cur, struct task_struct *p,
 	if (!cpumask_test_cpu(arg.src_cpu, arg.dst_task->cpus_ptr))
 		goto out;
 
+#ifdef CONFIG_NUMA_BALANCING
 	trace_sched_swap_numa(cur, arg.src_cpu, p, arg.dst_cpu);
+#endif
 	ret = stop_two_cpus(arg.dst_cpu, arg.src_cpu, migrate_swap_stop, &arg);
 
 out:
 	return ret;
 }
-#endif /* CONFIG_NUMA_BALANCING */
+#endif /* CONFIG_SMP */
 
 /***
  * kick_process - kick a running thread to enter/exit the kernel
@@ -4658,6 +4664,7 @@ static void __sched_fork(u64 clone_flags, struct task_struct *p)
 	p->se.on_rq			= 0;
 	p->se.exec_start		= 0;
 	p->se.sum_exec_runtime		= 0;
+	p->misfit_runtime		= 0;
 	p->se.prev_sum_exec_runtime	= 0;
 	p->se.nr_migrations		= 0;
 	p->se.vruntime			= 0;

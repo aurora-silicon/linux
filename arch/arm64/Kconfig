@@ -2445,6 +2445,48 @@ config ARM64_MEMORY_MODEL_CONTROL
 	  for the PR_SET_MEM_MODEL/PR_GET_MEM_MODEL prctl() calls on
 	  CPUs with this feature.
 
+config ARM64_APPLE_X86_FLAGS
+	bool "Apple x86 parity and adjust flags (APFLG)"
+	default y
+	select ARM64_ACTLR_STATE
+	help
+	  Apple CPUs can compute the x86 parity (PF) and adjust (AF) flags
+	  alongside NZCV for x86 emulators. Say Y to let a thread enable
+	  this with the PR_AURORA_SET_X86_FLAGS prctl() and to keep both
+	  flags across exceptions, context switches and signal delivery.
+
+config ARM64_APPLE_X86_FP
+	bool "Apple x86 floating-point mode (AFP)"
+	default y
+	select ARM64_ACTLR_STATE
+	help
+	  Apple CPUs have an alternate floating-point mode that follows x86
+	  SSE rules for NaNs, FMAX/FMIN and denormals, with its own control
+	  register (AFPCR_EL0) for the DAZ and FTZ modes. Say Y to let a
+	  thread enable it with the PR_AURORA_SET_X86_FP prctl() and to
+	  give each thread its own AFPCR_EL0.
+
+config ARM64_APPLE_FP_PRESERVE
+	bool "Apple scalar FP upper-lane preservation (PRSV)"
+	default y
+	select ARM64_ACTLR_STATE
+	help
+	  Apple CPUs can make scalar floating-point instructions keep the
+	  rest of the destination vector register, as x86 SSE scalar
+	  instructions do. Say Y to let a thread enable this with the
+	  PR_AURORA_SET_FP_PRESERVE prctl().
+
+config ARM64_APPLE_AMX
+	bool "Apple AMX matrix coprocessor"
+	depends on ARCH_APPLE
+	default y
+	help
+	  Apple CPUs have a matrix coprocessor (AMX) that EL0 code drives
+	  with implementation-defined instructions. Say Y to let threads
+	  use it: AMX is enabled for a thread on its first AMX instruction
+	  and its 5 KiB register file is saved and restored across context
+	  switches. Boot with apple_amx=off to keep AMX disabled.
+
 config RELOCATABLE
 	bool "Build a relocatable kernel image" if EXPERT
 	select ARCH_HAS_RELR
@@ -2492,6 +2534,31 @@ config RANDOMIZE_MODULE_REGION_FULL
 	  core kernel, so branch relocations are almost always in range unless
 	  the region is exhausted. In this particular case of region
 	  exhaustion, modules might be able to fall back to a larger 2GB area.
+
+config ARM64_CTXR_EXECMEM
+	bool "Confine kernel executable code to a fixed physical window (CTXR)"
+	depends on EXECMEM && MMU
+	select EXECMEM_CONFINE
+	select GENERIC_ALLOCATOR
+	select PTDUMP
+	help
+	  On some Apple-silicon machines the boot firmware arms a CTXR (code
+	  text execute range) on the secondary CPUs: privileged code can only
+	  be fetched from inside a fixed physical window. To run the kernel at
+	  EL2 behind such a window (rather than dropping it to EL1), every
+	  executable physical page must live inside it.
+
+	  With this option the kernel reserves a single window — described by
+	  the bootloader in /chosen/aurora,ctxr-exec-window, where it has already
+	  placed the static image, or by the "ctxr_exec_window=" command-line
+	  option for VM bring-up — and backs every run-time executable allocation
+	  (modules, BPF, kprobes, ftrace) with pages drawn from the window's free
+	  memory. A verifier sweeps the kernel page tables and reports (or, when
+	  the window is enforcing, panics on) any executable mapping that escapes.
+
+	  This has no effect unless the bootloader or the command line supplies
+	  a window, so a distribution kernel for Apple silicon can enable it.
+	  Say Y for such a kernel, and N otherwise.
 
 config CC_HAVE_STACKPROTECTOR_SYSREG
 	def_bool $(cc-option,-mstack-protector-guard=sysreg -mstack-protector-guard-reg=sp_el0 -mstack-protector-guard-offset=0)

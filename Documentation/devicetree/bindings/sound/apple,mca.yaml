@@ -21,7 +21,11 @@ properties:
   compatible:
     oneOf:
       - items:
-          - const: apple,t6020-mca
+          - enum:
+              - apple,t6020-mca
+              - apple,t6030-mca
+              - apple,t6031-mca
+              - apple,t8122-mca
           - const: apple,t8103-mca
       - items:
           - enum:

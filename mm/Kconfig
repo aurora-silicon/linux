@@ -1474,6 +1474,19 @@ config IOMMU_MM_DATA
 config EXECMEM
 	bool
 
+config EXECMEM_CONFINE
+	bool
+	depends on EXECMEM && MMU
+	select GENERIC_ALLOCATOR
+	help
+	  Back executable-memory ranges flagged EXECMEM_CONFINE with physical
+	  pages drawn from a single fixed window registered by the architecture,
+	  rather than from arbitrary buddy pages. This keeps every run-time
+	  executable physical page (modules, BPF, kprobes, ftrace) inside a
+	  hardware-enforceable code region such as an Apple-silicon CTXR window.
+
+	  Selected by architectures that provide a window; no effect otherwise.
+
 config NUMA_MEMBLKS
 	bool
 

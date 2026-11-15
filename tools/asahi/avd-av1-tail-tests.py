@@ -15,7 +15,7 @@ DRIVER = Path('drivers/media/platform/apple/avd')
 
 
 def function(source, name):
-    match = re.search(r'^(?:static )?(?:int|void)\s+' + name + r'\(', source, re.M)
+    match = re.search(r'^(?:static )?(?:int|void|u64)\s+' + name + r'\(', source, re.M)
     if not match:
         raise ValueError(name)
     start = match.start()
@@ -47,11 +47,14 @@ typedef uint8_t u8;
 typedef int8_t s8;
 typedef uint16_t u16;
 typedef uint32_t u32;
+typedef uint64_t u64;
+#define U64_MAX UINT64_MAX
 typedef uint64_t dma_addr_t;
 #define ALIGN(x,a) (((x)+(a)-1)&~((__typeof__(x))(a)-1))
 #define ALIGN_DOWN(x,a) ((x)&~((__typeof__(x))(a)-1))
 #define WARN_ON(x) (x)
 #define DIV_ROUND_UP(n,d) (((n)+(d)-1)/(d))
+#define dev_err_ratelimited(...) ((void)0)
 @ALIGNMENT@
 @CDF_HEADER@
 @CDF_DEFAULTS@
@@ -62,10 +65,10 @@ struct avd_decoded_buffer {
  struct {unsigned int color_size; unsigned short width,height; size_t seg_size;} av1;
 };
 struct avd_buf {void *cpu; dma_addr_t addr;};
-struct avd_run {struct {struct vb2_v4l2_buffer *dst;} bufs; dma_addr_t y_out;};
+struct avd_run {struct {struct vb2_v4l2_buffer *src,*dst;} bufs; dma_addr_t y_out; int setup_err;};
 @RUN_STRUCT@
 @CTX_STRUCT@
-struct v4l2_ctrl {struct {void *p;} p_cur;};
+struct v4l2_ctrl {unsigned int elems; struct {void *p;} p_cur;};
 struct v4l2_pix_format_mplane {unsigned int width,height; struct {unsigned int sizeimage;} plane_fmt[1];};
 struct avd_ctx {void *priv; int ctrl_hdl; struct {struct {struct {unsigned int width,height;} pix_mp;} fmt;} decoded_fmt;};
 static struct avd_decoded_buffer *reference;
@@ -76,6 +79,7 @@ static struct v4l2_ctrl_av1_film_grain grain;
 static struct v4l2_ctrl controls[4];
 static unsigned int lookup_calls, preamble_calls;
 static void *vb2_plane_vaddr(struct vb2_buffer *b,unsigned int p){assert(p==0);return b->memory;}
+static unsigned long vb2_get_plane_payload(struct vb2_buffer *b,unsigned int p){assert(p==0);return b->planes[0].length;}
 static dma_addr_t vb2_dma_contig_plane_dma_addr(struct vb2_buffer *b,unsigned int p){assert(p==0);return b->dma;}
 static struct avd_decoded_buffer *vb2_to_avd_decoded_buf(struct vb2_buffer *b){return (void *)b;}
 static struct avd_decoded_buffer *avd_get_ref_buf(struct avd_ctx *ctx,struct vb2_v4l2_buffer *dst,uint64_t timestamp){(void)ctx;(void)dst;assert(timestamp==1000);lookup_calls++;return reference;}
@@ -211,7 +215,7 @@ def main():
     text = {name: p.read_text() for name, p in paths.items()}
     src = text['avd-av1.c']
     macros = src[src.index('#define AVD_CDFS_SIZE'):src.index('struct avd_av1_run {')]
-    functions = {n: function(src, n) for n in ['avd_av1_set_prob', 'avd_av1_set_seg', 'avd_av1_seg_size', 'avd_color_size', 'avd_av1_run_preamble', 'avd_av1_adjust_decoded_fmt']}
+    functions = {n: function(src, n) for n in ['avd_av1_ref_ts', 'avd_av1_set_prob', 'avd_av1_set_seg', 'avd_av1_seg_size', 'avd_color_size', 'avd_av1_check_tiles', 'avd_av1_run_preamble', 'avd_av1_adjust_decoded_fmt']}
     unaligned = ('\n#define UNALIGNED_CDFS_OFFSET(dst,cl) ((dst)-ALIGN(cl,AVD_ALIGN)-ALIGN(AVD_CDFS_SIZE,AVD_ALIGN))\n'
                  '#define UNALIGNED_SEG_OFFSET(dst,cl,sl) (UNALIGNED_CDFS_OFFSET(dst,cl)-(sl))\n')
     # Each mutation names the extracted text it rewrites; a stale one is refused, never run as a no-op.

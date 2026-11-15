@@ -1,0 +1,94 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/apple,t6000-dpaudio.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T6000, T6020 and T8112 DisplayPort audio
+
+maintainers:
+  - Ryan Murray <ryan@aurorasilicon.org>
+
+description: |
+  Each display coprocessor (DCP) provides a DisplayPort/HDMI audio service.
+  Samples are fed to it by SIO DMA; the host does not access the register
+  window of the interface. The graph connects this interface to port 0 of
+  the display processor that owns the audio service.
+
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t6000-dpaudio
+          - apple,t6020-dpaudio
+          - apple,t8112-dpaudio
+  required:
+    - compatible
+
+properties:
+  compatible:
+    items:
+      - enum:
+          - apple,t6000-dpaudio
+          - apple,t6020-dpaudio
+          - apple,t8112-dpaudio
+      - const: apple,dpaudio
+
+  reg:
+    maxItems: 1
+
+  dmas:
+    maxItems: 1
+
+  dma-names:
+    const: tx
+
+  power-domains:
+    maxItems: 1
+
+  ports:
+    $ref: /schemas/graph.yaml#/properties/ports
+    properties:
+      port@0:
+        $ref: /schemas/graph.yaml#/properties/port
+        description: Connection to the display processor's audio service.
+    required:
+      - port@0
+
+required:
+  - compatible
+  - reg
+  - dmas
+  - dma-names
+  - power-domains
+
+additionalProperties: false
+
+examples:
+  - |
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        audio-controller@39b500000 {
+            compatible = "apple,t6000-dpaudio", "apple,dpaudio";
+            reg = <0x3 0x9b500000 0x0 0x4000>;
+            dmas = <&sio 0x64>;
+            dma-names = "tx";
+            power-domains = <&ps_dpa0>;
+
+            ports {
+                #address-cells = <1>;
+                #size-cells = <0>;
+
+                port@0 {
+                    reg = <0>;
+
+                    endpoint {
+                        remote-endpoint = <&dcp_audio>;
+                    };
+                };
+            };
+        };
+    };

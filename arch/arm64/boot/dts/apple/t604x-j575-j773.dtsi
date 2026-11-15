@@ -1,0 +1,82 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * This file contains the parts common to the M4 Pro Mac mini (J773s)
+ * and M4 Max Mac Studio (J575c).
+ *
+ * target-type: J575c / J773s
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/*
+ * Neither has an internal panel or a camera: the internal display and ISP
+ * blocks of the SoC stay disabled, and the boot loader's framebuffer is on
+ * an external display.
+ */
+/ {
+	chassis-type = "desktop";
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>; /* To be filled by loader */
+			/* Format properties will be added by loader */
+			status = "disabled";
+		};
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0 0 0 0>; /* To be filled by loader */
+	};
+
+	/* The DART of PCIe port 2, the Ethernet port (J773s ADT dart-apcie2). */
+	apcie2_dart: iommu@412000000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x4 0x12000000 0x0 0x20000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1742 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+};
+
+/*
+ * The ISP and camera sensor have no power states here (J773s ADT no_ps), and
+ * the ISP's own PMGR block sits behind ISP_SYS: keep every ISP domain off.
+ */
+&ps_ispsens0 {
+	status = "disabled";
+};
+
+&ps_isp_sys {
+	status = "disabled";
+};
+
+&ps_isp_cpu {
+	status = "disabled";
+};
+
+&ps_isp_fe {
+	status = "disabled";
+};
+
+&ps_isp_dprx {
+	status = "disabled";
+};
+
+&ps_isp_secure {
+	status = "disabled";
+};
+
+&ps_isp_be {
+	status = "disabled";
+};
+
+&ps_isp_clr {
+	status = "disabled";
+};

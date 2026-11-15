@@ -126,8 +126,7 @@ impl Firmware {
     }
 
     pub(crate) fn recovery_pending(&self) -> Result<bool> {
-        Ok(self.recovery.running || self.new_recovery()
-            || self.firmware_r32(logic::PHASE)? != 0)
+        Ok(self.recovery.running || self.new_recovery() || self.firmware_r32(logic::PHASE)? != 0)
     }
 
     pub(crate) fn recovery_idle(&self) -> Result<bool> {
@@ -254,6 +253,8 @@ impl Firmware {
     /// flights are retained whole, never released to the free slot lists.
     pub(crate) fn fail_flights(&mut self, error: Error, done: &mut Completions) {
         let flights = core::mem::take(&mut self.engine.flights);
+        // A failed device never publishes again: release the memory floor now.
+        self.power.report_work(false);
         for flight in flights.iter() {
             for job in Iterator::chain(core::iter::once(&flight.job), flight.group.iter()) {
                 push_completion(done, job, Err(error));
@@ -289,7 +290,7 @@ impl Firmware {
         // The firmware is stopped while its published generation is consumed.
         let lo = self.firmware_r32(logic::GENERATION)?;
         let hi = self.firmware_r32(logic::GENERATION + 4)?;
-        Ok(lo as u64 | ((hi as u64) << 32))
+        Ok(u64::from(lo) | (u64::from(hi) << 32))
     }
 
     /// Resolve the snapshot while the firmware is stopped. A missing retained

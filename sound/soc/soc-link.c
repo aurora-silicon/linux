@@ -136,6 +136,8 @@ static int soc_link_trigger(struct snd_pcm_substream *substream, int cmd)
 	    rtd->dai_link->ops->trigger)
 		ret = rtd->dai_link->ops->trigger(substream, cmd);
 
+	if (snd_soc_link_trigger_refused(rtd->dai_link, ret))
+		return ret;
 	return soc_link_ret(rtd, ret);
 }
 

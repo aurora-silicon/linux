@@ -8,9 +8,8 @@
 //! device tree node the boot loader fills, not an ADT export), the GPU power (its power domain;
 //! there is no PMP vote), the initdata root version, a longer HardwareData record (0xb480
 //! bytes, its fourth view at +0xb400) placed aligned and ASC-cached, the IOMapping table (17
-//! slots at the T6031 register blocks) and the board images, built from the device tree and
-//! checked against this machine's firmware file, which supplies the record's non-device-tree
-//! words. Every
+//! slots at the T6031 register blocks) and the board images, built from the device tree, the
+//! ADT's sensor rows and the J516C reference words. Every
 //! value was measured on a J516C: the SGX identification
 //! registers, the loaded firmware segment, the device tree the boot loader hands over and the
 //! initdata of that machine.
@@ -117,18 +116,6 @@ pub(crate) const LAYOUT: Layout = Layout {
     record_empty_writable: &RECORD_EMPTY_WRITABLE,
 };
 
-/// The J516C board file (`asahi/t6031-j516c-board.bin`, built into the kernel): the hardware
-/// record, Globals and the power block that this machine's firmware accepted, as the earlier
-/// J516C driver uploaded them (its device-tree-built records with the per-board words of this
-/// machine applied). Kept out of the tree; pinned by its SHA-256. The three images are built
-/// from the device tree and must match the file's; the file supplies the record's words the
-/// device tree does not carry (`board::record::FROM_FILE`).
-const BOARD_SHA256: [u8; 32] = [
-    0x4e, 0x03, 0xf2, 0x9f, 0xa4, 0x47, 0xdc, 0xeb, 0xfd, 0x4d, 0x1c, 0x22, 0x5a, 0x64, 0x7b,
-    0xfa, 0x31, 0xb3, 0x63, 0x45, 0x8f, 0x28, 0x33, 0x82, 0x3a, 0x5c, 0xa8, 0xa1, 0x0e, 0xdf,
-    0xf3, 0xfc,
-];
-
 pub(crate) const CONFIG: Config = Config {
     name: "T6031 G15C",
     chip_id: 0x6031,
@@ -172,15 +159,12 @@ pub(crate) const CONFIG: Config = Config {
             ],
         },
     ],
-    // The pinned board images and measured layout belong to the J516C, not
+    // The reference words and measured layout belong to the J516C, not
     // every T6031 board (in particular, not the 14-inch J514C).
     machine: kernel::c_str!("apple,j516c"),
     platform: super::Platform::DeviceTree,
     layout: &LAYOUT,
-    board: super::Board::Blob {
-        name: kernel::c_str!("asahi/t6031-j516c-board.bin"),
-        sha256: BOARD_SHA256,
-    },
+    board: super::Board::DeviceTree(&super::super::board::record::J516C),
     // Four clusters: the saved-state pointers at +0x2980 of the preemption buffer (0xd80 plus
     // 0x700 per cluster), UMA PTC 0x6000400020, DUPM 0x3c000000140 (32 N | 96 N << 32 for
     // N = 10 cores per cluster) and 0x1a0e9 = 0, with the saved-state pointers and the

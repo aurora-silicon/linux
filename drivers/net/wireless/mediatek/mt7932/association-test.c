@@ -188,7 +188,7 @@ static void mt_connect_auth_test(struct kunit *test)
 	} cases[] = {
 		{ "pure PSK", MT_AUTH_PSK, 0, WLAN_AKM_SUITE_PSK },
 		{ "PSK missing PMK", MT_AUTH_PSK, 1, -EOPNOTSUPP },
-		{ "PSK required MFP", MT_AUTH_PSK, 2, -EOPNOTSUPP },
+		{ "PSK required MFP", MT_AUTH_PSK, 2, WLAN_AKM_SUITE_PSK },
 		{ "pure SAE", MT_AUTH_NONE, 0, WLAN_AKM_SUITE_SAE },
 		{ "optional MFP", MT_AUTH_MFP, NL80211_MFP_OPTIONAL, WLAN_AKM_SUITE_SAE },
 		{ "no MFP", MT_AUTH_MFP, NL80211_MFP_NO, -EOPNOTSUPP },
@@ -221,7 +221,7 @@ static void mt_connect_auth_test(struct kunit *test)
 		{ "SAE first missing password", MT_AUTH_SAE_FIRST, 1, -EOPNOTSUPP },
 		{ "PSK first optional MFP", MT_AUTH_PSK_FIRST, 0, WLAN_AKM_SUITE_PSK },
 		{ "PSK first missing PMK", MT_AUTH_PSK_FIRST, 1, -EOPNOTSUPP },
-		{ "PSK first required MFP", MT_AUTH_PSK_FIRST, 2, -EOPNOTSUPP },
+		{ "PSK first required MFP", MT_AUTH_PSK_FIRST, 2, WLAN_AKM_SUITE_PSK },
 		{ "PSK first no MFP", MT_AUTH_PSK_FIRST, 3, WLAN_AKM_SUITE_PSK },
 		{ "PSK first mixed versions", MT_AUTH_PSK_FIRST, 4, WLAN_AKM_SUITE_PSK },
 		{ "PSK first VERSION_3 only", MT_AUTH_PSK_FIRST, 5, -EOPNOTSUPP },
@@ -439,6 +439,17 @@ static void mt_owe_connect_auth_test(struct kunit *test)
 	}
 }
 
+/* A radar or no-IR candidate counts only once heard during this attempt. */
+static void mt_bss_heard_test(struct kunit *test)
+{
+	KUNIT_EXPECT_TRUE(test, mt7932_bss_heard(0, 0, 1000));
+	KUNIT_EXPECT_FALSE(test, mt7932_bss_heard(IEEE80211_CHAN_RADAR, 999, 1000));
+	KUNIT_EXPECT_TRUE(test, mt7932_bss_heard(IEEE80211_CHAN_RADAR, 1000, 1000));
+	KUNIT_EXPECT_FALSE(test, mt7932_bss_heard(IEEE80211_CHAN_NO_IR, 0, 1000));
+	KUNIT_EXPECT_TRUE(test, mt7932_bss_heard(IEEE80211_CHAN_NO_IR | IEEE80211_CHAN_RADAR,
+						 2000, 1000));
+}
+
 static struct kunit_case mt_association_test_cases[] = {
 	KUNIT_CASE(mt_owe_body_bounds_test),
 	KUNIT_CASE(mt_owe_connect_auth_test),
@@ -447,6 +458,7 @@ static struct kunit_case mt_association_test_cases[] = {
 	KUNIT_CASE(mt_connect_body_test),
 	KUNIT_CASE(mt_sae_body_bounds_test),
 	KUNIT_CASE(mt_connect_auth_test),
+	KUNIT_CASE(mt_bss_heard_test),
 	{}
 };
 

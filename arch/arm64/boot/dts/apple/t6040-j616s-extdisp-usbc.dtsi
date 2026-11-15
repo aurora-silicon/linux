@@ -23,52 +23,17 @@
 };
 
 /*
- * DISPEXT1_SYS sits on FAB7_SOC (ADT pmgr device id2 134, pmgr_aux 0x488, parent
- * FAB6_SOC, off at boot), which t6040-pmgr.dtsi does not describe. m4.62 enabled
- * DISPEXT1_SYS without it and the first DCPEXT1 register access (its DART) reset
- * the SoC. DISPEXT0_SYS's parent FAB2_SOC is on anyway through ATC0..2_COMMON.
+ * DISPEXT1_SYS sits on FAB7_SOC (ADT pmgr id2 133, parent AFI as described
+ * in t6040-pmgr.dtsi, off at boot). m4.62 enabled DISPEXT1_SYS without it
+ * and the first DCPEXT1 register access (its DART) reset the SoC.
  */
-&pmgr_aux {
-	ps_fab7_soc: power-controller@488 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x488 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "fab7_soc";
-		power-domains = <&ps_fab6_soc>;
-		status = "disabled";
-	};
-};
-
 &ps_dispext1_sys {
 	power-domains = <&ps_fab7_soc>, <&pmp_dispext1>;
-	status = "disabled";
-};
-
-&ps_dispext1_fe {
-	status = "disabled";
 };
 
 &ps_dispext1_cpu {
 	/* NEVER enable: ADT no_ps, as DISPEXT0_CPU (its register read resets the SoC). */
 	/delete-property/ apple,always-on;
-	status = "disabled";
-};
-
-/* The per-ATC crossbars of the Type-C ports: the ATC USB domain, as atcphy3's. */
-&atcphy0_xbar {
-	power-domains = <&ps_atc0_usb>;
-	status = "disabled";
-};
-
-&atcphy1_xbar {
-	power-domains = <&ps_atc1_usb>;
-	status = "disabled";
-};
-
-&atcphy2_xbar {
-	power-domains = <&ps_atc2_usb>;
-	status = "disabled";
 };
 
 /* tipd switches the PHY into DP alt mode through the connector graph. */
@@ -152,7 +117,26 @@
 	};
 };
 
+/*
+ * As DISPEXT0: dcpext1, its DARTs and its mailbox are in the DISPEXT1 block,
+ * so they hold DISPEXT1_FE (and with it the PMP request) while they are bound.
+ * Without it DISPEXT1 is only powered when iBoot left it on for a display
+ * plugged in at boot, and genpd turns it off as unused under a running dcpext1.
+ */
+&dcpext1_dart {
+	power-domains = <&ps_dispext1_fe>;
+};
+
+&dispext1_dart {
+	power-domains = <&ps_dispext1_fe>;
+};
+
+&dcpext1_mbox {
+	power-domains = <&ps_dispext1_fe>;
+};
+
 &dcpext1 {
+	power-domains = <&ps_dispext1_fe>;
 	apple,connector-type = "USB-C";
 	/* as dcpext0: without it apple-dcp's probe fails with -EINVAL (m4.63) */
 	apple,iomfb-surfaces = <1 1 0 0>;

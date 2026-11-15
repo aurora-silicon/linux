@@ -94,6 +94,8 @@ struct usb_hub {
  * @reconnect_ss: SuperSpeed hub requesting that USB2 connection restart
  * @ss_reconnected: the current USB2 attachment already had its late-SS handover
  * @ss_reconnect_pending: consume the connection event from our own power cycle
+ * @ss_handover_generation: explicit SS lane handovers, under usb_port_peer_mutex
+ * @ss_reconnect_generation: handover serviced by the last USB2 reconnect
  * @connector: USB Type-C connector
  * @req: default pm qos request for hubs without port power control
  * @connect_type: port's connect type
@@ -140,7 +142,23 @@ struct usb_port {
 	bool held_off;
 	bool ss_reconnected;
 	bool ss_reconnect_pending;
+	u32 ss_handover_generation;
+	u32 ss_reconnect_generation;
 };
+
+/* usb_port_peer_mutex protects the peer and both handover counters. */
+static inline bool usb_port_ss_reconnect_done(const struct usb_port *port)
+{
+	return port->ss_reconnected && port->peer &&
+	       port->ss_reconnect_generation == port->peer->ss_handover_generation;
+}
+
+static inline bool usb_port_may_queue_ss_reconnect(const struct usb_port *port,
+						   const struct usb_device *ss)
+{
+	return port->child && !usb_port_ss_reconnect_done(port) &&
+	       (port->reconnect_hs != port->child || port->reconnect_ss != ss);
+}
 
 /* Caller holds the hub lock and usb_port_peer_mutex. */
 static inline void usb_port_ss_reconnect_event(struct usb_port *port, u16 status, u16 change)
@@ -160,7 +178,7 @@ static inline bool usb_port_needs_ss_reconnect(const struct usb_port *port,
 					       const struct usb_device *hs,
 					       const struct usb_device *ss)
 {
-	return hs && ss && !port->ss_reconnected && !port->is_superspeed &&
+	return hs && ss && !usb_port_ss_reconnect_done(port) && !port->is_superspeed &&
 	       port->child == hs && port->peer &&
 	       port->peer->is_superspeed && port->connector_node &&
 	       port->peer->connector_node == port->connector_node &&

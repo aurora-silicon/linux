@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Disabled coprocessor interfaces; firmware handoff remains a loader job. */
+
+&soc {
+	sio_mbox: mailbox@2a1c08000 {
+		compatible = "apple,t8122-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x2 0xa1c08000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 798 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 799 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 800 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 801 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_sio_cpu>;
+		status = "disabled";
+	};
+
+	sio: dma-controller@2a1c00000 {
+		compatible = "apple,t8122-sio", "apple,sio";
+		reg = <0x2 0xa1c00000 0 0x6c000>,
+		      <0x2 0xa1850000 0 0x4000>;
+		mboxes = <&sio_mbox>;
+		#dma-cells = <1>;
+		dma-channels = <128>;
+		iommus = <&sio_dart 0>;
+		power-domains = <&ps_sio_cpu>;
+		status = "disabled";
+	};
+
+};

@@ -97,6 +97,12 @@
 #define CISP_CMD_APPLE_CH_MOTION_HISTORY_STOP		     0xc103
 #define CISP_CMD_APPLE_CH_TEMPORAL_FILTER_ENABLE	     0xc113
 #define CISP_CMD_APPLE_CH_TEMPORAL_FILTER_DISABLE	     0xc114
+#define CISP_CMD_APPLE_CH_TEMPORAL_FILTER_BAND0_MODULATION   0xc11c
+#define CISP_CMD_APPLE_CH_TEMPORAL_FILTER_BAND0_THRESHOLD    0xc11d
+#define CISP_CMD_APPLE_CH_TEMPORAL_FILTER_HIGH_STRENGTH	     0xc120
+
+/* Opcodes of the DEBUG channel, which has its own numbering */
+#define CISP_DEBUG_CMD_STOP_KEY_GET			     0x001d
 
 #define CISP_POOL_TYPE_META				     0x0
 #define CISP_POOL_TYPE_RENDERED				     0x1
@@ -155,6 +161,19 @@ struct cmd_print_enable {
 	u32 enable;
 } __packed;
 static_assert(sizeof(struct cmd_print_enable) == 0xc);
+
+/*
+ * CISP_DEBUG_CMD_STOP_KEY_GET: the firmware answers with a word of its
+ * memory and the value it writes there once it has stopped.
+ */
+struct cmd_stop_key {
+	u64 opcode;
+	u32 enable;
+	u32 pad_c;
+	u64 addr;
+	u64 key;
+} __packed;
+static_assert(sizeof(struct cmd_stop_key) == 0x20);
 
 struct cmd_trace_enable {
 	u64 opcode;
@@ -260,10 +279,12 @@ int isp_cmd_send(struct apple_isp *isp, void *args, u32 insize, u32 outsize,
 		 int timeout);
 int isp_cmd_start(struct apple_isp *isp, u32 mode);
 int isp_cmd_stop(struct apple_isp *isp, u32 mode);
+int isp_cmd_stop_cold(struct apple_isp *isp, u32 mode);
 int isp_cmd_power_down(struct apple_isp *isp);
 int isp_cmd_suspend(struct apple_isp *isp);
 int isp_cmd_print_enable(struct apple_isp *isp, u32 enable);
 int isp_cmd_trace_enable(struct apple_isp *isp, u32 enable);
+int isp_cmd_stop_key_get(struct apple_isp *isp, struct cmd_stop_key *args);
 int isp_cmd_config_get(struct apple_isp *isp, struct cmd_config_get *args);
 int isp_cmd_set_isp_pmu_base(struct apple_isp *isp, u64 pmu_base);
 int isp_cmd_set_dsid_clr_req_base(struct apple_isp *isp, u64 dsid_clr_base,
@@ -643,6 +664,32 @@ struct cmd_apple_ch_temporal_filter_start {
 } __packed;
 static_assert(sizeof(struct cmd_apple_ch_temporal_filter_start) == 0x14);
 
+/* The H17 firmware's start record carries one more word, sent as zero. */
+struct cmd_apple_ch_temporal_filter_start_h17 {
+	u64 opcode;
+	u32 chan;
+	u32 unk_c;
+	u32 unk_10;
+	u32 unk_14;
+} __packed;
+static_assert(sizeof(struct cmd_apple_ch_temporal_filter_start_h17) == 0x18);
+
+/* High-strength filtering (0xc120) and band 0 modulation (0xc11c) */
+struct cmd_apple_ch_temporal_filter_enable_set {
+	u64 opcode;
+	u32 chan;
+	u32 enable;
+} __packed;
+static_assert(sizeof(struct cmd_apple_ch_temporal_filter_enable_set) == 0x10);
+
+/* Band 0 strength modulation thresholds, in 1/256 steps */
+struct cmd_apple_ch_temporal_filter_band0_threshold {
+	u64 opcode;
+	u32 chan;
+	u32 threshold[2];
+} __packed;
+static_assert(sizeof(struct cmd_apple_ch_temporal_filter_band0_threshold) == 0x14);
+
 struct cmd_apple_ch_temporal_filter_stop {
 	u64 opcode;
 	u32 chan;
@@ -679,6 +726,13 @@ int isp_cmd_apple_ch_motion_history_start(struct apple_isp *isp, u32 chan);
 int isp_cmd_apple_ch_motion_history_stop(struct apple_isp *isp, u32 chan);
 int isp_cmd_apple_ch_temporal_filter_enable(struct apple_isp *isp, u32 chan);
 int isp_cmd_apple_ch_temporal_filter_disable(struct apple_isp *isp, u32 chan);
+int isp_cmd_apple_ch_tnr_start_h17(struct apple_isp *isp, u32 chan);
+int isp_cmd_apple_ch_tnr_high_strength_set(struct apple_isp *isp, u32 chan,
+					   u32 enable);
+int isp_cmd_apple_ch_tnr_band0_mod_set(struct apple_isp *isp, u32 chan,
+				       u32 enable);
+int isp_cmd_apple_ch_tnr_band0_threshold_set(struct apple_isp *isp, u32 chan,
+					     u32 first, u32 second);
 
 struct cmd_ch_ae_stability_set {
 	u64 opcode;

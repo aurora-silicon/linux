@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/misc/apple,avellino.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple Avellino control interface
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  Addressed Avellino control interfaces on an I2C bus. Describing their
+  bus addresses does not specify a register protocol or transfer firmware
+  ownership to the host.
+
+properties:
+  compatible:
+    items:
+      - const: apple,t8112-avellino
+      - const: apple,avellino
+
+  reg:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false

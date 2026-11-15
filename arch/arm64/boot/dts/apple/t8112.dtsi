@@ -75,6 +75,7 @@
 			next-level-cache = <&l2_cache_0>;
 			i-cache-size = <0x20000>;
 			d-cache-size = <0x10000>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_e1: cpu@1 {
@@ -89,6 +90,7 @@
 			next-level-cache = <&l2_cache_0>;
 			i-cache-size = <0x20000>;
 			d-cache-size = <0x10000>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_e2: cpu@2 {
@@ -103,6 +105,7 @@
 			next-level-cache = <&l2_cache_0>;
 			i-cache-size = <0x20000>;
 			d-cache-size = <0x10000>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_e3: cpu@3 {
@@ -117,6 +120,7 @@
 			next-level-cache = <&l2_cache_0>;
 			i-cache-size = <0x20000>;
 			d-cache-size = <0x10000>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p0: cpu@10100 {
@@ -131,6 +135,7 @@
 			next-level-cache = <&l2_cache_1>;
 			i-cache-size = <0x30000>;
 			d-cache-size = <0x20000>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p1: cpu@10101 {
@@ -145,6 +150,7 @@
 			next-level-cache = <&l2_cache_1>;
 			i-cache-size = <0x30000>;
 			d-cache-size = <0x20000>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p2: cpu@10102 {
@@ -159,6 +165,7 @@
 			next-level-cache = <&l2_cache_1>;
 			i-cache-size = <0x30000>;
 			d-cache-size = <0x20000>;
+			#cooling-cells = <2>;
 		};
 
 		cpu_p3: cpu@10103 {
@@ -173,6 +180,7 @@
 			next-level-cache = <&l2_cache_1>;
 			i-cache-size = <0x30000>;
 			d-cache-size = <0x20000>;
+			#cooling-cells = <2>;
 		};
 
 		l2_cache_0: l2-cache-0 {
@@ -505,6 +513,47 @@
 		/* Required to get >32-bit DMA via DARTs */
 		dma-ranges = <0 0 0 0 0xffffffff 0xffffc000>;
 
+		ave_dart0: iommu@267030000 {
+			compatible = "apple,t8112-dart", "apple,t8110-dart";
+			reg = <0x2 0x67030000 0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 689 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_venc_sys>;
+			#iommu-cells = <1>;
+			status = "okay";
+		};
+
+		ave_dart1: iommu@267040000 {
+			compatible = "apple,t8112-dart", "apple,t8110-dart";
+			reg = <0x2 0x67040000 0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 689 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_venc_sys>;
+			#iommu-cells = <1>;
+			status = "okay";
+		};
+
+		ave: video-codec@267100000 {
+			compatible = "apple,t8112-ave";
+			reg = <0x2 0x67100000 0 0x45c000>,
+			      <0x2 0x67050000 0 0x8000>,
+			      <0x2 0x67800000 0 0x800000>,
+			      <0x2 0x3b708000 0 0x4000>,
+			      <0x2 0x66000000 0 0x1000000>;
+			reg-names = "codec", "mailbox", "coproc", "pmgr", "pio";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 692 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 686 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 685 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 688 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 687 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_venc_dma>, <&ps_venc_pipe4>,
+					<&ps_venc_pipe5>, <&ps_venc_me0>, <&ps_venc_me1>;
+			power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1";
+			iommus = <&ave_dart0 0>, <&ave_dart1 0>;
+			status = "okay";
+		};
+
 		gpu: gpu@206400000 {
 			compatible = "apple,agx-t8112", "apple,agx-g14g";
 			reg = <0x2 0x6400000 0 0x40000>,
@@ -692,7 +741,9 @@
 				<&ps_isp_set4>, <&ps_isp_set5>, <&ps_isp_set6>,
 				<&ps_isp_set7>, <&ps_isp_set8>, <&ps_isp_set9>,
 				<&ps_isp_set10>, <&ps_isp_set11>,
-				<&ps_isp_set12>;
+				<&ps_isp_set12>, <&ps_ispsens0>,
+				<&ps_ispsens1>, <&ps_ispsens2>,
+				<&ps_ispsens3>;
 
 			apple,dart-vm-size = <0x0 0xa0000000>;
 			status = "disabled";
@@ -922,6 +973,18 @@
 			status = "disabled"; /* only used in J493 */
 		};
 
+		spi4: spi@235110000 {
+			compatible = "apple,t8112-spi", "apple,t8103-spi";
+			reg = <0x2 0x35110000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 752 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>;
+			power-domains = <&ps_spi4>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
 		serial0: serial@235200000 {
 			compatible = "apple,s5l-uart";
 			reg = <0x2 0x35200000 0x0 0x1000>;
@@ -996,7 +1059,6 @@
 			dmas = <&sio 0x64>;
 			dma-names = "tx";
 			power-domains = <&ps_dpa0>;
-			reset-domains = <&ps_dpa0>;
 			status = "disabled";
 
 			ports {
@@ -1017,7 +1079,6 @@
 			dmas = <&sio 0x66>;
 			dma-names = "tx";
 			power-domains = <&ps_dpa1>;
-			reset-domains = <&ps_dpa1>;
 			status = "disabled";
 
 			ports {
@@ -1393,10 +1454,23 @@
 			reg = <0x2 0x3d714000 0x0 0x100>;
 			#address-cells = <2>;
 			#size-cells = <0>;
+			#interrupt-cells = <2>;
+			interrupt-controller;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 384 IRQ_TYPE_LEVEL_HIGH>;
 
 			pmic1: pmic@e {
 				compatible = "apple,stowe-pmic", "apple,spmi-nvmem";
 				reg = <0xe SPMI_USID>;
+
+				pmu_rtc: rtc {
+					compatible = "apple,t8112-pmu-rtc";
+					interrupt-parent = <&nub_spmi>;
+					interrupts = <2 IRQ_TYPE_EDGE_RISING>;
+					nvmem-cells = <&rtc_offset>;
+					nvmem-cell-names = "rtc_offset";
+					wakeup-source;
+				};
 
 				nvmem-layout {
 					compatible = "fixed-layout";
@@ -1445,6 +1519,14 @@
 			};
 		};
 
+		nub_spmi1: spmi@23d794000 {
+			compatible = "apple,t8112-spmi", "apple,t8103-spmi";
+			reg = <0x2 0x3d794000 0x0 0x100>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
 		smc: smc@23e400000 {
 			compatible = "apple,t8112-smc", "apple,smc";
 			reg = <0x2 0x3e400000 0x0 0x4000>,
@@ -1468,9 +1550,47 @@
 
 			smc_hwmon: hwmon {
 				compatible = "apple,smc-hwmon";
+				#thermal-sensor-cells = <1>;
+				/*
+				 * The GPU keys read a fixed low value while the GPU
+				 * is idle, then the CPU die keys.
+				 */
+				apple,soc-die-keys = "Tg0f", "Tg0n", "Tg0r", "Te05",
+						     "Tp01", "Tp05", "Tp09", "Tp0D";
+
+				/* SoC die temperatures, first: thermal zones index them. */
+				temperature-TCMz {
+					apple,key-id = "TCMz";
+					label = "SoC Die Temperature";
+				};
+
+				temperature-Te05 {
+					apple,key-id = "Te05";
+					label = "E-cluster Temperature";
+				};
+
+				temperature-Tp01 {
+					apple,key-id = "Tp01";
+					label = "P-core 0 Temperature";
+				};
+
+				temperature-Tp05 {
+					apple,key-id = "Tp05";
+					label = "P-core 1 Temperature";
+				};
+
+				temperature-Tp09 {
+					apple,key-id = "Tp09";
+					label = "P-core 2 Temperature";
+				};
+
+				temperature-Tp0D {
+					apple,key-id = "Tp0D";
+					label = "P-core 3 Temperature";
+				};
 			};
 
-			rtc {
+			smc_rtc: rtc {
 				compatible = "apple,smc-rtc";
 				nvmem-cells = <&rtc_offset>;
 				nvmem-cell-names = "rtc_offset";
@@ -1560,6 +1680,22 @@
 			#iommu-cells = <1>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 338 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
+		aop_spmi0: spmi@24a894000 {
+			compatible = "apple,t8112-spmi", "apple,t8103-spmi";
+			reg = <0x2 0x4a894000 0x0 0x100>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		aop_spmi1: spmi@24a8d4000 {
+			compatible = "apple,t8112-spmi", "apple,t8103-spmi";
+			reg = <0x2 0x4a8d4000 0x0 0x100>;
+			#address-cells = <2>;
+			#size-cells = <0>;
 			status = "disabled";
 		};
 
@@ -1731,6 +1867,7 @@
 				<0x2 0x69100000 0x0 0x10000>;
 			reg-names = "code", "sram", "mbox", "ctrl";
 			iommus = <&avd_dart 0>;
+			dma-coherent;
 		};
 
 		avd_dart: iommu@269010000 {
@@ -1749,7 +1886,6 @@
 			interrupts = <AIC_IRQ 520 IRQ_TYPE_LEVEL_HIGH>;
 			interrupt-names = "recv-not-empty";
 			#mbox-cells = <0>;
-			status = "disabled";
 		};
 
 		ane_dart0: iommu@26b800000 {
@@ -1759,7 +1895,6 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 521 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_ane_sys>;
-			status = "disabled";
 		};
 
 		ane_dart1: iommu@26b810000 {
@@ -1769,7 +1904,6 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 521 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_ane_sys>;
-			status = "disabled";
 		};
 
 		ane_dart2: iommu@26b820000 {
@@ -1779,7 +1913,6 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 521 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_ane_sys>;
-			status = "disabled";
 		};
 
 		ane: ane@26a000000 {
@@ -1797,7 +1930,6 @@
 				<&ps_ane_base>, <&ps_ane_set1>, <&ps_ane_set2>,
 				<&ps_ane_set3>, <&ps_ane_set4>;
 			mboxes = <&ane_mbox>;
-			status = "disabled";
 		};
 
 		dispext0_dart: iommu@271304000 {
@@ -2023,6 +2155,7 @@
 
 			apciec0: pcie@3b0000000 {
 				compatible = "apple,t8112-pciec", "apple,t8103-pciec";
+				apple,pciec-kernel-init;
 				device_type = "pci";
 
 				reg = <0x3 0xb0000000 0x0 0x10000000>,
@@ -2243,6 +2376,7 @@
 
 			apciec1: pcie@530000000 {
 				compatible = "apple,t8112-pciec", "apple,t8103-pciec";
+				apple,pciec-kernel-init;
 				device_type = "pci";
 
 				reg = <0x5 0x30000000 0x0 0x10000000>,
@@ -2428,7 +2562,7 @@
 			ranges = <0x43000000 0x6 0xa0000000 0x6 0xa0000000 0x0 0x20000000>,
 				 <0x02000000 0x0 0xc0000000 0x6 0xc0000000 0x0 0x40000000>;
 
-			power-domains = <&ps_apcie_gp>;
+			power-domains = <&ps_apcie_gp>, <&ps_apcie_st>;
 			pinctrl-0 = <&pcie_pins>;
 			pinctrl-names = "default";
 
@@ -2522,3 +2656,70 @@
 
 #include "t8112-pmgr.dtsi"
 #include "hwmon-common.dtsi"
+
+/*
+ * DRAM interface class: width and maximum rate are inferred from topology
+ * and the published bandwidth class. Lower-state rates remain unqualified.
+ * State IDs below describe firmware DCS states, not PMGR codes.
+ */
+/ {
+	dram_opp: opp-table-dram {
+		compatible = "operating-points-v2-apple-dram";
+		opp-shared;
+
+		opp-0 {
+			opp-level = <0>;
+		};
+
+		opp-1 {
+			opp-level = <1>;
+		};
+
+		opp-2 {
+			opp-level = <2>;
+		};
+
+		opp-3 {
+			opp-level = <3>;
+		};
+
+		opp-4 {
+			opp-level = <4>;
+			opp-hz = /bits/ 64 <3200000000>;
+			apple,data-rate = /bits/ 64 <6400000000>;
+		};
+	};
+};
+
+&pmp_report {
+	operating-points-v2 = <&dram_opp>;
+	apple,dram-type = "lpddr5";
+	apple,data-bus-width = <128>;
+	apple,dcs-state-count = <5>;
+	apple,peak-bandwidth-bytes-per-second = /bits/ 64 <102400000000>;
+	apple,bandwidth-class-bytes-per-second = /bits/ 64 <100000000000>;
+};
+
+#include "t8112-peripherals.dtsi"
+
+/* Event-log interrupt group (apple_soc_edac). */
+&m2_event_log_handler {
+	status = "okay";
+};
+
+/* Both JPEG encoders are SoC blocks with no board wiring. */
+&m2_dart_jpeg0 {
+	status = "okay";
+};
+
+&m2_jpeg0 {
+	status = "okay";
+};
+
+&m2_dart_jpeg1 {
+	status = "okay";
+};
+
+&m2_jpeg1 {
+	status = "okay";
+};

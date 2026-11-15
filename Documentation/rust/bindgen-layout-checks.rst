@@ -19,6 +19,13 @@ pointer as the current mm and Asahi's RSS charge faulted in
 counter layout; the pointer supplied to them was wrong. Enabling SCHEDSTATS
 only masks the generator defect and is not a requirement of the driver.
 
+``rust/bindgen_parameters`` declares ``sched_statistics`` opaque. bindgen takes
+an opaque type's size and alignment from Clang's layout, so stock bindgen also
+emits ``#[repr(align(64))]`` for it and ``task_struct`` agrees with C. Rust code
+does not access its fields. Other aligned empty records still need the
+corrected generator below, and the layout assertions still check every
+emitted type.
+
 Known generator limitations
 ---------------------------
 
@@ -57,6 +64,14 @@ The top-level Makefile automatically selects
 builds. Packagers prepare this entry point in their build roots. Make does not
 fetch tools or install anything system-wide. If the entry point is absent,
 Kbuild uses ``bindgen`` from PATH and the same mandatory assertions apply.
+
+``make LLVM=1 rustavailable`` probes the selected generator's empty-record
+alignment support, including locally patched versions. An affected generator
+prints the preparation command above. This is a warning so it cannot silently
+disable Rust drivers during configuration; the layout assertions still reject
+incorrect bindings when compiling the kernel. Prepare the tool before running
+``defconfig`` and merging ``asahi.config``, then keep the resolved configuration
+unchanged for the kernel build.
 
 The generated bindings are consumed by the Rust kernel crate and by several
 drivers. After changing the bindings generator, rebuild the kernel Image and

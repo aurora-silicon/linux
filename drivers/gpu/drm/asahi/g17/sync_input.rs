@@ -15,6 +15,24 @@ unsafe extern "C" {
     fn asahi_g17_collect_fences(head: *mut bindings::dma_fence,
         out: *mut Leaf, capacity: usize) -> i32;
     fn asahi_g17_put_fence(fence: *mut bindings::dma_fence);
+    fn asahi_g17_merge_fences(fences: *const *mut bindings::dma_fence, count: usize)
+        -> *mut bindings::dma_fence;
+}
+
+/// One fence that signals once all of `fences` have (see `job::MERGED_DEPENDENCIES`).
+pub(super) fn merge(fences: &[Fence]) -> Result<Fence> {
+    let mut raw = KVec::with_capacity(fences.len(), GFP_KERNEL)?;
+    for fence in fences {
+        raw.push(fence.raw(), GFP_KERNEL)?;
+    }
+    // SAFETY: Every pointer is a live fence borrowed from `fences` for this call;
+    // the helper only reads them and returns a new reference of its own.
+    let merged = unsafe { asahi_g17_merge_fences(raw.as_ptr(), raw.len()) };
+    if merged.is_null() {
+        return Err(ENOMEM);
+    }
+    // SAFETY: The helper transferred ownership of that reference.
+    Ok(unsafe { Fence::from_raw(merged) })
 }
 
 impl Drop for Leaf {

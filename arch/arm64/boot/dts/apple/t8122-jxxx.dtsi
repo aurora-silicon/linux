@@ -40,6 +40,8 @@
 			reg = <0 0 0 0>; /* To be filled by loader */
 			power-domains = <&ps_disp_cpu>, <&ps_dptx_ext_phy>;
 			/* Format properties will be added by loader */
+			panel = <&panel>;
+			post-init-providers = <&panel>;
 			status = "disabled";
 		};
 	};
@@ -49,7 +51,7 @@
 		#size-cells = <2>;
 		ranges;
 
-		/* Filled from the live ADT by opt-in m1n1 diagnostics. */
+		/* GPU memory, filled and enabled by the boot loader. */
 		uat_handoff: uat-handoff {
 			reg = <0 0 0 0>;
 			status = "disabled";
@@ -69,7 +71,6 @@
 			reg = <0 0 0 0>;
 			status = "disabled";
 		};
-		/* To be filled by loader */
 	};
 
 	memory@800000000 {
@@ -97,6 +98,7 @@
 		/* To be filled by the loader */
 		local-mac-address = [00 00 00 00 00 00];
 		apple,antenna-sku = "XX";
+		brcm,ccode-map-trivial;
 	};
 
 	bluetooth0: bluetooth@0,1 {
@@ -254,3 +256,12 @@
 #include "hwmon-common.dtsi"
 
 #include "spi1-nvram.dtsi"
+
+/* Panel control remains firmware-owned until the host transport is supported. */
+&spi4 {
+	tcon: panel-controller@0 {
+		compatible = "parade,dp855";
+		reg = <0>;
+		status = "disabled";
+	};
+};

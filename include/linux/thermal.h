@@ -195,6 +195,12 @@ struct thermal_zone_params {
 
 	/* Integral time relative to k_pu, in ms; 0 keeps the per-poll estimate. */
 	u32 integral_time_constant_ms;
+
+	/*
+	 * Consecutive zone updates at or above a critical trip before it
+	 * acts; 0 or 1 act on the first. Only meaningful for a polled zone.
+	 */
+	u32 critical_samples;
 };
 
 /* Function declarations */

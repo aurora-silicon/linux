@@ -3206,6 +3206,40 @@ int tb_switch_set_link_width(struct tb_switch *sw, enum tb_link_width width)
 	return ret;
 }
 
+/*
+ * Some hosts (Apple silicon) run their Gen4 links with link recovery
+ * enabled at both ends. Without it, the router firmware has no way back
+ * from a Gen4 link error but to disconnect the link.
+ */
+static void tb_switch_gen4_link_recovery(struct tb_switch *sw,
+					 struct tb_port *up, struct tb_port *down)
+{
+	struct tb_port *ports[] = { down, up };
+	unsigned int i;
+	u32 val;
+
+	if (!(sw->tb->nhi->quirks & QUIRK_GEN4_LINK_RECOVERY) ||
+	    tb_port_get_link_generation(up) < 4)
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(ports); i++) {
+		struct tb_port *port = ports[i];
+
+		if (!port->cap_usb4 ||
+		    tb_port_read(port, &val, TB_CFG_PORT,
+				 port->cap_usb4 + PORT_CS_19, 1))
+			continue;
+		if (val & PORT_CS_19_GEN4_LINK_RECOVERY)
+			continue;
+		val |= PORT_CS_19_GEN4_LINK_RECOVERY;
+		if (tb_port_write(port, &val, TB_CFG_PORT,
+				  port->cap_usb4 + PORT_CS_19, 1))
+			tb_port_warn(port, "cannot enable Gen4 link recovery\n");
+		else
+			tb_port_dbg(port, "Gen4 link recovery enabled\n");
+	}
+}
+
 /**
  * tb_switch_configure_link() - Set link configured
  * @sw: Switch whose link is configured
@@ -3236,8 +3270,15 @@ int tb_switch_configure_link(struct tb_switch *sw)
 
 	down = up->remote;
 	if (tb_switch_is_usb4(down->sw))
-		return usb4_port_configure(down);
-	return tb_lc_configure_port(down);
+		ret = usb4_port_configure(down);
+	else
+		ret = tb_lc_configure_port(down);
+	if (ret)
+		return ret;
+
+	if (tb_switch_is_usb4(up->sw) && tb_switch_is_usb4(down->sw))
+		tb_switch_gen4_link_recovery(sw, up, down);
+	return 0;
 }
 
 /**
@@ -3708,6 +3749,38 @@ void tb_switch_suspend(struct tb_switch *sw, bool runtime)
 		usb4_switch_set_sleep(sw);
 	else
 		tb_lc_set_sleep(sw);
+}
+
+/* The CIO host uses its own enter-sleep command after its children sleep. */
+int tb_switch_suspend_cio(struct tb_switch *sw)
+{
+	struct tb_port *port;
+	unsigned int wake = 0;
+	int ret;
+
+	/* It returns the CL states it disabled. */
+	ret = tb_switch_clx_disable(sw);
+	if (ret < 0)
+		return ret;
+	ret = tb_plug_events_active(sw, false);
+	if (ret)
+		return ret;
+	tb_switch_for_each_port(sw, port) {
+		if (port->xdomain)
+			return -EOPNOTSUPP;
+		if (!tb_port_has_remote(port))
+			continue;
+		ret = tb_switch_suspend_cio(port->remote->sw);
+		if (ret)
+			return ret;
+	}
+	if (device_may_wakeup(&sw->dev))
+		wake = TB_WAKE_ON_CONNECT | TB_WAKE_ON_DISCONNECT |
+		       TB_WAKE_ON_USB4 | TB_WAKE_ON_USB3 | TB_WAKE_ON_PCIE;
+	ret = tb_switch_set_wake(sw, wake, false);
+	if (ret || !tb_route(sw))
+		return ret;
+	return tb_switch_is_usb4(sw) ? usb4_switch_set_sleep(sw) : tb_lc_set_sleep(sw);
 }
 
 /**

@@ -184,6 +184,16 @@ config THERMAL_GOV_POWER_ALLOCATOR_KUNIT_TEST
 	  The tests use synthetic thermal zones and do not need hardware.
 	  Only useful for kernel developers; say N unless testing the governor.
 
+config THERMAL_CRITICAL_SAMPLES_KUNIT_TEST
+	bool "KUnit tests for critical trip confirmation" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Test that a zone with critical-samples acts on a critical trip only
+	  after that many consecutive updates at or above it, once, and again
+	  only after it has dropped below the trip. The tests need no hardware.
+	  Only useful for kernel developers; say N unless testing the core.
+
 config CPU_THERMAL
 	bool "Generic cpu cooling support"
 	depends on THERMAL_OF

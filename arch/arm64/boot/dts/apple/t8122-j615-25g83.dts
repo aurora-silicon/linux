@@ -1,31 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * Experimental J615 board with the exact 25G83 DCP and PMP profile.
- * Board-specific speakers, Wi-Fi, power limits, storage and trackpad remain
- * in t8122-j615.dts. m1n1 hands the J615 display over only with
- * chosen.asahi,j615-25g83-experimental=1, and Linux checks it again.
+ * Experimental J615 with the J613 25G83 DCP and PMP profile. m1n1 hands the
+ * display over only with chosen.asahi,j615-25g83-experimental=1.
  */
 #include "t8122-j615.dts"
 #include "t8122-j613-dcp-25g83.dtsi"
-#include "t8122-j613-25g83-qspi.dtsi"
+#include "t8122-j613-qspi.dtsi"
 
-/*
- * As on the J613 25G83 tree: keep U-Boot from starting the MTP. U-Boot's
- * helper binds only the generic "apple,rtk-helper-asc4" compatible, boots the
- * MTP for its keyboard and quiesces it at ExitBootServices; the 25G83 MTP
- * firmware the J613 runs then data-aborts when Linux wakes it. Linux binds
- * the SoC-specific compatible instead.
- */
+/* As on the J613 25G83. */
 &mtp {
 	compatible = "apple,t8122-mtp", "apple,t8122-rtk-helper-asc4", "apple,mtp";
 };
 
-/* As on the J613: the 25G83 MTP_SYS uses GPIO-mediated AFE power sequencing
- * (the J615 ADT's afe-reset function is the J613's, gP08). */
-&mtp_hid {
-	multi-touch {
-		apple,power-method = <2>;
-	};
+/* GPIO-mediated AFE power sequencing, as on the J613 (J615 ADT gP08). */
+&mtp_mt {
+	apple,power-method = <2>;
 };
 
 /* Keep the J615 NVRAM partition read-only. */

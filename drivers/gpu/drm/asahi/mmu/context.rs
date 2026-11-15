@@ -14,6 +14,7 @@ use kernel::drm::gem::BaseObject;
 struct Binding {
     gem: ARef<gem::Object>,
     offset: usize,
+    bind_sequence: u64,
 }
 struct Bindings {
     generation: u64,
@@ -115,6 +116,7 @@ impl Vm {
         &self,
         gem: &ARef<gem::Object>,
         update: &PreparedBinding,
+        bind_sequence: u64,
     ) -> RetiredBindings {
         let mut retired = RetiredBindings::new();
         if update.touched == 0 {
@@ -136,6 +138,7 @@ impl Vm {
                 *slot = Some(Binding {
                     gem: gem.clone(),
                     offset,
+                    bind_sequence,
                 });
             }
         }
@@ -173,6 +176,10 @@ impl Vm {
     }
 
     pub(crate) fn untrack_context_object(&self, gem: &gem::Object) {
+        self.untrack_context_object_before(gem, u64::MAX);
+    }
+
+    pub(super) fn untrack_context_object_before(&self, gem: &gem::Object, sequence: u64) {
         let Some(context) = self.context_bindings.as_ref() else {
             return;
         };
@@ -181,7 +188,8 @@ impl Vm {
         for slot in &mut bindings.slots {
             if slot
                 .as_ref()
-                .is_some_and(|binding| core::ptr::eq(&*binding.gem, gem))
+                .is_some_and(|binding| core::ptr::eq(&*binding.gem, gem)
+                    && binding.bind_sequence <= sequence)
             {
                 *slot = None;
                 touched = true;
@@ -193,9 +201,51 @@ impl Vm {
     }
 
     pub(crate) fn translate_iova(&self, address: u64) -> Result<u64> {
-        lock_vm(&self.gpuvm, None, false)?
-            .page_table
-            .translate_iova(address)
+        // SAFETY: See `lock_vm()`. A page-table read needs only the VM's own reservation, not
+        // every external object's: G18 translates each page of a job's mappings on every
+        // submission, and locking all external objects made each translation cost O(external
+        // objects).
+        let mut vm_exec = unsafe { self.gpuvm.exec_lock_vm(None, false)? };
+        vm_exec.unique_gpuvm.data().page_table.translate_iova(address)
+    }
+
+    /// [`Self::translate_iova`] of `address + k * UAT_PGSZ` for each `k` below
+    /// `bytes.div_ceil(UAT_PGSZ)`, under one lock and one page-table walk.
+    pub(crate) fn translate_pages(&self, address: u64, bytes: usize) -> Result<KVec<u64>> {
+        let offset = address & UAT_PGMSK as u64;
+        let start = address - offset;
+        let pages = bytes.div_ceil(UAT_PGSZ);
+        let end = start.checked_add((pages as u64) << UAT_PGBIT).ok_or(EINVAL)?;
+        let mut physical = KVec::from_elem(0u64, pages, GFP_KERNEL)?;
+        if pages == 0 {
+            return Ok(physical);
+        }
+        {
+            // SAFETY: See `lock_vm()`, and `translate_iova()` for why the VM's reservation
+            // suffices.
+            let mut vm_exec = unsafe { self.gpuvm.exec_lock_vm(None, false)? };
+            vm_exec
+                .unique_gpuvm
+                .data()
+                .page_table
+                .translate_pages(start..end, &mut physical)?;
+        }
+        for frame in physical.iter_mut() {
+            *frame |= offset;
+        }
+        Ok(physical)
+    }
+
+    /// [`Self::translate_iova`] for each of `addresses`, under one lock.
+    pub(crate) fn translate_each(&self, addresses: &[u64]) -> Result<KVec<u64>> {
+        let mut physical = KVec::with_capacity(addresses.len(), GFP_KERNEL)?;
+        // SAFETY: As in `translate_pages()`.
+        let mut vm_exec = unsafe { self.gpuvm.exec_lock_vm(None, false)? };
+        let page_table = &mut vm_exec.unique_gpuvm.data().page_table;
+        for &address in addresses {
+            physical.push(page_table.translate_iova(address)?, GFP_KERNEL)?;
+        }
+        Ok(physical)
     }
 
     /// Requires a job mapping guard before validating or installing these views.

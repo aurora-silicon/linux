@@ -89,13 +89,46 @@ int main(void) {
         # Platform functions are mocked; the bridge's actual decisions and cleanup execute.
         for name in ('device', 'export', 'mutex', 'of'):
             write(tmp, 'linux/'+name+'.h', '#include "mock.h"\n')
-        write(tmp, 'linux/errno.h', '#define EPROBE_DEFER 517\n#define ENODEV 19\n#define EINVAL 22\n#define EBUSY 16\n#define EIO 5\n#define ETIMEDOUT 110\n')
+        write(tmp, 'linux/errno.h', '#define EPROBE_DEFER 517\n#define ENODEV 19\n#define EINVAL 22\n#define EBUSY 16\n#define EIO 5\n#define ETIMEDOUT 110\n#define EAGAIN 11\n')
         write(tmp, 'linux/kconfig.h', '#define IS_REACHABLE(x) 1\n#define IS_ENABLED(x) 1\n')
+        # The PMP's system-sleep callbacks live in the bridge; this harness never suspends.
+        write(tmp, 'linux/pm.h', '#include "mock.h"\n'
+              'struct dev_pm_ops { int (*suspend_late)(struct device *); int (*resume_early)(struct device *); };\n'
+              '#define LATE_SYSTEM_SLEEP_PM_OPS(s, r) .suspend_late = (s), .resume_early = (r),\n')
+        write(tmp, 'linux/suspend.h', '#include <stdbool.h>\n'
+              'static inline bool pm_suspend_via_firmware(void) { return false; }\n'
+              'static inline bool pm_resume_via_firmware(void) { return false; }\n')
+        # The bridge's sleep-commit stop: MMIO, RTKit and the sleep driver, reached only in a suspend.
+        write(tmp, 'linux/io.h', '#include "mock.h"\n'
+              'static inline u32 readl_relaxed(const volatile void __iomem *a) { assert(!"no system sleep here"); return 0; }\n'
+              'static inline void iounmap(volatile void __iomem *a) { assert(!"no system sleep here"); }\n')
+        write(tmp, 'linux/of_address.h', '#include "mock.h"\n'
+              'static inline void __iomem *of_iomap(struct device_node *n, int i) { assert(!"no system sleep here"); return NULL; }\n')
+        write(tmp, 'linux/soc/apple/rtkit.h', '#include "mock.h"\n#include <linux/errno.h>\n'
+              'struct apple_rtkit;\n'
+              'static inline int apple_rtkit_sleep_idle_polled(struct apple_rtkit *r, void __iomem *c,\n'
+              '\t\t\t\t\t\tunsigned int *us) { assert(!"no system sleep here"); return -EIO; }\n'
+              'static inline void apple_rtkit_mailbox_recv_off(struct apple_rtkit *r) { assert(!"no system sleep here"); }\n')
+        write(tmp, 'linux/soc/apple/sleep.h', '#include "mock.h"\n#include <linux/errno.h>\n'
+              'static inline int apple_sleep_coproc_register(struct device *d, void __iomem *a, bool p,\n'
+              '\t\t\t\t\t      int (*f)(void *), void *x) { assert(!"no system sleep here"); return -EIO; }\n'
+              'static inline void apple_sleep_coproc_set_ready(struct device *d, bool r) { assert(!"no system sleep here"); }\n'
+              'static inline bool apple_sleep_coproc_stopped(struct device *d) { assert(!"no system sleep here"); return false; }\n'
+              'static inline bool apple_sleep_commit_stops_coprocs(void) { assert(!"no system sleep here"); return false; }\n')
+        write(tmp, 'linux/soc/apple/pmp-display.h', '#include <stdbool.h>\nbool apple_pmp_display_retained_board(void);\n')
         write(tmp, 'mock.h', '''#pragma once
 #include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <pthread.h>
+#define dev_err(...) ((void)0)
+#define dev_warn(...) ((void)0)
+#define dev_dbg(...) ((void)0)
+#define dev_err_probe(d, e, ...) (e)
+#define dev_info(...) ((void)0)
+#include <linux/errno.h>
+#define __iomem
+#include <string.h>
 #include <linux/types.h>
 struct device_node { int id; }; struct device { struct device_node *of_node; bool bound; int refs; };
 struct device_link { int unused; };
@@ -117,12 +150,24 @@ static bool device_is_bound(struct device*d){return d->bound;}
 static struct device *get_device(struct device*d){d->refs++;return d;}
 static void put_device(struct device*d){d->refs--;}
 static struct device_link *device_link_add(struct device*c,struct device*s,unsigned flags){static struct device_link l;assert(flags==1);return link_fail?NULL:&l;}
+/* This harness exercises the J613/25G83 bridge, not the T6030 GFX report. */
+static bool of_machine_is_compatible(const char *name){return !strcmp(name,"apple,t8132");}
+static bool of_device_is_compatible(const struct device_node*n,const char*name){return false;}
+static inline int of_property_match_string(const struct device_node*n,const char*p,const char*s){assert(!"no system sleep here");return -EINVAL;}
 ''')
         write(tmp, 'bridge.c', '''#include <stdio.h>
 #include "drivers/soc/apple/pmp-export.c"
 static int ready_result,send_result,calls;
 int apple_pmp_report_wait_supplier_ready(struct device*d,unsigned timeout){assert(d==pmp_device);assert(timeout==5000);return ready_result;}
 int apple_pmp_send_power_command(const void*data,u8 command,u16 id,u32 enabled){assert(data==pmp_data);calls++;return send_result;}
+int apple_pmp_report_check_t6030_gfx(struct device*d){assert(!"unexpected T6030 report on J613");return -EIO;}
+int apple_pmp_report_set_t6030_gfx(struct device*d,bool enabled){assert(!"unexpected T6030 report on J613");return -EIO;}
+bool apple_pmp_display_retained_board(void){return false;}
+void apple_pmp_report_sleep(struct device*d,bool at_commit){assert(!"no system sleep here");}
+void apple_pmp_report_wake(struct device*d,bool real){assert(!"no system sleep here");}
+int apple_pmp_sleep(const void*data){assert(!"no system sleep here");return -EIO;}
+int apple_pmp_sleep_prepare(const void*data,struct apple_pmp_commit_stop*stop){assert(!"no system sleep here");return -EIO;}
+int apple_pmp_wake(const void*data){assert(!"no system sleep here");return -EIO;}
 int main(void){
  struct device_node n={1},wrong={2}; struct device supplier={&n,true,0},consumer={NULL,false,0}; int data;
  assert(apple_pmp_set_device_power(0xf,8,1)==-ENODEV);

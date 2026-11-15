@@ -1,0 +1,78 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J873g N1 on APCIE port 0. Aura releases the SMC-controlled N1 reset,
+ * initializes the common PHY and applies the inactive DART's tunables.
+ * Linux owns port training and the three function-specific DMA streams.
+ * Resources follow the J873g ADT and the public J873 PCIe bring-up tree.
+ */
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	soc {
+		pinctrl_ap: pinctrl@31a000000 {
+			compatible = "apple,t8152-pinctrl", "apple,t8103-pinctrl";
+			reg = <0x3 0x1a000000 0x0 0x100000>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			gpio-ranges = <&pinctrl_ap 0 0 224>;
+			apple,npins = <224>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupts = <AIC_IRQ 433 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 434 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 435 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 436 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 437 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 438 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 439 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		pcie0_dart: iommu@388000000 {
+			compatible = "apple,t8152-dart", "apple,t8110-dart";
+			reg = <0x3 0x88000000 0x0 0xc000>;
+			#iommu-cells = <1>;
+			interrupts = <AIC_IRQ 1572 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		pcie: pcie@1cb0000000 {
+			compatible = "apple,t8152-pcie";
+			device_type = "pci";
+			reg = <0x1c 0xb0000000 0x0 0x1000000>,
+			      <0x3 0x8c000000 0x0 0x4000>,
+			      <0x3 0x88028000 0x0 0x4000>,
+			      <0x3 0x8f010000 0x0 0x4000>;
+			reg-names = "config", "rc", "port0", "phy0";
+			interrupts = <AIC_IRQ 1571 IRQ_TYPE_LEVEL_HIGH>;
+			msi-controller;
+			msi-parent = <&pcie>;
+			msi-ranges = <&aic AIC_IRQ 1879 IRQ_TYPE_EDGE_RISING 32>;
+			iommu-map = <0x100 &pcie0_dart 1 1>,
+				    <0x101 &pcie0_dart 2 1>,
+				    <0x102 &pcie0_dart 3 1>;
+			iommu-map-mask = <0xffff>;
+			bus-range = <0 1>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges = <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0x0 0x20000000>,
+				 <0x02000000 0x0 0x80000000 0xb 0x80000000 0x0 0x40000000>;
+			dma-coherent;
+
+			port00: pci@0,0 {
+				device_type = "pci";
+				reg = <0x0 0x0 0x0 0x0 0x0>;
+				reset-gpios = <&pinctrl_ap 3 GPIO_ACTIVE_LOW>;
+				bus-range = <1 1>;
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+				interrupt-controller;
+				#interrupt-cells = <1>;
+				interrupt-map-mask = <0 0 0 7>;
+				interrupt-map = <0 0 0 1 &port00 0 0 0 0>,
+						<0 0 0 2 &port00 0 0 0 1>,
+						<0 0 0 3 &port00 0 0 0 2>,
+						<0 0 0 4 &port00 0 0 0 3>;
+			};
+		};
+	};
+};

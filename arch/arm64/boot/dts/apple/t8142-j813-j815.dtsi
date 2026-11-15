@@ -1,0 +1,391 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Shared by the 13- and 15-inch M5 MacBook Air (J813, J815).
+ *
+ * The J813 and J815 ADTs (25G83) describe the same CPU performance states,
+ * cluster controllers, PMC, SMC, MTP, ANS, watchdog and PMU. Each board
+ * supplies the CPUs, AIC, PMGR and MTP DART these nodes use, and names its
+ * trackpad firmware (the multi-touch hid-merge-personality differs).
+ */
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	aliases {
+		mtp = &mtp;
+		keyboard = &keyboard;
+	};
+
+	/* State 1 is 300 MHz; firmware SRAM OPP tables begin at state 2. */
+	/* Cap each cluster at its measured J813 firmware handoff state. */
+	/*
+	 * opp-microwatt (per core, for the energy model) was measured on J815
+	 * with the main-PMU rail meters through the SMC: each cluster pinned to
+	 * each OPP with all its cores busy, the cluster rail (P: PP0b at VP0b,
+	 * E: PPbb at VPbb) read at the end of the load and split per core. The
+	 * readings follow C * V^2 * f closely (P: C 950-1150, E: 226-263 mW per
+	 * V^2 GHz, 900 MHz up to the highest unthrottled OPP), so the table is
+	 * that fit (P 1061, E 237) at each OPP's measured rail voltage. Above
+	 * 4020 MHz the P cluster sat at its power limit (die ~102 C), so those
+	 * rows rely on the fit, not on a direct reading. The values carry the
+	 * cluster's shared leakage, like the T8132 table; P at 4464 MHz (5.07 W)
+	 * matches T8132's 5.01 W.
+	 */
+	ecluster_opp: opp-table-0 {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp-300000000 {
+			opp-hz = /bits/ 64 <300000000>;
+			opp-level = <1>;
+			opp-microwatt = <31000>;
+		};
+
+		opp-972000000 {
+			opp-hz = /bits/ 64 <972000000>;
+			opp-level = <2>;
+			opp-microwatt = <88000>;
+		};
+
+		opp-1152000000 {
+			opp-hz = /bits/ 64 <1152000000>;
+			opp-level = <3>;
+			opp-microwatt = <109000>;
+		};
+
+		opp-1584000000 {
+			opp-hz = /bits/ 64 <1584000000>;
+			opp-level = <4>;
+			opp-microwatt = <178000>;
+		};
+
+		opp-1992000000 {
+			opp-hz = /bits/ 64 <1992000000>;
+			opp-level = <5>;
+			opp-microwatt = <252000>;
+		};
+
+		opp-2352000000 {
+			opp-hz = /bits/ 64 <2352000000>;
+			opp-level = <6>;
+			opp-microwatt = <330000>;
+		};
+
+		opp-2700000000 {
+			opp-hz = /bits/ 64 <2700000000>;
+			opp-level = <7>;
+			opp-microwatt = <463000>;
+		};
+
+		opp-2964000000 {
+			opp-hz = /bits/ 64 <2964000000>;
+			opp-level = <8>;
+			opp-microwatt = <630000>;
+		};
+	};
+
+	pcluster_opp: opp-table-1 {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp-300000000 {
+			opp-hz = /bits/ 64 <300000000>;
+			opp-level = <1>;
+			opp-microwatt = <109000>;
+		};
+
+		opp-1308000000 {
+			opp-hz = /bits/ 64 <1308000000>;
+			opp-level = <2>;
+			opp-microwatt = <467000>;
+		};
+
+		opp-1608000000 {
+			opp-hz = /bits/ 64 <1608000000>;
+			opp-level = <3>;
+			opp-microwatt = <643000>;
+		};
+
+		opp-1932000000 {
+			opp-hz = /bits/ 64 <1932000000>;
+			opp-level = <4>;
+			opp-microwatt = <869000>;
+		};
+
+		opp-2220000000 {
+			opp-hz = /bits/ 64 <2220000000>;
+			opp-level = <5>;
+			opp-microwatt = <1076000>;
+		};
+
+		opp-2508000000 {
+			opp-hz = /bits/ 64 <2508000000>;
+			opp-level = <6>;
+			opp-microwatt = <1293000>;
+		};
+
+		opp-2820000000 {
+			opp-hz = /bits/ 64 <2820000000>;
+			opp-level = <7>;
+			opp-microwatt = <1577000>;
+		};
+
+		opp-3072000000 {
+			opp-hz = /bits/ 64 <3072000000>;
+			opp-level = <8>;
+			opp-microwatt = <1927000>;
+		};
+
+		opp-3300000000 {
+			opp-hz = /bits/ 64 <3300000000>;
+			opp-level = <9>;
+			opp-microwatt = <2180000>;
+		};
+
+		opp-3516000000 {
+			opp-hz = /bits/ 64 <3516000000>;
+			opp-level = <10>;
+			opp-microwatt = <2651000>;
+		};
+
+		/* ADT levels 11-20, measured on J813 (level 19, 4416 MHz, is below
+		 * level 18 and left out). The SoC throttles them when hot. */
+		opp-3720000000 {
+			opp-hz = /bits/ 64 <3720000000>;
+			opp-level = <11>;
+			opp-microwatt = <3001000>;
+		};
+
+		opp-3876000000 {
+			opp-hz = /bits/ 64 <3876000000>;
+			opp-level = <12>;
+			opp-microwatt = <3451000>;
+		};
+
+		opp-4020000000 {
+			opp-hz = /bits/ 64 <4020000000>;
+			opp-level = <13>;
+			opp-microwatt = <3841000>;
+		};
+
+		opp-4176000000 {
+			opp-hz = /bits/ 64 <4176000000>;
+			opp-level = <14>;
+			opp-microwatt = <4520000>;
+		};
+
+		opp-4248000000 {
+			opp-hz = /bits/ 64 <4248000000>;
+			opp-level = <15>;
+			opp-microwatt = <4828000>;
+		};
+
+		opp-4272000000 {
+			opp-hz = /bits/ 64 <4272000000>;
+			opp-level = <16>;
+			opp-microwatt = <4855000>;
+		};
+
+		opp-4332000000 {
+			opp-hz = /bits/ 64 <4332000000>;
+			opp-level = <17>;
+			opp-microwatt = <4924000>;
+		};
+
+		opp-4428000000 {
+			opp-hz = /bits/ 64 <4428000000>;
+			opp-level = <18>;
+			opp-microwatt = <5033000>;
+		};
+
+		opp-4464000000 {
+			opp-hz = /bits/ 64 <4464000000>;
+			opp-level = <20>;
+			opp-microwatt = <5074000>;
+		};
+	};
+};
+
+&{/soc} {
+	cpufreq_e: performance-controller@210e20000 {
+		compatible = "apple,t8142-cluster-cpufreq";
+		reg = <0x2 0x10e20000 0 0x1000>;
+		#performance-domain-cells = <0>;
+	};
+
+	cpufreq_p: performance-controller@211e20000 {
+		compatible = "apple,t8142-cluster-cpufreq";
+		reg = <0x2 0x11e20000 0 0x1000>;
+		#performance-domain-cells = <0>;
+	};
+
+	/*
+	 * PMC voter interface (AppleT8142PMC, ADT pmc-pmgr 31 + 0x700000):
+	 * floors at 0x382700000 + agent * 0x4000, per-agent states at
+	 * +0x106000, rail enables at +0x108000. Agents (ADT voter-agent):
+	 * PMP 0, CLPC 1, GFX 2, AP 3. iBoot leaves every enable at 0, so
+	 * no vote is honoured and DRAM and fabric stay at their lowest
+	 * states (CPU DRAM latency 171 ns instead of 70 ns).
+	 */
+	pmc: power-management@382700000 {
+		compatible = "apple,t8142-pmc";
+		reg = <0x3 0x82700000 0x0 0x10000>,
+		      <0x3 0x82806000 0x0 0x3000>;
+		reg-names = "voters", "rails";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		/* PMP, CLPC and AP agents */
+		apple,static-voters = <0 1 3>;
+
+		clpc: performance-controller@1 {
+			compatible = "apple,t8142-clpc";
+			reg = <1>;
+		};
+	};
+
+	smc_mbox: mailbox@38c608000 {
+		compatible = "apple,t8142-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <3 0x8c608000 0 0x4000>;
+		interrupts = <AIC_IRQ 633 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 634 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 635 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 636 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty", "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+
+	smc: smc@38c600000 {
+		compatible = "apple,t8142-smc", "apple,t8103-smc";
+		reg = <3 0x8c600000 0 0x4000>, <3 0x8de00000 0 0x120000>;
+		reg-names = "smc", "sram";
+		mboxes = <&smc_mbox>;
+
+		hwmon {
+			compatible = "apple,smc-hwmon";
+			apple,discover-temperatures;
+		};
+
+		smc_gpio: gpio {
+			compatible = "apple,smc-gpio";
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+	};
+
+	mtp: mtp@394600000 {
+		compatible = "apple,t8142-mtp", "apple,t8142-rtk-helper-asc4",
+			     "apple,mtp", "apple,rtk-helper-asc4";
+		/* The second region is firmware SRAM, not the ASC control window. */
+		reg = <3 0x94600000 0 0x4000>, <3 0x94c00000 0 0x100000>;
+		reg-names = "asc", "sram";
+		mboxes = <&mtp_mbox>;
+		iommus = <&mtp_dart 0>;
+	};
+
+	mtp_mbox: mailbox@394608000 {
+		compatible = "apple,t8142-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <3 0x94608000 0 0x4000>;
+		interrupts = <AIC_IRQ 1299 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1300 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1301 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1302 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty", "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+
+	mtp_dockchannel: fifo@394b14000 {
+		compatible = "apple,t8142-dockchannel", "apple,dockchannel";
+		reg = <3 0x94b14000 0 0x1000>;
+		reg-names = "irq";
+		interrupts = <AIC_IRQ 1277 IRQ_TYPE_LEVEL_HIGH>;
+		ranges = <0 3 0x94b28000 0x20000>;
+		nonposted-mmio;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+
+		mtp_hid: input@8000 {
+			compatible = "apple,dockchannel-hid";
+			reg = <0x8000 0x1000>, <0xc000 0x1000>,
+			      <0x0000 0x1000>, <0x4000 0x1000>;
+			reg-names = "config", "data", "rmt-config", "rmt-data";
+			iommus = <&mtp_dart 0>;
+			interrupt-parent = <&mtp_dockchannel>;
+			interrupts = <2 IRQ_TYPE_LEVEL_HIGH>, <3 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "tx", "rx";
+			apple,fifo-size = <0x800>;
+			apple,helper-cpu = <&mtp>;
+			/*
+			 * ADT dockchannel-mtp/mtp-transport/multi-touch:
+			 * function-afe-reset = smc-pmu pKW4('gP1c'), SMC GPIO 28.
+			 * The MTP firmware cannot reach the AFE on its own ("No
+			 * HINT_L"): after macOS left it running the trackpad
+			 * worked, after a Linux warm reboot it stayed in reset.
+			 */
+			apple,afe-reset-gpios = <&smc_gpio 28 GPIO_ACTIVE_LOW>;
+
+			stm { };
+
+			/* Each board names its own trackpad firmware. */
+			multi-touch {
+				apple,power-method = <2>;
+			};
+
+			/* Layout is filled by the loader using this machine's own data. */
+			keyboard: keyboard { };
+
+			/*
+			 * The trackpad's haptic engine. The MTP firmware offers it
+			 * as interface 4 "actuator"; without this node the click
+			 * stays firmware-driven and there is no Force Touch stage.
+			 */
+			actuator { };
+		};
+	};
+};
+
+#include "t8142-j813-psci-idle.dtsi"
+#include "t8142-j813-nvme.dtsi"
+#include "t8142-j813-power.dtsi"
+
+/*
+ * CPU topology: DT cpu0-5 are the E cores (cluster 0), cpu6-9 (MPIDR
+ * 0x10100-0x10103) the P cores (cluster 1). The scheduler then knows the
+ * two clusters are asymmetric (SD_ASYM_CPUCAPACITY) and places heavy tasks
+ * on the P cores. Linux boots on a P core, so logical cpu0 and 7-9 are P.
+ * capacity-dmips-mhz (per MHz, scaled by each cluster's top OPP): E 671 /
+ * P 1024, measured on J815 (boot 0f4c4bbd, pinned integer loop at the top
+ * OPP of each cluster, best of 3: E 0.1045 / P 0.1597 per MHz). The T8132
+ * (M4) ratio this replaces, 754, overstated the E cores by 12%; E capacity
+ * at 2964 MHz is now ~445 of 1024 (4464 MHz P).
+ */
+&{/cpus} {
+	cpu-map {
+		cluster0 {
+			core0 { cpu = <&cpu0>; };
+			core1 { cpu = <&cpu1>; };
+			core2 { cpu = <&cpu2>; };
+			core3 { cpu = <&cpu3>; };
+			core4 { cpu = <&cpu4>; };
+			core5 { cpu = <&cpu5>; };
+		};
+
+		cluster1 {
+			core0 { cpu = <&cpu6>; };
+			core1 { cpu = <&cpu7>; };
+			core2 { cpu = <&cpu8>; };
+			core3 { cpu = <&cpu9>; };
+		};
+	};
+};
+
+&cpu0 { capacity-dmips-mhz = <671>; };
+&cpu1 { capacity-dmips-mhz = <671>; };
+&cpu2 { capacity-dmips-mhz = <671>; };
+&cpu3 { capacity-dmips-mhz = <671>; };
+&cpu4 { capacity-dmips-mhz = <671>; };
+&cpu5 { capacity-dmips-mhz = <671>; };
+&cpu6 { capacity-dmips-mhz = <1024>; };
+&cpu7 { capacity-dmips-mhz = <1024>; };
+&cpu8 { capacity-dmips-mhz = <1024>; };
+&cpu9 { capacity-dmips-mhz = <1024>; };

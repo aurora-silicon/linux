@@ -100,6 +100,9 @@ SYM_FUNC_END(__cpu_suspend_enter)
 	.pushsection ".idmap.text", "a"
 SYM_CODE_START(cpu_resume)
 	mov	x0, xzr
+#ifdef CONFIG_ARM64_CTXR_EXECMEM
+	mov	x22, #1				// a resuming CPU may be confined
+#endif
 	bl	init_kernel_el
 	mov	x19, x0			// preserve boot mode
 	bl	__cpu_setup

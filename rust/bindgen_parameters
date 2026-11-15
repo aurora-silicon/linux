@@ -32,6 +32,13 @@
 # warning. We don't need to peek into it anyway.
 --opaque-type spinlock
 
+# With CONFIG_SCHEDSTATS=n, `struct sched_statistics` is an empty
+# `____cacheline_aligned` struct. bindgen (0.73.2 and earlier) drops the
+# explicit alignment of a zero-sized non-opaque struct, which moves
+# `task_struct::stats` and every later field, including `mm`. Opaque types take
+# their alignment from Clang's layout, and Rust does not access these fields.
+--opaque-type sched_statistics
+
 # enums that appear in indirect function calls should specify a cfi type
 --newtype-enum lru_status
 --with-attribute-custom-enum=lru_status='#[cfi_encoding="10lru_status"]'

@@ -4,15 +4,23 @@
 //! treating another firmware's pstate report as an achieved GPU frequency.
 //! Writers and readers hold the device mutex; reads never power the GPU up.
 
-use super::{fw::channels::{EVENT_WORDS, STATISTICS_TYPES}, Role};
+use super::{
+    fw::channels::EVENT_WORDS,
+    Role,
+};
 use kernel::prelude::*;
 
 #[derive(Clone, Copy, Default)]
 struct Sample {
     count: u64,
+    admitted: u64,
+    last_admitted: bool,
     host_ns: u64,
     words: [u32; EVENT_WORDS],
 }
+
+/// One sample per statistics tag a family's 64-bit mask can name.
+const TAGS: usize = u64::BITS as usize;
 
 pub(super) struct Reports {
     samples: KVec<Sample>,
@@ -21,29 +29,56 @@ pub(super) struct Reports {
 impl Reports {
     pub(super) fn new() -> Result<Self> {
         // Allocate before firmware starts; receive and debugfs paths allocate nothing.
-        let mut samples = KVec::with_capacity(64, GFP_KERNEL)?;
-        for _ in 0..64 {
+        let mut samples = KVec::with_capacity(2 * TAGS, GFP_KERNEL)?;
+        for _ in 0..2 * TAGS {
             samples.push(Sample::default(), GFP_KERNEL)?;
         }
         Ok(Self { samples })
     }
 
-    pub(super) fn record(&mut self, role: Role, words: [u32; EVENT_WORDS], host_ns: u64) {
+    /// `allowed` is the family's statistics tag mask (`InitData::statistics_types`).
+    pub(super) fn record(
+        &mut self,
+        role: Role,
+        words: [u32; EVENT_WORDS],
+        host_ns: u64,
+        allowed: u64,
+        admitted: bool,
+    ) {
         let tag = words[0];
-        if tag >= u32::BITS || STATISTICS_TYPES & (1 << tag) == 0 {
+        if tag >= u64::BITS || allowed & (1u64 << tag) == 0 {
             return;
         }
-        let sample = &mut self.samples[role as usize * 32 + tag as usize];
+        let sample = &mut self.samples[role as usize * TAGS + tag as usize];
         sample.count = sample.count.saturating_add(1);
+        sample.admitted = sample.admitted.saturating_add(u64::from(admitted));
+        sample.last_admitted = admitted;
         sample.host_ns = host_ns;
         sample.words = words;
     }
 
     pub(super) fn write(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
-        writeln!(f, "format=1 units=raw host_time=monotonic_ns achieved_frequency=unqualified")?;
-        for (index, sample) in self.samples.iter().enumerate().filter(|(_, s)| s.count != 0) {
-            writeln!(f, "role={} tag={:#x} count={} host_ns={} words={:08x?}",
-                index / 32, index % 32, sample.count, sample.host_ns, sample.words)?;
+        writeln!(
+            f,
+            "format=1 units=raw host_time=monotonic_ns achieved_frequency=unqualified"
+        )?;
+        for (index, sample) in self
+            .samples
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.count != 0)
+        {
+            writeln!(
+                f,
+                "role={} tag={:#x} count={} host_ns={} admitted={} last_admitted={} words={:08x?}",
+                index / TAGS,
+                index % TAGS,
+                sample.count,
+                sample.host_ns,
+                sample.admitted,
+                sample.last_admitted,
+                sample.words
+            )?;
         }
         Ok(())
     }
@@ -55,14 +90,28 @@ pub(super) struct View(pub(super) kernel::sync::Arc<super::Shared>);
 impl kernel::debugfs::Writer for View {
     fn write(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
         let state = self.0.state.lock();
-        let Some(firmware) = state.as_deref() else { return writeln!(f, "online=0"); };
-        writeln!(f, "online=1 graph={:?} sampled_ns={}", self.0.variant.graph, super::now_ns())?;
+        let Some(firmware) = state.as_deref() else {
+            return writeln!(f, "online=0");
+        };
+        writeln!(
+            f,
+            "online=1 device={} graph={:?} sampled_ns={}",
+            self.0.dev.name().to_str().unwrap_or("<non-UTF8>"),
+            self.0.variant.graph,
+            super::now_ns()
+        )?;
         write_power(firmware, f)?;
         firmware.rings.write_reports(f)
     }
 }
 
-fn write_power(firmware: &super::Firmware, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+fn write_power(
+    firmware: &super::Firmware,
+    f: &mut kernel::fmt::Formatter<'_>,
+) -> kernel::fmt::Result {
+    if firmware.rings.statistics_suspended() || firmware.primary.state.shared.sleeping() {
+        return writeln!(f, "power_management=firmware suspended=1");
+    }
     let core_power = firmware.bridge.regs.g17_core_power();
     writeln!(f, "power_management=firmware sampled_ns={} core_power={:#x} cores_powered={} host_hold={} idle_hold_ms={}",
         super::now_ns(), core_power, core_power & 0xf != 0, firmware.hold.active(),
@@ -76,8 +125,59 @@ pub(super) struct PowerView(pub(super) kernel::sync::Arc<super::Shared>);
 impl kernel::debugfs::Writer for PowerView {
     fn write(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
         let state = self.0.state.lock();
-        let Some(firmware) = state.as_deref() else { return writeln!(f, "online=0"); };
+        let Some(firmware) = state.as_deref() else {
+            return writeln!(f, "online=0");
+        };
         write_power(firmware, f)
+    }
+}
+
+/// What each coprocessor has written into the log buffer the host published to it, which is
+/// where an M5 firmware records what it is doing when it never reports a crash.
+pub(super) struct FirmwareLogView(pub(super) kernel::sync::Arc<super::Shared>);
+
+impl kernel::debugfs::Writer for FirmwareLogView {
+    fn write(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        let state = self.0.state.lock();
+        let Some(firmware) = state.as_deref() else {
+            return writeln!(f, "online=0");
+        };
+        for role in [Role::Primary, Role::Secondary] {
+            let bytes = firmware.init.fw_log_bytes(role);
+            let used = bytes.iter().rposition(|byte| *byte != 0).map_or(0, |last| last + 1);
+            writeln!(f, "role={} size={:#x} used={:#x}", role as u32, bytes.len(), used)?;
+            for (index, line) in bytes[..used].chunks(32).enumerate() {
+                write!(f, "  {:#06x}:", index * 32)?;
+                for byte in line {
+                    write!(f, " {:02x}", byte)?;
+                }
+                writeln!(f)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The hardware-data bundle this driver built, for comparing it word for word with the bundle a
+/// machine's own firmware runs on.
+pub(super) struct HardwareDataView(pub(super) kernel::sync::Arc<super::Shared>);
+
+impl kernel::debugfs::Writer for HardwareDataView {
+    fn write(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        let state = self.0.state.lock();
+        let Some(firmware) = state.as_deref() else {
+            return writeln!(f, "online=0");
+        };
+        let bytes = firmware.init.hardware_data_bytes();
+        writeln!(f, "size={:#x}", bytes.len())?;
+        for (index, line) in bytes.chunks(32).enumerate() {
+            write!(f, "{:#06x}:", index * 32)?;
+            for byte in line {
+                write!(f, " {:02x}", byte)?;
+            }
+            writeln!(f)?;
+        }
+        Ok(())
     }
 }
 
@@ -85,21 +185,30 @@ impl kernel::debugfs::Writer for PowerView {
 mod tests {
     use super::*;
 
+    /// The G17 family's statistics tags, as `InitData::statistics_types` gives them.
+    const G17: u64 = super::super::fw::channels::STATISTICS_TYPES as u64;
+    /// M5's, which add tag 32.
+    const M5: u64 = super::super::fw::m5::STATISTICS_TYPES;
+
     #[test]
     fn retains_all_words_and_separates_role_and_tag() {
         let mut reports = Reports::new().unwrap();
         let mut words = [0; EVENT_WORDS];
         words[0] = 16;
         words[17] = 0xdeadbeef;
-        reports.record(Role::Primary, words, 100);
-        reports.record(Role::Primary, words, 101);
-        reports.record(Role::Secondary, words, 102);
+        reports.record(Role::Primary, words, 100, G17, false);
+        reports.record(Role::Primary, words, 101, G17, true);
+        reports.record(Role::Secondary, words, 102, G17, false);
         assert_eq!(reports.samples[16].count, 2);
         assert_eq!(reports.samples[16].host_ns, 101);
         assert_eq!(reports.samples[16].words, words);
-        assert_eq!(reports.samples[48].count, 1);
+        assert_eq!(reports.samples[16].admitted, 1);
+        assert!(reports.samples[16].last_admitted);
+        assert_eq!(reports.samples[TAGS + 16].count, 1);
+        assert_eq!(reports.samples[TAGS + 16].admitted, 0);
+        assert!(!reports.samples[TAGS + 16].last_admitted);
         words[0] = 17;
-        reports.record(Role::Primary, words, 103);
+        reports.record(Role::Primary, words, 103, G17, true);
         assert_eq!(reports.samples[17].count, 1);
         assert_eq!(reports.samples[16].count, 2);
     }
@@ -107,11 +216,25 @@ mod tests {
     #[test]
     fn rejects_invalid_tags_before_indexing() {
         let mut reports = Reports::new().unwrap();
-        for tag in [0, 15, 29, 31, 32, u32::MAX] {
+        for tag in [0, 15, 29, 31, 32, 63, 64, u32::MAX] {
             let mut words = [0; EVENT_WORDS];
             words[0] = tag;
-            reports.record(Role::Primary, words, 1);
+            reports.record(Role::Primary, words, 1, G17, true);
         }
         assert!(reports.samples.iter().all(|s| s.count == 0));
+    }
+
+    #[test]
+    fn follows_the_family_mask() {
+        let mut reports = Reports::new().unwrap();
+        let mut words = [0; EVENT_WORDS];
+        words[0] = 32;
+        reports.record(Role::Secondary, words, 1, G17, true);
+        assert_eq!(reports.samples[TAGS + 32].count, 0);
+        reports.record(Role::Secondary, words, 2, M5, true);
+        assert_eq!(reports.samples[TAGS + 32].count, 1);
+        words[0] = 64;
+        reports.record(Role::Secondary, words, 3, u64::MAX, true);
+        assert_eq!(reports.samples.iter().filter(|s| s.count != 0).count(), 1);
     }
 }

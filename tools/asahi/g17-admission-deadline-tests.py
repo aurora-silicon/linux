@@ -37,15 +37,17 @@ static MODE:AtomicUsize=AtomicUsize::new(0);
 mod g17 {pub fn now_ns()->u64 {crate::NOW.load(crate::Ordering::SeqCst)}}
 mod kernel {pub mod time {pub fn msecs_to_jiffies(ms:u32)->u64 {u64::from(ms)}}}
 mod hazard {pub const WAIT_MS:u32=1000;}
+mod cfg {pub const RENDER_SLOTS:usize=2;}
 const QUARANTINE_WAIT_MS:u32=1000;
 #[derive(Clone,Copy,PartialEq)] enum Plan {Any,Conflict}
 #[derive(Clone,Copy)] struct Request<'a>(&'a ());
-struct State {owners:[u64;2],quarantined:u64,spared:u64,next_ticket:u64,waiters:usize,conflict:bool,ready:bool}
+struct State {owners:[u64;cfg::RENDER_SLOTS],quarantined:u64,spared:u64,next_ticket:u64,waiters:usize,conflict:bool,ready:bool}
 impl State {
  fn exhausted(&self)->bool {false}
+''' + item(source, 'fn owner_quarantine(') + r'''
  fn refusal(&self,_:u64)->Result {Ok(())}
  fn plan(&self,_:u64,_:Option<Request<'_>>,_:Option<u64>)->Plan {if self.conflict {Plan::Conflict}else{Plan::Any}}
- fn pick(&mut self,_:u64,_:Plan)->Option<u8> {if self.ready{Some(1)}else{None}}
+ fn pick(&mut self,_:u64,_:usize,_:Plan)->Option<u8> {if self.ready{Some(1)}else{None}}
  fn record(&mut self,_:u64,slot:Option<u8>,_:u64,_:Request<'_>)->Option<usize> {if slot.is_none(){self.waiters+=1;}Some(0)}
  fn forget_waiter(&mut self,t:Option<u64>){if t.is_some(){self.waiters-=1;}}
 }
@@ -76,31 +78,31 @@ fn main(){
  for mode in 0..2 {
   for conflict in [false,true] {
    reset(mode);let pool=new_pool(conflict,0);
-   let result=pool.acquire_render(1,Some(Request(&())),2_000_000_000,||Ok(()));
+   let result=pool.acquire_render(1,1,Some(Request(&())),2_000_000_000,||Ok(()));
    assert!(matches!(result,Err(EBUSY)),"busy wait must expire");
    assert!(NOW.load(Ordering::SeqCst)<=2_010_000_000,"absolute deadline extended by wakes");
    assert_eq!(pool.state.lock().waiters,0,"expired waiter must be removed");
    reset(mode);let pool=new_pool(conflict,0);
-   let result=pool.acquire_render(1,Some(Request(&())),2_000_000_000,||if g17::now_ns()>=5_000_000 {Err(ECANCELED)}else{Ok(())});
+   let result=pool.acquire_render(1,1,Some(Request(&())),2_000_000_000,||if g17::now_ns()>=5_000_000 {Err(ECANCELED)}else{Ok(())});
    assert!(matches!(result,Err(ECANCELED)),"cancel must interrupt a busy wait");
    assert!(NOW.load(Ordering::SeqCst)<=15_000_000,"cancel observation bound");
    assert_eq!(pool.state.lock().waiters,0,"cancelled waiter must be removed");
   }
   reset(mode);let pool=new_pool(false,2);
-  assert!(matches!(pool.acquire_render(1,None,2_000_000_000,||Ok(())),Err(EIO)));
+  assert!(matches!(pool.acquire_render(1,1,None,2_000_000_000,||Ok(())),Err(EIO)));
   assert!(NOW.load(Ordering::SeqCst)<=1_010_000_000,"quarantine budget extended");
   reset(mode);let pool=new_pool(false,2);pool.state.lock().spared=2;
-  assert!(matches!(pool.acquire_render(1,None,2_000_000_000,||Ok(())),Err(EBUSY)));
-  assert!(NOW.load(Ordering::SeqCst)<=1_010_000_000,"spared quarantine budget extended");
+  assert!(matches!(pool.acquire_render(1,1,None,2_000_000_000,||Ok(())),Err(EBUSY)));
+  assert!((2_000_000_000..=2_010_000_000).contains(&NOW.load(Ordering::SeqCst)),"a spared quarantine waits for the caller's deadline");
  }
  reset(2);let pool=new_pool(true,0);
- assert!(matches!(pool.acquire_render(1,Some(Request(&())),2_000_000_000,||Ok(())),Err(ERESTARTSYS)));
+ assert!(matches!(pool.acquire_render(1,1,Some(Request(&())),2_000_000_000,||Ok(())),Err(ERESTARTSYS)));
  assert_eq!(pool.state.lock().waiters,0);
  // A previous outer retry already spent the budget. Even available capacity
  // cannot restart it or install a lease after cancellation.
  reset(0);NOW.store(2_000_000_000,Ordering::SeqCst);let pool=new_pool(false,0);pool.state.lock().ready=true;
- assert!(matches!(pool.acquire_render(1,None,2_000_000_000,||Ok(())),Err(EBUSY)));
- assert!(matches!(pool.acquire_render(1,None,u64::MAX,||Err(ECANCELED)),Err(ECANCELED)));
+ assert!(matches!(pool.acquire_render(1,1,None,2_000_000_000,||Ok(())),Err(EBUSY)));
+ assert!(matches!(pool.acquire_render(1,1,None,u64::MAX,||Err(ECANCELED)),Err(ECANCELED)));
  assert_eq!(WAITS.load(Ordering::SeqCst),0);
  println!("PASS production admission: all-pairs-busy/no-progress and 20,000 unrelated wakes expire at absolute deadline; no-event cancellation bounded; conflict/quarantine/signal cleanup preserved");
 }

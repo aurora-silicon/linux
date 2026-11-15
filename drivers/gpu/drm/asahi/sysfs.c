@@ -8,6 +8,8 @@
 #include <linux/errno.h>
 #include <linux/export.h>
 #include <linux/module.h>
+#include <linux/notifier.h>
+#include <linux/suspend.h>
 #include <linux/slab.h>
 #include <linux/stddef.h>
 #include <linux/string.h>
@@ -16,7 +18,7 @@
 
 #include "sysfs.h"
 
-/* Mirror of repr(C) Rust atomics; READ_ONCE accesses the current values. */
+/* Legacy prefix of repr(C) Rust atomics; READ_ONCE accesses current values. */
 struct asahi_stats_snapshot {
 	u32 util1;
 	u32 util2;
@@ -40,6 +42,7 @@ struct asahi_gpu_memory {
 	u64 refused;
 	u64 limit;
 	u64 client_limit;
+	u64 user_kept;
 };
 
 struct asahi_stats_attribute {
@@ -48,7 +51,100 @@ struct asahi_stats_attribute {
 	const struct asahi_stats_snapshot *snapshot;
 	const struct asahi_gpu_memory *memory;
 	bool export_enabled;
+	asahi_stats_read_fn read;
+	asahi_stats_suspend_fn suspend;
+	asahi_stats_frequency_fn frequency;
+	struct notifier_block pm_notifier;
 };
+
+/* 0: unavailable, 1: valid, 2: stale, 3: unsupported; matches g17::telemetry. */
+static const char *asahi_stats_quality(u32 status)
+{
+	switch (status) {
+	case 1:
+		return "valid";
+	case 2:
+		return "stale";
+	case 3:
+		return "unsupported";
+	default:
+		return "unavailable";
+	}
+}
+
+static ssize_t agx_qualified_stats_show(struct asahi_stats_attribute *stats, char *buf)
+{
+	struct asahi_qualified_stats snap;
+	ssize_t n = 0;
+
+	stats->read(stats->snapshot, &snap);
+	n += sysfs_emit_at(buf, n, "utilisation_status %s\n",
+			   asahi_stats_quality(snap.util_status));
+	if (snap.util_status == 1) {
+		n += sysfs_emit_at(buf, n, "util_tiler_percent %u\n", snap.tiler);
+		n += sysfs_emit_at(buf, n, "util_renderer_percent %u\n", snap.renderer);
+		n += sysfs_emit_at(buf, n, "util_device_percent %u\n", snap.device);
+	} else {
+		n += sysfs_emit_at(buf, n, "util_tiler_percent unsupported\n"
+				   "util_renderer_percent unsupported\n"
+				   "util_device_percent unsupported\n");
+	}
+	/*
+	 * unsupported comes from the firmware match data (g17::stats): V25G83
+	 * never emits a pstate record, so it is not a transient state.
+	 * unavailable keeps meaning "no qualified sample yet".
+	 */
+	n += sysfs_emit_at(buf, n, "pstate_status %s\n",
+			   asahi_stats_quality(snap.pstate_status));
+	if (snap.pstate_status == 1)
+		n += sysfs_emit_at(buf, n, "pstate %u\n", snap.pstate);
+	else
+		n += sysfs_emit_at(buf, n, "pstate unsupported\n");
+	/* No host frequency request, measured power or temperature. */
+	n += sysfs_emit_at(buf, n, "requested_frequency_hz unsupported\n");
+	/*
+	 * V26A428 reports the state the GPU runs at: its frequency is the
+	 * achieved one. State 0 is off (gated cores) and runs at 0 Hz.
+	 */
+	if (snap.pstate_status == 1 && (snap.achieved_frequency_hz || !snap.pstate))
+		n += sysfs_emit_at(buf, n, "achieved_frequency_hz %llu\n",
+				   (unsigned long long)snap.achieved_frequency_hz);
+	else
+		n += sysfs_emit_at(buf, n, "achieved_frequency_hz unsupported\n");
+	if (snap.busy_status == 1)
+		n += sysfs_emit_at(buf, n, "busy_ns %llu\n",
+				   (unsigned long long)snap.busy_ns);
+	else
+		n += sysfs_emit_at(buf, n, "busy_ns unsupported\n");
+	n += sysfs_emit_at(buf, n, "power_mw unsupported\n"
+			   "temperature_raw unsupported\n");
+	n += sysfs_emit_at(buf, n, "utilisation_source firmware-statistics-tag-0x13\n"
+			   "utilisation_samples %llu\n"
+			   "utilisation_host_ns %llu\n",
+			   (unsigned long long)snap.util_samples,
+			   (unsigned long long)snap.util_host_ns);
+	return n;
+}
+
+static int asahi_stats_pm_notify(struct notifier_block *nb, unsigned long action, void *unused)
+{
+	struct asahi_stats_attribute *stats =
+		container_of(nb, struct asahi_stats_attribute, pm_notifier);
+
+	switch (action) {
+	case PM_SUSPEND_PREPARE:
+	case PM_HIBERNATION_PREPARE:
+	case PM_RESTORE_PREPARE:
+		stats->suspend(stats->snapshot, true);
+		break;
+	case PM_POST_SUSPEND:
+	case PM_POST_HIBERNATION:
+	case PM_POST_RESTORE:
+		stats->suspend(stats->snapshot, false);
+		break;
+	}
+	return NOTIFY_OK;
+}
 
 static ssize_t agx_stats_show(struct device *dev,
 			      struct device_attribute *attr, char *buf)
@@ -57,15 +153,20 @@ static ssize_t agx_stats_show(struct device *dev,
 		container_of(attr, struct asahi_stats_attribute, attr);
 	const struct asahi_stats_snapshot *snap = stats->snapshot;
 	ssize_t n = 0;
+	u32 pstate;
+	u64 frequency_hz;
 
 	if (!stats->export_enabled)
 		return sysfs_emit(buf, "unsupported\n");
+	if (stats->read)
+		return agx_qualified_stats_show(stats, buf);
+	pstate = READ_ONCE(snap->pstate);
 	n += scnprintf(buf + n, PAGE_SIZE - n, "busy_ns %llu\n",
 		       (unsigned long long)READ_ONCE(snap->busy_ns));
 	n += scnprintf(buf + n, PAGE_SIZE - n, "jobs %llu\n",
 		       (unsigned long long)READ_ONCE(snap->jobs));
 	n += scnprintf(buf + n, PAGE_SIZE - n, "pstate %u\n",
-		       (u32)READ_ONCE(snap->pstate));
+		       pstate);
 	n += scnprintf(buf + n, PAGE_SIZE - n, "power_mw %u\n",
 		       (u32)READ_ONCE(snap->avg_power_mw));
 	n += scnprintf(buf + n, PAGE_SIZE - n, "util1 %u\n",
@@ -80,6 +181,13 @@ static ssize_t agx_stats_show(struct device *dev,
 		       (u32)READ_ONCE(snap->temperature_raw));
 	n += scnprintf(buf + n, PAGE_SIZE - n, "temperature_scale %u\n",
 		       (u32)READ_ONCE(snap->temperature_scale));
+	if (stats->frequency) {
+		if (stats->frequency(snap, pstate, &frequency_hz))
+			n += sysfs_emit_at(buf, n, "requested_frequency_hz %llu\n",
+					   (unsigned long long)frequency_hz);
+		else
+			n += sysfs_emit_at(buf, n, "requested_frequency_hz unsupported\n");
+	}
 
 	return n;
 }
@@ -87,7 +195,11 @@ static ssize_t agx_stats_show(struct device *dev,
 /*
  * GPU memory held by the driver, in bytes: user objects created (committed)
  * and held by the GPU (resident), held kernel objects, the limits that admit
- * user objects (0: none) and the number of refused creations.
+ * user objects (0: none), the number of refused creations, and the size of
+ * the user objects that userspace asked to keep resident (user_kept), whether
+ * their memory is held at the moment or not. The request is a hint: when
+ * reclaim releases idle memory of a VM, its kept objects go after the others
+ * (see DRM_IOCTL_ASAHI_GEM_RESIDENCY).
  */
 static ssize_t gpu_memory_show(struct device *dev,
 			       struct device_attribute *attr, char *buf)
@@ -109,6 +221,8 @@ static ssize_t gpu_memory_show(struct device *dev,
 		       (unsigned long long)READ_ONCE(mem->client_limit));
 	n += scnprintf(buf + n, PAGE_SIZE - n, "refused %llu\n",
 		       (unsigned long long)READ_ONCE(mem->refused));
+	n += scnprintf(buf + n, PAGE_SIZE - n, "user_kept %llu\n",
+		       (unsigned long long)READ_ONCE(mem->user_kept));
 
 	return n;
 }
@@ -118,17 +232,24 @@ static ssize_t gpu_memory_show(struct device *dev,
  * registered. Returns 0 on success, or a negative errno.
  */
 int asahi_sysfs_register(struct device *dev, const void *snapshot,
-			 int export_enabled, const void *memory, void **handle)
+			 int export_enabled, const void *memory, void **handle,
+			 asahi_stats_read_fn read, asahi_stats_suspend_fn suspend,
+			 asahi_stats_frequency_fn frequency)
 {
 	struct asahi_stats_attribute *stats;
 	int ret;
 
-	if (!dev || !handle || !memory || (export_enabled && !snapshot))
+	if (!dev || !handle || !memory || ((export_enabled || read) && !snapshot) ||
+	    (!!read != !!suspend))
 		return -ENODEV;
 
+	BUILD_BUG_ON(offsetof(struct asahi_qualified_stats, util_host_ns) != 24);
+	BUILD_BUG_ON(offsetof(struct asahi_qualified_stats, busy_ns) != 56);
+	BUILD_BUG_ON(sizeof(struct asahi_qualified_stats) != 80);
 	BUILD_BUG_ON(offsetof(struct asahi_gpu_memory, refused) != 24);
 	BUILD_BUG_ON(offsetof(struct asahi_gpu_memory, client_limit) != 40);
-	BUILD_BUG_ON(sizeof(struct asahi_gpu_memory) != 48);
+	BUILD_BUG_ON(offsetof(struct asahi_gpu_memory, user_kept) != 48);
+	BUILD_BUG_ON(sizeof(struct asahi_gpu_memory) != 56);
 
 	BUILD_BUG_ON(offsetof(struct asahi_stats_snapshot, pstate) != 16);
 	BUILD_BUG_ON(offsetof(struct asahi_stats_snapshot, busy_ns) != 40);
@@ -145,6 +266,17 @@ int asahi_sysfs_register(struct device *dev, const void *snapshot,
 	stats->attr.show = agx_stats_show;
 	stats->snapshot = snapshot;
 	stats->export_enabled = export_enabled;
+	stats->read = read;
+	stats->suspend = suspend;
+	stats->frequency = frequency;
+	if (suspend) {
+		stats->pm_notifier.notifier_call = asahi_stats_pm_notify;
+		ret = register_pm_notifier(&stats->pm_notifier);
+		if (ret) {
+			kfree(stats);
+			return ret;
+		}
+	}
 
 	sysfs_attr_init(&stats->memory_attr.attr);
 	stats->memory_attr.attr.name = "gpu_memory";
@@ -154,6 +286,8 @@ int asahi_sysfs_register(struct device *dev, const void *snapshot,
 
 	ret = device_create_file(dev, &stats->attr);
 	if (ret) {
+		if (stats->suspend)
+			unregister_pm_notifier(&stats->pm_notifier);
 		kfree(stats);
 		return ret;
 	}
@@ -161,6 +295,8 @@ int asahi_sysfs_register(struct device *dev, const void *snapshot,
 	ret = device_create_file(dev, &stats->memory_attr);
 	if (ret) {
 		device_remove_file(dev, &stats->attr);
+		if (stats->suspend)
+			unregister_pm_notifier(&stats->pm_notifier);
 		kfree(stats);
 		return ret;
 	}
@@ -217,6 +353,9 @@ void asahi_sysfs_unregister(struct device *dev, void *handle)
 	if (!dev || !stats)
 		return;
 
+	/* Both notifier removal and file removal join readers of the Rust Arc. */
+	if (stats->suspend)
+		unregister_pm_notifier(&stats->pm_notifier);
 	/* Removal drains active show callbacks before either allocation dies. */
 	device_remove_file(dev, &stats->memory_attr);
 	device_remove_file(dev, &stats->attr);
@@ -230,4 +369,4 @@ EXPORT_SYMBOL_GPL(asahi_sysfs_unregister);
 
 MODULE_AUTHOR("AGX driver maintainer");
 MODULE_LICENSE("Dual MIT/GPL");
-MODULE_DESCRIPTION("Asahi AGX firmware stats sysfs shim");
+MODULE_DESCRIPTION("AGX firmware stats sysfs shim");

@@ -131,4 +131,3 @@
 &usb4_0_acio {
 	apple,pcie-tunnel = <&usb4_0_pcie_tunnel>;
 };
-

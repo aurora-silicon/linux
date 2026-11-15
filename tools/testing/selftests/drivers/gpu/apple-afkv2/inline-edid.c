@@ -116,6 +116,12 @@ int main(void)
 	afkv2_put64(edid + 32, 8 + 128);
 	afkv2_put64(edid, EDID_BUF_SIZE - 1);
 	CHECK(dpavserv_edid_size(edid, sizeof(edid), &length));
+	/* A reply without EDID bytes: not read from the sink yet. */
+	afkv2_put64(edid, EDID_BUF_SIZE);
+	afkv2_put64(edid + 32, 0);
+	CHECK(dpavserv_edid_size(edid, sizeof(edid), &length) == -ENODATA);
+	afkv2_put64(edid + 32, 8);
+	CHECK(dpavserv_edid_size(edid, sizeof(edid), &length) == -EIO);
 	printf("PASS: inline AFKV2 and EDID validation (%u checks)\n", assertions);
 	return 0;
 }

@@ -5,6 +5,7 @@
 
 use super::{memory, retirement::Window};
 use crate::g17::fw::{
+    m5,
     kick::KickTimestamp,
     queue::{DataMaster, KickAnnounce, QueueConfig, ITEM_RING_ENTRIES},
 };
@@ -27,6 +28,12 @@ pub(in crate::g17::queue) fn required(previous: Option<QueueConfig>, config: Que
         || previous.map(identity) != Some(identity(config))
 }
 
+/// The kick announcement record: the G17P one, or the M5 notification.
+enum Announcement {
+    Neo(KickAnnounce),
+    M5(m5::queue::Notification),
+}
+
 pub(super) struct Lane<'a> {
     items: [&'a AtomicU64; 4],
     producer: &'a AtomicU32,
@@ -34,13 +41,17 @@ pub(super) struct Lane<'a> {
     config: QueueConfig,
     config_destination: *mut u64,
     config_present: bool,
-    announce: KickAnnounce,
-    announce_destination: *mut KickAnnounce,
+    announce: Announcement,
+    announce_destination: *mut u8,
     prefix: usize,
     prefix_end: u32,
     pub(super) window: Window,
 }
 impl<'a> Lane<'a> {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The publication lane describes independent fields of the firmware wire record."
+    )]
     pub(super) fn new(
         graph: &'a memory::Graph,
         stage: usize,
@@ -51,7 +62,13 @@ impl<'a> Lane<'a> {
         timestamp: KickTimestamp,
         lead: bool,
     ) -> Result<Self> {
-        let count = 2 + u32::from(present) + u32::from(lead);
+        // macOS 27.0 on the J813 (common 26A428 interface) publishes the Neo form: its
+        // TA, 3D and compute item rings carry [configuration], descriptor, KickAnnounce (tag 0xe)
+        // records, never the M5 Pro's descriptor-less tag-16 notification.
+        let j813 = crate::g17::J813_FORMS.load(core::sync::atomic::Ordering::Relaxed);
+        let m5 = graph.is_m5() && !j813;
+        // M5 items carry no descriptor: [configuration], notification.
+        let count = u32::from(present) + u32::from(lead) + if m5 { 1 } else { 2 };
         let window = Window::new(base, count, ITEM_RING_ENTRIES)?;
         let offset = ordinal as usize % memory::RECORDS;
         let config_offset = memory::CONFIG[stage] + offset * memory::CONFIG_STRIDE;
@@ -65,8 +82,8 @@ impl<'a> Lane<'a> {
         }
         let announce_destination = graph
             .queues
-            .pointer(announce_offset, size_of::<KickAnnounce>())?
-            .cast::<KickAnnounce>();
+            .pointer(announce_offset, if m5 { size_of::<m5::queue::Notification>() }
+                else { size_of::<KickAnnounce>() })?;
         let index =
             |delta: u32| memory::ITEMS[stage] + ((base + delta) % ITEM_RING_ENTRIES) as usize * 8;
         let items = [
@@ -87,28 +104,39 @@ impl<'a> Lane<'a> {
         if lead {
             push(graph.config.gpu_va() + (config_offset + memory::LEAD) as u64);
         }
-        push(descriptor);
-        if present {
+        if j813 && present {
+            push(graph.config.gpu_va() + config_offset as u64);
+        }
+        if !m5 {
+            push(descriptor);
+        }
+        if present && !j813 {
             push(graph.config.gpu_va() + config_offset as u64);
         }
         push(announce_va);
         Ok(Self {
             items,
-            producer: graph.queues.word(memory::POINTERS[stage] + graph.pointers.producer)?,
+            producer: graph
+                .queues
+                .word(memory::POINTERS[stage] + graph.pointers.producer)?,
             values,
             config,
             config_destination,
             config_present: present,
-            announce: KickAnnounce::new(
-                config.qid.try_into()?,
-                if stage == 0 {
-                    DataMaster::Tiling
-                } else {
-                    DataMaster::Fragment
-                },
-                timestamp,
-                config.priority as u8,
-            )?,
+            announce: if m5 {
+                Announcement::M5(m5::queue::notification(config.qid.try_into()?, timestamp)?)
+            } else {
+                Announcement::Neo(KickAnnounce::new(
+                    config.qid.try_into()?,
+                    if stage == 0 {
+                        DataMaster::Tiling
+                    } else {
+                        DataMaster::Fragment
+                    },
+                    timestamp,
+                    config.priority as u8,
+                )?)
+            },
             announce_destination,
             prefix: count as usize - 1,
             prefix_end: (base + count - 1) % ITEM_RING_ENTRIES,
@@ -140,8 +168,20 @@ impl<'a> Lane<'a> {
         // SAFETY: The full record is inside the retained queue graph and is
         // exclusively owned by this ordinal. Publication follows its copy.
         unsafe {
-            self.announce_destination.write_unaligned(self.announce);
+            match &self.announce {
+                Announcement::Neo(value) => self.announce_destination
+                    .cast::<KickAnnounce>().write_unaligned(*value),
+                Announcement::M5(value) => self.announce_destination
+                    .cast::<m5::queue::Notification>().write_unaligned(*value),
+            }
         }
+    }
+    /// Fill the retained records without advancing the firmware-visible cursor.
+    /// M5's host-port transaction must occur between this and publish_kick.
+    pub(super) fn prepare(&self) {
+        self.items(0..self.prefix + 1);
+        self.config();
+        self.announce();
     }
     pub(super) fn publish_prefix(&self) {
         self.items(0..self.prefix);

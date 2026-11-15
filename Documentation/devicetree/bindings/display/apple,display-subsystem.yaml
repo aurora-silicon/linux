@@ -18,9 +18,15 @@ properties:
     oneOf:
       - enum:
           - apple,display-subsystem
+          - apple,t6031-display-subsystem
           - apple,t8132-display-subsystem
       - const: apple,t8132-display-diagnostics
         deprecated: true
+      - items:
+          - enum:
+              - apple,t8140-display-subsystem
+              - apple,t8142-display-subsystem
+          - const: apple,display-subsystem
       - items:
           - const: apple,t8132-display-subsystem
           - const: apple,t8132-display-diagnostics
@@ -34,6 +40,11 @@ properties:
     minItems: 1
     maxItems: 64
     description: Reserved memory retaining the inherited display mappings.
+
+  memory-region-names:
+    items:
+      - const: framebuffer
+    description: Identifies the boot framebuffer reservation supplied by the loader.
 
   apple,j713-inherited-mappings:
     type: boolean

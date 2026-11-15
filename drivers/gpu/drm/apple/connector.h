@@ -39,8 +39,9 @@ struct apple_connector {
 	struct platform_device *dcp;
 
 	/*
-	 * A Type-C connector is a physical port rather than a fixed pipeline,
-	 * and it has one encoder covering every pipeline that can drive it.
+	 * A Type-C connector has one encoder covering its allowed pipelines.
+	 * T6050 has a connector per port/pipeline pair with a single CRTC;
+	 * other platforms have a connector per port or USB4 stream.
 	 * One encoder per pipeline would describe the same hardware, but
 	 * userspace takes the CRTCs a connector can use to be what all of its
 	 * encoders have in common, and single-pipeline encoders have nothing

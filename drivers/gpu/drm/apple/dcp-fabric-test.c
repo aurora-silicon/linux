@@ -478,7 +478,8 @@ static void fabric_scenario_test(struct kunit *test)
 		KUNIT_EXPECT_PTR_EQ(test, found, NULL);
 		KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_request(f.port, 3, 0, &found), -ENODEV);
 		KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_request(f.port, 0, 0, &found), -EINVAL);
-		KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_request(f.port, 1, 2, &found), -EINVAL);
+		KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_request(f.port, 1, DCP_FABRIC_DPIN_MAX,
+								&found), -EINVAL);
 		break;
 	}
 }
@@ -2344,7 +2345,38 @@ static void relink_stamp_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, dcp_relink_unplug(&s, 1, 3));
 }
 
+/*
+ * A refused T8132 tunnel clock stays refused through stops, failed or not,
+ * and only a nonzero rate taken clears it: refused, 0, refused is one
+ * refusal, not three changes.
+ */
+static void fabric_t8132_clock_refused_test(struct kunit *test)
+{
+	bool refused = false;
+
+	/* HBR2 taken, then stopped: never refused */
+	refused = dcp_fabric_clock_refused(refused, 0x14, 0);
+	KUNIT_EXPECT_FALSE(test, refused);
+	refused = dcp_fabric_clock_refused(refused, 0, 0);
+	KUNIT_EXPECT_FALSE(test, refused);
+
+	/* HBR refused, stop, HBR refused again: refused throughout */
+	refused = dcp_fabric_clock_refused(refused, 0x0a, -EBUSY);
+	KUNIT_EXPECT_TRUE(test, refused);
+	refused = dcp_fabric_clock_refused(refused, 0, 0);
+	KUNIT_EXPECT_TRUE(test, refused);
+	refused = dcp_fabric_clock_refused(refused, 0, -EBUSY);
+	KUNIT_EXPECT_TRUE(test, refused);
+	refused = dcp_fabric_clock_refused(refused, 0x0a, -EBUSY);
+	KUNIT_EXPECT_TRUE(test, refused);
+
+	/* a nonzero rate taken clears it */
+	refused = dcp_fabric_clock_refused(refused, 0x14, 0);
+	KUNIT_EXPECT_FALSE(test, refused);
+}
+
 static struct kunit_case fabric_tests[] = {
+	KUNIT_CASE(fabric_t8132_clock_refused_test),
 	KUNIT_CASE(relink_unplug_test),
 	KUNIT_CASE(relink_running_test),
 	KUNIT_CASE(relink_budget_test),

@@ -64,18 +64,8 @@ pub(super) fn snapshot(memory: &memory::Memory, ordinal: u64) -> Result<retireme
         return Err(EIO);
     }
     let cursors = memory.graph.cursors()?;
-    // Sample the private head before the logical shared head, whose membership
-    // may include other pairs. Individual completion does not require it empty.
-    let _first = memory
-        .graph
-        .queues
-        .dword(memory::JOB_LIST)?
-        .load(Ordering::Relaxed);
-    let _last = memory
-        .graph
-        .queues
-        .dword(memory::JOB_LIST + 8)?
-        .load(Ordering::Relaxed);
+    // The logical shared head, whose membership may include other pairs. Individual
+    // completion does not require it empty.
     let head = memory.context.work_head()?;
     Ok(retirement::Snapshot {
         cursors,

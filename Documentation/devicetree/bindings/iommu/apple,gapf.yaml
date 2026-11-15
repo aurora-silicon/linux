@@ -1,0 +1,42 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/iommu/apple,gapf.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple M4 base SoC global address protection filter
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  Hardware resources of the M4 base SoC global address protection filter.
+  The interface is described for discovery and must remain disabled until
+  its ownership, initialization and shutdown are supported. Register windows
+  are listed in hardware resource order; firmware configuration and tuning
+  data are supplied by the boot firmware rather than this binding.
+
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t8132-gapf
+  required:
+    - compatible
+
+properties:
+  compatible:
+    items:
+      - enum:
+          - apple,t8132-gapf
+      - const: apple,gapf
+
+  reg:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false

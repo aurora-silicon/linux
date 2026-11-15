@@ -117,7 +117,14 @@ static void dcp_afk_debugfs_root(struct platform_device *pdev, int ep, struct de
 {
 #if IS_ENABLED(CONFIG_DRM_APPLE_DEBUG)
 	struct dentry *entry = NULL;
-	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	struct apple_dcp *dcp;
+
+	/* Type-C connectors can be registered before a pipeline is routed. */
+	if (!pdev)
+		return;
+	dcp = platform_get_drvdata(pdev);
+	if (!dcp)
+		return;
 
 	switch (ep) {
 	case AV_ENDPOINT:
@@ -153,7 +160,7 @@ void apple_connector_debugfs_init(struct drm_connector *connector, struct dentry
 	switch (connector->connector_type) {
 	case DRM_MODE_CONNECTOR_DisplayPort:
 	case DRM_MODE_CONNECTOR_HDMIA:
-		dcp_afk_debugfs_root(apple_con->dcp, AV_ENDPOINT, root);
+		dcp_afk_debugfs_root(READ_ONCE(apple_con->dcp), AV_ENDPOINT, root);
 		break;
 	default:
 		break;
@@ -170,7 +177,7 @@ static void dcp_connector_set_dict(struct apple_connector *connector,
 	 * replaced, and freeing it against the connector's current DCP then
 	 * fails devres_destroy() -- one WARN and one leak per dictionary.
 	 */
-	kfree(dict->data);
+	kvfree(dict->data);
 
 	*dict = *chunks;
 }
@@ -188,7 +195,7 @@ void dcp_connector_update_dict(struct apple_connector *connector, const char *ke
 	else if (!strcmp(key, "Transport"))
 		dcp_connector_set_dict(connector, &connector->transport, chunks);
 	else
-		kfree(chunks->data);
+		kvfree(chunks->data);
 
 	chunks->data = NULL;
 	chunks->length = 0;

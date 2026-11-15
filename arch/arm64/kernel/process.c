@@ -47,6 +47,7 @@
 #include <linux/memory_ordering_model.h>
 
 #include <asm/alternative.h>
+#include <asm/apple_amx.h>
 #include <asm/apple_cpufeature.h>
 #include <asm/arch_timer.h>
 #include <asm/compat.h>
@@ -348,6 +349,7 @@ void flush_thread(void)
 void arch_release_task_struct(struct task_struct *tsk)
 {
 	fpsimd_release_task(tsk);
+	apple_amx_release(tsk);
 }
 
 int arch_dup_task_struct(struct task_struct *dst, struct task_struct *src)
@@ -380,6 +382,11 @@ int arch_dup_task_struct(struct task_struct *dst, struct task_struct *src)
 	dst->thread.sme_state = NULL;
 	clear_tsk_thread_flag(dst, TIF_SME);
 	dst->thread.svcr &= ~SVCR_ZA_MASK;
+
+#ifdef CONFIG_ARM64_APPLE_AMX
+	/* Drop the copied reference; copy_thread() makes the child its own */
+	dst->thread.amx = NULL;
+#endif
 
 	/* clear any pending asynchronous tag fault raised by the parent */
 	clear_tsk_thread_flag(dst, TIF_MTE_ASYNC_FAULT);
@@ -452,6 +459,17 @@ int copy_thread(struct task_struct *p, const struct kernel_clone_args *args)
 		if (system_has_actlr_state())
 			p->thread.actlr = read_sysreg(actlr_el1);
 #endif
+#ifdef CONFIG_ARM64_APPLE_X86_FP
+		/* The live AFPCR_EL0 is the parent's while it has EnAFP */
+		p->thread.afpcr = 0;
+		if (alternative_has_cap_unlikely(ARM64_HAS_AFP_APPLE) &&
+		    (p->thread.actlr & ACTLR_APPLE_AFP))
+			p->thread.afpcr = read_sysreg_s(SYS_IMP_APL_AFPCR_EL0);
+#endif
+
+		ret = apple_amx_copy_thread(p);
+		if (ret)
+			return ret;
 
 		if (stack_start) {
 			if (is_compat_thread(task_thread_info(p)))
@@ -773,6 +791,173 @@ int arch_prctl_mem_model_set(struct task_struct *t, unsigned long val)
 }
 #endif
 
+#ifdef CONFIG_ARM64_APPLE_X86_FLAGS
+int apple_x86_flags_get(void)
+{
+	if (!alternative_has_cap_unlikely(ARM64_HAS_APFLG_APPLE))
+		return -EINVAL;
+
+	return read_sysreg(actlr_el1) & ACTLR_APPLE_APFLG ?
+		PR_AURORA_X86_FLAGS_ON : PR_AURORA_X86_FLAGS_OFF;
+}
+
+int apple_x86_flags_set(unsigned long val)
+{
+	u64 actlr;
+
+	if (!alternative_has_cap_unlikely(ARM64_HAS_APFLG_APPLE))
+		return -EINVAL;
+	if (val != PR_AURORA_X86_FLAGS_ON && val != PR_AURORA_X86_FLAGS_OFF)
+		return -EINVAL;
+
+	/* The task switch saves the live ACTLR_EL1, so update it atomically */
+	preempt_disable();
+	actlr = read_sysreg(actlr_el1);
+	if (val == PR_AURORA_X86_FLAGS_ON) {
+		actlr |= ACTLR_APPLE_APFLG;
+		set_thread_flag(TIF_APPLE_APFLG);
+	} else {
+		actlr &= ~ACTLR_APPLE_APFLG;
+		clear_thread_flag(TIF_APPLE_APFLG);
+	}
+	write_sysreg(actlr, actlr_el1);
+	current->thread.actlr = actlr;
+	preempt_enable();
+
+	/* Start from clear flags either way; ERET loads them from here */
+	current_pt_regs()->pstate &= ~(PSR_APPLE_PF_BIT | PSR_APPLE_AF_BIT);
+	return 0;
+}
+#endif
+
+#ifdef CONFIG_ARM64_APPLE_X86_FP
+int apple_x86_fp_get(void)
+{
+	if (!alternative_has_cap_unlikely(ARM64_HAS_AFP_APPLE))
+		return -EINVAL;
+
+	return read_sysreg(actlr_el1) & ACTLR_APPLE_AFP ?
+		PR_AURORA_X86_FP_ON : PR_AURORA_X86_FP_OFF;
+}
+
+int apple_x86_fp_set(unsigned long val)
+{
+	u64 actlr, old;
+
+	if (!alternative_has_cap_unlikely(ARM64_HAS_AFP_APPLE))
+		return -EINVAL;
+	if (val != PR_AURORA_X86_FP_ON && val != PR_AURORA_X86_FP_OFF)
+		return -EINVAL;
+
+	/* The task switch saves the live ACTLR_EL1, so update it atomically */
+	preempt_disable();
+	old = read_sysreg(actlr_el1);
+	if (val == PR_AURORA_X86_FP_ON)
+		actlr = old | ACTLR_APPLE_AFP;
+	else
+		actlr = old & ~ACTLR_APPLE_AFP;
+	if (actlr != old) {
+		/* Enter or leave the mode with clear DAZ and FTZ */
+		current->thread.afpcr = 0;
+		write_sysreg_s(0, SYS_IMP_APL_AFPCR_EL0);
+		write_sysreg(actlr, actlr_el1);
+		current->thread.actlr = actlr;
+	}
+	preempt_enable();
+	return 0;
+}
+
+bool apple_afp_enabled(struct task_struct *t)
+{
+	if (!alternative_has_cap_unlikely(ARM64_HAS_AFP_APPLE))
+		return false;
+
+	return (t == current ? read_sysreg(actlr_el1) : t->thread.actlr) &
+		ACTLR_APPLE_AFP;
+}
+
+/* The live register is current's; a stopped task's copy is in thread.afpcr */
+u64 apple_afp_read_afpcr(struct task_struct *t)
+{
+	u64 afpcr;
+
+	if (t != current)
+		return t->thread.afpcr;
+
+	preempt_disable();
+	afpcr = read_sysreg_s(SYS_IMP_APL_AFPCR_EL0);
+	preempt_enable();
+	return afpcr;
+}
+
+void apple_afp_write_afpcr(struct task_struct *t, u64 afpcr)
+{
+	afpcr &= AFPCR_APPLE_DAZ | AFPCR_APPLE_FTZ;
+	if (t != current) {
+		t->thread.afpcr = afpcr;
+		return;
+	}
+
+	preempt_disable();
+	write_sysreg_s(afpcr, SYS_IMP_APL_AFPCR_EL0);
+	current->thread.afpcr = afpcr;
+	preempt_enable();
+}
+
+/*
+ * AFPCR_EL0 belongs to the thread while EnAFP is set. Save it before
+ * actlr_thread_switch() replaces ACTLR_EL1 and load the next thread's copy;
+ * a thread without EnAFP can neither read nor be affected by it.
+ */
+static void apple_afp_thread_switch(struct task_struct *next)
+{
+	if (!alternative_has_cap_unlikely(ARM64_HAS_AFP_APPLE))
+		return;
+
+	if (read_sysreg(actlr_el1) & ACTLR_APPLE_AFP)
+		current->thread.afpcr = read_sysreg_s(SYS_IMP_APL_AFPCR_EL0);
+	if (next->thread.actlr & ACTLR_APPLE_AFP)
+		write_sysreg_s(next->thread.afpcr, SYS_IMP_APL_AFPCR_EL0);
+}
+#else
+static inline void apple_afp_thread_switch(struct task_struct *next)
+{
+}
+#endif
+
+#ifdef CONFIG_ARM64_APPLE_FP_PRESERVE
+int apple_fp_preserve_get(void)
+{
+	if (!alternative_has_cap_unlikely(ARM64_HAS_PRSV_APPLE))
+		return -EINVAL;
+
+	return read_sysreg(actlr_el1) & ACTLR_APPLE_PRSV ?
+		PR_AURORA_FP_PRESERVE_ON : PR_AURORA_FP_PRESERVE_OFF;
+}
+
+int apple_fp_preserve_set(unsigned long val)
+{
+	u64 actlr;
+
+	if (!alternative_has_cap_unlikely(ARM64_HAS_PRSV_APPLE))
+		return -EINVAL;
+	if (val != PR_AURORA_FP_PRESERVE_ON && val != PR_AURORA_FP_PRESERVE_OFF)
+		return -EINVAL;
+
+	/* The task switch saves the live ACTLR_EL1, so update it atomically */
+	preempt_disable();
+	actlr = read_sysreg(actlr_el1);
+	if (val == PR_AURORA_FP_PRESERVE_ON)
+		actlr |= ACTLR_APPLE_PRSV;
+	else
+		actlr &= ~ACTLR_APPLE_PRSV;
+	write_sysreg(actlr, actlr_el1);
+	current->thread.actlr = actlr;
+	preempt_enable();
+	return 0;
+}
+#endif
+
 #ifdef CONFIG_ARM64_ACTLR_STATE
 /*
  * IMPDEF control register ACTLR_EL1 handling. Some CPUs use this to
@@ -813,7 +998,9 @@ struct task_struct *__switch_to(struct task_struct *prev,
 	ptrauth_thread_switch_user(next);
 	permission_overlay_switch(next);
 	gcs_thread_switch(next);
+	apple_afp_thread_switch(next);
 	actlr_thread_switch(next);
+	apple_amx_thread_switch(next);
 
 	/*
 	 * Complete any pending TLB or cache maintenance on this CPU in case the
@@ -968,6 +1155,19 @@ void arch_setup_new_exec(void)
 	ptrauth_thread_init_user();
 	mte_thread_init_user();
 	do_set_tsc_mode(PR_TSC_ENABLE);
+#ifdef CONFIG_ARM64_APPLE_X86_FLAGS
+	if (alternative_has_cap_unlikely(ARM64_HAS_APFLG_APPLE))
+		apple_x86_flags_set(PR_AURORA_X86_FLAGS_OFF);
+#endif
+#ifdef CONFIG_ARM64_APPLE_X86_FP
+	if (alternative_has_cap_unlikely(ARM64_HAS_AFP_APPLE))
+		apple_x86_fp_set(PR_AURORA_X86_FP_OFF);
+#endif
+#ifdef CONFIG_ARM64_APPLE_FP_PRESERVE
+	if (alternative_has_cap_unlikely(ARM64_HAS_PRSV_APPLE))
+		apple_fp_preserve_set(PR_AURORA_FP_PRESERVE_OFF);
+#endif
+	apple_amx_exec();
 
 	if (task_spec_ssb_noexec(current)) {
 		arch_prctl_spec_ctrl_set(current, PR_SPEC_STORE_BYPASS,

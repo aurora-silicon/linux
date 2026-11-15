@@ -14,16 +14,19 @@ description:
   wrapper resource contains the coprocessor control registers and mailbox
   FIFOs. A separate resource provides the coprocessor vector-base register.
   The firmware role identifies which GPU firmware instance uses the mailbox;
-  the T6040 runs a single one.
+  the T6040 runs a single one. The T6050 J775D profile describes the physical
+  GPU aperture shared by J775D and J716c; the other T6050 profiles describe
+  alias windows.
 
 properties:
   compatible:
     enum:
       - apple,t6040-ascwrap-v6
       - apple,t8140-ascwrap-v6
-      - apple,t6050-apif-ascwrap-v6
+      - apple,t8142-ascwrap-v6
       - apple,t6050-ascwrap-v6
       - apple,t6050-x1n1-ascwrap-v6
+      - apple,t6050-j775d-ascwrap-v6
 
   reg:
     items:

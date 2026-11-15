@@ -1,0 +1,49 @@
+What:           /sys/bus/platform/devices/.../dram/type
+Date:           October 2026
+Contact:        Ryan Murray <ryan@aurorasilicon.org>
+Description:
+                Read-only DRAM family from DT, currently "lpddr5". This family
+                includes LPDDR5X; the attribute does not assert the X suffix.
+                The dram group is present on an apple-pmp-report device only
+                when DT supplies a complete, consistent memory description.
+                Static attributes remain valid when firmware is stopped.
+
+What:           /sys/bus/platform/devices/.../dram/max_data_rate
+Date:           October 2026
+Contact:        Ryan Murray <ryan@aurorasilicon.org>
+Description:
+                Read-only maximum interface transfers per second per data pin
+                (divide by 1000000 for MT/s), from the highest DT OPP. This is
+                an inferred interface class, not a measured current rate or
+                a literal LPDDR5 command clock/WCK. The maximum state ID is
+                state_count minus one, independent of DT child order.
+
+What:           /sys/bus/platform/devices/.../dram/peak_bandwidth
+Date:           October 2026
+Contact:        Ryan Murray <ryan@aurorasilicon.org>
+Description:
+                Read-only inferred physical maximum in decimal bytes/second,
+                max_data_rate * data_bus_width / 8. This excludes ECC/check bits
+                and does not measure sustainable application bandwidth.
+
+What:           /sys/bus/platform/devices/.../dram/bandwidth_class
+Date:           October 2026
+Contact:        Ryan Murray <ryan@aurorasilicon.org>
+Description:
+                Read-only published maximum bandwidth class in decimal
+                bytes/second. It may be rounded relative to peak_bandwidth.
+
+What:           /sys/bus/platform/devices/.../dram/data_bus_width
+Date:           October 2026
+Contact:        Ryan Murray <ryan@aurorasilicon.org>
+Description:
+                Read-only inferred usable data width in bits, excluding ECC.
+
+What:           /sys/bus/platform/devices/.../dram/state_count
+Date:           October 2026
+Contact:        Ryan Murray <ryan@aurorasilicon.org>
+Description:
+                Read-only number of firmware DCS states, from DT. State IDs
+                are not frequencies. No current-state, current-rate, residency,
+                or transition-statistics attribute is provided without an
+                independently specified achieved-state transport.

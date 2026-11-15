@@ -120,14 +120,23 @@ class SepReadyTest(unittest.TestCase):
         else:
             self.assertNotIn("xart_guard=0", log)
 
-    def test_cold_boot_guard_blocks_matching(self):
-        # A cold-boot M1-family Mac under the default level 1: restored, but
-        # every match is refused.
+    def test_cold_boot_guard_is_unverified(self):
+        # A cold-boot Mac can now be set up under the guard, so it reports
+        # unverified like a warm-attach one.
+        self.attached(matching="unverified", xart="enabled", xart_guard="1",
+                      xart_guard_list="loaded", xart_guard_refusals="0", boot="cold")
+        rc, log = self.run_ready()
+        self.assertEqual(rc, 0, log)
+        self.assert_unverified(log)
+
+    def test_blocked_without_a_known_reason(self):
+        # An older kernel reports a guarded cold-boot Mac as blocked.
         self.attached(matching="blocked", xart="enabled", xart_guard="1",
                       xart_guard_list="loaded", xart_guard_refusals="0", boot="cold")
         rc, log = self.run_ready()
         self.assertEqual(rc, 1, log)
-        self.assert_blocked(log, "the enrolled fingerprints are restored", "cold-boot")
+        self.assert_blocked(log, "the enrolled fingerprints are restored",
+                            "refuses a match's write")
 
     def test_refusals_block_matching(self):
         self.attached(matching="blocked", xart="enabled", xart_guard="1",
@@ -159,7 +168,7 @@ class SepReadyTest(unittest.TestCase):
         self.assert_blocked(log, "no fingerprint is enrolled")
 
     def test_cold_boot_without_a_guard_is_ready(self):
-        # An M1 Pro pinned to xart_guard=0.
+        # An M1 Pro, where the guard is off by default.
         self.attached(matching="usable", xart="enabled", xart_guard="0",
                       xart_guard_list="none", xart_guard_refusals="0", boot="cold")
         rc, log = self.run_ready()

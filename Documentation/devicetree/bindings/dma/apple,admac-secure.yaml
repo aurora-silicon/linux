@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/dma/apple,admac-secure.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple secure audio DMA controller
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  The secure LEAP audio DMA controller's direct hardware aperture. It is
+  distinct from the AP-accessible channel proxy. Its register aperture is
+  not safe for the AP to access until firmware transfers ownership. The
+  node remains disabled and must not select the ordinary ADMAC driver.
+  Linux logical channel IDs alternate TX and RX; the ADT slot count is
+  per direction.
+
+allOf:
+  - $ref: dma-controller.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8140-admac-secure
+    then:
+      required:
+        - dma-channels
+        - interrupts
+        - iommus
+        - power-domains
+
+properties:
+  compatible:
+    items:
+      - enum:
+          - apple,t6050-admac-secure
+          - apple,t8140-admac-secure
+      - const: apple,admac-secure
+
+  reg:
+    maxItems: 1
+
+  '#dma-cells':
+    const: 1
+
+  dma-channels:
+    const: 18
+
+  interrupts:
+    maxItems: 1
+
+  iommus:
+    maxItems: 1
+
+  power-domains:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+  - '#dma-cells'
+
+additionalProperties: false

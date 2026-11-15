@@ -44,6 +44,13 @@ struct dcpavserv {
 	u64 terminated_epoch;
 	u64 close_epoch;
 	struct work_struct close_wq;
+	/*
+	 * An EDID read the firmware answered without data: probe again for
+	 * the instance edid_retry_epoch, a few times (dcpavserv_edid_retry()).
+	 */
+	struct delayed_work edid_retry_wq;
+	u64 edid_retry_epoch;
+	unsigned int edid_retries;
 };
 
 /* The 14.7 external role: close the AV client before the sink is released. */
@@ -56,5 +63,9 @@ bool dcpavserv_edid_service_current(struct apple_dcp *dcp, u64 epoch);
 const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp, u64 generation,
 					u64 *epoch);
 void dpavservep_detach(struct apple_dcp *dcp);
+/* Set up once with the DCP (dcp_platform_probe_pipe()). */
+int dcpavserv_edid_retry_init(struct apple_dcp *dcp);
+bool dcpavserv_edid_retry(struct apple_dcp *dcp, u64 epoch);
+void dcpavserv_edid_retry_reset(struct apple_dcp *dcp);
 
 #endif /* _DRM_APPLE_EPIC_DPAVSERV_H */

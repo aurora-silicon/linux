@@ -16,10 +16,11 @@ use crate::{
         AsahiDrmDevice, //
     },
     gem,
-    memacct,
     gpu,
+    memacct,
     mmu,
     queue,
+    queue_share,
     util::{
         align,
         align_down,
@@ -30,9 +31,10 @@ use crate::{
     }, //
 };
 use core::mem::MaybeUninit;
-use core::ops::Deref;
+use core::ops::{Deref, DerefMut};
 use core::ops::Range;
 use core::ptr::addr_of_mut;
+use core::sync::atomic::{AtomicBool, Ordering};
 use kernel::bindings;
 use kernel::dma_fence::RawDmaFence;
 use kernel::drm::gem::BaseObject;
@@ -57,6 +59,81 @@ use kernel::{
     uapi,
     xarray, //
 };
+
+// The M5 runtime's UAPI numbers. The header's values are Mesa's; the M5 queue and
+// GET_PARAMS paths use these names.
+
+/// DRM_ASAHI_BIND_SPARSE_TILE: with SINGLE_PAGE, fill the range
+/// from kernel sparse tiles (read-only: global zero tile; writable: per-VM
+/// sink) instead of the GEM's first page. The GEM only anchors the GPUVA.
+pub(crate) const DRM_ASAHI_BIND_SPARSE_TILE: u32 = uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_SPARSE_TILE;
+/// DRM_ASAHI_FEATURE_SPARSE_TILES: BIND_SPARSE_TILE accepted.
+pub(crate) const DRM_ASAHI_FEATURE_SPARSE_TILES: u64 =
+    uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SPARSE_TILES as u64;
+pub(crate) const DRM_ASAHI_FEATURE_COMPUTE_MATRIX: u64 =
+    uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE_MATRIX as u64;
+/// DRM_ASAHI_FEATURE_TASK_MESH_STORAGE: render programs accept
+/// DRM_ASAHI_RENDER_PROGRAM_TASK and such task (object-stage) kicks get the
+/// TA mesh rendering buffer, which backs the object stage's payload address.
+/// Reported only while m5_mesh_storage_chunks != 0.
+pub(crate) const DRM_ASAHI_FEATURE_TASK_MESH_STORAGE: u64 =
+    uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_TASK_MESH_STORAGE as u64;
+pub(crate) const DRM_ASAHI_FEATURE_RENDER_SHADER_WRITES: u64 =
+    uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_SHADER_WRITES as u64;
+/// D32 2x/4x ZLS admission; no compressed stencil or resolve bits.
+pub(crate) const DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION: u64 =
+    uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_M5_DEPTH_MSAA_COMPRESSION as u64;
+/// DRM_ASAHI_FEATURE_M5_STENCIL_MSAA_COMPRESSION: single-layer
+/// 2x/4x ZLS admission in the compressed Z/S form, stencil included.
+pub(crate) const DRM_ASAHI_FEATURE_M5_STENCIL_MSAA_COMPRESSION: u64 =
+    uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_M5_STENCIL_MSAA_COMPRESSION as u64;
+#[allow(dead_code)]
+pub(crate) const DRM_ASAHI_RENDER_SHADER_WRITES: u32 =
+    uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_SHADER_WRITES;
+/// Renders may carry separate tiling prefixes of both subqueues
+/// (DRM_ASAHI_RENDER_STAGE_PREFIXES), as the complete struct drm_asahi_cmd_render_m5.
+pub(crate) const DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2: u64 =
+    uapi::DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2 as u64;
+/// Compute commands may declare a stream that ends with a memory-scoped flush
+/// (DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION).
+pub(crate) const DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION: u64 =
+    uapi::DRM_ASAHI_FEATURE_COMPUTE_VISIBLE_COMPLETION as u64;
+/// The compute command's writes are visible when it completes, so another queue's compute
+/// command may wait for it in firmware.
+pub(crate) const DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION: u32 =
+    uapi::drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_VISIBLE_COMPLETION as u32;
+/// Queues take a watchdog allowance for their compute commands
+/// (`drm_asahi_queue_create::compute_timeout_ms`).
+pub(crate) const DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT: u64 =
+    uapi::DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT as u64;
+/// The tiling half waits only on the render and compute prefixes of the command's stage-prefix
+/// fields, its fragment half on the whole ones.
+#[allow(dead_code)]
+pub(crate) const DRM_ASAHI_RENDER_STAGE_PREFIXES: u32 =
+    uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_STAGE_PREFIXES;
+/// Renders may declare that they write whole attachments only
+/// (DRM_ASAHI_RENDER_WHOLE_ATTACHMENTS).
+pub(crate) const DRM_ASAHI_FEATURE_WHOLE_ATTACHMENT_RENDERS: u64 =
+    uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_WHOLE_ATTACHMENT_RENDERS as u64;
+/// The render area covers every attachment's full extent, so its tile stores
+/// write no pixel outside it: an overlap with another such render without an
+/// ordering dependency is the application's own race.
+#[allow(dead_code)]
+pub(crate) const DRM_ASAHI_RENDER_WHOLE_ATTACHMENTS: u32 =
+    uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_WHOLE_ATTACHMENTS;
+/// DRM_ASAHI_RENDER_PROGRAM_TASK, only with DRM_ASAHI_RENDER_PROGRAM_OBJECT: the object
+/// program is an API task stage.
+pub(crate) const DRM_ASAHI_RENDER_PROGRAM_TASK: u32 = uapi::DRM_ASAHI_RENDER_PROGRAM_TASK;
+/// Bit 16, as Mesa defines it.
+#[allow(dead_code)]
+pub(crate) const DRM_ASAHI_COMPUTE_USES_MATRIX: u32 =
+    uapi::drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_USES_MATRIX as u32;
+/// The compute command neither copies nor resets queries, so it cannot observe
+/// timestamps the host publishes after earlier commands complete
+/// (DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS). Accepted, and reported with
+/// DRM_ASAHI_FEATURE_COMPUTE_NO_QUERY_ACCESS by the M5 command set.
+pub(crate) const DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS: u32 =
+    uapi::drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_NO_QUERY_ACCESS as u32;
 
 const DEBUG_CLASS: DebugFlags = DebugFlags::File;
 
@@ -132,11 +209,16 @@ pub(crate) struct SyncItem {
 }
 
 impl SyncItem {
-    fn parse_one(file: &DrmFile, mut data: uapi::drm_asahi_sync, out: bool,
-        bundled: bool) -> Result<SyncItem>
-    {
+    fn parse_one(
+        file: &DrmFile,
+        mut data: uapi::drm_asahi_sync,
+        out: bool,
+        bundled: bool,
+    ) -> Result<SyncItem> {
         if data.sync_type == crate::g17::sync_output::SYNC_CUMULATIVE {
-            if !out || !bundled || data.timeline_value == 0 { return Err(EINVAL); }
+            if !out || !bundled || data.timeline_value == 0 {
+                return Err(EINVAL);
+            }
             data.sync_type = uapi::drm_asahi_sync_type_DRM_ASAHI_SYNC_TIMELINE_SYNCOBJ;
         }
         match data.sync_type {
@@ -210,15 +292,15 @@ impl SyncItem {
         let mut vec = KVec::with_capacity(count as usize, GFP_KERNEL)?;
         let mut anchor = None;
 
-        // SAFETY: We only read this once, so there are no TOCTOU issues.
-        let mut reader = UserSlice::new(UserPtr::from_addr(ptr as _), size).reader();
+        // Read each record once so validation and use see the same retained bytes.
+        let mut reader = UserSlice::new(UserPtr::from_addr(ptr as usize), size).reader();
 
         for i in 0..count {
             let mut sync: MaybeUninit<uapi::drm_asahi_sync> = MaybeUninit::uninit();
 
             // SAFETY: The size of `sync` is STRIDE
             reader.read_raw(unsafe {
-                core::slice::from_raw_parts_mut(sync.as_mut_ptr() as *mut MaybeUninit<u8>, STRIDE)
+                core::slice::from_raw_parts_mut(sync.as_mut_ptr().cast::<MaybeUninit<u8>>(), STRIDE)
             })?;
 
             // SAFETY: All bit patterns in the struct are valid
@@ -230,12 +312,16 @@ impl SyncItem {
                 }
                 anchor = Some(i as usize);
             }
-            vec.push(Self::parse_one(file, sync, i >= in_count,
-                allow_cumulative)?, GFP_KERNEL)?;
+            vec.push(
+                Self::parse_one(file, sync, i >= in_count, allow_cumulative)?,
+                GFP_KERNEL,
+            )?;
         }
         if let Some(anchor) = anchor {
             let bundle = crate::g17::sync_output::SignalBundle::new(
-                &vec[in_count as usize..], anchor - in_count as usize)?;
+                &vec[in_count as usize..],
+                anchor - in_count as usize,
+            )?;
             vec[anchor].cumulative = Some(bundle);
         } else {
             for sync in &mut vec[in_count as usize..] {
@@ -254,20 +340,52 @@ pub(crate) enum Object {
     TimestampBuffer(Arc<crate::timestamp::Buffer>),
 }
 
+/// A queue in a file's table. Its count in the creating process's share of the device's
+/// queues is given back once the queue itself is gone.
+pub(crate) struct TableQueue {
+    queue: KBox<dyn queue::Queue>,
+    _share: Option<queue_share::Share>,
+}
+
+impl Deref for TableQueue {
+    type Target = dyn queue::Queue;
+
+    fn deref(&self) -> &Self::Target {
+        &*self.queue
+    }
+}
+
+impl DerefMut for TableQueue {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut *self.queue
+    }
+}
+
 /// State associated with a client.
 // #[pin_data]
 pub(crate) struct File {
     id: u64,
     /// Available VM range for the user
     user_range: Range<u64>,
+    // Fields drop in order: the queues go first, so that a closing client's submitted work
+    // can finish before its VMs unmap the user ranges.
+    // #[pin]
+    queues: xarray::XArray<Arc<Mutex<TableQueue>>>,
     // #[pin]
     vms: xarray::XArray<KBox<Vm>>,
-    // #[pin]
-    queues: xarray::XArray<Arc<Mutex<KBox<dyn queue::Queue>>>>,
     // #[pin]
     objects: xarray::XArray<KBox<Object>>,
     /// GPU memory this client created and holds.
     mem: Arc<memacct::Client>,
+    /// Completed engine time, retained by queues after handle destruction.
+    usage: Arc<crate::usage::Client>,
+    /// Largest size this file has asked GET_PARAMS for the global parameters with
+    /// ([`gpu::Gpu::admit_vm`]).
+    params_size: core::sync::atomic::AtomicU64,
+    /// The device's statistics, for the GPU frequency in fdinfo.
+    stats: Option<Arc<crate::stats::StatsSnapshot>>,
+    /// An exiting task's close of this file began ([`File::close_on_exit`]).
+    drained: AtomicBool,
 }
 
 /// Convenience type alias for our DRM `File` type.
@@ -288,9 +406,11 @@ impl drm::file::DriverFile for File {
             let id = gpu.ids().file.next();
             let user_range = gpu.user_range();
             let mem = memacct::Client::new()?;
+            let usage = Arc::new(crate::usage::Client::new(), GFP_KERNEL)?;
+            let stats = gpu.stats_snapshot();
 
             mod_dev_dbg!(device, "[File {}]: DRM device opened\n", id);
-            KBox::pin_init(File::new(id, user_range, mem), GFP_KERNEL)
+            KBox::pin_init(File::new(id, user_range, mem, usage, stats), GFP_KERNEL)
         })
     }
 
@@ -302,6 +422,22 @@ impl drm::file::DriverFile for File {
             resident: Some(self.mem.resident()),
             ..Default::default()
         })
+    }
+
+    fn engine_stats(&self, mut emit: impl FnMut(&CStr, u64)) {
+        let names = [
+            kernel::c_str!("vertex"),
+            kernel::c_str!("fragment"),
+            kernel::c_str!("compute"),
+        ];
+        for (name, ns) in names.into_iter().zip(self.usage.snapshot()) {
+            emit(name, ns);
+        }
+    }
+
+    /// One clock drives every engine.
+    fn engine_frequency(&self) -> Option<(Option<u64>, u64)> {
+        self.stats.as_ref()?.engine_frequency()
     }
 
     fn as_raw(&self) -> *mut bindings::drm_file {
@@ -317,7 +453,12 @@ impl File {
         id: u64,
         user_range: Range<u64>,
         mem: Arc<memacct::Client>,
+        usage: Arc<crate::usage::Client>,
+        stats: Option<Arc<crate::stats::StatsSnapshot>>,
     ) -> impl PinInit<Self, Error> {
+        // SAFETY: The initializer supplies aligned, pinned storage for Self.
+        // XArray::new is infallible; each pinned array is initialized in place,
+        // then every remaining field is written before returning success.
         unsafe {
             pin_init::pin_init_from_closure(move |slot: *mut Self| {
                 let raw_vms = addr_of_mut!((*slot).vms);
@@ -329,7 +470,7 @@ impl File {
                 let raw_queues = addr_of_mut!((*slot).queues);
                 pin_init::raw_try_init(
                     raw_queues,
-                    xarray::XArray::<Arc<Mutex<KBox<dyn queue::Queue>>>>::new(
+                    xarray::XArray::<Arc<Mutex<TableQueue>>>::new(
                         xarray::AllocKind::Alloc1,
                     ),
                 )?;
@@ -343,6 +484,10 @@ impl File {
                 (*slot).id = id;
                 (*slot).user_range = user_range;
                 addr_of_mut!((*slot).mem).write(mem);
+                addr_of_mut!((*slot).usage).write(usage);
+                addr_of_mut!((*slot).params_size).write(core::sync::atomic::AtomicU64::new(0));
+                addr_of_mut!((*slot).stats).write(stats);
+                addr_of_mut!((*slot).drained).write(AtomicBool::new(false));
                 Ok(())
             })
         }
@@ -355,7 +500,7 @@ impl File {
     }
 
     #[allow(clippy::type_complexity)]
-    fn queues(self: Pin<&Self>) -> Pin<&xarray::XArray<Arc<Mutex<KBox<dyn queue::Queue>>>>> {
+    fn queues(self: Pin<&Self>) -> Pin<&xarray::XArray<Arc<Mutex<TableQueue>>>> {
         // SAFETY: Structural pinned projection for queues.
         // We never move out of this field.
         unsafe { self.map_unchecked(|s| &s.queues) }
@@ -434,18 +579,27 @@ impl File {
         gpu.get_params(&mut params)?;
 
         params.features |= gpu.feature_flags();
+        if Self::supports_user_memory(reg_data) {
+            params.features |= uapi::DRM_ASAHI_FEATURE_USERPTR as u64;
+        }
+        if Self::supports_residency_control(reg_data) {
+            params.features |= uapi::DRM_ASAHI_FEATURE_GEM_RESIDENCY as u64;
+        }
 
         let size = core::mem::size_of::<uapi::drm_asahi_params_global>().min(data.size.try_into()?);
 
-        // SAFETY: We only write to this userptr once, so there are no TOCTOU issues.
+        // Write the retained result to this user slice once.
         let mut params_writer =
             UserSlice::new(UserPtr::from_addr(data.pointer as usize), size).writer();
 
         // SAFETY: `size` is at most the sizeof of `params`
         params_writer.write_slice(unsafe {
-            core::slice::from_raw_parts(&params as *const _ as *const u8, size)
+            core::slice::from_raw_parts(core::ptr::from_ref(&params).cast::<u8>(), size)
         })?;
 
+        file.inner()
+            .params_size
+            .fetch_max(data.size, core::sync::atomic::Ordering::Relaxed);
         Ok(0)
     }
 
@@ -517,6 +671,13 @@ impl File {
             // Every other runtime here reports DRM_ASAHI_GPU_HAL_LEGACY.
             return Err(EINVAL);
         }
+        reg_data.gpu.admit_vm(
+            device.as_ref().as_ref(),
+            file.inner()
+                .params_size
+                .load(core::sync::atomic::Ordering::Relaxed),
+            data.flags,
+        )?;
 
         let kernel_range = data.kernel_start..data.kernel_end;
         let user_range = file.inner().user_range.clone();
@@ -541,7 +702,9 @@ impl File {
 
         let gpu = &reg_data.gpu;
         let file_id = file.inner().id;
-        let vm = gpu.new_vm_for_file(kernel_range.clone(), file_id)?;
+        let vm = gpu
+            .new_vm_for_file(kernel_range.clone(), file_id)?
+            .with_memory_client(file.inner().mem.clone());
         // G16 registers a retained backend owner before returning this VM. Any later
         // allocation can fail before file::Vm exists to run its normal close path.
         let failed_vm = ScopeGuard::new_with_data(
@@ -613,7 +776,7 @@ impl File {
         }
         let dummy_mapping = dummy_obj.map_at(
             &vm,
-            gpu.uat_geometry().unk_page(),
+            gpu.unknown_page(),
             mmu::PROT_GPU_SHARED_RW,
             true,
         )?;
@@ -698,22 +861,29 @@ impl File {
         };
 
         let size = gem::checked_object_size(data.size.try_into()?)?;
-        let commit = memacct::LEDGER.admit(&file.inner().mem, size as u64).inspect_err(|_| {
-            cls_pr_debug!(
-                Errors,
-                "gem_create: {:#x} bytes refused by the GPU memory limits\n",
-                size
-            );
-        })?;
+        let commit = memacct::LEDGER
+            .admit(&file.inner().mem, size as u64)
+            .inspect_err(|_| {
+                cls_pr_debug!(
+                    Errors,
+                    "gem_create: {:#x} bytes refused by the GPU memory limits\n",
+                    size
+                );
+            })?;
         // Large G17 user objects are populated in full by the first VM_BIND.
-        // Do not multiply direct reclaim/compaction latency by their folio
-        // count. Userspace can evict its BO cache and retry after ENOMEM.
-        let pages_no_reclaim = gem::user_pages_no_reclaim(
-            size,
-            reg_data.gpu.as_any().is::<crate::g17::Gpu>(),
-        );
+        // Let them release clean page cache, but do not swap out the rest of
+        // the system for them folio by folio. Userspace can evict its BO
+        // cache and retry after ENOMEM.
+        let pages_bounded_reclaim =
+            gem::user_pages_bounded_reclaim(size, reg_data.gpu.as_any().is::<crate::g17::Gpu>());
         let gem = gem::new_object(
-            device, size, data.flags, resv_obj, reclaim_cpu, pages_no_reclaim, commit,
+            device,
+            size,
+            data.flags,
+            resv_obj,
+            reclaim_cpu,
+            pages_bounded_reclaim,
+            commit,
         )?;
         if reg_data.gpu.prepare_new_objects() {
             #[cfg(CONFIG_DRM_ASAHI_G15)]
@@ -747,6 +917,131 @@ impl File {
         Ok(0)
     }
 
+    /// Whether this GPU takes objects over user memory (DRM_IOCTL_ASAHI_GEM_USERPTR).
+    ///
+    /// The bindings of G17 user VMs are the only ones that admit such an object's pages. They
+    /// are GPU-only page-table entries, and the GPU's accesses through those are taken to be
+    /// coherent with the CPU caches, as they are for the cacheable CPU mappings of ordinary
+    /// objects (DRM_ASAHI_GEM_WRITEBACK): see `gem::new_user_memory_object()`.
+    fn supports_user_memory(reg_data: &driver::AsahiDrmRegistrationData<'_>) -> bool {
+        reg_data.gpu.as_any().is::<crate::g17::Gpu>()
+    }
+
+    /// IOCTL: gem_userptr: Create a GEM object over the caller's own memory.
+    pub(crate) fn gem_userptr(
+        device: &AsahiDrmDevice,
+        reg_data: &driver::AsahiDrmRegistrationData<'_>,
+        data: &mut uapi::drm_asahi_gem_userptr,
+        file: &DrmFile,
+    ) -> Result<u32> {
+        mod_dev_dbg!(
+            device,
+            "[File {}]: IOCTL: gem_userptr addr={:#x} size={:#x}\n",
+            file.inner().id,
+            data.userptr,
+            data.size
+        );
+
+        if !Self::supports_user_memory(reg_data) {
+            return Err(EOPNOTSUPP);
+        }
+        let private = data.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0;
+        if data.flags
+            & !(uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE
+                | uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_USERPTR_READ_ONLY)
+            != 0
+            || (!private && data.vm_id != 0)
+            || data.pad != 0
+            || data.size == 0
+            || (data.userptr | data.size) & (mmu::UAT_PGMSK | (kernel::page::PAGE_SIZE - 1)) as u64
+                != 0
+        {
+            cls_pr_debug!(Errors, "gem_userptr: Invalid arguments\n");
+            return Err(EINVAL);
+        }
+        let addr = usize::try_from(data.userptr)?;
+        let size = gem::checked_object_size(data.size.try_into()?)?;
+        let writable = data.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_USERPTR_READ_ONLY == 0;
+
+        let resv_gem;
+        let resv_obj = if private {
+            let vms = file.inner().vms();
+            let vms = vms.lock();
+            resv_gem = vms
+                .get(data.vm_id.try_into()?)
+                .ok_or(ENOENT)?
+                .vm
+                .get_resv_obj();
+            Some(resv_gem.deref())
+        } else {
+            None
+        };
+
+        let commit = memacct::LEDGER
+            .admit(&file.inner().mem, size as u64)
+            .inspect_err(|_| {
+                cls_pr_debug!(
+                    Errors,
+                    "gem_userptr: {:#x} bytes refused by the GPU memory limits\n",
+                    size
+                );
+            })?;
+        let pages = gem::UserPages::pin(addr, size, writable).inspect_err(|e| {
+            cls_pr_debug!(Errors, "gem_userptr: pinning failed: {:?}\n", e);
+        })?;
+        let registered = device.registration_guard().ok_or(ENODEV)?;
+        let parent: &kernel::platform::Device<kernel::device::Bound> = registered.as_ref();
+        let gem = gem::new_user_memory_object(
+            device,
+            parent.as_ref(),
+            pages,
+            data.flags,
+            resv_obj,
+            commit,
+        )?;
+        drop(registered);
+
+        data.handle = gem.create_handle(file)?;
+
+        mod_dev_dbg!(
+            device,
+            "[File {}]: IOCTL: gem_userptr size={:#x} handle={:#x?}\n",
+            file.inner().id,
+            size,
+            data.handle
+        );
+
+        Ok(0)
+    }
+
+    /// Whether this GPU takes residency requests (DRM_IOCTL_ASAHI_GEM_RESIDENCY): only G17 user
+    /// VMs release idle memory under pressure.
+    fn supports_residency_control(reg_data: &driver::AsahiDrmRegistrationData<'_>) -> bool {
+        reg_data.gpu.as_any().is::<crate::g17::Gpu>()
+    }
+
+    /// IOCTL: gem_residency: Keep an object's memory resident, or return it to the default
+    /// policy.
+    pub(crate) fn gem_residency(
+        _device: &AsahiDrmDevice,
+        reg_data: &driver::AsahiDrmRegistrationData<'_>,
+        data: &mut uapi::drm_asahi_gem_residency,
+        file: &DrmFile,
+    ) -> Result<u32> {
+        if !Self::supports_residency_control(reg_data) {
+            return Err(EOPNOTSUPP);
+        }
+        if data.flags & !uapi::drm_asahi_gem_residency_flags_DRM_ASAHI_GEM_RESIDENCY_KEEP != 0 {
+            return Err(EINVAL);
+        }
+        let gem = gem::Object::lookup_handle(file, data.handle)?;
+        gem::set_keep_resident(
+            &gem,
+            data.flags & uapi::drm_asahi_gem_residency_flags_DRM_ASAHI_GEM_RESIDENCY_KEEP != 0,
+        )?;
+        Ok(0)
+    }
+
     /// IOCTL: gem_mmap_offset: Assign an mmap offset to a GEM object.
     pub(crate) fn gem_mmap_offset(
         device: &AsahiDrmDevice,
@@ -767,6 +1062,10 @@ impl File {
         }
 
         let gem = gem::Object::lookup_handle(file, data.handle)?;
+        // The caller maps a user-memory object's memory itself.
+        if gem.is_user_memory() {
+            return Err(EINVAL);
+        }
         data.offset = gem.create_mmap_offset()?;
         Ok(0)
     }
@@ -891,11 +1190,13 @@ impl File {
             if op.flags
                 & !(uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_READ
                     | uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_WRITE
-                    | uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_SINGLE_PAGE)
+                    | uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_SINGLE_PAGE
+                    | DRM_ASAHI_BIND_SPARSE_TILE)
                 != 0
             {
                 return Err(EINVAL);
             }
+            let sparse_tile = op.flags & DRM_ASAHI_BIND_SPARSE_TILE != 0;
             let read = op.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_READ != 0;
             let write = op.flags & uapi::drm_asahi_bind_flags_DRM_ASAHI_BIND_WRITE != 0;
             let prot = match (read, write) {
@@ -922,6 +1223,7 @@ impl File {
                 op.offset,
                 prot,
                 single_page,
+                sparse_tile,
             )?)?;
         }
         vm.reserve_deferred_user_unmaps(unmaps)?;
@@ -1117,7 +1419,69 @@ impl File {
         Ok(0)
     }
 
+    /// Runs once, at the first GEM handle close of an exiting task's file.
+    ///
+    /// Handles close through GEM_CLOSE, which an exiting task cannot issue, or when the file is
+    /// released, so an exiting task here is releasing the file.
+    ///
+    /// Such a file closes its GEM handles before the driver sees it go. The client is gone:
+    /// its G17 VMs are marked closed first, as `File::drop` does, so work that fails once an
+    /// object leaves is unobserved teardown. Closing a handle also unmaps the object at
+    /// once from VMs that do not track jobs (G13/G14), where work left running would fault,
+    /// so the queues are drained. A live client unmaps only what its work no longer uses.
+    fn close_on_exit(file: &DrmFile) {
+        // SAFETY: `current` is valid for the running task.
+        let exiting =
+            unsafe { (*kernel::task::Task::current_raw()).flags } & bindings::PF_EXITING != 0;
+        if !exiting || file.inner().drained.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // M5 VMs keep their mark at file close.
+        Self::mark_clients_closed(file.inner(), |vm| {
+            vm.gpu.as_any().is::<crate::g17::Gpu>() && !vm.vm.is_m5()
+        });
+        let mut index = 0;
+        loop {
+            // Clone since we can't hold the xarray spinlock while waiting.
+            let Some((idx, queue)) =
+                file.inner()
+                    .queues()
+                    .find(index, usize::MAX)
+                    .map(|(idx, guard)| {
+                        let queue: Arc<Mutex<TableQueue>> = guard.borrow().into();
+                        (idx, queue)
+                    })
+            else {
+                break;
+            };
+            queue.lock().drain();
+            if idx == usize::MAX {
+                break;
+            }
+            index = idx + 1;
+        }
+    }
+
+    /// Tells the status of each VM `which` selects that its client is gone: nobody sees the
+    /// failures of the client's remaining work any more.
+    fn mark_clients_closed(this: Pin<&Self>, which: impl Fn(&Vm) -> bool) {
+        let mut index = 0;
+        while let Some((idx, entry)) = this.vms().find(index, usize::MAX) {
+            let vm: &Vm = entry.borrow();
+            if which(vm) {
+                if let Some(status) = vm.vm.status() {
+                    status.mark_client_closed();
+                }
+            }
+            if idx == usize::MAX {
+                break;
+            }
+            index = idx + 1;
+        }
+    }
+
     pub(crate) fn unbind_gem_object(file: &DrmFile, bo: &gem::Object) -> Result {
+        Self::close_on_exit(file);
         // TODO: use iter()
         let mut index = 0;
         loop {
@@ -1291,6 +1655,10 @@ impl File {
             data.flags,
         );
 
+        if data.pad != 0 {
+            cls_pr_debug!(Errors, "queue_create: Invalid arguments\n");
+            return Err(EINVAL);
+        }
         if data.flags != 0 || data.priority > uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_REALTIME {
             cls_pr_debug!(Errors, "queue_create: Invalid arguments\n");
             return Err(EINVAL);
@@ -1302,22 +1670,43 @@ impl File {
             cls_pr_debug!(Errors, "queue_create: Invalid priority\n");
             return Err(EINVAL);
         }
-        // HIGH has only been run on G17; G13 and G14 keep refusing it.
+        // Keep support tied to a backend and admitted profile. G13/G14 and
+        // unqualified M3 profiles retain their previous rejection.
+        let high_supported = reg_data.gpu.as_any().is::<crate::g17::Gpu>();
+        #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+        let high_supported = high_supported || reg_data.gpu.as_any()
+            .downcast_ref::<crate::m3::m3_drm::Backend>()
+            .is_some_and(|gpu| gpu.supports_high_priority());
         if data.priority == uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_HIGH
-            && !reg_data.gpu.as_any().is::<crate::g17::Gpu>()
+            && !high_supported
         {
-            cls_pr_debug!(Errors, "queue_create: HIGH priority is not supported on this GPU\n");
+            cls_pr_debug!(
+                Errors,
+                "queue_create: HIGH priority is not supported on this GPU\n"
+            );
             return Err(EINVAL);
         }
-        // SAFETY: capable() only reads the calling task's credentials (ioctl process context).
         if data.priority == uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_HIGH
-            && !unsafe { bindings::capable(bindings::CAP_SYS_NICE as _) }
+            // SAFETY: capable() reads the current ioctl task's credentials.
+            && !unsafe { bindings::capable(bindings::CAP_SYS_NICE as i32) }
             && !file.is_current_master()
         {
-            cls_pr_debug!(Errors, "queue_create: HIGH priority needs CAP_SYS_NICE or DRM master\n");
+            cls_pr_debug!(
+                Errors,
+                "queue_create: HIGH priority needs CAP_SYS_NICE or DRM master\n"
+            );
             return Err(EACCES);
         }
 
+        // The queue counts against the creating process's share of the device's independent
+        // queues, whichever of its files it is created on, so no process can take every
+        // execution context and leave the others, the compositor included, unable to create
+        // one (see [`queue_share`]); a refusal fails with EBUSY.
+        let share = reg_data
+            .gpu
+            .queue_limits()
+            .map(|limits| queue_share::Share::take_current(limits.max_queues))
+            .transpose()?;
         let queues_xa = file.inner().queues();
         let resv = queues_xa.lock().reserve_limit(1..=u32::MAX, GFP_KERNEL)?;
         let vms_xa = file.inner().vms();
@@ -1337,12 +1726,22 @@ impl File {
             // TODO: Plumb deeper the enum
             uapi::drm_asahi_priority_DRM_ASAHI_PRIORITY_REALTIME - data.priority,
             data.usc_exec_base,
+            file.inner().usage.clone(),
         )?;
 
         queue.reserve_render_scs(data.render_scs_layout)?;
+        if data.compute_timeout_ms != 0 {
+            data.compute_timeout_ms = queue.set_compute_timeout(data.compute_timeout_ms)?;
+        }
 
         data.queue_id = resv.index().try_into()?;
-        resv.fill(Arc::pin_init(new_mutex!(queue), GFP_KERNEL)?)?;
+        resv.fill(Arc::pin_init(
+            new_mutex!(TableQueue {
+                queue,
+                _share: share,
+            }),
+            GFP_KERNEL,
+        )?)?;
 
         Ok(0)
     }
@@ -1386,7 +1785,7 @@ impl File {
         }
 
         // Upgrade to Arc<T> to drop the XArray lock early
-        let queue: Arc<Mutex<KBox<dyn queue::Queue>>> = file
+        let queue: Arc<Mutex<TableQueue>> = file
             .inner()
             .queues()
             .lock()
@@ -1425,9 +1824,13 @@ impl File {
         if guarded {
             copy_commands(&mut vec)?;
         }
-        let syncs =
-            SyncItem::parse_array(file, data.syncs, data.in_sync_count, data.out_sync_count,
-                gpu.as_any().is::<crate::g17::Gpu>())?;
+        let syncs = SyncItem::parse_array(
+            file,
+            data.syncs,
+            data.in_sync_count,
+            data.out_sync_count,
+            gpu.as_any().is::<crate::g17::Gpu>(),
+        )?;
 
         mod_dev_dbg!(
             device,
@@ -1516,5 +1919,11 @@ impl File {
 impl Drop for File {
     fn drop(&mut self) {
         mod_pr_debug!("[File {}]: Closing...\n", self.id);
+        // The queues drop before the VMs (see the field order), and destroying a queue fails
+        // its queued work with ENOENT or ECANCELED. Nobody sees those any more: the client
+        // closed its file. Say so before any queue goes, as a VM handle closed first did.
+        // SAFETY: `drop` runs on the pinned file in place, and nothing here moves it.
+        let this = unsafe { Pin::new_unchecked(&*self) };
+        Self::mark_clients_closed(this, |_| true);
     }
 }

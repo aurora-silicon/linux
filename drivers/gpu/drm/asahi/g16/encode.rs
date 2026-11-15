@@ -118,23 +118,27 @@ impl Geometry {
     /// The geometry of render `u` with layer metadata at `heap`. The render was validated
     /// (width, height, layers >= 1, samples 1, 2 or 4, utiles 16 or 32).
     pub(crate) fn new(u: &uapi::drm_asahi_cmd_render, heap: u64) -> Self {
-        let (w, h, l) = (u.width_px as u32, u.height_px as u32, u.layers as u32);
+        let (w, h, l) = (
+            u32::from(u.width_px),
+            u32::from(u.height_px),
+            u32::from(u.layers),
+        );
         let empty =
             u.flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES != 0;
-        let log2s = (u.samples as u32).max(1).ilog2();
+        let log2s = u32::from(u.samples).max(1).ilog2();
         let mut g = Geometry::default();
 
-        g.tx = div_round_up(w as u64, 32) as u32;
-        g.ty = div_round_up(h as u64, 32) as u32;
-        g.bx = align(div_round_up(g.tx as u64, 4), 4) as u32;
-        g.by = align(div_round_up(g.ty as u64, 4), 4) as u32;
+        g.tx = div_round_up(u64::from(w), 32) as u32;
+        g.ty = div_round_up(u64::from(h), 32) as u32;
+        g.bx = align(div_round_up(u64::from(g.tx), 4), 4) as u32;
+        g.by = align(div_round_up(u64::from(g.ty), 4), 4) as u32;
         g.sx = g.bx * if u.utile_width_px == 16 { 2 } else { 1 };
         g.sy = g.by * if u.utile_height_px == 16 { 2 } else { 1 };
-        g.e = (4 * g.sx as u64) * (4 * g.sy as u64);
+        g.e = (4 * u64::from(g.sx)) * (4 * u64::from(g.sy));
         g.pixels = w.wrapping_sub(1) | h.wrapping_sub(1) << 16;
         g.screen = g.tx.wrapping_sub(1) | g.ty.wrapping_sub(1) << 12;
-        g.x_blocks = (g.bx as u64) << 10 | (g.bx as u64) << 18 | 3 * g.bx as u64;
-        g.y_blocks = (g.by as u64) << 18 | (g.by as u64) << 10 | 3 * g.by as u64;
+        g.x_blocks = u64::from(g.bx) << 10 | u64::from(g.bx) << 18 | (3 * u64::from(g.bx));
+        g.y_blocks = u64::from(g.by) << 18 | u64::from(g.by) << 10 | (3 * u64::from(g.by));
         g.blocks = g.bx * g.by;
         g.tiles = g.tx * g.ty;
         g.region_stride = (5 * g.e / 64) as u32;
@@ -151,8 +155,8 @@ impl Geometry {
             0x4000
         };
         g.utile_config = utile_w | utile_h | log2s;
-        g.tilemap_bytes = align(5 * g.e * l as u64, 0x1000);
-        g.tpc_bytes = g.e * 8 * l as u64;
+        g.tilemap_bytes = align(5 * g.e * u64::from(l), 0x1000);
+        g.tpc_bytes = g.e * 8 * u64::from(l);
         g.layer_metadata = heap + if l > 1 { 0x200 } else { 0 };
         g.layer_mode = if l == 1 {
             0x8000
@@ -160,21 +164,21 @@ impl Geometry {
             0xc000 | (if empty { 0x2000 } else { 0x1000 }) | l.wrapping_sub(1)
         };
         g.tilebuffer_control = div_round_up(
-            u.sample_size_B as u64
-                * u.utile_width_px as u64
-                * u.utile_height_px as u64
-                * u.samples as u64,
+            u64::from(u.sample_size_B)
+                * u64::from(u.utile_width_px)
+                * u64::from(u.utile_height_px)
+                * u64::from(u.samples),
             2048,
         ) as u32
             | log2s << 17;
-        g.tile_mode = 0x280 | (l > 1) as u32 | if empty { 1 << 16 } else { 0 };
+        g.tile_mode = 0x280 | u32::from(l > 1) | if empty { 1 << 16 } else { 0 };
         g.isp_control = 0xc000 | (u.flags & (1 << 18));
         g.native_tiles = 0x3717fu64
-            | ((l > 1) as u64) << 32
-            | (g.tx.wrapping_sub(1) as u64) << 44
-            | (g.ty.wrapping_sub(1) as u64) << 53
+            | u64::from(l > 1) << 32
+            | u64::from(g.tx.wrapping_sub(1)) << 44
+            | u64::from(g.ty.wrapping_sub(1)) << 53
             | 137438953472u64
-            | ((g.utile_config & 0xf000) as u64) << 28;
+            | u64::from(g.utile_config & 0xf000) << 28;
         g
     }
 }
@@ -223,7 +227,7 @@ pub(crate) fn cluster_eligible(_u: &uapi::drm_asahi_cmd_render, _geo: &Geometry)
 
 /// Program address.
 pub(crate) fn prog_addr(usc_base: u64, p: &uapi::drm_asahi_bg_eot) -> u64 {
-    usc_base.wrapping_add((p.usc & !63) as u64)
+    usc_base.wrapping_add(u64::from(p.usc & !63))
 }
 
 /// Program resource word, 64-bit with RSRC_SPEC_HI.
@@ -233,9 +237,9 @@ pub(crate) fn prog_rsrc(
     hi: u32,
 ) -> u64 {
     if u.flags & uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_RSRC_SPEC_HI != 0 {
-        (hi as u64) << 32 | p.rsrc_spec as u64
+        u64::from(hi) << 32 | u64::from(p.rsrc_spec)
     } else {
-        p.rsrc_spec as u64
+        u64::from(p.rsrc_spec)
     }
 }
 

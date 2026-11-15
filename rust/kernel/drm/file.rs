@@ -44,6 +44,21 @@ pub trait DriverFile {
     fn memory_stats(&self) -> Option<MemoryStats> {
         None
     }
+
+    /// Emit completed per-engine busy time in nanoseconds for this client's fdinfo.
+    /// Engine names must be stable, unique and contain no whitespace or colons.
+    /// The default emits no engine keys. See `Documentation/gpu/drm-usage-stats.rst`.
+    fn engine_stats(&self, _emit: impl FnMut(&crate::str::CStr, u64)) {}
+
+    /// The frequency the engines of [`Self::engine_stats`] run at now, if known, and their
+    /// highest, in Hz, for this client's fdinfo (`drm-curfreq-<engine>` and
+    /// `drm-maxfreq-<engine>` beside each `drm-engine-<engine>`). The default, `None`,
+    /// prints neither. Every engine gets the same pair: this suits a device whose engines
+    /// share one clock, and a driver with independently clocked engines needs a per-engine
+    /// form instead.
+    fn engine_frequency(&self) -> Option<(Option<u64>, u64)> {
+        None
+    }
 }
 
 /// An open DRM File.
@@ -136,6 +151,42 @@ impl<T: DriverFile> File<T> {
         // `driver_priv` was set by `open_callback()`. The seq_file read holds a reference to the
         // file, so `postclose_callback()` cannot run concurrently.
         let file = unsafe { File::<T>::from_raw(raw_file) };
+        let frequency = file.inner().engine_frequency();
+        file.inner().engine_stats(|name, ns| {
+            // SAFETY: The DRM core owns printer throughout this callback; the format and
+            // name are NUL-terminated, and the vararg types match %s and %llu.
+            unsafe {
+                bindings::drm_printf(
+                    printer,
+                    c"drm-engine-%s:\t%llu ns\n".as_char_ptr(),
+                    name.as_char_ptr(),
+                    ns as core::ffi::c_ulonglong,
+                )
+            };
+            let Some((current, max)) = frequency else {
+                return;
+            };
+            if let Some(current) = current {
+                // SAFETY: As above.
+                unsafe {
+                    bindings::drm_printf(
+                        printer,
+                        c"drm-curfreq-%s:\t%llu Hz\n".as_char_ptr(),
+                        name.as_char_ptr(),
+                        current as core::ffi::c_ulonglong,
+                    )
+                };
+            }
+            // SAFETY: As above.
+            unsafe {
+                bindings::drm_printf(
+                    printer,
+                    c"drm-maxfreq-%s:\t%llu Hz\n".as_char_ptr(),
+                    name.as_char_ptr(),
+                    max as core::ffi::c_ulonglong,
+                )
+            };
+        });
         let Some(stats) = file.inner().memory_stats() else {
             return;
         };
@@ -164,7 +215,7 @@ impl<T: DriverFile> File<T> {
         // SAFETY: `printer` is the printer `drm_show_fdinfo()` passes, valid for this call; `raw`
         // and the region name outlive the call.
         unsafe {
-            bindings::drm_print_memory_stats(printer, &raw, supported, c"system".as_ptr())
+            bindings::drm_print_memory_stats(printer, &raw, supported, c"system".as_char_ptr())
         };
     }
 

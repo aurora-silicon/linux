@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/display/apple,display-secure-proxy.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple secure display proxy apertures
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  Secure display proxy register apertures. They are distinct from the
+  non-secure display engine and remain owned by firmware.
+
+properties:
+  compatible:
+    oneOf:
+      - items:
+          - const: apple,t8140-display-secure-proxy
+          - const: apple,display-secure-proxy
+
+  reg:
+    minItems: 3
+    maxItems: 3
+    description: Register apertures in hardware-description order.
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false

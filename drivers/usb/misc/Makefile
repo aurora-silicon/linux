@@ -23,6 +23,7 @@ obj-$(CONFIG_USB_QCOM_EUD)		+= qcom_eud.o
 obj-$(CONFIG_USB_TEST)			+= usbtest.o
 obj-$(CONFIG_USB_EHSET_TEST_FIXTURE)    += ehset.o
 obj-$(CONFIG_USB_TRANCEVIBRATOR)	+= trancevibrator.o
+obj-$(CONFIG_USB_VL122_HUB)		+= vl122-hub.o
 obj-$(CONFIG_USB_USS720)		+= uss720.o
 obj-$(CONFIG_USB_SEVSEG)		+= usbsevseg.o
 obj-$(CONFIG_USB_YUREX)			+= yurex.o

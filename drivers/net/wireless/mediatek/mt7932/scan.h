@@ -8,6 +8,32 @@
 /* CID03 carries this many band/channel slots, from 0xa0 up to 0xe0. */
 #define MT7932_SCAN_CHANNELS 32
 
+/* cfg80211 owns PSC selection and RNR expansion for split scans. Until the
+ * firmware target list can carry its BSSID/short-SSID constraints, listen on
+ * those channels even when the request also contains an ordinary SSID.
+ */
+static inline bool
+mt7932_scan_listen(const struct cfg80211_scan_request *request,
+		   const struct ieee80211_channel *channel, u64 legacy_channels)
+{
+	unsigned int i;
+
+	if (!request->n_ssids ||
+	    (channel->flags & (IEEE80211_CHAN_NO_IR | IEEE80211_CHAN_RADAR)))
+		return true;
+	if (channel->band != NL80211_BAND_6GHZ)
+		return false;
+	if ((request->flags & NL80211_SCAN_FLAG_COLOCATED_6GHZ) ||
+	    request->n_6ghz_params ||
+	    !mt7932_channel_band(channel->band, channel->hw_value) ||
+	    !(legacy_channels & BIT_ULL((channel->hw_value - 1) / 4)))
+		return true;
+	for (i = 0; i < request->n_ssids; i++)
+		if (request->ssids[i].ssid_len)
+			return false;
+	return true;
+}
+
 /* Selected ordinary TX17/fullmac wildcard scan, not a pre-RF gate.
  * Caller must own BSS0 and filter cfg80211 DISABLED channels first. NO_IR
  * channels require mt7932_scan_passive() before submission. The body uses
@@ -85,10 +111,23 @@ static inline void mt7932_scan_disconnected_passive(u8 body[0x4d4])
 	put_unaligned_le16(233, body + 0x4ca);
 }
 
+/* Wait for the whole disconnected passive batch, not just one channel.
+ * Retain the existing five-second command/completion margin and active wait.
+ */
+static inline unsigned int mt7932_scan_discovery_timeout(const u8 body[0x4d4])
+{
+	return 5000 + (body[2] ? 0 :
+		      body[0x9f] * get_unaligned_le16(body + 0x4ca));
+}
+
 /* CID03 carries up to four directed SSIDs in 36-byte slots (le32 length,
- * 32 bytes) at offset 8; selector 8 marks a directed request and byte 4
- * counts the populated slots. Wildcard entries occupy no slot. A directed
- * request carries no probe IEs.
+ * 32 bytes) at offset 8, and byte 4 counts the populated slots. Byte 3 is
+ * the SSID type: 4 asks for the listed SSIDs and the wildcard together, as
+ * the other connac firmware takes it. Type 8 matched results against the
+ * firmware's remembered SSID for each BSSID, so a BSSID that changed its
+ * SSID was not reported to a directed scan until a wildcard scan refreshed
+ * it. Wildcard entries occupy no slot. A directed request carries no probe
+ * IEs.
  */
 #define MT7932_SCAN_SSIDS 4
 
@@ -103,7 +142,7 @@ static inline int mt7932_scan_ssid_slot(u8 body[0x4d4], const u8 *ssid,
 		return -EINVAL;
 	if (slot >= MT7932_SCAN_SSIDS)
 		return -ENOSPC;
-	body[3] = 8;
+	body[3] = 4;
 	put_unaligned_le32(ssid_length, body + 8 + 36 * slot);
 	memcpy(body + 12 + 36 * slot, ssid, ssid_length);
 	body[4] = slot + 1;

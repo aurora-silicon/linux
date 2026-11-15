@@ -2,6 +2,7 @@
 #include <linux/dma-fence.h>
 #include <linux/dma-fence-unwrap.h>
 #include <linux/errno.h>
+#include <linux/slab.h>
 #include "sync_input.h"
 #include "sync_scope.h"
 
@@ -81,4 +82,22 @@ int asahi_g17_collect_fences(struct dma_fence *head,
 void asahi_g17_put_fence(struct dma_fence *fence)
 {
 	dma_fence_put(fence);
+}
+
+/*
+ * One fence that signals once every one of @fences has: unwrapped, already
+ * signalled members dropped and same-context members deduplicated. The
+ * fences stay borrowed; returns a new reference, or NULL without memory.
+ */
+struct dma_fence *asahi_g17_merge_fences(struct dma_fence *const *fences, size_t count)
+{
+	struct dma_fence_unwrap *cursors;
+	struct dma_fence *merged;
+
+	cursors = kmalloc_array(count, sizeof(*cursors), GFP_KERNEL);
+	if (!cursors)
+		return NULL;
+	merged = __dma_fence_unwrap_merge(count, (struct dma_fence **)fences, cursors);
+	kfree(cursors);
+	return merged;
 }

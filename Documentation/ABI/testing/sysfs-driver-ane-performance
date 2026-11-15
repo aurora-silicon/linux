@@ -1,0 +1,35 @@
+What:           /sys/class/accel/accel*/device/performance_level
+Date:           October 2026
+Contact:        asahi@lists.linux.dev
+Description:
+                Requested ANE performance level, 0 through 5, or "unsupported"
+                when the device tree does not describe a supported controller.
+                This is a firmware request, not a measured clock frequency.
+                Work raises the level from the SoC match data. It drops to 0
+                after 32 ms without a submission. A stream amortizes the clock
+                transition cost; the first job after idle includes that cost.
+                The runtime PM reference covers the entire request lifetime.
+
+What:           /sys/class/accel/accel*/device/memory_vote
+Date:           October 2026
+Contact:        asahi@lists.linux.dev
+Description:
+                Requested average and peak memory bandwidth, in decimal kB/s,
+                separated by a space. Both are zero after idle release. The
+                requests are aggregated with other interconnect consumers.
+                The active values come from the high-level OPP's opp-avg-kBps
+                and opp-peak-kBps. "unsupported" means no interconnect path is
+                described. It does not mean a successful zero-bandwidth vote.
+                Current T600x trees have no host DCS interconnect provider;
+                describing a path requires a verified shared voting transport.
+
+What:           /sys/class/accel/accel*/device/performance_error
+Date:           October 2026
+Contact:        asahi@lists.linux.dev
+Description:
+                Last performance transition result: zero on success or a
+                negative errno. Failed busy requests abort before enqueueing.
+                Failed idle releases retain the runtime PM reference, retry
+                up to three times, and remain visible here if still failing.
+                A subsequent workload retries release before requesting high.
+                An unknown DMA state retains the votes until recovery.

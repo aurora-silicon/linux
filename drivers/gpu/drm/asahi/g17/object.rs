@@ -75,9 +75,13 @@ impl KernelObject {
         prot: mmu::Prot,
         cpu: CpuMap,
     ) -> Result<Self> {
-        let mut this = Self::backing(dev, size, cpu)?;
+        Self::backing(dev, size, cpu)?.placed(vm, placement, prot)
+    }
+
+    /// Maps fresh backing into `vm`.
+    fn placed(mut self, vm: &mmu::Vm, placement: Placement, prot: mmu::Prot) -> Result<Self> {
         let mapping = match placement {
-            Placement::At(addr) => this.obj.map_at(vm, addr, prot, false)?,
+            Placement::At(addr) => self.obj.map_at(vm, addr, prot, false)?,
             Placement::In(range, align) => {
                 let site = if range.start >= crate::hw::t8140::dynamic::LOWER.start
                     && range.end <= crate::hw::t8140::dynamic::LOWER.end {
@@ -85,21 +89,24 @@ impl KernelObject {
                 } else {
                     super::capacity::Site::UpperVa
                 };
-                this.obj.map_into_range(vm, range, align, prot, true).map_err(|error| {
+                self.obj.map_into_range(vm, range, align, prot, true).map_err(|error| {
                     if error == ENOSPC { super::capacity::refused(site) } else { error }
                 })?
             }
         };
-        this.mapping = Some(mapping);
-        Ok(this)
+        self.mapping = Some(mapping);
+        Ok(self)
     }
 
     /// Allocates CPU-accessible backing whose GPU mappings will be installed later.
     pub(crate) fn backing(dev: &AsahiDrmDevice, size: usize, cpu: CpuMap) -> Result<Self> {
-        let mut obj = match cpu {
+        Self::with_object(match cpu {
             CpuMap::WriteBack => gem::new_kernel_object(dev, size)?,
             CpuMap::WriteCombined => gem::new_kernel_object_wc(dev, size)?,
-        };
+        }, size)
+    }
+
+    fn with_object(mut obj: gem::ObjectRef, size: usize) -> Result<Self> {
         let vmap = obj.vmap()?;
         let ptr = NonNull::new(vmap.addr.cast::<u8>()).ok_or(ENOMEM)?;
         // SAFETY: The mapping covers the whole object.
@@ -229,6 +236,13 @@ impl KernelObject {
         self.mapping.take().ok_or(EINVAL)
     }
 
+    /// Publishes the page-table updates of the object's own mapping to every context naming its
+    /// VM's root (see [`mmu::KernelMapping::publish_to_contexts`]).
+    pub(crate) fn publish_to_contexts(&self) -> Result {
+        self.mapping.as_ref().ok_or(EINVAL)?.publish_to_contexts();
+        Ok(())
+    }
+
     /// Returns the GPU address of the object.
     pub(crate) fn gpu_va(&self) -> u64 {
         self.mapping.as_ref().map_or(0, |mapping| mapping.iova())
@@ -237,6 +251,13 @@ impl KernelObject {
     /// Returns the size of the object in bytes.
     pub(crate) fn size(&self) -> usize {
         self.size
+    }
+
+    /// Reads the contents of the object. The firmware may be writing them, so a reader sees a
+    /// torn snapshot: for diagnostics, never for anything the host acts on.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        // SAFETY: Per the type invariant `ptr` is valid for `size` bytes.
+        unsafe { core::slice::from_raw_parts(self.ptr.as_ptr(), self.size) }
     }
 
     /// Returns the contents of the object.
@@ -314,6 +335,17 @@ impl KernelObject {
     pub(crate) fn read_words<const N: usize>(&self, offset: usize) -> Result<[u32; N]> {
         let base = self.aligned::<[u32; N]>(offset)?.cast::<u32>();
         let mut words = [0u32; N];
+        // Most views are uncached: where the copy is 8-byte aligned, load two words at a time.
+        if N % 2 == 0 && base as usize % 8 == 0 {
+            let pairs = base.cast::<u64>();
+            for (i, pair) in words.chunks_exact_mut(2).enumerate() {
+                // SAFETY: As below; the 8-byte loads cover the same aligned `N` words.
+                let bytes = unsafe { pairs.add(i).read_volatile() }.to_ne_bytes();
+                pair[0] = u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                pair[1] = u32::from_ne_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+            }
+            return Ok(words);
+        }
         for (i, word) in words.iter_mut().enumerate() {
             // SAFETY: `aligned()` checked that all `N` words are within the object and aligned.
             *word = unsafe { base.add(i).read_volatile() };
@@ -338,8 +370,7 @@ impl Allocator<'_> {
         prot: mmu::Prot,
         cpu: CpuMap,
     ) -> Result<KernelObject> {
-        let mut range = self.uat.geometry().kernel_range();
-        range.start += crate::hw::t8140::dynamic::KERNEL_OFFSET;
+        let range = self.uat.kernel_dynamic_range();
         KernelObject::new(
             self.dev,
             self.uat.kernel_vm(),
@@ -362,11 +393,27 @@ impl Allocator<'_> {
         KernelObject::new(
             self.dev,
             self.uat.kernel_lower_vm(),
-            Placement::In(crate::hw::t8140::dynamic::LOWER, align),
+            Placement::In(self.uat.kernel_lower_dynamic_range(), align),
             size,
             prot,
             cpu,
         )
+    }
+
+    /// [`Self::lower`] write-combined backing that is not counted as kernel memory: the
+    /// caller charges it to a client ([`crate::memacct::Charge::user`]).
+    pub(crate) fn lower_user_charged(
+        &self,
+        size: usize,
+        align: u64,
+        prot: mmu::Prot,
+    ) -> Result<KernelObject> {
+        KernelObject::with_object(gem::new_kernel_object_wc_user_charged(self.dev, size)?, size)?
+            .placed(
+                self.uat.kernel_lower_vm(),
+                Placement::In(self.uat.kernel_lower_dynamic_range(), align),
+                prot,
+            )
     }
 
     /// Place fresh backing at one address in the canonical and both alias VMs.
@@ -448,9 +495,11 @@ pub(crate) enum Family {
     WorkState = 1,
     QueueState = 2,
     QueueConfig = 3,
+    /// An M5 context's scheduler page, whose mapping the M5 firmware caches.
+    Scheduler = 4,
 }
 
-const POOL_FAMILIES: usize = 4;
+const POOL_FAMILIES: usize = 5;
 const POOL_SLOTS: usize = 64;
 const POOL_BYTES: usize = 128 * 1024 * 1024;
 
@@ -459,6 +508,11 @@ struct Retained {
     prefix: usize,
     cpu: CpuMap,
     poisoned: bool,
+    /// Return order: reuse takes the object returned longest ago.
+    order: u64,
+    /// Firmware progress after which the previous owner's references are gone
+    /// (see [`super::channel::control_fence`]).
+    fence: u64,
 }
 
 struct PoolInner {
@@ -472,6 +526,10 @@ struct PoolInner {
     kept_bytes: usize,
     /// Kept objects still owned by their users, whose list entries are reserved.
     kept_reserved: usize,
+    /// Objects returned so far, ordering the reuse cache.
+    returns: u64,
+    /// Reuses that had to take an object whose fence the firmware had not met yet.
+    fence_overruns: u64,
 }
 
 /// Retained objects past this many are still retained, with one warning.
@@ -554,7 +612,7 @@ impl Pool {
             pin_init!(Self {
                 inner <- kernel::new_mutex!(PoolInner {
                     returned, reserved: [0; POOL_FAMILIES], bytes: 0, stopped: false, kept: KVec::new(),
-                    kept_bytes: 0, kept_reserved: 0,
+                    kept_bytes: 0, kept_reserved: 0, returns: 0, fence_overruns: 0,
                 }, "g17::object::Pool"),
             }),
             GFP_KERNEL,
@@ -563,6 +621,12 @@ impl Pool {
 
     /// Allocates or reuses a matching object. Capacity pressure leaves a fresh
     /// mapping uncached, preserving allocation and submission concurrency.
+    ///
+    /// The firmware may still follow a previous owner's pointers into a returned object
+    /// until it has processed that owner's release. Reuse takes the matching object
+    /// returned longest ago once the firmware consumed a control record published after
+    /// its return; a younger one is reused only when the family has no room for a fresh
+    /// cached object, because an uncached one is unmapped as soon as its owner drops it.
     pub(crate) fn allocate(
         self: &kernel::sync::Arc<Self>,
         alloc: &Allocator<'_>,
@@ -574,22 +638,40 @@ impl Pool {
     ) -> Result<PooledObject> {
         let family_index = family as usize;
         let begin = family_index * POOL_SLOTS;
+        let witnessed = super::channel::control_witnessed();
         let reused = {
             let mut inner = self.inner.lock();
             if inner.stopped {
                 return Err(ENODEV);
             }
-            let slot = inner.returned[begin..begin + POOL_SLOTS]
-                .iter_mut()
-                .find(|entry| {
-                    entry.as_ref().is_some_and(|entry| {
-                        !entry.poisoned
-                            && entry.object.size() == size
-                            && entry.prefix == prefix
-                            && entry.cpu == cpu
-                    })
-                });
-            slot.and_then(Option::take)
+            let room = inner.reserved[family_index] < POOL_SLOTS
+                && inner.bytes.checked_add(size).is_some_and(|bytes| bytes <= POOL_BYTES);
+            let mut oldest: Option<(usize, u64, bool)> = None;
+            for (index, entry) in inner.returned[begin..begin + POOL_SLOTS].iter().enumerate() {
+                let Some(entry) = entry.as_ref().filter(|entry| {
+                    !entry.poisoned
+                        && entry.object.size() == size
+                        && entry.prefix == prefix
+                        && entry.cpu == cpu
+                }) else {
+                    continue;
+                };
+                let ready = entry.fence <= witnessed;
+                if oldest.is_none_or(|(_, order, best_ready)| {
+                    (ready && !best_ready) || (ready == best_ready && entry.order < order)
+                }) {
+                    oldest = Some((begin + index, entry.order, ready));
+                }
+            }
+            match oldest {
+                Some((index, _, ready)) if ready || !room => {
+                    if !ready {
+                        inner.fence_overruns += 1;
+                    }
+                    inner.returned[index].take()
+                }
+                _ => None,
+            }
         };
         let lease = || CacheLease {
             pool: self.clone(),
@@ -671,6 +753,9 @@ impl Pool {
             return;
         }
         let begin = family * POOL_SLOTS;
+        inner.returns += 1;
+        let order = inner.returns;
+        let fence = super::channel::control_fence();
         for slot in &mut inner.returned[begin..begin + POOL_SLOTS] {
             if slot.is_none() {
                 *slot = Some(Retained {
@@ -678,6 +763,8 @@ impl Pool {
                     prefix: lease.prefix,
                     cpu: lease.cpu,
                     poisoned: lease.poisoned,
+                    order,
+                    fence,
                 });
                 return;
             }
@@ -776,6 +863,10 @@ impl Pool {
                      entries.iter().flatten().filter(|entry| entry.poisoned).count())?;
         }
         writeln!(f, "cached_object_bytes used={} total={}", inner.bytes, POOL_BYTES)?;
+        let witnessed = super::channel::control_witnessed();
+        writeln!(f, "cached_objects_fenced waiting={} overruns={}",
+                 inner.returned.iter().flatten().filter(|entry| entry.fence > witnessed).count(),
+                 inner.fence_overruns)?;
         writeln!(f, "firmware_linked_objects kept={} bytes={}", inner.kept.len(), inner.kept_bytes)
     }
 }

@@ -44,7 +44,9 @@
 #include <asm/cpu.h>
 #include <asm/cputype.h>
 #include <asm/cpu_ops.h>
+#include <asm/ctxr_execmem.h>
 #include <asm/daifflags.h>
+#include <asm/kexec.h>
 #include <asm/kvm_mmu.h>
 #include <asm/mmu_context.h>
 #include <asm/nmi.h>
@@ -799,6 +801,10 @@ void __init smp_prepare_cpus(unsigned int max_cpus)
 	if (max_cpus == 0)
 		return;
 
+	/* Leave CPUs confined to an unusable CTXR window in the bootloader. */
+	if (ctxr_exec_secondaries_held())
+		return;
+
 	/*
 	 * Initialise the present map (which describes the set of CPUs
 	 * actually populated at the present time) and release the
@@ -918,6 +924,9 @@ void __noreturn arm64_nmi_cpu_stop(struct pt_regs *regs, bool die_on_crash)
 	set_cpu_online(cpu, false);
 
 	sdei_mask_local_cpu();
+
+	/* Under a CTXR window, CPU 0 may have to start the crash kernel. */
+	arm64_crash_handoff_wait();
 
 	if (crash && die_on_crash)
 		__cpu_try_die(cpu);

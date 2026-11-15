@@ -3,7 +3,8 @@
 int main(void)
 {
 	u8 rx[16], tx[16], output[16];
-	struct apple_dcp_afkep ep = { .wire_v2 = true };
+	struct apple_dcp dcp = { .fw_compat = DCP_FIRMWARE_UNKNOWN };
+	struct apple_dcp_afkep ep = { .wire_v2 = true, .dcp = &dcp };
 	struct apple_epic_service service = { .ep = &ep };
 	struct epic_cmd_info *cmd = &service.cmds[0];
 
@@ -51,6 +52,24 @@ int main(void)
 				   false) == 0);
 	assert(afk_v2_access_owned(&service, cmd->rxbuf_dma + 1, NULL, 16, true,
 				   false) == -EACCES);
-	puts("PASS owned-copy boundaries (actual extracted function; lock/barrier mocks)");
+	/* Only firmware 27 falls back to its retained mappings, and only when unowned. */
+	assert(remote_calls == 0);
+	dcp.fw_compat = DCP_FIRMWARE_V_27_0;
+	assert(afk_v2_copy_owned(&service, cmd->rxbuf_dma + 12, output, 4,
+				 false) == 0);
+	assert(remote_calls == 0);
+	assert(afk_v2_copy_owned(&service, 0x20000003000ULL, output, 4, true) ==
+	       -EACCES);
+	assert(remote_calls == 1 && remote_dva == 0x20000003000ULL &&
+	       remote_size == 4 && remote_to_remote && remote_copy);
+	remote_ret = 0;
+	assert(afk_v2_access_owned(&service, 0x20000003000ULL, NULL, 8, false,
+				   false) == 0);
+	assert(remote_calls == 2 && remote_size == 8 && !remote_to_remote &&
+	       !remote_copy);
+	assert(afk_v2_copy_owned(&service, 0x20000003000ULL, NULL, 1, false) ==
+	       -EINVAL);
+	assert(remote_calls == 2);
+	puts("PASS owned-copy boundaries and firmware-27 fallback (actual extracted function; lock/barrier and fallback mocks)");
 	return 0;
 }

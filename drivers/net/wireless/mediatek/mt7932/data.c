@@ -33,6 +33,12 @@ void mt_data_clean_locked(struct mt7932 *m)
 	if (READ_ONCE(m->connected) && mt_rf_allowed(m) && mt_bss_tx_allowed(m) &&
 	    !m->data_live[q->head] && q->queued < q->count - 1)
 		netif_wake_queue(m->netdev);
+#if IS_ENABLED(CONFIG_MT7932_AWDL)
+	if (READ_ONCE(m->awdl.active) && READ_ONCE(m->awdl.sync_enabled) &&
+	    READ_ONCE(m->awdl.slot_open) && !m->data_live[q->head] &&
+	    q->queued < q->count - 1)
+		netif_wake_queue(m->awdl.netdev);
+#endif
 }
 
 /*
@@ -79,6 +85,15 @@ void mt_bss_presence(struct mt7932 *m, const struct mt7932_event *event)
 
 	if (event->length < 40 || body[0] || !READ_ONCE(m->bss_active))
 		return;
+	/* response_lock: how often, and for how long, the firmware reports
+	 * the BSS absent. TX is held while it is absent without quota.
+	 */
+	if (body[1] && !m->bss_absent) {
+		m->bss_absent_events++;
+		m->bss_absent_since = jiffies;
+	} else if (!body[1] && m->bss_absent) {
+		m->bss_absent_ms += jiffies_to_msecs(jiffies - m->bss_absent_since);
+	}
 	spin_lock_irqsave(&m->data_lock, flags);
 	m->bss_absent = !!body[1];
 	m->bss_quota = body[2];
@@ -107,6 +122,7 @@ void mt_data_complete(struct mt7932 *m, const u8 *packet, size_t length)
 		return;
 	}
 	spin_lock_irqsave(&m->data_lock, flags);
+	m->tx_free_events++;
 	mt_data_clean_locked(m);
 	for (i = 0; i < count; i++) {
 		unsigned int token = tokens[i];
@@ -269,6 +285,8 @@ void mt_data_receive(struct mt7932 *m, const struct mt7932_rx_frame *frame)
 	m->rx_ethernet++;
 	spin_lock(&m->data_lock);
 	m->station_rx_packets++;
+	m->rx_band_records[frame->band == NL80211_BAND_2GHZ ? 0 :
+			   frame->band == NL80211_BAND_5GHZ ? 1 : 2]++;
 	m->station_rx_bytes += frame->length;
 	signal = mt7932_rx_signal(frame, m->antenna_mask);
 	if (frame->signal_valid && signal > -128) {

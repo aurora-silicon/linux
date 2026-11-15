@@ -11,6 +11,16 @@
 	aliases {
 		nvram = &nvram;
 	};
+
+	/*
+	 * The boot NOR runs from a PMU rail that is on whenever the SoC is
+	 * and that no OS switches. The ADT gives the flash no supply.
+	 */
+	nor_flash_vcc: regulator-nor-flash-vcc {
+		compatible = "regulator-fixed";
+		regulator-name = "nor-flash-vcc";
+		regulator-always-on;
+	};
 };
 
 &spi1 {
@@ -20,6 +30,7 @@
 		compatible = "jedec,spi-nor";
 		reg = <0x0>;
 		spi-max-frequency = <25000000>;
+		vcc-supply = <&nor_flash_vcc>;
 
 		partitions {
 			compatible = "fixed-partitions";
@@ -31,6 +42,16 @@
 				/* To be filled by the loader */
 				reg = <0x0 0x0>;
 				status = "disabled";
+			};
+
+			/*
+			 * iBoot firmware and the syscfg factory data. Listed
+			 * after nvram so the nvram MTD index stays the same.
+			 */
+			partition@0 {
+				label = "firmware";
+				reg = <0x0 0x700000>;
+				read-only;
 			};
 		};
 	};

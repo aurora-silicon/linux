@@ -1,0 +1,58 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/dma/apple,admac-control.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple audio DMA control block
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  The LLT escalation detector of a T6050 display engine's ADMAC. The ADMAC
+  driver sets it up through the ADMAC's apple,admac-control phandle, with
+  the ADT's tunables, which the boot loader copies into the node.
+
+properties:
+  compatible:
+    items:
+      - const: apple,t6050-admac-control
+      - const: apple,admac-control
+
+  reg:
+    minItems: 2
+    maxItems: 2
+    description: Register windows in the ADT's order, including views shared with other blocks.
+
+  interrupts:
+    maxItems: 1
+
+  apple,tunable-ced:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description:
+      The ADT's ced-tunables for the first window, as [offset, mask, value]
+      entries; supplied by the boot loader.
+    items:
+      items:
+        - description: register offset
+        - description: mask of the bits to clear
+        - description: bits to set
+
+  apple,tunable-ssw:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description:
+      The ADT's ssw-tunables for the second window, as [offset, mask, value]
+      entries; supplied by the boot loader.
+    items:
+      items:
+        - description: register offset
+        - description: mask of the bits to clear
+        - description: bits to set
+
+required:
+  - compatible
+  - reg
+  - interrupts
+
+additionalProperties: false

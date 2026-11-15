@@ -102,7 +102,7 @@ static void mt7932_band_scan_test(struct kunit *test)
 					       channels, 1), 0x4d4);
 	KUNIT_EXPECT_EQ(test, mt7932_scan_options(body, (const u8 *)"hidden", 6, NULL, 0), 0);
 	KUNIT_EXPECT_EQ(test, body[2], 1);
-	KUNIT_EXPECT_EQ(test, body[3], 8);
+	KUNIT_EXPECT_EQ(test, body[3], 4);
 	KUNIT_EXPECT_EQ(test, body[4], 1);
 	/* Further directed SSIDs fill the next slots; wildcards take none. */
 	KUNIT_EXPECT_EQ(test, mt7932_scan_ssid_slot(body, NULL, 0), 0);
@@ -141,6 +141,105 @@ static void mt7932_he_6g_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, mt7932_channel_6g_center(5, true), 7U);
 	KUNIT_EXPECT_EQ(test, mt7932_channel_6g_center(233, false), 0U);
 	KUNIT_EXPECT_EQ(test, mt7932_channel_6g_center(225, true), 0U);
+}
+
+static void mt7932_scan_6g_policy_test(struct kunit *test)
+{
+	struct cfg80211_ssid ssids[2] = { {}, { .ssid_len = 6 } };
+	struct cfg80211_scan_request request = { .ssids = ssids };
+	struct ieee80211_channel channel = {
+		.band = NL80211_BAND_6GHZ, .hw_value = 5,
+	};
+	u64 legacy = BIT_ULL(1) | BIT_ULL(9);
+	unsigned int i;
+
+	KUNIT_EXPECT_TRUE(test, mt7932_scan_listen(&request, &channel, legacy));
+	request.n_ssids = 1; /* wildcard on a PSC still listens */
+	KUNIT_EXPECT_TRUE(test, mt7932_scan_listen(&request, &channel, legacy));
+	request.n_ssids = 2;
+	KUNIT_EXPECT_FALSE(test, mt7932_scan_listen(&request, &channel, legacy));
+	KUNIT_EXPECT_TRUE(test, mt7932_scan_listen(&request, &channel, 0));
+	request.flags = NL80211_SCAN_FLAG_COLOCATED_6GHZ;
+	/* RNR constraints must not become an unconstrained directed probe,
+	 * including a PSC with psc_no_listen and a non-PSC target channel.
+	 */
+	for (i = 1; i <= 233; i += 4) {
+		channel.hw_value = i;
+		KUNIT_EXPECT_TRUE(test,
+				  mt7932_scan_listen(&request, &channel, ~0ULL));
+	}
+	request.flags = 0;
+	request.n_6ghz_params = 1;
+	channel.hw_value = 37;
+	KUNIT_EXPECT_TRUE(test, mt7932_scan_listen(&request, &channel, legacy));
+	request.n_6ghz_params = 0;
+	channel.flags = IEEE80211_CHAN_NO_IR;
+	KUNIT_EXPECT_TRUE(test, mt7932_scan_listen(&request, &channel, legacy));
+	channel.flags = IEEE80211_CHAN_RADAR;
+	KUNIT_EXPECT_TRUE(test, mt7932_scan_listen(&request, &channel, legacy));
+	channel.flags = 0;
+	channel.band = NL80211_BAND_2GHZ;
+	request.flags = NL80211_SCAN_FLAG_COLOCATED_6GHZ;
+	KUNIT_EXPECT_FALSE(test, mt7932_scan_listen(&request, &channel, legacy));
+}
+
+static void mt7932_scan_6g_golden_test(struct kunit *test)
+{
+	static const u8 channels[] = { 5, 37, 149 };
+	static const u8 expected[0x4d4] = {
+		[0] = 1, [6] = 0x12, [7] = 1,
+		[0x9a] = 40, [0x9e] = 4, [0x9f] = 3,
+		[0xa0] = 3, 5, 3, 37, 3, 149,
+		[0xe0] = 21,
+		[0xe2] = 0x7f, 0x0a, 1, 0, 8, 0x8c, 1, 0x40, 0, 0, 0, 0,
+		0x6b, 7, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		[0x33c] = 40, [0x4b9] = 0x18, [0x4bc] = 45,
+		[0x4c2] = 220, [0x4ca] = 233,
+	};
+	u8 *body = kunit_kmalloc(test, sizeof(expected), GFP_KERNEL);
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, body);
+	KUNIT_ASSERT_EQ(test, mt7932_scan_body(body, sizeof(expected), 1,
+					       NL80211_BAND_6GHZ, channels, 3),
+			0x4d4);
+	KUNIT_EXPECT_EQ(test, mt7932_scan_discovery_timeout(body), 5000U);
+	mt7932_scan_disconnected_passive(body);
+	KUNIT_EXPECT_MEMEQ(test, body, expected, sizeof(expected));
+	for (i = 1; i <= MT7932_SCAN_CHANNELS; i++) {
+		body[0x9f] = i;
+		KUNIT_EXPECT_EQ(test, mt7932_scan_discovery_timeout(body),
+				5000U + 233 * i);
+	}
+	KUNIT_EXPECT_EQ(test, mt7932_scan_discovery_timeout(body), 12456U);
+	KUNIT_EXPECT_GT(test, mt7932_scan_discovery_timeout(body), 32U * 220);
+}
+
+/* Association-start group selection does not establish runtime D7's band-2
+ * procedures. Refuse before touching the container or a partial send plan.
+ */
+static void mt7932_cal_6g_runtime_rejected_test(struct kunit *test)
+{
+	static const u32 upper[] = { 0, 0x1000, 0x1001, U32_MAX };
+	struct mt7932_cal_piece pieces[7], untouched[7];
+	u8 request[16] = {};
+	unsigned int channel, i, tag;
+	int ret;
+
+	memset(untouched, 0xa5, sizeof(untouched));
+	put_unaligned_le32(2, request + 8);
+	for (i = 0; i < ARRAY_SIZE(upper); i++) {
+		put_unaligned_le32(upper[i], request + 4);
+		for (channel = 1; channel <= 233; channel++) {
+			put_unaligned_le32(channel, request + 12);
+			memcpy(pieces, untouched, sizeof(pieces));
+			tag = 0xffff;
+			ret = mt7932_cal_requested(NULL, 0, request, 16, 12, 0x89, pieces, &tag);
+			KUNIT_EXPECT_EQ(test, ret, -EOPNOTSUPP);
+			KUNIT_EXPECT_EQ(test, tag, 0U);
+			KUNIT_EXPECT_MEMEQ(test, pieces, untouched, sizeof(pieces));
+		}
+	}
 }
 
 static void mt7932_cal_6g_test(struct kunit *test)
@@ -220,6 +319,9 @@ static struct kunit_case mt7932_channel_cases[] = {
 	KUNIT_CASE(mt7932_he_6g_test),
 	KUNIT_CASE(mt7932_6g_security_test),
 	KUNIT_CASE(mt7932_cal_6g_test),
+	KUNIT_CASE(mt7932_scan_6g_policy_test),
+	KUNIT_CASE(mt7932_scan_6g_golden_test),
+	KUNIT_CASE(mt7932_cal_6g_runtime_rejected_test),
 	{}
 };
 

@@ -19,7 +19,7 @@ struct phy;
 
 /*
  * appledrm: route a display pipeline to (active) or away from (!active) the
- * crossbar output of DP IN adapter @dpin (0/1) of the router wired to
+ * crossbar output of DP IN adapter @dpin (0-3) of the router wired to
  * @connector_np. @set_active(@binding, active) runs the DP IN adapter's
  * DPTX_INACTIVE handshake and is called back from DCP's link activation.
  * Activation returns -EBUSY while no pipeline is free for the stream (or a
@@ -38,6 +38,21 @@ int apple_dcp_tb_dp_tunnel(struct device_node *connector_np, unsigned int dpin,
 			   u64 generation, bool active,
 			   int (*set_active)(void *binding, bool active), void *binding);
 
+/* The sink raised IRQ_HPD on the tunnel's DP IN adapter. */
+#define APPLE_DP_TUNNEL_IRQ_HPD		BIT(0)
+/* The HPD level of the tunnel's DP IN adapter changed to @hpd. */
+#define APPLE_DP_TUNNEL_HPD_CHANGED	BIT(1)
+
+/*
+ * appledrm: pass interrupt @events (APPLE_DP_TUNNEL_*) of DP IN adapter
+ * @dpin of the router wired to @connector_np to the display pipeline that
+ * holds the tunnel handed over with @generation. The pipeline's DPTX port
+ * gets them as a DP source's HPD input does. Returns -ESTALE if no
+ * pipeline holds that tunnel. Does not wait for DCP; may sleep.
+ */
+int apple_dcp_tb_dp_event(struct device_node *connector_np, unsigned int dpin,
+			  u64 generation, unsigned int events, bool hpd);
+
 /*
  * ATC PHY: start the pixel clock for a DP tunnel at DP link rate code @rate,
  * or stop it (@rate == 0). The PHY must be in Thunderbolt/USB4 mode.
@@ -50,9 +65,53 @@ static inline int apple_dp_tunnel_t6030_pclk(unsigned int source, unsigned int d
 	return dpin < 2 && (source == 0 || source == 2) ? (int)dpin : -EOPNOTSUPP;
 }
 
-/* T6030: keep the source owning the pixel clock across rate changes and stop. */
+/*
+ * T8132's external pipes are crossbar sources 2 (dcpext0) and 4 (dcpext1).
+ * Either feeds DP IN0 through DPTX PCLK1 and DP IN1 through PCLK2.
+ */
+static inline int apple_dp_tunnel_t8132_pclk(unsigned int source, unsigned int dpin)
+{
+	return dpin < 2 && (source == 2 || source == 4) ? (int)dpin : -EOPNOTSUPP;
+}
+
+/*
+ * T6030 and T8132 tunnel pixel clocks: the TX_DP_CTRL0 gates the DP IN
+ * streams in @users (bit n: DP IN n) need. DP IN 0 runs on PCLK1; DP IN 1 on
+ * PCLK2, and needs PCLK1 at its own rate as well: without it its video stops.
+ */
+#define APPLE_DP_TUNNEL_PCLK1	BIT(0)
+#define APPLE_DP_TUNNEL_PCLK2	BIT(1)
+
+static inline unsigned int apple_dp_tunnel_pclks(unsigned int users)
+{
+	return (users & 3 ? APPLE_DP_TUNNEL_PCLK1 : 0) |
+	       (users & 2 ? APPLE_DP_TUNNEL_PCLK2 : 0);
+}
+
+/*
+ * T8132: both DP IN streams of a PHY must run at one link rate, or the
+ * DP IN 1 stream stays dark. 0 if a stream may run at link rate code @rate
+ * next to the other stream's @other (0: none running), -EBUSY if not.
+ */
+static inline int apple_dp_tunnel_t8132_rate_ok(u8 rate, u8 other)
+{
+	return !rate || !other || rate == other ? 0 : -EBUSY;
+}
+
+/*
+ * T6030 and T8132: keep the source owning the pixel clock across rate changes
+ * and stop.
+ */
 int apple_atc_dp_tunnel_rate_source(struct phy *phy, unsigned int source,
 				    unsigned int dpin, u8 rate);
+
+/*
+ * T6050 ATC PHY in USB4/TBT mode: run tunnel pixel clock @clock (1-4, which
+ * feeds the display crossbar's pixel clock @clock) at DP link rate code @rate
+ * (0x06 RBR, 0x0a HBR, 0x14 HBR2, 0x1e HBR3, 0x81 UHBR10, 0x82 UHBR20), or
+ * stop it (@rate == 0). A running clock holds its clock gate.
+ */
+int apple_t6050_dp_tunnel_clock(struct phy *phy, unsigned int clock, u8 rate);
 
 /*
  * ATC PHY: wake the DP clock path of a PHY in Thunderbolt/USB4 mode ahead of
@@ -179,6 +238,32 @@ static inline bool apple_dp_tunnel_route_wired(struct device_node *route,
 }
 
 /*
+ * The graph port of USB-C connector @connector_np that carries its display
+ * routes: the first port with an endpoint leading to a route of a display
+ * pipeline's "typec-routes" node. Most boards put them on port 3; a board
+ * whose port 3 is taken by the USB4 router uses another one. Without such an
+ * endpoint, port 3, if present. Returns a reference to the port node, or NULL.
+ */
+static inline struct device_node *
+apple_dp_tunnel_routes_port(struct device_node *connector_np)
+{
+	if (!connector_np)
+		return NULL;
+	for_each_of_graph_port(connector_np, port) {
+		for_each_of_graph_port_endpoint(port, endpoint) {
+			struct device_node *route __free(device_node) =
+				of_graph_get_remote_port_parent(endpoint);
+			struct device_node *routes __free(device_node) =
+				route ? of_get_parent(route) : NULL;
+
+			if (routes && of_node_name_eq(routes, "typec-routes"))
+				return of_node_get(port);
+		}
+	}
+	return of_graph_get_port_by_id(connector_np, 3);
+}
+
+/*
  * DT wiring only: no DCP registration, firmware or display status.
  * Two candidates alone (e.g. j314) are single-stream. Named DPIN0/1 controls,
  * or old-DTB typecN-usb4 cell 1, must share the DP-alt crossbar (cell 0).
@@ -192,7 +277,7 @@ static inline bool apple_dp_tunnel_dual_stream(struct device_node *connector_np)
 
 	if (!connector_np)
 		return false;
-	port = of_graph_get_port_by_id(connector_np, 3);
+	port = apple_dp_tunnel_routes_port(connector_np);
 	for_each_child_of_node_scoped(port, endpoint)
 		endpoints++;
 	if (endpoints < 2)

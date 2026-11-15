@@ -104,7 +104,7 @@ impl Mapping {
         }
         // SAFETY: memremap() of a range outside System RAM creates a new mapping; the range is
         // an ADT-described GPU region that the caller admitted.
-        let addr = unsafe { bindings::memremap(phys, size, bindings::MEMREMAP_WC as _) };
+        let addr = unsafe { bindings::memremap(phys, size, bindings::MEMREMAP_WC as usize) };
         if addr.is_null() {
             return Err(ENOMEM);
         }

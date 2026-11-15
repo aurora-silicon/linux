@@ -9,6 +9,7 @@
 
 use crate::shim;
 use crate::store::crc16_ccitt_false;
+use crate::xart_guard::Unfinished;
 use kernel::prelude::*;
 
 pub(crate) const KEYBAG_PATH: &CStr = c"/var/lib/aurora-sep-keybag.bin";
@@ -30,6 +31,9 @@ const MAGIC: [u8; 16] = *b"APPLE-SEP-KBAG01";
 /// v2 stores the bag secret; a v1 record is refused, not reinterpreted.
 const VERSION: u32 = 2;
 
+/// Written before CREATE_KEYBAG is sent: until it is replaced, a bag may
+/// exist unnamed.
+const STATE_INTENT: u32 = 0;
 const STATE_COMMITTED: u32 = 1;
 /// Create refused by the enclave: nothing exists, retry allowed (unlike an
 /// intent record, where a bag may exist unnamed — block retry).
@@ -177,6 +181,15 @@ pub(crate) fn read(slot: Slot) -> Result<State> {
         head[OFF_STATE + 3],
     ]);
     if state == STATE_REFUSED {
+        let expected_crc = crc16_ccitt_false(&checksum_input(state, &[], &[0; UUID_LEN], &[])?);
+        let crc = u16::from_le_bytes([head[OFF_CRC], head[OFF_CRC + 1]]);
+        if size != HEADER as u64
+            || crc != expected_crc
+            || head[OFF_LEN..OFF_CRC].iter().any(|byte| *byte != 0)
+            || head[OFF_CRC + 2..].iter().any(|byte| *byte != 0)
+        {
+            return Err(EINVAL);
+        }
         return Ok(State::Absent(NoStoredKeyBag { slot }));
     }
     let Some(provenance) = UuidProvenance::from_state(state) else {
@@ -236,8 +249,88 @@ pub(crate) fn read(slot: Slot) -> Result<State> {
     }))
 }
 
-pub(crate) fn write_intent(slot: Slot) -> Result<()> {
-    write_record(slot, 0, &[], &[0; UUID_LEN], &[])
+/// An intent's UUID field records Linux's list ([`Unfinished`]): `AXGI`, 1 if
+/// guarded, three zero bytes, then the entry count, little-endian. Older
+/// drivers left it zero; every driver reads either as an intent.
+const MARK_MAGIC: &[u8; 4] = b"AXGI";
+
+fn encode_mark(unfinished: Unfinished) -> [u8; UUID_LEN] {
+    let mut uuid = [0u8; UUID_LEN];
+    let (guarded, entries) = match unfinished {
+        Unfinished::Unmarked => return uuid,
+        Unfinished::Unguarded => (0, 0),
+        Unfinished::Guarded(entries) => (1, entries),
+    };
+    uuid[..4].copy_from_slice(MARK_MAGIC);
+    uuid[4] = guarded;
+    uuid[8..].copy_from_slice(&entries.to_le_bytes());
+    uuid
+}
+
+fn decode_mark(uuid: &[u8; UUID_LEN]) -> Option<Unfinished> {
+    if *uuid == [0; UUID_LEN] {
+        return Some(Unfinished::Unmarked);
+    }
+    if &uuid[..4] != MARK_MAGIC || uuid[5..8] != [0; 3] {
+        return None;
+    }
+    let mut entries = [0u8; 8];
+    entries.copy_from_slice(&uuid[8..]);
+    let entries = u64::from_le_bytes(entries);
+    match uuid[4] {
+        0 if entries == 0 => Some(Unfinished::Unguarded),
+        1 => Some(Unfinished::Guarded(entries)),
+        _ => None,
+    }
+}
+
+/// Records the intent, with Linux's list as it is now.
+pub(crate) fn write_intent(slot: Slot, unfinished: Unfinished) -> Result<()> {
+    write_record(slot, STATE_INTENT, &[], &encode_mark(unfinished), &[])
+}
+
+/// Decodes an intent header; an error for anything but one intact intent.
+fn decode_intent(head: &[u8; HEADER]) -> Result<Unfinished> {
+    let word =
+        |off: usize| u32::from_le_bytes([head[off], head[off + 1], head[off + 2], head[off + 3]]);
+    if head[..MAGIC.len()] != MAGIC {
+        return Err(EINVAL);
+    }
+    if word(OFF_VERSION) != VERSION {
+        return Err(ENOTSYNC);
+    }
+    if word(OFF_STATE) != STATE_INTENT || word(OFF_LEN) != 0 || word(OFF_SECRET_LEN) != 0 {
+        return Err(EEXIST);
+    }
+    let mut uuid = [0u8; UUID_LEN];
+    uuid.copy_from_slice(&head[OFF_UUID..OFF_UUID + UUID_LEN]);
+    let crc = u16::from_le_bytes([head[OFF_CRC], head[OFF_CRC + 1]]);
+    if head[OFF_CRC + 2..OFF_CRC + 4] != [0; 2]
+        || crc16_ccitt_false(&checksum_input(STATE_INTENT, &[], &uuid, &[])?) != crc
+    {
+        return Err(EINVAL);
+    }
+    decode_mark(&uuid).ok_or(EEXIST)
+}
+
+/// The intent in `slot`, which [`read`] reports as `EEXIST`.
+pub(crate) fn unfinished(slot: Slot) -> Result<Unfinished> {
+    let file = shim::StoreFile::open_readonly(slot.path())?;
+    if file.size()? != HEADER as u64 {
+        return Err(EINVAL);
+    }
+    let mut head = [0u8; HEADER];
+    file.read_exact(0, &mut head)?;
+    decode_intent(&head)
+}
+
+/// The no-bag proof for sending an unfinished create again; the file must
+/// still hold the intent that was judged.
+pub(crate) fn retry_unfinished(slot: Slot, seen: Unfinished) -> Result<NoStoredKeyBag> {
+    if unfinished(slot)? != seen {
+        return Err(EEXIST);
+    }
+    Ok(NoStoredKeyBag { slot })
 }
 
 pub(crate) fn mark_refused(slot: Slot) -> Result<()> {
@@ -319,16 +412,7 @@ fn write_record(
     uuid: &[u8; UUID_LEN],
     secret: &[u8],
 ) -> Result<()> {
-    let crc = crc16_ccitt_false(&checksum_input(state, wrapped, uuid, secret)?);
-
-    let mut head = [0u8; HEADER];
-    head[..MAGIC.len()].copy_from_slice(&MAGIC);
-    head[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&VERSION.to_le_bytes());
-    head[OFF_STATE..OFF_STATE + 4].copy_from_slice(&state.to_le_bytes());
-    head[OFF_LEN..OFF_LEN + 4].copy_from_slice(&(wrapped.len() as u32).to_le_bytes());
-    head[OFF_CRC..OFF_CRC + 2].copy_from_slice(&crc.to_le_bytes());
-    head[OFF_UUID..OFF_UUID + UUID_LEN].copy_from_slice(uuid);
-    head[OFF_SECRET_LEN..OFF_SECRET_LEN + 4].copy_from_slice(&(secret.len() as u32).to_le_bytes());
+    let head = header(state, wrapped, uuid, secret)?;
 
     let file = shim::StoreFile::open_trunc(slot.path())?;
     // Body first, then the header that vouches for it: a crash between leaves a
@@ -341,4 +425,91 @@ fn write_record(
     }
     file.write_all(0, &head)?;
     file.sync()
+}
+
+fn header(
+    state: u32,
+    wrapped: &[u8],
+    uuid: &[u8; UUID_LEN],
+    secret: &[u8],
+) -> Result<[u8; HEADER]> {
+    let crc = crc16_ccitt_false(&checksum_input(state, wrapped, uuid, secret)?);
+
+    let mut head = [0u8; HEADER];
+    head[..MAGIC.len()].copy_from_slice(&MAGIC);
+    head[OFF_VERSION..OFF_VERSION + 4].copy_from_slice(&VERSION.to_le_bytes());
+    head[OFF_STATE..OFF_STATE + 4].copy_from_slice(&state.to_le_bytes());
+    head[OFF_LEN..OFF_LEN + 4].copy_from_slice(&(wrapped.len() as u32).to_le_bytes());
+    head[OFF_CRC..OFF_CRC + 2].copy_from_slice(&crc.to_le_bytes());
+    head[OFF_UUID..OFF_UUID + UUID_LEN].copy_from_slice(uuid);
+    head[OFF_SECRET_LEN..OFF_SECRET_LEN + 4].copy_from_slice(&(secret.len() as u32).to_le_bytes());
+    Ok(head)
+}
+
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[::kernel::macros::kunit_tests(apple_sep_keybag)]
+mod tests {
+    use super::*;
+
+    fn intent(unfinished: Unfinished) -> Result<[u8; HEADER]> {
+        header(STATE_INTENT, &[], &encode_mark(unfinished), &[])
+    }
+
+    #[test]
+    fn intents_round_trip() -> Result<()> {
+        for unfinished in [
+            Unfinished::Unmarked,
+            Unfinished::Unguarded,
+            Unfinished::Guarded(0),
+            Unfinished::Guarded(7),
+            Unfinished::Guarded(u64::MAX),
+        ] {
+            assert_eq!(decode_intent(&intent(unfinished)?), Ok(unfinished));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_earlier_drivers_intent_is_unmarked() -> Result<()> {
+        // What drivers before the mark wrote: a zero UUID.
+        let head = header(STATE_INTENT, &[], &[0; UUID_LEN], &[])?;
+        assert_eq!(decode_intent(&head), Ok(Unfinished::Unmarked));
+        Ok(())
+    }
+
+    #[test]
+    fn damaged_or_foreign_intents_stay_ambiguous() -> Result<()> {
+        let good = intent(Unfinished::Guarded(3))?;
+        // A flipped mark bit no longer matches the checksum.
+        let mut flipped = good;
+        flipped[OFF_UUID + 8] ^= 1;
+        assert_eq!(decode_intent(&flipped), Err(EINVAL));
+        // A UUID that is neither zero nor a mark, with a matching checksum.
+        let mut other = [0u8; UUID_LEN];
+        other[0] = 1;
+        assert_eq!(
+            decode_intent(&header(STATE_INTENT, &[], &other, &[])?),
+            Err(EEXIST)
+        );
+        // An unguarded mark with a length is not one this driver writes.
+        let mut odd = encode_mark(Unfinished::Unguarded);
+        odd[8] = 1;
+        assert_eq!(
+            decode_intent(&header(STATE_INTENT, &[], &odd, &[])?),
+            Err(EEXIST)
+        );
+        // Committed and refused records are not intents.
+        let committed = header(STATE_COMMITTED, &[1], &[2; UUID_LEN], &[3])?;
+        assert_eq!(decode_intent(&committed), Err(EEXIST));
+        let refused = header(STATE_REFUSED, &[], &[0; UUID_LEN], &[])?;
+        assert_eq!(decode_intent(&refused), Err(EEXIST));
+        // Another format.
+        let mut magic = good;
+        magic[0] ^= 1;
+        assert_eq!(decode_intent(&magic), Err(EINVAL));
+        let mut version = good;
+        version[OFF_VERSION] = 1;
+        assert_eq!(decode_intent(&version), Err(ENOTSYNC));
+        Ok(())
+    }
 }

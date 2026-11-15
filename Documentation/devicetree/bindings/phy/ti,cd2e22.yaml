@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/phy/ti,cd2e22.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Texas Instruments CD2E22 eUSB2 to USB 2.0 repeater
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  The CD2E22 is a dual-channel eUSB2 to USB 2.0 repeater with an I2C
+  configuration interface. Board-specific tuning is supplied by firmware and
+  is represented as masked 8-bit register updates. The operating-system driver
+  deliberately has no built-in fallback values.
+
+properties:
+  compatible:
+    const: ti,cd2e22
+
+  reg:
+    maxItems: 1
+
+  "#phy-cells":
+    const: 0
+
+  ti,port:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    enum: [0, 1]
+    description: Repeater channel connected to this PHY consumer.
+
+  apple,tunable:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    description: |
+      Masked register updates copied verbatim from the corresponding firmware
+      device-tree property by the bootloader, one 32-bit cell per update. A
+      cell holds, from its most to its least significant byte, the register,
+      the mask, the value and a reserved byte that must be zero; in the
+      flattened tree that is the byte sequence (register, mask, value,
+      reserved). Each update applies (old & ~mask) | (value & mask).
+
+      The type is the one apple,tunable has in the other bindings that define
+      it, because a property name can have only one integer type across all
+      bindings. No item counts are given here for the same reason: they would
+      be merged into the three-cell row layout of those bindings.
+
+required:
+  - compatible
+  - reg
+  - "#phy-cells"
+  - ti,port
+
+additionalProperties: false
+
+examples:
+  - |
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        usb_repeater: phy@21 {
+            compatible = "ti,cd2e22";
+            reg = <0x21>;
+            #phy-cells = <0>;
+            ti,port = <0>;
+            apple,tunable = <0x010f0500>;
+        };
+    };
+...

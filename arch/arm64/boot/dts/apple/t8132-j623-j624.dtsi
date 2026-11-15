@@ -1,0 +1,93 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple iMac (24-inch, M4, 2024): parts common to the 2-port (J623) and
+ * 4-port (J624) models.
+ *
+ * There is no ADT for these boards yet. The layout follows the M3 iMacs
+ * (J433, J434) and the T8132 wiring the J713, J604 and J773g ADTs share.
+ * Each value that is not from an ADT or the shared T8132 files is marked
+ * "guessed".
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+#include "t8132-desktop.dtsi"
+#include "t8132-isp.dtsi"
+
+/ {
+	chassis-type = "all-in-one";
+
+	/*
+	 * The headphone jack: the AOP audio component's jack back-end (DAI 4)
+	 * to the CS42L84, as a card of its own. The speakers are not
+	 * described until their amps are known.
+	 */
+	sound_jack: sound-jack {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Headphone Jack";
+
+			cpu {
+				sound-dai = <&aop_audio 4>;
+			};
+
+			codec {
+				sound-dai = <&jack_codec>;
+			};
+		};
+	};
+
+	/*
+	 * Physical size of the 4480x2520 panel (23.5", 218 ppi), so simpledrm
+	 * reports the real DPI.
+	 */
+	fb_panel: panel {
+		width-mm = <522>;
+		height-mm = <294>;
+		status = "disabled";
+	};
+};
+
+&framebuffer0 {
+	panel = <&fb_panel>;
+};
+
+&aop_audio {
+	/* The microphones on LEAP, the jack on base-ns TX2 and RX2 (guessed). */
+	dmas = <&admac0 1>, <&admac1 4>, <&admac1 5>;
+	dma-names = "dma", "cout", "cin";
+	apple,machine-kind = "iMac";
+};
+
+/* The headphone codec's tip sense is inverted (guessed, as on the M3 iMacs). */
+&jack_codec {
+	cirrus,ts-inv = <1>;
+};
+
+/* The port controllers' places are guessed, as on every M4 ADT. */
+&typec0 {
+	label = "USB-C Back 1";
+};
+
+&typec1 {
+	label = "USB-C Back 2";
+};
+
+/*
+ * brcm,board-type is "apple," + the ADT /arm-io/wlan module-instance,
+ * which is not known for these boards; the boot loader supplies it.
+ */
+
+#include "hwmon-common.dtsi"
+#include "hwmon-fan-dual.dtsi"
+
+&avd_dart {
+	status = "okay";
+};
+
+&avd {
+	status = "okay";
+};

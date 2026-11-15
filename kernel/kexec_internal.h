@@ -26,10 +26,23 @@ const char *notrace kexec_block_reason(void);
 #ifdef CONFIG_KEXEC_BLOCK_KUNIT_TEST
 bool kexec_test_load_limits_unlimited(void);
 #endif
+/*
+ * A blocker keeps a new kernel from reusing memory that a device still reaches
+ * by DMA. A crash kernel reuses none of it: it runs in the crash kernel
+ * reservation, which memblock set aside at boot, before any driver could give
+ * memory to a device. Only CMA-backed crash memory (crashkernel=,cma) is lent
+ * to the page allocator while the system runs, so blockers still stop a crash
+ * kernel that has some.
+ */
+static __always_inline bool notrace kexec_crash_blocked(void)
+{
+	return kexec_blocked() && crashk_cma_cnt;
+}
+
 /* Caller holds the existing NMI-safe kexec lock; no image is dereferenced. */
 static __always_inline bool kexec_crash_image_allowed(bool image_loaded)
 {
-	return image_loaded && !kexec_blocked();
+	return image_loaded && !kexec_crash_blocked();
 }
 
 #ifdef CONFIG_KEXEC

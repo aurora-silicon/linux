@@ -16,6 +16,7 @@
 
 //#define DEBUG 2
 
+#include <linux/atomic.h>
 #include <linux/crc16.h>
 #include <linux/delay.h>
 #include <linux/device/driver.h>
@@ -26,12 +27,15 @@
 #include <linux/printk.h>
 #include <linux/platform_device.h>
 #include <linux/spi/spi.h>
+#include <linux/spinlock.h>
 #include <linux/unaligned.h>
 #include <linux/wait.h>
+#include <linux/workqueue.h>
 
 #include "spi-hid-apple.h"
 
 #define SPIHID_DEF_WAIT msecs_to_jiffies(1000)
+#define SPIHID_GET_REPORT_ATTEMPTS 3
 
 #define SPIHID_MAX_INPUT_REPORT_SIZE 0x800
 
@@ -57,6 +61,11 @@
 static const u8 spi_hid_apple_booted[4] = { 0xa0, 0x80, 0x00, 0x00 };
 static const u8 spi_hid_apple_status_ok[4] = { 0xac, 0x27, 0x68, 0xd5 };
 
+/* Writers wait out SPIHID_PWR_BOOT and are refused while OFF. */
+#define SPIHID_PWR_OFF	0
+#define SPIHID_PWR_BOOT	1
+#define SPIHID_PWR_ON	2
+
 struct spihid_interface {
 	struct hid_device *hid;
 	u8 *hid_desc;
@@ -69,6 +78,9 @@ struct spihid_interface {
 	u8 name[32];
 	u8 reply_buf[SPIHID_DESC_MAX];
 	u32 reply_len;
+	u8 reply_id;
+	u8 reply_report;
+	bool reply_pending;
 	bool ready;
 };
 
@@ -92,6 +104,8 @@ struct spihid_apple {
 
 	wait_queue_head_t wait;
 	struct mutex tx_lock; //< protects against concurrent SPI writes
+	struct mutex get_report_lock; /* serializes synchronous GET_REPORTs */
+	spinlock_t reply_lock; /* protects reply state shared with the IRQ thread */
 
 	struct spi_message rx_msg;
 	struct spi_message tx_msg;
@@ -120,10 +134,10 @@ struct spihid_apple {
 
 	/* state tracking flags */
 	bool status_booted;
+	/* devm_kzalloc leaves this SPIHID_PWR_OFF. */
+	atomic_t power;
 
-#ifdef IRQ_WAKE_SUPPORT
 	bool irq_wake_enabled;
-#endif
 };
 
 /**
@@ -194,6 +208,53 @@ struct spihid_transfer_packet {
 	__le16 crc16;
 };
 
+static void spihid_set_power(struct spihid_apple *spihid, int power)
+{
+	mutex_lock(&spihid->tx_lock);
+	atomic_set(&spihid->power, power);
+	mutex_unlock(&spihid->tx_lock);
+	wake_up_interruptible(&spihid->wait);
+}
+
+/* Returns with tx_lock held, or a negative errno with the lock released. */
+static int spihid_wait_ready(struct spihid_apple *spihid)
+{
+	int err;
+
+	for (;;) {
+		err = mutex_lock_interruptible(&spihid->tx_lock);
+		if (err < 0)
+			return err;
+
+		if (atomic_read(&spihid->power) != SPIHID_PWR_BOOT)
+			return 0;
+
+		mutex_unlock(&spihid->tx_lock);
+		err = wait_event_interruptible(spihid->wait,
+				atomic_read(&spihid->power) != SPIHID_PWR_BOOT);
+		if (err)
+			return err;
+	}
+}
+
+static void spihid_flush_one_led(struct hid_device *hid)
+{
+	/* hidraw-only devices never call hidinput_connect(). */
+	if (hid && (hid->claimed & HID_CONNECT_HIDINPUT))
+		flush_work(&hid->led_work);
+}
+
+static void spihid_flush_led_reports(struct spihid_apple *spihid)
+{
+	/*
+	 * Input suspend turns lit EV_LEDs off by queueing hid->led_work
+	 * on system_wq, which is not frozen. Flush that report while the
+	 * controller is still powered. The actuator has no input device.
+	 */
+	spihid_flush_one_led(spihid->kbd.hid);
+	spihid_flush_one_led(spihid->tp.hid);
+}
+
 /*
  * how HID is mapped onto the protocol is not fully clear. This are the known
  * reports/request:
@@ -217,22 +278,37 @@ struct spihid_transfer_packet {
  */
 
 
+static struct spihid_interface *spihid_get_iface(struct spihid_apple *spihid,
+						 u32 iface);
+
+#define SPIHID_STATUS_MISMATCH_FMT \
+	"status message mismatch: %02x %02x %02x %02x (device %u request %02x report %02x id %u)\n"
+
 static int spihid_apple_request(struct spihid_apple *spihid, u8 target, u8 unk0,
 				u8 unk1, u8 unk2, u16 resp_len, u8 *buf,
-				    size_t len)
+				    size_t len, bool *bad_status)
 {
 	struct spihid_transfer_packet *pkt;
 	struct spihid_msg_hdr *hdr;
 	u16 crc;
+	bool status_mismatch;
 	int err;
+
+	if (bad_status)
+		*bad_status = false;
 
 	/* know reports are small enoug to fit in a single packet */
 	if (len > sizeof(pkt->data) - sizeof(*hdr) - sizeof(__le16))
 		return -EINVAL;
 
-	err = mutex_lock_interruptible(&spihid->tx_lock);
+	err = spihid_wait_ready(spihid);
 	if (err < 0)
 		return err;
+
+	if (atomic_read(&spihid->power) != SPIHID_PWR_ON) {
+		mutex_unlock(&spihid->tx_lock);
+		return -ENODEV;
+	}
 
 	pkt = (struct spihid_transfer_packet *)spihid->tx_buf;
 
@@ -259,15 +335,45 @@ static int spihid_apple_request(struct spihid_apple *spihid, u8 target, u8 unk0,
 
 	memset(spihid->status_buf, 0, sizeof(spi_hid_apple_status_ok));
 
+	if (unk0 == 0x32) {
+		struct spihid_interface *iface = spihid_get_iface(spihid, target);
+		unsigned long flags;
+
+		/* Arm before sending: the IRQ reply can precede spi_sync(). */
+		spin_lock_irqsave(&spihid->reply_lock, flags);
+		WRITE_ONCE(iface->reply_len, 0);
+		iface->reply_id = hdr->id;
+		iface->reply_report = unk1;
+		iface->reply_pending = true;
+		spin_unlock_irqrestore(&spihid->reply_lock, flags);
+	}
+
 	err = spi_sync(spihid->spidev, &spihid->tx_msg);
 
-	if (memcmp(spihid->status_buf, spi_hid_apple_status_ok,
-		   sizeof(spi_hid_apple_status_ok))) {
+	status_mismatch = !err && memcmp(spihid->status_buf, spi_hid_apple_status_ok,
+					 sizeof(spi_hid_apple_status_ok));
+	if (bad_status)
+		*bad_status = status_mismatch;
+	if (status_mismatch) {
 		u8 *b = spihid->status_buf;
-		dev_warn_ratelimited(&spihid->spidev->dev, "status message "
-				     "mismatch: %02x %02x %02x %02x\n",
-				     b[0], b[1], b[2], b[3]);
+
+		/*
+		 * A GET is retried with a fresh ID; spihid_get_report() reports
+		 * the outcome. SET and OUTPUT are single attempts: warn.
+		 */
+		if (unk0 == 0x32)
+			dev_dbg(&spihid->spidev->dev,
+				SPIHID_STATUS_MISMATCH_FMT, b[0], b[1], b[2], b[3],
+				target, unk0, unk1, hdr->id);
+		else
+			dev_warn_ratelimited(&spihid->spidev->dev,
+					     SPIHID_STATUS_MISMATCH_FMT,
+					     b[0], b[1], b[2], b[3], target,
+					     unk0, unk1, hdr->id);
 	}
+	/* Preserve best-effort SET/OUTPUT semantics; only GETs are replayable. */
+	if (status_mismatch && unk0 == 0x32)
+		err = -EPROTO;
 	mutex_unlock(&spihid->tx_lock);
 	if (err < 0)
 		return err;
@@ -328,13 +434,76 @@ static int apple_ll_parse(struct hid_device *hdev)
 	return hid_parse_report(hdev, idev->hid_desc, idev->hid_desc_len);
 }
 
+static int spihid_get_report(struct spihid_apple *spihid,
+			     struct spihid_interface *idev, u8 reportnum,
+			     u8 *buf, size_t len)
+{
+	unsigned long flags;
+	int attempt, ret;
+	unsigned int rejected = 0;
+	bool bad_status, timed_out;
+
+	ret = mutex_lock_interruptible(&spihid->get_report_lock);
+	if (ret)
+		return ret;
+
+	for (attempt = 0; attempt < SPIHID_GET_REPORT_ATTEMPTS; attempt++) {
+		timed_out = false;
+		ret = spihid_apple_request(spihid, idev->id, 0x32, reportnum,
+					   0x00, len, NULL, 0, &bad_status);
+		if (ret >= 0) {
+			ret = wait_event_interruptible_timeout(spihid->wait,
+							       READ_ONCE(idev->reply_len),
+							       SPIHID_DEF_WAIT);
+			if (!ret) {
+				timed_out = true;
+				ret = -ETIMEDOUT;
+			}
+		}
+
+		spin_lock_irqsave(&spihid->reply_lock, flags);
+		idev->reply_pending = false;
+		if (ret > 0) {
+			ret = min_t(size_t, len, idev->reply_len);
+			memcpy(buf, idev->reply_buf, ret);
+		}
+		spin_unlock_irqrestore(&spihid->reply_lock, flags);
+
+		/*
+		 * RX CRC validation can discard a reply even after a valid
+		 * write status. A valid GET can also receive a bad status,
+		 * including the first dimensions query after enabling MT.
+		 * Retry either with a fresh ID, sharing the attempt limit.
+		 * Keep SPI errors (even -EPROTO) and signals distinct from
+		 * status mismatches so they are never replayed.
+		 */
+		if (!timed_out && !bad_status)
+			break;
+		if (bad_status)
+			rejected++;
+	}
+
+	mutex_unlock(&spihid->get_report_lock);
+	if (ret < 0 && rejected)
+		dev_err(&spihid->spidev->dev,
+			"get report %02x failed: %d (bad status: %u)\n",
+			reportnum, ret, rejected);
+	else if (ret < 0)
+		dev_err(&spihid->spidev->dev,
+			"get report %02x failed: %d\n", reportnum, ret);
+	else if (rejected)
+		dev_info_ratelimited(&spihid->spidev->dev,
+				     "get report %02x recovered by retry (bad status: %u)\n",
+				     reportnum, rejected);
+	return ret;
+}
+
 static int apple_ll_raw_request(struct hid_device *hdev,
 				unsigned char reportnum, __u8 *buf, size_t len,
 				unsigned char rtype, int reqtype)
 {
 	struct spihid_interface *idev = hdev->driver_data;
 	struct spihid_apple *spihid = spihid_get_data(idev);
-	int ret;
 
 	dev_dbg(&spihid->spidev->dev,
 		"apple_ll_raw_request: device:%u reportnum:%hhu rtype:%hhu",
@@ -345,21 +514,7 @@ static int apple_ll_raw_request(struct hid_device *hdev,
 		if (rtype != HID_FEATURE_REPORT)
 			return -EINVAL;
 
-		idev->reply_len = 0;
-		ret = spihid_apple_request(spihid, idev->id, 0x32, reportnum, 0x00, len, NULL, 0);
-		if (ret < 0)
-			return ret;
-
-		ret = wait_event_interruptible_timeout(spihid->wait, idev->reply_len,
-						       SPIHID_DEF_WAIT);
-		if (ret == 0)
-			ret = -ETIMEDOUT;
-		if (ret < 0) {
-			dev_err(&spihid->spidev->dev, "waiting for get report failed: %d", ret);
-			return ret;
-		}
-		memcpy(buf, idev->reply_buf, max_t(size_t, len, idev->reply_len));
-		return idev->reply_len;
+		return spihid_get_report(spihid, idev, reportnum, buf, len);
 
 	case HID_REQ_SET_REPORT:
 		if (!len || buf[0] != reportnum)
@@ -368,7 +523,8 @@ static int apple_ll_raw_request(struct hid_device *hdev,
 		 * The report number is not the interface id: the keyboard's LED
 		 * report is 1 on interface 1, the actuator's is 0x21 on 3.
 		 */
-		return spihid_apple_request(spihid, idev->id, 0x52, reportnum, 0x00, 2, buf, len);
+		return spihid_apple_request(spihid, idev->id, 0x52, reportnum,
+					   0x00, 2, buf, len, NULL);
 	default:
 		return -EIO;
 	}
@@ -388,7 +544,8 @@ static int apple_ll_output_report(struct hid_device *hdev, __u8 *buf,
 	dev_dbg(&spihid->spidev->dev, "device:%u report:%u len:%zu",
 		idev->id, buf[0], len);
 	/* The request carries the report number, not the interface id. */
-	return spihid_apple_request(spihid, idev->id, 0x51, buf[0], 0x00, 0, buf, len);
+	return spihid_apple_request(spihid, idev->id, 0x51, buf[0],
+				   0x00, 0, buf, len, NULL);
 }
 
 static struct hid_ll_driver apple_hid_ll = {
@@ -638,10 +795,11 @@ static bool spihid_process_iface_hid_report_desc(struct spihid_apple *spihid,
 }
 
 static bool spihid_process_iface_get_report(struct spihid_apple *spihid,
-					    u32 device, u8 report,
+					    u32 device, u8 report, u8 id,
 					    u8 *payload, size_t len)
 {
 	struct spihid_interface *iface = spihid_get_iface(spihid, device);
+	unsigned long flags;
 
 	if (!iface)
 		return false;
@@ -649,8 +807,16 @@ static bool spihid_process_iface_get_report(struct spihid_apple *spihid,
 	if (len > sizeof(iface->reply_buf) || len < 1)
 		return false;
 
+	spin_lock_irqsave(&spihid->reply_lock, flags);
+	if (!iface->reply_pending || iface->reply_id != id ||
+	    iface->reply_report != report) {
+		spin_unlock_irqrestore(&spihid->reply_lock, flags);
+		return false;
+	}
 	memcpy(iface->reply_buf, payload, len);
-	iface->reply_len = len;
+	WRITE_ONCE(iface->reply_len, len);
+	iface->reply_pending = false;
+	spin_unlock_irqrestore(&spihid->reply_lock, flags);
 
 	wake_up_interruptible(&spihid->wait);
 
@@ -678,7 +844,8 @@ static bool spihid_process_response(struct spihid_apple *spihid, u32 device,
 	}
 
 	if (hdr->unknown0 == 0x32) {
-		return spihid_process_iface_get_report(spihid, device, hdr->unknown1, payload, len);
+		return spihid_process_iface_get_report(spihid, device, hdr->unknown1,
+						 hdr->id, payload, len);
 	}
 
 	return false;
@@ -1022,6 +1189,8 @@ int spihid_apple_core_probe(struct spi_device *spi, struct spihid_apple_ops *ops
 	init_waitqueue_head(&spihid->wait);
 
 	mutex_init(&spihid->tx_lock);
+	mutex_init(&spihid->get_report_lock);
+	spin_lock_init(&spihid->reply_lock);
 
 	/* Init spi transfer buffers and power device on */
 	err = spihid_apple_setup_spi(spihid);
@@ -1042,9 +1211,21 @@ int spihid_apple_core_probe(struct spi_device *spi, struct spihid_apple_ops *ops
 		goto error;
 	}
 
+	spihid_set_power(spihid, SPIHID_PWR_ON);
+
+	/*
+	 * The built-in keyboard and trackpad wake the system, as they do
+	 * under macOS. User space can turn this off through power/wakeup.
+	 */
+	if (ops->enable_irq_wake && ops->disable_irq_wake) {
+		err = devm_device_init_wakeup(dev);
+		if (err)
+			dev_warn(dev, "cannot enable wakeup: %d\n", err);
+	}
+
 	/* request device information */
 	dev_dbg(dev, "request device info");
-	spihid_apple_request(spihid, 0xd0, 0x20, 0x01, 0xd0, 0, NULL, 0);
+	spihid_apple_request(spihid, 0xd0, 0x20, 0x01, 0xd0, 0, NULL, 0, NULL);
 	err = wait_event_interruptible_timeout(spihid->wait, spihid->vendor_id,
 					       SPIHID_DEF_WAIT);
 	if (err == 0)
@@ -1061,7 +1242,7 @@ int spihid_apple_core_probe(struct spi_device *spi, struct spihid_apple_ops *ops
 			continue;
 		dev_dbg(dev, "request interface info 0x%02x", i);
 		spihid_apple_request(spihid, 0xd0, 0x20, 0x02, i,
-				     SPIHID_DESC_MAX, NULL, 0);
+				     SPIHID_DESC_MAX, NULL, 0, NULL);
 		err = wait_event_interruptible_timeout(
 			spihid->wait, iface->max_input_report_len,
 			SPIHID_DEF_WAIT);
@@ -1074,7 +1255,7 @@ int spihid_apple_core_probe(struct spi_device *spi, struct spihid_apple_ops *ops
 			continue;
 		dev_dbg(dev, "request hid report desc 0x%02x", i);
 		spihid_apple_request(spihid, 0xd0, 0x20, 0x10, i,
-				     SPIHID_DESC_MAX, NULL, 0);
+				     SPIHID_DESC_MAX, NULL, 0, NULL);
 		wait_event_interruptible_timeout(
 			spihid->wait, iface->hid_desc_len, SPIHID_DEF_WAIT);
 	}
@@ -1088,6 +1269,13 @@ EXPORT_SYMBOL_GPL(spihid_apple_core_probe);
 void spihid_apple_core_remove(struct spi_device *spi)
 {
 	struct spihid_apple *spihid = spi_get_drvdata(spi);
+
+	/*
+	 * hid_destroy_device() cancels led_work, which calls back into
+	 * spihid_apple_request(). Refuse that transfer. Power stays on
+	 * until power_off() below.
+	 */
+	spihid_set_power(spihid, SPIHID_PWR_OFF);
 
 	/* destroy input devices */
 
@@ -1107,6 +1295,8 @@ void spihid_apple_core_shutdown(struct spi_device *spi)
 {
 	struct spihid_apple *spihid = spi_get_drvdata(spi);
 
+	spihid_set_power(spihid, SPIHID_PWR_OFF);
+
 	/* disable irq */
 	spihid->ops->disable_irq(spihid->ops);
 
@@ -1119,9 +1309,6 @@ EXPORT_SYMBOL_GPL(spihid_apple_core_shutdown);
 static int spihid_apple_core_suspend(struct device *dev)
 {
 	int ret;
-#ifdef IRQ_WAKE_SUPPORT
-	int wake_status;
-#endif
 	struct spihid_apple *spihid = spi_get_drvdata(to_spi_device(dev));
 
 	if (spihid->tp.hid) {
@@ -1139,48 +1326,87 @@ static int spihid_apple_core_suspend(struct device *dev)
 		}
 	}
 
+	/*
+	 * Children suspend first. Input core has queued a NumLock-off
+	 * report on the non-freezable system workqueue. Deliver it
+	 * before the controller is powered down, or the transfer reads
+	 * status 00 00 00 00.
+	 */
+	spihid_flush_led_reports(spihid);
+
 	/* Save some power */
 	spihid->ops->disable_irq(spihid->ops);
 
-#ifdef IRQ_WAKE_SUPPORT
+	/*
+	 * A wakeup device stays powered: the controller asserts its
+	 * interrupt on a key press or a trackpad click, which wakes the
+	 * system. Its state is kept, so resume does not reboot it.
+	 */
+	spihid->irq_wake_enabled = false;
 	if (device_may_wakeup(dev)) {
-		wake_status = spihid->ops->enable_irq_wake(spihid->ops);
-		if (!wake_status)
+		ret = spihid->ops->enable_irq_wake(spihid->ops);
+		if (!ret) {
 			spihid->irq_wake_enabled = true;
-		else
-			dev_warn(dev, "Failed to enable irq wake: %d\n",
-				wake_status);
-	} else {
-		spihid->ops->power_off(spihid->ops);
+			return 0;
+		}
+		dev_warn(dev, "Failed to enable irq wake: %d\n", ret);
 	}
-#else
+
+	spihid_set_power(spihid, SPIHID_PWR_OFF);
 	spihid->ops->power_off(spihid->ops);
-#endif
 
 	return 0;
+}
+
+static int spihid_wake_controller(struct spihid_apple *spihid)
+{
+	int err;
+
+	/*
+	 * Same order as probe. The boot packet (a0 80 00 00) is
+	 * level-triggered and stays pending while the irq is disabled,
+	 * so drop the flag before the reset and enable the irq after.
+	 */
+	spihid_set_power(spihid, SPIHID_PWR_BOOT);
+	spihid->status_booted = false;
+
+	spihid->ops->power_on(spihid->ops);
+	spihid->ops->enable_irq(spihid->ops);
+
+	err = wait_event_interruptible_timeout(spihid->wait,
+					       spihid->status_booted,
+					       msecs_to_jiffies(1000));
+	if (err == 0)
+		err = -ETIMEDOUT;
+	if (err < 0)
+		dev_err(&spihid->spidev->dev,
+			"waiting for device boot failed: %d", err);
+
+	/* ON even on timeout, so waiters are not stuck in BOOT. */
+	spihid_set_power(spihid, SPIHID_PWR_ON);
+	return err < 0 ? err : 0;
 }
 
 static int spihid_apple_core_resume(struct device *dev)
 {
 	int ret_tp = 0, ret_kbd = 0;
+	int err = 0;
 	struct spihid_apple *spihid = spi_get_drvdata(to_spi_device(dev));
-#ifdef IRQ_WAKE_SUPPORT
-	int wake_status;
 
-	if (!device_may_wakeup(dev)) {
-		spihid->ops->power_on(spihid->ops);
-	} else if (spihid->irq_wake_enabled) {
-		wake_status = spihid->ops->disable_irq_wake(spihid->ops);
-		if (!wake_status)
-			spihid->irq_wake_enabled = false;
-		else
-			dev_warn(dev, "Failed to disable irq wake: %d\n",
-				wake_status);
+	if (spihid->irq_wake_enabled) {
+		err = spihid->ops->disable_irq_wake(spihid->ops);
+		if (err)
+			dev_warn(dev, "Failed to disable irq wake: %d\n", err);
+		spihid->irq_wake_enabled = false;
+		/* Still powered and booted: just take interrupts again. */
+		spihid->ops->enable_irq(spihid->ops);
+		err = 0;
+	} else {
+		err = spihid_wake_controller(spihid);
 	}
-#endif
-
-	spihid->ops->enable_irq(spihid->ops);
-	spihid->ops->power_on(spihid->ops);
+	if (err)
+		dev_warn(dev, "SPI HID controller resume incomplete: %d\n",
+			 err);
 
 	if (spihid->tp.hid)
 		ret_tp = hid_driver_reset_resume(spihid->tp.hid);
@@ -1203,3 +1429,7 @@ EXPORT_SYMBOL_GPL(spihid_apple_core_pm);
 MODULE_DESCRIPTION("Apple SPI HID transport driver");
 MODULE_AUTHOR("Janne Grunau <j@jannau.net>");
 MODULE_LICENSE("GPL");
+
+#if IS_ENABLED(CONFIG_SPI_HID_APPLE_KUNIT_TEST)
+#include "spi-hid-apple-test.c"
+#endif

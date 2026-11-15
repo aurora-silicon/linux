@@ -17,8 +17,15 @@ properties:
     oneOf:
       - items:
           - enum:
+              - apple,t6000-spi
               - apple,t6020-spi
+              - apple,t6030-spi
+              - apple,t6031-spi
               - apple,t6041-spi
+              - apple,t6050-spi
+              - apple,t8112-spi
+              - apple,t8122-spi
+              - apple,t8132-spi
               - apple,t8140-spi
           - const: apple,t8103-spi
       - items:

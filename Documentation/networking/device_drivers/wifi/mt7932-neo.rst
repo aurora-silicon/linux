@@ -14,10 +14,11 @@ Co-authored by DJ (DjDeveloperr), Ace (Acelogic), and Ryan Murray.
 Platform and configuration
 --------------------------
 
-Use the separately reviewed T8140 PCIe bootstrap described in
-``Documentation/PCI/controller/apple-t8140.rst``. It runs during boot when
-``CONFIG_PCIE_APPLE_PIODMA_DIAG=y``. Public m1n1 must populate the J700
-``wifi0`` endpoint's own ``local-mac-address``; a zero placeholder is rejected.
+Use the T8140 PCIe bootstrap described in
+``Documentation/PCI/controller/apple-t8140.rst``. Build the provider with
+``CONFIG_PCIE_APPLE_T8140_BOOTSTRAP=y`` and select it through reciprocal
+host/engine DT links. Public m1n1 must populate the J700 ``wifi0`` endpoint's
+own ``local-mac-address``; a zero placeholder is rejected.
 
 The tested configuration includes ``CONFIG_MT7932_FULLMAC=m``,
 ``CONFIG_CFG80211=m``, ``CONFIG_BT_MTK7932_PCIE=m``, ``CONFIG_BT_BREDR=y``,
@@ -29,8 +30,11 @@ bootstrap DMA ownership is active. Kernels may still support kexec elsewhere.
 The station uses 2.4 GHz channels 1-13 and the 5 GHz channels 36-64,
 100-144 and 149-165 that the cfg80211 regulatory domain permits. Radar (DFS)
 channels stay passive: the firmware listens on them while the station is not
-associated, but never probes or joins an access point there, and scans made
-while associated skip them. A channel whose restrictions the driver cannot
+associated and never probes there, and scans made while associated skip them.
+An access point heard on a radar channel may be joined, since the access point
+owns radar detection. A beacon from it that carries a Channel Switch
+Announcement or an Extended one ends the connection, or the join in progress,
+and logs RADAR_CHANNEL_SWITCH. A channel whose restrictions the driver cannot
 apply (reduced power, no OFDM, PSD limits) is disabled rather than used, and
 so is a channel the country package does not permit: every power limit of
 that channel in the applied country package is left undefined.
@@ -74,12 +78,20 @@ Country packages
 Every regulatory change selects a country package again, without a reload.
 For country CC the driver uses the first of these that exists and is valid:
 
-1. ``policy-v2/CC.bin``: J7RP version 2 (version 1 plus 6 GHz VLP pages);
-2. ``policy/CC.bin``: J7RP version 1 (2.4 and 5 GHz, at most 16 KiB);
-3. ``policy/world-XZ.bin``: the world package.
+1. ``policy-v4/CC.bin``: J7RP version 4 (bound LP and optional VLP class data);
+2. ``policy-v2/CC.bin``: J7RP version 2 (version 1 plus 6 GHz VLP pages);
+3. ``policy/CC.bin``: J7RP version 1 (2.4 and 5 GHz, at most 16 KiB);
+4. ``policy/world-XZ.bin``: the world package.
+
+When valid v4 and v2 packages coexist, the driver keeps v2's original base
+and VLP pages and retains v4 as a class sidecar. LP and additional VLP
+permissions extend the exposed channel set, but never change the legacy
+VLP page bytes or its original numeric clamp. Both files remain held until
+publication; the sidecar hash is exposed with the primary package hash.
 
 Country 00 uses only the world package. ``policy/`` holds version 1 only and
-``policy-v2/`` version 2 only; a package in the wrong directory is refused.
+``policy-v2/`` version 2 only and ``policy-v4/`` version 4 only; a package in
+the wrong directory is refused. Version 3 archives remain unbound and refused.
 Kernels without version 2 support never read ``policy-v2/``, so version 2
 packages can be installed while those kernels remain bootable.
 
@@ -100,7 +112,8 @@ fallback reason and the result of each lookup.
 Station security
 ----------------
 
-The driver advertises PSK and SAE with CCMP only. Firmware performs SAE
+The driver advertises PSK, PSK-SHA256, SAE and OWE with CCMP, plus
+BIP-CMAC-128 for management protection. Firmware performs SAE
 authentication and the four-way handshake and owns PTK, GTK and IGTK;
 there is no host key-install interface or external-auth exchange.
 
@@ -112,16 +125,28 @@ permit security fallback.
 For SAE, userspace supplies SAE authentication, an 8-63 byte password and
 required or optional management frame protection (MFP). Firmware uses required
 MFP for the SAE arm. On a PSK+SAE transition network, the first AKM supplied
-by userspace selects the arm: PSK keeps the existing binary-PMK request and
-disables MFP, while SAE uses the password and required MFP. PSK with required
-MFP and PSK-SHA256 are unsupported.
+by userspace selects the arm: PSK keeps the binary-PMK request, while SAE
+uses the password and required MFP. On the PSK (AKM 2) arm the firmware sets
+MFPC in its own RSN element and negotiates PMF with any AP that sets MFPC, so
+a WPA2 network with optional or required PMF is joined with PMF on. iwd and
+wpa_supplicant both ask for required MFP once they have negotiated PMF with
+such an AP, and wpa_supplicant asks for optional MFP when either outcome will
+do; every MFP setting is accepted on this arm. WPA2 PMF with the PSK-SHA256 AKM (6)
+also takes a binary 32-byte PMK and optional or required MFP; its only EA/40
+security delta is little-endian 0x0400 at body +0x14. There is no standalone
+optional/required field.
 
-BIP-CMAC-128 is not advertised because WPA2 with required MFP has not been
-implemented or qualified. Advertising BIP would also make supplicants request
-required MFP on WPA2 networks. iwd requires BIP-CMAC-128 before selecting SAE,
-so it remains WPA2-only with this driver, including on transition networks;
-it cannot join a pure-SAE network. SAE offload support here targets
-NetworkManager with wpa_supplicant, pending the hardware qualification below.
+Before any association command, the host validates the candidate's RSN IE,
+selected AKM, CCMP and MFPC/MFPR. A request for PMF cannot join an AP
+without MFPC, and a request with MFP disabled cannot join an AP that sets
+MFPR. With MFP disabled, the AKM 2 arm still negotiates PMF when the AP
+offers it, because the firmware always sets MFPC there. Only BIP-CMAC-128
+is accepted as an explicit group
+management suite; the standard omitted-suite default is also CMAC-128.
+Firmware owns IGTK extraction, install/removal and BIP verification. No
+add_key or set_default_mgmt_key operation is added. The admitted PMF state
+follows the AP's RSN capabilities; it is not a firmware readback. Selectors
+0x40/0x42 retain their normal completion contract; neither reports PMF state.
 
 The standard SAE PWE settings (unspecified, hunting-and-pecking,
 hash-to-element and both) are accepted; firmware chooses the exchange without
@@ -136,6 +161,14 @@ transition network has confirmed, on 2.4 GHz channel 6 and 5 GHz channel 149:
 * PSK with MFP disabled, and a ``wpa-psk`` profile with optional MFP, which
   joins the transition network as PSK;
 * repeated reconnection through NetworkManager after each change of profile.
+
+With iwd 3.12 and with NetworkManager and wpa_supplicant, against hostapd
+access points, every network that offers PMF is joined with it (hostapd
+lists the station with MFP): WPA2 with optional PMF and with required PMF on
+AKM 2, WPA2 with required PMF on AKM 6, the WPA2/WPA3 transition network and
+WPA3-only networks on 5 GHz, and WPA3 on 6 GHz. OWE with iwd needs an iwd
+that knows ``NL80211_EXT_FEATURE_OWE_OFFLOAD``; iwd 3.12 runs its own OWE
+exchange, which a firmware-offload device cannot serve.
 
 The request layout, transition admission and PMK derivation also have
 automated tests. A pure WPA3 network, exact PWE policy behavior, WPA2
@@ -182,10 +215,17 @@ Only SAE and OWE with required MFP are admitted on 6 GHz. Hunting-and-pecking
 only is refused there; firmware owns H2E. These checks extend the SAE and
 OWE layers without another crypto or authentication implementation.
 
-Wildcard 6 GHz scans listen passively. Hidden SSIDs use directed scanning
-when NO_IR permits it. RNR-only requests remain passive until target-list
-serialization is implemented. Full-band scans are split into bounded
-32-channel commands. Firmware event channel layout is checked before OCA
+Legacy VLP channels retain directed hidden-SSID probing and the original
+connect discovery sequence. Channels added only by class packages listen
+passively until the target supplies its class/TPE. RNR-only requests remain
+passive until target-list serialization is implemented. cfg80211 splits the
+lower-band and 6 GHz phases, selects PSCs and expands cached RNR entries.
+The driver keeps the supplied channel list, including non-PSC RNR targets,
+and never treats ``psc_no_listen`` as permission for an unconstrained probe.
+Full-band scans are split into bounded 32-channel commands. Internal
+discovery allows the entire passive batch's serialized dwell budget plus
+the existing five-second completion margin; 32 channels with a 233 ms
+budget require a 12456 ms wait. Firmware event channel layout is checked before OCA
 association calibration, queue binding and the two association power pages.
 
 J7RP version 1 remains valid and never authorizes 6 GHz. Version 2 packages
@@ -554,10 +594,292 @@ NO_IR, VLP-client restrictions and runtime EIRP/PSD reductions remain
 authoritative. The driver preserves 0xc4/0x7f sentinels when reducing
 numeric native half-dBm cells. LPI, SP and AFC are outside this contract.
 
-The active association path submits the two native selector pages after
-queue binding and does not build a 60-byte TPE. Generic runtime D7
+The legacy v2 path retains its two native selector pages after queue
+binding. Explicit VLP APs on these channels retain their original admission
+and command sequence, including ordinary finite or absent TPE and AP-wide
+160 MHz announcements (the station still negotiates at most 80 MHz). No
+pre-association class/TPE SET is inserted on this compatibility path. Generic runtime D7
 requests for band 2 (6 GHz) remain rejected by the raw planner. RF behavior,
 rate accounting and calibration still require hardware qualification.
+
+6 GHz software proof and qualification boundary
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The association-start OCA group selector and power-on fragments are separate
+from runtime D7. The raw planner rejects every runtime band-2 request before
+reading a container or producing a partial fragment plan. The runtime worker
+latches that error and closes RF admission. Association success does not
+prove that firmware will never issue such a request, and the 2.4/5 GHz D7
+layouts must not be reused by changing only the band number.
+
+The public producer constructs the 32-byte CID5d header pad from
+``one_ss_pad()`` and copies it unchanged through J7RP and class publication.
+Its bits index channel numbers. It is independent of the primary permission
+mask and does not generate the separate unsupported-rate accounting data.
+Neither a zero pad nor numeric per-rate cells prove that firmware excludes
+unsupported rates. The channel pad must not be relabelled or populated with
+guessed rate bits. Synthetic tests check a nonzero pad, class isolation and
+the exact first-page header without distributing power-table inputs.
+
+The strict class path parses default-client EIRP and PSD TPEs, intersects
+applicable limits, preserves ``0x7f``, deducts the J700 antenna gains and
+submits the separate 60-byte CID5d body before EA/40. A changed or invalid
+home beacon envelope disconnects the strict-class link; disconnect and
+country/reset handling invalidate its decision. This does not establish
+firmware readback or radiated power. The legacy v2 VLP compatibility path
+above still bypasses the new class/TPE submission and beacon comparison;
+tests preserving that sequence are not proof of AP TPE enforcement there.
+
+The software regressions can be exercised without a radio::
+
+  python3 tools/asahi/mt7932-scan-tests.py --out /tmp/mt7932-scan-tests
+  python3 tools/asahi/run-host-tests.py --only mt7932 --jobs 8
+
+The KUnit ``mt7932-six-ghz``, ``mt7932-regulatory`` and
+``mt7932-pmf-lpi`` suites also cover runtime D7 rejection, the header pad,
+and complete passive-scan/TPE golden bodies. The host scan test executes
+the production batcher and internal discovery worker with synthetic
+32/27-channel batches, and requires compiling RNR-probe and short-wait
+mutants to fail their runtime assertions.
+
+Before claiming RF qualification, retain failures as well as successful
+cells and run this AP matrix with an explicitly approved device identity:
+
+* PSC and non-PSC targets, with and without lower-band RNR; wildcard and
+  hidden SSIDs; connected and disconnected scans. Check matching completion,
+  bounded 32/27-channel batches and no probes from RNR-derived passive scans.
+* LPI and VLP at 20/40/80 MHz, both PSD and EIRP TPE, finite and ``0x7f``
+  limits, and changed envelopes. Distinguish strict-class operation from the
+  legacy v2 bypass. Check class pages and TPE precede association, and measure
+  power against country, AP, SAR and board limits.
+* LPI/VLP reconnects, country changes and firmware resets; confirm fresh
+  policy publication and no stale AP envelope after rollback.
+* Calibration events during discovery, association and sustained traffic.
+  Record only band/channel, procedure outcome and nonsecret body hashes;
+  band-2 D7 remains unsupported until its own procedure ABI is established.
+* Rate/NSS/MCS and bandwidth accounting under each class, including rates
+  represented by unsupported or unpopulated cells. Static serialization
+  tests cannot establish the firmware's default rate-selection behavior.
+
+6 GHz LPI table archive (J7RP v3, unbound)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The class archive producer audits the authenticated text tables and preserves
+LPI alongside VLP. Version 3 does **not** enable LPI operation. Its binding
+revision zero remains unbound; version 4 below explicitly binds the same data
+to the established class/TPE ABI. Do not infer a command selector from
+the VLP tag ``0x2a``, use larger LP values with that tag, or transplant a
+related softmac driver's CLC command into this fullmac driver.
+
+Run an audit without producing packages::
+
+  python3 tools/asahi/mt7932-policy-classes.py --tables /path/to/IZUBA
+
+Opt in to **host data archives**, separate from operational v1/v2 packages::
+
+  python3 tools/asahi/mt7932-policy-classes.py --tables /path/to/IZUBA \
+    --legacy-dir /path/to/policy --output-dir /path/to/private-archive-root
+  python3 tools/asahi/mt7932-policy-classes-tests.py
+
+Archives use ``policy-v3/CC.bin`` exclusively. Never place them in ``policy/``
+or ``policy-v2/``. The driver does not search policy-v3 and rejects version 3
+if it is mistakenly placed in either operational directory. The installer
+archive API is explicit and separate from deployment; deployment remains
+v1/v2. No Apple input or generated archive may be committed or redistributed.
+
+Authenticated table coverage
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+For the same 25G83 hashes as v2, the class audit distinguishes section labels,
+alphabetic countries, empty sections and usable primaries:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Class
+     - Sections
+     - Countries
+     - Nonempty countries
+     - Eligible
+   * - LP (LPI)
+     - 135
+     - 132
+     - 129
+     - 129
+   * - VLP
+     - 127
+     - 124
+     - 120
+     - 120
+   * - SP
+     - 112
+     - 109
+     - 8
+     - 8
+
+A2/A4/A5 are non-country labels in every class. CN/KH/MH have sections but no
+6 GHz matrix row; AR has no usable VLP primary. Every eligible LPI country
+has a legacy v1 package. LPI adds AE/AR/CO/EG/GT/JO/PE/SV/TN to the VLP set.
+SP is audit-only: no SP archive section, command, AFC permission or runtime
+support is produced. The report lists countries and primary counts for all
+three classes, including the reasons each unusable section was excluded.
+
+LP uses matrix mode 1; VLP uses mode 2; SP uses mode 3. These are table
+operating-class values, **not firmware command selectors**. Require both the
+class-specific matrix mode and at least one projected numeric power cell on
+a primary; all-sentinel rows never grant permission. Retain the v2 parsing,
+row projection, sentinel and one-SS pad rules separately for each class.
+Thus the table-derived LP primary counts are AU/GB/DE/JP=24, US/CA=59;
+the corresponding VLP counts are 24 and 50. These counts describe table data,
+not a live cfg80211 or firmware grant.
+
+Unbound v3 byte contract
+^^^^^^^^^^^^^^^^^^^^^^^
+
+All integers are little endian. The outer J7RP header and legacy mode/table
+records are identical to v1 except version=3 and the total file length.
+After the thirteen legacy tables append this 16-byte class directory::
+
+  Offset Size Meaning
+    0     4   ASCII 6GCL
+    4     1   Archive schema revision 1
+    5     1   Section count: 1 or 2
+    6     1   Firmware binding revision: 0 (unbound data)
+    7     1   Flags: zero
+    8     4   Directory size, including header and every section
+   12     4   Reserved: zero
+
+Each section has this 24-byte header followed by a 32-byte one-SS pad and
+110 table records of 122 bytes each (total section size 13,476 bytes)::
+
+  Offset Size Meaning
+    0     1   J7RP class ID: 1=VLP, 2=LPI (not a firmware enum)
+    1     1   Indoor-only requirement: 0 for VLP, 1 for LPI
+    2     1   Cell units contract: 1, native half-dBm and v2 sentinels
+    3     1   Table record count: 110
+    4     4   Section size including header: 13476
+    8     8   Nonzero primary bitmap; bit i denotes channel 1+4*i
+   16     2   Alpha2 identical to the outer header
+   18     6   Reserved: zero
+   24    32   One-SS pad, independently derived for this class
+   56 13420   110 records: channel byte followed by 121 projected cells
+
+Records follow the exact v2 110-channel matrix order, including channel 2
+and excluding 231. Sections are ordered by increasing class ID, with no
+duplicates. A usable LPI section is mandatory; a usable VLP section is
+optional, so countries without VLP data can still be archived. Reject unknown
+classes, binding revisions, flags, units, reserved fields, mismatched countries,
+wrong channel order/count/size, empty or out-of-range primary masks, a masked
+primary with all-sentinel cells, truncation and trailing bytes. The maximum
+archive size is 65,536 bytes. SP must never be serialized. These bodies are
+**table records, not CID 0x5d or CID 0x95 packets**.
+
+Build all selected archives before publication. Refuse a nonempty output root.
+Use the v2 inventory rules with ``policy-v3/`` replacing ``policy-v2/``; roots
+and directories have mode 0700, files 0600. Preserve every legacy byte except
+the version and total size. Audit output contains only counts, country names,
+skip reasons, hashes and lengths, never source rows or rate values.
+
+6 GHz runtime binding (J7RP v4)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The clean 2026-10-31 firmware ABI specification establishes CID 0x5d byte
++0x01[6:4] as the power class: 0 SP, 1 LPI, 2 VLP. Normal infrastructure
+per-rate pages use submode 0 and byte 1 of 0x1a for LP data or 0x2a for VLP
+data. SP stays disabled because AFC is not implemented. No module parameter
+or forced power mode is exposed.
+
+Version 4 is byte-for-byte version 3 table data, except the J7RP version
+halfword is 4 and the 6GCL directory binding revision is 1. It uses only
+``policy-v4/CC.bin``. Section order, independent class masks, indoor metadata,
+units, bitmap and 110 projected records retain the v3 contract. It requires
+LP and permits optional VLP; SP, duplicate/reordered classes, reserved fields,
+invalid channel order and sentinel-only permitted primaries are rejected.
+These files are data, not captured command envelopes. Older kernels never
+search this directory, and v1/v2 remain available for rollback.
+
+Produce bound packages from the same authenticated inputs::
+
+  python3 tools/asahi/mt7932-policy-classes.py --tables /path/to/IZUBA \
+    --legacy-dir /path/to/policy --output-dir /path/to/new-root --runtime
+
+For new LPI and v4-only VLP associations the driver validates the complete IE
+stream, HE Operation size, primary/center/width and default-client TPE.
+Regulatory Info 0 selects LPI, 2 selects VLP; SP and other unqualified values
+fail closed. Missing/malformed/duplicate HE Operation never defaults to LPI.
+The selected class mask and cfg80211 permissions must allow every occupied
+20 MHz channel. The exact installed class-package hash is checked again.
+Normal class pages precede the separate 60-byte TPE and EA/40. Partial SET
+failure closes RF admission and requires checked reset; no rollback ACK is
+invented. The single station has no concurrent BSS class arbitration.
+
+Existing v2 VLP channels instead retain the original startup CID5d/CID95
+pages and the two 1020-byte CID5d pages after queue binding. Their TPE never
+selected admission in aurora-wip, so finite, absent or unsupported TPE does
+not introduce a new refusal or pre-association SET on this path. HE Regulatory
+Info must explicitly select VLP; it can never authorize SP or select LPI by
+fallback. Existing SAE/OWE admission is unchanged.
+
+The new TPE encoder writes the fixed header, enable, band 3, primary and one
+to four SISO/CDD/MIMO bandwidth limits. EIRP interpretations retain half-dBm
+bytes. PSD uses the minimum of all advertised 20 MHz values, then adds
+26/32/38/44 half-dB ticks for 20/40/80/160 MHz; this conservatively bounds
+narrower allocations. Multiple applicable envelopes are intersected; PSD
+-128 forbids transmission and is rejected. The 0x7f sentinel survives
+conversion and gain subtraction. Signed arithmetic underflow or overflow
+is rejected. Extended PSD and subordinate-AP envelopes cannot supply a
+station limit. Missing applicable TPE is refused on the new class path.
+
+The t-3573 J700 antenna-gain SPEC supplies immutable board properties. A fixed
+six-by-three signed half-dB table is bound to the existing J700-only probe;
+no device-tree property or module parameter is added. SISO/CDD/MIMO tuples
+are (16,16,10), (14,14,8), (15,16,10), (15,15,9), (16,16,10), (15,16,10).
+See :doc:`mt7932-j700-antenna` for the immutable matrix and lookup contract.
+The exact primary-channel/bandwidth map includes the boundary exceptions at
+113, 117, 121, 125, 185 and 189. Each finite TPE cell subtracts its own mapped
+gain. Both LPI and v4-only VLP use this matrix; neither changes the other
+country/class, SAR or hardware ceilings. Missing channel/bandwidth mappings
+fail closed for finite cells. No 2.4/5 GHz gains are inferred.
+
+Country changes retire the connection. Each new class connection reparses
+AP information. Changed or invalid class/TPE in its connected AP's beacon
+closes data admission and schedules disconnect. After peer/DMA retirement,
+RF admission stays fenced while the installed VLP policy is restored and a
+known all-0x7f TPE body removes the previous AP ceiling. A subsequent legacy
+VLP join uses its original association sequence. Firmware acceptance and RF
+compliance, including clearing across class transitions, remain unqualified.
+There is no authoritative active-class or PMF readback. Debug metadata
+excludes BSSIDs and key material.
+
+Requirements before runtime enablement
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The static ABI now establishes the class selector and 60-byte TPE transport.
+The remaining hardware qualification gates are described below, including changes on association, reassociation, AP changes, country
+changes, disconnect and reset. Do not send
+unbound archive bytes as commands or claim readback of a firmware-active
+class from table presence. Public mac80211 handles HE Operation Regulatory
+Info separately from TPE; TPE values alone do not identify the AP class.
+
+Association must use the target BSS's validated HE 6 GHz Operation Information
+and applicable client-category TPE, intersect the country/class primary mask
+with cfg80211 permissions, channel width, EIRP and PSD, and enforce indoor-only
+rules. LPI cannot be selected for a VLP AP. SP requires separate AFC semantics
+and stays unsupported. An LPI AP without country LPI permission must never
+cause an LPI power increase; VLP fallback must retain all VLP restrictions and
+only occur when allowed for that connection. Unknown or malformed HE/TPE
+information cannot authorize higher power. Preserve sentinel meanings and
+round power caps downward. Revalidate changing BSS/regulatory state before
+submission and abort rather than transmit with stale, more permissive limits.
+
+The Neo test plan requires a 6 GHz AP explicitly advertising LPI in HE 6 GHz
+Operation Regulatory Info, with inspectable client TPEs and a legal indoor
+configuration. A phone hotspot may advertise only VLP and cannot close this
+gate. Capture the advertised class and TPE independently, verify host selection
+and firmware acceptance/readback, then test SAE-H2E and OWE, reconnect, VLP
+fallback, forbidden-class/country/indoor cases, country changes, reset, power
+caps and v1/v2 rollback. Controller approval with explicit Neo identity and
+all session/resource/ownership gates is required for every hardware run.
 
 Local firmware inputs
 ---------------------
@@ -623,6 +945,20 @@ over-air MPDU counts, BA-window sizes, TX retries or firmware ACK counters.
 Duplicate suppression records sequences only after the protection check,
 so a rejected unprotected frame cannot suppress a later decrypted retry.
 
+Transport counters describe how the host services the device:
+``irq_service_passes`` counts interrupt-thread passes and
+``rx_ring0_records`` to ``rx_ring8_records`` count descriptors consumed per
+receive ring. ``irq_unmasked_bits`` accumulates status bits that were
+pending outside the enabled interrupt mask, and ``irq_unmasked_passes``
+counts the passes that saw any. Work announced only by such a bit waits for
+an unrelated interrupt, which shows up as latency rather than loss.
+``tx_free_events`` counts TX completion reports. ``bss_absent_events`` and
+``bss_absent_ms`` count how often and for how long the firmware reported the
+BSS absent, during which TX is held. ``home_beacons`` counts beacons from
+the associated BSS that reached the host, and ``rx_2ghz_records``,
+``rx_5ghz_records`` and ``rx_6ghz_records`` split admitted Ethernet RX by
+band. Like the RX counters, they are lifetime values.
+
 Use the current RX bitrate from ``iw dev <interface> station dump`` while
 traffic is running. The driver expires that sample after one second; an
 idle or unsupported RX vector can leave it absent. TX bitrate is not
@@ -658,3 +994,35 @@ Limitations
   are described under Station security.
 * SCO/headset microphone, LE Audio/ISO and simultaneous headset audio are
   unqualified.
+
+Station power cache and coexistence
+----------------------------------
+
+Each join submits CID05 awake before EA/40. That pre-join submission is
+not the power policy of the subsequent associated firmware session. The
+host invalidates its applied-mode cache after pre-join initialization so
+that the existing post-association worker submits the desired policy,
+including awake when station power save is disabled. Successful repeated
+requests within that association still coalesce. Sleep remains gated by
+TIM discovery and the normal RF, peer and termination checks. A successful
+submission is not firmware readback or a measured coexistence improvement.
+
+The association builder retains its twenty-beacon listen interval on all
+bands. The earlier proposal to reduce it to one on every 2.4 GHz association
+is omitted: there is no BT activity notification connecting these drivers,
+and a band-only policy would also affect BT-off associations. Twenty to one
+permits twenty times as many listen opportunities, or nineteen additional
+opportunities per twenty beacons. At a 100 TU beacon interval (102.4 ms),
+the advertised span would fall from 2048 ms to 102.4 ms. These values do not
+quantify radio wake duty cycle, milliwatts or battery life; those depend on
+firmware, TIM/DTIM and actual traffic. No new module parameter, guessed PTA
+command or Bluetooth link-policy override is introduced.
+
+Qualify with paired control/fix boots, BT off/on on 2.4 GHz, local wired
+iperf3 in each direction and ten-minute gateway pings. Interleave off/on/off
+and on/off/on blocks to expose drift in a busy channel. Compare each
+module's BT-on penalty against its adjacent BT-off cells, retaining loss
+and tail latency separately. Include a 5 GHz control, functioning BT HID,
+and a twenty-second rtc1 suspend/resume followed by a fresh association.
+Keep failed cells and independent rollback evidence; host tests alone do
+not establish latency, throughput or Bluetooth functionality.

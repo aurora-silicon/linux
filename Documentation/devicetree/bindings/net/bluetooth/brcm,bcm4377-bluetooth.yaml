@@ -55,6 +55,11 @@ properties:
 
   local-bd-address: true
 
+  wake-gpios:
+    maxItems: 1
+    description: GPIO the chip drives to wake the host when the PCIe link
+      is down (the PCIe WAKE# signal of the Bluetooth function).
+
 required:
   - compatible
   - reg

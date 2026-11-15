@@ -18,8 +18,9 @@ struct mux_chip;
 struct mux_control {
 	struct mux_chip *chip;
 };
+/* Up to the DP-alt output and four DP IN outputs (the T8142 layout). */
 struct mux_chip {
-	struct mux_control mux[3];
+	struct mux_control mux[1 + DCP_FABRIC_DPIN_MAX];
 	unsigned int controllers;
 };
 struct apple_connector {
@@ -42,7 +43,7 @@ struct apple_dcp_typec_route {
 	struct dcp_fabric_route core;
 	bool tunnel;
 	unsigned int tunnel_dpin, mux_index;
-	struct mux_control *xbar, *dpin[2];
+	struct mux_control *xbar, *dpin[DCP_FABRIC_DPIN_MAX];
 };
 struct apple_dcp_typec_port {
 	struct dcp_fabric_port core;
@@ -52,11 +53,16 @@ struct apple_dcp_typec_port {
 	struct apple_connector *connector, *secondary_connector;
 	bool dp_wanted, dp_hpd, typec_yielded;
 };
-static bool t6030;
+static bool t6030, t8132_ext;
 static bool of_machine_is_compatible(const char *compatible)
 {
 	assert(!strcmp(compatible, "apple,t6030"));
 	return t6030;
+}
+/* Production: of_device_is_compatible(dcp->dev->of_node, "apple,t8132-dcpext"). */
+static bool dcp_is_t8132_ext(const struct apple_dcp *dcp)
+{
+	return t8132_ext;
 }
 #define drm_crtc_index(crtc) ((crtc)->index)
 static bool dcp_typec_route_busy(struct apple_dcp_typec_route *r)
@@ -98,7 +104,7 @@ int main(void)
 	};
 	struct apple_dcp_typec_port port = { .routes = &source0 };
 	source0.next = &source2;
-	for (unsigned int i = 0; i < 3; i++)
+	for (unsigned int i = 0; i < 1 + DCP_FABRIC_DPIN_MAX; i++)
 		chip.mux[i].chip = &chip;
 	for (unsigned int soc = 0; soc < 2; soc++) {
 		t6030 = soc;
@@ -121,7 +127,10 @@ int main(void)
 			       &chip.mux[1]);
 			assert(dcp_typec_tunnel_ctl(&source2, 1) ==
 			       &chip.mux[2]);
+			/* A three-output crossbar has no DP IN 2/3 output. */
 			assert(!dcp_typec_tunnel_ctl(&source0, 2));
+			assert(!dcp_typec_tunnel_ctl(&source0, 3));
+			assert(!dcp_typec_tunnel_ctl(&source0, DCP_FABRIC_DPIN_MAX));
 			/* Late migration checks the real route, even with a stale snapshot. */
 			source2.core.tunnel_clock_blocked = 0;
 			assert(dcp_typec_tunnel_ctl(&source2, 0) ==
@@ -140,6 +149,53 @@ int main(void)
 			assert(dcp_typec_tunnel_ctl(&source1, dpin) ==
 			       (soc ? NULL : &chip.mux[1 + dpin]));
 	}
+	/*
+	 * A T8132 dcpext is a tunnel clock source as crossbar source 2 or 4,
+	 * on either DP IN, never as 0, 1 or 3, whatever the machine.
+	 */
+	t8132_ext = true;
+	for (unsigned int soc = 0; soc < 2; soc++) {
+		t6030 = soc;
+		for (unsigned int source = 0; source < 5; source++) {
+			struct apple_dcp_typec_route r = {
+				.dcp = &dcp,
+				.xbar = &chip.mux[0],
+				.mux_index = source,
+			};
+			struct apple_dcp_typec_port p = { .routes = &r };
+			bool ok = source == 2 || source == 4;
+
+			dcp_fabric_snapshot_port(&p, true);
+			assert(p.core.routes == &r.core);
+			assert(r.core.tunnel_clock_blocked == (ok ? 0 : 3));
+			for (unsigned int dpin = 0; dpin < 2; dpin++)
+				assert(dcp_typec_tunnel_ctl(&r, dpin) ==
+				       (ok ? &chip.mux[1 + dpin] : NULL));
+			assert(!dcp_typec_tunnel_ctl(&r, 2) && !dcp_typec_tunnel_ctl(&r, 3));
+		}
+	}
+	t8132_ext = false;
+	/*
+	 * T6050: a T8142-layout crossbar has an output per DP IN, named or by
+	 * the legacy order; a four-output one has no DP IN 3.
+	 */
+	t6030 = false;
+	for (unsigned int outputs = 4; outputs <= 1 + DCP_FABRIC_DPIN_MAX; outputs++) {
+		struct mux_chip xbar = { .controllers = outputs };
+		struct apple_dcp_typec_route r = { .dcp = &dcp, .xbar = &xbar.mux[0] };
+
+		for (unsigned int i = 0; i < 1 + DCP_FABRIC_DPIN_MAX; i++)
+			xbar.mux[i].chip = &xbar;
+		for (unsigned int named = 0; named < 2; named++) {
+			for (unsigned int dpin = 0; dpin < DCP_FABRIC_DPIN_MAX; dpin++)
+				r.dpin[dpin] = named && dpin + 1 < outputs ?
+					&xbar.mux[1 + dpin] : NULL;
+			for (unsigned int dpin = 0; dpin < DCP_FABRIC_DPIN_MAX; dpin++)
+				assert(dcp_typec_tunnel_ctl(&r, dpin) ==
+				       (dpin + 1 < outputs ? &xbar.mux[1 + dpin] : NULL));
+			assert(!dcp_typec_tunnel_ctl(&r, DCP_FABRIC_DPIN_MAX));
+		}
+	}
 	/* A display that yielded both pipes to an HDMI display wants none. */
 	for (unsigned int yielded = 0; yielded < 2; yielded++) {
 		port.dp_wanted = true;
@@ -147,6 +203,6 @@ int main(void)
 		dcp_fabric_snapshot_port(&port, true);
 		assert(port.core.wanted == !yielded);
 	}
-	puts("PASS: DCP snapshot, named/legacy controls, invalid DP IN, stale snapshot, yielded port");
+	puts("PASS: DCP snapshot, named/legacy controls, invalid DP IN, stale snapshot, T8132 dcpext sources, T6050 four DP INs, yielded port");
 	return 0;
 }

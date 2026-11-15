@@ -11,7 +11,7 @@ mod attribution;
 mod slot;
 mod safety;
 pub(crate) use safety::{note_retired, since_retired};
-pub(crate) use attribution::Sources;
+pub(crate) use attribution::{Sources, PAGE_FAULT};
 use attribution::Attribution;
 
 pub(super) fn slot_key(slot: usize, slot_keys: Option<u64>) -> Option<u64> {
@@ -45,11 +45,13 @@ pub(super) struct Entries {
     /// Listed commands found by their exact stamp, and by the oldest-work fallback.
     pub(super) exact: u32,
     pub(super) fallback: u32,
+    /// QIDs with a listed command found by its exact stamp: that command was dropped.
+    exact_qids: u128,
 }
 
 impl Entries {
-    /// Returns false at the first invalid record: the table is a packed list and
-    /// records after it are left over from an earlier restart.
+    /// Counts a valid record. Returns false for an invalid one, which ends the walk on G17P
+    /// and is skipped on M5 (see `read_entries`).
     pub(super) fn include(&mut self, flags: u32) -> bool {
         if flags & 1 == 0 {
             return false;
@@ -92,6 +94,12 @@ pub(super) enum Class {
 pub(super) trait Queues {
     fn render_scheduler_active(&self) -> bool;
     fn render_pass_started(&self, qid: u8, stamp: u64) -> Option<bool>;
+    /// Read while firmware is halted, like `render_pass_started`. The QIDs of every pair of a VM
+    /// an earlier recovery found guilty with a render that started and did not finish. Without
+    /// one, and only when the oldest published render of the pair holding `blamed` had not
+    /// started, those of the one VM with such a render. None if no such VM, several, or any
+    /// other VM holds compute work, which these records cannot see.
+    fn render_culprit(&self, _blamed: u8) -> Option<u128> { None }
     /// Copy every retained queue's live producer to its recovery target, then
     /// issue a full barrier. A failed graph must not skip subsequent queues.
     fn publish_recovery_targets(&self) -> Option<Error>;
@@ -105,6 +113,8 @@ pub(super) trait Queues {
     fn note_interrupted(&mut self, qid: u8, stamp: u32) -> Interrupted;
     /// Optional diagnostics only; absence cannot alter attribution or release.
     fn report_blamed_render(&self, _qid: u8) {}
+    /// Optional diagnostics: logs the MMU fault banks while the firmware is halted.
+    fn report_mmu_fault(&self) {}
     fn settle_blamed_render(&mut self, qid: u8, error: Error);
     fn settle_cancelled_renders(&mut self, qids: u128);
     fn rescan_compute(&mut self) -> Result;
@@ -124,6 +134,8 @@ pub(super) trait Memory {
     fn entry(&self, index: usize) -> Result<(u32, u32)>;
     /// One millisecond wait; this is polled because the firmware sends no state-3 notification.
     fn wait_tick(&self);
+    /// The M5 firmware's recovery table, whose stamp form is not the G17P one.
+    fn is_m5(&self) -> bool;
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -144,6 +156,8 @@ pub(super) struct State {
 pub(super) struct ServiceResult {
     pub(super) scan_error: Option<Error>,
     pub(super) target_error: Option<Error>,
+    /// Every VM found guilty had failed before, and the restart dropped one of its commands.
+    pub(super) leftover: bool,
 }
 
 impl State {
@@ -158,7 +172,14 @@ impl State {
     pub(super) fn timeout_limit(&mut self, now: u64) -> bool {
         self.timeouts.note_unless_progress(now, safety::retired())
     }
-    pub(super) fn restart_limit(&mut self, now: u64) -> bool { self.restarts.note(now) }
+    /// Like timeouts, restarts with work retired between them start a new window: each one
+    /// still costs the guilty client its device, but only restarts without progress stop the GPU.
+    pub(super) fn restart_limit(&mut self, now: u64) -> bool {
+        self.restarts.note_unless_progress(now, safety::retired())
+    }
+    /// A restart that only dropped leftover work of failed VMs (`ServiceResult::leftover`)
+    /// does not count toward the storm limit. Returns whether it was forgiven.
+    pub(super) fn forgive_restart(&mut self) -> bool { self.restarts.forgive() }
     pub(super) fn generation(&self) -> u64 {
         self.accepted
     }
@@ -244,6 +265,7 @@ pub(super) fn service<H: Host>(
     }
     let mut sources = host.fault_sources()?;
     sources.report(request.generation, super::queue::compute::retirement::stampless_total());
+    host.report_mmu_fault();
     if let Some(qid) = request.blamed {
         host.report_blamed_render(qid);
     }
@@ -252,6 +274,11 @@ pub(super) fn service<H: Host>(
     // acknowledged; sampling them during classification can blame a bystander.
     let attribution = sources.attribute(request.blamed,
         |qid, stamp| host.render_pass_started(qid, stamp));
+    let attribution = sources.host_fallback(attribution,
+        || host.render_culprit(request.blamed?));
+    if let Attribution::Queues(qids) = attribution {
+        pr_warn!("G17: recovery gen {} blames queues {:#x}\n", request.generation, qids);
+    }
     let target_error = host.publish_recovery_targets();
     host.transition(1, 2)?;
     let mut recovered = false;
@@ -282,8 +309,15 @@ pub(super) fn service<H: Host>(
     host.recovery_mut().pending = None;
 
     let (listed, exact, fallback) = (entries.listed, entries.exact, entries.fallback);
-    let (cancelled, blame) = classify(host, entries, request.blamed, attribution);
-    if listed != 0 {
+    let (cancelled, blame, leftover) = classify(host, entries, request.blamed, attribution);
+    if listed != 0 && host.is_m5() {
+        // The M5 table only classifies (read_entries): each command is retired from its own
+        // queue's records, replayed when it never ran.
+        pr_warn!(
+            "G17: GPU recovery: {} commands were in flight; each is retired from its own queue's records\n",
+            listed
+        );
+    } else if listed != 0 {
         pr_warn!(
             "G17: GPU recovery: {} commands were in flight ({} matched by stamp, {} by queue); they fail instead of completing\n",
             listed,
@@ -307,22 +341,35 @@ pub(super) fn service<H: Host>(
     }
     let scan_error = host.rescan_compute().err();
     host.release_retired_compute();
-    Ok(ServiceResult { scan_error, target_error })
+    Ok(ServiceResult { scan_error, target_error, leftover })
 }
 
-/// Walks the packed recovery table up to its first invalid record and marks
-/// every listed command interrupted. A failed read keeps what was read so far.
+/// Walks the recovery table. G17P's is a packed list: records after its first invalid one are
+/// left over from an earlier restart, so the walk ends there. M5's need not be packed, so all
+/// of its records are walked and invalid ones skipped; they only classify the recovery, while
+/// on G17P every listed command is marked interrupted. A failed read keeps what was read so far.
 fn read_entries<H: Host>(host: &mut H) -> Entries {
     let mut entries = Entries::default();
+    let m5 = host.is_m5();
     for index in 0..RECOVERY_RECORDS {
         let Ok((flags, stamp)) = host.entry(index) else {
             break;
         };
         if !entries.include(flags) {
+            if m5 {
+                continue;
+            }
             break;
         }
-        match host.note_interrupted(((flags >> 4) & 0x7f) as u8, stamp) {
-            Interrupted::Exact => entries.exact += 1,
+        if m5 {
+            continue;
+        }
+        let qid = ((flags >> 4) & 0x7f) as u8;
+        match host.note_interrupted(qid, stamp) {
+            Interrupted::Exact => {
+                entries.exact += 1;
+                entries.exact_qids |= 1u128 << qid;
+            }
             Interrupted::Oldest => entries.fallback += 1,
             Interrupted::None => {}
         }
@@ -336,7 +383,9 @@ fn read_entries<H: Host>(host: &mut H) -> Entries {
 /// Also returns whether the firmware's blamed QID is still guilty after attribution: a blamed
 /// render that had not started while others had (or with no culprit at all) is innocent, and its
 /// work is spared like that of every other innocent VM instead of failing with EIO.
-fn classify<Q: Queues>(queues: &mut Q, entries: Entries, blamed: Option<u8>, attribution: Attribution) -> (u128, bool) {
+/// Last, whether every guilty VM had failed before this restart and it dropped one of their
+/// commands: a failed VM publishes nothing new, so such restarts end with its queued work.
+fn classify<Q: Queues>(queues: &mut Q, entries: Entries, blamed: Option<u8>, attribution: Attribution) -> (u128, bool, bool) {
     let mut guilty_qids = entries.guilty | blamed.map_or(0, |qid| 1u128 << qid);
     let cancelled = entries.cancelled;
     match attribution {
@@ -347,7 +396,7 @@ fn classify<Q: Queues>(queues: &mut Q, entries: Entries, blamed: Option<u8>, att
     let no_culprit = attribution == Attribution::NoCulprit;
     let blame = blamed.is_some_and(|qid| guilty_qids & (1u128 << qid) != 0);
     if guilty_qids == 0 && !no_culprit {
-        return (0, blame);
+        return (0, blame, false);
     }
     let mut guilty: [Option<Arc<VmStatus>>; MAX_GUILTY_VMS] = Default::default();
     let mut count = 0;
@@ -383,8 +432,15 @@ fn classify<Q: Queues>(queues: &mut Q, entries: Entries, blamed: Option<u8>, att
         }
     }
     if unresolved || (count == 0 && collateral == 0 && !no_culprit) {
-        return (0, blame);
+        return (0, blame, false);
     }
+    let known = |status: &Arc<VmStatus>| guilty[..count].iter().flatten().any(|known| Arc::ptr_eq(known, status));
+    let mut dropped = false;
+    for qid in (0..QIDS).filter(|qid| entries.exact_qids & (1u128 << qid) != 0) {
+        queues.visit_owners(qid, &mut |status| dropped |= known(status));
+    }
+    let leftover = count != 0 && dropped && guilty[..count].iter().flatten().all(|status| status.get() != 0);
+    guilty[..count].iter().flatten().for_each(|status| status.note_recovery_guilty());
     let spared = queues.classify_work(&|status| {
         guilty[..count]
             .iter()
@@ -394,9 +450,11 @@ fn classify<Q: Queues>(queues: &mut Q, entries: Entries, blamed: Option<u8>, att
                     .filter(|known| Arc::ptr_eq(known, status))
                     .map(|_| Class::Guilty)
             })
-            .unwrap_or(Class::Spared)
+            // A VM an earlier recovery found guilty stays guilty. Spared, its leftover work would
+            // make the next blame on it collateral, and that restart would count as a storm.
+            .unwrap_or(if status.recovery_guilty() { Class::Guilty } else { Class::Spared })
     });
-    (cancelled & !(guilty_qids & !collateral) & spared, blame)
+    (cancelled & !(guilty_qids & !collateral) & spared, blame, leftover)
 }
 
 
@@ -423,6 +481,7 @@ mod tests {
     }
 
     impl Memory for Halted {
+        fn is_m5(&self) -> bool { false }
         fn recovery_state(&self) -> Result<u32> { Ok(self.state.get()) }
         fn host_recovery(&self) -> Result<u32> { Ok(0) }
         fn fault_sources(&self) -> Result<Sources> {
@@ -477,6 +536,96 @@ mod tests {
         fn recovery_mut(&mut self) -> &mut State { &mut self.recovery }
     }
 
+    /// A halted recovery table holding `records` (index, flags); every other record is invalid.
+    /// Records the QIDs whose commands the walk marks interrupted.
+    struct Table {
+        recovery: State,
+        m5: bool,
+        records: [(usize, u32); 5],
+        marked: u128,
+    }
+
+    impl Table {
+        fn new(m5: bool) -> Self {
+            const VALID: u32 = 1;
+            Self {
+                recovery: State::new(),
+                m5,
+                records: [
+                    (0, VALID | (12 << 4)),
+                    (1, VALID | u32::from(GUILTY) | (17 << 4)),
+                    // Index 2 is invalid: G17P's list ends here, and what follows is left over.
+                    (3, VALID | u32::from(GUILTY | CANCELLED) | (40 << 4)),
+                    (RECOVERY_RECORDS - 1, VALID | u32::from(GUILTY) | (41 << 4)),
+                    (RECOVERY_RECORDS, VALID | u32::from(GUILTY) | (42 << 4)),
+                ],
+                marked: 0,
+            }
+        }
+    }
+
+    impl Memory for Table {
+        fn is_m5(&self) -> bool { self.m5 }
+        fn recovery_state(&self) -> Result<u32> { Ok(3) }
+        fn host_recovery(&self) -> Result<u32> { Ok(0) }
+        fn fault_sources(&self) -> Result<Sources> { Err(EIO) }
+        fn transition(&self, _expected: u32, _next: u32) -> Result { Err(EIO) }
+        fn clear_timestamps(&self) -> Result { Err(EIO) }
+        fn entry(&self, index: usize) -> Result<(u32, u32)> {
+            assert!(index < RECOVERY_RECORDS);
+            let flags = self.records.iter().find(|(at, _)| *at == index).map_or(0, |(_, flags)| *flags);
+            Ok((flags, index as u32))
+        }
+        fn wait_tick(&self) {}
+    }
+
+    impl Queues for Table {
+        fn render_scheduler_active(&self) -> bool { true }
+        fn render_pass_started(&self, _qid: u8, _stamp: u64) -> Option<bool> { None }
+        fn publish_recovery_targets(&self) -> Option<Error> { None }
+        fn oldest_spared(&self, _qid: u8) -> Option<bool> { None }
+        fn visit_owners(&self, _qid: u8, _visit: &mut dyn FnMut(&Arc<VmStatus>)) {}
+        fn classify_work(&mut self, _class: &dyn Fn(&Arc<VmStatus>) -> Class) -> u128 { 0 }
+        fn note_interrupted(&mut self, qid: u8, _stamp: u32) -> Interrupted {
+            self.marked |= 1u128 << qid;
+            Interrupted::Exact
+        }
+        fn settle_blamed_render(&mut self, _qid: u8, _error: Error) {}
+        fn settle_cancelled_renders(&mut self, _qids: u128) {}
+        fn rescan_compute(&mut self) -> Result { Ok(()) }
+        fn release_retired_compute(&mut self) {}
+    }
+
+    impl Host for Table {
+        fn recovery(&self) -> &State { &self.recovery }
+        fn recovery_mut(&mut self) -> &mut State { &mut self.recovery }
+    }
+
+    #[test]
+    fn recovery_table_ends_at_its_first_invalid_record() {
+        let mut host = Table::new(false);
+        let entries = read_entries(&mut host);
+        assert_eq!(entries.listed, 2);
+        assert_eq!(entries.guilty, 1u128 << 17);
+        assert_eq!(entries.cancelled, 0);
+        assert_eq!(entries.exact, 2);
+        assert_eq!(entries.exact_qids, (1u128 << 12) | (1u128 << 17));
+        // Leftover records blame and cancel nothing and mark no bystander's command.
+        assert_eq!(host.marked, (1u128 << 12) | (1u128 << 17));
+    }
+
+    #[test]
+    fn m5_recovery_table_is_walked_past_invalid_records() {
+        let mut host = Table::new(true);
+        let entries = read_entries(&mut host);
+        assert_eq!(entries.listed, 4);
+        assert_eq!(entries.guilty, (1u128 << 17) | (1u128 << 40) | (1u128 << 41));
+        assert_eq!(entries.cancelled, 1u128 << 40);
+        // The M5 table only classifies.
+        assert_eq!((entries.exact, entries.fallback, entries.exact_qids), (0, 0, 0));
+        assert_eq!(host.marked, 0);
+    }
+
     #[test]
     fn pass_evidence_is_frozen_before_the_first_acknowledgement() {
         let mut host = Halted::new(true);
@@ -485,6 +634,68 @@ mod tests {
         assert_eq!(host.state.get(), 0);
         assert_eq!(host.recovery.generation(), 1);
         assert!(!host.blamed);
+    }
+
+    /// Two VMs, each owning one render pair: `a` queues 40/41, `b` queues 60/61.
+    struct Owners([(u8, Arc<VmStatus>); 4], [Option<Class>; 4]);
+
+    impl Queues for Owners {
+        fn render_scheduler_active(&self) -> bool { true }
+        fn render_pass_started(&self, _qid: u8, _stamp: u64) -> Option<bool> { None }
+        fn publish_recovery_targets(&self) -> Option<Error> { None }
+        fn oldest_spared(&self, qid: u8) -> Option<bool> {
+            self.0.iter().any(|(own, _)| *own == qid).then_some(false)
+        }
+        fn visit_owners(&self, qid: u8, visit: &mut dyn FnMut(&Arc<VmStatus>)) {
+            self.0.iter().filter(|(own, _)| *own == qid).for_each(|(_, status)| visit(status));
+        }
+        fn classify_work(&mut self, class: &dyn Fn(&Arc<VmStatus>) -> Class) -> u128 {
+            for (index, (_, status)) in self.0.iter().enumerate() {
+                self.1[index] = Some(class(status));
+            }
+            0
+        }
+        fn note_interrupted(&mut self, _qid: u8, _stamp: u32) -> Interrupted { Interrupted::None }
+        fn settle_blamed_render(&mut self, _qid: u8, _error: Error) {}
+        fn settle_cancelled_renders(&mut self, _qids: u128) {}
+        fn rescan_compute(&mut self) -> Result { Ok(()) }
+        fn release_retired_compute(&mut self) {}
+    }
+
+    fn owners() -> Owners {
+        let a = Arc::pin_init(VmStatus::new(), GFP_KERNEL).unwrap();
+        let b = Arc::pin_init(VmStatus::new(), GFP_KERNEL).unwrap();
+        Owners([(40, a.clone()), (41, a), (60, b.clone()), (61, b)], [None; 4])
+    }
+
+    fn leftover(queues: &mut Owners, exact_qid: u8) -> bool {
+        let entries = Entries { exact_qids: 1u128 << exact_qid, ..Entries::default() };
+        classify(queues, entries, Some(40), Attribution::Queues(3u128 << 60)).2
+    }
+
+    #[test]
+    fn only_dropped_work_of_an_already_failed_vm_is_leftover() {
+        let mut queues = owners();
+        // A first failure counts toward the storm.
+        assert!(!leftover(&mut queues, 60));
+        queues.0[2].1.record(EIO);
+        assert!(leftover(&mut queues, 60));
+        // The restart dropped nothing of the failed VM.
+        assert!(!leftover(&mut queues, 40));
+    }
+
+    #[test]
+    fn a_guilty_vm_is_not_spared_by_another_vms_recovery() {
+        let mut queues = owners();
+        let entries = || Entries { exact_qids: 1u128 << 40, ..Entries::default() };
+        // b failing for its own client does not make it guilty in a's recovery.
+        queues.0[2].1.record(EIO);
+        classify(&mut queues, entries(), Some(40), Attribution::Queues(3u128 << 40));
+        assert_eq!(queues.1, [Some(Class::Guilty), Some(Class::Guilty), Some(Class::Spared), Some(Class::Spared)]);
+        // Once a recovery finds b guilty, a later recovery that blames a keeps b guilty.
+        classify(&mut queues, entries(), Some(60), Attribution::Queues(3u128 << 60));
+        classify(&mut queues, entries(), Some(40), Attribution::Queues(3u128 << 40));
+        assert_eq!(queues.1, [Some(Class::Guilty); 4]);
     }
 
     #[test]

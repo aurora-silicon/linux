@@ -1,523 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * PMGR power domains for the Apple T6040 "M4 Pro" SoC
+ * T6040 PMGR power domains the T6041 tree does not describe yet.
  *
- * From the J616s ADT /arm-io/pmgr devices and their parents.
+ * The J773s and J616c ADTs list the same domains at the same offsets;
+ * t604x-pmgr.dtsi holds the ones the J616c has qualified.
  *
  * Copyright The Asahi Linux Contributors
  */
 
-&pmgr_gfx {
-	ps_afr: power-controller@100 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x100 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "afr";
-	};
-
-	/*
-	 * The GPU firmware keeps running and does not survive this domain going
-	 * off, so a board that enables the GPU keeps it and ps_afr always on.
-	 */
-	ps_gfx: power-controller@110 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x110 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "gfx";
-		power-domains = <&ps_afr>;
-	};
-};
-
-&pmgr {
-	ps_ispsens0: power-controller@0 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x0 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "ispsens0";
-	};
-
-	ps_apcie_st0: power-controller@108 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x108 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "apcie_st0";
-		apple,always-on;
-	};
-
-	ps_apcie_st1: power-controller@110 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x110 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "apcie_st1";
-		apple,always-on;
-	};
-
-	ps_fab3_soc: power-controller@118 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x118 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "fab3_soc";
-		power-domains = <&ps_afc>;
-		apple,always-on;
-	};
-
-	ps_sio: power-controller@120 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x120 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "sio";
-		power-domains = <&ps_fab3_soc>;
-		apple,always-on;
-	};
-
-	ps_fpwm0: power-controller@138 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x138 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "fpwm0";
-		power-domains = <&ps_sio>;
-	};
-
-	ps_i2c1: power-controller@158 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x158 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "i2c1";
-		power-domains = <&ps_sio>;
-	};
-
-	ps_i2c2: power-controller@160 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x160 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "i2c2";
-		power-domains = <&ps_sio>;
-	};
-
-	ps_i2c3: power-controller@168 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x168 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "i2c3";
-		power-domains = <&ps_sio>;
-	};
-
-	ps_i2c4: power-controller@170 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x170 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "i2c4";
-		power-domains = <&ps_sio>;
-	};
-
-	ps_i2c6: power-controller@180 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x180 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "i2c6";
-		power-domains = <&ps_sio>;
-	};
-
-	ps_i2c8: power-controller@190 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x190 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "i2c8";
-		power-domains = <&ps_sio>;
-	};
-
-	ps_spi_p: power-controller@198 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x198 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "spi_p";
-		power-domains = <&ps_sio>;
-	};
-
-	ps_spi2: power-controller@1c8 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x1c8 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "spi2";
-		power-domains = <&ps_spi_p>;
-	};
-
-	ps_ans: power-controller@370 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x370 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "ans";
-		power-domains = <&ps_fab3_soc>;
-		apple,always-on;
-	};
-
-	ps_isp_sys: power-controller@378 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x378 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "isp_sys";
-		power-domains = <&ps_fab6_soc>;
-	};
-
-	ps_apcie_sys_st0: power-controller@380 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x380 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "apcie_sys_st0";
-		power-domains = <&ps_ans>, <&ps_apcie_st0>;
-		apple,always-on;
-	};
-
-	ps_apcie_sys_st1: power-controller@388 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x388 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "apcie_sys_st1";
-		power-domains = <&ps_ans>, <&ps_apcie_st1>;
-		apple,always-on;
-	};
-
-	ps_sep: power-controller@c00 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0xc00 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "sep";
-		power-domains = <&ps_fab3_soc>;
-		apple,always-on;
-	};
-};
-
-/*
- * The ISP's own power states at PMGR +0x4000 (ADT isp0 reg[1]). The ADT
- * gives addresses only for ISP_CPU and ISP_FE; the other slots follow
- * T8140's order (CPU, FE, DPRX, SECURE, BE, CLR) without the blocks T6040
- * lacks. With only CPU and FE on, the firmware takes an SError while it
- * loads its tunables.
- */
-&pmgr_isp {
-	ps_isp_cpu: power-controller@0 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x0 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "isp_cpu";
-		power-domains = <&ps_isp_sys>;
-	};
-
-	ps_isp_fe: power-controller@8 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x8 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "isp_fe";
-		power-domains = <&ps_isp_sys>;
-	};
-
-	ps_isp_dprx: power-controller@10 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x10 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "isp_dprx";
-		power-domains = <&ps_isp_fe>;
-	};
-
-	ps_isp_secure: power-controller@18 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x18 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "isp_secure";
-		power-domains = <&ps_isp_fe>;
-	};
-
-	ps_isp_be: power-controller@20 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x20 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "isp_be";
-		power-domains = <&ps_isp_fe>;
-	};
-
-	ps_isp_clr: power-controller@28 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x28 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "isp_clr";
-		power-domains = <&ps_isp_be>;
-	};
-};
-
-&pmgr_aux {
-	ps_pms: power-controller@100 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x100 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "pms";
-		apple,always-on;
-	};
-
-	/* fabric parent of isp_sys, on from boot */
-	ps_afi: power-controller@110 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x110 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "afi";
-		apple,always-on;
-	};
-
-	ps_avd_sys: power-controller@170 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x170 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "avd_sys";
-		power-domains = <&ps_fab0_soc>;
-	};
-
-	ps_afc: power-controller@178 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x178 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "afc";
-		apple,always-on;
-	};
-
-	ps_pmp: power-controller@410 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x410 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "pmp";
-		apple,always-on;
-		power-domains = <&ps_pms>;
-	};
-
-	ps_pms_sram: power-controller@418 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x418 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "pms_sram";
-		apple,always-on;
-		power-domains = <&ps_pms>;
-	};
-
-	ps_fab6_soc: power-controller@480 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x480 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "fab6_soc";
-		power-domains = <&ps_afi>;
-		apple,always-on;
-	};
-};
-
-&pmgr_mini {
-	/* ADT pmgr device NUB_GPIO (0x11a), no parent */
-	ps_nub_gpio: power-controller@90 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x90 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "nub_gpio";
-		apple,always-on;
-	};
-};
-
-&pmgr_aux {
-	/* Always on: the firmware leaves ATCn_USB on below it, and genpd refuses an active child under a parent it would turn off. */
-	ps_atc0_common: power-controller@390 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x390 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "atc0_common";
-		apple,always-on;
-		power-domains = <&ps_fab2_soc>;
-	};
-
-	ps_atc1_common: power-controller@3b8 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x3b8 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "atc1_common";
-		apple,always-on;
-		power-domains = <&ps_fab2_soc>;
-	};
-
-	ps_atc2_common: power-controller@3e0 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x3e0 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "atc2_common";
-		apple,always-on;
-		power-domains = <&ps_fab2_soc>;
-	};
-};
-
-&pmgr_mini {
-	ps_nub_spmi_a0: power-controller@68 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x68 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "nub_spmi_a0";
-		apple,always-on;
-	};
-
-	ps_nub_spmi_a1: power-controller@70 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x70 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "nub_spmi_a1";
-		apple,always-on;
-	};
-
-	ps_atc0_usb_aon: power-controller@c8 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0xc8 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "atc0_usb_aon";
-		apple,always-on;
-	};
-
-	ps_atc0_usb: power-controller@118 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x118 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "atc0_usb";
-		power-domains = <&ps_atc0_common>, <&ps_atc0_usb_aon>;
-	};
-
-	ps_atc0_phymxwrap: power-controller@150 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x150 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "atc0_phymxwrap";
-		power-domains = <&ps_atc0_common>, <&ps_atc0_usb_aon>;
-	};
-
-	ps_atc0_common_dp: power-controller@a0 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0xa0 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "atc0_common_dp";
-		power-domains = <&ps_atc0_phymxwrap>;
-	};
-
-	ps_atc1_usb_aon: power-controller@d0 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0xd0 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "atc1_usb_aon";
-		apple,always-on;
-	};
-
-	ps_atc1_usb: power-controller@120 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x120 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "atc1_usb";
-		power-domains = <&ps_atc1_common>, <&ps_atc1_usb_aon>;
-	};
-
-	ps_atc1_phymxwrap: power-controller@158 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x158 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "atc1_phymxwrap";
-		power-domains = <&ps_atc1_common>, <&ps_atc1_usb_aon>;
-	};
-
-	ps_atc1_common_dp: power-controller@a8 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0xa8 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "atc1_common_dp";
-		power-domains = <&ps_atc1_phymxwrap>;
-	};
-
-	ps_atc2_usb_aon: power-controller@d8 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0xd8 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "atc2_usb_aon";
-		apple,always-on;
-	};
-
-	ps_atc2_usb: power-controller@140 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x140 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "atc2_usb";
-		power-domains = <&ps_atc2_common>, <&ps_atc2_usb_aon>;
-	};
-
-	ps_atc2_phymxwrap: power-controller@160 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x160 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "atc2_phymxwrap";
-		power-domains = <&ps_atc2_common>, <&ps_atc2_usb_aon>;
-	};
-
-	ps_atc2_common_dp: power-controller@b0 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0xb0 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "atc2_common_dp";
-		power-domains = <&ps_atc2_phymxwrap>;
-	};
-};
-
-/*
- * Remaining ADT power states. Keep providers without a qualified consumer
- * disabled: registering an unused genpd can power down firmware-owned blocks.
- * Enable the provider and its parents together with the consumer.
- */
 &pmgr {
 	ps_apcie_gp: power-controller@100 {
 		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
@@ -536,18 +26,6 @@
 		label = "fab4_soc";
 		power-domains = <&ps_afc>;
 		apple,always-on;
-		status = "disabled";
-	};
-
-	ps_sio_cpu: power-controller@130 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x130 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "sio_cpu";
-		power-domains = <&ps_sio>;
-		apple,always-on;
-		status = "disabled";
 	};
 
 	ps_fpwm1: power-controller@140 {
@@ -599,7 +77,6 @@
 		power-domains = <&ps_sio>;
 		status = "disabled";
 	};
-
 
 	ps_uart_p: power-controller@1a0 {
 		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
@@ -653,7 +130,6 @@
 		status = "disabled";
 	};
 
-
 	ps_spi3: power-controller@1d0 {
 		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x1d0 4>;
@@ -680,16 +156,6 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "spi5";
-		power-domains = <&ps_spi_p>;
-		status = "disabled";
-	};
-
-	ps_qspi: power-controller@1e8 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x1e8 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "qspi";
 		power-domains = <&ps_spi_p>;
 		status = "disabled";
 	};
@@ -1039,27 +505,6 @@
 		power-domains = <&ps_apcie_sys_st0>, <&ps_apcie_sys_st1>;
 		status = "disabled";
 	};
-
-	ps_jpg: power-controller@3a0 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x3a0 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "jpg";
-		power-domains = <&ps_fab4_soc>;
-		status = "disabled";
-	};
-
-	ps_ane_sys: power-controller@3c0 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x3c0 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "ane_sys";
-		power-domains = <&ps_fab5_soc>, <&ps_fab4_soc>;
-		status = "disabled";
-	};
-
 };
 
 &pmgr_aux {
@@ -1240,7 +685,6 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "dwi";
-		status = "disabled";
 	};
 
 	ps_aic: power-controller@118 {
@@ -1546,16 +990,6 @@
 		status = "disabled";
 	};
 
-	ps_venc0_sys: power-controller@278 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x278 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "venc0_sys";
-		power-domains = <&ps_fab0_soc>;
-		status = "disabled";
-	};
-
 	ps_fab_gw_0: power-controller@288 {
 		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x288 4>;
@@ -1777,16 +1211,6 @@
 		status = "disabled";
 	};
 
-	ps_atc3_common: power-controller@408 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x408 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "atc3_common";
-		power-domains = <&ps_fab2_soc>;
-		status = "disabled";
-	};
-
 	ps_atc3_cio: power-controller@420 {
 		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x420 4>;
@@ -1835,7 +1259,6 @@
 		label = "fab5_soc";
 		power-domains = <&ps_afi>;
 		apple,always-on;
-		status = "disabled";
 	};
 
 	ps_sbr: power-controller@448 {
@@ -1879,7 +1302,8 @@
 		status = "disabled";
 	};
 
-	ps_msr0: power-controller@470 {
+	/* MSR0-DART (gate 425) aliases physical MSR0 (130), like MSR0-V. */
+	ps_msr0: ps_msr0_dart: power-controller@470 {
 		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x470 4>;
 		#power-domain-cells = <0>;
@@ -1937,48 +1361,6 @@
 		#reset-cells = <0>;
 		label = "dispext1_cpu";
 		power-domains = <&ps_dispext1_fe>;
-		status = "disabled";
-	};
-};
-
-&pmgr_ane {
-	ps_ane_mpm: power-controller@0 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x0 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "ane_mpm";
-		power-domains = <&ps_ane_sys>;
-		status = "disabled";
-	};
-
-	ps_ane_cpu: power-controller@8 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x8 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "ane_cpu";
-		power-domains = <&ps_ane_sys>;
-		status = "disabled";
-	};
-
-	ps_ane_td: power-controller@10 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x10 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "ane_td";
-		power-domains = <&ps_ane_sys>;
-		status = "disabled";
-	};
-
-	ps_ane_base: power-controller@18 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x18 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "ane_base";
-		power-domains = <&ps_ane_td>;
 		status = "disabled";
 	};
 };
@@ -2055,15 +1437,6 @@
 		status = "disabled";
 	};
 
-	ps_atc3_common_dp: power-controller@b8 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0xb8 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "atc3_common_dp";
-		status = "disabled";
-	};
-
 	ps_nub_spmi1: power-controller@c0 {
 		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0xc0 4>;
@@ -2072,15 +1445,6 @@
 		label = "nub_spmi1";
 		power-domains = <&ps_nub_spmi_ahb>;
 		apple,always-on;
-		status = "disabled";
-	};
-
-	ps_atc3_usb_aon: power-controller@e0 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0xe0 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "atc3_usb_aon";
 		status = "disabled";
 	};
 
@@ -2147,24 +1511,16 @@
 		apple,always-on;
 		status = "disabled";
 	};
+};
 
-	ps_atc3_usb: power-controller@148 {
+&pmgr_gfx {
+	ps_gpx: power-controller@0 {
 		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x148 4>;
+		reg = <0x0 4>;
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
-		label = "atc3_usb";
-		power-domains = <&ps_atc3_common>, <&ps_atc3_usb_aon>;
-		status = "disabled";
-	};
-
-	ps_atc3_phymxwrap: power-controller@168 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x168 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "atc3_phymxwrap";
-		power-domains = <&ps_atc3_common>, <&ps_atc3_usb_aon>;
+		label = "gpx";
+		apple,always-on;
 		status = "disabled";
 	};
 };
@@ -2181,66 +1537,42 @@
 	};
 };
 
-&pmgr_gfx {
-	ps_gpx: power-controller@0 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x0 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "gpx";
-		apple,always-on;
-		status = "disabled";
-	};
+&ps_avd_sys {
+	power-domains = <&ps_fab0_soc>;
 };
 
-&pmgr_venc {
-	ps_venc0_dma: power-controller@0 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x0 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "venc0_dma";
-		power-domains = <&ps_venc0_sys>;
-		status = "disabled";
-	};
+&ps_atc0_common {
+	power-domains = <&ps_fab2_soc>;
+};
 
-	ps_venc0_pipe4: power-controller@8 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x8 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "venc0_pipe4";
-		power-domains = <&ps_venc0_dma>;
-		status = "disabled";
-	};
+&ps_atc1_common {
+	power-domains = <&ps_fab2_soc>;
+};
 
-	ps_venc0_pipe5: power-controller@10 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x10 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "venc0_pipe5";
-		power-domains = <&ps_venc0_dma>;
-		status = "disabled";
-	};
+&ps_atc2_common {
+	power-domains = <&ps_fab2_soc>;
+};
 
-	ps_venc0_me0: power-controller@18 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x18 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "venc0_me0";
-		power-domains = <&ps_venc0_dma>;
-		status = "disabled";
-	};
+&ps_atc3_common {
+	power-domains = <&ps_fab2_soc>;
+};
 
-	ps_venc0_me1: power-controller@20 {
-		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
-		reg = <0x20 4>;
-		#power-domain-cells = <0>;
-		#reset-cells = <0>;
-		label = "venc0_me1";
-		power-domains = <&ps_venc0_me0>;
-		status = "disabled";
-	};
+&ps_ane_sys {
+	power-domains = <&ps_fab5_soc>, <&ps_fab4_soc>;
+};
+
+&ps_pmp {
+	power-domains = <&ps_pms>;
+};
+
+&ps_pms_sram {
+	power-domains = <&ps_pms>;
+};
+
+&ps_jpg {
+	power-domains = <&ps_fab4_soc>;
+};
+
+&ps_venc0_sys {
+	power-domains = <&ps_fab0_soc>;
 };

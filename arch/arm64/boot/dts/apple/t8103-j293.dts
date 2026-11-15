@@ -329,3 +329,5 @@
 &isp {
 	apple,platform-id = <1>;
 };
+
+#include "t8103-j293-control.dtsi"

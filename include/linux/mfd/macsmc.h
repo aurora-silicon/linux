@@ -80,6 +80,8 @@ enum apple_smc_boot_stage {
 	APPLE_SMC_ERROR_CRASHED
 };
 
+struct apple_smc_wake_reason;
+
 /**
  * struct apple_smc
  * @dev: Underlying device struct for the physical backend device
@@ -111,6 +113,19 @@ struct apple_smc {
 	struct blocking_notifier_head event_handlers;
 
 	struct apple_rtkit *rtk;
+
+	/* Between the AP power notices of a firmware-driven suspend. */
+	bool ap_notified;
+	/* Told of a coming sleep, and not yet of its end. */
+	bool sleep_warned;
+	/* To be told at the noirq suspend, after the debug link's cut. */
+	bool sleep_warn_late;
+	/* In a noirq phase: replies are polled for. */
+	bool polled;
+	/* MBSW at the last wake: what the SMC had woken the AP for. */
+	u64 wake_record;
+	/* MBSW's bits as this SoC numbers them, from the probe. */
+	const struct apple_smc_wake_reason *wake_reasons;
 
 	struct completion init_done;
 	enum apple_smc_boot_stage boot_stage;
@@ -266,6 +281,23 @@ APPLE_SMC_TYPE_OPS(s64)
 APPLE_SMC_TYPE_OPS(s32)
 APPLE_SMC_TYPE_OPS(s16)
 APPLE_SMC_TYPE_OPS(s8)
+
+struct device;
+
+/*
+ * The SMC hwmon cell's fan control for a kernel thermal policy (a GPU
+ * governor): see drivers/hwmon/macsmc-hwmon.c.
+ */
+#if IS_REACHABLE(CONFIG_SENSORS_MACSMC_HWMON)
+int macsmc_hwmon_fans_request(struct device *dev, unsigned int permille,
+			      unsigned int min_step_rpm);
+#else
+static inline int macsmc_hwmon_fans_request(struct device *dev, unsigned int permille,
+					    unsigned int min_step_rpm)
+{
+	return -ENODEV;
+}
+#endif
 
 static inline int apple_smc_read_flag(struct apple_smc *smc, smc_key key, bool *flag)
 {

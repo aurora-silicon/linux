@@ -45,3 +45,7 @@
 &mtp_mt {
 	firmware-name = "apple/tpmtfw-j414s.bin";
 };
+
+#include "t6020-peripherals.dtsi"
+
+#include "t6020-j414s-peripherals.dtsi"

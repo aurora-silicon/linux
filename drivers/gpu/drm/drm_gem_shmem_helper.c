@@ -89,13 +89,18 @@ static int __drm_gem_shmem_init(struct drm_device *dev, struct drm_gem_shmem_obj
 		 */
 		gfp_t gfp = GFP_HIGHUSER | __GFP_RETRY_MAYFAIL | __GFP_NOWARN;
 
-		/* A bulk pin must not run direct reclaim once per folio when
-		 * the driver can instead return an allocation failure. Clearing
-		 * DIRECT_RECLAIM also makes memcg charges fail without reclaim
-		 * or invoking the OOM killer. Preserve placement and kswapd.
+		/* A bulk pin must not swap out the rest of the system to
+		 * make room for itself, once per folio, before it can fail.
+		 * It must still release clean page cache: free memory alone
+		 * stays near the watermarks once files have been read.
+		 * Without __GFP_IO and __GFP_FS, direct reclaim drops clean
+		 * page cache but neither swaps nor writes back, so it runs
+		 * out of progress quickly when the object cannot fit, and
+		 * __GFP_RETRY_MAYFAIL then fails it without the OOM killer.
+		 * Placement and kswapd are unchanged.
 		 */
-		if (shmem->pages_no_reclaim)
-			gfp &= ~(__GFP_DIRECT_RECLAIM | __GFP_RETRY_MAYFAIL);
+		if (shmem->pages_bounded_reclaim)
+			gfp &= ~(__GFP_IO | __GFP_FS);
 		mapping_set_gfp_mask(obj->filp->f_mapping, gfp);
 	}
 

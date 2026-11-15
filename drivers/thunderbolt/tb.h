@@ -447,6 +447,8 @@ struct tb_path {
 	bool clear_fc;
 	int path_length;
 	bool alloc_hopid;
+	struct tb_regs_hop *sleep_hops;
+	bool sleep_valid;
 
 	struct tb_path_hop hops[] __counted_by(path_length);
 };
@@ -764,6 +766,22 @@ static inline int tb_port_write(struct tb_port *port, const void *buffer,
 
 struct tb *icm_probe(struct tb_nhi *nhi);
 struct tb *tb_probe(struct tb_nhi *nhi);
+#if IS_ENABLED(CONFIG_KUNIT)
+int tb_consumed_dp_bandwidth(struct tb *tb, struct tb_port *src_port,
+			     struct tb_port *dst_port, struct tb_port *port,
+			     int *consumed_up, int *consumed_down);
+u32 tb_dp_host_rate_limit(struct tb *tb);
+void tb_dp_host_tunnel_gone(struct tb *tb, unsigned int before);
+#endif
+#if IS_ENABLED(CONFIG_USB4_KUNIT_TEST)
+size_t tb_test_cm_size(void);
+void tb_test_cm_init(struct tb *tb);
+struct list_head *tb_test_cm_tunnels(struct tb *tb);
+struct list_head *tb_test_cm_dp_resources(struct tb *tb);
+void tb_test_cm_set_relink_deferred(struct tb *tb, bool deferred);
+bool tb_test_cm_relink_armed(struct tb *tb);
+void tb_test_cm_stop(struct tb *tb);
+#endif
 
 extern const struct device_type tb_domain_type;
 extern const struct device_type tb_retimer_type;
@@ -772,6 +790,8 @@ extern const struct device_type usb4_port_device_type;
 
 int tb_domain_init(void);
 void tb_domain_exit(void);
+void tb_dp_pm_gate_init(void);
+void tb_dp_pm_gate_exit(void);
 int tb_xdomain_init(void);
 void tb_xdomain_exit(void);
 
@@ -781,6 +801,10 @@ void tb_domain_remove(struct tb *tb);
 int tb_domain_suspend_noirq(struct tb *tb);
 int tb_domain_resume_noirq(struct tb *tb);
 int tb_domain_suspend(struct tb *tb);
+int tb_cio_sleep_prepare(struct tb *tb);
+int tb_cio_sleep(struct tb *tb);
+int tb_cio_wake(struct tb *tb, bool *host_pci_lost);
+void tb_cio_sleep_complete(struct tb *tb);
 int tb_domain_freeze_noirq(struct tb *tb);
 int tb_domain_thaw_noirq(struct tb *tb);
 void tb_domain_complete(struct tb *tb);
@@ -857,6 +881,7 @@ int tb_switch_configuration_valid(struct tb_switch *sw);
 int tb_switch_add(struct tb_switch *sw);
 void tb_switch_remove(struct tb_switch *sw);
 void tb_switch_suspend(struct tb_switch *sw, bool runtime);
+int tb_switch_suspend_cio(struct tb_switch *sw);
 int tb_switch_resume(struct tb_switch *sw, bool runtime);
 int tb_switch_reset(struct tb_switch *sw);
 int tb_switch_wait_for_bit(struct tb_switch *sw, u32 offset, u32 bit,
@@ -1043,6 +1068,7 @@ int tb_switch_tmu_post_time(struct tb_switch *sw);
 int tb_switch_tmu_disable(struct tb_switch *sw);
 int tb_switch_tmu_enable(struct tb_switch *sw);
 int tb_switch_tmu_configure(struct tb_switch *sw, enum tb_switch_tmu_mode mode);
+bool tb_switch_tmu_host_managed(const struct tb_switch *sw);
 
 /**
  * tb_switch_tmu_is_configured() - Is given TMU mode configured
@@ -1145,6 +1171,8 @@ static inline bool tb_port_is_apple_host_dpin(const struct tb_port *port)
 	return tb->nhi->host_dp_policy & TB_HOST_DP_NOTIFY;
 }
 
+bool tb_has_apple_host_dp_tunnel(struct tb *tb);
+
 static inline bool tb_port_needs_host_dp_credits(const struct tb_port *port)
 {
 	const struct tb *tb = port->sw->tb;
@@ -1226,6 +1254,10 @@ struct tb_path *tb_path_alloc(struct tb *tb, struct tb_port *src, int src_hopid,
 void tb_path_free(struct tb_path *path);
 int tb_path_activate(struct tb_path *path);
 void tb_path_deactivate(struct tb_path *path);
+int tb_path_sleep_prepare(struct tb_path *path);
+int tb_path_sleep(struct tb_path *path);
+int tb_path_wake(struct tb_path *path);
+void tb_path_sleep_complete(struct tb_path *path);
 int tb_path_deactivate_hop(struct tb_port *port, int hop_index);
 bool tb_path_is_invalid(struct tb_path *path);
 bool tb_path_port_on_path(const struct tb_path *path,

@@ -26,20 +26,27 @@ description:
   SART3, first seen in M1 Pro/Max, extends both the address space and filter
   entry size to 42 bit.
 
+  SART4, seen on M5 Ultra (T6050), keeps SART3's entries but moves the
+  address and size arrays, so it has no SART3 fallback.
+
 properties:
   compatible:
     oneOf:
       - items:
           - enum:
               - apple,t6020-sart
+              - apple,t6030-sart
+              - apple,t6031-sart
               - apple,t6041-sart
               - apple,t8112-sart
               - apple,t8122-sart
               - apple,t8132-sart
               - apple,t8140-sart
+              - apple,t8142-sart
           - const: apple,t6000-sart
       - enum:
           - apple,t6000-sart
+          - apple,t6050-sart
           - apple,t8015-sart
           - apple,t8103-sart
 
