@@ -51,6 +51,12 @@ concurrency and system suspend require separate kernel/hardware qualification.
 Kernel KUnit tests and apple-afkv2 remain separate tests in their existing
 standard layouts. No archived diagnostic script is a dependency of this suite.
 
+The external VRR callback fixture checks H17P video-power-savings updates,
+delayed and rejected replies, continuation ordering and modeset-cookie lifetime.
+Synthetic external TimingElements cover an explicit 48-144 Hz range and invalid
+or absent ranges. These are host checks; they do not establish monitor refresh,
+idle maximum refresh, flicker, or the firmware's acceptance of Variable mode.
+
 The display group's desktop-gamma fixture executes the production A420/A421
 callbacks and composition with synthetic tables. It checks full return-status
 handling, the external empty status-2 reply, internal-panel diagnostics,

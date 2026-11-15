@@ -1866,12 +1866,6 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 	if (dcp->crashed)
 		return crtc_state && crtc_state->enable ? -EINVAL : 0;
 
-	/* External H17P does not program adaptive sync. */
-	if (dcp->hw.iomfb_method_profile ==
-	    DCP_IOMFB_METHODS_H17P_EXTERNAL &&
-	    crtc_state->vrr_enabled)
-		return -EINVAL;
-
 	/*
 	 * On desktop 26.6 firmware the panel takes VRR_ENABLED with the next
 	 * frame, without a mode set (see dcp_vrr_update()).  The external

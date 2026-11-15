@@ -6,6 +6,7 @@
 #include <linux/err.h>
 #include <linux/limits.h>
 #include <linux/math.h>
+#include <linux/math64.h>
 #include <linux/string.h>
 #include <linux/slab.h>
 
@@ -1015,11 +1016,12 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		return -EINVAL;
 
 	/*
-	 * External H17P stays fixed. Desktop zero placeholders are also an
-	 * absent range; a partial or duplicate pair must not enable fallback.
+	 * Desktop zero placeholders are also an absent range; a partial or
+	 * duplicate pair must not enable fallback. External ranges are explicit
+	 * firmware metadata, never inferred from a panel fallback.
 	 */
 	vrr_fallback = !vrr_seen || (vrr_seen == 3 && handle->zero_vrr_range_fallback);
-	if (!external_sdr && !vrr_ambiguous)
+	if (!vrr_ambiguous)
 		out->vrr = dcp_refresh_range(vert.precise_sync_rate, min_vrr,
 					     max_vrr, internal && vrr_fallback,
 					     &out->min_vrr, &out->max_vrr);
@@ -1327,6 +1329,30 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 	}
 	if (best_mode != NULL)
 		best_mode->mode.type |= DRM_MODE_TYPE_PREFERRED;
+
+	/*
+	 * An H17P external offers variable refresh only at its default
+	 * timing, as macOS does (Variable 48-144 Hz at 2560x1440 on a 144 Hz
+	 * monitor), and never above that timing's own rate: the firmware
+	 * reports the sink's whole range (48-240 Hz) for it. Every other
+	 * timing stays fixed.
+	 */
+	if (external_sdr && !internal) {
+		unsigned int i;
+
+		for (i = 0; i < *count; i++) {
+			struct dcp_display_mode *m = &modes[i];
+			u32 nominal = m->mode.htotal && m->mode.vtotal ?
+				div_u64((u64)m->mode.clock * 1000 << 16,
+					(u32)m->mode.htotal * m->mode.vtotal) : 0;
+
+			if (m != best_mode)
+				m->vrr = false;
+			else if (m->vrr && nominal && m->max_vrr > nominal)
+				m->max_vrr = nominal;
+			m->needs_timestamps = m->vrr;
+		}
+	}
 
 	if (handle->automatic_1080p180_rgb8) {
 		unsigned int i, kept = 0;

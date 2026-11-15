@@ -1864,7 +1864,7 @@ int main(void)
         state.crtc.vrr_enabled = vrr;
         dcp.connector = link == 2 ? NULL : &connector;
         connector.connected = link == 1;
-        int expected = profile == DCP_IOMFB_METHODS_H17P_EXTERNAL && vrr ? -EINVAL : 0;
+        int expected = 0;
         int actual = dcp_crtc_atomic_check(&crtc, &state);
         if (actual != expected) {
             fprintf(stderr, "profile=%u valid=%u modeset=%u link=%u vrr=%u: got %d expected %d\n",
