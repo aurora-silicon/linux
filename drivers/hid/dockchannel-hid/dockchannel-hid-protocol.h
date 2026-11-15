@@ -52,4 +52,15 @@ static inline void dchid_pm2_command(u8 iface, u8 state, bool has_changed,
 	cmd[4] = has_changed;
 }
 
+/*
+ * Whether a failed receive-ring command is to be absorbed. Only a node that
+ * has an MMIO FIFO receive path of its own (fifo_fallback) may fall back to
+ * it; the T6041 ring is its only receive path and its failure must fail the
+ * interface start.
+ */
+static inline bool dchid_ring_refused(int ret, bool fifo_fallback)
+{
+	return ret < 0 && fifo_fallback;
+}
+
 #endif /* _DOCKCHANNEL_HID_PROTOCOL_H */
