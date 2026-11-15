@@ -4734,6 +4734,18 @@ void dcp_poweron(struct platform_device *pdev)
 			dcp_relink_wake(&dcp->relink,
 					READ_ONCE(dcp->typec_generation), jiffies);
 			spin_unlock_irqrestore(&dcp->relink_lock, flags);
+		} else if (READ_ONCE(dcp->typec_cable_connected)) {
+			unsigned long flags;
+
+			/*
+			 * The first enable for a sink that was attached while the
+			 * outputs were off: DCP trains its link only now. Time the
+			 * relink window from here, keeping the attachment's retries.
+			 */
+			spin_lock_irqsave(&dcp->relink_lock, flags);
+			dcp_relink_link_up(&dcp->relink,
+					   READ_ONCE(dcp->typec_generation), jiffies);
+			spin_unlock_irqrestore(&dcp->relink_lock, flags);
 		}
 
 		/*
