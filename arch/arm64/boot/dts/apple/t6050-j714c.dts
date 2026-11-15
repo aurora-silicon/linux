@@ -207,9 +207,32 @@
 	gpio-reserved-ranges = <0 80>, <81 25>, <108 113>;
 };
 
-/* This board's SMC fan and power keys are not yet checked */
+/*
+ * SMC sensors, as on J714s: the J714cAP SMC has the same two fans (F0Ac/F1Ac,
+ * 2317..7826 rpm, mode keys F0md/F1md), power, voltage and current keys, plus
+ * every readable float T* key through apple,discover-temperatures in
+ * t6050-die0.dtsi. Discovery refuses to run once any temperature channel
+ * exists, so the shared temperature nodes and apple,soc-die-keys go.
+ */
+#include "hwmon-common.dtsi"
+#include "hwmon-fan-dual.dtsi"
+#include "hwmon-laptop.dtsi"
+
 &smc_hwmon {
-	status = "disabled";
+	/delete-property/ apple,soc-die-keys;
+	/delete-node/ temperature-TH0x;
+	/delete-node/ temperature-TB0T;
+	/delete-node/ temperature-TCHP;
+	/delete-node/ temperature-TW0P;
+
+	/* The T6050 SMC spells the fan mode keys F0md/F1md. The SMC drives the fans. */
+	fan-F0Ac {
+		apple,fan-mode = "F0md";
+	};
+
+	fan-F1Ac {
+		apple,fan-mode = "F1md";
+	};
 };
 
 /*
