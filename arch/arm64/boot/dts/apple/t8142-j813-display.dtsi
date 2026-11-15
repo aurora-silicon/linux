@@ -12,8 +12,12 @@
 	aliases {
 		dcp = &dcp;
 		disp0 = &display;
-		disp0_piodma = &disp0_piodma;
-		/* The canonical name; aura (#165) prefers it on T8142, the kernel still finds the legacy one. */
+		/*
+		 * The loader reserves the display's regions through this alias
+		 * (aura's dt_set_display(); the canonical name since
+		 * aurora-silicon/aura#165). J813 keeps the legacy disp0_piodma
+		 * as well, for its earlier loaders.
+		 */
 		disp0-piodma = &disp0_piodma;
 	};
 
