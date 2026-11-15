@@ -188,9 +188,13 @@ pub(super) const BUILD_25G83: fw::variant::Build = fw::variant::Build {
             ],
         },
     ],
-    // Four clusters: the tiler segment values of 25F84 on this machine.
+    // Four clusters tile clustered with the four-cluster segment words (fw::m5::target::
+    // cluster_control). A clustered RD32 Minecraft frame needs ~1600-2200 heap blocks, past
+    // the 0x45e normal maximum, and at that maximum a four-cluster pass never starts (reason 0
+    // recoveries), so the heap may use every slot of the block table.
     variant: &fw::variant::Variant {
-        ta_mode_1: true,
+        ta_mode_1: false,
+        tvb_normal_blocks: crate::g17::fw::buffer::NORMAL_MAX_BLOCKS_FOUR_CLUSTERS,
         ..fw::variant::V25G83
     },
     config: None,
