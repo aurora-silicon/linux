@@ -620,7 +620,7 @@
 	status = "okay";
 };
 
-/* The ProRes encoder; it probes only with the Mac's own apple/prores-t8142-init.bin. */
+/* The ProRes encoder (built-in T8142 rows; apple/prores-t8142-init.bin replaces them). */
 &ps_scodec {
 	status = "okay";
 };
