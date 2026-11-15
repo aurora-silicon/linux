@@ -962,7 +962,7 @@ static int ane_h16_map(void *ctx)
 	    !(h->domain->pgsize_bitmap & SZ_16K))
 		return -EOPNOTSUPP;
 	/* Never widen a finalized DART aperture by assigning geometry fields. */
-	for (i = 0; i < 4; i++) {
+	for (i = 0; i < b->soc->dapf_count; i++) {
 		u64 page = round_down(b->ranges[i][0], SZ_16K);
 
 		if (!ane_fw_contains(h->domain->geometry.aperture_start,
@@ -991,7 +991,7 @@ static int ane_h16_map(void *ctx)
 	ret = ane_h16_map_heap_tail(h);
 	if (ret)
 		return ret;
-	for (i = 0; i < 4; i++) {
+	for (i = 0; i < b->soc->dapf_count; i++) {
 		u64 page = round_down(b->ranges[i][0], SZ_16K);
 
 		ret = ane_h16_map_range(h, page, page, SZ_16K,
@@ -1657,6 +1657,8 @@ static int ane_h16_acquire(struct platform_device *pdev, struct ane_h16_device *
 	for (i = 0; i < ARRAY_SIZE(names); i++) {
 		struct resource *r = platform_get_resource_byname(pdev, IORESOURCE_MEM, names[i]);
 
+		if (i == ANE_H16_XL && !h->boot.soc->has_xl)
+			continue;
 		if (!r)
 			return -ENODEV;
 		h->window[i] = ioremap_np(r->start, resource_size(r));
@@ -2061,11 +2063,14 @@ int ane_h16_backend_probe(struct platform_device *pdev, const struct ane_fw_plat
 	h->boot.ctx = h;
 	h->boot.ops = &ane_h16_ops;
 	h->boot.transport_ops = &ane_h16_transport_ops;
+	ret = -EINVAL;
+	if (!soc->dapf_count || soc->dapf_count > ANE_FW_DAPF_MAX)
+		goto free;
 	ret = of_property_read_u64_array(h->dev->of_node, "apple,dapf-ranges",
-					 &h->boot.ranges[0][0], 8);
+					 &h->boot.ranges[0][0], soc->dapf_count * 2);
 	if (ret)
 		goto free;
-	for (i = 0; i < 4; i++) {
+	for (i = 0; i < soc->dapf_count; i++) {
 		u64 start = h->boot.ranges[i][0], end = h->boot.ranges[i][1];
 
 		ret = -EINVAL;
