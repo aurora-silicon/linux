@@ -1652,6 +1652,13 @@ static int __init apple_soc_cpufreq_module_init(void)
 			apple_fast_die_hp_state = ret;
 	}
 
+	/*
+	 * Start with boost enabled, so that the turbo-mode states are usable
+	 * without userspace having to turn boost on first. It can still be
+	 * switched off globally or per policy through sysfs.
+	 */
+	apple_soc_cpufreq_driver.boost_enabled = true;
+
 	ret = cpufreq_register_driver(&apple_soc_cpufreq_driver);
 	if (ret && apple_fast_die_hp_state > 0)
 		cpuhp_remove_state_nocalls(apple_fast_die_hp_state);
