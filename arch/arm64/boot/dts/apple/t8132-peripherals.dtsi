@@ -365,12 +365,9 @@
 		interrupts = <AIC_IRQ 629 IRQ_TYPE_LEVEL_HIGH>,
 			     <AIC_IRQ 642 IRQ_TYPE_LEVEL_HIGH>;
 		iommus = <&ane_dart0 0>, <&ane_dart1 0>, <&ane_dart2 0>;
-		/*
-		 * Gate 292 (ANE-SYS-V) resolves to physical gate 155 (ANE_SYS).
-		 * Gate 396 (ANE-SYS-V-PMP) is a virtual PMP notification, not a
-		 * PMGR power state, and has no genpd provider yet.
-		 */
-		power-domains = <&ps_ane_sys>;
+		/* The T6041 order: ANE_SYS, then the CPU, MPM, TD and base. */
+		power-domains = <&ps_ane_sys>, <&ps_ane_cpu>, <&ps_ane_mpm>,
+				<&ps_ane_td>, <&ps_ane_base>;
 		apple,ane-type = <0x100>;
 		apple,firmware-preloaded;
 		/* ADT dapf-instance-0: inclusive CPU addresses, in record order. */
