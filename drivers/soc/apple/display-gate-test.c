@@ -1014,8 +1014,22 @@ static void __init gate_t6041_staged_steps(struct kunit *test)
 				    "step %u", i);
 }
 
+static void __init gate_t6041_firmware_compat_test(struct kunit *test)
+{
+	const u32 desktop[] = { 26, 6, 2 };
+	const u32 v27[] = { 27, 2, 0 };
+	const u32 old[] = { 26, 5, 2 };
+	const u32 unknown[] = { 27, 3, 0 };
+
+	KUNIT_EXPECT_TRUE(test, gate_t6041_firmware_compat(desktop));
+	KUNIT_EXPECT_TRUE(test, gate_t6041_firmware_compat(v27));
+	KUNIT_EXPECT_FALSE(test, gate_t6041_firmware_compat(old));
+	KUNIT_EXPECT_FALSE(test, gate_t6041_firmware_compat(unknown));
+}
+
 static struct kunit_case gate_t6041_cases[] __refdata = {
 	KUNIT_CASE(gate_t6041_staged_steps),
+	KUNIT_CASE(gate_t6041_firmware_compat_test),
 	{}
 };
 
