@@ -3824,7 +3824,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	};
 	dcp->output_pq = dcp->pq_requested && mode->pq.score >= 0;
 
-	/* VRR modes need swap timestamps, see iomfb_flush(); ProMotion fixed 120 too. */
+	/* VRR modes need swap timestamps, see iomfb_flush(); so do fixed internal timings. */
 	dcp->use_timestamps = mode->needs_timestamps;
 
 	/* A display within one pipe may let the other input have a pipe again. */
