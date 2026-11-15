@@ -267,24 +267,6 @@ enum dcp_iomfb_method_profile {
 };
 
 /*
- * The internal display's power words for hw.s2r, see dcp_s2r_domains_off(): its domains'
- * offsets in "ps", its retention controls in "pwrgate" (the PMGR's per-device "retention"
- * words: flip-flops 3 off / 0 on, memories 0 off / 1 on), and the DART streams its firmware
- * and scanout use.
- */
-struct dcp_s2r_layout {
-	u32 disp_cpu;
-	u32 disp_fe;
-	u32 disp_sys;
-	u32 ret_ff;
-	u32 ret_mem;
-	u32 dcp_streams;
-	u32 disp_streams;
-	/* "pmc-dcp" counts the powered DCPs: T8132 and T8140 only */
-	bool pmc_dcp;
-};
-
-/*
  * A T6041 display pipe's PMGR power words, as offsets in the "ps" window of its
  * apple,display-power node: SYS, FE and the coprocessor's CPU. The pipe's own
  * sub-blocks have their words right after the CPU's, 8 bytes apart: @blocks of

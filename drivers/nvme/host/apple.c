@@ -1775,7 +1775,7 @@ static int apple_nvme_start_from_off(struct apple_nvme *anv)
 						 boot_status == APPLE_ANS_BOOT_STATUS_OK,
 						 USEC_PER_MSEC, APPLE_ANS_BOOT_TIMEOUT);
 		if (!ret || attempt || !anv->reset) {
-			if (anv->hw->sleep_traced)
+			if (anv->hw->sleep_coproc)
 				apple_rtkit_set_warm_epmap_mask(anv->rtk,
 								anv->hw->sleep_epmap_last_mask);
 			else
