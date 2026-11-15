@@ -428,6 +428,11 @@
 /* Left-back port (ATC0) */
 #include "t6050-j714s-left-back.dtsi"
 
+/* The three routers' LSTX pins (77, 79 and 81) are the only AOP GPIOs exposed. */
+&pinctrl_aop {
+	gpio-reserved-ranges = <0 77>, <78 1>, <80 1>, <82 3>;
+};
+
 /*
  * The PMP (ADT pmp0, /chosen, /arm-io/pmgr). iBoot loads its firmware and the driver starts it
  * with these boot arguments and the firmware properties below. Its report tells it which devices
