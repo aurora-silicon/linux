@@ -967,6 +967,8 @@ struct apple_dcp {
 	/* w88: log every message sent to the firmware until this jiffies value. */
 	unsigned long tb_irq_log_until;
 	ktime_t tb_irq_log_t0;
+	/* w88: jiffies when the last set_digital_out_mode finished; see tb_hpd0_hold_ms. */
+	unsigned long tb_modeset_done_jiffies;
 
 	/* Kept last: the template instances share the layout above. */
 	struct dcp_desktop_state *desktop;

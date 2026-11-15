@@ -3426,6 +3426,13 @@ void dcp_tb_modeset_end(struct apple_dcp *dcp)
 {
 	bool held;
 
+	WRITE_ONCE(dcp->tb_modeset_done_jiffies, jiffies);
+	if (tb_irq_log_ms && dcp->external) {
+		dcp->tb_irq_log_t0 = ktime_get();
+		WRITE_ONCE(dcp->tb_irq_log_until,
+			   jiffies + msecs_to_jiffies(tb_irq_log_ms) + 1);
+	}
+
 	scoped_guard(mutex, &dcp->tb_event_lock) {
 		WRITE_ONCE(dcp->tb_modeset_busy, false);
 		held = test_bit(DCP_TB_EVENT_IRQ_HPD, &dcp->tb_events);

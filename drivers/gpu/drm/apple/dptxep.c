@@ -213,12 +213,32 @@ int dptxport_release_display(struct apple_epic_service *service)
 	return afk_service_call(service, 0, 7, NULL, 0, 16, NULL, 0, 16);
 }
 
+/* w88 experiment: skip an HPD-low request this soon after a mode set ended. */
+static unsigned int tb_hpd0_hold_ms;
+module_param(tb_hpd0_hold_ms, uint, 0644);
+MODULE_PARM_DESC(tb_hpd0_hold_ms,
+		 "Skip set_hpd(0) within this many ms after a mode set finished; 0 = off");
+
 int dptxport_set_hpd_timeout(struct apple_epic_service *service, bool hpd,
 			     unsigned int timeout_ms)
 {
 	struct dcpdptx_hotplug_cmd cmd, resp;
 	size_t received;
 	int ret;
+
+	if (!hpd) {
+		struct apple_dcp *dcp = service->ep->dcp;
+		unsigned long done = READ_ONCE(dcp->tb_modeset_done_jiffies);
+		bool hold = tb_hpd0_hold_ms && done &&
+			    time_before(jiffies, done + msecs_to_jiffies(tb_hpd0_hold_ms));
+
+		dev_info(dcp->dev, "w88-hpd: set_hpd(0) %s, %u ms after the last mode set\n",
+			 hold ? "SKIPPED" : "sent",
+			 done ? jiffies_to_msecs(jiffies - done) : 0);
+		dump_stack();
+		if (hold)
+			return 0;
+	}
 
 	/* The 14.7 external role completes an HPD low only once its AV client closed. */
 	if (!hpd)

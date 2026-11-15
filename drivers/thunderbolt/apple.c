@@ -458,6 +458,8 @@ struct apple_cio {
 		struct apple_nhi *diag_anhi;	/* set at tunnel activation, read by the IRQ diagnostics */
 		unsigned int diag_count;	/* sink IRQ_HPD events logged, on dp_wq only */
 		u8 diag_port;		/* the DP IN adapter's port number for the diagnostics */
+		struct delayed_work diag_poll;	/* w88: periodic DP IN samples after tunnel activation */
+		unsigned int diag_polls;
 	} dpin[APPLE_DPIN_MAX];
 };
 
@@ -804,6 +806,26 @@ static void apple_dpin_event_fn(struct work_struct *work)
 			apple_dpin_diag(c, t);
 		}
 	}
+}
+
+static unsigned int dpin_poll_ms;
+module_param(dpin_poll_ms, uint, 0644);
+MODULE_PARM_DESC(dpin_poll_ms,
+		 "Log the DP IN adapter every this many ms after a DP tunnel activates; 0 = off");
+
+static unsigned int dpin_poll_count = 160;
+module_param(dpin_poll_count, uint, 0644);
+MODULE_PARM_DESC(dpin_poll_count, "Samples per tunnel activation for dpin_poll_ms (default: 160)");
+
+static void apple_dpin_diag_poll_fn(struct work_struct *work)
+{
+	struct apple_dpin_ctx *c = container_of(work, struct apple_dpin_ctx, diag_poll.work);
+
+	if (!READ_ONCE(c->diag_anhi) || !dpin_poll_ms || c->diag_polls >= dpin_poll_count)
+		return;
+	apple_dpin_diag(c, c->diag_polls * dpin_poll_ms);
+	c->diag_polls++;
+	queue_delayed_work(system_dfl_wq, &c->diag_poll, msecs_to_jiffies(dpin_poll_ms));
 }
 
 static void apple_dpin_request_mask_irqs(void *data)
@@ -1190,6 +1212,7 @@ static void apple_cio_destroy_wq(void *data)
 	for (unsigned int i = 0; i < ARRAY_SIZE(acio->dpin); i++) {
 		cancel_delayed_work_sync(&acio->dpin[i].retry);
 		cancel_delayed_work_sync(&acio->dpin[i].poll);
+		cancel_delayed_work_sync(&acio->dpin[i].diag_poll);
 	}
 	destroy_workqueue(acio->dp_wq);
 }
@@ -2373,6 +2396,10 @@ static void apple_nhi_dp_tunnel_changed(struct tb_nhi *nhi, u8 in_port,
 		WRITE_ONCE(c->diag_anhi, active ? anhi : NULL);
 		c->diag_port = in_port;
 		c->diag_count = 0;
+	}
+	if (active && dpin_poll_ms) {
+		acio->dpin[dpin].diag_polls = 0;
+		mod_delayed_work(system_dfl_wq, &acio->dpin[dpin].diag_poll, 0);
 	}
 	queue_work(acio->dp_wq, &acio->dpin[dpin].work);
 }
@@ -4031,6 +4058,7 @@ static int apple_cio_probe(struct platform_device *pdev)
 			INIT_WORK(&acio->dpin[i].work, apple_dpin_work_fn);
 			INIT_DELAYED_WORK(&acio->dpin[i].retry, apple_dpin_retry_fn);
 			INIT_DELAYED_WORK(&acio->dpin[i].poll, apple_dpin_poll_fn);
+			INIT_DELAYED_WORK(&acio->dpin[i].diag_poll, apple_dpin_diag_poll_fn);
 			INIT_WORK(&acio->dpin[i].event_work, apple_dpin_event_fn);
 			ret = devm_mutex_init(dev, &acio->dpin[i].lock);
 			if (ret)
