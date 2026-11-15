@@ -202,7 +202,7 @@ impl InitData {
         m::encode_common26_aon_ptd(board, &mut self.object_mut(aon)?.bytes_mut()[..m::M5_AON_PTD_SIZE])
             .map_err(|_| EINVAL)?;
         if common26 {
-            m::encode_common26_board_region_c(
+            m::encode_common26_board_region_c(board,
                 &mut self.object_mut(self.region_c)?.bytes_mut()[..m::REGION_C_SIZE])
                 .map_err(|_| EINVAL)?;
             m::encode_common26_private_cluster(board.graph.profile, PRIVATE, FWCTL,

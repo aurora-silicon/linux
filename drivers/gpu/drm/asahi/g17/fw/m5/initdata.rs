@@ -2319,11 +2319,19 @@ pub(crate) fn encode_common26_bundle_policy(
 /// Encode a common 26A428 region C from the board's 25G76 one: the fields from +0x38 on move up
 /// by four, plus the fields 26A428 added. Unlike [`encode_common26_region_c`] it keeps the
 /// board's own tunables (standby timer, minimum confidence, state counts).
-pub(crate) fn encode_common26_board_region_c(out: &mut [u8]) -> Result<(), InitdataError> {
+pub(crate) fn encode_common26_board_region_c(
+    board: &Board,
+    out: &mut [u8],
+) -> Result<(), InitdataError> {
     if out.len() != REGION_C_SIZE {
         return Err(InitdataError::BufferSize);
     }
-    encode_region_c_for_profile(RootProfile::J813G17G25G76, out)?;
+    let source = if board.chip_id == 0x8140 {
+        RootProfile::J700G17P
+    } else {
+        RootProfile::J813G17G25G76
+    };
+    encode_region_c_for_profile(source, out)?;
     let shifted = ABI_ALLOCATION_SIZES_25G76[ALLOC_REGION_C];
     if out[shifted..].iter().any(|byte| *byte != 0) {
         return Err(InitdataError::BufferSize);
@@ -2346,8 +2354,8 @@ const fn hw_offset(board: &Board, offset: usize) -> usize {
     }
 }
 
-/// What the M5 graph's HW data and power policy depend on per board. Every board is a T6050
-/// running the same firmware build; [`crate::g17::Config::m5`] names the board's.
+/// What a packed G17 graph's HW data and power policy depend on per board.
+/// [`crate::g17::Config::m5`] names the board selected by the identified build.
 pub(crate) struct Board {
     /// The chip ID the HW data names.
     chip_id: u32,
@@ -2411,6 +2419,9 @@ pub(crate) struct Board {
     /// Whether explicit waits on other kicks take the completion class
     /// ([`Board::completion_inputs`]).
     completion_inputs: bool,
+    /// Whether queues and register programs use the single-cluster G17 forms shared by J700
+    /// and J813 rather than the multi-cluster M5 Pro forms.
+    j813_forms: bool,
 }
 
 /// M5 Pro: two clusters of ten cores.
@@ -2441,6 +2452,7 @@ pub(crate) const J714: Board = Board {
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
     completion_inputs: true,
+    j813_forms: false,
 };
 
 /// M5 Max: four clusters of ten cores.
@@ -2473,6 +2485,7 @@ pub(crate) const J716C: Board = Board {
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
     completion_inputs: false,
+    j813_forms: false,
 };
 
 /// J775D's performance controllers run from P3.
@@ -2515,6 +2528,108 @@ pub(crate) const J775D: Board = Board {
     fan_curve_start_mc: 97_000,
     g17d_forms: true,
     completion_inputs: false,
+    j813_forms: false,
+};
+
+/// A18 Pro (J700) on the common 26B123 graph. The performance rows are the eleven states the
+/// existing J700 table A selects from the device tree; unused rows stay zero.
+const J700_GPU_PERF_STATES: [M5PerfState; 14] = one_table([
+    (0, 125, 765), (338, 605, 765), (492, 630, 765), (618, 650, 765),
+    (796, 695, 765), (928, 745, 765), (1056, 800, 800), (1170, 845, 845),
+    (1278, 885, 885), (1338, 905, 905), (1470, 975, 975),
+    (1470, 975, 975), (1470, 975, 975), (1470, 975, 975),
+]);
+
+/// Relative performance of the J700 table-A rows, in percent.
+const J700_GPU_RELATIVE_POWER: [u32; 14] =
+    [0, 15, 22, 29, 42, 56, 74, 86, 90, 92, 100, 0, 0, 0];
+
+/// Relative performance of the J700 table-B rows, in percent.
+const J700_GPU_RELATIVE_FREQUENCY: [u32; 16] =
+    [0, 0, 13, 24, 40, 52, 63, 73, 83, 88, 100, 0, 0, 0, 0, 0];
+
+const J700_GPU_BASE: u64 = 0x4_8000_0000;
+
+/// J700's existing register windows expressed in the packed common-graph form.
+const J700_REGISTER_WINDOWS: [M5RegisterWindowSpec; 18] = {
+    const G: u64 = J700_GPU_BASE;
+    [
+        jw(0, &[0x3_0101_4000], 0x4000, 0, 2),
+        jw(3, &[0x2_2010_4000], 0x18000, 0, 2),
+        jw(9, &[0x3_003d_0000], 0x1000, 0, 2),
+        jw(10, &[0x3_003c_0000], 0x2000, 0, 0),
+        jw(12, &[0x4_0165_c000], 0x4000, 0, 2),
+        jw(14, &[0x3_0028_0000], 0x8000, 0, 0),
+        jw(17, &[G], 0x21400, 0, 2),
+        jw(22, &[G + 0x100_0000], 0x8000, 0, 2),
+        jw(26, &[G + 0xd0_4000], 0x8000, 0xd0_4000, 2),
+        jw(27, &[G + 0xd0_d000], 0x1000, 0xd0_d000, 2),
+        jw(28, &[G + 0xd5_8000], 0x8000, 0xd5_8000, 2),
+        jw(29, &[G + 0xd1_0000], 0x4000, 0xd1_0000, 2),
+        jw(31, &[G + 0xd4_0000], 0x4000, 0xd4_0000, 2),
+        jw(32, &[G + 0xd6_0000], 0x4000, 0xd6_0000, 2),
+        jw(35, &[G + 0xe0_0000], 0x4000, 0xe0_0000, 2),
+        jw(39, &[G + 0xe0_8000], 0x8000, 0, 2),
+        jw(40, &[G + 0xe1_c000], 0x4000, 0xe1_c000, 2),
+        jw(41, &[G + 0xe1_f800], 0x4000, 0, 0),
+    ]
+};
+
+/// Register-map slots reserved by the J700 graph but not backed by a window.
+const J700_RESERVED_REGISTER_SLOTS: [usize; 17] =
+    [2, 5, 6, 7, 8, 30, 33, 34, 37, 38, 42, 43, 46, 47, 48, 49, 52];
+
+const fn j700_register_slot_flags() -> [u32; COMMON26_HW_REGISTER_MAP_SLOTS] {
+    let mut flags = [0; COMMON26_HW_REGISTER_MAP_SLOTS];
+    let mut index = 0;
+    while index < J700_REGISTER_WINDOWS.len() {
+        let window = J700_REGISTER_WINDOWS[index];
+        flags[window.slot] = window.flag;
+        index += 1;
+    }
+    index = 0;
+    while index < J700_RESERVED_REGISTER_SLOTS.len() {
+        flags[J700_RESERVED_REGISTER_SLOTS[index]] = 2;
+        index += 1;
+    }
+    flags
+}
+
+const J700_HW_REGISTER_SLOT_FLAGS: [u32; COMMON26_HW_REGISTER_MAP_SLOTS] =
+    j700_register_slot_flags();
+
+/// The common graph requires an AON row even when the board has no separate AON tuning table.
+const J700_AON_RECORDS: [[u32; 3]; 1] = [[0; 3]];
+
+/// J700 on macOS 27.2 (26B123): one cluster with six cores on the common 27.2 graph.
+pub(crate) const J700_26B123: Board = Board {
+    chip_id: 0x8140,
+    graph: &COMMON26B123_GRAPH,
+    hw_data_insert: false,
+    clusters: 1,
+    gpu_cores: 6,
+    core_revision: (0x1e, 4),
+    perf_state_count: 10,
+    perf_states: &J700_GPU_PERF_STATES,
+    perf_tables: 1,
+    aux_perf_states: None,
+    relative_frequency: J700_GPU_RELATIVE_FREQUENCY,
+    relative_power: Some(&J700_GPU_RELATIVE_POWER),
+    aon_records: &J700_AON_RECORDS,
+    register_windows: &J700_REGISTER_WINDOWS,
+    register_slot_flags: Some(&J700_HW_REGISTER_SLOT_FLAGS),
+    min_parameter_buffer: (super::target::min_parameter_buffer_pages(1) << 15) as u32,
+    render_pool: (0x10_0000, 1 << 31),
+    calibration: None,
+    controller_defaults: None,
+    idle_standby_us: None,
+    mcc_mask: Some(1),
+    topology_words: None,
+    hw_words: &[],
+    fan_curve_start_mc: 84_000,
+    g17d_forms: false,
+    completion_inputs: false,
+    j813_forms: true,
 };
 
 /// M5 (T8142, MacBook Air J813): one cluster of ten core slots, eight enabled. Values from the
@@ -2555,6 +2670,7 @@ pub(crate) const J813: Board = Board {
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
     completion_inputs: false,
+    j813_forms: true,
 };
 
 /// The J813 on its macOS 27.2 (26B123) firmware: the same board on the common 26B123 graph.
@@ -2933,10 +3049,10 @@ impl Board {
         self.completion_inputs
     }
 
-    /// Whether this is the J813, whose register programs macOS 27.0 writes in the common 26A428
-    /// forms rather than the M5 Pro's (read out of its own kicks under aura).
+    /// Whether the board uses the single-cluster common-G17 register-program and queue forms
+    /// rather than the M5 Pro's multi-cluster forms.
     pub(crate) const fn j813_forms(&self) -> bool {
-        self.chip_id == 0x8142
+        self.j813_forms
     }
 
     /// The board's `index`th register window.
@@ -3660,4 +3776,46 @@ pub(crate) fn encode_m5_policy_controller_defaults_j775d(out: &mut [u8]) -> Resu
         }
     }
     Ok(())
+}
+
+use kernel::prelude::kunit_tests;
+
+#[kunit_tests(asahi_g17_fw272_layout)]
+mod fw272_tests {
+    use super::*;
+
+    #[test]
+    fn j700_26b123_uses_the_common_layout_delta() {
+        assert_eq!(J700_26B123.graph.profile, RootProfile::J873G18G26B123);
+        assert_eq!(J700_26B123.graph.profile.version_word(), 0x0c8b_6339_83a0_04c0);
+        assert_eq!(
+            COMMON26B123_LAYOUTS.policy_size,
+            COMMON26_LAYOUTS.policy_size + 0x60
+        );
+        assert_eq!(
+            COMMON26B123_LAYOUTS.status_config_size,
+            COMMON26_LAYOUTS.status_config_size + 8
+        );
+        assert_eq!(
+            COMMON26B123_SHARED_LAYOUT.block_68,
+            COMMON26_SHARED_LAYOUT.block_68 + 0x80
+        );
+        assert_eq!(COMMON26B123_SHARED_LAYOUT.total, COMMON26_SHARED_LAYOUT.total);
+        assert_eq!(COMMON26B123_PRIVATE_LAYOUT.total, COMMON26_PRIVATE_LAYOUT.total);
+    }
+
+    #[test]
+    fn j700_26b123_region_c_keeps_board_values() {
+        let mut region = [0u8; REGION_C_SIZE];
+        encode_common26_board_region_c(&J700_26B123, &mut region).unwrap();
+        let word = |offset| {
+            u32::from_le_bytes(region[offset..offset + 4].try_into().unwrap())
+        };
+        // The common graph inserts its enable word at +0x38; the J700 maximum-power input therefore
+        // moves from +0x84 to +0x88. The 27.2-only controller word is at +0x2f28 in policy,
+        // not Region C, so this board value stays 9550 mW.
+        assert_eq!(word(0x38), 1);
+        assert_eq!(word(0x88), 9550);
+        assert_eq!(word(0x7c8), 2000);
+    }
 }

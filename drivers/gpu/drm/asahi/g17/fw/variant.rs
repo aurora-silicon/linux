@@ -197,6 +197,19 @@ pub(crate) const V26A428_M5: Variant = Variant {
     ..V26A428
 };
 
+/// The common G17 interface shipped for J700 in macOS 27.2 (26B123).
+///
+/// Its queue and command protocol is the common two-role protocol. The exact InitData graph is
+/// selected by the build's [`crate::g17::Config`], so the current J700 build remains on
+/// [`V26A428`] and its existing graph.
+pub(crate) const V26B123: Variant = Variant {
+    m5_commands: true,
+    traversal_exclusion: false,
+    render_ray_query: false,
+    registration_power_hold: false,
+    ..V26A428
+};
+
 pub(crate) const V25F84: Variant = Variant {
     qid_floor: 0,
     registration: QueueRegistration::Mailbox,
@@ -208,6 +221,7 @@ pub(crate) const V25F84: Variant = Variant {
 
 const _: () = {
     assert!(super::queue::PointerBlock::valid_layout(&V26A428.pointers));
+    assert!(super::queue::PointerBlock::valid_layout(&V26B123.pointers));
     assert!(super::queue::PointerBlock::valid_layout(&V25G83.pointers));
     assert!(super::queue::PointerBlock::valid_layout(&V25F84.pointers));
 };

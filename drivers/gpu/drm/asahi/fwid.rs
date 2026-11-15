@@ -590,4 +590,34 @@ mod tests {
             assert!(admit(t, d, &e[..1], h).is_none());
         }
     }
+
+    #[test]
+    fn t8140_identifies_current_and_26b123_graphs() {
+        use crate::g17::fw::m5::initdata::RootProfile;
+        let crate::g17::fw::variant::Firmware::Identified(builds) =
+            crate::hw::t8140::CONFIG.firmware
+        else {
+            panic!("T8140 must identify its loaded firmware");
+        };
+        assert_eq!(builds.len(), 2);
+        assert_eq!(builds[0].os_version, [27, 2, 0]);
+        assert_eq!(builds[1].os_version, [26, 6, 2]);
+        t6050_admits_only(builds);
+
+        let [b123, g83] = [&builds[0].images[0], &builds[1].images[0]];
+        assert_eq!((b123.text_size, b123.data_size), (0x9c000, 0x188000));
+        assert_eq!((g83.text_size, g83.data_size), (0x98000, 0x260000));
+        assert_ne!(b123.text_sha256, g83.text_sha256);
+
+        assert!(builds[1].config.is_none());
+        let config = builds[0].config.expect("26B123 needs its own graph");
+        assert_eq!(
+            config
+                .m5
+                .expect("26B123 needs a common-graph board")
+                .graph
+                .profile,
+            RootProfile::J873G18G26B123
+        );
+    }
 }
