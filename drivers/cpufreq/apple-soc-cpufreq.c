@@ -1509,6 +1509,12 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 	priv->waited = true;
 	policy->driver_data = priv;
 	policy->freq_table = freq_table;
+	cpufreq_for_each_valid_entry(p, freq_table) {
+		if (p->flags & CPUFREQ_BOOST_FREQ) {
+			policy->boost_enabled = cpufreq_boost_enabled();
+			break;
+		}
+	}
 
 	if (info->needs_thermal_owner) {
 		mutex_lock(&apple_soc_thermal_owner_lock);
