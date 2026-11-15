@@ -1258,6 +1258,9 @@ static int tb_dp_bandwidth_alloc_mode_enable(struct tb_tunnel *tunnel)
 	for (granularity = 250; tmp / granularity > 255 && granularity <= 1000;
 	     granularity *= 2)
 		;
+	/* The host's own OS programs these adapters at 1 Gb/s. */
+	if (tb_port_dp_bw_held_ack(in))
+		granularity = 1000;
 
 	tb_tunnel_dbg(tunnel, "granularity %d Mb/s\n", granularity);
 
