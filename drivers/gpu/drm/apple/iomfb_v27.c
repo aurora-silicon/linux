@@ -171,6 +171,13 @@ static const struct dcp_method_entry dcp_methods_27_2[dcpep_num_methods] = {
 	IOMFB_METHOD("A529", iomfbep_abort_swaps_dcp),
 	IOMFB_METHOD("A534", dcpep_set_power_state),
 	IOMFB_METHOD("A533", dcpep_register_dfb_surface),
+	/*
+	 * The AP link's release, 27.0's A500, moved up by 50 with the AP methods: in
+	 * t8142dcp 1317.40.16 the one special-cased compare that 1317.1.1 makes against
+	 * 'A500' (then 'A500' | 1, selecting two handlers) is made against 'A550', with the
+	 * same shape, and no code builds 'A500' any more (A500 is set_parameter_dcp here).
+	 */
+	IOMFB_METHOD("A550", dcpep_unnamed_500),
 };
 
 /*
