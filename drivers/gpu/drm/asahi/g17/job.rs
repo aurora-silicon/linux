@@ -8,7 +8,7 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicU8, Ordering};
 use kernel::{
     bindings, c_str,
     cpu::CpuId,
-    cpumask::Cpumask,
+    cpumask::{Cpumask, CpumaskVar},
     workqueue,
     dma_fence::{Fence, RawDmaFence},
     drm::sched,
@@ -325,6 +325,9 @@ pub(crate) trait Backend: Send + Sync {
     fn supports_submission(&self) -> bool { true }
     /// Whether this backend's scheduler workers run in their queue creator's cluster (M5).
     fn creator_cluster_scheduling(&self) -> bool { false }
+    /// Whether this backend's render scheduler worker runs on the highest-capacity CPUs
+    /// (T6041).
+    fn fastest_cpu_render(&self) -> bool { false }
     /// Whether to keep compute input completion waits and wait on the host for other-engine
     /// prefix producers: without the G17D forms an M5 kick may start while its ring
     /// predecessor still runs.
@@ -558,6 +561,19 @@ impl<B: Backend> Scheduler<B> {
             // follows the submitter, instead of wherever an unbound worker last ran.
             let queue = workqueue::OwnedQueue::new_ordered_reclaim(name)?;
             queue.restrict(Cpumask::cluster_of(CpuId::current()))?;
+            Some(queue)
+        } else if engine == Engine::Render && backend.fastest_cpu_render() {
+            // The render run work publishes one job at a time, and with many small passes per
+            // frame the GPU waits for it. On an E core it falls behind the GPU, so keep it on
+            // the P cores.
+            unsafe extern "C" {
+                fn asahi_fastest_cpus(cpus: *mut bindings::cpumask);
+            }
+            let cpus = CpumaskVar::new_zero(GFP_KERNEL)?;
+            // SAFETY: `cpus` is a valid mask, written only during the call.
+            unsafe { asahi_fastest_cpus(cpus.as_raw()) };
+            let queue = workqueue::OwnedQueue::new_ordered_reclaim(name)?;
+            queue.restrict(&cpus)?;
             Some(queue)
         } else {
             // drm_sched allocates its own ordered reclaim-safe queue.
