@@ -1023,8 +1023,9 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		out->vrr = dcp_refresh_range(vert.precise_sync_rate, min_vrr,
 					     max_vrr, internal && vrr_fallback,
 					     &out->min_vrr, &out->max_vrr);
-	out->needs_timestamps = out->vrr ||
-		(internal && dcp_refresh_is_promotion(vert.precise_sync_rate));
+	out->needs_timestamps = dcp_refresh_needs_deadline(vert.precise_sync_rate,
+							   out->vrr, internal,
+							   handle->internal_present_deadline);
 
 	clock = calculate_clock(&horiz, &vert);
 	if (!clock || clock > INT_MAX)
