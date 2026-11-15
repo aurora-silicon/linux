@@ -32,12 +32,15 @@ static REFUSALS: [AtomicU64; SITE_COUNT] = [const { AtomicU64::new(0) }; SITE_CO
 
 /// First and power-of-two refusals per site keep a pressure storm bounded in
 /// the log. This does not change whether the caller retries or rejects work.
+///
+/// Most refusals are retried; a final one fails its caller, which reports it.
+/// So this is informational; the counters stay in the capacity snapshot.
 #[track_caller]
 pub(super) fn refused(site: Site) -> Error {
     let count = REFUSALS[site as usize].fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     if count.is_power_of_two() {
         let at = core::panic::Location::caller();
-        pr_warn!("G17 capacity refusal {:?} count={} at {}:{}\n", site, count,
+        pr_info!("G17 capacity refusal {:?} count={} at {}:{}\n", site, count,
             at.file().rsplit("asahi/").next().unwrap_or(at.file()), at.line());
     }
     ENOSPC
