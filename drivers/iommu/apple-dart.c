@@ -4692,11 +4692,17 @@ static irqreturn_t apple_dart_irq(int irq, void *dev)
 	irqreturn_t ret = IRQ_NONE;
 	struct apple_dart *dart = dev;
 
-	if (READ_ONCE(dart->commands_gated))
+	/*
+	 * A DART its DCP powered down (host_off) has no registers to read: on
+	 * this fabric a read of a powered-down block stalls the CPU instead of
+	 * faulting. Its line can be shared or still pending, so leave it alone;
+	 * apple_dart_host_power_off() waits for a handler already past this.
+	 */
+	if (READ_ONCE(dart->commands_gated) || READ_ONCE(dart->host_off))
 		return IRQ_NONE;
 	if (pm_runtime_resume_and_get(dart->dev) < 0)
 		return IRQ_NONE;
-	if (!READ_ONCE(dart->commands_gated))
+	if (!READ_ONCE(dart->commands_gated) && !READ_ONCE(dart->host_off))
 		ret = dart->hw->irq_handler(irq, dev);
 	pm_runtime_put(dart->dev);
 	return ret;
@@ -7028,6 +7034,9 @@ static int apple_dart_host_power_off(struct apple_dart *dart)
 	apple_dart_host_lock(dart, &flags);
 	WRITE_ONCE(dart->host_off, true);
 	apple_dart_host_unlock(dart, flags);
+	/* No exception handler may still be reading it once it powers down. */
+	if (dart->irq > 0)
+		synchronize_irq(dart->irq);
 	apple_dart_pm_invalidate(dart, false);
 	apple_dart_quiesce_commands(dart->dev);
 
