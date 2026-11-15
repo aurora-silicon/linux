@@ -3888,7 +3888,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	 * an adaptive swap timed out (dcp_swap_watchdog), stay fixed.
 	 */
 	modeset->vrr = mode->vrr &&
-		       (dcp_vrr_live(dcp) || crtc_state->vrr_enabled) &&
+		       ((dcp_vrr_live(dcp) && READ_ONCE(w3_fixed) != 3) || crtc_state->vrr_enabled) &&
 		       !READ_ONCE(dcp->desktop->vrr_failed);
 	dcp->desktop->vrr_min_on = 0;
 
@@ -4209,11 +4209,20 @@ static bool dcp_vrr_update(struct apple_dcp *dcp, struct drm_crtc_state *crtc_st
 	if (!dcp->vrr_enabled || !d->vrr_min_on)
 		return false;
 	min = crtc_state->vrr_enabled ? d->vrr_min_on : d->vrr_min_off;
-	if (min == d->vrr_min_sent)
-		return false;
-	d->vrr_min_sent = min;
-	/* minRR (16.16 Hz), then mediaTargetRate and the fractional rate */
-	param.value[0] = min;
+	{
+		int w3 = READ_ONCE(w3_fixed);
+		u32 tgt = (!crtc_state->vrr_enabled && (w3 == 1 || w3 == 2)) ? d->vrr_min_off : 0;
+		bool zero = !crtc_state->vrr_enabled && (w3 == 2 || w3 == 4);
+		u32 key = min ^ (crtc_state->vrr_enabled ? 0 : ((u32)w3 << 28));
+
+		if (key == d->vrr_min_sent)
+			return false;
+		d->vrr_min_sent = key;
+		param.value[0] = zero ? 0 : min;
+		param.value[1] = tgt;
+		dev_info(dcp->dev, "W3 adaptive sync minRR %#x target %#x (VRR_ENABLED %u w3_fixed %d)\n",
+			 param.value[0], tgt, crtc_state->vrr_enabled, w3);
+	}
 	dev_dbg(dcp->dev, "adaptive sync minimum %#x (VRR_ENABLED %u)\n", min,
 		crtc_state->vrr_enabled);
 	dcp_set_parameter_dcp(dcp, false, &param, next, NULL);

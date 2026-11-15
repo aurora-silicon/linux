@@ -389,6 +389,11 @@ module_param(fw27_panel_boot_mode, int, 0644);
 MODULE_PARM_DESC(fw27_panel_boot_mode,
 		 "FW27 internal panel: -1 keep the boot mode for a single fixed timing (default), 0 always mode-set, 1 always keep the boot mode");
 
+/* W3 experiment: fixed refresh on the desktop panel's adaptive timing. */
+int w3_fixed;
+module_param(w3_fixed, int, 0644);
+MODULE_PARM_DESC(w3_fixed, "W3 test: 0 minRR only, 1 +mediaTargetRate=mode, 2 +target, minRR 0, 3 modeset adaptive off, 4 minRR 0 live");
+
 static bool unstable_edid = true;
 module_param(unstable_edid, bool, 0644);
 MODULE_PARM_DESC(unstable_edid, "Enable unstable EDID retrival support");
@@ -1869,7 +1874,7 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 	if ((dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
 	     (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp->main_display &&
 	      !dcp_has_panel(dcp))) &&
-	    crtc_state->enable && !dcp_vrr_live(dcp)) {
+	    crtc_state->enable && (!dcp_vrr_live(dcp) || READ_ONCE(w3_fixed) == 3)) {
 		struct drm_crtc_state *old =
 			drm_atomic_get_old_crtc_state(commit, crtc);
 
