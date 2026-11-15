@@ -290,13 +290,16 @@ static int dcp_secure_port_init(struct apple_dcp *dcp)
  * Stopping the firmware (DPMS off and system sleep with hw.s2r or hw.s2r_ext) powers the
  * display domains through apple,display-power, and the internal DCP only takes IOP idle
  * once its secure port has gone idle. A device tree without those keeps the firmware
- * running: DPMS is the backlight alone and the display stays up across a sleep.
+ * running: DPMS is the backlight alone and the display stays up across a sleep. A SoC
+ * without a secure mailbox says so (hw.s2r_no_secure_port), and one behind
+ * appledrm.s2r_untested stops its firmware for DPMS off only.
  */
 static void dcp_s2r_check_dt(struct apple_dcp *dcp)
 {
 	struct device_node *np = dcp->dev->of_node;
 	bool power = of_property_present(np, "apple,display-power");
-	bool secure = of_property_match_string(np, "mbox-names", "secure") >= 0;
+	bool secure = dcp->hw.s2r_no_secure_port ||
+		      of_property_match_string(np, "mbox-names", "secure") >= 0;
 
 	if (dcp->hw.s2r && (!power || !secure)) {
 		dev_info(dcp->dev, "no %s in the device tree, the firmware keeps running\n",
@@ -307,6 +310,8 @@ static void dcp_s2r_check_dt(struct apple_dcp *dcp)
 		dev_info(dcp->dev, "no apple,display-power in the device tree, the firmware keeps running\n");
 		dcp->hw.s2r_ext = false;
 	}
+	if (dcp->hw.s2r && dcp->hw.s2r_untested)
+		dev_info(dcp->dev, "firmware stop on DPMS off enabled (appledrm.s2r_untested)\n");
 }
 
 static void dcp_release_rtkit(void *data)
@@ -9872,6 +9877,10 @@ static int dcp_platform_suspend(struct device *dev)
 	cancel_delayed_work_sync(&dcp->s2r_prewarm_off_wq);
 	dcp->s2r_prewarmed = false;
 
+	/*
+	 * Derived power words (T8142) also stop the firmware for a deep sleep here; both stay
+	 * behind appledrm.s2r_untested (the J815 S2R work, untested on firmware 27.2).
+	 */
 	if (pm_suspend_via_firmware() && dcp_s2r_capable(dcp)) {
 		int ret = dcp_s2r_suspend(dcp);
 
@@ -11305,6 +11314,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8142 = {
 	/* Firmware 27.0's sleep calls (iomfb_v27.c): only with appledrm.s2r_untested */
 	.s2r = true,
 	.s2r_untested = true,
+	.s2r_no_secure_port = true,
 	.s2r_layout = &dcp_s2r_t8142,
 };
 
