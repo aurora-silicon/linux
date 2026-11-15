@@ -1859,13 +1859,7 @@ static enum avd_image_fmt avd_av1_get_image_fmt(struct avd_ctx *ctx,
 	if (ctrl->id != V4L2_CID_STATELESS_AV1_SEQUENCE)
 		return AVD_IMG_FMT_ANY;
 
-	if (!(seq->flags & V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_X)) /* 4:4:4 */
-		return AVD_IMG_FMT_ANY;
-	if (!(seq->flags & V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y))
-		return BIT_DEPTH(422);
-	if (seq->flags & V4L2_AV1_SEQUENCE_FLAG_MONO_CHROME)
-		return AVD_IMG_FMT_ANY; /* 4:0:0 (not supported?) */
-
+	/* avd_av1_validate_sequence() admits only Main profile 4:2:0. */
 	return BIT_DEPTH(420);
 #undef BIT_DEPTH
 }
@@ -1908,11 +1902,27 @@ static void avd_av1_adjust_decoded_fmt(struct avd_ctx *ctx,
 		avd_av1_seg_size(pix_mp->width, pix_mp->height);
 }
 
+/*
+ * Only the AV1 Main profile at 4:2:0 (8 and 10 bits) decodes. A High
+ * profile (4:4:4) frame is never completed: it times out and the whole
+ * decoder is reset, failing every other stream's frames too. Professional
+ * (4:2:2, 12-bit) has no capture format. Refuse anything but Main 4:2:0
+ * when the sequence is set, so it never reaches the decoder.
+ */
 static int avd_av1_validate_sequence(struct avd_ctx *ctx,
 				     struct v4l2_ctrl_av1_sequence *seq)
 {
+	const u32 subsampling = V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_X |
+				V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y;
+
+	if (seq->seq_profile != 0)
+		return -EINVAL;
+	if (seq->bit_depth != 8 && seq->bit_depth != 10)
+		return -EINVAL;
 	if (seq->flags & V4L2_AV1_SEQUENCE_FLAG_MONO_CHROME)
 		return -EINVAL; /* 4:0:0 (not supported?) */
+	if ((seq->flags & subsampling) != subsampling)
+		return -EINVAL;
 
 	return 0;
 }
