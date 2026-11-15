@@ -3620,12 +3620,12 @@ bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp)
 }
 
 /*
- * The external pipe was unplugged and is being powered on again.  The
- * firmware swallows an accepted present that the unplug caught ("swallowed
- * swap ID n as fControllerPowerState is 0"): it never completes, and the
- * queue holds the power-on and mode set behind it until the 10 s transaction
- * timeout marks the coprocessor crashed.  Retire it now instead of waiting
- * for the swap watchdog, which did not fire on the 14 Nov M5 boot.
+ * The external pipe was unplugged, and is now powered on again or turned
+ * off.  The firmware swallows an accepted present that the unplug caught
+ * ("swallowed swap ID n as fControllerPowerState is 0"): it never completes,
+ * and the queue holds the next command behind it until the 10 s transaction
+ * timeout marks the coprocessor crashed.  dcp_poweroff() cancels the swap
+ * watchdog, so retire the present here.
  */
 void iomfb_retire_unplugged_present_h17p(struct apple_dcp *dcp)
 {

@@ -4345,9 +4345,10 @@ void dcp_poweron(struct platform_device *pdev)
 	/*
 	 * The unplug of a Type-C display powers the pipe off under a present
 	 * the firmware already accepted, and swallows it: it never completes.
-	 * dcp_poweroff() cancels the swap watchdog, so nothing else retires it,
-	 * and the queue starts no power-on command behind a pending present
-	 * until the 10 s transaction timeout marks the coprocessor crashed.
+	 * dcp_poweroff() cancels the swap watchdog and retires it only when the
+	 * display is gone, and the queue starts no power-on command behind a
+	 * pending present until the 10 s transaction timeout marks the
+	 * coprocessor crashed.
 	 */
 	if (dcp_is_typec_output(dcp) || dcp_is_external_h17p(dcp))
 		iomfb_retire_unplugged_present_h17p(dcp);
@@ -4491,6 +4492,21 @@ void dcp_external_recover(struct platform_device *pdev)
 		dcp_poweron(pdev);
 }
 
+/*
+ * The firmware powers a Type-C pipe down before it reports the unplug, and
+ * swallows the present it accepted: that present never completes.  When the
+ * desktop then turns the CRTC off (the relink budget is spent), no power-on
+ * follows to retire it, and the power-off waits behind it until the 10 s
+ * transaction timeout marks the coprocessor crashed.  A present on a display
+ * that is still connected can complete: keep it.
+ */
+VISIBLE_IF_KUNIT void dcp_poweroff_retire_swallowed(struct apple_dcp *dcp)
+{
+	if (dcp_is_typec_output(dcp) && dcp->connector &&
+	    !READ_ONCE(dcp->connector->connected))
+		iomfb_retire_unplugged_present_h17p(dcp);
+}
+
 void dcp_poweroff(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
@@ -4518,6 +4534,7 @@ void dcp_poweroff(struct platform_device *pdev)
 	}
 
 	cancel_delayed_work(&dcp->swap_watchdog_wq);
+	dcp_poweroff_retire_swallowed(dcp);
 
 	/* Internal H17P DPMS is a brightness present, never a pipe stop. */
 	if (dcp_uses_soft_dpms(dcp)) {
