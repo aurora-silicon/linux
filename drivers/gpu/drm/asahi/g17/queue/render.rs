@@ -1093,6 +1093,17 @@ impl Pair {
         let tiling_kick = tiling_kick.prepare_entry(&ta_args)?;
         let fragment_kick = fragment_kick.prepare_entry(&fragment_args)?;
         let memory = &mut *self.memory;
+        // J716C retains an installed render pair while work is already in
+        // flight. In that steady state the host-port kick is sufficient:
+        // another item-ring notification has no new configuration or lead
+        // command to publish. Keep the ordinary inner publication for the
+        // first command, a drained restart, a rebind, and a class change.
+        let sparse_inner = m5 && !j813
+            && self.board.is_some_and(|board| board.clusters == 4)
+            && self.active.front().is_some() && self.previous.is_none()
+            && self.registered == Some(policy.priority()) && !self.context_update
+            && !self.identity_update && !present.into_iter().any(|value| value)
+            && !leads.into_iter().any(|value| value);
         let lanes = [
             publication::Lane::new(
                 &memory.graph,
@@ -1103,6 +1114,7 @@ impl Pair {
                 present[0],
                 kicks[0],
                 leads[0],
+                sparse_inner,
             )?,
             publication::Lane::new(
                 &memory.graph,
@@ -1113,6 +1125,7 @@ impl Pair {
                 present[1],
                 kicks[1],
                 leads[1],
+                sparse_inner,
             )?,
         ];
         let windows = [lanes[0].window, lanes[1].window];
@@ -1333,6 +1346,7 @@ impl Pair {
                 true,
                 kicks[0],
                 false,
+                false,
             )?,
             publication::Lane::new(
                 &self.memory.graph,
@@ -1342,6 +1356,7 @@ impl Pair {
                 configs[1],
                 true,
                 kicks[1],
+                false,
                 false,
             )?,
         ];
