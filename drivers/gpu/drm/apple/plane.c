@@ -852,9 +852,16 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 	return &plane->base;
 }
 
-/* The formats the T6030 (14.x firmware) scanout was qualified with. */
+/*
+ * The formats the T6030 (14.x firmware) scanout was qualified with.
+ *
+ * The 14.x firmware blends the X byte of XRGB8888 as straight alpha and
+ * ignores the opaque/premultiplied surface flag, so pure green and blue
+ * render black whenever a compositor leaves a zero in the X byte (see
+ * omacom/linux-aurora #308). Offer only the alpha format: compositors
+ * write a real alpha of 255, which the blend then leaves untouched.
+ */
 static const u32 dcp_primary_formats_14_7[] = {
-	DRM_FORMAT_XRGB8888,
 	DRM_FORMAT_ARGB8888,
 };
 
