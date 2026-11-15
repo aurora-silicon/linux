@@ -1979,9 +1979,19 @@ static void apple_dpin_diag(struct apple_dpin_ctx *c, unsigned int ms)
 	if (!anhi || !anhi->tb || !anhi->tb->root_switch)
 		return;
 	in = &anhi->tb->root_switch->ports[READ_ONCE(c->diag_port)];
+	/*
+	 * Config reads of the same route from two contexts cross their
+	 * responses (comb4w: "wrong offset" warnings and a failed DPRX wait).
+	 * The core reads under tb->lock; sample only when it is free.
+	 */
+	if (!mutex_trylock(&anhi->tb->lock)) {
+		dev_info(anhi->dev, "w88-dpin%u +%ums: skipped, tb lock busy\n", c->idx, ms);
+		return;
+	}
 	for (i = 0; i <= 8; i++)
 		if (tb_port_read(in, &w[i], TB_CFG_PORT, in->cap_adap + i, 1))
 			w[i] = 0xffffffff;
+	mutex_unlock(&anhi->tb->lock);
 	scoped_guard(mutex, &c->lock) {
 		if (c->regs && c->state.alive) {
 			st = readl(c->regs + APPLE_DPIN_STATUS);
