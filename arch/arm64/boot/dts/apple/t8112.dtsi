@@ -1552,10 +1552,12 @@
 				compatible = "apple,smc-hwmon";
 				#thermal-sensor-cells = <1>;
 				/*
-				 * The CPU die keys. The GPU keys are separate channels
-				 * below: while the GPU is off they read a low placeholder.
+				 * The GPU keys, then the CPU die keys. The GPU keys
+				 * join the zone through their channels below, which
+				 * read no data while the GPU is off.
 				 */
-				apple,soc-die-keys = "Te05", "Tp01", "Tp05", "Tp09", "Tp0D";
+				apple,soc-die-keys = "Tg0f", "Tg0n", "Tg0r", "Te05",
+						     "Tp01", "Tp05", "Tp09", "Tp0D";
 
 				/* SoC die temperatures, first: thermal zones index them. */
 				temperature-TCMz {
