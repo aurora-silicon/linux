@@ -1,0 +1,31 @@
+[Unit]
+Description=Aurora SEP services
+# Nothing in the boot waits for the enclave, which can take most of a minute
+# and, after a boot policy change, does not come up at all: no ordering
+# before multi-user.target. fprintd and aurora-sep-ready still wait for it.
+# aurora-sep-load.conf keeps udev from loading the driver before /var/lib is
+# there; this unit loads it, and aurora-sep.timer starts it one second into
+# the boot where the packaging enables the timer instead of the unit.
+DefaultDependencies=no
+After=sysinit.target basic.target local-fs.target aurora-peripherals.service
+Conflicts=shutdown.target
+Before=shutdown.target
+RequiresMountsFor=/var/lib
+# Only Apple silicon Macs have the enclave.
+ConditionPathExists=/dev/disk/by-partlabel/iBootSystemContainer
+# Activate Touch ID as soon as the driver is up, and set up its calibration
+# when it is missing or the enclave refused it.
+Wants=aurora-sep-ready.service aurora-touchid-setup.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The driver must be a module: aurora-sep-load.conf defers it to this unit.
+ExecCondition=/bin/sh -c 'modinfo -F filename apple_sep 2>/dev/null | grep -Eq "[.]ko([.](gz|xz|zst))?$"'
+ExecStart=/usr/local/sbin/aurora-sep-load
+StateDirectory=aurora-sep
+StateDirectoryMode=0700
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

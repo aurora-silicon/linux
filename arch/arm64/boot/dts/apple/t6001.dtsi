@@ -1,0 +1,173 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple T6001 "M1 Max" SoC
+ *
+ * Other names: H13J, "Jade"
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/apple-aic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/pinctrl/apple.h>
+#include <dt-bindings/phy/phy.h>
+#include <dt-bindings/spmi/spmi.h>
+
+#include "multi-die-cpp.h"
+
+#ifndef GPU_REPEAT
+# define GPU_REPEAT(x) <x x x x>
+#endif
+
+#define APPLE_T600X_NON_ULTRA
+
+#include "t600x-common.dtsi"
+
+/ {
+	compatible = "apple,t6001", "apple,arm-platform";
+
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+
+		ranges;
+		nonposted-mmio;
+		/* Required to get >32-bit DMA via DARTs */
+		dma-ranges = <0 0 0 0 0xffffffff 0xffffc000>;
+
+		// filled via templated includes at the end of the file
+	};
+};
+
+#define DIE
+#define DIE_NO 0
+#define SOC_NODE {/soc}
+
+#include "t600x-die0.dtsi"
+#include "t600x-dieX.dtsi"
+
+&SOC_NODE {
+#include "t600x-pciec.dtsi"
+};
+
+#include "t600x-nvme.dtsi"
+#include "t600x-gpio-pins.dtsi"
+#include "t600x-pmgr.dtsi"
+
+#undef DIE
+#undef DIE_NO
+#undef SOC_NODE
+
+
+&aic {
+	affinities {
+		e-core-pmu-affinity {
+			apple,fiq-index = <AIC_CPU_PMU_E>;
+			cpus = <&cpu_e00 &cpu_e01>;
+		};
+
+		p-core-pmu-affinity {
+			apple,fiq-index = <AIC_CPU_PMU_P>;
+			cpus = <&cpu_p00 &cpu_p01 &cpu_p02 &cpu_p03
+				&cpu_p10 &cpu_p11 &cpu_p12 &cpu_p13>;
+		};
+	};
+};
+
+&pmp {
+	apple,pio-ranges = <0x2 0x82000000 0x0 0x1000000>,
+		<0x3 0x4000000 0x0 0x1000000>,
+		<0x3 0x83000000 0x0 0x1000000>,
+		<0x4 0x2000000 0x0 0x1000000>,
+		<0x2 0x10e70000 0x0 0x90000>,
+		<0x2 0x11e70000 0x0 0x90000>,
+		<0x2 0x12e70000 0x0 0x90000>,
+		<0x4 0x82000000 0x0 0x1000000>,
+		<0x5 0x2000000 0x0 0x1000000>;
+};
+
+&gpu {
+	compatible = "apple,agx-t6001", "apple,agx-g13c", "apple,agx-g13s";
+};
+
+#include "hwmon-common.dtsi"
+/*
+ * The ANE has run on the M1 Pro and the M1 Max, so enable it here with its
+ * DARTs and the power states only it uses. t6000.dtsi includes this file.
+ */
+&ane {
+	status = "okay";
+};
+
+&ane_dart0 {
+	status = "okay";
+};
+
+&ane_dart1 {
+	status = "okay";
+};
+
+&ane_dart2 {
+	status = "okay";
+};
+
+&ps_ane_base {
+	status = "okay";
+};
+
+&ps_ane_set0 {
+	status = "okay";
+};
+
+&ps_ane_set1 {
+	status = "okay";
+};
+
+&ps_ane_set2 {
+	status = "okay";
+};
+
+&ps_ane_set3 {
+	status = "okay";
+};
+
+&ps_ane_set4 {
+	status = "okay";
+};
+
+&pmp_report {
+	reg = <0x2 0x8e3c0000 0x0 0x20000>,
+	      <0x2 0x85868000 0x0 0x4000>;
+	reg-names = "report", "ane-dvfs";
+};
+
+&ane {
+	apple,performance-controller = <&pmp_report>;
+	power-domains = <&ps_ane_sys_cpu>, <&ps_ane_set1>,
+		<&ps_ane_set2>, <&ps_ane_set3>, <&ps_ane_set4>, <&ps_pms_sram>;
+};
+
+#ifndef APPLE_T6000_SUBSET
+#include "t6001-peripherals.dtsi"
+#include "t6001-aux-spmi.dtsi"
+#include "t6001-display-extra.dtsi"
+
+/*
+ * The die 0 video encoder is the M1 Pro's: the bootloader hands it the
+ * firmware iBoot preloads, and without that handoff the driver refuses
+ * the reservation and the encoder stays off.
+ */
+&ave_dart0 {
+	status = "okay";
+};
+
+&ave_dart1 {
+	status = "okay";
+};
+
+&ave {
+	status = "okay";
+};
+#endif

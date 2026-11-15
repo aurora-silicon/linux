@@ -1,0 +1,21 @@
+[Unit]
+Description=Activate Touch ID and restore its fingerprints
+Documentation=file:///usr/share/doc/aurora-sep/README.md
+Requires=aurora-sep.service
+After=aurora-sep.service
+Before=fprintd.service
+ConditionPathExists=/dev/sep-bio
+
+# Whatever is ordered after this waits for the enclave, which can take most
+# of a minute after boot. Stop waiting 90 s after boot, so that a broken
+# enclave cannot hold anything back for longer.
+JobTimeoutSec=90
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecCondition=/usr/local/sbin/aurora-sep-sensor-present
+ExecStart=/usr/local/sbin/aurora-sep-ready
+# The script gives up after 50 s and fails the unit when Touch ID is not
+# ready; this only catches a hung open.
+TimeoutStartSec=60

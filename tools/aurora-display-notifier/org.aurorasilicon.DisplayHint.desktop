@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Desktop Entry]
+Type=Application
+Name=Aurora Display Hint
+Comment=Explain the front USB-C port's display limitation
+Exec=systemctl --user start aurora-display-notifier.service
+Icon=video-display-symbolic
+NoDisplay=true
+X-GNOME-UsesNotifications=true

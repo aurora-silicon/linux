@@ -1,0 +1,110 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# mesa-m3-session-confirm [--settle SECONDS]: write the success marker of this
+# boot's login with /opt/mesa-m3, but only on live evidence that its
+# compositor is up and serving. Run by mesa-m3-session-confirm.service after
+# graphical-session.target (reaching the target alone proves nothing).
+#
+# The attempt (${XDG_STATE_HOME:-~/.local/state}/mesa-m3/attempt, written by
+# the session hook) names the login: boot_id, session_id, hook_run_id. The
+# marker (session-ok beside it) is written, atomically, only when all of this
+# holds:
+#   1. the attempt is this boot's, and this unit runs in that login (the user
+#      manager's MESA_M3_HOOK_RUN_ID is the attempt's hook_run_id);
+#   2. the process listening on $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY (found with
+#      SO_PEERCRED by mesa-m3-wlcheck) is this user's and is this login's
+#      compositor: its environment has the attempt's MESA_M3_HOOK_RUN_ID and
+#      XDG_SESSION_ID;
+#   3. it completes a Wayland round trip (wl_display_sync) within 5 s;
+#   4. after the settle time (default 15 s) the same process (pid and start
+#      time) is still running, and a second round trip on the socket completes
+#      and is answered by that same process.
+# Otherwise there is no marker, and the next login of this boot gets
+# previous-failed (software). The journal (tag mesa-m3) says which check
+# failed. Files are read as text only; nothing is sourced.
+set -u
+settle=15
+if [ "${1:-}" = --settle ]; then
+	case ${2:-} in '' | *[!0-9]*) echo "usage: mesa-m3-session-confirm [--settle SECONDS]" >&2; exit 2 ;; esac
+	settle=$2
+fi
+root=${MESA_M3_ROOT:-}
+uid=$(id -u)
+rdir=${XDG_RUNTIME_DIR:-/run/user/$uid}
+dir=${XDG_STATE_HOME:-$HOME/.local/state}/mesa-m3
+att="$dir/attempt"
+ok="$dir/session-ok"
+wlcheck="$root/opt/mesa-m3/libexec/mesa-m3-wlcheck"
+run=
+log() { logger -t mesa-m3 "$*" 2>/dev/null; }
+no() {
+	log "not confirmed (hook_run_id=${run:-unknown}): $*; no success marker, so the next login of this boot renders in software (previous-failed)"
+	exit 1
+}
+get() { sed -n "s/^$1=//p" "$2" 2>/dev/null | head -n 1; }
+
+[ -f "$att" ] || exit 0
+boot=
+[ -r "$root/proc/sys/kernel/random/boot_id" ] && IFS= read -r boot < "$root/proc/sys/kernel/random/boot_id"
+[ "$(head -n 1 "$att" 2>/dev/null)" = schema=aurora.mesa-m3-attempt/2 ] || exit 0
+[ -n "$boot" ] && [ "$(get boot_id "$att")" = "$boot" ] || exit 0
+run=$(get hook_run_id "$att")
+sid=$(get session_id "$att")
+if [ -z "$run" ] || [ "${MESA_M3_HOOK_RUN_ID:-}" != "$run" ]; then
+	log "not confirmed: this unit's session (hook_run_id ${MESA_M3_HOOK_RUN_ID:-none}) is not the attempt's (${run:-none})"
+	exit 0
+fi
+case $sid in '' | unknown) no "the attempt has no session id" ;; esac
+
+case ${WAYLAND_DISPLAY:-} in
+'') no "WAYLAND_DISPLAY is not set in the user manager" ;;
+/*) sock=$WAYLAND_DISPLAY ;;
+*) sock="$rdir/$WAYLAND_DISPLAY" ;;
+esac
+[ -S "$sock" ] || no "$sock is not a socket"
+
+# wl PASS: one round trip; sets pid. Fails the confirmation on any error.
+wl() {
+	_out=$(timeout -k 2 10 "$wlcheck" --timeout-ms 5000 "$sock" 2>&1)
+	_rc=$?
+	[ "$_rc" -eq 0 ] || no "$1: no Wayland round trip on $sock ($(printf '%s\n' "$_out" | sed -n 's/^roundtrip=//p' | head -n 1), exit $_rc)"
+	pid=$(printf '%s\n' "$_out" | sed -n 's/^peer_pid=//p')
+	_puid=$(printf '%s\n' "$_out" | sed -n 's/^peer_uid=//p')
+	case $pid in '' | *[!0-9]*) no "$1: no compositor pid from $sock" ;; esac
+	[ "$_puid" = "$uid" ] || no "$1: $sock is served by uid $_puid, not $uid"
+}
+# starttime PID: field 22 of /proc/PID/stat (after the parenthesised name).
+starttime() { sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | cut -d ' ' -f 20; }
+pstate() { sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | cut -d ' ' -f 1; }
+
+wl first
+cpid=$pid
+cstart=$(starttime "$cpid")
+[ -n "$cstart" ] || no "compositor pid $cpid has no /proc entry"
+cenv=$(tr '\0' '\n' < "/proc/$cpid/environ" 2>/dev/null)
+[ -n "$cenv" ] || no "cannot read the environment of compositor pid $cpid"
+printf '%s\n' "$cenv" | grep -qxF "MESA_M3_HOOK_RUN_ID=$run" ||
+	no "compositor pid $cpid is not this login's (its MESA_M3_HOOK_RUN_ID differs)"
+printf '%s\n' "$cenv" | grep -qxF "XDG_SESSION_ID=$sid" ||
+	no "compositor pid $cpid is not this login's (its XDG_SESSION_ID is not $sid)"
+comm=$(tr -cd 'A-Za-z0-9._+-' < "/proc/$cpid/comm" 2>/dev/null)
+
+sleep "$settle"
+
+case $(pstate "$cpid") in
+'' | Z | X | x) no "compositor ${comm:-?}[$cpid] exited within ${settle} s" ;;
+esac
+[ "$(starttime "$cpid")" = "$cstart" ] || no "compositor ${comm:-?}[$cpid] exited within ${settle} s (pid reused)"
+wl "after ${settle} s"
+[ "$pid" = "$cpid" ] || no "after ${settle} s $sock is served by pid $pid, not the compositor $cpid"
+
+wd=$(printf '%s' "$sock" | tr -d '\n\r')
+tmp=$(mktemp "$dir/.session-ok.XXXXXX") || no "cannot create the marker in $dir"
+if printf 'schema=aurora.mesa-m3-session-ok/1\nboot_id=%s\nsession_id=%s\nhook_run_id=%s\ncompositor_pid=%s\ncompositor_starttime=%s\ncompositor_comm=%s\nwayland_socket=%s\nsettle_s=%s\nchecked_at=%s\n' \
+	"$boot" "$sid" "$run" "$cpid" "$cstart" "${comm:-unknown}" "$wd" "$settle" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$tmp" &&
+	chmod 0644 "$tmp" && mv -f "$tmp" "$ok"; then
+	log "confirmed: compositor ${comm:-?}[$cpid] alive after ${settle} s and answering on $sock (boot_id=$boot session_id=$sid hook_run_id=$run)"
+	exit 0
+fi
+rm -f "$tmp"
+no "cannot write the marker in $dir"

@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
+__pycache__/
+# Independent compressed reference data is part of the regression suite.
+!fixtures/*.bin.gz

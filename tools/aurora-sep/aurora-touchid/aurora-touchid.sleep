@@ -1,0 +1,23 @@
+#!/bin/sh
+# Stop fprintd before the system sleeps.
+#
+# If the lock screen is waiting for a fingerprint when the lid closes,
+# fprintd cannot install its own sleep delay inhibitor (logind answers
+# OperationInProgress), so it never releases its claim on the sensor.
+# After resume every fingerprint session then fails until fprintd is
+# restarted, and the lock screen falls back to the password. Stopping it
+# here drops the claim; D-Bus activation starts a fresh fprintd when the
+# lock screen asks for a finger after resume.
+#
+# Diagnosed and tested by cb2206 and thomasanderson88 (omacom/linux#7).
+# Never fail the sleep: always exit 0.
+
+case "$1" in
+pre)
+	if systemctl -q is-active fprintd.service; then
+		timeout 5 systemctl stop fprintd.service
+		sleep 0.2
+	fi
+	;;
+esac
+exit 0

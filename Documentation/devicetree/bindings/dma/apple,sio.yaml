@@ -1,0 +1,271 @@
+# SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/dma/apple,sio.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple SIO Coprocessor
+
+description:
+  SIO is a coprocessor on Apple M1 and later chips (and maybe also on earlier
+  chips). Its role is to offload SPI, UART and DisplayPort audio transfers,
+  being a pretend DMA controller. The SoC-specific compatible selects the
+  firmware protocol and channel configuration. In particular, apple,t6030-sio
+  requires protocol-10 boot tables before the coprocessor can be started.
+
+maintainers:
+  - Martin Povišer <povik+lin@cutebit.org>
+
+allOf:
+  - $ref: dma-controller.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6050-sio
+      required:
+        - compatible
+    then:
+      properties:
+        clocks:
+          minItems: 2
+          maxItems: 2
+      required:
+        - clocks
+      if:
+        required:
+          - mboxes
+      then:
+        properties:
+          reg:
+            minItems: 3
+            maxItems: 3
+          reg-names:
+            items:
+              - const: asc
+              - const: auxiliary
+              - const: asc-tail
+          interrupts: false
+        required:
+          - dma-channels
+      else:
+        properties:
+          reg:
+            minItems: 2
+            maxItems: 2
+          interrupts:
+            minItems: 4
+          status:
+            const: disabled
+        required:
+          - interrupts
+          - status
+    else:
+      properties:
+        interrupts: false
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8132-sio
+      required:
+        - compatible
+    then:
+      properties:
+        reg:
+          minItems: 2
+          maxItems: 2
+        clocks:
+          minItems: 3
+          maxItems: 3
+        status:
+          const: disabled
+      required:
+        - clocks
+        - status
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              enum:
+                - apple,t6050-sio
+                - apple,t8132-sio
+    then:
+      required:
+        - dma-channels
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t8140-sio
+          then:
+            properties:
+              reg:
+                minItems: 3
+                maxItems: 3
+              reg-names:
+                items:
+                  - const: asc
+                  - const: auxiliary
+                  - const: asc-tail
+          else:
+            if:
+              properties:
+                compatible:
+                  contains:
+                    enum:
+                      - apple,t6031-sio
+                      - apple,t8122-sio
+            then:
+              properties:
+                reg:
+                  minItems: 2
+                  maxItems: 2
+            else:
+              properties:
+                reg:
+                  maxItems: 1
+
+properties:
+  compatible:
+    oneOf:
+      - items:
+          - enum:
+              - apple,t6000-sio
+              - apple,t6020-sio
+              - apple,t6030-sio
+              - apple,t6031-sio
+              - apple,t8122-sio
+              - apple,t8103-sio
+              - apple,t8112-sio
+              - apple,t8132-sio
+              - apple,t8140-sio
+              - apple,t6050-sio
+          - const: apple,sio
+      - description: T6041 firmware requires a generation-specific backend.
+        const: apple,t6041-sio
+
+  reg:
+    minItems: 1
+    maxItems: 3
+    description: |
+      Coprocessor control registers. T8140, and T6050 once it has its mailbox
+      provider, also publish an auxiliary ASC window and the remaining ASC
+      registers after the mailbox window. The mailbox registers are described
+      by the mailbox provider. A T6050 node without a provider has the whole
+      ASC bank and the auxiliary window, and stays disabled.
+
+  clocks:
+    minItems: 1
+    maxItems: 3
+
+  interrupts:
+    maxItems: 4
+    description:
+      On T6050, the coprocessor's mailbox interrupts in ADT order, on a node
+      that has no mailbox provider. With one, they are the provider's.
+
+  status: true
+
+  reg-names:
+    minItems: 1
+    maxItems: 3
+
+  '#dma-cells':
+    const: 1
+    description:
+      DMA clients specify a single cell that corresponds to the RTKit endpoint
+      number used for arranging the transfers in question
+
+  dma-channels:
+    maximum: 128
+
+  mboxes:
+    maxItems: 1
+
+  iommus:
+    maxItems: 1
+
+  power-domains:
+    maxItems: 1
+
+  resets:
+    maxItems: 1
+
+  memory-region:
+    minItems: 2
+    maxItems: 8
+    description:
+      A number of references to reserved memory regions among which are the DATA/TEXT
+      sections of coprocessor executable firmware and also auxiliary firmware data
+      describing the available DMA-enabled peripherals
+
+  apple,sio-firmware-params:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    description: |
+      Parameters in the form of opaque key/value pairs that are to be sent to the SIO
+      coprocesssor once it boots. These parameters can point into the reserved memory
+      regions (in device address space).
+
+      Note that unlike Apple's firmware, we treat the parameters, and the data they
+      refer to, as opaque. Apple embed short data blobs into their SIO devicetree node
+      that describe the DMA-enabled peripherals (presumably with defined semantics).
+      Their driver processes those blobs and sets up data structure in mapped device
+      memory, then references this memory in the parameters sent to the SIO. At the
+      level of description we are opting for in this binding, we assume the job of
+      constructing those data structures has been done in advance, leaving behind an
+      opaque list of key/value parameter pairs to be sent by a prospective driver.
+
+      This approach is chosen for two reasons:
+
+       - It means we don't need to try to understand the semantics of Apple's blobs
+         as long as we know the transformation we need to do from Apple's devicetree
+         data to SIO data (which can be shoved away into a loader). It also means the
+         semantics of Apple's blobs (or of something to replace them) need not be part
+         of the binding and be kept up with Apple's firmware changes in the future.
+
+       - It leaves less work for the driver attaching on this binding. Instead the work
+         is done upfront in the loader which can be better suited for keeping up with
+         Apple's firmware changes.
+
+  apple,channel-threshold:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      The threshold word of the configuration a DMA channel is given when its
+      client configures it. Without it the SoC's built-in value is used, or,
+      for a SoC without one, the generic value. Filled in by the bootloader.
+
+  apple,channel-limit:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      The limit word of the same channel configuration, with the same
+      default. Filled in by the bootloader.
+
+required:
+  - compatible
+  - reg
+  - '#dma-cells'
+  - mboxes
+  - iommus
+  - power-domains
+
+additionalProperties: false
+
+examples:
+  - |
+    sio: dma-controller@36400000 {
+      compatible = "apple,t8103-sio", "apple,sio";
+      reg = <0x36400000 0x8000>;
+      dma-channels = <128>;
+      #dma-cells = <1>;
+      mboxes = <&sio_mbox>;
+      iommus = <&sio_dart 0>;
+      power-domains = <&ps_sio_cpu>;
+      memory-region = <&sio_text>, <&sio_data>,
+                      <&sio_auxdata1>, <&sio_auxdata2>; /* Filled by loader */
+      apple,sio-firmware-params = <0xb 0x10>, <0xc 0x1b80>, <0xf 0x14>,
+                                  <0x10 0x1e000>, <0x30d 0x34>, <0x30e 0x4000>,
+                                  <0x1a 0x38>, <0x1b 0x50>; /* Filled by loader */
+    };

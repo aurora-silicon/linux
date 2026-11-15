@@ -1,0 +1,182 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * T8122 (M3) internal display and external display processor, from the
+ * J613 ADT. Every node stays disabled until the display gate takes them
+ * over after the boot loader's handoff (apple,t8122-handoff).
+ */
+
+/ {
+	aliases {
+		dcp = &dcp;
+		disp0 = &display;
+		disp0-piodma = &disp0_piodma;
+		disp0_piodma = &disp0_piodma;
+	};
+
+	/* As iBoot sets it up (J613 ADT disp0 clock 345). */
+	clk_disp0: clock-disp0 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <712000000>;
+		clock-output-names = "clk_disp0";
+	};
+
+	/* Rate unknown, as on T8112 and T602x. */
+	clk_dispext0: clock-dispext0 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <0>;
+		clock-output-names = "clk_dispext0";
+	};
+
+	/* Component master without MMIO, outside the simple-bus. */
+	display: display-subsystem {
+		compatible = "apple,t8122-display-subsystem";
+		iommus = <&disp0_dart 0>;
+		status = "disabled";
+	};
+};
+
+&{/soc} {
+	dcp_mbox: mailbox@28ec08000 {
+		compatible = "apple,t8122-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x2 0x8ec08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 537 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 538 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 539 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 540 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		power-domains = <&ps_disp_cpu>;
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	dcp_dart: iommu@28d30c000 {
+		compatible = "apple,t8122-dart", "apple,t8110-dart";
+		reg = <0x2 0x8d30c000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 557 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		status = "disabled";
+	};
+
+	disp0_dart: iommu@28d304000 {
+		compatible = "apple,t8122-dart", "apple,t8110-dart";
+		reg = <0x2 0x8d304000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 557 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		status = "disabled";
+	};
+
+	dcp: dcp@28ec00000 {
+		compatible = "apple,t8122-dcp";
+		mboxes = <&dcp_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcp_dart 5>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3",
+			    "disp-4", "disp-5", "iop-vbar";
+		reg = <0x2 0x8ec00000 0x0 0x4000>,
+		      <0x2 0x8c000000 0x0 0x690000>,
+		      <0x2 0x8c800000 0x0 0x690000>,
+		      <0x2 0x8d320000 0x0 0x4000>,
+		      <0x2 0x8d344000 0x0 0x4000>,
+		      <0x2 0x8e800000 0x0 0x800000>,
+		      <0x2 0xd03d0000 0x0 0x4000>,
+		      <0x2 0x8e850000 0x0 0x4000>;
+		power-domains = <&ps_disp_cpu>;
+		clocks = <&clk_disp0>;
+		/* The 14.x firmware runs once the PMP acknowledges this request. */
+		apple,pmp-report = <&pmp_report_disp>;
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		status = "disabled";
+
+		disp0_piodma: piodma {
+			iommus = <&disp0_dart 4>;
+		};
+	};
+
+	/* Bandwidth page: the DCP's disp-5, dcpext's apple,bw-scratch. */
+	pmgr_dcp: power-management@2d03d0000 {
+		reg = <0x2 0xd03d0000 0x0 0x4000>;
+		reg-names = "dcp-fw-pmgr";
+		#apple,bw-scratch-cells = <3>;
+	};
+
+	/*
+	 * External display processor: the boot loader only reserves its
+	 * firmware, the driver starts it. DMA windows as on T8112.
+	 */
+	dispext0_dart: iommu@319304000 {
+		compatible = "apple,t8122-dart", "apple,t8110-dart";
+		reg = <0x3 0x19304000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 599 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x0 0x0 0xf 0xffff0000>;
+		power-domains = <&ps_dispext_cpu>;
+		status = "disabled";
+	};
+
+	dcpext_dart: iommu@31930c000 {
+		compatible = "apple,t8122-dart", "apple,t8110-dart";
+		reg = <0x3 0x1930c000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 599 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x8 0x0 0x7 0xffff0000>;
+		power-domains = <&ps_dispext_cpu>;
+		status = "disabled";
+	};
+
+	dcpext_mbox: mailbox@31ac08000 {
+		compatible = "apple,t8122-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x1ac08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 582 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 583 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 584 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 585 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_dispext_cpu>;
+		resets = <&ps_dispext_cpu>;
+		status = "disabled";
+	};
+
+	/* The ADT dispext0 ranges; disp-5 is apple,bw-scratch index 5. */
+	dcpext: dcp@31ac00000 {
+		compatible = "apple,t8122-dcpext", "apple,dcpext";
+		mboxes = <&dcpext_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcpext_dart 5>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3",
+			    "disp-4";
+		reg = <0x3 0x1ac00000 0x0 0x4000>,
+		      <0x3 0x18000000 0x0 0x690000>,
+		      <0x3 0x18800000 0x0 0x690000>,
+		      <0x3 0x19320000 0x0 0x4000>,
+		      <0x3 0x19344000 0x0 0x4000>,
+		      <0x3 0x1a800000 0x0 0x800000>;
+		apple,bw-scratch = <&pmgr_dcp 0 5 0x910>;
+		apple,iomfb-surfaces = <1 1 0 1>;
+		power-domains = <&ps_dispext_cpu>;
+		resets = <&ps_dispext_cpu>;
+		clocks = <&clk_dispext0>;
+		/* Its first mode set completes only with this PMP request. */
+		apple,pmp-report = <&pmp_report_dispext>;
+		apple,dcp-index = <1>;
+		status = "disabled";
+
+		dcpext_piodma: piodma {
+			iommus = <&dispext0_dart 4>;
+		};
+	};
+};

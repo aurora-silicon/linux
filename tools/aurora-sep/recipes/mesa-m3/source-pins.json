@@ -1,0 +1,13 @@
+{
+  "native_commit": "78908f4d18af2274b5df08c4ad9d953c25980b53",
+  "native_archive": "mesa-m3-hal200-78908f4d18af.tar.zst",
+  "native_sha256": "535e26266e1d173bfd2f73e63be07eccf32eb9cb329ea8955e32a4fa45278ce8",
+  "legacy_commit": "7ff89a4da387bd561b78efd5f09c98ca8ae18538",
+  "legacy_sha256": "7ed24969985dce91f089d34dbe1c55cbcb8c95765e3e5bc0f268d27fbead2222",
+  "selector": "j613-25g83-hal200",
+  "marker": "j613-25g83-gl-only",
+  "native_prefix": "/opt/mesa-m3/25g83",
+  "native_vulkan": false,
+  "native_shader_scratch": false,
+  "legacy_archive": "mesa-m3-src-7ff89a4da38.tar.zst"
+}

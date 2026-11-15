@@ -1,0 +1,78 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple T8122 (M3 / G15G) GPU, from the J613 ADT. The boot loader fills in
+ * this machine's performance states, coefficients, firmware version and
+ * memory, enables the mailbox and then the GPU; drm/asahi refuses a node
+ * with any of them missing.
+ */
+
+/ {
+	aliases {
+		gpu = &gpu;	/* m1n1 finds the GPU node through this alias */
+	};
+
+	gpu_opp: opp-table-gpu {
+		compatible = "operating-points-v2";
+
+		/* Placeholder; the boot loader replaces it with the real states. */
+		opp00 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+			opp-microwatt = <0>;
+		};
+	};
+};
+
+&{/soc} {
+	gpu: gpu@292400000 {
+		compatible = "apple,agx-t8122";
+		reg = <0x2 0x92400000 0x0 0x6c000>,
+		      <0x2 0x90000000 0x0 0x4000000>;
+		reg-names = "asc", "sgx";
+		interrupt-parent = <&aic>;
+		/* Preserve the ADT order; entry 5 (IRQ 729) is marked invalid there. */
+		interrupts = <AIC_IRQ 706 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 707 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 708 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 709 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 727 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 729 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 721 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_gfx>;
+		/* Do not hold back ps_gfx sync_state() if the GPU never probes. */
+		post-init-providers = <&ps_gfx>;
+		mboxes = <&agx_mbox>;
+		memory-region = <&uat_ttbs>, <&uat_pagetables>,
+				<&uat_handoff>, <&uat_pagetables_l2>;
+		memory-region-names = "ttbs", "pagetables", "handoff",
+				      "pagetables-l2";
+
+		/* Zero until the boot loader identifies the loaded GPU firmware. */
+		apple,firmware-abi = <0 0 0>;
+		apple,firmware-version = <0 0 0>;
+		apple,firmware-compat = <0 0 0>;
+
+		operating-points-v2 = <&gpu_opp>;
+
+		/* The boot loader sets "okay" as its last step. */
+		status = "disabled";
+	};
+
+	/*
+	 * IRQ roles as on the other T8122 mailboxes, untested for GFX. No
+	 * asc-mailbox-v4 fallback, so it stays unbound without M3 GPU support.
+	 */
+	agx_mbox: mbox@292408000 {
+		compatible = "apple,t8122-agx-asc-mailbox";
+		reg = <0x2 0x92408000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 723 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 724 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 725 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 726 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+};

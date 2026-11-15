@@ -1,0 +1,169 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+# Copyright (C) 2020-2022 Texas Instruments Incorporated
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/ti,tas27xx.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Texas Instruments TAS2764/TAS2780 Smart PA
+
+maintainers:
+  - Shenghao Ding <shenghao-ding@ti.com>
+
+description: |
+  The TAS2764/TAS2780 is a mono, digital input Class-D audio amplifier
+  optimized for efficiently driving high peak power into small
+  loudspeakers. Integrated speaker voltage and current sense provides
+  for real time monitoring of loudspeaker behavior.
+
+allOf:
+  - $ref: dai-common.yaml#
+  - if:
+      required:
+        - apple,sdz-group-fail-closed
+    then:
+      properties:
+        shutdown-gpios: false
+
+properties:
+  compatible:
+    oneOf:
+      - enum:
+          - ti,tas2764
+          - ti,tas2780
+          - ti,sn012776 # Apple variant of TAS2764
+      - items:
+          - const: ti,sn012776
+          - const: ti,tas2764
+
+  reg:
+    maxItems: 1
+    description: |
+       I2C address of the device can be between 0x38 to 0x45.
+
+  reset-gpios:
+    maxItems: 1
+    description: GPIO used to reset the device.
+
+  shutdown-gpios:
+    maxItems: 1
+    description: GPIO used to control the state of the device.
+
+  interrupts:
+    maxItems: 1
+
+  SDZ-supply:
+    description:
+      Regulator that drives the SDZ (shutdown) pin, an alternative to
+      shutdown-gpios for a line that several amplifiers share.
+
+  apple,sdz-group-fail-closed:
+    type: boolean
+    description:
+      The amplifier belongs to the group of amplifiers that share its
+      SDZ-supply. An over-temperature or over-current fault on any member
+      turns the shared supply off, which shuts every amplifier of the group
+      down, and no member enables it again until the driver is reloaded.
+      A member needs its fault interrupt.
+
+  apple,bop-config:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 24
+    maxItems: 24
+    description:
+      SN012776 only. The brownout prevention registers BOP_CFG0 to BOP_CFG24,
+      in register order, as the Mac's boot ADT gives them for the amplifier's
+      group (its bop-config). The boot loader copies it into the device tree;
+      without it the block keeps its reset values.
+
+  apple,amp-dcblocker-config:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 2
+    description:
+      SN012776 only. The DC blocker setting of the amplifier's group, as the
+      Mac's boot ADT gives it (its amp-dcblocker-config), copied by the boot
+      loader; its first two bytes are DC_BLK0 and DC_BLK1. Absent when the
+      ADT has none; the driver then writes DC_BLK0 = 0x01 and DC_BLK1 = 0x00.
+
+  apple,amp-tx-zd-config:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 8
+    maxItems: 8
+    description:
+      SN012776 only. This amplifier's row of its group's amp-tx-zd-config in
+      the Mac's boot ADT, copied by the boot loader - one byte per eight SDOUT
+      slots from slot 0, a set bit driving zeros in that idle slot. It
+      replaces the sound card's TDM idle masks for this amplifier.
+
+  apple,speaker-config:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 4
+    maxItems: 4
+    description:
+      SN012776 only. This amplifier's row of its group's speaker-config in
+      the Mac's boot ADT, copied by the boot loader. Its second byte is the
+      amplifier's operating level (AMP_LEVEL, low five bits); the others are
+      its receive and sense slots.
+
+  apple,deferred-shutdown:
+    type: boolean
+    description:
+      The amplifier's TDM bus keeps running for a while after its playback
+      stream stops, as on an AOP-fed speaker stream, and its current and
+      voltage sense slots are still sampled in that time. The amplifier
+      must not enter software shutdown until the bus has stopped. One shut
+      down while the bus still runs can leave garbage in its sense slots.
+
+  ti,imon-slot-no:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: TDM TX current sense time slot.
+
+  ti,vmon-slot-no:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description: TDM TX voltage sense time slot.
+
+  ti,bclk-ratio:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    enum: [250]
+    description:
+      Fixed BCLK/FS ratio of the TDM frame, for a frame the amplifier's ratio
+      auto-detection does not accept (250 BCLKs on the Mac mini (M6, J873)
+      speaker).
+
+  '#sound-dai-cells':
+    # The codec has a single DAI, the #sound-dai-cells=<1>; case is left in for backward
+    # compatibility but is deprecated.
+    enum: [0, 1]
+
+required:
+  - compatible
+  - reg
+
+dependencies:
+  apple,sdz-group-fail-closed:
+    - SDZ-supply
+
+unevaluatedProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/gpio/gpio.h>
+
+    i2c {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        codec@38 {
+            compatible = "ti,tas2764";
+            reg = <0x38>;
+            #sound-dai-cells = <0>;
+            interrupt-parent = <&gpio1>;
+            interrupts = <14>;
+            reset-gpios = <&gpio1 15 GPIO_ACTIVE_HIGH>;
+            shutdown-gpios = <&gpio1 15 GPIO_ACTIVE_HIGH>;
+            ti,imon-slot-no = <0>;
+            ti,vmon-slot-no = <2>;
+        };
+    };
+
+...

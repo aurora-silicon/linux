@@ -1,0 +1,15 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * T602x Thunderbolt PCIe (PCIe-C) DART tunables, included in each
+ * apciec[0-2] DART node. iBoot adds "dart-tunables-instance-0" to the ADT
+ * at boot, but m1n1 does not copy it for these DARTs, and the DART cannot
+ * probe without it. Values read from J416c and J414s ADTs, identical on
+ * both machines and for all three ports. Offsets are relative to the
+ * DART's reg.
+ */
+apple,tunable = <0x20c 0xff0000b7 0xe40000b7>,
+		<0x220 0x000f0f0f 0x000f0f0f>,
+		<0x224 0x00ffffff 0x00080808>,
+		<0x300 0x00001f31 0x00000001>,
+		<0x308 0x3ffffffc 0x10000000>,
+		<0x310 0x3ffffffc 0x3ffffffc>;

@@ -1,0 +1,139 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0
+# Report whether PCIe over Thunderbolt (PCIe-C) works on this Mac.
+#
+# Plug a Thunderbolt 3 dock or display (for example an Apple Studio Display)
+# into the Mac, then run this. It only reads system state. Run it with sudo
+# if your user cannot read the kernel log.
+#
+#   tb-pcie-report             # wait for you to plug the device in
+#   tb-pcie-report --no-wait   # report the current state now
+set -u
+
+dt=/proc/device-tree
+param=/sys/module/pcie_apple/parameters/tunnel_kernel_init
+
+say() { printf '%s\n' "$*"; }
+
+compat=$(tr '\0' ' ' <"$dt/compatible" 2>/dev/null)
+model=$(tr -d '\0' <"$dt/model" 2>/dev/null)
+case "$compat" in
+*apple,t6000*|*apple,t6001*) chip=T600x ;;
+*apple,t6020*|*apple,t6021*) chip=T602x ;;
+*apple,t8103*) chip=t8103 ;;
+*) chip=other ;;
+esac
+
+if [ "$chip" = other ]; then
+	say "This Mac ($compat) is not covered: only M1, M1 Pro/Max and"
+	say "M2 Pro/Max have PCIe-C support in this kernel."
+	exit 1
+fi
+
+enabled=yes
+[ "$(cat "$param" 2>/dev/null)" = N ] && enabled=no
+# The parameter file only exists once pcie_apple is loaded.
+grep -qE '(^| )pcie_apple\.tunnel_kernel_init=(0|n|N)( |$)' /proc/cmdline &&
+	enabled=no
+if [ "$chip" != t8103 ] && [ "$enabled" = no ]; then
+	say "pcie_apple.tunnel_kernel_init=0 is on the kernel command line, so the"
+	say "tunnel stays off. Remove it from the command line and reboot."
+	exit 1
+fi
+
+if [ "${1:-}" != --no-wait ]; then
+	say "Plug the Thunderbolt dock or display in now, wait about 20 seconds,"
+	printf '%s' "then press Enter. "
+	read -r _
+fi
+
+if klog=$(journalctl -k -b -o short-monotonic --no-pager 2>/dev/null) &&
+   [ -n "$klog" ]; then
+	:
+elif klog=$(dmesg 2>/dev/null) && [ -n "$klog" ]; then
+	:
+else
+	say "Cannot read the kernel log; run again with sudo."
+	exit 1
+fi
+
+out=$(mktemp "${TMPDIR:-/tmp}/tb-pcie-report.XXXXXX") || exit 1
+
+{
+	say "# PCIe-C report: $model"
+	say
+	say "- Machine: \`$compat\` ($chip)"
+	say "- Kernel: \`$(uname -r)\`"
+	say "- tunnel_kernel_init: $enabled"
+	say "- Date: $(date -u +%Y-%m-%dT%H:%MZ)"
+	say
+	say "## DART tunables"
+	say
+	missing=no
+	for t in "$dt"/soc/usb4-pcie-tunnel-*; do
+		# m1n1 only fills in ports that this Mac has.
+		[ -e "$t"/pcie@*/apple,tunable-rc ] || continue
+		for d in "$t"/iommu@*; do
+			if [ -e "$d/apple,tunable" ]; then
+				say "- $(basename "$t"): present"
+			else
+				say "- $(basename "$t"): **missing**"
+				missing=yes
+			fi
+		done
+	done
+	say
+	say "## Thunderbolt PCIe devices"
+	say
+	say '```'
+	found=no
+	for p in /sys/bus/pci/devices/*; do
+		addr=$(basename "$p")
+		case "$addr" in 0000:*) continue ;; esac
+		found=yes
+		driver=$(readlink "$p/driver" 2>/dev/null) && driver=${driver##*/}
+		printf '%s %s:%s class %s driver %s runtime %s\n' "$addr" \
+			"$(cut -c3- "$p/vendor")" "$(cut -c3- "$p/device")" \
+			"$(cut -c3- "$p/class")" "${driver:-none}" \
+			"$(cat "$p/power/runtime_status" 2>/dev/null)"
+	done
+	[ "$found" = yes ] || say "(none)"
+	say '```'
+	say
+	say "## USB devices behind the tunnel"
+	say
+	say '```'
+	found=no
+	for u in /sys/bus/usb/devices/*; do
+		[ -e "$u/idVendor" ] || continue
+		case "$(readlink -f "$u")" in
+		*/pci000[1-9]:*|*/pci00[1-9]?:*) ;;
+		*) continue ;;
+		esac
+		found=yes
+		printf '%s %s:%s %s %s\n' "$(basename "$u")" "$(cat "$u/idVendor")" \
+			"$(cat "$u/idProduct")" "$(cat "$u/manufacturer" 2>/dev/null)" \
+			"$(cat "$u/product" 2>/dev/null)"
+	done
+	[ "$found" = yes ] || say "(none)"
+	say '```'
+	say
+	say "## Kernel log"
+	say
+	say '```'
+	printf '%s\n' "$klog" | grep -E \
+		'PCIe-C|usb4-pcie-tunnel|apple-dart [0-9a-f]+21008000|xhci_hcd 000[1-9]|tunnel reset' |
+		grep -v -e 'RTKit: syslog' -e 'dependency cycle' | tail -n 80
+	say '```'
+} >"$out"
+
+cat "$out"
+say
+say "Report saved to $out"
+if [ "$missing" = yes ]; then
+	say
+	say "Some tunnels have no DART tunables, so they stay off. If you can boot"
+	say "macOS on this Mac, please run this there and attach the output too:"
+	say
+	say "  { sysctl -n hw.model; sw_vers -productVersion; ioreg -p IODeviceTree -l -w0 | grep -E 'dart-apciec|dart-tunables-instance'; } > ~/Desktop/apciec-dart.txt"
+fi

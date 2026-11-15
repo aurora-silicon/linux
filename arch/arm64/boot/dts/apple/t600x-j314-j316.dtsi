@@ -1,0 +1,1636 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * MacBook Pro (14/16-inch, 2021)
+ *
+ * This file contains the parts common to J314 and J316 devices with both t6000 and t6001.
+ *
+ * target-type: J314s / J314c / J316s / J316c
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+#include <dt-bindings/leds/common.h>
+#include <dt-bindings/thermal/thermal.h>
+
+/ {
+	chassis-type = "laptop";
+
+	aliases {
+		atcphy0 = &atcphy0;
+		atcphy1 = &atcphy1;
+		atcphy2 = &atcphy2;
+		atcphy3 = &atcphy3;
+		bluetooth0 = &bluetooth0;
+		dcp = &dcp;
+		dcpext0 = &dcpext0;
+#ifdef APPLE_T600X_NON_ULTRA
+		dcpext1 = &dcpext1;
+#endif
+		disp0 = &display;
+		disp0_piodma = &disp0_piodma;
+		disp0-piodma = &disp0_piodma;
+		serial0 = &serial0;
+		sio = &sio;
+		usb4-0-acio = &usb4_0_acio;
+		usb4-0-nhi = &usb4_0_nhi;
+		usb4-0-pcie-adapter = &usb4_0_acio;
+		usb4-0-pcie = &apciec0;
+		usb4_0_rc = &usb4_0_acio;
+		usb4_0_nhi = &usb4_0_nhi;
+		usb4_0_pcie_adapter = &usb4_0_acio;
+		usb4_0_pcie = &apciec0;
+		usb4-1-acio = &usb4_1_acio;
+		usb4-1-nhi = &usb4_1_nhi;
+		usb4-1-pcie-adapter = &usb4_1_acio;
+		usb4-1-pcie = &apciec1;
+		usb4_1_rc = &usb4_1_acio;
+		usb4_1_nhi = &usb4_1_nhi;
+		usb4_1_pcie_adapter = &usb4_1_acio;
+		usb4_1_pcie = &apciec1;
+		usb4-2-acio = &usb4_2_acio;
+		usb4-2-nhi = &usb4_2_nhi;
+		usb4-2-pcie-adapter = &usb4_2_acio;
+		usb4-2-pcie = &apciec2;
+		usb4_2_rc = &usb4_2_acio;
+		usb4_2_nhi = &usb4_2_nhi;
+		usb4_2_pcie_adapter = &usb4_2_acio;
+		usb4_2_pcie = &apciec2;
+		usb4-3-pcie = &apciec3;
+		wifi0 = &wifi0;
+
+		usb4_0_rc = &usb4_0_acio;
+		usb4_0_nhi = &usb4_0_nhi;
+		usb4_1_rc = &usb4_1_acio;
+		usb4_1_nhi = &usb4_1_nhi;
+		usb4_2_rc = &usb4_2_acio;
+		usb4_2_nhi = &usb4_2_nhi;
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		stdout-path = "serial0";
+
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>; /* To be filled by loader */
+			/* Format properties will be added by loader */
+			status = "disabled";
+			panel = <&panel>;
+			post-init-providers = <&panel>;
+			power-domains = <&ps_disp0_cpu0>;
+		};
+	};
+
+	memory@10000000000 {
+		device_type = "memory";
+		reg = <0x100 0 0x2 0>; /* To be filled by loader */
+	};
+
+	led-controller {
+		compatible = "pwm-leds";
+		led-0 {
+			pwms = <&fpwm0 0 40000>;
+			label = "kbd_backlight";
+			function = LED_FUNCTION_KBD_BACKLIGHT;
+			color = <LED_COLOR_ID_WHITE>;
+			max-brightness = <255>;
+			default-state = "keep";
+		};
+	};
+};
+
+&serial0 {
+	status = "okay";
+};
+
+&dcp {
+	panel: panel {
+		apple,max-brightness = <500>;
+	};
+};
+
+&display {
+	iommus = <&disp0_dart 0 0x0 0x0 0x0 0xfc000000>,
+		<&dispext0_dart 0 0x0 0x0 0x0 0xfc000000>;
+};
+
+&dispext0_dart {
+	status = "okay";
+};
+
+&dcpext0_dart {
+	status = "okay";
+};
+
+&dcpext0_mbox {
+	status = "okay";
+};
+
+&dcpext0 {
+	/* enabled by the loader */
+	apple,connector-type = "HDMI-A";
+
+	/*  HDMI HPD gpio, used as interrupt*/
+	hdmi-hpd-gpios = <&pinctrl_nub 15 GPIO_ACTIVE_HIGH>;
+
+	hdmi-pwren-gpios = <&smc_gpio 23 GPIO_ACTIVE_HIGH>;
+	dp2hdmi-pwren-gpios = <&smc_gpio 6 GPIO_ACTIVE_HIGH>;
+
+	phys = <&atcphy3 PHY_TYPE_DP>, <&atcphy0 PHY_TYPE_DP>,
+	       <&atcphy1 PHY_TYPE_DP>, <&atcphy2 PHY_TYPE_DP>;
+	phy-names = "dp-phy", "typec0", "typec1", "typec2";
+	mux-controls = <&atcphy3_xbar 0>, <&atcphy0_xbar 0>,
+		       <&atcphy1_xbar 0>, <&atcphy2_xbar 0>;
+	mux-control-names = "dp-xbar", "typec0", "typec1", "typec2";
+	mux-index = <0>;
+	apple,dptx-phy = <3>;
+
+	/*
+	 * A hybrid pipeline, as on the M2 Pro/Max laptops: it keeps the HDMI
+	 * port and is lent to a USB-C port while HDMI is idle, so a second
+	 * USB-C display is not left without a pipeline.
+	 */
+	apple,typec-mux-indices = <0 0 0>;
+	apple,typec-dptx-phys = <0 1 2>;
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@1 {
+			reg = <1>;
+
+			decpext0_dpout: endpoint {
+				remote-endpoint = <&atcphy3_dp>;
+			};
+		};
+	};
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+
+			port {
+				dcpext0_typec0: endpoint {
+					remote-endpoint = <&typec0_dcpext0>;
+				};
+			};
+		};
+
+		route@1 {
+			reg = <1>;
+			mode-switch;
+
+			port {
+				dcpext0_typec1: endpoint {
+					remote-endpoint = <&typec1_dcpext0>;
+				};
+			};
+		};
+
+		route@2 {
+			reg = <2>;
+			mode-switch;
+
+			port {
+				dcpext0_typec2: endpoint {
+					remote-endpoint = <&typec2_dcpext0>;
+				};
+			};
+		};
+	};
+};
+
+#ifdef APPLE_T600X_NON_ULTRA
+&display {
+	iommus = <&disp0_dart 0 0x0 0x0 0x0 0xfc000000>,
+		 <&dispext0_dart 0 0x0 0x0 0x0 0xfc000000>,
+		 <&dispext1_dart 0 0x0 0x0 0x0 0xfc000000>;
+};
+
+&dispext1_dart {
+	status = "okay";
+};
+
+&dcpext1_dart {
+	status = "okay";
+};
+
+&dcpext1_mbox {
+	status = "okay";
+};
+
+&dcpext1 {
+	status = "okay";
+	apple,connector-type = "USB-C";
+	phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>,
+	       <&atcphy2 PHY_TYPE_DP>;
+	phy-names = "typec0", "typec1", "typec2";
+	mux-controls = <&atcphy0_xbar 0>, <&atcphy1_xbar 0>,
+		       <&atcphy2_xbar 0>;
+	mux-control-names = "typec0", "typec1", "typec2";
+	apple,typec-mux-indices = <2 2 2>;
+	apple,typec-dptx-phys = <0 1 2>;
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+
+			port {
+				dcpext1_typec0: endpoint {
+					remote-endpoint = <&typec0_dcp>;
+				};
+			};
+		};
+
+		route@1 {
+			reg = <1>;
+			mode-switch;
+
+			port {
+				dcpext1_typec1: endpoint {
+					remote-endpoint = <&typec1_dcp>;
+				};
+			};
+		};
+
+		route@2 {
+			reg = <2>;
+			mode-switch;
+
+			port {
+				dcpext1_typec2: endpoint {
+					remote-endpoint = <&typec2_dcp>;
+				};
+			};
+		};
+	};
+};
+
+&dpaudio2 {
+	status = "okay";
+};
+
+&atcphy0_xbar {
+	status = "okay";
+};
+
+&atcphy1_xbar {
+	status = "okay";
+};
+
+&atcphy2_xbar {
+	status = "okay";
+};
+
+&ps_atc0_common {
+	apple,always-on;
+};
+
+&ps_atc1_common {
+	apple,always-on;
+};
+
+&ps_atc2_common {
+	apple,always-on;
+};
+
+&usb4_0_acio {
+	apple,pcie-tunnel = <&usb4_0_pcie_tunnel>;
+};
+
+&usb4_1_acio {
+	apple,pcie-tunnel = <&usb4_1_pcie_tunnel>;
+};
+
+&usb4_2_acio {
+	apple,pcie-tunnel = <&usb4_2_pcie_tunnel>;
+};
+#endif
+
+/* remove once m1n1 enables sio nodes after setup */
+&sio {
+	status = "okay";
+};
+
+&dpaudio1 {
+	status = "okay";
+};
+
+&atcphy3_xbar {
+	status = "okay";
+};
+
+&ps_atc3_common {
+	apple,always-on; /* Needs to stay on for HDMI resume */
+};
+
+/* USB Type C */
+&i2c0 {
+	hpm0: usb-pd@38 {
+		compatible = "apple,cd321x";
+		reg = <0x38>;
+		interrupt-parent = <&pinctrl_ap>;
+		interrupts = <174 IRQ_TYPE_LEVEL_LOW>;
+		interrupt-names = "irq";
+
+		typec0: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Left Back";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+				port@0 {
+					reg = <0>;
+					typec0_connector_hs: endpoint {
+						remote-endpoint = <&dwc3_0_hs>;
+					};
+				};
+				port@1 {
+					reg = <1>;
+					typec0_connector_ss: endpoint {
+						remote-endpoint = <&atcphy0_typec_lanes>;
+					};
+				};
+			};
+		};
+	};
+
+	hpm1: usb-pd@3f {
+		compatible = "apple,cd321x";
+		reg = <0x3f>;
+		interrupt-parent = <&pinctrl_ap>;
+		interrupts = <174 IRQ_TYPE_LEVEL_LOW>;
+		interrupt-names = "irq";
+
+		typec1: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Left Front";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+				port@0 {
+					reg = <0>;
+					typec1_connector_hs: endpoint {
+						remote-endpoint = <&dwc3_1_hs>;
+					};
+				};
+				port@1 {
+					reg = <1>;
+					typec1_connector_ss: endpoint {
+						remote-endpoint = <&atcphy1_typec_lanes>;
+					};
+				};
+			};
+		};
+	};
+
+	hpm2: usb-pd@3b {
+		compatible = "apple,cd321x";
+		reg = <0x3b>;
+		interrupt-parent = <&pinctrl_ap>;
+		interrupts = <174 IRQ_TYPE_LEVEL_LOW>;
+		interrupt-names = "irq";
+
+		typec2: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Right";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+				port@0 {
+					reg = <0>;
+					typec2_connector_hs: endpoint {
+						remote-endpoint = <&dwc3_2_hs>;
+					};
+				};
+				port@1 {
+					reg = <1>;
+					typec2_connector_ss: endpoint {
+						remote-endpoint = <&atcphy2_typec_lanes>;
+					};
+				};
+			};
+		};
+	};
+
+	/* MagSafe port */
+	hpm5: usb-pd@3a {
+		compatible = "apple,cd321x";
+		reg = <0x3a>;
+		interrupt-parent = <&pinctrl_ap>;
+		interrupts = <174 IRQ_TYPE_LEVEL_LOW>;
+		interrupt-names = "irq";
+	};
+};
+
+&i2c1 {
+	status = "okay";
+
+	speaker_left_tweet: codec@3a {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3a>;
+		shutdown-gpios = <&pinctrl_ap 178 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Tweeter";
+		interrupts-extended = <&pinctrl_ap 179 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <8>;
+		ti,vmon-slot-no = <10>;
+	};
+
+	speaker_left_woof1: codec@38 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x38>;
+		shutdown-gpios = <&pinctrl_ap 178 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 1";
+		interrupts-extended = <&pinctrl_ap 179 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <0>;
+		ti,vmon-slot-no = <2>;
+	};
+
+	speaker_left_woof2: codec@39 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x39>;
+		shutdown-gpios = <&pinctrl_ap 178 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 2";
+		interrupts-extended = <&pinctrl_ap 179 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <16>;
+		ti,vmon-slot-no = <18>;
+	};
+};
+
+&i2c2 {
+	status = "okay";
+
+	jack_codec: codec@4b {
+		compatible = "cirrus,cs42l84";
+		reg = <0x4b>;
+		reset-gpios = <&pinctrl_nub 4 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		interrupts-extended = <&pinctrl_ap 180 IRQ_TYPE_LEVEL_LOW>;
+		sound-name-prefix = "Jack";
+	};
+};
+
+&i2c3 {
+	status = "okay";
+
+	speaker_right_tweet: codec@3d {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3d>;
+		shutdown-gpios = <&pinctrl_ap 178 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Tweeter";
+		interrupts-extended = <&pinctrl_ap 179 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <12>;
+		ti,vmon-slot-no = <14>;
+	};
+
+	speaker_right_woof1: codec@3b {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3b>;
+		shutdown-gpios = <&pinctrl_ap 178 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 1";
+		interrupts-extended = <&pinctrl_ap 179 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <4>;
+		ti,vmon-slot-no = <6>;
+	};
+
+	speaker_right_woof2: codec@3c {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3c>;
+		shutdown-gpios = <&pinctrl_ap 178 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 2";
+		interrupts-extended = <&pinctrl_ap 179 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <20>;
+		ti,vmon-slot-no = <22>;
+	};
+};
+
+&nco_clkref {
+	clock-frequency = <1068000000>;
+};
+
+#ifndef NO_SPI_TRACKPAD
+&spi3 {
+	status = "okay";
+
+	hid-transport@0 {
+		compatible = "apple,spi-hid-transport";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+		/*
+		 * Apple's ADT specifies 20us CS change delays, and the
+		 * SPI HID interface metadata specifies 45us. Using either
+		 * seems not to be reliable, but adding both works, so
+		 * best guess is they are cumulative.
+		 */
+		spi-cs-setup-delay-ns = <65000>;
+		spi-cs-hold-delay-ns = <65000>;
+		spi-cs-inactive-delay-ns = <250000>;
+		spien-gpios = <&pinctrl_ap 194 0>;
+		interrupts-extended = <&pinctrl_nub 6 IRQ_TYPE_LEVEL_LOW>;
+	};
+};
+#endif
+
+/* PCIe devices */
+&port00 {
+	/* WLAN */
+	bus-range = <1 1>;
+	pwren-gpios = <&smc_gpio 13 GPIO_ACTIVE_HIGH>;
+	wifi0: wifi@0,0 {
+		compatible = "pci14e4,4433";
+		reg = <0x10000 0x0 0x0 0x0 0x0>;
+		wakeup-source;
+		/* To be filled by the loader */
+		local-mac-address = [00 10 18 00 00 10];
+		apple,antenna-sku = "XX";
+		brcm,ccode-map-trivial;
+	};
+
+	bluetooth0: bluetooth@0,1 {
+		compatible = "pci14e4,5f71";
+		reg = <0x10100 0x0 0x0 0x0 0x0>;
+		/* To be filled by the loader */
+		local-bd-address = [00 00 00 00 00 00];
+	};
+};
+
+&port01 {
+	/* SD card reader */
+	bus-range = <2 2>;
+	pwren-gpios = <&smc_gpio 26 GPIO_ACTIVE_HIGH>;
+	status = "okay";
+	sdhci0: mmc@0,0 {
+		compatible = "pci17a0,9755";
+		reg = <0x20000 0x0 0x0 0x0 0x0>;
+		cd-inverted;
+		wp-inverted;
+	};
+};
+
+&fpwm0 {
+	status = "okay";
+};
+
+&pcie0_dart_1 {
+	status = "okay";
+};
+
+#ifdef APPLE_T600X_NON_ULTRA
+&typec0 {
+	ports {
+		port@3 {
+			reg = <3>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			typec0_dcp: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&dcpext1_typec0>;
+			};
+
+			typec0_dcpext0: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext0_typec0>;
+			};
+		};
+	};
+};
+
+&typec1 {
+	ports {
+		port@3 {
+			reg = <3>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			typec1_dcp: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&dcpext1_typec1>;
+			};
+
+			typec1_dcpext0: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext0_typec1>;
+			};
+		};
+	};
+};
+
+&typec2 {
+	ports {
+		port@3 {
+			reg = <3>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			typec2_dcp: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&dcpext1_typec2>;
+			};
+
+			typec2_dcpext0: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext0_typec2>;
+			};
+		};
+	};
+};
+#endif
+
+/* USB controllers */
+&dwc3_0 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dwc3_0_hs: endpoint {
+				remote-endpoint = <&typec0_connector_hs>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			dwc3_0_ss: endpoint {
+				remote-endpoint = <&atcphy0_usb3>;
+			};
+		};
+	};
+};
+
+&dwc3_1 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dwc3_1_hs: endpoint {
+				remote-endpoint = <&typec1_connector_hs>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			dwc3_1_ss: endpoint {
+				remote-endpoint = <&atcphy1_usb3>;
+			};
+		};
+	};
+};
+
+&dwc3_2 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dwc3_2_hs: endpoint {
+				remote-endpoint = <&typec2_connector_hs>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			dwc3_2_ss: endpoint {
+				remote-endpoint = <&atcphy2_usb3>;
+			};
+		};
+	};
+};
+
+/*
+ * ps_atc3_usb_aon power-domain is always-on to keep dwc3 working over suspend.
+ * atc3 is used exclusively for the DP-to-HDMI so do not keep this always on.
+ * On t600x it is required to keep atc DP state over suspend.
+ */
+// &ps_atc3_usb_aon {
+// 	/delete-property/ apple,always-on;
+// };
+
+/* ATC3 is used for DisplayPort -> HDMI only */
+&dwc3_3_dart_0 {
+	status = "disabled";
+};
+
+&dwc3_3_dart_1 {
+	status = "disabled";
+};
+
+/* ATC3 has no USB4/Thunderbolt, so there is no PCIe-C tunnel behind it either */
+&apciec3_dart {
+	status = "disabled";
+};
+
+&apciec3 {
+	status = "disabled";
+};
+
+&dwc3_3 {
+	status = "disabled";
+};
+
+/* Delete unused dwc3_3 to prevent dt_disable_missing_devs() from disabling
+ * atcphy3 via phandle references from a disablecd device.
+ */
+/delete-node/ &dwc3_3;
+
+/* Type-C PHYs */
+&atcphy0 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			atcphy0_typec_lanes: endpoint {
+				remote-endpoint = <&typec0_connector_ss>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			atcphy0_usb3: endpoint {
+				remote-endpoint = <&dwc3_0_ss>;
+			};
+		};
+	};
+};
+
+&atcphy1 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			atcphy1_typec_lanes: endpoint {
+				remote-endpoint = <&typec1_connector_ss>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			atcphy1_usb3: endpoint {
+				remote-endpoint = <&dwc3_1_ss>;
+			};
+		};
+	};
+};
+
+&atcphy2 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			atcphy2_typec_lanes: endpoint {
+				remote-endpoint = <&typec2_connector_ss>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			atcphy2_usb3: endpoint {
+				remote-endpoint = <&dwc3_2_ss>;
+			};
+		};
+	};
+};
+
+&atcphy3 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@2 {
+			reg = <2>;
+			atcphy3_dp: endpoint {
+				remote-endpoint = <&decpext0_dpout>;
+			};
+		};
+	};
+};
+
+&aop_mbox {
+       status = "okay";
+};
+
+&aop_dart {
+       status = "okay";
+};
+
+&aop_admac {
+       status = "okay";
+};
+
+&aop {
+       status = "okay";
+};
+
+/ {
+	sound: sound {
+		/* compatible is set per machine */
+
+		dai-link@0 {
+			link-name = "Speakers";
+			dai-tdm-idle-mode-0 = "zero";
+			dai-tdm-idle-mode-3 = "zero";
+			dai-tdm-slot-tx-idle-mask-0 = <0xf0f0f0>;
+			dai-tdm-slot-tx-idle-mask-3 = <0x0f0f0f>;
+
+			cpu {
+				sound-dai = <&mca 0>, <&mca 1>;
+			};
+			codec {
+				sound-dai = <&speaker_left_woof1>,
+					    <&speaker_left_tweet>,
+					    <&speaker_left_woof2>,
+					    <&speaker_right_woof1>,
+					    <&speaker_right_tweet>,
+					    <&speaker_right_woof2>;
+			};
+		};
+
+		dai-link@1 {
+			link-name = "Headphone Jack";
+
+			cpu {
+				sound-dai = <&mca 2>;
+			};
+			codec {
+				sound-dai = <&jack_codec>;
+			};
+		};
+	};
+};
+
+&typec0 {
+	ports {
+		port@2 {
+			reg = <2>;
+			typec0_con_tbt: endpoint {
+				remote-endpoint = <&usb4_0_acio_tbt>;
+			};
+		};
+	};
+};
+
+&typec1 {
+	ports {
+		port@2 {
+			reg = <2>;
+			typec1_con_tbt: endpoint {
+				remote-endpoint = <&usb4_1_acio_tbt>;
+			};
+		};
+	};
+};
+
+&typec2 {
+	ports {
+		port@2 {
+			reg = <2>;
+			typec2_con_tbt: endpoint {
+				remote-endpoint = <&usb4_2_acio_tbt>;
+			};
+		};
+	};
+};
+
+/* USB4 */
+&usb4_0_acio {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* 1: USB4 port */
+		port@1 {
+			reg = <1>;
+			usb4_0_acio_tbt: endpoint {
+				remote-endpoint = <&typec0_con_tbt>;
+			};
+		};
+
+		/* 2: unused(?) USB4 port */
+		/* 3: PCIe */
+		/* 4: USB3 */
+		/* 5: DP0 */
+		/* 6: DP1 */
+	};
+};
+
+&usb4_1_acio {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* 1: USB4 port */
+		port@1 {
+			reg = <1>;
+			usb4_1_acio_tbt: endpoint {
+				remote-endpoint = <&typec1_con_tbt>;
+			};
+		};
+
+		/* 2: unused(?) USB4 port */
+		/* 3: PCIe */
+		/* 4: USB3 */
+		/* 5: DP0 */
+		/* 6: DP1 */
+	};
+};
+
+&usb4_2_acio {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* 1: USB4 port */
+		port@1 {
+			reg = <1>;
+			usb4_2_acio_tbt: endpoint {
+				remote-endpoint = <&typec2_con_tbt>;
+			};
+		};
+
+		/* 2: unused(?) USB4 port */
+		/* 3: PCIe */
+		/* 4: USB3 */
+		/* 5: DP0 */
+		/* 6: DP1 */
+	};
+};
+
+/* ATC3 is used for DP-to-HDMI only and has no USB4 host router */
+/delete-node/ &usb4_3_acio;
+/delete-node/ &usb4_3_mbox;
+
+#include "spi1-nvram.dtsi"
+#include "hwmon-laptop.dtsi"
+#include "hwmon-fan-dual.dtsi"
+
+/*
+ * GPU temperatures. The SMC publishes them only while the GPU is powered:
+ * with the GPU off, Tg04/Tg0C read 0 C and Tg05/Tg0D read 9.2 C (they
+ * track Tg04/Tg0C plus a fixed 9.2 C). Those placeholders are no data.
+ */
+&smc_hwmon {
+	temperature-Tg04 {
+		apple,key-id = "Tg04";
+		label = "GPU Tg04";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg05 {
+		apple,key-id = "Tg05";
+		label = "GPU Tg05";
+		apple,no-data-below-millicelsius = <15000>;
+	};
+
+	temperature-Tg0C {
+		apple,key-id = "Tg0C";
+		label = "GPU Tg0C";
+		apple,no-data-below-millicelsius = <10000>;
+	};
+
+	temperature-Tg0D {
+		apple,key-id = "Tg0D";
+		label = "GPU Tg0D";
+		apple,no-data-below-millicelsius = <15000>;
+	};
+};
+
+/*
+ * CPU temperatures, after the channels above so their numbers do not
+ * change. Each sensor site has three keys: the reading (TpX0), the same
+ * plus a fixed offset (TpX1: 9 C, Te01: 13.4 C), and a hotspot estimate
+ * (TpX2) above both. TCMz is the hottest of the hotspot keys. Under
+ * load on one cluster at a time, Tp00-Tp0I follow the first P cluster,
+ * Tp0K-Tp0c the second, and Te00-Te02 the E cluster.
+ */
+&smc_hwmon {
+	#thermal-sensor-cells = <1>;
+
+	temperature-TCMz {
+		apple,key-id = "TCMz";
+		label = "SoC Die Temperature";
+	};
+
+	temperature-Te00 {
+		apple,key-id = "Te00";
+		label = "E-cluster Te00";
+	};
+
+	temperature-Te01 {
+		apple,key-id = "Te01";
+		label = "E-cluster Te01";
+	};
+
+	temperature-Te02 {
+		apple,key-id = "Te02";
+		label = "E-cluster Te02";
+	};
+
+	temperature-Tp00 {
+		apple,key-id = "Tp00";
+		label = "P0-cluster Tp00";
+	};
+
+	temperature-Tp01 {
+		apple,key-id = "Tp01";
+		label = "P0-cluster Tp01";
+	};
+
+	temperature-Tp02 {
+		apple,key-id = "Tp02";
+		label = "P0-cluster Tp02";
+	};
+
+	temperature-Tp04 {
+		apple,key-id = "Tp04";
+		label = "P0-cluster Tp04";
+	};
+
+	temperature-Tp05 {
+		apple,key-id = "Tp05";
+		label = "P0-cluster Tp05";
+	};
+
+	temperature-Tp06 {
+		apple,key-id = "Tp06";
+		label = "P0-cluster Tp06";
+	};
+
+	temperature-Tp08 {
+		apple,key-id = "Tp08";
+		label = "P0-cluster Tp08";
+	};
+
+	temperature-Tp09 {
+		apple,key-id = "Tp09";
+		label = "P0-cluster Tp09";
+	};
+
+	temperature-Tp0A {
+		apple,key-id = "Tp0A";
+		label = "P0-cluster Tp0A";
+	};
+
+	temperature-Tp0C {
+		apple,key-id = "Tp0C";
+		label = "P0-cluster Tp0C";
+	};
+
+	temperature-Tp0D {
+		apple,key-id = "Tp0D";
+		label = "P0-cluster Tp0D";
+	};
+
+	temperature-Tp0E {
+		apple,key-id = "Tp0E";
+		label = "P0-cluster Tp0E";
+	};
+
+	temperature-Tp0G {
+		apple,key-id = "Tp0G";
+		label = "P0-cluster Tp0G";
+	};
+
+	temperature-Tp0H {
+		apple,key-id = "Tp0H";
+		label = "P0-cluster Tp0H";
+	};
+
+	temperature-Tp0I {
+		apple,key-id = "Tp0I";
+		label = "P0-cluster Tp0I";
+	};
+
+	temperature-Tp0K {
+		apple,key-id = "Tp0K";
+		label = "P1-cluster Tp0K";
+	};
+
+	temperature-Tp0L {
+		apple,key-id = "Tp0L";
+		label = "P1-cluster Tp0L";
+	};
+
+	temperature-Tp0M {
+		apple,key-id = "Tp0M";
+		label = "P1-cluster Tp0M";
+	};
+
+	temperature-Tp0O {
+		apple,key-id = "Tp0O";
+		label = "P1-cluster Tp0O";
+	};
+
+	temperature-Tp0P {
+		apple,key-id = "Tp0P";
+		label = "P1-cluster Tp0P";
+	};
+
+	temperature-Tp0Q {
+		apple,key-id = "Tp0Q";
+		label = "P1-cluster Tp0Q";
+	};
+
+	temperature-Tp0S {
+		apple,key-id = "Tp0S";
+		label = "P1-cluster Tp0S";
+	};
+
+	temperature-Tp0T {
+		apple,key-id = "Tp0T";
+		label = "P1-cluster Tp0T";
+	};
+
+	temperature-Tp0U {
+		apple,key-id = "Tp0U";
+		label = "P1-cluster Tp0U";
+	};
+
+	temperature-Tp0W {
+		apple,key-id = "Tp0W";
+		label = "P1-cluster Tp0W";
+	};
+
+	temperature-Tp0X {
+		apple,key-id = "Tp0X";
+		label = "P1-cluster Tp0X";
+	};
+
+	temperature-Tp0Y {
+		apple,key-id = "Tp0Y";
+		label = "P1-cluster Tp0Y";
+	};
+
+	temperature-Tp0a {
+		apple,key-id = "Tp0a";
+		label = "P1-cluster Tp0a";
+	};
+
+	temperature-Tp0b {
+		apple,key-id = "Tp0b";
+		label = "P1-cluster Tp0b";
+	};
+
+	temperature-Tp0c {
+		apple,key-id = "Tp0c";
+		label = "P1-cluster Tp0c";
+	};
+};
+
+/* The zones below throttle the clusters through cpufreq. */
+&cpu_e00 {
+	#cooling-cells = <2>;
+};
+
+&cpu_e01 {
+	#cooling-cells = <2>;
+};
+
+&cpu_p00 {
+	#cooling-cells = <2>;
+};
+
+&cpu_p01 {
+	#cooling-cells = <2>;
+};
+
+&cpu_p02 {
+	#cooling-cells = <2>;
+};
+
+&cpu_p03 {
+	#cooling-cells = <2>;
+};
+
+&cpu_p10 {
+	#cooling-cells = <2>;
+};
+
+&cpu_p11 {
+	#cooling-cells = <2>;
+};
+
+&cpu_p12 {
+	#cooling-cells = <2>;
+};
+
+&cpu_p13 {
+	#cooling-cells = <2>;
+};
+
+/ {
+	/*
+	 * One zone per sensor site on its hotspot key, throttling only the
+	 * cluster the site sits on. The power allocator starts at 75 C, above
+	 * the 46-66 C idle readings, and controls at 105 C. The E site also
+	 * warms with the P clusters, so its zone starts at 85 C: the governor
+	 * grants no power to an idle cluster and would park E at its lowest
+	 * speed. A 180 s load on every CPU, with the fans under SMC control,
+	 * peaks at 95 C on the hottest site and 87 C on the E site without
+	 * any throttling, so these zones are a backstop. There is no hot or
+	 * critical trip: the SMC drives the fans and keeps its own
+	 * protection. sustainable-power is the energy model's four cores at
+	 * 2448 MHz per P cluster and both cores at full speed for E.
+	 */
+	thermal-zones {
+		cpu-e0-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <800>;
+			thermal-sensors = <&smc_hwmon 11>;	/* Te02 */
+
+			trips {
+				cpu_e0_switch_on: trip-switch-on {
+					temperature = <85000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_e0_control: trip-control {
+					temperature = <105000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_e0_control>;
+					cooling-device =
+						<&cpu_e00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p00-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <11600>;
+			thermal-sensors = <&smc_hwmon 14>;	/* Tp02 */
+
+			trips {
+				cpu_p00_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p00_control: trip-control {
+					temperature = <105000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p00_control>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p01-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <11600>;
+			thermal-sensors = <&smc_hwmon 17>;	/* Tp06 */
+
+			trips {
+				cpu_p01_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p01_control: trip-control {
+					temperature = <105000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p01_control>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p02-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <11600>;
+			thermal-sensors = <&smc_hwmon 20>;	/* Tp0A */
+
+			trips {
+				cpu_p02_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p02_control: trip-control {
+					temperature = <105000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p02_control>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p03-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <11600>;
+			thermal-sensors = <&smc_hwmon 23>;	/* Tp0E */
+
+			trips {
+				cpu_p03_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p03_control: trip-control {
+					temperature = <105000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p03_control>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p04-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <11600>;
+			thermal-sensors = <&smc_hwmon 26>;	/* Tp0I */
+
+			trips {
+				cpu_p04_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p04_control: trip-control {
+					temperature = <105000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p04_control>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p10-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <11600>;
+			thermal-sensors = <&smc_hwmon 29>;	/* Tp0M */
+
+			trips {
+				cpu_p10_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p10_control: trip-control {
+					temperature = <105000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p10_control>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p11-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <11600>;
+			thermal-sensors = <&smc_hwmon 32>;	/* Tp0Q */
+
+			trips {
+				cpu_p11_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p11_control: trip-control {
+					temperature = <105000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p11_control>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p12-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <11600>;
+			thermal-sensors = <&smc_hwmon 35>;	/* Tp0U */
+
+			trips {
+				cpu_p12_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p12_control: trip-control {
+					temperature = <105000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p12_control>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p13-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <11600>;
+			thermal-sensors = <&smc_hwmon 38>;	/* Tp0Y */
+
+			trips {
+				cpu_p13_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p13_control: trip-control {
+					temperature = <105000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p13_control>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+
+		cpu-p14-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			sustainable-power = <11600>;
+			thermal-sensors = <&smc_hwmon 41>;	/* Tp0c */
+
+			trips {
+				cpu_p14_switch_on: trip-switch-on {
+					temperature = <75000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p14_control: trip-control {
+					temperature = <105000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p14_control>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+	};
+};
+
+#include "isp-imx558.dtsi"
+
+&isp {
+	apple,platform-id = <3>;
+};
+
+&pmp_report_isp_sys {
+	status = "okay";
+};
+
+#ifdef APPLE_T600X_NON_ULTRA
+#include "t600x-j314-j316-control.dtsi"
+#endif

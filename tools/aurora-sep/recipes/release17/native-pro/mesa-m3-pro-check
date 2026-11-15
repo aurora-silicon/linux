@@ -1,0 +1,16 @@
+#!/bin/sh
+# Admit the paired legacy-HAL T6030 kernel and Mesa profile.
+set -eu
+case " $(cat /proc/cmdline) " in *" mesa_m3=off "*) exit 1 ;; esac
+[ ! -e /etc/mesa-m3/disable ] || exit 1
+[ ! -e /etc/mesa-m3/pro-disable ] || exit 1
+[ ! -e "${XDG_CONFIG_HOME:-${HOME:-/root}/.config}/mesa-m3/disable" ] || exit 1
+marker=/usr/lib/modules/$(uname -r)/aurora-m3pro-profile
+[ "$(cat "$marker" 2>/dev/null)" = 't6030-perf-v1
+source=d49021440d8ca02bbc8ecc17c19ce76c048b6236' ] || exit 1
+[ "$(cat /opt/mesa-m3/native-pro/share/mesa-m3/profile 2>/dev/null)" = t6030-native-gl-legacy-hal ] || exit 1
+[ "$(cat /opt/mesa-m3/pro-vulkan/share/mesa-m3/profile 2>/dev/null)" = t6030-pro-vulkan-legacy-hal ] || exit 1
+grep -qx source=99d5b9d16e779ad9a0879a71578da0a6536cf006 /opt/mesa-m3/native-pro/share/mesa-m3/capabilities || exit 1
+grep -qx source=b0f56952b7f06955b143fbfa90c07de4c5864964 /opt/mesa-m3/pro-vulkan/share/mesa-m3/capabilities || exit 1
+identity=$(/opt/mesa-m3/libexec/mesa-m3-abi-check legacy /dev/dri/renderD128) || exit 1
+[ "$identity" = 'profile=legacy chip=0x6030 G15S rev=0x11 dies=1 clusters=2 USC3 HAL0 params=600 match=1' ]

@@ -1,0 +1,77 @@
+# mesa-m3: what counts as a user's (or administrator's) own Mesa setup.
+# Read by /opt/mesa-m3/libexec/mesa-m3-user-setup; the session hook and the
+# installer both use that one detector. Format: KIND<TAB>ITEM, one per line.
+#
+# variable  a path variable that chooses a Mesa. A finding when it is set (in
+#           the environment checked, or in one of the files below) and any
+#           ":"-separated component lies outside /opt/mesa-m3, or when it is
+#           set empty. A reference to its own previous value is allowed.
+# flag      a variable that forces a driver choice: a finding when set to any
+#           non-empty value.
+# prefix    chonkstep's M3 Mesa prefix: a finding unless it is /opt/mesa-m3.
+# ldpath    LD_LIBRARY_PATH: a finding for an entry, other than
+#           /opt/mesa-m3/lib, that holds libgallium*, libEGL_mesa*,
+#           libvulkan_asahi* or a dri/ directory with *_dri.so; and, in a
+#           file, for an assignment that replaces it (does not keep
+#           $LD_LIBRARY_PATH), since that drops /opt/mesa-m3/lib after the
+#           session hook ran. Unrelated entries added to it are no finding.
+# envfile   a file that sets session variables, searched for the variables
+#           above. Shell, environment.d and /etc/environment lines are split
+#           like a POSIX shell (quotes, comments, "export", ";"); Hyprland
+#           .conf lines as "env = NAME,VALUE"; Hyprland .lua lines as
+#           env("NAME", "VALUE"). "~" is the user's home; a "{config}" path
+#           is under XDG_CONFIG_HOME (default ~/.config); "**" matches any
+#           depth of subdirectories. envfile: read after the session hook
+#           (uwsm env files and Hyprland's own); envfile-before: applied before
+#           it (environment.d, /etc/environment, the system uwsm env); and
+#           envfile-hookdir: the hook's own directory, where a file sorting
+#           after 50-mesa-m3 is read after it. Replacing LD_LIBRARY_PATH counts
+#           only after the hook.
+# drirc     a drirc file: a finding when it contains a dri_driver option
+#           outside XML comments.
+# chonkstep chonkstep's M3 session settings: a finding when the file exists and
+#           its last CHONKSTEP_M3_MESA_PREFIX names a prefix other than
+#           /opt/mesa-m3, or when it sets none (chonkstep's M3 launcher then
+#           uses its own default prefix) and the environment checked does not
+#           set it to /opt/mesa-m3 either.
+# A candidate that exists but cannot be read, or a value that cannot be
+# resolved, makes the result "unknown" (never "none").
+variable	VK_ICD_FILENAMES
+variable	VK_DRIVER_FILES
+variable	VK_ADD_DRIVER_FILES
+variable	LIBGL_DRIVERS_PATH
+variable	__EGL_VENDOR_LIBRARY_FILENAMES
+variable	__EGL_VENDOR_LIBRARY_DIRS
+variable	GBM_BACKENDS_PATH
+variable	DRIRC_CONFIGDIR
+flag	MESA_LOADER_DRIVER_OVERRIDE
+flag	GALLIUM_DRIVER
+flag	LIBGL_ALWAYS_SOFTWARE
+flag	GBM_ALWAYS_SOFTWARE
+prefix	CHONKSTEP_M3_MESA_PREFIX
+ldpath	LD_LIBRARY_PATH
+envfile-before	{config}/environment.d/*.conf
+envfile	{config}/uwsm/env
+envfile	{config}/uwsm/env-*
+envfile	{config}/uwsm/env.d/*
+envfile	{config}/uwsm/env-*.d/*
+envfile-before	{config}/uwsm/default
+envfile	{config}/hypr/**/*.conf
+envfile	{config}/hypr/**/*.lua
+envfile	/etc/xdg/uwsm/env
+envfile	/etc/xdg/uwsm/env-*
+envfile	/etc/xdg/uwsm/env.d/*
+envfile	/etc/xdg/uwsm/env-*.d/*
+envfile	/usr/local/share/uwsm/env
+envfile	/usr/local/share/uwsm/env-*
+envfile	/usr/local/share/uwsm/env.d/*
+envfile	/usr/local/share/uwsm/env-*.d/*
+envfile-before	/usr/share/uwsm/env
+envfile	/usr/share/uwsm/env-*
+envfile-hookdir	/usr/share/uwsm/env.d/*
+envfile	/usr/share/uwsm/env-*.d/*
+envfile-before	/etc/environment
+drirc	~/.drirc
+drirc	{config}/drirc
+drirc	/etc/drirc
+chonkstep	{config}/chonkstep/m3gpu-session.env

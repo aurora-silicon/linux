@@ -1,0 +1,240 @@
+# AArch64 Apple Silicon kernel and headers, with separate T8140 and M3 GPU profiles.
+_auroraver=7.1.12
+_aurorarel=2
+pkgrel=20261012.16
+
+_commit=d49021440d8ca02bbc8ecc17c19ce76c048b6236
+
+# GPU-profile bootloaders are admitted separately by the installer.
+_m1n1_version=1.6.1
+
+pkgbase=linux-aurora
+_srcname=aurora-linux-${_commit}
+_kernelname=${pkgbase#linux}
+_desc="AArch64 Apple Silicon (Aurora kernel)"
+pkgdesc=$_desc
+pkgver="${_auroraver}.aurora${_aurorarel}"
+arch=('aarch64')
+url="https://github.com/omacom/linux-aurora"
+license=('GPL2')
+
+_makedeps=(
+  base-devel bc dtc kmod libelf pahole cpio perl rustup rust-bindgen tar xz xmlto python clang22 llvm22 lld22
+)
+options=('!strip')
+source=(
+  "aurora-linux-${_commit}.tar.gz"
+  config         # the main kernel config file
+  rust-toolchain.toml
+  linux-aurora-phram.conf  # modprobe.d: no phram at boot
+)
+sha256sums=('1499aae4d440e9d069a5976b261d9709bd859f687f7a705560cdfdf5c9648f21'
+            'c811698c5242d42850bef6669f29cd7b485e997d3ac1a423e2d3cbbb3fdc19b8'
+            '2a95563bb9f5b216cc3c170a17e9471448bc63a7084bdd67df23d074939b366c'
+            'e2d0c0171e3a8fa04e9fc20d59101b84db544994fb710662b8830680a3d081d6')
+
+# Kbuild takes ARCH literally and knows arm64, not aarch64.
+export ARCH=arm64
+export LLVM=1
+export PATH="/usr/lib/llvm22/bin:$PATH"
+export LIBCLANG_PATH=/usr/lib/llvm22/lib
+export MAKEFLAGS=-j4
+export KBUILD_BUILD_HOST=archlinux
+export KBUILD_BUILD_USER=$pkgbase
+export KBUILD_BUILD_TIMESTAMP="$(date -Ru${SOURCE_DATE_EPOCH:+d @$SOURCE_DATE_EPOCH})"
+
+prepare() {
+  sudo pacman -Sy --noconfirm --needed archlinuxarm-keyring
+  sudo pacman -Su --noconfirm --needed "${_makedeps[@]}"
+  for tool in clang ld.lld llvm-ar; do
+    [[ -x /usr/lib/llvm22/bin/$tool ]] || return 1
+  done
+  [[ $(clang --version) == *"clang version 22.1.8"* ]] || return 1
+  [[ $(ld.lld --version) == *"22.1.8"* ]] || return 1
+  rustup toolchain install 1.93.1 --profile minimal --component rust-src
+  rustup target add aarch64-unknown-linux-gnu --toolchain 1.93.1
+  cd $_srcname
+
+  echo "Setting version..."
+  echo "-$_aurorarel-$pkgrel-sep" > localversion.10-pkgrel
+
+  local src
+  for src in "${source[@]}"; do
+    src="${src%%::*}"
+    src="${src##*/}"
+    [[ $src = *.patch ]] || continue
+    echo "Applying patch $src..."
+    patch -Np1 < "../$src"
+  done
+
+  echo "Pinning the Rust toolchain..."
+  cp ../rust-toolchain.toml .
+  [[ $(rustc --version) == "rustc 1.93.1 "* ]] || return 1
+  clang --version
+  rustc --version
+  bindgen --version
+
+  echo "Creating build directories..."
+  mkdir -p build/base
+
+  echo "Setting config (base)..."
+  cp ../config build/base/.config
+  make olddefconfig prepare O=$PWD/build/base
+  diff -u ../config build/base/.config || :
+  make -s kernelrelease O=$PWD/build/base > build/base/version
+
+  echo "Prepared $pkgbase version $(<build/base/version)"
+}
+
+build() {
+  cd $_srcname
+  echo "Building base..."
+  make all O=$PWD/build/base -j4 W=1
+}
+
+_package_kernel() {
+  pkgdesc="The $pkgdesc kernel and modules"
+  depends=(coreutils kmod initramfs $2 "m1n1>=$_m1n1_version")
+  optdepends=('crda: to set the correct wireless channels of your country'
+              'linux-firmware: firmware images needed for some devices')
+  # No generic linux provide: on a shared aarch64 repository it would compete
+  # with linux-aarch64 for any dependency on linux.
+  provides=(WIREGUARD-MODULE linux-asahi=${pkgver})
+  conflicts=(linux-asahi)
+
+  local kernver="$(<$O/version)"
+  local modulesdir="$pkgdir/usr/lib/modules/$kernver"
+
+  echo "Installing boot image..."
+  # systemd expects to find the kernel here to allow hibernation
+  # https://github.com/systemd/systemd/commit/edda44605f06a41fb86b7ab8128dcf99161d2344
+  install -Dm644 "$O"/arch/arm64/boot/Image "$modulesdir/vmlinuz"
+
+  # Used by mkinitcpio to name the kernel
+  echo "$1" | install -Dm644 /dev/stdin "$modulesdir/pkgbase"
+
+  printf "t6030-perf-v1\nsource=%s\n" "$_commit" | install -Dm644 /dev/stdin "$modulesdir/aurora-m3pro-profile"
+
+  echo "Installing modules..."
+  make O="$O" INSTALL_MOD_PATH="$pkgdir/usr" INSTALL_MOD_STRIP=1 modules_install
+
+  echo "Installing device trees..."
+  install -Dt "$modulesdir/dtbs" "$O"/arch/arm64/boot/dts/apple/*.dtb
+
+  echo "Installing the phram blacklist..."
+  install -Dm644 "$srcdir/linux-aurora-phram.conf" "$pkgdir/usr/lib/modprobe.d/linux-aurora-phram.conf"
+
+  # remove build and source links
+  rm -f "$modulesdir"/{source,build}
+}
+
+_package() {
+  cd $_srcname
+  export O="$PWD/build/base"
+  _package_kernel "$pkgbase"
+}
+
+_package-headers() {
+  pkgdesc="Headers and scripts for building modules for the $pkgdesc kernel"
+  depends=(pahole)
+  provides=(linux-asahi-headers=${pkgver})
+  conflicts=(linux-asahi-headers)
+
+  KARCH=arm64
+
+  cd $_srcname
+  O=build/base
+  local builddir="$pkgdir/usr/lib/modules/$(<${O}/version)/build"
+
+  echo "Installing build files..."
+  install -Dt "$builddir" -m644 $O/.config Makefile $O/Module.symvers $O/System.map \
+    localversion.* $O/version $O/vmlinux
+  install -Dt "$builddir/kernel" -m644 kernel/Makefile
+  cp -t "$builddir" -a scripts $O/scripts
+
+  # required when STACK_VALIDATION is enabled
+  #install -Dt "$builddir/tools/objtool" tools/objtool/objtool
+
+  # required when DEBUG_INFO_BTF_MODULES is enabled
+  install -Dt "$builddir/tools/bpf/resolve_btfids" $O/tools/bpf/resolve_btfids/resolve_btfids
+
+  echo "Installing headers..."
+  cp -t "$builddir" -a include $O/include
+
+  install -Dt "${builddir}/arch/${KARCH}" -m644 arch/${KARCH}/Makefile
+  install -Dt "${builddir}/arch/${KARCH}/kernel" -m644 $O/arch/${KARCH}/kernel/asm-offsets.s
+  cp -t "${builddir}/arch/${KARCH}" -a arch/${KARCH}/include $O/arch/${KARCH}/include
+
+  install -Dt "$builddir/drivers/md" -m644 drivers/md/*.h
+  install -Dt "$builddir/net/mac80211" -m644 net/mac80211/*.h
+
+  # https://bugs.archlinux.org/task/13146
+  install -Dt "$builddir/drivers/media/i2c" -m644 drivers/media/i2c/msp3400-driver.h
+
+  # https://bugs.archlinux.org/task/20402
+  install -Dt "$builddir/drivers/media/usb/dvb-usb" -m644 drivers/media/usb/dvb-usb/*.h
+  install -Dt "$builddir/drivers/media/dvb-frontends" -m644 drivers/media/dvb-frontends/*.h
+  install -Dt "$builddir/drivers/media/tuners" -m644 drivers/media/tuners/*.h
+
+  # https://bugs.archlinux.org/task/71392
+  install -Dt "$builddir/drivers/iio/common/hid-sensors" -m644 drivers/iio/common/hid-sensors/*.h
+
+  echo "Installing KConfig files..."
+  find . -name 'Kconfig*' -exec install -Dm644 {} "$builddir/{}" \;
+
+  echo "Installing unstripped VDSO..."
+  make O="$O" INSTALL_MOD_PATH="$pkgdir/usr" vdso_install link=
+
+  echo "Removing unneeded architectures..."
+  local arch
+  for arch in "$builddir"/arch/*/; do
+    [[ $arch = */${KARCH}/ ]] && continue
+    echo "Removing $(basename "$arch")"
+    rm -r "$arch"
+  done
+
+  echo "Removing documentation..."
+  rm -r "$builddir/Documentation"
+
+  echo "Removing broken symlinks..."
+  find -L "$builddir" -type l -printf 'Removing %P\n' -delete
+
+  echo "Removing loose objects..."
+  find "$builddir" -type f -name '*.o' -printf 'Removing %P\n' -delete
+
+  echo "Removing cmd files..."
+  find "$builddir" -type f -name '*.cmd' -printf 'Removing %P\n' -delete
+
+  echo "Stripping build tools..."
+  local file
+  while read -rd '' file; do
+    case "$(file --no-sandbox -bi "$file")" in
+      application/x-sharedlib\;*)      # Libraries (.so)
+        strip -v $STRIP_SHARED "$file" ;;
+      application/x-archive\;*)        # Libraries (.a)
+        strip -v $STRIP_STATIC "$file" ;;
+      application/x-executable\;*)     # Binaries
+        strip -v $STRIP_BINARIES "$file" ;;
+      application/x-pie-executable\;*) # Relocatable binaries
+        strip -v $STRIP_SHARED "$file" ;;
+    esac
+  done < <(find "$builddir" -type f -perm -u+x ! -name vmlinux -print0)
+
+  echo "Stripping vmlinux..."
+  strip -v $STRIP_STATIC "$builddir/vmlinux"
+
+  echo "Adding symlink..."
+  mkdir -p "$pkgdir/usr/src"
+  ln -sr "$builddir" "$pkgdir/usr/src/$pkgbase"
+
+}
+
+pkgname=("$pkgbase" "$pkgbase-headers")
+for _p in "${pkgname[@]}"; do
+  eval "package_$_p() {
+    $(declare -f "_package${_p#$pkgbase}")
+    _package${_p#$pkgbase}
+  }"
+done
+
+# vim:set ts=8 sts=2 sw=2 et:

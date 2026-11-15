@@ -1,0 +1,162 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Unclaimed T6031 peripheral buses. */
+
+&soc {
+	spi2: spi@391108000 {
+		compatible = "apple,t6031-spi", "apple,t8103-spi";
+		reg = <0x3 0x91108000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1313 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clk_200m>;
+		power-domains = <&ps_spi2>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	spi4: spi@391110000 {
+		compatible = "apple,t6031-spi", "apple,t8103-spi";
+		reg = <0x3 0x91110000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1315 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clk_200m>;
+		power-domains = <&ps_spi4>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	qspi: spi@391118000 {
+		compatible = "apple,t6031-qspi", "apple,qspi";
+		reg = <0x3 0x91118000 0 0x4800>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1317 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&clk_200m>;
+		power-domains = <&ps_qspi>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	nub_spmi1: spmi@2a1054000 {
+		compatible = "apple,t6031-spmi", "apple,t8103-spmi";
+		reg = <0x2 0xa1054000 0 0x4000>,
+		      <0x2 0xa1044000 0 0x4000>,
+		      <0x2 0xa1040000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 728 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	nub_spmi2: spmi@2a1094000 {
+		compatible = "apple,t6031-spmi", "apple,t8103-spmi";
+		reg = <0x2 0xa1094000 0 0x4000>,
+		      <0x2 0xa1084000 0 0x4000>,
+		      <0x2 0xa1080000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 733 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	nub_spmi3: spmi@2a10d4000 {
+		compatible = "apple,t6031-spmi", "apple,t8103-spmi";
+		reg = <0x2 0xa10d4000 0 0x4000>,
+		      <0x2 0xa10c4000 0 0x4000>,
+		      <0x2 0xa10c0000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 738 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	nub_spmi4: spmi@2a1114000 {
+		compatible = "apple,t6031-spmi", "apple,t8103-spmi";
+		reg = <0x2 0xa1114000 0 0x4000>,
+		      <0x2 0xa1104000 0 0x4000>,
+		      <0x2 0xa1100000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 743 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	aop_spmi0: spmi@2a8894000 {
+		compatible = "apple,t6031-spmi", "apple,t8103-spmi";
+		reg = <0x2 0xa8894000 0 0x4000>,
+		      <0x2 0xa8884000 0 0x4000>,
+		      <0x2 0xa8880000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 634 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	aop_spmi1: spmi@2a88d4000 {
+		compatible = "apple,t6031-spmi", "apple,t8103-spmi";
+		reg = <0x2 0xa88d4000 0 0x4000>,
+		      <0x2 0xa88c4000 0 0x4000>,
+		      <0x2 0xa88c0000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 643 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	atcphy3: phy@1303000000 {
+		compatible = "apple,t6031-atcphy", "apple,t8122-atcphy";
+		reg = <0x13 0x03000000 0 0x4c000>;
+		reg-names = "core";
+		#phy-cells = <1>;
+		#reset-cells = <0>;
+		orientation-switch;
+		mode-switch;
+		power-domains = <&ps_atc3_common>;
+		status = "disabled";
+	};
+
+	atcphy3_xbar: mux@130304c000 {
+		compatible = "apple,t6031-display-crossbar",
+			     "apple,t6020-display-crossbar";
+		reg = <0x13 0x0304c000 0 0x4000>;
+		#mux-control-cells = <1>;
+		power-domains = <&ps_atc3_usb>;
+		status = "disabled";
+	};
+
+};
+
+&soc {
+	nub_spmi_a2: spmi@2a11a8000 {
+		compatible = "apple,t6031-spmi", "apple,t8103-spmi";
+		reg = <0x2 0xa11a8000 0 0x4000>,
+		      <0x2 0xa11a4000 0 0x4000>,
+		      <0x2 0xa11a0000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 767 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+};

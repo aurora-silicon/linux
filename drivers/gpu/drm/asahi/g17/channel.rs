@@ -1,0 +1,411 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+
+//! Firmware-produced rings and the device-control producer.
+//!
+//! The device mutex serializes every caller. Entries are copied before a
+//! single aligned consumer store returns their slots to the firmware. Trace
+//! and statistics transport errors quarantine only that ring; event errors
+//! propagate to the device owner. Device-control publication reserves one
+//! empty slot and orders the record, power tally and producer together.
+
+use core::sync::atomic::{fence, AtomicU64, Ordering};
+use kernel::{device::Device, prelude::*};
+
+use super::fw::{channels::*, initdata::status};
+use super::initdata::InitData;
+use super::Role;
+
+/// Device-control records published since the driver loaded. Counted across firmware
+/// restarts, so it only grows.
+static CONTROL_PUBLISHED: AtomicU64 = AtomicU64::new(0);
+/// The largest count of published records the firmware is known to have consumed.
+static CONTROL_CONSUMED: AtomicU64 = AtomicU64::new(0);
+
+/// Firmware progress fences for host identities and storage that the firmware may still
+/// name after their owner let go of them.
+///
+/// The firmware consumes device-control records in order. Once it has consumed a record
+/// published after an owner released something, it has finished with every record before
+/// that one, including the release that retired the owner. [`fence`](control_fence) is that
+/// next record; [`witnessed`](control_witnessed) says how far the firmware got. A fence of
+/// zero is always met.
+pub(crate) fn control_fence() -> u64 {
+    CONTROL_PUBLISHED.load(Ordering::Acquire) + 1
+}
+
+/// The control-ring progress the firmware has shown so far (see [`control_fence`]).
+pub(crate) fn control_witnessed() -> u64 {
+    CONTROL_CONSUMED.load(Ordering::Acquire)
+}
+
+/// Records how far the firmware consumed the control ring. Call under the device mutex,
+/// which also serializes publication, with cursors read after any publication by the caller.
+/// A restarted firmware has nothing pending, so everything published so far counts.
+pub(crate) fn observe_control(consumer: u32, producer: u32) {
+    if consumer >= DEVICE_CONTROL_SLOTS || producer >= DEVICE_CONTROL_SLOTS {
+        return;
+    }
+    let pending = u64::from(producer.wrapping_sub(consumer) & (DEVICE_CONTROL_SLOTS - 1));
+    let consumed = CONTROL_PUBLISHED.load(Ordering::Acquire).saturating_sub(pending);
+    CONTROL_CONSUMED.fetch_max(consumed, Ordering::AcqRel);
+}
+
+/// Firmware rings whose contents do not affect host scheduling.
+#[derive(Copy, Clone, Debug)]
+enum ReportRing {
+    Trace = 0,
+    Statistics = 1,
+}
+
+impl ReportRing {
+    /// State and entry offsets, capacity and the record tags the family allows.
+    fn geometry(self, init: &InitData) -> (usize, usize, u32, u64) {
+        match self {
+            Self::Trace => (
+                status::TRACE_STATE as usize,
+                status::TRACE_RING as usize,
+                TRACE_SLOTS,
+                u64::from(TRACE_TYPES),
+            ),
+            Self::Statistics => (
+                status::STATS_STATE as usize,
+                status::STATS_RING as usize,
+                STATISTICS_SLOTS,
+                init.statistics_types(),
+            ),
+        }
+    }
+}
+
+/// Host-side receive-ring state. A quarantined ring stays stopped until the
+/// device is destroyed; firmware restart does not clear it.
+pub(crate) struct Rings {
+    quarantined: [[bool; 2]; 2],
+    reports: super::reports::Reports,
+    telemetry: super::telemetry::Telemetry,
+    max_age_ns: u64,
+    suspended: bool,
+    discard_statistics: [bool; 2],
+    statistics_epoch: u64,
+    statistics_powered: bool,
+    statistics_cutoff: [Option<u32>; 2],
+}
+
+impl Rings {
+    /// `m5`: the firmware runs the M5 protocol ([`super::stats::protocol`]).
+    pub(crate) fn new(graph: super::fw::variant::InitGraph, m5: bool) -> Result<Self> {
+        Ok(Self {
+            quarantined: [[false; 2]; 2],
+            reports: super::reports::Reports::new()?,
+            telemetry: super::telemetry::Telemetry::new(super::stats::protocol(graph, m5)),
+            max_age_ns: super::stats::max_age_ns(graph),
+            suspended: false,
+            discard_statistics: [false; 2],
+            statistics_epoch: 0,
+            statistics_powered: true,
+            statistics_cutoff: [None; 2],
+        })
+    }
+
+    pub(super) fn invalidate_statistics(&mut self) {
+        self.telemetry.invalidate();
+        // The packets have no epoch marker. Discard each role's already
+        // queued records before accepting a new baseline after the boundary.
+        self.discard_statistics = [true; 2];
+        self.statistics_cutoff = [None; 2];
+    }
+
+    pub(super) fn suspend_statistics(&mut self, suspended: bool) {
+        self.suspended = suspended;
+        self.invalidate_statistics();
+    }
+
+    pub(super) fn statistics_suspended(&self) -> bool {
+        self.suspended
+    }
+
+    pub(super) fn observe_statistics_power(
+        &mut self,
+        dev: &Device,
+        init: &InitData,
+        roles: &[Role],
+        powered: bool,
+        epoch: u64,
+    ) {
+        if !powered || !self.statistics_powered || epoch != self.statistics_epoch {
+            if powered {
+                self.telemetry.invalidate();
+            } else {
+                self.telemetry.gate();
+            }
+            // End the queued prefix *now*, not at the next drain. A boolean
+            // discard-next-batch also throws away records produced after this
+            // observation, even if the queue was empty at the boundary.
+            for &role in roles {
+                if self.quarantined[role as usize][ReportRing::Statistics as usize] {
+                    continue;
+                }
+                let cutoff = (|| {
+                    let state = status::STATS_STATE as usize;
+                    let producer = init
+                        .status_word(role, state + RX_PRODUCER_OFFSET)?
+                        .load(Ordering::Relaxed);
+                    fence(Ordering::Acquire);
+                    if producer >= STATISTICS_SLOTS {
+                        return Err(EIO);
+                    }
+                    Ok(producer)
+                })();
+                match cutoff {
+                    Ok(producer) => self.statistics_cutoff[role as usize] = Some(producer),
+                    Err(error) => self.stop_report(dev, role, ReportRing::Statistics, error),
+                }
+            }
+        }
+        self.statistics_powered = powered;
+        self.statistics_epoch = epoch;
+    }
+
+    pub(super) fn read_statistics(&self, now_ns: u64) -> super::telemetry::Readout {
+        self.telemetry.read(now_ns, self.max_age_ns)
+    }
+
+    pub(super) fn write_reports(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        self.reports.write(f)?;
+        writeln!(
+            f,
+            "admission suspended={} discard_queued={:?} quarantine={:?} power_epoch={} powered={} cutoff={:?}",
+            self.suspended, self.discard_statistics, self.quarantined, self.statistics_epoch,
+            self.statistics_powered, self.statistics_cutoff
+        )?;
+        let view = self.read_statistics(super::now_ns());
+        writeln!(f, "qualified max_age_ns={} util_status={} util_host_ns={} util_samples={} pstate_status={} pstate_host_ns={} pstate_timestamp={} delta_ticks={:?} tiler={} renderer={} device={} pstate={} delivery_intervals_ns={:?}",
+            self.max_age_ns, view.util_status, view.util_host_ns, view.util_samples,
+            view.pstate_status, view.pstate_host_ns, view.pstate_timestamp, self.telemetry.delta_ticks,
+            view.tiler, view.renderer, view.device, view.pstate, self.telemetry.delivery_intervals)
+    }
+
+    pub(crate) fn drain_trace(&mut self, dev: &Device, init: &InitData, role: Role) {
+        self.drain_report(dev, init, role, ReportRing::Trace);
+    }
+
+    pub(crate) fn drain_statistics(&mut self, dev: &Device, init: &InitData, role: Role) {
+        self.drain_report(dev, init, role, ReportRing::Statistics);
+    }
+
+    fn drain_report(&mut self, dev: &Device, init: &InitData, role: Role, ring: ReportRing) {
+        if self.quarantined[role as usize][ring as usize] {
+            return;
+        }
+        let statistics = matches!(ring, ReportRing::Statistics);
+        let accept = !self.suspended
+            && self.statistics_powered
+            && !self.discard_statistics[role as usize]
+            && !self
+                .quarantined
+                .iter()
+                .any(|rings| rings[ReportRing::Statistics as usize]);
+        if let Err(error) = Self::consume_report(
+            init,
+            role,
+            ring,
+            &mut self.reports,
+            &mut self.telemetry,
+            self.max_age_ns,
+            accept,
+            &mut self.statistics_cutoff[role as usize],
+        ) {
+            self.stop_report(dev, role, ring, error);
+        } else if statistics && !self.suspended {
+            self.discard_statistics[role as usize] = false;
+        }
+    }
+
+    fn stop_report(&mut self, dev: &Device, role: Role, ring: ReportRing, error: Error) {
+        self.quarantined[role as usize][ring as usize] = true;
+        if matches!(ring, ReportRing::Statistics) {
+            self.invalidate_statistics();
+        }
+        dev_err!(
+            dev.as_ref(),
+            "G17 {:?} {:?} ring stopped: {:?}\n",
+            role,
+            ring,
+            error
+        );
+    }
+
+    fn consume_report(
+        init: &InitData,
+        role: Role,
+        ring: ReportRing,
+        reports: &mut super::reports::Reports,
+        telemetry: &mut super::telemetry::Telemetry,
+        max_age_ns: u64,
+        accept_statistics: bool,
+        statistics_cutoff: &mut Option<u32>,
+    ) -> Result {
+        let (state, entries, capacity, allowed_types) = ring.geometry(init);
+        let consumer_word = init.status_word(role, state)?;
+        let producer_word = init.status_word(role, state + RX_PRODUCER_OFFSET)?;
+        fence(Ordering::Acquire);
+        let mut consumer = consumer_word.load(Ordering::Relaxed);
+        let producer = producer_word.load(Ordering::Relaxed);
+        // The producer makes the entries it covers available to the host.
+        fence(Ordering::Acquire);
+        if consumer >= capacity || producer >= capacity {
+            return Err(EIO);
+        }
+        // One receive time per drain: records the firmware published in one
+        // producer update are one delivery (see Telemetry::note_delivery).
+        // Only a statistics drain with records reads the clock.
+        let host_ns = if matches!(ring, ReportRing::Statistics) && consumer != producer {
+            super::now_ns()
+        } else {
+            0
+        };
+        while consumer != producer {
+            if matches!(ring, ReportRing::Statistics) && *statistics_cutoff == Some(consumer) {
+                *statistics_cutoff = None;
+            }
+            let offset = entries + consumer as usize * EVENT_RECORD_SIZE;
+            // Decode only the complete copy, before returning the slot.
+            // Statistics never affect scheduling or power control.
+            let words = init.status_read_words::<EVENT_WORDS>(role, offset)?;
+            super::trace::report(role as u8, ring as u8, &words);
+            let tag = words[0];
+            if tag >= u64::BITS || allowed_types & (1u64 << tag) == 0 {
+                return Err(EIO);
+            }
+            if matches!(ring, ReportRing::Statistics) {
+                let admitted = accept_statistics && statistics_cutoff.is_none();
+                reports.record(role, words, host_ns, allowed_types, admitted);
+                if admitted {
+                    telemetry.record(&words, host_ns, max_age_ns);
+                }
+            }
+            consumer = (consumer + 1) & (capacity - 1);
+            fence(Ordering::SeqCst);
+            consumer_word.store(consumer, Ordering::Relaxed);
+            if matches!(ring, ReportRing::Trace) {
+                fence(Ordering::SeqCst);
+            }
+        }
+        if matches!(ring, ReportRing::Statistics) {
+            if *statistics_cutoff == Some(consumer) {
+                *statistics_cutoff = None;
+            }
+            fence(Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
+    /// Publishes one primary device-control record. On EAGAIN the caller
+    /// retains the request and retries before consuming more dependent events.
+    /// The returned cursor is the value the consumer must reach to retire it.
+    /// The caller announces the publication through the coprocessor mailbox.
+    pub(crate) fn publish_control(init: &InitData, record: &ControlRecord) -> Result<u32> {
+        fence(Ordering::Acquire);
+        let consumer = init.control_consumer()?.load(Ordering::Relaxed);
+        let producer = init.control_producer()?.load(Ordering::Relaxed);
+        if consumer >= DEVICE_CONTROL_SLOTS || producer >= DEVICE_CONTROL_SLOTS {
+            return Err(EIO);
+        }
+        let next = (producer + 1) & (DEVICE_CONTROL_SLOTS - 1);
+        if next == consumer {
+            return Err(EAGAIN);
+        }
+        // InitData validates every mapping before the first write, then writes
+        // record, packed tally, barrier, producer, barrier without failure.
+        init.publish_control(
+            producer,
+            record.bytes(),
+            init.control_asserts_gpu_power(record.opcode()),
+            next,
+        )?;
+        CONTROL_PUBLISHED.fetch_add(1, Ordering::AcqRel);
+        observe_control(consumer, next);
+        super::trace::message(super::trace::CONTROL, record.opcode() as u64);
+        Ok(next)
+    }
+}
+
+/// One bounded event-ring pass. No shared-memory borrow survives `next`, so
+/// the caller can service the copied event using the complete device owner.
+pub(crate) struct Events {
+    role: Role,
+    graph: super::fw::variant::InitGraph,
+    remaining: u32,
+    unknown_reported: bool,
+}
+
+impl Events {
+    /// A bounded pass can leave records written while its earlier slots were
+    /// consumed. Check both cursors again before the worker goes idle.
+    pub(crate) fn pending(init: &InitData, role: Role) -> Result<bool> {
+        let state = status::EVENT_STATE as usize;
+        fence(Ordering::Acquire);
+        let consumer = init.status_word(role, state)?.load(Ordering::Relaxed);
+        let producer = init
+            .status_word(role, state + RX_PRODUCER_OFFSET)?
+            .load(Ordering::Relaxed);
+        if consumer >= EVENT_SLOTS || producer >= EVENT_SLOTS {
+            return Err(EIO);
+        }
+        Ok(consumer != producer)
+    }
+
+    pub(crate) fn new(role: Role, graph: super::fw::variant::InitGraph) -> Self {
+        Self {
+            role,
+            graph,
+            remaining: EVENT_SLOTS,
+            unknown_reported: false,
+        }
+    }
+
+    pub(crate) fn next(&mut self, dev: &Device, init: &InitData) -> Result<Option<Event>> {
+        let role = self.role;
+        let state = status::EVENT_STATE as usize;
+        let consumer_word = init.status_word(role, state)?;
+        let producer_word = init.status_word(role, state + RX_PRODUCER_OFFSET)?;
+        while self.remaining != 0 {
+            init.validate_event_ring(role)?;
+            self.remaining -= 1;
+            let consumer = consumer_word.load(Ordering::Relaxed);
+            let producer = producer_word.load(Ordering::Relaxed);
+            if consumer >= EVENT_SLOTS || producer >= EVENT_SLOTS {
+                return Err(EIO);
+            }
+            if consumer == producer {
+                self.remaining = 0;
+                break;
+            }
+            // Observe the producer before reading the record it publishes.
+            fence(Ordering::Acquire);
+            let offset = status::EVENT_RING as usize + consumer as usize * EVENT_RECORD_SIZE;
+            let words = init.status_read_words(role, offset)?;
+            super::trace::report(role as u8, 2, &words);
+            let record = EventRecord::from_words(words);
+            let event = record.decode_for(self.graph, init.is_m5());
+            fence(Ordering::SeqCst);
+            consumer_word.store((consumer + 1) & (EVENT_SLOTS - 1), Ordering::Relaxed);
+            fence(Ordering::SeqCst);
+            match event? {
+                Event::Unknown(tag) => {
+                    if !self.unknown_reported {
+                        dev_warn!(
+                            dev.as_ref(),
+                            "G17 {:?} unknown firmware event {}\n",
+                            role,
+                            tag
+                        );
+                        self.unknown_reported = true;
+                    }
+                }
+                event => return Ok(Some(event)),
+            }
+        }
+        Ok(None)
+    }
+}

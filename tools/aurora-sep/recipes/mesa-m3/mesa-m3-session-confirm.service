@@ -1,0 +1,15 @@
+# Installed by the mesa-m3 package (/usr/lib/systemd/user/mesa-m3-session-confirm.service),
+# enabled for every user through graphical-session.target.wants.
+[Unit]
+Description=mesa-m3: confirm that this login's compositor is alive and serving on /opt/mesa-m3
+After=graphical-session.target
+PartOf=graphical-session.target
+ConditionPathExists=%S/mesa-m3/attempt
+
+[Service]
+Type=oneshot
+ExecStart=/opt/mesa-m3/libexec/mesa-m3-session-confirm --settle 15
+TimeoutStartSec=60
+
+[Install]
+WantedBy=graphical-session.target

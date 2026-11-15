@@ -1,0 +1,13 @@
+[Unit]
+Description=Select the paired T6030 GPU performance profile
+After=systemd-modules-load.service
+Before=display-manager.service
+ConditionPathExists=/opt/mesa-m3/pro-vulkan/share/mesa-m3/profile
+
+[Service]
+Type=oneshot
+ExecStart=/opt/mesa-m3/native-pro/libexec/mesa-m3-pro-performance
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

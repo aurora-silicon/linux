@@ -1,0 +1,118 @@
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
+config DRM_APPLE
+	tristate "DRM Support for Apple display controllers"
+	depends on DRM && OF && ARM64
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on APPLE_RTKIT
+	depends on TYPEC || !TYPEC
+	depends on OF_ADDRESS
+	# The firmware-27 remote buffer path calls into the DART driver.
+	depends on APPLE_DART || !APPLE_DART
+	select APPLE_PMP_REPORT
+	select OF_DYNAMIC
+	select DRM_CLIENT_SELECTION
+	select DRM_KMS_HELPER
+	select DRM_KMS_DMA_HELPER
+	select DRM_GEM_SHMEM_HELPER
+	select DRM_GEM_DMA_HELPER
+	select VIDEOMODE_HELPERS
+	# write-combined maps of firmware-placed carveouts (desktop 26.x)
+	select VMAP_PFN
+	depends on BACKLIGHT_CLASS_DEVICE
+	select MULTIPLEXER
+	select DRM_APPLE_FABRIC_CORE
+	help
+	  Say Y if you have an Apple Silicon chipset. This includes the
+	  Type-C display fabric and Thunderbolt display routing.
+
+config DRM_APPLE_AUDIO
+	bool "DisplayPort/HDMI Audio support"
+	default y
+	depends on DRM_APPLE
+	depends on SND=y || SND=DRM_APPLE
+	select SND_PCM
+	select SND_DMAENGINE_PCM
+
+config DRM_APPLE_DCP_T6030_AUDIO
+	bool "Native audio links through external display processors"
+	default y
+	depends on DRM_APPLE_AUDIO
+	help
+	  DP/HDMI audio of the external display processors of the M3 Pro
+	  (T6030, MacBook Pro J514S/J516S built-in HDMI port), whose DCP
+	  firmware 14.7 external role takes 32-byte audio link data and the
+	  native driver's link lifecycle. Also build the compact audio service
+	  binding for desktop 26.x external processors (T6041). Those audio
+	  interfaces remain disabled until SIO firmware support is available.
+	  Say N to omit native links and the desktop compact audio binding.
+
+config DRM_APPLE_DCP_T8132
+	bool "MacBook Air M4 (J713) internal panel"
+	depends on DRM_APPLE
+	depends on APPLE_DART=y && APPLE_DART_J713_DCP
+	depends on APPLE_PMP=y || APPLE_PMP=DRM_APPLE
+	select APERTURE_HELPERS
+	help
+	  Lets the common Apple display driver adopt the J713 (T8132)
+	  internal display coprocessor and its display subsystem. The
+	  inherited firmware session uses the IOMFB 26.6 interface, while
+	  planes, CRTCs, connectors and DMA GEM use the common DRM driver.
+
+	  The boot loader must publish the qualified firmware reservations
+	  and inherited display DART mappings. The retained session cannot
+	  be unloaded or reset; its backing stays pinned until reboot.
+	  Load appledrm explicitly before the GPU, with its alias autoload
+	  disabled, after guarded admission of the inherited display DARTs.
+
+config DRM_APPLE_DEBUG
+	bool "Enable additional driver debugging"
+	depends on DRM_APPLE
+	depends on EXPERT # only for developers
+
+config DRM_APPLE_KUNIT_TEST
+	tristate "KUnit tests for Apple display controller" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	depends on DRM_APPLE || !DRM_APPLE
+	select DRM_KUNIT_TEST_HELPERS if DRM_APPLE
+	default KUNIT_ALL_TESTS
+	help
+	  Build tests for the Apple display driver's AFK ring parser and
+	  backlight policy (takeover, DPMS, suspend, fades and present
+	  completion).
+	  The tests cover the header strides used by older firmware and
+	  larger rings, as well as malformed ring size combinations.
+	  This option is intended for developer test kernels.
+	  Also test the Type-C modeset, hotplug and service ownership state,
+	  the system resume of a CRTC whose mode is no longer admissible,
+	  when an external display is ready to be reported to userspace, and
+	  which display processors must have started before the boot
+	  framebuffer is taken over.
+	  The AFK service lifetime test uses the display driver and is built
+	  with it. When the driver is a module, these tests can only be
+	  built as modules too. The standalone modeset state test can still
+	  be built without the driver.
+
+config DRM_APPLE_PARSER_KUNIT_TEST
+	bool "KUnit tests for Apple firmware message parsers" if !KUNIT_ALL_TESTS
+	depends on DRM_APPLE && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Build tests for AFKv2 lengths, DMA ownership and reply correlation,
+	  legacy EPIC replies, and H17P IOMFB callback envelopes and sizes.
+	  The tests use allocated buffers and fake devices and do not require
+	  an Apple display controller or any firmware.
+
+config DRM_APPLE_DISPLAY_KUNIT_TEST
+	bool "KUnit tests for Apple display mode probing" if !KUNIT_ALL_TESTS
+	depends on KUNIT && DRM_APPLE
+	select DRM_KUNIT_TEST_HELPERS
+	select DRM_CLIENT
+	default KUNIT_ALL_TESTS
+	help
+	  Test the production timing parser and display reply bounds without
+	  Apple display hardware, including incomplete records and stable
+	  preferred mode selection. Exercise mode list replacement and
+	  catalog admission for each display attachment. Check connector
+	  status updates before hotplug notifications and same-state retrains.
+	  Check which 14.x board record an internal display gets on which
+	  machine, and which DCP firmware image each record admits.

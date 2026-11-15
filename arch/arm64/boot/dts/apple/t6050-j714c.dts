@@ -1,0 +1,462 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * MacBook Pro (14-inch, M5 Max, 2026)
+ *
+ * target-type: J714c
+ *
+ * The M5 Max is one T6050 die, die 0 (t6050-max.dtsi). This file enables
+ * and configures what has been brought up on this board, the same set as
+ * t6050-j716c.dts; the SoC's other ports and buses stay disabled until each
+ * is described for it.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#define T6050_J714C
+#include "t6050-max.dtsi"
+
+/ {
+	compatible = "apple,j714c", "apple,t6050", "apple,arm-platform";
+	model = "Apple MacBook Pro (14-inch, M5 Max, 2026)";
+	chassis-type = "laptop";
+
+	aliases {
+		serial0 = &dockchannel;
+		/* kboot fills the N1's factory addresses from /chosen through these */
+		wifi0 = &n1_alpha;
+		bluetooth0 = &n1_beta;
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>; /* To be filled by the loader */
+			/* Format properties will be added by the loader */
+			status = "disabled";
+		};
+	};
+};
+
+/*
+ * PCIe port 0: the N1 (Wi-Fi and Bluetooth). The registers, interrupt, DART streams
+ * and PERST# pin are the J716c's: the J714c's ADT has the same port. The boot loader
+ * trains the link after the SMC releases the N1's reset and keeps power, clocks, the
+ * PHY and PERST; Linux owns the routing, MSI and the DART. Disabled with its DART
+ * until the boot loader trains it, which also renumbers the bus here to the PCI
+ * core's order.
+ */
+&pcie0 {
+	reg = <0x1c 0xb0000000 0x0 0x10000000>,
+	      <0x4 0x14000000 0x0 0x4000>,
+	      <0x4 0x10028000 0x0 0x8000>,
+	      <0x4 0x17010000 0x0 0x4000>,
+	      <0x4 0x10024000 0x0 0x4000>;
+	reg-names = "config", "rc", "port0", "phy0", "intr2axi0";
+	interrupts = <AIC_IRQ 0 1523 IRQ_TYPE_LEVEL_HIGH>;
+	interrupt-names = "port0";
+
+	/* The N1's three functions are on DART streams 1-3 */
+	iommu-map = <0x100 &dart_apcie0 1 3>;
+	bus-range = <0 4>;
+
+	port00: pci@0,0 {
+		device_type = "pci";
+		reg = <0x0 0 0 0 0>;
+		bus-range = <1 1>;
+		apple,link-trained-by-bootloader;
+		/* PERST#, driven only by the root-port reset after the N1's ROM stage */
+		reset-gpios = <&pinctrl_ap 80 GPIO_ACTIVE_LOW>;
+		status = "disabled";
+
+		#address-cells = <3>;
+		#size-cells = <2>;
+		ranges;
+
+		interrupt-controller;
+		#interrupt-cells = <1>;
+		interrupt-map-mask = <0 0 0 7>;
+		interrupt-map = <0 0 0 1 &port00 0 0 0 0>,
+				<0 0 0 2 &port00 0 0 0 1>,
+				<0 0 0 3 &port00 0 0 0 2>,
+				<0 0 0 4 &port00 0 0 0 3>;
+
+		/* platform ID (board 0x0a << 16) | chip 0x6050 */
+		n1_control: control@0,0 {
+			compatible = "pci106b,1900";
+			reg = <0x10000 0x0 0x0 0x0 0x0>;
+			firmware-name = "apple/centauri/j714c-ftab.bin";
+			apple,centauri-platform-id = <0x000a6050>;
+			apple,centauri-protocol = <27>;
+		};
+
+		n1_alpha: wifi@0,1 {
+			compatible = "pci106b,1902";
+			reg = <0x10100 0x0 0x0 0x0 0x0>;
+			local-mac-address = [00 00 00 00 00 00];
+		};
+
+		n1_beta: bluetooth@0,2 {
+			compatible = "pci106b,1903";
+			reg = <0x10200 0x0 0x0 0x0 0x0>;
+			local-bd-address = [00 00 00 00 00 00];
+		};
+	};
+};
+
+/* ATC3 and the PD controller bus nub-spmi-a2: not on this board's ports */
+&nub_spmi_a2 {
+	status = "disabled";
+};
+
+&atc3_phy_mbox {
+	status = "disabled";
+};
+
+&atc3_phy {
+	status = "disabled";
+};
+
+&usb_drd3 {
+	status = "disabled";
+};
+
+&usb_drd3_dart_0 {
+	status = "disabled";
+};
+
+&usb_drd3_dart_1 {
+	status = "disabled";
+};
+
+/*
+ * The six speaker amplifiers (ADT /arm-io/i2c1/audio-speaker* and /arm-io/i2c3/audio-speaker*,
+ * SN012776) share one shutdown line, AP pin 107 (function-reset of the first), and one fault
+ * interrupt, pin 106. The ADT's speaker-config gives each amp a transmit slot N with its
+ * voltage sense in slot 4N and current sense in 4N+2, and names the amps by speakerN:
+ * 0 left woofer 1, 1 right woofer 1, 2 left woofer 2, 3 right woofer 2, 4 left tweeter,
+ * 5 right tweeter.
+ *
+ * There is no sound card yet: the AOP audio driver is not on this branch, and the jack codec
+ * (i2c2) is not described. The amps stay in shutdown until a stream asks for them.
+ */
+/ {
+	speaker_sdz: regulator-sn012776-sdz {
+		compatible = "regulator-fixed";
+		regulator-name = "sn012776-sdz";
+		gpios = <&pinctrl_ap 107 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+};
+
+&i2c1 {
+	status = "okay";
+
+	speaker_left_woof1: codec@38 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x38>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 1";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <2>;
+		ti,vmon-slot-no = <0>;
+	};
+
+	speaker_left_woof2: codec@39 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x39>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 2";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <10>;
+		ti,vmon-slot-no = <8>;
+	};
+
+	speaker_left_tweet: codec@3a {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3a>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Tweeter";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <18>;
+		ti,vmon-slot-no = <16>;
+	};
+};
+
+&i2c2 {
+	status = "disabled";
+};
+
+/*
+ * Only the pins a node here names are exposed, as on the J716c: pin 112's register
+ * takes an SError when read. 80 is PCIe port 0's PERST#, 106 the amps' fault interrupt and
+ * 107 their shutdown line.
+ */
+&pinctrl_ap {
+	gpio-reserved-ranges = <0 80>, <81 25>, <108 113>;
+};
+
+/* This board's SMC fan and power keys are not yet checked */
+&smc_hwmon {
+	status = "disabled";
+};
+
+/*
+ * The console is on the USB debug link, which drains only while a host reads
+ * it; the machine also boots with nothing attached there.
+ */
+&dockchannel {
+	apple,tx-never-wait;
+	status = "okay";
+};
+
+/*
+ * The keyboard and trackpad: the HID transport on the MTP's DockChannel FIFO.
+ * The J714c's MTP firmware owns the trackpad AFE reset, so there is no reset
+ * GPIO here, unlike the J716c.
+ */
+&mtp_dockchannel {
+	mtp_hid: input@8000 {
+		compatible = "apple,dockchannel-hid";
+		reg = <0x8000 0x1000>, <0xc000 0x1000>,
+		      <0x0 0x1000>, <0x4000 0x1000>;
+		reg-names = "config", "data", "rmt-config", "rmt-data";
+		iommus = <&mtp_dart 0>;
+		interrupt-parent = <&mtp_dockchannel>;
+		interrupts = <2 IRQ_TYPE_LEVEL_HIGH>,
+			     <3 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "tx", "rx";
+		apple,fifo-size = <0x800>;
+		apple,helper-cpu = <&mtp>;
+
+		multi-touch {
+			apple,power-method = <2>;
+			apple,firmware-managed-reset;
+			firmware-name = "apple/tpmtfw-j714c.bin";
+		};
+
+		keyboard {
+		};
+
+		stm {
+		};
+	};
+};
+
+#include "t6050-peripherals.dtsi"
+
+/*
+ * The PMP (ADT pmp0, /chosen, /arm-io/pmgr), as on the J714s. iBoot loads its firmware and the
+ * driver starts it with these boot arguments and the firmware properties below. Its report
+ * tells it which devices are on; it then votes DCS and the fabric for GPU load itself, and the
+ * PMC honours that next to the CLPC. The report, the PMP's vote and the GPU's request are
+ * enabled together, so the GPU never waits on a disabled report.
+ */
+&ps_pms {
+	status = "okay";
+};
+
+&ps_pmp {
+	status = "okay";
+};
+
+&ps_pms_sram {
+	status = "okay";
+};
+
+&pmp0_dart {
+	status = "okay";
+};
+
+&pmp0_mbox {
+	status = "okay";
+};
+
+&pmp0 {
+	/* The J714c's board ID (0x0a, as in the N1 platform ID above) and the dram-vendor-id a J716c reports */
+	apple,board-id = <10>;
+	apple,dram-vendor-id = <255>;
+	/* ADT /arm-io/pmgr pmc, pmc-pmgr, as read on a J716c */
+	apple,pmc = <1>;
+	apple,pmc-pmgr = <63>;
+	status = "okay";
+};
+
+&pmp0_report {
+	status = "okay";
+};
+
+&pmc {
+	/* PMP, CLPC and AP agents, once the PMP runs */
+	apple,static-voters = <0 1 3>;
+	apple,pmp = <&pmp0>;
+};
+
+&sgx {
+	power-domains = <&pmp0_gfx>;
+};
+
+#include "t6050-max-pmp-tunables.dtsi"
+
+#include "t6050-max-atc2.dtsi"
+
+/* The I2C power states have no described parent (SIO), as for i2c1 and i2c2 */
+&ps_i2c3 {
+	/delete-property/ power-domains;
+	status = "okay";
+};
+
+&i2c3 {
+	/*
+	 * The stub's pmgr clock controller has no driver. The ADT gives i2c1, i2c2 and i2c3 the same
+	 * clock-ids (4), so i2c3 takes the reference clock as i2c1 and i2c2 do.
+	 */
+	clocks = <&clkref>;
+	status = "okay";
+
+	speaker_right_woof1: codec@3b {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3b>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 1";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <6>;
+		ti,vmon-slot-no = <4>;
+	};
+
+	speaker_right_woof2: codec@3c {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3c>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 2";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <14>;
+		ti,vmon-slot-no = <12>;
+	};
+
+	speaker_right_tweet: codec@3d {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3d>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Tweeter";
+		interrupts-extended = <&pinctrl_ap 106 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <22>;
+		ti,vmon-slot-no = <20>;
+	};
+};
+
+/*
+ * ==== The left-front USB-C port (ATC1) ====
+ *
+ * ADT /arm-io/nub-spmi-a0/hpm1 (SN201202x, SPMI address 0xa, port-number 2, port-location
+ * "left-front", acio-parent acio1), with atc-phy1, usb-drd1 and dart-usb1. The PHY, the DWC3 and
+ * their DARTs and mailbox are the ATC1 template of t6050-dieX.dtsi; only the links to the PD
+ * controller are the board's. The port's USB4/Thunderbolt router (/arm-io/acio1) and its
+ * DisplayPort routes are not described yet; the PHY runs in USB mode.
+ *
+ * The left-back port (ATC0, hpm0) is the boot link's debug port. The combo PHY binding and
+ * driver exclude it on purpose (apple,port-index 0), so it is not described either.
+ */
+/ {
+	aliases {
+		atcphy1 = &atc1_phy;
+	};
+};
+
+&atc1_phy {
+	port {
+		atc1_phy_ep: endpoint {
+			remote-endpoint = <&hpm1_ss>;
+		};
+	};
+};
+
+&usb_drd1 {
+	port {
+		usb_drd1_hs: endpoint {
+			remote-endpoint = <&hpm1_hs>;
+		};
+	};
+};
+
+&nub_spmi_a0 {
+	hpm1: usb-pd@a {
+		compatible = "apple,sn201202x";
+		reg = <0xa SPMI_USID>;
+
+		connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Left Front";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					hpm1_hs: endpoint {
+						remote-endpoint = <&usb_drd1_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					hpm1_ss: endpoint {
+						remote-endpoint = <&atc1_phy_ep>;
+					};
+				};
+			};
+		};
+	};
+};
+
+/* The host DROM from the J714cAP ADT (/arm-io/acio2 thunderbolt-drom); the boot loader replaces it */
+&acio2_nhi {
+	apple,thunderbolt-drom = [fd 02 00 00 00 00 00 00 00 90 19 c3 8c 00 5c 00
+			00 00 00 00 00 00 08 81 82 02 82 00 00 00 08 82
+			92 01 82 00 00 00 03 83 20 08 84 00 00 00 00 00
+			00 08 85 00 00 00 00 00 00 05 86 09 01 00 08 87
+			00 00 00 00 00 00 05 88 09 01 00 05 89 09 01 00
+			05 8a 09 01 00 0e 01 41 70 70 6c 65 2c 20 49 6e
+			63 2e 00 06 02 69 4f 53 00 00 00 00];
+};
+
+/* The video decoder, its DART and power states. */
+&pmgr4 {
+	status = "okay";
+};
+
+&ps_fab1_soc {
+	status = "okay";
+};
+
+&ps_avd_sys {
+	status = "okay";
+};
+
+&avd_dart {
+	status = "okay";
+};
+
+&avd {
+	status = "okay";
+};

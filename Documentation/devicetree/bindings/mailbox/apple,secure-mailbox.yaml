@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/mailbox/apple,secure-mailbox.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple secure coprocessor mailbox aperture
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  Secure coprocessor proxy mailbox aperture and its transport interrupts.
+  This description does not authorize access to secure-world registers.
+
+properties:
+  compatible:
+    oneOf:
+      - items:
+          - const: apple,t8152-secure-mailbox
+          - const: apple,secure-mailbox
+      - items:
+          - enum:
+              - apple,t6050-secure-mailbox
+              - apple,t8142-secure-mailbox
+          - const: apple,secure-mailbox
+      - items:
+          - const: apple,t8140-secure-mailbox
+          - const: apple,secure-mailbox
+
+  reg:
+    maxItems: 1
+    description: Register apertures in hardware-description order.
+
+  interrupts:
+    minItems: 2
+    maxItems: 3
+
+  iommus:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - iommus
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8152-secure-mailbox
+    then:
+      properties:
+        interrupts:
+          minItems: 3
+          maxItems: 3
+    else:
+      properties:
+        interrupts:
+          maxItems: 2
+
+additionalProperties: false

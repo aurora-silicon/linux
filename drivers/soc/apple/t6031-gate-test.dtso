@@ -1,0 +1,225 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Test device tree for the display gate KUnit test: the T6031 display
+ * nodes of t6031-dcp.dtsi with the boot loader's handoff applied, the power
+ * states they hang from, the PMP topology of t6031-die0.dtsi that the gate
+ * reuses, and PMP values. The values are made up: only their presence and
+ * the PMP image UUID matter to the gate.
+ *
+ * /soc is disabled, so no device is created for any of these nodes.
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	fragment@0 {
+		target-path = "/";
+
+		__overlay__ {
+			chosen {
+				asahi,t6031-pmp {
+					apple,board-id = <0x1234>;
+					apple,dram-vendor-id = <0x5>;
+					apple,tunable-uuid = "07FF4C5B-CB2E-3DE6-95FF-3B107D19B7AB";
+					apple,tunable-test = <0x1 0x2>;
+				};
+			};
+
+			soc {
+				#address-cells = <2>;
+				#size-cells = <2>;
+				status = "disabled";
+
+				test_aic: interrupt-controller@292400000 {
+					reg = <0x2 0x92400000 0x0 0x4000>;
+					interrupt-controller;
+					#interrupt-cells = <4>;
+				};
+
+				power-management@292280000 {
+					reg = <0x2 0x92280000 0x0 0xc000>;
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					ps_disp_sys: power-controller@200 {
+						compatible = "apple,t6031-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+						reg = <0x200 4>;
+						#power-domain-cells = <0>;
+						label = "disp_sys";
+						apple,inherited-on;
+					};
+
+					ps_disp_fe: power-controller@298 {
+						compatible = "apple,t6031-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+						reg = <0x298 4>;
+						#power-domain-cells = <0>;
+						label = "disp_fe";
+						power-domains = <&ps_disp_cpu>;
+						apple,min-state = <4>;
+						apple,inherited-on;
+					};
+
+					ps_disp_cpu: power-controller@2a0 {
+						compatible = "apple,t6031-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+						reg = <0x2a0 4>;
+						#power-domain-cells = <0>;
+						label = "disp_cpu";
+						power-domains = <&ps_disp_sys>;
+						apple,inherited-on;
+					};
+				};
+
+				power-management@292800000 {
+					reg = <0x2 0x92800000 0x0 0x4000>;
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					ps_pmp: power-controller@550 {
+						compatible = "apple,t6031-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+						reg = <0x550 4>;
+						#power-domain-cells = <0>;
+						label = "pmp";
+					};
+
+					ps_pms_sram: power-controller@560 {
+						compatible = "apple,t6031-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+						reg = <0x560 4>;
+						#power-domain-cells = <0>;
+						label = "pms_sram";
+					};
+				};
+
+				dcp_mbox: mailbox@386c08000 {
+					compatible = "apple,t6031-asc-mailbox", "apple,asc-mailbox-v4";
+					reg = <0x3 0x86c08000 0x0 0x4000>;
+					interrupt-parent = <&test_aic>;
+					interrupts = <0 0 1029 4>, <0 0 1030 4>, <0 0 1031 4>, <0 0 1032 4>;
+					interrupt-names = "send-empty", "send-not-empty",
+							  "recv-empty", "recv-not-empty";
+					power-domains = <&ps_disp_fe>;
+					#mbox-cells = <0>;
+					status = "disabled";
+				};
+
+				dcp_dart: iommu@38530c000 {
+					compatible = "apple,t6031-dart", "apple,t8110-dart";
+					reg = <0x3 0x8530c000 0x0 0x4000>;
+					interrupt-parent = <&test_aic>;
+					interrupts = <0 0 1008 4>;
+					#iommu-cells = <1>;
+					apple,dma-range = <0x100 0x0 0x10 0x0>;
+					status = "disabled";
+				};
+
+				disp0_dart: iommu@385304000 {
+					compatible = "apple,t6031-dart", "apple,t8110-dart";
+					reg = <0x3 0x85304000 0x0 0x4000>;
+					interrupt-parent = <&test_aic>;
+					interrupts = <0 0 1008 4>;
+					#iommu-cells = <1>;
+					apple,dma-range = <0x100 0x0 0x10 0x0>;
+					status = "disabled";
+				};
+
+				pmp_dart: iommu@290300000 {
+					compatible = "apple,t6031-dart", "apple,t8110-dart";
+					reg = <0x2 0x90300000 0x0 0x4000>;
+					#iommu-cells = <1>;
+					interrupt-parent = <&test_aic>;
+					interrupts = <0 0 1184 4>;
+					power-domains = <&ps_pmp>;
+				};
+
+				pmp_report: pmp_report@2903c0000 {
+					compatible = "apple,t6031-pmp-v2-report",
+						     "apple,t6020-pmp-v2-report";
+					reg = <0x2 0x903c0000 0x0 0x30000>;
+					power-domains = <&ps_pms_sram>;
+					#address-cells = <1>;
+					#size-cells = <0>;
+					apple,pmp = <&pmp>;
+
+					pmp_report_disp: report@10 {
+						compatible = "apple,t6031-pmp-v2-report-entry",
+							     "apple,t6000-pmp-v2-report-entry";
+						reg = <0x10>;
+						label = "pmp-disp";
+						#power-domain-cells = <0>;
+						power-domains = <&ps_disp_fe>;
+						apple,always-on;
+					};
+
+					report@11 {
+						compatible = "apple,t6031-pmp-v2-report-entry",
+							     "apple,t6000-pmp-v2-report-entry";
+						reg = <0x11>;
+						label = "pmp-dispext0";
+						#power-domain-cells = <0>;
+						status = "disabled";
+					};
+
+					pmp_report_ans: report@21 {
+						compatible = "apple,t6031-pmp-v2-report-entry",
+							     "apple,t6000-pmp-v2-report-entry";
+						reg = <0x21>;
+						label = "pmp-ans";
+						#power-domain-cells = <0>;
+					};
+				};
+
+				pmp: pmp@290700000 {
+					compatible = "apple,t6031-pmp-v2", "apple,t6000-pmp-v2";
+					reg = <0x2 0x90700000 0x0 0x100000>,
+					      <0x2 0x90c00000 0x0 0x4000>;
+					reg-names = "pmp", "asc";
+					mboxes = <&pmp_mbox>;
+					mbox-names = "mbox";
+					iommus = <&pmp_dart 0>;
+					power-domains = <&ps_pmp>;
+					status = "disabled";
+				};
+
+				pmp_mbox: mbox@290c08000 {
+					compatible = "apple,t6031-asc-mailbox", "apple,asc-mailbox-v4";
+					reg = <0x2 0x90c08000 0x0 0x4000>;
+					interrupt-parent = <&test_aic>;
+					interrupts = <0 0 1180 4>, <0 0 1181 4>, <0 0 1182 4>, <0 0 1183 4>;
+					interrupt-names = "send-empty", "send-not-empty",
+							  "recv-empty", "recv-not-empty";
+					#mbox-cells = <0>;
+					power-domains = <&ps_pmp>, <&ps_pms_sram>;
+				};
+
+				dcp: dcp@386c00000 {
+					compatible = "apple,t6031-dcp";
+					mboxes = <&dcp_mbox>;
+					mbox-names = "mbox";
+					iommus = <&dcp_dart 5>;
+					reg-names = "coproc";
+					reg = <0x3 0x86c00000 0x0 0x4000>;
+					power-domains = <&ps_disp_fe>;
+					#address-cells = <2>;
+					#size-cells = <2>;
+					status = "disabled";
+					apple,t6031-handoff = <1>;
+					apple,firmware-compat = <14 7 0>;
+					apple,firmware-uuid = "DDF38191-93B3-324A-BC8F-643006F5AC82";
+					apple,pmp-report = <&pmp_report_disp>;
+
+					piodma {
+						iommus = <&disp0_dart 4>;
+						apple,t6031-handoff = <1>;
+					};
+				};
+
+				display: display-subsystem {
+					compatible = "apple,t6031-display-subsystem";
+					iommus = <&disp0_dart 0>;
+					status = "disabled";
+					apple,t6031-handoff = <1>;
+				};
+			};
+		};
+	};
+};

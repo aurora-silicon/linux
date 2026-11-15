@@ -1,0 +1,311 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple MacBook Air (13-inch, M4, 2025)
+ *
+ * target-type: J713
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#include "t8132.dtsi"
+#include "t8132-j713-j715.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	compatible = "apple,j713", "apple,t8132", "apple,arm-platform";
+	model = "Apple MacBook Air (13-inch, M4, 2025)";
+
+	/*
+	 * The AOP firmware runs the stream (MCA cluster 0, one serializer for
+	 * the four amps); macaudio's J713 variant links the AOP audio
+	 * component's speaker back-end (DAI 3) to them. The codecs are listed in
+	 * the ADT provider order, so each gets its native playback slot (LW 0,
+	 * RW 1, LT 2, RT 3). The idle masks are the ADT amp-tx-zd-config rows 0
+	 * and 1 over the 16 sense byte slots: the left woofer drives zeros in
+	 * the right amps' sense slots, the right woofer in the left amps'.
+	 */
+	sound: sound {
+		compatible = "apple,j713-macaudio", "apple,macaudio";
+		model = "MacBook Air J713";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Speakers";
+			dai-tdm-idle-mode-0 = "zero";
+			dai-tdm-idle-mode-1 = "zero";
+			dai-tdm-slot-tx-idle-mask-0 = <0xf0f0>;
+			dai-tdm-slot-tx-idle-mask-1 = <0x0f0f>;
+
+			cpu {
+				sound-dai = <&aop_audio 3>;
+			};
+
+			codec {
+				sound-dai = <&speaker_left_woof>, <&speaker_right_woof>,
+					    <&speaker_left_tweet>, <&speaker_right_tweet>;
+			};
+		};
+	};
+
+	/*
+	 * Physical size of the firmware framebuffer's 2560x1600 area below the
+	 * notch (13.6" panel, 224 ppi), so simpledrm reports the real DPI.
+	 */
+	fb_panel: panel {
+		width-mm = <290>;
+		height-mm = <181>;
+		status = "disabled";
+	};
+};
+
+&sound_jack {
+	compatible = "apple,j713-macaudio-jack", "apple,macaudio";
+	model = "MacBook Air J713 Jack";
+};
+
+&mtp_hid {
+	multi-touch {
+		firmware-name = "apple/tpmtfw-j713.bin";
+	};
+};
+
+&aop_audio {
+	apple,chassis-name = "J713";
+	apple,machine-kind = "MacBook Air";
+};
+
+/* Deep sleep has been brought up and tested on this machine only. */
+&sleep {
+	status = "okay";
+};
+
+/* Deep sleep needs both CPU clusters' power gates; iBoot enables E's only. */
+&cluster_pwrgate {
+	status = "okay";
+};
+
+/* The enclave must take the sleep request, so its driver has to bind. */
+&sep_dart {
+	status = "okay";
+};
+
+/* Only named: the sleep's last refusal reads its state to see the enclave gate. */
+&ps_sep {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&sep {
+	/*
+	 * Without a domain the driver tells the enclave at .suspend, and a sleep
+	 * refused after that finds it gated with its mailbox gone.
+	 */
+	power-domains = <&ps_sep>, <&ps_gpio>;
+	status = "okay";
+};
+
+/*
+ * The four SN012776 speaker amps, held in hardware shutdown until the sound
+ * card enables them (ADT /arm-io/i2c3/audio-speaker at 0x38 and its
+ * speaker1..3): one interrupt line on AP GPIO 14, level low; sense slots from
+ * speaker-config (amp i at RX bytes 4i and 4i + 2, order LW RW LT RT). Names
+ * as speakersafetyd's j413/j613 profiles use them. Every amp joins the SDZ
+ * fail-closed group.
+ */
+&i2c3 {
+	status = "okay";
+
+	speaker_left_woof: codec@38 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x38>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer";
+		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <0>;
+		ti,vmon-slot-no = <2>;
+	};
+
+	speaker_left_tweet: codec@39 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x39>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Tweeter";
+		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <8>;
+		ti,vmon-slot-no = <10>;
+	};
+
+	speaker_right_woof: codec@3b {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3b>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer";
+		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <4>;
+		ti,vmon-slot-no = <6>;
+	};
+
+	speaker_right_tweet: codec@3c {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3c>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Tweeter";
+		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <12>;
+		ti,vmon-slot-no = <14>;
+	};
+};
+
+&mesa {
+	/*
+	 * Per-device factory data from this Mac's own iBoot system container:
+	 * the calibration, and the signed root key the nonce session loads.
+	 */
+	firmware-name = "apple/mesacal-j713.bin", "apple/msrk-j713.bin";
+};
+
+/*
+ * The DCP powers its display domains down while blanked
+ * (appledrm.power_gate_ms): the clock protection slices of its DARTs, as the
+ * ADT has them, and the internal pipe's PMC interface.
+ */
+&dcp_dart {
+	apple,clock-protection = <&ps_prot 42>;
+};
+
+&disp0_dart {
+	apple,clock-protection = <&ps_prot 8>;
+};
+
+&dcp {
+	apple,pmc-interface = <&pmc_disp0>;
+};
+
+/*
+ * Each external DCP powers its CPU, front-end and system domains off around
+ * a deep sleep. The system domains have a bus bridge in front of their
+ * block: its link words are 0x800104 past the start of the block's disp-3
+ * registers (reg 4 of the external DCP).
+ */
+&ps_dispext0_sys {
+	apple,consumer-switched;
+	apple,bridge-link = <&dcpext0 4 0x800104>;
+};
+
+&ps_dispext0_fe {
+	apple,consumer-switched;
+};
+
+&ps_dispext0_cpu {
+	apple,consumer-switched;
+	/* Power-gate retention workaround, as macOS sets it while off. */
+	apple,retention-workaround = <0x256cc 0x3 0x3>, <0x256f0 0x3 0x0>;
+};
+
+&ps_dispext1_sys {
+	apple,consumer-switched;
+	apple,bridge-link = <&dcpext1 4 0x800104>;
+};
+
+&ps_dispext1_fe {
+	apple,consumer-switched;
+};
+
+&ps_dispext1_cpu {
+	apple,consumer-switched;
+	/* Power-gate retention workaround, as macOS sets it while off. */
+	apple,retention-workaround = <0x25b4c 0x3 0x3>, <0x25b70 0x3 0x0>;
+};
+
+/*
+ * A deep sleep with a dock attached powers these off: their hosts (the ACIO
+ * NHIs, the tunneled PCIe ports and the external DCPs) take them down and
+ * restore them, with these clock protection slices.
+ */
+&usb4_0_dart {
+	apple,clock-protection = <&ps_prot 15>;
+};
+
+&usb4_1_dart {
+	apple,clock-protection = <&ps_prot 19>;
+};
+
+&usb4_0_pcie_dart {
+	apple,clock-protection = <&ps_prot 14>;
+};
+
+&usb4_1_pcie_dart {
+	apple,clock-protection = <&ps_prot 18>;
+};
+
+&dcpext0_dart {
+	apple,clock-protection = <&ps_prot 5>;
+};
+
+&dispext0_dart {
+	apple,clock-protection = <&ps_prot 4>;
+};
+
+&dcpext1_dart {
+	apple,clock-protection = <&ps_prot 30>;
+};
+
+&dispext1_dart {
+	apple,clock-protection = <&ps_prot 29>;
+};
+
+/* Native radio recovery is required before admitting system sleep. */
+&pcie0 {
+	status = "okay";
+};
+
+&dart_apcie0 {
+	status = "okay";
+};
+
+&port00 {
+	clkreq-gpios = <&pinctrl_ap 160 GPIO_ACTIVE_LOW>;
+};
+
+/* Each ACIO host powers its Type-C PHY down and up around a deep sleep with a dock. */
+&usb4_0_acio {
+	phys = <&atcphy0 PHY_TYPE_USB3>;
+	phy-names = "cio";
+};
+
+&usb4_1_acio {
+	phys = <&atcphy1 PHY_TYPE_USB3>;
+	phy-names = "cio";
+};
+
+&ane_dart0 {
+	status = "okay";
+};
+
+&ane_dart1 {
+	status = "okay";
+};
+
+&ane_dart2 {
+	status = "okay";
+};
+
+&ane {
+	status = "okay";
+};

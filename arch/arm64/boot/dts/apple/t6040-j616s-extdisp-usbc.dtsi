@@ -1,0 +1,252 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * USB-C DisplayPort: dcpext1 over any of the three Type-C ports. As for
+ * HDMI, the DISPEXT1 chain and dcpext1 stay DISABLED in the DTB and are
+ * enabled by the enable gate (drivers/soc/apple/display-gate.c). The
+ * routes go through the display fabric (typec-routes, end of this file):
+ * tipd's mode switch reaches dcpext1, which claims the port. Boot-time
+ * changes: mode-switch on atcphy0..2 (the PHY registers a Type-C mode
+ * switch; tipd drives it) and the port@3 route endpoints of the connectors.
+ */
+
+/* PMP device-state acknowledgement for DISPEXT1 (soc-device 19, request bit 18), as DISPEXT0. */
+&pmp_report {
+	pmp_dispext1: report@12 {
+		compatible = "apple,t6041-pmp-v2-report-entry",
+			     "apple,t6000-pmp-v2-report-entry";
+		reg = <0x12>;
+		label = "pmp-dispext1";
+		#power-domain-cells = <0>;
+		apple,irq-safe;
+		status = "disabled";
+	};
+};
+
+/*
+ * DISPEXT1_SYS sits on FAB7_SOC (ADT pmgr id2 133, parent AFI as described
+ * in t6040-pmgr.dtsi, off at boot). m4.62 enabled DISPEXT1_SYS without it
+ * and the first DCPEXT1 register access (its DART) reset the SoC.
+ */
+&ps_dispext1_sys {
+	power-domains = <&ps_fab7_soc>, <&pmp_dispext1>;
+};
+
+&ps_dispext1_cpu {
+	/* NEVER enable: ADT no_ps, as DISPEXT0_CPU (its register read resets the SoC). */
+	/delete-property/ apple,always-on;
+};
+
+/* tipd switches the PHY into DP alt mode through the connector graph. */
+&atcphy0 {
+	mode-switch;
+};
+
+&atcphy1 {
+	mode-switch;
+};
+
+&atcphy2 {
+	mode-switch;
+};
+
+/*
+ * Type-C display routes through the display fabric, as T6030 and J700:
+ * dcpext1 offers one route per port, each a mode switch the port controller
+ * drives over the connector graph (port@3). The gate enables the routes
+ * before devices exist, so the port controllers wait for dcpext1's mode
+ * switches, and probes the controllers again once dcpext1 is bound. A route
+ * without a registered mode switch would make the port wait for one forever.
+ */
+&typec0 {
+	ports {
+		port@3 {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			reg = <3>;
+
+			typec0_dcpext1: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&dcpext1_typec0>;
+			};
+
+			typec0_dcpext0: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext0_typec0>;
+			};
+		};
+	};
+};
+
+&typec1 {
+	ports {
+		port@3 {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			reg = <3>;
+
+			typec1_dcpext1: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&dcpext1_typec1>;
+			};
+
+			typec1_dcpext0: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext0_typec1>;
+			};
+		};
+	};
+};
+
+&typec2 {
+	ports {
+		port@3 {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			reg = <3>;
+
+			typec2_dcpext1: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&dcpext1_typec2>;
+			};
+
+			typec2_dcpext0: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext0_typec2>;
+			};
+		};
+	};
+};
+
+/*
+ * As DISPEXT0: dcpext1, its DARTs and its mailbox are in the DISPEXT1 block,
+ * so they hold DISPEXT1_FE (and with it the PMP request) while they are bound.
+ * Without it DISPEXT1 is only powered when iBoot left it on for a display
+ * plugged in at boot, and genpd turns it off as unused under a running dcpext1.
+ */
+&dcpext1_dart {
+	power-domains = <&ps_dispext1_fe>;
+};
+
+&dispext1_dart {
+	power-domains = <&ps_dispext1_fe>;
+};
+
+&dcpext1_mbox {
+	power-domains = <&ps_dispext1_fe>;
+};
+
+&dcpext1 {
+	power-domains = <&ps_dispext1_fe>;
+	apple,connector-type = "USB-C";
+	/* as dcpext0: without it apple-dcp's probe fails with -EINVAL (m4.63) */
+	apple,iomfb-surfaces = <1 1 0 0>;
+	phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>, <&atcphy2 PHY_TYPE_DP>;
+	phy-names = "typec0", "typec1", "typec2";
+	mux-controls = <&atcphy0_xbar 0>, <&atcphy1_xbar 0>, <&atcphy2_xbar 0>;
+	mux-control-names = "typec0", "typec1", "typec2";
+	/* ADT: atcN-dpphy dp-switch-dfp-endpoint N; dcpext1 ufp 1 port 0 = crossbar state 2 */
+	apple,typec-dptx-phys = <0 1 2>;
+	apple,typec-mux-indices = <2 2 2>;
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext1_typec0: endpoint {
+					remote-endpoint = <&typec0_dcpext1>;
+				};
+			};
+		};
+
+		route@1 {
+			reg = <1>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext1_typec1: endpoint {
+					remote-endpoint = <&typec1_dcpext1>;
+				};
+			};
+		};
+
+		route@2 {
+			reg = <2>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext1_typec2: endpoint {
+					remote-endpoint = <&typec2_dcpext1>;
+				};
+			};
+		};
+	};
+};
+
+/*
+ * dcpext0 also offers a route to every Type-C port, next to its fixed HDMI
+ * path (a hybrid pipeline, as the T6030 J514s).  It is the only pipe that
+ * can be the primary of a two-pipe display (firmware endpoint 1; the pipes
+ * merge upwards only, m4.138), so a 7680 px sink on USB-C needs it: the
+ * fabric takes it for a Type-C port with appledrm.typec_hybrid_first.
+ * ADT: atcN-dpphy dp-switch-dfp-endpoint 0 = dispext0 = crossbar state 0,
+ * as its HDMI route on atcphy3 (mux-index 0).
+ */
+&dcpext0 {
+	phys = <&atcphy3 PHY_TYPE_DP>,
+	       <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>, <&atcphy2 PHY_TYPE_DP>;
+	phy-names = "dp-phy", "typec0", "typec1", "typec2";
+	mux-controls = <&atcphy3_xbar 0>,
+		       <&atcphy0_xbar 0>, <&atcphy1_xbar 0>, <&atcphy2_xbar 0>;
+	mux-control-names = "dp-xbar", "typec0", "typec1", "typec2";
+	apple,typec-dptx-phys = <0 1 2>;
+	apple,typec-mux-indices = <0 0 0>;
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext0_typec0: endpoint {
+					remote-endpoint = <&typec0_dcpext0>;
+				};
+			};
+		};
+
+		route@1 {
+			reg = <1>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext0_typec1: endpoint {
+					remote-endpoint = <&typec1_dcpext0>;
+				};
+			};
+		};
+
+		route@2 {
+			reg = <2>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext0_typec2: endpoint {
+					remote-endpoint = <&typec2_dcpext0>;
+				};
+			};
+		};
+	};
+};

@@ -1,0 +1,39 @@
+SPDX-License-Identifier: GPL-2.0-only OR MIT
+
+J713 PMGR policy developer regression
+====================================
+
+Run manually from a kernel source checkout:
+
+  python3 tools/testing/m4-pmgr-policy/run.py
+
+Requires a host C compiler, dtc, libfdt development headers/library, and Python
+libfdt bindings for the default synthesized legacy fixture. HOSTCC selects the
+host compiler. This is a source-based developer test, not an installed kselftest.
+It builds two DTBs and host test executables in a temporary directory; it does
+not build a kernel, access hardware, or run CTS.
+
+The default native and embedded policy DTBs come from this checkout. The legacy
+fixture removes PMGR availability/ownership properties from the native DTB to
+model the old loader ABI. For stronger local qualification, supply actual DTBs:
+
+  python3 tools/testing/m4-pmgr-policy/run.py \
+    --policy-dtb /path/to/t8132-platform-data.dtb \
+    --native-dtb /path/to/t8132-j713.dtb \
+    --legacy-dtb /path/to/captured-legacy-live.dtb \
+    --output-dir /path/to/results
+
+The harness extracts the production mapping helper and policy function. Live
+OF full_name fields contain fdt_get_name() components, with parent ancestry
+stored separately, as in Linux unflatten. Real libfdt resolves the actual DTBs.
+Validation independently uses full paths from the live FDT, rather than the
+production mapping helper. A negative control restores the original bad
+component-as-path lookup and must fail by disabling all domains.
+
+Checks include native policy remaining unchanged; enabled storage/GPIO domains;
+firmware ownership; unknown-child isolation; missing-parent errors before apply;
+all property-queue failure positions leaving the live tree unchanged; unit
+addresses; and node references. OF property access and changeset staging/apply
+are mocked. This does not test kernel notifier failure, post-apply rollback,
+MMIO, device probing, or boot. Run both basic and graphics profiles and perform
+the separate kernel build and reboot qualification before deployment.

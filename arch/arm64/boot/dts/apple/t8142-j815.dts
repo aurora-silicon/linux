@@ -1,0 +1,223 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple MacBook Air (15-inch, M5), J815.
+ *
+ * Boots on the T8142 inventory with the resources its ADT (25G83) shares
+ * with J813: CPUs, timer, AIC, DockChannel UART, PMGR, CPU performance
+ * states, PMC, SMC, the MTP keyboard and trackpad, ANS NVMe, watchdog and
+ * PMU. The loader supplies usable memory, CPU release addresses and
+ * framebuffer geometry. Audio, display, USB, camera, GPU and radios are not
+ * described yet: their J815 wiring has not been checked.
+ */
+/dts-v1/;
+
+#include "t8142.dtsi"
+
+/ {
+	compatible = "apple,j815", "apple,t8142", "apple,arm-platform";
+	model = "Apple MacBook Air (15-inch, M5)";
+	chassis-type = "laptop";
+
+	aliases {
+		serial0 = &dockchannel;
+		serial1 = &serial0;
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		stdout-path = "serial0:1500000n8";
+
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>; /* Filled by the loader. */
+			status = "disabled";
+		};
+	};
+};
+
+&cpu0 {
+	operating-points-v2 = <&ecluster_opp>;
+	performance-domains = <&cpufreq_e>;
+	status = "okay";
+};
+
+&cpu1 {
+	operating-points-v2 = <&ecluster_opp>;
+	performance-domains = <&cpufreq_e>;
+	status = "okay";
+};
+
+&cpu2 {
+	operating-points-v2 = <&ecluster_opp>;
+	performance-domains = <&cpufreq_e>;
+	status = "okay";
+};
+
+&cpu3 {
+	operating-points-v2 = <&ecluster_opp>;
+	performance-domains = <&cpufreq_e>;
+	status = "okay";
+};
+
+&cpu4 {
+	operating-points-v2 = <&ecluster_opp>;
+	performance-domains = <&cpufreq_e>;
+	status = "okay";
+};
+
+&cpu5 {
+	operating-points-v2 = <&ecluster_opp>;
+	performance-domains = <&cpufreq_e>;
+	status = "okay";
+};
+
+&cpu6 {
+	operating-points-v2 = <&pcluster_opp>;
+	performance-domains = <&cpufreq_p>;
+	status = "okay";
+};
+
+&cpu7 {
+	operating-points-v2 = <&pcluster_opp>;
+	performance-domains = <&cpufreq_p>;
+	status = "okay";
+};
+
+&cpu8 {
+	operating-points-v2 = <&pcluster_opp>;
+	performance-domains = <&cpufreq_p>;
+	status = "okay";
+};
+
+&cpu9 {
+	operating-points-v2 = <&pcluster_opp>;
+	performance-domains = <&cpufreq_p>;
+	status = "okay";
+};
+
+&{/timer} {
+	status = "okay";
+};
+
+&aic {
+	status = "okay";
+};
+
+&cpu_pmu {
+	status = "okay";
+};
+
+&dockchannel {
+	status = "okay";
+};
+
+&pmgr {
+	status = "okay";
+};
+
+&mtp_dart {
+	/* Keep host allocations clear of firmware's low IOVA mappings. */
+	apple,dma-range = <0 0x02000000 0 0x10000000>;
+	status = "okay";
+};
+
+#include "t8142-j813-j815.dtsi"
+
+&mtp_hid {
+	multi-touch {
+		/* ADT hid-merge-personality C1FD3,3 (J813: C1FD1,4). */
+		firmware-name = "apple/tpmtfw-j815.bin";
+	};
+};
+
+/* Unexposed chassis port instances remain described and disabled. */
+
+/* aura (mcc_init_m5) turns the system level cache on; the driver confirms it and flushes on shutdown. */
+&mcc {
+	status = "okay";
+};
+
+/*
+ * Video encoder: ADT ave behind dart-ave (DART + CPUDART). aura hands over the
+ * preloaded 26A428 firmware (memory regions, CRCs in /chosen) or disables the
+ * node when the ADT has no preload.
+ */
+&ps_venc_sys {
+	status = "okay";
+};
+
+&ps_venc_dma {
+	status = "okay";
+};
+
+&ps_venc_pipe4 {
+	status = "okay";
+};
+
+&ps_venc_pipe5 {
+	status = "okay";
+};
+
+&ps_venc_me0 {
+	status = "okay";
+};
+
+&ps_venc_me1 {
+	status = "okay";
+};
+
+&ave_dart0 {
+	status = "okay";
+};
+
+&ave_dart1 {
+	status = "okay";
+};
+
+&ave {
+	status = "okay";
+};
+
+/*
+ * The Neural Engine. It stays off until the first request: the firmware is
+ * started then, from the preload, and system sleep cycles it cold.
+ */
+&ps_ane_sys {
+	status = "okay";
+};
+
+&ane_dart0 {
+	status = "okay";
+};
+
+&ane_dart1 {
+	status = "okay";
+};
+
+&ane_dart2 {
+	status = "okay";
+};
+
+&ane {
+	status = "okay";
+};
+
+/* Both JPEG engines and their DART. */
+&ps_jpg {
+	status = "okay";
+};
+
+&jpeg_dart {
+	status = "okay";
+};
+
+&jpeg0 {
+	status = "okay";
+};
+
+&jpeg1 {
+	status = "okay";
+};

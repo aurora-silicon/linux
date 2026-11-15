@@ -1,0 +1,107 @@
+pkgname=mesa-m3-native-pro
+pkgver=26.1.4.nativepro.20261012
+pkgrel=3
+_commit=99d5b9d16e779ad9a0879a71578da0a6536cf006
+pkgdesc="Experimental native Asahi OpenGL for T6030 G15S legacy HAL; existing Vulkan retained"
+arch=('aarch64')
+url='https://github.com/iconidentify/mesa-omacom'
+license=('MIT')
+options=('strip' '!debug' '!lto')
+_src=mesa-native-pro
+_prefix=/opt/mesa-m3/native-pro
+_llvm=/usr/lib/llvm22
+_slt=SPIRV-LLVM-Translator-0e67244861402a51b071414d7cb231a052b1ce03
+_slt_headers=SPIRV-Headers-575b6512579ebde466ed3dfc04e413439d14d95d
+_spvtools=SPIRV-Tools-vulkan-sdk-1.4.357.0
+_spvtools_headers=SPIRV-Headers-vulkan-sdk-1.4.357.0
+_deps=('expat' 'gcc-libs' 'libdisplay-info' 'libdrm' 'libelf' 'libglvnd' 'libunwind' 'libx11'
+       'libxcb' 'libxext' 'libxfixes' 'libxrandr' 'libxshmfence' 'libxxf86vm' 'systemd-libs'
+       'vulkan-icd-loader' 'wayland' 'xcb-util-keysyms' 'zlib' 'zstd')
+_makedeps=('meson' 'ninja' 'cmake' 'python' 'python-mako' 'python-packaging' 'python-ply'
+           'python-pycparser' 'python-yaml' 'llvm22' 'llvm22-libs' 'clang22' 'compiler-rt22'
+           'glslang' 'wayland-protocols' 'xorgproto' 'vulkan-headers' 'binutils')
+prepare() {
+  sudo pacman -Sy --noconfirm --needed archlinuxarm-keyring
+  sudo pacman -Su --noconfirm --needed "${_deps[@]}" "${_makedeps[@]}"
+}
+build() {
+  local deps="$srcdir/deps" qbad=0
+  export PKG_CONFIG_PATH="$deps/lib/pkgconfig:$deps/share/pkgconfig"
+  export LD_LIBRARY_PATH="$deps/lib"
+
+  # SPIRV-Tools (linker and validator of the kernel compiler).
+  CFLAGS= CXXFLAGS= LDFLAGS= cmake -S "$_spvtools" -B build-spvtools -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$deps" -DCMAKE_INSTALL_LIBDIR=lib \
+    -DSPIRV-Headers_SOURCE_DIR="$srcdir/$_spvtools_headers" -DSPIRV_WERROR=OFF \
+    -DBUILD_SHARED_LIBS=ON -DSPIRV_TOOLS_BUILD_STATIC=OFF -DSPIRV_SKIP_TESTS=ON \
+    -DSPIRV_SKIP_EXECUTABLES=ON
+  cmake --build build-spvtools --parallel 4
+  cmake --install build-spvtools
+
+  # SPIRV-LLVM-Translator for LLVM 22.
+  CFLAGS= CXXFLAGS= LDFLAGS= cmake -S "$_slt" -B build-slt -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$deps" -DCMAKE_INSTALL_LIBDIR=lib \
+    -DLLVM_DIR="$_llvm/lib/cmake/llvm" \
+    -DLLVM_EXTERNAL_SPIRV_HEADERS_SOURCE_DIR="$srcdir/$_slt_headers" \
+    -DBUILD_SHARED_LIBS=ON -DLLVM_SPIRV_INCLUDE_TESTS=OFF -DLLVM_SPIRV_ENABLE_LIBSPIRV_DIS=OFF
+  cmake --build build-slt --parallel 4
+  cmake --install build-slt
+
+  # libclc 22.1.8, the two targets the kernel compiler uses.
+  CFLAGS= CXXFLAGS= LDFLAGS= cmake -S llvm-project/libclc -B build-libclc -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$deps" \
+    -DLLVM_DIR="$_llvm/lib/cmake/llvm" \
+    -DLIBCLC_TARGETS_TO_BUILD='spirv-mesa3d-;spirv64-mesa3d-' \
+    -DLLVM_SPIRV="$deps/bin/llvm-spirv"
+  cmake --build build-libclc --parallel 4
+  cmake --install build-libclc
+  echo "build toolchain: llvm-config $("$_llvm/bin/llvm-config" --version)," \
+    "LLVMSPIRVLib $(pkg-config --modversion LLVMSPIRVLib), libclc $(pkg-config --modversion libclc)," \
+    "SPIRV-Tools $(pkg-config --modversion SPIRV-Tools), $(${CC:-cc} --version | head -1)"
+
+  printf "[binaries]\nllvm-config = '%s'\n" "$_llvm/bin/llvm-config" > llvm22.ini
+  CFLAGS= CXXFLAGS= LDFLAGS= meson setup build "${_src}" \
+    --native-file llvm22.ini --prefix="${_prefix}" --libdir=lib --wrap-mode=nofallback \
+    -Dbuildtype=release -Ddebug=true \
+    "-Dc_args=['-DMESA_DYNAMIC_TLS']" "-Dcpp_args=['-DMESA_DYNAMIC_TLS']" \
+    -Dvulkan-drivers= -Dgallium-drivers=asahi,softpipe \
+    -Dglx=dri -Dglvnd=enabled -Degl=enabled -Dgbm=enabled -Dplatforms=x11,wayland \
+    -Dgles1=enabled -Dgles2=enabled -Dllvm=enabled -Ddraw-use-llvm=false \
+    -Dmesa-clc=enabled -Dprecomp-compiler=enabled -Dbuild-tests=false \
+    -Dlmsensors=disabled -Dvideo-codecs= -Dtools=drm-shim
+  meson compile -C build -j4
+  meson compile -C build -j4 asahi-native-mrt-clear asahi-native-mediump-opt asahi-native-integer-attrib
+  "$srcdir/build/src/gallium/drivers/asahi/asahi-native-mediump-opt"
+  for case in fresh-fresh fresh-valid; do
+    LD_PRELOAD="$srcdir/build/src/asahi/drm-shim/libasahi_noop_drm_shim.so" \
+    ASAHI_SHIM_CHIP=g15s ASAHI_M3_EXPERIMENTAL=1 \
+      "$srcdir/build/src/gallium/drivers/asahi/asahi-native-mrt-clear" "$case"
+  done
+}
+package() {
+  depends=('mesa-m3' 'expat' 'glibc>=2.43' 'libdisplay-info' 'libdrm' 'libgcc' 'libglvnd'
+           'libstdc++' 'libx11' 'libxcb' 'libxext' 'libxshmfence' 'libxxf86vm'
+           'systemd-libs' 'wayland' 'xcb-util-keysyms' 'zlib' 'zstd')
+  for helper in mesa-m3-pro-check mesa-m3-pro-performance; do
+    install -Dm755 "$srcdir/$helper" "$pkgdir$_prefix/libexec/$helper"
+  done
+  install -Dm644 "$srcdir/mesa-m3-pro-session-env" "$pkgdir$_prefix/libexec/mesa-m3-pro-session-env"
+  install -Dm644 "$srcdir/51-mesa-m3-pro" "$pkgdir/usr/share/uwsm/env.d/51-mesa-m3-pro"
+  install -Dm644 "$srcdir/10-m3-pro.conf" "$pkgdir$_prefix/share/drirc.d/10-m3-pro.conf"
+  install -Dm644 "$srcdir/mesa-m3-pro-performance.service" "$pkgdir/usr/lib/systemd/system/mesa-m3-pro-performance.service"
+  install -Dm755 "$srcdir/build/src/gallium/drivers/asahi/asahi-native-integer-attrib" "$pkgdir$_prefix/libexec/mesa-m3-integer-attrib-probe"
+  meson install -C build --destdir "${pkgdir}" --no-rebuild
+  rm -f "${pkgdir}${_prefix}/lib/libasahi_noop_drm_shim.so"
+  rm -rf "${pkgdir}${_prefix}/include" "${pkgdir}${_prefix}/lib/pkgconfig"
+  install -d "${pkgdir}${_prefix}/share/mesa-m3"
+  printf 't6030-native-gl-legacy-hal\n' > "${pkgdir}${_prefix}/share/mesa-m3/profile"
+  printf 'source=%s\nopengl=native-experimental\nvulkan=legacy-honeykrisp-retained\n' "$_commit" > "${pkgdir}${_prefix}/share/mesa-m3/capabilities"
+  install -Dm644 "${_src}/docs/license.rst" "${pkgdir}/usr/share/licenses/${pkgname}/license.rst"
+  cp -r "${_src}/licenses" "${pkgdir}/usr/share/licenses/${pkgname}/licenses"
+  find "${pkgdir}${_prefix}" -type f -exec sh -c 'head -c4 "$1" | grep -q ELF' sh {} \; -print > elfs
+  if xargs readelf -d < elfs | grep -E 'NEEDED.*lib(LLVM|clang)|\((RPATH|RUNPATH)\)'; then
+    echo "unexpected runtime build dependency"; return 1
+  fi
+}
+source=('10-m3-pro.conf' '51-mesa-m3-pro' 'mesa-m3-pro-check' 'mesa-m3-pro-performance' 'mesa-m3-pro-performance.service' 'mesa-m3-pro-session-env' 'mesa-native-pro-99d5b9d16e77.tar.zst' 'llvm-project-22.1.8-libclc.tar.zst' 'SPIRV-LLVM-Translator-0e67244.tar.gz' 'SPIRV-Headers-575b651.tar.gz' 'SPIRV-Tools-vulkan-sdk-1.4.357.0.tar.gz' 'SPIRV-Headers-vulkan-sdk-1.4.357.0.tar.gz')
+sha256sums=('4be61c12f338e986f0f8544b58ef13231141fc820453233047a29a55ca2b2225' '7f70bfe514b4ef414ae3124915d1863fb39e8080e3f0e4a289020821e16efdda' 'abe200849b61f1db8e49dd2bd7094dc41f197fae87e109f80eb4a7e8efc91592' 'edd9db451ed4121c2c359a73fb44b53cfdc4b354d2d241d67a76509044ead0f5' 'afd73fafb0bc4c209579847cf24fb78a20d491c981f8e1fec5cf09c3b6d56e43' '04232cc122c986b62be3ad61336067f96d577d470642c628785fcff4a8d30f40' '1bad7a31263973ca239f46bc8a21744842313b824a101aaa04e10aaf206b9429' '3d41db41e1e566c1db697ca7acd521d8d8d457de8af84cbaf4ad6ac14ae0af23' 'b43abf03cfe1614b562a7c84d829a9f29d0443e23ac75a622ce622744c5a7ada' '775ee89eb77d067df3f5736e2b4bb2f5f3e39ead915f11f3d366139dcb42209d' 'd31e7109b6ef3559067e53e520870eafed7c9534d00db9728814b6df03fa4a5e' '4d703067a7e06331ccb37bdfed3f9b7879cc61969a2689ae95c95db34a47ff07')

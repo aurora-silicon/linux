@@ -1,0 +1,36 @@
+Controlled reclaim of hole-refill backing
+========================================
+
+  sudo <userpages4k launcher> ./anon-hole-refill-reclaim --external-reclaim
+
+This separate fixture repeats the concurrent allocation and owner-exit checks
+in README.hole-refill-race. It requires the same page ABI, native granule and
+visible swap metadata. After the survivor rewrites and verifies its region, it
+prints:
+
+  RECLAIM_READY pid=<survivor> base=<hex> bytes=16777216 owner_mm_exited=1
+
+It then waits up to 20 seconds for byte r on stdin. Place only the fixture and
+its descendants in a fresh cgroup, with the controller outside that cgroup.
+The controller may make at most three writes of "24M swappiness=200" to that
+cgroup's memory.reclaim. Leave memory.max/high unchanged and do not reclaim
+other cgroups or create global pressure. Bound controller work within the
+20-second window.
+
+Record memory.current, memory.swap.current, memory.stat and memory.events, plus
+present and valid-swap PTE counts for the reported region. EAGAIN or a partial
+reclaim result does not determine success: actual coverage does. Send r after
+the bounded attempts, even if coverage is below the required threshold.
+
+Before reading data back, the survivor snapshots pagemap. It requires at least
+3072 of 4096 leaves (75%) to contain real swap entries and verifies every byte
+after refault. Insufficient coverage fails this qualification rather than
+skipping it. Expect three TAP passes, no skips and no unexpected signals or
+kernel warnings. Supervisor and child alarms are 35 and 30 seconds; the
+fixture's dedicated process group is killed on failure.
+
+MADV_COLD/PAGEOUT compares native folio mapcount with a contiguous PTE batch.
+Nonlinear pooled quarters can belong to the same requested region while
+occupying separate virtual locations, so those advice operations skip them.
+This fixture exercises ordinary cgroup reclaim and nonlinear reverse mapping
+without removing the advice path's protection for other mappings.

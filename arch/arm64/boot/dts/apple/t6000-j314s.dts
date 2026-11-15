@@ -1,0 +1,88 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * MacBook Pro (14-inch, M1 Pro, 2021)
+ *
+ * target-type: J314s
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+/*
+ * PMP manages system power states; with pmgr-misc leaving DCS to it and
+ * lowering only the fabric for sleep, this board resumes from s2idle and
+ * idles about 0.8 W lower.
+ */
+#define APPLE_USE_PMP
+
+#include "t6000.dtsi"
+#include "t600x-j314-j316.dtsi"
+#include "t6000-hwmon-rails.dtsi"
+
+/ {
+	compatible = "apple,j314s", "apple,t6000", "apple,arm-platform";
+	model = "Apple MacBook Pro (14-inch, M1 Pro, 2021)";
+
+	aliases {
+		rtc0 = &smc_rtc;
+		rtc1 = &pmu_rtc;
+		sep = &sep;
+	};
+};
+
+/*
+ * m1n1 keys off the sep alias to add the sepfw region and the boot
+ * manifests the driver needs to cold-boot SEPOS.
+ */
+&sep {
+	status = "okay";
+};
+
+/*
+ * From the J314s platform device tree (/arm-io/spi2/mesa): the power line
+ * is gpio0 pin 196 (function-mesa_pwr, active high) and the data-ready line
+ * is pin 195, the same lines as J316s.
+ */
+&spi2 {
+	status = "okay";
+};
+
+&mesa {
+	status = "okay";
+	enable-gpios = <&pinctrl_ap 196 GPIO_ACTIVE_HIGH>;
+	interrupt-parent = <&pinctrl_ap>;
+	interrupts = <195 IRQ_TYPE_EDGE_RISING>;
+	spi-cs-setup-delay-ns = <20>;
+	spi-cs-hold-delay-ns = <20>;
+	/*
+	 * Per-device factory data, extracted from this machine's own macOS
+	 * install; it is not redistributable.
+	 */
+	firmware-name = "apple/mesacal-j314s.bin";
+};
+
+&wifi0 {
+	brcm,board-type = "apple,maldives";
+};
+
+&bluetooth0 {
+	brcm,board-type = "apple,maldives";
+};
+
+&panel {
+	compatible = "apple,panel-j314", "apple,panel-mini-led", "apple,panel";
+	width-mm = <302>;
+	height-mm = <196>;
+	adj-height-mm = <189>;
+};
+
+&aop_audio {
+	apple,chassis-name = "J314";
+	apple,machine-kind = "MacBook Pro";
+};
+
+&sound {
+	compatible = "apple,j314-macaudio", "apple,macaudio";
+	model = "MacBook Pro J314";
+};

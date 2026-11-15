@@ -1,0 +1,37 @@
+Pinned anonymous fork density and pin isolation
+=============================================
+
+Build pinned-fork with the other arm64/user4k tests. Run as root through the
+established 4K userspace launcher on a native16K kernel:
+
+  userpages 4k ./pinned-fork --native-16k --expect-packed
+
+The fixture initializes one native-aligned1MiB anonymous range, registers real
+writable long-term io_uring buffer pins, then forks while the parent retains the
+registration. It requires every copied child native PFN to be disjoint from the
+pinned parent's native PFNs. It checks every byte before and after distinct
+parent/child writes; registration and PFN disjointness, not mlock or VmPin alone,
+establish copy-path coverage. Kernel/pin-policy limitations return77 UNEXERCISED.
+
+--expect-packed requires child backing <=1.25MiB for1MiB copied data, with bounded
+pool-shard slack. Without this option the fixture also accepts the old4MiB
+backing so a baseline can record both content and density separately. Successful
+contents alone do not establish packed density. --selftest checks metadata PFN
+grouping only, with no dynamic pin/fork qualification.
+
+Optional --hold reports the parent PID, child PID and range base after fork PFN
+verification, then waits for the byte 'c' on stdin. A controller can hold both
+processes in one fresh uncapped non-root cgroup and verify exact payload charges:
+read each target's pagemap in4KiB units; normalize PFN>>2 to native16KiB PFN;
+read /proc/kpagecgroup at native_PFN*8 and require each returned inode equals
+stat(the fixture cgroup).st_ino. Re-read pagemap to reject migration during the
+sample. This directly catches incorrectly root-charged fork copies; total
+memory.current includes unrelated fixture code/stack/table costs and is not an
+exact payload charge oracle. Verify both PIDs belong to the same owned cgroup,
+record memory.stat/status, and release promptly (within3seconds).
+
+Parent15s/child10s alarms bound the protocol; parent exit kills/reaps the child
+and the child uses PDEATHSIG. Payload native backing is at most5MiB on the old
+path. No forced reclaim, memory.max/high changes, GPU operations, or swap-area
+changes are used. Controllers should additionally enforce their own process-group
+or service-unit lifetime and preserve logs on any failure.

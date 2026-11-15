@@ -1,0 +1,163 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,rtk-helper-asc4.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple ASC4 RTKit helper coprocessor
+
+maintainers:
+  - Ryan Murray <ryan@aurorasilicon.org>
+
+description:
+  Apple SoCs contain a number of ASC coprocessors that run RTKit firmware.
+  For some of them the operating system only has to boot the coprocessor and
+  keep it running, while the devices it serves are described by other nodes.
+  The MTP (multi-touch processor) ASC of Apple laptops is one of these. It
+  serves the built-in keyboard and trackpad over DockChannel, and the
+  DockChannel HID transport refers to this node through its apple,helper-cpu
+  property.
+
+properties:
+  compatible:
+    items:
+      - enum:
+          - apple,t6020-mtp
+          - apple,t6030-mtp
+          - apple,t6031-mtp
+          - apple,t6041-mtp
+          - apple,t6050-mtp
+          - apple,t8112-mtp
+          - apple,t8122-mtp
+          - apple,t8132-mtp
+          - apple,t8140-mtp
+          - apple,t8142-mtp
+      - enum:
+          - apple,t6020-rtk-helper-asc4
+          - apple,t6030-rtk-helper-asc4
+          - apple,t6041-rtk-helper-asc4
+          - apple,t6050-rtk-helper-asc4
+          - apple,t8112-rtk-helper-asc4
+          - apple,t8122-rtk-helper-asc4
+          - apple,t8132-rtk-helper-asc4
+          - apple,t8140-rtk-helper-asc4
+          - apple,t8142-rtk-helper-asc4
+      - const: apple,mtp
+      - const: apple,rtk-helper-asc4
+
+  reg:
+    minItems: 1
+    items:
+      - description: ASC control registers
+      - description:
+          Coprocessor SRAM, from which the firmware may ask the host to map
+          buffers instead of allocating them from system memory
+
+  reg-names:
+    minItems: 1
+    items:
+      - const: asc
+      - const: sram
+
+  mboxes:
+    maxItems: 1
+
+  iommus:
+    maxItems: 1
+
+  apple,rtkit-handoff:
+    enum:
+      - mtp-live-v1
+    description: |
+      The producer reserves firmware-visible buffers and retains their DART
+      mappings, and transfers a running RTKit session without renegotiation.
+      On T8132 it also supplies apple,rtkit-buffers, leaves the initial
+      DockChannel HID header unread, and retains the helper's identity DART
+      bypass. The host continues servicing system endpoints without restarting
+      the coprocessor or taking it to QUIESCED.
+
+  apple,rtkit-buffers:
+    oneOf:
+      - type: boolean
+      - $ref: /schemas/types.yaml#/definitions/uint32-array
+        minItems: 5
+        maxItems: 20
+    description: |
+      An empty property records that no shared buffers were negotiated.
+      Otherwise this is the inventory of every shared buffer negotiated,
+      in groups of five cells: system endpoint number, device address high
+      cell, device address low cell, exact protocol size in bytes, and the
+      original request's is-mapped flag (0 or 1). Endpoint numbers are 1 for
+      crashlog, 2 for syslog, 4 for IOReport, and 8 for OSLog, each at most once.
+      The last cell records whether firmware supplied the original address;
+      it does not classify the backing memory as SRAM or DRAM. Device
+      addresses are physical addresses under the retained identity bypass.
+      SRAM buffers must lie inside the sram register resource. Every DRAM
+      buffer must lie inside a no-map reserved-memory region referenced by
+      memory-region. The inventory is installed before mailbox RX is enabled;
+      repeating an existing request cannot replace a live allocation.
+
+  memory-region:
+    minItems: 1
+    maxItems: 4
+    description:
+      Reserved no-map DRAM buffers held by the running coprocessor. This
+      excludes buffers inside its SRAM register resource.
+
+  linux-enablement-mac,rtkit-inherited:
+    deprecated: true
+    description: |
+      Legacy J713 preservation contract. An empty property or one 32-bit
+      cell containing 1 retains the running helper. A cell containing 0
+      selects ordinary startup. This carries no buffer inventory or verified
+      reservation record; the consumer can service system notifications but
+      cannot reconstruct or replace the existing shared buffers. New
+      producers use mtp-live-v1 and may retain this marker for older kernels.
+    oneOf:
+      - type: boolean
+      - $ref: /schemas/types.yaml#/definitions/uint32
+        enum: [0, 1]
+
+  '#helper-cells':
+    const: 0
+    description:
+      Present in existing device trees. Nothing references the helper with
+      argument cells; the DockChannel HID transport uses a plain phandle.
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - mboxes
+  - iommus
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8132-mtp
+      required:
+        - apple,rtkit-handoff
+    then:
+      required:
+        - apple,rtkit-buffers
+
+additionalProperties: false
+
+examples:
+  - |
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        mtp@314600000 {
+            compatible = "apple,t8140-mtp", "apple,t8140-rtk-helper-asc4",
+                         "apple,mtp", "apple,rtk-helper-asc4";
+            reg = <0x3 0x14600000 0x0 0x4000>,
+                  <0x3 0x14050000 0x0 0x4000>;
+            reg-names = "asc", "sram";
+            mboxes = <&mtp_mbox>;
+            iommus = <&mtp_dart 0>;
+        };
+    };

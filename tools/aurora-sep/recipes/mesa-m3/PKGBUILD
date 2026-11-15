@@ -1,0 +1,442 @@
+# Mesa profiles share one package and use explicit firmware/ABI admission.
+# Legacy Honeykrisp/Zink remains under /opt/mesa-m3 for current14/Pro users.
+# The J613 25G83 profile uses /opt/mesa-m3/25g83 for native GL only; its
+# Vulkan directory is empty. Selection requires persistent administrator intent,
+# the exact j613-25g83-hal200 token, firmware26.6.2 handoff and runtime HAL200/USC3.
+# The J615 shares that profile experimentally: the session hook admits it only
+# with /chosen asahi,j615-25g83-experimental="1" (share/mesa-m3/native25-boards).
+# The package builds both sources sequentially and checks compiler definitions,
+# generated kernels, queue sandbox behavior, TLS loading and native MRT clears.
+# No profile selection substitutes another Mac's firmware or calibration.
+pkgname=mesa-m3
+pkgver=26.1.4.m3.2
+pkgrel=5
+_commit=7ff89a4da387bd561b78efd5f09c98ca8ae18538
+pkgdesc="Mesa in /opt/mesa-m3 for the M3 Pro (G15S) and M3 (G15G) GPUs; used by uwsm sessions on T6030, and on T8122 when opted in"
+arch=('aarch64')
+url='https://github.com/iconidentify/aurora-linux'
+license=('MIT' 'SGI-B-2.0' 'BSL-1.0' 'HPND-sell-variant' 'BSD-3-Clause' 'CC0-1.0 OR Apache-2.0'
+         'LicenseRef-MLAA' 'Apache-2.0 WITH LLVM-exception')
+install=mesa-m3.install
+# Runtime and build packages. They are not listed in depends/makedepends because the
+# lab builder image's package database lags the mirror (makepkg -s gets 404s); prepare()
+# updates the throwaway build container and installs them instead. The package's own
+# runtime depends are set in package_mesa-m3(), with the lowest versions whose symbols
+# the binaries were checked against.
+_deps=('expat' 'gcc-libs' 'libdisplay-info' 'libdrm' 'libelf' 'libglvnd' 'libunwind' 'libx11'
+       'libxcb' 'libxext' 'libxfixes' 'libxrandr' 'libxshmfence' 'libxxf86vm' 'systemd-libs'
+       'vulkan-icd-loader' 'wayland' 'xcb-util-keysyms' 'zlib' 'zstd')
+_makedeps=('meson' 'ninja' 'cmake' 'python' 'python-mako' 'python-packaging' 'python-ply'
+           'python-pycparser' 'python-yaml' 'llvm22' 'llvm22-libs' 'clang22' 'compiler-rt22'
+           'glslang' 'wayland-protocols' 'xorgproto' 'vulkan-headers' 'binutils')
+options=('strip' '!debug' '!lto')
+_src=mesa-26.1.4
+_prefix=/opt/mesa-m3
+_native_src=mesa-hal200
+_native_commit=78908f4d18af2274b5df08c4ad9d953c25980b53
+_native_prefix=${_prefix}/25g83
+_llvm=/usr/lib/llvm22
+_slt=SPIRV-LLVM-Translator-0e67244861402a51b071414d7cb231a052b1ce03
+_slt_headers=SPIRV-Headers-575b6512579ebde466ed3dfc04e413439d14d95d
+_spvtools=SPIRV-Tools-vulkan-sdk-1.4.357.0
+_spvtools_headers=SPIRV-Headers-vulkan-sdk-1.4.357.0
+source=("mesa-m3-src-${_commit:0:11}.tar.zst"
+        "mesa-m3-hal200-${_native_commit:0:12}.tar.zst"
+        mesa-m3-profile.h mesa-m3-abi-check.c
+        build-checks.sh late-load.c tls-pad.c queue-check.py
+        llvm-project-22.1.8-libclc.tar.zst
+        SPIRV-LLVM-Translator-0e67244.tar.gz
+        SPIRV-Headers-575b651.tar.gz
+        SPIRV-Tools-vulkan-sdk-1.4.357.0.tar.gz
+        SPIRV-Headers-vulkan-sdk-1.4.357.0.tar.gz
+        10-m3-asahi-zink.conf
+        gpu-heat.c
+        compute-check.c
+        compute-check.comp
+        mesa-m3-probe.c
+        mesa-m3-session-env
+        50-mesa-m3
+        notices-gen.py
+        mesa-m3-loadcheck.c
+        needs-derive.py
+        kernel-digest.py
+        mesa-m3-user-setup
+        user-setup.list
+        72-mesa-m3-render-node.rules
+        mesa-m3-session-confirm
+        mesa-m3-session-confirm.service
+        mesa-m3-wlcheck.c)
+sha256sums=('7ed24969985dce91f089d34dbe1c55cbcb8c95765e3e5bc0f268d27fbead2222'
+            '535e26266e1d173bfd2f73e63be07eccf32eb9cb329ea8955e32a4fa45278ce8'
+            '9be098fc0a1ec38632678ece7d6d7b743d25df4a1af59ce3d17ba3a4eed34db7'
+            '4ea541456250ed020ce51a89bad0ce31fa0393ddb1b74631acafe2f7b4c148ee'
+            '7cf569863516d753a75308822b15e613eda88acee7bf26e3f91869a4f744facb'
+            'c283068654ed24181899f044817dcaa05660919f4ee09dd47932851a13ee3648'
+            '999e2895b0f2fd5702c27dd32a3acc6a3c0949dc08e2da81a8992fadcaeabd9b'
+            '8ab1f981545ab71ea5d98b9f38e53fed97352ead2e43fd50b3f2d6c5f79c48cb'
+            '3d41db41e1e566c1db697ca7acd521d8d8d457de8af84cbaf4ad6ac14ae0af23'
+            'b43abf03cfe1614b562a7c84d829a9f29d0443e23ac75a622ce622744c5a7ada'
+            '775ee89eb77d067df3f5736e2b4bb2f5f3e39ead915f11f3d366139dcb42209d'
+            'd31e7109b6ef3559067e53e520870eafed7c9534d00db9728814b6df03fa4a5e'
+            '4d703067a7e06331ccb37bdfed3f9b7879cc61969a2689ae95c95db34a47ff07'
+            '3e5aa4dc0418a5b1c49b67e4a3a3a7d55287d8702b94466eeb249f8aec41be1d'
+            '821d02fd42d628a334522215d4407e262ef1ab14ce7947cd81cbbbb15a127b9b'
+            '10abda78df16e650a77443f50cc46a15e418c42d4d9680c6a61616b232c9bdef'
+            '6c98fab6f9d70449bd7f5258c34eac773836908e060ce5bef86dc5b0ce595e61'
+            '826016665cd0424a614b67add921c0c79c3c698a4d104ea5712518449b75f27c'
+            '2b2eb627459f73aa596812503c48fc64331e925015bb7121e1888d18cac65b5e'
+            '6144af8b2e0f04ea615e8c4149e69c45ac49e630c46b2a58f0d1095d977798b2'
+            '530948fc1a124de21c030a497e2ef5351742ba4ad4653484fe30fd1697ad7141'
+            '644cf4a5ab57b7badec75843e2899b68d41490c4851d6885227180d6090c25ea'
+            '9a26a232fd050b6207bd0d385035723f72ffd2b6b72a25d6ac92ae2f99ea5b66'
+            '34f8bb3fa505718dab176b6283dde0d4de9cae4c3928922bca18e6052434bca7'
+            '7e7914877c5f1ccc85b985b071c838271608c78f858489d69b7a3ba64c4f51f0'
+            '8f19ebea2b8e669a764d7c4b40ecbc11e8234acfc3a2bfe7910e22de0b64a49d'
+            '9c7c3050d3ec15fce80a6e59d099567b396f1844a43695aa4377e02ac696f566'
+            '2a15cfdbc160b78e5a3a8e99d5898d40a54db28592f1a4ce04a600990a731f87'
+            '7eaae7de828e15208fccc84db2b910f38bb1288176419f7af7f4675b5c542ce4'
+            'c888e9dce99e8379aa21e9c5895cbe1b7e879a9319bca144193eddc66f9d4051')
+
+# The qualified M3 Pro build's generated kernel files and libclc. build() stops
+# when one of ours differs. libagx_shaders.c is compared through kernel-digest.py:
+# the portable NIR kernels and program tables an M3 uses, without the M1/M2-only
+# precompiled G13 binaries (their info header carries uninitialised padding, so
+# that part differs from run to run).
+_qualified_kernel_digest='8c5a6eb11747db4fcf06602750e827af14f6c0c9f953caa76eb65d8f72a33994 105'
+_qualified=('f44305b94e884049d35d3934416a75571eb7bb0085e3593f8c04480956c02e30 deps/share/clc/spirv-mesa3d-.spv'
+            'f725856fffbfe6dfbe6149a6a49cac407ab3a1c2eee9a7326c3dcdbd8987ee84 deps/share/clc/spirv64-mesa3d-.spv'
+            '96d77577d056298f84a4132e8d01be5128251af959020e3a17b1f0a86555e37f build/src/asahi/libagx/libagx.spv'
+            '35a81d2d0e39cfac382d7899247832fc88486a6de459a9c54f19436b11783ec7 build/src/asahi/libagx/libagx.cpp'
+            '4aeb663cfcb17107dc7e3879bc769eef3a9e592c94fcf42baf7f93866fc71f9c build/src/asahi/libagx/libagx.h'
+            '7321ac1385d5c346fbcaeb74b59ba682154b3e205b345b52983726bbcf6cf729 build/src/asahi/lib/libagx_shaders.h'
+            '1e035f86496d78a56428175d8a4e6d37243ef0dbf89ad04e56751716ffe3a63f build/src/poly/cl/libpoly.spv'
+            'a5813469388f33b022b9458e99f871993aefeec2589d91012dd153e1db9aad08 build/src/poly/cl/libpoly.cpp'
+            '2abb58becda1f59d8e56f629a97aa802b9f6d22691f195147a8af2857f2caf06 build/src/poly/cl/libpoly.h')
+
+prepare() {
+  # This updates and adds packages in the build container: run it only in a
+  # throwaway container (lab package does).
+  sudo pacman -Sy --noconfirm --needed archlinuxarm-keyring
+  sudo pacman -Su --noconfirm --needed "${_deps[@]}" "${_makedeps[@]}"
+}
+
+# _check_qualified PREFIX...: compare the listed files whose path starts with
+# one of the prefixes with the qualified build's.
+_check_qualified() {
+  local line sum path ours bad=0
+  for line in "${_qualified[@]}"; do
+    sum=${line%% *}; path=${line#* }
+    case " $* " in *" ${path%%/*} "*) ;; *) continue ;; esac
+    ours=$(sha256sum "$path" 2>/dev/null | cut -d' ' -f1)
+    if [ "$ours" = "$sum" ]; then
+      echo "qualified-match $sum $path"
+    else
+      echo "QUALIFIED-MISMATCH want $sum got ${ours:-missing} $path"
+      bad=1
+    fi
+  done
+  return "$bad"
+}
+
+build() {
+  local deps="$srcdir/deps" qbad=0
+  export PKG_CONFIG_PATH="$deps/lib/pkgconfig:$deps/share/pkgconfig"
+  export LD_LIBRARY_PATH="$deps/lib"
+
+  # SPIRV-Tools (linker and validator of the kernel compiler).
+  CFLAGS= CXXFLAGS= LDFLAGS= cmake -S "$_spvtools" -B build-spvtools -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$deps" -DCMAKE_INSTALL_LIBDIR=lib \
+    -DSPIRV-Headers_SOURCE_DIR="$srcdir/$_spvtools_headers" -DSPIRV_WERROR=OFF \
+    -DBUILD_SHARED_LIBS=ON -DSPIRV_TOOLS_BUILD_STATIC=OFF -DSPIRV_SKIP_TESTS=ON \
+    -DSPIRV_SKIP_EXECUTABLES=ON
+  cmake --build build-spvtools --parallel 4
+  cmake --install build-spvtools
+
+  # SPIRV-LLVM-Translator for LLVM 22.
+  CFLAGS= CXXFLAGS= LDFLAGS= cmake -S "$_slt" -B build-slt -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$deps" -DCMAKE_INSTALL_LIBDIR=lib \
+    -DLLVM_DIR="$_llvm/lib/cmake/llvm" \
+    -DLLVM_EXTERNAL_SPIRV_HEADERS_SOURCE_DIR="$srcdir/$_slt_headers" \
+    -DBUILD_SHARED_LIBS=ON -DLLVM_SPIRV_INCLUDE_TESTS=OFF -DLLVM_SPIRV_ENABLE_LIBSPIRV_DIS=OFF
+  cmake --build build-slt --parallel 4
+  cmake --install build-slt
+
+  # libclc 22.1.8, the two targets the kernel compiler uses.
+  CFLAGS= CXXFLAGS= LDFLAGS= cmake -S llvm-project/libclc -B build-libclc -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$deps" \
+    -DLLVM_DIR="$_llvm/lib/cmake/llvm" \
+    -DLIBCLC_TARGETS_TO_BUILD='spirv-mesa3d-;spirv64-mesa3d-' \
+    -DLLVM_SPIRV="$deps/bin/llvm-spirv"
+  cmake --build build-libclc --parallel 4
+  cmake --install build-libclc
+  echo "build toolchain: llvm-config $("$_llvm/bin/llvm-config" --version)," \
+    "LLVMSPIRVLib $(pkg-config --modversion LLVMSPIRVLib), libclc $(pkg-config --modversion libclc)," \
+    "SPIRV-Tools $(pkg-config --modversion SPIRV-Tools), $(${CC:-cc} --version | head -1)"
+  _check_qualified deps || qbad=1
+
+  # Mesa. Meson's release + debug defaults only, as in the qualified build.
+  printf "[binaries]\nllvm-config = '%s'\n" "$_llvm/bin/llvm-config" > llvm22.ini
+  CFLAGS= CXXFLAGS= LDFLAGS= meson setup build "${_src}" \
+    --native-file llvm22.ini \
+    --prefix="${_prefix}" \
+    --libdir=lib \
+    --wrap-mode=nofallback \
+    -Dbuildtype=release \
+    -Ddebug=true \
+    -Dvulkan-drivers=asahi \
+    -Dgallium-drivers=zink,softpipe \
+    -Dglx=dri \
+    -Dglvnd=enabled \
+    -Degl=enabled \
+    -Dgbm=enabled \
+    -Dplatforms=x11,wayland \
+    -Dgles1=enabled \
+    -Dgles2=enabled \
+    -Dllvm=enabled \
+    -Ddraw-use-llvm=false \
+    -Dmesa-clc=enabled \
+    -Dprecomp-compiler=enabled \
+    -Dbuild-tests=false \
+    -Dlmsensors=disabled \
+    -Dvideo-codecs=
+  meson compile -C build -j4
+  meson compile -C build -j4 hk-explicit-plane-layout
+  python3 - build/compile_commands.json <<'PLANE_CHECK'
+import json, shlex, subprocess, sys
+command = next(c for c in json.load(open(sys.argv[1]))
+               if c['file'].endswith('/tests/test-hk-explicit-plane-layout.c'))
+args = command.get('arguments') or shlex.split(command['command'])
+if '-UNDEBUG' not in args:
+    raise SystemExit('plane layout control must retain release assertions')
+filtered=[]; skip=False
+for arg in args:
+    if skip: skip=False; continue
+    if arg in ('-o', '-MQ', '-MF', '-MT'): skip=True; continue
+    if arg in ('-c', '-MD', '-MMD') or arg == command['file']: continue
+    filtered.append(arg)
+output = subprocess.check_output(filtered + ['-dM', '-E', '-x', 'c', '-'],
+    cwd=command['directory'], input=b'').decode()
+if any(line.startswith('#define NDEBUG') for line in output.splitlines()):
+    raise SystemExit('plane layout control release assertions are disabled')
+print('legacy-plane-offset-compiler-assertions=pass')
+PLANE_CHECK
+  "$srcdir/build/src/asahi/vulkan/hk-explicit-plane-layout"
+  echo "legacy-plane-offset-control=pass"
+  _check_qualified build || qbad=1
+  local digest
+  digest=$(python3 kernel-digest.py build/src/asahi/lib/libagx_shaders.c)
+  if [ "$digest" = "$_qualified_kernel_digest" ]; then
+    echo "qualified-match kernel-digest $digest build/src/asahi/lib/libagx_shaders.c"
+  else
+    echo "QUALIFIED-MISMATCH kernel-digest want $_qualified_kernel_digest got $digest"; qbad=1
+  fi
+
+  # The resolved options and dependencies, for comparison with the qualified build.
+  python3 - build/meson-info/intro-buildoptions.json build/meson-info/intro-dependencies.json <<'EOF'
+import json, sys
+for o in json.load(open(sys.argv[1])):
+    if o['section'] in ('user', 'core', 'base') and o['name'] not in ('prefix', 'libdir'):
+        print('meson-option', o['name'], '=', json.dumps(o['value']))
+for d in sorted(json.load(open(sys.argv[2])), key=lambda d: d['name']):
+    print('meson-dependency', d['name'], d.get('version'), d.get('type'))
+EOF
+  if [ "$qbad" != 0 ]; then
+    echo "this build does not reproduce the qualified build's kernel files"; return 1
+  fi
+
+  # Native J613 has its own generated kernels and command ABI. Build it
+  # separately so the legacy libraries retain the qualified code and kernels.
+  CFLAGS= CXXFLAGS= LDFLAGS= meson setup build-native "$_native_src" \
+    --native-file llvm22.ini --prefix="$_native_prefix" --libdir=lib --wrap-mode=nofallback \
+    -Dbuildtype=release -Ddebug=true \
+    "-Dc_args=['-DMESA_DYNAMIC_TLS','-DMESA_M3_HAL200_PROFILE']" \
+    "-Dcpp_args=['-DMESA_DYNAMIC_TLS','-DMESA_M3_HAL200_PROFILE']" \
+    -Dvulkan-drivers= -Dgallium-drivers=asahi,softpipe \
+    -Dglx=dri -Dglvnd=enabled -Degl=enabled -Dgbm=enabled -Dplatforms=x11,wayland \
+    -Dgles1=enabled -Dgles2=enabled -Dllvm=enabled -Ddraw-use-llvm=false \
+    -Dmesa-clc=enabled -Dprecomp-compiler=enabled -Dbuild-tests=false \
+    -Dlmsensors=disabled -Dvideo-codecs= -Dtools=drm-shim
+  python3 - build-native/compile_commands.json <<'EOF'
+import json, shlex, subprocess, sys
+commands = json.load(open(sys.argv[1]))
+for basename in ('agx_device.c', 'agx_state.c'):
+    command = next(c for c in commands if c['file'].endswith('/' + basename))
+    args = command.get('arguments') or shlex.split(command['command'])
+    for macro in ('-DMESA_DYNAMIC_TLS', '-DMESA_M3_HAL200_PROFILE'):
+        if macro not in args:
+            raise SystemExit(f"native compiler definition missing: {macro} in {basename}")
+    filtered=[]; skip=False
+    for arg in args:
+        if skip: skip=False; continue
+        if arg in ('-o', '-MQ', '-MF', '-MT'): skip=True; continue
+        if arg in ('-c', '-MD', '-MMD') or arg == command['file']: continue
+        filtered.append(arg)
+    output = subprocess.check_output(filtered + ['-dM', '-E', '-x', 'c', '-'],
+        cwd=command['directory'], input=b'').decode()
+    for macro in ('MESA_DYNAMIC_TLS', 'MESA_M3_HAL200_PROFILE'):
+        if not any(line.startswith('#define ' + macro + ' ') for line in output.splitlines()):
+            raise SystemExit(f"native preprocessor definition missing: {macro} in {basename}")
+        print(f'native-compiler-definition=pass file={basename} macro={macro}')
+print('native-compiler-definitions=pass')
+EOF
+  meson compile -C build-native -j4
+  meson compile -C build-native -j4 asahi-native-mrt-clear
+  for case in fresh-fresh fresh-valid; do
+    LD_PRELOAD="$srcdir/build-native/src/asahi/drm-shim/libasahi_noop_drm_shim.so" \
+      ASAHI_SHIM_CHIP=g15g-hal200 ASAHI_M3_EXPERIMENTAL=1 \
+      "$srcdir/build-native/src/gallium/drivers/asahi/asahi-native-mrt-clear" "$case"
+  done
+  echo "native-kernel-digest $(python3 kernel-digest.py build-native/src/asahi/lib/libagx_shaders.c)"
+
+  # The programs, against the system loaders (libglvnd, Vulkan loader).
+  glslangValidator -V --target-env vulkan1.1 --vn compute_check_spv \
+    -o compute-check.spv.h compute-check.comp
+  ${CC:-cc} ${CFLAGS} -Wall -I. -o compute-check compute-check.c ${LDFLAGS} -lvulkan
+  ${CC:-cc} ${CFLAGS} -Wall -o gpu-heat gpu-heat.c ${LDFLAGS} -lEGL -lGLESv2
+  ${CC:-cc} ${CFLAGS} -Wall -I. -o mesa-m3-probe mesa-m3-probe.c ${LDFLAGS} \
+    -lEGL -lGLESv2 -lvulkan -lwayland-client -lwayland-egl
+  ${CC:-cc} ${CFLAGS} -Wall -o mesa-m3-loadcheck mesa-m3-loadcheck.c ${LDFLAGS}
+  ${CC:-cc} ${CFLAGS} -Wall -I"$_src/include" $(pkg-config --cflags libdrm) \
+    -o mesa-m3-abi-check mesa-m3-abi-check.c ${LDFLAGS} $(pkg-config --libs libdrm)
+  ${CC:-cc} ${CFLAGS} -Wall -DMESA_M3_GL_ONLY -I. -o mesa-m3-native-probe mesa-m3-probe.c ${LDFLAGS} \
+    -lEGL -lGLESv2 -lwayland-client -lwayland-egl
+  ${CC:-cc} ${CFLAGS} -Wall -DMESA_M3_GL_ONLY -o mesa-m3-native-loadcheck mesa-m3-loadcheck.c ${LDFLAGS}
+  ${CC:-cc} ${CFLAGS} -Wall -o mesa-m3-wlcheck mesa-m3-wlcheck.c ${LDFLAGS} -lwayland-client
+}
+
+package_mesa-m3() {
+  # These must equal what needs-derive.py derives from the shipped ELF files
+  # (checked below): each DT_NEEDED soname's owner; minimums from the highest
+  # GLIBC_, GLIBCXX_/CXXABI_ and GCC_ symbol versions used; spirv-tools at the
+  # version linked against (its soname carries no version). The others have a
+  # stable soname and no minimum; the login check (mesa-m3-loadcheck) still
+  # refuses a library that lacks a symbol. python runs mesa-m3-user-setup;
+  # systemd (journalctl, systemctl, loginctl, the user unit) and util-linux
+  # (logger) serve the session hook.
+  depends=('expat' 'glibc>=2.43' 'libdisplay-info' 'libdrm' 'libgcc>=3.0' 'libglvnd'
+           'libstdc++>=11.1' 'libx11' 'libxcb' 'libxext' 'libxshmfence' 'libxxf86vm' 'python'
+           'spirv-tools>=1:1.4.357.0' 'systemd' 'systemd-libs' 'util-linux' 'vulkan-icd-loader'
+           'wayland' 'xcb-util-keysyms' 'zlib' 'zstd')
+  optdepends=('uwsm: graphical sessions that pick this Mesa up on the M3 Pro and M3')
+  # One package for both M3 GPUs: the M3 MacBook Air experiment's separate G15G
+  # prefix package goes (no file in common; never both installed).
+  replaces=('mesa-m3-g15g')
+  conflicts=('mesa-m3-g15g')
+
+  meson install -C build --destdir "${pkgdir}" --no-rebuild
+  meson install -C build-native --destdir "${pkgdir}" --no-rebuild
+  rm -f "${pkgdir}${_native_prefix}/lib/libasahi_noop_drm_shim.so"
+  rm -r "${pkgdir}${_native_prefix}/include" "${pkgdir}${_native_prefix}/lib/pkgconfig"
+  install -Dm755 mesa-m3-native-probe "${pkgdir}${_native_prefix}/bin/mesa-m3-probe"
+  install -Dm755 mesa-m3-native-loadcheck "${pkgdir}${_native_prefix}/libexec/mesa-m3-loadcheck"
+  install -Dm755 mesa-m3-abi-check "${pkgdir}${_prefix}/libexec/mesa-m3-abi-check"
+  install -d "${pkgdir}${_native_prefix}/share/vulkan/disabled" "${pkgdir}${_native_prefix}/share/mesa-m3"
+  echo j613-25g83-gl-only > "${pkgdir}${_native_prefix}/share/mesa-m3/profile"
+  printf 'opengl=native-experimental\nvulkan=unavailable\nshader-scratch=unsupported\ncompressed-render-targets=unsupported\n' > "${pkgdir}${_native_prefix}/share/mesa-m3/capabilities"
+  # Nothing builds against the prefix.
+  rm -r "${pkgdir}${_prefix}/include" "${pkgdir}${_prefix}/lib/pkgconfig"
+
+  install -Dm644 10-m3-asahi-zink.conf "${pkgdir}${_prefix}/share/drirc.d/10-m3-asahi-zink.conf"
+  install -Dm755 compute-check "${pkgdir}${_prefix}/bin/compute-check"
+  install -Dm755 gpu-heat "${pkgdir}${_prefix}/bin/gpu-heat"
+  install -Dm755 mesa-m3-probe "${pkgdir}${_prefix}/bin/mesa-m3-probe"
+  install -Dm755 mesa-m3-loadcheck "${pkgdir}${_prefix}/libexec/mesa-m3-loadcheck"
+  install -Dm644 mesa-m3-session-env "${pkgdir}${_prefix}/libexec/mesa-m3-session-env"
+  install -Dm755 mesa-m3-user-setup "${pkgdir}${_prefix}/libexec/mesa-m3-user-setup"
+  install -Dm644 user-setup.list "${pkgdir}${_prefix}/share/mesa-m3/user-setup.list"
+  # The boards whose 25G83 sessions the hook admits; installers and stack
+  # assembly require j615-experimental before they offer the J615 the profile.
+  grep -Fq 'asahi,j615-25g83-experimental' mesa-m3-session-env
+  printf 'j613\nj615-experimental\n' > "${pkgdir}${_prefix}/share/mesa-m3/native25-boards"
+  install -Dm644 50-mesa-m3 "${pkgdir}/usr/share/uwsm/env.d/50-mesa-m3"
+  install -Dm644 72-mesa-m3-render-node.rules "${pkgdir}/usr/lib/udev/rules.d/72-mesa-m3-render-node.rules"
+  install -Dm755 mesa-m3-session-confirm "${pkgdir}${_prefix}/libexec/mesa-m3-session-confirm"
+  install -Dm755 mesa-m3-wlcheck "${pkgdir}${_prefix}/libexec/mesa-m3-wlcheck"
+  install -Dm644 mesa-m3-session-confirm.service "${pkgdir}/usr/lib/systemd/user/mesa-m3-session-confirm.service"
+  install -d "${pkgdir}/usr/lib/systemd/user/graphical-session.target.wants"
+  ln -s ../mesa-m3-session-confirm.service \
+    "${pkgdir}/usr/lib/systemd/user/graphical-session.target.wants/mesa-m3-session-confirm.service"
+
+  for file in libexec/mesa-m3-user-setup libexec/mesa-m3-session-confirm libexec/mesa-m3-wlcheck share/mesa-m3/user-setup.list; do
+    install -Dm644 "${pkgdir}${_prefix}/$file" "${pkgdir}${_native_prefix}/$file"
+    case "$file" in libexec/*) chmod 755 "${pkgdir}${_native_prefix}/$file" ;; esac
+  done
+  echo "${pkgver}-${pkgrel}" > "${pkgdir}${_native_prefix}/share/mesa-m3/package-version"
+  find "${pkgdir}${_native_prefix}/lib" -type f -name '*.so*' -exec readelf -d {} + 2>/dev/null | \
+    sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' | sort -u | while read -r so; do
+      [ -e "${pkgdir}${_native_prefix}/lib/$so" ] || echo "$so"
+    done > "${pkgdir}${_native_prefix}/share/mesa-m3/needed-sonames"
+
+  # Licences: Mesa's statement and texts, and the notices of the compiled files. The
+  # libraries still carry debug info here (makepkg strips after this function).
+  local lic="${pkgdir}/usr/share/licenses/${pkgname}"
+  install -Dm644 "${_src}/docs/license.rst" "${lic}/license.rst"
+  cp -r "${_src}/licenses" "${lic}/licenses"
+  chmod -R u=rwX,go=rX "${lic}/licenses"
+  python3 notices-gen.py "${_src}" build "${lic}/NOTICES" "${pkgname}" "${_prefix}" \
+    gpu-heat,compute-check,mesa-m3-probe,mesa-m3-loadcheck,mesa-m3-wlcheck \
+    $(find "${pkgdir}${_prefix}/lib" -name '*.so*' -type f)
+  python3 notices-gen.py "${_native_src}" build-native "${lic}/NOTICES-native" "${pkgname}" "${_native_prefix}" \
+    mesa-m3-native-probe,mesa-m3-native-loadcheck \
+    $(find "${pkgdir}${_native_prefix}/lib" -name '*.so*' -type f)
+  ! grep -q '(file not found)' "${lic}/NOTICES" || { echo "NOTICES misses files"; return 1; }
+
+  # Nothing in the package may need a versioned LLVM or a build directory at run time.
+  local elfs
+  elfs=$(find "${pkgdir}${_prefix}" -type f -exec sh -c 'head -c4 "$1" | grep -q ELF' sh {} \; -print)
+  if printf '%s\n' "$elfs" | xargs readelf -d 2>/dev/null | grep -E 'NEEDED.*lib(LLVM|clang)'; then
+    echo "a binary links LLVM or clang"; return 1
+  fi
+  if printf '%s\n' "$elfs" | xargs readelf -d 2>/dev/null | grep -E '\((RPATH|RUNPATH)\)'; then
+    echo "a binary carries an RPATH or RUNPATH"; return 1
+  fi
+  # No build-directory path in any shipped data file (the libraries still
+  # carry debug info here; they are checked after stripping, outside the build).
+  local bad
+  bad=$(find "${pkgdir}" -type f -exec sh -c 'head -c4 "$1" | grep -q ELF || grep -l -a -F "$2" "$1"' sh {} "${srcdir%/src}" \;)
+  [ -z "$bad" ] || { echo "a shipped file names the build directory: $bad"; return 1; }
+
+  # What the login check reads: the package version, and every library the
+  # prefix's own objects need from the system.
+  local meta="${pkgdir}${_prefix}/share/mesa-m3"
+  install -d "$meta"
+  echo "${pkgver}-${pkgrel}" > "$meta/package-version"
+  {
+    echo "# Libraries ${_prefix}/lib needs from the system (DT_NEEDED), one per line."
+    find "${pkgdir}${_prefix}/lib" -type f -name '*.so*' -exec readelf -d {} + 2>/dev/null |
+      sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p' | sort -u | while read -r so; do
+        [ -e "${pkgdir}${_prefix}/lib/$so" ] || echo "$so"
+      done
+    echo "libvulkan.so.1"  # loaded by zink with dlopen
+  } | awk '!seen[$0]++' > "$meta/needed-sonames"
+  echo "needed-sonames:"; sed 's/^/  /' "$meta/needed-sonames"
+
+  # The dependencies, derived from every shipped ELF file; they must equal depends.
+  local d declared=()
+  for d in "${depends[@]}"; do declared+=(--declared "$d"); done
+  python3 needs-derive.py "${pkgdir}${_prefix}" "${pkgdir}${_prefix}/lib" "$meta/needs.tsv" "$meta/needs" \
+    --libdir-label "${_prefix}/lib" --linked spirv-tools=1:1.4.357.0 --extra "python=interpreter of libexec/mesa-m3-user-setup" \
+    --extra "systemd=journalctl, systemctl and loginctl of the session hook; the user unit" \
+    --extra "util-linux=logger of the session hook" "${declared[@]}"
+  sed 's/^/  /' "$meta/needs.tsv"
+  chmod 644 "$meta"/*
+  echo "NEEDS: $(cat "$meta/needs")"
+
+  # Production queue regression and late loading after static TLS exhaustion.
+  # No graphics API or GPU submission is performed by these checks.
+  grep -aFq 'asahi: native J613 profile requires USC3/HAL200 G15G C0' "${pkgdir}${_native_prefix}/lib/libgallium-26.1.4.so"
+  grep -aFq 'asahi: J613 HAL200 shader requires unsupported scratch storage' "${pkgdir}${_native_prefix}/lib/libgallium-26.1.4.so"
+  echo 'native-profile-artifact-guards=pass'
+  bash build-checks.sh "$_native_src" build-native "${pkgdir}${_native_prefix}"
+
+  # Outside the prefix: only the licences, the uwsm hook, the udev rule and the
+  # user unit with its wants link.
+  local stray
+  stray=$(cd "${pkgdir}" && find . \( -type f -o -type l \) ! -path "./opt/mesa-m3/*" \
+    ! -path "./usr/share/licenses/${pkgname}/*" ! -path ./usr/share/uwsm/env.d/50-mesa-m3 \
+    ! -path ./usr/lib/udev/rules.d/72-mesa-m3-render-node.rules \
+    ! -path ./usr/lib/systemd/user/mesa-m3-session-confirm.service \
+    ! -path ./usr/lib/systemd/user/graphical-session.target.wants/mesa-m3-session-confirm.service)
+  [ -z "${stray}" ] || { echo "files outside the prefix: ${stray}"; return 1; }
+
+}

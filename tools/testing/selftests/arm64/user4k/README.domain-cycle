@@ -1,0 +1,78 @@
+Cgroup allocation-domain pool reuse
+==================================
+
+Build domain-cycle with -pthread. Run in the established4K userspace ABI on a
+native16K kernel. Root-visible pagemap and kpagecgroup are required for the
+controller's density/charge proof. The fixture itself checks every payload byte.
+No memory.high/max limits, reclaim, swap-area or GPU operations are needed.
+
+  userpages 4k ./domain-cycle --native-16k [--tail | --race]
+
+The program prints READY and waits for stdin byte 'c' before allocating payload.
+A controller places only this fresh fixture in owned cgroup A, then acknowledges.
+Each PHASE prints its index/PID/base/leaf count/stride and waits for 'c'. Both
+cgroups must remain alive until all prior ranges have been checked and unmapped.
+
+Default: three1MiB useful guarded allocation phases. Run in A, move to B, move
+back to A between phases. Check all256 written leaves/range (4K every8K), excluding
+the inaccessible guards. The old sticky-domain implementation can allocate16K
+native backing per4K leaf after a move. Packed acceptance is1MiB..1.25MiB native
+PFN union per1MiB phase; the allowance covers bounded shard/partial-owner tails.
+
+--tail:16 independent4K allocations, switching A/B after EVERY leaf. All16VAs are
+selected in the same current16-way allocator shard using its documented hash.
+Eight leaves/domain should occupy at most3native folios: two useful plus one
+possible preexisting partial boundary. This catches a latest-domain-only cache
+that closes old A pools when switching to B, then cannot use A's surviving free
+quarters on return. Preserve every earlier leaf throughout all switches. Useful
+payload64KiB, maximum256KiB private backing, about8MiB virtual reservation.
+
+--race:4workers allocate64guarded leaves each, with bounded test-only2ms pacing
+per leaf. RACE prints four bases and waits for 'c'. After acknowledgement, move
+only this thread group between A/B32times while allocation is active; record
+monotonic move intervals. RACE_DONE prints the allocation interval and waits.
+Require at least one move overlapping that interval before claiming concurrency
+coverage (this does not prove a particular RCU/CAS interleaving occurred). Check
+all race PFNs are charged to A or B, never outside those owned domains. Then move
+the stopped fixture to B and acknowledge: it allocates one additional1MiB guarded
+PHASE. Require packed density after transitions stop, plus unchanged earlier
+race PFNs/charges and all bytes. Worst native payload8MiB, useful2MiB; threads
+have128KiB stacks. No tight density claim applies during arbitrary in-flight moves.
+
+For each held range, read pagemap indexed by target4K VA. A present PFN is in4K
+units; native PFN=PFN>>2. Read /proc/kpagecgroup at native_PFN*8 and compare with
+stat(the intended cgroup).st_ino. Old phases keep their original allocation-time
+charge after process moves. During racing allocations either A/B is valid.
+Re-read PFNs to reject migration during the charge sample. Do not use total
+memory.current as exact payload accounting: it includes code/stacks/page tables.
+Normal8KiB guard stride and --tail4KiB stride are emitted explicitly.
+
+Use an owned fresh uncapped cgroup hierarchy and a bounded controller. If using
+a parent unit and childA/B groups, move the held PID into childA BEFORE enabling
+memory in that owned parent's subtree_control (parent must be empty). Do not
+change unrelated cgroups or global controller settings. Parent15s alarm kills
+all fixture threads; partial thread creation releases waiting workers before
+joining. Controller should independently terminate/reap the owned process/unit
+on protocol error, timeout or failed metadata, and retain the evidence.
+
+--selftest only validates byte patterns and same-shard address selection; it does
+not exercise cgroup moves, kernel pool allocation or RCU. Hardware qualification
+must include bulk/tail/race content and exact-charge/density gates, mm-exit cleanup,
+existing COW/fork/reclaim controls, and dense/concurrent timing. No source or
+parser-only pass closes these runtime/performance requirements.
+
+Race density must count newly added native owners. Before and after sampling
+the final steady range, recheck the original race PFNs and allocation charges.
+Reject old/new physical 4K aliases and inconsistent charges in shared native
+owners. Subtract only those native owners actually observed in both stable
+snapshots. The 80-owner/1,310,720-byte limit applies to the added native PFN
+union for the new 1 MiB payload. Reusing an old owner's free quarters should
+not count its existing live quarters as additional backing. Record total,
+reused and added owners separately, plus combined per-domain quarter masks.
+This is payload accounting, not proof of whole-mm alias closure.
+
+On Neo the corrected controller observed 77 owners in the final range, of
+which 14 were reused and 63 new (1,032,192 added bytes). Old mappings and
+charges stayed unchanged, reused slots were disjoint and all bytes passed.
+The earlier range-only oracle failed at 81 seen owners before its final
+checks; that run remains failed, not retrospectively qualified.

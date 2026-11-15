@@ -1,0 +1,33 @@
+Concurrent hole-refill lifetime test
+===================================
+
+  sudo <userpages4k launcher> ./anon-hole-refill-race
+
+Run with a 4K userspace ABI on the native 16K kernel. CAP_SYS_ADMIN is required
+to distinguish real swap entries from migration and poison markers. The target
+configuration has MAX_SWAPFILES=27; types 27 through 31 are excluded and counted
+separately.
+
+Four workers own disjoint 16K virtual windows in a 16 MiB region. Two phased
+rounds discard and refill individual 4K leaves. Barriers synchronize quarter
+phases, exercising concurrent shared-pool reservations without a userspace data
+race. Every refill checks zeroing and unchanged neighbors. This covers pool
+contention across windows, not simultaneous PTE changes within one window.
+
+After joining workers and verifying the region, the allocating process forks a
+survivor, modifies one native window privately and exits. A supervisor waits
+for that exit before releasing the survivor. The survivor verifies original
+contents, rewrites all leaf tags, and verifies them again. This checks that
+backing survives its original allocating mm and preserves fork isolation.
+
+The survivor then applies MADV_COLD/PAGEOUT only to its own region, at most 20
+times with 10 ms between attempts. At least one real swapped leaf and complete
+byte-exact readback are required for the reclaim result. The reported count
+states coverage; one swapped leaf is not broad reclaim qualification. These
+advice operations can skip nonlinear pooled folios because their mappings are
+not contiguous. Use README.hole-refill-reclaim for broader controlled coverage.
+
+Expect three TAP passes and no skips or unexpected signals. The supervisor has
+a 35-second alarm and children have 30-second alarms. Failure or timeout kills
+the dedicated process group; the supervisor reaps surviving descendants. An
+external runner should also bound the entire fixture cgroup.

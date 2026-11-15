@@ -1,0 +1,1782 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Driver for Audio DMA Controller (ADMAC) on t8103 (M1) and other Apple chips
+ *
+ * Copyright (C) The Asahi Linux Contributors
+ */
+
+#include <linux/bits.h>
+#include <linux/bitfield.h>
+#include <linux/dma-mapping.h>
+#include <linux/device.h>
+#include <linux/init.h>
+#include <linux/iopoll.h>
+#include <linux/module.h>
+#include <linux/of.h>
+#include <linux/of_address.h>
+#include <linux/of_dma.h>
+#include <linux/overflow.h>
+#include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
+#include <linux/reset.h>
+#include <linux/soc/apple/tunable.h>
+#include <linux/spinlock.h>
+#include <linux/suspend.h>
+#include <linux/interrupt.h>
+
+#include "dmaengine.h"
+
+#define NCHANNELS_MAX	64
+#define IRQ_NOUTPUTS	4
+
+/*
+ * For allocation purposes we split the cache
+ * memory into blocks of fixed size (given in bytes).
+ */
+#define SRAM_BLOCK	2048
+
+#define RING_WRITE_SLOT		GENMASK(1, 0)
+#define RING_READ_SLOT		GENMASK(5, 4)
+#define RING_FULL		BIT(9)
+#define RING_EMPTY		BIT(8)
+#define RING_ERR		BIT(10)
+
+#define STATUS_DESC_DONE	BIT(0)
+#define STATUS_ERR		BIT(6)
+
+#define FLAG_DESC_NOTIFY	BIT(16)
+
+#define T603X_UNK_28_VAL	0x200000
+
+/* T8132's channel setup, which the T6050 display ADMAC takes as well */
+#define T8132_CTL_VAL		0x18080001
+#define T8132_CHAN_CONFIG_VAL	0x29b0000
+#define T8132_CHAN_BURST_VAL	0x302
+
+/*
+ * One bit per channel: a write to START sets the channel's enable bit, a write
+ * to STOP clears it, and START reads back the channels that are enabled.
+ */
+#define REG_TX_START		0x0000
+#define REG_TX_STOP		0x0004
+#define REG_RX_START		0x0008
+#define REG_RX_STOP		0x000c
+#define REG_CTL			0x0010
+#define REG_UNK_28		0x0028
+#define REG_UNK_2C		0x002c
+#define REG_IMPRINT		0x0090
+#define REG_TX_SRAM_SIZE	0x0094
+#define REG_RX_SRAM_SIZE	0x0098
+
+/*
+ * Per-channel control blocks.  Up to t8122 every channel (TX and RX
+ * interleaved as raw channel numbers) has a block at 0x8000 + ch * 0x200.
+ * The t8140 "evolved" ADMAC keeps the TX blocks at 0x8000 + tx * 0x200 and
+ * moves the RX blocks to 0xc000 + rx * 0x200 (measured on J700: the
+ * headphone channel base-ns TX2 answers at +0x8400, not +0x8800).  The
+ * descriptor/report FIFO ports and the start/stop bits are unchanged.
+ */
+#define REG_CHAN_BASE_LEGACY(ch)	(0x8000 + (ch) * 0x200)
+#define REG_CHAN_BASE_EVOLVED(ch)	(((ch) & 1 ? 0xc000 : 0x8000) + ((ch) / 2) * 0x200)
+#define REG_CHAN_BASE(ad, ch)		((ad)->evolved_layout ? \
+					 REG_CHAN_BASE_EVOLVED(ch) : REG_CHAN_BASE_LEGACY(ch))
+
+#define REG_CHAN_CTL(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0x00)
+#define REG_CHAN_CTL_RST_RINGS	BIT(0)
+#define REG_CHAN_CONFIG(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0x04)
+#define REG_CHAN_BURST(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0x30)
+
+#define REG_DESC_RING(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0x70)
+#define REG_REPORT_RING(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0x74)
+
+#define REG_RESIDUE(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0x64)
+
+#define REG_BUS_WIDTH(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0x40)
+
+#define BUS_WIDTH_WORD_SIZE	GENMASK(3, 0)
+#define BUS_WIDTH_FRAME_SIZE	GENMASK(7, 4)
+#define BUS_WIDTH_8BIT		0x00
+#define BUS_WIDTH_16BIT		0x01
+#define BUS_WIDTH_32BIT		0x02
+#define BUS_WIDTH_FRAME_2_WORDS	0x10
+#define BUS_WIDTH_FRAME_4_WORDS	0x20
+
+#define REG_CHAN_SRAM_CARVEOUT(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0x50)
+#define CHAN_SRAM_CARVEOUT_SIZE		GENMASK(31, 16)
+#define CHAN_SRAM_CARVEOUT_BASE		GENMASK(15, 0)
+
+#define REG_CHAN_FIFOCTL(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0x54)
+#define CHAN_FIFOCTL_LIMIT	GENMASK(31, 16)
+#define CHAN_FIFOCTL_THRESHOLD	GENMASK(15, 0)
+
+#define REG_DESC_WRITE(ch)	(0x10000 + ((ch) / 2) * 0x4 + ((ch) & 1) * 0x4000)
+#define REG_REPORT_READ(ch)	(0x10100 + ((ch) / 2) * 0x4 + ((ch) & 1) * 0x4000)
+
+#define REG_TX_INTSTATE(idx)		(0x0030 + (idx) * 4)
+#define REG_RX_INTSTATE(idx)		(0x0040 + (idx) * 4)
+#define REG_GLOBAL_INTSTATE(idx)	(0x0050 + (idx) * 4)
+#define REG_CHAN_INTSTATUS(ad, ch, idx)	(REG_CHAN_BASE(ad, ch) + 0x10 + (idx) * 4)
+#define REG_CHAN_INTMASK(ad, ch, idx)	(REG_CHAN_BASE(ad, ch) + 0x20 + (idx) * 4)
+
+#define REG_CHAN_ENABLE(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0xa0)
+#define CHAN_ENABLE_MEMORY	BIT(0)
+#define CHAN_ENABLE_PERIPHERAL	BIT(1)
+
+/*
+ * The T6050 display ADMACs, one per display engine (ADT "self-actuated"),
+ * which feed the engine's DisplayPort audio. As macOS 27 drives dispext0's
+ * on the M5 Pro: a report is two words at 0x10200, with the report ring's
+ * slots (eight of them) at +0xb0 of the channel; a descriptor asks for its
+ * report with flags 0xc0000 and a sequence number of 1 to 255; a report
+ * raises status bit 12, and the other bits macOS unmasks are errors, bit 10
+ * only once the first report has come. The channel takes a fixed 4 KiB
+ * carveout and FIFO limit, and the controller's LLT escalation detector
+ * (its control block) is set up with the ADT's tunables.
+ */
+#define REG_UNK_60			0x0060
+#define REG_UNK_104			0x0104
+#define REG_CHAN_UNK_34(ad, ch)		(REG_CHAN_BASE(ad, ch) + 0x34)
+#define REG_CHAN_UNK_A4(ad, ch)		(REG_CHAN_BASE(ad, ch) + 0xa4)
+#define REG_DISPLAY_REPORT_RING(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0xb0)
+#define DISPLAY_RING_WRITE_SLOT		GENMASK(2, 0)
+#define DISPLAY_RING_READ_SLOT		GENMASK(6, 4)
+#define DISPLAY_RING_SLOTS		8
+#define REG_DISPLAY_REPORT_READ(ch)	(0x10200 + ((ch) / 2) * 0x4 + ((ch) & 1) * 0x4000)
+#define DISPLAY_FLAG_DESC_REPORT	0xc0000
+#define DISPLAY_STATUS_REPORT		BIT(12)
+#define DISPLAY_STATUS_ERR		(BIT(1) | BIT(5) | BIT(6) | BIT(16))
+#define DISPLAY_STATUS_RUNNING_ERR	BIT(10)
+#define DISPLAY_CARVEOUT		(FIELD_PREP(CHAN_SRAM_CARVEOUT_BASE, 0) | \
+					 FIELD_PREP(CHAN_SRAM_CARVEOUT_SIZE, 0x1000))
+#define DISPLAY_FIFOCTL			(FIELD_PREP(CHAN_FIFOCTL_LIMIT, 0x1000) | \
+					 FIELD_PREP(CHAN_FIFOCTL_THRESHOLD, 0x800))
+/* The control block's second window: written after its tunables */
+#define DISPLAY_SSW_UNK_8		0x8
+
+struct admac_data;
+struct admac_tx;
+
+struct admac_chan {
+	unsigned int no;
+	struct admac_data *host;
+	struct dma_chan chan;
+	struct tasklet_struct tasklet;
+
+	u32 carveout;
+
+	spinlock_t lock;
+	struct admac_tx *current_tx;
+	int nperiod_acks;
+	/* frame size a paused capture restarts aligned to on resume, or 0 */
+	u32 realign_bytes;
+
+	/*
+	 * We maintain a 'submitted' and 'issued' list mainly for interface
+	 * correctness. Typical use of the driver (per channel) will be
+	 * prepping, submitting and issuing a single cyclic transaction which
+	 * will stay current until terminate_all is called.
+	 */
+	struct list_head submitted;
+	struct list_head issued;
+
+	struct list_head to_free;
+
+	/* The client's last configuration, set up again after a system sleep. */
+	struct dma_slave_config cfg;
+	bool cfg_valid;
+	/* A system sleep took the channel's registers; set it up before a transfer. */
+	bool lost;
+
+	/* Display ADMAC: the last descriptor's sequence number, the first report seen */
+	u8 seq;
+	bool reported;
+};
+
+struct admac_sram {
+	u32 size;
+	/*
+	 * SRAM_CARVEOUT has 16-bit fields, so the SRAM cannot be larger than
+	 * 64K and a 32-bit bitfield over 2K blocks covers it.
+	 */
+	u32 allocated;
+};
+
+struct admac_data {
+	struct dma_device dma;
+	struct device *dev;
+	__iomem void *base;
+	struct reset_control *rstc;
+
+	struct mutex cache_alloc_lock;
+	struct admac_sram txcache, rxcache;
+
+	bool set_unk28;
+	bool evolved_layout;
+	bool split_channels;
+	bool display;
+	bool ctl_programmed;
+	/* Display ADMAC: its control block's two windows and their tunables */
+	void __iomem *control[2];
+	struct apple_tunable *control_tunables[2];
+	int irq;
+	int irq_index;
+	int nchannels;
+	struct admac_chan channels[] __counted_by(nchannels);
+};
+
+struct admac_tx {
+	struct dma_async_tx_descriptor tx;
+	bool cyclic;
+	bool error;
+	unsigned int nperiods_outstanding;
+	dma_addr_t buf_addr;
+	dma_addr_t buf_end;
+	size_t buf_len;
+	size_t period_len;
+
+	size_t submitted_pos;
+	size_t reclaimed_pos;
+	/* The last position tx_status reported, in [0, 2 * buf_len) */
+	size_t reported_pos;
+
+	struct list_head node;
+};
+
+struct admac_hw {
+	bool set_unk28;
+	bool evolved_layout;
+	bool split_channels;
+	bool display;
+};
+
+static int admac_alloc_sram_carveout(struct admac_data *ad,
+				     enum dma_transfer_direction dir,
+				     u32 *out)
+{
+	struct admac_sram *sram;
+	int i, ret = 0, nblocks;
+	ad->txcache.size = readl_relaxed(ad->base + REG_TX_SRAM_SIZE);
+	ad->rxcache.size = readl_relaxed(ad->base + REG_RX_SRAM_SIZE);
+	/* T8132 reports channel metadata in the upper half of these words. */
+	if (ad->split_channels) {
+		ad->txcache.size &= GENMASK(15, 0);
+		ad->rxcache.size &= GENMASK(15, 0);
+	}
+
+	if (dir == DMA_MEM_TO_DEV)
+		sram = &ad->txcache;
+	else
+		sram = &ad->rxcache;
+
+	mutex_lock(&ad->cache_alloc_lock);
+
+	nblocks = sram->size / SRAM_BLOCK;
+	for (i = ad->split_channels ? 1 : 0; i < nblocks; i++)
+		if (!(sram->allocated & BIT(i)))
+			break;
+
+	if (i < nblocks) {
+		*out = FIELD_PREP(CHAN_SRAM_CARVEOUT_BASE, i * SRAM_BLOCK) |
+			FIELD_PREP(CHAN_SRAM_CARVEOUT_SIZE, SRAM_BLOCK);
+		sram->allocated |= BIT(i);
+	} else {
+		ret = -EBUSY;
+	}
+
+	mutex_unlock(&ad->cache_alloc_lock);
+
+	return ret;
+}
+
+static void admac_free_sram_carveout(struct admac_data *ad,
+				     enum dma_transfer_direction dir,
+				     u32 carveout)
+{
+	struct admac_sram *sram;
+	u32 base = FIELD_GET(CHAN_SRAM_CARVEOUT_BASE, carveout);
+	int i;
+
+	if (dir == DMA_MEM_TO_DEV)
+		sram = &ad->txcache;
+	else
+		sram = &ad->rxcache;
+
+	if (WARN_ON(base >= sram->size))
+		return;
+
+	mutex_lock(&ad->cache_alloc_lock);
+	i = base / SRAM_BLOCK;
+	sram->allocated &= ~BIT(i);
+	mutex_unlock(&ad->cache_alloc_lock);
+}
+
+static void admac_modify(struct admac_data *ad, int reg, u32 mask, u32 val)
+{
+	void __iomem *addr = ad->base + reg;
+	u32 curr = readl_relaxed(addr);
+
+	writel_relaxed((curr & ~mask) | (val & mask), addr);
+}
+
+static struct admac_chan *to_admac_chan(struct dma_chan *chan)
+{
+	return container_of(chan, struct admac_chan, chan);
+}
+
+static struct admac_tx *to_admac_tx(struct dma_async_tx_descriptor *tx)
+{
+	return container_of(tx, struct admac_tx, tx);
+}
+
+static enum dma_transfer_direction admac_chan_direction(int channo)
+{
+	/* Channel directions are hardwired */
+	return (channo & 1) ? DMA_DEV_TO_MEM : DMA_MEM_TO_DEV;
+}
+
+static dma_cookie_t admac_tx_submit(struct dma_async_tx_descriptor *tx)
+{
+	struct admac_tx *adtx = to_admac_tx(tx);
+	struct admac_chan *adchan = to_admac_chan(tx->chan);
+	unsigned long flags;
+	dma_cookie_t cookie;
+
+	spin_lock_irqsave(&adchan->lock, flags);
+	cookie = dma_cookie_assign(tx);
+	list_add_tail(&adtx->node, &adchan->submitted);
+	spin_unlock_irqrestore(&adchan->lock, flags);
+
+	return cookie;
+}
+
+static int admac_desc_free(struct dma_async_tx_descriptor *tx)
+{
+	kfree(to_admac_tx(tx));
+
+	return 0;
+}
+
+static struct dma_async_tx_descriptor *admac_prep_dma_cyclic(
+		struct dma_chan *chan, dma_addr_t buf_addr, size_t buf_len,
+		size_t period_len, enum dma_transfer_direction direction,
+		unsigned long flags)
+{
+	struct admac_chan *adchan = container_of(chan, struct admac_chan, chan);
+	struct admac_tx *adtx;
+	dma_addr_t buf_end;
+
+	if (direction != admac_chan_direction(adchan->no))
+		return NULL;
+
+	/* Reports advance whole periods, and residue is a u32. */
+	if (!buf_len || !period_len || period_len > buf_len ||
+	    buf_len % period_len || buf_len > U32_MAX ||
+	    check_add_overflow(buf_addr, (dma_addr_t)buf_len, &buf_end))
+		return NULL;
+
+	adtx = kzalloc_obj(*adtx, GFP_NOWAIT);
+	if (!adtx)
+		return NULL;
+
+	adtx->cyclic = true;
+
+	adtx->buf_addr = buf_addr;
+	adtx->buf_len = buf_len;
+	adtx->buf_end = buf_end;
+	adtx->period_len = period_len;
+
+	adtx->submitted_pos = 0;
+	adtx->reclaimed_pos = 0;
+	adtx->reported_pos = 0;
+
+	dma_async_tx_descriptor_init(&adtx->tx, chan);
+	adtx->tx.tx_submit = admac_tx_submit;
+	adtx->tx.desc_free = admac_desc_free;
+
+	return &adtx->tx;
+}
+
+/*
+ * Write one hardware descriptor.
+ */
+static void admac_write_hw_desc(struct admac_data *ad, int channo,
+				dma_addr_t addr, size_t len)
+{
+	u32 flags = FLAG_DESC_NOTIFY;
+
+	if (ad->display) {
+		struct admac_chan *adchan = &ad->channels[channo];
+
+		adchan->seq = adchan->seq == 0xff ? 1 : adchan->seq + 1;
+		flags = DISPLAY_FLAG_DESC_REPORT | adchan->seq;
+	}
+
+	dev_dbg(ad->dev, "ch%d descriptor: addr=0x%pad len=0x%zx flags=0x%x\n",
+		channo, &addr, len, flags);
+
+	writel_relaxed(lower_32_bits(addr), ad->base + REG_DESC_WRITE(channo));
+	writel_relaxed(upper_32_bits(addr), ad->base + REG_DESC_WRITE(channo));
+	writel_relaxed(len,                 ad->base + REG_DESC_WRITE(channo));
+	writel_relaxed(flags,               ad->base + REG_DESC_WRITE(channo));
+}
+
+/*
+ * Write one hardware descriptor for a dmaengine cyclic transaction.
+ */
+static bool admac_cyclic_write_one_desc(struct admac_data *ad, int channo,
+					struct admac_tx *tx)
+{
+	dma_addr_t addr;
+
+	if (tx->error)
+		return false;
+
+	addr = tx->buf_addr + (tx->submitted_pos % tx->buf_len);
+
+	/* If happens means we have buggy code */
+	WARN_ON_ONCE(addr + tx->period_len > tx->buf_end);
+
+	admac_write_hw_desc(ad, channo, addr, tx->period_len);
+	/* Include a descriptor already consumed while the ring is refilled. */
+	tx->nperiods_outstanding++;
+
+	tx->submitted_pos += tx->period_len;
+	tx->submitted_pos %= 2 * tx->buf_len;
+	return true;
+}
+
+/*
+ * Write all the hardware descriptors for a dmaengine cyclic
+ * transaction there is space for.
+ */
+static bool admac_cyclic_write_desc(struct admac_data *ad, int channo,
+				    struct admac_tx *tx)
+{
+	int i;
+
+	for (i = 0; i < 4; i++) {
+		if (readl_relaxed(ad->base + REG_DESC_RING(ad, channo)) & RING_FULL)
+			break;
+		if (!admac_cyclic_write_one_desc(ad, channo, tx))
+			return false;
+	}
+	return true;
+}
+
+static int admac_ring_noccupied_slots(int ringval)
+{
+	int wrslot = FIELD_GET(RING_WRITE_SLOT, ringval);
+	int rdslot = FIELD_GET(RING_READ_SLOT, ringval);
+
+	if (wrslot != rdslot) {
+		return (wrslot + 4 - rdslot) % 4;
+	} else {
+		WARN_ON((ringval & (RING_FULL | RING_EMPTY)) == 0);
+
+		if (ringval & RING_FULL)
+			return 4;
+		else
+			return 0;
+	}
+}
+
+/* Reads of the report ring and the residue before the position is given up */
+#define ADMAC_RESIDUE_READS	16
+
+/* The report ring and the residue, read twice in that order */
+struct admac_residue_read {
+	u32 ring1, residue1;
+	u32 ring2, residue2;
+	/* The rings are a display ADMAC's (eight report slots at +0xb0) */
+	bool display;
+};
+
+/* The reports in a display ADMAC's report ring */
+static int admac_display_reports(u32 ringval)
+{
+	return (FIELD_GET(DISPLAY_RING_WRITE_SLOT, ringval) + DISPLAY_RING_SLOTS -
+		FIELD_GET(DISPLAY_RING_READ_SLOT, ringval)) % DISPLAY_RING_SLOTS;
+}
+
+static int admac_read_reports(const struct admac_residue_read *r)
+{
+	return r->display ? admac_display_reports(r->ring2) :
+			    admac_ring_noccupied_slots(r->ring2);
+}
+
+/*
+ * The position of a cyclic transaction, in [0, 2 * buf_len), from one
+ * &struct admac_residue_read: the periods reclaimed, those reported since,
+ * and the part of the period in progress. False if the read is not a
+ * consistent snapshot of the controller.
+ *
+ * At the end of a period the controller runs the residue down to 0, posts
+ * the period's report, then loads the next descriptor (its full period as
+ * the residue): seen on the J316s, where a read between the last two put
+ * the playback position a period ahead and the PCM core stopped the
+ * stream for an underrun at a period's end. With the residue at 0 the report may or may not
+ * be in the ring yet: the same read is the end of the period in progress,
+ * or, the report counted, a whole period further on. And a load between
+ * the two residue reads can come with a report posted before the first
+ * ring read or after it. So only a read whose ring did not move and whose
+ * residue is non-zero and did not reload is a position.
+ */
+static bool admac_cyclic_pos(const struct admac_tx *adtx,
+			     const struct admac_residue_read *r, size_t *pos)
+{
+	if (r->ring1 != r->ring2 || !r->residue2 || r->residue2 > r->residue1 ||
+	    r->residue2 > adtx->period_len)
+		return false;
+	*pos = (adtx->reclaimed_pos +
+		adtx->period_len * (admac_read_reports(r) + 1) -
+		r->residue2) % (2 * adtx->buf_len);
+	return true;
+}
+
+/* Position @b is ahead of @a, both in [0, 2 * buf_len), by less than a buffer */
+static bool admac_cyclic_pos_after(const struct admac_tx *adtx, size_t a, size_t b)
+{
+	size_t span = 2 * adtx->buf_len;
+	size_t ahead = (b + span - a) % span;
+
+	return ahead && ahead < adtx->buf_len;
+}
+
+/*
+ * The position for a read that is caught in a period's end (see
+ * admac_cyclic_pos()): never ahead of the transfer, and never behind the
+ * last position reported. The periods reclaimed and reported are done
+ * either way, the report of the one ending perhaps among them.
+ */
+static size_t admac_cyclic_pos_at_period_end(const struct admac_tx *adtx,
+					     const struct admac_residue_read *r)
+{
+	size_t done = (adtx->reclaimed_pos +
+		       adtx->period_len * admac_read_reports(r)) %
+		      (2 * adtx->buf_len);
+
+	return admac_cyclic_pos_after(adtx, adtx->reported_pos, done) ? done :
+								       adtx->reported_pos;
+}
+
+/*
+ * Read from hardware the residue of a cyclic dmaengine transaction.
+ *
+ * The read is repeated while it is caught in a period's end (see
+ * admac_cyclic_pos()), which lasts well under a microsecond. A controller
+ * that stays there, stalled at a period's end with no descriptor to load,
+ * gets admac_cyclic_pos_at_period_end(). The PCM core takes a position a
+ * period ahead of the transfer for an underrun, and one behind the last it
+ * read for a wrap of the whole buffer: both stop the stream.
+ *
+ * Context: adchan->lock held.
+ */
+static u32 admac_cyclic_read_residue(struct admac_data *ad, int channo,
+				     struct admac_tx *adtx)
+{
+	struct admac_residue_read r = { .display = ad->display };
+	void __iomem *ring = ad->base + (ad->display ? REG_DISPLAY_REPORT_RING(ad, channo) :
+						       REG_REPORT_RING(ad, channo));
+	size_t pos;
+	int i;
+
+	for (i = 0; i < ADMAC_RESIDUE_READS; i++) {
+		r.ring1 =    readl_relaxed(ring);
+		r.residue1 = readl_relaxed(ad->base + REG_RESIDUE(ad, channo));
+		r.ring2 =    readl_relaxed(ring);
+		r.residue2 = readl_relaxed(ad->base + REG_RESIDUE(ad, channo));
+
+		if (admac_cyclic_pos(adtx, &r, &pos))
+			break;
+	}
+	if (i == ADMAC_RESIDUE_READS)
+		pos = admac_cyclic_pos_at_period_end(adtx, &r);
+	adtx->reported_pos = pos;
+
+	return adtx->buf_len - pos % adtx->buf_len;
+}
+
+static enum dma_status admac_tx_status(struct dma_chan *chan, dma_cookie_t cookie,
+				       struct dma_tx_state *txstate)
+{
+	struct admac_chan *adchan = to_admac_chan(chan);
+	struct admac_data *ad = adchan->host;
+	struct admac_tx *adtx;
+
+	enum dma_status ret;
+	size_t residue;
+	unsigned long flags;
+
+	ret = dma_cookie_status(chan, cookie, txstate);
+	if (ret == DMA_COMPLETE)
+		return ret;
+
+	spin_lock_irqsave(&adchan->lock, flags);
+	adtx = adchan->current_tx;
+
+	if (!txstate) {
+		if (adtx && adtx->tx.cookie == cookie && adtx->error)
+			ret = DMA_ERROR;
+		spin_unlock_irqrestore(&adchan->lock, flags);
+		return ret;
+	}
+
+	if (adtx && adtx->tx.cookie == cookie) {
+		ret = adtx->error ? DMA_ERROR : DMA_IN_PROGRESS;
+		residue = adtx->error ? adtx->buf_len :
+			admac_cyclic_read_residue(ad, adchan->no, adtx);
+	} else {
+		ret = DMA_IN_PROGRESS;
+		residue = 0;
+		list_for_each_entry(adtx, &adchan->issued, node) {
+			if (adtx->tx.cookie == cookie) {
+				residue = adtx->buf_len;
+				break;
+			}
+		}
+	}
+	spin_unlock_irqrestore(&adchan->lock, flags);
+
+	dma_set_residue(txstate, residue);
+	return ret;
+}
+
+/* Clears a display ADMAC channel's status words, all four of them, as macOS does. */
+static void admac_display_clear_status(struct admac_data *ad, int ch)
+{
+	int i;
+
+	for (i = 0; i < IRQ_NOUTPUTS; i++)
+		writel_relaxed(~0U, ad->base + REG_CHAN_INTSTATUS(ad, ch, i));
+}
+
+static u32 admac_display_intmask(struct admac_chan *adchan)
+{
+	return DISPLAY_STATUS_REPORT | DISPLAY_STATUS_ERR |
+	       (adchan->reported ? DISPLAY_STATUS_RUNNING_ERR : 0);
+}
+
+static void admac_start_chan(struct admac_chan *adchan)
+{
+	struct admac_data *ad = adchan->host;
+	u32 startbit = 1 << (adchan->no / 2);
+
+	if (ad->display) {
+		admac_display_clear_status(ad, adchan->no);
+		writel_relaxed(admac_display_intmask(adchan),
+			       ad->base + REG_CHAN_INTMASK(ad, adchan->no, ad->irq_index));
+	} else {
+		writel_relaxed(STATUS_DESC_DONE | STATUS_ERR,
+			       ad->base + REG_CHAN_INTSTATUS(ad, adchan->no, ad->irq_index));
+		writel_relaxed(STATUS_DESC_DONE | STATUS_ERR,
+			       ad->base + REG_CHAN_INTMASK(ad, adchan->no, ad->irq_index));
+	}
+
+	switch (admac_chan_direction(adchan->no)) {
+	case DMA_MEM_TO_DEV:
+		writel_relaxed(startbit, ad->base + REG_TX_START);
+		break;
+	case DMA_DEV_TO_MEM:
+		writel_relaxed(startbit, ad->base + REG_RX_START);
+		break;
+	default:
+		break;
+	}
+	dev_dbg(adchan->host->dev, "ch%d start\n", adchan->no);
+}
+
+static void admac_stop_chan(struct admac_chan *adchan)
+{
+	struct admac_data *ad = adchan->host;
+	u32 stopbit = 1 << (adchan->no / 2);
+
+	switch (admac_chan_direction(adchan->no)) {
+	case DMA_MEM_TO_DEV:
+		writel_relaxed(stopbit, ad->base + REG_TX_STOP);
+		break;
+	case DMA_DEV_TO_MEM:
+		writel_relaxed(stopbit, ad->base + REG_RX_STOP);
+		break;
+	default:
+		break;
+	}
+	dev_dbg(adchan->host->dev, "ch%d stop\n", adchan->no);
+}
+
+/*
+ * Generous bound for a channel to wind down after its enable bit was cleared:
+ * it only has to finish the burst in flight, a few frames at audio rates.
+ */
+#define ADMAC_STOP_TIMEOUT_US	100000
+
+static void admac_wait_stopped(struct admac_chan *adchan)
+{
+	struct admac_data *ad = adchan->host;
+	u32 bit = BIT(adchan->no / 2);
+	void __iomem *reg;
+	u32 val;
+
+	switch (admac_chan_direction(adchan->no)) {
+	case DMA_MEM_TO_DEV:
+		reg = ad->base + REG_TX_START;
+		break;
+	case DMA_DEV_TO_MEM:
+		reg = ad->base + REG_RX_START;
+		break;
+	default:
+		return;
+	}
+
+	if (readl_poll_timeout(reg, val, !(val & bit), 10, ADMAC_STOP_TIMEOUT_US))
+		dev_warn_ratelimited(ad->dev, "ch%d still enabled %d us after stop\n",
+				     adchan->no, ADMAC_STOP_TIMEOUT_US);
+}
+
+/*
+ * A display ADMAC's rings, as macOS resets them: the control's other bits
+ * kept, the rings' flags cleared, the status cleared, the channel disabled,
+ * and bit 10 out of the mask until the next first report.
+ */
+static void admac_display_reset_rings(struct admac_chan *adchan)
+{
+	struct admac_data *ad = adchan->host;
+	int ch = adchan->no;
+
+	admac_modify(ad, REG_CHAN_CTL(ad, ch), REG_CHAN_CTL_RST_RINGS, REG_CHAN_CTL_RST_RINGS);
+	admac_modify(ad, REG_CHAN_CTL(ad, ch), REG_CHAN_CTL_RST_RINGS, 0);
+	writel_relaxed(RING_EMPTY | RING_ERR, ad->base + REG_DESC_RING(ad, ch));
+	writel_relaxed(RING_EMPTY | RING_ERR, ad->base + REG_REPORT_RING(ad, ch));
+	admac_display_clear_status(ad, ch);
+	writel_relaxed(~0U, ad->base + REG_CHAN_UNK_34(ad, ch));
+	writel_relaxed(0, ad->base + REG_CHAN_ENABLE(ad, ch));
+	adchan->seq = 0;
+	adchan->reported = false;
+	writel_relaxed(admac_display_intmask(adchan),
+		       ad->base + REG_CHAN_INTMASK(ad, ch, ad->irq_index));
+}
+
+static void admac_reset_rings(struct admac_chan *adchan)
+{
+	struct admac_data *ad = adchan->host;
+
+	if (ad->display) {
+		admac_display_reset_rings(adchan);
+		return;
+	}
+	writel_relaxed(REG_CHAN_CTL_RST_RINGS,
+		       ad->base + REG_CHAN_CTL(ad, adchan->no));
+	writel_relaxed(0, ad->base + REG_CHAN_CTL(ad, adchan->no));
+}
+
+static int admac_device_config(struct dma_chan *chan, struct dma_slave_config *config);
+
+/* Registers can't be reached before a client powers the fabric, so this waits for it. */
+static void admac_restore_chan(struct admac_chan *adchan)
+{
+	struct admac_data *ad = adchan->host;
+
+	if (!adchan->lost)
+		return;
+	adchan->lost = false;
+
+	if (ad->split_channels || ad->display)
+		writel_relaxed(T8132_CTL_VAL, ad->base + REG_CTL);
+	writel_relaxed(adchan->carveout, ad->base + REG_CHAN_SRAM_CARVEOUT(ad, adchan->no));
+	if (adchan->cfg_valid)
+		admac_device_config(&adchan->chan, &adchan->cfg);
+}
+
+/*
+ * A display ADMAC channel starts as macOS starts it: stopped and reset, the
+ * controller's and the channel's status cleared and the channel's unmasked,
+ * the channel configured and enabled, its first descriptor, then START,
+ * then the rest.
+ */
+static void admac_display_start_current_tx(struct admac_chan *adchan)
+{
+	struct admac_data *ad = adchan->host;
+	int ch = adchan->no, i;
+
+	admac_stop_chan(adchan);
+	admac_reset_rings(adchan);
+	for (i = 0; i < IRQ_NOUTPUTS; i++)
+		writel_relaxed(~0U, ad->base + REG_GLOBAL_INTSTATE(i));
+	writel_relaxed(~0U, ad->base + REG_UNK_60);
+	writel_relaxed(T8132_CHAN_CONFIG_VAL, ad->base + REG_CHAN_CONFIG(ad, ch));
+	writel_relaxed(CHAN_ENABLE_MEMORY, ad->base + REG_CHAN_ENABLE(ad, ch));
+	writel_relaxed(CHAN_ENABLE_MEMORY | CHAN_ENABLE_PERIPHERAL,
+		       ad->base + REG_CHAN_ENABLE(ad, ch));
+	writel_relaxed(T8132_CHAN_BURST_VAL, ad->base + REG_CHAN_BURST(ad, ch));
+
+	if (!admac_cyclic_write_one_desc(ad, ch, adchan->current_tx))
+		return;
+	writel_relaxed(0, ad->base + REG_CHAN_UNK_A4(ad, ch));
+	admac_start_chan(adchan);
+	if (!admac_cyclic_write_desc(ad, ch, adchan->current_tx))
+		admac_stop_chan(adchan);
+}
+
+static void admac_start_current_tx(struct admac_chan *adchan)
+{
+	struct admac_data *ad = adchan->host;
+	int ch = adchan->no;
+
+	admac_restore_chan(adchan);
+	if (ad->display) {
+		admac_display_start_current_tx(adchan);
+		return;
+	}
+	admac_reset_rings(adchan);
+	writel_relaxed(0, ad->base + REG_CHAN_CTL(ad, ch));
+	if (ad->split_channels) {
+		/* T8132 separates the memory and peripheral sides of a channel. */
+		writel_relaxed(T8132_CHAN_CONFIG_VAL, ad->base + REG_CHAN_CONFIG(ad, ch));
+		writel_relaxed(T8132_CHAN_BURST_VAL, ad->base + REG_CHAN_BURST(ad, ch));
+		writel_relaxed(CHAN_ENABLE_MEMORY | CHAN_ENABLE_PERIPHERAL,
+			       ad->base + REG_CHAN_ENABLE(ad, ch));
+	}
+
+	if (!admac_cyclic_write_one_desc(ad, ch, adchan->current_tx))
+		return;
+	admac_start_chan(adchan);
+	if (!admac_cyclic_write_desc(ad, ch, adchan->current_tx))
+		admac_stop_chan(adchan);
+}
+
+static void admac_issue_pending(struct dma_chan *chan)
+{
+	struct admac_chan *adchan = to_admac_chan(chan);
+	struct admac_tx *tx;
+	unsigned long flags;
+
+	spin_lock_irqsave(&adchan->lock, flags);
+	list_splice_tail_init(&adchan->submitted, &adchan->issued);
+	if (!list_empty(&adchan->issued) && !adchan->current_tx) {
+		tx = list_first_entry(&adchan->issued, struct admac_tx, node);
+		list_del(&tx->node);
+
+		adchan->current_tx = tx;
+		adchan->nperiod_acks = 0;
+		admac_start_current_tx(adchan);
+	}
+	spin_unlock_irqrestore(&adchan->lock, flags);
+}
+
+static int admac_pause(struct dma_chan *chan)
+{
+	struct admac_chan *adchan = to_admac_chan(chan);
+
+	admac_stop_chan(adchan);
+
+	return 0;
+}
+
+static int admac_drain_reports(struct admac_data *ad, int channo);
+
+/*
+ * Restart a paused cyclic capture at the next frame boundary of the current
+ * period. A source that stopped in the middle of a frame (a serializer that
+ * firmware stops whenever it likes) leaves a partial frame in the buffer, and
+ * without this every later frame would be off by its words. Called with the
+ * channel stopped and the lock held.
+ */
+static void admac_cyclic_realign(struct admac_chan *adchan)
+{
+	struct admac_data *ad = adchan->host;
+	struct admac_tx *tx = adchan->current_tx;
+	int ch = adchan->no;
+	size_t done, aligned;
+	int nreports;
+
+	/* Periods completed before the pause */
+	nreports = admac_drain_reports(ad, ch);
+	tx->nperiods_outstanding -= min_t(unsigned int, nreports, tx->nperiods_outstanding);
+	adchan->nperiod_acks += nreports;
+	tx->reclaimed_pos += nreports * tx->period_len;
+	tx->reclaimed_pos %= 2 * tx->buf_len;
+
+	done = tx->period_len -
+		min_t(size_t, readl_relaxed(ad->base + REG_RESIDUE(ad, ch)), tx->period_len);
+	aligned = roundup(done, adchan->realign_bytes);
+	if (aligned >= tx->period_len) {
+		adchan->nperiod_acks++;
+		tx->reclaimed_pos += tx->period_len;
+		tx->reclaimed_pos %= 2 * tx->buf_len;
+		aligned = 0;
+	}
+	if (adchan->nperiod_acks)
+		tasklet_schedule(&adchan->tasklet);
+
+	dev_dbg(ad->dev, "ch%d realign: %zu bytes into the period, restart at %zu\n",
+		ch, done, aligned);
+
+	admac_reset_rings(adchan);
+	writel_relaxed(0, ad->base + REG_CHAN_CTL(ad, ch));
+	/* The reset dropped every descriptor still in the ring. */
+	tx->nperiods_outstanding = 0;
+
+	/* The rest of the current period, then whole periods as before */
+	tx->submitted_pos = tx->reclaimed_pos;
+	admac_write_hw_desc(ad, ch, tx->buf_addr + (tx->submitted_pos % tx->buf_len) + aligned,
+			    tx->period_len - aligned);
+	tx->nperiods_outstanding++;
+	tx->submitted_pos += tx->period_len;
+	tx->submitted_pos %= 2 * tx->buf_len;
+
+	admac_start_chan(adchan);
+	admac_cyclic_write_desc(ad, ch, tx);
+}
+
+/*
+ * Whether a resume restarts the channel aligned (admac_cyclic_realign()): only a
+ * capture whose client gave a frame size, with a transfer to restart. Every
+ * other channel, and every playback one, starts again where it paused.
+ */
+static bool admac_resume_realigns(const struct admac_chan *adchan)
+{
+	return adchan->realign_bytes && adchan->current_tx &&
+	       admac_chan_direction(adchan->no) == DMA_DEV_TO_MEM;
+}
+
+static int admac_resume(struct dma_chan *chan)
+{
+	struct admac_chan *adchan = to_admac_chan(chan);
+	unsigned long flags;
+	int ret = 0;
+
+	spin_lock_irqsave(&adchan->lock, flags);
+	if (adchan->current_tx && adchan->current_tx->error) {
+		ret = -EIO;
+	} else if (adchan->lost && adchan->current_tx) {
+		struct admac_tx *tx = adchan->current_tx;
+
+		/* The rings went with the registers: start again from the last period reclaimed. */
+		tx->submitted_pos = tx->reclaimed_pos;
+		tx->nperiods_outstanding = 0;
+		adchan->nperiod_acks = 0;
+		admac_start_current_tx(adchan);
+	} else if (admac_resume_realigns(adchan)) {
+		admac_cyclic_realign(adchan);
+	} else {
+		admac_start_chan(adchan);
+	}
+	spin_unlock_irqrestore(&adchan->lock, flags);
+
+	return ret;
+}
+
+static int admac_terminate_all(struct dma_chan *chan)
+{
+	struct admac_chan *adchan = to_admac_chan(chan);
+	unsigned long flags;
+
+	spin_lock_irqsave(&adchan->lock, flags);
+	admac_stop_chan(adchan);
+	admac_reset_rings(adchan);
+	/* macOS stops a display ADMAC channel again once it is reset. */
+	if (adchan->host->display)
+		admac_stop_chan(adchan);
+
+	if (adchan->current_tx) {
+		list_add_tail(&adchan->current_tx->node, &adchan->to_free);
+		adchan->current_tx = NULL;
+	}
+	/*
+	 * Descriptors can only be freed after the tasklet
+	 * has been killed (in admac_synchronize).
+	 */
+	list_splice_tail_init(&adchan->submitted, &adchan->to_free);
+	list_splice_tail_init(&adchan->issued, &adchan->to_free);
+	spin_unlock_irqrestore(&adchan->lock, flags);
+
+	return 0;
+}
+
+static void admac_synchronize(struct dma_chan *chan)
+{
+	struct admac_chan *adchan = to_admac_chan(chan);
+	struct admac_tx *adtx, *_adtx;
+	unsigned long flags;
+	LIST_HEAD(head);
+
+	/*
+	 * terminate_all() only requests the stop: make sure the channel no
+	 * longer touches the memory of the terminated descriptors before the
+	 * client is allowed to reuse or free it.
+	 */
+	admac_wait_stopped(adchan);
+
+	spin_lock_irqsave(&adchan->lock, flags);
+	list_splice_tail_init(&adchan->to_free, &head);
+	spin_unlock_irqrestore(&adchan->lock, flags);
+
+	tasklet_kill(&adchan->tasklet);
+
+	list_for_each_entry_safe(adtx, _adtx, &head, node) {
+		list_del(&adtx->node);
+		admac_desc_free(&adtx->tx);
+	}
+}
+
+static int admac_alloc_chan_resources(struct dma_chan *chan)
+{
+	struct admac_chan *adchan = to_admac_chan(chan);
+	struct admac_data *ad = adchan->host;
+	int ret;
+
+	/* Keep MMIO accessible for config, status and the atomic DMA callbacks. */
+	ret = pm_runtime_resume_and_get(ad->dev);
+	if (ret < 0)
+		return ret;
+
+	dma_cookie_init(&adchan->chan);
+
+	/*
+	 * No register access at probe: on the T6040 the controller sits in a
+	 * power domain the AOP firmware manages, and it is only powered once
+	 * the audio driver has set the audio power state, before its first
+	 * channel request. The one-time CTL write is done here, before the
+	 * first carveout access.
+	 */
+	mutex_lock(&ad->cache_alloc_lock);
+	if (!ad->ctl_programmed) {
+		if (ad->split_channels || ad->display)
+			writel_relaxed(T8132_CTL_VAL, ad->base + REG_CTL);
+		ad->ctl_programmed = true;
+	}
+	mutex_unlock(&ad->cache_alloc_lock);
+
+	if (ad->display) {
+		/* One channel, which takes the SRAM's first 4 KiB as macOS has it */
+		adchan->carveout = DISPLAY_CARVEOUT;
+		ret = 0;
+	} else {
+		ret = admac_alloc_sram_carveout(ad, admac_chan_direction(adchan->no),
+						&adchan->carveout);
+	}
+	if (ret < 0) {
+		pm_runtime_put_autosuspend(ad->dev);
+		return ret;
+	}
+
+	writel_relaxed(adchan->carveout,
+		       ad->base + REG_CHAN_SRAM_CARVEOUT(ad, adchan->no));
+	return 0;
+}
+
+static void admac_free_chan_resources(struct dma_chan *chan)
+{
+	struct admac_chan *adchan = to_admac_chan(chan);
+
+	admac_terminate_all(chan);
+	admac_synchronize(chan);
+	if (!adchan->host->display)
+		admac_free_sram_carveout(adchan->host, admac_chan_direction(adchan->no),
+					 adchan->carveout);
+	pm_runtime_put_autosuspend(adchan->host->dev);
+}
+
+static struct dma_chan *admac_dma_of_xlate(struct of_phandle_args *dma_spec,
+					   struct of_dma *ofdma)
+{
+	struct admac_data *ad = (struct admac_data *) ofdma->of_dma_data;
+	unsigned int index;
+
+	if (dma_spec->args_count != 1)
+		return NULL;
+
+	index = dma_spec->args[0];
+
+	if (index >= ad->nchannels) {
+		dev_err(ad->dev, "channel index %u out of bounds\n", index);
+		return NULL;
+	}
+
+	return dma_get_slave_channel(&ad->channels[index].chan);
+}
+
+/* A display ADMAC's reports: two words each, its ring read twice first as macOS does */
+static int admac_display_drain_reports(struct admac_data *ad, int channo)
+{
+	void __iomem *ring = ad->base + REG_DISPLAY_REPORT_RING(ad, channo);
+	int count, nreports;
+
+	readl_relaxed(ring);
+	nreports = admac_display_reports(readl_relaxed(ring));
+	for (count = 0; count < nreports; count++) {
+		u32 stamp, flags;
+
+		stamp = readl_relaxed(ad->base + REG_DISPLAY_REPORT_READ(channo));
+		flags = readl_relaxed(ad->base + REG_DISPLAY_REPORT_READ(channo));
+
+		dev_dbg(ad->dev, "ch%d report: stamp=0x%x flags=0x%x\n", channo, stamp, flags);
+	}
+
+	return count;
+}
+
+static int admac_drain_reports(struct admac_data *ad, int channo)
+{
+	int count;
+
+	if (ad->display)
+		return admac_display_drain_reports(ad, channo);
+
+	for (count = 0; count < 4; count++) {
+		u32 countval_hi, countval_lo, unk1, flags;
+
+		if (readl_relaxed(ad->base + REG_REPORT_RING(ad, channo)) & RING_EMPTY)
+			break;
+
+		countval_lo = readl_relaxed(ad->base + REG_REPORT_READ(channo));
+		countval_hi = readl_relaxed(ad->base + REG_REPORT_READ(channo));
+		unk1 =        readl_relaxed(ad->base + REG_REPORT_READ(channo));
+		flags =       readl_relaxed(ad->base + REG_REPORT_READ(channo));
+
+		dev_dbg(ad->dev, "ch%d report: countval=0x%llx unk1=0x%x flags=0x%x\n",
+			channo, ((u64) countval_hi) << 32 | countval_lo, unk1, flags);
+	}
+
+	return count;
+}
+
+static void admac_handle_status_err(struct admac_data *ad, int channo)
+{
+	struct admac_chan *adchan = &ad->channels[channo];
+	unsigned long flags;
+	bool handled = false;
+
+	spin_lock_irqsave(&adchan->lock, flags);
+	if (adchan->current_tx) {
+		adchan->current_tx->error = true;
+		adchan->nperiod_acks = 0;
+		admac_stop_chan(adchan);
+	}
+
+	if (readl_relaxed(ad->base + REG_DESC_RING(ad, channo)) & RING_ERR) {
+		writel_relaxed(RING_ERR, ad->base + REG_DESC_RING(ad, channo));
+		dev_err_ratelimited(ad->dev, "ch%d descriptor ring error\n", channo);
+		handled = true;
+	}
+
+	if (readl_relaxed(ad->base + REG_REPORT_RING(ad, channo)) & RING_ERR) {
+		writel_relaxed(RING_ERR, ad->base + REG_REPORT_RING(ad, channo));
+		dev_err_ratelimited(ad->dev, "ch%d report ring error\n", channo);
+		handled = true;
+	}
+
+	if (unlikely(!handled)) {
+		dev_err(ad->dev, "ch%d unknown error, masking errors as cause of IRQs\n", channo);
+		admac_modify(ad, REG_CHAN_INTMASK(ad, channo, ad->irq_index),
+			     STATUS_ERR, 0);
+	}
+	spin_unlock_irqrestore(&adchan->lock, flags);
+}
+
+static void admac_handle_status_desc_done(struct admac_data *ad, int channo)
+{
+	struct admac_chan *adchan = &ad->channels[channo];
+	unsigned long flags;
+	int nreports;
+
+	if (!ad->display)
+		writel_relaxed(STATUS_DESC_DONE,
+			       ad->base + REG_CHAN_INTSTATUS(ad, channo, ad->irq_index));
+
+	spin_lock_irqsave(&adchan->lock, flags);
+	nreports = admac_drain_reports(ad, channo);
+	if (ad->display && nreports && !adchan->reported) {
+		adchan->reported = true;
+		admac_modify(ad, REG_CHAN_INTMASK(ad, channo, ad->irq_index),
+			     DISPLAY_STATUS_RUNNING_ERR, DISPLAY_STATUS_RUNNING_ERR);
+	}
+
+	if (adchan->current_tx) {
+		struct admac_tx *tx = adchan->current_tx;
+
+		/* Never turn an unowned report into a period callback. */
+		if (tx->error || (unsigned int)nreports > tx->nperiods_outstanding)
+			goto error;
+
+		tx->nperiods_outstanding -= nreports;
+		adchan->nperiod_acks += nreports;
+		tx->reclaimed_pos += nreports * tx->period_len;
+		tx->reclaimed_pos %= 2 * tx->buf_len;
+
+		if (!admac_cyclic_write_desc(ad, channo, tx))
+			goto error;
+		tasklet_schedule(&adchan->tasklet);
+		goto out;
+error:
+		tx->error = true;
+		adchan->nperiod_acks = 0;
+		admac_stop_chan(adchan);
+		dev_err_ratelimited(ad->dev, "ch%d completion accounting error\n", channo);
+	}
+out:
+	spin_unlock_irqrestore(&adchan->lock, flags);
+}
+
+/*
+ * A display ADMAC's unmasked status bits other than the report's are
+ * errors: the transfer ends there, and they stay masked until the channel
+ * starts again.
+ */
+static void admac_display_handle_err(struct admac_data *ad, int channo, u32 cause)
+{
+	struct admac_chan *adchan = &ad->channels[channo];
+	unsigned long flags;
+
+	spin_lock_irqsave(&adchan->lock, flags);
+	if (adchan->current_tx) {
+		adchan->current_tx->error = true;
+		adchan->nperiod_acks = 0;
+		admac_stop_chan(adchan);
+	}
+	admac_modify(ad, REG_CHAN_INTMASK(ad, channo, ad->irq_index), cause, 0);
+	spin_unlock_irqrestore(&adchan->lock, flags);
+	dev_err_ratelimited(ad->dev, "ch%d error status %#x\n", channo, cause);
+}
+
+static void admac_handle_chan_int(struct admac_data *ad, int no)
+{
+	u32 cause = readl_relaxed(ad->base + REG_CHAN_INTSTATUS(ad, no, ad->irq_index));
+
+	if (ad->display) {
+		cause &= readl_relaxed(ad->base + REG_CHAN_INTMASK(ad, no, ad->irq_index));
+		admac_display_clear_status(ad, no);
+		if (cause & ~DISPLAY_STATUS_REPORT)
+			admac_display_handle_err(ad, no, cause & ~DISPLAY_STATUS_REPORT);
+		if (cause & DISPLAY_STATUS_REPORT)
+			admac_handle_status_desc_done(ad, no);
+		return;
+	}
+
+	if (cause & STATUS_ERR)
+		admac_handle_status_err(ad, no);
+
+	if (cause & STATUS_DESC_DONE)
+		admac_handle_status_desc_done(ad, no);
+}
+
+static irqreturn_t admac_interrupt(int irq, void *devid)
+{
+	struct admac_data *ad = devid;
+	u32 rx_intstate, tx_intstate, global_intstate;
+	int i;
+
+	rx_intstate = readl_relaxed(ad->base + REG_RX_INTSTATE(ad->irq_index));
+	tx_intstate = readl_relaxed(ad->base + REG_TX_INTSTATE(ad->irq_index));
+	global_intstate = readl_relaxed(ad->base + REG_GLOBAL_INTSTATE(ad->irq_index));
+
+	if (!tx_intstate && !rx_intstate && !global_intstate)
+		return IRQ_NONE;
+
+	/* A display ADMAC: both states cleared before the channel's, as macOS does */
+	if (ad->display) {
+		writel_relaxed(~0U, ad->base + REG_GLOBAL_INTSTATE(ad->irq_index));
+		writel_relaxed(~0U, ad->base + REG_TX_INTSTATE(ad->irq_index));
+		global_intstate = 0;
+	}
+
+	for (i = 0; i < ad->nchannels; i += 2) {
+		if (tx_intstate & 1)
+			admac_handle_chan_int(ad, i);
+		tx_intstate >>= 1;
+	}
+
+	for (i = 1; i < ad->nchannels; i += 2) {
+		if (rx_intstate & 1)
+			admac_handle_chan_int(ad, i);
+		rx_intstate >>= 1;
+	}
+
+	/*
+	 * Controller-global event sources are sticky write-one-to-clear
+	 * notifications. They carry no recovery semantics: DMA faults are
+	 * reported per channel through REG_CHAN_INTSTATUS. Acknowledge the
+	 * sources seen in this snapshot so a later one raises a new interrupt.
+	 */
+	if (global_intstate) {
+		dev_dbg_ratelimited(ad->dev, "global event state: %#x\n",
+				    global_intstate);
+		writel_relaxed(global_intstate,
+			       ad->base + REG_GLOBAL_INTSTATE(ad->irq_index));
+	}
+
+	return IRQ_HANDLED;
+}
+
+static void admac_chan_tasklet(struct tasklet_struct *t)
+{
+	struct admac_chan *adchan = from_tasklet(adchan, t, tasklet);
+	struct admac_tx *adtx;
+	struct dmaengine_desc_callback cb;
+	struct dmaengine_result tx_result;
+	int nacks;
+
+	spin_lock_irq(&adchan->lock);
+	adtx = adchan->current_tx;
+	nacks = adchan->nperiod_acks;
+	adchan->nperiod_acks = 0;
+	spin_unlock_irq(&adchan->lock);
+
+	if (!adtx || !nacks)
+		return;
+
+	tx_result.result = DMA_TRANS_NOERROR;
+	tx_result.residue = 0;
+
+	while (nacks--) {
+		spin_lock_irq(&adchan->lock);
+		if (adchan->current_tx != adtx || adtx->error) {
+			spin_unlock_irq(&adchan->lock);
+			break;
+		}
+		dmaengine_desc_get_callback(&adtx->tx, &cb);
+		spin_unlock_irq(&adchan->lock);
+
+		/* The callback may terminate this cyclic transaction. */
+		dmaengine_desc_callback_invoke(&cb, &tx_result);
+	}
+}
+
+/*
+ * The frame size a paused capture is restarted aligned to on resume (see
+ * admac_cyclic_realign()): an optional u32 in bytes in the peripheral config.
+ * A client that passes none, as the MCA's PCM does, gets 0: no realignment.
+ */
+static u32 admac_config_realign_bytes(const struct dma_slave_config *config)
+{
+	if (config->peripheral_config && config->peripheral_size == sizeof(u32))
+		return *(const u32 *)config->peripheral_config;
+	return 0;
+}
+
+/*
+ * A display ADMAC's control block, its LLT escalation detector: the ADT's
+ * tunables for its two windows (the boot loader copies them), then the
+ * second window's word at +0x8, as macOS sets it up for each stream.
+ */
+static void admac_display_control_setup(struct admac_data *ad)
+{
+	if (!ad->control[0] || !ad->control[1])
+		return;
+	apple_tunable_apply(ad->control[0], ad->control_tunables[0]);
+	apple_tunable_apply(ad->control[1], ad->control_tunables[1]);
+	writel_relaxed(~0U, ad->control[1] + DISPLAY_SSW_UNK_8);
+}
+
+/* The control block of a display ADMAC; one without its tunables is left as it is. */
+static int admac_display_probe_control(struct admac_data *ad)
+{
+	static const char * const names[] = { "apple,tunable-ced", "apple,tunable-ssw" };
+	void __iomem *control[ARRAY_SIZE(names)];
+	struct device_node *np;
+	int i, ret = 0;
+
+	np = of_parse_phandle(ad->dev->of_node, "apple,admac-control", 0);
+	if (!np)
+		return 0;
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		if (!of_property_present(np, names[i])) {
+			dev_warn(ad->dev, "%pOF has no %s: left as it is\n", np, names[i]);
+			goto out;
+		}
+	}
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		struct resource res;
+
+		ret = of_address_to_resource(np, i, &res);
+		if (ret)
+			goto out;
+		ad->control_tunables[i] = devm_apple_tunable_parse(ad->dev, np, names[i], &res);
+		if (IS_ERR(ad->control_tunables[i])) {
+			ret = PTR_ERR(ad->control_tunables[i]);
+			goto out;
+		}
+		/* Not requested: the ADT lists views shared with other blocks. */
+		control[i] = devm_ioremap(ad->dev, res.start, resource_size(&res));
+		if (!control[i]) {
+			ret = -ENOMEM;
+			goto out;
+		}
+	}
+	for (i = 0; i < ARRAY_SIZE(names); i++)
+		ad->control[i] = control[i];
+out:
+	of_node_put(np);
+	if (ret)
+		return dev_err_probe(ad->dev, ret, "bad control block\n");
+	return 0;
+}
+
+static int admac_device_config(struct dma_chan *chan,
+			       struct dma_slave_config *config)
+{
+	struct admac_chan *adchan = to_admac_chan(chan);
+	struct admac_data *ad = adchan->host;
+	bool is_tx = admac_chan_direction(adchan->no) == DMA_MEM_TO_DEV;
+	int wordsize = 0;
+	u32 bus_width = readl_relaxed(ad->base + REG_BUS_WIDTH(ad, adchan->no)) &
+		~(BUS_WIDTH_WORD_SIZE | BUS_WIDTH_FRAME_SIZE);
+
+	switch (is_tx ? config->dst_addr_width : config->src_addr_width) {
+	case DMA_SLAVE_BUSWIDTH_1_BYTE:
+		wordsize = 1;
+		bus_width |= BUS_WIDTH_8BIT;
+		break;
+	case DMA_SLAVE_BUSWIDTH_2_BYTES:
+		wordsize = 2;
+		bus_width |= BUS_WIDTH_16BIT;
+		break;
+	case DMA_SLAVE_BUSWIDTH_4_BYTES:
+		wordsize = 4;
+		bus_width |= BUS_WIDTH_32BIT;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	/*
+	 * We take port_window_size to be the number of words in a frame.
+	 *
+	 * The controller has some means of out-of-band signalling, to the peripheral,
+	 * of words position in a frame. That's where the importance of this control
+	 * comes from.
+	 */
+	switch (is_tx ? config->dst_port_window_size : config->src_port_window_size) {
+	case 0 ... 1:
+		break;
+	case 2:
+		bus_width |= BUS_WIDTH_FRAME_2_WORDS;
+		break;
+	case 4:
+		bus_width |= BUS_WIDTH_FRAME_4_WORDS;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	if (ad->set_unk28) {
+		writel_relaxed(T603X_UNK_28_VAL, ad->base + REG_UNK_28);
+		writel_relaxed(T603X_UNK_28_VAL, ad->base + REG_UNK_2C);
+	}
+
+	writel_relaxed(bus_width, ad->base + REG_BUS_WIDTH(ad, adchan->no));
+
+	adchan->realign_bytes = admac_config_realign_bytes(config);
+
+	/*
+	 * By FIFOCTL_LIMIT we seem to set the maximal number of bytes allowed to be
+	 * held in controller's per-channel FIFO. Transfers seem to be triggered
+	 * around the time FIFO occupancy touches FIFOCTL_THRESHOLD.
+	 *
+	 * The numbers we set are more or less arbitrary.
+	 */
+	if (ad->display) {
+		/* macOS's FIFO limit and threshold, then the control block */
+		writel_relaxed(DISPLAY_FIFOCTL, ad->base + REG_CHAN_FIFOCTL(ad, adchan->no));
+		writel_relaxed(1, ad->base + REG_UNK_104);
+		admac_display_control_setup(ad);
+	} else {
+		writel_relaxed(FIELD_PREP(CHAN_FIFOCTL_LIMIT, 0x30 * wordsize)
+			       | FIELD_PREP(CHAN_FIFOCTL_THRESHOLD, 0x18 * wordsize),
+			       ad->base + REG_CHAN_FIFOCTL(ad, adchan->no));
+	}
+
+	adchan->cfg = *config;
+	adchan->cfg_valid = true;
+
+	return 0;
+}
+
+static int admac_runtime_suspend(struct device *dev)
+{
+	struct admac_data *ad = dev_get_drvdata(dev);
+
+	/* No channel resources remain; drain handlers before genpd gates MMIO. */
+	disable_irq(ad->irq);
+	if (dev->pm_domain)
+		ad->ctl_programmed = false;
+
+	return 0;
+}
+
+static int admac_runtime_resume(struct device *dev)
+{
+	struct admac_data *ad = dev_get_drvdata(dev);
+
+	/*
+	 * Defer register restoration to alloc/config, before any transfer. Some
+	 * controllers are powered by firmware only after the audio handshake.
+	 * Restore only the requested channel, never reset the shared fabric.
+	 */
+	enable_irq(ad->irq);
+
+	return 0;
+}
+
+/*
+ * A firmware-driven sleep, refused or not, takes the registers of a channel a
+ * client still holds (genpd gates the domain at noirq), and its client won't
+ * configure it again: only a new hw_params does that.
+ */
+static int __maybe_unused admac_resume_early(struct device *dev)
+{
+	struct admac_data *ad = dev_get_drvdata(dev);
+	unsigned long flags;
+	int i;
+
+	if (!pm_suspend_via_firmware())
+		return 0;
+
+	mutex_lock(&ad->cache_alloc_lock);
+	ad->ctl_programmed = false;
+	mutex_unlock(&ad->cache_alloc_lock);
+
+	for (i = 0; i < ad->nchannels; i++) {
+		spin_lock_irqsave(&ad->channels[i].lock, flags);
+		ad->channels[i].lost = true;
+		spin_unlock_irqrestore(&ad->channels[i].lock, flags);
+	}
+
+	return 0;
+}
+
+/* Allocated channels must stay powered, including paused cyclic transfers. */
+static const struct dev_pm_ops admac_pm_ops = {
+	LATE_SYSTEM_SLEEP_PM_OPS(NULL, admac_resume_early)
+	RUNTIME_PM_OPS(admac_runtime_suspend, admac_runtime_resume, NULL)
+};
+
+static int admac_probe(struct platform_device *pdev)
+{
+	struct device_node *np = pdev->dev.of_node;
+	struct admac_data *ad;
+	struct dma_device *dma;
+	const struct admac_hw *hw;
+	int nchannels;
+	int err, irq, i;
+
+	err = of_property_read_u32(np, "dma-channels", &nchannels);
+	if (err || nchannels > NCHANNELS_MAX) {
+		dev_err(&pdev->dev, "missing or invalid dma-channels property\n");
+		return -EINVAL;
+	}
+	hw = of_device_get_match_data(&pdev->dev);
+	if (!hw)
+		return -EINVAL;
+
+	/*
+	 * Descriptors carry 64-bit addresses; the t8140 dart-aop streams put
+	 * the audio windows above 4 GiB (apple,dma-range), so the default
+	 * 32-bit coherent mask would leave the PCM buffers unallocatable.
+	 */
+	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(42));
+	if (err)
+		return dev_err_probe(&pdev->dev, err, "Failed to set DMA mask\n");
+
+	ad = devm_kzalloc(&pdev->dev, struct_size(ad, channels, nchannels), GFP_KERNEL);
+	if (!ad)
+		return -ENOMEM;
+
+	platform_set_drvdata(pdev, ad);
+	ad->dev = &pdev->dev;
+	ad->nchannels = nchannels;
+	ad->set_unk28 = hw->set_unk28;
+	ad->evolved_layout = hw->evolved_layout;
+	ad->split_channels = hw->split_channels;
+	ad->display = hw->display;
+	mutex_init(&ad->cache_alloc_lock);
+
+	if (ad->display) {
+		err = admac_display_probe_control(ad);
+		if (err)
+			return err;
+	}
+
+	/*
+	 * The controller has 4 IRQ outputs. Try them all until
+	 * we find one we can use.
+	 */
+	for (i = 0; i < IRQ_NOUTPUTS; i++) {
+		irq = platform_get_irq_optional(pdev, i);
+		if (irq >= 0) {
+			ad->irq_index = i;
+			break;
+		}
+	}
+
+	if (irq < 0)
+		return dev_err_probe(&pdev->dev, irq, "no usable interrupt\n");
+	ad->irq = irq;
+
+	ad->base = devm_platform_ioremap_resource(pdev, 0);
+	if (IS_ERR(ad->base))
+		return dev_err_probe(&pdev->dev, PTR_ERR(ad->base),
+				     "unable to obtain MMIO resource\n");
+
+	ad->rstc = devm_reset_control_get_optional_shared(&pdev->dev, NULL);
+	if (IS_ERR(ad->rstc))
+		return PTR_ERR(ad->rstc);
+
+	dma = &ad->dma;
+
+	dma_cap_set(DMA_PRIVATE, dma->cap_mask);
+	dma_cap_set(DMA_CYCLIC, dma->cap_mask);
+
+	dma->dev = &pdev->dev;
+	dma->device_alloc_chan_resources = admac_alloc_chan_resources;
+	dma->device_free_chan_resources = admac_free_chan_resources;
+	dma->device_tx_status = admac_tx_status;
+	dma->device_issue_pending = admac_issue_pending;
+	dma->device_terminate_all = admac_terminate_all;
+	dma->device_synchronize = admac_synchronize;
+	dma->device_prep_dma_cyclic = admac_prep_dma_cyclic;
+	dma->device_config = admac_device_config;
+	dma->device_pause = admac_pause;
+	dma->device_resume = admac_resume;
+
+	dma->directions = BIT(DMA_MEM_TO_DEV) | BIT(DMA_DEV_TO_MEM);
+	dma->residue_granularity = DMA_RESIDUE_GRANULARITY_BURST;
+	dma->src_addr_widths = BIT(DMA_SLAVE_BUSWIDTH_1_BYTE) |
+			BIT(DMA_SLAVE_BUSWIDTH_2_BYTES) |
+			BIT(DMA_SLAVE_BUSWIDTH_4_BYTES);
+	dma->dst_addr_widths = BIT(DMA_SLAVE_BUSWIDTH_1_BYTE) |
+			BIT(DMA_SLAVE_BUSWIDTH_2_BYTES) |
+			BIT(DMA_SLAVE_BUSWIDTH_4_BYTES);
+
+	INIT_LIST_HEAD(&dma->channels);
+	for (i = 0; i < nchannels; i++) {
+		struct admac_chan *adchan = &ad->channels[i];
+
+		adchan->host = ad;
+		adchan->no = i;
+		adchan->chan.device = &ad->dma;
+		spin_lock_init(&adchan->lock);
+		INIT_LIST_HEAD(&adchan->submitted);
+		INIT_LIST_HEAD(&adchan->issued);
+		INIT_LIST_HEAD(&adchan->to_free);
+		list_add_tail(&adchan->chan.device_node, &dma->channels);
+		tasklet_setup(&adchan->tasklet, admac_chan_tasklet);
+	}
+
+	err = reset_control_reset(ad->rstc);
+	if (err)
+		return dev_err_probe(&pdev->dev, err,
+				     "unable to trigger reset\n");
+
+	err = request_irq(irq, admac_interrupt, 0, dev_name(&pdev->dev), ad);
+	if (err) {
+		dev_err_probe(&pdev->dev, err,
+				"unable to register interrupt\n");
+		goto free_reset;
+	}
+
+	pm_runtime_get_noresume(ad->dev);
+	err = pm_runtime_set_active(ad->dev);
+	if (err)
+		goto put_pm;
+	pm_runtime_set_autosuspend_delay(ad->dev, 100);
+	pm_runtime_use_autosuspend(ad->dev);
+	pm_runtime_enable(ad->dev);
+
+	err = dma_async_device_register(&ad->dma);
+	if (err) {
+		dev_err_probe(&pdev->dev, err, "failed to register DMA device\n");
+		goto disable_pm;
+	}
+
+	err = of_dma_controller_register(pdev->dev.of_node, admac_dma_of_xlate, ad);
+	if (err) {
+		dma_async_device_unregister(&ad->dma);
+		dev_err_probe(&pdev->dev, err, "failed to register with OF\n");
+		goto disable_pm;
+	}
+
+	dev_info(&pdev->dev, "Audio DMA Controller\n");
+	pm_runtime_put_autosuspend(ad->dev);
+
+	return 0;
+
+disable_pm:
+	pm_runtime_disable(ad->dev);
+	pm_runtime_dont_use_autosuspend(ad->dev);
+put_pm:
+	pm_runtime_put_noidle(ad->dev);
+	free_irq(ad->irq, ad);
+free_reset:
+	reset_control_rearm(ad->rstc);
+	return err;
+}
+
+static void admac_remove(struct platform_device *pdev)
+{
+	struct admac_data *ad = platform_get_drvdata(pdev);
+
+	of_dma_controller_free(pdev->dev.of_node);
+	dma_async_device_unregister(&ad->dma);
+	pm_runtime_disable(ad->dev);
+	pm_runtime_dont_use_autosuspend(ad->dev);
+	free_irq(ad->irq, ad);
+	reset_control_rearm(ad->rstc);
+}
+
+static const struct admac_hw admac_t8013_hw = {
+	.set_unk28 = false,
+};
+
+static const struct admac_hw admac_t8122_hw = {
+	.set_unk28 = true,
+};
+
+/*
+ * T8132 keeps the TX and RX channel blocks in separate banks, the same
+ * register layout as the T8140 "evolved" one.
+ */
+static const struct admac_hw admac_t8132_hw = {
+	.evolved_layout = true,
+	.split_channels = true,
+};
+
+static const struct admac_hw admac_t8140_hw = {
+	.set_unk28 = true,
+	.evolved_layout = true,
+};
+
+/* The T6050 display ADMACs: T8140's layout, set up as T8132's and macOS's */
+static const struct admac_hw admac_t6050_display_hw = {
+	.evolved_layout = true,
+	.display = true,
+};
+
+static const struct of_device_id admac_of_match[] = {
+	{ .compatible = "apple,t6050-display-admac", .data = &admac_t6050_display_hw },
+	{ .compatible = "apple,t8140-admac", .data = &admac_t8140_hw },
+	{ .compatible = "apple,t8132-admac", .data = &admac_t8132_hw },
+	{ .compatible = "apple,t8122-admac", .data = &admac_t8122_hw },
+	{ .compatible = "apple,t8103-admac", .data = &admac_t8013_hw },
+	{ .compatible = "apple,admac", .data = &admac_t8013_hw },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, admac_of_match);
+
+static struct platform_driver apple_admac_driver = {
+	.driver = {
+		.name = "apple-admac",
+		.of_match_table = admac_of_match,
+		.pm = pm_ptr(&admac_pm_ops),
+	},
+	.probe = admac_probe,
+	.remove = admac_remove,
+};
+module_platform_driver(apple_admac_driver);
+
+#if IS_ENABLED(CONFIG_KUNIT) && !defined(MODULE)
+#include "apple-admac-test.h"
+#endif
+
+MODULE_AUTHOR("Martin Povišer <povik+lin@cutebit.org>");
+MODULE_DESCRIPTION("Driver for Audio DMA Controller (ADMAC) on Apple SoCs");
+MODULE_LICENSE("GPL");

@@ -1,0 +1,317 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/* Copyright 2023 Eileen Yoon <eyn@gmx.com> */
+
+#include <linux/iommu.h>
+#include <linux/vmalloc.h>
+
+#include "isp-iommu.h"
+
+static void isp_surf_free_pages(struct isp_surf *surf)
+{
+	for (u32 i = 0; i < surf->num_pages && surf->pages[i] != NULL; i++) {
+		__free_page(surf->pages[i]);
+	}
+	kvfree(surf->pages);
+}
+
+static int isp_surf_alloc_pages(struct isp_surf *surf)
+{
+	surf->pages = kvmalloc_array(surf->num_pages, sizeof(*surf->pages),
+				     GFP_KERNEL);
+	if (!surf->pages)
+		return -ENOMEM;
+
+	for (u32 i = 0; i < surf->num_pages; i++) {
+		surf->pages[i] = alloc_page(GFP_KERNEL | __GFP_ZERO);
+		if (surf->pages[i] == NULL)
+			goto free_pages;
+	}
+
+	return 0;
+
+free_pages:
+	isp_surf_free_pages(surf);
+	return -ENOMEM;
+}
+
+int isp_surf_vmap(struct apple_isp *isp, struct isp_surf *surf)
+{
+	surf->virt = vmap(surf->pages, surf->num_pages, VM_MAP,
+			  pgprot_writecombine(PAGE_KERNEL));
+	if (surf->virt == NULL) {
+		dev_err(isp->dev, "failed to vmap size 0x%llx\n", surf->size);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static void isp_surf_vunmap(struct apple_isp *isp, struct isp_surf *surf)
+{
+	if (surf->virt)
+		vunmap(surf->virt);
+	surf->virt = NULL;
+}
+
+static void isp_surf_unreserve_iova(struct apple_isp *isp,
+				    struct isp_surf *surf)
+{
+	if (surf->iova_reserved)
+		mtree_erase(&isp->iovas, surf->iova >> isp->shift);
+	surf->iova_reserved = false;
+}
+
+/*
+ * The IOVA range starts at the top of the firmware heap. Hand out the lowest
+ * free range of whole IOMMU pages above it.
+ */
+static int isp_surf_reserve_iova(struct apple_isp *isp, struct isp_surf *surf)
+{
+	unsigned long first = DIV_ROUND_UP_ULL(isp->fw.heap_top, 1ULL << isp->shift);
+	unsigned long last = ((isp->fw.heap_top + isp->iova_size) >> isp->shift) - 1;
+	unsigned long pages = DIV_ROUND_UP_ULL(surf->size, 1ULL << isp->shift);
+	unsigned long index;
+	int err;
+
+	err = mtree_alloc_range(&isp->iovas, &index, surf, pages, first, last,
+				GFP_KERNEL);
+	if (err < 0) {
+		dev_err(isp->dev, "failed to reserve 0x%llx of iova space\n",
+			surf->size);
+		return err;
+	}
+
+	surf->iova = (dma_addr_t)index << isp->shift;
+	surf->iova_reserved = true;
+
+	return 0;
+}
+
+static void isp_surf_iommu_unmap(struct apple_isp *isp, struct isp_surf *surf)
+{
+	iommu_unmap(isp->domain, surf->iova, surf->size);
+	sg_free_table(&surf->sgt);
+}
+
+static int isp_surf_iommu_map(struct apple_isp *isp, struct isp_surf *surf)
+{
+	ssize_t mapped;
+	int err;
+
+	err = sg_alloc_table_from_pages(&surf->sgt, surf->pages,
+					surf->num_pages, 0, surf->size,
+					GFP_KERNEL);
+	if (err < 0) {
+		dev_err(isp->dev, "failed to alloc sgt from pages\n");
+		return err;
+	}
+
+	mapped = iommu_map_sgtable(isp->domain, surf->iova, &surf->sgt,
+				   IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE);
+	if (mapped < 0 || (u64)mapped < surf->size) {
+		dev_err(isp->dev, "failed to iommu_map sgt to iova %pad\n",
+			&surf->iova);
+		if (mapped > 0)
+			iommu_unmap(isp->domain, surf->iova, mapped);
+		sg_free_table(&surf->sgt);
+		return mapped < 0 ? mapped : -ENXIO;
+	}
+
+	return 0;
+}
+
+static void __isp_surf_init(struct apple_isp *isp, struct isp_surf *surf,
+			    u64 size, bool gc)
+{
+	surf->iova_reserved = false;
+	surf->virt = NULL;
+	surf->size = ALIGN(size, 1UL << isp->shift);
+	surf->num_pages = surf->size >> isp->shift;
+	surf->gc = gc;
+}
+
+struct isp_surf *__isp_alloc_surface(struct apple_isp *isp, u64 size, bool gc)
+{
+	struct isp_surf *surf;
+	int err;
+
+	/*
+	 * The firmware chooses the size of the extra heap and of SHAREDMALLOC
+	 * surfaces. Nothing larger than the IOVA range can be mapped, and the
+	 * bound also keeps the page count within 32 bits.
+	 */
+	if (!size || size > isp->iova_size) {
+		dev_err_ratelimited(isp->dev, "invalid surface size 0x%llx\n",
+				    size);
+		return NULL;
+	}
+
+	surf = kzalloc(sizeof(*surf), GFP_KERNEL);
+	if (!surf)
+		return NULL;
+
+	__isp_surf_init(isp, surf, size, gc);
+
+	err = isp_surf_alloc_pages(surf);
+	if (err < 0) {
+		dev_err(isp->dev, "failed to allocate %d pages\n",
+			surf->num_pages);
+		goto free_surf;
+	}
+
+	err = isp_surf_reserve_iova(isp, surf);
+	if (err < 0) {
+		dev_err(isp->dev, "failed to reserve 0x%llx of iova space\n",
+			surf->size);
+		goto free_pages;
+	}
+
+	err = isp_surf_iommu_map(isp, surf);
+	if (err < 0) {
+		dev_err(isp->dev,
+			"failed to iommu_map size 0x%llx to iova %pad\n",
+			surf->size, &surf->iova);
+		goto unreserve_iova;
+	}
+
+	refcount_set(&surf->refcount, 1);
+	if (surf->gc) {
+		mutex_lock(&isp->gc_lock);
+		list_add_tail(&surf->head, &isp->gc);
+		mutex_unlock(&isp->gc_lock);
+	}
+
+	return surf;
+
+unreserve_iova:
+	isp_surf_unreserve_iova(isp, surf);
+free_pages:
+	isp_surf_free_pages(surf);
+free_surf:
+	kfree(surf);
+	return NULL;
+}
+
+struct isp_surf *isp_alloc_surface_vmap(struct apple_isp *isp, u64 size)
+{
+	int err;
+
+	struct isp_surf *surf = __isp_alloc_surface(isp, size, false);
+	if (!surf)
+		return NULL;
+
+	err = isp_surf_vmap(isp, surf);
+	if (err < 0) {
+		dma_addr_t iova_end = surf->iova + surf->size;
+		dev_err(isp->dev, "failed to vmap iova %pad - %pad\n",
+			&surf->iova, &iova_end);
+		isp_free_surface(isp, surf);
+		return NULL;
+	}
+
+	return surf;
+}
+
+/* A surface at a fixed IOVA, outside the range the others come from. */
+struct isp_surf *isp_alloc_surface_at(struct apple_isp *isp, dma_addr_t iova,
+				      u64 size)
+{
+	struct isp_surf *surf;
+
+	surf = kzalloc_obj(*surf);
+	if (!surf)
+		return NULL;
+
+	__isp_surf_init(isp, surf, size, false);
+	surf->iova = iova;
+
+	if (isp_surf_alloc_pages(surf) < 0)
+		goto free_surf;
+
+	if (isp_surf_iommu_map(isp, surf) < 0)
+		goto free_pages;
+
+	refcount_set(&surf->refcount, 1);
+	return surf;
+
+free_pages:
+	isp_surf_free_pages(surf);
+free_surf:
+	kfree(surf);
+	return NULL;
+}
+
+void isp_free_surface(struct apple_isp *isp, struct isp_surf *surf)
+{
+	if (refcount_dec_and_test(&surf->refcount)) {
+		isp_surf_vunmap(isp, surf);
+		isp_surf_iommu_unmap(isp, surf);
+		isp_surf_unreserve_iova(isp, surf);
+		isp_surf_free_pages(surf);
+		if (surf->gc) {
+			mutex_lock(&isp->gc_lock);
+			list_del(&surf->head);
+			mutex_unlock(&isp->gc_lock);
+		}
+		kfree(surf);
+	}
+}
+
+/*
+ * Free the SHAREDMALLOC surfaces the firmware has released. Only call this
+ * once the firmware no longer uses them: after the stream that released them
+ * has stopped, or after the firmware has stopped.
+ */
+void isp_free_released_surfaces(struct apple_isp *isp)
+{
+	struct isp_surf *surf, *tmp;
+	LIST_HEAD(released);
+
+	mutex_lock(&isp->gc_lock);
+	list_splice_init(&isp->gc_released, &released);
+	mutex_unlock(&isp->gc_lock);
+
+	list_for_each_entry_safe(surf, tmp, &released, head) {
+		isp_dbg(isp, "shared surface freed: iova %pad size 0x%llx\n",
+			&surf->iova, surf->size);
+		isp_free_surface(isp, surf);
+	}
+}
+
+int apple_isp_iommu_map_sgt(struct apple_isp *isp, struct isp_surf *surf,
+			    struct sg_table *sgt, u64 size)
+{
+	int err;
+	ssize_t mapped;
+
+	// TODO userptr sends unaligned sizes
+	surf->iova_reserved = false;
+	surf->size = size;
+
+	err = isp_surf_reserve_iova(isp, surf);
+	if (err < 0) {
+		dev_err(isp->dev, "failed to reserve 0x%llx of iova space\n",
+			surf->size);
+		return err;
+	}
+
+	mapped = iommu_map_sgtable(isp->domain, surf->iova, sgt,
+				   IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE);
+	if (mapped < 0 || (u64)mapped < surf->size) {
+		dev_err(isp->dev, "failed to iommu_map sgt to iova %pad\n",
+			&surf->iova);
+		if (mapped > 0)
+			iommu_unmap(isp->domain, surf->iova, mapped);
+		isp_surf_unreserve_iova(isp, surf);
+		return mapped < 0 ? mapped : -ENXIO;
+	}
+	surf->size = mapped;
+
+	return 0;
+}
+
+void apple_isp_iommu_unmap_sgt(struct apple_isp *isp, struct isp_surf *surf)
+{
+	iommu_unmap(isp->domain, surf->iova, surf->size);
+	isp_surf_unreserve_iova(isp, surf);
+}

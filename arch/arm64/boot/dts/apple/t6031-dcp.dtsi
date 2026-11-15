@@ -1,0 +1,117 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * T6031 internal display: the T6030 block at 0x3_8400_0000, from the J516C
+ * ADT. Every node stays disabled until the display gate takes them over
+ * after the boot loader's handoff (apple,t6031-handoff); the gate acts only
+ * on apple,t6031 machines, so they stay disabled on T6034.
+ */
+
+/ {
+	aliases {
+		/* The boot loader finds the display nodes through these. */
+		dcp = &dcp;
+		disp0 = &display;
+		disp0-piodma = &disp0_piodma;
+		disp0_piodma = &disp0_piodma;
+	};
+
+	/* The ADT gives no rate for it: this is the T6030 rate, unconfirmed here. */
+	clk_disp0: clock-disp0 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <712000000>;
+		clock-output-names = "clk_disp0";
+	};
+
+	/* Component master without MMIO, outside the simple-bus. */
+	display: display-subsystem {
+		compatible = "apple,t6031-display-subsystem";
+		iommus = <&disp0_dart 0>;
+		status = "disabled";
+	};
+};
+
+&soc {
+	dcp_mbox: mailbox@386c08000 {
+		compatible = "apple,t6031-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x86c08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1029 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1030 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1031 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1032 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		power-domains = <&ps_disp_fe>;
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	dcp_dart: iommu@38530c000 {
+		compatible = "apple,t6031-dart", "apple,t8110-dart";
+		reg = <0x3 0x8530c000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1008 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		status = "disabled";
+	};
+
+	disp0_dart: iommu@385304000 {
+		compatible = "apple,t6031-dart", "apple,t8110-dart";
+		reg = <0x3 0x85304000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1008 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		status = "disabled";
+	};
+
+	/* DISP_FE, a child of DISP_CPU, keeps all three display states on. */
+	dcp: dcp@386c00000 {
+		compatible = "apple,t6031-dcp";
+		mboxes = <&dcp_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcp_dart 5>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3",
+			    "disp-4", "disp-5", "iop-vbar";
+		reg = <0x3 0x86c00000 0x0 0x4000>,
+		      <0x3 0x84000000 0x0 0x690000>,
+		      <0x3 0x84800000 0x0 0x690000>,
+		      <0x3 0x85320000 0x0 0x4000>,
+		      <0x3 0x85344000 0x0 0x4000>,
+		      <0x3 0x86800000 0x0 0x800000>,
+		      <0x2 0x903d0000 0x0 0x4000>,
+		      <0x3 0x86850000 0x0 0x4000>;
+		power-domains = <&ps_disp_fe>;
+		clocks = <&clk_disp0>;
+		/* The 14.x firmware runs once the PMP acknowledges this request. */
+		apple,pmp-report = <&pmp_report_disp>;
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		status = "disabled";
+
+		disp0_piodma: piodma {
+			iommus = <&disp0_dart 4>;
+		};
+	};
+};
+
+/* Left on by the boot loader; read by the display gate only. */
+&ps_disp_sys {
+	apple,inherited-on;
+};
+
+&ps_disp_fe {
+	apple,inherited-on;
+};
+
+&ps_disp_cpu {
+	apple,inherited-on;
+};
+
+/* The PMP that reports here; started only after a display handoff. */
+&pmp_report {
+	apple,pmp = <&pmp>;
+};

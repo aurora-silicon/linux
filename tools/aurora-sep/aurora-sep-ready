@@ -1,0 +1,266 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# The sensor-present ExecCondition admits interface v4 and v5; both use
+# these diag attributes for readiness and keep the same xART checks.
+#
+# Bring Touch ID up before anyone asks for a fingerprint, and say whether it
+# is ready. The first open of /dev/sep-bio activates it: the driver restores
+# the enrolled fingerprints from the enclave and brings the sensor up before
+# the open returns. Opened here at boot, ahead of fprintd, the restore no
+# longer delays the first fingerprint request.
+#
+# An open that succeeds does not make Touch ID ready: the sensor can still
+# fall short of attaching, and then nothing can be captured. Ready means the
+# driver's diag attributes show the sensor attached and the fingerprints
+# restored, the state in which it logs "Touch ID: restored N". An attach
+# that falls short is tried once more about 10 s later, so this waits for
+# that, for at most AURORA_SEP_READY_WAIT seconds from its start.
+#
+# Restored is not enough to match: a match rewrites xART session records,
+# and the xART guard (apple_sep xart_guard) refuses that where it is known
+# to, for instance once it has refused a write. So, from diag "matching":
+#   usable      ready: no guard runs and xART is writable;
+#   blocked     NOT ready, with the reason and, for the guard, the
+#               documented xart_guard=0 opt-out and what it gives up;
+#   unverified  restored, but whether a match can save its state is not
+#               known (a guard that has refused nothing yet, or a kernel
+#               that does not report it). Not called ready.
+#
+# When the sensor has not attached, this also looks once in this boot's
+# kernel log for the enclave refusing the calibration or the signed root
+# key (LOAD_CALIBRATION or SENSOR_ROOT_KEY refused, or the file missing).
+# It then starts aurora-touchid-setup.service, once per boot, to rebuild
+# the file from this Mac's factory data, and keeps waiting: the driver loads
+# the file again at its retry about 10 s later. A boot whose sensor attached
+# never reads the log.
+#
+# Exits 0 when Touch ID is ready, unverified or not set up on this machine,
+# and 1, with the reason, when it is not ready.
+set -u
+
+dev=${AURORA_SEP_DEV:-/dev/sep-bio}
+devices=${AURORA_SEP_SYSFS:-/sys/bus/platform/devices}
+wait_s=${AURORA_SEP_READY_WAIT:-50}
+
+log() {
+    echo "aurora-sep-ready: $*" >&2
+}
+
+uptime_s() {
+    read -r up _ </proc/uptime
+    echo "${up%%.*}"
+}
+
+start=$(uptime_s)
+
+elapsed() {
+    echo $(($(uptime_s) - start))
+}
+
+diag=
+for path in "$devices"/*.sep/diag; do
+    if [ -r "$path/touchid" ]; then
+        diag=$path
+        break
+    fi
+done
+
+# One diag attribute, or "absent" if this kernel does not have it.
+attr() {
+    value=
+    if [ -n "$diag" ] && [ -r "$diag/$1" ]; then
+        read -r value <"$diag/$1"
+    fi
+    echo "${value:-absent}"
+}
+
+ready() {
+    log "Touch ID is ready after $(elapsed) s: $*"
+    pam_hint
+    exit 0
+}
+
+unverified() {
+    log "Touch ID is restored, matching UNVERIFIED, after $(elapsed) s: $*"
+    pam_hint
+    exit 0
+}
+
+not_ready() {
+    log "Touch ID is NOT ready after $(elapsed) s: $*"
+    exit 1
+}
+
+# Activation failed, or the open did: say why if the driver knows.
+failed() {
+    if [ "$(attr keybag)" = missing ]; then
+        log "Touch ID is not set up: no identity keybag is provisioned"
+        exit 0
+    fi
+    case "$(attr keystore)" in
+    closed) not_ready "$1; the enclave's key store never opened" ;;
+    esac
+    case "$(attr keybag)" in
+    failed) not_ready "$1; the identity keybag did not load" ;;
+    esac
+    not_ready "$1"
+}
+
+# The enclave refused (or the driver could not find) a Touch ID file this
+# boot: start the rebuild, once per boot.
+run_dir=${AURORA_SEP_RUN:-/run/aurora-sep}
+repair_checked=
+repair_started=
+repair_once() {
+    [ -z "$repair_checked" ] || return 0
+    repair_checked=1
+    line=$({ journalctl -k -b -o cat --no-pager 2>/dev/null || dmesg 2>/dev/null; } |
+        grep -m1 -E 'sensor: ((LOAD_CALIBRATION|SENSOR_ROOT_KEY) refused|calibration refused|calibration blob [^ ]+ could not be loaded|signed root-key container [^ ]+ unavailable)')
+    [ -n "$line" ] || return 0
+    if [ -e "$run_dir/touchid-auto-rebuild" ]; then
+        log "the enclave refused a Touch ID file again ($line); the automatic rebuild already ran this boot, so not again. Run 'sudo aurora-touchid-setup --check' for details"
+        return 0
+    fi
+    mkdir -p "$run_dir" && printf '%s\n' "$line" >"$run_dir/calibration-refused" || return 0
+    log "the enclave refused a Touch ID file ($line); starting aurora-touchid-setup.service to rebuild it from this Mac's factory data"
+    systemctl start --no-block aurora-touchid-setup.service && repair_started=1
+}
+
+sensor_down() {
+    repair_once
+    if [ -n "$repair_started" ]; then
+        not_ready "sensor attach incomplete; capture unavailable ($1, sensor $(attr sensor)). A rebuild of the Touch ID file was started after the enclave refused it; the driver loads the new file at the next enrolment or verify, or reboot"
+    fi
+    not_ready "sensor attach incomplete; capture unavailable ($1, sensor $(attr sensor))"
+}
+
+# Why a match's xART write is refused, from the diag attributes.
+blocked_reason() {
+    optout="To match anyway, set 'options apple_sep xart_guard=0' in /etc/modprobe.d/ and reboot; the enclave may then rewrite session records another OS on this Mac (macOS) created, see XART-SAFETY.md"
+    refusals=$(attr xart_guard_refusals)
+    if [ "$(attr xart)" = disabled ]; then
+        echo "xART writes are disabled (xart_writes=0, or the gigalocker did not validate for writing), and a match must save state there"
+    elif [ "$refusals" != absent ] && [ "$refusals" != 0 ]; then
+        echo "the xART guard (level $(attr xart_guard)) refused $refusals write(s) of records this Linux install did not create. $optout"
+    elif [ "$(attr xart_guard_list)" = unavailable ]; then
+        echo "the xART guard could not load its list of Linux's records, so it refuses every session write. $optout"
+    else
+        echo "the xART guard refuses a match's write. $optout"
+    fi
+}
+
+# The sensor is attached and the fingerprints restored (or none enrolled):
+# ready only if the driver says a match can save its state.
+restored() {
+    case "$(attr matching)" in
+    usable) ready "$1; matching is usable" ;;
+    unverified)
+        unverified "$1; the xART guard (level $(attr xart_guard)) has refused nothing yet, but whether it allows every record a match rewrites is untested on this Mac. If a verify fails with an \"xART guard: refused\" kernel message, see XART-SAFETY.md"
+        ;;
+    blocked) not_ready "$1, but matching is blocked: $(blocked_reason)" ;;
+    *) unverified "$1; this kernel does not report whether the xART guard allows matching" ;;
+    esac
+}
+
+# fprintd answers only what PAM asks it. Where authselect manages PAM (Fedora),
+# fingerprints stay unused until its with-fingerprint feature is on; that is
+# the user's choice, so by default only say how to make it.
+#
+# A distribution whose GNOME settings then hide and lock Fingerprint Login
+# sets AURORA_SEP_OFFER_FINGERPRINT=1 (a drop-in for aurora-sep-ready.service).
+# On a Mac with a sensor this then turns the feature on once, so that the
+# option is there: the lock screens, sudo and polkit take a finger (a vendor
+# profile can keep it from the console login and su). Whether to enrol and use
+# a finger stays the user's choice. The marker records that this was done, so
+# a later "authselect disable-feature with-fingerprint" is never undone.
+pam_hint() {
+    command -v authselect >/dev/null 2>&1 || return 0
+    features=$(authselect current --raw 2>/dev/null) || return 0
+    marker=${AURORA_SEP_STATE_DIR:-/var/lib/aurora-sep}/fingerprint-sign-in-offered
+    case " $features " in
+    *" with-fingerprint "*)
+        [ "${AURORA_SEP_OFFER_FINGERPRINT:-0}" != 1 ] || [ -e "$marker" ] ||
+            printf "" >"$marker" 2>/dev/null || :
+        return 0
+        ;;
+    esac
+    if [ "${AURORA_SEP_OFFER_FINGERPRINT:-0}" != 1 ]; then
+        log "PAM does not use fingerprints; for Touch ID at sudo, polkit and the lock screen, run: sudo authselect enable-feature with-fingerprint"
+        return 0
+    fi
+    if [ -e "$marker" ]; then
+        log "fingerprint sign-in is turned off; to turn it on, run: sudo authselect enable-feature with-fingerprint"
+        return 0
+    fi
+    if authselect enable-feature with-fingerprint >/dev/null 2>&1; then
+        printf "" >"$marker" 2>/dev/null || :
+        log "fingerprint sign-in is available; enrol a finger in Settings to use it"
+    else
+        log "could not turn on authselect's with-fingerprint feature"
+    fi
+}
+
+if [ ! -c "$dev" ]; then
+    log "$dev is not there; Touch ID is not available this boot"
+    exit 0
+fi
+
+while :; do
+    # Read-only: the driver does not mind, and a redirection that may write
+    # would create a file if the device went away.
+    if err=$(LC_ALL=C sh -c 'exec 3<"$1"' sh "$dev" 2>&1); then
+        break
+    fi
+    case "$err" in
+    # Another opener is activating it or using it.
+    *[Bb]usy*)
+        [ "$(elapsed)" -lt "$wait_s" ] ||
+            not_ready "$dev stayed busy for ${wait_s} s"
+        sleep 0.2
+        ;;
+    *) failed "could not open $dev: ${err##*: }" ;;
+    esac
+done
+
+if [ -z "$diag" ]; then
+    log "Touch ID is activated, but this kernel does not report whether its sensor attached"
+    pam_hint
+    exit 0
+fi
+
+while :; do
+    touchid=$(attr touchid)
+    attach=$(attr sensor_attach)
+    case "$touchid" in
+    failed) failed "Touch ID activation failed" ;;
+    esac
+    case "$attach" in
+    attached)
+        [ "$touchid" = ready ] ||
+            sensor_down "the sensor went offline after it attached"
+        case "$(attr restore)" in
+        restored) restored "the enrolled fingerprints are restored" ;;
+        empty) restored "no fingerprint is enrolled" ;;
+        unproven)
+            not_ready "the enrolled fingerprints were not restored; matching is unavailable this boot"
+            ;;
+        *) not_ready "the sensor attached, but the fingerprint restore did not run" ;;
+        esac
+        ;;
+    not-ready) sensor_down "every automatic bring-up fell short" ;;
+    absent)
+        # A kernel from before diag ABI 2 reports the sensor alone.
+        case "$touchid" in
+        ready) ready "the sensor is online (this kernel does not report the fingerprint restore)" ;;
+        not-ready) sensor_down "the sensor is not online" ;;
+        esac
+        ;;
+    esac
+    # unknown or retrying: the driver is still at it. A retry after a
+    # refused file only helps once the file is rebuilt, so start that now.
+    [ "$attach" = retrying ] && repair_once
+    [ "$(elapsed)" -lt "$wait_s" ] ||
+        sensor_down "still $attach after ${wait_s} s"
+    sleep 0.5
+done

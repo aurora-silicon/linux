@@ -1,0 +1,262 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/phy/apple,t6040-atcphy.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T6040 Type-C PHY
+
+maintainers:
+  - Ryan Murray <ryan@aurorasilicon.org>
+
+description: >
+  The Type-C PHY of the Apple T6040 (M4 Pro) SoC, as used for USB2 and USB3
+  host operation and for DisplayPort. USB3 is brought up by a PHY coprocessor
+  running RTKit firmware, reached through an ASC mailbox. The PHY also
+  provides the reset line of the attached DWC3 controller and acts as the
+  Type-C orientation switch and, where the port carries DisplayPort alt mode,
+  as its mode switch. The same PHY drives the fixed DisplayPort link of an
+  HDMI converter; that instance has no USB controller behind it and therefore
+  no PIPE interface.
+
+$defs:
+  apple,tunable:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    minItems: 1
+    maxItems: 512
+    items:
+      items:
+        - description: Register offset
+        - description: Mask to be applied to the register value
+        - description: Bits to be set after applying the mask
+    description: >
+      Calibration table from the device's Apple device tree, applied at every
+      USB3 power-on.
+
+properties:
+  compatible:
+    const: apple,t6040-atcphy
+
+  reg:
+    minItems: 10
+    items:
+      - description: USB2 PHY controls
+      - description: USB2 event counter controls
+      - description: USB3 PIPE interface controls
+      - description: PHY core, including the lane and BIST blocks
+      - description: PHY power and reset requests
+      - description: PHY coprocessor wrapper controls
+      - description: PHY coprocessor data memory
+      - description: AXI to Apple Fabric interface controls
+      - description: Local IO address translation controls
+      - description: ATC fabric controls
+      - description: ATC common configuration controls
+
+  reg-names:
+    oneOf:
+      - items:
+          - const: bank0
+          - const: bank1
+          - const: pipehandler
+          - const: core
+          - const: cfg
+          - const: cpu
+          - const: cpu-data
+          - const: axi2af
+          - const: axi2af-lioa
+          - const: fabric
+          - const: common-cfg
+      - description: A fixed DisplayPort PHY without a USB controller
+        items:
+          - const: bank0
+          - const: bank1
+          - const: core
+          - const: cfg
+          - const: cpu
+          - const: cpu-data
+          - const: axi2af
+          - const: axi2af-lioa
+          - const: fabric
+          - const: common-cfg
+
+  "#phy-cells":
+    const: 1
+    description: >
+      The PHY type (dt-bindings/phy/phy.h): PHY_TYPE_USB2, PHY_TYPE_USB3 or
+      PHY_TYPE_DP.
+
+  "#reset-cells":
+    const: 0
+
+  power-domains:
+    maxItems: 1
+
+  mboxes:
+    maxItems: 1
+
+  mbox-names:
+    const: phy-cpu
+
+  nonposted-mmio: true
+
+  orientation-switch: true
+
+  mode-switch: true
+
+  port:
+    $ref: /schemas/graph.yaml#/properties/port
+    description: >
+      Link to the SuperSpeed lanes of the Type-C connector. Absent on a fixed
+      DisplayPort PHY.
+
+  ports:
+    $ref: /schemas/graph.yaml#/properties/ports
+    description: >
+      USB and DisplayPort lane connections to the Type-C connector, and the
+      link to the USB3 controller, in place of port. Absent on a fixed
+      DisplayPort PHY.
+
+    properties:
+      port@0:
+        $ref: /schemas/graph.yaml#/properties/port
+        description: The SuperSpeed lanes of the Type-C connector.
+
+      port@1:
+        $ref: /schemas/graph.yaml#/properties/port
+        description: The SuperSpeed (PIPE) link to the USB controller.
+
+    required:
+      - port@0
+
+  apple,tunable-axi2af:
+    $ref: "#/$defs/apple,tunable"
+    description: Tunables applied to the axi2af region.
+
+  apple,tunable-fabric:
+    $ref: "#/$defs/apple,tunable"
+    description: Tunables applied to the fabric region.
+
+  apple,tunable-common-cfg:
+    $ref: "#/$defs/apple,tunable"
+    description: Tunables applied to the common-cfg region.
+
+  apple,tunable-axi2af-lioa:
+    $ref: "#/$defs/apple,tunable"
+    description: Tunables applied to the axi2af-lioa region.
+
+  apple,tunable-lane0:
+    $ref: "#/$defs/apple,tunable"
+    description: Lane 0 tunables, applied to the core region.
+
+  apple,tunable-lane1:
+    $ref: "#/$defs/apple,tunable"
+    description: Lane 1 tunables, applied to the core region.
+
+  apple,tunable-aus40cmn-shm:
+    $ref: "#/$defs/apple,tunable"
+    description: AUS40CMN_SHM tunables, applied to the core region.
+
+  apple,tunable-auspll:
+    $ref: "#/$defs/apple,tunable"
+    description: AUSPLL tunables, applied to the core region.
+
+  apple,tunable-cio4pll:
+    $ref: "#/$defs/apple,tunable"
+    description: CIO4PLL tunables, applied to the core region.
+
+  apple,tunable-pipehandler:
+    $ref: "#/$defs/apple,tunable"
+    description: Tunables applied to the pipehandler region.
+
+  apple,tunable-usb2-host:
+    $ref: "#/$defs/apple,tunable"
+    description: USB2 host tunables, applied to the bank0 region.
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - "#phy-cells"
+  - power-domains
+
+allOf:
+  - not:
+      required:
+        - port
+        - ports
+  - if:
+      properties:
+        reg-names:
+          contains:
+            const: pipehandler
+    then:
+      required:
+        - "#reset-cells"
+    else:
+      properties:
+        "#reset-cells": false
+        orientation-switch: false
+        mode-switch: false
+        port: false
+        ports: false
+
+additionalProperties: false
+
+examples:
+  - |
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        phy@38aa90000 {
+            compatible = "apple,t6040-atcphy";
+            reg = <0x3 0x8aa90000 0x0 0x4000>,
+                  <0x3 0x8a800000 0x0 0x4000>,
+                  <0x3 0x8aa84000 0x0 0x4000>,
+                  <0x3 0x8b000000 0x0 0x30000>,
+                  <0x3 0x8b200000 0x0 0x4000>,
+                  <0x3 0x8b140000 0x0 0x4000>,
+                  <0x3 0x8b0c0000 0x0 0x10000>,
+                  <0x3 0x88000000 0x0 0x8000>,
+                  <0x3 0x88020000 0x0 0x4000>,
+                  <0x3 0x8b244000 0x0 0x4000>,
+                  <0x3 0x8b250000 0x0 0x4000>;
+            reg-names = "bank0", "bank1", "pipehandler", "core", "cfg", "cpu",
+                        "cpu-data", "axi2af", "axi2af-lioa", "fabric",
+                        "common-cfg";
+            #phy-cells = <1>;
+            #reset-cells = <0>;
+            power-domains = <&ps_atc1_common_dp>;
+            mboxes = <&atcphy1_mbox>;
+            mbox-names = "phy-cpu";
+            nonposted-mmio;
+            orientation-switch;
+        };
+    };
+  - |
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        phy@39aa90000 {
+            compatible = "apple,t6040-atcphy";
+            reg = <0x3 0x9aa90000 0x0 0x4000>,
+                  <0x3 0x9a800000 0x0 0x4000>,
+                  <0x3 0x9b000000 0x0 0x30000>,
+                  <0x3 0x9b200000 0x0 0x4000>,
+                  <0x3 0x9b140000 0x0 0x4000>,
+                  <0x3 0x9b0c0000 0x0 0x10000>,
+                  <0x3 0x98000000 0x0 0x8000>,
+                  <0x3 0x98020000 0x0 0x4000>,
+                  <0x3 0x9b244000 0x0 0x4000>,
+                  <0x3 0x9b250000 0x0 0x4000>;
+            reg-names = "bank0", "bank1", "core", "cfg", "cpu", "cpu-data",
+                        "axi2af", "axi2af-lioa", "fabric", "common-cfg";
+            #phy-cells = <1>;
+            power-domains = <&ps_atc3_common_dp>;
+            mboxes = <&atcphy3_mbox>;
+            mbox-names = "phy-cpu";
+            nonposted-mmio;
+        };
+    };
+...

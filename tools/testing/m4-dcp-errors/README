@@ -1,0 +1,81 @@
+SPDX-License-Identifier: GPL-2.0-only OR MIT
+
+J713 DCP/DART error-path developer regressions
+=============================================
+
+Run manually from a kernel source checkout:
+
+  python3 tools/testing/m4-dcp-errors/run.py
+
+Requires Python 3 and a host GCC or Clang supporting UndefinedBehaviorSanitizer.
+HOSTCC or --cc selects the compiler, including compiler wrappers. This is a
+source-based developer test, not an installed kselftest. It creates temporary
+host C units/executables and never builds a kernel, accesses hardware or runs CTS.
+Nothing is generated in the source checkout.
+
+Preserve generated sources, commands, source hashes and failure logs in a new
+directory, and optionally run the real Kconfig dependency matrix using an
+existing host scripts/kconfig/conf binary:
+
+  python3 tools/testing/m4-dcp-errors/run.py \
+    --source-root /path/to/kernel \
+    --output-dir /path/to/new-results \
+    --kconfig-conf /path/to/kernel-build/scripts/kconfig/conf
+
+KCONFIG_CONF also selects that existing binary. The runner does not build it.
+Without it the Kconfig matrix is explicitly reported as skipped; header-stub
+linking and conditional module preprocessing still run. Run once with GCC and
+once with Clang for both compiler controls.
+
+The harness extracts the current production functions and register definitions.
+Transport, MMIO, locks, pages and DRM context are synthetic host boundaries:
+
+* Retained v2 IRQ routing: actual common handler and radio/display quarantine
+  functions; owned and foreign SID faults; W1C exception ACK, barrier and readback.
+  Neither retained profile may issue FLUSH_UNLOCK. The ordinary-domain control
+  still requires encoded FLUSH_UNLOCK after ACK/barrier/readback. Both profiles
+  cover v2.2 SID and v2.3 block exceptions, plus quiet and legacy routing.
+  DMA-disable MMIO is a boundary mock here and covered by the radio SID tests.
+  MMIO mocks implement W1C, not hardware timing.
+* Shared-IRQ teardown: both display peers are quarantined before the action is
+  freed, including the surviving peer. Partial-admission and ordinary IRQ
+  removal are covered independently. Locks/IRQ synchronization are synthetic.
+* Read-only admission: the actual probe predicate and pending-fault helper must
+  notice v2 exception/block state and masked fault delivery without writes.
+* Quarantined SID0 unmap: all pages across a child-table boundary must be pinned
+  before full logical retirement. Existing hardware PTEs remain; a new map is
+  refused by the sticky failure state. Failed pin, normal unmap and failed-flush
+  PTE restoration controls remain distinct.
+* Asynchronous callback failures: dispatch, finish and ACK errors must log the
+  method/tag, lengths, stage and errno. Failed dispatch cannot send an ACK;
+  successful callbacks produce no error diagnostic.
+* Module-disabled public APIs must compile/link as EOPNOTSUPP stubs. The actual
+  retained implementation fragments are conditionally preprocessed to ensure
+  ordinary modular DART contains no private ARM64 DMA calls; the native graphics
+  configuration fragment must explicitly opt in to the built-in retained feature.
+* Optional Kconfig: unchanged production producer blocks plus synthetic unrelated
+  dependencies cover ordinary modular DART, retained built-in, modular DRM with
+  built-in DART, unsupported page size, and disabled retained feature. This is
+  dependency reachability, not full kernel configuration or module linking.
+
+Six built-in mutation controls must compile and fail at runtime: missing radio
+or display quarantine, an unlocked retained display, an ordinary domain left
+locked, loss of the surviving peer's quarantine, and masked fault admission.
+Compile errors do not count as detected mutations.
+
+An optional old source snapshot can act as an additional negative control:
+
+  python3 tools/testing/m4-dcp-errors/run.py \
+    --negative-source-root /path/to/old-kernel-source \
+    --output-dir /path/to/new-results
+
+Every production-function control must fail against that snapshot; it should
+contain the old borrowed-v2 routing, zero-return quarantined unmap and silent
+callback behavior. No historical source or captured firmware data is bundled.
+
+These tests do not prove DMA cache coherency, firmware layout, real shared-IRQ
+synchronization, interrupt delivery, resource lifetime during device removal,
+full kernel Kconfig, ARM64 module linking, or successful display operation.
+Full kernel/module builds and a fresh reboot with native KMS checks remain
+separate qualification. A working fallback does not establish native firmware
+clock, bandwidth or thermal-policy parity.

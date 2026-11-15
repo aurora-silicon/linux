@@ -1,0 +1,65 @@
+{
+  "reference_kernel_commit": "5e86481d356cdfa05d703b4b97f1cb56aa8e2819",
+  "cases": [
+    {
+      "case": 0,
+      "return_errno": 0,
+      "input_sha256": "4720712fac659d1809a82d36773795dc8a94444eef40e65304479c67eb78e182"
+    },
+    {
+      "case": 1,
+      "return_errno": 0,
+      "input_sha256": "c0ba3d2a2b41d4f330ed269182e9b14ec144ec33cd2a60113c3dbe4afce5cc08"
+    },
+    {
+      "case": 2,
+      "return_errno": -22,
+      "input_sha256": "a8f41641464bd4fd7a766f6bc0262b36418c83f2444bf2b98c9df06f7c3932a1"
+    },
+    {
+      "case": 3,
+      "return_errno": -22,
+      "input_sha256": "c63b5234a88ce517d67383e67811527cff790bde539bfc0e270c6fc5eb42c667"
+    },
+    {
+      "case": 4,
+      "return_errno": -22,
+      "input_sha256": "eb435c8c30a952d92aefb26d3fe61554d17c6d91b8eeea2b2da1680f3d56e39b"
+    },
+    {
+      "case": 5,
+      "return_errno": -22,
+      "input_sha256": "9edae99fb71f75daec989bedd356395b65effd7ba66c9a546320e1058de7fdaf"
+    },
+    {
+      "case": 6,
+      "return_errno": -22,
+      "input_sha256": "7dcd56e33ce24abbad232fd5a71dfd4ee73d0bc052c5776f5be744d4674901a7"
+    },
+    {
+      "case": 7,
+      "return_errno": -22,
+      "input_sha256": "e651f158158fec473cfe1efea6463b6f78db717f3735cd8044e806882556ac13"
+    },
+    {
+      "case": 8,
+      "return_errno": -22,
+      "input_sha256": "1b2bda6a6ac4ac171df43081cbf6e75e505513b23691565019ff101dd73d55d6"
+    },
+    {
+      "case": 9,
+      "return_errno": -22,
+      "input_sha256": "fe9446f47e1634fcbd8a1cbe12773b356ce0051b6439de769c177a0b5d46360c"
+    },
+    {
+      "case": 10,
+      "return_errno": -22,
+      "input_sha256": "01dfdf59c9da96491c586c3401f9c38f6ceecb39a538398c349a717fc5f5fe51"
+    },
+    {
+      "case": 11,
+      "return_errno": -22,
+      "input_sha256": "0c992e11b0319b6fcc741f1a638d10a070b95f040327901ecac728e45f266294"
+    }
+  ]
+}

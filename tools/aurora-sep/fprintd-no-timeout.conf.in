@@ -1,0 +1,7 @@
+# Keep fprintd running instead of letting it exit after 30 s without a
+# client. Each new start probes the reader again, and the login and lock
+# screens ask it for the reader when they come up, so a resident fprintd
+# answers them at once. The packages fill in fprintd's path.
+[Service]
+ExecStart=
+ExecStart=@FPRINTD@ --no-timeout

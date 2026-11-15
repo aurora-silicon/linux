@@ -1,0 +1,121 @@
+# Copyright 2026 Chris Kearney
+# SPDX-License-Identifier: MIT
+mesa_neo_has_compatible() {
+    [ -r "$1" ] && tr '\0' '\n' <"$1" | grep -qx "$2"
+}
+
+mesa_neo_clear_environment() {
+    unset LD_PRELOAD DRI_PRIME
+    unset VK_DRIVER_FILES VK_ICD_FILENAMES VK_LOADER_LAYERS_DISABLE
+    unset MESA_LOADER_DRIVER_OVERRIDE GALLIUM_DRIVER LIBGL_DRIVERS_PATH
+    unset GBM_BACKENDS_PATH __EGL_VENDOR_LIBRARY_FILENAMES MESA_NEO_PROFILE
+    _neo_clean_ld=
+    _neo_saved_ifs=$IFS; IFS=:
+    for _neo_entry in ${LD_LIBRARY_PATH:-}; do
+        case "$_neo_entry" in /opt/mesa-m3/lib|/opt/mesa-m3/25g83/lib|/opt/mesa-neo/lib|'') continue;; esac
+        _neo_clean_ld=${_neo_clean_ld:+$_neo_clean_ld:}$_neo_entry
+    done
+    IFS=$_neo_saved_ifs
+    export LD_LIBRARY_PATH="$_neo_clean_ld"
+}
+
+mesa_neo_gpu_admit() {
+    _neo_root=$1; _neo_prefix=$2
+    _neo_reason=wrong-board
+    mesa_neo_has_compatible "$_neo_root/proc/device-tree/compatible" apple,t8140 &&
+        [ "$(tr '\0' '\n' <"$_neo_root/proc/device-tree/compatible" | grep '^apple,j' | sort -u)" = apple,j700 ] || return 1
+    _neo_reason=render-node-unavailable
+    _neo_nodes=0; _neo_node=; _neo_gpu_device=
+    for _neo_sys in "$_neo_root"/sys/class/drm/renderD*; do
+        mesa_neo_has_compatible "$_neo_sys/device/of_node/compatible" apple,agx-t8140 || continue
+        _neo_nodes=$((_neo_nodes+1)); _neo_node=$_neo_root/dev/dri/${_neo_sys##*/}
+        _neo_gpu_device=$(readlink -f "$_neo_sys/device" 2>/dev/null)
+    done
+    [ "$_neo_nodes" = 1 ] && [ -r "$_neo_node" ] && [ -w "$_neo_node" ] || return 1
+    _neo_reason=package-profile-mismatch
+    [ "$(cat "$_neo_prefix/share/mesa-neo/profile" 2>/dev/null)" = j700-g17p-hal200 ] || return 1
+    _neo_reason=render-abi-mismatch
+    LD_LIBRARY_PATH="$_neo_prefix/lib" "$_neo_prefix/libexec/mesa-neo-abi-check"         j700-g17p-hal200 "$_neo_node" >/dev/null 2>&1 || return 1
+    _neo_reason=implementation-load-failed
+    LD_LIBRARY_PATH="$_neo_prefix/lib" "$_neo_prefix/libexec/mesa-neo-loadcheck"         "$_neo_prefix" >/dev/null 2>&1 || return 1
+}
+
+mesa_neo_display_admit() {
+    _neo_reason=native-display-unavailable
+    _neo_cards=0; _neo_connected=0
+    for _neo_card in "$_neo_root"/sys/class/drm/card*; do
+        case "${_neo_card##*/}" in card*[!0-9]*) continue;; esac
+        [ -e "$_neo_card" ] || continue
+        if mesa_neo_has_compatible "$_neo_card/device/of_node/compatible" apple,agx-t8140; then
+            [ "$(readlink -f "$_neo_card/device" 2>/dev/null)" = "$_neo_gpu_device" ] || return 1
+            # Kernels with separate T8140 drivers name them asahi_neo and
+            # apple-drm-neo; the shared drivers are asahi and apple-drm.
+            # The compatible checks keep both spellings T8140-only.
+            case "$(basename "$(readlink -f "$_neo_card/device/driver" 2>/dev/null)")" in
+                asahi|asahi_neo) ;;
+                *) return 1;;
+            esac
+            # The GPU primary node has no KMS connectors.
+            for _neo_connector in "$_neo_card"-*; do
+                [ ! -e "$_neo_connector" ] || return 1
+            done
+            continue
+        fi
+        _neo_cards=$((_neo_cards+1))
+        # A firmware framebuffer cannot use the Asahi render-only KMS route.
+        case "$(basename "$(readlink -f "$_neo_card/device/driver" 2>/dev/null)")" in
+            apple-drm|apple-drm-neo) ;;
+            *) return 1;;
+        esac
+        mesa_neo_has_compatible "$_neo_card/device/of_node/compatible" apple,t8140-display-subsystem || return 1
+        [ -r "$_neo_root/dev/dri/${_neo_card##*/}" ] && [ -w "$_neo_root/dev/dri/${_neo_card##*/}" ] || return 1
+        for _neo_connector in "$_neo_card"-*; do
+            [ "$(cat "$_neo_connector/status" 2>/dev/null)" = connected ] &&
+                [ -n "$(cat "$_neo_connector/modes" 2>/dev/null)" ] && _neo_connected=$((_neo_connected+1))
+        done
+    done
+    [ "$_neo_cards" = 1 ] && [ "$_neo_connected" -gt 0 ]
+}
+
+mesa_neo_select_environment() {
+    # Keep the KMS driver's name available to the kmsro loader.
+    unset MESA_LOADER_DRIVER_OVERRIDE DRI_PRIME LD_PRELOAD
+    export LD_LIBRARY_PATH="$_neo_prefix/lib"
+    export LIBGL_DRIVERS_PATH="$_neo_prefix/lib/dri" GBM_BACKENDS_PATH="$_neo_prefix/lib/gbm"
+    export __EGL_VENDOR_LIBRARY_FILENAMES="$_neo_prefix/share/glvnd/egl_vendor.d/50_mesa.json"
+    export GALLIUM_DRIVER=asahi
+    export VK_DRIVER_FILES="$_neo_prefix/share/vulkan/icd.d/asahi_icd.aarch64.json"
+    export VK_ICD_FILENAMES="$VK_DRIVER_FILES" VK_LOADER_LAYERS_DISABLE='~implicit~'
+    export MESA_NEO_PROFILE=j700-g17p-hal200
+    unset LIBGL_ALWAYS_SOFTWARE MESA_NEO_FALLBACK MESA_NEO_FALLBACK_REASON
+}
+
+mesa_neo_session_env() {
+    _neo_root=$1; _neo_prefix=$2
+    mesa_neo_has_compatible "$_neo_root/proc/device-tree/compatible" apple,t8140 || return 0
+    mesa_neo_clear_environment
+    _neo_reason=experiment-disabled
+    if [ -e "$_neo_root/etc/mesa-neo/gpu-experiment" ] &&
+       [ "$(cat "$_neo_root/etc/mesa-neo/profile" 2>/dev/null)" = j700-g17p-hal200 ] &&
+       [ ! -e "$_neo_root/etc/mesa-neo/disable" ] &&
+       [ ! -e "${XDG_CONFIG_HOME:-$HOME/.config}/mesa-neo/disable" ] &&
+       mesa_neo_gpu_admit "$_neo_root" "$_neo_prefix" && mesa_neo_display_admit; then
+        mesa_neo_select_environment
+    else
+        export LIBGL_ALWAYS_SOFTWARE=1 MESA_NEO_FALLBACK=software MESA_NEO_FALLBACK_REASON="$_neo_reason"
+        unset MESA_NEO_PROFILE
+    fi
+}
+
+mesa_neo_probe_run() {
+    _neo_root=$1; _neo_prefix=$2; shift 2
+    mesa_neo_clear_environment
+    unset LD_PRELOAD
+    if ! mesa_neo_gpu_admit "$_neo_root" "$_neo_prefix"; then
+        printf 'mesa-neo-probe: %s; check the Neo kernel and matched Mesa package.\n' "$_neo_reason" >&2
+        return 1
+    fi
+    # Render diagnosis remains possible while native display is unavailable.
+    mesa_neo_select_environment
+    exec "$_neo_prefix/libexec/mesa-neo-probe.real" "$@"
+}

@@ -1,0 +1,15 @@
+# Copyright 2026 Chris Kearney
+# SPDX-License-Identifier: MIT
+# Sourced at graphical-session startup.
+if [ -r /opt/mesa-neo/libexec/mesa-neo-env ]; then
+    . /opt/mesa-neo/libexec/mesa-neo-env
+    mesa_neo_session_env '' /opt/mesa-neo
+    if [ "${MESA_NEO_FALLBACK:-}" = software ]; then
+        logger -t mesa-neo "software fallback: ${MESA_NEO_FALLBACK_REASON}" 2>/dev/null || :
+    fi
+    unset -f mesa_neo_has_compatible mesa_neo_clear_environment mesa_neo_gpu_admit
+    unset -f mesa_neo_display_admit mesa_neo_select_environment mesa_neo_session_env mesa_neo_probe_run
+    unset _neo_root _neo_prefix _neo_reason _neo_nodes _neo_node _neo_sys _neo_gpu_device
+    unset _neo_cards _neo_card _neo_connected _neo_connector
+    unset _neo_clean_ld _neo_saved_ifs _neo_entry
+fi

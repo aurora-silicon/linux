@@ -1,0 +1,297 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * T6030 internal display and the first external display processor, from
+ * the tested J516S ADT. Every node stays disabled until the display gate
+ * takes them over after the boot loader's handoff (apple,t6030-handoff).
+ */
+
+/ {
+	aliases {
+		dcp = &dcp;
+		dcpext0 = &dcpext;
+		dcpext1 = &dcpext1;
+		/* The boot loader fills the ATC3 tunables through this alias. */
+		atcphy3 = &atcphy3;
+		disp0 = &display;
+		disp0-piodma = &disp0_piodma;
+		disp0_piodma = &disp0_piodma;
+	};
+
+	clk_disp0: clock-disp0 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <712000000>;
+		clock-output-names = "clk_disp0";
+	};
+
+	/* Component master without MMIO, outside the simple-bus. */
+	display: display-subsystem {
+		compatible = "apple,t6030-display-subsystem";
+		iommus = <&disp0_dart 0>;
+		status = "disabled";
+	};
+};
+
+&soc {
+	dcp_mbox: mailbox@28ec08000 {
+		compatible = "apple,t6030-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x2 0x8ec08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 589 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 590 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 591 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 592 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		power-domains = <&ps_disp_cpu>;
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	dcp_dart: iommu@28d30c000 {
+		compatible = "apple,t6030-dart", "apple,t8110-dart";
+		reg = <0x2 0x8d30c000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 609 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		status = "disabled";
+	};
+
+	disp0_dart: iommu@28d304000 {
+		compatible = "apple,t6030-dart", "apple,t8110-dart";
+		reg = <0x2 0x8d304000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 609 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		status = "disabled";
+	};
+
+	dcp: dcp@28ec00000 {
+		compatible = "apple,t6030-dcp";
+		mboxes = <&dcp_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcp_dart 5>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3",
+			    "disp-4", "disp-5", "iop-vbar";
+		reg = <0x2 0x8ec00000 0x0 0x4000>,
+		      <0x2 0x8c000000 0x0 0x690000>,
+		      <0x2 0x8c800000 0x0 0x690000>,
+		      <0x2 0x8d320000 0x0 0x4000>,
+		      <0x2 0x8d344000 0x0 0x4000>,
+		      <0x2 0x8e800000 0x0 0x800000>,
+		      <0x3 0x503d0000 0x0 0x4000>,
+		      <0x2 0x8e850000 0x0 0x4000>;
+		power-domains = <&ps_disp_cpu>;
+		clocks = <&clk_disp0>;
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		status = "disabled";
+
+		disp0_piodma: piodma {
+			iommus = <&disp0_dart 4>;
+		};
+	};
+
+	dcpext_dart: iommu@2d130c000 {
+		compatible = "apple,t6030-dart", "apple,t8110-dart";
+		reg = <0x2 0xd130c000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 651 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		power-domains = <&ps_dispext0_cpu>;
+		status = "disabled";
+	};
+
+	dcpext_mbox: mbox@2d2c08000 {
+		compatible = "apple,t6030-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x2 0xd2c08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 634 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 635 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 636 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 637 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_dispext0_cpu>;
+		resets = <&ps_dispext0_cpu>;
+		status = "disabled";
+	};
+
+	dcpext: dcp@2d2c00000 {
+		compatible = "apple,t6030-dcpext", "apple,dcpext";
+		reg = <0x2 0xd2c00000 0x0 0x4000>;
+		reg-names = "coproc";
+		mboxes = <&dcpext_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcpext_dart 5>;
+		power-domains = <&ps_dispext0_cpu>;
+		resets = <&ps_dispext0_cpu>;
+		phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>,
+		       <&atcphy2 PHY_TYPE_DP>;
+		phy-names = "typec0", "typec1", "typec2";
+		mux-controls = <&atcphy0_xbar 0>, <&atcphy1_xbar 0>,
+			       <&atcphy2_xbar 0>,
+			       <&atcphy0_xbar 1>, <&atcphy0_xbar 2>,
+			       <&atcphy1_xbar 1>, <&atcphy1_xbar 2>,
+			       <&atcphy2_xbar 1>, <&atcphy2_xbar 2>;
+		mux-control-names = "typec0", "typec1", "typec2",
+				    "typec0-dpin0", "typec0-dpin1",
+				    "typec1-dpin0", "typec1-dpin1",
+				    "typec2-dpin0", "typec2-dpin1";
+		apple,connector-type = "USB-C";
+		apple,dcp-index = <1>;
+		apple,typec-dptx-phys = <0 1 2>;
+		apple,typec-mux-indices = <0 0 0>;
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		status = "disabled";
+
+		/* Enabled with the processor; until then a port would wait for it. */
+		typec-routes {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			route@0 {
+				reg = <0>;
+				mode-switch;
+				status = "disabled";
+
+				port {
+					dcpext_typec0: endpoint {
+						remote-endpoint = <&typec0_dcpext>;
+					};
+				};
+			};
+
+			route@1 {
+				reg = <1>;
+				mode-switch;
+				status = "disabled";
+
+				port {
+					dcpext_typec1: endpoint {
+						remote-endpoint = <&typec1_dcpext>;
+					};
+				};
+			};
+
+			route@2 {
+				reg = <2>;
+				mode-switch;
+				status = "disabled";
+
+				port {
+					dcpext_typec2: endpoint {
+						remote-endpoint = <&typec2_dcpext>;
+					};
+				};
+			};
+		};
+	};
+
+	dcpext1_dart: iommu@2d530c000 {
+		compatible = "apple,t6030-dart", "apple,t8110-dart";
+		reg = <0x2 0xd530c000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 689 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		power-domains = <&ps_dispext1_cpu>;
+		status = "disabled";
+	};
+
+	dcpext1_mbox: mbox@2d6c08000 {
+		compatible = "apple,t6030-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x2 0xd6c08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 672 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 673 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 674 IRQ_TYPE_LEVEL_HIGH>,
+			<AIC_IRQ 675 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+			"recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_dispext1_cpu>;
+		resets = <&ps_dispext1_cpu>;
+		status = "disabled";
+	};
+
+	dcpext1: dcp@2d6c00000 {
+		compatible = "apple,t6030-dcpext", "apple,dcpext";
+		reg = <0x2 0xd6c00000 0x0 0x4000>;
+		reg-names = "coproc";
+		mboxes = <&dcpext1_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcpext1_dart 5>;
+		power-domains = <&ps_dispext1_cpu>;
+		resets = <&ps_dispext1_cpu>;
+		phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>,
+		       <&atcphy2 PHY_TYPE_DP>;
+		phy-names = "typec0", "typec1", "typec2";
+		mux-controls = <&atcphy0_xbar 0>, <&atcphy1_xbar 0>,
+			       <&atcphy2_xbar 0>,
+			       <&atcphy0_xbar 1>, <&atcphy0_xbar 2>,
+			       <&atcphy1_xbar 1>, <&atcphy1_xbar 2>,
+			       <&atcphy2_xbar 1>, <&atcphy2_xbar 2>;
+		mux-control-names = "typec0", "typec1", "typec2",
+				    "typec0-dpin0", "typec0-dpin1",
+				    "typec1-dpin0", "typec1-dpin1",
+				    "typec2-dpin0", "typec2-dpin1";
+		apple,connector-type = "USB-C";
+		apple,dcp-index = <2>;
+		apple,typec-dptx-phys = <0 1 2>;
+		apple,typec-mux-indices = <2 2 2>;
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		status = "disabled";
+
+		/* Enabled with this processor by the display gate, as for dcpext. */
+		typec-routes {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			route@0 {
+				reg = <0>;
+				mode-switch;
+				status = "disabled";
+
+				port {
+					dcpext1_typec0: endpoint {
+						remote-endpoint = <&typec0_dcpext1>;
+					};
+				};
+			};
+
+			route@1 {
+				reg = <1>;
+				mode-switch;
+				status = "disabled";
+
+				port {
+					dcpext1_typec1: endpoint {
+						remote-endpoint = <&typec1_dcpext1>;
+					};
+				};
+			};
+
+			route@2 {
+				reg = <2>;
+				mode-switch;
+				status = "disabled";
+
+				port {
+					dcpext1_typec2: endpoint {
+						remote-endpoint = <&typec2_dcpext1>;
+					};
+				};
+			};
+		};
+	};
+};

@@ -1,0 +1,39 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * External display resources of the J616s. Everything here is disabled in
+ * the device tree: the enable gate (drivers/soc/apple/display-gate.c)
+ * switches the chain on once the boot loader has provided the firmware
+ * memory of the external display processors, so without that the booted
+ * hardware state is the same as without this file.
+ *
+ * Values come from this unit's ADT (25G83); CPU address = ADT address +
+ * 0x2_0000_0000. Path of the picture:
+ *   HDMI:  dcpext0 -> atc3 display crossbar -> atcphy3 (fixed DP PHY, no
+ *          USB controller) -> on-board DP-to-HDMI converter
+ *   USB-C: dcpext1 -> atcN display crossbar -> atcphyN (DP alt mode)
+ *
+ * Needs the DP mode of the T6040 Type-C PHY driver (phy-apple-t6040-usb2)
+ * with its probe path for a PHY without a USB controller (atcphy3), the
+ * atc-dpxbar,t604x display crossbar driver and the dcpext firmware memory
+ * (dcp-map style memory-region with iommu-addresses, t6040-j616s-extdisp-
+ * mem-loader.dtsi).
+ */
+
+/*
+ * HDMI port (disabled with dcpext0): converter power SMC gP0f/gP1a (as on
+ * the M3 Pro J514s), HPD on AOP GPIO 0x24. The converter's reset (gP10),
+ * force-dpfu (AOP GPIO 0x2a) and its I2C side channel (i2c8 0x08) are left
+ * undescribed, as on the J514s.
+ */
+&dcpext0 {
+	apple,connector-type = "HDMI-A";
+	hdmi-hpd-gpios = <&pinctrl_aop 36 GPIO_ACTIVE_HIGH>;
+	hdmi-pwren-gpios = <&smc_gpio 15 GPIO_ACTIVE_HIGH>;
+	dp2hdmi-pwren-gpios = <&smc_gpio 26 GPIO_ACTIVE_HIGH>;
+	phys = <&atcphy3 PHY_TYPE_DP>;
+	phy-names = "dp-phy";
+	mux-controls = <&atcphy3_xbar 0>;
+	mux-control-names = "dp-xbar";
+	mux-index = <0>;
+	apple,dptx-phy = <3>;
+};

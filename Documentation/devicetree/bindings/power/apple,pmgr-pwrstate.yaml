@@ -1,0 +1,246 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/power/apple,pmgr-pwrstate.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple SoC PMGR Power States
+
+maintainers:
+  - Hector Martin <marcan@marcan.st>
+
+allOf:
+  - $ref: power-domain.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8132-pmgr-pwrstate
+      required:
+        - compatible
+        - apple,inherited-on
+    then:
+      properties:
+        apple,firmware-owned: false
+        apple,sleep-retained: false
+        apple,sleep-driver-owned: false
+        apple,always-on: false
+        apple,min-state: false
+        apple,force-disable: false
+        apple,force-reset: false
+        apple,externally-clocked: false
+        apple,consumer-switched: false
+  - if:
+      required:
+        - apple,consumer-switched
+    then:
+      required:
+        - apple,firmware-owned
+  - if:
+      required:
+        - apple,retention-workaround
+    then:
+      required:
+        - apple,consumer-switched
+  - if:
+      required:
+        - apple,bridge-link
+    then:
+      required:
+        - apple,consumer-switched
+
+description: |
+  Apple SoCs include PMGR blocks responsible for power management,
+  which can control various clocks, resets, power states, and
+  performance features. This binding describes the device power
+  state registers, which control power states and resets.
+
+  Each instance of a power controller within the PMGR syscon node
+  represents a generic power domain provider, as documented in
+  Documentation/devicetree/bindings/power/power-domain.yaml.
+  The provider controls a single SoC block. The power hierarchy is
+  represented via power-domains relationships between these nodes.
+
+  See Documentation/devicetree/bindings/arm/apple/apple,pmgr.yaml
+  for the top-level PMGR node documentation.
+
+properties:
+  compatible:
+    oneOf:
+      - items:
+          - enum:
+              # Do not add additional SoC to this list.
+              - apple,s5l8960x-pmgr-pwrstate
+              - apple,t7000-pmgr-pwrstate
+              - apple,s8000-pmgr-pwrstate
+              - apple,t8010-pmgr-pwrstate
+              - apple,t8015-pmgr-pwrstate
+              - apple,t8103-pmgr-pwrstate
+              - apple,t8112-pmgr-pwrstate
+              - apple,t6000-pmgr-pwrstate
+          - const: apple,pmgr-pwrstate
+      - items:
+          - enum:
+              - apple,t6020-pmgr-pwrstate
+              - apple,t6030-pmgr-pwrstate
+              - apple,t6031-pmgr-pwrstate
+              - apple,t6041-pmgr-pwrstate
+              - apple,t6050-pmgr-pwrstate
+              - apple,t8122-pmgr-pwrstate
+              - apple,t8132-pmgr-pwrstate
+              - apple,t8140-pmgr-pwrstate
+              - apple,t8142-pmgr-pwrstate
+          - const: apple,t8103-pmgr-pwrstate
+
+  reg:
+    maxItems: 1
+
+  "#power-domain-cells":
+    const: 0
+
+  "#reset-cells":
+    const: 0
+
+  power-domains:
+    description:
+      Reference to parent power domains. A domain may have multiple parents,
+      and all will be powered up when it is powered.
+    minItems: 1
+    maxItems: 8 # Arbitrary, should be enough
+
+  label:
+    description:
+      Specifies the name of the SoC domain being controlled. This is used to
+      name the power/reset domains.
+
+  apple,always-on:
+    description:
+      Forces this power domain to always be powered up.
+    type: boolean
+
+  apple,externally-clocked:
+    description:
+      The domain's clock comes from outside the PMGR, such as an MCA
+      cluster clocked by its NCO. Until that clock runs the domain only
+      reaches the clock-gated state, which then counts as powered up.
+    type: boolean
+
+  apple,no-auto-pm:
+    description: |
+      Never enables automatic power management (auto-enable) for this
+      domain: once powered up it stays at its requested state until
+      Linux changes it. Required for a coprocessor CPU domain whose
+      firmware is started cold by Linux and must not be clock or power
+      gated behind its back, such as the T6030 external display
+      coprocessors' CPU domains.
+    type: boolean
+
+  apple,sleep-retained:
+    description:
+      A coprocessor keeps running in this domain across system sleep with no
+      system-sleep callbacks of its own. The OS keeps the domain on during
+      system sleep. Runtime power management is unaffected.
+    type: boolean
+
+  apple,sleep-driver-owned:
+    description:
+      The driver behind this domain lowers it before a system sleep and brings
+      it back afterwards, in an order its hardware needs. The power controller
+      leaves it alone after a wake.
+    type: boolean
+
+  apple,firmware-owned:
+    description:
+      The boot loader hands over active hardware whose power domain remains
+      under firmware control. Its state register may not be CPU-accessible.
+      The OS keeps the domain on and never accesses its state register,
+      including reads, power target, automatic gating and reset. Availability
+      is supplied by the firmware handoff rather than determined by probing
+      the power-state register.
+    type: boolean
+
+  apple,consumer-switched:
+    description:
+      With apple,firmware-owned, the consumer of this domain may power it
+      off and on again around stopping its coprocessor, through the PMGR
+      driver, which then writes the state register. The OS otherwise treats
+      the domain as firmware-owned and always on. A chain of such domains
+      (this one and its consumer-switched parents) is powered off child first
+      and on parent first.
+    type: boolean
+
+  apple,retention-workaround:
+    description:
+      PMGR registers to set while this consumer-switched domain is off, and
+      to restore afterwards, as triplets of the offset in the PMGR register
+      block, a mask and the masked value while the domain is off. They are
+      set after automatic power management of the domain is disabled and
+      before it powers off, and restored after it powers on and before
+      automatic power management is enabled again.
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: register offset
+        - description: mask
+        - description: value while the domain is off
+    maxItems: 4
+
+  apple,bridge-link:
+    description:
+      The two consecutive 32-bit link words of the bus bridge of the block
+      behind this consumer-switched domain, as the node of that block, the
+      index of one of its reg entries and the offset of the words from the
+      start of that entry. Bit 0 of each is cleared before the domain powers
+      off and set after it has powered on. The words are only accessible
+      while the domain is on.
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    items:
+      - items:
+          - description: node of the block behind the domain
+          - description: index of a reg entry of that node
+          - description: offset of the link words from the start of that entry
+
+  apple,inherited-on:
+    description: |
+      On T8132, the boot loader hands over an active domain whose state
+      register can be read, but whose power and reset transitions have not
+      been handed over. Both target and actual state must already be active,
+      with reset, auto-enable, reset-state, busy and device-disable clear.
+      The OS verifies that state, retains an always-on domain, and refuses
+      power-off and reset without writing the register.
+
+      On T6030, T6031 and T8122, this marks the internal display chain left
+      running by the boot loader. The display handoff requires the marker
+      before adding the PMP and setting apple,min-state on that chain.
+      These older domains retain their normal PMGR transition ownership;
+      unlike apple,firmware-owned, their registers remain writable.
+    type: boolean
+
+  apple,min-state:
+    description:
+      Specifies the minimum power state for auto-PM.
+      0 = power gated, 4 = clock gated, 15 = on.
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 0
+    maximum: 15
+
+  apple,force-disable:
+    description:
+      Forces this device to be disabled (bus access blocked) when the power
+      domain is powered down.
+    type: boolean
+
+  apple,force-reset:
+    description:
+      Forces a reset/error recovery of the power control logic when the power
+      domain is powered down.
+    type: boolean
+
+required:
+  - compatible
+  - reg
+  - "#power-domain-cells"
+  - "#reset-cells"
+  - label
+
+additionalProperties: false

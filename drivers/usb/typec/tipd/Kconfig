@@ -1,0 +1,84 @@
+config TYPEC_TPS6598X_CORE
+	tristate
+	select USB_ROLE_SWITCH
+	select POWER_SUPPLY
+	select USB_COMMON if DEBUG_FS
+
+config TYPEC_TPS6598X
+	tristate "TI TPS6598x USB Power Delivery controller driver"
+	depends on I2C
+	select REGMAP_I2C
+	select TYPEC_TPS6598X_CORE
+	help
+	  Say Y or M here if your system has TI TPS65982 or TPS65983 USB Power
+	  Delivery controller.
+
+	  If you choose to build this driver as a dynamically linked module, the
+	  module will be called tps6598x.ko.
+
+config TYPEC_SN201202X
+	tristate "TI SN201202x USB Power Delivery controller support"
+	depends on SPMI
+	select TYPEC_TPS6598X_CORE
+	help
+	  Say Y here to enable support for SN201202x, a TPS6598x variant
+	  that uses SPMI as a host bus, and is found on Apple devices starting
+	  from the M3 series.
+
+	  If you choose to build this driver as a dynamically linked module, the
+	  module will be called sn201202x.ko.
+
+config TYPEC_TPS6598X_DEBUG_COMMANDS
+	bool "Debugfs command access to TPS6598x/CD321x controllers"
+	depends on TYPEC_TPS6598X_CORE && DEBUG_FS
+	help
+	  Add a root-only debugfs file, usb/tipd/<device>/command, that sends
+	  a few controller commands (LOCK, DBMa, VDMs, DVEn and DISC) to the
+	  USB Power Delivery controller. Tools such as tuxvdmtool use it to
+	  send Apple VDMs (reboot, DFU, serial, Debug USB) to a Mac connected
+	  to the port, or to enable the local end of a debug route.
+
+	  These commands can disconnect the port or reboot the connected
+	  device. The read-only register file, usb/tipd/<device>/regs, is
+	  available with DEBUG_FS whether or not this is set.
+
+	  Say N unless you use the controller's debug mode for development.
+
+config TYPEC_TIPD_KUNIT_TEST
+	tristate "KUnit tests for CD321x" if !KUNIT_ALL_TESTS
+	depends on KUNIT && TYPEC_TPS6598X_CORE
+	select REGMAP
+	default KUNIT_ALL_TESTS
+	help
+	  Test suspend gating, fresh cable-state revalidation, bounded retries
+	  and removal during resume. The tests exercise the state transitions
+	  shared with the driver, including aborted and repeated sleep cycles.
+	  Also test that interrupt events which could not be read or cleared
+	  are still acknowledged, however long that keeps failing, so that the
+	  controller keeps raising its interrupt.
+	  Also test that a USB4/Thunderbolt router which never registers its
+	  switch does not keep the port from probing.
+	  Also test that a Type-C state which a mux provider with transient
+	  timeouts holds up is applied again until it goes through, for up to
+	  about two minutes, also next to a display route that declares
+	  nothing, and that other providers and errors keep the bounded
+	  retries.
+	  They also cover which DisplayPort hotplug event a cable update sends
+	  to the display connector.
+	  These tests run without accessing a physical Type-C controller.
+
+config TYPEC_SN201202X_KUNIT_TEST
+	tristate "KUnit tests for SN201202x" if !KUNIT_ALL_TESTS
+	depends on KUNIT && TYPEC_SN201202X && SUSPEND
+	select REGMAP
+	default KUNIT_ALL_TESTS
+	help
+	  Test that the SN201202x events are not handled while the controller
+	  sleeps, that a system suspend that fails leaves the controller awake,
+	  and that an idle controller sleeps and wakes for register access and
+	  for system suspend. Also test which data status and status count as
+	  a link that wakes the system from suspend-to-idle. Liquid-detection
+	  coverage includes status decode and the ordering of controller
+	  mitigation, dry revalidation and connector-state reporting. These tests
+	  run on a simulated SPMI bus, without accessing a physical Type-C
+	  controller.

@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Unit]
+Description=Explain USB-C display limitations
+PartOf=graphical-session.target
+After=graphical-session.target
+ConditionPathExists=/sys/firmware/devicetree/base/compatible
+
+[Service]
+ExecStart=@LIBEXECDIR@/aurora-display-notifier
+Restart=on-failure
+RestartSec=10
+RuntimeDirectory=aurora-display-notifier
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=graphical-session.target

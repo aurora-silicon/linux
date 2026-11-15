@@ -1,0 +1,61 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* T8132 memory/cache resources, also used by the legacy-loader adapter. */
+
+&soc {
+	mcc: memory-controller@220000000 {
+		compatible = "apple,t8132-mcc";
+		reg = <0x2 0x20000000 0x0 0x1c1c04>,
+		      <0x2 0x22000000 0x0 0x1c1c04>;
+		status = "disabled";
+	};
+
+	pmc: power-management@382800000 {
+		compatible = "apple,t8132-pmc";
+		reg = <0x3 0x82800000 0x0 0x10000>,
+		      <0x3 0x828aa000 0x0 0x3000>;
+		reg-names = "voters", "rails";
+		#address-cells = <1>;
+		#size-cells = <0>;
+		apple,pmp = <&pmp>;
+		status = "disabled";
+
+		/*
+		 * The external display pipes' bandwidth request (BWR) and
+		 * boost interface enables. The PMC ignores a pipe's bandwidth
+		 * and display clock votes while they are clear.
+		 */
+		/*
+		 * The internal display pipe's enables. Its power states are
+		 * firmware-owned, so they are not a power domain: its DCP
+		 * clears them before powering the pipe down and restores them.
+		 */
+		pmc_disp0: interface-disp0 {
+			label = "disp0-interface";
+			apple,consumer-switched;
+			apple,bwr-bit = <0>;
+			apple,boost-bit = <0>;
+		};
+
+		pmc_dispext0: interface-dispext0 {
+			label = "dispext0-interface";
+			#power-domain-cells = <0>;
+			power-domains = <&ps_dispext0_sys>;
+			apple,bwr-bit = <3>;
+			apple,boost-bit = <1>;
+		};
+
+		pmc_dispext1: interface-dispext1 {
+			label = "dispext1-interface";
+			#power-domain-cells = <0>;
+			power-domains = <&ps_dispext1_sys>;
+			apple,bwr-bit = <4>;
+			apple,boost-bit = <2>;
+		};
+
+		clpc: performance-controller@3 {
+			compatible = "apple,t8132-clpc";
+			reg = <3>;
+			apple,gpu-power-state = <&ps_gfx>;
+		};
+	};
+};

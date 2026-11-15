@@ -1,0 +1,226 @@
+Apple external display host regressions
+======================================
+
+Run from a kernel source checkout:
+
+  make -C tools/testing/selftests TARGETS=drivers/gpu/apple-dcp run_tests
+
+Or keep translation units, commands, failure logs and source hashes:
+
+  tools/testing/selftests/drivers/gpu/apple-dcp/run.sh --output /tmp/apple-dcp-results
+
+An installed copy needs --source /path/to/kernel. --group edid, rate, phy or
+lifecycle or boot selects one group. HOSTCC selects the host compiler (default clang).
+Python 3 and a compiler supporting AddressSanitizer/UndefinedBehaviorSanitizer
+are required. The usb-kconfig producer also needs GNU Make 4 or newer. The
+runner uses MAKE when set, otherwise gmake if available, then make. On macOS,
+install GNU Make or select an existing producer with KCONFIG_CONF. The host
+fixtures use native errno definitions; Linux-only reply statuses stay local
+to the synthetic callback test.
+
+No target access, firmware command, captured fixture or kernel
+configuration is required.
+
+One TAP entry point uses shared production extraction and compiler handling.
+The modules contain public synthetic host boundaries and retained assertions:
+
+* edid: actual AFK admission and OPEN/CLOSE handling; native/HDMI providers
+  alternating over 64 epochs; foreign owners, stale replies, reader/command
+  pins, ordered receive progress and legacy service behavior.
+* rate: actual binary parser, EDID/capacity policy, receipt ingress, getters
+  and lookup; all arrival orders, conflicting/discarded siblings, rejected
+  replacement catalogs, HPD retirement and recovery; malformed/duplicate
+  metadata and independent EDID decoding; eight bounded delayed retries.
+* phy: actual parking/mux/init/reset/configure callbacks, masked PMA context,
+  faulted ACK/BIST cleanup, dirty-route retry, OFF/new-calibration epochs,
+  warm reset and legacy T8103/T8122/T8140/T8142 route controls.
+* lifecycle: actual physical-disconnect authority and ownership despite failed
+  teardown; a fast dock replug whose DPTX link never configures (withdrawn,
+  unacknowledged, unanswered, refused and live failures); an old disconnect's
+  delayed CRTC power-off racing a replacement M1/M2 Type-C session; a dock
+  that leaves during the first mode set, whose dropped present keeps the IOMFB
+  queue busy (deferred and retried stop, never-retired, post-power-off and
+  crashed-queue latches); DWC3/core/PHY PM
+  and reset-reference recovery; exact firmware
+  tuple/resource admission, unsupported VRR rejection and power reply bounds;
+  15,552 D134 dispatcher scope/length/context and legacy reply cases.
+
+Transport, MMIO, kernel locks and work scheduling are host mocks. These tests
+establish source behavior; electrical readiness, firmware/FDT ownership,
+concurrency and system suspend require separate kernel/hardware qualification.
+Kernel KUnit tests and apple-afkv2 remain separate tests in their existing
+standard layouts. No archived diagnostic script is a dependency of this suite.
+
+The display group's desktop-gamma fixture executes the production A420/A421
+callbacks and composition with synthetic tables. It checks full return-status
+handling, the external empty status-2 reply, internal-panel diagnostics,
+malformed tables, independent RGB interpolation and restoration of the base.
+It does not establish firmware table encoding or external A421 support.
+
+The runner preserves host artifacts on failure as well as success. Existing
+physical-disconnect fixture warnings for unused mock boundaries and signed
+host/kernel ABI comparisons are handled only by those fixtures' original
+compiler options; production source compilation uses the normal Kbuild policy.
+
+The bounded-PM group shares the PHY fixture and executes the actual PM get/put
+and mux wrapper, usb_hc_died and typec_mux_set. The probe group executes real
+CD321x register/unregister/rollback and retry-state functions. USB n/y/m uses
+the actual optional dependency and a real Kconfig producer (KCONFIG_CONF may
+select an existing producer). Legacy lane/teardown groups keep executing the
+same locked mux body; they do not pretend their old USB mocks own runtime PM.
+The cpuidle group executes the actual Apple table/probe, generic registration
+and s2idle selector/entry, and tick_freeze/unfreeze. It checks source behavior
+only; RTC, elapsed suspend time and simultaneous hardware execution remain
+separate qualification gates. The original human cpuidle patch is preserved.
+
+The service-rebind group also runs retained reviewer controls through the
+actual sender, receive worker, recovery, quiesce and EDID wrapper. It covers
+CLOSED cancellation before lookup, first late ACK versus already consumed
+duplicates, reader-pinned cross-slot/channel reuse, and the explicit physical
+absence window. Per-interface sequence history has a fixed 64-KiB bound per
+AFKV2 endpoint; reply routing still ignores reader-only retired services.
+
+Two wrap controls intentionally retain the command-17 replay assertion
+failure, for OOB and inline. The group verifies that these counterexamples
+still reproduce, alongside nonvacuous mutations and passing corrected safety
+controls. A passing host suite does not establish a replay-exclusion contract
+or admit a hardware trial. Token/sequence semantics remain a separate protocol
+fact to establish; the tests do not manufacture a firmware echo guarantee.
+
+The boot group executes the actual OSLOG dispatcher with synthetic fixed-width
+words. Opaque event types 2-5 use debug logging, unknown types retain warnings,
+and only the existing buffer-request path can allocate/ACK buffers. The EDID
+service-rebind group also distinguishes intentional optional EOPNOTSUPP from
+required admission failures and genuine optional-service errors, and proves
+refused services never OPEN or publish. No captured firmware values are used.
+
+The ATC lane/PIPE and DWC3 teardown fixtures use a shared host adapter around
+both the extracted Type-C target-mode mapper and the extracted locked mux body.
+They omit USB PM at that boundary. The PM fixtures replace the adapter with the
+actual mux update and callback, including the scoped no-op check: a clean
+same-mode request needs neither root-hub lookup nor PM, while dirty lanes,
+pending PIPE work and a mismatched PIPE still require ownership. KUnit static
+redirects are disabled in host fixtures so the production bodies execute.
+CD321x probe uses the actual optional-router lookup with a modeled deferred
+probe decision; both supplier waiting and optional-router fallback are checked.
+
+With the fixed-hub SuperSpeed handover the locked mux body is
+atcphy_mux_switch(), and the PM fixtures run the actual USB side around it:
+the SuperSpeed root port goes down before the PIPE moves, the device on it
+with it, and comes up only once the PIPE is back on the USB3 backend of the
+running host. A modeled port refuses PIPE moves while it is up, and its
+power-off and power-on failures, a port someone else switched off and the
+retries the update queues are checked. The adapter of the lane fixtures takes
+no port down and checks that none comes up. A failed USB3 power-off or reset
+leaves dwc3 out of host mode, and a fixed-hub host whose PIPE cannot be routed
+still starts. Each fixture detects these from the source, so the expectations
+for sources without the handover remain.
+
+The standalone plane-layout.py test executes the production atomic check and
+update, the DRM block-format descriptors, and the surface structs with synthetic
+GEM sizes. It checks RGB8/RGB10/FP16 and semiplanar YUV layouts, tile padding,
+metadata, offsets, GEM boundaries, arithmetic overflow and invisible planes.
+Packed P030/P230 remain supported for LINEAR; INTERCHANGE is refused and omitted
+from per-format modifier advertisement until its packed tile layout is known.
+DRM's three-pixel block descriptor establishes linear storage, not how those
+blocks cross the interchange tile and compression-subtile boundaries.
+Run `./plane-layout.py --mutations --ref <old-public-revision> --output <dir>`
+to retain the compiled before/after controls, baseline reproducer and runtime
+mutation results. A compile failure never counts as a mutation kill. DRM
+clipping, GEM/DMA allocation and firmware execution are outside this host test.
+
+The m4 group executes the actual M4 firmware codecs against ten immutable
+A407 request fixtures generated from the working kernel at
+feb6464a52a7d968d8e7a0ac6a5cab2865f31782. All 71,280 bytes are compared,
+including XRGB/ARGB, cursor updates/removal, blanking, and 0/120/500-nit
+brightness. The fixture records original source hashes and synthetic input
+source; running the tests never regenerates expected bytes from current code.
+Logical blanking deliberately replaces the former purple diagnostic background
+with opaque black; only the four-byte background field of the two blanking
+fixtures permits that documented change. Protocol tests also cover independent
+A407/D590 receipt ordering, exact swap
+IDs, malformed/duplicate replies, READY identity, packet bounds, nested
+callback routing, DMA aperture/extent bounds and cursor admission. These
+remain CPU regressions, not firmware or display qualification. The common
+plane callback runs against synthetic DRM-core boundaries to check strict
+linear DMA GEM admission and active/invisible rejection. Real prepare_fb
+keeps producer preparation while the backend owns v26_6 framebuffer retirement;
+legacy retirement remains tested. Actual backend present/blank functions and
+the real common backlight state/wrappers run with a bounded mock transport,
+covering DPMS-off before delayed work and retaining active plus uncertain
+framebuffers when one of the two required receipts never arrives.
+
+The m4-panel-timing case runs the actual internal-panel timing parser on
+encoded TimingElements reports. The J713 and J715 reports have one element.
+The J604 fixture is the six-element report from macOS 26B123: a preferred
+120 Hz element and five 48-60 Hz ones. Only the preferred ID 2 element is
+adopted, and only with the profile's exact values. The parser refuses a
+changed value, a missing or duplicated ID 2, a second preferred element and
+more elements than the profile allows. This does not show what the firmware
+reports on hardware.
+
+run-native-m4-kms.py defaults to dry run; --compile-only needs libdrm development
+headers and never opens DRM. Explicit --execute requires root, an exact fresh
+source/Image/boot identity, the common appledrm module, a stopped display
+manager and the independent unqualified-candidate rollback guard. It resolves
+the internal CRTC through the eDP encoder mask, performs 60 bounded flips, a
+CRTC-only atomic commit, then 20 blank/unblank cycles. The operator owns desktop stop
+and restart plus kernel health monitoring; the runner never disarms rollback.
+This hardware runner is excluded from ordinary selftest execution.
+
+M4 error-path regression checks can also run independently:
+
+  python3 tools/testing/selftests/drivers/gpu/apple-dcp/m4-error-paths.py
+
+They compile the actual PMP vote state transitions, borrowed-DART fault
+handler, retained-resource cleanup action and failed-flip event handoff with
+host mocks under UndefinedBehaviorSanitizer. Controls cover accepted DISP
+surviving an unrelated failed AGX request, both reply/timeout lock orderings,
+malformed replies, true owner failure, an unowned or invalid fault SID, probe
+rollback versus published DMA lifetime, exactly-once DRM event ownership, and
+mixed-owner, truncated, failed-translation and invalid-owner IOMMU tuples.
+
+Internal panel policy
+---------------------
+The display group covers the shared nits ramp on a 600-nit panel, retargeting,
+blanking, suspend, rejected submits and both submit/completion callback orders.
+Brightness-only commits retain the active gamma state without marking it changed.
+Synthetic TimingElements exercise 120 Hz and fractional lower refresh rates,
+DCP color/timing identities, invalid geometry and adaptive-sync ranges. The
+adaptive-sync callback test verifies the desktop parameter record, mode-info
+ordering and one fixed-refresh retry after a rejected enable or modeset. The
+watchdog test checks fixed-refresh recovery, retained-buffer arming and late
+completion isolation.
+These tests do not establish which timings a particular panel reports or prove
+refresh rate, flicker, brightness smoothness or adaptive-sync on hardware.
+
+Desktop panel brightness regressions also cover panel EDID parsing and
+publication from ProductAttributes without optional color data. Both bare and
+descriptor-wrapped powerlog reports pass through the production compact receiver,
+systemep handler and mNits parser. Rapid key repeats with interleaved stale and
+new reports must converge monotonically to the last user target in both
+directions. Report observations cannot restart a fade or request another write.
+The callback cases exercise the desktop D202/D454 wire adapters, physical resource
+mapping and release, and unknown-callback failure followed by a successful set.
+
+Panel identity tests also retain the EDID and generation across repeated and
+partial dictionaries, and notify only when valid identity data actually changes.
+
+The identity case also exercises the real D552/D561 table bindings, nested
+DisplayAttributes and direct ProductAttributes, legacy manufacturer codes,
+minimal identity data, and unchanged byte/padded boolean acknowledgments.
+
+Desktop identity diagnostics cover bounded traversal of key names and types,
+including truncated and oversized dictionaries. ADT identity tests use only
+synthetic nodes and panel serials, reject truncated trees transactionally and
+ensure the machine's serial cannot override the panel's. Panel EDID tests cover
+a missing firmware identity, real EDID priority and invalid replacement retention.
+Desktop backlight notification tests exercise accepted, rejected, duplicate and
+out-of-order completions and preserve the requested target during notification.
+
+The audio group executes the native AV call and OSObject reply boundaries with
+synthetic transport replies, including truncated bodies, inconsistent used
+sizes and transport errors. It retains the legacy reply behavior. KUnit's
+apple-av-native-audio suite separately runs service replacement, Terminate and
+link lifecycle checks for both external 14.7 and desktop 26.x firmware roles.
+These fixtures do not establish the desktop audio firmware ABI or SIO support.

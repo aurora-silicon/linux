@@ -1,0 +1,28 @@
+First-write and clipped-native-window backing tests
+==================================================
+
+Run only on the audited native16K kernel through the established4K ABI launcher:
+  cd /var/tmp/owned-test-dir
+  userpages 4k ./first-write --native-16k
+  userpages 4k ./clipped-firstwrite --native-16k
+
+first-write: six fresh child arms (anonymous,shmem,regular file x dense/guarded),
+eight threads, absent-PTE direct first writes, full untouched-byte verification,
+DONTNEED and distinct-byte same-PTE refault racing, all source-file bytes verified.
+Regular-file working directory MUST be non-tmpfs; otherwise that arm SKIPs.
+All six must pass for qualification.4MiB useful payload/arm,<=16MiB native private
+backing under a wasteful baseline plus source file.40s supervisor/15s child alarm
+kills the fixture child/threads on timeout. No global pressure or kernel change.
+This content/race fixture does not itself assert physical density.
+
+clipped-firstwrite: root CAP_SYS_ADMIN pagemap visibility required.11 fresh child
+arms cover all valid starts for1/2/3leaf windows,3+1tail fill and full4dense control;
+two rounds with DONTNEED between. A single initial byte write must prefault every
+neighbor in its clipped batch, proven by pagemap before any neighbor read. Full
+zero/content checks then native PFN union enforce density.256groups/arm,
+<=8MiB payload backing even on baseline;16MiB reserved VA.1MiB native slack bounds
+pool sharding/background COW. Count3 alone allows natural16K/12K packing; mixed3+1
+must fill tails.40s supervisor/8s child alarm, no GPU/reclaim/pressure.
+
+The fixture metadata selftest (--selftest) checks tags/sorting only. It is not a
+kernel-path test and does not replace running both fixtures on the target kernel.

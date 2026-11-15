@@ -1,0 +1,110 @@
+// SPDX-License-Identifier: GPL-2.0
+/dts-v1/;
+/plugin/;
+
+/*
+ * Type-C connectors and the muxes they reach, as a display processor's
+ * Type-C routes: one processor is left disabled, the other is available.
+ */
+&{/} {
+	typec-mux-test {
+		connector-off {
+			port {
+				conn_off: endpoint {
+					remote-endpoint = <&route_off>;
+				};
+			};
+		};
+
+		connector-on {
+			port {
+				conn_on: endpoint {
+					remote-endpoint = <&route_on>;
+				};
+			};
+		};
+
+		connector-both {
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+
+					conn_both_off: endpoint {
+						remote-endpoint = <&route_both_off>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+
+					conn_both_on: endpoint {
+						remote-endpoint = <&route_both_on>;
+					};
+				};
+			};
+		};
+
+		processor-off {
+			status = "disabled";
+
+			typec-routes {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				route@0 {
+					reg = <0>;
+					mode-switch;
+
+					port {
+						route_off: endpoint {
+							remote-endpoint = <&conn_off>;
+						};
+					};
+				};
+
+				route@1 {
+					reg = <1>;
+					mode-switch;
+
+					port {
+						route_both_off: endpoint {
+							remote-endpoint = <&conn_both_off>;
+						};
+					};
+				};
+			};
+		};
+
+		processor-on {
+			typec-routes {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				route@0 {
+					reg = <0>;
+					mode-switch;
+
+					port {
+						route_on: endpoint {
+							remote-endpoint = <&conn_on>;
+						};
+					};
+				};
+
+				route@1 {
+					reg = <1>;
+					mode-switch;
+
+					port {
+						route_both_on: endpoint {
+							remote-endpoint = <&conn_both_on>;
+						};
+					};
+				};
+			};
+		};
+	};
+};

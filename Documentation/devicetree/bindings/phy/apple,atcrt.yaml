@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/phy/apple,atcrt.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple ATC retimer control interface
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  An addressed retimer control interface on an I2C bus. This does not
+  transfer PHY, reset or firmware ownership to the host.
+
+properties:
+  compatible:
+    items:
+      - enum:
+          - apple,t8103-atcrt
+          - apple,t6000-atcrt
+          - apple,t8112-atcrt
+          - apple,t6041-atcrt
+      - const: apple,atcrt
+
+  reg:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false

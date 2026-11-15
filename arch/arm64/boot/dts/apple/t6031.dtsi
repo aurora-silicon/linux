@@ -1,0 +1,69 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple T6031 "M3 Max" SoC
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/apple-aic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/pinctrl/apple.h>
+#include <dt-bindings/phy/phy.h>
+#include <dt-bindings/spmi/spmi.h>
+
+#include "multi-die-cpp.h"
+
+#include "t6031-base.dtsi"
+
+/ {
+	compatible = "apple,t6031", "apple,arm-platform";
+
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	soc: soc {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+
+		ranges;
+		nonposted-mmio;
+		/* Required to get >32-bit DMA via DARTs */
+		dma-ranges = <0 0 0 0 0xffffffff 0xffffc000>;
+
+		// filled via templated includes at the end of the file
+	};
+};
+
+#define DIE
+#define DIE_NO 0
+#define SOC_NODE soc
+
+#include "t6031-die0.dtsi"
+#include "t6031-dieX.dtsi"
+#include "t6031-gpio-pins.dtsi"
+#include "t6031-nvme.dtsi"
+#include "t6031-pmgr.dtsi"
+#include "t6031-gpu.dtsi"
+
+#undef DIE
+#undef DIE_NO
+#undef SOC_NODE
+
+#include "t6031-peripherals.dtsi"
+
+#include "t6031-peripheral-buses.dtsi"
+
+#include "t6031-coprocessors.dtsi"
+
+#include "t6031-misc-interfaces.dtsi"
+
+&smc_hwmon {
+	/* M3 Max die keys; absent firmware keys are skipped. */
+	apple,soc-die-keys = "Tf04", "Tf06", "Tf09", "Tf0A", "Tf0B",
+			     "Tf14", "Tf16", "Tf19", "Tf1A", "Tf1B",
+			     "Tf24", "Tf26", "Tf29", "Tf2A", "Tf2B",
+			     "Tf34", "Tf36", "Tf39", "Tf3A", "Tf3B",
+			     "Tf44", "Tf46", "Tf49", "Tf4A", "Tf4B";
+};

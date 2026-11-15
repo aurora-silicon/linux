@@ -1,0 +1,23 @@
+#!/bin/bash
+# Pair the tested batching controls with the admitted T6030 Mesa profile.
+set -euo pipefail
+for attempt in {1..300}; do
+    [[ -r /sys/kernel/debug/asahi-m3/completion_wait ]] && break
+    sleep 0.1
+done
+/opt/mesa-m3/native-pro/libexec/mesa-m3-pro-check || exit 0
+[[ $(cat /sys/module/asahi/parameters/m3_consistent_perf) == 0 ]]
+[[ $(cat /sys/module/asahi/parameters/m3_pipeline_depth) == 0 ]]
+for path in /sys/module/asahi/parameters/m3_render_batch_override \
+            /sys/module/asahi/parameters/m3_compute_batch_override \
+            /sys/kernel/debug/asahi-m3/completion_wait \
+            /sys/kernel/debug/asahi-m3/submit_overlap \
+            /sys/module/asahi/parameters/m3_mixed_batch; do
+    [[ -w $path ]]
+done
+printf 4 > /sys/module/asahi/parameters/m3_render_batch_override
+printf 4 > /sys/module/asahi/parameters/m3_compute_batch_override
+printf 25 > /sys/kernel/debug/asahi-m3/completion_wait
+printf 1 > /sys/kernel/debug/asahi-m3/submit_overlap
+printf 1 > /sys/module/asahi/parameters/m3_mixed_batch
+echo 'T6030 performance profile: render/compute batches 4, completion wait 25 us, mixed batches and preparation overlap'

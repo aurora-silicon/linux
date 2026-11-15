@@ -1,0 +1,18 @@
+Scan deadline tests
+===================
+
+From the kernel source directory:
+
+  ./tools/testing/kunit/kunit.py run \
+    --kunitconfig=drivers/net/wireless/broadcom/brcm80211/brcmfmac/tests \
+    'brcmfmac-scan-timeout*'
+
+The timeout has a 10-second minimum and a 60-second maximum. A 97-channel
+foreground scan receives a 24,280 ms budget. The tests cover active and
+passive requests, all-band fallback, explicit channel lists and arithmetic
+saturation. P2P keeps its existing deadline. Internal PNO follow-up scans
+do not arm the foreground timer.
+
+To exercise the scan entrypoints with mocked firmware and timer services:
+
+  python3 tools/asahi/brcmfmac-scan-timeout-tests.py

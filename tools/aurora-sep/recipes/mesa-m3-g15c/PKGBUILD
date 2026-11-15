@@ -1,0 +1,401 @@
+# Mesa for the M3 Max GPU bring-up (T6031, G15C), in its own prefix,
+# /opt/mesa-m3-g15c. It installs beside system Mesa and the M3 Pro's
+# /opt/mesa-m3, and nothing uses it except programs started through
+# /opt/mesa-m3-g15c/bin/g15c-run (or g15c-first-job), which sets the opt-in
+# variables. No session hook, udev rule or user unit.
+#
+# Source: branch max/g15c-mesa-20261011, commit _commit below: the M3 Pro
+# release Mesa (7ff89a4da38, the source of mesa-m3-26.1.4.m3.2-5 in
+# aurora-2026.10.11.15) plus four commits:
+#   asahi/drm-shim: add a G15C (T6031) profile
+#   asahi: describe the T6031 runtime VA ranges in one table
+#   asahi, hk, zink: give G15C the G15S runtime choices
+#   asahi: admit G15C (T6031) behind ASAHI_M3_G15C
+# The tarball is `git archive` of the commit with the prefix mesa-26.1.4/.
+#
+# The build follows mesa-m3-26.1.4.m3.2-5's legacy profile exactly: the same
+# toolchain (SPIRV-Tools, SPIRV-LLVM-Translator and libclc built from the same
+# tarballs against LLVM 22), the same Meson options with the prefix moved,
+# the plane-layout control, and the qualified M3 Pro kernel files and kernel
+# digest, which must still match (the G15C commits do not change them). One
+# option is added: -Dtools=drm-shim, so build() can open the built drivers
+# against the G15C, G15S and G15G drm-shim profiles. The shim library is not
+# packaged. The HAL200 (J613) build, the probes and the session pieces of
+# mesa-m3 are left out.
+#
+# Also built: compute-check (Vulkan compute, every word checked) and gpu-heat
+# (GLES load), the M3 Pro's files; vk-render-check and gl-render-check (a clear
+# and a draw, every pixel checked, in Vulkan and in GLES through zink); and
+# the g15c-run and g15c-first-job scripts. For the M3 Max kit's render job,
+# bin/mesa-m3-probe runs the M3 Pro's session probe (mesa-m3-probe.c, the
+# release's file, built with its PREFIX set to this prefix) through g15c-run.
+#
+# Every file is under /opt (the kit installs only such a package), so the
+# licences are in /opt/mesa-m3-g15c/share/licenses/mesa-m3-g15c.
+pkgname=mesa-m3-g15c
+pkgver=26.1.4.g15c1
+pkgrel=2
+_commit=ff120e88cfc047b69ed412b2276599e3b2a426de
+pkgdesc="Mesa in /opt/mesa-m3-g15c for M3 Max (G15C) GPU bring-up: opt-in test prefix (source ${_commit:0:12})"
+arch=('aarch64')
+url='https://github.com/iconidentify/aurora-linux'
+license=('MIT' 'SGI-B-2.0' 'BSL-1.0' 'HPND-sell-variant' 'BSD-3-Clause' 'CC0-1.0 OR Apache-2.0'
+         'LicenseRef-MLAA' 'Apache-2.0 WITH LLVM-exception')
+# Runtime and build packages, as in mesa-m3: prepare() updates the throwaway
+# build container and installs them, because the builder image's package
+# database lags the mirror. The package's own runtime depends are set in
+# package() and checked against what the shipped ELF files need.
+_deps=('expat' 'gcc-libs' 'libdisplay-info' 'libdrm' 'libelf' 'libglvnd' 'libunwind' 'libx11'
+       'libxcb' 'libxext' 'libxfixes' 'libxrandr' 'libxshmfence' 'libxxf86vm' 'systemd-libs'
+       'vulkan-icd-loader' 'wayland' 'xcb-util-keysyms' 'zlib' 'zstd')
+_makedeps=('meson' 'ninja' 'cmake' 'python' 'python-mako' 'python-packaging' 'python-ply'
+           'python-pycparser' 'python-yaml' 'llvm22' 'llvm22-libs' 'clang22' 'compiler-rt22'
+           'glslang' 'wayland-protocols' 'xorgproto' 'vulkan-headers' 'binutils')
+options=('strip' '!debug' '!lto')
+_src=mesa-26.1.4
+_prefix=/opt/mesa-m3-g15c
+_llvm=/usr/lib/llvm22
+_slt=SPIRV-LLVM-Translator-0e67244861402a51b071414d7cb231a052b1ce03
+_slt_headers=SPIRV-Headers-575b6512579ebde466ed3dfc04e413439d14d95d
+_spvtools=SPIRV-Tools-vulkan-sdk-1.4.357.0
+_spvtools_headers=SPIRV-Headers-vulkan-sdk-1.4.357.0
+source=("mesa-m3-g15c-src-${_commit:0:11}.tar.zst"
+        llvm-project-22.1.8-libclc.tar.zst
+        SPIRV-LLVM-Translator-0e67244.tar.gz
+        SPIRV-Headers-575b651.tar.gz
+        SPIRV-Tools-vulkan-sdk-1.4.357.0.tar.gz
+        SPIRV-Headers-vulkan-sdk-1.4.357.0.tar.gz
+        kernel-digest.py
+        notices-gen.py
+        needs-derive.py
+        10-m3-asahi-zink.conf
+        gpu-heat.c
+        compute-check.c
+        compute-check.comp
+        render-check.vert
+        render-check.frag
+        vk-render-check.c
+        gl-render-check.c
+        g15c-run
+        g15c-first-job
+        mesa-m3-probe.c
+        g15c-mesa-m3-probe)
+sha256sums=('310f959b5e86ac22da5582906c67c35825ff032f4549793a49f8ee28f69e96cc'
+            '3d41db41e1e566c1db697ca7acd521d8d8d457de8af84cbaf4ad6ac14ae0af23'
+            'b43abf03cfe1614b562a7c84d829a9f29d0443e23ac75a622ce622744c5a7ada'
+            '775ee89eb77d067df3f5736e2b4bb2f5f3e39ead915f11f3d366139dcb42209d'
+            'd31e7109b6ef3559067e53e520870eafed7c9534d00db9728814b6df03fa4a5e'
+            '4d703067a7e06331ccb37bdfed3f9b7879cc61969a2689ae95c95db34a47ff07'
+            '34f8bb3fa505718dab176b6283dde0d4de9cae4c3928922bca18e6052434bca7'
+            '530948fc1a124de21c030a497e2ef5351742ba4ad4653484fe30fd1697ad7141'
+            '9a26a232fd050b6207bd0d385035723f72ffd2b6b72a25d6ac92ae2f99ea5b66'
+            '14a85c75d669b9d2cd9366c1343326174fd4d32c1cdf791fe0b7710bcd7d5f85'
+            '821d02fd42d628a334522215d4407e262ef1ab14ce7947cd81cbbbb15a127b9b'
+            '10abda78df16e650a77443f50cc46a15e418c42d4d9680c6a61616b232c9bdef'
+            '6c98fab6f9d70449bd7f5258c34eac773836908e060ce5bef86dc5b0ce595e61'
+            '1004715f808be12c7cbca71922507215b8a86a5c1ea18b7b6f592e8b98a64060'
+            '3177972580acecc051f9044c0a5c5915516673a250d5ca346f2d6914e8e5cc00'
+            '6406edc8c688c2ef56af73369a89404afda0d5fe6ca707147d4e6414734ed167'
+            'f85a3463970193d2f03f19306965427e21cd0071906393bc5dc10a2316f845f8'
+            'a6601727734330a7b5f605f5b0faf9ec9863d79bde8f7285362796a64ab54d75'
+            '26fe2dde93c166d1177205e28b7e45665d2bd233bc09ba759bbbaeb7d68f9ca7'
+            '826016665cd0424a614b67add921c0c79c3c698a4d104ea5712518449b75f27c'
+            '7da59d04ff0c3f8a8691700290ce0bd375344cdd783d87533a3d8161d81cbddf')
+
+# The qualified M3 Pro build's generated kernel files and libclc, as in
+# mesa-m3-26.1.4.m3.2-5. build() stops when one of ours differs.
+_qualified_kernel_digest='8c5a6eb11747db4fcf06602750e827af14f6c0c9f953caa76eb65d8f72a33994 105'
+_qualified=('f44305b94e884049d35d3934416a75571eb7bb0085e3593f8c04480956c02e30 deps/share/clc/spirv-mesa3d-.spv'
+            'f725856fffbfe6dfbe6149a6a49cac407ab3a1c2eee9a7326c3dcdbd8987ee84 deps/share/clc/spirv64-mesa3d-.spv'
+            '96d77577d056298f84a4132e8d01be5128251af959020e3a17b1f0a86555e37f build/src/asahi/libagx/libagx.spv'
+            '35a81d2d0e39cfac382d7899247832fc88486a6de459a9c54f19436b11783ec7 build/src/asahi/libagx/libagx.cpp'
+            '4aeb663cfcb17107dc7e3879bc769eef3a9e592c94fcf42baf7f93866fc71f9c build/src/asahi/libagx/libagx.h'
+            '7321ac1385d5c346fbcaeb74b59ba682154b3e205b345b52983726bbcf6cf729 build/src/asahi/lib/libagx_shaders.h'
+            '1e035f86496d78a56428175d8a4e6d37243ef0dbf89ad04e56751716ffe3a63f build/src/poly/cl/libpoly.spv'
+            'a5813469388f33b022b9458e99f871993aefeec2589d91012dd153e1db9aad08 build/src/poly/cl/libpoly.cpp'
+            '2abb58becda1f59d8e56f629a97aa802b9f6d22691f195147a8af2857f2caf06 build/src/poly/cl/libpoly.h')
+
+prepare() {
+  # This updates and adds packages in the build container: run it only in a
+  # throwaway container (lab package does).
+  sudo pacman -Sy --noconfirm --needed archlinuxarm-keyring
+  sudo pacman -Su --noconfirm --needed "${_deps[@]}" "${_makedeps[@]}"
+}
+
+# _check_qualified PREFIX...: compare the listed files whose path starts with
+# one of the prefixes with the qualified build's.
+_check_qualified() {
+  local line sum path ours bad=0
+  for line in "${_qualified[@]}"; do
+    sum=${line%% *}; path=${line#* }
+    case " $* " in *" ${path%%/*} "*) ;; *) continue ;; esac
+    ours=$(sha256sum "$path" 2>/dev/null | cut -d' ' -f1)
+    if [ "$ours" = "$sum" ]; then
+      echo "qualified-match $sum $path"
+    else
+      echo "QUALIFIED-MISMATCH want $sum got ${ours:-missing} $path"
+      bad=1
+    fi
+  done
+  return "$bad"
+}
+
+# _shim CHIP CMD...: run CMD against the built (not installed) drivers with
+# the asahi drm-shim reporting CHIP. Nothing executes on a GPU.
+_shim() {
+  local chip=$1 b="$srcdir/build"
+  shift
+  env LD_LIBRARY_PATH="$b/src/egl:$b/src/gbm:$b/src/gallium/targets/dri:$srcdir/deps/lib" \
+    __EGL_VENDOR_LIBRARY_FILENAMES="$srcdir/smoke/50_mesa.json" \
+    LIBGL_DRIVERS_PATH="$b/src/gallium/targets/dri" GBM_BACKENDS_PATH="$b/src/gbm" \
+    VK_ICD_FILENAMES="$b/src/asahi/vulkan/asahi_devenv_icd.aarch64.json" \
+    VK_DRIVER_FILES="$b/src/asahi/vulkan/asahi_devenv_icd.aarch64.json" \
+    VK_LOADER_LAYERS_DISABLE='~implicit~' MESA_LOADER_DRIVER_OVERRIDE=zink \
+    MESA_SHADER_CACHE_DISABLE=true ASAHI_SHIM_CHIP="$chip" \
+    LD_PRELOAD="$b/src/asahi/drm-shim/libasahi_noop_drm_shim.so" \
+    timeout -k 5 300 "$@"
+}
+
+# _expect NAME STATUS PATTERN... -- CMD...: run CMD, require its exit status
+# and every PATTERN (a grep -E expression) in its output.
+_expect() {
+  local name=$1 want=$2 rc pat
+  shift 2
+  local pats=()
+  while [ "$1" != "--" ]; do pats+=("$1"); shift; done
+  shift
+  rc=0
+  "$@" > "smoke/$name.log" 2>&1 || rc=$?
+  sed "s/^/  $name: /" "smoke/$name.log" | grep -v -E '^  [^:]+: (progress|MISMATCH run [0-9]+:)' | head -n 40
+  [ "$rc" = "$want" ] || { echo "SMOKE-FAIL $name: exit $rc, want $want"; return 1; }
+  for pat in "${pats[@]}"; do
+    grep -q -E -- "$pat" "smoke/$name.log" || { echo "SMOKE-FAIL $name: no line matches: $pat"; return 1; }
+  done
+  echo "smoke-pass $name"
+}
+
+build() {
+  local deps="$srcdir/deps" qbad=0
+  export PKG_CONFIG_PATH="$deps/lib/pkgconfig:$deps/share/pkgconfig"
+  export LD_LIBRARY_PATH="$deps/lib"
+
+  # SPIRV-Tools (linker and validator of the kernel compiler).
+  CFLAGS= CXXFLAGS= LDFLAGS= cmake -S "$_spvtools" -B build-spvtools -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$deps" -DCMAKE_INSTALL_LIBDIR=lib \
+    -DSPIRV-Headers_SOURCE_DIR="$srcdir/$_spvtools_headers" -DSPIRV_WERROR=OFF \
+    -DBUILD_SHARED_LIBS=ON -DSPIRV_TOOLS_BUILD_STATIC=OFF -DSPIRV_SKIP_TESTS=ON \
+    -DSPIRV_SKIP_EXECUTABLES=ON
+  cmake --build build-spvtools --parallel 4
+  cmake --install build-spvtools
+
+  # SPIRV-LLVM-Translator for LLVM 22.
+  CFLAGS= CXXFLAGS= LDFLAGS= cmake -S "$_slt" -B build-slt -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$deps" -DCMAKE_INSTALL_LIBDIR=lib \
+    -DLLVM_DIR="$_llvm/lib/cmake/llvm" \
+    -DLLVM_EXTERNAL_SPIRV_HEADERS_SOURCE_DIR="$srcdir/$_slt_headers" \
+    -DBUILD_SHARED_LIBS=ON -DLLVM_SPIRV_INCLUDE_TESTS=OFF -DLLVM_SPIRV_ENABLE_LIBSPIRV_DIS=OFF
+  cmake --build build-slt --parallel 4
+  cmake --install build-slt
+
+  # libclc 22.1.8, the two targets the kernel compiler uses.
+  CFLAGS= CXXFLAGS= LDFLAGS= cmake -S llvm-project/libclc -B build-libclc -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$deps" \
+    -DLLVM_DIR="$_llvm/lib/cmake/llvm" \
+    -DLIBCLC_TARGETS_TO_BUILD='spirv-mesa3d-;spirv64-mesa3d-' \
+    -DLLVM_SPIRV="$deps/bin/llvm-spirv"
+  cmake --build build-libclc --parallel 4
+  cmake --install build-libclc
+  echo "build toolchain: llvm-config $("$_llvm/bin/llvm-config" --version)," \
+    "LLVMSPIRVLib $(pkg-config --modversion LLVMSPIRVLib), libclc $(pkg-config --modversion libclc)," \
+    "SPIRV-Tools $(pkg-config --modversion SPIRV-Tools), $(${CC:-cc} --version | head -1)"
+  _check_qualified deps || qbad=1
+
+  # Mesa: the mesa-m3 legacy profile's options, prefix moved, plus drm-shim.
+  printf "[binaries]\nllvm-config = '%s'\n" "$_llvm/bin/llvm-config" > llvm22.ini
+  CFLAGS= CXXFLAGS= LDFLAGS= meson setup build "${_src}" \
+    --native-file llvm22.ini \
+    --prefix="${_prefix}" \
+    --libdir=lib \
+    --wrap-mode=nofallback \
+    -Dbuildtype=release \
+    -Ddebug=true \
+    -Dvulkan-drivers=asahi \
+    -Dgallium-drivers=zink,softpipe \
+    -Dglx=dri \
+    -Dglvnd=enabled \
+    -Degl=enabled \
+    -Dgbm=enabled \
+    -Dplatforms=x11,wayland \
+    -Dgles1=enabled \
+    -Dgles2=enabled \
+    -Dllvm=enabled \
+    -Ddraw-use-llvm=false \
+    -Dmesa-clc=enabled \
+    -Dprecomp-compiler=enabled \
+    -Dbuild-tests=false \
+    -Dlmsensors=disabled \
+    -Dvideo-codecs= \
+    -Dtools=drm-shim
+  meson compile -C build -j4
+  meson compile -C build -j4 hk-explicit-plane-layout
+  python3 - build/compile_commands.json <<'PLANE_CHECK'
+import json, shlex, subprocess, sys
+command = next(c for c in json.load(open(sys.argv[1]))
+               if c['file'].endswith('/tests/test-hk-explicit-plane-layout.c'))
+args = command.get('arguments') or shlex.split(command['command'])
+if '-UNDEBUG' not in args:
+    raise SystemExit('plane layout control must retain release assertions')
+filtered=[]; skip=False
+for arg in args:
+    if skip: skip=False; continue
+    if arg in ('-o', '-MQ', '-MF', '-MT'): skip=True; continue
+    if arg in ('-c', '-MD', '-MMD') or arg == command['file']: continue
+    filtered.append(arg)
+output = subprocess.check_output(filtered + ['-dM', '-E', '-x', 'c', '-'],
+    cwd=command['directory'], input=b'').decode()
+if any(line.startswith('#define NDEBUG') for line in output.splitlines()):
+    raise SystemExit('plane layout control release assertions are disabled')
+print('legacy-plane-offset-compiler-assertions=pass')
+PLANE_CHECK
+  "$srcdir/build/src/asahi/vulkan/hk-explicit-plane-layout"
+  echo "legacy-plane-offset-control=pass"
+  _check_qualified build || qbad=1
+  local digest
+  digest=$(python3 kernel-digest.py build/src/asahi/lib/libagx_shaders.c)
+  if [ "$digest" = "$_qualified_kernel_digest" ]; then
+    echo "qualified-match kernel-digest $digest build/src/asahi/lib/libagx_shaders.c"
+  else
+    echo "QUALIFIED-MISMATCH kernel-digest want $_qualified_kernel_digest got $digest"; qbad=1
+  fi
+
+  # The resolved options and dependencies, for comparison with mesa-m3's build.
+  python3 - build/meson-info/intro-buildoptions.json build/meson-info/intro-dependencies.json <<'EOF'
+import json, sys
+for o in json.load(open(sys.argv[1])):
+    if o['section'] in ('user', 'core', 'base') and o['name'] not in ('prefix', 'libdir'):
+        print('meson-option', o['name'], '=', json.dumps(o['value']))
+for d in sorted(json.load(open(sys.argv[2])), key=lambda d: d['name']):
+    print('meson-dependency', d['name'], d.get('version'), d.get('type'))
+EOF
+  if [ "$qbad" != 0 ]; then
+    echo "this build does not reproduce the qualified build's kernel files"; return 1
+  fi
+
+  # The programs, against the system loaders (libglvnd, Vulkan loader).
+  glslangValidator -V --target-env vulkan1.1 --vn compute_check_spv \
+    -o compute-check.spv.h compute-check.comp
+  glslangValidator -V --target-env vulkan1.1 --vn render_check_vert \
+    -o render-check.vert.h render-check.vert
+  glslangValidator -V --target-env vulkan1.1 --vn render_check_frag \
+    -o render-check.frag.h render-check.frag
+  ${CC:-cc} ${CFLAGS} -Wall -I. -o compute-check compute-check.c ${LDFLAGS} -lvulkan
+  ${CC:-cc} ${CFLAGS} -Wall -I. -o vk-render-check vk-render-check.c ${LDFLAGS} -lvulkan
+  ${CC:-cc} ${CFLAGS} -Wall -o gl-render-check gl-render-check.c ${LDFLAGS} -lEGL -lGLESv2
+  ${CC:-cc} ${CFLAGS} -Wall -o gpu-heat gpu-heat.c ${LDFLAGS} -lEGL -lGLESv2
+  # The session probe, with its implementation prefix moved to this one.
+  sed 's|^#define PREFIX "/opt/mesa-m3/"$|#define PREFIX "/opt/mesa-m3-g15c/"|' \
+    mesa-m3-probe.c > g15c-probe.c
+  [ "$(grep -c '^#define PREFIX "/opt/mesa-m3-g15c/"$' g15c-probe.c)" = 1 ] ||
+    { echo "mesa-m3-probe.c: PREFIX not moved"; return 1; }
+  ${CC:-cc} ${CFLAGS} -Wall -I. -o mesa-m3-probe g15c-probe.c ${LDFLAGS} \
+    -lEGL -lGLESv2 -lvulkan -lwayland-client -lwayland-egl
+
+  # drm-shim smoke: the built drivers open the G15C profile only with the
+  # opt-in, record and submit a compute job, a Vulkan render and a GLES render
+  # through zink, and still open G15S and G15G as before. The shim executes
+  # nothing, so results are not checked (compute-check reports wrong words).
+  mkdir -p smoke
+  printf '{"file_format_version":"1.0.0","ICD":{"library_path":"%s"}}\n' \
+    "$srcdir/build/src/egl/libEGL_mesa.so.0" > smoke/50_mesa.json
+  local admitted='^asahi: G15C admitted \(ASAHI_M3_G15C=1\): chip 0x6031, 4 clusters x 10 slots, 40 cores \(masks 0x3ff 0x3ff 0x3ff 0x3ff\), revision 0x12, features 0x0, max 1380000 kHz; scheduling stalls off; VA layout m3-runtime-'
+  local sbad=0
+  _expect g15c-compute 1 "$admitted" '^Device: Apple M3 Max \(G15C B2\) \(deviceID 0x6031\)$' '^MISMATCH run 1:' -- \
+    _shim g15c env ASAHI_M3_EXPERIMENTAL=1 ASAHI_M3_G15C=1 ./compute-check 1 || sbad=1
+  _expect g15c-vk-render 0 "$admitted" '^Device: Apple M3 Max \(G15C B2\) \(deviceID 0x6031\)$' '^DONE: [1-9][0-9]* runs' -- \
+    _shim g15c env ASAHI_M3_EXPERIMENTAL=1 ASAHI_M3_G15C=1 ./vk-render-check 1 --no-check || sbad=1
+  _expect g15c-gl-render 0 "$admitted" '^Renderer: zink .*Apple M3 Max \(G15C B2\)' '^DONE: [1-9][0-9]* runs' -- \
+    _shim g15c env ASAHI_M3_EXPERIMENTAL=1 ASAHI_M3_G15C=1 ./gl-render-check 1 --no-check || sbad=1
+  _expect g15c-gpu-heat 0 '^DONE: ' -- \
+    _shim g15c env ASAHI_M3_EXPERIMENTAL=1 ASAHI_M3_G15C=1 ./gpu-heat 1 64 64 4 || sbad=1
+  _expect g15c-stalls 0 'scheduling stalls ON \(ASAHI_G15C_SCHEDULING_STALLS=1\)' '^DONE: [1-9][0-9]* runs' -- \
+    _shim g15c env ASAHI_M3_EXPERIMENTAL=1 ASAHI_M3_G15C=1 ASAHI_G15C_SCHEDULING_STALLS=1 ./vk-render-check 1 --no-check || sbad=1
+  _expect g15c-no-opt-in 2 'Apple G15C uses the G15 command stream, which this driver does not implement' -- \
+    _shim g15c env ASAHI_M3_EXPERIMENTAL=1 ./vk-render-check 1 --no-check || sbad=1
+  _expect g15c-no-m3-switch 2 '^asahi: G15C refused \(ASAHI_M3_G15C=1\): ASAHI_M3_EXPERIMENTAL=1 is not set' -- \
+    _shim g15c env ASAHI_M3_G15C=1 ./vk-render-check 1 --no-check || sbad=1
+  _expect g15s-vk-render 0 '^Device: Apple M3 Pro \(G15S B1\) \(deviceID 0x6030\)$' '^DONE: [1-9][0-9]* runs' -- \
+    _shim g15s env ASAHI_M3_EXPERIMENTAL=1 ./vk-render-check 1 --no-check || sbad=1
+  _expect g15g-vk-render 0 '^Device: Apple M3 \(G15G C0\) \(deviceID 0x8122\)$' '^DONE: [1-9][0-9]* runs' -- \
+    _shim g15g env ASAHI_M3_EXPERIMENTAL=1 ./vk-render-check 1 --no-check || sbad=1
+  [ "$sbad" = 0 ] || { echo "drm-shim smoke failed"; return 1; }
+  echo "drm-shim-smoke=pass"
+}
+
+package() {
+  # These must equal what needs-derive.py derives from the shipped ELF files
+  # (checked below), as in mesa-m3. coreutils provides timeout for the scripts.
+  depends=('coreutils' 'expat' 'glibc>=2.43' 'libdisplay-info' 'libdrm' 'libgcc>=3.0' 'libglvnd'
+           'libstdc++>=11.1' 'libx11' 'libxcb' 'libxext' 'libxshmfence' 'libxxf86vm'
+           'spirv-tools>=1:1.4.357.0' 'systemd-libs' 'vulkan-icd-loader' 'wayland'
+           'xcb-util-keysyms' 'zlib' 'zstd')
+
+  meson install -C build --destdir "${pkgdir}" --no-rebuild
+  # The shim is a build-time test tool; nothing builds against the prefix.
+  rm -f "${pkgdir}${_prefix}/lib/libasahi_noop_drm_shim.so"
+  rm -r "${pkgdir}${_prefix}/include" "${pkgdir}${_prefix}/lib/pkgconfig"
+
+  install -Dm644 10-m3-asahi-zink.conf "${pkgdir}${_prefix}/share/drirc.d/10-m3-asahi-zink.conf"
+  install -Dm755 compute-check "${pkgdir}${_prefix}/bin/compute-check"
+  install -Dm755 vk-render-check "${pkgdir}${_prefix}/bin/vk-render-check"
+  install -Dm755 gl-render-check "${pkgdir}${_prefix}/bin/gl-render-check"
+  install -Dm755 gpu-heat "${pkgdir}${_prefix}/bin/gpu-heat"
+  install -Dm755 g15c-run "${pkgdir}${_prefix}/bin/g15c-run"
+  install -Dm755 g15c-first-job "${pkgdir}${_prefix}/bin/g15c-first-job"
+  install -Dm755 mesa-m3-probe "${pkgdir}${_prefix}/libexec/mesa-m3-probe"
+  install -Dm755 g15c-mesa-m3-probe "${pkgdir}${_prefix}/bin/mesa-m3-probe"
+
+  local meta="${pkgdir}${_prefix}/share/mesa-m3-g15c"
+  install -d "$meta"
+  echo "${pkgver}-${pkgrel}" > "$meta/package-version"
+  printf 'source=%s\nchip=t6031-g15c\nopt-in=ASAHI_M3_EXPERIMENTAL=1 ASAHI_M3_G15C=1\nvulkan=honeykrisp\nopengl=zink\n' \
+    "$_commit" > "$meta/capabilities"
+
+  # Licences: Mesa's statement and texts, and the notices of the compiled files. The
+  # libraries still carry debug info here (makepkg strips after this function).
+  local lic="${pkgdir}${_prefix}/share/licenses/${pkgname}"
+  install -Dm644 "${_src}/docs/license.rst" "${lic}/license.rst"
+  cp -r "${_src}/licenses" "${lic}/licenses"
+  chmod -R u=rwX,go=rX "${lic}/licenses"
+  python3 notices-gen.py "${_src}" build "${lic}/NOTICES" "${pkgname}" "${_prefix}" \
+    gpu-heat,compute-check,vk-render-check,gl-render-check,mesa-m3-probe \
+    $(find "${pkgdir}${_prefix}/lib" -name '*.so*' -type f)
+  ! grep -q '(file not found)' "${lic}/NOTICES" || { echo "NOTICES misses files"; return 1; }
+
+  # Nothing in the package may need a versioned LLVM or a build directory at run time.
+  local elfs
+  elfs=$(find "${pkgdir}${_prefix}" -type f -exec sh -c 'head -c4 "$1" | grep -q ELF' sh {} \; -print)
+  if printf '%s\n' "$elfs" | xargs readelf -d 2>/dev/null | grep -E 'NEEDED.*lib(LLVM|clang)'; then
+    echo "a binary links LLVM or clang"; return 1
+  fi
+  if printf '%s\n' "$elfs" | xargs readelf -d 2>/dev/null | grep -E '\((RPATH|RUNPATH)\)'; then
+    echo "a binary carries an RPATH or RUNPATH"; return 1
+  fi
+  local bad
+  bad=$(find "${pkgdir}" -type f -exec sh -c 'head -c4 "$1" | grep -q ELF || grep -l -a -F "$2" "$1"' sh {} "${srcdir%/src}" \;)
+  [ -z "$bad" ] || { echo "a shipped file names the build directory: $bad"; return 1; }
+
+  # The dependencies, derived from every shipped ELF file; they must equal depends.
+  local d declared=()
+  for d in "${depends[@]}"; do declared+=(--declared "$d"); done
+  python3 needs-derive.py "${pkgdir}${_prefix}" "${pkgdir}${_prefix}/lib" "$meta/needs.tsv" "$meta/needs" \
+    --libdir-label "${_prefix}/lib" --linked spirv-tools=1:1.4.357.0 \
+    --extra "coreutils=timeout of bin/g15c-run and bin/g15c-first-job" "${declared[@]}"
+  sed 's/^/  /' "$meta/needs.tsv"
+  chmod 644 "$meta"/*
+  echo "NEEDS: $(cat "$meta/needs")"
+
+  # Every file is in the prefix (the M3 Max kit installs nothing else).
+  local stray
+  stray=$(cd "${pkgdir}" && find . \( -type f -o -type l \) ! -path "./opt/mesa-m3-g15c/*")
+  [ -z "${stray}" ] || { echo "files outside the prefix: ${stray}"; return 1; }
+}

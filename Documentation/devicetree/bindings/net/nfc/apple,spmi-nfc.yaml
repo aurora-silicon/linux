@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/net/nfc/apple,spmi-nfc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple SPMI NFC peripheral
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  SPMI NFC peripheral resources. The address is a unique slave identifier on
+  its parent bus. Register access and protocol support are separate from
+  describing the peripheral and its interrupt resources.
+
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t6020-spmi-nfc
+          - apple,t6021-spmi-nfc
+          - apple,t6022-spmi-nfc
+          - apple,t8112-spmi-nfc
+  required:
+    - compatible
+
+properties:
+  compatible:
+    items:
+      - enum:
+          - apple,t6020-spmi-nfc
+          - apple,t6021-spmi-nfc
+          - apple,t6022-spmi-nfc
+          - apple,t8112-spmi-nfc
+      - const: apple,spmi-nfc
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    maxItems: 7
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false

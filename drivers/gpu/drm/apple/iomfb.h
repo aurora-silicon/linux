@@ -1,0 +1,574 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+/* Copyright 2021 Alyssa Rosenzweig */
+
+#ifndef __APPLE_DCPEP_H__
+#define __APPLE_DCPEP_H__
+
+#include <linux/build_bug.h>
+#include <linux/string.h>
+#include <linux/types.h>
+
+#include "version_utils.h"
+
+/* Fixed size of shared memory between DCP and AP */
+#define DCP_SHMEM_SIZE 0x100000
+
+/* DCP message contexts */
+enum dcp_context_id {
+	/* Callback */
+	DCP_CONTEXT_CB = 0,
+	DCP_CONTEXT_ASYNC_CB = 1,
+
+	/* Command */
+	DCP_CONTEXT_CMD = 2,
+
+	/* Asynchronous */
+	DCP_CONTEXT_ASYNC = 3,
+
+	/* Out-of-band callback */
+	DCP_CONTEXT_OOBCB = 4,
+	DCP_CONTEXT_OOBASYNC_CB = 5,
+
+	/* Out-of-band command */
+	DCP_CONTEXT_OOBCMD = 6,
+
+	/* Out-of-band Asynchronous */
+	DCP_CONTEXT_OOBASYNC = 7,
+
+	DCP_NUM_CONTEXTS
+};
+
+/* RTKit endpoint message types */
+enum dcpep_type {
+	/* Set shared memory */
+	IOMFB_MESSAGE_TYPE_SET_SHMEM = 0,
+
+	/* DCP is initialized */
+	IOMFB_MESSAGE_TYPE_INITIALIZED = 1,
+
+	/* Remote procedure call */
+	IOMFB_MESSAGE_TYPE_MSG = 2,
+};
+
+/*
+ * IOMFB supports the setting of a number of parameters
+ * that alter various aspects of the connected sink's
+ * behaviour at runtime.
+ */
+enum iomfb_parameter {
+	IOMFBPARAM_ADAPTIVE_SYNC = 14,
+};
+
+#define IOMFB_MESSAGE_TYPE	GENMASK_ULL( 3,  0)
+
+/* Message */
+#define IOMFB_MSG_LENGTH	GENMASK_ULL(63, 32)
+#define IOMFB_MSG_OFFSET	GENMASK_ULL(31, 16)
+#define IOMFB_MSG_CONTEXT	GENMASK_ULL(11,  8)
+#define IOMFB_MSG_ACK		BIT_ULL(6)
+
+/* Set shmem */
+#define IOMFB_SHMEM_DVA		GENMASK_ULL(63, 16)
+#define IOMFB_SHMEM_FLAG	GENMASK_ULL( 7,  4)
+#define IOMFB_SHMEM_FLAG_VALUE	4
+
+struct dcp_packet_header {
+	char tag[4];
+	u32 in_len;
+	u32 out_len;
+} __packed;
+
+#define DCP_IS_NULL(ptr) ((ptr) ? 1 : 0)
+#define DCP_PACKET_ALIGNMENT (0x40)
+
+enum iomfb_property_id {
+    IOMFB_PROPERTY_NITS_V13_3 = 15, // divide by Brightness_Scale
+    IOMFB_PROPERTY_NITS_V14_7 = 19,
+};
+
+#define IOMFB_BRIGHTNESS_MIN 0x10000000
+
+/* Structures used in v12.0 firmware */
+
+#define SWAP_SURFACES 4
+
+struct dcp_iouserclient {
+	/* Handle for the IOUserClient. macOS sets this to a kernel VA. */
+	u64 handle;
+	u32 unk;
+	u8 flag1;
+	u8 flag2;
+	u8 padding[2];
+} __packed;
+
+/*
+ * Update background color to struct dcp_swap.bg_color
+ */
+#define IOMFB_SET_BACKGROUND	BIT(31)
+
+struct dcp_allocate_bandwidth_req {
+	u64 unk1;
+	u64 unk2;
+	u64 unk3;
+	u8 unk1_null;
+	u8 unk2_null;
+	u8 padding[8];
+} __packed;
+
+struct dcp_allocate_bandwidth_resp {
+	u64 unk1;
+	u64 unk2;
+	u32 ret;
+} __packed;
+
+struct dcp_rt_bandwidth {
+	u64 unk1;
+	u64 reg_scratch;
+	u64 reg_doorbell;
+	u32 unk2;
+	u32 doorbell_bit;
+	u32 padding[7];
+} __packed;
+
+struct frame_sync_props {
+	u8 unk[28];
+};
+
+struct dcp_set_frame_sync_props_req {
+	struct frame_sync_props props;
+	u8 frame_sync_props_null;
+	u8 padding[3];
+} __packed;
+
+struct dcp_set_frame_sync_props_resp {
+	struct frame_sync_props props;
+} __packed;
+
+/* Method calls */
+
+enum dcpep_method {
+	dcpep_late_init_signal,
+	dcpep_setup_video_limits,
+	dcpep_set_create_dfb,
+	dcpep_start_signal,
+	dcpep_swap_start,
+	dcpep_swap_submit,
+	dcpep_set_display_device,
+	dcpep_set_digital_out_mode,
+	dcpep_create_default_fb,
+	dcpep_set_display_refresh_properties,
+	dcpep_flush_supports_power,
+	dcpep_set_power_state,
+	dcpep_first_client_open,
+	dcpep_register_dfb_surface,
+	dcpep_set_parameter_dcp,
+	dcpep_enable_disable_video_power_savings,
+	dcpep_is_main_display,
+	iomfbep_a131_pmu_service_matched,
+	iomfbep_a132_backlight_service_matched,
+	iomfbep_a358_vi_set_temperature_hint,
+	iomfbep_get_color_remap_mode,
+	iomfbep_last_client_close,
+	iomfbep_abort_swaps_dcp,
+	iomfbep_set_matrix,
+	/*
+	 * H17P default-framebuffer queries, issued from inside
+	 * start_hardware_boot (D121) between create_default_fb and
+	 * setup_video_limits.
+	 */
+	dcpep_get_dfb_compression_info,
+	dcpep_get_dfb_info,
+	dcpep_get_dfb_layout,
+	dcpep_get_dfb_state,
+	dcpep_set_dfb_dimensions,
+	dcpep_commit_dfb_info,
+	dcpep_dfb_query,
+	dcpep_dfb_ready_query,
+	/*
+	 * H17P pipe-configuration calls made before the first swap.  Most
+	 * names are unknown; they are identified by method number.
+	 */
+	dcpep_pipe_query_353,
+	dcpep_pipe_set_352,
+	dcpep_pipe_cfg_415,
+	dcpep_pipe_cfg_031,
+	dcpep_pipe_cfg_414,
+	dcpep_pipe_query_478,
+	dcpep_pipe_query_474,
+	dcpep_pipe_set_476,
+	dcpep_unnamed_500,
+	iomfbep_set_brightness_correction,
+	dcpep_num_methods
+};
+
+#define IOMFB_METHOD(tag, name) [name] = { #name, { tag[0], tag[1], tag[2], tag[3] } }
+#define IOMFB_METHOD_H17(tag, h17g, name) [name] = { #name, \
+	{ tag[0], tag[1], tag[2], tag[3] }, \
+	{ h17g[0], h17g[1], h17g[2], h17g[3] } }
+
+struct dcp_method_entry {
+	const char *name;
+	char tag[4];
+	/* H17G shares the H17P transport but changes selected method IDs. */
+	char tag_h17g[4];
+};
+
+/* The IOMFB method table of a firmware 27.x build, by its compat string; NULL if unknown. */
+const struct dcp_method_entry *iomfb_v27_methods(const char *compat);
+const struct dcp_method_entry *iomfb_v27_methods_j714s(struct device *dev,
+						       const struct dcp_method_entry *methods);
+/* The first method of a firmware 27.x table that has no ID, NULL if none. */
+const char *iomfb_v27_missing_method(const struct dcp_method_entry *methods,
+				     unsigned int *count);
+
+#define IOMFB_MAX_CB (1000)
+
+bool iomfb_validate_callback_h17p(int tag, u32 in_len, u32 out_len);
+struct apple_dcp;
+bool iomfb_channels_idle(struct apple_dcp *dcp);
+int iomfb_v27_sleep_rpc(struct apple_dcp *dcp, bool a500, bool on);
+bool iomfb_v27_sleep_described(struct apple_dcp *dcp);
+void iomfb_v27_wake_present(struct apple_dcp *dcp);
+int iomfb_v27_sleep_plain(struct apple_dcp *dcp, bool on);
+int iomfb_v27_sleep_call(struct apple_dcp *dcp, const char *tag, const void *in,
+			 u32 in_len, u32 out_len);
+int iomfb_v27_sleep_a115(struct apple_dcp *dcp, bool awake);
+/* The display stage's DT arguments: A414's eight, then A487's four. */
+#define IOMFB_V27_STAGE_ARGS	12
+int iomfb_v27_display_args(struct apple_dcp *dcp, bool stage, u8 *args);
+bool iomfb_v27_display_described(struct apple_dcp *dcp);
+bool iomfb_check_callback_h17p(struct apple_dcp *dcp, int tag, u32 in_len,
+			       u32 out_len);
+/* Desktop 26.6: does the record hold what the tag's handler reads and writes? */
+bool iomfb_check_callback_v26_6_desktop(int tag, u32 in_len, u32 out_len);
+
+typedef bool (*iomfb_cb_handler)(struct apple_dcp *, int, void *, void *);
+
+/* Prototypes */
+
+struct dcp_set_digital_out_mode_req {
+	u32 color_mode_id;
+	u32 timing_mode_id;
+} __packed;
+
+struct dcp_map_buf_req {
+	u64 buffer;
+	u8 unk;
+	u8 buf_null;
+	u8 vaddr_null;
+	u8 dva_null;
+} __packed;
+
+struct dcp_unmap_buf_resp {
+	u64 buffer;
+	u64 vaddr;
+	u64 dva;
+	u8 unk;
+	u8 buf_null;
+} __packed;
+
+struct dcp_allocate_buffer_req {
+	u32 unk0;
+	u64 size;
+	u32 unk2;
+	u8 paddr_null;
+	u8 dva_null;
+	u8 dva_size_null;
+	u8 padding;
+} __packed;
+
+struct dcp_allocate_buffer_resp {
+	u64 paddr;
+	u64 dva;
+	u64 dva_size;
+	u32 mem_desc_id;
+} __packed;
+
+struct dcp_map_physical_req {
+	u64 paddr;
+	u64 size;
+	u32 flags;
+	u8 dva_null;
+	u8 dva_size_null;
+	u8 padding[2];
+} __packed;
+
+struct dcp_map_physical_resp {
+	u64 dva;
+	u64 dva_size;
+	u32 mem_desc_id;
+} __packed;
+
+struct dcp_get_uint_prop_req {
+	char obj[4];
+	char key[0x40];
+	u64 value;
+	u8 value_null;
+	u8 padding[3];
+} __packed;
+
+struct dcp_get_uint_prop_resp {
+	u64 value;
+	u8 ret;
+	u8 padding[3];
+} __packed;
+
+struct iomfb_sr_set_property_int_req {
+	char obj[4];
+	char key[0x40];
+	u64 value;
+	u8 value_null;
+	u8 padding[3];
+} __packed;
+
+struct iomfb_set_fx_prop_req {
+	char obj[4];
+	char key[0x40];
+	u32 value;
+} __packed;
+
+struct dcp_set_power_state_resp {
+	u32 unkint;
+	u32 ret;
+} __packed;
+
+struct dcp_set_dcpav_prop_chunk_req {
+	char data[0x1000];
+	u32 offset;
+	u32 length;
+} __packed;
+
+struct dcp_set_dcpav_prop_end_req {
+	char key[0x40];
+} __packed;
+
+struct dcp_set_parameter_dcp {
+	u32 param;
+	u32 value[8];
+	u32 count;
+} __packed;
+
+struct dcp_swap_complete_intent_gated {
+	u32 swap_id;
+	u8 unkBool;
+	u32 unkInt;
+	u32 width;
+	u32 height;
+} __packed;
+
+struct dcp_read_edt_data_req {
+	char key[0x40];
+	u32 count;
+	u32 value[8];
+} __packed;
+
+struct dcp_read_edt_data_resp {
+	u32 value[8];
+	u8 ret;
+} __packed;
+
+struct iomfb_property {
+	u32 id;
+	u32 value;
+} __packed;
+
+/*
+ * The two IOMFB parameters macOS sends to an external display after each mode
+ * set (see dcp_external_hdr_hints()).  Split out so it can be unit tested.
+ */
+void iomfb_external_hdr_hint_values(bool pq, struct iomfb_property out[2]);
+
+struct iomfb_get_color_remap_mode_req {
+	u32 mode;
+	u8 mode_null;
+	u8 padding[3];
+} __packed;
+
+struct iomfb_get_color_remap_mode_resp {
+	u32 mode;
+	u32 ret;
+} __packed;
+
+struct iomfb_last_client_close_req {
+	u8 unkint_null;
+	u8 padding[3];
+} __packed;
+
+struct iomfb_last_client_close_resp {
+	u32 unkint;
+} __packed;
+
+struct io_user_client {
+	u64 addr;
+	u32 unk;
+	u8 flag1;
+	u8 flag2;
+	u8 pad[2];
+} __packed;
+
+struct iomfb_abort_swaps_dcp_req {
+	struct io_user_client client;
+	u8 client_null;
+	u8 pad[3];
+} __packed;
+
+struct iomfb_abort_swaps_dcp_resp {
+	struct io_user_client client;
+	u32 ret;
+} __packed;
+
+struct iomfb_set_matrix_req {
+	u32 location;
+	u64 matrix[9];
+	u8 matrix_null;
+	u8 padding[3];
+} __packed;
+
+/* "PMUS"/"Temperature" reply in 0.1 K: the battery temperature, as macOS. */
+#define DCP_PMU_TEMPERATURE_FALLBACK 3029
+struct device;
+u64 dcp_pmu_temperature(struct device *dev);
+
+struct drm_color_ctm;
+void dcp_ctm_to_fw(u64 fw[9], const struct drm_color_ctm *ctm);
+
+struct iomfb_set_matrix_resp {
+	u32 ret;
+} __packed;
+
+struct dcpep_get_tiling_state_req {
+	u32 event;
+	u32 param;
+	u32 value;
+	u8 value_null;
+	u8 padding[3];
+} __packed;
+
+struct dcpep_get_tiling_state_resp {
+	u32 value;
+	u32 ret;
+} __packed;
+
+/*
+ * Records of the desktop 26.6 IOMFB (T6041, DCP_FIRMWARE_V_26_6_DESKTOP)
+ * that differ from the shared ones above.
+ */
+
+/* A364 get_mode_info: fills the mode record A413 then selects. */
+struct dcp_get_mode_info_req_v26_6 {
+	u8 mode[0x64];
+	u8 mode_null;
+	u8 padding0[3];
+	u64 opaque;
+	u32 timing_mode_id;
+	u32 color_mode_id;
+	u8 result_null;
+	u8 padding1[3];
+} __packed;
+
+struct dcp_get_mode_info_resp_v26_6 {
+	u8 opaque[0x74];
+} __packed;
+
+/* A469 abort_swaps_dcp takes the bare client identity. */
+struct iomfb_abort_swaps_dcp_req_v26_6 {
+	u64 client;
+} __packed;
+
+struct iomfb_abort_swaps_dcp_resp_v26_6 {
+	u32 ret;
+} __packed;
+
+/* D592 swap_complete_intent_gated, padded to 0x14. */
+struct dcp_swap_complete_intent_gated_v26_6 {
+	u32 swap_id;
+	u8 unkBool;
+	u32 unkInt;
+	u32 width;
+	u32 height;
+	u8 padding[3];
+} __packed;
+
+/* D125 read_edt_data reply, padded to 0x24. */
+struct dcp_read_edt_data_resp_v26_6 {
+	u32 value[8];
+	u8 ret;
+	u8 padding[3];
+} __packed;
+
+/*
+ * D575 hotplug_gated: the connection state and a tiled-display record in,
+ * a 0x4c-byte record out.
+ */
+struct dcp_hotplug_req_v26_6 {
+	u64 connected;
+	u8 opaque[0x50];
+} __packed;
+
+struct dcp_hotplug_resp_v26_6 {
+	u8 opaque[0x4c];
+} __packed;
+
+/*
+ * A name and a serialized dictionary: the firmware's analytics event
+ * (D113 on 27.x, D114 on desktop 26.6).
+ */
+struct dcp_dict_passthrough_req {
+	u8 key[0x40];
+	u8 value[0x1000];
+	u8 value_null;
+	u8 padding[3];
+} __packed;
+
+struct dcp_dict_passthrough_resp {
+	u8 value[0x1000];
+	u8 ret;
+	u8 padding[3];
+} __packed;
+
+static_assert(sizeof(struct dcp_dict_passthrough_req) == 0x1044);
+static_assert(sizeof(struct dcp_dict_passthrough_resp) == 0x1004);
+
+/*
+ * The analytics event passes its dictionary by pointer, so the firmware
+ * deserializes the reply's copy when the call returns, and stops if that
+ * fails. Return the dictionary as it came, and report the event not sent.
+ * A zeroed reply is not a dictionary.
+ */
+static inline void
+dcp_dict_passthrough_reply(const struct dcp_dict_passthrough_req *req,
+			   struct dcp_dict_passthrough_resp *resp)
+{
+	if (req->value_null)
+		memset(resp->value, 0, sizeof(resp->value));
+	else
+		memcpy(resp->value, req->value, sizeof(resp->value));
+	resp->ret = false;
+	memset(resp->padding, 0, sizeof(resp->padding));
+}
+
+/* A boolean argument, padded to four bytes. */
+struct dcp_bool_arg {
+	u8 value;
+	u8 padding[3];
+} __packed;
+
+/*
+ * A420 get_gamma_table / A421 set_gamma_table: three channels (red, green,
+ * blue) of 257 u32 entries. The request appends an input pointer null flag;
+ * the reply appends a return status instead. Both are 3088 bytes.
+ */
+#define IOMFB_GAMMA_ENTRIES 257
+
+struct iomfb_gamma_table_req {
+	__le32 table[3][IOMFB_GAMMA_ENTRIES];
+	u8 table_null;
+	u8 padding[3];
+} __packed;
+
+struct iomfb_gamma_table_resp {
+	__le32 table[3][IOMFB_GAMMA_ENTRIES];
+	__le32 ret;
+} __packed;
+
+#endif

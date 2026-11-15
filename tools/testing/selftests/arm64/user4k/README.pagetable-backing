@@ -1,0 +1,45 @@
+Page-table physical backing and fragment retention
+==================================================
+
+These bounded fixtures reserve 2 GiB of virtual address space and write one
+4 KiB leaf in each of 1,024 distinct 2 MiB table windows. Native payload
+backing is at most 16 MiB, with approximately 4 MiB of logical PTE tables.
+The concurrent variant uses 32 threads, 32 synchronized fault rounds and
+128 KiB thread stacks. Both verify all payload bytes across six checkpoints:
+baseline, full, quarter_survivors, refilled, quarter_survivors_again, unmapped.
+
+Run through the 4 KiB ABI launcher on a native 16 KiB kernel. Each JSON
+checkpoint requires one byte 'c' on stdin before continuing. For contents
+only, with no physical charge observation:
+
+  yes c | userpages 4k ./pagetable-retention --native-16k
+  yes c | userpages 4k ./pagetable-concurrent --native-16k
+
+For physical accounting, run each fixture alone in a fresh uncapped cgroup.
+At each checkpoint verify the fixture is the only member, record memory.stat
+pagetables and memory.swap.current, and sample at 0, 1 and 3 seconds before
+acknowledging. Record logical VmPTE separately: it is not physical backing.
+Use an external service lifetime below the fixture's 60-second alarm and
+verify all processes exit. Do not change memory.max/high or force reclaim.
+
+Compare the same complete fixture across kernels. Concurrent thread stacks
+and upper-level tables contribute to the measurements; do not subtract them
+as though they were pure payload. Deferred table releases can occur between
+samples. Contents PASS does not assert a density or performance result.
+
+The allocator reuses safely retired fragments, including slots from owners
+that still contain live tables. RCU-pending slots remain unavailable until
+their callback runs; an empty owner is freed. A reused dirty slot is cleared
+before it is returned. This avoids allocating new owners while old ones have
+reusable holes. It does not compact surviving live tables.
+
+On Neo, the serial refill checkpoint fell from 7,421,952 to 4,276,224 bytes of
+physical page tables; the concurrent refill fell from 6,275,072 to 4,276,224.
+The same six-phase contents and post-unmap cleanup passed. Whole-cgroup slab
+usage increased and includes allocator metadata plus other kernel objects.
+Do not report page-table bytes as the complete memory cost.
+
+Seven operation-timed rounds after one warmup had serial/concurrent total
+medians of 15.625/16.865 ms, versus 15.434/16.679 ms before reuse. The ranges
+substantially overlap; a small cost remains possible. These measurements do
+not establish a speedup or zero overhead. They exclude checkpoint I/O.

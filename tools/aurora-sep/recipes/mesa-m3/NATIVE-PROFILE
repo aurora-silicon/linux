@@ -1,0 +1,5 @@
+J613 firmware 26.6.2 uses experimental native OpenGL in /opt/mesa-m3/25g83. Vulkan is unavailable in this profile. Shaders requiring scratch storage are rejected before upload. Compressed render targets are unsupported. Existing Air 14.x and M3 Pro Vulkan/GL use /opt/mesa-m3.
+
+Persistent selection requires /etc/mesa-m3/t8122-gpu-experiment and the exact /etc/mesa-m3/t8122-profile token j613-25g83-hal200. The native capability marker is j613-25g83-gl-only. The loader also checks same-boot firmware and GPU ABI identity.
+
+Native MRT colour clears use per-target write masks. Background reloads preserve initialized attachments while undefined attachments may reload allocated storage.

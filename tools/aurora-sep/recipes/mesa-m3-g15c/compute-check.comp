@@ -1,0 +1,23 @@
+#version 450
+// SPDX-License-Identifier: MIT
+// compute-check: a dependent integer chain per invocation, with a loop, one
+// device load and one device store. The host recomputes every result.
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) readonly buffer Seeds { uint seed[]; };
+layout(std430, set = 0, binding = 1) writeonly buffer Results { uint result[]; };
+
+const uint ITERATIONS = 256u;
+
+void main()
+{
+   uint i = gl_GlobalInvocationID.x;
+   uint x = seed[i];
+   uint y = i * 2654435761u;
+   for (uint k = 0u; k < ITERATIONS; ++k) {
+      x = x * 1664525u + 1013904223u;
+      y ^= x >> 13;
+      y = (y << 5) | (y >> 27);
+      x += y + k;
+   }
+   result[i] = x ^ y;
+}

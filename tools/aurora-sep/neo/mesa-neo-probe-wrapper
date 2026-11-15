@@ -1,0 +1,5 @@
+#!/bin/sh
+# Copyright 2026 Chris Kearney
+# SPDX-License-Identifier: MIT
+. /opt/mesa-neo/libexec/mesa-neo-env || exit 1
+mesa_neo_probe_run '' /opt/mesa-neo "$@"

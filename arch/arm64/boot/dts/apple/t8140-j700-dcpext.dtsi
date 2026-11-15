@@ -1,0 +1,77 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * T8140 external display resources measured through the public ADT API.
+ *
+ * The controller remains disabled until the loader validates and preserves
+ * the inherited firmware and its complete dependency group.
+ */
+
+&{/soc} {
+	dcpext: dcp@416e00000 {
+		compatible = "apple,t8140-dcpext", "apple,dcp";
+		reg = <0x4 0x16e00000 0x0 0x4000>,
+		      <0x4 0x14000000 0x0 0xafc000>,
+		      <0x4 0x16240000 0x0 0x10000>,
+		      <0x4 0x163ac000 0x0 0x4000>,
+		      <0x4 0x16800000 0x0 0x800000>,
+		      <0x3 0x02800000 0x0 0xbc000>,
+		      <0x4 0x16850000 0x0 0x4000>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2",
+			    "disp-3", "disp-4", "iop-vbar";
+		mboxes = <&dcpext_mbox>;
+		mbox-names = "mbox";
+		/* First mapper in the measured ADT iommu-parent list. */
+		iommus = <&dcpext0_dart 23>;
+		power-domains = <&ps_dispext0_cpu>;
+		/* DISPEXT0's words and pmc-dcp, for the restart after a sleep */
+		apple,display-power = <&dcp_power>;
+		apple,connector-type = "USB-C";
+		status = "disabled";
+
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		dispext0_piodma: piodma {
+			iommus = <&dispext0_dart 16>;
+		};
+
+		typec-routes {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			route@0 {
+				reg = <0>;
+				status = "disabled";
+				mode-switch;
+
+				port {
+					dcpext_typec0: endpoint {
+						remote-endpoint = <&typec0_dcp>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&typec0 {
+	ports {
+		port@3 {
+			reg = <3>;
+
+			typec0_dcp: endpoint {
+				remote-endpoint = <&dcpext_typec0>;
+			};
+		};
+	};
+};
+
+/*
+ * Retain the inherited firmware supply once the loader publishes it. After a sleep the DCP
+ * driver raises it, the way macOS does, not the PMGR resync.
+ */
+&ps_dispext0_cpu {
+	apple,always-on;
+	apple,sleep-driver-owned;
+};

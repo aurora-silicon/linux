@@ -1,0 +1,616 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J713 and J715 power-domain ownership, also used by the legacy-loader
+ * adapter (drivers/soc/apple/t8132-platform-data.dts).
+ *
+ * Only domains with a qualified Linux power/reset contract are enabled.
+ * Retained core, GPIO and display domains are firmware-owned: no state
+ * reads and no power/reset writes. The board tree enables ps_gfx and the
+ * ATC0/ATC1 PCIe and CIO domains afterwards for the GPU and USB4; the
+ * adapter enables only ps_gfx.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+&ps_msg {
+	status = "disabled";
+};
+
+&ps_aic {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_dwi {
+	status = "disabled";
+};
+
+&ps_gpio {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_pmc {
+	status = "disabled";
+};
+
+&ps_pms_fpwm0 {
+	status = "disabled";
+};
+
+&ps_pms_fpwm1 {
+	status = "disabled";
+};
+
+&ps_pms_fpwm2 {
+	status = "disabled";
+};
+
+&ps_pms_fpwm3 {
+	status = "disabled";
+};
+
+&ps_pms_fpwm4 {
+	status = "disabled";
+};
+
+&ps_pms_c1ppt {
+	status = "disabled";
+};
+
+&ps_soc_rc {
+	status = "disabled";
+};
+
+&ps_soc_dpe {
+	status = "disabled";
+};
+
+&ps_ispsens0 {
+	status = "okay";
+};
+
+&ps_ispsens1 {
+	status = "okay";
+};
+
+&ps_pmgr_soc_ocla {
+	status = "disabled";
+};
+
+&ps_ap_tmm {
+	status = "disabled";
+};
+
+&ps_dispext0_sys {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_dispext0_fe {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_dispext0_cpu {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_scodec {
+	status = "disabled";
+};
+
+&ps_scodec_streaming {
+	status = "disabled";
+};
+
+/* The DCP powers these down while the display is off. */
+&ps_disp_sys {
+	apple,firmware-owned;
+	apple,consumer-switched;
+	status = "okay";
+};
+
+&ps_disp_fe {
+	apple,firmware-owned;
+	apple,consumer-switched;
+	status = "okay";
+};
+
+&ps_gfx {
+	status = "disabled";
+};
+
+&ps_sio_cpu {
+	status = "disabled";
+};
+
+&ps_fpwm0 {
+	status = "disabled";
+};
+
+&ps_fpwm1 {
+	status = "okay";
+};
+
+&ps_fpwm2 {
+	status = "disabled";
+};
+
+&ps_i2c0 {
+	status = "disabled";
+};
+
+/* The CS42L84 headphone codec. */
+&ps_i2c1 {
+	status = "okay";
+};
+
+&ps_i2c2 {
+	status = "disabled";
+};
+
+/* The SN012776 speaker amps. */
+&ps_i2c3 {
+	status = "okay";
+};
+
+&ps_i2c4 {
+	status = "disabled";
+};
+
+&ps_i2c5 {
+	status = "disabled";
+};
+
+&ps_i2c6 {
+	status = "disabled";
+};
+
+&ps_i2c7 {
+	status = "disabled";
+};
+
+&ps_i2c8 {
+	status = "disabled";
+};
+
+&ps_spi_p {
+	status = "okay";
+};
+
+&ps_uart_p {
+	status = "okay";
+};
+
+&ps_dpa_p {
+	status = "disabled";
+};
+
+&ps_aes {
+	status = "disabled";
+};
+
+&ps_spi0 {
+	status = "disabled";
+};
+
+&ps_afiaft {
+	status = "disabled";
+};
+
+&ps_venc_sys {
+	status = "disabled";
+};
+
+&ps_spi1 {
+	status = "disabled";
+};
+
+&ps_atc0_common {
+	status = "okay";
+};
+
+&ps_spi2 {
+	status = "okay";
+};
+
+&ps_spi3 {
+	status = "disabled";
+};
+
+&ps_spi4 {
+	status = "disabled";
+};
+
+&ps_trace_fab {
+	status = "disabled";
+};
+
+&ps_atc0_pcie {
+	status = "disabled";
+};
+
+&ps_atc0_cio {
+	status = "disabled";
+};
+
+&ps_atc0_cio_pcie {
+	status = "disabled";
+};
+
+&ps_spi5 {
+	status = "disabled";
+};
+
+&ps_qspi {
+	status = "okay";
+};
+
+&ps_dptx_phy {
+	status = "disabled";
+};
+
+&ps_uart_n {
+	status = "disabled";
+};
+
+&ps_uart0 {
+	status = "okay";
+};
+
+&ps_uart1 {
+	status = "disabled";
+};
+
+&ps_uart2 {
+	status = "disabled";
+};
+
+&ps_uart3 {
+	status = "disabled";
+};
+
+&ps_uart4 {
+	status = "disabled";
+};
+
+&ps_uart5 {
+	status = "disabled";
+};
+
+&ps_uart6 {
+	status = "disabled";
+};
+
+&ps_dpa0 {
+	status = "disabled";
+};
+
+&ps_dpa1 {
+	status = "disabled";
+};
+
+&ps_atc0_cio_usb {
+	status = "disabled";
+};
+
+&ps_atc1_common {
+	status = "okay";
+};
+
+&ps_atc1_pcie {
+	status = "disabled";
+};
+
+&ps_atc1_cio {
+	status = "disabled";
+};
+
+&ps_atc1_cio_pcie {
+	status = "disabled";
+};
+
+&ps_atc1_cio_usb {
+	status = "disabled";
+};
+
+&ps_atc2_common {
+	status = "disabled";
+};
+
+&ps_atc2_pcie {
+	status = "disabled";
+};
+
+&ps_atc2_cio {
+	status = "disabled";
+};
+
+&ps_atc2_cio_pcie {
+	status = "disabled";
+};
+
+&ps_dpa2 {
+	status = "disabled";
+};
+
+&ps_atc2_cio_usb {
+	status = "disabled";
+};
+
+&ps_atc3_common {
+	status = "disabled";
+};
+
+&ps_pmp {
+	status = "okay";
+};
+
+&ps_pms_sram {
+	status = "okay";
+};
+
+&ps_atc3_pcie {
+	status = "disabled";
+};
+
+&ps_atc3_cio {
+	status = "disabled";
+};
+
+&ps_dpa3 {
+	status = "disabled";
+};
+
+&ps_atc3_cio_pcie {
+	status = "disabled";
+};
+
+&ps_atc3_cio_usb {
+	status = "disabled";
+};
+
+&ps_dpa4 {
+	status = "disabled";
+};
+
+&ps_apcie_gp {
+	status = "disabled";
+};
+
+&ps_apcie_sys_gp {
+	status = "disabled";
+};
+
+&ps_dispext1_sys {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_dispext1_fe {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_dispext1_cpu {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+/* The camera powers the ISP from its first stream until it is unbound. */
+&ps_isp_sys {
+	status = "okay";
+};
+
+&ps_ans {
+	status = "okay";
+};
+
+&ps_apcie_st {
+	status = "okay";
+};
+
+&ps_apcie_sys_st {
+	status = "okay";
+};
+
+&ps_apcie_phy_sw {
+	status = "disabled";
+};
+
+&ps_msr {
+	status = "okay";
+};
+
+&ps_msr_ase_core {
+	status = "okay";
+};
+
+&ps_ane_sys {
+	status = "okay";
+};
+
+&ps_jpg {
+	status = "okay";
+};
+
+&ps_avd_sys {
+	status = "okay";
+};
+
+&ps_sep {
+	status = "disabled";
+};
+
+&ps_isp_cpu {
+	status = "okay";
+};
+
+&ps_isp_cpu_core0 {
+	status = "okay";
+};
+
+&ps_isp_cpu_core1 {
+	status = "okay";
+};
+
+&ps_isp_fe {
+	status = "okay";
+};
+
+&ps_isp_dprx {
+	status = "okay";
+};
+
+&ps_isp_secure {
+	status = "okay";
+};
+
+&ps_isp_sts0 {
+	status = "okay";
+};
+
+&ps_isp_sts1 {
+	status = "okay";
+};
+
+&ps_isp_pearl {
+	status = "okay";
+};
+
+&ps_isp_be {
+	status = "okay";
+};
+
+&ps_isp_clr {
+	status = "okay";
+};
+
+&ps_isp_cvd {
+	status = "okay";
+};
+
+&ps_isp_cvm {
+	status = "okay";
+};
+
+&ps_venc_dma {
+	status = "disabled";
+};
+
+&ps_venc_pipe4 {
+	status = "disabled";
+};
+
+&ps_venc_pipe5 {
+	status = "disabled";
+};
+
+&ps_venc_me0 {
+	status = "disabled";
+};
+
+&ps_venc_me1 {
+	status = "disabled";
+};
+
+&ps_ane_mpm {
+	status = "okay";
+};
+
+&ps_ane_cpu {
+	status = "okay";
+};
+
+&ps_ane_td {
+	status = "okay";
+};
+
+&ps_ane_base {
+	status = "okay";
+};
+
+&ps_disp_cpu {
+	apple,firmware-owned;
+	apple,consumer-switched;
+	/* Power-gate retention workaround, as macOS sets it while off. */
+	apple,retention-workaround = <0x2504c 0x3 0x3>, <0x25070 0x1 0x0>;
+	status = "okay";
+};
+
+&ps_debug_gated {
+	status = "disabled";
+};
+
+&ps_nub_spmi0 {
+	status = "disabled";
+};
+
+&ps_nub_spmi1 {
+	status = "disabled";
+};
+
+&ps_nub_spmi_a0 {
+	status = "disabled";
+};
+
+&ps_nub_spmi_a1 {
+	status = "disabled";
+};
+
+&ps_nub_spi0 {
+	status = "disabled";
+};
+
+&ps_nub_ocla {
+	status = "disabled";
+};
+
+&ps_nub_gpio {
+	apple,firmware-owned;
+	status = "okay";
+};
+
+&ps_nub_sram {
+	status = "disabled";
+};
+
+&ps_debug_switch {
+	status = "disabled";
+};
+
+&ps_atc0_usb_aon {
+	apple,inherited-on;
+	status = "okay";
+};
+
+&ps_atc1_usb_aon {
+	apple,inherited-on;
+	status = "okay";
+};
+
+&ps_atc0_usb {
+	status = "okay";
+};
+
+&ps_atc1_usb {
+	status = "okay";
+};
+
+&ps_atc2_usb_aon {
+	status = "disabled";
+};
+
+&ps_atc3_usb_aon {
+	status = "disabled";
+};
+
+&ps_atc2_usb {
+	status = "disabled";
+};
+
+&ps_atc3_usb {
+	status = "disabled";
+};

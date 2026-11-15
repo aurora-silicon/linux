@@ -1,0 +1,31 @@
+#!/bin/sh
+# Hold the display manager until the Apple display driver is up.
+#
+# On some Macs (seen on 16" M2 Pro/Max) apple-drm registers well after the
+# desktop session has started on the boot framebuffer (simpledrm). When the
+# boot framebuffer then goes away, the session is left without its screen
+# and the built-in display stays black until the display manager restarts.
+# Waiting for apple-drm first avoids the race. It only waits on a Mac whose
+# device tree enables an Apple display subsystem, gives up after 30 s, and
+# never fails the display manager's start.
+
+enabled=$(grep -rl --null-data -x 'apple,display-subsystem' /proc/device-tree 2>/dev/null |
+	while read -r node; do
+		dir=${node%/compatible}
+		status=okay
+		[ -e "$dir/status" ] && status=$(tr -d '\0' <"$dir/status")
+		[ "$status" = okay ] && echo yes
+	done)
+[ -n "$enabled" ] || exit 0
+
+i=0
+while [ "$i" -lt 60 ]; do
+	for card in /sys/class/drm/card[0-9]*; do
+		[ -e "$card/device/driver" ] || continue
+		[ "$(basename "$(readlink -f "$card/device/driver")")" = apple-drm ] && exit 0
+	done
+	sleep 0.5
+	i=$((i + 1))
+done
+echo "aurora-touchid: apple-drm did not appear within 30 s; starting the display manager anyway" >&2
+exit 0

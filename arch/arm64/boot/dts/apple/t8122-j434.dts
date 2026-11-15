@@ -1,0 +1,54 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple iMac (24-inch, 4x USB-C, M3, 2023)
+ *
+ * target-type: J434
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#include "t8122.dtsi"
+#include "t8122-j433-j434.dtsi"
+
+/ {
+	compatible = "apple,j434", "apple,t8122", "apple,arm-platform";
+	model = "Apple iMac (24-inch, 4x USB-C, M3, 2023)";
+};
+
+&dcp {
+	panel: panel {
+		compatible = "apple,panel-j434", "apple,panel";
+		width-mm = <522>;
+		height-mm = <294>;
+		apple,max-brightness = <525>;
+	};
+};
+
+&wifi0 {
+	brcm,board-type = "apple,iona";
+};
+
+&bluetooth0 {
+	brcm,board-type = "apple,iona";
+};
+
+&port02 {
+	bus-range = <3 3>;
+	pwren-gpios = <&smc_gpio 14 GPIO_ACTIVE_HIGH>;
+	status = "okay";
+};
+
+&pcie2_dart {
+	status = "okay";
+};
+
+&aop_audio {
+	apple,chassis-name = "J434";
+};
+
+&sound {
+	compatible = "apple,j434-macaudio", "apple,macaudio";
+	model = "iMac J434";
+};

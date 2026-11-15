@@ -1,0 +1,81 @@
+#!/bin/bash
+# Enrol a finger with Touch ID and use it for sudo, polkit and the lock screen.
+#
+#   aurora-touchid-setup            enrol, verify, then configure PAM
+#   aurora-touchid-setup --remove   take fingerprint out of PAM again
+#
+# The Apple SEP driver (apple-sep.service) must be running: /dev/sep-bio exists.
+# PAM is only changed after a finger has been enrolled and verified, with the
+# same lines and clamshell gate as Omarchy's omarchy-setup-security-fingerprint,
+# which cannot be used here (it looks for USB readers and installs libfprint-git).
+set -euo pipefail
+
+gate="auth      [success=1 default=ignore] pam_exec.so quiet /usr/bin/omarchy-hw-laptop-closed"
+sudo=""
+(( EUID == 0 )) || sudo=sudo
+
+say() { printf '\033[1;32m%s\033[0m\n' "$*"; }
+die() { printf '\033[1;31m%s\033[0m\n' "$*" >&2; exit 1; }
+
+configure_pam() {
+  local file
+  for file in /etc/pam.d/sudo /etc/pam.d/polkit-1; do
+    if [[ ! -f $file && $file == */polkit-1 ]]; then
+      $sudo tee "$file" >/dev/null <<EOF
+auth      sufficient pam_fprintd.so
+auth      required pam_unix.so
+
+account   required pam_unix.so
+password  required pam_unix.so
+session   required pam_unix.so
+EOF
+    fi
+    grep -q pam_fprintd.so "$file" || $sudo sed -i '1i auth      sufficient pam_fprintd.so' "$file"
+    # The gate needs omarchy-hw-laptop-closed; without Omarchy's helper, skip it.
+    if [[ -x /usr/bin/omarchy-hw-laptop-closed ]] && ! grep -q omarchy-hw-laptop-closed "$file"; then
+      $sudo sed -i "/pam_fprintd\.so/i $gate" "$file"
+    fi
+  done
+  $sudo tee /etc/pam.d/omarchy-lock-fingerprint >/dev/null <<'EOF'
+#%PAM-1.0
+auth       required                    pam_fprintd.so
+account    include                     system-local-login
+EOF
+  command -v omarchy-apply-lock >/dev/null && omarchy-apply-lock || true
+}
+
+remove_pam() {
+  local file
+  for file in /etc/pam.d/sudo /etc/pam.d/polkit-1; do
+    [[ -f $file ]] || continue
+    $sudo sed -i -e '/pam_fprintd\.so/d' -e '/omarchy-hw-laptop-closed/d' "$file"
+  done
+  $sudo rm -f /etc/pam.d/omarchy-lock-fingerprint
+  command -v omarchy-apply-lock >/dev/null && omarchy-apply-lock || true
+  say "Fingerprint login removed. Enrolled prints stay in fprintd; delete them with: fprintd-delete $USER"
+}
+
+usage() {
+  sed -n '2,5s/^# \{0,1\}//p' "$0"
+}
+
+case ${1:-} in
+  "") ;;
+  --remove) remove_pam; exit 0 ;;
+  -h|--help) usage; exit 0 ;;
+  *) usage >&2; die "unknown option $1" ;;
+esac
+
+[[ -c /dev/sep-bio ]] || die "Touch ID is not available: /dev/sep-bio is missing.
+Reboot into the aurora kernel first, then check: systemctl status apple-sep.service"
+
+say "Place your right index finger on Touch ID, lift and repeat until enrolment completes."
+$sudo fprintd-enroll "${SUDO_USER:-$USER}" || die "Enrolment failed. Run aurora-touchid-setup again."
+
+say "Enrolled. Now touch the sensor once more to verify."
+# As root, like the enrolment: polkit lets an unprivileged user claim the
+# reader only from the active local session, so over SSH it refuses.
+$sudo fprintd-verify "${SUDO_USER:-$USER}" || die "Verification failed; PAM was not changed. Run aurora-touchid-setup again."
+
+configure_pam
+say "Touch ID now works for sudo, polkit prompts and the lock screen. Your password still works too."

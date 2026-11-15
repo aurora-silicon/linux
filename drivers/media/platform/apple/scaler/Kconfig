@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+config VIDEO_APPLE_SCALER
+	tristate "Apple Silicon scaler and colour-space converter"
+	depends on VIDEO_DEV
+	depends on ARCH_APPLE || (COMPILE_TEST && 64BIT)
+	depends on OF_ADDRESS && IOMMU_API && PM
+	select V4L2_MEM2MEM_DEV
+	select VIDEOBUF2_DMA_CONTIG
+	help
+	  V4L2 memory-to-memory driver for the image scaler and
+	  colour-space converter (MSR) in Apple silicon SoCs (M1 to M4
+	  generations and A18 Pro). It converts between Y'CbCr (NV12,
+	  P010) and 32-bit RGB at the same size; scaling follows.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called apple-scaler.
+
+config VIDEO_APPLE_SCALER_KUNIT_TEST
+	tristate "KUnit tests for the Apple scaler" if !KUNIT_ALL_TESTS
+	depends on KUNIT && VIDEO_APPLE_SCALER
+	default KUNIT_ALL_TESTS
+	help
+	  Check the colour-conversion matrices, offsets, scale ratios and
+	  format encodings the scaler driver programs. No hardware is
+	  needed.

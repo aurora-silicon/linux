@@ -1,0 +1,159 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/hwmon/apple,smc-hwmon.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple SMC Hardware Monitoring
+
+description:
+  Apple's System Management Controller (SMC) exposes a vast array of
+  hardware monitoring sensors, including temperature probes, current and
+  voltage sense, power meters, and fan speeds. It also provides endpoints
+  to manually control the speed of each fan individually. Each Apple
+  Silicon device exposes a different set of endpoints via SMC keys. This
+  is true even when two machines share an SoC. The CPU core temperature
+  sensor keys on an M1 Mac mini are different to those on an M1 MacBook
+  Pro, for example.
+
+maintainers:
+  - James Calligeros <jcalligeros99@gmail.com>
+
+$defs:
+  sensor:
+    type: object
+
+    properties:
+      apple,key-id:
+        $ref: /schemas/types.yaml#/definitions/string
+        pattern: "^[A-Za-z0-9]{4}$"
+        description: The SMC FourCC key of the desired sensor.
+          Must match the node's suffix.
+
+      label:
+        description: Human-readable name for the sensor
+
+      apple,no-data-below-millicelsius:
+        maxItems: 1
+        description:
+          The SMC publishes a placeholder below this temperature, in
+          millidegrees Celsius, while the sensor is powered down (the GPU
+          temperature sensors of the M4 Pro read -4 to 4 C while the GPU is
+          off). Such readings are reported as no data instead of as a
+          temperature, and a thermal zone on the sensor skips them.
+
+    required:
+      - apple,key-id
+
+properties:
+  compatible:
+    const: apple,smc-hwmon
+
+  apple,soc-die-keys:
+    $ref: /schemas/types.yaml#/definitions/string-array
+    minItems: 1
+    maxItems: 32
+    items:
+      pattern: "^[A-Za-z0-9]{4}$"
+    description:
+      SMC FourCC keys for SoC die temperature sensors. Each key must report a
+      readable four-byte floating-point temperature in degrees Celsius. The
+      hottest reading supplies the macsmc_soc_die thermal zone. These channels
+      follow the temperature-* children in the listed order and are labelled
+      "SoC die <key>". Keys absent from the running firmware or with an
+      unsupported format are skipped. These channels do not change the indices
+      used by thermal-sensors references to temperature-* children. With
+      apple,discover-temperatures, a listed key adds no channel; its
+      discovered channel (labelled with the key) supplies the zone.
+
+  apple,thermal-pressure-key:
+    $ref: /schemas/types.yaml#/definitions/string
+    pattern: "^[A-Za-z0-9]{4}$"
+    description:
+      SMC FourCC key reporting the firmware thermal pressure level as a
+      readable signed 32-bit integer. This is exposed for monitoring only.
+
+  apple,discover-temperatures:
+    type: boolean
+    description:
+      Enumerate readable, non-function temperature keys from the running SMC
+      instead of providing a board-specific temperature table. Only keys
+      beginning with T and reporting a four-byte floating-point value are
+      exposed. Labels are the key identifiers, without inferred locations.
+      Channels are reporting-only; their indices depend on the firmware and
+      must not be used by a static thermal policy.
+
+  "#thermal-sensor-cells":
+    const: 1
+    description:
+      The cell is the zero-based index of a temperature channel, counting
+      the temperature-* child nodes in order.
+
+  "#cooling-cells":
+    const: 3
+    deprecated: true
+    description:
+      Former fan cooling-device specifier. Fan policy is handled by the SMC
+      firmware; the driver no longer registers fan cooling devices.
+
+patternProperties:
+  "^current-[A-Za-z0-9]{4}$":
+    $ref: "#/$defs/sensor"
+    unevaluatedProperties: false
+
+  "^fan-[A-Za-z0-9]{4}$":
+    $ref: "#/$defs/sensor"
+    unevaluatedProperties: false
+
+    properties:
+      apple,fan-minimum:
+        $ref: /schemas/types.yaml#/definitions/string
+        pattern: "^[A-Za-z0-9]{4}$"
+        description: SMC key containing the fan's minimum speed
+
+      apple,fan-maximum:
+        $ref: /schemas/types.yaml#/definitions/string
+        pattern: "^[A-Za-z0-9]{4}$"
+        description: SMC key containing the fan's maximum speed
+
+      apple,fan-target:
+        $ref: /schemas/types.yaml#/definitions/string
+        pattern: "^[A-Za-z0-9]{4}$"
+        description: Writeable endpoint for setting desired fan speed
+
+      apple,fan-mode:
+        $ref: /schemas/types.yaml#/definitions/string
+        pattern: "^[A-Za-z0-9]{4}$"
+        description: Writeable key to enable/disable manual fan control
+
+      apple,fan-manual-control:
+        type: boolean
+        description:
+          The SMC firmware of this machine accepts a manual speed for this
+          fan from the host and returns it to firmware control when asked,
+          so the fan's target speed can be set from the OS. Requires
+          apple,fan-target and apple,fan-mode. Without it the fan is only
+          monitored, and driven by the thermal framework where the SMC
+          node is a cooling device.
+
+  "^power-[A-Za-z0-9]{4}$":
+    $ref: "#/$defs/sensor"
+    unevaluatedProperties: false
+
+  "^temperature-[A-Za-z0-9]{4}$":
+    $ref: "#/$defs/sensor"
+    unevaluatedProperties: false
+
+  "^voltage-[A-Za-z0-9]{4}$":
+    $ref: "#/$defs/sensor"
+    unevaluatedProperties: false
+
+allOf:
+  - if:
+      required:
+        - apple,discover-temperatures
+    then:
+      patternProperties:
+        "^temperature-": false
+
+additionalProperties: false

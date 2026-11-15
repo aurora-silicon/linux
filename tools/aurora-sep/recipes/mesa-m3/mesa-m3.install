@@ -1,0 +1,25 @@
+_render_note() {
+  if [ -z "$(getent group render 2>/dev/null | cut -d: -f4)" ]; then
+    echo "mesa-m3: on an M3 Pro or M3 the GPU's render node is now for the render group; add the"
+    echo "mesa-m3: desktop user to it (sudo usermod -aG render <user>) and log out and in."
+  fi
+}
+
+post_install() {
+  echo "mesa-m3: takes effect at the next login to a uwsm session on an M3 Pro (T6030),"
+  echo "mesa-m3: and on an M3 (T8122) only with /etc/mesa-m3/t8122-gpu-experiment: its GPU"
+  echo "mesa-m3: is experimental (the installer writes the file for --m3-gpu-experiment)."
+  echo "mesa-m3: It does nothing on other machines. Each login's decision is in"
+  echo "mesa-m3: /run/user/<uid>/mesa-m3-session.state and the journal (tag mesa-m3)."
+  _render_note
+}
+
+post_upgrade() {
+  echo "mesa-m3: running programs keep the previous libraries; log out and in to use this build."
+  _render_note
+}
+
+post_remove() {
+  echo "mesa-m3: removed. A session that started with it still points at /opt/mesa-m3:"
+  echo "mesa-m3: log out now; the next login uses the system Mesa."
+}

@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/rtc/apple,smc-rtc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple SMC RTC
+
+description:
+  Apple Silicon Macs (M1, etc.) have an RTC that is part of the PMU IC,
+  but most of the PMU functionality is abstracted out by the SMC.
+  An additional RTC offset stored inside NVMEM is required to compute
+  the current date/time.
+
+maintainers:
+  - Sven Peter <sven@kernel.org>
+
+properties:
+  compatible:
+    const: apple,smc-rtc
+
+  nvmem-cells:
+    minItems: 1
+    items:
+      - description:
+          RTC offset. By default a 48bit value, specified in 32768 (2^15) Hz
+          clock ticks. With apple,rtc-offset-seconds, a 64bit little-endian
+          count of whole seconds.
+      - description:
+          PMU alarm control byte, with the alarm enable, the monitor bit and
+          the latched alarm event.
+      - description:
+          PMU alarm compare value, a 32-bit count of whole seconds of the RTC
+          counter without the offset.
+      - description: PMU alarm mask byte.
+
+  nvmem-cell-names:
+    oneOf:
+      - items:
+          - const: rtc_offset
+      - items:
+          - const: rtc_offset
+          - const: rtc_ctrl
+          - const: rtc_alarm
+          - const: rtc_alarm_mask
+
+  interrupts:
+    maxItems: 1
+    description:
+      The PMU's RTC alarm interrupt. Only used with the three alarm cells.
+
+  wakeup-source: true
+
+  apple,rtc-offset-seconds:
+    type: boolean
+    description:
+      The RTC offset cell holds whole seconds rather than 32768 Hz ticks. The
+      current time is the SMC RTC counter's integer seconds plus the offset.
+      Used where the system firmware keeps the offset in a PMU scratchpad
+      register in this format, such as on the t8140 (A18 Pro).
+
+required:
+  - compatible
+  - nvmem-cells
+  - nvmem-cell-names
+
+additionalProperties: false

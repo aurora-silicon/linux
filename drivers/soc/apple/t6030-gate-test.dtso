@@ -1,0 +1,147 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Test device tree for the display gate KUnit test: the T6030 display nodes
+ * of t6030-dcp.dtsi with the boot loader's handoff applied, the power states
+ * they hang from (DISP_CPU under DISP_FE under DISP_SYS, the PMP states in
+ * the same PMGR block), and PMP values. The values are made up. It shares
+ * the disabled /soc of the T6031 test tree, so its node names differ.
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	fragment@0 {
+		target-path = "/";
+
+		__overlay__ {
+			chosen {
+				asahi,t6030-pmp {
+					apple,board-id = <0x4321>;
+					apple,dram-vendor-id = <0x6>;
+					apple,tunable-uuid = "2F4EB4C4-001B-3ACF-A9A0-68D8E42FC3A7";
+					apple,tunable-test = <0x3>;
+				};
+			};
+
+			soc {
+				#address-cells = <2>;
+				#size-cells = <2>;
+				status = "disabled";
+
+				t6030_aic: interrupt-controller@351000000 {
+					reg = <0x3 0x51000000 0x0 0x4000>;
+					interrupt-controller;
+					#interrupt-cells = <3>;
+				};
+
+				power-management@350700000 {
+					reg = <0x3 0x50700000 0x0 0x14000>;
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					t6030_ps_disp_sys: power-controller@1c0 {
+						compatible = "apple,t6030-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+						reg = <0x1c0 4>;
+						#power-domain-cells = <0>;
+						label = "disp_sys";
+						apple,inherited-on;
+					};
+
+					t6030_ps_disp_fe: power-controller@258 {
+						compatible = "apple,t6030-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+						reg = <0x258 4>;
+						#power-domain-cells = <0>;
+						label = "disp_fe";
+						power-domains = <&t6030_ps_disp_sys>;
+						apple,inherited-on;
+					};
+
+					power-controller@4c8 {
+						compatible = "apple,t6030-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+						reg = <0x4c8 4>;
+						#power-domain-cells = <0>;
+						label = "pmp";
+					};
+
+					power-controller@4d0 {
+						compatible = "apple,t6030-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+						reg = <0x4d0 4>;
+						#power-domain-cells = <0>;
+						label = "pms_sram";
+					};
+
+					t6030_ps_disp_cpu: power-controller@10000 {
+						compatible = "apple,t6030-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+						reg = <0x10000 4>;
+						#power-domain-cells = <0>;
+						label = "disp_cpu";
+						power-domains = <&t6030_ps_disp_fe>;
+						apple,min-state = <4>;
+						apple,inherited-on;
+					};
+				};
+
+				t6030_dcp_mbox: mailbox@28ec08000 {
+					compatible = "apple,t6030-asc-mailbox", "apple,asc-mailbox-v4";
+					reg = <0x2 0x8ec08000 0x0 0x4000>;
+					interrupt-parent = <&t6030_aic>;
+					interrupts = <0 589 4>, <0 590 4>, <0 591 4>, <0 592 4>;
+					interrupt-names = "send-empty", "send-not-empty",
+							  "recv-empty", "recv-not-empty";
+					power-domains = <&t6030_ps_disp_cpu>;
+					#mbox-cells = <0>;
+					status = "disabled";
+				};
+
+				t6030_dcp_dart: iommu@28d30c000 {
+					compatible = "apple,t6030-dart", "apple,t8110-dart";
+					reg = <0x2 0x8d30c000 0x0 0x4000>;
+					interrupt-parent = <&t6030_aic>;
+					interrupts = <0 609 4>;
+					#iommu-cells = <1>;
+					apple,dma-range = <0x100 0x0 0x10 0x0>;
+					status = "disabled";
+				};
+
+				t6030_disp0_dart: iommu@28d304000 {
+					compatible = "apple,t6030-dart", "apple,t8110-dart";
+					reg = <0x2 0x8d304000 0x0 0x4000>;
+					interrupt-parent = <&t6030_aic>;
+					interrupts = <0 609 4>;
+					#iommu-cells = <1>;
+					apple,dma-range = <0x100 0x0 0x10 0x0>;
+					status = "disabled";
+				};
+
+				dcp@28ec00000 {
+					compatible = "apple,t6030-dcp";
+					mboxes = <&t6030_dcp_mbox>;
+					mbox-names = "mbox";
+					iommus = <&t6030_dcp_dart 5>;
+					reg-names = "coproc";
+					reg = <0x2 0x8ec00000 0x0 0x4000>;
+					power-domains = <&t6030_ps_disp_cpu>;
+					#address-cells = <2>;
+					#size-cells = <2>;
+					status = "disabled";
+					apple,t6030-handoff = <1>;
+					apple,firmware-compat = <14 7 0>;
+					apple,firmware-uuid = "DDF38191-93B3-324A-BC8F-643006F5AC82";
+
+					piodma {
+						iommus = <&t6030_disp0_dart 4>;
+						apple,t6030-handoff = <1>;
+					};
+				};
+
+				display-subsystem-t6030 {
+					compatible = "apple,t6030-display-subsystem";
+					iommus = <&t6030_disp0_dart 0>;
+					status = "disabled";
+					apple,t6030-handoff = <1>;
+				};
+			};
+		};
+	};
+};

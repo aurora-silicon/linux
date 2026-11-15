@@ -1,0 +1,80 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J613 25G83: the same wiring with the 26.6 firmware ABI. The boot loader
+ * passes this Mac's PMP values and validates the running display's mappings.
+ */
+/ {
+	aliases {
+		pmp = &pmp;
+	};
+};
+
+&dcp {
+	apple,j613-25g83-profile = <1>;
+	apple,firmware-compat = <26 6 2>;
+	apple,pmp = <&pmp>;
+	/* The 26.6 firmware takes its PMP through apple,pmp, not a request. */
+	/delete-property/ apple,pmp-report;
+	/delete-property/ clocks;
+	status = "disabled";
+};
+
+&dcpext {
+	/delete-property/ apple,pmp-report;
+};
+
+&disp0_piodma {
+	status = "disabled";
+};
+
+/* Reuse the complete Asahi PMP topology, with this profile left disabled. */
+&pmp_report {
+	compatible = "apple,j613-25g83-pmp-report";
+	/* The native PMP names its report instead (apple,pmp-report). */
+	/delete-property/ apple,pmp;
+	status = "disabled";
+};
+
+/* This profile requests only DISP and ANS until external admission succeeds. */
+&pmp_report_dispext {
+	status = "disabled";
+};
+
+&pmp_report_ans {
+	apple,always-on;
+};
+
+&pmp_dart {
+	status = "disabled";
+};
+
+&pmp_mbox {
+	power-domains = <&ps_pmp>, <&ps_pms_sram>,
+			<&pmp_report_disp>, <&pmp_report_ans>;
+	status = "disabled";
+};
+
+&pmp {
+	apple,pmp-report = <&pmp_report>;
+	status = "disabled";
+};
+
+/* Native ASC mailbox; the boot loader supplies firmware and calibration. */
+&agx_mbox {
+	compatible = "apple,t8122-agx-asc-mailbox", "apple,asc-mailbox-v4";
+	status = "disabled";
+};
+
+/*
+ * G16G takes exactly six memory regions: list the three the boot loader
+ * replaces (it adds the others), and only the 16 KiB ASC page, as the
+ * mailbox owns +0x8000.
+ */
+&gpu {
+	reg = <0x2 0x92400000 0x0 0x4000>,
+	      <0x2 0x90000000 0x0 0x4000000>;
+	memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>;
+	memory-region-names = "ttbs", "pagetables", "handoff";
+	apple,pmp = <&pmp>;
+	status = "disabled";
+};

@@ -1,0 +1,72 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The firmware memory of the external DCPs, for a boot loader that fills it
+ * (m4-loader m4_dcpext_fixup()).
+ *
+ * The loader reads /arm-io/dcpextN/iop-dcpextN-nub segment-ranges of the
+ * booting Mac (__TEXT, __DATA and the heap; __OS_LOG is left out as for the
+ * internal DCP), gives each placeholder below its reg, iommu-addresses and
+ * name, enables it, names the regions in the node's memory-region-names and
+ * sets apple,firmware-version/compat. A placeholder it does not fill is
+ * deleted together with the node's memory-region. A boot loader without this
+ * fix-up leaves them disabled, and the enable gate then keeps the external
+ * displays off.
+ *
+ * Nothing here enables dcpext0/1 or their DART/mailbox.
+ */
+
+/ {
+	reserved-memory {
+		dcpext0_text: dcpext0-text {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+
+		dcpext0_data: dcpext0-data {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+
+		dcpext0_heap: dcpext0-heap {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+
+		dcpext1_text: dcpext1-text {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+
+		dcpext1_data: dcpext1-data {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+
+		dcpext1_heap: dcpext1-heap {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+	};
+};
+
+&dcpext0 {
+	memory-region = <&dcpext0_text>, <&dcpext0_data>, <&dcpext0_heap>;
+	memory-region-names = "text", "data", "heap";
+};
+
+&dcpext1 {
+	memory-region = <&dcpext1_text>, <&dcpext1_data>, <&dcpext1_heap>;
+	memory-region-names = "text", "data", "heap";
+};

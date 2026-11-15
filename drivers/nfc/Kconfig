@@ -1,0 +1,97 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Near Field Communication (NFC) devices
+#
+
+menu "Near Field Communication (NFC) devices"
+	depends on NFC
+
+config NFC_TRF7970A
+	tristate "Texas Instruments TRF7970a NFC driver"
+	depends on SPI && NFC_DIGITAL && GPIOLIB
+	help
+	  This option enables the NFC driver for Texas Instruments' TRF7970a
+	  device. Such device supports 5 different protocols: ISO14443A,
+	  ISO14443B, FeLiCa, ISO15693 and ISO18000-3.
+
+	  Say Y here to compile support for TRF7970a into the kernel or
+	  say M  to compile it as a module. The module will be called
+	  trf7970a.ko.
+
+config NFC_MEI_PHY
+	tristate "MEI bus NFC device support"
+	depends on INTEL_MEI && NFC_HCI
+	help
+	  This adds support to use an mei bus nfc device. Select this if you
+	  will use an HCI NFC driver for an NFC chip connected behind an
+	  Intel's Management Engine chip.
+
+	  If unsure, say N.
+
+config NFC_SIM
+	tristate "NFC hardware simulator driver"
+	depends on NFC_DIGITAL
+	help
+	  This driver declares two virtual NFC devices supporting NFC-DEP
+	  protocol. An LLCP connection can be established between them and
+	  all packets sent from one device is sent back to the other, acting as
+	  loopback devices.
+
+	  If unsure, say N.
+
+config NFC_PORT100
+	tristate "Sony NFC Port-100 Series USB device support"
+	depends on USB
+	depends on NFC_DIGITAL
+	help
+	  This adds support for Sony Port-100 chip based USB devices such as the
+	  RC-S380 dongle.
+
+	  If unsure, say N.
+
+config NFC_VIRTUAL_NCI
+	tristate "NCI device simulator driver"
+	depends on NFC_NCI
+	help
+	  NCI virtual device simulates a NCI device to the user.
+	  It can be used to validate the NCI module and applications.
+	  This driver supports communication between the virtual NCI device and
+	  module.
+
+	  If unsure, say N.
+
+config NFC_APPLE_STOCKHOLM
+	tristate "Apple Stockholm NFC controller and Secure Element"
+	depends on SPMI && GPIOLIB && OF
+	depends on ARCH_APPLE || COMPILE_TEST
+	help
+	  This enables the driver for the Apple Stockholm NFC controller with
+	  embedded Secure Element found on Apple silicon Macs, connected over
+	  SPMI. The Mac parts have no NFC radio interfaces, so no NFC device
+	  is registered: the driver reads the controller identity once and
+	  keeps the controller powered off.
+
+	  Say M here to compile this driver as a module named apple-stockholm.
+
+config NFC_APPLE_STOCKHOLM_KUNIT_TEST
+	bool "KUnit tests for the Apple Stockholm driver" if !KUNIT_ALL_TESTS
+	depends on NFC_APPLE_STOCKHOLM && KUNIT
+	depends on KUNIT=y || NFC_APPLE_STOCKHOLM=m
+	default KUNIT_ALL_TESTS
+	help
+	  Tests for the parsing of the NCI identity responses, built into the
+	  apple-stockholm driver.
+
+	  If unsure, say N.
+
+source "drivers/nfc/fdp/Kconfig"
+source "drivers/nfc/pn544/Kconfig"
+source "drivers/nfc/pn533/Kconfig"
+source "drivers/nfc/microread/Kconfig"
+source "drivers/nfc/nfcmrvl/Kconfig"
+source "drivers/nfc/st21nfca/Kconfig"
+source "drivers/nfc/st-nci/Kconfig"
+source "drivers/nfc/nxp-nci/Kconfig"
+source "drivers/nfc/s3fwrn5/Kconfig"
+source "drivers/nfc/st95hf/Kconfig"
+endmenu

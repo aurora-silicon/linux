@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: GPL-2.0-only OR MIT
+
+What:		/sys/bus/platform/devices/<unit>.iommu/j713_radio_fault_state
+Date:		October 2026
+KernelVersion:	7.2
+Contact:	Eryk Wieliczko <eryk@wieliczko.ninja>
+Description:
+		Root-readable, passive fault-register snapshot for a bound Apple
+		DART using the J713 managed radio stream profile. Absent on other
+		DARTs. A read returns hexadecimal register values, decimal failure
+		state, and the following newline-separated fields:
+
+		version, managed, failed: DART version, owned stream bitmap, and
+		whether the driver's owned-stream quarantine has been triggered.
+		error_mask, error: inherited global error interrupt mask and error
+		register. A zero error mask is the generic driver's unmasked state.
+		error_streams[N], exceptions[N]: implemented stream-error and
+		per-stream exception summary words, including foreign streams.
+		sidN status, addr: exception status and address for each owned SID.
+
+		The snapshot can race hardware updates and IRQ acknowledgements;
+		it is not an atomic hardware snapshot or a claim of DMA quiescence.
+		Reading never clears or unmasks a fault, changes stream state,
+		starts DMA, or communicates with the Bluetooth controller.

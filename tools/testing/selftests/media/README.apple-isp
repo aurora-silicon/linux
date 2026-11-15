@@ -1,0 +1,34 @@
+Apple ISP capture delivery stress
+=================================
+
+Build with make -C tools/testing/selftests/media. This is a manual hardware
+runner; run_tests does not start the camera automatically. No image files are
+written. Run only on the agreed J616s test kernel while audio is idle.
+
+Example for configurations whose expected rate has been established as 30 fps:
+
+  ./apple-isp-stress /dev/video0 600 10 30 | tee capture-results.jsonl
+
+It enumerates every offered single-planar format and discrete size. Each gets
+a ten-minute run, then ten five-second start/stop cycles, switching formats and
+sizes between streams. A substituted format/rate, poll timeout, queue error,
+V4L2 buffer error, sequence discontinuity or delivery gap exceeding 1.5 nominal
+frame periods fails. Delivered FPS must reach 99.8% of the supplied rate, allowing
+29.97/30 rounding. The rate argument is an explicit test expectation, not a
+rate inferred from the sensor clock or set by the tool as an alleged sensor fact.
+For modes with a different nominal rate, filter the run explicitly, for example
+`./apple-isp-stress /dev/video0 600 10 25 P010 1920 1080`. A filtered run tests
+that mode's restart cycles; the unfiltered run also exercises format switches. This runner stops
+on the first failure to preserve evidence and avoid retrying ambiguous firmware.
+
+The driver's sequence increments for received reports, so consecutive sequence
+values alone cannot establish zero sensor/firmware drops. The timing checks
+measure delivery gaps and completed frames. A true zero-drop sensor claim also
+needs a validated firmware frame counter or an independent sensor-rate oracle.
+No RAW packing, Bayer order or nominal per-config FPS is guessed by this tool.
+It tests RAW automatically if a verified RAW format is added to ENUM_FMT later.
+
+Preserve the current firmware config dump, v4l2-ctl --all/--list-formats-ext,
+the JSONL output, dmesg before/after, exact kernel and source hashes. Check both
+P010 presets for correct image content separately; this runner deliberately
+avoids a converter or disk writer in the capture loop.

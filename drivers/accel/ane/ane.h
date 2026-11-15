@@ -1,0 +1,257 @@
+/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
+/* Copyright 2022 Eileen Yoon <eyn@gmx.com> */
+
+#ifndef __ANE_H__
+#define __ANE_H__
+
+#include <linux/atomic.h>
+#include <linux/list.h>
+#include <linux/mutex.h>
+#include <linux/pm_qos.h>
+#include <linux/workqueue.h>
+
+#include <drm/drm_device.h>
+#include <drm/drm_mm.h>
+
+#include <drm/ane_accel.h>
+
+#include "ane_stats.h"
+
+#define ANE_DART_MAX 3
+#define ANE_DART_SCRATCH_MAX 16
+
+struct ane_dart_scratch {
+	u64 iova;
+	struct page *page;
+	struct drm_mm_node *node;
+};
+
+struct ane_device {
+	struct drm_device drm;
+	struct device *dev;
+
+	struct device **pd_dev;
+	struct device_link **pd_link;
+	int pd_count;
+
+	void __iomem *engine;
+
+	/* The ane SET block (m1n1 ANE.ps_map): pmgr power-state words for
+	 * this engine, mapped at probe on every SoC. Read-only, always:
+	 * pmgr reads give recovery the ACTUAL power state, while direct
+	 * SET writes are firmware-locked and external-abort the SoC
+	 * (T6001 and T8103 alike).
+	 */
+	phys_addr_t ps_base;
+	void __iomem *ps;
+
+	struct drm_mm mm;
+	struct iommu_domain *domain;
+	unsigned long shift;
+	struct ane_dart {
+		void __iomem *regs;
+		int irq;
+		u32 sid;
+		bool masked;
+	} darts[3];
+	int dart_count;
+
+	int irq;
+	/* Protects mm and the iommu_map()/iommu_unmap() calls on domain. */
+	struct mutex iommu_lock;
+	/*
+	 * Serializes engine access (submit, BO mapping, recovery, removal)
+	 * and protects bo_list, preserved_list and removed.
+	 */
+	struct mutex engine_lock;
+	/* Serializes runtime-PM references across a recovery cycle. */
+	struct mutex pm_lock;
+	struct list_head bo_list;
+
+	/*
+	 * Wedge-preserved BO ranges, tied to their still-inserted drm_mm
+	 * nodes (see ane_reclaim_preserved). Registered under engine_lock.
+	 */
+	struct list_head preserved_list;
+	/* Fault-drain DMA backing, retained until completion or a safe reset. */
+	struct ane_dart_scratch scratch[ANE_DART_SCRATCH_MAX];
+	int scratch_pages;
+	bool removed;
+
+	/*
+	 * Set under engine_lock once a task manager timeout leaves the queue
+	 * state unknown and DMA possibly still active. A wedged engine refuses
+	 * new work while recovery (ane_tm_recover) power-cycles it; the
+	 * preserve-until-reboot behaviour applies only when that reset fails.
+	 */
+	atomic_t wedged;
+
+	/*
+	 * Set under engine_lock for the duration of a recovery power cycle,
+	 * so runtime suspend may gate an engine that the reset itself is
+	 * quiescing.
+	 */
+	bool recovering;
+
+	/*
+	 * Set by system suspend for an engine that was wedged when it began:
+	 * the sleep powers its partitions off as a recovery cycle does, so
+	 * runtime suspend lets it go, and resume tries one recovery.
+	 */
+	bool sleep_wedged;
+
+	/*
+	 * TM_STATUS sampled right after the first tm_enable at probe: the
+	 * engine's fresh, idle-state signature. Recovery accepts a reset
+	 * whose post-cycle status matches it, since the register reset
+	 * value is not documented.
+	 */
+	u32 tm_status_fresh;
+	bool tm_status_known;
+
+	/*
+	 * SoC descriptor fact: the set0/base islands hold the tm/tq
+	 * register file in retention through any genpd power cycle
+	 * (on T6001 TQ_EN still reads 0x3000 after a 2 s gate), so
+	 * recovery must drain retained task-manager state itself
+	 * instead of expecting a power-on reset to clear it.
+	 * False on T8103, where the cycle is a full POR of the file.
+	 */
+	bool tm_retention;
+
+	/*
+	 * Set under engine_lock when a failure is known to survive the
+	 * recovery power cycle: the engine stays wedged, recovery and the
+	 * reset attribute refuse, and only a reboot brings it back.
+	 * wedge_reason names why for the wedge_reason sysfs file.
+	 */
+	bool wedge_final;
+	const char *wedge_reason;
+
+	/*
+	 * Recoveries since the last completed job: raised by a recovery that
+	 * reported the engine idle, cleared by the next completed job. A
+	 * recovery that only looks successful is caught by the jobs after it
+	 * hanging the same way.
+	 */
+	unsigned int recovery_unproven;
+
+	/* Protected independently of engine_lock so idle work can release votes. */
+	struct ane_perf {
+		struct mutex lock; /* protects votes, idle work and status */
+		struct delayed_work idle;
+		struct device_node *report;
+		struct icc_path *memory;
+		unsigned int high_level;
+		unsigned int level;
+		u32 avg_bw;
+		u32 peak_bw;
+		int error;
+		unsigned int release_retries;
+		bool initialized;
+		bool busy;
+		bool voted;
+		bool clock_held;
+		bool pinned;
+		bool cpu_boost;
+	} perf;
+
+	/*
+	 * Engine-busy CPU cluster boost (ane_boost.c): min-frequency QoS on
+	 * every cpufreq policy while a submit runs and until boost_idle_ms
+	 * after the last one completes. Used only when the DT binds no
+	 * performance controller, so the engine keeps the boost it had
+	 * until it gets a clock level instead.
+	 */
+	struct ane_boost {
+		struct mutex lock;	/* protects the fields below */
+		struct delayed_work off;
+		struct freq_qos_request *legs;
+		int nlegs;
+		int held;
+		unsigned long last_end;
+		bool busy;
+		bool on;
+	} boost;
+
+	/*
+	 * Producer-side stats (sysfs ane_stats, debugfs ane_timeline;
+	 * see ane_stats.h). stats=0 or a failed ring allocation leaves
+	 * stats_slots NULL, which is the one hot-path gate: no files,
+	 * no counter updates.
+	 */
+	struct ane_stats_counters stats_ctrs;
+	struct ane_stats_ring stats_ring;
+	struct ane_stats_ring_entry *stats_slots;
+};
+
+struct ane_request {
+	int qid;
+	u32 nid;
+	u32 td_size;
+	u32 td_count;
+	u32 btsp_iova;
+	u32 bar[DRM_ANE_TILE_COUNT];
+};
+
+/*
+ * Recoveries in a row without one completed job that a T600x engine gets
+ * before it is declared wedged until reboot: a run this long means the
+ * recovery does not bring the engine back.
+ */
+#define ANE_TM_RECOVERIES_MAX 3
+
+/*
+ * Can a power cycle bring the engine back after a failed job? A job that
+ * timed out without one completion event (@finished == 0) left the task
+ * manager stopped mid-program. The cycle stops it; a hang on a job after a
+ * recovery (@unproven recoveries since the last completed job) shows that
+ * the recovery did not bring the engine back. T8103 allows no such repeat.
+ * T600x (@tm_retention), whose recovery also drains and re-arms the tm/tq
+ * file, allows up to ANE_TM_RECOVERIES_MAX in a row, so back-to-back bad
+ * programs do not cost a reboot. Every other failure is worth a recovery.
+ */
+static inline bool ane_tm_failure_recoverable(bool tm_retention,
+					      unsigned int unproven, int err,
+					      u32 finished)
+{
+	if (err != -ETIMEDOUT || finished)
+		return true;
+	if (tm_retention)
+		return unproven < ANE_TM_RECOVERIES_MAX;
+	return !unproven;
+}
+
+#if IS_ENABLED(CONFIG_KUNIT)
+int ane_submit_check_sizes(const struct drm_ane_submit *args, size_t cmd_size,
+			   size_t btsp_size);
+#endif
+
+/*
+ * Reclaim wedge-preserved BO ranges (unmap, release nodes and pages).
+ * Only legal once DMA is provably quiescent: after a successful
+ * recovery power cycle, or at driver remove. Callers hold engine_lock.
+ */
+void ane_reclaim_preserved(struct ane_device *ane);
+
+int ane_perf_init(struct ane_device *ane, unsigned int high_level);
+int ane_perf_exit(struct ane_device *ane);
+int ane_perf_begin(struct ane_device *ane);
+void ane_perf_end(struct ane_device *ane);
+int ane_perf_suspend(struct ane_device *ane);
+
+int ane_boost_init(struct ane_device *ane);
+void ane_boost_exit(struct ane_device *ane);
+void ane_boost_begin(struct ane_device *ane);
+void ane_boost_end(struct ane_device *ane);
+
+int ane_dart_init(struct ane_device *ane);
+void ane_dart_mask(struct ane_device *ane);
+void ane_dart_unmask(struct ane_device *ane);
+bool ane_dart_faulted(struct ane_device *ane, u64 *iova, u32 *status);
+int ane_dart_drain_fault(struct ane_device *ane, u64 fault_iova,
+			 struct ane_dart_scratch *scratch, int *pages);
+void ane_dart_release_scratch(struct ane_device *ane,
+			      struct ane_dart_scratch *scratch, int pages);
+
+#endif /* __ANE_H__ */

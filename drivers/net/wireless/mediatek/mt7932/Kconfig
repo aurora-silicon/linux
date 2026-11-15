@@ -1,0 +1,77 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config MT7932_FULLMAC
+	tristate "MediaTek MT7932 Wi-Fi on the Apple MacBook Neo (J700)"
+	depends on PCI && OF && ARM64 && IOMMU_DMA
+	depends on PCIE_APPLE_T8140_BOOTSTRAP && CFG80211
+	select FW_LOADER
+	select CRYPTO
+	select CRYPTO_HMAC
+	select CRYPTO_SHA1
+	select CRYPTO_LIB_SHA256
+	help
+	  Support for the Wi-Fi function of the MediaTek MT7932 radio in the
+	  Apple MacBook Neo (J700). The firmware runs association and the
+	  WPA2-PSK, WPA3-SAE or OWE handshake. The driver is a cfg80211 station
+	  on 2.4 GHz, 5 GHz UNII-1/2/2e/3 and country-permitted 6 GHz UNII-5..8.
+	  6 GHz requires SAE-H2E or OWE, MFP and country VLP power data.
+	  Radar (DFS) channels are scanned passively; an AP heard there
+	  during the connect attempt may be joined, and is left when it
+	  announces a channel switch. Other MediaTek devices and other
+	  machines are not matched.
+
+	  The driver needs the original firmware, the unit's own calibration
+	  and the country policy packages under mediatek/mt7932/, besides the
+	  cfg80211 regulatory database. The device is probed before the root
+	  filesystem is mounted, so say M unless those files are in the
+	  initramfs.
+
+	  Once the device has been given DMA addresses, the module cannot be
+	  unloaded. A function that fails to initialize and cannot be reset
+	  stays bound and keeps its DMA memory.
+
+config MT7932_AWDL
+	bool "Experimental clean-room MT7932 AWDL interface"
+	depends on MT7932_FULLMAC
+	default n
+	help
+	  Build the experimental second-BSS Apple Wireless Direct Link path.
+	  It exposes an awdl0 station-typed Ethernet interface, programs the native
+	  firmware AWDL command records and routes BSS-1 RX records.  The option
+	  is deliberately off by default while firmware policy values and target
+	  validation remain incomplete.
+	  Systems using NetworkManager should install 80-mt7932-awdl.rules from
+	  this directory into /usr/lib/udev/rules.d/ before loading the driver,
+	  so only the AWDL controller brings awdl0 up.
+
+config MT7932_AWDL_KUNIT_TEST
+	bool "KUnit tests for MT7932 AWDL records and RX parsing" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && MT7932_AWDL
+	default KUNIT_ALL_TESTS
+	help
+	  Test every clean-room command-record builder, AWDL data framing and
+	  synthetic CONNAC2/event receive records without radio hardware.
+	  Check station routing and BSS activation/rollback command submission.
+
+config MT7932_RF_KUNIT_TEST
+	bool "KUnit tests for MT7932 terminal RF failure" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && MT7932_FULLMAC
+	default KUNIT_ALL_TESTS
+	help
+	  Exercise the driver's terminal calibration failure and startup
+	  admission paths with synthetic devices, without radio hardware.
+	  Check association wakeups, retained peer ownership and refusal to
+	  reopen RF admission after a terminal calibration error.
+
+config MT7932_KUNIT_TEST
+	bool "KUnit tests for MT7932 firmware input validation" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && MT7932_FULLMAC
+	default KUNIT_ALL_TESTS
+	help
+	  Exercise the validation of what the firmware and the device hand
+	  to the driver, with synthetic, truncated and corrupted input and
+	  without radio hardware: receive descriptors, including frames the
+	  hardware did not decrypt, command replies, regulatory snapshots
+	  and country power packages. Also check connection admission, SAE
+	  request encoding, WPA passphrase derivation, channel switch
+	  announcements and what is reported when a move to another AP
+	  lands, fails or is cancelled.

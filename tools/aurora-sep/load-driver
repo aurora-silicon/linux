@@ -1,0 +1,152 @@
+#!/bin/sh
+set -eu
+
+keybag=/var/lib/aurora-sep-keybag.bin
+refkey=/var/lib/aurora-sep-refkey.bin
+
+# Seconds to wait for the enclave to seal and unseal a trusted key. On J700 the key store arrives around 43 s after boot, and the
+# driver waits up to 90 s for it before it brings Touch ID up, so the first
+# wait has to outlast that. Set either in the environment, for example with a
+# drop-in for aurora-sep.service.
+ready_timeout=${AURORA_SEP_READY_TIMEOUT:-120}
+
+log() {
+    echo "aurora-sep-load: $*" >&2
+}
+
+for budget in "$ready_timeout"; do
+    case "$budget" in
+        '' | *[!0-9]*)
+            log "timeouts must be whole seconds, not '$budget'"
+            exit 2
+            ;;
+    esac
+done
+
+# Seconds since boot. Unlike the wall clock it cannot jump when the time is
+# first synchronised during boot.
+uptime_s() {
+    read -r up _ </proc/uptime
+    echo "${up%%.*}"
+}
+
+# An SSH/sudo caller cannot change its parent's session keyring with
+# `keyctl new_session`. Run the whole probe in a child keyring instead; the
+# marker prevents re-exec recursion and the keyring dies with this process.
+if [ "${AURORA_SEP_SESSION:-0}" != 1 ]; then
+    exec keyctl session aurora-sep-load env AURORA_SEP_SESSION=1 "$0" "$@"
+fi
+
+case "$(cat /sys/module/apple_sep/parameters/keystore_only 2>/dev/null || true)" in
+    1 | 2 | Y)
+        completed=false
+        for attribute in /sys/bus/platform/devices/*.sep/complete_attach; do
+            [ -e "$attribute" ] || continue
+            printf '1\n' >"$attribute"
+            completed=true
+            break
+        done
+        if [ "$completed" != true ]; then
+            log "keystore-only driver has no complete_attach attribute"
+            exit 1
+        fi
+        ;;
+    *) modprobe apple_sep xart_writes=1 provision_keybag=1 ;;
+esac
+
+work=$(mktemp -d /run/aurora-sep-load.XXXXXX)
+cleanup() {
+    case "$work" in
+        /run/aurora-sep-load.*) rm -rf -- "$work" ;;
+    esac
+}
+trap cleanup EXIT HUP INT TERM
+
+# The driver's diag attributes, when this kernel has them.
+diag=
+for d in /sys/bus/platform/devices/*.sep/diag; do
+    [ -d "$d" ] && diag=$d && break
+done
+
+# A refused xART write does not go away by waiting: the enclave keeps asking
+# for the same record. After a boot policy change (a new Stage 1, another
+# boot object) it is the record that the first unlock of Linux's keybag under
+# the new policy rewrites. Say so once, instead of retrying for minutes.
+guard_refused() {
+    [ -n "$diag" ] || return 1
+    refusals=$(cat "$diag/xart_guard_refusals" 2>/dev/null || echo 0)
+    [ -n "$refusals" ] && [ "$refusals" != 0 ]
+}
+
+start=$(uptime_s)
+deadline=$((start + ready_timeout))
+
+# The kernel instantiates every key under one global mutex, and a trusted key
+# made before the enclave's bring-up has ended waits there for it, up to 90 s.
+# Meanwhile no other key can be created, and systemd creates one for each
+# service it starts, so the whole boot stalls behind this probe. The driver's
+# diag/keystore attribute leaves "unknown" once the bring-up has ended, and
+# reading it takes no lock, so wait on that first. Without the attribute the
+# probe below still works, as before.
+for keystore in /sys/bus/platform/drivers/apple_sep/*/diag/keystore; do
+    [ -r "$keystore" ] || continue
+    while [ "$(cat "$keystore" 2>/dev/null || echo unknown)" = unknown ] &&
+        [ "$(uptime_s)" -lt "$deadline" ]; do
+        sleep 0.1
+    done
+done
+
+verified=false
+while :; do
+    key_id=$(printf 'new 32' | keyctl padd trusted aurora-sep-check @s 2>/dev/null || true)
+    if [ -n "$key_id" ]; then
+        if keyctl pipe "$key_id" >"$work/sealed"; then
+            { printf 'load '; tr -d '\n\r ' <"$work/sealed"; } >"$work/load"
+            loaded_id=$(keyctl padd trusted aurora-sep-load-check @s <"$work/load" 2>/dev/null || true)
+            if [ -n "$loaded_id" ]; then
+                keyctl revoke "$loaded_id" >/dev/null 2>&1 || true
+                verified=true
+            fi
+        fi
+        keyctl revoke "$key_id" >/dev/null 2>&1 || true
+    fi
+    [ "$verified" = true ] && break
+    if guard_refused; then
+        log "the xART guard refused a record the enclave needs to unlock Linux's keybag. After a boot policy change (a new Stage 1 or boot object) the driver lets that one update through by itself; this one it could not. Touch ID and its fingerprints are intact. To allow it on the next boot, run aurora-sep-policy-change and reboot; see XART-SAFETY.md"
+        exit 1
+    fi
+    [ "$(uptime_s)" -lt "$deadline" ] || break
+    sleep 0.1
+done
+
+if [ "$verified" != true ]; then
+    log "the enclave did not seal and unseal a trusted key within ${ready_timeout} s"
+    exit 1
+fi
+log "trusted keys work after $(($(uptime_s) - start)) s"
+
+# The driver let the enclave update its record for a boot policy change.
+# Note what this boot came up with, for the record.
+if journalctl -k -b -o cat --no-pager -g 'for a boot policy change; its previous value' 2>/dev/null |
+    grep -q .; then
+    chosen=/proc/device-tree/chosen
+    versions=
+    for prop in m1n1-stage1-version m1n1-stage2-version iboot1-version iboot2-version os-fw-version; do
+        [ -r "$chosen/asahi,$prop" ] &&
+            versions="$versions $prop=$(tr -d '\0' <"$chosen/asahi,$prop")"
+    done
+    log "the boot policy changed since the last boot; the enclave updated its record and Touch ID kept its fingerprints ($versions )"
+fi
+
+if [ ! -s "$keybag" ] || [ ! -s "$refkey" ]; then
+    log "$keybag or $refkey is missing or empty"
+    exit 1
+fi
+
+# A model without a fingerprint reader can still provide SEP trusted keys.
+# Biometric readiness is handled separately by aurora-sep-ready.service.
+if [ -c /dev/sep-bio ]; then
+    log "/dev/sep-bio is available"
+else
+    log "trusted keys are ready; no biometric device is present"
+fi

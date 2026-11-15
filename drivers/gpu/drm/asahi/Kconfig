@@ -1,0 +1,113 @@
+# SPDX-License-Identifier: GPL-2.0
+
+config RUST_DRM_SCHED
+	bool
+	select DRM_SCHED
+
+config RUST_DRM_GPUVM
+	bool
+	select DRM_GPUVM
+
+config DRM_ASAHI
+	tristate "Aurora (DRM support for Apple AGX GPUs)"
+	depends on RUST
+	depends on DRM=y
+	depends on (ARM64 && ARCH_APPLE) || (COMPILE_TEST && !GENERIC_ATOMIC64)
+	depends on MMU
+	depends on IOMMU_SUPPORT
+	depends on PAGE_SIZE_16KB
+	select APPLE_PMP_REPORT
+	select RUST_DRM_SCHED
+	select RUST_DRM_GEM_SHMEM_HELPER
+	select RUST_DRM_GPUVM
+	select RUST_APPLE_RTKIT
+	select CRYPTO_LIB_SHA256
+	help
+	  DRM driver for Apple AGX GPUs, from the M1 family onwards.
+
+	  To compile this driver as a module, choose M here: the module will
+	  be called aurora. It keeps "asahi" as a module alias.
+
+config DRM_ASAHI_G16
+	bool "Apple M4 (G16G) support"
+	depends on DRM_ASAHI && ARM64
+	depends on DRM_APPLE=y || (DRM_APPLE=m && DRM_ASAHI=m)
+	depends on DRM_APPLE_DCP_T8132
+	depends on APPLE_PMP=y || APPLE_PMP=DRM_ASAHI
+	depends on APPLE_CLPC=y || APPLE_CLPC=DRM_ASAHI || APPLE_CLPC=n
+	depends on THERMAL_OF
+	default y
+	help
+	  Backend for the M4 (T8132) GPU running the 25G83 firmware of
+	  macOS 26.6.2, which the boot loader leaves loaded. The driver
+	  binds when the GPU node appears and starts the firmware once the
+	  PMP supplier, and a native display the boot loader handed over,
+	  are up. The firmware session is retained until reboot and stays
+	  running across suspend-to-idle.
+	  A rendering VM pins about 0.7 GiB. An aborted receipt disables
+	  that command class until reboot.
+
+config DRM_ASAHI_G18
+	bool "Apple M6 (G18G, T8152) support (experimental)"
+	depends on DRM_ASAHI && ARM64
+	select WANT_DEV_COREDUMP
+	help
+	  Backend for the Mac mini M6 (J873) GPU and its 26A428 firmware.
+	  The GPU is started only when the boot loader reports the matching
+	  firmware images and enables both GFX coprocessor mailboxes; the
+	  firmware session and its memory are then retained until reboot.
+	  Submission is synchronous: every command retires before the next
+	  one starts. The module parameters prefixed g18_ select the bring-up
+	  stage and the admitted command envelope.
+config DRM_ASAHI_M5
+	bool "Apple M5 (G17G, T8142) support (experimental)"
+	depends on DRM_ASAHI && ARM64
+	help
+	  Backend for the M5 GPU (J813 MacBook Air) running the 25G76
+	  firmware (RTKit-3255.160.4), as loaded and published by the aura
+	  boot loader (/chosen/aurora,m5-gpu-firmware-profile).
+
+config DRM_ASAHI_DEBUG_ALLOCATOR
+	bool "Use debug allocator"
+	depends on DRM_ASAHI
+	help
+	  Use an alternate, simpler allocator which significantly reduces
+	  performance, but can help find firmware- or GPU-side memory safety
+	  issues. However, it can also trigger firmware bugs more easily,
+	  so expect GPU crashes.
+
+	  Say N unless you are debugging firmware structures or porting to a
+	  new firmware version.
+
+config DRM_ASAHI_M3_T8122
+	bool "M3 MacBook Air GPU runtime (T8122, 14.8.3 firmware)"
+	depends on DRM_ASAHI
+	# The runtime adopts the firmware's UAT through the G15 backend's handoff helpers.
+	depends on DRM_ASAHI_G15
+	select CRYPTO_LIB_SHA256
+	default n
+	help
+	  Build the M3 runtime that starts the GPU of the M3 MacBook Air
+	  (J613, J615) on the 14.8.3 GPU firmware the boot loader leaves
+	  loaded. On the listed Air boards it starts after the boot loader
+	  handed the GPU over and resource/firmware identity checks pass.
+	  asahi.t8122_start=0 keeps startup disabled for recovery. Unknown
+	  boards and firmware do not gain automatic admission. Other GPUs
+	  are not affected.
+
+config DRM_ASAHI_G15
+	bool "Apple M3 Pro/Max (G15) support"
+	depends on DRM_ASAHI
+	depends on DRM_APPLE=y || (DRM_APPLE=m && DRM_ASAHI=m)
+	select APPLE_T6030_GPU_PMP_LINK
+	select CRYPTO_LIB_SHA256
+	default y
+	help
+	  Backend for the M3 Pro (T6030) and M3 Max (T6031) GPUs on the
+	  boards and firmware it admits. The driver binds when the boot
+	  loader enables the GPU node and starts the firmware once the
+	  native display is up. The firmware session is retained until
+	  reboot. Other GPUs keep the maintained backend.
+	  The native display driver must be built in, or both drivers must
+	  be modules, so a modular display provider finishes initialization
+	  before the GPU module can probe through its direct helper import.

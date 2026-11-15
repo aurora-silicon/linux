@@ -1,0 +1,109 @@
+policy_module(aurora_sep, 1.3.0)
+
+########################################
+#
+# Declarations
+#
+
+# /dev/sep-bio, the apple_sep driver's Touch ID device. The distribution
+# packages build this module under the same name, so the type name has to
+# match theirs: a module that drops the type leaves the node with a context
+# the policy no longer knows.
+type aurora_sep_device_t;
+dev_node(aurora_sep_device_t)
+
+# The apple_sep driver's own state in /var/lib: the Catacomb records, the
+# identity keybag, the reference keys, the host store and the xART guard
+# files. They hold enclave secrets, so they get their own type instead of
+# var_lib_t, and only the domains that drive the enclave may use them.
+type aurora_sep_state_t;
+files_type(aurora_sep_state_t)
+
+# aurora-sep-load, which loads the driver and checks that the enclave seals
+# and unseals a trusted key. It needs what the unconfined service domain gave
+# it, so it stays unconfined; its own domain gives its probe keys their own
+# label.
+type aurora_sep_load_t;
+type aurora_sep_load_exec_t;
+init_daemon_domain(aurora_sep_load_t, aurora_sep_load_exec_t)
+
+########################################
+#
+# Local policy
+#
+
+gen_require(`
+	type init_t, kernel_t, var_lib_t;
+')
+
+# The driver opens its state files with kernel credentials (store_shim.c), so
+# the kernel creates them. Give each new file the state type by name: a file
+# that the kernel creates in /var/lib must never start out as var_lib_t.
+allow kernel_t aurora_sep_state_t:file { create_file_perms rw_file_perms };
+type_transition kernel_t var_lib_t:file aurora_sep_state_t "apple-sep-catacomb-master.bin";
+type_transition kernel_t var_lib_t:file aurora_sep_state_t "apple-sep-catacomb-owner.bin";
+type_transition kernel_t var_lib_t:file aurora_sep_state_t "apple-sep-catacomb-user.bin";
+type_transition kernel_t var_lib_t:file aurora_sep_state_t "aurora-sep-keybag.bin";
+type_transition kernel_t var_lib_t:file aurora_sep_state_t "aurora-sep-refkey.bin";
+type_transition kernel_t var_lib_t:file aurora_sep_state_t "aurora-sep-refkey-v2.bin";
+type_transition kernel_t var_lib_t:file aurora_sep_state_t "aurora-sep-host-state.bin";
+type_transition kernel_t var_lib_t:file aurora_sep_state_t "aurora-sep-xart-owned.bin";
+type_transition kernel_t var_lib_t:file aurora_sep_state_t "aurora-sep-xart-allow-once.bin";
+type_transition kernel_t var_lib_t:file aurora_sep_state_t "aurora-sep-xart-policy-previous.bin";
+
+# Reads and writes on an open state file are checked against the task that
+# drove the driver, not the opener. The loader's helpers check the files
+# before they load the driver.
+allow init_t aurora_sep_state_t:file read_file_perms;
+
+# The units' helpers activate Touch ID with a read-only open and ask the
+# driver about its sensor with an ioctl. Let them where they run as init_t.
+allow init_t aurora_sep_device_t:chr_file { getattr open read ioctl };
+
+# fprintd, through libfprint's aurora driver, is the device's only user.
+optional_policy(`
+	gen_require(`
+		type fprintd_t;
+	')
+
+	allow fprintd_t aurora_sep_device_t:chr_file rw_chr_file_perms;
+
+	# Enrolment and verification run in the context of fprintd: the driver reads
+	# and writes the Catacomb records and the keybag on its behalf.
+	allow fprintd_t aurora_sep_state_t:file rw_file_perms;
+
+	# libfprint hides the reader while the lid is closed. It follows the
+	# lid through the SW_LID switch of an input event device, which the
+	# targeted policy keeps fprintd from reading.
+	dev_read_input(fprintd_t)
+')
+
+# modprobe loads apple_sep, whose initialisation reads the keybag and the
+# reference key and writes the keybag when it provisions one.
+optional_policy(`
+	gen_require(`
+		type kmod_t;
+	')
+
+	allow kmod_t aurora_sep_state_t:file rw_file_perms;
+')
+
+# An administrator grants a one-time xART allowance by writing its file.
+optional_policy(`
+	gen_require(`
+		type unconfined_t;
+	')
+
+	type_transition unconfined_t var_lib_t:file aurora_sep_state_t "aurora-sep-xart-allow-once.bin";
+')
+
+optional_policy(`
+	unconfined_domain(aurora_sep_load_t)
+')
+
+# The probe keys and their session keyring belong to the loader alone. A root
+# process that lists /proc/keys while the probe runs, such as the GDM session
+# worker at an automatic login, is asked for view on each of them: their user
+# view bit lets the check reach SELinux, which denies it, and the listing
+# leaves them out. That denial is the intended result, so do not log it.
+dontaudit domain aurora_sep_load_t:key view;

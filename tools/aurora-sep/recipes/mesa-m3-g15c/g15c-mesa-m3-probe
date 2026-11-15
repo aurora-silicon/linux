@@ -1,0 +1,11 @@
+#!/bin/sh
+# mesa-m3-probe (installed as /opt/mesa-m3-g15c/bin/mesa-m3-probe): the M3 Pro
+# session probe, built for this prefix, run through g15c-run, so it uses this
+# prefix's Mesa with the G15C opt-in. For the M3 Max kit's render job: start it
+# in the desktop session (WAYLAND_DISPLAY set). It renders a GLES frame through
+# zink on the GPU, checks two pixels, hands the frame to the compositor, runs a
+# Vulkan compute job checked on the CPU, checks that the Mesa objects mapped
+# come from this prefix, and prints key=value lines ending in result=pass or
+# result=fail. Options are passed on (--out FILE).
+P="${G15C_PREFIX:-/opt/mesa-m3-g15c}"
+exec "$P/bin/g15c-run" "$P/libexec/mesa-m3-probe" "$@"

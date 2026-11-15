@@ -1,0 +1,283 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Mac mini (M2 Pro, 2023) and Mac Studio (2023)
+ *
+ * This file contains the parts common to J474 and J475 devices with t6020,
+ * t6021 and t6022.
+ *
+ * target-type: J474s / J475c / J475d
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/*
+ * These models are very similar to the previous generation Mac Studio, other
+ * than GPIO indices.
+ */
+
+#include "t600x-j375.dtsi"
+
+&framebuffer0 {
+	power-domains = <&ps_dispext0_cpu0>, <&ps_dptx_phy_ps>;
+};
+
+#ifdef APPLE_T602X_NON_ULTRA
+/ {
+	aliases {
+		dcpext1 = &dcpext1;
+		/* Same Thunderbolt aliases as the 14/16-inch boards. This mini
+		 * brings up a fourth controller.
+		 */
+		usb4-0-acio = &usb4_0_acio;
+		usb4-0-nhi = &usb4_0_nhi;
+		usb4-0-pcie-adapter = &usb4_0_acio;
+		usb4-0-pcie = &apciec0;
+		usb4_0_rc = &usb4_0_acio;
+		usb4_0_nhi = &usb4_0_nhi;
+		usb4_0_pcie_adapter = &usb4_0_acio;
+		usb4_0_pcie = &apciec0;
+		usb4-1-acio = &usb4_1_acio;
+		usb4-1-nhi = &usb4_1_nhi;
+		usb4-1-pcie-adapter = &usb4_1_acio;
+		usb4-1-pcie = &apciec1;
+		usb4_1_rc = &usb4_1_acio;
+		usb4_1_nhi = &usb4_1_nhi;
+		usb4_1_pcie_adapter = &usb4_1_acio;
+		usb4_1_pcie = &apciec1;
+		usb4-2-acio = &usb4_2_acio;
+		usb4-2-nhi = &usb4_2_nhi;
+		usb4-2-pcie-adapter = &usb4_2_acio;
+		usb4-2-pcie = &apciec2;
+		usb4_2_rc = &usb4_2_acio;
+		usb4_2_nhi = &usb4_2_nhi;
+		usb4_2_pcie_adapter = &usb4_2_acio;
+		usb4_2_pcie = &apciec2;
+		usb4-3-acio = &usb4_3_acio;
+		usb4-3-nhi = &usb4_3_nhi;
+		usb4-3-pcie-adapter = &usb4_3_acio;
+		usb4-3-pcie = &apciec3;
+		usb4_3_rc = &usb4_3_acio;
+		usb4_3_nhi = &usb4_3_nhi;
+		usb4_3_pcie_adapter = &usb4_3_acio;
+		usb4_3_pcie = &apciec3;
+	};
+};
+
+&display {
+	iommus = <&dispext0_dart 0 0x100 0x0 0x10 0x0>,
+		 <&dispext1_dart 0 0x100 0x0 0x10 0x0>;
+};
+
+&dispext1_dart {
+	status = "okay";
+};
+
+&dcpext1_dart {
+	status = "okay";
+};
+
+&dcpext1_mbox {
+	status = "okay";
+};
+
+&dcpext1 {
+	status = "okay";
+	apple,connector-type = "USB-C";
+	phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>,
+	       <&atcphy2 PHY_TYPE_DP>, <&atcphy3 PHY_TYPE_DP>;
+	phy-names = "typec0", "typec1", "typec2", "typec3";
+	mux-controls = <&atcphy0_xbar 0>, <&atcphy1_xbar 0>,
+		       <&atcphy2_xbar 0>, <&atcphy3_xbar 0>;
+	mux-control-names = "typec0", "typec1", "typec2", "typec3";
+	apple,typec-mux-indices = <2 2 2 2>;
+	apple,typec-dptx-phys = <0 1 2 3>;
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+
+			port {
+				dcpext1_typec0: endpoint {
+					remote-endpoint = <&typec0_dcp>;
+				};
+			};
+		};
+
+		route@1 {
+			reg = <1>;
+			mode-switch;
+
+			port {
+				dcpext1_typec1: endpoint {
+					remote-endpoint = <&typec1_dcp>;
+				};
+			};
+		};
+
+		route@2 {
+			reg = <2>;
+			mode-switch;
+
+			port {
+				dcpext1_typec2: endpoint {
+					remote-endpoint = <&typec2_dcp>;
+				};
+			};
+		};
+
+		route@3 {
+			reg = <3>;
+			mode-switch;
+
+			port {
+				dcpext1_typec3: endpoint {
+					remote-endpoint = <&typec3_dcp>;
+				};
+			};
+		};
+	};
+};
+
+&typec0 {
+	ports {
+		port@3 {
+			reg = <3>;
+			typec0_dcp: endpoint {
+				remote-endpoint = <&dcpext1_typec0>;
+			};
+		};
+	};
+};
+
+&typec1 {
+	/*
+	 * t600x-j375.dtsi guards this on APPLE_T600X_NON_ULTRA, which only
+	 * t6001.dtsi defines, so the legacy phandle survives on t602x.  The
+	 * typec-routes provider owns hotplug notification here.
+	 */
+	/delete-property/ displayport;
+
+	ports {
+		port@3 {
+			reg = <3>;
+			typec1_dcp: endpoint {
+				remote-endpoint = <&dcpext1_typec1>;
+			};
+		};
+	};
+};
+
+&typec2 {
+	ports {
+		port@3 {
+			reg = <3>;
+			typec2_dcp: endpoint {
+				remote-endpoint = <&dcpext1_typec2>;
+			};
+		};
+	};
+};
+
+&typec3 {
+	ports {
+		port@3 {
+			reg = <3>;
+			typec3_dcp: endpoint {
+				remote-endpoint = <&dcpext1_typec3>;
+			};
+		};
+	};
+};
+
+&dpaudio2 {
+	status = "okay";
+};
+
+&atcphy0_xbar {
+	status = "okay";
+};
+
+&atcphy1_xbar {
+	status = "okay";
+};
+
+&atcphy2_xbar {
+	status = "okay";
+};
+
+&atcphy3_xbar {
+	status = "okay";
+};
+
+&ps_atc0_common {
+	apple,always-on;
+};
+
+&ps_atc1_common {
+	apple,always-on;
+};
+
+&ps_atc2_common {
+	apple,always-on;
+};
+
+&ps_atc3_common {
+	apple,always-on;
+};
+
+&usb4_0_acio {
+	apple,pcie-tunnel = <&usb4_0_pcie_tunnel>;
+};
+
+&usb4_1_acio {
+	apple,pcie-tunnel = <&usb4_1_pcie_tunnel>;
+};
+
+&usb4_2_acio {
+	apple,pcie-tunnel = <&usb4_2_pcie_tunnel>;
+};
+
+&usb4_3_acio {
+	apple,pcie-tunnel = <&usb4_3_pcie_tunnel>;
+};
+#endif
+
+&hpm0 {
+	interrupts = <44 IRQ_TYPE_LEVEL_LOW>;
+};
+
+&hpm1 {
+	interrupts = <44 IRQ_TYPE_LEVEL_LOW>;
+};
+
+&hpm2 {
+	interrupts = <44 IRQ_TYPE_LEVEL_LOW>;
+};
+
+&hpm3 {
+	interrupts = <44 IRQ_TYPE_LEVEL_LOW>;
+};
+
+/* PCIe devices */
+&port00 {
+	pwren-gpios = <&smc_gpio 13 GPIO_ACTIVE_HIGH>;
+};
+
+&port03 {
+	/* USB xHCI */
+	pwren-gpios = <&smc_gpio 19 GPIO_ACTIVE_HIGH>;
+};
+
+&speaker {
+	shutdown-gpios = <&pinctrl_ap 57 GPIO_ACTIVE_HIGH>;
+	interrupts-extended = <&pinctrl_ap 58 IRQ_TYPE_LEVEL_LOW>;
+};
+
+&jack_codec {
+	reset-gpios = <&pinctrl_nub 8 GPIO_ACTIVE_HIGH>;
+	interrupts-extended = <&pinctrl_ap 59 IRQ_TYPE_LEVEL_LOW>;
+};

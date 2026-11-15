@@ -1,0 +1,74 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,t8140-aop.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T8140 Always-On Processor
+
+maintainers:
+  - Ryan Murray <ryan@aurorasilicon.org>
+
+description:
+  The Always-On Processor provides audio and sensor services through firmware
+  loaded by the bootloader. The application processor uses a primary mailbox
+  and a separate setup-port mailbox. Each mailbox consumer has its own DMA
+  allocation window in the inherited AOP DART mappings.
+
+properties:
+  compatible:
+    const: apple,t8140-aop
+
+  reg:
+    items:
+      - description: AOP register and boot-argument window
+      - description: ASC wrapper and processor control registers
+
+  reg-names:
+    items:
+      - const: mmio
+      - const: asc
+
+  mboxes:
+    items:
+      - description: Primary firmware transport
+      - description: Firmware setup-port transport
+
+  mbox-names:
+    items:
+      - const: mbox
+      - const: setup
+
+  iommus:
+    maxItems: 1
+
+  apple,dma-range:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    minItems: 2
+    maxItems: 2
+    description:
+      Host DMA allocation window as a base and nonzero size. The window must
+      occupy root slots available to the host on this AOP DART stream.
+
+  power-domains:
+    maxItems: 1
+
+  als:
+    type: object
+    $ref: /schemas/iio/light/apple,t8140-aop-als.yaml#
+
+  audio:
+    type: object
+    $ref: /schemas/sound/apple,t8140-aop-audio.yaml#
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - mboxes
+  - mbox-names
+  - iommus
+  - apple,dma-range
+  - power-domains
+
+additionalProperties: false

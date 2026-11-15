@@ -1,0 +1,113 @@
+#!/bin/sh
+# g15c-first-job OUTDIR [SECS]: the first GPU jobs on an M3 Max (G15C),
+# headless, through /opt/mesa-m3-g15c. Run it as the desktop user (or root)
+# in a boot where the kernel has started the GPU. Each job runs for SECS
+# seconds (default 5, 1..60) under `timeout -k 5 120`.
+#
+#   1. compute-check    Vulkan compute; every result word checked
+#   2. vk-render-check  Vulkan clear + draw + copy; every pixel checked
+#   3. gl-render-check  GLES 3 through zink; every pixel checked
+#   4. each of 1-3 that gave wrong results runs again with
+#      ASAHI_G15C_SCHEDULING_STALLS=1 (the G15G stall pass), as <job>-stalls
+#   5. gpu-heat SECS 256 256 16, a short GLES load, only when 1-3 passed
+#
+# After a hang (a job timeout, or a fence that did not complete) no further
+# GPU job is started. Writes OUTDIR/<job>.log for each job and
+# OUTDIR/summary.txt: one "VERDICT <job> exit=<n> <class>" line per job, where
+# class is pass, wrong (results checked and wrong), error (no device,
+# refused, API error), hang or skipped, then the Mesa admission line. Prints
+# the same lines. Exit 0 only if jobs 1-3 passed; 1 otherwise; 2 on a usage
+# error. Knobs set by the caller (see g15c-run) apply to every job.
+P="${G15C_PREFIX:-/opt/mesa-m3-g15c}"
+OUT="$1"
+SECS="${2:-5}"
+usage() { echo "usage: g15c-first-job OUTDIR [SECS 1..60]" >&2; exit 2; }
+[ -n "$OUT" ] || usage
+case "$SECS" in ''|*[!0-9]*) usage ;; esac
+[ "$SECS" -ge 1 ] && [ "$SECS" -le 60 ] || usage
+mkdir -p "$OUT" || exit 2
+SUMMARY="$OUT/summary.txt"
+: > "$SUMMARY" || exit 2
+hung=0
+
+say() { echo "$*" | tee -a "$SUMMARY"; }
+
+# job NAME [VAR=VALUE...] -- PROGRAM ARGS...: run one job; sets $class.
+job() {
+	name=$1
+	shift
+	envs=
+	while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do
+		envs="$envs $1"
+		shift
+	done
+	shift
+	log="$OUT/$name.log"
+	if [ "$hung" = 1 ]; then
+		class=skipped
+		say "VERDICT $name exit=- skipped"
+		return
+	fi
+	{
+		echo "# $name $(date -u +%Y-%m-%dT%H:%M:%SZ) kernel $(uname -r)"
+		echo "# env:$envs"
+		echo "# cmd: $*"
+	} > "$log"
+	# shellcheck disable=SC2086 # $envs is a list of VAR=VALUE words
+	env $envs G15C_TIMEOUT=0 timeout -k 5 120 "$P/bin/g15c-run" "$@" >> "$log" 2>&1
+	rc=$?
+	case "$rc" in
+	0) class=pass ;;
+	124|137) class=hang ;;
+	1)
+		case "$1" in
+		*/gpu-heat) class=error ;;
+		*) class=wrong ;;
+		esac
+		;;
+	*)
+		if grep -q 'did not complete' "$log"; then
+			class=hang
+		else
+			class=error
+		fi
+		;;
+	esac
+	[ "$class" = hang ] && hung=1
+	echo "# exit $rc ($class)" >> "$log"
+	say "VERDICT $name exit=$rc $class"
+}
+
+{
+	echo "# g15c-first-job $(date -u +%Y-%m-%dT%H:%M:%SZ), $SECS s per job"
+	echo "# kernel $(uname -r); package $(cat "$P/share/mesa-m3-g15c/package-version" 2>/dev/null)"
+	ls -l /dev/dri/ 2>&1 | sed 's/^/# /'
+} | tee -a "$SUMMARY"
+
+first_failed=
+job compute-check -- "$P/bin/compute-check" "$SECS"
+[ "$class" = pass ] || first_failed="$first_failed compute-check:$class"
+job vk-render-check -- "$P/bin/vk-render-check" "$SECS"
+[ "$class" = pass ] || first_failed="$first_failed vk-render-check:$class"
+job gl-render-check -- "$P/bin/gl-render-check" "$SECS"
+[ "$class" = pass ] || first_failed="$first_failed gl-render-check:$class"
+
+for entry in $first_failed; do
+	case "$entry" in
+	*:wrong)
+		name=${entry%%:*}
+		job "$name-stalls" ASAHI_G15C_SCHEDULING_STALLS=1 -- "$P/bin/$name" "$SECS"
+		;;
+	esac
+done
+
+if [ -z "$first_failed" ]; then
+	job gpu-heat -- "$P/bin/gpu-heat" "$SECS" 256 256 16
+else
+	say "VERDICT gpu-heat exit=- skipped"
+fi
+
+# The admission line Mesa printed (chip, clusters, masks, VA layout, stalls).
+grep -h -m1 -E '^asahi: G15C (admitted|refused)' "$OUT"/*.log 2>/dev/null | head -n 1 | tee -a "$SUMMARY"
+
+[ -z "$first_failed" ]

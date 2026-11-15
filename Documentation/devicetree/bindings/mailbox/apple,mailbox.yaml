@@ -1,0 +1,254 @@
+# SPDX-License-Identifier: GPL-2.0 OR BSD-2-Clause
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/mailbox/apple,mailbox.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple Mailbox Controller
+
+maintainers:
+  - Hector Martin <marcan@marcan.st>
+  - Sven Peter <sven@svenpeter.dev>
+
+description:
+  The Apple mailbox consists of two FIFOs used to exchange 64+32 bit
+  messages between the main CPU and a co-processor. Multiple instances
+  of this mailbox can be found on Apple SoCs.
+  One of the two FIFOs is used to send data to a co-processor while the other
+  FIFO is used for the other direction.
+  Various clients implement different IPC protocols based on these simple
+  messages and shared memory buffers.
+
+properties:
+  compatible:
+    oneOf:
+      - description:
+          T8152 SMC post-office mailbox with counted FIFOs and interrupt
+          masking provided by the interrupt controller.
+        const: apple,t8152-smc-mailbox
+
+      - description:
+          ASC mailboxes are the most common variant found on the M1 used
+          for example for the display controller, the system management
+          controller and the NVMe coprocessor.
+        items:
+          - enum:
+              - apple,t8103-asc-mailbox
+              - apple,t8112-asc-mailbox
+              - apple,t8122-asc-mailbox
+              - apple,t8132-asc-mailbox
+              - apple,t8140-asc-mailbox
+              - apple,t8142-asc-mailbox
+              - apple,t6000-asc-mailbox
+              - apple,t6020-asc-mailbox
+              - apple,t6030-asc-mailbox
+              - apple,t6031-asc-mailbox
+              - apple,t6041-asc-mailbox
+              - apple,t6050-asc-mailbox
+          - const: apple,asc-mailbox-v4
+
+      - description:
+          ASC mailboxes of the T8140 GPU coprocessors. Unlike the other
+          T8140 ASC mailboxes, they do not need the application processor
+          to enable their receive FIFO.
+        items:
+          - const: apple,t8140-gfx-asc-mailbox
+          - const: apple,asc-mailbox-v4
+
+      - description:
+          The T6021 and T8112 ANE coprocessor mailboxes are ASC mailboxes.
+          Only their recv-not-empty interrupt is known.
+        items:
+          - enum:
+              - apple,t6021-ane-mailbox
+              - apple,t8112-ane-mailbox
+          - const: apple,asc-mailbox-v4
+
+      - description:
+          M3 GPU ASC mailboxes with no generic mailbox fallback. This keeps
+          older kernels from binding before the GPU handoff is supported.
+        enum:
+          - apple,t6030-agx-asc-mailbox
+          - apple,t6031-agx-asc-mailbox
+          - apple,t8122-agx-asc-mailbox
+
+      - description:
+          AOP setup-port mailbox with a separate register layout.
+        const: apple,t8140-aop-setup-mailbox
+
+      - description:
+          A coprocessor's secure RTBuddy port, the ADT's
+          iop,secure-rtbuddy-proxy. It is polled, with no interrupts described.
+        items:
+          - enum:
+              - apple,t8140-secure-rtbuddy-proxy
+          - const: apple,secure-rtbuddy-proxy
+
+      - description:
+          Later AOP setup-port mailboxes with the T8140 register layout.
+        items:
+          - enum:
+              - apple,t6050-aop-setup-mailbox
+              - apple,t8142-aop-setup-mailbox
+          - const: apple,t8140-aop-setup-mailbox
+
+      - description:
+          An older ASC mailbox interface found on T2 and A11 that is also
+          used for the NVMe coprocessor and the system management
+          controller.
+        items:
+          - const: apple,t8015-asc-mailbox
+
+      - description:
+          M3 mailboxes are an older variant with a slightly different MMIO
+          interface still found on the M1. It is used for the Thunderbolt
+          co-processors.
+        items:
+          - enum:
+              - apple,t8103-m3-mailbox
+              - apple,t8112-m3-mailbox
+              - apple,t6000-m3-mailbox
+          - const: apple,m3-mailbox-v2
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    minItems: 1
+    maxItems: 4
+
+  interrupt-names:
+    minItems: 1
+    maxItems: 4
+
+  iommus:
+    maxItems: 1
+
+  apple,dma-range:
+    $ref: /schemas/types.yaml#/definitions/uint64-array
+    minItems: 2
+    maxItems: 2
+    description:
+      Setup-port DMA allocation window, expressed as a base and nonzero size.
+      This identifies host-available slots in the inherited AOP stream root.
+
+  "#mbox-cells":
+    const: 0
+
+  resets:
+    maxItems: 1
+
+  apple,hold-rx-in-sleep:
+    description:
+      Messages from this coprocessor need not wake the system. The OS may
+      leave them in the receive FIFO while the system sleeps and handle
+      them at resume.
+    type: boolean
+
+  power-domains:
+    minItems: 1
+    maxItems: 2
+
+allOf:
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              const: apple,secure-rtbuddy-proxy
+    then:
+      required:
+        - interrupts
+        - interrupt-names
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8152-smc-mailbox
+    then:
+      properties:
+        interrupts:
+          minItems: 2
+          maxItems: 2
+        interrupt-names:
+          items:
+            - const: send-empty
+            - const: recv-not-empty
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8140-aop-setup-mailbox
+    then:
+      properties:
+        interrupts:
+          minItems: 2
+          maxItems: 2
+        interrupt-names:
+          items:
+            - const: send-empty
+            - const: recv-not-empty
+      required:
+        - iommus
+        - apple,dma-range
+    else:
+      properties:
+        iommus: false
+        apple,dma-range: false
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t6021-ane-mailbox
+              - apple,t8112-ane-mailbox
+    then:
+      properties:
+        interrupt-names:
+          minItems: 1
+          items:
+            - const: recv-not-empty
+            - const: send-empty
+            - const: send-not-empty
+            - const: recv-empty
+
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              enum:
+                - apple,t6021-ane-mailbox
+                - apple,t8112-ane-mailbox
+                - apple,t8140-aop-setup-mailbox
+                - apple,t8152-smc-mailbox
+    then:
+      properties:
+        interrupts:
+          minItems: 4
+        interrupt-names:
+          items:
+            - const: send-empty
+            - const: send-not-empty
+            - const: recv-empty
+            - const: recv-not-empty
+
+required:
+  - compatible
+  - reg
+  - "#mbox-cells"
+
+additionalProperties: false
+
+examples:
+  - |
+    mailbox@77408000 {
+        compatible = "apple,t8103-asc-mailbox", "apple,asc-mailbox-v4";
+        reg = <0x77408000 0x4000>;
+        interrupts = <1 583 4>, <1 584 4>, <1 585 4>, <1 586 4>;
+        interrupt-names = "send-empty", "send-not-empty",
+                          "recv-empty", "recv-not-empty";
+        #mbox-cells = <0>;
+    };

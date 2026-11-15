@@ -1,0 +1,9 @@
+[Unit]
+Description=Load Apple SEP when the iBoot container appears
+
+[Path]
+PathExists=/dev/disk/by-partlabel/iBootSystemContainer
+Unit=apple-sep.service
+
+[Install]
+WantedBy=multi-user.target

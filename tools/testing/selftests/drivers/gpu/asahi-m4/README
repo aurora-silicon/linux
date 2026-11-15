@@ -1,0 +1,73 @@
+SPDX-License-Identifier: GPL-2.0-only OR MIT
+
+Asahi M4 driver regression tests
+===============================
+
+From a kernel checkout, `make` builds/installs no generated harnesses and
+requires no Rust compiler. `make cpu`, `make run_tests` and the kselftest entry
+point `./run.sh` run CPU-only regressions. They never open a render node or submit GPU work. They need Python 3,
+a host Rust compiler (edition 2021) and a host C compiler. RUSTC and CC may be
+set to compiler command lines; no private checkout or kernel build output is
+needed. Missing compilers produce a kselftest skip (exit 4).
+
+Results and generated host harnesses go into a fresh temporary directory;
+`ASAHI_M4_OUTPUT=/path/to/results make cpu` selects a retained output directory.
+Installed tests need ASAHI_M4_KERNEL=/path/to/kernel-source. The in-tree suite
+finds its own checkout. Each test compiles actual production Rust modules or
+method bodies with CPU-only memory, allocation, MMIO and kernel API stand-ins.
+These tests do not qualify hardware MMIO, cache effects, firmware lifetime,
+performance, desktop operation or graphics API conformance.
+
+The fixtures directory preserves independent C-generated firmware bytes and
+VM oracle results from kernel commit 5e86481d356cdfa05d703b4b97f1cb56aa8e2819.
+manifest.json pins the original C helper hashes, compressed/uncompressed byte
+hashes, historical generator inputs and UAPI bindings. The reference commits
+are provenance from the pre-removal development history, not dependencies on
+the proposed commit ancestry. The historical *.input.c files reference helpers
+that are not shipped here; they do not form a complete reproducible generator.
+Keep the original source snapshots when reviewing fixture replacement. The C helpers
+were checked with address/undefined-behavior sanitizers during generation.
+The removed C GPU driver is not restored or required. *.input.c are historical
+fixture inputs only; no test compiles them. Fixtures must never be regenerated
+from the Rust implementation being tested. Protocol changes require reviewing
+and documenting an independent reference before replacing these fixtures.
+
+The byte fixtures cover initdata, loader spans and bounds, compute work,
+allocator images, TA/FS work and sequences, timestamps, submit records,
+queue/context/notifier records and TTBAT generation words. Comparisons include
+3,736,988 encoder bytes and 598 bounds/loader cases. Frozen Rust UAPI bindings
+are compared against the actual kernel header by compiling complete C and Rust
+definitions and measuring sizes, alignments, member offsets and constants.
+Comments and documentation can change without invalidating that ABI check.
+The current global-parameters reply has a documented additive capacity tail.
+The frozen 600-byte prefix is compared unchanged; independent C assertions
+require the full reply to be exactly 616 bytes, with two eight-byte fields at
+600 and 608. Older Mesa headers can still match the shared prefix. Firmware
+encoder golden data and its fixture manifest are never regenerated.
+No Mesa headers are vendored. Set ASAHI_M4_MESA=/path/to/mesa, or run
+`test-uapi.py --mesa /path/to/mesa`, for a compatibility check against the real
+userspace source; a default host run reports that Mesa comparison was omitted.
+
+The thermal suite compiles the shared production C policy/sensor headers
+against deterministic regression traces: 571,828 policy rows, 75,414 sensor
+cases, and independent rounding/boundary checks. Rust tests exercise only the
+GPU scheduling and request-selection helpers; sensor decoding and thermal
+policy are owned by PMP rather than duplicated in the GPU. The
+PPL tests exercise the actual shared RAII handshake core with competing CPU
+owners, firmware-yield/timeout/error paths and guard-drop ordering; separate
+VM and retention harnesses check publication and memory ownership with mock
+hardware. Resource/recovery/frontend tests cover real capacity admission,
+dirty-span clearing, abort receipts, command validation and fence completion.
+
+GPU execution is opt-in and requires a running M4 Rust Asahi kernel and the
+paired native Mesa installation:
+
+  make hardware MESA=/path/to/installed/mesa RENDER_NODE=/dev/dri/renderD128 ROUNDS=32
+
+This builds native-gl46.c, verifies aurora-g16 (asahi-g16 on older kernels) owns the render node, selects the
+requested Mesa libraries, clears software/translation/API-version overrides,
+and runs native OpenGL 4.6 triangle readback, compute and geometry-feedback
+checks. Results include kernel/boot identity and Mesa/binary hashes. Ordinary
+make and kselftest targets do not invoke this hardware target. A passing host
+suite is not permission to skip the reboot and hardware regression after a
+kernel change.

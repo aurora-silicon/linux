@@ -1,0 +1,56 @@
+# The M3 Max test kit's plan (install-aurora-sep.sh --m3max-kit), a release asset pinned by
+# M3MAX_KIT_PLAN. It names every boot the kit runs on a t6031 and its kernel parameters, so the
+# knob sets change here, not in the script. m3max_kit_plan_check in install-aurora-sep.sh says
+# what each directive takes; a plan it refuses stops the kit before anything changes.
+#
+# The parameter names follow the M3 Max naming contract (BRINGUP-COMMON-20261011.md): the display
+# path is apple_t6031_display.enable (off by default on a t6031), the GPU start is
+# asahi.t6031_start=1 with t6031_* knobs. The kernel the kit installs must have each one, or that
+# boot is not armed (its stage says not-armed, and the kit goes on).
+format 1
+chip t6031
+boards j514c j516c
+# Experimental boots one run arms at most (the script's ceiling is 12): display, gpu-handoff, the
+# four GPU knob sets below and the jobs boot fit.
+max-boots 8
+# Seconds between a boot's collection and the restart into the next one, and before the restart
+# into the loader boot (longer: it is announced with the macOS restore steps).
+reboot-delay 60
+loader-delay 180
+# On every experimental boot (the kit adds panic=10): a soft lockup or a task stuck for
+# hung_task_timeout_secs panics, and systemd keeps the hardware watchdog armed, so most hangs
+# restart into the normal boot on their own.
+safety softlockup_panic=1 hung_task_panic=1 systemd.watchdog_sec=30
+
+# T1: the first normal boot of the new kernel and boot loader variant (no one-shot).
+boot data data
+# T2: the native internal display, for one boot.
+boot display display apple_t6031_display.enable=1
+# T3a: m1n1's GPU handoff (the powered identity read and the GPU node fill), after the interim
+# results are packed: boot.bin is rebuilt with chosen.asahi,t6031-gpu=1, then a normal boot (not a
+# one-shot). The kernel starts nothing. Afterwards boot.bin goes back to the GPU handoff off.
+boot gpu-handoff loader
+# T3: the GPU firmware start (asahi.t6031_start=1, one attempt per boot), one boot per knob set,
+# in order, until one succeeds; only after gpu-handoff passed, and only with a kernel that has
+# every parameter. Lowest risk first, from the GPU workstream's sweep table: the kernel's defaults
+# at the lowest performance state, then one knob at a time (the second InitData version
+# candidate, the T8122 clock-generator slot, the ADT's Fender window), all at performance state 1.
+boot gpu-1 gpu asahi.t6031_start=1 asahi.t6031_pstate_cap=1
+boot gpu-2 gpu asahi.t6031_start=1 asahi.t6031_pstate_cap=1 asahi.t6031_initdata_version=0x0c89c357839204b8
+boot gpu-3 gpu asahi.t6031_start=1 asahi.t6031_pstate_cap=1 asahi.t6031_clkgen=e1c
+boot gpu-4 gpu asahi.t6031_start=1 asahi.t6031_pstate_cap=1 asahi.t6031_fender=adt
+# T4: GPU jobs, with the parameters of the GPU boot that succeeded (@gpu), when the kit has a
+# Mesa (mesa-prefix with a Vulkan driver).
+boot jobs jobs @gpu asahi.m3_expose=1
+
+# What counts as a success in a boot's kernel log (extended regexes): the display gate enabled
+# the display nodes (the DRM state is in the stage's checks too); the GPU's verdict line.
+success gpu M3 G15C verdict: (firmware-running|job-completed):
+success display apple-t6031-display: enabled /
+
+# The jobs boot: its Mesa (mesa-m3-g15c), the jobs' environment, and the jobs in order: the
+# headless first jobs, then the desktop session's render probe (optional: a zink frame handed to
+# the compositor on the boot framebuffer has never been tried).
+mesa-prefix /opt/mesa-m3-g15c
+job-env ASAHI_M3_EXPERIMENTAL=1 ASAHI_M3_G15C=1
+jobs first-job render

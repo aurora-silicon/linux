@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "scope": "Exact synthetic J713 A407 wire bytes from working M4 C backend; host compatibility, not hardware qualification. M3 uses its existing iomfb_v14_7 backend, not the old standalone J514S profile.",
+  "reference_commit": "feb6464a52a7d968d8e7a0ac6a5cab2865f31782",
+  "source_sha256": {
+    "drivers/gpu/drm/apple/dcp-m4-profile.h": "551113bad758743de662be4590fb4e10b24a6ee5b715bd594b1e89a47dd34dfd",
+    "drivers/gpu/drm/apple/dcp-m4-frame.h": "75a84db4de4cca8f2afc1aa455b417644baaa57d6ad80eb546ffe1f7082820c8",
+    "drivers/gpu/drm/apple/dcp-m4-protocol.h": "7d21e8e8ed0e270558bb89d59ffe124004456a56d4aa10a57b12f07854f2ac2d"
+  },
+  "cases_sha256": "797126cc96d39737214046d43693566dfa7b9af3a233b88449417a63445e1b57",
+  "cases": 10,
+  "bytes": 71280,
+  "sha256": "441529306e6a0c097437514c8963d269afc6a1571fd752c7d260e65d06ce8bea",
+  "encoding": "base64 of zlib stream",
+  "zlib_base64": "eNrt3E1Kw0AYBuAZKCqiVLyAXXanCw8Q3bh34VJ6CnGnx/C2mtCmP4E2bX5Ixz4PDLQpmcKQ+abTlySE45Q9TG7itg8vQ/g+6/HLG/Z/np9WtPzlbwDYWyzKXdGeXl+eiwPXV2FaHIlxsyiNlnUx7upuWzGbzvsYlf3+t2F0JQFAfx5vrbUAAADDiKUj/mtXrgecUlkOcr1uRhEA6IlcDwAAYCip5HqpjWuZ680mmVwPAAAAAACAtqL79Wq4X482E8wQ0KAsB/frmXwAcNTcrwcAADAUuV4NuR5t5lfl/XtmTKivykGu1/3kAwA6JNcDAAAYilyvhlyPNvOrcil/ZcaE+qoc5HqdTz4AoEtyPQAAgKGkmOvlu8iVA3O3bNHWffzsOGHP/u/ydr/W/zg/bSzXAxpU5SDX62AYXUkADatnZQ2KqzVo+UM626/exm0/wOP8gDUoYdtyvc83azAAAEDP284Yksj1KrvI5n2FA3O9PVVzvYtFC3I9AAAS2RoEuV43o3iy5HoAAAB97zpTzPVSINcDAAAAAACgQzGV53CmNrDlczhnk0yuBwAAAAAAQFsbud4fdGtBxg=="
+}

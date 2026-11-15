@@ -1,0 +1,1790 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * PMGR Power domains for the Apple T8140 "A18 Pro" SoC
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+&pmgr {
+	ps_sep_aon: power-controller@60 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x60 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "sep_aon";
+		apple,always-on;
+	};
+
+	ps_aic: power-controller@110 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x110 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aic";
+		apple,always-on;
+	};
+
+	ps_gpio: power-controller@120 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x120 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "gpio";
+	};
+
+	ps_pmc: power-controller@138 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x138 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pmc";
+		apple,always-on;
+	};
+
+	ps_afggfxni0: power-controller@1b8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1b8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "afggfxni0";
+		apple,always-on;
+	};
+
+	ps_gfx: power-controller@1f0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1f0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "gfx";
+		power-domains = <&ps_afimccni0>, <&ps_piogw>;
+		/*
+		 * The GPU firmware keeps running across system sleep and
+		 * does not survive this state going off for long.
+		 */
+		apple,always-on;
+		apple,sleep-driver-owned;
+	};
+
+	ps_venc0_sys: power-controller@240 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x240 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc0_sys";
+		power-domains = <&ps_afisocni0>;
+	};
+
+	ps_venc1_sys: power-controller@248 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x248 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc1_sys";
+		status = "disabled";
+	};
+
+	ps_apcie_gp: power-controller@258 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x258 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "apcie_gp";
+		power-domains = <&ps_afisocni1>;
+	};
+
+	ps_isp_sys: power-controller@268 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x268 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_sys";
+		power-domains = <&ps_afisocni1>;
+	};
+
+	ps_avd_sys: power-controller@270 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x270 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "avd_sys";
+		power-domains = <&ps_afisocni1>;
+	};
+
+	ps_ans: power-controller@278 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x278 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ans";
+		power-domains = <&ps_afisocni1>;
+		apple,always-on; /* handed over running, cannot be reset */
+	};
+
+	ps_disp_sys: power-controller@280 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x280 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "disp_sys";
+		power-domains = <&ps_afisocni2>;
+	};
+
+	/*
+	 * The external display coprocessor has no Linux consumer yet. Its
+	 * firmware keeps it running, so leave its three states, dispext0_sys,
+	 * dispext0_fe and dispext0_cpu, to it: powering dispext0_cpu down
+	 * underneath that firmware faults.
+	 */
+	ps_dispext0_sys: power-controller@288 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x288 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dispext0_sys";
+		power-domains = <&ps_afisocni2>;
+		status = "disabled";
+	};
+
+	ps_apcie_sys_gp: power-controller@2a0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2a0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "apcie_sys_gp";
+		power-domains = <&ps_apcie_gp>;
+	};
+
+	ps_i2c0: power-controller@2c8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2c8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "i2c0";
+		power-domains = <&ps_sio>;
+	};
+
+	ps_spi_p: power-controller@2f0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2f0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "spi_p";
+		power-domains = <&ps_sio>;
+		status = "okay";
+	};
+
+	ps_apcie_st: power-controller@310 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x310 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "apcie_st";
+		power-domains = <&ps_ans>;
+	};
+
+	ps_disp_fe: power-controller@318 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x318 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "disp_fe";
+		power-domains = <&ps_disp_sys>;
+	};
+
+	ps_dispext0_fe: power-controller@320 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x320 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dispext0_fe";
+		power-domains = <&ps_dispext0_sys>;
+		status = "disabled";
+	};
+
+	ps_dispext0_cpu: power-controller@328 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x328 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dispext0_cpu";
+		power-domains = <&ps_dispext0_fe>;
+		status = "disabled";
+	};
+
+	ps_spi2: power-controller@340 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x340 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "spi2";
+		power-domains = <&ps_spi_p>;
+	};
+
+	ps_apcie_sys_st: power-controller@3a0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3a0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "apcie_sys_st";
+		power-domains = <&ps_ans>, <&ps_apcie_st>, <&ps_apcie_phy_sw>;
+	};
+
+	/* SYS_ST's parent, kept on: only a real sleep lowers it, through the sleep controller. */
+	ps_apcie_phy_sw: power-controller@3c0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3c0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "apcie_phy_sw";
+		power-domains = <&ps_apcie_sys_gp>;
+		apple,always-on;
+	};
+
+	ps_pmp: power-controller@3d0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3d0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pmp";
+		apple,always-on;
+	};
+
+	ps_pms_sram: power-controller@3d8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3d8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pms_sram";
+		apple,always-on;
+	};
+
+	ps_atc0_usb_aon: power-controller@3e0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3e0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc0_usb_aon";
+	};
+
+	ps_atc0_common: power-controller@3e8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3e8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc0_common";
+		power-domains = <&ps_afisocni2>, <&ps_atc0_usb_aon>;
+	};
+
+	ps_atc0_usb: power-controller@3f0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3f0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc0_usb";
+		power-domains = <&ps_atc0_common>;
+	};
+
+	/*
+	 * ISP-local power domains (live J700 ADT: ISP_CPU .. ISP_CVM, "no-ps"
+	 * entries in the main PMGR block).  As on t8112, the dependency tree is
+	 * left to the ISP driver, which sequences them in the ADT parent-first
+	 * order (ISP_SYS -> ISP_CPU -> cores, ISP_SYS -> ISP_FE -> ...).  The
+	 * unnamed slot at 0x4020 is the ISP_DPRX domain, which the firmware
+	 * enables between ISP_FE and ISP_SECURE.  Plain power
+	 * gating only: a local domain parked with DEV_DISABLE (the t8112
+	 * apple,force-disable pattern) never reached ACTIVE again on J700
+	 * (isp_cpu_core0 stuck at ACTUAL=0 on the second firmware boot).  No
+	 * automatic power management either: macOS writes them exactly 0xf.
+	 */
+	ps_sep: power-controller@c00 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xc00 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "sep";
+		power-domains = <&ps_afisocni0>;
+		apple,always-on;
+	};
+
+	ps_isp_cpu: power-controller@4000 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4000 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		apple,no-auto-pm;
+		label = "isp_cpu";
+		power-domains = <&ps_isp_sys>;
+	};
+
+	ps_isp_cpu_core0: power-controller@4008 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4008 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		apple,no-auto-pm;
+		label = "isp_cpu_core0";
+		power-domains = <&ps_isp_cpu>;
+	};
+
+	ps_isp_cpu_core1: power-controller@4010 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4010 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		apple,no-auto-pm;
+		label = "isp_cpu_core1";
+		power-domains = <&ps_isp_cpu>;
+	};
+
+	ps_isp_fe: power-controller@4018 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4018 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		apple,no-auto-pm;
+		label = "isp_fe";
+		power-domains = <&ps_isp_sys>;
+	};
+
+	ps_isp_dprx: power-controller@4020 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4020 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		apple,no-auto-pm;
+		label = "isp_dprx";
+		power-domains = <&ps_isp_fe>;
+	};
+
+	ps_isp_secure: power-controller@4028 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4028 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		apple,no-auto-pm;
+		label = "isp_secure";
+		power-domains = <&ps_isp_fe>;
+	};
+
+	ps_isp_sts0: power-controller@4030 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4030 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		apple,no-auto-pm;
+		label = "isp_sts0";
+		power-domains = <&ps_isp_fe>;
+	};
+
+	ps_isp_sts1: power-controller@4038 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4038 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		apple,no-auto-pm;
+		label = "isp_sts1";
+		power-domains = <&ps_isp_fe>;
+	};
+
+	ps_isp_pearl: power-controller@4040 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4040 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		apple,no-auto-pm;
+		label = "isp_pearl";
+		power-domains = <&ps_isp_fe>;
+	};
+
+	ps_isp_be: power-controller@4048 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4048 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		apple,no-auto-pm;
+		label = "isp_be";
+		power-domains = <&ps_isp_fe>;
+	};
+
+	ps_isp_clr: power-controller@4050 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4050 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		apple,no-auto-pm;
+		label = "isp_clr";
+		power-domains = <&ps_isp_be>;
+	};
+
+	ps_isp_cvd: power-controller@4058 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4058 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		apple,no-auto-pm;
+		label = "isp_cvd";
+		power-domains = <&ps_isp_be>;
+	};
+
+	ps_isp_cvm: power-controller@4060 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4060 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		apple,no-auto-pm;
+		label = "isp_cvm";
+		power-domains = <&ps_isp_cvd>;
+	};
+	ps_disp_cpu: power-controller@10000 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x10000 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "disp_cpu";
+		power-domains = <&ps_disp_fe>;
+		/*
+		 * The display coprocessor is handed over running and its
+		 * firmware owns this state; writing it faults.
+		 */
+		apple,always-on;
+		apple,firmware-owned;
+	};
+
+	ps_venc0_dma: power-controller@8000 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8000 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc0_dma";
+		power-domains = <&ps_venc0_sys>;
+	};
+
+	ps_venc0_pipe4: power-controller@8008 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8008 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc0_pipe4";
+		power-domains = <&ps_venc0_dma>;
+	};
+
+	ps_venc0_pipe5: power-controller@8010 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8010 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc0_pipe5";
+		power-domains = <&ps_venc0_dma>;
+	};
+
+	ps_venc0_me0: power-controller@8018 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8018 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc0_me0";
+		power-domains = <&ps_venc0_dma>;
+	};
+
+	ps_venc0_me1: power-controller@8020 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8020 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc0_me1";
+		power-domains = <&ps_venc0_me0>;
+	};
+
+	ps_venc1_dma: power-controller@8028 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8028 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc1_dma";
+		power-domains = <&ps_venc1_sys>;
+		status = "disabled";
+	};
+
+	ps_venc1_pipe4: power-controller@8030 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8030 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc1_pipe4";
+		power-domains = <&ps_venc1_dma>;
+		status = "disabled";
+	};
+
+	ps_venc1_pipe5: power-controller@8038 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8038 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc1_pipe5";
+		power-domains = <&ps_venc1_dma>;
+		status = "disabled";
+	};
+
+	ps_venc1_me0: power-controller@8040 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8040 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc1_me0";
+		power-domains = <&ps_venc1_dma>;
+		status = "disabled";
+	};
+
+	ps_venc1_me1: power-controller@8048 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8048 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "venc1_me1";
+		power-domains = <&ps_venc1_me0>;
+		status = "disabled";
+	};
+};
+
+&pmgr_mini {
+	ps_nub_spmi0: power-controller@58 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x58 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "nub_spmi0";
+		apple,always-on;
+	};
+
+	ps_nub_spmi_a0: power-controller@68 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x68 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "nub_spmi_a0";
+		apple,always-on;
+	};
+
+	/*
+	 * AOP and audio-fabric power domains (live J700 ADT /arm-io/pmgr entries
+	 * flagged "no-ps", register slots in this block at 0x4000+).  Parents are
+	 * the ADT parents.  The speaker path needs them enabled parent-first:
+	 * aop_filter, audio_a, audio_fr, audio_p, audio_leap_mca, audio_leap_a,
+	 * audio_leap_c, audio_leap_ns_a, audio_leap_tx0.  The AOP firmware is
+	 * loaded by iBoot and already running when Linux boots, so the AOP
+	 * domains iBoot leaves on are always-on (aop2_cpu, aop2_piodma,
+	 * aop_he_nrcs0/1, aop_i2cm3 and aop_spi1 are off at boot and the HE
+	 * NRCS pair does not power up, so those stay unmanaged).  The audio
+	 * fabric parents (audio_a, audio_fr, audio_p, audio_leap_a,
+	 * audio_leap_c) are off at boot, and the AOP firmware relies on them
+	 * once they are on: letting genpd switch audio_p off during a
+	 * runtime-PM cycle of audio_leap_mca left the firmware unable to
+	 * answer LPAI power requests, so they are always-on and the driver
+	 * turns them on at probe; only the leaves (audio_leap_tx0,
+	 * audio_leap_mca, audio_leap_ns_a, ...) are runtime-managed.
+	 */
+	ps_aop_filter: power-controller@4000 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4000 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_filter";
+		apple,always-on;
+	};
+
+	ps_aop_base: power-controller@4010 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4010 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_base";
+		power-domains = <&ps_aop_filter>;
+		apple,always-on;
+	};
+
+	ps_aop_fr: power-controller@4018 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4018 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_fr";
+		power-domains = <&ps_aop_filter>;
+		apple,always-on;
+	};
+
+	ps_audio_a: power-controller@4020 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4020 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_a";
+		/* AOP audio fabric: the firmware expects it to stay on */
+		apple,always-on;
+		power-domains = <&ps_aop_filter>;
+	};
+
+	ps_aop_cpu: power-controller@4098 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4098 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_cpu";
+		power-domains = <&ps_aop_base>, <&ps_aop_fr>;
+		apple,always-on;
+	};
+
+	ps_audio_fr: power-controller@40a8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x40a8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_fr";
+		/* AOP audio fabric: the firmware expects it to stay on */
+		apple,always-on;
+		power-domains = <&ps_audio_a>;
+	};
+
+	ps_audio_p: power-controller@40d0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x40d0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_p";
+		/* AOP audio fabric: the firmware expects it to stay on */
+		apple,always-on;
+		power-domains = <&ps_audio_fr>;
+	};
+
+	ps_audio_leap_a: power-controller@40d8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x40d8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_leap_a";
+		/* AOP audio fabric: the firmware expects it to stay on */
+		apple,always-on;
+		power-domains = <&ps_audio_fr>;
+	};
+
+	ps_audio_base_ns_a: power-controller@40f0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x40f0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_base_ns_a";
+		power-domains = <&ps_audio_p>;
+	};
+
+	ps_audio_leap_mca: power-controller@40f8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x40f8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_leap_mca";
+		power-domains = <&ps_audio_p>;
+	};
+
+	ps_audio_mca0_m: power-controller@4100 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4100 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_mca0_m";
+		power-domains = <&ps_audio_p>;
+	};
+
+	ps_audio_mca1_m: power-controller@4108 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4108 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_mca1_m";
+		power-domains = <&ps_audio_p>;
+	};
+
+	ps_audio_leap_c: power-controller@4130 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4130 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_leap_c";
+		/* AOP audio fabric: the firmware expects it to stay on */
+		apple,always-on;
+		power-domains = <&ps_audio_leap_a>;
+	};
+
+	ps_audio_leap_s_a: power-controller@4138 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4138 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_leap_s_a";
+		power-domains = <&ps_audio_leap_c>;
+	};
+
+	ps_audio_leap_ns_a: power-controller@4140 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4140 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_leap_ns_a";
+		power-domains = <&ps_audio_leap_c>;
+	};
+
+	ps_audio_leap_rx0: power-controller@4148 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4148 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_leap_rx0";
+		power-domains = <&ps_audio_leap_c>;
+	};
+
+	ps_audio_leap_tx0: power-controller@4170 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4170 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_leap_tx0";
+		power-domains = <&ps_audio_leap_c>;
+	};
+
+	ps_smc_i2cm1: power-controller@8030 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8030 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "smc_i2cm1";
+		power-domains = <&ps_smc_fabric>;
+		apple,always-on; /* used by the SMC firmware */
+	};
+
+	ps_smc_i2cm2: power-controller@8038 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8038 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "smc_i2cm2";
+		power-domains = <&ps_smc_fabric>;
+		apple,always-on; /* used by the SMC firmware */
+	};
+
+};
+
+&pmgr {
+	ps_msg: power-controller@108 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x108 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "msg";
+		status = "okay";
+	};
+
+	ps_dwi: power-controller@118 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x118 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dwi";
+		status = "okay";
+	};
+
+	ps_pms_fpwm0: power-controller@140 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x140 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pms_fpwm0";
+		status = "okay";
+	};
+
+	ps_pms_fpwm1: power-controller@148 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x148 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pms_fpwm1";
+		status = "okay";
+	};
+
+	ps_pms_fpwm2: power-controller@150 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x150 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pms_fpwm2";
+		status = "okay";
+	};
+
+	ps_pms_fpwm3: power-controller@158 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x158 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pms_fpwm3";
+		status = "okay";
+	};
+
+	ps_pms_fpwm4: power-controller@160 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x160 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pms_fpwm4";
+		status = "okay";
+	};
+
+	ps_pms_c1ppt: power-controller@168 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x168 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pms_c1ppt";
+		apple,always-on;
+		status = "okay";
+	};
+
+	ps_soc_rc: power-controller@170 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x170 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "soc_rc";
+		status = "okay";
+	};
+
+	ps_soc_dpe: power-controller@178 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x178 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "soc_dpe";
+		apple,always-on;
+		status = "okay";
+	};
+
+	ps_pmgr_soc_ocla: power-controller@180 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x180 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pmgr_soc_ocla";
+		status = "okay";
+	};
+
+	ps_ispsens0: power-controller@188 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x188 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ispsens0";
+		status = "okay";
+	};
+
+	ps_ispsens1: power-controller@190 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x190 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ispsens1";
+		status = "okay";
+	};
+
+	ps_ap_tmm: power-controller@1a0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1a0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ap_tmm";
+		status = "okay";
+	};
+
+	/*
+	 * SoC fabric power states (ADT AFIMCCNI0, PIOGW, AFINS0, AFISOCNI0-2):
+	 * the parents of the blocks behind them. Kept on, like the fabric
+	 * states of T6041, and never accessed: an AP write to them latches an
+	 * AP event-log error, so they are firmware-owned. The loader ends its
+	 * DCP power-chain check at these always-on states (aura "end the DCP
+	 * power chain at always-on fabric"); older loaders refuse the display
+	 * handoff with them.
+	 */
+	ps_afimccni0: power-controller@198 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x198 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "afimccni0";
+		apple,always-on;
+		apple,firmware-owned;
+	};
+
+	ps_piogw: power-controller@1a8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1a8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "piogw";
+		apple,always-on;
+		apple,firmware-owned;
+	};
+
+	ps_afins0: power-controller@1e8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x1e8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "afins0";
+		power-domains = <&ps_afimccni0>, <&ps_piogw>;
+		apple,always-on;
+		apple,firmware-owned;
+	};
+
+	ps_afisocni0: power-controller@218 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x218 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "afisocni0";
+		power-domains = <&ps_afins0>, <&ps_piogw>;
+		apple,always-on;
+		apple,firmware-owned;
+	};
+
+	ps_afisocni1: power-controller@220 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x220 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "afisocni1";
+		power-domains = <&ps_afins0>, <&ps_piogw>;
+		apple,always-on;
+		apple,firmware-owned;
+	};
+
+	ps_afisocni2: power-controller@228 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x228 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "afisocni2";
+		power-domains = <&ps_afins0>, <&ps_piogw>;
+		apple,always-on;
+		apple,firmware-owned;
+	};
+
+	ps_jpg: power-controller@230 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x230 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "jpg";
+		power-domains = <&ps_afisocni0>;
+		status = "okay";
+	};
+
+	ps_msr: power-controller@238 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x238 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "msr";
+		power-domains = <&ps_afisocni0>;
+		status = "okay";
+	};
+
+	ps_prores: power-controller@250 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x250 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "prores";
+		power-domains = <&ps_afisocni0>;
+		status = "okay";
+	};
+
+	ps_ane_sys: power-controller@290 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x290 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ane_sys";
+		power-domains = <&ps_afisocni2>;
+		status = "okay";
+	};
+
+	ps_msr_ase_core: power-controller@298 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x298 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "msr_ase_core";
+		power-domains = <&ps_msr>;
+		status = "okay";
+	};
+
+	/*
+	 * The SIO block itself: the parent of its CPU, DPA_P and the SIO
+	 * peripheral states. The ADT marks this state no_ps (on at boot, no
+	 * AP-controlled state word), and the PMGR access lockdown latches an
+	 * event-log error when the AP reads or writes the word at 0x260. Keep
+	 * the dependency links but never touch the register.
+	 */
+	ps_sio: power-controller@260 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x260 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "sio";
+		apple,firmware-owned;
+		status = "okay";
+	};
+
+	ps_sio_cpu: power-controller@2a8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2a8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "sio_cpu";
+		/*
+		 * The SIO firmware brings up its native SPI and UART DMA shims,
+		 * which sit in those blocks, when it takes its shim table: their
+		 * parent states must be on while it runs.
+		 */
+		power-domains = <&ps_sio>, <&ps_spi_p>, <&ps_uart_p>;
+		status = "okay";
+		/* The sleep reads the SIO's run bit at the commit, so it stays on until then. */
+		apple,always-on;
+	};
+
+	ps_fpwm0: power-controller@2b0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2b0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "fpwm0";
+		power-domains = <&ps_sio>;
+		status = "okay";
+	};
+
+	ps_fpwm1: power-controller@2b8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2b8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "fpwm1";
+		power-domains = <&ps_sio>;
+		status = "okay";
+	};
+
+	ps_fpwm2: power-controller@2c0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2c0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "fpwm2";
+		power-domains = <&ps_sio>;
+		status = "okay";
+	};
+
+	ps_i2c1: power-controller@2d0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2d0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "i2c1";
+		power-domains = <&ps_sio>;
+		status = "okay";
+	};
+
+	ps_i2c2: power-controller@2d8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2d8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "i2c2";
+		power-domains = <&ps_sio>;
+		status = "okay";
+	};
+
+	ps_i2c3: power-controller@2e0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2e0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "i2c3";
+		power-domains = <&ps_sio>;
+		status = "okay";
+	};
+
+	ps_i2c4: power-controller@2e8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2e8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "i2c4";
+		power-domains = <&ps_sio>;
+		status = "okay";
+	};
+
+	ps_uart_p: power-controller@2f8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2f8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "uart_p";
+		power-domains = <&ps_sio>;
+		status = "okay";
+	};
+
+	ps_dpa_p: power-controller@300 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x300 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dpa_p";
+		power-domains = <&ps_sio>;
+		apple,always-on;
+		status = "okay";
+	};
+
+	ps_aes: power-controller@308 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x308 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aes";
+		power-domains = <&ps_sio>;
+		status = "okay";
+	};
+
+	ps_spi0: power-controller@330 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x330 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "spi0";
+		power-domains = <&ps_spi_p>;
+		status = "okay";
+	};
+
+	ps_spi1: power-controller@338 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x338 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "spi1";
+		power-domains = <&ps_spi_p>;
+		status = "okay";
+	};
+
+	ps_spi3: power-controller@348 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x348 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "spi3";
+		power-domains = <&ps_spi_p>;
+		status = "okay";
+	};
+
+	ps_qspi: power-controller@350 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x350 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "qspi";
+		power-domains = <&ps_spi_p>;
+		status = "okay";
+	};
+
+	ps_uart_n: power-controller@358 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x358 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "uart_n";
+		power-domains = <&ps_uart_p>;
+		status = "okay";
+	};
+
+	ps_uart0: power-controller@360 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x360 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "uart0";
+		power-domains = <&ps_uart_p>;
+		status = "okay";
+	};
+
+	ps_uart1: power-controller@368 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x368 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "uart1";
+		power-domains = <&ps_uart_p>;
+		status = "okay";
+	};
+
+	ps_uart2: power-controller@370 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x370 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "uart2";
+		power-domains = <&ps_uart_p>;
+		status = "okay";
+	};
+
+	ps_uart3: power-controller@378 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x378 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "uart3";
+		power-domains = <&ps_uart_p>;
+		status = "okay";
+	};
+
+	ps_uart4: power-controller@380 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x380 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "uart4";
+		power-domains = <&ps_uart_p>;
+		status = "okay";
+	};
+
+	ps_uart5: power-controller@388 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x388 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "uart5";
+		power-domains = <&ps_uart_p>;
+		status = "okay";
+	};
+
+	ps_dpa0: power-controller@390 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x390 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dpa0";
+		power-domains = <&ps_dpa_p>;
+		status = "okay";
+	};
+
+	ps_dpa1: power-controller@398 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x398 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dpa1";
+		power-domains = <&ps_dpa_p>;
+		status = "okay";
+	};
+
+};
+
+&pmgr_mini {
+	ps_debug_gated: power-controller@0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "debug_gated";
+		apple,always-on;
+		status = "okay";
+	};
+
+	ps_nub_spmi1: power-controller@60 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x60 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "nub_spmi1";
+		apple,always-on;
+		status = "okay";
+	};
+
+	ps_nub_aon_nogate: power-controller@78 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x78 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "nub_aon_nogate";
+		apple,always-on;
+		status = "okay";
+	};
+
+	ps_nub_ocla: power-controller@80 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x80 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "nub_ocla";
+		apple,always-on; /* critical in the Apple Device Tree */
+		status = "okay";
+	};
+
+	ps_nub_gpio: power-controller@88 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x88 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "nub_gpio";
+		apple,always-on;
+		status = "okay";
+	};
+
+	ps_nub_fabric: power-controller@a0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xa0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "nub_fabric";
+		apple,always-on;
+		status = "okay";
+	};
+
+	ps_nub_sram: power-controller@a8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xa8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "nub_sram";
+		apple,always-on;
+		status = "okay";
+	};
+
+	ps_debug_switch: power-controller@b0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xb0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "debug_switch";
+		apple,always-on;
+		status = "okay";
+	};
+
+	ps_aop_gpio: power-controller@4008 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4008 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_gpio";
+		power-domains = <&ps_aop_filter>;
+		apple,always-on;
+		status = "okay";
+	};
+
+	ps_aop_shim: power-controller@4028 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4028 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_shim";
+		power-domains = <&ps_aop_base>;
+		apple,always-on;
+		status = "okay";
+	};
+
+	ps_aop_piodma: power-controller@4030 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4030 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_piodma";
+		power-domains = <&ps_aop_base>;
+		apple,always-on;
+		status = "okay";
+	};
+
+	ps_aop2_piodma: power-controller@4038 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4038 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop2_piodma";
+		power-domains = <&ps_aop_base>;
+		/* Firmware-owned or unable to reach ACTIVE on this board. */
+		status = "disabled";
+	};
+
+	ps_aop_i2cm0: power-controller@4040 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4040 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_i2cm0";
+		power-domains = <&ps_aop_fr>;
+		apple,always-on;
+		status = "okay";
+	};
+
+	ps_aop_i2cm1: power-controller@4048 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4048 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_i2cm1";
+		power-domains = <&ps_aop_fr>;
+		apple,always-on;
+		status = "okay";
+	};
+
+	ps_aop_i2cm2: power-controller@4050 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4050 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_i2cm2";
+		power-domains = <&ps_aop_fr>;
+		apple,always-on;
+		status = "okay";
+	};
+
+	ps_aop_i2cm3: power-controller@4058 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4058 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_i2cm3";
+		power-domains = <&ps_aop_fr>;
+		/* Firmware-owned or unable to reach ACTIVE on this board. */
+		status = "disabled";
+	};
+
+	ps_aop_scm: power-controller@4060 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4060 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_scm";
+		power-domains = <&ps_aop_base>, <&ps_aop_fr>;
+		apple,always-on;
+		status = "okay";
+	};
+
+	ps_aop_spi0: power-controller@4068 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4068 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_spi0";
+		power-domains = <&ps_aop_fr>;
+		apple,always-on;
+		status = "okay";
+	};
+
+	ps_aop_spi1: power-controller@4070 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4070 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_spi1";
+		power-domains = <&ps_aop_fr>;
+		/* Firmware-owned or unable to reach ACTIVE on this board. */
+		status = "disabled";
+	};
+
+	ps_aop_spmi0: power-controller@4078 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4078 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_spmi0";
+		power-domains = <&ps_aop_filter>, <&ps_aop_fr>;
+		apple,always-on;
+		status = "okay";
+	};
+
+	ps_aop_spmi1: power-controller@4080 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4080 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_spmi1";
+		power-domains = <&ps_aop_filter>, <&ps_aop_fr>;
+		apple,always-on;
+		status = "okay";
+	};
+
+	ps_aop_he_nrcs0: power-controller@4088 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4088 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_he_nrcs0";
+		power-domains = <&ps_aop_fr>;
+		/* Firmware-owned or unable to reach ACTIVE on this board. */
+		status = "disabled";
+	};
+
+	ps_aop_he_nrcs1: power-controller@4090 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4090 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_he_nrcs1";
+		power-domains = <&ps_aop_fr>;
+		/* Firmware-owned or unable to reach ACTIVE on this board. */
+		status = "disabled";
+	};
+
+	ps_aop2_cpu: power-controller@40a0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x40a0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop2_cpu";
+		power-domains = <&ps_aop_base>, <&ps_aop_fr>;
+		/* Firmware-owned or unable to reach ACTIVE on this board. */
+		status = "disabled";
+	};
+
+	ps_aop_uart0: power-controller@40b0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x40b0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_uart0";
+		power-domains = <&ps_aop_shim>;
+		apple,always-on;
+		status = "okay";
+	};
+
+	ps_aop_uart1: power-controller@40b8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x40b8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_uart1";
+		power-domains = <&ps_aop_shim>;
+		apple,always-on;
+		status = "okay";
+	};
+
+	ps_aop_uart2: power-controller@40c0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x40c0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_uart2";
+		power-domains = <&ps_aop_shim>;
+		apple,always-on;
+		status = "okay";
+	};
+
+	ps_aop_sram: power-controller@40c8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x40c8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "aop_sram";
+		power-domains = <&ps_aop_scm>, <&ps_aop_cpu>;
+		apple,always-on;
+		status = "okay";
+	};
+
+	ps_audio_sense_pdmc: power-controller@40e0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x40e0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_sense_pdmc";
+		power-domains = <&ps_audio_fr>;
+		status = "okay";
+	};
+
+	ps_audio_base_s_a: power-controller@40e8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x40e8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_base_s_a";
+		power-domains = <&ps_audio_p>;
+		status = "okay";
+	};
+
+	ps_audio_mca2_m: power-controller@4110 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4110 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_mca2_m";
+		power-domains = <&ps_audio_p>;
+		status = "okay";
+	};
+
+	ps_audio_mca3_m: power-controller@4118 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4118 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_mca3_m";
+		power-domains = <&ps_audio_p>;
+		status = "okay";
+	};
+
+	ps_audio_mca4_m: power-controller@4120 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4120 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_mca4_m";
+		power-domains = <&ps_audio_p>;
+		status = "okay";
+	};
+
+	ps_audio_mca5_m: power-controller@4128 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4128 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_mca5_m";
+		power-domains = <&ps_audio_p>;
+		status = "okay";
+	};
+
+	ps_audio_leap_rx1: power-controller@4150 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4150 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_leap_rx1";
+		power-domains = <&ps_audio_leap_c>;
+		status = "okay";
+	};
+
+	ps_audio_leap_rx2: power-controller@4158 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4158 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_leap_rx2";
+		power-domains = <&ps_audio_leap_c>;
+		status = "okay";
+	};
+
+	ps_audio_leap_rx3: power-controller@4160 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4160 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_leap_rx3";
+		power-domains = <&ps_audio_leap_c>;
+		status = "okay";
+	};
+
+	ps_audio_leap_rx4: power-controller@4168 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4168 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "audio_leap_rx4";
+		power-domains = <&ps_audio_leap_c>;
+		status = "okay";
+	};
+
+	ps_smc_fabric: power-controller@8000 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8000 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "smc_fabric";
+		status = "okay";
+	};
+
+	ps_smc_i2cm0: power-controller@8028 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8028 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "smc_i2cm0";
+		power-domains = <&ps_smc_fabric>;
+		apple,always-on; /* on in the Apple Device Tree, like smc_i2cm1/2 */
+		status = "okay";
+	};
+
+};
+
+/* CPU power states are described but remain owned by CPU power management. */
+&pmgr {
+
+	ps_ecpu_0: power-controller@0 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ecpu_0";
+		status = "disabled";
+	};
+
+	ps_ecpu_1: power-controller@8 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ecpu_1";
+		status = "disabled";
+	};
+
+	ps_ecpu_2: power-controller@10 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x10 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ecpu_2";
+		status = "disabled";
+	};
+
+	ps_ecpu_3: power-controller@18 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x18 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ecpu_3";
+		status = "disabled";
+	};
+
+	ps_pcpu_0: power-controller@30 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x30 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pcpu_0";
+		status = "disabled";
+	};
+
+	ps_pcpu_1: power-controller@38 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x38 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pcpu_1";
+		status = "disabled";
+	};
+
+	ps_ecpm: power-controller@50 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x50 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ecpm";
+		status = "disabled";
+	};
+
+	ps_pcpm: power-controller@58 {
+		compatible = "apple,t8140-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x58 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pcpm";
+		status = "disabled";
+	};
+};

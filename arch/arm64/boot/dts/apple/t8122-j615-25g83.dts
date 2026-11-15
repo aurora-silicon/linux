@@ -1,0 +1,23 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Experimental J615 with the J613 25G83 DCP and PMP profile. m1n1 hands the
+ * display over only with chosen.asahi,j615-25g83-experimental=1.
+ */
+#include "t8122-j615.dts"
+#include "t8122-j613-dcp-25g83.dtsi"
+#include "t8122-j613-qspi.dtsi"
+
+/* As on the J613 25G83. */
+&mtp {
+	compatible = "apple,t8122-mtp", "apple,t8122-rtk-helper-asc4", "apple,mtp";
+};
+
+/* GPIO-mediated AFE power sequencing, as on the J613 (J615 ADT gP08). */
+&mtp_mt {
+	apple,power-method = <2>;
+};
+
+/* Keep the J615 NVRAM partition read-only. */
+&nvram_qspi {
+	read-only;
+};

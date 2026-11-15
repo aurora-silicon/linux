@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+/dts-v1/;
+/plugin/;
+
+/*
+ * A DP audio interface whose DMA controller never registers, as the T6030
+ * SIO with an earlier boot loader's tables: its probe refuses it. Nothing
+ * binds to these nodes; the test requests the channel itself.
+ */
+&{/} {
+	dcpaud-no-sio-test {
+		#address-cells = <2>;
+		#size-cells = <2>;
+
+		sio_stub: sio-stub {
+			#dma-cells = <1>;
+		};
+
+		dpaudio-no-sio {
+			dmas = <&sio_stub 0x66>;
+			dma-names = "tx";
+		};
+	};
+};

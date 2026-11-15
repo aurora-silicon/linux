@@ -1,0 +1,16 @@
+{
+  "provenance": {
+    "source": "Original M4 J713 boot-loader ADT phram export; read-only generic phram MTD acquisition on omarchy-m4",
+    "source_sha256": "19c11cbd5e4bedc74670b6e188a8deb0f84207014728baed59344420bbfd225f",
+    "source_bytes": 475136,
+    "extraction": "Exact property values from /arm-io/sgx. Names and unrelated nodes omitted. No serial identifiers or full ADT included."
+  },
+  "properties_hex": {
+    "compatible": "6770752c743831333200",
+    "perf-state-count": "10000000",
+    "perf-state-table-count": "01000000",
+    "gpu-num-perf-states": "0f000000",
+    "perf-states": "000000007d000000807825146202000080eed5248502000000ff712fa80200000059d431d502000000285037d5020000005ebe380c0300000048f13e0c0300004081c33e3903000080c8bc45390300000020aa446103000080bb2c4c610300000095c3477f0300008042c04f7f0300008027094fca030000806b9e57ca030000",
+    "perf-states-sram": "000000000c030000807825140c03000080eed5240c03000000ff712f0c0300000059d4310c030000002850370c030000005ebe380c0300000048f13e0c0300004081c33e3903000080c8bc45390300000020aa446103000080bb2c4c610300000095c3477f0300008042c04f7f0300008027094fca030000806b9e57ca030000"
+  }
+}

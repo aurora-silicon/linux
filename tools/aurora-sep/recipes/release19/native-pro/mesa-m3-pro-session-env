@@ -1,0 +1,28 @@
+# Native T6030 OpenGL and paired Honeykrisp Vulkan, after the common Mesa hook.
+if /opt/mesa-m3/native-pro/libexec/mesa-m3-pro-check; then
+    if journalctl -k -b -q --no-pager -g 'M3 bank|execution failed|M3 firmware error|M3 compute rejected|native DCP flip failed' >/dev/null 2>&1; then
+        return 0
+    else
+        _mesa_pro_log_status=$?
+        [ "$_mesa_pro_log_status" = 1 ] || return 0
+    fi
+    unset MESA_LOADER_DRIVER_OVERRIDE GALLIUM_DRIVER LIBGL_ALWAYS_SOFTWARE GBM_ALWAYS_SOFTWARE VK_ADD_DRIVER_FILES
+    export LD_LIBRARY_PATH=/opt/mesa-m3/native-pro/lib:/opt/mesa-m3/pro-vulkan/lib:/opt/mesa-m3/lib
+    export LIBGL_DRIVERS_PATH=/opt/mesa-m3/native-pro/lib/dri
+    export GBM_BACKENDS_PATH=/opt/mesa-m3/native-pro/lib/gbm
+    export DRIRC_CONFIGDIR=/opt/mesa-m3/native-pro/share/drirc.d
+    export __EGL_VENDOR_LIBRARY_FILENAMES=/opt/mesa-m3/native-pro/share/glvnd/egl_vendor.d/50_mesa.json
+    export VK_DRIVER_FILES=/opt/mesa-m3/pro-vulkan/share/vulkan/icd.d/asahi_icd.aarch64.json
+    export VK_ICD_FILENAMES="$VK_DRIVER_FILES"
+    export VK_LOADER_LAYERS_DISABLE='~implicit~'
+    export ASAHI_M3_EXPERIMENTAL=1 AGX_MESA_DEBUG=nopromote
+    export HK_M3_COMPRESSED_RGBA16F=1 HK_M3_COMPRESSED_R8=1 HK_M3_COMPRESSED_SPLIT_DEPTH=1
+    export HK_M3_COMPRESSED_DEPTH=0 HK_M4_COMPRESSED_2D=0 HK_M3_EARLY_TILING=0 HK_M3_CROSS_CB_TILING=0
+    export HK_M4_NATIVE_PREAMBLE=0 AGX_NATIVE_MEMORY_PREAMBLE=0 HK_M3_PREFETCH_TEXTURE_INDICES=0
+    export HK_M3_FRAGMENT_READ_SCHEDULE=0 HK_M4_PREFETCH_DESCRIPTORS=0 HK_M3_BRANCH_RGBA16F_COMPRESSION=0
+    export HK_NATIVE_BRANCH_SCALED=0 HK_M3_DIRECT_TEXTURE_UNIFORMS=0 HK_M3_DIRECT_TEXEL_UNIFORMS=0
+    export HK_M3_TILE_CLEANUP=0 HK_M3_NATIVE_INPUT_ATTACHMENTS=0
+    export HK_M4_SHADER_PROFILE=0 HK_M4_PROGRAM_PROFILE=0 HK_ARCHITECTURE_PROFILE=0
+    export QSG_RHI_BACKEND=opengl
+    unset _mesa_pro_log_status
+fi

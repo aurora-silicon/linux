@@ -1,0 +1,35 @@
+#!/bin/sh
+# g15c-run CMD [ARGS...]: run CMD with the /opt/mesa-m3-g15c Mesa and the
+# M3 Max (G15C) opt-in, under a time limit. Nothing else on the system uses
+# this prefix; system Mesa and the session are untouched.
+#
+# Set before calling, if wanted:
+#   G15C_TIMEOUT=SECS                 time limit (default 120; 0 means none).
+#                                     After it, CMD gets SIGTERM, then
+#                                     SIGKILL 5 s later.
+#   ASAHI_G15C_SCHEDULING_STALLS=1    apply the G15G scheduling-stall pass
+#                                     (A/B test; default off, as on G15S)
+#   HK_M4_CDM_VISIBILITY_BARRIER=0    drop the wide-visibility compute barrier
+#   AGX_MESA_DEBUG                    defaults to nopromote, as in the M3 Pro
+#                                     session
+#   G15C_PREFIX=DIR                   the prefix (tests only; default
+#                                     /opt/mesa-m3-g15c)
+P="${G15C_PREFIX:-/opt/mesa-m3-g15c}"
+export LD_LIBRARY_PATH="$P/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LIBGL_DRIVERS_PATH="$P/lib/dri"
+export GBM_BACKENDS_PATH="$P/lib/gbm"
+export __EGL_VENDOR_LIBRARY_FILENAMES="$P/share/glvnd/egl_vendor.d/50_mesa.json"
+export VK_DRIVER_FILES="$P/share/vulkan/icd.d/asahi_icd.aarch64.json"
+export VK_ICD_FILENAMES="$VK_DRIVER_FILES"
+export VK_LOADER_LAYERS_DISABLE='~implicit~'
+export ASAHI_M3_EXPERIMENTAL=1
+export ASAHI_M3_G15C=1
+export AGX_MESA_DEBUG="${AGX_MESA_DEBUG-nopromote}"
+# Binaries depend on the stall switch; never reuse a cached one.
+export MESA_SHADER_CACHE_DISABLE=true
+limit="${G15C_TIMEOUT:-120}"
+case "$limit" in
+	''|*[!0-9]*) echo "g15c-run: G15C_TIMEOUT must be a number of seconds" >&2; exit 2 ;;
+esac
+[ "$limit" = 0 ] && exec "$@"
+exec timeout -k 5 "$limit" "$@"

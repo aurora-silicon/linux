@@ -1,0 +1,229 @@
+{
+  "schema": 1,
+  "source_pins": {
+    "target": "10ff0fe408d83936d6c7783b0382a3092e520ea5",
+    "pr148": "ee4f0f3ee2958ddc0243bb5e71a0bea88215d01b",
+    "sf": "65cd54ba0da8f93e4530f851382ccb5187ab794c"
+  },
+  "scope": "Public native G15 subtree only. No private notes, whole-driver replacement, global UAPI selector, display/PMGR/memory-floor policy or branding.",
+  "source_carries": [
+    {
+      "source": "04795f0d9600a3a695b3bd96fdb023720bea2883",
+      "commit": "54f7d6904f8d935781b79b7175b556b1ceeb9619",
+      "author": "Eryk Wieliczko",
+      "note": "G15 subtree snapshot including the preceding firmware/engine/recovery commits a8b817ef0614,39e7cf0bfdaa,01812cc4894f; no shared APIs or display/PMP policy imported."
+    },
+    {
+      "source": "d8422e044e37f5d366422b2f37db8571fa64d11b",
+      "commit": "41275bfd985b7ccbcad6cb6650d94696fb0b29c3",
+      "author": "Naeem Malik",
+      "note": "G15 subtree only; shared layers and registration adapted separately."
+    },
+    {
+      "source": "7c2857681b843ddab2c66abc8c04d12746efcba4",
+      "commit": "1f28f12c5e11608a8d7694d3b8db8a867f058f45",
+      "author": "Naeem Malik",
+      "note": "G15 subtree only; shared layers and registration adapted separately."
+    },
+    {
+      "source": "0c98b7e731e8c42189593d7b9b9835785e4f6b07",
+      "commit": "bcb43bb61412df2808079f05fa684938c5e26528",
+      "author": "Naeem Malik",
+      "note": "G15 subtree only; shared layers and registration adapted separately."
+    },
+    {
+      "source": "d3283ae4798ebd8c5e0de418dcbe9adb5b09327d",
+      "commit": "9538af3d5d3911ddd4762e7cc3b026180e193a88",
+      "author": "Naeem Malik",
+      "note": "G15 subtree only; shared layers and registration adapted separately."
+    },
+    {
+      "source": "2a2def4ae6625d4a09d0cc944fc72b6682a2cf0c",
+      "commit": "e3d7591ae5f8135a4a3915c76cc849fcc1c2c996",
+      "author": "Naeem Malik",
+      "note": "G15 subtree only; shared layers and registration adapted separately."
+    },
+    {
+      "source": "b091ba71dfe11dc66c83542131420027f1a13281",
+      "commit": "4d38ccc69d4781336ce5263f32365436abe35c2c",
+      "author": "Naeem Malik",
+      "note": "G15 subtree only; shared layers and registration adapted separately."
+    },
+    {
+      "source": "ad229034eb4300fcbfe40c658d22f38f34454438",
+      "commit": "113194ca413fc0b05c2ffd5e7d26ab4c5224baf5",
+      "author": "DjDeveloperr",
+      "note": "G15 subtree only; shared layers and registration adapted separately."
+    },
+    {
+      "source": "fa62b3345de5d8887201d3750e4f8ecc83a20778",
+      "commit": "369360537e628e7b04ebf24ac1d2a90786cf6c89",
+      "author": "DjDeveloperr",
+      "note": "G15 subtree only; shared layers and registration adapted separately."
+    },
+    {
+      "source": "0da467881effc823ee51616f361c2e446b540cf5",
+      "commit": "2371dbf829c408917d6b4c52095931c0166a5331",
+      "author": "DjDeveloperr",
+      "note": "G15 subtree only; shared layers and registration adapted separately."
+    },
+    {
+      "source": "897412529e3941f99e159a2585f2574179b38307",
+      "commit": "d9f1f541cd7ab5a5f01b60d9523c6e51db1113b1",
+      "author": "DjDeveloperr",
+      "note": "G15 subtree only; shared layers and registration adapted separately."
+    },
+    {
+      "source": "90dc887b72d791809cfc8e2b92fcf42a186cf716",
+      "commit": "b58306ce0518bf0982166e3acfcce8661eb8d852",
+      "author": "DjDeveloperr",
+      "note": "G15 subtree only; shared layers and registration adapted separately."
+    },
+    {
+      "source": "ee4f0f3ee2958ddc0243bb5e71a0bea88215d01b",
+      "commit": "2cdad45526fb46273dcd03474c3ab074eb97af7d",
+      "author": "DjDeveloperr",
+      "note": "G15 subtree only; shared layers and registration adapted separately."
+    },
+    {
+      "source": "0fcf28d2cd305c6622475a01b81b334adf65a422",
+      "commit": "1903ae11e30a93f39fa39c0172cb5b3022e12ccb",
+      "author": "Chris Kearney",
+      "note": "G15 subtree only from the public native-profile bridge. Includes existing maintained loader/PMP admission adaptations 9333b0728dc4,674fd94f0b20,19cebe363276,d68cf5c0040f and c70e30b60623; no Rust API or global profile/header switch imported."
+    },
+    {
+      "source": "16a4b74b0d7912cbb174c0a4c4503776391ccf8a",
+      "commit": "029d221c3d49284f593198165befb74a892baf39",
+      "author": "Naeem Malik",
+      "note": "G15 subtree hunks only; asahi-m3 path becomes maintained asahi/g15; tests carried in the dedicated test adaptation."
+    },
+    {
+      "source": "d3b664b79b70f099630f48437af134682a1b11d7",
+      "commit": "1426152ddedbecc3766942256810560163522980",
+      "author": "Naeem Malik",
+      "note": "G15 subtree hunks only; asahi-m3 path becomes maintained asahi/g15; tests carried in the dedicated test adaptation."
+    },
+    {
+      "source": "52705c9919c94bcd86a7278ef4b99c150f26c0b5",
+      "commit": "be6a5b4303fb1403c70c666aa98e06fb24109baa",
+      "author": "Naeem Malik",
+      "note": "G15 subtree hunks only; asahi-m3 path becomes maintained asahi/g15; tests carried in the dedicated test adaptation."
+    },
+    {
+      "source": "c77b143bc5161fa19354aeb9dd3ae6f323e6d851",
+      "commit": "2173a9adef3f0eb7eb3111c6faafca4286dd0eee",
+      "author": "Naeem Malik",
+      "note": "G15 subtree hunks only; asahi-m3 path becomes maintained asahi/g15; tests carried in the dedicated test adaptation."
+    },
+    {
+      "source": "1a49fbfaafff0c9693bfbe3d1847305725d6787b",
+      "commit": "45953c21d0f3711f629c9f332ca37adaa13416ef",
+      "author": "Naeem Malik",
+      "note": "G15 subtree hunks only; asahi-m3 path becomes maintained asahi/g15; tests carried in the dedicated test adaptation."
+    },
+    {
+      "source": "ca6e846e41e364f343257de50a0fdce7a2ed4586",
+      "commit": "a63a953ee1d887bb339bbd4d29121aedf6949eb2",
+      "author": "Naeem Malik",
+      "note": "G15 subtree hunks only; asahi-m3 path becomes maintained asahi/g15; tests carried in the dedicated test adaptation."
+    },
+    {
+      "source": "ea93a3d4d2ff7c8bc24fe4796b98fc7ba9627072",
+      "commit": "bf160c16ec91df92f9b1442724010ad4595feb41",
+      "author": "Chris Kearney",
+      "note": "G15 subtree hunks only; asahi-m3 path becomes maintained asahi/g15; tests carried in the dedicated test adaptation."
+    },
+    {
+      "source": "186c30e76a428ca80197fa91444fbb44a7712f79",
+      "commit": "6a1c99e7b960305fae441f20f2bcd95ae4eca80d",
+      "author": "Chris Kearney",
+      "note": "G15 subtree hunks only; asahi-m3 path becomes maintained asahi/g15; tests carried in the dedicated test adaptation."
+    },
+    {
+      "source": "20d359950d0c981e762fbb43c315866fc86c271b",
+      "commit": "1d769b3d9f606505230a5780f14930cf40269025",
+      "author": "Chris Kearney",
+      "note": "G15 subtree hunks only; asahi-m3 path becomes maintained asahi/g15; tests carried in the dedicated test adaptation."
+    },
+    {
+      "source": "bec6e4f83afd815b38803e754333b8954ce7bc29",
+      "commit": "5c597f936e919a31db34aa74a9a7782522f31c2b",
+      "author": "Naeem Malik",
+      "note": "G15 subtree hunks only; asahi-m3 path becomes maintained asahi/g15; tests carried in the dedicated test adaptation."
+    },
+    {
+      "source": "3be092a24989523cab10253243981ab32c92193a",
+      "commit": "5c490e10e442cca145bc3a9847bd6d14982cc5b3",
+      "author": "Naeem Malik",
+      "note": "G15 subtree hunks only; asahi-m3 path becomes maintained asahi/g15; tests carried in the dedicated test adaptation."
+    },
+    {
+      "source": "2c8d031fccc0ce4b125318dc011884de342325c7",
+      "commit": "fea7b79a3aa5c41799ba8a3410616a7d51d06c9f",
+      "author": "Chris Kearney",
+      "note": "G15 subtree hunks only; asahi-m3 path becomes maintained asahi/g15; tests carried in the dedicated test adaptation."
+    },
+    {
+      "source": "d0fc3c53d90f0be24644c0f3d8e3ba46bf9a0e0d",
+      "commit": "4b7929dfe546b9ae829458051350d07b1d1d3fe1",
+      "author": "Naeem Malik",
+      "note": "G15 subtree hunks only; asahi-m3 path becomes maintained asahi/g15; tests carried in the dedicated test adaptation."
+    },
+    {
+      "source": "e2a97e967bea7b45c02801fa9afc4ae450be5a40",
+      "commit": "77528f1df378237950a3a6f85c9021b0129a4523",
+      "author": "Naeem Malik",
+      "note": "G15 subtree hunks only; asahi-m3 path becomes maintained asahi/g15; tests carried in the dedicated test adaptation."
+    },
+    {
+      "source": "1a16318bc89c0658152405a3f587436b06c15157",
+      "commit": "44fdda4028002d93514879505903cf6cc8e02240",
+      "author": "Naeem Malik",
+      "note": "G15 subtree hunks only; asahi-m3 path becomes maintained asahi/g15; tests carried in the dedicated test adaptation."
+    },
+    {
+      "source": "dba2a110de00743eeecd41edf23e54ede4491d5e",
+      "commit": "571e1d0c9da42d15fd7b4a023fb84cefde0904c0",
+      "author": "Naeem Malik",
+      "note": "G15 subtree hunks only; asahi-m3 path becomes maintained asahi/g15; tests carried in the dedicated test adaptation."
+    },
+    {
+      "source": "3d247356aa8a4ee5f50b24d3d6fd4afc89cf5c6f",
+      "commit": "f3893274d2a6d559be1b9d4e99c4f1294d2f3bbe",
+      "author": "Chris Kearney",
+      "note": "G15 subtree hunks only; asahi-m3 path becomes maintained asahi/g15; tests carried in the dedicated test adaptation."
+    },
+    {
+      "source": "f3668549340d6cb9bb84f2bc5719b78abdf4b5bb",
+      "commit": "bc29e6b988e2d597b0c5338d8891dfd473901644",
+      "author": "Chris Kearney",
+      "note": "G15 subtree hunks only; asahi-m3 path becomes maintained asahi/g15; tests carried in the dedicated test adaptation."
+    },
+    {
+      "source": "6fef6f3820ba34a2c2cbd0b0ee95ec473def4ffc",
+      "commit": "83aa75f592b015fb940109ee7578c674999348c6",
+      "author": "Chris Kearney",
+      "note": "G15 subtree hunks only; asahi-m3 path becomes maintained asahi/g15; tests carried in the dedicated test adaptation."
+    },
+    {
+      "source": "d5317ea1542d42382a7d6e3dbcdc3d611d5c5237",
+      "commit": "1d1702b49ef6a72062da37c1fa98f6cb72fb8fdf",
+      "author": "Chris Kearney",
+      "note": "G15 subtree hunks only; asahi-m3 path becomes maintained asahi/g15; tests carried in the dedicated test adaptation."
+    },
+    {
+      "source": "9e67aed169c3cc6a0388d0184d8db76936299385",
+      "commit": "c739064a9d1a7c388ae8bb74dde4ee099b374b68",
+      "author": "Chris Kearney",
+      "note": "G15 subtree hunks only; asahi-m3 path becomes maintained asahi/g15; tests carried in the dedicated test adaptation."
+    }
+  ],
+  "adaptation_notes": {
+    "registration": "Separate no-alias G15 adapter in the maintained asahi module; retained failed probe and manual-unbind suppression. Existing normal/G17 paths kept.",
+    "drm": "Uses target RegistrationData and current DRM/GEM/GPUVM APIs; no Uninit conversion or forged registered context.",
+    "mmio": "G15 retained Mapping owns its register windows; target regs::Resources remains borrowed by RegistrationData.",
+    "sg_table": "Target held_sg_table permanently pins backing and owns SG lifetime inside GEM; G15 HeldPages retains a GEM reference, not the removed owned-SG wrapper.",
+    "page_tables": "Only adopted G15 page tables enable point-of-coherency publication; normal/G17 default remains false.",
+    "wire": "Native per-device wire facade is separately supplied; canonical normal/G17 UAPI unchanged."
+  }
+}

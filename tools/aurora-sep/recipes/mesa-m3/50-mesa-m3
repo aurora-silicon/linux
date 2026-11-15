@@ -1,0 +1,7 @@
+# Installed by the mesa-m3 package. Sourced by uwsm's environment preloader at
+# the start of each uwsm-managed graphical session; the rules are in
+# /opt/mesa-m3/libexec/mesa-m3-session-env, which is sourced only when it is
+# readable and its syntax checks out. Opt out with /etc/mesa-m3/disable,
+# ~/.config/mesa-m3/disable or mesa_m3=off.
+[ -r /opt/mesa-m3/libexec/mesa-m3-session-env ] && sh -n /opt/mesa-m3/libexec/mesa-m3-session-env 2>/dev/null &&
+	. /opt/mesa-m3/libexec/mesa-m3-session-env

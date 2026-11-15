@@ -1,0 +1,121 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple T6031 (M3 Max / G15C) GPU, from the J516C ADT. The boot loader fills
+ * in this machine's performance states, coefficients, firmware version and
+ * memory, enables the mailbox and then the GPU.
+ */
+
+/ {
+	aliases {
+		gpu = &gpu;	/* the boot loader finds the GPU node through this alias */
+	};
+
+	gpu_opp: opp-table-gpu {
+		compatible = "operating-points-v2";
+
+		/* Placeholder; the boot loader writes one OPP per state, per cluster. */
+		opp00 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0 0 0 0>;
+			opp-microwatt = <0>;
+		};
+	};
+
+	/* CS and AFR clock domains; placeholders the boot loader replaces. */
+	gpu_cs_opp: opp-table-gpu-cs {
+		compatible = "operating-points-v2";
+
+		opp00 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+	};
+
+	gpu_afr_opp: opp-table-gpu-afr {
+		compatible = "operating-points-v2";
+
+		opp00 {
+			opp-hz = /bits/ 64 <0>;
+			opp-microvolt = <0>;
+		};
+	};
+
+	reserved-memory {
+		/* Filled and enabled by the boot loader; disabled while empty. */
+		uat_ttbs: uat-ttbs@10 {
+			reg = <0 0x10 0 0>;
+			status = "disabled";
+		};
+
+		uat_pagetables: uat-pagetables@20 {
+			reg = <0 0x20 0 0>;
+			status = "disabled";
+		};
+
+		uat_handoff: uat-handoff@30 {
+			reg = <0 0x30 0 0>;
+			status = "disabled";
+		};
+
+		uat_pagetables_l2: uat-pagetables-l2@40 {
+			reg = <0 0x40 0 0>;
+			status = "disabled";
+		};
+	};
+};
+
+&soc {
+	gpu: gpu@40a400000 {
+		compatible = "apple,agx-t6031";
+		reg = <0x4 0x0a400000 0x0 0x6c000>,
+		      <0x4 0x08000000 0x0 0x3fdc000>;
+		reg-names = "asc", "sgx";
+		interrupt-parent = <&aic>;
+		/* Preserve the ADT order; entry 5 (IRQ 1249) is marked invalid there. */
+		interrupts = <AIC_IRQ 0 1224 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1225 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1226 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1227 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1247 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1249 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1239 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_gfx>;
+		/* Do not hold back ps_gfx sync_state() if the GPU never probes. */
+		post-init-providers = <&ps_gfx>;
+		mboxes = <&agx_mbox>;
+		memory-region = <&uat_ttbs>, <&uat_pagetables>,
+				<&uat_handoff>, <&uat_pagetables_l2>;
+		memory-region-names = "ttbs", "pagetables", "handoff",
+				      "pagetables-l2";
+
+		/* Zero until the boot loader identifies the loaded GPU firmware. */
+		apple,firmware-abi = <0 0 0>;
+		apple,firmware-version = <0 0 0>;
+		apple,firmware-compat = <0 0 0>;
+
+		operating-points-v2 = <&gpu_opp>;
+		apple,cs-opp = <&gpu_cs_opp>;
+		apple,afr-opp = <&gpu_afr_opp>;
+
+		/* The boot loader sets "okay" as its last step. */
+		status = "disabled";
+	};
+
+	/*
+	 * The ADT lists 1244, 1243, 1246, 1245, swapped as on T8122. No
+	 * asc-mailbox-v4 fallback: unbound without M3 Max GPU support.
+	 */
+	agx_mbox: mbox@40a408000 {
+		compatible = "apple,t6031-agx-asc-mailbox";
+		reg = <0x4 0x0a408000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1243 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1244 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1245 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 0 1246 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+};

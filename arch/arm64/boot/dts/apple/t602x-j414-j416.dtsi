@@ -1,0 +1,554 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * MacBook Pro (14/16-inch, 2022)
+ *
+ * This file contains the parts common to J414 and J416 devices with both t6020 and t6021.
+ *
+ * target-type: J414s / J414c / J416s / J416c
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/*
+ * These models are essentially identical to the previous generation, other than
+ * the GPIO indices.
+ */
+
+#define NO_SPI_TRACKPAD
+#include "t600x-j314-j316.dtsi"
+
+/ {
+	aliases {
+		dcp = &dcp;
+		dcpext0 = &dcpext0;
+		dcpext1 = &dcpext1;
+		disp0 = &display;
+		disp0_piodma = &disp0_piodma;
+		keyboard = &keyboard;
+		sep = &sep;
+		sio = &sio;
+		/* m1n1 writes this machine's Thunderbolt calibration onto these
+		 * aliases. usb4-N-* is current m1n1; usb4_N_* is the 1.6.1 bootloader.
+		 */
+		usb4-0-acio = &usb4_0_acio;
+		usb4-0-nhi = &usb4_0_nhi;
+		usb4-0-pcie-adapter = &usb4_0_acio;
+		usb4-0-pcie = &apciec0;
+		usb4_0_rc = &usb4_0_acio;
+		usb4_0_nhi = &usb4_0_nhi;
+		usb4_0_pcie_adapter = &usb4_0_acio;
+		usb4_0_pcie = &apciec0;
+		usb4-1-acio = &usb4_1_acio;
+		usb4-1-nhi = &usb4_1_nhi;
+		usb4-1-pcie-adapter = &usb4_1_acio;
+		usb4-1-pcie = &apciec1;
+		usb4_1_rc = &usb4_1_acio;
+		usb4_1_nhi = &usb4_1_nhi;
+		usb4_1_pcie_adapter = &usb4_1_acio;
+		usb4_1_pcie = &apciec1;
+		usb4-2-acio = &usb4_2_acio;
+		usb4-2-nhi = &usb4_2_nhi;
+		usb4-2-pcie-adapter = &usb4_2_acio;
+		usb4-2-pcie = &apciec2;
+		usb4_2_rc = &usb4_2_acio;
+		usb4_2_nhi = &usb4_2_nhi;
+		usb4_2_pcie_adapter = &usb4_2_acio;
+		usb4_2_pcie = &apciec2;
+	};
+};
+
+&framebuffer0 {
+	power-domains = <&ps_disp0_cpu0>, <&ps_dptx_phy_ps>;
+	panel = <&panel>;
+	post-init-providers = <&panel>;
+};
+
+&dcp {
+	panel: panel {
+		compatible = "apple,panel";
+		apple,max-brightness = <500>;
+	};
+};
+
+&disp0_dart {
+	status = "okay";
+};
+
+&display {
+	iommus = <&disp0_dart 0 0x100 0x0 0x10 0x0>, <&dispext0_dart 0 0x100 0x0 0x10 0x0>, <&dispext1_dart 0 0x100 0x0 0x10 0x0>;
+};
+
+&dispext0_dart {
+	status = "okay";
+};
+
+&dcpext0_dart {
+	status = "okay";
+};
+
+&dcpext0_mbox {
+	status = "okay";
+};
+
+&dcpext0 {
+	status = "okay";
+	apple,connector-type = "HDMI-A";
+	hdmi-hpd-gpios = <&pinctrl_aop 25 GPIO_ACTIVE_HIGH>;
+	hdmi-pwren-gpios = <&smc_gpio 23 GPIO_ACTIVE_HIGH>;
+	dp2hdmi-pwren-gpios = <&smc_gpio 6 GPIO_ACTIVE_HIGH>;
+	phys = <&atcphy3 PHY_TYPE_DP>, <&atcphy0 PHY_TYPE_DP>,
+	       <&atcphy1 PHY_TYPE_DP>, <&atcphy2 PHY_TYPE_DP>;
+	phy-names = "dp-phy", "typec0", "typec1", "typec2";
+	mux-controls = <&atcphy3_xbar 0>, <&atcphy0_xbar 0>,
+		       <&atcphy1_xbar 0>, <&atcphy2_xbar 0>,
+		       <&atcphy0_xbar 1>, <&atcphy1_xbar 1>,
+		       <&atcphy2_xbar 1>,
+		       <&atcphy0_xbar 2>, <&atcphy1_xbar 2>,
+		       <&atcphy2_xbar 2>;
+	mux-control-names = "dp-xbar", "typec0", "typec1", "typec2",
+			    "typec0-dpin0", "typec1-dpin0", "typec2-dpin0",
+			    "typec0-dpin1", "typec1-dpin1", "typec2-dpin1";
+	mux-index = <0>;
+	apple,dptx-phy = <3>;
+	apple,typec-mux-indices = <0 0 0>;
+	apple,typec-dptx-phys = <0 1 2>;
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@1 {
+			reg = <1>;
+			dcpext0_dpout: endpoint {
+				remote-endpoint = <&atcphy3_dp>;
+			};
+		};
+	};
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+
+			port {
+				dcpext0_typec0: endpoint {
+					remote-endpoint = <&typec0_dcpext0>;
+				};
+			};
+		};
+
+		route@1 {
+			reg = <1>;
+			mode-switch;
+
+			port {
+				dcpext0_typec1: endpoint {
+					remote-endpoint = <&typec1_dcpext0>;
+				};
+			};
+		};
+
+		route@2 {
+			reg = <2>;
+			mode-switch;
+
+			port {
+				dcpext0_typec2: endpoint {
+					remote-endpoint = <&typec2_dcpext0>;
+				};
+			};
+		};
+	};
+};
+
+&dispext1_dart {
+	status = "okay";
+};
+
+&dcpext1_dart {
+	status = "okay";
+};
+
+&dcpext1_mbox {
+	status = "okay";
+};
+
+&dcpext1 {
+	/delete-property/ mux-index;
+	status = "okay";
+	apple,connector-type = "USB-C";
+	phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>,
+	       <&atcphy2 PHY_TYPE_DP>;
+	phy-names = "typec0", "typec1", "typec2";
+	mux-controls = <&atcphy0_xbar 0>, <&atcphy1_xbar 0>,
+		       <&atcphy2_xbar 0>,
+		       <&atcphy0_xbar 1>, <&atcphy1_xbar 1>,
+		       <&atcphy2_xbar 1>,
+		       <&atcphy0_xbar 2>, <&atcphy1_xbar 2>,
+		       <&atcphy2_xbar 2>;
+	mux-control-names = "typec0", "typec1", "typec2",
+			    "typec0-dpin0", "typec1-dpin0", "typec2-dpin0",
+			    "typec0-dpin1", "typec1-dpin1", "typec2-dpin1";
+	apple,typec-mux-indices = <2 2 2>;
+	apple,typec-dptx-phys = <0 1 2>;
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+
+			port {
+				dcpext1_typec0: endpoint {
+					remote-endpoint = <&typec0_dcp>;
+				};
+			};
+		};
+
+		route@1 {
+			reg = <1>;
+			mode-switch;
+
+			port {
+				dcpext1_typec1: endpoint {
+					remote-endpoint = <&typec1_dcp>;
+				};
+			};
+		};
+
+		route@2 {
+			reg = <2>;
+			mode-switch;
+
+			port {
+				dcpext1_typec2: endpoint {
+					remote-endpoint = <&typec2_dcp>;
+				};
+			};
+		};
+	};
+};
+
+&typec0 {
+	ports {
+		port@3 {
+			reg = <3>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			typec0_dcp: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&dcpext1_typec0>;
+			};
+
+			typec0_dcpext0: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext0_typec0>;
+			};
+		};
+	};
+};
+
+&typec1 {
+	/delete-property/ displayport;
+	ports {
+		port@3 {
+			reg = <3>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			typec1_dcp: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&dcpext1_typec1>;
+			};
+
+			typec1_dcpext0: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext0_typec1>;
+			};
+		};
+	};
+};
+
+&typec2 {
+	ports {
+		port@3 {
+			reg = <3>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			typec2_dcp: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&dcpext1_typec2>;
+			};
+
+			typec2_dcpext0: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&dcpext0_typec2>;
+			};
+		};
+	};
+};
+
+&sio {
+	status = "okay";
+};
+
+&dpaudio1 {
+	status = "okay";
+};
+
+&dpaudio2 {
+	status = "okay";
+};
+
+&atcphy0_xbar {
+	status = "okay";
+};
+
+&atcphy1_xbar {
+	status = "okay";
+};
+
+&atcphy2_xbar {
+	status = "okay";
+};
+
+&atcphy3_xbar {
+	status = "okay";
+};
+
+&atcphy3 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@2 {
+			reg = <2>;
+			atcphy3_dp: endpoint {
+				remote-endpoint = <&dcpext0_dpout>;
+			};
+		};
+	};
+};
+
+&ps_atc0_common {
+	apple,always-on;
+};
+
+&ps_atc1_common {
+	apple,always-on;
+};
+
+&ps_atc2_common {
+	apple,always-on;
+};
+
+&ps_atc3_common {
+	apple,always-on;
+};
+
+&usb4_0_acio {
+	apple,pcie-tunnel = <&usb4_0_pcie_tunnel>;
+};
+
+&usb4_1_acio {
+	apple,pcie-tunnel = <&usb4_1_pcie_tunnel>;
+};
+
+&usb4_2_acio {
+	apple,pcie-tunnel = <&usb4_2_pcie_tunnel>;
+};
+
+/*
+ * No m1n1 performs the PCIe-C preinit handoff on these machines. Let the
+ * PCIe driver cold-initialize the Thunderbolt PCIe tunnel ports itself, so
+ * PCIe devices behind Thunderbolt 3 docks (e.g. their xHCI) come up.
+ */
+&apciec0 {
+	apple,pciec-kernel-init;
+};
+
+&apciec1 {
+	apple,pciec-kernel-init;
+};
+
+&apciec2 {
+	apple,pciec-kernel-init;
+};
+
+/*
+ * PCIe-C DART tunables. iBoot adds "dart-tunables-instance-0" to the ADT at
+ * boot and m1n1 does not copy it for these DARTs. Values taken from the live
+ * J416c ADT (macOS ioreg), identical for all three ports; offsets are
+ * relative to the DART's reg.
+ */
+#define APCIEC_DART_TUNABLES				\
+	apple,tunable = <0x20c 0xff0000b7 0xe40000b7>,	\
+			<0x220 0x000f0f0f 0x000f0f0f>,	\
+			<0x224 0x00ffffff 0x00080808>,	\
+			<0x300 0x00001f31 0x00000001>,	\
+			<0x308 0x3ffffffc 0x10000000>,	\
+			<0x310 0x3ffffffc 0x3ffffffc>
+
+&apciec0_dart {
+	APCIEC_DART_TUNABLES;
+};
+
+&apciec1_dart {
+	APCIEC_DART_TUNABLES;
+};
+
+&apciec2_dart {
+	APCIEC_DART_TUNABLES;
+};
+
+#undef APCIEC_DART_TUNABLES
+
+/* Keep dptx_phy_ps on until DCP can sequence it during display bring-up. */
+&ps_dptx_phy_ps {
+	apple,always-on;
+};
+
+&dcpext0 {
+	/*  HDMI HPD gpio, used as interrupt*/
+	hdmi-hpd-gpios = <&pinctrl_aop 25 GPIO_ACTIVE_HIGH>;
+};
+
+&hpm0 {
+	interrupts = <44 IRQ_TYPE_LEVEL_LOW>;
+};
+
+&hpm1 {
+	interrupts = <44 IRQ_TYPE_LEVEL_LOW>;
+};
+
+&hpm2 {
+	interrupts = <44 IRQ_TYPE_LEVEL_LOW>;
+};
+
+&hpm5 {
+	interrupts = <44 IRQ_TYPE_LEVEL_LOW>;
+};
+
+&speaker_left_tweet {
+	shutdown-gpios = <&pinctrl_ap 57 GPIO_ACTIVE_HIGH>;
+	interrupts-extended = <&pinctrl_ap 58 IRQ_TYPE_LEVEL_LOW>;
+};
+
+&speaker_left_woof1 {
+	shutdown-gpios = <&pinctrl_ap 57 GPIO_ACTIVE_HIGH>;
+	interrupts-extended = <&pinctrl_ap 58 IRQ_TYPE_LEVEL_LOW>;
+};
+
+&speaker_left_woof2 {
+	shutdown-gpios = <&pinctrl_ap 57 GPIO_ACTIVE_HIGH>;
+	interrupts-extended = <&pinctrl_ap 58 IRQ_TYPE_LEVEL_LOW>;
+};
+
+&speaker_right_tweet {
+	shutdown-gpios = <&pinctrl_ap 57 GPIO_ACTIVE_HIGH>;
+	interrupts-extended = <&pinctrl_ap 58 IRQ_TYPE_LEVEL_LOW>;
+};
+
+&speaker_right_woof1 {
+	shutdown-gpios = <&pinctrl_ap 57 GPIO_ACTIVE_HIGH>;
+	interrupts-extended = <&pinctrl_ap 58 IRQ_TYPE_LEVEL_LOW>;
+};
+
+&speaker_right_woof2 {
+	shutdown-gpios = <&pinctrl_ap 57 GPIO_ACTIVE_HIGH>;
+	interrupts-extended = <&pinctrl_ap 58 IRQ_TYPE_LEVEL_LOW>;
+};
+
+&jack_codec {
+	reset-gpios = <&pinctrl_nub 8 GPIO_ACTIVE_HIGH>;
+	interrupts-extended = <&pinctrl_ap 59 IRQ_TYPE_LEVEL_LOW>;
+};
+
+&wifi0 {
+	compatible = "pci14e4,4434";
+};
+
+&bluetooth0 {
+	compatible = "pci14e4,5f72";
+};
+
+&port01 {
+	pwren-gpios = <&smc_gpio 22 GPIO_ACTIVE_HIGH>;
+};
+
+&ps_mtp_fabric {
+	status = "okay";
+};
+
+&mtp {
+	status = "okay";
+};
+
+&mtp_mbox {
+	status = "okay";
+};
+
+&mtp_dart {
+	status = "okay";
+};
+
+&mtp_dockchannel {
+	status = "okay";
+};
+
+&mtp_hid {
+	apple,afe-reset-gpios = <&smc_gpio 25 GPIO_ACTIVE_LOW>;
+	apple,stm-reset-gpios = <&smc_gpio 26 GPIO_ACTIVE_LOW>;
+
+	mtp_mt: multi-touch {
+	};
+
+	keyboard: keyboard {
+		hid-country-code = <0>;
+		apple,keyboard-layout-id = <0>;
+	};
+
+	stm {
+	};
+
+	actuator {
+	};
+
+	tp_accel {
+	};
+};
+
+/*
+ * Mesa fingerprint sensor. The power line is gpio0 pin 122 (function-mesa_pwr,
+ * active high) and the data-ready line is pin 121 on J414c and J416c (from
+ * their platform device trees, /arm-io/spi2/mesa) and on J414s. J416s shares
+ * the rest of this family's AP GPIO assignments and is expected to match.
+ */
+&spi2 {
+	status = "okay";
+};
+
+&mesa {
+	status = "okay";
+	enable-gpios = <&pinctrl_ap 122 GPIO_ACTIVE_HIGH>;
+	interrupt-parent = <&pinctrl_ap>;
+	interrupts = <121 IRQ_TYPE_EDGE_RISING>;
+	spi-cs-setup-delay-ns = <20>;
+	spi-cs-hold-delay-ns = <20>;
+};
+
+&isp {
+	apple,platform-id = <7>;
+	/delete-node/ sensor-presets; /* Override j31[46] below */
+};
+
+#include "isp-imx558-cfg0.dtsi"

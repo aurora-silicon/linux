@@ -1,0 +1,37 @@
+Arbitrary-quarter anonymous COW qualification
+=============================================
+
+Run on the audited native16K kernel through an established4K ABI launcher,
+with CAP_SYS_ADMIN for visible pagemap PFNs:
+  userpages 4k ./same-quarter --native-16k > same-quarter.log
+  python3 check-any-quarter.py same-quarter.log
+  userpages 4k ./file-cow-consumers --native-16k
+  userpages 4k ./same-native --native-16k
+
+same-quarter: two fresh owner+child arms compare4MiB changed data in same versus
+balanced virtual quarters of a16MiB dense parent. Exact nativePFN union, no
+modified-child alias to parent/unchangedchild, all-byte isolation and histograms.
+The binary reports measurements; the checker requires both arms <=6MiB native
+for4MiB changed and actual nonzero physical-quarter use in the same-quarter arm.
+This catches the old16MiB same-quarter result while allowing bounded pool slack.
+30s supervisor/20s child alarms, group/subreaper cleanup, no pressure.
+
+file-cow-consumers:1MiB owned memfd,two private views; child explicitly READ-
+prefaults both views AFTER fork (fork may omit reconstructible file PTEs).
+CPU COW, remote typed GUP read-unshare/write-COW each require actual physical/
+logical quarter mismatch and correct file-to-anonymous transition. Then shifted
+VA mremap must preserve every actualPFN and byte; post-move GUP and parent/file
+isolation are checked.30s supervisor/20s child. Exact stage/byte/PTE diagnostics.
+This is typed GUP coverage, not long-term DMA pin or migration qualification.
+
+same-native:16fresh three-generation trials/16KiB logical payload. B's first COW
+is retained by held C while B COWs again. Required distinct4KPFNs sharing native
+PFN/4 prove source/destination use one nativefolio; every generation and neighbor
+byte stays correct. At least1actual pair is required for PASS; exit77 means
+UNEXERCISED, never a coverage pass.20/5/4s supervisor/owner/held-child alarms.
+
+No fixture changes memory policy, system swap, kernel or GPU state. Native16K
+assumption is explicit; do not run density math on an unaudited kernel. Metadata
+--selftest modes (where provided) are not kernel-path qualification. UFFD_MOVE
+and targeted migration are separate gates; disabled UFFD/single-node systems do
+not acquire those qualifications merely by passing these tests.

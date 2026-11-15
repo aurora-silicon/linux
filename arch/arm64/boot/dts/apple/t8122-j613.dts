@@ -1,0 +1,434 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple MacBook Air (13-inch, M3, 2024)
+ *
+ * target-type: J613
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#include "t8122.dtsi"
+#include "t8122-j613-j615.dtsi"
+#include <dt-bindings/thermal/thermal.h>
+
+/ {
+	compatible = "apple,j613", "apple,t8122", "apple,arm-platform";
+	model = "Apple MacBook Air (13-inch, M3, 2024)";
+
+	/*
+	 * Fanless: every die sensor throttles both clusters, E weighted 3:1
+	 * and capped at state 3. Trips as on the J700; sustainable-power from
+	 * J613 load tests.
+	 */
+	thermal-zones {
+		cpu-e0-thermal {
+			polling-delay-passive = <500>;
+			polling-delay = <500>;
+			thermal-sensors = <&smc_hwmon 0>;	/* Te05 */
+			sustainable-power = <6000>;
+
+			trips {
+				cpu_e0_alert: trip-alert {
+					temperature = <58000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_e0_control: trip-control {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <110000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_e0_control>;
+					cooling-device =
+						<&cpu_p0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <1024>;
+				};
+
+				map1 {
+					trip = <&cpu_e0_control>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT 3>,
+						<&cpu_e1 THERMAL_NO_LIMIT 3>,
+						<&cpu_e2 THERMAL_NO_LIMIT 3>,
+						<&cpu_e3 THERMAL_NO_LIMIT 3>;
+					contribution = <3072>;
+				};
+			};
+		};
+
+		cpu-e1-thermal {
+			polling-delay-passive = <500>;
+			polling-delay = <500>;
+			thermal-sensors = <&smc_hwmon 1>;	/* Te0P */
+			sustainable-power = <6000>;
+
+			trips {
+				cpu_e1_alert: trip-alert {
+					temperature = <58000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_e1_control: trip-control {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <110000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_e1_control>;
+					cooling-device =
+						<&cpu_p0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <1024>;
+				};
+
+				map1 {
+					trip = <&cpu_e1_control>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT 3>,
+						<&cpu_e1 THERMAL_NO_LIMIT 3>,
+						<&cpu_e2 THERMAL_NO_LIMIT 3>,
+						<&cpu_e3 THERMAL_NO_LIMIT 3>;
+					contribution = <3072>;
+				};
+			};
+		};
+
+		cpu-p0-thermal {
+			polling-delay-passive = <500>;
+			polling-delay = <500>;
+			thermal-sensors = <&smc_hwmon 2>;	/* Tp05 */
+			sustainable-power = <6000>;
+
+			trips {
+				cpu_p0_alert: trip-alert {
+					temperature = <58000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p0_control: trip-control {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <110000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p0_control>;
+					cooling-device =
+						<&cpu_p0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <1024>;
+				};
+
+				map1 {
+					trip = <&cpu_p0_control>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT 3>,
+						<&cpu_e1 THERMAL_NO_LIMIT 3>,
+						<&cpu_e2 THERMAL_NO_LIMIT 3>,
+						<&cpu_e3 THERMAL_NO_LIMIT 3>;
+					contribution = <3072>;
+				};
+			};
+		};
+
+		cpu-p1-thermal {
+			polling-delay-passive = <500>;
+			polling-delay = <500>;
+			thermal-sensors = <&smc_hwmon 3>;	/* Tp0L */
+			sustainable-power = <6000>;
+
+			trips {
+				cpu_p1_alert: trip-alert {
+					temperature = <58000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p1_control: trip-control {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <110000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p1_control>;
+					cooling-device =
+						<&cpu_p0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <1024>;
+				};
+
+				map1 {
+					trip = <&cpu_p1_control>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT 3>,
+						<&cpu_e1 THERMAL_NO_LIMIT 3>,
+						<&cpu_e2 THERMAL_NO_LIMIT 3>,
+						<&cpu_e3 THERMAL_NO_LIMIT 3>;
+					contribution = <3072>;
+				};
+			};
+		};
+
+		cpu-p2-thermal {
+			polling-delay-passive = <500>;
+			polling-delay = <500>;
+			thermal-sensors = <&smc_hwmon 4>;	/* Tp0b */
+			sustainable-power = <6000>;
+
+			trips {
+				cpu_p2_alert: trip-alert {
+					temperature = <58000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p2_control: trip-control {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <110000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p2_control>;
+					cooling-device =
+						<&cpu_p0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <1024>;
+				};
+
+				map1 {
+					trip = <&cpu_p2_control>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT 3>,
+						<&cpu_e1 THERMAL_NO_LIMIT 3>,
+						<&cpu_e2 THERMAL_NO_LIMIT 3>,
+						<&cpu_e3 THERMAL_NO_LIMIT 3>;
+					contribution = <3072>;
+				};
+			};
+		};
+
+		cpu-p3-thermal {
+			polling-delay-passive = <500>;
+			polling-delay = <500>;
+			thermal-sensors = <&smc_hwmon 5>;	/* Tp0r */
+			sustainable-power = <6000>;
+
+			trips {
+				cpu_p3_alert: trip-alert {
+					temperature = <58000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				cpu_p3_control: trip-control {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "passive";
+				};
+
+				trip-critical {
+					temperature = <110000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&cpu_p3_control>;
+					cooling-device =
+						<&cpu_p0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+					contribution = <1024>;
+				};
+
+				map1 {
+					trip = <&cpu_p3_control>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT 3>,
+						<&cpu_e1 THERMAL_NO_LIMIT 3>,
+						<&cpu_e2 THERMAL_NO_LIMIT 3>,
+						<&cpu_e3 THERMAL_NO_LIMIT 3>;
+					contribution = <3072>;
+				};
+			};
+		};
+	};
+};
+
+&dcp {
+	panel: panel {
+		compatible = "apple,panel-j613", "apple,panel";
+		/* 2560x1664 at 224 ppi; 64 notch rows above the desktop. */
+		width-mm = <290>;
+		height-mm = <189>;
+		adj-height-mm = <181>;
+		apple,max-brightness = <525>;
+	};
+};
+
+&wifi0 {
+	brcm,board-type = "apple,dnieper";
+};
+
+&bluetooth0 {
+	brcm,board-type = "apple,dnieper";
+};
+
+&aop_audio {
+	apple,chassis-name = "J613";
+};
+
+&i2c1 {
+	speaker_left_woof: codec@38 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x38>;
+		shutdown-gpios = <&pinctrl_ap 13 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer";
+		interrupts-extended = <&pinctrl_ap 12 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <0>;
+		ti,vmon-slot-no = <2>;
+	};
+
+	speaker_left_tweet: codec@39 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x39>;
+		shutdown-gpios = <&pinctrl_ap 13 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Tweeter";
+		interrupts-extended = <&pinctrl_ap 12 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <8>;
+		ti,vmon-slot-no = <10>;
+	};
+};
+
+&i2c3 {
+	speaker_right_woof: codec@3b {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3b>;
+		shutdown-gpios = <&pinctrl_ap 13 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer";
+		interrupts-extended = <&pinctrl_ap 12 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <4>;
+		ti,vmon-slot-no = <6>;
+	};
+
+	speaker_right_tweet: codec@3c {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3c>;
+		shutdown-gpios = <&pinctrl_ap 13 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Tweeter";
+		interrupts-extended = <&pinctrl_ap 12 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <12>;
+		ti,vmon-slot-no = <14>;
+	};
+};
+
+/ {
+	sound {
+		compatible = "apple,j613-macaudio", "apple,j413-macaudio", "apple,macaudio";
+		model = "MacBook Air J613";
+
+		dai-link@0 {
+			link-name = "Speakers";
+			dai-tdm-idle-mode-0 = "zero";
+			dai-tdm-idle-mode-2 = "zero";
+			dai-tdm-slot-tx-idle-mask-0 = <0x0f0f>;
+			dai-tdm-slot-tx-idle-mask-2 = <0xf0f0>;
+
+			cpu {
+				sound-dai = <&mca 0>, <&mca 1>;
+			};
+			codec {
+				sound-dai = <&speaker_left_woof>, <&speaker_left_tweet>,
+					    <&speaker_right_woof>, <&speaker_right_tweet>;
+			};
+		};
+
+		dai-link@1 {
+			link-name = "Headphone Jack";
+
+			cpu {
+				sound-dai = <&mca 2>;
+			};
+			codec {
+				sound-dai = <&jack_codec>;
+			};
+		};
+	};
+};
+
+&mtp_mt {
+	firmware-name = "apple/tpmtfw-j613.bin";
+};
+
+&mesa {
+	/* Per-device factory data from this Mac's own iBoot system container. */
+	firmware-name = "apple/mesacal-j613.bin";
+};

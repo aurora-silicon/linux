@@ -1,0 +1,11 @@
+[Unit]
+Description=Apple SEP and Touch ID
+ConditionPathExists=/dev/disk/by-partlabel/iBootSystemContainer
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/sbin/modprobe apple-sep
+
+[Install]
+WantedBy=multi-user.target

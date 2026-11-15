@@ -1,0 +1,58 @@
+AFKV2 host selftests
+===================
+
+Run ./run-afkv2-tests.sh from this directory, or use make run_tests in a
+complete kernel source checkout. HOSTCC, CFLAGS and PYTHON select host tools
+(standalone CC is also accepted).
+AFKV2_SANITIZERS=1 additionally enables AddressSanitizer and UBSan.
+AFKV2_SOURCE_ROOT can name the source checkout when running a copied test
+package; the Makefile exports it automatically for separate output builds.
+
+The codec tests include the production header directly and compare invented,
+independently specified golden bytes. They cover truncation, category ranges,
+length/padding/overflow, unaligned input, OOB descriptor ownership, response
+correlation, token preservation and command ID packing.
+
+The owned-copy test extracts the actual production function from afk.c, prints
+its SHA256, and compiles it with synthetic command slots and CPU buffers. It
+checks active/inactive/done slots, high device addresses, boundaries and copies,
+and that only firmware 27 hands an unowned buffer to its retained-DART path.
+Locks, DMA barriers and that path (afk_v27_access_remote()) are mocked: this
+test does not qualify concurrency, DMA coherency, firmware, a graphics device
+or any hardware display behavior.
+
+All build products are temporary. No device node is opened and no GPU, firmware
+or target machine is contacted. The extractor fails if production function
+boundaries change, requiring review rather than silently testing a stale copy.
+
+The inline EDID tests cover response context, status, declared/actual lengths,
+EDID header/checksum/block limits, and continued rejection of inline responses
+by the OOB matcher. The actual service-call body is extracted for short reply,
+error status and timeout checks; its wire sender is mocked.
+
+The DPTX HPD request is extracted with that service-call body and its timeout
+wrapper. With legacy and AFK-v2 framing, a reply whose declared body stops
+before the HPD echo, or runs past the bytes that arrived, is refused for both
+HPD states; complete and padded replies are accepted and a wrong echo refused.
+
+The real sender is also extracted to test a 128-byte mocked command payload
+with a 32 KiB response capacity, OOB behavior, send failures and timeout
+retention. The two production EDID readers are tested independently to
+prove legacy checksum tolerance remains unchanged.
+
+The complete encoded EDID request is 160 bytes including the queue entry,
+consumes 192 bytes at a 64-byte stride, and needs a 256-byte empty ring. The
+ring-admission block is extracted from the real transmitter to check this.
+The late-publication notifier is extracted to test asynchronous hotplug
+queueing and connector-registration, quiesce, routing and legacy guards.
+
+The compact slot allocator is extracted to model DCP poweron cycles without
+service teardown, on every compact endpoint (0x20-0x2f) and both DCPs, for
+64 generations. A service re-announced after a poweron replaces the same
+name, unit and binding in place, so the slot count stays bounded; the
+hotplug endpoints 0x27-0x29 also replace within a generation. DPAVCTRL's
+same-name, no-unit siblings announced in one generation stay separate, as
+do different identities. Free-slot capacity, reader pins and pending
+commands are checked
+separately. Publication and teardown are mocked; this does not test firmware
+power transitions or concurrent service users.

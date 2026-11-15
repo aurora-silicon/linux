@@ -1,0 +1,126 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# The loader and desktop integration for the Apple SEP fingerprint driver.
+# The local sources are links into tools/aurora-sep; after changing any of
+# them, run updpkgsums here. libfprint with the aurora driver comes from
+# https://github.com/aurora-silicon/aurora-sep-userspace.
+
+pkgname=aurora-sep
+pkgver=1
+pkgrel=17
+pkgdesc="Loader and desktop integration for the Apple SEP (Touch ID) driver"
+url="https://github.com/aurora-silicon/linux/tree/aurora-wip/tools/aurora-sep"
+arch=(any)
+license=(GPL-2.0-only)
+depends=(
+  coreutils
+  fprintd
+  keyutils
+  kmod
+  sh
+)
+backup=('etc/xdg/powerdevilrc')
+optdepends=('glib2-devel: fingerprint at the GNOME login screen'
+            'python: aurora-touchid-setup and the sensor check')
+source=(load-driver
+        aurora-sep.service
+        fprintd-aurora.conf
+        aurora-sep-ready
+        aurora-sep-ready.service
+        fprintd-no-timeout.conf.in
+        logind-aurora-sep.conf
+        aurora-sep-greeter-fingerprint
+        aurora-sep-greeter-fingerprint.service
+        aurora-sep-greeter-refresh.service
+        aurora-sep-policy-change
+        README.md
+        XART-SAFETY.md
+        OS-IDENTITY.md
+        sep-bio-identities
+        aurora-sep.timer
+        aurora-sep-load.conf
+        sensor-present
+        touchid-setup-needed
+        aurora-touchid-setup
+        aurora-touchid-setup.service
+        extract-mesa-calibration.py
+        powerdevilrc
+        aurora-sep)
+sha256sums=('SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP')
+
+# A unit and the helper it runs ($1, installed as $3), pointed at the
+# packaged helper.
+_unit() {
+  local unit="$pkgdir/usr/lib/systemd/system/$2"
+
+  install -Dm755 "$1" "$pkgdir/usr/lib/aurora-sep/$3"
+  install -Dm644 "$2" "$unit"
+  sed -i "s|^\(Exec[A-Za-z]*=\)/usr/local/sbin/|\1/usr/lib/aurora-sep/|" "$unit"
+  if grep -q /usr/local "$unit"; then
+    return 1
+  fi
+}
+
+package() {
+  _unit load-driver aurora-sep.service aurora-sep-load
+  _unit aurora-sep-ready aurora-sep-ready.service aurora-sep-ready
+  _unit aurora-sep-greeter-fingerprint aurora-sep-greeter-fingerprint.service \
+    aurora-sep-greeter-fingerprint
+  install -Dm644 aurora-sep-greeter-refresh.service \
+    "$pkgdir/usr/lib/systemd/system/aurora-sep-greeter-refresh.service"
+  install -Dm755 aurora-sep-policy-change "$pkgdir/usr/bin/aurora-sep-policy-change"
+  sed -i "s|^\(Exec[A-Za-z]*=\)/usr/local/sbin/|\1/usr/lib/aurora-sep/|" \
+    "$pkgdir/usr/lib/systemd/system/aurora-sep-greeter-refresh.service"
+
+  install -Dm644 fprintd-aurora.conf \
+    "$pkgdir/usr/lib/systemd/system/fprintd.service.d/aurora-sep.conf"
+  grep -qx 'ExecStart=/usr/lib/fprintd' /usr/lib/systemd/system/fprintd.service
+  sed 's|@FPRINTD@|/usr/lib/fprintd|' fprintd-no-timeout.conf.in \
+    >"$pkgdir/usr/lib/systemd/system/fprintd.service.d/50-aurora-sep-no-timeout.conf"
+  install -Dm644 logind-aurora-sep.conf \
+    "$pkgdir/usr/lib/systemd/logind.conf.d/50-aurora-sep.conf"
+  install -Dm755 sep-bio-identities "$pkgdir/usr/bin/sep-bio-identities"
+  install -Dm755 aurora-sep "$pkgdir/usr/bin/aurora-sep"
+  sed -i "s|^\(Exec[A-Za-z]*=\)/usr/local/sbin/|\1/usr/lib/aurora-sep/|" \
+    "$pkgdir/usr/lib/systemd/system/fprintd.service.d/aurora-sep.conf"
+  install -Dm755 sensor-present "$pkgdir/usr/lib/aurora-sep/aurora-sep-sensor-present"
+
+  # The Touch ID calibration setup, run when a file is missing or refused.
+  install -Dm755 touchid-setup-needed "$pkgdir/usr/lib/aurora-sep/aurora-touchid-setup-needed"
+  install -Dm755 aurora-touchid-setup "$pkgdir/usr/bin/aurora-touchid-setup"
+  install -Dm755 extract-mesa-calibration.py "$pkgdir/usr/libexec/aurora/extract-mesa-calibration"
+  install -Dm644 aurora-touchid-setup.service "$pkgdir/usr/lib/systemd/system/aurora-touchid-setup.service"
+  sed -i -e "s|^\(Exec[A-Za-z]*=\)/usr/local/sbin/aurora-touchid-setup |\1/usr/bin/aurora-touchid-setup |" \
+    -e "s|^\(Exec[A-Za-z]*=\)/usr/local/sbin/|\1/usr/lib/aurora-sep/|" \
+    "$pkgdir/usr/lib/systemd/system/aurora-touchid-setup.service"
+
+  # Load the driver from aurora-sep.service, once /var/lib is there.
+  install -Dm644 aurora-sep-load.conf "$pkgdir/usr/lib/modprobe.d/aurora-sep-load.conf"
+  install -Dm644 aurora-sep.timer "$pkgdir/usr/lib/systemd/system/aurora-sep.timer"
+  install -Dm644 powerdevilrc "$pkgdir/etc/xdg/powerdevilrc"
+  ! grep -rq /usr/local "$pkgdir/usr/lib/systemd"
+  install -Dm644 -t "$pkgdir/usr/share/doc/$pkgname" README.md XART-SAFETY.md OS-IDENTITY.md
+}

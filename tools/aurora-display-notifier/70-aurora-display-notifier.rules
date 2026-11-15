@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# The notifier additionally checks apple,j700 and the fixed hub/controller.
+# Never launch a desktop process or guess a user's session bus from udev.
+ACTION=="add|change", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", \
+  ATTR{bDeviceClass}=="11", ATTR{devpath}=="1.1|1.1.*", \
+  ATTRS{idVendor}=="2109", ATTRS{idProduct}=="2122", \
+  ENV{AURORA_DISPLAY_UNSUPPORTED}="1"

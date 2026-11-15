@@ -1,0 +1,133 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Extend the existing USB4 routers with their PCIe adapter and ASC windows. */
+
+&usb4_0_acio {
+	reg = <0x7 0x01ac0000 0x0 0xc000>,
+	      <0x7 0x01080000 0x0 0x20000>,
+	      <0x7 0x01e44000 0x0 0x4000>,
+	      <0x7 0x01100000 0x0 0x4000>;
+	reg-names = "rc", "sram", "pcie-adapter", "cpu";
+	power-domains = <&ps_atc0_cio>, <&ps_atc0_cio_pcie>,
+			<&ps_atc0_cio_usb>, <&ps_atc0_pcie>;
+	post-init-providers = <&ps_atc0_cio>, <&ps_atc0_cio_pcie>,
+			      <&ps_atc0_cio_usb>, <&ps_atc0_pcie>;
+};
+
+&usb4_1_acio {
+	reg = <0xb 0x01ac0000 0x0 0xc000>,
+	      <0xb 0x01080000 0x0 0x20000>,
+	      <0xb 0x01e44000 0x0 0x4000>,
+	      <0xb 0x01100000 0x0 0x4000>;
+	reg-names = "rc", "sram", "pcie-adapter", "cpu";
+	power-domains = <&ps_atc1_cio>, <&ps_atc1_cio_pcie>,
+			<&ps_atc1_cio_usb>, <&ps_atc1_pcie>;
+	post-init-providers = <&ps_atc1_cio>, <&ps_atc1_cio_pcie>,
+			      <&ps_atc1_cio_usb>, <&ps_atc1_pcie>;
+};
+
+&usb4_2_acio {
+	reg = <0xf 0x01ac0000 0x0 0xc000>,
+	      <0xf 0x01080000 0x0 0x20000>,
+	      <0xf 0x01e44000 0x0 0x4000>,
+	      <0xf 0x01100000 0x0 0x4000>;
+	reg-names = "rc", "sram", "pcie-adapter", "cpu";
+	power-domains = <&ps_atc2_cio>, <&ps_atc2_cio_pcie>,
+			<&ps_atc2_cio_usb>, <&ps_atc2_pcie>;
+	post-init-providers = <&ps_atc2_cio>, <&ps_atc2_cio_pcie>,
+			      <&ps_atc2_cio_usb>, <&ps_atc2_pcie>;
+};
+
+/ {
+	usb4_0_pcie_tunnel: usb4-pcie-tunnel-0 {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		nonposted-mmio;
+		/* Preserve the SoC DMA window after moving the virtual container. */
+		dma-ranges = <0 0 0 0 0xffffffff 0xffffc000>;
+
+		usb4_0_pcie_dart: iommu@721008000 {
+			compatible = "apple,t6030-dart", "apple,t8110-dart";
+			reg = <0x7 0x21008000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1077 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			/* No bootloader fills this one; the tunnel's cold init needs it. */
+			apple,tunable =
+				<0x20c 0x800001b7 0x800001b7>,
+				<0x220 0xf0f0f 0xf0f0f>,
+				<0x224 0xffffff 0x80808>,
+				<0x300 0x1f31 0x1>,
+				<0x308 0x3ffffffc 0x10000000>,
+				<0x310 0x3ffffffc 0x3ffffffc>,
+				<0x318 0x1f31 0x1>,
+				<0x320 0x3ffffffc 0x1f00000>,
+				<0x328 0x3ffffffc 0x1f0bffc>;
+		};
+
+		usb4_0_pcie: pcie@730000000 {
+			compatible = "apple,t8122-pciec", "apple,t8103-pciec";
+			device_type = "pci";
+			reg = <0x7 0x30000000 0x0 0x10000000>,
+			      <0x7 0x20000000 0x0 0x4000>,
+			      <0x7 0x21000000 0x0 0x8000>,
+			      <0x7 0x20004000 0x0 0x4000>,
+			      <0x7 0x20200000 0x0 0x4000>,
+			      <0x7 0x21010000 0x0 0x4000>,
+			      <0x7 0x20008000 0x0 0x4000>,
+			      <0x7 0x2100c000 0x0 0x4000>;
+			reg-names = "config", "rc", "port0", "fabric",
+				    "debug", "ltssm", "oe-fabric", "intr2axi";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1076 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_atc0_cio_pcie>;
+			apple,pciec-kernel-init;
+			/*
+			 * m1n1 fills the rc, fabric and debug tunables through the
+			 * usb4_0_pcie alias, but not this one.
+			 */
+			apple,tunable-oe-fabric =
+				<0x4 0x70007 0x40004>,
+				<0x8 0x1 0x1>,
+				<0xc 0x1 0x1>,
+				<0x10 0x801f 0x4>,
+				<0x18 0x801f 0x4>,
+				<0x20 0x801f 0x4>;
+			msi-controller;
+			msi-parent = <&usb4_0_pcie>;
+			msi-ranges = <&aic AIC_IRQ 1342 IRQ_TYPE_EDGE_RISING 0x200>;
+			iommu-map = <0x0 &usb4_0_pcie_dart 0x0 0x40>;
+			iommu-map-mask = <0x3f>;
+			bus-range = <0x0 0x7f>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges = <0x43000000 0x8 0x0
+				  0x8 0x0 0x2 0x0>,
+				 <0x02000000 0x0 0x100000
+				  0xa 0x100000 0x0 0x3ff00000>,
+				 <0x42000000 0x0 0x40000000
+				  0xa 0x40000000 0x0 0x40000000>;
+
+			usb4_0_pcie_port: pci@0,0 {
+				device_type = "pci";
+				reg = <0x0 0x0 0x0 0x0 0x0>;
+				external-facing;
+				/* apple,tunable is filled by the bootloader */
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+				interrupt-controller;
+				#interrupt-cells = <1>;
+				interrupt-map-mask = <0 0 0 7>;
+				interrupt-map = <0 0 0 1 &usb4_0_pcie_port 0 0 0 0>,
+						<0 0 0 2 &usb4_0_pcie_port 0 0 0 1>,
+						<0 0 0 3 &usb4_0_pcie_port 0 0 0 2>,
+						<0 0 0 4 &usb4_0_pcie_port 0 0 0 3>;
+			};
+		};
+	};
+};
+
+&usb4_0_acio {
+	apple,pcie-tunnel = <&usb4_0_pcie_tunnel>;
+};

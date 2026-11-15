@@ -1,0 +1,152 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/usb/apple,sn201202x.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Texas Instruments sn201202x Type-C Power Delivery controller
+
+maintainers:
+  - Sasha Finkelstein <k@chaosmail.tech>
+
+description: |
+  Texas Instruments sn201202x Type-C Power Delivery controller
+
+  A variant of tps6598x controller also known as Apple ACE3
+  present on hardware with Apple SoCs starting from the M3.
+
+  The controller can be polled when interrupt resources are not supplied.
+
+  T8132 omits the register-selection interrupt, so selection is polled while
+  event, standby and wakeup notifications use interrupts.
+
+properties:
+  compatible:
+    oneOf:
+      - const: apple,sn201202x
+      - items:
+          - const: apple,t8132-sn201202x
+          - const: apple,sn201202x
+
+  reg:
+    maxItems: 1
+
+  interrupts:
+    minItems: 3
+    maxItems: 4
+
+  interrupt-names:
+    minItems: 3
+    maxItems: 4
+
+  wakeup-source: true
+
+  apple,sleep-ssps:
+    type: boolean
+    description:
+      Tell the controller the system's power state (SSPS) around a
+      firmware-driven suspend, S3 before it and S0 after.
+
+  apple,debug-lock-key:
+    $ref: /schemas/types.yaml#/definitions/string
+    description:
+      The four-character key that unlocks the controller's debug mode, for
+      rearming the debug link after a sleep ended it.
+
+  apple,usb-remote-wake:
+    type: boolean
+    description:
+      This controller serves the USB controller's root port, and watches its
+      USB2 lines for a remote wakeup during a firmware-driven system sleep.
+
+  connector:
+    $ref: /schemas/connector/usb-connector.yaml#
+
+  apple,no-liquid-detection:
+    type: boolean
+    description:
+      The controller's port has no liquid detection and corrosion mitigation
+      (LDCM), as on the MagSafe 3 port, which the ADT lists with the
+      "Power In" feature only.
+
+  apple,reset-inherited-usb2-connection:
+    type: boolean
+    description: |
+      A connection that is up when the OS starts keeps state from the boot
+      chain that resetting the host PHY does not recover: a USB2 repeater
+      connection on the boot port (J716c), or a Type-C retimer set up before
+      the host PHY ran, which keeps SuperSpeed from training (J575c).
+      Renegotiate a normal application connection before starting the host
+      controllers. Debug routes are preserved.
+
+required:
+  - compatible
+  - reg
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8132-sn201202x
+    then:
+      properties:
+        interrupts:
+          items:
+            - description: Primary irq used for tps6598x events
+            - description: Standby command completed
+            - description: Wakeup command completed
+        interrupt-names:
+          items:
+            - const: irq
+            - const: sleep
+            - const: wake
+    else:
+      properties:
+        interrupts:
+          items:
+            - description: Primary irq used for tps6598x events
+            - description: Logical register selection completed
+            - description: Standby command completed
+            - description: Wakeup command completed
+        interrupt-names:
+          items:
+            - const: irq
+            - const: select
+            - const: sleep
+            - const: wake
+
+dependentRequired:
+  interrupts: [interrupt-names]
+  interrupt-names: [interrupts]
+
+additionalProperties: false
+
+examples:
+  - |
+    #include <dt-bindings/interrupt-controller/irq.h>
+    #include <dt-bindings/spmi/spmi.h>
+    spmi {
+        #address-cells = <2>;
+        #size-cells = <0>;
+        usb-pd@c {
+            compatible = "apple,sn201202x";
+            reg = <0xc SPMI_USID>;
+            interrupts = <11 IRQ_TYPE_EDGE_RISING>,
+                         <13 IRQ_TYPE_EDGE_RISING>,
+                         <17 IRQ_TYPE_EDGE_RISING>,
+                         <19 IRQ_TYPE_EDGE_RISING>;
+            interrupt-names = "irq", "select", "sleep", "wake";
+
+            connector {
+                compatible = "usb-c-connector";
+                label = "USB-C";
+
+                port {
+                    typec_ep: endpoint {
+                        remote-endpoint = <&otg_ep>;
+                    };
+                };
+            };
+        };
+    };

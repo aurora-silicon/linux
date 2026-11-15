@@ -1,0 +1,135 @@
+"""--m3-report: one file for an M3 test report, read-only, without private data.
+
+Runs against the fake Mac of test_m3_flow, with a fake dmesg and lsusb.
+"""
+import tarfile
+import unittest
+
+import test_m3_flow as flow
+
+Base = getattr(flow, "M3FlowBase", None)
+if Base is None:
+    Base = type("Base", (flow.M3FlowTest,),
+                {n: None for n in dir(flow.M3FlowTest) if n.startswith("test")})
+
+DMESG = """\
+[    0.000000] OF: reserved mem: 0x00000103fff70000..0x00000103fff73fff (16 KiB) map non-reusable uat-handoff
+[    0.055969] [drm] Initialized simpledrm 1.0.0 for 103e1c94000.framebuffer on minor 0
+[    2.100000] usb 1-1: SerialNumber: ABC123SECRET
+[    3.000000] brcmfmac: wlan0 address 12:34:56:78:9a:bc
+[    3.100000] usb 2-1: new SuperSpeed USB device, mac 12:34:56:78:9a:bc
+[    4.000000] some unrelated line
+"""
+
+
+class M3ReportTest(Base):
+    def setUp(self):
+        super().setUp()
+        (self.tmp / "bin/dmesg").write_text("#!/bin/sh\ncat <<'EOF'\n" + DMESG + "EOF\n")
+        (self.tmp / "bin/dmesg").chmod(0o755)
+        (self.tmp / "bin/lsusb").write_text("#!/bin/sh\necho '/:  Bus 001.Port 001: Dev 001, Class=root_hub, Driver=xhci-hcd/1p, 5000M'\n")
+        (self.tmp / "bin/lsusb").chmod(0o755)
+        self.out = self.tmp / "out"
+        self.out.mkdir()
+
+    def report(self):
+        proc = self.run_sh(f"cd '{self.out}'\nm3_report")
+        files = list(self.out.glob("aurora-m3-report-*.tgz"))
+        self.assertEqual(len(files), 1, proc.stdout + proc.stderr)
+        with tarfile.open(files[0]) as t:
+            return proc, {m.name.lstrip("./"): (t.extractfile(m).read() if m.isfile() else None)
+                          for m in t.getmembers()}
+
+    def test_air_report(self):
+        self.mac("j613")
+        node = self.tmp / "dt/chosen/asahi,t8122-gpu-powered-identity"
+        node.mkdir(parents=True)
+        (node / "id-version").write_bytes(b"\x07\x02\x20\x00")
+        (self.tmp / "dt/chosen/asahi,t8122-dcp").write_bytes(b"1\0")
+        (self.tmp / "dt/chosen/asahi,os-fw-version").write_bytes(b"14.7\0")
+        proc, files = self.report()
+        self.assertIn("aurora-m3-report-j613-", proc.stdout)
+        self.assertIn("board: j613 soc: t8122", files["system.txt"].decode())
+        self.assertIn("os-fw-version: 14.7", files["system.txt"].decode())
+        self.assertEqual(files["chosen/asahi,t8122-gpu-powered-identity/id-version"], b"\x07\x02\x20\x00")
+        self.assertIn("chosen/asahi,t8122-dcp", files)
+        dmesg = files["dmesg-m3.txt"].decode()
+        self.assertIn("uat-handoff", dmesg)
+        self.assertIn("simpledrm", dmesg)
+        self.assertNotIn("ABC123SECRET", dmesg)
+        self.assertNotIn("12:34:56:78:9a:bc", dmesg)
+        self.assertIn("xx:xx:xx:xx:xx:xx", dmesg)
+        self.assertNotIn("unrelated", dmesg)
+        self.assertIn("5000M", files["usb-display.txt"].decode())
+
+    def test_report_changes_nothing(self):
+        self.mac("j613")
+        before = self.boot.read_bytes()
+        self.report()
+        self.assertEqual(self.boot.read_bytes(), before)
+        self.assertNotIn("pacman -U", self.log())
+        self.assertNotIn("update-m1n1", self.log())
+
+    def test_overlap_marker_and_display_logs(self):
+        # 12.0's additions: the marker's presence, the dcp-oslog list, the
+        # marker copied with the other /chosen entries, and the warning.
+        self.mac("j516s")
+        marker = self.tmp / "dt/chosen/asahi,m1n1-oslog-overlap"
+        marker.write_bytes(bytes(range(16)))
+        for addr in ("10000000000", "10000100000", "10000200000"):
+            (self.tmp / f"dt/reserved-memory/dcp-oslog@{addr}").mkdir(parents=True)
+        (self.tmp / "dt/chosen/asahi,t6030-display-facts").write_bytes(b"facts\0")
+        proc, files = self.report()
+        text = files["system.txt"].decode()
+        self.assertIn("m1n1-oslog-overlap: present", text)
+        listed = text.split("reserved display logs:\n", 1)[1].splitlines()[:3]
+        self.assertEqual([l.rsplit("/", 1)[1] for l in listed],
+                         ["dcp-oslog@10000000000", "dcp-oslog@10000100000", "dcp-oslog@10000200000"])
+        self.assertEqual(files["chosen/asahi,m1n1-oslog-overlap"], bytes(range(16)))
+        self.assertEqual(files["chosen/asahi,t6030-display-facts"], b"facts\0")
+        self.assertIn("display log buffer overlaps", proc.stderr)
+        self.assertIn("issues", proc.stderr)
+
+    def test_no_overlap_marker(self):
+        self.mac("j613")
+        proc, files = self.report()
+        text = files["system.txt"].decode()
+        self.assertIn("m1n1-oslog-overlap: absent", text)
+        self.assertIn("reserved display logs:\n-\n", text)
+        self.assertNotIn("chosen/asahi,m1n1-oslog-overlap", files)
+        self.assertNotIn("overlaps", proc.stderr)
+
+    def test_report_names_the_m1n1_by_its_bytes(self):
+        self.mac("j516s")
+        self.install()
+        sha = self.bin_shas[self.m1n1_pkg]
+        _, files = self.report()
+        text = files["system.txt"].decode()
+        self.assertIn(f"installed m1n1.bin: sha256 {sha}", text)
+        self.assertRegex(text, rf"boot.bin's first \d+ bytes: sha256 {sha}")
+        self.assertIn(f"m1n1-installed: {sha} ", text)
+
+    def test_m1n1_log_is_named_even_when_not_read(self):
+        # G1: the report always has m1n1-stage2-log.txt: m1n1's log of this boot, read with the ADT
+        # through phram (test_m3_max.AdtTest), or one line saying why it was not.
+        self.mac("j613")
+        _, files = self.report()
+        self.assertIn("m1n1-stage2-log.txt", files)
+        self.assertTrue(files["m1n1-stage2-log.txt"].decode().startswith("m1n1's log was not read: "),
+                        files["m1n1-stage2-log.txt"])
+        self.assertIn("m1n1-stage2-log.txt  m1n1's log of this boot", files["README.txt"].decode())
+
+    def test_the_t6034_smc_line_is_the_generic_one(self):
+        # macsmc_hwmon_is_m3() lists t6034: a missing key list no longer blames the chip.
+        src = flow.INSTALLER.read_text()
+        body = src.split("m3_smc_missing() {", 1)[1].split("\n}\n", 1)[0]
+        self.assertNotIn("t6034", body)
+        self.assertIn("debugfs is not mounted, or the SMC driver did not start", body)
+
+    def test_report_needs_no_preflight(self):
+        src = flow.INSTALLER.read_text()
+        self.assertIn("--agent-prompt | --reset-touchid | --m3-report | --m3-power-survey) return 1", src)
+
+
+if __name__ == "__main__":
+    unittest.main()

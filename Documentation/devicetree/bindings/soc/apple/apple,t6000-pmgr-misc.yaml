@@ -1,0 +1,74 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,t6000-pmgr-misc.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple SoC PMGR Misc Power States
+
+maintainers:
+  - Sasha Finkelstein <k@chaosmail.tech>
+
+description: |
+  Certain Apple SoCs include additional PMGR power states that are controlled
+  via a different "misc" control block. This includes the fabric and memory
+  controller states.
+
+  When the host owns these registers and PMP firmware is disabled, an optional
+  measured bandwidth OPP table enables one shared interconnect provider on
+  T600x. Endpoint 0 represents clients and endpoint 1 represents memory. All
+  clients use the path from 0 to 1, so their bandwidth requests aggregate.
+
+properties:
+  compatible:
+    enum:
+      - apple,t6000-pmgr-misc
+      - apple,t6020-pmgr-misc
+
+  reg:
+    maxItems: 2
+
+  reg-names:
+    items:
+      - const: fabric-ps
+      - const: dcs-ps
+
+  '#interconnect-cells':
+    const: 1
+
+  operating-points-v2:
+    description: |
+      Measured sustainable bandwidth table following
+      operating-points-v2-apple-dcs.yaml. Only valid with host ownership of DCS;
+      do not enable PMP firmware together with this interface.
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+  - reg-names
+
+dependentRequired:
+  operating-points-v2: ['#interconnect-cells']
+  '#interconnect-cells': [operating-points-v2]
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          const: apple,t6020-pmgr-misc
+    then:
+      properties:
+        operating-points-v2: false
+        '#interconnect-cells': false
+
+additionalProperties: false
+
+examples:
+  - |
+    power-management@8e20c000 {
+        compatible = "apple,t6000-pmgr-misc";
+        reg = <0x8e20c000 0x400>,
+              <0x8e20c800 0x400>;
+        reg-names = "fabric-ps", "dcs-ps";
+    };

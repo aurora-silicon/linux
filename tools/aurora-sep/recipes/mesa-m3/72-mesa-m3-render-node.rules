@@ -1,0 +1,11 @@
+# Installed by the mesa-m3 package (/usr/lib/udev/rules.d/72-mesa-m3-render-node.rules).
+#
+# The render nodes of the M3 Pro (T6030) and M3 (T8122) GPUs open for the
+# render group (the installer adds the desktop user) instead of for everyone.
+# The kernel refuses the system Mesa on these GPUs (it is not M3-aware), and a
+# compositor started without the M3 Mesa that renders through an EGL device on
+# such a node, such as the SDDM greeter's Hyprland (user sddm), stops at start.
+# Without access to the node it renders in software. Other Apple GPUs are not
+# matched.
+SUBSYSTEM=="drm", KERNEL=="renderD*", DRIVERS=="asahi", ATTR{device/of_node/compatible}=="apple,agx-t6030", GROUP="render", MODE="0660"
+SUBSYSTEM=="drm", KERNEL=="renderD*", DRIVERS=="asahi", ATTR{device/of_node/compatible}=="apple,agx-t8122", GROUP="render", MODE="0660"
