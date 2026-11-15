@@ -930,6 +930,36 @@ static void parser_route_invalid_own_mode(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, dcp_crtc_atomic_check(&crtc->base, &state), -EINVAL);
 }
 
+/* A crashed DCP refuses a mode or a frame, never its CRTC going or staying off. */
+static void parser_crashed_crtc_off(struct kunit *test)
+{
+	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
+	struct apple_crtc *crtc = kunit_kzalloc(test, sizeof(*crtc), GFP_KERNEL);
+	struct platform_device *pdev = kunit_kzalloc(test, sizeof(*pdev), GFP_KERNEL);
+	struct drm_crtc_state crtc_state = { .enable = true, .active = true };
+	struct __drm_crtcs_state crtcs[1] = { { .new_state = &crtc_state } };
+	struct drm_atomic_commit state = { .crtcs = crtcs };
+
+	KUNIT_ASSERT_NOT_NULL(test, dcp);
+	KUNIT_ASSERT_NOT_NULL(test, crtc);
+	KUNIT_ASSERT_NOT_NULL(test, pdev);
+	dcp->fw_compat = DCP_FIRMWARE_V_27_0;
+	dcp->crashed = true;
+	crtc->dcp = pdev;
+	platform_set_drvdata(pdev, dcp);
+	KUNIT_EXPECT_EQ(test, dcp_crtc_atomic_check(&crtc->base, &state), -EINVAL);
+	/* The display was reported gone: the desktop turns the CRTC off. */
+	crtc_state.enable = false;
+	crtc_state.active = false;
+	crtc_state.active_changed = true;
+	crtc_state.mode_changed = true;
+	KUNIT_EXPECT_EQ(test, dcp_crtc_atomic_check(&crtc->base, &state), 0);
+	/* System suspend adds every CRTC, the ones already off too. */
+	crtc_state.active_changed = false;
+	crtc_state.mode_changed = false;
+	KUNIT_EXPECT_EQ(test, dcp_crtc_atomic_check(&crtc->base, &state), 0);
+}
+
 static void parser_connector_ownership(struct kunit *test)
 {
 	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
@@ -2035,6 +2065,7 @@ static struct kunit_case parser_cases[] = {
 	KUNIT_CASE(parser_route_prepare_scope),
 	KUNIT_CASE(parser_route_holder_snapshot),
 	KUNIT_CASE(parser_route_invalid_own_mode),
+	KUNIT_CASE(parser_crashed_crtc_off),
 	KUNIT_CASE(parser_connector_ownership),
 	KUNIT_CASE(parser_route_retirement),
 	KUNIT_CASE(parser_rejected_replacement),

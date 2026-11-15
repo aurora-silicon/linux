@@ -1637,10 +1637,15 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7)
 		return iomfb_v14_7_atomic_check(dcp, crtc, commit);
 
-	if (dcp->crashed)
-		return -EINVAL;
-
 	crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
+
+	/*
+	 * A crashed coprocessor takes no mode or frame, but its CRTC must
+	 * still go off: dcp_external_wedged() reports the display gone so the
+	 * desktop turns the CRTC off, and system suspend turns every CRTC off.
+	 */
+	if (dcp->crashed)
+		return crtc_state->enable ? -EINVAL : 0;
 
 	/* External H17P does not program adaptive sync. */
 	if (dcp->hw.iomfb_method_profile ==
