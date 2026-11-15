@@ -13,6 +13,8 @@
 		dcp = &dcp;
 		disp0 = &display;
 		disp0_piodma = &disp0_piodma;
+		/* The canonical name; aura (#165) prefers it on T8142, the kernel still finds the legacy one. */
+		disp0-piodma = &disp0_piodma;
 	};
 
 	display: display-subsystem {
