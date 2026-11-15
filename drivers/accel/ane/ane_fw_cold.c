@@ -1091,6 +1091,8 @@ busy:
 	/* Something is still pending on a ring: try again later. */
 	ane_h16_session_sleep(&b->session, false);
 	ane_fw_idle_arm(b);
+}
+
 /*
  * Power the engine off without its firmware and boot it again from the
  * preload, as after a sleep. The CPU and sub-block power states must read
