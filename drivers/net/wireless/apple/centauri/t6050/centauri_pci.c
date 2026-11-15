@@ -401,10 +401,14 @@ static void centauri_t6050_remove(struct pci_dev *pdev)
 /*
  * A firmware sleep takes the N1's power state with it, and its firmware does not survive one:
  * the N1 is reset after the wake and boots from its ROM again, as at power-on.
- * - Before the sleep, every DMA mapping of the N1's three functions is released and the firmware
- *   is told nothing: Bluetooth tears itself down in its own suspend, then this function's
- *   suspend takes Wi-Fi and every IPC and boot buffer down. The root port's
+ * - Before the sleep, Bluetooth tears itself down in its own suspend, then this function
+ *   tears Wi-Fi and the IPC/boot resources down. DMA buffers are retained if DMA shutdown
+ *   cannot be verified. No firmware sleep handover is implemented. The root port's
  *   "apple,endpoint-sleep-smc-writes", if any, are written after that.
+ * - Neither function arms a wake for the sleep: Wi-Fi has no wake-on-WLAN, and Bluetooth's HCI
+ *   device is gone. Request a replay of the N1 warm-reset sequence after link shutdown to
+ *   avoid leaving its firmware running without its host. Selective WoWLAN and paired-device
+ *   Bluetooth wake require a firmware handover that is not implemented here.
  * - The host gives the warm reset in its noirq resume, while the port is still down (see
  *   pcie-apple). This resume writes the port's "apple,endpoint-wake-smc-writes", if any; once
  *   tasks run again, a work item removes the three functions and enumerates them again.
@@ -676,6 +680,7 @@ static int centauri_t6050_suspend(struct device *dev)
 	/* Down since an earlier suspend (a dark wake, or a warm reset not run yet or failed) */
 	if (c->firmware_sleep) {
 		centauri_t6050_smc_writes(pdev->bus->self, "apple,endpoint-sleep-smc-writes");
+		apple_pcie_t6050_sleep_reset(pdev->bus->self);
 		return pci_save_state(pdev);
 	}
 	/* A boot that failed is taken down too: the warm reset after the wake boots the N1 again */
@@ -696,6 +701,8 @@ static int centauri_t6050_suspend(struct device *dev)
 	ret = centauri_t6050_smc_writes(pdev->bus->self, "apple,endpoint-sleep-smc-writes");
 	if (ret)
 		dev_warn(dev, "N1 before the sleep: SMC writes: %d\n", ret);
+	/* No wake armed: request a warm-reset replay after host link shutdown. */
+	apple_pcie_t6050_sleep_reset(pdev->bus->self);
 	dev_dbg(dev, "N1 down for the sleep: Wi-Fi and IPC released\n");
 	return pci_save_state(pdev);
 }
