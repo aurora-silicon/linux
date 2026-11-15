@@ -501,6 +501,11 @@ impl Pages {
     }
 }
 
+/// What one render pool of the smallest size takes of the shared lower
+/// window, with its guard.
+pub(crate) const RENDER_POOL_SPAN: u64 =
+    (TABLE_SIZE + RENDER_BLOCKS * FREE_LIST_BLOCK_SIZE + mmu::UAT_PGSZ) as u64;
+
 /// Pool-object identities are independent of recycled firmware IDs and VAs.
 static RENDER_POOL_SERIAL: AtomicU64 = AtomicU64::new(0);
 
@@ -577,8 +582,9 @@ impl RenderStorage {
 
 /// A render pool retained by a logical context and every graph referencing it.
 /// Its backing can be given back while the pool's free-list release has been
-/// consumed and the client VM is evicted; a fresh backing is installed before
-/// the pool is staged again.
+/// consumed: when the client VM is evicted, or when its queue is idle and the
+/// shared window is short. A fresh backing is installed before the pool is
+/// staged again.
 pub(crate) struct RenderPool {
     storage: Arc<RenderStorage>,
     /// Counts installed backings, so a re-armed backing is a new free-list

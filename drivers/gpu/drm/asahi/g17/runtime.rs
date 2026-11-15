@@ -1357,7 +1357,8 @@ pub(super) struct DeferredBatch {
     /// of vacated pools: unmapping and freeing happen in `finish`, off-lock.
     bindings: KVVec<super::queue::compute::Binding>,
     vacated: KVVec<super::queue::compute::Vacated>,
-    /// Backing of render pools vacated for evicted idle clients.
+    /// Backing of render pools vacated for evicted idle clients, or given back
+    /// by a capacity wait's reclaim.
     render: KVVec<super::freelist::RenderBacking>,
     /// Tiler-heap extensions removed from idle heaps, with their aliases.
     tvb: KVVec<super::buffer::TvbRelease>,
@@ -1379,6 +1380,13 @@ impl DeferredBatch {
     /// VM-wide settlement is a separate transaction before publishing its error.
     fn publication() -> Result<Self> {
         Self::with_capacity(2 * Self::DEPTH, 0)
+    }
+    /// The reclaim transaction of a capacity wait: also room for the backing of
+    /// every render pool it gives back, which `finish` frees off-lock.
+    fn reclaim() -> Result<Self> {
+        let mut batch = Self::publication()?;
+        batch.render = KVVec::with_capacity(crate::hw::t8140::queues::RENDER_SLOTS, GFP_KERNEL)?;
+        Ok(batch)
     }
     fn with_capacity(capacity: usize, detached: usize) -> Result<Self> {
         let render_slots = if detached != 0 {
@@ -1402,7 +1410,7 @@ impl DeferredBatch {
             drop(binding);
         }
     }
-    /// Room for one more vacated render backing; the worker vacates no more.
+    /// Room for one more vacated render backing; the caller vacates no more.
     pub(super) fn render_backing_room(&self) -> bool {
         self.render.len() < self.render.capacity()
     }
@@ -2825,11 +2833,35 @@ impl Backend {
         admission.check()
     }
 
+    /// The shared lower window refuses free-list backing, or has no room for one
+    /// more render pool: idle render pools are worth giving back. Never on M5,
+    /// which places and reclaims its pools by identity.
+    fn lower_window_short(&self) -> bool {
+        if self.context.is_m5() {
+            return false;
+        }
+        if super::freelist::lower_pressure() {
+            return true;
+        }
+        let uat = {
+            let state = self.shared.state.lock();
+            match (*state).as_deref() {
+                Some(firmware) => firmware.uat.clone(),
+                None => return false,
+            }
+        };
+        // Off the device mutex: this takes the address space's lock.
+        uat.kernel_lower_vm()
+            .capacity(crate::hw::t8140::dynamic::LOWER)
+            .is_ok_and(|(_, largest)| largest < super::freelist::RENDER_POOL_SPAN)
+    }
+
     /// Reclaim steps of a capacity wait that never sleep: observe consumed pool releases and,
     /// under backing pressure, give idle pools back.
     fn reclaim_capacity(&self, admission: &Admission<'_>, reclaim_backing: bool) -> Result {
         admission.check()?;
-        let mut deferred = DeferredBatch::publication()?;
+        let mut deferred = DeferredBatch::reclaim()?;
+        let pools = reclaim_backing && self.lower_window_short();
         let result: Result = (|| {
             // A short reclaim transaction obeys the same session/epoch gate as
             // publication. Never keep this lease while sleeping for capacity.
@@ -2847,7 +2879,7 @@ impl Backend {
             // Pool eviction addresses backing allocation pressure, not channel
             // occupancy. Normal idle expiry and the retained-pool cap still run
             // in the event worker for either kind of admission wait.
-            if reclaim_backing {
+            if pools {
                 firmware.queues.reclaim_idle_render_pools(&firmware.init, &mut deferred)?;
             }
             if reclaim_backing && !firmware.render_control_backpressured() {
@@ -2899,6 +2931,12 @@ mod shared_capacity_tests {
         assert_eq!(leases.len(), crate::mmu::MAX_EXECUTION_CONTEXTS as usize);
         // Every accepted logical render owner now has its physical pair; no
         // published identity was cancelled or retyped to achieve the fit.
+    }
+
+    #[test]
+    fn a_reclaim_has_room_for_the_render_pools_it_gives_back() {
+        assert!(!DeferredBatch::publication().unwrap().render_backing_room());
+        assert!(DeferredBatch::reclaim().unwrap().render_backing_room());
     }
 
     #[test]
