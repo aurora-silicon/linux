@@ -46,10 +46,10 @@ module_param(tb_forward_irq_hpd, bool, 0644);
 MODULE_PARM_DESC(tb_forward_irq_hpd,
 		 "Pass a Thunderbolt DP sink IRQ_HPD to the display firmware (default: on)");
 
-static bool tb_drop_replay;
+static bool tb_drop_replay = true;
 module_param(tb_drop_replay, bool, 0644);
 MODULE_PARM_DESC(tb_drop_replay,
-		 "Drop the sink IRQ_HPD replayed after a mode set instead of passing it (default: off)");
+		 "Drop the sink IRQ_HPD replayed after a mode set instead of passing it (default: on)");
 
 static unsigned int tb_irq_log_ms = 2000;
 module_param(tb_irq_log_ms, uint, 0644);

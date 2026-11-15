@@ -756,10 +756,10 @@ static void apple_dpin_irq_stop(struct apple_dpin_ctx *c)
 
 static void apple_dpin_diag(struct apple_dpin_ctx *c, unsigned int ms);
 
-static unsigned int dpin_diag_events = 3;
+static unsigned int dpin_diag_events = 20;
 module_param(dpin_diag_events, uint, 0644);
 MODULE_PARM_DESC(dpin_diag_events,
-		 "Sink IRQ_HPD events per tunnel that log the DP IN adapter for 300 ms (default: 3)");
+		 "Sink IRQ_HPD events per tunnel that log the DP IN adapter for 300 ms (default: 20)");
 
 /* On dp_wq, ordered with bring-up and teardown: the binding is stable. */
 static void apple_dpin_event_fn(struct work_struct *work)
