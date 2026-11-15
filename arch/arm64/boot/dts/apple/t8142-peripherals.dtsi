@@ -226,11 +226,37 @@
 		status = "disabled";
 	};
 
+	/* ADT dart-jpeg: one DART for both engines, jpeg0 on SID 0, jpeg1 on SID 1. */
 	jpeg_dart: iommu@301020000 {
 		compatible = "apple,t8142-dart", "apple,t8110-dart";
 		reg = <0x3 0x1020000 0x0 0xc000>;
 		interrupts = <AIC_IRQ 1157 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		/* ADT vm-base 0x100_0000_0000, vm-size 0x300_0000_0000 */
+		apple,dma-range = <0x100 0x0 0x300 0x0>;
+		power-domains = <&ps_jpg>;
+		status = "disabled";
+	};
+
+	/*
+	 * ADT jpeg0/jpeg1 ("jpeg,t8101", hw-type 0x110010). Their power-gates
+	 * JPG0-V/JPG1-V are virtual PMGR entries under JPG.
+	 */
+	jpeg0: jpeg@301000000 {
+		compatible = "apple,t8142-jpeg", "apple,jpeg";
+		reg = <0x3 0x1000000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 1156 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&jpeg_dart 0>;
+		power-domains = <&ps_jpg>;
+		status = "disabled";
+	};
+
+	jpeg1: jpeg@301060000 {
+		compatible = "apple,t8142-jpeg", "apple,jpeg";
+		reg = <0x3 0x1060000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 1159 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&jpeg_dart 1>;
+		power-domains = <&ps_jpg>;
 		status = "disabled";
 	};
 
@@ -529,6 +555,16 @@
 };
 
 &pmgr {
+	/* ADT pmgr device JPG (id 64), parent AFISOCNI1 (no power state). */
+	ps_jpg: power-controller@2a0 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2a0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "jpg";
+		status = "disabled";
+	};
+
 	/* ADT pmgr device ANE_SYS (id 73), parent AFISOCNI3 (no power state). */
 	ps_ane_sys: power-controller@2e8 {
 		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";

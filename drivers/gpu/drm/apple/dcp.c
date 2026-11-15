@@ -8955,6 +8955,13 @@ static int dcp_platform_suspend(struct device *dev)
 	if (dcp_takeover_was_aborted(dcp))
 		return -EBUSY;
 
+	/*
+	 * An external DCP given up at probe may never have set up the works
+	 * below, and one given up has nothing to put down.
+	 */
+	if (READ_ONCE(dcp->ext_dead))
+		return 0;
+
 	/* A firmware start from the last resume finishes first; this sleep stops it again. */
 	flush_work(&dcp->s2r_prewarm_work);
 	cancel_delayed_work_sync(&dcp->s2r_prewarm_off_wq);
@@ -8991,8 +8998,6 @@ static int dcp_platform_suspend(struct device *dev)
 		dev_warn(dev, "native26 refuses non-s2idle target %d\n", pm_suspend_target_state);
 		return -EBUSY;
 	}
-	if (READ_ONCE(dcp->ext_dead))
-		return 0;
 	iomfb_v14_7_backlight_suspend(dcp);
 
 	/* Serialize PM against explicit bring-up, including queued startup work.
