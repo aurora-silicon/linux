@@ -83,8 +83,9 @@ impl KernelObject {
         let mapping = match placement {
             Placement::At(addr) => self.obj.map_at(vm, addr, prot, false)?,
             Placement::In(range, align) => {
-                let site = if range.start >= crate::hw::t8140::dynamic::LOWER.start
-                    && range.end <= crate::hw::t8140::dynamic::LOWER.end {
+                // The pool window of either split; client-private windows end past it.
+                let site = if range.start >= crate::hw::t8140::dynamic::WIDE_LOWER.start
+                    && range.end <= crate::hw::t8140::dynamic::WIDE_LOWER.end {
                     super::capacity::Site::LowerVa
                 } else {
                     super::capacity::Site::UpperVa
@@ -431,7 +432,7 @@ impl Allocator<'_> {
             return Err(EINVAL);
         }
         let mut object = KernelObject::backing(self.dev, size, cpu)?;
-        let mut range = crate::hw::t8140::dynamic::LOWER;
+        let mut range = self.uat.kernel_lower_dynamic_range();
         let mut searching = false;
         loop {
             // Keep ordinary best-fit placement on the uncontended path. A

@@ -233,6 +233,12 @@ pub(crate) struct UatQuirks {
     /// Store GPU-only mappings of client and kernel-lower tables as AP 0 with the access in
     /// PXN (read) and UXN (write), the form the firmware itself uses, instead of AP 2.
     pub(crate) native_gpu_permissions: bool,
+    /// Keep the shared pool window and the client-private window at their original split
+    /// (`hw::t8140::dynamic::LOWER`, `CLIENT_LOWER`) instead of the A18 Pro's
+    /// (`WIDE_LOWER`, `WIDE_CLIENT_LOWER`), which holds the render pools of every execution
+    /// context at once. The M4 Pro/Max could also use the wider pool window, for its larger
+    /// compute pools.
+    pub(crate) narrow_pool_window: bool,
 }
 
 impl UatQuirks {
@@ -245,6 +251,7 @@ impl UatQuirks {
         handoff_slot: 0,
         handoff_unk2: 0,
         native_gpu_permissions: false,
+        narrow_pool_window: false,
     };
 }
 
@@ -411,12 +418,26 @@ pub(crate) fn client_private_high_water() -> u64 {
 }
 
 /// Where client-private aliases are placed: [`layout::CLIENT_PRIVATE_RANGE`] on M5,
-/// outside every Mesa window; the A18 Pro's arena otherwise.
-pub(crate) fn client_private_range(m5: bool) -> Range<u64> {
+/// outside every Mesa window; the SoC's arena next to the shared pool window otherwise.
+fn client_private_range(m5: bool, narrow_pool_window: bool) -> Range<u64> {
     if m5 {
         layout::CLIENT_PRIVATE_RANGE
-    } else {
+    } else if narrow_pool_window {
         crate::hw::t8140::dynamic::CLIENT_LOWER
+    } else {
+        crate::hw::t8140::dynamic::WIDE_CLIENT_LOWER
+    }
+}
+
+/// The shared window of canonical lower objects (render and compute pools and the small
+/// mappings of hardware queues) next to [`client_private_range`].
+fn pool_window(m5: bool, narrow_pool_window: bool) -> Range<u64> {
+    if m5 {
+        layout::CANONICAL_RANGE
+    } else if narrow_pool_window {
+        crate::hw::t8140::dynamic::LOWER
+    } else {
+        crate::hw::t8140::dynamic::WIDE_LOWER
     }
 }
 
@@ -1208,8 +1229,10 @@ pub(crate) struct Vm {
     gpuvm: ARef<gpuvm::GpuVm<VmInner>>,
     dummy_obj: ARef<gem::Object>,
     binding: Arc<Mutex<VmBinding>>,
-    /// Bytes of the client-private window ([`client_private_range`]) this VM has mapped.
+    /// Bytes of the client-private window ([`Vm::client_private_range`]) this VM has mapped.
     private_bytes: Arc<AtomicU64>,
+    /// [`UatQuirks::narrow_pool_window`].
+    narrow_pool_window: bool,
 }
 no_debug!(Vm);
 
@@ -2445,6 +2468,7 @@ impl Vm {
     ) -> Result<Vm> {
         let dummy_obj = gem::new_kernel_object(&dev, UAT_PGSZ)?;
         let is_kernel = ttb.is_some();
+        let narrow_pool_window = uat_inner.quirks.narrow_pool_window;
 
         let page_table = if let Some(ttb) = ttb {
             UatPageTable::new_with_ttb(
@@ -2541,6 +2565,7 @@ impl Vm {
             dummy_obj: dummy_obj.gem.clone(),
             binding,
             private_bytes: Arc::new(AtomicU64::new(0), GFP_KERNEL)?,
+            narrow_pool_window,
         })
     }
 
@@ -2548,6 +2573,11 @@ impl Vm {
     #[cfg_attr(not(any(CONFIG_DRM_ASAHI_M5, CONFIG_DRM_ASAHI_G18)), allow(dead_code))]
     pub(crate) fn kernel_range(&self) -> Range<u64> {
         self.kernel_range.clone()
+    }
+
+    /// Where this client VM's private aliases are placed.
+    pub(crate) fn client_private_range(&self) -> Range<u64> {
+        client_private_range(self.m5, self.narrow_pool_window)
     }
 
     /// Attach a status before sharing a newly created user VM with queues.
@@ -2863,7 +2893,7 @@ impl Vm {
                 _gem: None,
                 offset: object_range.start,
                 mapped_size: size,
-                private: (range == client_private_range(self.m5))
+                private: (range == self.client_private_range())
                     .then(|| self.private_bytes.clone()),
             },
             reserved_size as u64,
@@ -4009,11 +4039,12 @@ impl Uat {
     /// Canonical lower objects are aliased into every owning client VM.
     /// Sparse VA reservation has no physical-memory cost.
     pub(crate) fn kernel_lower_dynamic_range(&self) -> Range<u64> {
-        if self.is_m5() {
-            layout::CANONICAL_RANGE
-        } else {
-            crate::hw::t8140::dynamic::LOWER
-        }
+        pool_window(self.is_m5(), self.inner.quirks.narrow_pool_window)
+    }
+
+    /// Where client VMs of this UAT place their private aliases ([`Vm::client_private_range`]).
+    pub(crate) fn client_private_range(&self) -> Range<u64> {
+        client_private_range(self.is_m5(), self.inner.quirks.narrow_pool_window)
     }
 
     /// The MMU's arenas an M5 client VM keeps from userspace binds, even while they
