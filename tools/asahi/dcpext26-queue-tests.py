@@ -3,6 +3,7 @@
 """Exercise production queue, preparation and reference release with mock DRM/RPCs."""
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 r = Path(__file__).resolve().parents[2]
 s = (r / 'drivers/gpu/drm/apple/iomfb.c').read_text()
@@ -73,13 +74,14 @@ struct apple_dcp;
 struct iomfb_transaction {struct list_head link;void (*start)(struct apple_dcp *,struct iomfb_transaction *);void (*release)(struct iomfb_transaction *);bool brightness_only,presentation,completed,backlight_failed;};
 struct iomfb_scanout_h17p {int request;struct drm_framebuffer *fb[4];struct list_head link;};
 struct apple_dcp {
- void *dev;bool s2r_scanout_stale,s2r_scanout_hold;
+ void *dev;bool s2r_scanout_stale,s2r_scanout_hold,sleep_v27_closed;
  struct {int lock,timeout,backlight_retry,callback_count;void *owner;unsigned long deadline;unsigned queued;bool presentation_paused,backlight_queued,stopped;struct work_struct work;struct list_head pending,dropped;struct iomfb_transaction *active;struct iomfb_scanout_h17p *scanout,*next_scanout;} iomfb;
  struct {bool pending;} present_state_h17p;struct {bool valid;} mode_state;struct {bool connected;} *connector;
  struct {void *data;} chunks;bool native,crashed,ext26_control_pending,ext26_blanked,ext26_normal,ext26_early_complete;
  unsigned ext26_epochs;u64 ext26_retained_bytes;struct list_head ext26_retained;
  int fw_compat;struct work_struct vblank_wq,bl_update_wq;
 };
+static void iomfb_v27_sleep_start(struct apple_dcp *d, struct iomfb_transaction *t) { }
 #define DCP_FIRMWARE_V_27_0 27
 static bool dcp_is_ext26(struct apple_dcp *d){return d->native;}
 static bool iomfb_channels_idle(struct apple_dcp *d){return true;}
@@ -105,6 +107,12 @@ static void setup(struct apple_dcp *d){
  static typeof(*d->connector) conn={.connected=true};d->connector=&conn;
 }
 int main(void){
+ struct apple_dcp closed={0};setup(&closed);closed.sleep_v27_closed=true;
+ struct iomfb_transaction ordinary={0}, sleep={.start=iomfb_v27_sleep_start};
+ INIT_LIST_HEAD(&ordinary.link);INIT_LIST_HEAD(&sleep.link);
+ assert(iomfb_queue(&closed,&ordinary)==-EBUSY && closed.iomfb.queued==0);
+ assert(iomfb_queue(&closed,&sleep)==0 && closed.iomfb.queued==1);
+ list_del(&sleep.link);closed.iomfb.queued=0;
  struct apple_dcp d={0};setup(&d);struct drm_crtc c={0};
  struct obj o={32ULL<<20};struct drm_framebuffer fb={.obj={&o},.refs=1};
  struct drm_atomic_commit s={.refs=1,.count=1,.new={{.crtc=&c,.visible=true,.fb=&fb}}};
@@ -151,11 +159,16 @@ int main(void){
  assert(fb.refs==1&&s.refs==1);
 }
 '''
+if '--drop-v27-close' in sys.argv:
+    assert code.count('READ_ONCE(dcp->sleep_v27_closed)') == 1
+    code = code.replace('READ_ONCE(dcp->sleep_v27_closed)', 'false')
 with tempfile.TemporaryDirectory() as t:
     p = Path(t) / 'queue.c'
     p.write_text(code)
     subprocess.run(['clang', '-std=gnu11', '-Wall', '-Werror',
                     '-Wno-unused-function', '-Wno-unused-variable',
                     '-fsanitize=address,undefined', str(p), '-o', str(p.with_suffix(''))], check=True)
-    subprocess.run([str(p.with_suffix(''))], check=True)
+    result = subprocess.run([str(p.with_suffix(''))])
+    if result.returncode:
+        sys.exit(1)
 print('PASS production queue/start/prepare/advance/release: 30 epochs, budget refusal, inherited refs, native/classic allocation failure, exposed failed present')

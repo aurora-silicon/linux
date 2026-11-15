@@ -58,7 +58,9 @@ struct typec_mux { struct typec_mux_context *context; struct typec_mux_state tra
 struct connector { bool connected; };
 struct apple_dcp { int external_lock,external_error; bool external_cable,external_stopped; struct { bool connected; } dptxport[1]; void *hdmi_hpd; bool active; bool external,typec_cable_connected; void *dev; struct connector *typec_connector; bool ext_backlight; };
 struct apple_dcp_typec_route;
-struct apple_dcp_typec_port { int link; void *connector_np; struct apple_dcp_typec_route *owner,*target,*secondary_target,*preferred_route; void *applied_alt; unsigned long applied_mode; unsigned applied_status,applied_conf; bool applied_valid,safe_pending,safe_finish_ready,dp_wanted,dp_hpd,hpd,busy_noted; };
+struct apple_dcp_typec_port { int link; void *connector_np; struct apple_dcp_typec_route *owner,*target,*secondary_target,*preferred_route; void *applied_alt; unsigned long applied_mode; unsigned applied_status,applied_conf; bool applied_valid,safe_pending,safe_finish_ready,dp_wanted,dp_hpd,hpd,busy_noted;
+    /* Held for a J714s firmware 27 sleep (dcp_fabric_sleep_release()): never here. */
+    bool sleep_held,sleep_withdrawn; };
 struct apple_dcp_typec_route { struct apple_dcp_typec_port *port; struct apple_dcp *dcp; void *xbar; bool deactivate_xbar_done; int deactivate_error; bool selected,tunnel; };
 static int dcp_typec_fabric_lock,dcp_typec_ports,deactivate_calls;
 struct drm_device { int unused; };

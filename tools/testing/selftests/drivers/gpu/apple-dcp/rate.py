@@ -551,7 +551,8 @@ struct apple_epic { struct apple_dcp *dcp; unsigned endpoint; bool wire_v2; };
 struct apple_epic_service { struct apple_epic *ep; void *cookie; bool enabled; };
 struct dptx_port { u32 lane_count, link_rate; bool enabled, closed, connected; void *atcphy; struct apple_epic_service *service; bool tile_hint; u32 tile_width, tile_height; };
 struct apple_dcp {
-    struct { int iomfb_method_profile; bool fw_14_7_endpoints; } hw;
+    /* link_report: the link line of T6050's external processors; none is one here. */
+    struct { int iomfb_method_profile; bool fw_14_7_endpoints, link_report; } hw;
     struct { bool lock, attributes_valid, timing_valid, hpd_seen; struct dcp_metadata_epoch epoch; struct dcp_metadata_ticket catalog_ticket;
         u64 catalog_connection_sequence; } metadata;
     struct { bool lock, enabled; void *service; u64 epoch; } dcpavserv;
@@ -873,6 +874,14 @@ static int __attribute__((unused)) dcp_direct_crossbar_link(struct apple_dcp *d,
         'bool dcpavserv_edid_current(', 'bool dcpavserv_edid_service_current(',
     ])
     mode_helpers = iomfb[iomfb.index('static struct dcp_display_mode *dcp_modes_snapshot('):iomfb.index('int dcp_get_modes(')]
+    # The link line of a processor whose hardware description asks for it
+    # (hw.link_report, T6050's external ones): no processor here does.
+    if 'void dcp_link_report(' in mode_helpers:
+        mode_helpers = mode_helpers.replace(block(mode_helpers, 'void dcp_link_report('), '')
+    if 'static void dcp_note_edid(' in mode_helpers:
+        mode_helpers = mode_helpers.replace(block(mode_helpers, 'static void dcp_note_edid('),
+            'static void dcp_note_edid(struct apple_connector *c,const struct drm_edid *e)\n'
+            '{ (void)c;(void)e;assert(!"EDID identity noted without a link report"); }')
     # The catalogue owner check, hotplug queueing, connector EDID helpers and
     # property bounds the catalogue helpers use, all actual.
     property_header = base/'dcp-property.h'

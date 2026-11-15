@@ -357,6 +357,13 @@ def check(root, output):
     }
     '''
     af=(root/'drivers/gpu/drm/apple/afk.c').read_text()
+    if 'atomic_inc(&ep->sleep_jobs);' in af:
+        # The receive jobs a firmware sleep waits for; nothing here waits.
+        anchor='struct apple_dcp_afkep { u8 *command_tags;int started,stopped;'
+        assert queued.count(anchor)==1
+        queued=queued.replace(anchor,'typedef int atomic_t;\n'
+                              '#define atomic_inc(p) ((void)++*(p))\n'
+                              '#define atomic_dec_return_release(p) (--*(p))\n'+anchor+'atomic_t sleep_jobs;',1)
     if 'static bool afk_compact_capable(' in af:
         # The desktop 26.x ring messages and compact state; the actual
         # capability check keeps this H17P endpoint on the classic path.
