@@ -165,6 +165,9 @@ ASAHI_TESTS = {
     'g17-firmware-selection-tests.py': [([], PASS)],
     'g17-growth-gate-tests.py': [([], PASS)],
     'g17-growth-tests.py': [([], PASS)],
+    'g17-object-fence-tests.py': [([], PASS)]
+        + mutations('--mutation', ('overrun-work-states', 'unseen-strict', 'retain-not-sticky',
+                                   'node-unmarked', 'no-release'), []),
     'g17-owner-release-order-tests.py': [([], PASS)],
     'g17-pool-release-tests.py': [([], PASS)],
     'g17-resource-tests.py': [([], PASS)],
