@@ -112,6 +112,11 @@ impl Allowance {
         self.ms > DEFAULT_ALLOWANCE_MS
     }
 
+    /// How long ago the job reached the head of its queue, as the watchdog counts it, in ms.
+    pub(crate) fn at_head_ms(&self, now: u64) -> Option<u64> {
+        Some(now.saturating_sub(self.head_since?) / 1_000_000)
+    }
+
     /// Whether a [`Self::renew`] at an expiry that finds the job `published` places it after a
     /// wait in publication: the one poll even the default allowance renews.
     pub(crate) fn placing_after_wait(&self, published: bool) -> bool {
@@ -192,6 +197,93 @@ pub(crate) fn renew_shared(published: bool, shared: bool, renewals: &mut u8) -> 
 pub(crate) fn count_allowance_poll(beyond_default: bool, renewals: &mut u8) {
     if beyond_default {
         *renewals = renewals.saturating_add(1).min(SHARED_RENEWALS);
+    }
+}
+
+/// What the watchdog had granted a job when it stopped renewing it: the one line that says why
+/// a job was failed as timed out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GaveUp {
+    /// The job's allowance, ms.
+    allowance_ms: u32,
+    /// Since the job reached the head of its queue, ms.
+    at_head_ms: Option<u64>,
+    /// Execution renewals used; `None` for a job that is not long work.
+    execution: Option<u8>,
+    /// Shared renewals used; `None` where the GPU's watchdog does not renew for sharing.
+    shared: Option<u8>,
+    /// Since a command last retired, ms, as the last sharing renewal saw it; `None` if none has.
+    since_retired_ms: Option<u64>,
+    /// Polls deferred behind older work or a pending transaction.
+    deferred: u8,
+    /// Polls excused behind other VMs' work that was within its allowance.
+    excused: u32,
+    /// Spared behind another VM's work instead of failed as its own.
+    spared: bool,
+}
+
+impl GaveUp {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        allowance: &Allowance,
+        now: u64,
+        long_job: bool,
+        execution: u8,
+        renews_shared: bool,
+        shared: u8,
+        since_retired: Option<u64>,
+        deferred: u8,
+        excused: u32,
+        decision: Decision,
+    ) -> Self {
+        Self {
+            allowance_ms: allowance.ms,
+            at_head_ms: allowance.at_head_ms(now),
+            execution: long_job.then_some(execution),
+            shared: renews_shared.then_some(shared),
+            since_retired_ms: since_retired.map(|ns| ns / 1_000_000),
+            deferred,
+            excused,
+            spared: decision == Decision::Spare,
+        }
+    }
+
+    fn describe(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "allowance {} ms", self.allowance_ms)?;
+        if let Some(ms) = self.at_head_ms {
+            write!(f, ", at the head of its queue for {ms} ms")?;
+        }
+        match self.execution {
+            Some(used) => write!(f, "; long-work renewals {used}/{EXECUTION_RENEWALS}")?,
+            None => write!(f, "; not long work")?,
+        }
+        match self.shared {
+            Some(used) => write!(f, "; sharing renewals {used}/{SHARED_RENEWALS}")?,
+            None => write!(f, "; no sharing renewals on this GPU")?,
+        }
+        match self.since_retired_ms {
+            Some(ms) => write!(f, ", last command retired {ms} ms ago")?,
+            None => write!(f, ", no command retired yet")?,
+        }
+        write!(
+            f,
+            "; deferred {} polls behind older or pending work, excused {} polls behind other \
+             clients' allowed work; {}",
+            self.deferred,
+            self.excused,
+            if self.spared {
+                "failed, spared behind another client's work"
+            } else {
+                "failed as its own"
+            },
+        )
+    }
+}
+
+#[cfg(not(test))]
+impl kernel::fmt::Display for GaveUp {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.describe(f)
     }
 }
 
@@ -768,5 +860,71 @@ mod tests {
         let own = head(5, 101, false);
         assert_eq!(classify(own, 0, [head(5, 100, false), head(7, 100, true), head(7, 101, false), head(7, 102, false)].into_iter()), Decision::Own);
         assert_eq!(classify(head(5, 101, true), 0, [head(7, 100, false)].into_iter()), Decision::Own);
+    }
+    #[test]
+    fn giving_up_says_what_the_watchdog_had_granted() {
+        let mut allowance = Allowance::new(DEFAULT_ALLOWANCE_MS);
+        // Placed at the first expiry, one poll after it reached the head.
+        assert!(!allowance.renew(true, 10_000 * MS));
+        let plain = GaveUp::new(&allowance, 12_000 * MS, false, 0, false, 0, None, 0, 0, Decision::Own);
+        assert_eq!(plain, GaveUp {
+            allowance_ms: DEFAULT_ALLOWANCE_MS,
+            at_head_ms: Some(4_000),
+            execution: None,
+            shared: None,
+            since_retired_ms: None,
+            deferred: 0,
+            excused: 0,
+            spared: false,
+        });
+        // Long work on a GPU whose watchdog renews for sharing, spared behind another client.
+        let long = GaveUp::new(&allowance, 40_000 * MS, true, EXECUTION_RENEWALS, true,
+            SHARED_RENEWALS, Some(6_200 * MS), MAX_RENEWALS, 3, Decision::Spare);
+        assert_eq!(long.execution, Some(EXECUTION_RENEWALS));
+        assert_eq!(long.shared, Some(SHARED_RENEWALS));
+        assert_eq!(long.since_retired_ms, Some(6_200));
+        assert_eq!((long.deferred, long.excused, long.spared), (MAX_RENEWALS, 3, true));
+        // A job no expiry has placed yet has no time at the head.
+        assert_eq!(Allowance::new(DEFAULT_ALLOWANCE_MS).at_head_ms(5 * MS), None);
+        // The line itself.
+        assert!(shown(&plain) == *"allowance 2000 ms, at the head of its queue for 4000 ms; not long \
+            work; no sharing renewals on this GPU, no command retired yet; deferred 0 polls behind \
+            older or pending work, excused 0 polls behind other clients' allowed work; failed as its \
+            own");
+        assert!(shown(&long) == *"allowance 2000 ms, at the head of its queue for 32000 ms; \
+            long-work renewals 4/4; sharing renewals 14/14, last command retired 6200 ms ago; \
+            deferred 8 polls behind older or pending work, excused 3 polls behind other clients' \
+            allowed work; failed, spared behind another client's work");
+    }
+
+    /// The watchdog's line for `why`.
+    struct Line {
+        bytes: [u8; 320],
+        len: usize,
+    }
+    impl core::fmt::Write for Line {
+        fn write_str(&mut self, text: &str) -> core::fmt::Result {
+            let end = self.len + text.len();
+            self.bytes.get_mut(self.len..end).ok_or(core::fmt::Error)?.copy_from_slice(text.as_bytes());
+            self.len = end;
+            Ok(())
+        }
+    }
+    impl PartialEq<str> for Line {
+        fn eq(&self, other: &str) -> bool {
+            &self.bytes[..self.len] == other.as_bytes()
+        }
+    }
+    struct Shown<'a>(&'a GaveUp);
+    impl core::fmt::Display for Shown<'_> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            self.0.describe(f)
+        }
+    }
+    fn shown(why: &GaveUp) -> Line {
+        use core::fmt::Write;
+        let mut line = Line { bytes: [0; 320], len: 0 };
+        assert!(write!(line, "{}", Shown(why)).is_ok());
+        line
     }
 }

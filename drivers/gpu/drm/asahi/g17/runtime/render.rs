@@ -1125,9 +1125,9 @@ impl Registry {
 
     /// Gives back the USC backing of render pools whose client VM pressure
     /// reclaim evicted (an idle VM) and whose final free-list release was
-    /// consumed. The vacated backings go to the worker's deferred batch, which
-    /// frees them after the device mutex; a later job of that client re-arms
-    /// the pool first.
+    /// consumed, and of the pools that kept graphs still hold. The vacated
+    /// backings go to the worker's deferred batch, which frees them after the
+    /// device mutex; a later job of an evicted client re-arms its pool first.
     pub(in crate::g17) fn vacate_evicted_render_pools(
         &mut self,
         init: &crate::g17::initdata::InitData,
@@ -1146,6 +1146,20 @@ impl Registry {
                 continue;
             };
             if pool.vacant() || !render.pools.idle(pool.id()) || !pool.client_evicted() {
+                continue;
+            }
+            if let Some(backing) = pool.vacate() {
+                deferred.defer_render_backing(backing);
+            }
+        }
+        // A kept graph's pool is never staged again; its pages go back once
+        // its final free-list release is consumed.
+        for graph in render.kept_graphs.iter() {
+            if !deferred.render_backing_room() {
+                break;
+            }
+            let pool = graph.pool();
+            if pool.vacant() || !render.pools.released(u32::from(pool.id()), pool.control_va()) {
                 continue;
             }
             if let Some(backing) = pool.vacate() {

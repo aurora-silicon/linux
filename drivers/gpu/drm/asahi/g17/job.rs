@@ -371,6 +371,8 @@ pub(crate) trait Backend: Send + Sync {
     /// A published job's deadline may be renewed while other work retires
     /// ([`super::timeout::renew_shared`]).
     fn renews_shared(&self) -> bool { true }
+    /// The watchdog stopped renewing `packet`: it is failed as timed out next, if it is published.
+    fn gave_up(&self, _packet: &Arc<Packet>, _why: &super::timeout::GaveUp) {}
     /// Return true only after taking publication ownership and recording its result.
     fn try_early(&self, packet: &Arc<Packet>) -> bool;
     fn count_backlog(&self, packet: &Packet);
@@ -447,8 +449,10 @@ impl<B: Backend> sched::JobImpl for Job<B> {
         }
         // Other work retiring means the GPU is shared, not hung. So does another long job
         // running beside a long job, though neither retires until it ends.
-        let shared = job.backend.renews_shared()
-            && (super::timeout::retiring(super::recovery::since_retired(super::now_ns()))
+        let renews_shared = job.backend.renews_shared();
+        let since_retired = super::recovery::since_retired(super::now_ns());
+        let shared = renews_shared
+            && (super::timeout::retiring(since_retired)
                 || (job.packet.command.long_job() && job.backend.long_job_beside(&job.packet)));
         if super::timeout::renew_shared(job.packet.is_published(), shared, &mut job.shared_renewals) {
             return true;
@@ -462,7 +466,15 @@ impl<B: Backend> sched::JobImpl for Job<B> {
                 job.excused = job.excused.saturating_add(1);
                 true
             }
-            super::timeout::Decision::Own | super::timeout::Decision::Spare => false,
+            decision @ (super::timeout::Decision::Own | super::timeout::Decision::Spare) => {
+                // The sharing inputs are the ones the renewal above was decided on.
+                job.backend.gave_up(&job.packet, &super::timeout::GaveUp::new(
+                    &job.allowance, super::now_ns(), job.packet.command.long_job(),
+                    job.execution_renewals, renews_shared, job.shared_renewals, since_retired,
+                    job.victim_renewals, job.excused, decision,
+                ));
+                false
+            }
         }
     }
 

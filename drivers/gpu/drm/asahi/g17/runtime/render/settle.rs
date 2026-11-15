@@ -44,6 +44,8 @@ impl Backend {
             return Ok(());
         }
         if packet.is_published() {
+            // Not a watchdog's verdict: the queue went away before its work finished.
+            packet.completion.status().note_teardown_expired();
             self.timeout_render(packet)
         } else {
             // The outer callback already completed a successful 0 -> 3
@@ -90,7 +92,11 @@ impl crate::g17::Firmware {
                     .as_mut()
                     .and_then(|entry| entry.pair.as_mut())
                 {
-                    pair.report_timeout(stamps, state);
+                    if !packet.completion.status().unobserved_teardown(ETIMEDOUT)
+                        || crate::debug::debug_enabled(crate::debug::DebugFlags::VerboseFaults)
+                    {
+                        pair.report_timeout(stamps, state);
+                    }
                     pair.expire_stamp_wait(packet, stamps, state)?;
                 }
             }

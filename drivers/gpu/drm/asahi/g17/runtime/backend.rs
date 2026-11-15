@@ -371,6 +371,19 @@ impl job::Backend for Backend {
         };
     }
 
+    /// Says why the watchdog gave up on a published command, which the client's lost device
+    /// alone does not. The first few of a boot report; the rest would repeat them.
+    fn gave_up(&self, packet: &Arc<Packet>, why: &crate::g17::timeout::GaveUp) {
+        static REPORTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        if !packet.is_published() || REPORTED.fetch_add(1, Ordering::Relaxed) >= 8 {
+            return;
+        }
+        dev_warn!(self.shared.dev.as_ref(),
+            "G17: watchdog gave up on a {} command of owner {}: {}\n",
+            match packet.engine() { Engine::Compute => "compute", Engine::Render => "render" },
+            self.owner, why);
+    }
+
     /// Not on M5: a job that does not finish within its watchdog interval fails then, however
     /// recently other work retired. Its compute kill then follows the first expiry.
     fn renews_shared(&self) -> bool {
