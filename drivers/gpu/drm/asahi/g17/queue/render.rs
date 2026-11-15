@@ -1032,8 +1032,11 @@ impl Pair {
             },
             mcache,
             // M5 tiling kicks also retain the last event of the mask, except on the J813, whose
-            // macOS 27.0 TA and 3D kicks name no event at all.
-            event_mask: if m5 && stage == 0 && !j813 {
+            // macOS 27.0 TA and 3D kicks name no event at all. The J716C also runs its tiling
+            // kick ungated: the redundant entry-signal event adds a firmware round trip to a
+            // lone render and candidate 44 has qualified the zero-event form on this board.
+            event_mask: if m5 && stage == 0 && !j813
+                && !self.board.is_some_and(|board| board.clusters == 4) {
                 [0, 0, 0, 1u64 << 62]
             } else {
                 abi::RENDER_KICK_EVENT_MASK
