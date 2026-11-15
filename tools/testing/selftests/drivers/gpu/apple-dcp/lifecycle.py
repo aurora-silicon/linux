@@ -1221,12 +1221,16 @@ struct device_node { bool named; unsigned count; };
 struct device { struct device_node *of_node; };
 struct platform_device { struct device dev; int num_resources; struct resource resources[10]; };
 #define to_platform_device(d) ((struct platform_device *)(d))
+/* The profiles name their firmware-stop layout; this unit does not read it. */
+struct dcp_s2r_layout { int unused; };
+static const struct dcp_s2r_layout dcp_s2r_t8140;
 struct apple_dcp_hw_data {
     unsigned num_dptx_ports; bool adopt_live_session;
     int iomfb_method_profile,firmware_compat;
     const struct resource *firmware_clock;
     u32 firmware_display_windows,firmware_scratch,firmware_request;
     bool s2r,s2r_ext;
+    const struct dcp_s2r_layout *s2r_layout;
 };
 struct apple_dcp {
     struct device *dev; struct apple_dcp_hw_data hw;
