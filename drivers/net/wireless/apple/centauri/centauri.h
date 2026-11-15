@@ -6,6 +6,7 @@
 #include <linux/of.h>
 #include <linux/pci.h>
 #include <linux/sizes.h>
+#include <linux/workqueue.h>
 
 #define CEN_ALPHA_SCRATCH_OFFSET SZ_8M
 #define CEN_ALPHA_SCRATCH_SIZE (5 * SZ_1M)
@@ -18,6 +19,15 @@ struct cen_alpha_resources {
 	void __iomem *bar;
 	u32 index[4], mtr, mcr;
 };
+enum centauri_boot_phase {
+	CEN_BOOT_ROM,
+	CEN_BOOT_CYCLE,
+	CEN_BOOT_IPC,
+	CEN_BOOT_READY,
+	CEN_BOOT_FAILED,
+	CEN_BOOT_STOPPED,
+};
+
 struct centauri {
 	struct pci_dev *pdev;
 	void __iomem *bar;
@@ -35,6 +45,9 @@ struct centauri {
 	bool link_ready;
 	struct centauri_ipc *ipc;
 	struct centauri_wifi *wifi;
+	struct delayed_work boot_work;
+	enum centauri_boot_phase boot_phase;
+	bool removing;
 };
 
 /* One row per machine with an N1: the FTAB file name, the word written to BAR+0x807c,
