@@ -239,10 +239,15 @@
 		interrupt-names = "tx", "rx";
 		apple,fifo-size = <0x800>;
 		apple,helper-cpu = <&mtp>;
+		/*
+		 * ADT mtp function-afe-reset is the SMC pcIO template (0x10000, 0x11c0000),
+		 * the same line as SMC GPIO gp1c, active low, which gpio-macsmc drives, as
+		 * on the J714s. The MTP firmware does not reset the AFE on this board.
+		 */
+		apple,afe-reset-gpios = <&smc_gpio_low 28 GPIO_ACTIVE_LOW>;
 
 		multi-touch {
 			apple,power-method = <2>;
-			apple,firmware-managed-reset;
 			firmware-name = "apple/tpmtfw-j714c.bin";
 		};
 
