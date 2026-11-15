@@ -7790,12 +7790,13 @@ static void dcp_s2r_restart_failed_stop(struct apple_dcp *dcp);
 /*
  * Crashed firmware takes no stop sequence, and refusing would hold every later sleep off until
  * reboot. Its CPU stops cold, as for a failed start, and the wake starts it again, as macOS
- * recovers a crashed DCP. A system sleep only: DPMS off still refuses it.
+ * recovers a crashed DCP. A firmware-driven sleep only: DPMS off still refuses it, the DPMS
+ * off of a suspend-to-idle included.
  */
 static bool dcp_s2r_stops_crashed(struct apple_dcp *dcp)
 {
 	return READ_ONCE(dcp->crashed) && !IS_ERR_OR_NULL(dcp->rtk) &&
-	       pm_suspend_target_state != PM_SUSPEND_ON;
+	       pm_suspend_target_state != PM_SUSPEND_ON && pm_suspend_via_firmware();
 }
 
 static int dcp_s2r_stop_crashed(struct apple_dcp *dcp)
@@ -8558,11 +8559,17 @@ static void dcp_s2r_restart_failed_stop(struct apple_dcp *dcp)
 /*
  * DPMS on an internal panel with hw.s2r as macOS does a display sleep: the backlight to 0,
  * then the firmware stopped and the display domains off, and the reverse on wake. Not
- * during a system sleep: that path stops the firmware itself.
+ * during a firmware-driven system sleep: that path stops the firmware itself.
+ *
+ * A suspend-to-idle has no such path. Its CRTC goes off from the DRM device's suspend, which
+ * comes here as a DPMS off: without the power-off the firmware would run through the whole
+ * sleep unless the compositor had blanked the display first. The flag is only current while
+ * a sleep is under way.
  */
 static bool dcp_dpms_power_cycles(struct apple_dcp *dcp)
 {
-	return dcp_s2r_capable(dcp) && pm_suspend_target_state == PM_SUSPEND_ON;
+	return dcp_s2r_capable(dcp) &&
+	       (pm_suspend_target_state == PM_SUSPEND_ON || !pm_suspend_via_firmware());
 }
 
 static void __dcp_dpms_power_off(struct apple_dcp *dcp)
