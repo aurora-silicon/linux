@@ -9488,6 +9488,9 @@ static int dcp_platform_suspend(struct device *dev)
 	}
 
 	dcp_drain_for_sleep(dcp);
+	/* An EDR step must not kick a present once the mailbox is held. */
+	WRITE_ONCE(dcp->edr_ramping, false);
+	cancel_delayed_work_sync(&dcp->iomfb.edr_tick);
 	/*
 	 * The Type-C route reports cable removal through
 	 * dcp_dptx_disconnect_oob(). A DP tunnel kept through the sleep stays
