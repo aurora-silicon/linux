@@ -134,6 +134,8 @@ struct apple_smc {
 	bool saved_pending, saved_recovery, saved_wake;
 	int saved_fault, saved_notice_error, saved_restore_error;
 	u64 saved_unexpected;
+	/* WKTP left at its sleep value: written back once a wake is a full one. */
+	bool wake_silent;
 	/* To be told at the noirq suspend, after the debug link's cut. */
 	bool sleep_warn_late;
 	/* In a noirq phase: replies are polled for. */
