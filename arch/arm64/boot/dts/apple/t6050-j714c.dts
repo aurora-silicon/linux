@@ -15,6 +15,7 @@
 /dts-v1/;
 
 #define T6050_J714C
+#include <dt-bindings/leds/common.h>
 #include "t6050-max.dtsi"
 
 / {
@@ -205,6 +206,30 @@
  */
 &pinctrl_ap {
 	gpio-reserved-ranges = <0 80>, <81 25>, <108 113>;
+};
+
+/*
+ * The keyboard backlight, as on J714s: ADT arm-io/pwm0/kbd-backlight, the
+ * fpwm s5l8920x at 0x3_05040000 (0x5_05040000 here), default-hz 25000, so a
+ * 40000 ns period on channel 0.
+ */
+/ {
+	led-controller {
+		compatible = "pwm-leds";
+
+		led-0 {
+			pwms = <&fpwm0 0 40000>;
+			label = "kbd_backlight";
+			function = LED_FUNCTION_KBD_BACKLIGHT;
+			color = <LED_COLOR_ID_WHITE>;
+			max-brightness = <255>;
+			default-state = "keep";
+		};
+	};
+};
+
+&fpwm0 {
+	status = "okay";
 };
 
 /*
