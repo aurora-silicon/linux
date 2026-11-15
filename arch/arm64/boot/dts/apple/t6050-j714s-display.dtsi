@@ -305,6 +305,13 @@
 	interrupt-names = "dpin0", "dpin1", "dpin2", "dpin3";
 };
 
+/* The left-front router's DP IN interrupts (atc1-dpin0..3, as in the T6050 inventory and J716c) */
+&acio1 {
+	interrupts = <AIC_IRQ 0 1635 IRQ_TYPE_LEVEL_HIGH>, <AIC_IRQ 0 1636 IRQ_TYPE_LEVEL_HIGH>,
+		     <AIC_IRQ 0 1641 IRQ_TYPE_LEVEL_HIGH>, <AIC_IRQ 0 1642 IRQ_TYPE_LEVEL_HIGH>;
+	interrupt-names = "dpin0", "dpin1", "dpin2", "dpin3";
+};
+
 /* The right router's suppliers, disabled in the inventory */
 &ps_atc2_cio {
 	status = "okay";
