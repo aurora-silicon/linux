@@ -987,16 +987,29 @@ impl VmInner {
         self.page_table.ttb()
     }
 
-    /// Invalidate a VA range of this Vm's address space in the TLB of one ASID.
+    /// The VA range starting at `iova`, and its mirror copy if it overlaps the page table's
+    /// mirrored window ([`UatPageTable::set_mirror`]).
+    fn with_mirror_copy(&self, iova: u64, size: usize) -> [Option<(u64, usize)>; 2] {
+        let copy = self
+            .page_table
+            .mirrored(&(iova..iova.saturating_add(size as u64)))
+            .map(|(copy, _)| (copy.start, (copy.end - copy.start) as usize));
+        [Some((iova, size)), copy]
+    }
+
+    /// Invalidate a VA range of this Vm's address space, and its mirror copy, in the TLB of one
+    /// ASID.
     fn tlbi_range(&self, asid: u8, iova: u64, size: usize) {
-        match self.uat_inner.firmware {
-            UatFirmware::Handoff => mem::tlbi_range(asid, iova as usize, size),
-            UatFirmware::PublishedRoots { .. } => {
-                mem::tlbi_range_or_asid(asid, iova as usize, size)
+        for (iova, size) in self.with_mirror_copy(iova, size).into_iter().flatten() {
+            match self.uat_inner.firmware {
+                UatFirmware::Handoff => mem::tlbi_range(asid, iova as usize, size),
+                UatFirmware::PublishedRoots { .. } => {
+                    mem::tlbi_range_or_asid(asid, iova as usize, size)
+                }
+                // T8152: the per-page range encoding module 1134 issues.
+                #[cfg(CONFIG_DRM_ASAHI_G18)]
+                UatFirmware::NoPeerRoots { .. } => mem::tlbi_range(asid, iova as usize, size),
             }
-            // T8152: the per-page range encoding module 1134 issues.
-            #[cfg(CONFIG_DRM_ASAHI_G18)]
-            UatFirmware::NoPeerRoots { .. } => mem::tlbi_range(asid, iova as usize, size),
         }
     }
 
@@ -1045,12 +1058,15 @@ impl VmInner {
             return;
         }
         let no_peer = self.uat_inner.firmware.is_no_peer();
+        let ranges = self.with_mirror_copy(iova, size);
         for ctx in 0..UAT_NUM_CTX {
             if contexts & (1 << ctx) != 0 {
-                if no_peer {
-                    mem::tlbi_range(ctx as u8, iova as usize, size);
-                } else {
-                    mem::tlbi_range_or_asid(ctx as u8, iova as usize, size);
+                for (iova, size) in ranges.into_iter().flatten() {
+                    if no_peer {
+                        mem::tlbi_range(ctx as u8, iova as usize, size);
+                    } else {
+                        mem::tlbi_range_or_asid(ctx as u8, iova as usize, size);
+                    }
                 }
             }
         }
@@ -2667,6 +2683,12 @@ impl Vm {
             .page_table
             .covers_range(start..end, read, write)
             .unwrap_or(false)
+    }
+
+    /// Writes every leaf of `window` also at `window + offset` ([`UatPageTable::set_mirror`]).
+    /// Call before anything in `window` is mapped.
+    pub(crate) fn mirror_window(&self, window: Range<u64>, offset: u64) -> Result {
+        self.gpuvm.lock_inner().page_table.set_mirror(window, offset)
     }
 
     pub(crate) fn covers_range(&self, address: u64, size: u64, read: bool, write: bool) -> bool {

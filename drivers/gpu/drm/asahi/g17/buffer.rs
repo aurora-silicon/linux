@@ -391,7 +391,9 @@ impl Tvb {
         if geometry == BlockGeometry::NEO {
             return Self::bytes(blocks);
         }
-        geometry.backing_bytes(blocks)
+        // Every M5 block, the last included, carries its trailing backing.
+        geometry.backing_bytes(blocks)?;
+        blocks.checked_mul(geometry.backing_stride).ok_or(EOVERFLOW)
     }
     fn map_block(
         object: &KernelObject,
@@ -400,11 +402,12 @@ impl Tvb {
         geometry: BlockGeometry,
     ) -> Result<mmu::KernelMapping> {
         if geometry != BlockGeometry::NEO {
+            // The block and its trailing backing, with no unmapped guard: the M5 fragment
+            // pipeline reads past a block's end.
             let start = relative.checked_mul(geometry.backing_stride).ok_or(EOVERFLOW)?;
-            let source = start..start.checked_add(geometry.block_bytes).ok_or(EOVERFLOW)?;
-            let guard = geometry.stride - geometry.block_bytes;
+            let source = start..start.checked_add(geometry.backing_stride).ok_or(EOVERFLOW)?;
             let mapping = object.map_range(vm, source, geometry.base..geometry.end,
-                BlockGeometry::PAGE as u64, mmu::PROT_GPU_SHARED_RW, guard)?;
+                BlockGeometry::PAGE as u64, mmu::PROT_GPU_SHARED_RW, 0)?;
             geometry.compact_page(mapping.iova())?;
             return Ok(mapping);
         }
@@ -1045,19 +1048,26 @@ pub(crate) struct PreparedGrowth {
     descriptor: Option<[u32; 4]>,
 }
 impl Manager {
-    /// Validate every retained sparse block and its reserved trailing guard in
-    /// one VM snapshot before constructing more aliases.
+    /// Validate every retained sparse block (on NEO with its reserved trailing
+    /// guard, on M5 with its trailing backing) before constructing more aliases.
     pub(crate) fn validate_vm(&self, vm: &mmu::Vm) -> Result {
         let geometry = self.tvb.geometry;
         let minimum = if geometry == BlockGeometry::NEO { cfg::TVB_INITIAL_PAGES.len() } else { 1 };
-        if self.blocks() < minimum
-            || self.blocks() > geometry.max_blocks()
-            || !vm.covers_sparse_blocks_with_guards(
+        if self.blocks() < minimum || self.blocks() > geometry.max_blocks() {
+            return Err(EFAULT);
+        }
+        let covered = if geometry == BlockGeometry::NEO {
+            vm.covers_sparse_blocks_with_guards(
                 self.tvb.addresses(),
                 geometry.block_bytes as u64,
                 geometry.stride as u64,
             )
-        {
+        } else {
+            self.tvb.addresses().iter().all(|&address| {
+                vm.covers_range(address, geometry.backing_stride as u64, true, true)
+            })
+        };
+        if !covered {
             return Err(EFAULT);
         }
         Ok(())
