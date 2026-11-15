@@ -15,6 +15,7 @@
 #include <linux/seq_file.h>
 #include <linux/sizes.h>
 #include <linux/unaligned.h>
+#include <linux/workqueue.h>
 
 #include "centauri.h"
 
@@ -156,40 +157,48 @@ release:
 	return ret;
 }
 
-static ssize_t centauri_boot_write(struct file *file, const char __user *buffer,
-				  size_t count, loff_t *pos)
+static void centauri_boot_worker(struct work_struct *work)
 {
-	struct centauri *c = file->private_data;
-	u32 value;
-	int ret = kstrtou32_from_user(buffer, count, 0, &value);
+	struct centauri *c = container_of(to_delayed_work(work), struct centauri, boot_work);
+	int ret;
 
-	if (ret || value < 1 || value > 3)
-		return ret ?: -EINVAL;
 	mutex_lock(&c->boot_lock);
-	if (value == 1) {
-		ret = centauri_rom_boot(c);
-	} else if (value == 3) {
-		ret = centauri_start_ipc(c);
-	} else if (!c->firmware || !c->link_ready || readl(c->bar + 0x8000) != 4) {
-		ret = -EBUSY;
-	} else {
-		c->link_ready = false;
-		ret = centauri_port_cycle(c->pdev);
-		if (!ret) {
-			c->link_ready = true;
-			dev_info(&c->pdev->dev, "post-reset execution stage=%#x\n",
-				 readl(c->bar + 0x8000));
+	while (!READ_ONCE(c->removing)) {
+		switch (c->boot_phase) {
+		case CEN_BOOT_ROM:
+			ret = centauri_rom_boot(c);
+			if (!ret)
+				c->boot_phase = readl(c->bar + 0x8000) == 1 ?
+					CEN_BOOT_IPC : CEN_BOOT_CYCLE;
+			break;
+		case CEN_BOOT_CYCLE:
+			c->link_ready = false;
+			ret = centauri_port_cycle(c->pdev);
+			if (!ret)
+				c->link_ready = true;
+			if (!ret)
+				c->boot_phase = CEN_BOOT_IPC;
+			break;
+		case CEN_BOOT_IPC:
+			ret = centauri_start_ipc(c);
+			if (!ret)
+				c->boot_phase = CEN_BOOT_READY;
+			break;
+		default:
+			goto out;
+		}
+		if (ret) {
+			dev_err(&c->pdev->dev, "N1 automatic startup failed in phase %d: %d\n",
+				c->boot_phase, ret);
+			c->boot_phase = CEN_BOOT_FAILED;
+			break;
 		}
 	}
+out:
+	if (READ_ONCE(c->removing))
+		c->boot_phase = CEN_BOOT_STOPPED;
 	mutex_unlock(&c->boot_lock);
-	return ret ?: count;
 }
-
-static const struct file_operations centauri_boot_fops = {
-	.owner = THIS_MODULE,
-	.open = simple_open,
-	.write = centauri_boot_write,
-};
 
 static int centauri_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
@@ -211,6 +220,8 @@ static int centauri_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	c->link_ready = true;
 	mutex_init(&c->boot_lock);
 	c->stage_offset = id->driver_data;
+	INIT_DELAYED_WORK(&c->boot_work, centauri_boot_worker);
+	c->boot_phase = CEN_BOOT_ROM;
 	ret = pcim_enable_device(pdev);
 	if (ret)
 		return ret;
@@ -238,7 +249,7 @@ static int centauri_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	pci_set_drvdata(pdev, c);
 	c->debug = debugfs_create_dir(pci_name(pdev), centauri_debug);
 	debugfs_create_file("status", 0400, c->debug, c, &centauri_status_fops);
-	debugfs_create_file("rom_boot", 0200, c->debug, c, &centauri_boot_fops);
+	queue_delayed_work(system_long_wq, &c->boot_work, 0);
 	return 0;
 }
 
@@ -246,9 +257,14 @@ static void centauri_remove(struct pci_dev *pdev)
 {
 	struct centauri *c = pci_get_drvdata(pdev);
 
+	WRITE_ONCE(c->removing, true);
+	cancel_delayed_work_sync(&c->boot_work);
+	mutex_lock(&c->boot_lock);
 	centauri_wifi_unregister(c);
 	debugfs_remove_recursive(c->debug);
 	centauri_free_boot(c);
+	c->boot_phase = CEN_BOOT_STOPPED;
+	mutex_unlock(&c->boot_lock);
 }
 
 /*
