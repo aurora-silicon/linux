@@ -94,6 +94,13 @@ pub(crate) struct Variant {
     /// work. The bare-metal M5 firmware powers the cores for work by its own policy: under a
     /// hold, the M5 Ultra's core-power witness reads unpowered until the hold is released.
     pub(crate) registration_power_hold: bool,
+    /// Cached descriptor storage, queue records and queue configuration that come back
+    /// after their owner's release was consumed are reused once the firmware has consumed
+    /// every control record published before they came back, not only after a later one.
+    /// Set for the A18 Pro. Elsewhere they keep the stricter fence of 34b438de, which fixed
+    /// an M4 Pro crash on a recycled work state; extending this needs a create/destroy-heavy
+    /// queue test on that hardware.
+    pub(crate) objects_after_release: bool,
 }
 
 /// A firmware build a SoC supports, identified by its loaded TEXT.
@@ -146,6 +153,7 @@ pub(crate) const V26A428: Variant = Variant {
     split_firmware_area: false,
     m5_commands: false,
     registration_power_hold: true,
+    objects_after_release: true,
 };
 
 /// The M4 Pro firmware (25G83, `mBoot-18000.161.10`).
@@ -184,6 +192,7 @@ pub(crate) const V25G83: Variant = Variant {
     split_firmware_area: false,
     m5_commands: false,
     registration_power_hold: true,
+    objects_after_release: false,
 };
 
 /// The 26A428 firmware of the M5 GPUs, which runs the M5 protocol (the M5 graph, queues and
@@ -194,6 +203,7 @@ pub(crate) const V26A428_M5: Variant = Variant {
     traversal_exclusion: false,
     render_ray_query: false,
     registration_power_hold: false,
+    objects_after_release: false,
     ..V26A428
 };
 

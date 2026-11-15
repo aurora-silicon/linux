@@ -528,6 +528,8 @@ struct PoolInner {
     kept_reserved: usize,
     /// Objects returned so far, ordering the reuse cache.
     returns: u64,
+    /// [`super::fw::Variant::objects_after_release`].
+    after_release: bool,
     /// Reuses that had to take an object whose fence the firmware had not met yet, per family.
     fence_overruns: [u64; POOL_FAMILIES],
 }
@@ -603,7 +605,7 @@ impl Drop for PooledObject {
 }
 
 impl Pool {
-    pub(crate) fn new() -> Result<kernel::sync::Arc<Self>> {
+    pub(crate) fn new(after_release: bool) -> Result<kernel::sync::Arc<Self>> {
         let mut returned = KVec::with_capacity(POOL_FAMILIES * POOL_SLOTS, GFP_KERNEL)?;
         for _ in 0..POOL_FAMILIES * POOL_SLOTS {
             returned.push(None, GFP_KERNEL)?;
@@ -612,7 +614,7 @@ impl Pool {
             pin_init!(Self {
                 inner <- kernel::new_mutex!(PoolInner {
                     returned, reserved: [0; POOL_FAMILIES], bytes: 0, stopped: false, kept: KVec::new(),
-                    kept_bytes: 0, kept_reserved: 0, returns: 0, fence_overruns: [0; POOL_FAMILIES],
+                    kept_bytes: 0, kept_reserved: 0, returns: 0, after_release, fence_overruns: [0; POOL_FAMILIES],
                 }, "g17::object::Pool"),
             }),
             GFP_KERNEL,
@@ -624,9 +626,9 @@ impl Pool {
     ///
     /// The firmware may still follow a previous owner's pointers into a returned object
     /// until it has processed that owner's release. Reuse takes the matching object
-    /// returned longest ago once the firmware consumed a control record published after
-    /// its return; a younger one is reused only when the family has no room for a fresh
-    /// cached object, because an uncached one is unmapped as soon as its owner drops it.
+    /// returned longest ago once its fence is met (see `return_object`); a younger one is
+    /// reused only when the family has no room for a fresh cached object, because an
+    /// uncached one is unmapped as soon as its owner drops it.
     pub(crate) fn allocate(
         self: &kernel::sync::Arc<Self>,
         alloc: &Allocator<'_>,
@@ -755,7 +757,15 @@ impl Pool {
         let begin = family * POOL_SLOTS;
         inner.returns += 1;
         let order = inner.returns;
-        let fence = super::channel::control_fence();
+        // These families come back only after their owner's release was consumed, or
+        // unseen by the firmware. Work states and scheduler pages keep the stricter fence.
+        let fence = if inner.after_release
+            && matches!(lease.family, Family::Descriptor | Family::QueueState | Family::QueueConfig)
+        {
+            super::channel::control_published()
+        } else {
+            super::channel::control_fence()
+        };
         for slot in &mut inner.returned[begin..begin + POOL_SLOTS] {
             if slot.is_none() {
                 *slot = Some(Retained {
