@@ -84,6 +84,7 @@ struct dcp_packet_header {
 enum iomfb_property_id {
     IOMFB_PROPERTY_NITS_V13_3 = 15, // divide by Brightness_Scale
     IOMFB_PROPERTY_NITS_V14_7 = 19,
+    IOMFB_PROPERTY_FRAME_V27 = 119, // published once per scanned-out frame
 };
 
 #define IOMFB_BRIGHTNESS_MIN 0x10000000

@@ -479,11 +479,37 @@ static void iomfb_queue_advance(struct apple_dcp *dcp)
 		schedule_work(&dcp->iomfb.work);
 }
 
+void iomfb_note_frame(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&dcp->iomfb.frame_lock, flags);
+	memmove(dcp->iomfb.frame_ns, dcp->iomfb.frame_ns + 1,
+		sizeof(dcp->iomfb.frame_ns) - sizeof(dcp->iomfb.frame_ns[0]));
+	dcp->iomfb.frame_ns[DCP_BAND_FRAMES - 1] = ktime_get_ns();
+	spin_unlock_irqrestore(&dcp->iomfb.frame_lock, flags);
+}
+
+static u64 iomfb_band_hold_ns(struct apple_dcp *dcp)
+{
+	u64 frames[DCP_BAND_FRAMES];
+	unsigned long flags;
+
+	if (!READ_ONCE(dcp_swap_band_hold))
+		return 0;
+	spin_lock_irqsave(&dcp->iomfb.frame_lock, flags);
+	memcpy(frames, dcp->iomfb.frame_ns, sizeof(frames));
+	spin_unlock_irqrestore(&dcp->iomfb.frame_lock, flags);
+	return dcp_band_hold_ns(frames, ktime_get_ns());
+}
+
 static void iomfb_queue_work(struct work_struct *work)
 {
 	struct apple_dcp *dcp = container_of(work, struct apple_dcp, iomfb.work);
 	struct iomfb_transaction *transaction;
+	u64 hold;
 
+relock:
 	mutex_lock(&dcp->iomfb.lock);
 	if (READ_ONCE(dcp->crashed) || dcp->iomfb.stopped) {
 		iomfb_discard_pending(dcp);
@@ -496,6 +522,14 @@ static void iomfb_queue_work(struct work_struct *work)
 
 	transaction = list_first_entry(&dcp->iomfb.pending,
 				       struct iomfb_transaction, link);
+	/* The lock is dropped so callers can queue; every check above runs again. */
+	hold = transaction->presentation ? iomfb_band_hold_ns(dcp) : 0;
+	if (hold) {
+		mutex_unlock(&dcp->iomfb.lock);
+		dev_dbg(dcp->dev, "band hold %llu us\n", div_u64(hold, NSEC_PER_USEC));
+		fsleep(div_u64(hold, NSEC_PER_USEC));
+		goto relock;
+	}
 	list_del(&transaction->link);
 	dcp->iomfb.queued--;
 	dcp->iomfb.active = transaction;
@@ -674,6 +708,7 @@ void iomfb_queue_init(struct apple_dcp *dcp)
 	INIT_WORK(&dcp->iomfb.work, iomfb_queue_work);
 	spin_lock_init(&dcp->iomfb.callback_lock);
 	INIT_LIST_HEAD(&dcp->iomfb.callbacks);
+	spin_lock_init(&dcp->iomfb.frame_lock);
 	INIT_WORK(&dcp->iomfb.callback_work, iomfb_callback_work);
 	INIT_DELAYED_WORK(&dcp->iomfb.timeout, iomfb_queue_timeout);
 	INIT_DELAYED_WORK(&dcp->iomfb.backlight_retry, iomfb_backlight_retry);

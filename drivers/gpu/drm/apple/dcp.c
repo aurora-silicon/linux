@@ -222,6 +222,10 @@ unsigned int dcp_keepalive_ms = DCP_KEEPALIVE_MS_DEFAULT;
 module_param_named(keepalive_ms, dcp_keepalive_ms, uint, 0644);
 MODULE_PARM_DESC(keepalive_ms, "0 = off. N = present the last frame again, with new timestamps, N ms after the last swap (v27 only, max 1000)");
 
+bool dcp_swap_band_hold = DCP_SWAP_BAND_HOLD_DEFAULT;
+module_param_named(swap_band_hold, dcp_swap_band_hold, bool, 0644);
+MODULE_PARM_DESC(swap_band_hold, "hold a presentation that would reach an idle panel 3-8.5 ms before its next grid frame until just after that frame (default off)");
+
 /*
  * DP/HDMI audio of external displays, on by default as on macOS: a display
  * that takes audio, over HDMI or DisplayPort (USB-C alt mode included),

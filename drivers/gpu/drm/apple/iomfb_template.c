@@ -1022,6 +1022,11 @@ static void iomfb_cb_pr_publish(struct apple_dcp *dcp, struct iomfb_property *pr
 		break;
 	}
 #endif
+#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
+	case IOMFB_PROPERTY_FRAME_V27:
+		iomfb_note_frame(dcp);
+		fallthrough;
+#endif
 	default:
 		dev_dbg(dcp->dev, "pr_publish: id: %d = %u\n", prop->id, prop->value);
 	}

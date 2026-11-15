@@ -72,6 +72,46 @@ static void keepalive_delay_is_off_or_bounded(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, dcp_keepalive_delay_ms(4000000000U), (unsigned int)DCP_KEEPALIVE_MAX_MS);
 }
 
+#define MS 1000000ULL
+#define T0 (1000 * MS)
+
+/* An idle panel: frames 100 ms apart, the last one at T0 + 300 ms. */
+static const u64 idle[DCP_BAND_FRAMES] = { T0, T0 + 100 * MS, T0 + 200 * MS, T0 + 300 * MS };
+
+static void band_hold_waits_past_the_grid_frame(struct kunit *test)
+{
+	/* 95 ms after the last frame: the next grid frame is 5 ms away. */
+	KUNIT_EXPECT_EQ(test, dcp_band_hold_ns(idle, T0 + 395 * MS), 6 * MS);
+	KUNIT_EXPECT_EQ(test, dcp_band_hold_ns(idle, T0 + 397 * MS), 4 * MS);
+	KUNIT_EXPECT_EQ(test, dcp_band_hold_ns(idle, T0 + 392 * MS), 9 * MS);
+}
+
+static void band_hold_ignores_swaps_outside_the_band(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, dcp_band_hold_ns(idle, T0 + 398 * MS), 0ULL);
+	KUNIT_EXPECT_EQ(test, dcp_band_hold_ns(idle, T0 + 391 * MS + MS / 2), 0ULL);
+	KUNIT_EXPECT_EQ(test, dcp_band_hold_ns(idle, T0 + 350 * MS), 0ULL);
+	KUNIT_EXPECT_EQ(test, dcp_band_hold_ns(idle, T0 + 410 * MS), 0ULL);
+	KUNIT_EXPECT_EQ(test, dcp_band_hold_ns(idle, T0 + 299 * MS), 0ULL);
+}
+
+static void band_hold_uses_the_median_idle_period(struct kunit *test)
+{
+	const u64 uneven[DCP_BAND_FRAMES] = { T0, T0 + 108 * MS, T0 + 200 * MS, T0 + 300 * MS };
+
+	/* Intervals 108, 92, 100: period 100, so the grid frame is 5 ms away. */
+	KUNIT_EXPECT_EQ(test, dcp_band_hold_ns(uneven, T0 + 395 * MS), 6 * MS);
+}
+
+static void band_hold_needs_an_idle_panel(struct kunit *test)
+{
+	const u64 busy[DCP_BAND_FRAMES] = { T0, T0 + 100 * MS, T0 + 200 * MS, T0 + 240 * MS };
+	const u64 unknown[DCP_BAND_FRAMES] = { 0, T0 + 100 * MS, T0 + 200 * MS, T0 + 300 * MS };
+
+	KUNIT_EXPECT_EQ(test, dcp_band_hold_ns(busy, T0 + 335 * MS), 0ULL);
+	KUNIT_EXPECT_EQ(test, dcp_band_hold_ns(unknown, T0 + 395 * MS), 0ULL);
+}
+
 static struct kunit_case dcp_swap_pace_test_cases[] = {
 	KUNIT_CASE(swap_ts_current_follows_the_clock),
 	KUNIT_CASE(swap_ts_current_keeps_a_lone_swap_at_now),
@@ -81,6 +121,10 @@ static struct kunit_case dcp_swap_pace_test_cases[] = {
 	KUNIT_CASE(swap_ts_off_is_all_zero),
 	KUNIT_CASE(swap_ts_unknown_mode_is_current),
 	KUNIT_CASE(keepalive_delay_is_off_or_bounded),
+	KUNIT_CASE(band_hold_waits_past_the_grid_frame),
+	KUNIT_CASE(band_hold_ignores_swaps_outside_the_band),
+	KUNIT_CASE(band_hold_uses_the_median_idle_period),
+	KUNIT_CASE(band_hold_needs_an_idle_panel),
 	{}
 };
 

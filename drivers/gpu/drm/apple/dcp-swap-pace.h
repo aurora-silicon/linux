@@ -3,6 +3,7 @@
 #define DCP_SWAP_PACE_H
 
 #include <linux/minmax.h>
+#include <linux/time64.h>
 #include <linux/types.h>
 
 #include "dcp-refresh.h"
@@ -58,8 +59,48 @@ static inline unsigned int dcp_keepalive_delay_ms(unsigned int param)
 	return min_t(unsigned int, param, DCP_KEEPALIVE_MAX_MS);
 }
 
-/* Boot values of the two parameters. A change here flips the default; the parameters stay as the runtime rollback. */
+/*
+ * An idle M5 internal panel scans out on a grid of about 100 ms. A swap that
+ * reaches the firmware 3-8 ms before the next grid frame gets no frame of its
+ * own (receipts/2026-11-14-m5-lone-print-cal-ab.md: lost leads 3.1-7.5 ms,
+ * shown leads up to 3.5 ms and from 7.2 ms). The hold runs before the swap is
+ * stamped, up to 0.6 ms ahead of the submit, so the band ends at 8.5 ms.
+ */
+#define DCP_BAND_FRAMES 4
+#define DCP_BAND_IDLE_MIN_NS (90 * NSEC_PER_MSEC)
+#define DCP_BAND_IDLE_MAX_NS (110 * NSEC_PER_MSEC)
+#define DCP_BAND_LEAD_MIN_NS (3 * NSEC_PER_MSEC)
+#define DCP_BAND_LEAD_MAX_NS (8 * NSEC_PER_MSEC + NSEC_PER_MSEC / 2)
+#define DCP_BAND_MARGIN_NS (1 * NSEC_PER_MSEC)
+
+/*
+ * frames[] are the last frame times, oldest first, 0 when unknown. Returns how
+ * long a swap at now waits so it reaches the firmware after the grid frame.
+ */
+static inline u64 dcp_band_hold_ns(const u64 *frames, u64 now)
+{
+	u64 iv[DCP_BAND_FRAMES - 1], period, last = frames[DCP_BAND_FRAMES - 1], lead;
+	int i;
+
+	for (i = 0; i < DCP_BAND_FRAMES - 1; i++) {
+		if (!frames[i] || frames[i + 1] <= frames[i])
+			return 0;
+		iv[i] = frames[i + 1] - frames[i];
+		if (iv[i] < DCP_BAND_IDLE_MIN_NS || iv[i] > DCP_BAND_IDLE_MAX_NS)
+			return 0;
+	}
+	period = max(min(iv[0], iv[1]), min(max(iv[0], iv[1]), iv[2]));
+	if (now < last || now - last >= period)
+		return 0;
+	lead = period - (now - last);
+	if (lead < DCP_BAND_LEAD_MIN_NS || lead >= DCP_BAND_LEAD_MAX_NS)
+		return 0;
+	return lead + DCP_BAND_MARGIN_NS;
+}
+
+/* Boot values of the parameters. A change here flips the default; the parameters stay as the runtime rollback. */
 #define DCP_SWAP_TS_MODE_DEFAULT DCP_SWAP_TS_CURRENT
 #define DCP_KEEPALIVE_MS_DEFAULT 25
+#define DCP_SWAP_BAND_HOLD_DEFAULT false
 
 #endif
