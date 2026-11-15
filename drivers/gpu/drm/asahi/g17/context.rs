@@ -8,7 +8,7 @@
 
 mod identity;
 use super::{
-    freelist::{RenderIds, RenderPool},
+    freelist::{RenderId, RenderIds, RenderPool},
     fw::{context as fw, queue::Policy},
     object::{Allocator, CpuMap, Family, KernelObject, Pool, PooledObject},
     status::VmStatus,
@@ -232,6 +232,10 @@ pub(crate) struct Context {
     work: Arc<Mutex<WorkStorage>>,
     work_base: u64,
     render: Arc<Mutex<Option<Arc<RenderPool>>>>,
+    /// The render pool identity taken with the context
+    /// ([`super::fw::Variant::render_id_at_create`]), until its render pool takes it over or
+    /// the closed context is reclaimed.
+    render_id: Arc<Mutex<Option<RenderId>>>,
     render_blocks: AtomicUsize,
     /// Timestamp pages of retired compute commands, mapped in this context's VM.
     compute_timestamps: Arc<super::completion::ComputeTimestampCache>,
@@ -247,7 +251,7 @@ impl Context {
         clippy::too_many_arguments,
         reason = "A context takes its allocators, identities and both admission domains."
     )]
-    pub(crate) fn new(
+    pub(super) fn new(
         alloc: &Allocator<'_>,
         pool: &Arc<Pool>,
         qos: &Arc<QosIds>,
@@ -257,6 +261,7 @@ impl Context {
         state_returns: Arc<super::availability::Availability>,
         compute_returns: Arc<super::availability::Availability>,
         share: Option<super::exec_share::Use>,
+        render_id: Option<RenderId>,
     ) -> Result<Self> {
         let status = execution.vm().status().ok_or(EINVAL)?.clone();
         let hold = execution.hold(super::channel::control_fence)?;
@@ -324,6 +329,8 @@ impl Context {
             GFP_KERNEL,
         )?;
         let render = Arc::pin_init(new_mutex!(None, "G17 context private memory"), GFP_KERNEL)?;
+        let render_id =
+            Arc::pin_init(new_mutex!(render_id, "G17 context render pool identity"), GFP_KERNEL)?;
         let order =
             Arc::pin_init(new_mutex!(Order::new(), "G17 context admission order"), GFP_KERNEL)?;
         Ok(Self {
@@ -349,6 +356,7 @@ impl Context {
             work,
             work_base,
             render,
+            render_id,
             render_blocks: AtomicUsize::new(super::fw::freelist::RENDER_BLOCKS),
             compute_timestamps: super::completion::ComputeTimestampCache::new()?,
             policy,
@@ -559,9 +567,14 @@ impl Context {
                     self.vm(),
                     plan.geometry,
                 )?,
-                None => {
-                    RenderPool::new(alloc, ids, render_global, self.vm(), self.render_blocks())?
-                }
+                None => RenderPool::new(
+                    alloc,
+                    ids,
+                    render_global,
+                    self.vm(),
+                    self.render_blocks(),
+                    Some(&self.render_id),
+                )?,
             },
             GFP_KERNEL,
         )?;
@@ -575,6 +588,11 @@ impl Context {
     /// context itself until replacement; they never use the render pool.
     pub(crate) fn take_render_pool(&self) -> Option<Arc<RenderPool>> {
         self.render.lock().take()
+    }
+    /// Gives back the identity a closed context took at creation and never used: compute
+    /// bindings may retain the context itself until they are replaced.
+    pub(crate) fn release_render_id(&self) {
+        drop(self.render_id.lock().take());
     }
     pub(crate) fn render_pools_released(&self, released: impl Fn(u32, u64) -> bool) -> bool {
         self.render

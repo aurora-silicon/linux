@@ -773,7 +773,7 @@ impl Backend {
         // sleeping, and nothing of the new queue is visible yet.
         const RETAINED_CONTEXT_WAIT_NS: u64 = 4 * WORK_RING_WAIT_NS;
         let started = now_ns();
-        let (lease, uat, pool, qos, execution, slot, share) = loop {
+        let (lease, uat, pool, qos, execution, slot, share, render_id) = loop {
             let observed = shared.queues.observe();
             let lease = shared.preparations.enter(true)?;
             let mut state = shared.state.lock();
@@ -794,6 +794,13 @@ impl Backend {
             {
                 return Err(super::capacity::refused(super::capacity::Site::LogicalQueues));
             }
+            // A context that takes its render pool identity now is refused here, holding
+            // nothing, when render graphs kept until the firmware stops hold the rest.
+            let render_id = if shared.variant.render_id_at_create {
+                Some(super::freelist::RenderId::new(&firmware.render_ids)?)
+            } else {
+                None
+            };
             // The new context may reuse a pooled scheduler page: clear released QoS rows first.
             firmware.queues.qos_ids.forget_released(|ids| firmware.port.qos_forget(ids));
             // G17P queues of one VM join its live execution context (super::exec_share).
@@ -818,6 +825,7 @@ impl Backend {
                         execution,
                         slot,
                         share,
+                        render_id,
                     )
                 }
                 Err(error) if error == ENOSPC => {
@@ -828,6 +836,7 @@ impl Backend {
                     if closing == 0 || now_ns().saturating_sub(started) >= RETAINED_CONTEXT_WAIT_NS {
                         return Err(super::capacity::refused(super::capacity::Site::ExecutionContexts));
                     }
+                    drop(render_id);
                     drop(state);
                     drop(lease);
                     // Nothing is visible yet: a signalled creator restarts.
@@ -866,6 +875,7 @@ impl Backend {
                 shared.renders.clone(),
                 shared.progress.clone(),
                 share,
+                render_id,
             )?,
             GFP_KERNEL,
         )?;

@@ -619,15 +619,27 @@ impl RenderPool {
         Ok(pin.map(|pin| PoolPin { _identity: pin, _pool: self.clone() }))
     }
 
-    pub(crate) fn new(
+    /// Uses the identity in `reserved` when there is one
+    /// ([`super::fw::Variant::render_id_at_create`]) and takes it only once the backing is
+    /// placed, so a refused placement keeps it. Without one, the identity is taken first, so a
+    /// refused identity places no backing.
+    pub(super) fn new(
         alloc: &Allocator<'_>,
         ids: &Arc<RenderIds>,
         render_global: &mmu::Vm,
         client: &mmu::Vm,
         blocks: usize,
+        reserved: Option<&Mutex<Option<RenderId>>>,
     ) -> Result<Self> {
-        let id = RenderId::new(ids)?;
+        let fresh = match reserved {
+            Some(reserved) if reserved.lock().is_some() => None,
+            _ => Some(RenderId::new(ids)?),
+        };
         let backing = RenderBacking::new(alloc, render_global, client, blocks)?;
+        let id = match fresh.or_else(|| reserved.and_then(|reserved| reserved.lock().take())) {
+            Some(id) => id,
+            None => RenderId::new(ids)?,
+        };
         Self::with_backing(alloc, id, client, backing)
     }
 
