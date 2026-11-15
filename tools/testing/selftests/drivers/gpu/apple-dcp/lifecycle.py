@@ -1079,6 +1079,10 @@ def teardown(root):
     for name in ('atcphy_mode_configuration', 'atcphy_hw', 'atcphy_dp_link_rate_configuration'):
         decls.append(block(files['atc'], files['atc'].index('struct ' + name + ' {')) + ';')
     decls.append(block(files['state'], files['state'].index('enum dwc3_apple_state {')) + ';')
+    # The glue's PM sleep epoch, for its syscore helper, role switch and the model struct.
+    phase = 'enum dwc3_apple_sleep_phase {'
+    decls.append(block(files['apple'], files['apple'].index(phase)) + ';' if phase in files['apple']
+                 else 'enum dwc3_apple_sleep_phase { DWC3_APPLE_SLEEP_IDLE, DWC3_APPLE_SLEEP_PREPARING };')
     role = 'static inline enum dwc3_apple_state dwc3_apple_state_for_role('
     if role in files['state']:
         decls.append(block(files['state'], files['state'].index(role)))
@@ -1107,7 +1111,7 @@ def teardown(root):
                 '_atcphy_dwc3_reset_assert', 'atcphy_dwc3_reset_assert', 'atcphy_mux_set'),
         'phy': ('phy_init', 'phy_exit', 'phy_reset', 'phy_power_on', 'phy_power_off'),
         'core': ('dwc3_phy_power_on', 'dwc3_phy_power_off', 'dwc3_phy_exit', 'dwc3_core_exit'),
-        'apple': ('dwc3_apple_host_before_core_init', 'dwc3_apple_core_stop', 'dwc3_apple_core_init', 'dwc3_apple_core_start',
+        'apple': ('dwc3_apple_syscore', 'dwc3_apple_host_before_core_init', 'dwc3_apple_core_stop', 'dwc3_apple_core_init', 'dwc3_apple_core_start',
                   'dwc3_apple_init', 'dwc3_apple_exit', 'dwc3_usb_role_switch_set'),
     }
     names['core'] = ('dwc3_phy_power_on', 'dwc3_phy_power_off', 'dwc3_phy_exit',
