@@ -229,6 +229,10 @@ impl Scene::ver {
     /// Returns the GPU pointer to the clustering layer metadata buffer, if clustering is enabled.
     #[allow(dead_code)]
     pub(crate) fn tvb_cluster_layermeta_pointer(&self) -> Option<GpuPointer<'_, &'_ [u8]>> {
+        if debug_enabled(DebugFlags::NullClusterLayerMeta) {
+            return None;
+        }
+
         self.object
             .clustering
             .as_ref()

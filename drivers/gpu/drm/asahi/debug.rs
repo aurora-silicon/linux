@@ -77,7 +77,8 @@ pub(crate) enum DebugFlags {
     // 48-: Misc
     Debug0 = 48,
     Debug1 = 49,
-    Debug2 = 50,
+    // Diagnostic: leave the legacy per-cluster layer-metadata address unset.
+    NullClusterLayerMeta = 50,
     Debug3 = 51,
     Debug4 = 52,
     Debug5 = 53,
