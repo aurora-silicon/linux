@@ -3043,6 +3043,9 @@ static void apple_pcie_sd_power_down(struct apple_pcie *pcie, struct apple_pcie_
 	 */
 	if (rp && !port->sd_rp_held && pm_runtime_resume_and_get(&rp->dev) >= 0)
 		port->sd_rp_held = pci_dev_get(rp);
+	/* The port's reset takes the root port's config too: kept for the power-up. */
+	if (port->sd_rp_held)
+		pci_save_state(port->sd_rp_held);
 	if (rp && rp->subordinate)
 		list_for_each_entry_safe_reverse(dev, tmp, &rp->subordinate->devices, bus_list)
 			pci_stop_and_remove_bus_device(dev);
@@ -3121,6 +3124,14 @@ out:
 	}
 
 	pci_lock_rescan_remove();
+	/*
+	 * The root port comes back at its reset values: bus numbers 0, no window, memory
+	 * decoding off. The PCI core renumbers the bus but sets no window up for a bridge it
+	 * has enabled, so every read of the reader's BAR came back all ones. As the radio's
+	 * Neo path does before its link, the state saved at the power-down goes back first.
+	 */
+	if (port->sd_rp_held)
+		pci_restore_state(port->sd_rp_held);
 	if (bridge->bus)
 		pci_rescan_bus(bridge->bus);
 	pci_unlock_rescan_remove();
