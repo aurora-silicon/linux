@@ -236,8 +236,8 @@
 
 /*
  * The keyboard and trackpad: the HID transport on the MTP's DockChannel FIFO.
- * The J714c's MTP firmware owns the trackpad AFE reset, so there is no reset
- * GPIO here, unlike the J716c.
+ * The J714c's MTP firmware does not reset the trackpad AFE, so the host does
+ * it through an SMC GPIO, as on the J714s.
  */
 &mtp_dockchannel {
 	status = "okay";
@@ -254,10 +254,15 @@
 		interrupt-names = "tx", "rx";
 		apple,fifo-size = <0x800>;
 		apple,helper-cpu = <&mtp>;
+		/*
+		 * ADT mtp function-afe-reset is the SMC pcIO template (0x10000, 0x11c0000),
+		 * the same line as SMC GPIO gp1c, active low, which gpio-macsmc drives, as
+		 * on the J714s.
+		 */
+		apple,afe-reset-gpios = <&smc_gpio_low 28 GPIO_ACTIVE_LOW>;
 
 		multi-touch {
 			apple,power-method = <2>;
-			apple,firmware-managed-reset;
 			firmware-name = "apple/tpmtfw-j714c.bin";
 		};
 
