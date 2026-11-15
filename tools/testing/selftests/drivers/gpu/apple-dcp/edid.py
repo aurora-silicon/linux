@@ -900,7 +900,6 @@ struct apple_rtkit { bool shutting_down, sync_syslog_ack, pmp_registry_v2; const
     /* Messages a firmware sleep holds and the RX jobs it counts; none are held here. */
     struct { bool tracked; int error; atomic_t jobs; } m5_saved; atomic_t v27_jobs; };
 struct apple_rtkit_rx_work { u64 received_ns; struct apple_rtkit *rtk; u8 ep; u64 msg; struct work_struct work; };
-static u64 ktime_get_ns(void) { return 1; }
 #define current ((void *)1)
 static pthread_mutex_t reply_lock=PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t reply_ready=PTHREAD_COND_INITIALIZER;

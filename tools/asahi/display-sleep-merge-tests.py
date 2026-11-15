@@ -148,18 +148,29 @@ static void queue(struct apple_rtkit *r) {
 int main(void) {
  const struct apple_rtkit_ops both={.recv_message=legacy_cb,.recv_message_timed=timed_cb};
  const struct apple_rtkit_ops old={.recv_message=legacy_cb};
+ const struct apple_rtkit_ops timed_only={.recv_message_timed=timed_cb};
  struct apple_rtkit r={.ops=&both}; queue(&r);
  assert(timed==1 && legacy==0 && observed==9 && clock_calls==0 && frees==1);
- apple_rtkit_rx_dispatch(&r,0x2a,0x1234,true,0); assert(timed==2 && observed==37 && clock_calls==1);
- r.ops=&old; queue(&r); assert(legacy==1 && frees==2);
+ apple_rtkit_rx_dispatch(&r,0x2a,0x1234,true,0); assert(timed==1 && legacy==1 && clock_calls==0);
+ r.ops=&timed_only; apple_rtkit_rx_dispatch(&r,0x2a,0x1234,true,0); assert(timed==2 && observed==0 && clock_calls==0);
+ r.ops=&old; queue(&r); assert(legacy==2 && frees==2);
  r.ops=&both; r.shutting_down=true; queue(&r); assert(timed==2 && frees==3);
- apple_rtkit_rx_dispatch(&r,0x2a,0x1234,true,0); assert(r.m5_saved.error==-ESHUTDOWN && clock_calls==1);
+ apple_rtkit_rx_dispatch(&r,0x2a,0x1234,true,0); assert(r.m5_saved.error==-ESHUTDOWN && clock_calls==0);
 }
 '''
+start = dispatch.index('\t\tif (received_ns && rtk->ops->recv_message_timed)')
+end = dispatch.index('\t\telse\n\t\t\tdev_warn', start)
+fabricated_dispatch = dispatch[:start] + '''\t\tif (rtk->ops->recv_message_timed)
+\t\t\trtk->ops->recv_message_timed(rtk->cookie, ep, msg,
+\t\t\t\t\t\t     received_ns ?: ktime_get_ns());
+\t\telse if (rtk->ops->recv_message)
+\t\t\trtk->ops->recv_message(rtk->cookie, ep, msg);
+''' + dispatch[end:]
 for label, d, w, negative in [('rtkit', dispatch, worker, False),
+                             ('rtkit-fabricated-time-control', fabricated_dispatch, worker, True),
                              ('rtkit-drop-arrival', dispatch, worker.replace('false, w->received_ns', 'false, 0'), True),
-                             ('rtkit-drop-timed', dispatch.replace('if (rtk->ops->recv_message_timed)', 'if (false && rtk->ops->recv_message_timed)'), worker, True),
-                             ('rtkit-drop-fallback', dispatch.replace('received_ns ?: ktime_get_ns()', 'received_ns'), worker, True)]:
+                             ('rtkit-drop-timed', dispatch.replace('if (received_ns && rtk->ops->recv_message_timed)', 'if (false && received_ns && rtk->ops->recv_message_timed)'), worker, True),
+                             ('rtkit-drop-unknown-delivery', dispatch.replace('else if (rtk->ops->recv_message_timed)', 'else if (false && rtk->ops->recv_message_timed)'), worker, True)]:
     run(label, pre + d + done + w + tests, negative)
 
 template = (A / 'iomfb_template.c').read_text()
@@ -211,5 +222,5 @@ for label, body, version, negative in [('mode26', mode, 26, False), ('mode27', m
     code = pre + 'static int evaluate(struct apple_dcp *dcp,bool keep_mode,struct cookie *cookie) { int ret;\n' + body + '{ modesets++; }\nreturn 0;\n}\n' + tests
     run(label, code, negative, extra=(f'-DDCP_FW_VER={version}',))
 
-assert len(results) == 16
-print('PASS: 16 compiled merge-boundary runs, including runtime controls', flush=True)
+assert len(results) == 17
+print('PASS: 17 compiled merge-boundary runs, including runtime controls', flush=True)

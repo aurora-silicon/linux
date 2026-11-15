@@ -1495,12 +1495,13 @@ static void apple_rtkit_rx_dispatch(struct apple_rtkit *rtk, u8 ep, u64 msg,
 		apple_rtkit_oslog_rx(rtk, msg);
 		break;
 	case APPLE_RTKIT_APP_ENDPOINT_START ... 0xff:
-		/* Sleep-buffered packets retain the legacy dispatch-time fallback. */
-		if (rtk->ops->recv_message_timed)
-			rtk->ops->recv_message_timed(rtk->cookie, ep, msg,
-						     received_ns ?: ktime_get_ns());
+		/* Buffered sleep packets have no original receive timestamp. */
+		if (received_ns && rtk->ops->recv_message_timed)
+			rtk->ops->recv_message_timed(rtk->cookie, ep, msg, received_ns);
 		else if (rtk->ops->recv_message)
 			rtk->ops->recv_message(rtk->cookie, ep, msg);
+		else if (rtk->ops->recv_message_timed)
+			rtk->ops->recv_message_timed(rtk->cookie, ep, msg, 0);
 		else
 			dev_warn(
 				rtk->dev,

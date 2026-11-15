@@ -84,8 +84,11 @@ struct apple_rtkit_inherited_buffer {
  * @recv_message:  Function called when a message from RTKit is received
  *                 on a non-system endpoint. Called from a worker thread.
  * @recv_message_timed: Like recv_message, carrying the monotonic nanosecond
- *                 timestamp captured before deferring mailbox RX. If set,
- *                 this callback is used instead of recv_message.
+ *                 timestamp captured before deferring normal mailbox RX.
+ *                 Preferred over recv_message when that timestamp is known.
+ *                 Sleep-buffered packets lack a saved receive timestamp:
+ *                 they use recv_message if provided, otherwise this callback
+ *                 receives zero to report that the timestamp is unavailable.
  * @recv_message_early:
  *                 Like recv_message, but called from atomic context. It
  *                 should return true if it handled the message. If it
