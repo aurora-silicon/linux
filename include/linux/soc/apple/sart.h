@@ -70,4 +70,11 @@ bool apple_sart_is_inherited_region(struct apple_sart *sart, phys_addr_t paddr,
  */
 int apple_sart_replay(struct apple_sart *sart);
 
+/*
+ * apple_sart_restore_entry - write back a SART entry that a boot stage passed on
+ * (apple,sart-entries) after it powered the coprocessor off, and protect it.
+ */
+int apple_sart_restore_entry(struct apple_sart *sart, int index, u8 flags,
+			     phys_addr_t paddr, size_t size);
+
 #endif /* _LINUX_SOC_APPLE_SART_H_ */

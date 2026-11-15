@@ -325,6 +325,35 @@ static int sart_set_entry(struct apple_sart *sart, int index, u8 flags,
 	return 0;
 }
 
+/*
+ * Write back entries that a boot stage set up before it powered the coprocessor off, and
+ * protect them as the boot loader's own: the firmware keeps the buffers they cover.
+ */
+int apple_sart_restore_entry(struct apple_sart *sart, int index, u8 flags,
+			     phys_addr_t paddr, size_t size)
+{
+	phys_addr_t rb_paddr;
+	size_t rb_size;
+	u8 rb_flags;
+
+	if (index < 0 || index >= APPLE_SART_MAX_ENTRIES || !flags ||
+	    paddr & ((1ULL << sart->ops->paddr_shift) - 1) ||
+	    size & ((1ULL << sart->ops->size_shift) - 1) ||
+	    (size >> sart->ops->size_shift) > sart->ops->size_max)
+		return -EINVAL;
+	sart->ops->set_entry(sart, index, flags, paddr >> sart->ops->paddr_shift,
+			     size >> sart->ops->size_shift);
+	sart->ops->get_entry(sart, index, &rb_flags, &rb_paddr, &rb_size);
+	if (rb_flags != flags || rb_paddr != paddr || rb_size != size) {
+		dev_warn(sart->dev, "entry %d reads %#x %pa+%#zx, wrote %#x %pa+%#zx\n",
+			 index, rb_flags, &rb_paddr, rb_size, flags, &paddr, size);
+		return -EIO;
+	}
+	set_bit(index, &sart->protected_entries);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_sart_restore_entry);
+
 int apple_sart_add_allowed_region(struct apple_sart *sart, phys_addr_t paddr,
 				  size_t size)
 {
