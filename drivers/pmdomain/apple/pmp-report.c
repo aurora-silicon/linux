@@ -1510,6 +1510,14 @@ EXPORT_SYMBOL_GPL(apple_pmp_report_wait_ready);
 static bool j613_floor = true;
 module_param(j613_floor, bool, 0444);
 MODULE_PARM_DESC(j613_floor, "J613: own the CPU memory-floor request and run its governor (default: on for the native J613 report; 0 disables)");
+/*
+ * J615 legacy handoff trees: off until the floor is qualified on that board
+ * (disable and re-enable, boot veto, suspend, policy teardown, sustained
+ * power). j613_floor=0 still vetoes it.
+ */
+static bool j615_floor;
+module_param(j615_floor, bool, 0444);
+MODULE_PARM_DESC(j615_floor, "J615: run the memory floor on a legacy handoff tree (default: off; j613_floor=0 still vetoes it)");
 static unsigned int j613_floor_dcs = 4;
 module_param(j613_floor_dcs, uint, 0444);
 /* Fabric 2: 4-thread CPU copy 67 -> 92 GB/s, GPU copy 62 -> 76 GB/s over fabric 0. */
@@ -2143,29 +2151,68 @@ static void j613_floor_put_pmp(void *pmp)
 	of_node_put(pmp);
 }
 
+/*
+ * J615: the J613's SoC, DRAM, PMP tables and PACC0 layout. It is admitted
+ * only on the generic T8122 report of a legacy handoff tree, whose driver
+ * starts the 14.x PMP and names it with apple,pmp. The native J613 report of
+ * the experimental J615 25G83 tree is not covered. A refused J615 identity
+ * leaves the floor off and the report probing.
+ */
+static bool j615_floor_eligible(const struct apple_pmp_report *rep)
+{
+	return pmp_floor_j615_enabled(of_machine_is_compatible("apple,j615"),
+				      rep->offsets->j613_floor_default,
+				      of_device_is_compatible(rep->dev->of_node,
+							      "apple,t8122-pmp-v2-report"),
+				      j613_floor, j615_floor);
+}
+
+/* The PMP names this report; a J615 legacy report names its PMP instead. */
+static bool j613_floor_linked(struct device_node *pmp, struct device_node *report,
+			      bool j615)
+{
+	struct device_node *link;
+	bool linked;
+
+	if (j615) {
+		link = of_parse_phandle(report, "apple,pmp", 0);
+		linked = link == pmp;
+	} else {
+		link = of_parse_phandle(pmp, "apple,pmp-report", 0);
+		linked = link == report;
+	}
+	of_node_put(link);
+	return linked;
+}
+
 static int j613_floor_probe(struct apple_pmp_report *rep)
 {
 	struct device *dev = rep->dev;
 	struct j613_floor *f;
-	struct device_node *pmp, *link;
+	struct device_node *pmp;
 	const char *uuid;
 	unsigned long flags;
+	bool j615 = j615_floor_eligible(rep);
 	int ret;
 
 	if (!pmp_floor_enabled(of_machine_is_compatible("apple,j613"),
-			       rep->offsets->j613_floor_default, j613_floor))
+			       rep->offsets->j613_floor_default, j613_floor) && !j615)
 		return 0;
 	f = devm_kzalloc(dev, sizeof(*f), GFP_KERNEL);
 	if (!f)
 		return -ENOMEM;
-	/* Native PMP startup remains owned by its existing supplier driver. */
+	/*
+	 * Native PMP startup remains owned by its existing supplier driver; on a
+	 * J615 legacy tree this report's driver starts the PMP. That PMP is still
+	 * disabled here: apple_pmp_start_init() takes it over after this probe and
+	 * enables it once the display asks, and the floor's start work waits for
+	 * the report to read READY before it writes anything.
+	 */
 	for_each_compatible_node(pmp, NULL, "apple,t8122-pmp-v2") {
-		link = of_parse_phandle(pmp, "apple,pmp-report", 0);
-		if (link != dev->of_node || !of_device_is_available(pmp)) {
-			of_node_put(link);
+		if (!j613_floor_linked(pmp, dev->of_node, j615))
 			continue;
-		}
-		of_node_put(link);
+		if (!of_device_is_available(pmp) && !(j615 && rep->offsets->starts_pmp))
+			continue;
 		if (f->pmp) {
 			of_node_put(pmp);
 			return -EINVAL;
@@ -2178,8 +2225,13 @@ static int j613_floor_probe(struct apple_pmp_report *rep)
 		}
 	}
 	if (!f->pmp || of_property_read_string(f->pmp, "apple,tunable-uuid", &uuid) ||
-	    strcmp(uuid, PMP_FLOOR_J613_UUID))
+	    !pmp_floor_uuid_ok(uuid, j615)) {
+		if (j615) {
+			dev_warn(dev, "J615 floor PMP identity refused; floor off\n");
+			return 0;
+		}
 		return dev_err_probe(dev, -EINVAL, "J613 floor PMP identity refused\n");
+	}
 	f->cpu_idle = devm_kcalloc(dev, nr_cpu_ids, sizeof(u64), GFP_KERNEL);
 	f->cpu_wall = devm_kcalloc(dev, nr_cpu_ids, sizeof(u64), GFP_KERNEL);
 	f->cluster_sum = devm_kcalloc(dev, nr_cpu_ids, sizeof(unsigned int), GFP_KERNEL);
