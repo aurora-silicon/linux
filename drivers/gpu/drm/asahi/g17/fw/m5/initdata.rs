@@ -2139,9 +2139,6 @@ pub(crate) struct Board {
     /// Render block size and private-memory address inventory of the board's
     /// render pools, bytes.
     pub(crate) render_pool: (usize, u64),
-    /// The leakage calibration words [`Board::controller_defaults`] are valid for, or `None`
-    /// where they hold for every part of the board.
-    pub(crate) calibration: Option<[u32; 3]>,
     /// The policy controllers' configuration, where the board has one.
     pub(crate) controller_defaults: Option<fn(&mut [u8]) -> Result<(), InitdataError>>,
 
@@ -2186,7 +2183,6 @@ pub(crate) const J714: Board = Board {
     register_slot_flags: None,
     min_parameter_buffer: 0x0020_0000,
     render_pool: (0x40_0000, 1 << 32),
-    calibration: Some([0xd2035701, 0xac3a1280, 0x0a281d81]),
     controller_defaults: Some(encode_m5_policy_controller_defaults),
     idle_standby_us: None,
     mcc_mask: None,
@@ -2216,8 +2212,7 @@ pub(crate) const J716C: Board = Board {
     register_slot_flags: None,
     min_parameter_buffer: 0x0030_0000,
     render_pool: (0x80_0000, 1 << 33),
-    // Its own controller configuration, for a part with this calibration.
-    calibration: Some([0x7e4a4902, 0x8c4f3362, 0x96be56e5]),
+    // Its own controller configuration.
     controller_defaults: Some(encode_m5_policy_controller_defaults_j716c),
     idle_standby_us: None,
     // The ADT GPU node's active-mcc-bit-vector: eight memory cache controllers.
@@ -2255,8 +2250,7 @@ pub(crate) const J775D: Board = Board {
     min_parameter_buffer: 0x0050_0000,
     // 16 MiB render blocks in a 16 GiB inventory.
     render_pool: (0x100_0000, 1 << 34),
-    // The power model's synthetic leakage inputs hold for every J775D: no calibration words.
-    calibration: None,
+    // The power model's synthetic leakage inputs.
     controller_defaults: Some(encode_m5_policy_controller_defaults_j775d),
     idle_standby_us: Some(3500),
     // The ADT GPU node's active-mcc-bit-vector: eight memory cache controllers.
@@ -2296,7 +2290,6 @@ pub(crate) const J813: Board = Board {
     min_parameter_buffer: (super::target::min_parameter_buffer_pages(1) << 15) as u32,
     // Half J714's: 2 MiB render blocks in a 2 GiB inventory.
     render_pool: (0x20_0000, 1 << 31),
-    calibration: None,
     controller_defaults: None,
     idle_standby_us: None,
     // One memory cache controller (/arm-io/sgx active-mcc-bit-vector; 25G76 +0xf8c = 1).
@@ -3047,7 +3040,10 @@ pub(crate) fn encode_m5_bundle_policy(
     Ok(())
 }
 
-/// Initial controller inputs for J714 with the matched calibration.
+/// Initial controller inputs for J714, applied on every part. The leakage inputs are those of the
+/// part they were read from (calibration words 0xd2035701 0xac3a1280 0x0a281d81). The firmware
+/// holds its power estimate, not the draw, to the maximum: a part that leaks more draws more than
+/// the estimate; the emergency clamp still applies.
 pub(crate) fn encode_m5_policy_controller_defaults(out: &mut [u8]) -> Result<(), InitdataError> {
     if out.len() < M5_SHARED_PREFIX_SIZE { return Err(InitdataError::BufferSize); }
     // Both calibrated hardware curves, as J714's firmware expects them.
@@ -3309,8 +3305,8 @@ pub(crate) fn encode_m5_policy_controller_defaults(out: &mut [u8]) -> Result<(),
     Ok(())
 }
 
-/// Initial controller inputs for J716c with its matched calibration: the J714
-/// defaults, including the relative power curves, with this chip's leakage
+/// Initial controller inputs for J716c, applied on every part: the J714
+/// defaults, including the relative power curves, with the reference part's leakage
 /// values (clusters 0-3, base, AFR) and its maximum power (196098 mW), and the
 /// found masks of its AON PTD records (RT0g and RT1g, then RT0r) next to their
 /// tags.
