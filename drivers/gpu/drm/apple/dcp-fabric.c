@@ -1930,7 +1930,7 @@ static int dcp_typec_port_busy(struct apple_dcp_typec_port *port,
 }
 
 static int dcp_typec_route_apply(struct typec_mux_dev *mux,
-			       struct typec_mux_state *state)
+				 struct typec_mux_state *state)
 {
 	struct apple_dcp_typec_route *route = typec_mux_get_drvdata(mux);
 	struct apple_dcp_typec_port *port = route->port;
