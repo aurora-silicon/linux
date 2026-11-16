@@ -3113,14 +3113,18 @@ impl Queue {
             // bits 3:2. The generic work doorbell left the firmware to find the
             // ring itself and delayed dispatch.
             fence(Ordering::SeqCst);
-            host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
             if self.graph.m5 {
-                // The firmware work notification must precede a deferred host
-                // doorbell: an idle-policy hold alone does not wake gated cores.
+                // macOS's order on this firmware: the host-port transaction, with core gating
+                // held off across it (Host::submit_m5), then the work doorbell. Rung first, the
+                // doorbell can be served before the advance lands; the firmware then finds
+                // nothing new and goes idle, and the advance alone never wakes it, so the kick
+                // never runs. Held gating is what lets the advance land first: without the
+                // hold, gated cores did not take it.
                 host.submit_m5(&crate::g17::fw::m5::queue::HardwareSubmission::compute(
                     qid, self.kick.low_va(), policy.priority(),
                     first || notify_activation)?)?;
             }
+            host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
             crate::g17::trace::publish(crate::g17::trace::COMPUTE, qid, ordinal, &packet);
             host.note_submission()
         })();
@@ -3464,6 +3468,25 @@ impl Queue {
     /// A pool replacement is in flight for this queue.
     pub(crate) fn growing(&self) -> bool {
         self.growing
+    }
+
+    /// The host-port configuration of an installed M5 queue as its kicks last sent it (its kick
+    /// ring, at the priority class of its last publication), for a real wake to send again
+    /// before any doorbell: the configuration and validity only, no advance. None where the next
+    /// kick configures the queue anyway (it never kicked at any class, or was recycled since),
+    /// and off M5.
+    pub(crate) fn wake_configuration(
+        &self,
+    ) -> Result<Option<crate::g17::fw::m5::queue::HardwareSubmission>> {
+        if !self.graph.m5 || !self.installed || self.outer_started == 0 {
+            return Ok(None);
+        }
+        // On M5 a publication leaves exactly the bit of its own class (activation.rs).
+        let priority = self.outer_started.trailing_zeros() as u8;
+        crate::g17::fw::m5::queue::HardwareSubmission::configure_compute(
+            self.qid(), self.kick.low_va(), priority,
+        )
+        .map(Some)
     }
 
     /// The queue's first command has been published: its identity and configuration exist.
