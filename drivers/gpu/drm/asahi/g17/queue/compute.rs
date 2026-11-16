@@ -528,6 +528,41 @@ struct Active {
     /// has its result, but the firmware may still store the stamp through its descriptor: the
     /// descriptor stays held, and the command at the front, until the stamp covers it.
     stamps_owed: bool,
+    /// TEST ONLY (gpubench_opt bit 12): published with the pipelined parent class while its
+    /// parent was still in flight. While such a command is active, the queue's stamp no longer
+    /// proves that every older command completed, so retirement takes each command's own record
+    /// ([`Queue::retire`]), and a command that depends on earlier work waits on the host until
+    /// none is active ([`Queue::publish_with_native_waits`]).
+    pipelined: bool,
+}
+
+/// TEST ONLY (gpubench_opt bit 12): commands of queues with pipelined commands active that
+/// started before an earlier command of their queue ended, and those of them that also ended
+/// before it.
+static PIPELINED_EARLY_STARTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static PIPELINED_EARLY_ENDS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Counts a command that started at `start` (and ended at `end`, completion-record ticks) before
+/// the latest end `last_end` of the earlier commands of queue `qid`; logs the first and every
+/// 256th, and the first and every 64th that also ended before it.
+fn note_pipelined_overlap(qid: u8, start: u64, end: u64, last_end: u64) {
+    let starts = PIPELINED_EARLY_STARTS.fetch_add(1, Ordering::Relaxed) + 1;
+    let inverted = end < last_end;
+    let ends = if inverted {
+        PIPELINED_EARLY_ENDS.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        PIPELINED_EARLY_ENDS.load(Ordering::Relaxed)
+    };
+    if starts == 1 || starts % 256 == 0 || (inverted && (ends == 1 || ends % 64 == 0)) {
+        pr_info!(
+            "G17: TEST gpubench_opt bit 12: {} compute commands started before an earlier command of their queue ended, {} of them ended before it (latest: queue {}, {} ticks early{})\n",
+            starts,
+            ends,
+            qid,
+            last_end - start,
+            if inverted { ", ended first" } else { "" }
+        );
+    }
 }
 struct Previous<B = Binding, C = Arc<Context>> {
     binding: Option<B>,
@@ -1162,6 +1197,9 @@ impl Queue {
         while let Some(front) = self.active.front() {
             let mut restart = None;
             let mut crossed = false;
+            // TEST ONLY (gpubench_opt bit 12): with a pipelined command active, a newer kick of
+            // this queue may store the stamp that covers this command before it completes.
+            let overtakable = self.active.iter().any(|active| active.pipelined);
             let result = (|| {
                 let ticket = front.ticket.ok_or(EIO)?;
                 self.valid_ticket(front, &ticket)?;
@@ -1180,6 +1218,9 @@ impl Queue {
                 let recordless = if epoch != ticket.epoch {
                     crossed = true;
                     Recordless::CrossedRecovery
+                } else if overtakable {
+                    // Only its own record shows that this command completed.
+                    Recordless::NotYet
                 } else if masks.is_none() || (finished_before && oldest) {
                     Recordless::Allowed
                 } else {
@@ -1211,7 +1252,9 @@ impl Queue {
                     recordless,
                     self.last_end,
                     next_end,
-                    record_aged && !self.graph.m5,
+                    // An older kick's stamp may have replaced a newer one's: its own record,
+                    // aged, completes an overtakable command, as off M5.
+                    record_aged && (!self.graph.m5 || overtakable),
                 )?;
                 let stampless = !retirement::stamp_covers(stamp, ticket.kick);
                 if timestamps.is_some() && stampless {
@@ -1246,6 +1289,9 @@ impl Queue {
                         self.active.iter_mut().next().ok_or(EIO)?.qos_pending = false;
                     }
                     let front = self.active.front().ok_or(EIO)?;
+                    if overtakable && front.observed.is_some() && timestamps[0] < self.last_end {
+                        note_pipelined_overlap(self.qid(), timestamps[0], timestamps[1], self.last_end);
+                    }
                     if let Some(ticket) = front.ticket {
                         crate::g17::recovery::note_retired();
                         crate::g17::trace::complete(
@@ -2532,6 +2578,21 @@ impl Queue {
         self.quarantined && self.spared_quarantine && self.awaiting_witness
     }
 
+    /// TEST ONLY (gpubench_opt bit 12): whether `packet` waits for nothing an earlier command
+    /// of its queue produces: no barrier or prior on earlier commands of either engine, no
+    /// input fence or source, and no kick or native dependency.
+    fn independent(
+        packet: &Packet,
+        dependencies: &[crate::g17::fw::kick::KickDependency],
+        native: &[crate::g17::sync_input::NativeWait],
+    ) -> bool {
+        packet.order.wait_through.iter().all(Option::is_none)
+            && !packet.has_dependencies()
+            && packet.completion.sources().is_none()
+            && dependencies.is_empty()
+            && native.is_empty()
+    }
+
     /// Retains the packet before any potentially visible store. An error before publication
     /// rolls back its work count; every ambiguous error quarantines the graph and packet.
     pub(crate) fn publish(
@@ -2557,6 +2618,18 @@ impl Queue {
             compute::{ComputeArgs, ComputeDescriptor, COMPUTE_KICK_EVENT_MASK, COMPUTE_QOS_CLASS},
             kick::{KickArgs, KickQos},
         };
+        // TEST ONLY (gpubench_opt bit 12): the command waits for nothing an earlier command of
+        // its queue produces. While a pipelined command is active, a completion-class parent no
+        // longer covers the older kicks, so a command that is not independent waits on the host
+        // (backpressure: it is retried after retirement progress) until none is active. One
+        // that retired on its record and only holds its descriptor for a stamp is complete.
+        let independent = Self::independent(&packet, dependencies, native);
+        if !independent
+            && self.replays.len == 0
+            && self.active.iter().any(|active| active.pipelined && !active.stamps_owed)
+        {
+            return Err(EAGAIN);
+        }
         let (epoch, addresses) = self.publication_preflight(&packet, host)?;
         let crate::g17::command::Validated::Compute {
             matrix_ops: requested_matrix_ops,
@@ -2704,8 +2777,23 @@ impl Queue {
             && self.replays.len == 0
             && !self.quarantined
             && !self.awaiting_witness;
-        let parent_class = m5_board
-            .map(|board| crate::g17::fw::m5::compute::parent_dependency(board, parent_retired));
+        // TEST ONLY (gpubench_opt bit 12): an independent command of a queue that shares its
+        // execution context with another live queue takes the pipelined class for a parent
+        // still in flight, as macOS's M5 Pro kicks of the firmware queues of one API queue do.
+        let pipelined = !parent_retired
+            && self.active.len != 0
+            && self.replays.len == 0
+            && !self.quarantined
+            && !self.awaiting_witness
+            && independent
+            && m5_board.is_some_and(|board| {
+                crate::g17::fw::m5::compute::pipelined_parent_in_flight(board)
+            })
+            && crate::g17::opt(crate::g17::OPT_M5_PIPELINED_PARENT)
+            && packet.context.shares_execution_now();
+        let parent_class = m5_board.map(|board| {
+            crate::g17::fw::m5::compute::parent_dependency(board, parent_retired || pipelined)
+        });
         let m5_args = m5_board.zip(parent_class).map(|(board, parent_class)| {
             let tuple = crate::g17::fw::m5::compute::kick_tuple(board, parent_class);
             crate::g17::fw::m5::compute::DescriptorArgs {
@@ -2744,6 +2832,15 @@ impl Queue {
             event_metadata: crate::g17::fw::m5::compute::completion_forms(board).1,
             usage_fw_va: self.graph.usage.gpu_va(),
             completion_identity: crate::g17::fw::m5::compute::completion_forms(board).0,
+            // TEST ONLY (gpubench_opt bit 13): the queue's position among the queues sharing
+            // its execution context, in macOS's range (0, 1, 2).
+            queue_index: if crate::g17::fw::m5::compute::pipelined_parent_in_flight(board)
+                && crate::g17::opt(crate::g17::OPT_M5_QUEUE_INDEX)
+            {
+                u64::from(packet.context.execution_index() % 3)
+            } else {
+                0
+            },
         }});
         // Explicit dependencies take the board's class
         // ([`crate::g17::fw::m5::compute::explicit_dependency`]); the implicit parent, last,
@@ -2797,6 +2894,7 @@ impl Queue {
                 // A replay keeps its spared class: its own fault must still make it guilty.
                 spared_as_dropped: packet.completion.spared(),
                 stamps_owed: false,
+                pipelined,
             })
             .map_err(|_| EBUSY)?;
         self.retirement_ready = false;

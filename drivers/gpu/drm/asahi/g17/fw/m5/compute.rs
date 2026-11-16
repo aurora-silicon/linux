@@ -60,6 +60,18 @@ pub(crate) fn parent_dependency(board: &Board, parent_retired: bool) -> u8 {
     }
 }
 
+/// TEST ONLY (gpubench_opt bit 12): whether a compute kick on `board` may take the pipelined
+/// class for a parent that is still in flight. Only on boards whose explicit waits take the
+/// completion class ([`Board::completion_inputs`], the M5 Pro), where macOS gives every
+/// independent compute kick a pipelined parent with the auxiliary control set, whether or not
+/// the parent has completed ([`kick_tuple`] then sets it): its firmware queues start a kick at
+/// most a fraction of a microsecond before their previous kick ends, and finish them in order.
+/// Never with the G17D forms, where pipelined parents let two kicks of one queue run side by
+/// side, nor on the J813, where macOS gives every dependency the completion class.
+pub(crate) fn pipelined_parent_in_flight(board: &Board) -> bool {
+    board.completion_inputs() && !board.g17d_forms() && !board.j813_forms()
+}
+
 /// Whether compute kicks on `board` count their completion ordinal and hold for their parent:
 /// with the G17D forms, on boards whose explicit waits take the completion class
 /// ([`Board::completion_inputs`]), as macOS encodes M5 Pro compute, and on the J813, whose
@@ -475,6 +487,10 @@ pub(crate) struct DescriptorArgs {
     pub(crate) completion_identity: u64,
     /// The common 26A428 firmware's tail ([`Descriptor::tail`]).
     pub(crate) common26_tail: bool,
+    /// TEST ONLY (gpubench_opt bit 13): the word at +0xf58. macOS writes the position of the
+    /// kick's firmware queue among the firmware queues of its API queue there (0, 1, 2); 0 is
+    /// the driver's form.
+    pub(crate) queue_index: u64,
 }
 
 /// The M5 descriptor has a shorter reserved region before shared-control
@@ -503,7 +519,8 @@ pub(crate) struct Descriptor {
     stamp_va: [u64; 2],
     stamp_value: u32,
     qid: u32,
-    reserved_f58: u64,
+    /// The queue's position among its API queue's firmware queues ([`DescriptorArgs::queue_index`]).
+    queue_index: u64,
     kick_timestamp: u64,
     current_id: u64,
     completion_ordinal: u32,
@@ -574,6 +591,7 @@ impl Descriptor {
         self.stamp_va = args.stamp_va;
         self.stamp_value = args.stamp_value;
         self.qid = args.qid;
+        self.queue_index = args.queue_index;
         self.kick_timestamp = args.kick_timestamp;
         self.current_id = args.registers.object_ids as u32 as u64;
         self.completion_ordinal = args.completion_ordinal;

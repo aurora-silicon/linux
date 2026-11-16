@@ -24,7 +24,7 @@
 
 use super::context::SharedStates;
 use crate::mmu::{ExecutionContext, Vm};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use kernel::{prelude::*, sync::Arc};
 
 unsafe extern "C" {
@@ -71,6 +71,10 @@ struct Entry {
     execution: Arc<ExecutionContext>,
     states: Arc<SharedStates>,
     sharers: Sharers,
+    /// TEST ONLY (gpubench_opt bits 12 and 13): sharers that have not left, readable without
+    /// the registry lock, and the number of uses ever made of this context.
+    peers: Arc<AtomicU32>,
+    joined: u32,
 }
 
 kernel::sync::global_lock! {
@@ -100,15 +104,31 @@ pub(crate) struct Use {
     execution: Arc<ExecutionContext>,
     states: Arc<SharedStates>,
     left: AtomicBool,
+    peers: Arc<AtomicU32>,
+    index: u32,
 }
 
 impl Use {
-    fn new(entry: &Entry) -> Self {
+    fn new(entry: &Entry, index: u32) -> Self {
         Self {
             execution: entry.execution.clone(),
             states: entry.states.clone(),
             left: AtomicBool::new(false),
+            peers: entry.peers.clone(),
+            index,
         }
+    }
+
+    /// TEST ONLY: how many queues use this execution context now, this one included (it may
+    /// change as soon as it is read).
+    pub(crate) fn peers(&self) -> u32 {
+        self.peers.load(Ordering::Relaxed)
+    }
+
+    /// TEST ONLY: this use's position among the uses of the context, in creation order: 0 for
+    /// the queue that offered it, then 1, 2, ... for the queues that joined it.
+    pub(crate) fn index(&self) -> u32 {
+        self.index
     }
 
     pub(crate) fn states(&self) -> &Arc<SharedStates> {
@@ -136,6 +156,7 @@ impl Use {
         if self.left.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.peers.fetch_sub(1, Ordering::Relaxed);
         let mut shares = SHARES.lock();
         let Some(index) = shares
             .iter()
@@ -169,7 +190,10 @@ pub(crate) fn join(vm: &Vm) -> Option<(Arc<ExecutionContext>, Use)> {
         .iter_mut()
         .find(|entry| same_vm(entry.execution.vm(), vm) && entry.execution.is_current())?;
     entry.sharers.join()?;
-    Some((entry.execution.clone(), Use::new(entry)))
+    let index = entry.joined;
+    entry.joined = entry.joined.saturating_add(1);
+    entry.peers.fetch_add(1, Ordering::Relaxed);
+    Some((entry.execution.clone(), Use::new(entry, index)))
 }
 
 /// Offers `execution`, just created for a queue of its VM, to that VM's later queues.
@@ -178,8 +202,10 @@ pub(crate) fn offer(execution: &Arc<ExecutionContext>) -> Result<Use> {
         execution: execution.clone(),
         states: SharedStates::new()?,
         sharers: Sharers::new(),
+        peers: Arc::new(AtomicU32::new(1), GFP_KERNEL)?,
+        joined: 1,
     };
-    let share = Use::new(&entry);
+    let share = Use::new(&entry, 0);
     let pushed = SHARES.lock().push(entry, GFP_KERNEL);
     if pushed.is_err() {
         // Never listed: leaving must not find or release anything.

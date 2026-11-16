@@ -1195,6 +1195,15 @@ pub(crate) const OPT_LATENCY: u32 = 1 << 8;
 pub(crate) const OPT_REPORTS_LAST: u32 = 1 << 20;
 pub(crate) const OPT_RESERVICE: u32 = 1 << 21;
 pub(crate) const OPT_HANDOFF: u32 = 1 << 22;
+/// TEST ONLY, M5 Pro compute overlap A/B (queue/compute.rs): an independent compute kick of a
+/// queue that shares its execution context with another live queue (aurora.m5_shared_context
+/// and sibling queues) takes the pipelined parent class and auxiliary control 1, macOS's
+/// per-kick form, while its parent is still in flight.
+pub(crate) const OPT_M5_PIPELINED_PARENT: u32 = 1 << 12;
+/// TEST ONLY, M5 Pro compute overlap A/B: a compute descriptor names its queue's position among
+/// the queues sharing its execution context at +0xf58 (0, 1, 2), as macOS's do for the firmware
+/// queues of one API queue.
+pub(crate) const OPT_M5_QUEUE_INDEX: u32 = 1 << 13;
 
 /// Event work item ID.
 const EVENT_WORK: u64 = 0;

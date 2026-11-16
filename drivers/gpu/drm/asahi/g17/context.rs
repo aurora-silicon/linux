@@ -453,6 +453,16 @@ impl Context {
     pub(crate) fn scheduler_generation(&self) -> u32 {
         self.scheduler_generation
     }
+    /// TEST ONLY (gpubench_opt bit 12): whether this context still shares its execution
+    /// identity with at least one other live context of its VM (aurora.m5_shared_context).
+    pub(crate) fn shares_execution_now(&self) -> bool {
+        self.share.as_ref().is_some_and(|share| !share.released() && share.peers() >= 2)
+    }
+    /// TEST ONLY (gpubench_opt bit 13): this context's position among the contexts sharing its
+    /// execution identity, in creation order (0 for an unshared context).
+    pub(crate) fn execution_index(&self) -> u32 {
+        self.share.as_ref().map_or(0, |share| share.index())
+    }
     /// The pages an installed queue record of this context still names: the
     /// scheduler page and the work storage holding the job-list head. A retained
     /// physical queue keeps these after dropping the context itself.
