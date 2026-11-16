@@ -136,6 +136,10 @@ module! {
             default: 0x200,
             description: "M5 mesh rendering buffer bound to API task (object-stage) render kicks only, in 64 KiB chunks; 0 disables the binding and the task feature",
         },
+        m5_probe_only: u32 {
+            default: 0,
+            description: "M5 (T8142) on 26A428: 1 logs the GPU ID registers and core masks and refuses the GPU before the UAT or the firmware are touched (bring-up); 0 starts the board's configuration",
+        },
         m5_thermal_governor: u32 {
             default: 0,
             description: "M5 thermal flags: bit 0 enables the host GPU power budget controller, bit 2 lets the controller lower the CPU frequency ceiling while the GPU is budget-bound, bit 3 runs the fans at their maximum while it governs; default 0 preserves the existing policy",

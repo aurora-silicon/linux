@@ -1,13 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
-//! M5 (T8142, MacBook Air J813) on the macOS 27.0 (26A428) and 27.2 (26B123) GPU firmware.
+//! M5 (T8142: MacBook Air J813, MacBook Pro 14-inch J704) on the macOS 27.0 (26A428) and, for the
+//! J813, 27.2 (26B123) GPU firmware.
 //!
-//! Bring-up only: the M5 graph ([`crate::g17::fw::m5::initdata`]) has no J813 board yet, so
 //! [`PROBE`] stops at the identity check, after `get_g17_id` has logged the ID registers and
-//! core masks, before the UAT or the firmware are touched.
+//! core masks, before the UAT or the firmware are touched. [`select`] picks it when the
+//! `m5_probe_only` module parameter is set (`aurora.m5_probe_only=1` with the driver built in);
+//! otherwise the board's own configuration, by the root compatible: [`CONFIG_J704`] on
+//! `apple,j704`, [`CONFIG`] (the J813) on everything else, as before.
 //!
 //! J813 (2026-11-07): ID registers 0xb022000 0xb0800 0x11010a 0x40404 0x1320311 0x10030302,
 //! family 0xb, variant 2, one die, one cluster of ten core slots; core mask 0x3bd (eight
 //! enabled, slots 1 and 6 fused off).
+//!
+//! J704 (m1n1 proxy reads of SGX, before this driver): the same ID registers, core mask 0x3ff
+//! (all ten slots enabled).
+use kernel::prelude::*;
 use crate::g17::{Config, CoreLayout, CrashBuffers, FirmwareProfile, Identity};
 use crate::hw::{GpuGen, GpuVariant};
 
@@ -160,3 +167,39 @@ const _: () = assert!(
     CONFIG.core_layout.operand_state.bank_bytes()
         == crate::g17::fw::m5::initdata::J813.gpu_cores * 0x1800
 );
+
+/// The J704 on the M5 graph: [`CONFIG`] with the J704 board (thirteen perf states up to
+/// 1620 MHz, its own AON rows, region C and power policy words). Same GPU identity and core layout as the J813.
+/// Only the 26A428 build: [`CONFIG_26B123`] carries the J813's board, so a J704 on the 27.2
+/// firmware is refused rather than run with the J813's power values.
+pub(crate) const CONFIG_J704: Config = Config {
+    m5: Some(&crate::g17::fw::m5::initdata::J704),
+    firmware: crate::g17::fw::variant::Firmware::Identified(&[BUILD_26A428]),
+    ..CONFIG
+};
+
+const _: () = assert!(
+    CONFIG_J704.core_layout.operand_state.bank_bytes()
+        == crate::g17::fw::m5::initdata::J704.gpu_cores * 0x1800
+);
+
+/// Whether the root node's compatible list names `compatible`. A failed read (no root node,
+/// no property, or no memory for the copy) is an error, so that a J704 never falls back to the
+/// J813's power values silently.
+fn machine_is(compatible: &[u8]) -> Result<bool> {
+    let root = kernel::of::root().ok_or(ENODEV)?;
+    let list = root.get_property::<kernel::alloc::KVec<u8>>(kernel::c_str!("compatible"))?;
+    Ok(list.split(|b| *b == 0).any(|s| s == compatible))
+}
+
+/// The configuration the 26A428 (G17) path of a T8142 starts with: [`PROBE`] when the
+/// `m5_probe_only` module parameter is set, else the board's, by the root compatible.
+pub(crate) fn select() -> Result<&'static Config> {
+    if crate::module_parameters::m5_probe_only.value() != 0 {
+        Ok(&PROBE)
+    } else if machine_is(b"apple,j704")? {
+        Ok(&CONFIG_J704)
+    } else {
+        Ok(&CONFIG)
+    }
+}
