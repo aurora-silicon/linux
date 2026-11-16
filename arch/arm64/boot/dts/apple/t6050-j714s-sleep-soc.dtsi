@@ -4562,3 +4562,31 @@
 &sgx {
 	apple,sleep-ps-auto = <0xf>;
 };
+
+/*
+ * TEST: the right port's USB4 router sleeping in place, with its tunnels kept, as macOS has
+ * it (run mxt4; drivers/thunderbolt/apple-cio-sleep.c). The clock protection slices of the
+ * NHI's and the tunnelled PCIe's DART are words 0x880 and 0x8c0 of the block the sleep
+ * controller knows as "gapf": macOS writes each to its off value (bit 4 clear) right after
+ * taking that DART down and back to the live value before using it again. The router's host
+ * also needs the port's PHY, which it stops after the router and starts before it. The left
+ * port's router was never up in a trace: it has none of this and is powered off for a sleep.
+ */
+&die0 {
+	ps_prot: syscon@2803f0000 {
+		compatible = "apple,t6050-ps-prot", "syscon";
+		reg = <0x2 0x803f0000 0x0 0x4000>;
+	};
+};
+
+&acio2 {
+	apple,cio-phy = <&atc2_phy>;
+};
+
+&acio2_dart {
+	apple,clock-protection = <&ps_prot 30>;
+};
+
+&apciec2_dart {
+	apple,clock-protection = <&ps_prot 31>;
+};

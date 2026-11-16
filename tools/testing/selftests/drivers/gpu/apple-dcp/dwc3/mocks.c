@@ -107,6 +107,12 @@ struct dwc3_apple {
 	enum dwc3_apple_sleep_phase sleep_phase;
 	bool sleep_syscore, sleep_role_pending;
 	enum dwc3_apple_state sleep_role;
+	/*
+	 * J714s only: a host kept suspended on its USB4 router's USB3 tunnel through the
+	 * router's sleep, and the role its port controller asked for meanwhile.
+	 */
+	bool sleep_tunnel;
+	enum usb_role sleep_tunnel_role;
 };
 /* The epoch spinlock: taken only when free, released only when held. */
 #define spin_lock_irqsave(l, f) do { assert(!*(l)); *(l) = 1; (f) = 0; } while (0)

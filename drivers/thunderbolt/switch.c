@@ -11,6 +11,7 @@
 #include <linux/idr.h>
 #include <linux/module.h>
 #include <linux/nvmem-provider.h>
+#include <linux/of.h>
 #include <linux/pm_runtime.h>
 #include <linux/sched/signal.h>
 #include <linux/sizes.h>
@@ -2639,6 +2640,9 @@ int tb_switch_configure(struct tb_switch *sw)
 
 	/* Set Notification Timeout to 255 ms for all routers */
 	sw->config.plug_events_delay = 0xff;
+	/* TEST: placeholder from run mxt6: macOS enumerates the host and the dock with 10 ms. */
+	if (tb->nhi->quirks & QUIRK_CIO_MACOS_FRAMES)
+		sw->config.plug_events_delay = 0x0a;
 	if (tb_switch_is_usb4(sw)) {
 		/*
 		 * For USB4 devices, we need to program the CM version
@@ -3751,6 +3755,375 @@ void tb_switch_suspend(struct tb_switch *sw, bool runtime)
 		tb_lc_set_sleep(sw);
 }
 
+/*
+ * TEST: what macOS sends to the dock before a T6050 host's sleep in place (run mxt6, both
+ * sleeps): PORT_CS_19 of every lane adapter with bits 19:16 set (0x800f000e upstream,
+ * 0x000f0006 downstream: the three wake enables and bit 19, whose name is not known here),
+ * ROUTER_CS_5 with WoP and WoU set (0x97000006), then the sleep bit (0x97000007) and the
+ * wait for sleep ready. The values are what the router holds plus those bits.
+ *
+ * J714s: macOS reads the dock's sleep ready on a 12 ms period and sends its first frame
+ * to the host router one period after it reads it set (mxt6 and mxt6b, four sleeps:
+ * 12.1 ms each time). The host's part follows here as late, not at once.
+ */
+#define PORT_CS_19_CIO_WAKES	GENMASK(19, 16)
+#define TB_CIO_MACOS_HOST_AFTER_DOCK_MS	12
+
+/*
+ * TEST (sv6t9): when the last device router was given its sleep bit and when it reported
+ * sleep ready. Nothing is printed in between: the host's part follows; the connection
+ * manager prints it behind the host's request.
+ */
+static struct {
+	u64 route;
+	ktime_t bit, ready;
+	int ret;
+} tb_cio_test_dock;
+
+void tb_switch_cio_test_dock(u64 *route, ktime_t *bit, ktime_t *ready, int *ret)
+{
+	*route = tb_cio_test_dock.route;
+	*bit = tb_cio_test_dock.bit;
+	*ready = tb_cio_test_dock.ready;
+	*ret = tb_cio_test_dock.ret;
+	/* Taken once a sleep: a later one without a dock reports none. */
+	memset(&tb_cio_test_dock, 0, sizeof(tb_cio_test_dock));
+}
+
+static int tb_switch_sleep_cio_frames(struct tb_switch *sw)
+{
+	struct tb_port *port;
+	u32 val;
+	int ret;
+
+	tb_switch_for_each_port(sw, port) {
+		if (!tb_port_is_null(port) || !port->cap_usb4)
+			continue;
+		ret = tb_port_read(port, &val, TB_CFG_PORT, port->cap_usb4 + PORT_CS_19, 1);
+		if (ret)
+			return ret;
+		val |= PORT_CS_19_CIO_WAKES;
+		ret = tb_port_write(port, &val, TB_CFG_PORT, port->cap_usb4 + PORT_CS_19, 1);
+		if (ret)
+			return ret;
+	}
+	ret = tb_sw_read(sw, &val, TB_CFG_SWITCH, ROUTER_CS_5, 1);
+	if (ret)
+		return ret;
+	val |= ROUTER_CS_5_WOP | ROUTER_CS_5_WOU;
+	ret = tb_sw_write(sw, &val, TB_CFG_SWITCH, ROUTER_CS_5, 1);
+	if (ret)
+		return ret;
+	tb_cio_test_dock.route = tb_route(sw);
+	tb_cio_test_dock.bit = ktime_get();
+	ret = usb4_switch_set_sleep(sw);
+	tb_cio_test_dock.ready = ktime_get();
+	tb_cio_test_dock.ret = ret;
+	if (!ret && of_machine_is_compatible("apple,j714s"))
+		msleep(TB_CIO_MACOS_HOST_AFTER_DOCK_MS);
+	return ret;
+}
+
+/*
+ * TEST (sv6u2): what tb_switch_cio_macos_host_state() found and left: the first link's two
+ * LANE_ADP_CS_1 words read before and after its roles are given, and each DP IN adapter's
+ * ADP_DP_CS_3 read before and after. Nothing is printed before the routers' frames: the
+ * connection manager prints it behind the host's request, once its outcome is known.
+ */
+static struct {
+	struct tb_port *down, *up;
+	u32 down_was, down_now, up_was, up_now;
+	int lane_reads;
+	unsigned int n_dpin;
+	u8 dpin[4];
+	u32 dpin_was[4], dpin_now[4];
+	int ret;
+	bool set;
+	ktime_t at;
+} tb_cio_test_host;
+
+/*
+ * TEST (sv6u3): the last tb_switch_cio_pm_roles() that applied: who called it, when, and
+ * the link's two LANE_ADP_CS_1 words before and after. Each one prints its own line; the
+ * last is printed again behind the host's request, against the words at the sleep entry.
+ */
+static struct {
+	void *caller;
+	ktime_t at;
+	unsigned int count;
+	u32 down_was, down_now, up_was, up_now;
+	int ret;
+} tb_cio_test_roles;
+
+static void tb_cio_test_roles_words(struct tb_switch *sw, u32 *down, u32 *up)
+{
+	struct tb_port *u = tb_upstream_port(sw), *d = tb_switch_downstream_port(sw);
+
+	*down = 0;
+	*up = 0;
+	tb_port_read(d, down, TB_CFG_PORT, d->cap_phy + LANE_ADP_CS_1, 1);
+	tb_port_read(u, up, TB_CFG_PORT, u->cap_phy + LANE_ADP_CS_1, 1);
+}
+
+static void tb_cio_test_roles_tmu(struct tb_port *port, u32 *tmu)
+{
+	static const u8 regs[3] = { TMU_ADP_CS_6, TMU_ADP_CS_8, TMU_ADP_CS_9 };
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(regs); i++) {
+		tmu[i] = 0;
+		if (port->cap_tmu)
+			tb_port_read(port, &tmu[i], TB_CFG_PORT, port->cap_tmu + regs[i], 1);
+	}
+}
+
+static void tb_cio_test_roles_done(struct tb_switch *sw, int ret, void *caller)
+{
+	struct tb_port *u = tb_upstream_port(sw), *d = tb_switch_downstream_port(sw);
+	u32 dt[3], ut[3];
+
+	tb_cio_test_roles_words(sw, &tb_cio_test_roles.down_now, &tb_cio_test_roles.up_now);
+	tb_cio_test_roles.caller = caller;
+	tb_cio_test_roles.at = ktime_get();
+	tb_cio_test_roles.ret = ret;
+	tb_cio_test_roles.count++;
+	tb_cio_test_roles_tmu(d, dt);
+	tb_cio_test_roles_tmu(u, ut);
+	tb_sw_info(sw, "TEST sv6u3: link %llx:%u <-> %llx:%u PM roles given by %pS (#%u since boot) (%d): LANE_ADP_CS_1 %#x -> %#x on the host (PM %s), %#x -> %#x on the device router (PM %s) (macOS, once the dock's configuration is valid and it is ready, mxt6 W1 +0.660, W2 +0.640, mxt6b W1 +0.639, W2 +0.674, and at the start of each sleep entry: the host 0x4822001e -> 0x0822001e, PM secondary as it comes up from each restart, the dock 0x4822001e); TMU_ADP_CS_6/8/9 on the host %#x %#x %#x, on the device router %#x %#x %#x (macOS after its TMU writes at W1 and W2: host 0x0 0x8753 0x10ffde, dock 0x100000 0x8000 0x10ff00)\n",
+		   tb_route(d->sw), d->port, tb_route(sw), u->port, caller,
+		   tb_cio_test_roles.count, ret,
+		   tb_cio_test_roles.down_was, tb_cio_test_roles.down_now,
+		   tb_cio_test_roles.down_now & LANE_ADP_CS_1_PMS ? "SECONDARY" : "primary",
+		   tb_cio_test_roles.up_was, tb_cio_test_roles.up_now,
+		   tb_cio_test_roles.up_now & LANE_ADP_CS_1_PMS ? "secondary" : "PRIMARY",
+		   dt[0], dt[1], dt[2], ut[0], ut[1], ut[2]);
+}
+
+static void tb_cio_test_host_lane(struct tb_port *down, struct tb_switch *sw, bool after)
+{
+	struct tb_port *up = tb_upstream_port(sw);
+	u32 d = 0, u = 0;
+
+	/* The first link only: J714s has one per port. */
+	if (tb_cio_test_host.down && tb_cio_test_host.down != down)
+		return;
+	tb_cio_test_host.down = down;
+	tb_cio_test_host.up = up;
+	tb_cio_test_host.lane_reads |=
+		tb_port_read(down, &d, TB_CFG_PORT, down->cap_phy + LANE_ADP_CS_1, 1) |
+		tb_port_read(up, &u, TB_CFG_PORT, up->cap_phy + LANE_ADP_CS_1, 1);
+	if (after) {
+		tb_cio_test_host.down_now = d;
+		tb_cio_test_host.up_now = u;
+	} else {
+		tb_cio_test_host.down_was = d;
+		tb_cio_test_host.up_was = u;
+	}
+}
+
+static void tb_cio_test_host_dpin(struct tb_port *port, u32 was)
+{
+	unsigned int n = tb_cio_test_host.n_dpin;
+	u32 now = was;
+
+	if (n >= ARRAY_SIZE(tb_cio_test_host.dpin))
+		return;
+	if (was & ADP_DP_CS_3_HPDC)
+		tb_port_read(port, &now, TB_CFG_PORT, port->cap_adap + ADP_DP_CS_3, 1);
+	tb_cio_test_host.dpin[n] = port->port;
+	tb_cio_test_host.dpin_was[n] = was;
+	tb_cio_test_host.dpin_now[n] = now;
+	tb_cio_test_host.n_dpin = n + 1;
+}
+
+/*
+ * TEST (J714s): the host router's own adapters as macOS has them when the routers are told
+ * to sleep (runs mxt6 and mxt6b, four sleeps). Sent before the device routers' frames, in
+ * macOS's order:
+ *
+ * - The PM roles of each link to a device router: the device router's lane adapter PM
+ *   secondary, the host's lane adapter PM primary. tb_switch_cio_pm_roles() gives them where
+ *   macOS does, at the device router's enumeration, after each wake and at the start of the
+ *   sleep entry; they are written once more here. The CL states are off by then: each of
+ *   those points ends with them off (tb_switch_clx_macos_cycle()).
+ *
+ * - The HPD clear of each DP IN adapter given back: macOS clears HPD when it tears a display
+ *   tunnel down, and writes the bit back one 12 ms period later, so it is clear again before
+ *   the routers' sleep. tb_dp_port_hpd_clear() leaves it set until the adapter's next tunnel.
+ *   The last DP IN adapter first: macOS's teardown order.
+ */
+static int tb_switch_cio_macos_host_state(struct tb_switch *sw)
+{
+	struct tb_port *port;
+	unsigned int i;
+	u32 val, was;
+	int ret;
+
+	memset(&tb_cio_test_host, 0, sizeof(tb_cio_test_host));	/* TEST */
+	tb_cio_test_host.set = true;	/* TEST */
+	tb_cio_test_host.at = ktime_get();	/* TEST (sv6u3) */
+	tb_switch_for_each_port(sw, port) {
+		if (!tb_port_has_remote(port))
+			continue;
+		tb_cio_test_host_lane(port, port->remote->sw, false);	/* TEST */
+		ret = tb_switch_clx_pm_roles(port->remote->sw);
+		tb_cio_test_host_lane(port, port->remote->sw, true);	/* TEST */
+		if (ret)
+			return ret;
+	}
+	for (i = sw->config.max_port_number; i > 0; i--) {
+		port = &sw->ports[i];
+		if (port->disabled || !tb_port_is_dpin(port) || !port->cap_adap)
+			continue;
+		ret = tb_port_read(port, &val, TB_CFG_PORT, port->cap_adap + ADP_DP_CS_3, 1);
+		if (ret)
+			return ret;
+		was = val;	/* TEST */
+		if (!(val & ADP_DP_CS_3_HPDC)) {
+			tb_cio_test_host_dpin(port, was);	/* TEST */
+			continue;
+		}
+		val &= ~ADP_DP_CS_3_HPDC;
+		ret = tb_port_write(port, &val, TB_CFG_PORT, port->cap_adap + ADP_DP_CS_3, 1);
+		tb_cio_test_host_dpin(port, was);	/* TEST */
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+/*
+ * TEST (sv6u2): printed behind the host's request. After a refusal the host router is awake
+ * and its words are read once more (the device routers may be asleep or gone: not read);
+ * after the firmware's sleep nothing more is read.
+ */
+void tb_switch_cio_test_host(struct tb *tb, bool slept)
+{
+	char dpin[192] = "", again[192] = "";
+	struct tb_port *down = tb_cio_test_host.down;
+	size_t at = 0;
+	unsigned int i;
+	u32 val;
+
+	if (!tb_cio_test_host.set)
+		return;
+	for (i = 0; i < tb_cio_test_host.n_dpin; i++)
+		at += scnprintf(dpin + at, sizeof(dpin) - at, "%sDP IN %u ADP_DP_CS_3 %#x -> %#x%s",
+				i ? ", " : "", tb_cio_test_host.dpin[i],
+				tb_cio_test_host.dpin_was[i], tb_cio_test_host.dpin_now[i],
+				tb_cio_test_host.dpin_now[i] & ADP_DP_CS_3_HPDC ? " (STILL SET)" : "");
+	if (!tb_cio_test_host.n_dpin)
+		scnprintf(dpin, sizeof(dpin), "no DP IN adapter");
+	if (slept) {
+		scnprintf(again, sizeof(again), "the host router asleep: not read again");
+	} else {
+		at = scnprintf(again, sizeof(again), "read again behind the refusal:");
+		if (down && !tb_port_read(down, &val, TB_CFG_PORT, down->cap_phy + LANE_ADP_CS_1, 1))
+			at += scnprintf(again + at, sizeof(again) - at, " host LANE_ADP_CS_1 %#x (PM %s)",
+					val, val & LANE_ADP_CS_1_PMS ? "secondary" : "primary");
+		for (i = 0; i < tb_cio_test_host.n_dpin; i++) {
+			struct tb_port *port = &tb->root_switch->ports[tb_cio_test_host.dpin[i]];
+
+			if (!tb_port_read(port, &val, TB_CFG_PORT, port->cap_adap + ADP_DP_CS_3, 1))
+				at += scnprintf(again + at, sizeof(again) - at, ", DP IN %u ADP_DP_CS_3 %#x",
+						port->port, val);
+		}
+	}
+	tb_info(tb, "TEST sv6u2: the host router's adapters before the routers' sleep bits, as macOS has them (mxt6, mxt6b, four sleeps) (%d): link %llx:%u <-> %llx:%u PM roles: LANE_ADP_CS_1 %#x -> %#x on the host (PM %s), %#x -> %#x on the device router (PM %s) (reads %d) (macOS: 0x0822001e on the host, primary, set at its enumeration, and 0x4822001e on the dock, secondary; sv6u1: 0x4822001e on both, both secondary); HPD clear given back: %s (macOS: 0x200 read, 0x0 written one 12 ms period after its HPD clear; sv6u1: 0x200 left set); %s\n",
+		tb_cio_test_host.ret,
+		down ? tb_route(down->sw) : 0ULL, down ? down->port : 0,
+		tb_cio_test_host.up ? tb_route(tb_cio_test_host.up->sw) : 0ULL,
+		tb_cio_test_host.up ? tb_cio_test_host.up->port : 0,
+		tb_cio_test_host.down_was, tb_cio_test_host.down_now,
+		tb_cio_test_host.down_now & LANE_ADP_CS_1_PMS ? "SECONDARY" : "primary",
+		tb_cio_test_host.up_was, tb_cio_test_host.up_now,
+		tb_cio_test_host.up_now & LANE_ADP_CS_1_PMS ? "secondary" : "PRIMARY",
+		tb_cio_test_host.lane_reads, dpin, again);
+	/* TEST (sv6u3): the roles' last write before the sleep entry, and whether they held. */
+	if (tb_cio_test_roles.count)
+		tb_info(tb, "TEST sv6u3: the link's PM roles before the routers' sleep bits: last given %lld ms before the sleep entry by %pS (#%u since boot) (%d), leaving %#x on the host and %#x on the device router; at the sleep entry %#x and %#x: %s (macOS: given at each enumeration and again at the start of its sleep entry, 0.36 s before the dock's sleep bit; sv6u2: given only 25 ms before the request, its sleep not run)\n",
+			ktime_ms_delta(tb_cio_test_host.at, tb_cio_test_roles.at),
+			tb_cio_test_roles.caller, tb_cio_test_roles.count, tb_cio_test_roles.ret,
+			tb_cio_test_roles.down_now, tb_cio_test_roles.up_now,
+			tb_cio_test_host.down_was, tb_cio_test_host.up_was,
+			tb_cio_test_host.down_was == tb_cio_test_roles.down_now &&
+			tb_cio_test_host.up_was == tb_cio_test_roles.up_now ? "held" : "CHANGED");
+	else
+		tb_info(tb, "TEST sv6u3: the link's PM roles were never given at an enumeration, a wake or a sleep's prepare before the routers' sleep bits\n");
+	/* TEST (sv6u4): the CL states' last cycle, and the firmware's lines for it. */
+	tb_clx_test_sleep_report(tb, tb_cio_test_host.at);
+	/* Taken once a sleep. */
+	memset(&tb_cio_test_host, 0, sizeof(tb_cio_test_host));
+}
+
+/* TEST (J714s): set once a link's CL-state cycle fails; then the links get their roles only. */
+static bool tb_cio_clx_cycle_failed;
+
+/**
+ * tb_switch_cio_pm_roles() - Give a link to the host router the PM roles macOS gives it
+ * @sw: Router whose link to its parent router is set
+ *
+ * TEST (J714s): macOS gives the link from the host router to the dock its PM roles each
+ * time it enumerates the dock, before anything else on that link (runs mxt6 and mxt6b, the
+ * enumeration after each of four wakes). Once the dock's link is configured, its TMU set
+ * and its configuration valid, and the dock reports itself ready, macOS writes the dock's
+ * lane adapter PM secondary, then the host's lane adapter PM primary; its CL states and
+ * tunnels come after. No retraining follows. The host's lane adapter comes up from each
+ * router restart PM secondary, and macOS reads it so up to that write. macOS writes the same
+ * two words again at the start of each sleep entry, as the end of its CL states' disable and
+ * before it tears the display tunnels down.
+ *
+ * tb_switch_clx_enable() gives the roles only before it enables CL states, so with the host
+ * router out of CL states (%QUIRK_NO_CLX) both ends of the link stayed PM secondary, and the
+ * host router's firmware, asked to sleep, never started its own sleep (sv6u1). Given just
+ * before the routers' frames, 25 ms before the request, the roles held and its sleep still
+ * did not start (sv6u2). They are now given where macOS gives them: once the router's
+ * configuration is valid at its enumeration (tb_scan_port()) and after each wake
+ * (tb_restore_children()), and at the start of the sleep entry (tb_cio_sleep_prepare()).
+ * Given there, they held, and its sleep still did not start (sv6u3).
+ *
+ * The host router's firmware has never logged a change of its CL configuration under Linux;
+ * under macOS it logs one at each of the host's CL-state writes, which come right after the
+ * roles at each enumeration and start each sleep entry. At each of these points the link
+ * now also gets macOS's CL-state writes, on and then off again, in macOS's order and with
+ * no wait (tb_switch_clx_macos_cycle()), so it is never left with its CL states on: macOS
+ * keeps them on from each enumeration to its sleep entry, and this router's Gen4 links
+ * dropped when Linux left them on (apple.c). A cycle that fails, or ends with either lane
+ * adapter down, leaves the CL states off, warns at an enumeration or a wake and refuses the
+ * sleep at its prepare; no link is cycled again while the driver stays loaded.
+ *
+ * Return: %0 on success or for any other link, negative errno otherwise.
+ */
+int tb_switch_cio_pm_roles(struct tb_switch *sw)
+{
+	struct tb_switch *parent = tb_switch_parent(sw);
+	int ret;
+
+	if (!parent || tb_route(parent) || !(parent->quirks & QUIRK_NO_CLX) ||
+	    !(sw->tb->nhi->quirks & QUIRK_CIO_MACOS_FRAMES) || !tb_switch_is_usb4(parent) ||
+	    !tb_switch_is_usb4(sw) || !of_machine_is_compatible("apple,j714s"))
+		return 0;
+	/* TEST (sv6u3) */
+	tb_cio_test_roles_words(sw, &tb_cio_test_roles.down_was, &tb_cio_test_roles.up_was);
+	ret = tb_switch_clx_pm_roles(sw);
+	tb_cio_test_roles_done(sw, ret, __builtin_return_address(0));	/* TEST (sv6u3) */
+	if (ret)
+		return ret;
+	if (tb_cio_clx_cycle_failed) {
+		/* TEST (sv6u4) */
+		tb_sw_info(sw, "TEST sv6u4: its link's CL states not cycled: an earlier cycle failed\n");
+		return 0;
+	}
+	tb_clx_test_set_caller(__builtin_return_address(0));	/* TEST (sv6u4) */
+	ret = tb_switch_clx_macos_cycle(sw);
+	if (ret) {
+		tb_cio_clx_cycle_failed = true;
+		tb_sw_warn(sw, "its link's CL states did not take macOS's cycle (%d): they are off, and no link is cycled again\n",
+			   ret);
+	}
+	return ret;
+}
+
 /* The CIO host uses its own enter-sleep command after its children sleep. */
 int tb_switch_suspend_cio(struct tb_switch *sw)
 {
@@ -3765,6 +4138,13 @@ int tb_switch_suspend_cio(struct tb_switch *sw)
 	ret = tb_plug_events_active(sw, false);
 	if (ret)
 		return ret;
+	if ((sw->tb->nhi->quirks & QUIRK_CIO_MACOS_FRAMES) && tb_switch_is_usb4(sw) &&
+	    !tb_route(sw) && of_machine_is_compatible("apple,j714s")) {
+		ret = tb_switch_cio_macos_host_state(sw);
+		tb_cio_test_host.ret = ret;	/* TEST */
+		if (ret)
+			return ret;
+	}
 	tb_switch_for_each_port(sw, port) {
 		if (port->xdomain)
 			return -EOPNOTSUPP;
@@ -3773,6 +4153,12 @@ int tb_switch_suspend_cio(struct tb_switch *sw)
 		ret = tb_switch_suspend_cio(port->remote->sw);
 		if (ret)
 			return ret;
+	}
+	if ((sw->tb->nhi->quirks & QUIRK_CIO_MACOS_FRAMES) && tb_switch_is_usb4(sw)) {
+		/* The host's wake words and its sleep bit are its NHI's (router_sleep). */
+		if (!tb_route(sw))
+			return 0;
+		return tb_switch_sleep_cio_frames(sw);
 	}
 	if (device_may_wakeup(&sw->dev))
 		wake = TB_WAKE_ON_CONNECT | TB_WAKE_ON_DISCONNECT |
