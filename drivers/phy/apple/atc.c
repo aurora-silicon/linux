@@ -4190,7 +4190,7 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 			return ret;
 	}
 	if ((atcphy->hw->has_t8140_dp || atcphy->hw->dp_banked_tunables) &&
-		    atcphy_modes[mode].enable_dp_aux &&
+	    atcphy_modes[mode].enable_dp_aux &&
 	    !atcphy->dp_tunables)
 		return -EOPNOTSUPP;
 	if (atcphy->hw->has_t8140_dp &&
@@ -6343,9 +6343,9 @@ static int atcphy_load_dp_banks(struct apple_atcphy *atcphy)
 	}
 
 	lioa = devm_apple_tunable_parse(atcphy->dev, atcphy->np,
-				      "apple,tunable-dp-lioa", atcphy->res.lioa);
+					"apple,tunable-dp-lioa", atcphy->res.lioa);
 	common = devm_apple_tunable_parse(atcphy->dev, atcphy->np,
-					"apple,tunable-dp-common-config", atcphy->res.lpdptx);
+					  "apple,tunable-dp-common-config", atcphy->res.lpdptx);
 	if (IS_ERR(lioa) || IS_ERR(common)) {
 		int ret = IS_ERR(lioa) ? PTR_ERR(lioa) : PTR_ERR(common);
 
