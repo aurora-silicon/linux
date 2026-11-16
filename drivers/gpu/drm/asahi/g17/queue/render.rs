@@ -1779,6 +1779,13 @@ impl Pair {
             && self.active.iter().all(|active| active.stamps_owed)
     }
 
+    /// Work no other owner can bind this pair past: a quarantine, or a group whose stamps are
+    /// owed. Only the firmware draining the pair (the stamps, or a kill of its context) or a
+    /// processor stop ends either, so admission holds the slot from every other owner meanwhile.
+    pub(crate) fn unreusable_work(&self) -> bool {
+        self.quarantined || self.active.iter().any(|active| active.stamps_owed)
+    }
+
     /// Whether a settlement attempt of this drained pair is due at `now`.
     pub(crate) fn drain_due(&self, now: u64) -> bool {
         now >= self.drain_retry_at
