@@ -7011,6 +7011,74 @@ static void t8142_commit_note(struct apple_sleep *s)
 }
 
 /*
+ * The PMU's RTC alarm after the S2R timer, as macOS 27.2 sends it on the J813 (traced
+ * 2026-11-16, run g01: 0.11 to 0.25 ms after the timer, boot core): read RTC_CTL (0x41),
+ * the 4-byte compare at 0x2008, 0x200e <- 0, RTC_CTL <- 0x41; 0x43 first if it had fired.
+ * The same registers and order as T6050's post-timer step (apple,pmu-alarm-rearm 0x43 0x41).
+ * Without it the SoC never goes down after the timer and WD2 resets it (J813, PMU note 0x67).
+ * TEST: the compare is now + apple_sleep.t8142_wake_s (0: macOS's own compare as found).
+ */
+static unsigned int t8142_wake_s = 30;
+module_param(t8142_wake_s, uint, 0644);
+MODULE_PARM_DESC(t8142_wake_s, "T8142 TEST: PMU RTC alarm this many s after the commit (0: keep the PMU's)");
+static u8 t8142_alarm[4];
+static bool t8142_alarm_ok;
+static int t8142_post_ret = -ENODATA;
+static u64 t8142_alarm_counter;
+
+static void t8142_pre_commit(struct apple_sleep *s)
+{
+	u32 mask = s->soc->spmi_notify_sleep;
+	u8 ticks[8] = {};
+
+	t8142_alarm_ok = false;
+	t8142_post_ret = -ENODATA;
+	if (s->spmi) {
+		t6050_sleep_pmu_drain(s);
+		if (!t6050_sleep_pmu_xfer_post(s, mask, T6050_SPMI_EXT_READL, T6050_RTC_COMPARE,
+					       NULL, t8142_alarm, 4) &&
+		    !t6050_sleep_pmu_xfer_post(s, mask, T6050_SPMI_EXT_READL, T6050_RTC_COUNTER,
+					       NULL, ticks, 6)) {
+			t8142_alarm_counter = get_unaligned_le64(ticks) >> 16;
+			if (t8142_wake_s)
+				put_unaligned_le32(t8142_alarm_counter + t8142_wake_s, t8142_alarm);
+			t8142_alarm_ok = true;
+		}
+	}
+	t8132_pre_commit(s);
+}
+
+static void t8142_post_timer(struct apple_sleep *s)
+{
+	u32 mask = s->soc->spmi_notify_sleep & ~M5_SPMI_IRQ_DONE;
+	u8 ctl = 0, v;
+	int ret;
+
+	if (!t8142_alarm_ok)
+		return;
+	ret = t6050_sleep_pmu_xfer_post(s, mask, T6050_SPMI_EXT_READL, T6050_RTC_CTL, NULL, &ctl, 1);
+	if (!ret && (ctl & T6050_RTC_CTL_FIRED)) {
+		v = 0x43;
+		ret = t6050_sleep_pmu_xfer_post(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_CTL, &v,
+						NULL, 1);
+	}
+	if (!ret)
+		ret = t6050_sleep_pmu_xfer_post(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_COMPARE,
+						t8142_alarm, NULL, 4);
+	if (!ret) {
+		v = 0;
+		ret = t6050_sleep_pmu_xfer_post(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_MASK, &v,
+						NULL, 1);
+	}
+	if (!ret) {
+		v = 0x41;
+		ret = t6050_sleep_pmu_xfer_post(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_CTL, &v,
+						NULL, 1);
+	}
+	t8142_post_ret = ret;
+}
+
+/*
  * T8142's memory side, as macOS steps it down 4.6 to 2.7 ms before the S2R timer (J813, 27.2.1,
  * all ten cores: gig3m's trace, gist 89aedeca, 2026-11-15; the J815 ADT has the same mcc
  * layout). The PMGR words around it match our J815 trace write for write.
@@ -7158,6 +7226,9 @@ static void t8142_wake(struct apple_sleep *s)
 	const struct apple_sleep_soc *soc = s->soc;
 	u32 val;
 	int i;
+
+	pr_info("apple-sleep: T8142 PMU alarm after the timer: %d (counter %llu, compare %u)\n",
+		t8142_post_ret, t8142_alarm_counter, get_unaligned_le32(t8142_alarm));
 
 	s->cluster_e_ret = t8142_cluster_on(s, soc->cluster_cpu[0], s->acc_e);
 	s->cluster_p_ret = t8142_cluster_on(s, soc->cluster_cpu[1], s->acc_p);
@@ -7354,7 +7425,8 @@ static const struct apple_sleep_ops t8142_sleep_ops = {
 	.last_mile = t8142_last_mile,
 	/* WD2 is at T8132's address (/arm-io/wdt), so the same stub restarts it. */
 	.resume = t8132_resume_stub,
-	.pre_commit = t8132_pre_commit,
+	.pre_commit = t8142_pre_commit,
+	.post_timer = t8142_post_timer,
 	.wake = t8142_wake,
 	.aic_mask_all = aic_sleep_mask_all,
 	.aic_ack = aic_sleep_ack,
