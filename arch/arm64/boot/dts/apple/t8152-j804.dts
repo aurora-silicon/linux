@@ -1,12 +1,379 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple MacBook Pro (14-inch, M6), J804.
+ *
+ * Booted from RAM by the loader, which fills usable memory, the release
+ * addresses of the CPUs it started (and removes the others) and the boot
+ * framebuffer. The console is the framebuffer: the DockChannel UART has no
+ * reader on this board, so it stays disabled. Resources follow the J804 ADT.
+ */
 /dts-v1/;
 
 #include "t8152.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/leds/common.h>
 
 / {
-	model = "Apple MacBook Pro (J804)";
 	compatible = "apple,j804", "apple,t8152", "apple,arm-platform";
+	model = "Apple MacBook Pro (14-inch, M6)";
 	chassis-type = "laptop";
+
+	/* Retain the RAM handoff and secondary CPU park contract. */
+	aurora,minimal-boot;
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>; /* Filled by the loader. */
+			status = "disabled";
+		};
+	};
+
+	/*
+	 * As on M4 and later, the OS cannot request core power-down: both idle
+	 * states are WFI. The driver must be bound for s2idle to freeze the
+	 * tick and suspend timekeeping.
+	 */
+	cpuidle {
+		compatible = "apple,t8152-cpuidle", "apple,t8140-cpuidle";
+	};
+
+	/*
+	 * The first two CPU performance states of each cluster, which the
+	 * driver may use without a thermal policy, as on J873.
+	 */
+	m6_e_opp: opp-table-e {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp-972000000 {
+			opp-hz = /bits/ 64 <972000000>;
+			opp-level = <2>;
+		};
+		opp-1152000000 {
+			opp-hz = /bits/ 64 <1152000000>;
+			opp-level = <3>;
+		};
+	};
+
+	m6_pm_opp: opp-table-pm {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp-1440000000 {
+			opp-hz = /bits/ 64 <1440000000>;
+			opp-level = <2>;
+		};
+		opp-1728000000 {
+			opp-hz = /bits/ 64 <1728000000>;
+			opp-level = <3>;
+		};
+	};
+
+	/* Keyboard backlight: ADT fpwm0 kbd-backlight, 25 kHz. */
+	led-controller {
+		compatible = "pwm-leds";
+
+		led-0 {
+			pwms = <&fpwm0 0 40000>;
+			label = "kbd_backlight";
+			function = LED_FUNCTION_KBD_BACKLIGHT;
+			color = <LED_COLOR_ID_WHITE>;
+			max-brightness = <255>;
+			default-state = "keep";
+		};
+	};
+};
+
+&{/reserved-memory} {
+	smc-firmware@30de00000 {
+		reg = <3 0x0de00000 0 0x120000>;
+		no-map;
+	};
+};
+
+&cpu0 {
+	operating-points-v2 = <&m6_e_opp>;
+	performance-domains = <&m6_e_cpufreq>;
+	status = "okay";
+};
+
+&cpu1 {
+	operating-points-v2 = <&m6_e_opp>;
+	performance-domains = <&m6_e_cpufreq>;
+	status = "okay";
+};
+
+&cpu2 {
+	operating-points-v2 = <&m6_e_opp>;
+	performance-domains = <&m6_e_cpufreq>;
+	status = "okay";
+};
+
+&cpu3 {
+	operating-points-v2 = <&m6_e_opp>;
+	performance-domains = <&m6_e_cpufreq>;
+	status = "okay";
+};
+
+&cpu4 {
+	operating-points-v2 = <&m6_e_opp>;
+	performance-domains = <&m6_e_cpufreq>;
+	status = "okay";
+};
+
+&cpu5 {
+	operating-points-v2 = <&m6_e_opp>;
+	performance-domains = <&m6_e_cpufreq>;
+	status = "okay";
+};
+
+&cpu6 {
+	operating-points-v2 = <&m6_pm_opp>;
+	performance-domains = <&m6_pm_cpufreq>;
+	status = "okay";
+};
+
+&cpu7 {
+	operating-points-v2 = <&m6_pm_opp>;
+	performance-domains = <&m6_pm_cpufreq>;
+	status = "okay";
+};
+
+&cpu8 {
+	operating-points-v2 = <&m6_pm_opp>;
+	performance-domains = <&m6_pm_cpufreq>;
+	status = "okay";
+};
+
+&cpu9 {
+	operating-points-v2 = <&m6_pm_opp>;
+	performance-domains = <&m6_pm_cpufreq>;
+	status = "okay";
+};
+
+&cpu10 {
+	operating-points-v2 = <&m6_pm_opp>;
+	performance-domains = <&m6_pm_cpufreq>;
+	status = "okay";
+};
+
+&cpu11 {
+	operating-points-v2 = <&m6_pm_opp>;
+	performance-domains = <&m6_pm_cpufreq>;
+	status = "okay";
+};
+
+&aic {
+	status = "okay";
+};
+
+&{/timer} {
+	status = "okay";
+};
+
+&{/soc} {
+	m6_e_cpufreq: performance-controller@210e20000 {
+		compatible = "apple,t8152-cluster-cpufreq";
+		reg = <2 0x10e20000 0 0x1000>;
+		#performance-domain-cells = <0>;
+	};
+
+	m6_pm_cpufreq: performance-controller@211e20000 {
+		compatible = "apple,t8152-cluster-cpufreq";
+		reg = <2 0x11e20000 0 0x1000>;
+		#performance-domain-cells = <0>;
+	};
+
+	smc_mbox: mailbox@30c710080 {
+		compatible = "apple,t8152-smc-mailbox";
+		reg = <3 0x0c710080 0 0x80>;
+		interrupts = <AIC_IRQ 760 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 759 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+
+	smc: smc@30c600000 {
+		compatible = "apple,t8152-smc";
+		reg = <3 0x0c600000 0 0x74000>,
+		      <3 0x0de00000 0 0x120000>;
+		reg-names = "smc", "sram";
+		mboxes = <&smc_mbox>;
+
+		/*
+		 * pcIO outputs. The trackpad's AFE reset is the ADT multi-touch
+		 * function-afe-reset pKW8('pcIO', 0x10000, 0x1c0000): line 0.
+		 */
+		smc_pcio: gpio {
+			compatible = "apple,smc-pcio-gpio";
+			gpio-controller;
+			#gpio-cells = <2>;
+			apple,output-commands = /bits/ 64 <0x001c000000010000>;
+		};
+
+		smc_hwmon: hwmon {
+			compatible = "apple,smc-hwmon";
+			apple,discover-temperatures;
+
+			/* One fan; mode key in lower case on T8152. */
+			fan-F0Ac {
+				apple,key-id = "F0Ac";
+				apple,fan-minimum = "F0Mn";
+				apple,fan-maximum = "F0Mx";
+				apple,fan-target = "F0Tg";
+				apple,fan-mode = "F0md";
+				label = "Fan";
+			};
+
+			power-PSTR {
+				apple,key-id = "PSTR";
+				label = "Total System Power";
+			};
+
+			power-PDTR {
+				apple,key-id = "PDTR";
+				label = "AC Input Power";
+			};
+
+			power-PMVR {
+				apple,key-id = "PMVR";
+				label = "3.8 V Rail Power";
+			};
+
+			power-PHPC {
+				apple,key-id = "PHPC";
+				label = "Heatpipe Power";
+			};
+
+			voltage-VD0R {
+				apple,key-id = "VD0R";
+				label = "AC Input Voltage";
+			};
+
+			voltage-SBAV {
+				apple,key-id = "SBAV";
+				label = "Battery Voltage";
+			};
+
+			current-ID0R {
+				apple,key-id = "ID0R";
+				label = "AC Input Current";
+			};
+		};
+	};
+
+	wdt: watchdog@3082b0000 {
+		compatible = "apple,t8152-wdt", "apple,t8103-wdt";
+		reg = <3 0x082b0000 0 0x4000>;
+		clocks = <&clkref>;
+		interrupts = <AIC_IRQ 447 IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	pinctrl_ap: pinctrl@31a000000 {
+		/*
+		 * Uncached (T8140 profile): a cache filled at probe would read
+		 * pins 78 and 208, which fault on an AP read.
+		 */
+		compatible = "apple,t8152-pinctrl", "apple,t8140-pinctrl";
+		reg = <0x3 0x1a000000 0x0 0x100000>;
+		gpio-controller;
+		#gpio-cells = <2>;
+		gpio-ranges = <&pinctrl_ap 0 0 224>;
+		apple,npins = <224>;
+		/* ADT no-restore-gpio-pins */
+		gpio-reserved-ranges = <78 1>, <140 2>, <198 1>, <208 1>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		interrupts = <AIC_IRQ 433 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 434 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 435 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 436 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 437 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 438 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 439 IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	/* The headphone jack codec. */
+	i2c1: i2c@331014000 {
+		compatible = "apple,t8152-i2c", "apple,t8103-i2c";
+		reg = <3 0x31014000 0 0x4000>;
+		clocks = <&clkref>;
+		interrupts = <AIC_IRQ 1414 IRQ_TYPE_LEVEL_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		power-domains = <&ps_i2c1>;
+		resets = <&ps_i2c1>;
+
+		/* Disabled until the sound card that uses it is described. */
+		jack_codec: codec@4b {
+			compatible = "cirrus,cs42l84";
+			reg = <0x4b>;
+			reset-gpios = <&pinctrl_ap 204 GPIO_ACTIVE_HIGH>;
+			interrupts-extended = <&pinctrl_ap 203 IRQ_TYPE_LEVEL_LOW>;
+			#sound-dai-cells = <0>;
+			status = "disabled";
+		};
+	};
+
+	/* The speaker amplifiers, described with the audio support. */
+	i2c3: i2c@33101c000 {
+		compatible = "apple,t8152-i2c", "apple,t8103-i2c";
+		reg = <3 0x3101c000 0 0x4000>;
+		clocks = <&clkref>;
+		interrupts = <AIC_IRQ 1416 IRQ_TYPE_LEVEL_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		power-domains = <&ps_i2c3>;
+		resets = <&ps_i2c3>;
+	};
+
+	fpwm0: pwm@331040000 {
+		compatible = "apple,t8152-fpwm", "apple,s5l-fpwm";
+		reg = <3 0x31040000 0 0x4000>;
+		clocks = <&clkref>;
+		#pwm-cells = <2>;
+	};
+};
+
+/* The boot NOR (NVRAM) and the PMGR block, as on J873. */
+#include "t8152-j873-qspi.dtsi"
+
+&pmgr {
+	/* On at handoff; the I2C controllers below hang off it. */
+	ps_sio: power-controller@840 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0x840 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "sio";
+		apple,always-on;
+	};
+
+	ps_i2c1: power-controller@cc0 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0xcc0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "i2c1";
+		power-domains = <&ps_sio>;
+	};
+
+	ps_i2c3: power-controller@d00 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0xd00 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "i2c3";
+		power-domains = <&ps_sio>;
+	};
 };
 
 /* Unexposed chassis port instances remain described and disabled. */
