@@ -191,6 +191,9 @@ pub(crate) struct Submission {
     /// Live Member objects, plus the enqueue guard, independently of signalling.
     owners: AtomicU8,
     firmware_source: bool,
+    /// The logical queue that published this submission
+    /// ([`super::job::Backend::source_origin`]); 0 if it does not say.
+    origin: u64,
     /// Set under the device mutex when the only member's successful retirement
     /// is queued, before its fence is signalled off-lock: a consumer published
     /// in between needs no wait on it.
@@ -198,11 +201,15 @@ pub(crate) struct Submission {
 }
 
 impl Submission {
-    fn new(context: Arc<Context>, firmware_source: bool) -> Result<Arc<Self>> {
+    fn new(context: Arc<Context>, firmware_source: bool, origin: u64) -> Result<Arc<Self>> {
         let work = Arc::new(WorkStateLease::deferred(context)?, GFP_KERNEL)?;
-        Self::with_work(Some(work), firmware_source)
+        Self::with_work(Some(work), firmware_source, origin)
     }
-    fn with_work(work: Option<Arc<WorkStateLease>>, firmware_source: bool) -> Result<Arc<Self>> {
+    fn with_work(
+        work: Option<Arc<WorkStateLease>>,
+        firmware_source: bool,
+        origin: u64,
+    ) -> Result<Arc<Self>> {
         Arc::pin_init(
             pin_init!(Self {
                 state <- new_mutex!(State { work, ready: None }, "G17 submission work state"),
@@ -210,10 +217,15 @@ impl Submission {
                 error: AtomicI32::new(0),
                 owners: AtomicU8::new(1),
                 firmware_source,
+                origin,
                 retired: AtomicBool::new(false),
             }),
             GFP_KERNEL,
         )
+    }
+    /// The logical queue that published this submission, or 0.
+    pub(super) fn origin(&self) -> u64 {
+        self.origin
     }
     pub(super) fn source_status(&self) -> Result<bool> {
         let complete =
@@ -368,7 +380,7 @@ mod tests {
     }
     fn aggregate(contexts: &FenceContexts) -> Aggregate {
         let mut fence = export_fallback(contexts).unwrap();
-        fence.source = Some(Submission::with_work(None, true).unwrap());
+        fence.source = Some(Submission::with_work(None, true, 0).unwrap());
         Aggregate(fence.into())
     }
 
@@ -517,8 +529,9 @@ impl Outputs {
         &mut self,
         context: Arc<Context>,
         firmware_source: bool,
+        origin: u64,
     ) -> Result<Aggregate> {
-        let source = Submission::new(context, firmware_source)?;
+        let source = Submission::new(context, firmware_source, origin)?;
         let mut fence = self.fallback.take().ok_or(EINVAL)?;
         fence.source = Some(source);
         fence.scoped = self.cumulative.is_some();
