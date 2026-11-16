@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * The J716c's devices' settings for its deep sleep: what the drivers of the devices that take
+ * part in it need besides the sleep controller (t6050-j716c-sleep-full.dtsi).
+ */
+&nvme {
+	/* The storage controller's restart spacing after a deep sleep */
+	apple,sleep-wake-delay-ms = <70>;
+};
+
+/*
+ * The display coprocessors' firmware 27.0 sleep control arguments. Normal
+ * panel/swap profiles stay as-is.
+ */
+&dcp {
+	apple,sleep-power-args = [01 00 00 01 01 00 00 00];
+	apple,sleep-a500-args = [00 01 00 00 00 00 00 00];
+	apple,sleep-display-power-args = [00 00 00 00 00 00 00 00];
+	apple,sleep-display-stage-args = [00 00 00 00 00 00 00 00 01 00 00 00];
+};
+
+&dcpext0 {
+	apple,sleep-power-args = [01 00 00 01 01 00 00 00];
+	apple,sleep-a500-args = [00 01 00 00 00 00 00 00];
+};
+
+&dcpext1 {
+	apple,sleep-power-args = [01 00 00 01 01 00 00 00];
+	apple,sleep-a500-args = [00 01 00 00 00 00 00 00];
+};
+
+&dcpext2 {
+	apple,sleep-power-args = [01 00 00 01 01 00 00 00];
+	apple,sleep-a500-args = [00 01 00 00 00 00 00 00];
+};
+
+&dcpext3 {
+	apple,sleep-power-args = [01 00 00 01 01 00 00 00];
+	apple,sleep-a500-args = [00 01 00 00 00 00 00 00];
+};
