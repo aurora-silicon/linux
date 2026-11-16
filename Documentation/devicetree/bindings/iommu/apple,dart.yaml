@@ -123,6 +123,26 @@ properties:
       may select a firmware-visible alias of the translation aperture.
       A consumer may further specify its own aperture in its binding.
 
+  apple,tlbi-aperture:
+    $ref: /schemas/types.yaml#/definitions/uint64
+    description: >
+      T8152 Gen3 DARTs only. Physical address of this DART's 16-byte command
+      slot in the SoC's shared TLB invalidation aperture: the aperture base
+      plus the DART's offset into it. Gen3 DARTs ignore the T8110 TLB command
+      register; with this property, TLB invalidations are issued as a
+      command to the slot followed by a broadcast TLBI.
+
+  apple,gen3-ias:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 32
+    maximum: 42
+    description: >
+      T8152 Gen3 DARTs only. Width in bits of the DVA that the stream's
+      table walk uses, where the loader configured a narrower walk than the
+      VA width the DART reports (for example 36 for a three-level walk).
+      Device-visible addresses above that width select an alias of the
+      translated window.
+
   apple,dapf-ranges:
     $ref: /schemas/types.yaml#/definitions/uint64-matrix
     items:
@@ -318,8 +338,19 @@ required:
 
 dependencies:
   apple,gapf-slice-values: [ 'apple,gapf-slice' ]
+  apple,gen3-ias: [ 'apple,tlbi-aperture' ]
 
 allOf:
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              const: apple,t8152-dart
+    then:
+      properties:
+        apple,tlbi-aperture: false
+        apple,gen3-ias: false
   - if:
       properties:
         compatible:
@@ -372,6 +403,21 @@ examples:
 
     master2 {
       iommus = <&dart2a 0>, <&dart2b 1>;
+    };
+
+  - |+
+    soc {
+      #address-cells = <2>;
+      #size-cells = <2>;
+
+      dart4: iommu@3a1020000 {
+        compatible = "apple,t8152-dart", "apple,t8110-dart";
+        reg = <0x3 0xa1020000 0x0 0x4000>;
+        interrupts = <1 400 4>;
+        #iommu-cells = <1>;
+        apple,tlbi-aperture = /bits/ 64 <0x200000800>;
+        apple,gen3-ias = <36>;
+      };
     };
 
   - |+
