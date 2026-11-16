@@ -704,6 +704,7 @@ impl crate::g17::Firmware {
         if let Some((status, error)) = entry.pending_error.take() {
             if Arc::ptr_eq(pair.context().status(), &status) {
                 pair.quarantine(error, &mut |event| deferred.push(event))?;
+                self.queues.admission.set_held(usize::from(slot), pair.unreusable_work());
             }
         }
         if entry.closed {

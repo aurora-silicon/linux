@@ -156,7 +156,11 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('fields', 'range', 'timestamp', 'age', 'delivery',
                                    'quarantine', 'epoch', 'cutoff', 'whole-batch', 'legacy-format', 'read-drain'), out()),
     'g17-admission-deadline-tests.py': [([], PASS)],
-    'g17-admission-order-tests.py': [([], PASS)],
+    'g17-admission-order-tests.py': [([], PASS)]
+        + mutations('--mutation', ('no-held-free', 'no-held-sibling', 'no-held-refusal', 'no-held-pick',
+                                   'no-held-spare', 'no-held-other', 'no-held-cancel', 'no-held-killed',
+                                   'no-held-used', 'no-held-wake', 'wake-on-every-clear', 'no-held-stop',
+                                   'held-blocks-owner'), []),
     'g17-capacity-backoff-tests.py': [([], PASS)],
     'g17-capacity-fault-tests.py': [([], PASS)],
     'g17-compute-constructor-tests.py': [([], PASS)],

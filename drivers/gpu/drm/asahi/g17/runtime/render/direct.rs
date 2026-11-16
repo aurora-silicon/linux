@@ -250,6 +250,8 @@ impl crate::g17::Firmware {
         if !packet.is_published() {
             pair.discard_prepared(packet)?;
         }
+        // A failed publication may have quarantined the lent pair.
+        self.queues.admission.set_held(usize::from(slot), pair.unreusable_work());
         if let Some((id, generation)) = activation {
             if self.queues.render.pools.activate(id, generation).is_err() {
                 self.primary.state.shared.lose_device_quietly();

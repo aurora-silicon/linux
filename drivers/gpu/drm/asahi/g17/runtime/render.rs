@@ -503,7 +503,10 @@ impl Registry {
         error: Error,
         deferred: &mut DeferredBatch,
     ) -> Result {
-        for entry in self.render.entries.iter_mut().flatten() {
+        for (slot, entry) in self.render.entries.iter_mut().enumerate() {
+            let Some(entry) = entry.as_mut() else {
+                continue;
+            };
             if !entry
                 .context
                 .as_ref()
@@ -513,6 +516,8 @@ impl Registry {
             }
             if let Some(pair) = entry.pair.as_mut() {
                 pair.quarantine(error, &mut |event| deferred.push(event))?;
+                // An idle pair has no lease to carry the quarantine into admission.
+                self.admission.set_held(slot, pair.unreusable_work());
             } else if entry.preparing.is_some() || entry.growing {
                 entry.pending_error = Some((status.clone(), error));
             }
@@ -822,7 +827,11 @@ impl crate::g17::Firmware {
         };
         let result = operation(&mut pair, &mut host);
         host.release_registration();
+        let held = pair.unreusable_work();
         self.queues.render.entries[slot].as_mut().ok_or(EIO)?.pair = Some(pair);
+        // Still under the device mutex: the retirements this pass deferred drop their leases
+        // only after it is released, so another owner never sees the slot free in between.
+        self.queues.admission.set_held(slot, held);
         result
     }
 
