@@ -5609,6 +5609,10 @@ void apple_pcie_t6050_sleep_reset(struct pci_dev *bridge)
 EXPORT_SYMBOL_GPL(apple_pcie_t6050_sleep_reset);
 
 /* In the noirq suspend, the link just shut down for the sleep. */
+static bool t6050_test_entry_reset = true;
+module_param_named(t6050_test_entry_reset, t6050_test_entry_reset, bool, 0644);
+MODULE_PARM_DESC(t6050_test_entry_reset, "TEST: replay only the J714s entry warm reset; wake reset unchanged");
+
 static int apple_pcie_t6050_reset_for_sleep(struct apple_pcie *pcie)
 {
 	int ret;
@@ -6846,8 +6850,16 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 			/* The root ports below are suspended: from here a parked port's is not read */
 			WRITE_ONCE(pcie->t6050_cold_lost, pcie->t6050_parked);
 			ret = apple_pcie_t6050_sleep_down(pcie);
-			if (!ret && pcie->t6050_reset_before_sleep)
-				ret = apple_pcie_t6050_reset_for_sleep(pcie);
+			if (!ret && pcie->t6050_reset_before_sleep) {
+				bool selected = READ_ONCE(t6050_test_entry_reset);
+
+				if (selected)
+					ret = apple_pcie_t6050_reset_for_sleep(pcie);
+				else
+					pcie->t6050_reset_before_sleep = false;
+				dev_info(pcie->dev, "TEST entry warm reset: requested 1 selected %u executed %u result %d\n",
+					 selected, selected, ret);
+			}
 			return ret;
 		}
 		ret = apple_pcie_check_adopted_s2idle(pcie);
