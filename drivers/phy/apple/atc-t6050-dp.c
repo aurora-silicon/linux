@@ -20,6 +20,7 @@
 #include <linux/suspend.h>
 #include <linux/soc/apple/tunable.h>
 #include <linux/soc/apple/rtkit.h>
+#include <linux/phy/apple-atc.h>
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/sleep.h>
 #include <linux/usb/typec.h>
@@ -135,6 +136,15 @@ struct t6050_dp {
 	bool sleep_stopped;		/* stopped for a sleep that has not been accounted for yet */
 	bool aon_syscore;		/* the always-on domain is held out of this system transition */
 	bool aon_kept;			/* the stop left the always-on domain's reference in place */
+	/* A USB4 router's sleep in place: its host stops and restarts the port, see the end. */
+	bool cio_sleep;			/* asked for: the PHY's own stop for the sleep is skipped */
+	bool cio_sleep_off;		/* stopped by the router's host */
+	bool cio_sleep_hold;		/* the domains' references are left alone while it runs */
+	bool cio_tunnel_lost;		/* the router woke without its dock: no USB3 tunnel PIPE */
+	/* TEST (J714s): the USB host kept on the tunnel's PIPE through the router's sleep. */
+	bool cio_usb_host;		/* a router host that sleeps in place is bound to this PHY */
+	bool cio_usb_kept;		/* kept for this sleep, until its USB controller's RESULT */
+	bool cio_usb_parked;		/* its PIPE parked behind the router's sleep or refusal */
 };
 
 static int atc_domain_set(struct atc_domain *pd, bool active)
@@ -1131,6 +1141,14 @@ static int t6050_dp_suspend_late(struct device *dev)
 
 	if (!dp->combo || !pm_suspend_via_firmware())
 		return 0;
+	/* A router sleeping in place still uses the link: its host stops the PHY after it. */
+	scoped_guard(mutex, &dp->lock) {
+		if (dp->cio_sleep) {
+			dp->sleep_stopped = false;
+			dp->sleep_mode = dp->combo_mode;
+			return 0;
+		}
+	}
 	return combo_suspend_late(dp);
 }
 
@@ -1151,6 +1169,211 @@ static int t6050_dp_resume(struct device *dev)
 		combo_resume(dp);
 	return 0;
 }
+
+/*
+ * TEST: a USB4 router that sleeps in place (T6050, from a macOS sleep with a dock). macOS
+ * stops the port's PHY after the router: the router processor's power-off and the CIO
+ * domains first, then the PHY's CIO shutdown with its processor idled, then the wrapper, USB
+ * and common domains; after the wake the PHY is started from cold in the same mode before
+ * the router's domains and processor. The router's host calls these in its last suspend
+ * step and its first resume step, where runtime PM no longer runs: the domains'
+ * references stay as they are and the system's own power-down takes the domains.
+ */
+static struct t6050_dp *t6050_dp_from_dev(struct device *dev)
+{
+	if (!dev || !dev->driver || strcmp(dev->driver->name, "apple-t6050-dp-phy"))
+		return NULL;
+	return dev_get_drvdata(dev);
+}
+
+int apple_t6050_phy_cio_prepare(struct device *dev)
+{
+	struct t6050_dp *dp = t6050_dp_from_dev(dev);
+
+	if (!dp || !dp->combo)
+		return -EOPNOTSUPP;
+	guard(mutex)(&dp->lock);
+	if (dp->cio_sleep || dp->faulted || dp->combo_mode != COMBO_CIO || !dp->cio_prepared)
+		return -EBUSY;
+	dp->cio_sleep = true;
+	dp->cio_sleep_off = false;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_t6050_phy_cio_prepare);
+
+int apple_t6050_phy_cio_off(struct device *dev)
+{
+	struct t6050_dp *dp = t6050_dp_from_dev(dev);
+	ktime_t start = ktime_get();
+	int ret;
+
+	if (!dp)
+		return -EOPNOTSUPP;
+	guard(mutex)(&dp->lock);
+	if (!dp->cio_sleep || dp->cio_sleep_off || dp->faulted || dp->combo_mode != COMBO_CIO)
+		return -EBUSY;
+	atc_dp_tunnels_stop(dp);
+	/* A host kept for the sleep is out of reset here, its PIPE parked on the dummy producer. */
+	if (dp->pipe_active || (dp->controller_active && !dp->cio_usb_parked))
+		return -EBUSY;
+	dp->cio_sleep_hold = true;
+	ret = combo_quiesce(dp);
+	if (!ret && dp->usb2_active) {
+		ret = apple_t6050_usb2_stop(&dp->usb_platform);
+		if (!ret)
+			dp->usb2_active = false;
+	}
+	dp->cio_sleep_hold = false;
+	if (ret) {
+		dev_err(dp->dev, "CIO mode not stopped for the router's sleep (%d)\n", ret);
+		dp->faulted = true;
+		return ret < 0 ? ret : -EIO;
+	}
+	dp->cio_sleep_off = true;
+	dp->combo_mode = COMBO_SAFE;
+	dev_info(dp->dev, "CIO mode stopped for the router's sleep in %lld ms, domains left to the system\n",
+		 ktime_ms_delta(ktime_get(), start));
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_t6050_phy_cio_off);
+
+int apple_t6050_phy_cio_on(struct device *dev)
+{
+	struct t6050_dp *dp = t6050_dp_from_dev(dev);
+	int ret;
+
+	if (!dp)
+		return -EOPNOTSUPP;
+	guard(mutex)(&dp->lock);
+	if (!dp->cio_sleep)
+		return -EINVAL;
+	if (!dp->cio_sleep_off)
+		return 0;
+	/* After a real sleep the resume has already forgotten the old state; a stop alone left it. */
+	dp->cio_sleep_hold = true;
+	ret = combo_start(dp, COMBO_CIO);
+	dp->cio_sleep_hold = false;
+	if (!ret)
+		dp->cio_sleep_off = false;
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_t6050_phy_cio_on);
+
+int apple_t6050_phy_cio_finish(struct device *dev)
+{
+	struct t6050_dp *dp = t6050_dp_from_dev(dev);
+	bool off;
+
+	if (!dp)
+		return -EOPNOTSUPP;
+	guard(mutex)(&dp->lock);
+	if (!dp->cio_sleep)
+		return -EINVAL;
+	off = dp->cio_sleep_off;
+	dp->cio_sleep = dp->cio_sleep_off = false;
+	return off ? -EUCLEAN : 0;
+}
+EXPORT_SYMBOL_GPL(apple_t6050_phy_cio_finish);
+
+/*
+ * TEST: the router's host found no dock after a sleep in place and retired its tunnels. Until
+ * the port's mode is started again, DWC3 is not given the router's USB3 tunnel as its PIPE
+ * producer. Called in the host's resume, before the USB host is started again.
+ */
+int apple_t6050_phy_cio_lost(struct device *dev)
+{
+	struct t6050_dp *dp = t6050_dp_from_dev(dev);
+
+	if (!dp || !dp->combo)
+		return -EOPNOTSUPP;
+	guard(mutex)(&dp->lock);
+	dp->cio_tunnel_lost = true;
+	dev_info(dp->dev, "the router's dock is gone after the sleep: USB3 PIPE %s\n",
+		 dp->pipe_active && dp->pipe_tunnel ? "ALREADY on the USB4 tunnel" :
+		 "not given the USB4 tunnel until the port starts again");
+	return dp->pipe_active && dp->pipe_tunnel ? -EBUSY : 0;
+}
+EXPORT_SYMBOL_GPL(apple_t6050_phy_cio_lost);
+
+/*
+ * TEST (J714s): macOS keeps the port's USB host powered (ATC2_USB on) through the router's sleep
+ * and gates it 28 to 37 ms after the router firmware's state word reads asleep, after the CIO
+ * domains, the PHY's CIO shutdown and its wrapper (runs mxt4, mxt5, mxt6, mxt6b, seven sleeps).
+ * Linux removed that host before the freezer and parked its PIPE, leaving the USB3 tunnel with
+ * no host. Here the host is kept instead: xHCI suspends in place (its ports in U3), its PIPE
+ * stays on the tunnel and the controller out of reset until the router's host parks the PIPE
+ * on its dummy producer, behind the router firmware's sleep, or, for a refused sleep, with the
+ * router awake again, before anything can stop the router under it (run sv6t4: a host on a
+ * router's tunnel PIPE when that router's domains went off, then an SError). The controller's
+ * domain stays as it is and goes off with the system's sleep. KEEP refuses (-EBUSY) unless the
+ * PIPE is on the tunnel now and a router host that sleeps in place is bound; the controller
+ * then stops for the sleep as before.
+ */
+int apple_t6050_phy_cio_usb(struct device *dev, enum apple_t6050_cio_usb step)
+{
+	struct t6050_dp *dp = t6050_dp_from_dev(dev);
+	u32 mux = 0, lock = 0;	/* TEST */
+	bool parked;
+	int ret;
+
+	if (!dp || !dp->combo)
+		return -EOPNOTSUPP;
+	guard(mutex)(&dp->lock);
+	/* TEST (sv6t11): the PIPE handler, the controller's bank, read while it holds its domain. */
+	if (step == APPLE_T6050_CIO_USB_PARK && dp->cio_usb_kept && !dp->cio_usb_parked) {
+		mux = readl(dp->banks[44] + 0xc);
+		lock = readl(dp->banks[44] + 0x14);
+	}
+	switch (step) {
+	case APPLE_T6050_CIO_USB_BIND:
+	case APPLE_T6050_CIO_USB_UNBIND:
+		dp->cio_usb_host = step == APPLE_T6050_CIO_USB_BIND;
+		return 0;
+	case APPLE_T6050_CIO_USB_KEEP:
+		dp->cio_usb_kept = dp->cio_usb_parked = false;
+		if (!of_machine_is_compatible("apple,j714s") || !dp->cio_usb_host || dp->faulted ||
+		    dp->combo_mode != COMBO_CIO || !dp->cio_prepared || !dp->controller_active ||
+		    !dp->pipe_active || !dp->pipe_tunnel)
+			return -EBUSY;
+		dp->cio_usb_kept = true;
+		dev_info(dp->dev, "T6050 sleep: USB host kept on the USB4 tunnel's PIPE for the router's sleep\n");
+		return 0;
+	case APPLE_T6050_CIO_USB_PARK:
+		if (!dp->cio_usb_kept || dp->cio_usb_parked)
+			return 0;
+		if (dp->faulted)
+			return -EIO;
+		/* xHCI is suspended: no DMA, its SuperSpeed port in U3, the PIPE in P3. */
+		if (dp->pipe_active && dp->pipe_tunnel) {
+			ret = apple_t6050_usb3_pipe_stop(&dp->usb_io, combo_pipe_keep, dp);
+			if (ret) {
+				combo_pipe_fault(dp, "USB3 tunnel PIPE park for the router's sleep", ret);
+				return -EIO;
+			}
+			dp->pipe_active = dp->pipe_tunnel = false;
+		}
+		dp->cio_usb_parked = true;
+		dev_info(dp->dev, "T6050 sleep: USB3 PIPE parked on its dummy producer, the USB host suspended in place, its controller out of reset\n");
+		dev_info(dp->dev, "TEST sv6t11: PIPE handler at the park: mux %#x (%#x) and lock %#x before, mux %#x (%#x) and lock %#x after (0x42 under 0x73: its dummy producer)\n",
+			 mux, mux & 0x73, lock, readl(dp->banks[44] + 0xc),
+			 readl(dp->banks[44] + 0xc) & 0x73, readl(dp->banks[44] + 0x14));
+		return 0;
+	case APPLE_T6050_CIO_USB_RESULT:
+		if (!dp->cio_usb_kept)
+			return -ENOENT;
+		parked = dp->cio_usb_parked;
+		dp->cio_usb_kept = dp->cio_usb_parked = false;
+		/* A PIPE that did not park: its state is not known, the port needs its cable again. */
+		if (dp->faulted)
+			return -EIO;
+		/* A firmware sleep's resume forgot the controller: it lost its power and registers. */
+		if (!dp->controller_active)
+			return APPLE_T6050_CIO_USB_LOST;
+		return parked ? APPLE_T6050_CIO_USB_PARKED : APPLE_T6050_CIO_USB_KEPT;
+	}
+	return -EINVAL;
+}
+EXPORT_SYMBOL_GPL(apple_t6050_phy_cio_usb);
 
 static const struct dev_pm_ops t6050_dp_pm_ops = {
 	.suspend_late = pm_sleep_ptr(t6050_dp_suspend_late),
