@@ -364,6 +364,7 @@ struct apple_dart {
 	/* The firmware 27 display sleep owns it: never replay locked trees. */
 	struct device *m5_sleep_owner;
 	u32 m5_streams, m5_gapf, m5_diag, m5_error_mask, m5_protect, m5_lock;
+	u32 m5_disp_streams;	/* the display pipe's streams before its domain went off */
 	bool m5_released, m5_changed, m5_display, m5_failed;
 	/* Optional cached evidence; never a sleep-ownership grant. */
 	struct mutex v27_lifecycle;
@@ -7659,5 +7660,217 @@ int apple_dart_m5_restore(struct device *dev, struct device *owner)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_dart_m5_restore);
+
+/*
+ * T6050 (firmware 27): a display coprocessor's DART around a stop and restart of that
+ * coprocessor after a wake, outside a system sleep, and the internal display pipe's DART
+ * around a power cycle of the display's domain.
+ *
+ * One stop or start of the internal display coprocessor's DART around a firmware restart after a
+ * wake, in the order macOS writes it around every stop and run bit: at a
+ * stop the error interrupts masked and cleared, streams 23 and 24 disabled one write each, the TLB
+ * command, then the protection slice to 2; before a start the slice back to 0x12, the diagnostic
+ * lock and error mask cleared and both streams enabled. No table is touched.
+ */
+/*
+ * The display coprocessors' DARTs have no protection range in this machine's tree; each one's
+ * slice is the GAPF word macOS writes for it around these writes.
+ */
+static const struct {
+	resource_size_t dart, slice;
+} m5_dcp_slices[] = {
+	{ 0x48a340000ULL, 0x2803f0a80ULL },	/* the internal panel's */
+	{ 0x2b2340000ULL, 0x2803f0500ULL },	/* DCPEXT0 */
+	{ 0x392340000ULL, 0x2803f0840ULL },	/* DCPEXT1 */
+	{ 0x302340000ULL, 0x2803f06c0ULL },	/* DCPEXT2 */
+	{ 0x306340000ULL, 0x2803f0780ULL },	/* DCPEXT3 */
+};
+static void __iomem *m5_dcp_slice[ARRAY_SIZE(m5_dcp_slices)];
+
+int apple_dart_m5_display_cycle(struct device *dev, bool on)
+{
+	struct apple_dart *dart;
+	void __iomem *gapf;
+	u32 status;
+	int ret = 0;
+
+	if (!dev || dev->driver != &apple_dart_driver.driver || !dev_get_drvdata(dev))
+		return -ENODEV;
+	dart = dev_get_drvdata(dev);
+	if (dart->hw->type != DART_T8110)
+		return -EOPNOTSUPP;
+	gapf = dart->gapf;
+	if (!gapf) {
+		struct resource *res = platform_get_resource(to_platform_device(dev),
+							     IORESOURCE_MEM, 0);
+		unsigned int i;
+
+		for (i = 0; res && i < ARRAY_SIZE(m5_dcp_slices); i++)
+			if (res->start == m5_dcp_slices[i].dart)
+				break;
+		if (!res || i == ARRAY_SIZE(m5_dcp_slices))
+			return -EOPNOTSUPP;
+		if (!m5_dcp_slice[i])
+			m5_dcp_slice[i] = ioremap(m5_dcp_slices[i].slice, 4);
+		gapf = m5_dcp_slice[i];
+		if (!gapf)
+			return -ENOMEM;
+	}
+	if (on) {
+		scoped_guard(spinlock_irqsave, &dart->lock) {
+			writel(0x12, gapf);
+			writel(0, dart->regs + DART_T8110_DIAG_LOCK);
+			writel(0, dart->regs + DART_T8110_V2_ERROR_MASK);
+			writel(BIT(23) | BIT(24), dart->regs + DART_T8110_ENABLE_STREAMS);
+		}
+		dev_dbg(dev, "display start: TCR23 %#x TTBR23 %#x TCR24 %#x TTBR24 %#x slice %#x\n",
+			readl(dart->regs + DART_TCR(dart, 23)),
+			readl(dart->regs + DART_TTBR(dart, 23, 0)),
+			readl(dart->regs + DART_TCR(dart, 24)),
+			readl(dart->regs + DART_TTBR(dart, 24, 0)), readl(gapf));
+		return 0;
+	}
+	dev_dbg(dev, "display stop: TCR23 %#x TTBR23 %#x TCR24 %#x TTBR24 %#x slice %#x\n",
+		readl(dart->regs + DART_TCR(dart, 23)), readl(dart->regs + DART_TTBR(dart, 23, 0)),
+		readl(dart->regs + DART_TCR(dart, 24)), readl(dart->regs + DART_TTBR(dart, 24, 0)),
+		readl(gapf));
+	guard(spinlock_irqsave)(&dart->lock);
+	writel(0xffffffff, dart->regs + DART_T8110_V2_ERROR_MASK);
+	writel(0, dart->regs + DART_T8110_EXCEPTION(0));
+	writel(0xffffffff, dart->regs + DART_T8110_V24_ERR_IRQ_STATUS);
+	writel(BIT(23), dart->regs + DART_T8110_DISABLE_STREAMS);
+	writel(BIT(24), dart->regs + DART_T8110_DISABLE_STREAMS);
+	writel(0xa000, dart->regs + DART_T8110_TLB_CMD);
+	ret = readl_poll_timeout_atomic(dart->regs + DART_T8110_TLB_CMD, status,
+					!(status & DART_T8110_TLB_CMD_BUSY), 1, 1000);
+	writel(0x2, gapf);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_dart_m5_display_cycle);
+
+static int apple_dart_m5_match_disp0(struct device *dev, const void *data)
+{
+	struct resource *res = platform_get_resource(to_platform_device(dev), IORESOURCE_MEM, 0);
+
+	return res && res->start == 0x48a300000ULL && dev_get_drvdata(dev);
+}
+
+/*
+ * Before the display domain goes off: every stream whose context is valid now is remembered, for
+ * apple_dart_m5_display_rewrite(). A locked DART has no saved state otherwise. A stream already
+ * found invalid keeps what was remembered for it.
+ */
+int apple_dart_m5_display_snapshot(struct device *dev)
+{
+	struct apple_dart *dart;
+	unsigned int sid, idx, n = 0;
+
+	if (dev)
+		get_device(dev);
+	else
+		dev = driver_find_device(&apple_dart_driver.driver, NULL, NULL,
+					 apple_dart_m5_match_disp0);
+	if (!dev)
+		return -ENODEV;
+	dart = dev_get_drvdata(dev);
+	if (dev->driver != &apple_dart_driver.driver || !dart || dart->hw->type != DART_T8110) {
+		put_device(dev);
+		return -EOPNOTSUPP;
+	}
+	scoped_guard(spinlock_irqsave, &dart->lock) {
+		for (sid = 0; sid < dart->num_streams; sid++) {
+			if (!(readl(dart->regs + DART_TTBR(dart, sid, 0)) & dart->hw->ttbr_valid))
+				continue;
+			dart->save_tcr[sid] = readl(dart->regs + DART_TCR(dart, sid));
+			for (idx = 0; idx < dart->hw->ttbr_count; idx++)
+				dart->save_ttbr[sid][idx] =
+					readl(dart->regs + DART_TTBR(dart, sid, idx));
+			n++;
+		}
+		dart->m5_disp_streams = readl(dart->regs + DART_T8110_ENABLE_STREAMS);
+	}
+	dev_dbg(dev, "display pipe: %u streams remembered, stream 0 TCR %#x TTBR %#x, streams %#x\n",
+		n, dart->save_tcr[0], dart->save_ttbr[0][0], dart->m5_disp_streams);
+	put_device(dev);
+	return n;
+}
+EXPORT_SYMBOL_GPL(apple_dart_m5_display_snapshot);
+
+/*
+ * The internal display pipe's DART after a power cycle of the display domain: Linux's own saved
+ * translation registers written back wherever a stream's no longer read as saved. macOS does
+ * not write this DART from the AP; here stream 0 carries Linux's framebuffer
+ * mappings, and the firmware's first scan-out after the restart cycles faulted on a cleared
+ * context entry. With no device, the internal panel's display pipe DART is looked up.
+ */
+int apple_dart_m5_display_rewrite(struct device *dev)
+{
+	struct apple_dart_stream_map map = { };
+	struct apple_dart *dart;
+	unsigned int sid, idx, n = 0;
+	u32 tcr0, ttbr0, streams;
+	bool found = !dev;
+	int ret = 0;
+
+	if (dev)
+		get_device(dev);
+	else
+		dev = driver_find_device(&apple_dart_driver.driver, NULL, NULL,
+					 apple_dart_m5_match_disp0);
+	if (!dev)
+		return -ENODEV;
+	dart = dev_get_drvdata(dev);
+	if (dev->driver != &apple_dart_driver.driver || !dart || dart->hw->type != DART_T8110) {
+		put_device(dev);
+		return -EOPNOTSUPP;
+	}
+	map.dart = dart;
+	scoped_guard(spinlock_irqsave, &dart->lock) {
+		tcr0 = readl(dart->regs + DART_TCR(dart, 0));
+		ttbr0 = readl(dart->regs + DART_TTBR(dart, 0, 0));
+		streams = readl(dart->regs + DART_T8110_ENABLE_STREAMS);
+		for (sid = 0; sid < dart->num_streams; sid++) {
+			bool differs = false;
+
+			/* The firmware's locked streams keep their own; they are not Linux's. */
+			if (dart->locked_fw_tree[sid])
+				continue;
+			if (!dart->save_tcr[sid] && !dart->save_ttbr[sid][0])
+				continue;
+			for (idx = 0; idx < dart->hw->ttbr_count; idx++)
+				differs |= readl(dart->regs + DART_TTBR(dart, sid, idx)) !=
+					   dart->save_ttbr[sid][idx];
+			differs |= readl(dart->regs + DART_TCR(dart, sid)) != dart->save_tcr[sid];
+			if (!differs)
+				continue;
+			for (idx = 0; idx < dart->hw->ttbr_count; idx++)
+				writel(dart->save_ttbr[sid][idx],
+				       dart->regs + DART_TTBR(dart, sid, idx));
+			writel(dart->save_tcr[sid], dart->regs + DART_TCR(dart, sid));
+			for (idx = 0; idx < dart->hw->ttbr_count; idx++)
+				if (readl(dart->regs + DART_TTBR(dart, sid, idx)) !=
+				    dart->save_ttbr[sid][idx])
+					ret = -EIO;
+			if (readl(dart->regs + DART_TCR(dart, sid)) != dart->save_tcr[sid])
+				ret = -EIO;
+			__set_bit(sid, map.sidmap);
+			n++;
+		}
+		if (n && dart->m5_disp_streams && streams != dart->m5_disp_streams)
+			writel(dart->m5_disp_streams, dart->regs + DART_T8110_ENABLE_STREAMS);
+	}
+	if (n && dart->hw->invalidate_tlb(&map))
+		ret = ret ?: -EIO;
+	dev_dbg(dev,
+		"display pipe%s: %u streams rewritten (%d); stream 0 TCR %#x TTBR %#x (saved %#x %#x) -> %#x %#x, streams %#x (saved %#x) -> %#x, protect %#x lock %#x\n",
+		found ? "" : " (driver)", n, ret, tcr0, ttbr0, dart->save_tcr[0],
+		dart->save_ttbr[0][0], readl(dart->regs + DART_TCR(dart, 0)),
+		readl(dart->regs + DART_TTBR(dart, 0, 0)), streams, dart->m5_disp_streams,
+		readl(dart->regs + DART_T8110_ENABLE_STREAMS),
+		readl(dart->regs + DART_T8110_PROTECT), readl(dart->regs + DART_T8110_PROTECT_LOCK));
+	put_device(dev);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_dart_m5_display_rewrite);
 
 #include "apple-dart-v27-late.inc"

@@ -5096,6 +5096,161 @@ int apple_sleep_display_v27_power_ready(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_display_v27_power_ready);
 
+/*
+ * T6050 (firmware 27): the internal display's three power words (this profile's ps.disp[0]: CPU,
+ * FE, SYS) and its coprocessor core's gate pair, lowered or raised around one stop and start of
+ * the display coprocessor after a wake, outside a system sleep, in this order and with these
+ * values. No PMC word is written here: the display driver does the PMC requests around this. The
+ * display pipe DART's Linux-owned streams are remembered before the power-off and written back
+ * after the power-on (m5_disp_dart_rewrite). The sleep's own entry and exit don't call this.
+ */
+static bool t6050_disp_dart_rewrite = true;
+module_param_named(m5_disp_dart_rewrite, t6050_disp_dart_rewrite, bool, 0644);
+
+static void __iomem *t6050_disp_dcp_gate;
+
+static int t6050_disp_ps_settle(void __iomem *word, u32 mask, u32 want)
+{
+	u32 v;
+
+	return readl_poll_timeout_atomic(word, v, (v & mask) == want, 1, 2000);
+}
+
+int apple_sleep_m5_display_power(bool on)
+{
+	struct apple_sleep *s = apple_sleep;
+	void __iomem *cpu, *fe, *sys;
+	int ret = 0;
+
+	if (!s || !s->soc->regions || !s->region || s->soc != &t6050_sleep_soc)
+		return -ENODEV;
+	/* The coprocessor core's gate pair: 3, 0 off and 0, 1 on. */
+	if (!t6050_disp_dcp_gate)
+		t6050_disp_dcp_gate = ioremap(0x280920500ULL, 0x100);
+	if (!t6050_disp_dcp_gate)
+		return -ENOMEM;
+	cpu = sleep_region_reg(s, s->soc->ps.disp[0][0]);
+	fe = sleep_region_reg(s, s->soc->ps.disp[0][1]);
+	sys = sleep_region_reg(s, s->soc->ps.disp[0][2]);
+	if (on) {
+		writel(0xf, sys);
+		ret |= t6050_disp_ps_settle(sys, 0xf0, 0xf0);
+		writel(0xf, fe);
+		ret |= t6050_disp_ps_settle(fe, 0xf0, 0xf0);
+		writel(0x0f00000f, cpu);
+		ret |= t6050_disp_ps_settle(cpu, 0xf0, 0xf0);
+		writel(0, t6050_disp_dcp_gate + 0x1c);
+		writel(1, t6050_disp_dcp_gate + 0x40);
+		writel(0x1f00000f, cpu);
+		if (t6050_disp_dart_rewrite)
+			apple_dart_m5_display_rewrite(NULL);
+		dev_dbg(s->dev, "display power on: %d, CPU %#x FE %#x SYS %#x gate %#x %#x\n", ret,
+			readl(cpu), readl(fe), readl(sys), readl(t6050_disp_dcp_gate + 0x1c),
+			readl(t6050_disp_dcp_gate + 0x40));
+		return ret;
+	}
+	if (t6050_disp_dart_rewrite)
+		apple_dart_m5_display_snapshot(NULL);
+	writel(0x0f0000ff, cpu);
+	ret |= t6050_disp_ps_settle(cpu, 0xf0, 0xf0);
+	writel(3, t6050_disp_dcp_gate + 0x1c);
+	writel(0, t6050_disp_dcp_gate + 0x40);
+	writel(0x0f0003f0, cpu);
+	ret |= t6050_disp_ps_settle(cpu, 0xf0, 0);
+	writel(0x3f0, fe);
+	ret |= t6050_disp_ps_settle(fe, 0xf0, 0);
+	writel(0x3f0, sys);
+	ret |= t6050_disp_ps_settle(sys, 0xf0, 0);
+	dev_dbg(s->dev, "display power off: %d, CPU %#x FE %#x SYS %#x gate %#x %#x\n", ret,
+		readl(cpu), readl(fe), readl(sys), readl(t6050_disp_dcp_gate + 0x1c),
+		readl(t6050_disp_dcp_gate + 0x40));
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_sleep_m5_display_power);
+
+/*
+ * T6050 (firmware 27): one external display coprocessor's power words (this profile's
+ * ps.disp[1..4]: CPU, FE, SYS) and its bits in the PMC's boost and bandwidth enable words,
+ * lowered or raised around one stop and start of that coprocessor after a wake, with the values
+ * and in the order of macOS's own stop and start of it (the same for all four and for each of
+ * its stops): off, the two PMC bits cleared, then CPU, FE, SYS; on, SYS, FE, CPU, then the two
+ * bits set. The PMC's request word is not written: macOS writes it only when the first of the
+ * four comes on or the last goes off, and here the others stay on. @dev is the coprocessor. The
+ * sleep's own entry and exit don't call this.
+ */
+static const struct {
+	u8 boost, bwr;
+} t6050_disp_ext_pmc[] = {
+	{ 2, 3 },	/* DISPEXT0 */
+	{ 4, 4 },	/* DISPEXT1 */
+	{ 6, 5 },	/* DISPEXT2 */
+	{ 8, 6 },	/* DISPEXT3 */
+};
+#define T6050_DISP_PMC_BWR	0x20
+#define T6050_DISP_PMC_BOOST	0x28
+static void __iomem *t6050_disp_pmc_en;
+
+int apple_sleep_m5_dispext_power(struct device *dev, bool on)
+{
+	struct apple_sleep *s = apple_sleep;
+	void __iomem *cpu, *fe, *sys, *pmc;
+	unsigned int d;
+	u32 boost, bwr;
+	int ret = 0;
+
+	if (!dev || !s || !s->soc->regions || !s->region || s->soc != &t6050_sleep_soc ||
+	    s->soc->ndisp != ARRAY_SIZE(t6050_disp_ext_pmc) + 1)
+		return -ENODEV;
+	for (d = 1; d < s->soc->ndisp; d++)
+		if (s->display[d].np == dev->of_node)
+			break;
+	if (d == s->soc->ndisp)
+		return -ENODEV;
+	if (!t6050_disp_pmc_en)
+		t6050_disp_pmc_en = ioremap(0x286808000ULL, 0x30);
+	pmc = t6050_disp_pmc_en;
+	if (!pmc)
+		return -ENOMEM;
+	boost = BIT(t6050_disp_ext_pmc[d - 1].boost);
+	bwr = BIT(t6050_disp_ext_pmc[d - 1].bwr);
+	cpu = sleep_region_reg(s, s->soc->ps.disp[d][0]);
+	fe = sleep_region_reg(s, s->soc->ps.disp[d][1]);
+	sys = sleep_region_reg(s, s->soc->ps.disp[d][2]);
+	if (on) {
+		writel(0xf, sys);
+		writel(0x1000000f, sys);
+		ret |= t6050_disp_ps_settle(sys, 0xf0, 0xf0);
+		writel(0xf, fe);
+		writel(0x1000000f, fe);
+		ret |= t6050_disp_ps_settle(fe, 0xf0, 0xf0);
+		writel(0x0f040000, cpu);
+		writel(0x0f04000f, cpu);
+		ret |= t6050_disp_ps_settle(cpu, 0xf0, 0xf0);
+		writel(0x1f04000f, cpu);
+		writel(readl(pmc + T6050_DISP_PMC_BOOST) | boost, pmc + T6050_DISP_PMC_BOOST);
+		writel(readl(pmc + T6050_DISP_PMC_BWR) | bwr, pmc + T6050_DISP_PMC_BWR);
+		dev_dbg(s->dev, "external display %u power on: %d, CPU %#x FE %#x SYS %#x, PMC boost %#x bandwidth %#x\n",
+			d - 1, ret, readl(cpu), readl(fe), readl(sys),
+			readl(pmc + T6050_DISP_PMC_BOOST), readl(pmc + T6050_DISP_PMC_BWR));
+		return ret;
+	}
+	writel(readl(pmc + T6050_DISP_PMC_BOOST) & ~boost, pmc + T6050_DISP_PMC_BOOST);
+	writel(readl(pmc + T6050_DISP_PMC_BWR) & ~bwr, pmc + T6050_DISP_PMC_BWR);
+	writel(0x0f0400ff, cpu);
+	writel(0x0f0403f0, cpu);
+	ret |= t6050_disp_ps_settle(cpu, 0xf0, 0);
+	writel(0x3f0, fe);
+	ret |= t6050_disp_ps_settle(fe, 0xf0, 0);
+	writel(0x3f0, sys);
+	ret |= t6050_disp_ps_settle(sys, 0xf0, 0);
+	dev_dbg(s->dev, "external display %u power off: %d, CPU %#x FE %#x SYS %#x, PMC boost %#x bandwidth %#x\n",
+		d - 1, ret, readl(cpu), readl(fe), readl(sys),
+		readl(pmc + T6050_DISP_PMC_BOOST), readl(pmc + T6050_DISP_PMC_BWR));
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_sleep_m5_dispext_power);
+
+
 
 
 #include "sleep-v27-late.inc"
