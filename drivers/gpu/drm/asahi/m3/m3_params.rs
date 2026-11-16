@@ -205,8 +205,8 @@ pub(crate) fn render_internal_timestamps()->bool {
 // The runtime's boot-time module parameters. On 7.1.12 they were `module!` parameters; they
 // keep their names, and exist only with the T8122 runtime built in.
 
-/// `asahi.m3_render_batch_size`: bounded ordered render batch size (1..16).
-static M3_RENDER_BATCH_SIZE: AtomicU64 = AtomicU64::new(1);
+/// `asahi.m3_render_batch_size`: bounded ordered render batch size (1..16, default 2).
+static M3_RENDER_BATCH_SIZE: AtomicU64 = AtomicU64::new(2);
 m3_param!("m3_render_batch_size", M3_RENDER_BATCH_SIZE, parse_u64);
 /// `asahi.m3_compute_batch_size`: bounded ordered compute batch size (1..16).
 static M3_COMPUTE_BATCH_SIZE: AtomicU64 = AtomicU64::new(1);
