@@ -245,7 +245,8 @@ static const struct apple_cio_hw apple_cio_t6040_hw = {
 	.lstx_after_boot = true,
 	.strict_fw_ready = true,
 	.no_host_clx = true,
-	.dp = &apple_dpin_disabled,
+	/* The T8132 (M4) DP IN flow; the PHY's AUSPLL is the pixel clock. */
+	.dp = &apple_dpin_m4,
 };
 
 #define APPLE_CIO_NHI_HOP_COUNT 0x0
@@ -630,6 +631,9 @@ static const struct of_device_id apple_dpin_qualified_soc[] = {
 	{ .compatible = "apple,t6021" },
 	{ .compatible = "apple,t6030" },
 	{ .compatible = "apple,t8132" },
+	/* T6040/T6041 (M4 Pro/Max): M4 DP IN flow, PHY tunnel pixel clock */
+	{ .compatible = "apple,t6040" },
+	{ .compatible = "apple,t6041" },
 	/* T6050: t8103 DP IN handshake, M3 flow, four DP IN adapters */
 	{ .compatible = "apple,t6050" },
 	{},
