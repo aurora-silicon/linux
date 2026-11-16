@@ -7108,7 +7108,8 @@ static void dcp_ext_give_up(struct apple_dcp *dcp, int err, const char *when)
 }
 
 /*
- * Whether the DP PHY and display crossbar of every Type-C route are there.
+ * Whether the DP PHY and display crossbar of every Type-C route are there,
+ * but for a route whose PHY or crossbar node is disabled, which is left out.
  * Routes register one at a time, and one registered cannot be taken back,
  * since a port controller may hold it: a later route waiting for its
  * supplier would leave the dcpext unusable for the boot. Returns
@@ -7131,6 +7132,12 @@ static int dcp_ext_route_suppliers(struct device *dev)
 		if (of_property_read_u32(route_np, "reg", &index))
 			continue;
 		snprintf(name, sizeof(name), "typec%u", index);
+		/*
+		 * A disabled PHY or crossbar never registers: probe skips its
+		 * route (dcp_register_typec_routes()), so do not wait for it.
+		 */
+		if (dcp_typec_route_supplier_disabled(dev, name))
+			continue;
 		phy = of_phy_get(dev->of_node, name);
 		if (PTR_ERR_OR_ZERO(phy) == -EPROBE_DEFER)
 			return -EPROBE_DEFER;

@@ -4648,6 +4648,104 @@ struct dcp_route_probe_context {
 	struct device_node *routes;
 };
 
+/*
+ * Is the provider that @dev's @names entry @name points to in @list available?
+ * A disabled one never registers, so looking it up would defer for ever. A
+ * missing or malformed entry counts as available: the lookup reports it.
+ */
+static bool dcp_typec_route_supplier_available(struct device *dev, const char *list,
+					       const char *cells, const char *names,
+					       const char *name)
+{
+	struct of_phandle_args args;
+	bool available;
+	int index;
+
+	index = of_property_match_string(dev->of_node, names, name);
+	if (index < 0 || of_parse_phandle_with_args(dev->of_node, list, cells, index, &args))
+		return true;
+	available = of_device_is_available(args.np);
+	of_node_put(args.np);
+	return available;
+}
+
+/*
+ * Disables @route, or every available route under @routes if @route is NULL,
+ * in the device tree, in one changeset, for good. A connector passes over
+ * unavailable routes when it looks for its display routes, so the port no
+ * longer waits for them. Returns the applied changeset, which stays (the live
+ * tree refers to it), or an ERR_PTR.
+ */
+static struct of_changeset *dcp_typec_routes_disable_nodes(struct device *dev,
+							   struct device_node *routes,
+							   struct device_node *route)
+{
+	struct of_changeset *cs;
+	struct device_node *np;
+	int ret = 0;
+
+	cs = kzalloc_obj(*cs);
+	if (!cs)
+		return ERR_PTR(-ENOMEM);
+	of_changeset_init(cs);
+	if (route) {
+		ret = of_changeset_update_prop_string(cs, route, "status", "disabled");
+	} else {
+		for_each_available_child_of_node(routes, np) {
+			ret = of_changeset_update_prop_string(cs, np, "status", "disabled");
+			if (ret) {
+				of_node_put(np);
+				break;
+			}
+		}
+	}
+	if (!ret)
+		ret = of_changeset_apply(cs);
+	if (ret) {
+		if (route)
+			dev_err(dev, "%pOF: could not disable the route: %d\n", route, ret);
+		else
+			dev_err(dev, "could not disable the Type-C display routes: %d\n", ret);
+		of_changeset_destroy(cs);
+		kfree(cs);
+		return ERR_PTR(ret);
+	}
+	return cs;
+}
+
+/*
+ * Which of @dev's suppliers for its Type-C route @name ("typecN") has a
+ * disabled node: "DP PHY", "display crossbar", or NULL if neither. Such a
+ * route is left out, here and in a failsafe dcpext's supplier preflight.
+ */
+const char *dcp_typec_route_supplier_disabled(struct device *dev, const char *name)
+{
+	if (!dcp_typec_route_supplier_available(dev, "phys", "#phy-cells", "phy-names", name))
+		return "DP PHY";
+	if (!dcp_typec_route_supplier_available(dev, "mux-controls", "#mux-control-cells",
+						"mux-control-names", name))
+		return "display crossbar";
+	return NULL;
+}
+
+/*
+ * A route whose PHY or crossbar node is disabled is skipped and disabled in
+ * turn, so that one port's disabled PHY costs only that port's displays, not
+ * every route of the processor. Returns NULL if the route is not skipped,
+ * else the changeset that disabled it, or an ERR_PTR if that failed.
+ */
+static struct of_changeset *dcp_typec_route_skip(struct device *dev,
+						 struct device_node *route_np,
+						 const char *name)
+{
+	const char *what = dcp_typec_route_supplier_disabled(dev, name);
+
+	if (!what)
+		return NULL;
+	dev_warn(dev, "%pOF: its %s is disabled, route skipped\n", route_np, what);
+	return dcp_typec_routes_disable_nodes(dev, NULL, route_np);
+}
+
 static int dcp_register_typec_routes_present(void *data)
 {
 	struct dcp_route_probe_context *ctx = data;
@@ -4688,6 +4786,10 @@ static int dcp_register_typec_routes_present(void *data)
 		if (!mux_name)
 			return -ENOMEM;
 
+		/* Skipped even if disabling it failed (logged): it cannot register */
+		if (dcp_typec_route_skip(dev, route_np, name))
+			continue;
+
 		route = &dcp->typec_routes[dcp->nr_typec_routes];
 		route->dcp = dcp;
 		INIT_LIST_HEAD(&route->port_link);
@@ -4696,6 +4798,7 @@ static int dcp_register_typec_routes_present(void *data)
 			return dev_err_probe(dev, PTR_ERR(route->phy),
 					     "%pOF: failed to get DP PHY\n", route_np);
 
+		/* A failure fails the probe, and devres puts the PHY */
 		route->xbar = devm_mux_control_get(dev, name);
 		if (IS_ERR(route->xbar))
 			return dev_err_probe(dev, PTR_ERR(route->xbar),
@@ -4808,31 +4911,9 @@ void dcp_typec_routes_disable_dev(struct device *dev)
 {
 	struct device_node *routes __free(device_node) =
 		of_get_child_by_name(dev->of_node, "typec-routes");
-	struct device_node *route;
-	struct of_changeset *cs;
-	int ret = 0;
 
-	if (!routes)
-		return;
-	cs = kzalloc(sizeof(*cs), GFP_KERNEL);
-	if (!cs)
-		return;
-	of_changeset_init(cs);
-	for_each_available_child_of_node(routes, route) {
-		ret = of_changeset_update_prop_string(cs, route, "status", "disabled");
-		if (ret) {
-			of_node_put(route);
-			break;
-		}
-	}
-	if (!ret)
-		ret = of_changeset_apply(cs);
-	if (ret) {
-		dev_err(dev, "could not disable the Type-C display routes: %d\n", ret);
-		of_changeset_destroy(cs);
-		kfree(cs);
-	}
-	/* Applied, it stays: the live tree refers to it. */
+	if (routes)
+		dcp_typec_routes_disable_nodes(dev, routes, NULL);
 }
 
 int dcp_register_typec_routes(struct apple_dcp *dcp)

@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Included by dcp-fabric.c to exercise its connector publication paths. */
+#include <kunit/device.h>
+#include <kunit/of.h>
 #include <kunit/platform_device.h>
 #include <kunit/test.h>
+
+OF_OVERLAY_DECLARE(dcp_route_supplier_test);
 
 struct dcp_topology_test {
 	struct apple_dcp_typec_port port[3];
@@ -312,11 +316,107 @@ static void topology_connector_group_test(struct kunit *test)
 	KUNIT_EXPECT_MEMEQ(test, order, three_ports, sizeof(three_ports));
 }
 
+static void topology_route_supplier_put(void *data)
+{
+	struct device *dev = data;
+
+	of_node_put(dev->of_node);
+	dev->of_node = NULL;
+}
+
+/*
+ * Only a route whose PHY or crossbar node is disabled is skipped. A missing
+ * or malformed entry counts as available, so that its lookup fails the probe.
+ */
+static void topology_route_supplier_test(struct kunit *test)
+{
+	struct device *dev;
+
+	KUNIT_ASSERT_EQ(test, 0, of_overlay_apply_kunit(test, dcp_route_supplier_test));
+	dev = kunit_device_register(test, "dcp-route-supplier");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
+	dev->of_node = of_find_node_by_path("/dcp-route-supplier-test/dcp");
+	KUNIT_ASSERT_NOT_NULL(test, dev->of_node);
+	KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(test, topology_route_supplier_put, dev), 0);
+
+	KUNIT_EXPECT_TRUE(test, dcp_typec_route_supplier_available(dev, "phys", "#phy-cells",
+								   "phy-names", "typec0"));
+	KUNIT_EXPECT_FALSE(test, dcp_typec_route_supplier_available(dev, "phys", "#phy-cells",
+								    "phy-names", "typec1"));
+	/* No such name, and no crossbar entry for typec2: the lookups report those */
+	KUNIT_EXPECT_TRUE(test, dcp_typec_route_supplier_available(dev, "phys", "#phy-cells",
+								   "phy-names", "typec4"));
+	KUNIT_EXPECT_TRUE(test, dcp_typec_route_supplier_available(dev, "mux-controls",
+								   "#mux-control-cells",
+								   "mux-control-names", "typec2"));
+	KUNIT_EXPECT_TRUE(test, dcp_typec_route_supplier_available(dev, "mux-controls",
+								   "#mux-control-cells",
+								   "mux-control-names", "typec1"));
+
+	/*
+	 * The per-route decision a failsafe dcpext's supplier preflight
+	 * (dcp_ext_route_suppliers()) and route registration share
+	 */
+	KUNIT_EXPECT_NULL(test, dcp_typec_route_supplier_disabled(dev, "typec0"));
+	KUNIT_EXPECT_STREQ(test, dcp_typec_route_supplier_disabled(dev, "typec1") ?: "",
+			   "DP PHY");
+	KUNIT_EXPECT_NULL(test, dcp_typec_route_supplier_disabled(dev, "typec2"));
+	KUNIT_EXPECT_STREQ(test, dcp_typec_route_supplier_disabled(dev, "typec3") ?: "",
+			   "display crossbar");
+
+	/* Available suppliers: the route is not skipped, and nothing is changed */
+	KUNIT_EXPECT_NULL(test, dcp_typec_route_skip(dev, dev->of_node, "typec0"));
+	KUNIT_EXPECT_NULL(test, dcp_typec_route_skip(dev, dev->of_node, "typec2"));
+	KUNIT_EXPECT_TRUE(test, of_device_is_available(dev->of_node));
+}
+
+static void topology_route_node_put(void *data)
+{
+	of_node_put(data);
+}
+
+/*
+ * A route whose PHY is disabled is skipped and disabled itself, so its port
+ * stops waiting for it. The changeset is reverted, for the overlay's removal.
+ */
+static void topology_route_skip_test(struct kunit *test)
+{
+	struct device_node *route_np;
+	struct of_changeset *cs;
+	struct device *dev;
+
+	KUNIT_ASSERT_EQ(test, 0, of_overlay_apply_kunit(test, dcp_route_supplier_test));
+	dev = kunit_device_register(test, "dcp-route-skip");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
+	dev->of_node = of_find_node_by_path("/dcp-route-supplier-test/dcp");
+	KUNIT_ASSERT_NOT_NULL(test, dev->of_node);
+	KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(test, topology_route_supplier_put, dev), 0);
+	route_np = of_find_node_by_path("/dcp-route-supplier-test/dcp/typec-routes/route@1");
+	KUNIT_ASSERT_NOT_NULL(test, route_np);
+	KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(test, topology_route_node_put, route_np), 0);
+	KUNIT_ASSERT_TRUE(test, of_device_is_available(route_np));
+
+	cs = dcp_typec_route_skip(dev, route_np, "typec1");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, cs);
+	KUNIT_EXPECT_FALSE(test, of_device_is_available(route_np));
+
+	/* A changeset still applied must not be destroyed */
+	KUNIT_ASSERT_EQ(test, of_changeset_revert(cs), 0);
+	of_changeset_destroy(cs);
+	kfree(cs);
+	KUNIT_EXPECT_TRUE(test, of_device_is_available(route_np));
+}
+
 static struct kunit_case dcp_topology_cases[] = {
 	KUNIT_CASE(topology_pipeline_identity_test),
 	KUNIT_CASE(topology_adopt_release_test),
 	KUNIT_CASE(topology_unbind_test),
 	KUNIT_CASE(topology_connector_group_test),
+	KUNIT_CASE(topology_route_supplier_test),
+	KUNIT_CASE(topology_route_skip_test),
 	{}
 };
 

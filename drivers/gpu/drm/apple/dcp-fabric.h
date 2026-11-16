@@ -132,6 +132,7 @@ int dcp_fabric_sleep_withdraw(struct apple_dcp *dcp, s64 ms[2]);
 void dcp_fabric_sleep_done(struct apple_dcp *dcp);
 void dcp_typec_routes_disable(struct apple_dcp *dcp);
 void dcp_typec_routes_disable_dev(struct device *dev);
+const char *dcp_typec_route_supplier_disabled(struct device *dev, const char *name);
 void dcp_typec_retrain_work(struct work_struct *work);
 void dcp_fabric_init(struct apple_dcp *dcp);
 void dcp_fabric_hdmi_resume(struct apple_dcp *dcp);
