@@ -1799,6 +1799,29 @@ impl super::Firmware {
 }
 
 impl Registry {
+    /// The firmware restarted after a real sleep powered its domain off, which lost every M5
+    /// compute queue's host-port configuration. Sends it again for each installed queue
+    /// ([`compute::Queue::wake_configuration`]), with the device mutex held and publication still
+    /// closed, so before any doorbell: no advance and no doorbell, and the next kick is an
+    /// ordinary one. Returns how many were sent and how many failed.
+    pub(in crate::g17) fn restore_compute_port_configurations(
+        &self,
+        regs: &crate::regs::G17Resources,
+    ) -> (u32, u32) {
+        let (mut sent, mut failed) = (0, 0);
+        for entry in self.compute.iter().flatten() {
+            let Some(queue) = entry.queue.as_deref() else {
+                continue;
+            };
+            match queue.wake_configuration() {
+                Ok(None) => {}
+                Ok(Some(submission)) if regs.submit_m5_work(&submission).is_ok() => sent += 1,
+                _ => failed += 1,
+            }
+        }
+        (sent, failed)
+    }
+
     /// Everything ensure_compute establishes for `owner`: the shared compute
     /// objects mapped into its VM, and its queue bound to `context` with a
     /// pool that fits and no spared witness to release.
