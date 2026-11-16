@@ -10,6 +10,10 @@
 #define SLEEP_REPLAY_PS BIT(31)
 #define SLEEP_REPLAY_INDEX(w) ((w) & ~SLEEP_REPLAY_PS)
 
+static bool t6050_test_control0;
+module_param_named(t6050_test_control0, t6050_test_control0, bool, 0644);
+MODULE_PARM_DESC(t6050_test_control0, "TEST: write AP wake control zero at boot and early wake");
+
 enum {
 	T6050_PS0, T6050_PS1, T6050_PS_AON, T6050_PS_GPX,
 	T6050_PS_MEDIA, T6050_PS_GFX_AON, T6050_CLK, T6050_CLK_SOC,
@@ -95,6 +99,9 @@ struct apple_sleep_region_state {
 	u64 diag_counter;
 	u32 diag_compare, diag_wake_mask4;
 	bool diag_mask149;
+	u32 diag_control0_boot_before, diag_control0_wake_before;
+	bool diag_control0_boot_wrote, diag_control0_wake_wrote;
+	u32 diag_admission_pending[10];
 	int diag_post_control;
 	u8 diag_wake_control, diag_wake_counter[8], diag_wake_compare[4];
 	int diag_wake_error;
@@ -1464,6 +1471,12 @@ static int t6050_sleep_map_regs(struct apple_sleep *s)
 						  ARRAY_SIZE(s->region->pins_low));
 	s->region->npins_low = max(ret, 0);
 	t6050_wake_masks(s);
+	/* TEST: macOS initializes this word at boot. Do not change mask policy. */
+	if (t6050_test_control0 && s->region->wake) {
+		s->region->diag_control0_boot_before = readl(s->region->wake);
+		writel(0, s->region->wake);
+		s->region->diag_control0_boot_wrote = true;
+	}
 	t6050_ans_chain(s);
 	/* The clusters' CPM set-up, where the boot loader puts it: no entry, no write */
 	ret = t6050_cpm_prop(s, "apple,cpm-boot", &s->region->cpm_boot, &s->region->ncpm_boot);
@@ -2051,6 +2064,9 @@ static void t6050_wake_arm(struct apple_sleep *s)
 		dev_dbg(s->dev, "wake word %u: implemented %#x, enabled %#x\n", i, implemented,
 			r->wake_enabled[i]);
 	}
+	/* Read only the defined pending words at returning admission. */
+	for (i = 0; i < ARRAY_SIZE(r->diag_admission_pending); i++)
+		r->diag_admission_pending[i] = readl(r->wake + 0x34 + 4 * i);
 	r->wake_armed = true;
 }
 
@@ -3240,6 +3256,11 @@ static void t6050_wake_report(struct apple_sleep *s)
 	struct apple_sleep_region_state *r = s->region;
 	unsigned int i, shown = 0, restored = 0, timeouts = 0, expected = 0;
 
+	dev_info(s->dev, "TEST control0: selected %u boot before %#x wrote %u; wake before %#x wrote %u\n",
+		t6050_test_control0, r->diag_control0_boot_before, r->diag_control0_boot_wrote,
+		r->diag_control0_wake_before, r->diag_control0_wake_wrote);
+	dev_info(s->dev, "TEST control0: admission pending %*ph\n",
+		(int)sizeof(r->diag_admission_pending), r->diag_admission_pending);
 	dev_info(s->dev, "TEST mask149: selected %u word4 mask %#x ADT enabled %#x\n",
 		r->diag_mask149, r->diag_wake_mask4, r->wake_enabled[149 / 32]);
 	dev_info(s->dev, "TEST alarm: counter before %llu compare %u; post-timer control %#x; wake error %d control %#x counter %llu compare %u\n",
@@ -3308,6 +3329,13 @@ static void t6050_sleep_wake_regs(struct apple_sleep *s)
 	if (r->wake)
 		for (i = 0; i < ARRAY_SIZE(r->diag_wake); i++)
 			r->diag_wake[i] = readl(r->wake + 0x34 + 4 * i);
+	/* TEST: macOS writes this word during early wake, before a later rearm. */
+	r->diag_control0_wake_wrote = false;
+	if (t6050_test_control0 && r->wake) {
+		r->diag_control0_wake_before = readl(r->wake);
+		writel(0, r->wake);
+		r->diag_control0_wake_wrote = true;
+	}
 	if (r->spmi_masked) {
 		/* Snapshot the latch before diagnostic PMU commands can affect the controller. */
 		r->diag_spmi[3] = t6050_spmi_pmu_ack(s);
