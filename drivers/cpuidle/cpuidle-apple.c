@@ -8,9 +8,13 @@
 #include <linux/init.h>
 #include <linux/cpuidle.h>
 #include <linux/cpu_pm.h>
+#include <linux/moduleparam.h>
 #include <linux/platform_device.h>
 #include <linux/of.h>
+#include <linux/stringify.h>
 #include <asm/cpuidle.h>
+
+#define CPU_PD_DEFAULT_RESIDENCY_US	10000
 
 enum idle_state {
 	STATE_WFI,
@@ -111,7 +115,7 @@ static struct cpuidle_driver apple_idle_driver = {
 			.enter			= apple_enter_idle,
 			.enter_s2idle		= apple_enter_idle,
 			.exit_latency		= 10,
-			.target_residency	= 10000,
+			.target_residency	= CPU_PD_DEFAULT_RESIDENCY_US,
 			.power_usage            = 0,
 			.name			= "CPU PD",
 			.desc			= "CPU/cluster powered down",
@@ -130,6 +134,47 @@ static const char *const apple_cyc_ovrd_machines[] = {
 	"apple,t6034",
 	NULL
 };
+
+/*
+ * CPU PD's target residency, in microseconds. Its break-even point has not
+ * been measured; the governors read it on every idle entry, so it can be
+ * tuned at runtime through /sys/module/cpuidle_apple/parameters/ as well as
+ * on the command line (cpuidle_apple.pd_residency_us=).
+ */
+static int pd_residency_set(const char *val, const struct kernel_param *kp)
+{
+	struct cpuidle_state *s = &apple_idle_driver.states[STATE_PWRDOWN];
+	unsigned int us;
+	int ret;
+
+	if (s->enter != apple_enter_idle)
+		return -EOPNOTSUPP;
+
+	ret = kstrtouint(val, 0, &us);
+	if (ret)
+		return ret;
+	if (us < s->exit_latency || us > USEC_PER_SEC)
+		return -EINVAL;
+
+	WRITE_ONCE(s->target_residency, us);
+	WRITE_ONCE(s->target_residency_ns, (s64)us * NSEC_PER_USEC);
+	return 0;
+}
+
+static int pd_residency_get(char *buf, const struct kernel_param *kp)
+{
+	return sysfs_emit(buf, "%u\n",
+			  READ_ONCE(apple_idle_driver.states[STATE_PWRDOWN].target_residency));
+}
+
+static const struct kernel_param_ops pd_residency_ops = {
+	.set = pd_residency_set,
+	.get = pd_residency_get,
+};
+module_param_cb(pd_residency_us, &pd_residency_ops, NULL, 0644);
+MODULE_PARM_DESC(pd_residency_us,
+		 "CPU PD target residency in microseconds (default "
+		 __stringify(CPU_PD_DEFAULT_RESIDENCY_US) ")");
 
 static int apple_cpuidle_probe(struct platform_device *pdev)
 {
