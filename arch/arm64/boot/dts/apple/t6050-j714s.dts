@@ -599,10 +599,10 @@
 #include "t6050-j714s-pmp-tunables.dtsi"
 
 /*
- * SMC sensors, as on J716s: the shared fan, power, voltage and current keys, plus
- * every readable float T* key through apple,discover-temperatures in
- * t6050-die0.dtsi, labelled with the key name. A key this SMC lacks only drops
- * its channel.
+ * SMC sensors, as on J716s except that userspace may set the fans (below): the
+ * shared fan, power, voltage and current keys, plus every readable float T* key
+ * through apple,discover-temperatures in t6050-die0.dtsi, labelled with the key
+ * name. A key this SMC lacks only drops its channel.
  *
  * Discovery refuses to run once any temperature channel exists, so the shared
  * temperature nodes go (their keys are discovered anyway), and so does
@@ -620,13 +620,20 @@
 	/delete-node/ temperature-TCHP;
 	/delete-node/ temperature-TW0P;
 
-	/* The T6050 SMC spells the fan mode keys F0md/F1md. The SMC drives the fans. */
+	/*
+	 * The T6050 SMC spells the fan mode keys F0md/F1md. The SMC drives the
+	 * fans (the M5 GPU governor sets them through macsmc_hwmon_fans_request()
+	 * as well); it also accepts a manual speed for both from userspace and
+	 * returns them to firmware control when the request is dropped.
+	 */
 	fan-F0Ac {
 		apple,fan-mode = "F0md";
+		apple,fan-manual-control;
 	};
 
 	fan-F1Ac {
 		apple,fan-mode = "F1md";
+		apple,fan-manual-control;
 	};
 };
 
@@ -707,6 +714,8 @@
 /* The Neural Engine, started only after the boot loader's preload hand-off */
 #include "t6050-j714s-ane.dtsi"
 #include "t6050-j714s-sleep.dtsi"
+#include "t6050-j714s-sleep-soc.dtsi"
+#include "t6050-j714s-sleep-adt.dtsi"
 
 /*
  * Sound through the AOP, as on J813: its audio service runs the serializers, the

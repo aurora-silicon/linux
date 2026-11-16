@@ -76,6 +76,7 @@ bool dcp_has_typec_routes(struct platform_device *pdev);
 unsigned int dcp_typec_nr_ports(void);
 struct device_node *dcp_typec_port_of_node(unsigned int idx);
 bool dcp_typec_port_has_candidate(unsigned int idx, struct platform_device *pdev);
+bool dcp_typec_port_tunnel_only(unsigned int idx, struct platform_device *pdev);
 bool dcp_typec_port_unusable(unsigned int idx);
 void dcp_typec_port_set_connector(unsigned int idx, bool secondary,
 				  struct apple_connector *connector,

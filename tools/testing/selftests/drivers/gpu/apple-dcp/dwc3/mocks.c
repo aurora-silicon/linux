@@ -102,7 +102,15 @@ struct dwc3_apple {
 	bool sleep_phy_wait, sleep_phy_pending;
 	bool dt_dis_u3_susphy;
 	unsigned long usb2_power_off_pending, usb3_power_off_pending;
+	/* The PM sleep epoch (dwc3_apple_pm_notify()); the fixtures stay IDLE. */
+	int sleep_pm_lock;
+	enum dwc3_apple_sleep_phase sleep_phase;
+	bool sleep_syscore, sleep_role_pending;
+	enum dwc3_apple_state sleep_role;
 };
+/* The epoch spinlock: taken only when free, released only when held. */
+#define spin_lock_irqsave(l, f) do { assert(!*(l)); *(l) = 1; (f) = 0; } while (0)
+#define spin_unlock_irqrestore(l, f) do { assert(*(l)); *(l) = 0; (void)(f); } while (0)
 static void __attribute__((unused)) apple_sleep_usb_slp_ddr(bool on)
 {
 	(void)on;

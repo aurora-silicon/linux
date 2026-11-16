@@ -520,12 +520,23 @@ properties:
             maxItems: 1
           mode-switch:
             type: boolean
+          apple,tunnel-only:
+            type: boolean
+            description:
+              The route carries USB4 DP tunnels only, never a DP Alt Mode
+              display. It is not a Type-C mode-switch.
           port:
             $ref: /schemas/graph.yaml#/properties/port
         required:
           - reg
-          - mode-switch
           - port
+        if:
+          not:
+            required:
+              - apple,tunnel-only
+        then:
+          required:
+            - mode-switch
         additionalProperties: false
     required:
       - '#address-cells'

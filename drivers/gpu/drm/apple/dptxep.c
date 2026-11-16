@@ -117,6 +117,27 @@ static u32 dptxport_remote_target(struct apple_dcp *dcp, u8 core, u8 atc,
 	       DCPDPTX_REMOTE_PORT_CONNECTED;
 }
 
+/*
+ * The tunnel part of the connection attributes, none for a direct PHY. A
+ * Thunderbolt/USB4 tunnel has the DP IN role (bits 7:0 = 1). On T6050 it
+ * also names the host DP IN adapter the tunnel starts at, by its DFP port
+ * number (the target's CORE: 1..4 for DP IN 0..3), in bits 15:13, as
+ * macOS connects every tunnel. Left 0, the tunnels on all four DP INs
+ * looked the same in this field.
+ */
+static u32 dptxport_tunnel_attrs(struct apple_dcp *dcp, u8 core)
+{
+	u32 attrs;
+
+	if (!dcp_is_usb4_output(dcp))
+		return 0;
+	attrs = 1;
+	if (of_device_is_compatible(dcp->dev->of_node, "apple,t6050-dcpext") &&
+	    core >= 1 && core <= 4)
+		attrs |= FIELD_PREP(DCPDPTX_REMOTE_PORT_DPIN, core);
+	return attrs;
+}
+
 int dptxport_validate_connection(struct apple_epic_service *service, u8 core,
 				 u8 atc, u8 die)
 {
@@ -127,11 +148,12 @@ int dptxport_validate_connection(struct apple_epic_service *service, u8 core,
 
 	/*
 	 * Attributes: role (bits 7:0; 0 = direct PHY, 1 = Thunderbolt/USB4
-	 * DP IN) | supports HPD (bit 8): 0x101 for a tunnel, 0x100 for a PHY.
+	 * DP IN) | supports HPD (bit 8): 0x101 for a tunnel, 0x100 for a PHY,
+	 * plus a T6050 tunnel's DP IN (see dptxport_tunnel_attrs()).
 	 * Without the DP IN role DCP gives up on a tunnel whose AUX channel is
 	 * slower to answer than a direct PHY's.
 	 */
-	u32 attrs = 0x100 | (dcp_is_usb4_output(service->ep->dcp) ? 1 : 0);
+	u32 attrs = 0x100 | dptxport_tunnel_attrs(service->ep->dcp, core);
 
 	trace_dptxport_validate_connection(dptx, core, atc, die);
 
@@ -169,9 +191,9 @@ int dptxport_connect(struct apple_epic_service *service, u8 core, u8 atc,
 {
 	struct dptx_port *dptx = service->cookie;
 	struct dcpdptx_connection_cmd cmd, resp;
-	/* same role bit as dptxport_validate_connection() above */
+	/* same tunnel attributes as dptxport_validate_connection() above */
 	u32 unk_field = (supports_hpd ? DCPDPTX_REMOTE_PORT_SUPPORTS_HPD : 0) |
-			(dcp_is_usb4_output(service->ep->dcp) ? 1 : 0);
+			dptxport_tunnel_attrs(service->ep->dcp, core);
 	int ret;
 	u32 target = dptxport_remote_target(service->ep->dcp, core, atc, die);
 

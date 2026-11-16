@@ -184,14 +184,14 @@ int apple_smc_read(struct apple_smc *smc, smc_key key, void *buf, size_t size);
 int apple_smc_write(struct apple_smc *smc, smc_key key, const void *buf, size_t size);
 
 /**
- * apple_smc_write_noirq - apple_smc_write() from another device's noirq resume
+ * apple_smc_write_noirq - apple_smc_write() from another device's noirq callbacks
  * @smc: Pointer to apple_smc struct
  * @key: smc_key data will be written to
  * @buf: Buffer from which size bytes of data will be written to SMC
  * @size: Number of bytes to be written
  *
  * The reply is polled for: device interrupts are off. Only for a caller that a
- * device link orders after the SMC's own noirq resume.
+ * device link orders before the SMC's noirq suspend and after its noirq resume.
  *
  * Return: Zero on success, negative errno on error
  */

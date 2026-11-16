@@ -622,6 +622,13 @@ static const struct apple_smc_wake_reason apple_smc_t8132_wake_reasons[] = {
 	{ 44, "USB2_wake" }, { 45, "aupo" }, { 48, "rtc" }, { }
 };
 
+/* The J714s's: T8132's numbering, with the SD reader's and the keyboard's own bits */
+static const struct apple_smc_wake_reason apple_smc_j714s_wake_reasons[] = {
+	{ 0, "pwrbtn" }, { 8, "lid" }, { 9, "sdconn" }, { 11, "charger" }, { 13, "wifibt" },
+	{ 35, "trackpadkeyboard" }, { 40, "acattach" }, { 41, "acdetach" }, { 42, "USB-C_plug" },
+	{ 43, "USB2_plug" }, { 44, "USB2_wake" }, { 45, "aupo" }, { 48, "rtc" }, { }
+};
+
 static int apple_smc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -641,6 +648,8 @@ static int apple_smc_probe(struct platform_device *pdev)
 	smc->dev = &pdev->dev;
 	smc->saved_enabled = of_machine_is_compatible("apple,j714s") &&
 		of_device_is_compatible(dev->of_node, "apple,t6050-smc");
+	if (smc->saved_enabled)
+		smc->wake_reasons = apple_smc_j714s_wake_reasons;
 	smc->sram_base = devm_platform_get_and_ioremap_resource(pdev, 1, &smc->sram);
 	if (IS_ERR(smc->sram_base))
 		return dev_err_probe(dev, PTR_ERR(smc->sram_base), "Failed to map SRAM region");
@@ -797,12 +806,13 @@ static void apple_smc_set_polled(struct apple_smc *smc, bool polled)
 }
 
 /*
- * A key write from another driver's noirq resume. SMC traffic is interrupt driven everywhere
- * else; this is the one exception, for a write that has to come before a device's bring-up that
- * itself has to be done in the noirq phase (an endpoint's reset given while its PCIe port is
- * still down, before the PCI core restores the port). The mailbox's interrupt is off there, so
- * the reply is fetched, as this driver fetches its own in its noirq callbacks. The caller is
- * ordered after this device's noirq resume by a device link, and must not sleep around the call.
+ * A key write from another driver's noirq callbacks. SMC traffic is interrupt driven everywhere
+ * else; this is the one exception, for a write that has to be made while a device's PCIe port is
+ * down in the noirq phase (an endpoint's reset given before the PCI core restores the port, or
+ * one replayed after the port's shutdown before sleep). The mailbox's interrupt is off there, so
+ * the reply is fetched, as this driver fetches its own in its noirq callbacks. A device link
+ * orders the caller's noirq suspend before this device's and its noirq resume after it; the
+ * caller must not sleep around the call.
  */
 int apple_smc_write_noirq(struct apple_smc *smc, smc_key key, const void *buf, size_t size)
 {
@@ -912,10 +922,7 @@ static int apple_smc_notice_on(struct apple_smc *smc, bool *mbsw)
 	}
 
 	smc->wake_record = get_unaligned_le64(record);
-	if (smc->sleep_policy)
-		names[0] = 0;
-	else
-		apple_smc_wake_reason_names(smc, smc->wake_record, names, sizeof(names));
+	apple_smc_wake_reason_names(smc, smc->wake_record, names, sizeof(names));
 	dev_info(smc->dev, "wake record: MBSE %#x, MBSW %8ph%s%s\n", event, record,
 		 names[0] ? ": " : "", names);
 	*mbsw = ret >= 0;
@@ -1006,9 +1013,10 @@ static void apple_smc_sleep_wake(struct apple_smc *smc)
 		apple_smc_write_mbse(smc, SMC_KEY(waka));
 	}
 	smc->sleep_warned = false;
-	if (smc->sleep_policy)
-		return; /* M5 wake-reason bit meanings are separate profile data. */
 	apple_smc_lid_wake(smc);
+	/* With a sleep policy (the J714s), the record is only named and the lid read. */
+	if (smc->sleep_policy)
+		return;
 	if (apple_smc_port_reasons_only(smc, smc->wake_record))
 		apple_sleep_debug_link_cut_wake();
 	/* A dark wake isn't one: with wakeup_count in use, it would abort the sleep after it. */

@@ -7,6 +7,8 @@
 #include <drm/drm_modeset_lock.h>
 #include <drm/drm_print.h>
 
+#include <linux/moduleparam.h>
+#include <linux/suspend.h>
 #include <linux/backlight.h>
 #include <linux/math64.h>
 #include <linux/completion.h>
@@ -17,6 +19,10 @@
 #include "dcp.h"
 #include "dcp-internal.h"
 #include "iomfb_v14_7.h"
+
+static bool v27_keep_level = true;
+module_param(v27_keep_level, bool, 0644);
+MODULE_PARM_DESC(v27_keep_level, "Firmware 27: keep the panel's level through a sleep, as macOS");
 
 #define MIN_BRIGHTNESS_PART1	2U
 #define MAX_BRIGHTNESS_PART1	99U
@@ -822,12 +828,17 @@ static int dcp_set_brightness(struct backlight_device *bd)
 		bool fade;
 		u32 old;
 
+		bool suspended = bd->props.state & BL_CORE_SUSPENDED;
+
+		/* macOS keeps the panel's level through a firmware 27 sleep. */
+		if (suspended && READ_ONCE(v27_keep_level) &&
+		    dcp->fw_compat == DCP_FIRMWARE_V_27_0 && pm_suspend_via_firmware())
+			suspended = false;
 		/* Preserve the requested level even while the core forces zero. */
 		spin_lock_irqsave(&dcp->backlight.lock, flags);
 		old = state->target;
 		ret = dcp_bl_request(state, bd->props.brightness,
-				     backlight_is_blank(bd),
-				     bd->props.state & BL_CORE_SUSPENDED);
+				     backlight_is_blank(bd), suspended);
 		/* A new level restarts the fade from the level presented last. */
 		fade = !ret && state->fading && state->target != old;
 		if (fade)

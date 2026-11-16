@@ -441,6 +441,12 @@ struct apple_dcp {
 	struct delayed_work hybrid_wq;
 	struct dcp_peer_tiling peer_tiling;
 	bool peer_unbinding;
+	/*
+	 * T6050: the platform limit left this display no pair when last
+	 * evaluated (dcp_peer_hints_v27(), dcp_peer_limit_update_v27()). Under
+	 * dcp_peer_lock.
+	 */
+	bool peer_limited;
 	/* Firmware display endpoint (its Disp_Index), apple,dcp-endpoint;
 	 * separate from index, which also selects the doorbell and PHY mode. */
 	u32 peer_endpoint;

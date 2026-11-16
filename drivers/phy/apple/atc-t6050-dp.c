@@ -123,12 +123,11 @@ struct t6050_dp {
 	bool fw_running;
 	bool fw_cold;		/* idled for a system sleep and halted: its next start is a cold one */
 	void *fw_data_saved;	/* the firmware data SRAM as the first start found it */
-	/* USB4 DP tunnel pixel clocks: source words, gates, running link rates */
+	/* USB4 DP tunnel pixel clocks: source words, gates, each one's link rate (0: off) */
 	void __iomem *dp_clk_src;
 	struct atc_domain dp_gate[ATC_DP_TUNNELS];
 	bool dp_gates;
 	u8 tunnel_rate[ATC_DP_TUNNELS];
-	u8 tunnel_idle;		/* bit k - 1: clock k runs with no user, see below */
 	/* A combo PHY's system sleep. */
 	u32 port;
 	struct notifier_block pm_nb;
@@ -497,73 +496,125 @@ static int atc_dp_source(u8 rate)
 	}
 }
 
-/* Switch tunnel clock @k off and park it; its gate stays as it is. */
-static void atc_dp_tunnel_switch_off(struct t6050_dp *dp, unsigned int k)
+/*
+ * Set switch @k as tunnel clock @k's rate has it: field k (and the UHBR bit
+ * for a 128b/132b rate) with its enable bit for a clock with a rate, field 7
+ * (parked) with its enable bit clear for one without. The switch is written
+ * before the enable, then the status read back for the enable bit.
+ */
+static int atc_dp_tunnel_switch(struct t6050_dp *dp, unsigned int k, u32 *status)
 {
 	void __iomem *cfg = dp->banks[39];
-	u32 en = atc_dp_enable_bit(k), v;
+	u8 rate = dp->tunnel_rate[k - 1];
+	u32 en = atc_dp_enable_bit(k);
+	u32 sw = readl(cfg + ATC_CFG_DP_SWITCH) & ~atc_dp_switch_mask(k);
+	u32 on = readl(cfg + ATC_CFG_DP_ENABLE) & ~en;
+	u32 v;
+	int ret;
 
-	writel(readl(cfg + ATC_CFG_DP_ENABLE) & ~en, cfg + ATC_CFG_DP_ENABLE);
-	writel((readl(cfg + ATC_CFG_DP_SWITCH) & ~atc_dp_switch_mask(k)) |
-	       (ATC_DP_SWITCH_PARKED << (3 * k - 3)), cfg + ATC_CFG_DP_SWITCH);
-	if (readl_poll_timeout(cfg + ATC_CFG_DP_STATUS, v, !(v & en), 10, 10000))
-		dev_warn(dp->dev, "DP tunnel clock %u: switch status %08x still on\n", k, v);
-	dp->tunnel_rate[k - 1] = 0;
-	dp->tunnel_idle &= ~BIT(k - 1);
+	if (rate) {
+		sw |= k << (3 * k - 3);
+		if (rate == 0x81 || rate == 0x82)
+			sw |= BIT(11 + k);
+		on |= en;
+	} else {
+		sw |= ATC_DP_SWITCH_PARKED << (3 * k - 3);
+	}
+	writel(sw, cfg + ATC_CFG_DP_SWITCH);
+	writel(on, cfg + ATC_CFG_DP_ENABLE);
+	ret = readl_poll_timeout(cfg + ATC_CFG_DP_STATUS, v, !(v & en) == !rate, 10, 10000);
+	if (status)
+		*status = v;
+	return ret;
 }
 
 /*
- * Park every tunnel clock switch that runs no clock (field 7, enable off),
- * once the PHY is in USB4 mode: an unparked switch selects the native DP
- * clock for its crossbar pixel clock.
+ * Bring tunnel clock @k to its rate: for a clock with one, its gate on, then
+ * the power manager's source for the rate (its busy bit waited out), then its
+ * switch; for a clock without one, its switch parked, then its gate off.
+ */
+static int atc_dp_tunnel_apply(struct t6050_dp *dp, unsigned int k, u32 *status)
+{
+	unsigned int i = k - 1;
+	u8 rate = dp->tunnel_rate[i];
+	void __iomem *word;
+	int ret, src;
+	u32 v;
+
+	if (!rate) {
+		if (atc_dp_tunnel_switch(dp, k, &v))
+			dev_warn(dp->dev, "DP tunnel clock %u: switch status %08x still on\n",
+				 k, v);
+		/* A failed start or gate suspend can leave a held domain at rate zero. */
+		return dp->dp_gates ? atc_domain_set(&dp->dp_gate[i], false) : 0;
+	}
+	if (dp->dp_gates) {
+		ret = atc_domain_set(&dp->dp_gate[i], true);
+		if (ret)
+			return ret;
+	}
+	src = atc_dp_source(rate);
+	word = dp->dp_clk_src + 4 * i;
+	writel((readl(word) & ~ATC_DP_SRC_SELECT) | FIELD_PREP(ATC_DP_SRC_SELECT, src), word);
+	ret = readl_poll_timeout(word, v, !(v & ATC_DP_SRC_BUSY), 10, 200000);
+	if (ret) {
+		dev_err(dp->dev, "DP tunnel clock %u: source %d not taken (%08x)\n", k, src, v);
+		return ret;
+	}
+	ret = atc_dp_tunnel_switch(dp, k, &v);
+	if (ret)
+		dev_err(dp->dev, "DP tunnel clock %u: switch status %08x not on\n", k, v);
+	if (status)
+		*status = v;
+	return ret;
+}
+
+/*
+ * Apply every tunnel clock in clock order after one has changed: each clock
+ * with a rate keeps it, its source and switch written again as they are,
+ * and each clock without one stays parked and gated. A clock is therefore
+ * only ever started from off at its own user's rate, and only stopped to off;
+ * a clock no display uses never runs. Returns @clock's result.
+ */
+static int atc_dp_tunnels_apply(struct t6050_dp *dp, unsigned int clock, u32 *status)
+{
+	int ret = 0;
+
+	for (unsigned int k = 1; k <= ATC_DP_TUNNELS; k++) {
+		int err = atc_dp_tunnel_apply(dp, k, k == clock ? status : NULL);
+
+		if (k == clock)
+			ret = err;
+	}
+	return ret;
+}
+
+/*
+ * Park every tunnel clock (field 7, enable off), once the PHY is in USB4
+ * mode: an unparked switch selects the native DP clock for its crossbar pixel
+ * clock. No clock has a rate yet.
  */
 static void atc_dp_tunnels_park(struct t6050_dp *dp)
 {
-	void __iomem *cfg = dp->banks[39];
-	u32 sw = readl(cfg + ATC_CFG_DP_SWITCH), en = readl(cfg + ATC_CFG_DP_ENABLE);
-
-	for (unsigned int k = 1; k <= ATC_DP_TUNNELS; k++) {
-		if (dp->tunnel_rate[k - 1])
-			continue;
-		sw = (sw & ~atc_dp_switch_mask(k)) | (ATC_DP_SWITCH_PARKED << (3 * k - 3));
-		en &= ~atc_dp_enable_bit(k);
-	}
-	writel(en, cfg + ATC_CFG_DP_ENABLE);
-	writel(sw, cfg + ATC_CFG_DP_SWITCH);
-}
-
-/* Stop tunnel clock @k and gate it. */
-static int atc_dp_tunnel_stop(struct t6050_dp *dp, unsigned int k)
-{
-	if (dp->tunnel_rate[k - 1])
-		atc_dp_tunnel_switch_off(dp, k);
-	return dp->dp_gates ? atc_domain_set(&dp->dp_gate[k - 1], false) : 0;
+	atc_dp_tunnels_apply(dp, 0, NULL);
 }
 
 /*
- * Taking a running tunnel clock away disturbs the port's other tunnel
- * clocks: the display on one of them loses its stream for a moment, and can
- * lose its link. A clock whose user stopped it therefore keeps running while
- * another clock of the port is in use, and stops with the last of them.
+ * Stop every tunnel clock, before the PHY leaves USB4 mode. The switches are
+ * written only while a clock runs, which it does only in USB4 mode.
  */
-static bool atc_dp_tunnel_others_in_use(struct t6050_dp *dp, unsigned int k)
-{
-	for (unsigned int i = 0; i < ATC_DP_TUNNELS; i++)
-		if (i != k - 1 && dp->tunnel_rate[i] && !(dp->tunnel_idle & BIT(i)))
-			return true;
-	return false;
-}
-
-/* Stop every tunnel clock, before the PHY leaves USB4 mode. */
 static void atc_dp_tunnels_stop(struct t6050_dp *dp)
 {
-	for (unsigned int k = 1; k <= ATC_DP_TUNNELS; k++) {
-		if (dp->tunnel_rate[k - 1])
-			atc_dp_tunnel_switch_off(dp, k);
-		/* A failed start or gate suspend can leave a held domain at rate zero. */
-		if (dp->dp_gates)
-			atc_domain_set(&dp->dp_gate[k - 1], false);
+	bool running = memchr_inv(dp->tunnel_rate, 0, sizeof(dp->tunnel_rate));
+
+	memset(dp->tunnel_rate, 0, sizeof(dp->tunnel_rate));
+	if (running) {
+		atc_dp_tunnels_apply(dp, 0, NULL);
+		return;
 	}
+	/* A failed start or gate suspend can leave a held domain at rate zero. */
+	for (unsigned int k = 1; dp->dp_gates && k <= ATC_DP_TUNNELS; k++)
+		atc_domain_set(&dp->dp_gate[k - 1], false);
 }
 
 #include "atc-t6050-combo.h"
@@ -673,56 +724,19 @@ int apple_dp_phy_link_config(struct phy *phy, unsigned int *pclk, bool *uhbr)
 }
 EXPORT_SYMBOL_GPL(apple_dp_phy_link_config);
 
-/* Start tunnel clock @clock at link rate @rate from PMGR source @src. */
-static int atc_dp_tunnel_start(struct t6050_dp *dp, unsigned int clock, u8 rate,
-			       int src, u32 *status)
-{
-	void __iomem *cfg = dp->banks[39], *word;
-	unsigned int i = clock - 1;
-	u32 en = atc_dp_enable_bit(clock), v;
-	int ret;
-
-	if (dp->dp_gates) {
-		ret = atc_domain_set(&dp->dp_gate[i], true);
-		if (ret)
-			return ret;
-	}
-	word = dp->dp_clk_src + 4 * i;
-	writel((readl(word) & ~ATC_DP_SRC_SELECT) | FIELD_PREP(ATC_DP_SRC_SELECT, src), word);
-	ret = readl_poll_timeout(word, v, !(v & ATC_DP_SRC_BUSY), 10, 200000);
-	if (ret) {
-		dev_err(dp->dev, "DP tunnel clock %u: source %d not taken (%08x)\n",
-			clock, src, v);
-		if (dp->dp_gates)
-			atc_domain_set(&dp->dp_gate[i], false);
-		return ret;
-	}
-	writel((readl(cfg + ATC_CFG_DP_SWITCH) & ~atc_dp_switch_mask(clock)) |
-	       (clock << (3 * clock - 3)) |
-	       (rate == 0x81 || rate == 0x82 ? BIT(11 + clock) : 0),
-	       cfg + ATC_CFG_DP_SWITCH);
-	writel(readl(cfg + ATC_CFG_DP_ENABLE) | en, cfg + ATC_CFG_DP_ENABLE);
-	ret = readl_poll_timeout(cfg + ATC_CFG_DP_STATUS, v, v & en, 10, 10000);
-	if (ret) {
-		dev_err(dp->dev, "DP tunnel clock %u: switch status %08x not on\n", clock, v);
-		/* Undo the partial start before leaving the rate uncached for retry. */
-		atc_dp_tunnel_switch_off(dp, clock);
-		if (dp->dp_gates)
-			atc_domain_set(&dp->dp_gate[i], false);
-		return ret;
-	}
-	dp->tunnel_rate[i] = rate;
-	*status = v;
-	return 0;
-}
-
+/*
+ * A tunnel clock has one rate while its display uses it, the one its link
+ * was set up at, and none otherwise. It starts from off at that rate when the
+ * link is set up and stops to off when the link goes; a clock that runs is
+ * never given another rate in place. Every change applies all four clocks in
+ * order (atc_dp_tunnels_apply()).
+ */
 int apple_t6050_dp_tunnel_clock(struct phy *phy, unsigned int clock, u8 rate)
 {
 	struct t6050_dp *dp;
 	unsigned int i = clock - 1;
 	int src = 0, ret;
-	bool others;
-	u32 v;
+	u32 v = 0;
 
 	if (!phy || phy->ops != &t6050_dp_ops)
 		return -EOPNOTSUPP;
@@ -737,50 +751,44 @@ int apple_t6050_dp_tunnel_clock(struct phy *phy, unsigned int clock, u8 rate)
 	guard(mutex)(&dp->lock);
 	if (!dp->combo || !dp->dp_clk_src)
 		return -EOPNOTSUPP;
-	if (rate && dp->tunnel_rate[i] == rate) {
-		dp->tunnel_idle &= ~BIT(i);
+	if (dp->tunnel_rate[i] == rate) {
+		/* A failed start or gate suspend can leave a held domain at rate zero. */
+		if (!rate && dp->dp_gates)
+			return atc_domain_set(&dp->dp_gate[i], false);
 		return 0;
 	}
-	others = atc_dp_tunnel_others_in_use(dp, clock);
-	if (!rate) {
-		if (dp->tunnel_rate[i] && others) {
-			dp->tunnel_idle |= BIT(i);
-			dev_dbg(dp->dev, "DP tunnel clock %u left running for the others\n",
-				clock);
-			return 0;
+	/*
+	 * Stop a running clock to off: its switch parked and its gate off. One
+	 * whose user now asks for another rate is stopped the same way and then
+	 * started again from off below.
+	 */
+	if (dp->tunnel_rate[i]) {
+		u8 old = dp->tunnel_rate[i];
+
+		dp->tunnel_rate[i] = 0;
+		ret = atc_dp_tunnels_apply(dp, clock, NULL);
+		if (!rate) {
+			if (!ret)
+				dev_info(dp->dev, "DP tunnel clock %u stopped\n", clock);
+			return ret;
 		}
-		ret = atc_dp_tunnel_stop(dp, clock);
-		/* The last user went: the clocks kept for it go as well. */
-		for (unsigned int k = 1; !others && k <= ATC_DP_TUNNELS; k++)
-			if (dp->tunnel_idle & BIT(k - 1))
-				atc_dp_tunnel_stop(dp, k);
-		if (!ret)
-			dev_info(dp->dev, "DP tunnel clock %u stopped\n", clock);
-		return ret;
+		if (ret)
+			dev_warn(dp->dev, "DP tunnel clock %u: gate not released: %d\n",
+				 clock, ret);
+		dev_info(dp->dev, "DP tunnel clock %u: link rate 0x%02x to 0x%02x, restarting from off\n",
+			 clock, old, rate);
 	}
-	/* A new rate takes the clock off its old source first. */
-	if (dp->tunnel_rate[i])
-		atc_dp_tunnel_switch_off(dp, clock);
 	if (dp->faulted)
 		return -EIO;
 	if (dp->combo_mode != COMBO_CIO)
 		return -ENOLINK;
-	ret = atc_dp_tunnel_start(dp, clock, rate, src, &v);
-	if (ret)
+	dp->tunnel_rate[i] = rate;
+	ret = atc_dp_tunnels_apply(dp, clock, &v);
+	if (ret) {
+		/* Undo the partial start: the clock is left without a rate, for a retry. */
+		dp->tunnel_rate[i] = 0;
+		atc_dp_tunnel_apply(dp, clock, NULL);
 		return ret;
-	/*
-	 * Starting a clock disturbs the running ones as stopping one does. The
-	 * port's first clock therefore starts the others with it, at its rate
-	 * and with no user: a display that comes later at that rate finds its
-	 * clock running.
-	 */
-	for (unsigned int k = 1; !others && k <= ATC_DP_TUNNELS; k++) {
-		u32 unused;
-
-		if (k == clock || dp->tunnel_rate[k - 1])
-			continue;
-		if (!atc_dp_tunnel_start(dp, k, rate, src, &unused))
-			dp->tunnel_idle |= BIT(k - 1);
 	}
 	dev_info(dp->dev, "DP tunnel clock %u: link rate 0x%02x, source %d, switch status %08x\n",
 		 clock, rate, src, v);

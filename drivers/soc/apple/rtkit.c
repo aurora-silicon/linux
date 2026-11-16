@@ -563,7 +563,8 @@ static int apple_rtkit_alloc_shmem(struct apple_rtkit *rtk, u8 ep,
 {
 	if (READ_ONCE(rtk->ans_hold))
 		return apple_rtkit_ans_fail(rtk, -EBUSY);
-	if (READ_ONCE(rtk->strict_retained_buffers))
+	/* The crash log's buffer is asked for only at a crash: serve it after a strict restart too. */
+	if (READ_ONCE(rtk->strict_retained_buffers) && ep != APPLE_RTKIT_EP_CRASHLOG)
 		return -EPROTO;
 
 	if (rtk->ops->shmem_setup_ep)
@@ -584,7 +585,7 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 	u64 reply;
 	int err;
 
-	if (READ_ONCE(rtk->strict_retained_buffers) && !buffer->size) {
+	if (READ_ONCE(rtk->strict_retained_buffers) && !buffer->size && ep != APPLE_RTKIT_EP_CRASHLOG) {
 		rtk->boot_result = -EPROTO;
 		complete_all(&rtk->epmap_completion);
 		complete_all(&rtk->iop_pwr_ack_completion);
