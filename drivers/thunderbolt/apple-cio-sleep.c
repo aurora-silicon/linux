@@ -906,7 +906,7 @@ static int apple_nhi_cio_power_off_t6050(struct apple_nhi *anhi)
 		if (of_machine_is_compatible("apple,j714s"))
 			dev_info(anhi->dev, "TEST CIO LSTX: selected %u held %u gpio %d result %d\n",
 				 t6050_test_sleep_lstx_high, acio->lstx_high,
-				 !ret && acio->lstx_gpio ? gpiod_get_raw_value_cansleep(acio->lstx_gpio) : -ENODATA,
+				 !ret && acio->lstx_gpio ? gpiod_get_raw_value(acio->lstx_gpio) : -ENODATA,
 				 ret);
 		if (ret)
 			return ret;
