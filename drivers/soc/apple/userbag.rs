@@ -1797,6 +1797,10 @@ impl crate::SepData {
     /// without these the bag would stay unlocked.
     fn userbag_lock_13_steps(&self, user: crate::sks::DesignateUser, flags: u64) -> Result<()> {
         const FIRES: u32 = 15;
+        // Retained matches for this bag's keys end with the lock.
+        if let Some(uid) = u32::try_from(-user.special_handle().value()).ok().and_then(|id| id.checked_sub(USER_BAG_BASE)) {
+            self.revoke_bag_contexts(uid);
+        }
         // Not held across the requests and the waits between fires: every
         // other bag and Touch ID path takes this lock.
         let (bag, touch) = {

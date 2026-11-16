@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 //! Shared capture ownership; an idle biometric file does not own the sensor.
 
-use crate::SepData;
+use crate::{key_request::Request, SepData};
 use kernel::prelude::*;
-use kernel::sync::atomic::Relaxed;
+use kernel::sync::{atomic::Relaxed, Arc};
 
 enum Owner {
     Idle,
     Sync(u64),
     Bio(u64),
+    Key(Arc<Request>),
 }
 
 pub(crate) struct State {
@@ -31,6 +32,27 @@ impl State {
         self.generation = self.generation.checked_add(1).ok_or(EOVERFLOW)?;
         self.owner = Owner::Sync(self.generation);
         Ok(self.generation)
+    }
+
+    pub(crate) fn start_key(&mut self, request: Arc<Request>) -> Result {
+        if !matches!(self.owner, Owner::Idle) {
+            return Err(EBUSY);
+        }
+        self.owner = Owner::Key(request);
+        Ok(())
+    }
+
+    pub(crate) fn key(&self) -> Option<Arc<Request>> {
+        match &self.owner {
+            Owner::Key(request) => Some(request.clone()),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn finish_key(&mut self, request: &Arc<Request>) {
+        if matches!(&self.owner, Owner::Key(active) if Arc::ptr_eq(active, request)) {
+            self.owner = Owner::Idle;
+        }
     }
 
     /// Hands a synchronous owner's capture to the bio worker `epoch`.
