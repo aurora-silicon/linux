@@ -40,6 +40,16 @@ struct Authenticate {
     outcome: u32,
     reserved: u32,
 }
+/// Password authentication of a bag context: the enclave checks the
+/// password against that bag (and counts a wrong one) into a fresh credential
+/// that becomes the context's grant. The kernel wipes its copy.
+#[repr(C)]
+struct AuthPassword {
+    id: u64,
+    timeout_ms: u32,
+    outcome: u32,
+    password: keys::Password,
+}
 #[repr(C)]
 struct Query {
     phase: u32,
@@ -77,6 +87,7 @@ struct ContextDecrypt {
 
 static_assert!(core::mem::size_of::<NewContext>() == 16);
 static_assert!(core::mem::size_of::<Authenticate>() == 24);
+static_assert!(core::mem::size_of::<AuthPassword>() == 16 + 8 + keys::PASSWORD_MAX);
 static_assert!(core::mem::size_of::<Query>() == 16);
 static_assert!(core::mem::size_of::<Revoke>() == 8);
 static_assert!(core::mem::size_of::<ContextSign>() == 144);
@@ -86,6 +97,8 @@ unsafe impl kernel::transmute::FromBytes for NewContext {}
 unsafe impl kernel::transmute::AsBytes for NewContext {}
 unsafe impl kernel::transmute::FromBytes for Authenticate {}
 unsafe impl kernel::transmute::AsBytes for Authenticate {}
+unsafe impl kernel::transmute::FromBytes for AuthPassword {}
+unsafe impl kernel::transmute::AsBytes for AuthPassword {}
 unsafe impl kernel::transmute::AsBytes for Query {}
 unsafe impl kernel::transmute::FromBytes for Revoke {}
 unsafe impl kernel::transmute::FromBytes for ContextSign {}
@@ -95,6 +108,7 @@ unsafe impl kernel::transmute::AsBytes for ContextDecrypt {}
 
 const NEW: u32 = kernel::ioctl::_IOWR::<NewContext>(crate::key::MAGIC, 0x40);
 const AUTH: u32 = kernel::ioctl::_IOWR::<Authenticate>(crate::key::MAGIC, 0x41);
+const AUTH_PASSWORD: u32 = kernel::ioctl::_IOWR::<AuthPassword>(crate::key::MAGIC, 0x46);
 const QUERY: u32 = kernel::ioctl::_IOR::<Query>(crate::key::MAGIC, 0x42);
 const REVOKE: u32 = kernel::ioctl::_IOW::<Revoke>(crate::key::MAGIC, 0x43);
 const SIGN: u32 = kernel::ioctl::_IOWR::<ContextSign>(crate::key::MAGIC, 0x44);
@@ -360,6 +374,9 @@ unsafe extern "C" fn context_ioctl(pointer: *mut c_void, cmd: c_uint, arg: c_ulo
             let request: Cancel = UserSlice::new(user, 8).reader().read()?;
             return context.cancel(request.request_id);
         }
+        if cmd == AUTH_PASSWORD {
+            return auth_password(&context, user);
+        }
         if cmd != AUTH {
             return Err(ENOTTY);
         }
@@ -411,6 +428,80 @@ unsafe extern "C" fn context_ioctl(pointer: *mut c_void, cmd: c_uint, arg: c_ulo
         Ok(()) => 0,
         Err(error) => error.to_errno() as c_long,
     }
+}
+
+fn auth_password(context: &Arc<Context>, user: UserPtr) -> Result {
+    context.check_domain()?;
+    if context.sep.key_context_failed.load(Relaxed) {
+        return Err(EIO);
+    }
+    let size = core::mem::size_of::<AuthPassword>();
+    // `req` wipes the password when it drops, on every path.
+    let mut req: AuthPassword = UserSlice::new(user, size).reader().read()?;
+    if req.id == 0 || req.outcome != 0 {
+        return Err(EINVAL);
+    }
+    let uid = context.bag.ok_or(EOPNOTSUPP)?;
+    let deadline_ns = deadline(req.timeout_ms)?;
+    let status = (|| {
+        let pw = keys::check_password(&req.password)?;
+        let request = Request::new(
+            req.id,
+            crate::key_request::KeyRequest {
+                blob: KVec::new(),
+                input: crate::key_request::Input::Authenticate(context.clone()),
+                deadline_ns,
+            },
+        )?;
+        context.authenticate(request.id, &request.completion)?;
+        let made = (|| {
+            let bag = keys::bag_user(uid)?;
+            let (handle, verify) = context.sep.key_context_for(
+                -bag.special_handle().value(),
+                Some((bag.special_handle(), pw)),
+            )?;
+            // Dropped on refusal: the credential deletes its context.
+            let credential = crate::key_context::Credential::new(context.sep.clone(), handle);
+            if verify != 0 {
+                return Err(EACCES);
+            }
+            // The password also renews this user's Touch ID, as a bag
+            // unlock does.
+            context.sep.userbag_refresh_touch_13(bag, pw);
+            Ok(credential)
+        })();
+        context.finish_auth(
+            &request.completion,
+            made.map(|credential| (credential, Ok(()))),
+        );
+        // No capture is held, so the result is deliverable at once.
+        request.retire();
+        let result = request
+            .completion
+            .wait_ready()
+            .and_then(|()| context.claim(&request.completion));
+        context.forget(&request.completion);
+        match result {
+            Ok(crate::key_request::Output::Authenticated) => Ok(()),
+            Ok(_) => Err(EIO),
+            Err(error) => Err(error),
+        }
+    })();
+    if let Err(error) = status {
+        context.revoke(error);
+    }
+    req.outcome = match status {
+        Ok(()) => OUTCOME_OK,
+        Err(error) if error == EACCES => OUTCOME_NOT_MATCHED,
+        _ => OUTCOME_FAILED,
+    };
+    crate::image::wipe(&mut req.password.bytes);
+    req.password.len = 0;
+    if let Err(error) = UserSlice::new(user, size).writer().write(&req) {
+        context.revoke(error);
+        return Err(error);
+    }
+    status
 }
 
 /// A context file's release.
