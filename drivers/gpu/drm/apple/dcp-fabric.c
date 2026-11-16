@@ -2474,8 +2474,16 @@ int dcp_tunnel_crossbar_up(struct apple_dcp *dcp, u32 unit)
 		ret = mux_control_try_select(route->active_xbar, route->mux_index);
 		if (!ret)
 			route->xbar_up = true;
-		/* T602X DP IN selection reserves and routes the mux only. */
-		if (!ret && dcp_t602x_tunnel_route(route)) {
+		/*
+		 * T602X DP IN selection reserves and routes the mux only, so the
+		 * first link up also enables the connection. The T6041 crossbar
+		 * (M4 Pro/Max) takes the same T6030 flow on every firmware: without
+		 * this its clocks stay off until a retrain, and a mode set that
+		 * keeps the trained link (5K on 26.6) never gets any video.
+		 */
+		if (!ret && (dcp_t602x_tunnel_route(route) ||
+			     of_device_is_compatible(route->active_xbar->chip->dev.parent->of_node,
+						     "apple,t6041-display-crossbar"))) {
 			ret = dcp_tunnel_xbar_configure(route);
 			if (!ret)
 				ret = dcp_dpxbar_link(route->active_xbar, true);
