@@ -96,8 +96,21 @@ struct apple_dcp_typec_port {
 	struct list_head link;
 	struct list_head routes;
 	struct device_node *connector_np;
-	struct apple_dcp_typec_route *owner;
-	struct apple_dcp_typec_route *secondary_owner;
+	/* The owner slots, as core.owner[] (see dcp_fabric_tunnel_owner()). */
+	union {
+		struct {
+			struct apple_dcp_typec_route *owner;
+			struct apple_dcp_typec_route *secondary_owner;
+			/*
+			 * T6050 (fixed CRTCs): each pipeline drives one DP IN,
+			 * so DP IN 2 and 3 get slots of their own instead of
+			 * sharing DP IN 0/1's (see dcp_tb_slot()). Always NULL
+			 * elsewhere.
+			 */
+			struct apple_dcp_typec_route *dpin_owner[2];
+		};
+		struct apple_dcp_typec_route *slots[DCP_FABRIC_DPIN_MAX];
+	};
 	/* Keep a port on its last DCP while that pipeline remains free. */
 	struct apple_dcp_typec_route *preferred_route;
 	/* DRM connector for this physical port, driven by whichever DCP owns it */
@@ -369,6 +382,52 @@ bool dcp_typec_fixed_crtcs(void)
 	KUNIT_STATIC_STUB_REDIRECT(dcp_typec_fixed_crtcs);
 
 	return of_machine_is_compatible("apple,t6050");
+}
+
+static_assert(offsetof(struct apple_dcp_typec_port, dpin_owner[1]) ==
+	      offsetof(struct apple_dcp_typec_port, slots[DCP_FABRIC_DPIN_MAX - 1]));
+
+/*
+ * The owner slot of a Thunderbolt DP IN. Elsewhere a port carries two
+ * streams and DP IN n and n + 2 share a slot (dcp_fabric_dpin_slot()). With
+ * fixed CRTCs every pipeline takes one DP IN of its own, so DP IN 2 and 3 get
+ * separate slots and a third or fourth dock display can claim a free pipeline.
+ */
+static struct apple_dcp_typec_route **
+dcp_tb_slot(struct apple_dcp_typec_port *port, unsigned int dpin)
+{
+	bool per_dpin = dpin < DCP_FABRIC_DPIN_MAX && dcp_typec_fixed_crtcs();
+
+	return &port->slots[dcp_fabric_tunnel_owner(dpin, per_dpin)];
+}
+
+static bool dcp_typec_port_owned(const struct apple_dcp_typec_port *port)
+{
+	for (unsigned int i = 0; i < ARRAY_SIZE(port->slots); i++)
+		if (port->slots[i])
+			return true;
+	return false;
+}
+
+static bool dcp_typec_port_owner_is(const struct apple_dcp_typec_port *port,
+				    const struct apple_dcp_typec_route *route)
+{
+	for (unsigned int i = 0; i < ARRAY_SIZE(port->slots); i++)
+		if (port->slots[i] == route)
+			return true;
+	return false;
+}
+
+/*
+ * Does a Thunderbolt DP tunnel hold any of @port's slots? Its teardown is
+ * its own path's, whichever DP IN went first.
+ */
+static bool dcp_typec_port_tunneled(const struct apple_dcp_typec_port *port)
+{
+	for (unsigned int i = 0; i < ARRAY_SIZE(port->slots); i++)
+		if (port->slots[i] && port->slots[i]->tunnel)
+			return true;
+	return false;
 }
 
 static struct apple_connector *
@@ -1042,6 +1101,7 @@ static bool dcp_typec_move_starved_locked(void)
 			continue;
 		list_for_each_entry(route, &port->routes, port_link) {
 			if (route != owner && route->dcp->fixed_phy &&
+			    !route->core.tunnel_only &&
 			    dcp_typec_route_available(route)) {
 				to = route;
 				break;
@@ -1089,6 +1149,7 @@ static bool dcp_typec_move_off_hybrid_locked(struct apple_dcp_typec_port *port,
 		return false;
 	list_for_each_entry(route, &port->routes, port_link) {
 		if (route != owner && !route->dcp->fixed_phy && route->dcp->crtc &&
+		    !route->core.tunnel_only &&
 		    dcp_typec_route_available(route)) {
 			to = route;
 			break;
@@ -1326,9 +1387,9 @@ static void dcp_fabric_snapshot_port(struct apple_dcp_typec_port *port,
 	struct dcp_fabric_route **tail = &port->core.routes;
 
 	lockdep_assert_held(&dcp_typec_fabric_lock);
-	port->core.owner[0] = port->owner ? &port->owner->core : NULL;
-	port->core.owner[1] =
-		port->secondary_owner ? &port->secondary_owner->core : NULL;
+	for (unsigned int i = 0; i < ARRAY_SIZE(port->slots); i++)
+		port->core.owner[i] =
+			port->slots[i] ? &port->slots[i]->core : NULL;
 	port->core.preferred =
 		port->preferred_route ? &port->preferred_route->core : NULL;
 	port->core.wanted = port->dp_wanted && !port->typec_yielded;
@@ -1963,7 +2024,7 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 		}
 
 		/* a Thunderbolt/USB4 DP tunnel is torn down by its own path */
-		if (port->owner && port->owner->tunnel) {
+		if (dcp_typec_port_tunneled(port)) {
 			port->applied_valid = true;
 			return 0;
 		}
@@ -1997,7 +2058,7 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	 * way): don't act on or remember this state; the tunnel teardown drops
 	 * what was recorded so the next update is applied.
 	 */
-	if (port->owner && port->owner->tunnel) {
+	if (dcp_typec_port_tunneled(port)) {
 		port->applied_valid = false;
 		return 0;
 	}
@@ -2744,6 +2805,12 @@ static int dcp_tb_candidate(void *data)
 	struct apple_dcp_typec_route *best, *planned = NULL;
 	struct mux_control *ctl;
 	unsigned int dpin = ctx->dpin;
+	/*
+	 * The stream picks the pairing order's connector and CRTC mask. Only
+	 * the dual-stream policy reads them, which fixed-CRTC machines, the
+	 * ones with per-DP IN owner slots, never run (see
+	 * dcp_typec_ordered_dual_stream()).
+	 */
 	unsigned int stream = dcp_fabric_dpin_slot(dpin);
 	bool ordered;
 	int ret;
@@ -3140,8 +3207,7 @@ static int dcp_tb_split_locked(struct apple_dcp_typec_port *port,
 static int dcp_tb_release_locked(struct apple_dcp_typec_port *port,
 				 unsigned int dpin)
 {
-	struct apple_dcp_typec_route **slot = dcp_fabric_dpin_slot(dpin) ?
-		&port->secondary_owner : &port->owner;
+	struct apple_dcp_typec_route **slot = dcp_tb_slot(port, dpin);
 	struct apple_dcp *dcp;
 	int ret;
 
@@ -3182,7 +3248,7 @@ static int dcp_tb_release_locked(struct apple_dcp_typec_port *port,
 		return ret;
 	}
 	*slot = NULL;
-	port->hpd = !!(port->owner || port->secondary_owner);
+	port->hpd = dcp_typec_port_owned(port);
 	/* re-apply the next Type-C mux state in full */
 	port->applied_valid = false;
 	if (dcp->hdmi_hpd && dcp->active &&
@@ -3202,7 +3268,7 @@ static int dcp_tb_dispatch_request(void *data, const struct dcp_fabric_port *fou
 	unsigned int dpin = ctx->dpin;
 	int ret;
 
-	slot = dcp_fabric_dpin_slot(dpin) ? &port->secondary_owner : &port->owner;
+	slot = dcp_tb_slot(port, dpin);
 
 	if (dpin == 1 && (tiled_split || port->split_dcp)) {
 		ret = dcp_tb_split_locked(port, ctx);
@@ -3239,24 +3305,19 @@ static int dcp_tb_dispatch_request(void *data, const struct dcp_fabric_port *fou
 		return dcp_tb_release_locked(port, dpin);
 
 	{
-		struct dcp_fabric_port state = {
-			.owner[0] = port->owner ? &port->owner->core : NULL,
-			.owner[1] = port->secondary_owner ?
-					    &port->secondary_owner->core :
-					    NULL,
-		};
+		struct dcp_fabric_port state = {};
 
-		if (port->owner) {
-			port->owner->core.tunnel = port->owner->tunnel;
-			port->owner->core.dpin = port->owner->tunnel_dpin;
+		for (unsigned int i = 0; i < ARRAY_SIZE(port->slots); i++) {
+			struct apple_dcp_typec_route *owner = port->slots[i];
+
+			if (!owner)
+				continue;
+			owner->core.tunnel = owner->tunnel;
+			owner->core.dpin = owner->tunnel_dpin;
+			state.owner[i] = &owner->core;
 		}
-		if (port->secondary_owner) {
-			port->secondary_owner->core.tunnel =
-				port->secondary_owner->tunnel;
-			port->secondary_owner->core.dpin =
-				port->secondary_owner->tunnel_dpin;
-		}
-		ret = dcp_fabric_tunnel_slot(&state, dpin);
+		ret = dcp_fabric_tunnel_slot(&state, dpin,
+					     dcp_typec_fixed_crtcs());
 		if (ret > 0)
 			return 0;
 		if (ret) {
@@ -3286,8 +3347,7 @@ static int dcp_tb_dispatch_request(void *data, const struct dcp_fabric_port *fou
 static void dcp_tb_finish_request(struct apple_dcp_typec_port *port,
 				  const struct dcp_tb_attach_context *request)
 {
-	struct apple_dcp_typec_route *route = dcp_fabric_dpin_slot(request->dpin) ?
-		port->secondary_owner : port->owner;
+	struct apple_dcp_typec_route *route = *dcp_tb_slot(port, request->dpin);
 	struct apple_dcp *dcp;
 	bool matching;
 
@@ -3441,7 +3501,7 @@ int apple_dcp_tb_dp_event(struct device_node *connector_np, unsigned int dpin,
 
 		if (pos->connector_np != connector_np)
 			continue;
-		route = dcp_fabric_dpin_slot(dpin) ? pos->secondary_owner : pos->owner;
+		route = *dcp_tb_slot(pos, dpin);
 		if (route && route->tunnel && route->tunnel_dpin == dpin &&
 		    route->tunnel_generation == generation) {
 			dcp = route->dcp;
@@ -4258,6 +4318,25 @@ bool dcp_typec_port_has_candidate(unsigned int idx, struct platform_device *pdev
 	return false;
 }
 
+/* Is @pdev's route to port @idx for DP tunnels only (apple,tunnel-only)? */
+bool dcp_typec_port_tunnel_only(unsigned int idx, struct platform_device *pdev)
+{
+	struct apple_dcp_typec_port *port;
+	struct apple_dcp_typec_route *route;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+
+	port = dcp_typec_port_by_index(idx);
+	if (!port)
+		return false;
+
+	list_for_each_entry(route, &port->routes, port_link)
+		if (route->dcp->dev == &pdev->dev)
+			return route->core.tunnel_only;
+
+	return false;
+}
+
 /*
  * Is every pipeline that can drive port @idx unusable (a failed T8122
  * dcpext, or a T8132 dcpext, whose DRM outputs are its own, see
@@ -4298,8 +4377,7 @@ static void dcp_typec_port_bind_connector(struct apple_dcp_typec_port *port,
 		if (WARN_ON(!route))
 			return;
 		route->connector = connector;
-		owner = route == port->owner || route == port->secondary_owner ?
-			route : NULL;
+		owner = dcp_typec_port_owner_is(port, route) ? route : NULL;
 	} else if (secondary) {
 		port->secondary_connector = connector;
 		owner = port->secondary_owner;
@@ -4355,30 +4433,23 @@ static void dcp_typec_route_unregister(void *data)
 		port->preferred_route = NULL;
 	if (port->split_dcp == route->dcp)
 		dcp_tb_split_teardown_locked(port, true);
-	if (port->owner == route) {
+	for (unsigned int i = 0; i < ARRAY_SIZE(port->slots); i++) {
 		struct apple_dcp *dcp = route->dcp;
 
+		if (port->slots[i] != route)
+			continue;
 		if (route->tunnel)
 			dcp_tb_binding_retire(dcp, route);
 		if (port->hpd || dcp->typec_cable_connected)
 			dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
-		port->hpd = false;
+		/* The primary stream's going drops the port's HPD, as before. */
+		if (!i)
+			port->hpd = false;
 		if (dcp_typec_route_deactivate(route) && dcp_is_external_h17p(dcp))
 			return;
-		port->owner = NULL;
+		port->slots[i] = NULL;
 	}
-	if (port->secondary_owner == route) {
-		struct apple_dcp *dcp = route->dcp;
-
-		if (route->tunnel)
-			dcp_tb_binding_retire(dcp, route);
-		if (port->hpd || dcp->typec_cable_connected)
-			dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
-		if (dcp_typec_route_deactivate(route) && dcp_is_external_h17p(dcp))
-			return;
-		port->secondary_owner = NULL;
-	}
-	port->hpd = !!(port->owner || port->secondary_owner);
+	port->hpd = dcp_typec_port_owned(port);
 	list_del(&route->port_link);
 	if (route->dual_stream)
 		atomic_dec(&dcp_dual_stream_routes);
@@ -4526,6 +4597,10 @@ static int dcp_register_typec_routes_present(void *data)
 		if (ret)
 			return dev_err_probe(dev, ret, "%pOF: missing crossbar state\n",
 					     route_np);
+
+		/* A route for USB4 DP tunnels only is never given a DP-alt stream. */
+		route->core.tunnel_only =
+			of_property_read_bool(route_np, "apple,tunnel-only");
 
 		ret = of_property_read_u32_index(dev->of_node, "apple,typec-dptx-phys",
 						 route_index, &route->dptx_phy);
@@ -5068,6 +5143,7 @@ static bool dcp_typec_hdmi_reclaim(struct apple_dcp *dcp)
 		return false;
 	list_for_each_entry(route, &port->routes, port_link) {
 		if (route == owner || !route->dcp->crtc ||
+		    (!owner->tunnel && route->core.tunnel_only) ||
 		    !dcp_typec_route_available(route) ||
 		    (owner->tunnel && !dcp_typec_tunnel_ctl(route, owner->tunnel_dpin)) ||
 		    (port->split_dcp == dcp && !dcp_follow_split_fits(route)))

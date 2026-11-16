@@ -8,14 +8,26 @@
 /*
  * A Thunderbolt DP tunnel enters through one of up to four DP IN adapters of
  * the port's host router, each behind a crossbar output of its own. A port
- * carries at most two streams, primary and secondary: DP IN n and n + 2 share
- * a stream slot.
+ * carries two streams, primary and secondary: DP IN n and n + 2 share a
+ * stream slot. Where every pipeline drives one DP IN of its own (T6050, fixed
+ * CRTCs), DP IN 2 and 3 have owner slots of their own as well; see
+ * dcp_fabric_tunnel_owner().
  */
 #define DCP_FABRIC_DPIN_MAX	4
 
 static inline unsigned int dcp_fabric_dpin_slot(unsigned int dpin)
 {
 	return dpin & 1;
+}
+
+/*
+ * The owner slot (dcp_fabric_port.owner[]) of DP IN @dpin: its stream slot,
+ * or the DP IN itself when @per_dpin, each pipeline taking one DP IN.
+ */
+static inline unsigned int dcp_fabric_tunnel_owner(unsigned int dpin,
+						   bool per_dpin)
+{
+	return per_dpin ? dpin : dcp_fabric_dpin_slot(dpin);
 }
 
 enum dcp_fabric_presence_state {
@@ -53,6 +65,8 @@ struct dcp_fabric_route {
 	unsigned int dpin;
 	/* DP IN adapters this source cannot clock; direct DP is unaffected. */
 	u8 tunnel_clock_blocked;
+	/* Carries DP tunnels only, never a direct DP-alt stream. */
+	bool tunnel_only;
 };
 
 struct dcp_fabric_plan {
@@ -65,7 +79,13 @@ struct dcp_fabric_port {
 	unsigned long key;
 	struct dcp_fabric_port *next;
 	struct dcp_fabric_route *routes;
-	struct dcp_fabric_route *owner[2];
+	/*
+	 * Indexed by dcp_fabric_tunnel_owner(): [0] the primary stream (direct
+	 * DP, DP IN 0, and DP IN 2 unless per-DP IN), [1] the secondary (DP
+	 * IN 1, and 3 unless per-DP IN), [2] and [3] DP IN 2 and 3 with per-DP
+	 * IN slots.
+	 */
+	struct dcp_fabric_route *owner[DCP_FABRIC_DPIN_MAX];
 	struct dcp_fabric_route *preferred;
 	u32 candidate_crtcs[2];
 	bool wanted;
@@ -196,7 +216,7 @@ void dcp_fabric_plan(struct dcp_fabric_pipeline *pipelines,
 		     const struct dcp_fabric_port *ports,
 		     const struct dcp_fabric_port *arriving, unsigned int dpin);
 int dcp_fabric_tunnel_slot(const struct dcp_fabric_port *port,
-			   unsigned int dpin);
+			   unsigned int dpin, bool per_dpin);
 struct dcp_fabric_route *
 dcp_fabric_tunnel_candidate(const struct dcp_fabric_port *port,
 			    const struct dcp_fabric_policy *policy,
