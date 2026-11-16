@@ -261,6 +261,9 @@ static int dcp_v27_rtkit_cycle(struct apple_dcp *dcp, unsigned int pause_ms)
 	u32 status, run_status = 0;
 	int ret;
 
+	/* A cancelled suspend must keep the inherited firmware session running. */
+	if (!pm_resume_via_firmware())
+		return -EPERM;
 	if (s && s->cycle_failed)
 		return -ECANCELED;
 	dcp_v27_sessions(dcp, false);
@@ -388,7 +391,7 @@ static int dcp_v27_rtkit_cycle(struct apple_dcp *dcp, unsigned int pause_ms)
 
 static bool dcp_v27_sleep_selected(struct apple_dcp *dcp)
 {
-	return apple_sleep_v27_late() &&
+	return apple_sleep_v27_late() && dcp->v27_sleep_transport &&
 		(of_device_is_compatible(dcp->dev->of_node, "apple,t6050-dcp") ||
 		 of_device_is_compatible(dcp->dev->of_node, "apple,t6050-dcpext")) &&
 		dcp->hw.adopt_live_session && dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
@@ -579,7 +582,7 @@ static unsigned long dcp_v27_ext_round(struct apple_dcp *dcp)
 	 * sessions opened. Here with its DART, PMC bits and power words as there
 	 * (dcp_v27_rtkit_cycle()), and without the pause.
 	 */
-	if (v27_ext_cycles) {
+	if (pm_resume_via_firmware() && v27_ext_cycles) {
 		int ret = dcp_v27_ext_cycle_ready(dcp);
 
 		if (!ret) {
@@ -1058,10 +1061,12 @@ static int dcp_v27_disp_dart_release(struct dcp_v27_sleep *s)
 	return ret;
 }
 
-/* Normal process-context cancellation: firmware was NEVER idled or stopped. */
+/* Reopen after cancellation, or after restarting the firmware on a real wake. */
 static int dcp_v27_reopen_live(struct apple_dcp *dcp)
 {
 	struct dcp_v27_sleep *s = dcp->sleep_v27;
+	/* Wake-only cycles must not stop firmware while undoing preparation. */
+	unsigned int cycles = pm_resume_via_firmware() ? v27_rtkit_cycles : 0;
 	unsigned int i;
 	bool per_call;
 	int ret;
@@ -1086,7 +1091,7 @@ static int dcp_v27_reopen_live(struct apple_dcp *dcp)
 			/* A500's wake form first; its failure does not stop the power-on. */
 			iomfb_v27_sleep_rpc(dcp, true, true);
 			/* The wake's one restart: the rest of the wake runs in the session it starts. */
-			if (s->soft_off && v27_rtkit_cycles >= 1)
+			if (s->soft_off && cycles >= 1)
 				dcp_v27_rtkit_cycle(dcp, 0);
 			if (s->soft_off && v27_a115)
 				iomfb_v27_sleep_call(dcp, "A489", NULL, 0, 4);
@@ -1101,7 +1106,7 @@ static int dcp_v27_reopen_live(struct apple_dcp *dcp)
 						dev_warn(dcp->dev, "V27 wake: A115(1): %d\n", ret);
 				}
 				/* The dark-wake forms only: a restart, or a pause, before the display stage. */
-				if (v27_rtkit_cycles >= 2) {
+				if (cycles >= 2) {
 					iomfb_v27_sleep_rpc(dcp, true, true);
 					dcp_v27_rtkit_cycle(dcp, v27_lit_delay_ms);
 				} else if (v27_lit_delay_ms) {
@@ -1115,7 +1120,7 @@ static int dcp_v27_reopen_live(struct apple_dcp *dcp)
 				 * Back to back with the hard power-on; only the dark-to-lit form idles
 				 * the DCP, with A500 first, between the calls.
 				 */
-				per_call = v27_rtkit_cycles >= 3;
+				per_call = cycles >= 3;
 				if (!per_call)
 					dcp_v27_sessions(dcp, true);
 				dcp_v27_display_stage(dcp, per_call, per_call && v27_session_rounds, per_call);
