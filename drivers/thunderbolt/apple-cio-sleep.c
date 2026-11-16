@@ -895,8 +895,8 @@ static int apple_nhi_cio_power_off_t6050(struct apple_nhi *anhi)
 		apple_cio_cpu_halt(acio);
 		if (ret)
 			return ret;
-		/* macOS leaves LSTX low for the sleep; the rc block is not read with the CPU halted. */
-		ret = apple_cio_lstx_hold(acio, false);
+		/* J714s holds LSTX high through sleep; do not read the halted rc block. */
+		ret = apple_cio_lstx_hold(acio, of_machine_is_compatible("apple,j714s"));
 		if (ret)
 			return ret;
 	}
