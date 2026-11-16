@@ -6679,6 +6679,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 			if (own) {
 				dcp->v27_methods = own;
 				dcp->v27_a407 = true;
+				dcp->v27_sleep_known = true;
 			}
 		}
 	}
@@ -7514,15 +7515,17 @@ static const char *dcp_external_sleep_vetoed(struct apple_dcp *dcp)
  */
 static bool dcp_v27_sleep_selected(struct apple_dcp *dcp);
 static void dcp_v27_sleep_invalidate(struct apple_dcp *dcp);
+static int dcp_v27_sleep_known(struct apple_dcp *dcp);
 
 static int dcp_platform_prepare(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 	const char *why;
 
+	/* A deep sleep whose display step is not known for this firmware is refused here. */
 	if (pm_suspend_via_firmware() && dcp_v27_sleep_selected(dcp)) {
 		dcp_v27_sleep_invalidate(dcp);
-		return 0;
+		return dcp_v27_sleep_known(dcp);
 	}
 
 	/*
