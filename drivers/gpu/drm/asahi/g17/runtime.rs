@@ -1669,28 +1669,48 @@ impl super::Firmware {
         }
         let sources = packet.completion.sources().ok_or(EINVAL)?.clone();
         sources.check()?;
+        // M5 shared-ring queues have no completion-wait records: the consumer's kick entry names
+        // the source's kick, and the firmware orders it. So is a G17P source of the consumer's
+        // own execution context: one context needs no write-back between the two kicks.
+        let m5 = self.init.is_m5();
+        let epoch = self.recovery.generation();
         let mut merged = super::dependency::Frontier::new();
         for dependency in dependencies { merged.insert(0, *dependency)?; }
         let mut holds = KVec::with_capacity(sources.sources.len(), GFP_KERNEL)?;
         let mut native: KVec<super::sync_input::NativeWait> =
             KVec::with_capacity(sources.sources.len(), GFP_KERNEL)?;
-        // M5 shared-ring queues have no completion-wait records: the consumer's kick entry names
-        // the source's kick, and the firmware orders it. So is a G17P source of the consumer's
-        // own execution context: one context needs no write-back between the two kicks.
-        let m5 = self.init.is_m5();
+        let mut local = 0;
         let mut waited: u128 = 0;
         for source in &sources.sources {
             if source.submission.source_status()? { continue; }
-            let found = self.queues.compute.iter_mut().flatten()
-                .filter_map(|entry| entry.queue.as_deref_mut())
-                .find_map(|mut queue| match queue.source_dependency(source, packet.completion.status(),
-                    self.recovery.generation(), &packet.context) {
-                    Ok(None) => None,
-                    result => Some(result),
-                }).ok_or(EAGAIN)??;
-            let Some((sequence, dependency, stamp_va, event_slot, hold, same_execution)) = found else {
-                return Err(EAGAIN);
+            // A local source (published by the consumer's own logical queue) is published ahead of
+            // the consumer on the queue that logical queue is bound to: look for it there before
+            // walking every compute queue. It takes the same checks, kick-entry dependency, binding
+            // loan and firmware-consumer mark as a source found by the walk; a local source that is
+            // not live on that queue takes the walk.
+            let own = if m5 && source.local {
+                match self.queues.compute_mut(owner) {
+                    Some(mut queue) => queue.source_dependency(source, packet.completion.status(),
+                        epoch, &packet.context)?,
+                    None => None,
+                }
+            } else {
+                None
             };
+            let found = match own {
+                Some(found) => {
+                    local += 1;
+                    found
+                }
+                None => self.queues.compute.iter_mut().flatten()
+                    .filter_map(|entry| entry.queue.as_deref_mut())
+                    .find_map(|mut queue| match queue.source_dependency(source,
+                        packet.completion.status(), epoch, &packet.context) {
+                        Ok(None) => None,
+                        result => Some(result),
+                    }).ok_or(EAGAIN)??.ok_or(EAGAIN)?,
+            };
+            let (sequence, dependency, stamp_va, event_slot, hold, same_execution) = found;
             waited |= 1u128 << dependency.qid();
             if m5 || same_execution {
                 merged.insert(sequence, dependency)?;
@@ -1721,6 +1741,7 @@ impl super::Firmware {
             sources.set_holds(holds);
             super::sync_input::note_published();
             super::sync_input::note_native(native.len());
+            super::sync_input::note_local(local);
         }
         result
     }

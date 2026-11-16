@@ -56,9 +56,9 @@ impl kernel::debugfs::Writer for View {
             let Some(firmware) = state.as_deref() else { return writeln!(f, "online=0"); };
             writeln!(f, "online=1")?;
             let (converted, published) = super::sync_input::counters();
-            writeln!(f, "fw_inputs converted={} published={} native={} pending={}",
+            writeln!(f, "fw_inputs converted={} published={} native={} pending={} local={}",
                 converted, published, super::sync_input::native_count(),
-                super::sync_input::pending_count())?;
+                super::sync_input::pending_count(), super::sync_input::local_count())?;
             writeln!(f, "compute_admission_demand={}", self.0.compute_demand.load(Ordering::Acquire))?;
             firmware.queues.write_capacity(f)?;
             firmware.pool.write_capacity(f)?;
