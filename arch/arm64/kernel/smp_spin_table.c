@@ -272,11 +272,17 @@ int spin_table_stop_parked(void)
 	return -ETIMEDOUT;
 }
 
-static bool spin_table_pen_deep_armed;
+static bool spin_table_pen_deep_armed, spin_table_pen_el1_on;
 
 void spin_table_pen_deep_arm(bool on)
 {
 	spin_table_pen_deep_armed = on;
+}
+
+/* The pen's last WFI at EL1 (2) instead of the kernel's EL (1), for the next release */
+void spin_table_pen_deep_el1(bool on)
+{
+	spin_table_pen_el1_on = on;
 }
 
 static void spin_table_pen_deep_set(unsigned long on)
@@ -292,7 +298,7 @@ void spin_table_release_stopped(void)
 {
 	WRITE_ONCE(spin_table_stop_released, true);
 	if (spin_table_pen_deep_armed)
-		spin_table_pen_deep_set(1);
+		spin_table_pen_deep_set(spin_table_pen_el1_on ? 2 : 1);
 	dsb(ish);
 	sev();
 }
@@ -323,12 +329,14 @@ static int smp_rvbar_spin_table_cpu_boot(unsigned int cpu)
 	/* The CPU may run straight into the pen: release it before it starts. */
 	write_pen_release(mpidr);
 
-	if (cpumask_test_and_clear_cpu(cpu, &spin_table_cpus_off)) {
+	if (cpumask_test_cpu(cpu, &spin_table_cpus_off)) {
+		/*
+		 * Still off until it runs smp_rvbar_spin_table_postboot(): a start that times out
+		 * leaves it here, so another online attempt pulses it again.
+		 */
 		ret = spin_table_power->cpu_on(mpidr);
-		if (ret) {
-			cpumask_set_cpu(cpu, &spin_table_cpus_off);
+		if (ret)
 			return ret;
-		}
 	} else if (cpumask_test_cpu(cpu, &spin_table_cpus_parked)) {
 		cpumask_set_cpu(cpu, &spin_table_cpus_unpark);
 	}
@@ -444,6 +452,7 @@ static int smp_rvbar_spin_table_cpu_kill(unsigned int cpu)
 
 static void smp_rvbar_spin_table_postboot(void)
 {
+	cpumask_clear_cpu(smp_processor_id(), &spin_table_cpus_off);
 	if (READ_ONCE(spin_table_power) && spin_table_power->cpu_restore)
 		spin_table_power->cpu_restore(read_cpuid_mpidr() & MPIDR_HWID_BITMASK);
 }
