@@ -109,6 +109,12 @@ bool apple_sleep_coproc_stopped(struct device *dev);
 bool apple_sleep_commit_stops_coprocs(void);
 
 /*
+ * Untested SoCs: a coprocessor's last stop notes its own step in PMU scratch (kept across a
+ * WD2 reset), next to the sleep driver's step and the coprocessor's slot.
+ */
+void apple_sleep_note_sub(u8 step);
+
+/*
  * The USB host sleeps in place for this sleep, as macOS's does: its always-on domain stays
  * up through the commit. Its PHY sets it once the controller is in its hibernation state,
  * and clears it at the wake.
@@ -299,6 +305,8 @@ static inline bool apple_sleep_coproc_stopped(struct device *dev)
 {
 	return false;
 }
+
+static inline void apple_sleep_note_sub(u8 step) {}
 
 static inline bool apple_sleep_commit_stops_coprocs(void)
 {
