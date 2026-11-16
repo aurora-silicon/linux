@@ -246,8 +246,8 @@ int dcp_peer_hints_v27(struct apple_dcp *dcp, struct dptx_port *port,
 	 * display is routed to, and the firmware keeps the merged timings for
 	 * when a pair fits again (dcp_peer_limit_update_v27()). Until then DRM
 	 * offers only the modes one engine drives; a mode set of one of them
-	 * stops a pair that ran and sets the mode on this engine alone
-	 * (dcp_peer_install_video_v27()).
+	 * runs no paired call: it stops a pair that ran, leaving the peer off,
+	 * and sets the mode on this engine alone (dcp_peer_modeset_v27()).
 	 */
 	{
 		unsigned int displays, engines;

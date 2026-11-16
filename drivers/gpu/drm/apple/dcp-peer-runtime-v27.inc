@@ -74,9 +74,45 @@ static void dcp_peer_finish_v27(struct apple_dcp *dcp, struct apple_dcp *peer)
 			 le32_to_cpu(tile[0]), le32_to_cpu(tile[1]));
 }
 
+/*
+ * While the platform limit leaves the display no pair, it is set one of the
+ * modes one engine drives (dcp_peer_check_v27()), and no paired call runs for
+ * it. A pair it ran is stopped first: both engines powered off, the peer left
+ * off and this engine powered on again. -EOPNOTSUPP then has the caller set
+ * the mode on this engine alone.
+ */
+static bool dcp_peer_limited_pair_locked(struct apple_dcp *dcp, bool *prepared)
+{
+	struct apple_dcp *peer = dcp->peer_reserved;
+
+	lockdep_assert_held(&dcp_peer_lock);
+	*prepared = false;
+	if (!peer || !dcp_peer_limited_locked(dcp, NULL, NULL))
+		return false;
+	*prepared = dcp->peer_tiling.vftg || peer->peer_tiling.vftg;
+	return true;
+}
+
+static int dcp_peer_limited_stop_v27(struct apple_dcp *dcp, struct apple_dcp *peer)
+{
+	u8 power[16] = {1}, response[8];
+	int ret;
+
+	ret = dcp_peer_probe_quiesce(dcp, peer);
+	if (ret)
+		return ret;
+	ret = dcp_peer_video_call(dcp, "A484", power, sizeof(power),
+				  response, sizeof(response));
+	if (ret || get_unaligned_le32(response + 4))
+		return ret ?: -EIO;
+	dev_info(dcp->dev, "platform limit: pair stopped, its peer left off\n");
+	return -EOPNOTSUPP;
+}
+
 int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, u32 min_vrr)
 {
 	struct apple_dcp *peer;
+	bool limited, prepared;
 	int ret = -EOPNOTSUPP;
 
 	if (!peer_scanout || !peer_allocation_probe ||
@@ -84,12 +120,22 @@ int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, u32 min_v
 		return ret;
 	if (timing > U32_MAX - 10000 || color > U32_MAX - 10000)
 		return -EINVAL;
+	/* No paired call, nor wait for one, for a display the limit leaves no pair. */
+	scoped_guard(mutex, &dcp_peer_lock) {
+		limited = dcp_peer_limited_pair_locked(dcp, &prepared);
+		if (limited && !prepared)
+			return ret;
+	}
 	if (!device_trylock(dcp->dev))
 		return -EBUSY;
 	{
 		guard(mutex)(&dcp_peer_lock);
 		peer = dcp->peer_reserved;
 		if (!peer)
+			goto unlock;
+		/* The limit may have come or gone since the check above. */
+		limited = dcp_peer_limited_pair_locked(dcp, &prepared);
+		if (limited && !prepared)
 			goto unlock;
 		if (peer->peer_owner != dcp || !dcp_peer_transport_idle(dcp) ||
 		    !dcp_peer_transport_idle(peer) || peer->fixed_phy ||
@@ -99,6 +145,10 @@ int dcp_peer_modeset_v27(struct apple_dcp *dcp, u32 timing, u32 color, u32 min_v
 			ret = -EBUSY;
 			goto unlock;
 		}
+	}
+	if (limited) {
+		ret = dcp_peer_limited_stop_v27(dcp, peer);
+		goto peer_unlock;
 	}
 	ret = dcp_peer_prepare_v27(dcp, peer, min_vrr);
 	if (ret)
