@@ -989,6 +989,55 @@ static void cs42l84_set_interrupt_masks(struct cs42l84_private *cs42l84,
 			val);
 }
 
+/*
+ * The tip went to unplugged. Called with irq_lock held, tip_state already
+ * set to CS42L84_UNPLUG.
+ */
+static void cs42l84_handle_unplug(struct cs42l84_private *cs42l84)
+{
+	cs42l84->ring_state = CS42L84_UNPLUG;
+
+	cs42l84_revert_hs(cs42l84);
+	cs42l84->hs_type = 0;
+	snd_soc_jack_report(cs42l84->jack, 0, SND_JACK_HEADSET);
+
+	/* Mask ring sense interrupts */
+	cs42l84_set_interrupt_masks(cs42l84,
+				    CS42L84_RS_PLUG | CS42L84_RS_UNPLUG);
+}
+
+/*
+ * The tip went to plugged: detect the headset. Called with irq_lock held,
+ * tip_state already set to CS42L84_PLUG.
+ */
+static void cs42l84_handle_plug(struct cs42l84_private *cs42l84)
+{
+	unsigned int reg;
+	u8 current_tip_state;
+
+	cs42l84_detect_hs(cs42l84);
+
+	/*
+	 * Check the tip sense status again, and possibly invalidate
+	 * the detection result
+	 *
+	 * Thanks to debounce, this should reliably indicate if the tip
+	 * was disconnected at any point during the detection procedure.
+	 */
+	regmap_read(cs42l84->regmap, CS42L84_TSRS_PLUG_STATUS, &reg);
+	current_tip_state = (((char) reg) &
+	      (CS42L84_TS_PLUG | CS42L84_TS_UNPLUG)) >>
+	      CS42L84_TS_PLUG_SHIFT;
+	if (current_tip_state != CS42L84_PLUG) {
+		dev_dbg(cs42l84->dev, "Wobbly connection, detection invalidated\n");
+		cs42l84->tip_state = CS42L84_UNPLUG;
+		cs42l84_revert_hs(cs42l84);
+	}
+
+	/* Unmask ring sense interrupts */
+	cs42l84_set_interrupt_masks(cs42l84, 0);
+}
+
 static irqreturn_t cs42l84_irq_thread(int irq, void *data)
 {
 	struct cs42l84_private *cs42l84 = (struct cs42l84_private *)data;
@@ -1029,41 +1078,11 @@ static irqreturn_t cs42l84_irq_thread(int irq, void *data)
 			switch (current_tip_state) {
 			case CS42L84_PLUG:
 				dev_dbg(cs42l84->dev, "Plug event\n");
-
-				cs42l84_detect_hs(cs42l84);
-
-				/*
-				 * Check the tip sense status again, and possibly invalidate
-				 * the detection result
-				 *
-				 * Thanks to debounce, this should reliably indicate if the tip
-				 * was disconnected at any point during the detection procedure.
-				 */
-				regmap_read(cs42l84->regmap, CS42L84_TSRS_PLUG_STATUS, &reg);
-				current_tip_state = (((char) reg) &
-				      (CS42L84_TS_PLUG | CS42L84_TS_UNPLUG)) >>
-				      CS42L84_TS_PLUG_SHIFT;
-				if (current_tip_state != CS42L84_PLUG) {
-					dev_dbg(cs42l84->dev, "Wobbly connection, detection invalidated\n");
-					cs42l84->tip_state = CS42L84_UNPLUG;
-					cs42l84_revert_hs(cs42l84);
-				}
-
-				/* Unmask ring sense interrupts */
-				cs42l84_set_interrupt_masks(cs42l84, 0);
+				cs42l84_handle_plug(cs42l84);
 				break;
 			case CS42L84_UNPLUG:
-				cs42l84->ring_state = CS42L84_UNPLUG;
 				dev_dbg(cs42l84->dev, "Unplug event\n");
-
-				cs42l84_revert_hs(cs42l84);
-				cs42l84->hs_type = 0;
-				snd_soc_jack_report(cs42l84->jack, 0,
-						    SND_JACK_HEADSET);
-
-				/* Mask ring sense interrupts */
-				cs42l84_set_interrupt_masks(cs42l84,
-							    CS42L84_RS_PLUG | CS42L84_RS_UNPLUG);
+				cs42l84_handle_unplug(cs42l84);
 				break;
 			default:
 				cs42l84->ring_state = CS42L84_TRANS;
