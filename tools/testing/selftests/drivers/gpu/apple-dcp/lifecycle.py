@@ -739,6 +739,16 @@ int main(void)
                      '  assert(!"T8132 dcpext teardown in an H17P scenario"); return -ENODEV; }\n')
     if 'static unsigned long jiffies;' not in unit:
         firmware += '\nstatic unsigned long jiffies;\n'
+    if 'dcp_dptx_wait_linkcfg(' in raw:
+        # The link wait with T6050's tunnel watch. This H17P machine does not watch, so the
+        # production wait waits for the link configuration once, as before.
+        firmware += ('#define DCP_LINKCFG_POLL_MS 50\n'
+                     '#ifndef min_t\n#define min_t(t, a, b) ((t)(a) < (t)(b) ? (t)(a) : (t)(b))\n#endif\n'
+                     '#ifndef max_t\n#define max_t(t, a, b) ((t)(a) > (t)(b) ? (t)(a) : (t)(b))\n#endif\n'
+                     'static bool dcp_tb_tunnel_withdrawn(struct apple_dcp *d, u32 port)\n'
+                     '{ (void)d; (void)port; assert(!"T6050 tunnel watch in an H17P scenario"); return false; }\n' +
+                     apple_function(root, 'dcp_watches_tunnel_withdrawal') +
+                     apple_function(root, 'dcp_dptx_wait_linkcfg'))
     # unless the update work already needed the clock
     clock = 'static unsigned jiffies_to_msecs(unsigned long t) { return t; }\n'
     if clock in unit:
