@@ -271,6 +271,30 @@ unlock:
 	return ret;
 }
 
+/*
+ * The display of a running pair goes: its cable or tunnel, or its release
+ * at a sleep's entry. The primary's firmware keeps a merged pipe lit across
+ * the HPD low and answers that call only once the AP has powered the pair
+ * down; with user space frozen nothing else does that within the call's
+ * second, and the HPD low times out (-110), the route stays owned and the
+ * sleep is refused. Stop the pair first, as macOS tears its dual pipe down
+ * (power 0 on both engines, A362(0) on the main, then the peer) before the
+ * DPTX release it sends to the main DCP only. A swap in flight, or a power-off
+ * of the CRTC holding the device lock, is let go in a few ms.
+ * Returns 1 after a stop, 0 if no pair runs, or an error.
+ */
+static int dcp_peer_unplug_v27(struct apple_dcp *dcp)
+{
+	unsigned int tries = 20;
+	int ret;
+
+	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0)
+		return 0;
+	while ((ret = dcp_peer_stop_v27(dcp)) == -EBUSY && --tries)
+		usleep_range(5000, 6000);
+	return ret;
+}
+
 struct apple_dcp *dcp_peer_scanout_v27(struct apple_dcp *dcp)
 {
 	struct apple_dcp *peer;
