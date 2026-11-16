@@ -124,6 +124,12 @@ impl Rings {
         self.suspended
     }
 
+    /// The last power observation found the cores powered in `epoch` (measurement switch 0x10:
+    /// another that finds them powered in it changes nothing).
+    pub(super) fn statistics_settled(&self, epoch: u64) -> bool {
+        self.statistics_powered && self.statistics_epoch == epoch
+    }
+
     pub(super) fn observe_statistics_power(
         &mut self,
         dev: &Device,

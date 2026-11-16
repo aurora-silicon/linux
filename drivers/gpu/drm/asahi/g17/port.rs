@@ -118,8 +118,16 @@ pub(super) struct Port {
     demand: super::power::Demand,
     statistics_epoch: AtomicU64,
     last_submission_ns: AtomicU64,
+    /// Measurement switches 0x8 and 0x10: when a core-power read last found the cores powered.
+    power_seen_ns: AtomicU64,
     submissions: AtomicU64,
 }
+
+/// Measurement switches 0x8 and 0x10: how recent a submission and a powered core-power read
+/// must both be for the cores to count as powered without a read ([`Port::power_recent`]).
+/// The firmware powers the cores off only once they have been idle for its idle-off delay,
+/// 2 ms where measured (`power::FIRMWARE_IDLE_OFF_MS`).
+const POWER_RECENT_NS: u64 = 500_000;
 
 /// Room in both render work rings of one priority, observed under the render publication
 /// lock. While that lock is held no other host producer moves, and the firmware consumers only
@@ -176,6 +184,7 @@ impl Port {
                 demand,
                 statistics_epoch: AtomicU64::new(0),
                 last_submission_ns: AtomicU64::new(0),
+                power_seen_ns: AtomicU64::new(0),
                 submissions: AtomicU64::new(0),
             }),
             GFP_KERNEL,
@@ -528,7 +537,7 @@ impl Port {
     /// clear sees this submission or this submission sees the flag withdrawn.
     pub(super) fn note_submission(&self) -> bool {
         self.submissions.fetch_add(1, Ordering::SeqCst);
-        self.note_gpu_activity();
+        self.note_gpu_activity(false);
         self.effort_full.load(Ordering::SeqCst)
     }
 
@@ -550,20 +559,40 @@ impl Port {
         self.statistics_epoch.load(Ordering::Acquire)
     }
 
-    pub(super) fn note_gpu_activity(&self) {
-        // Observe gating before activity can wake the cores. A lockless
-        // publisher cannot clear the decoder under the device mutex; this
-        // epoch makes both the next drain and the next reader discard it.
-        if self
-            .regs
-            .as_ref()
-            .is_some_and(|regs| regs.g17_core_power() & 0xf == 0)
-        {
-            self.statistics_epoch.fetch_add(1, Ordering::Release);
+    /// `may_skip` (measurement switch 0x8, M5): leave the gating read out while the cores are
+    /// known powered ([`Self::power_recent`]); there is no gating to observe then.
+    pub(super) fn note_gpu_activity(&self, may_skip: bool) {
+        let now = may_skip.then(super::now_ns);
+        if !now.is_some_and(|now| self.power_recent(now)) {
+            // Observe gating before activity can wake the cores. A lockless
+            // publisher cannot clear the decoder under the device mutex; this
+            // epoch makes both the next drain and the next reader discard it.
+            let power = self.regs.as_ref().map(|regs| regs.g17_core_power());
+            if power.is_some_and(|power| power & 0xf == 0) {
+                self.statistics_epoch.fetch_add(1, Ordering::Release);
+            } else if let (Some(now), Some(_)) = (now, power) {
+                self.note_powered(now);
+            }
         }
         self.last_submission_ns
-            .store(super::now_ns(), Ordering::Relaxed);
+            .store(now.unwrap_or_else(super::now_ns), Ordering::Relaxed);
         self.demand.set_active(true);
+    }
+
+    /// Measurement switches 0x8 and 0x10: a submission was noted and a core-power read found
+    /// the cores powered, both within [`POWER_RECENT_NS`] of `now`. The cores are powered at
+    /// `now` then: the firmware powers them off only after an idle-off delay longer than that
+    /// from the end of the work the submission brought, and the read bounds how stale this
+    /// inference can be should anything else gate them.
+    pub(super) fn power_recent(&self, now: u64) -> bool {
+        now.saturating_sub(self.last_submission_ns.load(Ordering::Relaxed)) < POWER_RECENT_NS
+            && now.saturating_sub(self.power_seen_ns.load(Ordering::Relaxed)) < POWER_RECENT_NS
+    }
+
+    /// Measurement switches 0x8 and 0x10: a core-power read made at `now` or later found the
+    /// cores powered.
+    pub(super) fn note_powered(&self, now: u64) {
+        self.power_seen_ns.store(now, Ordering::Relaxed);
     }
 
     pub(super) fn write_power(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
