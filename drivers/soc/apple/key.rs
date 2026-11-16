@@ -1349,26 +1349,13 @@ mod tests {
 
 impl SepData {
     pub(crate) fn register_key(&self) -> Result<()> {
-        let ctx = core::ptr::from_ref(self).cast_mut().cast::<c_void>();
-        self.publish_chardev(&self.key_dev, || {
-            // SAFETY: as in `register_bio`: `remove()` drops the registration
-            // before the `Arc` that keeps `ctx` alive, and the shim's unregister
-            // waits for running ioctls and clears the stored context before
-            // any later callback. Ioctls run concurrently: a touch-gated SIGN or
-            // UNSEAL sleeps up to a minute, and CANCEL must reach it meanwhile.
-            // They serialise on `catacomb_writer`; CANCEL only sets a flag.
-            unsafe {
-                crate::shim::BioChardev::register_concurrent(
-                    DEVICE_NAME,
-                    DEVICE_MODE,
-                    ctx,
-                    key_open_trampoline,
-                    key_release_trampoline,
-                    key_ioctl_trampoline,
-                    key_ready_trampoline,
-                )
-            }
-        })?;
+        let mut device = self.key_dev.lock();
+        if self.shutting_down.load(Relaxed) { return Err(ENODEV); }
+        if device.is_none() {
+            // SAFETY: remove drops the registration before the driver Arc.
+            // Every successful open acquires its own reference.
+            *device = Some(unsafe { crate::key_device::Registration::new(self)? });
+        }
         Ok(())
     }
 
@@ -2270,7 +2257,7 @@ impl SepData {
         Ok(())
     }
 
-    fn key_ioctl(&self, cmd: u32, arg: usize) -> Result<()> {
+    pub(crate) fn key_ioctl(&self, cmd: u32, arg: usize) -> Result<()> {
         if self.shutting_down.load(Relaxed) {
             return Err(ENODEV);
         }
@@ -2401,41 +2388,6 @@ impl SepData {
             }
         }
     }
-}
-
-// /dev/sep-key has no session: any number of openers, no poll.
-
-/// # Safety
-/// `ctx` is the `SepData` pointer given to `register_key`, valid while the
-/// registration lives (see `register_key`).
-unsafe extern "C" fn key_open_trampoline(ctx: *mut c_void) -> c_int {
-    // SAFETY: per the contract above.
-    let this = unsafe { &*ctx.cast::<SepData>() };
-    if this.shutting_down.load(Relaxed) {
-        return ENODEV.to_errno();
-    }
-    0
-}
-
-/// # Safety
-/// As for `key_open_trampoline`.
-unsafe extern "C" fn key_release_trampoline(_ctx: *mut c_void) {}
-
-/// # Safety
-/// As for `key_open_trampoline`.
-unsafe extern "C" fn key_ioctl_trampoline(ctx: *mut c_void, cmd: c_uint, arg: c_ulong) -> c_long {
-    // SAFETY: per the contract above.
-    let this = unsafe { &*ctx.cast::<SepData>() };
-    match this.key_ioctl(cmd, arg) {
-        Ok(()) => 0,
-        Err(e) => e.to_errno() as c_long,
-    }
-}
-
-/// # Safety
-/// As for `key_open_trampoline`.
-unsafe extern "C" fn key_ready_trampoline(_ctx: *mut c_void) -> c_int {
-    0
 }
 
 /// KUnit hook for `sep_ioctl_test.c`: [`read_request`] on user memory the

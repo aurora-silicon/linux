@@ -24,6 +24,7 @@ mod hibe;
 mod hwrng;
 mod image;
 mod key;
+mod key_device;
 mod keybag;
 mod keybag_identity;
 mod os_identity;
@@ -907,7 +908,9 @@ struct SepData {
 
     // /dev/sep-key: P-256 keys created inside the SEP (see `key`).
     #[pin]
-    key_dev: Mutex<Option<shim::BioChardev>>,
+    key_dev: Mutex<Option<key_device::Registration>>,
+    /// `/dev/sep-key` calls in progress (`key_device::Call`).
+    key_calls: Atomic<u32>,
     #[pin]
     capture: Mutex<capture::State>,
 
@@ -1315,6 +1318,7 @@ impl SepData {
                 bio_dev <- new_mutex!(None),
                 rearm_dev <- new_mutex!(None),
                 key_dev <- new_mutex!(None),
+                key_calls: Atomic::new(0),
                 capture <- new_mutex!(capture::State::new()),
                 key_bag_lock <- new_mutex!(()),
                 key_touch <- new_mutex!(None),
@@ -3299,6 +3303,9 @@ impl SepData {
         drop(dev);
         let dev = self.key_dev.lock().take();
         drop(dev);
+        // Files outlive the registration; their calls end before the
+        // hardware goes.
+        key_device::wait_for_calls(self);
 
         self.rng_shutdown.store(true, Relaxed);
         self.control_wq.notify_all();
