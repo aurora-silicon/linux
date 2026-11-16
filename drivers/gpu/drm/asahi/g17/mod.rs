@@ -932,7 +932,8 @@ impl Firmware {
             let pair = self.init.m5_work_pair(priority, &records[0], &records[1], cursors.take())?;
             pair.prepare();
             if let Some(commit) = commit_accounting.take() { commit()?; }
-            match self.bridge.regs.submit_m5_work(submission) {
+            let relaxed = sync_input::render_submit(sync_input::SUBMIT_HOSTPORT);
+            match self.bridge.regs.submit_m5_work_ordered(submission, relaxed) {
                 Err(error) if error == EAGAIN && attempt == 0 => {
                     drop(pair);
                     self.acquire_registration_power()?;

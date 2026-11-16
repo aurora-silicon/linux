@@ -663,13 +663,34 @@ impl G17Resources {
         &self,
         submission: &crate::g17::fw::m5::queue::HardwareSubmission,
     ) -> Result {
+        self.submit_m5_work_ordered(submission, false)
+    }
+
+    /// [`Self::submit_m5_work`]. With `relaxed_inner` (measurement switch), only the first and
+    /// the last write carry the write barrier of an ordered MMIO write; the ones between are
+    /// relaxed. The register block is mapped non-posted, so each barrier waits for the write
+    /// before it to complete at the GPU. The ordering is the same: all the writes go to this one
+    /// register block, whose device mapping keeps them in program order among themselves; the
+    /// first barrier orders every earlier memory write before all of them, as no memory write
+    /// comes between them; and the last barrier orders every write before it ahead of whatever
+    /// follows, as each barrier did for the writes before it.
+    pub(crate) fn submit_m5_work_ordered(
+        &self,
+        submission: &crate::g17::fw::m5::queue::HardwareSubmission,
+        relaxed_inner: bool,
+    ) -> Result {
         if crate::g17::J813_FORMS.load(core::sync::atomic::Ordering::Relaxed) {
             return Ok(());
         }
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
         let sgx = (&*sgx).as_view();
-        for &(offset, value) in submission.writes() {
-            sgx.try_write64(value, offset)?;
+        let writes = submission.writes();
+        for (index, &(offset, value)) in writes.iter().enumerate() {
+            if relaxed_inner && index != 0 && index + 1 != writes.len() {
+                sgx.relaxed().try_write64(value, offset)?;
+            } else {
+                sgx.try_write64(value, offset)?;
+            }
         }
         Ok(())
     }
