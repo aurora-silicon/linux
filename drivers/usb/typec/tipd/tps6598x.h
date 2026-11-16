@@ -510,8 +510,6 @@ struct sn201202x {
 	bool ldcm_mitigated;
 	/* ldcm_mitigated matches the controller (unknown after a reset) */
 	bool ldcm_mitigation_known;
-	/* J714s, no connector (its MagSafe controller): only its system sleep state is driven */
-	bool sleep_only;
 };
 
 extern const struct tipd_data *tipd_hw_variants[];
