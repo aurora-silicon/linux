@@ -506,6 +506,12 @@ impl Pages {
 pub(crate) const RENDER_POOL_SPAN: u64 =
     (TABLE_SIZE + RENDER_BLOCKS * FREE_LIST_BLOCK_SIZE + mmu::UAT_PGSZ) as u64;
 
+// The A18 Pro's shared pool window holds the smallest render pool for every execution context.
+const _: () = assert!(
+    crate::hw::t8140::dynamic::WIDE_LOWER.end - crate::hw::t8140::dynamic::WIDE_LOWER.start
+        >= crate::mmu::MAX_EXECUTION_CONTEXTS as u64 * RENDER_POOL_SPAN
+);
+
 /// Pool-object identities are independent of recycled firmware IDs and VAs.
 static RENDER_POOL_SERIAL: AtomicU64 = AtomicU64::new(0);
 

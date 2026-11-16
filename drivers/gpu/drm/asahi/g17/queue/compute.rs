@@ -278,7 +278,7 @@ impl Graph {
         let descriptors = self.descriptor_alias(vm)?;
         let prot = if self.m5 { mmu::PROT_GPU_SHARED_RW } else { mmu::PROT_GPU_FW_SHARED_RW };
         let page = mmu::UAT_PGSZ as u64;
-        let private = mmu::client_private_range(self.m5);
+        let private = vm.client_private_range();
         let preempt = self
             .preempt
             .alias_in(vm, private.clone(), page, prot)?;

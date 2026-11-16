@@ -2862,7 +2862,7 @@ impl Backend {
         };
         // Off the device mutex: this takes the address space's lock.
         uat.kernel_lower_vm()
-            .capacity(crate::hw::t8140::dynamic::LOWER)
+            .capacity(uat.kernel_lower_dynamic_range())
             .is_ok_and(|(_, largest)| largest < super::freelist::RENDER_POOL_SPAN)
     }
 

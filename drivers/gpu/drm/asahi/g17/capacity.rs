@@ -78,7 +78,7 @@ impl kernel::debugfs::Writer for View {
         writeln!(f, "timestamp_window firmware={} host_fallbacks={}", kept, fallbacks)?;
         let upper = uat.kernel_dynamic_range();
         for (name, vm, range) in [
-            ("dynamic_lower_bytes", uat.kernel_lower_vm(), crate::hw::t8140::dynamic::LOWER),
+            ("dynamic_lower_bytes", uat.kernel_lower_vm(), uat.kernel_lower_dynamic_range()),
             ("dynamic_upper_bytes", uat.kernel_vm(), upper),
         ] {
             match vm.capacity(range.clone()) {
@@ -87,6 +87,9 @@ impl kernel::debugfs::Writer for View {
             }
         }
         crate::queue_share::write_capacity(f, super::kick::queue_limit(self.0.variant.qid_floor))?;
+        let private = uat.client_private_range();
+        writeln!(f, "client_private_bytes high_water={} total={}",
+                 crate::mmu::client_private_high_water(), private.end - private.start)?;
         for (site, count) in [
             Site::ComputeReserve, Site::PhysicalQids, Site::RenderSlots, Site::LogicalQueues,
             Site::ComputeSlots, Site::QosIds, Site::ComputeItems, Site::RetiredRenderBindings,
