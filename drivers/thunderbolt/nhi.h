@@ -236,6 +236,12 @@ struct tb_nhi_ops {
  * mode takes the host's own constants, see tmu.c.
  */
 #define QUIRK_HOST_TMU					BIT(11)
+/*
+ * The host router and every device router run their TMU in bi-directional
+ * HiFi mode, as macOS does: a DP OUT adapter may require it to recover its
+ * stream clock.
+ */
+#define QUIRK_TMU_HIFI_BI				BIT(12)
 
 /* Host display policies are independent of which optional hooks are installed. */
 #define TB_HOST_DP_NOTIFY		BIT(0)
