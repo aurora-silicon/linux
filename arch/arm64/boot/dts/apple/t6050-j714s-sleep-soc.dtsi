@@ -4558,9 +4558,14 @@
 	apple,ptd-echo-entry = <0x269>;
 };
 
-/* GPU: the PS automatic state (bits 27:24) its domain is raised with after a sleep (g17/sleep.c) */
+/*
+ * GPU: the PS automatic state (bits 27:24) its domain is raised with after a sleep, and the floor
+ * (bits 19:16) the boot leaves in its word (0x1404034f), which the wake's replay clears
+ * (g17/sleep.c)
+ */
 &sgx {
 	apple,sleep-ps-auto = <0xf>;
+	apple,sleep-ps-min = <4>;
 };
 
 /*
