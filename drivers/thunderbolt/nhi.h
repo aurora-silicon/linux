@@ -255,6 +255,13 @@ struct tb_nhi_ops {
  * being set up again at HBR2 first.
  */
 #define TB_HOST_DP_SHARED_RATE		BIT(6)
+/*
+ * Run the host DP IN adapters' bandwidth allocation mode as the host's own
+ * OS does: 1 Gb/s granularity, and the connection manager acknowledges a
+ * DPTX bandwidth request by holding CM Ack until the adapter has cleared
+ * the request.
+ */
+#define TB_HOST_DP_BW_HELD_ACK		BIT(7)
 
 /*
  * Minimal number of vectors when we use MSI-X. Two for control channel
