@@ -1656,8 +1656,13 @@ static int __init apple_soc_cpufreq_module_init(void)
 	 * Start with boost enabled, so that the turbo-mode states are usable
 	 * without userspace having to turn boost on first. It can still be
 	 * switched off globally or per policy through sysfs.
+	 *
+	 * Not on T8112: there the turbo-mode states do not raise the clock
+	 * the P-cores deliver, they only run them hotter. Boost stays off by
+	 * default and can still be switched on through sysfs.
 	 */
-	apple_soc_cpufreq_driver.boost_enabled = true;
+	if (!of_machine_is_compatible("apple,t8112"))
+		apple_soc_cpufreq_driver.boost_enabled = true;
 
 	ret = cpufreq_register_driver(&apple_soc_cpufreq_driver);
 	if (ret && apple_fast_die_hp_state > 0)
