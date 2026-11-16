@@ -708,6 +708,46 @@ const fn v25g83_clustered_free_pages(clusters: u32) -> u64 {
 }
 const _: () = assert!(v25g83_clustered_free_pages(2) == MIN_FREE_TVB_PAGES);
 
+/// Smallest pass, in 32x32 tiles, that a non-TA-mode-1 >2-cluster V25G83 pass tiles clustered.
+const CLUSTERED_MIN_TILES: u64 = 256;
+
+/// Segment control (`0x1c890`), segment index (`0x1c918`), free parameter-buffer pages
+/// (`0x1c9a8`), and whether the pass tiles clustered (`cluster_pass`) for a V25G83 tiling array.
+///
+/// Only a non-TA-mode-1 build on more than two clusters tiles a pass under
+/// [`CLUSTERED_MIN_TILES`] unclustered (segment-control bit 0 set, clustering buffers zeroed).
+/// TA-mode-1 builds (such as 25F84, 40-core 25G83, and 26B123) and two-cluster layouts always
+/// keep `cluster_pass == true` and their segment and GTP register values untouched.
+fn v25g83_segment_words(ta_mode_1: bool, clusters: u32, tiles: u64) -> (u64, u64, u64, bool) {
+    let multi = (!ta_mode_1 && clusters > 2)
+        .then(|| {
+            super::m5::target::cluster_control(clusters, v25g83_clustered_free_pages(clusters))
+        })
+        .flatten();
+    match (ta_mode_1, multi) {
+        (true, _) => (T6041_TA_MODE_1, 0, MIN_FREE_TVB_PAGES, true),
+        // Above two clusters (four-cluster M4 Max: 0x280540 / 4 / 0x5c): segment words from
+        // cluster_control() with the V25G83 free-page count (28 + 16 x clusters). Small passes
+        // keep the four-cluster segment control with bit 0 set (0x280541) and get no clustering
+        // buffers, as macOS 26.6.2 does for unclustered passes on the 32-core M4 Max.
+        (false, Some([control, index, pages])) => {
+            let cluster_pass = tiles >= CLUSTERED_MIN_TILES;
+            (
+                if cluster_pass { control } else { control | 1 },
+                index,
+                pages,
+                cluster_pass,
+            )
+        }
+        (false, None) => (
+            VDM_SEGMENT_CONTROL,
+            VDM_SEGMENT_INDEX,
+            MIN_FREE_TVB_PAGES,
+            true,
+        ),
+    }
+}
+
 /// The 25G83 tiling array: the A18 Pro's without 0x1748 and 0x1740 (and 0x17d9 unless the stage
 /// has SCS), with the tiler parameter sub-buffer registers and 0x10131 = 0x88, in the order the
 /// M4 Pro has run with. Returns the array and its used entry count.
@@ -718,7 +758,15 @@ fn ta_registers_25g83(
 ) -> Result<([RegisterWrite; TA_REGISTERS_25G83 + 1], usize)> {
     let a = ta_registers(args, g, w)?;
     let r = args.resources;
+    let (segment_control, segment_index, free_pages, cluster_pass) = v25g83_segment_words(
+        args.ta_mode_1,
+        args.clusters,
+        g.tiles_x.saturating_mul(g.tiles_y),
+    );
     let gtp = |index: usize| -> Result<u64> {
+        if !cluster_pass && matches!(index, 1 | 4 | 5 | 6 | 7) {
+            return Ok(0);
+        }
         match r.gtp_va[index] {
             0 => Ok(0),
             va => user_offset(va),
@@ -758,21 +806,6 @@ fn ta_registers_25g83(
     push(find(0x1c880, 0)?);
     push(RegisterWrite::new(0x1c948, gtp(4)?));
     push(RegisterWrite::new(0x1c888, gtp(5)?));
-    let multi = (!args.ta_mode_1 && args.clusters > 2)
-        .then(|| {
-            super::m5::target::cluster_control(
-                args.clusters,
-                v25g83_clustered_free_pages(args.clusters),
-            )
-        })
-        .flatten();
-    let (segment_control, segment_index, free_pages) = match (args.ta_mode_1, multi) {
-        (true, _) => (T6041_TA_MODE_1, 0, MIN_FREE_TVB_PAGES),
-        // Above two clusters (four-cluster M4 Max: 0x280540 / 4 / 0x5c): segment words from
-        // cluster_control() with the V25G83 free-page count (28 + 16 x clusters).
-        (false, Some([control, index, pages])) => (control, index, pages),
-        (false, None) => (VDM_SEGMENT_CONTROL, VDM_SEGMENT_INDEX, MIN_FREE_TVB_PAGES),
-    };
     push(RegisterWrite::new(0x1c890, segment_control));
     push(RegisterWrite::new(0x1c918, segment_index));
     push(find(0x1c079, 0)?);
@@ -1935,7 +1968,10 @@ mod ta_mode_tests {
 
     #[test]
     fn four_clusters_take_the_four_cluster_segment_words() {
-        let (pass, resources) = fixture();
+        let (mut pass, resources) = fixture();
+        // Large enough (16x16 = 256 tiles) to stay clustered on >2-cluster GPUs.
+        pass.width = 512;
+        pass.height = 512;
         let geometry = Geometry::new(&pass).unwrap();
         let words = PassWords::new(&pass).unwrap();
         let find = |a: &[RegisterWrite], reg: u32| a.iter().find(|w| w.reg == reg).map(|w| w.value);
@@ -1963,6 +1999,114 @@ mod ta_mode_tests {
         assert_eq!(count1, count);
         assert_eq!(find(&mode1[..count1], 0x1c890), Some(T6041_TA_MODE_1));
         assert_eq!(find(&mode1[..count1], 0x1c9a8), Some(MIN_FREE_TVB_PAGES));
+    }
+
+    #[test]
+    fn small_unclustered_passes_leave_ta_mode_1_and_two_clusters_alone() {
+        let find = |a: &[RegisterWrite], reg: u32| a.iter().find(|w| w.reg == reg).map(|w| w.value);
+        // Helper returns segment words together with cluster_pass from one decision.
+        assert_eq!(
+            v25g83_segment_words(true, 4, 4),
+            (T6041_TA_MODE_1, 0, MIN_FREE_TVB_PAGES, true)
+        );
+        assert_eq!(
+            v25g83_segment_words(false, 2, 4),
+            (
+                VDM_SEGMENT_CONTROL,
+                VDM_SEGMENT_INDEX,
+                MIN_FREE_TVB_PAGES,
+                true
+            )
+        );
+        assert_eq!(
+            v25g83_segment_words(false, 4, CLUSTERED_MIN_TILES - 1),
+            (0x28_0541, 4, 0x5c, false)
+        );
+        assert_eq!(
+            v25g83_segment_words(false, 4, CLUSTERED_MIN_TILES),
+            (0x28_0540, 4, 0x5c, true)
+        );
+
+        let (small_pass, resources) = fixture();
+        let small_geom = Geometry::new(&small_pass).unwrap();
+        let small_words = PassWords::new(&small_pass).unwrap();
+        let gtp_off = |i: usize| user_offset(resources.gtp_va[i]).unwrap();
+        let gtp_regs = [
+            (0x1c041, gtp_off(1)),
+            (0x1c9d0, gtp_off(1)),
+            (0x1c948, gtp_off(4)),
+            (0x1c888, gtp_off(5)),
+            (0x16c41, gtp_off(6) & !127),
+            (0x1ca40, gtp_off(6) & !127),
+            (0x1c920, gtp_off(7)),
+        ];
+
+        // TA mode 1 on four clusters, small pass (e.g. 25F84 and 26B123): cluster_pass stays
+        // true and all gtp registers remain unchanged.
+        let mut mode1_args = args(&small_pass, &resources, false);
+        mode1_args.ta_mode_1 = true;
+        mode1_args.clusters = 4;
+        let (mode1_regs, mode1_count) =
+            ta_registers_25g83(&mode1_args, &small_geom, &small_words).unwrap();
+        assert_eq!(
+            find(&mode1_regs[..mode1_count], 0x1c890),
+            Some(T6041_TA_MODE_1)
+        );
+        assert_eq!(find(&mode1_regs[..mode1_count], 0x1c918), Some(0));
+        assert_eq!(
+            find(&mode1_regs[..mode1_count], 0x1c9a8),
+            Some(MIN_FREE_TVB_PAGES)
+        );
+        for (reg, expected) in gtp_regs {
+            assert_eq!(find(&mode1_regs[..mode1_count], reg), Some(expected));
+        }
+
+        // Two-cluster GPU, small pass: cluster_pass stays true and gtp registers are unchanged.
+        let two_args = args(&small_pass, &resources, false);
+        let (two_regs, two_count) =
+            ta_registers_25g83(&two_args, &small_geom, &small_words).unwrap();
+        assert_eq!(
+            find(&two_regs[..two_count], 0x1c890),
+            Some(VDM_SEGMENT_CONTROL)
+        );
+        for (reg, expected) in gtp_regs {
+            assert_eq!(find(&two_regs[..two_count], reg), Some(expected));
+        }
+
+        // Non-TA-mode-1 on four clusters, small pass: bit 0 set on segment control and
+        // clustering buffer registers gtp[1, 4, 5, 6, 7] zeroed; gtp[2] stays untouched.
+        let mut small_four = args(&small_pass, &resources, false);
+        small_four.ta_mode_1 = false;
+        small_four.clusters = 4;
+        let (small_regs, small_count) =
+            ta_registers_25g83(&small_four, &small_geom, &small_words).unwrap();
+        assert_eq!(find(&small_regs[..small_count], 0x1c890), Some(0x28_0541));
+        assert_eq!(find(&small_regs[..small_count], 0x1c918), Some(4));
+        assert_eq!(find(&small_regs[..small_count], 0x1c9a8), Some(0x5c));
+        for (reg, _) in gtp_regs {
+            assert_eq!(find(&small_regs[..small_count], reg), Some(0));
+        }
+        assert_eq!(find(&small_regs[..small_count], 0x1c089), Some(gtp_off(2)));
+        assert_eq!(find(&small_regs[..small_count], 0x1c9e0), Some(gtp_off(2)));
+
+        // Non-TA-mode-1 on four clusters, large pass (256 tiles): stays clustered with all
+        // gtp registers intact.
+        let mut large_pass = small_pass;
+        large_pass.width = 512;
+        large_pass.height = 512;
+        let large_geom = Geometry::new(&large_pass).unwrap();
+        let large_words = PassWords::new(&large_pass).unwrap();
+        let mut large_four = args(&large_pass, &resources, false);
+        large_four.ta_mode_1 = false;
+        large_four.clusters = 4;
+        let (large_regs, large_count) =
+            ta_registers_25g83(&large_four, &large_geom, &large_words).unwrap();
+        assert_eq!(find(&large_regs[..large_count], 0x1c890), Some(0x28_0540));
+        assert_eq!(find(&large_regs[..large_count], 0x1c918), Some(4));
+        assert_eq!(find(&large_regs[..large_count], 0x1c9a8), Some(0x5c));
+        for (reg, expected) in gtp_regs {
+            assert_eq!(find(&large_regs[..large_count], reg), Some(expected));
+        }
     }
 
     #[test]
