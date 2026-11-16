@@ -64,7 +64,11 @@ static const struct mfd_cell apple_smc_devs[] = {
 	MFD_CELL_OF("macsmc-rtc", NULL, NULL, 0, 0, "apple,smc-rtc"),
 };
 
-/* This profile exposes notifications and the explicitly described outputs. */
+/*
+ * This profile (T6050, and T8152 on the J804) exposes notifications and the explicitly
+ * described outputs. It has no 'gP' GPIO cell: its GPIOs are pcIO outputs, registered as
+ * "macsmc-gpio" from apple_smc_described_devs.
+ */
 static const struct mfd_cell apple_smc_t6050_devs[] = {
 	MFD_CELL_NAME("macsmc-input"),
 	MFD_CELL_NAME("macsmc-power"),
@@ -83,8 +87,8 @@ static const struct mfd_cell apple_smc_described_devs[] = {
 
 /*
  * T6050's reboot/power-off and RTC, for a kernel that owns the machine (J775D, booted bare
- * metal). Registered only where the device tree describes them, so a T6050 device tree without
- * them registers what it did before.
+ * metal). Registered only where the device tree describes them, so a T6050 (or J804) device
+ * tree without them registers what it did before.
  */
 static const struct mfd_cell apple_smc_t6050_described_devs[] = {
 	MFD_CELL_OF("macsmc-reboot", NULL, NULL, 0, 0, "apple,smc-reboot"),
@@ -113,7 +117,10 @@ static int apple_smc_add_described_devices(struct apple_smc *smc, const struct m
 	return 0;
 }
 
-/* T8152 currently exposes read-only telemetry; firmware owns fan control. */
+/*
+ * T8152 exposes read-only telemetry on boards where nothing else is qualified;
+ * firmware owns fan control there.
+ */
 static const struct mfd_cell apple_smc_telemetry_devs[] = {
 	MFD_CELL_OF("macsmc-hwmon", NULL, NULL, 0, 0, "apple,smc-hwmon"),
 };
@@ -634,7 +641,7 @@ static int apple_smc_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct apple_smc *smc;
 	__be32 count = 0;
-	bool t6050;
+	bool described;
 	int ret;
 
 	smc = devm_kzalloc(dev, sizeof(*smc), GFP_KERNEL);
@@ -704,8 +711,14 @@ static int apple_smc_probe(struct platform_device *pdev)
 		return dev_err_probe(smc->dev, ret, "Failed to get key count");
 	smc->key_count = be32_to_cpu(count);
 
-	/* Notifications, GPIO and power management are not qualified on T8152. */
-	if (of_device_is_compatible(dev->of_node, "apple,t8152-smc"))
+	/*
+	 * Notifications, GPIO and power management are not qualified on T8152,
+	 * except on the J804 laptop. The SMC's compatible is the same on every
+	 * T8152 board, so the board is told apart by the machine, as gpio-macsmc
+	 * does for the J700's pcIO path.
+	 */
+	if (of_device_is_compatible(dev->of_node, "apple,t8152-smc") &&
+	    !of_machine_is_compatible("apple,j804"))
 		return devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
 					    apple_smc_telemetry_devs,
 					    ARRAY_SIZE(apple_smc_telemetry_devs),
@@ -721,8 +734,9 @@ static int apple_smc_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	t6050 = of_device_is_compatible(dev->of_node, "apple,t6050-smc");
-	if (t6050)
+	described = of_device_is_compatible(dev->of_node, "apple,t6050-smc") ||
+		    of_device_is_compatible(dev->of_node, "apple,t8152-smc");
+	if (described)
 		ret = devm_mfd_add_devices(smc->dev, PLATFORM_DEVID_NONE,
 					 apple_smc_t6050_devs,
 					 ARRAY_SIZE(apple_smc_t6050_devs), NULL, 0, NULL);
@@ -735,7 +749,7 @@ static int apple_smc_probe(struct platform_device *pdev)
 
 	ret = apple_smc_add_described_devices(smc, apple_smc_described_devs,
 					      ARRAY_SIZE(apple_smc_described_devs));
-	if (ret || !t6050)
+	if (ret || !described)
 		return ret;
 
 	return apple_smc_add_described_devices(smc, apple_smc_t6050_described_devs,
