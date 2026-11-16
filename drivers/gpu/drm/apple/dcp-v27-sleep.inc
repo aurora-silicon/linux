@@ -912,6 +912,30 @@ static const struct apple_epic_service_ops dcp_v27_ext_services[] = {
 	{},
 };
 
+static void dcp_v27_ext_av_teardown(struct apple_epic_service *service)
+{
+	afk_service_disable(service);
+}
+
+/*
+ * The same holds for the AV interfaces (compact, cut to "dcpav-video-interface-" and
+ * so on) on endpoint 0x2b, which the sleep step starts when no audio did: left
+ * unanswered, the firmware never reports a display plugged after the sleep. One of
+ * each is live, re-announced at every plug.
+ */
+static const struct apple_epic_service_ops dcp_v27_ext_av_services[] = {
+	{ .name = "dcpav-video-interface-epic", .compact_full = "dcpav-video-interface-epic:0",
+	  .singleton = true, .init = dcp_v27_ext_service_init,
+	  .teardown = dcp_v27_ext_av_teardown },
+	{ .name = "dcpav-audio-interface-epic", .compact_full = "dcpav-audio-interface-epic:0",
+	  .singleton = true, .init = dcp_v27_ext_service_init,
+	  .teardown = dcp_v27_ext_av_teardown },
+	{ .name = "dcpav-cec-interface-epic", .compact_full = "dcpav-cec-interface-epic:0",
+	  .singleton = true, .init = dcp_v27_ext_service_init,
+	  .teardown = dcp_v27_ext_av_teardown },
+	{},
+};
+
 static void dcp_v27_ext_wq_destroy(void *data)
 {
 	destroy_workqueue(data);
@@ -931,8 +955,9 @@ static int dcp_v27_sleep_endpoints_open(struct apple_dcp *dcp)
 
 	for (i = 0; i < ARRAY_SIZE(v27_sleep_endpoints); i++) {
 		u8 id = v27_sleep_endpoints[i];
-		bool served = s && dcp_v27_external(dcp) && t6050_ext_services &&
-			      (id == 0x29 || id == 0x2a);
+		bool ext = s && dcp_v27_external(dcp) && t6050_ext_services;
+		bool served = ext && (id == 0x29 || id == 0x2a);
+		const struct apple_epic_service_ops *ops = no_services;
 
 		if (!apple_rtkit_has_endpoint(dcp->rtk, id))
 			return -ENODEV;
@@ -945,7 +970,11 @@ static int dcp_v27_sleep_endpoints_open(struct apple_dcp *dcp)
 			if (!s->ext_wq)
 				return -ENOMEM;
 		}
-		ep = afk_init(dcp, id, served ? dcp_v27_ext_services : no_services);
+		if (served)
+			ops = dcp_v27_ext_services;
+		else if (ext && id == AV_AUDIO_ENDPOINT_DESKTOP)
+			ops = dcp_v27_ext_av_services;
+		ep = afk_init(dcp, id, ops);
 		if (IS_ERR(ep))
 			return PTR_ERR(ep);
 		if (served) {
