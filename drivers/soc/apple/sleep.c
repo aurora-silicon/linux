@@ -546,6 +546,11 @@ struct apple_sleep_soc {
 	/* The SoC's operations arm and read its wake sources: none of the common wake words */
 	bool own_wake;
 	bool strict_gate_inventory;
+	/*
+	 * No PMP runs and its report is disabled: the PTD entries the commit drops have no
+	 * report driver to take them from. A board whose report is enabled still takes them.
+	 */
+	bool pmp_unstarted;
 
 	/*
 	 * Only for a SoC that states its CPU topology, which the probe then checks: MPIDR's
@@ -4975,7 +4980,7 @@ int apple_sleep_ans_m5_register(struct device *dev, void __iomem *asc,
 	bool late = sleep_ans_late_selected();
 	int ret;
 
-	if (!late || !s || s->soc != &t6050_sleep_soc)
+	if (!late || !s || !apple_sleep_t6050_full(s))
 		return -EOPNOTSUPP;
 	if (!check || !stop || !asc ||
 	    !of_device_is_compatible(dev->of_node, "apple,t6050-nvme-ans2"))
@@ -5009,7 +5014,7 @@ int apple_sleep_ans_m5_preflight(struct device *dev)
 	unsigned int i;
 
 	/* Called noirq: PM owns registration/lifetimes; acquire no sleeping lock. */
-	if (!sleep_ans_late_selected() || !s || s->soc != &t6050_sleep_soc || !s->region ||
+	if (!sleep_ans_late_selected() || !s || !apple_sleep_t6050_full(s) || !s->region ||
 	    !s->region->snapshot_valid)
 		return -EOPNOTSUPP;
 	/* The entry boundary: the attempt's own task, its reserved owner, late scope armed. */
@@ -5050,7 +5055,7 @@ int apple_sleep_ans_m5_domains_ready(struct device *dev)
 	struct apple_sleep *s = apple_sleep;
 	struct apple_sleep_coproc *c;
 
-	if (!sleep_ans_late_selected() || !s || s->soc != &t6050_sleep_soc ||
+	if (!sleep_ans_late_selected() || !s || !apple_sleep_t6050_full(s) ||
 	    !pm_resume_via_firmware() ||
 	    s->resumes_after <= s->resumes_before)
 		return -EOPNOTSUPP;
@@ -5076,7 +5081,7 @@ int apple_sleep_display_v27_power_ready(struct device *dev)
 	unsigned int d, j;
 
 	if (!s || !s->soc->regions || !s->region ||
-	    !of_machine_is_compatible("apple,j714s") || s->soc->ndisp != 5)
+	    !apple_sleep_t6050_full(s) || s->soc->ndisp != 5)
 		return -EOPNOTSUPP;
 	if (s->region->late_errors || s->region->display_lowered)
 		return -EIO;
@@ -5125,7 +5130,7 @@ int apple_sleep_m5_display_power(bool on)
 	void __iomem *cpu, *fe, *sys;
 	int ret = 0;
 
-	if (!s || !s->soc->regions || !s->region || s->soc != &t6050_sleep_soc)
+	if (!s || !s->soc->regions || !s->region || !apple_sleep_t6050_full(s))
 		return -ENODEV;
 	/* The coprocessor core's gate pair: 3, 0 off and 0, 1 on. */
 	if (!t6050_disp_dcp_gate)
@@ -5201,7 +5206,7 @@ int apple_sleep_m5_dispext_power(struct device *dev, bool on)
 	u32 boost, bwr;
 	int ret = 0;
 
-	if (!dev || !s || !s->soc->regions || !s->region || s->soc != &t6050_sleep_soc ||
+	if (!dev || !s || !s->soc->regions || !s->region || !apple_sleep_t6050_full(s) ||
 	    s->soc->ndisp != ARRAY_SIZE(t6050_disp_ext_pmc) + 1)
 		return -ENODEV;
 	for (d = 1; d < s->soc->ndisp; d++)

@@ -198,11 +198,16 @@ static const struct apple_sleep_region_profile t6050_region_profile = {
 	.ntables = ARRAY_SIZE(t6050_tables),
 };
 
-/* Inventory only: the Max's memory stop/wake sequence is not yet qualified. */
+/*
+ * The Max inventory, for the J716c's full sleep. Its keepalive tables have the Pro's bases,
+ * counts and strides.
+ */
 static const struct apple_sleep_region_profile t6050_j716c_region_profile = {
 	.region = t6050_regions,
 	.count = ARRAY_SIZE(t6050_regions),
 	.power = SLEEP_WORDS(t6050_j716c_ps_all),
+	.table = t6050_tables,
+	.ntables = ARRAY_SIZE(t6050_tables),
 };
 
 static bool sleep_region_word_valid(const struct apple_sleep_region_profile *p,
@@ -1502,6 +1507,12 @@ static int t6050_sleep_ptd_ownership(struct apple_sleep *s, bool own)
 	report = of_find_compatible_node(NULL, NULL, "apple,t6050-pmp-v2-report");
 	if (!report)
 		return -ENODEV;
+	/* Nothing else writes the entries: the gate refuses a PMP that runs unbound. */
+	if (s->soc->pmp_unstarted && !of_device_is_available(report)) {
+		of_node_put(report);
+		r->ptd_owned = true;
+		return 0;
+	}
 	for_each_child_of_node(report, entry) {
 		u32 id;
 
@@ -3428,15 +3439,105 @@ static const struct apple_sleep_soc t6050_sleep_soc = {
 };
 
 /*
- * Keep the Max inventory separate without granting it the Pro's entry callbacks.
- * Matching this node must fail before any mapping or boot-time register writes:
- * its DCS inventory differs, and the stop/wake contract still needs validation.
+ * The J716c's banks, checked against the addresses its own hardware description gives before
+ * anything is mapped, and its display slots against the coprocessors they name.
+ */
+static int t6050_j716c_apertures(struct apple_sleep *s)
+{
+	static const resource_size_t base[T6050_REGIONS] = {
+		0x280600000ULL, 0x280900000ULL, 0x288300000ULL, 0x2300e80000ULL,
+		0x2380600000ULL, 0x2388300000ULL, 0x280760000ULL, 0x2807d4000ULL,
+		0x280930000ULL, 0x2300e90000ULL, 0x2380760000ULL, 0x280700000ULL,
+		0x2380700000ULL, 0x2807ec000ULL, 0x280950000ULL, 0x23807dc000ULL,
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(base); i++) {
+		struct resource res;
+		int index = of_property_match_string(s->dev->of_node, "reg-names",
+						     t6050_regions[i].name);
+
+		if (index < 0 || of_address_to_resource(s->dev->of_node, index, &res) ||
+		    res.start != base[i] || resource_size(&res) != t6050_regions[i].size)
+			return dev_err_probe(s->dev, -EINVAL, "wrong J716c aperture %s\n",
+					     t6050_regions[i].name);
+	}
+	/* Power words must describe the actual display instance in this slot. */
+	for (i = 0; i < s->soc->ndisp; i++) {
+		static const resource_size_t asc[] = {
+			0x48ae00000ULL, 0x2b2e00000ULL, 0x392e00000ULL,
+			0x302e00000ULL, 0x306e00000ULL,
+		};
+		struct device_node *np __free(device_node) =
+			of_parse_phandle(s->dev->of_node, "apple,display-coprocessors", i);
+		struct resource res;
+		int index;
+
+		if (!np || !of_device_is_compatible(np, i ? "apple,t6050-dcpext" :
+							  "apple,t6050-dcp"))
+			return -EINVAL;
+		index = of_property_match_string(np, "reg-names", "coproc");
+		if (index < 0 || of_address_to_resource(np, index, &res) ||
+		    res.start != asc[i] || resource_size(&res) != 0x4000)
+			return dev_err_probe(s->dev, -EINVAL, "wrong display %u aperture\n", i);
+	}
+	return 0;
+}
+
+/* The full sleep's map, from the same checked banks */
+static int t6050_j716c_sleep_map(struct apple_sleep *s)
+{
+	return t6050_j716c_apertures(s) ?: t6050_sleep_map_regs(s);
+}
+
+/* The J714s's operations, with the J716c's checked map. */
+static const struct apple_sleep_ops t6050_j716c_sleep_ops = {
+	.deep_wfi_arm = t8140_deep_wfi_arm,
+	.resume = cpu_resume,
+	.aic_mask_all = aic_sleep_mask_all,
+	.aic_ack = aic_sleep_ack,
+	.aic_restore = aic_sleep_restore,
+	.plan_complex_request = t6050_sleep_plan_complex_request,
+	.map_regs = t6050_j716c_sleep_map,
+	.begin = t6050_sleep_begin,
+	.check = t6050_sleep_check_alarm,
+	.display_off = t6050_sleep_display_prepare,
+	.display_stop = sleep_v27_final_stop,
+	.before_enclave = t6050_sleep_before_enclave,
+	.stage = t6050_sleep_stage,
+	.final_check = t6050_sleep_final_check,
+	.commit_notice = t6050_sleep_commit_notice,
+	.after_ans = t6050_sleep_after_ans,
+	.prepare_regs = t6050_sleep_prepare_regs,
+	.undo_regs = t6050_sleep_undo_regs,
+	.commit_begin = t6050_sleep_pre_commit,
+	.commit_regs = t6050_sleep_commit_regs,
+	.post_timer = t6050_sleep_post_timer,
+	.cpu_down = t6050_cpu_down,
+	.wake = t6050_sleep_wake_regs,
+	.finish = t6050_sleep_finish,
+	.cpu_prepare = t6050_sleep_cpu_prepare,
+	.cpu_restore = t6050_sleep_cpu_restore,
+};
+
+/*
+ * The J716c (M5 Max): the J714s's entry and wake over the Max inventory. The Max's own power
+ * words (the second encoder, AMCC16-31) are in no list the entry lowers: saved at the entry
+ * and put back at the wake if they dropped. No PMP runs on this board.
  */
 static const struct apple_sleep_soc t6050_j716c_sleep_soc = {
-	.unavailable_reason = "J716c memory-controller stop/wake is not qualified",
-	.early_context = true,
 	.strict_gate_inventory = true,
+	.gate_coprocs = t6050_gate_coprocs,
+	.ngate_coprocs = ARRAY_SIZE(t6050_gate_coprocs),
+	.gate_off = t6050_gate_off,
+	.ngate_off = ARRAY_SIZE(t6050_gate_off),
+	.ops = &t6050_j716c_sleep_ops,
+	.smc_policy = &t6050_smc_policy,
+	.early_context = true,
+	.own_wake = true,
+	.pmp_unstarted = true,
 	.machine = "apple,j716c",
+	.spmi_notify_sleep = 0x2000001,
 	.boot_mpidr = 0x040000,
 	.cpu_count = 18,
 	.cpu_cluster_affinity = 1,
@@ -3446,4 +3547,28 @@ static const struct apple_sleep_soc t6050_j716c_sleep_soc = {
 	.cpu_valid = t6050_sleep_cpu_valid,
 	.ndisp = 5,
 	.regions = &t6050_j716c_region_profile,
+	.ps = {
+		.ans = SLEEP_REGION_WORD(T6050_PS1, 0x140),
+		.apcie_sys_gp = SLEEP_REGION_WORD(T6050_PS1, 0x280),
+		.sep = SLEEP_REGION_WORD(T6050_PS1, 0x298),
+		.sio_cpu = SLEEP_REGION_WORD(T6050_PS1, 0x2a0),
+		.disp = {
+			{ SLEEP_REGION_WORD(T6050_PS1, 0x1a8), SLEEP_REGION_WORD(T6050_PS1, 0x198),
+			  SLEEP_REGION_WORD(T6050_PS1, 0x180) },
+			{ SLEEP_REGION_WORD(T6050_PS0, 0x278), SLEEP_REGION_WORD(T6050_PS0, 0x268),
+			  SLEEP_REGION_WORD(T6050_PS0, 0x200) },
+			{ SLEEP_REGION_WORD(T6050_PS0, 0x2e0), SLEEP_REGION_WORD(T6050_PS0, 0x2d0),
+			  SLEEP_REGION_WORD(T6050_PS0, 0x230) },
+			{ SLEEP_REGION_WORD(T6050_PS0, 0x2b0), SLEEP_REGION_WORD(T6050_PS0, 0x2a0),
+			  SLEEP_REGION_WORD(T6050_PS0, 0x220) },
+			{ SLEEP_REGION_WORD(T6050_PS0, 0x2c8), SLEEP_REGION_WORD(T6050_PS0, 0x2b8),
+			  SLEEP_REGION_WORD(T6050_PS0, 0x228) },
+		},
+	},
 };
+
+/* The full T6050 entries: the J714s's and the J716c's */
+static bool apple_sleep_t6050_full(const struct apple_sleep *s)
+{
+	return s && (s->soc == &t6050_sleep_soc || s->soc == &t6050_j716c_sleep_soc);
+}

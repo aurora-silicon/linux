@@ -250,18 +250,81 @@ static void apple_sleep_test_j716c_inventory(struct kunit *test)
 }
 
 /* An inventory must never authorize unqualified hardware entry callbacks. */
-static void apple_sleep_test_j716c_unavailable(struct kunit *test)
+static void apple_sleep_test_unavailable(struct kunit *test)
 {
 	struct apple_sleep_soc incomplete = t6050_j716c_sleep_soc;
 
-	KUNIT_EXPECT_STREQ(test, incomplete.machine, "apple,j716c");
-	KUNIT_EXPECT_EQ(test, incomplete.cpu_count, 18U);
-	KUNIT_EXPECT_TRUE(test, incomplete.strict_gate_inventory);
-	KUNIT_EXPECT_PTR_EQ(test, incomplete.ops, NULL);
+	incomplete.unavailable_reason = "not qualified";
 	KUNIT_EXPECT_EQ(test, apple_sleep_profile_validate(&incomplete), -EOPNOTSUPP);
-	/* Deleting the explanation alone still cannot enable a sleep. */
+	/* Deleting the explanation alone still cannot enable a profile without operations. */
 	incomplete.unavailable_reason = NULL;
+	incomplete.ops = NULL;
 	KUNIT_EXPECT_EQ(test, apple_sleep_profile_validate(&incomplete), -EINVAL);
+}
+
+/* The J716c runs the J714s's steps: only its map, inventory, board and PMP differ. */
+static void apple_sleep_test_j716c_full(struct kunit *test)
+{
+	const struct apple_sleep_soc *max = &t6050_j716c_sleep_soc, *pro = &t6050_sleep_soc;
+	struct apple_sleep_ops ops = *max->ops;
+	struct apple_sleep *state = kunit_kzalloc(test, sizeof(*state), GFP_KERNEL);
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, state);
+	KUNIT_EXPECT_EQ(test, apple_sleep_profile_validate(max), 0);
+	KUNIT_EXPECT_PTR_EQ(test, max->unavailable_reason, NULL);
+	KUNIT_EXPECT_STREQ(test, max->machine, "apple,j716c");
+	KUNIT_EXPECT_PTR_EQ(test, max->regions, &t6050_j716c_region_profile);
+	KUNIT_EXPECT_EQ(test, sleep_region_validate(max->regions), 0);
+	KUNIT_EXPECT_EQ(test, max->regions->ntables, pro->regions->ntables);
+	for (i = 0; i < max->regions->ntables; i++)
+		KUNIT_EXPECT_MEMEQ(test, &max->regions->table[i], &pro->regions->table[i],
+				   sizeof(pro->regions->table[i]));
+	KUNIT_EXPECT_TRUE(test, max->pmp_unstarted);
+	KUNIT_EXPECT_TRUE(test, max->ops->map_regs == t6050_j716c_sleep_map);
+	ops.map_regs = pro->ops->map_regs;
+	KUNIT_EXPECT_MEMEQ(test, &ops, pro->ops, sizeof(ops));
+	KUNIT_EXPECT_PTR_EQ(test, max->smc_policy, pro->smc_policy);
+	KUNIT_EXPECT_PTR_EQ(test, max->gate_coprocs, pro->gate_coprocs);
+	KUNIT_EXPECT_EQ(test, max->ngate_coprocs, pro->ngate_coprocs);
+	KUNIT_EXPECT_PTR_EQ(test, max->gate_off, pro->gate_off);
+	KUNIT_EXPECT_EQ(test, max->ngate_off, pro->ngate_off);
+	KUNIT_EXPECT_EQ(test, max->strict_gate_inventory, pro->strict_gate_inventory);
+	KUNIT_EXPECT_EQ(test, max->early_context, pro->early_context);
+	KUNIT_EXPECT_EQ(test, max->own_wake, pro->own_wake);
+	KUNIT_EXPECT_EQ(test, max->spmi_notify_sleep, pro->spmi_notify_sleep);
+	KUNIT_EXPECT_EQ(test, max->boot_mpidr, pro->boot_mpidr);
+	KUNIT_EXPECT_EQ(test, max->cpu_count, pro->cpu_count);
+	KUNIT_EXPECT_EQ(test, max->cpu_cluster_affinity, pro->cpu_cluster_affinity);
+	KUNIT_EXPECT_EQ(test, max->cpu_clusters, pro->cpu_clusters);
+	KUNIT_EXPECT_EQ(test, max->cpu_cores_per_cluster, pro->cpu_cores_per_cluster);
+	KUNIT_EXPECT_EQ(test, max->cpu_start_stride, pro->cpu_start_stride);
+	KUNIT_EXPECT_PTR_EQ(test, max->cpu_valid, pro->cpu_valid);
+	KUNIT_EXPECT_EQ(test, max->ndisp, pro->ndisp);
+	KUNIT_EXPECT_MEMEQ(test, &max->ps, &pro->ps, sizeof(max->ps));
+	/* Every word the J714s's steps name by index is the J716c's too, at the same index. */
+	for (i = 0; i < pro->regions->power.count; i++)
+		KUNIT_EXPECT_EQ(test, max->regions->power.offset[i], pro->regions->power.offset[i]);
+	state->soc = max;
+	KUNIT_EXPECT_TRUE(test, apple_sleep_t6050_full(state));
+	state->soc = pro;
+	KUNIT_EXPECT_TRUE(test, apple_sleep_t6050_full(state));
+}
+
+/* The J714s's profile is as it was: its own map, its inventory, a PMP that runs. */
+static void apple_sleep_test_j714s_unchanged(struct kunit *test)
+{
+	const struct apple_sleep_soc *pro = &t6050_sleep_soc;
+
+	KUNIT_EXPECT_PTR_EQ(test, pro->unavailable_reason, NULL);
+	KUNIT_EXPECT_STREQ(test, pro->machine, "apple,j714s");
+	KUNIT_EXPECT_PTR_EQ(test, pro->ops, &t6050_sleep_ops);
+	KUNIT_EXPECT_TRUE(test, pro->ops->map_regs == t6050_sleep_map_regs);
+	KUNIT_EXPECT_PTR_EQ(test, pro->regions, &t6050_region_profile);
+	KUNIT_EXPECT_PTR_EQ(test, pro->regions->power.offset, &t6050_ps_all[0]);
+	KUNIT_EXPECT_EQ(test, pro->regions->power.count, ARRAY_SIZE(t6050_ps_all));
+	KUNIT_EXPECT_FALSE(test, pro->pmp_unstarted);
+	KUNIT_EXPECT_EQ(test, apple_sleep_profile_validate(pro), 0);
 }
 
 static void apple_sleep_test_region_rejects_bad_inventory(struct kunit *test)
@@ -282,7 +345,9 @@ static struct kunit_case apple_sleep_test_cases[] = {
 	KUNIT_CASE(apple_sleep_test_layout),
 	KUNIT_CASE(apple_sleep_test_t6050),
 	KUNIT_CASE(apple_sleep_test_j716c_inventory),
-	KUNIT_CASE(apple_sleep_test_j716c_unavailable),
+	KUNIT_CASE(apple_sleep_test_unavailable),
+	KUNIT_CASE(apple_sleep_test_j716c_full),
+	KUNIT_CASE(apple_sleep_test_j714s_unchanged),
 	KUNIT_CASE(apple_sleep_test_region_rejects_bad_inventory),
 	KUNIT_CASE(apple_sleep_test_known_profiles),
 	KUNIT_CASE(apple_sleep_test_ops),
