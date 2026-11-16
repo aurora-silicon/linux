@@ -870,6 +870,11 @@ static int apple_nhi_cio_power_on_t6050(struct apple_nhi *anhi)
 }
 
 /* The rest of the way down once the router has taken its sleep. */
+/* TEST: independently select the measured J714s router-sleep GPIO level. */
+static bool t6050_test_sleep_lstx_high;
+module_param_named(t6050_test_sleep_lstx_high, t6050_test_sleep_lstx_high, bool, 0644);
+MODULE_PARM_DESC(t6050_test_sleep_lstx_high, "TEST: hold J714s LSTX high during router sleep; default low");
+
 static int apple_nhi_cio_power_off_t6050(struct apple_nhi *anhi)
 {
 	static const u8 before[] = { 4, 1, 2, 3 }, after[] = { 0 };
@@ -895,8 +900,14 @@ static int apple_nhi_cio_power_off_t6050(struct apple_nhi *anhi)
 		apple_cio_cpu_halt(acio);
 		if (ret)
 			return ret;
-		/* macOS leaves LSTX low for the sleep; the rc block is not read with the CPU halted. */
-		ret = apple_cio_lstx_hold(acio, false);
+		/* The rc block is not read with its CPU halted. */
+		ret = apple_cio_lstx_hold(acio, t6050_test_sleep_lstx_high &&
+					  of_machine_is_compatible("apple,j714s"));
+		if (of_machine_is_compatible("apple,j714s"))
+			dev_info(anhi->dev, "TEST CIO LSTX: selected %u held %u gpio %d result %d\n",
+				 t6050_test_sleep_lstx_high, acio->lstx_high,
+				 !ret && acio->lstx_gpio ? gpiod_get_raw_value(acio->lstx_gpio) : -ENODATA,
+				 ret);
 		if (ret)
 			return ret;
 	}
