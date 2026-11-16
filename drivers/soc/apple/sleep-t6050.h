@@ -90,6 +90,16 @@ struct apple_sleep_region_state {
 	bool snapshot_valid;
 	unsigned long manager_down[BITS_TO_LONGS(ARRAY_SIZE(t6050_ps_all))];
 	u8 alarm_compare[4];
+	/* TEST: retained entry/wake diagnostics, printed only after the returning replay. */
+	u32 diag_spmi[5], diag_wake[10];
+	u32 diag_entry[2][10], diag_entry_masks[2][10];
+	u32 diag_entry_valid;
+	u64 diag_counter;
+	u32 diag_compare, diag_wake_mask4;
+	bool diag_mask149;
+	int diag_post_control;
+	u8 diag_wake_control, diag_wake_counter[8], diag_wake_compare[4];
+	int diag_wake_error;
 	bool alarm_valid;
 	unsigned int pmu_errors;
 	/* The DART GAPF bank, read only, if the node names it. */
@@ -650,6 +660,7 @@ static void t6050_sleep_post_timer(struct apple_sleep *s)
 	ret = t6050_sleep_pmu_xfer(s, T6050_SPMI_EXT_READL, T6050_RTC_CTL, NULL, &control, 1);
 	if (ret)
 		goto failed; /* No fabricated status or conditional ack after a failed read. */
+	r->diag_post_control = control;
 	if (control & T6050_RTC_CTL_FIRED) {
 		value = r->alarm_rearm[0];
 		ret = t6050_sleep_pmu_xfer(s, T6050_SPMI_EXT_WRITEL, T6050_RTC_CTL, &value, NULL, 1);
@@ -1626,6 +1637,13 @@ static int t6050_sleep_begin(struct apple_sleep *s)
 	r->refusal_cycled = 0;
 	r->pmu_errors = 0;
 	r->alarm_valid = false;
+	r->diag_post_control = -1;
+	r->diag_wake_error = -ENODATA;
+	memset(r->diag_spmi, 0, sizeof(r->diag_spmi));
+	memset(r->diag_wake, 0, sizeof(r->diag_wake));
+	r->diag_entry_valid = 0;
+	memset(r->diag_wake_counter, 0, sizeof(r->diag_wake_counter));
+	memset(r->diag_wake_compare, 0, sizeof(r->diag_wake_compare));
 	r->boot_stage_written = false;
 	s->regs_staged = s->entry_prepared = s->wake_masks_saved = false;
 	s->smc_idle_sent = s->smc_idle_ack = 0;
@@ -2005,11 +2023,15 @@ static void t6050_wake_masks(struct apple_sleep *s)
 			r->wake_enabled[T6050_WAKE_WORDS] |= BIT(ids[i]);
 }
 
+static bool t6050_test_mask149;
+module_param_named(t6050_test_mask149, t6050_test_mask149, bool, 0644);
+MODULE_PARM_DESC(t6050_test_mask149, "TEST: mask only ADT wake index 149 (ATC2 CIO)");
+
 static void t6050_wake_arm(struct apple_sleep *s)
 {
 	struct apple_sleep_region_state *r = s->region;
 	unsigned int i;
-	u32 implemented;
+	u32 implemented, enabled;
 
 	if (!r->wake || !r->wake_gfx || !r->wake_sources)
 		return;
@@ -2021,10 +2043,22 @@ static void t6050_wake_arm(struct apple_sleep *s)
 		/* Every implemented source masked, then the enabled ones cleared */
 		writel(U32_MAX, reg);
 		implemented = readl(reg);
-		writel(implemented & ~r->wake_enabled[i], reg);
+		enabled = r->wake_enabled[i];
+		if (t6050_test_mask149 && i == 149 / 32)
+			enabled &= ~BIT(149 % 32);
+		writel(implemented & ~enabled, reg);
+		if (i == 149 / 32) {
+			r->diag_mask149 = t6050_test_mask149;
+			r->diag_wake_mask4 = implemented & ~enabled;
+		}
 		dev_dbg(s->dev, "wake word %u: implemented %#x, enabled %#x\n", i, implemented,
 			r->wake_enabled[i]);
 	}
+	for (i = 0; i < T6050_WAKE_WORDS; i++) {
+		r->diag_entry[0][i] = readl(r->wake + 0x34 + 4 * i);
+		r->diag_entry_masks[0][i] = readl(r->wake + T6050_WAKE_ENABLE + 4 * i);
+	}
+	r->diag_entry_valid |= BIT(0);
 	r->wake_armed = true;
 }
 
@@ -2270,6 +2304,10 @@ static u32 t6050_spmi_pmu_ack(struct apple_sleep *s)
  * the PMU's latched interrupts acknowledged, the SPMI buses' sleep masks (nub-spmi0 first,
  * then the DT's order and spacing), SPI4, SPI2.
  */
+static bool t6050_alarm_readback;
+module_param_named(t6050_alarm_readback, t6050_alarm_readback, bool, 0644);
+MODULE_PARM_DESC(t6050_alarm_readback, "TEST: read SPMI latch and enable back after entry ack");
+
 static void t6050_sleep_after_ans(struct apple_sleep *s)
 {
 	struct apple_sleep_region_state *r = s->region;
@@ -2302,7 +2340,11 @@ static void t6050_sleep_after_ans(struct apple_sleep *s)
 		t6050_late_lower(s, i);
 	r->spmi_mask[0] = readl(s->spmi + M5_SPMI_IRQ_EN);
 	/* nub-spmi0 first: its interrupt outputs are AP wake sources. */
-	t6050_spmi_pmu_ack(s);
+	r->diag_spmi[0] = t6050_spmi_pmu_ack(s);
+	if (r->spmi_pmu_bits && t6050_alarm_readback) {
+		r->diag_spmi[1] = readl(s->spmi + r->spmi_pmu_status);
+		r->diag_spmi[2] = readl(s->spmi + r->spmi_pmu_status - 0x200);
+	}
 	writel(readl(s->spmi + M5_SPMI_IRQ_STATUS), s->spmi + M5_SPMI_IRQ_STATUS);
 	writel(s->soc->spmi_notify_sleep, s->spmi + M5_SPMI_IRQ_EN);
 	for (i = 0; i < r->nspmi_order; i++) {
@@ -2319,6 +2361,13 @@ static void t6050_sleep_after_ans(struct apple_sleep *s)
 	r->spmi_masked = true;
 	for (i = T6050_LATE_SPI4; i <= T6050_LATE_SPI2; i++)
 		t6050_late_lower(s, i);
+	if (r->wake) {
+		for (i = 0; i < ARRAY_SIZE(r->diag_entry[1]); i++) {
+			r->diag_entry[1][i] = readl(r->wake + 0x34 + 4 * i);
+			r->diag_entry_masks[1][i] = readl(r->wake + T6050_WAKE_ENABLE + 4 * i);
+		}
+		r->diag_entry_valid |= BIT(1);
+	}
 }
 
 /*
@@ -2621,6 +2670,8 @@ static int t6050_sleep_final_check(struct apple_sleep *s)
 		return ret;
 	counter = get_unaligned_le64(ticks) >> 16; /* In the alarm compare's units */
 	compare = get_unaligned_le32(r->alarm_compare);
+	r->diag_counter = counter;
+	r->diag_compare = compare;
 	delay = div_u64((s->timer_at - now) * USEC_PER_SEC, arch_timer_get_cntfrq());
 	if (compare <= counter + DIV_ROUND_UP_ULL(delay, USEC_PER_SEC) + 2)
 		return -ETIME;
@@ -3204,6 +3255,20 @@ static void t6050_wake_report(struct apple_sleep *s)
 	struct apple_sleep_region_state *r = s->region;
 	unsigned int i, shown = 0, restored = 0, timeouts = 0, expected = 0;
 
+	for (i = 0; i < ARRAY_SIZE(r->diag_entry); i++)
+		dev_info(s->dev, "TEST CIO entry phase %u valid %u pending %*ph masks %*ph\n",
+			 i, !!(r->diag_entry_valid & BIT(i)), (int)sizeof(r->diag_entry[i]),
+			 r->diag_entry[i], (int)sizeof(r->diag_entry_masks[i]), r->diag_entry_masks[i]);
+	dev_info(s->dev, "TEST mask149: selected %u word4 mask %#x ADT enabled %#x\n",
+		r->diag_mask149, r->diag_wake_mask4, r->wake_enabled[149 / 32]);
+	dev_info(s->dev, "TEST alarm: counter before %llu compare %u; post-timer control %#x; wake error %d control %#x counter %llu compare %u\n",
+		r->diag_counter, r->diag_compare, r->diag_post_control, r->diag_wake_error,
+		r->diag_wake_control, get_unaligned_le64(r->diag_wake_counter) >> 16,
+		get_unaligned_le32(r->diag_wake_compare));
+	dev_info(s->dev, "TEST alarm: readback %u SPMI source entry %#x -> %#x enable %#x; wake %#x -> %#x; AP wake %*ph\n",
+		t6050_alarm_readback,
+		r->diag_spmi[0], r->diag_spmi[1], r->diag_spmi[2], r->diag_spmi[3],
+		r->diag_spmi[4], (int)sizeof(r->diag_wake), r->diag_wake);
 	for (i = 0; i < p->power.count; i++)
 		if (r->late[i] && t6050_wake_word_expected(r->saved[i],
 							   readl(sleep_region_reg(s, p->power.offset[i]))))
@@ -3259,9 +3324,22 @@ static void t6050_sleep_wake_regs(struct apple_sleep *s)
 	unsigned int i;
 	u32 value;
 
+	if (r->wake)
+		for (i = 0; i < ARRAY_SIZE(r->diag_wake); i++)
+			r->diag_wake[i] = readl(r->wake + 0x34 + 4 * i);
 	if (r->spmi_masked) {
-		/* What the PMU sent while the SoC slept (its wake), before the run-time mask */
-		t6050_spmi_pmu_ack(s);
+		/* Snapshot the latch before diagnostic PMU commands can affect the controller. */
+		r->diag_spmi[3] = t6050_spmi_pmu_ack(s);
+		if (r->spmi_pmu_bits)
+			r->diag_spmi[4] = readl(s->spmi + r->spmi_pmu_status);
+		r->diag_wake_error = t6050_sleep_pmu_xfer(s, T6050_SPMI_EXT_READL,
+			T6050_RTC_CTL, NULL, &r->diag_wake_control, 1);
+		if (!r->diag_wake_error)
+			r->diag_wake_error = t6050_sleep_pmu_xfer(s, T6050_SPMI_EXT_READL,
+				T6050_RTC_COUNTER, NULL, r->diag_wake_counter, 6);
+		if (!r->diag_wake_error)
+			r->diag_wake_error = t6050_sleep_pmu_xfer(s, T6050_SPMI_EXT_READL,
+				T6050_RTC_COMPARE, NULL, r->diag_wake_compare, 4);
 		writel(r->spmi_mask[0], s->spmi + M5_SPMI_IRQ_EN);
 		for (i = 0; i < ARRAY_SIZE(r->spmi_bus); i++)
 			if (r->spmi_bus[i])
