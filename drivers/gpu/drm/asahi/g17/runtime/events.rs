@@ -340,16 +340,31 @@ impl Firmware {
     /// this after it has signalled the completions of its pass: the reports are not scheduling
     /// inputs.
     fn drain_reports(&mut self) {
+        // Measurement switch 0x10: while the cores are known powered and the statistics state
+        // last saw them powered in the current epoch, an observation would find them powered
+        // and change nothing; it is left out, with its register read.
+        let noting = crate::g17::sync_input::render_submit(
+            crate::g17::sync_input::SUBMIT_POWER_DRAIN,
+        )
+        .then(crate::g17::now_ns);
+        let known = noting.is_some_and(|now| {
+            self.port.power_recent(now)
+                && self.rings.statistics_settled(self.port.statistics_epoch())
+        });
         let dev = &self.primary.state.shared.dev;
         for &role in self.roles() {
             self.rings.drain_trace(dev, &self.init, role);
         }
         // Each drain is bracketed by power observations; consecutive roles share the one
         // between them (each reads the GPU's power register).
-        self.observe_statistics_power();
+        if !known {
+            self.observe_statistics_power_noting(noting);
+        }
         for &role in self.roles() {
             self.rings.drain_statistics(&self.primary.state.shared.dev, &self.init, role);
-            self.observe_statistics_power();
+            if !known {
+                self.observe_statistics_power_noting(noting);
+            }
         }
     }
 

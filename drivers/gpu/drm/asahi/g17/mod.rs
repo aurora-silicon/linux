@@ -951,7 +951,9 @@ impl Firmware {
     /// Called at actual submission publication, not while a queued job is merely being built.
     fn note_submission(&mut self) -> Result {
         self.primary.state.shared.note_submitter();
-        self.port.note_gpu_activity();
+        self.port.note_gpu_activity(
+            self.init.is_m5() && sync_input::render_submit(sync_input::SUBMIT_POWER_NOTE),
+        );
         self.primary.state.shared.note_gpu_activity();
         self.effort.submit();
         self.effort.note_waiters(now_ns(), fence::waiters());
@@ -1032,15 +1034,25 @@ impl Firmware {
 
     /// Observe a telemetry epoch boundary without changing GPU power policy.
     fn observe_statistics_power(&mut self) {
+        self.observe_statistics_power_noting(None);
+    }
+
+    /// [`Self::observe_statistics_power`]. `now` (measurement switch 0x10): a reading that
+    /// finds the cores powered is also noted at `now` for [`port::Port::power_recent`].
+    fn observe_statistics_power_noting(&mut self, now: Option<u64>) {
         if self.rings.statistics_suspended() || self.primary.state.shared.sleeping() {
             return;
         }
         let roles = self.roles();
+        let powered = self.bridge.regs.g17_core_power() & 0xf != 0;
+        if let Some(now) = now.filter(|_| powered) {
+            self.port.note_powered(now);
+        }
         self.rings.observe_statistics_power(
             &self.primary.state.shared.dev,
             &self.init,
             roles,
-            self.bridge.regs.g17_core_power() & 0xf != 0,
+            powered,
             self.port.statistics_epoch(),
         );
     }
