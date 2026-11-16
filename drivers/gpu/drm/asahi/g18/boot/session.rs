@@ -259,6 +259,11 @@ impl G18Session {
                 && scheduler.submitted==frame.submitted() && scheduler.completed==frame.submitted()
                 && scheduler.linked==0 && list==[0,job.job.queues().job_list()];
             let completed=stamps==[frame.stamp();2] && masks[0]&0x600==0x600;
+            // The remaining conditions follow within 50-150 us: wait_job
+            // re-polls without sleeping for a bounded time.
+            if !recovered && (scheduler.completed==frame.submitted() || stamps==[frame.stamp();2]) {
+                recovery::RETIRE_NEAR.store(true,Ordering::Relaxed);
+            }
             recovery::note_phases(&mut first,&kicked,&[outer==[outer_after;3],inner==[[frame.inner_after();3];2],
                 scheduler.submitted==frame.submitted(),scheduler.completed==frame.submitted(),scheduler.linked==0,
                 list==[0,job.job.queues().job_list()],stamps==[frame.stamp();2],masks[0]&0x600==0x600]);
