@@ -531,7 +531,7 @@ impl File {
             uapi::DRM_ASAHI_PARAM_GROUP_VM_STATUS_MIRROR if gpu.supports_vm_status() => {
                 return Self::register_vm_status_mirror(data, file);
             }
-            uapi::DRM_ASAHI_PARAM_GROUP_VM_FENCE_ERROR_MIRROR => {
+            crate::errc_uapi::DRM_ASAHI_PARAM_GROUP_VM_FENCE_ERROR_MIRROR => {
                 // Only backends whose failed output fences are all counted (g17).
                 if !gpu.supports_vm_status() || !gpu.supports_vm_fence_error_count() {
                     return Err(EOPNOTSUPP);
@@ -656,7 +656,7 @@ impl File {
         data: &uapi::drm_asahi_get_params,
         file: &DrmFile,
     ) -> Result<u32> {
-        type Request = uapi::drm_asahi_vm_fence_error_mirror;
+        type Request = crate::errc_uapi::drm_asahi_vm_fence_error_mirror;
         kernel::static_assert!(core::mem::size_of::<Request>() == 24);
         kernel::static_assert!(core::mem::offset_of!(Request, handle) == 4);
         kernel::static_assert!(core::mem::offset_of!(Request, offset) == 8);
