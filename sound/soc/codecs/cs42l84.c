@@ -1007,8 +1007,9 @@ static void cs42l84_handle_unplug(struct cs42l84_private *cs42l84)
 }
 
 /*
- * The tip went to plugged: detect the headset. Called with irq_lock held,
- * tip_state already set to CS42L84_PLUG.
+ * The tip went to plugged: detect the headset, and drop the result if the
+ * tip did not stay plugged throughout. Called with irq_lock held, tip_state
+ * already set to CS42L84_PLUG.
  */
 static void cs42l84_handle_plug(struct cs42l84_private *cs42l84)
 {
@@ -1030,8 +1031,15 @@ static void cs42l84_handle_plug(struct cs42l84_private *cs42l84)
 	      CS42L84_TS_PLUG_SHIFT;
 	if (current_tip_state != CS42L84_PLUG) {
 		dev_dbg(cs42l84->dev, "Wobbly connection, detection invalidated\n");
+		/*
+		 * Undo it all, as an unplug. With tip_state unplugged, an unplug
+		 * IRQ that follows is no change, so the jack must not stay
+		 * reported, and the ring IRQs stay masked. A tip that then
+		 * settles plugged is a change: its IRQ detects again.
+		 */
 		cs42l84->tip_state = CS42L84_UNPLUG;
-		cs42l84_revert_hs(cs42l84);
+		cs42l84_handle_unplug(cs42l84);
+		return;
 	}
 
 	/* Unmask ring sense interrupts */
@@ -1097,7 +1105,13 @@ static irqreturn_t cs42l84_irq_thread(int irq, void *data)
 		      (CS42L84_RS_PLUG | CS42L84_RS_UNPLUG)) >>
 		      CS42L84_RS_PLUG_SHIFT;
 
-		if (current_ring_state != cs42l84->ring_state) {
+		/*
+		 * Only with the tip plugged: with the tip unplugged or in
+		 * transition there is nothing to detect, and the tip's own IRQ
+		 * detects once it settles plugged.
+		 */
+		if (cs42l84->tip_state == CS42L84_PLUG &&
+		    current_ring_state != cs42l84->ring_state) {
 			cs42l84->ring_state = current_ring_state;
 			if (current_ring_state == CS42L84_PLUG)
 				cs42l84_detect_hs(cs42l84);
