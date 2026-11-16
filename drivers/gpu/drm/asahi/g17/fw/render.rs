@@ -700,6 +700,8 @@ const T6041_TA_MODE_1: u64 = 1;
 /// Pages the tiler keeps out of a partial render's segments: without them the pages a pass
 /// returns shrink to none and the tiler can't advance. Fifteen blocks, macOS's minimum heap.
 const MIN_FREE_TVB_PAGES: u64 = 0x3c;
+/// 0x1c9a8 of a clustered four-cluster T6041 25G83 pass, as macOS 26.6.2 writes it.
+const T6041_CLUSTERED_FREE_PAGES: u64 = 0x5c;
 
 /// The 25G83 tiling array: the A18 Pro's without 0x1748 and 0x1740 (and 0x17d9 unless the stage
 /// has SCS), with the tiler parameter sub-buffer registers and 0x10131 = 0x88, in the order the
@@ -762,7 +764,8 @@ fn ta_registers_25g83(
     let (segment_control, segment_index, free_pages) = match (args.ta_mode_1, multi) {
         (true, _) => (T6041_TA_MODE_1, 0, MIN_FREE_TVB_PAGES),
         // Four clusters (M4 Max): 0x280540 / 4, and 32 + 16 x clusters free pages.
-        (false, Some([control, index, pages])) => (control, index, pages),
+        // macOS writes 0x5c free pages on the four-cluster 25G83 build, not the M5's 0x60.
+        (false, Some([control, index, _])) => (control, index, T6041_CLUSTERED_FREE_PAGES),
         (false, None) => (VDM_SEGMENT_CONTROL, VDM_SEGMENT_INDEX, MIN_FREE_TVB_PAGES),
     };
     push(RegisterWrite::new(0x1c890, segment_control));
@@ -1928,7 +1931,7 @@ mod ta_mode_tests {
         assert_eq!(count4, count);
         assert_eq!(find(&four[..count4], 0x1c890), Some(0x28_0540));
         assert_eq!(find(&four[..count4], 0x1c918), Some(4));
-        assert_eq!(find(&four[..count4], 0x1c9a8), Some(0x60));
+        assert_eq!(find(&four[..count4], 0x1c9a8), Some(T6041_CLUSTERED_FREE_PAGES));
         // TA mode 1 is unaffected by the cluster count.
         args.ta_mode_1 = true;
         let (mode1, _) = ta_registers_25g83(&args, &geometry, &words).unwrap();
