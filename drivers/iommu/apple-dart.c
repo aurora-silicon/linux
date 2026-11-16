@@ -567,6 +567,7 @@ static int apple_dart_sleep_writer_get(struct apple_dart *dart);
 static void apple_dart_sleep_writer_put(struct apple_dart *dart, int gate);
 static void __noreturn apple_dart_sleep_release_failed(void);
 static int apple_dart_cio_init(struct apple_dart *dart, resource_size_t size, bool skip);
+static void apple_dart_cio_release(struct apple_dart *dart);
 
 #ifndef MODULE
 static struct kexec_blocker apple_dart_radio_kexec = {
@@ -6091,6 +6092,9 @@ static void apple_dart_remove(struct platform_device *pdev)
 	if (!dart->locked && !dart->retained_mtp && !dart->live_mtp &&
 	    !READ_ONCE(dart->commands_gated))
 		apple_dart_hw_reset(dart);
+
+	/* Its streams are off: its clock protection goes before its domain can. */
+	apple_dart_cio_release(dart);
 
 	if (dart->irq >= 0)
 		apple_dart_free_irq(dart);
