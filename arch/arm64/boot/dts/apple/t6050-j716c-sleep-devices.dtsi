@@ -57,3 +57,28 @@
 	apple,sleep-ssps;
 	status = "okay";
 };
+
+/*
+ * The right port's USB4 router sleeping in place (drivers/thunderbolt/apple-cio-sleep.c): its
+ * protection syscon, its combo PHY and the clock-protection slices of its NHI and tunnelled
+ * PCIe DARTs. The J716c's dart-acio2 and dart-apciec2 have slice indices 30 and 31, as on
+ * the J714s.
+ */
+&die0 {
+	ps_prot: syscon@2803f0000 {
+		compatible = "apple,t6050-ps-prot", "syscon";
+		reg = <0x2 0x803f0000 0x0 0x4000>;
+	};
+};
+
+&acio2 {
+	apple,cio-phy = <&atc2_phy>;
+};
+
+&acio2_dart {
+	apple,clock-protection = <&ps_prot 30>;
+};
+
+&apciec2_dart {
+	apple,clock-protection = <&ps_prot 31>;
+};
