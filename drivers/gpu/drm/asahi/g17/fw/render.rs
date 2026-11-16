@@ -702,6 +702,10 @@ const T6041_TA_MODE_1: u64 = 1;
 const MIN_FREE_TVB_PAGES: u64 = 0x3c;
 /// 0x1c9a8 of a clustered four-cluster T6041 25G83 pass, as macOS 26.6.2 writes it.
 const T6041_CLUSTERED_FREE_PAGES: u64 = 0x5c;
+/// 0x0a5a1 (tiling PTC cap in bits 32 and up) of a clustered four-cluster 25G83 pass. macOS
+/// 26.6.2 writes 0x7f, 0x97 or 0xaf there per pass, never the 0x60 of the two-cluster M4 Pro;
+/// take the largest it used.
+const T6041_CLUSTERED_TA_PTC: u64 = 0xaf_0040_0020;
 
 /// The 25G83 tiling array: the A18 Pro's without 0x1748 and 0x1740 (and 0x17d9 unless the stage
 /// has SCS), with the tiler parameter sub-buffer registers and 0x10131 = 0x88, in the order the
@@ -794,6 +798,11 @@ fn ta_registers_25g83(
         0x1a0f1, 0x10799, 0x1c830, 0x1ca30, 0x16c39, 0x1c910, 0x0a5a1, 0x0d419, 0x1ca10, 0x014a1,
         0x0a349, 0x10209, 0x1c9f0, 0x14320, 0x14308, 0x14318,
     ] {
+        // A clustered four-cluster pass gets a larger tiling PTC cap, as macOS writes it.
+        if reg == 0x0a5a1 && multi.is_some() {
+            push(RegisterWrite::new(0x0a5a1, T6041_CLUSTERED_TA_PTC));
+            continue;
+        }
         push(find(reg, 0)?);
     }
     push(find(0x1c880, 1)?);
