@@ -321,6 +321,7 @@ struct sep_bio_rearm {
 #define SEP_KEY_FEATURE_SEAL   0x2
 #define SEP_KEY_FEATURE_PASSWORD 0x4
 #define SEP_KEY_FEATURE_PERSISTENT_ATTEMPTS 0x8
+#define SEP_KEY_FEATURE_CONTEXTS 0x20 /* authorization contexts, below */
 #define SEP_KEY_PASSWORD_MAX 256
 #define SEP_KEY_SECRET_MAX 64
 #define SEP_KEY_SEALED_MAX 256
@@ -414,6 +415,105 @@ struct sep_key_unseal_password {
 #define SEP_KEY_CREATE_USER     _IOWR(SEP_BIO_IOC_MAGIC, 0x28, struct sep_key_create_user)
 #define SEP_KEY_SIGN_PASSWORD   _IOWR(SEP_BIO_IOC_MAGIC, 0x29, struct sep_key_sign_password)
 #define SEP_KEY_UNSEAL_PASSWORD _IOWR(SEP_BIO_IOC_MAGIC, 0x2a, struct sep_key_unseal_password)
+
+/*
+ * Authorization contexts (SEP_KEY_FEATURE_CONTEXTS; module parameter
+ * key_context_api=1, 13.5 key store). DESIGN DRAFT, not a stable ABI.
+ *
+ * One authentication (a Touch ID match in the bag user's own domain)
+ * authorizes a bounded run of operations on that bag's keys, as macOS lets
+ * an authentication be reused for a short time: a password manager reveals
+ * many items after one unlock. The bounds:
+ *
+ * - a context belongs to one Unix account's key bag (NEW: root or that
+ *   user) and is a file descriptor: closing it ends it;
+ * - it lasts lifetime_s from the authentication (at most 12 hours, 0 =
+ *   until revoked), and ends at once when the bag locks, on suspend, on
+ *   REVOKE and when the driver stops;
+ * - each SIGN or DECRYPT still runs one enclave operation under the
+ *   enclave's own access-control check of that key.
+ *
+ * Every request carries a caller-chosen nonzero id; SEP_KEY_CANCEL_ID on
+ * the file it was made on (the /dev/sep-key file, or the context for its
+ * AUTH) ends that request, such as an AUTH waiting for a finger.
+ * Outcome: 0 authenticated, 1 not matched, 5 failed.
+ * Errors: EOPNOTSUPP without the feature, EKEYEXPIRED once the
+ * context has ended, EBUSY while another request runs, ECANCELED when
+ * cancelled, ETIMEDOUT at timeout_ms.
+ */
+#define SEP_KEY_CTX_NEW_BAG       0x1
+#define SEP_KEY_CTX_LIFETIME_MAX  (12 * 3600)
+#define SEP_KEY_CTX_METHOD_TOUCH  1
+#define SEP_KEY_CTX_OUTCOME_OK          0
+#define SEP_KEY_CTX_OUTCOME_NOT_MATCHED 1
+#define SEP_KEY_CTX_OUTCOME_FAILED      5
+
+struct sep_key_buffer {
+	__u32 len;
+	__u32 reserved;
+	__u64 ptr;
+};
+
+struct sep_key_ctx_new {
+	__u32 flags;            /* SEP_KEY_CTX_NEW_BAG */
+	__s32 fd;               /* out: the context */
+	__u32 uid;              /* the bag's Unix account */
+	__u32 lifetime_s;       /* 0..SEP_KEY_CTX_LIFETIME_MAX */
+};
+
+struct sep_key_ctx_auth {
+	__u64 id;
+	__u32 timeout_ms;
+	__u32 method;           /* SEP_KEY_CTX_METHOD_TOUCH */
+	__u32 outcome;          /* out: SEP_KEY_CTX_OUTCOME_* */
+	__u32 reserved;
+};
+
+struct sep_key_ctx_query {
+	__u32 phase;
+	__u32 cleanup;
+	__s32 reason;
+	__u32 activity_flags;
+};
+
+struct sep_key_ctx_revoke {
+	__u32 timeout_ms;
+	__u32 reserved;
+};
+
+struct sep_key_ctx_sign {
+	__u64 id;
+	__u32 timeout_ms;
+	__s32 context_fd;
+	__u32 blob_len;
+	__u32 reserved;
+	__u64 blob_ptr;
+	__u8  digest[SEP_KEY_DIGEST_LEN];
+	__u32 sig_len;          /* out */
+	__u32 reserved2;
+	__u8  signature[SEP_KEY_SIG_MAX];
+};
+
+struct sep_key_ctx_decrypt {
+	__u64 id;
+	__u32 timeout_ms;
+	__s32 context_fd;
+	struct sep_key_buffer blob;
+	struct sep_key_buffer sealed;
+	struct sep_key_buffer plain;    /* in: capacity, out: length */
+};
+
+struct sep_key_cancel_id {
+	__u64 request_id;
+};
+
+#define SEP_KEY_CTX_NEW           _IOWR(SEP_BIO_IOC_MAGIC, 0x40, struct sep_key_ctx_new)
+#define SEP_KEY_CTX_AUTH          _IOWR(SEP_BIO_IOC_MAGIC, 0x41, struct sep_key_ctx_auth)
+#define SEP_KEY_CTX_QUERY         _IOR(SEP_BIO_IOC_MAGIC, 0x42, struct sep_key_ctx_query)
+#define SEP_KEY_CTX_REVOKE        _IOW(SEP_BIO_IOC_MAGIC, 0x43, struct sep_key_ctx_revoke)
+#define SEP_KEY_CTX_SIGN          _IOWR(SEP_BIO_IOC_MAGIC, 0x44, struct sep_key_ctx_sign)
+#define SEP_KEY_CTX_DECRYPT       _IOWR(SEP_BIO_IOC_MAGIC, 0x45, struct sep_key_ctx_decrypt)
+#define SEP_KEY_CANCEL_ID         _IOW(SEP_BIO_IOC_MAGIC, 0x48, struct sep_key_cancel_id)
 
 /*
  * Test only, refused unless apple_sep.key_selftest=1, root: sign with a

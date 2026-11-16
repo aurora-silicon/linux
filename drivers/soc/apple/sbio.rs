@@ -2921,6 +2921,7 @@ impl SepData {
         // Touch ID device: fprintd claims it for one PAM authentication.
         let open_gen = self.bio_open_gen.load(Relaxed);
         let key_mode = self.key_touch_active.load(Relaxed);
+        let retaining = self.key_authorization_request().is_some();
         // A /dev/sep-key signature is its own prompt: a fresh evaluation that
         // never outlives this run, whatever prompt /dev/sep-bio has open.
         let current = if !key_mode && self.match_scope_gen.load(Relaxed) == open_gen {
@@ -2976,7 +2977,7 @@ impl SepData {
         // A /dev/sep-key call owns its evaluation outright: it is deleted
         // when this goes, on every path out of this run, never kept open
         // for a later touch, and never shared with /dev/sep-bio.
-        let key_context = key_mode.then(|| crate::key::OwnedContext::new(self, evaluation));
+        let mut key_context = key_mode.then(|| crate::key::OwnedContext::new(self, evaluation));
 
         let mut outcome = self.verify_one_image();
         // A retry straight from the capture (no finger in time, partial
@@ -3067,11 +3068,13 @@ impl SepData {
             }
             *self.match_context.lock() = None;
             self.match_scope_gen.store(0, Relaxed);
-            match key_context {
-                Some(context) => drop(context),
-                None => self.close_unlock_evaluation(&evaluation),
+            if !retaining {
+                match key_context.take() {
+                    Some(context) => drop(context),
+                    None => self.close_unlock_evaluation(&evaluation),
+                }
             }
-            if key_mode && matched && !self.key_context_failed.load(Relaxed) {
+            if key_mode && !retaining && matched && !self.key_context_failed.load(Relaxed) {
                 self.key_touch_after_close(&evaluation);
             }
         }
@@ -3191,6 +3194,11 @@ impl SepData {
             "verify: post-result steps done {} ms after the touch was finished\n",
             shim::boottime_ns().saturating_sub(touched_at) / 1_000_000
         );
+        if retaining && matches!(outcome, bio::VerifyOutcome::Matched(_)) {
+            if key_context.take().ok_or(EIO).and_then(|credential| self.retain_key_authorization(credential)).is_err() {
+                outcome = bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE);
+            }
+        }
         if !reported_early {
             self.finish_verify(outcome, token_bytes);
         }
@@ -3253,8 +3261,9 @@ impl SepData {
                 return bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR);
             }
             CaptureWait::Abandon => {
-                // A cancelled verify also abandons; only a live one is a fault.
-                if self.key_touch_active.load(Relaxed)
+                // A cancelled verify also abandons, as does a context's touch
+                // whose request ended; only a live one is a fault.
+                if (self.key_touch_active.load(Relaxed) && self.key_capture_wanted())
                     || bio::verify_is_live(&self.bio_session.lock(), self.capture_epoch.load(Relaxed))
                 {
                     dev_err_ratelimited!(
@@ -4528,6 +4537,7 @@ impl SepData {
         // to the same duration as the poll path.
         let deadline_ns = crate::shim::monotonic_ns().saturating_add(wait_ms.saturating_mul(1_000_000));
         let mut attempt: u32 = 0;
+        let _waiting = crate::key_command::SensorWait::new(self);
         loop {
             if !self.capture_live() {
                 return CaptureWait::Abandon;
@@ -5262,6 +5272,9 @@ impl SepData {
             self.suspending.store(true, Relaxed);
             bio::abort_capture(&mut session)
         };
+        self.cancel_key(ENODEV);
+        self.cancel_context_commands(ENODEV);
+        self.revoke_key_contexts(ENODEV);
         if woke {
             dev_info_ratelimited!(
                 self.dev,
@@ -5282,10 +5295,15 @@ impl SepData {
                     "Touch ID: a capture was still running {} ms after the system started to sleep; continuing\n",
                     SLEEP_DRAIN_MS
                 );
+                self.key_context_failed.store(true, Relaxed);
                 return;
             }
             kernel::time::delay::fsleep(kernel::time::Delta::from_millis(10));
             waited += 10;
+        }
+        let deadline = shim::monotonic_ns().saturating_add(u64::from(SLEEP_DRAIN_MS) * 1_000_000);
+        if self.drain_key_contexts(deadline).is_err() {
+            self.key_context_failed.store(true, Relaxed);
         }
     }
 

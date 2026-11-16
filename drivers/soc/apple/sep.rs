@@ -24,7 +24,13 @@ mod hibe;
 mod hwrng;
 mod image;
 mod key;
+mod key_command;
+mod key_context;
+mod key_context_state;
 mod key_device;
+mod key_request;
+mod key_result;
+mod key_wait;
 mod keybag;
 mod keybag_identity;
 mod os_identity;
@@ -909,10 +915,17 @@ struct SepData {
     // /dev/sep-key: P-256 keys created inside the SEP (see `key`).
     #[pin]
     key_dev: Mutex<Option<key_device::Registration>>,
-    /// `/dev/sep-key` calls in progress (`key_device::Call`).
     key_calls: Atomic<u32>,
+    key_context_generation: Atomic<u64>,
+    #[pin]
+    key_contexts: Mutex<KVec<Arc<key_context::Context>>>,
+    key_context_queue: workqueue::OwnedQueue,
+    key_auth_queue: workqueue::OwnedQueue,
+    #[pin]
+    key_commands: Mutex<key_command::State>,
     #[pin]
     capture: Mutex<capture::State>,
+    key_sensor_waiting: Atomic<bool>,
 
     // /dev/sep-key: one identity-bag load, operation and unload at a time.
     // The device's ioctls run concurrently (a touch wait must not block
@@ -1319,7 +1332,13 @@ impl SepData {
                 rearm_dev <- new_mutex!(None),
                 key_dev <- new_mutex!(None),
                 key_calls: Atomic::new(0),
+                key_context_generation: Atomic::new(0),
+                key_contexts <- new_mutex!(KVec::new()),
+                key_context_queue: workqueue::OwnedQueue::new_ordered(c"sep_context")?,
+                key_auth_queue: workqueue::OwnedQueue::new_ordered(c"sep_auth")?,
+                key_commands <- new_mutex!(key_command::State::new()),
                 capture <- new_mutex!(capture::State::new()),
+                key_sensor_waiting: Atomic::new(false),
                 key_bag_lock <- new_mutex!(()),
                 key_touch <- new_mutex!(None),
                 key_touch_active: Atomic::new(false),
@@ -3291,6 +3310,11 @@ impl SepData {
         self.sks_wq.notify_all();
         self.scrd_wq.notify_all();
         pm::unregister();
+        self.cancel_key(ENODEV);
+        self.cancel_context_commands(ENODEV);
+        self.revoke_key_contexts(ENODEV);
+        self.key_auth_queue.drain();
+        self.remove_key_contexts();
         // Release any capture start still held for a resume that will not be
         // reported now.
         self.sleep_finished();
@@ -3800,6 +3824,10 @@ module! {
         probe_owner_export: u8 {
             default: 0,
             description: "Opt-in J414s diagnostic: with zero live identities, select the system context and try saving the missing owner Catacomb",
+        },
+        key_context_api: u8 {
+            default: 0,
+            description: "Enable the authorization-context requests on /dev/sep-key (SEP_KEY_CTX_*, a design draft; 13.5 key store with per-user bags)",
         },
         key_selftest: u8 {
             default: 0,

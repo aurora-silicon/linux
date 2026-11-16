@@ -18,13 +18,24 @@
 
 #include <linux/types.h>
 
-/* -- application-key files ---------------------------------------------- */
+/* -- application-key files and waits ------------------------------------ */
 
 void *sep_key_register(const char *name, u16 mode, void *ctx,
 		       int (*open)(void *, void **),
 		       void (*release)(void *),
 		       long (*ioctl)(void *, unsigned int, unsigned long));
 void sep_key_unregister(void *device);
+void *sep_key_event_new(void);
+void sep_key_event_free(void *event);
+u64 sep_key_event_sequence(void *event);
+void sep_key_event_wake(void *event);
+int sep_key_event_wait(void *event, u64 sequence, u32 timeout_ms);
+int sep_context_file_new(void *ctx, void (*release)(void *),
+			 long (*ioctl)(void *, unsigned int, unsigned long),
+			 void **file, int *fd);
+void sep_context_file_finish(void *file, int fd, bool install);
+void *sep_context_file_get(int fd, void **ctx);
+void sep_context_file_put(void *file);
 
 struct apple_sep_fv_new_file_key;
 struct dev_pm_ops;

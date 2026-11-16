@@ -2,19 +2,117 @@
 //! `/dev/sep-key` as a per-open device: each file owns its state and a
 //! reference to the driver; the key commands keep their existing ABI.
 
-use crate::{key as keys, SepData};
+use crate::{key as keys, key_request::{Request, RequestIds}, SepData};
 use kernel::prelude::*;
 use kernel::sync::atomic::{Acquire, Full, Relaxed, Release};
-use kernel::sync::{Arc, ArcBorrow};
+use kernel::sync::{Arc, ArcBorrow, Mutex};
 use kernel::types::ForeignOwnable;
+use kernel::uaccess::{UserPtr, UserSlice};
 
+#[path = "key_context_device.rs"]
+mod contexts;
+
+#[repr(C)]
+struct Cancel {
+    request_id: u64,
+}
+// SAFETY: one initialized fixed-width integer, all bit patterns valid.
+unsafe impl kernel::transmute::FromBytes for Cancel {}
+/// `SEP_KEY_CANCEL_ID`: ends this file's request `request_id`.
+const IOC_CANCEL: u32 = kernel::ioctl::_IOW::<Cancel>(crate::key::MAGIC, 0x48);
+
+/// Whether the authorization-context requests are offered: opted in by
+/// `key_context_api`, on the 13.5 key store with per-user bags.
+pub(crate) fn contexts_supported(sep: &SepData) -> bool {
+    crate::module_parameters::key_context_api.value() != 0
+        && sep.profile.per_user_keybags
+        && matches!(
+            sep.profile.key_store,
+            crate::profile::KeyStore::Sepos13 { .. }
+        )
+}
+
+enum Operation {
+    Idle,
+    Private(Arc<Request>),
+}
+struct State {
+    ids: RequestIds,
+    operation: Operation,
+}
+
+#[pin_data]
 struct File {
     sep: Arc<SepData>,
+    context_generation: u64,
+    #[pin]
+    state: Mutex<State>,
+}
+
+struct Active<'a>(&'a File);
+impl Drop for Active<'_> {
+    fn drop(&mut self) {
+        self.0.state.lock().operation = Operation::Idle;
+    }
 }
 
 impl File {
+    fn begin(&self, request: Arc<Request>) -> Result<Active<'_>> {
+        let mut state = self.state.lock();
+        if !matches!(state.operation, Operation::Idle) {
+            return Err(EBUSY);
+        }
+        state.ids.admit(request.id)?;
+        state.operation = Operation::Private(request);
+        Ok(Active(self))
+    }
+
+    fn cancel(&self, id: u64) -> Result {
+        if id == 0 {
+            return Err(EINVAL);
+        }
+        let request = {
+            let mut state = self.state.lock();
+            match &state.operation {
+                Operation::Private(request) if request.id == id => request.clone(),
+                _ => {
+                    return if state.ids.cancel_ahead(id)? {
+                        Ok(())
+                    } else {
+                        Err(ENOENT)
+                    }
+                }
+            }
+        };
+        request.cancel(ECANCELED)
+    }
+
+    fn check_api(&self) -> Result {
+        if self.sep.shutting_down.load(Relaxed) {
+            return Err(ENODEV);
+        }
+        if !contexts_supported(&self.sep) {
+            return Err(EOPNOTSUPP);
+        }
+        if self.sep.key_context_failed.load(Relaxed) {
+            return Err(EIO);
+        }
+        if !self.sep.xart_writable() {
+            return Err(EROFS);
+        }
+        Ok(())
+    }
+
     fn ioctl(&self, cmd: u32, arg: usize) -> Result {
         let _call = Call::enter(&self.sep)?;
+        let user = UserPtr::from_addr(arg);
+        if cmd == IOC_CANCEL {
+            let request: Cancel = UserSlice::new(user, 8).reader().read()?;
+            return self.cancel(request.request_id);
+        }
+        if contexts::handles(cmd) {
+            return self.context_ioctl(cmd, user);
+        }
         self.sep.key_ioctl(cmd, arg)
     }
 }
@@ -111,8 +209,15 @@ unsafe extern "C" fn open(ctx: *mut c_void, out: *mut *mut c_void) -> c_int {
     if sep.shutting_down.load(Relaxed) {
         return ENODEV.to_errno();
     }
-    let file = Arc::new(
-        File { sep: sep.into() },
+    let file = Arc::pin_init(
+        try_pin_init!(File {
+            context_generation: sep.key_context_generation.load(Relaxed),
+            sep: sep.into(),
+            state <- kernel::new_mutex!(State {
+                ids: RequestIds::new(),
+                operation: Operation::Idle,
+            }),
+        }),
         kernel::alloc::flags::GFP_KERNEL_ACCOUNT,
     );
     match file {
@@ -121,7 +226,7 @@ unsafe extern "C" fn open(ctx: *mut c_void, out: *mut *mut c_void) -> c_int {
             unsafe { out.write(file.into_foreign()) };
             0
         }
-        Err(_) => ENOMEM.to_errno(),
+        Err(error) => error.to_errno(),
     }
 }
 
