@@ -161,6 +161,11 @@ impl InitData {
                 if let Some(chip) = chip {
                     power.apply_chip(chip)?;
                 }
+                // TEST ONLY: power configuration word +0x2e64 override for the DVFS ceiling A/B.
+                let test_2e64 = crate::module_parameters::g17_test_pcfg_2e64.value();
+                if test_2e64 != 0 {
+                    power.0[0x2e64..0x2e68].copy_from_slice(&test_2e64.to_le_bytes());
+                }
                 Ok(())
             })?;
         self.object_mut(self.region_c)?

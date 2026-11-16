@@ -144,6 +144,10 @@ module! {
             default: 90000,
             description: "M5 GPU power budget governor target for the SoC hotspot temperature computed by the SMC, in milli-degrees C (70000..104000)",
         },
+        g17_test_pcfg_2e64: u32 {
+            default: 0,
+            description: "TEST ONLY (GPUPERF 25G83 DVFS ceiling A/B): nonzero overrides power configuration word +0x2e64 (0 keeps the table value)",
+        },
         m5_depth_msaa_compression: u32 {
             default: 1,
             description: "Enable single-layer D32 compressed 2x/4x ZLS admission",
