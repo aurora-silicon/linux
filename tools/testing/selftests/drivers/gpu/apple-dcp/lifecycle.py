@@ -713,6 +713,23 @@ int main(void)
  CHECK(dcp_dptx_connect_oob(&device, 0) == -ETIMEDOUT && connects == 0);
  printf("case live-failure complete\n");
 
+ /* A connect that finds the old display still attached drops it and connects: its unplug never reached us. */
+ bounced(); link_trains = true;
+ display.dptxport[0].connected = fw_display = true;
+ {
+  int before = releases;
+  CHECK(dcp_dptx_connect_oob(&device, 0) == 0);
+  CHECK(releases == before + 1 && connects == 1);
+  CHECK(display.dptxport[0].connected && fw_hpd && fw_display);
+ }
+ /* An old display that will not release fails the connect and stays attached: nothing new is started on it. */
+ bounced(); link_trains = true;
+ display.dptxport[0].connected = fw_display = true; release_error = -ETIMEDOUT;
+ CHECK(dcp_dptx_connect_oob(&device, 0) == -ETIMEDOUT);
+ CHECK(connects == 0 && display.dptxport[0].connected);
+ release_error = 0;
+ printf("case stale-display complete\n");
+
  printf("%d assertions, %d failures\n", checks, failures); return !!failures;
 }
 '''
@@ -752,6 +769,21 @@ int main(void)
                      'static bool dcp_tb_tunnel_withdrawn(struct apple_dcp *d, u32 port)\n'
                      '{ (void)d; (void)port; assert(!"tunnel watch in an H17P scenario"); return false; }\n' +
                      apple_function(root, 'dcp_dptx_wait_linkcfg'))
+    if 'dcp_dptx_release_locked(' in raw:
+        # A connect that finds the old display still attached drops it with the production release. This H17P
+        # display has no T6030 dcpext, T6030 crossbar or T8132 teardown for that release to reach.
+        firmware += ('static void dcpext_scanout_invalidate(struct apple_dcp *d)\n'
+                     '{ (void)d; assert(!"T6030 dcpext path in an H17P scenario"); }\n'
+                     'static void dcp_direct_crossbar_link(struct apple_dcp *d, bool on)\n'
+                     '{ (void)d; (void)on; assert(!"T6030 crossbar in an H17P scenario"); }\n'
+                     'static void iomfb_m4_external_link_gone(struct apple_dcp *d)\n'
+                     '{ (void)d; assert(!"T8132 dcpext in an H17P scenario"); }\n'
+                     'static void dcp_t8132_dptx_teardown_log(struct apple_dcp *d, u32 port, const char *what, int err)\n'
+                     '{ (void)d; (void)port; (void)what; (void)err; assert(!"T8132 dcpext in an H17P scenario"); }\n'
+                     'static int dcp_dptx_release_locked(struct apple_dcp *dcp, u32 port);\n')
+        released = apple_function(root, 'dcp_dptx_release_locked')
+        assert released, 'dcp_dptx_release_locked'
+        raw += '\n' + released
     # unless the update work already needed the clock
     clock = 'static unsigned jiffies_to_msecs(unsigned long t) { return t; }\n'
     if clock in unit:
