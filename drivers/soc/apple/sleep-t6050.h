@@ -93,7 +93,8 @@ struct apple_sleep_region_state {
 	/* TEST: retained entry/wake diagnostics, printed only after the returning replay. */
 	u32 diag_spmi[5], diag_wake[10];
 	u64 diag_counter;
-	u32 diag_compare;
+	u32 diag_compare, diag_wake_mask4;
+	bool diag_mask149;
 	int diag_post_control;
 	u8 diag_wake_control, diag_wake_counter[8], diag_wake_compare[4];
 	int diag_wake_error;
@@ -2019,11 +2020,15 @@ static void t6050_wake_masks(struct apple_sleep *s)
 			r->wake_enabled[T6050_WAKE_WORDS] |= BIT(ids[i]);
 }
 
+static bool t6050_test_mask149;
+module_param_named(t6050_test_mask149, t6050_test_mask149, bool, 0644);
+MODULE_PARM_DESC(t6050_test_mask149, "TEST: mask only ADT wake index 149 (ATC2 CIO)");
+
 static void t6050_wake_arm(struct apple_sleep *s)
 {
 	struct apple_sleep_region_state *r = s->region;
 	unsigned int i;
-	u32 implemented;
+	u32 implemented, enabled;
 
 	if (!r->wake || !r->wake_gfx || !r->wake_sources)
 		return;
@@ -2035,7 +2040,14 @@ static void t6050_wake_arm(struct apple_sleep *s)
 		/* Every implemented source masked, then the enabled ones cleared */
 		writel(U32_MAX, reg);
 		implemented = readl(reg);
-		writel(implemented & ~r->wake_enabled[i], reg);
+		enabled = r->wake_enabled[i];
+		if (t6050_test_mask149 && i == 149 / 32)
+			enabled &= ~BIT(149 % 32);
+		writel(implemented & ~enabled, reg);
+		if (i == 149 / 32) {
+			r->diag_mask149 = t6050_test_mask149;
+			r->diag_wake_mask4 = implemented & ~enabled;
+		}
 		dev_dbg(s->dev, "wake word %u: implemented %#x, enabled %#x\n", i, implemented,
 			r->wake_enabled[i]);
 	}
@@ -3228,6 +3240,8 @@ static void t6050_wake_report(struct apple_sleep *s)
 	struct apple_sleep_region_state *r = s->region;
 	unsigned int i, shown = 0, restored = 0, timeouts = 0, expected = 0;
 
+	dev_info(s->dev, "TEST mask149: selected %u word4 mask %#x ADT enabled %#x\n",
+		r->diag_mask149, r->diag_wake_mask4, r->wake_enabled[149 / 32]);
 	dev_info(s->dev, "TEST alarm: counter before %llu compare %u; post-timer control %#x; wake error %d control %#x counter %llu compare %u\n",
 		r->diag_counter, r->diag_compare, r->diag_post_control, r->diag_wake_error,
 		r->diag_wake_control, get_unaligned_le64(r->diag_wake_counter) >> 16,
