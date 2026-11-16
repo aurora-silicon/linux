@@ -235,14 +235,14 @@ static int apple_spmi_wait_rx_not_empty(struct spmi_controller *ctrl)
  * late, or the stray one that was read in a reply's place, is read out instead: the bus gets a
  * command's whole timeout to finish, then the reply FIFO is read until it is empty. Nothing of
  * an old exchange can then answer a new command. A FIFO that does not empty keeps the failure.
- * On the J714s only, the board this is for; on every other generation 4 machine a failed
- * exchange refuses the later commands, as before.
+ * On the boards with a T6050 sleep only, the J714s and the J716c; on every other generation 4
+ * machine a failed exchange refuses the later commands, as before.
  */
 static int apple_spmi_gen4_recover(struct spmi_controller *ctrl, struct apple_spmi *spmi)
 {
 	unsigned int i;
 
-	if (!of_machine_is_compatible("apple,j714s"))
+	if (!of_machine_is_compatible("apple,j714s") && !of_machine_is_compatible("apple,j716c"))
 		return -EIO;
 	usleep_range(REG_POLL_TIMEOUT_US, 2 * REG_POLL_TIMEOUT_US);
 	for (i = 0; i < SPMI_GEN4_REPLY_DRAIN_MAX; i++) {
