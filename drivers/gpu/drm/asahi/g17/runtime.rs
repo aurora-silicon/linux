@@ -1700,6 +1700,7 @@ impl super::Firmware {
             let found = match own {
                 Some(found) => {
                     local += 1;
+                    if super::sync_input::local_inputs_mode() == 2 { continue; }
                     found
                 }
                 None => self.queues.compute.iter_mut().flatten()

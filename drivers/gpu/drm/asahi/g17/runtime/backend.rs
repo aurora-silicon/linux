@@ -142,7 +142,8 @@ impl job::Backend for Backend {
         // published there ahead of the consumer or still queued ahead of it here. So its own
         // sources need no publication check (or wait) under the device mutex; publication finds
         // them on that queue and orders the consumer behind them as behind any other source.
-        let own_first = self.shared.m5_board.is_some_and(|board| board.completion_inputs());
+        let own_first = sync_input::local_inputs_mode() != 0
+            && self.shared.m5_board.is_some_and(|board| board.completion_inputs());
         let mut heads = KVec::new();
         let mut sources: KVec<sync_input::Source> = KVec::new();
         let mut publication_waits = KVec::new();
