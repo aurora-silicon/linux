@@ -2306,6 +2306,12 @@ pub(crate) fn encode_common26_bundle_policy(
     // The AON row the policy names: the board's first record (RT0g on J813 and J873).
     let record = board.aon_records.first().ok_or(InitdataError::BufferSize)?;
     put_u32(policy, 0x64e0, record[0]);
+    for &(offset, value) in board.policy_words {
+        if offset % 4 != 0 || offset + 4 > COMMON26_POLICY_SIZE {
+            return Err(InitdataError::BufferSize);
+        }
+        put_u32(policy, offset, value);
+    }
     put_u64(policy, COMMON26_POLICY_STATE_PTR, bindings.state);
     put_u64(policy, COMMON26_POLICY_AON_PTD_PTR, bindings.aon_ptd);
     put_u64(policy, COMMON26_POLICY_BOOT_TIMESTAMP, bindings.boot_timestamp);
@@ -2331,6 +2337,22 @@ pub(crate) fn encode_common26_board_region_c(out: &mut [u8]) -> Result<(), Initd
     out.copy_within(0x38..shifted, 0x3c);
     out[0x38..0x3c].fill(0);
     for (offset, value) in COMMON26_REGION_C_NEW_WORDS {
+        put_u32(out, offset, value);
+    }
+    Ok(())
+}
+
+/// Apply the board's own region-C words ([`Board::region_c_words`]) over the common 26A428
+/// region C [`encode_common26_board_region_c`] wrote.
+pub(crate) fn set_common26_region_c_words(board: &Board, out: &mut [u8])
+    -> Result<(), InitdataError> {
+    if out.len() != REGION_C_SIZE {
+        return Err(InitdataError::BufferSize);
+    }
+    for &(offset, value) in board.region_c_words {
+        if offset % 4 != 0 || offset + 4 > ABI_ALLOCATION_SIZES_26A428[ALLOC_REGION_C] {
+            return Err(InitdataError::BufferSize);
+        }
         put_u32(out, offset, value);
     }
     Ok(())
@@ -2393,6 +2415,14 @@ pub(crate) struct Board {
     pub(crate) register_slot_flags: Option<&'static [u32; COMMON26_HW_REGISTER_MAP_SLOTS]>,
     /// Region C's idle standby timer where the board's differs from the image's 1500 us, us.
     pub(crate) idle_standby_us: Option<u32>,
+    /// Words of the common 26A428 region C (offsets in its layout) where the board's own
+    /// firmware data differs from the J813-derived template [`encode_common26_board_region_c`]
+    /// writes, applied right after it.
+    pub(crate) region_c_words: &'static [(usize, u32)],
+    /// Words of the common 26A428 power policy block (offsets in that block) where the board's
+    /// own firmware data differs from the J813-derived template, applied by
+    /// [`encode_common26_bundle_policy`] before it writes the pointers and the boot timestamp.
+    pub(crate) policy_words: &'static [(usize, u32)],
     /// The active memory cache controller mask, where it differs from the inherited 0xf.
     mcc_mask: Option<u64>,
     /// The two topology words (16, and the core count), where the board sets them.
@@ -2431,6 +2461,8 @@ pub(crate) const J714: Board = Board {
     render_pool: (0x40_0000, 1 << 32),
     controller_defaults: Some(encode_m5_policy_controller_defaults),
     idle_standby_us: None,
+    region_c_words: &[],
+    policy_words: &[],
     mcc_mask: None,
     topology_words: None,
     hw_words: &[],
@@ -2461,6 +2493,8 @@ pub(crate) const J716C: Board = Board {
     // Its own controller configuration.
     controller_defaults: Some(encode_m5_policy_controller_defaults_j716c),
     idle_standby_us: None,
+    region_c_words: &[],
+    policy_words: &[],
     // The ADT GPU node's active-mcc-bit-vector: eight memory cache controllers.
     mcc_mask: Some(0xff),
     topology_words: Some((16, 40)),
@@ -2499,6 +2533,8 @@ pub(crate) const J775D: Board = Board {
     // The power model's synthetic leakage inputs.
     controller_defaults: Some(encode_m5_policy_controller_defaults_j775d),
     idle_standby_us: Some(3500),
+    region_c_words: &[],
+    policy_words: &[],
     // The ADT GPU node's active-mcc-bit-vector: eight memory cache controllers.
     mcc_mask: Some(0xff),
     topology_words: None,
@@ -2538,6 +2574,8 @@ pub(crate) const J813: Board = Board {
     render_pool: (0x20_0000, 1 << 31),
     controller_defaults: None,
     idle_standby_us: None,
+    region_c_words: &[],
+    policy_words: &[],
     // One memory cache controller (/arm-io/sgx active-mcc-bit-vector; 25G76 +0xf8c = 1).
     mcc_mask: Some(0x1),
     topology_words: None,
@@ -2554,6 +2592,127 @@ pub(crate) const J813: Board = Board {
 pub(crate) const J813_26B123: Board = Board {
     graph: &COMMON26B123_GRAPH,
     ..J813
+};
+
+/// M5 (T8142, MacBook Pro 14-inch J704): the J813's GPU (one cluster of ten core slots, all ten
+/// enabled on the measured part) on the same common 26A428 firmware interface, with one more
+/// performance state (thirteen, 338..1620 MHz) and its own power words.
+///
+/// Every value that differs from [`J813`] comes from the J704's own ADT (`/arm-io/sgx`) or from
+/// macOS 27.0's own InitData on a J704 (26A428, root word 0x0c8b_4339_83a0_04c0), captured under
+/// the m1n1 hypervisor; the rest is the J813's, which that capture matches where checked (register
+/// map and slot flags, HW words, MCC mask, perf scale and index map, region C apart from the words
+/// below). Region C and the power policy block take the J704's own words
+/// ([`J704_REGION_C_WORDS`], [`J704_POLICY_WORDS`]). Bring-up: no policy controller
+/// configuration yet, as on the J813.
+pub(crate) const J704: Board = Board {
+    // ADT sgx gpu-num-perf-states = 13 (perf-state-count = 14 with the off state); macOS 27.0's
+    // HW data +0x10e0 = 13.
+    perf_state_count: 13,
+    perf_states: &J704_GPU_PERF_STATES,
+    relative_frequency: relative_frequency(&J704_GPU_PERF_STATES, 1),
+    relative_power: Some(&J704_GPU_RELATIVE_POWER),
+    aon_records: &J704_AON_RECORDS,
+    // macOS 27.0's J704 HW data has these words exactly as the J813's does, except +0x1118: that
+    // is state 13's frequency (COMMON26_HW_PERF_FREQUENCY + 13 * 4), 0x654 = 1620 MHz on the
+    // J704, which the perf-state loop already writes; the J813's (0x1118, 0) would clear it.
+    hw_words: &[(0x0fa8, 0x8000), (0x0fb4, 2), (0x0fb8, 0), (0x1044, 0xc), (0x10a4, 0xa),
+                (0x10d4, 0x17), (0x2660, 4), (0x2720, 1), (0x2724, 0)],
+    // macOS 27.0's J704 region C +0x7c8: 2000 us (the J813 template has 1250).
+    idle_standby_us: Some(2000),
+    region_c_words: &J704_REGION_C_WORDS,
+    policy_words: &J704_POLICY_WORDS,
+    // The J704 has fans; the J813's (and J714's) curve start is kept, untested on this board.
+    ..J813
+};
+
+/// J704 ADT sgx perf-states (MHz, core mV) and perf-states-sram (mV): thirteen states after the
+/// off state, one voltage table (perf-state-table-count = 1). macOS 27.0's J704 HW data carries
+/// the same values at +0x10e4 (MHz), +0x1124 (core) and +0x1524 (SRAM), all sixteen lanes alike.
+pub(crate) const J704_GPU_PERF_STATES: [M5PerfState; 14] = one_table([
+    (0, 125, 770), (338, 610, 770), (486, 625, 770), (636, 655, 770),
+    (796, 700, 770), (888, 725, 770), (988, 745, 770), (1084, 775, 775),
+    (1182, 805, 805), (1278, 840, 840), (1374, 885, 885), (1470, 940, 940),
+    (1578, 1010, 1010), (1620, 1030, 1030),
+]);
+
+/// The J704's per-state relative performance (IEEE single, percent) from macOS 27.0's own J704
+/// HW data +0x19e4: 0, 11.52, 15.13, 20.03, 27.18, 31.89, 36.86, 43.31, 50.58, 59.33, 71.35,
+/// 87.47, 98.06, 100.0. (Its relative-frequency curve at +0x1a24 is exactly what
+/// [`relative_frequency`] computes from [`J704_GPU_PERF_STATES`] with floor 1.)
+const J704_GPU_RELATIVE_POWER: [u32; 14] = [
+    0, 0x4138_59bf, 0x4172_1ec4, 0x41a0_407d, 0x41d9_69aa, 0x41ff_2298, 0x4213_7266,
+    0x422d_41a1, 0x424a_5481, 0x426d_5023, 0x428e_b134, 0x42ae_ee33, 0x42c4_1dd3, 0x42c8_0000,
+];
+
+/// The J704's AON rows as macOS 27.0 hands them over on a J704 (its AON block at startup, every
+/// capture alike; the firmware reorders the rows later): RT0g first (table index 0x28 where the
+/// J813 has 0x1d; the policy names this row), then the rows tagged LFCR, LFXG and PLXG, which
+/// the J813's 25G76-derived table does not carry.
+const J704_AON_RECORDS: [[u32; 3]; 4] = [
+    [0x6730_5452, 0x0028_0001, 0x0000_1401],
+    [0x5243_464c, 0x00b1_0001, 0x0000_ff01],
+    [0x4758_464c, 0x014f_0001, 0x0000_ff01],
+    [0x4758_4c50, 0x014e_0001, 0x0000_ff01],
+];
+
+/// macOS 27.0's J704 region C where it differs from the J813-derived template (common 26A428
+/// offsets; every capture of that machine agrees): the power words at +0x88 (0x94de, J813 0x5eb0)
+/// and +0x8c, +0x90, +0x9c (0x514, J813 0x4b0), and +0x9b0, which the J873-derived template sets
+/// to 0x200 and the J704 leaves 0. +0x7c8 is [`Board::idle_standby_us`].
+const J704_REGION_C_WORDS: [(usize, u32); 5] =
+    [(0x088, 0x94de), (0x08c, 0x514), (0x090, 0x514), (0x09c, 0x514), (0x9b0, 0)];
+
+/// macOS 27.0's J704 power policy block (common 26A428, offsets in the policy block) where it
+/// differs from the J813-derived template [`encode_common26_bundle_policy`] writes, from the
+/// startup captures of that machine (all alike apart from the boot timestamp at +0x6c14). They
+/// are the J704's higher power limits (1300 where the template has 1200, 0x94de = 38110 where
+/// it has 0x5eb0 = 24240, the floats derived from them), its top frequency at +0x22b4 (0x654 =
+/// 1620 MHz, the template's 0x62a = 1578), and at +0x6560.. the policy's references to the AON
+/// rows after RT0g ([`J704_AON_RECORDS`]: LFCR, LFXG, a count of 3, PLXG). The state and AON
+/// pointers (+0x3d30, +0x64d8) and the boot timestamp are left to the encoder.
+const J704_POLICY_WORDS: [(usize, u32); 54] = [
+    (0x0048, 0x514), (0x0088, 0x514), (0x09f0, 0x4714de00), (0x09fc, 0xbd0bb8cc), (0x0a04, 0x514),
+    (0x0a08, 0x514), (0x0a14, 0x94de), (0x0a48, 0x514), (0x0abc, 0x514), (0x0acc, 0x94de),
+    (0x0b38, 0x4b), (0x0b84, 0x414a1af3), (0x0b8c, 0x514), (0x0ca0, 0x0), (0x22ac, 0x42c80000),
+    (0x22b0, 0x44a28000), (0x22b4, 0x654), (0x22c8, 0x64), (0x22d4, 0x514), (0x236c, 0x514),
+    (0x2370, 0x514), (0x23b0, 0x514), (0x2810, 0x5140000), (0x2854, 0x5140000), (0x2928, 0x514),
+    (0x2988, 0x10001), (0x2a88, 0x0), (0x2aa0, 0x94de), (0x2aa4, 0x94de), (0x2aa8, 0x94de),
+    (0x2bd0, 0x514), (0x2bd4, 0x514), (0x2bdc, 0x4714de00), (0x2be0, 0x94de), (0x2c14, 0x514),
+    (0x2d60, 0x514), (0x2e1c, 0x514), (0x2fb4, 0x514), (0x2fb8, 0x514), (0x301c, 0x4b0),
+    (0x3020, 0x514), (0x3024, 0x514), (0x3030, 0x514), (0x3064, 0x514), (0x30ac, 0x0),
+    (0x6560, 0x5243464c), (0x6564, 0x4758464c), (0x6568, 0x3), (0x6570, 0x47584c50),
+    (0x6574, 0x1), (0x6580, 0x1), (0x6c6c, 0x42e06667), (0x6cac, 0x44b30000),
+    (0x6cec, 0x42ca0000),
+];
+
+const _: () = {
+    // The J704 is the J813's GPU: same chip, graph, topology and register map.
+    assert!(J704.chip_id == J813.chip_id && J704.clusters == 1 && J704.gpu_cores == 10);
+    assert!(J704.perf_tables == 1 && !J704.hw_data_insert);
+    // Thirteen states: the top state (state 13) is the J704's own 1620 MHz, not a repeat.
+    assert!(J704.perf_states[13].0 == 1620 && J704.perf_states[12].0 == 1578);
+    assert!(J704.perf_state_count as usize + 1 == J704_GPU_PERF_STATES.len());
+    // The policy words leave the pointers and the boot timestamp to the encoder.
+    let mut p = 0;
+    while p < J704_POLICY_WORDS.len() {
+        let offset = J704_POLICY_WORDS[p].0;
+        assert!(offset + 4 <= COMMON26_POLICY_SIZE);
+        assert!(offset + 4 <= COMMON26_POLICY_STATE_PTR || offset >= COMMON26_POLICY_STATE_PTR + 8);
+        assert!(offset + 4 <= COMMON26_POLICY_AON_PTD_PTR
+            || offset >= COMMON26_POLICY_AON_PTD_PTR + 8);
+        assert!(offset + 4 <= COMMON26_POLICY_BOOT_TIMESTAMP
+            || offset >= COMMON26_POLICY_BOOT_TIMESTAMP + 8);
+        p += 1;
+    }
+    // No HW word may clear a frequency the perf-state loop wrote.
+    let mut i = 0;
+    while i < J704.hw_words.len() {
+        let offset = J704.hw_words[i].0;
+        assert!(offset < COMMON26_HW_PERF_FREQUENCY
+            || offset >= COMMON26_HW_PERF_FREQUENCY + 14 * 4);
+        i += 1;
+    }
 };
 
 const _: () = {

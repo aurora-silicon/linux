@@ -205,6 +205,9 @@ impl InitData {
             m::encode_common26_board_region_c(
                 &mut self.object_mut(self.region_c)?.bytes_mut()[..m::REGION_C_SIZE])
                 .map_err(|_| EINVAL)?;
+            m::set_common26_region_c_words(board,
+                &mut self.object_mut(self.region_c)?.bytes_mut()[..m::REGION_C_SIZE])
+                .map_err(|_| EINVAL)?;
             m::encode_common26_private_cluster(board.graph.profile, PRIVATE, FWCTL,
                 &mut self.object_mut(self.cluster)?.bytes_mut()[..private.total])
                 .map_err(|_| EINVAL)?;
