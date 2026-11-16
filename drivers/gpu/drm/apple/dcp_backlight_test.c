@@ -808,6 +808,66 @@ static void edr_timed_limits_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, dcp_edr_next_timed(15000, 16000, 16000, 60, 30, 8333), 16000U);
 }
 
+/* The K114s panel's ADT values: a 2000 nit peak, a potential headroom of 16. */
+#define EDR_K114S_PEAK		2000U
+#define EDR_K114S_CEILING	0x100000U
+
+static void edr_peak_test(struct kunit *test)
+{
+	/* No cap: the ADT's peak, when it is above the SDR maximum. */
+	KUNIT_EXPECT_EQ(test, dcp_edr_peak(EDR_K114S_PEAK, 1000, 0), 2000U);
+	KUNIT_EXPECT_EQ(test, dcp_edr_peak(1000, 1000, 0), 0U);
+	KUNIT_EXPECT_EQ(test, dcp_edr_peak(0, 1000, 0), 0U);
+	KUNIT_EXPECT_EQ(test, dcp_edr_peak(10000, 1000, 0), 10000U);
+	KUNIT_EXPECT_EQ(test, dcp_edr_peak(10001, 1000, 0), 0U);
+	/* A cap above the SDR maximum lowers the peak; one at or below it ends EDR. */
+	KUNIT_EXPECT_EQ(test, dcp_edr_peak(EDR_K114S_PEAK, 1000, 1600), 1600U);
+	KUNIT_EXPECT_EQ(test, dcp_edr_peak(EDR_K114S_PEAK, 1000, 4000), 2000U);
+	KUNIT_EXPECT_EQ(test, dcp_edr_peak(EDR_K114S_PEAK, 1000, 1001), 1001U);
+	KUNIT_EXPECT_EQ(test, dcp_edr_peak(EDR_K114S_PEAK, 1000, 1000), 0U);
+	KUNIT_EXPECT_EQ(test, dcp_edr_peak(EDR_K114S_PEAK, 1000, 500), 0U);
+	/* A cap never makes an out-of-range ADT peak usable. */
+	KUNIT_EXPECT_EQ(test, dcp_edr_peak(20000, 1000, 500), 0U);
+	/* An unknown SDR maximum: no cap, the ADT's peak; with a cap, no EDR. */
+	KUNIT_EXPECT_EQ(test, dcp_edr_peak(EDR_K114S_PEAK, 0, 0), 2000U);
+	KUNIT_EXPECT_EQ(test, dcp_edr_peak(EDR_K114S_PEAK, 0, 500), 0U);
+	KUNIT_EXPECT_EQ(test, dcp_edr_peak(EDR_K114S_PEAK, 0, 1600), 0U);
+}
+
+/*
+ * Whatever SDR white is, a ramp to the headroom the capped peak leaves asks
+ * the panel for at most SDR white or that peak, at every swap.
+ */
+static void edr_peak_bound_test(struct kunit *test)
+{
+	static const u32 sdr[] = { 1, 10, 100, 250, 400, 499, 500, 600, 1000 };
+	static const u32 caps[] = { 500, 1001, 1600 };
+	u32 ceiling = dcp_edr_ceiling(EDR_K114S_CEILING);
+
+	KUNIT_ASSERT_EQ(test, ceiling, 16000U);
+	for (unsigned int c = 0; c < ARRAY_SIZE(caps); c++) {
+		/* A panel whose SDR maximum is 400 nits, so every cap leaves headroom. */
+		u32 peak = dcp_edr_peak(EDR_K114S_PEAK, 400, caps[c]);
+
+		KUNIT_ASSERT_EQ(test, peak, caps[c]);
+		for (unsigned int i = 0; i < ARRAY_SIZE(sdr); i++) {
+			u32 target = dcp_edr_target(peak, sdr[i], ceiling);
+			u32 hm = DCP_EDR_UNITY;
+			unsigned int swaps = 0;
+
+			do {
+				u64 bri;
+
+				hm = dcp_edr_next_timed(hm, target, target, sdr[i], sdr[i],
+							DCP_EDR_TICK_US);
+				bri = (u64)sdr[i] * hm / DCP_EDR_UNITY;
+				KUNIT_EXPECT_LE(test, bri, (u64)max(sdr[i], peak));
+				KUNIT_ASSERT_LT(test, ++swaps, 1000U);
+			} while (hm != target);
+		}
+	}
+}
+
 static struct kunit_case backlight_cases[] = {
 	KUNIT_CASE(backlight_reports_keep_target_test),
 	KUNIT_CASE(backlight_millinits_takeover_test),
@@ -836,6 +896,8 @@ static struct kunit_case backlight_cases[] = {
 	KUNIT_CASE(edr_start_ramp_test),
 	KUNIT_CASE(edr_timed_ramp_test),
 	KUNIT_CASE(edr_timed_limits_test),
+	KUNIT_CASE(edr_peak_test),
+	KUNIT_CASE(edr_peak_bound_test),
 	{}
 };
 

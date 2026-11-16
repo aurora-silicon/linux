@@ -1191,6 +1191,18 @@ void dcp_panel_read_dimensions(struct apple_dcp *dcp, struct device_node *panel_
  * keep per-display settings such as its brightness.  The identity state is
  * allocated at probe (bind may fail and run again); bind fills it in.
  */
+/*
+ * A firmware 27 panel shows PQ content as EDR: a swap asks the panel for SDR
+ * white times the headroom, up to the panel's peak (the ADT's LmaxProduct).
+ * This caps that peak.  A cap at or below the panel's SDR maximum leaves no
+ * headroom, so the panel offers no EDR at all: its EDID advertises no PQ and
+ * PQ commits are refused.  Read once, when the display processor binds.
+ */
+static unsigned int fw27_panel_edr_max_nits;
+module_param(fw27_panel_edr_max_nits, uint, 0444);
+MODULE_PARM_DESC(fw27_panel_edr_max_nits,
+		 "Firmware 27 panels: most nits an EDR swap may ask for, 0 for the panel's peak (default: 0)");
+
 static void dcp_panel_read_adt(struct apple_dcp *dcp)
 {
 	bool desktop = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
@@ -1240,14 +1252,26 @@ static void dcp_panel_read_adt(struct apple_dcp *dcp)
 	/*
 	 * Firmware 27 reports no peak (desktop 26.x: res_max_panel_brightness()).
 	 * The ADT's LmaxProduct gives it (1600 nits on the M5 Pro).  Only a peak
-	 * above the SDR range gives headroom.
+	 * above the SDR range gives headroom, and fw27_panel_edr_max_nits caps it.
 	 */
 	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
-		u32 peak = panel.lmax_product >> 16;
+		u32 adt_peak = panel.lmax_product >> 16;
+		u32 cap = READ_ONCE(fw27_panel_edr_max_nits);
+		u32 peak = dcp_edr_peak(adt_peak, dcp->brightness.maximum, cap);
 
-		if (peak > dcp->brightness.maximum && peak <= 10000) {
-			dev_info(dcp->dev, "panel peak luminance %u nits (ADT)\n", peak);
+		if (peak) {
+			dev_info(dcp->dev, "panel peak luminance %u nits (ADT)\n", adt_peak);
+			if (peak < adt_peak)
+				dev_info(dcp->dev, "panel EDR capped at %u nits\n", peak);
 			WRITE_ONCE(dcp->panel.peak_nits, peak);
+		} else if (cap && !dcp->brightness.maximum && adt_peak && adt_peak <= 10000) {
+			dev_info(dcp->dev,
+				 "panel EDR off: cap %u nits set and the SDR maximum is unknown\n",
+				 cap);
+		} else if (cap && dcp_edr_peak(adt_peak, dcp->brightness.maximum, 0)) {
+			dev_info(dcp->dev,
+				 "panel EDR off: cap %u nits is not above the SDR maximum %u nits\n",
+				 cap, dcp->brightness.maximum);
 		}
 	}
 	dev_info(dcp->dev, "panel ADT: %s, panel node %s, dimensions %ux%u mm\n",
