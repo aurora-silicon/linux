@@ -8405,6 +8405,18 @@ static int dcp_s2r_stop_crashed(struct apple_dcp *dcp)
 	return 0;
 }
 
+/* An EDR step must not kick a present once the mailbox stops for sleep. The
+ * tick re-arms while a present with a surface is prepared (dcp_edr_prepare_v27),
+ * so every suspend path cancels it as its last step before the firmware goes
+ * down or the mailbox is held, and nothing between cancel and stop can arm it
+ * again.
+ */
+static void dcp_edr_tick_stop(struct apple_dcp *dcp)
+{
+	WRITE_ONCE(dcp->edr_ramping, false);
+	cancel_delayed_work_sync(&dcp->iomfb.edr_tick);
+}
+
 static int dcp_s2r_ext_suspend(struct apple_dcp *dcp)
 {
 	int ret;
@@ -8456,6 +8468,7 @@ static int dcp_s2r_ext_suspend(struct apple_dcp *dcp)
 	/* The display's link went above: its crossbar output follows, as on macOS. */
 	dcp_typec_route_park(dcp);
 
+	dcp_edr_tick_stop(dcp);
 	ret = dcp_s2r_500(dcp);
 	if (ret) {
 		dev_err(dcp->dev, "no reply to A500: %d\n", ret);
@@ -8530,6 +8543,7 @@ static int dcp_s2r_suspend(struct apple_dcp *dcp)
 		return -EBUSY;
 	}
 
+	dcp_edr_tick_stop(dcp);
 	/* Presentation stays paused if this fails: see dcp_s2r_quiesce(). */
 	was_off = dcp->s2r_refused_off;
 	ret = dcp_s2r_stop_firmware(dcp);
@@ -9488,9 +9502,6 @@ static int dcp_platform_suspend(struct device *dev)
 	}
 
 	dcp_drain_for_sleep(dcp);
-	/* An EDR step must not kick a present once the mailbox is held. */
-	WRITE_ONCE(dcp->edr_ramping, false);
-	cancel_delayed_work_sync(&dcp->iomfb.edr_tick);
 	/*
 	 * The Type-C route reports cable removal through
 	 * dcp_dptx_disconnect_oob(). A DP tunnel kept through the sleep stays
@@ -9518,7 +9529,9 @@ static int dcp_platform_suspend(struct device *dev)
 	 * shutdown properly yet.
 	 */
 	device_set_wakeup_path(dev);
-	/* Last: the steps above still talk to the coprocessor. */
+	/* Last: the steps above still talk to the coprocessor. A tick armed by a
+	 * present between the drain and here would kick after the hold. */
+	dcp_edr_tick_stop(dcp);
 	dcp_hold_for_sleep(dcp);
 
 	return 0;

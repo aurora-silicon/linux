@@ -1601,6 +1601,7 @@ static int dcp_v27_sleep_suspend(struct apple_dcp *dcp)
 {
 	int ret;
 
+	dcp_edr_tick_stop(dcp);
 	if (dcp->sleep_v27)
 		dcp->sleep_v27->steps_len = 0;
 	ret = dcp_v27_sleep_prepare(dcp);
