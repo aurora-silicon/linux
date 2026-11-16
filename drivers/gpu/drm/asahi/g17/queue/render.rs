@@ -1728,9 +1728,20 @@ impl Pair {
     /// Sample PM feedback only after this pair's exact retirement. Busy pairs
     /// keep their current capacity and let firmware request growth as needed.
     pub(crate) fn host_growth_target(&mut self, packet: &Packet) -> Result<Option<usize>> {
-        let required =
+        let mut required =
             m5_render_submission::layout(&packet.command, self.clusters, self.variant.programs)?
                 .tvb_blocks;
+        // A mesh workgroup whose output is in flight when the tiler heap runs out loses part of
+        // it, whether the firmware then grows the heap or partial-renders, and the tile-count
+        // estimate does not see mesh output. Size the heap of a render with mesh shading ahead
+        // of it, to the size its automatic growth reaches after one such render.
+        if matches!(&packet.command, Validated::Render { pass, resources, .. }
+            if pass.mesh_output || resources.as_ref().is_some_and(|p| p.uses_mesh()))
+        {
+            if let Some(floor) = self.memory.manager.mesh_floor() {
+                required = required.max(floor);
+            }
+        }
         self.memory
             .manager
             .note_required(required, crate::g17::now_ns());

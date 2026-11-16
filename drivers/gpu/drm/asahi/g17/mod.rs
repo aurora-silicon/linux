@@ -2505,6 +2505,10 @@ impl gpu::Gpu for Gpu {
         if variant.few_primitives {
             params.features |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FEW_PRIMITIVES);
         }
+        // Only the A18 Pro heap sizes itself for it; other command sets accept the hint too.
+        if !variant.m5_commands {
+            params.features |= crate::file::DRM_ASAHI_FEATURE_RENDER_MESH_OUTPUT;
+        }
         // The M5 command set reports it with M5_FEATURES.
         if !variant.m5_commands && variant.render_stage_prefixes {
             params.features |= crate::file::DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2;
