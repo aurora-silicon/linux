@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * J716c sleep resources. This is a disabled description, not a sleep enable.
+ * J716c sleep resources. The sleep controller and coprocessors remain disabled;
+ * the PMU RTC is enabled for counter and alarm qualification while awake.
  * The native EL2 resume path and a J716c transition profile must be qualified
- * before enabling this node. In particular, no J714s commit schedule, clock
+ * before enabling the sleep node. In particular, no J714s commit schedule, clock
  * programming, MCC stop masks or SMC timings are inherited here.
  *
  * The common apertures are inside the J716c hardware description's ranges.
@@ -94,14 +95,18 @@
 	};
 };
 
-/* Alarm hardware is present. Keep it disabled until the wake path is qualified. */
+/*
+ * Abbey's counter and alarm layout match the J716c hardware description. The
+ * generation 4 SPMI controller has no Linux PMU alarm IRQ yet; enabling the RTC
+ * alone does not qualify the platform wake route or deep sleep.
+ */
 &pmu {
 	pmu_rtc: rtc {
 		compatible = "apple,t6050-pmu-rtc", "apple,t6041-pmu-rtc";
 		nvmem-cells = <&rtc_offset>;
 		nvmem-cell-names = "rtc_offset";
 		wakeup-source;
-		status = "disabled";
+		status = "okay";
 	};
 };
 
