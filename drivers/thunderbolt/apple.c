@@ -171,6 +171,8 @@ struct apple_cio_hw {
 	bool gen4_link_recovery;
 	/* Leave the host router's TMU to its firmware; host TMU constants. */
 	bool host_tmu;
+	/* Every router's TMU in bi-directional HiFi, as macOS runs it. */
+	bool tmu_hifi_bi;
 	const struct apple_dpin_policy *dp;
 };
 
@@ -234,6 +236,12 @@ static const struct apple_cio_hw apple_cio_t6050_hw = {
 	.no_asym = true,
 	.gen4_link_recovery = true,
 	.host_tmu = true,
+	/*
+	 * macOS runs a Studio Display's router in bi-directional HiFi with the host's time posted;
+	 * a router that already reads as bi-directional HiFi is otherwise left without the time,
+	 * and the display drops HPD a second into 5K.
+	 */
+	.tmu_hifi_bi = true,
 	.dp = &apple_dpin_m5,
 };
 
@@ -2706,6 +2714,8 @@ static int apple_nhi_probe(struct platform_device *pdev)
 		anhi->nhi.quirks |= QUIRK_GEN4_LINK_RECOVERY;
 	if (acio->hw->host_tmu)
 		anhi->nhi.quirks |= QUIRK_HOST_TMU;
+	if (acio->hw->tmu_hifi_bi)
+		anhi->nhi.quirks |= QUIRK_TMU_HIFI_BI;
 
 	/*
 	 * TEST: T6050 takes the vendor sleep and the state transfer as the J713 does (macOS,
