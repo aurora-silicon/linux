@@ -232,7 +232,9 @@ pub(crate) const T8103: PlatformProfile = PlatformProfile {
         cpx_encryption_mode: 2,
     },
     persistent_enrol: true,
-    per_user_keybags: false,
+    // User-bag create, designate, import/export, unlock, lock and password
+    // change on the 13.5 key store, proven on J293 hardware (cold-boot SEP).
+    per_user_keybags: true,
     nonce_session: false,
     // Off: Touch ID setup on a cold-boot SEP rewrites a session record that
     // predates Linux, so the guard would only block it.
