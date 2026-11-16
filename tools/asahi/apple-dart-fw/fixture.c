@@ -70,6 +70,9 @@ struct apple_dart {
 	bool cio_active;
 	phys_addr_t locked_phys[2][4];
 	struct io_pgtable_cfg *locked_cfg[2];
+	/* A J714s display sleep's and its firmware 27 provider's, never set here. */
+	struct device *m5_sleep_owner;
+	bool v27_provider, v27_lost;
 };
 struct apple_dart_stream_map {struct apple_dart*dart;unsigned long sidmap[1];};
 struct apple_dart_atomic_stream_map {struct apple_dart*dart;unsigned long sidmap[1];};
@@ -151,6 +154,15 @@ static void apple_dart_sleep_writer_put(struct apple_dart *dart, int gate)
 	(void)dart;
 	assert(gate == APPLE_DART_WRITER_COUNTED && writers > 0);
 	writers--;
+}
+
+/* The stream maps a device or domain has, as the fixture's arrays hold them. */
+#define MAX_DARTS_PER_DEVICE 2
+/* Only a J714s firmware 27 provider DART lists its clients; none is one here. */
+static void apple_dart_v27_client_remove(struct apple_dart_stream_map *map)
+{
+	if (map->dart->v27_provider)
+		abort();
 }
 #define dev_info(d,...) ((void)0)
 /* PRODUCTION */

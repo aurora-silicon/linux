@@ -24,8 +24,10 @@
 #include <linux/irqdomain.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
+#include <linux/soc/apple/spmi-fifo.h>
 #include <linux/spinlock.h>
 #include <linux/spmi.h>
 #include <linux/suspend.h>
@@ -62,6 +64,8 @@
 #define SPMI_GEN4_IRQ_ACK_BASE 0x600
 #define SPMI_GEN4_FAULT_IRQ (SPMI_MAX_PERIPHERAL_IRQS + 7)
 #define SPMI_FAULT_QUEUE_MAX 64
+/* More than the reply FIFO holds: the bound of a recovery's read-out. */
+#define SPMI_GEN4_REPLY_DRAIN_MAX 64
 
 #define REG_POLL_INTERVAL_US 10000
 #define REG_POLL_TIMEOUT_US (REG_POLL_INTERVAL_US * 5)
@@ -226,6 +230,33 @@ static int apple_spmi_wait_rx_not_empty(struct spmi_controller *ctrl)
 	return 0;
 }
 
+/*
+ * Generation 4 after a failed exchange. Its FIFO flush is not known, so the reply that came
+ * late, or the stray one that was read in a reply's place, is read out instead: the bus gets a
+ * command's whole timeout to finish, then the reply FIFO is read until it is empty. Nothing of
+ * an old exchange can then answer a new command. A FIFO that does not empty keeps the failure.
+ * On the J714s only, the board this is for; on every other generation 4 machine a failed
+ * exchange refuses the later commands, as before.
+ */
+static int apple_spmi_gen4_recover(struct spmi_controller *ctrl, struct apple_spmi *spmi)
+{
+	unsigned int i;
+
+	if (!of_machine_is_compatible("apple,j714s"))
+		return -EIO;
+	usleep_range(REG_POLL_TIMEOUT_US, 2 * REG_POLL_TIMEOUT_US);
+	for (i = 0; i < SPMI_GEN4_REPLY_DRAIN_MAX; i++) {
+		if (readl(spmi->regs + spmi->hw->status) & spmi->hw->rx_empty) {
+			dev_warn(&ctrl->dev,
+				 "recovered from a failed exchange, %u stale words dropped\n", i);
+			return 0;
+		}
+		readl(spmi->regs + spmi->hw->reply);
+	}
+	dev_err_ratelimited(&ctrl->dev, "reply FIFO does not empty\n");
+	return -EIO;
+}
+
 static int __spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid, u16 param,
 			  const u8 *buf_wr, size_t len_wr, u8 *buf_rd, size_t len_rd)
 {
@@ -237,10 +268,14 @@ static int __spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid, u16 para
 
 	if (spmi->prev_fail) {
 		/* Do not consume a late reply as the reply to a new command. */
-		if (!spmi->hw->legacy_irqs)
-			return -EIO;
-		writel(SPMI_ACT_FIFO_FLUSH, spmi->regs + SPMI_ACT_REG);
-		apple_spmi_irq_ack_raw(spmi, spmi->hw->num_irqs);
+		if (!spmi->hw->legacy_irqs) {
+			ret = apple_spmi_gen4_recover(ctrl, spmi);
+			if (ret)
+				return ret;
+		} else {
+			writel(SPMI_ACT_FIFO_FLUSH, spmi->regs + SPMI_ACT_REG);
+			apple_spmi_irq_ack_raw(spmi, spmi->hw->num_irqs);
+		}
 		spmi->prev_fail = false;
 	}
 	reinit_completion(&spmi->fifo_rx);
@@ -792,6 +827,31 @@ static struct platform_driver apple_spmi_driver = {
 		.pm	= pm_sleep_ptr(&apple_spmi_pm_ops),
 	},
 };
+
+/*
+ * For the sleep controller's by-hand PMU commands, sent where this driver's own exchange (a
+ * mutex, a sleeping poll) can't run. The lock is only tried: a holder means an exchange of
+ * ours is under way, and the caller keeps off the bus.
+ */
+int apple_spmi_fifo_trylock(struct device *dev)
+{
+	struct apple_spmi *spmi;
+
+	if (dev->driver != &apple_spmi_driver.driver)
+		return -ENODEV;
+	spmi = dev_get_drvdata(dev);
+	return mutex_trylock(&spmi->fifo_lock) ? 0 : -EBUSY;
+}
+EXPORT_SYMBOL_GPL(apple_spmi_fifo_trylock);
+
+void apple_spmi_fifo_unlock(struct device *dev)
+{
+	struct apple_spmi *spmi = dev_get_drvdata(dev);
+
+	mutex_unlock(&spmi->fifo_lock);
+}
+EXPORT_SYMBOL_GPL(apple_spmi_fifo_unlock);
+
 module_platform_driver(apple_spmi_driver);
 
 MODULE_AUTHOR("Jean-Francois Bortolotti <jeff@borto.fr>");

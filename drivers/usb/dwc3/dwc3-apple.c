@@ -254,6 +254,10 @@ struct dwc3_apple {
 	struct work_struct sleep_start_work;
 	/* The chain left the stop running. Only the suspending task reads and writes this. */
 	bool sleep_stop_behind;
+	/* The start after a sleep may find its Type-C PHY not started yet: the role switch follows. */
+	bool sleep_phy_wait;
+	/* The start after a sleep was left to the role switch, which may also come too early. */
+	bool sleep_phy_pending;
 
 	void __iomem *drd_regs[DWC3_APPLE_NR_DRD_REGS];
 	struct apple_tunable *tunables[DWC3_APPLE_NR_TUNABLES];
@@ -858,7 +862,10 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
 
 	ret = reset_control_deassert(appledwc->reset);
 	if (ret) {
-		dev_err(appledwc->dev, "Failed to deassert reset, err=%d\n", ret);
+		if (ret == -ENOLINK && appledwc->sleep_phy_wait)
+			dev_dbg(appledwc->dev, "PHY not started yet, reset kept\n");
+		else
+			dev_err(appledwc->dev, "Failed to deassert reset, err=%d\n", ret);
 		/* Nothing was started: drop the reference again. */
 		ret_reset = dwc3_apple_core_stop(appledwc);
 		if (ret_reset)
@@ -1050,6 +1057,17 @@ static void dwc3_apple_check_hub_later(struct dwc3_apple *appledwc)
 }
 
 /*
+ * Two things are in force on the board they have run on, the J714s: a running host is stopped
+ * for a deep sleep from a work instead of inside the PM notifier chain, and a Type-C port's
+ * PHY that is not started after a sleep is waited for. Elsewhere, other boards with the same
+ * SoC included, both are as before.
+ */
+static bool dwc3_apple_sleep_board(void)
+{
+	return of_machine_is_compatible("apple,j714s");
+}
+
+/*
  * Bring a controller up again after a sleep that stopped it or lost it. A fixed-hub host
  * starts as at probe, where the core has no role yet, so dwc3_core_soft_reset() runs too:
  * rebinding the driver brought the J700's hub back where a restart without it didn't.
@@ -1061,7 +1079,25 @@ static int dwc3_apple_start_after_sleep(struct dwc3_apple *appledwc, enum dwc3_a
 	lockdep_assert_held(&appledwc->lock);
 	if (appledwc->fixed_hub)
 		appledwc->dwc.current_dr_role = 0;
+	/*
+	 * After a real sleep a Type-C port's PHY starts with the port controller's mode request,
+	 * and the role switch that follows it starts the controller, as at a plug-in.
+	 * A sleep given up after the port controllers went to their sleep state leaves the PHY
+	 * stopped in the same way, so this doesn't ask whether the sleep was a real one: a PHY
+	 * that kept running never reports -ENOLINK. On the board that has run on; elsewhere
+	 * the error is an error, as before.
+	 */
+	appledwc->sleep_phy_wait = !appledwc->fixed_hub && appledwc->role_sw &&
+				   dwc3_apple_sleep_board();
 	ret = dwc3_apple_init(appledwc, state);
+	if (ret == -ENOLINK && appledwc->sleep_phy_wait) {
+		appledwc->sleep_phy_wait = false;
+		appledwc->sleep_phy_pending = true;
+		dev_info(appledwc->dev, "waiting for the Type-C port to start the PHY after the sleep\n");
+		return 0;
+	}
+	appledwc->sleep_phy_wait = false;
+	appledwc->sleep_phy_pending = false;
 	if (ret) {
 		dev_err(appledwc->dev, "Failed to start after sleep, err=%d\n", ret);
 		return ret;
@@ -1269,11 +1305,22 @@ static int dwc3_usb_role_switch_set(struct usb_role_switch *sw, enum usb_role ro
 	switch (role) {
 	case USB_ROLE_NONE:
 		/* Nothing to do if no cable is connected */
+		appledwc->sleep_phy_pending = false;
 		return 0;
 	case USB_ROLE_HOST:
-		return dwc3_apple_init(appledwc, DWC3_APPLE_HOST);
 	case USB_ROLE_DEVICE:
-		return dwc3_apple_init(appledwc, DWC3_APPLE_DEVICE);
+		/*
+		 * While the start after a sleep waits for the PHY, a role switch can still come
+		 * before the port controller's mode request. The error goes back as it is, so the
+		 * port controller tries again, without a line in the log.
+		 */
+		appledwc->sleep_phy_wait = appledwc->sleep_phy_pending;
+		ret = dwc3_apple_init(appledwc, role == USB_ROLE_HOST ? DWC3_APPLE_HOST :
+				      DWC3_APPLE_DEVICE);
+		appledwc->sleep_phy_wait = false;
+		if (ret != -ENOLINK)
+			appledwc->sleep_phy_pending = false;
+		return ret;
 	default:
 		dev_err(appledwc->dev, "Invalid target role: %d\n", role);
 		return -EINVAL;

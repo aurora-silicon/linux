@@ -21,6 +21,7 @@
 #include <linux/regmap.h>
 #include <linux/workqueue.h>
 #include <linux/slab.h>
+#include <linux/suspend.h>
 #include <linux/acpi.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
@@ -1359,6 +1360,7 @@ static void cs42l84_i2c_remove(struct i2c_client *i2c_client)
 
 	gpiod_set_value_cansleep(cs42l84->reset_gpio, 0);
 }
+
 
 static const struct of_device_id cs42l84_of_match[] = {
 	{ .compatible = "cirrus,cs42l84", },

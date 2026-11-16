@@ -29,6 +29,7 @@
 #include <linux/iopoll.h>
 #include <linux/of_platform.h>
 #include <linux/suspend.h>
+#include <linux/soc/apple/dcp-v27-sleep.h>
 #include <linux/property.h>
 #include <linux/soc/apple/aura-hibernate.h>
 #include <linux/random.h>
@@ -45,6 +46,7 @@
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_color_mgmt.h>
+#include <drm/drm_atomic.h>
 #include <drm/drm_edid.h>
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_file.h>
@@ -457,6 +459,32 @@ static bool s2r_untested;
 module_param(s2r_untested, bool, 0444);
 MODULE_PARM_DESC(s2r_untested,
 		 "Stop the DCP for a deep sleep and DPMS off on SoCs where that path is untested (default 0)");
+
+/*
+ * T6050: a firmware sleep with a display on a USB-C port, and the external display
+ * processors' wake. 1: the display is released before the sleep as an unplugged one is and
+ * comes back after the wake as a newly plugged one, and every external display processor
+ * gets the wake's two calls (A500's wake form, then the power state with the sleep's flags),
+ * as macOS does. Without them the firmware's hard power state stays off and a display
+ * plugged in after the wake stays dark. 0: such a sleep is refused and the external
+ * processors get no wake call.
+ */
+static int t6050_ext_sleep = 1;
+module_param(t6050_ext_sleep, int, 0644);
+MODULE_PARM_DESC(t6050_ext_sleep,
+		 "T6050: release a USB-C display for a firmware sleep and plug it again after the wake (default 1; 0: refuse the sleep)");
+
+/*
+ * What a T6050 external display processor gained outside the firmware 27 sleep itself (the
+ * Type-C reconnect skipped for a crashed one, a crashed one refusing a deep sleep before
+ * anything is stopped, the link line) is in force on the board it has run on, the J714s.
+ * Elsewhere, other boards with the same SoC included, these are as before.
+ */
+static bool dcp_j714s_ext(struct device *dev)
+{
+	return of_machine_is_compatible("apple,j714s") &&
+	       of_device_is_compatible(dev->of_node, "apple,t6050-dcpext");
+}
 
 bool dcp_t6041_ext_enabled(void)
 {
@@ -1494,6 +1522,10 @@ static void dcp_delayed_vblank(struct work_struct *work)
 
 static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
 {
+	if (IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) &&
+	    dcp->v27_j714s && endpoint >= 0x20 && endpoint < 0x40 &&
+	    READ_ONCE(dcp->sleep_v27_ep[endpoint - 0x20]))
+		return READ_ONCE(dcp->sleep_v27_ep[endpoint - 0x20]);
 	/* The auxiliary endpoints of a desktop 26.x processor. */
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
 	    endpoint >= 0x20 && endpoint < 0x40) {
@@ -1506,6 +1538,13 @@ static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
 	/* The J700 DCPEXT's audio service sits on endpoint 0x2b, not AV 0x29. */
 	if (!IS_ERR_OR_NULL(dcp->avep) && endpoint == dcp->avep->endpoint)
 		return dcp->avep;
+	/* A firmware 27 panel's AV and DP services (J714s: dcp->v27_j714s). */
+	if (dcp->v27_j714s && endpoint >= 0x20 && endpoint < 0x40) {
+		struct apple_dcp_afkep *ep = READ_ONCE(dcp->panelav[endpoint - 0x20]);
+
+		if (ep)
+			return ep;
+	}
 	/* DPAV 0x2a on H17P overlaps the legacy DPTX endpoint number. */
 	if (dcp->dcpavservep && endpoint == dcp->dcpavservep->endpoint)
 		return dcp->dcpavservep;
@@ -1635,6 +1674,7 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 {
 	struct apple_dcp *dcp = cookie;
 	struct apple_dcp_afkep *ep;
+	int ret;
 
 	if (READ_ONCE(dcp->quiescing))
 		return;
@@ -1647,6 +1687,11 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 	/* A failed T8122 dcpext: its firmware may still talk, nobody listens. */
 	if (READ_ONCE(dcp->ext_dead))
 		return;
+	/* Include traffic hidden by the fail-stop logging branch below. */
+	if (IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) &&
+	    dcp->v27_j714s && endpoint >= 0x20 &&
+	    endpoint != IOMFB_ENDPOINT && !dcp_afkep(dcp, endpoint))
+		WRITE_ONCE(dcp->sleep_v27_unhandled, true);
 
 	/*
 	 * H17P starts endpoints that have no AFK instance behind them (the
@@ -1672,7 +1717,9 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 		return;
 	}
 
-	afk_receive_message(ep, message);
+	ret = afk_receive_message(ep, message);
+	if (ret && IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) && dcp->v27_j714s)
+		WRITE_ONCE(dcp->sleep_v27_unhandled, true);
 }
 
 static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_size)
@@ -1808,7 +1855,33 @@ static void dcp_rtk_shmem_destroy(void *cookie, struct apple_rtkit_shmem *bfr)
 		dma_free_coherent(dcp->dev, bfr->size, bfr->buffer, bfr->iova);
 }
 
+/*
+ * The firmware names its own choice in the line of every mode set it makes, "... DSC=YES VRR=NO
+ * link: 1": kept for the link report. The line stays at info.
+ */
+static bool dcp_rtk_syslog_mode_set(void *cookie, const char *context, const char *message)
+{
+	struct apple_dcp *dcp = cookie;
+
+	if (strstr(message, "mode_set_gated")) {
+		if (strstr(message, "DSC=YES"))
+			WRITE_ONCE(dcp->link_dsc, 1);
+		else if (strstr(message, "DSC=NO"))
+			WRITE_ONCE(dcp->link_dsc, 2);
+	}
+	return false;
+}
+
 static struct apple_rtkit_ops rtkit_ops = {
+	.crashed = dcp_rtk_crashed,
+	.recv_message = dcp_recv_msg,
+	.shmem_setup = dcp_rtk_shmem_setup,
+	.shmem_destroy = dcp_rtk_shmem_destroy,
+};
+
+/* For a processor with the link report (hw.link_report): its log lines are searched. */
+static const struct apple_rtkit_ops link_report_rtkit_ops = {
+	.syslog_is_debug = dcp_rtk_syslog_mode_set,
 	.crashed = dcp_rtk_crashed,
 	.recv_message = dcp_recv_msg,
 	.shmem_setup = dcp_rtk_shmem_setup,
@@ -3368,6 +3441,15 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 	struct dcp_fabric_session session;
 	int ret;
 
+	/*
+	 * A crashed processor answers nothing: each call of a connect would run to its limit
+	 * (five tries, a dozen seconds of them). Its port is left alone instead, once and said.
+	 */
+	if (READ_ONCE(dcp->crashed) && dcp_j714s_ext(dcp->dev)) {
+		dev_warn(dcp->dev, "Type-C DPTX connect skipped: the display processor has crashed; its port is left alone until a reboot\n");
+		return;
+	}
+
 	/* A route following its CRTC hands the link over itself. */
 	if ((dcp->external && dcpext_scanout_terminal(dcp)) ||
 	    !READ_ONCE(dcp->typec_cable_connected) ||
@@ -3770,6 +3852,8 @@ int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 	}
 
 	if (dcp_is_typec_output(dcp)) {
+		/* A display again: the one released for a firmware sleep, or a new one. */
+		WRITE_ONCE(dcp->sleep_v27_torn, false);
 		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 		guard(mutex)(&dcp->hpd_mutex);
 		dcp_typec_attach_locked(dcp);
@@ -4528,6 +4612,14 @@ int dcp_start(struct platform_device *pdev)
 	if (ret) {
 		dev_err(dcp->dev, "Failed to start IOMFB endpoint: %d\n", ret);
 		return ret;
+	}
+
+	/* On the board they have run on; elsewhere these endpoints are not started, as before. */
+	if (dcp->v27_j714s && !dcp->external && dcp_has_panel(dcp)) {
+		ret = panelavep_init(dcp);
+		if (ret)
+			dev_warn(dcp->dev, "panel AV and DP services not started: %d\n", ret);
+		ret = 0;
 	}
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
@@ -6258,6 +6350,8 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		dcp->rtk = apple_rtkit_init(dev, dcp, "mbox", 0,
 					    &external_h17p_rtkit_ops);
+	else if (dcp->hw.link_report)
+		dcp->rtk = apple_rtkit_init(dev, dcp, "mbox", 0, &link_report_rtkit_ops);
 	else
 		dcp->rtk = apple_rtkit_init(dev, dcp, "mbox", 0, &rtkit_ops);
 	if (IS_ERR(dcp->rtk)) {
@@ -6352,6 +6446,8 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 
 	if (!dcp)
 		return;
+	if (IS_ENABLED(CONFIG_APPLE_SOC_SLEEP))
+		apple_sleep_v27_unregister(dev);
 	dcp_peer_forget(dcp);
 	/*
 	 * Stop the native initializer before looking up its owner, including
@@ -6829,6 +6925,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	iomfb_queue_init(dcp);
 
 	dcp->fw_compat = fw_compat;
+	dcp->v27_j714s = fw_compat == DCP_FIRMWARE_V_27_0 &&
+			 of_machine_is_compatible("apple,j714s");
 	/*
 	 * Probe-lifetime like the desktop state: component bind opens a devres
 	 * group on this device and releases it on failure or unbind.
@@ -6852,6 +6950,15 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		/* Checked by dcp_check_firmware_version(). */
 		dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
 		dcp->v27_methods = iomfb_v27_methods(compat_str);
+		if (dcp->v27_j714s) {
+			const struct dcp_method_entry *own =
+				iomfb_v27_methods_j714s(dev, dcp->v27_methods);
+
+			if (own) {
+				dcp->v27_methods = own;
+				dcp->v27_a407 = true;
+			}
+		}
 	}
 	if (fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
 		dcp->desktop = devm_kzalloc(dev, sizeof(*dcp->desktop), GFP_KERNEL);
@@ -6897,6 +7004,9 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
+	/* The link report: on the board it has run on (dcp_j714s_ext()). */
+	if (!dcp_j714s_ext(dev))
+		dcp->hw.link_report = false;
 	/*
 	 * T8142 on firmware 27 runs as the T6050's firmware-27 instance, with
 	 * the default method profile: with H17G every swap fails with status 4.
@@ -7618,6 +7728,9 @@ static void dcp_platform_remove(struct platform_device *pdev)
 		cancel_work_sync(&dcp->s2r_prewarm_work);
 		cancel_delayed_work_sync(&dcp->s2r_prewarm_off_wq);
 	}
+	/* Registration pins callback/provider lifetimes until same-task scope end. */
+	if (IS_ENABLED(CONFIG_APPLE_SOC_SLEEP))
+		apple_sleep_v27_unregister(&pdev->dev);
 
 	if (dcp && dcp->external && !dcp->external_native) {
 		/* Enabled for the external start at probe. No component unbind. */
@@ -7881,10 +7994,18 @@ static const char *dcp_external_sleep_vetoed(struct apple_dcp *dcp)
  * Veto early so Thunderbolt cannot tear down a working tunnel first. The
  * same HPD lock serializes this gate against explicit firmware startup.
  */
+static bool dcp_v27_sleep_selected(struct apple_dcp *dcp);
+static void dcp_v27_sleep_invalidate(struct apple_dcp *dcp);
+
 static int dcp_platform_prepare(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 	const char *why;
+
+	if (pm_suspend_via_firmware() && dcp_v27_sleep_selected(dcp)) {
+		dcp_v27_sleep_invalidate(dcp);
+		return 0;
+	}
 
 	/*
 	 * J713: a T8132 external DCP refuses system sleep only for what cannot
@@ -7938,6 +8059,9 @@ static void dcp_platform_complete(struct device *dev)
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
 	dcp_s2r_dark_finish(dcp);
+	/* Every device has resumed, the DRM device among them: its saved state is spent. */
+	if (!pm_dark_wake())
+		WRITE_ONCE(dcp->sleep_v27_torn, false);
 	/* The sleep failed, or wasn't one that stops the firmware: it still times out. */
 	if (READ_ONCE(dcp->s2r_wake_lit))
 		mod_delayed_work(system_freezable_wq, &dcp->s2r_prewarm_off_wq,
@@ -9052,6 +9176,17 @@ static int dcp_s2r_pm_notify(struct notifier_block *nb, unsigned long action, vo
 
 	if (action == PM_POST_SUSPEND)
 		dcp_s2r_dark_finish(dcp);
+	/*
+	 * A J714s external display processor that has crashed cannot take its sleep calls, and
+	 * the SoC cannot power down around it: the sleep is refused here, before the tasks
+	 * freeze and before any device or port controller is told of it, so nothing has to be
+	 * brought back. The processor stays as it is until a reboot.
+	 */
+	if (action == PM_SUSPEND_PREPARE && dcp_j714s_ext(dcp->dev) &&
+	    !pm_suspend_default_s2idle() && READ_ONCE(dcp->crashed)) {
+		dev_warn(dcp->dev, "the external display processor has crashed: sleep refused before anything is stopped (a reboot brings it back)\n");
+		return notifier_from_errno(-EBUSY);
+	}
 
 	return NOTIFY_DONE;
 }
@@ -9067,7 +9202,7 @@ static int dcp_s2r_pm_register(struct apple_dcp *dcp)
 {
 	int ret;
 
-	if (!dcp_s2r_ext_capable(dcp))
+	if (!dcp_s2r_ext_capable(dcp) && !dcp_j714s_ext(dcp->dev))
 		return 0;
 	dcp->s2r_pm_nb.notifier_call = dcp_s2r_pm_notify;
 	ret = register_pm_notifier(&dcp->s2r_pm_nb);
@@ -9864,6 +9999,8 @@ static void dcp_t6041_s2r_resume(struct apple_dcp *dcp)
 		 pm_resume_via_firmware() ? "after a real sleep" : "the sleep was refused");
 }
 
+#include "dcp-v27-sleep.inc"
+
 static int dcp_platform_suspend(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
@@ -9876,6 +10013,9 @@ static int dcp_platform_suspend(struct device *dev)
 	flush_work(&dcp->s2r_prewarm_work);
 	cancel_delayed_work_sync(&dcp->s2r_prewarm_off_wq);
 	dcp->s2r_prewarmed = false;
+
+	if (pm_suspend_via_firmware() && dcp_v27_sleep_selected(dcp))
+		return dcp_v27_sleep_suspend(dcp);
 
 	/*
 	 * Derived power words (T8142) also stop the firmware for a deep sleep here; both stay
@@ -10006,6 +10146,9 @@ static int dcp_platform_resume(struct device *dev)
 
 	if (dcp_takeover_was_aborted(dcp))
 		return 0;
+
+	if (dcp_v27_sleep_selected(dcp) && READ_ONCE(dcp->sleep_v27_closed))
+		return dcp_v27_sleep_resume(dcp);
 
 	if (dcp->s2r_stopped)
 		return dcp_s2r_resume(dcp);
@@ -11405,6 +11548,9 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6041_dcpext = {
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t6050 = {
+	.v27_sleep_protocol = true,
+	/* Off until recovery from a real and from an aborted wake is validated. */
+	.v27_sleep_recovery = false,
 	.firmware_dma_bits = 41,
 	.num_dptx_ports = 0,
 	.adopt_live_session = true,
@@ -11413,11 +11559,16 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6050 = {
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t6050_dcpext = {
+	/* Off: an inactive display DART's and its GAPF slice's handling is not validated. */
+	.v27_sleep_protocol = false,
+	/* Off until recovery from a real and from an aborted wake is validated. */
+	.v27_sleep_recovery = false,
 	.firmware_dma_bits = 41,
 	.num_dptx_ports = 2,
 	.adopt_live_session = true,
 	.firmware_compat = DCP_FIRMWARE_V_27_0,
 	.sink_metadata_edid = true,
+	.link_report = true,
 };
 
 /*

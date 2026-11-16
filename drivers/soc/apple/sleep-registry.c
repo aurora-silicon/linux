@@ -91,13 +91,26 @@ int apple_sleep_coproc_register(struct device *dev, void __iomem *asc, bool pcie
 	c->ready = false;
 	c->stopped = false;
 	c->first = false;
+	c->early = false;
 	c->order = 0;
 	c->ps = 0;
+	c->domain = NULL;
 	c->dev = dev;
 
 	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_sleep_coproc_register);
+
+void apple_sleep_coproc_set_early(struct device *dev)
+{
+	struct apple_sleep_coproc *c;
+
+	guard(mutex)(&apple_sleep_coprocs_lock);
+	c = apple_sleep_coproc_find(dev);
+	if (c)
+		c->early = true;
+}
+EXPORT_SYMBOL_GPL(apple_sleep_coproc_set_early);
 
 int apple_sleep_coproc_register_first(struct device *dev, unsigned int order,
 				      int (*last_stop)(void *data), void *data)
@@ -124,6 +137,7 @@ int apple_sleep_coproc_register_first(struct device *dev, unsigned int order,
 		c->first = true;
 		c->order = order;
 		c->ps = ps;
+		c->domain = of_parse_phandle(dev->of_node, "power-domains", 0);
 	}
 
 	return 0;
@@ -183,10 +197,16 @@ void apple_sleep_coproc_unregister(struct device *dev)
 {
 	struct apple_sleep_coproc *c;
 
+	if (!dev)
+		return;
+	apple_sleep_ans_late_leave(dev);
 	guard(mutex)(&apple_sleep_coprocs_lock);
 	c = apple_sleep_coproc_find(dev);
-	if (c)
+	if (c) {
+		of_node_put(c->domain);
 		memset(c, 0, sizeof(*c));
+	}
+	apple_sleep_ans_late_forget(dev);
 }
 EXPORT_SYMBOL_GPL(apple_sleep_coproc_unregister);
 
@@ -227,14 +247,15 @@ EXPORT_SYMBOL_GPL(apple_sleep_commit_stops_coprocs);
  * go back. In this order, on ANS itself: whatever its driver does last,
  * status and control read, then 0 written twice.
  */
-static void apple_sleep_coproc_run_off(struct apple_sleep_coproc *c)
+void apple_sleep_coproc_run_off(struct apple_sleep_coproc *c)
 {
 	/* Its own last stop cleared its run bits. */
 	if (!c->asc) {
 		c->stopped = true;
 		return;
 	}
-	c->status = readl(c->asc + ASC_CPU_STATUS);
+	if (!(READ_ONCE(apple_sleep_reg) & APPLE_SLEEP_REG_NO_ASC_STATUS))
+		c->status = readl(c->asc + ASC_CPU_STATUS);
 	writel(readl(c->asc + ASC_CPU_CONTROL) & ~ASC_CPU_CONTROL_RUN, c->asc + ASC_CPU_CONTROL);
 	writel(readl(c->asc + ASC_CPU_CONTROL) & ~ASC_CPU_CONTROL_RUN, c->asc + ASC_CPU_CONTROL);
 	c->stopped = true;
@@ -341,7 +362,7 @@ int apple_sleep_enclave_stop(struct device *dev)
  * PMP has to see that before its own stop. The rest after the match. With ANS among the ready
  * ones, @pcie_ans.
  */
-void apple_sleep_coprocs_stop(bool first, bool *pcie_ans)
+void apple_sleep_registry_stop(bool first, bool *pcie_ans)
 {
 	unsigned int order;
 	int i;

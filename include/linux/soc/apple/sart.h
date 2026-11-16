@@ -69,6 +69,8 @@ bool apple_sart_is_inherited_region(struct apple_sart *sart, phys_addr_t paddr,
  * each back. Returns how many didn't hold, or -EOPNOTSUPP.
  */
 int apple_sart_replay(struct apple_sart *sart);
+/* ANS's read-only last check, after supplier suspend_late. No ownership transfer. */
+int apple_sart_sleep_validate(struct apple_sart *sart);
 
 /*
  * apple_sart_restore_entry - write back a SART entry that a boot stage passed on

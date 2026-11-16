@@ -2721,8 +2721,8 @@ static int t6040_sleep_enter(suspend_state_t state)
 		return ret;
 	}
 	s->pcie_ans_stopped = false;
-	apple_sleep_coprocs_stop(true, &s->pcie_ans_stopped);
-	apple_sleep_coprocs_stop(false, &s->pcie_ans_stopped);
+	apple_sleep_registry_stop(true, &s->pcie_ans_stopped);
+	apple_sleep_registry_stop(false, &s->pcie_ans_stopped);
 	t6040_wake_arm(s);
 
 	s->cntkctl = read_sysreg(cntkctl_el1);

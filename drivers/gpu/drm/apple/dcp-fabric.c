@@ -134,6 +134,16 @@ struct apple_dcp_typec_port {
 	 * waits, routed nowhere, until that one fits one pipe or leaves.
 	 */
 	bool typec_yielded;
+	/*
+	 * Its display was released for a firmware sleep (dcp_fabric_sleep_release()): no
+	 * port state is applied until the wake, and the first one after it routes anew.
+	 */
+	bool sleep_held;
+	/*
+	 * Held because the display did not return after a wake (dcp_fabric_sleep_withdraw()):
+	 * the next wake, or the cable leaving the port, ends the hold.
+	 */
+	bool sleep_withdrawn;
 };
 
 /*
@@ -1917,6 +1927,20 @@ static int dcp_typec_route_apply(struct typec_mux_dev *mux,
 	/* The previous SAFE transition has not finished; retry. */
 	if (port->safe_pending)
 		return -EAGAIN;
+
+	/*
+	 * Released for a firmware sleep: nothing is routed until the wake. Not recorded
+	 * either, so the port controller's state after the wake is applied in full.
+	 */
+	if (port->sleep_held) {
+		/* A withdrawn display's cable has left: what is plugged next routes anew. */
+		if (port->sleep_withdrawn && !is_dp) {
+			port->sleep_held = false;
+			port->sleep_withdrawn = false;
+		}
+		port->applied_valid = false;
+		return 0;
+	}
 
 	/*
 	 * Every candidate route for this port is notified with the same state,
@@ -4779,6 +4803,110 @@ void dcp_typec_route_unpark(struct apple_dcp *dcp)
 		return;
 	}
 	dev_dbg(dcp->dev, "display route back after the sleep: crossbar output up\n");
+}
+
+/*
+ * A firmware sleep that takes a pipeline's power: its directly attached display is released
+ * as an unplugged one is (the display and its link, HPD toward the firmware, the DP PHY and
+ * the crossbar output) and the port is held unrouted. The port controller applies the port's
+ * state again after the wake, and the display comes back as a newly plugged one, on the
+ * pipeline it had if that is free. A tunnelled display is not released here.
+ *
+ * Returns 1 if a display was released, 0 if the pipeline drove none, or an error with the
+ * port not held. @ms: how long the display's release and the port's took.
+ */
+int dcp_fabric_sleep_release(struct apple_dcp *dcp, s64 ms[2])
+{
+	struct apple_dcp_typec_route *route;
+	struct apple_dcp_typec_port *port;
+	ktime_t start;
+	int ret;
+
+	ms[0] = ms[1] = 0;
+	guard(mutex)(&dcp_typec_fabric_lock);
+	route = dcp->active_typec_route;
+	if (!route)
+		return 0;
+	port = route->port;
+	if (route->tunnel || port->owner != route || port->secondary_owner ||
+	    port->split_dcp)
+		return -EBUSY;
+	if (port->safe_pending)
+		return -EAGAIN;
+	/* From here no port state routes it again before the wake. */
+	port->sleep_held = true;
+	start = ktime_get();
+	if (port->hpd || READ_ONCE(dcp->typec_cable_connected) ||
+	    (dcp->typec_connector && READ_ONCE(dcp->typec_connector->connected))) {
+		ret = dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
+		ms[0] = ktime_ms_delta(ktime_get(), start);
+		if (ret)
+			goto unhold;
+	}
+	start = ktime_get();
+	ret = dcp_typec_route_deactivate(route);
+	ms[1] = ktime_ms_delta(ktime_get(), start);
+	if (ret)
+		goto unhold;
+	port->preferred_route = route;
+	port->owner = NULL;
+	port->hpd = false;
+	port->dp_wanted = false;
+	port->dp_hpd = false;
+	port->busy_noted = false;
+	port->applied_valid = false;
+	return 1;
+unhold:
+	port->sleep_held = false;
+	port->applied_valid = false;
+	return ret;
+}
+
+/*
+ * A display released for a sleep did not return after the wake although its port was routed
+ * again: the route is given up as at the sleep, so that the pipeline is an idle one at the
+ * next sleep, and the port is held. The next wake applies the port's state anew, as does a
+ * cable plugged in after this one has left.
+ *
+ * Returns 1 if a route was given up, 0 if there was none, or an error.
+ */
+int dcp_fabric_sleep_withdraw(struct apple_dcp *dcp, s64 ms[2])
+{
+	unsigned int i;
+	int ret;
+
+	ret = dcp_fabric_sleep_release(dcp, ms);
+	if (ret <= 0)
+		return ret;
+	guard(mutex)(&dcp_typec_fabric_lock);
+	for (i = 0; i < dcp->nr_typec_routes; i++) {
+		struct apple_dcp_typec_port *port = dcp->typec_routes[i].port;
+
+		if (port && port->sleep_held && port->preferred_route &&
+		    port->preferred_route->dcp == dcp)
+			port->sleep_withdrawn = true;
+	}
+	return ret;
+}
+
+/* The wake, or a refused sleep: the ports @dcp can drive take their state again. */
+void dcp_fabric_sleep_done(struct apple_dcp *dcp)
+{
+	unsigned int i;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+	for (i = 0; i < dcp->nr_typec_routes; i++) {
+		struct apple_dcp_typec_port *port = dcp->typec_routes[i].port;
+
+		if (!port || !port->sleep_held)
+			continue;
+		/* Another pipeline of the port may still be on its way down or up. */
+		if (port->preferred_route && port->preferred_route->dcp != dcp)
+			continue;
+		port->sleep_held = false;
+		port->sleep_withdrawn = false;
+		port->applied_valid = false;
+	}
 }
 
 /*

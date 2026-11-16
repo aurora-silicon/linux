@@ -14,6 +14,7 @@ obj-$(CONFIG_APPLE_PMGR_MISC)	+= apple-pmgr-misc.o
 obj-$(CONFIG_APPLE_CLUSTER_PWRGATE) += apple-cluster-pwrgate.o
 
 obj-$(CONFIG_APPLE_SOC_SLEEP) += apple-sleep.o
+obj-$(CONFIG_APPLE_SOC_SLEEP) += t6050-aop.o
 apple-sleep-y = sleep.o sleep-registry.o
 # The T6040 sleep calls the SMC driver directly
 ifeq ($(CONFIG_MFD_MACSMC),y)

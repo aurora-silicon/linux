@@ -69,6 +69,37 @@ struct dcp_swap_submit_req_v27 {
 	u8 padding[2];
 } __packed;
 
+/* Surfaces past the first four, which the A407 swap also carries. */
+#define DCP_V27_SURF2_COUNT 6
+
+/*
+ * The A407 swap request, as macOS 27 submits every swap with it, on the
+ * internal panel and on external displays: the first four surfaces as
+ * in the A408 request above, then six more with their DVAs, then the tail.
+ * Sent on the J714s (dcp->v27_a407); every other machine keeps A408.
+ */
+struct dcp_swap_submit_req_v27_a407 {
+	struct dcp_swap_v27 swap;
+	struct dcp_surface_v27 surf[SWAP_SURFACES];
+	u64 surf_iova[SWAP_SURFACES];
+	u64 unk_u64_a[SWAP_SURFACES];
+	struct dcp_surface_v27 surf2[DCP_V27_SURF2_COUNT];
+	u64 surf2_iova[DCP_V27_SURF2_COUNT];
+
+	u8 unkbool;
+	u64 unkdouble;
+	u64 unkU64;
+	u8 unkbool2;
+	u32 clear;
+	u32 unkU32Ptr;
+	u8 swap_null;
+	u8 surf_null[SWAP_SURFACES];
+	u8 surf2_null[DCP_V27_SURF2_COUNT];
+	u8 unkoutbool_null;
+	u8 unknown_pointer_null;
+	u8 unknown_output_null;
+} __packed;
+
 struct dcp_swap_submit_resp_v27 {
 	u8 unkoutbool;
 	u32 unkU32out;
@@ -82,6 +113,15 @@ static_assert(sizeof(struct dcp_swap_submit_req_v27) == 0xff4);
 static_assert(offsetof(struct dcp_swap_submit_req_v27, surf) == 0x6e0);
 static_assert(offsetof(struct dcp_swap_submit_req_v27, surf_iova) == 0xf90);
 static_assert(offsetof(struct dcp_swap_submit_req_v27, swap_null) == 0xfea);
+static_assert(sizeof(struct dcp_swap_submit_req_v27_a407) == 0x1d30);
+static_assert(offsetof(struct dcp_swap_submit_req_v27_a407, surf) == 0x6e0);
+static_assert(offsetof(struct dcp_swap_submit_req_v27_a407, surf_iova) == 0xf90);
+static_assert(offsetof(struct dcp_swap_submit_req_v27_a407, surf2) == 0xfd0);
+static_assert(offsetof(struct dcp_swap_submit_req_v27_a407, surf2_iova) == 0x1cd8);
+static_assert(offsetof(struct dcp_swap_submit_req_v27_a407, unkbool) == 0x1d08);
+static_assert(offsetof(struct dcp_swap_submit_req_v27_a407, swap_null) == 0x1d22);
+static_assert(offsetof(struct dcp_swap_submit_req_v27_a407, surf_null) == 0x1d23);
+static_assert(offsetof(struct dcp_swap_submit_req_v27_a407, unknown_output_null) == 0x1d2f);
 static_assert(offsetof(struct dcp_swap_v27, brightness_update) == 0x354);
 static_assert(offsetof(struct dcp_swap_v27, brightness_nits) == 0x35e);
 static_assert(offsetof(struct dcp_swap_v27, bl_flags) == 0x358);
@@ -91,6 +131,8 @@ static_assert(offsetof(struct dcp_swap_v27, edr_headroom) == 0x3e6);
 
 void iomfb_serialize_present_v27(struct dcp_swap_submit_req_v27 *wire,
 				const struct dcp_swap_submit_req_h17p *request);
+void iomfb_serialize_present_v27_a407(struct dcp_swap_submit_req_v27_a407 *wire,
+				      const struct dcp_swap_submit_req_h17p *request);
 bool iomfb_v27_callback_size_valid(unsigned int tag, u32 input, u32 output);
 void iomfb_firmware_state_cleanup_v27(void *data);
 int iomfb_modeset_v27(struct apple_dcp *dcp, struct drm_crtc_state *state);
@@ -104,5 +146,6 @@ void iomfb_sleep_v27(struct apple_dcp *dcp);
 void iomfb_present_backlight_v27(struct apple_dcp *dcp);
 int iomfb_s2r_500_v27(struct apple_dcp *dcp);
 int iomfb_s2r_power_v27(struct apple_dcp *dcp, bool on, bool named_calls, bool oob);
+void iomfb_present_matrix_v27(struct apple_dcp *dcp);
 
 #endif

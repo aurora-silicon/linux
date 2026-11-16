@@ -15,6 +15,7 @@
 #include <linux/of_address.h>
 #include <linux/regmap.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/dcp-v27-sleep.h>
 #include <linux/soc/apple/mailbox.h>
 #include <linux/soc/apple/pmp-report.h>
 #include <linux/soc/apple/rtkit.h>
@@ -68,13 +69,145 @@ static struct device_node *asahi_g17_pmp_entry(struct device *dev, bool *domain)
 	return NULL;
 }
 
+/* Only the supported M5 board needs a wrapped provider translation here.
+ * Other G17 clients retain their established direct-domain methods below.
+ */
+static bool asahi_g17_m5_provider(struct device *dev)
+{
+	return of_machine_is_compatible("apple,j714s") &&
+	       of_machine_is_compatible("apple,t6050") &&
+	       of_device_is_compatible(dev->of_node, "apple,agx-g17s");
+}
+
+static bool asahi_g17_m5_zero_cells(struct device_node *np)
+{
+	u32 cells;
+
+	return of_device_is_available(np) &&
+	       of_property_count_u32_elems(np, "#power-domain-cells") == 1 &&
+	       !of_property_read_u32(np, "#power-domain-cells", &cells) && !cells;
+}
+
+static int asahi_g17_m5_dependency(struct device_node *np, struct device_node **out)
+{
+	struct of_phandle_args args;
+	int ret;
+
+	if (of_count_phandle_with_args(np, "power-domains", "#power-domain-cells") != 1)
+		return -EINVAL;
+	ret = of_parse_phandle_with_args(np, "power-domains", "#power-domain-cells", 0, &args);
+	if (ret)
+		return ret;
+	if (args.args_count || !asahi_g17_m5_zero_cells(args.np)) {
+		of_node_put(args.np);
+		return -EINVAL;
+	}
+	*out = args.np;
+	return 0;
+}
+
+/* Report reg is an entry identity. Its ONLY dependency supplies the power word. */
+static int asahi_g17_m5_report_power(struct device_node *np, struct device_node **power)
+{
+	struct device_node *parent;
+	u32 id;
+	int ret = -EINVAL;
+
+	if (!of_device_is_compatible(np, "apple,t6050-pmp-v2-report-entry") ||
+	    !asahi_g17_m5_zero_cells(np) ||
+	    of_property_count_u32_elems(np, "reg") != 1 ||
+	    of_property_read_u32(np, "reg", &id) || id >= 64)
+		return -EINVAL;
+	parent = of_get_parent(np);
+	if (parent && of_device_is_available(parent) &&
+	    of_device_is_compatible(parent, "apple,t6050-pmp-v2-report"))
+		ret = asahi_g17_m5_dependency(np, power);
+	of_node_put(parent);
+	return ret;
+}
+
+/* Referenced output nodes; metadata only, no request or power transition. */
+static int asahi_g17_m5_nodes(struct device *dev, struct device_node **power,
+			    struct device_node **request, u32 *offset)
+{
+	struct device_node *np = NULL, *report = NULL, *parent = NULL;
+	struct device_node *explicit = NULL, *dep = NULL;
+	struct resource res;
+	u32 reg[2];
+	int ret;
+
+	*power = *request = NULL;
+	ret = asahi_g17_m5_dependency(dev->of_node, &np);
+	if (ret)
+		return ret;
+	if (of_device_is_compatible(np, "apple,t6050-pmp-v2-report-entry")) {
+		report = np;
+		np = NULL;
+		ret = asahi_g17_m5_report_power(report, &np);
+		if (ret)
+			goto out;
+	}
+	ret = -EINVAL;
+	if (!of_device_is_compatible(np, "apple,t6050-pmgr-pwrstate") ||
+	    !asahi_g17_m5_zero_cells(np) ||
+	    of_property_count_u32_elems(np, "reg") != 2 ||
+	    of_property_read_u32_array(np, "reg", reg, 2) ||
+	    reg[1] != sizeof(u32) || (reg[0] & 3))
+		goto out;
+	parent = of_get_parent(np);
+	if (!parent || !of_device_is_available(parent) ||
+	    !of_device_is_compatible(parent, "apple,t6050-pmgr") ||
+	    !of_device_is_compatible(parent, "syscon") ||
+	    of_address_to_resource(parent, 0, &res) || !(res.flags & IORESOURCE_MEM) ||
+	    res.end < res.start || resource_size(&res) < sizeof(u32) ||
+	    reg[0] > resource_size(&res) - sizeof(u32))
+		goto out;
+	if (of_property_present(dev->of_node, "apple,pmp-report-entry")) {
+		if (of_property_count_u32_elems(dev->of_node, "apple,pmp-report-entry") != 1)
+			goto out;
+		explicit = of_parse_phandle(dev->of_node, "apple,pmp-report-entry", 0);
+		if (!explicit || (report && explicit != report))
+			goto out;
+		ret = asahi_g17_m5_report_power(explicit, &dep);
+		if (ret)
+			goto out;
+		ret = -EINVAL;
+		if (dep != np)
+			goto out;
+		if (!report)
+			report = of_node_get(explicit);
+	}
+	*offset = reg[0];
+	*power = np;
+	*request = report;
+	np = report = NULL;
+	ret = 0;
+out:
+	of_node_put(np);
+	of_node_put(report);
+	of_node_put(parent);
+	of_node_put(explicit);
+	of_node_put(dep);
+	return ret;
+}
+
 /* The PMP's request for the GPU, where the device tree names one. */
 int asahi_g17_pmp_request(struct device *dev, bool enable)
 {
 	struct device_node *np;
 	int ret;
 
-	np = asahi_g17_pmp_entry(dev, NULL);
+	if (asahi_g17_m5_provider(dev)) {
+		struct device_node *power;
+		u32 offset;
+
+		ret = asahi_g17_m5_nodes(dev, &power, &np, &offset);
+		if (ret)
+			return ret;
+		of_node_put(power);
+	} else {
+		np = asahi_g17_pmp_entry(dev, NULL);
+	}
 	if (!np)
 		return 0;
 	ret = apple_pmp_report_entry_request(np, enable);
@@ -123,9 +256,24 @@ static struct device_node *asahi_g17_ps_node(struct device *dev)
 
 static int asahi_g17_ps(struct device *dev, struct regmap **regmap, u32 *offset)
 {
-	struct device_node *np = asahi_g17_ps_node(dev);
+	struct device_node *np;
 	int ret;
 
+	if (asahi_g17_m5_provider(dev)) {
+		struct device_node *request, *parent;
+
+		ret = asahi_g17_m5_nodes(dev, &np, &request, offset);
+		if (ret)
+			return ret;
+		of_node_put(request);
+		parent = of_get_parent(np);
+		*regmap = parent ? syscon_node_to_regmap(parent) : ERR_PTR(-EINVAL);
+		ret = PTR_ERR_OR_ZERO(*regmap);
+		of_node_put(parent);
+		of_node_put(np);
+		return ret;
+	}
+	np = asahi_g17_ps_node(dev);
 	if (IS_ERR(np))
 		return PTR_ERR(np);
 	ret = of_property_read_u32(np, "reg", offset);
@@ -180,10 +328,15 @@ int asahi_g17_power_lower(struct device *dev)
 	return ret;
 }
 
-static u32 asahi_g17_ps_on(u32 val, u32 saved)
+/* The automatic state to raise with: apple,sleep-ps-auto if the DT has it, else the saved one. */
+static u32 asahi_g17_ps_on(struct device *dev, u32 val, u32 saved)
 {
+	u32 ps_auto;
+
 	val &= ~(PS_AUTO_ENABLE | PS_AUTO | PS_BUSY | PS_FLAGS | PS_ACTUAL | PS_TARGET);
 
+	if (!of_property_read_u32(dev->of_node, "apple,sleep-ps-auto", &ps_auto))
+		return val | FIELD_PREP(PS_AUTO, ps_auto) | FIELD_PREP(PS_TARGET, PS_ACTIVE);
 	return val | (saved & PS_AUTO) | FIELD_PREP(PS_TARGET, PS_ACTIVE);
 }
 
@@ -202,7 +355,7 @@ int asahi_g17_power_raise(struct device *dev, u32 saved)
 		return ret;
 	dev_dbg(dev, "GPU domain before raising it: %#x\n", val);
 
-	regmap_write(regmap, offset, asahi_g17_ps_on(val, saved));
+	regmap_write(regmap, offset, asahi_g17_ps_on(dev, val, saved));
 
 	return regmap_read_poll_timeout(regmap, offset, cur,
 					FIELD_GET(PS_ACTUAL, cur) == PS_ACTIVE,
@@ -223,7 +376,8 @@ int asahi_g17_power_auto_on(struct device *dev, u32 saved)
 	if (ret)
 		return ret;
 
-	return regmap_write(regmap, offset, asahi_g17_ps_on(val, saved) | (saved & PS_AUTO_ENABLE));
+	return regmap_write(regmap, offset,
+			    asahi_g17_ps_on(dev, val, saved) | (saved & PS_AUTO_ENABLE));
 }
 
 /*
@@ -243,7 +397,7 @@ struct asahi_g17_commit {
 	/* The power domain is the PMP's entry: the sleep controller lowers the word behind it. */
 	bool entry_domain;
 
-	bool ran;
+	bool ran, request_owned;
 	int idle[2];
 	unsigned int idle_us[2];
 	u32 status[2];
@@ -281,7 +435,7 @@ static int asahi_g17_commit_stop(void *data)
 	c->entry = readl(c->ps);
 	c->saved = c->entry;
 	if (FIELD_GET(PS_ACTUAL, c->entry) != PS_ACTIVE) {
-		writel(asahi_g17_ps_on(c->entry, c->entry), c->ps);
+		writel(asahi_g17_ps_on(c->dev, c->entry, c->entry), c->ps);
 		c->raise_ret = readl_poll_timeout_atomic(c->ps, val,
 							 FIELD_GET(PS_ACTUAL, val) == PS_ACTIVE,
 							 10, PS_TIMEOUT_US);
@@ -333,6 +487,81 @@ lower:
 	return (c->idle[0] || c->idle[1] || c->request_ret || c->lower_ret) ? 1 : 0;
 }
 
+/*
+ * The M5 Pro's stop, made in the sleep's last steps, before the commit, and nothing else. GFX
+ * then GFX1, each whole: AP IDLE, IOP IDLE and its ack, receiving off, the CPU's run bit off.
+ * Then GFX's power word down. No PMP request, gating or bridge write.
+ *
+ * After a first sleep the domain runs under automatic power as it does under macOS: between
+ * jobs its word has its target on, automatic power enabled and nothing powered, where the
+ * boot's word never reads that low. That is an idle GPU whose firmware still runs, not a stopped
+ * one: a stop that sends it no IDLE leaves firmware the wake cannot restart. macOS stops a
+ * domain that is up, so the domain is taken out of automatic power and waited on first, and
+ * the stop is the same from there.
+ */
+static int asahi_g17_m5_commit_stop(void *data)
+{
+	struct asahi_g17_commit *c = data;
+	unsigned int i;
+	u32 val, automatic;
+
+	c->ran = true;
+	/*
+	 * With its domain off the first mailbox read here takes a synchronous external abort.
+	 * With GFX off there is nothing to idle: report it and only lower the word.
+	 */
+	c->saved = readl(c->ps);
+	dev_info(c->dev, "commit stop: GFX %#x\n", c->saved);
+	automatic = c->saved & PS_AUTO_ENABLE;
+	if (!FIELD_GET(PS_ACTUAL, c->saved) && automatic && FIELD_GET(PS_TARGET, c->saved)) {
+		int ret;
+
+		writel((c->saved & ~(PS_AUTO_ENABLE | PS_AUTO | PS_BUSY | PS_FLAGS | PS_ACTUAL |
+				     PS_TARGET)) |
+		       FIELD_PREP(PS_AUTO, PS_ACTIVE) | FIELD_PREP(PS_TARGET, PS_ACTIVE), c->ps);
+		ret = readl_poll_timeout_atomic(c->ps, val,
+						FIELD_GET(PS_ACTUAL, val) == PS_ACTIVE,
+						10, PS_TIMEOUT_US);
+		dev_info(c->dev, "commit stop: GFX idle under automatic power, raised for the stop: %#x (%d)\n",
+			 val, ret);
+		c->saved = val;
+	}
+	if (FIELD_GET(PS_ACTUAL, c->saved) != PS_ACTIVE &&
+	    (!FIELD_GET(PS_ACTUAL, c->saved) || !automatic)) {
+		/* Off, or not raised: its mailboxes can't be read. The wake will not restart it. */
+		dev_warn(c->dev, "commit stop: GFX off (%#x), no idle sent: the GPU's firmware is not stopped for this sleep\n",
+			 c->saved);
+		c->idle[0] = c->idle[1] = -ENODEV;
+	} else {
+		for (i = 0; i < c->count; i++) {
+			c->idle[i] = apple_rtkit_sleep_idle_polled(c->rtk[i], c->cpu[i],
+								   &c->idle_us[i]);
+			c->status[i] = readl(c->cpu[i] + ASC_CPU_STATUS);
+			apple_rtkit_mailbox_recv_off(c->rtk[i]);
+			apple_mbox_ascwrap_v6_stop_cpu_atomic(c->mbox[i]);
+		}
+		c->saved = readl(c->ps);
+	}
+	/* The wake puts automatic power back as the stop found it. */
+	c->saved = (c->saved & ~PS_AUTO_ENABLE) | automatic;
+	/*
+	 * The GPU's PMP request (AGX, PTD request bit 15) goes before GFX does, as in the Neo's stop
+	 * above: before the sleep the only PTD request left is ANS's. Left on here, the PMP's
+	 * firmware crashes before its own stop (AP IDLE never echoed, a crashlog message instead).
+	 */
+	c->request_ret = c->request ? apple_pmp_report_entry_withdraw_polled(c->request) : 0;
+	dev_info(c->dev, "commit stop: PMP request withdrawn: %d\n", c->request_ret);
+	writel(c->saved & ~(PS_AUTO_ENABLE | PS_BUSY | PS_FLAGS), c->ps);
+	val = readl(c->ps);
+	writel((val & ~(PS_AUTO_ENABLE | PS_BUSY | PS_FLAGS | PS_TARGET)) | PS_FLAGS, c->ps);
+	c->lower_ret = readl_poll_timeout_atomic(c->ps, c->lowered,
+						 !FIELD_GET(PS_ACTUAL, c->lowered) &&
+						 !(c->lowered & PS_BUSY),
+						 10, PS_TIMEOUT_US);
+
+	return (c->idle[0] || c->idle[1] || c->request_ret || c->lower_ret) ? 1 : 0;
+}
+
 static void __iomem *asahi_g17_map(struct device_node *np, const char *name, int index,
 				   u32 offset, u32 size)
 {
@@ -350,7 +579,8 @@ static void __iomem *asahi_g17_map(struct device_node *np, const char *name, int
 static void asahi_g17_commit_free(struct asahi_g17_commit *c)
 {
 	if (c->request) {
-		apple_pmp_report_entry_commit_owned(c->request, false);
+		if (c->request_owned)
+			apple_pmp_report_entry_commit_owned(c->request, false);
 		of_node_put(c->request);
 	}
 	/* The mapping is only this structure's on G16: G17's belongs to its mailbox. */
@@ -400,15 +630,30 @@ struct asahi_g17_commit *asahi_g17_commit_prepare(struct device *dev,
 			goto err;
 	}
 
-	np = asahi_g17_ps_node(dev);
-	if (IS_ERR(np)) {
-		ret = PTR_ERR(np);
-		goto err;
+	if (asahi_g17_m5_provider(dev)) {
+		struct device_node *parent;
+
+		ret = asahi_g17_m5_nodes(dev, &np, &c->request, &offset);
+		if (ret)
+			goto err;
+		/* A failed mapping must remain an error, not ERR_PTR(0). */
+		ret = -ENODEV;
+		parent = of_get_parent(np);
+		if (parent)
+			c->ps = asahi_g17_map(parent, NULL, 0, offset, 4);
+		of_node_put(parent);
+		of_node_put(np);
+	} else {
+		np = asahi_g17_ps_node(dev);
+		if (IS_ERR(np)) {
+			ret = PTR_ERR(np);
+			goto err;
+		}
+		ret = -ENODEV;
+		if (!of_property_read_u32(np, "reg", &offset) && np->parent)
+			c->ps = asahi_g17_map(np->parent, NULL, 0, offset, 4);
+		of_node_put(np);
 	}
-	ret = -ENODEV;
-	if (!of_property_read_u32(np, "reg", &offset) && np->parent)
-		c->ps = asahi_g17_map(np->parent, NULL, 0, offset, 4);
-	of_node_put(np);
 	c->gating = asahi_g17_map(dev->of_node, "sgx", 0, SGX_GATING, 4);
 	if (bridge)
 		c->bridge = asahi_g17_map(dev->of_node, "sgx", 0, SGX_BRIDGE,
@@ -418,11 +663,19 @@ struct asahi_g17_commit *asahi_g17_commit_prepare(struct device *dev,
 	/* The word as it is before the sleep, for the raise after it if the stop leaves it. */
 	c->saved = readl(c->ps);
 
-	c->request = asahi_g17_pmp_entry(dev, &c->entry_domain);
-	if (c->request)
-		apple_pmp_report_entry_commit_owned(c->request, true);
+	if (!asahi_g17_m5_provider(dev))
+		c->request = asahi_g17_pmp_entry(dev, &c->entry_domain);
+	if (c->request) {
+		ret = apple_pmp_report_entry_commit_owned(c->request, true);
+		if (ret && asahi_g17_m5_provider(dev))
+			goto err;
+		/* Legacy release semantics are retained, even for its ignored error. */
+		c->request_owned = true;
+	}
 
-	ret = apple_sleep_coproc_register_first(dev, APPLE_SLEEP_FIRST_GPU, asahi_g17_commit_stop, c);
+	ret = apple_sleep_coproc_register_first(dev, APPLE_SLEEP_FIRST_GPU,
+						asahi_g17_m5_provider(dev) ?
+						asahi_g17_m5_commit_stop : asahi_g17_commit_stop, c);
 	if (ret)
 		goto err;
 	apple_sleep_coproc_set_ready(dev, true);
@@ -432,6 +685,12 @@ struct asahi_g17_commit *asahi_g17_commit_prepare(struct device *dev,
 err:
 	asahi_g17_commit_free(c);
 	return ERR_PTR(ret);
+}
+
+/* The M5 Pro: its GPU firmware is stopped by the sleep's last steps, not by .suspend. */
+bool asahi_g17_commit_stops_firmware(void)
+{
+	return apple_sleep_v27_late();
 }
 
 /* Whether only the sleep's commit may stop the GPU: then nothing else may. */

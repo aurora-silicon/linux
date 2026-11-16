@@ -23,7 +23,7 @@ struct platform_device;
 struct seq_file;
 
 /* The coprocessors the last mile stops. Each driver idles its own first. */
-#define APPLE_SLEEP_COPROCS	6
+#define APPLE_SLEEP_COPROCS	16
 
 struct apple_sleep_coproc {
 	struct device *dev;
@@ -39,7 +39,11 @@ struct apple_sleep_coproc {
 	/* No ASC: its last stop takes it whole, power word @ps included, before the others. */
 	bool first;
 	unsigned int order;	/* among those registered first, lowest runs first */
+	/* Between ANS and the others, whatever order they registered in (T6050). */
+	bool early;
 	u32 ps;
+	/* Its power domain, for a profile that finds the word by its node (T6050). */
+	struct device_node *domain;
 };
 
 /* Irreversible enclave stop; nonzero is legal only if SLEEP was not sent. */
@@ -71,6 +75,8 @@ struct apple_sleep_coproc *apple_sleep_coproc_find(struct device *dev);
 #define APPLE_SLEEP_REG_ENCLAVE_ANY	BIT(0)
 #define APPLE_SLEEP_REG_LID_AT_WAKE	BIT(1)
 #define APPLE_SLEEP_REG_USB_WAKE_PORTS	BIT(2)
+/* The last stop leaves a coprocessor's CPU status unread (T6050: not readable there). */
+#define APPLE_SLEEP_REG_NO_ASC_STATUS	BIT(3)
 
 int apple_sleep_registry_bind(unsigned int flags);
 void apple_sleep_registry_unbind(void);
@@ -327,6 +333,12 @@ bool apple_sleep_coproc_lowers(u32 ps);
 /* The enclave's stop, last of all refusals: nonzero only if no request was sent. */
 int apple_sleep_enclave_stop(struct device *dev);
 /* The last stops, those registered first with @first and then the rest. */
-void apple_sleep_coprocs_stop(bool first, bool *pcie_ans);
+void apple_sleep_registry_stop(bool first, bool *pcie_ans);
+/* One coprocessor's run bits cleared, after its own last stop. */
+void apple_sleep_coproc_run_off(struct apple_sleep_coproc *c);
+
+/* sleep.c: the T6050 ANS owner, around the registry's unregister. */
+void apple_sleep_ans_late_leave(struct device *dev);
+void apple_sleep_ans_late_forget(struct device *dev);
 
 #endif

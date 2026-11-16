@@ -106,8 +106,8 @@ config APPLE_SOC_SLEEP
 	  /chosen/aurora,s2r-mailbox.
 
 	  Only SoCs whose sleep has been measured and tested are supported,
-	  each by its match data: today T8140, T8132, and with MFD_MACSMC
-	  built in the T6040. On every other SoC the driver doesn't bind, and
+	  each by its match data: today T8140, T8132, T8142, T6050, and with
+	  MFD_MACSMC built in the T6040. On every other SoC the driver doesn't bind, and
 	  s2idle stays the only system sleep.
 
 	  The T6040 (M4 Pro) part has its own sequences and refuses first, on

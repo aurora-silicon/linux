@@ -54,6 +54,8 @@ struct centauri_t6050 {
 	u32 image_response;
 	bool boot_attempted;
 	bool link_ready;
+	/* Torn down for a sleep; Function 2 stays bound until the N1 is enumerated again */
+	bool firmware_sleep;
 	struct centauri_t6050_ipc *ipc;
 	struct centauri_t6050_wifi *wifi;
 };

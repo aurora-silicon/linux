@@ -350,7 +350,7 @@ struct tipd_data {
 	bool (*read_power_status)(struct tps6598x *tps);
 	int (*reset)(struct tps6598x *tps);
 	int (*connect)(struct tps6598x *tps, u32 status);
-	void (*prepare)(struct tps6598x *tps);
+	int (*prepare)(struct tps6598x *tps);
 	void (*complete)(struct tps6598x *tps);
 };
 
@@ -384,6 +384,8 @@ struct tps6598x {
 	int wakeup;
 	/* Handles events while the system sleeps, if the variant can filter them */
 	bool (*sleep_event)(struct tps6598x *tps);
+	/* Wakes the controller, where its bus has a command for that */
+	int (*wake)(struct tps6598x *tps);
 	u32 status; /* status reg */
 	u32 data_status;
 	u16 pwr_status;
@@ -520,6 +522,8 @@ struct sn201202x {
 	bool role_watch;
 	/* Restored from disk: register selections are polled until it is set up again. */
 	bool cold_polled;
+	/* J714s, no connector (its MagSafe controller): only its system sleep state is driven */
+	bool sleep_only;
 };
 
 extern const struct tipd_data *tipd_hw_variants[];

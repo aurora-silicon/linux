@@ -28,6 +28,7 @@
 #include <linux/irqdomain.h>
 #include <linux/list.h>
 #include <linux/module.h>
+#include <linux/mfd/macsmc.h>
 #include <linux/msi.h>
 #include <linux/notifier.h>
 #include <linux/of_address.h>
@@ -81,6 +82,20 @@ static int link_up_timeout = 500;
 #define LINK_RESET_RETRIES	2
 module_param(link_up_timeout, int, 0644);
 MODULE_PARM_DESC(link_up_timeout, "PCIe link training timeout in milliseconds");
+
+/*
+ * A T6050 port Linux powers and trains (the J714s SD card reader's, port 1) after a firmware
+ * sleep. macOS brings it back at every wake, during the wake and after the radio's port: the
+ * reader's power, the port's reset table and enable, the lane clocks, PERST# released, the
+ * LTSSM, and the link is up again. 1 does the same in this host's early resume, the first
+ * phase after the one the radio's port comes back in; its functions are looked for once the
+ * resume is over. 2 brings the port back only then. 0 leaves it parked, with no functions,
+ * until a restart.
+ */
+static int t6050_sd_port_wake = 1;
+module_param(t6050_sd_port_wake, int, 0644);
+MODULE_PARM_DESC(t6050_sd_port_wake,
+		 "T6050: the SD card reader's port after a firmware sleep: back during the resume, as under macOS (1, default), back once the resume is over (2), or parked until a restart (0)");
 
 /* T8103 (original M1) and related SoCs */
 #define CORE_RC_PHYIF_CTL		0x00024
@@ -524,6 +539,8 @@ struct apple_pcie_pd {
 
 struct apple_radio_sleep;
 
+#define APPLE_PCIE_T6050_WARM_WRITES	4
+
 struct apple_pcie {
 	struct mutex		lock;
 	struct device		*dev;
@@ -534,6 +551,28 @@ struct apple_pcie {
 	void __iomem		*oe_fabric_base;
 	void __iomem		*early_cfg;
 	void __iomem		*t6050_phy;	/* shared PHY, mapped by a cold train */
+	/* Firmware sleep of an adopted host: its DART, three more port blocks, the port taken down */
+	struct device		*t6050_dart;
+	/* The port a boot loader trained and the firmware sleep shuts down and brings back */
+	struct apple_pcie_port	*t6050_port;
+	bool			t6050_down;
+	bool			t6050_lost;
+	/* Ports Linux powers and trains, parked over a firmware sleep: their functions removed */
+	struct notifier_block	t6050_pm_nb;
+	/* The endpoint's warm reset, given by this host while the port is down */
+	struct platform_device	*t6050_smc;
+	u32			t6050_warm_key;
+	u32			t6050_warm_writes[2 * APPLE_PCIE_T6050_WARM_WRITES];
+	unsigned int		t6050_warm_count;
+	bool			t6050_warm_done;
+	unsigned long		t6050_parked;
+	/* Parked ports whose registers a firmware sleep has taken: not even their root port answers */
+	unsigned long		t6050_cold_lost;
+	/* Ports back up whose functions are still to be looked for, and whose root port is restored */
+	unsigned long		t6050_rescan;
+	unsigned long		t6050_rp_restored;
+	/* This wake brought the radio's port back, its endpoint reset: the port stays up from here */
+	bool			t6050_woke;
 	struct pci_config_window *cfg;
 	struct apple_tunable	*rc_tunable;
 	struct apple_tunable	*fabric_tunable;
@@ -639,6 +678,8 @@ struct apple_pcie_port {
 	bool			restore_cold;
 	/* The result of setting it up again (apple_pcie_conventional_up()) */
 	int			restore_ret;
+	struct device		*cold_dart;	/* a parked port's DART: gated while the port is parked */
+	struct pci_saved_state	*cold_rp_state;	/* a parked port's root port, as it was before the park */
 };
 
 /* A function's configuration, for its link back after a resume from disk. */
@@ -2722,6 +2763,27 @@ static void apple_pcie_t6050_cold_unwind(struct apple_pcie_port *port)
 		 port->idx);
 }
 
+/* The reset table cleared the routes and the MSI setup: put back what Linux set */
+static int apple_pcie_t6050_port_routes(struct apple_pcie_port *port, const u32 *routes)
+{
+	struct apple_pcie *pcie = port->pcie;
+	int ret = 0, slot, i;
+
+	for_each_set_bit(slot, &port->adopted_slots, BITS_PER_LONG)
+		if (apple_pcie_rid2sid_write(port, slot, routes[slot]) != routes[slot])
+			ret = -EIO;
+	apple_pcie_port_writel(port, lower_32_bits(DOORBELL_ADDR), pcie->hw->port_msiaddr);
+	if (pcie->hw->port_msiaddr_hi)
+		apple_pcie_port_writel(port, 0, pcie->hw->port_msiaddr_hi);
+	for (i = 0; i < pcie->nvecs; i++)
+		apple_pcie_port_writel(port, FIELD_PREP(PORT_MSIMAP_TARGET, pcie->msi_vector_base + i) |
+				       PORT_MSIMAP_ENABLE, pcie->hw->port_msimap + 4 * i);
+	writel(PCIEC_INTR2AXI_ENABLE, port->intr2axi + PCIEC_INTR2AXI_CTRL);
+	readl(port->intr2axi + 0x84);
+	apple_pcie_port_writel(port, PORT_MSICFG_EN, PORT_MSICFG);
+	return ret;
+}
+
 /*
  * Root-port reset of an adopted T6050 port, for an endpoint that must come back on a
  * retrained link (the N1 after its ROM boot): PME_Turn_Off to L2, PERST# asserted, the
@@ -2736,10 +2798,13 @@ static int apple_pcie_t6050_reset_root_port(struct pci_host_bridge *bridge,
 	struct apple_pcie *pcie = apple_pcie_lookup(cfg->parent);
 	struct apple_pcie_port *port = NULL, *p;
 	u32 routes[BITS_PER_LONG], value;
-	int ret, slot, i;
+	int ret, slot;
 
 	if (!pcie || !pcie->hw->adopt_link || !pci_is_root_bus(rp->bus))
 		return -EOPNOTSUPP;
+	/* Down for a firmware sleep, or since a wake that failed: nothing there is read */
+	if (READ_ONCE(pcie->t6050_down))
+		return -EHOSTDOWN;
 	list_for_each_entry(p, &pcie->ports, entry)
 		if (p->idx == PCI_SLOT(rp->devfn))
 			port = p;
@@ -2770,19 +2835,7 @@ static int apple_pcie_t6050_reset_root_port(struct pci_host_bridge *bridge,
 	if (ret)
 		goto out;
 
-	/* The reset table cleared the routes and the MSI setup: put back what Linux set */
-	for_each_set_bit(slot, &port->adopted_slots, BITS_PER_LONG)
-		if (apple_pcie_rid2sid_write(port, slot, routes[slot]) != routes[slot])
-			ret = -EIO;
-	apple_pcie_port_writel(port, lower_32_bits(DOORBELL_ADDR), pcie->hw->port_msiaddr);
-	if (pcie->hw->port_msiaddr_hi)
-		apple_pcie_port_writel(port, 0, pcie->hw->port_msiaddr_hi);
-	for (i = 0; i < pcie->nvecs; i++)
-		apple_pcie_port_writel(port, FIELD_PREP(PORT_MSIMAP_TARGET, pcie->msi_vector_base + i) |
-				       PORT_MSIMAP_ENABLE, pcie->hw->port_msimap + 4 * i);
-	writel(PCIEC_INTR2AXI_ENABLE, port->intr2axi + PCIEC_INTR2AXI_CTRL);
-	readl(port->intr2axi + 0x84);
-	apple_pcie_port_writel(port, PORT_MSICFG_EN, PORT_MSICFG);
+	ret = apple_pcie_t6050_port_routes(port, routes);
 	if (ret)
 		goto out;
 
@@ -3876,12 +3929,18 @@ static void __iomem *apple_pcie_map_bus(struct pci_bus *bus,
 	if (!apple_radio_config_allowed(pcie))
 		return NULL;
 	if (pcie->hw->adopt_link) {
+		/* Down for a firmware sleep, or since a wake that failed: not even the root port */
+		if (READ_ONCE(pcie->t6050_down))
+			return NULL;
 		/* Only adopted ports' root ports, and the endpoint behind each. */
 		list_for_each_entry(port, &pcie->ports, entry) {
 			if (bus->number == 0) {
-				if (devfn == PCI_DEVFN(port->idx, 0))
-					return pci_ecam_map_bus(bus, devfn, where);
-				continue;
+				if (devfn != PCI_DEVFN(port->idx, 0))
+					continue;
+				/* Parked, and a sleep took its registers: nothing there to read or restore */
+				if (READ_ONCE(pcie->t6050_cold_lost) & BIT(port->idx))
+					return NULL;
+				return pci_ecam_map_bus(bus, devfn, where);
 			}
 			if (bus->number != port->adopted_bus)
 				continue;
@@ -4857,7 +4916,7 @@ static int apple_pcie_neo_get(struct platform_device *pdev, const char *name, co
 }
 
 /* The DART in the host's iommu-map, which reads nothing until the port is set up. */
-static struct device *apple_pcie_neo_dart(struct device *dev)
+static struct device *apple_pcie_neo_dart(struct device *dev, bool retried)
 {
 	struct device_node *np = of_parse_phandle(dev->of_node, "iommu-map", 1);
 	struct platform_device *pdev = np ? of_find_device_by_node(np) : NULL;
@@ -4873,7 +4932,11 @@ static struct device *apple_pcie_neo_dart(struct device *dev)
 		ret = -EINVAL;
 	if (ret) {
 		put_device(&pdev->dev);
-		dev_warn(dev, "no deep sleep: its DART can't wait for the port: %d\n", ret);
+		/* Not bound yet, and the caller looks again when a sleep starts */
+		if (ret == -EPROBE_DEFER && retried)
+			dev_dbg(dev, "the port's DART isn't bound yet\n");
+		else
+			dev_warn(dev, "no deep sleep: its DART can't wait for the port: %d\n", ret);
 		return NULL;
 	}
 	return &pdev->dev;
@@ -4930,7 +4993,7 @@ static void apple_pcie_neo_sleep_probe(struct platform_device *pdev, struct appl
 							 cfg);
 	if (IS_ERR(cold->rc_gen4_tunable))
 		goto absent;
-	cold->dart = apple_pcie_neo_dart(dev);
+	cold->dart = apple_pcie_neo_dart(dev, false);
 	if (!cold->dart)
 		goto absent;
 
@@ -4955,6 +5018,612 @@ absent:
 }
 
 #include "pcie-apple-radio.c"
+
+/*
+ * A firmware sleep of a T6050 host whose port a boot loader trained (the J714s's N1). The SoC's
+ * sleep engine needs the port's link shut down before the commit, and the sleep takes the
+ * port's, its DART's and the shared PHY's state while the endpoint keeps its power, held in
+ * PERST#. So the noirq suspend shuts the link down (the sleep driver's sequence), with the
+ * DART saved and gated first, and the noirq resume sets the port up again: the port's reset
+ * table and enable, the root complex setup, the routes, the DART, the MSI setup, then the lane
+ * clocks, PERST# and the LTSSM. The PCI core
+ * restores the root port and the functions after that. The DART is clocked by the port: it
+ * waits for the host (apple_dart_set_host_resumes()), and is not read while the port is down.
+ */
+/*
+ * The other ports of that host, those Linux powers and trains (the J714s SD card reader): the
+ * firmware sleep takes their power and their state. Before the freeze their functions are
+ * removed and the port parked as a shutdown leaves it. macOS does the same to that port before
+ * the radio's, and switches the reader's power off after it.
+ *
+ * The port's DART is clocked by the port, as the radio's is: once the port is parked it does
+ * not answer, and after the sleep a write to it is an external abort. So it is saved and gated
+ * here, with the port still up, and marked as one its host resumes: its own resume then leaves
+ * it alone. The root port's config space goes with the port's registers as well; what the PCI
+ * core has to put back is kept from before the park.
+ *
+ * The root port itself is suspended at run time first, with the port still up: idle, it would
+ * be put into D3hot a moment later, through a port that no longer answers.
+ *
+ * After the wake the port comes back as under macOS (apple_pcie_t6050_cold_wake()), or, with
+ * t6050_sd_port_wake=0, stays parked, with no functions, until a restart.
+ */
+static struct device *apple_pcie_t6050_cold_dart(struct apple_pcie_port *port)
+{
+	struct of_phandle_args iommu = {};
+	struct platform_device *pdev;
+	int ret;
+
+	if (of_map_iommu_id(port->pcie->dev->of_node, port->adopted_bus << 8, &iommu) ||
+	    !iommu.np)
+		return NULL;
+	pdev = of_find_device_by_node(iommu.np);
+	of_node_put(iommu.np);
+	if (!pdev)
+		return NULL;
+	/* The reference is kept: this host can't be unbound. Not bound: nothing resumes it. */
+	ret = apple_dart_set_host_resumes(&pdev->dev);
+	if (ret) {
+		if (ret != -EPROBE_DEFER)
+			dev_warn(port->pcie->dev,
+				 "port %d: its DART can't wait for the port (%d): its own resume writes it at the wake\n",
+				 port->idx, ret);
+		put_device(&pdev->dev);
+		return NULL;
+	}
+	return &pdev->dev;
+}
+
+static void apple_pcie_t6050_park_cold(struct apple_pcie *pcie)
+{
+	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
+	struct apple_pcie_port *port;
+	struct pci_dev *dev, *tmp;
+	int slot;
+
+	pci_lock_rescan_remove();
+	list_for_each_entry(port, &pcie->ports, entry) {
+		bool link_up;
+
+		if (port == pcie->t6050_port || !port->pwren || (pcie->t6050_parked & BIT(port->idx)))
+			continue;
+		if (!port->cold_dart)
+			port->cold_dart = apple_pcie_t6050_cold_dart(port);
+		list_for_each_entry_safe_reverse(dev, tmp, &bridge->bus->devices, bus_list) {
+			if (PCI_SLOT(dev->devfn) != port->idx || !dev->subordinate)
+				continue;
+			pm_runtime_get_sync(&dev->dev);
+			while (!list_empty(&dev->subordinate->devices))
+				pci_stop_and_remove_bus_device(list_last_entry(&dev->subordinate->devices,
+									       struct pci_dev, bus_list));
+			/* The root port as it is now, for the PCI core after the port is back */
+			kfree(port->cold_rp_state);
+			port->cold_rp_state = NULL;
+			if (!pci_save_state(dev))
+				port->cold_rp_state = pci_store_saved_state(dev);
+			pm_runtime_put_sync_suspend(&dev->dev);
+		}
+		mutex_lock(&pcie->lock);
+		link_up = apple_pcie_port_readl(port, PORT_LINKSTS) & PORT_LINKSTS_UP;
+		apple_pcie_port_disable_irq(port);
+		port->saved_intmask = apple_pcie_port_readl(port, PORT_INTMSK);
+		for_each_set_bit(slot, &port->adopted_slots, BITS_PER_LONG)
+			port->saved_rid2sid[slot] = apple_pcie_port_readl(port,
+									  port_rid2sid_offset(port, slot));
+		if (port->cold_dart) {
+			apple_dart_state_save(port->cold_dart);
+			apple_dart_quiesce_commands(port->cold_dart);
+		}
+		apple_pcie_t6050_port_park(port, link_up);
+		mutex_unlock(&pcie->lock);
+		pcie->t6050_parked |= BIT(port->idx);
+		dev_info(pcie->dev, "port %d: parked for the sleep, its functions removed%s\n", port->idx,
+			 port->cold_dart ? ", its DART saved and gated" : "");
+	}
+	pci_unlock_rescan_remove();
+}
+
+/*
+ * A parked port back up, in macOS's order at its wake (after the radio's port): PERST# held,
+ * the endpoint's power on and the boot-time bring-up's wait for it, the port's reset table and
+ * enable, the root complex setup, the MSI setup and the routes, the DART, then the lane clocks,
+ * PERST# released and the LTSSM. With the host's lock held.
+ */
+static int apple_pcie_t6050_cold_up(struct apple_pcie_port *port, u32 *status)
+{
+	struct apple_pcie *pcie = port->pcie;
+	int ret;
+
+	*status = 0;
+
+	if (!(readl(pcie->base + CORE_RC_CTL) & CORE_RC_CTL_RUN) ||
+	    !(readl(pcie->base + CORE_RC_STAT) & CORE_RC_STAT_READY))
+		return -ENOLINK;
+	ret = apple_pcie_t6050_perst(port, true);
+	if (ret)
+		return ret;
+	/* From here the endpoint may be on, and a failure has to park the port */
+	port->powered = true;
+	ret = gpiod_set_value_cansleep(port->pwren, 1);
+	if (ret)
+		return ret;
+	msleep(150);
+	ret = apple_pcie_t6050_port_enable(port);
+	if (ret)
+		return ret;
+	ret = apple_pcie_t6050_port_configure(port) ?:
+	      apple_pcie_t6050_port_routes(port, port->saved_rid2sid);
+	/* The port is clocked: its DART answers again */
+	if (!ret && port->cold_dart)
+		ret = apple_dart_host_restart(port->cold_dart);
+	if (!ret)
+		ret = apple_pcie_t6050_port_train(port);
+	*status = apple_pcie_port_readl(port, PORT_LINKSTS);
+	if (ret)
+		return ret;
+	apple_pcie_port_writel(port, ~0, PORT_INTSTAT);
+	apple_pcie_port_writel(port, port->saved_intmask, PORT_INTMSK);
+	WRITE_ONCE(port->link_failed, false);
+	return 0;
+}
+
+/*
+ * One parked port back up: the link, its DART, and, in the early resume, the root port's config
+ * space. The PCI core's noirq resume of that root port came before this, with the port still
+ * down: it found the root port out of reach and restored nothing. Its later phases, and the
+ * port services' resume, find it as it was before the park.
+ */
+static int apple_pcie_t6050_cold_wake(struct apple_pcie *pcie, struct apple_pcie_port *port,
+				      bool early)
+{
+	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
+	ktime_t start = ktime_get();
+	struct pci_dev *rp;
+	u32 status;
+	int ret;
+
+	mutex_lock(&pcie->lock);
+	ret = apple_pcie_t6050_cold_up(port, &status);
+	if (ret && port->powered) {
+		/* Clocked but not up: held as a shutdown leaves it, its DART out of reach again */
+		if (port->cold_dart)
+			apple_dart_quiesce_commands(port->cold_dart);
+		apple_pcie_t6050_port_park(port, false);
+	}
+	mutex_unlock(&pcie->lock);
+	if (ret) {
+		dev_err(pcie->dev, "port %d: not back after the sleep: %d, status %#x; %s\n",
+			port->idx, ret, status,
+			early ? "tried once more when the resume is over" :
+			"it stays parked until a restart");
+		return ret;
+	}
+	WRITE_ONCE(pcie->t6050_cold_lost, pcie->t6050_cold_lost & ~BIT(port->idx));
+	pcie->t6050_parked &= ~BIT(port->idx);
+	pcie->t6050_rescan |= BIT(port->idx);
+	rp = early ? pci_get_domain_bus_and_slot(pci_domain_nr(bridge->bus), 0,
+						  PCI_DEVFN(port->idx, 0)) : NULL;
+	if (rp) {
+		/* Runtime PM is off in this phase: the power state and the config space directly */
+		if (port->cold_rp_state && !pci_set_power_state(rp, PCI_D0) &&
+		    !pci_load_saved_state(rp, port->cold_rp_state)) {
+			pci_restore_state(rp);
+			pcie->t6050_rp_restored |= BIT(port->idx);
+		}
+		pci_dev_put(rp);
+	}
+	apple_pcie_port_enable_irq(port);
+	dev_info(pcie->dev, "port %d: link up again after the sleep in %lld ms, status %#x%s\n",
+		 port->idx, ktime_ms_delta(ktime_get(), start), status,
+		 !early ? "" : pcie->t6050_rp_restored & BIT(port->idx) ?
+		 ", in the early resume, its root port restored" :
+		 ", in the early resume, its root port not restored yet");
+	return 0;
+}
+
+/*
+ * With every device resumed and the tasks thawed: the PCI core gets the root port's config
+ * space again, if the early resume has not given it back, and finds the port's functions.
+ */
+static void apple_pcie_t6050_cold_rescan(struct apple_pcie *pcie, struct apple_pcie_port *port)
+{
+	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
+	bool restored = pcie->t6050_rp_restored & BIT(port->idx);
+	bool found = false;
+	struct pci_dev *rp;
+
+	rp = pci_get_domain_bus_and_slot(pci_domain_nr(bridge->bus), 0, PCI_DEVFN(port->idx, 0));
+	if (rp) {
+		/* Should the root port be runtime-suspended, its resume restores this too */
+		if (!restored && port->cold_rp_state)
+			pci_load_saved_state(rp, port->cold_rp_state);
+		pm_runtime_get_sync(&rp->dev);
+		if (!restored) {
+			pci_set_power_state(rp, PCI_D0);
+			if (port->cold_rp_state) {
+				pci_load_and_free_saved_state(rp, &port->cold_rp_state);
+				pci_restore_state(rp);
+				restored = true;
+			}
+		}
+		if (restored) {
+			pci_lock_rescan_remove();
+			if (rp->subordinate) {
+				pci_rescan_bus(rp->subordinate);
+				found = !list_empty(&rp->subordinate->devices);
+			}
+			pci_unlock_rescan_remove();
+		}
+		pm_runtime_put(&rp->dev);
+		pci_dev_put(rp);
+	}
+	kfree(port->cold_rp_state);
+	port->cold_rp_state = NULL;
+	pcie->t6050_rescan &= ~BIT(port->idx);
+	pcie->t6050_rp_restored &= ~BIT(port->idx);
+	dev_info(pcie->dev, "port %d: its functions %s after the sleep\n", port->idx,
+		 found ? "found again" : "not found");
+}
+
+/*
+ * This host's early resume, the first phase with interrupts on, and so the first in which the
+ * SMC can switch the endpoint's power: the parked ports come back here, right after the phase
+ * the radio's port came back in, as under macOS. Only after a sleep whose wake left the radio's
+ * port up for good: after a suspend that was abandoned, or a wake that could not reset the
+ * radio, its driver takes that port down and up once more, and the shared PHY with it. The
+ * parked ports then wait for the end of the resume.
+ */
+static void apple_pcie_t6050_unpark_cold_early(struct apple_pcie *pcie)
+{
+	struct apple_pcie_port *port;
+
+	if (t6050_sd_port_wake != 1 || !pcie->t6050_woke || READ_ONCE(pcie->t6050_down) ||
+	    pcie->t6050_lost)
+		return;
+	list_for_each_entry(port, &pcie->ports, entry)
+		if (pcie->t6050_parked & BIT(port->idx))
+			apple_pcie_t6050_cold_wake(pcie, port, true);
+}
+
+/*
+ * After a suspend, with every device resumed and the tasks thawed (the park ran before the
+ * freeze): the ports still parked come back, and the functions of every port that is back are
+ * found again. Also after a suspend that was abandoned, where the port was parked and nothing
+ * was lost.
+ */
+static void apple_pcie_t6050_unpark_cold(struct apple_pcie *pcie)
+{
+	struct apple_pcie_port *port;
+
+	list_for_each_entry(port, &pcie->ports, entry) {
+		int i;
+
+		if (pcie->t6050_rescan & BIT(port->idx)) {
+			apple_pcie_t6050_cold_rescan(pcie, port);
+			continue;
+		}
+		if (!(pcie->t6050_parked & BIT(port->idx)))
+			continue;
+		if (!t6050_sd_port_wake) {
+			dev_info(pcie->dev, "port %d: stays parked after the sleep (t6050_sd_port_wake=0)\n",
+				 port->idx);
+			continue;
+		}
+		/*
+		 * The shared PHY and the root complex come back with the radio's port, which its
+		 * endpoint's driver may be taking down and up once more for the warm reset
+		 */
+		for (i = 0; i < 40 && READ_ONCE(pcie->t6050_down) && !pcie->t6050_lost; i++)
+			msleep(50);
+		if (READ_ONCE(pcie->t6050_down) || pcie->t6050_lost) {
+			dev_warn(pcie->dev, "port %d: stays parked: the radio's port is not back\n",
+				 port->idx);
+			continue;
+		}
+		if (!apple_pcie_t6050_cold_wake(pcie, port, false))
+			apple_pcie_t6050_cold_rescan(pcie, port);
+	}
+}
+
+static int apple_pcie_t6050_pm_notify(struct notifier_block *nb, unsigned long action, void *unused)
+{
+	struct apple_pcie *pcie = container_of(nb, struct apple_pcie, t6050_pm_nb);
+
+	if (action == PM_POST_SUSPEND) {
+		if (pcie->t6050_parked || pcie->t6050_rescan)
+			apple_pcie_t6050_unpark_cold(pcie);
+		return NOTIFY_DONE;
+	}
+	if (action != PM_SUSPEND_PREPARE)
+		return NOTIFY_DONE;
+	pcie->t6050_woke = false;
+	/* A suspend that never shuts the link down gives no reset: the last wake's doesn't count */
+	pcie->t6050_warm_done = false;
+	/*
+	 * The DART wasn't bound when this host probed. Looked up here, before the freezer and any
+	 * device callback: a device link added in the noirq phase would reorder this host in the
+	 * PM lists in the middle of the suspend.
+	 */
+	if (!pcie->t6050_dart)
+		pcie->t6050_dart = apple_pcie_neo_dart(pcie->dev, false);
+	if (!pm_suspend_default_s2idle())
+		apple_pcie_t6050_park_cold(pcie);
+	return NOTIFY_DONE;
+}
+
+/*
+ * The endpoint's warm reset: "apple,function-warm-reset" on the port names the SMC and the
+ * key (the ADT's function-warm_reset), "apple,warm-reset-writes" the writes: the key's value,
+ * its bytes from the cell's most significant down, and the wait after it in microseconds. The
+ * reset has to be given while the port is down and not set up, and the port set up only after
+ * it: the link then trains a chip that was just reset. Given on a trained link, it takes the
+ * link down and the link does not come back. Without both properties this host gives no reset.
+ */
+static void apple_pcie_t6050_warm_reset_probe(struct platform_device *pdev, struct apple_pcie *pcie,
+					      struct apple_pcie_port *port)
+{
+	struct of_phandle_args fn;
+	int count, i;
+
+	if (!IS_REACHABLE(CONFIG_MFD_MACSMC) ||
+	    of_parse_phandle_with_fixed_args(port->np, "apple,function-warm-reset", 2, 0, &fn))
+		return;
+	pcie->t6050_smc = of_find_device_by_node(fn.np);
+	of_node_put(fn.np);
+	if (!pcie->t6050_smc)
+		return;
+	count = of_property_count_u32_elems(port->np, "apple,warm-reset-writes");
+	if (count < 2 || count % 2 || count > ARRAY_SIZE(pcie->t6050_warm_writes) ||
+	    of_property_read_u32_array(port->np, "apple,warm-reset-writes",
+				       pcie->t6050_warm_writes, count))
+		goto drop;
+	for (i = 1; i < count; i += 2)
+		if (pcie->t6050_warm_writes[i] > 100 * USEC_PER_MSEC)
+			goto drop;
+	/* The SMC's noirq resume comes before this host's: the reset is written from there */
+	if (!device_link_add(&pdev->dev, &pcie->t6050_smc->dev, DL_FLAG_STATELESS)) {
+		dev_warn(&pdev->dev, "no warm reset after a sleep: no link to the SMC\n");
+		goto drop;
+	}
+	pcie->t6050_warm_key = fn.args[0];
+	pcie->t6050_warm_count = count / 2;
+	return;
+drop:
+	put_device(&pcie->t6050_smc->dev);
+	pcie->t6050_smc = NULL;
+}
+
+/*
+ * With the port down. In the noirq resume the SMC's reply is polled for: the one SMC write
+ * outside the interrupt-driven path, because the port has to be up before the PCI core's noirq
+ * restore of the root port and the functions, and the reset has to come before the port.
+ */
+static void apple_pcie_t6050_warm_reset(struct apple_pcie *pcie, bool noirq)
+{
+	struct apple_smc *smc;
+	unsigned int i;
+	int ret = 0;
+
+	pcie->t6050_warm_done = false;
+	if (!IS_REACHABLE(CONFIG_MFD_MACSMC) || !pcie->t6050_warm_count)
+		return;
+	smc = platform_get_drvdata(pcie->t6050_smc);
+	if (!smc) {
+		dev_warn(pcie->dev, "no warm reset: the SMC isn't bound\n");
+		return;
+	}
+	for (i = 0; i < pcie->t6050_warm_count && !ret; i++) {
+		__be32 value = cpu_to_be32(pcie->t6050_warm_writes[2 * i]);
+		u32 wait = pcie->t6050_warm_writes[2 * i + 1];
+		smc_key key = pcie->t6050_warm_key;
+
+		if (noirq) {
+			ret = apple_smc_write_noirq(smc, key, &value, sizeof(value));
+			if (!ret) {
+				mdelay(wait / USEC_PER_MSEC);
+				udelay(wait % USEC_PER_MSEC);
+			}
+		} else {
+			ret = apple_smc_write(smc, key, &value, sizeof(value));
+			if (!ret)
+				fsleep(wait);
+		}
+	}
+	pcie->t6050_warm_done = !ret;
+	if (ret)
+		dev_err(pcie->dev, "endpoint warm reset before the port comes up: %d\n", ret);
+	else
+		dev_dbg(pcie->dev, "endpoint warm reset before the port comes up\n");
+}
+
+/*
+ * The adopted host's firmware sleep is set up on the board it has run on, the J714s. On another
+ * T6050 board nothing is registered and no port is taken for it: the host is as before.
+ */
+static void apple_pcie_t6050_sleep_probe(struct platform_device *pdev, struct apple_pcie *pcie)
+{
+	struct apple_pcie_port *port;
+
+	if (pcie->managed_sids || !of_machine_is_compatible("apple,j714s"))
+		return;
+	/* The one port a boot loader trained; an endpoint Linux powers is parked instead. */
+	list_for_each_entry(port, &pcie->ports, entry)
+		if (port->perst && port->intr2axi && port->phy && !port->pwren)
+			break;
+	if (list_entry_is_head(port, &pcie->ports, entry))
+		return;
+	pcie->t6050_port = port;
+	pcie->t6050_pm_nb.notifier_call = apple_pcie_t6050_pm_notify;
+	if (register_pm_notifier(&pcie->t6050_pm_nb))
+		pcie->t6050_pm_nb.notifier_call = NULL;
+	apple_pcie_t6050_warm_reset_probe(pdev, pcie, port);
+	/* The host can probe before its DART: the notifier looks again when a sleep starts */
+	pcie->t6050_dart = apple_pcie_neo_dart(&pdev->dev, !!pcie->t6050_pm_nb.notifier_call);
+}
+
+static int apple_pcie_t6050_sleep_down(struct apple_pcie *pcie)
+{
+	struct apple_pcie_port *port;
+	int slot, ret;
+
+	if (!pcie->t6050_port)
+		return -EBUSY;
+	if (!pcie->t6050_dart) {
+		dev_warn(pcie->dev, "deep sleep refused: the port's DART can't wait for it\n");
+		return -EBUSY;
+	}
+	port = pcie->t6050_port;
+
+	mutex_lock(&pcie->lock);
+	apple_pcie_port_disable_irq(port);
+	port->saved_intmask = apple_pcie_port_readl(port, PORT_INTMSK);
+	for_each_set_bit(slot, &port->adopted_slots, BITS_PER_LONG)
+		port->saved_rid2sid[slot] = apple_pcie_port_readl(port,
+								  port_rid2sid_offset(port, slot));
+	/* The DART's registers go with the port's clock: saved now, untouched until the wake */
+	ret = apple_dart_state_save(pcie->t6050_dart);
+	if (!ret) {
+		apple_dart_quiesce_commands(pcie->t6050_dart);
+		WRITE_ONCE(pcie->t6050_down, true);
+		ret = apple_sleep_radio_port_down();
+		if (ret) {
+			/* Nothing was written: the port and its DART are as they were */
+			WRITE_ONCE(pcie->t6050_down, false);
+			apple_dart_host_resume(pcie->t6050_dart);
+		}
+	}
+	if (ret)
+		apple_pcie_port_enable_irq(port);
+	mutex_unlock(&pcie->lock);
+	if (ret) {
+		dev_err(pcie->dev, "port %d: link not shut down for the sleep: %d\n", port->idx, ret);
+		return -EBUSY;
+	}
+	dev_info(pcie->dev, "port %d: link shut down for the sleep\n", port->idx);
+	return 0;
+}
+
+static int apple_pcie_t6050_sleep_up(struct apple_pcie *pcie, bool noirq)
+{
+	struct pci_host_bridge *bridge = pci_host_bridge_from_priv(pcie);
+	struct apple_pcie_port *port;
+	bool park = false;
+	ktime_t start = ktime_get();
+	int ret;
+
+	if (!READ_ONCE(pcie->t6050_down) || pcie->t6050_lost)
+		return 0;
+	port = pcie->t6050_port;
+
+	/* The sleep driver started the shared PHY and the root complex, or says not to read them */
+	ret = apple_sleep_radio_rc_ready();
+	if (ret)
+		goto lost;
+	mutex_lock(&pcie->lock);
+	if (!(readl(pcie->base + CORE_RC_CTL) & CORE_RC_CTL_RUN) ||
+	    !(readl(pcie->base + CORE_RC_STAT) & CORE_RC_STAT_READY)) {
+		ret = -ENOLINK;
+		goto unlock;
+	}
+	park = true;
+	apple_pcie_t6050_warm_reset(pcie, noirq);
+	/* The pin restore left PERST# low, as the shutdown did; it stays low until the train */
+	ret = apple_pcie_t6050_perst(port, true) ?:
+	      apple_pcie_t6050_port_enable(port) ?:
+	      apple_pcie_t6050_port_configure(port);
+	if (ret)
+		goto unlock;
+	apple_sleep_radio_port_wake(0);
+	ret = apple_pcie_t6050_port_routes(port, port->saved_rid2sid);
+	if (ret)
+		goto unlock;
+	/* The port is clocked: its DART answers again */
+	ret = apple_dart_host_restart(pcie->t6050_dart);
+	if (ret)
+		goto unlock;
+	apple_sleep_radio_port_wake(1);
+	ret = apple_pcie_t6050_port_train(port);
+	if (ret)
+		goto unlock;
+	apple_pcie_port_writel(port, ~0, PORT_INTSTAT);
+	apple_pcie_port_writel(port, port->saved_intmask, PORT_INTMSK);
+	WRITE_ONCE(port->link_failed, false);
+	WRITE_ONCE(pcie->t6050_down, false);
+	dev_info(pcie->dev, "port %d: link up again after the sleep in %lld ms, status %#x\n",
+		 port->idx, ktime_ms_delta(ktime_get(), start),
+		 apple_pcie_port_readl(port, PORT_LINKSTS));
+unlock:
+	if (ret && park) {
+		/* Clocked but not up: held as a shutdown leaves it, its DART out of reach again */
+		apple_dart_quiesce_commands(pcie->t6050_dart);
+		apple_pcie_t6050_port_park(port, false);
+	}
+	mutex_unlock(&pcie->lock);
+lost:
+	if (!ret) {
+		apple_pcie_port_enable_irq(port);
+		return 0;
+	}
+	/* The port, its DART and the functions' config space stay unread until a restart */
+	pcie->t6050_lost = true;
+	WRITE_ONCE(port->link_failed, true);
+	pci_walk_bus(bridge->bus, pci_dev_set_disconnected, NULL);
+	dev_err(pcie->dev, "port %d: not back after the sleep: %d (%s); its functions are out of reach until a restart\n",
+		port->idx, ret, park ? "port held down" : "port not touched");
+	return 0;
+}
+
+static struct platform_driver apple_pcie_driver;
+
+static struct apple_pcie *apple_pcie_t6050_from_bridge(struct pci_dev *bridge)
+{
+	struct pci_host_bridge *host = bridge ? pci_find_host_bridge(bridge->bus) : NULL;
+	struct apple_pcie *pcie;
+
+	if (!host || !host->dev.parent || host->dev.parent->driver != &apple_pcie_driver.driver)
+		return NULL;
+	pcie = pci_host_bridge_priv(host);
+	return pcie->t6050_port ? pcie : NULL;
+}
+
+/* For the endpoint's driver: the host has reset the endpoint at this wake, before the link. */
+bool apple_pcie_t6050_warm_reset_done(struct pci_dev *bridge)
+{
+	struct apple_pcie *pcie = apple_pcie_t6050_from_bridge(bridge);
+
+	return pcie && pcie->t6050_warm_done;
+}
+EXPORT_SYMBOL_GPL(apple_pcie_t6050_warm_reset_done);
+
+/*
+ * For the endpoint's driver after a suspend that was abandoned before this host's shutdown:
+ * the endpoint was taken down for the sleep and needs its warm reset, but its link never went
+ * down, and a reset given on a trained link takes the link down for good. The port goes down
+ * as for a sleep, the reset is given with the port down, and the port comes up as after a wake.
+ * No function may exist below the port. 0: the endpoint is reset and the link is up.
+ */
+int apple_pcie_t6050_port_recycle(struct pci_dev *bridge)
+{
+	struct apple_pcie *pcie = apple_pcie_t6050_from_bridge(bridge);
+	int ret;
+
+	if (!pcie)
+		return -ENODEV;
+	if (!pcie->t6050_warm_count || pcie->t6050_lost || READ_ONCE(pcie->t6050_down))
+		return -EBUSY;
+	pci_save_state(bridge);
+	ret = apple_pcie_t6050_sleep_down(pcie);
+	if (ret)
+		return ret;
+	apple_pcie_t6050_sleep_up(pcie, false);
+	if (pcie->t6050_lost)
+		return -ENOLINK;
+	pci_restore_state(bridge);
+	dev_info(pcie->dev, "port %d: taken down and up for the endpoint's warm reset: %s\n",
+		 pcie->t6050_port->idx, pcie->t6050_warm_done ? "reset" : "no reset");
+	return pcie->t6050_warm_done ? 0 : -EIO;
+}
+EXPORT_SYMBOL_GPL(apple_pcie_t6050_port_recycle);
 
 static int apple_pcie_probe(struct platform_device *pdev)
 {
@@ -5178,6 +5847,8 @@ static int apple_pcie_probe(struct platform_device *pdev)
 
 	if (pcie->hw->tunneled)
 		pci_walk_bus(bridge->bus, apple_pcie_tunnel_keep_d0, NULL);
+	if (pcie->hw->adopt_link)
+		apple_pcie_t6050_sleep_probe(pdev, pcie);
 
 	apple_radio_register(pdev, pcie);
 	return 0;
@@ -5670,11 +6341,15 @@ static void apple_pcie_shutdown(struct platform_device *pdev)
 	struct pci_dev *rp;
 	u32 value;
 
-	if (!pcie->hw->adopt_link)
+	/* A port a failed wake left down is held already, and may not answer */
+	if (!pcie->hw->adopt_link || READ_ONCE(pcie->t6050_down))
 		return;
 	mutex_lock(&pcie->lock);
 	list_for_each_entry(port, &pcie->ports, entry) {
 		if (!port->perst || !port->base || !port->phy)
+			continue;
+		/* Parked for a sleep and not brought back: held already, and may not answer */
+		if (pcie->t6050_parked & BIT(port->idx))
 			continue;
 		rp = pci_get_domain_bus_and_slot(pci_domain_nr(bridge->bus), 0,
 						 PCI_DEVFN(port->idx, 0));
@@ -6314,7 +6989,17 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 	if (pcie->managed_sids && pm_suspend_target_state != PM_SUSPEND_TO_IDLE)
 		return apple_radio_suspend_noirq(pcie);
 	if (!pcie->managed_sids && pcie->hw->adopt_link) {
-		int ret = apple_pcie_check_adopted_s2idle(pcie);
+		int ret;
+
+		/* Down since a wake that failed: nothing to keep or shut down, nothing read */
+		if (READ_ONCE(pcie->t6050_down))
+			return 0;
+		if (pm_suspend_via_firmware()) {
+			/* The root ports below are suspended: from here a parked port's is not read */
+			WRITE_ONCE(pcie->t6050_cold_lost, pcie->t6050_parked);
+			return apple_pcie_t6050_sleep_down(pcie);
+		}
+		ret = apple_pcie_check_adopted_s2idle(pcie);
 
 		pcie->link_kept = !ret;
 		return ret;
@@ -6771,6 +7456,9 @@ static int apple_pcie_resume_early(struct device *dev)
 
 	if (pcie && pcie->neo_cold)
 		complete_all(&pcie->neo_noirq_done);
+	/* T6050: the ports parked for the sleep, now that the SMC can power their endpoints */
+	if (pcie && pcie->t6050_parked)
+		apple_pcie_t6050_unpark_cold_early(pcie);
 	return 0;
 }
 
@@ -6802,6 +7490,27 @@ static int apple_pcie_resume_noirq(struct device *dev)
 	if (pcie->neo_sleep_armed)
 		return apple_pcie_neo_resume_noirq(pcie);
 	if (pcie->hw->adopt_link) {
+		/* Also after a sleep that was abandoned: the link is down either way */
+		if (READ_ONCE(pcie->t6050_down)) {
+			ret = apple_pcie_t6050_sleep_up(pcie, true);
+			/* Up, and the endpoint reset if it has a reset: nothing takes it down again */
+			pcie->t6050_woke = !READ_ONCE(pcie->t6050_down) && !pcie->t6050_lost &&
+					   (pcie->t6050_warm_done || !pcie->t6050_warm_count);
+			list_for_each_entry(port, &pcie->ports, entry)
+				if (pcie->t6050_parked & BIT(port->idx))
+					dev_dbg(dev, "port %d at the wake: parked since before the sleep, power off, PERST# low, no functions, root port %s, DART %s; %s\n",
+						port->idx,
+						pcie->t6050_cold_lost & BIT(port->idx) ?
+						"not read" : "readable",
+						port->cold_dart ? "gated" : "not this host's",
+						!t6050_sd_port_wake ?
+						"it stays parked (t6050_sd_port_wake=0)" :
+						pcie->t6050_lost ? "it stays parked, the radio's port is lost" :
+						t6050_sd_port_wake == 1 && pcie->t6050_woke ?
+						"it comes back in the early resume" :
+						"it comes back once the resume is over");
+			return ret;
+		}
 		if (!pcie->link_kept)
 			return 0;
 		pcie->link_kept = false;

@@ -100,6 +100,8 @@ struct dwc3_apple {
 	bool rpm_held, host_only;
 	/* T8132 only: runtime PM before the first core probe; never set here. */
 	bool pre_core_rpm;
+	/* J714s only: the start after a sleep waits for its Type-C PHY; never set here. */
+	bool sleep_phy_wait, sleep_phy_pending;
 	bool dt_dis_u3_susphy;
 	unsigned long usb2_power_off_pending, usb3_power_off_pending;
 };

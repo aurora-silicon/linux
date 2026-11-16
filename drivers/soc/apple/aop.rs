@@ -218,18 +218,18 @@ mod aop_ring;
 /// Index into the AFK endpoint tables for RTKit endpoint `ep`, if it is one
 /// of the endpoints this driver drives.
 /// Iterates over `list`, or over every AFK endpoint if `list` is empty.
-struct AfkOrder {
-    list: &'static [u8],
+struct AfkOrder<'a> {
+    list: &'a [u8],
     next: usize,
 }
 
-impl AfkOrder {
-    fn new(list: &'static [u8]) -> AfkOrder {
+impl<'a> AfkOrder<'a> {
+    fn new(list: &'a [u8]) -> AfkOrder<'a> {
         AfkOrder { list, next: 0 }
     }
 }
 
-impl Iterator for AfkOrder {
+impl Iterator for AfkOrder<'_> {
     type Item = u8;
 
     fn next(&mut self) -> Option<u8> {
@@ -1353,10 +1353,11 @@ struct AopData {
     /// Answers to the stop and start of each endpoint around a system sleep.
     #[pin]
     ep_sleep: [FutureValue<()>; AFK_ENDPOINT_COUNT as usize],
-    /// The order endpoints stop for a system sleep and start after it. Empty
-    /// means all started ones in endpoint order.
-    sleep_endpoints: &'static [u8],
-    wake_endpoints: &'static [u8],
+    /// The order endpoints stop for a system sleep and start after it, from
+    /// the device tree where it gives one. Empty means all started ones in
+    /// endpoint order.
+    sleep_endpoints: KVec<u8>,
+    wake_endpoints: KVec<u8>,
     /// No call starts until the system has resumed.
     sleeping: Atomic<bool>,
     /// RTKit reported the firmware crashed. Nothing restarts it short of a reboot.
@@ -1470,7 +1471,53 @@ impl WorkItem for AopServiceRegisterWork {
 }
 
 impl AopData {
+    /// The order the device tree gives in `name` for the endpoints around a
+    /// system sleep, or `default` where it gives none. A list naming anything
+    /// but an AFK endpoint, or one twice, is not used.
+    fn endpoint_order(dev: &device::Device, name: &CStr, default: &[u8]) -> Result<KVec<u8>> {
+        let mut order = KVec::new();
+        let listed = dev.fwnode().and_then(|node| {
+            let len = node.property_count_elem::<u32>(name).ok()?;
+            node.property_read_array_vec::<u32>(name, len)
+                .ok()?
+                .optional()
+        });
+        if let Some(listed) = listed {
+            let mut seen = 0u32;
+            let distinct = listed.iter().all(|&ep| {
+                let index = u8::try_from(ep).ok().and_then(afk_endpoint_index);
+                index.is_some_and(|index| {
+                    let first = seen & (1 << index) == 0;
+                    seen |= 1 << index;
+                    first
+                })
+            });
+            if distinct {
+                for &ep in listed.iter() {
+                    order.push(ep as u8, GFP_KERNEL)?;
+                }
+                return Ok(order);
+            }
+            dev_warn!(
+                dev,
+                "{}: not a list of distinct endpoints; not used\n",
+                name
+            );
+        }
+        order.extend_from_slice(default, GFP_KERNEL)?;
+        Ok(order)
+    }
     fn new(dev: &platform::Device<Core<'_>>, cfg: &AopHwConfig) -> Result<Arc<AopData>> {
+        let sleep_endpoints = Self::endpoint_order(
+            dev.as_ref(),
+            c_str!("apple,sleep-endpoints"),
+            cfg.sleep_endpoints,
+        )?;
+        let wake_endpoints = Self::endpoint_order(
+            dev.as_ref(),
+            c_str!("apple,wake-endpoints"),
+            cfg.wake_endpoints,
+        )?;
         let registration_queue = OwnedQueue::new_ordered(c_str!("apple-aop"))?;
         let setup_queue = if cfg.setup_port {
             Some(OwnedQueue::new_ordered(c_str!("apple-aop-setup"))?)
@@ -1503,8 +1550,8 @@ impl AopData {
                     call_turn <- pin_init::pin_init_array_from_fn(|_| new_mutex!(())),
                     ep_shutdown <- pin_init::pin_init_array_from_fn(|_| FutureValue::pin_init()),
                     ep_sleep <- pin_init::pin_init_array_from_fn(|_| FutureValue::pin_init()),
-                    sleep_endpoints: cfg.sleep_endpoints,
-                    wake_endpoints: cfg.wake_endpoints,
+                    sleep_endpoints,
+                    wake_endpoints,
                     sleeping: Atomic::new(false),
                     crashed: Atomic::new(false),
                     sleep_stopped: Atomic::new(0),
@@ -1804,7 +1851,7 @@ impl AopData {
                 dev_err!(self.dev, "Wake notice not answered ({:?})", e);
             }
         }
-        let order = AfkOrder::new(self.wake_endpoints);
+        let order = AfkOrder::new(&self.wake_endpoints);
         for endpoint in order {
             let Some(index) = afk_endpoint_index(endpoint) else {
                 continue;
@@ -1841,7 +1888,7 @@ impl AopData {
         }
 
         let mut result = Ok(());
-        for endpoint in AfkOrder::new(self.sleep_endpoints) {
+        for endpoint in AfkOrder::new(&self.sleep_endpoints) {
             let Some(index) = afk_endpoint_index(endpoint) else {
                 continue;
             };
@@ -3169,9 +3216,10 @@ struct AopHwConfig {
     epic_v4: bool,
     /// The firmware boots through a second, "setup", mailbox as well.
     setup_port: bool,
-    /// The order endpoints stop for a system sleep; empty means endpoint order.
+    /// The order endpoints stop for a system sleep where the device tree
+    /// gives none (`apple,sleep-endpoints`); empty means endpoint order.
     sleep_endpoints: &'static [u8],
-    /// The order they start after one.
+    /// The order they start after one (`apple,wake-endpoints`).
     wake_endpoints: &'static [u8],
     /// Its service endpoints are the ones its EPMAP announces, not T8140's.
     setup_epmap_endpoints: bool,

@@ -103,6 +103,8 @@ struct apple_smc_wake_reason;
  * @mutex: Mutex for non-atomic mode
  * @lock: Spinlock for atomic mode
  */
+struct apple_sleep_smc_policy;
+
 struct apple_smc {
 	struct device *dev;
 
@@ -118,6 +120,20 @@ struct apple_smc {
 	bool ap_notified;
 	/* Told of a coming sleep, and not yet of its end. */
 	bool sleep_warned;
+	const struct apple_sleep_smc_policy *sleep_policy;
+	u64 sleep_warn_ack;
+	bool sleep_pmvc_info;
+	/* The saved scope's pmVC after ANS, and when it was answered. */
+	bool saved_pmvc_sent;
+	u64 saved_pmvc_at;
+	/* T6050's saved-context ownership over a sleep. Protected by the
+	 * command mutex, or by the exclusive synchronized RX/PM scope. RX may
+	 * resolve only the matching pending ID; timeout never cancels SRAM use.
+	 */
+	bool saved_enabled, saved_blocked, saved_scope, saved_committed;
+	bool saved_pending, saved_recovery, saved_wake;
+	int saved_fault, saved_notice_error, saved_restore_error;
+	u64 saved_unexpected;
 	/* To be told at the noirq suspend, after the debug link's cut. */
 	bool sleep_warn_late;
 	/* A sleep was committed, and the wake after it has not been declared a full one. */
@@ -172,6 +188,20 @@ int apple_smc_read(struct apple_smc *smc, smc_key key, void *buf, size_t size);
  * Return: Zero on success, negative errno on error
  */
 int apple_smc_write(struct apple_smc *smc, smc_key key, const void *buf, size_t size);
+
+/**
+ * apple_smc_write_noirq - apple_smc_write() from another device's noirq resume
+ * @smc: Pointer to apple_smc struct
+ * @key: smc_key data will be written to
+ * @buf: Buffer from which size bytes of data will be written to SMC
+ * @size: Number of bytes to be written
+ *
+ * The reply is polled for: device interrupts are off. Only for a caller that a
+ * device link orders after the SMC's own noirq resume.
+ *
+ * Return: Zero on success, negative errno on error
+ */
+int apple_smc_write_noirq(struct apple_smc *smc, smc_key key, const void *buf, size_t size);
 
 /**
  * apple_smc_enter_atomic - Enter atomic mode to be able to use apple_smc_write_atomic
