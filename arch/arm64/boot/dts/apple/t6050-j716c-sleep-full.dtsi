@@ -4431,3 +4431,17 @@
 &gpu {
 	apple,sleep-ps-auto = <0xf>;
 };
+
+&{/soc@200000000} {
+	/*
+	 * The cores' power-gate enables, /arm-io/pmgr reg[0] + 0x2c000, one word per core: the
+	 * boot loader leaves core 0's (the boot core's) clear, as on the J714s. Without it the
+	 * boot cluster never powers down, the sleep's first CPU wait never ends and the watchdog
+	 * resets the machine five seconds after the commit.
+	 */
+	cluster_pwrgate: power-gate@28062c000 {
+		compatible = "apple,t6050-cluster-pwrgate", "apple,cluster-pwrgate";
+		reg = <0x2 0x8062c000 0x0 0x4>,
+		      <0x2 0x8062c0c0 0x0 0x4>;
+	};
+};
