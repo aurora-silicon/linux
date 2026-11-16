@@ -145,7 +145,26 @@ struct t6050_dp {
 	bool cio_usb_host;		/* a router host that sleeps in place is bound to this PHY */
 	bool cio_usb_kept;		/* kept for this sleep, until its USB controller's RESULT */
 	bool cio_usb_parked;		/* its PIPE parked behind the router's sleep or refusal */
+	/* J714s: the host on the router's tunnel kept in place through the router's sleep */
+	bool usb2_suspended;		/* USB2 PHY suspended (+0x1c bit 30, +0x4 bit 2), not stopped */
+	bool pipe_gated;		/* PIPE kept on the tunnel producer with its clock off (mux 0x01) */
+	void __iomem *pwrctl;		/* the USB controller's power control, if described */
+	bool usb_hibernated;		/* D3 asked for at the PIPE's park: D0 is asked on every way back */
 };
+
+/*
+ * J714s: how macOS keeps the dock port's USB host through its USB4 router's sleep. The USB2
+ * PHY is not stopped: after the PHY's CIO shutdown usb2phy +0x1c bit 30 is set and +0x4 bit 2
+ * cleared, and both are given back right after the wake, before the PHY's restart, with no port
+ * reset and no tunables. The USB3 PIPE stays on the tunnel producer with its clock gated
+ * (pipehandler +0x4 bits 2:1 set, +0x0 bit 2 set, +0x4 bit 4 cleared, +0xc 0x21 -> 0x01), the
+ * core's reset (+0x1c bit 0) is taken after the CIO shutdown, and at the host's resume +0xc goes
+ * back to 0x21, +0x1c bit 0 is set and +0x0 bit 2 cleared.
+ */
+static bool atc_sleep_macos_usb(void)
+{
+	return of_machine_is_compatible("apple,j714s");
+}
 
 static int atc_domain_set(struct atc_domain *pd, bool active)
 {
@@ -625,6 +644,118 @@ static void atc_dp_tunnels_stop(struct t6050_dp *dp)
 	/* A failed start or gate suspend can leave a held domain at rate zero. */
 	for (unsigned int k = 1; dp->dp_gates && k <= ATC_DP_TUNNELS; k++)
 		atc_domain_set(&dp->dp_gate[k - 1], false);
+}
+
+/*
+ * J714s: the power control of the dock port's USB controller ("pwrctl", the controller's window
+ * beside its PIPE handler), as on T8140. macOS's sleep of that host: right after xHCI's save
+ * (CSS) the controller goes into hibernation (D3 asked for, VDD_OFF awaited and cleared, the wake
+ * events armed, SLEEP in the status), then the PIPE's clock is gated on the tunnel producer. At
+ * the wake the PIPE gets its clock back, the wake events are disarmed, D0 is asked for, the
+ * core's reset is released and D0_ON awaited (about 1 ms); only then are the globals written
+ * back and xHCI restores its state (CRS). Without the hibernation the core loses its power with
+ * nothing kept, and xHCI's restore fails with a save/restore error (USBSTS SRE), so every device
+ * behind the dock is reset at each wake.
+ */
+#define T6050_PWR_CFG			0x00
+#define T6050_PWR_CFG_STATE_REQ		GENMASK(5, 4)
+#define T6050_PWR_STATUS		0x04
+#define T6050_PWR_STATUS_SLEEP		BIT(20)
+#define T6050_PWR_EVENTS		0x08
+#define T6050_PWR_ENABLE		0x10
+#define T6050_PWR_CLEAR			0x14
+#define T6050_PWR_EVENT_MASK		GENMASK(3, 0)
+#define T6050_PWR_EVENT_D0_ON		BIT(0)
+#define T6050_PWR_EVENT_VDD_OFF		BIT(1)
+#define T6050_PWR_EVENT_WAKE		GENMASK(3, 2)
+#define T6050_PWR_TIMEOUT_US		200000
+
+static void t6050_pwr_mask(struct t6050_dp *dp, u32 off, u32 mask, u32 val)
+{
+	writel((readl(dp->pwrctl + off) & ~mask) | val, dp->pwrctl + off);
+}
+
+/*
+ * D0 asked for, the core's reset released (with @reset, the PIPE handler's +0x1c: clamp off,
+ * reset bit on, as the reset's release does) and D0_ON awaited. A power control that reads all
+ * zeros lost its state in the sleep: no D0_ON comes, and the core starts over (-ENODATA). A
+ * controller that gives no D0_ON and still reports SLEEP may be unpowered, where an access to
+ * its core would be an SError: the PHY is marked faulted, and its callers keep away from it.
+ * Without a hibernation pending, only the reset is released.
+ */
+static int t6050_usb_d0(struct t6050_dp *dp, bool reset)
+{
+	u32 status, events = 0;
+	int ret;
+
+	lockdep_assert_held(&dp->lock);
+	if (!dp->pwrctl || !dp->usb_hibernated) {
+		if (reset) {
+			apple_t6050_usb_mask(&dp->usb_io, 44, 0x1c, 0x10, 0);
+			apple_t6050_usb_mask(&dp->usb_io, 44, 0x1c, 1, 1);
+		}
+		return 0;
+	}
+	dp->usb_hibernated = false;
+	status = readl(dp->pwrctl + T6050_PWR_STATUS);
+	t6050_pwr_mask(dp, T6050_PWR_ENABLE, T6050_PWR_EVENT_MASK, 0);
+	t6050_pwr_mask(dp, T6050_PWR_CFG, T6050_PWR_CFG_STATE_REQ, 0);
+	if (reset) {
+		apple_t6050_usb_mask(&dp->usb_io, 44, 0x1c, 0x10, 0);
+		apple_t6050_usb_mask(&dp->usb_io, 44, 0x1c, 1, 1);
+	}
+	if (!status) {
+		dev_info(dp->dev, "USB controller's power control lost its state in the sleep: the core starts over\n");
+		return -ENODATA;
+	}
+	ret = readl_poll_timeout(dp->pwrctl + T6050_PWR_EVENTS, events,
+				 events & T6050_PWR_EVENT_D0_ON, 100, T6050_PWR_TIMEOUT_US);
+	t6050_pwr_mask(dp, T6050_PWR_CLEAR, T6050_PWR_EVENT_MASK,
+		       T6050_PWR_EVENT_D0_ON | T6050_PWR_EVENT_WAKE);
+	if (!ret) {
+		dev_dbg(dp->dev, "USB controller back from hibernation: status %#x, events %#x\n",
+			status, events);
+		return 0;
+	}
+	status = readl(dp->pwrctl + T6050_PWR_STATUS);
+	dev_warn(dp->dev, "USB controller gave no D0_ON after its hibernation: status %#x, events %#x\n",
+		 status, events);
+	/* No longer in SLEEP: out of hibernation, only the event is missing. */
+	if (!(status & T6050_PWR_STATUS_SLEEP))
+		return 0;
+	dp->faulted = true;
+	return -ENODEV;
+}
+
+/* D3 asked for, VDD_OFF awaited and cleared, the wake events armed, SLEEP awaited. */
+static int t6050_usb_hibernate(struct t6050_dp *dp)
+{
+	u32 cfg, events = 0, status = 0;
+	int ret;
+
+	lockdep_assert_held(&dp->lock);
+	if (!dp->pwrctl)
+		return -ENODEV;
+	cfg = readl(dp->pwrctl + T6050_PWR_CFG);
+	t6050_pwr_mask(dp, T6050_PWR_CFG, T6050_PWR_CFG_STATE_REQ, T6050_PWR_CFG_STATE_REQ);
+	dp->usb_hibernated = true;
+	ret = readl_poll_timeout(dp->pwrctl + T6050_PWR_EVENTS, events,
+				 events & T6050_PWR_EVENT_VDD_OFF, 100, T6050_PWR_TIMEOUT_US);
+	if (!ret) {
+		t6050_pwr_mask(dp, T6050_PWR_CLEAR, T6050_PWR_EVENT_MASK, T6050_PWR_EVENT_VDD_OFF);
+		t6050_pwr_mask(dp, T6050_PWR_ENABLE, T6050_PWR_EVENT_MASK, T6050_PWR_EVENT_WAKE);
+		ret = readl_poll_timeout(dp->pwrctl + T6050_PWR_STATUS, status,
+					 status & T6050_PWR_STATUS_SLEEP, 100, T6050_PWR_TIMEOUT_US);
+	}
+	if (ret) {
+		dev_warn(dp->dev, "USB controller did not hibernate for the router's sleep: config %#x, events %#x, status %#x\n",
+			 cfg, events, status);
+		t6050_usb_d0(dp, false);
+	} else {
+		dev_dbg(dp->dev, "USB controller in hibernation for the router's sleep: status %#x\n",
+			status);
+	}
+	return ret;
 }
 
 #include "atc-t6050-combo.h"
@@ -1213,12 +1344,25 @@ int apple_t6050_phy_cio_off(struct device *dev)
 	if (!dp->cio_sleep || dp->cio_sleep_off || dp->faulted || dp->combo_mode != COMBO_CIO)
 		return -EBUSY;
 	atc_dp_tunnels_stop(dp);
-	/* A host kept for the sleep is out of reset here, its PIPE parked on the dummy producer. */
+	/* A host kept for the sleep has parked its PIPE (on the dummy producer, or gated on J714s). */
 	if (dp->pipe_active || (dp->controller_active && !dp->cio_usb_parked))
 		return -EBUSY;
 	dp->cio_sleep_hold = true;
 	ret = combo_quiesce(dp);
-	if (!ret && dp->usb2_active) {
+	/* J714s: a gated PIPE's core reset after the CIO shutdown, as macOS */
+	if (!ret && dp->pipe_gated)
+		apple_t6050_usb_mask(&dp->usb_io, 44, 0x1c, 1, 0);
+	if (!ret && dp->usb2_active && atc_sleep_macos_usb()) {
+		u32 r1c = readl(dp->banks[0] + 0x1c), r4 = readl(dp->banks[0] + 0x4);
+
+		/* J714s: the USB2 PHY suspended, not stopped, as macOS */
+		apple_t6050_usb_mask(&dp->usb_io, 0, 0x1c, BIT(30), BIT(30));
+		apple_t6050_usb_mask(&dp->usb_io, 0, 0x4, BIT(2), 0);
+		dp->usb2_suspended = true;
+		dev_dbg(dp->dev, "USB2 PHY suspended for the router's sleep: +0x1c %#x -> %#x, +0x4 %#x -> %#x, PIPE %s\n",
+			r1c, readl(dp->banks[0] + 0x1c), r4, readl(dp->banks[0] + 0x4),
+			dp->pipe_gated ? "gated" : "not gated");
+	} else if (!ret && dp->usb2_active) {
 		ret = apple_t6050_usb2_stop(&dp->usb_platform);
 		if (!ret)
 			dp->usb2_active = false;
@@ -1344,6 +1488,19 @@ int apple_t6050_phy_cio_usb(struct device *dev, enum apple_t6050_cio_usb step)
 		if (dp->faulted)
 			return -EIO;
 		/* xHCI is suspended: no DMA, its SuperSpeed port in U3, the PIPE in P3. */
+		if (dp->pipe_active && dp->pipe_tunnel && atc_sleep_macos_usb() && dp->pwrctl &&
+		    (mux & 0x73) == 0x21 && !t6050_usb_hibernate(dp)) {
+			/* J714s: the controller in hibernation, now the PIPE's clock gated */
+			apple_t6050_usb_mask(&dp->usb_io, 44, 0x4, 0x6, 0x6);
+			apple_t6050_usb_mask(&dp->usb_io, 44, 0x0, 0x4, 0x4);
+			apple_t6050_usb_mask(&dp->usb_io, 44, 0x4, 0x10, 0);
+			apple_t6050_usb_mask(&dp->usb_io, 44, 0xc, 0x70, 0);
+			dp->pipe_active = dp->pipe_tunnel = false;
+			dp->pipe_gated = true;
+			dp->cio_usb_parked = true;
+			dev_info(dp->dev, "T6050 sleep: USB3 PIPE kept on the USB4 tunnel with its clock gated, the USB host in hibernation\n");
+			return 0;
+		}
 		if (dp->pipe_active && dp->pipe_tunnel) {
 			ret = apple_t6050_usb3_pipe_stop(&dp->usb_io, combo_pipe_keep, dp);
 			if (ret) {
@@ -1358,7 +1515,76 @@ int apple_t6050_phy_cio_usb(struct device *dev, enum apple_t6050_cio_usb step)
 			 mux, mux & 0x73, lock, readl(dp->banks[44] + 0xc),
 			 readl(dp->banks[44] + 0xc) & 0x73, readl(dp->banks[44] + 0x14));
 		return 0;
+	case APPLE_T6050_CIO_USB_RETAINED: {
+		/*
+		 * J714s: macOS keeps its USB host's state through a sleep (the PIPE handler still
+		 * reads 0x01 at the host's resume) and gives the PIPE its clock back as the host
+		 * resumes. The controller's bank is held by its always-on domain: it kept the gate as
+		 * the sleep left it (the dock's router woke in place, the tunnel kept), or it did not.
+		 */
+		u32 pmux, gate;
+
+		/* Nothing was saved without the hibernation: the core starts over. */
+		if (!dp->pipe_gated || !dp->usb_hibernated || dp->controller_active ||
+		    dp->cio_tunnel_lost || dp->faulted || !dp->cio_prepared || !dp->usb2_active)
+			return -ENOENT;
+		pmux = readl(dp->banks[44] + 0xc);
+		gate = readl(dp->banks[44] + 0x1c);
+		if ((pmux & 0x73) != 0x01 || (gate & 0x10)) {
+			dev_info(dp->dev, "the USB controller's bank did not keep the sleep's state: mux %#x, +0x1c %#x\n",
+				 pmux, gate);
+			/* A hibernated controller gets D0 with the reset's release that follows. */
+			return -ENOENT;
+		}
+		apple_t6050_usb_mask(&dp->usb_io, 44, 0xc, 0x70, 0x20);
+		/* Out of hibernation, as macOS: D0, the core's reset released, D0_ON */
+		ret = t6050_usb_d0(dp, true);
+		if (ret == -ENODEV)
+			return -EIO;
+		apple_t6050_usb_mask(&dp->usb_io, 44, 0x0, 0x4, 0);
+		dp->pipe_gated = false;
+		dp->controller_active = dp->pipe_active = dp->pipe_tunnel = true;
+		dp->cio_usb_kept = dp->cio_usb_parked = false;
+		/* Its power control lost its state too: the PIPE is back, the core starts over. */
+		if (ret == -ENODATA)
+			return -ENOENT;
+		dev_info(dp->dev, "T6050 sleep: the USB controller kept its state: PIPE given its clock back on the USB4 tunnel\n");
+		return APPLE_T6050_CIO_USB_KEPT;
+	}
 	case APPLE_T6050_CIO_USB_RESULT:
+		/*
+		 * J714s: a gated PIPE, before anything touches the USB host: given its clock back on
+		 * the tunnel producer, as macOS at the USB host's resume, when the dock is back with
+		 * its registers; otherwise put on the dummy producer, as the park did.
+		 */
+		if (dp->pipe_gated && !dp->controller_active) {
+			/* Not known yet whether the bank kept its state: see RETAINED. */
+			dev_dbg(dp->dev, "gated USB3 PIPE, its controller forgotten by the firmware sleep\n");
+		} else if (dp->pipe_gated) {
+			u32 before = readl(dp->banks[44] + 0xc);
+
+			dp->pipe_gated = false;
+			if ((before & 0x73) == 0x01 && !dp->cio_tunnel_lost) {
+				apple_t6050_usb_mask(&dp->usb_io, 44, 0xc, 0x70, 0x20);
+				/* D0 with the reset's release, as at a wake */
+				t6050_usb_d0(dp, true);
+				apple_t6050_usb_mask(&dp->usb_io, 44, 0x0, 0x4, 0);
+				dp->pipe_active = dp->pipe_tunnel = !dp->faulted;
+			} else {
+				if ((before & 0x73) == 0x01) {
+					apple_t6050_usb_mask(&dp->usb_io, 44, 0xc, 0x3, 0x2);
+					apple_t6050_usb_mask(&dp->usb_io, 44, 0xc, 0x70, 0x40);
+					apple_t6050_usb_mask(&dp->usb_io, 44, 0x0, 0x4, 0);
+				}
+				/* The core out of reset (and of hibernation), as the old park left it */
+				t6050_usb_d0(dp, true);
+			}
+			dev_info(dp->dev, "T6050 sleep: gated USB3 PIPE at the USB host's resume: mux %#x -> %#x (%s), dock %s\n",
+				 before, readl(dp->banks[44] + 0xc),
+				 (readl(dp->banks[44] + 0xc) & 0x73) == 0x21 ? "the USB4 tunnel" :
+				 (readl(dp->banks[44] + 0xc) & 0x73) == 0x42 ? "dummy producer" : "lost with the controller",
+				 dp->cio_tunnel_lost ? "gone" : "back");
+		}
 		if (!dp->cio_usb_kept)
 			return -ENOENT;
 		parked = dp->cio_usb_parked;

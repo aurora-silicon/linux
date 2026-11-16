@@ -24,11 +24,11 @@ properties:
 
   reg:
     minItems: 6
-    maxItems: 12
+    maxItems: 13
 
   reg-names:
     minItems: 6
-    maxItems: 12
+    maxItems: 13
 
   '#phy-cells':
     enum: [0, 1]
@@ -180,7 +180,7 @@ allOf:
           const: 1
         reg:
           minItems: 11
-          maxItems: 12
+          maxItems: 13
         reg-names:
           minItems: 11
           items:
@@ -197,6 +197,10 @@ allOf:
             - const: pipehandler
             - description: Source select words for the four USB4 DP pixel clocks
               const: dp-clock-source
+            - description:
+                Power control of the port's USB controller, for its hibernation through a
+                USB4 router's sleep
+              const: pwrctl
       required:
         - '#reset-cells'
         - apple,port-index

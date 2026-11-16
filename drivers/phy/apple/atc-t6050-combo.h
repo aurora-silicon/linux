@@ -151,6 +151,8 @@ static int combo_stop(struct t6050_dp *dp, bool keep_aon)
 	if (dp->controller_active || dp->pipe_active)
 		return -EBUSY;
 	ret = combo_quiesce(dp);
+	dp->usb2_suspended = false;
+	dp->pipe_gated = false;
 	if (!ret && dp->usb2_active) {
 		ret = apple_t6050_usb2_stop(&dp->usb_platform);
 		if (!ret)
@@ -196,8 +198,28 @@ static int combo_start(struct t6050_dp *dp, enum combo_mode mode)
 	if (!ret && dp->ndomains > 3)
 		ret = atc_domain_set(&dp->domain[3], true);
 	dp->aon_kept = false;
-	if (!ret)
+	/*
+	 * J714s: a USB2 PHY suspended through the router's sleep is given back as macOS does
+	 * (+0x4 bit 2, then +0x1c bit 30 clear, before the PHY's restart) when it kept its
+	 * registers; one that lost them (its suspend bit gone) is started again as before.
+	 */
+	if (!ret && dp->usb2_suspended && dp->cio_sleep_hold) {
+		u32 r1c = readl(dp->banks[0] + 0x1c), r4 = readl(dp->banks[0] + 0x4);
+
+		dp->usb2_suspended = false;
+		if (r1c & BIT(30)) {
+			apple_t6050_usb_mask(&dp->usb_io, 0, 0x4, BIT(2), BIT(2));
+			apple_t6050_usb_mask(&dp->usb_io, 0, 0x1c, BIT(30), 0);
+			dev_dbg(dp->dev, "USB2 PHY given back after the router's sleep: +0x4 %#x -> %#x, +0x1c %#x -> %#x\n",
+				r4, readl(dp->banks[0] + 0x4), r1c, readl(dp->banks[0] + 0x1c));
+		} else {
+			dev_info(dp->dev, "USB2 PHY lost its registers in the sleep (+0x1c %#x, +0x4 %#x): started again\n",
+				 r1c, r4);
+			ret = APPLE_T6050_USB_RUN(&dp->usb_platform, apple_t6050_usb2_host);
+		}
+	} else if (!ret) {
 		ret = APPLE_T6050_USB_RUN(&dp->usb_platform, apple_t6050_usb2_host);
+	}
 	if (!ret)
 		dp->usb2_active = true;
 	if (!ret && mode == COMBO_USB) {
@@ -560,6 +582,8 @@ static int combo_usb3_poweroff(struct phy *phy)
 		if (!ret)
 			dp->pipe_active = false;
 	}
+	dp->usb2_suspended = false;
+	dp->pipe_gated = false;
 	if (!ret && dp->usb2_active) {
 		ret = apple_t6050_usb2_stop(&dp->usb_platform);
 		if (!ret)
@@ -625,8 +649,21 @@ static int combo_reset_deassert(struct reset_controller_dev *reset, unsigned lon
 	 * The bit resets to clear with the controller's domain, so set it for every session.
 	 */
 	apple_t6050_usb_mask(&dp->usb_io, 44, 0x20, BIT(15), BIT(15));
-	apple_t6050_usb_mask(&dp->usb_io, 44, 0x1c, 0x10, 0);
-	apple_t6050_usb_mask(&dp->usb_io, 44, 0x1c, 1, 1);
+	/*
+	 * J714s: a PIPE left gated on the tunnel producer by the router's sleep (mux 0x01, kept by
+	 * the controller's always-on domain) goes on the dummy producer first, as a park leaves it.
+	 */
+	if (atc_sleep_macos_usb() && dp->pipe_gated && (readl(dp->banks[44] + 0xc) & 0x73) == 0x01) {
+		apple_t6050_usb_mask(&dp->usb_io, 44, 0xc, 0x3, 0x2);
+		apple_t6050_usb_mask(&dp->usb_io, 44, 0xc, 0x70, 0x40);
+		apple_t6050_usb_mask(&dp->usb_io, 44, 0x0, 0x4, 0);
+		dev_info(dp->dev, "gated USB3 PIPE kept through the sleep put on its dummy producer at the controller's reset release: mux %#x\n",
+			 readl(dp->banks[44] + 0xc));
+	}
+	dp->pipe_gated = false;
+	/* Out of a sleep's hibernation if it is still asked for, then the reset released */
+	if (t6050_usb_d0(dp, true) == -ENODEV)
+		return -EIO;
 	dp->controller_active = true;
 	return 0;
 }
@@ -669,6 +706,16 @@ static int combo_setup(struct platform_device *pdev, struct t6050_dp *dp)
 		if (IS_ERR(dp->banks[extra[i].bank]))
 			return PTR_ERR(dp->banks[extra[i].bank]);
 		dp->resources[extra[i].bank] = *res;
+	}
+	/* J714s: the USB controller's power control, for its hibernation through a router's sleep */
+	if (of_machine_is_compatible("apple,j714s")) {
+		struct resource *res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "pwrctl");
+
+		if (res) {
+			dp->pwrctl = devm_ioremap_resource(dev, res);
+			if (IS_ERR(dp->pwrctl))
+				return PTR_ERR(dp->pwrctl);
+		}
 	}
 	dp->usb2_default = devm_apple_tunable_parse(dev, dev->of_node,
 		"apple,tunable-usb2-default", &dp->resources[0]);
