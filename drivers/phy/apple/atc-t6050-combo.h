@@ -407,16 +407,17 @@ static void combo_pm_notifier_remove(void *data)
 	unregister_pm_notifier(&dp->pm_nb);
 }
 
-static int combo_usb2_mode(struct phy *phy, enum phy_mode mode, int submode)
+/*
+ * USB2 as a mode's start brings it up (combo_start()), for a port whose mode is up. A USB
+ * controller's power-off stops USB2 with its PIPE (combo_usb3_poweroff()); while the mode
+ * runs on, no mode request comes that would start it again. Without a mode, -ENOLINK: the
+ * port controller's next mode request starts USB2 with it.
+ */
+static int combo_usb2_start(struct t6050_dp *dp)
 {
-	struct t6050_dp *dp = phy_get_drvdata(phy);
 	int ret;
 
-	guard(mutex)(&dp->lock);
-	if (dp->faulted)
-		return -EIO;
-	if (mode != PHY_MODE_USB_HOST)
-		return -EOPNOTSUPP;
+	lockdep_assert_held(&dp->lock);
 	if (!dp->usb_prepared && !dp->cio_prepared && !dp->enabled)
 		return -ENOLINK;
 	if (dp->usb2_active)
@@ -429,6 +430,18 @@ static int combo_usb2_mode(struct phy *phy, enum phy_mode mode, int submode)
 		dp->usb2_active = true;
 	}
 	return ret;
+}
+
+static int combo_usb2_mode(struct phy *phy, enum phy_mode mode, int submode)
+{
+	struct t6050_dp *dp = phy_get_drvdata(phy);
+
+	guard(mutex)(&dp->lock);
+	if (dp->faulted)
+		return -EIO;
+	if (mode != PHY_MODE_USB_HOST)
+		return -EOPNOTSUPP;
+	return combo_usb2_start(dp);
 }
 
 static int combo_usb2_reset(struct phy *phy)
@@ -569,12 +582,25 @@ static int combo_reset_assert(struct reset_controller_dev *reset, unsigned long 
 static int combo_reset_deassert(struct reset_controller_dev *reset, unsigned long id)
 {
 	struct t6050_dp *dp = container_of(reset, struct t6050_dp, reset);
+	int ret;
 
 	guard(mutex)(&dp->lock);
 	if (id)
 		return -EINVAL;
-	if (dp->faulted || !dp->usb2_active)
+	if (dp->faulted)
 		return -ENOLINK;
+	/*
+	 * A controller that starts again while the port's mode still runs finds USB2 stopped by
+	 * its own power-off, and no mode request follows to start it: a system sleep given up
+	 * after the controllers stopped at its entry but before the PHY's own stop at its last
+	 * step (combo_suspend_late()), which therefore has nothing to bring back, or a role
+	 * change on the same plug. Start it here, before the reset goes, as the mode's start
+	 * does. After a real sleep no mode is up yet (combo_resume_noirq()): still -ENOLINK,
+	 * and the mode request starts USB2 as before.
+	 */
+	ret = combo_usb2_start(dp);
+	if (ret)
+		return ret == -ENOLINK ? ret : -EIO;
 	/*
 	 * The PIPE lock that starts the USB3 handoff is acknowledged only while the dummy PHY
 	 * behind the mux is enabled (NONSELECTED_OVERRIDE bit 15), as on the earlier ATC PHYs.
