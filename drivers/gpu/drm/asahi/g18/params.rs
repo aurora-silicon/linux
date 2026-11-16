@@ -99,6 +99,8 @@ g18_param!(g18_sma_minimum: u32 = 1, PARAM_OPS_U32,
     "Stage9/profile4 or stage10/profile1, variant0: 1 probes fixed native minimum TA/fragment resource words with unchanged owned backing. Default 1");
 g18_param!(g18_graphics_stall_trace: u32 = 0, PARAM_OPS_U32,
     "Stage9/profile4 or stage10/profile1, variant0: 1 enables firmware category9 diagnostics and the native TA mode2 progress sampler. No timeout changes. Default 0");
+g18_param!(g18_fw_trace: u32 = 0, PARAM_OPS_U32,
+    "G18 firmware trace: 0 (default) writes trace mask 0, so render jobs produce no firmware trace records and G18_APP_FAIL dumps have none; 1 writes mask 3, the earlier default, which restores them. g18_graphics_stall_trace=1 still selects 0x203");
 g18_param!(g18_kick_log: u32 = 0, PARAM_OPS_U32,
     "Stage10 application DRM log volume: 0 (default) omits the per-kick, frame-pass and per-job resource lines (G18_APP_KICK, G18_APP_FRAME_PASS, G18_APP_COMPUTE_KNOBS, G18_COMPUTE_*, G18_SHARED_COMPUTE_*, G18 UMA/compute-context lines, G18_POOL_DESCRIPTOR_CURSOR, role-0 type-1 G18_EVENT) once G18_DRM_READY is logged; 1 prints them as before. Startup, fault, recovery, refusal, wait, stall, admission and sampled summary lines are always printed");
 g18_param!(g18_vdm_high_alias: u32 = 0, PARAM_OPS_U32,
