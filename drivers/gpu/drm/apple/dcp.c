@@ -8265,6 +8265,11 @@ static int dcp_s2r_domains_on(struct apple_dcp *dcp)
 	val = readl(ps + l->disp_fe) & ~(GENMASK(9, 8) | GENMASK(3, 0));
 	writel(val | 0xf, ps + l->disp_fe);
 	val = readl(ps + l->disp_cpu) & ~(GENMASK(9, 8) | GENMASK(3, 0) | BIT(28));
+	if (dcp_s2r_is_t8142_ext(dcp)) {
+		/* Retain the CPU when idle, as in the measured J813 wake sequence. */
+		val = (val & ~DCP_PS_MIN) | FIELD_PREP(DCP_PS_MIN, 4);
+		writel(val, ps + l->disp_cpu);
+	}
 	writel(val | 0xf, ps + l->disp_cpu);
 	if (l->ret_ff) {
 		writel(0, pwrgate + l->ret_ff);
