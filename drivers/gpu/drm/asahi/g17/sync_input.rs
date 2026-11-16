@@ -19,6 +19,7 @@ unsafe extern "C" {
         -> *mut bindings::dma_fence;
     fn asahi_g17_local_inputs() -> u32;
     fn asahi_g17_compute_kick_mode() -> u32;
+    fn asahi_g17_note_compute_kick(path: u32);
     fn asahi_g17_render_submit() -> u32;
 }
 
@@ -26,6 +27,17 @@ unsafe extern "C" {
 pub(crate) fn old_compute_kick() -> bool {
     // SAFETY: Reads a module parameter word.
     unsafe { asahi_g17_compute_kick_mode() == 1 }
+}
+
+/// Measurement only: held-order win-back experiments (2 shadow, 3 running predecessor).
+pub(super) fn compute_kick_mode() -> u32 {
+    // SAFETY: Reads a module parameter word.
+    unsafe { asahi_g17_compute_kick_mode() }
+}
+
+pub(super) fn note_compute_kick(path: u32) {
+    // SAFETY: Increments one of four diagnostic counters, without retaining pointers.
+    unsafe { asahi_g17_note_compute_kick(path) }
 }
 
 /// Measurement only: `aurora.gpubench_local_inputs` (0 general, 1 own queue first, 2 ring order).

@@ -622,6 +622,8 @@ pub(crate) fn decode_fault(fault_info: u64, fault_addr: u64, g14x: bool) -> Opti
 pub(crate) struct G17Resources {
     dev: ARef<platform::Device>,
     sgx: Arc<DevresIoMem<SGX_SIZE>>,
+    /// TEST ONLY: last host-written gating word, shared by resource clones. Bit 32 is valid.
+    gating_shadow: Arc<core::sync::atomic::AtomicU64>,
 }
 
 impl G17Resources {
@@ -636,6 +638,7 @@ impl G17Resources {
         Ok(G17Resources {
             dev: pdev.into(),
             sgx,
+            gating_shadow: Arc::new(core::sync::atomic::AtomicU64::new(0), GFP_KERNEL)?,
         })
     }
 
@@ -702,22 +705,31 @@ impl G17Resources {
     pub(crate) fn submit_m5_work_held(
         &self,
         submission: &crate::g17::fw::m5::queue::HardwareSubmission,
+        shadow: bool,
     ) -> Result {
         if crate::g17::J813_FORMS.load(core::sync::atomic::Ordering::Relaxed) {
             return Ok(());
         }
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
         let sgx = (&*sgx).as_view();
-        let gating = sgx.try_read32(G17_GATING_CONTROL)?;
+        let cached = self.gating_shadow.load(core::sync::atomic::Ordering::Relaxed);
+        // An incomplete transaction must not leave a shadow usable by the next one.
+        self.gating_shadow.store(0, core::sync::atomic::Ordering::Relaxed);
+        let gating = if shadow && cached & (1 << 32) != 0 {
+            cached as u32
+        } else {
+            sgx.try_read32(G17_GATING_CONTROL)?
+        };
         sgx.try_write32(gating | G17_GATING_HOLD, G17_GATING_CONTROL)?;
-        sgx.try_read32(G17_GATING_CONTROL)?;
+        let held = sgx.try_read32(G17_GATING_CONTROL)?;
         let result = submission
             .writes()
             .iter()
             .try_for_each(|&(offset, value)| sgx.try_write64(value, offset));
-        let gating = sgx.try_read32(G17_GATING_CONTROL)?;
+        let gating = if shadow { held } else { sgx.try_read32(G17_GATING_CONTROL)? };
         sgx.try_write32(gating & !G17_GATING_HOLD, G17_GATING_CONTROL)?;
-        sgx.try_read32(G17_GATING_CONTROL)?;
+        let released = sgx.try_read32(G17_GATING_CONTROL)?;
+        self.gating_shadow.store(u64::from(released) | (1 << 32), core::sync::atomic::Ordering::Relaxed);
         result
     }
 
@@ -969,6 +981,8 @@ impl G17Resources {
     }
 
     pub(crate) fn enable_g17_gating(&self) -> Result {
+        // A power transition invalidates the measurement shadow before any register access.
+        self.gating_shadow.store(0, core::sync::atomic::Ordering::Relaxed);
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
         let sgx = (&*sgx).as_view();
         let val = sgx.try_read32(G17_GATING_CONTROL)?;
@@ -977,6 +991,7 @@ impl G17Resources {
 
     /// Hold part of the gating off, for a domain about to go off. The firmware must be idle.
     pub(crate) fn hold_g17_gating(&self) -> Result {
+        self.gating_shadow.store(0, core::sync::atomic::Ordering::Relaxed);
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;
         let sgx = (&*sgx).as_view();
         let val = sgx.try_read32(G17_GATING_CONTROL)?;
