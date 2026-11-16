@@ -310,3 +310,4 @@ MODULE_DESCRIPTION("Apple N1 Centauri native PCI and ACIPC bring-up backend");
 MODULE_FIRMWARE("apple/centauri/j813-ftab.bin");
 MODULE_FIRMWARE("apple/centauri/j815-ftab.bin");
 MODULE_FIRMWARE("apple/centauri/j873-ftab.bin");
+MODULE_FIRMWARE("apple/centauri/j804-ftab.bin");

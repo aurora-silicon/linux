@@ -48,6 +48,9 @@ struct centauri {
  * J873 (Mac mini M6): board 0x24, chip 0x8152 from its ADT, the composition taken from the J813
  * word; port 0 config 0x388028000, lane 0x38f010000 and PERST# gpio0 pin 3 (0x31a000000 + 4 * 3)
  * from its ADT; config +0x130 is 0x208 as in the m1n1 T8152 bring-up that links the port.
+ * J804 (MacBook Pro 14" M6): board 0x22, chip 0x8152 from its ADT /chosen; port 0 config,
+ * PHY lane and PERST# (pci-bridge0 function-perst = gpio0 pin 3) are J873's, and so are the
+ * port tweaks, the 27.x link TLV and the scan TLVs.
  * keep_port_tables: the J813 sequence zeroes the 16 words at port+0x3000 and the 256 words at
  * port+0x3800. On the J873 those are the RID2SID and MSIMAP tables that pcie-apple programmed
  * (PORT_T602X_RID2SID, PORT_T602X_MSIMAP); the cycle then drops function 0's stream entry and
@@ -81,6 +84,9 @@ static inline const struct centauri_board *centauri_board(void)
 		  0x488028000ULL, 0x48f010000ULL, 0x39a000300ULL, 0x03020000, 0x100c, false,
 		  386, true },
 		{ "apple,j873g", "apple/centauri/j873-ftab.bin", 0x00248152,
+		  0x388028000ULL, 0x38f010000ULL, 0x31a00000cULL, 0x208, 0, true,
+		  386, true },
+		{ "apple,j804", "apple/centauri/j804-ftab.bin", 0x00228152,
 		  0x388028000ULL, 0x38f010000ULL, 0x31a00000cULL, 0x208, 0, true,
 		  386, true },
 	};
