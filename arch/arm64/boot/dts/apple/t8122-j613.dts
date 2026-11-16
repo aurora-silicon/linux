@@ -18,12 +18,12 @@
 	model = "Apple MacBook Air (13-inch, M3, 2024)";
 
 	aliases {
-		usb4_0_pcie = &usb4_0_pcie;
-		usb4_0_pcie_port = &usb4_0_pcie_port;
-		usb4_1_pcie = &usb4_1_pcie;
-		usb4_1_pcie_port = &usb4_1_pcie_port;
-		usb4_0_pcie_adapter = &usb4_0_acio;
-		usb4_1_pcie_adapter = &usb4_1_acio;
+		usb4-0-pcie = &usb4_0_pcie;
+		usb4-0-pcie-port = &usb4_0_pcie_port;
+		usb4-1-pcie = &usb4_1_pcie;
+		usb4-1-pcie-port = &usb4_1_pcie_port;
+		usb4-0-pcie-adapter = &usb4_0_acio;
+		usb4-1-pcie-adapter = &usb4_1_acio;
 	};
 
 	/*
