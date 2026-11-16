@@ -272,3 +272,8 @@
 #include "t8142-j813-j815-sleep.dtsi"
 
 #include "t8142-j813-dcpext.dtsi"
+
+&sleep {
+	/* PMU RTC: peripheral source 2, routed through NUB.SPMI0.SW3. */
+	apple,spmi-pmu-sources = <0x600 0x4>;
+};
