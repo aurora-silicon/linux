@@ -54,6 +54,9 @@ def controls(ROOT):
     ''',1)
     # The hybrid hand-over walks a port's routes; the only route is this port's.
     actual=actual.replace('struct apple_dcp_typec_port { int link;', 'struct apple_dcp_typec_port { int link,routes; bool typec_yielded;',1)
+    # A port's owner slots are one array, as in production (one per DP IN with fixed
+    # CRTCs): the model's owner is slot 0, and the others stay NULL on this port.
+    actual=actual.replace('struct apple_dcp_typec_route *owner,*target,', 'union { struct apple_dcp_typec_route *owner; struct apple_dcp_typec_route *slots[DCP_FABRIC_DPIN_MAX]; }; struct apple_dcp_typec_route *target,',1)
     actual=actual.replace('#define list_for_each_entry(p,h,m) for((void)(h),(p)=sole_port();(p);(p)=NULL)',
         '#define list_for_each_entry(p,h,m) for((void)(h),(p)=_Generic((p),struct apple_dcp_typec_route *:sole_route(),default:sole_port());(p);(p)=NULL)',1)
     actual=actual.replace('static struct apple_dcp_typec_port *sole_port(void) { return &port; }',
@@ -158,7 +161,9 @@ static int mux_control_deselect(struct mux_control *m) { (void)m;event('C');xbar
     actual=actual.replace(block(actual,'static bool dcp_typec_route_available('), 'static bool dcp_typec_route_fixed_output_busy(struct apple_dcp_typec_route *r) { (void)r;return false; }\n'+available+block(dcp,'static bool dcp_typec_route_available('),1)
     actual=actual.replace(block(actual,'static int dcp_typec_route_deactivate('),block(dcp,dcp.rindex('static int dcp_typec_route_deactivate(')),1)
     pos=actual.index('static struct typec_mux_dev phy_provider')
-    actual=actual[:pos]+block(dcp,'static bool dcp_typec_route_is_dp(')+'\n'+block(dcp,'static int dcp_typec_route_set(')+'\n'+actual[pos:]
+    # route_set asks whether a tunnel holds any of the port's slots: the real helper.
+    tunneled='#ifndef ARRAY_SIZE\n#define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))\n#endif\n'+apple_function(ROOT,'dcp_typec_port_tunneled')
+    actual=actual[:pos]+tunneled+block(dcp,'static bool dcp_typec_route_is_dp(')+'\n'+block(dcp,'static int dcp_typec_route_set(')+'\n'+actual[pos:]
     actual=actual.replace(block(actual,'static int display_set('),'''static int display_set(struct typec_mux_dev *m,struct typec_mux_state *s) { event('S');return dcp_typec_route_set(m,s); }''',1)
     actual=actual.replace("(void)m;assert(s->mode==TYPEC_STATE_SAFE);event('L');", "(void)m;(void)s;event('L');",1)
     actual=actual.replace('connector=(struct connector){.connected=true};','connector=(struct connector){.connected=true};',1)
