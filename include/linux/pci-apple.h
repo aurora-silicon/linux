@@ -18,6 +18,7 @@ void apple_pcie_tunnel_unregister_notifier(struct notifier_block *nb);
 bool apple_pcie_tunnel_needs_cold_init(struct device_node *np);
 int apple_pcie_tunnel_prepare(struct device *dev, struct device_node *tunnel);
 int apple_pcie_tunnel_quiesce(struct device *dev);
+int apple_pcie_tunnel_remove_orderly(struct device *dev, bool in_use_too);
 int apple_pcie_tunnel_restore(struct device *dev);
 int apple_pcie_tunnel_check_state(struct device *dev);
 bool apple_pcie_tunnel_link_kept(struct device *dev);

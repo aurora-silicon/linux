@@ -38,6 +38,10 @@ static void combo_sleep(void *ctx, unsigned int msec) { msleep(msec); }
 static int combo_wrapper(void *ctx, unsigned int active)
 {
 	struct t6050_dp *dp = ctx;
+
+	/* A router's sleep in place: no runtime PM there, the wrapper's reference stays. */
+	if (dp->cio_sleep_hold)
+		return 0;
 	return atc_domain_set(&dp->domain[2], active);
 }
 static int combo_firmware(void *ctx, unsigned int active)
@@ -180,6 +184,8 @@ static int combo_start(struct t6050_dp *dp, enum combo_mode mode)
 		return -EIO;
 	if (dp->orientation == TYPEC_ORIENTATION_NONE)
 		return -ENOLINK;
+	/* A new start of the port's mode: what a router lost over a sleep is not carried on. */
+	dp->cio_tunnel_lost = false;
 	ret = atc_domain_set(&dp->domain[0], true);
 	if (!ret)
 		ret = atc_domain_set(&dp->domain[1], true);
@@ -504,6 +510,18 @@ static int combo_usb3_mode(struct phy *phy, enum phy_mode mode, int submode)
 	 * uses its independent D+/D- PHY. Do not switch USB3 onto DP lanes. */
 	if (dp->combo_mode == COMBO_DP4 && dp->enabled)
 		return 0;
+	/*
+	 * TEST: the router woke from a sleep in place without its dock, and its USB3 tunnel was
+	 * retired. A DWC3 moved to the tunnel's PIPE producer then takes its clock from a router
+	 * that the port controller stops next with the host still running (run sv6t4: this line's
+	 * "USB3 PIPE on the USB4 tunnel" at the resume, the router's domains off 3.1 s later with
+	 * the host up, an SError in that power-off). DWC3 stays on its dummy producer, as with
+	 * four DP lanes; USB2 is not touched. The port's next start gives the tunnel back.
+	 */
+	if (dp->combo_mode == COMBO_CIO && dp->cio_prepared && dp->cio_tunnel_lost) {
+		dev_info(dp->dev, "USB3 PIPE left on its dummy producer: the router's dock did not come back from the sleep\n");
+		return 0;
+	}
 	if (dp->combo_mode == COMBO_CIO && dp->cio_prepared)
 		return combo_pipe_tunnel(dp);
 	if (!dp->usb_prepared && !(dp->combo_mode == COMBO_DP2 && dp->enabled))

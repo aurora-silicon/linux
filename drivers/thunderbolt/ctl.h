@@ -26,6 +26,8 @@ struct tb_ctl *tb_ctl_alloc(struct tb_nhi *nhi, int index, int timeout_msec,
 void tb_ctl_start(struct tb_ctl *ctl);
 void tb_ctl_stop(struct tb_ctl *ctl);
 void tb_ctl_free(struct tb_ctl *ctl);
+void tb_ctl_frames_exit(void);
+int tb_ctl_frames_sleep_check(struct tb_ctl *ctl, char *buf, size_t size);
 
 /* configuration commands */
 
