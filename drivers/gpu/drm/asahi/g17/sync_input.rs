@@ -47,6 +47,15 @@ pub(super) const SUBMIT_HOSTPORT: u32 = 1 << 1;
 /// checks what the identity hold would have.
 pub(super) const SUBMIT_READY_HINT: u32 = 1 << 2;
 
+/// `aurora.gpubench_render_submit` 0x8: an M5 submission leaves out its core-power read while
+/// the cores are known powered (`Port::power_recent`).
+pub(super) const SUBMIT_POWER_NOTE: u32 = 1 << 3;
+
+/// `aurora.gpubench_render_submit` 0x10: an M5 event pass leaves out the core-power reads that
+/// bracket its statistics drain while the cores are known powered and the statistics state saw
+/// them powered in the current epoch.
+pub(super) const SUBMIT_POWER_DRAIN: u32 = 1 << 4;
+
 /// One fence that signals once all of `fences` have (see `job::MERGED_DEPENDENCIES`).
 pub(super) fn merge(fences: &[Fence]) -> Result<Fence> {
     let mut raw = KVec::with_capacity(fences.len(), GFP_KERNEL)?;
