@@ -269,11 +269,11 @@ impl InitData {
                 words.ok()
             });
             if let Some(words) = calibration {
-                pr_info!("G17: M5 controller facts: applied=1 chip={:#x} clusters={} cores={} calibration={:x?} policy_max_mw={} region_c_max_mw={}\n",
-                    board.chip_id, board.clusters, board.gpu_cores, words.as_slice(), maximum, maximum);
+                pr_info!("G17: M5 controller facts: applied=1 clusters={} cores={} calibration={:x?} policy_max_mw={} region_c_max_mw={}\n",
+                    board.clusters, board.gpu_cores, words.as_slice(), maximum, maximum);
             } else {
-                pr_info!("G17: M5 controller facts: applied=1 chip={:#x} clusters={} cores={} calibration=unavailable policy_max_mw={} region_c_max_mw={}\n",
-                    board.chip_id, board.clusters, board.gpu_cores, maximum, maximum);
+                pr_info!("G17: M5 controller facts: applied=1 clusters={} cores={} calibration=unavailable policy_max_mw={} region_c_max_mw={}\n",
+                    board.clusters, board.gpu_cores, maximum, maximum);
             }
         }
         if let Some(microseconds) = board.idle_standby_us {
