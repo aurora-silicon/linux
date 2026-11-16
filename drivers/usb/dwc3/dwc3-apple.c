@@ -953,10 +953,11 @@ static int dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_stat
 		}
 		dev_warn(appledwc->dev, "USB3 PHY setup failed, USB2 only, err=%d\n", ret);
 	} else if (host && appledwc->usb3_phy &&
-		   of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3")) {
+		   (of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3") ||
+		    of_device_is_compatible(appledwc->dev->of_node, "apple,t8142-dwc3"))) {
 		/*
-		 * The T8132 PHY does not bring a SuperSpeed link back from U3 once
-		 * the core has suspended it: keep it out of P3 from here on.
+		 * These PHYs do not bring a SuperSpeed link back from U3 once
+		 * the core has suspended them: keep them out of P3 from here on.
 		 */
 		appledwc->dwc.dis_u3_susphy_quirk = true;
 		dwc3_enable_susphy(&appledwc->dwc, true);
