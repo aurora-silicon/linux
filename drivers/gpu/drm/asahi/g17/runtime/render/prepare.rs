@@ -849,6 +849,7 @@ impl super::super::Backend {
         deferred: &mut super::super::DeferredBatch,
         sleep: bool,
         outer_wait: &mut Option<(Arc<crate::g17::availability::Availability>, u64)>,
+        verify: bool,
     ) -> Result {
         *outer_wait = None;
         let lease = self.enter_preparation(sleep)?;
@@ -858,6 +859,12 @@ impl super::super::Backend {
             let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
             if !lease.is_current() {
                 return Err(EAGAIN);
+            }
+            // Measurement switch 0x4: an early submission left the identity hold out for this
+            // pair. Check what it would have; the scheduler publishes onto a pair not ready.
+            if verify && !firmware.queues.render_ready(slot, self.owner, &self.context)? {
+                self.ready_slot.store(0, core::sync::atomic::Ordering::Relaxed);
+                return Err(super::submit::FALLBACK);
             }
             let qids = firmware
                 .queues
