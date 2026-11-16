@@ -1152,6 +1152,8 @@ void dcp_external_audio_start(struct apple_dcp *dcp);
 extern bool dcp_a352_enable_7c;
 extern unsigned int dcp_swap_ts_mode;
 extern unsigned int dcp_keepalive_ms;
+extern bool dcp_keepalive_repeat;
+extern unsigned int dcp_swap_target_lead_us;
 extern bool dcp_swap_band_hold;
 
 /*

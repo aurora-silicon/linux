@@ -3556,8 +3556,12 @@ bool iomfb_present_complete_h17p(struct apple_dcp *dcp)
 			dcp_backlight_complete(dcp, transaction->backlight.sequence, true);
 			transaction->backlight_reserved = false;
 		}
-		if (transaction->brightness_only)
+		if (transaction->brightness_only) {
+			/* A repeating keepalive keeps the current frame alive while idle. */
+			if (READ_ONCE(dcp_keepalive_repeat))
+				iomfb_keepalive_arm(dcp);
 			return false;
+		}
 	}
 	iomfb_keepalive_arm(dcp);
 	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0)

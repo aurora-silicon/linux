@@ -42,11 +42,26 @@ struct dcp_swap_ts {
  * start is when the driver got the commit; mode 4 clamps it to now. hz is
  * the timebase of all of them.
  */
+/*
+ * swap_target_lead_us, in firmware ticks at hz: added to every clock target
+ * the pick sets. 0 keeps the old past targets; a lead moves the target into
+ * the future the way macOS does.
+ */
+static inline u64 dcp_swap_lead_ticks(unsigned int lead_us, u64 hz)
+{
+	return div_u64(lead_us * hz, 1000000U);
+}
+
 static inline struct dcp_swap_ts dcp_swap_ts_pick(unsigned int mode, u64 now,
-						  u64 prev, u64 start, u64 hz)
+						  u64 prev, u64 start, u64 hz,
+						  unsigned int lead_us)
 {
 	struct dcp_swap_ts ts = { .ts0 = now, .ts1 = prev, .ts6 = now };
 	u64 frame_ticks = hz / 120;
+	u64 lead = dcp_swap_lead_ticks(lead_us, hz);
+
+	ts.ts0 += lead;
+	ts.ts6 += lead;
 
 	switch (mode) {
 	case DCP_SWAP_TS_DESKTOP:
@@ -63,7 +78,7 @@ static inline struct dcp_swap_ts dcp_swap_ts_pick(unsigned int mode, u64 now,
 		start = min(start, now);
 		ts = (struct dcp_swap_ts) {
 			.ts0 = max(now > frame_ticks / 8 ? now - frame_ticks / 8 : 0,
-				   start + hz / 10000),
+				   start + hz / 10000) + lead,
 			.ts1 = start,
 			.ts3 = start,
 			.ts4 = now,

@@ -9,7 +9,7 @@
 
 static void swap_ts_current_follows_the_clock(struct kunit *test)
 {
-	struct dcp_swap_ts ts = dcp_swap_ts_pick(DCP_SWAP_TS_CURRENT, 5000000, 4900000, START, TB_HZ);
+	struct dcp_swap_ts ts = dcp_swap_ts_pick(DCP_SWAP_TS_CURRENT, 5000000, 4900000, START, TB_HZ, 0U);
 
 	KUNIT_EXPECT_EQ(test, ts.ts0, 5000000ULL);
 	KUNIT_EXPECT_EQ(test, ts.ts1, 4900000ULL);
@@ -20,14 +20,14 @@ static void swap_ts_current_follows_the_clock(struct kunit *test)
 
 static void swap_ts_current_keeps_a_lone_swap_at_now(struct kunit *test)
 {
-	struct dcp_swap_ts ts = dcp_swap_ts_pick(DCP_SWAP_TS_CURRENT, 5000000, 5000000, START, TB_HZ);
+	struct dcp_swap_ts ts = dcp_swap_ts_pick(DCP_SWAP_TS_CURRENT, 5000000, 5000000, START, TB_HZ, 0U);
 
 	KUNIT_EXPECT_EQ(test, ts.ts1, 5000000ULL);
 }
 
 static void swap_ts_desktop_is_the_constant(struct kunit *test)
 {
-	struct dcp_swap_ts ts = dcp_swap_ts_pick(DCP_SWAP_TS_DESKTOP, 5000000, 5000000, START, TB_HZ);
+	struct dcp_swap_ts ts = dcp_swap_ts_pick(DCP_SWAP_TS_DESKTOP, 5000000, 5000000, START, TB_HZ, 0U);
 
 	KUNIT_EXPECT_EQ(test, ts.ts0, 120ULL);
 	KUNIT_EXPECT_EQ(test, ts.ts1, 120ULL);
@@ -38,8 +38,8 @@ static void swap_ts_desktop_is_the_constant(struct kunit *test)
 
 static void swap_ts_lone_frame_backs_up_one_frame(struct kunit *test)
 {
-	struct dcp_swap_ts lone = dcp_swap_ts_pick(DCP_SWAP_TS_LONE_FRAME, 5000000, 5000000, START, TB_HZ);
-	struct dcp_swap_ts burst = dcp_swap_ts_pick(DCP_SWAP_TS_LONE_FRAME, 5000000, 4900000, START, TB_HZ);
+	struct dcp_swap_ts lone = dcp_swap_ts_pick(DCP_SWAP_TS_LONE_FRAME, 5000000, 5000000, START, TB_HZ, 0U);
+	struct dcp_swap_ts burst = dcp_swap_ts_pick(DCP_SWAP_TS_LONE_FRAME, 5000000, 4900000, START, TB_HZ, 0U);
 
 	KUNIT_EXPECT_EQ(test, lone.ts0, 5000000ULL);
 	KUNIT_EXPECT_EQ(test, lone.ts1, 5000000ULL - FRAME);
@@ -51,14 +51,14 @@ static void swap_ts_lone_frame_backs_up_one_frame(struct kunit *test)
 
 static void swap_ts_lone_frame_does_not_wrap_at_boot(struct kunit *test)
 {
-	struct dcp_swap_ts ts = dcp_swap_ts_pick(DCP_SWAP_TS_LONE_FRAME, 100, 100, 100, TB_HZ);
+	struct dcp_swap_ts ts = dcp_swap_ts_pick(DCP_SWAP_TS_LONE_FRAME, 100, 100, 100, TB_HZ, 0U);
 
 	KUNIT_EXPECT_EQ(test, ts.ts1, 0ULL);
 }
 
 static void swap_ts_off_is_all_zero(struct kunit *test)
 {
-	struct dcp_swap_ts ts = dcp_swap_ts_pick(DCP_SWAP_TS_OFF, 5000000, 4900000, START, TB_HZ);
+	struct dcp_swap_ts ts = dcp_swap_ts_pick(DCP_SWAP_TS_OFF, 5000000, 4900000, START, TB_HZ, 0U);
 
 	KUNIT_EXPECT_EQ(test, ts.ts0, 0ULL);
 	KUNIT_EXPECT_EQ(test, ts.ts1, 0ULL);
@@ -68,7 +68,7 @@ static void swap_ts_off_is_all_zero(struct kunit *test)
 /* QuartzCore finish_update on macOS 26.6.2: types 1, 2, 4 and 5; type 7 unset. */
 static void swap_ts_macos_targets_an_eighth_frame_before_submit(struct kunit *test)
 {
-	struct dcp_swap_ts ts = dcp_swap_ts_pick(DCP_SWAP_TS_MACOS, 5000000, 4900000, 4000000, TB_HZ);
+	struct dcp_swap_ts ts = dcp_swap_ts_pick(DCP_SWAP_TS_MACOS, 5000000, 4900000, 4000000, TB_HZ, 0U);
 
 	KUNIT_EXPECT_EQ(test, ts.ts0, 5000000ULL - FRAME / 8);
 	KUNIT_EXPECT_EQ(test, ts.ts1, 4000000ULL);
@@ -79,7 +79,7 @@ static void swap_ts_macos_targets_an_eighth_frame_before_submit(struct kunit *te
 
 static void swap_ts_macos_target_is_100us_after_update_start(struct kunit *test)
 {
-	struct dcp_swap_ts ts = dcp_swap_ts_pick(DCP_SWAP_TS_MACOS, 5000000, 4900000, 4999000, TB_HZ);
+	struct dcp_swap_ts ts = dcp_swap_ts_pick(DCP_SWAP_TS_MACOS, 5000000, 4900000, 4999000, TB_HZ, 0U);
 
 	KUNIT_EXPECT_EQ(test, ts.ts0, 4999000ULL + TB_HZ / 10000);
 }
@@ -87,7 +87,7 @@ static void swap_ts_macos_target_is_100us_after_update_start(struct kunit *test)
 /* A commit stamped after the submit read (counter skew) must not put the update start in the future. */
 static void swap_ts_macos_clamps_a_start_after_submit(struct kunit *test)
 {
-	struct dcp_swap_ts ts = dcp_swap_ts_pick(DCP_SWAP_TS_MACOS, 5000000, 4900000, 5000500, TB_HZ);
+	struct dcp_swap_ts ts = dcp_swap_ts_pick(DCP_SWAP_TS_MACOS, 5000000, 4900000, 5000500, TB_HZ, 0U);
 
 	KUNIT_EXPECT_EQ(test, ts.ts1, 5000000ULL);
 	KUNIT_EXPECT_EQ(test, ts.ts3, 5000000ULL);
@@ -96,10 +96,34 @@ static void swap_ts_macos_clamps_a_start_after_submit(struct kunit *test)
 
 static void swap_ts_unknown_mode_is_current(struct kunit *test)
 {
-	struct dcp_swap_ts ts = dcp_swap_ts_pick(99, 5000000, 4900000, START, TB_HZ);
+	struct dcp_swap_ts ts = dcp_swap_ts_pick(99, 5000000, 4900000, START, TB_HZ, 0U);
 
 	KUNIT_EXPECT_EQ(test, ts.ts0, 5000000ULL);
 	KUNIT_EXPECT_EQ(test, ts.ts1, 4900000ULL);
+}
+
+static void swap_ts_lead_moves_the_target_into_the_future(struct kunit *test)
+{
+	struct dcp_swap_ts ts = dcp_swap_ts_pick(DCP_SWAP_TS_MACOS, 5000000, 4900000, 4000000, TB_HZ, 1000U);
+
+	/* 1000 us at TB_HZ ticks: ts0 gains the lead, the starts do not. */
+	KUNIT_EXPECT_EQ(test, ts.ts0, 5000000ULL - FRAME / 8 + TB_HZ / 1000);
+	KUNIT_EXPECT_EQ(test, ts.ts1, 4000000ULL);
+	KUNIT_EXPECT_EQ(test, ts.ts3, 4000000ULL);
+	KUNIT_EXPECT_EQ(test, ts.ts4, 5000000ULL);
+}
+
+static void swap_ts_zero_lead_keeps_the_old_targets(struct kunit *test)
+{
+	struct dcp_swap_ts ts = dcp_swap_ts_pick(DCP_SWAP_TS_MACOS, 5000000, 4900000, 4000000, TB_HZ, 0U);
+
+	KUNIT_EXPECT_EQ(test, ts.ts0, 5000000ULL - FRAME / 8);
+}
+
+static void swap_target_lead_ticks_scales_us_to_hz(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, dcp_swap_lead_ticks(1000U, 24000000U), 24000ULL);
+	KUNIT_EXPECT_EQ(test, dcp_swap_lead_ticks(0U, 24000000U), 0ULL);
 }
 
 static void keepalive_delay_is_off_or_bounded(struct kunit *test)
@@ -160,6 +184,9 @@ static struct kunit_case dcp_swap_pace_test_cases[] = {
 	KUNIT_CASE(swap_ts_macos_target_is_100us_after_update_start),
 	KUNIT_CASE(swap_ts_macos_clamps_a_start_after_submit),
 	KUNIT_CASE(swap_ts_unknown_mode_is_current),
+	KUNIT_CASE(swap_ts_lead_moves_the_target_into_the_future),
+	KUNIT_CASE(swap_ts_zero_lead_keeps_the_old_targets),
+	KUNIT_CASE(swap_target_lead_ticks_scales_us_to_hz),
 	KUNIT_CASE(keepalive_delay_is_off_or_bounded),
 	KUNIT_CASE(band_hold_waits_past_the_grid_frame),
 	KUNIT_CASE(band_hold_ignores_swaps_outside_the_band),

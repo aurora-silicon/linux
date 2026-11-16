@@ -222,6 +222,14 @@ unsigned int dcp_keepalive_ms = DCP_KEEPALIVE_MS_DEFAULT;
 module_param_named(keepalive_ms, dcp_keepalive_ms, uint, 0644);
 MODULE_PARM_DESC(keepalive_ms, "0 = off. N = present the last frame again, with new timestamps, N ms after the last swap (v27 only, max 1000)");
 
+bool dcp_keepalive_repeat = false;
+module_param_named(keepalive_repeat, dcp_keepalive_repeat, bool, 0644);
+MODULE_PARM_DESC(keepalive_repeat, "N (default) = the keepalive present fires once per swap; Y = it re-arms after its own present and keeps repeating the current frame every keepalive_ms while idle");
+
+unsigned int dcp_swap_target_lead_us = 0;
+module_param_named(swap_target_lead_us, dcp_swap_target_lead_us, uint, 0644);
+MODULE_PARM_DESC(swap_target_lead_us, "0 (default) = past targets as before; N = move the swap target ts0/ts6 N us into the future in every ts mode that sets clock values");
+
 bool dcp_swap_band_hold = DCP_SWAP_BAND_HOLD_DEFAULT;
 module_param_named(swap_band_hold, dcp_swap_band_hold, bool, 0644);
 MODULE_PARM_DESC(swap_band_hold, "hold a presentation that would reach an idle panel 3-8.5 ms before its next grid frame until just after that frame (default on)");

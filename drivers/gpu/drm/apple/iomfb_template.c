@@ -3252,7 +3252,8 @@ static void __maybe_unused dcp_swap_stamp(struct apple_dcp *dcp,
 	u64 start = active && active->queued_counter ?
 		dcp_swap_ticks(active->queued_counter) : now;
 	struct dcp_swap_ts ts = dcp_swap_ts_pick(READ_ONCE(dcp_swap_ts_mode), now, prev,
-						 start, DCP_V27_TIMEBASE_HZ);
+						 start, DCP_V27_TIMEBASE_HZ,
+						 READ_ONCE(dcp_swap_target_lead_us));
 
 	req->swap.timestamp[0] = ts.ts0;
 	req->swap.timestamp[1] = ts.ts1;
