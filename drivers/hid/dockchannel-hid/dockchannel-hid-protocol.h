@@ -63,4 +63,14 @@ static inline bool dchid_ring_refused(int ret, bool fifo_fallback)
 	return ret < 0 && fifo_fallback;
 }
 
+/*
+ * Whether the ring stays unused for the session. Only a refused CMD_REGISTER_RING does:
+ * when the preparation command failed, CMD_REGISTER_RING was never sent, so nothing
+ * was refused and a later interface start may register the ring.
+ */
+static inline bool dchid_ring_stays_on_fifo(bool prepared, int ret, bool fifo_fallback)
+{
+	return prepared && dchid_ring_refused(ret, fifo_fallback);
+}
+
 #endif /* _DOCKCHANNEL_HID_PROTOCOL_H */

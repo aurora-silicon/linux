@@ -79,6 +79,19 @@ static void dchid_ring_success_is_not_a_refusal_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, dchid_ring_refused(0, true));
 }
 
+static void dchid_ring_failed_prepare_is_not_a_refusal_test(struct kunit *test)
+{
+	/* CMD_REGISTER_RING was never sent, so the ring is not refused: stay unregistered and retry. */
+	KUNIT_EXPECT_FALSE(test, dchid_ring_stays_on_fifo(false, -ETIMEDOUT, true));
+}
+
+static void dchid_ring_refused_register_stays_on_fifo_test(struct kunit *test)
+{
+	KUNIT_EXPECT_TRUE(test, dchid_ring_stays_on_fifo(true, -ETIMEDOUT, true));
+	KUNIT_EXPECT_FALSE(test, dchid_ring_stays_on_fifo(true, -ETIMEDOUT, false));
+	KUNIT_EXPECT_FALSE(test, dchid_ring_stays_on_fifo(true, 0, true));
+}
+
 static struct kunit_case dchid_protocol_test_cases[] = {
 	KUNIT_CASE(dchid_pm1_command_test),
 	KUNIT_CASE(dchid_pm2_will_change_test),
@@ -87,6 +100,8 @@ static struct kunit_case dchid_protocol_test_cases[] = {
 	KUNIT_CASE(dchid_ring_refusal_keeps_fifo_test),
 	KUNIT_CASE(dchid_ring_refusal_fails_start_without_fallback_test),
 	KUNIT_CASE(dchid_ring_success_is_not_a_refusal_test),
+	KUNIT_CASE(dchid_ring_failed_prepare_is_not_a_refusal_test),
+	KUNIT_CASE(dchid_ring_refused_register_stays_on_fifo_test),
 	{}
 };
 
