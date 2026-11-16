@@ -38,7 +38,10 @@ const GTP6_SIZE: usize = GTP_SLOTS
 /// Clustering metadata 2-4 (0x1c948, 0x1c888, 0x16c41/0x1ca40) on GPUs with more than two
 /// clusters, at the sizes the M2 Pro/Max path gives them (`hw/t602x.rs` clustering config).
 /// Metadata 1 (0x1c920) is sized per target there: [`META1_BLOCK_SIZE`] per block of tiles.
-const GTP_MULTI_CLUSTER_SIZES: [usize; 3] = [0xc0 * 16, 0x280 * 16, 0x10 * 128];
+///
+/// macOS 26.6.2 on the J616C spaces a clustered pass's metadata 2, 3 and 4 0x1180, 0x1400
+/// and 0x1600 apart: metadata 2 needs 0x1180, more than the M2 Pro/Max 0xc00.
+const GTP_MULTI_CLUSTER_SIZES: [usize; 3] = [0x1180, 0x280 * 16, 0x10 * 128];
 const META1_BLOCK_SIZE: usize = 0x44;
 
 /// Per-command geometry, independent of the capacity already allocated.
