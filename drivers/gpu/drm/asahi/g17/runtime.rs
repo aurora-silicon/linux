@@ -1604,7 +1604,9 @@ impl compute::Host for ComputeHost<'_> {
         super::Firmware::apply_shared_effort(self.init, self.effort, self.port, super::power::FULL_EFFORT)
     }
     fn submit_m5(&mut self, submission: &super::fw::m5::queue::HardwareSubmission) -> Result {
-        self.regs.submit_m5_work(submission)
+        // Compute only (publication and installation); render pairs submit through
+        // Firmware::submit_m5_render_pair, which keeps its own order.
+        self.regs.submit_m5_work_held(submission)
     }
 }
 
