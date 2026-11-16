@@ -479,6 +479,9 @@ struct cd321x {
 	unsigned int rearm_resets;
 	bool dp_sink_reported;
 	bool dp_irq_hpd;
+	/* A plug was in when the sleep began, and a wake's first port state is still to be applied */
+	bool sleep_plug;
+	bool wake_apply;
 
 	struct cd321x_status update_status;
 	struct delayed_work update_work;
