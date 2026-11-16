@@ -256,11 +256,15 @@ fn main() {
                         (0x3d98, 0xffff_ffff), (0x3db0, 0xffff_ffff)] {
         assert_eq!(hw(at), value, "J616C hardware data +{:#x}", at);
     }
-    assert_eq!(fnv(&power32, &[(0x3b50, 8), (0x6318, 8), (0x63d4, 4)]), 0xc36d_7dba_a597_aac4,
+    // Equal to what macOS 26.6.2 writes on the J616C (16 Nov 2026 capture) except the two
+    // addresses and the entropy word skipped here, +0x2a04 and +0x0.
+    assert_eq!(fnv(&power32, &[(0x3b50, 8), (0x6318, 8), (0x63d4, 4)]), 0x912f_6adb_4a7e_2900,
                "the J616C power configuration");
-    assert_eq!(fnv(&region32, &[]), 0x91a4_c670_17e3_0a24, "the J616C region C");
+    assert_eq!(fnv(&region32, &[]), 0x5a52_acf2_8086_67c4, "the J616C region C");
     let word = |at: usize| u32::from_le_bytes(power32[at..at + 4].try_into().unwrap());
     assert_eq!(word(0x9ec), (-1000.0 / t6041_25g83::MAX_POWER_MW as f32).to_bits());
+    // +0x2a04 is the power ceiling, not the runtime budget macOS had there.
+    assert_eq!(word(0x2a04), (t6041_25g83::MAX_POWER_MW as f32).to_bits());
     println!("T6041 25G83 32-core objects match the J616C's");
     std::fs::write(format!("{}/t6041-25g83-32-hwdata.bin", out), &hw32).unwrap();
     std::fs::write(format!("{}/t6041-25g83-32-power-config.bin", out), &power32).unwrap();
