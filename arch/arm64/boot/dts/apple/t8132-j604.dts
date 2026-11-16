@@ -378,6 +378,8 @@
 	status = "okay";
 };
 
+#include "t8132-j604-atcphy-tunables.dtsi"
+
 /*
  * External displays over USB-C: both pipes (dcpext0/1), routed through each
  * port's display crossbar to its ATC PHY in DisplayPort alt mode. The left
