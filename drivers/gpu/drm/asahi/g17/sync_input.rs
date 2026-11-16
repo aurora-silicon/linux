@@ -70,6 +70,10 @@ use kernel::{new_mutex, sync::{Arc, Mutex}};
 
 pub(super) struct Source {
     pub(super) submission: Arc<Submission>,
+    /// Published by the consumer's own logical queue (M5): the submit ioctl does not look it up
+    /// under the device mutex, and publication looks for it on that queue's bound queue first.
+    /// It then takes the same checks, kick-entry dependency and binding loan as any source.
+    pub(super) local: bool,
 }
 
 /// The counter is independent of a physical queue's allocation and survives
@@ -187,6 +191,11 @@ impl NativeWait {
 static NATIVE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub(super) fn note_native(count: usize) { NATIVE.fetch_add(count as u64, Ordering::Relaxed); }
 pub(super) fn native_count() -> u64 { NATIVE.load(Ordering::Relaxed) }
+
+/// Live local sources found on the consumer's own bound queue at publication.
+static LOCAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub(super) fn note_local(count: usize) { LOCAL.fetch_add(count as u64, Ordering::Relaxed); }
+pub(super) fn local_count() -> u64 { LOCAL.load(Ordering::Relaxed) }
 
 #[kunit_tests(asahi_g17_input_wait)]
 mod tests {
