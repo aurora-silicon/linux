@@ -171,6 +171,8 @@ struct apple_cio_hw {
 	bool gen4_link_recovery;
 	/* Leave the host router's TMU to its firmware; host TMU constants. */
 	bool host_tmu;
+	/* Every router's TMU in bi-directional HiFi, as macOS runs it. */
+	bool tmu_hifi_bi;
 	const struct apple_dpin_policy *dp;
 };
 
@@ -245,6 +247,12 @@ static const struct apple_cio_hw apple_cio_t6040_hw = {
 	.lstx_after_boot = true,
 	.strict_fw_ready = true,
 	.no_host_clx = true,
+	/*
+	 * macOS runs the host's TMU in bi-directional HiFi with a Studio
+	 * Display attached, whose DP OUT adapter requires it (Min Required TMU
+	 * Mode 3); without it the display drops HPD a second into 5K.
+	 */
+	.tmu_hifi_bi = true,
 	/* The T8132 (M4) DP IN flow; the PHY's AUSPLL is the pixel clock. */
 	.dp = &apple_dpin_m4,
 };
@@ -2710,6 +2718,8 @@ static int apple_nhi_probe(struct platform_device *pdev)
 		anhi->nhi.quirks |= QUIRK_GEN4_LINK_RECOVERY;
 	if (acio->hw->host_tmu)
 		anhi->nhi.quirks |= QUIRK_HOST_TMU;
+	if (acio->hw->tmu_hifi_bi)
+		anhi->nhi.quirks |= QUIRK_TMU_HIFI_BI;
 
 	/*
 	 * TEST: T6050 takes the vendor sleep and the state transfer as the J713 does (macOS,
