@@ -276,7 +276,7 @@ const _: () = {
     }
 };
 
-const RESERVED_SLOTS: [usize; 14] = [2, 5, 6, 7, 8, 27, 30, 38, 42, 46, 47, 48, 49, 52];
+pub(crate) const RESERVED_SLOTS: [usize; 14] = [2, 5, 6, 7, 8, 27, 30, 38, 42, 46, 47, 48, 49, 52];
 
 pub(crate) const PERF: PerfConfig = PerfConfig {
     states_a: [0, 1, 2, 3, 4, 6, 8, 10, 12, 14, 15],

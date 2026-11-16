@@ -43,7 +43,8 @@ use crate::g17::{Config, CoreLayout};
 
 pub(super) const CONFIG: Config = Config {
     windows: &REGISTER_WINDOWS,
-    reserved_slots: &[],
+    // The empty register-map slots macOS 26.6.2 marks reserved on the J616C, as on the J614C.
+    reserved_slots: &t6041::RESERVED_SLOTS,
     perf: Some(&PERF),
     region_c: Some(&REGION_C),
     chip: Some(&CHIP),
@@ -124,14 +125,13 @@ const _: () = {
     }
 };
 
-/// The selector ladders. `states_a` and `states_b` are the highest and lowest of the J616C's
-/// operating points at each of its 11 core voltages, in ADT order; the 40-core 25F84 profile
-/// selects OPP 6 for state 5 of `states_b`, this one OPP 5. The relative ladders are the M4
-/// Pro's. The driver has no source for them on T6041.
+/// The selector ladders, as macOS 26.6.2 writes them on the J616C (hardware data captured under
+/// a hypervisor): `states_a` and `states_b` pick the J616C's operating points in ADT order, with
+/// OPP 6 for state 5 of `states_b` as on the J614C; `relative_a` is the J616C's own.
 const PERF: PerfConfig = PerfConfig {
     states_a: [0, 1, 2, 3, 4, 6, 8, 10, 12, 14, 15],
-    states_b: [0, 1, 2, 3, 4, 5, 7, 9, 11, 13, 15],
-    relative_a: [0, 9, 16, 23, 29, 38, 49, 60, 69, 79, 100],
+    states_b: [0, 1, 2, 3, 4, 6, 7, 9, 11, 13, 15],
+    relative_a: [0, 10, 18, 25, 31, 40, 51, 62, 69, 78, 100],
     relative_b: [0, 0, 22, 36, 47, 57, 68, 78, 84, 91, 100],
     sram_min_mv: 810,
 };
@@ -191,11 +191,57 @@ const CHIP: v25g83::Chip = v25g83::Chip {
         words
     },
     aon_table: &AON_TABLE,
-    hw_data_words: &[],
+    hw_data_words: HW_DATA_WORDS,
     power_config_words: POWER_CONFIG_WORDS,
-    perf_a_replicate_lanes: false,
-    cs_perf_table: true,
+    // macOS fills every voltage lane of table A and leaves the CS table empty, as on the J614C.
+    perf_a_replicate_lanes: true,
+    cs_perf_table: false,
 };
+
+/// Hardware data that differs from the M4 Pro's, as macOS 26.6.2 writes it on the J616C: the
+/// J614C's words with six memory cache controllers (`+0xf8c`, the ADT's active-mcc-bit-vector)
+/// and 40 at `+0xf88`/`+0xfc0` (macOS writes the die's core count there, 32 at `+0x2570`).
+///
+/// macOS also has 1 at `+0x2610`; this driver keeps 0 there, as with 1 the GPU takes work but
+/// never runs it (see `t6041::CHIP_25G83`).
+const HW_DATA_WORDS: &[(usize, u32, usize)] = &[
+    (0xe0, 0x2008, 1),
+    (0xe8, 0x20080000, 1),
+    (0xf4, 0x2008, 1),
+    (0xf8, 0x24cb, 1),
+    (0xfc, 0xc98a2cfa, 1),
+    (0x100, 0xf4f624cb, 1),
+    (0x104, 0x1877e917, 1),
+    (0x108, 0x38d924cb, 1),
+    (0x10c, 0xbdab0000, 1),
+    (0x2d8, 0xfff82000, 1),
+    (0x2dc, 0xd32d2cdb, 1),
+    (0x2e0, 0xf5002000, 1),
+    (0x2e4, 0x21dae926, 1),
+    (0x2e8, 0x38b62000, 1),
+    (0x2ec, 0xc7420008, 1),
+    (0x3e0, 0x7fe0, 1),
+    (0x3e8, 0x7fe00000, 1),
+    (0x3f4, 0x7fe0, 1),
+    (0x3f8, 0x8000, 1),
+    (0x400, 0x80000000, 1),
+    (0x40c, 0x8000, 1),
+    (0x5d8, 0x4b232645, 1),
+    (0x5dc, 0xe98, 1),
+    (0x5e0, 0xd5a2ea5f, 1),
+    (0x5e4, 0x40003fff, 1),
+    (0x5e8, 0xca5e4000, 1),
+    (0x5ec, 0x4000f5a2, 1),
+    (0xf6c, 0x1, 1),
+    (0xf88, 0x28, 1),
+    (0xf8c, 0x3f, 1),
+    (0xfac, 0x1, 1),
+    (0xfb8, 0x1d, 1),
+    (0xfc0, 0x28, 1),
+    (0x2594, 0x2e0000, 1),
+    (0x3d98, 0xffff_ffff, 1),
+    (0x3db0, 0xffff_ffff, 1),
+];
 
 /// What differs from the M4 Pro's power configuration besides the power limit and leakage.
 const POWER_CONFIG_WORDS: &[(usize, u32, usize)] = &[
