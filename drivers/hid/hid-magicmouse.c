@@ -2057,11 +2057,11 @@ static bool magicmouse_haptic_click(struct magicmouse_sc *msc, u32 pressure,
 
 /*
  * The actuator leaves system sleep in device-controlled mode whatever it was
- * in before: the transport resumes the keyboard and the trackpad, not the
- * actuator, and nothing reports the change. A cached host-controlled mode then
- * makes the next press skip the switch and play a pulse while the firmware is
- * playing its own, which is felt as two clicks. Forget it instead; the next
- * press takes the mode again if it needs it.
+ * in before: either the sleep resets it, or its own driver returns it there
+ * on resume, and nothing reports the change here. A cached host-controlled
+ * mode then makes the next press skip the switch and play a pulse while the
+ * firmware is playing its own, which is felt as two clicks. Forget it
+ * instead; the next press takes the mode again if it needs it.
  */
 static void magicmouse_haptic_forget_mode(struct magicmouse_sc *msc)
 {

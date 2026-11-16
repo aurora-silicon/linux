@@ -209,6 +209,25 @@ static int apple_actuator_probe(struct hid_device *haptic_hdev, const struct hid
 
 static int apple_actuator_resume(struct hid_device *haptic_hdev)
 {
+	int ret;
+
+	/*
+	 * The drivers that share the actuator forget a host-controlled mode
+	 * across system sleep and expect the firmware to click again. The
+	 * actuator does not always agree: suspend-to-idle does not put the MTP
+	 * to sleep, so one taken host-controlled before suspend is still
+	 * host-controlled after it. Its trackpad then reports no button, and
+	 * nothing presses one for it, so the pad stops clicking until the
+	 * actuator is reset. Assert the mode the drivers assume, as probe does.
+	 * A user that still wants host control takes it again on its next
+	 * effect.
+	 */
+	ret = apple_taptic_switch_modes(haptic_hdev, false);
+	if (ret)
+		hid_warn(haptic_hdev,
+			 "cannot return the actuator to device-controlled mode (%d)\n",
+			 ret);
+
 	apple_taptic_set_click_strength(haptic_hdev);
 	return 0;
 }
