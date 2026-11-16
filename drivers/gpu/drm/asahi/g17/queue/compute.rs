@@ -2593,6 +2593,10 @@ pub(crate) trait Host {
     fn notify(&mut self, message: u64) -> Result;
     fn note_submission(&mut self) -> Result;
     fn submit_m5(&mut self, submission: &crate::g17::fw::m5::queue::HardwareSubmission) -> Result;
+    /// TEST ONLY: a predecessor's private timestamp pair was observed started, not ended.
+    fn submit_m5_running(&mut self, submission: &crate::g17::fw::m5::queue::HardwareSubmission) -> Result {
+        self.submit_m5(submission)
+    }
 }
 
 impl Queue {
@@ -3124,9 +3128,19 @@ impl Queue {
                 // nothing new and goes idle, and the advance alone never wakes it, so the kick
                 // never runs. Held gating is what lets the advance land first: without the
                 // hold, gated cores did not take it.
-                host.submit_m5(&crate::g17::fw::m5::queue::HardwareSubmission::compute(
+                let submission = crate::g17::fw::m5::queue::HardwareSubmission::compute(
                     qid, self.kick.low_va(), policy.priority(),
-                    first || notify_activation)?)?;
+                    first || notify_activation)?;
+                // TEST ONLY: this observation is a timing experiment, not a power lease.
+                // A predecessor can finish after the sample; mode 3 is not a correctness fix.
+                let running = crate::g17::sync_input::compute_kick_mode() == 3
+                    && self.active.iter().any(|active| {
+                        active.ticket.is_some_and(|ticket| ticket.epoch == epoch && ticket.ordinal < ordinal)
+                            && active.packet.completion.replay_witness_words()
+                                .is_some_and(|words| words[0] != 0 && words[1] == 0)
+                    });
+                if running { host.submit_m5_running(&submission)?; }
+                else { host.submit_m5(&submission)?; }
             }
             if !old_order {
                 host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;

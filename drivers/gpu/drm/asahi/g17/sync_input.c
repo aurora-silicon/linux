@@ -3,6 +3,9 @@
 #include <linux/dma-fence-unwrap.h>
 #include <linux/errno.h>
 #include <linux/moduleparam.h>
+#include <linux/atomic.h>
+#include <linux/kernel.h>
+#include <linux/mm.h>
 #include <linux/slab.h>
 #include "sync_input.h"
 #include "sync_scope.h"
@@ -136,13 +139,38 @@ unsigned int asahi_g17_render_submit(void)
 }
 
 /* Measurement only: 0 is the held host-port-first path; 1 restores the
- * doorbell-first, unheld path. Change only between idle benchmark clients.
+ * doorbell-first, unheld path; 2 shadows the gating word; 3 omits the hold
+ * after observing a running predecessor. Change between benchmark clients.
  */
 static unsigned int gpubench_compute_kick;
 module_param(gpubench_compute_kick, uint, 0644);
-MODULE_PARM_DESC(gpubench_compute_kick, "Measurement: compute kick (0 held host-port first, 1 old doorbell first)");
+MODULE_PARM_DESC(gpubench_compute_kick, "Measurement: compute kick (0 held, 1 old, 2 gating shadow, 3 running predecessor)");
 
 unsigned int asahi_g17_compute_kick_mode(void)
 {
 	return READ_ONCE(gpubench_compute_kick);
 }
+
+static atomic64_t gpubench_kick_paths[4];
+
+void asahi_g17_note_compute_kick(unsigned int path)
+{
+	if (path < ARRAY_SIZE(gpubench_kick_paths))
+		atomic64_inc(&gpubench_kick_paths[path]);
+}
+
+static int gpubench_kick_counts_get(char *buffer, const struct kernel_param *kp)
+{
+	(void)kp;
+	return scnprintf(buffer, PAGE_SIZE, "%lld %lld %lld %lld\n",
+		(long long)atomic64_read(&gpubench_kick_paths[0]),
+		(long long)atomic64_read(&gpubench_kick_paths[1]),
+		(long long)atomic64_read(&gpubench_kick_paths[2]),
+		(long long)atomic64_read(&gpubench_kick_paths[3]));
+}
+
+static const struct kernel_param_ops gpubench_kick_counts_ops = {
+	.get = gpubench_kick_counts_get,
+};
+module_param_cb(gpubench_compute_kick_counts, &gpubench_kick_counts_ops, NULL, 0444);
+MODULE_PARM_DESC(gpubench_compute_kick_counts, "Measurement: held, old, shadow and running-predecessor transactions");

@@ -1611,11 +1611,17 @@ impl compute::Host for ComputeHost<'_> {
     fn submit_m5(&mut self, submission: &super::fw::m5::queue::HardwareSubmission) -> Result {
         // Compute only (publication and installation); render pairs submit through
         // Firmware::submit_m5_render_pair, which keeps its own order.
+        let mode = super::sync_input::compute_kick_mode();
+        super::sync_input::note_compute_kick(if mode == 1 || mode == 2 { mode } else { 0 });
         if super::sync_input::old_compute_kick() {
             self.regs.submit_m5_work(submission)
         } else {
-            self.regs.submit_m5_work_held(submission)
+            self.regs.submit_m5_work_held(submission, super::sync_input::compute_kick_mode() == 2)
         }
+    }
+    fn submit_m5_running(&mut self, submission: &super::fw::m5::queue::HardwareSubmission) -> Result {
+        super::sync_input::note_compute_kick(3);
+        self.regs.submit_m5_work(submission)
     }
 }
 

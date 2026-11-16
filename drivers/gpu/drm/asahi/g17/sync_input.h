@@ -17,6 +17,7 @@ void asahi_g17_put_fence(struct dma_fence *fence);
 struct dma_fence *asahi_g17_merge_fences(struct dma_fence *const *fences, size_t count);
 unsigned int asahi_g17_local_inputs(void);
 unsigned int asahi_g17_compute_kick_mode(void);
+void asahi_g17_note_compute_kick(unsigned int path);
 unsigned int asahi_g17_render_submit(void);
 
 #endif
