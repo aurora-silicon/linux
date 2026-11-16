@@ -3051,14 +3051,18 @@ impl Queue {
             // bits 3:2. The generic work doorbell left the firmware to find the
             // ring itself and delayed dispatch.
             fence(Ordering::SeqCst);
-            host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
             if self.graph.m5 {
-                // The firmware work notification must precede a deferred host
-                // doorbell: an idle-policy hold alone does not wake gated cores.
+                // macOS's order on this firmware: the host-port transaction, with core gating
+                // held off across it (Host::submit_m5), then the work doorbell. Rung first, the
+                // doorbell can be served before the advance lands; the firmware then finds
+                // nothing new and goes idle, and the advance alone never wakes it, so the kick
+                // never runs. Held gating is what lets the advance land first: without the
+                // hold, gated cores did not take it.
                 host.submit_m5(&crate::g17::fw::m5::queue::HardwareSubmission::compute(
                     qid, self.kick.low_va(), policy.priority(),
                     first || notify_activation)?)?;
             }
+            host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
             crate::g17::trace::publish(crate::g17::trace::COMPUTE, qid, ordinal, &packet);
             host.note_submission()
         })();
