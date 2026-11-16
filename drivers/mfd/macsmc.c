@@ -646,9 +646,11 @@ static int apple_smc_probe(struct platform_device *pdev)
 	mutex_init(&smc->mutex);
 	spin_lock_init(&smc->lock);
 	smc->dev = &pdev->dev;
-	smc->saved_enabled = of_machine_is_compatible("apple,j714s") &&
+	smc->saved_enabled = of_machine_is_compatible("apple,t6050") &&
+		(of_machine_is_compatible("apple,j714s") ||
+		 of_machine_is_compatible("apple,j716c")) &&
 		of_device_is_compatible(dev->of_node, "apple,t6050-smc");
-	if (smc->saved_enabled)
+	if (smc->saved_enabled && of_machine_is_compatible("apple,j714s"))
 		smc->wake_reasons = apple_smc_j714s_wake_reasons;
 	smc->sram_base = devm_platform_get_and_ioremap_resource(pdev, 1, &smc->sram);
 	if (IS_ERR(smc->sram_base))
