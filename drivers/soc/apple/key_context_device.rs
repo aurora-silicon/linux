@@ -50,6 +50,14 @@ struct AuthPassword {
     outcome: u32,
     password: keys::Password,
 }
+/// Binds a context, before AUTH, to the key in `handle` for the
+/// `key_context::SCOPE_*` operations in `ops`.
+#[repr(C)]
+struct ContextBind {
+    ops: u32,
+    reserved: u32,
+    handle: Buffer,
+}
 #[repr(C)]
 struct Query {
     phase: u32,
@@ -87,6 +95,7 @@ struct ContextDecrypt {
 
 static_assert!(core::mem::size_of::<NewContext>() == 16);
 static_assert!(core::mem::size_of::<Authenticate>() == 24);
+static_assert!(core::mem::size_of::<ContextBind>() == 24);
 static_assert!(core::mem::size_of::<AuthPassword>() == 16 + 8 + keys::PASSWORD_MAX);
 static_assert!(core::mem::size_of::<Query>() == 16);
 static_assert!(core::mem::size_of::<Revoke>() == 8);
@@ -98,6 +107,7 @@ unsafe impl kernel::transmute::AsBytes for NewContext {}
 unsafe impl kernel::transmute::FromBytes for Authenticate {}
 unsafe impl kernel::transmute::AsBytes for Authenticate {}
 unsafe impl kernel::transmute::FromBytes for AuthPassword {}
+unsafe impl kernel::transmute::FromBytes for ContextBind {}
 unsafe impl kernel::transmute::AsBytes for AuthPassword {}
 unsafe impl kernel::transmute::AsBytes for Query {}
 unsafe impl kernel::transmute::FromBytes for Revoke {}
@@ -109,6 +119,7 @@ unsafe impl kernel::transmute::AsBytes for ContextDecrypt {}
 const NEW: u32 = kernel::ioctl::_IOWR::<NewContext>(crate::key::MAGIC, 0x40);
 const AUTH: u32 = kernel::ioctl::_IOWR::<Authenticate>(crate::key::MAGIC, 0x41);
 const AUTH_PASSWORD: u32 = kernel::ioctl::_IOWR::<AuthPassword>(crate::key::MAGIC, 0x46);
+const BIND: u32 = kernel::ioctl::_IOW::<ContextBind>(crate::key::MAGIC, 0x47);
 const QUERY: u32 = kernel::ioctl::_IOR::<Query>(crate::key::MAGIC, 0x42);
 const REVOKE: u32 = kernel::ioctl::_IOW::<Revoke>(crate::key::MAGIC, 0x43);
 const SIGN: u32 = kernel::ioctl::_IOWR::<ContextSign>(crate::key::MAGIC, 0x44);
@@ -275,6 +286,7 @@ impl File {
             )?;
             let context = self.context(out.context_fd)?;
             let blob = decode_record(&blob, context.bag)?;
+            context.in_scope(&blob, crate::key_context::SCOPE_SIGN)?;
             let request = Request::new(
                 out.id,
                 crate::key_request::KeyRequest {
@@ -312,6 +324,7 @@ impl File {
         }
         let context = self.context(out.context_fd)?;
         let blob = decode_record(&blob, context.bag)?;
+        context.in_scope(&blob, crate::key_context::SCOPE_DECRYPT)?;
         let request = Request::new(
             out.id,
             crate::key_request::KeyRequest {
@@ -376,6 +389,15 @@ unsafe extern "C" fn context_ioctl(pointer: *mut c_void, cmd: c_uint, arg: c_ulo
         }
         if cmd == AUTH_PASSWORD {
             return auth_password(&context, user);
+        }
+        if cmd == BIND {
+            context.check_domain()?;
+            let request: ContextBind = UserSlice::new(user, 24).reader().read()?;
+            if request.reserved != 0 {
+                return Err(EINVAL);
+            }
+            let record = decode_record(&read(&request.handle, 1)?, context.bag)?;
+            return context.bind(record, request.ops);
         }
         if cmd != AUTH {
             return Err(ENOTTY);

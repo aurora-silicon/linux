@@ -422,12 +422,14 @@ struct sep_key_unseal_password {
  *
  * One authentication (a Touch ID match in the bag user's own domain, or the
  * bag's password checked by the enclave) authorizes a bounded run of
- * operations on that bag's keys, as macOS lets an authentication be reused
- * for a short time: a password manager reveals many items after one unlock.
- * The bounds:
+ * operations on that bag's keys, or with BIND on one of them, as macOS lets
+ * an authentication be reused for a short time: a password manager reveals
+ * many items after one unlock. The bounds:
  *
  * - a context belongs to one Unix account's key bag (NEW: root or that
  *   user) and is a file descriptor: closing it ends it;
+ * - BIND, before AUTH, may name the one key and the operations
+ *   (SEP_KEY_CTX_SCOPE_*) it authorizes; nothing else is then accepted;
  * - it lasts lifetime_s from the authentication (at most 12 hours, 0 =
  *   until revoked), and ends at once when the bag locks, on suspend, on
  *   REVOKE and when the driver stops;
@@ -439,11 +441,13 @@ struct sep_key_unseal_password {
  * AUTH) ends that request, such as an AUTH waiting for a finger.
  * Outcome: 0 authenticated, 1 not matched or wrong password, 5 failed.
  * Errors: EOPNOTSUPP without the feature, EKEYEXPIRED once the
- * context has ended, EBUSY while another request runs, ECANCELED when
- * cancelled, ETIMEDOUT at timeout_ms.
+ * context has ended, EPERM outside its scope, EBUSY while another request
+ * runs, ECANCELED when cancelled, ETIMEDOUT at timeout_ms.
  */
 #define SEP_KEY_CTX_NEW_BAG       0x1
 #define SEP_KEY_CTX_LIFETIME_MAX  (12 * 3600)
+#define SEP_KEY_CTX_SCOPE_SIGN    0x1
+#define SEP_KEY_CTX_SCOPE_DECRYPT 0x2
 #define SEP_KEY_CTX_METHOD_TOUCH  1
 #define SEP_KEY_CTX_OUTCOME_OK          0
 #define SEP_KEY_CTX_OUTCOME_NOT_MATCHED 1
@@ -475,6 +479,12 @@ struct sep_key_ctx_auth_password {
 	__u32 timeout_ms;
 	__u32 outcome;          /* out */
 	struct sep_key_password password;
+};
+
+struct sep_key_ctx_bind {
+	__u32 ops;              /* SEP_KEY_CTX_SCOPE_* */
+	__u32 reserved;
+	struct sep_key_buffer handle;
 };
 
 struct sep_key_ctx_query {
@@ -522,6 +532,7 @@ struct sep_key_cancel_id {
 #define SEP_KEY_CTX_SIGN          _IOWR(SEP_BIO_IOC_MAGIC, 0x44, struct sep_key_ctx_sign)
 #define SEP_KEY_CTX_DECRYPT       _IOWR(SEP_BIO_IOC_MAGIC, 0x45, struct sep_key_ctx_decrypt)
 #define SEP_KEY_CTX_AUTH_PASSWORD _IOWR(SEP_BIO_IOC_MAGIC, 0x46, struct sep_key_ctx_auth_password)
+#define SEP_KEY_CTX_BIND          _IOW(SEP_BIO_IOC_MAGIC, 0x47, struct sep_key_ctx_bind)
 #define SEP_KEY_CANCEL_ID         _IOW(SEP_BIO_IOC_MAGIC, 0x48, struct sep_key_cancel_id)
 
 /*
