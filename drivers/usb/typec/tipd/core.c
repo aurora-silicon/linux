@@ -15,6 +15,7 @@
 #include <linux/of.h>
 #include <linux/power_supply.h>
 #include <linux/regmap.h>
+#include <linux/reboot.h>
 #include <linux/unaligned.h>
 #include <linux/usb/pd.h>
 #include <linux/usb/typec.h>
@@ -2243,6 +2244,45 @@ VISIBLE_IF_KUNIT void cd321x_stop_work(struct cd321x *cd321x)
 }
 EXPORT_SYMBOL_IF_KUNIT(cd321x_stop_work);
 
+/*
+ * Close the port's USB4/Thunderbolt session while the system still runs. A
+ * cable event that closes it inside device_shutdown() makes pid 1 wait for the
+ * PCIe-C reset handshake of an ACIO that is already going down. Stopping the
+ * work first keeps every later event away from the router.
+ */
+VISIBLE_IF_KUNIT int cd321x_reboot_close(struct cd321x *cd321x)
+{
+	struct typec_thunderbolt_switch_data off = {
+		.state = TYPEC_THUNDERBOLT_SWITCH_OFF,
+	};
+
+	cd321x_stop_work(cd321x);
+	return typec_thunderbolt_switch_set(cd321x->tbt_switch, &off);
+}
+EXPORT_SYMBOL_IF_KUNIT(cd321x_reboot_close);
+
+VISIBLE_IF_KUNIT int cd321x_reboot_notify(struct notifier_block *nb,
+					  unsigned long action, void *data)
+{
+	struct cd321x *cd321x = container_of(nb, struct cd321x, reboot_nb);
+	struct tps6598x *tps = &cd321x->tps;
+	int ret;
+
+	if (action != SYS_RESTART && action != SYS_HALT && action != SYS_POWER_OFF)
+		return NOTIFY_DONE;
+
+	if (tps->irq)
+		disable_irq(tps->irq);
+	if (cd321x->tbt_switch)
+		dev_info(tps->dev, "closing the USB4/Thunderbolt session before shutdown\n");
+	ret = cd321x_reboot_close(cd321x);
+	if (cd321x->tbt_switch)
+		dev_info(tps->dev, "closed the USB4/Thunderbolt session before shutdown: %d\n",
+			 ret);
+	return NOTIFY_OK;
+}
+EXPORT_SYMBOL_IF_KUNIT(cd321x_reboot_notify);
+
 /* Separate so that the KUnit tests can choose the driver core's answer. */
 VISIBLE_IF_KUNIT bool cd321x_tbt_switch_keep_waiting(struct device *dev)
 {
@@ -2461,6 +2501,13 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 	    cd321x_tbt_watch_late(cd321x, fwnode))
 		dev_warn(tps->dev, "cannot watch for the USB4/Thunderbolt router\n");
 
+	cd321x->reboot_nb.notifier_call = cd321x_reboot_notify;
+	cd321x->reboot_nb.priority = INT_MAX;
+	if (register_reboot_notifier(&cd321x->reboot_nb))
+		dev_warn(tps->dev, "cannot close the USB4/Thunderbolt session at shutdown\n");
+	else
+		cd321x->reboot_nb_registered = true;
+
 	return 0;
 
 err_put_switch:
@@ -2491,6 +2538,11 @@ static void
 cd321x_unregister_port(struct tps6598x *tps)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
+
+	if (cd321x->reboot_nb_registered) {
+		unregister_reboot_notifier(&cd321x->reboot_nb);
+		cd321x->reboot_nb_registered = false;
+	}
 
 	cd321x_stop_work(cd321x);
 	fwnode_handle_put(cd321x->connector_fwnode);
