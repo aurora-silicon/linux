@@ -254,4 +254,4 @@
 #include "t6050-j716c-sep.dtsi"
 
 #include "t6050-j716c-sleep.dtsi"
-#include "t6050-j716c-sleep-devices.dtsi"
+#include "t6050-j716c-sleep-full.dtsi"
