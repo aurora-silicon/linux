@@ -268,3 +268,5 @@
 };
 
 /* Unexposed chassis port instances remain described and disabled. */
+
+#include "t8142-j813-j815-sleep.dtsi"
