@@ -92,6 +92,7 @@ int apple_sleep_coproc_register(struct device *dev, void __iomem *asc, bool pcie
 	c->stopped = false;
 	c->first = false;
 	c->early = false;
+	c->last = false;
 	c->order = 0;
 	c->ps = 0;
 	c->domain = NULL;
@@ -143,6 +144,27 @@ int apple_sleep_coproc_register_first(struct device *dev, unsigned int order,
 	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_sleep_coproc_register_first);
+
+int apple_sleep_coproc_register_last(struct device *dev, int (*last_stop)(void *data),
+				     void *data)
+{
+	struct apple_sleep_coproc *c;
+	int ret;
+
+	if (!last_stop)
+		return -EINVAL;
+	ret = apple_sleep_coproc_register(dev, NULL, false, last_stop, data);
+	if (ret)
+		return ret;
+
+	guard(mutex)(&apple_sleep_coprocs_lock);
+	c = apple_sleep_coproc_find(dev);
+	if (c)
+		c->last = true;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_sleep_coproc_register_last);
 
 int apple_sleep_coproc_set_last_check(struct device *dev, int (*last_check)(void *data))
 {
@@ -290,7 +312,8 @@ void apple_sleep_registry_show(struct seq_file *s)
 		if (!c->dev)
 			continue;
 		seq_printf(s, "  %s%s%s%s%s\n", dev_name(c->dev), c->pcie_ans ? " (ANS)" : "",
-			   c->first ? " (first)" : "", c->last_check ? ", last check" : "",
+			   c->first ? " (first)" : c->last ? " (last)" : "",
+			   c->last_check ? ", last check" : "",
 			   c->ready ? ", ready" : "");
 	}
 	seq_printf(s, "enclave sleep request left for the last refusal: %s\n",
@@ -369,14 +392,17 @@ void apple_sleep_registry_stop(bool first, bool *pcie_ans)
 
 	if (first)
 		*pcie_ans = false;
-	/* Those registered first run by their order, the others in one pass over the table. */
-	for (order = 0; order < (first ? APPLE_SLEEP_FIRST_ORDERS : 1); order++) {
+	/*
+	 * Those registered first run by their order; the others in one pass over the table,
+	 * then those registered last.
+	 */
+	for (order = 0; order < (first ? APPLE_SLEEP_FIRST_ORDERS : 2); order++) {
 		for (i = 0; i < APPLE_SLEEP_COPROCS; i++) {
 			struct apple_sleep_coproc *c = &apple_sleep_coprocs[i];
 
 			if (!c->dev || !c->ready || c->first != first)
 				continue;
-			if (first && c->order != order)
+			if (first ? c->order != order : c->last != (order == 1))
 				continue;
 			*pcie_ans |= c->pcie_ans;
 			if (c->stopped)

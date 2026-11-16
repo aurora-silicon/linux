@@ -1,0 +1,193 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Suspend-to-RAM on the 13- and 15-inch M5 MacBook Air (J813, J815): the sleep controller,
+ * the cores' power-gate enables, the shared PCIe block the wake brings back, the SEP's power
+ * word and the DCP DART's power-state write-disable. Included at the end of each board's
+ * device tree, after the nodes it refers to.
+ */
+
+/*
+ * The DCP DART's PS write-disable bit, which T8142 has instead of T8140's GAPF slice. Live ADT
+ * dart-dcp: clock-protection-wr-dis-id <0x1f 0xff>, PSWR instance 0 = reg[1] 0x380714000.
+ * /chosen/dart-ps-wr-dis-entries[0x1f] = {offset 0x3fdc, instance 0, bit 6, refcount 1}, and
+ * the T8142 SPTM (27.2.1) sets that bit on the 0->1 refcount and clears it on 1->0 at the
+ * DART's power-down, where T8140's clears GAPF bit 4. Set, the fabric rejects writes to
+ * DISP_CPU's power word: the DART driver clears it once the DCP is stopped and sets it again
+ * after. Only a DCP firmware stop uses it. Never run on an M5.
+ */
+&dcp_dart {
+	reg = <0x2 0x86340000 0x0 0x20000>,
+	      <0x3 0x80717fdc 0x0 0x4>;
+	reg-names = "dart", "ps-wr-dis";
+	apple,ps-wr-dis-bit = <6>;
+};
+
+/*
+ * Suspend-to-RAM (apple,t8142-sleep): derived from macOS 27.2.1 and T8132's measurements, and
+ * dry-run gated in the driver (apple_sleep.deep, apple_sleep.untested_commit). The J813 and J815
+ * ADTs (27.0) differ only in audio, product and CLPC power-limit properties: every block, wake
+ * source, GPIO and PCIe window below is the same on both.
+ */
+&pmgr {
+	/*
+	 * SEP (J815 ADT, PMGR +0xc00). Never switched by Linux: named so the enclave's sleep
+	 * request (pm_shim) and the deep sleep's last refusal can read its state, as on J713.
+	 */
+	ps_sep: power-controller@c00 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xc00 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "sep";
+		apple,always-on;
+		apple,firmware-owned;
+	};
+};
+
+/* For the enclave's sleep request; the domain is firmware-owned. */
+&sep {
+	power-domains = <&ps_sep>;
+};
+
+&{/soc} {
+	/*
+	 * The CPU cores' power-gate enables, /arm-io/pmgr reg[34] (0x380724000): one word per
+	 * core at a 0x10 stride, E cores 0..5 at +0x0..+0x50, P cores at +0x60... iBoot leaves
+	 * the boot core's (P core 0, +0x60) clear (probe snapshot: 0), so the boot core never
+	 * powers off in WFI, the P complex stays BUSY at the commit and WD2 resets (b44-b46).
+	 * AppleT8142PMGR's restoreHW sets exactly +0x0 and +0x60, T8132 (J713) enables the
+	 * same two words at boot, T6050 measured the same failure with core 0's word clear.
+	 */
+	cluster_pwrgate: power-gate@380724000 {
+		compatible = "apple,t8142-cluster-pwrgate", "apple,cluster-pwrgate";
+		reg = <0x3 0x80724000 0x0 0x4>,
+		      <0x3 0x80724060 0x0 0x4>;
+	};
+
+	/*
+	 * Suspend-to-RAM. The blocks are T8132's, at the same J815 ADT indices: /arm-io/pmgr
+	 * reg[32] (ps), [34] (pwrgate), [42] (cpu-start), [45] (cllt; EARLY_WAKEUP_CFG at
+	 * +0x50), [36] (cluster), [40] + 0x4000 (commit), [38] (aon-misc), [4] (wake: nine mask
+	 * and nine status words), [1] (ps-aon), /arm-io/wdt, nub-spmi0, nub-spmi-a0, the
+	 * PMC's voter floors (as &pmc), and the SoC and DCS perf-state words that
+	 * AppleT8142PMGR::setPerfState writes (reg[2] + 0x24000, + 0x25000).
+	 * Derived from macOS 27.2.1 and T8132's measurements, never run on an M5: the driver
+	 * stops each sleep at a dry run unless booted with apple_sleep.untested_commit=1,
+	 * and deep sleep is only used when asked for (mem_sleep).
+	 */
+	sleep: sleep-controller@380700000 {
+		compatible = "apple,t8142-sleep";
+		reg = <0x3 0x80700000 0x0 0x18000>,
+		      <0x3 0x80724000 0x0 0x2000>,
+		      <0x3 0x80734000 0x0 0x10>,
+		      <0x3 0x80768000 0x0 0x54>,
+		      <0x3 0x80780000 0x0 0x8>,
+		      <0x3 0x882d4000 0x0 0x4>,
+		      <0x3 0x882b0000 0x0 0x30>,
+		      <0x3 0x882b8000 0x0 0x44>,
+		      <0x3 0x88004000 0x0 0x50>,
+		      /* SPMI gen 4: queue at +0x200..0x220, notify enable/ack +0x420/+0x620 */
+		      <0x3 0x88714000 0x0 0x1000>,
+		      <0x3 0x88280000 0x0 0x10000>,
+		      /* nub-spmi-a0's notify enable word (gen 4: +0x420; gen 1 had +0x40) */
+		      <0x3 0x88908420 0x0 0x4>,
+		      <0x3 0x82700000 0x0 0x10000>,
+		      <0x3 0x80024000 0x0 0x4>,
+		      <0x3 0x80025000 0x0 0x4>,
+		      /*
+		       * Each complex's ACC word 0x40f8 (ADT pmgr reg[7] E, reg[18] P, + 0x40f8),
+		       * which AppleT8142PMGR sets to 1 after the complex powers on and at the
+		       * end of restoreHW.
+		       */
+		      <0x2 0x10e440f8 0x0 0x4>,
+		      <0x2 0x11e440f8 0x0 0x4>,
+		      /*
+		       * The memory side macOS steps down last (J813 trace, same ADT mcc layout
+		       * on J815): each AMCC plane's +0x28000 word (mcc reg[1], planes 0x40000
+		       * apart), the six SoC NI tables (reg[2..7]), the eight DCS channels'
+		       * words from +0x580 (reg[10..17]) and the clock word 0x380038000.
+		       */
+		      <0x2 0x20028000 0x0 0x8>,
+		      <0x2 0x20068000 0x0 0x8>,
+		      <0x2 0x200a8000 0x0 0x8>,
+		      <0x2 0x200e8000 0x0 0x8>,
+		      <0x2 0x4f010000 0x0 0x80>,
+		      <0x2 0x50010000 0x0 0x80>,
+		      <0x2 0x51010000 0x0 0x80>,
+		      <0x2 0x52010000 0x0 0x80>,
+		      <0x2 0x53010000 0x0 0x80>,
+		      <0x2 0x54010000 0x0 0x80>,
+		      <0x2 0x21000580 0x0 0x104>,
+		      <0x2 0x21200580 0x0 0x104>,
+		      <0x2 0x21400580 0x0 0x104>,
+		      <0x2 0x21600580 0x0 0x104>,
+		      <0x2 0x21800580 0x0 0x104>,
+		      <0x2 0x21a00580 0x0 0x104>,
+		      <0x2 0x21c00580 0x0 0x104>,
+		      <0x2 0x21e00580 0x0 0x104>,
+		      <0x3 0x80038000 0x0 0x4>;
+		reg-names = "ps", "pwrgate", "cpu-start", "cllt", "cluster",
+			    "commit", "wdt", "aon-misc", "wake", "spmi",
+			    "ps-aon", "spmi-a0", "pmc-voters", "clk-perf", "dcs",
+			    "acc-e", "acc-p",
+			    "amcc0", "amcc1", "amcc2", "amcc3",
+			    "socni0", "socni1", "socni2", "socni3", "socni4", "socni5",
+			    "mcc0", "mcc1", "mcc2", "mcc3", "mcc4", "mcc5", "mcc6", "mcc7",
+			    "mem-clk";
+		/*
+		 * From the J815 ADT's /arm-io/pmgr ap-wake-sources, the same sources
+		 * as T8132's by name: NUB.SPMI0.SW3, ATC0.USBWakeup, SMC.CPUWakeupAP,
+		 * SMC.OutboxNotEmpty, MTP.DOCK.CHANNELS.AP0.IRQ and MTP.OutboxNotEmpty.
+		 */
+		apple,wake-enable = <152 72 168 190 89 108>;
+		apple,display-coprocessors = <&dcp>;
+		/* ANS's link's shared block, and the radio's link, which only aura trains */
+		apple,apcie = <&apcie_shared>;
+		apple,radio-host = <&pcie0>;
+		/* ADT pci-bridge0 function-perst: AP GPIO 192 */
+		apple,radio-perst = <&pinctrl_ap 192 GPIO_ACTIVE_LOW>;
+		apple,pinctrl = <&pinctrl_ap>;
+		/* The ADT's no-restore-gpio-pins: reading pin 78 raises an SError. */
+		apple,pinctrl-skip-pins = <78 203>;
+	};
+
+	/*
+	 * ANS's side of the shared PCIe block, which the sleep controller brings back after a
+	 * real sleep in AppleT8142PCIe's order (as aura's j813_n1.c at boot): ADT /arm-io/apcie
+	 * reg[1] (rc), [2] (phy-block; its PHY-PHY control words are reg[3], 0x20000 in), [4]
+	 * (phy-ip) and [5] (axi2af, as far as its tables reach). Then the radio's port 0, which
+	 * it trains again after the wake: reg[8] (radio-port), [10] (radio-lane) and the root
+	 * port's configuration space (radio-cfg, the ECAM's first 4 KiB). reg[6] (clkgen, the
+	 * pcieclkgen whose PLLs APCIECoreRCGen4 shuts down before the power goes; AppleT8142PCIe
+	 * maps reg[7] as its AUS5 AON top, unused here). aura copies the ADT's
+	 * apcie-{axi2af,phy,phy-ip-pll,phy-ip-auspma}-tunables and pci-bridge0's
+	 * apcie-config-tunables and pcie-rc{,-gen3-shadow,-gen4-shadow}-tunables here. No
+	 * driver binds it.
+	 */
+	apcie_shared: pcie-shared@48c000000 {
+		reg = <0x4 0x8c000000 0x0 0x4000>,
+		      <0x4 0x8f000000 0x0 0x40000>,
+		      <0x4 0x8f040000 0x0 0x20000>,
+		      <0x4 0x8e000000 0x0 0x24000>,
+		      <0x4 0x88028000 0x0 0x8000>,
+		      <0x4 0x8f010000 0x0 0x4000>,
+		      <0x1c 0xb0000000 0x0 0x1000>,
+		      <0x4 0x8d044000 0x0 0x4000>;
+		reg-names = "rc", "phy-block", "phy-ip", "axi2af",
+			    "radio-port", "radio-lane", "radio-cfg", "clkgen";
+	};
+};
+
+/*
+ * The port controllers' system power state (SSPS 3 before the commit, 0 at the wake), as
+ * macOS's AppleHPM sends it on the J700 and J714s, measured there on the same SN201202x;
+ * not traced on an M5 Air. Only a firmware-driven sleep sends it, and a controller that
+ * does not take S3 refuses the sleep (tipd sleep_s3_refuse).
+ */
+&hpm0 {
+	apple,sleep-ssps;
+};
+
+&hpm1 {
+	apple,sleep-ssps;
+};

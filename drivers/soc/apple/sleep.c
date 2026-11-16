@@ -118,6 +118,12 @@
 
 
 #define AON_AP_DEADLINE		0x08
+/*
+ * T8142: a word of the watchdog's second page (/arm-io/wdt + 0x802c). macOS's entry
+ * read-modify-writes it from 0 to 0x20 right before WD0's control and WD2 (26B131 trace,
+ * 11.1 ms before the S2R timer); XNU writes 0x10 there during boot. Meaning unknown.
+ */
+#define AON_WDT_SLEEP		0x2c
 
 /* Wake sources: a mask, so 0 enables. Status words are sticky. Where and how many: the SoC. */
 #define WAKE_WORDS		9
@@ -156,6 +162,13 @@
 #define SPMI4_REPLY		0x220
 #define SPMI4_NOTIFY_ENABLE	0x420
 #define SPMI4_NOTIFY_ACK	0x620
+/*
+ * Gen 4: the peripheral sources' status words, below the controller's own (write 1 to
+ * clear). A latched source that is enabled holds the controller's interrupt output, an AP
+ * wake source, up (T6050, aurora-silicon/linux#1963 commit 24).
+ */
+#define SPMI4_SRC_STATUS	0x600
+#define SPMI4_SRC_WORDS		8
 /* A FIFO holds a few replies at most; never spin on a status that doesn't change. */
 #define SPMI_DRAIN_MAX		16
 
@@ -235,6 +248,7 @@
 #define SLEEP_CLK_MUX_MAX	4
 #define SLEEP_CLLT_MAX		4
 #define SLEEP_AMCC_MAX		16
+#define SLEEP_SOCNI_MAX		8
 
 /* cpm-dvfm */
 #define DVFM_CTL		0x178
@@ -291,6 +305,20 @@ struct apple_sleep_clear {
 	u32 offset;
 	u32 clear;
 };
+
+/*
+ * T8142: a DART's PS write-disable bit (SPTM's /chosen/dart-ps-wr-dis-entries), as an offset
+ * in "ps" and a bit. While it is set the PMGR drops the AP's writes to that DART's power word,
+ * so a word lowered with it set stays on with BUSY latched. macOS's SPTM clears each right
+ * before the domain goes down; without SPTM the sleep clears them itself.
+ */
+struct apple_sleep_ps_wr_dis {
+	const char *name;
+	u32 offset;
+	u8 bit;
+};
+
+#define SLEEP_PS_WR_DIS_MAX	8
 
 /* The power words in "ps" that the sleep drives itself */
 struct apple_sleep_domains {
@@ -460,6 +488,11 @@ struct apple_sleep_soc {
 	/* In "cllt": bits cleared before the commit */
 	struct apple_sleep_clear cllt[SLEEP_CLLT_MAX];
 	unsigned int ncllt;
+	/* In "ps": PS write-disable bits cleared after the enclave's stop, before the others' */
+	const struct apple_sleep_ps_wr_dis *ps_wr_dis;
+	unsigned int nps_wr_dis;
+	/* In "aon-misc": AON_WDT_SLEEP's bits set before WD2 is armed (0: none) */
+	u32 aon_wdt_sleep;
 	/* The PMU on the sleep's SPMI bus, and the byte it is told the AP sleeps with */
 	u8 pmu_usid;
 	u16 pmu_sleep_reg;
@@ -469,6 +502,9 @@ struct apple_sleep_soc {
 	/* "mcc0".. and "amcc0"..: how many the SoC has */
 	unsigned int nmcc;
 	unsigned int namcc;
+	/* "socni0"..: the SoC NI tables macOS zeroes before the memory goes down, in words */
+	const u8 *socni_words;
+	unsigned int nsocni;
 	/* In "wake": the mask and status words, and how many */
 	u32 wake_mask;
 	u32 wake_status;
@@ -582,6 +618,9 @@ struct apple_sleep {
 	unsigned long *driver_down;
 	void __iomem *clk_mux;
 	void __iomem *mcc[MCC_CHANNELS];
+	void __iomem *socni[SLEEP_SOCNI_MAX];
+	/* T8142: the clock word macOS writes after the memory controller ("mem-clk") */
+	void __iomem *mem_clk;
 	void __iomem *ptd;
 	void __iomem *clk_perf;
 	void __iomem *cluster_dcs;
@@ -727,6 +766,27 @@ struct apple_sleep {
 	u32 spmi_reply;
 	u32 spmi_notify_enable;
 	u32 spmi_notify_ack;
+	/*
+	 * Gen 4: nub-spmi0's controller device, whose exchange lock the sleep's own PMU writes
+	 * take (apple_spmi_fifo_trylock()); the PMU's latched sources in its status words, from
+	 * apple,spmi-pmu-sources; the words as read at the entry and at the wake; and how many
+	 * PMU writes found the lock taken.
+	 */
+	struct device *pmu_bus;
+	u32 spmi_pmu_status, spmi_pmu_bits;
+	u32 spmi_src[2][SPMI4_SRC_WORDS];
+	bool spmi_src_read[2];
+	unsigned int pmu_busy, pmu_busy_forced;
+	/*
+	 * T8142: each PS write-disable word as read at the entry and after the wake, and which
+	 * of the SoC's bits the entry cleared; AON_WDT_SLEEP as read before WD2 was armed.
+	 */
+	u32 ps_wr_dis_entry[SLEEP_PS_WR_DIS_MAX];
+	u32 ps_wr_dis_wake[SLEEP_PS_WR_DIS_MAX];
+	u32 ps_wr_dis_cleared;
+	bool ps_wr_dis_read;
+	u32 aon_wdt_saved;
+	bool aon_wdt_marked;
 	/* T8142: each complex's ACC word 0xe440f8 (optional), and what its steps returned */
 	void __iomem *acc_e;
 	void __iomem *acc_p;
@@ -1208,15 +1268,16 @@ static void apple_sleep_coprocs_stop(struct apple_sleep *s, bool first)
 		apple_sleep_registry_stop(first, &s->pcie_ans_stopped);
 		return;
 	}
-	/* macOS's order: ANS, SIO (early), then the rest, PMP among them. */
-	for (pass = 0; pass < 3; pass++) {
+	/* macOS's order: ANS, SIO (early), then the rest, PMP among them, then any last. */
+	for (pass = 0; pass < 4; pass++) {
 		if (ans_first && pass == 1 && s->soc->ops->after_ans)
 			s->soc->ops->after_ans(s);
 		for (i = 0; i < SLEEP_COPROCS; i++) {
 			struct apple_sleep_coproc *c = &apple_sleep_coprocs[i];
 
 			if (!c->dev || !c->ready || c->first != first ||
-			    (ans_first && pass != (c->pcie_ans ? 0 : c->early ? 1 : 2)))
+			    (ans_first &&
+			     pass != (c->last ? 3 : c->pcie_ans ? 0 : c->early ? 1 : 2)))
 				continue;
 			apple_sleep_coproc_stop(s, c);
 		}
@@ -2673,6 +2734,12 @@ static void apple_sleep_lower_apcie_gen4(struct apple_sleep *s)
 		writel(readl(s->apcie_axi + APCIE_AXI_EN1) & ~BIT(0), s->apcie_axi + APCIE_AXI_EN1);
 	}
 
+	/*
+	 * macOS's order on T8142 (26B131 trace, 13.0..12.8 ms before the timer): AUS5, AUS5_AON,
+	 * PHY_SW, SYS_ST, ST, SYS_GP, GP, ANS. apple_sleep_raise_apcie_gen4() brings PHY_SW back
+	 * after SYS_ST.
+	 */
+	sleep_ps_lower(s, d->apcie_phy_sw);
 	sleep_ps_lower(s, d->apcie_sys_st);
 	sleep_ps_lower(s, d->apcie_st);
 	sleep_ps_lower(s, d->apcie_sys_gp);
@@ -3126,6 +3193,8 @@ static void apple_sleep_set_wd2(struct apple_sleep *s, unsigned int secs)
 }
 
 #define PS_AUTO_STATE		GENMASK(27, 24)
+/* T6050's name for PS_BUSY's bit, as its profile reads it */
+#define PS_PARENT_MISSING	PS_BUSY
 #define PS_REWAKE_PASSES	2
 
 static void sleep_ps_save(struct apple_sleep *s)
@@ -3297,15 +3366,45 @@ static void sleep_ps_rewake_report(struct apple_sleep *s)
 
 #define T8132_PS_AON_ON_STATE	4
 
-static void sleep_pmu_write(struct apple_sleep *s, u16 reg, u8 val)
+/*
+ * Gen 4: the SPMI driver's exchange lock, tried. A debug note gives way to an exchange under
+ * way; a write the sleep needs (@must) goes ahead as before and is counted. Returns whether
+ * the lock is held (and must be released).
+ */
+static bool sleep_pmu_lock(struct apple_sleep *s, bool must, bool *skip)
+{
+	int ret;
+
+	*skip = false;
+	if (!s->pmu_bus)
+		return false;
+	ret = apple_spmi_fifo_trylock(s->pmu_bus);
+	if (!ret)
+		return true;
+	/* -ENODEV: its driver is not bound, and nothing else is on the bus. */
+	if (ret == -EBUSY) {
+		if (must)
+			s->pmu_busy_forced++;
+		else
+			*skip = true;
+		s->pmu_busy++;
+	}
+	return false;
+}
+
+static void sleep_pmu_write_one(struct apple_sleep *s, u16 reg, u8 val, bool must)
 {
 	u32 status, enable;
+	bool locked, skip;
 	int i;
 
 	if (!s->soc->spmi_gen4) {
 		apple_sleep_pmu_write(s->spmi, s->soc->pmu_usid, reg, val);
 		return;
 	}
+	locked = sleep_pmu_lock(s, must, &skip);
+	if (skip)
+		return;
 
 	enable = readl(s->spmi + s->spmi_notify_enable);
 	writel(enable & ~SPMI_NOTIFY_REPLY, s->spmi + s->spmi_notify_enable);
@@ -3317,7 +3416,7 @@ static void sleep_pmu_write(struct apple_sleep *s, u16 reg, u8 val)
 	for (i = 0; s->soc->spmi_gen4 && i < SPMI_DRAIN_MAX &&
 	     !(readl(s->spmi + s->spmi_status) & s->spmi_rx_empty); i++)
 		readl(s->spmi + s->spmi_reply);
-	writel(((u32)reg << 16) | SPMI_CMD_WRITE |
+	writel(((u32)reg << 16) | SLEEP_SPMI_CMD_WRITE |
 	       FIELD_PREP(SPMI_CMD_USID, s->soc->pmu_usid), s->spmi + s->spmi_cmd);
 	writel(val, s->spmi + s->spmi_cmd);
 	if (!readl_poll_timeout_atomic(s->spmi + s->spmi_status, status,
@@ -3328,6 +3427,61 @@ static void sleep_pmu_write(struct apple_sleep *s, u16 reg, u8 val)
 		readl(s->spmi + s->spmi_reply);
 	writel(1, s->spmi + s->spmi_notify_ack);
 	writel(enable, s->spmi + s->spmi_notify_enable);
+	if (locked)
+		apple_spmi_fifo_unlock(s->pmu_bus);
+}
+
+static void sleep_pmu_write(struct apple_sleep *s, u16 reg, u8 val)
+{
+	sleep_pmu_write_one(s, reg, val, false);
+}
+
+/*
+ * Gen 4: nub-spmi0's peripheral source words, read at the entry (@when 0) and at the wake
+ * (1), and the PMU's latched sources among them acknowledged where the DT names them. The
+ * T6050 sleep found that after the first sleep's alarm every later sleep was back within a
+ * second, the latched alarm holding the controller's output (an AP wake source) up; macOS
+ * acknowledges it at each wake. T8142's nub-spmi0 is the same generation and its output is
+ * the same wake source (NUB.SPMI0.SW3). Without the property the words are only read, so
+ * that a sleep's report shows which bits to name.
+ */
+static void sleep_spmi_sources(struct apple_sleep *s, unsigned int when)
+{
+	u32 latched;
+	int i;
+
+	if (!s->soc->spmi_gen4 || s->soc->regions)
+		return;
+	for (i = 0; i < SPMI4_SRC_WORDS; i++)
+		s->spmi_src[when][i] = readl(s->spmi + SPMI4_SRC_STATUS + 4 * i);
+	s->spmi_src_read[when] = true;
+	if (!s->spmi_pmu_bits)
+		return;
+	latched = s->spmi_src[when][(s->spmi_pmu_status - SPMI4_SRC_STATUS) / 4] &
+		  s->spmi_pmu_bits;
+	if (latched)
+		writel(latched, s->spmi + s->spmi_pmu_status);
+}
+
+static void sleep_spmi_sources_report(struct apple_sleep *s)
+{
+	static const char *const when[] = { "entry", "wake" };
+	u32 *w;
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		if (!s->spmi_src_read[i])
+			continue;
+		s->spmi_src_read[i] = false;
+		w = s->spmi_src[i];
+		dev_info(s->dev, "nub-spmi0 sources at the %s: %08x %08x %08x %08x %08x %08x %08x %08x%s\n",
+			 when[i], w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7],
+			 s->spmi_pmu_bits ? ", PMU's acknowledged" : "");
+	}
+	if (s->pmu_busy)
+		dev_info(s->dev, "PMU writes found the SPMI exchange lock taken %u times (%u went ahead)\n",
+			 s->pmu_busy, s->pmu_busy_forced);
+	s->pmu_busy = s->pmu_busy_forced = 0;
 }
 
 static bool sleep_notes_on(struct apple_sleep *s)
@@ -3546,8 +3700,9 @@ static void apple_sleep_match(struct apple_sleep *s)
 
 	writel(0, s->wdt + WDT_WD0_COUNT);
 	writel(0, s->wdt + WDT_WD1_COUNT);
-	sleep_pmu_write(s, soc->pmu_sleep_reg, soc->pmu_sleep_val);
+	sleep_pmu_write_one(s, soc->pmu_sleep_reg, soc->pmu_sleep_val, true);
 
+	sleep_spmi_sources(s, 0);
 	s->spmi_saved[0] = readl(s->spmi + s->spmi_notify_enable);
 	s->spmi_saved[1] = readl(s->spmi_a0);
 	writel(soc->spmi_notify_sleep, s->spmi + s->spmi_notify_enable);
@@ -3654,13 +3809,69 @@ static void apple_sleep_match_undo(struct apple_sleep *s)
 		else if (FIELD_GET(PS_ACTUAL, val) != 0xf)
 			writel(val & ~PS_FLAGS, s->ps + soc->ps_macos_on.offset[i]);
 	}
+	/* What the PMU sent while the SoC slept (its wake), before the run-time mask */
+	sleep_spmi_sources(s, 1);
 	writel(s->spmi_saved[0], s->spmi + s->spmi_notify_enable);
 	writel(s->spmi_saved[1], s->spmi_a0);
+}
+
+/*
+ * After the enclave's stop, with nothing left that refuses: each PS write-disable bit the SoC
+ * names, cleared where set, so that the coprocessor stops and the lowering below reach their
+ * words. They are not set again after the wake. Linux never needs them, the drivers' power-ups
+ * would be dropped if they were, and a deep sleep loses the PMGR's state anyway; the words
+ * are read again after the wake so the report shows what the PMGR came back with.
+ */
+static void sleep_ps_wr_dis_clear(struct apple_sleep *s)
+{
+	const struct apple_sleep_soc *soc = s->soc;
+	int i;
+
+	s->ps_wr_dis_cleared = 0;
+	for (i = 0; i < soc->nps_wr_dis; i++) {
+		void __iomem *reg = s->ps + soc->ps_wr_dis[i].offset;
+		u32 val = readl(reg);
+
+		s->ps_wr_dis_entry[i] = val;
+		if (!(val & BIT(soc->ps_wr_dis[i].bit)))
+			continue;
+		writel(val & ~BIT(soc->ps_wr_dis[i].bit), reg);
+		s->ps_wr_dis_cleared |= BIT(i);
+	}
+}
+
+static void sleep_ps_wr_dis_woke(struct apple_sleep *s)
+{
+	int i;
+
+	for (i = 0; i < s->soc->nps_wr_dis; i++)
+		s->ps_wr_dis_wake[i] = readl(s->ps + s->soc->ps_wr_dis[i].offset);
+	s->ps_wr_dis_read = s->soc->nps_wr_dis > 0;
+}
+
+static void sleep_ps_wr_dis_report(struct apple_sleep *s)
+{
+	const struct apple_sleep_ps_wr_dis *e = s->soc->ps_wr_dis;
+	int i;
+
+	if (!s->ps_wr_dis_read)
+		return;
+	s->ps_wr_dis_read = false;
+	for (i = 0; i < s->soc->nps_wr_dis; i++)
+		dev_info(s->dev, "PS write-disable %s (ps+%#x bit %u): %#x at the entry%s, %#x after the wake\n",
+			 e[i].name, e[i].offset, e[i].bit, s->ps_wr_dis_entry[i],
+			 s->ps_wr_dis_cleared & BIT(i) ? " (cleared)" : "",
+			 s->ps_wr_dis_wake[i]);
 }
 
 /* The safety net, as macOS arms it. */
 static void apple_sleep_arm_wd2(struct apple_sleep *s)
 {
+	if (s->soc->aon_wdt_sleep) {
+		s->aon_wdt_saved = readl(s->aon_misc + AON_WDT_SLEEP);
+		writel(s->aon_wdt_saved | s->soc->aon_wdt_sleep, s->aon_misc + AON_WDT_SLEEP);
+		s->aon_wdt_marked = true;
+	}
 	writel(0, s->wdt + WDT_WD0_CTL);
 	apple_sleep_set_wd2(s, WDT_SLEEP_SECS);
 	writel(0, s->aon_misc + AON_AP_DEADLINE);
@@ -4323,7 +4534,7 @@ static int apple_sleep_enter_prepare(struct apple_sleep *s)
 	}
 	if (!ret) {
 		step = "coprocessor checks";
-		ret = apple_sleep_coprocs_check(s);
+		ret = apple_sleep_coprocs_check(s->dev);
 	}
 	if (!ret && !s->soc->ops->commit_notice) {
 		step = "SMC notice";
@@ -4468,6 +4679,7 @@ static int apple_sleep_enter(suspend_state_t state)
 		return ret;
 	}
 	sleep_note(s, 0x44);
+	sleep_ps_wr_dis_clear(s);
 	apple_sleep_coprocs_stop(s, true);
 
 	sleep_note(s, 0x45);
@@ -4497,6 +4709,7 @@ static int apple_sleep_enter(suspend_state_t state)
 	if (s->deep_once)
 		sleep_slp_ddr_set_deep_once(false);
 
+	sleep_ps_wr_dis_woke(s);
 	apple_sleep_match_undo(s);
 	apple_sleep_stray_restore(s);
 	sleep_wake_restore(s);
@@ -4923,8 +5136,11 @@ static void apple_sleep_report(void)
 		if (s->wake_status[id / 32] & BIT(id % 32))
 			dev_info(s->dev, "wake source: %s\n", names[i].name);
 	}
-	if (!s->soc->regions)
+	if (!s->soc->regions) {
 		sleep_ps_rewake_report(s);
+		sleep_spmi_sources_report(s);
+		sleep_ps_wr_dis_report(s);
+	}
 
 	for (i = 0; i < SLEEP_COPROCS; i++) {
 		struct apple_sleep_coproc *c = &apple_sleep_coprocs[i];
@@ -5100,6 +5316,45 @@ static int apple_sleep_map_numbered(struct apple_sleep *s, const char *prefix,
 	return 0;
 }
 
+static void apple_sleep_put_device(void *dev)
+{
+	put_device(dev);
+}
+
+/*
+ * Gen 4: the controller at this node's "spmi" block (nub-spmi0), as the T6050 profile finds
+ * it, and the PMU's sources in its status words: apple,spmi-pmu-sources = <word bits>, the
+ * word's offset in 0x600..0x61c. Neither is required.
+ */
+static void sleep_map_pmu_bus(struct apple_sleep *s)
+{
+	struct resource *own = platform_get_resource_byname(to_platform_device(s->dev),
+							    IORESOURCE_MEM, "spmi");
+	struct device_node *np;
+	struct resource res;
+	u32 v[2];
+
+	for_each_compatible_node(np, NULL, "apple,t8142-spmi") {
+		struct platform_device *bus;
+
+		if (!own || of_address_to_resource(np, 0, &res) || res.start != own->start)
+			continue;
+		bus = of_find_device_by_node(np);
+		if (bus && !devm_add_action_or_reset(s->dev, apple_sleep_put_device, &bus->dev))
+			s->pmu_bus = &bus->dev;
+		of_node_put(np);
+		break;
+	}
+	if (!of_property_read_u32_array(s->dev->of_node, "apple,spmi-pmu-sources", v, 2) &&
+	    v[1] && v[0] >= SPMI4_SRC_STATUS && v[0] < SPMI4_NOTIFY_ACK && !(v[0] % 4)) {
+		s->spmi_pmu_status = v[0];
+		s->spmi_pmu_bits = v[1];
+	}
+	dev_info(s->dev, "PMU's SPMI controller %s, latched sources %s\n",
+		 s->pmu_bus ? dev_name(s->pmu_bus) : "not found (writes unlocked)",
+		 s->spmi_pmu_bits ? "acknowledged at entry and wake" : "only reported");
+}
+
 static int apple_sleep_map_regs(struct apple_sleep *s)
 {
 	int i, ret;
@@ -5116,6 +5371,9 @@ static int apple_sleep_map_regs(struct apple_sleep *s)
 					     apple_sleep_regs[i].name);
 	}
 
+	if (s->soc->spmi_gen4 && !s->soc->regions)
+		sleep_map_pmu_bus(s);
+
 	/* T8142: each complex's ACC word, used only with apple_sleep.acc_wake */
 	s->acc_e = apple_sleep_map(s->dev, "acc-e");
 	s->acc_p = apple_sleep_map(s->dev, "acc-p");
@@ -5129,6 +5387,14 @@ static int apple_sleep_map_regs(struct apple_sleep *s)
 	ret = apple_sleep_map_numbered(s, "amcc", s->amcc, s->soc->namcc);
 	if (ret)
 		return ret;
+
+	ret = apple_sleep_map_numbered(s, "socni", s->socni, s->soc->nsocni);
+	if (ret)
+		return ret;
+
+	s->mem_clk = apple_sleep_map(s->dev, "mem-clk");
+	if (IS_ERR(s->mem_clk))
+		s->mem_clk = NULL;
 
 	/* Lowering an unbound display clears its clock protection first. */
 	if (s->soc->lower_unbound_displays) {
@@ -5394,7 +5660,8 @@ static int apple_sleep_alloc_books(struct apple_sleep *s)
 	struct device *dev = s->dev;
 
 	/* One bit, and one gate, for each */
-	if (soc->nstray > BITS_PER_LONG || soc->ngate_coprocs > ARRAY_SIZE(s->gate))
+	if (soc->nstray > BITS_PER_LONG || soc->ngate_coprocs > ARRAY_SIZE(s->gate) ||
+	    soc->nps_wr_dis > SLEEP_PS_WR_DIS_MAX)
 		return dev_err_probe(dev, -EINVAL, "the SoC's lists are too long\n");
 
 	s->ps_on_saved = devm_kcalloc(dev, soc->ps_macos_on.count, sizeof(u32), GFP_KERNEL);
@@ -5753,7 +6020,7 @@ static int apple_sleep_probe(struct platform_device *pdev)
 
 	ret = apple_sleep_registry_bind(APPLE_SLEEP_REG_LID_AT_WAKE |
 				       APPLE_SLEEP_REG_USB_WAKE_PORTS |
-				       (soc->regions ? APPLE_SLEEP_REG_NO_ASC_STATUS : 0));
+				       (s->soc->regions ? APPLE_SLEEP_REG_NO_ASC_STATUS : 0));
 	if (ret)
 		return dev_err_probe(dev, ret, "another sleep controller is bound\n");
 	ret = spin_table_set_power_ops(s->soc->ops->cpu_prepare ? &sleep_cpu_prepared_power_ops :
@@ -6371,6 +6638,83 @@ static void t8142_commit_note(struct apple_sleep *s)
 }
 
 /*
+ * T8142's memory side, as macOS steps it down 4.6 to 2.7 ms before the S2R timer (J813, 27.2.1,
+ * all ten cores: gig3m's trace, gist 89aedeca, 2026-11-15; the J815 ADT has the same mcc
+ * layout). The PMGR words around it match our J815 trace write for write.
+ *
+ * - AMCC: each plane's +0x28000 word (mapped as "amcc<n>") holds 0x1fe; macOS clears it two
+ *   bits at a time, in the order below (plane, bit pair), 64-bit read-modify-writes. Whatever
+ *   is left on a plane macOS didn't list (the fourth, on J813) goes the same way, low bit first.
+ * - SoC NI (mcc reg[2..7], "socni<n>"): each table zeroed from its first word, as many as
+ *   macOS writes.
+ * - DCS channels (reg[10..17] + 0x580, "mcc<n>"): the enables down a bit at a time, low bit
+ *   first; then two lanes per channel per pass, as T8140's, with +0x680 rewritten before each
+ *   lane and only the lanes that are enabled (J813's fifth channel has lanes 0 and 2).
+ */
+#define T8142_AMCC_SLEEP_BITS	GENMASK_ULL(8, 1)
+#define T8142_MCC_LANE_EXTRA	0x100
+#define T8142_MEM_CLK_SLEEP	0x30000
+
+static void t8142_amcc_clear(void __iomem *reg, u64 bits)
+{
+	u64 val = readq(reg);
+	unsigned int b;
+
+	for_each_set_bit(b, (unsigned long *)&bits, 64) {
+		if (!(val & BIT_ULL(b)))
+			continue;
+		val &= ~BIT_ULL(b);
+		writeq(val, reg);
+		val = readq(reg);
+	}
+}
+
+static void t8142_sleep_mcc_stop(struct apple_sleep *s)
+{
+	/* (plane, pair): the pair's bits are 2 * pair + 1 and 2 * pair + 2 */
+	static const u8 order[][2] = {
+		{ 1, 0 }, { 2, 2 }, { 1, 2 }, { 0, 1 }, { 1, 3 }, { 0, 0 },
+		{ 1, 1 }, { 2, 3 }, { 0, 3 }, { 2, 1 }, { 0, 2 }, { 2, 0 },
+	};
+	const struct apple_sleep_soc *soc = s->soc;
+	int i, plane, ch, pass, n;
+
+	for (i = 0; i < ARRAY_SIZE(order); i++) {
+		if (order[i][0] >= soc->namcc)
+			continue;
+		t8142_amcc_clear(s->amcc[order[i][0]], GENMASK_ULL(2 * order[i][1] + 2,
+								 2 * order[i][1] + 1));
+	}
+	for (plane = 0; plane < soc->namcc; plane++)
+		t8142_amcc_clear(s->amcc[plane], T8142_AMCC_SLEEP_BITS);
+
+	for (i = 0; i < soc->nsocni; i++)
+		for (n = 0; n < soc->socni_words[i]; n++)
+			writel(0, s->socni[i] + 4 * n);
+
+	for (ch = 0; ch < soc->nmcc; ch++)
+		t8132_mcc_step_down(s->mcc[ch] + MCC_ENABLES);
+
+	for (pass = 0; pass < 2; pass++) {
+		for (ch = 0; ch < soc->nmcc; ch++) {
+			void __iomem *mcc = s->mcc[ch];
+
+			for (n = 2 * pass; n < 2 * pass + 2; n++) {
+				if (!(readl(mcc + MCC_LANES) & MCC_LANE(n)))
+					continue;
+				writel(readl(mcc + T8142_MCC_LANE_EXTRA), mcc + T8142_MCC_LANE_EXTRA);
+				writel(readl(mcc + MCC_LANES_MASK), mcc + MCC_LANES_MASK);
+				writel(readl(mcc + MCC_LANES) | MCC_LANE_STROBE(n), mcc + MCC_LANES);
+				writel(readl(mcc + MCC_LANES) & ~MCC_LANE(n), mcc + MCC_LANES);
+			}
+		}
+	}
+
+	if (s->mem_clk)
+		writel(T8142_MEM_CLK_SLEEP, s->mem_clk);
+}
+
+/*
  * T8132's order after the cores stopped, ATC0 and ANS lowered and WD2: quiescePerfState, the
  * CPM gates around the AP's PMC vote (agent 3, as T8132's), the complexes off, the quiesce
  * read, the early wake-up bits off, the words saved.
@@ -6382,6 +6726,10 @@ static void t8142_last_mile(struct apple_sleep *s)
 
 	t8142_perf_down(s);
 	sleep_note(s, 0x64);
+
+	/* The memory controller, after the SoC and DCS states, as on T8132 (and macOS on J813). */
+	t8142_sleep_mcc_stop(s);
+	sleep_note(s, 0x66);
 
 	t8142_cpm_on(s);
 	t8142_cpm_on(s);
@@ -6465,6 +6813,11 @@ static void t8142_wake(struct apple_sleep *s)
 		writel(1, s->acc_p);
 	}
 
+	/* macOS's wake is not traced: back to what the entry read, before WD2's re-arm. */
+	if (s->aon_wdt_marked) {
+		writel(s->aon_wdt_saved, s->aon_misc + AON_WDT_SLEEP);
+		s->aon_wdt_marked = false;
+	}
 	apple_sleep_set_wd2(s, WDT_SUSPEND_SECS);
 
 	if (s->pcie_ans_stopped)
@@ -6635,6 +6988,21 @@ static const struct apple_sleep_ops t8142_sleep_ops = {
 	.aic_restore = aic_sleep_restore,
 };
 
+/*
+ * The J815 /chosen/dart-ps-wr-dis-entries that macOS's SPTM clears during its entry (26B131
+ * trace), but the DCP's (ps+0x17fdc bit 6, which the DART driver owns) and DCPEXT0/1's (no
+ * external DCP in this tree), in the trace's order. The rest of each word stays set, as on macOS.
+ */
+static const struct apple_sleep_ps_wr_dis t8142_ps_wr_dis[] = {
+	{ "SEP (InvalidateHmac)", 0x17fe0, 12 },
+	{ "centauri-beta", 0x17fe8, 10 },
+	{ "PMP", 0x17ff8, 17 },
+	{ "SIO DMA", 0x17ff0, 28 },
+};
+
+/* mcc reg[2..7]: the words macOS zeroes in each SoC NI table (J813 trace) */
+static const u8 t8142_socni_words[] = { 15, 16, 28, 30, 21, 14 };
+
 static const char *const t8142_regs_absent[] = {
 	"pmc-dcp", "clk-mux", "ptd", "cluster-dcs", "dvfm-e", "dvfm-p", NULL,
 };
@@ -6656,6 +7024,14 @@ static const struct apple_sleep_soc t8142_sleep_soc = {
 	.cpu_start_stride = 6,
 	.cllt = { { 0x50, GENMASK(17, 16) } },
 	.ncllt = 1,
+	.ps_wr_dis = t8142_ps_wr_dis,
+	.nps_wr_dis = ARRAY_SIZE(t8142_ps_wr_dis),
+	/* ADT mcc: amcc-plane-enable-mask 0xf, dcs-count-per-amcc 8, socni-count 6 */
+	.namcc = 4,
+	.nmcc = 8,
+	.socni_words = t8142_socni_words,
+	.nsocni = ARRAY_SIZE(t8142_socni_words),
+	.aon_wdt_sleep = 0x20,
 	/* The same PMU, and the same boot-stage byte, as T8132 (J815 ADT info-leg_scrpad). */
 	.pmu_usid = 0xe,
 	.pmu_sleep_reg = 0xf801,

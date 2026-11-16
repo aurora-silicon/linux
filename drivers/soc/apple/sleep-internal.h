@@ -41,6 +41,8 @@ struct apple_sleep_coproc {
 	unsigned int order;	/* among those registered first, lowest runs first */
 	/* Between ANS and the others, whatever order they registered in (T6050). */
 	bool early;
+	/* No ASC: its last stop runs after every other one of the second pass (T8142's SMC). */
+	bool last;
 	u32 ps;
 	/* Its power domain, for a profile that finds the word by its node (T6050). */
 	struct device_node *domain;
@@ -213,7 +215,7 @@ struct aura_s2r_mailbox {
 #define SYS_APL_SIQ_CFG_EL1	sys_reg(3, 4, 15, 10, 4)
 
 /* A one-byte register write on the sleep's SPMI bus, to the PMU's USID */
-#define SPMI_CMD_WRITE		(BIT(15) | 0x30)
+#define SLEEP_SPMI_CMD_WRITE	(BIT(15) | 0x30)
 #define SPMI_CMD_USID		GENMASK(11, 8)
 
 /* A PMU write: the reply's vector masked, then acknowledged, so none is left raised. */
@@ -223,7 +225,8 @@ static inline void apple_sleep_pmu_write(void __iomem *spmi, u8 usid, u16 reg, u
 
 	enable = readl(spmi + SPMI_NOTIFY_ENABLE);
 	writel(enable & ~SPMI_NOTIFY_REPLY, spmi + SPMI_NOTIFY_ENABLE);
-	writel(((u32)reg << 16) | SPMI_CMD_WRITE | FIELD_PREP(SPMI_CMD_USID, usid), spmi + SPMI_CMD);
+	writel(((u32)reg << 16) | SLEEP_SPMI_CMD_WRITE | FIELD_PREP(SPMI_CMD_USID, usid),
+	       spmi + SPMI_CMD);
 	writel(val, spmi + SPMI_CMD);
 	if (!readl_poll_timeout_atomic(spmi + SPMI_STATUS, status,
 				       !(status & SPMI_STATUS_RX_EMPTY), 1, 1000))

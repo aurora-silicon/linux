@@ -5,7 +5,10 @@
  */
 #include <kunit/test.h>
 
-/* Matched only once its sleep has been tested on hardware. */
+/*
+ * Matched only once its sleep has been tested on hardware, or with .untested set: then each
+ * sleep stops before the commit unless apple_sleep.untested_commit=1 (T8142).
+ */
 static const char *const apple_sleep_test_tested[] = {
 	"apple,t8140-sleep",
 	"apple,t8132-sleep",
@@ -56,10 +59,17 @@ static void apple_sleep_test_only_tested(struct kunit *test)
 	const struct of_device_id *id;
 	int n = 0;
 
-	for (id = apple_sleep_of_match; id->compatible[0]; id++, n++) {
-		KUNIT_EXPECT_NOT_NULL_MSG(test, id->data, "%s has no data", id->compatible);
-		KUNIT_ASSERT_LT(test, n, ARRAY_SIZE(apple_sleep_test_tested));
-		KUNIT_EXPECT_STREQ(test, id->compatible, apple_sleep_test_tested[n]);
+	for (id = apple_sleep_of_match; id->compatible[0]; id++) {
+		const struct apple_sleep_soc *soc = id->data;
+		bool tested = false;
+		int i;
+
+		KUNIT_ASSERT_NOT_NULL_MSG(test, soc, "%s has no data", id->compatible);
+		for (i = 0; i < ARRAY_SIZE(apple_sleep_test_tested); i++)
+			tested |= !strcmp(id->compatible, apple_sleep_test_tested[i]);
+		KUNIT_EXPECT_TRUE_MSG(test, tested || soc->untested,
+				      "%s is matched, neither tested nor gated", id->compatible);
+		n += tested;
 	}
 	KUNIT_EXPECT_EQ(test, n, ARRAY_SIZE(apple_sleep_test_tested));
 }
@@ -86,9 +96,13 @@ static void apple_sleep_test_words(struct kunit *test)
 			continue;
 		apple_sleep_test_full(test, c, "ps_all", all);
 		apple_sleep_test_full(test, c, "ps_aon_all", aon);
+		/* 0: a word the SoC doesn't name (a second display, T8142's USB words). */
 		for (i = 0; i < ARRAY_SIZE(named); i++)
-			apple_sleep_test_in(test, c, "named", all, named[i]);
-		apple_sleep_test_in(test, c, "debug switch", aon, soc->ps_aon_debug_switch);
+			if (named[i])
+				apple_sleep_test_in(test, c, "named", all, named[i]);
+		/* An untested SoC only reads its debug switch, outside the lists. */
+		if (!soc->untested)
+			apple_sleep_test_in(test, c, "debug switch", aon, soc->ps_aon_debug_switch);
 		apple_sleep_test_list_in(test, c, "ps_macos_on", all, &soc->ps_macos_on);
 		apple_sleep_test_list_in(test, c, "ps_macos_off", all, &soc->ps_macos_off);
 		apple_sleep_test_list_in(test, c, "ps_wake_order", all, &soc->ps_wake_order);
@@ -199,13 +213,26 @@ static void apple_sleep_test_layout(struct kunit *test)
 		KUNIT_EXPECT_GT(test, soc->cpu_start_stride, 0);
 		KUNIT_EXPECT_LE(test, soc->nclk_mux_parked, SLEEP_CLK_MUX_MAX);
 		KUNIT_EXPECT_LE(test, soc->ncllt, SLEEP_CLLT_MAX);
+		/* Every SoC steps its memory controller down (T8142: from the J813 trace). */
 		KUNIT_EXPECT_GE(test, soc->nmcc, 1);
 		KUNIT_EXPECT_LE(test, soc->nmcc, MCC_CHANNELS);
 		KUNIT_EXPECT_LE(test, soc->namcc, SLEEP_AMCC_MAX);
+		/* Each SoC NI table is mapped 0x80 bytes long (the T8142 sleep node). */
+		KUNIT_EXPECT_LE(test, soc->nsocni, SLEEP_SOCNI_MAX);
+		KUNIT_EXPECT_EQ(test, !!soc->socni_words, !!soc->nsocni);
+		for (int j = 0; j < soc->nsocni; j++)
+			KUNIT_EXPECT_LE(test, soc->socni_words[j] * 4, 0x80);
 		KUNIT_EXPECT_GE(test, soc->wake_words, 1);
 		KUNIT_EXPECT_LE(test, soc->wake_words, WAKE_WORDS);
 		KUNIT_EXPECT_GE(test, soc->wake_status, soc->wake_mask + soc->wake_words * 4);
 		KUNIT_EXPECT_LT(test, soc->pmu_usid, 16);
+		/* PS write-disable words: in "ps" (0x18000 on T8142), aligned, one bit each */
+		KUNIT_EXPECT_LE(test, soc->nps_wr_dis, SLEEP_PS_WR_DIS_MAX);
+		for (int i = 0; i < soc->nps_wr_dis; i++) {
+			KUNIT_EXPECT_EQ(test, soc->ps_wr_dis[i].offset % 4, 0);
+			KUNIT_EXPECT_LT(test, soc->ps_wr_dis[i].offset, 0x18000);
+			KUNIT_EXPECT_LT(test, soc->ps_wr_dis[i].bit, 32);
+		}
 	}
 }
 

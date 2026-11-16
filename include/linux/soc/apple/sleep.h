@@ -79,6 +79,12 @@ int apple_sleep_coproc_register(struct device *dev, void __iomem *asc, bool pcie
  */
 int apple_sleep_coproc_register_first(struct device *dev, unsigned int order,
 				      int (*last_stop)(void *data), void *data);
+/*
+ * The same, with @last_stop run after every other coprocessor's stop instead of before: the
+ * T8142 SMC, whose SLPA and AP idle notice macOS sends after SIO's and the PMP's sleep.
+ */
+int apple_sleep_coproc_register_last(struct device *dev, int (*last_stop)(void *data),
+				     void *data);
 void apple_sleep_coproc_unregister(struct device *dev);
 
 /*
@@ -136,6 +142,12 @@ static inline int apple_sleep_coproc_register(struct device *dev, void __iomem *
 
 static inline int apple_sleep_coproc_register_first(struct device *dev, unsigned int order,
 						    int (*last_stop)(void *data), void *data)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int apple_sleep_coproc_register_last(struct device *dev,
+						   int (*last_stop)(void *data), void *data)
 {
 	return -EOPNOTSUPP;
 }
