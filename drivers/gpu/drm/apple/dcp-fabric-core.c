@@ -531,5 +531,13 @@ bool dcp_fabric_t6030_link(bool tunnel, bool has_xbar, bool t6030_dpin)
 }
 EXPORT_SYMBOL_GPL(dcp_fabric_t6030_link);
 
+bool dcp_fabric_merged_fits(unsigned int displays, unsigned int extra,
+			    unsigned int engines)
+{
+	return displays && extra && displays < engines &&
+	       extra < engines - displays;
+}
+EXPORT_SYMBOL_GPL(dcp_fabric_merged_fits);
+
 MODULE_DESCRIPTION("Apple display fabric decisions");
 MODULE_LICENSE("Dual MIT/GPL");

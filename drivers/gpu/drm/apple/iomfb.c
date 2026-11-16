@@ -1872,6 +1872,8 @@ void dcp_hotplug(struct work_struct *work)
 		}
 		dcp_notify_hotplug(connector);
 		apple_connector_backlight_sync(connector);
+		/* The display left: another may get its pair back. */
+		dcp_peer_limit_update_v27(connector->base.dev);
 		return;
 	}
 	dcp = platform_get_drvdata(pdev);
@@ -1961,6 +1963,8 @@ void dcp_hotplug(struct work_struct *work)
 		dcp_notify_hotplug(connector);
 	/* after the event, so registering a backlight cannot delay it */
 	apple_connector_backlight_sync(connector);
+	/* A display came or went: the platform limit may now differ for another. */
+	dcp_peer_limit_update_v27(connector->base.dev);
 }
 
 /*
@@ -3380,6 +3384,13 @@ enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
 	scoped_guard(mutex, &dcp->modes_lock)
 		if (!dcp_modes_for_connector(dcp, apple_connector))
 			return MODE_BAD;
+	/*
+	 * A mode only a pair drives is not offered while the platform limit
+	 * leaves this display no pair; dcp_peer_limit_update_v27() has the
+	 * connector probed again when that changes.
+	 */
+	if (dcp_peer_mode_limited_v27(dcp, mode->clock))
+		return MODE_CLOCK_HIGH;
 	return dcp_mode_settable(dcp, mode) ? MODE_OK : MODE_BAD;
 }
 
