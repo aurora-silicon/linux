@@ -2179,6 +2179,70 @@ static void fabric_tunnel_only_test(struct kunit *test)
 			DCP_FABRIC_FOLLOW_SWAP);
 }
 
+/*
+ * J714s: dcpext0 and dcpext2 carry DP alt mode and tunnels on both ports,
+ * dcpext1 tunnels only. With a display up, a tunnel takes dcpext1 before a
+ * pipeline that a DP alt mode display could have.
+ */
+static void fabric_tunnel_only_first_test(struct kunit *test)
+{
+	struct dcp_fabric_pipeline pipeline[3] = {};
+	struct dcp_fabric_route route[3] = {};
+	struct dcp_fabric_port port = {};
+	struct dcp_fabric_policy policy = {};
+	unsigned int i;
+	int error;
+
+	for (i = 0; i < 3; i++) {
+		pipeline[i].bound = true;
+		pipeline[i].services_ready = true;
+		route[i].pipeline = &pipeline[i];
+		if (i < 2)
+			route[i].next = &route[i + 1];
+	}
+	/* CRTC order dcpext0, (internal panel), dcpext1, dcpext2 */
+	pipeline[0].crtc_index = 0;
+	pipeline[1].crtc_index = 2;
+	pipeline[2].crtc_index = 3;
+	route[1].tunnel_only = true;
+	port.routes = &route[0];
+	port.candidate_crtcs[0] = GENMASK(3, 0);
+	port.candidate_crtcs[1] = GENMASK(3, 0);
+
+	/* The first display takes the lowest pipeline, as before. */
+	KUNIT_EXPECT_PTR_EQ(test,
+			    dcp_fabric_tunnel_candidate(&port, &policy, NULL,
+							false, 0, true, &error),
+			    &route[0]);
+
+	/*
+	 * dcpext2 drives the dock's other display: the one coming back takes
+	 * dcpext1, and a DP alt mode display still has dcpext0.
+	 */
+	pipeline[2].owned = true;
+	KUNIT_EXPECT_PTR_EQ(test,
+			    dcp_fabric_tunnel_candidate(&port, &policy, NULL,
+							false, 0, true, &error),
+			    &route[1]);
+	pipeline[1].owned = true;
+	KUNIT_EXPECT_PTR_EQ(test, dcp_fabric_free_route(&port, &policy),
+			    &route[0]);
+
+	/* With dcpext1 held too, a tunnel still gets dcpext0. */
+	KUNIT_EXPECT_PTR_EQ(test,
+			    dcp_fabric_tunnel_candidate(&port, &policy, NULL,
+							false, 2, true, &error),
+			    &route[0]);
+
+	/* Without a tunnel-only route the CRTC order decides alone. */
+	route[1].tunnel_only = false;
+	pipeline[1].owned = false;
+	KUNIT_EXPECT_PTR_EQ(test,
+			    dcp_fabric_tunnel_candidate(&port, &policy, NULL,
+							false, 0, true, &error),
+			    &route[0]);
+}
+
 static void fabric_t6030_follow_test(struct kunit *test)
 {
 	struct fabric_fixture f;
@@ -2570,6 +2634,7 @@ static struct kunit_case fabric_tests[] = {
 	KUNIT_CASE(fabric_t6030_follow_test),
 	KUNIT_CASE(fabric_per_dpin_slot_test),
 	KUNIT_CASE(fabric_tunnel_only_test),
+	KUNIT_CASE(fabric_tunnel_only_first_test),
 	KUNIT_CASE(fabric_reclaim_transaction_test),
 	KUNIT_CASE_PARAM(fabric_shared_wiring_test, fabric_wiring_gen_params),
 	KUNIT_CASE(fabric_binding_cookie_test),

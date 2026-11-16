@@ -323,6 +323,25 @@ int dcp_fabric_tunnel_slot(const struct dcp_fabric_port *port,
 }
 EXPORT_SYMBOL_GPL(dcp_fabric_tunnel_slot);
 
+/*
+ * Whether a tunnel should take one of @port's tunnel-only routes before a
+ * route that can carry a DP alt mode display: once another of the pipelines
+ * it reaches drives a display. A DP alt mode display can never use a
+ * tunnel-only pipeline, so tunnels on every other one would leave it none
+ * while that one stays idle. The first display keeps the lowest pipeline.
+ */
+static bool dcp_fabric_tunnel_keeps_direct(const struct dcp_fabric_port *port)
+{
+	const struct dcp_fabric_route *route;
+	bool tunnel_only = false, owned = false;
+
+	for (route = port->routes; route; route = route->next) {
+		tunnel_only |= route->tunnel_only;
+		owned |= route->pipeline->owned;
+	}
+	return tunnel_only && owned;
+}
+
 struct dcp_fabric_route *
 dcp_fabric_tunnel_candidate(const struct dcp_fabric_port *port,
 			    const struct dcp_fabric_policy *policy,
@@ -333,12 +352,14 @@ dcp_fabric_tunnel_candidate(const struct dcp_fabric_port *port,
 	struct dcp_fabric_route *route, *best = NULL;
 	unsigned int best_score = UINT_MAX;
 	bool waiting = false, clock_blocked = false, clock_capable = false;
+	bool keep_direct;
 
 	if (dpin >= DCP_FABRIC_DPIN_MAX) {
 		*error = -EINVAL;
 		return NULL;
 	}
 
+	keep_direct = dcp_fabric_tunnel_keeps_direct(port);
 	for (route = port->routes; route; route = route->next) {
 		const struct dcp_fabric_pipeline *pipeline = route->pipeline;
 		unsigned int score;
@@ -368,6 +389,9 @@ dcp_fabric_tunnel_candidate(const struct dcp_fabric_port *port,
 		    !pipeline->has_fixed &&
 		    score < UINT_MAX - 100)
 			score += 100;
+		/* below the hybrid and stream penalties, above the CRTC order (indices < 50) */
+		if (keep_direct && !route->tunnel_only && score < UINT_MAX - 100)
+			score += 50;
 		if (score < best_score) {
 			best = route;
 			best_score = score;
