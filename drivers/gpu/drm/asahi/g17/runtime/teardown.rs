@@ -33,6 +33,7 @@ impl Reclaim {
             Self::Context(context) => {
                 context.release_execution();
                 drop(context.take_render_pool());
+                context.release_render_id();
                 drop(context);
             }
         }
