@@ -16,9 +16,9 @@ module_param(v27_two_stage, bool, 0644);
 MODULE_PARM_DESC(v27_two_stage, "V27 sleep: the panel's soft power state off before the hard one, on after it (macOS's display stage)");
 static bool v27_soft_first = true;
 module_param(v27_soft_first, bool, 0644);
-static unsigned int v27_lit_delay_ms = 2000;
+static unsigned int v27_lit_delay_ms;
 module_param(v27_lit_delay_ms, uint, 0644);
-MODULE_PARM_DESC(v27_lit_delay_ms, "V27 wake: the time between the hard power-on and the display's (macOS: a dark wake, then the lit one)");
+MODULE_PARM_DESC(v27_lit_delay_ms, "V27 wake: a pause between the hard power-on and the display stage, the domain off through it with v27_rtkit_cycles >= 2 (default 0: a full wake goes on at once; macOS waits there only in a dark wake)");
 MODULE_PARM_DESC(v27_soft_first, "V27 sleep: the display's soft off (display stage, plain A484) before the hard off, as macOS's display sleep");
 static bool v27_a115 = true;
 module_param(v27_a115, bool, 0644);
@@ -27,12 +27,12 @@ MODULE_PARM_DESC(v27_a115, "V27 sleep: A489 before and A115 after each flags-for
 static bool v27_ext_a442 = true;
 module_param(v27_ext_a442, bool, 0644);
 MODULE_PARM_DESC(v27_ext_a442, "V27 wake: an external processor's A442 on the out-of-band context right behind A489, as macOS (needs v27_a115)");
-static bool v27_ext_a500_again = true;
+static bool v27_ext_a500_again;
 module_param(v27_ext_a500_again, bool, 0644);
-MODULE_PARM_DESC(v27_ext_a500_again, "V27 wake: A500's wake form again after an external processor's A115, as macOS's dark wake (there later, here at once)");
+MODULE_PARM_DESC(v27_ext_a500_again, "V27 wake: A500's wake form again after an external processor's A115, with its stop or session round (default 0: macOS's dark wake only; a full wake has one A500)");
 static bool v27_ext_cycles = true;
 module_param(v27_ext_cycles, bool, 0644);
-MODULE_PARM_DESC(v27_ext_cycles, "V27 wake: an external processor is stopped and restarted after each A500, as macOS; 0: only its sessions are closed and opened");
+MODULE_PARM_DESC(v27_ext_cycles, "V27 wake: an external processor is stopped and restarted after each A500 (once by default, as macOS's full wake); 0: only its sessions are closed and opened");
 static bool v27_ext_rounds = true;
 module_param(v27_ext_rounds, bool, 0644);
 MODULE_PARM_DESC(v27_ext_rounds, "V27 wake: an external processor's sessions closed and opened again after each A500, as macOS");
@@ -43,9 +43,9 @@ MODULE_PARM_DESC(v27_session_rounds, "V27 wake: macOS's session rounds, closed i
 static bool v27_cycle_power = true;
 module_param(v27_cycle_power, bool, 0644);
 MODULE_PARM_DESC(v27_cycle_power, "V27 wake: each DCP stop/restart also turns the DCP's DART streams and the internal display's domain off and on, as macOS");
-static unsigned int v27_rtkit_cycles = 2;
+static unsigned int v27_rtkit_cycles = 1;
 module_param(v27_rtkit_cycles, uint, 0644);
-MODULE_PARM_DESC(v27_rtkit_cycles, "V27 wake: macOS's DCP stop/restart cycles: 0 none, 1 after the first A500 and around the dark-to-lit pause, 2 also after each display-stage call");
+MODULE_PARM_DESC(v27_rtkit_cycles, "V27 wake: DCP stop/restart cycles: 0 none; 1 (default) one, after the first A500, the hard power-on, display stage and plain power-on then back to back in that session (macOS's full wake); 2 also A500 and a restart after the hard power-on; 3 also A500, a session round and a restart after each display-stage call (macOS's dark-to-lit wake)");
 static unsigned int v27_cycle_hold_ms = 12;
 module_param(v27_cycle_hold_ms, uint, 0644);
 MODULE_PARM_DESC(v27_cycle_hold_ms, "V27 wake: the least time the display's domain stays off in a DCP cycle (macOS: about 10 ms)");
@@ -610,8 +610,8 @@ static int dcp_v27_ext_wake_calls(struct dcp_v27_sleep *s)
 	/*
 	 * macOS, every external processor, idle or not: sessions open, A500, sessions closed and
 	 * open again, A489 and (out of band) A442, the flagged A484, A115, later A500 again,
-	 * sessions closed, and open again for the plug. The pause before the second A500 and the
-	 * one before the plug are macOS's dark wake; they are not kept.
+	 * sessions closed, and open again for the plug. The second A500, and the pauses, are
+	 * macOS's dark wake: a full wake restarts the processor once, after the first A500.
 	 */
 	a500 = iomfb_v27_sleep_rpc(dcp, true, true);
 	round[0] = dcp_v27_ext_round(dcp);
@@ -1063,6 +1063,7 @@ static int dcp_v27_reopen_live(struct apple_dcp *dcp)
 {
 	struct dcp_v27_sleep *s = dcp->sleep_v27;
 	unsigned int i;
+	bool per_call;
 	int ret;
 
 	ret = dcp_v27_disp_dart_release(s);
@@ -1084,7 +1085,7 @@ static int dcp_v27_reopen_live(struct apple_dcp *dcp)
 		if (s->restore_on) {
 			/* A500's wake form first; its failure does not stop the power-on. */
 			iomfb_v27_sleep_rpc(dcp, true, true);
-			/* macOS's first wake session ends there; the hard power-on runs in the next one */
+			/* The wake's one restart: the rest of the wake runs in the session it starts. */
 			if (s->soft_off && v27_rtkit_cycles >= 1)
 				dcp_v27_rtkit_cycle(dcp, 0);
 			if (s->soft_off && v27_a115)
@@ -1099,12 +1100,8 @@ static int dcp_v27_reopen_live(struct apple_dcp *dcp)
 					if (ret)
 						dev_warn(dcp->dev, "V27 wake: A115(1): %d\n", ret);
 				}
-				/*
-				 * macOS's lit wake comes seconds after the dark one's hard power-on, after
-				 * A500's wake form and with every session closed.
-				 */
-				if (v27_rtkit_cycles >= 1) {
-					/* A500, then the DCP stopped through the pause and restarted for the lit wake */
+				/* The dark-wake forms only: a restart, or a pause, before the display stage. */
+				if (v27_rtkit_cycles >= 2) {
 					iomfb_v27_sleep_rpc(dcp, true, true);
 					dcp_v27_rtkit_cycle(dcp, v27_lit_delay_ms);
 				} else if (v27_lit_delay_ms) {
@@ -1114,7 +1111,14 @@ static int dcp_v27_reopen_live(struct apple_dcp *dcp)
 					}
 					msleep(min(v27_lit_delay_ms, 10000U));
 				}
-				dcp_v27_display_stage(dcp, true, v27_session_rounds, v27_rtkit_cycles >= 2);
+				/*
+				 * Back to back with the hard power-on; only the dark-to-lit form idles
+				 * the DCP, with A500 first, between the calls.
+				 */
+				per_call = v27_rtkit_cycles >= 3;
+				if (!per_call)
+					dcp_v27_sessions(dcp, true);
+				dcp_v27_display_stage(dcp, per_call, per_call && v27_session_rounds, per_call);
 				if (v27_session_rounds)
 					dcp_v27_sessions(dcp, true);
 				ret = iomfb_v27_sleep_plain(dcp, true);
