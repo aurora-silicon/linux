@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """Run production MTP PM and magicmouse suspend/resume callbacks without a device.
 
-Checks notification order, suspend rollback, resume-error handling, the
-actuator mode cache and the multitouch enable work held across sleep. The old transport must compile and fail at runtime.
+Checks notification order, suspend rollback, resume-error handling, that
+no actuator request is sent while the transport is suspended, the actuator
+mode asserted on resume and the multitouch enable work held across sleep. The old transport must compile and fail at runtime.
 """
 import argparse
 import os
@@ -17,7 +18,7 @@ TRANSPORT = 'drivers/hid/dockchannel-hid/dockchannel-hid.c'
 
 
 def function(source, name):
-    for kind in ('int', 'void'):
+    for kind in ('int', 'void', 'bool'):
         prefix = 'static ' + kind + ' ' + name + '('
         if prefix in source:
             start = source.index(prefix)
@@ -36,11 +37,23 @@ PREFIX = r'''
 #define HID_HAPTIC_MODE_HOST 1
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x) = (v))
-struct haptics { int mode; };
+#define FF_MAX_EFFECTS 4
+typedef unsigned u32;
+#define guard(type) (void)
+#define scoped_guard(type, lock) for (int _once = ((void)(lock), 1); _once; _once = 0)
+#define hid_warn(...) ((void)0)
+struct haptics { int mode; void *wq; int auto_trigger_mutex; };
 struct delayed_work { bool pending; unsigned queued; };
-struct magicmouse_sc { struct haptics *haptics; bool haptic_button_down, haptic_deep_down;
+struct work_struct { unsigned cancels; };
+struct effect_job { int effect_type; };
+struct hid_device;
+struct magicmouse_sc { struct haptics *haptics; bool haptic_button_down, haptic_deep_down, haptic_suspended;
+    struct work_struct haptic_press_work, haptic_release_work, haptic_deep_work, haptic_deep_release_work;
+    struct effect_job *haptic_effects; struct hid_device *hdev;
     struct delayed_work work; bool work_held; };
 typedef int pm_message_t;
+static bool haptic_press;
+static void cancel_work_sync(struct work_struct *w) { w->cancels++; }
 static unsigned long msecs_to_jiffies(unsigned m) { return m; }
 static bool cancel_delayed_work_sync(struct delayed_work *w) { bool p = w->pending; w->pending = false; return p; }
 static bool schedule_delayed_work(struct delayed_work *w, unsigned long d) { w->queued++; w->pending = true; return true; }
@@ -64,6 +77,14 @@ static void *hid_get_drvdata(struct hid_device *d) { return d->data; }
 static void magicmouse_force_key(struct magicmouse_sc *m, bool down) {
     assert(!down); key_releases++;
 }
+/* The transport refuses requests (-EBUSY) while it is suspended: never send one then. */
+static struct hid_device *actuator;
+static unsigned switches; static u32 switched_to; static int switch_error;
+static struct hid_device *magicmouse_get_actuator(struct magicmouse_sc *m) { (void)m; return actuator; }
+static int apple_taptic_switch_modes(struct hid_device *a, u32 mode) {
+    assert(a && !transport->suspended);
+    switches++; switched_to = mode; return switch_error;
+}
 static int hid_driver_suspend(struct hid_device *h, int state) {
     assert(state == PMSG_SUSPEND && !transport->suspended);
     suspends[h->id]++;
@@ -82,15 +103,20 @@ static int hid_driver_resume(struct hid_device *h) {
 '''
 CASES = r'''
 int main(void) {
-    struct haptics hap = {.mode = HID_HAPTIC_MODE_HOST};
+    struct haptics hap = {.mode = HID_HAPTIC_MODE_HOST, .wq = &hap};
     struct magicmouse_sc m = {.haptics = &hap, .haptic_button_down = true, .haptic_deep_down = true};
     struct hid_device h0 = {.data = &m, .id = 0}, h4 = {.id = 4}, h8 = {.id = 8};
+    struct effect_job effects[FF_MAX_EFFECTS] = {0};
+    actuator = &h0;
     struct dchid_iface i0 = {.hid = &h0}, i4 = {.hid = &h4}, i8 = {.hid = &h8}, empty = {0};
     struct dockchannel_hid t = {.ifaces = {[0] = &i0, [3] = &empty, [4] = &i4, [8] = &i8}};
     struct device d = {.data = &t}; transport = &t;
     assert(!dockchannel_hid_suspend(&d) && t.suspended);
-    assert(!dockchannel_hid_resume(&d) && !t.suspended);
-    assert(hap.mode == HID_HAPTIC_MODE_DEVICE);
+    /* Suspend stops the click workers; nothing is sent until resume. */
+    assert(m.haptic_suspended && m.haptic_press_work.cancels == 1 && m.haptic_deep_release_work.cancels == 1);
+    assert(!dockchannel_hid_resume(&d) && !t.suspended && !m.haptic_suspended);
+    /* A cached host mode is not trusted: device mode is asserted once the transport is up. */
+    assert(hap.mode == HID_HAPTIC_MODE_DEVICE && switches == 1 && switched_to == HID_HAPTIC_MODE_DEVICE);
     assert(!m.haptic_button_down && !m.haptic_deep_down && key_releases == 1);
     assert(suspends[0] == 1 && resumes[0] == 1 && resumes[8] == 1);
     /* A later HID failure rolls back only the drivers that suspended. */
@@ -113,6 +139,11 @@ int main(void) {
         assert(!dockchannel_hid_resume(&d));
         assert(hap.mode == HID_HAPTIC_MODE_DEVICE);
     }
+    /* Host clicks wanted: host mode is taken again on resume. */
+    haptic_press = true; switches = 0;
+    assert(!dockchannel_hid_suspend(&d) && !dockchannel_hid_resume(&d));
+    assert(switches == 1 && switched_to == HID_HAPTIC_MODE_HOST && hap.mode == HID_HAPTIC_MODE_HOST);
+    haptic_press = false;
     /* Pending multitouch enable work is held across sleep and re-queued once. */
     m.work.pending = true; m.work.queued = 0;
     assert(!dockchannel_hid_suspend(&d) && !m.work.pending && m.work_held);
@@ -120,7 +151,7 @@ int main(void) {
     m.work.pending = false;
     assert(!dockchannel_hid_suspend(&d) && !m.work_held);
     assert(!dockchannel_hid_resume(&d) && !m.work.pending && m.work.queued == 1);
-    puts("MTP PM: HID notifications, rollback, all-interface resume, haptic cache and held enable work passed");
+    puts("MTP PM: HID notifications, rollback, all-interface resume, no request while suspended, haptic mode on resume and held enable work passed");
 }
 '''
 
@@ -138,8 +169,11 @@ def main():
         out = Path(args.out or tmp)
         out.mkdir(parents=True, exist_ok=True)
         c, exe = out/'mtp-pm.c', out/'mtp-pm'
-        c.write_text(PREFIX.replace('static int hid_driver_suspend', function(mouse, 'magicmouse_suspend') + '\nstatic int hid_driver_suspend', 1) +
-                     function(mouse, 'magicmouse_haptic_forget_mode') + '\n' +
+        haptics = '\n'.join(function(mouse, name) for name in (
+            'magicmouse_haptic_effects_loaded', 'magicmouse_haptic_suspend',
+            'magicmouse_haptic_resume')) + '\n'
+        c.write_text(PREFIX.replace('static int hid_driver_suspend', haptics + function(mouse, 'magicmouse_suspend') +
+                                    '\nstatic int hid_driver_suspend', 1) +
                      function(mouse, 'magicmouse_resume') + MIDDLE +
                      function(source, 'dockchannel_hid_suspend') + '\n' +
                      function(source, 'dockchannel_hid_resume') + CASES)
@@ -151,7 +185,7 @@ def main():
         if args.old_transport:
             if r.returncode != -6 or 'Assertion' not in r.stderr:
                 raise SystemExit('old transport did not fail its runtime assertion')
-            print('MTP PM: old transport compiled and failed the haptic-cache assertion')
+            print('MTP PM: old transport compiled and failed a runtime assertion')
         elif r.returncode:
             raise SystemExit(r.stdout+r.stderr)
         else:
