@@ -4554,6 +4554,14 @@ static int atcphy_usb2_init(struct phy *phy)
 	if (!atcphy->fixed_usb2) {
 		if (atcphy->mode == APPLE_ATCPHY_MODE_OFF || atcphy->mode_dirty)
 			return atcphy_configure(atcphy, atcphy->typec_mode);
+		/*
+		 * Reset assertion stops USB2 even when a DisplayPort mode keeps
+		 * the common block running. An aborted suspend need not produce
+		 * a new mux event: restore USB2 without disturbing the DP link.
+		 */
+		if ((readl(atcphy->regs.usb2phy + USB2PHY_USBCTL) &
+		     USB2PHY_USBCTL_USB_MODE) != USB2PHY_USBCTL_RUN)
+			atcphy_usb2_power_on(atcphy);
 		return 0;
 	}
 

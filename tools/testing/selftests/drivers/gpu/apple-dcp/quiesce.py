@@ -168,6 +168,9 @@ struct phy { struct apple_atcphy *data; };
 #define phy_get_drvdata(p) ((p)->data)
 #define USB2PHY_SIG 0
 #define USB2PHY_SIG_HOST 1
+USB2_RUN_DEFINES
+/* Retained USB2 power is exercised by dwc3-teardown, not these role removals. */
+static u32 readl(void *p) { (void)p;assert(false);return 0; }
 static struct { enum atcphy_pipehandler_state pipehandler_state; bool enable_dp_aux; } atcphy_modes[7];
 static struct apple_atcphy ordinary_phy;
 static struct phy usb_phy={.data=&ordinary_phy};
@@ -204,6 +207,10 @@ static void ordinary_usb2_check(void) {
 '''
  # The ordinary port is the T8122 profile unless a case selects the T8103
  # generation, whose live legacy PIPE park the mux switch now consults.
+ ordinary_phy=ordinary_phy.replace('USB2_RUN_DEFINES', '\n'.join(
+  line for line in atc.splitlines()
+  if line.startswith(('#define USB2PHY_USBCTL ', '#define USB2PHY_USBCTL_USB_MODE ',
+                      '#define USB2PHY_USBCTL_RUN '))))
  generation='enum atcphy_generation {' in atc
  ordinary_phy=ordinary_phy.replace('GENERATION_ENUM\n',block(atc,'enum atcphy_generation {')+';\n' if generation else '',1)
  ordinary_phy=ordinary_phy.replace('GENERATION_FIELD ','enum atcphy_generation gen; ' if generation else '',1)

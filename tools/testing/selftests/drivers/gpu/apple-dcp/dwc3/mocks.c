@@ -257,10 +257,12 @@ static int __attribute__((unused)) atcphy_configure_pipehandler_usb3_host_t8132(
 { (void)p; assert(false); return -EOPNOTSUPP; }
 
 
-/* USB2 power-on is outside this teardown/recovery control. */
+/* Model the USB2 power-on boundary's running state. */
+static unsigned int usb2_starts;
 static void atcphy_usb2_power_on(struct apple_atcphy *p)
 {
-	(void)p;
+	usb2_starts++;
+	writel(USB2PHY_USBCTL_RUN, p->regs.usb2phy + USB2PHY_USBCTL);
 }
 
 /* This teardown fixture never selects T8142 DP calibration. */
