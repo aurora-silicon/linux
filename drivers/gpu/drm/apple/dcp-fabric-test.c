@@ -2346,6 +2346,70 @@ static void relink_stamp_test(struct kunit *test)
 }
 
 /*
+ * T6050's limit on merged modes, on its four external engines (one of them an
+ * unrouted peer): a display that needs a pair gets it alone and with one other
+ * external display present, not with two, whichever order the three come in,
+ * and gets it back once one of the others leaves.
+ */
+static void fabric_t6050_merged_limit_test(struct kunit *test)
+{
+	/* One display on direct DP, one in the same dock as the paired one. */
+	enum { DIRECT, DOCK, PAIRED, NR };
+	static const u8 orders[][NR] = {
+		{ DIRECT, DOCK, PAIRED },	/* direct first, the dock's other before it */
+		{ DIRECT, PAIRED, DOCK },	/* the dock's other after it */
+		{ DOCK, PAIRED, DIRECT },	/* the dock first */
+		{ DOCK, DIRECT, PAIRED },
+		{ PAIRED, DOCK, DIRECT },	/* the paired one first */
+		{ PAIRED, DIRECT, DOCK },
+	};
+	const unsigned int engines = 4;
+	unsigned int o, i, j;
+
+	KUNIT_EXPECT_TRUE(test, dcp_fabric_merged_fits(1, 1, engines));
+	KUNIT_EXPECT_TRUE(test, dcp_fabric_merged_fits(2, 1, engines));
+	KUNIT_EXPECT_FALSE(test, dcp_fabric_merged_fits(3, 1, engines));
+	KUNIT_EXPECT_FALSE(test, dcp_fabric_merged_fits(4, 1, engines));
+	KUNIT_EXPECT_FALSE(test, dcp_fabric_merged_fits(5, 1, engines));
+	/* No display, no pair asked for, no engine to spare, no wrap. */
+	KUNIT_EXPECT_FALSE(test, dcp_fabric_merged_fits(0, 1, engines));
+	KUNIT_EXPECT_FALSE(test, dcp_fabric_merged_fits(1, 0, engines));
+	KUNIT_EXPECT_FALSE(test, dcp_fabric_merged_fits(1, 1, 2));
+	KUNIT_EXPECT_FALSE(test, dcp_fabric_merged_fits(1, UINT_MAX, engines));
+	KUNIT_EXPECT_FALSE(test, dcp_fabric_merged_fits(UINT_MAX, 1, engines));
+
+	for (o = 0; o < ARRAY_SIZE(orders); o++) {
+		bool present[NR] = {};
+
+		for (i = 0; i < NR; i++) {
+			unsigned int others;
+			bool fits;
+
+			present[orders[o][i]] = true;
+			if (!present[PAIRED])
+				continue;
+			/*
+			 * The paired display counts itself from its display hints
+			 * on, which come before it is reported connected.
+			 */
+			others = present[DIRECT] + present[DOCK];
+			fits = dcp_fabric_merged_fits(others + 1, 1, engines);
+			KUNIT_EXPECT_EQ_MSG(test, fits, others <= 1, "order %u, step %u", o, i);
+		}
+		/* From all three, either other one leaving gives the pair back. */
+		for (j = DIRECT; j <= DOCK; j++) {
+			unsigned int displays;
+
+			present[j] = false;
+			displays = present[DIRECT] + present[DOCK] + present[PAIRED];
+			KUNIT_EXPECT_TRUE_MSG(test, dcp_fabric_merged_fits(displays, 1, engines),
+					      "order %u, display %u unplugged", o, j);
+			present[j] = true;
+		}
+	}
+}
+
+/*
  * A refused T8132 tunnel clock stays refused through stops, failed or not,
  * and only a nonzero rate taken clears it: refused, 0, refused is one
  * refusal, not three changes.
@@ -2377,6 +2441,7 @@ static void fabric_t8132_clock_refused_test(struct kunit *test)
 
 static struct kunit_case fabric_tests[] = {
 	KUNIT_CASE(fabric_t8132_clock_refused_test),
+	KUNIT_CASE(fabric_t6050_merged_limit_test),
 	KUNIT_CASE(relink_unplug_test),
 	KUNIT_CASE(relink_running_test),
 	KUNIT_CASE(relink_budget_test),

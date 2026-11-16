@@ -212,4 +212,18 @@ u32 dcp_fabric_port_crtc_mask(bool secondary, bool ordered_dual, bool typec_only
 enum dcp_fabric_attach_action dcp_fabric_attach_action(bool external);
 bool dcp_fabric_t6030_link(bool tunnel, bool has_xbar, bool t6030_dpin);
 
+/*
+ * T6050's platform limit on merged (dual-pipe) modes: whether a display may
+ * take a mode its own engine cannot drive, @extra engines more than its own,
+ * while @displays external displays, it included, are present on the
+ * platform's @engines external display engines. A full pair is given only
+ * while the displays and the pair leave an external engine unused; on the
+ * four engines of a T6050, a display pairs alone or with one other external
+ * display present, not with two. Otherwise the platform offers only a limited
+ * pipe, which the driver does not implement, and the display runs on its own
+ * engine at a timing that one engine drives.
+ */
+bool dcp_fabric_merged_fits(unsigned int displays, unsigned int extra,
+			    unsigned int engines);
+
 #endif /* __APPLE_DCP_FABRIC_CORE_H__ */

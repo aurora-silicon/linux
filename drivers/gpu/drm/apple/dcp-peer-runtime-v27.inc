@@ -127,13 +127,23 @@ bool dcp_peer_needs_pair_v27(struct apple_dcp *dcp, u32 clock_khz)
 	return dcp->fw_compat == DCP_FIRMWARE_V_27_0 && rate && (u64)clock_khz * 1000 > rate;
 }
 
+/* A timing only a pair drives, while the platform limit leaves no pair. */
+bool dcp_peer_mode_limited_v27(struct apple_dcp *dcp, u32 clock_khz)
+{
+	if (!dcp_peer_needs_pair_v27(dcp, clock_khz))
+		return false;
+	guard(mutex)(&dcp_peer_lock);
+	return dcp_peer_limited_locked(dcp, NULL, NULL);
+}
+
 /*
  * At atomic check: refuse a paired timing the pair cannot take, so that the
  * commit fails instead of a mode set that leaves the CRTC without a timing.
  * The peer's CRTC is not taken into the commit; its current state is read.
  * A CRTC being enabled reserves its peer when the link comes up, in
  * dcp_poweron() after this check; iomfb_modeset() refuses the timing then
- * if no peer was reserved.
+ * if no peer was reserved. While the platform limit leaves the display no
+ * pair, a paired timing is refused whatever the peer's state.
  */
 int dcp_peer_check_v27(struct apple_dcp *dcp, struct drm_atomic_commit *commit,
 		       struct drm_crtc_state *crtc_state)
@@ -157,7 +167,18 @@ int dcp_peer_check_v27(struct apple_dcp *dcp, struct drm_atomic_commit *commit,
 		return -EINVAL;
 	scoped_guard(mutex, &dcp_peer_lock) {
 		struct apple_dcp *peer = dcp->peer_reserved;
+		unsigned int displays, engines;
 
+		/* Not even for a CRTC being enabled: the limit has no pair to give. */
+		if (dcp_peer_limited_locked(dcp, &displays, &engines)) {
+			dev_info_ratelimited(dcp->dev,
+					     "mode %ux%u@%u refused: %u external displays on %u engines leave no pair\n",
+					     crtc_state->mode.hdisplay,
+					     crtc_state->mode.vdisplay,
+					     drm_mode_vrefresh(&crtc_state->mode),
+					     displays, engines);
+			return -EINVAL;
+		}
 		if (!peer && crtc_state->active_changed)
 			return 0;
 		if (!peer || peer->peer_owner != dcp || peer->fixed_phy ||
