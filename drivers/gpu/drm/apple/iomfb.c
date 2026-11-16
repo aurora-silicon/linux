@@ -840,7 +840,8 @@ struct iomfb_v27_sleep_rpc {
 	struct dcp_method_entry method;
 	u8 data[16];
 	u32 input, output, status, power_state;
-	bool oob, flags_form, any_reply, inout;
+	bool oob, flags_form, any_reply, inout, a442;
+	u8 a442_key;	/* an external processor's A442 rides this call, with this key */
 };
 
 static void iomfb_v27_sleep_free(struct kref *ref)
@@ -870,6 +871,10 @@ static void iomfb_v27_sleep_done(struct apple_dcp *dcp, void *out, void *cookie)
 	complete(&rpc->done);
 }
 
+static void iomfb_v27_a442_done(struct apple_dcp *dcp, void *out, void *cookie)
+{
+}
+
 static void iomfb_v27_sleep_start(struct apple_dcp *dcp,
 				  struct iomfb_transaction *transaction)
 {
@@ -881,6 +886,22 @@ static void iomfb_v27_sleep_start(struct apple_dcp *dcp,
 	dcp_push(dcp, rpc->oob, &rpc->method, rpc->input, rpc->output,
 		 rpc->data, iomfb_v27_sleep_done, rpc);
 	dcp->push_out_prefill = NULL;
+	if ((rpc->a442 || rpc->a442_key) && !rpc->oob) {
+		static const struct dcp_method_entry a442 = {
+			.name = "v27_a442", .tag = { 'A', '4', '4', '2' },
+		};
+		u8 in[92];
+
+		memset(in, 0xaa, sizeof(in));
+		memset(in, 0, 16);
+		in[8] = rpc->a442_key ?: 0x41;
+		/* An external processor's wake: no indexes, and the block's size word. */
+		if (rpc->a442_key) {
+			memset(in + 80, 0, 12);
+			in[84] = 0x20;
+		}
+		dcp_push(dcp, true, &a442, sizeof(in), 4100, in, iomfb_v27_a442_done, NULL);
+	}
 }
 
 /*
@@ -935,6 +956,11 @@ static bool v27_sleep_power_oob;
 module_param(v27_sleep_power_oob, bool, 0644);
 MODULE_PARM_DESC(v27_sleep_power_oob, "V27 sleep: the power state calls on the out-of-band context (0, default: the command context)");
 
+/* macOS's A442 (key 0x41) on the out-of-band context alongside the display's power-on. */
+static bool v27_a442 = true;
+module_param(v27_a442, bool, 0644);
+MODULE_PARM_DESC(v27_a442, "Firmware 27 wake: macOS's out-of-band A442 alongside the plain A484(1)");
+
 static int iomfb_v27_rpc(struct apple_dcp *dcp, bool a500, bool on, bool flags);
 
 int iomfb_v27_sleep_rpc(struct apple_dcp *dcp, bool a500, bool on)
@@ -984,6 +1010,7 @@ static int iomfb_v27_rpc(struct apple_dcp *dcp, bool a500, bool on, bool flags)
 		rpc->output = sizeof(struct dcp_set_power_state_resp);
 		rpc->oob = READ_ONCE(v27_sleep_power_oob);
 		rpc->power_state = on;
+		rpc->a442 = on && !flags && READ_ONCE(v27_a442);
 		put_unaligned_le64(on, rpc->data);
 		/*
 		 * The firmware keeps a hard and a soft power state, and the flags move the hard one,
@@ -1009,13 +1036,23 @@ static int iomfb_v27_rpc(struct apple_dcp *dcp, bool a500, bool on, bool flags)
 }
 
 static int iomfb_v27_call(struct apple_dcp *dcp, const char *tag, const void *in,
-			  u32 in_len, u32 out_len, bool inout);
+			  u32 in_len, u32 out_len, bool inout, u8 a442_key);
 
 /* One call of the display stage around a V27 sleep, by tag; any reply is accepted. */
 int iomfb_v27_sleep_call(struct apple_dcp *dcp, const char *tag, const void *in,
 			 u32 in_len, u32 out_len)
 {
-	return iomfb_v27_call(dcp, tag, in, in_len, out_len, false);
+	return iomfb_v27_call(dcp, tag, in, in_len, out_len, false, 0);
+}
+
+/*
+ * A call without input, and macOS's A442 with @key on the out-of-band context right behind
+ * it, before the call's answer: an external processor's wake sends A489 so.
+ * A442's own answer is not waited for.
+ */
+int iomfb_v27_sleep_call_a442(struct apple_dcp *dcp, const char *tag, u32 out_len, u8 key)
+{
+	return iomfb_v27_call(dcp, tag, NULL, 0, out_len, false, key);
 }
 
 /*
@@ -1026,11 +1063,11 @@ int iomfb_v27_sleep_a115(struct apple_dcp *dcp, bool awake)
 {
 	u32 v = awake;
 
-	return iomfb_v27_call(dcp, "A115", &v, 0, sizeof(v), true);
+	return iomfb_v27_call(dcp, "A115", &v, 0, sizeof(v), true, 0);
 }
 
 static int iomfb_v27_call(struct apple_dcp *dcp, const char *tag, const void *in,
-			  u32 in_len, u32 out_len, bool inout)
+			  u32 in_len, u32 out_len, bool inout, u8 a442_key)
 {
 	struct iomfb_v27_sleep_rpc *rpc;
 	int ret;
@@ -1053,7 +1090,9 @@ static int iomfb_v27_call(struct apple_dcp *dcp, const char *tag, const void *in
 	rpc->input = in_len;
 	rpc->output = out_len;
 	rpc->inout = inout;
-	memcpy(rpc->data, in, inout ? out_len : in_len);
+	rpc->a442_key = a442_key;
+	if (in)
+		memcpy(rpc->data, in, inout ? out_len : in_len);
 	kref_get(&rpc->ref);
 	ret = iomfb_queue(dcp, &rpc->transaction);
 	if (ret)
