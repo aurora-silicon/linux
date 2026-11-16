@@ -1470,6 +1470,18 @@ const struct apple_sleep_smc_policy *apple_sleep_smc_policy(void)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_smc_policy);
 
+static bool sleep_j813_smc_late = true;
+module_param_named(j813_smc_late, sleep_j813_smc_late, bool, 0444);
+MODULE_PARM_DESC(j813_smc_late,
+		 "TEST ONLY: J813 final SMC sleep notice after peer stops");
+
+bool apple_sleep_smc_defer_notice(void)
+{
+	return apple_sleep && READ_ONCE(sleep_j813_smc_late) &&
+		of_machine_is_compatible("apple,j813") && pm_suspend_via_firmware();
+}
+EXPORT_SYMBOL_GPL(apple_sleep_smc_defer_notice);
+
 int apple_sleep_smc_register(struct device *dev,
 		int (*late_notice)(void *data, u64 *sent, u64 *ack), void *data)
 {
@@ -1494,8 +1506,8 @@ int apple_sleep_smc_register_saved(struct device *dev,
 	struct apple_sleep *s = apple_sleep;
 	guard(mutex)(&apple_sleep_smc_lock);
 
-	if (!s || !s->soc->early_context || !s->soc->smc_policy ||
-	    !pm_suspend_via_firmware())
+	if (!s || ((!s->soc->early_context || !s->soc->smc_policy) &&
+		   !apple_sleep_smc_defer_notice()) || !pm_suspend_via_firmware())
 		return -EOPNOTSUPP;
 	if (!ops || !ops->begin || !ops->late_notice || !ops->end || s->smc.dev)
 		return -EBUSY;
@@ -3907,11 +3919,12 @@ static void t8132_wake(struct apple_sleep *s)
 
 static int apple_sleep_smc_late_notice(struct apple_sleep *s)
 {
-	if (!s->soc->smc_policy)
+	if (!s->soc->smc_policy && !apple_sleep_smc_defer_notice())
 		return 0;
 	if (!s->smc.dev || !s->smc.late_notice)
 		return -ENODEV;
-	if (s->soc->early_context && (!s->smc.saved_ops || !s->smc.held))
+	if ((s->soc->early_context || apple_sleep_smc_defer_notice()) &&
+	    (!s->smc.saved_ops || !s->smc.held))
 		return -EBUSY;
 	return s->smc.late_notice(s->smc.data, &s->smc_idle_sent, &s->smc_idle_ack);
 }
@@ -4097,6 +4110,14 @@ static int apple_sleep_enter(suspend_state_t state)
 	if (s->soc->early_context)
 		return apple_sleep_enter_early(s);
 
+	/* Refuse while all peer stops are still reversible. */
+	if (apple_sleep_smc_defer_notice()) {
+		if (!s->smc.dev || !s->smc.late_notice)
+			return -ENODEV;
+		if (!s->smc.saved_ops || !s->smc.held)
+			return -EBUSY;
+	}
+
 	ret = apple_sleep_refuse(s);
 	if (ret)
 		return ret;
@@ -4126,6 +4147,18 @@ static int apple_sleep_enter(suspend_state_t state)
 	if (s->soc->ack_cluster_dcs && (readl(s->cluster_dcs) & CLUSTER_UP_DONE))
 		writel(readl(s->cluster_dcs), s->cluster_dcs);
 	apple_sleep_coprocs_stop(s, false);
+	/*
+	 * J813 native trace: ANS idle completes before SMC slpa/AP IDLE.
+	 * In the battery failure SMC faulted at ANS + 0xc110 after ANS's
+	 * idle ACK was missed. Keep its final notice behind the peer stops
+	 * and ahead of the domain power-down in the last mile.
+	 */
+	if (apple_sleep_smc_defer_notice()) {
+		ret = apple_sleep_smc_late_notice(s);
+		dev_info(s->dev, "TEST: SMC notice after peer stops: %d\n", ret);
+		if (ret)
+			panic("J813 SMC notice failed after peer stops: %d", ret);
+	}
 	/* Done by now unless no SMC driver is bound. */
 	apple_sleep_usb_down(s);
 	s->deep_once = READ_ONCE(sleep_deep_requested);
@@ -4398,7 +4431,8 @@ static int apple_sleep_smc_scope_begin(void)
 	struct apple_sleep *s = apple_sleep;
 	int ret = 0;
 
-	if (!s->soc->early_context || !s->soc->smc_policy)
+	if ((!s->soc->early_context || !s->soc->smc_policy) &&
+	    !apple_sleep_smc_defer_notice())
 		return 0;
 	mutex_lock(&apple_sleep_smc_lock);
 	if (!s->smc.saved_ops || !s->smc.dev) {
@@ -4587,6 +4621,8 @@ static const struct platform_suspend_ops apple_sleep_ops = {
 	.valid = suspend_valid_only_mem,
 	.begin = apple_sleep_begin,
 	.prepare = apple_sleep_prepare,
+	.prepare_late = apple_sleep_smc_scope_begin,
+	.finish = apple_sleep_smc_scope_end,
 	.enter = apple_sleep_enter,
 	.wake = apple_sleep_report,
 	.end = apple_sleep_end,
