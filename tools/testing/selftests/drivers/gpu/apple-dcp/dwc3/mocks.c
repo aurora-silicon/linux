@@ -100,6 +100,8 @@ struct dwc3_apple {
 	bool pre_core_rpm;
 	/* J714s only: the start after a sleep waits for its Type-C PHY; never set here. */
 	bool sleep_phy_wait, sleep_phy_pending;
+	/* Post-sleep SuperSpeed diagnostic ownership. */
+	bool ss_retry;
 	bool dt_dis_u3_susphy;
 	unsigned long usb2_power_off_pending, usb3_power_off_pending;
 	/* The PM sleep epoch (dwc3_apple_pm_notify()); the fixtures stay IDLE. */
@@ -440,3 +442,11 @@ static void dwc3_apple_apply_tunables(struct dwc3_apple *appledwc)
 	assert(!appledwc->host_only);
 }
 #define dev_info_ratelimited(...) ((void)0)
+
+/* Scheduling only; this legacy teardown fixture does not run delayed USB checks. */
+static unsigned int hub_check_calls;
+static void dwc3_apple_check_hub_later(struct dwc3_apple *appledwc)
+{
+    (void)appledwc;
+    hub_check_calls++;
+}
