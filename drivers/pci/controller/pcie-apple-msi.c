@@ -22,6 +22,7 @@
 #include <linux/of.h>
 #include <linux/of_irq.h>
 #include <linux/platform_device.h>
+#include <linux/suspend.h>
 
 #define PORT_MSICFG		0x0124
 #define   PORT_MSICFG_EN	BIT(0)
@@ -35,6 +36,8 @@ struct apple_msi {
 	struct mutex lock;
 	struct irq_fwspec fwspec;
 	unsigned long *bitmap;
+	void __iomem **ports;
+	unsigned int nports;
 	u32 nvecs;
 };
 
@@ -114,6 +117,33 @@ static const struct msi_parent_ops apple_msi_parent_ops = {
 	.init_dev_msi_info	= msi_lib_init_dev_msi_info,
 };
 
+/* On every port, MSI data N goes to the Nth interrupt of msi-ranges. */
+static void apple_msi_hw_init(struct apple_msi *msi)
+{
+	unsigned int p, i;
+
+	for (p = 0; p < msi->nports; p++) {
+		void __iomem *port = msi->ports[p];
+
+		writel(lower_32_bits(DOORBELL_ADDR), port + PORT_MSIADDR);
+		for (i = 0; i < msi->nvecs; i++)
+			writel(PORT_MSIMAP_ENABLE | i, port + PORT_MSIMAP + 4 * i);
+		writel(readl(port + PORT_MSICFG) | PORT_MSICFG_EN, port + PORT_MSICFG);
+	}
+}
+
+/* The platform wake has brought the port back before device noirq resume. */
+static int apple_msi_resume_noirq(struct device *dev)
+{
+	if (pm_resume_via_firmware())
+		apple_msi_hw_init(dev_get_drvdata(dev));
+	return 0;
+}
+
+static const struct dev_pm_ops apple_msi_pm_ops = {
+	.resume_noirq = apple_msi_resume_noirq,
+};
+
 static int apple_msi_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -171,15 +201,10 @@ static int apple_msi_probe(struct platform_device *pdev)
 	info.size = msi->nvecs;
 	info.host_data = msi;
 
-	/* On every port, MSI data N goes to the Nth interrupt of msi-ranges. */
-	while (nports--) {
-		void __iomem *port = ports[nports];
-
-		writel(lower_32_bits(DOORBELL_ADDR), port + PORT_MSIADDR);
-		for (i = 0; i < msi->nvecs; i++)
-			writel(PORT_MSIMAP_ENABLE | i, port + PORT_MSIMAP + 4 * i);
-		writel(readl(port + PORT_MSICFG) | PORT_MSICFG_EN, port + PORT_MSICFG);
-	}
+	msi->ports = ports;
+	msi->nports = nports;
+	platform_set_drvdata(pdev, msi);
+	apple_msi_hw_init(msi);
 
 	if (!msi_create_parent_irq_domain(&info, &apple_msi_parent_ops))
 		return -ENOMEM;
@@ -198,6 +223,7 @@ static struct platform_driver apple_msi_driver = {
 		.name			= "pcie-apple-msi",
 		.of_match_table		= apple_msi_of_match,
 		.suppress_bind_attrs	= true,
+		.pm			= &apple_msi_pm_ops,
 	},
 };
 builtin_platform_driver(apple_msi_driver);
