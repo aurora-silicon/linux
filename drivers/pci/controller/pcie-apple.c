@@ -48,6 +48,7 @@
 #include <linux/soc/apple/t8132.h>
 #include <linux/soc/apple/tunable.h>
 #include <linux/suspend.h>
+#include <linux/blkdev.h>
 
 #include "../pci.h"
 #include "pci-host-common.h"
@@ -134,6 +135,14 @@ MODULE_PARM_DESC(t6050_sd_port_wake,
 #define   PORT_PME_TURN_OFF_SEND	BIT(0)
 /* Written with bit 0 and still set afterwards; meaning not known */
 #define   PORT_PME_TURN_OFF_BIT4	BIT(4)
+/*
+ * T6050 PCIe-C, the root port of a USB4 router's PCIe tunnel: macOS sends PME_Turn_Off
+ * through this register of the port, with the same two bits, waits for the send bit to
+ * clear and reads the link in L2 before it stops the link. It writes nothing at
+ * PORT_PME_TURN_OFF on that port. The port's tunnel control words sit elsewhere on this
+ * block as well (PORT_T6050_TUNCTRL).
+ */
+#define PORT_T6050_PCIEC_PME_TURN_OFF	0x0008c
 #define PORT_INTSTAT			0x00100
 #define   PORT_INT_TUNNEL_ERR		31
 #define   PORT_INT_CPL_TIMEOUT		23
@@ -4302,6 +4311,17 @@ static int apple_pcie_tunnel_add_links(struct apple_pcie *pcie)
 		/* An older DT gives the DART no sleep path: keep the tunnel without one. */
 		if (ret == -EOPNOTSUPP)
 			dev_warn(pcie->dev, "DART has no CIO sleep path; a docked deep sleep is refused\n");
+	} else if (cio_s2r && pcie->hw == &t6050_pciec_hw &&
+		   of_machine_is_compatible("apple,j714s") &&
+		   of_property_present(dart_pdev->dev.of_node, "apple,clock-protection")) {
+		/*
+		 * TEST: T6050, a router that sleeps in place. Only with the DART's clock
+		 * protection slice in the device tree; without it the tunnel is as before
+		 * and its port is powered off for a sleep.
+		 */
+		ret = apple_dart_cio_bind(pcie->dev, &dart_pdev->dev, &pcie->cio_dart);
+		if (!ret)
+			dev_info(pcie->dev, "T6050 sleep: the tunnel is kept across a sleep by its router's NHI\n");
 	}
 	if (ret == -EOPNOTSUPP)
 		ret = apple_pcie_tunnel_add_link(pcie, &dart_pdev->dev, pcie->dev);
@@ -5979,6 +5999,108 @@ int apple_pcie_tunnel_quiesce(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(apple_pcie_tunnel_quiesce);
 
+struct apple_pcie_tunnel_use {
+	struct pci_host_bridge *bridge;
+	unsigned int disks, open;
+};
+
+/* The disks below one device, and whether anything has them open. */
+static int apple_pcie_tunnel_disk_use(struct device *dev, void *data)
+{
+	struct apple_pcie_tunnel_use *use = data;
+
+	if (dev->class && dev->class->name && !strcmp(dev->class->name, "block") &&
+	    !bdev_is_partition(dev_to_bdev(dev))) {
+		use->disks++;
+		if (disk_openers(dev_to_disk(dev)))
+			use->open++;
+	}
+	return device_for_each_child(dev, data, apple_pcie_tunnel_disk_use);
+}
+
+/* The disks below a function of the tunnelled host. */
+static int apple_pcie_tunnel_function_disks(struct pci_dev *pdev, void *data)
+{
+	return device_for_each_child(&pdev->dev, data, apple_pcie_tunnel_disk_use);
+}
+
+/* Only drivers known not to touch the PM notifier chain in their remove are removed there. */
+static int apple_pcie_tunnel_other_driver(struct pci_dev *pdev, void *data)
+{
+	struct device_driver *drv = READ_ONCE(pdev->dev.driver);
+
+	if (!drv || !strcmp(drv->name, "nvme") || !strcmp(drv->name, "pcieport"))
+		return 0;
+	*(const char **)data = drv->name;
+	return 1;
+}
+
+/**
+ * apple_pcie_tunnel_remove_orderly - remove a tunnelled hierarchy that is still reachable
+ * @dev: the tunnelled host
+ * @in_use_too: also when a disk below it is open
+ *
+ * For a sleep that takes the tunnel's router down. Unlike apple_pcie_tunnel_quiesce(), which
+ * marks the functions disconnected first (their drivers then treat them as gone), the
+ * functions are removed while they still answer: an NVMe controller's driver stops its
+ * queues and gives the controller its normal shutdown, as at a power-off. Nothing is written
+ * to a disk that has no opener. apple_pcie_tunnel_quiesce() then takes the ports down and
+ * apple_pcie_tunnel_restore() enumerates the hierarchy again.
+ *
+ * Returns 0 when the hierarchy is removed (or was already), -EBUSY when a disk is open and
+ * @in_use_too is false, -EOPNOTSUPP when a function has a driver other than nvme or the PCIe
+ * port driver. Nothing is removed on an error.
+ */
+int apple_pcie_tunnel_remove_orderly(struct device *dev, bool in_use_too)
+{
+	struct pci_host_bridge *bridge = dev_get_drvdata(dev);
+	struct apple_pcie_tunnel_use use = { .bridge = bridge };
+	struct pci_dev *pdev, *tmp;
+	struct apple_pcie *pcie;
+	const char *other = NULL;
+	unsigned int tries;
+
+	if (!bridge || !bridge->bus)
+		return -ENODEV;
+	pcie = pci_host_bridge_priv(bridge);
+	if (!pcie->hw->tunneled)
+		return -EINVAL;
+
+	pci_lock_rescan_remove();
+	if (pcie->bus_stopped) {
+		pci_unlock_rescan_remove();
+		return 0;
+	}
+	pci_walk_bus(bridge->bus, apple_pcie_tunnel_other_driver, &other);
+	if (other) {
+		pci_unlock_rescan_remove();
+		dev_info(dev, "PCIe-C: a function driven by %s is not removed for the sleep\n", other);
+		return -EOPNOTSUPP;
+	}
+	/* A probe by udev right after the disk appeared closes again within moments. */
+	for (tries = 0; tries < 10; tries++) {
+		use.disks = use.open = 0;
+		pci_walk_bus(bridge->bus, apple_pcie_tunnel_function_disks, &use);
+		if (!use.open || in_use_too)
+			break;
+		msleep(50);
+	}
+	if (use.open && !in_use_too) {
+		pci_unlock_rescan_remove();
+		dev_warn(dev, "PCIe-C: %u of %u disk(s) behind the tunnel in use: not removed for the sleep\n",
+			 use.open, use.disks);
+		return -EBUSY;
+	}
+	list_for_each_entry_safe(pdev, tmp, &bridge->bus->devices, bus_list)
+		pci_stop_and_remove_bus_device(pdev);
+	pcie->bus_stopped = true;
+	pci_unlock_rescan_remove();
+	dev_info(dev, "PCIe-C: hierarchy removed in order for the sleep (%u disk(s), %u in use)\n",
+		 use.disks, use.open);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_pcie_tunnel_remove_orderly);
+
 /*
  * Bring the tunneled host back after apple_pcie_tunnel_quiesce(). The ports
  * need the restart that resume performs, and the hierarchy below them has to be
@@ -7207,9 +7329,20 @@ static int apple_pcie_resume_noirq(struct device *dev)
 		 * closed, and the hierarchy is removed with the tunnel after
 		 * resume. The NHI still ends the DART transaction.
 		 */
-		dev_err(dev, "PCIe-C not back after deep sleep: %d\n", ret);
 		pcie->resume_failed = true;
 		apple_pcie_tunnel_hierarchy_gone(dev);
+		/*
+		 * TEST: T6050. The router's host said the tunnel's peer is gone: an unplug that
+		 * happened during the sleep, not a failed resume. The port is closed as above,
+		 * its DART is back for the removal that follows, and the system's resume is not
+		 * failed for it (run sv6t4: "PM: failed to resume noirq: error -107").
+		 */
+		if (ret == -ENOTCONN && pcie->cio_lost && pcie->hw == &t6050_pciec_hw &&
+		    of_machine_is_compatible("apple,j714s")) {
+			dev_warn(dev, "T6050 sleep: PCIe-C tunnel gone with its dock during the sleep: the port is closed as after an unplug, its functions return when the dock is plugged in again\n");
+			return 0;
+		}
+		dev_err(dev, "PCIe-C not back after deep sleep: %d\n", ret);
 		return ret;
 	}
 	if (pcie->managed_sids)
