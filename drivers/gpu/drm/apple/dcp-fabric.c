@@ -11,6 +11,7 @@
 #include <linux/of_graph.h>
 #include <linux/phy/phy.h>
 #include <linux/slab.h>
+#include <linux/suspend.h>
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
@@ -3304,6 +3305,18 @@ static int dcp_tb_release_locked(struct apple_dcp_typec_port *port,
 		port->tb_last_until[dcp_fabric_dpin_slot(dpin)] = jiffies + msecs_to_jiffies(DCP_TB_STICKY_MS);
 	}
 	*slot = NULL;
+	/*
+	 * A tunnel taken down at a deep sleep's entry (a USB4 router that sleeps takes its
+	 * tunnels down after user space is frozen) is a display released for the sleep, as a
+	 * USB-C port's display is (dcp_fabric_sleep_release()). Its CRTC is still lit for the
+	 * frozen desktop; it resumes disabled (dcp_crtc_mode_fixup()), and the display's
+	 * return after the wake sets its mode again. Its next connect clears the mark.
+	 */
+	if (pm_suspend_target_state == PM_SUSPEND_MEM && dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    !READ_ONCE(dcp->sleep_v27_torn)) {
+		WRITE_ONCE(dcp->sleep_v27_torn, true);
+		dev_info(dcp->dev, "tunnel display released for the sleep\n");
+	}
 	port->hpd = dcp_typec_port_owned(port);
 	/* re-apply the next Type-C mux state in full */
 	port->applied_valid = false;
