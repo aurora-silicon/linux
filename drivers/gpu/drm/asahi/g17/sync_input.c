@@ -134,3 +134,15 @@ unsigned int asahi_g17_render_submit(void)
 {
 	return READ_ONCE(gpubench_render_submit);
 }
+
+/* Measurement only: 0 is the held host-port-first path; 1 restores the
+ * doorbell-first, unheld path. Change only between idle benchmark clients.
+ */
+static unsigned int gpubench_compute_kick;
+module_param(gpubench_compute_kick, uint, 0644);
+MODULE_PARM_DESC(gpubench_compute_kick, "Measurement: compute kick (0 held host-port first, 1 old doorbell first)");
+
+unsigned int asahi_g17_compute_kick_mode(void)
+{
+	return READ_ONCE(gpubench_compute_kick);
+}

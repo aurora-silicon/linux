@@ -3113,6 +3113,10 @@ impl Queue {
             // bits 3:2. The generic work doorbell left the firmware to find the
             // ring itself and delayed dispatch.
             fence(Ordering::SeqCst);
+            let old_order = self.graph.m5 && crate::g17::sync_input::old_compute_kick();
+            if old_order {
+                host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
+            }
             if self.graph.m5 {
                 // macOS's order on this firmware: the host-port transaction, with core gating
                 // held off across it (Host::submit_m5), then the work doorbell. Rung first, the
@@ -3124,7 +3128,9 @@ impl Queue {
                     qid, self.kick.low_va(), policy.priority(),
                     first || notify_activation)?)?;
             }
-            host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
+            if !old_order {
+                host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
+            }
             crate::g17::trace::publish(crate::g17::trace::COMPUTE, qid, ordinal, &packet);
             host.note_submission()
         })();

@@ -18,7 +18,14 @@ unsafe extern "C" {
     fn asahi_g17_merge_fences(fences: *const *mut bindings::dma_fence, count: usize)
         -> *mut bindings::dma_fence;
     fn asahi_g17_local_inputs() -> u32;
+    fn asahi_g17_compute_kick_mode() -> u32;
     fn asahi_g17_render_submit() -> u32;
+}
+
+/// Measurement only: restore the pre-held-order path for a same-boot comparison.
+pub(crate) fn old_compute_kick() -> bool {
+    // SAFETY: Reads a module parameter word.
+    unsafe { asahi_g17_compute_kick_mode() == 1 }
 }
 
 /// Measurement only: `aurora.gpubench_local_inputs` (0 general, 1 own queue first, 2 ring order).

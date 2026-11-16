@@ -1611,7 +1611,11 @@ impl compute::Host for ComputeHost<'_> {
     fn submit_m5(&mut self, submission: &super::fw::m5::queue::HardwareSubmission) -> Result {
         // Compute only (publication and installation); render pairs submit through
         // Firmware::submit_m5_render_pair, which keeps its own order.
-        self.regs.submit_m5_work_held(submission)
+        if super::sync_input::old_compute_kick() {
+            self.regs.submit_m5_work(submission)
+        } else {
+            self.regs.submit_m5_work_held(submission)
+        }
     }
 }
 
