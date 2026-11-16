@@ -13,7 +13,8 @@ use core::ops::Range;
 use core::ptr::NonNull;
 use core::sync::atomic::{
     AtomicU32,
-    AtomicU64, //
+    AtomicU64,
+    Ordering, //
 };
 
 use kernel::{
@@ -504,6 +505,70 @@ const POOL_FAMILIES: usize = 5;
 const POOL_SLOTS: usize = 64;
 const POOL_BYTES: usize = 128 * 1024 * 1024;
 
+/// How far the address of a cached work state reached the firmware, which decides the fence
+/// the object waits for when it comes back (see `Pool::return_object`). Set only on the
+/// A18 Pro ([`super::fw::Variant::objects_after_release`]): the lease of each cached work state
+/// carries one, and its context updates it whenever it hands the address out or lets go of it.
+pub(crate) struct ReturnMark(AtomicU64);
+
+/// Work-state return classes, counted in the capacity snapshot.
+const RETURN_UNSEEN: usize = 0;
+const RETURN_RELEASED: usize = 1;
+const RETURN_STRICT: usize = 2;
+
+impl ReturnMark {
+    /// The address never left its context: no record or command names the object.
+    const UNSEEN: u64 = 0;
+    /// A queue record or command may name the object.
+    const STRICT: u64 = u64::MAX - 1;
+    /// A compute queue record kept installed after its owner let go named the object. The
+    /// record is rewritten when the queue is bound again, possibly for another VM, and no
+    /// control record shows when the firmware stops following the old one, so the object
+    /// keeps the strict fence whatever its owner does later. Any other value is the
+    /// control-ring witness at which the owner's release was found consumed.
+    const RETAINED: u64 = u64::MAX;
+
+    fn new() -> Self {
+        Self(AtomicU64::new(Self::UNSEEN))
+    }
+
+    /// The address is being written to a queue record or command.
+    pub(crate) fn expose(&self) {
+        let _ = self.0.fetch_update(Ordering::AcqRel, Ordering::Acquire, |mark| {
+            (mark != Self::STRICT && mark != Self::RETAINED).then_some(Self::STRICT)
+        });
+    }
+
+    /// A queue record that outlives its owner names the object (see `RETAINED`).
+    pub(crate) fn retain(&self) {
+        self.0.store(Self::RETAINED, Ordering::Release);
+    }
+
+    /// The firmware has consumed the owner's scheduler release, `witnessed` control records
+    /// in, and the owner's work list was empty. Only an exposed object changes: an unseen one
+    /// needs no fence and a retained one keeps the strict fence.
+    pub(crate) fn released(&self, witnessed: u64) {
+        let _ = self.0.compare_exchange(
+            Self::STRICT,
+            witnessed.clamp(1, Self::STRICT - 1),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    /// The return class of a work state and the fence it waits for. One without a mark keeps
+    /// the strict fence.
+    fn fence(mark: Option<&Self>) -> (usize, u64) {
+        match mark.map_or(Self::STRICT, |mark| mark.0.load(Ordering::Acquire)) {
+            Self::UNSEEN => (RETURN_UNSEEN, 0),
+            // The fence 34b438de added for an M4 Pro crash on a recycled work state.
+            Self::STRICT | Self::RETAINED => (RETURN_STRICT, super::channel::control_fence()),
+            // Already met: the witness only grows.
+            witnessed => (RETURN_RELEASED, witnessed),
+        }
+    }
+}
+
 struct Retained {
     object: KernelObject,
     prefix: usize,
@@ -529,8 +594,12 @@ struct PoolInner {
     kept_reserved: usize,
     /// Objects returned so far, ordering the reuse cache.
     returns: u64,
-    /// Reuses that had to take an object whose fence the firmware had not met yet.
-    fence_overruns: u64,
+    /// Reuses that had to take an object whose fence the firmware had not met yet, per family.
+    fence_overruns: [u64; POOL_FAMILIES],
+    /// Fresh objects left uncached because their family had no room, per family.
+    uncached: [u64; POOL_FAMILIES],
+    /// Work states returned per class (see `ReturnMark::fence`); only the A18 Pro counts.
+    work_returns: [u64; 3],
 }
 
 /// Retained objects past this many are still retained, with one warning.
@@ -543,6 +612,8 @@ const KEPT_WARN: usize = 256;
 pub(crate) struct Pool {
     #[pin]
     inner: kernel::sync::Mutex<PoolInner>,
+    /// [`super::fw::Variant::objects_after_release`].
+    after_release: bool,
 }
 
 struct CacheLease {
@@ -551,6 +622,8 @@ struct CacheLease {
     prefix: usize,
     cpu: CpuMap,
     poisoned: bool,
+    /// A work state's [`ReturnMark`], on the A18 Pro.
+    mark: Option<kernel::sync::Arc<ReturnMark>>,
 }
 
 /// A firmware object whose cached mapping is returned to its device pool
@@ -585,6 +658,11 @@ impl PooledObject {
             self.keep = Some((pool.clone(), reserved));
         }
     }
+
+    /// The mark its owner keeps up to date, for a cached work state on the A18 Pro.
+    pub(crate) fn return_mark(&self) -> Option<kernel::sync::Arc<ReturnMark>> {
+        self.lease.as_ref().and_then(|lease| lease.mark.clone())
+    }
 }
 
 impl Drop for PooledObject {
@@ -604,7 +682,7 @@ impl Drop for PooledObject {
 }
 
 impl Pool {
-    pub(crate) fn new() -> Result<kernel::sync::Arc<Self>> {
+    pub(crate) fn new(after_release: bool) -> Result<kernel::sync::Arc<Self>> {
         let mut returned = KVec::with_capacity(POOL_FAMILIES * POOL_SLOTS, GFP_KERNEL)?;
         for _ in 0..POOL_FAMILIES * POOL_SLOTS {
             returned.push(None, GFP_KERNEL)?;
@@ -613,8 +691,10 @@ impl Pool {
             pin_init!(Self {
                 inner <- kernel::new_mutex!(PoolInner {
                     returned, reserved: [0; POOL_FAMILIES], bytes: 0, stopped: false, kept: KVec::new(),
-                    kept_bytes: 0, kept_reserved: 0, returns: 0, fence_overruns: 0,
+                    kept_bytes: 0, kept_reserved: 0, returns: 0, fence_overruns: [0; POOL_FAMILIES],
+                    uncached: [0; POOL_FAMILIES], work_returns: [0; 3],
                 }, "g17::object::Pool"),
+                after_release,
             }),
             GFP_KERNEL,
         )
@@ -625,9 +705,10 @@ impl Pool {
     ///
     /// The firmware may still follow a previous owner's pointers into a returned object
     /// until it has processed that owner's release. Reuse takes the matching object
-    /// returned longest ago once the firmware consumed a control record published after
-    /// its return; a younger one is reused only when the family has no room for a fresh
-    /// cached object, because an uncached one is unmapped as soon as its owner drops it.
+    /// returned longest ago once its fence is met (see `return_object`); a younger one is
+    /// reused only when the family has no room for a fresh cached object, because an
+    /// uncached one is unmapped as soon as its owner drops it. On the A18 Pro a work state is
+    /// never reused before its fence: with no room, a fresh one stays uncached instead.
     pub(crate) fn allocate(
         self: &kernel::sync::Arc<Self>,
         alloc: &Allocator<'_>,
@@ -640,6 +721,14 @@ impl Pool {
         let family_index = family as usize;
         let begin = family_index * POOL_SLOTS;
         let witnessed = super::channel::control_witnessed();
+        // On the A18 Pro a cached work state carries a ReturnMark, allocated before an entry is
+        // taken so that a failure loses no returned object, and is never reused before its fence.
+        let marked = self.after_release && family == Family::WorkState;
+        let mark = if marked {
+            Some(kernel::sync::Arc::new(ReturnMark::new(), GFP_KERNEL)?)
+        } else {
+            None
+        };
         let reused = {
             let mut inner = self.inner.lock();
             if inner.stopped {
@@ -665,9 +754,9 @@ impl Pool {
                 }
             }
             match oldest {
-                Some((index, _, ready)) if ready || !room => {
+                Some((index, _, ready)) if ready || (!room && !marked) => {
                     if !ready {
-                        inner.fence_overruns += 1;
+                        inner.fence_overruns[family_index] += 1;
                     }
                     inner.returned[index].take()
                 }
@@ -680,6 +769,7 @@ impl Pool {
             prefix,
             cpu,
             poisoned: false,
+            mark: mark.clone(),
         };
         if let Some(mut entry) = reused {
             entry.object.bytes_mut().fill(0);
@@ -702,6 +792,7 @@ impl Pool {
                     .checked_add(size)
                     .is_none_or(|bytes| bytes > POOL_BYTES)
             {
+                inner.uncached[family_index] += 1;
                 false
             } else {
                 inner.reserved[family_index] += 1;
@@ -756,7 +847,24 @@ impl Pool {
         let begin = family * POOL_SLOTS;
         inner.returns += 1;
         let order = inner.returns;
-        let fence = super::channel::control_fence();
+        let fence = match lease.family {
+            // On the A18 Pro a work state's owner records how far its address reached the
+            // firmware: one never named needs no fence, and one whose owner's release was
+            // consumed with an empty work list is reused at once. One a record or command may
+            // still name keeps the strict fence.
+            Family::WorkState if self.after_release => {
+                let (class, fence) = ReturnMark::fence(lease.mark.as_deref());
+                inner.work_returns[class] += 1;
+                fence
+            }
+            // These families come back only after their owner's release was consumed, or
+            // unseen by the firmware.
+            Family::Descriptor | Family::QueueState | Family::QueueConfig if self.after_release => {
+                super::channel::control_published()
+            }
+            // Scheduler pages, and every family on the other GPUs.
+            _ => super::channel::control_fence(),
+        };
         for slot in &mut inner.returned[begin..begin + POOL_SLOTS] {
             if slot.is_none() {
                 *slot = Some(Retained {
@@ -857,17 +965,23 @@ impl Pool {
 impl Pool {
     pub(crate) fn write_capacity(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
         let inner = self.inner.lock();
+        let witnessed = super::channel::control_witnessed();
         for family in 0..POOL_FAMILIES {
             let entries = &inner.returned[family * POOL_SLOTS..(family + 1) * POOL_SLOTS];
-            writeln!(f, "cached_objects_{} used={} total={} returned={} poisoned={}", family,
-                     inner.reserved[family], POOL_SLOTS, entries.iter().flatten().count(),
-                     entries.iter().flatten().filter(|entry| entry.poisoned).count())?;
+            writeln!(f, concat!("cached_objects_{} used={} total={} returned={} poisoned={} ",
+                                "waiting={} overruns={} uncached={}"),
+                     family, inner.reserved[family], POOL_SLOTS, entries.iter().flatten().count(),
+                     entries.iter().flatten().filter(|entry| entry.poisoned).count(),
+                     entries.iter().flatten().filter(|entry| entry.fence > witnessed).count(),
+                     inner.fence_overruns[family], inner.uncached[family])?;
         }
         writeln!(f, "cached_object_bytes used={} total={}", inner.bytes, POOL_BYTES)?;
-        let witnessed = super::channel::control_witnessed();
         writeln!(f, "cached_objects_fenced waiting={} overruns={}",
                  inner.returned.iter().flatten().filter(|entry| entry.fence > witnessed).count(),
-                 inner.fence_overruns)?;
+                 inner.fence_overruns.iter().sum::<u64>())?;
+        writeln!(f, "workstate_returns unseen={} released={} strict={}",
+                 inner.work_returns[RETURN_UNSEEN], inner.work_returns[RETURN_RELEASED],
+                 inner.work_returns[RETURN_STRICT])?;
         writeln!(f, "firmware_linked_objects kept={} bytes={}", inner.kept.len(), inner.kept_bytes)
     }
 }
