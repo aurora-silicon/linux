@@ -1202,7 +1202,18 @@ void ___cfg80211_scan_done(struct cfg80211_registered_device *rdev,
 
 void __cfg80211_scan_done(struct wiphy *wiphy, struct wiphy_work *wk)
 {
-	___cfg80211_scan_done(wiphy_to_rdev(wiphy), true);
+	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
+	struct cfg80211_scan_request_int *req =
+		rdev->int_scan_req ? rdev->int_scan_req : rdev->scan_req;
+
+	/*
+	 * Queued for the held-back message of a stale request (see
+	 * cfg80211_scan_done()) that has been sent meanwhile: do not complete
+	 * a newer scan that the driver has not finished.
+	 */
+	if (!rdev->scan_msg && req && !req->notified)
+		return;
+	___cfg80211_scan_done(rdev, true);
 }
 
 void cfg80211_scan_done(struct cfg80211_scan_request *request,
@@ -1223,6 +1234,13 @@ void cfg80211_scan_done(struct cfg80211_scan_request *request,
 		 * it was just kept around for the driver - done now, free it.
 		 */
 		kfree(intreq);
+		/*
+		 * If the netdev went down while the driver was scanning, the
+		 * result message is still held back in rdev->scan_msg until the
+		 * driver is done, which is now. Only the scan_done work sends
+		 * and clears it; while it is set, every new scan gets -EBUSY.
+		 */
+		wiphy_work_queue(&rdev->wiphy, &rdev->scan_done_wk);
 		return;
 	}
 
