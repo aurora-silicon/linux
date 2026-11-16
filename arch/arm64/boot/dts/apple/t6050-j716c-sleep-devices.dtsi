@@ -143,3 +143,16 @@
 	apple,gapf-slice = <0x780>;
 	apple,gapf-slice-values = <0x12 0x2>;
 };
+
+/*
+ * The internal panel's size, which the driver needs to treat it as a panel (backlight level,
+ * the sleep's relighting): 3456 x 2234 pixels at the J714s's 0.1 mm pitch, 2160 rows below
+ * the camera housing.
+ */
+&dcp {
+	panel {
+		width-mm = <345>;
+		height-mm = <223>;
+		adj-height-mm = <216>;
+	};
+};
