@@ -537,6 +537,7 @@ struct device {};
 struct device_attribute {
     struct { const char *name; unsigned mode; } attr;
     ssize_t (*show)(struct device*,struct device_attribute*,char*);
+    ssize_t (*store)(struct device*,struct device_attribute*,const char*,size_t);
 };
 struct notifier_block { int (*notifier_call)(struct notifier_block*,unsigned long,void*); };
 #define PM_SUSPEND_PREPARE 1
@@ -548,6 +549,21 @@ struct notifier_block { int (*notifier_call)(struct notifier_block*,unsigned lon
 #define NOTIFY_OK 1
 #define ENODEV 19
 #define ENOMEM 12
+#define EINVAL 22
+#define PAGE_SHIFT 12
+#define WRITE_ONCE(x,v) ((x)=(v))
+#define DEFINE_MUTEX(n) int n
+#define mutex_lock(m) ((void)(m))
+#define mutex_unlock(m) ((void)(m))
+#define dev_info(dev,...) ((void)(dev))
+static unsigned long totalram_pages(void) { return 1UL<<18; }
+static u64 div64_u64(u64 a,u64 b) { return a/b; }
+static u64 mul_u64_u32_div(u64 a,u32 b,u32 c) { return (u64)((unsigned __int128)a*b/c); }
+static int kstrtou32(const char *s,unsigned base,u32 *res) {
+    char *end;unsigned long v=strtoul(s,&end,base);
+    if(end==s || (*end && !(*end=='\n' && !end[1]))) return -EINVAL;
+    *res=(u32)v;return 0;
+}
 #define BUILD_BUG_ON(x) _Static_assert(!(x),#x)
 #define kzalloc_obj(x) calloc(1,sizeof(x))
 #define sysfs_attr_init(x) ((void)0)
@@ -653,6 +669,21 @@ int main(void) {
     assert(suspend_calls==11);
     asahi_sysfs_unregister(&dev,handle);
     assert(removed==1);
+    /* gpu_mem_limit_pct: 1 GiB of RAM; 50 sets both limits, over 95 clamps, 0 restores the boot limits. */
+    struct asahi_gpu_memory limits={.limit=7777,.client_limit=3333};
+    assert(!asahi_sysfs_register(&dev,&snap,1,&limits,&handle,NULL,NULL,NULL));
+    struct asahi_stats_attribute *limit_stats=handle;
+    char pct[16];
+    assert(limit_stats->limit_attr.store(&dev,&limit_stats->limit_attr,"50\n",3)==3);
+    assert(limits.limit==536870912 && limits.client_limit==536870912);
+    assert(limit_stats->limit_attr.show(&dev,&limit_stats->limit_attr,pct)==3 && !strcmp(pct,"50\n"));
+    assert(limit_stats->limit_attr.store(&dev,&limit_stats->limit_attr,"200",3)==3);
+    assert(limits.limit==1020054732 && limits.client_limit==1020054732);
+    assert(limit_stats->limit_attr.store(&dev,&limit_stats->limit_attr,"abc",3)==-EINVAL);
+    assert(limits.limit==1020054732);
+    assert(limit_stats->limit_attr.store(&dev,&limit_stats->limit_attr,"0",1)==1);
+    assert(limits.limit==7777 && limits.client_limit==3333);
+    asahi_sysfs_unregister(&dev,handle);
     for(int failure=1;failure<=2;failure++) {
         created=0;fail_file=failure;handle=NULL;
         assert(asahi_sysfs_register(&dev,&snap,1,&memory,&handle,read_stats,suspend_stats,NULL)==-12);
@@ -761,8 +792,11 @@ fn write_power(_: &super::Firmware, f:&mut kernel::fmt::Formatter<'_>)->kernel::
     for signature in ['struct asahi_stats_snapshot', 'struct asahi_gpu_memory', 'struct asahi_stats_attribute']:
         pieces.append(item(source, signature) + ';')
     pieces.append(item(baseline, 'static ssize_t agx_stats_show').replace('agx_stats_show(', 'old_agx_stats_show(', 1))
+    pieces += [line for line in source.splitlines()
+               if line.startswith(('#define ASAHI_GPU_MEM_LIMIT_PCT_MAX', 'static DEFINE_MUTEX(asahi_limit_lock)'))]
     for signature in ['static const char *asahi_stats_quality', 'static ssize_t agx_qualified_stats_show',
                       'static int asahi_stats_pm_notify', 'static ssize_t agx_stats_show',
+                      'static ssize_t gpu_mem_limit_pct_show', 'static ssize_t gpu_mem_limit_pct_store',
                       'int asahi_sysfs_register(', 'void asahi_sysfs_unregister(']:
         pieces.append(item(source, signature))
     pieces.append(C_TESTS)
