@@ -261,8 +261,12 @@ static int dcp_v27_rtkit_cycle(struct apple_dcp *dcp, unsigned int pause_ms)
 	u32 status, run_status = 0;
 	int ret;
 
-	/* A cancelled suspend must keep the inherited firmware session running. */
-	if (!pm_resume_via_firmware())
+	/*
+	 * A cancelled suspend must keep the inherited firmware session running, unless it is an
+	 * external processor's that already took its sleep step: that session does not report a
+	 * display plugged again until it is restarted, as after a real wake.
+	 */
+	if (!pm_resume_via_firmware() && !(ext && s && s->phase == V27_PREPARED))
 		return -EPERM;
 	if (s && s->cycle_failed)
 		return -ECANCELED;
@@ -582,7 +586,7 @@ static unsigned long dcp_v27_ext_round(struct apple_dcp *dcp)
 	 * sessions opened. Here with its DART, PMC bits and power words as there
 	 * (dcp_v27_rtkit_cycle()), and without the pause.
 	 */
-	if (pm_resume_via_firmware() && v27_ext_cycles) {
+	if ((pm_resume_via_firmware() || dcp->sleep_v27->phase == V27_PREPARED) && v27_ext_cycles) {
 		int ret = dcp_v27_ext_cycle_ready(dcp);
 
 		if (!ret) {
