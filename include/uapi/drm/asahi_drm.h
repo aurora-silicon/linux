@@ -291,6 +291,10 @@ enum drm_asahi_feature {
 	 * toggled. Therefore, it is exposed as a feature bit and not a
 	 * userspace-settable flag on the VM. When soft fault is enabled,
 	 * userspace can speculate memory accesses more aggressively.
+	 *
+	 * On G17 GPUs the first 0x74000 bytes of a VM are not unmapped memory:
+	 * they hold the views of the execution context, which the kernel and
+	 * userspace map there. Loads from them return the context's data.
 	 */
 	DRM_ASAHI_FEATURE_SOFT_FAULTS = (1UL) << 0,
 

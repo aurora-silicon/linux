@@ -2561,13 +2561,16 @@ impl gpu::Gpu for Gpu {
         true
     }
 
-    /// The G17 runtime never programs fault_control into the firmware, so unmapped reads are not
-    /// guaranteed to return zero. Advertising soft faults made Mesa point out-of-bounds vec3/vec4
-    /// vertex fetches at address 0 and skip bounds checks on bounded loads; on T6040 those reads
-    /// returned non-zero data (2026-10-19: every robustness2 rgba32 vertex_attribute_fetch case
-    /// failed; all pass with soft faults off).
+    /// The G17 firmware takes no fault_control. Its own fault mode gives soft faults: a shader
+    /// load of an unmapped client address returns zero and a store or atomic to one is dropped,
+    /// with no fault reported (measured on the M4 Pro, firmware 25G83). The driver gives every
+    /// queue of the family the same fault setting, 1 in `QueueConfig::unk_66`, the word the M5
+    /// firmware names soft_fault_enabled, so this is not a per-SoC property. Advertise it unless
+    /// fault_control asks for anything else. The first 0x74000 bytes of a client VM are mapped,
+    /// not unmapped memory: they hold the execution context's views (`CONTEXT_VIEWS`, the null
+    /// view at address 0).
     fn supports_soft_faults(&self) -> bool {
-        false
+        crate::module_parameters::fault_control.value() == 0xb
     }
 
     fn queue_limits(&self) -> Option<uapi::drm_asahi_queue_limits> {
