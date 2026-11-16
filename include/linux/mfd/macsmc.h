@@ -144,6 +144,8 @@ struct apple_smc {
 	bool polled;
 	/* Registered with the sleep controller, whose last stops can send the sleep commit. */
 	bool commit_at_stop;
+	/* Its gaps there in ms: the warning to slpa, slpa to the idle notice, after the notice */
+	unsigned int stop_warn_ms, stop_arm_ms, stop_idle_ms;
 	/* MBSW at the last wake: what the SMC had woken the AP for. */
 	u64 wake_record;
 	/* MBSW's bits as this SoC numbers them, from the probe. */

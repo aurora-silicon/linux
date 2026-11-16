@@ -94,6 +94,15 @@ static const struct mfd_cell apple_smc_t6050_described_devs[] = {
 };
 
 /* What this driver has to know of one SoC's SMC that the others do not share. */
+/* The gaps macOS leaves before the AP idle notice and after it. */
+#define SMC_SLEEP_ARM_MS	6
+#define SMC_SLEEP_IDLE_MS	30
+/*
+ * Between the warning and slpa. Sleeps with 150-500 ms between them ran to the alarm;
+ * 770 ms is known to work.
+ */
+#define SMC_SLEEP_WARN_MS	200
+
 struct apple_smc_hw {
 	/*
 	 * The SMC takes the WKTP key at the sleep request and once a wake is a
@@ -106,11 +115,34 @@ struct apple_smc_hw {
 	 * apple_smc_last_stop().
 	 */
 	bool commit_at_stop;
+	/*
+	 * With commit_at_stop: the sequence goes after every other coprocessor's stop instead of
+	 * before them, and the gaps in ms from the warning to slpa, from slpa to the AP idle
+	 * notice, and after the notice (0: SMC_SLEEP_WARN_MS, _ARM_MS, _IDLE_MS).
+	 */
+	bool stop_last;
+	u16 warn_ms, arm_ms, idle_ms;
 };
 
 static const struct apple_smc_hw apple_smc_t6041_hw = {
 	.wktp = true,
 	.commit_at_stop = true,
+};
+
+/*
+ * T8142 (J813/J815). macOS 27.2.1 (26B131) on J815, traced: MBSE = slpw 478.6 ms before the
+ * S2R timer, ahead of the displays; pmVC 175 ms later; after the GPU, SEP, ANS, SIO and PMP
+ * sleeps MBSE = slpa (44.2 ms), the AP idle notice 3.0 ms after it, and 41.2 ms to the timer.
+ * Here the whole sequence is the last stop, so the warning is sent where the commit is, behind
+ * every refusal, as on T6041, with macOS's 434 ms from it to slpa. pmVC is left out: its value
+ * is in the SMC's shared memory, which the trace doesn't have. No WKTP: not in the trace.
+ */
+static const struct apple_smc_hw apple_smc_t8142_hw = {
+	.commit_at_stop = true,
+	.stop_last = true,
+	.warn_ms = 434,
+	.arm_ms = 3,
+	.idle_ms = 41,
 };
 
 static int apple_smc_add_described_devices(struct apple_smc *smc, const struct mfd_cell *cells,
@@ -779,9 +811,14 @@ static int apple_smc_probe(struct platform_device *pdev)
 	 * or no room in its table) the noirq suspend commits, as on every other SoC.
 	 */
 	if (hw && hw->commit_at_stop &&
-	    !apple_sleep_coproc_register_first(dev, APPLE_SLEEP_FIRST_SMC, apple_smc_last_stop,
-					       smc)) {
+	    !(hw->stop_last ?
+	      apple_sleep_coproc_register_last(dev, apple_smc_last_stop, smc) :
+	      apple_sleep_coproc_register_first(dev, APPLE_SLEEP_FIRST_SMC, apple_smc_last_stop,
+						smc))) {
 		smc->commit_at_stop = true;
+		smc->stop_warn_ms = hw->warn_ms ?: SMC_SLEEP_WARN_MS;
+		smc->stop_arm_ms = hw->arm_ms ?: SMC_SLEEP_ARM_MS;
+		smc->stop_idle_ms = hw->idle_ms ?: SMC_SLEEP_IDLE_MS;
 		ret = devm_add_action_or_reset(dev, apple_smc_last_stop_unregister, smc);
 		if (ret)
 			return ret;
@@ -910,6 +947,7 @@ static const struct of_device_id apple_smc_of_match[] = {
 	{ .compatible = "apple,t8152-smc" },
 	{ .compatible = "apple,t6050-smc" },
 	{ .compatible = "apple,t6041-smc", .data = &apple_smc_t6041_hw },
+	{ .compatible = "apple,t8142-smc", .data = &apple_smc_t8142_hw },
 	{ .compatible = "apple,t8103-smc" },
 	{ .compatible = "apple,smc" },
 	{},
@@ -940,15 +978,6 @@ MODULE_DEVICE_TABLE(of, apple_smc_of_match);
  * with interrupts off, one CPU up and every refusal behind it, the whole sequence is sent
  * from there, ahead of the other coprocessors' stops: apple_smc_last_stop().
  */
-
-/* The gaps macOS leaves before the AP idle notice and after it. */
-#define SMC_SLEEP_ARM_MS	6
-#define SMC_SLEEP_IDLE_MS	30
-/*
- * Between the warning and slpa. Sleeps with 150-500 ms between them ran to the alarm;
- * 770 ms is known to work.
- */
-#define SMC_SLEEP_WARN_MS	200
 
 /* After the debug link's cut. No message came in it in any logged sleep. */
 #define SMC_OUTBOX_QUIET_MS	100
@@ -1827,7 +1856,7 @@ static int apple_smc_last_stop(void *data)
 	smc->sleep_warned = true;
 	if (apple_smc_stop_dead(err))
 		goto dead;
-	apple_smc_outbox_poll(smc, "sleep warning at the last stop", SMC_SLEEP_WARN_MS, 0);
+	apple_smc_outbox_poll(smc, "sleep warning at the last stop", smc->stop_warn_ms, 0);
 
 	/* As in apple_smc_sleep_commit(). */
 	smc->wake_silent = true;
@@ -1841,7 +1870,7 @@ static int apple_smc_last_stop(void *data)
 	err = err ?: ret;
 	if (apple_smc_stop_dead(ret))
 		goto dead;
-	mdelay(SMC_SLEEP_ARM_MS);
+	mdelay(smc->stop_arm_ms);
 
 	/* Not taken back if the notice fails: the sleep goes on, and its wake sends the other. */
 	smc->ap_notified = true;
@@ -1849,7 +1878,7 @@ static int apple_smc_last_stop(void *data)
 	if (ret)
 		dev_err(smc->dev, "SMC did not take the sleep notice at the last stop: %d\n", ret);
 	else
-		mdelay(SMC_SLEEP_IDLE_MS);
+		mdelay(smc->stop_idle_ms);
 	err = err ?: ret;
 	goto out;
 

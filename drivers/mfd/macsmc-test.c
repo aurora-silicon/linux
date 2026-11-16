@@ -557,13 +557,15 @@ static void macsmc_last_stop_late_test(struct kunit *test)
 static void macsmc_notice_test(struct kunit *test)
 {
 	struct macsmc_test_context *ctx = test->priv;
+	bool mbsw = false;
 
 	kunit_activate_static_stub(test, apple_smc_ap_power, macsmc_test_ap_power);
 	ctx->result = 8;
 
 	/* The test trigger writes no MBSE value: those announce a real sleep. */
 	KUNIT_EXPECT_EQ(test, apple_smc_notice_idle(&ctx->smc), 0);
-	apple_smc_notice_on(&ctx->smc);
+	/* The stub has no MBSE value: only the order is checked here. */
+	apple_smc_notice_on(&ctx->smc, &mbsw);
 	KUNIT_ASSERT_EQ(test, ctx->seen_count, 4U);
 	KUNIT_EXPECT_EQ(test, ctx->seen[0], (u32)MACSMC_TEST_AP_IDLE);
 	KUNIT_EXPECT_EQ(test, ctx->seen[1], (u32)MACSMC_TEST_AP_ON);
