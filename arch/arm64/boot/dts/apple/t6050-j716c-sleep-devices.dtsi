@@ -38,3 +38,22 @@
 	apple,sleep-power-args = [01 00 00 01 01 00 00 00];
 	apple,sleep-a500-args = [00 01 00 00 00 00 00 00];
 };
+
+/* The port controllers take system power state S3 for a firmware suspend, then SLEEP. */
+&hpm0 {
+	apple,sleep-ssps;
+};
+
+&hpm1 {
+	apple,sleep-ssps;
+};
+
+&hpm2 {
+	apple,sleep-ssps;
+};
+
+/* MagSafe's controller registers its port and power supply and follows the sleep too. */
+&hpm5 {
+	apple,sleep-ssps;
+	status = "okay";
+};
