@@ -25,11 +25,11 @@ properties:
 
   reg:
     minItems: 25
-    maxItems: 36
+    maxItems: 41
 
   reg-names:
     minItems: 25
-    maxItems: 36
+    maxItems: 41
 
   apple,wake-enable:
     $ref: /schemas/types.yaml#/definitions/uint32-array
@@ -83,7 +83,12 @@ properties:
       the wake.
 
   apple,radio-perst:
-    maxItems: 1
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    items:
+      - items:
+          - description: Phandle of the radio GPIO controller.
+          - description: Pin number.
+          - description: GPIO flags.
     description:
       The GPIO that drives the radio's PERST#, held across that retraining.
 
@@ -192,8 +197,9 @@ allOf:
       properties:
         reg:
           minItems: 36
-          maxItems: 36
+          maxItems: 41
         reg-names:
+          minItems: 36
           items:
             - const: ps
             - const: pwrgate
@@ -231,6 +237,11 @@ allOf:
             - const: mcc6
             - const: mcc7
             - const: mem-clk
+            - const: clk-slots
+            - const: amcc-cfg0
+            - const: amcc-cfg1
+            - const: amcc-cfg2
+            - const: amcc-cfg3
   - if:
       not:
         properties:
