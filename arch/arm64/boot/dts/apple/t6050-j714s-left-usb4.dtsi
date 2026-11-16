@@ -49,6 +49,8 @@
 &{/soc@200000000} {
 	/* /arm-io/acio-cpu1 reg[0]: the router CPU's mailbox, inside its wrapper */
 	acio1_mbox: mailbox@2a9108000 {
+		/* This board enables the shared, disabled router inventory. */
+		status = "okay";
 		compatible = "apple,t6050-asc-mailbox", "apple,asc-mailbox-v4";
 		reg = <0x2 0xa9108000 0x0 0x4000>;
 		interrupts = <AIC_IRQ 0 847 IRQ_TYPE_LEVEL_HIGH>,
@@ -61,6 +63,8 @@
 	};
 
 	acio1: acio@2a9ac0000 {
+		/* This board enables the shared, disabled router inventory. */
+		status = "okay";
 		compatible = "apple,t6050-usb4-acio";
 		reg = <0x2 0xa9ac0000 0x0 0xc000>,
 		      <0x2 0xa9080000 0x0 0x26000>,
