@@ -38,6 +38,8 @@ struct apple_sleep_smc_saved_ops {
 
 #if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP)
 const struct apple_sleep_smc_policy *apple_sleep_smc_policy(void);
+/* J813 experiment: send the final SMC notice after the peer idle handshakes. */
+bool apple_sleep_smc_defer_notice(void);
 int apple_sleep_smc_register(struct device *dev,
 	int (*late_notice)(void *data, u64 *sent, u64 *ack), void *data);
 int apple_sleep_smc_register_saved(struct device *dev,
@@ -241,6 +243,7 @@ void apple_sleep_restore_pins(void);
 int apple_sleep_engine_reset(struct device *dev);
 #else
 static inline const struct apple_sleep_smc_policy *apple_sleep_smc_policy(void) { return NULL; }
+static inline bool apple_sleep_smc_defer_notice(void) { return false; }
 static inline int apple_sleep_smc_register(struct device *dev,
 	int (*late_notice)(void *data, u64 *sent, u64 *ack), void *data) { return -EOPNOTSUPP; }
 static inline int apple_sleep_smc_register_saved(struct device *dev,
