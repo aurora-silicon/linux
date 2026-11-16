@@ -1231,7 +1231,10 @@ static void dcp_panel_read_adt(struct apple_dcp *dcp)
 		dcp->panel.height_mm = panel.height_mm;
 	if (dcp->panel_identity)
 		dcp->panel_identity->adt = panel.identity;
-	dcp->panel.color_target = ret ? NULL : dcp_panel_gamut_color_space(panel.gamut);
+	if (ret || !dcp_panel_gamut_color_space(panel.gamut))
+		dev_info(dcp->dev, "panel ADT: no known colour gamut, EDID primaries default to Display P3\n");
+	dcp->panel.color_target =
+		dcp_panel_color_target(ret ? DCP_PANEL_GAMUT_UNSPECIFIED : panel.gamut);
 	if (desktop || dcp->fw_compat == DCP_FIRMWARE_V_27_0)
 		dcp->panel.edr_ceiling = dcp_edr_ceiling(panel.edr_potential_headroom);
 	/*
