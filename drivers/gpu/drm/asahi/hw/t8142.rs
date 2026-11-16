@@ -83,6 +83,9 @@ const BASE: Config = Config {
         deflake: crate::g17::fw::render::Deflake::ONE_CLUSTER,
         compute_blocks: crate::g17::fw::freelist::COMPUTE_BLOCKS,
     },
+    // TEST: the sleep's commit stops the firmware and a real wake restarts it warm, as on
+    // T8140. Not yet run through a real sleep on the J813.
+    sleep_restart: true,
     ..PROBE
 };
 
