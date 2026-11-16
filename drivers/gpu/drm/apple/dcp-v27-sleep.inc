@@ -1460,6 +1460,11 @@ static int dcp_v27_sleep_prepare(struct apple_dcp *dcp)
 	}
 	if (!dcp_v27_external(dcp) && !dcp->crtc)
 		return -ENODEV;
+	/* The sleep turns the panel's backlight off: without a level it stays off after it. */
+	if (!dcp_v27_external(dcp) && dcp_has_panel(dcp) && !dcp_backlight_active(dcp)) {
+		dev_info(dcp->dev, "V27 sleep: no backlight level to light the panel again\n");
+		return -EBUSY;
+	}
 	if (!dcp_v27_external(dcp) && !READ_ONCE(dcp->pipe_enabled_h17p))
 		return -EAGAIN; /* require the actual normal driver pipe-on ACK */
 	s->scanout = dcp->crtc ? dcp->crtc->base.dev->dev : NULL;

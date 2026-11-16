@@ -4801,12 +4801,15 @@ void dcp_poweron(struct platform_device *pdev)
 				WRITE_ONCE(dcp->crashed, true);
 				return;
 			}
-			/* The powerlog takeover report normally precedes this. */
-			if (dcp_has_panel(dcp))
-				queue_delayed_work(system_freezable_wq,
-						   &dcp->bl_fallback_wq,
-						   DCP_BL_FALLBACK_DELAY);
 		}
+		/*
+		 * The powerlog takeover report normally precedes this. A pipe adopted already
+		 * running (J716c) gets none either: without a level, a panel the firmware turned
+		 * off for a sleep could not be lit again.
+		 */
+		if (dcp_has_panel(dcp) && !dcp_backlight_active(dcp))
+			queue_delayed_work(system_freezable_wq, &dcp->bl_fallback_wq,
+					   DCP_BL_FALLBACK_DELAY);
 		/* The loader report or fallback may initialize the policy later. */
 		if (!dcp_backlight_active(dcp))
 			return;
