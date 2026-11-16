@@ -396,7 +396,7 @@ pub(crate) trait Gpu: Send + Sync {
                 | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS_MIRROR);
         }
         if self.supports_vm_status() && self.supports_vm_fence_error_count() {
-            flags |= uapi::DRM_ASAHI_FEATURE_VM_FENCE_ERROR_COUNT as u64;
+            flags |= crate::errc_uapi::DRM_ASAHI_FEATURE_VM_FENCE_ERROR_COUNT;
         }
         if self.queue_limits().is_some() {
             flags |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES);

@@ -11,6 +11,7 @@ mod cleanup;
 mod debug;
 mod driver;
 mod event;
+mod errc_uapi;
 mod file;
 mod float;
 mod fw;
