@@ -86,6 +86,7 @@ impl kernel::debugfs::Writer for View {
                 Err(error) => writeln!(f, "{} unavailable={:?}", name, error)?,
             }
         }
+        crate::queue_share::write_capacity(f, super::kick::queue_limit(self.0.variant.qid_floor))?;
         for (site, count) in [
             Site::ComputeReserve, Site::PhysicalQids, Site::RenderSlots, Site::LogicalQueues,
             Site::ComputeSlots, Site::QosIds, Site::ComputeItems, Site::RetiredRenderBindings,
