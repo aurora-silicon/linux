@@ -44,3 +44,27 @@ The remaining DT gate item is the GPU loader contract migration: qualify
 a loader supporting modern GPU paths, compatibles and resources, then
 update the DT and recheck GPU handoff and HDMI on hardware. Until then,
 preserve the compatibility DT and keep the PR draft while CI fails.
+
+Rebase onto current integration
+------------------------------
+
+The rebased stack starts at integration commit
+``677be395b9d2e15d98696107ebf88191f08efbf9``. It includes the shared,
+disabled ACIO routers from PR #1579, the adopted-link Clock PM policy
+from PR #1618, and the board changes from PR #1619. Satya Benson's
+original board series is consolidated into one commit; the original
+PRs and their branches remain unchanged.
+
+The rebase retains K114c in the existing Max router activation guards,
+keeps the current PCIe radio and SD helpers, and preserves the T8142
+ANE binding constraints alongside the separate T6050 layout. J714s and
+J716c board definitions explicitly retain their previously enabled
+routers and mailboxes after inheriting shared disabled nodes.
+The Clock PM host test exercises the production helper, including the
+locked and unlocked PCI APIs, failures, and the adopted-host gate.
+It does not exercise physical links or qualify other M5 boards.
+
+All hardware receipts above apply only to their stated revisions.
+Neither the rebased head nor its normal and ANE wrappers have a new
+hardware qualification. The GPU loader migration remains outstanding;
+this rebase does not authorize installation or replace those gates.
