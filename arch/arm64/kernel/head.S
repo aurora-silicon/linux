@@ -424,6 +424,28 @@ pen:	ldr	x4, [x3]
 	orr	x4, x4, #1
 	orr	x4, x4, #0x8000000000000000
 	msr_s	sys_reg(3, 5, 15, 6, 2), x4
+	/*
+	 * 2 = the sleep driver asked for the last WFI at EL1 (apple_sleep.el1_wfi=2): from EL2,
+	 * MMU off (as here), every exception masked, no traps, stage 2 off, fast IPIs acked.
+	 */
+	cmp	x5, #2
+	b.ne	2f
+	mrs	x4, CurrentEL
+	cmp	x4, #CurrentEL_EL2
+	b.ne	2f
+	mov	x4, #1
+	msr_s	sys_reg(3, 5, 15, 1, 1), x4
+	mov_q	x4, INIT_SCTLR_EL1_MMU_OFF
+	msr_s	SYS_SCTLR_EL12, x4
+	isb
+	mov_q	x4, (HCR_RW | HCR_E2H)
+	msr	hcr_el2, x4
+	mov	x4, #(PSR_MODE_EL1h | PSR_D_BIT | PSR_A_BIT | PSR_I_BIT | PSR_F_BIT)
+	msr	spsr_el2, x4
+	adr	x4, 2f
+	msr	elr_el2, x4
+	isb
+	eret
 2:	dsb	sy
 	isb
 	wfi
