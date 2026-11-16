@@ -546,6 +546,11 @@ impl Pair {
         let (scratch, metric) = self.memory.manager.scene_registers(scene)?;
         let timestamp_offset = self.memory.timestamp_offset(ordinal);
         let timestamp = self.memory.timestamps.gpu_va() + timestamp_offset as u64;
+        // Four clusters: tile small passes without clustering, as macOS does for most passes
+        // (segment control bit 0, no clustering buffers). Large ones stay clustered.
+        let cluster_pass = self.clusters <= 2
+            || (pass.width as usize).div_ceil(32) * (pass.height as usize).div_ceil(32)
+                >= CLUSTERED_MIN_TILES;
         let resources = abi::RenderResources {
             context_id: packet.context.id().try_into()?,
             // On M5 too: a directly owned execution root has one generation, which the
@@ -565,7 +570,16 @@ impl Pair {
             heapmeta_va: target.heap,
             tpc_va: self.memory.target.tpc_va(),
             tpc_size: layout.tpc_size as u64,
-            gtp_va: self.memory.target.gtp_va(&layout)?,
+            gtp_va: {
+                let mut gtp = self.memory.target.gtp_va(&layout)?;
+                if !cluster_pass {
+                    // No cluster tile maps and no clustering metadata 1-4.
+                    for index in [1, 4, 5, 6, 7] {
+                        gtp[index] = 0;
+                    }
+                }
+                gtp
+            },
             deflake_va: deflake,
             ta_status_va: ta_status,
             mesh_storage,
@@ -603,6 +617,7 @@ impl Pair {
             programs: self.variant.programs,
             ta_mode_1: self.variant.ta_mode_1,
             clusters: self.clusters,
+            cluster_pass,
             deflake: deflake_layout,
         };
         self.memory.graph.claim(ordinal)?;
@@ -666,6 +681,9 @@ struct RenderBarriers {
 /// The last fragment kick published on any pair: on the J813 the next tiling kick waits for it
 /// (see [`Pair::publish`]).
 static J813_LAST_FRAGMENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Smallest pass, in 32x32 tiles, that the four-cluster M4 Max tiles clustered.
+const CLUSTERED_MIN_TILES: usize = 256;
 
 fn render_barriers(
     fragment_stage: bool,

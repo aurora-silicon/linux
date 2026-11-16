@@ -401,6 +401,10 @@ pub(crate) struct RenderArgs<'a> {
     /// Clusters of the GPU: above two, clustered tiling takes the segment words of
     /// `fw::m5::target::cluster_control` instead of the two-cluster capture.
     pub(crate) clusters: u32,
+    /// Clustered tiling for this pass, on a GPU with more than two clusters. Off, the segment
+    /// control keeps its four-cluster word with bit 0 set and the pass has no clustering buffers,
+    /// as macOS 26.6.2 does for most passes on the 32-core M4 Max.
+    pub(crate) cluster_pass: bool,
     /// Deflake-buffer layout of the GPU.
     pub(crate) deflake: Deflake,
 }
@@ -765,7 +769,11 @@ fn ta_registers_25g83(
         (true, _) => (T6041_TA_MODE_1, 0, MIN_FREE_TVB_PAGES),
         // Four clusters (M4 Max): 0x280540 / 4, and 32 + 16 x clusters free pages.
         // macOS writes 0x5c free pages on the four-cluster 25G83 build, not the M5's 0x60.
-        (false, Some([control, index, _])) => (control, index, T6041_CLUSTERED_FREE_PAGES),
+        (false, Some([control, index, _])) => (
+            if args.cluster_pass { control } else { control | 1 },
+            index,
+            T6041_CLUSTERED_FREE_PAGES,
+        ),
         (false, None) => (VDM_SEGMENT_CONTROL, VDM_SEGMENT_INDEX, MIN_FREE_TVB_PAGES),
     };
     push(RegisterWrite::new(0x1c890, segment_control));
@@ -1871,6 +1879,7 @@ mod ta_mode_tests {
             programs: RegisterPrograms::V25G83,
             ta_mode_1: false,
             clusters: 2,
+            cluster_pass: true,
             deflake: Deflake::FOUR_CLUSTERS,
         }
     }
