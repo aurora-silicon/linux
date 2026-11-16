@@ -1455,6 +1455,8 @@ struct apple_nhi {
 	struct device *cio_pcie;
 	u8 cio_pd_suspended;
 	bool cio_prepared, cio_rtk_off, cio_cycled;
+	/* ATC2_CIO is down for a router's sleep in place, until the PHY's CIO mode is up again */
+	bool cio_router_pd_down;
 	void __iomem *pdf_base;
 
 	int *tx_irqs;
