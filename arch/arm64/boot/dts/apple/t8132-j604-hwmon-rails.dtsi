@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * T8132 J604 power channels published by the SMC.
+ * T8132 J604 power, voltage, current and temperature channels published by the SMC.
  *
- * Every readable float power key the J604's SMC updates on an idle macOS
- * desktop (macOS 26B123 key sweep: flt, 4 bytes, flags 0x85, value moving
- * between two reads 20 s apart) that the common laptop files do not list.
+ * Every readable float power, voltage, current and temperature key the
+ * J604's SMC updates on an idle macOS desktop (macOS 26B123 key sweep:
+ * flt, 4 bytes, flags 0x85, value moving between two reads 20 s apart)
+ * that the common laptop and board files do not list.
  * Only the backlight's consumer is proven on this machine: PBLR follows the
  * panel content and level (about 0.28 W on a full black and 2.2 W on a full
  * white window at the same level, 6.6 W at a high level). The other keys
@@ -203,5 +204,1030 @@
 	power-Pb0f {
 		apple,key-id = "Pb0f";
 		label = "SMC Pb0f";
+	};
+
+	voltage-VDMM {
+		apple,key-id = "VDMM";
+		label = "SMC VDMM";
+	};
+
+	voltage-VDMS {
+		apple,key-id = "VDMS";
+		label = "SMC VDMS";
+	};
+
+	voltage-VP0R {
+		apple,key-id = "VP0R";
+		label = "PMU VP0R";
+	};
+
+	voltage-VP0b {
+		apple,key-id = "VP0b";
+		label = "PMU VP0b";
+	};
+
+	voltage-VP1b {
+		apple,key-id = "VP1b";
+		label = "PMU VP1b";
+	};
+
+	voltage-VP2b {
+		apple,key-id = "VP2b";
+		label = "PMU VP2b";
+	};
+
+	voltage-VP3b {
+		apple,key-id = "VP3b";
+		label = "PMU VP3b";
+	};
+
+	voltage-VP4b {
+		apple,key-id = "VP4b";
+		label = "PMU VP4b";
+	};
+
+	voltage-VP7b {
+		apple,key-id = "VP7b";
+		label = "PMU VP7b";
+	};
+
+	voltage-VP9b {
+		apple,key-id = "VP9b";
+		label = "PMU VP9b";
+	};
+
+	voltage-VP9l {
+		apple,key-id = "VP9l";
+		label = "PMU VP9l";
+	};
+
+	voltage-VPbb {
+		apple,key-id = "VPbb";
+		label = "PMU VPbb";
+	};
+
+	voltage-VPeb {
+		apple,key-id = "VPeb";
+		label = "PMU VPeb";
+	};
+
+	voltage-VR4l {
+		apple,key-id = "VR4l";
+		label = "Rail VR4l";
+	};
+
+	voltage-VR5b {
+		apple,key-id = "VR5b";
+		label = "Rail VR5b";
+	};
+
+	voltage-VR6b {
+		apple,key-id = "VR6b";
+		label = "Rail VR6b";
+	};
+
+	voltage-VR8b {
+		apple,key-id = "VR8b";
+		label = "Rail VR8b";
+	};
+
+	voltage-VR9l {
+		apple,key-id = "VR9l";
+		label = "Rail VR9l";
+	};
+
+	voltage-VRab {
+		apple,key-id = "VRab";
+		label = "Rail VRab";
+	};
+
+	voltage-VRcb {
+		apple,key-id = "VRcb";
+		label = "Rail VRcb";
+	};
+
+	voltage-VReb {
+		apple,key-id = "VReb";
+		label = "Rail VReb";
+	};
+
+	voltage-Vb0f {
+		apple,key-id = "Vb0f";
+		label = "SMC Vb0f";
+	};
+
+	voltage-Vb1f {
+		apple,key-id = "Vb1f";
+		label = "SMC Vb1f";
+	};
+
+	current-IBLR {
+		apple,key-id = "IBLR";
+		label = "SMC IBLR";
+	};
+
+	current-IIDR {
+		apple,key-id = "IIDR";
+		label = "SMC IIDR";
+	};
+
+	current-IMVC {
+		apple,key-id = "IMVC";
+		label = "SMC IMVC";
+	};
+
+	current-IMVR {
+		apple,key-id = "IMVR";
+		label = "SMC IMVR";
+	};
+
+	current-IO5R {
+		apple,key-id = "IO5R";
+		label = "SMC IO5R";
+	};
+
+	current-IP0b {
+		apple,key-id = "IP0b";
+		label = "PMU IP0b";
+	};
+
+	current-IP1b {
+		apple,key-id = "IP1b";
+		label = "PMU IP1b";
+	};
+
+	current-IP1l {
+		apple,key-id = "IP1l";
+		label = "PMU IP1l";
+	};
+
+	current-IP2b {
+		apple,key-id = "IP2b";
+		label = "PMU IP2b";
+	};
+
+	current-IP4b {
+		apple,key-id = "IP4b";
+		label = "PMU IP4b";
+	};
+
+	current-IP5l {
+		apple,key-id = "IP5l";
+		label = "PMU IP5l";
+	};
+
+	current-IP7b {
+		apple,key-id = "IP7b";
+		label = "PMU IP7b";
+	};
+
+	current-IP8l {
+		apple,key-id = "IP8l";
+		label = "PMU IP8l";
+	};
+
+	current-IP9b {
+		apple,key-id = "IP9b";
+		label = "PMU IP9b";
+	};
+
+	current-IPMR {
+		apple,key-id = "IPMR";
+		label = "SMC IPMR";
+	};
+
+	current-IPSR {
+		apple,key-id = "IPSR";
+		label = "SMC IPSR";
+	};
+
+	current-IPal {
+		apple,key-id = "IPal";
+		label = "PMU IPal";
+	};
+
+	current-IPbb {
+		apple,key-id = "IPbb";
+		label = "PMU IPbb";
+	};
+
+	current-IPbl {
+		apple,key-id = "IPbl";
+		label = "PMU IPbl";
+	};
+
+	current-IPdb {
+		apple,key-id = "IPdb";
+		label = "PMU IPdb";
+	};
+
+	current-IPeb {
+		apple,key-id = "IPeb";
+		label = "PMU IPeb";
+	};
+
+	current-IPkl {
+		apple,key-id = "IPkl";
+		label = "PMU IPkl";
+	};
+
+	current-IR4l {
+		apple,key-id = "IR4l";
+		label = "Rail IR4l";
+	};
+
+	current-IR5b {
+		apple,key-id = "IR5b";
+		label = "Rail IR5b";
+	};
+
+	current-IRab {
+		apple,key-id = "IRab";
+		label = "Rail IRab";
+	};
+
+	current-IReb {
+		apple,key-id = "IReb";
+		label = "Rail IReb";
+	};
+
+	current-IRfb {
+		apple,key-id = "IRfb";
+		label = "Rail IRfb";
+	};
+
+	current-IU5R {
+		apple,key-id = "IU5R";
+		label = "SMC IU5R";
+	};
+
+	current-IU5r {
+		apple,key-id = "IU5r";
+		label = "SMC IU5r";
+	};
+
+	current-IW3C {
+		apple,key-id = "IW3C";
+		label = "SMC IW3C";
+	};
+
+	current-Ib0f {
+		apple,key-id = "Ib0f";
+		label = "SMC Ib0f";
+	};
+
+	current-Ib8f {
+		apple,key-id = "Ib8f";
+		label = "SMC Ib8f";
+	};
+
+	temperature-TAOL {
+		apple,key-id = "TAOL";
+		label = "SMC TAOL";
+	};
+
+	temperature-TCMb {
+		apple,key-id = "TCMb";
+		label = "SMC TCMb";
+	};
+
+	temperature-TD00 {
+		apple,key-id = "TD00";
+		label = "SMC TD00";
+	};
+
+	temperature-TD01 {
+		apple,key-id = "TD01";
+		label = "SMC TD01";
+	};
+
+	temperature-TD02 {
+		apple,key-id = "TD02";
+		label = "SMC TD02";
+	};
+
+	temperature-TD03 {
+		apple,key-id = "TD03";
+		label = "SMC TD03";
+	};
+
+	temperature-TD04 {
+		apple,key-id = "TD04";
+		label = "SMC TD04";
+	};
+
+	temperature-TD10 {
+		apple,key-id = "TD10";
+		label = "SMC TD10";
+	};
+
+	temperature-TD11 {
+		apple,key-id = "TD11";
+		label = "SMC TD11";
+	};
+
+	temperature-TD12 {
+		apple,key-id = "TD12";
+		label = "SMC TD12";
+	};
+
+	temperature-TD13 {
+		apple,key-id = "TD13";
+		label = "SMC TD13";
+	};
+
+	temperature-TD14 {
+		apple,key-id = "TD14";
+		label = "SMC TD14";
+	};
+
+	temperature-TD20 {
+		apple,key-id = "TD20";
+		label = "SMC TD20";
+	};
+
+	temperature-TD21 {
+		apple,key-id = "TD21";
+		label = "SMC TD21";
+	};
+
+	temperature-TD22 {
+		apple,key-id = "TD22";
+		label = "SMC TD22";
+	};
+
+	temperature-TD23 {
+		apple,key-id = "TD23";
+		label = "SMC TD23";
+	};
+
+	temperature-TD24 {
+		apple,key-id = "TD24";
+		label = "SMC TD24";
+	};
+
+	temperature-TDBP {
+		apple,key-id = "TDBP";
+		label = "SMC TDBP";
+	};
+
+	temperature-TDEL {
+		apple,key-id = "TDEL";
+		label = "SMC TDEL";
+	};
+
+	temperature-TDTC {
+		apple,key-id = "TDTC";
+		label = "SMC TDTC";
+	};
+
+	temperature-TDVx {
+		apple,key-id = "TDVx";
+		label = "SMC TDVx";
+	};
+
+	temperature-TDeL {
+		apple,key-id = "TDeL";
+		label = "SMC TDeL";
+	};
+
+	temperature-TDeR {
+		apple,key-id = "TDeR";
+		label = "SMC TDeR";
+	};
+
+	temperature-TH0A {
+		apple,key-id = "TH0A";
+		label = "SMC TH0A";
+	};
+
+	temperature-TH0B {
+		apple,key-id = "TH0B";
+		label = "SMC TH0B";
+	};
+
+	temperature-TIOP {
+		apple,key-id = "TIOP";
+		label = "SMC TIOP";
+	};
+
+	temperature-TMVR {
+		apple,key-id = "TMVR";
+		label = "SMC TMVR";
+	};
+
+	temperature-TPD0 {
+		apple,key-id = "TPD0";
+		label = "SMC TPD0";
+	};
+
+	temperature-TPD1 {
+		apple,key-id = "TPD1";
+		label = "SMC TPD1";
+	};
+
+	temperature-TPD2 {
+		apple,key-id = "TPD2";
+		label = "SMC TPD2";
+	};
+
+	temperature-TPD3 {
+		apple,key-id = "TPD3";
+		label = "SMC TPD3";
+	};
+
+	temperature-TPD4 {
+		apple,key-id = "TPD4";
+		label = "SMC TPD4";
+	};
+
+	temperature-TPD5 {
+		apple,key-id = "TPD5";
+		label = "SMC TPD5";
+	};
+
+	temperature-TPD6 {
+		apple,key-id = "TPD6";
+		label = "SMC TPD6";
+	};
+
+	temperature-TPD7 {
+		apple,key-id = "TPD7";
+		label = "SMC TPD7";
+	};
+
+	temperature-TPD8 {
+		apple,key-id = "TPD8";
+		label = "SMC TPD8";
+	};
+
+	temperature-TPD9 {
+		apple,key-id = "TPD9";
+		label = "SMC TPD9";
+	};
+
+	temperature-TPDA {
+		apple,key-id = "TPDA";
+		label = "SMC TPDA";
+	};
+
+	temperature-TPDB {
+		apple,key-id = "TPDB";
+		label = "SMC TPDB";
+	};
+
+	temperature-TPDC {
+		apple,key-id = "TPDC";
+		label = "SMC TPDC";
+	};
+
+	temperature-TPDD {
+		apple,key-id = "TPDD";
+		label = "SMC TPDD";
+	};
+
+	temperature-TPDE {
+		apple,key-id = "TPDE";
+		label = "SMC TPDE";
+	};
+
+	temperature-TPDF {
+		apple,key-id = "TPDF";
+		label = "SMC TPDF";
+	};
+
+	temperature-TPDX {
+		apple,key-id = "TPDX";
+		label = "SMC TPDX";
+	};
+
+	temperature-TPMP {
+		apple,key-id = "TPMP";
+		label = "SMC TPMP";
+	};
+
+	temperature-TPSP {
+		apple,key-id = "TPSP";
+		label = "SMC TPSP";
+	};
+
+	temperature-TRD0 {
+		apple,key-id = "TRD0";
+		label = "SMC TRD0";
+	};
+
+	temperature-TRD1 {
+		apple,key-id = "TRD1";
+		label = "SMC TRD1";
+	};
+
+	temperature-TRD2 {
+		apple,key-id = "TRD2";
+		label = "SMC TRD2";
+	};
+
+	temperature-TRD3 {
+		apple,key-id = "TRD3";
+		label = "SMC TRD3";
+	};
+
+	temperature-TRD4 {
+		apple,key-id = "TRD4";
+		label = "SMC TRD4";
+	};
+
+	temperature-TRD5 {
+		apple,key-id = "TRD5";
+		label = "SMC TRD5";
+	};
+
+	temperature-TRD6 {
+		apple,key-id = "TRD6";
+		label = "SMC TRD6";
+	};
+
+	temperature-TRD7 {
+		apple,key-id = "TRD7";
+		label = "SMC TRD7";
+	};
+
+	temperature-TRD8 {
+		apple,key-id = "TRD8";
+		label = "SMC TRD8";
+	};
+
+	temperature-TRDX {
+		apple,key-id = "TRDX";
+		label = "SMC TRDX";
+	};
+
+	temperature-TSCD {
+		apple,key-id = "TSCD";
+		label = "SMC TSCD";
+	};
+
+	temperature-TVD0 {
+		apple,key-id = "TVD0";
+		label = "SMC TVD0";
+	};
+
+	temperature-TVM0 {
+		apple,key-id = "TVM0";
+		label = "SMC TVM0";
+	};
+
+	temperature-TVMS {
+		apple,key-id = "TVMS";
+		label = "SMC TVMS";
+	};
+
+	temperature-TVMh {
+		apple,key-id = "TVMh";
+		label = "SMC TVMh";
+	};
+
+	temperature-TVS0 {
+		apple,key-id = "TVS0";
+		label = "SMC TVS0";
+	};
+
+	temperature-TVS1 {
+		apple,key-id = "TVS1";
+		label = "SMC TVS1";
+	};
+
+	temperature-TVV0 {
+		apple,key-id = "TVV0";
+		label = "SMC TVV0";
+	};
+
+	temperature-TVm1 {
+		apple,key-id = "TVm1";
+		label = "SMC TVm1";
+	};
+
+	temperature-TaLR {
+		apple,key-id = "TaLR";
+		label = "SMC TaLR";
+	};
+
+	temperature-TaLW {
+		apple,key-id = "TaLW";
+		label = "SMC TaLW";
+	};
+
+	temperature-Te04 {
+		apple,key-id = "Te04";
+		label = "SMC Te04";
+	};
+
+	temperature-Te05 {
+		apple,key-id = "Te05";
+		label = "SMC Te05";
+	};
+
+	temperature-Te06 {
+		apple,key-id = "Te06";
+		label = "SMC Te06";
+	};
+
+	temperature-Te08 {
+		apple,key-id = "Te08";
+		label = "SMC Te08";
+	};
+
+	temperature-Te09 {
+		apple,key-id = "Te09";
+		label = "SMC Te09";
+	};
+
+	temperature-Te0A {
+		apple,key-id = "Te0A";
+		label = "SMC Te0A";
+	};
+
+	temperature-Te0G {
+		apple,key-id = "Te0G";
+		label = "SMC Te0G";
+	};
+
+	temperature-Te0H {
+		apple,key-id = "Te0H";
+		label = "SMC Te0H";
+	};
+
+	temperature-Te0I {
+		apple,key-id = "Te0I";
+		label = "SMC Te0I";
+	};
+
+	temperature-Te0R {
+		apple,key-id = "Te0R";
+		label = "SMC Te0R";
+	};
+
+	temperature-Te0S {
+		apple,key-id = "Te0S";
+		label = "SMC Te0S";
+	};
+
+	temperature-Te0T {
+		apple,key-id = "Te0T";
+		label = "SMC Te0T";
+	};
+
+	temperature-Te0U {
+		apple,key-id = "Te0U";
+		label = "SMC Te0U";
+	};
+
+	temperature-Te0V {
+		apple,key-id = "Te0V";
+		label = "SMC Te0V";
+	};
+
+	temperature-Te0W {
+		apple,key-id = "Te0W";
+		label = "SMC Te0W";
+	};
+
+	temperature-Te0X {
+		apple,key-id = "Te0X";
+		label = "SMC Te0X";
+	};
+
+	temperature-TfC0 {
+		apple,key-id = "TfC0";
+		label = "SMC TfC0";
+	};
+
+	temperature-TfC1 {
+		apple,key-id = "TfC1";
+		label = "SMC TfC1";
+	};
+
+	temperature-Tp00 {
+		apple,key-id = "Tp00";
+		label = "SMC Tp00";
+	};
+
+	temperature-Tp01 {
+		apple,key-id = "Tp01";
+		label = "SMC Tp01";
+	};
+
+	temperature-Tp02 {
+		apple,key-id = "Tp02";
+		label = "SMC Tp02";
+	};
+
+	temperature-Tp04 {
+		apple,key-id = "Tp04";
+		label = "SMC Tp04";
+	};
+
+	temperature-Tp05 {
+		apple,key-id = "Tp05";
+		label = "SMC Tp05";
+	};
+
+	temperature-Tp06 {
+		apple,key-id = "Tp06";
+		label = "SMC Tp06";
+	};
+
+	temperature-Tp08 {
+		apple,key-id = "Tp08";
+		label = "SMC Tp08";
+	};
+
+	temperature-Tp09 {
+		apple,key-id = "Tp09";
+		label = "SMC Tp09";
+	};
+
+	temperature-Tp0A {
+		apple,key-id = "Tp0A";
+		label = "SMC Tp0A";
+	};
+
+	temperature-Tp0C {
+		apple,key-id = "Tp0C";
+		label = "SMC Tp0C";
+	};
+
+	temperature-Tp0D {
+		apple,key-id = "Tp0D";
+		label = "SMC Tp0D";
+	};
+
+	temperature-Tp0E {
+		apple,key-id = "Tp0E";
+		label = "SMC Tp0E";
+	};
+
+	temperature-Tp0U {
+		apple,key-id = "Tp0U";
+		label = "SMC Tp0U";
+	};
+
+	temperature-Tp0V {
+		apple,key-id = "Tp0V";
+		label = "SMC Tp0V";
+	};
+
+	temperature-Tp0W {
+		apple,key-id = "Tp0W";
+		label = "SMC Tp0W";
+	};
+
+	temperature-Tp0X {
+		apple,key-id = "Tp0X";
+		label = "SMC Tp0X";
+	};
+
+	temperature-Tp0Y {
+		apple,key-id = "Tp0Y";
+		label = "SMC Tp0Y";
+	};
+
+	temperature-Tp0Z {
+		apple,key-id = "Tp0Z";
+		label = "SMC Tp0Z";
+	};
+
+	temperature-Tp0a {
+		apple,key-id = "Tp0a";
+		label = "SMC Tp0a";
+	};
+
+	temperature-Tp0b {
+		apple,key-id = "Tp0b";
+		label = "SMC Tp0b";
+	};
+
+	temperature-Tp0c {
+		apple,key-id = "Tp0c";
+		label = "SMC Tp0c";
+	};
+
+	temperature-Tp0d {
+		apple,key-id = "Tp0d";
+		label = "SMC Tp0d";
+	};
+
+	temperature-Tp0e {
+		apple,key-id = "Tp0e";
+		label = "SMC Tp0e";
+	};
+
+	temperature-Tp0f {
+		apple,key-id = "Tp0f";
+		label = "SMC Tp0f";
+	};
+
+	temperature-Tp1A {
+		apple,key-id = "Tp1A";
+		label = "SMC Tp1A";
+	};
+
+	temperature-Tp1B {
+		apple,key-id = "Tp1B";
+		label = "SMC Tp1B";
+	};
+
+	temperature-Tp1C {
+		apple,key-id = "Tp1C";
+		label = "SMC Tp1C";
+	};
+
+	temperature-Tp1E {
+		apple,key-id = "Tp1E";
+		label = "SMC Tp1E";
+	};
+
+	temperature-Tp1F {
+		apple,key-id = "Tp1F";
+		label = "SMC Tp1F";
+	};
+
+	temperature-Tp1G {
+		apple,key-id = "Tp1G";
+		label = "SMC Tp1G";
+	};
+
+	temperature-Tp1Q {
+		apple,key-id = "Tp1Q";
+		label = "SMC Tp1Q";
+	};
+
+	temperature-Tp1R {
+		apple,key-id = "Tp1R";
+		label = "SMC Tp1R";
+	};
+
+	temperature-Tp1S {
+		apple,key-id = "Tp1S";
+		label = "SMC Tp1S";
+	};
+
+	temperature-Tp3O {
+		apple,key-id = "Tp3O";
+		label = "SMC Tp3O";
+	};
+
+	temperature-Tp3P {
+		apple,key-id = "Tp3P";
+		label = "SMC Tp3P";
+	};
+
+	temperature-Tp3S {
+		apple,key-id = "Tp3S";
+		label = "SMC Tp3S";
+	};
+
+	temperature-Tp3T {
+		apple,key-id = "Tp3T";
+		label = "SMC Tp3T";
+	};
+
+	temperature-Tp3W {
+		apple,key-id = "Tp3W";
+		label = "SMC Tp3W";
+	};
+
+	temperature-Tp3X {
+		apple,key-id = "Tp3X";
+		label = "SMC Tp3X";
+	};
+
+	temperature-Ts00 {
+		apple,key-id = "Ts00";
+		label = "SMC Ts00";
+	};
+
+	temperature-Ts01 {
+		apple,key-id = "Ts01";
+		label = "SMC Ts01";
+	};
+
+	temperature-Ts04 {
+		apple,key-id = "Ts04";
+		label = "SMC Ts04";
+	};
+
+	temperature-Ts05 {
+		apple,key-id = "Ts05";
+		label = "SMC Ts05";
+	};
+
+	temperature-Ts06 {
+		apple,key-id = "Ts06";
+		label = "SMC Ts06";
+	};
+
+	temperature-Ts08 {
+		apple,key-id = "Ts08";
+		label = "SMC Ts08";
+	};
+
+	temperature-Ts09 {
+		apple,key-id = "Ts09";
+		label = "SMC Ts09";
+	};
+
+	temperature-Ts0A {
+		apple,key-id = "Ts0A";
+		label = "SMC Ts0A";
+	};
+
+	temperature-Ts0C {
+		apple,key-id = "Ts0C";
+		label = "SMC Ts0C";
+	};
+
+	temperature-Ts0D {
+		apple,key-id = "Ts0D";
+		label = "SMC Ts0D";
+	};
+
+	temperature-Ts0G {
+		apple,key-id = "Ts0G";
+		label = "SMC Ts0G";
+	};
+
+	temperature-Ts0H {
+		apple,key-id = "Ts0H";
+		label = "SMC Ts0H";
+	};
+
+	temperature-Ts0I {
+		apple,key-id = "Ts0I";
+		label = "SMC Ts0I";
+	};
+
+	temperature-Ts0K {
+		apple,key-id = "Ts0K";
+		label = "SMC Ts0K";
+	};
+
+	temperature-Ts0L {
+		apple,key-id = "Ts0L";
+		label = "SMC Ts0L";
+	};
+
+	temperature-Ts0M {
+		apple,key-id = "Ts0M";
+		label = "SMC Ts0M";
+	};
+
+	temperature-Ts0O {
+		apple,key-id = "Ts0O";
+		label = "SMC Ts0O";
+	};
+
+	temperature-Ts0Q {
+		apple,key-id = "Ts0Q";
+		label = "SMC Ts0Q";
+	};
+
+	temperature-Ts0R {
+		apple,key-id = "Ts0R";
+		label = "SMC Ts0R";
+	};
+
+	temperature-Ts0S {
+		apple,key-id = "Ts0S";
+		label = "SMC Ts0S";
+	};
+
+	temperature-Ts0T {
+		apple,key-id = "Ts0T";
+		label = "SMC Ts0T";
+	};
+
+	temperature-Ts0U {
+		apple,key-id = "Ts0U";
+		label = "SMC Ts0U";
+	};
+
+	temperature-Ts0h {
+		apple,key-id = "Ts0h";
+		label = "SMC Ts0h";
+	};
+
+	temperature-Ts0i {
+		apple,key-id = "Ts0i";
+		label = "SMC Ts0i";
+	};
+
+	temperature-Ts1P {
+		apple,key-id = "Ts1P";
+		label = "SMC Ts1P";
+	};
+
+	temperature-TsOP {
+		apple,key-id = "TsOP";
+		label = "SMC TsOP";
 	};
 };
