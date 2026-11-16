@@ -9218,9 +9218,11 @@ static const u32 t8142_ps_aon_macos_off[] = {
 	0xe0, 0xd8,
 };
 
-static const u32 t8142_ps_aon_macos_on[] = {
-	0x40e0, 0x40e8, 0x4118, 0x4138, 0x4148, 0x4150, 0x4158,
-};
+/*
+ * T8142 has no ps_aon_macos_on list. These audio domains are no_ps in its
+ * ADT and remain at actual/target zero in the J813 macOS sleep snapshot;
+ * the traced AP never accesses them. The T8132 state-4 rule does not apply.
+ */
 
 /*
  * T8132's quiesce words by name: the ATC commons, the display's and DISPEXT's SYS, ANS, AVD,
@@ -9402,7 +9404,6 @@ static const struct apple_sleep_soc t8142_sleep_soc = {
 	.ps_aon_all = SLEEP_WORDS(t8142_ps_aon_all),
 	.ps_macos_off = SLEEP_WORDS(t8142_ps_macos_off),
 	.ps_aon_macos_off = SLEEP_WORDS(t8142_ps_aon_macos_off),
-	.ps_aon_macos_on = SLEEP_WORDS(t8142_ps_aon_macos_on),
 	.ps_wake_order = SLEEP_WORDS(t8142_ps_wake_order),
 	.ps_aon_wake_order = SLEEP_WORDS(t8142_ps_aon_wake_order),
 	.ps_boot_auto = SLEEP_WORDS(t8142_ps_boot_auto),
