@@ -120,3 +120,17 @@ unsigned int asahi_g17_local_inputs(void)
 {
 	return READ_ONCE(gpubench_local_inputs);
 }
+
+/*
+ * Measurement only: M5 render submission changes, one bit each (see
+ * sync_input.rs). Each bit is read where its change applies, so masks may
+ * alternate on one boot; 0 is the driver without them.
+ */
+static unsigned int gpubench_render_submit;
+module_param(gpubench_render_submit, uint, 0644);
+MODULE_PARM_DESC(gpubench_render_submit, "Measurement: M5 render submission changes (bit mask, 0 none)");
+
+unsigned int asahi_g17_render_submit(void)
+{
+	return READ_ONCE(gpubench_render_submit);
+}
