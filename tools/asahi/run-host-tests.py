@@ -192,6 +192,10 @@ ASAHI_TESTS = {
                                    'node-unmarked', 'no-release'), []),
     'g17-owner-release-order-tests.py': [([], PASS)],
     'g17-pool-release-tests.py': [([], PASS)],
+    # no-drain-release is the old rule: only a lease ends a slot's quarantine.
+    'g17-quarantine-drain-tests.py': [([], PASS)]
+        + mutations('--mutation', ('no-drain-release', 'without-witness', 'ignore-leases', 'no-last-lease',
+                                   'witness-covers-later-failure', 'unquarantined-drain'), []),
     'g17-resource-tests.py': [([], PASS)],
     'g17-shared-pool-tests.py': [([], PASS)],
     'g17-t6041-initdata-tests.py': [([], PASS)],
