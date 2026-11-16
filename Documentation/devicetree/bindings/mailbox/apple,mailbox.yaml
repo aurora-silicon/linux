@@ -28,6 +28,17 @@ properties:
         const: apple,t8152-smc-mailbox
 
       - description:
+          The other T8152 post-office mailboxes. Each coprocessor has its own
+          window of the same counted-FIFO block as the SMC's.
+        items:
+          - enum:
+              - apple,t8152-ans-mailbox
+              - apple,t8152-dcp-mailbox
+              - apple,t8152-mtp-mailbox
+              - apple,t8152-sep-mailbox
+          - const: apple,t8152-smc-mailbox
+
+      - description:
           T8152 ASC wrapper (v8) mailbox of the AOP, with the counted
           FIFOs of the SMC mailbox, described with its send-empty and
           recv-not-empty interrupts.
@@ -270,6 +281,20 @@ required:
 additionalProperties: false
 
 examples:
+  - |
+    soc {
+        #address-cells = <2>;
+        #size-cells = <2>;
+
+        mailbox@316020300 {
+            compatible = "apple,t8152-ans-mailbox", "apple,t8152-smc-mailbox";
+            reg = <0x3 0x16020300 0x0 0x80>;
+            interrupts = <1 302 4>, <1 262 4>;
+            interrupt-names = "send-empty", "recv-not-empty";
+            #mbox-cells = <0>;
+        };
+    };
+
   - |
     mailbox@77408000 {
         compatible = "apple,t8103-asc-mailbox", "apple,asc-mailbox-v4";
