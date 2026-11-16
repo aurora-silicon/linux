@@ -60,6 +60,7 @@ T6050
 
 ``apple/prores-t6050-init.bin`` is the same container with ``soc = 0x6050``,
 ``block_count = 4`` and a fourth block, SCODEC control (ID 4, 12 entries,
-offsets below ``0x4000``): 2,880 bytes in all.  The driver has no built-in
-T6050 rows, so that engine probes only with the file.  The control rows are
+offsets below ``0x4000``): 2,880 bytes in all.  Without the file, T6050 uses
+its built-in rows: the 82, 12, 80 and 62 values macOS writes to the system,
+control, core and wrapper windows before its first job.  The control rows are
 applied after the system rows and before the core rows.
