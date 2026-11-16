@@ -691,33 +691,36 @@
  */
 
 / {
-	chosen {
-		apple,atc0-handoff = <&ps_atc0_common>,
-			<&ps_atc0_usb_aon>,
-			<&ps_atc0_usb>,
-			<&ps_atc0_phymxwrap>,
-			<&ps_atc0_cio>,
-			<&ps_atc0_cio_pcie>,
-			<&ps_atc0_cio_usb>,
-			<&ps_atc0_cio_auss>,
-			<&ps_atc0_pcie>,
-			<&ps_atc0_common_dp_0>,
-			<&ps_atc0_common_dp_1>,
-			<&ps_atc0_common_dp_2>,
-			<&ps_atc0_common_dp_3>,
-			<&atc0_phy_mbox>,
-			<&atc0_phy>,
-			<&usb0_dart>,
-			<&usb0_dart1>,
-			<&usb_drd0>,
-			<&hpm0>,
-			<&acio0_mbox>,
-			<&acio0>,
-			<&acio0_dart>,
-			<&acio0_nhi>,
-			<&acio0_pcie_tunnel>,
-			<&apciec0_dart>,
-			<&apciec0>,
-			<&atc0_dpxbar>;
+	firmware {
+		atc0-handoff {
+			compatible = "apple,j714s-atc0-handoff";
+			apple,devices = <&ps_atc0_common>,
+				<&ps_atc0_usb_aon>,
+				<&ps_atc0_usb>,
+				<&ps_atc0_phymxwrap>,
+				<&ps_atc0_cio>,
+				<&ps_atc0_cio_pcie>,
+				<&ps_atc0_cio_usb>,
+				<&ps_atc0_cio_auss>,
+				<&ps_atc0_pcie>,
+				<&ps_atc0_common_dp_0>,
+				<&ps_atc0_common_dp_1>,
+				<&ps_atc0_common_dp_2>,
+				<&ps_atc0_common_dp_3>,
+				<&atc0_phy_mbox>,
+				<&atc0_phy>,
+				<&usb0_dart>,
+				<&usb0_dart1>,
+				<&usb_drd0>,
+				<&hpm0>,
+				<&acio0_mbox>,
+				<&acio0>,
+				<&acio0_dart>,
+				<&acio0_nhi>,
+				<&acio0_pcie_tunnel>,
+				<&apciec0_dart>,
+				<&apciec0>,
+				<&atc0_dpxbar>;
+		};
 	};
 };
