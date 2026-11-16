@@ -1308,6 +1308,13 @@ static const struct apple_sleep_v27_ops dcp_v27_late_ops = {
  * return after the wake reserves a peer again (dcp_peer_hints_v27()). False
  * while the pair still runs, which refuses the sleep as before.
  */
+/* A refusal before any sleep call is made, with its reason: each is a state that must not sleep. */
+static int dcp_v27_refuse(struct apple_dcp *dcp, const char *why)
+{
+	dev_info(dcp->dev, "V27 sleep: refused before its calls: %s\n", why);
+	return -EBUSY;
+}
+
 static bool dcp_v27_peer_released(struct apple_dcp *dcp)
 {
 	struct apple_dcp *owner, *peer;
@@ -1319,8 +1326,13 @@ static bool dcp_v27_peer_released(struct apple_dcp *dcp)
 	peer = owner->peer_reserved;
 	if (!peer || (owner != dcp && peer != dcp) || owner->peer_frames.active ||
 	    owner->peer_tiling.vftg || owner->peer_tiling.member ||
-	    peer->peer_tiling.vftg || peer->peer_tiling.member)
+	    peer->peer_tiling.vftg || peer->peer_tiling.member) {
+		dev_info(dcp->dev, "V27 sleep: pair still runs: peer %s, frames %d, vftg %d/%d, member %d/%d\n",
+			 peer ? dev_name(peer->dev) : "none", owner->peer_frames.active,
+			 owner->peer_tiling.vftg, peer ? peer->peer_tiling.vftg : 0,
+			 owner->peer_tiling.member, peer ? peer->peer_tiling.member : 0);
 		return false;
+	}
 	dev_info(owner->dev, "peer %s no longer reserved: the pair is stopped for the sleep\n",
 		 dev_name(peer->dev));
 	dcp_peer_release_locked(owner);
@@ -1342,18 +1354,18 @@ static int dcp_v27_sleep_prepare(struct apple_dcp *dcp)
 	}
 	if (!dcp->retain_dma || IS_ERR_OR_NULL(dcp->rtk) || !dcp->active || dcp->crashed || dcp->quiescing ||
 	    dcp->secure_rtk)
-		return -EBUSY;
+		return dcp_v27_refuse(dcp, "coprocessor not live (dma, rtkit, active, crashed, quiescing, secure)");
 	/* Mode-config suspend is the actual DRM scanout-owner boundary. No HPD
 	 * shortcut: external firmware still executes A484/A500/AFK and late IDLE.
 	 */
 	if (dcp->crtc && !dcp->crtc->base.dev->mode_config.suspend_state)
-		return -EBUSY;
+		return dcp_v27_refuse(dcp, "no saved mode-config state");
 	/* Nothing is released for a sleep an earlier failure refuses anyway. */
 	if (dcp->sleep_v27 && dcp->sleep_v27->phase != V27_LIVE)
 		return -EUCLEAN;
 	/* A pair that still runs refuses; a stopped one's reservation goes. */
 	if (!dcp_v27_peer_released(dcp))
-		return -EBUSY;
+		return dcp_v27_refuse(dcp, "its pair still runs");
 	/* Before the release: a refusal after it reports the display's return. */
 	if (!dcp->sleep_v27) {
 		dcp->sleep_v27 = devm_kzalloc(dcp->dev, sizeof(*s), GFP_KERNEL);
@@ -1386,11 +1398,12 @@ static int dcp_v27_sleep_prepare(struct apple_dcp *dcp)
 	/* What is still connected after that, or with the release switched off, refuses. */
 	for (i = 0; i < dcp->hw.num_dptx_ports; i++)
 		if (READ_ONCE(dcp->dptxport[i].connected))
-			return -EBUSY;
-	if (dcp_v27_external(dcp) && (READ_ONCE(dcp->active_typec_route) ||
-	    READ_ONCE(dcp->typec_cable_connected) ||
+			return dcp_v27_refuse(dcp, "a DPTX port still connected");
+	if (dcp_v27_external(dcp) && READ_ONCE(dcp->active_typec_route))
+		return dcp_v27_refuse(dcp, "a display route still active");
+	if (dcp_v27_external(dcp) && (READ_ONCE(dcp->typec_cable_connected) ||
 	    (dcp->hdmi_hpd && gpiod_get_value_cansleep(dcp->hdmi_hpd) > 0)))
-		return -EBUSY;
+		return dcp_v27_refuse(dcp, "a cable still connected");
 	if (dcp_v27_external(dcp) && dcp->crtc) {
 		/* The saved copy is the duplicated state's new state; its old
 		 * state is stale once disable_all has committed.
@@ -1402,8 +1415,10 @@ static int dcp_v27_sleep_prepare(struct apple_dcp *dcp)
 		 * A released display's CRTC was lit: it resumes disabled (see
 		 * dcp_crtc_mode_fixup()) and the display's return sets its mode again.
 		 */
-		if (!saved || (saved->active && !READ_ONCE(dcp->sleep_v27_torn)))
-			return -EBUSY;
+		if (!saved)
+			return dcp_v27_refuse(dcp, "no saved CRTC state");
+		if (saved->active && !READ_ONCE(dcp->sleep_v27_torn))
+			return dcp_v27_refuse(dcp, "its CRTC was lit and its display not released");
 	}
 	if (!dcp_v27_external(dcp) && !dcp->crtc)
 		return -ENODEV;
