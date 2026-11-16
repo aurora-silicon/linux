@@ -7052,6 +7052,17 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	dcp->external = of_device_is_compatible(dev->of_node, "apple,t6030-dcpext");
 	dcp->desktop_external = of_device_is_compatible(dev->of_node, "apple,t6041-dcpext");
 	dcp->external_native = dcp->external && dcp_t6030_ext_native(dev->of_node);
+	/*
+	 * J714s: the internal panel's processor suspends and resumes asynchronously, not in
+	 * the device list's order. After a deep sleep, its restart and its first frame wait only
+	 * for its suppliers (DARTs, mailbox, power domains) through their device links, not for
+	 * every device that happens to resume before it. The DRM device is a consumer of every
+	 * DCP (apple_drv.c), so it still suspends before this processor and resumes after it.
+	 * The external processors stay in order: their sleep steps reach Type-C, the PHYs and
+	 * the tunnels without device links.
+	 */
+	if (dcp->v27_j714s && dcp->panel_identity && !dcp->external)
+		device_enable_async_suspend(dev);
 	dcp_external_audio_init(dcp);
 	dcp->dev = dev;
 	/*
