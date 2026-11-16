@@ -3466,6 +3466,25 @@ impl Queue {
         self.growing
     }
 
+    /// The host-port configuration of an installed M5 queue as its kicks last sent it (its kick
+    /// ring, at the priority class of its last publication), for a real wake to send again
+    /// before any doorbell: the configuration and validity only, no advance. None where the next
+    /// kick configures the queue anyway (it never kicked at any class, or was recycled since),
+    /// and off M5.
+    pub(crate) fn wake_configuration(
+        &self,
+    ) -> Result<Option<crate::g17::fw::m5::queue::HardwareSubmission>> {
+        if !self.graph.m5 || !self.installed || self.outer_started == 0 {
+            return Ok(None);
+        }
+        // On M5 a publication leaves exactly the bit of its own class (activation.rs).
+        let priority = self.outer_started.trailing_zeros() as u8;
+        crate::g17::fw::m5::queue::HardwareSubmission::configure_compute(
+            self.qid(), self.kick.low_va(), priority,
+        )
+        .map(Some)
+    }
+
     /// The queue's first command has been published: its identity and configuration exist.
     pub(crate) fn installed(&self) -> bool {
         self.installed
