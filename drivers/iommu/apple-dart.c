@@ -5817,6 +5817,23 @@ params_done:
 			goto err_clk_disable;
 	}
 
+	if (dart->gen3_tlbi) {
+		u32 gen3_ias;
+
+		/*
+		 * A Gen3 stream may walk fewer address bits than PARAMS3
+		 * reports; DVAs are masked to the walk width before the tables
+		 * are touched, so a device can keep its high DVA window.
+		 */
+		if (!of_property_read_u32(dev->of_node, "apple,gen3-ias", &gen3_ias) &&
+		    gen3_ias >= 32 && gen3_ias <= dart->ias) {
+			dev_dbg(dev, "Gen3 walk width %u (PARAMS3 VA width %u)\n",
+				gen3_ias, dart->ias);
+			dart->ias = gen3_ias;
+			dart->four_level = gen3_ias > 36;
+		}
+	}
+
 	dart->dma_min = 0;
 	dart->dma_max = DMA_BIT_MASK(dart->ias);
 	dart->dma_offset = 0;
