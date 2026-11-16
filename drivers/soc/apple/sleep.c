@@ -211,6 +211,7 @@ struct aura_s2r_mailbox {
  * clear). A latched source that is enabled holds the controller's interrupt output, an AP
  * wake source, up (T6050, aurora-silicon/linux#1963 commit 24).
  */
+#define SPMI4_SRC_ENABLE	0x400
 #define SPMI4_SRC_STATUS	0x600
 #define SPMI4_SRC_WORDS		8
 /* A FIFO holds a few replies at most; never spin on a status that doesn't change. */
@@ -1022,6 +1023,8 @@ struct apple_sleep {
 	 */
 	struct device *pmu_bus;
 	u32 spmi_pmu_status, spmi_pmu_bits;
+	u32 spmi_pmu_enable_saved;
+	bool spmi_pmu_wake_armed;
 	u32 spmi_src[2][SPMI4_SRC_WORDS];
 	bool spmi_src_read[2];
 	unsigned int pmu_busy, pmu_busy_forced;
@@ -4633,6 +4636,29 @@ static void sleep_pmu_write(struct apple_sleep *s, u16 reg, u8 val)
 }
 
 /*
+ * The PMU alarm also needs its peripheral interrupt routed by nub-spmi0.
+ * Arm only the DT-owned sources, after the old RTC event has been cleared and
+ * the next compare programmed. A latched event from the previous alarm must
+ * not turn this sleep into an immediate wake.
+ */
+static void sleep_spmi_alarm_wake_arm(struct apple_sleep *s)
+{
+	void __iomem *enable;
+	u32 latched, val;
+
+	if (!s->spmi_pmu_bits)
+		return;
+	enable = s->spmi + SPMI4_SRC_ENABLE + s->spmi_pmu_status - SPMI4_SRC_STATUS;
+	latched = readl(s->spmi + s->spmi_pmu_status) & s->spmi_pmu_bits;
+	if (latched)
+		writel(latched, s->spmi + s->spmi_pmu_status);
+	val = readl(enable);
+	s->spmi_pmu_enable_saved = val & s->spmi_pmu_bits;
+	s->spmi_pmu_wake_armed = true;
+	writel(val | s->spmi_pmu_bits, enable);
+}
+
+/*
  * Gen 4: nub-spmi0's peripheral source words, read at the entry (@when 0) and at the wake
  * (1), and the PMU's latched sources among them acknowledged where the DT names them. The
  * T6050 sleep found that after the first sleep's alarm every later sleep was back within a
@@ -4657,6 +4683,14 @@ static void sleep_spmi_sources(struct apple_sleep *s, unsigned int when)
 		  s->spmi_pmu_bits;
 	if (latched)
 		writel(latched, s->spmi + s->spmi_pmu_status);
+	if (when && s->spmi_pmu_wake_armed) {
+		void __iomem *enable = s->spmi + SPMI4_SRC_ENABLE +
+				      s->spmi_pmu_status - SPMI4_SRC_STATUS;
+
+		writel((readl(enable) & ~s->spmi_pmu_bits) | s->spmi_pmu_enable_saved,
+		       enable);
+		s->spmi_pmu_wake_armed = false;
+	}
 }
 
 static void sleep_spmi_sources_report(struct apple_sleep *s)
@@ -8355,6 +8389,8 @@ static void t8142_post_timer(struct apple_sleep *s)
 		v = 0x41;
 		ret = t8142_pmu(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_CTL, &v, NULL, 1);
 	}
+	if (!ret)
+		sleep_spmi_alarm_wake_arm(s);
 	t8142_post_ret = ret;
 }
 
