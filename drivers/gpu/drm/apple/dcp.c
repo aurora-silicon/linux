@@ -3776,6 +3776,19 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 	}
 
+	/*
+	 * Firmware 27: a running pair stops before its primary's HPD low, which
+	 * the firmware answers only for a pipe that is down
+	 * (dcp_peer_unplug_v27()). Ahead of the hotplug event, so that the
+	 * CRTC's own power-off finds the pair stopped. A pair that cannot be
+	 * stopped leaves the HPD low as it was.
+	 */
+	ret = dcp_peer_unplug_v27(dcp);
+	if (ret < 0)
+		dev_warn(dcp->dev, "pair not stopped before the HPD low: %d\n", ret);
+	else if (ret)
+		dev_info(dcp->dev, "pair stopped before the HPD low\n");
+
 	disconnected_hpd_event(dcp->connector);
 
 	if (dcp->avep)
