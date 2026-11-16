@@ -5417,14 +5417,16 @@ static int apple_pcie_t6050_warm_reset(struct apple_pcie *pcie, bool noirq)
 }
 
 /*
- * The adopted host's firmware sleep is set up on the board it has run on, the J714s. On another
- * T6050 board nothing is registered and no port is taken for it: the host is as before.
+ * The adopted host's firmware sleep is set up on the boards with a T6050 sleep, the J714s and
+ * the J716c. On another T6050 board nothing is registered and no port is taken for it: the
+ * host is as before.
  */
 static void apple_pcie_t6050_sleep_probe(struct platform_device *pdev, struct apple_pcie *pcie)
 {
 	struct apple_pcie_port *port;
 
-	if (pcie->managed_sids || !of_machine_is_compatible("apple,j714s"))
+	if (pcie->managed_sids || !(of_machine_is_compatible("apple,j714s") ||
+				    of_machine_is_compatible("apple,j716c")))
 		return;
 	/* The one port a boot loader trained; an endpoint Linux powers is parked instead. */
 	list_for_each_entry(port, &pcie->ports, entry)
