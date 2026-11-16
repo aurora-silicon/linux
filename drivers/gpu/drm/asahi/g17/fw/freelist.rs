@@ -10,6 +10,9 @@ pub(crate) const RUN_LIST_SIZE: usize = 0x1_0000;
 pub(crate) const TABLE_SIZE: usize = PAGE_LIST_SIZE + RUN_LIST_SIZE;
 pub(crate) const CONTROL_SIZE: usize = 0x4000;
 pub(crate) const RENDER_BLOCKS: usize = 44;
+/// Render pool of the 32-core M4 Max on 25G83: with four-cluster tiling, 44 blocks run out
+/// under Roblox's vertex work and the firmware kills the render as no-progress (reason 0).
+pub(crate) const RENDER_BLOCKS_T6041_25G83: usize = 96;
 pub(crate) const COMPUTE_BLOCKS: usize = 21;
 
 /// Render reserves eight run words per block; compute packs runs consecutively.
