@@ -24,8 +24,10 @@
  *   8917..    further sections that are not decoded yet
  *
  * Every 2 s four whole-image shifts arrive (about +658, +902, -445 and -126
- * counts, slightly different per row). Frames shifted by more than 200 counts
- * are skipped and a per-row mean is removed from the rest. The raw image has no
+ * counts), each between two ordinary frames. A few cells on the top edge
+ * (rows 52 and 53, columns 0, 41 and 81) move by 260 to 880 counts more than
+ * the rest in each of them. Frames shifted by more than 64 counts are skipped
+ * and a per-row mean is removed from the rest. The raw image has no
  * baseline, so the driver keeps one per cell, picks local maxima of
  * (baseline - raw), and centroids 3x3.
  */
@@ -51,7 +53,8 @@
 /* Panel is about 10 units per mm. */
 #define KIWI_RES		10
 #define KIWI_FP			256
-#define KIWI_GLITCH		200	/* mean shift of the 2 s reference frame is about 900 */
+#define KIWI_GLITCH		64	/* counts: reference frames shift the mean by 137 to 899, idle frames by under 10 */
+#define KIWI_SAME		200	/* counts: two ordinary frames differ less than this in every cell */
 #define KIWI_GLITCH_MAX		10	/* skipped frames in a row before the baseline is retaken */
 #define KIWI_MISS_MAX		2
 #define KIWI_MATCH_D2		(4 * KIWI_FP * 4 * KIWI_FP)
@@ -69,6 +72,8 @@ struct kiwi {
 	struct input_dev *input;
 	bool have_base;
 	int bad;
+	u8 cand[2 * KIWI_CELLS];	/* baseline candidate: raw frame, little endian */
+	int cand_age;
 	s16 sig[KIWI_CELLS];	/* baseline minus raw, positive under a finger */
 	s32 base[KIWI_CELLS];
 	s32 fp[KIWI_CELLS];
@@ -81,11 +86,41 @@ static bool kiwi_match(struct hid_device *hdev, bool ignore_special_drivers)
 }
 
 /*
+ * The chip sends four reference frames in every 2 s cycle, each between two
+ * ordinary frames. They differ from the ordinary frames and from each other, so
+ * a frame is a baseline only if the frame two later matches it.
+ */
+static void kiwi_take_base(struct kiwi *k, const u8 *data)
+{
+	const u8 *cells = data + KIWI_HDR_LEN;
+	int i;
+
+	if (k->cand_age == 0) {
+		memcpy(k->cand, cells, sizeof(k->cand));
+		k->cand_age = 1;
+		return;
+	}
+	if (k->cand_age == 1) {
+		k->cand_age = 2;
+		return;
+	}
+	k->cand_age = 0;
+	for (i = 0; i < KIWI_CELLS; i++)
+		if (abs(get_unaligned_le16(cells + 2 * i) - get_unaligned_le16(k->cand + 2 * i)) > KIWI_SAME)
+			return;
+	for (i = 0; i < KIWI_CELLS; i++)
+		k->base[i] = get_unaligned_le16(cells + 2 * i) << 8;
+	k->have_base = true;
+	k->bad = 0;
+}
+
+/*
  * Fixed point: base and fp are in 1/256 count. fp is baseline minus raw with the
  * frame-wide shift removed, positive under a finger.
- * Returns false for a frame that must be skipped (big reference frame).
- * Besides the two big reference frames (+658 and +902 counts) every 2 s there is a
- * -445 and a -126 count frame: the whole image moves, so remove the mean.
+ * Returns false for a frame that must be skipped: no baseline yet, or one of the
+ * four reference frames of the 2 s cycle. None may reach the baseline or the
+ * peak search: a baseline taken from the -126 frame, or a -126 frame passed
+ * through, turns the top edge cells into a held touch.
  */
 static bool kiwi_load(struct kiwi *k, const u8 *data)
 {
@@ -94,10 +129,7 @@ static bool kiwi_load(struct kiwi *k, const u8 *data)
 	int i, r, c;
 
 	if (!k->have_base) {
-		for (i = 0; i < KIWI_CELLS; i++)
-			k->base[i] = get_unaligned_le16(data + KIWI_HDR_LEN + 2 * i) << 8;
-		k->have_base = true;
-		k->bad = 0;
+		kiwi_take_base(k, data);
 		return false;
 	}
 	for (i = 0; i < KIWI_CELLS; i++) {
@@ -293,6 +325,7 @@ static int kiwi_input_open(struct input_dev *input)
 	struct kiwi *k = input_get_drvdata(input);
 
 	k->have_base = false;
+	k->cand_age = 0;
 	return hid_hw_open(to_hid_device(input->dev.parent));
 }
 
