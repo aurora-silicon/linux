@@ -710,8 +710,9 @@ fn select(
     if has(b"apple,t8132") && (has(b"apple,j713") || has(b"apple,j715")) {
         return Ok(&T8132);
     }
-    // Only the J815, whose ADT was read; the J813's sensor bus is unchecked.
-    if has(b"apple,t8142") && has(b"apple,j815") {
+    // The J815 and the J813, whose ADTs were read: both have the sensor (mesa) on spi2
+    // at 0x3a5108000.
+    if has(b"apple,t8142") && (has(b"apple,j815") || has(b"apple,j813")) {
         return Ok(&T8142);
     }
     Err(ENODEV)
