@@ -4869,8 +4869,22 @@ int dcp_fabric_sleep_release(struct apple_dcp *dcp, s64 ms[2])
 	if (!route)
 		return 0;
 	port = route->port;
-	if (route->tunnel || port->owner != route || port->secondary_owner ||
-	    port->split_dcp)
+	/*
+	 * A USB4 router that sleeps in place has its DP IN's display torn down
+	 * at its entry (the DPTX port disconnected, the tunnel clock stopped),
+	 * but the tunnel route stays owned. Release it as a DP IN detach does;
+	 * the router hands the display back once the sleep is over.
+	 */
+	if (route->tunnel) {
+		if (READ_ONCE(dcp->dptxport[0].connected) || port->split_dcp)
+			return -EBUSY;
+		dcp_tb_binding_retire(dcp, route);
+		start = ktime_get();
+		ret = dcp_typec_route_deactivate(route);
+		ms[1] = ktime_ms_delta(ktime_get(), start);
+		return ret ?: 1;
+	}
+	if (port->owner != route || port->secondary_owner || port->split_dcp)
 		return -EBUSY;
 	if (port->safe_pending)
 		return -EAGAIN;
