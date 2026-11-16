@@ -460,6 +460,19 @@ impl<T> Fifo<T> {
     fn front(&self) -> Option<&T> {
         self.entries[self.head].as_ref()
     }
+    /// The entry `index` places behind the front.
+    fn get(&self, index: usize) -> Option<&T> {
+        if index >= self.len {
+            return None;
+        }
+        self.entries[(self.head + index) % IN_FLIGHT].as_ref()
+    }
+    fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        if index >= self.len {
+            return None;
+        }
+        self.entries[(self.head + index) % IN_FLIGHT].as_mut()
+    }
     fn back(&self) -> Option<&T> {
         if self.len == 0 {
             None
@@ -530,7 +543,8 @@ struct Active {
     spared_as_dropped: bool,
     /// The command retired on its completion record without a completion stamp and its client
     /// has its result, but the firmware may still store the stamp through its descriptor: the
-    /// descriptor stays held, and the command at the front, until the stamp covers it.
+    /// descriptor stays held, and the command in the queue, until the stamp covers it. Also set
+    /// for a command that retired behind such commands: it leaves the queue after them.
     stamps_owed: bool,
 }
 struct Previous<B = Binding, C = Arc<Context>> {
@@ -911,12 +925,14 @@ impl Queue {
     /// whose fences still wait (`spared_deferred`) does, whether or not every entry holds a
     /// ticket: it holds the GPU until the firmware drains it or this queue's watchdog settles it
     /// ([`Self::timeout`]), so other VMs' watchdogs see it as a failed blocker and defer to it
-    /// within their bounded renewals instead of failing their own work at once.
+    /// within their bounded renewals instead of failing their own work at once. Commands that
+    /// already retired and only hold their descriptors (`Active::stamps_owed`) are not the head.
     pub(crate) fn timeout_head(&self) -> Option<crate::g17::timeout::Head> {
         if self.quarantined && !self.awaiting_witness && !self.spared_deferred {
             return None;
         }
-        self.active.front().map(|active| crate::g17::timeout::Head {
+        let head = self.active.iter().find(|active| !active.stamps_owed);
+        head.map(|active| crate::g17::timeout::Head {
             vm: active.packet.context.vm().id(),
             published: active.published,
             // An M5 completion record can precede the command's writes: only the stamp
@@ -1150,6 +1166,8 @@ impl Queue {
 
     /// Poll only the ordered prefix; the next pass may recheck a finished front on another QID's
     /// event. A final identity-less scan allows recordless retirement without the one-pass grace.
+    /// Commands that retired without their stamp keep their place and descriptors until it
+    /// covers them; the pass steps past them to the commands behind.
     pub(crate) fn retire(
         &mut self,
         masks: Option<[u64; 2]>,
@@ -1165,7 +1183,9 @@ impl Queue {
         let finished_before = self.retire_pending;
         self.retire_pending = false;
         let mut oldest = true;
-        while let Some(front) = self.active.front() {
+        // How many retired commands at the front, still owed their stamp, this pass stepped past.
+        let mut at = 0;
+        while let Some(front) = self.active.get(at) {
             let mut restart = None;
             let mut crossed = false;
             let result = (|| {
@@ -1184,6 +1204,10 @@ impl Queue {
                     };
                 }
                 let recordless = if epoch != ticket.epoch {
+                    if at != 0 {
+                        // Only its stamp retires it now, and that covers the commands ahead.
+                        return Err(EAGAIN);
+                    }
                     crossed = true;
                     Recordless::CrossedRecovery
                 } else if masks.is_none() || (finished_before && oldest) {
@@ -1194,7 +1218,7 @@ impl Queue {
                 let next_end = self
                     .active
                     .iter()
-                    .skip(1)
+                    .skip(at + 1)
                     .find_map(|a| a.observed.map(|o| o.timestamps[1]));
                 let stamp = self.graph.stamp()?;
                 let record_aged = !retirement::stamp_covers(stamp, ticket.kick)
@@ -1223,18 +1247,23 @@ impl Queue {
                 if timestamps.is_some() && stampless {
                     retirement::note_stampless(self.qid(), ticket.kick);
                 }
+                // After a rebind the first publication retires first, and stays the oldest
+                // command until its stamp covers it.
+                let first = self
+                    .active
+                    .front()
+                    .and_then(|first| Some((first.packet.order.sequence, first.ticket?.epoch)));
                 if timestamps.is_some()
-                    && self.previous.as_ref().is_some_and(|p| {
-                        p.publication != Some((front.packet.order.sequence, ticket.epoch))
-                    })
+                    && self.previous.as_ref().is_some_and(|p| p.publication != first)
                 {
                     return Err(EIO);
                 }
                 Ok(timestamps.map(|timestamps| (timestamps, stampless)))
             })();
             oldest = false;
+            let owed = front.stamps_owed;
             match result {
-                Ok(Some((_, _))) if self.active.front().is_some_and(|front| front.stamps_owed) => {
+                Ok(Some(_)) if owed && at == 0 => {
                     // The stamp now covers the held command: release its descriptor.
                     self.submitted = self.submitted.checked_sub(1).ok_or(EIO)?;
                     self.active.pop().ok_or(EIO)?;
@@ -1245,13 +1274,15 @@ impl Queue {
                         self.released_at = now_ns();
                     }
                 }
+                // It was reported when it retired: step past it.
+                Ok(Some(_)) | Err(EAGAIN) if owed => at += 1,
                 Ok(Some((timestamps, stampless))) => {
                     let submitted = self.submitted.checked_sub(1).ok_or(EIO)?;
                     if front.qos_pending {
                         complete_qos(self.qos_owner())?;
-                        self.active.iter_mut().next().ok_or(EIO)?.qos_pending = false;
+                        self.active.get_mut(at).ok_or(EIO)?.qos_pending = false;
                     }
-                    let front = self.active.front().ok_or(EIO)?;
+                    let front = self.active.get(at).ok_or(EIO)?;
                     if let Some(ticket) = front.ticket {
                         crate::g17::recovery::note_retired();
                         crate::g17::trace::complete(
@@ -1275,17 +1306,19 @@ impl Queue {
                         Err(error) => Deferred::Retired(completion, Err(error)),
                     })?;
                     self.retire_pending = false;
-                    if stampless {
+                    if stampless || at != 0 {
                         // A completion record is no witness that the firmware is done with the
                         // descriptor: it can still store the stamp through it. Keep the command
-                        // (and its descriptor) at the front until the stamp covers it.
+                        // (and its descriptor) until the stamp covers it, as well as one that
+                        // retired behind it, and go on with the next command.
                         let _ = submitted;
-                        let front = self.active.iter_mut().next().ok_or(EIO)?;
+                        let front = self.active.get_mut(at).ok_or(EIO)?;
                         front.stamps_owed = true;
                         if front.observed.is_some() {
                             self.last_end = self.last_end.max(timestamps[1]);
                         }
-                        break;
+                        at += 1;
+                        continue;
                     }
                     self.submitted = submitted;
                     let active = self.active.pop().ok_or(EIO)?;
@@ -1301,7 +1334,7 @@ impl Queue {
                 }
                 Ok(None) | Err(EAGAIN) => {
                     if restart.is_some() {
-                        self.active.iter_mut().next().ok_or(EIO)?.observed_at = restart;
+                        self.active.get_mut(at).ok_or(EIO)?.observed_at = restart;
                     }
                     self.retire_pending = self.front_finished();
                     break;
@@ -1314,6 +1347,10 @@ impl Queue {
                     return Ok(());
                 }
             }
+        }
+        if at != 0 {
+            // Owed stamps come without a completion event: keep polling for them.
+            self.retire_pending = self.front_finished();
         }
         Ok(())
     }
@@ -1330,7 +1367,8 @@ impl Queue {
         let dropped = crossed && self.fault_stamp.is_none();
         for active in self.active.iter_mut() {
             let completion = &active.packet.completion;
-            if completion.spared() || completion.guilty() {
+            // A command whose stamp is owed ran and has its result.
+            if active.stamps_owed || completion.spared() || completion.guilty() {
                 continue;
             }
             if dropped {
@@ -2295,6 +2333,30 @@ impl Queue {
         self.active
             .iter()
             .any(|active| Arc::ptr_eq(&active.packet, packet))
+    }
+
+    /// `packet` retired and its command only holds its descriptor (`Active::stamps_owed`).
+    pub(crate) fn retired_held(&self, packet: &Arc<Packet>) -> bool {
+        self.active
+            .iter()
+            .any(|active| active.stamps_owed && Arc::ptr_eq(&active.packet, packet))
+    }
+
+    /// The watchdog gave up on `packet`, the oldest command still to retire, and the firmware
+    /// wrote its completion record: end its stamp wait, so that the next pass retires it on the
+    /// record, its stamp owed, instead of the watchdog failing it. Not on M5, whose record can
+    /// precede the command's writes.
+    pub(crate) fn expire_stamp_wait(&mut self, packet: &Arc<Packet>) -> bool {
+        if self.quarantined || self.graph.m5 {
+            return false;
+        }
+        match self.active.iter_mut().find(|active| !active.stamps_owed) {
+            Some(head) if Arc::ptr_eq(&head.packet, packet) && head.observed.is_some() => {
+                head.observed_at = Some(retirement::STAMP_WAIT_EXPIRED);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// A watchdog settles spared, deferred waiters without changing their VM status.

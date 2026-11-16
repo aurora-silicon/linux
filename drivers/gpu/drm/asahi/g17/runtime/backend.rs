@@ -436,7 +436,12 @@ impl job::Backend for Backend {
             let excuse = timeout::Excuse { used: excused, limit: timeout::excuse_limit(
                 crate::module_parameters::compute_timeout_max_ms.value()) };
             let verdict = firmware.queues.render_timeout_decision(packet, renewals, excuse);
-            let decision = verdict.map_or(Decision::Own, |verdict| verdict.decision);
+            // Nothing retires a render here: one whose stamps lag retires on its pass record
+            // when it is failed (`fail_render_packet`).
+            let decision = match verdict.map(|verdict| verdict.decision) {
+                None | Some(Decision::Retire) => Decision::Own,
+                Some(decision) => decision,
+            };
             // As compute does: work still blocked behind another VM's older unfinished work
             // after the whole grace is innocent, so its failure must stay non-sticky. The pair's
             // quarantine extends the class to the pair's other groups.

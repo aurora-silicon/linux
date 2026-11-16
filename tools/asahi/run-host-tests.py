@@ -164,6 +164,11 @@ ASAHI_TESTS = {
     'g17-capacity-backoff-tests.py': [([], PASS)],
     'g17-capacity-fault-tests.py': [([], PASS)],
     'g17-compute-constructor-tests.py': [([], PASS)],
+    'g17-compute-owed-stamp-tests.py': [([], PASS)]
+        + mutations('--mutation', ('own-finished', 'no-retire-glue', 'retire-unchecked', 'no-expiry',
+                                   'no-step-past', 'pop-owed', 'head-includes-owed', 'held-stamped-pops',
+                                   'crossed-behind-owed', 'owed-classified', 'rebind-check-entry',
+                                   'timeout-fails-retired', 'no-owed-poll'), []),
     'g17-compute-deadline-tests.py': [([], PASS)],
     'g17-compute-growth-deadline-tests.py': [([], PASS)],
     'g17-firmware-selection-tests.py': [([], PASS)],
