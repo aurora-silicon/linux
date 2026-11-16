@@ -2043,7 +2043,8 @@ static void t6040_tun_pll_stop(struct t6040_usb2_phy *tphy)
 		dev_warn(tphy->dev, "DP tunnel: AUSPLL release timed out (cmd %#x, pclk status %#x)\n",
 			 readl(core + T6040_CORE_AUSPLL_CMD),
 			 readl(core + T6040_CORE_DP_PCLK_STATUS));
-	t6040_usb2_clear32(core + T6040_CORE_AUSPLL_CLKOUT_MASTER, 0x8);
+	/* Both outputs the start set: a stale 0x800 reads as "in use" next time. */
+	t6040_usb2_clear32(core + T6040_CORE_AUSPLL_CLKOUT_MASTER, 0x808);
 	tphy->tun_pll = false;
 }
 
