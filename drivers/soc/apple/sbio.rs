@@ -2325,6 +2325,10 @@ impl SepData {
             Self::defer_late_attach(this);
             return;
         }
+        let Ok(_capture) = crate::capture::Lease::acquire(this) else {
+            Self::defer_late_attach(this);
+            return;
+        };
         // Enrol, verify and deletion drive the sensor and the enclave under
         // the same lock, and `capture_begin` lets a suspend wait for us.
         let _writer = this.catacomb_writer.lock();
@@ -5167,7 +5171,7 @@ impl SepData {
         self.wait_for_worker_exit(&mut session, true)?;
         bio::open(&mut session)?;
         drop(session);
-        if let Err(e) = self.prepare_bio_open() {
+        if let Err(e) = crate::capture::Lease::acquire(self).and_then(|_lease| self.prepare_bio_open()) {
             bio::release(&mut self.bio_session.lock());
             return Err(e);
         }
@@ -5208,6 +5212,7 @@ impl SepData {
     /// The enrol or verify work item `epoch` has stopped.
     pub(crate) fn capture_worker_stopped(&self, epoch: u64) {
         bio::worker_stopped(&mut self.bio_session.lock(), epoch);
+        self.capture.lock().finish_bio(epoch);
         self.worker_gone.notify_all();
     }
 
@@ -6022,6 +6027,11 @@ impl SepData {
         if self.shutting_down.load(Relaxed) {
             return Err(ENODEV);
         }
+        if bio::starts_capture(cmd) {
+            self.wait_until_awake()?;
+            self.wait_for_worker_exit(&mut self.bio_session.lock(), false)?;
+        }
+        let lease = if bio::uses_enclave(cmd) { Some(crate::capture::Lease::acquire(self)?) } else { None };
         if cmd == bio::IOC_ATTEST {
             return self.bio_attest(arg);
         }
@@ -6099,9 +6109,6 @@ impl SepData {
             self.bio_delete_orphan(arg)?
         } else {
             let mut session = self.bio_session.lock();
-            if bio::starts_capture(cmd) {
-                self.wait_for_worker_exit(&mut session, false)?;
-            }
             let index = self.bio_index.lock();
             let mut ctx = bio::Context {
                 session: &mut session,
@@ -6143,6 +6150,10 @@ impl SepData {
             deleted?;
         }
 
+        if handled.start_verify || handled.start_enrol {
+            let epoch = bio::queued_epoch(&self.bio_session.lock()).ok_or(EIO)?;
+            lease.ok_or(EIO)?.into_bio(epoch);
+        }
         if handled.wake {
             self.bio_wake();
         }

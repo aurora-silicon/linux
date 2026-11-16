@@ -1323,6 +1323,12 @@ pub(crate) fn abort_capture(session: &mut Session) -> bool {
     true
 }
 
+/// Calls that must not interleave with an admitted sensor operation.
+pub(crate) fn uses_enclave(cmd: u32) -> bool {
+    starts_capture(cmd) || matches!(cmd, IOC_GET_INFO | IOC_DELETE | IOC_DELETE_ALL
+        | IOC_DELETE_ORPHAN | IOC_ATTEST | IOC_LIST_ENCLAVE | IOC_PREPARE_ENROL)
+}
+
 /// The ioctls that start a sensor capture.
 pub(crate) fn starts_capture(cmd: u32) -> bool {
     cmd == IOC_ENROL_START || cmd == IOC_VERIFY_START

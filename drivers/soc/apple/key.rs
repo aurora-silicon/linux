@@ -1601,6 +1601,7 @@ impl SepData {
         };
         let mut job = KeyTouch::new_in(op, blob, digest, sealed, constraint, bag)?;
         job.probe = probe;
+        let _capture = crate::capture::Lease::acquire(self)?;
         // Serialises with /dev/sep-bio's enrol and verify work, as they do
         // with each other, and with every other touch-gated call: one job,
         // one grant, one context at a time.

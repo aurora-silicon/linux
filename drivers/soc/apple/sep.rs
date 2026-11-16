@@ -13,6 +13,7 @@ compile_error!("apple_sep requires CONFIG_OF_DYNAMIC: the SEP and DART nodes shi
 mod ratelimit;
 mod attach;
 mod bio;
+mod capture;
 mod catacomb;
 mod control;
 mod der;
@@ -907,6 +908,8 @@ struct SepData {
     // /dev/sep-key: P-256 keys created inside the SEP (see `key`).
     #[pin]
     key_dev: Mutex<Option<shim::BioChardev>>,
+    #[pin]
+    capture: Mutex<capture::State>,
 
     // /dev/sep-key: one identity-bag load, operation and unload at a time.
     // The device's ioctls run concurrently (a touch wait must not block
@@ -1312,6 +1315,7 @@ impl SepData {
                 bio_dev <- new_mutex!(None),
                 rearm_dev <- new_mutex!(None),
                 key_dev <- new_mutex!(None),
+                capture <- new_mutex!(capture::State::new()),
                 key_bag_lock <- new_mutex!(()),
                 key_touch <- new_mutex!(None),
                 key_touch_active: Atomic::new(false),
