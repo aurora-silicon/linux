@@ -6966,6 +6966,10 @@ static void t8142_lower_io(struct apple_sleep *s)
 		apple_sleep_lower_apcie(s);
 		s->ans_off_ret = sleep_ps_wait_off(s, s->soc->ps.ans);
 	}
+	/* PMP's callback has idled the firmware and saved SRAM; RUN is clear. */
+	sleep_ps_lower(s, 0x598);
+	if (sleep_ps_wait_off(s, 0x598))
+		dev_warn(s->dev, "PMP power domain did not turn off\n");
 	sleep_note(s, 0x63);
 }
 
