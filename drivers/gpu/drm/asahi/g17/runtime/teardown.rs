@@ -174,6 +174,7 @@ impl Firmware {
     pub(in crate::g17) fn service_teardown(&mut self, reclaim: &mut ReclaimBatch) -> Result {
         self.queues.render.collect_reclaimable(reclaim)?;
         if self.queues.teardown.is_empty() {
+            self.queues.sync_render_holds();
             return Ok(());
         }
         self.queues.render.observe_teardown_releases(&self.init)?;
@@ -211,6 +212,9 @@ impl Firmware {
             // A channel whose last scheduler release is consumed can change owner.
             self.primary.state.shared.channels.notify();
         }
+        // The pairs of consumed releases are parked: their holds end, which wakes the
+        // publications waiting for render capacity.
+        self.queues.sync_render_holds();
         Ok(())
     }
 }

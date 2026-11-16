@@ -704,13 +704,14 @@ impl crate::g17::Firmware {
         if let Some((status, error)) = entry.pending_error.take() {
             if Arc::ptr_eq(pair.context().status(), &status) {
                 pair.quarantine(error, &mut |event| deferred.push(event))?;
-                self.queues.admission.set_held(usize::from(slot), pair.unreusable_work());
             }
         }
         if entry.closed {
             pair.release_owner();
         }
-        if !entry.pending_timeout {
+        let pending_timeout = entry.pending_timeout;
+        self.queues.hold_render_slot(usize::from(slot));
+        if !pending_timeout {
             return Ok(());
         }
         for _ in 0..crate::hw::t8140::queues::RENDER_DEPTH {

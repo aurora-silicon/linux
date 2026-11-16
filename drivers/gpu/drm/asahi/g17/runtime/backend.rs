@@ -108,6 +108,10 @@ impl Backend {
             .close(&self.context, super::now_ns())?;
         firmware.queues.release_compute(self.owner)?;
         firmware.queues.release_render(self.owner)?;
+        // The armed release holds the owner's pairs from every other owner until it is
+        // consumed. Hold them before admission releases the owner: admission does not take
+        // the device mutex, so a slot released first could be taken in between.
+        firmware.queues.sync_render_holds();
         firmware.queues.admission.release_owner(self.owner);
         drop(state);
         // Its idle channel, or its slot and never-published QID, is free.

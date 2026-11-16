@@ -597,7 +597,6 @@ impl super::super::Backend {
                 let pair = parked.commit(&mut prepared, storage)?;
                 firmware.queues.buffers.reserve_owner(buffer.0)?;
                 firmware.queues.buffers.release(buffer.0)?;
-                let held = pair.unreusable_work();
                 let entry = firmware.queues.render.entry_mut(slot)?;
                 entry.reservation.owner = self.owner;
                 entry.reservation.buffer = buffer;
@@ -606,7 +605,7 @@ impl super::super::Backend {
                 entry.pair = Some(pair);
                 entry.closed = false;
                 entry.published = false;
-                firmware.queues.admission.set_held(usize::from(slot), held);
+                firmware.queues.hold_render_slot(usize::from(slot));
                 Ok(())
             })()
         };
@@ -746,7 +745,6 @@ impl super::super::Backend {
                 Ok(())
             })();
             // The original installed pair remains owned on every error.
-            let held = pair.unreusable_work();
             let entry = firmware.queues.render.entry_mut(slot)?;
             entry.preparing = None;
             entry.pending_owner = None;
@@ -754,7 +752,8 @@ impl super::super::Backend {
             entry.pair = Some(pair);
             entry.borrowed_dependencies = None;
             entry.borrowed_switch = None;
-            firmware.queues.admission.set_held(usize::from(slot), held);
+            // A displaced context's release is armed now: its other pairs are held as well.
+            firmware.queues.sync_render_holds();
             if firmware.queues.render.take_missed_event(slot) {
                 self.shared.queue_events();
             }
@@ -950,6 +949,7 @@ impl super::super::Backend {
                 .ok_or(EIO)?
                 .release_owner();
         }
+        firmware.queues.hold_render_slot(usize::from(slot));
         self.shared.note_changed();
         let published = (|| {
             let entry = firmware.queues.render.entry(slot)?;

@@ -75,10 +75,12 @@ struct State {
     /// and when. A new owner takes such a pair last, the one released longest ago first.
     killed: u64,
     killed_at: [u64; cfg::RENDER_SLOTS],
-    /// Slots whose pair keeps work that no other owner can bind past: a quarantine, or a group
-    /// whose stamps are still owed. The slot's own live owner keeps using its pair, but no new or
-    /// other owner is given it, even once it is released and has no lease left, until the
-    /// runtime clears the bit (the pair drained) or both processors stop.
+    /// Slots whose pair no other owner can bind: it keeps work nobody else can bind past (a
+    /// quarantine, or a group whose stamps are still owed), or the scheduler release of the
+    /// context it is bound to is pending. The slot's own live owner keeps using its pair, but no
+    /// new or other owner is given it, even once it is released and has no lease left, until
+    /// the runtime clears the bit (the pair drained, or the release was consumed and the pair
+    /// parked) or both processors stop.
     held: u64,
     /// The physical queue table still has room for a pair built in an unowned slot. The
     /// runtime updates this whenever the table changes.
@@ -488,6 +490,15 @@ impl State {
         was && !held
     }
 
+    /// [`Self::set_held`] for every slot in `slots`, whose bits in `held` are the new ones.
+    /// Returns whether a slot stopped being held.
+    fn sync_held(&mut self, slots: u64, held: u64) -> bool {
+        let slots = slots & Self::MASK;
+        let cleared = self.held & slots & !held != 0;
+        self.held = (self.held & !slots) | (held & slots);
+        cleared
+    }
+
     fn retained(&self) -> u64 {
         self.owners.iter().enumerate().fold(0u64, |bits, (slot, owner)| {
             bits | if *owner != 0 { 1u64 << slot } else { 0 }
@@ -770,12 +781,21 @@ impl Pool {
         self.returned();
     }
 
-    /// Under the device mutex, each time the runtime puts a pair back: `held` while the pair in
-    /// `slot` keeps work that no other owner can bind past (`Pair::unreusable_work`). Set before
-    /// that pass's retirements drop their leases, so the slot is never free for another owner
-    /// in between; clearing it wakes the waiters.
+    /// Under the device mutex, each time the runtime puts a pair back: `held` while no other
+    /// owner can bind the pair in `slot` (`render_hold` in the runtime). Set before that pass's
+    /// retirements drop their leases, and before a closing owner's slots are released, so the
+    /// slot is never free for another owner in between; clearing it wakes the waiters.
     pub(crate) fn set_held(&self, slot: usize, held: bool) {
         let cleared = self.state.lock().set_held(slot, held);
+        if cleared {
+            self.returned();
+        }
+    }
+
+    /// [`Self::set_held`] for every slot in `slots` under one lock: the runtime re-derives
+    /// them all where a scheduler release is armed or consumed, and on housekeeping passes.
+    pub(crate) fn sync_held(&self, slots: u64, held: u64) {
+        let cleared = self.state.lock().sync_held(slots, held);
         if cleared {
             self.returned();
         }
@@ -870,6 +890,18 @@ mod accounting_tests {
         assert_eq!(state.acquire(2, 1), None);
         assert!(state.set_held(5, false));
         assert_eq!(state.acquire(2, 1), Some(5));
+    }
+
+    #[test]
+    fn a_sync_changes_only_the_slots_it_names() {
+        let mut state = State::new();
+        state.held = (1u64 << 3) | (1u64 << 4);
+        // Slot 4 is lent out (not named): its bit stays. Slot 0 is no render slot.
+        assert!(!state.sync_held((1u64 << 3) | (1u64 << 7) | 1, (1u64 << 3) | (1u64 << 7) | 1));
+        assert_eq!(state.held, (1u64 << 3) | (1u64 << 4) | (1u64 << 7));
+        assert!(state.sync_held((1u64 << 3) | (1u64 << 7), 1u64 << 7));
+        assert_eq!(state.held, (1u64 << 4) | (1u64 << 7));
+        assert!(!state.sync_held(1u64 << 3, 0));
     }
 
     #[test]
