@@ -302,23 +302,29 @@ static inline void dwc3_apple_mask(struct dwc3_apple *appledwc, u32 offset, u32 
 }
 
 /*
- * macOS's T8140 controller reset sets GCTL's hibernation enable and a power-down scale
- * of 0xd. Without the enable the core's power management accepts a
- * D0/D3 request but saves and restores nothing, so the PHY's hibernation for a sleep
- * needs it.
+ * macOS's T8140 and T6050 controller starts set GCTL's hibernation enable and a power-down
+ * scale of 0xd. Without the enable the core's power management accepts a D0/D3 request but
+ * saves and restores nothing, so the PHY's hibernation for a sleep needs it.
  */
-#define DWC3_APPLE_T8140_PWRDNSCALE 0xd
+#define DWC3_APPLE_HIB_PWRDNSCALE 0xd
 
 static void dwc3_apple_setup_hibernation(struct dwc3_apple *appledwc)
 {
 	struct dwc3 *dwc = &appledwc->dwc;
 	u32 reg;
 
-	if (!of_device_is_compatible(appledwc->dev->of_node, "apple,t8140-dwc3"))
+	/*
+	 * J714s: its T6050 controllers too (set at every start, in either role). The one on the
+	 * USB4 dock's port goes through hibernation for its router's sleep (see
+	 * apple_t6050_phy_cio_usb()), and xHCI restores its state after the wake.
+	 */
+	if (!of_device_is_compatible(appledwc->dev->of_node, "apple,t8140-dwc3") &&
+	    !(of_machine_is_compatible("apple,j714s") &&
+	      of_device_is_compatible(appledwc->dev->of_node, "apple,t6050-dwc3")))
 		return;
 	reg = dwc3_readl(dwc, DWC3_GCTL);
 	reg &= ~DWC3_GCTL_PWRDNSCALE_MASK;
-	reg |= DWC3_GCTL_PWRDNSCALE(DWC3_APPLE_T8140_PWRDNSCALE) | DWC3_GCTL_GBLHIBERNATIONEN;
+	reg |= DWC3_GCTL_PWRDNSCALE(DWC3_APPLE_HIB_PWRDNSCALE) | DWC3_GCTL_GBLHIBERNATIONEN;
 	dwc3_writel(dwc, DWC3_GCTL, reg);
 }
 
@@ -482,6 +488,31 @@ static void dwc3_apple_set_ptrcap(struct dwc3_apple *appledwc, u32 mode)
 #define DWC3_APPLE_PIPE_PHY_READY_US 100000
 
 /*
+ * A host core's globals written back after it lost its registers, with no core soft reset.
+ * After a sleep in place this is all macOS's wake of the dock port's host writes before xHCI's
+ * restore (CRS), once the controller is out of hibernation: the ADT's DRD_USB31_GBL_HOST
+ * tunables, Apple's CIO timers and its DRD configuration (after dwc3_core_init()'s soft reset
+ * the restore fails). The core keeps the PHYs it holds.
+ */
+static void dwc3_apple_core_restore(struct dwc3_apple *appledwc)
+{
+	struct dwc3 *dwc = &appledwc->dwc;
+	int ret;
+
+	dwc3_apple_setup_cio(appledwc);
+	dwc3_apple_apply_tunables(appledwc);
+	dwc3_apple_setup_hibernation(appledwc);
+	dwc3_apple_set_ptrcap(appledwc, DWC3_GCTL_PRTCAP_HOST);
+	dwc->dis_u3_susphy_quirk = appledwc->dt_dis_u3_susphy;
+	dwc3_enable_susphy(dwc, true);
+	/* A PHY that came back in a USB3 mode routes the PIPE to it now, before xHCI starts. */
+	ret = phy_set_mode(appledwc->usb3_phy, PHY_MODE_USB_HOST);
+	if (ret)
+		dev_warn(appledwc->dev, "USB3 PHY setup failed after the sleep, USB2 only, err=%d\n",
+			 ret);
+}
+
+/*
  * The core is powered but its registers are at their reset values. Set it up again the way
  * dwc3_apple_core_start() and dwc3_apple_set_role() do, in place: the PHYs and the xHCI
  * device stay, so xHCI can restore its saved state, or start over. Runs in the resume,
@@ -505,18 +536,7 @@ static int dwc3_apple_core_reinit(struct dwc3_apple *appledwc)
 		phy_exit(dwc->usb2_generic_phy[i]);
 	}
 
-	dwc3_apple_setup_cio(appledwc);
-	dwc3_apple_apply_tunables(appledwc);
-	dwc3_apple_setup_hibernation(appledwc);
-	dwc3_apple_set_ptrcap(appledwc, DWC3_GCTL_PRTCAP_HOST);
-	dwc->dis_u3_susphy_quirk = appledwc->dt_dis_u3_susphy;
-	dwc3_enable_susphy(dwc, true);
-	/* A PHY that came back in a USB3 mode routes the PIPE to it now, before xHCI starts. */
-	ret = phy_set_mode(appledwc->usb3_phy, PHY_MODE_USB_HOST);
-	if (ret)
-		dev_warn(appledwc->dev, "USB3 PHY setup failed after the sleep, USB2 only, err=%d\n",
-			 ret);
-
+	dwc3_apple_core_restore(appledwc);
 	return 0;
 }
 
@@ -561,6 +581,55 @@ static int dwc3_apple_tunnel_resume(struct dwc3_apple *appledwc)
 			 appledwc->sleep_tunnel_result, pm_resume_via_firmware() ? "yes" : "no");
 	}
 	ret = appledwc->sleep_tunnel_result;
+	/*
+	 * J714s: the PHY forgot the controller in the firmware sleep, but its bank may have kept
+	 * the state the sleep left, as macOS's does: then, the PIPE given its clock back and the
+	 * controller out of hibernation, a core that kept the GUID mark kept its registers and
+	 * xHCI resumes in place.
+	 */
+	if (ret == APPLE_T6050_CIO_USB_LOST &&
+	    dwc3_apple_tunnel_phy(appledwc, APPLE_T6050_CIO_USB_RETAINED) == APPLE_T6050_CIO_USB_KEPT) {
+		u32 guid = dwc3_readl(&appledwc->dwc, DWC3_GUID);
+
+		dev_dbg(appledwc->dev, "USB host's core after the firmware sleep: GUID %#x (%s)\n",
+			guid, guid == DWC3_APPLE_SLEEP_GUID ? "kept its registers" : "lost them");
+		if (guid == DWC3_APPLE_SLEEP_GUID) {
+			dwc3_writel(&appledwc->dwc, DWC3_GUID, appledwc->sleep_guid);
+			appledwc->sleep_tunnel_result = APPLE_T6050_CIO_USB_KEPT;
+			return 0;
+		}
+		/*
+		 * The core lost its registers (GUID at its reset value) while the controller's
+		 * bank kept the PIPE as the sleep left it: its globals written back as macOS does,
+		 * xHCI restores its saved state rather than starting over and resetting every
+		 * device on the dock.
+		 */
+		ret = reset_control_deassert(appledwc->reset);
+		if (!ret)
+			dwc3_apple_core_restore(appledwc);
+		dev_info(appledwc->dev, "USB host kept through the router's sleep: globals written back, xHCI restores its state (%d)\n",
+			 ret);
+		if (!ret) {
+			appledwc->sleep_tunnel_result = DWC3_APPLE_TUNNEL_REINIT;
+			return 0;
+		}
+		appledwc->sleep_tunnel_result = APPLE_T6050_CIO_USB_LOST;
+		return ret;
+	} else if (ret == APPLE_T6050_CIO_USB_KEPT || ret == APPLE_T6050_CIO_USB_PARKED) {
+		u32 guid = dwc3_readl(&appledwc->dwc, DWC3_GUID);
+
+		if (guid == DWC3_APPLE_SLEEP_GUID) {
+			dwc3_writel(&appledwc->dwc, DWC3_GUID, appledwc->sleep_guid);
+		} else {
+			/*
+			 * A sleep refused after the controller's hibernation: the PHY brought
+			 * it back to D0 and its core lost its registers as at a wake. Its
+			 * globals are written back the same way, and xHCI restores its state.
+			 */
+			dwc3_apple_core_restore(appledwc);
+			dev_info(appledwc->dev, "USB host after the hibernation of a refused sleep: globals written back, xHCI restores its state\n");
+		}
+	}
 	if (ret == APPLE_T6050_CIO_USB_KEPT || ret == APPLE_T6050_CIO_USB_PARKED)
 		return 0;
 	/* Lost, or not known: nothing touches the core before it is out of reset. */
@@ -1463,9 +1532,10 @@ static int dwc3_apple_recover(struct dwc3_apple *appledwc)
  * mxt5, mxt6, mxt6b, seven sleeps), so the router's USB3 tunnel keeps its host. Linux stopped the
  * host here, 2.66 s before the dock's sleep bit (run sv6t9), and parked its PIPE. With its PIPE
  * on the router's USB3 tunnel the host now stays: xHCI and the devices behind it suspend as for
- * any sleep, their links in U3; the glue stays a syscore device, so the core keeps its power and
- * registers; the router's host parks the PIPE behind the router firmware's sleep, or with the
- * router awake again after a refusal, see apple_t6050_phy_cio_usb().
+ * any sleep, their links in U3; the glue stays a syscore device; the router's host parks the PIPE
+ * behind the router firmware's sleep, or with the router awake again after a refusal, see
+ * apple_t6050_phy_cio_usb(). On J714s the PHY takes the controller through hibernation there:
+ * its core comes back without its registers, its state kept for xHCI's restore.
  */
 static bool dwc3_apple_tunnel_keep(struct dwc3_apple *appledwc)
 {
@@ -1477,6 +1547,9 @@ static bool dwc3_apple_tunnel_keep(struct dwc3_apple *appledwc)
 	appledwc->sleep_tunnel = true;
 	appledwc->sleep_tunnel_taken = false;
 	appledwc->sleep_tunnel_result = APPLE_T6050_CIO_USB_KEPT;
+	/* A mark in GUID, to tell after the sleep whether the core kept its registers */
+	appledwc->sleep_guid = dwc3_readl(&appledwc->dwc, DWC3_GUID);
+	dwc3_writel(&appledwc->dwc, DWC3_GUID, DWC3_APPLE_SLEEP_GUID);
 	appledwc->sleep_tunnel_role = USB_ROLE_HOST;
 	dev_info(appledwc->dev, "USB host kept for the USB4 router's sleep: xHCI suspends in place\n");
 	return true;
