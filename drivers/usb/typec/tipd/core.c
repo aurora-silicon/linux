@@ -353,12 +353,17 @@ static int tps6598x_disconnect(struct tps6598x *tps, u32 status)
 /*
  * The sleep's rules for the port controllers' system power state command (the controller is
  * woken first, the command's end is read at intervals, a failed S3 refuses the sleep, the
- * command's limit and its lines) are in force on the board they have run on, the J714s.
- * Elsewhere, other boards with the same SoC included, the command is as it was.
+ * command's limit and its lines) are in force on the board they have run on, the J714s, and on
+ * the M5 MacBook Airs (J813, J815), whose SN201202x controllers sit on the same generation 4
+ * SPMI and whose sleep, like the J714s's, asks for the command (apple,sleep-ssps). Elsewhere,
+ * other boards with the same SoCs included, the command is as it was. Only a firmware-driven
+ * sleep sends it.
  */
 static bool tipd_sleep_ssps_rules(void)
 {
-	return of_machine_is_compatible("apple,j714s");
+	return of_machine_is_compatible("apple,j714s") ||
+	       of_machine_is_compatible("apple,j813") ||
+	       of_machine_is_compatible("apple,j815");
 }
 
 /*
