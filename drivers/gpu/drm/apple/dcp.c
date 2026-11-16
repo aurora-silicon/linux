@@ -363,9 +363,9 @@ bool dcp_h17p_external_ready(struct device_node *np)
 	return ready;
 }
 
-static bool relink_rebuild = true;
+static bool relink_rebuild;
 module_param(relink_rebuild, bool, 0644);
-MODULE_PARM_DESC(relink_rebuild, "from the second Type-C relink of an attachment on a Thunderbolt display, set the DP tunnel up again instead of attaching the sink again (default on)");
+MODULE_PARM_DESC(relink_rebuild, "from the second Type-C relink of an attachment on a Thunderbolt display, set the DP tunnel up again instead of attaching the sink again (default off; day2 boot 07024114: no rebuild recovered the display)");
 
 static bool show_notch;
 module_param(show_notch, bool, 0644);

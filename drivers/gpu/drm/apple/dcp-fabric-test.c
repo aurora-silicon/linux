@@ -2472,7 +2472,6 @@ static void relink_running_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, s.tries, 2U);
 }
 
-/* Three relinks per attachment or wake; a new attachment starts afresh. */
 /* Only the second and later relinks of an attachment rebuild, and only so many. */
 static void relink_escalate_test(struct kunit *test)
 {
@@ -2496,6 +2495,7 @@ static void relink_escalate_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, s.rebuilds, 0U);
 }
 
+/* Three relinks per attachment or wake; a new attachment starts afresh. */
 static void relink_budget_test(struct kunit *test)
 {
 	unsigned long t = 100000;
