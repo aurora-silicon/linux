@@ -345,9 +345,27 @@ impl Shared {
         }
     }
 
-    /// Undoes everything short of a stopped firmware. A builder that never finishes would keep
-    /// publication closed for good, and that is a lost device.
-    fn sleep_cancel(self: &Arc<Self>) {
+    /// Undoes everything short of a stopped firmware. T6050 keeps an uncertain session owned:
+    /// marking it lost here would let the runtime worker stop firmware before the commit.
+    fn sleep_cancel(self: &Arc<Self>, commit_only: bool) {
+        if commit_only {
+            self.sleeping.store(true, Ordering::Release);
+            self.join_event_workers();
+            let drained = self
+                .preparations
+                .wait_drained_until(super::now_ns().saturating_add(DRAIN_NS));
+            if self.crashed.load(Ordering::Acquire)
+                || drained.is_err()
+                || !self.preparations.reopen()
+            {
+                dev_warn!(self.dev.as_ref(), "GPU sleep cancellation retains its session\n");
+                return;
+            }
+            self.sleeping.store(false, Ordering::Release);
+            self.sleep_gate.store(false, Ordering::Release);
+            self.queue_events();
+            return;
+        }
         self.sleeping.store(false, Ordering::Release);
         self.sleep_gate.store(false, Ordering::Release);
         let drained = self
@@ -424,8 +442,11 @@ impl Shared {
 
     /// Closes publication, waits for quiet, and leaves the stop to the sleep's commit. A refusal
     /// changes nothing.
-    fn sleep_down(self: &Arc<Self>) -> Result {
+    fn sleep_down(self: &Arc<Self>, commit_only: bool) -> Result {
         if self.sleeping() {
+            if commit_only {
+                return Err(EBUSY);
+            }
             let mut state = self.state.lock();
             if let Some(firmware) = (*state).as_deref_mut() {
                 lower_domain(firmware);
@@ -449,7 +470,8 @@ impl Shared {
             });
         match result {
             Ok(()) => Ok(()),
-            Err(error) if error == ENODEV || self.crashed.load(Ordering::Acquire) => {
+            Err(error) if !commit_only &&
+                (error == ENODEV || self.crashed.load(Ordering::Acquire)) => {
                 // Nothing to save: let the worker finish detaching what's left, and then the
                 // domain only has to be off for the sleep.
                 self.sleeping.store(false, Ordering::Release);
@@ -464,7 +486,7 @@ impl Shared {
                 Ok(())
             }
             Err(error) => {
-                self.sleep_cancel();
+                self.sleep_cancel(commit_only);
                 Err(error)
             }
         }
@@ -540,7 +562,7 @@ impl super::Gpu {
             );
             return Err(EBUSY);
         }
-        let result = self.shared.sleep_down();
+        let result = self.shared.sleep_down(self.cfg.chip_id == 0x6050);
         if let Err(error) = result {
             dev_warn!(self.shared.dev.as_ref(), "GPU refused sleep: {:?}\n", error);
         }
@@ -560,10 +582,15 @@ impl super::Gpu {
                     self.shared.dev.as_ref(),
                     "sleep refused before the commit: GPU firmware never stopped\n"
                 );
-                self.shared.sleep_cancel();
+                self.shared.sleep_cancel(self.cfg.chip_id == 0x6050);
                 return;
             }
             self.shared.sleep_settle_commit();
+        }
+        if self.cfg.chip_id == 0x6050 && !real {
+            // With no physical wake, even an uncertain or stopped session stays owned.
+            // Neither a refusal nor a missing commit receipt authorizes power or restart.
+            return;
         }
         if !real && self.shared.sleep_hold() {
             return;
