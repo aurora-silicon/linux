@@ -254,7 +254,10 @@
 		<0x0 38 0x540 0x0>;
 	apple,ptd-sleep = <0x1e0 12 13 14 36>;
 	apple,pmu-sleep-reads = <0xf801 1 0xf808 4 0xf802 1 0xf818 1 0xf819 2 0xf800 1 0xa7dc 4>;
-	apple,spmi-sleep-order = <1 0 4 2 3>;
+	/* The J714s's buses, then the Max's nub-spmi1 and nub-spmi4 (its other PMICs) */
+	apple,spmi-buses = <&nub_spmi_a0>, <&nub_spmi2>, <&nub_spmi_a1>, <&nub_spmi3>,
+			   <&aop_spmi0>, <&nub_spmi1>, <&nub_spmi4>;
+	apple,spmi-sleep-order = <1 0 4 2 3 5 6>;
 	apple,spmi-sleep-gap-us = <480>;
 	apple,pmu-alarm-rearm = <0x43 0x41>;
 	apple,pmu-wake-stage = <0xfe>;
