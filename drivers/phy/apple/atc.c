@@ -7293,8 +7293,9 @@ static int atcphy_suspend_noirq(struct device *dev)
  */
 static void atcphy_sleep_lost_common(struct apple_atcphy *atcphy)
 {
-	if (!atcphy->hw->has_t8140_dp || !atcphy->hw->restore_after_pd_off ||
-	    !pm_resume_via_firmware())
+	if ((!atcphy->hw->has_t8140_dp &&
+	     !of_device_is_compatible(atcphy->np, "apple,t8142-atcphy")) ||
+	    !atcphy->hw->restore_after_pd_off || !pm_resume_via_firmware())
 		return;
 	WRITE_ONCE(atcphy->pd_was_off, true);
 	dev_dbg(atcphy->dev, "mode %d lost in the sleep: setting it up again\n", atcphy->mode);
@@ -7870,6 +7871,8 @@ static const struct atcphy_hw atcphy_hw_t8142 = {
 	.pipe_mux_clk = PIPEHANDLER_MUX_CTRL_CLK_T8142,
 	.pipe_mux_data = PIPEHANDLER_MUX_CTRL_DATA_T8142,
 	.has_usb4 = true,
+	.park_dummy_phy = true,
+	.restore_after_pd_off = true,
 };
 
 static const struct of_device_id atcphy_match[] = {
