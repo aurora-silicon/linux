@@ -163,7 +163,14 @@ static int mux_control_deselect(struct mux_control *m) { (void)m;event('C');xbar
     pos=actual.index('static struct typec_mux_dev phy_provider')
     # route_set asks whether a tunnel holds any of the port's slots: the real helper.
     tunneled='#ifndef ARRAY_SIZE\n#define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))\n#endif\n'+apple_function(ROOT,'dcp_typec_port_tunneled')
-    actual=actual[:pos]+tunneled+block(dcp,'static bool dcp_typec_route_is_dp(')+'\n'+block(dcp,'static int dcp_typec_route_set(')+'\n'+actual[pos:]
+    route_apply=apple_function(ROOT,'dcp_typec_route_apply')
+    if route_apply:
+        # The ordinary SAFE fixture supplies a leaf for the T8142-only finish
+        # path. Here set must execute the complete production apply body too.
+        stub=block(actual,'static int dcp_typec_route_apply(')
+        actual=actual.replace(stub, 'static int dcp_typec_route_apply(struct typec_mux_dev *,struct typec_mux_state *);', 1)
+        pos=actual.index('static struct typec_mux_dev phy_provider')
+    actual=actual[:pos]+tunneled+block(dcp,'static bool dcp_typec_route_is_dp(')+'\n'+route_apply+block(dcp,'static int dcp_typec_route_set(')+'\n'+actual[pos:]
     actual=actual.replace(block(actual,'static int display_set('),'''static int display_set(struct typec_mux_dev *m,struct typec_mux_state *s) { event('S');return dcp_typec_route_set(m,s); }''',1)
     actual=actual.replace("(void)m;assert(s->mode==TYPEC_STATE_SAFE);event('L');", "(void)m;(void)s;event('L');",1)
     actual=actual.replace('connector=(struct connector){.connected=true};','connector=(struct connector){.connected=true};',1)

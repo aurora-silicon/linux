@@ -77,6 +77,10 @@ static int ordinary_safe(void);
 static void ordinary_initial(void);
 static void ordinary_usb2_check(void);
 static void event(char c) { assert(count+1<sizeof(events));events[count++]=c;events[count]=0; }
+/* This fixture covers M1/M2 role removal, never T8142 DP admission. */
+static bool dcp_t8142_ext(struct apple_dcp *d) { (void)d;return false; }
+static int dcp_typec_route_apply(struct typec_mux_dev *m,struct typec_mux_state *s)
+{ (void)m;(void)s;assert(!"unexpected T8142 route admission");return -EINVAL; }
 static bool dcp_is_external_h17p(struct apple_dcp *d) { return d->external; }
 static int dcp_dptx_disconnect_oob(void *dev,u32 index) { (void)dev;assert(index==0);event('Q');stops++;if(power_error){display.external_error=power_error;return power_error;}display.external_cable=false;display.external_stopped=true;display.dptxport[0].connected=false;display.typec_cable_connected=false;connector.connected=false;return 0; }
 static struct drm_device *dcp_typec_drm(void) { return NULL; }

@@ -8,11 +8,13 @@ struct apple_atcphy {
 	struct {
 		bool prepared;
 	} cio_sleep;
-    struct { void *usb3_dp; } tunables;
+	struct {
+		void *usb3_dp, *dp_lioa, *dp_common_config;
+	} tunables;
 
 	const struct atcphy_hw *hw;
 	struct {
-		unsigned char *core, *lpdptx, *pipehandler, *usb2phy;
+		unsigned char *core, *lpdptx, *lioa, *pipehandler, *usb2phy;
 	} regs;
 	struct reset_controller_dev rcdev;
 	void *dev;
@@ -260,6 +262,15 @@ static void atcphy_usb2_power_on(struct apple_atcphy *p)
 {
 	(void)p;
 }
+
+/* This teardown fixture never selects T8142 DP calibration. */
+static void apple_tunable_apply(void *base, void *tunable)
+{
+	(void)base;
+	(void)tunable;
+	assert(!"unexpected banked DP calibration");
+}
+
 static void atcphy_apply_tunables(struct apple_atcphy *p, enum atcphy_mode m)
 {
 	(void)p;
