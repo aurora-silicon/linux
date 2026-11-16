@@ -123,7 +123,7 @@ struct apple_sleep_region_state {
 	/* Each display child's word as it read before the stop lowered it */
 	u32 disp_child_saved[5][16];
 	u32 mcc_cycle[2][10];
-	void __iomem *spmi_bus[5];
+	void __iomem *spmi_bus[7];
 	/* nub-spmi0's controller: its driver's lock is held through a returning PMU exchange */
 	struct device *pmu_bus;
 	void __iomem *aon_clk[2];
@@ -146,7 +146,7 @@ struct apple_sleep_region_state {
 	/* Each stopped DART's GAPF slice, the value written there, and what it held before */
 	u32 dart_slice[5], dart_slice_off, dart_slice_saved[5], dart_slice_written;
 	/* The PMU's reads after the boot stage, the SPMI buses' masking order and gap */
-	u32 pmu_reads[8][2], npmu_reads, spmi_order[5], nspmi_order, spmi_gap_us;
+	u32 pmu_reads[8][2], npmu_reads, spmi_order[7], nspmi_order, spmi_gap_us;
 	/* nub-spmi0's interrupt mask at run time */
 	u32 spmi_runtime_mask;
 	/* nub-spmi0's status word holding the PMU's interrupt sources, and their bits (the DT's) */
@@ -169,7 +169,7 @@ struct apple_sleep_region_state {
 	void __iomem *wake, *wake_gfx, *aic_gfx;
 	u32 wake_enabled[11], wake_saved[11];
 	bool wake_armed, wake_sources;
-	u32 spmi_mask[6];
+	u32 spmi_mask[8];
 	bool spmi_masked;
 	bool spmi_post_timer;
 };
@@ -1371,6 +1371,7 @@ static int t6050_sleep_map_regs(struct apple_sleep *s)
 	unsigned int i;
 	int ret = sleep_region_map(s);
 
+	BUILD_BUG_ON(T6050_RBLK_SPMI + ARRAY_SIZE(s->region->spmi_bus) > T6050_RBLK_NODE);
 	if (ret)
 		return ret;
 	for (i = 0; i < ARRAY_SIZE(regs); i++) {
