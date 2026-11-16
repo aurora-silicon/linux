@@ -618,6 +618,15 @@ pub(crate) struct Context<'a> {
     /// Whether a verify may name a Unix account: only where per-user key
     /// bags exist (`PlatformProfile::per_user_keybags`).
     pub(crate) verify_account: bool,
+    /// Identities enrolled in a Unix account's own key bag, which a verify
+    /// naming that account matches. Listed with the index's, so a list
+    /// holds every identity a match can answer.
+    pub(crate) account_identities: &'a [[u8; UUID_LEN]],
+}
+
+/// Whether `cmd` lists identities, which then needs the accounts' own.
+pub(crate) fn lists_identities(cmd: u32) -> bool {
+    cmd == IOC_LIST
 }
 
 pub(crate) struct Handled {
@@ -702,19 +711,38 @@ fn get_info(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
     ok()
 }
 
-fn list(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
+/// The index's identities, then each account's own not already among them
+/// (without a label: the account's records are fprintd's, by identity).
+/// fprintd deletes any of its prints a list lacks, so a list without the
+/// accounts' identities would delete prints a match still answers.
+fn listed(index: &IdentityIndex, accounts: &[[u8; UUID_LEN]]) -> List {
     let mut out = List {
         count: 0,
         reserved: 0,
         id: [Identity::ZERO; MAX_IDENTITIES],
     };
-    for entry in ctx.index.entries.iter() {
+    for entry in index.entries.iter() {
         if out.count as usize >= MAX_IDENTITIES {
             break;
         }
         out.id[out.count as usize] = *entry;
         out.count += 1;
     }
+    for uuid in accounts {
+        if out.count as usize >= MAX_IDENTITIES {
+            break;
+        }
+        if *uuid == [0; UUID_LEN] || out.id[..out.count as usize].iter().any(|id| id.uuid == *uuid) {
+            continue;
+        }
+        out.id[out.count as usize] = Identity { uuid: *uuid, label: [0; LABEL_LEN] };
+        out.count += 1;
+    }
+    out
+}
+
+fn list(ctx: &mut Context<'_>, user: UserPtr) -> Result<Handled> {
+    let out = listed(ctx.index, ctx.account_identities);
 
     UserSlice::new(user, core::mem::size_of::<List>())
         .writer()
@@ -743,6 +771,28 @@ pub(crate) fn validate_enrol_start_arg(arg: usize) -> Result<()> {
     let request: EnrolStart = UserSlice::new(user, core::mem::size_of::<EnrolStart>())
         .reader().read()?;
     validate_enrol_request(&request)
+}
+
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[::kernel::macros::kunit_tests(apple_sep_list_accounts)]
+mod list_accounts_tests {
+    use super::*;
+
+    #[test]
+    fn a_list_holds_the_accounts_identities_once_after_the_index() {
+        let mut index = IdentityIndex::new();
+        let shared = Identity { uuid: [1; UUID_LEN], label: [b'x'; LABEL_LEN] };
+        assert!(index.insert(shared).is_ok());
+        let accounts = [[2; UUID_LEN], [1; UUID_LEN], [0; UUID_LEN], [2; UUID_LEN], [3; UUID_LEN]];
+        let out = listed(&index, &accounts);
+        assert_eq!(out.count, 3);
+        assert_eq!(out.id[0].uuid, [1; UUID_LEN]);
+        assert_eq!(out.id[0].label, [b'x'; LABEL_LEN]);
+        assert_eq!(out.id[1].uuid, [2; UUID_LEN]);
+        assert_eq!(out.id[1].label, [0; LABEL_LEN]);
+        assert_eq!(out.id[2].uuid, [3; UUID_LEN]);
+        assert_eq!(listed(&index, &[]).count, 1);
+    }
 }
 
 #[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
@@ -1389,6 +1439,7 @@ pub unsafe extern "C" fn sep_kunit_bio_ioctl(bio: *mut c_void, cmd: c_uint, arg:
         sensor_present: true,
         live_identity_count: Some(0),
         verify_account: true,
+        account_identities: &[],
     };
     match ioctl(&mut ctx, cmd, arg as usize) {
         Ok(h) => h.ret as c_long,

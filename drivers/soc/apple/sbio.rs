@@ -1090,6 +1090,26 @@ impl SepData {
         }
     }
 
+    /// The identities enrolled in Unix accounts' own key bags (designated at
+    /// `USER_BAG_BASE + uid`), whichever accounts' bags the enclave holds.
+    pub(crate) fn enclave_account_identities(&self) -> Option<KVec<[u8; bio::UUID_LEN]>> {
+        let SbioOutcome::Ok(reply) = self.sbio_call(&crate::sbio::sbio_list_identities()) else {
+            return None;
+        };
+        let records = crate::sbio::IdentityRecords::new(&reply)?;
+        let mut out = KVec::new();
+        let mut failed = false;
+        records.each_built_in_account(|identity| {
+            if out.push(*identity.uuid(), GFP_KERNEL).is_err() {
+                failed = true;
+            }
+        });
+        if failed {
+            return None;
+        }
+        Some(out)
+    }
+
     pub(crate) fn enclave_identities_for(&self, user_id: i32) -> Option<KVec<[u8; bio::UUID_LEN]>> {
         let op = crate::sbio::sbio_list_identities();
         let SbioOutcome::Ok(reply) = self.sbio_call(&op) else {
@@ -6046,6 +6066,12 @@ impl SepData {
         // The SPI probe may have deferred until its SMC power supplier bound.
         // A saved attach-time snapshot would incorrectly reject later ioctls.
         let sensor_present = sensor::is_bound();
+        // Also outside the locks: the accounts' own identities, for a list.
+        let account_identities = if bio::lists_identities(cmd) && self.touchid_started.load(Relaxed) {
+            self.enclave_account_identities().unwrap_or_default()
+        } else {
+            KVec::new()
+        };
         let handled = if cmd == bio::IOC_DELETE_ORPHAN {
             self.bio_delete_orphan(arg)?
         } else {
@@ -6060,6 +6086,7 @@ impl SepData {
                 sensor_present,
                 live_identity_count,
                 verify_account: self.profile.per_user_keybags,
+                account_identities: &account_identities,
             };
             bio::ioctl(&mut ctx, cmd, arg)?
         };
@@ -7432,6 +7459,18 @@ impl<'a> IdentityRecords<'a> {
         (0..self.count())
             .filter_map(|i| self.record(i))
             .any(|(identity, _)| identity.uuid == *uuid)
+    }
+
+    /// Each built-in identity of a Unix account's own key bag.
+    pub(crate) fn each_built_in_account(&self, mut visit: impl FnMut(IdentityV1)) {
+        let base = crate::userbag::USER_BAG_BASE as i32;
+        for i in 0..self.count() {
+            if let Some((identity, built_in)) = self.record(i) {
+                if built_in && identity.user_id >= base {
+                    visit(identity);
+                }
+            }
+        }
     }
 
     pub(crate) fn each_built_in_for(&self, user_id: i32, mut visit: impl FnMut(IdentityV1)) {
