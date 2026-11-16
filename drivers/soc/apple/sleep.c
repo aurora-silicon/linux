@@ -7026,6 +7026,13 @@ static bool t8142_alarm_ok;
 static int t8142_post_ret = -ENODATA;
 static u64 t8142_alarm_counter;
 
+/* The opcode carries the byte count, as t6050_sleep_pmu_xfer() builds it (macOS: 0x33 for 4). */
+static int t8142_pmu(struct apple_sleep *s, u32 mask, u8 opcode, u16 address, const u8 *wr, u8 *rd,
+		     unsigned int len)
+{
+	return t6050_sleep_pmu_xfer_post(s, mask, opcode | (len - 1), address, wr, rd, len);
+}
+
 static void t8142_pre_commit(struct apple_sleep *s)
 {
 	u32 mask = s->soc->spmi_notify_sleep;
@@ -7035,9 +7042,9 @@ static void t8142_pre_commit(struct apple_sleep *s)
 	t8142_post_ret = -ENODATA;
 	if (s->spmi) {
 		t6050_sleep_pmu_drain(s);
-		if (!t6050_sleep_pmu_xfer_post(s, mask, T6050_SPMI_EXT_READL, T6050_RTC_COMPARE,
+		if (!t8142_pmu(s, mask, T6050_SPMI_EXT_READL, T6050_RTC_COMPARE,
 					       NULL, t8142_alarm, 4) &&
-		    !t6050_sleep_pmu_xfer_post(s, mask, T6050_SPMI_EXT_READL, T6050_RTC_COUNTER,
+		    !t8142_pmu(s, mask, T6050_SPMI_EXT_READL, T6050_RTC_COUNTER,
 					       NULL, ticks, 6)) {
 			t8142_alarm_counter = get_unaligned_le64(ticks) >> 16;
 			if (t8142_wake_s)
@@ -7056,23 +7063,23 @@ static void t8142_post_timer(struct apple_sleep *s)
 
 	if (!t8142_alarm_ok)
 		return;
-	ret = t6050_sleep_pmu_xfer_post(s, mask, T6050_SPMI_EXT_READL, T6050_RTC_CTL, NULL, &ctl, 1);
+	ret = t8142_pmu(s, mask, T6050_SPMI_EXT_READL, T6050_RTC_CTL, NULL, &ctl, 1);
 	if (!ret && (ctl & T6050_RTC_CTL_FIRED)) {
 		v = 0x43;
-		ret = t6050_sleep_pmu_xfer_post(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_CTL, &v,
+		ret = t8142_pmu(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_CTL, &v,
 						NULL, 1);
 	}
 	if (!ret)
-		ret = t6050_sleep_pmu_xfer_post(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_COMPARE,
+		ret = t8142_pmu(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_COMPARE,
 						t8142_alarm, NULL, 4);
 	if (!ret) {
 		v = 0;
-		ret = t6050_sleep_pmu_xfer_post(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_MASK, &v,
+		ret = t8142_pmu(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_MASK, &v,
 						NULL, 1);
 	}
 	if (!ret) {
 		v = 0x41;
-		ret = t6050_sleep_pmu_xfer_post(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_CTL, &v,
+		ret = t8142_pmu(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_CTL, &v,
 						NULL, 1);
 	}
 	t8142_post_ret = ret;
