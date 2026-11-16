@@ -37,6 +37,10 @@ impl ApplicationOwner {
         let session=self.session.clone();let failed=self.failed.clone();
         let quarantined=self.quarantined.clone();
         let ticket=Arc::new(AtomicI32::new(TICKET_RUNNING),GFP_KERNEL)?;let done=ticket.clone();
+        // The caller sleeps on `gate`; the worker's guard completes it when
+        // the closure ends, or is dropped unrun.
+        let gate=Arc::pin_init(kernel::sync::Completion::new(),GFP_KERNEL)?;
+        let signal=TicketSignal(gate.clone());
         kernel::workqueue::system_long().try_spawn(GFP_KERNEL,move || {
             let mut owner=session.lock();
             let result=if failed.load(Ordering::Acquire) {Err(Failure::Fatal(EIO))} else {
@@ -75,16 +79,23 @@ impl ApplicationOwner {
                 Err(Failure::Job(JobFailure::Recovered(_) | JobFailure::Unbound(..) | JobFailure::Released))=>JobOutcome::Recovered as i32,
                 Err(Failure::Job(JobFailure::Stranded(..) | JobFailure::Retained))=>JobOutcome::Stranded as i32,
             },Ordering::Release);
+            // The outcome is stored. Release the session before waking the
+            // caller: it, or the next client's worker, takes that lock next.
+            drop(owner);
+            drop(signal);
         })?;
         let waited=Instant::<Monotonic>::now();
-        loop {
-            match ticket.load(Ordering::Acquire) {
-                TICKET_RUNNING => fsleep(Delta::from_micros(recovery::poll_interval_us(waited.elapsed().as_micros_ceil()))),
-                0 => {recovery::SUBMIT_LATENCY.record(waited.elapsed().as_micros_ceil());return Ok(())}
-                code if code==JobOutcome::Recovered as i32 => return Err(Failure::Job(JobFailure::Released)),
-                code if code==JobOutcome::Stranded as i32 => return Err(Failure::Job(JobFailure::Retained)),
-                errno => return Err(Failure::Fatal(Error::from_errno(errno))),
-            }
+        // Sleep in slices: queued behind other clients and recovery, a wait
+        // can outlast the hung-task timeout, which a single uninterruptible
+        // sleep would trip.
+        while !gate.wait_for_completion_timeout(kernel::time::msecs_to_jiffies(1000)) {}
+        match ticket.load(Ordering::Acquire) {
+            // The worker closure was dropped without running.
+            TICKET_RUNNING => Err(Failure::Fatal(EIO)),
+            0 => {recovery::SUBMIT_LATENCY.record(waited.elapsed().as_micros_ceil());Ok(())}
+            code if code==JobOutcome::Recovered as i32 => Err(Failure::Job(JobFailure::Released)),
+            code if code==JobOutcome::Stranded as i32 => Err(Failure::Job(JobFailure::Retained)),
+            errno => Err(Failure::Fatal(Error::from_errno(errno))),
         }
     }
 
@@ -98,6 +109,15 @@ impl ApplicationOwner {
             Err(Failure::Job(_)) => {if let Some(status)=vm.status(){status.record(EIO);}Err(EIO)}
             Err(Failure::Fatal(error)) => {if let Some(status)=vm.status(){status.record(error);}Err(error)}
         }
+    }
+}
+
+/// Wakes the thread waiting in [`ApplicationOwner::work`] when dropped: at the
+/// end of the worker closure, or when the closure is dropped without running.
+struct TicketSignal(Arc<kernel::sync::Completion>);
+impl Drop for TicketSignal {
+    fn drop(&mut self) {
+        self.0.complete_all();
     }
 }
 
