@@ -754,6 +754,10 @@ pub(super) struct Backend {
     /// The render pair this owner last published to without the device mutex
     /// (zero for none): a hint, revalidated by every lend.
     direct_slot: core::sync::atomic::AtomicU32,
+    /// Measurement switch 0x4 (M5): the render pair this owner last published to through the
+    /// device mutex (zero for none): a hint, checked by the publication hold it lets an early
+    /// submission reach without the identity hold.
+    ready_slot: core::sync::atomic::AtomicU32,
     /// Render pairs this owner may hold, fixed at creation with its scheduler's
     /// credits and its render pool's sizing.
     pairs: u8,
@@ -890,6 +894,7 @@ impl Backend {
                     outer_render <- kernel::new_mutex!(None, "g17::Backend::outer_render"),
                     admission,
                     direct_slot: core::sync::atomic::AtomicU32::new(0),
+                    ready_slot: core::sync::atomic::AtomicU32::new(0),
                     pairs: super::pairs::per_owner(),
                 }),
                 GFP_KERNEL,

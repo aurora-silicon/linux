@@ -427,7 +427,17 @@ impl Backend {
             }
             lease => lease,
         };
-        let (admission, mut ready) = self.acquire_render_with_ids(packet, early, sleep)?;
+        // Measurement switch 0x4 (M5): an early lease on the pair this owner last published to
+        // skips the identity hold. The first publication hold checks that the pair is ready,
+        // as that hold would have, and leaves one that is not to the scheduler (FALLBACK, so
+        // only the submitting ioctl, which never sleeps, takes this path).
+        let hinted = if sleep { 0 } else { self.ready_hint() };
+        let mut verify =
+            hinted != 0 && early.as_ref().is_some_and(|lease| u32::from(lease.slot()) == hinted);
+        let (admission, mut ready) = match early {
+            Some(lease) if verify => (lease, true),
+            early => self.acquire_render_with_ids(packet, early, sleep)?,
+        };
         let slot = admission.slot();
         packet.completion.attach_render_lease(admission)?;
         if ready {
@@ -510,7 +520,8 @@ impl Backend {
                 }
                 result => result?,
             }
-            match self.prepare_render(slot, packet, deferred, sleep, &mut outer_wait) {
+            let checked = core::mem::take(&mut verify);
+            match self.prepare_render(slot, packet, deferred, sleep, &mut outer_wait, checked) {
                 Err(error)
                     if !packet.is_published() && error == crate::g17::context::RENDER_CHANNEL_PENDING =>
                 {
@@ -561,8 +572,30 @@ impl Backend {
                         return Err(FALLBACK);
                     }
                 }
-                result => return result,
+                result => {
+                    if result.is_ok()
+                        && packet.context.is_m5()
+                        && crate::g17::sync_input::render_submit(
+                            crate::g17::sync_input::SUBMIT_READY_HINT,
+                        )
+                    {
+                        self.ready_slot.store(u32::from(slot), Ordering::Relaxed);
+                    }
+                    return result;
+                }
             }
+        }
+    }
+
+    /// Measurement switch 0x4 (M5): the slot of the pair this owner last published to through
+    /// the device mutex, or zero.
+    fn ready_hint(&self) -> u32 {
+        if self.context.is_m5()
+            && crate::g17::sync_input::render_submit(crate::g17::sync_input::SUBMIT_READY_HINT)
+        {
+            self.ready_slot.load(Ordering::Relaxed)
+        } else {
+            0
         }
     }
 

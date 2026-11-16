@@ -42,6 +42,11 @@ pub(super) const SUBMIT_OBSERVED: u32 = 1 << 0;
 /// its first and last write with a barrier.
 pub(super) const SUBMIT_HOSTPORT: u32 = 1 << 1;
 
+/// `aurora.gpubench_render_submit` 0x4: an M5 render submission on the pair its owner last
+/// published to takes the device mutex twice, not three times: its first publication hold
+/// checks what the identity hold would have.
+pub(super) const SUBMIT_READY_HINT: u32 = 1 << 2;
+
 /// One fence that signals once all of `fences` have (see `job::MERGED_DEPENDENCIES`).
 pub(super) fn merge(fences: &[Fence]) -> Result<Fence> {
     let mut raw = KVec::with_capacity(fences.len(), GFP_KERNEL)?;
