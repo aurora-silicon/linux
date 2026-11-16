@@ -27,6 +27,13 @@ properties:
       - items:
           - const: apple,agx-g17c
           - const: apple,agx-g17s
+      - description:
+          G17C firmware handoff with the SoC fallback required by installed
+          boot loaders when filling operating points and firmware resources.
+        items:
+          - const: apple,agx-g17c
+          - const: apple,agx-g17s
+          - const: apple,agx-t6050
       - items:
           - const: apple,agx-t8103
           - const: apple,agx-g13g
