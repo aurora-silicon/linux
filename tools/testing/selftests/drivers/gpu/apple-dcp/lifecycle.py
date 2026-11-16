@@ -211,6 +211,8 @@ struct tps6598x { void *partner, *dev, *port, *psy; int lock; u32 data_status; e
 struct cd321x { struct tps6598x tps; struct cd321x_status update_status;
  struct cd321x_pm_state pm; struct delayed_work update_work, resume_work;
  struct typec_mux_state state; bool state_valid, display_route_active, cur_partner_is_pd;
+ /* A wake's first port state, applied without the debounce until a retry clears it */
+ bool sleep_plug, wake_apply;
  bool dp_irq_hpd, dp_sink_reported,dp_sid_valid;
  u32 dp_status,dp_conf; void *port_altmode_dp;
  struct usb_pd_identity cur_partner_identity; void *connector_fwnode, *tbt_switch, *mux; };
@@ -291,6 +293,7 @@ static void init(void)
  display.typec_generation = 4;
  port.tps.partner = (void *)1; port.tps.role_sw = &role; role = USB_ROLE_HOST;
  port.pm.phase = CD321X_PM_RUNNING; port.state_valid = true; port.state.mode = 2;
+ port.wake_apply = true;
  port.display_route_active = true; port.connector_fwnode = (void *)1;
  settle_error = power_error = hpd_error = release_error = 0;
  tbt_error = role_error = safe_error = mode_error = 0;
@@ -314,7 +317,7 @@ int main(void)
   CHECK(display.external_error == -ETIMEDOUT);
   CHECK(display.dptxport[0].connected && display.pipe_enabled_h17p);
   CHECK(!display.external_stopped && !display.typec_crtc_off);
-  CHECK(port.display_route_active && !port.state_valid);
+  CHECK(port.display_route_active && !port.state_valid && !port.wake_apply);
   CHECK(port.pm.phase == CD321X_PM_REVALIDATE && port.pm.attempts_left == CD321X_RESUME_ATTEMPTS);
   CHECK(notices > 0 && releases == 0);
   callback(true); CHECK(!sink.connected);
