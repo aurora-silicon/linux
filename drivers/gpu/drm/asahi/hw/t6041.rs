@@ -79,9 +79,8 @@ const BUILDS: [fw::variant::Build; 5] = [
         ..BUILD_25G83
     },
     fw::variant::Build {
-        name: "macOS 26.6.2 (25G83, iBoot mBoot-18000.161.10), 32 cores",
         config: Some(&super::t6041_25g83::CONFIG),
-        ..BUILD_25G83
+        ..BUILD_25G83_32CORE
     },
     fw::variant::Build {
         config: Some(&BASE),
@@ -141,8 +140,8 @@ const BUILD_25F84: fw::variant::Build = fw::variant::Build {
 
 /// The macOS 26.6.2 boot firmware (iBoot mBoot-18000.161.10) loads the 25G83 build the M4 Pro
 /// runs. iBoot fills part of the loaded TEXT for each Mac, so each admitted image is a
-/// measurement. Four are listed: the 32-core J616C's, which runs with
-/// [`super::t6041_25g83::CONFIG`], and the 40-core J614C's and J575C's, which run with
+/// measurement. Four are listed: the 32-core J616C's, which runs via [`BUILD_25G83_32CORE`]
+/// with [`super::t6041_25g83::CONFIG`], and the 40-core J614C's and J575C's, which run with
 /// [`CONFIG_25G83`]. The J575C's is measured with its boot-filled ranges zeroed, as is the
 /// J614C's under system firmware 27.2, whose iBoot fills the same ranges.
 pub(super) const BUILD_25G83: fw::variant::Build = fw::variant::Build {
@@ -203,7 +202,8 @@ pub(super) const BUILD_25G83: fw::variant::Build = fw::variant::Build {
             ],
         },
     ],
-    // Four clusters: the tiler segment values of 25F84 on this machine.
+    // 40-core T6041 parts (J614C, J575C) stay on TA mode 1 until clustered tiling is tested on
+    // 40-core hardware; 32-core parts run [`BUILD_25G83_32CORE`] below.
     // T6041's 25G83 firmware emits pstate reports (tags 0x19/0x1b) and 8 ms
     // timestamped utilisation records (tag 0x13).
     variant: &fw::variant::Variant {
@@ -215,6 +215,21 @@ pub(super) const BUILD_25G83: fw::variant::Build = fw::variant::Build {
         ..fw::variant::V25G83
     },
     config: None,
+};
+
+/// 32-core T6041 (J616C) on 25G83: inherits the 25G83 image list (the 32- vs 40-core config
+/// is chosen by probed core count) and tiles clustered with the four-cluster segment words
+/// (`fw::m5::target::cluster_control`). A clustered RD32 Minecraft frame needs ~1600-2200 heap
+/// blocks, past the 0x45e normal maximum, and at that maximum a four-cluster pass never starts
+/// (reason 0 recoveries), so the heap may use every slot of the block table.
+pub(super) const BUILD_25G83_32CORE: fw::variant::Build = fw::variant::Build {
+    name: "macOS 26.6.2 (25G83, iBoot mBoot-18000.161.10), 32 cores",
+    variant: &fw::variant::Variant {
+        ta_mode_1: false,
+        tvb_normal_blocks: crate::g17::fw::buffer::NORMAL_MAX_BLOCKS_FOUR_CLUSTERS,
+        ..*BUILD_25G83.variant
+    },
+    ..BUILD_25G83
 };
 
 /// The 40-core M4 Max on 25G83: the 25F84 configuration with the 25G83 register map and

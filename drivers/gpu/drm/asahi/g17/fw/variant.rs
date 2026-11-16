@@ -84,6 +84,9 @@ pub(crate) struct Variant {
     pub(crate) programs: super::render::RegisterPrograms,
     /// Use 0x1c890 = 1, 0x1c918 = 0 in V25G83-format tiling arrays (device/build policy).
     pub(crate) ta_mode_1: bool,
+    /// The normal maximum of a G17P tiler heap in blocks, which bounds host growth and the
+    /// firmware's own (device/build policy).
+    pub(crate) tvb_normal_blocks: usize,
     pub(crate) compute: super::compute::ComputeProgram,
     pub(crate) opening_record: bool,
     pub(crate) split_firmware_area: bool,
@@ -159,6 +162,7 @@ pub(crate) const V26A428: Variant = Variant {
     lead_commands: false,
     programs: super::render::RegisterPrograms::G17P,
     ta_mode_1: false,
+    tvb_normal_blocks: super::buffer::NORMAL_MAX_BLOCKS,
     compute: super::compute::ComputeProgram::G17P,
     opening_record: true,
     split_firmware_area: false,
@@ -201,6 +205,7 @@ pub(crate) const V25G83: Variant = Variant {
     lead_commands: true,
     programs: super::render::RegisterPrograms::V25G83,
     ta_mode_1: false,
+    tvb_normal_blocks: super::buffer::NORMAL_MAX_BLOCKS,
     compute: super::compute::ComputeProgram::G17P,
     opening_record: true,
     split_firmware_area: false,

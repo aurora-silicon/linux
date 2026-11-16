@@ -612,6 +612,7 @@ impl Pair {
             },
             programs: self.variant.programs,
             ta_mode_1: self.variant.ta_mode_1,
+            clusters: self.clusters,
             deflake: deflake_layout,
         };
         self.memory.graph.claim(ordinal)?;
