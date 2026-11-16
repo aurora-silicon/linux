@@ -235,14 +235,23 @@ static int apple_spmi_wait_rx_not_empty(struct spmi_controller *ctrl)
  * late, or the stray one that was read in a reply's place, is read out instead: the bus gets a
  * command's whole timeout to finish, then the reply FIFO is read until it is empty. Nothing of
  * an old exchange can then answer a new command. A FIFO that does not empty keeps the failure.
- * On the J714s only, the board this is for; on every other generation 4 machine a failed
- * exchange refuses the later commands, as before.
+ * On the J714s, the board this is for, and on the M5 MacBook Airs (J813, J815), whose
+ * nub-spmi controllers are the same generation 4 and whose deep sleep writes the PMU on the
+ * same queue; on every other generation 4 machine a failed exchange refuses the later
+ * commands, as before.
  */
+static bool apple_spmi_gen4_recovers(void)
+{
+	return of_machine_is_compatible("apple,j714s") ||
+	       of_machine_is_compatible("apple,j813") ||
+	       of_machine_is_compatible("apple,j815");
+}
+
 static int apple_spmi_gen4_recover(struct spmi_controller *ctrl, struct apple_spmi *spmi)
 {
 	unsigned int i;
 
-	if (!of_machine_is_compatible("apple,j714s"))
+	if (!apple_spmi_gen4_recovers())
 		return -EIO;
 	usleep_range(REG_POLL_TIMEOUT_US, 2 * REG_POLL_TIMEOUT_US);
 	for (i = 0; i < SPMI_GEN4_REPLY_DRAIN_MAX; i++) {
