@@ -9219,6 +9219,8 @@ static const struct apple_sleep_word t8142_gate_off[] = {
 /* T8142's, from the J815 tree. GFX's word is in its own block, not "ps". */
 static const struct apple_sleep_gate_coproc t8142_gate_coprocs[] = {
 	{ "/soc/dcp@286e00000", true, 0x10000 },
+	{ "/soc/dcp@506e00000", true, 0x428 },
+	{ "/soc/dcp@3aae00000", true, 0x3b8 },
 	{ "/soc/pmp@380500000", true },
 	{ "/soc/nvme@4c5cc0000" },	{ "/soc/mtp@394600000" },
 	{ "/soc/aop@390c00000" },	{ "/soc/smc@38c600000" },

@@ -6782,6 +6782,9 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	dcp->fixed_connector_type = dcp_connector_type_from_dt(dev->of_node);
 	dcp->connector_type = dcp->fixed_connector_type;
 	of_property_read_u32(dev->of_node, "apple,dcp-index", &dcp->index);
+	if (of_device_is_compatible(dev->of_node, "apple,t8142-dcpext") &&
+	    (dcp->index < 1 || dcp->index > 2))
+		return dev_err_probe(dev, -EINVAL, "invalid external display index\n");
 	of_property_read_u32(dev->of_node, "apple,dcp-endpoint", &dcp->peer_endpoint);
 	if (of_property_read_bool(dev->of_node, "apple,typec-hybrid-first"))
 		dcp_typec_hybrid_first_dt();
@@ -7653,8 +7656,23 @@ static const struct dcp_s2r_layout dcp_s2r_t8142 = {
 	.pmc_dcp = false,
 };
 
+/* TEST: J813 external processors, ADT DISPEXT0/1 power words. */
+static const struct dcp_s2r_layout dcp_s2r_t8142_ext[] = {
+	{ .disp_cpu = 0x428, .disp_fe = 0x418, .disp_sys = 0x308,
+	  .dcp_streams = BIT(23) | BIT(24), .disp_streams = BIT(0) | BIT(16) },
+	{ .disp_cpu = 0x3b8, .disp_fe = 0x3a8, .disp_sys = 0x2b8,
+	  .dcp_streams = BIT(23) | BIT(24), .disp_streams = BIT(0) | BIT(16) },
+};
+
+static bool dcp_s2r_is_t8142_ext(struct apple_dcp *dcp)
+{
+	return of_device_is_compatible(dcp->dev->of_node, "apple,t8142-dcpext");
+}
+
 static const struct dcp_s2r_layout *dcp_s2r_layout(struct apple_dcp *dcp)
 {
+	if (dcp_s2r_is_t8142_ext(dcp))
+		return &dcp_s2r_t8142_ext[dcp->index - 1];
 	return dcp->hw.s2r_layout ?: &dcp_s2r_t8140;
 }
 #define DCP_PS_MIN		GENMASK(19, 16)
@@ -7924,6 +7942,9 @@ static int dcp_s2r_stop_firmware(struct apple_dcp *dcp)
  */
 static bool dcp_s2r_ext_capable(struct apple_dcp *dcp)
 {
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+		return dcp->hw.s2r_ext && s2r_untested && dcp->v27_methods &&
+		       dcp->v27_methods[dcpep_unnamed_500].tag[0];
 	return dcp->fw_compat == DCP_FIRMWARE_H17P && dcp->hw.s2r_ext;
 }
 
@@ -8198,8 +8219,10 @@ static int dcp_s2r_domains_off(struct apple_dcp *dcp)
 	val = readl(ps + l->disp_cpu);
 	if (val & BIT(28))
 		writel(val & ~(BIT(28) | GENMASK(9, 8)), ps + l->disp_cpu);
-	writel(3, pwrgate + l->ret_ff);
-	writel(0, pwrgate + l->ret_mem);
+	if (l->ret_ff) {
+		writel(3, pwrgate + l->ret_ff);
+		writel(0, pwrgate + l->ret_mem);
+	}
 	dcp_s2r_ps_lower(ps + l->disp_cpu);
 	dcp_s2r_ps_lower(ps + l->disp_fe);
 	dcp_s2r_ps_lower(ps + l->disp_sys);
@@ -8243,8 +8266,10 @@ static int dcp_s2r_domains_on(struct apple_dcp *dcp)
 	writel(val | 0xf, ps + l->disp_fe);
 	val = readl(ps + l->disp_cpu) & ~(GENMASK(9, 8) | GENMASK(3, 0) | BIT(28));
 	writel(val | 0xf, ps + l->disp_cpu);
-	writel(0, pwrgate + l->ret_ff);
-	writel(1, pwrgate + l->ret_mem);
+	if (l->ret_ff) {
+		writel(0, pwrgate + l->ret_ff);
+		writel(1, pwrgate + l->ret_mem);
+	}
 	writel(val | 0xf | BIT(28), ps + l->disp_cpu);
 	if (pmc)
 		dcp_pmc_set(dcp, pmc, true);
@@ -8277,6 +8302,9 @@ static int dcp_s2r_ext_domains_on(struct apple_dcp *dcp)
 	void __iomem *ps = NULL, *pmc = NULL;
 	u32 val;
 	int i, ret = -ENODEV;
+
+	if (dcp_s2r_is_t8142_ext(dcp))
+		return dcp_s2r_domains_on(dcp);
 
 	np = of_parse_phandle(dcp->dev->of_node, "apple,display-power", 0);
 	if (!np)
@@ -8372,6 +8400,9 @@ static int dcp_s2r_ext_domains_off(struct apple_dcp *dcp)
 	int i, ret = -ENODEV;
 	u32 val;
 
+	if (dcp_s2r_is_t8142_ext(dcp))
+		return dcp_s2r_domains_off(dcp);
+
 	np = of_parse_phandle(dcp->dev->of_node, "apple,display-power", 0);
 	if (!np)
 		return -ENODEV;
@@ -8428,7 +8459,8 @@ static bool dcp_s2r_ext_cpu_on(struct apple_dcp *dcp)
 	of_node_put(np);
 	if (!ps)
 		return false;
-	on = FIELD_GET(GENMASK(7, 4), readl(ps + 0x328));
+	on = FIELD_GET(GENMASK(7, 4), readl(ps + (dcp_s2r_is_t8142_ext(dcp) ?
+				dcp_s2r_layout(dcp)->disp_cpu : 0x328)));
 	iounmap(ps);
 
 	return on;
@@ -9306,6 +9338,10 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8142_dcpext = {
 	.sink_metadata_edid = true,
 	.dptx_endpoint = DPTX_ENDPOINT,
 	.dptx_controller = true,
+	/* TEST: firmware 27.2 link release, gated by appledrm.s2r_untested. */
+	.s2r_ext = true,
+	.s2r_no_secure_port = true,
+	.s2r_layout = &dcp_s2r_t8142_ext[0],
 };
 
 static const struct of_device_id of_match[] = {
