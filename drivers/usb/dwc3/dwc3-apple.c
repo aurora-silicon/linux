@@ -1471,7 +1471,8 @@ static int dwc3_apple_recover(struct dwc3_apple *appledwc)
 static bool dwc3_apple_tunnel_keep(struct dwc3_apple *appledwc)
 {
 	lockdep_assert_held(&appledwc->lock);
-	if (appledwc->fixed_hub || !of_machine_is_compatible("apple,j714s") ||
+	if (appledwc->fixed_hub || !(of_machine_is_compatible("apple,j714s") ||
+				     of_machine_is_compatible("apple,j716c")) ||
 	    !of_device_is_compatible(appledwc->dev->of_node, "apple,t6050-dwc3") ||
 	    dwc3_apple_tunnel_phy(appledwc, APPLE_T6050_CIO_USB_KEEP))
 		return false;
