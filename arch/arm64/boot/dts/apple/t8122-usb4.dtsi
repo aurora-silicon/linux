@@ -48,7 +48,7 @@
 			apple,pciec-kernel-init;
 			/*
 			 * m1n1 fills the rc, fabric and debug tunables through the
-			 * usb4_0_pcie alias, but not this one.
+			 * usb4-0-pcie alias, but not this one.
 			 */
 			apple,tunable-oe-fabric =
 				<0x4 0x70007 0x40004>,
@@ -148,7 +148,7 @@
 			apple,pciec-kernel-init;
 			/*
 			 * m1n1 fills the rc, fabric and debug tunables through the
-			 * usb4_1_pcie alias, but not this one.
+			 * usb4-1-pcie alias, but not this one.
 			 */
 			apple,tunable-oe-fabric =
 				<0x4 0x70007 0x40004>,

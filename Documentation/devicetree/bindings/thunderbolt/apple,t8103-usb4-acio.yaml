@@ -108,6 +108,14 @@ properties:
       apple,pcie-tunnel is present, the domain after them powers its PCIe-C
       controller and is enabled only after the USB4 PCIe tunnel is active.
 
+  post-init-providers:
+    $ref: /schemas/types.yaml#/definitions/phandle-array
+    maxItems: 4
+    description:
+      Power-domain suppliers managed explicitly by the router, rather than
+      required before it can probe, to break their initialization dependency
+      cycle. On J613 these are the four power domains listed above.
+
   thunderbolt-switch:
     type: boolean
     description:
