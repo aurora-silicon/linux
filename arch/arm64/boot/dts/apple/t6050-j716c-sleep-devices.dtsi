@@ -82,3 +82,64 @@
 &apciec2_dart {
 	apple,clock-protection = <&ps_prot 31>;
 };
+
+/*
+ * The DARTs' GAPF slices, as on the J714s: the J716c's ADT gives every one of these DARTs the
+ * same clock-protection slice index (offset 0x100 + 0x40 * index). The <live off> values are
+ * the J714s's and are not yet read back on this board.
+ */
+/* Each stopped DART's GAPF slice, and the slice's live and off values */
+&sep_dart {
+	apple,gapf-slice = <0xb00>;
+	apple,gapf-slice-values = <0x12 0x2>;
+};
+
+&pmp0_dart {
+	apple,gapf-slice = <0x1c0>;
+	apple,gapf-slice-values = <0x12 0x2>;
+};
+
+&sio_dart {
+	apple,gapf-slice = <0xac0>;
+	apple,gapf-slice-values = <0x12 0x2>;
+};
+
+&dart_apcie0 {
+	apple,gapf-slice = <0x980>;
+	apple,gapf-slice-values = <0x12 0x2>;
+};
+
+/*
+ * GAPF slices of the display coprocessors' DARTs (drivers/iommu/apple-dart-v27-late.inc):
+ * offset in the sleep controller's "gapf" region (0x2803f0000), then <live off> values.
+ * The external display DARTs (dart_dispext0, dispext1..3_dart) have none: they are retained.
+ */
+&dcp_dart {		/* 0x48a340000 -> 0x2803f0a80 */
+	apple,gapf-slice = <0xa80>;
+	apple,gapf-slice-values = <0x12 0x2>;
+};
+
+&disp0_dart {		/* 0x48a300000 -> 0x2803f0a00 */
+	apple,gapf-slice = <0xa00>;
+	apple,gapf-slice-values = <0x12 0x2>;
+};
+
+&dart_dcpext0 {		/* 0x2b2340000 -> 0x2803f0500 */
+	apple,gapf-slice = <0x500>;
+	apple,gapf-slice-values = <0x12 0x2>;
+};
+
+&dcpext1_dart {		/* 0x392340000 -> 0x2803f0840 */
+	apple,gapf-slice = <0x840>;
+	apple,gapf-slice-values = <0x12 0x2>;
+};
+
+&dcpext2_dart {		/* 0x302340000 -> 0x2803f06c0 */
+	apple,gapf-slice = <0x6c0>;
+	apple,gapf-slice-values = <0x12 0x2>;
+};
+
+&dcpext3_dart {		/* 0x306340000 -> 0x2803f0780 */
+	apple,gapf-slice = <0x780>;
+	apple,gapf-slice-values = <0x12 0x2>;
+};
