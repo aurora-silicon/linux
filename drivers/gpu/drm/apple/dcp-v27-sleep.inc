@@ -262,11 +262,11 @@ static int dcp_v27_rtkit_cycle(struct apple_dcp *dcp, unsigned int pause_ms)
 	int ret;
 
 	/*
-	 * A cancelled suspend must keep the inherited firmware session running, unless it is an
-	 * external processor's that already took its sleep step: that session does not report a
-	 * display plugged again until it is restarted, as after a real wake.
+	 * A cancelled suspend must keep the inherited firmware session running, unless the
+	 * processor already took its sleep step: that session neither reports a display plugged
+	 * again nor completes the panel's power-on until it is restarted, as after a real wake.
 	 */
-	if (!pm_resume_via_firmware() && !(ext && s && s->phase == V27_PREPARED))
+	if (!pm_resume_via_firmware() && !(s && s->phase == V27_PREPARED))
 		return -EPERM;
 	if (s && s->cycle_failed)
 		return -ECANCELED;
@@ -1098,8 +1098,9 @@ static int dcp_v27_disp_dart_release(struct dcp_v27_sleep *s)
 static int dcp_v27_reopen_live(struct apple_dcp *dcp)
 {
 	struct dcp_v27_sleep *s = dcp->sleep_v27;
-	/* Wake-only cycles must not stop firmware while undoing preparation. */
-	unsigned int cycles = pm_resume_via_firmware() ? v27_rtkit_cycles : 0;
+	/* Undoing a partial preparation never stops the firmware; a completed sleep step does. */
+	unsigned int cycles = pm_resume_via_firmware() || s->phase == V27_PREPARED ?
+			      v27_rtkit_cycles : 0;
 	unsigned int i;
 	bool per_call;
 	int ret;
