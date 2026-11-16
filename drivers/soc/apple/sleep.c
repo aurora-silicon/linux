@@ -428,6 +428,19 @@ struct apple_sleep_word {
 	u32 offset;
 };
 
+#define T8142_PS_ATC0_COMMON		0x2c8
+#define T8142_PS_PMP			0x598
+#define T8142_PS_AON_ATC0_USB_AON	0xc8
+#define T8142_PS_AON_ATC0_USB		0xd0
+
+/* A power word the match leaves alone when its group's bit is set in apple_sleep.ps_keep */
+struct apple_sleep_ps_keep {
+	const char *name;
+	u32 offset;
+	bool aon;
+	u8 group;
+};
+
 /* Power words by their offsets */
 struct apple_sleep_words {
 	const u32 *offset;
@@ -537,6 +550,14 @@ static int sleep_v27_final_stop(struct apple_sleep *s);
  * way. The refusals, the coprocessor stops, macOS's power words, the mailbox and the commit
  * word are shared, and run around these.
  */
+struct apple_sleep_extra_off {
+	const char *name;
+	u32 offset;
+	u32 parent;
+};
+
+#define SLEEP_EXTRA_OFF_MAX	16
+
 struct apple_sleep_ops {
 	/* What makes a core's last WFI end in a reset, after its timers are masked */
 	void (*deep_wfi_arm)(void);
@@ -594,6 +615,8 @@ struct apple_sleep_ops {
 	int (*check)(struct apple_sleep *s);
 	/* Optional traffic strictly after timer, before AIC/release/DEEP. */
 	void (*post_timer)(struct apple_sleep *s);
+	/* The dry run's list: does macOS have this ps word off at its commit? */
+	bool (*macos_off_at_commit)(u32 offset);
 };
 
 /*
@@ -609,6 +632,21 @@ struct apple_sleep_soc {
 	bool wake_optional;
 	unsigned int ndisp;
 	bool lower_unbound_displays;
+	/*
+	 * apple_sleep.dispext: the external displays (index 1 and up) are lowered only with it on,
+	 * and a missing phandle for one is no error. Each one's PS write-disable bit (offset, bit;
+	 * offset 0 = none) is cleared before its lowering, as macOS's SPTM leaves it.
+	 */
+	bool dispext_optional;
+	u32 disp_wr_dis[SLEEP_DISPLAYS_MAX][2];
+	/*
+	 * apple_sleep.extra_off: each display's ADMA word (a child of its SYS word; 0 = none),
+	 * lowered before the display's own, and the words lower_io lowers first, children before
+	 * parents, each restored at the wake only once its parent (0 = root) is on.
+	 */
+	u32 disp_adma[SLEEP_DISPLAYS_MAX];
+	const struct apple_sleep_extra_off *extra_off;
+	unsigned int nextra_off;
 	/* The clock-protection slice guarding each display's CPU word, 0 if none needs clearing. */
 	u8 disp_prot_slice[SLEEP_DISPLAYS_MAX];
 	/* Which display to lower next, in macOS's order: index into ps.disp. */
@@ -693,9 +731,17 @@ struct apple_sleep_soc {
 	struct apple_sleep_words ps_still_on;
 	/* The wake's timed power-gate polls: off with BUSY clear at the commit, on macOS */
 	struct apple_sleep_words ps_engine_polled;
+	/* Put under AUTO_ENABLE by XNU's PMGR start at boot, iBoot leaving them on without it */
+	struct apple_sleep_words ps_boot_auto;
+	struct apple_sleep_words ps_aon_boot_auto;
+	/* T8142: replay XNU's memory-controller start at the entry (apple_sleep.mem_boot) */
+	bool mem_boot;
 	/* Lowered at the last step if still on, with no user left */
 	const struct apple_sleep_word *stray;
 	unsigned int nstray;
+	/* Words the match leaves as they are, by group (apple_sleep.ps_keep) */
+	const struct apple_sleep_ps_keep *ps_keep;
+	unsigned int nps_keep;
 	/* Off on macOS by the last step: one still on only warns. */
 	const struct apple_sleep_word *gate_off;
 	unsigned int ngate_off;
@@ -737,6 +783,11 @@ struct apple_sleep_soc {
 	bool radio_retrain;
 	/* A core restarted after the commit takes the deep WFI in the holding pen. */
 	bool pen_deep;
+	/*
+	 * The stopped cores take their deep WFI before the boot core's last mile, not after
+	 * the commit (apple_sleep.early_wfi): XNU's order (T8142, J813 ten-core trace).
+	 */
+	bool early_cpu_wfi;
 };
 
 struct apple_sleep {
@@ -787,6 +838,32 @@ struct apple_sleep {
 	u32 *ps_aon_saved;
 	u32 *ps_aon_on_saved;
 	u32 *ps_aon_auto_saved;
+	/* apple_sleep.ps_keep as the match took it, for its undo and lower_io */
+	unsigned int ps_keep_mask;
+	/* apple_sleep.boot_auto: the words it put on AUTO_ENABLE (ps first, then ps-aon) */
+	u64 boot_auto_set;
+	u32 boot_auto_saved[64];
+	/* Of those, how many read AUTO_ENABLE back right after the write */
+	unsigned int boot_auto_nset, boot_auto_stuck;
+	/* apple_sleep.mem_boot: the pages, the fingerprint's mismatches, whether it ran */
+	void __iomem *mem_boot_page[40];
+	unsigned int mem_boot_mismatch;
+	bool mem_boot_done, mem_floor_done;
+	/* apple_sleep.pmp_off: PMP's word as lower_io found it, and whether it went off */
+	u32 pmp_saved;
+	bool pmp_lowered;
+	int pmp_off_ret;
+	/* apple_sleep.dispext: each external display's CPU, FE, SYS words before the lowering */
+	u32 dispext_saved[SLEEP_DISPLAYS_MAX][3];
+	u8 dispext_lowered;
+	u8 dispext_note;
+	/* apple_sleep.extra_off */
+	u32 disp_adma_saved[SLEEP_DISPLAYS_MAX];
+	u8 disp_adma_lowered;
+	u32 extra_saved[SLEEP_EXTRA_OFF_MAX];
+	u16 extra_lowered;
+	/* bits 0-15 extra_off's words, bit 31 a display's ADMA */
+	u32 extra_stuck;
 	/* For each word of ps_all and ps_aon_all: at the commit, as the wake found it, late */
 	u32 *ps_commit;
 	u32 *ps_aon_commit;
@@ -824,6 +901,22 @@ struct apple_sleep {
 	u64 resumes_after;
 	/* T8132: ATC0's words as they were before the commit path lowered them. */
 	u32 atc0_saved[3];
+	/*
+	 * T8142: what the deep sleep loses and XNU puts back at the wake (J813 ten-core trace,
+	 * 2026-11-16): the memory side as it was before the entry's stop (amcc, socni, mcc,
+	 * "amcc-cfg<n>"), the clock word and the PMGR clkgen slots ("clk-slots").
+	 */
+	void __iomem *amcc_cfg[SLEEP_AMCC_MAX];
+	void __iomem *clk_slots;
+	u64 amcc_saved[SLEEP_AMCC_MAX];
+	u64 amcc_cfg_saved[SLEEP_AMCC_MAX][3];
+	u32 amcc_ctl_saved[SLEEP_AMCC_MAX];
+	u32 socni_saved[SLEEP_SOCNI_MAX][32];
+	u32 mcc_saved[MCC_CHANNELS][65];
+	u32 clk_slot_saved[126][2];
+	u32 mem_clk_saved;
+	bool mem_saved, clk_saved;
+	int mem_restore_ret;
 	int cluster_e_ret;
 	int cluster_ave_ret;
 	/* The AVE complex, as the parent domain of the encoders' enabled domains */
@@ -1034,6 +1127,7 @@ MODULE_PARM_DESC(pmu_notes, "Untested SoC: note each sleep step in PMU scratch, 
 
 static void sleep_note(struct apple_sleep *s, u8 step);
 static void sleep_note_at(struct apple_sleep *s, u8 off, u8 val);
+static int sleep_ps_restore(void __iomem *reg, u32 saved);
 
 static bool sleep_usb_asleep;
 
@@ -1809,6 +1903,413 @@ static void t8140_deep_wfi_arm(void)
 	sysreg_clear_set_s(SYS_APL_DEEP_SLEEP, 0, DEEP_SLEEP_ENABLE);
 }
 
+/*
+ * T8142 (M5): the core's power-down control, S3_5_C15_C1_6 (#1963's M5_C1_6 on T6050). XNU's
+ * per-core init sets its bits 28:26 (26B131 kernelcache +0x4ed4098: orr #0x1c000000) and a
+ * kext programs the rest; iBoot leaves them clear. #1963 measured on the M5 Pro that a core
+ * running at EL2 without them stays powered in its last WFI, so its cluster never goes down and
+ * WD2 resets the SoC ~5 s after the commit: the J815's signature on every committing sleep (note
+ * 0x65, P complex BUSY). Set right before each core's last deep WFI, never for idle (a core that
+ * powered off in Linux's idle would not come back); a reset follows, so nothing restores it.
+ * apple_sleep.m5_pwrdn=0 leaves it alone (A/B).
+ */
+#define SLEEP_M5_C1_6		sys_reg(3, 5, 15, 1, 6)
+#define SLEEP_M5_C1_6_PWRDN	GENMASK_ULL(28, 26)
+static bool sleep_m5_pwrdn = true;
+module_param_named(m5_pwrdn, sleep_m5_pwrdn, bool, 0644);
+MODULE_PARM_DESC(m5_pwrdn, "T8142: set S3_5_C15_C1_6[28:26] before each core's last deep WFI");
+
+/* Probe: each core's value as the boot left it (E cores powered off in b45, the boot core's P complex did not). */
+static void t8142_c1_6_read(void *info)
+{
+	((u64 *)info)[smp_processor_id()] = read_sysreg_s(SLEEP_M5_C1_6);
+}
+
+static void t8142_c1_6_report(struct device *dev)
+{
+	u64 *v = kcalloc(nr_cpu_ids, sizeof(*v), GFP_KERNEL);
+	char line[256];
+	int cpu, n = 0;
+
+	if (!v)
+		return;
+	on_each_cpu(t8142_c1_6_read, v, 1);
+	for_each_online_cpu(cpu) {
+		n += scnprintf(line + n, sizeof(line) - n, " %d:%llx", cpu, v[cpu]);
+	}
+	dev_info(dev, "probe: S3_5_C15_C1_6 per cpu (boot cpu%d; bits 28:26 = 0x1c000000 set before each last WFI: %s):%s\n",
+		 raw_smp_processor_id(), READ_ONCE(sleep_m5_pwrdn) ? "yes" : "no, m5_pwrdn=0", line);
+	kfree(v);
+}
+
+/*
+ * T8142: each core's CoreSight external debug block (J815 ADT cpuN coresight-reg 0x210010000 +
+ * cluster * 0x1000000 + core * 0x100000, the T6040 layout). XNU's ml_arm_sleep (26B131 kc
+ * +0x4ed7470) unlocks it (EDLAR := 0xc5acce55) and writes EDPRCR := 0 on every core, boot and
+ * secondary, right before arm64_prepare_for_sleep(1); with EDPRCR.CORENPDRQ left set a core only
+ * emulates its power-down. apple_sleep.ed_release=0 leaves it alone (A/B).
+ */
+#define T8142_ED_BASE_PA	0x210010000ULL
+#define T8142_ED_CLUSTER_STRIDE	0x1000000ULL
+#define T8142_ED_CORE_STRIDE	0x100000ULL
+#define T8142_ED_EDPRCR		0x310
+#define T8142_ED_EDPRSR		0x314
+#define T8142_ED_EDLAR		0xfb0
+#define T8142_ED_KEY		0xc5acce55
+#define T8142_ED_CLUSTERS	2
+#define T8142_ED_CORES		6
+static void __iomem *t8142_ed[T8142_ED_CLUSTERS][T8142_ED_CORES];
+static bool sleep_ed_release = true;
+module_param_named(ed_release, sleep_ed_release, bool, 0644);
+MODULE_PARM_DESC(ed_release, "T8142: EDLAR unlock + EDPRCR := 0 before each core's last deep WFI");
+
+static void t8142_ed_unmap(void *p)
+{
+	iounmap((void __iomem *)p);
+}
+
+static void t8142_ed_map(struct device *dev)
+{
+	unsigned int cpu, n = 0;
+
+	for_each_possible_cpu(cpu) {
+		u64 mpidr = cpu_logical_map(cpu);
+		unsigned int c = MPIDR_AFFINITY_LEVEL(mpidr, 2), k = MPIDR_AFFINITY_LEVEL(mpidr, 0);
+		void __iomem *ed;
+
+		if (c >= T8142_ED_CLUSTERS || k >= T8142_ED_CORES || t8142_ed[c][k])
+			continue;
+		ed = ioremap_np(T8142_ED_BASE_PA + c * T8142_ED_CLUSTER_STRIDE +
+				k * T8142_ED_CORE_STRIDE, 0x1000);
+		if (!ed || devm_add_action_or_reset(dev, t8142_ed_unmap, (void __force *)ed))
+			continue;
+		t8142_ed[c][k] = ed;
+		n++;
+	}
+	dev_info(dev, "probe: %u external debug windows mapped (EDPRCR := 0 before each last WFI: %s)\n",
+		 n, READ_ONCE(sleep_ed_release) ? "yes" : "no, ed_release=0");
+}
+
+/* The dry run: every core's EDPRCR/EDPRSR, read from the boot core while all are up and held */
+static void t8142_ed_report(struct device *dev)
+{
+	char line[256];
+	unsigned int cpu, n = 0;
+
+	for_each_possible_cpu(cpu) {
+		u64 mpidr = cpu_logical_map(cpu);
+		unsigned int c = MPIDR_AFFINITY_LEVEL(mpidr, 2), k = MPIDR_AFFINITY_LEVEL(mpidr, 0);
+		void __iomem *ed = (c < T8142_ED_CLUSTERS && k < T8142_ED_CORES) ? t8142_ed[c][k] : NULL;
+
+		if (ed)
+			n += scnprintf(line + n, sizeof(line) - n, " %d:%x/%x", cpu,
+				       readl_relaxed(ed + T8142_ED_EDPRCR),
+				       readl_relaxed(ed + T8142_ED_EDPRSR));
+	}
+	dev_info(dev, "dry run: EDPRCR/EDPRSR per cpu (CORENPDRQ = EDPRCR bit 0):%s\n", line);
+}
+
+static void t8142_ed_release(void)
+{
+	u64 mpidr = read_cpuid_mpidr();
+	unsigned int c = MPIDR_AFFINITY_LEVEL(mpidr, 2), k = MPIDR_AFFINITY_LEVEL(mpidr, 0);
+	void __iomem *ed;
+
+	if (!READ_ONCE(sleep_ed_release) || c >= T8142_ED_CLUSTERS || k >= T8142_ED_CORES)
+		return;
+	ed = t8142_ed[c][k];
+	if (!ed)
+		return;
+	writel_relaxed(T8142_ED_KEY, ed + T8142_ED_EDLAR);
+	writel_relaxed(0, ed + T8142_ED_EDPRCR);
+}
+
+/*
+ * The core's own FIQ sources, quiet before its last WFI (a pending one ends the WFI, masked or
+ * not). With VHE, sleep_deep_wfi_arm's cntp/cntv_ctl_el0 reach the EL2 timers only; the EL1
+ * pair (_EL02) is what macOS masks (per-core init: cntp_ctl = 2). XNU's core-offline path
+ * (26B131 kc +0x4ed69d4) also stops the core PMU (PMCR0 := 0) before its deep WFI.
+ * apple_sleep.m5_quiet=0 leaves them alone (A/B).
+ */
+#define T8142_PMCR0		sys_reg(3, 1, 15, 0, 0)
+#define T8142_UPMCR0		sys_reg(3, 7, 15, 0, 4)
+#define T8142_UPMSR		sys_reg(3, 7, 15, 6, 4)
+#define T8142_VM_TMR_FIQ_ENA	sys_reg(3, 5, 15, 1, 3)
+#define T8142_CLPC_C5_0		sys_reg(3, 7, 15, 5, 0)
+static bool sleep_m5_quiet = true;
+module_param_named(m5_quiet, sleep_m5_quiet, bool, 0644);
+MODULE_PARM_DESC(m5_quiet, "T8142: mask the EL1 timers and stop the core PMU before each core's last deep WFI");
+
+/*
+ * The last WFI at EL1, not EL2. Under aura on J815 (kit v10, 2026-11-16), macOS's own sleep
+ * completed when its cores took their last WFI natively at EL1 (sleep-go-keep) and reset on WD2
+ * when aura took the same WFI at EL2 for them (sleep-go-el2): Linux's signature (note 0x65,
+ * E complex off, P complex asked off but BUSY, the boot core's WFI held: b45 observer 0x98).
+ * Linux runs at EL2 (VHE), so each core drops to EL1h, MMU off, every exception masked, stage 2
+ * off, no traps, and loops on WFI there. Nothing returns: a reset or the wake (RVBAR) follows.
+ * apple_sleep.el1_wfi: 0 = at EL2 (default), 1 = the boot core only, 2 = every core.
+ */
+/*
+ * The dry run's register readouts (IMPDEF sysregs, every core's ED block, the C1_6 write test):
+ * never booted before 2026-11-16, and a dry-run report has reset the Mac before (b32), so they
+ * only run when asked: echo 1 > /sys/module/apple_sleep/parameters/dry_regs.
+ */
+static bool sleep_dry_regs;
+module_param_named(dry_regs, sleep_dry_regs, bool, 0644);
+MODULE_PARM_DESC(dry_regs, "T8142: print the core register readouts at each dry run (off by default)");
+
+/*
+ * Default 0 again since 2026-11-16 14:4x: with 2, the E complex stayed BUSY 2 s after the commit
+ * (note 0x67, boot 475520fe); with 0 it powered off, in either release order (fe1573cb, 2335a7e7).
+ */
+static unsigned int sleep_el1_wfi;
+module_param_named(el1_wfi, sleep_el1_wfi, uint, 0644);
+MODULE_PARM_DESC(el1_wfi, "T8142: take the last WFI at EL1: 0 no, 1 boot core, 2 every core");
+
+/*
+ * Where the stopped cores take their deep WFI. XNU (ml_arm_sleep): each other core writes its
+ * stop bit, waits for the boot core's flag, then takes its deep WFI; the boot core clears the
+ * flag and only then runs the platform quiesce actions, the PMGR's last mile and the S2R
+ * timer among them. Thomas's J813 trace (all ten cores, 27.2, 2026-11-16) has it so: the nine
+ * stop bits at -6.7..-6.06 ms, the boot core's first PCIe word at -5.79 ms, the timer at 0.
+ * Linux held them in WFE through the memory stop and the clusters' off words and released
+ * them after the timer (#1963's T6050 order). 1 (default): XNU's order, the cores in their
+ * deep WFI before the last mile; 0: after the commit, as before.
+ */
+static bool sleep_early_wfi = true;
+module_param_named(early_wfi, sleep_early_wfi, bool, 0644);
+MODULE_PARM_DESC(early_wfi, "T8142: stopped cores take their deep WFI before the last mile (XNU's order), not after the commit");
+#define SLEEP_EARLY_WFI_SETTLE_US	300
+
+/*
+ * T8142 DIAGNOSTIC, b45's observer back on the current tree (2026-11-16 14:4x): E core 0 does not
+ * take its last WFI; it waits for the boot core's, samples at +20 ms, +300 ms and +observer_ms,
+ * writes note 0x6a (one flag byte per sample: bit 0 commit word nonzero, 1/2 complex E/P asked
+ * on, 3/4 E/P busy, 5 the boot core's WFI came back, 6 an armed wake source pending, 7 the boot
+ * core reached its WFI), then takes its own last WFI, so the sleep can still complete. It answers
+ * what the post-commit probe can't: does complex P power down once the boot core is in its WFI.
+ * 0: off (default).
+ */
+static unsigned int sleep_observer_ms;
+module_param_named(observer_ms, sleep_observer_ms, uint, 0644);
+MODULE_PARM_DESC(observer_ms, "T8142 DIAGNOSTIC: E core 0 watches complex P for this many ms after the boot core's last WFI (note 0x6a), then sleeps (0 = off)");
+static u32 t8142_obs_boot_wfi, t8142_obs_wfi_back;
+
+/*
+ * T8142 DIAGNOSTIC (b43's post_commit_note, back on the current tree, 2026-11-16): after the
+ * commit and the other cores' release, the boot core spins this many ms instead of taking its
+ * WFI, writes note 0x66 (what the engine left: the commit word, both complexes, a pending armed
+ * wake, the perf states, the PMC voters), then takes its WFI, so the sleep can still go down.
+ * The one J815 run that slept and ran the engine's wake program (b43 run 32535966) was such a
+ * probe. 0: off (default). The SPMI writes come after the S2R timer, as macOS's own do.
+ */
+static unsigned int sleep_post_commit_ms;
+module_param_named(post_commit_ms, sleep_post_commit_ms, uint, 0644);
+MODULE_PARM_DESC(post_commit_ms, "T8142 DIAGNOSTIC: the boot core notes the engine's state this many ms after the commit, then takes its WFI (0 = off)");
+/*
+ * With post_commit_ms: after note 0x66, every core's EDPRSR through its external debug window
+ * (bit 0 PU = the core is powered, bit 1 SPD = it powered down since the last read), note 0x67.
+ * A read that hangs leaves 0x66 in the PMU. 0 skips it.
+ */
+/* Off by default: in boot 475520fe it read PU 0 for every core, the running boot core too. */
+static bool sleep_post_commit_ed;
+module_param_named(post_commit_ed, sleep_post_commit_ed, bool, 0644);
+MODULE_PARM_DESC(post_commit_ed, "T8142 DIAGNOSTIC: with post_commit_ms, also note each core's EDPRSR power status (note 0x67)");
+
+/*
+ * T8142: words the T8132-derived lists lower but macOS 27.2 leaves on at the commit (J813 trace
+ * g01, 2026-11-16). Bit 0: PMS_C1PPT, SOC_RC. Bit 1: I2C0/2/4, SPI0/1/3/5. macOS raises both
+ * groups with AUTO_ENABLE at boot and at each wake and writes neither before any of the run's
+ * three committed sleeps; none has a node in the J815 DT, so only this match touches them.
+ * Bit 2: ATC1_COMMON, ATC1_USB(_AON). Bit 3: ATC0_USB(_AON), ATC0_COMMON at
+ * lower_io. Both ATC ports were hidden from that guest, so bits 2 and 3 have no evidence
+ * behind them yet and are off by default.
+ */
+/*
+ * T8142: XNU's PMGR start puts 54 power words under AUTO_ENABLE at boot (J813 trace g01: read,
+ * the value with its flags cleared, then the same | AUTO_ENABLE), the same 22 + 4 as at each
+ * wake and 28 more. iBoot leaves them on with AUTO_ENABLE clear, and on J815 Linux leaves them
+ * so (dry run: PMS_C1PPT 0x2ff, I2C0 0xff): T6050's seq-boot does the same for its own words
+ * ("so none can gate"). This does it at the deep entry, right after the dry-run gate, for the
+ * words that are on without it; a refusal before the commit takes it back.
+ */
+static bool sleep_boot_auto_on = true;
+module_param_named(boot_auto, sleep_boot_auto_on, bool, 0644);
+MODULE_PARM_DESC(boot_auto, "T8142: put XNU's boot list of power words under AUTO_ENABLE at the deep entry (default Y)");
+/*
+ * T8142: XNU's AppleT8142MCC start (J813 trace g01: ~1120 accesses in the first ms of XNU, 677
+ * writes): DCS channels' +0x580/+0x584 enables bit by bit, their lanes (+0x588 strobe/enable with
+ * +0x680/+0x58c), the group words, every channel's +0x24 bit 12, the AMCC planes' sleep bits 1..8
+ * and config, the SoC NI tables with their +0x100 strobe. iBoot leaves all of it at reset values
+ * and no Linux driver does it, so J815's memory side reads 0 where macOS has 0x3ff1, 0x11, ...
+ * Replayed at the deep entry after the last refusal point, only if the 34 words XNU reads before
+ * its first write hold exactly what they hold on the J813 (iBoot's values). J813 constants on
+ * J815's memory controller: default off.
+ */
+static bool sleep_mem_boot;
+module_param_named(mem_boot, sleep_mem_boot, bool, 0644);
+MODULE_PARM_DESC(mem_boot, "T8142 EXPERIMENT: replay XNU's memory-controller start at the deep entry if iBoot's fingerprint matches (default N)");
+/*
+ * T8142: T6050's memory performance floor (its voter 1: 2, 1 at 9 ms, then 0 before the memory
+ * stop; "the value read back stays 0"). No T8142 evidence: J813's trace didn't hook the voters.
+ */
+/*
+ * T8142: PMP's power domain off after its firmware's final stop (Thomas Glanzmann,
+ * m0d16l14n1/linux#4 e754b17c, 2026-11-16): the PMP is idled and RUN cleared, but its domain
+ * stayed at target f; macOS lowers it (J813 g01: 0x598 0x0f0f00ff -> 0x0f0f03f0 at -12.2 ms),
+ * and PMS_SRAM then gates by itself. On J813 the first real sleep and return came with it.
+ */
+static bool sleep_pmp_off = true;
+module_param_named(pmp_off, sleep_pmp_off, bool, 0644);
+MODULE_PARM_DESC(pmp_off, "T8142: power the PMP's domain off after its final stop, as macOS (default Y)");
+
+/*
+ * J815 macOS 26B131 (notes/sleep-trace/t8142-j815-26B131-entry.md): DISPEXT0, then DISPEXT1,
+ * then DISP, each SYS/FE up, the CPU word down in four steps, SYS/FE down, 159-137 ms before
+ * the S2R timer; all six DISPEXT words are off at macOS's commit. Linux's T8142 profile only
+ * lowered the internal DCP, while both external DCPs are bound here and their FE/SYS words read
+ * 0x20ff in the dry run.
+ */
+static bool sleep_dispext = true;
+module_param_named(dispext, sleep_dispext, bool, 0644);
+MODULE_PARM_DESC(dispext, "T8142: lower the external DCPs' domains with the display, as macOS (default Y)");
+
+/*
+ * The OS-managed words (not no_ps in the J815 ADT) that macOS has off at its commit (J813 g01
+ * end state) and no other step of Linux's sleep lowers: SIO_CPU (on from iBoot, no driver on
+ * J815; macOS lowers it 53 ms before the timer, Thomas's "inactive SIO CPU domain"), FPWM0 (the
+ * keyboard backlight), GLOBAL_AUX_CTRL0/1, the PCIe OCLAs (children of APCIE_SYS_GP/ST, which
+ * lower_io lowers) and the displays' ADMA words (children of their SYS words). Each only if on.
+ */
+static bool sleep_extra_off = true;
+module_param_named(extra_off, sleep_extra_off, bool, 0644);
+MODULE_PARM_DESC(extra_off, "T8142: lower the words macOS has off at its commit that nothing else lowers (default Y)");
+
+static bool sleep_mem_floor;
+module_param_named(mem_floor, sleep_mem_floor, bool, 0644);
+MODULE_PARM_DESC(mem_floor, "T8142 EXPERIMENT: step PMC voter 1 down (2, 1, 0) as T6050 does (default N)");
+
+static bool sleep_boot_auto_dry = true;
+module_param_named(boot_auto_dry, sleep_boot_auto_dry, bool, 0644);
+MODULE_PARM_DESC(boot_auto_dry, "T8142: a dry run also does boot_auto's writes, reads them back and undoes them (default Y)");
+
+static unsigned int sleep_ps_keep = 0x3;
+module_param_named(ps_keep, sleep_ps_keep, uint, 0644);
+MODULE_PARM_DESC(ps_keep, "T8142: power words left as they are at the match, by group (bit 0 PMS_C1PPT/SOC_RC, 1 I2C/SPI, 2 ATC1, 3 ATC0 at lower_io; default 0x3)");
+
+/* The T8142 wake's own restores (J813 trace), each switchable for an A/B. */
+static bool sleep_mem_restore = true;
+module_param_named(mem_restore, sleep_mem_restore, bool, 0644);
+MODULE_PARM_DESC(mem_restore, "T8142: put the memory side (AMCC, SoC NI, DCS) back at the wake as XNU does");
+static bool sleep_clk_restore = true;
+module_param_named(clk_restore, sleep_clk_restore, bool, 0644);
+MODULE_PARM_DESC(clk_restore, "T8142: put the 126 PMGR clkgen slots and the memory clock word back at the wake as XNU does");
+static bool sleep_perf_down = true;
+module_param_named(perf_down, sleep_perf_down, bool, 0644);
+MODULE_PARM_DESC(perf_down, "T8142: SoC/DCS perf states down before the memory stop (macOS on J813 never writes them; A/B)");
+static u64 t8142_boot_mpidr = ~0ULL;
+
+extern char t8142_el1_wfi_stub[], t8142_el1_wfi_stub_end[];
+asm(".pushsection .text, \"ax\"\n"
+	".balign 64\n"
+	".global t8142_el1_wfi_stub\n"
+	"t8142_el1_wfi_stub:\n"
+	"1:	dsb sy\n"
+	"	isb\n"
+	"	wfi\n"
+	"	b 1b\n"
+	".global t8142_el1_wfi_stub_end\n"
+	"t8142_el1_wfi_stub_end:\n"
+	".popsection\n");
+
+static void __noreturn t8142_el1_wfi(void)
+{
+	write_sysreg_s(INIT_SCTLR_EL1_MMU_OFF, SYS_SCTLR_EL12);
+	isb();
+	write_sysreg(HCR_RW | HCR_E2H, hcr_el2);
+	write_sysreg(PSR_MODE_EL1h | PSR_D_BIT | PSR_A_BIT | PSR_I_BIT | PSR_F_BIT, spsr_el2);
+	write_sysreg(__pa_symbol(t8142_el1_wfi_stub), elr_el2);
+	/* The EL1 loop acks nothing: no fast IPI may be left pending to end its WFI. */
+	write_sysreg_s(IPI_SR_PENDING, SYS_APL_IPI_SR_EL1);
+	isb();
+	asm volatile("eret" ::: "memory");
+	unreachable();
+}
+
+static bool t8142_el1_wfi_here(void)
+{
+	unsigned int mode = READ_ONCE(sleep_el1_wfi);
+
+	if (!is_kernel_in_hyp_mode() || !mode)
+		return false;
+	return mode >= 2 || (read_cpuid_mpidr() & MPIDR_HWID_BITMASK) == READ_ONCE(t8142_boot_mpidr);
+}
+
+static void t8142_deep_wfi_arm(void)
+{
+	if (READ_ONCE(sleep_m5_pwrdn) && is_kernel_in_hyp_mode())
+		sysreg_clear_set_s(SLEEP_M5_C1_6, 0, SLEEP_M5_C1_6_PWRDN);
+	if (READ_ONCE(sleep_m5_quiet)) {
+		if (is_kernel_in_hyp_mode()) {
+			write_sysreg_s(ARCH_TIMER_CTRL_IT_MASK, SYS_CNTP_CTL_EL02);
+			write_sysreg_s(ARCH_TIMER_CTRL_IT_MASK, SYS_CNTV_CTL_EL02);
+		}
+		write_sysreg_s(0, T8142_PMCR0);
+		isb();
+	}
+	t8142_ed_release();
+	t8140_deep_wfi_arm();
+	if (t8142_el1_wfi_here()) {
+		dsb(sy);
+		t8142_el1_wfi();
+	}
+}
+
+static u8 t8142_fiq_sources(void)
+{
+	u8 m = 0;
+#define FIRING(v)	(((v) & (ARCH_TIMER_CTRL_ENABLE | ARCH_TIMER_CTRL_IT_MASK | ARCH_TIMER_CTRL_IT_STAT)) == \
+			 (ARCH_TIMER_CTRL_ENABLE | ARCH_TIMER_CTRL_IT_STAT))
+	if (FIRING(read_sysreg(cntp_ctl_el0)))
+		m |= 0x01;
+	if (FIRING(read_sysreg(cntv_ctl_el0)))
+		m |= 0x02;
+	if (is_kernel_in_hyp_mode()) {
+		if (FIRING(read_sysreg_s(SYS_CNTP_CTL_EL02)))
+			m |= 0x04;
+		if (FIRING(read_sysreg_s(SYS_CNTV_CTL_EL02)))
+			m |= 0x08;
+	}
+#undef FIRING
+	if (read_sysreg_s(T8142_PMCR0) & BIT(11))
+		m |= 0x10;
+	if (read_sysreg_s(SYS_APL_IPI_SR_EL1) & IPI_SR_PENDING)
+		m |= 0x20;
+	if (read_sysreg_s(T8142_UPMSR) & BIT(0))
+		m |= 0x40;
+	return m;
+}
+
+/*
+ * The boot core's last WFI (at EL2) returned while it should be powered off: note 0x6c once, 100 ms
+ * into the loop (past the engine's 33 ms window, so no SPMI traffic while the sleep can still
+ * go through): +2 0x80 | ISR_EL1's A/I/F (bits 2/1/0), +4 the core's own FIQ sources still
+ * firing (0x01 CNTP/EL2, 0x02 CNTV/EL2, 0x04 CNTP_EL02, 0x08 CNTV_EL02, 0x10 PMC, 0x20 IPI,
+ * 0x40 UPMC). The next boot reads 0x6c (it woke over and over) or 0x65 (it sat in WFI).
+ */
+static void t8142_wfi_returned(struct apple_sleep *s, u64 t0, bool *noted)
+{
+	u64 isr;
+
+	if (*noted || read_sysreg(cntpct_el0) - t0 < arch_timer_get_cntfrq() / 10)
+		return;
+	*noted = true;
+	isr = read_sysreg(isr_el1);
+	sleep_note_at(s, 2, 0x80 | ((isr >> 6) & 7));
+	sleep_note_at(s, 4, t8142_fiq_sources());
+	sleep_note(s, 0x6c);
+}
+
 static void sleep_deep_wfi_arm(void)
 {
 	/* A timer left running ends the WFI, and costs power until reset. */
@@ -1838,8 +2339,67 @@ static void sleep_cpu_stop(u64 mpidr)
 	dsb(sy);
 }
 
+static u8 t8142_obs_sample(struct apple_sleep *s)
+{
+	const struct apple_sleep_soc *soc = s->soc;
+	u32 e = readl(s->cluster + soc->cluster_cpu[0]);
+	u32 p = readl(s->cluster + soc->cluster_cpu[1]);
+	u8 f = 0;
+	int i;
+
+	if (readl(s->commit))
+		f |= BIT(0);
+	if (e & CLUSTER_ON)
+		f |= BIT(1);
+	if (p & CLUSTER_ON)
+		f |= BIT(2);
+	if (e & BIT(4))
+		f |= BIT(3);
+	if (p & BIT(4))
+		f |= BIT(4);
+	if (READ_ONCE(t8142_obs_wfi_back))
+		f |= BIT(5);
+	for (i = 0; i < soc->wake_words; i++)
+		if (readl(s->wake + soc->wake_status + 4 * i) & s->wake_armed[i])
+			f |= BIT(6);
+	if (READ_ONCE(t8142_obs_boot_wfi))
+		f |= BIT(7);
+	return f;
+}
+
+/* E core 0 with apple_sleep.observer_ms: see sleep_observer_ms. */
+static void t8142_observe(struct apple_sleep *s, unsigned int ms)
+{
+	u64 freq = arch_timer_get_cntfrq(), t0 = read_sysreg(cntpct_el0);
+	static const unsigned int at_ms[2] = { 20, 300 };
+	u8 b[3];
+	int i;
+
+	/* At most 30 s for the boot core to get there (a hang before it ends at WD2 anyway). */
+	while (!READ_ONCE(t8142_obs_boot_wfi) && read_sysreg(cntpct_el0) - t0 < 30 * freq)
+		cpu_relax();
+	t0 = read_sysreg(cntpct_el0);
+	for (i = 0; i < 3; i++) {
+		u64 wait = (i < 2 ? at_ms[i] : max(ms, 301U)) * freq / 1000;
+
+		while (read_sysreg(cntpct_el0) - t0 < wait)
+			cpu_relax();
+		b[i] = t8142_obs_sample(s);
+	}
+	sleep_note_at(s, 2, b[0]);
+	sleep_note_at(s, 3, b[1]);
+	sleep_note_at(s, 4, b[2]);
+	sleep_note(s, 0x6a);
+}
+
 static void sleep_cpu_off(u64 mpidr)
 {
+	struct apple_sleep *s = apple_sleep;
+	unsigned int ms = READ_ONCE(sleep_observer_ms);
+
+	if (ms && s && s->soc->ops->deep_wfi_arm == t8142_deep_wfi_arm &&
+	    (mpidr & MPIDR_HWID_BITMASK) == 0)
+		t8142_observe(s, ms);
 	sleep_deep_wfi();
 }
 
@@ -1851,13 +2411,91 @@ static void sleep_cpu_down_off(u64 mpidr)
 	sleep_deep_wfi();
 }
 
+/*
+ * apple_sleep.cpu_on_trace: after a sleep, one line per core start. aura's spin-table slot is
+ * { mpidr, flag, target, ... } with cpu-release-addr = &target, and aura bumps flag as the core
+ * enters its reset path: "flag a -> b" tells a core that never left reset from one that ran
+ * and stopped later (in the kernel's pen or its bring-up). Also the cpu-start words before and
+ * after, the core's power and power-gate words and its EDPRSR (bit 0 PU).
+ */
+static bool sleep_cpu_on_trace = true;
+module_param_named(cpu_on_trace, sleep_cpu_on_trace, bool, 0644);
+MODULE_PARM_DESC(cpu_on_trace, "Report each core start after a sleep (aura slot flag, cpu-start words, EDPRSR)");
+
+static void __iomem *sleep_cpu_slot[NR_CPUS];
+
+static void __iomem *sleep_cpu_slot_map(int cpu)
+{
+	struct device_node *np;
+	u64 rel;
+
+	if (cpu < 0 || cpu >= NR_CPUS)
+		return NULL;
+	if (sleep_cpu_slot[cpu])
+		return sleep_cpu_slot[cpu];
+	np = of_get_cpu_node(cpu, NULL);
+	if (!np)
+		return NULL;
+	if (!of_property_read_u64(np, "cpu-release-addr", &rel) && rel >= 16)
+		sleep_cpu_slot[cpu] = ioremap_cache(rel - 16, 24);
+	of_node_put(np);
+	return sleep_cpu_slot[cpu];
+}
+
+static u64 sleep_cpu_slot_read(void __iomem *slot, unsigned int off)
+{
+	dcache_inval_poc((unsigned long)slot + off, (unsigned long)slot + off + 8);
+	return readq(slot + off);
+}
+
+static void sleep_cpu_start_words(struct apple_sleep *s, u32 *w)
+{
+	w[0] = readl(s->cpu_start + CPU_START_STOP);
+	w[1] = readl(s->cpu_start + CPU_START_SYS);
+	w[2] = readl(s->cpu_start + CPU_START_CLUSTER(0));
+	w[3] = readl(s->cpu_start + CPU_START_CLUSTER(1));
+}
+
 static int sleep_cpu_on(u64 mpidr)
 {
 	struct apple_sleep *s = apple_sleep;
-	unsigned int cluster = sleep_cpu_cluster(s, mpidr);
+	unsigned int cluster = sleep_cpu_cluster(s, mpidr), core = sleep_cpu_core(mpidr);
+	bool trace = READ_ONCE(sleep_cpu_on_trace) && s->soc->cpu_clusters >= 2;
+	int cpu = get_logical_index(mpidr & MPIDR_HWID_BITMASK);
+	void __iomem *slot = trace ? sleep_cpu_slot_map(cpu) : NULL;
+	u32 before[4], after[4], ps = 0, gate = 0, edprsr = ~0U;
+	u64 flag0 = 0, flag1 = 0;
+	unsigned int us = 0;
+
+	if (trace) {
+		sleep_cpu_start_words(s, before);
+		if (slot)
+			flag0 = sleep_cpu_slot_read(slot, 8);
+	}
 
 	writel(sleep_cpu_start_bit(s, mpidr), s->cpu_start + CPU_START_SYS);
-	writel(BIT(sleep_cpu_core(mpidr)), s->cpu_start + CPU_START_CLUSTER(cluster));
+	writel(BIT(core), s->cpu_start + CPU_START_CLUSTER(cluster));
+
+	if (!trace)
+		return 0;
+	/* Up to 20 ms for aura's entry to count it; the kernel's own wait is 5 s. */
+	for (us = 0; slot && us < 20000; us += 20) {
+		flag1 = sleep_cpu_slot_read(slot, 8);
+		if (flag1 != flag0)
+			break;
+		udelay(20);
+	}
+	sleep_cpu_start_words(s, after);
+	if (s->soc->ops->deep_wfi_arm == t8142_deep_wfi_arm) {
+		/* T8142 core words: E k at 8k, P k at 0x30 + 8k; power gates at a 0x10 stride */
+		ps = readl(s->ps + (cluster ? 0x30 : 0) + 8 * core);
+		gate = readl(s->pwrgate + (cluster ? 0x60 : 0) + 0x10 * core);
+		if (cluster < T8142_ED_CLUSTERS && core < T8142_ED_CORES && t8142_ed[cluster][core])
+			edprsr = readl_relaxed(t8142_ed[cluster][core] + T8142_ED_EDPRSR);
+	}
+	pr_info("apple-sleep: cpu%d start %#llx: stop/sys/e/p %x/%x/%x/%x -> %x/%x/%x/%x; aura slot %s flag %llu -> %llu after %u us; ps %#x pwrgate %#x edprsr %#x\n",
+		cpu, mpidr, before[0], before[1], before[2], before[3], after[0], after[1],
+		after[2], after[3], slot ? "mapped" : "UNMAPPED", flag0, flag1, us, ps, gate, edprsr);
 
 	return 0;
 }
@@ -2593,6 +3231,24 @@ static int apple_sleep_refuse(struct apple_sleep *s)
 	for (i = 0; i < s->soc->ndisp; i++) {
 		u32 ps = d->disp[i][0];
 
+		/*
+		 * T8142's external DCPs have no sleep stop in their driver (no s2r_ext, not
+		 * T6050's late stop): with apple_sleep.dispext the display's lowering stops each
+		 * one's CPU cold, as for an unbound DCP, so a running one is no refusal.
+		 */
+		if (i != 0 && s->soc->dispext_optional) {
+			/*
+			 * Undescribed (no phandle), it can't be stopped here, and iBoot leaves its
+			 * firmware running with the domain up: the engine would wait on it.
+			 */
+			if (READ_ONCE(sleep_dispext) && !s->display[i].np && sleep_ps_on(s, ps)) {
+				dev_err(s->dev,
+					"refused: external display coprocessor %d is on (%#x: %#x) and not in apple,display-coprocessors\n",
+					i - 1, ps, readl(sleep_power_reg(s, ps)));
+				refused = true;
+			}
+			continue;
+		}
 		if (s->display[i].bound && sleep_asc_running(s, ps, s->display[i].asc) &&
 		    (!apple_sleep_v27_late() || sleep_v27_final_check(i))) {
 			dev_err(s->dev, "refused: a bound display coprocessor is still running\n");
@@ -2647,18 +3303,62 @@ static void sleep_wake_restore(struct apple_sleep *s)
  * writes. The coprocessors' secure mailboxes are not used here. Whether that
  * holds is open.
  */
+static bool sleep_dispext_skip(struct apple_sleep *s, int i)
+{
+	return i != 0 && s->soc->dispext_optional &&
+	       (!READ_ONCE(sleep_dispext) || !s->display[i].np);
+}
+
+/*
+ * apple_sleep.dispext: an external display's words back as the lowering found them, parents
+ * first (SYS, FE, CPU), after a refusal or at the wake (the commit saw them off, so the rewake
+ * leaves them). Its firmware was stopped cold; its driver's resume starts it again.
+ */
+static void sleep_dispext_restore(struct apple_sleep *s)
+{
+	const u32 (*domains)[3] = s->soc->ps.disp;
+	int i, k;
+
+	for (i = 1; i < s->soc->ndisp; i++) {
+		if (!(s->dispext_lowered & BIT(i)))
+			continue;
+		for (k = 2; k >= 0; k--)
+			if (FIELD_GET(PS_TARGET, s->dispext_saved[i][k]))
+				sleep_ps_restore(s->ps + domains[i][k], s->dispext_saved[i][k]);
+	}
+	s->dispext_lowered = 0;
+	/*
+	 * An external display's ADMA once its SYS word is up again. The internal display's stays
+	 * off: no Linux driver uses it, and its SYS word comes back with the DCP's own resume.
+	 */
+	for (i = 1; i < s->soc->ndisp; i++) {
+		if (!(s->disp_adma_lowered & BIT(i)))
+			continue;
+		if (FIELD_GET(PS_ACTUAL, readl(s->ps + domains[i][2])))
+			sleep_ps_restore(sleep_power_reg(s, s->soc->disp_adma[i]),
+					 s->disp_adma_saved[i]);
+		s->disp_adma_lowered &= ~BIT(i);
+	}
+}
+
 static int sleep_display_off(struct apple_sleep *s)
 {
 	const struct apple_sleep_soc *soc = s->soc;
 	const u32 (*domains)[3] = soc->ps.disp;
 	int n = soc->ndisp, j, i, ret = 0;
 
+	s->dispext_lowered = 0;
+	s->disp_adma_lowered = 0;
+	s->extra_stuck = 0;
+	s->dispext_note = soc->dispext_optional && READ_ONCE(sleep_dispext) ? 1 : 0;
 	for (j = 0; j < n; j++) {
 		void __iomem *asc;
 
 		i = soc->display_order[j];
 		asc = s->display[i].asc;
 
+		if (sleep_dispext_skip(s, i))
+			continue;
 		/*
 		 * T8140's engine doesn't wait for its external display. On T8132 macOS has them
 		 * all off.
@@ -2672,6 +3372,43 @@ static int sleep_display_off(struct apple_sleep *s)
 
 				slice = s->ps_prot + PS_PROT_SLICE(soc->disp_prot_slice[i]);
 				writel(readl(slice) & ~PS_PROT_SLICE_ON, slice);
+			}
+		}
+		if (i != 0 && soc->dispext_optional) {
+			int k;
+
+			for (k = 0; k < 3; k++)
+				s->dispext_saved[i][k] = readl(s->ps + domains[i][k]);
+			s->dispext_lowered |= BIT(i);
+			/* +22 bits 1/2 (DISPEXT0) and 3/4 (DISPEXT1): CPU on, FE or SYS on */
+			if (i <= 2 && FIELD_GET(PS_ACTUAL, s->dispext_saved[i][0]))
+				s->dispext_note |= BIT(2 * i - 1);
+			if (i <= 2 && (FIELD_GET(PS_ACTUAL, s->dispext_saved[i][1]) ||
+				       FIELD_GET(PS_ACTUAL, s->dispext_saved[i][2])))
+				s->dispext_note |= BIT(2 * i);
+			if (sleep_asc_running(s, domains[i][0], asc))
+				s->dispext_note |= 0x20;
+			if (soc->disp_wr_dis[i][0]) {
+				void __iomem *wr = s->ps + soc->disp_wr_dis[i][0];
+				u32 bit = BIT(soc->disp_wr_dis[i][1]);
+
+				if (readl(wr) & bit) {
+					writel(readl(wr) & ~bit, wr);
+					s->dispext_note |= 0x40;
+				}
+			}
+		}
+
+		/* apple_sleep.extra_off: the display's ADMA, a child of its SYS word, first */
+		if (soc->disp_adma[i] && READ_ONCE(sleep_extra_off)) {
+			u32 a = soc->disp_adma[i], v = readl(sleep_power_reg(s, a));
+
+			s->disp_adma_saved[i] = v;
+			if (FIELD_GET(PS_ACTUAL, v)) {
+				sleep_ps_lower(s, a);
+				s->disp_adma_lowered |= BIT(i);
+				if (sleep_ps_wait_off(s, a))
+					s->extra_stuck |= BIT(31);
 			}
 		}
 
@@ -2698,6 +3435,8 @@ static int sleep_display_off(struct apple_sleep *s)
 	for (i = 0; i < n; i++) {
 		int err;
 
+		if (sleep_dispext_skip(s, i))
+			continue;
 		if (i != 0 && !s->display[i].bound && !s->soc->lower_unbound_displays)
 			continue;
 
@@ -2706,9 +3445,13 @@ static int sleep_display_off(struct apple_sleep *s)
 		if (err) {
 			dev_err(s->dev, "refused: display domain %#x stayed on: %#x\n",
 				domains[i][0], readl(s->ps + domains[i][0]));
+			if (i != 0 && soc->dispext_optional)
+				s->dispext_note |= 0x80;
 			ret = err;
 		}
 	}
+	if (soc->dispext_optional)
+		sleep_note_at(s, 22, s->dispext_note);
 
 	return ret;
 }
@@ -3998,10 +4741,179 @@ static bool apple_sleep_ps_unlatch(struct apple_sleep *s)
 	return stuck;
 }
 
+struct t8142_mem_op {
+	u64 pa;
+	u64 val;
+	u8 op;
+};
+#define T8142_MEM_WRITE	BIT(0)
+#define T8142_MEM_64	BIT(1)
+#define T8142_MEM_FP	BIT(4)
+#include "sleep-t8142-mem.h"
+
+static void t8142_mem_map(struct apple_sleep *s)
+{
+	unsigned int i;
+
+	BUILD_BUG_ON(ARRAY_SIZE(t8142_mem_pages) > ARRAY_SIZE(s->mem_boot_page));
+	for (i = 0; i < ARRAY_SIZE(t8142_mem_pages); i++)
+		s->mem_boot_page[i] = devm_ioremap(s->dev, t8142_mem_pages[i], SZ_16K);
+}
+
+static void __iomem *t8142_mem_va(struct apple_sleep *s, u64 pa)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(t8142_mem_pages); i++)
+		if ((pa & ~(u64)(SZ_16K - 1)) == t8142_mem_pages[i])
+			return s->mem_boot_page[i] ? s->mem_boot_page[i] + (pa & (SZ_16K - 1)) : NULL;
+	return NULL;
+}
+
+/* The words XNU reads before its first write, against J813's (iBoot's) values: mismatches. */
+static unsigned int t8142_mem_fingerprint(struct apple_sleep *s, u64 *pa, u64 *got, u64 *want)
+{
+	unsigned int i, bad = 0;
+
+	*pa = 0;
+	for (i = 0; i < ARRAY_SIZE(t8142_mem_boot); i++) {
+		const struct t8142_mem_op *o = &t8142_mem_boot[i];
+		void __iomem *va;
+		u64 v;
+
+		if (!(o->op & T8142_MEM_FP))
+			continue;
+		va = t8142_mem_va(s, o->pa);
+		if (!va) {
+			bad++;
+			continue;
+		}
+		v = (o->op & T8142_MEM_64) ? readq(va) : readl(va);
+		if (v == o->val)
+			continue;
+		if (!bad++) {
+			*pa = o->pa;
+			*got = v;
+			*want = o->val;
+		}
+	}
+	return bad;
+}
+
+/* XNU's accesses in its order: the writes as it wrote them, the reads done and dropped. */
+static void t8142_mem_replay(struct apple_sleep *s)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(t8142_mem_boot); i++) {
+		const struct t8142_mem_op *o = &t8142_mem_boot[i];
+		void __iomem *va = t8142_mem_va(s, o->pa);
+
+		if (!va)
+			continue;
+		if (o->op & T8142_MEM_WRITE) {
+			if (o->op & T8142_MEM_64)
+				writeq(o->val, va);
+			else
+				writel(o->val, va);
+		} else if (o->op & T8142_MEM_64) {
+			readq(va);
+		} else {
+			readl(va);
+		}
+	}
+}
+
+static void t8142_mem_boot_entry(struct apple_sleep *s)
+{
+	u64 pa, got, want;
+
+	s->mem_boot_done = false;
+	s->mem_boot_mismatch = 0;
+	if (!s->soc->mem_boot || !READ_ONCE(sleep_mem_boot))
+		return;
+	s->mem_boot_mismatch = t8142_mem_fingerprint(s, &pa, &got, &want);
+	if (s->mem_boot_mismatch)
+		return;
+	t8142_mem_replay(s);
+	s->mem_boot_done = true;
+}
+
+static void __iomem *sleep_boot_auto_reg(struct apple_sleep *s, unsigned int i)
+{
+	unsigned int n = s->soc->ps_boot_auto.count;
+
+	return i < n ? s->ps + s->soc->ps_boot_auto.offset[i] :
+		       s->ps_aon + s->soc->ps_aon_boot_auto.offset[i - n];
+}
+
+static unsigned int sleep_boot_auto_count(struct apple_sleep *s)
+{
+	return min_t(unsigned int, s->soc->ps_boot_auto.count + s->soc->ps_aon_boot_auto.count,
+		     ARRAY_SIZE(s->boot_auto_saved));
+}
+
+/* As XNU's PMGR start: the value with its flags cleared, then AUTO_ENABLE. On words that are on. */
+static int sleep_boot_auto(struct apple_sleep *s)
+{
+	unsigned int i, n = sleep_boot_auto_count(s);
+	int set = 0;
+
+	s->boot_auto_set = 0;
+	s->boot_auto_nset = s->boot_auto_stuck = 0;
+	if (!READ_ONCE(sleep_boot_auto_on))
+		return 0;
+	for (i = 0; i < n; i++) {
+		void __iomem *reg = sleep_boot_auto_reg(s, i);
+		u32 v = readl(reg);
+
+		if ((v & PS_AUTO_ENABLE) || !FIELD_GET(PS_TARGET, v) || !FIELD_GET(PS_ACTUAL, v))
+			continue;
+		s->boot_auto_saved[i] = v;
+		s->boot_auto_set |= BIT_ULL(i);
+		writel(v & ~PS_FLAGS, reg);
+		readl(reg);
+		writel((v & ~PS_FLAGS) | PS_AUTO_ENABLE, reg);
+		set++;
+		if (readl(reg) & PS_AUTO_ENABLE)
+			s->boot_auto_stuck++;
+	}
+	s->boot_auto_nset = set;
+	return set;
+}
+
+/* A refusal before the commit: AUTO_ENABLE off again where this set it, the target as it was. */
+static void sleep_boot_auto_undo(struct apple_sleep *s)
+{
+	unsigned int i, n = sleep_boot_auto_count(s);
+
+	for (i = 0; i < n; i++)
+		if (s->boot_auto_set & BIT_ULL(i))
+			writel(s->boot_auto_saved[i] & ~PS_FLAGS, sleep_boot_auto_reg(s, i));
+	s->boot_auto_set = 0;
+}
+
+/* Whether the match leaves this word as it is (apple_sleep.ps_keep, as the match took it) */
+static bool sleep_ps_kept(struct apple_sleep *s, u32 offset, bool aon)
+{
+	unsigned int i;
+
+	for (i = 0; i < s->soc->nps_keep; i++) {
+		const struct apple_sleep_ps_keep *k = &s->soc->ps_keep[i];
+
+		if (k->offset == offset && k->aon == aon)
+			return s->ps_keep_mask & BIT(k->group);
+	}
+
+	return false;
+}
+
 static void apple_sleep_match(struct apple_sleep *s)
 {
 	const struct apple_sleep_soc *soc = s->soc;
-	int i, raised = 0, lowered = 0, failed = 0;
+	int i, raised = 0, lowered = 0, failed = 0, kept = 0;
+
+	s->ps_keep_mask = READ_ONCE(sleep_ps_keep);
 
 	writel(0, s->wdt + WDT_WD0_COUNT);
 	writel(0, s->wdt + WDT_WD1_COUNT);
@@ -4031,6 +4943,10 @@ static void apple_sleep_match(struct apple_sleep *s)
 		s->ps_off_saved[i] = readl(sleep_power_reg(s, offset));
 		if (!sleep_ps_on(s, offset))
 			continue;
+		if (sleep_ps_kept(s, offset, false)) {
+			kept++;
+			continue;
+		}
 		sleep_ps_lower(s, offset);
 		lowered++;
 	}
@@ -4041,6 +4957,10 @@ static void apple_sleep_match(struct apple_sleep *s)
 		s->ps_aon_saved[i] = val;
 		if (!FIELD_GET(PS_ACTUAL, val))
 			continue;
+		if (sleep_ps_kept(s, soc->ps_aon_macos_off.offset[i], true)) {
+			kept++;
+			continue;
+		}
 		if (val & PS_AUTO_ENABLE) {
 			val &= ~(PS_AUTO_ENABLE | PS_FLAGS);
 			writel(val, reg);
@@ -4075,12 +4995,14 @@ static void apple_sleep_match(struct apple_sleep *s)
 	for (i = 0; i < soc->ps_macos_off.count; i++) {
 		u32 offset = soc->ps_macos_off.offset[i];
 
+		if (sleep_ps_kept(s, offset, false))
+			continue;
 		if (sleep_ps_wait_off(s, offset))
 			dev_dbg(s->dev, "still on, macOS has it off: %x = %x\n", offset,
 				readl(sleep_power_reg(s, offset)));
 	}
-	dev_dbg(s->dev, "macOS's power words: raised %d, %d of them failed, lowered %d\n",
-		raised, failed, lowered);
+	dev_dbg(s->dev, "macOS's power words: raised %d, %d of them failed, lowered %d, kept on %d\n",
+		raised, failed, lowered, kept);
 }
 
 /* Back as they were, after a refusal past the match or a real wake. */
@@ -4100,11 +5022,13 @@ static void apple_sleep_match_undo(struct apple_sleep *s)
 		writel(s->ps_aon_auto_saved[i] & ~PS_FLAGS,
 		       s->ps_aon + soc->ps_aon_macos_no_auto.offset[i]);
 	for (i = soc->ps_aon_macos_off.count - 1; i >= 0; i--)
-		if (FIELD_GET(PS_ACTUAL, s->ps_aon_saved[i]))
+		if (FIELD_GET(PS_ACTUAL, s->ps_aon_saved[i]) &&
+		    !sleep_ps_kept(s, soc->ps_aon_macos_off.offset[i], true))
 			writel(s->ps_aon_saved[i] & ~PS_FLAGS,
 			       s->ps_aon + soc->ps_aon_macos_off.offset[i]);
 	for (i = soc->ps_macos_off.count - 1; i >= 0; i--)
-		if (FIELD_GET(PS_ACTUAL, s->ps_off_saved[i]))
+		if (FIELD_GET(PS_ACTUAL, s->ps_off_saved[i]) &&
+		    !sleep_ps_kept(s, soc->ps_macos_off.offset[i], false))
 			sleep_ps_raise(s, soc->ps_macos_off.offset[i]);
 	for (i = soc->ps_macos_on.count - 1; i >= 0; i--) {
 		u32 val = s->ps_on_saved[i];
@@ -4260,12 +5184,25 @@ static void apple_sleep_dcs_down(struct apple_sleep *s)
 /* The boot core's last WFI. An event that ends it is taken, and the WFI taken again. */
 static void __noreturn sleep_boot_wfi(struct apple_sleep *s)
 {
+	bool t8142 = s->soc->ops->deep_wfi_arm == t8142_deep_wfi_arm, noted = false;
+	bool observed = t8142 && READ_ONCE(sleep_observer_ms);
+	u64 t0;
+
+	if (observed) {
+		WRITE_ONCE(t8142_obs_boot_wfi, 1);
+		dsb(sy);
+	}
 	sleep_deep_wfi_arm();
+	t0 = read_sysreg(cntpct_el0);
 
 	while (true) {
 		dsb(sy);
 		isb();
 		wfi();
+		if (observed)
+			WRITE_ONCE(t8142_obs_wfi_back, READ_ONCE(t8142_obs_wfi_back) + 1);
+		else if (t8142)
+			t8142_wfi_returned(s, t0, &noted);
 		s->soc->ops->aic_ack();
 		write_sysreg_s(IPI_SR_PENDING, SYS_APL_IPI_SR_EL1);
 	}
@@ -4293,10 +5230,13 @@ static void apple_sleep_wait_still_on(struct apple_sleep *s)
  *    before this, with no SPMI traffic near the engine.
  */
 static bool sleep_v27_selected_for(struct apple_sleep *s);
+static void t8142_last_mile(struct apple_sleep *s);
+static void t8142_post_commit_probe(struct apple_sleep *s, unsigned int ms);
 
 static int apple_sleep_commit(unsigned long unused)
 {
 	struct apple_sleep *s = apple_sleep;
+	bool early;
 
 	if (s->soc->ops->commit_begin)
 		s->soc->ops->commit_begin(s);
@@ -4306,8 +5246,20 @@ static int apple_sleep_commit(unsigned long unused)
 	 * stay coherent until the commit.
 	 */
 	s->siq_cfg = read_sysreg_s(SYS_APL_SIQ_CFG_EL1);
+	WRITE_ONCE(t8142_boot_mpidr, read_cpuid_mpidr() & MPIDR_HWID_BITMASK);
 	sleep_note(s, 0x60);
+	WRITE_ONCE(t8142_obs_boot_wfi, 0);
+	WRITE_ONCE(t8142_obs_wfi_back, 0);
+	early = s->soc->early_cpu_wfi && READ_ONCE(sleep_early_wfi);
+	if (early) {
+		/* Released before the stop: each core goes from its stop bit to its deep WFI. */
+		spin_table_pen_deep_el1(s->soc->ops->deep_wfi_arm == t8142_deep_wfi_arm &&
+					is_kernel_in_hyp_mode() && READ_ONCE(sleep_el1_wfi) >= 2);
+		spin_table_release_stopped();
+	}
 	s->cpus_stop_ret = spin_table_stop_parked();
+	if (early)
+		udelay(SLEEP_EARLY_WFI_SETTLE_US);
 
 	if (s->soc->ops->commit_regs) {
 		/* A SoC whose irreversible steps share nothing with the ones below. */
@@ -4343,9 +5295,15 @@ static int apple_sleep_commit(unsigned long unused)
 		s->soc->ops->post_timer(s);
 
 	/* Each core's deep WFI comes after the commit, this one last. No SPMI from here on. */
-	spin_table_release_stopped();
+	if (!early) {
+		spin_table_pen_deep_el1(s->soc->ops->deep_wfi_arm == t8142_deep_wfi_arm &&
+					is_kernel_in_hyp_mode() && READ_ONCE(sleep_el1_wfi) >= 2);
+		spin_table_release_stopped();
+	}
 	if (s->soc->boot_wfi_delay_ms)
 		mdelay(s->soc->boot_wfi_delay_ms);
+	if (s->soc->ops->last_mile == t8142_last_mile && READ_ONCE(sleep_post_commit_ms))
+		t8142_post_commit_probe(s, READ_ONCE(sleep_post_commit_ms));
 	sleep_boot_wfi(s);
 }
 
@@ -4933,6 +5891,9 @@ static int apple_sleep_enter_early(struct apple_sleep *s)
 	return ret;
 }
 
+static void t8142_mem_save(struct apple_sleep *s);
+static void t8142_clk_save(struct apple_sleep *s);
+
 static int apple_sleep_enter(suspend_state_t state)
 {
 	struct apple_sleep *s = apple_sleep;
@@ -4955,9 +5916,255 @@ static int apple_sleep_enter(suspend_state_t state)
 	if (s->soc->untested && !READ_ONCE(sleep_untested_commit)) {
 		sleep_note(s, 0x31);
 		apple_sleep_stray_restore(s);
+		/* nub-spmi0's latched sources as a sleep would find them, for apple,spmi-pmu-sources:
+		 * read only while the DT names no bits (then this acknowledges them, as the entry does).
+		 */
+		sleep_spmi_sources(s, 0);
+		sleep_spmi_sources_report(s);
+		/* The boot core's power controls here, to diff against macOS's at its commit (aura's
+		 * R.* ring markers). Reads only: interrupts are off and the secondaries are held.
+		 */
+		if (READ_ONCE(sleep_dry_regs) && s->soc->ops->deep_wfi_arm == t8142_deep_wfi_arm && is_kernel_in_hyp_mode())
+			dev_info(s->dev, "dry run: boot cpu%d C1_6 %#llx C6_2 %#llx C5_0 %#llx C10_4 %#llx C7_4 %#llx C1_1 %#llx\n",
+				 raw_smp_processor_id(), read_sysreg_s(SLEEP_M5_C1_6),
+				 read_sysreg_s(sys_reg(3, 5, 15, 6, 2)), read_sysreg_s(sys_reg(3, 5, 15, 5, 0)),
+				 read_sysreg_s(sys_reg(3, 4, 15, 10, 4)), read_sysreg_s(sys_reg(3, 1, 15, 7, 4)),
+				 read_sysreg_s(sys_reg(3, 5, 15, 1, 1)));
+		/* What XNU's per-core init (26B131 kc +0x4ed3d3c) writes on every core: c1_5 = 0,
+		 * c14_6 = 3, c10_4 = 0, c9_6 |= ..|0xf, c0_5 = 1, c13_4 = 2; cntkctl |= 3.
+		 */
+		if (READ_ONCE(sleep_dry_regs) && s->soc->ops->deep_wfi_arm == t8142_deep_wfi_arm && is_kernel_in_hyp_mode())
+			dev_info(s->dev, "dry run: boot cpu XNU-init regs: s3_1_c15_c1_5 %#llx s3_4_c15_c14_6 %#llx s3_4_c15_c9_6 %#llx s3_1_c15_c0_5 %#llx s3_1_c15_c13_4 %#llx cntkctl %#llx\n",
+				 read_sysreg_s(sys_reg(3, 1, 15, 1, 5)), read_sysreg_s(sys_reg(3, 4, 15, 14, 6)),
+				 read_sysreg_s(sys_reg(3, 4, 15, 9, 6)), read_sysreg_s(sys_reg(3, 1, 15, 0, 5)),
+				 read_sysreg_s(sys_reg(3, 1, 15, 13, 4)), read_sysreg(cntkctl_el1));
+		if (READ_ONCE(sleep_dry_regs) && s->soc->ops->deep_wfi_arm == t8142_deep_wfi_arm) {
+			dev_info(s->dev, "dry run: boot cpu FIQ sources: PMCR0 %#llx UPMCR0 %#llx UPMSR %#llx IPI_SR %#llx cntp/cntv_el0 %#llx/%#llx cntp/cntv_el02 %#llx/%#llx VM_TMR_FIQ_ENA %#llx ISR %#llx CLPC C5_0 %#llx; still firing %#x\n",
+				 read_sysreg_s(T8142_PMCR0), read_sysreg_s(T8142_UPMCR0), read_sysreg_s(T8142_UPMSR),
+				 read_sysreg_s(SYS_APL_IPI_SR_EL1), read_sysreg(cntp_ctl_el0), read_sysreg(cntv_ctl_el0),
+				 is_kernel_in_hyp_mode() ? read_sysreg_s(SYS_CNTP_CTL_EL02) : 0,
+				 is_kernel_in_hyp_mode() ? read_sysreg_s(SYS_CNTV_CTL_EL02) : 0,
+				 is_kernel_in_hyp_mode() ? read_sysreg_s(T8142_VM_TMR_FIQ_ENA) : 0,
+				 read_sysreg(isr_el1), read_sysreg_s(T8142_CLPC_C5_0), t8142_fiq_sources());
+			t8142_ed_report(s->dev);
+			if (is_kernel_in_hyp_mode()) {
+				u64 o = read_sysreg_s(SLEEP_M5_C1_6), w;
+
+				write_sysreg_s(o | SLEEP_M5_C1_6_PWRDN, SLEEP_M5_C1_6);
+				isb();
+				w = read_sysreg_s(SLEEP_M5_C1_6);
+				write_sysreg_s(o, SLEEP_M5_C1_6);
+				isb();
+				dev_info(s->dev, "dry run: C1_6 write test: %#llx | 0x1c000000 reads back %#llx (%s)\n",
+					 o, w, (w & SLEEP_M5_C1_6_PWRDN) == SLEEP_M5_C1_6_PWRDN ? "sticks" : "IGNORED");
+			}
+		}
+		/* The wake restores' reads, here too, so a read that hangs shows in the ladder. */
+		if (s->soc->ops->last_mile == t8142_last_mile) {
+			t8142_mem_save(s);
+			t8142_clk_save(s);
+			dev_info(s->dev, "dry run: wake saves: mem %d (amcc0 %#llx cfg0 %#llx ch0 %#x/%#x/%#x) clk %d (slot0 %#x:%#x) early_wfi %d\n",
+				 s->mem_saved, s->amcc_saved[0], s->amcc_cfg_saved[0][0],
+				 s->mcc_saved[0][0], s->mcc_saved[0][MCC_ENABLES / 4],
+				 s->mcc_saved[0][MCC_LANES / 4], s->clk_saved,
+				 s->clk_slot_saved[0][1], s->clk_slot_saved[0][0],
+				 s->soc->early_cpu_wfi && READ_ONCE(sleep_early_wfi));
+			s->mem_saved = s->clk_saved = false;
+		}
+		/* Read-only: what the match would find in the words macOS leaves on (ps_keep). */
+		if (s->soc->nps_keep) {
+			char line[400];
+			int i, n = 0;
+
+			for (i = 0; i < s->soc->nps_keep; i++) {
+				const struct apple_sleep_ps_keep *k = &s->soc->ps_keep[i];
+
+				n += scnprintf(line + n, sizeof(line) - n, " %s %#x", k->name,
+					       readl((k->aon ? s->ps_aon : s->ps) + k->offset));
+			}
+			n += scnprintf(line + n, sizeof(line) - n, " ATC0_COMMON %#x ATC0_USB_AON %#x ATC0_USB %#x",
+				       readl(s->ps + T8142_PS_ATC0_COMMON),
+				       readl(s->ps_aon + T8142_PS_AON_ATC0_USB_AON),
+				       readl(s->ps_aon + T8142_PS_AON_ATC0_USB));
+			dev_info(s->dev, "dry run: ps_keep %#x, the words:%s\n",
+				 READ_ONCE(sleep_ps_keep), line);
+		}
+		/* Read-only: XNU's boot AUTO_ENABLE list as Linux has it (apple_sleep.boot_auto) */
+		if (sleep_boot_auto_count(s)) {
+			char line[700];
+			unsigned int i, n = 0, missing = 0, autoed = 0, off_words = 0;
+			u32 v;
+
+			for (i = 0; i < sleep_boot_auto_count(s); i++) {
+				bool aon = i >= s->soc->ps_boot_auto.count;
+				u32 off = aon ? s->soc->ps_aon_boot_auto.offset[i - s->soc->ps_boot_auto.count] :
+						s->soc->ps_boot_auto.offset[i];
+
+				v = readl(sleep_boot_auto_reg(s, i));
+				if (v & PS_AUTO_ENABLE) {
+					autoed++;
+				} else if (FIELD_GET(PS_TARGET, v) && FIELD_GET(PS_ACTUAL, v)) {
+					missing++;
+					n += scnprintf(line + n, sizeof(line) - n, " %s%x=%x",
+						       aon ? "a" : "", off, v);
+				} else {
+					off_words++;
+				}
+			}
+			dev_info(s->dev, "dry run: boot_auto %d: of XNU's %u AUTO_ENABLE words %u already have it, %u are off, %u on without it:%s\n",
+				 READ_ONCE(sleep_boot_auto_on), sleep_boot_auto_count(s), autoed,
+				 off_words, missing, line);
+			/*
+			 * The one power-word write a dry run makes (apple_sleep.boot_auto_dry): XNU's
+			 * boot write on those words, each read back at once and 1 ms later, then undone.
+			 */
+			if (READ_ONCE(sleep_boot_auto_on) && READ_ONCE(sleep_boot_auto_dry)) {
+				u32 now[64];
+				unsigned int set;
+
+				sleep_note(s, 0x3d);
+				set = sleep_boot_auto(s);
+				mdelay(1);
+				n = 0;
+				for (i = 0; i < sleep_boot_auto_count(s); i++) {
+					bool aon = i >= s->soc->ps_boot_auto.count;
+					u32 off = aon ? s->soc->ps_aon_boot_auto.offset[i - s->soc->ps_boot_auto.count] :
+							s->soc->ps_boot_auto.offset[i];
+
+					if (!(s->boot_auto_set & BIT_ULL(i)))
+						continue;
+					now[i] = readl(sleep_boot_auto_reg(s, i));
+					n += scnprintf(line + n, sizeof(line) - n, " %s%x=%x", aon ? "a" : "",
+						       off, now[i]);
+				}
+				sleep_boot_auto_undo(s);
+				dev_info(s->dev, "dry run: boot_auto write test: %u set, %u read AUTO_ENABLE back at once; 1 ms later:%s (undone)\n",
+					 set, s->boot_auto_stuck, line);
+			}
+		}
+		/* Read-only: the memory-controller start's fingerprint and the PMC's four voters */
+		if (s->soc->mem_boot) {
+			u64 pa = 0, got = 0, want = 0;
+			unsigned int bad = t8142_mem_fingerprint(s, &pa, &got, &want);
+
+			dev_info(s->dev, "dry run: mem_boot %d mem_floor %d: fingerprint %u of 34 differ (first %#llx: %#llx, J813 %#llx); PMC voters +0/+4: %#x/%#x %#x/%#x %#x/%#x %#x/%#x\n",
+				 READ_ONCE(sleep_mem_boot), READ_ONCE(sleep_mem_floor), bad, pa, got, want,
+				 readl(s->pmc_voters), readl(s->pmc_voters + 4),
+				 readl(s->pmc_voters + PMC_VOTER_STRIDE),
+				 readl(s->pmc_voters + PMC_VOTER_STRIDE + 4),
+				 readl(s->pmc_voters + 2 * PMC_VOTER_STRIDE),
+				 readl(s->pmc_voters + 2 * PMC_VOTER_STRIDE + 4),
+				 readl(s->pmc_voters + 3 * PMC_VOTER_STRIDE),
+				 readl(s->pmc_voters + 3 * PMC_VOTER_STRIDE + 4));
+		}
+		/* Read-only: every word of the match's off lists that reads on, i.e. that it lowers. */
+		if (s->soc->ps_macos_off.count || s->soc->ps_aon_macos_off.count) {
+			const struct apple_sleep_words *off = &s->soc->ps_macos_off;
+			const struct apple_sleep_words *aoff = &s->soc->ps_aon_macos_off;
+			char line[800];
+			int i, n = 0;
+			u32 v;
+
+			for (i = 0; i < off->count; i++) {
+				v = readl(sleep_power_reg(s, off->offset[i]));
+				if (FIELD_GET(PS_ACTUAL, v))
+					n += scnprintf(line + n, sizeof(line) - n, " %x=%x",
+						       off->offset[i], v);
+			}
+			n += scnprintf(line + n, sizeof(line) - n, " | aon");
+			for (i = 0; i < aoff->count; i++) {
+				v = readl(s->ps_aon + aoff->offset[i]);
+				if (FIELD_GET(PS_ACTUAL, v))
+					n += scnprintf(line + n, sizeof(line) - n, " %x=%x",
+						       aoff->offset[i], v);
+			}
+			dev_info(s->dev, "dry run: macos_off words on now (the match lowers them unless kept):%s\n",
+				 line);
+		}
+		/* Read-only: what apple_sleep.dispext lowers (T8142's external DCPs). */
+		if (s->soc->dispext_optional) {
+			char line[400];
+			int i, k, n = 0;
+
+			for (i = 1; i < s->soc->ndisp; i++) {
+				n += scnprintf(line + n, sizeof(line) - n, " | ext%d %s:", i - 1,
+					       !s->display[i].np ? "no node" :
+					       s->display[i].bound ? "bound" : "unbound");
+				for (k = 0; k < 3; k++)
+					n += scnprintf(line + n, sizeof(line) - n, " %x=%x",
+						       s->soc->ps.disp[i][k],
+						       readl(s->ps + s->soc->ps.disp[i][k]));
+				n += scnprintf(line + n, sizeof(line) - n, " run %d",
+					       sleep_asc_running(s, s->soc->ps.disp[i][0],
+								 s->display[i].asc));
+				if (s->soc->disp_wr_dis[i][0])
+					n += scnprintf(line + n, sizeof(line) - n, " wr-dis %d",
+						       !!(readl(s->ps + s->soc->disp_wr_dis[i][0]) &
+							  BIT(s->soc->disp_wr_dis[i][1])));
+			}
+			dev_info(s->dev, "dry run: dispext %d:%s\n", READ_ONCE(sleep_dispext), line);
+		}
+		/* Read-only: what apple_sleep.extra_off would lower (only those on). */
+		if (s->soc->nextra_off) {
+			static char line[900];
+			int i, n = 0;
+
+			for (i = 0; i < s->soc->nextra_off; i++)
+				n += scnprintf(line + n, sizeof(line) - n, " %s %x=%x",
+					       s->soc->extra_off[i].name, s->soc->extra_off[i].offset,
+					       readl(sleep_power_reg(s, s->soc->extra_off[i].offset)));
+			for (i = 0; i < s->soc->ndisp; i++)
+				if (s->soc->disp_adma[i])
+					n += scnprintf(line + n, sizeof(line) - n, " adma%d %x=%x", i,
+						       s->soc->disp_adma[i],
+						       readl(sleep_power_reg(s, s->soc->disp_adma[i])));
+			dev_info(s->dev, "dry run: extra_off %d:%s\n", READ_ONCE(sleep_extra_off), line);
+		}
+		/*
+		 * Read-only, before the display, coprocessor and match steps: every ps word on
+		 * (index:offset=value; * = macOS has it off at its commit), the list the commit's PMU
+		 * digest can only count; aon: every word on without AUTO_ENABLE.
+		 */
+		if (s->soc->ops->macos_off_at_commit) {
+			const struct apple_sleep_words *all = &s->soc->ps_all;
+			const struct apple_sleep_words *aon = &s->soc->ps_aon_all;
+			/* Interrupts are off here: no allocation. */
+			static char line[1024];
+			int i, n = 0;
+			u32 v;
+
+			line[0] = 0;
+			for (i = 0; i < all->count; i++) {
+				v = readl(s->ps + all->offset[i]);
+				if (!FIELD_GET(PS_ACTUAL, v))
+					continue;
+				n += scnprintf(line + n, 1024 - n, " %d:%x=%x%s", i, all->offset[i], v,
+					       s->soc->ops->macos_off_at_commit(all->offset[i]) ? "*" : "");
+				/* printk would cut a long line: a new one every 24 words */
+				if (n > 400) {
+					dev_info(s->dev, "dry run: ps on (* = off at macOS's commit):%s\n",
+						 line);
+					n = 0;
+					line[0] = 0;
+				}
+			}
+			dev_info(s->dev, "dry run: ps on (* = off at macOS's commit):%s\n", line);
+			line[0] = 0;
+			for (i = 0, n = 0; i < aon->count; i++) {
+				v = readl(s->ps_aon + aon->offset[i]);
+				if (!FIELD_GET(PS_ACTUAL, v) || (v & PS_AUTO_ENABLE))
+					continue;
+				n += scnprintf(line + n, 1024 - n, " %d:%x=%x", i, aon->offset[i], v);
+			}
+			dev_info(s->dev, "dry run: aon on without AUTO:%s\n", line);
+		}
 		dev_info(s->dev,
 			 "dry run: every check passed; refusing before the commit (untested SoC, apple_sleep.untested_commit=1 lets it through)\n");
 		return -EAGAIN;
+	}
+	if (sleep_boot_auto_count(s)) {
+		sleep_note(s, 0x3e);
+		sleep_note_at(s, 2, min(sleep_boot_auto(s), 255));
 	}
 	sleep_note(s, 0x40);
 	ret = apple_sleep_cpus_hold(s);
@@ -4980,12 +6187,28 @@ static int apple_sleep_enter(suspend_state_t state)
 	if (ret) {
 		dev_dbg(s->dev, "refused before any commit coprocessor stop: %d\n", ret);
 		spin_table_unhold_parked();
+		sleep_dispext_restore(s);
+		sleep_boot_auto_undo(s);
 		apple_sleep_stray_restore(s);
 		return ret;
 	}
 	sleep_note(s, 0x44);
 	sleep_ps_wr_dis_clear(s);
 	apple_sleep_coprocs_stop(s, true);
+	if (s->soc->mem_boot && READ_ONCE(sleep_mem_boot)) {
+		sleep_note(s, 0x4c);
+		t8142_mem_boot_entry(s);
+	}
+	s->mem_floor_done = false;
+	if (s->soc->mem_boot && READ_ONCE(sleep_mem_floor)) {
+		/* T6050's stage: the floor's voter stepped down 2, then 1, 9 ms apart */
+		sleep_note(s, 0x4d);
+		writel(2, s->pmc_voters + PMC_VOTER_STRIDE * 1);
+		mdelay(9);
+		writel(1, s->pmc_voters + PMC_VOTER_STRIDE * 1);
+		mdelay(9);
+		s->mem_floor_done = true;
+	}
 
 	sleep_note(s, 0x45);
 	sleep_wake_arm(s);
@@ -5536,6 +6759,10 @@ static int apple_sleep_map_displays(struct apple_sleep *s)
 		int index;
 
 		np = of_parse_phandle(s->dev->of_node, "apple,display-coprocessors", i);
+		if (!np && i != 0 && s->soc->dispext_optional) {
+			dev_info(s->dev, "no external display coprocessor %d: not lowered\n", i);
+			continue;
+		}
 		if (!np)
 			return dev_err_probe(s->dev, -ENODEV, "no display coprocessor %d\n", i);
 		s->display[i].np = np;
@@ -5696,6 +6923,23 @@ static int apple_sleep_map_regs(struct apple_sleep *s)
 	s->mem_clk = apple_sleep_map(s->dev, "mem-clk");
 	if (IS_ERR(s->mem_clk))
 		s->mem_clk = NULL;
+
+	/* T8142's memory-controller start, mapped page by page (shared with nothing that binds) */
+	if (s->soc->mem_boot)
+		t8142_mem_map(s);
+
+	/* T8142's wake restores (optional: a tree without them skips that restore). */
+	s->clk_slots = apple_sleep_map(s->dev, "clk-slots");
+	if (IS_ERR(s->clk_slots))
+		s->clk_slots = NULL;
+	for (i = 0; i < s->soc->namcc; i++) {
+		char name[16];
+
+		snprintf(name, sizeof(name), "amcc-cfg%d", i);
+		s->amcc_cfg[i] = apple_sleep_map(s->dev, name);
+		if (IS_ERR(s->amcc_cfg[i]))
+			s->amcc_cfg[i] = NULL;
+	}
 
 	/* Lowering an unbound display clears its clock protection first. */
 	if (s->soc->lower_unbound_displays) {
@@ -6425,6 +7669,17 @@ static int apple_sleep_probe(struct platform_device *pdev)
 	if (s->soc->untested) {
 		if (mem_sleep_current == PM_SUSPEND_MEM)
 			mem_sleep_current = PM_SUSPEND_TO_IDLE;
+		if (s->soc->ops->deep_wfi_arm == t8142_deep_wfi_arm && is_kernel_in_hyp_mode())
+			t8142_c1_6_report(dev);
+		if (s->soc->ops->deep_wfi_arm == t8142_deep_wfi_arm) {
+			t8142_ed_map(dev);
+			dcache_clean_poc((unsigned long)t8142_el1_wfi_stub,
+					 (unsigned long)t8142_el1_wfi_stub_end);
+			dev_info(dev, "probe: last WFI at %s (stub at PA %pa)\n",
+				 !is_kernel_in_hyp_mode() || !READ_ONCE(sleep_el1_wfi) ? "the kernel's EL" :
+				 READ_ONCE(sleep_el1_wfi) >= 2 ? "EL1 on every core" : "EL1 on the boot core",
+				 &(phys_addr_t){ __pa_symbol(t8142_el1_wfi_stub) });
+		}
 		dev_info(dev, "probe: pwrgate wake %#x %#x cpm %#x %#x, commit %#x, clusters %#x %#x\n",
 			 readl(s->pwrgate + s->soc->pwrgate_wake[0]),
 			 readl(s->pwrgate + s->soc->pwrgate_wake[1]),
@@ -6885,9 +8140,6 @@ static const struct apple_sleep_soc t8132_sleep_soc = {
  * the commit. The DT's cluster power gate sets it at boot (apple-cluster-pwrgate.c), as on
  * T8132 and T6050.
  */
-#define T8142_PS_ATC0_COMMON		0x2c8
-#define T8142_PS_AON_ATC0_USB_AON	0xc8
-#define T8142_PS_AON_ATC0_USB		0xd0
 #define T8142_PMC_VOTER_AP		(3 * PMC_VOTER_STRIDE)
 #define T8142_CLUSTER_BUSY		BIT(4)
 /*
@@ -6949,27 +8201,80 @@ static void t8142_cpm_on(struct apple_sleep *s)
 	}
 }
 
+/*
+ * apple_sleep.extra_off, after every coprocessor's last stop and before ATC0/PCIe/PMP: each listed
+ * word that is on, in the list's order (children first), waited off; one that stays on is noted,
+ * not refused (past the last refusal point).
+ */
+static void t8142_extra_lower(struct apple_sleep *s)
+{
+	const struct apple_sleep_soc *soc = s->soc;
+	unsigned int i;
+
+	s->extra_lowered = 0;
+	if (!READ_ONCE(sleep_extra_off))
+		return;
+	for (i = 0; i < min_t(unsigned int, soc->nextra_off, SLEEP_EXTRA_OFF_MAX); i++) {
+		u32 off = soc->extra_off[i].offset, v = readl(sleep_power_reg(s, off));
+
+		s->extra_saved[i] = v;
+		if (!FIELD_GET(PS_ACTUAL, v))
+			continue;
+		sleep_ps_lower(s, off);
+		s->extra_lowered |= BIT(i);
+		if (sleep_ps_wait_off(s, off))
+			s->extra_stuck |= BIT(i);
+	}
+}
+
+/* At the wake, parents first: each lowered word back once its parent reads on. */
+static void t8142_extra_restore(struct apple_sleep *s)
+{
+	const struct apple_sleep_soc *soc = s->soc;
+	int i;
+
+	for (i = min_t(unsigned int, soc->nextra_off, SLEEP_EXTRA_OFF_MAX) - 1; i >= 0; i--) {
+		u32 parent = soc->extra_off[i].parent;
+
+		if (!(s->extra_lowered & BIT(i)))
+			continue;
+		if (!parent || FIELD_GET(PS_ACTUAL, readl(sleep_power_reg(s, parent))))
+			sleep_ps_restore(sleep_power_reg(s, soc->extra_off[i].offset),
+					 s->extra_saved[i]);
+	}
+	s->extra_lowered = 0;
+}
+
 /* T8132's, with T8142's ATC0 words; ANS's PCIe block in AppleT8142PCIe's order. */
 static void t8142_lower_io(struct apple_sleep *s)
 {
 	sleep_note(s, 0x61);
 	t8132_clean_ram();
 	sleep_note(s, 0x62);
+	t8142_extra_lower(s);
 	s->atc0_saved[0] = readl(s->ps_aon + T8142_PS_AON_ATC0_USB);
 	s->atc0_saved[1] = readl(s->ps_aon + T8142_PS_AON_ATC0_USB_AON);
 	s->atc0_saved[2] = readl(s->ps + T8142_PS_ATC0_COMMON);
-	t8132_aon_lower(s, T8142_PS_AON_ATC0_USB);
-	if (!READ_ONCE(sleep_usb_asleep))
-		t8132_aon_lower(s, T8142_PS_AON_ATC0_USB_AON);
-	sleep_ps_lower(s, T8142_PS_ATC0_COMMON);
+	/* apple_sleep.ps_keep bit 3: as macOS would, if its ports weren't hidden in the trace */
+	if (!(s->ps_keep_mask & BIT(3))) {
+		t8132_aon_lower(s, T8142_PS_AON_ATC0_USB);
+		if (!READ_ONCE(sleep_usb_asleep))
+			t8132_aon_lower(s, T8142_PS_AON_ATC0_USB_AON);
+		sleep_ps_lower(s, T8142_PS_ATC0_COMMON);
+	}
 	if (s->pcie_ans_stopped) {
 		apple_sleep_lower_apcie(s);
 		s->ans_off_ret = sleep_ps_wait_off(s, s->soc->ps.ans);
 	}
-	/* PMP's callback has idled the firmware and saved SRAM; RUN is clear. */
-	sleep_ps_lower(s, 0x598);
-	if (sleep_ps_wait_off(s, 0x598))
-		dev_warn(s->dev, "PMP power domain did not turn off\n");
+	/* PMP's final stop has idled its firmware and saved its SRAM; RUN is clear (#4). */
+	s->pmp_lowered = false;
+	s->pmp_off_ret = 0;
+	if (READ_ONCE(sleep_pmp_off) && sleep_ps_on(s, T8142_PS_PMP)) {
+		s->pmp_saved = readl(s->ps + T8142_PS_PMP);
+		sleep_ps_lower(s, T8142_PS_PMP);
+		s->pmp_lowered = true;
+		s->pmp_off_ret = sleep_ps_wait_off(s, T8142_PS_PMP);
+	}
 	sleep_note(s, 0x63);
 }
 
@@ -6980,6 +8285,203 @@ static void t8142_lower_io(struct apple_sleep *s)
  * is >= 256, 0x20 the commit word read non-zero (it reads 1 from boot on J815). No PMU traffic
  * after it: the engine gives the cores 33 ms from the complex words to their WFI.
  */
+/*
+ * The PMU's RTC alarm after the S2R timer, as macOS 27.2 sends it on the J813 (Thomas
+ * Glanzmann, m0d16l14n1/linux#3, from trace g01: 0.11 to 0.25 ms after the timer, boot core):
+ * read RTC_CTL, 0x43 if it had fired, the 4-byte compare at 0x2008, 0x200e <- 0, RTC_CTL <-
+ * 0x41. T6050's post-timer step at the same addresses (apple,pmu-alarm-rearm 0x43 0x41). The
+ * opcode carries the byte count (his follow-up fix). The compare and the counter are read here,
+ * before the cores' window, with the notes; the compare is now + apple_sleep.t8142_wake_s
+ * (0 keeps the PMU's own), which is also a wake source: J815 has no RTC device under Linux.
+ * J813 still resets with it (PMU took all four commands), so this is parity, not the fix.
+ */
+static bool sleep_pmu_alarm = true;
+module_param_named(pmu_alarm, sleep_pmu_alarm, bool, 0644);
+MODULE_PARM_DESC(pmu_alarm, "T8142: send the PMU's RTC alarm after the S2R timer, as macOS does (default Y)");
+static unsigned int t8142_wake_s = 30;
+module_param(t8142_wake_s, uint, 0644);
+MODULE_PARM_DESC(t8142_wake_s, "T8142: the PMU RTC alarm this many s after the commit (0: keep the PMU's)");
+static u8 t8142_alarm[4];
+static bool t8142_alarm_ok;
+static int t8142_post_ret = -ENODATA;
+static u64 t8142_alarm_counter;
+
+static int t8142_pmu(struct apple_sleep *s, u32 mask, u8 opcode, u16 address, const u8 *wr,
+		     u8 *rd, unsigned int len)
+{
+	return t6050_sleep_pmu_xfer_post(s, mask, opcode | (len - 1), address, wr, rd, len);
+}
+
+static void t8142_alarm_prepare(struct apple_sleep *s)
+{
+	u32 mask = s->soc->spmi_notify_sleep;
+	u8 ticks[8] = {};
+
+	t8142_alarm_ok = false;
+	t8142_post_ret = -ENODATA;
+	if (!s->spmi || !READ_ONCE(sleep_pmu_alarm))
+		return;
+	t6050_sleep_pmu_drain(s);
+	if (!t8142_pmu(s, mask, T6050_SPMI_EXT_READL, T6050_RTC_COMPARE, NULL, t8142_alarm, 4) &&
+	    !t8142_pmu(s, mask, T6050_SPMI_EXT_READL, T6050_RTC_COUNTER, NULL, ticks, 6)) {
+		t8142_alarm_counter = get_unaligned_le64(ticks) >> 16;
+		if (READ_ONCE(t8142_wake_s))
+			put_unaligned_le32(t8142_alarm_counter + READ_ONCE(t8142_wake_s), t8142_alarm);
+		t8142_alarm_ok = true;
+	}
+	t6050_sleep_pmu_drain(s);
+}
+
+static void t8142_post_timer(struct apple_sleep *s)
+{
+	u32 mask = s->soc->spmi_notify_sleep & ~M5_SPMI_IRQ_DONE;
+	u8 ctl = 0, v;
+	int ret;
+
+	if (!t8142_alarm_ok)
+		return;
+	ret = t8142_pmu(s, mask, T6050_SPMI_EXT_READL, T6050_RTC_CTL, NULL, &ctl, 1);
+	if (!ret && (ctl & T6050_RTC_CTL_FIRED)) {
+		v = 0x43;
+		ret = t8142_pmu(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_CTL, &v, NULL, 1);
+	}
+	if (!ret)
+		ret = t8142_pmu(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_COMPARE, t8142_alarm, NULL, 4);
+	if (!ret) {
+		v = 0;
+		ret = t8142_pmu(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_MASK, &v, NULL, 1);
+	}
+	if (!ret) {
+		v = 0x41;
+		ret = t8142_pmu(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_CTL, &v, NULL, 1);
+	}
+	t8142_post_ret = ret;
+}
+
+/*
+ * What survives the reset, at 0x8310.. (J813's #4 used the same bytes): the power words as the
+ * commit has them. +8 ps_all words on without AUTO_ENABLE, +9 ps_all words on that macOS has off,
+ * +10/+11 ps_all words on that macOS never touched (past the CPUs) and the first one's index
+ * (0xff none), +12 ps_aon_all words on
+ * without it, +13 the first such index, +14/+15 the SEP word's bits 7:0 and 31:24 (macOS: 0x0f,
+ * 0x10), +5..+7 and +16..+19 the first seven of +9's. PMU scratch from 0x831f up holds data
+ * that isn't Linux's (the same on every boot): nothing is written there.
+ */
+#define T8142_PS_SEP	0xc00
+/*
+ * The ps_all words macOS has OFF (actual state 0) at its commit: the last value each had in the
+ * J813 g01 end state (notes/sleep-trace/macos-ps-endstate-g01-sleep1.txt). Of t8142_ps_all's
+ * 156: 66 off, 38 on, 52 never touched in the trace (unknown). By actual state only: a written
+ * 0x100000ff reads back without AUTO_ENABLE on macOS too, so that bit can't be compared.
+ */
+static bool t8142_macos_off_at_commit(u32 offset)
+{
+	static const u32 off[] = {
+		0x190, 0x198, 0x1a0, 0x1a8, 0x1b0, 0x290, 0x298, 0x2a0, 0x2a8, 0x2b8,
+		0x2c0, 0x2e8, 0x2f0, 0x2f8, 0x300, 0x308, 0x310, 0x318, 0x320, 0x328,
+		0x330, 0x350, 0x360, 0x3a0, 0x3a8, 0x3b0, 0x3b8, 0x3c0, 0x3c8, 0x3d0,
+		0x3d8, 0x3e0, 0x408, 0x410, 0x418, 0x420, 0x428, 0x440, 0x450, 0x460,
+		0x4d8, 0x4e0, 0x4e8, 0x4f0, 0x518, 0x520, 0x560, 0x568, 0x578, 0x580,
+		0x598, 0xc00, 0x4020, 0x4030, 0x4048, 0x4050, 0x8000, 0x8008, 0x8010, 0x8018,
+		0x8020, 0xc000, 0xc008, 0xc010, 0x10000, 0x10068,
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(off); i++)
+		if (off[i] == offset)
+			return true;
+	return false;
+}
+
+/* The 38 ps_all words macOS has ON at its commit (same end state, actual state != 0) */
+static bool t8142_macos_on_at_commit(u32 offset)
+{
+	static const u32 on[] = {
+		0x110, 0x118, 0x120, 0x138, 0x140, 0x148, 0x150, 0x158, 0x160, 0x168,
+		0x170, 0x178, 0x180, 0x2c8, 0x2d0, 0x340, 0x348, 0x358, 0x368, 0x370,
+		0x378, 0x380, 0x388, 0x390, 0x398, 0x430, 0x438, 0x448, 0x458, 0x468,
+		0x470, 0x478, 0x480, 0x488, 0x490, 0x498, 0x4a0, 0x5a0,
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(on); i++)
+		if (on[i] == offset)
+			return true;
+	return false;
+}
+
+/*
+ * Neither: never touched in macOS's trace. Past the CPU words (< 0x60), all but ATC2/3 are no_ps
+ * children of the displays and ISP, which their firmware lowers, not the AP: one left on by a
+ * cold-stopped DCP keeps its FE word up.
+ */
+static bool t8142_macos_untraced(u32 offset)
+{
+	return offset >= 0x60 && !t8142_macos_on_at_commit(offset) &&
+	       !t8142_macos_off_at_commit(offset);
+}
+
+static void t8142_commit_digest(struct apple_sleep *s)
+{
+	const struct apple_sleep_words *all = &s->soc->ps_all, *aon = &s->soc->ps_aon_all;
+	u8 noauto = 0, untraced = 0, first[1] = { 0xff }, aon_noauto = 0, aon_first = 0xff;
+	unsigned int i;
+	u32 v;
+
+	for (i = 0; i < all->count; i++) {
+		v = readl(s->ps + all->offset[i]);
+		if (!FIELD_GET(PS_ACTUAL, v))
+			continue;
+		/* +10/+11: untraced words on (count, first index): see t8142_macos_untraced */
+		if (t8142_macos_untraced(all->offset[i])) {
+			if (!untraced)
+				first[0] = min(i, 254U);
+			untraced += untraced < 255;
+		}
+		if (v & PS_AUTO_ENABLE)
+			continue;
+		noauto += noauto < 255;
+	}
+	for (i = 0; i < aon->count; i++) {
+		v = readl(s->ps_aon + aon->offset[i]);
+		if (!FIELD_GET(PS_ACTUAL, v) || (v & PS_AUTO_ENABLE))
+			continue;
+		if (!aon_noauto)
+			aon_first = min(i, 254U);
+		aon_noauto += aon_noauto < 255;
+	}
+	v = readl(s->ps + T8142_PS_SEP);
+	sleep_note_at(s, 8, noauto);
+	sleep_note_at(s, 10, untraced);
+	sleep_note_at(s, 11, first[0]);
+	sleep_note_at(s, 12, aon_noauto);
+	sleep_note_at(s, 13, aon_first);
+	sleep_note_at(s, 14, v & 0xff);
+	sleep_note_at(s, 15, v >> 24);
+
+	/*
+	 * +5..+7, +16..+19: the first seven ps_all indices on here (actual state, AUTO_ENABLE or
+	 * not) that macOS has off at its commit (t8142_macos_off_at_commit); 0xff = none. +9 their
+	 * count (replaces the AUTO count). The full list is the dry run's.
+	 */
+	{
+		static const u8 slot[] = { 5, 6, 7, 16, 17, 18, 19 };
+		unsigned int nodd = 0;
+
+		for (i = 0; i < all->count; i++) {
+			v = readl(s->ps + all->offset[i]);
+			if (!FIELD_GET(PS_ACTUAL, v) || !t8142_macos_off_at_commit(all->offset[i]))
+				continue;
+			if (nodd < ARRAY_SIZE(slot))
+				sleep_note_at(s, slot[nodd], min(i, 254U));
+			nodd++;
+		}
+		for (i = nodd; i < ARRAY_SIZE(slot); i++)
+			sleep_note_at(s, slot[i], 0xff);
+		sleep_note_at(s, 9, min(nodd, 255U));
+	}
+}
+
 static void t8142_commit_note(struct apple_sleep *s)
 {
 	u8 flags = 0, src = 0xff;
@@ -7009,84 +8511,21 @@ static void t8142_commit_note(struct apple_sleep *s)
 	}
 	if (readl(s->commit))
 		flags |= 0x20;
+	t8142_commit_digest(s);
+	t8142_alarm_prepare(s);
+	/* +20: the alarm read (1 = ready, 0 = off or failed) */
+	sleep_note_at(s, 20, t8142_alarm_ok);
+	/* +21: mem_boot (bit 0 asked, bit 1 replayed, bit 2 floor stepped), +22 fingerprint mismatches */
+	sleep_note_at(s, 21, (READ_ONCE(sleep_mem_boot) ? 1 : 0) | (s->mem_boot_done ? 2 : 0) |
+			     (s->mem_floor_done ? 4 : 0) | (s->pmp_lowered ? 8 : 0) |
+			     (s->pmp_off_ret ? 0x10 : 0) |
+			     (READ_ONCE(sleep_extra_off) ? 0x20 : 0) |
+			     (s->extra_lowered || s->disp_adma_lowered ? 0x40 : 0) |
+			     (s->extra_stuck ? 0x80 : 0));
+	/* +22: dispext (sleep_display_off) */
 	sleep_note_at(s, 2, flags);
 	sleep_note_at(s, 4, src);
 	sleep_note(s, 0x65);
-}
-
-/*
- * The PMU's RTC alarm after the S2R timer, as macOS 27.2 sends it on the J813 (traced
- * 2026-11-16, run g01: 0.11 to 0.25 ms after the timer, boot core): read RTC_CTL (0x41),
- * the 4-byte compare at 0x2008, 0x200e <- 0, RTC_CTL <- 0x41; 0x43 first if it had fired.
- * The same registers and order as T6050's post-timer step (apple,pmu-alarm-rearm 0x43 0x41).
- * Without it the SoC never goes down after the timer and WD2 resets it (J813, PMU note 0x67).
- * TEST: the compare is now + apple_sleep.t8142_wake_s (0: macOS's own compare as found).
- */
-static unsigned int t8142_wake_s = 30;
-module_param(t8142_wake_s, uint, 0644);
-MODULE_PARM_DESC(t8142_wake_s, "T8142 TEST: PMU RTC alarm this many s after the commit (0: keep the PMU's)");
-static u8 t8142_alarm[4];
-static bool t8142_alarm_ok;
-static int t8142_post_ret = -ENODATA;
-static u64 t8142_alarm_counter;
-
-/* The opcode carries the byte count, as t6050_sleep_pmu_xfer() builds it (macOS: 0x33 for 4). */
-static int t8142_pmu(struct apple_sleep *s, u32 mask, u8 opcode, u16 address, const u8 *wr, u8 *rd,
-		     unsigned int len)
-{
-	return t6050_sleep_pmu_xfer_post(s, mask, opcode | (len - 1), address, wr, rd, len);
-}
-
-static void t8142_pre_commit(struct apple_sleep *s)
-{
-	u32 mask = s->soc->spmi_notify_sleep;
-	u8 ticks[8] = {};
-
-	t8142_alarm_ok = false;
-	t8142_post_ret = -ENODATA;
-	if (s->spmi) {
-		t6050_sleep_pmu_drain(s);
-		if (!t8142_pmu(s, mask, T6050_SPMI_EXT_READL, T6050_RTC_COMPARE,
-					       NULL, t8142_alarm, 4) &&
-		    !t8142_pmu(s, mask, T6050_SPMI_EXT_READL, T6050_RTC_COUNTER,
-					       NULL, ticks, 6)) {
-			t8142_alarm_counter = get_unaligned_le64(ticks) >> 16;
-			if (t8142_wake_s)
-				put_unaligned_le32(t8142_alarm_counter + t8142_wake_s, t8142_alarm);
-			t8142_alarm_ok = true;
-		}
-	}
-	t8132_pre_commit(s);
-}
-
-static void t8142_post_timer(struct apple_sleep *s)
-{
-	u32 mask = s->soc->spmi_notify_sleep & ~M5_SPMI_IRQ_DONE;
-	u8 ctl = 0, v;
-	int ret;
-
-	if (!t8142_alarm_ok)
-		return;
-	ret = t8142_pmu(s, mask, T6050_SPMI_EXT_READL, T6050_RTC_CTL, NULL, &ctl, 1);
-	if (!ret && (ctl & T6050_RTC_CTL_FIRED)) {
-		v = 0x43;
-		ret = t8142_pmu(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_CTL, &v,
-						NULL, 1);
-	}
-	if (!ret)
-		ret = t8142_pmu(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_COMPARE,
-						t8142_alarm, NULL, 4);
-	if (!ret) {
-		v = 0;
-		ret = t8142_pmu(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_MASK, &v,
-						NULL, 1);
-	}
-	if (!ret) {
-		v = 0x41;
-		ret = t8142_pmu(s, mask, T6050_SPMI_EXT_WRITEL, T6050_RTC_CTL, &v,
-						NULL, 1);
-	}
-	t8142_post_ret = ret;
 }
 
 /*
@@ -7107,6 +8546,225 @@ static void t8142_post_timer(struct apple_sleep *s)
 #define T8142_MCC_LANE_EXTRA	0x100
 #define T8142_MEM_CLK_SLEEP	0x30000
 
+/*
+ * What T8142's deep sleep loses and XNU writes back at the wake, before the AMCC/MCC and
+ * clkgen drivers' state is used again (Thomas's J813 trace, 27.2, all ten cores, 2026-11-16;
+ * the J815 ADT has the same mcc and clkgen layout). Every one of the 411 memory-side words
+ * XNU writes at the wake ends at the value it held before the entry's stop, and the clkgen
+ * slots at the values it read 3.2 ms before the timer: so this saves J815's own values and
+ * replays them in XNU's order. Nothing here is a J813 constant but the clkgen slot commands.
+ */
+/*
+ * The AMCC sleep bits by (plane, pair), the pair's bits being 2 * pair + 1 and 2 * pair + 2:
+ * the order XNU clears them in at the entry and sets them again at the wake.
+ */
+static const u8 t8142_amcc_order[][2] = {
+	{ 1, 0 }, { 2, 2 }, { 1, 2 }, { 0, 1 }, { 1, 3 }, { 0, 0 },
+	{ 1, 1 }, { 2, 3 }, { 0, 3 }, { 2, 1 }, { 0, 2 }, { 2, 0 },
+};
+
+#define T8142_CLK_SLOTS		126
+#define T8142_CLK_SLOT(n)	((n) * 0x20)
+#define T8142_CLK_SLOT_LO	0x10
+#define T8142_CLK_SLOT_HI	0x14
+/* The command XNU writes to each slot's +0x0 after its value (4, or 5 for these 48 slots). */
+static const u64 t8142_clk_slot_cmd5[2] = { 0x54aaaaaaaa000000ULL, 0x02aaaaaaa9555555ULL };
+/* Per DCS channel ("mcc<n>" = +0x580): +0x0 enables, +0x4 groups, +0x10.. six words a group */
+#define T8142_MCC_SAVE_WORDS	65
+#define T8142_MCC_GROUPS	10
+#define T8142_MCC_GROUP(k)	(0x10 + (k) * 0x18)
+/* Per AMCC plane ("amcc-cfg<n>" = plane + 0x2a000): 64-bit +0x0, +0x8, +0x10; 32-bit +0x4000 */
+#define T8142_AMCC_CFG_CTL	0x4000
+#define T8142_SOCNI_STROBE	0x100
+
+static void t8142_mem_save(struct apple_sleep *s)
+{
+	const struct apple_sleep_soc *soc = s->soc;
+	int i, n;
+
+	s->mem_saved = false;
+	if (!READ_ONCE(sleep_mem_restore))
+		return;
+	for (i = 0; i < soc->namcc; i++) {
+		s->amcc_saved[i] = readq(s->amcc[i]);
+		if (!s->amcc_cfg[i])
+			continue;
+		for (n = 0; n < 3; n++)
+			s->amcc_cfg_saved[i][n] = readq(s->amcc_cfg[i] + 8 * n);
+		s->amcc_ctl_saved[i] = readl(s->amcc_cfg[i] + T8142_AMCC_CFG_CTL);
+	}
+	for (i = 0; i < soc->nsocni; i++)
+		for (n = 0; n < soc->socni_words[i] && n < ARRAY_SIZE(s->socni_saved[0]); n++)
+			s->socni_saved[i][n] = readl(s->socni[i] + 4 * n);
+	for (i = 0; i < soc->nmcc; i++)
+		for (n = 0; n < T8142_MCC_SAVE_WORDS; n++)
+			s->mcc_saved[i][n] = readl(s->mcc[i] + 4 * n);
+	s->mem_saved = true;
+}
+
+static void t8142_clk_save(struct apple_sleep *s)
+{
+	int i;
+
+	s->clk_saved = false;
+	if (!s->clk_slots || !READ_ONCE(sleep_clk_restore))
+		return;
+	for (i = 0; i < T8142_CLK_SLOTS; i++) {
+		void __iomem *slot = s->clk_slots + T8142_CLK_SLOT(i);
+		u32 hi, lo;
+		int tries = 4;
+
+		/* As XNU reads them: high, low, high again (bounded: interrupts are off). */
+		do {
+			hi = readl(slot + T8142_CLK_SLOT_HI);
+			lo = readl(slot + T8142_CLK_SLOT_LO);
+		} while (readl(slot + T8142_CLK_SLOT_HI) != hi && --tries);
+		s->clk_slot_saved[i][0] = lo;
+		s->clk_slot_saved[i][1] = hi;
+	}
+	s->clk_saved = true;
+}
+
+/* XNU's wake at +4.6..8.8 ms: each slot's value, then its command; then the memory clock word. */
+static void t8142_clk_restore(struct apple_sleep *s)
+{
+	int i;
+
+	if (s->clk_saved) {
+		for (i = 0; i < T8142_CLK_SLOTS; i++) {
+			void __iomem *slot = s->clk_slots + T8142_CLK_SLOT(i);
+			bool five = t8142_clk_slot_cmd5[i / 64] & BIT_ULL(i % 64);
+
+			writel(s->clk_slot_saved[i][0], slot + T8142_CLK_SLOT_LO);
+			writel(s->clk_slot_saved[i][1], slot + T8142_CLK_SLOT_HI);
+			writel(five ? 5 : 4, slot);
+		}
+		s->clk_saved = false;
+	}
+	if (s->mem_clk && s->mem_clk_saved && READ_ONCE(sleep_clk_restore))
+		writel(s->mem_clk_saved, s->mem_clk);
+}
+
+/* One bit at a time, low first, as XNU raises each AMCC pair back. */
+static void t8142_amcc_set(void __iomem *reg, u64 bits)
+{
+	u64 val = readq(reg);
+	unsigned int b;
+
+	for_each_set_bit(b, (unsigned long *)&bits, 64) {
+		if (val & BIT_ULL(b))
+			continue;
+		val |= BIT_ULL(b);
+		writeq(val, reg);
+		val = readq(reg);
+	}
+}
+
+/* Byte @n of @reg back to its saved value, as XNU does before each lane comes up. */
+static void t8142_byte_restore(void __iomem *reg, u32 saved, int n)
+{
+	u32 mask = GENMASK(8 * n + 7, 8 * n);
+
+	writel((readl(reg) & ~mask) | (saved & mask), reg);
+}
+
+/*
+ * XNU's wake from +9.06 ms, in its order: the AMCC planes' sleep bits back in the entry's pair
+ * order; each SoC NI table word with its strobe; each DCS channel's region groups, each
+ * followed by its enable bits; the lanes, two per channel per pass; the AMCC planes' control
+ * words. Skipped: XNU's read-and-rewrite of each channel's +0x24 (outside the DT's map).
+ */
+static int t8142_mem_restore(struct apple_sleep *s, const u8 (*order)[2], int norder)
+{
+	const struct apple_sleep_soc *soc = s->soc;
+	int i, n, ch, pass, k;
+
+	if (!s->mem_saved)
+		return -ENODATA;
+
+	for (i = 0; i < norder; i++) {
+		int plane = order[i][0];
+
+		if (plane >= soc->namcc)
+			continue;
+		t8142_amcc_set(s->amcc[plane], s->amcc_saved[plane] &
+			       GENMASK_ULL(2 * order[i][1] + 2, 2 * order[i][1] + 1));
+	}
+	for (i = 0; i < soc->namcc; i++)
+		t8142_amcc_set(s->amcc[i], s->amcc_saved[i] & T8142_AMCC_SLEEP_BITS);
+
+	for (i = 0; i < soc->nsocni; i++)
+		for (n = 0; n < soc->socni_words[i] && n < ARRAY_SIZE(s->socni_saved[0]); n++) {
+			writel(s->socni_saved[i][n], s->socni[i] + 4 * n);
+			writel(1, s->socni[i] + T8142_SOCNI_STROBE);
+		}
+
+	for (ch = 0; ch < soc->nmcc; ch++) {
+		void __iomem *mcc = s->mcc[ch];
+		const u32 *sv = s->mcc_saved[ch];
+		u32 en = 0, groups = 0;
+
+		for (k = 0; k < T8142_MCC_GROUPS; k++) {
+			if (!(sv[MCC_ENABLES / 4] & BIT(k)))
+				continue;
+			for (n = 0; n < 6; n++)
+				writel(sv[(T8142_MCC_GROUP(k) + 4 * n) / 4],
+				       mcc + T8142_MCC_GROUP(k) + 4 * n);
+			en |= GENMASK(3, 0) | BIT(4 + k);
+			groups |= BIT(k);
+			writel(readl(mcc) | (sv[0] & en), mcc);
+			writel(readl(mcc + MCC_ENABLES) | (sv[MCC_ENABLES / 4] & groups),
+			       mcc + MCC_ENABLES);
+		}
+		/* Whatever else was on, as XNU's last group leaves the words at their old values. */
+		if (readl(mcc) != sv[0])
+			writel(sv[0], mcc);
+		if (readl(mcc + MCC_ENABLES) != sv[MCC_ENABLES / 4])
+			writel(sv[MCC_ENABLES / 4], mcc + MCC_ENABLES);
+	}
+
+	for (pass = 0; pass < 2; pass++) {
+		for (ch = 0; ch < soc->nmcc; ch++) {
+			void __iomem *mcc = s->mcc[ch];
+			const u32 *sv = s->mcc_saved[ch];
+
+			for (n = 2 * pass; n < 2 * pass + 2; n++) {
+				if (!(sv[MCC_LANES / 4] & MCC_LANE(n)))
+					continue;
+				t8142_byte_restore(mcc + T8142_MCC_LANE_EXTRA,
+						   sv[T8142_MCC_LANE_EXTRA / 4], n);
+				t8142_byte_restore(mcc + MCC_LANES_MASK, sv[MCC_LANES_MASK / 4], n);
+				writel(readl(mcc + MCC_LANES) | MCC_LANE_STROBE(n), mcc + MCC_LANES);
+				writel(readl(mcc + MCC_LANES) | MCC_LANE(n), mcc + MCC_LANES);
+			}
+		}
+	}
+	for (ch = 0; ch < soc->nmcc; ch++) {
+		void __iomem *mcc = s->mcc[ch];
+		const u32 *sv = s->mcc_saved[ch];
+
+		if (readl(mcc + T8142_MCC_LANE_EXTRA) != sv[T8142_MCC_LANE_EXTRA / 4])
+			writel(sv[T8142_MCC_LANE_EXTRA / 4], mcc + T8142_MCC_LANE_EXTRA);
+		if (readl(mcc + MCC_LANES_MASK) != sv[MCC_LANES_MASK / 4])
+			writel(sv[MCC_LANES_MASK / 4], mcc + MCC_LANES_MASK);
+	}
+
+	/* +14.56 ms: plane 0's +0x10, then each plane's +0x4000, +0x8, +0x0. */
+	for (i = 0; i < soc->namcc; i++) {
+		void __iomem *cfg = s->amcc_cfg[i];
+
+		if (!cfg)
+			continue;
+		if (i == 0)
+			writeq(s->amcc_cfg_saved[i][2], cfg + 0x10);
+		writel(s->amcc_ctl_saved[i], cfg + T8142_AMCC_CFG_CTL);
+		writeq(s->amcc_cfg_saved[i][1], cfg + 0x8);
+		writeq(s->amcc_cfg_saved[i][0], cfg);
+	}
+	s->mem_saved = false;
+	return 0;
+}
+
 static void t8142_amcc_clear(void __iomem *reg, u64 bits)
 {
 	u64 val = readq(reg);
@@ -7123,15 +8781,14 @@ static void t8142_amcc_clear(void __iomem *reg, u64 bits)
 
 static void t8142_sleep_mcc_stop(struct apple_sleep *s)
 {
-	/* (plane, pair): the pair's bits are 2 * pair + 1 and 2 * pair + 2 */
-	static const u8 order[][2] = {
-		{ 1, 0 }, { 2, 2 }, { 1, 2 }, { 0, 1 }, { 1, 3 }, { 0, 0 },
-		{ 1, 1 }, { 2, 3 }, { 0, 3 }, { 2, 1 }, { 0, 2 }, { 2, 0 },
-	};
+	const u8 (*order)[2] = t8142_amcc_order;
 	const struct apple_sleep_soc *soc = s->soc;
 	int i, plane, ch, pass, n;
 
-	for (i = 0; i < ARRAY_SIZE(order); i++) {
+	/* What the wake puts back (t8142_mem_restore), before anything here changes it. */
+	t8142_mem_save(s);
+
+	for (i = 0; i < ARRAY_SIZE(t8142_amcc_order); i++) {
 		if (order[i][0] >= soc->namcc)
 			continue;
 		t8142_amcc_clear(s->amcc[order[i][0]], GENMASK_ULL(2 * order[i][1] + 2,
@@ -7162,8 +8819,12 @@ static void t8142_sleep_mcc_stop(struct apple_sleep *s)
 		}
 	}
 
-	if (s->mem_clk)
+	if (s->mem_clk) {
+		s->mem_clk_saved = readl(s->mem_clk);
 		writel(T8142_MEM_CLK_SLEEP, s->mem_clk);
+	}
+	/* macOS reads the clkgen slots right after the clock word (-3.2 ms). */
+	t8142_clk_save(s);
 }
 
 /*
@@ -7176,9 +8837,14 @@ static void t8142_last_mile(struct apple_sleep *s)
 	const struct apple_sleep_soc *soc = s->soc;
 	int i;
 
-	t8142_perf_down(s);
+	/* Not in macOS's J813 entry (its perf-state page is untouched in the whole trace): A/B. */
+	if (READ_ONCE(sleep_perf_down))
+		t8142_perf_down(s);
 	sleep_note(s, 0x64);
 
+	/* T6050's commit window: the floor's voter to 0, not read, right before the memory stop */
+	if (s->mem_floor_done)
+		writel(0, s->pmc_voters + PMC_VOTER_STRIDE * 1);
 	/* The memory controller, after the SoC and DCS states, as on T8132 (and macOS on J813). */
 	t8142_sleep_mcc_stop(s);
 	sleep_note(s, 0x66);
@@ -7209,6 +8875,95 @@ static void t8142_last_mile(struct apple_sleep *s)
 }
 
 /*
+ * Note 0x67 (replaces 0x66 once every read came back): +2 E cores' PU bits [5:0], bit 6 complex
+ * E busy, bit 7 complex P busy; +3 P cores' PU bits [3:0], bit 4 commit word nonzero, bit 5 an
+ * armed wake pending, bit 6 E asked on, bit 7 P asked on; +4 E cores' SPD bits [5:0], bit 6 any
+ * P core's SPD, bit 7 a window read all-ones (no answer). Unmapped windows read as PU 1.
+ */
+static void t8142_post_commit_ed(u8 b2_0x66)
+{
+	u8 b2 = 0, b3 = 0, b4 = 0;
+	int k;
+
+	for (k = 0; k < T8142_ED_CORES; k++) {
+		u32 v;
+
+		if (k < 6) {
+			v = t8142_ed[0][k] ? readl_relaxed(t8142_ed[0][k] + T8142_ED_EDPRSR) : 1;
+			if (v == ~0U)
+				b4 |= BIT(7);
+			if (v & BIT(0))
+				b2 |= BIT(k);
+			if (v & BIT(1))
+				b4 |= BIT(k);
+		}
+		if (k < 4) {
+			v = t8142_ed[1][k] ? readl_relaxed(t8142_ed[1][k] + T8142_ED_EDPRSR) : 1;
+			if (v == ~0U)
+				b4 |= BIT(7);
+			if (v & BIT(0))
+				b3 |= BIT(k);
+			if (v & BIT(1))
+				b4 |= BIT(6);
+		}
+	}
+	b2 |= (b2_0x66 & BIT(3) ? BIT(6) : 0) | (b2_0x66 & BIT(4) ? BIT(7) : 0);
+	b3 |= (b2_0x66 & BIT(0) ? BIT(4) : 0) | (b2_0x66 & BIT(5) ? BIT(5) : 0) |
+	      (b2_0x66 & BIT(1) ? BIT(6) : 0) | (b2_0x66 & BIT(2) ? BIT(7) : 0);
+	sleep_note_at(apple_sleep, 2, b2);
+	sleep_note_at(apple_sleep, 3, b3);
+	sleep_note_at(apple_sleep, 4, b4);
+	sleep_note(apple_sleep, 0x67);
+}
+
+/*
+ * apple_sleep.post_commit_ms: note 0x66, decoded by aurora-bootlog as b43's was.
+ * +2: bit 0 commit word nonzero, 1/2 complex E/P asked on, 3/4 E/P busy, 5 an armed wake source
+ *     pending. +3: SoC perf state [3:0], bit 4 DCS busy, bit 5 SoC busy. +4: DCS state [3:0],
+ *     bits 4..7 PMC voters PMP/CLPC/GFX/AP nonzero.
+ */
+static void t8142_post_commit_probe(struct apple_sleep *s, unsigned int ms)
+{
+	const struct apple_sleep_soc *soc = s->soc;
+	u32 e, p, soc_perf = 0, dcs = 0;
+	u8 b2 = 0, b3, b4;
+	int i;
+
+	mdelay(ms);
+	e = readl(s->cluster + soc->cluster_cpu[0]);
+	p = readl(s->cluster + soc->cluster_cpu[1]);
+	if (readl(s->commit))
+		b2 |= BIT(0);
+	if (e & CLUSTER_ON)
+		b2 |= BIT(1);
+	if (p & CLUSTER_ON)
+		b2 |= BIT(2);
+	if (e & T8142_CLUSTER_BUSY)
+		b2 |= BIT(3);
+	if (p & T8142_CLUSTER_BUSY)
+		b2 |= BIT(4);
+	for (i = 0; i < soc->wake_words; i++)
+		if (readl(s->wake + soc->wake_status + 4 * i) & s->wake_armed[i])
+			b2 |= BIT(5);
+	if (s->clk_perf)
+		soc_perf = readl(s->clk_perf + CLK_PERF_SOC);
+	if (s->dcs)
+		dcs = readl(s->dcs);
+	b3 = FIELD_GET(DCS_STATE, soc_perf) | (dcs & DCS_BUSY ? BIT(4) : 0) |
+	     (soc_perf & DCS_BUSY ? BIT(5) : 0);
+	b4 = FIELD_GET(DCS_STATE, dcs);
+	for (i = 0; s->pmc_voters && i < 4; i++)
+		if (readl(s->pmc_voters + i * PMC_VOTER_STRIDE))
+			b4 |= BIT(4 + i);
+	sleep_note_at(s, 2, b2);
+	sleep_note_at(s, 3, b3);
+	sleep_note_at(s, 4, b4);
+	sleep_note(s, 0x66);
+	if (READ_ONCE(sleep_post_commit_ed))
+		t8142_post_commit_ed(b2);
+}
+
+/*
  * AppleT8142PMGR's complex power-on: ApplePMGR's cluster method writes (word & ~0xf) | 0xf and
  * waits for bit 4 to clear; T8142's override then writes 1 to the complex's ACC word.
  */
@@ -7234,12 +8989,13 @@ static int t8142_cluster_on(struct apple_sleep *s, u32 word, void __iomem *acc)
  */
 static void t8142_wake(struct apple_sleep *s)
 {
+	if (t8142_alarm_ok)
+		pr_info("apple-sleep: T8142 PMU alarm after the timer: %d (counter %llu, compare %u)\n",
+			t8142_post_ret, t8142_alarm_counter, get_unaligned_le32(t8142_alarm));
+
 	const struct apple_sleep_soc *soc = s->soc;
 	u32 val;
 	int i;
-
-	pr_info("apple-sleep: T8142 PMU alarm after the timer: %d (counter %llu, compare %u)\n",
-		t8142_post_ret, t8142_alarm_counter, get_unaligned_le32(t8142_alarm));
 
 	s->cluster_e_ret = t8142_cluster_on(s, soc->cluster_cpu[0], s->acc_e);
 	s->cluster_p_ret = t8142_cluster_on(s, soc->cluster_cpu[1], s->acc_p);
@@ -7251,6 +9007,14 @@ static void t8142_wake(struct apple_sleep *s)
 	}
 
 	sleep_ps_rewake(s);
+	/* Off at the commit by pmp_off, so the rewake left it: back as lower_io found it. */
+	if (s->pmp_lowered) {
+		s->pmp_lowered = false;
+		sleep_ps_restore(s->ps + T8142_PS_PMP, s->pmp_saved);
+	}
+	/* Off at the commit by dispext, likewise: back before the display drivers resume. */
+	sleep_dispext_restore(s);
+	t8142_extra_restore(s);
 	/* The commit saved ATC0's words already lowered: reverse of the lowering. */
 	sleep_ps_restore(s->ps + T8142_PS_ATC0_COMMON, s->atc0_saved[2]);
 	sleep_ps_restore(s->ps_aon + T8142_PS_AON_ATC0_USB_AON, s->atc0_saved[1]);
@@ -7262,7 +9026,10 @@ static void t8142_wake(struct apple_sleep *s)
 	if (val & PS_DEV_DISABLE)
 		writel(val & ~PS_DEV_DISABLE, s->ps + soc->ps.sep);
 
+	/* XNU's order: the clkgen slots and the memory clock, the CPM gates, the memory side. */
+	t8142_clk_restore(s);
 	t8142_cpm_on(s);
+	s->mem_restore_ret = t8142_mem_restore(s, t8142_amcc_order, ARRAY_SIZE(t8142_amcc_order));
 	if (READ_ONCE(sleep_acc_wake) && s->acc_e && s->acc_p) {
 		writel(1, s->acc_e);
 		writel(1, s->acc_p);
@@ -7355,16 +9122,36 @@ static const u32 t8142_ps_aon_all[] = {
 	0xc048, 0xc050, 0xc058, 0xc060,
 };
 
-/* Less DPTX_PHY (0x590): no_ps on T8142 (see t8142_ps_macos_off). */
+/*
+ * XNU's own wake order on T8142 (J813 27.2 trace, 2026-11-16: the 22 words it raises with
+ * AUTO_ENABLE right after the clusters and SEP), then the rest of the T8132-derived list. A
+ * word is only raised if Linux had it on at the commit (sleep_ps_rewake).
+ */
 static const u32 t8142_ps_wake_order[] = {
-	0xc00, 0x118, 0x120, 0x180, 0x390, 0x398, 0x468, 0x470, 0x478, 0x480,
-	0x488, 0x598, 0x5a0, 0x300, 0x2f0, 0x408, 0x410, 0x520, 0x560, 0x328,
-	0x2a8, 0x320, 0x2b8, 0x3a8, 0x3b8, 0x290, 0x318, 0x10000, 0x308, 0x418,
-	0x428, 0x440, 0x360,
+	0xc00, 0x118, 0x120, 0x138, 0x170, 0x178, 0x180, 0x348, 0x358, 0x368,
+	0x390, 0x398, 0x430, 0x438, 0x448, 0x458, 0x468, 0x470, 0x478, 0x480,
+	0x488, 0x5a0,
+	0x598, 0x300, 0x2f0, 0x408, 0x410, 0x520, 0x560, 0x328, 0x2a8, 0x320,
+	0x2b8, 0x3a8, 0x3b8, 0x290, 0x318, 0x10000, 0x308, 0x418, 0x428, 0x440,
+	0x360,
+};
+
+/* XNU's PMGR start at boot (J813 trace g01, -218649 ms): put on AUTO_ENABLE, in its order */
+static const u32 t8142_ps_boot_auto[] = {
+	0x118, 0x120, 0x138, 0x140, 0x170, 0x178, 0x180, 0x290, 0x2b8, 0x2c8,
+	0x2d0, 0x2f0, 0x300, 0x308, 0x328, 0x348, 0x350, 0x358, 0x360, 0x368,
+	0x390, 0x398, 0x3a0, 0x3a8, 0x410, 0x418, 0x430, 0x438, 0x440, 0x448,
+	0x450, 0x458, 0x460, 0x468, 0x470, 0x478, 0x480, 0x488, 0x578, 0x598,
+	0x5a0,
+};
+
+static const u32 t8142_ps_aon_boot_auto[] = {
+	0x58, 0x60, 0x68, 0x70, 0x78, 0x88, 0x98, 0xa0, 0xa8, 0xc8,
+	0xd0, 0xd8, 0xe0,
 };
 
 static const u32 t8142_ps_aon_wake_order[] = {
-	0xa8,
+	0x88, 0x98, 0xa0, 0xa8,
 };
 
 /*
@@ -7409,6 +9196,17 @@ static const u32 t8142_quiesce_words[] = {
 };
 static_assert(ARRAY_SIZE(t8142_quiesce_words) <= 32);
 
+/* In t8142_ps_macos_off / t8142_ps_aon_macos_off, but on at macOS 27.2's commit (apple_sleep.ps_keep) */
+static const struct apple_sleep_ps_keep t8142_ps_keep[] = {
+	{ "PMS_C1PPT", 0x170, false, 0 },	{ "SOC_RC", 0x178, false, 0 },
+	{ "I2C0", 0x348, false, 1 },		{ "I2C2", 0x358, false, 1 },
+	{ "I2C4", 0x368, false, 1 },		{ "SPI0", 0x430, false, 1 },
+	{ "SPI1", 0x438, false, 1 },		{ "SPI3", 0x448, false, 1 },
+	{ "SPI5", 0x458, false, 1 },
+	{ "ATC1_COMMON", 0x2d0, false, 2 },	{ "ATC1_USB_AON", 0xd8, true, 2 },
+	{ "ATC1_USB", 0xe0, true, 2 },
+};
+
 static const struct apple_sleep_word t8142_stray_words[] = {
 	{ "AVD_SYS", 0x310 }, { "VENC_SYS", 0x298 }, { "JPG", 0x2a0 },
 };
@@ -7430,14 +9228,15 @@ static const struct apple_sleep_gate_coproc t8142_gate_coprocs[] = {
 
 
 static const struct apple_sleep_ops t8142_sleep_ops = {
-	/* XNU's last-WFI helper is the same code as T8132's and T8140's. */
-	.deep_wfi_arm = t8140_deep_wfi_arm,
+	/* XNU's last-WFI helper is the same code as T8132's and T8140's; plus M5's power-down bits. */
+	.deep_wfi_arm = t8142_deep_wfi_arm,
 	.lower_io = t8142_lower_io,
 	.last_mile = t8142_last_mile,
 	/* WD2 is at T8132's address (/arm-io/wdt), so the same stub restarts it. */
 	.resume = t8132_resume_stub,
-	.pre_commit = t8142_pre_commit,
+	.pre_commit = t8132_pre_commit,
 	.post_timer = t8142_post_timer,
+	.macos_off_at_commit = t8142_macos_off_at_commit,
 	.wake = t8142_wake,
 	.aic_mask_all = aic_sleep_mask_all,
 	.aic_ack = aic_sleep_ack,
@@ -7463,6 +9262,27 @@ static const char *const t8142_regs_absent[] = {
 	"pmc-dcp", "clk-mux", "ptd", "cluster-dcs", "dvfm-e", "dvfm-p", NULL,
 };
 
+/* Children before parents (J815 ADT pmgr devices: parent ids) */
+static const struct apple_sleep_extra_off t8142_extra_off[] = {
+	{ "SYS_GP_OCLA", 0x518, 0x408 },	/* parent APCIE_SYS_GP */
+	{ "SYS_ST_OCLA", 0x568, 0x520 },	/* parent APCIE_SYS_ST */
+	{ "GLOBAL_AUX_CTRL0", 0x1a0, 0 },
+	{ "GLOBAL_AUX_CTRL1", 0x1a8, 0 },
+	{ "FPWM0", 0x330, 0x2b0 },		/* parent SIO */
+	{ "SIO_CPU", 0x328, 0x2b0 },		/* parent SIO; macOS -53 ms */
+	/* ATC2/3: no port on the Airs, never touched by macOS; lowered only if on */
+	{ "ATC2_CIO_PCIE", 0x4f8, 0x3f0 },
+	{ "ATC2_CIO_USB", 0x500, 0x3f0 },
+	{ "ATC2_PCIE", 0x3e8, 0x2d8 },
+	{ "ATC2_CIO", 0x3f0, 0x2d8 },
+	{ "ATC2_COMMON", 0x2d8, 0 },
+	{ "ATC3_CIO_PCIE", 0x508, 0x400 },
+	{ "ATC3_CIO_USB", 0x510, 0x400 },
+	{ "ATC3_PCIE", 0x3f8, 0x2e0 },
+	{ "ATC3_CIO", 0x400, 0x2e0 },
+	{ "ATC3_COMMON", 0x2e0, 0 },
+};
+
 static const struct apple_sleep_soc t8142_sleep_soc = {
 	.ops = &t8142_sleep_ops,
 	.untested = true,
@@ -7470,9 +9290,21 @@ static const struct apple_sleep_soc t8142_sleep_soc = {
 	.spmi_gen4 = true,
 	.boot_wfi_delay_ms = 3,
 	.wake_optional = true,
-	/* The J815 tree has no external DCP: DISPEXT0/1 are 0x428/0x418/0x308, 0x3b8/0x3a8/0x2b8. */
-	.ndisp = 1,
-	.display_order = { 0 },
+	/*
+	 * DCP, DISPEXT0 (0x428/0x418/0x308), DISPEXT1 (0x3b8/0x3a8/0x2b8), lowered in macOS's order
+	 * (J815 26B131: DISPEXT0, DISPEXT1, DISP). Both external DCPs are bound on J813/J815 now;
+	 * apple_sleep.dispext=0 leaves them as before. macOS writes no pwrgate word for them. Their
+	 * DARTs' PS write-disable bits (trace pmgr-soc-ps+0x3fe8 bit 15, +0x3fec bit 31) are clear
+	 * at macOS's commit.
+	 */
+	.ndisp = 3,
+	.display_order = { 1, 2, 0 },
+	.dispext_optional = true,
+	.disp_wr_dis = { { 0 }, { 0x17fe8, 15 }, { 0x17fec, 31 } },
+	/* DISP_ADMA (pmgr base 1 +0x68), DISPEXT0_ADMA, DISPEXT1_ADMA */
+	.disp_adma = { 0x10068, 0x420, 0x3b0 },
+	.extra_off = t8142_extra_off,
+	.nextra_off = ARRAY_SIZE(t8142_extra_off),
 	/* E, P (ADT soc-clusters) */
 	.cluster_cpu = { 0x0, 0x4 },
 	.ncluster_cpu = 2,
@@ -7500,6 +9332,8 @@ static const struct apple_sleep_soc t8142_sleep_soc = {
 	.ps = {
 		.disp = {
 			{ 0x10000, 0x318, 0x290 },
+			{ 0x428, 0x418, 0x308 },
+			{ 0x3b8, 0x3a8, 0x2b8 },
 		},
 		.sio_cpu = 0x328,
 		.sep = 0xc00,
@@ -7520,6 +9354,7 @@ static const struct apple_sleep_soc t8142_sleep_soc = {
 	.apcie_gen4 = true,
 	.radio_retrain = true,
 	.pen_deep = true,
+	.early_cpu_wfi = true,
 	.pwrgate_wake = { 0x000, 0x060 },
 	/* AppleT8142PMGR vtable 0xfa0: 0xa0 + 8 * complex */
 	.pwrgate_cpm = { 0x0a0, 0x0a8 },
@@ -7532,9 +9367,14 @@ static const struct apple_sleep_soc t8142_sleep_soc = {
 	.ps_aon_macos_on = SLEEP_WORDS(t8142_ps_aon_macos_on),
 	.ps_wake_order = SLEEP_WORDS(t8142_ps_wake_order),
 	.ps_aon_wake_order = SLEEP_WORDS(t8142_ps_aon_wake_order),
+	.ps_boot_auto = SLEEP_WORDS(t8142_ps_boot_auto),
+	.ps_aon_boot_auto = SLEEP_WORDS(t8142_ps_aon_boot_auto),
+	.mem_boot = true,
 	.quiesce = SLEEP_WORDS(t8142_quiesce_words),
 	.stray = t8142_stray_words,
 	.nstray = ARRAY_SIZE(t8142_stray_words),
+	.ps_keep = t8142_ps_keep,
+	.nps_keep = ARRAY_SIZE(t8142_ps_keep),
 	.gate_off = t8142_gate_off,
 	.ngate_off = ARRAY_SIZE(t8142_gate_off),
 	.gate_coprocs = t8142_gate_coprocs,

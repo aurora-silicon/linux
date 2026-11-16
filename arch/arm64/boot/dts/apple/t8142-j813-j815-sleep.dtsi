@@ -64,12 +64,12 @@
 		      <0x2 0x20068000 0x0 0x8>,
 		      <0x2 0x200a8000 0x0 0x8>,
 		      <0x2 0x200e8000 0x0 0x8>,
-		      <0x2 0x4f010000 0x0 0x80>,
-		      <0x2 0x50010000 0x0 0x80>,
-		      <0x2 0x51010000 0x0 0x80>,
-		      <0x2 0x52010000 0x0 0x80>,
-		      <0x2 0x53010000 0x0 0x80>,
-		      <0x2 0x54010000 0x0 0x80>,
+		      <0x2 0x4f010000 0x0 0x104>,
+		      <0x2 0x50010000 0x0 0x104>,
+		      <0x2 0x51010000 0x0 0x104>,
+		      <0x2 0x52010000 0x0 0x104>,
+		      <0x2 0x53010000 0x0 0x104>,
+		      <0x2 0x54010000 0x0 0x104>,
 		      <0x2 0x21000580 0x0 0x104>,
 		      <0x2 0x21200580 0x0 0x104>,
 		      <0x2 0x21400580 0x0 0x104>,
@@ -78,7 +78,18 @@
 		      <0x2 0x21a00580 0x0 0x104>,
 		      <0x2 0x21c00580 0x0 0x104>,
 		      <0x2 0x21e00580 0x0 0x104>,
-		      <0x3 0x80038000 0x0 0x4>;
+		      <0x3 0x80038000 0x0 0x4>,
+		      /*
+		       * What the deep sleep loses and XNU restores at the wake (J813 ten-core
+		       * trace, 2026-11-16): the PMGR clkgen's 126 slots (0x20 apart from
+		       * 0x380038100) and each AMCC plane's control words (+0x2a000..+0x2e003).
+		       * The SoC NI tables above reach their strobe word at +0x100.
+		       */
+		      <0x3 0x80038100 0x0 0xfc0>,
+		      <0x2 0x2002a000 0x0 0x4004>,
+		      <0x2 0x2006a000 0x0 0x4004>,
+		      <0x2 0x200aa000 0x0 0x4004>,
+		      <0x2 0x200ea000 0x0 0x4004>;
 		reg-names = "ps", "pwrgate", "cpu-start", "cllt", "cluster",
 			    "commit", "wdt", "aon-misc", "wake", "spmi",
 			    "ps-aon", "spmi-a0", "pmc-voters", "clk-perf", "dcs",
@@ -86,13 +97,18 @@
 			    "amcc0", "amcc1", "amcc2", "amcc3",
 			    "socni0", "socni1", "socni2", "socni3", "socni4", "socni5",
 			    "mcc0", "mcc1", "mcc2", "mcc3", "mcc4", "mcc5", "mcc6", "mcc7",
-			    "mem-clk";
+			    "mem-clk", "clk-slots",
+			    "amcc-cfg0", "amcc-cfg1", "amcc-cfg2", "amcc-cfg3";
 		/*
 		 * From the J815 ADT's /arm-io/pmgr ap-wake-sources, the same sources
 		 * as T8132's by name: NUB.SPMI0.SW3, ATC0.USBWakeup, SMC.CPUWakeupAP,
 		 * SMC.OutboxNotEmpty, MTP.DOCK.CHANNELS.AP0.IRQ and MTP.OutboxNotEmpty.
 		 */
 		apple,wake-enable = <152 72 168 190 89 108>;
+		/*
+		 * The DCP, then the external DCPs once the tree describes them (dcpext0, dcpext1):
+		 * the sleep lowers them with the display, and refuses while an undescribed one is up.
+		 */
 		apple,display-coprocessors = <&dcp>;
 		/* ANS's link's shared block, and the radio's link, which only aura trains */
 		apple,apcie = <&apcie_shared>;
