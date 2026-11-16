@@ -2,8 +2,9 @@
 
 //! Logical queue and physical render-pair admission. A retained pair belongs
 //! to one logical owner even while idle. Closing that owner makes it reusable
-//! only after every active lease retires. Quarantine retains these leases until
-//! a firmware drain witness or both processors stopping makes reuse safe.
+//! only after every active lease retires. Quarantine keeps the slot from any new
+//! lease until the runtime's drain witness of its pair or both processors stopping
+//! makes reuse safe.
 //!
 //! The pool lock protects host accounting only and is never held while building
 //! a graph or waiting for GPU work. Capacity waiters sleep on the release event.
@@ -70,6 +71,10 @@ struct State {
     /// Quarantined slots whose failed work is all spared (innocent): waiting publications fail
     /// their own fence with EBUSY instead of a device-loss error, so the VM stays usable.
     spared: u64,
+    /// Quarantined slots whose pair the runtime's drain witness released while leases of the
+    /// slot were still held ([`Pool::pair_drained`]): the quarantine ends when the last of them
+    /// is dropped. A quarantined slot takes no new lease, and a new failure clears the bit.
+    drained: u64,
     kill_hold: u64,
     /// Slots whose kill hold ended at their killed context's consumed scheduler release,
     /// and when. A new owner takes such a pair last, the one released longest ago first.
@@ -101,6 +106,7 @@ impl State {
             epochs: [0; cfg::RENDER_SLOTS],
             quarantined: 0,
             spared: 0,
+            drained: 0,
             kill_hold: 0,
             killed: 0,
             killed_at: [0; cfg::RENDER_SLOTS],
@@ -471,8 +477,41 @@ impl State {
             self.refs[slot] -= 1;
         }
         if self.refs[slot] == 0 {
-            self.active &= !(1u64 << slot);
+            let bit = 1u64 << slot;
+            self.active &= !bit;
+            // The last lease of a slot whose pair has drained ends its quarantine
+            // (see `pair_drained`).
+            if self.drained & bit != 0 {
+                self.quarantined &= !bit;
+                self.spared &= !bit;
+                self.drained &= !bit;
+            }
         }
+    }
+
+    /// Ends the quarantine of `slot`.
+    fn rehabilitate(&mut self, slot: usize) {
+        let bit = 1u64 << slot;
+        self.quarantined &= !bit;
+        self.spared &= !bit;
+        self.drained &= !bit;
+    }
+
+    /// The runtime's drain witness released every group of the pair in `slot`. A quarantine
+    /// that no lease of the slot is left to end ends now; returns whether it did. While leases
+    /// remain, it ends with the last of them, so that a drained command still gives its VM
+    /// pin back before its slot returns ([`RenderLease::rehabilitate_after_firmware_drain`]).
+    fn pair_drained(&mut self, slot: usize) -> bool {
+        let bit = (1u64 << slot) & Self::MASK;
+        if self.quarantined & bit == 0 {
+            return false;
+        }
+        if self.refs[slot] != 0 {
+            self.drained |= bit;
+            return false;
+        }
+        self.rehabilitate(slot);
+        true
     }
 
     /// Returns whether the slot stopped being held.
@@ -801,6 +840,28 @@ impl Pool {
         }
     }
 
+    /// Under the device mutex, once the runtime's drain witness released every group of the
+    /// pair in `slot` (`Pair::release_witnessed`): the firmware consumed the pair's ring
+    /// entries and returned its free-list blocks, and either stored stamps that cover its last
+    /// publication or acknowledged the kill of its context. It runs nothing of the pair and
+    /// stores through none of its records, so the slot's quarantine ends.
+    ///
+    /// Otherwise only a lease a drained command still holds ends it
+    /// ([`RenderLease::rehabilitate_after_firmware_drain`]). A group that retired on its pass
+    /// record (`stamps_owed`) gave its lease back with its result, and a quarantine can reach
+    /// the slot through that lease while the retirement is still deferred (a watchdog expiry
+    /// retires the group, then fails its pair, in one pass): the quarantine then outlived every
+    /// lease, and the slot stayed out of service until the processors stopped.
+    pub(crate) fn pair_drained(&self, slot: usize) {
+        if slot >= cfg::RENDER_SLOTS {
+            return;
+        }
+        let ended = self.state.lock().pair_drained(slot);
+        if ended {
+            self.returned();
+        }
+    }
+
     /// Whether the physical queue table can hold another pair (see `State::build_room`).
     pub(crate) fn note_build_room(&self, room: bool) {
         let mut state = self.state.lock();
@@ -848,6 +909,31 @@ mod accounting_tests {
         assert_eq!(state.owners[usize::from(slot)], 0);
         assert_eq!(state.refs[usize::from(slot)], 0);
         assert_eq!(state.active & (1u64 << slot), 0);
+    }
+
+    #[test]
+    fn a_drained_pair_ends_a_quarantine_no_lease_is_left_to_end() {
+        let mut state = State::new();
+        let slot = state.acquire(1, 1).unwrap();
+        let (index, bit) = (usize::from(slot), 1u64 << slot);
+        // Its lease carried a failure into admission, then went with a retirement on the
+        // pass record; the owner closed.
+        state.quarantined |= bit;
+        state.release(slot);
+        state.released |= bit;
+        assert_ne!(state.used() & bit, 0);
+        assert!(state.pair_drained(index));
+        assert_eq!(state.used() & bit, 0);
+        assert!(!state.pair_drained(index));
+        // With leases left, the last of them ends it.
+        state.refs[index] = 2;
+        state.active |= bit;
+        state.quarantined |= bit;
+        assert!(!state.pair_drained(index));
+        state.release(slot);
+        assert_ne!(state.quarantined & bit, 0);
+        state.release(slot);
+        assert_eq!(state.quarantined | state.drained, 0);
     }
 
     #[test]
@@ -985,15 +1071,15 @@ impl RenderLease {
             state.spared |= bit;
         }
         state.quarantined |= bit;
+        // A drain witnessed before this failure does not cover it.
+        state.drained &= !bit;
         drop(state);
         self.pool.returned();
     }
     /// The VM pin must be retired first. Keep this lease until after clearing
     /// quarantine; its drop is what permits waiting publications to proceed.
     pub(crate) fn rehabilitate_after_processor_stop(&self) {
-        let mut state = self.pool.state.lock();
-        state.quarantined &= !(1u64 << self.slot);
-        state.spared &= !(1u64 << self.slot);
+        self.pool.state.lock().rehabilitate(usize::from(self.slot));
     }
     /// Requires the runtime's closed-recovery, exact pair-drain witness.
     pub(crate) fn rehabilitate_after_firmware_drain(&self) {

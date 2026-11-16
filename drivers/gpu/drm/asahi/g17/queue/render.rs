@@ -2644,13 +2644,14 @@ impl Pair {
 
     /// Fresh proof after asynchronous control publication is the ownership
     /// boundary. A refused deferred item leaves the precise owner available.
+    /// Returns whether the proof held and released every group of the pair.
     pub(crate) fn release_witnessed(
         &mut self,
         host: &impl Host,
         defer: &mut impl FnMut(Deferred) -> Result,
-    ) -> Result {
+    ) -> Result<bool> {
         if self.active.iter().any(|a| !a.flist_completed) || !self.firmware_drained(host)? {
-            return Ok(());
+            return Ok(false);
         }
         while let Some(active) = self.active.front() {
             // A group retired on its pass record was reported then (`stamps_owed`): the pair-wide
@@ -2668,7 +2669,7 @@ impl Pair {
         self.drain_failures = 0;
         self.drain_retry_at = 0;
         self.resync();
-        Ok(())
+        Ok(true)
     }
 
     /// The registry first polls the completed prefix through this exact Arc.
