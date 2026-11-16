@@ -50,13 +50,20 @@ inheriting the shared disabled inventory. The production-C Clock PM host
 test covers the locked and unlocked PCI APIs, errors and adopted-host
 gate; it does not qualify physical links or other M5 boards.
 
-Full-schema validation still reports the legacy GPU compatible-list
-``oneOf`` failure. ``scripts/dtc/apple-dt-check.sh`` compares normalized
-warning sets for all Apple DTBs at base and head. It has no warning
-allowlist or board exception mechanism. ADT coverage waivers cannot waive
-schema diagnostics.
+The GPU binding describes both the two-item G17C compatible list and the
+exact three-item list carrying the installed loader's T6050 fallback.
+Both forms retain the same register, mailbox, memory and performance
+handoff requirements. This does not change the separate, disabled raw
+T6050 GPU inventory contract. ``scripts/dtc/apple-agx-binding-test.py``
+checks both valid forms and rejects malformed lists, incomplete G17C
+resources and a raw T6050 node without its required interrupt inventory.
 
-Keep this work draft until the GPU loader migration and affected-board
-hardware qualification are complete. A later migration must recheck GPU
-handoff and HDMI on J775c; old hardware receipts do not qualify a new
-loader or kernel composition.
+``scripts/dtc/apple-dt-check.sh`` compares normalized warning sets for all
+Apple DTBs at base and head. It has no warning allowlist or board exception
+mechanism. ADT coverage waivers cannot waive schema diagnostics.
+
+Keep this work draft until affected-board hardware qualification is
+complete. Any later migration to a modern loader must recheck GPU handoff
+and HDMI on J775c; old hardware receipts do not qualify a new loader or
+kernel composition. Accepting the existing binding contract is not new
+hardware qualification.
