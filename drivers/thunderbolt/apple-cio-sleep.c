@@ -719,6 +719,30 @@ static int apple_nhi_cio_dart_off(struct apple_nhi *anhi)
 	return ret;
 }
 
+#include <linux/soc/apple/sleep.h>
+
+/*
+ * The router's own domain (ATC2_CIO, the acio node's first) across its sleep in place. macOS
+ * takes it down before the PHY's CIO shutdown, and raises it at the wake only once the PHY's
+ * CIO mode is up (right after UC_TNBL_DONE and the PHY's reset release), before CIO_PCIE,
+ * CIO_USB and AUSS. Linux's router DART still holds the domain at the entry, so the PMGR's
+ * driver would raise it at the very start of the wake, and the router would be powered while
+ * the PHY is reset and started again: its link then reaches the dock's broadcast but never
+ * trains, and the dock is lost. Taken down through the sleep driver, the domain is left to
+ * this driver at the wake.
+ */
+static int apple_nhi_cio_router_pd_set(struct apple_nhi *anhi, bool on)
+{
+	struct device_node *np = of_parse_phandle(anhi->acio->np, "power-domains", 0);
+	int ret;
+
+	if (!np)
+		return -ENODEV;
+	ret = apple_sleep_domain_set(np, on);
+	of_node_put(np);
+	return ret;
+}
+
 /* T6050's domains: 0 CIO, 1 CIO_PCIE, 2 CIO_USB, 3 CIO_AUSS, 4 the tunnelled PCIe's. */
 static int apple_nhi_cio_domains_t6050(struct apple_nhi *anhi, const u8 *order, unsigned int n,
 				       bool on)
@@ -788,6 +812,16 @@ static int apple_nhi_cio_power_on_t6050(struct apple_nhi *anhi)
 
 	dev_info(anhi->dev, "CIO restore PHY\n");
 	ret = apple_nhi_cio_phy(anhi, CIO_PHY_ON);
+	/* The router's domain only now, with the PHY's CIO mode up (or failed: raised all the same). */
+	if (anhi->cio_router_pd_down) {
+		int up = apple_nhi_cio_router_pd_set(anhi, true);
+
+		anhi->cio_router_pd_down = false;
+		if (up)
+			dev_err(anhi->dev, "CIO router domain not raised after the PHY: %d\n", up);
+		if (!ret)
+			ret = up;
+	}
 	if (ret)
 		return ret;
 	ret = apple_nhi_cio_domains_t6050(anhi, first, ARRAY_SIZE(first), true);
@@ -869,6 +903,17 @@ static int apple_nhi_cio_power_off_t6050(struct apple_nhi *anhi)
 	ret = apple_nhi_cio_domains_t6050(anhi, after, ARRAY_SIZE(after), false);
 	if (ret < 0)
 		return ret;
+	/* Held on by its DART: taken down here, before the PHY's shutdown, as macOS does. */
+	if (ret && of_machine_is_compatible("apple,j714s")) {
+		int down = apple_nhi_cio_router_pd_set(anhi, false);
+
+		if (!down) {
+			anhi->cio_router_pd_down = true;
+			ret = 0;
+		} else {
+			dev_warn(anhi->dev, "CIO router domain not taken down for the sleep: %d\n", down);
+		}
+	}
 	/* Held on by another user: the firmware sleep itself takes its power. */
 	anhi->cio_cycled = !ret;
 	return 0;
