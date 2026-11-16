@@ -38,6 +38,10 @@ pub(super) fn render_submit(bit: u32) -> bool {
 /// per device-mutex hold, and releases its retained pair on the room check's producer.
 pub(super) const SUBMIT_OBSERVED: u32 = 1 << 0;
 
+/// `aurora.gpubench_render_submit` 0x2: an M5 render pair's host-port transaction orders only
+/// its first and last write with a barrier.
+pub(super) const SUBMIT_HOSTPORT: u32 = 1 << 1;
+
 /// One fence that signals once all of `fences` have (see `job::MERGED_DEPENDENCIES`).
 pub(super) fn merge(fences: &[Fence]) -> Result<Fence> {
     let mut raw = KVec::with_capacity(fences.len(), GFP_KERNEL)?;
