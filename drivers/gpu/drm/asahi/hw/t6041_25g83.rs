@@ -55,7 +55,9 @@ pub(super) const CONFIG: Config = Config {
         // Banks for all forty core slots: the firmware indexes them by physical slot, and the
         // J616C's enabled slots run to 39 (core mask 0xf6_fdbf6fdb). With banks for the 32
         // enabled cores only, a compute load beside rendering hit reason-0 recoveries.
-        operand_state: fw::compute::OperandState::FOUR_BY_TEN,
+        // macOS 26.6.2 on the J616C writes 0xf7 as the first compute PTC cap (0x0a599; 0x60
+        // after the work, as here), where the M4 Pro writes 0x60 both times.
+        operand_state: fw::compute::OperandState::FOUR_BY_TEN.with_ptc_first(0xf7_0040_0020),
         deflake: fw::render::Deflake::FOUR_CLUSTERS,
         // The compute pool the J616C has run with since 23 Oct 2026; the M4 Pro's 21 blocks
         // hang this GPU's firmware on grids of more than ten workgroups.
