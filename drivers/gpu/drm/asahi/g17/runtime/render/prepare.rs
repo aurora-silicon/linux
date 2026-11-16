@@ -955,12 +955,18 @@ impl super::super::Backend {
                 self.shared.queue_events();
                 return Err(EBUSY);
             }
-            if !lease.is_current()
-                || firmware.recovery.pending()
-                || crate::g17::recovery::Memory::recovery_state(&firmware.init)? != 0
-            {
+            if !lease.is_current() || firmware.recovery.pending() {
                 return Err(EAGAIN);
             }
+            let state = crate::g17::recovery::Memory::recovery_state(&firmware.init)?;
+            if state != 0 {
+                return Err(EAGAIN);
+            }
+            // Measurement switch 0x1 (M5): this read stands for the publication's own reads in
+            // this hold.
+            let observed = (firmware.init.is_m5()
+                && crate::g17::sync_input::render_submit(crate::g17::sync_input::SUBMIT_OBSERVED))
+            .then_some(state);
             // Private restaging can fail after preparing a larger inventory.
             // Finish its descriptor before discarding the command preparation.
             firmware.commit_render_growth(slot, &mut growth)?;
@@ -974,7 +980,7 @@ impl super::super::Backend {
                 .filter(|claim| claim.remaining() != 0)
                 .map(|claim| firmware.init.outer_scope(claim))
                 .transpose()?;
-            firmware.publish_render(self.owner, slot, packet, deferred)
+            firmware.publish_render_observed(self.owner, slot, packet, deferred, observed)
         })();
         let result = (|| {
             if published.is_err() && !packet.is_published() {

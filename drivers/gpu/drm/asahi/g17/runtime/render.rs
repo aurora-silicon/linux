@@ -531,6 +531,9 @@ struct Host<'a> {
     /// serves the first pair written to the ring only.
     outer_cursors: Option<(u8, [u32; 3])>,
     outer_producer_used: bool,
+    /// The recovery word as this hold already read it, returned by `epoch` instead of a
+    /// reread (measurement switch 0x1, `Firmware::publish_render_observed`).
+    recovery_state: Option<u32>,
 }
 impl Host<'_> {
     /// The room check's cursors for the first pair this publication writes to the ring.
@@ -544,14 +547,22 @@ impl Host<'_> {
     }
 
     /// The room check's consumers with the producer read now: a retained pair revalidates the
-    /// producer it was prepared against.
-    fn retained_cursors(&mut self, priority: u8) -> Result<Option<[u32; 3]>> {
+    /// producer it was prepared against. `next`: the slots after the retained pair's.
+    fn retained_cursors(&mut self, priority: u8, next: [u32; 2]) -> Result<Option<[u32; 3]>> {
         self.outer_producer_used = true;
-        let Some((checked, [consumer, consumer_b, _])) = self.outer_cursors else {
+        let Some((checked, [consumer, consumer_b, producer])) = self.outer_cursors else {
             return Ok(None);
         };
         if checked != priority {
             return Ok(None);
+        }
+        // Measurement switch 0x1: the retained pair was written at the room check's producer
+        // (its first slot follows it) in this hold, which is the ring's only producer and has
+        // not advanced it since: the producer is still the room check's.
+        if crate::g17::sync_input::render_submit(crate::g17::sync_input::SUBMIT_OBSERVED)
+            && next[0] == (producer + 1) % crate::g17::fw::channels::WORK_RING_SLOTS
+        {
+            return Ok(Some([consumer, consumer_b, producer]));
         }
         Ok(Some([consumer, consumer_b, self.firmware.init.work_producer(priority)?]))
     }
@@ -578,7 +589,10 @@ impl crate::g17::queue::render::Host for Host<'_> {
     fn epoch(&self) -> Result<(u64, u32)> {
         Ok((
             self.firmware.recovery.generation(),
-            crate::g17::recovery::Memory::recovery_state(&self.firmware.init)?,
+            match self.recovery_state {
+                Some(state) => state,
+                None => crate::g17::recovery::Memory::recovery_state(&self.firmware.init)?,
+            },
         ))
     }
     fn stamps(&self, qids: [u8; 2]) -> Result<[u32; 2]> {
@@ -708,7 +722,7 @@ impl crate::g17::queue::render::Host for Host<'_> {
         tiling: &crate::g17::fw::channels::WorkSlot,
         next: [u32; 2],
     ) -> Result {
-        let result = self.retained_cursors(priority).and_then(|cursors| {
+        let result = self.retained_cursors(priority, next).and_then(|cursors| {
             self.firmware
                 .init
                 .publish_retained_work_pair(priority, fragment, tiling, next, cursors)
@@ -794,15 +808,17 @@ impl crate::g17::Firmware {
         slot: usize,
         operation: impl FnOnce(&mut Pair, &mut Host<'_>) -> Result<R>,
     ) -> Result<R> {
-        self.with_render_at(slot, None, operation)
+        self.with_render_at(slot, None, None, operation)
     }
 
     /// [`Self::with_render`] for a publication whose shared-ring room check, made in this
-    /// hold, sampled `outer_cursors`.
+    /// hold, sampled `outer_cursors`. `recovery_state`: the recovery word as this hold read it
+    /// for the publication (measurement switch 0x1), else None.
     fn with_render_at<R>(
         &mut self,
         slot: usize,
         outer_cursors: Option<(u8, [u32; 3])>,
+        recovery_state: Option<u32>,
         operation: impl FnOnce(&mut Pair, &mut Host<'_>) -> Result<R>,
     ) -> Result<R> {
         let mut pair = self
@@ -819,6 +835,7 @@ impl crate::g17::Firmware {
             m5_registration: None,
             outer_cursors,
             outer_producer_used: false,
+            recovery_state,
         };
         let result = operation(&mut pair, &mut host);
         host.release_registration();

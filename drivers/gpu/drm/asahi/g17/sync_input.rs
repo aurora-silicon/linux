@@ -18,6 +18,7 @@ unsafe extern "C" {
     fn asahi_g17_merge_fences(fences: *const *mut bindings::dma_fence, count: usize)
         -> *mut bindings::dma_fence;
     fn asahi_g17_local_inputs() -> u32;
+    fn asahi_g17_render_submit() -> u32;
 }
 
 /// Measurement only: `aurora.gpubench_local_inputs` (0 general, 1 own queue first, 2 ring order).
@@ -25,6 +26,17 @@ pub(super) fn local_inputs_mode() -> u32 {
     // SAFETY: Reads a module parameter word.
     unsafe { asahi_g17_local_inputs() }
 }
+
+/// Measurement only: whether `bit` of `aurora.gpubench_render_submit` is set. Each bit selects
+/// one M5 render submission change; with none set the driver runs without them.
+pub(super) fn render_submit(bit: u32) -> bool {
+    // SAFETY: Reads a module parameter word.
+    unsafe { asahi_g17_render_submit() & bit != 0 }
+}
+
+/// `aurora.gpubench_render_submit` 0x1: an M5 render publication reads the recovery word once
+/// per device-mutex hold, and releases its retained pair on the room check's producer.
+pub(super) const SUBMIT_OBSERVED: u32 = 1 << 0;
 
 /// One fence that signals once all of `fences` have (see `job::MERGED_DEPENDENCIES`).
 pub(super) fn merge(fences: &[Fence]) -> Result<Fence> {

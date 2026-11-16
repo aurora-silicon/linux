@@ -745,8 +745,27 @@ impl crate::g17::Firmware {
         packet: &Arc<Packet>,
         deferred: &mut DeferredBatch,
     ) -> Result {
+        self.publish_render_observed(owner, slot, packet, deferred, None)
+    }
+
+    /// [`Self::publish_render`] in a device-mutex hold that has already read the recovery word
+    /// as `observed` (measurement switch 0x1): that read stands for the ones the publication
+    /// makes in the same hold. The firmware can begin a recovery just after any read, which the
+    /// recovery service handles for every publication; a later read in the hold only narrows
+    /// that window, by a few microseconds.
+    pub(super) fn publish_render_observed(
+        &mut self,
+        owner: u64,
+        slot: u8,
+        packet: &Arc<Packet>,
+        deferred: &mut DeferredBatch,
+        observed: Option<u32>,
+    ) -> Result {
         use crate::g17::queue::render::PublicationLease;
-        let state = crate::g17::recovery::Memory::recovery_state(&self.init)?;
+        let state = match observed {
+            Some(state) => state,
+            None => crate::g17::recovery::Memory::recovery_state(&self.init)?,
+        };
         if self.recovery.pending() || state != 0 {
             return Err(EAGAIN);
         }
@@ -817,7 +836,7 @@ impl crate::g17::Firmware {
             buffer_token,
             buffer_context: buffer_context.map(|(context, _)| context),
         };
-        let result = self.with_render_at(usize::from(slot), outer_cursors, |pair, host| {
+        let result = self.with_render_at(usize::from(slot), outer_cursors, observed, |pair, host| {
             pair.publish(
                 packet.clone(),
                 &dependencies,
