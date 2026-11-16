@@ -2284,6 +2284,10 @@ static u32 t6050_spmi_pmu_ack(struct apple_sleep *s)
  * the PMU's latched interrupts acknowledged, the SPMI buses' sleep masks (nub-spmi0 first,
  * then the DT's order and spacing), SPI4, SPI2.
  */
+static bool t6050_alarm_readback;
+module_param_named(t6050_alarm_readback, t6050_alarm_readback, bool, 0644);
+MODULE_PARM_DESC(t6050_alarm_readback, "TEST: read SPMI latch and enable back after entry ack");
+
 static void t6050_sleep_after_ans(struct apple_sleep *s)
 {
 	struct apple_sleep_region_state *r = s->region;
@@ -2317,7 +2321,7 @@ static void t6050_sleep_after_ans(struct apple_sleep *s)
 	r->spmi_mask[0] = readl(s->spmi + M5_SPMI_IRQ_EN);
 	/* nub-spmi0 first: its interrupt outputs are AP wake sources. */
 	r->diag_spmi[0] = t6050_spmi_pmu_ack(s);
-	if (r->spmi_pmu_bits) {
+	if (r->spmi_pmu_bits && t6050_alarm_readback) {
 		r->diag_spmi[1] = readl(s->spmi + r->spmi_pmu_status);
 		r->diag_spmi[2] = readl(s->spmi + r->spmi_pmu_status - 0x200);
 	}
@@ -3228,7 +3232,8 @@ static void t6050_wake_report(struct apple_sleep *s)
 		r->diag_counter, r->diag_compare, r->diag_post_control, r->diag_wake_error,
 		r->diag_wake_control, get_unaligned_le64(r->diag_wake_counter) >> 16,
 		get_unaligned_le32(r->diag_wake_compare));
-	dev_info(s->dev, "TEST alarm: SPMI source entry %#x -> %#x enable %#x; wake %#x -> %#x; AP wake %*ph\n",
+	dev_info(s->dev, "TEST alarm: readback %u SPMI source entry %#x -> %#x enable %#x; wake %#x -> %#x; AP wake %*ph\n",
+		t6050_alarm_readback,
 		r->diag_spmi[0], r->diag_spmi[1], r->diag_spmi[2], r->diag_spmi[3],
 		r->diag_spmi[4], (int)sizeof(r->diag_wake), r->diag_wake);
 	for (i = 0; i < p->power.count; i++)
