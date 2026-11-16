@@ -554,6 +554,7 @@ static int dchid_register_ring(struct dockchannel_hid *dchid)
 	u8 prepare[] = { CMD_HOST_STATE, HOST_STATE_AWAKE };
 	int ret = 0, cmd_ret;
 	bool fifo_fallback = !dchid->use_ring;
+	bool prepared;
 
 	if (!dchid->use_rx_ring)
 		return 0;
@@ -562,7 +563,8 @@ static int dchid_register_ring(struct dockchannel_hid *dchid)
 	ret = dchid->ring_error;
 	if (!dchid->ring_registered) {
 		cmd_ret = dchid_comm_cmd(dchid, prepare, sizeof(prepare));
-		if (cmd_ret >= 0) {
+		prepared = cmd_ret >= 0;
+		if (prepared) {
 			/* The registration ACK itself arrives through the ring. */
 			dma_wmb();
 			WRITE_ONCE(dchid->ring_registered, true);
@@ -570,7 +572,7 @@ static int dchid_register_ring(struct dockchannel_hid *dchid)
 			dchid->ring_error = cmd_ret;
 		}
 		ret = cmd_ret;
-		if (dchid_ring_refused(cmd_ret, fifo_fallback)) {
+		if (dchid_ring_stays_on_fifo(prepared, cmd_ret, fifo_fallback)) {
 			/*
 			 * Stay on the FIFO. Keep the ring marked registered, so a
 			 * ring the firmware did accept still drains, and clear the
@@ -580,6 +582,16 @@ static int dchid_register_ring(struct dockchannel_hid *dchid)
 			dchid->ring_error = 0;
 			dev_warn(dchid->dev,
 				 "receive ring refused (%d), staying on FIFO\n", cmd_ret);
+			ret = 0;
+		} else if (!prepared && fifo_fallback) {
+			/*
+			 * The preparation command failed and the ring was never asked for.
+			 * The FIFO still works, so the start goes on, but the ring stays
+			 * unregistered and the next interface start tries again.
+			 */
+			dev_warn(dchid->dev,
+				 "receive ring not registered, host state failed (%d); using the FIFO for now\n",
+				 cmd_ret);
 			ret = 0;
 		}
 	}
