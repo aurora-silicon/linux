@@ -440,6 +440,47 @@ static void markers(size_t ps)
 	printf("ok - uffd ABI %zuK poison: SIGBUS, MADV_FREE recovery, neighbours\n",
 	       ps / 1024);
 }
+/*
+ * A write-first fault under WP_UNPOPULATED: in a smaller-granule mm the
+ * native window is filled at once, so the marker neighbours become present
+ * and keep their write protection; with the native granule they stay markers.
+ */
+static void marker_window(size_t ps, size_t native)
+{
+	unsigned char *map = mmap(NULL, 4 * ps + native, PROT_READ | PROT_WRITE,
+				  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	CHECK(map != MAP_FAILED);
+	unsigned char *p = (unsigned char *)(((uintptr_t)map + native - 1) &
+					     ~(uintptr_t)(native - 1));
+	int fd = syscall(SYS_userfaultfd,
+			 O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
+	CHECK(fd >= 0);
+	struct uffdio_api api = { .api = UFFD_API,
+				  .features = UFFD_FEATURE_PAGEFAULT_FLAG_WP |
+					      UFFD_FEATURE_WP_UNPOPULATED |
+					      UFFD_FEATURE_WP_ASYNC };
+	CHECK(!ioctl(fd, UFFDIO_API, &api));
+	struct uffdio_register reg = { .range = { (uintptr_t)p, 4 * ps },
+				       .mode = UFFDIO_REGISTER_MODE_WP };
+	CHECK(!ioctl(fd, UFFDIO_REGISTER, &reg));
+	protect(fd, p, 4 * ps, UFFDIO_WRITEPROTECT_MODE_WP);
+	p[ps + 17] = 0x5a;
+	for (unsigned int i = 0; i < 4; i++) {
+		uint64_t entry = pagemap(p + i * ps, ps);
+
+		if (i == 1) {
+			CHECK((entry & (1ULL << 63)) && !(entry & (1ULL << 57)));
+			continue;
+		}
+		CHECK(entry & (1ULL << 57));
+		CHECK(!!(entry & (1ULL << 63)) == (ps < native));
+		CHECK(p[i * ps + 17] == 0);
+		CHECK(pagemap(p + i * ps, ps) & (1ULL << 57));
+	}
+	CHECK(!close(fd) && !munmap(map, 4 * ps + native));
+	printf("ok - uffd ABI %zuK unpopulated WP write-first window keeps neighbour protection\n",
+	       ps / 1024);
+}
 struct pager_request {
 	uintptr_t address;
 	size_t size;
@@ -783,6 +824,7 @@ static int worker(unsigned long expected, unsigned long native)
 	missing(ps, native);
 	file_minor(ps, native);
 	markers(ps);
+	marker_window(ps, native);
 	cross_pager(ps, native, 0);
 	cross_pager(ps, native, 1);
 	private_missing(ps);

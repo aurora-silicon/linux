@@ -6838,15 +6838,24 @@ retry_private:
 	return err;
 }
 
+/*
+ * A uffd-wp marker in a registered VMA is unpopulated memory that remembers its
+ * protection: populate it like a none neighbour, then protect it (see below).
+ * Otherwise every first write under WP_UNPOPULATED takes a native page of its own.
+ */
 static unsigned long anon_subpage_missing_mask(pte_t *first, unsigned int nr,
-					       unsigned int target, unsigned int offset)
+					       unsigned int target, unsigned int offset,
+					       bool uffd_wp)
 {
 	unsigned long mask = 0;
 	unsigned int i;
 
-	for (i = 0; i < nr; i++)
-		if (i == target || pte_none(ptep_get(first + i)))
+	for (i = 0; i < nr; i++) {
+		pte_t pte = ptep_get(first + i);
+
+		if (i == target || pte_none(pte) || (uffd_wp && pte_is_uffd_wp_marker(pte)))
 			mask |= BIT(offset + i);
+	}
 	return mask;
 }
 
@@ -6860,6 +6869,7 @@ static vm_fault_t do_anonymous_subpage(struct vm_fault *vmf)
 	unsigned long start, end, lower, mask, current_mask, window_mask;
 	unsigned int first_offset, nr, target, i, index, mapped;
 	bool pooled, fresh, force_private = false, retry_private;
+	bool uffd_wp = userfaultfd_wp(vma);
 	vm_fault_t ret;
 	pte_t *first;
 	int err;
@@ -6880,7 +6890,8 @@ retry:
 	vmf->pte = pte_offset_map_mm(mm, vmf->pmd, vmf->address);
 	if (!vmf->pte)
 		return 0;
-	mask = anon_subpage_missing_mask(vmf->pte - target, nr, target, first_offset);
+	mask = anon_subpage_missing_mask(vmf->pte - target, nr, target, first_offset,
+					 uffd_wp);
 	pte_unmap(vmf->pte);
 	vmf->pte = NULL;
 	err = anon_subpage_prealloc_mask(mm, vma, vmf->address, mask,
@@ -6930,7 +6941,8 @@ retry:
 	}
 
 	first = vmf->pte - target;
-	current_mask = anon_subpage_missing_mask(first, nr, target, first_offset);
+	current_mask = anon_subpage_missing_mask(first, nr, target, first_offset,
+						 uffd_wp);
 	/* Do not lose newly missing neighbors or publish sparse dense-path supply.
 	 * Return to the fault handler on a racing mask change instead of spinning
 	 * under repeated zaps. No mapping has been published yet.
@@ -6957,7 +6969,8 @@ retry:
 		entry = pte_sw_mkyoung(entry);
 		if (vma->vm_flags & VM_WRITE)
 			entry = pte_mkwrite(pte_mkdirty(entry), vma);
-		if (i == target && vmf_orig_pte_uffd_wp(vmf))
+		if (i == target ? vmf_orig_pte_uffd_wp(vmf) :
+		    pte_is_uffd_wp_marker(ptep_get(first + i)))
 			entry = pte_mkuffd(entry);
 		set_pte_at(mm, address, first + i, entry);
 		update_mmu_cache(vma, address, first + i);
