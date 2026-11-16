@@ -195,6 +195,7 @@ pub(super) const BUILD_25G83: fw::variant::Build = fw::variant::Build {
     variant: &fw::variant::Variant {
         ta_mode_1: false,
         tvb_normal_blocks: crate::g17::fw::buffer::NORMAL_MAX_BLOCKS_FOUR_CLUSTERS,
+        render_pool_blocks: crate::g17::fw::freelist::RENDER_BLOCKS_T6041_25G83,
         ..fw::variant::V25G83
     },
     config: None,

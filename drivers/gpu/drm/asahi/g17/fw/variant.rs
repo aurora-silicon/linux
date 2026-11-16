@@ -87,6 +87,9 @@ pub(crate) struct Variant {
     /// The normal maximum of a G17P tiler heap in blocks, which bounds host growth and the
     /// firmware's own (device/build policy).
     pub(crate) tvb_normal_blocks: usize,
+    /// The smallest render pool of an owner, in blocks (device/build policy, at least
+    /// [`super::freelist::RENDER_BLOCKS`]).
+    pub(crate) render_pool_blocks: usize,
     pub(crate) compute: super::compute::ComputeProgram,
     pub(crate) opening_record: bool,
     pub(crate) split_firmware_area: bool,
@@ -160,6 +163,7 @@ pub(crate) const V26A428: Variant = Variant {
     programs: super::render::RegisterPrograms::G17P,
     ta_mode_1: false,
     tvb_normal_blocks: super::buffer::NORMAL_MAX_BLOCKS,
+    render_pool_blocks: super::freelist::RENDER_BLOCKS,
     compute: super::compute::ComputeProgram::G17P,
     opening_record: true,
     split_firmware_area: false,
@@ -202,6 +206,7 @@ pub(crate) const V25G83: Variant = Variant {
     programs: super::render::RegisterPrograms::V25G83,
     ta_mode_1: false,
     tvb_normal_blocks: super::buffer::NORMAL_MAX_BLOCKS,
+    render_pool_blocks: super::freelist::RENDER_BLOCKS,
     compute: super::compute::ComputeProgram::G17P,
     opening_record: true,
     split_firmware_area: false,
