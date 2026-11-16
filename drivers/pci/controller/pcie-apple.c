@@ -4312,7 +4312,8 @@ static int apple_pcie_tunnel_add_links(struct apple_pcie *pcie)
 		if (ret == -EOPNOTSUPP)
 			dev_warn(pcie->dev, "DART has no CIO sleep path; a docked deep sleep is refused\n");
 	} else if (cio_s2r && pcie->hw == &t6050_pciec_hw &&
-		   of_machine_is_compatible("apple,j714s") &&
+		   (of_machine_is_compatible("apple,j714s") ||
+		    of_machine_is_compatible("apple,j716c")) &&
 		   of_property_present(dart_pdev->dev.of_node, "apple,clock-protection")) {
 		/*
 		 * TEST: T6050, a router that sleeps in place. Only with the DART's clock
@@ -7340,7 +7341,8 @@ static int apple_pcie_resume_noirq(struct device *dev)
 		 * failed for it (run sv6t4: "PM: failed to resume noirq: error -107").
 		 */
 		if (ret == -ENOTCONN && pcie->cio_lost && pcie->hw == &t6050_pciec_hw &&
-		    of_machine_is_compatible("apple,j714s")) {
+		    (of_machine_is_compatible("apple,j714s") ||
+		     of_machine_is_compatible("apple,j716c"))) {
 			dev_warn(dev, "T6050 sleep: PCIe-C tunnel gone with its dock during the sleep: the port is closed as after an unplug, its functions return when the dock is plugged in again\n");
 			return 0;
 		}
