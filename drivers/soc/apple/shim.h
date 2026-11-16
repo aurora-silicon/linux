@@ -18,6 +18,14 @@
 
 #include <linux/types.h>
 
+/* -- application-key files ---------------------------------------------- */
+
+void *sep_key_register(const char *name, u16 mode, void *ctx,
+		       int (*open)(void *, void **),
+		       void (*release)(void *),
+		       long (*ioctl)(void *, unsigned int, unsigned long));
+void sep_key_unregister(void *device);
+
 struct apple_sep_fv_new_file_key;
 struct dev_pm_ops;
 
