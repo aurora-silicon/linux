@@ -24,8 +24,8 @@
  * What the kernel does in suspend-to-RAM is what macOS does in its last 14 ms,
  * with the order kept. What differs between SoCs, their power words and the
  * lists macOS was measured with, is each SoC's match data. Only SoCs measured
- * and tested that way are matched: on the others this driver doesn't bind, and
- * s2idle stays the only sleep.
+ * and tested that way can suspend. Inventory-only matches report why they are
+ * unavailable, before any hardware access; s2idle stays the only sleep.
  *
  * T8132 takes the same path with its own tables and operations, t8132_sleep_ops,
  * measured the same way from a macOS sleep under aura's hypervisor. Its blocks are
@@ -301,6 +301,7 @@ struct aura_s2r_mailbox {
 
 /* The coprocessors the last mile stops. Each driver idles its own first. */
 #define SLEEP_COPROCS		16
+#define SLEEP_GATES_MAX		16
 
 static struct apple_sleep_coproc {
 	struct device *dev;
@@ -525,6 +526,8 @@ struct apple_sleep_ops {
  * so, and the lists keep the order macOS was measured with.
  */
 struct apple_sleep_soc {
+	/* Inventory-only profiles cannot enter any hardware preparation callback. */
+	const char *unavailable_reason;
 	const struct apple_sleep_ops *ops;
 	/* The boot core's WFI comes last, this long after the commit, in ms */
 	unsigned int boot_wfi_delay_ms;
@@ -764,7 +767,7 @@ struct apple_sleep {
 		u32 ps;
 		bool allow_unstarted;
 		bool strict_unbound;
-	} gate[16];
+	} gate[SLEEP_GATES_MAX];
 	unsigned int gate_count;
 	/* The AP pins, which a deep sleep resets */
 	void __iomem *pins;
@@ -4935,7 +4938,7 @@ static int apple_sleep_alloc_books(struct apple_sleep *s)
 	struct device *dev = s->dev;
 
 	/* One bit, and one gate, for each */
-	if (soc->nstray > BITS_PER_LONG || soc->ngate_coprocs > ARRAY_SIZE(s->gate))
+	if (soc->nstray > BITS_PER_LONG || soc->ngate_coprocs > SLEEP_GATES_MAX)
 		return dev_err_probe(dev, -EINVAL, "the SoC's lists are too long\n");
 
 	s->ps_on_saved = devm_kcalloc(dev, soc->ps_macos_on.count, sizeof(u32), GFP_KERNEL);
@@ -5255,18 +5258,17 @@ EXPORT_SYMBOL_GPL(apple_sleep_m5_dispext_power);
 
 #include "sleep-v27-late.inc"
 
-static int apple_sleep_profile_check(struct apple_sleep *s)
+static int apple_sleep_profile_validate(const struct apple_sleep_soc *soc)
 {
-	const struct apple_sleep_soc *soc;
-
-	if (!s)
+	if (!soc)
 		return -ENODEV;
-	soc = s->soc;
+	if (soc->unavailable_reason)
+		return -EOPNOTSUPP;
 
 	/* Only a SoC with its own entry: what that entry calls without a test */
 	if (!soc->early_context)
 		return 0;
-	if (soc->ngate_coprocs > ARRAY_SIZE(s->gate) || soc->nstray > BITS_PER_LONG)
+	if (soc->ngate_coprocs > SLEEP_GATES_MAX || soc->nstray > BITS_PER_LONG)
 		return -EINVAL;
 	if (!soc->ops || !soc->ops->cpu_prepare || !soc->ops->cpu_restore ||
 	    !soc->ops->prepare_regs || !soc->ops->undo_regs ||
@@ -5275,7 +5277,21 @@ static int apple_sleep_profile_check(struct apple_sleep *s)
 	    !soc->ops->aic_restore ||
 	    (!soc->ops->commit_regs && (!soc->ops->lower_io || !soc->ops->last_mile)) ||
 	    !soc->ndisp || soc->ndisp > SLEEP_DISPLAYS_MAX || !soc->cpu_clusters)
-		return dev_err_probe(s->dev, -EINVAL, "incomplete sleep profile\n");
+		return -EINVAL;
+	return 0;
+}
+
+static int apple_sleep_profile_check(struct apple_sleep *s)
+{
+	int ret;
+
+	if (!s)
+		return -ENODEV;
+	ret = apple_sleep_profile_validate(s->soc);
+
+	if (ret)
+		return dev_err_probe(s->dev, ret, "%s\n",
+				     s->soc->unavailable_reason ?: "incomplete sleep profile");
 	return 0;
 }
 
@@ -5302,6 +5318,13 @@ static int apple_sleep_probe(struct platform_device *pdev)
 	ret = apple_sleep_profile_check(s);
 	if (ret)
 		return ret;
+
+	/* Reject another board or CPU layout before map_regs can program hardware. */
+	if (s->soc->cpu_clusters) {
+		ret = apple_sleep_validate_cpu_topology(s);
+		if (ret)
+			return ret;
+	}
 
 	/* Without the boot object's half, a wake would rerun its boot flow. */
 	ret = apple_sleep_map_mailbox(s);
@@ -5336,11 +5359,6 @@ static int apple_sleep_probe(struct platform_device *pdev)
 		}
 
 		ret = apple_sleep_read_wake_sources(s);
-		if (ret)
-			return ret;
-	}
-	if (s->soc->cpu_clusters) {
-		ret = apple_sleep_validate_cpu_topology(s);
 		if (ret)
 			return ret;
 	}
@@ -5791,13 +5809,14 @@ static const struct apple_sleep_soc t8132_sleep_soc = {
 };
 
 /*
- * Only SoCs whose sleep was measured and tested. On every other the driver doesn't bind, and
- * s2idle stays the only sleep.
+ * Qualified profiles expose system sleep. Inventory-only profiles match for a
+ * precise refusal and cannot reach hardware preparation or suspend_set_ops().
  */
 static const struct of_device_id apple_sleep_of_match[] = {
 	{ .compatible = "apple,t8140-sleep", .data = &t8140_sleep_soc },
 	{ .compatible = "apple,t8132-sleep", .data = &t8132_sleep_soc },
 	{ .compatible = "apple,t6050-sleep", .data = &t6050_sleep_soc },
+	{ .compatible = "apple,t6050-j716c-sleep", .data = &t6050_j716c_sleep_soc },
 	{ }
 };
 

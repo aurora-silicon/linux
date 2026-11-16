@@ -113,8 +113,8 @@ config APPLE_SOC_SLEEP_KUNIT_TEST
 	depends on APPLE_SOC_SLEEP && KUNIT=y
 	default KUNIT_ALL_TESTS
 	help
-	  Checks each matched SoC's sleep data: that only tested SoCs are
-	  matched, that every list names only words of the SoC's full lists,
+	  Checks each matched SoC's sleep data: that unqualified profiles cannot
+	  suspend, that every list names only words of the SoC's full lists,
 	  with no duplicates, and that the lists fit the driver's books. The
 	  tests touch no hardware.
 

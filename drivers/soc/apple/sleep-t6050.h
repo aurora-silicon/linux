@@ -88,7 +88,7 @@ struct apple_sleep_region_state {
 	/* Connected to shared domain APIs; owners clear exclusions after a successful raise. */
 	unsigned long *driver_down;
 	bool snapshot_valid;
-	unsigned long manager_down[BITS_TO_LONGS(ARRAY_SIZE(t6050_ps_all))];
+	unsigned long *manager_down;
 	u8 alarm_compare[4];
 	bool alarm_valid;
 	unsigned int pmu_errors;
@@ -198,6 +198,13 @@ static const struct apple_sleep_region_profile t6050_region_profile = {
 	.ntables = ARRAY_SIZE(t6050_tables),
 };
 
+/* Inventory only: the Max's memory stop/wake sequence is not yet qualified. */
+static const struct apple_sleep_region_profile t6050_j716c_region_profile = {
+	.region = t6050_regions,
+	.count = ARRAY_SIZE(t6050_regions),
+	.power = SLEEP_WORDS(t6050_j716c_ps_all),
+};
+
 static bool sleep_region_word_valid(const struct apple_sleep_region_profile *p,
 				    u32 w, bool power)
 {
@@ -272,7 +279,9 @@ static int sleep_region_map(struct apple_sleep *s)
 	r->done = devm_kcalloc(s->dev, p->power.count, sizeof(bool), GFP_KERNEL);
 	r->late = devm_kcalloc(s->dev, p->power.count, sizeof(bool), GFP_KERNEL);
 	r->driver_down = devm_bitmap_zalloc(s->dev, p->power.count, GFP_KERNEL);
-	if (!r->saved || !r->woke || !r->done || !r->late || !r->driver_down)
+	r->manager_down = devm_bitmap_zalloc(s->dev, p->power.count, GFP_KERNEL);
+	if (!r->saved || !r->woke || !r->done || !r->late ||
+	    !r->driver_down || !r->manager_down)
 		return -ENOMEM;
 	s->region = r;
 	return 0;
@@ -1620,7 +1629,7 @@ static int t6050_sleep_begin(struct apple_sleep *s)
 	r->pmc_saved = false;
 	r->floor_changed = 0;
 	r->display_lowered = 0;
-	bitmap_zero(r->manager_down, ARRAY_SIZE(t6050_ps_all));
+	bitmap_zero(r->manager_down, s->soc->regions->power.count);
 	r->late_errors = 0;
 	r->auss_lowered = 0;
 	r->refusal_cycled = 0;
@@ -1850,7 +1859,8 @@ static int t6050_sleep_display_off_one(struct apple_sleep *s, unsigned int d)
 	/* Snapshot belongs to the returning pre-SEP phase. */
 	r->display_lowered |= BIT(d);
 	for (j = 0; j < 3; j++) {
-		int index = sleep_ps_find(t6050_ps_all, ARRAY_SIZE(t6050_ps_all), s->soc->ps.disp[d][j]);
+		int index = sleep_ps_find(s->soc->regions->power.offset,
+				  s->soc->regions->power.count, s->soc->ps.disp[d][j]);
 
 		if (index >= 0)
 			set_bit(index, r->manager_down);
@@ -2985,7 +2995,7 @@ static void t6050_sleep_restore_display(struct apple_sleep *s)
 		r->disp_children_lowered[d] = 0;
 	}
 	r->display_lowered = 0;
-	bitmap_zero(r->manager_down, ARRAY_SIZE(t6050_ps_all));
+	bitmap_zero(r->manager_down, s->soc->regions->power.count);
 }
 
 static void t6050_sleep_restore_pmc(struct apple_sleep *s)
@@ -3415,4 +3425,25 @@ static const struct apple_sleep_soc t6050_sleep_soc = {
 			  SLEEP_REGION_WORD(T6050_PS0, 0x228) },
 		},
 	},
+};
+
+/*
+ * Keep the Max inventory separate without granting it the Pro's entry callbacks.
+ * Matching this node must fail before any mapping or boot-time register writes:
+ * its DCS inventory differs, and the stop/wake contract still needs validation.
+ */
+static const struct apple_sleep_soc t6050_j716c_sleep_soc = {
+	.unavailable_reason = "J716c memory-controller stop/wake is not qualified",
+	.early_context = true,
+	.strict_gate_inventory = true,
+	.machine = "apple,j716c",
+	.boot_mpidr = 0x040000,
+	.cpu_count = 18,
+	.cpu_cluster_affinity = 1,
+	.cpu_clusters = 3,
+	.cpu_cores_per_cluster = 6,
+	.cpu_start_stride = 6,
+	.cpu_valid = t6050_sleep_cpu_valid,
+	.ndisp = 5,
+	.regions = &t6050_j716c_region_profile,
 };
