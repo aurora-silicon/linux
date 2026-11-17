@@ -224,7 +224,31 @@ impl Layout {
         {
             return Err(ERANGE);
         }
-        Ok(aligned(self.tpc_end, mmu::UAT_PGSZ)?.max(cfg::TPC_MIN))
+        Ok(aligned(self.shared_end(), mmu::UAT_PGSZ)?.max(cfg::TPC_MIN))
+    }
+    /// End of the shared part, the TPC and GTP 1-3: GTP 4, where the metadata starts. GTP 4
+    /// need not be page aligned, and the tile maps run up to it.
+    fn shared_end(&self) -> usize {
+        match (self.m5, self.gtp[4]) {
+            (None, Some(start)) => start,
+            _ => self.tpc_end,
+        }
+    }
+    /// One render's clustering-metadata copy, page aligned; zero when there is none.
+    fn meta_capacity(&self) -> Result<usize> {
+        aligned(self.meta_bytes(), mmu::UAT_PGSZ)
+    }
+    /// Start of the per-render part: clustering metadata (GTP 4-7) begins at GTP 4, rounded
+    /// down to a page so every sub-buffer keeps its alignment in a page-aligned copy.
+    fn meta_base(&self) -> usize {
+        match (self.m5, self.gtp[4]) {
+            (None, Some(start)) => start / mmu::UAT_PGSZ * mmu::UAT_PGSZ,
+            _ => self.tpc_end,
+        }
+    }
+    /// Bytes of one render's metadata copy, zero without clustering metadata.
+    fn meta_bytes(&self) -> usize {
+        self.tpc_end - self.meta_base()
     }
     pub(crate) fn record_stride(&self) -> Result<usize> {
         let bytes = aligned(self.used, mmu::UAT_PGSZ)?;
@@ -276,7 +300,14 @@ pub(crate) struct Addresses {
 
 pub(crate) struct Target {
     records: Object,
+    /// The TPC and tile-map sub-buffers, shared by every render of the target.
     tpc: Object,
+    tpc_stride: usize,
+    /// One zeroed clustering-metadata copy (GTP 4-7) per in-flight render, like the records.
+    /// Only these are copied: a copy of the whole TPC object per render (32 in flight) filled
+    /// the client's target window once a game kept several large targets.
+    meta: Option<Object>,
+    meta_stride: usize,
     stride: usize,
     slots: [Option<u64>; DEPTH],
     retired: KVec<Retired>,
@@ -291,11 +322,21 @@ impl Target {
         layout.check_capacity(stride)?;
         let m5 = layout.m5.is_some();
         let records = Object::new(dev, vm, stride * DEPTH, m5.then_some(PairObject::Records))?;
+        let tpc_stride = tpc;
         let tpc = Object::new(dev, vm, tpc, m5.then_some(PairObject::Tpc))?;
+        let meta_stride = layout.meta_capacity()?;
+        let meta = if meta_stride == 0 {
+            None
+        } else {
+            Some(Object::new(dev, vm, meta_stride.checked_mul(DEPTH).ok_or(EOVERFLOW)?, None)?)
+        };
         KBox::new(
             Self {
                 records,
                 tpc,
+                tpc_stride,
+                meta,
+                meta_stride,
                 stride,
                 slots: [None; DEPTH],
                 retired: KVec::new(),
@@ -305,6 +346,10 @@ impl Target {
         )
         .map_err(Into::into)
     }
+    fn meta_offset(&self, ordinal: u64) -> usize {
+        (ordinal as usize % DEPTH) * self.meta_stride
+    }
+
     pub(crate) fn tpc_va(&self) -> u64 {
         self.tpc.address
     }
@@ -332,14 +377,24 @@ impl Target {
 
     /// GPU addresses of the tiler parameter sub-buffers of `layout` (25G83), zero for an empty
     /// or absent one. The TPC object holds them after the TPC.
-    pub(crate) fn gtp_va(&self, layout: &Layout) -> Result<[u64; 8]> {
-        if layout.tpc_end > self.tpc.backing.size() {
+    pub(crate) fn gtp_va(&self, ordinal: u64, layout: &Layout) -> Result<[u64; 8]> {
+        let split = layout.meta_base();
+        if layout.shared_end() > self.tpc_stride || layout.meta_bytes() > self.meta_stride {
             return Err(ERANGE);
         }
+        let meta = match &self.meta {
+            Some(meta) => meta.address.checked_add(self.meta_offset(ordinal) as u64).ok_or(EOVERFLOW)?,
+            None => 0,
+        };
         let mut addresses = [0; 8];
         for (address, offset) in addresses.iter_mut().zip(layout.gtp) {
             if let Some(offset) = offset {
-                *address = self.tpc.address.checked_add(offset as u64).ok_or(EOVERFLOW)?;
+                *address = if offset < split {
+                    self.tpc.address.checked_add(offset as u64).ok_or(EOVERFLOW)?
+                } else {
+                    if meta == 0 { return Err(ERANGE); }
+                    meta.checked_add((offset - split) as u64).ok_or(EOVERFLOW)?
+                };
             }
         }
         Ok(addresses)
@@ -364,6 +419,25 @@ impl Target {
             .get_mut(offset..offset + span)
             .ok_or(ERANGE)?
             .fill(0);
+        // Clustered tiling expects zeroed clustering metadata (GTP 4-7), as G15 gives every
+        // clustered pass a zeroed buffer. Zero this render's own copy.
+        if !self.m5 {
+            if let Some(start) = layout.gtp[4] {
+                let split = layout.meta_base();
+                if layout.meta_bytes() > self.meta_stride {
+                    return Err(ERANGE);
+                }
+                let base = self.meta_offset(ordinal);
+                self.meta
+                    .as_mut()
+                    .ok_or(ERANGE)?
+                    .backing
+                    .bytes_mut()
+                    .get_mut(base + start - split..base + layout.tpc_end - split)
+                    .ok_or(ERANGE)?
+                    .fill(0);
+            }
+        }
         self.slots[slot] = Some(ordinal);
         let tilemap = self
             .records
@@ -395,9 +469,27 @@ impl Target {
         if self.m5 != layout.m5.is_some() { return Err(EINVAL); }
         layout.check_capacity(stride)?;
         let mut grew = false;
-        if tpc > self.tpc.backing.size() {
-            Self::replace(&mut self.retired, &mut self.tpc, dev, vm, tpc, owners,
-                self.m5.then_some(PairObject::Tpc))?;
+        if tpc > self.tpc_stride {
+            Self::replace(
+                &mut self.retired,
+                &mut self.tpc,
+                dev,
+                vm,
+                tpc,
+                owners,
+                self.m5.then_some(PairObject::Tpc),
+            )?;
+            self.tpc_stride = tpc;
+            grew = true;
+        }
+        let meta = layout.meta_capacity()?;
+        if meta > self.meta_stride {
+            let size = meta.checked_mul(DEPTH).ok_or(EOVERFLOW)?;
+            match self.meta.as_mut() {
+                Some(old) => Self::replace(&mut self.retired, old, dev, vm, size, owners, None)?,
+                None => self.meta = Some(Object::new(dev, vm, size, None)?),
+            }
+            self.meta_stride = meta;
             grew = true;
         }
         if stride > self.stride {
@@ -498,9 +590,70 @@ mod tests {
             assert!(layout.tpc_size < cfg::TPC_MAX);
             assert!(layout.record_stride().unwrap() < cfg::TARGET_RECORD_MAX);
             assert!(layout.tpc_end > cfg::TPC_MAX);
-            assert!(layout.tpc_capacity().unwrap() >= layout.tpc_end);
             assert_eq!(layout.gtp[0], Some(0));
             assert!(layout.gtp[1].unwrap() >= layout.tpc_size);
+            fits(&layout);
+        }
+    }
+
+    /// Every sub-buffer of `layout` lies whole in its object with its alignment: the TPC and
+    /// GTP 1-3 in the shared TPC object, GTP 4-7 in a render's metadata copy.
+    fn fits(layout: &Layout) {
+        let shared = layout.tpc_capacity().unwrap();
+        let split = layout.meta_base();
+        // GTP 0-3 sizes, as Layout::new gives them; GTP 2 exists for layered targets only.
+        let sizes = [layout.tpc_size, layout.tilemap_size * 64, 0x4000, 0];
+        for (index, size) in sizes.into_iter().enumerate() {
+            if let Some(offset) = layout.gtp[index] {
+                assert!(offset < split);
+                assert!(offset + size <= shared);
+            }
+        }
+        assert!(layout.meta_capacity().unwrap() >= layout.tpc_end - split);
+        for (offset, alignment) in layout.gtp.iter().zip(GTP_ALIGNMENTS).skip(4) {
+            assert!(offset.unwrap() >= split);
+            assert_eq!((offset.unwrap() - split) % alignment, 0);
+        }
+    }
+
+    #[test]
+    fn only_clustering_metadata_is_copied_per_render() {
+        // 1728x1117 on the four-cluster M4 Max: the per-render copy is the metadata alone,
+        // not the TPC and the megabyte of tile maps.
+        let mut p = pass(1728, 32);
+        p.height = 1117;
+        let layout = Layout::new(&p, 4, RegisterPrograms::V25G83).unwrap();
+        let start = layout.gtp[4].unwrap();
+        assert!(layout.meta_base() <= start && start - layout.meta_base() < mmu::UAT_PGSZ);
+        // Metadata 4 (GTP 6) has room for 64 partial renders: 0x65e00 bytes.
+        assert!(layout.meta_capacity().unwrap() <= 0x8_0000);
+        assert!(layout.meta_capacity().unwrap() < layout.tilemap_size * 64);
+        fits(&layout);
+    }
+
+    #[test]
+    fn the_shared_object_holds_the_last_tile_map() {
+        // With 32x32 utiles at 3456x2234 the TPC is 0x46000 bytes, so GTP 4 is not page
+        // aligned and the tile maps end past GTP 4 rounded down to a page.
+        let mut p = pass(3456, 32);
+        p.height = 2234;
+        let layout = Layout::new(&p, 4, RegisterPrograms::V25G83).unwrap();
+        assert_ne!(layout.gtp[4].unwrap() % mmu::UAT_PGSZ, 0);
+        let end = layout.gtp[1].unwrap() + layout.tilemap_size * 64;
+        assert!(end > aligned(layout.meta_base(), mmu::UAT_PGSZ).unwrap());
+        assert!(layout.tpc_capacity().unwrap() >= end);
+        for (width, height) in [(1728, 1117), (3456, 2234), (2048, 2048), (1280, 720)] {
+            for (utile_width, utile_height) in [(32, 32), (32, 16), (16, 16)] {
+                for layers in [1, 2] {
+                    for clusters in [2, 4] {
+                        let mut p = pass(width, utile_width);
+                        p.height = height;
+                        p.utile_height = utile_height;
+                        p.layers = layers;
+                        fits(&Layout::new(&p, clusters, RegisterPrograms::V25G83).unwrap());
+                    }
+                }
+            }
         }
     }
 
