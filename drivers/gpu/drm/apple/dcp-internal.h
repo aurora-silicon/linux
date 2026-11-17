@@ -765,6 +765,13 @@ struct apple_dcp {
 	 * T8142 included, takes the paths it took before.
 	 */
 	bool v27_j714s;
+	/*
+	 * The firmware 27 sleep's calls are known for this processor: the J714s on the 27.0
+	 * table, whose copy carries the sleep's A500 (iomfb_v27_methods_j714s()). The sleep sends
+	 * 27.0's tags (A484, A500, A414, ...), which other builds renumbered, and it relies on
+	 * sleep_v27_ep, which only a v27_j714s processor fills.
+	 */
+	bool v27_sleep_known;
 	struct dcp_v27_sleep *sleep_v27;
 	bool sleep_v27_closed;
 	/*

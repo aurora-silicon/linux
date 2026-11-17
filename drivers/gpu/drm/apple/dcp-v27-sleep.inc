@@ -405,6 +405,30 @@ static void dcp_v27_sleep_invalidate(struct apple_dcp *dcp)
 	apple_sleep_v27_prepared(dcp->dev, false);
 }
 
+/*
+ * The deep sleep's display step runs only where its calls are known (dcp->v27_sleep_known:
+ * the J714s on 27.0). Anywhere else the deep sleep is refused at the device .prepare, before
+ * any device suspends, with one line; s2idle never comes here (no pm_suspend_via_firmware()).
+ *
+ * On the J716s (27.3) the step ran and crashed the firmware: no endpoint was in sleep_v27_ep
+ * there, so dcp_v27_sleep_endpoints_open() started the live system endpoint 0x20 again
+ * (START_EP, then RBEP_INIT on its running ring), and the firmware asserted at
+ * afk_messenger_common.c:246. Past that it would have sent 27.0's tags, which name other
+ * methods in the 27.2 and 27.3 tables (set_power_state is A534/A535 there, A500 is
+ * set_parameter_dcp), and the 27.3 tags of the sleep's own calls are not known.
+ */
+static int dcp_v27_sleep_known(struct apple_dcp *dcp)
+{
+	char compat[DCP_FW_VERSION_STR_LEN];
+
+	if (dcp->v27_sleep_known)
+		return 0;
+	dcp_read_fw_version(dcp->dev, "apple,firmware-compat", compat);
+	dev_warn(dcp->dev, "deep sleep refused: no display sleep known for firmware %s on this machine (only the J714s on 27.0); s2idle is not affected\n",
+		 compat);
+	return -EOPNOTSUPP;
+}
+
 /* DCPEXT0..3, from the processors' DT index (the internal display's is 0). */
 static unsigned int dcp_v27_ext_nr(struct apple_dcp *dcp)
 {
@@ -936,6 +960,13 @@ static int dcp_v27_sleep_endpoints_open(struct apple_dcp *dcp)
 		ep = READ_ONCE(dcp->sleep_v27_ep[id - 0x20]);
 		if (ep)
 			continue;
+		/*
+		 * An AFK ring already runs there without being tracked (the system endpoint on a
+		 * processor that never filled sleep_v27_ep): a second START_EP and RBEP_INIT on it
+		 * make the firmware assert. Refused before anything is sent.
+		 */
+		if (!IS_ERR_OR_NULL(dcp_afkep(dcp, id)))
+			return -EPROTO;
 		if (served && !s->ext_wq) {
 			/* Not ordered and not the endpoint's: a call waits for its reply. */
 			s->ext_wq = alloc_workqueue("apple-dcp-ext-av", WQ_UNBOUND, 0);
@@ -1347,6 +1378,9 @@ static int dcp_v27_sleep_prepare(struct apple_dcp *dcp)
 	int ret;
 
 	dcp_v27_sleep_invalidate(dcp);
+	/* .prepare refused it already; nothing is sent to firmware this step is not known for. */
+	if (!dcp->v27_sleep_known)
+		return -EOPNOTSUPP;
 	/* Refused before anything changes: the sleep RPCs' arguments come from the DT. */
 	if (!iomfb_v27_sleep_described(dcp)) {
 		dev_warn(dcp->dev, "V27 sleep: no sleep RPC arguments in the DT\n");
@@ -1630,6 +1664,7 @@ static int dcp_v27_sleep_resume(struct apple_dcp *dcp)
 #else
 static bool dcp_v27_sleep_selected(struct apple_dcp *dcp) { return false; }
 static void dcp_v27_sleep_invalidate(struct apple_dcp *dcp) { }
+static int dcp_v27_sleep_known(struct apple_dcp *dcp) { return 0; }
 static int dcp_v27_sleep_suspend(struct apple_dcp *dcp) { return -EOPNOTSUPP; }
 static int dcp_v27_sleep_resume(struct apple_dcp *dcp) { return -EOPNOTSUPP; }
 #endif
