@@ -278,6 +278,12 @@ void spin_table_release_cpus(const struct cpumask *cpus)
 	sev();
 }
 
+/* CPUs already tracked off will not execute another sleep CPU-off callback. */
+bool spin_table_cpu_tracked_off(unsigned int cpu)
+{
+	return cpumask_test_cpu(cpu, &spin_table_cpus_off);
+}
+
 /* After the commit: the stopped CPUs take their last WFI. */
 void spin_table_release_stopped(void)
 {

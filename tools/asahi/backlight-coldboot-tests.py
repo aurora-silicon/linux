@@ -71,7 +71,7 @@ struct apple_dcp {
  struct desktop *desktop;
  struct { struct dcp_backlight_state state; int lock; } backlight;
  struct { bool update; u32 maximum; } brightness;
- bool panel,m4,v14,external,ext26,typec,pipe_enabled_h17p,crashed,quiescing;
+ bool panel,m4,v14,external,typec,pipe_enabled_h17p,crashed,quiescing;
  bool typec_crtc_off,typec_cable_connected,typec_follow_start,typec_poweron_hpd,hdmi_yielded;
  unsigned crtc_unplugs,typec_unplugs,typec_generation,typec_reconnect_tries,external_generation,external_crtc_generation;
  int external_lock,hpd_mutex,relink_lock,relink,typec_iomfb_hpd_ready;
@@ -95,9 +95,10 @@ static bool iomfb_is_m4(struct apple_dcp *p) { return p->m4; }
 static bool iomfb_v14_7_panel_nits(struct apple_dcp *p) { return p->v14; }
 static bool dcp_has_panel(struct apple_dcp *p) { return p->panel; }
 static bool dcp_is_external_h17p(struct apple_dcp *p) { return p->external; }
-static bool dcp_is_ext26(struct apple_dcp *p) { return p->ext26; }
-static bool dcp_is_retained_external(struct apple_dcp *p) { return p->external || p->ext26; }
-static void flush_work(struct work_struct *p) { (void)p; }
+/* These fixtures exercise the internal panel and the H17P external path. */
+static bool dcp_is_ext26(struct apple_dcp *p) { (void)p;return false; }
+static bool dcp_is_retained_external(struct apple_dcp *p) { return dcp_is_external_h17p(p); }
+static void flush_work(struct work_struct *p) { (void)p;assert(!"unexpected native26 work flush"); }
 static bool dcp_is_typec_output(struct apple_dcp *p) { return p->typec; }
 static bool dcp_h17g_panel(struct apple_dcp *p) { return p->hw.iomfb_method_profile==DCP_IOMFB_METHODS_H17G; }
 static void dcp_backlight_kick(struct apple_dcp *p) { assert(p->backlight.state.ready);kicks++; }
