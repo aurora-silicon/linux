@@ -246,6 +246,13 @@ int main(int argc,char **argv) {
   for(size_t j=0;j<frame.prog_words;j++)if(words[j]==(shown->bufs.color.addr>>8))prior_color=true;
   assert(!prior_color);}
  avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);avd_vp9_done(&ctx,&src,&dst[1].base.vb,VB2_BUF_STATE_DONE);
+ /* A 1440x1088 reference of a 1920x1088 frame: vertical scale high, horizontal low. */
+ params.frame_width_minus_1=1919;params.frame_height_minus_1=1087;reference.vp9.width=1440;
+ current_dst=&dst[0].base.vb;frame.idx=0;assert(!avd_vp9_run(&ctx));
+ {bool scale=false;u32 *words=program.cpu;
+  for(size_t j=0;j<frame.prog_words;j++){assert(words[j]!=0x30004000);if(words[j]==0x40003000)scale=true;}
+  assert(scale);}
+ reference.vp9.width=1920;avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);
  /* The firmware transport keeps the 64-pixel floor. */
  ctx.decoded_fmt.fmt.pix_mp.width=64;ctx.decoded_fmt.fmt.pix_mp.height=64;
  ctx.decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline=64;
