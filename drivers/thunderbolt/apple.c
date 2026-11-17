@@ -171,6 +171,8 @@ struct apple_cio_hw {
 	bool gen4_link_recovery;
 	/* Leave the host router's TMU to its firmware; host TMU constants. */
 	bool host_tmu;
+	/* Drain PSD runtime power-off before the PHY is reset or reused. */
+	bool psd_power_cycle;
 	const struct apple_dpin_policy *dp;
 };
 
@@ -204,6 +206,17 @@ static const struct apple_cio_hw apple_cio_t8132_hw = {
 	.strict_fw_ready = true,
 	.no_host_clx = true,
 	.dp = &apple_dpin_m4,
+};
+
+/* MXWrap-v2p3 is started by reconfiguration, using its counted mailbox. */
+static const struct apple_cio_hw apple_cio_t8152_hw = {
+	.psd_power_cycle = true,
+	.type7 = true,
+	.lstx_after_boot = true,
+	.strict_fw_ready = true,
+	.no_host_clx = true,
+	.no_asym = true,
+	.dp = &apple_dpin_disabled,
 };
 
 /* Type 7 uses its existing ready-state check and has no qualified DP route. */
@@ -1305,7 +1318,8 @@ static void apple_cio_of_node_put(void *data)
 
 static bool apple_cio_pciec_eligible(const struct device_node *np)
 {
-	return of_device_is_compatible(np, "apple,t6040-pciec") ||
+	return of_device_is_compatible(np, "apple,t8152-pciec") ||
+	       of_device_is_compatible(np, "apple,t6040-pciec") ||
 	       of_device_is_compatible(np, "apple,t8103-pciec") ||
 	       of_device_is_compatible(np, "apple,t6000-pciec") ||
 	       of_device_is_compatible(np, "apple,t6050-pciec");
@@ -2591,7 +2605,8 @@ static int apple_nhi_probe(struct platform_device *pdev)
 
 	/* The T6050 router is the Type 7 one released by a RUN store. */
 	if (acio->type7 !=
-	    (of_device_is_compatible(pdev->dev.of_node, "apple,t8142-usb4-nhi") ||
+	    (of_device_is_compatible(pdev->dev.of_node, "apple,t8152-usb4-nhi") ||
+	     of_device_is_compatible(pdev->dev.of_node, "apple,t8142-usb4-nhi") ||
 	     of_device_is_compatible(pdev->dev.of_node, "apple,t6040-usb4-nhi") ||
 	     of_device_is_compatible(pdev->dev.of_node, "apple,t6050-usb4-nhi")) ||
 	    acio->hw->run_store !=
@@ -3091,6 +3106,7 @@ static const struct of_device_id apple_nhi_match[] = {
 	{
 		.compatible = "apple,t6050-usb4-nhi",
 	},
+	{ .compatible = "apple,t8152-usb4-nhi" },
 	{
 		.compatible = "apple,t8142-usb4-nhi",
 	},
@@ -3301,6 +3317,26 @@ static void apple_cio_test_log_guards(struct apple_cio *acio)
 	dev_info(acio->dev, "TEST sv6t7: ACIO stop, its domain links go next: PS_PROT%s\n", buf);
 }
 
+static void apple_cio_release_domains(struct apple_cio *acio)
+{
+	int n, i, ret;
+
+	for (n = 0; n < acio->pd_list->num_pds; n++) {
+		i = acio->hw->psd_power_cycle ? acio->pd_list->num_pds - 1 - n : n;
+		dev_pm_syscore_device(acio->pd_list->pd_devs[i], false);
+		if (!acio->pd_list->pd_links[i])
+			continue;
+		device_link_del(acio->pd_list->pd_links[i]);
+		acio->pd_list->pd_links[i] = NULL;
+		if (!acio->hw->psd_power_cycle)
+			continue;
+		/* Link removal only queues idle; finish it before returning. */
+		ret = pm_runtime_suspend(acio->pd_list->pd_devs[i]);
+		if (ret < 0)
+			dev_warn(acio->dev, "PSD domain %d failed to suspend: %d\n", i, ret);
+	}
+}
+
 /**
  * apple_cio_stop - Stop and power down the ACIO complex
  * @acio: ACIO complex to stop
@@ -3311,7 +3347,7 @@ static void apple_cio_test_log_guards(struct apple_cio *acio)
  */
 static void apple_cio_stop(struct apple_cio *acio)
 {
-	int ret, i;
+	int ret;
 
 	lockdep_assert_held(&acio->lock);
 	if (!acio->current_cable_info)
@@ -3336,12 +3372,7 @@ static void apple_cio_stop(struct apple_cio *acio)
 	apple_cio_test_log_guards(acio);
 
 	/* Finally, remove the links to the PD domains to power everything off */
-	for (i = 0; i < acio->pd_list->num_pds; i++) {
-		if (acio->pd_list->pd_links[i])
-			device_link_del(acio->pd_list->pd_links[i]);
-		acio->pd_list->pd_links[i] = NULL;
-		dev_pm_syscore_device(acio->pd_list->pd_devs[i], false);
-	}
+	apple_cio_release_domains(acio);
 
 	acio->current_cable_info = 0;
 	acio->resume_link_failed = false;
@@ -3602,12 +3633,7 @@ remove_links:
 	acio->rtk = NULL;
 	apple_cio_cpu_halt(acio);
 	/* Cut power to reset the entire block  */
-	for (i = 0; i < acio->pd_list->num_pds; i++) {
-		if (acio->pd_list->pd_links[i])
-			device_link_del(acio->pd_list->pd_links[i]);
-		acio->pd_list->pd_links[i] = NULL;
-		dev_pm_syscore_device(acio->pd_list->pd_devs[i], false);
-	}
+	apple_cio_release_domains(acio);
 	return ret;
 }
 
@@ -4759,6 +4785,7 @@ static const struct of_device_id apple_acio_match[] = {
 		.compatible = "apple,t6050-usb4-acio",
 		.data = &apple_cio_t6050_hw,
 	},
+	{ .compatible = "apple,t8152-usb4-acio", .data = &apple_cio_t8152_hw },
 	{
 		.compatible = "apple,t8142-usb4-acio",
 		.data = &apple_cio_t8142_hw,
