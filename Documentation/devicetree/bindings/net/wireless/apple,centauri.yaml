@@ -17,11 +17,18 @@ description: |
   bootstrap. This binding does not authorize adopting an existing live
   firmware session or releasing another owner's retained DART streams.
 
+  T8142 uses its board-selected firmware and platform ID instead of the
+  firmware properties supplied to the T6050 control driver.
+
 properties:
   compatible:
-    enum:
-      - pci106b,1900
-      - pci106b,1901
+    oneOf:
+      - enum:
+          - pci106b,1900
+          - pci106b,1901
+      - items:
+          - const: apple,t8142-centauri-control
+          - const: pci106b,1900
 
   reg:
     maxItems: 1
@@ -43,8 +50,18 @@ properties:
 required:
   - compatible
   - reg
-  - firmware-name
-  - apple,centauri-platform-id
-  - apple,centauri-protocol
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              const: apple,t8142-centauri-control
+    then:
+      required:
+        - firmware-name
+        - apple,centauri-platform-id
+        - apple,centauri-protocol
 
 additionalProperties: false
