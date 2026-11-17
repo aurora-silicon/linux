@@ -340,6 +340,19 @@ static bool t6050_v27_retained_display_word(struct apple_sleep *s, u32 word)
 }
 
 
+/*
+ * The SEP's domain is under automatic power: the hardware raises it when the enclave is used,
+ * and a forced raise at the wake does not take. Whatever the snapshot caught it doing, its word
+ * goes back under automatic power without a wait (sleep_ps_restore()'s path for a word off
+ * under AUTO_ENABLE), rather than waiting for a state the hardware gives only on demand.
+ */
+static u32 t6050_replay_saved(struct apple_sleep *s, u32 word, u32 saved)
+{
+	if (s->soc->ps.sep && word == s->soc->ps.sep && (saved & PS_AUTO_ENABLE))
+		return saved & ~PS_ACTUAL;
+	return saved;
+}
+
 static void sleep_region_replay(struct apple_sleep *s)
 {
 	const struct apple_sleep_region_profile *p = s->soc->regions;
@@ -400,7 +413,8 @@ static void sleep_region_replay(struct apple_sleep *s)
 		if ((test_bit(n, r->driver_down) || test_bit(n, r->manager_down)) || !FIELD_GET(PS_TARGET, r->saved[n]))
 			continue;
 		s->ps_rewoken++;
-		r->late[n] = !!sleep_ps_restore(sleep_region_reg(s, p->power.offset[n]), r->saved[n]);
+		r->late[n] = !!sleep_ps_restore(sleep_region_reg(s, p->power.offset[n]),
+				t6050_replay_saved(s, p->power.offset[n], r->saved[n]));
 	}
 	for (pass = 0; pass < PS_REWAKE_PASSES; pass++)
 		for (i = 0; i < p->power.count; i++) {
@@ -417,7 +431,8 @@ static void sleep_region_replay(struct apple_sleep *s)
 			if (!r->done[i])
 				s->ps_rewoken++;
 			r->done[i] = true;
-			r->late[i] = !!sleep_ps_restore(sleep_region_reg(s, p->power.offset[i]), r->saved[i]);
+			r->late[i] = !!sleep_ps_restore(sleep_region_reg(s, p->power.offset[i]),
+				t6050_replay_saved(s, p->power.offset[i], r->saved[i]));
 		}
 	for (i = 0; i < p->power.count; i++)
 		s->ps_rewake_timeouts += r->late[i];
