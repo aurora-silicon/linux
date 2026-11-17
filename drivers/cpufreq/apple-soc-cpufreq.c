@@ -1033,7 +1033,22 @@ static int apple_soc_cpufreq_find_cluster(struct cpufreq_policy *policy,
 
 	*info = match->data;
 
-	*reg_base = of_iomap(args.np, 0);
+	/*
+	 * TEST-ONLY (CPUBENCH 11-17, not for merge): map the cluster-local APSC
+	 * block on a production DTB whose resource is still 0x1000 long.
+	 */
+	if (experimental_apsc_sync && (*info)->apsc_state_stride) {
+		struct resource res;
+
+		if (of_address_to_resource(args.np, 0, &res)) {
+			of_node_put(args.np);
+			return -ENODEV;
+		}
+		*reg_base = ioremap(res.start, max_t(resource_size_t,
+						     resource_size(&res), 0x60000));
+	} else {
+		*reg_base = of_iomap(args.np, 0);
+	}
 	if (!*reg_base) {
 		of_node_put(args.np);
 		return -ENOMEM;
