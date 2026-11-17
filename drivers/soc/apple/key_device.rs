@@ -22,14 +22,9 @@ unsafe impl kernel::transmute::FromBytes for Cancel {}
 const IOC_CANCEL: u32 = kernel::ioctl::_IOW::<Cancel>(crate::key::MAGIC, 0x48);
 
 /// Whether the authorization-context requests are offered: opted in by
-/// `key_context_api`, on the 13.5 key store with per-user bags.
+/// `key_context_api`, on a key store with per-user bags (13.5 or variant 5).
 pub(crate) fn contexts_supported(sep: &SepData) -> bool {
-    crate::module_parameters::key_context_api.value() != 0
-        && sep.profile.per_user_keybags
-        && matches!(
-            sep.profile.key_store,
-            crate::profile::KeyStore::Sepos13 { .. }
-        )
+    crate::module_parameters::key_context_api.value() != 0 && sep.profile.per_user_keybags
 }
 
 enum Operation {

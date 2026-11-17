@@ -3827,7 +3827,7 @@ module! {
         },
         key_context_api: u8 {
             default: 0,
-            description: "Enable the authorization-context requests on /dev/sep-key (SEP_KEY_CTX_*, a design draft; 13.5 key store with per-user bags)",
+            description: "Enable the authorization-context requests on /dev/sep-key (SEP_KEY_CTX_*, a design draft; key stores with per-user bags)",
         },
         key_selftest: u8 {
             default: 0,

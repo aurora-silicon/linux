@@ -1290,9 +1290,13 @@ impl crate::SepData {
         self.user_bags.lock().track_designated(user.special_handle().value())
     }
 
-    /// A lock of `user`'s bag (variant 5): its Touch ID preparation ends
-    /// before the store is asked, whatever it answers.
+    /// A lock of `user`'s bag (variant 5): its contexts and its Touch ID
+    /// preparation end before the store is asked, whatever it answers.
     fn userbag_end_touch(&self, user: crate::sks::DesignateUser) {
+        // Retained matches for this bag's keys end with the lock.
+        if let Some(uid) = u32::try_from(-user.special_handle().value()).ok().and_then(|id| id.checked_sub(USER_BAG_BASE)) {
+            self.revoke_bag_contexts(uid);
+        }
         let touch = self.user_bags.lock().entry(user.special_handle().value()).and_then(|e| e.touch.take());
         if let Some(t) = touch {
             self.userbag_dispose_touch(t);
@@ -1656,8 +1660,8 @@ impl crate::SepData {
             }
             return self.userbag_lock_13(user, 0);
         }
-        // Variant 5: this bag's Touch ID ends with any lock, including one
-        // with a grace period.
+        // Variant 5: this bag's contexts and Touch ID end with any lock,
+        // including one with a grace period.
         self.userbag_end_touch(user);
         if immediate {
             let handle = user.special_handle().value();

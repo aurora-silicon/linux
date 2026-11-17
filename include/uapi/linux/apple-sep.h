@@ -418,7 +418,8 @@ struct sep_key_unseal_password {
 
 /*
  * Authorization contexts (SEP_KEY_FEATURE_CONTEXTS; module parameter
- * key_context_api=1, 13.5 key store). DESIGN DRAFT, not a stable ABI.
+ * key_context_api=1, a key store with per-user bags). DESIGN DRAFT, not a
+ * stable ABI.
  *
  * One authentication (a Touch ID match in the bag user's own domain, or the
  * bag's password checked by the enclave) authorizes a bounded run of
