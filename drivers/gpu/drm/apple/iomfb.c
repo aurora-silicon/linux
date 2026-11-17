@@ -701,6 +701,7 @@ static void iomfb_callback_work(struct work_struct *work)
 }
 
 static void iomfb_keepalive_work(struct work_struct *work);
+static void iomfb_reswap_kick(struct apple_dcp *dcp);
 
 void iomfb_queue_init(struct apple_dcp *dcp)
 {

@@ -773,8 +773,10 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 {
 	ktime_t now = ktime_get();
 	trace_iomfb_swap_complete(dcp, resp->swap_id);
+#if (DCP_FW_H17(DCP_FW_VER) && !DCP_FW_DESKTOP_26(DCP_FW_VER))
 	trace_iomfb_swap_displayed(dcp, resp->swap_id, resp->displayed_data,
 				   resp->notify_displayed, resp->completion_flag);
+#endif
 #if DCP_FW_H17(DCP_FW_VER) && !DCP_FW_DESKTOP_26(DCP_FW_VER)
 	dcp_swap_complete_dbg(dcp, resp, now);
 #endif
