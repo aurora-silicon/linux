@@ -583,7 +583,7 @@ impl Backend {
             packet.set_early_result(Err(ECANCELED));
             return true;
         }
-        let mut deferred = match DeferredBatch::publication() {
+        let mut deferred = match self.publication_batch() {
             Ok(deferred) => deferred,
             Err(error) => {
                 if packet.completion.status().get() != 0 {
