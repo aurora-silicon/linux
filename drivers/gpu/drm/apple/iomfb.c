@@ -3721,71 +3721,6 @@ static void iomfb_keepalive_start(struct apple_dcp *dcp,
 	iomfb_present_keepalive_v27(dcp);
 }
 
-/*
- * Lab knob: after an atomic swap completes with nothing queued, submit the
- * same full request again as REAL swaps (new swap_id each, no flip event),
- * up to dcp_reswap times. An idle 27.3 pipeline holds the last two frames off
- * the glass until two more swaps arrive; the repeats advance it.
- */
-static void iomfb_reswap_start(struct apple_dcp *dcp,
-			       struct iomfb_transaction *transaction)
-{
-	struct iomfb_atomic_transaction *atomic =
-		container_of(transaction, struct iomfb_atomic_transaction,
-			     transaction);
-	struct iomfb_scanout_h17p *scanout = dcp->iomfb.scanout;
-
-	lockdep_assert_held(&dcp->iomfb.lock);
-	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0 || !scanout || !scanout->fb[0])
-		return;
-	atomic->scanout = scanout;
-	atomic->crtc = NULL;
-	atomic->state = NULL;
-	for (unsigned int i = 0; i < SWAP_SURFACES; i++)
-		if (scanout->fb[i])
-			drm_framebuffer_get(scanout->fb[i]);
-	dcp->iomfb.next_scanout = scanout;
-	iomfb_flush_v27(dcp, NULL, NULL);
-}
-
-static void iomfb_reswap_release(struct iomfb_transaction *transaction)
-{
-	struct iomfb_atomic_transaction *atomic =
-		container_of(transaction, struct iomfb_atomic_transaction,
-			     transaction);
-
-	iomfb_scanout_put_h17p(atomic->dcp, atomic->scanout);
-	kfree(atomic);
-}
-
-static void iomfb_reswap_kick(struct apple_dcp *dcp)
-{
-	struct iomfb_atomic_transaction *atomic;
-	unsigned int n;
-
-	lockdep_assert_held(&dcp->iomfb.lock);
-	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0)
-		return;
-	n = READ_ONCE(dcp_reswap);
-	if (!n || dcp->iomfb.reswaps >= n)
-		return;
-	if (!dcp->iomfb.scanout || !dcp->iomfb.scanout->fb[0])
-		return;
-	if (!list_empty(&dcp->iomfb.pending) || dcp->iomfb.queued)
-		return;
-	atomic = kzalloc(sizeof(*atomic), GFP_KERNEL);
-	if (!atomic)
-		return;
-	atomic->dcp = dcp;
-	atomic->transaction.start = iomfb_reswap_start;
-	atomic->transaction.release = iomfb_reswap_release;
-	if (iomfb_queue(dcp, &atomic->transaction)) {
-		kfree(atomic);
-		return;
-	}
-	dcp->iomfb.reswaps++;
-}
-
 static void iomfb_keepalive_work(struct work_struct *work)
 {
 	struct apple_dcp *dcp = container_of(to_delayed_work(work), struct apple_dcp,
@@ -3855,6 +3790,59 @@ static void iomfb_atomic_release(struct iomfb_transaction *transaction)
 	drm_atomic_commit_put(atomic->state);
 	kfree(atomic);
 }
+
+/*
+ * Lab knob: after an atomic swap completes with nothing queued, submit the
+ * same full request again as REAL swaps (new swap_id each, no flip event),
+ * up to dcp_reswap times. An idle 27.3 pipeline holds the last two frames off
+ * the glass until two more swaps arrive; the repeats advance it. The repeat
+ * reuses the flush tail's submit path (do_swap): same pending request slot,
+ * fresh timestamps, full swap_start + swap_submit, no atomic state, no
+ * scanout pointer moves, so there is no lifetime question at all.
+ */
+static void do_swap(struct apple_dcp *dcp, void *data, void *cookie);
+
+static void iomfb_reswap_start(struct apple_dcp *dcp,
+			       struct iomfb_transaction *transaction)
+{
+	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0 || !iomfb_scanout_presentable(dcp))
+		return;
+
+	do_swap(dcp, NULL, NULL);
+}
+
+static void iomfb_reswap_release(struct iomfb_transaction *transaction)
+{
+	kfree(transaction);
+}
+
+static void iomfb_reswap_kick(struct apple_dcp *dcp)
+{
+	struct iomfb_transaction *transaction;
+	unsigned int n;
+
+	lockdep_assert_held(&dcp->iomfb.lock);
+	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0)
+		return;
+	n = READ_ONCE(dcp_reswap);
+	if (!n || dcp->iomfb.reswaps >= n)
+		return;
+	if (!iomfb_scanout_presentable(dcp))
+		return;
+	if (!list_empty(&dcp->iomfb.pending) || dcp->iomfb.queued)
+		return;
+	transaction = kzalloc(sizeof(*transaction), GFP_KERNEL);
+	if (!transaction)
+		return;
+	transaction->start = iomfb_reswap_start;
+	transaction->release = iomfb_reswap_release;
+	if (iomfb_queue(dcp, transaction)) {
+		kfree(transaction);
+		return;
+	}
+	dcp->iomfb.reswaps++;
+}
+
 
 static void iomfb_queue_atomic(struct apple_dcp *dcp, struct drm_crtc *crtc,
 			       struct drm_atomic_commit *state)
