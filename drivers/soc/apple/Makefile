@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
+obj-$(CONFIG_APPLE_J613_DISPLAY_SYNC) += j613-display.o
+
 obj-$(CONFIG_APPLE_DBGVIEW) += apple-dbgview.o
 apple-dbgview-y = dbgview.o
 

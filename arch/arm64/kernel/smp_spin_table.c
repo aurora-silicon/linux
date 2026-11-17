@@ -162,6 +162,8 @@ static u32 spin_table_hold_generation, spin_table_held_generation[NR_CPUS];
 static bool spin_table_hold_requested;
 static bool spin_table_stop_requested;
 static bool spin_table_stop_released;
+/* Stopped CPUs released to their last WFI ahead of the others: spin_table_release_cpus() */
+static struct cpumask spin_table_cpus_early;
 
 #define SPIN_TABLE_WAIT_US	100000
 
@@ -265,6 +267,23 @@ int spin_table_stop_parked(void)
 	return -ETIMEDOUT;
 }
 
+/*
+ * At the commit, after spin_table_stop_parked(): the stopped CPUs in @cpus take their last WFI
+ * now, ahead of the others, which wait for spin_table_release_stopped().
+ */
+void spin_table_release_cpus(const struct cpumask *cpus)
+{
+	cpumask_or(&spin_table_cpus_early, &spin_table_cpus_early, cpus);
+	dsb(ish);
+	sev();
+}
+
+/* CPUs already tracked off will not execute another sleep CPU-off callback. */
+bool spin_table_cpu_tracked_off(unsigned int cpu)
+{
+	return cpumask_test_cpu(cpu, &spin_table_cpus_off);
+}
+
 /* After the commit: the stopped CPUs take their last WFI. */
 void spin_table_release_stopped(void)
 {
@@ -282,6 +301,7 @@ void spin_table_stop_finished(void)
 	WRITE_ONCE(spin_table_hold_requested, false);
 	WRITE_ONCE(spin_table_stop_requested, false);
 	WRITE_ONCE(spin_table_stop_released, false);
+	cpumask_clear(&spin_table_cpus_early);
 	cpumask_or(&spin_table_cpus_off, &spin_table_cpus_off, &spin_table_cpus_parked);
 	cpumask_clear(&spin_table_cpus_parked);
 	cpumask_clear(&spin_table_cpus_held);
@@ -363,7 +383,8 @@ static void smp_rvbar_spin_table_hold(unsigned int cpu, u64 mpidr)
 			cpumask_clear_cpu(cpu, &spin_table_cpus_held);
 			cpumask_clear_cpu(cpu, &spin_table_cpus_parked);
 
-			while (!READ_ONCE(spin_table_stop_released))
+			while (!READ_ONCE(spin_table_stop_released) &&
+			       !cpumask_test_cpu(cpu, &spin_table_cpus_early))
 				wfe();
 			spin_table_power->cpu_off(mpidr);
 		}

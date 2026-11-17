@@ -317,6 +317,11 @@ impl Gate {
         }
     }
 
+    /// A canceled sleep may only retry its own temporary closed epoch.
+    pub(super) fn closed_and_recoverable(&self) -> bool {
+        self.state.load(Ordering::Acquire) & (CLOSED | FAILED | REMOVED) == CLOSED
+    }
+
     /// Reopen only an empty, temporary closure. Failed or removed devices remain closed.
     pub(super) fn reopen(&self) -> bool {
         let wait = self.wait.lock();
