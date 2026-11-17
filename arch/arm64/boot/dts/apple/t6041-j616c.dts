@@ -61,3 +61,21 @@
 &mesa {
 	firmware-name = "apple/mesacal-j616c.bin", "apple/msrk-j616c.bin";
 };
+
+/* The port controllers take system power state S3 for a firmware suspend, as macOS sends it. */
+&hpm0 {
+	apple,sleep-ssps;
+};
+
+&hpm1 {
+	apple,sleep-ssps;
+};
+
+&hpm2 {
+	apple,sleep-ssps;
+};
+
+/* MagSafe's controller follows the sleep too. */
+&hpm5 {
+	apple,sleep-ssps;
+};
