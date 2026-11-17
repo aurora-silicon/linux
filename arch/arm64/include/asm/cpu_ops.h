@@ -79,6 +79,7 @@ void spin_table_release_stopped(void);
 void spin_table_release_cpus(const struct cpumask *cpus);
 void spin_table_stop_finished(void);
 bool spin_table_cpus_stuck(void);
+bool spin_table_cpu_tracked_off(unsigned int cpu);
 #else
 static inline int spin_table_hold_parked(void)
 {
@@ -99,6 +100,11 @@ static inline void spin_table_stop_finished(void) {}
 static inline int spin_table_set_power_ops(const struct spin_table_power_ops *ops)
 {
 	return -EOPNOTSUPP;
+}
+
+static inline bool spin_table_cpu_tracked_off(unsigned int cpu)
+{
+	return false;
 }
 
 static inline bool spin_table_cpus_stuck(void)
