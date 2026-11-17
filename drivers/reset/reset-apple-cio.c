@@ -200,6 +200,31 @@ static int t8142_cio_deassert(struct apple_cio_reset *priv, unsigned long id)
 				       APPLE_CIO_RESET_TIMEOUT_US);
 }
 
+static int t8152_cio_deassert(struct apple_cio_reset *priv, unsigned long id)
+{
+	u32 val, busy = id < 2 ? 3 : 12;
+	int ret;
+
+	guard(mutex)(&priv->lock);
+	ret = regmap_read_poll_timeout(priv->regmap, 0x68, val,
+				       !(val & busy), 10, 192000);
+	if (ret)
+		return ret;
+	ret = regmap_write(priv->regmap, 0x68, BIT(id));
+	if (ret)
+		return ret;
+	ret = regmap_read_poll_timeout(priv->regmap, 0x6c, val,
+				       val & BIT(id), 10, 192000);
+	if (ret)
+		return ret;
+	return regmap_write(priv->regmap, 0x6c, BIT(id));
+}
+
+static const struct apple_cio_reset_variant apple_t8152_cio_reset = {
+	.nr_resets = 4,
+	.deassert = t8152_cio_deassert,
+};
+
 static const struct apple_cio_reset_variant apple_t8142_cio_reset = {
 	.nr_resets = 4,
 	.ctrl = T8142_CIO_CTRL,
@@ -330,6 +355,7 @@ static int apple_cio_reset_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_cio_reset_match[] = {
+	{ .compatible = "apple,t8152-cio-reset", .data = &apple_t8152_cio_reset },
 	{
 		.compatible = "apple,t6050-cio-reset",
 		.data = &apple_t6050_cio_reset,
