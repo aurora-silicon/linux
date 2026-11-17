@@ -200,6 +200,8 @@ struct avd_vp9_bank {
 	struct avd_vp9_frame_info cur;
 	struct avd_vp9_frame_info last;
 	u8 submit_num;
+	/* The seg buffer holds a map laid out for another frame size. */
+	bool seg_clear;
 };
 
 struct avd_vp9_ctx {
@@ -208,6 +210,8 @@ struct avd_vp9_ctx {
 	unsigned int nbanks;
 	struct avd_vp9_bank bank[AVD_VP9_BANKS];
 	struct avd_vp9_bank *b;
+	/* The size changed, and no frame has updated the segmentation map since. */
+	bool seg_reset;
 };
 
 static bool avd_vp9_needs_counts(u32 flags)
@@ -347,6 +351,7 @@ static u32 make_flags1(struct avd_ctx *ctx, struct avd_vp9_run *run)
 	flags |= VP9_SEG_RESET(
 		frame->seg.flags & V4L2_VP9_SEGMENTATION_FLAG_ENABLED &&
 		(frame->flags & V4L2_VP9_FRAME_FLAG_KEY_FRAME ||
+		 vp9_ctx->seg_reset ||
 		 (vp9_ctx->last.valid &&
 		  !(vp9_ctx->last.seg.flags &
 		    V4L2_VP9_SEGMENTATION_FLAG_ENABLED) &&
@@ -593,6 +598,14 @@ static void update_ctx_cur_info(struct avd_vp9_ctx *vp9_ctx,
 static void update_ctx_last_info(struct avd_vp9_ctx *vp9_ctx)
 {
 	vp9_ctx->last = vp9_ctx->b->cur;
+	/*
+	 * The decoder does not carry a reset map forward: a frame that keeps the
+	 * map after one with VP9_SEG_RESET reads the old map again. So the reset
+	 * stays until a frame has written a new map.
+	 */
+	if ((vp9_ctx->last.seg.flags & V4L2_VP9_SEGMENTATION_FLAG_ENABLED) &&
+	    (vp9_ctx->last.seg.flags & V4L2_VP9_SEGMENTATION_FLAG_UPDATE_MAP))
+		vp9_ctx->seg_reset = false;
 }
 
 static void copy_vp9_frame_mv(struct avd_vp9_probs *avd_probs,
@@ -907,6 +920,24 @@ static int avd_vp9_run_preamble(struct avd_ctx *ctx, struct avd_vp9_run *run)
 		bank->last = vp9_ctx->last;
 		vb2_to_avd_decoded_buf(&run->base.bufs.dst->vb2_buf)->bank =
 			bank - vp9_ctx->bank + 1;
+	}
+
+	/*
+	 * VP9 clears the segmentation map when the frame size changes, and the
+	 * decoder carries part of it over in the seg buffer. Every bank's buffer
+	 * holds the old map, but a busy bank's belongs to the hardware until the
+	 * frame retires: clear each bank's when it is next taken. The map reset
+	 * goes to every frame that uses segmentation until one updates the map
+	 * (make_flags1(), update_ctx_last_info()).
+	 */
+	if (vp9_ctx->last.valid && !avd_vp9_same_size(dec_params, &vp9_ctx->last)) {
+		for (unsigned int i = 0; i < vp9_ctx->nbanks; i++)
+			vp9_ctx->bank[i].seg_clear = true;
+		vp9_ctx->seg_reset = true;
+	}
+	if (vp9_ctx->b->seg_clear) {
+		memset(vp9_ctx->b->bufs.seg.cpu, 0, vp9_ctx->b->bufs.seg.size);
+		vp9_ctx->b->seg_clear = false;
 	}
 
 	vp9_ctx->b->cur.tx_mode = run->prob_updates->tx_mode;

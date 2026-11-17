@@ -253,6 +253,40 @@ int main(int argc,char **argv) {
   for(size_t j=0;j<frame.prog_words;j++){assert(words[j]!=0x30004000);if(words[j]==0x40003000)scale=true;}
   assert(scale);}
  reference.vp9.width=1920;avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);
+ /* Only a frame size change clears the segmentation state in the seg buffers: each bank's
+  * when it is next taken (a busy one belongs to the hardware), and VP9_SEG_RESET goes to the
+  * first frame that uses segmentation after the change. */
+ for(unsigned int i=0;i<p->nbanks;i++)memset(p->bank[i].bufs.seg.cpu,0xa5,p->bank[i].bufs.seg.size);
+ /* Frame A writes a map, so no reset is owed from the earlier size changes. */
+ params.seg.flags=V4L2_VP9_SEGMENTATION_FLAG_ENABLED|V4L2_VP9_SEGMENTATION_FLAG_UPDATE_MAP;
+ current_dst=&dst[0].base.vb;frame.idx=0;assert(!avd_vp9_run(&ctx));
+ assert(p->b==&p->bank[0]&&((u8 *)p->bank[0].bufs.seg.cpu)[0]==0xa5&&!p->seg_reset);
+ /* Bank 0 stays busy; the next frame is smaller and has no segmentation. */
+ params.seg.flags=0;params.frame_width_minus_1=1899;params.frame_height_minus_1=1079;
+ current_dst=&dst[1].base.vb;frame.idx=1;assert(!avd_vp9_run(&ctx));
+ assert(p->b==&p->bank[1]&&p->seg_reset&&p->bank[0].seg_clear&&!p->bank[1].seg_clear);
+ {u8 *seg=p->bank[1].bufs.seg.cpu;for(size_t j=0;j<p->bank[1].bufs.seg.size;j++)assert(!seg[j]);}
+ assert(((u8 *)p->bank[0].bufs.seg.cpu)[0]==0xa5);
+ avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);
+ avd_vp9_done(&ctx,&src,&dst[1].base.vb,VB2_BUF_STATE_DONE);
+ /* Same size again, segmentation on without a map update: the reset is still owed, and it stays
+  * owed after that frame, as the decoder would read the old map again. */
+ params.seg.flags=V4L2_VP9_SEGMENTATION_FLAG_ENABLED;current_dst=&dst[0].base.vb;
+ {struct avd_vp9_run r={.decode_params=&params};r.base.bufs.dst=current_dst;
+  assert(make_flags1(&ctx,&r)&VP9_SEG_RESET(1));}
+ frame.idx=0;assert(!avd_vp9_run(&ctx));
+ assert(p->b==&p->bank[0]&&!p->bank[0].seg_clear&&p->seg_reset);
+ {u8 *seg=p->bank[0].bufs.seg.cpu;for(size_t j=0;j<p->bank[0].bufs.seg.size;j++)assert(!seg[j]);}
+ avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);
+ /* The next frame updates the map: it still gets the reset, and after it the reset is gone. */
+ params.seg.flags=V4L2_VP9_SEGMENTATION_FLAG_ENABLED|V4L2_VP9_SEGMENTATION_FLAG_UPDATE_MAP;
+ current_dst=&dst[1].base.vb;
+ {struct avd_vp9_run r={.decode_params=&params};r.base.bufs.dst=current_dst;
+  assert(make_flags1(&ctx,&r)&VP9_SEG_RESET(1));}
+ frame.idx=1;assert(!avd_vp9_run(&ctx));assert(!p->seg_reset);
+ {struct avd_vp9_run r={.decode_params=&params};r.base.bufs.dst=current_dst;
+  assert(!(make_flags1(&ctx,&r)&VP9_SEG_RESET(1)));}
+ avd_vp9_done(&ctx,&src,&dst[1].base.vb,VB2_BUF_STATE_DONE);params.seg.flags=0;
  /* The firmware transport keeps the 64-pixel floor. */
  ctx.decoded_fmt.fmt.pix_mp.width=64;ctx.decoded_fmt.fmt.pix_mp.height=64;
  ctx.decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline=64;
