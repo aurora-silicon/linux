@@ -681,6 +681,14 @@ unsupported:
 			dptx->phy_ops.dp.link_rate = phy_link_rate;
 			dptx->phy_ops.dp.set_rate = 1;
 			ret = phy_configure(dptx->atcphy, &dptx->phy_ops);
+			/*
+			 * A dcpext takes its link down (rate 0) when its HPD goes
+			 * low, and its ATC PHY may have left DP mode already: the
+			 * link is down then. Refused, the firmware waits on this
+			 * call and answers nothing else, the HPD low among them.
+			 */
+			if (ret == -EOPNOTSUPP && !phy_link_rate)
+				ret = 0;
 			if (ret)
 				return ret;
 		}
