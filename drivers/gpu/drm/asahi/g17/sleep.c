@@ -46,12 +46,13 @@
 #define ASC_CPU_CONTROL		0x44
 #define ASC_CPU_CONTROL_RUN	BIT(4)
 
-/* Only the supported M5 board needs a wrapped provider translation here.
- * Other G17 clients retain their established direct-domain methods below.
+/* Only the M5 boards with a deep sleep need a wrapped provider translation here: the J714s
+ * and the J716c. Other G17 clients retain their established direct-domain methods below.
  */
 static bool asahi_g17_m5_provider(struct device *dev)
 {
-	return of_machine_is_compatible("apple,j714s") &&
+	return (of_machine_is_compatible("apple,j714s") ||
+		of_machine_is_compatible("apple,j716c")) &&
 	       of_machine_is_compatible("apple,t6050") &&
 	       of_device_is_compatible(dev->of_node, "apple,agx-g17s");
 }
