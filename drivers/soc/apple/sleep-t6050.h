@@ -100,6 +100,9 @@ struct apple_sleep_region_state {
 	u32 late_saved[17], state4_saved[16], pmc154_lowered;
 	/* AUSS and the routers' CIO_AUSS words the entry lowered, and each as it read before */
 	u32 auss_lowered, auss_timeouts, auss_saved[5];
+	/* VENC0_SYS as it read before the entry lowered it, if it did */
+	u32 venc0_saved;
+	bool venc0_lowered;
 	/* The idle words the last refusal switched off and on again: their blocks' registers are at reset */
 	u32 refusal_cycled;
 	/* Type-C ports, by port index, whose always-on USB word the last entry left on. */
@@ -1650,6 +1653,7 @@ static int t6050_sleep_begin(struct apple_sleep *s)
 	r->committed = false;
 	r->early_done = false;
 	r->early_dropped = false;
+	r->venc0_lowered = false;
 	r->pmc_saved = false;
 	r->floor_changed = 0;
 	r->display_lowered = 0;
@@ -1845,7 +1849,7 @@ static const u8 t6050_disp_children[5][16] = {
 };
 static const u8 t6050_disp_nchildren[5] = { 16, 7, 7, 7, 7 };
 
-static void t6050_sleep_entry_lower(struct apple_sleep *s);
+static int t6050_sleep_entry_lower(struct apple_sleep *s);
 
 /*
  * Driver-provided readiness is required; never clear a running DCP's RUN bit. One set's words,
@@ -1948,8 +1952,7 @@ static int t6050_sleep_display_prepare(struct apple_sleep *s)
 	r->gate_saved[1] = readl(s->disp_gate + 0x540);
 	memset(r->disp_children_lowered, 0, sizeof(r->disp_children_lowered));
 	sleep_region_snapshot(s);
-	t6050_sleep_entry_lower(s);
-	return 0;
+	return t6050_sleep_entry_lower(s);
 }
 
 /*
@@ -2245,16 +2248,68 @@ static void t6050_auss_restore(struct apple_sleep *s)
 	r->auss_lowered = 0;
 }
 
-/* At the start of .enter, after the snapshot a refusal restores: the first lowerings and the state-4 caps. */
-static void t6050_sleep_entry_lower(struct apple_sleep *s)
+/*
+ * VENC0_SYS, the first video encoder's system word. On the J716c it reads 0x0f0003ff (on, no
+ * automatic state) at the commit, with no Linux user, while every other media word of the GPU
+ * die is off or under automatic power; and the entry's last phase waits for its power gate.
+ * It is lowered at the entry, after AUSS, and polled off: one that does not go off refuses the
+ * sleep. A refusal puts it back as it read before; after a sleep the snapshot's replay raises
+ * it again.
+ */
+#define T6050_VENC0_SYS	SLEEP_REGION_WORD(T6050_PS_MEDIA, 0x1c0)
+
+static int t6050_venc0_lower(struct apple_sleep *s)
+{
+	struct apple_sleep_region_state *r = s->region;
+	int ret;
+
+	r->venc0_lowered = false;
+	if (!s->soc->lower_venc0 || !t6050_late_word_on(s, T6050_VENC0_SYS))
+		return 0;
+	r->venc0_saved = readl(sleep_region_reg(s, T6050_VENC0_SYS));
+	sleep_ps_lower(s, T6050_VENC0_SYS);
+	r->venc0_lowered = true;
+	ret = sleep_ps_wait_off(s, T6050_VENC0_SYS);
+	if (ret) {
+		dev_warn(s->dev, "entry: VENC0_SYS %#x -> %#x, not off: refusing the sleep\n",
+			 r->venc0_saved, readl(sleep_region_reg(s, T6050_VENC0_SYS)));
+		return ret;
+	}
+	dev_info(s->dev, "entry: VENC0_SYS %#x -> %#x\n", r->venc0_saved,
+		 readl(sleep_region_reg(s, T6050_VENC0_SYS)));
+	return 0;
+}
+
+/* After a refusal: VENC0_SYS as it read before the entry lowered it */
+static void t6050_venc0_restore(struct apple_sleep *s)
+{
+	struct apple_sleep_region_state *r = s->region;
+
+	if (!r->venc0_lowered)
+		return;
+	if (sleep_ps_restore(sleep_region_reg(s, T6050_VENC0_SYS), r->venc0_saved))
+		dev_warn(s->dev, "refusal: VENC0_SYS not back: reads %#x, was %#x\n",
+			 readl(sleep_region_reg(s, T6050_VENC0_SYS)), r->venc0_saved);
+	r->venc0_lowered = false;
+}
+
+/*
+ * At the start of .enter, after the snapshot a refusal restores: the first lowerings and the
+ * state-4 caps. An error refuses the sleep; the refusal raises what was lowered.
+ */
+static int t6050_sleep_entry_lower(struct apple_sleep *s)
 {
 	struct apple_sleep_region_state *r = s->region;
 	unsigned int i;
+	int ret;
 
 	r->late_lowered = r->state4_set = r->late_timeouts = 0;
 	for (i = 0; i < T6050_LATE_ENTRY_END; i++)
 		t6050_late_lower(s, i);
 	t6050_auss_lower(s);
+	ret = t6050_venc0_lower(s);
+	if (ret)
+		return ret;
 	for (i = 0; i < ARRAY_SIZE(t6050_state4); i++) {
 		void __iomem *reg = sleep_region_reg(s, t6050_state4[i].word);
 		u32 val = readl(reg);
@@ -2273,6 +2328,7 @@ static void t6050_sleep_entry_lower(struct apple_sleep *s)
 		 r->auss_saved[i], readl(sleep_region_reg(s, t6050_auss_words[i])),
 		 r->auss_lowered, r->auss_timeouts,
 		 t6050_auss_off ? "" : ", t6050_auss_off=0");
+	return 0;
 }
 
 /*
@@ -3227,6 +3283,7 @@ static void t6050_sleep_refusal_raise(struct apple_sleep *s)
 		}
 	}
 	r->state4_set = 0;
+	t6050_venc0_restore(s);
 	/* AUSS and its children: between the caps and the idle words, as the entry had them */
 	t6050_auss_restore(s);
 	for (i = ARRAY_SIZE(t6050_late_off); i-- > 0;) {
@@ -3695,6 +3752,7 @@ static const struct apple_sleep_soc t6050_j716c_sleep_soc = {
 	.own_wake = true,
 	.pmp_unstarted = true,
 	.clusters_down_first = true,
+	.lower_venc0 = true,
 	.machine = "apple,j716c",
 	.spmi_notify_sleep = 0x2000001,
 	.boot_mpidr = 0x040000,

@@ -556,6 +556,8 @@ struct apple_sleep_soc {
 	 * commit, ahead of the boot cluster (t6050_clusters_down_first()).
 	 */
 	bool clusters_down_first;
+	/* T6050: the first video encoder's system word lowered at the entry */
+	bool lower_venc0;
 
 	/*
 	 * Only for a SoC that states its CPU topology, which the probe then checks: MPIDR's
