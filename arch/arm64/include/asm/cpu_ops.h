@@ -59,10 +59,16 @@ struct cpu_operations {
  * Each takes the CPU's MPIDR hardware ID.
  */
 struct spin_table_power_ops {
+	/* Optional reversible per-core preparation while held/coherent. */
+	int (*cpu_hold)(u64 mpidr);
+	/* Abort in held loop, or target core after reset/secondary boot. */
+	void (*cpu_restore)(u64 mpidr);
 	void	(*cpu_stop)(u64 mpidr);
 	void	(*cpu_off)(u64 mpidr);
 	int	(*cpu_on)(u64 mpidr);
 };
+
+struct cpumask;
 
 #ifdef CONFIG_HOTPLUG_CPU
 int spin_table_set_power_ops(const struct spin_table_power_ops *ops);
@@ -70,6 +76,7 @@ int spin_table_hold_parked(void);
 void spin_table_unhold_parked(void);
 int spin_table_stop_parked(void);
 void spin_table_release_stopped(void);
+void spin_table_release_cpus(const struct cpumask *cpus);
 void spin_table_stop_finished(void);
 bool spin_table_cpus_stuck(void);
 #else
@@ -86,6 +93,7 @@ static inline int spin_table_stop_parked(void)
 }
 
 static inline void spin_table_release_stopped(void) {}
+static inline void spin_table_release_cpus(const struct cpumask *cpus) {}
 static inline void spin_table_stop_finished(void) {}
 
 static inline int spin_table_set_power_ops(const struct spin_table_power_ops *ops)

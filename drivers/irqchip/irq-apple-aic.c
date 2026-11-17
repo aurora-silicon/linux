@@ -286,6 +286,8 @@ struct aic_info {
 	bool siq_cfg_routing;
 	/* A firmware-driven suspend powers the controller down: aic_syscore_ops keep it. */
 	bool fw_suspend;
+	/* If set, fw_suspend holds on this board only */
+	const char *fw_suspend_board;
 };
 
 static const struct aic_info aic1_info __initconst = {
@@ -332,6 +334,20 @@ static const struct aic_info aic3_info __initconst = {
 	.local_fast_ipi = true,
 };
 
+/*
+ * The M5 Pro's sleep: the last steps mask every interrupt and acknowledge events by hand. The
+ * save and restore are set up on the board the sleep has run on; another T6050 board is as
+ * one without them.
+ */
+static const struct aic_info aic3_t6050_info __initconst = {
+	.version = 3,
+	.irq_cfg = AIC3_IRQ_CFG,
+	.fast_ipi = true,
+	.local_fast_ipi = true,
+	.fw_suspend = true,
+	.fw_suspend_board = "apple,j714s",
+};
+
 static const struct aic_info aic3_t8140_info __initconst = {
 	.version = 3,
 	.irq_cfg = AIC3_IRQ_CFG,
@@ -358,6 +374,7 @@ static const struct aic_info aic3_t8142_info __initconst = {
 };
 
 static const struct of_device_id aic_info_match[] = {
+	{ .compatible = "apple,t6050-aic3", .data = &aic3_t6050_info },
 	{
 		.compatible = "apple,t8132-aic3",
 		.data = &aic3_t8132_info,
@@ -1256,7 +1273,9 @@ static struct syscore aic_syscore = {
 
 static void __init aic_sleep_init(struct aic_irq_chip *irqc)
 {
-	if (!irqc->info.fw_suspend)
+	if (!irqc->info.fw_suspend ||
+	    (irqc->info.fw_suspend_board &&
+	     !of_machine_is_compatible(irqc->info.fw_suspend_board)))
 		return;
 
 	aic_sleep.irq_cfg = kcalloc(irqc->nr_die * irqc->nr_irq, sizeof(u32), GFP_KERNEL);

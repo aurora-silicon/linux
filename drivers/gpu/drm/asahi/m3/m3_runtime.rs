@@ -295,11 +295,37 @@ impl Inner {
             self.config.pipe_free(0)? && self.config.pipe_free(1)?) {return Ok(None);}
         Ok(Some(room))
     }
+    /// Stop extending the pipeline before any stamp reaches zero. The final
+    /// active batch must pass poll_active's stamp/queue/event/pipe checks and
+    /// configured SoC MMIO checks before either epoch can change.
+    fn reseed_stamp_epochs(&mut self)->Result<bool> {
+        let reseed=self.jobs.iter().any(|job|match job {
+            NativeJob::Render(j)=>j.stamps_need_reseed(),
+            NativeJob::Compute(j)=>j.stamps_need_reseed(),
+        });
+        if !reseed {return Ok(true);}
+        if !self.active.is_empty() {return Ok(false);}
+        for job in &mut self.jobs {
+            match job {
+                NativeJob::Render(j) if j.stamps_need_reseed()=>j.reseed_stamps()?,
+                NativeJob::Compute(j) if j.stamps_need_reseed()=>j.reseed_stamps()?,
+                _=>{},
+            }
+        }
+        crate::m3::agx_memory::publish();
+        crate::mem::sync();
+        Ok(true)
+    }
     /// Publish pending batches while allowed: one when none is active, more behind it with
     /// asahi.m3_pipeline_depth > 1. Returns whether anything was published or failed.
     fn publish_next(&mut self)->bool {
         let mut progress=false;
         while !self.pending.is_empty() && self.state.healthy() {
+            match self.reseed_stamp_epochs() {
+                Ok(true)=>{},
+                Ok(false)=>break,
+                Err(error)=>{self.fail_active(error);return true;},
+            }
             let overlap=!self.active.is_empty();
             let (base,max)=match self.pipeline_slot() {
                 Ok(Some(slot))=>slot,

@@ -108,6 +108,10 @@ impl Backend {
             .close(&self.context, super::now_ns())?;
         firmware.queues.release_compute(self.owner)?;
         firmware.queues.release_render(self.owner)?;
+        // The armed release holds the owner's pairs from every other owner until it is
+        // consumed. Hold them before admission releases the owner: admission does not take
+        // the device mutex, so a slot released first could be taken in between.
+        firmware.queues.sync_render_holds();
         firmware.queues.admission.release_owner(self.owner);
         drop(state);
         // Its idle channel, or its slot and never-published QID, is free.
@@ -269,10 +273,12 @@ impl job::Backend for Backend {
     /// Compute and render admission wait for their shared capacity here, as a
     /// fence.
     fn prepare(&self, packet: &Arc<Packet>) -> Option<Fence> {
-        match packet.engine() {
+        let capacity = match packet.engine() {
             Engine::Compute => self.prepare_compute(packet),
             Engine::Render => self.admit_render(packet),
-        }
+        };
+        // Capacity first: a command is held for ray-traversal work only once it could run.
+        capacity.or_else(|| self.traversal_admission(packet))
     }
 
     fn publish(&self, packet: Arc<Packet>) -> Result<Fence> {
@@ -369,6 +375,19 @@ impl job::Backend for Backend {
         };
     }
 
+    /// Says why the watchdog gave up on a published command, which the client's lost device
+    /// alone does not. The first few of a boot report; the rest would repeat them.
+    fn gave_up(&self, packet: &Arc<Packet>, why: &crate::g17::timeout::GaveUp) {
+        static REPORTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        if !packet.is_published() || REPORTED.fetch_add(1, Ordering::Relaxed) >= 8 {
+            return;
+        }
+        dev_warn!(self.shared.dev.as_ref(),
+            "G17: watchdog gave up on a {} command of owner {}: {}\n",
+            match packet.engine() { Engine::Compute => "compute", Engine::Render => "render" },
+            self.owner, why);
+    }
+
     /// Not on M5: a job that does not finish within its watchdog interval fails then, however
     /// recently other work retired. Its compute kill then follows the first expiry.
     fn renews_shared(&self) -> bool {
@@ -421,7 +440,12 @@ impl job::Backend for Backend {
             let excuse = timeout::Excuse { used: excused, limit: timeout::excuse_limit(
                 crate::module_parameters::compute_timeout_max_ms.value()) };
             let verdict = firmware.queues.render_timeout_decision(packet, renewals, excuse);
-            let decision = verdict.map_or(Decision::Own, |verdict| verdict.decision);
+            // Nothing retires a render here: one whose stamps lag retires on its pass record
+            // when it is failed (`fail_render_packet`).
+            let decision = match verdict.map(|verdict| verdict.decision) {
+                None | Some(Decision::Retire) => Decision::Own,
+                Some(decision) => decision,
+            };
             // As compute does: work still blocked behind another VM's older unfinished work
             // after the whole grace is innocent, so its failure must stay non-sticky. The pair's
             // quarantine extends the class to the pair's other groups.

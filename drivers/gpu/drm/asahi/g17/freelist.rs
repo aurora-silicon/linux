@@ -501,6 +501,17 @@ impl Pages {
     }
 }
 
+/// What one render pool of the smallest size takes of the shared lower
+/// window, with its guard.
+pub(crate) const RENDER_POOL_SPAN: u64 =
+    (TABLE_SIZE + RENDER_BLOCKS * FREE_LIST_BLOCK_SIZE + mmu::UAT_PGSZ) as u64;
+
+// The A18 Pro's shared pool window holds the smallest render pool for every execution context.
+const _: () = assert!(
+    crate::hw::t8140::dynamic::WIDE_LOWER.end - crate::hw::t8140::dynamic::WIDE_LOWER.start
+        >= crate::mmu::MAX_EXECUTION_CONTEXTS as u64 * RENDER_POOL_SPAN
+);
+
 /// Pool-object identities are independent of recycled firmware IDs and VAs.
 static RENDER_POOL_SERIAL: AtomicU64 = AtomicU64::new(0);
 
@@ -577,8 +588,9 @@ impl RenderStorage {
 
 /// A render pool retained by a logical context and every graph referencing it.
 /// Its backing can be given back while the pool's free-list release has been
-/// consumed and the client VM is evicted; a fresh backing is installed before
-/// the pool is staged again.
+/// consumed: when the client VM is evicted, or when its queue is idle and the
+/// shared window is short. A fresh backing is installed before the pool is
+/// staged again.
 pub(crate) struct RenderPool {
     storage: Arc<RenderStorage>,
     /// Counts installed backings, so a re-armed backing is a new free-list
@@ -613,15 +625,27 @@ impl RenderPool {
         Ok(pin.map(|pin| PoolPin { _identity: pin, _pool: self.clone() }))
     }
 
-    pub(crate) fn new(
+    /// Uses the identity in `reserved` when there is one
+    /// ([`super::fw::Variant::render_id_at_create`]) and takes it only once the backing is
+    /// placed, so a refused placement keeps it. Without one, the identity is taken first, so a
+    /// refused identity places no backing.
+    pub(super) fn new(
         alloc: &Allocator<'_>,
         ids: &Arc<RenderIds>,
         render_global: &mmu::Vm,
         client: &mmu::Vm,
         blocks: usize,
+        reserved: Option<&Mutex<Option<RenderId>>>,
     ) -> Result<Self> {
-        let id = RenderId::new(ids)?;
+        let fresh = match reserved {
+            Some(reserved) if reserved.lock().is_some() => None,
+            _ => Some(RenderId::new(ids)?),
+        };
         let backing = RenderBacking::new(alloc, render_global, client, blocks)?;
+        let id = match fresh.or_else(|| reserved.and_then(|reserved| reserved.lock().take())) {
+            Some(id) => id,
+            None => RenderId::new(ids)?,
+        };
         Self::with_backing(alloc, id, client, backing)
     }
 

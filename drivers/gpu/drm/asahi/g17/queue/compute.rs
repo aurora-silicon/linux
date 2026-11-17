@@ -158,6 +158,8 @@ struct Graph {
     /// The M5 board, whose part selects the M5 descriptor words.
     board: Option<&'static Board>,
     program: ComputeProgram,
+    /// The firmware takes MCache tables in compute kick entries.
+    mcache: bool,
 }
 
 impl Graph {
@@ -170,6 +172,7 @@ impl Graph {
         board: Option<&'static Board>,
         program: ComputeProgram,
         m5: bool,
+        mcache: bool,
     ) -> Result<Self> {
         let page = mmu::UAT_PGSZ as u64;
         let prot = mmu::PROT_GPU_FW_SHARED_RW;
@@ -256,6 +259,7 @@ impl Graph {
             operand_state,
             board,
             program,
+            mcache,
         })
     }
 
@@ -274,7 +278,7 @@ impl Graph {
         let descriptors = self.descriptor_alias(vm)?;
         let prot = if self.m5 { mmu::PROT_GPU_SHARED_RW } else { mmu::PROT_GPU_FW_SHARED_RW };
         let page = mmu::UAT_PGSZ as u64;
-        let private = mmu::client_private_range(self.m5);
+        let private = vm.client_private_range();
         let preempt = self
             .preempt
             .alias_in(vm, private.clone(), page, prot)?;
@@ -456,6 +460,19 @@ impl<T> Fifo<T> {
     fn front(&self) -> Option<&T> {
         self.entries[self.head].as_ref()
     }
+    /// The entry `index` places behind the front.
+    fn get(&self, index: usize) -> Option<&T> {
+        if index >= self.len {
+            return None;
+        }
+        self.entries[(self.head + index) % IN_FLIGHT].as_ref()
+    }
+    fn get_mut(&mut self, index: usize) -> Option<&mut T> {
+        if index >= self.len {
+            return None;
+        }
+        self.entries[(self.head + index) % IN_FLIGHT].as_mut()
+    }
     fn back(&self) -> Option<&T> {
         if self.len == 0 {
             None
@@ -526,7 +543,8 @@ struct Active {
     spared_as_dropped: bool,
     /// The command retired on its completion record without a completion stamp and its client
     /// has its result, but the firmware may still store the stamp through its descriptor: the
-    /// descriptor stays held, and the command at the front, until the stamp covers it.
+    /// descriptor stays held, and the command in the queue, until the stamp covers it. Also set
+    /// for a command that retired behind such commands: it leaves the queue after them.
     stamps_owed: bool,
 }
 struct Previous<B = Binding, C = Arc<Context>> {
@@ -613,6 +631,19 @@ pub(crate) enum PoolPhase {
 pub(crate) struct Growth {
     qid: u8,
     phase: PoolPhase,
+}
+
+/// See [`Queue::admission_state`]. Its fields are read only through `Debug`, by the report.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct AdmissionState {
+    installed: bool,
+    m5_install_end: Option<u32>,
+    consumer: Option<u32>,
+    configuration: bool,
+    ordinal: u32,
+    quarantined: bool,
+    awaiting_witness: bool,
 }
 
 pub(crate) struct Queue {
@@ -707,10 +738,12 @@ impl Queue {
         board: Option<&'static Board>,
         program: ComputeProgram,
         m5: bool,
+        mcache: bool,
     ) -> Result<Self> {
         let Backing { mut pool, mut kick } = backing;
         let (active, replays) = (Fifo::new()?, Fifo::new()?);
-        let mut graph = Graph::new(alloc, objects, &context, pointers, operand_state, board, program, m5)?;
+        let mut graph =
+            Graph::new(alloc, objects, &context, pointers, operand_state, board, program, m5, mcache)?;
         let kick_alias = kick.map_client(context.vm())?;
         let pool_alias = pool.map_client(context.vm())?;
         let binding = graph.bind(context.clone(), kick_alias, pool_alias)?;
@@ -892,12 +925,14 @@ impl Queue {
     /// whose fences still wait (`spared_deferred`) does, whether or not every entry holds a
     /// ticket: it holds the GPU until the firmware drains it or this queue's watchdog settles it
     /// ([`Self::timeout`]), so other VMs' watchdogs see it as a failed blocker and defer to it
-    /// within their bounded renewals instead of failing their own work at once.
+    /// within their bounded renewals instead of failing their own work at once. Commands that
+    /// already retired and only hold their descriptors (`Active::stamps_owed`) are not the head.
     pub(crate) fn timeout_head(&self) -> Option<crate::g17::timeout::Head> {
         if self.quarantined && !self.awaiting_witness && !self.spared_deferred {
             return None;
         }
-        self.active.front().map(|active| crate::g17::timeout::Head {
+        let head = self.active.iter().find(|active| !active.stamps_owed);
+        head.map(|active| crate::g17::timeout::Head {
             vm: active.packet.context.vm().id(),
             published: active.published,
             // An M5 completion record can precede the command's writes: only the stamp
@@ -1131,6 +1166,8 @@ impl Queue {
 
     /// Poll only the ordered prefix; the next pass may recheck a finished front on another QID's
     /// event. A final identity-less scan allows recordless retirement without the one-pass grace.
+    /// Commands that retired without their stamp keep their place and descriptors until it
+    /// covers them; the pass steps past them to the commands behind.
     pub(crate) fn retire(
         &mut self,
         masks: Option<[u64; 2]>,
@@ -1146,7 +1183,9 @@ impl Queue {
         let finished_before = self.retire_pending;
         self.retire_pending = false;
         let mut oldest = true;
-        while let Some(front) = self.active.front() {
+        // How many retired commands at the front, still owed their stamp, this pass stepped past.
+        let mut at = 0;
+        while let Some(front) = self.active.get(at) {
             let mut restart = None;
             let mut crossed = false;
             let result = (|| {
@@ -1165,6 +1204,10 @@ impl Queue {
                     };
                 }
                 let recordless = if epoch != ticket.epoch {
+                    if at != 0 {
+                        // Only its stamp retires it now, and that covers the commands ahead.
+                        return Err(EAGAIN);
+                    }
                     crossed = true;
                     Recordless::CrossedRecovery
                 } else if masks.is_none() || (finished_before && oldest) {
@@ -1175,7 +1218,7 @@ impl Queue {
                 let next_end = self
                     .active
                     .iter()
-                    .skip(1)
+                    .skip(at + 1)
                     .find_map(|a| a.observed.map(|o| o.timestamps[1]));
                 let stamp = self.graph.stamp()?;
                 let record_aged = !retirement::stamp_covers(stamp, ticket.kick)
@@ -1204,18 +1247,23 @@ impl Queue {
                 if timestamps.is_some() && stampless {
                     retirement::note_stampless(self.qid(), ticket.kick);
                 }
+                // After a rebind the first publication retires first, and stays the oldest
+                // command until its stamp covers it.
+                let first = self
+                    .active
+                    .front()
+                    .and_then(|first| Some((first.packet.order.sequence, first.ticket?.epoch)));
                 if timestamps.is_some()
-                    && self.previous.as_ref().is_some_and(|p| {
-                        p.publication != Some((front.packet.order.sequence, ticket.epoch))
-                    })
+                    && self.previous.as_ref().is_some_and(|p| p.publication != first)
                 {
                     return Err(EIO);
                 }
                 Ok(timestamps.map(|timestamps| (timestamps, stampless)))
             })();
             oldest = false;
+            let owed = front.stamps_owed;
             match result {
-                Ok(Some((_, _))) if self.active.front().is_some_and(|front| front.stamps_owed) => {
+                Ok(Some(_)) if owed && at == 0 => {
                     // The stamp now covers the held command: release its descriptor.
                     self.submitted = self.submitted.checked_sub(1).ok_or(EIO)?;
                     self.active.pop().ok_or(EIO)?;
@@ -1226,13 +1274,15 @@ impl Queue {
                         self.released_at = now_ns();
                     }
                 }
+                // It was reported when it retired: step past it.
+                Ok(Some(_)) | Err(EAGAIN) if owed => at += 1,
                 Ok(Some((timestamps, stampless))) => {
                     let submitted = self.submitted.checked_sub(1).ok_or(EIO)?;
                     if front.qos_pending {
                         complete_qos(self.qos_owner())?;
-                        self.active.iter_mut().next().ok_or(EIO)?.qos_pending = false;
+                        self.active.get_mut(at).ok_or(EIO)?.qos_pending = false;
                     }
-                    let front = self.active.front().ok_or(EIO)?;
+                    let front = self.active.get(at).ok_or(EIO)?;
                     if let Some(ticket) = front.ticket {
                         crate::g17::recovery::note_retired();
                         crate::g17::trace::complete(
@@ -1256,17 +1306,19 @@ impl Queue {
                         Err(error) => Deferred::Retired(completion, Err(error)),
                     })?;
                     self.retire_pending = false;
-                    if stampless {
+                    if stampless || at != 0 {
                         // A completion record is no witness that the firmware is done with the
                         // descriptor: it can still store the stamp through it. Keep the command
-                        // (and its descriptor) at the front until the stamp covers it.
+                        // (and its descriptor) until the stamp covers it, as well as one that
+                        // retired behind it, and go on with the next command.
                         let _ = submitted;
-                        let front = self.active.iter_mut().next().ok_or(EIO)?;
+                        let front = self.active.get_mut(at).ok_or(EIO)?;
                         front.stamps_owed = true;
                         if front.observed.is_some() {
                             self.last_end = self.last_end.max(timestamps[1]);
                         }
-                        break;
+                        at += 1;
+                        continue;
                     }
                     self.submitted = submitted;
                     let active = self.active.pop().ok_or(EIO)?;
@@ -1282,7 +1334,7 @@ impl Queue {
                 }
                 Ok(None) | Err(EAGAIN) => {
                     if restart.is_some() {
-                        self.active.iter_mut().next().ok_or(EIO)?.observed_at = restart;
+                        self.active.get_mut(at).ok_or(EIO)?.observed_at = restart;
                     }
                     self.retire_pending = self.front_finished();
                     break;
@@ -1295,6 +1347,10 @@ impl Queue {
                     return Ok(());
                 }
             }
+        }
+        if at != 0 {
+            // Owed stamps come without a completion event: keep polling for them.
+            self.retire_pending = self.front_finished();
         }
         Ok(())
     }
@@ -1311,7 +1367,8 @@ impl Queue {
         let dropped = crossed && self.fault_stamp.is_none();
         for active in self.active.iter_mut() {
             let completion = &active.packet.completion;
-            if completion.spared() || completion.guilty() {
+            // A command whose stamp is owed ran and has its result.
+            if active.stamps_owed || completion.spared() || completion.guilty() {
                 continue;
             }
             if dropped {
@@ -2278,6 +2335,30 @@ impl Queue {
             .any(|active| Arc::ptr_eq(&active.packet, packet))
     }
 
+    /// `packet` retired and its command only holds its descriptor (`Active::stamps_owed`).
+    pub(crate) fn retired_held(&self, packet: &Arc<Packet>) -> bool {
+        self.active
+            .iter()
+            .any(|active| active.stamps_owed && Arc::ptr_eq(&active.packet, packet))
+    }
+
+    /// The watchdog gave up on `packet`, the oldest command still to retire, and the firmware
+    /// wrote its completion record: end its stamp wait, so that the next pass retires it on the
+    /// record, its stamp owed, instead of the watchdog failing it. Not on M5, whose record can
+    /// precede the command's writes.
+    pub(crate) fn expire_stamp_wait(&mut self, packet: &Arc<Packet>) -> bool {
+        if self.quarantined || self.graph.m5 {
+            return false;
+        }
+        match self.active.iter_mut().find(|active| !active.stamps_owed) {
+            Some(head) if Arc::ptr_eq(&head.packet, packet) && head.observed.is_some() => {
+                head.observed_at = Some(retirement::STAMP_WAIT_EXPIRED);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// A watchdog settles spared, deferred waiters without changing their VM status.
     /// Fully ticketed spared work can still return this queue after its drain witness.
     ///
@@ -2558,6 +2639,7 @@ impl Queue {
             cdm_end_va,
             sampler_heap_va,
             sampler_count,
+            attachments,
             ..
         } = &packet.command
         else {
@@ -2584,6 +2666,15 @@ impl Queue {
         let ordinal = self.ordinal.checked_add(1).ok_or(EOVERFLOW)?;
         let (descriptor_high, descriptor_low) =
             self.graph.descriptor_vas(kick_timestamp.slot() as u8)?;
+        // The kick names the buffers the dispatch writes in an MCache table, as a fragment
+        // kick names its attachments.
+        let mcache_writes = if self.graph.mcache && !self.graph.m5 {
+            attachments.as_slice()
+        } else {
+            &[][..]
+        };
+        let mcache_context: u8 = packet.context.id().try_into()?;
+        let mcache = ComputeDescriptor::mcache_table(descriptor_low, mcache_writes.len())?;
         let first = self.ordinal == 0 && (self.graph.m5 || !self.installed);
         // The first prototype only waits on an installed consumer channel.
         // A retry without a published source falls back to completion on CPU.
@@ -2755,7 +2846,7 @@ impl Queue {
                 slot: identity.qos,
                 class: COMPUTE_QOS_CLASS,
             },
-            mcache: None,
+            mcache,
             event_mask: match m5_board {
                 Some(board) => crate::g17::fw::m5::compute::kick_event_mask(board, identity.context)?,
                 None => COMPUTE_KICK_EVENT_MASK,
@@ -2798,7 +2889,10 @@ impl Queue {
                 object.initialize::<crate::g17::fw::m5::compute::Descriptor>(offset,
                     |descriptor| descriptor.write_zeroed(m5_args))?;
             } else {
-                object.initialize::<ComputeDescriptor>(offset, |descriptor| descriptor.write_zeroed(&args))?;
+                object.initialize::<ComputeDescriptor>(offset, |descriptor| {
+                    descriptor.write_zeroed(&args)?;
+                    descriptor.write_mcache(mcache_writes, mcache_context)
+                })?;
             }
             if !self.graph.m5 && first {
                 self.graph.context_high.as_mut().ok_or(EINVAL)?.write(
@@ -2961,7 +3055,9 @@ impl Queue {
                 None => self.graph.append(producer, announce_va, || {})?,
             };
             fence(Ordering::SeqCst);
-            if entry_signal && !self.graph.m5 {
+            // Only the first kick installs a predecessor record. A later kick that names another
+            // queue's kick depends on it through the kick entry alone.
+            if first && !self.graph.m5 {
                 let predecessor_va =
                     self.graph
                         .record(record_slot, PREDECESSOR, 0x400, predecessor)?;
@@ -3017,14 +3113,18 @@ impl Queue {
             // bits 3:2. The generic work doorbell left the firmware to find the
             // ring itself and delayed dispatch.
             fence(Ordering::SeqCst);
-            host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
             if self.graph.m5 {
-                // The firmware work notification must precede a deferred host
-                // doorbell: an idle-policy hold alone does not wake gated cores.
+                // macOS's order on this firmware: the host-port transaction, with core gating
+                // held off across it (Host::submit_m5), then the work doorbell. Rung first, the
+                // doorbell can be served before the advance lands; the firmware then finds
+                // nothing new and goes idle, and the advance alone never wakes it, so the kick
+                // never runs. Held gating is what lets the advance land first: without the
+                // hold, gated cores did not take it.
                 host.submit_m5(&crate::g17::fw::m5::queue::HardwareSubmission::compute(
                     qid, self.kick.low_va(), policy.priority(),
                     first || notify_activation)?)?;
             }
+            host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
             crate::g17::trace::publish(crate::g17::trace::COMPUTE, qid, ordinal, &packet);
             host.note_submission()
         })();
@@ -3058,6 +3158,21 @@ impl Queue {
             if self.released { self.owner = None; }
         }
         Ok(())
+    }
+
+    /// The installation and health state a timed-out publication reports (diagnostics):
+    /// whether the queue was installed, the item an M5 installation waits for the firmware to
+    /// consume and how far it got, an outstanding configuration, and quarantine.
+    pub(crate) fn admission_state(&self) -> AdmissionState {
+        AdmissionState {
+            installed: self.installed,
+            m5_install_end: self.m5_install,
+            consumer: self.graph.cursors().ok().map(|cursors| cursors.consumer),
+            configuration: self.configuration.is_some(),
+            ordinal: self.ordinal,
+            quarantined: self.quarantined,
+            awaiting_witness: self.awaiting_witness,
+        }
     }
 
     fn install_m5(&mut self, packet: &Arc<Packet>, host: &mut impl Host) -> Result {
@@ -3097,6 +3212,21 @@ impl Queue {
             host.publish_outer(policy.priority(), &crate::g17::fw::channels::WorkSlot::new(DataMaster::Compute,
                 self.graph.graph.gpu_va(), self.qid(), producer.try_into()?, true)?)?;
             self.outer_started = 1 << policy.priority();
+            // The queue's host-port configuration and validity go out before the installation's
+            // doorbell, so that the queue is configured when the firmware acts on it. A
+            // publication writes its host-port transaction after its doorbell, the work
+            // notification that wakes gated cores (see the publication path); as we understand
+            // it, that order matters for the advance the transaction ends with. The
+            // installation's transaction has no advance: its ring holds no kick yet, and the first
+            // publication configures the queue again with its kick. The configuration record is
+            // already visible, so a failed host-port write must not keep the doorbell back: the
+            // doorbell alone installs the queue, as it did before.
+            if let Err(error) = crate::g17::fw::m5::queue::HardwareSubmission::configure_compute(
+                self.qid(), self.kick.low_va(), policy.priority(),
+            ).and_then(|submission| host.submit_m5(&submission)) {
+                pr_warn!("asahi: G17: M5 queue {} installs without its host-port configuration: {:?}\n",
+                    self.qid(), error);
+            }
             host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
             Err(EAGAIN)
         })();
@@ -3340,6 +3470,25 @@ impl Queue {
         self.growing
     }
 
+    /// The host-port configuration of an installed M5 queue as its kicks last sent it (its kick
+    /// ring, at the priority class of its last publication), for a real wake to send again
+    /// before any doorbell: the configuration and validity only, no advance. None where the next
+    /// kick configures the queue anyway (it never kicked at any class, or was recycled since),
+    /// and off M5.
+    pub(crate) fn wake_configuration(
+        &self,
+    ) -> Result<Option<crate::g17::fw::m5::queue::HardwareSubmission>> {
+        if !self.graph.m5 || !self.installed || self.outer_started == 0 {
+            return Ok(None);
+        }
+        // On M5 a publication leaves exactly the bit of its own class (activation.rs).
+        let priority = self.outer_started.trailing_zeros() as u8;
+        crate::g17::fw::m5::queue::HardwareSubmission::configure_compute(
+            self.qid(), self.kick.low_va(), priority,
+        )
+        .map(Some)
+    }
+
     /// The queue's first command has been published: its identity and configuration exist.
     pub(crate) fn installed(&self) -> bool {
         self.installed
@@ -3468,6 +3617,7 @@ impl Queue {
         source: &crate::g17::sync_input::Source,
         status: &Arc<VmStatus>,
         epoch: u64,
+        consumer: &crate::g17::context::Context,
     ) -> Result<Option<SourceDependency>> {
         for active in self.active.iter() {
             if !active.packet.completion.is_input_source(&source.submission) {
@@ -3500,6 +3650,7 @@ impl Queue {
                 self.graph.support.gpu_va() + STAMP as u64,
                 u32::from(self.qid()),
                 hold,
+                active.packet.context.shares_execution(consumer),
             )));
         }
         Ok(None)
@@ -3517,11 +3668,13 @@ impl Queue {
     }
 }
 
-/// Publication, dependency, stamp address, queue and the retained source hold.
+/// Publication, dependency, stamp address, queue, the retained source hold and whether the
+/// source shares the consumer's execution context.
 pub(crate) type SourceDependency = (
     u64,
     crate::g17::fw::kick::KickDependency,
     u64,
     u32,
     crate::g17::sync_input::Hold,
+    bool,
 );

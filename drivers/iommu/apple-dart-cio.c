@@ -75,6 +75,42 @@ int apple_dart_cio_bind(struct device *owner, struct device *provider,
 }
 EXPORT_SYMBOL_GPL(apple_dart_cio_bind);
 
+/* The bank size comes from the hardware, not from the stream allocator. */
+static void apple_dart_cio_bank(struct apple_dart *dart, unsigned int *streams, bool *partitions)
+{
+	u32 params0 = readl(dart->regs), params3 = readl(dart->regs + 12);
+
+	*streams = FIELD_GET(GENMASK(8, 0), params3);
+	*partitions = (params0 & BIT(29)) &&
+		      FIELD_GET(GENMASK(24, 16), params3) >= DART_CIO_PARTITIONS;
+}
+
+/*
+ * Would off() be able to save this DART? Reads only; inside the transaction and before
+ * off(). @quiesced: its requesters are stopped, so the checks of an idle DART are made too.
+ */
+int apple_dart_cio_check(struct apple_dart_cio *s, bool quiesced)
+{
+	struct apple_dart *dart;
+	unsigned int streams;
+	bool partitions;
+	int ret;
+
+	if (!s || !READ_ONCE(s->dart->cio_active) || s->changed || s->restored)
+		return -EINVAL;
+	dart = s->dart;
+	apple_dart_cio_bank(dart, &streams, &partitions);
+	ret = dart_cio_check(dart->regs, &s->saved, streams, partitions, quiesced);
+	if (ret)
+		dev_err(dart->dev, "CIO DART cannot be saved for a sleep (%d, %s): params=%08x/%08x/%08x/%08x, TLB %08x/%08x, queue %08x, error mask %08x; nothing of it was changed\n",
+			ret, quiesced ? "requesters stopped" : "before anything stops",
+			s->saved.params[0], s->saved.params[1], s->saved.params[2],
+			s->saved.params[3], readl(dart->regs + 0x80), readl(dart->regs + 0x604),
+			readl(dart->regs + 0x230), readl(dart->regs + DART_POWER_ERROR_MASK));
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_dart_cio_check);
+
 int apple_dart_cio_prepare(struct apple_dart_cio *s)
 {
 	struct apple_dart *dart;
@@ -101,6 +137,18 @@ int apple_dart_cio_prepare(struct apple_dart_cio *s)
 		ret = 0;
 	}
 	spin_unlock_irqrestore(&dart->managed_lock, flags);
+	/*
+	 * A DART this owner could not save is found now, with every requester running and
+	 * nothing stopped: the sleep is refused here, not after its devices went down.
+	 */
+	if (!ret) {
+		ret = apple_dart_cio_check(s, false);
+		if (ret) {
+			spin_lock_irqsave(&dart->managed_lock, flags);
+			dart->cio_active = false;
+			spin_unlock_irqrestore(&dart->managed_lock, flags);
+		}
+	}
 	if (ret)
 		pm_runtime_put(dart->dev);
 	return ret;
@@ -181,10 +229,10 @@ static int apple_dart_cio_reopen(struct apple_dart_cio *s)
 
 int apple_dart_cio_off(struct apple_dart_cio *s)
 {
-	u32 value, params0, params3;
 	struct apple_dart *dart;
 	unsigned int streams;
 	bool partitions;
+	u32 value;
 	int ret;
 
 	if (!s || !READ_ONCE(s->dart->cio_active) || s->changed || s->restored)
@@ -193,12 +241,7 @@ int apple_dart_cio_off(struct apple_dart_cio *s)
 	ret = apple_dart_sleep_close(dart);
 	if (ret)
 		return ret;
-	/* The bank size comes from the hardware, not from the stream allocator. */
-	params0 = readl(dart->regs);
-	params3 = readl(dart->regs + 12);
-	streams = FIELD_GET(GENMASK(8, 0), params3);
-	partitions = (params0 & BIT(29)) &&
-		     FIELD_GET(GENMASK(24, 16), params3) >= DART_CIO_PARTITIONS;
+	apple_dart_cio_bank(dart, &streams, &partitions);
 	/* Drains the fault IRQ and any hardware command admitted before closure. */
 	apple_dart_quiesce_commands(dart->dev);
 	dma_wmb();
@@ -217,9 +260,10 @@ int apple_dart_cio_off(struct apple_dart_cio *s)
 	if (!ret)
 		ret = dart_cio_capture(dart->regs, &s->saved, streams, partitions);
 	if (ret) {
-		dev_err(dart->dev, "CIO DART snapshot failed: %d, params=%08x/%08x/%08x/%08x\n",
+		dev_err(dart->dev, "CIO DART snapshot failed: %d, params=%08x/%08x/%08x/%08x, TLB %08x/%08x, queue %08x\n",
 			ret, s->saved.params[0], s->saved.params[1],
-			s->saved.params[2], s->saved.params[3]);
+			s->saved.params[2], s->saved.params[3], readl(dart->regs + 0x80),
+			readl(dart->regs + 0x604), readl(dart->regs + 0x230));
 		/* Its registers were not changed: reopen it, flushing what changed meanwhile. */
 		if (apple_dart_cio_reopen(s)) {
 			s->dead = true;
@@ -238,6 +282,7 @@ EXPORT_SYMBOL_GPL(apple_dart_cio_off);
 
 int apple_dart_cio_on(struct apple_dart_cio *s)
 {
+	u32 test_word = 0;
 	int ret;
 
 	if (!s || !READ_ONCE(s->dart->cio_active))
@@ -283,6 +328,13 @@ int apple_dart_cio_on(struct apple_dart_cio *s)
 		return ret;
 	}
 	dma_wmb();
+	/*
+	 * A v2.4 DART keeps the enables of its error interrupt outside the saved state, and
+	 * they go with its power: put back as at its start, or a fault after the sleep is
+	 * never reported.
+	 */
+	if (s->dart->full_errors && s->saved.common.version == DART_CIO_VERSION_T6050)
+		apple_dart_t8110_enable_errors(s->dart);
 	/* Updates that came after the restore's flush are flushed; requesters still wait. */
 	ret = apple_dart_cio_reopen(s);
 	if (ret) {
@@ -290,6 +342,10 @@ int apple_dart_cio_on(struct apple_dart_cio *s)
 		return ret;
 	}
 	s->restored = true;
+	/* TEST (sv6t7): the guard the wake leaves on, until the DART is removed. */
+	regmap_read(s->gapf, APPLE_PS_PROT_SLICE(s->slice), &test_word);
+	dev_info(s->dart->dev, "TEST sv6t7: CIO DART start: PS_PROT slice %u now %#x\n",
+		 s->slice, test_word);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_dart_cio_on);
@@ -322,3 +378,52 @@ int apple_dart_cio_finish(struct apple_dart_cio *s)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_dart_cio_finish);
+
+/*
+ * T6050 (J714s): the ACIO DART and the PCIe-C DART of a USB4 port go away with the port when
+ * its ACIO stops: a cable removed, or a dock given up after a sleep. While bit 4 of a DART's
+ * PS_PROT slice is set, the slice guards a power-state register of the DART's power domain.
+ * apple_dart_cio_on() sets the bit again after every sleep that saved the DART, as macOS does
+ * right after the domain's power-up, but nothing cleared it before apple_cio_stop() dropped the
+ * ACIO's domain links: genpd then gated ATC's CIO and PCIe-C domains from the runtime suspend
+ * of the ACIO's domain devices, with the guard on, and the CPU that wrote the PMGR took an
+ * SError. macOS clears the bit once the DART's streams are disabled and its TLB flushed, then
+ * gates the domain; it never gates one with the bit set. Clear it here in that order:
+ * apple_dart_remove() has just reset the DART, or its port clock went with its port and its
+ * requesters stopped first (its commands are gated). A slice still on is said, since the
+ * domain's power-off would fault.
+ */
+static bool apple_dart_cio_atc_port(struct apple_dart *dart)
+{
+	struct device_node *parent = dart->dev->of_node->parent;
+
+	return parent && of_machine_is_compatible("apple,j714s") &&
+	       (of_device_is_compatible(parent, "apple,t6050-usb4-acio") ||
+		of_node_name_prefix(parent, "pcie-tunnel-"));
+}
+
+static void apple_dart_cio_release(struct apple_dart *dart)
+{
+	struct apple_dart_cio *s = dart->cio;
+	u32 before = 0, after = 0;
+	int ret;
+
+	if (!s || !apple_dart_cio_atc_port(dart))
+		return;
+	ret = regmap_read(s->gapf, APPLE_PS_PROT_SLICE(s->slice), &before);
+	if (ret || !(before & APPLE_PS_PROT_SLICE_ON)) {
+		dev_info(dart->dev, "T6050: removed, PS_PROT slice %u %#x: nothing to clear (%d)\n",
+			 s->slice, before, ret);
+		return;
+	}
+	ret = apple_dart_cio_gapf(s, false);
+	regmap_read(s->gapf, APPLE_PS_PROT_SLICE(s->slice), &after);
+	if (ret)
+		dev_err(dart->dev,
+			"T6050: removed with PS_PROT slice %u still on (%#x -> %#x, %d): its domain's power-off will fault\n",
+			s->slice, before, after, ret);
+	else
+		dev_info(dart->dev,
+			 "T6050: removed, PS_PROT slice %u %#x -> %#x before its domain goes off\n",
+			 s->slice, before, after);
+}

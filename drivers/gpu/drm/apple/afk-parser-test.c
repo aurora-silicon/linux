@@ -103,12 +103,120 @@ static void afk_serialized_report_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, afk_compact_report_dictionary(dictionary, sizeof(dictionary)));
 }
 
+/*
+ * Slot reuse for re-announced compact services. The firmware re-announces a
+ * service under a fresh interface on every DP relink without closing the old
+ * one; afk_compact_slot() decides whether the new announcement supersedes the
+ * enabled one it matches (reclaiming its slot) or is a sibling (a fresh slot).
+ */
+static const struct apple_epic_service_ops compact_singleton_ops = {
+	.name = "singleton",
+	.singleton = true,
+};
+
+static const struct apple_epic_service_ops compact_sibling_ops = {
+	.name = "sibling",
+};
+
+/* Populate a returned slot as afk_recv_handle_compact_init() would. */
+static void compact_slot_fill(struct apple_epic_service *service,
+			      const struct apple_epic_service_ops *ops,
+			      const char *name, s64 unit, u32 channel)
+{
+	service->ops = ops;
+	strscpy(service->name, name, sizeof(service->name));
+	service->unit = unit;
+	service->channel = channel;
+	service->enabled = true;
+}
+
+static void compact_slot_reset(struct apple_dcp_afkep *ep, u32 endpoint)
+{
+	u32 i;
+
+	ep->endpoint = endpoint;
+	ep->num_channels = 0;
+	for (i = 0; i < AFK_MAX_CHANNEL; i++) {
+		struct apple_epic_service *service = &ep->services[i];
+
+		service->ops = NULL;
+		service->enabled = false;
+		service->users = 0;
+		service->channel = 0;
+		service->unit = 0;
+		service->power_gen = 0;
+		service->name[0] = '\0';
+		bitmap_zero(service->cmd_map, MAX_PENDING_CMDS);
+	}
+	WRITE_ONCE(ep->dcp->afk_power_gen, 0);
+}
+
+static void afk_compact_singleton_replaces_test(struct kunit *test)
+{
+	struct apple_dcp_afkep *ep = test->priv;
+	struct apple_epic_service *first, *again;
+
+	/* 0x2b (AV_AUDIO_ENDPOINT_DESKTOP) is not in the hotplug range. */
+	compact_slot_reset(ep, 0x2b);
+
+	first = afk_compact_slot(ep, &compact_singleton_ops, "singleton", 0);
+	KUNIT_ASSERT_PTR_NE(test, first, NULL);
+	compact_slot_fill(first, &compact_singleton_ops, "singleton", 0, 10);
+	KUNIT_EXPECT_EQ(test, ep->num_channels, 1U);
+
+	/* Re-announced in the same power generation: reuse and retire the slot. */
+	again = afk_compact_slot(ep, &compact_singleton_ops, "singleton", 0);
+	KUNIT_EXPECT_PTR_EQ(test, again, first);
+	KUNIT_EXPECT_EQ(test, ep->num_channels, 1U);
+	KUNIT_EXPECT_FALSE(test, again->enabled);
+}
+
+static void afk_compact_singleton_no_leak_test(struct kunit *test)
+{
+	struct apple_dcp_afkep *ep = test->priv;
+	struct apple_epic_service *service;
+	unsigned int i;
+
+	compact_slot_reset(ep, 0x2b);
+
+	/* A relink across every suspend re-announces; the slot budget must hold. */
+	for (i = 0; i < 4 * AFK_MAX_CHANNEL; i++) {
+		service = afk_compact_slot(ep, &compact_singleton_ops, "singleton", 0);
+		KUNIT_ASSERT_PTR_NE(test, service, NULL);
+		compact_slot_fill(service, &compact_singleton_ops, "singleton", 0, i);
+	}
+	KUNIT_EXPECT_EQ(test, ep->num_channels, 1U);
+}
+
+static void afk_compact_siblings_kept_test(struct kunit *test)
+{
+	struct apple_dcp_afkep *ep = test->priv;
+	struct apple_epic_service *first, *second;
+
+	compact_slot_reset(ep, 0x2b);
+
+	/* A non-singleton re-announced in one generation is a sibling. */
+	first = afk_compact_slot(ep, &compact_sibling_ops, "sibling", -1);
+	KUNIT_ASSERT_PTR_NE(test, first, NULL);
+	compact_slot_fill(first, &compact_sibling_ops, "sibling", -1, 10);
+	KUNIT_EXPECT_EQ(test, ep->num_channels, 1U);
+
+	second = afk_compact_slot(ep, &compact_sibling_ops, "sibling", -1);
+	KUNIT_ASSERT_PTR_NE(test, second, NULL);
+	KUNIT_EXPECT_PTR_NE(test, second, first);
+	KUNIT_EXPECT_EQ(test, ep->num_channels, 2U);
+	KUNIT_EXPECT_TRUE(test, first->enabled);
+}
+
 static struct kunit_case afk_parser_cases[] = {
 	KUNIT_CASE(afk_serialized_report_test),
 	KUNIT_CASE(afk_compact_header_test),
 	KUNIT_CASE(afk_short_epic_test),
 	KUNIT_CASE(afk_short_reply_test),
 	KUNIT_CASE(afk_reply_index_test),
+	KUNIT_CASE(afk_compact_singleton_replaces_test),
+	KUNIT_CASE(afk_compact_singleton_no_leak_test),
+	KUNIT_CASE(afk_compact_siblings_kept_test),
 	{}
 };
 

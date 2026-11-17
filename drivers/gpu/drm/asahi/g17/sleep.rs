@@ -48,6 +48,7 @@ unsafe extern "C" {
         bridge: bool,
     ) -> *mut core::ffi::c_void;
     fn asahi_g17_commit_finish(commit: *mut core::ffi::c_void, saved: *mut u32) -> bool;
+    fn asahi_g17_commit_stops_firmware() -> bool;
 }
 
 /// What `.complete` does after a sleep whose stop was left to the commit.
@@ -129,6 +130,11 @@ impl Hardware for Firmware {
     }
 
     fn gating(&mut self, enable: bool) -> Result {
+        // A target without the bridge (the M5): its core gating, written once at probe, is
+        // lost when a real sleep powers the domain off. Written again before the run bit.
+        if enable && !self.bridge.enabled {
+            return self.bridge.regs.enable_g17_gating();
+        }
         self.bridge.set_gating(enable)
     }
 
@@ -475,6 +481,18 @@ impl Shared {
                     if result.is_ok() {
                         // The cores lost power, so the next command on each pair installs it again.
                         firmware.queues.forget_render_registrations();
+                        // So did every M5 compute queue's host-port configuration: it goes out
+                        // again here, before publication reopens and so before any doorbell.
+                        let (_, failed) = firmware
+                            .queues
+                            .restore_compute_port_configurations(&firmware.bridge.regs);
+                        if failed != 0 {
+                            dev_warn!(
+                                self.dev.as_ref(),
+                                "{} GPU compute queues not configured again after the wake\n",
+                                failed
+                            );
+                        }
                         firmware.rings.invalidate_statistics();
                         firmware.port.statistics_epoch_bump();
                     }
@@ -513,7 +531,9 @@ impl Shared {
 impl super::Gpu {
     /// Called before any device suspends. Only a sleep that powers the SoC down gets here.
     pub(crate) fn sleep_prepare(&self) -> Result {
-        if !self.cfg.sleep_restart {
+        // SAFETY: Reads the sleep driver's state: true where the commit stops the firmware.
+        let commit_stop = unsafe { asahi_g17_commit_stops_firmware() };
+        if !self.cfg.sleep_restart && !commit_stop {
             dev_warn!(
                 self.shared.dev.as_ref(),
                 "no firmware restart on this chip, refusing sleep\n"

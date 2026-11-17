@@ -35,6 +35,7 @@ pub(crate) mod context;
 mod data_segment;
 mod dependency;
 mod sync_input;
+pub(crate) mod exec_share;
 pub(crate) mod sync_output;
 mod trace;
 #[cfg(CONFIG_DRM_ASAHI_G15)]
@@ -68,6 +69,7 @@ mod teardown;
 pub(crate) mod telemetry;
 mod thermal;
 mod timeout;
+mod traversal;
 mod validation;
 
 use core::any::Any;
@@ -1231,6 +1233,8 @@ struct Shared {
     /// returns, an owner closes, a teardown parks, and on every event pass
     /// while a render publisher waits (firmware consumption has no event).
     renders: Arc<availability::Availability>,
+    /// Which commands may enter the GPU beside a command that traces rays.
+    traversal: Arc<runtime::traversal::Gate>,
     /// Unbound compute publishers which can reuse a retired channel.
     compute_demand: AtomicU32,
     #[pin]
@@ -1701,6 +1705,7 @@ impl Gpu {
         let queues = availability::Availability::new()?;
         let preparations = preparation::Gate::with_waiters(Some(progress.clone()))?;
         let renders = availability::Availability::new()?;
+        let traversal = runtime::traversal::Gate::new()?;
         let reclaim = runtime::teardown::ReclaimBatch::new()?;
         let feed = feed::Feed::new(m5)?;
         let alternate = cfg.core_layout.cores.is_some_and(|(clusters, cores)| {
@@ -1770,6 +1775,7 @@ impl Gpu {
                 progress,
                 queues,
                 renders,
+                traversal,
                 compute_demand: AtomicU32::new(0),
                 work <- new_work!("g17::Shared::work"),
                 housekeeping: AtomicBool::new(true),
@@ -2082,7 +2088,7 @@ impl Gpu {
                     Some(shared.queues.clone()),
                     Some(shared.renders.clone()),
                 ),
-                pool: object::Pool::new()?,
+                pool: object::Pool::new(shared.variant.objects_after_release)?,
                 render_rings: kick::RenderRings::new()?,
                 render_ids: freelist::RenderIds::new()?,
                 init: initdata::InitData::new(),
@@ -2286,7 +2292,7 @@ impl Gpu {
                     Some(shared.queues.clone()),
                     Some(shared.renders.clone()),
                 ),
-                pool: object::Pool::new()?,
+                pool: object::Pool::new(shared.variant.objects_after_release)?,
                 render_rings: kick::RenderRings::new()?,
                 render_ids: freelist::RenderIds::new()?,
                 init: initdata::InitData::new(),
@@ -2498,6 +2504,10 @@ impl gpu::Gpu for Gpu {
         }
         if variant.few_primitives {
             params.features |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FEW_PRIMITIVES);
+        }
+        // Only the A18 Pro heap sizes itself for it; other command sets accept the hint too.
+        if !variant.m5_commands {
+            params.features |= crate::file::DRM_ASAHI_FEATURE_RENDER_MESH_OUTPUT;
         }
         // The M5 command set reports it with M5_FEATURES.
         if !variant.m5_commands && variant.render_stage_prefixes {

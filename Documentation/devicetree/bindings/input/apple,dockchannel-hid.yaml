@@ -205,6 +205,16 @@ properties:
             minimum: 1
             maximum: 255
 
+      apple,sleep-report:
+        $ref: /schemas/types.yaml#/definitions/uint8-array
+        minItems: 1
+        maxItems: 65524
+        description:
+          A feature report, starting with its report ID, that the host sets
+          on this interface before it tells the coprocessor of a system sleep
+          that removes power, in one command frame, which holds up to 65524
+          bytes. When absent, nothing is sent. Filled in by the bootloader.
+
   tp_accel:
     type: object
     additionalProperties: false

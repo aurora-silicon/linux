@@ -44,6 +44,8 @@ impl Backend {
             return Ok(());
         }
         if packet.is_published() {
+            // Not a watchdog's verdict: the queue went away before its work finished.
+            packet.completion.status().note_teardown_expired();
             self.timeout_render(packet)
         } else {
             // The outer callback already completed a successful 0 -> 3
@@ -90,7 +92,11 @@ impl crate::g17::Firmware {
                     .as_mut()
                     .and_then(|entry| entry.pair.as_mut())
                 {
-                    pair.report_timeout(stamps, state);
+                    if !packet.completion.status().unobserved_teardown(ETIMEDOUT)
+                        || crate::debug::debug_enabled(crate::debug::DebugFlags::VerboseFaults)
+                    {
+                        pair.report_timeout(stamps, state);
+                    }
                     pair.expire_stamp_wait(packet, stamps, state)?;
                 }
             }
@@ -322,14 +328,27 @@ impl crate::g17::Firmware {
         {
             return Ok(());
         }
-        self.with_render(slot, |pair, host| {
-            pair.release_witnessed(host, &mut |event| deferred.push(event))
-        })
-        .map_err(at("release"))?;
+        self.release_drained_render(slot, deferred)
+            .map_err(at("release"))?;
         self.queues
             .render
             .collect_retired(slot)
             .map_err(at("binding collection"))
+    }
+
+    /// Releases the drained pair in `slot` on a fresh drain witness
+    /// ([`crate::g17::queue::render::Pair::release_witnessed`]), and with it the quarantine of
+    /// its admission slot ([`crate::g17::queue::admission::Pool::pair_drained`]). The witness,
+    /// not a lease of the pair's commands, ends that quarantine: a group that retired on its
+    /// pass record gave its lease back with its result, so no lease may be left to end it.
+    fn release_drained_render(&mut self, slot: usize, deferred: &mut DeferredBatch) -> Result {
+        let released = self.with_render(slot, |pair, host| {
+            pair.release_witnessed(host, &mut |event| deferred.push(event))
+        })?;
+        if released {
+            self.queues.admission.pair_drained(slot);
+        }
+        Ok(())
     }
 }
 

@@ -114,7 +114,26 @@ fn main(){
 '''
 
 
+def callers():
+    """The reclaim only returns backing its batch has room for: both capacity
+    waits must hand it the batch that has that room."""
+    runtime = (ROOT / 'runtime.rs').read_text()
+    submit = (ROOT / 'runtime/render/submit.rs').read_text()
+    room = item(runtime, '    fn reclaim() -> Result<Self>')
+    assert 'batch.render = KVVec::with_capacity(crate::hw::t8140::queues::RENDER_SLOTS' in room, room
+    for text, signature in [(runtime, '    fn reclaim_capacity('), (submit, '    fn reclaim_render_capacity(')]:
+        body = item(text, signature)
+        assert 'reclaim_idle_render_pools(' in body, signature
+        assert 'DeferredBatch::reclaim()?' in body and 'DeferredBatch::publication()' not in body, signature
+        assert 'self.lower_window_short()' in body and 'if pools {' in body, signature
+    assert 'self.render.len() < self.render.capacity()' in item(runtime, '    pub(super) fn render_backing_room('), 'room rule'
+    short = item(runtime, '    fn lower_window_short(')
+    assert 'lower_pressure()' in short and 'RENDER_POOL_SPAN' in short and 'is_m5()' in short, short
+    print('PASS both capacity waits give the reclaim a batch with room for render pool backing, while the window is short')
+
+
 def main():
+    callers()
     source = fixture()
     mutations = [('fixed', source),
                  ('ignore-release-consumption', source.replace('!render.pools.released(u32::from(pool.id()), pool.control_va())', 'false')),

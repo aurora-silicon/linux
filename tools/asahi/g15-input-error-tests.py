@@ -43,9 +43,9 @@ struct Mirror{word:*mut i32}
 struct BStr<'a>(&'a [u8]);
 impl<'a> BStr<'a>{fn from_bytes(b:&'a [u8])->Self{Self(b)}}
 impl std::fmt::Display for BStr<'_>{fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{write!(f,"{}",String::from_utf8_lossy(self.0))}}
-struct VmStatus{error:AtomicI32,reported_error:AtomicI32,client_closed:AtomicBool,warned:AtomicBool,recovery_guilty:AtomicBool,tgid:i32,comm:[u8;16],mirror:Mutex<Option<Mirror>>}
+struct VmStatus{error:AtomicI32,reported_error:AtomicI32,client_closed:AtomicBool,teardown_expired:AtomicBool,warned:AtomicBool,recovery_guilty:AtomicBool,tgid:i32,comm:[u8;16],mirror:Mutex<Option<Mirror>>}
 impl VmStatus {
- fn new(word:*mut i32)->Self{Self{error:AtomicI32::new(0),reported_error:AtomicI32::new(0),client_closed:AtomicBool::new(false),warned:AtomicBool::new(false),recovery_guilty:AtomicBool::new(false),tgid:1,comm:*b"host-test\0\0\0\0\0\0\0",mirror:Mutex(StdMutex::new(Some(Mirror{word})))}}
+ fn new(word:*mut i32)->Self{Self{error:AtomicI32::new(0),reported_error:AtomicI32::new(0),client_closed:AtomicBool::new(false),teardown_expired:AtomicBool::new(false),warned:AtomicBool::new(false),recovery_guilty:AtomicBool::new(false),tgid:1,comm:*b"host-test\0\0\0\0\0\0\0",mirror:Mutex(StdMutex::new(Some(Mirror{word})))}}
 __STATUS__
 }
 mod g17 {use super::*;__POLICY__}
@@ -202,6 +202,26 @@ fn main(){
   assert_eq!(fw.slots.releases,0);
  }
  assert_eq!(unrelated.vm.status.get(),0,"unrelated VM untouched");assert_eq!(unrelated.vm.status.reported_error(),0);assert_eq!(other_mirror.load(Ordering::SeqCst),0);assert_eq!(unrelated.fence.signals.load(Ordering::SeqCst),0);
+ {
+  // The end of a teardown wait is a failure nobody sees only once the client is closed; a
+  // closed client's other timeouts are still reported until such a wait has ended.
+  let mut word=0i32;let status=VmStatus::new(&mut word);
+  status.note_teardown_expired();
+  assert!(!status.unobserved_teardown(ETIMEDOUT),"an open client sees the end of its teardown wait");
+  status.report_failure(ETIMEDOUT);
+  assert!(status.warned.load(Ordering::SeqCst),"an open client's timeout is warned about");
+  let mut word=0i32;let status=VmStatus::new(&mut word);
+  status.client_closed.store(true,Ordering::SeqCst);
+  assert!(!status.unobserved_teardown(ETIMEDOUT),"a closed client's timeout is reported until a teardown wait ended");
+  assert!(status.unobserved_teardown(ECANCELED)&&status.unobserved_teardown(ENOENT));
+  status.note_teardown_expired();
+  assert!(status.unobserved_teardown(ETIMEDOUT)&&!status.unobserved_teardown(EIO));
+  status.report_failure(ETIMEDOUT);
+  assert!(!status.warned.load(Ordering::SeqCst),"a closed client's ended teardown wait is not warned about");
+  assert_eq!(status.reported_error(),ETIMEDOUT.to_errno(),"the failure is still recorded");
+  status.report_failure(EIO);
+  assert!(status.warned.load(Ordering::SeqCst),"a closed client's device loss is still warned about");
+ }
  println!("PASS: production job/prefix/status bodies: input errors, binding reuse/release/retention, exhaustion retry, published-prefix lifetime and isolation");
 }
 '''
@@ -236,7 +256,7 @@ def main():
     code = PRELUDE.replace("__JOB__", bodies).replace("__STATUS__", "\n".join(
         extract(status, marker) for marker in ["    pub(crate) fn get(", "    pub(crate) fn record(",
         "    pub(crate) fn reported_error(", "    pub(crate) fn report_failure(",
-        "    fn unobserved_teardown("])).replace(
+        "    pub(crate) fn unobserved_teardown(", "    pub(crate) fn note_teardown_expired("])).replace(
         "__POLICY__", extract(policy, "pub(crate) fn inherited_error(")).replace(
         "__PREFIX__", extract(engine, "    fn publish_prefix("))
     variants = {"control": code}
@@ -256,6 +276,7 @@ def main():
             "binding-release-leaks": ("drop(self.binding.lock().take());", "let _ = self;", "release_binding must drop exactly once"),
             "bound-job-rebinds": ("if slot.is_none() {", "if true {", "repeated bind must keep existing binding"),
             "slot-exhaustion-not-retried": ("self.engine.slot_wait = true;", "self.engine.slot_wait = false;", "slot exhaustion must request retry"),
+            "closed-client-timeout-always-quiet": ("(error == ETIMEDOUT && self.teardown_expired.load(Ordering::Acquire))", "error == ETIMEDOUT", "a closed client's timeout is reported until a teardown wait ended"),
             "published-prefix-releases-binding": ("if job.progress.next() == job.progress.sent() {", "if true {", "published prefix must retain binding on append failure"),
         }
         for name, (old, new, message) in changes.items():
