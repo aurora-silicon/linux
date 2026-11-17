@@ -896,8 +896,9 @@ static int apple_nhi_cio_power_off_t6050(struct apple_nhi *anhi)
 		apple_cio_cpu_halt(acio);
 		if (ret)
 			return ret;
-		/* J714s holds LSTX high through sleep; do not read the halted rc block. */
-		ret = apple_cio_lstx_hold(acio, of_machine_is_compatible("apple,j714s"));
+		/* J714s and J716c hold LSTX high through sleep; do not read the halted rc block. */
+		ret = apple_cio_lstx_hold(acio, of_machine_is_compatible("apple,j714s") ||
+					  of_machine_is_compatible("apple,j716c"));
 		if (ret)
 			return ret;
 	}
@@ -905,7 +906,8 @@ static int apple_nhi_cio_power_off_t6050(struct apple_nhi *anhi)
 	if (ret < 0)
 		return ret;
 	/* Held on by its DART: taken down here, before the PHY's shutdown, as macOS does. */
-	if (ret && of_machine_is_compatible("apple,j714s")) {
+	if (ret && (of_machine_is_compatible("apple,j714s") ||
+		    of_machine_is_compatible("apple,j716c"))) {
 		int down = apple_nhi_cio_router_pd_set(anhi, false);
 
 		if (!down) {
