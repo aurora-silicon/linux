@@ -71,12 +71,12 @@ struct apple_dcp {
  struct desktop *desktop;
  struct { struct dcp_backlight_state state; int lock; } backlight;
  struct { bool update; u32 maximum; } brightness;
- bool panel,m4,v14,external,typec,pipe_enabled_h17p,crashed,quiescing;
+ bool panel,m4,v14,external,ext26,typec,pipe_enabled_h17p,crashed,quiescing;
  bool typec_crtc_off,typec_cable_connected,typec_follow_start,typec_poweron_hpd,hdmi_yielded;
  unsigned crtc_unplugs,typec_unplugs,typec_generation,typec_reconnect_tries,external_generation,external_crtc_generation;
  int external_lock,hpd_mutex,relink_lock,relink,typec_iomfb_hpd_ready;
  struct delayed_work typec_reconnect_wq,placeholder_edid_wq,external_stop_retry_wq,bl_fallback_wq;
- struct work_struct external_stop_work;
+ struct work_struct external_stop_work,ext26_blank_work;
  void *dev,*hdmi_hpd,*avep;
 };
 struct platform_device { struct apple_dcp *data; };
@@ -95,6 +95,9 @@ static bool iomfb_is_m4(struct apple_dcp *p) { return p->m4; }
 static bool iomfb_v14_7_panel_nits(struct apple_dcp *p) { return p->v14; }
 static bool dcp_has_panel(struct apple_dcp *p) { return p->panel; }
 static bool dcp_is_external_h17p(struct apple_dcp *p) { return p->external; }
+static bool dcp_is_ext26(struct apple_dcp *p) { return p->ext26; }
+static bool dcp_is_retained_external(struct apple_dcp *p) { return p->external || p->ext26; }
+static void flush_work(struct work_struct *p) { (void)p; }
 static bool dcp_is_typec_output(struct apple_dcp *p) { return p->typec; }
 static bool dcp_h17g_panel(struct apple_dcp *p) { return p->hw.iomfb_method_profile==DCP_IOMFB_METHODS_H17G; }
 static void dcp_backlight_kick(struct apple_dcp *p) { assert(p->backlight.state.ready);kicks++; }
