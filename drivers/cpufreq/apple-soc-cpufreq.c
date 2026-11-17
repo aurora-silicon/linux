@@ -35,12 +35,13 @@
 #include <linux/timer.h>
 #include <linux/workqueue.h>
 
+#include "apple-soc-cpufreq-internal.h"
+
 #define APPLE_DVFS_CMD				0x20
 #define APPLE_DVFS_CMD_BUSY			BIT(31)
 #define APPLE_DVFS_CMD_SET			BIT(25)
 #define APPLE_DVFS_CMD_PS1_S5L8960X		GENMASK(24, 22)
 #define APPLE_DVFS_CMD_PS1_S5L8960X_SHIFT	22
-#define APPLE_DVFS_CMD_PS2			GENMASK(15, 12)
 #define APPLE_DVFS_CMD_PS1			GENMASK(4, 0)
 #define APPLE_DVFS_CMD_PS1_SHIFT		0
 
@@ -70,6 +71,18 @@
 #define APPLE_DVFS_PLL_FACTOR		0xc8
 #define APPLE_DVFS_PLL_FACTOR_MULT	GENMASK(31, 16)
 #define APPLE_DVFS_PLL_FACTOR_DIV	GENMASK(15, 0)
+
+/*
+ * T8112 APSC state descriptors.  The boot firmware populates one descriptor
+ * per P-state.  The live pair is not a tuning value: it is a shadow loaded
+ * from the selected firmware row.
+ *
+ * These offsets are relative to the cpufreq resource at cluster + 0x20000.
+ */
+#define APPLE_APSC_STATE_TABLE_T8112	0x58000
+#define APPLE_APSC_STATE_STRIDE_T8112	0x40
+#define APPLE_APSC_STATE_SHADOW_LO_T8112	0x5ffe8
+#define APPLE_APSC_STATE_SHADOW_HI_T8112	0x5fff0
 
 #define APPLE_DVFS_TRANSITION_TIMEOUT 400
 
@@ -202,6 +215,7 @@ static int apple_fast_die_hp_state;
 
 struct apple_soc_cpufreq_info {
 	bool has_ps2;
+	bool preserve_ps2;
 	bool verify_transition;
 	bool lazy_verify;
 	/* Fail closed when the DT describes no fast die-temperature limit. */
@@ -217,6 +231,10 @@ struct apple_soc_cpufreq_info {
 	u64 cur_pstate_shift;
 	u64 ps1_mask;
 	u64 ps1_shift;
+	u32 apsc_state_table;
+	u32 apsc_state_stride;
+	u32 apsc_state_shadow_lo;
+	u32 apsc_state_shadow_hi;
 };
 
 struct apple_cpu_priv {
@@ -259,6 +277,12 @@ struct apple_cpu_priv {
 
 static struct cpufreq_driver apple_soc_cpufreq_driver;
 
+/* Experimental until the read-only row/shadow discriminator passes. */
+static bool experimental_apsc_sync;
+module_param(experimental_apsc_sync, bool, 0400);
+MODULE_PARM_DESC(experimental_apsc_sync,
+		 "refresh firmware APSC descriptors and preserve firmware-owned PS2 (default: off)");
+
 static const struct apple_soc_cpufreq_info soc_s5l8960x_info = {
 	.has_ps2 = false,
 	.max_pstate = 7,
@@ -277,6 +301,16 @@ static const struct apple_soc_cpufreq_info soc_t8103_info = {
 	.ps1_shift = APPLE_DVFS_CMD_PS1_SHIFT,
 };
 
+static const struct apple_soc_cpufreq_info soc_t6000_info = {
+	.has_ps2 = true,
+	.preserve_ps2 = true,
+	.max_pstate = 15,
+	.cur_pstate_mask = APPLE_DVFS_STATUS_CUR_PS_T8103,
+	.cur_pstate_shift = APPLE_DVFS_STATUS_CUR_PS_SHIFT_T8103,
+	.ps1_mask = APPLE_DVFS_CMD_PS1,
+	.ps1_shift = APPLE_DVFS_CMD_PS1_SHIFT,
+};
+
 static const struct apple_soc_cpufreq_info soc_t8112_info = {
 	.has_ps2 = false,
 	.max_pstate = 31,
@@ -284,6 +318,10 @@ static const struct apple_soc_cpufreq_info soc_t8112_info = {
 	.cur_pstate_shift = APPLE_DVFS_STATUS_CUR_PS_SHIFT_T8112,
 	.ps1_mask = APPLE_DVFS_CMD_PS1,
 	.ps1_shift = APPLE_DVFS_CMD_PS1_SHIFT,
+	.apsc_state_table = APPLE_APSC_STATE_TABLE_T8112,
+	.apsc_state_stride = APPLE_APSC_STATE_STRIDE_T8112,
+	.apsc_state_shadow_lo = APPLE_APSC_STATE_SHADOW_LO_T8112,
+	.apsc_state_shadow_hi = APPLE_APSC_STATE_SHADOW_HI_T8112,
 };
 
 /*
@@ -366,6 +404,10 @@ static const struct of_device_id apple_soc_cpufreq_of_match[] __maybe_unused = {
 		.data = &soc_s5l8960x_info,
 	},
 	{
+		.compatible = "apple,t6000-cluster-cpufreq",
+		.data = &soc_t6000_info,
+	},
+	{
 		.compatible = "apple,t8103-cluster-cpufreq",
 		.data = &soc_t8103_info,
 	},
@@ -441,15 +483,48 @@ static unsigned int apple_soc_cpufreq_get_rate(unsigned int cpu)
 	return 0;
 }
 
-/* Writes a request for @pstate into the command register value @reg. */
+/* Load the firmware-authored descriptor for @pstate into the APSC shadow. */
+static int apple_soc_cpufreq_sync_apsc(struct apple_cpu_priv *priv,
+				       unsigned int pstate)
+{
+	const struct apple_soc_cpufreq_info *info = priv->info;
+	u32 row, stride, table;
+	u64 old_lo, old_hi, lo, hi;
+
+	if (!experimental_apsc_sync || !info->apsc_state_stride)
+		return 0;
+
+	table = info->apsc_state_table;
+	stride = info->apsc_state_stride;
+	row = apple_soc_cpufreq_apsc_row(table, stride, pstate);
+	lo = readq_relaxed(priv->reg_base + row);
+	hi = readq_relaxed(priv->reg_base + row + sizeof(lo));
+	old_lo = readq_relaxed(priv->reg_base + info->apsc_state_shadow_lo);
+	old_hi = readq_relaxed(priv->reg_base + info->apsc_state_shadow_hi);
+
+	writeq_relaxed(lo, priv->reg_base + info->apsc_state_shadow_lo);
+	writeq_relaxed(hi, priv->reg_base + info->apsc_state_shadow_hi);
+
+	if (readq_relaxed(priv->reg_base + info->apsc_state_shadow_lo) != lo ||
+	    readq_relaxed(priv->reg_base + info->apsc_state_shadow_hi) != hi) {
+		writeq_relaxed(old_lo, priv->reg_base + info->apsc_state_shadow_lo);
+		writeq_relaxed(old_hi, priv->reg_base + info->apsc_state_shadow_hi);
+		return -EIO;
+	}
+
+	return 0;
+}
+
 static void apple_soc_cpufreq_write(struct apple_cpu_priv *priv, u64 reg,
 				    unsigned int pstate)
 {
-	reg &= ~priv->info->ps1_mask;
-	reg |= pstate << priv->info->ps1_shift;
-	if (priv->info->has_ps2)
-		FIELD_MODIFY(APPLE_DVFS_CMD_PS2, &reg, pstate);
-	reg |= APPLE_DVFS_CMD_SET;
+	bool update_ps2 = priv->info->has_ps2;
+
+	if (experimental_apsc_sync && priv->info->preserve_ps2)
+		update_ps2 = false;
+	reg = apple_soc_cpufreq_command(reg, priv->info->ps1_mask,
+					priv->info->ps1_shift, pstate,
+					update_ps2);
 
 	writeq_relaxed(reg, priv->reg_base + APPLE_DVFS_CMD);
 }
@@ -476,7 +551,6 @@ static int apple_soc_cpufreq_set_pstate(struct apple_cpu_priv *priv,
 		}
 		return -EIO;
 	}
-
 	if (priv->info->verify_transition) {
 		unsigned int previous = FIELD_GET(APPLE_DVFS_CMD_PS1, reg);
 
@@ -492,6 +566,21 @@ static int apple_soc_cpufreq_set_pstate(struct apple_cpu_priv *priv,
 	}
 
 	apple_soc_cpufreq_write(priv, reg, pstate);
+	if (apple_soc_cpufreq_sync_apsc(priv, pstate)) {
+		dev_err(priv->cpu_dev,
+			"APSC state descriptor read-back failed for P-state %u\n",
+			pstate);
+		return -EIO;
+	}
+	if (experimental_apsc_sync && priv->info->apsc_state_stride &&
+	    readq_poll_timeout_atomic(priv->reg_base + APPLE_DVFS_CMD, reg,
+				      !(reg & APPLE_DVFS_CMD_BUSY), 2,
+				      apple_soc_cpufreq_timeout(priv->info))) {
+		dev_err(priv->cpu_dev,
+			"DVFS busy timeout after APSC descriptor refresh, command=%#llx\n",
+			reg);
+		return -ETIMEDOUT;
+	}
 
 	if (priv->info->verify_transition &&
 	    readq_poll_timeout_atomic(priv->reg_base + APPLE_DVFS_CMD, reg,
@@ -1537,7 +1626,8 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 
 	policy->cpuinfo.transition_latency = transition_latency;
 	policy->dvfs_possible_from_any_cpu = true;
-	policy->fast_switch_possible = !info->verify_transition || info->lazy_verify;
+	policy->fast_switch_possible = !experimental_apsc_sync &&
+		(!info->verify_transition || info->lazy_verify);
 	policy->suspend_freq = freq_table[0].frequency;
 
 	return 0;

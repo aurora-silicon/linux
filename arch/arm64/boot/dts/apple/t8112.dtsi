@@ -619,13 +619,13 @@
 
 		cpufreq_e: cpufreq@210e20000 {
 			compatible = "apple,t8112-cluster-cpufreq", "apple,cluster-cpufreq";
-			reg = <0x2 0x10e20000 0 0x1000>;
+			reg = <0x2 0x10e20000 0 0x60000>;
 			#performance-domain-cells = <0>;
 		};
 
 		cpufreq_p: cpufreq@211e20000 {
 			compatible = "apple,t8112-cluster-cpufreq", "apple,cluster-cpufreq";
-			reg = <0x2 0x11e20000 0 0x1000>;
+			reg = <0x2 0x11e20000 0 0x60000>;
 			#performance-domain-cells = <0>;
 		};
 
