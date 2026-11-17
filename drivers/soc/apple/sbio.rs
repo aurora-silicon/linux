@@ -5221,8 +5221,9 @@ impl SepData {
 
     /// The enrol or verify work item `epoch` has stopped.
     pub(crate) fn capture_worker_stopped(&self, epoch: u64) {
-        bio::worker_stopped(&mut self.bio_session.lock(), epoch);
+        // The sensor first: a request woken by the worker's exit finds it free.
         self.capture.lock().finish_bio(epoch);
+        bio::worker_stopped(&mut self.bio_session.lock(), epoch);
         self.worker_gone.notify_all();
     }
 
@@ -6047,6 +6048,12 @@ impl SepData {
         }
         if bio::starts_capture(cmd) {
             self.wait_until_awake()?;
+        }
+        // The last enrol or verify worker keeps the sensor until its
+        // bookkeeping ends, after a no-match is already reported. Every
+        // request that takes the enclave waits for it, or fprintd's next call
+        // (a duplicate check's enrolment, a retry's GET_INFO) is refused.
+        if bio::uses_enclave(cmd) {
             self.wait_for_worker_exit(&mut self.bio_session.lock(), false)?;
         }
         let lease = if bio::uses_enclave(cmd) { Some(crate::capture::Lease::acquire(self)?) } else { None };
