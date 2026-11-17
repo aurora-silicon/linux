@@ -276,7 +276,7 @@ struct effect_job {
  * @mtp_palm_size: Whether a tool area alone marks an MTP contact as a palm.
  * @mtp_palm_ids: MTP contact IDs reported as palms until they lift.
  * @mtp_palm_debounce: Whether two consecutive palm classes mark an MTP contact
- *                     as a palm whatever its tool area (J813).
+ *                     as a palm whatever its tool area (J813, J815).
  * @mtp_palm_classed: MTP contact IDs the controller classed as palms in the
  *                    previous report.
  * @ntouches: Number of touches in most recent touch report.
@@ -2685,10 +2685,12 @@ static int magicmouse_probe(struct hid_device *hdev,
 				     of_machine_is_compatible("apple,t6041");
 		/*
 		 * The J813 controller classes contacts the same way, and two
-		 * consecutive palm classes mark its palms.
+		 * consecutive palm classes mark its palms. The J815 (15-inch)
+		 * sends the same standard report from its own, larger pad.
 		 */
 		msc->mtp_palm_debounce = !msc->mtp_c1fe &&
-					 of_machine_is_compatible("apple,j813");
+					 (of_machine_is_compatible("apple,j813") ||
+					  of_machine_is_compatible("apple,j815"));
 		/*
 		 * The J616s controller classes contacts the same way, but its
 		 * fingers reach a tool area of 2475, so only the class marks its
