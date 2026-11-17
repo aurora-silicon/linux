@@ -1558,10 +1558,12 @@ static void dcp_delayed_vblank(struct work_struct *work)
 
 static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
 {
-	if (IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) &&
-	    dcp->v27_j714s && endpoint >= 0x20 && endpoint < 0x40 &&
-	    READ_ONCE(dcp->sleep_v27_ep[endpoint - 0x20]))
-		return READ_ONCE(dcp->sleep_v27_ep[endpoint - 0x20]);
+	if (dcp->v27_sleep_transport && endpoint >= 0x20 && endpoint < 0x40) {
+		struct apple_dcp_afkep *ep = READ_ONCE(dcp->sleep_v27_ep[endpoint - 0x20]);
+
+		if (ep)
+			return ep;
+	}
 	/* The auxiliary endpoints of a desktop 26.x processor. */
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
 	    endpoint >= 0x20 && endpoint < 0x40) {
@@ -1722,8 +1724,7 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 	if (READ_ONCE(dcp->ext_dead))
 		return;
 	/* Include traffic hidden by the fail-stop logging branch below. */
-	if (IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) &&
-	    dcp->v27_j714s && endpoint >= 0x20 &&
+	if (dcp->v27_sleep_transport && endpoint >= 0x20 &&
 	    endpoint != IOMFB_ENDPOINT && !dcp_afkep(dcp, endpoint))
 		WRITE_ONCE(dcp->sleep_v27_unhandled, true);
 
@@ -1752,7 +1753,7 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 	}
 
 	ret = afk_receive_message(ep, message);
-	if (ret && IS_ENABLED(CONFIG_APPLE_SOC_SLEEP) && dcp->v27_j714s)
+	if (ret && dcp->v27_sleep_transport)
 		WRITE_ONCE(dcp->sleep_v27_unhandled, true);
 }
 
@@ -5010,12 +5011,15 @@ void dcp_poweron(struct platform_device *pdev)
 				WRITE_ONCE(dcp->crashed, true);
 				return;
 			}
-			/* The powerlog takeover report normally precedes this. */
-			if (dcp_has_panel(dcp))
-				queue_delayed_work(system_freezable_wq,
-						   &dcp->bl_fallback_wq,
-						   DCP_BL_FALLBACK_DELAY);
 		}
+		/*
+		 * The powerlog takeover report normally precedes this. A pipe adopted already
+		 * running (J716c) gets none either: without a level, a panel the firmware turned
+		 * off for a sleep could not be lit again.
+		 */
+		if (dcp_has_panel(dcp) && !dcp_backlight_active(dcp))
+			queue_delayed_work(system_freezable_wq, &dcp->bl_fallback_wq,
+					   DCP_BL_FALLBACK_DELAY);
 		/* The loader report or fallback may initialize the policy later. */
 		if (!dcp_backlight_active(dcp))
 			return;
@@ -5740,6 +5744,34 @@ static bool dcp_ext26_admitted(struct device_node *np)
 		j613_25g83_identity(true, 1, version, 3, uuid);
 	of_node_put(chosen);
 	return ok;
+}
+
+/*
+ * J716c shares the 27.0 endpoint-control wire format, not the J714s normal
+ * IOMFB method or panel profile. Establish this before RTKit can receive any
+ * application traffic, including traffic that invalidates a later inventory.
+ */
+static bool dcp_v27_sleep_transport_supported(struct apple_dcp *dcp)
+{
+	struct device *dev = dcp->dev;
+	char compat[DCP_FW_VERSION_STR_LEN];
+
+	if (!IS_ENABLED(CONFIG_APPLE_SOC_SLEEP))
+		return false;
+	if (dcp->v27_j714s)
+		return true;
+	if (!of_machine_is_compatible("apple,j716c") ||
+	    !of_machine_is_compatible("apple,t6050") ||
+	    !(of_device_is_compatible(dev->of_node, "apple,t6050-dcp") ||
+	      of_device_is_compatible(dev->of_node, "apple,t6050-dcpext")) ||
+	    !dcp->hw.adopt_live_session ||
+	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_DEFAULT ||
+	    dcp->fw_compat != DCP_FIRMWARE_V_27_0)
+		return false;
+
+	/* The enum also covers later 27.x method tables. */
+	return dcp_read_fw_version(dev, "apple,firmware-compat", compat) >= 0 &&
+	       !strcmp(compat, "27.0.0");
 }
 
 static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
@@ -6619,6 +6651,10 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 		afk_quiesce(dcp->ibootep);
 		afk_quiesce(dcp->systemep);
 		afk_quiesce(dcp->dcpavservep);
+		/* Auxiliary sleep endpoints retain DMA too, but must drain host work. */
+		if (dcp->v27_sleep_transport)
+			for (int i = 0; i < ARRAY_SIZE(dcp->sleep_v27_ep); i++)
+				afk_quiesce(READ_ONCE(dcp->sleep_v27_ep[i]));
 		cancel_delayed_work_sync(&dcp->bl_fallback_wq);
 		dcp_backlight_stop(dcp);
 		if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP) {
@@ -7020,6 +7056,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
 	    of_device_is_compatible(dev->of_node, "apple,t8142-dcp"))
 		dcp->hw.iomfb_method_profile = DCP_IOMFB_METHODS_DEFAULT;
+	dcp->v27_sleep_transport = dcp_v27_sleep_transport_supported(dcp);
 	/* The display such a processor finds at boot is its first sink. */
 	if (dcp_sink_metadata(dcp))
 		dcp_desktop_metadata_new_sink(dcp);

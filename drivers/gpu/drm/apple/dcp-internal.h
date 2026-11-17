@@ -759,12 +759,10 @@ struct apple_dcp {
 
 	/* A firmware-driven suspend stops the firmware, see dcp_s2r_suspend(). */
 	struct apple_dcp_afkep *sleep_v27_ep[0x20];
-	/*
-	 * Firmware 27.0 on the J714s, the board the firmware 27 sleep and what it needs of the
-	 * shared paths have run on. Every other machine on firmware 27, other T6050 boards and
-	 * T8142 included, takes the paths it took before.
-	 */
+	/* The J714s normal method table, panel services and swap profile. */
 	bool v27_j714s;
+	/* Sleep endpoint inventory and control replies; not a normal RPC profile. */
+	bool v27_sleep_transport;
 	struct dcp_v27_sleep *sleep_v27;
 	bool sleep_v27_closed;
 	/*
