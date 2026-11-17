@@ -282,8 +282,10 @@ struct ane_rtclient {
 	struct delayed_work poll_work;
 	struct ane_t6021_pm sleep_pm;
 	struct ane_rtclient_restart *sleep_restart;
-	/* A resume found the CPU domain never went off; restart pending. */
+	/* A system resume left the firmware restart to sleep_work. */
 	bool sleep_deferred;
+	/* The deferred restart must power-cycle a CPU that stayed on. */
+	bool sleep_cycle;
 	struct work_struct sleep_work;
 
 	/* fw_start=1 view over the shared boot/fwload helpers. */
@@ -3681,6 +3683,7 @@ static int ane_rtclient_sleep_stop(void *ctx)
 	rs->cpu_off_mark = READ_ONCE(rs->cycle.pd->cpu_off_count);
 	ane->sleep_restart = rs;
 	ane->sleep_deferred = false;
+	ane->sleep_cycle = false;
 	return 0;
 free:
 	kfree(rs);
@@ -3688,49 +3691,46 @@ free:
 }
 
 /*
- * System resume. The stopped ASC may only cold-start after its CPU domain
- * went off. A suspend that aborted before genpd powered the domains off (a
- * wake event during the device phase) resumes a CPU that was only halted;
- * booting it then fails and leaves the firmware half-started. Keep it
- * stopped and let the work below power-cycle it once system PM is done.
+ * System resume. The firmware boot takes about 1.2 s on a T8112, so it never
+ * runs here: resume only queues the work below, and the first client that
+ * beats the work finishes the restart itself (ane_rtclient_admit()). Until
+ * then submissions are held off as for any SUSPENDED device. Probe holds a
+ * runtime PM reference for the firmware lifetime, so the domains stay up
+ * between resume and the work.
+ *
+ * The stopped ASC may only cold-start after its CPU domain went off. A
+ * suspend that aborted before genpd powered the domains off (a wake event
+ * during the device phase) resumes a CPU that was only halted; booting it
+ * then fails and leaves the firmware half-started. The work power-cycles
+ * that CPU first.
  */
 static int ane_rtclient_sleep_restart(void *ctx)
 {
 	struct ane_rtclient *ane = ctx;
 	struct ane_rtclient_restart *rs = ane->sleep_restart;
-	enum ane_t6021_restart_stage stage = ANE_T6021_RESTART_CYCLE;
-	int ret;
 
 	lockdep_assert_held(&ane_t6021_fw_lock);
 	if (!rs)
 		return -EIO;
 	if (rs->cpu_off_known &&
 	    READ_ONCE(rs->cycle.pd->cpu_off_count) == rs->cpu_off_mark) {
-		if (!ane->sleep_deferred)
+		if (!ane->sleep_cycle)
 			dev_info(ane->dev,
 				 "resume: CPU domain stayed on through the sleep; restart after a power cycle\n");
-		ane->sleep_deferred = true;
-		queue_work(system_freezable_wq, &ane->sleep_work);
-		return ANE_T6021_PM_RESTART_DEFERRED;
+		ane->sleep_cycle = true;
 	}
-	ane->sleep_restart = NULL;
-	ane->sleep_deferred = false;
-	ret = ane_rtclient_rs_ready(rs);
-	if (!ret) {
-		stage = ANE_T6021_RESTART_BOOT;
-		ret = ane_rtclient_rs_boot(rs);
-	}
-	ret = ane_rtclient_rs_finish(rs, true, stage, ret);
-	kfree(rs);
-	return ret;
+	ane->sleep_deferred = true;
+	queue_work(system_freezable_wq, &ane->sleep_work);
+	return ANE_T6021_PM_RESTART_DEFERRED;
 }
 
-/* The deferred half: runtime power cycle (verified off), then boot. */
+/* The deferred half: runtime power cycle (verified off) if needed, then boot. */
 static int ane_rtclient_sleep_restart_deferred(void *ctx)
 {
 	struct ane_rtclient *ane = ctx;
 	struct ane_rtclient_restart *rs = ane->sleep_restart;
 	enum ane_t6021_restart_stage stage = ANE_T6021_RESTART_CYCLE;
+	bool cycle = ane->sleep_cycle;
 	int ret;
 
 	lockdep_assert_held(&ane_t6021_fw_lock);
@@ -3738,7 +3738,8 @@ static int ane_rtclient_sleep_restart_deferred(void *ctx)
 		return -EIO;
 	ane->sleep_restart = NULL;
 	ane->sleep_deferred = false;
-	ret = ane_rtclient_rs_power_cycle(rs);
+	ane->sleep_cycle = false;
+	ret = cycle ? ane_rtclient_rs_power_cycle(rs) : ane_rtclient_rs_ready(rs);
 	if (!ret) {
 		stage = ANE_T6021_RESTART_BOOT;
 		ret = ane_rtclient_rs_boot(rs);

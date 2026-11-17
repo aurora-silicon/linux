@@ -25,10 +25,12 @@ enum ane_t6021_pm_state {
  * The firmware may only cold-start on a CPU whose power domain went off
  * after the stop. A suspend that aborts before the domains are powered off
  * (a wake event during the device phase, or pm_test=devices) still runs
- * every resume callback. restart then returns ANE_T6021_PM_RESTART_DEFERRED:
+ * every resume callback. restart may then return ANE_T6021_PM_RESTART_DEFERRED:
  * the CPU stays stopped, the device stays SUSPENDED (submissions refused)
  * and restart_deferred() later power-cycles the domains through runtime PM
- * and boots, once system PM has released its references.
+ * and boots, once system PM has released its references. restart may also
+ * defer a cold start that needs no power cycle, to keep a slow firmware boot
+ * out of system resume.
  *
  * park is optional. It runs when a FAILED device is suspended and must leave
  * its CPU safe to lose power (proven stopped, already unpowered, or a busy
