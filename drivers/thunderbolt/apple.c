@@ -171,6 +171,15 @@ struct apple_cio_hw {
 	bool gen4_link_recovery;
 	/* Leave the host router's TMU to its firmware; host TMU constants. */
 	bool host_tmu;
+	/* Deep sleep removes the CIO domains, including an attached router. */
+	bool sleep_removes_domains;
+	/* Start the router again at once after a wake. */
+	bool restart_on_wake;
+	/*
+	 * The PHY is shared with DWC3: release PCIe, or refuse the sleep,
+	 * before DWC3's default-priority PM notifier queues its PHY shutdown.
+	 */
+	bool phy_shared_with_dwc3;
 	const struct apple_dpin_policy *dp;
 };
 
@@ -206,9 +215,22 @@ static const struct apple_cio_hw apple_cio_t8132_hw = {
 	.dp = &apple_dpin_m4,
 };
 
-/* Type 7 uses its existing ready-state check and has no qualified DP route. */
+/*
+ * T8142 has a Type 7 router with an MxWrap CPU already running after CIO
+ * reset. Hand LSTX to firmware only after RTKit is ready. DP IN is not yet
+ * qualified; the connector's DisplayPort alternate mode is independent.
+ */
 static const struct apple_cio_hw apple_cio_t8142_hw = {
+	.mxwrap = true,
 	.type7 = true,
+	.lstx_explicit = true,
+	.skip_run = true,
+	.lstx_after_boot = true,
+	.strict_fw_ready = true,
+	.no_host_clx = true,
+	.sleep_removes_domains = true,
+	.restart_on_wake = true,
+	.phy_shared_with_dwc3 = true,
 	.dp = &apple_dpin_disabled,
 };
 
@@ -1308,7 +1330,8 @@ static bool apple_cio_pciec_eligible(const struct device_node *np)
 	return of_device_is_compatible(np, "apple,t6040-pciec") ||
 	       of_device_is_compatible(np, "apple,t8103-pciec") ||
 	       of_device_is_compatible(np, "apple,t6000-pciec") ||
-	       of_device_is_compatible(np, "apple,t6050-pciec");
+	       of_device_is_compatible(np, "apple,t6050-pciec") ||
+	       of_device_is_compatible(np, "apple,t8142-pciec");
 }
 
 static bool
@@ -3999,6 +4022,16 @@ static bool apple_cio_t6050_sleep(struct apple_cio *acio)
 	       apple_sleep_v27_late() && !pm_suspend_default_s2idle();
 }
 
+/*
+ * Deep sleep removes the CIO domains, including an attached router. A freeze
+ * does not, even with deep as the default.
+ */
+static bool apple_cio_sleep_removes_domains(struct apple_cio *acio)
+{
+	return acio->hw->sleep_removes_domains && !pm_suspend_default_s2idle() &&
+	       !pm_suspend_no_platform();
+}
+
 /* The longest the displays behind a port may take to go before its router does. */
 #define APPLE_CIO_SLEEP_DP_RELEASE_MS	3000
 
@@ -4101,7 +4134,8 @@ static int apple_cio_sleep_teardown(struct apple_cio *acio)
 	scoped_guard(mutex, &acio->pcie_tunnel_lock) {
 		if (READ_ONCE(acio->pcie_tunnel_requested) || acio->pcie_tunnel_populated) {
 			struct platform_device *pcie;
-			int mode = READ_ONCE(t6050_sleep_pcie);
+			bool removes = apple_cio_sleep_removes_domains(acio);
+			int mode = removes ? 1 : READ_ONCE(t6050_sleep_pcie);
 			int ret = 0;
 
 			/*
@@ -4110,7 +4144,7 @@ static int apple_cio_sleep_teardown(struct apple_cio *acio)
 			 * still carries them: only NVMe controllers, whose driver touches no
 			 * notifier chain on removal, and by default only with no disk in use.
 			 */
-			if (!mode || !apple_cio_t6050_sleep(acio))
+			if (!mode || (!removes && !apple_cio_t6050_sleep(acio)))
 				return 0;
 			pcie = apple_cio_find_pcie_tunnel(acio);
 			if (pcie) {
@@ -4121,7 +4155,8 @@ static int apple_cio_sleep_teardown(struct apple_cio *acio)
 				dev_warn(acio->dev,
 					 "PCIe devices behind this port stay for the sleep (%d): the port is not powered off\n",
 					 ret);
-				return 0;
+				/* T8142 cannot retain this port through deep sleep. */
+				return removes ? ret : 0;
 			}
 		}
 		acio->pcie_tunnel_stopping = true;
@@ -4130,7 +4165,7 @@ static int apple_cio_sleep_teardown(struct apple_cio *acio)
 	dev_info(acio->dev, "powering off port for system sleep (cable info 0x%x)\n",
 		 acio->current_cable_info);
 	t6050 = apple_cio_t6050_sleep(acio);
-	if (t6050) {
+	if (t6050 || apple_cio_sleep_removes_domains(acio)) {
 		u64 activity;
 
 		/* With no NHI the answer is "yes": then nothing is expected back. */
@@ -4198,7 +4233,7 @@ static void apple_cio_sleep_restart_work(struct work_struct *work)
 /* Is this port powered off for the sleep about to start? Asked at PM_SUSPEND_PREPARE. */
 static bool apple_cio_sleep_tears_down(struct apple_cio *acio)
 {
-	if (READ_ONCE(s2idle_teardown))
+	if (READ_ONCE(s2idle_teardown) || apple_cio_sleep_removes_domains(acio))
 		return true;
 	/* A "freeze" is a suspend-to-idle with deep as the default too: the port stays up. */
 	if (pm_suspend_no_platform())
@@ -4228,7 +4263,7 @@ static int apple_cio_pm_notify(struct notifier_block *nb, unsigned long event,
 		apple_cio_sleep_close_owed(acio);
 		/* Before tasks freeze: tearing down the NHI needs unfrozen work. */
 		if (tears_down) {
-			/* Only the displays' release refuses, with the port as it was. */
+			/* Refuse before powering off a port that cannot be released. */
 			ret = apple_cio_sleep_teardown(acio);
 			if (ret)
 				return notifier_from_errno(ret);
@@ -4243,6 +4278,8 @@ static int apple_cio_pm_notify(struct notifier_block *nb, unsigned long event,
 			}
 			owed = acio->sleep_restart_owed;
 			early = acio->sleep_aborted_early;
+			if (acio->hw->restart_on_wake)
+				delay = 0;
 			/* TEST: macOS starts the router again straight after the wake. */
 			if (acio->sleep_t6050) {
 				acio->sleep_t6050 = false;
@@ -4727,6 +4764,9 @@ static int apple_cio_probe(struct platform_device *pdev)
 	}
 
 	acio->pm_notifier.notifier_call = apple_cio_pm_notify;
+	/* Before DWC3's default-priority notifier queues its PHY shutdown. */
+	if (acio->hw->phy_shared_with_dwc3)
+		acio->pm_notifier.priority = 40;
 	register_pm_notifier(&acio->pm_notifier);
 	/* Before the notifiers of the default priority, after the port controllers' (30). */
 	acio->pm_notifier_dp.notifier_call = apple_cio_dp_pm_notify;
