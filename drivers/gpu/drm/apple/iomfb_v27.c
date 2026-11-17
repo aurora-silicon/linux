@@ -210,6 +210,11 @@ static const struct dcp_method_entry dcp_methods_27_2[dcpep_num_methods] = {
 	IOMFB_METHOD("A529", iomfbep_abort_swaps_dcp),
 	IOMFB_METHOD("A534", dcpep_set_power_state),
 	IOMFB_METHOD("A533", dcpep_register_dfb_surface),
+	/*
+	 * The AP link's release: t8142dcp 26B123 compares 'A550', then 'A550' | 1, in the
+	 * dispatch where 26A428's compares 'A500' (0x1df68c vs 0x1de0dc, same code).
+	 */
+	IOMFB_METHOD("A550", dcpep_unnamed_500),
 };
 
 /*
