@@ -139,6 +139,11 @@ ASAHI_TESTS = {
     'centauri-wifi-pm-tests.py': [(out(), PASS), (out() + ['--negative-controls'], PASS)],
     'centauri-bt-arena-tests.py': [(out(), PASS), (out() + ['--negative-controls'], PASS)],
     'centauri-recovery-tests.py': [(out(), PASS), (out() + ['--negative-controls'], PASS)],
+    'centauri-physical-recovery-tests.py': [(out(), PASS)]
+        + mutations('--mutation', ('bound-guard-reverted', 'owner-guard-reverted',
+                                   'missing-control-firmware', 'missing-control-descriptor',
+                                   'missing-owner-ipc', 'missing-owner-firmware',
+                                   'missing-owner-descriptor', 'missing-owner-arena'), out()),
     'clpc-gpu-demand-tests.py': [([], PASS)],
     # The old policy always disabled compute preemption.
     'compute-preempt-tests.py': [(out(), PASS),
