@@ -145,6 +145,7 @@ ASAHI_TESTS = {
     'dart-sleep-power-tests.py': [([], PASS)],
     'dart-sleep-snapshot-tests.py': [([], PASS)],
     'dart-sleep-writer-tests.py': [([], PASS)],
+    'backlight-coldboot-tests.py': [(out('--output'), PASS), (out('--output') + ['--negative-controls'], PASS)],
     'dcp14-backlight-tests.py': [([], PASS)],
     'dcp14-panel-tests.py': [([], PASS)],
     'devcoredump-init-tests.py': [([], PASS)],
