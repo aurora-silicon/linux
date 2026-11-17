@@ -1078,9 +1078,9 @@ void dcp_enable_typec_work(struct apple_dcp *dcp);
 void dcp_swap_watchdog(struct work_struct *work);
 void dcp_poweroff_retire_swallowed(struct apple_dcp *dcp);
 void iomfb_scanout_put_h17p(struct apple_dcp *dcp, struct iomfb_scanout_h17p *scanout);
-bool dcp_panel_adaptive_off_enabled(void);
-void dcp_panel_adaptive_send(struct apple_dcp *dcp);
 #endif
+
+bool dcp_panel_adaptive_off_enabled(void);
 
 int dcp_backlight_init(struct apple_dcp *dcp, struct device *dev);
 void dcp_backlight_stop(struct apple_dcp *dcp);

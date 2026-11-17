@@ -2380,52 +2380,11 @@ static void dcp_on_final(struct apple_dcp *dcp, void *out, void *cookie)
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)
 static void dcp_on_set_parameter(struct apple_dcp *dcp, void *out, void *cookie);
 
-/*
- * Lab knob panel_adaptive_off: force fixed refresh on the internal panel.
- * The driver never programs the panel's refresh policy, so firmware 27.3 runs
- * its default adaptive state; a swap-gated 2-stage pipeline then shows swap
- * k-2 after idle. Sends param 15 {0,0,0} count 3 (H17 27.x adaptive sync off)
- * at panel power-on completion, and from the parameter set hook for a live
- * apply on a screen off-and-on cycle without a reboot. Logs the send and the
- * firmware reply.
- */
-static void dcp_panel_adaptive_done(struct apple_dcp *dcp, void *out, void *cookie)
-{
-	dev_info(dcp->dev, "panel adaptive-sync off sent, firmware replied %s\n",
-		 out ? "ok" : "no data");
-	(void)cookie;
-}
-
-void dcp_panel_adaptive_send(struct apple_dcp *dcp)
-{
-	struct dcp_set_parameter_dcp param = {
-		.param =
-#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
-		15,
-#else
-		IOMFBPARAM_ADAPTIVE_SYNC,
-#endif
-		.value = { 0 },
-#if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-		.count = 3,
-#else
-		.count = 1,
-#endif
-	};
-
-	if (!dcp_has_panel(dcp) || !dcp_panel_adaptive_off_enabled())
-		return;
-	dev_info(dcp->dev, "sending panel adaptive-sync off (param %u)\n", param.param);
-	dcp_set_parameter_dcp(dcp, false, &param, dcp_panel_adaptive_done, NULL);
-}
-
 /* After set_power_state(1): select the display, then adaptive sync off. */
 static void dcp_on_set_power_state(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	u32 handle = dcp->main_display ? 0 : 2;
 
-	if (dcp->main_display && dcp_panel_adaptive_off_enabled())
-		dcp_panel_adaptive_send(dcp);
 	dcp_set_display_device(dcp, false, &handle,
 			       dcp->main_display ? dcp_on_final :
 						   dcp_on_set_parameter,
@@ -2473,12 +2432,16 @@ static void dcp_poweron_after_prepare_wake(struct apple_dcp *dcp, void *out,
 	dcp_first_client_open(dcp, false, dcp_poweron_after_first_client, cookie);
 }
 #else
+static void DCP_FW_NAME(dcp_panel_adaptive_send)(struct apple_dcp *dcp);
+
 static void dcp_on_set_power_state(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	struct DCP_FW_NAME(dcp_set_power_state_req) req = {
 		.unklong = 1,
 	};
 
+	if (dcp->main_display)
+		DCP_FW_NAME(dcp_panel_adaptive_send)(dcp);
 	dcp_set_power_state(dcp, DCP_POWER_OOB, &req, dcp_on_final, cookie);
 }
 
@@ -2502,6 +2465,46 @@ static void dcp_on_set_parameter(struct apple_dcp *dcp, void *out, void *cookie)
 	dcp_set_parameter_dcp(dcp, false, &param, dcp_on_set_power_state, cookie);
 }
 #endif
+
+/*
+ * Lab knob panel_adaptive_off: force fixed refresh on the internal panel.
+ * The driver never programs the panel's refresh policy, so firmware 27.3 runs
+ * its default adaptive state; a swap-gated 2-stage pipeline then shows swap
+ * k-2 after idle. Sends param 15 {0,0,0} count 3 (H17 27.x adaptive sync off)
+ * at panel power-on completion. Logs the send and the firmware reply.
+ * Static per-firmware TU: the template instantiates once per firmware.
+ */
+static void DCP_FW_NAME(dcp_panel_adaptive_done)(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	dev_info(dcp->dev, "panel adaptive-sync off sent, firmware replied %s\n",
+		 out ? "ok" : "no data");
+	(void)cookie;
+}
+
+static void DCP_FW_NAME(dcp_panel_adaptive_send)(struct apple_dcp *dcp)
+{
+	struct dcp_set_parameter_dcp param = {
+		.param =
+#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
+		15,
+#else
+		IOMFBPARAM_ADAPTIVE_SYNC,
+#endif
+		.value = { 0 },
+#if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
+		.count = 3,
+#else
+		.count = 1,
+#endif
+	};
+
+	if (!dcp_has_panel(dcp) || !dcp->main_display ||
+	    !dcp_panel_adaptive_off_enabled())
+		return;
+	dev_info(dcp->dev, "sending panel adaptive-sync off (param %u)\n", param.param);
+	dcp_set_parameter_dcp(dcp, false, &param,
+			      DCP_FW_NAME(dcp_panel_adaptive_done), NULL);
+}
 
 void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 {
