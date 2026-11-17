@@ -2674,6 +2674,27 @@ static void t6050_sleep_before_enclave(struct apple_sleep *s)
 	t6050_sleep_dart_stop(s, T6050_DART_SEP);
 }
 
+/*
+ * The early secondary-cluster step counts each present core entering its
+ * last WFI. A core left off by a failed restart cannot acknowledge it.
+ * Parked cores, including intentionally offline ones, still take part.
+ */
+static int t6050_check_early_cpus(struct apple_sleep *s)
+{
+	unsigned int cpu, cluster;
+
+	if (!s->soc->clusters_down_first)
+		return 0;
+	for_each_present_cpu(cpu) {
+		cluster = sleep_cpu_cluster(s, cpu_logical_map(cpu));
+		if ((cluster == 1 || cluster == 2) && spin_table_cpu_tracked_off(cpu)) {
+			dev_warn(s->dev, "refused: early cluster CPU%u still tracked off\n", cpu);
+			return -EBUSY;
+		}
+	}
+	return 0;
+}
+
 /* Final returning checks: no last_stop/enclave action has happened yet. */
 static int t6050_sleep_final_check(struct apple_sleep *s)
 {
@@ -2682,6 +2703,10 @@ static int t6050_sleep_final_check(struct apple_sleep *s)
 	u64 now, delay, counter;
 	u32 compare;
 	int ret;
+
+	ret = t6050_check_early_cpus(s);
+	if (ret)
+		return ret;
 
 	if (!r->ptd_owned || !s->smc.held || !s->smc.saved_ops ||
 	    !s->smc.saved_ops->check || !s->smc.saved_ops->commit_notice) {
