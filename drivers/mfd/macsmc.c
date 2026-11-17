@@ -1537,6 +1537,21 @@ static int apple_smc_suspend_noirq(struct device *dev)
 static int apple_smc_resume_noirq(struct device *dev)
 {
 	struct apple_smc *smc = dev_get_drvdata(dev);
+	unsigned int i;
+
+	/*
+	 * A wake by something the SMC reports (a port's plug or unplug) brings a notification
+	 * right behind it, and its handler's ordinary command can be in flight here: posted, its
+	 * reply waiting in the mailbox with the interrupt still off. That is no unresolved saved
+	 * command. Take the reply in by polling before judging the lane; refusing here left the
+	 * SMC without its AP ON notice and ANS waiting for its topology ("timed out waiting for
+	 * topology from SMC", ANS crashed 10 s into the wake).
+	 */
+	if (smc->saved_enabled && !smc->saved_recovery && !smc->saved_fault)
+		for (i = 0; i < 20000 && smp_load_acquire(&smc->saved_pending); i++) {
+			apple_rtkit_poll(smc->rtk);
+			udelay(10);
+		}
 
 	if (smc->saved_enabled && (smc->saved_recovery || smc->saved_pending ||
 				   smc->saved_fault))
