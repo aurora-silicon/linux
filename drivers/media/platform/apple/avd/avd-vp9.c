@@ -262,7 +262,7 @@ static void set_refs(struct avd_ctx *ctx, struct avd_vp9_run *run)
 			 dst->vp9.width;
 		yscale = (ref_buf[i]->vp9.height << VP9_REF_SCALE_SHIFT) /
 			 dst->vp9.height;
-		push(AVD_HDR_HEIGHT(xscale) | AVD_HDR_WIDTH(yscale),
+		push(AVD_HDR_HEIGHT(yscale) | AVD_HDR_WIDTH(xscale),
 		     "ref_scale");
 
 		push_comp(ctx, addr, ref_buf[i]->comp.offsets);
