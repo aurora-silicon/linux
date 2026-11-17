@@ -481,6 +481,22 @@ static const struct hw_info t6050_pciec_hw = {
 	.s2idle_hold_domain	= true,
 };
 
+/* T8142 shares this register layout, with its own three-cell AIC MSI slice. */
+static const struct hw_info t8142_pciec_hw = {
+	.port_msiaddr		= PORT_MSIADDR,
+	.port_msiaddr_hi	= PORT_MSIADDR + 4,
+	.port_perst		= PORT_PERST,
+	.port_rid2sid		= PORT_RID2SID,
+	.port_msimap		= PORT_T602X_MSIMAP,
+	.port_tunctrl		= PORT_T6050_TUNCTRL,
+	.max_rid2sid		= 256,
+	.tunneled		= true,
+	.tunnel_intr2axi	= true,
+	.no_port_reset		= true,
+	.msimap_by_vector	= true,
+	.mps_timers		= true,
+};
+
 static const struct of_device_id apple_pcie_of_match[];
 
 /**
@@ -3394,8 +3410,25 @@ static int apple_msi_init(struct apple_pcie *pcie)
 	 * 32-vector slice. Keep endpoint MSI data local, and route its table
 	 * entry to the corresponding shared-window vector.
 	 */
-	if (pcie->hw == &t8122_pciec_hw || pcie->hw == &t8132_pciec_hw ||
-	    pcie->hw == &t6040_pciec_hw) {
+	if (pcie->hw == &t8132_pciec_hw || pcie->hw == &t8142_pciec_hw) {
+		/*
+		 * msi-ranges names the AIC input of global vector
+		 * apple,msi-vector-base in a linear window, so the slice is
+		 * checked by its shape only: an edge-rising SPI, 32 vectors,
+		 * 32-aligned, above the internal port's vectors and inside the
+		 * 8-bit map target.
+		 */
+		if (args.args_count != 3 || args.args[0] != 0 ||
+		    args.args[2] != IRQ_TYPE_EDGE_RISING ||
+		    of_property_read_u32(to_of_node(fwnode),
+					 "apple,msi-vector-base",
+					 &pcie->msi_vector_base) ||
+		    args.args[1] < pcie->msi_vector_base ||
+		    !apple_t6030_msi_slice_valid(pcie->msi_vector_base,
+						 pcie->nvecs, args.args[1],
+						 args.args[1] - pcie->msi_vector_base))
+			goto invalid_slice;
+	} else if (pcie->hw == &t8122_pciec_hw || pcie->hw == &t6040_pciec_hw) {
 		struct resource ecam;
 		u32 expected_base, aic_base;
 
@@ -3428,19 +3461,6 @@ static int apple_msi_init(struct apple_pcie *pcie)
 				break;
 			case 0x1c70000000ULL:
 				expected_base = 0x60;
-				break;
-			default:
-				goto invalid_slice;
-			}
-		} else if (of_machine_is_compatible("apple,t8132")) {
-			aic_base = 1506;
-			switch (ecam.start) {
-			/* The internal port's bridges own vectors 0..95. */
-			case 0x1c50000000ULL:
-				expected_base = 0x60;
-				break;
-			case 0x1c60000000ULL:
-				expected_base = 0x80;
 				break;
 			default:
 				goto invalid_slice;
@@ -3478,7 +3498,7 @@ static int apple_msi_init(struct apple_pcie *pcie)
 
 	/* Keep map targets within the supported 8-bit range. */
 	if ((pcie->hw == &t8122_pciec_hw || pcie->hw == &t8132_pciec_hw ||
-	     pcie->hw == &t6040_pciec_hw) &&
+	     pcie->hw == &t6040_pciec_hw || pcie->hw == &t8142_pciec_hw) &&
 	    (!pcie->nvecs || pcie->nvecs > 256 ||
 	     pcie->msi_vector_base >
 	     FIELD_MAX(PORT_MSIMAP_TARGET) + 1 - pcie->nvecs)) {
@@ -7588,6 +7608,7 @@ static const struct dev_pm_ops apple_pcie_pm_ops = {
 static const struct of_device_id apple_pcie_of_match[] = {
 	{ .compatible = "apple,t6040-pciec",	.data = &t6040_pciec_hw },
 	{ .compatible = "apple,t6050-pciec",	.data = &t6050_pciec_hw },
+	{ .compatible = "apple,t8142-pciec",	.data = &t8142_pciec_hw },
 	{ .compatible = "apple,t8132-pciec",	.data = &t8132_pciec_hw },
 	{ .compatible = "apple,t8122-pciec",	.data = &t8122_pciec_hw },
 	{ .compatible = "apple,t8112-pciec",	.data = &t8112_pciec_hw },
