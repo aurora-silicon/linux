@@ -168,6 +168,19 @@ static const struct dcp_method_entry dcp_methods_27_0[dcpep_num_methods] = {
  * an unknown tag with a panic ("link_rpc_lookup callback not found"), so
  * dfb_ready_query, whose 27.2 tag has not been seen in a call, has no entry
  * here and is not sent to this build (boot_5()).
+ *
+ * The method side of this table is confirmed by a static read of Apple's
+ * public 27.2.1 restore image for this board (T6050): the framebuffer and
+ * DCP-side classes show the same method layout, with the swap request and
+ * response still in the v27 shapes (0xff4 / 0x6e0). The read also explains
+ * 27.3's one-higher IDs from here up: the pbl fence-notify and swap-complete
+ * methods and the trace-source swap-wait parameter exist only in 27.3, and
+ * 27.2 has none of them. The 27.3 table's pbl fence-notify row therefore has
+ * no 27.2 method and is dropped on retarget, and its MemDescRelay thunk row
+ * has no symbol in the 27.2 image, so it stays on the offset basis. The tag
+ * values themselves are registered by the firmware, not the kernelcache, so
+ * this read cannot confirm them; they stay as this table had them until a
+ * 27.2 boot does.
  */
 static const struct dcp_method_entry dcp_methods_27_2[dcpep_num_methods] = {
 	IOMFB_METHOD("A000", dcpep_late_init_signal),
