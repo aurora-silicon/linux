@@ -42,6 +42,8 @@ const GTP6_SIZE: usize = GTP_SLOTS
 /// macOS 26.6.2 on the J616C spaces a clustered pass's metadata 2, 3 and 4 0x1180, 0x1400
 /// and 0x1600 apart: metadata 2 needs 0x1180, more than the M2 Pro/Max 0xc00.
 const GTP_MULTI_CLUSTER_SIZES: [usize; 3] = [0x1180, 0x280 * 16, 0x10 * 128];
+/// Metadata 1 is the last sub-buffer; its macOS size is not visible in the capture. Keep a floor.
+const META1_MIN_SIZE: usize = 0x4000;
 const META1_BLOCK_SIZE: usize = 0x44;
 
 /// Per-command geometry, independent of the capacity already allocated.
@@ -142,7 +144,7 @@ impl Layout {
                         meta1_blocks.checked_mul(META1_BLOCK_SIZE).ok_or(EOVERFLOW)?,
                         0x80,
                     )?
-                    .max(GTP_FIXED_SIZES[3]),
+                    .max(META1_MIN_SIZE),
                 ]
             } else {
                 GTP_FIXED_SIZES
