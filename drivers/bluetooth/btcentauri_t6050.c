@@ -10,6 +10,7 @@
 #include <linux/apple-centauri.h>
 #include <linux/of.h>
 #include <linux/pci.h>
+#include <linux/pci-apple.h>
 #include <linux/property.h>
 #include <linux/random.h>
 #include <linux/sizes.h>
@@ -861,6 +862,10 @@ static int cen_dma_stopped(struct cen_bt *bt)
 						      &command));
 	if (ret)
 		return ret;
+	/* Reset by the host for the wake, and not enumerated again yet */
+	if (PCI_POSSIBLE_ERROR(command))
+		return apple_pcie_t6050_warm_reset_done(bt->pdev->bus->self) ?
+			0 : -EBUSY;
 	if (command & PCI_COMMAND_MASTER)
 		return -EBUSY;
 	if (!pci_wait_for_pending_transaction(bt->pdev))

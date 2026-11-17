@@ -205,7 +205,12 @@ bool centauri_t6050_stop_dma(struct pci_dev *pdev)
 
 	pci_clear_master(pdev);
 	ret = pci_read_config_word(pdev, PCI_COMMAND, &command);
-	if (ret || (command & PCI_COMMAND_MASTER))
+	if (ret)
+		return false;
+	/* Reset by the host for the wake, and not enumerated again yet */
+	if (PCI_POSSIBLE_ERROR(command))
+		return apple_pcie_t6050_warm_reset_done(pdev->bus->self);
+	if (command & PCI_COMMAND_MASTER)
 		return false;
 	return pci_wait_for_pending_transaction(pdev);
 }

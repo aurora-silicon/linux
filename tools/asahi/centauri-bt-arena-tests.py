@@ -45,9 +45,11 @@ STUBS = r'''
 typedef uint16_t u16;
 #define PCI_COMMAND 4
 #define PCI_COMMAND_MASTER 4
+#define PCI_POSSIBLE_ERROR(x) ((x) == (typeof(x))~0)
 #define CEN_ARENA_SIZE (1024 * 1024)
 struct device { int dummy; };
-struct pci_dev { struct device dev; void *data; };
+struct pci_bus { struct pci_dev *self; int number; };
+struct pci_dev { struct device dev; void *data; struct pci_bus *bus; int devfn; };
 struct hci_dev { int dummy; };
 struct cen_bt {
     struct pci_dev *pdev;
@@ -61,12 +63,13 @@ struct cen_bt {
     int suspend_error;
 };
 static struct cen_bt *active;
-static int config_error, pending, command, saves, save_error, requests, recovery_error;
+static int config_error, pending, saves, save_error, requests, recovery_error;
 static int unregisters, closes, hci_frees, arena_frees, irq_frees;
 static int owner_unregisters, handoffs;
 static void *handed_arena;
 static uintptr_t handed_dma;
-static bool sleep_reboot;
+static u16 command;
+static bool sleep_reboot, host_reset;
 static void mutex_lock(int *p) { (void)p; }
 static void mutex_unlock(int *p) { (void)p; }
 static void cancel_work_sync(int *p) { *p = 0; }
@@ -102,6 +105,10 @@ static int pci_read_config_word(struct pci_dev *p, int reg, u16 *out) {
     return config_error;
 }
 static int pcibios_err_to_errno(int error) { return error ? -EIO : 0; }
+static bool apple_pcie_t6050_warm_reset_done(struct pci_dev *bridge) {
+    (void)bridge;
+    return host_reset;
+}
 static bool pci_wait_for_pending_transaction(struct pci_dev *p) {
     assert(p == active->pdev);
     return pending;
@@ -138,7 +145,8 @@ static int pci_save_state(struct pci_dev *p) { (void)p; saves++; return save_err
 '''
 
 TESTS = r'''
-static struct pci_dev dev;
+static struct pci_bus bus;
+static struct pci_dev dev = { .bus = &bus };
 static struct hci_dev hdev;
 static struct cen_bt bt;
 static void reset(void) {
@@ -155,7 +163,7 @@ static void reset(void) {
     unregisters = closes = hci_frees = arena_frees = irq_frees = 0;
     owner_unregisters = handoffs = 0;
     handed_arena = NULL; handed_dma = 0;
-    sleep_reboot = true;
+    sleep_reboot = true; host_reset = false;
 }
 static void stopped(void) {
     assert(cen_quiesce(&bt) == 0);
@@ -176,6 +184,12 @@ int main(void) {
     assert(cen_release(&bt) == -EIO);
     config_error = 0; pending = 0;
     assert(cen_release(&bt) == -EBUSY);
+    /* All-ones is a stopped function only after the host's reset. */
+    command = 0xffff;
+    assert(cen_release(&bt) == -EBUSY);
+    host_reset = true;
+    assert(cen_dma_stopped(&bt) == 0);
+    host_reset = false; command = 0;
     assert(bt.arena == (void *)0x1000 && bt.dma == 0x2000);
     assert(bt.ipc_requested && arena_frees == 0);
     pending = 1; bt.io_work = 1;
@@ -352,9 +366,6 @@ int main(void) {
 def probe_stubs():
     stubs = STUBS.replace('struct device { int dummy; };',
                          'struct device { struct device *parent; void *of_node; };')
-    stubs = stubs.replace('struct pci_dev { struct device dev; void *data; };',
-                         'struct pci_bus { int number; };\n'
-                         'struct pci_dev { struct device dev; void *data; struct pci_bus *bus; int devfn; };')
     stubs = stubs.replace('struct hci_dev { int dummy; };', 'struct sk_buff;\nstruct hci_dev {\n    int bus;\n    int (*open)(struct hci_dev *), (*close)(struct hci_dev *);\n    int (*flush)(struct hci_dev *), (*setup)(struct hci_dev *);\n    int (*post_init)(struct hci_dev *), (*reset_dup_filter)(struct hci_dev *);\n    int (*send)(struct hci_dev *, struct sk_buff *);\n};')
     stubs = stubs.replace('    void *arena;', '    void *arena, *bar;')
     stubs = stubs.replace('static struct cen_bt *active;',

@@ -112,6 +112,7 @@ static void pci_clear_master(struct pci_dev *p)
 { p->reads++; p->writes++; if (can_config(p)) p->command &= ~PCI_COMMAND_MASTER; }
 static int pci_read_config_word(struct pci_dev *p, int where, u16 *v)
 { (void)where; p->reads++; *v = can_config(p) ? p->command : 0xffff; return 0; }
+#define PCI_POSSIBLE_ERROR(v) ((v) == (typeof(v))~0)
 static int pcibios_err_to_errno(int x) { return x ? -EIO : 0; }
 static bool pci_wait_for_pending_transaction(struct pci_dev *p)
 { return can_config(p) && !p->pending && !force_pending; }
