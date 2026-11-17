@@ -594,6 +594,9 @@ static int mca_fe_set_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 
 	mca_modify(cl, CLUSTER_TX_OFF + REG_TX_SERDES_CONF,
 		   SERDES_CONF_BCLK_POL, serdes_conf);
+	/* J613 sense SDOUT is launched on the rising edge, not sampled there. */
+	if (of_machine_is_compatible("apple,j613") && cl->no == 2)
+		serdes_conf ^= SERDES_CONF_BCLK_POL;
 	mca_modify(cl, CLUSTER_RX_OFF + REG_RX_SERDES_CONF,
 		   SERDES_CONF_BCLK_POL, serdes_conf);
 	writel_relaxed(bitstart,
