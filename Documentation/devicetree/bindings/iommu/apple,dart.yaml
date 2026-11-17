@@ -33,6 +33,8 @@ properties:
           - apple,t8110-dart
           - apple,t6000-dart
           - apple,t8152-dart-gen3
+          - apple,t8152-acio-dart
+          - apple,t8152-pciec-dart
       - items:
           - const: apple,t8140-ane-dart
           - const: apple,t8140-dart
@@ -369,7 +371,10 @@ allOf:
       properties:
         compatible:
           contains:
-            const: apple,t8152-dart-gen3
+            enum:
+              - apple,t8152-dart-gen3
+              - apple,t8152-acio-dart
+              - apple,t8152-pciec-dart
     then:
       description:
         The T8152 Gen3 DARTs in front of the display coprocessors and their
@@ -377,7 +382,10 @@ allOf:
         locked, and the operating system only adds page table entries in
         root slots that are empty at handoff. Their TLB command register
         answers translation queries; a stream is invalidated through the
-        TLB invalidation aperture instead.
+        TLB invalidation aperture instead. The DARTs of the rear USB4
+        routers (ACIO NHI streams) and of their PCIe-C tunnels use the same
+        invalidation aperture, each at its own slot, but start unlocked with
+        inactive streams and are initialized by the operating system.
       properties:
         reg:
           minItems: 2
@@ -394,6 +402,18 @@ allOf:
           items:
             - const: dart
             - enum: [dapf, gapf, ps-wr-dis, auxiliary]
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t8152-acio-dart
+              - apple,t8152-pciec-dart
+    then:
+      required:
+        - apple,dma-range
+        - apple,tunable
 
 additionalProperties: false
 
