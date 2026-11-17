@@ -773,7 +773,7 @@ impl Backend {
         // sleeping, and nothing of the new queue is visible yet.
         const RETAINED_CONTEXT_WAIT_NS: u64 = 4 * WORK_RING_WAIT_NS;
         let started = now_ns();
-        let (lease, uat, pool, qos, execution, slot, share) = loop {
+        let (lease, uat, pool, qos, execution, slot, share, render_id) = loop {
             let observed = shared.queues.observe();
             let lease = shared.preparations.enter(true)?;
             let mut state = shared.state.lock();
@@ -794,6 +794,13 @@ impl Backend {
             {
                 return Err(super::capacity::refused(super::capacity::Site::LogicalQueues));
             }
+            // A context that takes its render pool identity now is refused here, holding
+            // nothing, when render graphs kept until the firmware stops hold the rest.
+            let render_id = if shared.variant.render_id_at_create {
+                Some(super::freelist::RenderId::new(&firmware.render_ids)?)
+            } else {
+                None
+            };
             // The new context may reuse a pooled scheduler page: clear released QoS rows first.
             firmware.queues.qos_ids.forget_released(|ids| firmware.port.qos_forget(ids));
             // G17P queues of one VM join its live execution context (super::exec_share).
@@ -818,6 +825,7 @@ impl Backend {
                         execution,
                         slot,
                         share,
+                        render_id,
                     )
                 }
                 Err(error) if error == ENOSPC => {
@@ -828,6 +836,7 @@ impl Backend {
                     if closing == 0 || now_ns().saturating_sub(started) >= RETAINED_CONTEXT_WAIT_NS {
                         return Err(super::capacity::refused(super::capacity::Site::ExecutionContexts));
                     }
+                    drop(render_id);
                     drop(state);
                     drop(lease);
                     // Nothing is visible yet: a signalled creator restarts.
@@ -866,6 +875,7 @@ impl Backend {
                 shared.renders.clone(),
                 shared.progress.clone(),
                 share,
+                render_id,
             )?,
             GFP_KERNEL,
         )?;
@@ -1594,7 +1604,9 @@ impl compute::Host for ComputeHost<'_> {
         super::Firmware::apply_shared_effort(self.init, self.effort, self.port, super::power::FULL_EFFORT)
     }
     fn submit_m5(&mut self, submission: &super::fw::m5::queue::HardwareSubmission) -> Result {
-        self.regs.submit_m5_work(submission)
+        // Compute only (publication and installation); render pairs submit through
+        // Firmware::submit_m5_render_pair, which keeps its own order.
+        self.regs.submit_m5_work_held(submission)
     }
 }
 
@@ -1789,6 +1801,29 @@ impl super::Firmware {
 }
 
 impl Registry {
+    /// The firmware restarted after a real sleep powered its domain off, which lost every M5
+    /// compute queue's host-port configuration. Sends it again for each installed queue
+    /// ([`compute::Queue::wake_configuration`]), with the device mutex held and publication still
+    /// closed, so before any doorbell: no advance and no doorbell, and the next kick is an
+    /// ordinary one. Returns how many were sent and how many failed.
+    pub(in crate::g17) fn restore_compute_port_configurations(
+        &self,
+        regs: &crate::regs::G17Resources,
+    ) -> (u32, u32) {
+        let (mut sent, mut failed) = (0, 0);
+        for entry in self.compute.iter().flatten() {
+            let Some(queue) = entry.queue.as_deref() else {
+                continue;
+            };
+            match queue.wake_configuration() {
+                Ok(None) => {}
+                Ok(Some(submission)) if regs.submit_m5_work(&submission).is_ok() => sent += 1,
+                _ => failed += 1,
+            }
+        }
+        (sent, failed)
+    }
+
     /// Everything ensure_compute establishes for `owner`: the shared compute
     /// objects mapped into its VM, and its queue bound to `context` with a
     /// pool that fits and no spared witness to release.
@@ -2852,7 +2887,7 @@ impl Backend {
         };
         // Off the device mutex: this takes the address space's lock.
         uat.kernel_lower_vm()
-            .capacity(crate::hw::t8140::dynamic::LOWER)
+            .capacity(uat.kernel_lower_dynamic_range())
             .is_ok_and(|(_, largest)| largest < super::freelist::RENDER_POOL_SPAN)
     }
 

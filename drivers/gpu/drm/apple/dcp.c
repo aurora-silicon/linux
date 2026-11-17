@@ -1083,10 +1083,10 @@ static void dcp_firmware_metadata_notify(struct apple_dcp *dcp)
 	unsigned long flags;
 	bool ready;
 
+	/* The sink's identity is enough: a timing that fits a descriptor is optional. */
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
-	ready = dcp->metadata.attributes_valid && dcp->metadata.timing_valid &&
-		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.attributes_ticket) &&
-		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.timing_ticket);
+	ready = dcp->metadata.attributes_valid &&
+		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.attributes_ticket);
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	if (ready && dcp->connector && READ_ONCE(dcp->connector->connected))
 		schedule_work(&dcp->connector->hotplug_wq);
@@ -1138,8 +1138,13 @@ void dcp_firmware_metadata_timing(struct apple_dcp *dcp)
 	 */
 	for (i = 0; i < dcp->nr_modes; i++) {
 		const struct dcp_display_mode *m = &dcp->modes[i];
+		struct drm_display_mode timing = m->mode;
 
 		if (!m->metadata_timing_valid)
+			continue;
+		/* A descriptor holds at most 655.35 MHz: faster modes are left to the list. */
+		timing.flags |= m->metadata_sync_flags;
+		if (!dcp_metadata_timing_fits(&timing))
 			continue;
 		if (best == UINT_MAX || (m->mode.type & DRM_MODE_TYPE_PREFERRED) ||
 		    (!(dcp->modes[best].mode.type & DRM_MODE_TYPE_PREFERRED) &&
@@ -1172,29 +1177,35 @@ bool dcp_firmware_metadata_current(struct apple_dcp *dcp, u64 generation)
 	return valid;
 }
 
-const struct drm_edid *dcp_firmware_edid(struct apple_dcp *dcp, u64 *generation)
+const struct drm_edid *dcp_firmware_edid(struct apple_dcp *dcp, u64 *generation,
+					 u32 *defaults)
 {
 	struct dcp_display_metadata attributes;
 	struct drm_display_mode preferred;
 	const struct drm_edid *edid;
 	unsigned long flags;
-	bool valid;
+	bool valid, timing = false;
 
 	if (!dcp_firmware_metadata_enabled(dcp))
 		return ERR_PTR(-ENODEV);
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
-	valid = dcp->metadata.attributes_valid && dcp->metadata.timing_valid &&
-		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.attributes_ticket) &&
-		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.timing_ticket);
+	valid = dcp->metadata.attributes_valid &&
+		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.attributes_ticket);
 	if (valid) {
 		attributes = dcp->metadata.attributes;
-		preferred = dcp->metadata.preferred;
+		timing = dcp->metadata.timing_valid &&
+			 dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.timing_ticket);
+		if (timing)
+			preferred = dcp->metadata.preferred;
 		*generation = dcp->metadata.epoch.generation;
 	}
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	if (!valid)
 		return ERR_PTR(-ENODATA);
-	edid = dcp_metadata_edid(&attributes, &preferred);
+	if (!timing)
+		attributes.defaults |= DCP_METADATA_DEFAULT_TIMING;
+	*defaults = attributes.defaults;
+	edid = dcp_metadata_edid(&attributes, timing ? &preferred : NULL);
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
 	valid = !dcp->metadata.epoch.invalidated && dcp->metadata.epoch.connected &&
 		*generation == dcp->metadata.epoch.generation;
@@ -2196,6 +2207,77 @@ static int dcp_t8132_wait_teardown_answers(struct apple_dcp *dcp, u32 port,
 }
 
 /*
+ * Has the Thunderbolt DP tunnel feeding DPTX port @port been taken down?
+ * Port 0 carries the tunnel this pipeline was handed; port 1 carries only
+ * the second tile of a tiled split, fed by its own tunnel. The tunnel's
+ * provider knows at once, while the detach that follows waits for the
+ * connect in progress on this pipeline.
+ */
+static bool dcp_tb_tunnel_withdrawn(struct apple_dcp *dcp, u32 port)
+{
+	typeof(apple_dp_tunnel_binding_live) *live;
+	bool gone = false;
+	void *binding;
+
+	guard(mutex)(&dcp->tb_lock);
+	binding = port ? dcp->split.binding : dcp->tb_dpin_ctx;
+	if (!binding)
+		return false;
+	live = symbol_get(apple_dp_tunnel_binding_live);
+	if (live) {
+		gone = !live(binding);
+		symbol_put(apple_dp_tunnel_binding_live);
+	}
+	return gone;
+}
+
+/*
+ * Only T6050 is known to need the tunnel watched: a Thunderbolt 5 dock
+ * there withdraws a fresh tunnel right after DCP starts on it. Elsewhere
+ * the wait stays as it was until the watch is tested there.
+ */
+static bool dcp_watches_tunnel_withdrawal(void)
+{
+	return of_machine_is_compatible("apple,t6050");
+}
+
+#define DCP_LINKCFG_POLL_MS	50
+
+/*
+ * Wait up to @timeout for DCP's link configuration of @port, returning what
+ * wait_for_completion_timeout() would. With @watch_tunnel, a Thunderbolt
+ * tunnel taken down meanwhile ends the wait at once and sets *@withdrawn:
+ * no link comes on it, and DCP keeps retrying it until released. A release
+ * sent late, after the full timeout, is more likely to go unanswered and
+ * leave the pipeline held, so release it as soon as the tunnel goes.
+ */
+static unsigned long dcp_dptx_wait_linkcfg(struct apple_dcp *dcp, u32 port,
+					   unsigned long timeout, bool watch_tunnel,
+					   bool *withdrawn)
+{
+	unsigned long deadline = jiffies + timeout;
+	long left;
+
+	*withdrawn = false;
+	if (!watch_tunnel)
+		return wait_for_completion_timeout(&dcp->dptxport[port].linkcfg_completion,
+						   timeout);
+	for (;;) {
+		left = (long)(deadline - jiffies);
+		if (left <= 0)
+			return 0;
+		if (wait_for_completion_timeout(&dcp->dptxport[port].linkcfg_completion,
+						min_t(unsigned long, left,
+						      msecs_to_jiffies(DCP_LINKCFG_POLL_MS))))
+			return max_t(long, (long)(deadline - jiffies), 1);
+		if (dcp_tb_tunnel_withdrawn(dcp, port)) {
+			*withdrawn = true;
+			return 0;
+		}
+	}
+}
+
+/*
  * Connect DPTX port @port. On failure, @retryable (if given) tells whether
  * the attempt left nothing outstanding in the firmware, so that a later
  * connection may simply try again: the service was not published yet, or a
@@ -2210,7 +2292,7 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 	/* T8122 dcpext: HPD only after the link wait, see dcp_ext_dptx_607() */
 	bool late_hpd = dcp_ext_dptx_607(dcp);
 	bool t8132 = dcp_is_t8132_ext(dcp);
-	bool compact;
+	bool compact, withdrawn;
 	unsigned long timeout;
 	u64 generation;
 	u8 dfp_port;
@@ -2363,12 +2445,20 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 	}
 	timeout = dcp_uses_t6020_tunnel_flow(dcp) ?
 		  DPTX_TUNNEL_CONNECT_TIMEOUT : DPTX_CONNECT_TIMEOUT;
-	ret = wait_for_completion_timeout(&dcp->dptxport[port].linkcfg_completion,
-					  timeout);
+	ret = dcp_dptx_wait_linkcfg(dcp, port, timeout,
+				    !compact && !late_hpd &&
+				    dcp_watches_tunnel_withdrawal(),
+				    &withdrawn);
 	/* A revoked wait must not disconnect or publish readiness for a new session. */
 	if (!dcp_connect_session_valid(dcp, session, cable, recovery))
 		return -ESTALE;
-	if (!ret && compact) {
+	if (!ret && withdrawn) {
+		dev_info(dcp->dev,
+			 "dcp_dptx_connect: port %u: the DP tunnel went before link configuration\n",
+			 port);
+		ret = -ENOLINK;
+		goto out_withdraw;
+	} else if (!ret && compact) {
 		/* Without a sink the link is configured once one arrives. */
 		dev_dbg(dcp->dev,
 			"dcp_dptx_connect: no link configuration on port %u yet\n", port);
@@ -3819,6 +3909,19 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
 		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 	}
+
+	/*
+	 * Firmware 27: a running pair stops before its primary's HPD low, which
+	 * the firmware answers only for a pipe that is down
+	 * (dcp_peer_unplug_v27()). Ahead of the hotplug event, so that the
+	 * CRTC's own power-off finds the pair stopped. A pair that cannot be
+	 * stopped leaves the HPD low as it was.
+	 */
+	ret = dcp_peer_unplug_v27(dcp);
+	if (ret < 0)
+		dev_warn(dcp->dev, "pair not stopped before the HPD low: %d\n", ret);
+	else if (ret)
+		dev_info(dcp->dev, "pair stopped before the HPD low\n");
 
 	disconnected_hpd_event(dcp->connector);
 

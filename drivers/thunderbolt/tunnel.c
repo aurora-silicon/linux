@@ -3098,8 +3098,10 @@ int tb_tunnel_wake(struct tb_tunnel *tunnel)
 	tunnel->sleep_replay = true;
 	if (tunnel->pre_activate)
 		ret = tunnel->pre_activate(tunnel);
-	for (i = 0; !ret && i < tunnel->npaths; i++)
+	for (i = 0; !ret && i < tunnel->npaths; i++) {
+		tunnel->paths[i]->sleep_lost = tunnel->sleep_lost;
 		ret = tb_path_wake(tunnel->paths[i]);
+	}
 	if (!ret && tunnel->activate)
 		ret = tunnel->activate(tunnel, true);
 	tunnel->sleep_replay = false;

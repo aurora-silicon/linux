@@ -2869,10 +2869,11 @@ int dcp_get_modes(struct drm_connector *connector)
 		}
 	} else {
 		u64 generation = 0;
+		u32 defaults = 0;
 		bool panel = dcp->panel_identity && dcp_has_panel(dcp);
 		const struct drm_edid *derived = nr_modes ?
 			(panel ? dcp_panel_edid_snapshot(dcp, modes, nr_modes, &generation) :
-			 dcp_firmware_edid(dcp, &generation)) : ERR_PTR(-ENODATA);
+			 dcp_firmware_edid(dcp, &generation, &defaults)) : ERR_PTR(-ENODATA);
 
 		if (!IS_ERR(derived)) {
 			bool log = !apple_connector->drm_edid_firmware_derived ||
@@ -2890,8 +2891,14 @@ int dcp_get_modes(struct drm_connector *connector)
 				drm_edid_connector_update(connector, NULL);
 				apple_connector->drm_edid_firmware_derived = false;
 			} else if (log) {
-				dev_info(dcp->dev, "using firmware-derived EDID metadata for connection %llu\n",
-					 generation);
+				dev_info(dcp->dev, "using firmware-derived EDID metadata for connection %llu%s%s%s%s%s%s%s\n",
+					 generation, defaults ? "; not reported:" : "",
+					 defaults & DCP_METADATA_DEFAULT_SIZE ? " size" : "",
+					 defaults & DCP_METADATA_DEFAULT_COLOR ? " colour" : "",
+					 defaults & DCP_METADATA_DEFAULT_NAME ? " name" : "",
+					 defaults & DCP_METADATA_DEFAULT_SERIAL ? " serial" : "",
+					 defaults & DCP_METADATA_DEFAULT_DATE ? " date" : "",
+					 defaults & DCP_METADATA_DEFAULT_TIMING ? " timing" : "");
 			}
 		} else {
 			if (panel && nr_modes)

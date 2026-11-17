@@ -11,6 +11,7 @@
 #include <linux/of_graph.h>
 #include <linux/phy/phy.h>
 #include <linux/slab.h>
+#include <linux/suspend.h>
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
@@ -90,6 +91,9 @@ static bool dcp_typec_hybrid_first(void)
 MODULE_PARM_DESC(typec_follow_crtc,
 		 "Let direct DP-alt routes follow their selected CRTC (default: on)");
 
+/* J714s: how long a tunnel's last pipeline is held for its return, in running time */
+#define DCP_TB_STICKY_MS	20000
+
 struct apple_dcp_typec_port {
 	struct dcp_fabric_port core;
 	struct dcp_fabric_plan plan;
@@ -157,6 +161,13 @@ struct apple_dcp_typec_port {
 	 * the next wake, or the cable leaving the port, ends the hold.
 	 */
 	bool sleep_withdrawn;
+	/*
+	 * J714s: each DP IN stream's last pipeline, while its tunnel came down (a router's sleep,
+	 * an unplug): its tunnel goes back there for a while, so that the display keeps its
+	 * connector (connectors are port/pipeline pairs here).
+	 */
+	struct apple_dcp_typec_route *tb_last[2];
+	unsigned long tb_last_until[2];
 };
 
 /*
@@ -2826,6 +2837,45 @@ static int dcp_tb_candidate(void *data)
 		planned = dcp_typec_rebalance_locked(port, stream);
 	ctx->planned = planned;
 
+	/*
+	 * A tunnel that comes back goes back to its last pipeline while that is held for it
+	 * (DCP_TB_STICKY_MS of running time from its teardown), and waits for it to be free and
+	 * ready meanwhile, rather than take another: after a deep sleep the dock's dpin0 came back
+	 * first, took the pipeline of a DP-alt display on another port, and both displays came
+	 * back on other connectors.
+	 */
+	if (!ordered && port->tb_last[stream] && time_before(jiffies, port->tb_last_until[stream])) {
+		struct dcp_fabric_policy policy = {
+			.dual_stream = dcp_typec_ordered_dual_stream(),
+			.follow = dcp_typec_port_follows(port),
+			.hybrid_first = dcp_typec_hybrid_first(),
+		};
+		struct apple_dcp_typec_route *last = port->tb_last[stream];
+		bool connector_present = stream ? !!port->secondary_connector :
+						  !!port->connector;
+		struct dcp_fabric_route *chosen;
+
+		dcp_fabric_snapshot_port(port, true);
+		chosen = dcp_fabric_tunnel_candidate(&port->core, &policy, &last->core, true, dpin,
+						     connector_present, &ret);
+		best = dcp_fabric_real_route(chosen);
+		if (best) {
+			ctl = dcp_typec_tunnel_ctl(best, dpin);
+			if (ctl) {
+				dev_info(best->dcp->dev, "DP tunnel dpin%u back on its last pipeline\n",
+					 dpin);
+				ctx->best = best;
+				ctx->ctl = ctl;
+				return 0;
+			}
+		} else if (ret == -EAGAIN || ret == -EBUSY) {
+			dev_dbg(last->dcp->dev, "DP tunnel dpin%u waits for its last pipeline: %d\n",
+				dpin, ret);
+			return -EAGAIN;
+		}
+		port->tb_last[stream] = NULL;
+	}
+
 	{
 		struct dcp_fabric_policy policy = {
 			.dual_stream = dcp_typec_ordered_dual_stream(),
@@ -2893,6 +2943,8 @@ static void dcp_tb_claim(void *data)
 	struct apple_dcp_typec_port *port = ctx->port;
 	struct apple_dcp *dcp = best->dcp;
 	unsigned int dpin = ctx->dpin;
+
+	port->tb_last[dcp_fabric_dpin_slot(dpin)] = NULL;
 
 	*ctx->slot = best;
 	if (dpin == 0)
@@ -3248,7 +3300,24 @@ static int dcp_tb_release_locked(struct apple_dcp_typec_port *port,
 		}
 		return ret;
 	}
+	/* J714s: the stream's pipeline, held for its tunnel's return */
+	if (of_machine_is_compatible("apple,j714s")) {
+		port->tb_last[dcp_fabric_dpin_slot(dpin)] = *slot;
+		port->tb_last_until[dcp_fabric_dpin_slot(dpin)] = jiffies + msecs_to_jiffies(DCP_TB_STICKY_MS);
+	}
 	*slot = NULL;
+	/*
+	 * A tunnel taken down at a deep sleep's entry (a USB4 router that sleeps takes its
+	 * tunnels down after user space is frozen) is a display released for the sleep, as a
+	 * USB-C port's display is (dcp_fabric_sleep_release()). Its CRTC is still lit for the
+	 * frozen desktop; it resumes disabled (dcp_crtc_mode_fixup()), and the display's
+	 * return after the wake sets its mode again. Its next connect clears the mark.
+	 */
+	if (pm_suspend_target_state == PM_SUSPEND_MEM && dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    !READ_ONCE(dcp->sleep_v27_torn)) {
+		WRITE_ONCE(dcp->sleep_v27_torn, true);
+		dev_info(dcp->dev, "tunnel display released for the sleep\n");
+	}
 	port->hpd = dcp_typec_port_owned(port);
 	/* re-apply the next Type-C mux state in full */
 	port->applied_valid = false;
@@ -4432,6 +4501,10 @@ static void dcp_typec_route_unregister(void *data)
 	guard(mutex)(&dcp_typec_fabric_lock);
 	if (port->preferred_route == route)
 		port->preferred_route = NULL;
+	if (port->tb_last[0] == route)
+		port->tb_last[0] = NULL;
+	if (port->tb_last[1] == route)
+		port->tb_last[1] = NULL;
 	if (port->split_dcp == route->dcp)
 		dcp_tb_split_teardown_locked(port, true);
 	for (unsigned int i = 0; i < ARRAY_SIZE(port->slots); i++) {

@@ -481,6 +481,18 @@ impl Shared {
                     if result.is_ok() {
                         // The cores lost power, so the next command on each pair installs it again.
                         firmware.queues.forget_render_registrations();
+                        // So did every M5 compute queue's host-port configuration: it goes out
+                        // again here, before publication reopens and so before any doorbell.
+                        let (_, failed) = firmware
+                            .queues
+                            .restore_compute_port_configurations(&firmware.bridge.regs);
+                        if failed != 0 {
+                            dev_warn!(
+                                self.dev.as_ref(),
+                                "{} GPU compute queues not configured again after the wake\n",
+                                failed
+                            );
+                        }
                         firmware.rings.invalidate_statistics();
                         firmware.port.statistics_epoch_bump();
                     }

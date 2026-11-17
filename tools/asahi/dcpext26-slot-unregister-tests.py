@@ -58,7 +58,7 @@ struct apple_dcp_typec_route {
  int typec_mux; bool tunnel, dual_stream; struct list_head port_link;
 };
 struct apple_dcp_typec_port {
- struct apple_dcp_typec_route *preferred_route, *slots[4];
+ struct apple_dcp_typec_route *preferred_route, *tb_last[2], *slots[4];
  struct apple_dcp *split_dcp; bool hpd;
  struct list_head link, routes; void *connector_np;
 };
@@ -100,11 +100,14 @@ int main(void) {
   unsigned next=(slot+1)%4; port.slots[slot]=&route;
   if(other) port.slots[next]=&neighbor;
   port.routes.empty=!other; port.preferred_route=&route; port.split_dcp=&d;
+  port.tb_last[slot%2]=&route; port.tb_last[(slot%2)^1]=other?&neighbor:NULL;
   current_port=&port; primary=slot==0; failure=fail?-EBUSY:0; dcp_dual_stream_routes=1;
   muxes=retired=disconnected=deactivated=deleted=freed=node_puts=split=order=0;
   dcp_typec_route_unregister(&route);
   assert(muxes==1 && retired==1 && disconnected==1 && deactivated==1 && split==1);
   assert(port.preferred_route==NULL && port.split_dcp==NULL);
+  assert(port.tb_last[slot%2]==NULL);
+  assert(port.tb_last[(slot%2)^1]==(other?&neighbor:NULL));
   if(fail && profile) {
    assert(port.slots[slot]==&route && deleted==0 && freed==0 && node_puts==0);
    assert(dcp_dual_stream_routes==1 && port.hpd==(slot!=0));
@@ -122,6 +125,8 @@ mutants = [
     ('retained-slots', body, False),
     ('drop-native26-retention', body.replace('dcp_is_retained_external(dcp)', 'dcp_is_external_h17p(dcp)'), True),
     ('drop-extra-slots', body.replace('ARRAY_SIZE(port->slots)', '2'), True),
+    ('keep-stale-tb-last', body.replace('if (port->tb_last[0] == route)', 'if (false)').replace('if (port->tb_last[1] == route)', 'if (false)'), True),
+    ('drop-neighbor-tb-last', body.replace('if (port->tb_last[0] == route)', 'if (true)').replace('if (port->tb_last[1] == route)', 'if (true)'), True),
     ('drop-primary-only-hpd', body.replace('if (!i)\n', 'if (true)\n'), True),
 ]
 results = []
@@ -140,4 +145,4 @@ for name, code, negative in mutants:
         assert process.returncode == 0, log
     results.append({'name': name, 'compiled': True, 'exit': process.returncode, 'negative': negative})
     (out / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
-print('PASS:48 production cases and3 compiled runtime-negative controls')
+print('PASS:48 production cases and5 compiled runtime-negative controls')

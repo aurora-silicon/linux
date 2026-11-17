@@ -154,6 +154,9 @@
 #define DART_T8110_TLB_START 0x98
 #define DART_T8110_TLB_END 0xa0
 #define DART_T8110_FLUSH_BUSY_TIMEOUT 2000
+/* How much longer a range invalidate may stall, polled how often: apple_dart_t8110_tlb_wait() */
+#define DART_T8110_FLUSH_STALL_TIMEOUT 250000
+#define DART_T8110_FLUSH_STALL_POLL 10
 #define DART_T8110_TLB_CMD_STREAM       GENMASK(7, 0)
 
 #define DART_T8110_ERROR 0x100
@@ -435,6 +438,10 @@ struct apple_dart {
 	/* Powered down by its DCP across a real sleep: see apple_dart_host_power_on(). */
 	u32 host_off_slept : 1;
 	bool commands_gated;
+	/* TLB commands written, counted under the lock: see apple_dart_t8110_tlb_wait(). */
+	unsigned long tlb_commands;
+	/* A handed-off DART a display subsystem scans out through: apple_dart_display_scanout(). */
+	bool display_scanout;
 	/*
 	 * A real sleep took the ISP host streams' registers: the next runtime resume, its
 	 * consumer's next power-up, resets them and writes back what the last suspend saved.
@@ -567,6 +574,7 @@ static int apple_dart_sleep_writer_get(struct apple_dart *dart);
 static void apple_dart_sleep_writer_put(struct apple_dart *dart, int gate);
 static void __noreturn apple_dart_sleep_release_failed(void);
 static int apple_dart_cio_init(struct apple_dart *dart, resource_size_t size, bool skip);
+static void apple_dart_cio_release(struct apple_dart *dart);
 
 #ifndef MODULE
 static struct kexec_blocker apple_dart_radio_kexec = {
@@ -1027,6 +1035,34 @@ static bool apple_dart_fw_handoff_enabled(const struct apple_dart *dart)
 		of_property_count_u32_elems(np, "apple,firmware-root-handoff") == 1 &&
 		!of_property_read_u32(np, "apple,firmware-root-handoff", &handoff) &&
 		handoff == 1;
+}
+
+/*
+ * Whether an available display subsystem, the component master the DRM driver
+ * binds and the loader walks for the scan-out DARTs it hands off, lists a
+ * stream of @np in its iommus: the display pipe scans out through this DART.
+ * On J700 that is disp0 and dispext0. The DCP and DCPEXT firmware DARTs are
+ * named only by their coprocessors, and a PCIe device such as the Wi-Fi
+ * reaches its DART through its host bridge's iommu-map.
+ */
+static bool apple_dart_display_scanout(struct device_node *np)
+{
+	struct of_phandle_args args;
+	bool match;
+	int i;
+
+	for_each_compatible_node_scoped(display, NULL, "apple,display-subsystem") {
+		if (!of_device_is_available(display))
+			continue;
+		for (i = 0; !of_parse_phandle_with_args(display, "iommus", "#iommu-cells",
+							i, &args); i++) {
+			match = args.np == np;
+			of_node_put(args.np);
+			if (match)
+				return true;
+		}
+	}
+	return false;
 }
 
 /* A 16K table page, aligned and inside the output address space. */
@@ -1687,11 +1723,88 @@ apple_dart_t8020_hw_stream_command(struct apple_dart_stream_map *stream_map,
 	return 0;
 }
 
+/*
+ * The TLB command engine is idle, or a command was written after @issued.
+ * A command is only ever written to an idle engine, so @issued has finished
+ * in both cases.
+ */
+static bool apple_dart_t8110_tlb_settled(struct apple_dart *dart,
+					 unsigned long issued, u32 *status)
+{
+	if (issued && READ_ONCE(dart->tlb_commands) != issued)
+		return true;
+	*status = apple_dart_readl(dart, DART_T8110_TLB_CMD);
+	return !(*status & DART_T8110_TLB_CMD_BUSY);
+}
+
+/*
+ * Wait for the TLB command engine, called and returning with dart->lock
+ * held: before a command (@issued 0) until it is idle, after one until
+ * command @issued finished.
+ *
+ * On J700 the boot loader hands the display DARTs' roots off (fw_handoff).
+ * There a range invalidate of the internal display's stream 0 can stay busy
+ * well past DART_T8110_FLUSH_BUSY_TIMEOUT while the display pipe changes
+ * what it scans out (screen locker, panel power-off, after a resume),
+ * reading 0x8700e100, and it finishes on its own: the next commands work.
+ * Giving up fails the mapping of a framebuffer the compositor imports, and
+ * returns from an unmap while the TLB can still translate to the pages its
+ * caller frees next. So keep waiting on the DARTs the display subsystem
+ * scans out through (display_scanout: disp0 and dispext0), not on the
+ * handed-off DCP firmware DARTs or any other device's DART, for up to
+ * DART_T8110_FLUSH_STALL_TIMEOUT more, without the lock and with interrupts
+ * as the caller had them. Every command here waits for an idle engine
+ * before it is written, so the engine needs no lock meanwhile (the
+ * suspend-time writes of apple_dart_display_streams() never took it). What
+ * relies on the lock to find the engine idle is left out: a CTC flush, the
+ * sleep lists of apple_dart_sleep_prepare(), and apple_dart_quiesce_commands(),
+ * which serves only PCIe port DARTs, without firmware roots to hand off.
+ * Commands that aren't range invalidates, such as the unlock of the fault
+ * handler, keep the short wait.
+ */
+static int apple_dart_t8110_tlb_wait(struct apple_dart *dart, unsigned long *flags,
+				     bool range, unsigned long issued, u32 *status,
+				     unsigned int *stalled_us)
+{
+	unsigned int waited = 0;
+	bool settled;
+	int ret;
+
+	ret = read_poll_timeout_atomic(apple_dart_readl, *status,
+		!(*status & DART_T8110_TLB_CMD_BUSY), 1,
+		DART_T8110_FLUSH_BUSY_TIMEOUT, false, dart,
+		DART_T8110_TLB_CMD);
+	if (!ret || !range || !dart->fw_handoff || !dart->display_scanout ||
+	    dart->ctc_flush || dart->sleep_restore.count)
+		return ret;
+
+	spin_unlock_irqrestore(&dart->lock, *flags);
+	while (!(settled = apple_dart_t8110_tlb_settled(dart, issued, status)) &&
+	       waited < DART_T8110_FLUSH_STALL_TIMEOUT) {
+		udelay(DART_T8110_FLUSH_STALL_POLL);
+		waited += DART_T8110_FLUSH_STALL_POLL;
+	}
+	spin_lock_irqsave(&dart->lock, *flags);
+	if (!settled)
+		return -ETIMEDOUT;
+	*stalled_us = max(*stalled_us, DART_T8110_FLUSH_BUSY_TIMEOUT + waited);
+	if (issued)
+		return 0;
+	/* Not yet written: another command may have gone in meanwhile. */
+	if (dart->commands_gated)
+		return -EHOSTDOWN;
+	return read_poll_timeout_atomic(apple_dart_readl, *status,
+		!(*status & DART_T8110_TLB_CMD_BUSY), 1,
+		DART_T8110_FLUSH_BUSY_TIMEOUT, false, dart,
+		DART_T8110_TLB_CMD);
+}
+
 static int
 apple_dart_t8110_hw_tlb_command_range(struct apple_dart_stream_map *stream_map,
 				   u32 command, bool range, u64 first, u64 last)
 {
 	struct apple_dart *dart = stream_map->dart;
+	unsigned int stalled_us = 0;
 	unsigned long flags;
 	u32 status;
 	int sid, ret = 0;
@@ -1706,10 +1819,8 @@ apple_dart_t8110_hw_tlb_command_range(struct apple_dart_stream_map *stream_map,
 		u32 val = FIELD_PREP(DART_T8110_TLB_CMD_OP, command) |
 			  FIELD_PREP(DART_T8110_TLB_CMD_STREAM, sid);
 
-		ret = read_poll_timeout_atomic(apple_dart_readl, status,
-			!(status & DART_T8110_TLB_CMD_BUSY), 1,
-			DART_T8110_FLUSH_BUSY_TIMEOUT, false, dart,
-			DART_T8110_TLB_CMD);
+		ret = apple_dart_t8110_tlb_wait(dart, &flags, range, 0, &status,
+						&stalled_us);
 		if (ret)
 			break;
 		if (dart->version >= 0x0202 &&
@@ -1724,10 +1835,9 @@ apple_dart_t8110_hw_tlb_command_range(struct apple_dart_stream_map *stream_map,
 		}
 		dma_wmb();
 		apple_dart_writel(dart, val, DART_T8110_TLB_CMD);
-		ret = read_poll_timeout_atomic(apple_dart_readl, status,
-			!(status & DART_T8110_TLB_CMD_BUSY), 1,
-			DART_T8110_FLUSH_BUSY_TIMEOUT, false, dart,
-			DART_T8110_TLB_CMD);
+		WRITE_ONCE(dart->tlb_commands, dart->tlb_commands + 1);
+		ret = apple_dart_t8110_tlb_wait(dart, &flags, range, dart->tlb_commands,
+						&status, &stalled_us);
 		if (ret)
 			break;
 	}
@@ -1736,10 +1846,14 @@ apple_dart_t8110_hw_tlb_command_range(struct apple_dart_stream_map *stream_map,
 	    command == DART_T8110_TLB_CMD_OP_FLUSH_SID)
 		apple_dart_writel(dart, 0, DART_T8110_CTC_FLUSH);
 	spin_unlock_irqrestore(&dart->lock, flags);
-	if (ret)
+	if (ret == -ETIMEDOUT)
 		dev_err_ratelimited(dart->dev,
 			"TLB command %#x for stream %d timed out (%#x)\n",
 			command, sid, status);
+	else if (!ret && stalled_us)
+		dev_info_ratelimited(dart->dev,
+			"TLB command %#x for streams %*pbl stayed busy for at least %u us\n",
+			command, dart->num_streams, stream_map->sidmap, stalled_us);
 	return ret;
 }
 
@@ -5721,6 +5835,7 @@ params_done:
 				    &dart->sleep_restore_late);
 	/* Reserved table-page lifetime requires the matched three-level loader. */
 	dart->fw_handoff = apple_dart_fw_handoff_enabled(dart);
+	dart->display_scanout = dart->fw_handoff && apple_dart_display_scanout(dev->of_node);
 	/*
 	 * Preserve our retained-root path when no reserved-table handoff exists.
 	 * T6050's boot loader leaves every display DART locked on four-level
@@ -6091,6 +6206,9 @@ static void apple_dart_remove(struct platform_device *pdev)
 	if (!dart->locked && !dart->retained_mtp && !dart->live_mtp &&
 	    !READ_ONCE(dart->commands_gated))
 		apple_dart_hw_reset(dart);
+
+	/* Its streams are off: its clock protection goes before its domain can. */
+	apple_dart_cio_release(dart);
 
 	if (dart->irq >= 0)
 		apple_dart_free_irq(dart);

@@ -45,9 +45,13 @@ def parser_fixture(root):
     source = (base / 'parser.c').read_text()
     parser = source[source.index('#define DCP_PARSE_HEADER'):source.index('int parse_epic_service_init(')]
     metadata = (base / 'dcp-display-metadata.h').read_text()
+    # What a sink left out (DCP_METADATA_DEFAULT_*), as the parser notes it.
+    defaults = ''.join(re.sub(r'\bBIT\((\d+)\)', r'(1U << \1)', d) + '\n'
+                       for d in source_defines(metadata) if d.startswith('#define DCP_METADATA_DEFAULT_'))
     metadata = (block(metadata, 'struct dcp_display_metadata {') + ';\n' +
                 block(metadata, 'enum dcp_panel_gamut {') + ';\n' +
-                block(metadata, 'struct dcp_color_space {') + ';\n')
+                block(metadata, 'struct dcp_color_space {') + ';\n' +
+                defaults)
     header = (base / 'parser.h').read_text()
     header = header[header.index('struct apple_dcp;'):header.index('int parse(')]
     refresh = (base / 'dcp-refresh.h').read_text().replace('#include <linux/types.h>', '')
@@ -363,6 +367,23 @@ int main(int argc, char **argv)
     memset(&metadata, 0xa5, sizeof(metadata)); unchanged = metadata;
     assert(!parse(data, length, &ctx));
     int ret = parse_display_metadata(&ctx, &metadata);
+    if (argv[2][0] == 'd' || argv[2][0] == 't') {
+        /* Left out or out of range: noted and left undefined; the EDID is still built. */
+        unsigned long want = argv[2][0] == 'd' ? strtoul(argv[2] + 1, NULL, 0) : 0;
+        assert(!ret && (metadata.defaults & want) == want && (want || !metadata.defaults));
+        if (want & DCP_METADATA_DEFAULT_SIZE)
+            assert(!metadata.width_cm && !metadata.height_cm);
+        if (want & DCP_METADATA_DEFAULT_COLOR)
+            assert(!metadata.gamma && !metadata.white[0] && !metadata.chromaticity[0][0]);
+        if (want & DCP_METADATA_DEFAULT_DATE)
+            assert(!metadata.week && !metadata.year);
+        if (argv[2][0] == 't')
+            assert(strlen(metadata.name) == 13);
+        const struct drm_edid *e = dcp_metadata_edid(&metadata, NULL);
+        assert(!IS_ERR(e));
+        drm_edid_free(e);
+        free(data); return 0;
+    }
     if (atoi(argv[2])) {
         assert(ret == -EINVAL && !memcmp(&metadata, &unchanged, sizeof(metadata)));
         free(data); return 0;
@@ -424,11 +445,27 @@ int main(int argc, char **argv)
         assert(!memcmp(edid->cta, "\x02\x03\x08\x00\xe3\x06\x05\x01", 8));
         drm_edid_free(edid);
     }
+    /* A sync polarity the firmware leaves out is given as positive. */
     mode.flags = 0;
-    assert(IS_ERR(dcp_metadata_edid(&metadata, &mode)));
+    edid = dcp_metadata_edid(&metadata, &mode);
+    assert(!IS_ERR(edid));
+    {
+        const u8 *r = (const u8 *)&edid->raw;
+        assert((r[24] & DRM_EDID_FEATURE_PREFERRED_TIMING) && (r[54] | r[55]));
+        assert((r[71] & (DRM_EDID_PT_HSYNC_POSITIVE | DRM_EDID_PT_VSYNC_POSITIVE)) ==
+               (DRM_EDID_PT_HSYNC_POSITIVE | DRM_EDID_PT_VSYNC_POSITIVE));
+    }
+    drm_edid_free(edid);
+    /* No detailed timing holds the mode: a dummy descriptor, no preferred timing. */
     mode.flags = DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC;
     mode.clock++;
-    assert(IS_ERR(dcp_metadata_edid(&metadata, &mode)));
+    edid = dcp_metadata_edid(&metadata, &mode);
+    assert(!IS_ERR(edid));
+    {
+        const u8 *r = (const u8 *)&edid->raw;
+        assert(!(r[24] & DRM_EDID_FEATURE_PREFERRED_TIMING) && !r[54] && !r[55] && r[57] == 0x10);
+    }
+    drm_edid_free(edid);
     free(data);
     if (argc == 5) {
         f=fopen(argv[4],"rb"); assert(f && !fseek(f,0,SEEK_END));
@@ -744,6 +781,16 @@ struct apple_connector {''')
     start = state.index('static bool dcpavserv_edid_current(')
     state = state[:start]
 
+    dcp_c = (base/'dcp.c').read_text()
+    # The firmware-derived EDID reports what the sink left out, once the tree has it.
+    defaults_arg = re.search(r'dcp_firmware_edid\(\s*dcp,\s*&generation,\s*&defaults\s*\)', dcp_c + iomfb)
+    firmware_edid = ('static const struct drm_edid *dcp_firmware_edid(struct apple_dcp *d,u64 *generation' +
+                     (',u32 *defaults) { (void)defaults; ' if defaults_arg else ') { ') +
+                     '(void)d; (void)generation; return ERR_PTR(-ENODATA); }\n')
+    if 'dcp_metadata_timing_fits(' in dcp_c:
+        # A detailed timing descriptor holds a pixel clock of at most 655.35 MHz.
+        firmware_edid += ('static bool dcp_metadata_timing_fits(const struct drm_display_mode *m) '
+                          '{ return m->clock > 0 && m->clock <= 655350 && !(m->clock % 10); }\n')
     stubs = r'''
 /* The rate/HPD fixture is an external H17P sink; it never selects M4. */
 #define iomfb_is_v26_6(dcp) false
@@ -805,7 +852,7 @@ static void drm_edid_free(const struct drm_edid *e) { if(e) { assert(raw_allocat
 static int drm_edid_connector_update(struct drm_connector *c,const struct drm_edid *e) {
     assert(c->dev->mode_config.mutex); (void)e; return fail_update?-EIO:0;
 }
-static const struct drm_edid *dcp_firmware_edid(struct apple_dcp *d,u64 *generation) { (void)d; (void)generation; return ERR_PTR(-ENODATA); }
+DCP_FIRMWARE_EDID_STUB
 static bool dcp_firmware_metadata_current(struct apple_dcp *d,u64 generation) { (void)d; (void)generation; return false; }
 static const struct drm_edid *dcp_panel_edid_snapshot(struct apple_dcp *d,const struct dcp_display_mode *m,unsigned n,u64 *generation) { (void)d;(void)m;(void)n;(void)generation;assert(!"panel identity in external fixture");return ERR_PTR(-ENODATA); }
 static bool dcp_panel_metadata_current(struct apple_dcp *d,u64 generation) { (void)d;(void)generation;assert(!"panel identity in external fixture");return false; }
@@ -1029,6 +1076,7 @@ static void permutations(void) {
     puts("PASS: 24 callback/timing/AV arrival permutations and real get_modes/lookup publication; early configuration needs no second callback; CLOSE, physical reconnect, receipt epochs and publication races deny stale proof");
 }
 '''
+    stubs=stubs.replace('DCP_FIRMWARE_EDID_STUB\n',firmware_edid)
     unit=n['prefix']+n['metadata']+n['epoch']+n['header']+n['edid_header']+n['parser']+n['blobs']+n['policy']+n['proof']+state+stubs+transport+n['source']+n['callback_types']+n['callback_stubs']+n['callback']+n['connection']+publication+receipt+helpers+fixture+'int main(int argc,char **argv) {'+main_prefix+main
     # Conflicts are scanned across the full binary receipt, including filtered
     # siblings. Exercise both orders, replacement receipts and equivalent aliases.
@@ -1341,39 +1389,55 @@ static bool dcp_typec_relink(struct apple_dcp *d) { (void)d;return false; }
 
 
 def metadata(root, output):
-    """Keep malformed/duplicate metadata cases with synthetic bounded wire input."""
+    """Keep malformed/duplicate metadata cases with synthetic bounded wire input.
+
+    Only a sink's identity (manufacturer and product code, once each) is
+    required. A size, colour description or date out of range or missing is
+    noted in the metadata's defaults (DCP_METADATA_DEFAULT_*), left undefined,
+    and the sink still gets an EDID; a name longer than a descriptor is cut.
+    """
     n = parser_fixture(root)
     fixture = n['fixture']
-    cases = [(fixture, False)]
-    for path, value in [
-        (('MaxHorizontalImageSize',), 256), (('MaxVerticalImageSize',), '33'),
-        (('Chromaticity', 'Red', 'X'), True), (('Chromaticity', 'Blue', 'Y'), 65536),
-        (('DefaultWhitePoint', 'Y'), 64000), (('DefaultWhitePoint', 'Gamma'), 65535),
-        (('DefaultWhitePoint', 'Gamma'), 240000), (('ProductAttributes', 'ManufacturerID'), 'AC'),
-        (('ProductAttributes', 'ManufacturerID'), 'A\0R'), (('ProductAttributes', 'LegacyManufacturerID'), 1),
-        (('ProductAttributes', 'ProductName'), 'x' * 14), (('ProductAttributes', 'ProductID'), 65536),
-        (('ProductAttributes', 'YearOfManufacture'), 1989), (('ProductAttributes', 'WeekOfManufacture'), 54),
+    header = (root / 'drivers/gpu/drm/apple/dcp-display-metadata.h').read_text()
+    bits = {m.group(1): 1 << int(m.group(2)) for m in
+            re.finditer(r'^#define DCP_METADATA_DEFAULT_(\w+)\s+BIT\((\d+)\)', header, re.M)}
+    # Expectations: '1' refused and the output untouched, 'd<mask>' parsed with
+    # those defaults noted, 't' parsed with the name cut to 13 characters.
+    reject = '1'
+    size, color, date = (f"d{bits[k]}" for k in ('SIZE', 'COLOR', 'DATE'))
+    cases = [(fixture, '0')]
+    for path, value, expect in [
+        (('MaxHorizontalImageSize',), 256, size), (('MaxVerticalImageSize',), '33', size),
+        (('Chromaticity', 'Red', 'X'), True, color), (('Chromaticity', 'Blue', 'Y'), 65536, color),
+        (('DefaultWhitePoint', 'Y'), 64000, color), (('DefaultWhitePoint', 'Gamma'), 65535, color),
+        (('DefaultWhitePoint', 'Gamma'), 240000, color), (('ProductAttributes', 'ManufacturerID'), 'AC', reject),
+        (('ProductAttributes', 'ManufacturerID'), 'A\0R', reject),
+        (('ProductAttributes', 'LegacyManufacturerID'), 1, reject),
+        (('ProductAttributes', 'ProductName'), 'x' * 14, 't'), (('ProductAttributes', 'ProductID'), 65536, reject),
+        (('ProductAttributes', 'YearOfManufacture'), 1989, date),
+        (('ProductAttributes', 'WeekOfManufacture'), 54, date),
     ]:
         bad = copy.deepcopy(fixture)
         target = bad
         for key in path[:-1]:
             target = target[key]
         target[path[-1]] = value
-        cases.append((bad, True))
-    for key in ('Chromaticity', 'DefaultWhitePoint', 'ProductAttributes'):
+        cases.append((bad, expect))
+    # Missing: a colour description may be, the identity may not. Twice: never.
+    for key, missing in (('Chromaticity', color), ('DefaultWhitePoint', color), ('ProductAttributes', reject)):
         bad = copy.deepcopy(fixture)
         del bad[key]
-        cases.append((bad, True))
+        cases.append((bad, missing))
         second = copy.deepcopy(fixture[key])
-        cases.append((n['ObjectPairs'](list(fixture.items()) + [(key, second)]), True))
-    for path, field in [(('Chromaticity', 'Red'), 'X'), (('ProductAttributes',), 'ProductName')]:
+        cases.append((n['ObjectPairs'](list(fixture.items()) + [(key, second)]), reject))
+    for path, field, expect in [(('Chromaticity', 'Red'), 'X', color), (('ProductAttributes',), 'ProductName', reject)]:
         bad = copy.deepcopy(fixture)
         target = bad
         for key in path[:-1]:
             target = target[key]
         value = target[path[-1]]
         target[path[-1]] = n['ObjectPairs'](list(value.items()) + [(field, value[field])])
-        cases.append((bad, True))
+        cases.append((bad, expect))
     inputs = output / 'metadata-inputs'
     inputs.mkdir(parents=True, exist_ok=True)
     arguments = []
@@ -1382,7 +1446,7 @@ def metadata(root, output):
         n['wire'](value, data)
         path = inputs / str(index)
         path.write_bytes(data)
-        arguments.append((str(path), str(int(bad)), str(inputs / 'edid')))
+        arguments.append((str(path), bad, str(inputs / 'edid')))
     unit = ''.join(n[k] for k in ('prefix', 'metadata', 'epoch', 'header', 'edid_header',
                                   'stubs', 'parser', 'builder', 'timing_source', 'proof_test', 'suffix'))
     return unit, tuple(arguments)
