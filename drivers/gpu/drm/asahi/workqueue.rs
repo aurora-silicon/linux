@@ -29,6 +29,7 @@ use crate::{
     event,
     fw,
     gpu,
+    mmu,
     regs, //
 };
 use core::any::Any;
@@ -207,6 +208,8 @@ where
     vm_slot: u32,
     callback: Option<C>,
     fence: dma_fence::Fence,
+    _vm_job: Arc<mmu::VmJobGuard>,
+    _vm_bind: Arc<mmu::VmBind>,
 }
 
 pub(crate) trait GenSubmittedWork: Send + Sync {
@@ -214,6 +217,7 @@ pub(crate) trait GenSubmittedWork: Send + Sync {
     fn value(&self) -> event::EventValue;
     fn wptr(&self) -> u32;
     fn set_wptr(&mut self, wptr: u32);
+    fn quarantine_vm(&self);
     fn mark_error(&mut self, error: WorkError);
     fn complete(&mut self);
     fn get_fence(&self) -> dma_fence::Fence;
@@ -262,6 +266,10 @@ impl<O: OpaqueCommandObject, C: FnOnce(Option<WorkError>) + Send + Sync> GenSubm
 
     fn set_wptr(&mut self, wptr: u32) {
         self.wptr = wptr;
+    }
+
+    fn quarantine_vm(&self) {
+        self._vm_job.quarantine();
     }
 
     fn complete(&mut self) {
@@ -370,6 +378,8 @@ pub(crate) struct Job {
     submitted: bool,
     event_count: usize,
     fence: dma_fence::Fence,
+    vm_job: Arc<mmu::VmJobGuard>,
+    vm_bind: Arc<mmu::VmBind>,
 }
 
 #[versions(AGX)]
@@ -416,7 +426,8 @@ impl Job::ver {
 
         let fence = self.fence.clone();
         let value = self.event_info.value.next();
-
+        let vm_job = self.vm_job.clone();
+        let vm_bind = self.vm_bind.clone();
         self.pending.push(
             KBox::try_pin_init(
                 try_pin_init!(SubmittedWorkContainer {
@@ -429,6 +440,8 @@ impl Job::ver {
                         wptr: 0,
                         vm_slot,
                         fence,
+                        _vm_job: vm_job,
+                        _vm_bind: vm_bind,
                     }, GFP_KERNEL)?
                 }),
                 GFP_KERNEL,
@@ -691,6 +704,7 @@ impl<'a> Drop for JobSubmission::ver<'a> {
         mod_pr_debug!("WorkQueue({:?}): Dropping JobSubmission\n", inner.pipe_type);
 
         let new_len = inner.pending.len() - self.command_count;
+        // Job retains its guard until this submission drops the queue lock.
         inner.pending.truncate(new_len);
 
         let pipe_type = inner.pipe_type;
@@ -902,7 +916,12 @@ impl WorkQueue::ver {
         })
     }
 
-    pub(crate) fn new_job(self: &Arc<Self>, fence: dma_fence::Fence) -> Result<Job::ver> {
+    pub(crate) fn new_job(
+        self: &Arc<Self>,
+        fence: dma_fence::Fence,
+        vm_job: Arc<mmu::VmJobGuard>,
+        vm_bind: Arc<mmu::VmBind>,
+    ) -> Result<Job::ver> {
         let mut inner = self.inner.lock();
 
         if inner.event.is_none() {
@@ -948,6 +967,8 @@ impl WorkQueue::ver {
             committed: false,
             submitted: false,
             fence,
+            vm_job,
+            vm_bind,
         })
     }
 
@@ -985,7 +1006,9 @@ pub(crate) trait WorkQueue {
 
     fn signal(&self) -> bool;
     fn mark_error(&self, value: event::EventValue, error: WorkError);
-    fn fail_all(&self, error: WorkError);
+    /// Fails all pending commands. Returns true when commands were left pinned: the caller
+    /// must then keep its reference to this queue, whose ring they still point at.
+    fn fail_all(&self, error: WorkError) -> bool;
 }
 
 #[versions(AGX)]
@@ -1143,7 +1166,7 @@ impl WorkQueue for WorkQueue::ver {
     }
 
     /// Mark all of this queue's work as having failed, and complete it.
-    fn fail_all(&self, error: WorkError) {
+    fn fail_all(&self, error: WorkError) -> bool {
         // If anything is marked completed, we can consider it successful
         // at this point, even if we didn't get the signal event yet.
         self.signal();
@@ -1156,7 +1179,7 @@ impl WorkQueue for WorkQueue::ver {
             if inner.pending_jobs > 0 || !inner.pending.is_empty() {
                 pr_crit!("WorkQueue: fail_all() called with no event and pending jobs.\n");
             }
-            return;
+            return false;
         }
 
         mod_pr_debug!(
@@ -1180,10 +1203,15 @@ impl WorkQueue for WorkQueue::ver {
         core::mem::drop(inner);
         core::mem::drop(held);
 
+        let pinned = !cmds.is_empty();
         for mut cmd in cmds {
+            cmd.as_mut().inner_mut().quarantine_vm();
             cmd.as_mut().inner_mut().mark_error(error);
             cmd.as_mut().inner_mut().complete();
+            // No confirmed GPU stop exists after a firmware crash; retain command resources until reboot.
+            core::mem::forget(cmd);
         }
+        pinned
     }
 }
 
