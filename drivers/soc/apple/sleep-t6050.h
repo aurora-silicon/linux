@@ -171,6 +171,9 @@ struct apple_sleep_region_state {
 	/* The AP wake-enable words, on this die and the GFX die */
 	void __iomem *wake, *wake_gfx, *aic_gfx;
 	u32 wake_enabled[11], wake_saved[11];
+	/* The sticky wake status words as the wake found them, for t6050_wake_source_report() */
+	u32 wake_status[11];
+	bool wake_status_valid;
 	bool wake_armed, wake_sources;
 	u32 spmi_mask[8];
 	bool spmi_masked;
@@ -1654,6 +1657,7 @@ static int t6050_sleep_begin(struct apple_sleep *s)
 	r->early_done = false;
 	r->early_dropped = false;
 	r->venc0_lowered = false;
+	r->wake_status_valid = false;
 	r->pmc_saved = false;
 	r->floor_changed = 0;
 	r->display_lowered = 0;
@@ -3488,11 +3492,82 @@ static void t6050_wake_report(struct apple_sleep *s)
 			r->auss_lowered, timeouts);
 }
 
+/*
+ * The AP wake sources by number, as the ADT's /arm-io/pmgr ap-wake-sources names them (the
+ * J714s's and the J716c's are the same). Their status words are sticky: each source that
+ * raised a wake keeps its bit set, at +0x34 for the ten words on this die and at +0x10 for the
+ * GFX die's one.
+ */
+#define T6050_WAKE_STATUS	0x34
+#define T6050_WAKE_STATUS_GFX	0x10
+
+static const struct {
+	u16 id;
+	const char *name;
+} t6050_wake_names[] = {
+	{ 16, "AOP.GPIO.IRQ4" }, { 18, "AOP.GPIO.IRQ6" }, { 28, "AOP.Outbox0_NotEmpty" },
+	{ 30, "AOP.Outbox2_NotEmpty" }, { 38, "AOP2.Outbox2_NotEmpty" }, { 39, "AOP.CPUWakeupAP" },
+	{ 62, "NUB.WakeupAP" }, { 65, "NUB.GPIO.IRQ2" }, { 69, "NUB.GPIO.IRQ6" },
+	{ 71, "NUB.APWatchdog" }, { 72, "NUB.APWakeupTime" }, { 73, "NUB.SPMI0Sw0IRQ" },
+	{ 74, "NUB.SPMI0Sw1IRQ" }, { 76, "NUB.SPMI0Sw3IRQ" }, { 122, "SMC.CPUWakeupAP" },
+	{ 127, "SMC.OutboxNotEmpty" }, { 147, "ATC0.PMGRCIOWakeup" }, { 148, "ATC1.PMGRCIOWakeup" },
+	{ 149, "ATC2.PMGRCIOWakeup" }, { 150, "ATC3.PMGRCIOWakeup" }, { 151, "ATC0.PMGRUSBWakeup" },
+	{ 152, "ATC1.PMGRUSBWakeup" }, { 153, "ATC2.PMGRUSBWakeup" }, { 154, "ATC3.PMGRUSBWakeup" },
+	{ 171, "MTP.DOCK.CHANNELS.AP0.IRQ" }, { 183, "MTP.OutboxNotEmpty" },
+	{ 290, "AOP2.CPUWakeupAP" },
+};
+
+/* At the start of the wake, before anything is touched: the sticky wake status */
+static void t6050_wake_source_read(struct apple_sleep *s)
+{
+	struct apple_sleep_region_state *r = s->region;
+	unsigned int i;
+
+	r->wake_status_valid = false;
+	if (!r->wake || !r->wake_gfx)
+		return;
+	for (i = 0; i < T6050_WAKE_WORDS; i++)
+		r->wake_status[i] = readl(r->wake + T6050_WAKE_STATUS + 4 * i);
+	r->wake_status[T6050_WAKE_WORDS] = readl(r->wake_gfx + T6050_WAKE_STATUS_GFX);
+	r->wake_status_valid = true;
+}
+
+/* Once the wake is done: each source that raised it, by number and name */
+static void t6050_wake_source_report(struct apple_sleep *s)
+{
+	struct apple_sleep_region_state *r = s->region;
+	unsigned int w, b, i, id;
+
+	BUILD_BUG_ON(ARRAY_SIZE(r->wake_status) != T6050_WAKE_WORDS + 1);
+	if (!r->wake_status_valid)
+		return;
+	r->wake_status_valid = false;
+	for (w = 0; w < T6050_WAKE_WORDS; w++)
+		for (b = 0; b < 32; b++) {
+			if (!(r->wake_status[w] & BIT(b)))
+				continue;
+			id = 32 * w + b;
+			for (i = 0; i < ARRAY_SIZE(t6050_wake_names); i++)
+				if (t6050_wake_names[i].id == id)
+					break;
+			if (i < ARRAY_SIZE(t6050_wake_names))
+				dev_info(s->dev, "wake source: %u %s\n", id,
+					 t6050_wake_names[i].name);
+			else
+				dev_info(s->dev, "wake source: %u\n", id);
+		}
+	for (b = 0; b < 32; b++)
+		if (r->wake_status[T6050_WAKE_WORDS] & BIT(b))
+			dev_info(s->dev, "wake source: GFX die %u\n", b);
+}
+
 static void t6050_sleep_wake_regs(struct apple_sleep *s)
 {
 	struct apple_sleep_region_state *r = s->region;
 	unsigned int i;
 	u32 value;
+
+	t6050_wake_source_read(s);
 
 	if (r->spmi_masked) {
 		/* What the PMU sent while the SoC slept (its wake), before the run-time mask */
@@ -3560,6 +3635,7 @@ static void t6050_sleep_finish(struct apple_sleep *s)
 	if (!r->attempt_active)
 		return;
 	r->attempt_active = false;
+	t6050_wake_source_report(s);
 	t6050_clusters_down_first_report(s);
 	t6050_sleep_undo_regs(s);
 	/* Before any device resumes: the radio host's noirq resume asks for the result. */
