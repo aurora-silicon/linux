@@ -696,11 +696,13 @@ static int validate_dec_params(struct avd_ctx *ctx,
 	aligned_height = round_up(dec_params->frame_height_minus_1 + 1, 16);
 
 	/*
-	 * Userspace should update the capture/decoded format when the
-	 * resolution changes.
+	 * A larger frame needs a new capture format. A smaller one is decoded
+	 * into the current buffers with their stride: VP9 inter frames can
+	 * change size and keep predicting from references of the old size,
+	 * which set_refs() scales, so userspace may keep the buffers.
 	 */
-	if (aligned_width != ctx->decoded_fmt.fmt.pix_mp.width ||
-	    aligned_height != ctx->decoded_fmt.fmt.pix_mp.height) {
+	if (aligned_width > ctx->decoded_fmt.fmt.pix_mp.width ||
+	    aligned_height > ctx->decoded_fmt.fmt.pix_mp.height) {
 		dev_err(ctx->dev->dev,
 			"unexpected bitstream resolution %dx%d\n",
 			aligned_width, aligned_height);

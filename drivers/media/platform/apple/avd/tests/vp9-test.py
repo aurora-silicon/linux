@@ -237,6 +237,13 @@ int main(int argc,char **argv) {
  current_dst=&dst[1].base.vb;frame.idx=1;assert(!avd_vp9_run(&ctx));
  {u8 *seg=p->b->bufs.seg.cpu;for(size_t j=0;j<p->b->bufs.seg.size;j++)assert(!seg[j]);}
  avd_vp9_done(&ctx,&src,&dst[1].base.vb,VB2_BUF_STATE_DONE);params.seg.flags=0;
+ /* A frame smaller than the capture format runs in it, a larger one is refused. */
+ params.frame_width_minus_1=959;params.frame_height_minus_1=539;
+ current_dst=&dst[0].base.vb;frame.idx=0;assert(!avd_vp9_run(&ctx));
+ assert(dst[0].vp9.width==960&&dst[0].vp9.height==540);
+ avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);
+ params.frame_width_minus_1=1983;params.frame_height_minus_1=1087;
+ current_dst=&dst[1].base.vb;frame.idx=1;assert(avd_vp9_run(&ctx)==-EINVAL);
  avd_vp9_stop(&ctx);assert(!avd_vp9_ready(&ctx));
  /* Old firmware and the legacy transport allocate only one bank. */
  for(unsigned int mode=0;mode<2;mode++) {
