@@ -251,6 +251,8 @@ struct brcmf_cfg80211_vif {
 	struct vif_saved_ie saved_ie;
 	struct list_head list;
 	struct completion mgmt_tx;
+	struct completion join_cancel_done;
+	bool join_canceling;
 	unsigned long mgmt_tx_status;
 	u32 mgmt_tx_id;
 	u16 mgmt_rx_reg;
