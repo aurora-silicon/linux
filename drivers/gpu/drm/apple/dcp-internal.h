@@ -912,10 +912,6 @@ struct apple_dcp {
 		unsigned int callback_count;
 		struct delayed_work timeout;
 		struct delayed_work backlight_retry;
-		struct delayed_work keepalive;
-		/* Last frame publish times, oldest first (dcp_band_hold_ns()). */
-		spinlock_t frame_lock;
-		u64 frame_ns[DCP_BAND_FRAMES];
 		unsigned long deadline;
 		unsigned int queued;
 		bool stopped;
@@ -924,8 +920,6 @@ struct apple_dcp {
 		atomic_t opaque_x_state;
 		struct iomfb_scanout_h17p *scanout;
 		struct iomfb_scanout_h17p *next_scanout;
-		/* swap_completed_mode=2: swap_enabled of the previous completed swap. */
-		u32 prev_swap_enabled;
 		/*
 		 * Presents the firmware dropped, until it completes a later one:
 		 * at most one per present retired in present_state_h17p.
@@ -1040,7 +1034,6 @@ int iomfb_queue_callback(struct apple_dcp *dcp, dcp_callback_t callback,
 			 const void *data, size_t size, void *cookie);
 void iomfb_queue_init(struct apple_dcp *dcp);
 void iomfb_queue_stop(struct apple_dcp *dcp);
-void iomfb_note_frame(struct apple_dcp *dcp);
 bool iomfb_queue_drain(struct apple_dcp *dcp, unsigned long timeout);
 int iomfb_queue_settle(struct apple_dcp *dcp, unsigned long timeout);
 void iomfb_pause_presentation(struct apple_dcp *dcp, bool pause);
@@ -1080,7 +1073,6 @@ void dcp_poweroff_retire_swallowed(struct apple_dcp *dcp);
 void iomfb_scanout_put_h17p(struct apple_dcp *dcp, struct iomfb_scanout_h17p *scanout);
 #endif
 
-bool dcp_panel_adaptive_off_enabled(void);
 
 int dcp_backlight_init(struct apple_dcp *dcp, struct device *dev);
 void dcp_backlight_stop(struct apple_dcp *dcp);
@@ -1154,13 +1146,6 @@ static inline bool dcp_is_v14_7_panel(const struct apple_dcp *dcp)
 void dcp_external_audio_start(struct apple_dcp *dcp);
 
 extern bool dcp_a352_enable_7c;
-extern unsigned int dcp_swap_ts_mode;
-extern unsigned int dcp_keepalive_ms;
-extern bool dcp_keepalive_repeat;
-extern unsigned int dcp_swap_target_lead_us;
-extern unsigned int dcp_swap_completed_mode;
-extern bool dcp_surf_id_per_fb;
-extern bool dcp_swap_band_hold;
 
 /*
  * The T8122 dcpext connects its DPTX port as AsahiLinux/linux#607 does,

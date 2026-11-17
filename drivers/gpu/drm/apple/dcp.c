@@ -214,57 +214,6 @@ bool dcp_a352_enable_7c;
 module_param_named(a352_enable_7c, dcp_a352_enable_7c, bool, 0644);
 MODULE_PARM_DESC(a352_enable_7c, "send A352 key 0x7c value 0 then 1 at boot, before the first swap (27.3 probe)");
 
-unsigned int dcp_swap_ts_mode = DCP_SWAP_TS_MODE_DEFAULT;
-module_param_named(swap_ts_mode, dcp_swap_ts_mode, uint, 0644);
-MODULE_PARM_DESC(swap_ts_mode, "swap timestamps: 0 clock values, 1 constant 120 as on M4, 2 ts[1] one 120 Hz frame before ts[0] for a lone swap, 3 all zero, 4 macOS layout");
-
-unsigned int dcp_keepalive_ms = DCP_KEEPALIVE_MS_DEFAULT;
-module_param_named(keepalive_ms, dcp_keepalive_ms, uint, 0644);
-MODULE_PARM_DESC(keepalive_ms, "0 = off. N = present the last frame again, with new timestamps, N ms after the last swap (v27 only, max 1000)");
-
-bool dcp_keepalive_repeat = false;
-module_param_named(keepalive_repeat, dcp_keepalive_repeat, bool, 0644);
-MODULE_PARM_DESC(keepalive_repeat, "N (default) = the keepalive present fires once per swap; Y = it re-arms after its own present and keeps repeating the current frame every keepalive_ms while idle");
-
-unsigned int dcp_swap_target_lead_us = 0;
-module_param_named(swap_target_lead_us, dcp_swap_target_lead_us, uint, 0644);
-MODULE_PARM_DESC(swap_target_lead_us, "0 (default) = past targets as before; N = move the swap target ts0/ts6 N us into the future in every ts mode that sets clock values");
-
-unsigned int dcp_swap_completed_mode = 0;
-module_param_named(swap_completed_mode, dcp_swap_completed_mode, uint, 0644);
-MODULE_PARM_DESC(swap_completed_mode, "0 (default) = swap_completed equals swap_enabled; 1 = send swap_completed 0; 2 = send the previous swap's swap_enabled");
-
-bool dcp_surf_id_per_fb = false;
-module_param_named(surf_id_per_fb, dcp_surf_id_per_fb, bool, 0644);
-MODULE_PARM_DESC(surf_id_per_fb, "N (default) = firmware surface ids as before; Y = send a distinct surf id per framebuffer for lab tracing of the idle-revert fault");
-
-static bool dcp_panel_adaptive_off;
-
-static int dcp_panel_adaptive_off_set(const char *val, const struct kernel_param *kp)
-{
-	int ret = param_set_bool(val, kp);
-
-	/* Live apply needs no registry walk: the next panel power-on (screen
-	 * off-and-on cycle) picks the flag up in dcp_on_set_power_state. */
-	return ret;
-}
-
-static const struct kernel_param_ops dcp_panel_adaptive_off_ops = {
-	.set = dcp_panel_adaptive_off_set,
-	.get = param_get_bool,
-};
-module_param_cb(panel_adaptive_off, &dcp_panel_adaptive_off_ops, &dcp_panel_adaptive_off, 0644);
-MODULE_PARM_DESC(panel_adaptive_off, "N (default) = firmware default refresh policy on the internal panel; Y = send adaptive-sync off (param 15, {0,0,0}, count 3 on H17 27.x) at panel power-on and when set live, so a screen off-and-on cycle applies it without a reboot");
-
-bool dcp_panel_adaptive_off_enabled(void)
-{
-	return READ_ONCE(dcp_panel_adaptive_off);
-}
-
-bool dcp_swap_band_hold = DCP_SWAP_BAND_HOLD_DEFAULT;
-module_param_named(swap_band_hold, dcp_swap_band_hold, bool, 0644);
-MODULE_PARM_DESC(swap_band_hold, "hold a presentation that would reach an idle panel 3-8.5 ms before its next grid frame until just after that frame (default on)");
-
 /*
  * DP/HDMI audio of external displays, on by default as on macOS: a display
  * that takes audio, over HDMI or DisplayPort (USB-C alt mode included),
@@ -6963,7 +6912,6 @@ static void dcp_drain_for_sleep(struct apple_dcp *dcp)
 		dcp_backlight_finish_fade(dcp);
 	for (pass = 0; pass < 4; pass++) {
 		flush_delayed_work(&dcp->iomfb.backlight_retry);
-		cancel_delayed_work_sync(&dcp->iomfb.keepalive);
 		if (dcp_has_panel(dcp))
 			flush_work(&dcp->bl_update_wq);
 		if (!iomfb_queue_drain(dcp, msecs_to_jiffies(500))) {

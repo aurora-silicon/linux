@@ -1026,11 +1026,6 @@ static void iomfb_cb_pr_publish(struct apple_dcp *dcp, struct iomfb_property *pr
 		break;
 	}
 #endif
-#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
-	case IOMFB_PROPERTY_FRAME_V27:
-		iomfb_note_frame(dcp);
-		fallthrough;
-#endif
 	default:
 		dev_dbg(dcp->dev, "pr_publish: id: %d = %u\n", prop->id, prop->value);
 	}
@@ -2432,16 +2427,12 @@ static void dcp_poweron_after_prepare_wake(struct apple_dcp *dcp, void *out,
 	dcp_first_client_open(dcp, false, dcp_poweron_after_first_client, cookie);
 }
 #else
-static void DCP_FW_NAME(dcp_panel_adaptive_send)(struct apple_dcp *dcp);
-
 static void dcp_on_set_power_state(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	struct DCP_FW_NAME(dcp_set_power_state_req) req = {
 		.unklong = 1,
 	};
 
-	if (dcp->main_display)
-		DCP_FW_NAME(dcp_panel_adaptive_send)(dcp);
 	dcp_set_power_state(dcp, DCP_POWER_OOB, &req, dcp_on_final, cookie);
 }
 
@@ -2465,46 +2456,6 @@ static void dcp_on_set_parameter(struct apple_dcp *dcp, void *out, void *cookie)
 	dcp_set_parameter_dcp(dcp, false, &param, dcp_on_set_power_state, cookie);
 }
 #endif
-
-/*
- * Lab knob panel_adaptive_off: force fixed refresh on the internal panel.
- * The driver never programs the panel's refresh policy, so firmware 27.3 runs
- * its default adaptive state; a swap-gated 2-stage pipeline then shows swap
- * k-2 after idle. Sends param 15 {0,0,0} count 3 (H17 27.x adaptive sync off)
- * at panel power-on completion. Logs the send and the firmware reply.
- * Static per-firmware TU: the template instantiates once per firmware.
- */
-static void DCP_FW_NAME(dcp_panel_adaptive_done)(struct apple_dcp *dcp, void *out, void *cookie)
-{
-	dev_info(dcp->dev, "panel adaptive-sync off sent, firmware replied %s\n",
-		 out ? "ok" : "no data");
-	(void)cookie;
-}
-
-static void DCP_FW_NAME(dcp_panel_adaptive_send)(struct apple_dcp *dcp)
-{
-	struct dcp_set_parameter_dcp param = {
-		.param =
-#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
-		15,
-#else
-		IOMFBPARAM_ADAPTIVE_SYNC,
-#endif
-		.value = { 0 },
-#if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-		.count = 3,
-#else
-		.count = 1,
-#endif
-	};
-
-	if (!dcp_has_panel(dcp) || !dcp->main_display ||
-	    !dcp_panel_adaptive_off_enabled())
-		return;
-	dev_info(dcp->dev, "sending panel adaptive-sync off (param %u)\n", param.param);
-	dcp_set_parameter_dcp(dcp, false, &param,
-			      DCP_FW_NAME(dcp_panel_adaptive_done), NULL);
-}
 
 void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 {
@@ -3287,9 +3238,9 @@ static u64 __maybe_unused dcp_swap_prev_time(u64 now, u64 prev)
 }
 
 /*
- * Sets swap timestamps 1, 2, 4, 5 and 7 (swap_ts_mode, dcp-swap-pace.h). A
- * present built earlier has stale ones, so the keepalive present sets them
- * again. The active transaction's queue time is the update start.
+ * Sets swap timestamps 1, 2, 4, 5 and 7 (Aurora internal-panel layout:
+ * ts0/ts6 = now, ts1 = previous accepted swap). The active transaction's
+ * queue time is the update start.
  */
 static void __maybe_unused dcp_swap_stamp(struct apple_dcp *dcp,
 					  typeof(DCP_FW_SWAP(dcp)) *req)
@@ -3299,9 +3250,8 @@ static void __maybe_unused dcp_swap_stamp(struct apple_dcp *dcp,
 	u64 prev = dcp_swap_prev_time(now, dcp->swap_submit_timestamp);
 	u64 start = active && active->queued_counter ?
 		dcp_swap_ticks(active->queued_counter) : now;
-	struct dcp_swap_ts ts = dcp_swap_ts_pick(READ_ONCE(dcp_swap_ts_mode), now, prev,
-						 start, DCP_V27_TIMEBASE_HZ,
-						 READ_ONCE(dcp_swap_target_lead_us));
+	struct dcp_swap_ts ts = dcp_swap_ts_pick(DCP_SWAP_TS_CURRENT, now, prev,
+						 start, DCP_V27_TIMEBASE_HZ, 0);
 
 	req->swap.timestamp[0] = ts.ts0;
 	req->swap.timestamp[1] = ts.ts1;
@@ -4319,10 +4269,6 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 #if DCP_FW_H17(DCP_FW_VER)
 		req->surf[l].base.surface_id = 0;
 #endif
-		if (READ_ONCE(dcp_surf_id_per_fb) && new_state->fb) {
-			req->surf[l].base.surface_id = new_state->fb->base.id;
-			req->swap.surf_ids[apl_plane->iomfb_surf] = new_state->fb->base.id;
-		}
 
 		/* Internal panels: tag untagged RGB with the panel's own
 		 * primaries (P3-D65, as its EDID reports), so the firmware
@@ -4395,12 +4341,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 #endif
 
 	/* These fields should be set together */
-	if (READ_ONCE(dcp_swap_completed_mode) == 1)
-		req->swap.swap_completed = 0;
-	else if (READ_ONCE(dcp_swap_completed_mode) == 2)
-		req->swap.swap_completed = dcp->iomfb.prev_swap_enabled;
-	else
-		req->swap.swap_completed = req->swap.swap_enabled;
+	req->swap.swap_completed = req->swap.swap_enabled;
 
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)
 	/* The shared ramp is encoded after swap_start, at submission time. */

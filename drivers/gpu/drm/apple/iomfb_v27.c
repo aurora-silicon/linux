@@ -123,7 +123,6 @@ static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
 #define iomfb_sleep_h17p iomfb_sleep_v27
 #define iomfb_shutdown_h17p iomfb_shutdown_v27
 #define iomfb_present_backlight_h17p iomfb_present_backlight_v27
-#define iomfb_present_keepalive_h17p iomfb_present_keepalive_v27
 #define DCP_FW h17p
 #define DCP_FW_VER DCP_FW_VERSION(27, 0, 0)
 

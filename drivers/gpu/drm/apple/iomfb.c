@@ -486,37 +486,10 @@ static void iomfb_queue_advance(struct apple_dcp *dcp)
 		schedule_work(&dcp->iomfb.work);
 }
 
-void iomfb_note_frame(struct apple_dcp *dcp)
-{
-	unsigned long flags;
-
-	spin_lock_irqsave(&dcp->iomfb.frame_lock, flags);
-	memmove(dcp->iomfb.frame_ns, dcp->iomfb.frame_ns + 1,
-		sizeof(dcp->iomfb.frame_ns) - sizeof(dcp->iomfb.frame_ns[0]));
-	dcp->iomfb.frame_ns[DCP_BAND_FRAMES - 1] = ktime_get_ns();
-	spin_unlock_irqrestore(&dcp->iomfb.frame_lock, flags);
-}
-
-static u64 iomfb_band_hold_ns(struct apple_dcp *dcp)
-{
-	u64 frames[DCP_BAND_FRAMES];
-	unsigned long flags;
-
-	if (!READ_ONCE(dcp_swap_band_hold))
-		return 0;
-	spin_lock_irqsave(&dcp->iomfb.frame_lock, flags);
-	memcpy(frames, dcp->iomfb.frame_ns, sizeof(frames));
-	spin_unlock_irqrestore(&dcp->iomfb.frame_lock, flags);
-	return dcp_band_hold_ns(frames, ktime_get_ns());
-}
-
 static void iomfb_queue_work(struct work_struct *work)
 {
 	struct apple_dcp *dcp = container_of(work, struct apple_dcp, iomfb.work);
 	struct iomfb_transaction *transaction;
-	u64 hold;
-
-relock:
 	mutex_lock(&dcp->iomfb.lock);
 	if (READ_ONCE(dcp->crashed) || dcp->iomfb.stopped) {
 		iomfb_discard_pending(dcp);
@@ -529,14 +502,6 @@ relock:
 
 	transaction = list_first_entry(&dcp->iomfb.pending,
 				       struct iomfb_transaction, link);
-	/* The lock is dropped so callers can queue; every check above runs again. */
-	hold = transaction->presentation ? iomfb_band_hold_ns(dcp) : 0;
-	if (hold) {
-		mutex_unlock(&dcp->iomfb.lock);
-		dev_dbg(dcp->dev, "band hold %llu us\n", div_u64(hold, NSEC_PER_USEC));
-		fsleep(div_u64(hold, NSEC_PER_USEC));
-		goto relock;
-	}
 	list_del(&transaction->link);
 	dcp->iomfb.queued--;
 	dcp->iomfb.active = transaction;
@@ -705,7 +670,6 @@ static void iomfb_callback_work(struct work_struct *work)
 	mutex_unlock(&dcp->iomfb.lock);
 }
 
-static void iomfb_keepalive_work(struct work_struct *work);
 
 void iomfb_queue_init(struct apple_dcp *dcp)
 {
@@ -715,11 +679,9 @@ void iomfb_queue_init(struct apple_dcp *dcp)
 	INIT_WORK(&dcp->iomfb.work, iomfb_queue_work);
 	spin_lock_init(&dcp->iomfb.callback_lock);
 	INIT_LIST_HEAD(&dcp->iomfb.callbacks);
-	spin_lock_init(&dcp->iomfb.frame_lock);
 	INIT_WORK(&dcp->iomfb.callback_work, iomfb_callback_work);
 	INIT_DELAYED_WORK(&dcp->iomfb.timeout, iomfb_queue_timeout);
 	INIT_DELAYED_WORK(&dcp->iomfb.backlight_retry, iomfb_backlight_retry);
-	INIT_DELAYED_WORK(&dcp->iomfb.keepalive, iomfb_keepalive_work);
 	atomic_set(&dcp->iomfb.opaque_x_state, IOMFB_OPAQUE_X_WAITING);
 }
 
@@ -743,7 +705,6 @@ void iomfb_queue_stop(struct apple_dcp *dcp)
 		kfree(item);
 	cancel_delayed_work_sync(&dcp->iomfb.timeout);
 	cancel_delayed_work_sync(&dcp->iomfb.backlight_retry);
-	cancel_delayed_work_sync(&dcp->iomfb.keepalive);
 }
 
 /*
@@ -3530,20 +3491,6 @@ void iomfb_present_failed_h17p(struct apple_dcp *dcp)
 	}
 }
 
-/*
- * keepalive_ms: after a frame swap completes, present the same frame once more
- * if no other frame completes within the delay.  The repeat is brightness-only,
- * so it makes no flip event and never re-arms itself.
- */
-static void iomfb_keepalive_arm(struct apple_dcp *dcp)
-{
-	unsigned int ms = dcp_keepalive_delay_ms(READ_ONCE(dcp_keepalive_ms));
-
-	if (ms)
-		mod_delayed_work(system_dfl_wq, &dcp->iomfb.keepalive,
-				 msecs_to_jiffies(ms));
-}
-
 bool iomfb_present_complete_h17p(struct apple_dcp *dcp)
 {
 	struct iomfb_transaction *transaction = dcp->iomfb.active;
@@ -3561,20 +3508,13 @@ bool iomfb_present_complete_h17p(struct apple_dcp *dcp)
 			dcp_backlight_complete(dcp, transaction->backlight.sequence, true);
 			transaction->backlight_reserved = false;
 		}
-		if (transaction->brightness_only) {
-			/* A repeating keepalive keeps the current frame alive while idle. */
-			if (READ_ONCE(dcp_keepalive_repeat))
-				iomfb_keepalive_arm(dcp);
+		if (transaction->brightness_only)
 			return false;
-		}
 	}
-	iomfb_keepalive_arm(dcp);
 	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0 || dcp->tags_27_3)
 		atomic_cmpxchg(&dcp->iomfb.opaque_x_state, IOMFB_OPAQUE_X_WAITING,
 			       IOMFB_OPAQUE_X_NEEDED);
 	iomfb_scanout_complete_h17p(dcp);
-	if (!transaction || !transaction->brightness_only)
-		dcp->iomfb.prev_swap_enabled = dcp->swap.h17p.swap.swap_enabled;
 	return true;
 }
 
@@ -3707,36 +3647,6 @@ static void iomfb_backlight_kick(struct apple_dcp *dcp)
 	if (!transaction)
 		return;
 	transaction->start = iomfb_backlight_start;
-	transaction->release = iomfb_backlight_release;
-	transaction->brightness_only = true;
-	transaction->presentation = true;
-	if (iomfb_queue(dcp, transaction))
-		kfree(transaction);
-}
-
-static void iomfb_keepalive_start(struct apple_dcp *dcp,
-				  struct iomfb_transaction *transaction)
-{
-	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0 || !iomfb_scanout_presentable(dcp))
-		return;
-
-	trace_iomfb_keepalive(dcp, dcp_keepalive_delay_ms(READ_ONCE(dcp_keepalive_ms)));
-	dcp->swap.h17p = dcp->iomfb.scanout->request;
-	iomfb_present_keepalive_v27(dcp);
-}
-
-static void iomfb_keepalive_work(struct work_struct *work)
-{
-	struct apple_dcp *dcp = container_of(to_delayed_work(work), struct apple_dcp,
-					  iomfb.keepalive);
-	struct iomfb_transaction *transaction;
-
-	if (READ_ONCE(dcp->crashed) || READ_ONCE(dcp->iomfb.stopped))
-		return;
-	transaction = kzalloc_obj(*transaction);
-	if (!transaction)
-		return;
-	transaction->start = iomfb_keepalive_start;
 	transaction->release = iomfb_backlight_release;
 	transaction->brightness_only = true;
 	transaction->presentation = true;
