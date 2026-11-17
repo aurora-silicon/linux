@@ -29,6 +29,7 @@ pub(crate) struct Compute {
     sequence_bytes: KVec<u8>,
     _binding: mmu::VmBind,
     stats: Region,
+    stamp_epoch: timeline::StampEpoch,
     sequence: u64,
     last_progress_ns: i64,
     head: u16,
@@ -71,7 +72,7 @@ impl Compute {
             if matches!(a.mapping,Mapping::CommandAlias(_)) {client_command=Some(b.map_gpu_view(vm)?);}
             objects.push(b,GFP_KERNEL)?;
         }
-        Self::encode_command(&mut objects, &mut command_bytes, binding.slot(), control, 1, 0,
+        Self::encode_command(&mut objects, &mut command_bytes, binding.slot(), control, 1, timeline::stamp(0xc1000000,1), 0,
             registers, profile, binding.generation())?;
         Self::encode_sequence(&mut objects, &mut sequence_bytes, stats, binding.slot(), timeline::stamp(0xc1000000,1), 0, profile, 0)?;
         if profile == super::m3_profile::Profile::Extended {
@@ -118,10 +119,10 @@ impl Compute {
         // the invalidation.
         crate::mem::sync();crate::mem::tlbi_all();crate::mem::sync();
         unsafe {core::arch::asm!("isb",options(nostack,preserves_flags))};
-        Ok(Self {_client_command:client_command.ok_or(EINVAL)?,objects,command_bytes,sequence_bytes,_binding:binding,stats,last_progress_ns:0,sequence:1,head:1,cached_views:KVec::new(),slot:0,batch_count:1,checkpoint:(0,0,0),barriers:None,registers,profile,_lower_tlbi:lower_tlbi})
+        Ok(Self {_client_command:client_command.ok_or(EINVAL)?,objects,command_bytes,sequence_bytes,_binding:binding,stats,last_progress_ns:0,stamp_epoch:timeline::StampEpoch::default(),sequence:1,head:1,cached_views:KVec::new(),slot:0,batch_count:1,checkpoint:(0,0,0),barriers:None,registers,profile,_lower_tlbi:lower_tlbi})
     }
     fn encode_command(objects: &mut [Buffer], bytes: &mut [u8], context: u32,
-        control: crate::m3::agx_compute::Control, sequence: u64, slot: usize,
+        control: crate::m3::agx_compute::Control, sequence: u64, stamp_value: u32, slot: usize,
         register_set: command::RegisterSet, profile: super::m3_profile::Profile, generation: u8) -> Result {
         let offset = |owner:usize| storage::slot_offset_for(profile,owner,slot).map_err(|_|EINVAL);
         let fw = |owner: usize| queue::FirmwareVa::new(objects[owner].va()+offset(owner)? as u64).map_err(|_| EINVAL);
@@ -136,7 +137,7 @@ impl Compute {
                 if profile == super::m3_profile::Profile::Extended { microsequence::Sequence::EXTENDED_LENGTH as u32 }
                 else { microsequence::LENGTH as u32 },
             stamp: fw(storage::STAMP)?, fw_stamp: fw(storage::FW_STAMP)?,
-            stamp_value: timeline::stamp(0xc1000000,sequence),
+            stamp_value,
             timestamps: [fw(TIMESTAMPS[0])?, fw(TIMESTAMPS[1])?],
             pool: fw(storage::POOL)?, tail_scratch: fw(TAIL_SCRATCH)?, flush_stamps: false,
             register_set,
@@ -258,8 +259,8 @@ impl Compute {
         }
         self.objects[NOTIFIER].u32(state::NOTIFIER_CONTEXT,self._binding.slot())?;
         self.sequence=self.sequence.checked_add(1).ok_or(EOVERFLOW)?;
-        Self::encode_command(&mut self.objects,&mut self.command_bytes,self._binding.slot(),control,self.sequence,self.slot,self.registers,self.profile,self._binding.generation())?;
         let stamp=self.stamp();
+        Self::encode_command(&mut self.objects,&mut self.command_bytes,self._binding.slot(),control,self.sequence,stamp,self.slot,self.registers,self.profile,self._binding.generation())?;
         Self::encode_sequence(&mut self.objects,&mut self.sequence_bytes,self.stats,self._binding.slot(),stamp,self.slot,self.profile,self.sequence - 1)?;
         self.write_counters()?;
         let address=self.objects[storage::COMMAND].va()+storage::slot_offset_for(self.profile,storage::COMMAND,self.slot).map_err(|_|EINVAL)? as u64;
@@ -326,7 +327,20 @@ impl Compute {
         } else { microsequence::HAS_ATTACHMENTS },&[u8::from(attachments.count()!=0)])?;
         agx_memory::publish();Ok(())
     }
-    fn stamp(&self) -> u32 { timeline::stamp(0xc1000000,self.sequence) }
+    fn stamp(&self) -> u32 { self.stamp_epoch.value(0xc1000000,self.sequence) }
+    pub(crate) fn stamps_need_reseed(&self)->bool {
+        self.stamp_epoch.needs_reseed(0xc1000000,self.sequence)
+    }
+    /// All queues, including cross-engine consumers, must have passed Runtime's
+    /// final retirement checks. This preserves the pool and command counters.
+    pub(crate) fn reseed_stamps(&mut self)->Result {
+        if !self.complete()? {return Err(EBUSY);}
+        for owner in [storage::STAMP,storage::FW_STAMP] {
+            self.objects[owner].u32(0,0xc1000000)?;
+        }
+        self.stamp_epoch.reseed(self.sequence);
+        Ok(())
+    }
     pub(crate) fn completion_dependency(&self)->Result<crate::m3::m3_sync_layout::CompletionDependency> {
         Ok(crate::m3::m3_sync_layout::CompletionDependency {
             stamp:queue::FirmwareVa::new(self.objects[storage::FW_STAMP].va()).map_err(|_|EINVAL)?,

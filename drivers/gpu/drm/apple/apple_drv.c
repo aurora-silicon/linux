@@ -7,6 +7,7 @@
  * Copyright (C) 2014 Endless Mobile
  */
 
+#include <linux/soc/apple/j613-display.h>
 #include <linux/aperture.h>
 #include <linux/component.h>
 #include <linux/completion.h>
@@ -393,6 +394,8 @@ static void apple_crtc_atomic_enable(struct drm_crtc *crtc,
 	}
 	if (crtc_state->active &&
 	    (crtc_state->active_changed || dcp_crtc_needs_route_start(dcp))) {
+		/* The HPD of the link dcp_poweron() reconnects precedes our mode set. */
+		WRITE_ONCE(dcp->typec_enable_pending, true);
 		dcp_poweron(apple_crtc->dcp);
 		crtc_state->color_mgmt_changed = true;
 	} else if (crtc_state->active && drm_atomic_crtc_needs_modeset(crtc_state)) {
@@ -401,9 +404,14 @@ static void apple_crtc_atomic_enable(struct drm_crtc *crtc,
 	}
 	if (crtc_state->active) {
 		ret = dcp_crtc_atomic_modeset(crtc, commit);
-		if (ret)
+		if (ret) {
+			if (dcp_is_ext26(dcp))
+				goto failed;
 			dcp_drm_crtc_error(apple_crtc, crtc_state, ret);
+		}
 	}
+	/* The mode set of the enable has run: a sink still without one has a bad link. */
+	WRITE_ONCE(dcp->typec_enable_pending, false);
 	dcp_typec_follow_done(locked);
 	return;
 
@@ -414,6 +422,7 @@ failed:
 	dev_err(dcp->dev, "CRTC route unavailable (%d); modeset deferred\n", ret);
 	/* Flush completes any pending flip without issuing a firmware swap. */
 	schedule_work(&dcp->vblank_wq);
+	WRITE_ONCE(dcp->typec_enable_pending, false);
 	if (dcp->connector)
 		dcp_route_failure_notify(dcp->connector);
 	dcp_typec_follow_done(locked);
@@ -1161,7 +1170,7 @@ static int apple_probe_per_dcp(struct device *dev,
 							supports_xrgb2101010,
 							xrgb_is_alpha,
 							plane_type, interchange,
-							supports_premultiplied);
+							supports_premultiplied, dcp_is_ext26(dcp_data));
 		}
 		if (IS_ERR(planes[zpos]))
 			return PTR_ERR(planes[zpos]);
@@ -1320,9 +1329,17 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		ret = drm_connector_attach_vrr_capable_property(&connector->base);
 		if (ret)
 			return ret;
-		ret = apple_connector_attach_hdr(&connector->base, false);
-		if (ret)
-			return ret;
+		/*
+		 * T8122's retained external scanout accepts only 8-bit RGB.
+		 * Do not advertise the BT.2020/PQ output contract until this
+		 * route has a qualified 10-bit primary-plane format. The sink
+		 * EDID remains intact; its capabilities are not the pipeline's.
+		 */
+		if (!of_machine_is_compatible("apple,t8122")) {
+			ret = apple_connector_attach_hdr(&connector->base, false);
+			if (ret)
+				return ret;
+		}
 
 		connector->base.polled = DRM_CONNECTOR_POLL_HPD;
 		connector->connected = false;
@@ -2083,8 +2100,10 @@ static struct platform_driver apple_platform_driver = {
 static int __init appledrm_register(void)
 {
 	int ret;
-	if (drm_firmware_drivers_only())
+	if (drm_firmware_drivers_only()) {
+		apple_j613_display_fail();
 		return -ENODEV;
+	}
 
 	/* A refused experimental profile keeps the boot framebuffer available. */
 	ret = apple_j613_25g83_coldplug();
@@ -2093,8 +2112,10 @@ static int __init appledrm_register(void)
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
 	ret = dcp_audio_register();
-	if (ret)
+	if (ret) {
+		apple_j613_display_fail();
 		return ret;
+	}
 #endif
 	ret = dcp_register();
 	if (ret)
@@ -2104,6 +2125,7 @@ static int __init appledrm_register(void)
 		return 0;
 	dcp_unregister();
 unregister_audio:
+	apple_j613_display_fail();
 #if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
 	dcp_audio_unregister();
 #endif
@@ -2112,6 +2134,7 @@ unregister_audio:
 
 static void __exit appledrm_unregister(void)
 {
+	apple_j613_display_fail();
 #if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
 	dcp_audio_unregister();
 #endif
