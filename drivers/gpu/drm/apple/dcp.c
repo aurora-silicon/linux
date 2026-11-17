@@ -230,6 +230,18 @@ unsigned int dcp_swap_target_lead_us = 0;
 module_param_named(swap_target_lead_us, dcp_swap_target_lead_us, uint, 0644);
 MODULE_PARM_DESC(swap_target_lead_us, "0 (default) = past targets as before; N = move the swap target ts0/ts6 N us into the future in every ts mode that sets clock values");
 
+unsigned int dcp_reswap = 0;
+module_param_named(reswap, dcp_reswap, uint, 0644);
+MODULE_PARM_DESC(reswap, "0 (default) = one submit per swap as before; N = after each atomic swap completes with nothing queued, submit the same full request again N times as real swaps (new swap_id, no flip event)");
+
+unsigned int dcp_swap_completed_mode = 0;
+module_param_named(swap_completed_mode, dcp_swap_completed_mode, uint, 0644);
+MODULE_PARM_DESC(swap_completed_mode, "0 (default) = swap_completed equals swap_enabled; 1 = send swap_completed 0; 2 = send the previous swap's swap_enabled");
+
+bool dcp_surf_id_per_fb = false;
+module_param_named(surf_id_per_fb, dcp_surf_id_per_fb, bool, 0644);
+MODULE_PARM_DESC(surf_id_per_fb, "N (default) = firmware surface ids as before; Y = send a distinct surf id per framebuffer for lab tracing of the idle-revert fault");
+
 bool dcp_swap_band_hold = DCP_SWAP_BAND_HOLD_DEFAULT;
 module_param_named(swap_band_hold, dcp_swap_band_hold, bool, 0644);
 MODULE_PARM_DESC(swap_band_hold, "hold a presentation that would reach an idle panel 3-8.5 ms before its next grid frame until just after that frame (default on)");

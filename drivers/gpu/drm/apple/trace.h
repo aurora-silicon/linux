@@ -263,6 +263,71 @@ TRACE_EVENT(iomfb_swap_submit,
 		      __entry->swap_id)
 );
 
+/*
+ * Lab trace: one line per swap submit carrying the DRM fb id per surface and
+ * every surface IOVA sent. Matches the D594 displayed_data below: a frame
+ * that follows idle shows the picture from 2 swaps earlier while KMS plane-2
+ * fb ids rotate strictly, so the question is which buffer the request named.
+ */
+TRACE_EVENT(iomfb_swap_surfaces,
+	    TP_PROTO(struct apple_dcp *dcp, u32 swap_id, u32 fb0, u32 fb1,
+		     u64 iova0, u64 iova1, u32 surf_id0, u32 surf_id1),
+	    TP_ARGS(dcp, swap_id, fb0, fb1, iova0, iova1, surf_id0, surf_id1),
+	    TP_STRUCT__entry(
+			     __field(u64, dcp)
+			     __field(u32, swap_id)
+			     __field(u32, fb0)
+			     __field(u32, fb1)
+			     __field(u64, iova0)
+			     __field(u64, iova1)
+			     __field(u32, surf_id0)
+			     __field(u32, surf_id1)
+	    ),
+	    TP_fast_assign(
+			   __entry->dcp = (u64)dcp;
+			   __entry->swap_id = swap_id;
+			   __entry->fb0 = fb0;
+			   __entry->fb1 = fb1;
+			   __entry->iova0 = iova0;
+			   __entry->iova1 = iova1;
+			   __entry->surf_id0 = surf_id0;
+			   __entry->surf_id1 = surf_id1;
+	    ),
+	    TP_printk("dcp=%llx swap=%u fb=%u,%u iova=%llx,%llx sid=%u,%u",
+		      __entry->dcp, __entry->swap_id, __entry->fb0, __entry->fb1,
+		      __entry->iova0, __entry->iova1,
+		      __entry->surf_id0, __entry->surf_id1)
+);
+
+/*
+ * Lab trace: one line per D594 swap-complete with the fields that may tell a
+ * swap that reached the panel from one that did not.
+ */
+TRACE_EVENT(iomfb_swap_displayed,
+	    TP_PROTO(struct apple_dcp *dcp, u32 swap_id, u64 displayed_data,
+		     u8 notify_displayed, u8 completion_flag),
+	    TP_ARGS(dcp, swap_id, displayed_data, notify_displayed,
+		    completion_flag),
+	    TP_STRUCT__entry(
+			     __field(u64, dcp)
+			     __field(u32, swap_id)
+			     __field(u64, displayed_data)
+			     __field(u8, notify_displayed)
+			     __field(u8, completion_flag)
+	    ),
+	    TP_fast_assign(
+			   __entry->dcp = (u64)dcp;
+			   __entry->swap_id = swap_id;
+			   __entry->displayed_data = displayed_data;
+			   __entry->notify_displayed = notify_displayed;
+			   __entry->completion_flag = completion_flag;
+	    ),
+	    TP_printk("dcp=%llx swap=%u disp_data=%llx notify=%u cflag=%u",
+		      __entry->dcp, __entry->swap_id,
+		      __entry->displayed_data, __entry->notify_displayed,
+		      __entry->completion_flag)
+);
+
 TRACE_EVENT(iomfb_keepalive,
 	    TP_PROTO(struct apple_dcp *dcp, unsigned int delay_ms),
 	    TP_ARGS(dcp, delay_ms),

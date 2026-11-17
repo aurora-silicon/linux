@@ -924,6 +924,10 @@ struct apple_dcp {
 		atomic_t opaque_x_state;
 		struct iomfb_scanout_h17p *scanout;
 		struct iomfb_scanout_h17p *next_scanout;
+		/* Lab reswap knob: repeats submitted for the current atomic swap. */
+		unsigned int reswaps;
+		/* swap_completed_mode=2: swap_enabled of the previous completed swap. */
+		u32 prev_swap_enabled;
 		/*
 		 * Presents the firmware dropped, until it completes a later one:
 		 * at most one per present retired in present_state_h17p.
@@ -1154,6 +1158,9 @@ extern unsigned int dcp_swap_ts_mode;
 extern unsigned int dcp_keepalive_ms;
 extern bool dcp_keepalive_repeat;
 extern unsigned int dcp_swap_target_lead_us;
+extern unsigned int dcp_reswap;
+extern unsigned int dcp_swap_completed_mode;
+extern bool dcp_surf_id_per_fb;
 extern bool dcp_swap_band_hold;
 
 /*

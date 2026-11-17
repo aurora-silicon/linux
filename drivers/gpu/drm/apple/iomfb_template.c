@@ -773,6 +773,8 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 {
 	ktime_t now = ktime_get();
 	trace_iomfb_swap_complete(dcp, resp->swap_id);
+	trace_iomfb_swap_displayed(dcp, resp->swap_id, resp->displayed_data,
+				   resp->notify_displayed, resp->completion_flag);
 #if DCP_FW_H17(DCP_FW_VER) && !DCP_FW_DESKTOP_26(DCP_FW_VER)
 	dcp_swap_complete_dbg(dcp, resp, now);
 #endif
@@ -3394,6 +3396,13 @@ static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 	}
 #endif
 	trace_iomfb_swap_submit(dcp, resp->swap_id);
+	trace_iomfb_swap_surfaces(dcp, resp->swap_id,
+				  DCP_FW_SWAP(dcp).swap.surf_ids[0],
+				  DCP_FW_SWAP(dcp).swap.surf_ids[1],
+				  DCP_FW_SWAP(dcp).surf_iova[0],
+				  DCP_FW_SWAP(dcp).surf_iova[1],
+				  DCP_FW_SWAP(dcp).surf[0].base.surface_id,
+				  DCP_FW_SWAP(dcp).surf[1].base.surface_id);
 	dcp_h17p_prepare_swap(dcp);
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)
 	dcp_peer_swap_submit_26_6(dcp, &DCP_FW_SWAP(dcp), resp->swap_id);
@@ -4261,6 +4270,10 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 
 		req->surf_iova[l] = apple_state->iova;
 		req->surf[l].base = apple_state->surf;
+		if (READ_ONCE(dcp_surf_id_per_fb) && new_state->fb) {
+			req->surf[l].base.surface_id = new_state->fb->base.id;
+			req->swap.surf_ids[apl_plane->iomfb_surf] = new_state->fb->base.id;
+		}
 #if DCP_FW_H17(DCP_FW_VER)
 		req->surf[l].base.surface_id = 0;
 #endif
@@ -4336,7 +4349,12 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 #endif
 
 	/* These fields should be set together */
-	req->swap.swap_completed = req->swap.swap_enabled;
+	if (READ_ONCE(dcp_swap_completed_mode) == 1)
+		req->swap.swap_completed = 0;
+	else if (READ_ONCE(dcp_swap_completed_mode) == 2)
+		req->swap.swap_completed = dcp->iomfb.prev_swap_enabled;
+	else
+		req->swap.swap_completed = req->swap.swap_enabled;
 
 #if DCP_FW_DESKTOP_26(DCP_FW_VER)
 	/* The shared ramp is encoded after swap_start, at submission time. */
