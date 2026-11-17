@@ -78,11 +78,13 @@ static unsigned int doorbells, drains, notifications, consumer;
 static u16 firmware_status;
 static bool async_reply, async_event, wrong_reply;
 static bool *submission_probe;
+static bool private_access_forbidden;
 enum { REPLY, TIMEOUT, LOST };
 static int transport_mode;
 static void mutex_lock(int *lock) { assert(!*lock); *lock = 1; }
 static void mutex_unlock(int *lock) { assert(*lock); *lock = 0; }
-static void *wiphy_priv(struct wiphy *wiphy) { return &wiphy->wifi; }
+static void *wiphy_priv(struct wiphy *wiphy)
+{ assert(!private_access_forbidden); return &wiphy->wifi; }
 static void usleep_range(int a, int b) { (void)a; (void)b; jiffies += 100; }
 static unsigned int readl(void *address) { (void)address; return transport_mode == LOST ? 0 : 2; }
 static void writel(unsigned int value, void *address) { (void)value; (void)address; doorbells++; }
@@ -143,6 +145,7 @@ static void reset(void)
     transport_mode = REPLY;
     jiffies = 0;
     submission_probe = NULL;
+    private_access_forbidden = false;
 }
 static void prepare(void) { reset(); centauri_t6050_wifi_pm_prepare(&control); }
 static int disconnect(void) { return wifi_disconnect(&wiphy, &netdev, 3); }
@@ -155,8 +158,32 @@ static void expect_error(int expected)
     assert(doorbells == before); /* Suspend/error lookup cannot issue a retry. */
     assert(!wifi.lock);
 }
+
+static void test_registered_pm_contract(void)
+{
+    cfg80211_registration_check(&registered_pm_ops);
+    assert(registration_warnings == 0);
+    for (unsigned retired = 0; retired < 2; retired++) {
+        reset();
+        wifi.pm_prepared = true;
+        wifi.pm_disconnect.error = -EREMOTEIO;
+        if (retired) {
+            control.wifi = NULL;
+            wiphy.wifi = (struct centauri_t6050_wifi *)(uintptr_t)1;
+        }
+        struct centauri_t6050_wifi snapshot = wifi;
+        unsigned before_doorbells = doorbells, before_drains = drains;
+        private_access_forbidden = true;
+        assert(call_registered_resume(&wiphy) == 0);
+        private_access_forbidden = false;
+        assert(doorbells == before_doorbells && drains == before_drains);
+        assert(memcmp(&snapshot, &wifi, sizeof(wifi)) == 0);
+    }
+}
+
 int main(void)
 {
+    test_registered_pm_contract();
     prepare();
     assert(!wifi.pm_disconnect.seen);
     expect_error(0); /* Missing transaction remains missing. */
@@ -274,26 +301,63 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--out', type=Path)
     parser.add_argument('--negative-controls', action='store_true')
+    parser.add_argument('--source-root', type=Path)
+    parser.add_argument('--wifi-source', type=Path)
     args = parser.parse_args()
-    root = Path(__file__).resolve().parents[2]
-    source = (root / "drivers/net/wireless/apple/centauri/t6050/centauri_wifi.c").read_text()
+    root = args.source_root or Path(__file__).resolve().parents[2]
+    source = (args.wifi_source or root / "drivers/net/wireless/apple/centauri/t6050/centauri_wifi.c").read_text()
+    core = (root / "net/wireless/core.c").read_text()
     receipt = re.search(r"struct centauri_wifi_disconnect_receipt \{.*?\n\};", source, re.S)
     if not receipt:
         raise RuntimeError("Production receipt structure missing")
     names = ["command_reply", "wait_disconnect", "wifi_disconnect",
              "centauri_t6050_wifi_pm_prepare", "centauri_t6050_wifi_pm_error",
              "centauri_t6050_wifi_pm_complete", "wifi_suspend"]
+    has_resume = bool(re.search(r"^static int wifi_resume\(", source, re.M))
+    if has_resume:
+        names.append("wifi_resume")
     production = "\n\n".join(block(source, name) for name in names)
     ops = re.search(r"static const struct cfg80211_ops wifi_ops = \{(.*?)\n\};", source, re.S)
     registration = re.search(r"\.suspend\s*=\s*(\w+)", ops.group(1)) if ops else None
     suspend = registration.group(1) if registration else "NULL"
-    dispatch = f"static int (*registered_suspend)(struct wiphy *, struct cfg80211_wowlan *) = {suspend};\n" + r"""
+    resume_registration = re.search(r"\.resume\s*=\s*(\w+)", ops.group(1)) if ops else None
+    resume_callback = resume_registration.group(1) if resume_registration else "NULL"
+    expected_resume = "wifi_resume" if has_resume else "NULL"
+    constraint = re.search(r"^\s*WARN_ON\(ops->suspend && !ops->resume\);", core, re.M)
+    if not constraint:
+        raise RuntimeError("Actual cfg80211 PM registration constraint changed")
+    dispatch = f"""
+struct cfg80211_ops {{
+    int (*suspend)(struct wiphy *, struct cfg80211_wowlan *);
+    int (*resume)(struct wiphy *);
+}};
+static unsigned registration_warnings;
+static int mock_warn_on(bool condition)
+{{
+    registration_warnings += condition;
+    return condition;
+}}
+#define WARN_ON(condition) mock_warn_on(!!(condition))
+static void cfg80211_registration_check(const struct cfg80211_ops *ops)
+{{
+    {constraint.group().strip()}
+}}
+static const struct cfg80211_ops registered_pm_ops = {{
+    .suspend = {suspend},
+    .resume = {resume_callback},
+}};
 static int call_registered_suspend(struct wiphy *wiphy, struct cfg80211_wowlan *wowlan)
-{
-    assert(registered_suspend == wifi_suspend);
-    return registered_suspend(wiphy, wowlan);
-}
+{{
+    assert(registered_pm_ops.suspend == wifi_suspend);
+    return registered_pm_ops.suspend(wiphy, wowlan);
+}}
+static int call_registered_resume(struct wiphy *wiphy)
+{{
+    assert(registered_pm_ops.resume && registered_pm_ops.resume == {expected_resume});
+    return registered_pm_ops.resume(wiphy);
+}}
 """
+    production += dispatch
     variants = [("production", production, 0)]
     negative_controls = [
         ("lost-suspend-error", "ret = wifi->pm_disconnect.error;", "ret = 0;"),
@@ -318,6 +382,22 @@ static int call_registered_suspend(struct wiphy *wiphy, struct cfg80211_wowlan *
         late = production.replace(needle, "\tindex_write(wifi, 3, 1, wifi->command_head);\n\tif (submitted)\n\t\t*submitted = true;", 1)
         variants.append(("late-submission", late, -signal.SIGABRT))
         failures["late-submission"] = "*submission_probe"
+    if args.negative_controls and has_resume:
+        if resume_registration:
+            needle = ".resume = " + resume_callback + ","
+            if needle not in production:
+                raise RuntimeError("Registered resume initializer changed")
+            variants.append(("cfg80211-missing-resume", production.replace(needle, ".resume = NULL,", 1), -signal.SIGABRT))
+            failures["cfg80211-missing-resume"] = "registration_warnings == 0"
+        for name, replacement, failure in (
+            ("resume-private-access", "(void)wiphy_priv(wiphy);", "!private_access_forbidden"),
+            ("resume-command", "(void)wiphy; writel(1, NULL);", "doorbells == before_doorbells"),
+        ):
+            needle = "(void)wiphy;"
+            if needle not in production:
+                raise RuntimeError("No-private-access resume body changed")
+            variants.append((name, production.replace(needle, replacement, 1), -signal.SIGABRT))
+            failures[name] = failure
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     compiler = shlex.split(os.environ.get("CC", "cc"))
     with tempfile.TemporaryDirectory(prefix="centauri-wifi-pm-") as directory:
@@ -325,7 +405,7 @@ static int call_registered_suspend(struct wiphy *wiphy, struct cfg80211_wowlan *
         out.mkdir(parents=True, exist_ok=True)
         for name, code, expected in variants:
             harness, binary = out / (name + '.c'), out / name
-            harness.write_text(PRELUDE + receipt.group() + STUBS + code + dispatch + TESTS)
+            harness.write_text(PRELUDE + receipt.group() + STUBS + code + TESTS)
             subprocess.run(compiler + ["-std=gnu11", "-Wall", "-Wextra", "-Werror",
                                       str(harness), "-o", str(binary)], check=True)
             result = subprocess.run([str(binary)], capture_output=True, text=True)

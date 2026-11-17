@@ -2036,6 +2036,13 @@ static int wifi_suspend(struct wiphy *wiphy, struct cfg80211_wowlan *wowlan)
 	return ret;
 }
 
+static int wifi_resume(struct wiphy *wiphy)
+{
+	/* Control owns recovery and fresh registration; old Wi-Fi state may be gone. */
+	(void)wiphy;
+	return 0;
+}
+
 static int wifi_power_mgmt(struct wiphy *wiphy, struct net_device *netdev,
 			   bool enabled, int timeout)
 {
@@ -2139,6 +2146,7 @@ static int wifi_dump_station(struct wiphy *wiphy, struct wireless_dev *wdev,
 
 static const struct cfg80211_ops wifi_ops = {
 	.suspend = wifi_suspend,
+	.resume = wifi_resume,
 	.scan = wifi_scan,
 	.abort_scan = wifi_abort_scan,
 	.connect = wifi_connect,
