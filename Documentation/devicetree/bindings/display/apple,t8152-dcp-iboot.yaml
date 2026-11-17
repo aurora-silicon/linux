@@ -33,9 +33,31 @@ properties:
       the old session's buffers. The driver refuses takeover if absent.
       This property must not be hard-coded in a board device tree.
 
+  apple,dp-source:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 2
+    description:
+      Display-crossbar UFP endpoint, 0 for DCP, 1 for DCPEXT0, 2 for DCPEXT1.
+      The driver uses DPTX port zero, whose ATC mux selector is twice this.
+
+  apple,usb-c-ports:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      Controller node containing the shared USB-C port children, dp-clock,
+      aux and aux-ps resources. Each connected port has one controller owner.
+
+  apple,rtkit-wake:
+    type: boolean
+    description:
+      Runtime handoff for an unused DCPEXT whose firmware is loaded, powered,
+      and awaiting RTKit wake. The loader must reserve its firmware mappings
+      and buffers and supply apple,afk-active-endpoints. This property must
+      not be hard-coded in a board tree. An adopted HDMI session is already
+      running and takes precedence over this unused-controller indication.
+
   reg:
     minItems: 2
-    maxItems: 7
+    maxItems: 8
 
   reg-names:
     oneOf:
@@ -61,6 +83,8 @@ properties:
           - const: aux-ps
           - const: phy-ps
           - const: coproc-ps
+          - const: coproc-psd
+        minItems: 7
         description:
           DCP coprocessor, the HDMI dptx-phy blocks, the AP
           DisplayPort AUX controller that reads the sink's EDID with its
@@ -69,15 +93,21 @@ properties:
           powered link and must check these states before accessing the PHY.
       - items:
           - const: coproc
+          - const: coproc-psd
+        description:
+          Additional display controller and its PMGR2 PSD admission state;
+          PHY resources are shared through apple,usb-c-ports.
+      - items:
+          - const: coproc
           - const: dp-clock
           - const: aux
           - const: aux-ps
         minItems: 2
         description:
           DCP coprocessor, the PMGR clock control of the ATC DisplayPort
-          link (shared by the ports), and optionally the AP DisplayPort AUX
-          controller with its PMGR power state; the USB-C ports follow as
-          usb-c child nodes
+          links (one divider every eight bytes, starting with ATC0), and
+          optionally the AP DisplayPort AUX controller with its PMGR power
+          state; the USB-C ports follow as usb-c child nodes
 
   apple,tunable-pre:
     $ref: /schemas/types.yaml#/definitions/uint32-matrix
@@ -105,7 +135,8 @@ properties:
     type: boolean
     description:
       The DCP drives the HDMI port through the dedicated dptx-phy and an
-      on-board DisplayPort-to-HDMI converter, instead of an ATC USB-C PHY.
+      on-board DisplayPort-to-HDMI converter. With apple,usb-c-ports it can
+      instead claim a USB-C port when the bootloader has not assigned HDMI.
 
   apple,usb-pd:
     $ref: /schemas/types.yaml#/definitions/phandle
@@ -210,7 +241,7 @@ examples:
         compatible = "apple,t8152-dcp-iboot";
         reg = <0x2 0x86e00000 0x0 0x74000>,
               <0x4 0x13000000 0x0 0x84000>,
-              <0x3 0x0002005c 0x0 0x4>,
+              <0x3 0x00020044 0x0 0x1c>,
               <0x3 0x082900c0 0x0 0x104>,
               <0x3 0x03a13a00 0x0 0xc0>;
         reg-names = "coproc", "atc", "dp-clock", "atc-ps", "atc-psd";
@@ -225,7 +256,7 @@ examples:
       display@296e00000 {
         compatible = "apple,t8152-dcp-iboot";
         reg = <0x2 0x96e00000 0x0 0x74000>,
-              <0x3 0x0002005c 0x0 0x4>;
+              <0x3 0x00020044 0x0 0x1c>;
         reg-names = "coproc", "dp-clock";
         #address-cells = <2>;
         #size-cells = <2>;
