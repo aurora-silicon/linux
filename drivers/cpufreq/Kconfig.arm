@@ -32,6 +32,16 @@ config ARM_APPLE_SOC_CPUFREQ
 	  This adds the CPUFreq driver for Apple Silicon machines
 	  (e.g. Apple M1).
 
+config ARM_APPLE_SOC_CPUFREQ_KUNIT_TEST
+	tristate "KUnit tests for Apple Silicon SoC CPUFreq" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Tests command-field ownership and APSC state-row selection used by
+	  the Apple Silicon CPUFreq driver. These tests validate that a T6000
+	  request can preserve the firmware-owned PS2 field and that T8112
+	  state descriptor rows are selected with the documented stride.
+
 config ARM_ARMADA_37XX_CPUFREQ
 	tristate "Armada 37xx CPUFreq support"
 	depends on ARCH_MVEBU || COMPILE_TEST
