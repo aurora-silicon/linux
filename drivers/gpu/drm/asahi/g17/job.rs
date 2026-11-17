@@ -13,7 +13,7 @@ use kernel::{
     dma_fence::{Fence, RawDmaFence},
     drm::sched,
     prelude::*,
-    sync::Arc,
+    sync::{Arc, UniqueArc},
 };
 
 pub(super) const TIMEOUT_MS: kernel::time::Msecs = super::timeout::POLL_MS;
@@ -149,8 +149,10 @@ impl Packet {
             }
             Validated::Compute { .. } => None,
         };
-        Ok(Arc::new(
-            Self {
+        // Allocated first and written in place: built on the stack, the command (about 1.3 KB)
+        // was copied three more times.
+        let packet = UniqueArc::new_uninit(GFP_KERNEL)?;
+        let Ok(packet) = packet.init_with(init!(Self {
                 id,
                 context,
                 command,
@@ -164,9 +166,8 @@ impl Packet {
                 early: AtomicI32::new(0),
                 backlog: AtomicBool::new(false),
                 allowance_end: AtomicU64::new(0),
-            },
-            GFP_KERNEL,
-        )?)
+            }));
+        Ok(packet.into())
     }
 
     /// Its own watchdog still renews the job for the allowance its queue asked for at `now`
