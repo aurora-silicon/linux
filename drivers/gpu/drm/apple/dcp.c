@@ -4821,6 +4821,9 @@ void dcp_poweron(struct platform_device *pdev)
 						   &dcp->bl_fallback_wq,
 						   DCP_BL_FALLBACK_DELAY);
 		}
+		/* The loader report or fallback may initialize the policy later. */
+		if (!dcp_backlight_active(dcp))
+			return;
 		ret = dcp_backlight_dpms(dcp, true);
 		if (ret)
 			dev_warn(dcp->dev, "backlight restore unavailable: %d\n", ret);

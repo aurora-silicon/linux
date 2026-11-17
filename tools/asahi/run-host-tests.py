@@ -54,6 +54,8 @@ def mutations(flag, names, base, expect=KILL):
 
 # test file -> [(arguments, expectation)]. '{out}' is a fresh directory.
 ASAHI_TESTS = {
+    'm3-stamp-admission-tests.py': [(out(), PASS),
+                                     (out() + ['--mutation', 'live-reseed'], KILL)],
     'hardware-defaults-tests.py': [([], PASS)],
     'j613-mtp-s2idle-tests.py': [([], PASS)],
     # 11eccbedc3ed writes frames without a transport-wide lock.
@@ -134,6 +136,9 @@ ASAHI_TESTS = {
     'brcmfmac-scan-timeout-tests.py': [(out('--output'), PASS)],
     'brcmfmac-sleep-lifetime-tests.py': [([], PASS)],
     'cio-native-tests.py': [(out('--output'), PASS)],
+    'centauri-wifi-pm-tests.py': [(out(), PASS), (out() + ['--negative-controls'], PASS)],
+    'centauri-bt-arena-tests.py': [(out(), PASS), (out() + ['--negative-controls'], PASS)],
+    'centauri-recovery-tests.py': [(out(), PASS), (out() + ['--negative-controls'], PASS)],
     'clpc-gpu-demand-tests.py': [([], PASS)],
     # The old policy always disabled compute preemption.
     'compute-preempt-tests.py': [(out(), PASS),
@@ -143,6 +148,7 @@ ASAHI_TESTS = {
     'dart-sleep-power-tests.py': [([], PASS)],
     'dart-sleep-snapshot-tests.py': [([], PASS)],
     'dart-sleep-writer-tests.py': [([], PASS)],
+    'backlight-coldboot-tests.py': [(out('--output'), PASS), (out('--output') + ['--negative-controls'], PASS)],
     'dcp14-backlight-tests.py': [([], PASS)],
     'dcp14-panel-tests.py': [([], PASS)],
     'devcoredump-init-tests.py': [([], PASS)],
@@ -267,7 +273,7 @@ ASAHI_TESTS = {
 }
 
 # Rust unit-test files built with `rustc --test`, and shell drivers.
-ASAHI_RUST = ['m3-batching-tests.rs', 'm3-runtime-tests.rs', 'pmp-bootargs-tests.rs', 'pmp-power-tests.rs',
+ASAHI_RUST = ['m3-batching-tests.rs', 'm3-stamp-tests.rs', 'm3-runtime-tests.rs', 'pmp-bootargs-tests.rs', 'pmp-power-tests.rs',
               'usage-tests.rs']
 ASAHI_SHELL = ['g17-ray-query-timeout-tests.sh', 'g17-traversal-admission-tests.sh']
 
