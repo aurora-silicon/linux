@@ -32,10 +32,12 @@ static const struct ave_fw_transport ave_transport_6070 = {
 	.hello = { 7, 0x9bc0, 0x100, 0 },
 	.descriptors = 7,
 	.io_index = 1,
-	.t2h_index = 5,
-	.slots = { 32, 8 },
+	.t2h_index = 6,
+	.slots = { 32, 32 },
 	.doorbells = { 1, 3 },
-	.offsets = { 0x8700, 0x9180 },
+	.offsets = { 0x8700, 0x9380 },
+	.smalloc_offset = 0x400000,
+	.smalloc_bytes = 0x300000,
 	.scratch_halt = true,
 };
 
@@ -46,10 +48,10 @@ static void ave_header_9003(u8 *cmd, const struct ave_fw_abi *abi,
 	put_unaligned_le64(h->token, cmd + 0x08);
 	put_unaligned_le64(h->client, cmd + 0x10);
 	if (h->op != AVE_OP_CONFIG && h->op != AVE_OP_HALT) {
-		put_unaligned_le32(1, cmd + 0x18);
+		put_unaligned_le32(h->unit ?: AVE_SESSION_UNIT, cmd + 0x18);
 		put_unaligned_le32(h->codec, cmd + 0x1c);
 		put_unaligned_le32(h->arg0, cmd + 0x24);
-		put_unaligned_le32(0x36, cmd + 0x28);
+		put_unaligned_le32(h->arg1 ?: AVE_SESSION_ARG1, cmd + 0x28);
 		put_unaligned_le32(h->arg2, cmd + 0x2c);
 	}
 	put_unaligned_le32(h->subtype, cmd + 0x20);
@@ -102,6 +104,7 @@ static int ave_reply_9003(const struct ave_fw_abi *abi, const u8 *msg, u32 len,
 	reply->raw_status = get_unaligned_le32(msg + 0x40);
 	reply->status = reply->raw_status;
 	reply->bytes = len;
+	reply->completion_index = 0;
 	return 0;
 }
 
@@ -124,6 +127,8 @@ static int ave_reply_6070(const struct ave_fw_abi *abi, const u8 *msg, u32 len,
 		reply->raw_status = get_unaligned_le32(msg + 0x38);
 		reply->status = reply->raw_status;
 		reply->bytes = len;
+		reply->completion_index = op == AVE_OP_PROCESS ?
+			get_unaligned_le32(msg + 0x40) : 0;
 		if (reply->status == 0x00ee0000)
 			reply->status = 0;
 		else if (!reply->status)

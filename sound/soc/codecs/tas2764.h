@@ -37,6 +37,7 @@
 /* DC Blocker Control */
 #define TAS2764_DC_BLK0			TAS2764_REG(0x0, 0x04)
 #define TAS2764_DC_BLK0_HPF_FREQ_PB_SHIFT  0
+#define TAS2764_DC_BLK1			TAS2764_REG(0x0, 0x05)
 
 /* Digital Volume Control */
 #define TAS2764_DVC	TAS2764_REG(0X0, 0x1a)
@@ -57,6 +58,12 @@
 #define TAS2764_TDM_CFG0_44_1_48KHZ	BIT(3)
 #define TAS2764_TDM_CFG0_88_2_96KHZ	(BIT(3) | BIT(1))
 #define TAS2764_TDM_CFG0_FRAME_START	BIT(0)
+/*
+ * Set by the macOS SN012776 driver together with an explicit BCLK/FS
+ * ratio in TAS2764_CLK_CFG; without it the ratio is auto-detected, which
+ * fails ("bad TDM clock") for frames such as 250 BCLKs.
+ */
+#define TAS2764_TDM_CFG0_FIXED_RATIO	BIT(6)
 
 /* TDM Configuration Reg1 */
 #define TAS2764_TDM_CFG1		TAS2764_REG(0X0, 0x09)
@@ -123,8 +130,12 @@
 /* Clock/IRQ Settings */
 #define TAS2764_INT_CLK_CFG             TAS2764_REG(0x0, 0x5c)
 #define TAS2764_INT_CLK_CFG_IRQZ_CLR    BIT(2)
+/* BCLK/FS ratio code, written by macOS for the J873 speaker frame */
+#define TAS2764_CLK_CFG                 TAS2764_REG(0x0, 0x60)
 
 #define TAS2764_BOP_CFG0                TAS2764_REG(0X0, 0x1d)
+/* BOP_CFG0 to BOP_CFG24, page 0 0x1d to 0x34 */
+#define TAS2764_BOP_CFG_LEN		24
 
 #define TAS2764_SDOUT_HIZ_1            TAS2764_REG(0x1, 0x3d)
 #define TAS2764_SDOUT_HIZ_2            TAS2764_REG(0x1, 0x3e)

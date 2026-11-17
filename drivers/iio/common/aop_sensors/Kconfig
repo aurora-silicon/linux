@@ -28,10 +28,36 @@ config IIO_AOP_SENSOR_MOTION
 	depends on SYSFS
 	select APPLE_AOP
 	select IIO_BUFFER
-	select IIO_KFIFO_BUF
+	select IIO_TRIGGERED_BUFFER
 	help
 	  Module to handle the accelerometer and gyroscope that the AOP
 	  coprocessor of Apple laptops reads. Each sensor is an IIO device
 	  with X, Y and Z channels, readable directly or through a buffer.
 	  The bootloader has to pass the machine's sensor calibration in
 	  the device tree.
+
+config IIO_AOP_SENSOR_DEVMOTION
+	tristate "AOP device-motion fusion"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on RUST
+	depends on SYSFS
+	select APPLE_AOP
+	select IIO_BUFFER
+	select IIO_KFIFO_BUF
+	help
+	  Module to expose the orientation quaternion produced by the Apple
+	  Always-On Processor's device-motion fusion service. The quaternion is
+	  an IIO rotation channel readable directly or through a buffer.
+
+config IIO_AOP_SENSOR_TEMP
+	tristate "AOP board temperature sensor"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on RUST
+	depends on SYSFS
+	select APPLE_AOP
+	select IIO_BUFFER
+	select IIO_KFIFO_BUF
+	help
+	  Module to expose the board-temperature sensor announced by the Apple
+	  Always-On Processor as an IIO temperature device. Calibration data can
+	  be supplied by the bootloader in the device tree.

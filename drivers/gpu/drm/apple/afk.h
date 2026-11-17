@@ -7,6 +7,7 @@
 #ifndef _DRM_APPLE_DCP_AFK_H
 #define _DRM_APPLE_DCP_AFK_H
 
+#include <linux/atomic.h>
 #include <linux/bitmap.h>
 #include <linux/completion.h>
 #include <linux/errno.h>
@@ -76,6 +77,8 @@ struct apple_epic_service {
 	/* Compact EPIC (desktop 26.x): the announced identity and OPEN state. */
 	char name[33];
 	s64 unit;
+	/* DCP poweron generation that announced this compact service. */
+	u32 power_gen;
 	bool defer_start;
 	bool started;
 
@@ -87,12 +90,39 @@ struct apple_epic_service {
 
 enum epic_subtype;
 
+/* A compact service announcement's name field, with its NUL */
+#define AFK_COMPACT_NAME_LEN	32
+/* The shortest cut of a long compact service name that still identifies it */
+#define AFK_COMPACT_CUT_MIN	20
+
 struct apple_epic_service_ops {
 	const char name[32];
+	/*
+	 * A compact service whose announcement does not fit the 32-byte field:
+	 * its full "<name>:<unit>". The firmware cuts the announcement to 31
+	 * characters, losing the end of the name and the unit; a cut of this
+	 * string, at least AFK_COMPACT_CUT_MIN characters of it, matches.
+	 */
+	const char *compact_full;
 	/* All retained pointers must be pinned before enabling slot reuse. */
 	bool reusable;
 	/* EOPNOTSUPP from prepare means intentional absence only for this role. */
 	bool optional;
+	/*
+	 * At most one instance of this service (a given name and unit) is ever
+	 * live. The firmware re-announces it under a fresh interface on every
+	 * DP relink, without closing the old one, so a new announcement always
+	 * supersedes the enabled one it matches, even within a power
+	 * generation: afk_compact_slot() replaces it in place and reclaims the
+	 * slot. Without this a relink across every suspend would consume a new
+	 * channel each time until the endpoint runs out (the external DCP's
+	 * dcpav-audio/cec/video interfaces on AV_AUDIO_ENDPOINT_DESKTOP).
+	 * Services that announce legitimate same-name siblings in one
+	 * generation (DPAVCTRL) must leave this clear.
+	 */
+	bool singleton;
+	/* AFKV2: the provider sends this service's OPEN itself, afk_service_open(). */
+	bool open_later;
 
 	/*
 	 * Optional admission, before OPEN/publication. Must not retain service
@@ -105,6 +135,9 @@ struct apple_epic_service_ops {
 			  const char *class, s64 unit);
 	void (*init)(struct apple_epic_service *service, const char *name,
 			      const char *class, s64 unit);
+	/* Consumed synchronously before init publishes service readiness. */
+	void (*init_props)(struct apple_epic_service *service, s64 unit,
+			   const void *props, size_t size);
 	int (*call)(struct apple_epic_service *service, u32 idx,
 		    const void *data, size_t data_size, void *reply,
 		    size_t reply_size);
@@ -114,6 +147,9 @@ struct apple_epic_service_ops {
 		      const void *data, size_t data_size);
 	void (*teardown)(struct apple_epic_service *service);
 };
+
+bool afk_compact_cut_of(const struct apple_epic_service_ops *ops, const char *service_name);
+
 
 static inline int afk_ring_stride(u32 total, u32 bufsz, u32 *stride)
 {
@@ -481,6 +517,12 @@ struct apple_dcp_afkep {
 
 	struct completion started;
 	struct completion stopped;
+	/* The firmware 27 sleep's control exchange. A timeout poisons it until a new boot. */
+	struct completion sleep_done;
+	u8 sleep_expected;
+	bool sleep_waiting;
+	bool sleep_poisoned;
+	bool sleep_closed;
 
 	void *bfr;
 	u16 bfr_tag;
@@ -500,10 +542,20 @@ struct apple_dcp_afkep {
 	bool compact;
 	struct list_head compact_cmds;	/* lock */
 	bool compact_shutting_down;	/* lock */
+	/*
+	 * T8132 dcpext: a command that times out leaves an orphan in
+	 * compact_cmds, which takes its late reply, so that the reply never
+	 * completes a later identical command. Set once at init.
+	 */
+	bool compact_keep_orphans;
+	unsigned int compact_orphans;	/* lock */
+	wait_queue_head_t compact_orphan_wq;
 	/* A message went out in part; no further sends (lock). */
 	bool compact_tx_desync;
 	/* Replies to firmware calls, see afk_compact_reply_worker(). */
 	struct workqueue_struct *tx_wq;
+	/* Accepted RX and queued replies, until each worker has returned. */
+	atomic_t sleep_jobs;
 	struct mutex compact_tx_lock;
 	struct afk_fragment_state compact_rx;
 	void *compact_rx_data;
@@ -515,15 +567,44 @@ struct apple_dcp_afkep {
 	struct dentry *debugfs_entry;
 
 	bool match_epic_name;
+	/* Firmware 27: this endpoint's services end with the firmware's closed report. */
+	bool v27_closed_teardown;
 };
+
+/*
+ * The locks, lists and wait queues of an endpoint, before anything may use
+ * them. afk_init() starts from it, and so does any endpoint built without it.
+ */
+static inline void afk_ep_init_state(struct apple_dcp_afkep *ep)
+{
+	u32 i;
+
+	spin_lock_init(&ep->lock);
+	INIT_LIST_HEAD(&ep->compact_cmds);
+	init_waitqueue_head(&ep->compact_orphan_wq);
+	mutex_init(&ep->compact_tx_lock);
+	init_completion(&ep->started);
+	init_completion(&ep->stopped);
+	init_completion(&ep->sleep_done);
+	atomic_set(&ep->sleep_jobs, 0);
+	for (i = 0; i < AFK_MAX_CHANNEL; i++)
+		spin_lock_init(&ep->services[i].lock);
+}
 
 struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 				 const struct apple_epic_service_ops *ops);
 int afk_v2_copy_owned(struct apple_epic_service *service, u64 dva,
 		      void *buffer, size_t size, bool to_peer);
 int afk_start(struct apple_dcp_afkep *ep);
+int afk_v27_sleep_control(struct apple_dcp_afkep *ep, bool open);
+int afk_v27_sleep_check(struct apple_dcp_afkep *ep);
+unsigned int afk_v27_sleep_unanswered(struct apple_dcp_afkep *ep);
 int afk_start_service(struct apple_epic_service *service);
+int afk_service_open(struct apple_epic_service *service);
 void afk_cancel_commands(struct apple_dcp_afkep *ep);
+bool afk_compact_orphans_wait(struct apple_dcp_afkep *ep, unsigned long timeout);
+unsigned int afk_compact_orphans_drop(struct apple_dcp_afkep *ep);
+bool afk_compact_orphans_pending(struct apple_dcp_afkep *ep);
 void afk_shutdown(struct apple_dcp_afkep *ep);
 void afk_quiesce(struct apple_dcp_afkep *ep);
 int afk_receive_message(struct apple_dcp_afkep *ep, u64 message);

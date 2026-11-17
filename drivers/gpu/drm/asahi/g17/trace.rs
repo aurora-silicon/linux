@@ -6,6 +6,9 @@
 use kernel::{bindings, dma_fence::RawDmaFence, sync::Arc};
 
 unsafe extern "C" {
+    fn asahi_g17_trace_submit(phase: u8, submit_id: u64, ctx: u32, inputs: u32,
+        outputs: u32, result: i32, fence: *mut bindings::dma_fence);
+    fn asahi_g17_trace_output(result: i32, fence: *mut bindings::dma_fence);
     fn asahi_g17_trace_publish_enabled() -> bool;
     fn asahi_g17_trace_publish(engine: u8, qid: u8, ordinal: u32, ctx: u32, seq: u64,
         fence: *mut bindings::dma_fence);
@@ -21,6 +24,26 @@ unsafe extern "C" {
 
 pub(super) const RENDER: u8 = 0;
 pub(super) const COMPUTE: u8 = 1;
+
+/// Submit ioctl entry, output-fence installation and return. A missing fence on a successful
+/// return is therefore visible independently of userspace's private queue timeline.
+pub(super) fn submit(phase: u8, submit_id: u64, ctx: u32, inputs: usize, outputs: usize,
+    result: i32, fence: Option<&kernel::dma_fence::Fence>)
+{
+    let inputs = u32::try_from(inputs).unwrap_or(u32::MAX);
+    let outputs = u32::try_from(outputs).unwrap_or(u32::MAX);
+    let fence = fence.map_or(core::ptr::null_mut(), RawDmaFence::raw);
+    // SAFETY: `fence`, when present, is retained for the synchronous call; all other values are
+    // plain. Counter sampling is static-key gated in C.
+    unsafe { asahi_g17_trace_submit(phase, submit_id, ctx, inputs, outputs, result, fence) };
+}
+
+/// An aggregate or fallback output fence is about to become terminal. This event is emitted
+/// exactly once for that installed fence, before it is signalled.
+pub(super) fn output(fence: &dyn RawDmaFence, result: i32) {
+    // SAFETY: `fence` remains owned for this synchronous call and C only reads its identity.
+    unsafe { asahi_g17_trace_output(result, fence.raw()) };
+}
 
 /// Called once the command's doorbell has been rung.
 pub(super) fn publish(engine: u8, qid: u8, ordinal: u32, packet: &Arc<super::job::Packet>) {

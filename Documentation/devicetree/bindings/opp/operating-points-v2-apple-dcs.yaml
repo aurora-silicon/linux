@@ -13,6 +13,8 @@ allOf:
   - $ref: opp-v2-base.yaml#
 
 description: |
+  T6000 DCS raw states are 5, 6, 7 and 9. State 8 is invalid; fabric
+  states are a separate controller and are not DCS states.
   Each OPP maps a verified raw PMGR desired performance state to measured
   sustainable bandwidth. Values are decimal kB/s, not DRAM clock frequencies,
   theoretical peak bandwidth or firmware policy thresholds. State codes and
@@ -31,8 +33,7 @@ patternProperties:
       turbo-mode: false
       opp-level:
         description: Verified raw PMGR desired state, without a state-index bias
-        minimum: 7
-        maximum: 15
+        enum: [5, 6, 7, 9]
       opp-peak-kBps:
         description: Measured sustainable bandwidth at this raw state
         items:

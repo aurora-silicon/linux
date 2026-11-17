@@ -7,9 +7,11 @@
  * Author: Marco Pagani <marpagan@redhat.com>
  */
 
+#include <linux/blkdev.h>
 #include <linux/dma-buf.h>
 #include <linux/file.h>
 #include <linux/iosys-map.h>
+#include <linux/major.h>
 #include <linux/ktime.h>
 #include <linux/mm.h>
 #include <linux/pagemap.h>
@@ -351,7 +353,7 @@ static void drm_gem_shmem_test_purge(struct kunit *test)
 /* Test the opt-in mapping policy and real population, including retry after
  * releasing the backing. No large allocation is needed to exercise the path.
  */
-static void drm_gem_shmem_test_no_reclaim(struct kunit *test)
+static void drm_gem_shmem_test_bounded_reclaim(struct kunit *test)
 {
 	struct drm_device *drm_dev = test->priv;
 	struct drm_gem_shmem_object *shmem;
@@ -360,7 +362,7 @@ static void drm_gem_shmem_test_no_reclaim(struct kunit *test)
 
 	shmem = kzalloc_obj(*shmem);
 	KUNIT_ASSERT_NOT_NULL(test, shmem);
-	shmem->pages_no_reclaim = true;
+	shmem->pages_bounded_reclaim = true;
 	ret = drm_gem_shmem_init(drm_dev, shmem, TEST_SIZE);
 	if (ret) {
 		kfree(shmem);
@@ -370,8 +372,11 @@ static void drm_gem_shmem_test_no_reclaim(struct kunit *test)
 	ret = kunit_add_action_or_reset(test, drm_gem_shmem_free_wrapper, shmem);
 	KUNIT_ASSERT_EQ(test, ret, 0);
 	gfp = mapping_gfp_mask(shmem->base.filp->f_mapping);
-	KUNIT_EXPECT_EQ(test, gfp & __GFP_DIRECT_RECLAIM, 0);
-	KUNIT_EXPECT_EQ(test, gfp & __GFP_RETRY_MAYFAIL, 0);
+	KUNIT_EXPECT_NE(test, gfp & __GFP_DIRECT_RECLAIM, 0);
+	KUNIT_EXPECT_EQ(test, gfp & __GFP_IO, 0);
+	KUNIT_EXPECT_EQ(test, gfp & __GFP_FS, 0);
+	KUNIT_EXPECT_NE(test, gfp & __GFP_RETRY_MAYFAIL, 0);
+	KUNIT_EXPECT_EQ(test, gfp & __GFP_NOFAIL, 0);
 	KUNIT_EXPECT_NE(test, gfp & __GFP_KSWAPD_RECLAIM, 0);
 	KUNIT_EXPECT_EQ(test, gfp & __GFP_MOVABLE, 0);
 	KUNIT_EXPECT_NE(test, gfp & __GFP_HIGHMEM, 0);
@@ -397,7 +402,7 @@ static void drm_gem_shmem_test_free_flush(void *object)
 	flush_delayed_fput();
 }
 
-static void drm_gem_shmem_test_no_reclaim_oom(struct kunit *test)
+static void drm_gem_shmem_test_bounded_reclaim_oom(struct kunit *test)
 {
 	struct drm_device *drm_dev = test->priv;
 	struct drm_gem_shmem_object *shmem;
@@ -412,7 +417,7 @@ static void drm_gem_shmem_test_no_reclaim_oom(struct kunit *test)
 	}
 	shmem = kzalloc_obj(*shmem);
 	KUNIT_ASSERT_NOT_NULL(test, shmem);
-	shmem->pages_no_reclaim = true;
+	shmem->pages_bounded_reclaim = true;
 	ret = drm_gem_shmem_init(drm_dev, shmem, bytes);
 	if (ret) {
 		kfree(shmem);
@@ -433,6 +438,93 @@ static void drm_gem_shmem_test_no_reclaim_oom(struct kunit *test)
 	KUNIT_EXPECT_NULL(test, shmem->pages);
 	KUNIT_EXPECT_EQ(test, refcount_read(&shmem->pages_use_count), 0);
 	KUNIT_EXPECT_FALSE(test, mapping_unevictable(shmem->base.filp->f_mapping));
+}
+
+/*
+ * The page cache case: memory is full of clean, reclaimable file pages and
+ * almost none is free. A bounded-reclaim object larger than free memory must
+ * still be populated, by dropping cache. The cache is that of a RAM disk
+ * (brd, e.g. brd.rd_nr=1 brd.rd_size=1048576), read through its block device
+ * mapping: ordinary file LRU pages, as kswapd and direct reclaim see them.
+ */
+/* Page cache pages, excluding shmem (GEM objects included). */
+static unsigned long drm_gem_shmem_test_cached(void)
+{
+	return global_node_page_state(NR_FILE_PAGES) - global_node_page_state(NR_SHMEM);
+}
+
+static void drm_gem_shmem_test_fput(void *file)
+{
+	fput(file);
+}
+
+static void drm_gem_shmem_test_bounded_reclaim_cache(struct kunit *test)
+{
+	struct drm_device *drm_dev = test->priv;
+	u64 ram = (u64)totalram_pages() << PAGE_SHIFT;
+	struct drm_gem_shmem_object *shmem;
+	const size_t size = SZ_256M;
+	unsigned long free, cached;
+	struct folio *folio;
+	struct file *bdev;
+	pgoff_t i, n;
+	ktime_t start;
+	s64 elapsed_ms;
+	int ret;
+
+	if (ram > SZ_2G) {
+		kunit_skip(test, "requires a VM with at most 2 GiB RAM");
+		return;
+	}
+	bdev = bdev_file_open_by_dev(MKDEV(RAMDISK_MAJOR, 0), BLK_OPEN_READ, NULL, NULL);
+	if (IS_ERR(bdev)) {
+		kunit_skip(test, "requires a RAM disk (brd): %ld", PTR_ERR(bdev));
+		return;
+	}
+	/* Last close drops the cache; keep it open until the object is gone. */
+	ret = kunit_add_action_or_reset(test, drm_gem_shmem_test_fput, bdev);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	n = min_t(u64, bdev_nr_bytes(file_bdev(bdev)), ram) >> PAGE_SHIFT;
+
+	for (i = 0; i < n; i += folio_nr_pages(folio)) {
+		folio = read_mapping_folio(bdev->f_mapping, i, bdev);
+		if (IS_ERR(folio))
+			break;
+		folio_put(folio);
+	}
+	free = global_zone_page_state(NR_FREE_PAGES);
+	cached = drm_gem_shmem_test_cached();
+	kunit_info(test, "page cache: %lu MiB cached, %lu MiB free\n",
+		   cached >> (20 - PAGE_SHIFT), free >> (20 - PAGE_SHIFT));
+	if (((u64)free << PAGE_SHIFT) >= size || ((u64)cached << PAGE_SHIFT) < size) {
+		kunit_skip(test, "page cache did not fill memory (RAM disk too small?)");
+		return;
+	}
+
+	shmem = kzalloc_obj(*shmem);
+	KUNIT_ASSERT_NOT_NULL(test, shmem);
+	shmem->pages_bounded_reclaim = true;
+	ret = drm_gem_shmem_init(drm_dev, shmem, size);
+	if (ret) {
+		kfree(shmem);
+		KUNIT_FAIL(test, "shmem init failed: %d", ret);
+		return;
+	}
+	ret = kunit_add_action_or_reset(test, drm_gem_shmem_test_free_flush, shmem);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+
+	start = ktime_get();
+	ret = drm_gem_shmem_pin(shmem);
+	elapsed_ms = ktime_ms_delta(ktime_get(), start);
+	kunit_info(test, "pin of %zu MiB over page cache: ret=%d, %lld ms, %lu MiB cached after\n",
+		   size >> 20, ret, elapsed_ms,
+		   drm_gem_shmem_test_cached() >> (20 - PAGE_SHIFT));
+	KUNIT_EXPECT_EQ(test, ret, 0);
+	KUNIT_EXPECT_LT(test, elapsed_ms, (s64)10000);
+	if (!ret) {
+		KUNIT_EXPECT_NOT_NULL(test, shmem->pages);
+		drm_gem_shmem_unpin(shmem);
+	}
 }
 
 static int drm_gem_shmem_test_init(struct kunit *test)
@@ -468,8 +560,9 @@ static int drm_gem_shmem_test_init(struct kunit *test)
 
 static struct kunit_case drm_gem_shmem_test_cases[] = {
 	KUNIT_CASE(drm_gem_shmem_test_obj_create),
-	KUNIT_CASE(drm_gem_shmem_test_no_reclaim),
-	KUNIT_CASE_SLOW(drm_gem_shmem_test_no_reclaim_oom),
+	KUNIT_CASE(drm_gem_shmem_test_bounded_reclaim),
+	KUNIT_CASE_SLOW(drm_gem_shmem_test_bounded_reclaim_oom),
+	KUNIT_CASE_SLOW(drm_gem_shmem_test_bounded_reclaim_cache),
 	KUNIT_CASE(drm_gem_shmem_test_obj_create_private),
 	KUNIT_CASE(drm_gem_shmem_test_pin_pages),
 	KUNIT_CASE(drm_gem_shmem_test_vmap),

@@ -50,7 +50,7 @@ static void host_log(const char *format, ...)
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 struct device_node {
 	const char *name, *compatible;
-	bool available, always_on, no_ack, deferred, irq_safe, uuid, soc_record;
+	bool available, always_on, no_ack, deferred, irq_safe, uuid, soc_record, release_sleep;
 	u32 reg;
 	int refs;
 	struct device_node *parent, *child, *sibling, *pmp;
@@ -99,6 +99,7 @@ struct generic_pm_domain {
 };
 struct apple_pmp_report_offsets {
 	u32 tgt_read, tgt_write, actual, status, fast_die, fast_die_lanes;
+	u32 update, dvfs_first, dvfs_count;
 	bool starts_pmp;
 	const char *name, *fallback, *pwrstate;
 	bool devices_ordered;
@@ -158,6 +159,9 @@ struct apple_pmp_report {
 	/* Requests held until the PMP runs; T6030 does not defer them. */
 	u64 shadow, known;
 	bool defer;
+	/* Firmware-driven sleep: the request word at its start, the DVFS words kept. */
+	u64 sleep_request;
+	u64 *dvfs_shadow;
 	unsigned int polls;
 	struct delayed_work ready_work;
 	struct apple_pmp_ane ane;
@@ -195,8 +199,13 @@ struct apple_pmp_report_entry {
 	struct generic_pm_domain genpd;
 	struct device_node *node, *report_node;
 	u32 id;
-	bool no_ack, removed;
+	bool no_ack, dvfs, removed;
+	bool sleep_release, released;
+	u32 dvfs_entry;
+	u64 dvfs_off;
+	u64 dvfs_on;
 };
+#define PMP_DVFS_VALID BIT_ULL(61)
 #define genpd_to_apple_pmp_report_entry(p) \
 	container_of(p, struct apple_pmp_report_entry, genpd)
 struct of_phandle_iterator {
@@ -343,7 +352,7 @@ static void complete_all(struct completion *c)
 }
 #define complete complete_all
 #define INIT_WORK(w, f) ((w)->func = (f), (w)->pending = false)
-#define system_unbound_wq NULL
+#define system_dfl_wq NULL
 /* Deferred requests are not part of the T6030 graph: never queued here. */
 #define INIT_DELAYED_WORK(w, f) INIT_WORK(&(w)->work, f)
 #define system_freezable_power_efficient_wq NULL
@@ -394,11 +403,18 @@ static u64 readq(const void *a)
 {
 	return *(const u64 *)a;
 }
+/* The sleep cases: the PMP acknowledges the requests it is given, ack_late writes late. */
+static bool ack_follows;
+static unsigned int ack_late;
 static void writeq(u64 v, void *a)
 {
 	assert(a == (char *)regs + 0x108c0);
 	*(u64 *)a = v;
 	regs[0x1180 / 8] = v;
+	if (ack_follows && ack_late)
+		ack_late--;
+	else if (ack_follows)
+		regs[0x11c0 / 8] = v;
 }
 #define readq_poll_timeout(address, value, condition, delay, timeout) \
 	({                                                            \
@@ -451,6 +467,17 @@ static bool of_machine_is_compatible(const char *s)
 {
 	return !strcmp(s, "apple,t6030");
 }
+/* As in <linux/soc/apple/t8132.h>. */
+static inline bool apple_t8132_air(void)
+{
+	return of_machine_is_compatible("apple,j713") ||
+	       of_machine_is_compatible("apple,j715");
+}
+/* The qualified-firmware term: these harnesses model no /chosen. */
+static inline bool apple_t8132_firmware_path(void)
+{
+	return apple_t8132_air();
+}
 static bool of_property_read_bool(const struct device_node *n, const char *p)
 {
 	if (!strcmp(p, "apple,always-on"))
@@ -463,6 +490,8 @@ static bool of_property_read_bool(const struct device_node *n, const char *p)
 		return n->irq_safe;
 	if (!strcmp(p, "apple,soc-device-record"))
 		return n->soc_record;
+	if (!strcmp(p, "apple,release-for-sleep"))
+		return n->release_sleep;
 	return false;
 }
 static bool of_property_present(const struct device_node *n, const char *p)
@@ -479,6 +508,13 @@ static int of_property_read_u32(const struct device_node *n, const char *p,
 	assert(!strcmp(p, "reg"));
 	*v = n->reg;
 	return 0;
+}
+/* No T6030 graph node carries an array property the probe reads. */
+static int of_property_read_u32_array(const struct device_node *n,
+				      const char *p, u32 *v, size_t count)
+{
+	(void)n; (void)p; (void)v; (void)count;
+	return -EINVAL;
 }
 static int of_property_count_u32_elems(const struct device_node *n,
 				       const char *p)
@@ -595,6 +631,11 @@ static void *devm_kzalloc(struct device *d, size_t n, int g)
 	allocations[allocation_count++] = v;
 	return v;
 }
+
+static void *devm_kcalloc(struct device *d, size_t n, size_t size, int g)
+{
+	return devm_kzalloc(d, n * size, g);
+}
 #define kzalloc_obj(v) calloc(1, sizeof(v))
 #define kfree free
 static char *kstrdup(const char *s, int g)
@@ -707,6 +748,17 @@ static const struct apple_pmp_start_ops apple_pmp_start_hw_ops = { hw_check,
 								   hw_bound };
 static const struct apple_pmp_start_timing apple_pmp_start_timing = { 2, 0, 2,
 								      2 };
+/* The extracted probe compares rep->offsets with the T6001 table and tells the AGX vote that a report came back. This harness has neither: the table is empty and
+ * never matches, and the call does nothing. */
+static const struct apple_pmp_report_offsets apple_pmp_offsets_t600x;
+static void apple_pmp_agx_activity_resume(void) {}
+/* Floor admission is covered independently by the J613 fixture. */
+static int j613_floor_probe(struct apple_pmp_report *rep)
+{
+	(void)rep;
+	return 0;
+}
+
 #include "production.h"
 #if HOST_HAS_DRAM
 static int devm_device_add_group(struct device *dev, const struct attribute_group *group)
@@ -832,6 +884,8 @@ static struct apple_pmp_report *setup(void)
 			put32(devices + i * 0x7c + 8, 2);
 	}
 	ack_polls = 0;
+	ack_follows = false;
+	ack_late = 0;
 	check_error = enable_error = 0;
 	hw_binds = hw_ready = true;
 	hw_ack = BIT_ULL(7);
@@ -1027,6 +1081,49 @@ int main(void)
 	assert(dram_parse_calls == 1 && dram_group_calls == 1 && !registered_group);
 	assert(!action_count && !enables && !commands && !pending);
 	assert(!regs[0x1180 / 8] && !pmp_node.available);
+	cases++;
+	cleanup();
+#endif
+
+#ifdef HAVE_SLEEP_RELEASE
+	/* System sleep withdraws an acknowledged request marked for it, then asserts it again. */
+	setup();
+	entries[1].release_sleep = true;
+	assert(apple_pmp_report_probe(&report_dev) == 0);
+	assert(apple_pmp_report_wait_ready(&entries[0], 30000) == 0);
+	struct apple_pmp_report_entry *disp = entry_devs[0].dev.data;
+	struct apple_pmp_report_entry *ext = entry_devs[1].dev.data;
+
+	assert(ext->sleep_release && !disp->sleep_release);
+	ack_follows = true;
+	regs[0x11c0 / 8] = regs[0x1180 / 8];
+	u64 target = regs[0x1180 / 8];
+
+	assert(target & BIT_ULL(8));
+	assert(apple_pmp_report_entry_suspend_noirq(&entry_devs[0].dev) == 0 &&
+	       !disp->released && regs[0x1180 / 8] == target);
+	assert(apple_pmp_report_entry_suspend_noirq(&entry_devs[1].dev) == 0);
+	assert(ext->released && regs[0x1180 / 8] == (target & ~BIT_ULL(8)));
+	assert(apple_pmp_report_entry_resume_noirq(&entry_devs[1].dev) == 0);
+	assert(!ext->released && regs[0x1180 / 8] == target);
+	cases++;
+	/* A request the PMP has not acknowledged is left as it is. */
+	regs[0x11c0 / 8] &= ~BIT_ULL(8);
+	assert(apple_pmp_report_entry_suspend_noirq(&entry_devs[1].dev) == 0);
+	assert(!ext->released && regs[0x1180 / 8] == target);
+	assert(apple_pmp_report_entry_resume_noirq(&entry_devs[1].dev) == 0 &&
+	       regs[0x1180 / 8] == target);
+	cases++;
+	/* A re-assert the PMP acknowledges late is written again, three times at most. */
+	regs[0x11c0 / 8] = target;
+	assert(apple_pmp_report_entry_suspend_noirq(&entry_devs[1].dev) == 0 && ext->released);
+	ack_late = 2;
+	assert(apple_pmp_report_entry_resume_noirq(&entry_devs[1].dev) == 0 &&
+	       !ack_late && regs[0x11c0 / 8] == target);
+	assert(apple_pmp_report_entry_suspend_noirq(&entry_devs[1].dev) == 0 && ext->released);
+	ack_late = 5;
+	assert(apple_pmp_report_entry_resume_noirq(&entry_devs[1].dev) == -ETIMEDOUT &&
+	       ack_late == 2 && regs[0x1180 / 8] == target);
 	cases++;
 	cleanup();
 #endif

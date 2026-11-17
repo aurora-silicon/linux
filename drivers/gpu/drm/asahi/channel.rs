@@ -24,13 +24,17 @@ use crate::{
     event,
     gpu,
     mem,
-    module_parameters, //
+    module_parameters,
+    stats_raw::RawStatsSnapshot, //
 };
 use core::sync::atomic::Ordering;
 use kernel::{
     c_str,
     prelude::*,
-    sync::Arc,
+    sync::{
+        Arc,
+        SpinLock, //
+    },
     time::{
         delay::fsleep,
         Delta,
@@ -588,13 +592,14 @@ pub(crate) struct StatsChannel {
     dev: AsahiDevRef,
     ch: RxChannel<ChannelState, RawStatsMsg::ver>,
     snap: Arc<crate::stats::StatsSnapshot>,
-    /// Rate of firmware stats-message timestamps (Hz). All stats timestamps
-    /// run on the chip base clock (`HwConfig::base_clock_hz`, 24 MHz on every
-    /// supported SoC), not nanoseconds.
-    ts_hz: u64,
-    /// Last `Utilization` message timestamp (raw base-clock ticks), for
-    /// utilization-weighted `busy_ns` integration.
-    last_util_ts: u64,
+    /// Last raw sample of every statistics kind, shared with the export
+    /// through `crate::stats_raw`.
+    raw: Arc<SpinLock<RawStatsSnapshot>>,
+    /// Utilization-weighted `busy_ns` integration across `Utilization`
+    /// windows. All stats timestamps run on the chip base clock
+    /// (`HwConfig::base_clock_hz`, 24 MHz on every supported SoC), not
+    /// nanoseconds.
+    busy: crate::stats_busy::BusyIntegrator,
 }
 
 #[versions(AGX)]
@@ -604,14 +609,15 @@ impl StatsChannel::ver {
         dev: AsahiDevice,
         alloc: &mut gpu::KernelAllocators,
         snap: Arc<crate::stats::StatsSnapshot>,
+        raw: Arc<SpinLock<RawStatsSnapshot>>,
         ts_hz: u64,
     ) -> Result<StatsChannel::ver> {
         Ok(StatsChannel::ver {
             dev: dev.clone(),
             ch: RxChannel::<ChannelState, RawStatsMsg::ver>::new(alloc, 0x100)?,
             snap,
-            ts_hz,
-            last_util_ts: 0,
+            raw,
+            busy: crate::stats_busy::BusyIntegrator::new(ts_hz),
         })
     }
 
@@ -631,6 +637,7 @@ impl StatsChannel::ver {
                     // accessing the enum view is valid.
                     let msg = unsafe { msg.msg };
                     cls_dev_dbg!(StatsCh, self.dev, "Stats: {:?}\n", msg);
+                    self.record_raw(&msg);
                     if module_parameters::stats_export.value() != 0 {
                         // Retain the latest values for /sys/class/drm/card*/
                         // device/agx_stats. Read-only with respect to
@@ -656,37 +663,20 @@ impl StatsChannel::ver {
                                 // across a saturated 30 s matmul and 0-2 on
                                 // an idle desktop, while FwBusy timestamp
                                 // deltas (the prior producer) covered 0.17%
-                                // of that matmul. The timestamps are base-
-                                // clock ticks (24 MHz), so convert to ns
-                                // once here. The kernel runtime has no
-                                // 128-bit division, so split whole seconds
-                                // from the tick remainder: whole seconds
-                                // contribute util * 1e7 ns each (1e9 / 100
-                                // exactly), the remainder contributes
-                                // rem * util * 1e9 / (100 * ts_hz), which
-                                // cannot overflow u64 (rem < ts_hz <= 24e6
-                                // on supported SoCs).
-                                let util = u64::from(
-                                    [*util1, *util2, *util3, *util4]
-                                        .into_iter()
-                                        .max()
-                                        .unwrap_or(0)
-                                        .min(100),
-                                );
-                                let ts = timestamp.0;
-                                if self.last_util_ts != 0 && ts > self.last_util_ts {
-                                    let delta = ts - self.last_util_ts;
-                                    let whole_s = delta / self.ts_hz;
-                                    let rem = delta % self.ts_hz;
-                                    let busy = whole_s
-                                        .saturating_mul(util)
-                                        .saturating_mul(10_000_000)
-                                        .saturating_add(
-                                            rem * util * 1_000_000_000 / (100 * self.ts_hz),
-                                        );
+                                // of that matmul.
+                                let util = [*util1, *util2, *util3, *util4]
+                                    .into_iter()
+                                    .max()
+                                    .unwrap_or(0);
+                                let busy = self.busy.utilization(timestamp.0, util);
+                                if busy != 0 {
                                     self.snap.busy_ns.fetch_add(busy, Ordering::Relaxed);
                                 }
-                                self.last_util_ts = ts;
+                            }
+                            // No Utilization is sent while the GPU is off:
+                            // the next window must not span the gap.
+                            StatsMsg::ver::PowerOn { .. } | StatsMsg::ver::PowerOff { .. } => {
+                                self.busy.power_changed();
                             }
                             StatsMsg::ver::PowerState { pstate, .. } => {
                                 self.snap.pstate.store(*pstate, Ordering::Relaxed);
@@ -711,6 +701,82 @@ impl StatsChannel::ver {
                     pr_warn!("Unknown stats message: {:?}\n", unsafe { msg.raw });
                 }
             }
+        }
+    }
+
+    /// Record one statistics message in the raw per-device snapshot.
+    ///
+    /// The firmware words are stored exactly as they arrived: no unit is
+    /// assumed, nothing is scaled and no metric is derived from them.
+    fn record_raw(&mut self, msg: &StatsMsg::ver) {
+        let stamp = crate::stats_raw::monotonic_ns();
+        let mut snap = self.raw.lock();
+        snap.note_message();
+        match msg {
+            StatsMsg::ver::Power { power, .. } => snap.set_power(power.0, stamp),
+            StatsMsg::ver::PowerOn { off_time, .. } => snap.set_power_on(off_time.0, stamp),
+            StatsMsg::ver::PowerOff { on_time, .. } => snap.set_power_off(on_time.0, stamp),
+            StatsMsg::ver::Utilization {
+                timestamp,
+                util1,
+                util2,
+                util3,
+                util4,
+            } => snap.set_utilization(timestamp.0, [*util1, *util2, *util3, *util4], stamp),
+            StatsMsg::ver::AvgPower {
+                active_cs,
+                unk2,
+                unk3,
+                unk4,
+                avg_power,
+            } => snap.set_avg_power(active_cs.0, [*unk2, *unk3, *unk4], *avg_power, stamp),
+            StatsMsg::ver::Temperature {
+                raw_value,
+                scale,
+                tmin,
+                tmax,
+                ..
+            } => snap.set_temperature(*raw_value, *scale, *tmin, *tmax, stamp),
+            StatsMsg::ver::PowerState {
+                timestamp,
+                last_busy_ts,
+                active,
+                poweroff,
+                unk1,
+                pstate,
+                unk2,
+                unk3,
+            } => snap.set_power_state(
+                timestamp.0,
+                last_busy_ts.0,
+                *active,
+                *poweroff,
+                *unk1,
+                *pstate,
+                *unk2,
+                *unk3,
+                stamp,
+            ),
+            StatsMsg::ver::FwBusy { timestamp, busy } => {
+                snap.set_fw_busy(timestamp.0, *busy, stamp)
+            }
+            StatsMsg::ver::PState {
+                ps_min,
+                unk1,
+                ps_max,
+                unk2,
+                ..
+            } => snap.set_pstate(*ps_min, *unk1, *ps_max, *unk2, stamp),
+            StatsMsg::ver::TempSensor {
+                sensor_id,
+                raw_value,
+                scale,
+                tmin,
+                tmax,
+                ..
+            } => snap.set_temp_sensor(*sensor_id, *raw_value, *scale, *tmin, *tmax, stamp),
+            // The remaining tags are not decoded by the driver.
+            _ => {}
         }
     }
 }

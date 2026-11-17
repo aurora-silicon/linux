@@ -407,6 +407,37 @@ static void thermal_governor_trip_crossed(struct thermal_governor *governor,
 		governor->trip_crossed(tz, trip, upward);
 }
 
+/*
+ * A zone with critical_samples above one acts on a critical trip only once
+ * that many updates in a row have read at or above it, so that one noisy
+ * sample cannot shut the system down. Polling keeps the updates coming.
+ */
+static bool thermal_zone_confirms_critical(struct thermal_zone_device *tz)
+{
+	return tz->tzp && tz->tzp->critical_samples > 1 &&
+	       (tz->polling_delay_jiffies || tz->passive_delay_jiffies);
+}
+
+static void thermal_zone_confirm_critical(struct thermal_zone_device *tz)
+{
+	struct thermal_trip_desc *td;
+
+	if (!thermal_zone_confirms_critical(tz))
+		return;
+
+	for_each_trip_desc(tz, td) {
+		const struct thermal_trip *trip = &td->trip;
+
+		if (trip->type != THERMAL_TRIP_CRITICAL)
+			continue;
+
+		if (thermal_critical_confirm(&td->critical_count, tz->temperature,
+					     trip->temperature,
+					     tz->tzp->critical_samples))
+			handle_critical_trips(tz, trip);
+	}
+}
+
 static void thermal_trip_crossed(struct thermal_zone_device *tz,
 				 struct thermal_trip_desc *td,
 				 struct thermal_governor *governor,
@@ -417,8 +448,9 @@ static void thermal_trip_crossed(struct thermal_zone_device *tz,
 	if (upward) {
 		if (trip->type == THERMAL_TRIP_PASSIVE)
 			tz->passive++;
-		else if (trip->type == THERMAL_TRIP_CRITICAL ||
-			 trip->type == THERMAL_TRIP_HOT)
+		else if (trip->type == THERMAL_TRIP_HOT ||
+			 (trip->type == THERMAL_TRIP_CRITICAL &&
+			  !thermal_zone_confirms_critical(tz)))
 			handle_critical_trips(tz, trip);
 
 		thermal_notify_tz_trip_up(tz, trip);
@@ -584,6 +616,8 @@ void __thermal_zone_device_update(struct thermal_zone_device *tz,
 	tz->notify_event = event;
 
 	thermal_zone_handle_trips(tz, governor, &low, &high);
+
+	thermal_zone_confirm_critical(tz);
 
 	thermal_thresholds_handle(tz, &low, &high);
 
@@ -1871,3 +1905,7 @@ error:
 	return result;
 }
 postcore_initcall(thermal_init);
+
+#if IS_ENABLED(CONFIG_THERMAL_CRITICAL_SAMPLES_KUNIT_TEST)
+#include "thermal_core_critical_test.c"
+#endif

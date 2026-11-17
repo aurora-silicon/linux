@@ -126,3 +126,7 @@
 };
 
 #include "hwmon-mini.dtsi"
+
+#include "t6020-peripherals.dtsi"
+
+#include "t6020-j474s-peripherals.dtsi"

@@ -26,13 +26,17 @@ The default, `xart_guard=-1`, takes the platform's level:
 
 | Platform | Default |
 | --- | --- |
-| M1 (T8103), M1 Pro/Max (T6000/T6001) | 1 |
+| M1 (T8103), M1 Pro/Max (T6000/T6001) | 0 |
 | M2 (T8112), M2 Pro/Max (T6020/T6021) | 1 |
 | M3 (T8122) | 1 |
 | MacBook Neo (T8140) | 0 |
 
-The Neo stays at 0 because it already holds Linux records from before the
-list existed, and a guarded boot would treat those as another OS's.
+M1 Macs are at 0 because they cold-boot the SEP, and creating Linux's
+identity keybag there rewrites a session record that predates Linux (see
+"Cold-boot SEP Macs rewrite a pre-Linux record"). A guard could only block
+Touch ID setup on them. The Neo stays at 0 because it already holds Linux
+records from before the list existed, and a guarded boot would treat those
+as another OS's.
 
 What the guard allows depends on what the enclave writes, and that differs
 between restoring Touch ID at boot, using it, and setting it up. The driver
@@ -59,9 +63,8 @@ records are allowed only if they are on Linux's list: records the enclave
 created while the guard was on. Which records they are has not been
 established, so:
 
-- On a Mac whose Touch ID was set up with `xart_guard=0` (every cold-boot
-  Mac, see below, and any Mac that used Touch ID before the guard existed),
-  none of Linux's records are on the list. A guarded boot restores the
+- On a Mac whose Touch ID was set up with `xart_guard=0`, or before the
+  guard existed, none of Linux's records are on the list. A guarded boot restores the
   fingerprints and then refuses the match's write ("xART guard: refused to
   rewrite a kind-4 record this Linux install did not create"), and the
   verify fails. Such a Mac needs `xart_guard=0` to use Touch ID, not only to
@@ -77,9 +80,10 @@ another finger into an existing keybag does not create one.
 
 | Platform | Bootstrap | Keybag creation under level 1 |
 | --- | --- | --- |
-| M1 (T8103), M1 Pro/Max (T6000/T6001) | cold boot | Refused: it rewrites a pre-Linux session record (seen on T6000; T8103 and T6001 untested). Needs `xart_guard=0`. |
+| M1 (T8103), M1 Pro/Max (T6000/T6001) | cold boot | Guard off by default. Rewrites one pre-Linux session record (T6000). |
 | M2 (T8112) | warm attach | No xART writes (J413), so the guard does not affect it. |
-| M2 Pro/Max (T6020/T6021), M3 (T8122) | warm attach | Untested. |
+| M2 Pro/Max (T6020/T6021) | warm attach | Rewrites one existing kind-4 record (J414s, 2026-11-02); the keybag creation window lets it through. |
+| M3 (T8122) | warm attach | Untested. |
 | MacBook Neo (T8140) | warm attach | Guard off by default. |
 
 Whether the enclave writes xART records while enrolling a finger has not
@@ -90,7 +94,7 @@ been measured on a guarded Mac; a refused write fails the enrolment closed.
 A refusal fails closed: the enclave's request fails, no record changes, and
 the kernel log names the refused kind. What to do depends on the case:
 
-- A cold-boot Mac, or any Mac set up with the guard off: set
+- A Mac set up with the guard off: set
   `options apple_sep xart_guard=0` in `/etc/modprobe.d/` and reboot. Do it
   only once the rewrite of the shared, pre-Linux record has been accepted for
   that Mac (see the next section), and treat macOS Touch ID as unverified
@@ -99,6 +103,10 @@ the kernel log names the refused kind. What to do depends on the case:
   the log line. `xart_guard=0` restores use at the cost of the protection.
 - After a boot policy change (a new Stage 1, another boot object), see
   "Boot policy changes" below: one record, one boot, with a backup first.
+- A keybag create that never answered ("identity keybag state is
+  ambiguous: EEXIST" on every later boot): see "An unfinished keybag
+  create" below. A kernel with that rule sends the create again by itself
+  when the list proves nothing was created.
 - A list that could not be read: every record that existed at boot is
   protected and nothing can be adopted, so new records cannot be written
   either.
@@ -127,13 +135,36 @@ The same kernel, under the old policy, unlocked the keybag without any
 session record write. Linux had never created a record there: the guard
 ran from Linux's first boot and its list stayed empty.
 
-Under an unchanged policy that first unlock rewrites no session record at
-all (every J616s boot before the change). So the driver treats a rewrite
-inside it as the policy change and lets exactly one through, by itself, on
-the first boot after the change:
+Touch ID can use the keybag first instead. When fprintd opens the sensor
+before any trusted key is unsealed (a login screen that offers Touch ID,
+for example), the first use of the keybag under the new policy is the
+`DESIGNATE_KEYBAG` in `activate_touchid` (`sbio.rs`), and the enclave asks
+for the rewrite there, after LOAD_KEYBAG has answered. The guard refuses
+it, and the designate is never answered:
 
-- only during the first unlock of an identity keybag that already existed,
-  once per boot; a keybag or ref-key created this boot closes the window;
+    xART guard: refused to rewrite kind-4 record <id>, which this Linux install did not create
+    sks: DESIGNATE_KEYBAG got no reply after 2037 ms
+    sks: DESIGNATE_KEYBAG did not complete; enrolment will refuse
+    hwrng: read produced nothing (ETIMEDOUT)
+    matching unavailable this boot: ...
+
+Touch ID and the enclave's RNG stay down for that boot, and the refusal
+repeats on every boot until the record is allowed. This was seen on the
+MacBook Air M3 (T8122, J613) on 2026-11-07, after a change from a raw
+m1n1 Stage 1 to a Mach-O one, and on a J616s after every Recovery
+enrolment of a Stage 1 that day (https://github.com/aurora-silicon/linux/issues/1190). Kernels from before that
+designate ran in the window below need `aurora-sep-policy-change` for this
+case.
+
+Under an unchanged policy neither that first unlock nor that designate
+rewrites an existing session record (every J616s boot before the change,
+and every guarded Touch ID boot on the J613 and J616s). So the driver
+treats a rewrite inside them as the policy change and lets exactly one
+through, by itself, on the first boot after the change:
+
+- only during the first unlock or Touch ID designate of an identity keybag
+  that already existed, whichever comes first, once per boot; a keybag or
+  ref-key created this boot closes the window;
 - only one kind-4 session record, only a rewrite, never a delete or a
   shared root, and the record is not added to Linux's list;
 - only once the record's previous value is durable in
@@ -152,8 +183,12 @@ boot:
   run it with no arguments. It takes the session id from the refusal.
 - Before a planned change, run it with `--expect`. The record cannot be
   named in advance, so the allowance covers the first existing kind-4
-  record the enclave asks to rewrite. The identity unlock is the first
-  thing that asks.
+  record the enclave asks to rewrite. The keybag's first use, Touch ID's
+  designate or the first unlock, is the first thing that asks. See
+  "Changing Stage 1 on purpose" below.
+- On a kernel whose refusal line names no session id (one from before the
+  allowance code), the tool with no arguments finds nothing to allow. Use
+  `--expect` there, and boot a kernel with the allowance code next.
 
 Either way it first copies the whole 6 MiB gigalocker extent, the driver's
 host files and `/var/lib/fprint` to
@@ -166,6 +201,30 @@ log names the record either way. `--status`
 shows what is armed and what this boot refused; `--cancel` removes an
 allowance that was not used yet.
 
+#### Changing Stage 1 on purpose
+
+Arm the allowance before the change, so the first boot under the new
+policy keeps Touch ID:
+
+1. On the Linux install, run `aurora-sep-policy-change --expect` as root.
+   The running kernel only has to load the driver, which logs where the
+   gigalocker is; it need not have the allowance code.
+2. Change Stage 1 (for example, enrol it from 1TR).
+3. Make the first boot afterwards a kernel with the allowance code, the
+   one that reads `/var/lib/aurora-sep-xart-allow-once.bin`. It empties
+   the file at probe and logs "this boot may rewrite the first existing
+   kind-4 record the enclave asks for, once", then "allowed one rewrite of
+   kind-4 record ... for a boot policy change" when the enclave asks.
+   A kernel without that code does not read the file. With the guard on,
+   it refuses the rewrite as above and leaves the allowance for a later
+   boot; with the guard off, it lets the rewrite through without saving
+   the previous value.
+4. Later boots under the same policy need nothing, on either kernel.
+
+If the first boot was the wrong kernel, Touch ID is down for that boot
+only: boot one with the allowance code next, and it uses the allowance
+still in the file.
+
 `aurora-sep-load` recognises a refusal and stops at once with a message
 that points here, instead of retrying for two minutes.
 
@@ -174,9 +233,59 @@ rewrote one kind-4 record and one shared root. The other six kind-4
 records and the kind-3 record kept their revisions, Ryan's enrolled
 finger matched afterwards, and it kept matching across later reboots.
 
+On the J613 (2026-11-07) the tool with no arguments armed the record the
+designate refusal named. The next boot logged "allowed one rewrite of
+kind-4 record ... for a boot policy change", restored the Catacomb and the
+enrolment ("Touch ID: restored 1 enrolled identity/identities; enrolment
+survived reboot"), and a kernel without the allowance code brought Touch
+ID up on later boots. A second Stage 1 change on that Mac (2026-11-08),
+armed beforehand as in "Changing Stage 1 on purpose", kept Touch ID on
+the first boot with no refusal.
+
 The copy of the gigalocker is evidence and a last resort, not an undo:
 writing an old copy back does not roll back the enclave's anti-replay
 counters, and the enclave may refuse it.
+
+### The keybag creation window
+
+Creating Linux's identity keybag makes the enclave rewrite one existing
+kind-4 session record. The record is shared enclave state that the enclave
+reads at every attach, under every OS, and it predates every Linux install,
+so it is never on Linux's list. Refused, the enclave stops answering the
+create, and the key store is unusable for the rest of the boot.
+
+So the driver runs the identity CREATE_KEYBAG exchange in a window
+(`keybag_create_window` in `xart_guard.rs`), on the boot policy window's
+terms:
+
+- only during that exchange, which runs only when the host holds no keybag;
+- one rewrite per boot, shared with the boot policy window, of one kind-4
+  record that existed at probe; never a delete or another kind, and the
+  roots still follow the level;
+- only once the record's previous value is durable in
+  `/var/lib/aurora-sep-xart-policy-previous.bin`;
+- the record is not added to Linux's list.
+
+The kernel log names the record ("allowed one rewrite of kind-4 record ...
+while Linux's identity keybag was created"). Every other existing session
+record stays refused, including any record another Linux install made.
+Another install's keybag, ref-key and fingerprints are files on its own
+root file system.
+
+### An unfinished keybag create
+
+The driver writes an intent to `/var/lib/aurora-sep-keybag.bin` before it
+sends CREATE_KEYBAG and replaces it once the enclave answers. If a later
+boot finds the intent, a bag may exist that nothing names, so the driver
+does not create another ("identity keybag state is ambiguous: EEXIST").
+
+The intent records how many entries Linux's list had. Every new session
+record is listed before it is written, so if the list has not grown, the
+create left nothing and a later boot sends it again ("creating the identity
+keybag again"). An intent from an older kernel records no length, and is
+sent again only while the list is empty. That is wrong only for a create
+sent with the guard off that did keep a record. It then leaves one unnamed
+bag, as `install-aurora-sep.sh --reset-touchid` does.
 
 ### What `aurora-sep-ready` reports
 
@@ -190,8 +299,8 @@ and from those `matching`:
 | `matching` | When | `aurora-sep-ready` |
 | --- | --- | --- |
 | `usable` | xART writes enabled, no guard | ready |
-| `unverified` | guard on a warm-attach Mac, list loaded, nothing refused yet | restored, matching UNVERIFIED (not called ready; exit 0) |
-| `blocked` | xART writes disabled, a refusal seen, no list, or a guard on a cold-boot Mac | NOT ready (exit 1), with the reason and the `xart_guard=0` opt-out |
+| `unverified` | guard on, list loaded, nothing refused yet | restored, matching UNVERIFIED (not called ready; exit 0) |
+| `blocked` | xART writes disabled, a refusal seen, or no list | NOT ready (exit 1), with the reason and the `xart_guard=0` opt-out |
 | absent | a kernel that does not report it | restored, matching UNVERIFIED (exit 0) |
 
 The diag ABI stays at version 2: these attributes were added to it, and a
@@ -218,19 +327,17 @@ it:
 - A btrfs/snapper rollback, or restoring a backup, brings back an older list.
   Records the enclave created after that snapshot are no longer listed, so
   the guard treats them as another OS's and refuses to rewrite them. Nothing
-  is overwritten, but Touch ID may fail until the newer list is put back.
-  Keep the newest copy, or leave `/var/lib/aurora-sep-xart-owned.bin` out of
-  rollback snapshots.
+  is overwritten and those records stay protected. If Touch ID fails
+  afterwards, set it up again with `aurora-xart reset-touchid` (or
+  `install-aurora-sep.sh --reset-touchid`).
 - A reinstall, or deleting the file, empties the list. Every Linux record
-  then looks like another OS's. Copy the file back from the old install if
-  you have it. Without it, those records stay protected; resetting Touch ID
-  (`install-aurora-sep.sh --reset-touchid`) creates a new keybag, which on a
-  cold-boot Mac needs `xart_guard=0` as above.
+  then looks like another OS's, and those records stay protected. Set Touch
+  ID up again with `aurora-xart reset-touchid` (or
+  `install-aurora-sep.sh --reset-touchid`), which creates a new keybag.
 - A torn last entry, from a crash while appending, is ignored at the next
   probe and overwritten by the next new record.
 
-The file holds only record kinds and session ids, no key material, and it
-can be backed up and copied like any other file.
+The file holds only record kinds and session ids, no key material.
 
 ## Cold-boot SEP Macs rewrite a pre-Linux record (2026-10-16)
 
@@ -247,12 +354,13 @@ Creating the keybag makes the enclave do three things:
 The rewritten record is one of the four session records the enclave reads at
 every attach, and it grows by 71 bytes per keybag created. It is not tied to
 the OS identity, so giving Linux its own identity does not keep this write
-away from records macOS also reads. A driver that refuses to rewrite records
-Linux did not create cannot create a keybag on these Macs.
+away from records macOS also reads. The keybag creation window lets that one
+rewrite through if the record is kind-4.
 
-Warm-attach Macs behave differently. On an M2 (T8112, J413), keybag creation
-made no xART writes at all. On the J700, the macOS-era records stayed
-byte-identical through Linux enrolment.
+Warm-attach Macs differ. On an M2 (T8112, J413), keybag creation made no xART
+writes at all, and on the J700 the macOS-era records stayed byte-identical
+through Linux enrolment. An M2 Pro (T6020, J414s) rewrites one kind-4 record,
+as here.
 
 On a T600x Mac where Linux has created its keybag, treat macOS Touch ID as
 unverified until macOS Touch ID unlock and keychain access have been checked

@@ -1,0 +1,111 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/apple,scaler-v23.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple firmware and descriptor based scaler
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  MSR hardware version 23 and later uses a firmware/descriptor interface
+  with mailbox, scratch and dashboard resources. It is a different hardware
+  interface from the direct-register scaler family used through T8140 and
+  must not advertise the apple,scaler fallback matched by that driver.
+  Register windows and interrupt sources retain hardware-interface order.
+  Some logical interfaces share an aperture, so repeated register tuples
+  are intentional. Firmware, coefficients and workload policy are not DT
+  resources. Each instance has its own DART; an advertised MSRn-DART
+  gate belongs to that DART, rather than the scaler functional domains.
+  Keep the device disabled until its firmware handoff, clocks,
+  power and reset ownership have been qualified.
+
+properties:
+  compatible:
+    items:
+      - enum:
+          - apple,t6050-scaler
+          - apple,t8142-scaler
+          - apple,t8152-scaler
+      - const: apple,scaler-v23
+
+  reg:
+    minItems: 10
+    maxItems: 12
+    description: Register apertures in hardware-interface order.
+
+  interrupts:
+    minItems: 15
+    maxItems: 20
+    description: |
+      MSR and APIODMA completion/error sources, followed by the firmware
+      mailbox, scratch and dashboard sources in hardware-interface order.
+
+  iommus:
+    items:
+      - description: Pixel-data stream (SID 0) in this scaler's DART.
+      - description: APIODMA register-stream transfers (SID 1) in the same DART.
+
+  clocks:
+    maxItems: 1
+
+  power-domains:
+    minItems: 1
+    maxItems: 2
+    description: Functional MSR and ASE core domains where their providers are qualified.
+
+  resets:
+    maxItems: 1
+
+  status:
+    const: disabled
+
+required:
+  - compatible
+  - reg
+  - interrupts
+  - iommus
+  - status
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8152-scaler
+    then:
+      properties:
+        reg:
+          minItems: 12
+          maxItems: 12
+        interrupts:
+          minItems: 15
+          maxItems: 15
+    else:
+      properties:
+        reg:
+          minItems: 10
+          maxItems: 10
+        interrupts:
+          minItems: 20
+          maxItems: 20
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t6050-scaler
+              - apple,t8142-scaler
+    then:
+      properties:
+        power-domains:
+          minItems: 2
+          maxItems: 2
+      required:
+        - clocks
+        - power-domains
+        - resets
+
+additionalProperties: false

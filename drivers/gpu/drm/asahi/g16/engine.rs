@@ -724,6 +724,10 @@ impl Firmware {
     /// and latches the device failed. Dependency errors and exhausted resource classes are handled
     /// separately before preparation, without failing an otherwise healthy engine class.
     pub(crate) fn publish(&mut self, done: &mut Completions) -> Result {
+        // What arrives during a system sleep waits for its end.
+        if self.session.shared.sleeping.load(core::sync::atomic::Ordering::Acquire) {
+            return Ok(());
+        }
         self.session.check()?;
         self.objects.health()?;
         self.service_power()?;
@@ -855,6 +859,9 @@ impl Firmware {
         if !self.engine.chan_wait {
             self.recovery.publication_wait_deadline = None;
         }
+        // Polling retires before it publishes, so this sees work start and
+        // drain; a fail-stop reports from fail_flights().
+        self.power.report_work(!self.engine.flights.is_empty());
         result
     }
 
@@ -1358,5 +1365,7 @@ impl Firmware {
             s.starved_ns += s.pub_ns.wrapping_sub(s.starve_from_ns);
         }
         s.starve_from_ns = 0;
+        let now = s.pub_ns;
+        self.power.utilization.busy(now);
     }
 }

@@ -30,7 +30,7 @@ als = []
 for device in pathlib.Path('/sys/bus/iio/devices').glob('iio:device*'):
     try:
         if (device / 'name').read_text().strip() == 'aop-sensors-als':
-            als += [device / 'in_illuminance_input', device / 'in_cct_input']
+            als += [device / 'in_illuminance_input', device / 'in_colortemp_input']
     except OSError:
         pass
 paths += als

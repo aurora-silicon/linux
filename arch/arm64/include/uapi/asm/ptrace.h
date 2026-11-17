@@ -332,6 +332,18 @@ struct user_gcs {
 	__u64 gcspr_el0;
 };
 
+/*
+ * Aurora: NT_AURORA_APPLE_AMX regset. flags bit 0 says the thread is between
+ * AMX SET and CLR; regs then holds its 8 X, 8 Y and 64 Z rows of 64 bytes.
+ */
+struct user_apple_amx {
+	__u32 flags;
+	__u32 __reserved;
+	__u8 regs[5120];
+};
+
+#define USER_APPLE_AMX_SET	(1 << 0)
+
 #endif /* __ASSEMBLER__ */
 
 #endif /* _UAPI__ASM_PTRACE_H */

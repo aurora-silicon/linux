@@ -121,9 +121,13 @@ static inline unsigned int mt7932_scan_discovery_timeout(const u8 body[0x4d4])
 }
 
 /* CID03 carries up to four directed SSIDs in 36-byte slots (le32 length,
- * 32 bytes) at offset 8; selector 8 marks a directed request and byte 4
- * counts the populated slots. Wildcard entries occupy no slot. A directed
- * request carries no probe IEs.
+ * 32 bytes) at offset 8, and byte 4 counts the populated slots. Byte 3 is
+ * the SSID type: 4 asks for the listed SSIDs and the wildcard together, as
+ * the other connac firmware takes it. Type 8 matched results against the
+ * firmware's remembered SSID for each BSSID, so a BSSID that changed its
+ * SSID was not reported to a directed scan until a wildcard scan refreshed
+ * it. Wildcard entries occupy no slot. A directed request carries no probe
+ * IEs.
  */
 #define MT7932_SCAN_SSIDS 4
 
@@ -138,7 +142,7 @@ static inline int mt7932_scan_ssid_slot(u8 body[0x4d4], const u8 *ssid,
 		return -EINVAL;
 	if (slot >= MT7932_SCAN_SSIDS)
 		return -ENOSPC;
-	body[3] = 8;
+	body[3] = 4;
 	put_unaligned_le32(ssid_length, body + 8 + 36 * slot);
 	memcpy(body + 12 + 36 * slot, ssid, ssid_length);
 	body[4] = slot + 1;

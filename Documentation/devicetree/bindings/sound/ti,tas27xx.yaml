@@ -66,6 +66,54 @@ properties:
       down, and no member enables it again until the driver is reloaded.
       A member needs its fault interrupt.
 
+  apple,bop-config:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 24
+    maxItems: 24
+    description:
+      SN012776 only. The brownout prevention registers BOP_CFG0 to BOP_CFG24,
+      in register order, as the Mac's boot ADT gives them for the amplifier's
+      group (its bop-config). The boot loader copies it into the device tree;
+      without it the block keeps its reset values.
+
+  apple,amp-dcblocker-config:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 2
+    description:
+      SN012776 only. The DC blocker setting of the amplifier's group, as the
+      Mac's boot ADT gives it (its amp-dcblocker-config), copied by the boot
+      loader; its first two bytes are DC_BLK0 and DC_BLK1. Absent when the
+      ADT has none; the driver then writes DC_BLK0 = 0x01 and DC_BLK1 = 0x00.
+
+  apple,amp-tx-zd-config:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 8
+    maxItems: 8
+    description:
+      SN012776 only. This amplifier's row of its group's amp-tx-zd-config in
+      the Mac's boot ADT, copied by the boot loader - one byte per eight SDOUT
+      slots from slot 0, a set bit driving zeros in that idle slot. It
+      replaces the sound card's TDM idle masks for this amplifier.
+
+  apple,speaker-config:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 4
+    maxItems: 4
+    description:
+      SN012776 only. This amplifier's row of its group's speaker-config in
+      the Mac's boot ADT, copied by the boot loader. Its second byte is the
+      amplifier's operating level (AMP_LEVEL, low five bits); the others are
+      its receive and sense slots.
+
+  apple,deferred-shutdown:
+    type: boolean
+    description:
+      The amplifier's TDM bus keeps running for a while after its playback
+      stream stops, as on an AOP-fed speaker stream, and its current and
+      voltage sense slots are still sampled in that time. The amplifier
+      must not enter software shutdown until the bus has stopped. One shut
+      down while the bus still runs can leave garbage in its sense slots.
+
   ti,imon-slot-no:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: TDM TX current sense time slot.
@@ -73,6 +121,14 @@ properties:
   ti,vmon-slot-no:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: TDM TX voltage sense time slot.
+
+  ti,bclk-ratio:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    enum: [250]
+    description:
+      Fixed BCLK/FS ratio of the TDM frame, for a frame the amplifier's ratio
+      auto-detection does not accept (250 BCLKs on the Mac mini (M6, J873)
+      speaker).
 
   '#sound-dai-cells':
     # The codec has a single DAI, the #sound-dai-cells=<1>; case is left in for backward

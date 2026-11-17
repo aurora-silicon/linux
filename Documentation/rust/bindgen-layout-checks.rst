@@ -19,6 +19,13 @@ pointer as the current mm and Asahi's RSS charge faulted in
 counter layout; the pointer supplied to them was wrong. Enabling SCHEDSTATS
 only masks the generator defect and is not a requirement of the driver.
 
+``rust/bindgen_parameters`` declares ``sched_statistics`` opaque. bindgen takes
+an opaque type's size and alignment from Clang's layout, so stock bindgen also
+emits ``#[repr(align(64))]`` for it and ``task_struct`` agrees with C. Rust code
+does not access its fields. Other aligned empty records still need the
+corrected generator below, and the layout assertions still check every
+emitted type.
+
 Known generator limitations
 ---------------------------
 

@@ -94,10 +94,14 @@ static const char *brcmf_fil_get_errstr(u32 err)
 #endif /* DEBUG */
 
 static s32
-brcmf_fil_cmd_data(struct brcmf_if *ifp, u32 cmd, void *data, u32 len, bool set)
+brcmf_fil_cmd_data(struct brcmf_if *ifp, u32 cmd, void *data, u32 len, bool set,
+		   s32 *fwerr_out)
 {
 	struct brcmf_pub *drvr = ifp->drvr;
 	s32 err, fwerr;
+
+	if (fwerr_out)
+		*fwerr_out = 0;
 
 	if (drvr->bus_if->state != BRCMF_BUS_UP) {
 		bphy_err(drvr, "bus is down. we have nothing to do.\n");
@@ -112,6 +116,9 @@ brcmf_fil_cmd_data(struct brcmf_if *ifp, u32 cmd, void *data, u32 len, bool set)
 	else
 		err = brcmf_proto_query_dcmd(drvr, ifp->ifidx, cmd,
 					     data, len, &fwerr);
+
+	if (fwerr_out && !err)
+		*fwerr_out = fwerr;
 
 	if (err) {
 		brcmf_dbg(FIL, "Failed: error=%d\n", err);
@@ -137,7 +144,7 @@ brcmf_fil_cmd_data_set(struct brcmf_if *ifp, u32 cmd, void *data, u32 len)
 	brcmf_dbg_hex_dump(BRCMF_FIL_ON(), data,
 			   min_t(uint, len, MAX_HEX_DUMP_LEN), "data\n");
 
-	err = brcmf_fil_cmd_data(ifp, cmd, data, len, true);
+	err = brcmf_fil_cmd_data(ifp, cmd, data, len, true, NULL);
 	mutex_unlock(&ifp->drvr->proto_block);
 
 	return err;
@@ -150,7 +157,7 @@ brcmf_fil_cmd_data_get(struct brcmf_if *ifp, u32 cmd, void *data, u32 len)
 	s32 err;
 
 	mutex_lock(&ifp->drvr->proto_block);
-	err = brcmf_fil_cmd_data(ifp, cmd, data, len, false);
+	err = brcmf_fil_cmd_data(ifp, cmd, data, len, false, NULL);
 
 	brcmf_dbg(FIL, "ifidx=%d, cmd=%d, len=%d, err=%d\n", ifp->ifidx, cmd,
 		  len, err);
@@ -185,12 +192,15 @@ brcmf_create_iovar(const char *name, const char *data, u32 datalen,
 
 
 s32
-brcmf_fil_iovar_data_set(struct brcmf_if *ifp, const char *name, const void *data,
-			 u32 len)
+brcmf_fil_iovar_data_set_fwerr(struct brcmf_if *ifp, const char *name,
+			       const void *data, u32 len, s32 *fwerr)
 {
 	struct brcmf_pub *drvr = ifp->drvr;
 	s32 err;
 	u32 buflen;
+
+	if (fwerr)
+		*fwerr = 0;
 
 	mutex_lock(&drvr->proto_block);
 
@@ -202,7 +212,7 @@ brcmf_fil_iovar_data_set(struct brcmf_if *ifp, const char *name, const void *dat
 				    sizeof(drvr->proto_buf));
 	if (buflen) {
 		err = brcmf_fil_cmd_data(ifp, BRCMF_C_SET_VAR, drvr->proto_buf,
-					 buflen, true);
+					 buflen, true, fwerr);
 	} else {
 		err = -EPERM;
 		bphy_err(drvr, "Creating iovar failed\n");
@@ -210,6 +220,13 @@ brcmf_fil_iovar_data_set(struct brcmf_if *ifp, const char *name, const void *dat
 
 	mutex_unlock(&drvr->proto_block);
 	return err;
+}
+
+s32
+brcmf_fil_iovar_data_set(struct brcmf_if *ifp, const char *name, const void *data,
+			 u32 len)
+{
+	return brcmf_fil_iovar_data_set_fwerr(ifp, name, data, len, NULL);
 }
 BRCMF_EXPORT_SYMBOL_GPL(brcmf_fil_iovar_data_set);
 
@@ -227,7 +244,7 @@ brcmf_fil_iovar_data_get(struct brcmf_if *ifp, const char *name, void *data,
 				    sizeof(drvr->proto_buf));
 	if (buflen) {
 		err = brcmf_fil_cmd_data(ifp, BRCMF_C_GET_VAR, drvr->proto_buf,
-					 buflen, false);
+					 buflen, false, NULL);
 		if (err == 0)
 			memcpy(data, drvr->proto_buf, len);
 	} else {
@@ -347,7 +364,7 @@ brcmf_fil_bsscfg_data_set(struct brcmf_if *ifp, const char *name,
 				     drvr->proto_buf, sizeof(drvr->proto_buf));
 	if (buflen) {
 		err = brcmf_fil_cmd_data(ifp, BRCMF_C_SET_VAR, drvr->proto_buf,
-					 buflen, true);
+					 buflen, true, NULL);
 	} else {
 		err = -EPERM;
 		bphy_err(drvr, "Creating bsscfg failed\n");
@@ -372,7 +389,7 @@ brcmf_fil_bsscfg_data_get(struct brcmf_if *ifp, const char *name,
 				     drvr->proto_buf, sizeof(drvr->proto_buf));
 	if (buflen) {
 		err = brcmf_fil_cmd_data(ifp, BRCMF_C_GET_VAR, drvr->proto_buf,
-					 buflen, false);
+					 buflen, false, NULL);
 		if (err == 0)
 			memcpy(data, drvr->proto_buf, len);
 	} else {
@@ -428,7 +445,7 @@ s32 brcmf_fil_xtlv_data_set(struct brcmf_if *ifp, const char *name, u16 id,
 				   drvr->proto_buf, sizeof(drvr->proto_buf));
 	if (buflen) {
 		err = brcmf_fil_cmd_data(ifp, BRCMF_C_SET_VAR, drvr->proto_buf,
-					 buflen, true);
+					 buflen, true, NULL);
 	} else {
 		err = -EPERM;
 		bphy_err(drvr, "Creating xtlv failed\n");
@@ -452,7 +469,7 @@ s32 brcmf_fil_xtlv_data_get(struct brcmf_if *ifp, const char *name, u16 id,
 				   drvr->proto_buf, sizeof(drvr->proto_buf));
 	if (buflen) {
 		err = brcmf_fil_cmd_data(ifp, BRCMF_C_GET_VAR, drvr->proto_buf,
-					 buflen, false);
+					 buflen, false, NULL);
 		if (err == 0)
 			memcpy(data, drvr->proto_buf, len);
 	} else {

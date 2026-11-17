@@ -1,0 +1,15 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Additional T6020 hardware resources. Keep unqualified blocks disabled. */
+
+&{/soc} {
+	m2_apcie1_piodma: dma-controller@595010000 {
+		compatible = "apple,t6020-pcie-piodma", "apple,pcie-piodma";
+		reg = <0x5 0x95010000 0x0 0x4000>,
+			<0x5 0x95014000 0x0 0x4000>,
+			<0x5 0x95018000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1346 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&pcie0_dart_1 15>;
+		status = "disabled";
+	};
+};

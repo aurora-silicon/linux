@@ -1,0 +1,50 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Nodes for the macaudio amp level KUnit tests (macaudio-amp-level-test.h).
+ * The values are made up; only their length and placement matter.
+ */
+/dts-v1/;
+/plugin/;
+
+&{/} {
+	ma_amp_a: macaudio-kunit-amp-a {
+		compatible = "test,macaudio-kunit";
+		#sound-dai-cells = <0>;
+		apple,speaker-config = [00 0f 00 02];
+	};
+
+	ma_amp_b: macaudio-kunit-amp-b {
+		compatible = "test,macaudio-kunit";
+		#sound-dai-cells = <0>;
+		apple,speaker-config = [01 e7 04 06];
+	};
+
+	ma_amp_high: macaudio-kunit-amp-high {
+		compatible = "test,macaudio-kunit";
+		#sound-dai-cells = <0>;
+		apple,speaker-config = [02 15 08 0a];
+	};
+
+	ma_amp_short: macaudio-kunit-amp-short {
+		compatible = "test,macaudio-kunit";
+		#sound-dai-cells = <0>;
+		apple,speaker-config = [03 0f 0c];
+	};
+
+	ma_amp_none: macaudio-kunit-amp-none {
+		compatible = "test,macaudio-kunit";
+		#sound-dai-cells = <0>;
+	};
+
+	macaudio-kunit-codec-good {
+		sound-dai = <&ma_amp_a>, <&ma_amp_b>;
+	};
+
+	macaudio-kunit-codec-one-missing {
+		sound-dai = <&ma_amp_a>, <&ma_amp_none>;
+	};
+
+	macaudio-kunit-codec-one-high {
+		sound-dai = <&ma_amp_high>, <&ma_amp_a>;
+	};
+};

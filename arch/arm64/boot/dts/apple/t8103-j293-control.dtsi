@@ -1,0 +1,47 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Populated board control clients. Transport ownership is not transferred. */
+
+&spi4 {
+	panel_controller: panel-timing-controller@0 {
+		compatible = "parade,dp855";
+		reg = <0>;
+		status = "disabled";
+
+		i2c {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+			temperature-sensor@70 {
+				compatible = "ti,tmp103";
+				reg = <0x70>;
+				status = "disabled";
+			};
+			temperature-sensor@71 {
+				compatible = "ti,tmp103";
+				reg = <0x71>;
+				status = "disabled";
+			};
+			temperature-sensor@72 {
+				compatible = "ti,tmp103";
+				reg = <0x72>;
+				status = "disabled";
+			};
+		};
+	};
+};
+
+&i2c4 {
+	touchbar_control: touchbar-driver@4c {
+		compatible = "apple,t8103-touchbar-driver", "apple,touchbar-driver";
+		reg = <0x4c>;
+		status = "disabled";
+	};
+};
+
+&i2c4 {
+	touchbar_calibration: touchbar-calibration@50 {
+		compatible = "apple,t8103-touchbar-calibration", "apple,touchbar-calibration";
+		reg = <0x50>;
+		status = "disabled";
+	};
+};

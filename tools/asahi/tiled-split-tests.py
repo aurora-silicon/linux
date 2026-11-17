@@ -17,19 +17,24 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
 FUNCTIONS = {
+    'drivers/gpu/drm/apple/dcp-fabric-core.h': ['dcp_fabric_dpin_slot', 'dcp_fabric_tunnel_owner'],
     'drivers/gpu/drm/apple/dcp-fabric-session.h': ['dcp_fabric_binding_request'],
     'drivers/gpu/drm/apple/dcp-fabric-core.c': ['dcp_fabric_tunnel_slot'],
     'drivers/gpu/drm/apple/dcp-fabric.c': [
-        'dcp_typec_port_untileable', 'dcp_tb_split_locked', 'dcp_tb_dispatch_request'],
+        'dcp_typec_route_no_dp_alt', 'dcp_is_t8132_ext', 'dcp_typec_port_untileable',
+        'dcp_tb_slot', 'dcp_tb_split_locked', 'dcp_tb_dispatch_request'],
 }
 CASES = ['t6030-dpin1-alone', 't6030-dpin1-alone-before-services',
          't6030-dpin1-with-external-owner', 't6030-dpin1-then-dpin0',
          't6030-dpin0-then-dpin1', 't6030-split-off', 't6030-inactive-dpin1',
+         't6050-dpin1-alone', 't6050-dpin1-with-tile-hint', 't6050-dpin3-alone',
+         't6050-dpin-own-slots', 't6030-dpin3-shares-slot',
          'internal-dpin1-alone-waits', 'internal-not-ready-waits',
          'mixed-routes-wait', 'no-routes-wait', 'internal-tile-hint-pending',
          'internal-tiled-join', 'internal-owner-without-port1',
          'split-retired-teardown-first', 'split-existing-release',
-         'split-existing-active']
+         'split-existing-active', 't8132-dcpext-dpin1-alone',
+         't8132-dcpext-dpin1-with-tile-hint']
 # (name, old, new): valid C that changes the admission.
 MUTATIONS = [
     ('gate-removed', 'if (dcp_typec_port_untileable(port))',
@@ -38,11 +43,25 @@ MUTATIONS = [
      'lockdep_assert_held(&dcp_typec_fabric_lock);\n\t/* A retired provider',
      'lockdep_assert_held(&dcp_typec_fabric_lock);\n\tif (dcp_typec_port_untileable(port))\n'
      '\t\treturn -EOPNOTSUPP;\n\t/* A retired provider'),
-    ('readiness-judged', 'if (!route->dcp->external)\n\t\t\treturn false;',
-     'if (!route->dcp->external && route->dcp->dptxport[1].enabled)\n\t\t\treturn false;'),
+    ('readiness-judged',
+     'route->dcp->fw_compat != DCP_FIRMWARE_V_27_0)\n\t\t\treturn false;',
+     'route->dcp->fw_compat != DCP_FIRMWARE_V_27_0 &&\n'
+     '\t\t    route->dcp->dptxport[1].enabled)\n\t\t\treturn false;'),
     ('empty-untileable', 'return !list_empty(&port->routes);', 'return true;'),
-    ('any-external-untileable', 'if (!route->dcp->external)\n\t\t\treturn false;',
-     'if (route->dcp->external)\n\t\t\treturn true;'),
+    ('any-external-untileable',
+     'if (!route->dcp->external &&\n\t\t    !dcp_is_t8132_ext(route->dcp) &&\n'
+     '\t\t    route->dcp->fw_compat != DCP_FIRMWARE_V_27_0)\n\t\t\treturn false;',
+     'if (route->dcp->external || dcp_is_t8132_ext(route->dcp) ||\n'
+     '\t\t    route->dcp->fw_compat == DCP_FIRMWARE_V_27_0)\n\t\t\treturn true;'),
+    ('dcpext-tileable', '!dcp_is_t8132_ext(route->dcp) &&\n', ''),
+    # Firmware 27 pipelines drive one DP IN each: never a tile.
+    ('fw27-tileable', ' &&\n\t\t    route->dcp->fw_compat != DCP_FIRMWARE_V_27_0)', ')'),
+    # Without fixed CRTCs DP IN 3 is a second stream, in DP IN 1's slot.
+    ('dpin3-primary-slot', 'return dpin & 1;', 'return dpin == 1;'),
+    # With fixed CRTCs every DP IN has a slot of its own, in the driver and in the core.
+    ('driver-shared-slots', 'bool per_dpin = dpin < DCP_FABRIC_DPIN_MAX && dcp_typec_fixed_crtcs();',
+     'bool per_dpin = false;'),
+    ('core-shared-slots', 'dcp_typec_fixed_crtcs());', 'false);'),
     ('gate-always', 'if (dcp_typec_port_untileable(port))',
      'if (true || dcp_typec_port_untileable(port))'),
 ]
@@ -54,17 +73,26 @@ def function(source, name):
                       source, re.M | re.S)
     if not match:
         raise ValueError(name)
+    start = match.start()
+    # The return type on the line above, kernel style.
+    if source.startswith(name + '(', start):
+        start = source.rindex('\n', 0, start - 1) + 1
     pos = source.index('{', match.start()) + 1
     depth = 1
     while depth:
         depth += (source[pos] == '{') - (source[pos] == '}')
         pos += 1
-    return source[match.start():pos] + '\n'
+    return source[start:pos] + '\n'
 
 
 def build(out, bodies, tag):
     fixture = (ROOT / 'tools/asahi/tiled-split/fixture.c').read_text()
-    code = fixture.replace('/* PRODUCTION_FUNCTIONS */', '\n'.join(bodies.values()))
+    core = (ROOT / 'drivers/gpu/drm/apple/dcp-fabric-core.h').read_text()
+    versions = re.search(r'enum dcp_firmware_version \{.*?\n\};',
+                         (ROOT / 'drivers/gpu/drm/apple/version_utils.h').read_text(), re.S).group()
+    code = fixture.replace('/* FABRIC_DEFINES */', re.search(
+        r'^#define DCP_FABRIC_DPIN_MAX\b.*$', core, re.M).group() + '\n' + versions).replace(
+        '/* PRODUCTION_FUNCTIONS */', '\n'.join(bodies.values()))
     source, binary = out / f'{tag}.c', out / tag
     source.write_text(code)
     subprocess.run(['cc', '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra', '-Werror',

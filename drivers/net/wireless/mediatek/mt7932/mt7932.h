@@ -25,6 +25,7 @@
 #include "firmware.h"
 #include "calibration.h"
 #include "packet.h"
+#include "awdl.h"
 #include "scan.h"
 #include "association.h"
 #include "regulatory.h"
@@ -92,6 +93,12 @@ struct mt7932 {
 	bool dma_owned, module_pinned;
 	struct completion reset_retry;
 	int removal_error;
+	/* The firmware keeps running across a deep sleep with its host interface stopped. */
+	struct completion hif_done;
+	int hif_result;
+	u32 hif_glo;
+	/* hif_suspended stops new work; hif_gate then closes the BAR to all but the control. */
+	bool hif_waiting, hif_suspending, hif_suspended, hif_gate;
 	bool ram_config;
 	bool runtime_epoch;
 	bool runtime_cal_valid;
@@ -147,18 +154,32 @@ struct mt7932 {
 	u8 scan_seq, retired_scan_seq, scan_home_channel;
 	bool scan_finished, scan_aborted, bss_active;
 	u64 beacons;
-	unsigned long peer_alloc;
+	/* Station and security-table identities are independent host allocators. */
+	unsigned long station_alloc, wtbl_alloc, wmm_alloc;
 	struct mt7932_peer_ids peer_ids;
+	struct mt7932_awdl awdl;
 	struct cfg80211_bss *connect_bss;
 	struct work_struct connect_work, disconnect_work;
 	struct work_struct power_work;
 	/* Desired/submitted PS configuration uses command_mutex; TIM uses response_lock. */
 	u8 power_mode, power_applied;
 	bool power_applied_valid, power_tim;
+	/* WoWLAN detectors cfg80211 asked for at this sleep; 0 leaves the network. */
+	u8 wow_detect;
+	/* The firmware was given WoW at the sleep; command_mutex. */
+	bool wow_armed;
+	/* A wake reason is awaited, and the one received; response_lock. */
+	bool wow_report;
+	u8 wow_reason;
+	struct work_struct wow_work;
 	struct completion assoc_start, assoc_done, disconnect_done;
 	struct completion discovery_done;
 	struct completion scan_done;
 	struct ieee80211_channel *connect_channel_req, *connect_channel_hint;
+	/* Boot time after which a radar or no-IR candidate must have been
+	 * heard; set when an attempt starts listening, under command_mutex.
+	 */
+	u64 connect_heard_since;
 	u8 connect_bssid_req[ETH_ALEN], connect_bssid_hint[ETH_ALEN];
 	bool discovering, discovery_finished, connect_cancelled;
 	u8 connect_ssid[32], connect_pmk[32], connect_bssid[6];
@@ -176,6 +197,12 @@ struct mt7932 {
 	 * sets connect_lost for the worker to report. Under response_lock.
 	 */
 	bool connect_publishing, connect_lost;
+	/* A connect with the previous BSSID is moving the connection to another
+	 * AP (roam_moving), or the current connection is the result of one
+	 * (roam_landed). Written under response_lock with WRITE_ONCE(); read
+	 * under it, or with READ_ONCE() where the lock is not held.
+	 */
+	bool roam_moving, roam_landed;
 	u16 disconnect_reason;
 	int connect_error;
 	u32 event_cipher;
@@ -223,6 +250,45 @@ struct mt7932 {
 	dma_addr_t ipc_dma, aux_dma;
 };
 
+/* What the connect worker reports once an attempt has its result. A move, a
+ * connect with the previous BSSID while connected, ends in a connect result,
+ * which is what iwd's reassociation waits for; cfg80211_roamed() is never
+ * used. A failed connect result leaves cfg80211 holding the connection the
+ * move replaced, so a move that fails or is cancelled then reports a
+ * disconnect, for the reason the cancel gave if it was cancelled. A
+ * cancelled connect that was not a move reports only the disconnect. A
+ * cancel always leaves an error in ret.
+ */
+struct mt7932_connect_report {
+	bool result;		/* cfg80211_connect_done() */
+	bool disconnect;	/* then a disconnect, for reason */
+	bool landed;		/* the new connection is the result of a move */
+	u16 reason;
+};
+
+static inline struct mt7932_connect_report
+mt7932_connect_report(bool move, bool cancelled, int ret, u16 cancel_reason)
+{
+	struct mt7932_connect_report report = {
+		.result = move || !cancelled,
+		.disconnect = move ? ret != 0 : cancelled,
+		.landed = move && !ret,
+	};
+
+	if (report.disconnect)
+		report.reason = cancelled ? cancel_reason : WLAN_REASON_DEAUTH_LEAVING;
+	return report;
+}
+
+/* Whether a disconnect the driver ends is reported as local. See
+ * mt_report_disconnected() for why a connection a move made reports it as
+ * from the AP.
+ */
+static inline bool mt7932_disconnect_local(bool local, bool landed)
+{
+	return local && !landed;
+}
+
 bool mt_rf_allowed(struct mt7932 *m);
 void mt_retry_missing_policy(struct mt7932 *m);
 int mt_6g_connect_policy(struct mt7932 *m, const struct mt7932_6g_ap *ap);
@@ -262,6 +328,7 @@ struct mt7932 *mt_from_wiphy(struct wiphy *wiphy);
 void mt_scan_event(struct mt7932 *m, const struct mt7932_event *event);
 void mt_abort_scan(struct wiphy *wiphy, struct wireless_dev *wdev);
 int mt_scan_quiesce(struct mt7932 *m);
+void mt_scan_settle_retired(struct mt7932 *m);
 int mt_connect_discover(struct mt7932 *m);
 int mt_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request);
 int mt_register_interface(struct mt7932 *m);
@@ -273,6 +340,7 @@ void mt_connect_work(struct work_struct *work);
 int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 		      struct cfg80211_connect_params *params);
 void mt_disconnect_work(struct work_struct *work);
+void mt_report_disconnected(struct mt7932 *m, u16 reason, bool local, gfp_t gfp);
 int mt_disconnect(struct wiphy *wiphy, struct net_device *netdev, u16 reason);
 int mt_deauth(struct wiphy *wiphy, struct net_device *netdev,
 		     struct cfg80211_deauth_request *request);
@@ -293,5 +361,15 @@ int mt_set_power_mgmt(struct wiphy *wiphy, struct net_device *netdev,
 		      bool enabled, int timeout);
 void mt_power_work(struct work_struct *work);
 int mt_power_init(struct mt7932 *m);
+int mt_power_submit(struct mt7932 *m, u8 mode);
+#ifdef CONFIG_PM
+extern const struct wiphy_wowlan_support mt_wowlan_support;
+int mt_wow_suspend(struct wiphy *wiphy, struct cfg80211_wowlan *wow);
+int mt_wow_resume(struct wiphy *wiphy);
+#endif
+void mt_wow_arm(struct mt7932 *m);
+int mt_wow_disarm(struct mt7932 *m);
+void mt_wow_reason_event(struct mt7932 *m, const struct mt7932_event *event);
+void mt_wow_work(struct work_struct *work);
 
 #endif

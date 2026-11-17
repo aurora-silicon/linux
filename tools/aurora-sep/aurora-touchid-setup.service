@@ -1,0 +1,16 @@
+[Unit]
+Description=Set up the Touch ID calibration when it is missing or refused
+Documentation=file:///usr/share/doc/aurora-sep/README.md
+After=local-fs.target
+Before=aurora-sep-ready.service fprintd.service
+RequiresMountsFor=/var/lib
+ConditionPathExists=/dev/disk/by-partlabel/iBootSystemContainer
+
+[Service]
+Type=oneshot
+# Runs only when a Touch ID file is missing, when the enclave refused one
+# this boot (aurora-sep-ready starts this unit then), or on the first boot
+# after installation. Every other boot skips it here.
+ExecCondition=/usr/local/sbin/aurora-touchid-setup-needed
+ExecStart=/usr/local/sbin/aurora-touchid-setup --auto
+TimeoutStartSec=300

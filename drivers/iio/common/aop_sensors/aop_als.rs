@@ -268,7 +268,7 @@ impl platform::Driver for IIOAopAlsDriver {
                 &adata,
                 service,
                 offset,
-                [ty, bindings::BINDINGS_IIO_CCT],
+                [ty, bindings::BINDINGS_IIO_COLORTEMP],
             )?;
             (
                 listener,

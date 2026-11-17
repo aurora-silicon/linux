@@ -87,6 +87,18 @@ static void atcphy_test_target_mode_t8132(struct kunit *test)
 	state.alt = &dp;
 	state.mode = TYPEC_DP_STATE_D;
 	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB2);
+	/* No DisplayPort-only lanes: the USB2 beside them still runs. */
+	state.mode = TYPEC_DP_STATE_C;
+	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB2);
+	state.mode = TYPEC_DP_STATE_E;
+	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB2);
+	/* SuperSpeed without the DP calibration: pin assignment D runs USB3. */
+	atcphy->t8132_ss = true;
+	atcphy->ss_tunables = true;
+	state.mode = TYPEC_DP_STATE_D;
+	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB3);
+	state.mode = TYPEC_DP_STATE_C;
+	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB2);
 	state.alt = NULL;
 	state.mode = TYPEC_STATE_SAFE;
 	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_OFF);
@@ -552,6 +564,33 @@ static void atcphy_test_update_port_taken(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, atcphy->usb3_port_off);
 }
 
+/* The root hub, once another update that held it has brought the port up again */
+static int atcphy_test_pm_get_after_other(struct apple_atcphy *atcphy,
+					  struct atcphy_usb3_pm *pm)
+{
+	atcphy_test_step('g');
+	guard(mutex)(&atcphy->lock);
+	atcphy->usb3_port_off = false;
+	return 0;
+}
+
+/* An update that waited for another one doing the same change leaves the port alone */
+static void atcphy_test_update_after_other(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_fixed_hub(test);
+	struct atcphy_test_steps *steps = atcphy_test_stub_steps(test);
+
+	kunit_activate_static_stub(test, atcphy_usb3_pm_get, atcphy_test_pm_get_after_other);
+	steps->mode_port_on = true;
+
+	/* The lanes and the PIPE are in place, the port still owed by the other update */
+	atcphy->usb3_port_off = true;
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_D), 0);
+	KUNIT_EXPECT_STREQ(test, steps->log, "g");
+	KUNIT_EXPECT_FALSE(test, atcphy->usb3_port_off);
+	KUNIT_EXPECT_EQ(test, atcphy->typec_mode, APPLE_ATCPHY_MODE_USB3_DP);
+}
+
 /*
  * Zeroed memory in place of the core, PIPE handler and USB2 PHY registers:
  * enough to park the PIPE and power the PHY off, with a PIPE lock request
@@ -629,18 +668,25 @@ static struct apple_atcphy *atcphy_test_alloc_failed_handoff(struct kunit *test)
 	return atcphy;
 }
 
+static int atcphy_test_count_refused_lock(struct apple_atcphy *atcphy);
+
 /* Once dwc3 has stopped, its USB3 PHY power-off parks the PIPE without one */
 static void atcphy_test_stopped_power_off_common(struct kunit *test, bool dp)
 {
 	struct apple_atcphy *atcphy = atcphy_test_alloc_failed_handoff(test);
 	struct phy *phy = kunit_kzalloc(test, sizeof(*phy), GFP_KERNEL);
+	unsigned int requests = 0;
 
 	KUNIT_ASSERT_NOT_NULL(test, phy);
 	phy_set_drvdata(phy, atcphy);
 	if (!dp)
 		atcphy->mode = APPLE_ATCPHY_MODE_USB3;
 
+	/* The stopped controller can't acknowledge a lock, so none is asked for. */
+	test->priv = &requests;
+	kunit_activate_static_stub(test, atcphy_pipehandler_lock, atcphy_test_count_refused_lock);
 	KUNIT_EXPECT_EQ(test, atcphy_usb3_power_off(phy), 0);
+	KUNIT_EXPECT_EQ(test, requests, 0U);
 	KUNIT_EXPECT_EQ(test, atcphy->pipe_state, ATCPHY_PIPEHANDLER_STATE_DUMMY);
 	KUNIT_EXPECT_FALSE(test, atcphy->pipe_pending);
 	KUNIT_EXPECT_EQ(test, atcphy->mode,
@@ -1158,6 +1204,41 @@ static void atcphy_test_t8132_rpm_busy(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, atcphy_rpm_busy(atcphy));
 }
 
+#ifdef CONFIG_SUSPEND
+/* An epoch with a host survives suspend-to-idle only; without one, or incomplete, never. */
+static void atcphy_test_t8132_system_suspend(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_powered_off(test);
+	suspend_state_t target = pm_suspend_target_state;
+
+	atcphy->hw = &atcphy_hw_t8132;
+	atcphy->t8132_ss = true;
+	dev_set_drvdata(atcphy->dev, atcphy);
+
+	pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
+	atcphy->mode_dirty = true;
+	KUNIT_EXPECT_EQ(test, atcphy_suspend(atcphy->dev), -EBUSY);
+	atcphy->mode_dirty = false;
+
+	/* Without a host, as in a USB3 device role, nothing holds the domain */
+	atcphy->t8132_common_owned = true;
+	KUNIT_EXPECT_EQ(test, atcphy_suspend(atcphy->dev), -EBUSY);
+	KUNIT_EXPECT_FALSE(test, atcphy->t8132_suspended);
+
+	atcphy->host_active = true;
+	KUNIT_EXPECT_EQ(test, atcphy_suspend(atcphy->dev), 0);
+	KUNIT_EXPECT_TRUE(test, atcphy->t8132_suspended);
+	KUNIT_EXPECT_EQ(test, atcphy_resume(atcphy->dev), 0);
+	KUNIT_EXPECT_FALSE(test, atcphy->t8132_suspended);
+
+	pm_suspend_target_state = PM_SUSPEND_MEM;
+	KUNIT_EXPECT_EQ(test, atcphy_suspend(atcphy->dev), -EBUSY);
+	KUNIT_EXPECT_FALSE(test, atcphy->t8132_suspended);
+
+	pm_suspend_target_state = target;
+}
+#endif
+
 /* The hold follows the busy state, with one reference at most. */
 static void atcphy_test_t8132_rpm_hold(struct kunit *test)
 {
@@ -1321,6 +1402,7 @@ static struct kunit_case atcphy_mux_test_cases[] = {
 	KUNIT_CASE(atcphy_test_update_port_retry),
 	KUNIT_CASE(atcphy_test_update_unsupported),
 	KUNIT_CASE(atcphy_test_update_port_taken),
+	KUNIT_CASE(atcphy_test_update_after_other),
 	KUNIT_CASE(atcphy_test_set_port_on),
 	KUNIT_CASE(atcphy_test_host_start),
 	KUNIT_CASE(atcphy_test_stopped_power_off),
@@ -1356,6 +1438,9 @@ static struct kunit_case atcphy_t8132_pm_test_cases[] = {
 	KUNIT_CASE(atcphy_test_t8132_rpm_hold),
 	KUNIT_CASE(atcphy_test_t8132_restore_idle),
 	KUNIT_CASE(atcphy_test_t8132_restore_mode),
+#ifdef CONFIG_SUSPEND
+	KUNIT_CASE(atcphy_test_t8132_system_suspend),
+#endif
 	{}
 };
 

@@ -299,3 +299,17 @@ config DMA_MAP_BENCHMARK
 	  performance of dma_(un)map_page.
 
 	  See tools/testing/selftests/dma/dma_map_benchmark.c
+
+config DMA_NO_BOUNCE_KUNIT_TEST
+	bool "KUnit test of DMA_ATTR_NO_BOUNCE" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && HAS_DMA && !ARCH_HAS_PHYS_TO_DMA
+	default KUNIT_ALL_TESTS
+	help
+	  KUnit test of the DMA_ATTR_NO_BOUNCE mapping attribute: for a test
+	  device that cannot address one page, mappings of that page are
+	  refused instead of being made through a bounce buffer. The test
+	  device's addressing is set by its dma_range_map, which architectures
+	  with a phys_to_dma() of their own do not follow. The test is built
+	  in only, since it looks at the SWIOTLB state of the device.
+
+	  If unsure, say N.

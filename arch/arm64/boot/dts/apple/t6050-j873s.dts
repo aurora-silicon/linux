@@ -1,0 +1,36 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Mac mini (M5 Pro, 2026)
+ *
+ * target-type: J873s
+ *
+ * One T6050 die (t6050-max.dtsi). Nobody has booted Linux on this board
+ * yet: beyond the SoC this file only adds the board's hardware inventory
+ * (t6050-peripherals.dtsi), all of it disabled, from the board's ADT.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#include "t6050-max.dtsi"
+
+/ {
+	compatible = "apple,j873s", "apple,t6050", "apple,arm-platform";
+	model = "Apple Mac mini (M5 Pro, 2026)";
+	chassis-type = "desktop";
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+	};
+};
+
+/* PCIe port 0 is not described for this board yet */
+&pcie0 {
+	status = "disabled";
+};
+
+#define T6050_J873S
+#include "t6050-peripherals.dtsi"

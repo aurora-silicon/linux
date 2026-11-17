@@ -17,9 +17,10 @@
 //! then be unavailable, but no other OS's record changes.
 //!
 //! The parameter's default, -1, takes the platform profile's level: 1 on the
-//! M1, M2 and M3 Macs, whose enclave Linux shares with a macOS install, and
-//! 0 on the MacBook Neo, which already holds Linux records from before the
-//! list existed and would otherwise lose write access to them.
+//! M2 and M3 Macs, whose enclave Linux shares with a macOS install, and 0 on
+//! the M1 Macs, where setting up Touch ID has to rewrite a record from before
+//! Linux, and on the MacBook Neo, which already holds Linux records from
+//! before the list existed and would otherwise lose write access to them.
 //!
 //! The effective level, whether the list could be loaded and every refused
 //! write are reported in the driver's `diag` attributes, with what they make
@@ -36,20 +37,26 @@
 //!
 //! A boot policy change (a new Stage 1, a different boot object) makes the
 //! enclave rewrite one existing session record the first time Linux's
-//! identity keybag is unlocked under the new policy. Linux did not create
-//! that record. On a boot under an unchanged policy that unlock rewrites no
-//! session record at all, so a rewrite inside it is the sign of a policy
+//! identity keybag is used under the new policy: its first unlock, or
+//! Touch ID's `DESIGNATE_KEYBAG` when that comes first. Linux did not create
+//! that record. On a boot under an unchanged policy neither rewrites an
+//! existing session record, so a rewrite inside them is the sign of a policy
 //! change. The guard lets exactly one kind-4 rewrite through in that window
-//! ([`policy_window`]): the first unlock of an identity keybag that already
-//! existed, at most once per boot, never a delete, and only once the
-//! record's previous value is saved in a host file ([`PREVIOUS_PATH`]).
-//! The record is not added to Linux's list.
+//! ([`policy_window`]): the first unlock or designate of an identity keybag
+//! that already existed, at most once per boot, never a delete, and only
+//! once the record's previous value is saved in a host file
+//! ([`PREVIOUS_PATH`]). The record is not added to Linux's list.
 //!
 //! For a policy change the window did not cover, `aurora-sep-policy-change`
 //! backs up the gigalocker and leaves a one-time allowance in a host file
 //! ([`ALLOW_PATH`]): one record, named or the first of its kind, that the
 //! enclave may rewrite during the next boot only, on the same terms. The
 //! driver empties the file before it uses the allowance.
+//!
+//! Creating Linux's identity keybag also rewrites one existing kind-4
+//! record, so the create runs in the same window ([`keybag_create_window`]).
+//! An unfinished create is sent again only if Linux's list shows it left no
+//! record behind ([`may_retry_create`]).
 
 use crate::shim::StoreFile;
 use crate::xart_store::{crc32_ieee, Key};
@@ -60,29 +67,97 @@ use kernel::sync::atomic::{Atomic, Relaxed};
 pub(crate) const OWNED_PATH: &CStr = c"/var/lib/aurora-sep-xart-owned.bin";
 /// Host file holding the one-time allowance for a boot policy change.
 pub(crate) const ALLOW_PATH: &CStr = c"/var/lib/aurora-sep-xart-allow-once.bin";
-/// Host file keeping the previous value of every record rewritten for a
-/// boot policy change.
+/// Host file keeping the previous value of every existing record a window
+/// or allowance let the enclave rewrite.
 pub(crate) const PREVIOUS_PATH: &CStr = c"/var/lib/aurora-sep-xart-policy-previous.bin";
 const PREVIOUS_MAGIC: &[u8; 4] = b"AXGP";
-/// The kind of session record a boot policy change rewrites.
+/// The kind of session record a window or allowance may rewrite.
 const POLICY_KIND: u8 = 4;
 
-/// Whether the first unlock of an existing identity keybag has started this
-/// boot, and whether it is running now.
-static WINDOW_STARTED: Atomic<bool> = Atomic::new(false);
-static WINDOW_OPEN: Atomic<bool> = Atomic::new(false);
+/// Why the guard let the enclave rewrite an existing record Linux did not
+/// create.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Rewrite {
+    /// The first unlock of an existing keybag, or a one-time allowance.
+    PolicyChange = 1,
+    /// The creation of Linux's identity keybag.
+    KeybagCreate = 2,
+}
 
-/// Runs `unlock`, the unlock of an identity keybag that already existed,
-/// with the boot policy window open if it is this boot's first. Later
-/// unlocks run with it closed.
-pub(crate) fn policy_window<T>(unlock: impl FnOnce() -> T) -> T {
-    if WINDOW_STARTED.xchg(true, Relaxed) {
-        return unlock();
+impl Rewrite {
+    fn from_raw(raw: u32) -> Option<Rewrite> {
+        match raw {
+            1 => Some(Rewrite::PolicyChange),
+            2 => Some(Rewrite::KeybagCreate),
+            _ => None,
+        }
     }
-    WINDOW_OPEN.store(true, Relaxed);
-    let result = unlock();
-    WINDOW_OPEN.store(false, Relaxed);
+
+    /// The reason as the kernel log gives it.
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Rewrite::PolicyChange => "for a boot policy change",
+            Rewrite::KeybagCreate => "while Linux's identity keybag was created",
+        }
+    }
+}
+
+/// Whether this boot's one window has started, and the [`Rewrite`] it is
+/// open for now (0 when closed).
+static WINDOW_STARTED: Atomic<bool> = Atomic::new(false);
+static WINDOW_OPEN: Atomic<u32> = Atomic::new(0);
+
+/// The window open now.
+fn open_window() -> Option<Rewrite> {
+    Rewrite::from_raw(WINDOW_OPEN.load(Relaxed))
+}
+
+/// Runs `f` with the window open for `why`, unless this boot had one already.
+fn with_window<T>(why: Rewrite, f: impl FnOnce() -> T) -> T {
+    if WINDOW_STARTED.xchg(true, Relaxed) {
+        return f();
+    }
+    WINDOW_OPEN.store(why as u32, Relaxed);
+    let result = f();
+    WINDOW_OPEN.store(0, Relaxed);
     result
+}
+
+/// Runs `unlock`, the unlock or Touch ID designate of an identity keybag
+/// that already existed, with the boot policy window open if it is this
+/// boot's first. Later ones run with it closed.
+pub(crate) fn policy_window<T>(unlock: impl FnOnce() -> T) -> T {
+    with_window(Rewrite::PolicyChange, unlock)
+}
+
+/// Runs `create`, the identity keybag's CREATE_KEYBAG exchange, with the
+/// window open: the enclave rewrites one existing kind-4 record to create it.
+pub(crate) fn keybag_create_window<T>(create: impl FnOnce() -> T) -> T {
+    with_window(Rewrite::KeybagCreate, create)
+}
+
+/// Linux's list as an unfinished create's intent recorded it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Unfinished {
+    /// Written by a driver that did not record it.
+    Unmarked,
+    /// No guard ran with a list.
+    Unguarded,
+    /// The list had this many entries.
+    Guarded(u64),
+}
+
+/// Whether an unfinished create may be sent again, given the entries in
+/// Linux's list at load (`None` without a list). Every new session record is
+/// listed before it is written, so an unchanged list means the create left
+/// nothing; an unmarked intent needs an empty list.
+pub(crate) fn may_retry_create(unfinished: Unfinished, listed: Option<u64>) -> bool {
+    match (unfinished, listed) {
+        (_, None) => false,
+        (Unfinished::Guarded(then), Some(now)) => now == then,
+        (Unfinished::Unmarked, Some(now)) => now == 0,
+        (Unfinished::Unguarded, Some(_)) => false,
+    }
 }
 
 /// Keeps the window shut for the rest of the boot: a keybag or ref-key
@@ -91,8 +166,8 @@ pub(crate) fn close_policy_window() {
     WINDOW_STARTED.store(true, Relaxed);
 }
 
-/// Saves `value`, the current value of `key`, before it is rewritten for a
-/// boot policy change. The rewrite goes ahead only once this is durable.
+/// Saves `value`, the current value of `key`, before the enclave rewrites
+/// it. The rewrite goes ahead only once this is durable.
 pub(crate) fn save_previous(key: &Key, value: &[u8]) -> Result<()> {
     let (file, _created) = StoreFile::open_host(PREVIOUS_PATH)?;
     file.sync_parent()?;
@@ -177,8 +252,6 @@ pub(crate) enum Matching {
 pub(crate) struct MatchFacts {
     /// The store opened with writes enabled.
     pub(crate) xart_writable: bool,
-    /// The platform cold-boots its enclave.
-    pub(crate) cold: bool,
     /// The guard's effective level and whether its list loaded, or `None`
     /// when no guard runs.
     pub(crate) guard: Option<(u8, bool)>,
@@ -187,22 +260,15 @@ pub(crate) struct MatchFacts {
 }
 
 impl MatchFacts {
-    /// A match rewrites session records that existed before it (seen on a
-    /// T6000). It is blocked when xART is read-only, once the guard has
-    /// refused anything, when the guard has no list to allow Linux's records
-    /// by, and on a cold-boot Mac: creating the keybag there needs the guard
-    /// off, so the records a match rewrites were never listed.
-    ///
-    /// Nothing else proves an unguarded setup. An empty list in particular
-    /// does not: a guarded keybag creation on an M2 writes no record, and a
-    /// rollback can empty the list. So a guarded warm-attach Mac is
-    /// unverified until a refusal says otherwise.
+    /// A match rewrites existing session records, so it is blocked when
+    /// xART is read-only, after a refusal, or without a list. Otherwise a
+    /// guard leaves it unverified: not even an empty list proves the setup
+    /// ran unguarded.
     pub(crate) fn matching(&self) -> Matching {
         match self.guard {
             _ if !self.xart_writable || self.refusals != 0 => Matching::Blocked,
             None => Matching::Usable,
             Some((_, false)) => Matching::Blocked,
-            Some(_) if self.cold => Matching::Blocked,
             Some(_) => Matching::Unverified,
         }
     }
@@ -261,8 +327,9 @@ pub(crate) enum Allowance {
     Record(Key),
     /// The first existing record of this kind the enclave asks to rewrite.
     /// An installer that changes the boot policy cannot know the record's
-    /// session id beforehand; the first identity unlock under the new policy
-    /// comes before anything else can rewrite a session record.
+    /// session id beforehand; the keybag's first use under the new policy
+    /// (an unlock or Touch ID's designate) comes before anything else can
+    /// rewrite a session record.
     FirstOfKind(u8),
 }
 
@@ -302,7 +369,7 @@ fn take_allowance() -> Option<Allowance> {
     };
     drop(file);
     if let Err(e) = StoreFile::open_trunc(ALLOW_PATH).and_then(|file| file.sync()) {
-        pr_warn!(
+        pr_warn_ratelimited!(
             "xART guard: could not empty the one-time allowance ({:?}); not using it\n",
             e
         );
@@ -310,16 +377,16 @@ fn take_allowance() -> Option<Allowance> {
     }
     let allowance = if read { Allowance::decode(&entry) } else { None };
     match allowance {
-        Some(Allowance::Record(key)) => pr_info!(
+        Some(Allowance::Record(key)) => pr_info_ratelimited!(
             "xART guard: this boot may rewrite kind-{} record {} once, for a boot policy change\n",
             key.kind,
             Id(&key.uuid)
         ),
-        Some(Allowance::FirstOfKind(kind)) => pr_info!(
+        Some(Allowance::FirstOfKind(kind)) => pr_info_ratelimited!(
             "xART guard: this boot may rewrite the first existing kind-{} record the enclave asks for, once, for a boot policy change\n",
             kind
         ),
-        None => pr_warn!("xART guard: ignored a damaged one-time allowance\n"),
+        None => pr_warn_ratelimited!("xART guard: ignored a damaged one-time allowance\n"),
     }
     allowance
 }
@@ -334,47 +401,60 @@ pub(crate) trait ListFile {
     fn sync_parent(&self) -> Result<()>;
 }
 
-impl ListFile for StoreFile {
+/// Linux's list at [`OWNED_PATH`], opened for each access and closed again.
+///
+/// The guard lives as long as the xART store, which the driver keeps until it
+/// is unbound, and nothing unbinds it before a reboot. Holding the list open
+/// for writing that long keeps a writer on the root file system, so the
+/// read-only remount of `/` at shutdown fails with EBUSY. Writes never create
+/// the file: only [`Guard::open`] does that.
+pub(crate) struct HostListFile;
+
+impl ListFile for HostListFile {
     fn size(&self) -> Result<u64> {
-        StoreFile::size(self)
+        StoreFile::open_readonly(OWNED_PATH)?.size()
     }
 
     fn read_exact(&self, off: u64, buf: &mut [u8]) -> Result<()> {
-        StoreFile::read_exact(self, off, buf)
+        StoreFile::open_readonly(OWNED_PATH)?.read_exact(off, buf)
     }
 
     fn write_all(&self, off: u64, buf: &[u8]) -> Result<()> {
-        StoreFile::write_all(self, off, buf)
+        StoreFile::open_writable_existing(OWNED_PATH)?.write_all(off, buf)
     }
 
+    // fsync on a new descriptor still flushes the writes made through earlier
+    // ones, and reports a writeback error that no descriptor has seen yet.
     fn sync(&self) -> Result<()> {
-        StoreFile::sync(self)
+        StoreFile::open_readonly(OWNED_PATH)?.sync()
     }
 
     fn sync_parent(&self) -> Result<()> {
-        StoreFile::sync_parent(self)
+        StoreFile::open_readonly(OWNED_PATH)?.sync_parent()
     }
 }
 
-pub(crate) struct Guard<F: ListFile = StoreFile> {
+pub(crate) struct Guard<F: ListFile = HostListFile> {
     level: u8,
     /// `None` when the list could not be opened: nothing can be adopted, so
     /// every session write that is not already listed is refused.
     file: Option<F>,
     /// Byte offset of the next entry.
     end: u64,
+    /// Entries in the list at load, torn ones included.
+    loaded_entries: u64,
     owned: KVec<Key>,
     existed: KVec<Key>,
     refused: usize,
     /// The one-time allowance for a boot policy change, until it is used.
     allowance: Option<Allowance>,
-    /// The boot policy window let its one rewrite through.
+    /// This boot's window rewrite is used.
     window_used: bool,
-    /// The write just allowed is a boot policy change rewrite: its previous
-    /// value must be saved first ([`Guard::take_save_previous`]).
-    save_previous: bool,
-    /// Whether the boot policy window is open; the tests use their own.
-    window_open: fn() -> bool,
+    /// Why the write just allowed rewrites an existing record; its previous
+    /// value is saved first.
+    save_previous: Option<Rewrite>,
+    /// The window open now; the tests set their own.
+    window: fn() -> Option<Rewrite>,
 }
 
 impl Guard {
@@ -385,7 +465,8 @@ impl Guard {
         let mut guard = Guard::with_file(
             level,
             existing,
-            StoreFile::open_host(OWNED_PATH).map(|(file, _created)| file),
+            // Only to create the list if absent; the handle closes here.
+            StoreFile::open_host(OWNED_PATH).map(|_| HostListFile),
         );
         guard.allowance = take_allowance();
         guard
@@ -399,13 +480,14 @@ impl<F: ListFile> Guard<F> {
             level,
             file: None,
             end: 0,
+            loaded_entries: 0,
             owned: KVec::new(),
             existed: existing,
             refused: 0,
             allowance: None,
             window_used: false,
-            save_previous: false,
-            window_open: || WINDOW_OPEN.load(Relaxed),
+            save_previous: None,
+            window: open_window,
         };
         // A list created this boot (or by a crashed one) is only safe to adopt
         // into once its name is durable: fsync() of the file alone does not
@@ -415,7 +497,7 @@ impl<F: ListFile> Guard<F> {
         match file {
             Ok(file) => {
                 if let Err(e) = guard.load(&file) {
-                    pr_warn!(
+                    pr_warn_ratelimited!(
                         "xART guard: the list of Linux's records is unreadable ({:?}); every existing session record is protected and none can be adopted\n",
                         e
                     );
@@ -423,7 +505,7 @@ impl<F: ListFile> Guard<F> {
                     guard.file = Some(file);
                 }
             }
-            Err(e) => pr_warn!(
+            Err(e) => pr_warn_ratelimited!(
                 "xART guard: the list of Linux's records could not be opened ({:?}); every existing session record is protected and none can be adopted\n",
                 e
             ),
@@ -439,7 +521,7 @@ impl<F: ListFile> Guard<F> {
         } else {
             ""
         };
-        pr_info!(
+        pr_info_ratelimited!(
             "xART guard level {}: {} session records exist, {} created by Linux; the other {} are protected{}\n",
             level,
             sessions,
@@ -467,10 +549,11 @@ impl<F: ListFile> Guard<F> {
             }
         }
         if torn != 0 {
-            pr_warn!("xART guard: ignored {} unreadable list entries\n", torn);
+            pr_warn_ratelimited!("xART guard: ignored {} unreadable list entries\n", torn);
         }
         // A torn tail entry is overwritten by the next adoption.
         self.end = (whole * ENTRY_SIZE) as u64;
+        self.loaded_entries = whole as u64;
         Ok(())
     }
 
@@ -482,6 +565,16 @@ impl<F: ListFile> Guard<F> {
     /// Whether Linux's list was loaded. Without it nothing can be adopted.
     pub(crate) fn list_loaded(&self) -> bool {
         self.file.is_some()
+    }
+
+    /// Entries in Linux's list now, or `None` without a list.
+    pub(crate) fn listed_now(&self) -> Option<u64> {
+        self.file.as_ref().map(|_| self.end / ENTRY_SIZE as u64)
+    }
+
+    /// Entries in Linux's list at load, or `None` without a list.
+    pub(crate) fn listed_at_load(&self) -> Option<u64> {
+        self.file.as_ref().map(|_| self.loaded_entries)
     }
 
     fn adopt(&mut self, key: &Key) -> Result<()> {
@@ -516,62 +609,68 @@ impl<F: ListFile> Guard<F> {
             Verdict::Adopt if !write => Ok(()),
             Verdict::Adopt => self.adopt(key).inspect_err(|e| {
                 crate::diag::xart_guard_refused();
-                pr_warn!(
+                pr_warn_ratelimited!(
                     "xART guard: could not list a new kind-{} record as Linux's ({:?}); refusing to write it\n",
                     key.kind,
                     e
                 )
             }),
-            Verdict::Refuse if write && self.take_allowance_for(key) => {
-                self.save_previous = true;
-                Ok(())
-            }
-            Verdict::Refuse => {
-                crate::diag::xart_guard_refused();
-                self.refused += 1;
-                if self.refused <= LOGGED_REFUSALS {
-                    let action = if write { "rewrite" } else { "delete" };
-                    pr_warn!(
-                        "xART guard: refused to {} kind-{} record {}, which this Linux install did not create\n",
-                        action,
-                        key.kind,
-                        Id(&key.uuid)
-                    );
+            Verdict::Refuse if write => match self.take_allowance_for(key) {
+                Some(why) => {
+                    self.save_previous = Some(why);
+                    Ok(())
                 }
-                Err(EPERM)
-            }
+                None => Err(self.refuse(key, write)),
+            },
+            Verdict::Refuse => Err(self.refuse(key, write)),
         }
     }
 
-    /// Uses up the one-time allowance if it covers `key`, or else the boot
-    /// policy window's one rewrite.
-    fn take_allowance_for(&mut self, key: &Key) -> bool {
+    fn refuse(&mut self, key: &Key, write: bool) -> Error {
+        crate::diag::xart_guard_refused();
+        self.refused += 1;
+        if self.refused <= LOGGED_REFUSALS {
+            let action = if write { "rewrite" } else { "delete" };
+            pr_warn_ratelimited!(
+                "xART guard: refused to {} kind-{} record {}, which this Linux install did not create\n",
+                action,
+                key.kind,
+                Id(&key.uuid)
+            );
+        }
+        EPERM
+    }
+
+    /// Uses up the allowance if it covers `key`, else this boot's window
+    /// rewrite.
+    fn take_allowance_for(&mut self, key: &Key) -> Option<Rewrite> {
         if self.allowance.is_some_and(|allowance| allowance.covers(key)) {
             self.allowance = None;
-            return true;
+            return Some(Rewrite::PolicyChange);
         }
-        if key.kind == POLICY_KIND && !self.window_used && (self.window_open)() {
-            self.window_used = true;
-            return true;
+        if key.kind != POLICY_KIND || self.window_used {
+            return None;
         }
-        false
+        let why = (self.window)()?;
+        self.window_used = true;
+        Some(why)
     }
 
-    /// Whether the write [`Guard::check`] just allowed rewrites a record for
-    /// a boot policy change, whose previous value must be saved first.
-    pub(crate) fn take_save_previous(&mut self) -> bool {
-        core::mem::take(&mut self.save_previous)
+    /// Why the write just allowed rewrites an existing record, if it does.
+    pub(crate) fn take_save_previous(&mut self) -> Option<Rewrite> {
+        self.save_previous.take()
     }
 
     /// The previous value could not be saved: the rewrite is refused after
     /// all.
-    pub(crate) fn refuse_unsaved(&mut self, key: &Key, e: Error) {
+    pub(crate) fn refuse_unsaved(&mut self, key: &Key, why: Rewrite, e: Error) {
         crate::diag::xart_guard_refused();
         self.refused += 1;
-        pr_warn!(
-            "xART guard: could not save kind-{} record {} before its boot policy rewrite ({:?}); refusing it\n",
+        pr_warn_ratelimited!(
+            "xART guard: could not save kind-{} record {} before rewriting it {} ({:?}); refusing it\n",
             key.kind,
             Id(&key.uuid),
+            why.describe(),
             e
         );
     }
@@ -587,15 +686,9 @@ mod tests {
         Key::new(4, [byte; 16])
     }
 
-    fn facts(
-        xart_writable: bool,
-        cold: bool,
-        guard: Option<(u8, bool)>,
-        refusals: u32,
-    ) -> Matching {
+    fn facts(xart_writable: bool, guard: Option<(u8, bool)>, refusals: u32) -> Matching {
         MatchFacts {
             xart_writable,
-            cold,
             guard,
             refusals,
         }
@@ -604,30 +697,25 @@ mod tests {
 
     #[test]
     fn matching_without_a_guard_is_usable() {
-        // The Neo (warm, level 0) and an M1 Pro pinned to xart_guard=0 (cold).
-        assert_eq!(facts(true, false, None, 0), Matching::Usable);
-        assert_eq!(facts(true, true, None, 0), Matching::Usable);
+        assert_eq!(facts(true, None, 0), Matching::Usable);
     }
 
     #[test]
-    fn matching_under_a_listed_warm_guard_is_unverified() {
-        // An M2 set up under the guard. An empty list is still "loaded", and
-        // does not make the setup unguarded.
-        assert_eq!(facts(true, false, Some((1, true)), 0), Matching::Unverified);
-        assert_eq!(facts(true, false, Some((2, true)), 0), Matching::Unverified);
+    fn matching_under_a_listed_guard_is_unverified() {
+        // An empty list is still "loaded", and does not make the setup
+        // unguarded.
+        assert_eq!(facts(true, Some((1, true)), 0), Matching::Unverified);
+        assert_eq!(facts(true, Some((2, true)), 0), Matching::Unverified);
     }
 
     #[test]
     fn matching_is_blocked_where_it_is_known_to_be() {
-        // A cold-boot M1-family Mac under the default level 1.
-        assert_eq!(facts(true, true, Some((1, true)), 0), Matching::Blocked);
         // No list: nothing that existed at probe is Linux's.
-        assert_eq!(facts(true, false, Some((1, false)), 0), Matching::Blocked);
+        assert_eq!(facts(true, Some((1, false)), 0), Matching::Blocked);
         // A refusal seen.
-        assert_eq!(facts(true, false, Some((1, true)), 1), Matching::Blocked);
+        assert_eq!(facts(true, Some((1, true)), 1), Matching::Blocked);
         // xART read-only: no guard runs, and no write can land.
-        assert_eq!(facts(false, false, None, 0), Matching::Blocked);
-        assert_eq!(facts(false, true, None, 0), Matching::Blocked);
+        assert_eq!(facts(false, None, 0), Matching::Blocked);
     }
 
     #[test]
@@ -987,9 +1075,10 @@ mod tests {
     fn the_default_follows_the_platform() {
         use crate::profile;
 
+        // Off on M1, whose Touch ID setup rewrites a pre-Linux record.
+        assert_eq!(level(-1, profile::T8103.xart_guard), None);
+        assert_eq!(level(-1, profile::T6000.xart_guard), None);
         // On where Linux shares the enclave with macOS.
-        assert_eq!(level(-1, profile::T8103.xart_guard), Some(1));
-        assert_eq!(level(-1, profile::T6000.xart_guard), Some(1));
         assert_eq!(level(-1, profile::T6020.xart_guard), Some(1));
         assert_eq!(level(-1, profile::T6020_SEPOS13.xart_guard), Some(1));
         assert_eq!(level(-1, profile::T8112.xart_guard), Some(1));
@@ -1039,7 +1128,7 @@ mod tests {
         assert_eq!(guard.check(&policy, false), Err(EPERM));
         assert_eq!(guard.check(&other, true), Err(EPERM));
         assert_eq!(guard.check(&policy, true), Ok(()));
-        assert!(guard.take_save_previous());
+        assert_eq!(guard.take_save_previous(), Some(Rewrite::PolicyChange));
         assert_eq!(guard.check(&policy, true), Err(EPERM));
         // The record is not adopted.
         assert!(bytes.borrow().is_empty());
@@ -1078,18 +1167,117 @@ mod tests {
         let (a, b, c) = (session(1), session(2), Key::new(3, [3; 16]));
         let mut guard = Guard::with_file(1, keys(&[a, b, c])?, Ok(mem(&bytes)));
         // Outside the window nothing changes.
-        guard.window_open = || false;
+        guard.window = || None;
         assert_eq!(guard.check(&a, true), Err(EPERM));
-        guard.window_open = || true;
+        guard.window = || Some(Rewrite::PolicyChange);
         assert_eq!(guard.check(&c, true), Err(EPERM));
         assert_eq!(guard.check(&a, false), Err(EPERM));
         assert_eq!(guard.check(&a, true), Ok(()));
-        assert!(guard.take_save_previous());
-        assert!(!guard.take_save_previous());
+        assert_eq!(guard.take_save_previous(), Some(Rewrite::PolicyChange));
+        assert_eq!(guard.take_save_previous(), None);
         assert_eq!(guard.check(&b, true), Err(EPERM));
         assert_eq!(guard.check(&a, true), Err(EPERM));
         // Not adopted.
         assert!(bytes.borrow().is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn the_create_window_lets_one_kind_4_rewrite_through() -> Result<()> {
+        // A create: one existing kind-4 record rewritten, a new record and a
+        // root written.
+        let bytes = RefCell::new(KVec::new());
+        let attach = session(1);
+        let other = session(2);
+        let kind3 = Key::new(3, [3; 16]);
+        let new = session(9);
+        let mut guard = Guard::with_file(1, keys(&[attach, other, kind3])?, Ok(mem(&bytes)));
+        guard.window = || Some(Rewrite::KeybagCreate);
+        // Never another kind, never a delete.
+        assert_eq!(guard.check(&kind3, true), Err(EPERM));
+        assert_eq!(guard.check(&attach, false), Err(EPERM));
+        // A new record is adopted as before and does not use the window.
+        assert_eq!(guard.check(&new, true), Ok(()));
+        assert_eq!(guard.take_save_previous(), None);
+        assert_eq!(guard.check(&Key::root(2), true), Ok(()));
+        assert_eq!(guard.take_save_previous(), None);
+        // The one rewrite, which saves the previous value first.
+        assert_eq!(guard.check(&attach, true), Ok(()));
+        assert_eq!(guard.take_save_previous(), Some(Rewrite::KeybagCreate));
+        // Only one: neither the same record again nor another one.
+        assert_eq!(guard.check(&attach, true), Err(EPERM));
+        assert_eq!(guard.check(&other, true), Err(EPERM));
+        // Only the new record is Linux's.
+        assert_eq!(listed(&bytes).as_slice(), &[Some(new)]);
+        Ok(())
+    }
+
+    #[test]
+    fn level_2_keeps_the_roots_in_the_create_window() -> Result<()> {
+        let bytes = RefCell::new(KVec::new());
+        let mut guard = Guard::with_file(2, keys(&[session(1)])?, Ok(mem(&bytes)));
+        guard.window = || Some(Rewrite::KeybagCreate);
+        assert_eq!(guard.check(&Key::root(1), true), Err(EPERM));
+        assert_eq!(guard.check(&Key::root(2), true), Err(EPERM));
+        assert_eq!(guard.take_save_previous(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn an_allowance_is_used_before_the_create_window() -> Result<()> {
+        let bytes = RefCell::new(KVec::new());
+        let (named, other) = (session(1), session(2));
+        let mut guard = Guard::with_file(1, keys(&[named, other])?, Ok(mem(&bytes)));
+        guard.allowance = Some(Allowance::Record(named));
+        guard.window = || Some(Rewrite::KeybagCreate);
+        assert_eq!(guard.check(&named, true), Ok(()));
+        assert_eq!(guard.take_save_previous(), Some(Rewrite::PolicyChange));
+        // The window still has its one rewrite.
+        assert_eq!(guard.check(&other, true), Ok(()));
+        assert_eq!(guard.take_save_previous(), Some(Rewrite::KeybagCreate));
+        Ok(())
+    }
+
+    #[test]
+    fn the_list_length_is_kept_from_load() -> Result<()> {
+        let first = session(4);
+        let mut list = list_of(&[first])?;
+        // A torn tail is not an entry yet.
+        list.extend_from_slice(&encode(&session(5))[..10], GFP_KERNEL)?;
+        let bytes = RefCell::new(list);
+        let mut guard = Guard::with_file(1, keys(&[first])?, Ok(mem(&bytes)));
+        assert_eq!(guard.listed_at_load(), Some(1));
+        assert_eq!(guard.listed_now(), Some(1));
+        assert_eq!(guard.check(&session(6), true), Ok(()));
+        assert_eq!(guard.listed_at_load(), Some(1));
+        assert_eq!(guard.listed_now(), Some(2));
+        let unlisted = Guard::<MemFile<'_>>::with_file(1, KVec::new(), Err(ENOENT));
+        assert_eq!(unlisted.listed_at_load(), None);
+        assert_eq!(unlisted.listed_now(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn a_create_that_listed_nothing_may_be_sent_again() {
+        // The list did not grow since the intent: the enclave kept nothing.
+        assert!(may_retry_create(Unfinished::Guarded(0), Some(0)));
+        assert!(may_retry_create(Unfinished::Guarded(3), Some(3)));
+        // It did: a record of that create may exist.
+        assert!(!may_retry_create(Unfinished::Guarded(3), Some(4)));
+        // A list shorter than at the intent was rolled back or replaced.
+        assert!(!may_retry_create(Unfinished::Guarded(3), Some(2)));
+        // No guard, or no list, now: nothing proves it.
+        assert!(!may_retry_create(Unfinished::Guarded(3), None));
+        assert!(!may_retry_create(Unfinished::Unmarked, None));
+        // Sent without a guard: the enclave's records were never listed.
+        assert!(!may_retry_create(Unfinished::Unguarded, Some(0)));
+        assert!(!may_retry_create(Unfinished::Unguarded, None));
+    }
+
+    #[test]
+    fn an_older_intent_may_be_sent_again_only_with_an_empty_list() {
+        // A create the guard refused before intents recorded the list.
+        assert!(may_retry_create(Unfinished::Unmarked, Some(0)));
+        assert!(!may_retry_create(Unfinished::Unmarked, Some(1)));
     }
 }

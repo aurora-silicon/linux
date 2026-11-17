@@ -2221,6 +2221,14 @@ config SND_SOC_TAS2764
 	tristate "Texas Instruments TAS2764 Mono Audio amplifier"
 	depends on I2C
 
+config SND_SOC_TAS2764_KUNIT_TEST
+	bool "KUnit tests for the TAS2764 device tree configuration" if !KUNIT_ALL_TESTS
+	depends on KUNIT && SND_SOC_TAS2764=y && OF_OVERLAY
+	default KUNIT_ALL_TESTS
+	help
+	  Tests of how the TAS2764/SN012776 driver reads the amplifier
+	  configuration that the boot loader copies from the Mac's ADT.
+
 config SND_SOC_TAS2770
 	tristate "Texas Instruments TAS2770 speaker amplifier"
 	depends on I2C

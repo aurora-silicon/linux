@@ -9,6 +9,7 @@
  */
 #include <linux/delay.h>
 #include <linux/log2.h>
+#include <linux/platform_device.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
 
@@ -17,6 +18,7 @@
 #include <media/v4l2-mem2mem.h>
 #include <media/videobuf2-dma-contig.h>
 
+#include "../apple-video-nr.h"
 #include "ave.h"
 #include "ave-regs.h"
 
@@ -54,6 +56,7 @@ static const u32 ave_coded_fmts[] = {
 
 static const u32 ave_raw_fmts[] = {
 	V4L2_PIX_FMT_NV12,
+	V4L2_PIX_FMT_P010,
 };
 
 static const struct v4l2_event ave_eos_event = {
@@ -74,6 +77,26 @@ static bool ave_fmt_listed(const u32 *list, unsigned int n, u32 fourcc)
 	return false;
 }
 
+/* HEVC Main 10 (P010 input) is mapped for the 9003 layout only. */
+static bool ave_main10_supported(const struct ave_dev *ave)
+{
+	return ave->layout && ave->layout->kind == AVE_LAYOUT_9003 &&
+	       !ave->layout->counted;
+}
+
+/*
+ * Whether raw @fourcc can be encoded to @coded on @ave. P010 is only the
+ * input of HEVC Main 10: H.264 has no 10-bit profile here, and the 6070
+ * and 26A428 layouts have no Main 10 fields.
+ */
+static bool ave_raw_fmt_ok(const struct ave_dev *ave, u32 coded, u32 fourcc)
+{
+	if (fourcc == V4L2_PIX_FMT_NV12)
+		return true;
+	return fourcc == V4L2_PIX_FMT_P010 && coded == V4L2_PIX_FMT_HEVC &&
+	       ave_main10_supported(ave);
+}
+
 /* HEVC Main tier levels 5 to 5.2 allow at most this many luma samples. */
 #define AVE_HEVC_MAX_SAMPLES	8912896
 
@@ -87,17 +110,24 @@ static void ave_clamp_size(u32 coded, u32 *w, u32 *h)
 }
 
 /*
- * Raw NV12, one buffer: Y plane, then interleaved CbCr at half height.
- * @coded is the context's coded format, which limits the size.
+ * Raw NV12 or P010, one buffer: Y plane, then interleaved CbCr at half
+ * height. P010 holds 10-bit samples in the high bits of 16-bit words; it
+ * is the input for HEVC Main 10. @coded is the context's coded format,
+ * which limits the size and the formats: a raw format @coded cannot take
+ * becomes NV12, and ENUM_FMT does not list it for @coded.
  */
-static void ave_fill_raw(struct v4l2_pix_format_mplane *f, u32 coded)
+static void ave_fill_raw(const struct ave_dev *ave,
+			 struct v4l2_pix_format_mplane *f, u32 coded)
 {
-	u32 stride, height;
+	u32 stride, height, bytes;
 
-	f->pixelformat = V4L2_PIX_FMT_NV12;
+	if (!ave_raw_fmt_ok(ave, coded, f->pixelformat))
+		f->pixelformat = V4L2_PIX_FMT_NV12;
+	bytes = f->pixelformat == V4L2_PIX_FMT_P010 ? 2 : 1;
 	ave_clamp_size(coded, &f->width, &f->height);
 	/* Keep a client's stride, within reason, rounded to 64 bytes. */
-	stride = ALIGN(clamp_t(u32, f->plane_fmt[0].bytesperline, f->width, 2 * AVE_MAX_W),
+	stride = ALIGN(clamp_t(u32, f->plane_fmt[0].bytesperline, f->width * bytes,
+			       2 * AVE_MAX_W * bytes),
 		       AVE_STRIDE_ALIGN);
 	height = ALIGN(f->height, AVE_STEP);
 	f->num_planes = 1;
@@ -130,7 +160,13 @@ static void ave_reset_fmts(struct ave_ctx *ctx)
 	struct v4l2_pix_format_mplane *src = &ctx->src_fmt, *dst = &ctx->dst_fmt;
 
 	memset(dst, 0, sizeof(*dst));
-	dst->pixelformat = V4L2_PIX_FMT_H264;
+	/*
+	 * OUTPUT formats follow the CAPTURE format, and clients such as
+	 * GStreamer list them before choosing a codec. Start on HEVC where it
+	 * takes P010 so that list has every raw format the device takes.
+	 */
+	dst->pixelformat = ave_main10_supported(ctx->ave) ? V4L2_PIX_FMT_HEVC :
+							     V4L2_PIX_FMT_H264;
 	dst->width = AVE_DEFAULT_W;
 	dst->height = AVE_DEFAULT_H;
 	ave_fill_coded(dst);
@@ -138,7 +174,7 @@ static void ave_reset_fmts(struct ave_ctx *ctx)
 	memset(src, 0, sizeof(*src));
 	src->width = dst->width;
 	src->height = dst->height;
-	ave_fill_raw(src, dst->pixelformat);
+	ave_fill_raw(ctx->ave, src, dst->pixelformat);
 	src->colorspace = V4L2_COLORSPACE_REC709;
 	src->xfer_func = V4L2_XFER_FUNC_DEFAULT;
 	src->ycbcr_enc = V4L2_YCBCR_ENC_DEFAULT;
@@ -169,19 +205,30 @@ static int ave_enum_fmt_cap(struct file *file, void *priv, struct v4l2_fmtdesc *
 	return 0;
 }
 
+/* The raw formats the current coded format can take, as the encoder spec asks. */
 static int ave_enum_fmt_out(struct file *file, void *priv, struct v4l2_fmtdesc *f)
 {
-	if (f->index >= ARRAY_SIZE(ave_raw_fmts))
-		return -EINVAL;
-	f->pixelformat = ave_raw_fmts[f->index];
-	return 0;
+	struct ave_ctx *ctx = ave_file_to_ctx(file);
+	unsigned int n = 0;
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(ave_raw_fmts); i++) {
+		if (!ave_raw_fmt_ok(ctx->ave, ctx->dst_fmt.pixelformat, ave_raw_fmts[i]))
+			continue;
+		if (n++ == f->index) {
+			f->pixelformat = ave_raw_fmts[i];
+			return 0;
+		}
+	}
+	return -EINVAL;
 }
 
 static int ave_enum_framesizes(struct file *file, void *priv, struct v4l2_frmsizeenum *fs)
 {
+	struct ave_ctx *ctx = ave_file_to_ctx(file);
+
 	if (fs->index ||
 	    (!ave_fmt_listed(ave_coded_fmts, ARRAY_SIZE(ave_coded_fmts), fs->pixel_format) &&
-	     !ave_fmt_listed(ave_raw_fmts, ARRAY_SIZE(ave_raw_fmts), fs->pixel_format)))
+	     !ave_raw_fmt_ok(ctx->ave, ctx->dst_fmt.pixelformat, fs->pixel_format)))
 		return -EINVAL;
 	fs->type = V4L2_FRMSIZE_TYPE_STEPWISE;
 	fs->stepwise = (struct v4l2_frmsize_stepwise){
@@ -213,7 +260,7 @@ static int ave_try_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
 	struct ave_ctx *ctx = ave_file_to_ctx(file);
 	struct v4l2_pix_format_mplane *pix = &f->fmt.pix_mp;
 
-	ave_fill_raw(pix, ctx->dst_fmt.pixelformat);
+	ave_fill_raw(ctx->ave, pix, ctx->dst_fmt.pixelformat);
 	if (pix->colorspace == V4L2_COLORSPACE_DEFAULT) {
 		pix->colorspace = ctx->src_fmt.colorspace;
 		pix->xfer_func = ctx->src_fmt.xfer_func;
@@ -223,21 +270,58 @@ static int ave_try_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
 	return 0;
 }
 
+/*
+ * P010 can only be encoded as HEVC Main 10, so S_FMT selects it: a client
+ * that keeps the default profile (GStreamer's v4l2h265enc, FFmpeg) gets a
+ * session for 10-bit input too, and reading the control afterwards gives
+ * the profile the stream has. Going back to NV12 undoes only a Main 10
+ * that S_FMT chose; one the client set stays and is refused at STREAMON,
+ * as is Main set after S_FMT on P010.
+ */
+static void ave_sync_hevc_profile(struct ave_ctx *ctx)
+{
+	/* Only HEVC takes P010, so with H.264 this only undoes an automatic Main 10. */
+	bool ten = ctx->src_fmt.pixelformat == V4L2_PIX_FMT_P010;
+	s32 cur;
+
+	if (!ctx->hevc_profile_ctrl)
+		return;
+	cur = v4l2_ctrl_g_ctrl(ctx->hevc_profile_ctrl);
+	if (ten && cur != V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10) {
+		v4l2_ctrl_s_ctrl(ctx->hevc_profile_ctrl, V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10);
+		ctx->hevc_profile_auto = true;
+	} else if (!ten && cur == V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10 &&
+		   ctx->hevc_profile_auto) {
+		v4l2_ctrl_s_ctrl(ctx->hevc_profile_ctrl, V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN);
+		ctx->hevc_profile_auto = false;
+	}
+}
+
 static int ave_s_fmt_cap(struct file *file, void *priv, struct v4l2_format *f)
 {
 	struct ave_ctx *ctx = ave_file_to_ctx(file);
 	struct vb2_queue *vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx, f->type);
+	struct vb2_queue *out_vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx,
+						   V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE);
 	struct v4l2_pix_format_mplane *pix = &f->fmt.pix_mp;
+	bool raw_ok;
 
 	if (vb2_is_busy(vq))
 		return -EBUSY;
 	/* The coded format comes first; the raw side follows its size. */
 	ave_fill_coded(pix);
+	/* A raw format the new codec cannot take (P010 for H.264) becomes NV12. */
+	raw_ok = ave_raw_fmt_ok(ctx->ave, pix->pixelformat, ctx->src_fmt.pixelformat);
+	if (!raw_ok && vb2_is_busy(out_vq))
+		return -EBUSY;
 	pix->colorspace = ctx->src_fmt.colorspace;
 	pix->xfer_func = ctx->src_fmt.xfer_func;
 	pix->ycbcr_enc = ctx->src_fmt.ycbcr_enc;
 	pix->quantization = ctx->src_fmt.quantization;
 	ctx->dst_fmt = *pix;
+	if (!raw_ok)
+		ave_fill_raw(ctx->ave, &ctx->src_fmt, pix->pixelformat);
+	ave_sync_hevc_profile(ctx);
 	return 0;
 }
 
@@ -254,6 +338,7 @@ static int ave_s_fmt_out(struct file *file, void *priv, struct v4l2_format *f)
 	if (ret)
 		return ret;
 	ctx->src_fmt = *pix;
+	ave_sync_hevc_profile(ctx);
 
 	/* The coded size follows the raw size (crop is the whole frame). */
 	ctx->dst_fmt.width = pix->width;
@@ -413,6 +498,9 @@ static int ave_s_ctrl(struct v4l2_ctrl *ctrl)
 	case V4L2_CID_MPEG_VIDEO_BITRATE_MODE:
 		ctx->bitrate_mode = ctrl->val;
 		break;
+	case V4L2_CID_MPEG_VIDEO_CONSTANT_QUALITY:
+		ctx->quality = ctrl->val;
+		break;
 	case V4L2_CID_MPEG_VIDEO_BITRATE:
 		WRITE_ONCE(ctx->bitrate, ctrl->val);
 		break;
@@ -449,8 +537,15 @@ static int ave_s_ctrl(struct v4l2_ctrl *ctrl)
 	case V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP:
 		ctx->hevc_max_qp = ctrl->val;
 		break;
-	case V4L2_CID_MPEG_VIDEO_HEADER_MODE:
 	case V4L2_CID_MPEG_VIDEO_HEVC_PROFILE:
+		/* ave_sync_hevc_profile() sets the flag again after its own change. */
+		ctx->hevc_profile = ctrl->val;
+		ctx->hevc_profile_auto = false;
+		break;
+	case V4L2_CID_APPLE_AVE_PRIORITIZE_SPEED:
+		ctx->prioritize_speed = ctrl->val;
+		break;
+	case V4L2_CID_MPEG_VIDEO_HEADER_MODE:
 	case V4L2_CID_MIN_BUFFERS_FOR_OUTPUT:
 		break;
 	default:
@@ -463,19 +558,39 @@ static const struct v4l2_ctrl_ops ave_ctrl_ops = {
 	.s_ctrl = ave_s_ctrl,
 };
 
+static const struct v4l2_ctrl_config ave_ctrl_prioritize_speed = {
+	.ops = &ave_ctrl_ops,
+	.id = V4L2_CID_APPLE_AVE_PRIORITIZE_SPEED,
+	.name = "Prioritize Speed Over Quality",
+	.type = V4L2_CTRL_TYPE_BOOLEAN,
+	.max = 1,
+	.step = 1,
+};
+
 static int ave_init_ctrls(struct ave_ctx *ctx)
 {
 	struct v4l2_ctrl_handler *hdl = &ctx->hdl;
 	const struct v4l2_ctrl_ops *ops = &ave_ctrl_ops;
 	struct v4l2_ctrl *c;
 
-	v4l2_ctrl_handler_init(hdl, 17);
+	v4l2_ctrl_handler_init(hdl, 19);
 
-	/* Constant quality needs a quality-to-QP mapping that is not known yet. */
-	v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
-			       V4L2_MPEG_VIDEO_BITRATE_MODE_CBR,
-			       BIT(V4L2_MPEG_VIDEO_BITRATE_MODE_CQ),
-			       V4L2_MPEG_VIDEO_BITRATE_MODE_VBR);
+	/*
+	 * The 6070 firmware path (M1 Pro/Max, M2) is qualified for constant
+	 * quality only: offer just that mode, so a client that keeps the
+	 * defaults (GStreamer, FFmpeg) gets a session instead of a refusal.
+	 */
+	if (ctx->ave->layout && ctx->ave->layout->kind == AVE_LAYOUT_6070)
+		v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
+				       V4L2_MPEG_VIDEO_BITRATE_MODE_CQ,
+				       ~BIT(V4L2_MPEG_VIDEO_BITRATE_MODE_CQ),
+				       V4L2_MPEG_VIDEO_BITRATE_MODE_CQ);
+	else
+		v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
+				       V4L2_MPEG_VIDEO_BITRATE_MODE_CQ, 0,
+				       V4L2_MPEG_VIDEO_BITRATE_MODE_VBR);
+	/* Constant quality: 100 is the best; same scale as VideoToolbox's 0.0-1.0. */
+	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_CONSTANT_QUALITY, 0, 100, 1, 50);
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_BITRATE, 100000, 100000000, 1,
 			  4000000);
 	/*
@@ -510,14 +625,31 @@ static int ave_init_ctrls(struct ave_ctx *ctx)
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_H264_MIN_QP, 0, 51, 1, 0);
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_H264_MAX_QP, 0, 51, 1, 51);
 
-	v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_HEVC_PROFILE,
-			       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN, 0,
-			       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN);
+	/*
+	 * Main 10 takes P010 input: S_FMT sets the profile from the raw format
+	 * and STREAMON checks it. It is offered only where it is mapped.
+	 */
+	if (ave_main10_supported(ctx->ave))
+		ctx->hevc_profile_ctrl =
+			v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_HEVC_PROFILE,
+					       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10,
+					       ~(BIT(V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN) |
+						 BIT(V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN_10)),
+					       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN);
+	else
+		ctx->hevc_profile_ctrl =
+			v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_HEVC_PROFILE,
+					       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN,
+					       ~BIT(V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN),
+					       V4L2_MPEG_VIDEO_HEVC_PROFILE_MAIN);
 	v4l2_ctrl_new_std_menu(hdl, ops, V4L2_CID_MPEG_VIDEO_HEVC_LEVEL,
 			       V4L2_MPEG_VIDEO_HEVC_LEVEL_5_1, 0,
 			       V4L2_MPEG_VIDEO_HEVC_LEVEL_1);
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_HEVC_MIN_QP, 0, 51, 1, 0);
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MPEG_VIDEO_HEVC_MAX_QP, 0, 51, 1, 51);
+
+	/* Off by default: macOS also codes for quality unless asked. */
+	v4l2_ctrl_new_custom(hdl, &ave_ctrl_prioritize_speed, NULL);
 
 	/* The firmware holds up to five frames; one more keeps it fed. */
 	c = v4l2_ctrl_new_std(hdl, ops, V4L2_CID_MIN_BUFFERS_FOR_OUTPUT, 1, 32, 1,
@@ -615,7 +747,7 @@ static void ave_return_bufs(struct ave_ctx *ctx, struct vb2_queue *q,
 
 /* Sessions */
 
-static int ave_session_index(struct ave_dev *ave, struct ave_ctx *ctx)
+int ave_session_index(struct ave_dev *ave, struct ave_ctx *ctx)
 {
 	for (unsigned int i = 0; i < AVE_MAX_SESSIONS; i++)
 		if (ave->sessions[i] == ctx)
@@ -633,10 +765,10 @@ static unsigned int ave_session_count(struct ave_dev *ave)
 }
 
 /*
- * Drain (with @flush), stop and close the session in the firmware. The
+ * Drain normally, or Flush an aborted 6070 stream, then Stop and Close. The
  * last session to go halts the firmware. Caller holds hw_lock.
  */
-static void ave_session_close(struct ave_ctx *ctx, bool flush)
+static void ave_session_close(struct ave_ctx *ctx, bool drain)
 {
 	struct ave_dev *ave = ctx->ave;
 	struct ave_session *sess = ctx->sess;
@@ -646,13 +778,35 @@ static void ave_session_close(struct ave_ctx *ctx, bool flush)
 	if (!sess || idx < 0)
 		return;
 	if (sess->fw_open && ave->fw_state == AVE_FW_RUNNING) {
+		int err = 0;
+
 		/* Complete is a barrier: answered after every frame before it. */
-		if (flush && sess->frames && !ave_cmd_complete(ctx, AVE_DRAIN_COMPLETES))
+		if (drain && sess->frames) {
+			err = ave_cmd_complete(ctx, AVE_DRAIN_COMPLETES);
+			if (!err)
+				err = ave_ipc_settle(ave, AVE_FRAME_WAIT_MS);
+		} else if (!drain && sess->handed &&
+			   !ave->layout->abi->transport->boot_config &&
+			   !ave_cmd_flush(ctx)) {
 			ave_ipc_settle(ave, AVE_FRAME_WAIT_MS);
-		if (ave->fw_state == AVE_FW_RUNNING)
-			ave_cmd_close(ctx);
+		}
+		if (ave->fw_state == AVE_FW_RUNNING) {
+			int cerr = ave_cmd_close(ctx);
+
+			err = err ?: cerr;
+		}
+		/*
+		 * An MCTF session whose Complete or Close went unanswered, or
+		 * with frames still out, stays live in the firmware: fail the
+		 * firmware so only a proven power cycle ends it.
+		 */
+		if (ctx->mctf && (err || sess->busy) &&
+		    ave->fw_state == AVE_FW_RUNNING) {
+			dev_err(ave->dev, "MCTF session close not confirmed (%d, %u frames out)\n",
+				err, sess->busy);
+			ave_fw_mark_broken(ave, err ?: -EBUSY, "Close");
+		}
 	}
-	sess->fw_open = false;
 	ave->sessions[idx] = NULL;
 	if (!ave_session_count(ave))
 		ave_fw_halt(ave);
@@ -667,14 +821,15 @@ static int ave_session_attach(struct ave_ctx *ctx)
 {
 	struct ave_dev *ave = ctx->ave;
 	struct ave_session *sess = ctx->sess;
+	unsigned int max_sessions = ave->layout->max_sessions ?: AVE_MAX_SESSIONS;
 	int idx = -1, ret;
 
 	lockdep_assert_held(&ave->hw_lock);
-	for (unsigned int i = 0; i < AVE_MAX_SESSIONS && idx < 0; i++)
+	for (unsigned int i = 0; i < max_sessions && idx < 0; i++)
 		if (!ave->sessions[i])
 			idx = i;
 	if (idx < 0) {
-		dev_err(ave->dev, "already encoding %u streams\n", AVE_MAX_SESSIONS);
+		dev_err(ave->dev, "already encoding %u streams\n", max_sessions);
 		return -EBUSY;
 	}
 	if (!ave_session_count(ave)) {
@@ -690,9 +845,11 @@ static int ave_session_attach(struct ave_ctx *ctx)
 	sess->frames = 0;
 	sess->nudged = false;
 	ave->sessions[idx] = ctx;
-	ret = ave_cmd_open(ctx);
+	ret = ctx->mctf ? ave_sess_mctf_borrow(ctx) : 0;
 	if (!ret)
-		ret = ave_cmd_start(ctx);
+		ret = ave_cmd_open(ctx);
+	if (!ret)
+		ret = ctx->mctf ? ave_mctf_cmd_start(ctx) : ave_cmd_start(ctx);
 	if (ret)
 		ave_session_close(ctx, false);
 	return ret;
@@ -744,6 +901,9 @@ static void ave_session_free(struct ave_ctx *ctx)
 		if (s->src)
 			v4l2_m2m_buf_done(s->src, VB2_BUF_STATE_ERROR);
 		s->src = NULL;
+		if (s->dst)
+			v4l2_m2m_buf_done(s->dst, VB2_BUF_STATE_ERROR);
+		s->dst = NULL;
 	}
 	atomic_set(&ctx->ready, 0);
 	ave_sess_destroy(ctx);
@@ -755,15 +915,26 @@ static void ave_session_free(struct ave_ctx *ctx)
 static int ave_session_begin(struct ave_ctx *ctx)
 {
 	struct ave_dev *ave = ctx->ave;
+	struct iommu_domain *domain;
 	struct ave_session *sess;
 	bool pm_lost;
 	int ret;
 
 	if (ctx->sess)
 		return 0;
-	ret = ave_fw_check_build(ave);
+	/* The domain type can still change (DMA to DMA-FQ) while bound. */
+	domain = iommu_get_domain_for_dev(ave->dev);
+	if (!domain || !ave_domain_type_safe(domain->type)) {
+		dev_err(ave->dev,
+			"encoder DMA domain is not strict (type %#x); refusing to start\n",
+			domain ? domain->type : 0);
+		return -EPERM;
+	}
+	ret = ctx->mctf ? ave_mctf_check_build(ave) : ave_fw_check_build(ave);
 	if (ret)
 		return ret;
+	if (ave->layout->max_sessions == 1 && READ_ONCE(ave->sessions[0]))
+		return -EBUSY;
 	if (READ_ONCE(ave->sessions[0]) && READ_ONCE(ave->sessions[1]))
 		return -EBUSY;
 	/* A halted firmware restarts only from reset: let the power go first. */
@@ -799,7 +970,7 @@ static int ave_session_begin(struct ave_ctx *ctx)
  * Open and Start it again with the same parameters; its next frame is an
  * IDR with fresh parameter sets, so the stream stays decodable.
  */
-static int ave_session_reopen(struct ave_ctx *ctx)
+int ave_session_reopen(struct ave_ctx *ctx)
 {
 	bool pm_lost;
 	int ret;
@@ -892,7 +1063,7 @@ static void ave_stop_streaming(struct vb2_queue *q)
 		WRITE_ONCE(ctx->failed, false);
 }
 
-static const struct vb2_ops ave_qops = {
+const struct vb2_ops ave_qops = {
 	.queue_setup = ave_queue_setup,
 	.buf_prepare = ave_buf_prepare,
 	.buf_queue = ave_buf_queue,
@@ -933,11 +1104,12 @@ static int ave_queue_init(void *priv, struct vb2_queue *src, struct vb2_queue *d
 /*
  * Jobs. A job delivers finished frames to CAPTURE buffers and sends at most
  * one new frame. Up to five frames are inside the firmware at once; their
- * answers are collected by the job and, while frames are outstanding, by a
- * short poller, since the firmware interrupt is not wired up.
+ * answers are collected by the job and, between jobs, by the poll work, which
+ * the mailbox interrupt queues. While frames are outstanding the poll work
+ * also runs every AVE_WATCH_MS to catch a stuck or starved session.
  */
 
-#define AVE_POLL_MS		2
+#define AVE_WATCH_MS		25
 
 static int ave_job_ready(void *priv)
 {
@@ -1049,7 +1221,7 @@ static int ave_encode_one(struct ave_ctx *ctx)
 	ret = ave_sess_input(ctx, slot, src, &input);
 	if (!ret)
 		ret = ave_cmd_process(ctx, slot, src, input, READ_ONCE(ctx->bitrate),
-				      xchg(&ctx->force_key_frame, false));
+				      xchg(&ctx->force_key_frame, false), last);
 	if (ret) {
 		v4l2_m2m_buf_done(src, VB2_BUF_STATE_ERROR);
 		return ret;
@@ -1110,7 +1282,7 @@ static bool ave_finish_drain(struct ave_ctx *ctx)
 }
 
 /* The firmware or the session failed: return everything, fail the queues. */
-static void ave_job_fail(struct ave_ctx *ctx, int err)
+void ave_job_fail(struct ave_ctx *ctx, int err)
 {
 	struct ave_dev *ave = ctx->ave;
 	struct v4l2_m2m_ctx *m2m = ctx->fh.m2m_ctx;
@@ -1193,14 +1365,17 @@ static void ave_run_work(struct work_struct *work)
 		ctx->stopped = true;
 		v4l2_event_queue_fh(&ctx->fh, &ave_eos_event);
 	} else if (poll) {
-		mod_delayed_work(ave->wq, &ctx->poll_work, msecs_to_jiffies(AVE_POLL_MS));
+		mod_delayed_work(ave->wq, &ctx->poll_work, msecs_to_jiffies(AVE_WATCH_MS));
 	}
 finish:
 	pm_runtime_mark_last_busy(ave->dev);
 	v4l2_m2m_job_finish(ave->m2m_dev, m2m);
 }
 
-/* Collect frame answers while frames are outstanding and no job runs. */
+/*
+ * Collect frame answers that came in while no job ran, and watch sessions
+ * with frames outstanding.
+ */
 static void ave_poll_work(struct work_struct *work)
 {
 	struct ave_ctx *ctx = container_of(to_delayed_work(work), struct ave_ctx, poll_work);
@@ -1244,7 +1419,25 @@ static void ave_poll_work(struct work_struct *work)
 	else if (atomic_read(&ctx->ready))
 		v4l2_m2m_try_schedule(ctx->fh.m2m_ctx);
 	if (again)
-		queue_delayed_work(ave->wq, &ctx->poll_work, msecs_to_jiffies(AVE_POLL_MS));
+		queue_delayed_work(ave->wq, &ctx->poll_work, msecs_to_jiffies(AVE_WATCH_MS));
+}
+
+/*
+ * The mailbox interrupt came while no ring wait ran: take the event and let
+ * the sessions it may concern deliver. Jobs and poll work run on the same
+ * ordered queue, so none runs right now.
+ */
+static void ave_irq_work(struct work_struct *work)
+{
+	struct ave_dev *ave = container_of(work, struct ave_dev, irq_work);
+
+	mutex_lock(&ave->hw_lock);
+	if (ave->fw_state == AVE_FW_RUNNING)
+		ave_ipc_pump(ave, 0, NULL, NULL);
+	for (unsigned int i = 0; i < AVE_MAX_SESSIONS; i++)
+		if (ave->sessions[i] && atomic_read(&ave->sessions[i]->ready))
+			mod_delayed_work(ave->wq, &ave->sessions[i]->poll_work, 0);
+	mutex_unlock(&ave->hw_lock);
 }
 
 static void ave_device_run(void *priv)
@@ -1335,10 +1528,16 @@ int ave_v4l2_register(struct ave_dev *ave)
 	ave->wq = alloc_ordered_workqueue("apple-ave", WQ_MEM_RECLAIM);
 	if (!ave->wq)
 		return -ENOMEM;
+	INIT_WORK(&ave->irq_work, ave_irq_work);
+	ret = ave_ipc_irq_init(ave, to_platform_device(ave->dev));
+	if (ret) {
+		dev_err_probe(ave->dev, ret, "cannot get the mailbox interrupt\n");
+		goto err_wq;
+	}
 
 	ret = v4l2_device_register(ave->dev, &ave->v4l2_dev);
 	if (ret)
-		goto err_wq;
+		goto err_irq;
 
 	ave->m2m_dev = v4l2_m2m_init(&ave_m2m_ops);
 	if (IS_ERR(ave->m2m_dev)) {
@@ -1356,15 +1555,23 @@ int ave_v4l2_register(struct ave_dev *ave)
 	vdev->device_caps = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING;
 	video_set_drvdata(vdev, ave);
 
-	ret = video_register_device(vdev, VFL_TYPE_VIDEO, -1);
+	ret = video_register_device(vdev, VFL_TYPE_VIDEO, APPLE_M2M_VIDEO_NR);
 	if (ret)
 		goto err_m2m;
+	ret = ave_mctf_register(ave);
+	if (ret)
+		goto err_vdev;
 	return 0;
 
+err_vdev:
+	video_unregister_device(vdev);
 err_m2m:
 	v4l2_m2m_release(ave->m2m_dev);
 err_v4l2:
 	v4l2_device_unregister(&ave->v4l2_dev);
+err_irq:
+	free_irq(ave->irq, ave);
+	cancel_work_sync(&ave->irq_work);
 err_wq:
 	destroy_workqueue(ave->wq);
 	return ret;
@@ -1372,8 +1579,11 @@ err_wq:
 
 void ave_v4l2_unregister(struct ave_dev *ave)
 {
+	ave_mctf_unregister(ave);
 	video_unregister_device(&ave->vdev);
 	v4l2_m2m_release(ave->m2m_dev);
 	v4l2_device_unregister(&ave->v4l2_dev);
+	free_irq(ave->irq, ave);
+	cancel_work_sync(&ave->irq_work);
 	destroy_workqueue(ave->wq);
 }

@@ -12,7 +12,7 @@ def extract(s,n):
  while depth:depth+=(s[b]=='{')-(s[b]=='}');b+=1
  return s[m.start():b]+'\n'
 s=(r/'drivers/bluetooth/hci_bcm4377.c').read_text();core=(r/'net/bluetooth/hci_sync.c').read_text();core_hci=(r/'net/bluetooth/hci_core.c').read_text()
-names=['bcm4377_setup_retry_allowed','bcm4377_queue_setup_retry','bcm4377_setup_retry_work','bcm4377_resume_recovery_supported','bcm4377_resume_recovery_allowed','bcm4377_resume_recovery_invalidate','bcm4377_resume_recovery_sync','bcm4377_resume_recovery_destroy','bcm4377_resume_recovery_work','bcm4377_hci_timeout','bcm4377_resume_recovery_stop','bcm4377_hci_open','bcm4377_hci_close','bcm4377_hci_setup_once','bcm4377_hci_setup','bcm4377_hci_post_init','bcm4377_hci_unregister_dev','bcm4377_suspend','bcm4377_resume']
+names=['bcm4377_setup_retry_allowed','bcm4377_queue_setup_retry','bcm4377_setup_retry_work','bcm4377_resume_recovery_supported','bcm4377_resume_recovery_allowed','bcm4377_resume_recovery_invalidate','bcm4377_resume_recovery_sync','bcm4377_resume_recovery_destroy','bcm4377_resume_recovery_work','bcm4377_hci_timeout','bcm4377_resume_recovery_stop','bcm4377_hci_open','bcm4377_hci_close','bcm4377_hci_setup_once','bcm4377_hci_setup','bcm4377_hci_post_init','bcm4377_hci_unregister_dev','bcm4377_sleep_finish','bcm4377_suspend','bcm4377_resume']
 bodies={n:extract(s,n) for n in names};shared=[]
 if a.old_ref:
  old=subprocess.check_output(['git','show',a.old_ref+':drivers/bluetooth/hci_bcm4377.c'],cwd=r,text=True)

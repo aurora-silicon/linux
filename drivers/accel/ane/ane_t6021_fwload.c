@@ -633,8 +633,53 @@ int ane_t6021_fwload_probe(struct ane_t6021 *ane)
 		return ret;
 	}
 
-	release_firmware(fw);
+	ane->fw_image = fw;
 	return 0;
+}
+
+bool ane_t6021_fwload_recoverable(struct ane_t6021 *ane)
+{
+	return fw_load && ane->fw_buf && ane->fw_image &&
+	       ane->fw_size >= ANE_FW_BUF_SIZE &&
+	       !ane_t6021_fw_alias_is_reserved(ane->dev);
+}
+
+/* Restore the validated image in its existing owned mappings. The caller
+ * has stopped the old CPU through genpd; no alias is removed or recreated.
+ */
+int ane_t6021_fwload_reload(struct ane_t6021 *ane)
+{
+	const struct ane_t602x_soc *soc = of_device_get_match_data(ane->dev);
+	const struct ane_fw_image *img = soc->fw;
+	struct ane_fw_seg segs[ANE_FW_NSEGS];
+	const struct firmware *fw = ane->fw_image;
+	const char *reason = NULL;
+	u8 actual_sha[32];
+	u64 entry;
+	int ret;
+
+	if (!ane_t6021_fwload_recoverable(ane))
+		return -EOPNOTSUPP;
+	sha256(fw->data, fw->size, actual_sha);
+	ret = ane_fw_validate_blob(fw->data, fw->size, img, actual_sha,
+				   segs, &entry, &reason);
+	if (ret)
+		goto out;
+	for (unsigned int i = 0; i < ANE_FW_NSEGS; i++) {
+		if (segs[i].vmaddr > ane->fw_size ||
+		    segs[i].filesize > ane->fw_size - segs[i].vmaddr) {
+			ret = -E2BIG;
+			goto out;
+		}
+	}
+	memset(ane->fw_buf, 0, ane->fw_size);
+	for (unsigned int i = 0; i < ANE_FW_NSEGS; i++)
+		if (segs[i].filesize)
+			memcpy(ane->fw_buf + segs[i].vmaddr,
+			       fw->data + segs[i].fileoff, segs[i].filesize);
+	ret = ane_t6021_fw_patch(ane, ane->fw_buf);
+out:
+	return ret;
 }
 
 void ane_t6021_fwload_remove(struct ane_t6021 *ane)
@@ -655,6 +700,8 @@ void ane_t6021_fwload_remove(struct ane_t6021 *ane)
 					    ane->fw_alias_ext_len[i]);
 		ane->fw_alias_extn = 0;
 	}
+	release_firmware(ane->fw_image);
+	ane->fw_image = NULL;
 	if (!ane->fw_buf)
 		return;
 	dma_free_coherent(ane->dev, ane->fw_size, ane->fw_buf, ane->fw_iova);

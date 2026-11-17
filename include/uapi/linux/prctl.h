@@ -442,4 +442,79 @@ struct prctl_mm_map {
 #define PR_AURORA_SET_DEFAULT_PAGE_SIZE 0x41555003
 #define PR_AURORA_GET_DEFAULT_PAGE_SIZE 0x41555004
 
+/*
+ * Aurora experimental ABI: Apple x86 parity and adjust flags (APFLG).
+ * With ON, flag-setting integer instructions of the calling thread also
+ * compute the x86 parity flag (set for an even number of one bits in the
+ * low byte of the result) into NZCV bit 26 and the x86 adjust flag (carry
+ * or borrow out of bit 3) into NZCV bit 27, and MRS/MSR NZCV read and write
+ * both. Signal frames and ptrace carry them in the same pstate bits.
+ * GET returns ON or OFF. Both fail with EINVAL on CPUs without APFLG.
+ * The setting is per thread, inherited by fork and clone, and reset to OFF
+ * by execve.
+ * HWCAP3_APPLE_APFLG in AT_HWCAP3 and "apple_apflg" in /proc/cpuinfo say
+ * whether this is available.
+ */
+#define PR_AURORA_GET_X86_FLAGS		0x41555005
+#define PR_AURORA_SET_X86_FLAGS		0x41555006
+# define PR_AURORA_X86_FLAGS_OFF	0
+# define PR_AURORA_X86_FLAGS_ON		1
+
+/*
+ * Aurora experimental ABI: Apple x86 floating-point mode (AFP).
+ * With ON, floating point in the calling thread follows x86 SSE rules:
+ * operations that produce a default NaN return 0xffc00000/0xfff8000000000000,
+ * FMAX and FMIN return their second operand when either operand is a NaN or
+ * both are zeros, and FPCR.FZ is ignored. The thread may then use AFPCR_EL0
+ * (S3_6_C15_C2_5): bit 0 is DAZ (denormal inputs as zero), bit 1 is FTZ
+ * (flush denormal results to zero); EL0 accesses to it trap while OFF.
+ * Turning it ON clears AFPCR_EL0. GET returns ON or OFF. Both fail with
+ * EINVAL on CPUs without AFP. Mode and AFPCR_EL0 are per thread, inherited
+ * by fork and clone, and reset by execve. Signal frames save and restore
+ * AFPCR_EL0 (APPLE_AFPCR_MAGIC); ptrace and core dumps carry it as the
+ * NT_AURORA_APPLE_AFPCR regset.
+ * HWCAP3_APPLE_AFP in AT_HWCAP3 and "apple_afp" in /proc/cpuinfo say
+ * whether this is available.
+ */
+#define PR_AURORA_GET_X86_FP		0x41555007
+#define PR_AURORA_SET_X86_FP		0x41555008
+# define PR_AURORA_X86_FP_OFF		0
+# define PR_AURORA_X86_FP_ON		1
+
+/*
+ * Aurora experimental ABI: Apple scalar FP upper-lane preservation (PRSV).
+ * With ON, scalar floating-point instructions of the calling thread keep
+ * the elements above the result in the destination vector register, as
+ * x86 SSE scalar instructions do: two-operand arithmetic such as FADD,
+ * FMUL, FDIV, FMAX and FCSEL takes them from the first source, FMADD-style
+ * instructions from the addend, compares from the second source. One-
+ * operand instructions, conversions, FMOV and loads still zero them.
+ * GET returns ON or OFF. Both fail with EINVAL on CPUs without PRSV.
+ * The setting is per thread, inherited by fork and clone, and reset to OFF
+ * by execve.
+ * HWCAP3_APPLE_PRSV in AT_HWCAP3 and "apple_prsv" in /proc/cpuinfo say
+ * whether this is available.
+ */
+#define PR_AURORA_GET_FP_PRESERVE	0x41555009
+#define PR_AURORA_SET_FP_PRESERVE	0x4155500a
+# define PR_AURORA_FP_PRESERVE_OFF	0
+# define PR_AURORA_FP_PRESERVE_ON	1
+
+/*
+ * Aurora experimental ABI: Apple AMX matrix coprocessor.
+ * Threads may use AMX directly: the first AMX instruction of a thread enables
+ * it for that thread, and its register file then follows the thread across
+ * context switches and CPU migration. fork and clone copy it; execve drops it.
+ * GET returns AVAILABLE before the calling thread has used AMX and IN_USE
+ * after; it fails with EINVAL where AMX is absent or disabled (apple_amx=off).
+ * A signal handler starts with AMX clear; the interrupted register file is
+ * in the frame (APPLE_AMX_MAGIC) and sigreturn reloads it. ptrace and core
+ * dumps carry it as the NT_AURORA_APPLE_AMX regset.
+ * HWCAP3_APPLE_AMX in AT_HWCAP3 and "apple_amx" in /proc/cpuinfo say
+ * whether this is available.
+ */
+#define PR_AURORA_GET_AMX		0x4155500b
+# define PR_AURORA_AMX_AVAILABLE	0
+# define PR_AURORA_AMX_IN_USE		1
+
 #endif /* _LINUX_PRCTL_H */

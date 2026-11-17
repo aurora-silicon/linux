@@ -240,7 +240,7 @@ if [ -n "$bindgen_alignment_code" ] ||
 		echo >&2 "*** Rust bindings generator '$BINDGEN'"
 		echo >&2 "*** does not preserve empty struct alignment."
 	fi
-	echo >&2 "*** Default Asahi builds can fail the sched_statistics layout assertion."
+	echo >&2 "*** Types containing an aligned empty struct can fail their layout assertions."
 	echo >&2 "*** Prepare the corrected generator before configuring the kernel:"
 	echo >&2 "***   python3 tools/aurora-bindgen/build.py"
 	echo >&2 "*** See Documentation/rust/bindgen-layout-checks.rst for details."

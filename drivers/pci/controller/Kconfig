@@ -83,6 +83,14 @@ config PCIE_APPLE
 
 	  If unsure, say Y if you have an Apple Silicon system.
 
+config PCIE_APPLE_MSI
+	bool "Apple PCIe MSI controller for a bootloader-trained port"
+	depends on PCIE_APPLE=y
+	select IRQ_MSI_LIB
+	help
+	  MSIs for an Apple PCIe port that Linux drives as a generic ECAM
+	  host because the bootloader trained the link (T8142 Wi-Fi).
+
 config PCI_VERSATILE
 	bool "ARM Versatile PB PCI controller"
 	depends on ARCH_VERSATILE || COMPILE_TEST

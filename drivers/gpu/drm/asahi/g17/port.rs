@@ -91,8 +91,8 @@ unsafe impl Sync for Views {}
 #[pin_data]
 pub(super) struct Port {
     views: SetOnce<Views>,
-    /// Register access for tracing the core power state at the doorbell.
     regs: SetOnce<crate::regs::G17Resources>,
+    registration: SetOnce<super::fw::variant::QueueRegistration>,
     /// Compute work-ring slots reserved by publishers that have not exposed them yet.
     #[pin]
     rings: SpinLock<[u32; PRIORITIES]>,
@@ -163,6 +163,7 @@ impl Port {
             pin_init!(Self {
                 views: SetOnce::new(),
                 regs: SetOnce::new(),
+                registration: SetOnce::new(),
                 rings <- new_spinlock!([0; PRIORITIES], "g17::Port::rings"),
                 qos <- new_spinlock!(qos::Accounting::new(), "g17::Port::qos"),
                 rx: SetOnce::new(),
@@ -182,19 +183,47 @@ impl Port {
     }
 
     /// Called once while the session is built, before any publisher can see the port.
-    pub(super) fn attach(&self, views: Views, regs: crate::regs::G17Resources) -> Result {
-        // SAFETY: The session's primary coprocessor owns the mailbox and outlives the port, and
-        // with it every use of the handle.
+    pub(super) fn attach(
+        &self,
+        views: Views,
+        regs: crate::regs::G17Resources,
+        registration: super::fw::variant::QueueRegistration,
+        clamp_rx: bool,
+    ) -> Result {
+        // SAFETY: The session owns the mailbox and outlives every port user.
         let rx = unsafe { (*views.mailbox).rx_util_min_handle() };
-        if self.views.populate(views) && self.regs.populate(regs) && self.rx.populate(rx) {
+        // Without `clamp_rx` (M5) no handle is attached and the receive thread keeps its
+        // default; rx_update() then returns at once.
+        if self.views.populate(views)
+            && self.regs.populate(regs)
+            && self.registration.populate(registration)
+            && (!clamp_rx || self.rx.populate(rx))
+        {
             Ok(())
         } else {
             Err(EBUSY)
         }
     }
 
+    pub(super) fn register_queues(&self, queues: &[super::fw::kick::KsmQueue]) -> Result {
+        use super::fw::variant::QueueRegistration;
+        if self.registration.as_ref() != Some(&QueueRegistration::Mailbox) {
+            return Ok(());
+        }
+        let regs = self.regs.as_ref().ok_or(ENODEV)?;
+        for queue in queues {
+            regs.register_ksm_queue(queue.qid, queue.descriptor)?;
+        }
+        Ok(())
+    }
+
     fn views(&self) -> Result<&Views> {
         self.views.as_ref().ok_or(ENODEV)
+    }
+
+    /// Both MMU fault banks, for recovery diagnostics while the firmware is halted.
+    pub(super) fn fault_banks(&self) -> Result<[(u64, u64); 2]> {
+        self.regs.as_ref().ok_or(ENODEV)?.fault_banks()
     }
 
     fn ring(&self, priority: u8) -> Result<(usize, RingView)> {
@@ -427,6 +456,16 @@ impl Port {
         self.qos.lock().cancel(&view, publication)
     }
 
+    /// Clears the QoS table rows of released QoS IDs (`QosIds::forget_released`); returns
+    /// those left because work still runs on them.
+    pub(super) fn qos_forget(&self, ids: u128) -> Result<u128> {
+        if ids == 0 {
+            return Ok(0);
+        }
+        let view = self.qos_view()?;
+        Ok(self.qos.lock().forget(&view, ids))
+    }
+
     pub(super) fn qos_complete(&self, owners: &[qos::Owner]) -> Result {
         let view = self.qos_view()?;
         self.qos.lock().complete(&view, owners)?;
@@ -434,10 +473,10 @@ impl Port {
         Ok(())
     }
 
-    /// Requests the receive thread's minimum utilization for the feed's current view of the GPU.
-    /// Called at every publication and completion: the feed's state lingers for a few
-    /// milliseconds, so after a pause the publication that ends it restores the default before
-    /// its completion arrives.
+    /// Requests the receive thread's minimum utilization for the feed's current view of the GPU,
+    /// where the port clamps it (not on M5, see attach()). Called at every publication and
+    /// completion: the feed's state lingers for a few milliseconds, so after a pause the
+    /// publication that ends it restores the default before its completion arrives.
     fn rx_update(&self) {
         let Some(rx) = self.rx.as_ref() else {
             return;
@@ -500,6 +539,11 @@ impl Port {
     pub(super) fn set_effort_full(&self, full: bool) {
         self.effort_full.store(full, Ordering::SeqCst);
         self.demand.set_active(full);
+    }
+
+    /// The next statistics drain and reader discard what the decoder holds.
+    pub(super) fn statistics_epoch_bump(&self) {
+        self.statistics_epoch.fetch_add(1, Ordering::Release);
     }
 
     pub(super) fn statistics_epoch(&self) -> u64 {

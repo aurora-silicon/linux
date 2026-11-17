@@ -79,10 +79,8 @@ static ktime_t ns_to_ktime(ktime_t t){return t;}
 static ktime_t ktime_us_delta(ktime_t a,ktime_t b){return (a-b)/1000;}
 static u64 div_u64(u64 a,u64 b){return a/b;}
 static u64 mul_u32_u32(unsigned a,unsigned b){return (u64)a*b;}
-static bool t8140;
-static bool of_machine_is_compatible(const char *s){return t8140&&!strcmp(s,"apple,t8140");}
-static bool t6041;
-static bool of_device_is_compatible(const struct device_node *np,const char *s){(void)np;return t6041&&!strcmp(s,"apple,t6041-cpuidle");}
+static const char *machine;
+static bool of_machine_compatible_match(const char *const *c){for(;machine&&*c;c++)if(!strcmp(*c,machine))return true;return false;}
 static int cpu_pm_enter(void){pm++;return pm_fail;}
 static void cpu_pm_exit(void){pm--;}
 static void apple_cpu_deep_wfi(void){deep++;}
@@ -100,8 +98,8 @@ static void cpu_do_idle(void){
     if(faulty_irq)irq[current]=0;
 }
 static struct cpuidle_driver original;
-static void reset(bool is_t8140){
-    apple_idle_driver=original;t8140=is_t8140;t6041=false; current=0;
+static void reset(const char *m){
+    apple_idle_driver=original;machine=m; current=0;
     memset(cpuidle_dev,0,sizeof(cpuidle_dev)); memset(registered,0,sizeof(registered));
     for(int i=0;i<6;i++){irq[i]=1;rcu[i]=stopped[i]=0;}
     wfi=deep=pm=pm_fail=warnings=unregistered=0;reg_fail=-1;drv_fail=0;
@@ -110,7 +108,7 @@ static void reset(bool is_t8140){
 }
 int main(void){
     original=apple_idle_driver;
-    reset(true);check(!apple_cpuidle_probe(&pdev));
+    reset("apple,t8140");check(!apple_cpuidle_probe(&pdev));
     check(apple_idle_driver.cpumask==cpu_possible_mask);check(!apple_idle_driver.bctimer);
     for(int i=0;i<6;i++)check(registered[i]&&cpuidle_dev[i].cpu==i);
     int expected=EXPECT_FIXED?1:0;
@@ -126,34 +124,35 @@ int main(void){
         check(apple_idle_driver.states[1].exit_latency_ns==1000);
         check(apple_idle_driver.states[1].target_residency_ns==1000);
         check(apple_idle_driver.states[1].power_usage==apple_idle_driver.states[0].power_usage);
-        reset(true);apple_cpuidle_probe(&pdev);fanout=1;
+        reset("apple,t8140");apple_cpuidle_probe(&pdev);fanout=1;
         check(cpuidle_enter_s2idle(&apple_idle_driver,&cpuidle_dev[0],100000)==1);
         check(wfi==6&&deep==0&&pm==0);check(tk_suspend==1&&tk_resume==1);
         check(sched_suspend==1&&sched_resume==1&&local_suspend==5&&local_resume==5);
         check(tick_freeze_depth==0&&!frozen);
         for(int i=0;i<6;i++)check(cpuidle_dev[i].states_usage[1].s2idle_usage==1&&rcu[i]==0&&stopped[i]==0);
-        reset(true);apple_cpuidle_probe(&pdev);fanout=1;cpuidle_dev[5].states_usage[1].disable=1;
+        reset("apple,t8140");apple_cpuidle_probe(&pdev);fanout=1;cpuidle_dev[5].states_usage[1].disable=1;
         cpuidle_enter_s2idle(&apple_idle_driver,&cpuidle_dev[0],100000);
         check(wfi==5&&tk_suspend==0&&tk_resume==0&&tick_freeze_depth==0);
-        reset(true);apple_cpuidle_probe(&pdev);cpuidle_dev[0].states_usage[1].disable=1;
+        reset("apple,t8140");apple_cpuidle_probe(&pdev);cpuidle_dev[0].states_usage[1].disable=1;
         check(cpuidle_enter_s2idle(&apple_idle_driver,&cpuidle_dev[0],100000)==0&&wfi==0);
         cpuidle_dev[0].states_usage[1].disable=0;apple_idle_driver.states[1].enter_s2idle=NULL;
         check(cpuidle_enter_s2idle(&apple_idle_driver,&cpuidle_dev[0],100000)==0&&wfi==0);
-        reset(true);apple_cpuidle_probe(&pdev);
+        reset("apple,t8140");apple_cpuidle_probe(&pdev);
         check(cpuidle_enter_s2idle(&apple_idle_driver,&cpuidle_dev[0],999)==0);
         check(cpuidle_enter_s2idle(&apple_idle_driver,&cpuidle_dev[0],1000)==1);
-        reset(true);apple_cpuidle_probe(&pdev);apple_idle_driver.states[1].exit_latency_ns=0;
+        reset("apple,t8140");apple_cpuidle_probe(&pdev);apple_idle_driver.states[1].exit_latency_ns=0;
         check(find_deepest_state(&apple_idle_driver,&cpuidle_dev[0],100000,0,true)==0);
-        reset(true);apple_cpuidle_probe(&pdev);apple_idle_driver.states[1].flags=CPUIDLE_FLAG_TIMER_STOP;
+        reset("apple,t8140");apple_cpuidle_probe(&pdev);apple_idle_driver.states[1].flags=CPUIDLE_FLAG_TIMER_STOP;
         check(find_deepest_state(&apple_idle_driver,&cpuidle_dev[0],100000,CPUIDLE_FLAG_TIMER_STOP,false)==0);
-        reset(true);apple_cpuidle_probe(&pdev);faulty_irq=1;
+        reset("apple,t8140");apple_cpuidle_probe(&pdev);faulty_irq=1;
         check(cpuidle_enter_s2idle(&apple_idle_driver,&cpuidle_dev[0],100000)==1);
         check(warnings==1&&tick_freeze_depth==0&&rcu[0]==0&&stopped[0]==0);
     }
-    reset(true);apple_cpuidle_probe(&pdev);
+    reset("apple,t8140");apple_cpuidle_probe(&pdev);
     for(int i=0;i<apple_idle_driver.state_count;i++)check(apple_idle_driver.states[i].enter(&cpuidle_dev[0],&apple_idle_driver,i)==i);
     check(deep==0&&pm==0);
-    reset(false);apple_cpuidle_probe(&pdev);
+    /* M1 to M3 keep CPU PD. */
+    reset("apple,t8103");apple_cpuidle_probe(&pdev);
     check(apple_idle_driver.state_count==2&&apple_idle_driver.states[1].enter==apple_enter_idle);
     check(apple_idle_driver.states[1].flags==CPUIDLE_FLAG_RCU_IDLE);
     check(find_deepest_state(&apple_idle_driver,&cpuidle_dev[0],100000,0,true)==1);
@@ -161,16 +160,19 @@ int main(void){
     pm_fail=1;check(apple_enter_idle(&cpuidle_dev[0],&apple_idle_driver,1)==-1&&deep==1);pm=0;
     check(cpuidle_enter_s2idle(&apple_idle_driver,&cpuidle_dev[0],100000)==1);
     check(tick_freeze_depth==0&&cpuidle_dev[0].states_usage[1].s2idle_usage==1&&deep==1);pm=0;
-    /* T6041 (M4 Pro): matched by its cpuidle node, the same WFI-only states as T8140. */
-    reset(false);t6041=true;check(!apple_cpuidle_probe(&pdev));
-    check(apple_idle_driver.state_count==2&&apple_idle_driver.states[1].enter==apple_enter_wfi);
-    check(apple_idle_driver.states[1].enter_s2idle==apple_enter_wfi&&apple_idle_driver.states[1].flags==0);
-    check(find_deepest_state(&apple_idle_driver,&cpuidle_dev[0],100000,0,true)==1);
-    check(cpuidle_enter_s2idle(&apple_idle_driver,&cpuidle_dev[0],100000)==1);
-    check(local_suspend==1&&local_resume==1&&deep==0&&pm==0&&tick_freeze_depth==0&&!frozen);
-    reset(true);reg_fail=3;check(apple_cpuidle_probe(&pdev)==-5&&unregistered==1);
+    /* A WFI-only M4 part that still probes (it has a cpuidle node): same states as T8140. */
+    {
+        const char *m="apple,t6041";
+        reset(m);check(!apple_cpuidle_probe(&pdev));
+        check(apple_idle_driver.state_count==2&&apple_idle_driver.states[1].enter==apple_enter_wfi);
+        check(apple_idle_driver.states[1].enter_s2idle==apple_enter_wfi&&apple_idle_driver.states[1].flags==0);
+        check(find_deepest_state(&apple_idle_driver,&cpuidle_dev[0],100000,0,true)==1);
+        check(cpuidle_enter_s2idle(&apple_idle_driver,&cpuidle_dev[0],100000)==1);
+        check(local_suspend==1&&local_resume==1&&deep==0&&pm==0&&tick_freeze_depth==0&&!frozen);
+    }
+    reset("apple,t8140");reg_fail=3;check(apple_cpuidle_probe(&pdev)==-5&&unregistered==1);
     for(int i=0;i<6;i++)check(!registered[i]);
-    reset(true);drv_fail=1;check(apple_cpuidle_probe(&pdev)==-5&&unregistered==0);
+    reset("apple,t8140");drv_fail=1;check(apple_cpuidle_probe(&pdev)==-5&&unregistered==0);
     printf("%s: %d assertions passed; actual selector/wrapper/driver/tick bodies, mocked hardware/locks/timekeeping\n",EXPECT_FIXED?"patched":"parent",checks);
     return 0;
 }

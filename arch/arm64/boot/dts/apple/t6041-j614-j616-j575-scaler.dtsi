@@ -1,0 +1,189 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Disabled M4 Max scaler resources from the preferred live J616c description. */
+/* MSR-DART gate IDs 425/457 alias physical MSR0/MSR1; do not duplicate MMIO providers. */
+
+&pmgr_aux {
+	ps_msr0: ps_msr0_dart: power-controller@470 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x470 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "msr0";
+		power-domains = <&ps_fab5_soc>;
+		status = "disabled";
+	};
+};
+
+&pmgr_aux {
+	ps_msr0_ase_core: power-controller@478 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x478 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "msr0_ase_core";
+		power-domains = <&ps_msr0>;
+		status = "disabled";
+	};
+};
+
+&pmgr_aux {
+	ps_fab5_soc: power-controller@440 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x440 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "fab5_soc";
+		power-domains = <&ps_afi>;
+		apple,always-on;
+		status = "disabled";
+	};
+};
+
+/* PMGR group 1 resolves via ps-groups to the main bank at 0x502280000. */
+&pmgr {
+	ps_msr1: ps_msr1_dart: power-controller@3b0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3b0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "msr1";
+		power-domains = <&ps_fab6_soc>;
+		status = "disabled";
+	};
+
+	ps_msr1_ase_core: power-controller@3b8 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3b8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "msr1_ase_core";
+		power-domains = <&ps_msr1>;
+		status = "disabled";
+	};
+};
+
+/ {
+	scaler0_dart: iommu@521260000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x5 0x21260000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x300 0x0>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1548 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_msr0_dart>;
+		status = "disabled";
+	};
+
+	scaler1_dart: iommu@587260000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x5 0x87260000 0x0 0x20000>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x300 0x0>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1554 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_msr1_dart>;
+		status = "disabled";
+	};
+
+	scaler0: scaler@521000000 {
+		compatible = "apple,t6041-scaler", "apple,scaler";
+		reg = <0x5 0x21000000 0x0 0x38000>,
+		      <0x5 0x21210000 0x0 0x4000>,
+		      <0x5 0x21204000 0x0 0x4000>,
+		      <0x5 0x20000000 0x0 0x8000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1547 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 1549 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_msr0>, <&ps_msr0_ase_core>;
+		resets = <&ps_msr0>;
+		iommus = <&scaler0_dart 0>, <&scaler0_dart 1>;
+		clocks = <&max_scaler_clocks 417>;
+		status = "disabled";
+	};
+
+	scaler1: scaler@587000000 {
+		compatible = "apple,t6041-scaler", "apple,scaler";
+		reg = <0x5 0x87000000 0x0 0x38000>,
+		      <0x5 0x87210000 0x0 0x4000>,
+		      <0x5 0x87204000 0x0 0x4000>,
+		      <0x5 0x86000000 0x0 0x8000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1553 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 1555 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_msr1>, <&ps_msr1_ase_core>;
+		resets = <&ps_msr1>;
+		iommus = <&scaler1_dart 0>, <&scaler1_dart 1>;
+		clocks = <&max_scaler_clocks 418>;
+		status = "disabled";
+	};
+
+	max_scaler_clocks: clock-controller@502800000 {
+		compatible = "apple,t6041-pmgr-clocks", "apple,pmgr-clocks";
+		reg = <0x5 0x02800000 0x0 0x1e0000>,
+		      <0x5 0x08300000 0x0 0x80000>,
+		      <0x5 0x02280000 0x0 0x100000>,
+		      <0x5 0x00000000 0x0 0x80000>,
+		      <0x5 0x08200000 0x0 0x80000>,
+		      <0x5 0x08004000 0x0 0x1000>,
+		      <0x2 0x10e20000 0x0 0x2000>,
+		      <0x2 0x10050000 0x0 0xef1000>,
+		      <0x2 0x10e40000 0x0 0x9000>,
+		      <0x2 0x10e50000 0x0 0xe81000>,
+		      <0x2 0x10e70000 0x0 0x1000>,
+		      <0x2 0x10050000 0x0 0x10000>,
+		      <0x2 0x10150000 0x0 0x10000>,
+		      <0x2 0x10250000 0x0 0x10000>,
+		      <0x2 0x10350000 0x0 0x10000>,
+		      <0x2 0x11e20000 0x0 0x2000>,
+		      <0x2 0x11050000 0x0 0xef1000>,
+		      <0x2 0x11e40000 0x0 0xb000>,
+		      <0x2 0x11e50000 0x0 0xe81000>,
+		      <0x2 0x11e70000 0x0 0x1000>,
+		      <0x2 0x11050000 0x0 0x10000>,
+		      <0x2 0x11150000 0x0 0x10000>,
+		      <0x2 0x11250000 0x0 0x10000>,
+		      <0x2 0x11350000 0x0 0x10000>,
+		      <0x2 0x11450000 0x0 0x10000>,
+		      <0x2 0x11550000 0x0 0x10000>,
+		      <0x2 0x12e20000 0x0 0x2000>,
+		      <0x2 0x12050000 0x0 0xef1000>,
+		      <0x2 0x12e40000 0x0 0xb000>,
+		      <0x2 0x12e50000 0x0 0xe81000>,
+		      <0x2 0x12e70000 0x0 0x1000>,
+		      <0x2 0x12050000 0x0 0x10000>,
+		      <0x2 0x12150000 0x0 0x10000>,
+		      <0x2 0x12250000 0x0 0x10000>,
+		      <0x2 0x12350000 0x0 0x10000>,
+		      <0x2 0x12450000 0x0 0x10000>,
+		      <0x2 0x12550000 0x0 0x10000>,
+		      <0x5 0x02800000 0x0 0x18000>,
+		      <0x5 0x0282c000 0x0 0x4000>,
+		      <0x5 0x02850000 0x0 0x4000>,
+		      <0x5 0x02880000 0x0 0x1c000>,
+		      <0x5 0x02900000 0x0 0x24000>,
+		      <0x5 0x028f0000 0x0 0x4000>,
+		      <0x5 0x028e0000 0x0 0x4000>,
+		      <0x5 0x02820000 0x0 0x4000>,
+		      <0x5 0x08330000 0x0 0x10000>,
+		      <0x5 0x08374000 0x0 0x4000>,
+		      <0x5 0x08360000 0x0 0x4000>,
+		      <0x5 0x00200000 0x0 0x8000>,
+		      <0x5 0x00400000 0x0 0x34000>,
+		      <0x5 0x003c0000 0x0 0x30000>,
+		      <0x5 0x08800000 0x0 0xa8000>,
+		      <0x4 0x85878000 0x0 0x4000>,
+		      <0x2 0x88eb0000 0x0 0x4000>,
+		      <0x2 0x88e80000 0x0 0x30000>,
+		      <0x5 0x08900000 0x0 0x18000>,
+		      <0x5 0x00210000 0x0 0x8000>,
+		      <0x5 0x0020c000 0x0 0x4000>,
+		      <0x5 0x08004000 0x0 0x1000>,
+		      <0x5 0x0007a000 0x0 0x4000>,
+		      <0x5 0x04000000 0x0 0x1000000>,
+		      <0x2 0x88e1c000 0x0 0x4000>,
+		      <0x5 0x022a0000 0x0 0x4000>;
+		#clock-cells = <1>;
+		apple,pmgr = <&pmgr>;
+		status = "disabled";
+	};
+};

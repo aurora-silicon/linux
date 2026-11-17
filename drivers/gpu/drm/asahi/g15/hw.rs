@@ -46,15 +46,12 @@ pub(crate) enum Platform {
 pub(crate) enum Board {
     /// The hash-checked T6030 templates ([`super::board`]).
     Templates,
-    /// The three images built from the device tree ([`super::board::record`],
-    /// [`super::board::device_tree`]) and cross-checked against a firmware file holding the
-    /// machine's own ([`super::board::blob`], pinned by its SHA-256), which also supplies the
-    /// record's words the device tree does not carry ([`super::board::record::FROM_FILE`]); a
-    /// difference refuses admission, before any firmware is touched.
-    Blob {
-        name: &'static kernel::str::CStr,
-        sha256: [u8; 32],
-    },
+    /// The three images built from the device tree and the ADT's sensor rows
+    /// ([`super::board::record`], [`super::board::device_tree`]), with the SoC's reference
+    /// words for what neither carries ([`super::board::record::Reference`]). A value the
+    /// builder refuses stops admission, before any firmware is touched.
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    DeviceTree(&'static super::board::record::Reference),
     /// No board data: admission refuses the SoC before anything firmware-visible.
     None,
 }
@@ -153,6 +150,21 @@ pub(crate) mod t6030 {
           FirmwareBuild {
             name: "J516S B0 RTKit-2419.140.12 (maintained 14.x handoff)",
             machine: Some(kernel::c_str!("apple,j516s")),
+            text_size: 0x5c000,
+            data_size: 0x114000,
+            marker: 0x58e88,
+            text_sha256: [
+                0xda, 0x26, 0xec, 0xca, 0xb1, 0xf8, 0x59, 0x8d,
+                0xa8, 0x0c, 0x85, 0x5e, 0xca, 0x91, 0x65, 0x20,
+                0x40, 0x6d, 0x1d, 0x06, 0x70, 0xf1, 0xd4, 0x70,
+                0xe7, 0x9b, 0xb9, 0xb0, 0x22, 0x09, 0xdb, 0x53,
+            ],
+          },
+          // The J514S (14-inch) boot chain loads the same B0 image: its
+          // measured TEXT digest, sizes and marker match the J516S row above.
+          FirmwareBuild {
+            name: "J514S B0 RTKit-2419.140.12 (maintained 14.x handoff)",
+            machine: Some(kernel::c_str!("apple,j514s")),
             text_size: 0x5c000,
             data_size: 0x114000,
             marker: 0x58e88,
@@ -516,8 +528,6 @@ pub(crate) mod sizes {
     pub(crate) const AHEAD_RECORDS: u32 = 64;
     /// Policy bound on logical queues reported in QUEUE_LIMITS (not a firmware limit).
     pub(crate) const MAX_QUEUES: u32 = 58;
-    /// TTBAT user slots: user VMs hold one each for their lifetime (ASIDs 1..63).
-    pub(crate) const MAX_VMS: u32 = 63;
 }
 
 /// Firmware channels, doorbells, seeds and identifiers.
@@ -571,11 +581,25 @@ pub(crate) mod tuning {
     pub(crate) const SLOT_ROTATE: bool = true;
     /// Flights per VM.
     pub(crate) const MAX_INFLIGHT: u32 = 2;
-    /// PB growth through event 7 / DEVCTL 7, initial and maximum blocks.
+    /// PB growth through event 7 / DEVCTL 7, from the initial posting of [`PB_BLOCKS`].
     pub(crate) const PB_GROW: bool = true;
-    /// Initial PB blocks, and the most that may be posted: one below the mapped heap's block
-    /// count, so the block-list producer (modulo K = 4096) never returns to 0.
-    pub(crate) const PB_BLOCKS: u32 = 1024;
+    /// PB blocks posted at (re)initialization: 64 blocks of 128 KiB (8 MiB).
+    pub(crate) const PB_BLOCKS: u32 = 64;
+    /// PB reclaim when the engine is idle: 0 never, 1 re-initialize, 2 also free the backing
+    /// above the initial posting and the reserve.
+    pub(crate) const PB_RECLAIM: u32 = 2;
+    /// Idle time before a PB reclaim, ms.
+    pub(crate) const PB_IDLE_MS: u32 = 1000;
+    /// Posted PB blocks above which an idle engine reclaims the PB.
+    pub(crate) const PB_RECLAIM_BLOCKS: u32 = 1024;
+    /// Renders before the TA stamp wrap within which the TA/FS stamps are renumbered while
+    /// nothing is in flight (the wrap is at about 16.7 million renders).
+    pub(crate) const STAMP_RESEED_MARGIN: u64 = 100_000;
+    /// Computes before the compute stamp wrap within which the compute stamp is renumbered
+    /// while nothing is in flight (the wrap is at 4128768 computes).
+    pub(crate) const COMPUTE_RESEED_MARGIN: u64 = 100_000;
+    /// The most PB blocks that may be posted: one below the mapped heap's block count, so the
+    /// block-list producer (modulo K = 4096) never returns to 0.
     pub(crate) const PB_MAX_BLOCKS: u32 = super::sizes::PB_BLOCKS - 1;
     /// At the host deadline, arm the firmware kill.
     pub(crate) const HANG_PREEMPT: bool = true;

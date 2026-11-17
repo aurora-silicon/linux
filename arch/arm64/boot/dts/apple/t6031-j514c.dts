@@ -30,18 +30,20 @@
 	brcm,board-type = "apple,texa";
 };
 
-/*
- * The J514S values (t6030-j514s.dts): the same chassis and panel.
- * Not yet read from a J514C.
- */
+/* The J514S panel: the same chassis. Not yet read from a J514C. */
 &dcp {
-	panel {
+	panel: panel {
 		compatible = "apple,panel-j514", "apple,panel-mini-led", "apple,panel";
 		width-mm = <302>;
 		height-mm = <196>;
 		adj-height-mm = <189>;
 		apple,max-brightness = <500>;
 	};
+};
+
+&framebuffer0 {
+	panel = <&panel>;
+	post-init-providers = <&panel>;
 };
 
 &aop_audio {
@@ -54,11 +56,19 @@
 	model = "MacBook Pro J514";
 };
 
-&smc_hwmon {
-	/* Assumed to match J516c; unavailable firmware keys are skipped. */
-	apple,soc-die-keys = "Tf04", "Tf06", "Tf09", "Tf0A", "Tf0B",
-			     "Tf14", "Tf16", "Tf19", "Tf1A", "Tf1B",
-			     "Tf24", "Tf26", "Tf29", "Tf2A", "Tf2B",
-			     "Tf34", "Tf36", "Tf39", "Tf3A", "Tf3B",
-			     "Tf44", "Tf46", "Tf49", "Tf4A", "Tf4B";
+
+&i2c4 {
+	sd_card_control: card-control@20 {
+		compatible = "apple,t6031-sd-card-control", "apple,sd-card-control";
+		reg = <0x20>;
+		status = "disabled";
+	};
+};
+
+&i2c8 {
+	display_pcon: display-converter@8 {
+		compatible = "apple,t6031-display-pcon", "apple,display-pcon";
+		reg = <0x8>;
+		status = "disabled";
+	};
 };

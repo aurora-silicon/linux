@@ -76,4 +76,41 @@ static inline int apple_qspi_mx_status_allows_write(unsigned int sr,
 {
 	return !(sr & 0x03) && !(sr & 0x3c & ~bp_ok);
 }
+
+/* JEDEC manufacturer ID of GigaDevice parts. */
+#define APPLE_QSPI_MFR_GIGADEVICE	0xc8
+
+/*
+ * GigaDevice GD25UF16E. SR1 holds WIP, WEL, five block-protect bits BP[4:0]
+ * at bits 6:2 and SRP0. SR2 holds SRP1, QE, SUS2 at bit 2, LB[3:1], CMP and
+ * SUS1 at bit 7. SR3 holds output drive, dummy-cycle and low-power settings
+ * and has no write-protect selection. BUSY and WEL, both suspend bits and
+ * CMP are always refused. BP[2:0] sit where they do on Winbond parts and
+ * are tolerated only where bp_ok allows them; BP3 and BP4 move or shrink
+ * the protected range and are refused unless bp_ok names them. SRP0, SRP1,
+ * QE and LB stay unchanged.
+ */
+static inline int apple_qspi_gd_status_allows_write(unsigned int sr1,
+						    unsigned int sr2,
+						    unsigned int bp_ok)
+{
+	return !(sr1 & 0x03) && !(sr1 & 0x7c & ~bp_ok) && !(sr2 & 0xc4);
+}
+
+/* Pick the status checks from the manufacturer the flash itself reports. */
+static inline int apple_qspi_part_status_allows_write(unsigned int mfr,
+						      unsigned int sr1,
+						      unsigned int sr2,
+						      unsigned int sr3,
+						      unsigned int bp_ok)
+{
+	switch (mfr) {
+	case APPLE_QSPI_MFR_MACRONIX:
+		return apple_qspi_mx_status_allows_write(sr1, bp_ok);
+	case APPLE_QSPI_MFR_GIGADEVICE:
+		return apple_qspi_gd_status_allows_write(sr1, sr2, bp_ok);
+	default:
+		return apple_qspi_status_allows_write(sr1, sr2, sr3, bp_ok);
+	}
+}
 #endif

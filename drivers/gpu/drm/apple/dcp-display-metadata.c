@@ -143,25 +143,133 @@ static int dcp_metadata_color(struct edid *edid, const struct dcp_display_metada
 	return 0;
 }
 
-/* Build only a base block: the authoritative firmware mode list stays separate. */
+/*
+ * CIE x/y given in 1/10000, as published, rounded to 1/65536. Plain
+ * arithmetic: DIV_ROUND_CLOSEST() is not a constant expression.
+ */
+#define DCP_CIE(v)	(((v) * 65536U + 5000) / 10000)
+/* Nominal SDR gamma 2.2 in 16.16. */
+#define DCP_GAMMA_2_2	((22U * 65536 + 5) / 10)
+
+/*
+ * Standard primaries and D65 white of IEC 61966-2-1 (sRGB) and SMPTE EG 432-1
+ * (Display P3). These name the panel's calibrated default target; per-unit
+ * factory calibration is applied by the DCP and never reported here.
+ */
+static const struct dcp_color_space dcp_color_spaces[] = {
+	{
+		.name = "srgb",
+		.chromaticity = {
+			{ DCP_CIE(6400), DCP_CIE(3300) },
+			{ DCP_CIE(3000), DCP_CIE(6000) },
+			{ DCP_CIE(1500), DCP_CIE(600) },
+		},
+		.white = { DCP_CIE(3127), DCP_CIE(3290) },
+		.gamma = DCP_GAMMA_2_2,
+	}, {
+		.name = "display-p3",
+		.chromaticity = {
+			{ DCP_CIE(6800), DCP_CIE(3200) },
+			{ DCP_CIE(2650), DCP_CIE(6900) },
+			{ DCP_CIE(1500), DCP_CIE(600) },
+		},
+		.white = { DCP_CIE(3127), DCP_CIE(3290) },
+		.gamma = DCP_GAMMA_2_2,
+	},
+};
+
+const struct dcp_color_space *dcp_color_space_lookup(const char *name)
+{
+	for (unsigned int i = 0; name && i < ARRAY_SIZE(dcp_color_spaces); i++)
+		if (!strcmp(name, dcp_color_spaces[i].name))
+			return &dcp_color_spaces[i];
+	return ERR_PTR(-EINVAL);
+}
+
+const struct dcp_color_space *dcp_panel_gamut_color_space(enum dcp_panel_gamut gamut)
+{
+	switch (gamut) {
+	case DCP_PANEL_GAMUT_SRGB:
+		return dcp_color_space_lookup("srgb");
+	case DCP_PANEL_GAMUT_DISPLAY_P3:
+		return dcp_color_space_lookup("display-p3");
+	default:
+		return NULL;
+	}
+}
+
+/*
+ * Firmware chromaticities win. Without a complete, valid set, use the panel's
+ * named target. Without either the block keeps its nominal white only.
+ */
+static void dcp_panel_color(struct edid *edid, const struct dcp_display_metadata *metadata,
+			    const struct dcp_color_space *target)
+{
+	struct dcp_display_metadata named = {};
+
+	if (!dcp_metadata_color(edid, metadata) || !target)
+		return;
+	memcpy(named.chromaticity, target->chromaticity, sizeof(named.chromaticity));
+	memcpy(named.white, target->white, sizeof(named.white));
+	named.gamma = target->gamma;
+	dcp_metadata_color(edid, &named);
+}
+
+/* EDID 1.4 dummy descriptor: a placeholder for an unused 18-byte slot. */
+#define DCP_EDID_DETAIL_DUMMY	0x10
+
+/*
+ * The descriptor only names the sink's preferred timing: a sync polarity the
+ * firmware does not report is given as positive, and the authoritative mode
+ * list stays separate.
+ */
+static void dcp_metadata_timing_polarity(struct drm_display_mode *mode)
+{
+	if (!(mode->flags & (DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_NHSYNC)))
+		mode->flags |= DRM_MODE_FLAG_PHSYNC;
+	if (!(mode->flags & (DRM_MODE_FLAG_PVSYNC | DRM_MODE_FLAG_NVSYNC)))
+		mode->flags |= DRM_MODE_FLAG_PVSYNC;
+}
+
+/* Whether @mode fits an EDID detailed timing. */
+bool dcp_metadata_timing_fits(const struct drm_display_mode *mode)
+{
+	const struct dcp_display_metadata none = {};
+	struct detailed_timing timing;
+	struct drm_display_mode m = *mode;
+
+	dcp_metadata_timing_polarity(&m);
+	return !dcp_metadata_timing(&timing, &m, &none);
+}
+
+/*
+ * Build only a base block: the authoritative firmware mode list stays
+ * separate. What the sink leaves out stays undefined, as in its own EDID: no
+ * image size, the sRGB primaries, no manufacture week. Without a timing that
+ * fits a detailed timing descriptor, the first descriptor is a dummy one.
+ */
 static int dcp_metadata_block(struct edid *edid, const struct dcp_display_metadata *metadata,
 			      const struct drm_display_mode *mode)
 {
+	bool sized = metadata->width_cm && metadata->width_cm <= 255 &&
+		     metadata->height_cm && metadata->height_cm <= 255;
+	bool dated = metadata->year >= 1990 && metadata->year <= 2245 &&
+		     (metadata->week <= 53 || metadata->week == 255);
+	struct dcp_display_metadata image = *metadata;
 	u32 manufacturer = 0;
 	u8 checksum = 0;
 	int ret;
 
-	if (!metadata->width_cm || metadata->width_cm > 255 ||
-	    !metadata->height_cm || metadata->height_cm > 255 ||
-	    metadata->product > U16_MAX || metadata->week > 53 ||
-	    metadata->year < 1990 || metadata->year > 2245 ||
-	    metadata->gamma < 65536 || metadata->gamma > (354U << 16) / 100 ||
-	    strnlen(metadata->manufacturer, 4) != 3)
+	if (metadata->product > U16_MAX || strnlen(metadata->manufacturer, 4) != 3)
 		return -EINVAL;
 	for (unsigned int i = 0; i < 3; i++) {
 		if (metadata->manufacturer[i] < 'A' || metadata->manufacturer[i] > 'Z')
 			return -EINVAL;
 		manufacturer = manufacturer << 5 | (metadata->manufacturer[i] - '@');
+	}
+	if (!sized) {
+		image.width_cm = 0;
+		image.height_cm = 0;
 	}
 
 	memset(edid, 0, sizeof(*edid));
@@ -169,23 +277,34 @@ static int dcp_metadata_block(struct edid *edid, const struct dcp_display_metada
 	edid->product_id.manufacturer_name = cpu_to_be16(manufacturer);
 	edid->product_id.product_code = cpu_to_le16(metadata->product);
 	edid->product_id.serial_number = cpu_to_le32(metadata->serial);
-	edid->product_id.week_of_manufacture = metadata->week;
-	edid->product_id.year_of_manufacture = metadata->year - 1990;
+	edid->product_id.week_of_manufacture = dated ? metadata->week : 0;
+	edid->product_id.year_of_manufacture = dated ? metadata->year - 1990 : 0;
 	edid->version = 1;
 	edid->revision = 4;
 	/* No claim about connector interface, bit depth, HDR, audio or VRR. */
 	edid->input = DRM_EDID_INPUT_DIGITAL;
-	edid->width_cm = metadata->width_cm;
-	edid->height_cm = metadata->height_cm;
-	ret = dcp_metadata_color(edid, metadata);
-	if (ret)
-		return ret;
+	edid->width_cm = image.width_cm;
+	edid->height_cm = image.height_cm;
+	dcp_panel_color(edid, metadata, dcp_color_space_lookup("srgb"));
 	edid->features = DRM_EDID_FEATURE_PREFERRED_TIMING | DRM_EDID_FEATURE_RGB;
 	memset(edid->standard_timings, 1, sizeof(edid->standard_timings));
-	ret = dcp_metadata_timing(&edid->detailed_timings[0], mode, metadata);
-	if (!ret)
-		ret = dcp_metadata_text(&edid->detailed_timings[1], EDID_DETAIL_MONITOR_NAME,
-					metadata->name);
+	ret = -EINVAL;
+	if (mode) {
+		struct drm_display_mode m = *mode;
+
+		dcp_metadata_timing_polarity(&m);
+		ret = dcp_metadata_timing(&edid->detailed_timings[0], &m, &image);
+	}
+	if (ret) {
+		memset(&edid->detailed_timings[0], 0, sizeof(edid->detailed_timings[0]));
+		edid->detailed_timings[0].data.other_data.type = DCP_EDID_DETAIL_DUMMY;
+		edid->features &= ~DRM_EDID_FEATURE_PREFERRED_TIMING;
+	}
+	ret = metadata->name[0] ?
+		dcp_metadata_text(&edid->detailed_timings[1], EDID_DETAIL_MONITOR_NAME,
+				  metadata->name) :
+		dcp_metadata_text(&edid->detailed_timings[1], EDID_DETAIL_MONITOR_STRING,
+				  "DCP display");
 	if (!ret)
 		ret = dcp_metadata_text(&edid->detailed_timings[2], EDID_DETAIL_MONITOR_STRING,
 					"DCP metadata");
@@ -334,6 +453,7 @@ static int dcp_panel_range_byte(u32 limit, u8 *out, u8 *offsets, u8 flag)
  * conformity. DRM still enumerates TimingElements, never these rounded bytes.
  */
 const struct drm_edid *dcp_panel_edid(const struct dcp_display_metadata *metadata,
+				      const struct dcp_color_space *target,
 				      const struct dcp_display_mode *modes, unsigned int count,
 				      u32 width_mm, u32 height_mm)
 {
@@ -417,7 +537,7 @@ const struct drm_edid *dcp_panel_edid(const struct dcp_display_metadata *metadat
 	block.white_y = 337 >> 2;
 	block.blue_white_lo = (320 & 3) << 2 | (337 & 3);
 	/* Missing or malformed optional colour data leaves the identity usable. */
-	dcp_metadata_color(&block, metadata);
+	dcp_panel_color(&block, metadata, target);
 	block.features = DRM_EDID_FEATURE_PREFERRED_TIMING;
 	memset(block.standard_timings, 1, sizeof(block.standard_timings));
 	snprintf(name, sizeof(name), "%.3s %04x", metadata->manufacturer, metadata->product);

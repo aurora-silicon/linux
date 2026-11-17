@@ -205,6 +205,8 @@ struct typec_thunderbolt_switch_dev;
 #define TYPEC_THUNDERBOLT_SWITCH_READY 2
 /* The consumer powered down for system sleep and needs a fresh cable read. */
 #define TYPEC_THUNDERBOLT_SWITCH_RESTORE 3
+/* Sent to typec_thunderbolt_switch_watch() notifiers: a switch registered. */
+#define TYPEC_THUNDERBOLT_SWITCH_ADDED 4
 
 enum typec_thunderbolt_switch_state {
 	TYPEC_THUNDERBOLT_SWITCH_OFF,
@@ -251,6 +253,7 @@ struct typec_thunderbolt_switch_desc {
 struct typec_thunderbolt_switch *
 fwnode_typec_thunderbolt_switch_get(struct fwnode_handle *fwnode);
 void typec_thunderbolt_switch_put(struct typec_thunderbolt_switch *sw);
+bool typec_thunderbolt_switch_is_live(struct typec_thunderbolt_switch *sw);
 int typec_thunderbolt_switch_set(struct typec_thunderbolt_switch *sw,
 				 const struct typec_thunderbolt_switch_data *data);
 int typec_thunderbolt_switch_register_notifier(struct typec_thunderbolt_switch *sw,
@@ -260,6 +263,8 @@ void typec_thunderbolt_switch_unregister_notifier(struct typec_thunderbolt_switc
 void typec_thunderbolt_switch_notify(struct typec_thunderbolt_switch_dev *sw);
 void typec_thunderbolt_switch_notify_ready(struct typec_thunderbolt_switch_dev *sw);
 void typec_thunderbolt_switch_notify_restore(struct typec_thunderbolt_switch_dev *sw);
+int typec_thunderbolt_switch_watch(struct notifier_block *nb);
+void typec_thunderbolt_switch_unwatch(struct notifier_block *nb);
 
 struct typec_thunderbolt_switch_dev *
 typec_thunderbolt_switch_register(struct device *parent,
@@ -298,6 +303,12 @@ typec_thunderbolt_switch_register(struct device *parent,
 	return ERR_PTR(-EOPNOTSUPP);
 }
 
+static inline bool
+typec_thunderbolt_switch_is_live(struct typec_thunderbolt_switch *sw)
+{
+	return false;
+}
+
 static inline int
 typec_thunderbolt_switch_register_notifier(struct typec_thunderbolt_switch *sw,
 					   struct notifier_block *nb)
@@ -323,6 +334,15 @@ typec_thunderbolt_switch_notify_ready(struct typec_thunderbolt_switch_dev *sw)
 
 static inline void
 typec_thunderbolt_switch_notify_restore(struct typec_thunderbolt_switch_dev *sw)
+{
+}
+
+static inline int typec_thunderbolt_switch_watch(struct notifier_block *nb)
+{
+	return 0;
+}
+
+static inline void typec_thunderbolt_switch_unwatch(struct notifier_block *nb)
 {
 }
 

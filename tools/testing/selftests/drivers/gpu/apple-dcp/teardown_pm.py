@@ -92,18 +92,22 @@ struct xhci_hcd { atomic_int xhc_state; struct clk *clk,*reg_clk; struct reset_c
 static struct xhci_hcd xhci_context;
 #define XHCI_STATE_REMOVING 1
 #define hcd_to_xhci(h) (&xhci_context)
-struct dwc3 { bool sys_wakeup; struct platform_device *xhci; };
+struct dwc3 { bool sys_wakeup, dis_u3_susphy_quirk; struct platform_device *xhci; };
 enum { DWC3_APPLE_PROBE_PENDING, DWC3_APPLE_NO_CABLE, DWC3_APPLE_HOST, DWC3_APPLE_DEVICE };
 /* pre_core_rpm is T8132 only: runtime PM before the first core probe; never set here. */
-struct dwc3_apple { struct dwc3 dwc; struct device *dev; int lock,state; void *role_sw; bool pre_core_rpm; };
+struct dwc3_apple { struct dwc3 dwc; struct device *dev; int lock,state; void *role_sw; bool pre_core_rpm, dt_dis_u3_susphy, shutting_down, sleep_ddr; };
+static void __attribute__((unused)) apple_sleep_usb_slp_ddr(bool on) { (void)on; }
 static struct dwc3_apple apple_context;
 #define to_dwc3_apple(d) container_of(d,struct dwc3_apple,dwc)
 static bool inside_host_remove;
 static void *platform_get_drvdata(struct platform_device *d) { return d==&controller?(void *)&apple_context.dwc:(void *)&hcd; }
-static void dwc3_enable_susphy(struct dwc3 *d,bool v) { (void)d;assert(v);susphy_calls++;observed_controller_write(); }
+static void dwc3_enable_susphy(struct dwc3 *d,bool v) { assert(v&&d->dis_u3_susphy_quirk==apple_context.dt_dis_u3_susphy);susphy_calls++;observed_controller_write(); }
 static void device_init_wakeup(struct device *d,bool b) { (void)d;(void)b; }
 static void platform_device_unregister(struct platform_device *d);
 static void dwc3_gadget_exit(struct dwc3 *d) { (void)d;assert(0); }
+static unsigned quiesce_calls;
+/* The glue's PM quiesce (its notifier off, its sleep work drained) runs before the host goes, and stops new starts. */
+static void __attribute__((unused)) dwc3_apple_pm_quiesce(struct dwc3_apple *d) { assert(!host_remove_calls);quiesce_calls++;d->shutting_down=true; }
 static int dwc3_apple_core_stop(struct dwc3_apple *d) { (void)d;return 0; }
 static void usb_role_switch_unregister(void *s) { (void)s; }
 static void dwc3_core_remove_no_shutdown(struct dwc3 *d) { (void)d; }
@@ -158,21 +162,24 @@ int main(void) {
   struct apple_atcphy p;prepare(&p,true,true,false);
   struct device_private private={0};controller.dev.p=&private;host_device.p=&private;
   controller_driver.remove=controller_remove;host_driver.remove=host_remove;
-  apple_context=(struct dwc3_apple){.dwc={.xhci=&host_platform_device},.dev=&controller.dev,.state=DWC3_APPLE_HOST};
+  apple_context=(struct dwc3_apple){.dwc={.xhci=&host_platform_device,.dis_u3_susphy_quirk=true},.dev=&controller.dev,.state=DWC3_APPLE_HOST};
   xhci_context=(struct xhci_hcd){0};
   inject_remove=true;removal_started=blocked_attempt=release_remove=false;
   atomic_store(&early_write,false);atomic_store(&handoff_active,true);
-  susphy_calls=host_remove_calls=0;
+  susphy_calls=host_remove_calls=quiesce_calls=0;
   int ret=safe(&p);
   atomic_store(&handoff_active,false);
   pthread_mutex_lock(&schedule_mutex);release_remove=true;pthread_cond_broadcast(&schedule_cond);pthread_mutex_unlock(&schedule_mutex);
   assert(pthread_join(remove_thread,NULL)==0);
   fprintf(stderr,"connected teardown target=%d ret=%d early_write=%d susphy=%d host_remove=%d\n",remove_target,ret,atomic_load(&early_write),susphy_calls,host_remove_calls);
   assert(ret==0&&!atomic_load(&early_write)&&host_remove_calls==1);
-  assert(susphy_calls==(remove_target?0:1));balanced(&p);
+  assert(susphy_calls==(remove_target?0:1));QUIESCE_CHECK balanced(&p);
  }
  puts("PASS actual PM wrapper connected to driver-core/DWC3/xHCI removal; synchronous teardown waits until owned transaction ends");
  return 0;
 }
 '''
+ # Only a glue that quiesces its PM work in remove is held to it.
+ quiesce='assert(quiesce_calls==(remove_target?0:1));' if 'dwc3_apple_pm_quiesce(appledwc);' in glue else ''
+ controls=controls.replace('QUIESCE_CHECK ',quiesce)
  return unit+prefix+functions+controls

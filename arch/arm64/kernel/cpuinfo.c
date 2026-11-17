@@ -174,6 +174,10 @@ static const char *const hwcap_str[] = {
 	[KERNEL_HWCAP_F16F32DOT]	= "f16f32dot",
 	[KERNEL_HWCAP_F16F32MM]		= "f16f32mm",
 	[KERNEL_HWCAP_SVE_LUT6]		= "svelut6",
+	[KERNEL_HWCAP_APPLE_APFLG]	= "apple_apflg",
+	[KERNEL_HWCAP_APPLE_AFP]	= "apple_afp",
+	[KERNEL_HWCAP_APPLE_PRSV]	= "apple_prsv",
+	[KERNEL_HWCAP_APPLE_AMX]	= "apple_amx",
 };
 
 #ifdef CONFIG_COMPAT
@@ -545,6 +549,15 @@ static void __cpuinfo_store_cpu(struct cpuinfo_arm64 *info)
 	info->reg_id_aa64isar0 = read_cpuid(ID_AA64ISAR0_EL1);
 	info->reg_id_aa64isar1 = read_cpuid(ID_AA64ISAR1_EL1);
 	info->reg_id_aa64isar2 = read_cpuid(ID_AA64ISAR2_EL1);
+	/*
+	 * Timed waits bypass the register-saving idle path on Apple M4 and
+	 * later cores. Record WFxT as absent on every CPU, so the sanitised
+	 * register hides it from the kernel, KVM guests and userspace
+	 * (HWCAP2_WFXT) and a boot argument cannot bring it back.
+	 */
+	if (IS_ENABLED(CONFIG_ARCH_APPLE) &&
+	    midr_is_apple_m4_or_later(info->reg_midr))
+		info->reg_id_aa64isar2 &= ~ID_AA64ISAR2_EL1_WFxT;
 	info->reg_id_aa64isar3 = read_cpuid(ID_AA64ISAR3_EL1);
 	info->reg_id_aa64mmfr0 = read_cpuid(ID_AA64MMFR0_EL1);
 	info->reg_id_aa64mmfr1 = read_cpuid(ID_AA64MMFR1_EL1);

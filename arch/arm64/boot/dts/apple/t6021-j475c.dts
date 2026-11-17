@@ -125,3 +125,7 @@
 };
 
 #include "hwmon-fan-dual.dtsi"
+
+#include "t6021-peripherals.dtsi"
+
+#include "t6021-j475c-peripherals.dtsi"

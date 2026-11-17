@@ -78,6 +78,8 @@ thread_local! {
     static COMPLETED_REGISTRATION: Cell<u8> = const { Cell::new(0) };
     static ACTIVATED: Cell<bool> = const { Cell::new(false) };
     static BINDING_READY: Cell<bool> = const { Cell::new(false) };
+    static QUEUE_SHARE_READY: Cell<bool> = const { Cell::new(false) };
+    static EXEC_SHARE_READY: Cell<bool> = const { Cell::new(false) };
     static ATTACH_ERROR: Cell<bool> = const { Cell::new(false) };
     static PROBE_ERROR: Cell<i32> = const { Cell::new(0) };
 }
@@ -146,7 +148,21 @@ pub trait InPlaceModule: Sized {
 mod binding {
     pub unsafe fn init() { crate::BINDING_READY.set(true); }
 }
+// The queue-share registry must also be ready before an adapter can probe.
+mod queue_share {
+    pub unsafe fn init() { crate::QUEUE_SHARE_READY.set(true); }
+}
+// So must the registry of execution contexts shared by a VM's G17P queues.
+mod g17 {
+    pub mod exec_share {
+        pub unsafe fn init() { crate::EXEC_SHARE_READY.set(true); }
+    }
+}
 mod cleanup {
+    pub struct QueueOwner;
+    impl QueueOwner { pub fn new() -> crate::Result<Self> { Ok(Self) } }
+}
+mod legacy_rx {
     pub struct QueueOwner;
     impl QueueOwner { pub fn new() -> crate::Result<Self> { Ok(Self) } }
 }
@@ -157,6 +173,8 @@ mod driver {
     impl<T: 'static> Registration<T> {
         pub fn new(name: &'static std::ffi::CStr, _module: &'static ThisModule) -> impl PinInit<Self, Error> {
             assert!(BINDING_READY.get(), "adapter registered before binding registry init");
+            assert!(QUEUE_SHARE_READY.get(), "adapter registered before queue-share registry init");
+            assert!(EXEC_SHARE_READY.get(), "adapter registered before execution-context share registry init");
             try_pin_init!(Self {
                 stage: {
                     let stage = match name.to_bytes() {
@@ -193,6 +211,8 @@ mod driver {
 mod boot { pub mod glue {
     pub fn retained() -> bool { crate::RETAINED.with(core::cell::Cell::get) }
     pub unsafe fn asahi_g15_reprobe() { crate::activation_reprobe(); }
+    // Reads the device tree and logs; no driver state.
+    pub unsafe fn asahi_g15_report_loader_gpu() {}
 }}
 '''
 
@@ -206,6 +226,8 @@ fn callback<'bound, T: platform::Driver>(
 fn reset(fail_alloc: bool, touch: bool, error: i32) {
     MODULE_READY.store(true, Ordering::Release);
     BINDING_READY.set(false);
+    QUEUE_SHARE_READY.set(false);
+    EXEC_SHARE_READY.set(false);
     FAIL_ALLOC.set(fail_alloc); TOUCH.set(touch); PROBE_ERROR.set(error);
     RETAINED.set(false); ALLOCS.set(0); PROBES.set(0);
 }

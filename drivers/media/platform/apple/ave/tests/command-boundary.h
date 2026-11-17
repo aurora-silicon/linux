@@ -17,7 +17,8 @@ static int ave_build_start(struct ave_ctx *ctx, void *cmd, size_t len)
 	return 0;
 }
 static int ave_build_process(struct ave_ctx *ctx, void *cmd, size_t len,
-			     unsigned int slot, dma_addr_t input, u32 bitrate, bool force_key)
+			     unsigned int slot, dma_addr_t input, u32 bitrate,
+			     bool force_key, bool last)
 {
 	return 0;
 }

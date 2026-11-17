@@ -518,8 +518,33 @@ static void desktop_present_completion_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, dcp_desktop_present_complete(dcp, 43));
 }
 
+static void takeover_adopt_watched_test(struct kunit *test)
+{
+	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, dcp);
+	dcp->desktop = kunit_kzalloc(test, sizeof(*dcp->desktop), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dcp->desktop);
+	dcp->fw_compat = DCP_FIRMWARE_V_26_6_DESKTOP;
+	KUNIT_EXPECT_FALSE(test, dcp_desktop_swap_watched(dcp));
+	/* An adopted loader mode is watched until a swap completes on it. */
+	dcp->desktop->takeover_adopted = true;
+	KUNIT_EXPECT_TRUE(test, dcp_desktop_swap_watched(dcp));
+	dcp_takeover_adopt_proven(dcp);
+	KUNIT_EXPECT_FALSE(test, dcp->desktop->takeover_adopted);
+	KUNIT_EXPECT_FALSE(test, dcp_desktop_swap_watched(dcp));
+	dcp->vrr_enabled = true;
+	KUNIT_EXPECT_TRUE(test, dcp_desktop_swap_watched(dcp));
+	/* Other firmware never sees the flag. */
+	dcp->vrr_enabled = false;
+	dcp->desktop->takeover_adopted = true;
+	dcp->fw_compat = DCP_FIRMWARE_H17P;
+	KUNIT_EXPECT_FALSE(test, dcp_desktop_swap_watched(dcp));
+}
+
 static struct kunit_case dropped_swap_cases[] = {
 	KUNIT_CASE(desktop_present_completion_test),
+	KUNIT_CASE(takeover_adopt_watched_test),
 	KUNIT_CASE(dropped_present_retired_test),
 	KUNIT_CASE(dropped_present_buffers_test),
 	KUNIT_CASE(completed_present_kept_test),

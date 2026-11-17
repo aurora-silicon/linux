@@ -1,0 +1,54 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Additional T6020 hardware resources. Keep unqualified blocks disabled. */
+
+&{/soc} {
+	m2_apcie2_piodma: dma-controller@596010000 {
+		compatible = "apple,t6020-pcie-piodma", "apple,pcie-piodma";
+		reg = <0x5 0x96010000 0x0 0x4000>,
+			<0x5 0x96014000 0x0 0x4000>,
+			<0x5 0x96018000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1350 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&pcie0_dart_2 15>;
+		status = "disabled";
+	};
+
+	m2_apcie3_piodma: dma-controller@597010000 {
+		compatible = "apple,t6020-pcie-piodma", "apple,pcie-piodma";
+		reg = <0x5 0x97010000 0x0 0x4000>,
+			<0x5 0x97014000 0x0 0x4000>,
+			<0x5 0x97018000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1354 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&pcie0_dart_3 15>;
+		status = "disabled";
+	};
+
+	m2_atc3_dpin0: displayport-input@1301e50000 {
+		compatible = "apple,t6020-dpin", "apple,dpin";
+		reg = <0x13 0x1e50000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1528 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	m2_atc3_dpin1: displayport-input@1301e58000 {
+		compatible = "apple,t6020-dpin", "apple,dpin";
+		reg = <0x13 0x1e58000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1529 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	m2_apciec3_piodma: dma-controller@1322000000 {
+		compatible = "apple,t6020-pciec-piodma", "apple,pciec-piodma";
+		reg = <0x13 0x22000000 0x0 0x4000>,
+			<0x13 0x22004000 0x0 0x4000>,
+			<0x13 0x22008000 0x0 0x4000>,
+			<0x13 0x20008000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 0 1320 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&apciec3_dart 15>;
+		status = "disabled";
+	};
+};

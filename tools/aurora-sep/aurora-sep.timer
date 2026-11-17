@@ -1,0 +1,9 @@
+[Unit]
+Description=Initialize Aurora SEP after the root filesystem is available
+
+[Timer]
+OnBootSec=1
+Unit=aurora-sep.service
+
+[Install]
+WantedBy=timers.target

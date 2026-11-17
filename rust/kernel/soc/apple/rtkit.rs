@@ -245,6 +245,16 @@ impl<T: Operations> RtKit<T> {
         ..Self::VTABLE
     };
 
+    const FIRMWARE_CRASHLOG_VTABLE: bindings::apple_rtkit_ops = bindings::apple_rtkit_ops {
+        flags: Self::VTABLE.flags | bindings::APPLE_RTKIT_FIRMWARE_OWNED_CRASHLOG,
+        ..Self::VTABLE
+    };
+
+    const G17P_VTABLE: bindings::apple_rtkit_ops = bindings::apple_rtkit_ops {
+        flags: Self::FIRMWARE_CRASHLOG_VTABLE.flags | bindings::APPLE_RTKIT_EARLY_CRASHLOG,
+        ..Self::FIRMWARE_CRASHLOG_VTABLE
+    };
+
     /// Creates a new RTKit client for a given device and optional mailbox name or index.
     pub fn new(
         dev: &device::Device,
@@ -266,6 +276,30 @@ impl<T: Operations> RtKit<T> {
         data: T::Data,
     ) -> Result<Self> {
         Self::new_with_ops(dev, mbox_name, mbox_idx, data, &Self::COREANALYTICS_VTABLE)
+    }
+
+    /// Creates a client whose co-processor keeps its crash buffer in memory it
+    /// maps itself and asks for it with that IOVA (the T8142 AOP).
+    pub fn new_with_firmware_crashlog(
+        dev: &device::Device,
+        mbox_name: Option<&'static CStr>,
+        mbox_idx: usize,
+        data: T::Data,
+    ) -> Result<Self> {
+        Self::new_with_ops(dev, mbox_name, mbox_idx, data, &Self::FIRMWARE_CRASHLOG_VTABLE)
+    }
+
+    /// Creates a G17P/G18G client whose crash DVA belongs to the GPU UAT.
+    ///
+    /// The crashlog endpoint starts before its map is acknowledged. The
+    /// firmware-owned buffer is acknowledged without mapping it on the CPU.
+    pub fn new_g17p(
+        dev: &device::Device,
+        mbox_name: Option<&'static CStr>,
+        mbox_idx: usize,
+        data: T::Data,
+    ) -> Result<Self> {
+        Self::new_with_ops(dev, mbox_name, mbox_idx, data, &Self::G17P_VTABLE)
     }
 
     fn new_with_ops(
@@ -339,6 +373,26 @@ impl<T: Operations> RtKit<T> {
         to_result(unsafe { bindings::apple_rtkit_boot(self.rtk) })
     }
 
+    /// Asks the coprocessor to go idle, AP then IOP state, and waits for both acknowledgments.
+    pub fn idle(self: Pin<&mut Self>) -> Result {
+        // SAFETY: `rtk` is valid per the type invariant.
+        to_result(unsafe { bindings::apple_rtkit_idle(self.rtk) })
+    }
+
+    /// Turns the mailbox off for a coprocessor that has acknowledged idle, before its run bit and
+    /// power state go. Only [`Self::warm_restart`] follows this.
+    pub fn mailbox_off(self: Pin<&mut Self>) {
+        // SAFETY: `rtk` is valid per the type invariant.
+        unsafe { bindings::apple_rtkit_mailbox_off(self.rtk) };
+    }
+
+    /// Prepares for HELLO from firmware restarting warm, which keeps its buffers and rings. The
+    /// caller then sets the run bit and calls [`Self::boot`].
+    pub fn warm_restart(self: Pin<&mut Self>) -> Result {
+        // SAFETY: `rtk` is valid per the type invariant.
+        to_result(unsafe { bindings::apple_rtkit_warm_restart(self.rtk) })
+    }
+
     /// Starts a non-system endpoint.
     pub fn start_endpoint(self: Pin<&mut Self>, endpoint: u8) -> Result {
         // SAFETY: `rtk` is valid per the type invariant.
@@ -351,6 +405,24 @@ impl<T: Operations> RtKit<T> {
         to_result(unsafe {
             bindings::apple_rtkit_send_message(self.rtk, endpoint, message, ptr::null_mut(), false)
         })
+    }
+
+    /// Returns whether the coprocessor is running (not crashed, IOP and AP power states on).
+    pub fn is_running(&self) -> bool {
+        // SAFETY: `rtk` is valid per the type invariant. The call only reads state.
+        unsafe { bindings::apple_rtkit_is_running(self.rtk) }
+    }
+
+    /// Returns whether the coprocessor has reported a crash.
+    pub fn is_crashed(&self) -> bool {
+        // SAFETY: `rtk` is valid per the type invariant. The call only reads state.
+        unsafe { bindings::apple_rtkit_is_crashed(self.rtk) }
+    }
+
+    /// Echoes the OSLOG counters the firmware sends, or drops them.
+    pub fn set_oslog_echo(&self, echo: bool) {
+        // SAFETY: `rtk` is valid per the type invariant.
+        unsafe { bindings::apple_rtkit_set_oslog_echo(self.rtk, echo) };
     }
 
     /// Checks if an endpoint is present

@@ -149,10 +149,11 @@ config SPI_APPLE_QSPI
 	  memory descriptors and is used for the boot NOR on M3 and later
 	  systems.
 
-	  The boot NOR defaults to read-only access. On the J613, J713, J616s
-	  and J700 a runtime opt-in admits bounded, verified page programs and
-	  4 KiB erases inside the nvram partition only; the rest of the boot
-	  NOR stays read-only.
+	  The boot NOR defaults to read-only access. On the J613, the M4 Macs
+	  (J604, J623, J624, J713, J715, J773g), the J616s and the J700 a
+	  runtime opt-in admits bounded, verified page programs and 4 KiB
+	  erases inside the nvram partition only; the rest of the boot NOR
+	  stays read-only.
 
 config SPI_APPLE_QSPI_KUNIT_TEST
 	tristate "KUnit tests for the Apple QSPIMC NVRAM write policy" if !KUNIT_ALL_TESTS

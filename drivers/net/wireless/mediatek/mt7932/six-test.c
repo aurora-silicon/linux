@@ -102,7 +102,7 @@ static void mt7932_band_scan_test(struct kunit *test)
 					       channels, 1), 0x4d4);
 	KUNIT_EXPECT_EQ(test, mt7932_scan_options(body, (const u8 *)"hidden", 6, NULL, 0), 0);
 	KUNIT_EXPECT_EQ(test, body[2], 1);
-	KUNIT_EXPECT_EQ(test, body[3], 8);
+	KUNIT_EXPECT_EQ(test, body[3], 4);
 	KUNIT_EXPECT_EQ(test, body[4], 1);
 	/* Further directed SSIDs fill the next slots; wildcards take none. */
 	KUNIT_EXPECT_EQ(test, mt7932_scan_ssid_slot(body, NULL, 0), 0);

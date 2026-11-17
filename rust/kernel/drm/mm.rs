@@ -7,7 +7,7 @@
 use crate::{
     alloc::flags::*,
     bindings,
-    error::{code::EINVAL, to_result, Result},
+    error::{code::{EINVAL, EOVERFLOW}, to_result, Result},
     sync::{new_mutex, Arc, Mutex, UniqueArc},
     types::Opaque,
 };
@@ -48,9 +48,9 @@ pub struct NodeData<A: AllocInner<T>, T> {
     inner: T,
 }
 
-// SAFETY: Allocator ops take the mutex, and there are no mutable actions on the node.
+// SAFETY: Allocator ops take the mutex; node mutation requires exclusive pinned access.
 unsafe impl<A: Send + AllocInner<T>, T: Send> Send for NodeData<A, T> {}
-// SAFETY: Allocator ops take the mutex, and there are no mutable actions on the node.
+// SAFETY: Allocator ops take the mutex; node mutation requires exclusive pinned access.
 unsafe impl<A: Send + AllocInner<T>, T: Sync> Sync for NodeData<A, T> {}
 
 /// Available MM node insertion modes
@@ -136,6 +136,95 @@ impl<A: AllocInner<T>, T> Deref for NodeData<A, T> {
 
     fn deref(&self) -> &Self::Target {
         &self.inner
+    }
+}
+
+impl<T> NodeData<(), T> {
+    /// Split a trailing reservation while retaining ownership of every address.
+    ///
+    /// This is restricted to allocators without callbacks. The caller decides
+    /// whether its payload can be split; no payload or page-table state is
+    /// copied. Allocation precedes mutation, and both new reservations become
+    /// visible under the same allocator mutex.
+    pub fn split_tail(self: Pin<&mut Self>, size: u64, inner: T) -> Result<Node<(), T>> {
+        if !self.valid || size == 0 || size >= self.node.size {
+            return Err(EINVAL);
+        }
+        let mut tail = KBox::new(
+            NodeData {
+                // SAFETY: The native node starts empty before reservation.
+                node: unsafe { core::mem::zeroed() },
+                mm: self.mm.clone(), valid: false, _pin: PhantomPinned, inner,
+            },
+            GFP_KERNEL,
+        )?;
+        // SAFETY: Neither pinned node nor its payload moves. Only allocator
+        // bookkeeping fields are changed while holding the allocator mutex.
+        let front = unsafe { self.get_unchecked_mut() };
+        let guard = front.mm.lock();
+        // SAFETY: The allocator is initialized and protected by guard.
+        if unsafe { (*guard.0.get()).color_adjust.is_some() } { return Err(EINVAL); }
+        let old_size = front.node.size;
+        tail.node.start = front.node.start + old_size - size;
+        tail.node.size = size;
+        tail.node.color = front.node.color;
+        // SAFETY: Both node allocations remain at fixed addresses. The
+        // smaller front and adjacent tail partition the original reservation.
+        unsafe {
+            bindings::drm_mm_remove_node(&mut front.node);
+            front.node.size = old_size - size;
+            let first = bindings::drm_mm_reserve_node(guard.0.get(), &mut front.node);
+            if first != 0 {
+                front.node.size = old_size;
+                assert_eq!(bindings::drm_mm_reserve_node(guard.0.get(), &mut front.node), 0);
+                return to_result(first).map(|_| unreachable!());
+            }
+            let second = bindings::drm_mm_reserve_node(guard.0.get(), &mut tail.node);
+            if second != 0 {
+                bindings::drm_mm_remove_node(&mut front.node);
+                front.node.size = old_size;
+                assert_eq!(bindings::drm_mm_reserve_node(guard.0.get(), &mut front.node), 0);
+                return to_result(second).map(|_| unreachable!());
+            }
+        }
+        tail.valid = true;
+        Ok(Pin::from(tail))
+    }
+
+    /// Rejoin an adjacent tail without allocation. On success the tail is
+    /// detached and may only be dropped; its payload is not destroyed here.
+    /// Errors leave both reservations unchanged.
+    pub fn rejoin_tail(self: Pin<&mut Self>, tail: Pin<&mut Self>) -> Result {
+        if !self.valid || !tail.valid || !core::ptr::eq(&*self.mm, &*tail.mm)
+            || self.node.start.checked_add(self.node.size) != Some(tail.node.start)
+            || self.node.color != tail.node.color {
+            return Err(EINVAL);
+        }
+        let combined = self.node.size.checked_add(tail.node.size).ok_or(EOVERFLOW)?;
+        // SAFETY: Exclusive pinned access permits field mutation, not moving
+        // the linked native nodes. The mutex excludes every other MM operation.
+        let front = unsafe { self.get_unchecked_mut() };
+        let tail = unsafe { tail.get_unchecked_mut() };
+        let guard = front.mm.lock();
+        // SAFETY: The allocator remains initialized and locked.
+        if unsafe { (*guard.0.get()).color_adjust.is_some() } { return Err(EINVAL); }
+        let old_size = front.node.size;
+        // SAFETY: The two adjacent reservations cover exactly combined bytes.
+        // No other node can enter the temporary hole while the mutex is held.
+        unsafe {
+            bindings::drm_mm_remove_node(&mut tail.node);
+            bindings::drm_mm_remove_node(&mut front.node);
+            front.node.size = combined;
+            let result = bindings::drm_mm_reserve_node(guard.0.get(), &mut front.node);
+            if result != 0 {
+                front.node.size = old_size;
+                assert_eq!(bindings::drm_mm_reserve_node(guard.0.get(), &mut front.node), 0);
+                assert_eq!(bindings::drm_mm_reserve_node(guard.0.get(), &mut tail.node), 0);
+                return to_result(result);
+            }
+        }
+        tail.valid = false;
+        Ok(())
     }
 }
 

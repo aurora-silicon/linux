@@ -15104,7 +15104,11 @@ static void misfit_rotate_work(struct work_struct *work)
 			continue;
 
 		c = rcu_dereference_all(rq->curr);
-		if (!misfit_rotate_candidate(c) ||
+		/*
+		 * Balancing may have pulled p here since the check above;
+		 * migrate_swap(p, p) takes p->pi_lock twice in the stopper.
+		 */
+		if (c == p || !misfit_rotate_candidate(c) ||
 		    !cpumask_test_cpu(src_cpu, c->cpus_ptr))
 			continue;
 

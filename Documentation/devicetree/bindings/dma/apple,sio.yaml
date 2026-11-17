@@ -18,6 +18,115 @@ maintainers:
 
 allOf:
   - $ref: dma-controller.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t6050-sio
+      required:
+        - compatible
+    then:
+      properties:
+        clocks:
+          minItems: 2
+          maxItems: 2
+      required:
+        - clocks
+      if:
+        required:
+          - mboxes
+      then:
+        properties:
+          reg:
+            minItems: 3
+            maxItems: 3
+          reg-names:
+            items:
+              - const: asc
+              - const: auxiliary
+              - const: asc-tail
+          interrupts: false
+        required:
+          - dma-channels
+      else:
+        properties:
+          reg:
+            minItems: 2
+            maxItems: 2
+          interrupts:
+            minItems: 4
+          status:
+            const: disabled
+        required:
+          - interrupts
+          - status
+    else:
+      properties:
+        interrupts: false
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8132-sio
+      required:
+        - compatible
+    then:
+      properties:
+        reg:
+          minItems: 2
+          maxItems: 2
+        clocks:
+          minItems: 3
+          maxItems: 3
+        status:
+          const: disabled
+      required:
+        - clocks
+        - status
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              enum:
+                - apple,t6050-sio
+                - apple,t8132-sio
+    then:
+      required:
+        - dma-channels
+      allOf:
+        - if:
+            properties:
+              compatible:
+                contains:
+                  const: apple,t8140-sio
+          then:
+            properties:
+              reg:
+                minItems: 3
+                maxItems: 3
+              reg-names:
+                items:
+                  - const: asc
+                  - const: auxiliary
+                  - const: asc-tail
+          else:
+            if:
+              properties:
+                compatible:
+                  contains:
+                    enum:
+                      - apple,t6031-sio
+                      - apple,t8122-sio
+            then:
+              properties:
+                reg:
+                  minItems: 2
+                  maxItems: 2
+            else:
+              properties:
+                reg:
+                  maxItems: 1
 
 properties:
   compatible:
@@ -25,14 +134,44 @@ properties:
       - items:
           - enum:
               - apple,t6000-sio
+              - apple,t6020-sio
               - apple,t6030-sio
+              - apple,t6031-sio
+              - apple,t8122-sio
               - apple,t8103-sio
+              - apple,t8112-sio
+              - apple,t8132-sio
+              - apple,t8140-sio
+              - apple,t6050-sio
           - const: apple,sio
       - description: T6041 firmware requires a generation-specific backend.
         const: apple,t6041-sio
 
   reg:
-    maxItems: 1
+    minItems: 1
+    maxItems: 3
+    description: |
+      Coprocessor control registers. T8140, and T6050 once it has its mailbox
+      provider, also publish an auxiliary ASC window and the remaining ASC
+      registers after the mailbox window. The mailbox registers are described
+      by the mailbox provider. A T6050 node without a provider has the whole
+      ASC bank and the auxiliary window, and stays disabled.
+
+  clocks:
+    minItems: 1
+    maxItems: 3
+
+  interrupts:
+    maxItems: 4
+    description:
+      On T6050, the coprocessor's mailbox interrupts in ADT order, on a node
+      that has no mailbox provider. With one, they are the provider's.
+
+  status: true
+
+  reg-names:
+    minItems: 1
+    maxItems: 3
 
   '#dma-cells':
     const: 1
@@ -50,6 +189,9 @@ properties:
     maxItems: 1
 
   power-domains:
+    maxItems: 1
+
+  resets:
     maxItems: 1
 
   memory-region:
@@ -88,11 +230,23 @@ properties:
          is done upfront in the loader which can be better suited for keeping up with
          Apple's firmware changes.
 
+  apple,channel-threshold:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      The threshold word of the configuration a DMA channel is given when its
+      client configures it. Without it the SoC's built-in value is used, or,
+      for a SoC without one, the generic value. Filled in by the bootloader.
+
+  apple,channel-limit:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    description:
+      The limit word of the same channel configuration, with the same
+      default. Filled in by the bootloader.
+
 required:
   - compatible
   - reg
   - '#dma-cells'
-  - dma-channels
   - mboxes
   - iommus
   - power-domains

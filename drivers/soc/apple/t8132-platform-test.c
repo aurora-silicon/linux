@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 #include <kunit/test.h>
 #include <linux/of.h>
+#include <linux/soc/apple/t8132.h>
 
 static void t8132_test_legacy_descriptions(struct kunit *test)
 {
@@ -14,8 +15,8 @@ static void t8132_test_legacy_descriptions(struct kunit *test)
 	u32 reg[8], agent;
 	const char *status;
 
-	if (!of_machine_is_compatible("apple,j713")) {
-		kunit_skip(test, "requires the J713 legacy-loader fixture");
+	if (!apple_t8132_air()) {
+		kunit_skip(test, "requires the J713/J715 legacy-loader fixture");
 		return;
 	}
 	mcc = of_find_compatible_node(NULL, NULL, "apple,t8132-mcc");

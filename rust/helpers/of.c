@@ -27,3 +27,11 @@ struct device_node *rust_helper_of_parse_phandle(const struct device_node *np,
 {
 	return of_parse_phandle(np, phandle_name, index);
 }
+
+#ifndef CONFIG_OF_DYNAMIC
+/* of_node_put() is an inline no-op without OF_DYNAMIC: give Rust a symbol. */
+void rust_helper_of_node_put(struct device_node *node)
+{
+	of_node_put(node);
+}
+#endif

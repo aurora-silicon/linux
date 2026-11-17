@@ -4,19 +4,17 @@ set -eu
 keybag=/var/lib/aurora-sep-keybag.bin
 refkey=/var/lib/aurora-sep-refkey.bin
 
-# Seconds to wait for the enclave to seal and unseal a trusted key, then for
-# /dev/sep-bio. On J700 the key store arrives around 43 s after boot, and the
+# Seconds to wait for the enclave to seal and unseal a trusted key. On J700 the key store arrives around 43 s after boot, and the
 # driver waits up to 90 s for it before it brings Touch ID up, so the first
 # wait has to outlast that. Set either in the environment, for example with a
 # drop-in for aurora-sep.service.
 ready_timeout=${AURORA_SEP_READY_TIMEOUT:-120}
-device_timeout=${AURORA_SEP_DEVICE_TIMEOUT:-60}
 
 log() {
     echo "aurora-sep-load: $*" >&2
 }
 
-for budget in "$ready_timeout" "$device_timeout"; do
+for budget in "$ready_timeout"; do
     case "$budget" in
         '' | *[!0-9]*)
             log "timeouts must be whole seconds, not '$budget'"
@@ -39,7 +37,22 @@ if [ "${AURORA_SEP_SESSION:-0}" != 1 ]; then
     exec keyctl session aurora-sep-load env AURORA_SEP_SESSION=1 "$0" "$@"
 fi
 
-modprobe apple_sep xart_writes=1 provision_keybag=1
+case "$(cat /sys/module/apple_sep/parameters/keystore_only 2>/dev/null || true)" in
+    1 | 2 | Y)
+        completed=false
+        for attribute in /sys/bus/platform/devices/*.sep/complete_attach; do
+            [ -e "$attribute" ] || continue
+            printf '1\n' >"$attribute"
+            completed=true
+            break
+        done
+        if [ "$completed" != true ]; then
+            log "keystore-only driver has no complete_attach attribute"
+            exit 1
+        fi
+        ;;
+    *) modprobe apple_sep xart_writes=1 provision_keybag=1 ;;
+esac
 
 work=$(mktemp -d /run/aurora-sep-load.XXXXXX)
 cleanup() {
@@ -67,6 +80,22 @@ guard_refused() {
 
 start=$(uptime_s)
 deadline=$((start + ready_timeout))
+
+# The kernel instantiates every key under one global mutex, and a trusted key
+# made before the enclave's bring-up has ended waits there for it, up to 90 s.
+# Meanwhile no other key can be created, and systemd creates one for each
+# service it starts, so the whole boot stalls behind this probe. The driver's
+# diag/keystore attribute leaves "unknown" once the bring-up has ended, and
+# reading it takes no lock, so wait on that first. Without the attribute the
+# probe below still works, as before.
+for keystore in /sys/bus/platform/drivers/apple_sep/*/diag/keystore; do
+    [ -r "$keystore" ] || continue
+    while [ "$(cat "$keystore" 2>/dev/null || echo unknown)" = unknown ] &&
+        [ "$(uptime_s)" -lt "$deadline" ]; do
+        sleep 0.1
+    done
+done
+
 verified=false
 while :; do
     key_id=$(printf 'new 32' | keyctl padd trusted aurora-sep-check @s 2>/dev/null || true)
@@ -114,12 +143,10 @@ if [ ! -s "$keybag" ] || [ ! -s "$refkey" ]; then
     exit 1
 fi
 
-deadline=$(($(uptime_s) + device_timeout))
-while [ ! -c /dev/sep-bio ] && [ "$(uptime_s)" -lt "$deadline" ]; do
-    sleep 0.1
-done
-if [ ! -c /dev/sep-bio ]; then
-    log "/dev/sep-bio did not appear within ${device_timeout} s"
-    exit 1
+# A model without a fingerprint reader can still provide SEP trusted keys.
+# Biometric readiness is handled separately by aurora-sep-ready.service.
+if [ -c /dev/sep-bio ]; then
+    log "/dev/sep-bio is available"
+else
+    log "trusted keys are ready; no biometric device is present"
 fi
-log "/dev/sep-bio is ready after $(($(uptime_s) - start)) s"

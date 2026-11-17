@@ -1,0 +1,107 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,rsm.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple remote service manager
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  Remote service manager register banks, interrupt and DART stream.
+
+select:
+  properties:
+    compatible:
+      contains:
+        enum:
+          - apple,t6030-rsm
+          - apple,t6031-rsm
+          - apple,t6032-rsm
+          - apple,t6050-rsm
+          - apple,t8122-rsm
+          - apple,t8140-rsm
+          - apple,t8142-rsm
+          - apple,t8152-rsm
+  required:
+    - compatible
+
+properties:
+  compatible: true
+
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            enum:
+              - apple,t6032-rsm
+              - apple,t6050-rsm
+      required:
+        - compatible
+    then:
+      properties:
+        compatible:
+          items:
+            - enum:
+                - apple,t6032-rsm
+                - apple,t6050-rsm
+            - const: apple,rsm
+
+        reg:
+          minItems: 2
+          maxItems: 2
+
+        interrupts:
+          maxItems: 1
+
+        power-domains:
+          maxItems: 1
+
+        iommus:
+          maxItems: 1
+
+      required:
+        - compatible
+        - reg
+        - interrupts
+        - power-domains
+        - iommus
+    else:
+      properties:
+        compatible:
+          items:
+            - enum:
+                - apple,t6030-rsm
+                - apple,t6031-rsm
+                - apple,t8122-rsm
+                - apple,t8140-rsm
+                - apple,t8142-rsm
+                - apple,t8152-rsm
+            - const: apple,rsm
+
+        reg:
+          minItems: 2
+          maxItems: 2
+          description: Register apertures in hardware-description order.
+
+        interrupts:
+          maxItems: 1
+
+        iommus:
+          maxItems: 1
+
+        power-domains:
+          maxItems: 1
+
+      required:
+        - compatible
+        - reg
+        - interrupts
+        - iommus
+
+      additionalProperties: false
+
+unevaluatedProperties: false

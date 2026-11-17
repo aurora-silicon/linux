@@ -309,6 +309,13 @@ static inline bool dcp_bl_complete(struct dcp_backlight_state *state,
 	return true;
 }
 
+static inline int dcp_bl_reported_actual(const struct dcp_backlight_state *state, bool strict)
+{
+	if (strict && !state->level_known)
+		return -ENODATA;
+	return state->actual;
+}
+
 /* Three deferred retries per user request; a permanent rejection stays dirty. */
 static inline unsigned int dcp_bl_retry_delay(const struct dcp_backlight_state *state)
 {
@@ -376,6 +383,7 @@ void dcp_backlight_desktop_finish(struct apple_dcp *dcp, u32 id,
  * Configure before registration and keep the callback valid until teardown.
  */
 bool dcp_backlight_active(struct apple_dcp *dcp);
+bool dcp_backlight_level_known(struct apple_dcp *dcp);
 int dcp_backlight_takeover(struct apple_dcp *dcp, u32 millinits);
 int dcp_backlight_configure(struct apple_dcp *dcp, u32 maximum,
 			    bool inherited_valid, u32 inherited,
@@ -387,7 +395,9 @@ int dcp_backlight_prepare(struct apple_dcp *dcp, bool have_surface,
 			  struct dcp_backlight_present *present);
 bool dcp_backlight_complete(struct apple_dcp *dcp, u64 sequence, bool accepted);
 bool dcp_backlight_pending(struct apple_dcp *dcp);
+bool dcp_backlight_lit(struct apple_dcp *dcp);
 bool dcp_backlight_resend(struct apple_dcp *dcp);
+int dcp_backlight_wake_lit(struct apple_dcp *dcp);
 unsigned int dcp_backlight_retry_delay(struct apple_dcp *dcp);
 
 #endif /* __APPLE_DCP_BACKLIGHT_H__ */

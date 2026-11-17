@@ -23,7 +23,7 @@ use kernel::{
         hrtimer::{
             HrTimerCallback, HrTimerCallbackContext, HrTimerPointer, HrTimerRestart, RelativeMode,
         },
-        Delta, Jiffies, Monotonic,
+        msecs_to_jiffies, Delta, Jiffies, Monotonic,
     },
     workqueue::RawWorkItem,
 };
@@ -85,7 +85,15 @@ impl Shared {
                 let evented = self.evented.swap(false, Ordering::AcqRel);
                 match firmware.poll(evented, &mut done) {
                     Ok(true) => self.rearm(firmware.engine.chan_wait),
-                    Ok(false) => {}
+                    // Idle: nothing polls until new work arrives, so a PB reclaim that comes
+                    // due with more idle time gets one more pass then. A job's arrival brings
+                    // the poll work forward (`rearm`), which replaces this expiry.
+                    Ok(false) => {
+                        if let Some(ns) = firmware.reclaim_delay_ns() {
+                            let ms = ns.div_ceil(1_000_000).min(u32::MAX as u64) as u32;
+                            self.mod_poll(msecs_to_jiffies(ms) + 1);
+                        }
+                    }
                     Err(error) => self.fail_stop(error),
                 }
             }
@@ -109,7 +117,7 @@ impl Shared {
                 if let Err(error) = firmware.publish(&mut done) {
                     self.fail_stop(error);
                 }
-                if !firmware.engine.flights.is_empty() {
+                if !firmware.engine.flights.is_empty() || firmware.engine.slot_wait {
                     self.rearm(firmware.engine.chan_wait);
                 }
             }
@@ -181,10 +189,7 @@ impl Shared {
     }
 }
 
-/// Stamp cell `obs` reached its own target, bounded by the newest published target `tail`.
-pub(crate) fn stamp_reached(obs: u32, own: u32, tail: u32) -> bool {
-    obs != 0 && obs & 0xff == 0 && obs.wrapping_sub(own) <= tail.wrapping_sub(own)
-}
+pub(crate) use super::recovery::logic::stamp_reached;
 
 /// Cursor `c` of a ring of `m` entries passed end `h` of entries from `b`, within tail `t`.
 pub(crate) fn ring_passed(c: u32, b: u32, h: u32, t: u32, m: u32) -> bool {
@@ -207,7 +212,10 @@ impl Firmware {
         // prefixes published the retirement loop below drains first.
         if self.engine.flights.is_empty() {
             self.drain_rings()?;
-            if self.recovery_idle() {
+            // Idle bookkeeping of the PB: when the idle began, and the reclaim once it is due.
+            self.note_idle();
+            self.reclaim_check();
+            if self.recovery_idle() && self.engine.pending.is_empty() {
                 return Ok(false);
             }
         }
@@ -228,8 +236,14 @@ impl Firmware {
             self.engine.prof.polls += 1;
             self.engine.prof.poll_ns += now_ns().wrapping_sub(start);
         }
+        // The pass that retired the last flight is not re-armed: note the idle here, not only
+        // at the start of a pass that finds the flights empty.
+        self.note_idle();
         published?;
-        Ok(!self.engine.flights.is_empty() || self.recovery.needs_repoll() || self.engine.frozen)
+        Ok(!self.engine.flights.is_empty()
+            || self.engine.slot_wait
+            || self.recovery.needs_repoll()
+            || self.engine.frozen)
     }
 
     /// Drains the rings and retires finished flights, with up to four trailing 5 us polls
@@ -448,6 +462,10 @@ impl Firmware {
                 p.count.store(p.sent(), Ordering::Relaxed);
             }
         }
+        if result.is_ok() && p.next() == p.sent() {
+            // All published prefixes retired; another VM may run before this job resumes.
+            job.release_binding();
+        }
         if p.next() < p.sent() || p.sent() < p.count() {
             return; // more of it published or still to publish
         }
@@ -465,6 +483,7 @@ impl Firmware {
             match result {
                 Err(error) => complete(done, j2, Err(error)),
                 Ok(()) => {
+                    j2.release_binding();
                     s.jobs += 1;
                     s.job_cmds += p2.count() as u64;
                     s.job_max = s.job_max.max(p2.count() as u64);
@@ -484,23 +503,25 @@ impl Firmware {
             return;
         };
         let (g, r, e) = (&self.graph.compute, &self.graph.render, &self.engine);
-        let (mut c, mut ta, mut fs) = (0, 0, 0);
+        let pending = super::recovery::logic::pending_stamp;
+        let (mut c, mut ta, mut fs) = (None, None, None);
 
         if f.computes != 0 {
-            c = g.fw_stamp.r32(0).unwrap_or(0);
-            if stamp_reached(c, f.target, e.target) {
-                c = 0; // its computes are done: later work does not count
-            }
+            c = g
+                .fw_stamp
+                .r32(0)
+                .ok()
+                .and_then(|v| pending(v, f.target, e.target));
         }
         if f.renders != 0 {
-            ta = r.fw_stamp[0].r32(0).unwrap_or(0);
-            fs = r.fw_stamp[1].r32(0).unwrap_or(0);
-            if stamp_reached(ta, f.ta_target, e.ta_target) {
-                ta = 0;
-            }
-            if stamp_reached(fs, f.fs_target, e.fs_target) {
-                fs = 0;
-            }
+            ta = r.fw_stamp[0]
+                .r32(0)
+                .ok()
+                .and_then(|v| pending(v, f.ta_target, e.ta_target));
+            fs = r.fw_stamp[1]
+                .r32(0)
+                .ok()
+                .and_then(|v| pending(v, f.fs_target, e.fs_target));
         }
         let moved = e.progress_flight == f.published_ns && [c, ta, fs] != e.progress;
         let published = f.published_ns;
@@ -606,7 +627,7 @@ impl Firmware {
             self.graph.dev.as_ref(),
             "G15: {}: ctx={} prefixes={} n={} target={:#x} user={:#x} fw={:#x} done={} read={} write={} head={} ch={}/{} events={}/{} errors={} busy={} fault={:#x} {}ms\n",
             what,
-            f.map_or(0, |f| f.job.vm.slot),
+            f.map_or(0, |f| f.job.slot()),
             e.flights.len(),
             e.ordinal,
             e.target,
@@ -716,6 +737,16 @@ impl Firmware {
             s.hz_ahead
         )?;
         self.pools.write_stats(f)?;
+        // What is left before the stamps wrap, and the renumbering margins.
+        let (compute_left, render_left) = self.stamps_left();
+        writeln!(
+            f,
+            "stamps: compute_left {} compute_margin {} render_left {} render_margin {}",
+            compute_left,
+            params::compute_reseed_margin(),
+            render_left,
+            params::stamp_reseed_margin()
+        )?;
         writeln!(
             f,
             "stage: ta_us {} fs_us {} cdm_us {} span_us {}",

@@ -545,17 +545,17 @@ static void ave_start_surfaces(struct ave_session *sess, u8 *cmd,
 		ave_put_buf(cmd, l->meta + 0x10 * s, &sess->slot[s].meta,
 			    sess->slot[s].meta.size);
 	}
-	ave_put_buf(cmd, l->row_a, &sess->row_a, sess->row_a.size);
-	ave_put_buf(cmd, l->row_b, &sess->row_b, sess->row_b.size);
-	ave_put_buf(cmd, l->fixed, &sess->fixed, SZ_16K);
+	ave_put_buf(cmd, l->row_a, &sess->row_a[0], sess->row_a[0].size);
+	ave_put_buf(cmd, l->row_b, &sess->row_b[0], sess->row_b[0].size);
+	ave_put_buf(cmd, l->fixed, &sess->fixed[0], SZ_16K);
 	for (unsigned int i = 0; i < AVE_TILE_BUFS; i++) {
 		u32 off = l->tiles[i];
 
 		if (i < tiles) {
-			ave_put_buf(cmd, off, &sess->tile[i],
-				    sess->tile[i].size);
-			ave_put_buf(cmd, off + 0x10, &sess->tile_aux[i],
-				    sess->tile_aux[i].size);
+			ave_put_buf(cmd, off, &sess->tile[0][i],
+				    sess->tile[0][i].size);
+			ave_put_buf(cmd, off + 0x10, &sess->tile_aux[0][i],
+				    sess->tile_aux[0][i].size);
 		} else {
 			ave_put_surface(cmd, off, 0, 0);
 			ave_put_surface(cmd, off + 0x10, 0, 0);

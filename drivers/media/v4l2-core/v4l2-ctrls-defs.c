@@ -498,6 +498,15 @@ const char * const *v4l2_ctrl_get_menu(u32 id)
 		"Region Grid",
 		NULL,
 	};
+	static const char * const prores_profile[] = {
+		"422 Proxy",
+		"422 LT",
+		"422",
+		"422 HQ",
+		"4444",
+		"4444 XQ",
+		NULL,
+	};
 
 	static const char * const av1_profile[] = {
 		"Main",
@@ -738,6 +747,8 @@ const char * const *v4l2_ctrl_get_menu(u32 id)
 		return hevc_tier;
 	case V4L2_CID_MPEG_VIDEO_HEVC_LOOP_FILTER_MODE:
 		return hevc_loop_filter_mode;
+	case V4L2_CID_MPEG_VIDEO_PRORES_PROFILE:
+		return prores_profile;
 	case V4L2_CID_MPEG_VIDEO_AV1_PROFILE:
 		return av1_profile;
 	case V4L2_CID_MPEG_VIDEO_AV1_LEVEL:
@@ -1043,6 +1054,9 @@ const char *v4l2_ctrl_get_name(u32 id)
 	case V4L2_CID_MPEG_VIDEO_HEVC_SIZE_OF_LENGTH_FIELD:	return "HEVC Size of Length Field";
 	case V4L2_CID_MPEG_VIDEO_REF_NUMBER_FOR_PFRAMES:	return "Reference Frames for a P-Frame";
 	case V4L2_CID_MPEG_VIDEO_PREPEND_SPSPPS_TO_IDR:		return "Prepend SPS and PPS to IDR";
+
+	/* ProRes controls */
+	case V4L2_CID_MPEG_VIDEO_PRORES_PROFILE:			return "ProRes Profile";
 
 	/* AV1 controls */
 	case V4L2_CID_MPEG_VIDEO_AV1_PROFILE:			return "AV1 Profile";
@@ -1419,6 +1433,7 @@ void v4l2_ctrl_fill(u32 id, const char **name, enum v4l2_ctrl_type *type,
 	case V4L2_CID_MPEG_VIDEO_HEVC_SIZE_OF_LENGTH_FIELD:
 	case V4L2_CID_MPEG_VIDEO_HEVC_TIER:
 	case V4L2_CID_MPEG_VIDEO_HEVC_LOOP_FILTER_MODE:
+	case V4L2_CID_MPEG_VIDEO_PRORES_PROFILE:
 	case V4L2_CID_MPEG_VIDEO_AV1_PROFILE:
 	case V4L2_CID_MPEG_VIDEO_AV1_LEVEL:
 	case V4L2_CID_STATELESS_HEVC_DECODE_MODE:

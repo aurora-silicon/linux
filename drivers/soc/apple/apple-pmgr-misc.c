@@ -22,12 +22,16 @@
 #include <linux/soc/apple/pmgr-misc.h>
 #include <linux/sort.h>
 #include <linux/workqueue.h>
+#if IS_ENABLED(CONFIG_APPLE_PMGR_DCS_KUNIT_TEST)
+#include <kunit/static_stub.h>
+#endif
 
 #define APPLE_CLKGEN_PSTATE 0
 #define APPLE_CLKGEN_PSTATE_DESIRED GENMASK(3, 0)
 #define APPLE_CLKGEN_PSTATE_ACTUAL GENMASK(7, 4)
 
 #define DCS_DEV_PSTATE_MIN_T600X 7
+#define DCS_VALID_STATES_T600X (BIT(5) | BIT(6) | BIT(7) | BIT(9))
 #define SYS_DEV_PSTATE_SUSPEND 1
 
 #define APPLE_PMGR_IDLE_POLL_MS 250
@@ -59,6 +63,7 @@ struct apple_pmgr_sys_device {
 
 struct apple_pmgr_misc_hw {
 	u32 dev_min_ps[DEV_MAX];
+	u32 dcs_valid_states;
 };
 
 struct apple_pmgr_dcs_opp {
@@ -85,6 +90,7 @@ struct apple_pmgr_misc {
 	struct icc_onecell_data *dcs_data;
 	struct apple_pmgr_dcs_opp dcs_opps[16];
 	unsigned int dcs_num_opps;
+	u32 dcs_valid_states;
 	bool dcs_failed;
 	bool dcs_bw_active;
 	struct {
@@ -121,13 +127,29 @@ static int apple_pmgr_dcs_select(struct apple_pmgr_misc *misc, u32 bw, u32 *stat
 	return -ERANGE;
 }
 
+static bool apple_pmgr_dcs_state_valid(struct apple_pmgr_misc *misc, u32 state)
+{
+	return state <= FIELD_MAX(APPLE_CLKGEN_PSTATE_DESIRED) &&
+	       (misc->dcs_valid_states & BIT(state));
+}
+
+static void apple_pmgr_dcs_command(u32 word, void __iomem *reg)
+{
+#if IS_ENABLED(CONFIG_APPLE_PMGR_DCS_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(apple_pmgr_dcs_command, word, reg);
+#endif
+	writel(word, reg);
+}
+
 static int apple_pmgr_dcs_write(struct apple_pmgr_misc *misc, u32 state)
 {
 	void __iomem *reg = misc->devices[DEV_DCS].base + APPLE_CLKGEN_PSTATE;
-	u32 val = readl(reg);
+	u32 val;
 
-	FIELD_MODIFY(APPLE_CLKGEN_PSTATE_DESIRED, &val, state);
-	writel(val, reg);
+	if (!apple_pmgr_dcs_state_valid(misc, state))
+		return -EINVAL;
+	/* DCS takes a complete command word, not a replay of readback bits. */
+	apple_pmgr_dcs_command(FIELD_PREP(APPLE_CLKGEN_PSTATE_DESIRED, state), reg);
 	return readl_poll_timeout(reg, val,
 		FIELD_GET(APPLE_CLKGEN_PSTATE_ACTUAL, val) == state,
 		10, APPLE_PMGR_RAISE_TIMEOUT_US);
@@ -136,7 +158,7 @@ static int apple_pmgr_dcs_write(struct apple_pmgr_misc *misc, u32 state)
 static int apple_pmgr_dcs_set(struct icc_node *src, struct icc_node *dst)
 {
 	struct apple_pmgr_misc *misc = src->data;
-	u32 state, old, bw = 0;
+	u32 state, old, val, bw = 0;
 	unsigned int i;
 	int ret;
 
@@ -157,13 +179,19 @@ static int apple_pmgr_dcs_set(struct icc_node *src, struct icc_node *dst)
 	ret = apple_pmgr_dcs_select(misc, bw, &state);
 	if (ret)
 		return ret;
+	if (!apple_pmgr_dcs_state_valid(misc, state))
+		return -EINVAL;
+	old = misc->devices[DEV_DCS].active_state;
+	val = readl(misc->devices[DEV_DCS].base + APPLE_CLKGEN_PSTATE);
+	if (FIELD_GET(APPLE_CLKGEN_PSTATE_DESIRED, val) != old ||
+	    FIELD_GET(APPLE_CLKGEN_PSTATE_ACTUAL, val) != old)
+		return -EBUSY;
 	/* Untracked DMA clients need the fabric as well as DCS bandwidth. */
 	if (bw) {
 		ret = apple_pmgr_raise_fabric(misc);
 		if (ret)
 			return ret;
 	}
-	old = misc->devices[DEV_DCS].active_state;
 	ret = apple_pmgr_dcs_write(misc, state);
 	if (ret) {
 		/* A failed request must not replace the last confirmed vote. */
@@ -207,8 +235,7 @@ static int apple_pmgr_dcs_validate(struct apple_pmgr_misc *misc)
 	for (i = 0; i < misc->dcs_num_opps; i++) {
 		const struct apple_pmgr_dcs_opp *opp = &misc->dcs_opps[i];
 
-		if (!opp->bw || opp->state < DCS_DEV_PSTATE_MIN_T600X ||
-		    opp->state > FIELD_MAX(APPLE_CLKGEN_PSTATE_DESIRED))
+		if (!opp->bw || !apple_pmgr_dcs_state_valid(misc, opp->state))
 			return -EINVAL;
 		if (i && (opp->state <= misc->dcs_opps[i - 1].state ||
 			  opp->bw <= misc->dcs_opps[i - 1].bw))
@@ -326,6 +353,14 @@ static void apple_pmgr_sys_dev_set_pstate(struct apple_pmgr_misc *misc,
 		pstate = misc->devices[dev].suspend_state;
 
 	dev_dbg(misc->dev, "set %d ps to pstate %d\n", dev, pstate);
+
+	if (dev == DEV_DCS && misc->dcs_valid_states) {
+		if (WARN_ON_ONCE(!apple_pmgr_dcs_state_valid(misc, pstate)))
+			return;
+		apple_pmgr_dcs_command(FIELD_PREP(APPLE_CLKGEN_PSTATE_DESIRED, pstate),
+				       misc->devices[dev].base + APPLE_CLKGEN_PSTATE);
+		return;
+	}
 
 	val = readl_relaxed(misc->devices[dev].base + APPLE_CLKGEN_PSTATE);
 	FIELD_MODIFY(APPLE_CLKGEN_PSTATE_DESIRED, &val, pstate);
@@ -717,6 +752,7 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 	hw = of_device_get_match_data(dev);
 	if (!hw)
 		return -EINVAL;
+	misc->dcs_valid_states = hw->dcs_valid_states;
 
 	ret = apple_pmgr_init_device(misc, hw, DEV_FABRIC, "fabric");
 	if (ret)
@@ -763,6 +799,7 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 }
 
 static const struct apple_pmgr_misc_hw apple_pmgr_misc_hw_t600x = {
+	.dcs_valid_states = DCS_VALID_STATES_T600X,
 	.dev_min_ps = {
 		[DEV_FABRIC] = SYS_DEV_PSTATE_SUSPEND,
 		[DEV_DCS] = DCS_DEV_PSTATE_MIN_T600X,

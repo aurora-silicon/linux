@@ -11,6 +11,7 @@ def identity(root, output):
     unit = unit.replace('int fw_compat;bool has_panel;',
                         'int fw_compat;unsigned notch_height;bool has_panel;')
     unit += r'''
+typedef int32_t s32;
 #define ALIGN(x,n) (((x)+(n)-1)&~((n)-1))
 #define SZ_16M (16U<<20)
 static u32 get_unaligned_le32(const void *p) {u32 n;memcpy(&n,p,4);return n;}
@@ -50,7 +51,7 @@ int main(int argc, char **argv)
 {
     assert(argc==3);
     struct apple_dcp d={.fw_compat=5,.has_panel=true};
-    __typeof__(*d.desktop) state={0};d.desktop=&state;
+    __typeof__(*d.panel_identity) state={0};d.panel_identity=&state;
     struct device_node np={DTS_VALUES};
     d.notch_height=74;
     if (!strcmp(argv[1],"dimensions")) {
@@ -76,7 +77,7 @@ int main(int argc, char **argv)
         assert(!memcmp(&panel,&before,sizeof(panel)));
     }
     d.panel.width_mm=panel.width_mm;d.panel.height_mm=panel.height_mm;
-    state.panel_adt_identity=panel.identity;
+    state.adt=panel.identity;
     struct dcp_display_mode mode=panel_test_mode, saved=mode;
     u64 generation=99;
     const struct drm_edid *edid=dcp_panel_edid_snapshot(&d,&mode,1,&generation);

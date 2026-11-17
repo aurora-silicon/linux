@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/spmi/apple,viper-spmi.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple Viper SPMI endpoint
+
+maintainers:
+  - Ryan Murray <81541646+RyanTheTide@users.noreply.github.com>
+
+description: |
+  A Viper endpoint on an auxiliary SPMI bus. Its register protocol and
+  firmware ownership are separate from those of the primary PMIC.
+
+properties:
+  compatible:
+    oneOf:
+      - items:
+          - const: apple,t6000-viper-spmi
+          - const: apple,viper-spmi
+
+  reg:
+    maxItems: 1
+
+required:
+  - compatible
+  - reg
+
+additionalProperties: false

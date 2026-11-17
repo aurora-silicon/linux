@@ -9,6 +9,7 @@ execution still requires a hardware boot.
 from pathlib import Path
 import argparse
 import json
+import re
 import subprocess
 import tempfile
 
@@ -20,6 +21,11 @@ parser.add_argument('--kernel-root', type=Path, default=ROOT,
 args = parser.parse_args()
 DTB, ROOT = args.dtb, args.kernel_root.resolve()
 source = (ROOT / 'drivers/iommu/apple-dart.c').read_text()
+t8132 = (ROOT / 'include/linux/soc/apple/t8132.h').read_text()
+# Every board helper, in header order: the gates call them by trait.
+air = ''
+for start in [m.start() for m in re.finditer(r'^static inline bool apple_t8132_\w+\(', t8132, re.M)]:
+    air += t8132[start:t8132.index('\n}\n', start) + 3]
 
 
 def property(node, name, kind='s'):
@@ -77,8 +83,16 @@ static bool board, soc, bypassed;
 static unsigned int checks;
 static bool of_machine_is_compatible(const char *s) {
     if (!strcmp(s,"apple,j713")) return board;
+    if (!strcmp(s,"apple,j715") || !strcmp(s,"apple,j604") || !strcmp(s,"apple,j623") ||
+        !strcmp(s,"apple,j624") || !strcmp(s,"apple,j773g")) return false;
     assert(!strcmp(s,"apple,t8132")); return soc;
 }
+/* No /chosen: the qualified-firmware term is off and the Air gates decide. */
+static struct device_node *of_chosen;
+static int of_property_read_string(const struct device_node *n,const char *p,const char **out) {
+    (void)n;(void)p;(void)out;return -22;
+}
+AIR_HELPER
 static bool of_device_is_compatible(const struct device_node *n,const char *s) {
     for(unsigned int i=0;i<n->count;i++) if(!strcmp(n->compatible[i],s))return true;
     return false;
@@ -127,6 +141,7 @@ int main(void) {
 }
 '''
 for name, value in {
+    'AIR_HELPER': air,
     'RADIO_EXPRESSION': radio, 'MTP_EXPRESSION': mtp, 'IRQ_EXPRESSION': irq,
     'IRQ_EXPECTED': '(display||radio)' if 'preserve_display' in irq else 'radio',
     'RADIO_COMPAT': radio_compat, 'MTP_COMPAT': mtp_compat,

@@ -5,7 +5,7 @@
  * submission is accepted configuration, not proof that the radio is asleep.
  * cfg80211 implements GET_POWER_SAVE from the accepted requested setting.
  */
-static int mt_power_submit(struct mt7932 *m, u8 mode)
+int mt_power_submit(struct mt7932 *m, u8 mode)
 {
 	u8 body[4] = { 0, mode, 0, 0 }; /* owned BSS0, not a station/WTBL ID */
 	int ret;

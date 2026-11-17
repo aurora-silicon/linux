@@ -147,3 +147,5 @@
 };
 
 #include "hwmon-mini.dtsi"
+
+#include "t8103-j274-control.dtsi"

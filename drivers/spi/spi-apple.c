@@ -152,6 +152,7 @@ struct apple_spi {
 	 */
 	spinlock_t        lock;         /* protects the state below and IE */
 	bool              active;
+	bool              threaded_tx; /* transmit-only fallback */
 	const void        *tx_ptr;
 	void              *rx_ptr;
 	u32               remaining_tx;
@@ -488,6 +489,15 @@ static irqreturn_t apple_spi_irq(int irq, void *dev_id)
 		return IRQ_NONE;
 	}
 
+	/* Keep the working thread-driven handshake for transmit-only uploads. */
+	if (spi->active && spi->threaded_tx) {
+		reg_write(spi, APPLE_SPI_IE_XFER, 0);
+		reg_write(spi, APPLE_SPI_IE_FIFO, 0);
+		complete(&spi->done);
+		spin_unlock(&spi->lock);
+		return IRQ_HANDLED;
+	}
+
 	if (spi->active)
 		apple_spi_service(spi);
 	reg_write(spi, APPLE_SPI_IF_FIFO,
@@ -533,6 +543,7 @@ static int apple_spi_transfer_one(struct spi_controller *ctlr, struct spi_device
 	spi->remaining_tx = t->tx_buf ? words : 0;
 	spi->remaining_rx = t->rx_buf ? words : 0;
 	spi->bytes_per_word = bytes_per_word;
+	spi->threaded_tx = t->tx_buf && !t->rx_buf;
 
 	/* Reset FIFOs */
 	reg_write(spi, APPLE_SPI_CTRL, APPLE_SPI_CTRL_RX_RESET | APPLE_SPI_CTRL_TX_RESET);
@@ -570,6 +581,34 @@ static int apple_spi_transfer_one(struct spi_controller *ctlr, struct spi_device
 				break;
 
 			/* Transmit and receive everything we can */
+			apple_spi_service(spi);
+		}
+	} else if (spi->threaded_tx) {
+		/*
+		 * Transmit-only uploads can lose FIFO progress with the IRQ
+		 * engine. Use the pre-IRQ-engine wake/refill/rearm sequence;
+		 * retain in-handler service for receive and duplex transfers.
+		 */
+		while (spi->xfer_flags) {
+			reinit_completion(&spi->done);
+			spin_lock_irqsave(&spi->lock, flags);
+			spi->active = true;
+			reg_write(spi, APPLE_SPI_IE_XFER, spi->xfer_flags);
+			reg_write(spi, APPLE_SPI_IE_FIFO, apple_spi_fifo_flags(spi));
+			spin_unlock_irqrestore(&spi->lock, flags);
+
+			if (!wait_for_completion_timeout(&spi->done,
+							 msecs_to_jiffies(APPLE_SPI_TIMEOUT_MS)))
+				ret = -ETIMEDOUT;
+
+			spin_lock_irqsave(&spi->lock, flags);
+			spi->active = false;
+			reg_write(spi, APPLE_SPI_IE_XFER, 0);
+			reg_write(spi, APPLE_SPI_IE_FIFO, 0);
+			spin_unlock_irqrestore(&spi->lock, flags);
+			synchronize_irq(spi->irq);
+			if (ret)
+				break;
 			apple_spi_service(spi);
 		}
 	} else {

@@ -1,0 +1,85 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+
+/*
+ * The boot NOR behind the QSPIMC controller (ADT /arm-io/qspi/spinor: firmware,
+ * anvram, syscfg), for asahi-nvram and asahi-bless. The controller's power
+ * states (PMGR devices SPI_P and QSPI) are off once iBoot is done with it;
+ * reading it without them takes an SError.
+ */
+/ {
+	aliases {
+		nvram = &nvram;
+	};
+
+	/* QSPIMC input clock, as on T8140 (ADT clock-ids 412) */
+	clk_200m: clock-200m {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <200000000>;
+		clock-output-names = "clk_200m";
+	};
+
+	soc {
+		pmgr: power-management@300700000 {
+			compatible = "apple,t8152-pmgr", "apple,t8103-pmgr",
+				     "syscon", "simple-mfd";
+			#address-cells = <1>;
+			#size-cells = <1>;
+			reg = <0x3 0x700000 0x0 0x14000>;
+		};
+
+		qspi: spi@331118000 {
+			compatible = "apple,t8152-qspi", "apple,t8140-qspi";
+			/* One aperture; the command block starts at offset 0x800. */
+			reg = <0x3 0x31118000 0x0 0x4800>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1411 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clk_200m>;
+			power-domains = <&ps_qspi>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			spinor: flash@0 {
+				compatible = "jedec,spi-nor";
+				reg = <0>;
+				spi-max-frequency = <10000000>;
+
+				partitions {
+					compatible = "fixed-partitions";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					/*
+					 * 64 KiB NVRAM v3 banks ("3VVN") from 0x24000
+					 * to 0x1f4000, as on T8140 J700.
+					 */
+					nvram: partition@24000 {
+						label = "nvram";
+						reg = <0x24000 0x1d0000>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&pmgr {
+	ps_spi_p: power-controller@d40 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0xd40 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "spi_p";
+	};
+
+	ps_qspi: power-controller@1140 {
+		compatible = "apple,t8152-pmgr-pwrstate",
+			     "apple,t8103-pmgr-pwrstate";
+		reg = <0x1140 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "qspi";
+		power-domains = <&ps_spi_p>;
+	};
+};

@@ -6,7 +6,7 @@
 use crate::g17::initdata::{CompletionFold, ComputeCompletion};
 use kernel::prelude::*;
 
-pub(crate) const IN_FLIGHT: usize = 16;
+pub(crate) const IN_FLIGHT: usize = crate::hw::t8140::queues::COMPUTE_DEPTH;
 pub(crate) const RECORD_SLOTS: usize = 32;
 const QIDS: usize = 128;
 const TIME_MASK: u64 = 0x003f_ffff_ffff_ffff;
@@ -101,17 +101,25 @@ pub(crate) enum StampWait {
     /// The bound passed while the ioctl's work-state node still runs kicks: the stamp is not
     /// late, and the wait counts again from the given host time.
     Restart(u64),
-    /// The node drained and the stamp is still missing after the bound: retire on the record.
+    /// The node drained and the stamp is still missing after the bound, or the watchdog ended
+    /// the wait ([`STAMP_WAIT_EXPIRED`]): retire on the record.
     Aged,
 }
 
+/// The latch time a watchdog that gave up on a command with its record present stores: its
+/// stamp wait is over, however long the rest of its ioctl runs.
+pub(crate) const STAMP_WAIT_EXPIRED: u64 = 0;
+
 /// The stamp wait of a command whose exact record was latched at `observed_at` (host ns) and
 /// whose stamp is still missing, at `now`. `drained` reports whether every kick counted on the
-/// command's work-state node completed; it is asked only once the bound has passed.
+/// command's work-state node completed; it is asked only once the bound has passed, and never
+/// for a wait the watchdog ended.
 pub(crate) fn stamp_wait(observed_at: Option<u64>, now: u64, drained: impl FnOnce() -> bool)
     -> StampWait
 {
-    if !record_aged(observed_at, now) {
+    if observed_at == Some(STAMP_WAIT_EXPIRED) {
+        StampWait::Aged
+    } else if !record_aged(observed_at, now) {
         StampWait::Waiting
     } else if drained() {
         StampWait::Aged
@@ -141,7 +149,20 @@ pub(crate) fn note_stampless(qid: u8, kick: u64) {
     }
 }
 
-/// A zero-duration record fails before visibility polling. It proves execution did not occur;
+/// Firmware retires the compute commands in flight at a restart without executing them and
+/// stores a record whose end is at most this many timer ticks after its start (0 or 1 tick
+/// observed). The shortest executed command record seen is 18 ticks.
+pub(crate) const CANCELLED_TICKS: u64 = 1;
+
+/// The record shows the command never executed: zero duration, or, for a command that was in
+/// flight across a recovery (`crossed`), the restart's cancellation record.
+pub(crate) fn unexecuted(record: Observation, crossed: bool) -> bool {
+    let [start, end] = record.timestamps;
+    start == end || (crossed && start != 0 && end >= start && end - start <= CANCELLED_TICKS)
+}
+
+/// A record showing the command never executed ([`unexecuted`]) fails before visibility
+/// polling. It proves execution did not occur;
 /// ownership still requires a separate retirement witness before mappings can be released.
 /// The command is complete when its stamp covers it, or when its exact completion record has
 /// been present for [`STAMP_FALLBACK_NS`] without one (`record_aged`) in the same recovery
@@ -162,10 +183,11 @@ pub(crate) fn poll(
     next_end: Option<u64>,
     record_aged: bool,
 ) -> Result<Option<[u64; 2]>> {
-    if observed.is_some_and(|record| record.timestamps[0] == record.timestamps[1]) {
+    let crossed = matches!(recordless, Recordless::CrossedRecovery);
+    if observed.is_some_and(|record| unexecuted(record, crossed)) {
         return Err(ENODATA);
     }
-    let same_generation = !matches!(recordless, Recordless::CrossedRecovery);
+    let same_generation = !crossed;
     let completed = stamp_covers(stamp, ticket.kick)
         || (same_generation && observed.is_some() && record_aged);
     if !completed || !cursors.consumed(ticket.item_producer, ticket.item_count)? {
@@ -580,6 +602,11 @@ mod tests {
         // The node drained and the stamp is still missing after the bound.
         assert_eq!(stamp_wait(Some(late), late + STAMP_FALLBACK_NS, || true), StampWait::Aged);
         assert_eq!(stamp_wait(Some(at), late, || true), StampWait::Aged);
+        // The watchdog ended the wait: the node is not asked, and the bound does not apply.
+        for now in [0, 1, late] {
+            assert_eq!(stamp_wait(Some(STAMP_WAIT_EXPIRED), now, || panic!("node read")),
+                StampWait::Aged);
+        }
     }
 
     #[test]

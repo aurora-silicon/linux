@@ -32,12 +32,15 @@ static REFUSALS: [AtomicU64; SITE_COUNT] = [const { AtomicU64::new(0) }; SITE_CO
 
 /// First and power-of-two refusals per site keep a pressure storm bounded in
 /// the log. This does not change whether the caller retries or rejects work.
+///
+/// Most refusals are retried; a final one fails its caller, which reports it.
+/// So this is informational; the counters stay in the capacity snapshot.
 #[track_caller]
 pub(super) fn refused(site: Site) -> Error {
     let count = REFUSALS[site as usize].fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     if count.is_power_of_two() {
         let at = core::panic::Location::caller();
-        pr_warn!("G17 capacity refusal {:?} count={} at {}:{}\n", site, count,
+        pr_info!("G17 capacity refusal {:?} count={} at {}:{}\n", site, count,
             at.file().rsplit("asahi/").next().unwrap_or(at.file()), at.line());
     }
     ENOSPC
@@ -69,10 +72,13 @@ impl kernel::debugfs::Writer for View {
         // locks. Never take a VM/TTBAT lock with the device mutex held here.
         // The retained UAT owns valid allocator metadata even during shutdown.
         writeln!(f, "execution_contexts used={} total={}", uat.execution_contexts_used(), crate::mmu::MAX_EXECUTION_CONTEXTS)?;
-        let mut upper = uat.geometry().kernel_range();
-        upper.start += crate::hw::t8140::dynamic::KERNEL_OFFSET;
+        let (fenced, overruns) = uat.execution_contexts_fenced(super::channel::control_witnessed());
+        writeln!(f, "execution_contexts_fenced free_waiting={} overruns={}", fenced, overruns)?;
+        let [kept, fallbacks] = super::completion::window_counters();
+        writeln!(f, "timestamp_window firmware={} host_fallbacks={}", kept, fallbacks)?;
+        let upper = uat.kernel_dynamic_range();
         for (name, vm, range) in [
-            ("dynamic_lower_bytes", uat.kernel_lower_vm(), crate::hw::t8140::dynamic::LOWER),
+            ("dynamic_lower_bytes", uat.kernel_lower_vm(), uat.kernel_lower_dynamic_range()),
             ("dynamic_upper_bytes", uat.kernel_vm(), upper),
         ] {
             match vm.capacity(range.clone()) {
@@ -80,6 +86,10 @@ impl kernel::debugfs::Writer for View {
                 Err(error) => writeln!(f, "{} unavailable={:?}", name, error)?,
             }
         }
+        crate::queue_share::write_capacity(f, super::kick::queue_limit(self.0.variant.qid_floor))?;
+        let private = uat.client_private_range();
+        writeln!(f, "client_private_bytes high_water={} total={}",
+                 crate::mmu::client_private_high_water(), private.end - private.start)?;
         for (site, count) in [
             Site::ComputeReserve, Site::PhysicalQids, Site::RenderSlots, Site::LogicalQueues,
             Site::ComputeSlots, Site::QosIds, Site::ComputeItems, Site::RetiredRenderBindings,

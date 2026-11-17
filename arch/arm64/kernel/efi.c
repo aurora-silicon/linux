@@ -14,6 +14,7 @@
 #include <linux/screen_info.h>
 #include <linux/vmalloc.h>
 
+#include <asm/ctxr_execmem.h>
 #include <asm/efi.h>
 #include <asm/stacktrace.h>
 #include <asm/vmap_stack.h>
@@ -248,6 +249,11 @@ static int __init arm64_efi_rt_init(void)
 
 	if (!efi_enabled(EFI_RUNTIME_SERVICES))
 		return 0;
+
+	if (!ctxr_exec_efi_runtime_ok()) {
+		clear_bit(EFI_RUNTIME_SERVICES, &efi.flags);
+		return 0;
+	}
 
 	p = arch_alloc_vmap_stack(THREAD_SIZE, NUMA_NO_NODE);
 	if (!p) {

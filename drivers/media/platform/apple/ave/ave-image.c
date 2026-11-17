@@ -490,6 +490,9 @@ void ave_image_start(u8 *cmd, size_t len, const struct ave_fw_layout *fw,
 		     enum ave_codec codec, bool reorder_off,
 		     bool hevc_low_delay)
 {
+	/* 6070 has no qualified opaque defaults; its named fields are built. */
+	if (fw->kind == AVE_LAYOUT_6070)
+		return;
 	if (fw->counted) {
 		if (codec == AVE_CODEC_HEVC)
 			ave_put_words(cmd, len, ave_26a428_hevc_start,
@@ -514,6 +517,9 @@ void ave_image_start(u8 *cmd, size_t len, const struct ave_fw_layout *fw,
 void ave_image_process(u8 *cmd, size_t len, const struct ave_fw_layout *fw,
 		       enum ave_codec codec)
 {
+	/* Retained 6070 codec state is copied by the session-aware writer. */
+	if (fw->kind == AVE_LAYOUT_6070)
+		return;
 	if (fw->counted) {
 		if (codec == AVE_CODEC_HEVC)
 			ave_put_words(cmd, len, ave_26a428_hevc_process,

@@ -24,7 +24,9 @@ description: |
   mux cells 0, 1 and 2 describe the DP PHY, DP IN 0 and DP IN 1 outputs,
   respectively. The per-port prefix distinguishes multiple ATCs on one DCP.
   Dual-stream wiring requires these two named controls and two port@3
-  endpoints. It does not describe SoC handshake or retry policy.
+  endpoints. It does not describe SoC handshake or retry policy. T6050 host
+  routers have four DP IN adapters; their crossbars add typecN-dpin2 and
+  typecN-dpin3 (cells 3 and 4).
 
   Legacy typecN-usb4 names describe cell 1 on old j414/j416 DTBs. With two
   port@3 endpoints they retain the existing dual-stream wiring; cell 2 is
@@ -56,12 +58,12 @@ properties:
 
   mux-controls:
     minItems: 1
-    maxItems: 13
+    maxItems: 21
     description: Fixed, DP Alt Mode and wired DP IN crossbar output controls.
 
   mux-control-names:
     minItems: 1
-    maxItems: 13
+    maxItems: 21
     items:
       anyOf:
         - enum:
@@ -72,12 +74,20 @@ properties:
             - typec3
             - typec0-dpin0
             - typec0-dpin1
+            - typec0-dpin2
+            - typec0-dpin3
             - typec1-dpin0
             - typec1-dpin1
+            - typec1-dpin2
+            - typec1-dpin3
             - typec2-dpin0
             - typec2-dpin1
+            - typec2-dpin2
+            - typec2-dpin3
             - typec3-dpin0
             - typec3-dpin1
+            - typec3-dpin2
+            - typec3-dpin3
         - enum: [typec0-usb4, typec1-usb4, typec2-usb4, typec3-usb4]
           deprecated: true
 
@@ -113,12 +123,26 @@ properties:
               - maximum: 3
           mode-switch:
             type: boolean
+          apple,tunnel-only:
+            type: boolean
+            description: |
+              The route carries USB4 DP tunnels only and is never given a DP
+              Alt Mode display. It is not a Type-C mode-switch, so a port
+              whose connector already has as many mode-switch providers as
+              the Type-C class allows can still offer another tunnel
+              pipeline.
           port:
             $ref: /schemas/graph.yaml#/properties/port
         required:
           - reg
-          - mode-switch
           - port
+        if:
+          not:
+            required:
+              - apple,tunnel-only
+        then:
+          required:
+            - mode-switch
     required:
       - '#address-cells'
       - '#size-cells'

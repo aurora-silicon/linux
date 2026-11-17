@@ -26,7 +26,30 @@ bool apple_pmc_voter_enabled(struct device *pmc, unsigned int agent,
 u32 apple_pmc_floor_read(struct device *pmc, unsigned int agent);
 int apple_pmc_floor_update(struct device *pmc, unsigned int agent, u32 mask,
 			   u32 value);
+/*
+ * Clear, and later restore, the display pipe interface enables named by
+ * @consumer's apple,pmc-interface (an apple,consumer-switched interface).
+ * The check says, changing nothing, whether they can be cleared now.
+ */
+int apple_pmc_interface_consumer_check(struct device *consumer);
+int apple_pmc_interface_consumer_off(struct device *consumer);
+int apple_pmc_interface_consumer_on(struct device *consumer);
 #else
+static inline int apple_pmc_interface_consumer_check(struct device *consumer)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int apple_pmc_interface_consumer_off(struct device *consumer)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int apple_pmc_interface_consumer_on(struct device *consumer)
+{
+	return -EOPNOTSUPP;
+}
+
 static inline unsigned int apple_pmc_rail_count(struct device *pmc)
 {
 	return 0;

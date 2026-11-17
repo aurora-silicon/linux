@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Disabled coprocessor interfaces; firmware handoff remains a loader job. */
+
+&soc {
+	sep_dart: iommu@29cac0000 {
+		compatible = "apple,t6030-dart", "apple,t8110-dart";
+		reg = <0x2 0x9cac0000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 372 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	sep_mbox: mailbox@29e408000 {
+		compatible = "apple,t6030-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x2 0x9e408000 0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 366 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 367 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 368 IRQ_TYPE_LEVEL_HIGH>,
+		             <AIC_IRQ 369 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_sep>;
+		status = "disabled";
+	};
+
+	sep: sep@29e400000 {
+		compatible = "apple,t6030-sep", "apple,sep";
+		reg = <0x2 0x9e400000 0 0x6c000>,
+		      <0x2 0x9e050000 0 0x60000>;
+		mboxes = <&sep_mbox>;
+		mbox-names = "mbox";
+		iommus = <&sep_dart 0>;
+		power-domains = <&ps_sep>;
+		status = "disabled";
+	};
+
+};

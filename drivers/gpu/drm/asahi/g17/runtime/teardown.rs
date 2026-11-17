@@ -7,7 +7,7 @@ use crate::g17::{
     buffer::BufferIds,
     channel::Rings,
     context::Context,
-    fw::channels::{ControlRecord, SchedulerStateRelease},
+    fw::channels::ControlRecord,
     initdata::InitData,
     queue::render::RetiredBinding,
     recovery::Memory as _,
@@ -33,6 +33,7 @@ impl Reclaim {
             Self::Context(context) => {
                 context.release_execution();
                 drop(context.take_render_pool());
+                context.release_render_id();
                 drop(context);
             }
         }
@@ -111,7 +112,7 @@ struct Service<'a> {
 
 impl Host for Service<'_> {
     fn render_idle(&mut self, context: &Arc<Context>) -> Result<bool> {
-        self.render.teardown_idle(context)
+        self.render.release_idle(context)
     }
     fn compute_idle(&self, context: &Arc<Context>) -> bool {
         self.compute
@@ -126,13 +127,10 @@ impl Host for Service<'_> {
     fn control_backpressured(&self) -> bool {
         self.render.control_backpressured()
     }
-    fn publish(&mut self, record: &SchedulerStateRelease) -> Result<u32> {
+    fn publish_release(&mut self, page_va: u64, id: [u8; 4]) -> Result<u32> {
         Rings::publish_control(
             self.init,
-            &ControlRecord::SchedulerStateRelease(SchedulerStateRelease::new(
-                record.page_va,
-                record.id,
-            )),
+            &ControlRecord::SchedulerStateRelease(self.init.scheduler_release(page_va, id)),
         )
     }
     fn notify(&mut self) -> Result {
@@ -177,6 +175,7 @@ impl Firmware {
     pub(in crate::g17) fn service_teardown(&mut self, reclaim: &mut ReclaimBatch) -> Result {
         self.queues.render.collect_reclaimable(reclaim)?;
         if self.queues.teardown.is_empty() {
+            self.queues.sync_render_holds();
             return Ok(());
         }
         self.queues.render.observe_teardown_releases(&self.init)?;
@@ -202,6 +201,7 @@ impl Firmware {
         teardown.publish_ready(&mut service, recovery, super::now_ns())?;
         let consumer = self.init.control_consumer()?.load(Ordering::Relaxed);
         let producer = self.init.control_producer()?.load(Ordering::Relaxed);
+        crate::g17::channel::observe_control(consumer, producer);
         let mut consumed = false;
         while teardown
             .take_consumed(consumer, producer, &mut service)?
@@ -213,6 +213,9 @@ impl Firmware {
             // A channel whose last scheduler release is consumed can change owner.
             self.primary.state.shared.channels.notify();
         }
+        // The pairs of consumed releases are parked: their holds end, which wakes the
+        // publications waiting for render capacity.
+        self.queues.sync_render_holds();
         Ok(())
     }
 }

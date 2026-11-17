@@ -4,7 +4,7 @@
 from pathlib import Path
 import os, re, shlex, shutil, subprocess
 import phy
-from common import block, tipd_pm_header, atc_function, ATC_RPM
+from common import block, tipd_pm_header, atc_function, atc_mux_noop, ATC_RPM
 
 def ownership(root, usb_unreachable=False):
     ns=phy.parking(root)
@@ -424,10 +424,14 @@ int main(void)
      # delayed work functions themselves are left to the KUnit tests.
      helpers+=''.join(atc_function(s,name) for name in
        ('atcphy_usb3_port_off','atcphy_usb3_port_on','atcphy_usb3_port_retry_delay',
-        'atcphy_usb3_port_retry','atcphy_mux_in_mode'))
-     helpers+=ns['function'](s,'atcphy_mux_is_noop')+'\n'
+        'atcphy_usb3_port_retry'))
+     # Unless the lane fixture's atcphy_mux_set_locked() already needed them.
+     if not atc_mux_noop(s):
+      helpers+=atc_function(s,'atcphy_mux_in_mode')+ns['function'](s,'atcphy_mux_is_noop')+'\n'
      helpers+=''.join(atc_function(s,name) for name in
        ('atcphy_park_retry_delay','atcphy_park_retry','atcphy_park_due','atcphy_mux_change'))
+     # The mux callback's body, split out so the wake can set the mode it had.
+     helpers+=''.join(atc_function(s,name) for name in ('atcphy_mux_done','atcphy_mux_update_to'))
      helpers+=ns['function'](s,'atcphy_mux_update')+'\n'
      # Lane fixtures provide the target mapping and locked body; use the real callback here.
      # The mux callback powers an idle-power-off PHY first; this PHY is not one.
@@ -495,7 +499,7 @@ struct notifier_block { int (*notifier_call)(struct notifier_block *,unsigned lo
     mocks = r'''
 struct cd321x {
  struct tps6598x tps;
- struct work update_work,resume_work;
+ struct work update_work,resume_work,rearm_work;
  int link_event,ready_event,restore_event;
  struct cd321x_pm_state pm;
  void *mux,*tbt_switch,*port_altmode_dp,*port_altmode_tbt;
@@ -558,6 +562,27 @@ static void cd321x_stop_work(struct cd321x *c) {
     init_mux = block(core, 'VISIBLE_IF_KUNIT int cd321x_init_mux(')
     production += init_mux.replace('VISIBLE_IF_KUNIT', 'static', 1) + '\n'
     production += function(core, 'cd321x_register_port') + '\n' + function(core, 'cd321x_unregister_port')
+    # A port that probed without its USB4/Thunderbolt router keeps watching for it.
+    if 'cd321x_tbt_watch_late(' in core:
+        mocks = mocks.replace(' bool state_valid,tbt_notifier_registered;\n',
+                              ' bool state_valid,tbt_notifier_registered;\n'
+                              ' struct work tbt_attach_work;\n struct fwnode_handle *tbt_fwnode;\n'
+                              ' struct notifier_block tbt_watch;\n bool tbt_watch_registered;\n', 1)
+        mocks = mocks.replace('static void cd321x_stop_work(struct cd321x *c) {\n', r'''#define INIT_WORK(p,fn) ((p)->pending=false)
+#define dev_warn(...) ((void)0)
+static int watches, watch_error;
+/* Like the real watch, hold the port fwnode until the port is unregistered. */
+static int cd321x_tbt_watch_late(struct cd321x *c,struct fwnode_handle *f) {
+ if(watch_error)return watch_error;
+ f->refs++;c->tbt_fwnode=f;c->tbt_watch_registered=true;watches++;return 0;
+}
+static void cd321x_stop_work(struct cd321x *c) {
+ if(c->tbt_watch_registered){assert(watches>0);watches--;c->tbt_watch_registered=false;}
+''', 1)
+        assert 'cd321x_tbt_watch_late(struct cd321x' in mocks and 'tbt_watch_registered;' in mocks
+        late_watch = True
+    else:
+        late_watch = False
     controls = r'''
 static void reset(struct cd321x *c) {
  memset(c,0,sizeof(*c));connector.refs=0;
@@ -642,6 +667,19 @@ int main(void) {
 }
 '''
 
+    # Newer trees report an occupied pipeline as -ENOSPC on every SoC.
+    # Keep the old two-argument contract covered when testing an older tree.
+    if re.search(r'cd321x_display_taken\(int ret\)', pm):
+        old = ' assert(cd321x_display_taken(-ENOSPC,true)&&!cd321x_display_taken(-EBUSY,true)&&!cd321x_display_taken(0,true)&&cd321x_display_taken(-EBUSY,false)&&!cd321x_display_taken(-ENOSPC,false)&&!cd321x_display_taken(0,false));'
+        assert controls.count(old) == 1
+        controls = controls.replace(old, r'''
+ /* An occupied display permits USB progress; transient/other errors retry. */
+ assert(cd321x_display_taken(-ENOSPC));
+ assert(!cd321x_display_taken(-EBUSY)&&!cd321x_display_taken(-EAGAIN));
+ assert(!cd321x_display_taken(-ETIMEDOUT)&&!cd321x_display_taken(-EIO));
+ assert(!cd321x_display_taken(0));
+''')
+
     # A mux that holds a change up is retried outside the cable-state budget.
     if 'cd321x_pm_mux_held(' in pm:
         lost = ' puts("PASS actual lost events reopen a stale port; unacknowledged events keep their budget with capped backoff");\n'
@@ -694,6 +732,35 @@ int main(void) {
 #endif
  puts("PASS actual held mux gives up after its retries until an event; other failures end the hold-up");
 ''')
+
+    if late_watch:
+        quiet = ' mux_error=notifier_error=switch_error=0;'
+        assert controls.count(quiet) == 1
+        controls = controls.replace(quiet, ' assert(!watches);watch_error=0;\n' + quiet, 1)
+        even = ' assert(!ports&&!altmodes&&!muxes&&!switches&&!notifiers&&!connector.refs);\n}'
+        assert controls.count(even) == 1
+        controls = controls.replace(even, even[:-2] + '\n assert(!watches);\n}', 1)
+        optional = ' assert(cd321x_register_port(&c.tps,&connector)==0&&c.state_valid&&!c.tbt_switch);\n cd321x_unregister_port(&c.tps);balanced();\n'
+        assert controls.count(optional) == 1
+        controls = controls.replace(optional, r''' assert(cd321x_register_port(&c.tps,&connector)==0&&c.state_valid&&!c.tbt_switch);
+ /* ...and the port keeps watching for a router that binds later. */
+ assert(watches==1&&c.tbt_watch_registered&&c.tbt_fwnode==&connector);
+ cd321x_unregister_port(&c.tps);balanced();
+ /* A watch that cannot start leaves the port probed without it. */
+ reset(&c);switch_error=-EPROBE_DEFER;keep_waiting=false;watch_error=-ENOMEM;
+ assert(cd321x_register_port(&c.tps,&connector)==0&&c.state_valid&&!c.tbt_switch);
+ assert(!watches&&!c.tbt_watch_registered&&!c.tbt_fwnode);
+ cd321x_unregister_port(&c.tps);balanced();
+ /* A router present at probe is watched too: it can unbind and bind again with a new switch. */
+ reset(&c);assert(cd321x_register_port(&c.tps,&connector)==0&&c.tbt_switch);
+ assert(watches==1&&c.tbt_watch_registered&&c.tbt_fwnode==&connector);
+ cd321x_unregister_port(&c.tps);balanced();
+ /* Without that watch the port still probes with the router it has. */
+ reset(&c);watch_error=-ENOMEM;
+ assert(cd321x_register_port(&c.tps,&connector)==0&&c.tbt_switch);
+ assert(!watches&&!c.tbt_watch_registered&&!c.tbt_fwnode);
+ cd321x_unregister_port(&c.tps);balanced();
+''', 1)
 
     return prefix + pm + mocks + production + '\n#define TEST_DEFER 1\n#define TEST_FWNODE 1\n' + controls
 

@@ -9,6 +9,12 @@
 
 /dts-v1/;
 
+/*
+ * Let m1n1 boot the PMP, which takes over the fabric and DCS p-states
+ * (needs an m1n1 that makes room for the PMP's tunables).
+ */
+#define APPLE_USE_PMP
+
 #include "t6020.dtsi"
 #include "t602x-j414-j416.dtsi"
 
@@ -45,3 +51,7 @@
 &mtp_mt {
 	firmware-name = "apple/tpmtfw-j414s.bin";
 };
+
+#include "t6020-peripherals.dtsi"
+
+#include "t6020-j414s-peripherals.dtsi"

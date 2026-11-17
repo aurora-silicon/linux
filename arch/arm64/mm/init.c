@@ -36,12 +36,14 @@
 #include <linux/execmem.h>
 
 #include <asm/boot.h>
+#include <asm/ctxr_execmem.h>
 #include <asm/fixmap.h>
 #include <asm/hypervisor.h>
 #include <asm/kasan.h>
 #include <asm/kernel-pgtable.h>
 #include <asm/kvm_host.h>
 #include <asm/memory.h>
+#include <asm/mte.h>
 #include <asm/numa.h>
 #include <asm/rsi.h>
 #include <asm/sections.h>
@@ -106,6 +108,11 @@ static void __init arch_reserve_crashkernel(void)
 	if (!IS_ENABLED(CONFIG_CRASH_RESERVE))
 		return;
 
+	/*
+	 * Under a CTXR window the crash kernel runs on the boot CPU, which the
+	 * window doesn't confine. The window is already reserved, so the crash
+	 * kernel lands outside it.
+	 */
 	ret = parse_crashkernel(boot_command_line, memblock_phys_mem_size(),
 				&crash_size, &crash_base,
 				&low_size, &cma_size, &high);
@@ -298,11 +305,21 @@ void __init arm64_memblock_init(void)
 	}
 
 	early_init_fdt_scan_reserved_mem();
+
+	ctxr_exec_reserve();
 }
 
 void __init bootmem_init(void)
 {
 	unsigned long min, max;
+
+	/*
+	 * unflatten_device_tree() has run fdt_scan_reserved_mem_late(), which
+	 * can free a failed reserved-memory node and punch a hole in the
+	 * window. Close it before arch_reserve_crashkernel() can place the
+	 * crash kernel there, only for it to be freed later as a window page.
+	 */
+	ctxr_exec_keep_reserved();
 
 	min = PFN_UP(memblock_start_of_DRAM());
 	max = PFN_DOWN(memblock_end_of_DRAM());
@@ -333,7 +350,34 @@ void __init bootmem_init(void)
 
 void __init arch_setup_zero_pages(void)
 {
-	__zero_page = phys_to_page(__pa_symbol(empty_zero_page));
+	unsigned long off;
+	void *zero = NULL;
+
+	/*
+	 * Every untouched anonymous page that is read before it is written
+	 * maps the zero page, executable mappings included, and EL0 can't
+	 * execute from an active CTXR window, where empty_zero_page lies.
+	 */
+	if (ctxr_exec_window_reserved()) {
+		zero = memblock_alloc(ARCH_ZERO_PAGE_SIZE, ARCH_ZERO_PAGE_SIZE);
+		if (!zero)
+			pr_warn("ctxr-execmem: no memory for a zero page outside the window\n");
+	}
+
+	if (!zero) {
+		__zero_page = phys_to_page(__pa_symbol(empty_zero_page));
+		return;
+	}
+
+	/*
+	 * As cpu_enable_mte() does for empty_zero_page: the zero page is
+	 * always mapped pte_special(), so nothing else clears its tags.
+	 */
+	if (system_supports_mte())
+		for (off = 0; off < ARCH_ZERO_PAGE_SIZE; off += PAGE_SIZE)
+			mte_clear_page_tags(zero + off);
+
+	__zero_page = virt_to_page(zero);
 }
 
 void __init arch_mm_preinit(void)
@@ -516,8 +560,19 @@ struct execmem_info __init *execmem_arch_setup(void)
 {
 	unsigned long fallback_start = 0, fallback_end = 0;
 	unsigned long start = 0, end = 0;
+	enum execmem_range_flags cflags = 0;
 
 	module_init_limits();
+
+	/*
+	 * When a CTXR executable window is active, back the executable ranges
+	 * (text, BPF, kprobes and — by inheritance — ftrace) with pages drawn
+	 * from the window so every executable physical page stays confined.
+	 * Module *data* (EXECMEM_MODULE_DATA, set explicitly below) is never
+	 * executed and is left on ordinary vmalloc backing.
+	 */
+	if (ctxr_exec_execmem_setup())
+		cflags = EXECMEM_CONFINE;
 
 	/*
 	 * Where possible, prefer to allocate within direct branch range of the
@@ -545,18 +600,30 @@ struct execmem_info __init *execmem_arch_setup(void)
 				.alignment = 1,
 				.fallback_start	= fallback_start,
 				.fallback_end	= fallback_end,
+				.flags	= cflags,
+			},
+			[EXECMEM_MODULE_DATA] = {
+				.start	= start,
+				.end	= end,
+				.pgprot	= PAGE_KERNEL,
+				.alignment = 1,
+				.fallback_start	= fallback_start,
+				.fallback_end	= fallback_end,
 			},
 			[EXECMEM_KPROBES] = {
 				.start	= VMALLOC_START,
 				.end	= VMALLOC_END,
 				.pgprot	= PAGE_KERNEL_ROX,
 				.alignment = 1,
+				.flags	= cflags,
 			},
 			[EXECMEM_BPF] = {
 				.start	= VMALLOC_START,
 				.end	= VMALLOC_END,
 				.pgprot	= PAGE_KERNEL,
 				.alignment = 1,
+				/* JIT images can't use up what modules need. */
+				.flags	= cflags ? cflags | EXECMEM_CONFINE_BOUNDED : 0,
 			},
 		},
 	};

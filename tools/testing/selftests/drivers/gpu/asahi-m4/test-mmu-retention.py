@@ -20,7 +20,7 @@ mm=(ROOT/'drivers/gpu/drm/asahi/mmu.rs').read_text();pt=(ROOT/'drivers/gpu/drm/a
 pre=r'''
 #![allow(dead_code,unused_variables)]
 use std::{cell::RefCell,rc::Rc,mem::{ManuallyDrop,size_of},ops::{Deref,DerefMut,Range},num::NonZeroUsize,sync::{Mutex as StdMutex,atomic::{AtomicBool as StdAtomicBool,AtomicU8,AtomicU32,AtomicU64,AtomicUsize,Ordering,fence}}};
-type Result<T=()> = std::result::Result<T,i32>;const EIO:i32=5;const ETIMEDOUT:i32=110;const EOVERFLOW:i32=75;
+type Result<T=()> = std::result::Result<T,i32>;const EIO:i32=5;const ETIMEDOUT:i32=110;const EOVERFLOW:i32=75;const ENOTSUPP:i32=524;
 static TRIP_LOAD:AtomicUsize=AtomicUsize::new(0);
 struct AtomicBool(StdAtomicBool);impl AtomicBool{fn new(v:bool)->Self{Self(StdAtomicBool::new(v))}fn store(&self,v:bool,o:Ordering){self.0.store(v,o);}fn load(&self,o:Ordering)->bool{let n=TRIP_LOAD.load(Ordering::Relaxed);if n!=0&&TRIP_LOAD.fetch_sub(1,Ordering::Relaxed)==1{self.0.store(true,Ordering::Release);}self.0.load(o)}}
 const UAT_NUM_CTX:usize=64;const UAT_USER_CTX_START:usize=1;const TTBR_VALID:u64=1;const TTBR_ASID_SHIFT:usize=48;const UAT_PGSZ:usize=0x4000;
@@ -34,6 +34,8 @@ mod mem{pub fn sync(){super::BARRIERS.fetch_add(1,super::Ordering::Relaxed);}pub
 #[derive(Clone,Copy,PartialEq,Eq)]enum UatFirmware{Handoff,PublishedRoots}
 struct Handoff{lock_ap:AtomicU8,lock_fw:AtomicU8,turn:AtomicU32,cur_slot:AtomicU32}impl Handoff{fn new()->Self{Self{lock_ap:AtomicU8::new(0),lock_fw:AtomicU8::new(0),turn:AtomicU32::new(0),cur_slot:AtomicU32::new(0xffff)}}
 '''
+# Keep the production firmware predicate in the legacy-firmware harness.
+pre=pre.replace('struct Handoff{', 'impl UatFirmware{'+body(mm,'const fn is_no_peer(')+'}\nstruct Handoff{', 1)
 handoff='\n'.join(body(mm,m) for m in ['fn lock(&self) {\n        self.lock_ap', 'fn unlock(&self) {\n        self.turn', 'fn current_slot('])
 mid=r'''
 }
@@ -55,7 +57,7 @@ struct Mutation;impl Drop for Mutation{fn drop(&mut self){MUTATIONS.fetch_sub(1,
 struct MapTable{fail:bool}impl MapTable{fn unmap_pages(&mut self,_r:Range<u64>)->Result{LEAF_CLEARS.fetch_add(1,Ordering::Relaxed);if self.fail{Err(EIO)}else{Ok(())}}}
 struct OwnerState{dev:(),is_kernel:bool,page_table:MapTable}impl OwnerState{fn mapping_mutation(&mut self)->Mutation{MUTATIONS.fetch_add(1,Ordering::Relaxed);Mutation}fn slot(&self)->Option<u32>{Some(0)}fn tlbi_range(&self,_a:u8,_v:u64,_s:usize){}fn tlbi_contexts_naming_root(&self,_v:u64,_s:usize){}}
 struct Owner(RefCell<OwnerState>);impl Owner{fn lock_inner(&self)->std::cell::RefMut<'_,OwnerState>{self.0.borrow_mut()}}
-struct PinBo;struct KernelMappingInner{owner:Rc<Owner>,uat_inner:Rc<UatInner>,prot:Prot,mapped_size:usize,_bo:Rc<PinBo>}
+struct PinBo;struct KernelMappingInner{owner:Rc<Owner>,uat_inner:Rc<UatInner>,prot:Prot,mapped_size:usize,_bo:Rc<PinBo>,private:Option<std::sync::Arc<AtomicU64>>}
 struct Node{inner:KernelMappingInner,va:u64}impl Deref for Node{type Target=KernelMappingInner;fn deref(&self)->&Self::Target{&self.inner}}impl Node{fn start(&self)->u64{self.va}}
 impl Drop for Node{fn drop(&mut self){assert!(self.inner.owner.0.try_borrow_mut().is_ok(),"node freed under owner lock");assert_eq!(MUTATIONS.load(Ordering::Relaxed),0,"node freed before mutation guard");NODE_DROPS.fetch_add(1,Ordering::Relaxed);}}
 struct KernelMapping(ManuallyDrop<Node>);impl KernelMapping{fn iova(&self)->u64{self.0.start()}fn size(&self)->usize{self.0.mapped_size}fn iova_range(&self)->Range<u64>{self.iova()..self.iova()+self.size()as u64}fn remap_uncached_and_flush(&mut self){FWCTL.fetch_add(1,Ordering::Relaxed);}}
@@ -70,7 +72,7 @@ impl UatPageTable{fn new()->Self{Self{retained:false,ttb_owned:true,ttb:0x804000
 bindings=r'''
 #[derive(Clone,Copy)]struct Token(u32);impl Token{fn last_slot(&self)->u32{self.0}}
 struct Slot;impl Slot{fn changed(&self)->bool{true}fn slot(&self)->u32{3}fn token(&self)->Token{Token(3)}}
-struct Allocator;impl Allocator{fn set_limit(&self,_l:Option<NonZeroUsize>){}fn get(&self,_t:Option<Token>)->Result<Slot>{Ok(Slot)}}
+struct Allocator;impl Allocator{fn set_limit(&self,_l:Option<NonZeroUsize>){}fn get(&self,_t:Option<Token>)->Result<Slot>{Ok(Slot)}fn try_get(&self,_t:Option<Token>)->Result<Slot>{Ok(Slot)}}
 struct VmBinding{active_users:usize,bind_token:Option<Token>,binding:Option<Slot>,generation:u8,ttb:u64}
 #[derive(Clone)]struct Vm{id:u64,binding:Rc<Mutex<VmBinding>>}
 struct VmBind(Vm,u32);
@@ -78,14 +80,15 @@ struct Uat{inner:Rc<UatInner>,slots:Allocator}
 mod module_parameters{pub struct Param;impl Param{pub fn value(&self)->u32{0}}pub static robust_isolation:Param=Param;}
 '''
 helpers='\n'.join(body(mm,m) for m in ['const fn binding_wire_generation(', 'const fn application_ttb1('])
-bind='impl Uat{'+body(mm,'pub(crate) fn bind(&self, vm: &Vm)')+'}\n'
+# bind() is the waiting form of bind_inner(); G15's try_bind() is the other.
+bind='impl Uat{'+body(mm,'pub(crate) fn bind(&self, vm: &Vm)')+'\n'+body(mm,'fn bind_inner(&self, vm: &Vm, wait: bool)')+'}\n'
 vm=r'''
 struct VmInner{id:u64,binding:Rc<Mutex<VmBinding>>,uat_inner:Rc<UatInner>,page_table:UatPageTable}
 impl VmInner{fn ttb(&self)->u64{self.page_table.ttb}}
 '''+body(mm,'impl Drop for VmInner {')
 main=r'''
 fn reset(){TRIP_LOAD.store(0,Ordering::Relaxed);for c in [&NODE_DROPS,&MUTATIONS,&ROOT_FREES,&TREE_FREES,&FWCTL,&LEAF_CLEARS,&BARRIERS]{c.store(0,Ordering::Relaxed);}}
-fn mapping(u:Rc<UatInner>,cached:bool,fail_unmap:bool)->(KernelMapping,Rc<PinBo>){let bo=Rc::new(PinBo);let n=Node{va:0xfffffc2000000000,inner:KernelMappingInner{owner:Rc::new(Owner(RefCell::new(OwnerState{dev:(),is_kernel:true,page_table:MapTable{fail:fail_unmap}}))),uat_inner:u,prot:Prot{cached},mapped_size:0x4000,_bo:bo.clone()}};(KernelMapping(ManuallyDrop::new(n)),bo)}
+fn mapping(u:Rc<UatInner>,cached:bool,fail_unmap:bool)->(KernelMapping,Rc<PinBo>){let bo=Rc::new(PinBo);let n=Node{va:0xfffffc2000000000,inner:KernelMappingInner{owner:Rc::new(Owner(RefCell::new(OwnerState{dev:(),is_kernel:true,page_table:MapTable{fail:fail_unmap}}))),uat_inner:u,prot:Prot{cached},mapped_size:0x4000,_bo:bo.clone(),private:None}};(KernelMapping(ManuallyDrop::new(n)),bo)}
 fn mapping_tests(){
  for (m4,firmware,cached,node_free,fwctl) in [(false,UatFirmware::Handoff,false,1,0),(false,UatFirmware::Handoff,true,1,1),(false,UatFirmware::PublishedRoots,true,1,0),(true,UatFirmware::Handoff,false,1,0),(true,UatFirmware::Handoff,true,0,0)]{reset();let u=uat(m4,firmware);let (m,bo)=mapping(u.clone(),cached,false);drop(m);assert_eq!(NODE_DROPS.load(Ordering::Relaxed),node_free);assert_eq!(FWCTL.load(Ordering::Relaxed),fwctl);assert_eq!(Rc::strong_count(&bo),if node_free==0{2}else{1});assert_eq!(u.failed.load(Ordering::Acquire),m4&&cached);assert_eq!(u.shared.lock().handoff.lock_ap.load(Ordering::Relaxed),0);}
  for turn in [0,1]{reset();let u=uat(true,UatFirmware::Handoff);{let s=u.shared.lock();s.handoff.lock_fw.store(1,Ordering::Relaxed);s.handoff.turn.store(turn,Ordering::Relaxed);}let (m,bo)=mapping(u.clone(),false,false);drop(m);assert_eq!(NODE_DROPS.load(Ordering::Relaxed),0);assert_eq!(LEAF_CLEARS.load(Ordering::Relaxed),0);assert_eq!(Rc::strong_count(&bo),2);assert!(u.failed.load(Ordering::Acquire));assert_eq!(u.check_m4(),Err(EIO));assert_eq!(u.shared.lock().handoff.lock_ap.load(Ordering::Relaxed),0);assert!(BARRIERS.load(Ordering::Relaxed)>=2);}

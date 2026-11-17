@@ -46,6 +46,7 @@ struct sugov_cpu {
 
 	bool			iowait_boost_pending;
 	unsigned int		iowait_boost;
+	u64			iowait_boost_time;
 	u64			last_update;
 
 	unsigned long		util;
@@ -270,6 +271,7 @@ static bool sugov_iowait_reset(struct sugov_cpu *sg_cpu, u64 time,
 
 	sg_cpu->iowait_boost = set_iowait_boost ? IOWAIT_BOOST_MIN : 0;
 	sg_cpu->iowait_boost_pending = set_iowait_boost;
+	sg_cpu->iowait_boost_time = time;
 
 	return true;
 }
@@ -306,6 +308,7 @@ static void sugov_iowait_boost(struct sugov_cpu *sg_cpu, u64 time,
 	if (sg_cpu->iowait_boost_pending)
 		return;
 	sg_cpu->iowait_boost_pending = true;
+	sg_cpu->iowait_boost_time = time;
 
 	/* Double the boost at each request */
 	if (sg_cpu->iowait_boost) {
@@ -328,7 +331,13 @@ static void sugov_iowait_boost(struct sugov_cpu *sg_cpu, u64 time,
  * utilization boosted to speed up the completion of those IO operations.
  * The IO boost value is increased each time a task wakes up from IO, in
  * sugov_iowait_boost(), and it's instead decreased by this function,
- * each time an increase has not been requested (!iowait_boost_pending).
+ * each time an increase has not been requested (!iowait_boost_pending)
+ * for more than a tick. Holding the boost for a tick after the last
+ * request makes the decay independent of how often the frequency is
+ * evaluated: with a short rate limit the governor runs many times between
+ * two wakeups of a task that waits on back-to-back IO, and halving the
+ * boost at each of those evaluations would drop it before the next
+ * request could double it.
  *
  * A CPU which also appears to have been idle for at least one tick has also
  * its IO boost utilization reset.
@@ -347,9 +356,11 @@ static unsigned long sugov_iowait_apply(struct sugov_cpu *sg_cpu, u64 time,
 	if (sugov_iowait_reset(sg_cpu, time, false))
 		return 0;
 
-	if (!sg_cpu->iowait_boost_pending) {
+	if (!sg_cpu->iowait_boost_pending &&
+	    time - sg_cpu->iowait_boost_time > TICK_NSEC) {
 		/*
-		 * No boost pending; reduce the boost value.
+		 * No boost requested for more than a tick; reduce the boost
+		 * value.
 		 */
 		sg_cpu->iowait_boost >>= 1;
 		if (sg_cpu->iowait_boost < IOWAIT_BOOST_MIN) {

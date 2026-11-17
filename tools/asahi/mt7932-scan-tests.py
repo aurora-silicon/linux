@@ -57,6 +57,7 @@ static void put_unaligned_le32(u32 v,void *p){u8 *b=p;for(unsigned i=0;i<4;i++)b
 #define spin_lock_irqsave(l,f) ((void)(l),(f)=0)
 #define spin_unlock_irqrestore(l,f) ((void)(l),(void)(f))
 #define msecs_to_jiffies(x) (x)
+#define ktime_get_boottime_ns() 0ULL
 #define dev_dbg(...) ((void)0)
 static bool command_locked=true;
 #define mutex_unlock(l) do {assert(command_locked);command_locked=false;} while(0)
@@ -70,7 +71,7 @@ struct mt7932 {
  bool scan_aborted,disconnecting,connected,scan_finished,rf_ready;
  bool connect_cancelled,discovering,discovery_finished,link_failed;
  u8 scan_home_channel; enum nl80211_band scan_home_band;
- u64 six_legacy_channels;
+ u64 six_legacy_channels, connect_heard_since;
  unsigned connect_akm; int connect_error;
  struct ieee80211_supported_band band2,band5,band6;
  struct ieee80211_channel *connect_channel_req;
@@ -130,7 +131,7 @@ int main(void){
  m.connected=true;m.scan_home_channel=5;m.scan_home_band=NL80211_BAND_6GHZ;
  request.flags=request.n_6ghz_params=0;
  assert(mt_scan_submit_next(&m)==0);
- assert(bodies[0][2]==1&&bodies[0][3]==8&&bodies[0][4]==1);
+ assert(bodies[0][2]==1&&bodies[0][3]==4&&bodies[0][4]==1);
  assert(!memcmp(bodies[0]+12,"hidden",6));
  assert(bodies[0][0x4cc]==5&&bodies[0][0x4cd]==3);
  /* NO_IR remains passive, even for an explicit legacy SSID. */

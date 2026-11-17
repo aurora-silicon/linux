@@ -4,6 +4,18 @@
 #
 comment "USB Miscellaneous drivers"
 
+config USB_VL122_HUB
+	tristate "VIA Labs VL122 hub sideband configuration"
+	depends on I2C
+	depends on OF
+	select REGMAP_I2C
+	help
+	  Enable this to configure the VIA Labs VL122 USB 2.0 hub through its
+	  reset-only I2C sideband interface. The driver selects and applies the
+	  per-device tuning data supplied by firmware through devicetree.
+
+	  If M is selected, the module will be called vl122-hub.
+
 config USB_USS720
 	tristate "USS720 parport driver"
 	depends on PARPORT
