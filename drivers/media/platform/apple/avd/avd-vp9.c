@@ -347,6 +347,8 @@ static u32 make_flags1(struct avd_ctx *ctx, struct avd_vp9_run *run)
 		frame->seg.flags & V4L2_VP9_SEGMENTATION_FLAG_ENABLED &&
 		(frame->flags & V4L2_VP9_FRAME_FLAG_KEY_FRAME ||
 		 (vp9_ctx->last.valid &&
+		  !avd_vp9_same_size(frame, &vp9_ctx->last)) ||
+		 (vp9_ctx->last.valid &&
 		  !(vp9_ctx->last.seg.flags &
 		    V4L2_VP9_SEGMENTATION_FLAG_ENABLED) &&
 		  vp9_ctx->last.flags & (V4L2_VP9_FRAME_FLAG_KEY_FRAME |
@@ -853,6 +855,13 @@ static int avd_vp9_run_preamble(struct avd_ctx *ctx, struct avd_vp9_run *run)
 		vb2_to_avd_decoded_buf(&run->base.bufs.dst->vb2_buf)->bank =
 			bank - vp9_ctx->bank + 1;
 	}
+
+	/*
+	 * VP9 clears the segmentation map when the frame size changes, and the
+	 * decoder carries part of it over in the seg buffer.
+	 */
+	if (vp9_ctx->last.valid && !avd_vp9_same_size(dec_params, &vp9_ctx->last))
+		memset(vp9_ctx->b->bufs.seg.cpu, 0, vp9_ctx->b->bufs.seg.size);
 
 	vp9_ctx->b->cur.tx_mode = run->prob_updates->tx_mode;
 
