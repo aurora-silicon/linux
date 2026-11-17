@@ -698,7 +698,7 @@ static void init_probs(struct avd_ctx *ctx, const struct avd_vp9_run *run)
 static int validate_dec_params(struct avd_ctx *ctx,
 			       const struct v4l2_ctrl_vp9_frame *dec_params)
 {
-	unsigned int aligned_width, aligned_height;
+	unsigned int aligned_width, aligned_height, width, height;
 
 	/*
 	 * The CAPTURE format is at least 64x64, the minimum of the VP9 frame
@@ -721,11 +721,18 @@ static int validate_dec_params(struct avd_ctx *ctx,
 			       64);
 
 	/*
-	 * Userspace should update the capture/decoded format when the
-	 * resolution changes.
+	 * A larger frame needs a new capture format. On the legacy transport
+	 * a smaller one is decoded into the current buffers with their
+	 * stride: VP9 inter frames can change size and keep predicting from
+	 * references of the old size, which set_refs() scales, so userspace
+	 * may keep the buffers. The firmware transports keep requiring the
+	 * format's size until that is measured there, as for the floor above.
 	 */
-	if (aligned_width != ctx->decoded_fmt.fmt.pix_mp.width ||
-	    aligned_height != ctx->decoded_fmt.fmt.pix_mp.height) {
+	width = ctx->decoded_fmt.fmt.pix_mp.width;
+	height = ctx->decoded_fmt.fmt.pix_mp.height;
+	if (avd_backend_is_open(ctx->dev) ?
+	    (aligned_width > width || aligned_height > height) :
+	    (aligned_width != width || aligned_height != height)) {
 		dev_err(ctx->dev->dev,
 			"unexpected bitstream resolution %dx%d\n",
 			aligned_width, aligned_height);

@@ -287,6 +287,11 @@ int main(int argc,char **argv) {
  {struct avd_vp9_run r={.decode_params=&params};r.base.bufs.dst=current_dst;
   assert(!(make_flags1(&ctx,&r)&VP9_SEG_RESET(1)));}
  avd_vp9_done(&ctx,&src,&dst[1].base.vb,VB2_BUF_STATE_DONE);params.seg.flags=0;
+ /* The firmware transport still needs the format's size: smaller and larger frames are refused. */
+ params.frame_width_minus_1=959;params.frame_height_minus_1=539;
+ current_dst=&dst[0].base.vb;frame.idx=0;assert(avd_vp9_run(&ctx)==-EINVAL);
+ params.frame_width_minus_1=1983;params.frame_height_minus_1=1087;
+ current_dst=&dst[1].base.vb;frame.idx=1;assert(avd_vp9_run(&ctx)==-EINVAL);
  /* The firmware transport keeps the 64-pixel floor. */
  ctx.decoded_fmt.fmt.pix_mp.width=64;ctx.decoded_fmt.fmt.pix_mp.height=64;
  ctx.decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline=64;
@@ -306,6 +311,18 @@ int main(int argc,char **argv) {
  /* A frame larger than the CAPTURE format is still refused. */
  params.frame_width_minus_1=1919;params.frame_height_minus_1=1087;
  assert(avd_vp9_run(&ctx)==-EINVAL);
+ avd_vp9_stop(&ctx);
+ /* On the legacy transport a frame smaller than the capture format runs in it, a larger one is refused. */
+ ctx.decoded_fmt.fmt.pix_mp.width=1920;ctx.decoded_fmt.fmt.pix_mp.height=1088;
+ ctx.decoded_fmt.fmt.pix_mp.plane_fmt[0].bytesperline=1920;
+ dev.queued=false;vp_feature=false;assert(!avd_vp9_start(&ctx));p=ctx.priv;
+ params=(struct v4l2_ctrl_vp9_frame){.flags=V4L2_VP9_FRAME_FLAG_KEY_FRAME|V4L2_VP9_FRAME_FLAG_SHOW_FRAME,
+  .frame_width_minus_1=959,.frame_height_minus_1=539,.bit_depth=8};
+ current_dst=&dst[0].base.vb;frame.idx=0;assert(!avd_vp9_run(&ctx));
+ assert(dst[0].vp9.width==960&&dst[0].vp9.height==540);
+ avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);
+ params.frame_width_minus_1=1983;params.frame_height_minus_1=1087;
+ current_dst=&dst[0].base.vb;frame.idx=0;assert(avd_vp9_run(&ctx)==-EINVAL);
  avd_vp9_stop(&ctx);
  dev.queued=true;vp_feature=true;fail_alloc_after=13;allocating_ctx=&ctx;
  assert(avd_vp9_start(&ctx)==-ENOMEM);allocating_ctx=NULL;
