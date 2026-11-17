@@ -272,9 +272,13 @@ struct effect_job {
  * @tp26_button: Button state of the last Trackpad26 frame.
  * @mtp_c1fe: Whether the MTP trackpad sends the J700 C1FE report layout.
  * @mtp_palms: Whether the controller's contact classes are trusted for palms
- *             on the standard MTP report (T6041, J616s).
+ *             on the standard MTP report (T6041, J616s, J813).
  * @mtp_palm_size: Whether a tool area alone marks an MTP contact as a palm.
  * @mtp_palm_ids: MTP contact IDs reported as palms until they lift.
+ * @mtp_palm_debounce: Whether two consecutive palm classes mark an MTP contact
+ *                     as a palm whatever its tool area (J813).
+ * @mtp_palm_classed: MTP contact IDs the controller classed as palms in the
+ *                    previous report.
  * @ntouches: Number of touches in most recent touch report.
  * @scroll_accel: Number of consecutive scroll motions.
  * @scroll_jiffies: Time of last scroll motion.
@@ -307,6 +311,8 @@ struct magicmouse_sc {
 	bool mtp_palms;
 	bool mtp_palm_size;
 	DECLARE_BITMAP(mtp_palm_ids, U8_MAX + 1);
+	bool mtp_palm_debounce;
+	DECLARE_BITMAP(mtp_palm_classed, U8_MAX + 1);
 
 	int ntouches;
 	int scroll_accel;
@@ -1002,27 +1008,46 @@ static u8 magicmouse_mtp_contact_id(const struct tp_finger *f)
 	return le16_to_cpu(f->unknown1) & 0xff;
 }
 
+/*
+ * The J813 (MacBook Air 13" M5) controller classes contacts the same way, but
+ * most of its palms stay below the classed tool area above: recorded on a J813
+ * in normal use and while typing, 221 of 370 palm-classed contacts never passed
+ * 1400, and fingers reached 1560. Its class flickers to a palm for single
+ * reports on a finger (4 of 868 finger contacts), so there a contact also
+ * counts as a palm once two consecutive reports class it as one. That caught
+ * all 370 palms by their second report, and one finger, classed a palm for its
+ * last reports while lifting.
+ */
 static void magicmouse_mtp_update_palms(struct magicmouse_sc *msc,
 					const u8 *records, int count)
 {
 	DECLARE_BITMAP(palms, U8_MAX + 1);
+	DECLARE_BITMAP(classed, U8_MAX + 1);
 	const struct tp_finger *f;
+	bool palm_class;
 	int i, tool;
 	u8 id, class;
 
 	bitmap_zero(palms, U8_MAX + 1);
+	bitmap_zero(classed, U8_MAX + 1);
 	for (i = 0; i < count; i++) {
 		f = (const struct tp_finger *)(records + i * sizeof(*f));
 		id = magicmouse_mtp_contact_id(f);
 		class = le16_to_cpu(f->unknown2) & 0xff;
 		tool = le16_to_int(f->tool_major);
+		palm_class = class >= MAGICMOUSE_MTP_PALM_CLASS_MIN;
+		if (palm_class)
+			__set_bit(id, classed);
 		if ((msc->mtp_palm_size && tool > MAGICMOUSE_MTP_PALM_TOOL_MAJOR) ||
-		    (class >= MAGICMOUSE_MTP_PALM_CLASS_MIN &&
+		    (palm_class &&
 		     tool > MAGICMOUSE_MTP_CLASSED_PALM_TOOL_MAJOR) ||
+		    (msc->mtp_palm_debounce && palm_class &&
+		     test_bit(id, msc->mtp_palm_classed)) ||
 		    test_bit(id, msc->mtp_palm_ids))
 			__set_bit(id, palms);
 	}
 	bitmap_copy(msc->mtp_palm_ids, palms, U8_MAX + 1);
+	bitmap_copy(msc->mtp_palm_classed, classed, U8_MAX + 1);
 }
 
 static void report_finger_data(struct input_dev *input, int slot,
@@ -1616,7 +1641,7 @@ static int magicmouse_setup_input_mtp(struct input_dev *input,
 		/*
 		 * A palm's tool area on the T6041 and J616s trackpads exceeds
 		 * 5000 once scaled, so allow the full range of the record's
-		 * 16-bit fields there.
+		 * 16-bit fields on every trackpad whose palms are classed.
 		 */
 		int area_max = msc->mtp_palms ? 2 * S16_MAX : 5000;
 
@@ -1643,7 +1668,7 @@ static int magicmouse_setup_input_mtp(struct input_dev *input,
 				     J314_TP_MAX_FINGER_ORIENTATION, 0, 0);
 	}
 
-	/* The T6041, J616s and Trackpad26 controllers classify palms. */
+	/* The T6041, J616s, J813 and Trackpad26 controllers classify palms. */
 	if (msc->mtp_palms || msc->mtp_tp26)
 		input_set_abs_params(input, ABS_MT_TOOL_TYPE, 0, MT_TOOL_MAX,
 				     0, 0);
@@ -2659,11 +2684,18 @@ static int magicmouse_probe(struct hid_device *hdev,
 		msc->mtp_palm_size = !msc->mtp_c1fe &&
 				     of_machine_is_compatible("apple,t6041");
 		/*
+		 * The J813 controller classes contacts the same way, and two
+		 * consecutive palm classes mark its palms.
+		 */
+		msc->mtp_palm_debounce = !msc->mtp_c1fe &&
+					 of_machine_is_compatible("apple,j813");
+		/*
 		 * The J616s controller classes contacts the same way, but its
 		 * fingers reach a tool area of 2475, so only the class marks its
 		 * palms there.
 		 */
 		msc->mtp_palms = msc->mtp_palm_size ||
+				 msc->mtp_palm_debounce ||
 				 (!msc->mtp_c1fe &&
 				  of_machine_is_compatible("apple,j616s"));
 		of_node_put(np);
