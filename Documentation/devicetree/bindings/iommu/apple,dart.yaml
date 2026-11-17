@@ -33,6 +33,7 @@ properties:
           - apple,t8110-dart
           - apple,t6000-dart
           - apple,t8152-dart-gen3
+          - apple,t8152-avd-dart
       - items:
           - const: apple,t8140-ane-dart
           - const: apple,t8140-dart
@@ -358,7 +359,9 @@ allOf:
       properties:
         compatible:
           contains:
-            const: apple,t8152-dart-gen3
+            enum:
+              - apple,t8152-dart-gen3
+              - apple,t8152-avd-dart
     then:
       description:
         The T8152 Gen3 DARTs in front of the display coprocessors and their
@@ -366,7 +369,9 @@ allOf:
         locked, and the operating system only adds page table entries in
         root slots that are empty at handoff. Their TLB command register
         answers translation queries; a stream is invalidated through the
-        TLB invalidation aperture instead.
+        TLB invalidation aperture instead. The T8152 AVD instance uses the
+        same invalidation aperture, but starts unlocked with inactive streams
+        and is initialized by the operating system after its PSD domain is on.
       properties:
         reg:
           minItems: 2
@@ -383,6 +388,17 @@ allOf:
           items:
             - const: dart
             - enum: [dapf, gapf, ps-wr-dis, auxiliary]
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8152-avd-dart
+    then:
+      required:
+        - power-domains
+        - apple,dma-range
+        - apple,tunable
 
 additionalProperties: false
 
