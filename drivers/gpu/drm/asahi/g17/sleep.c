@@ -25,6 +25,7 @@
 
 #define PS_AUTO_ENABLE		BIT(28)
 #define PS_AUTO			GENMASK(27, 24)
+#define PS_MIN			GENMASK(19, 16)
 #define PS_BUSY			BIT(11)
 #define PS_FLAGS		GENMASK(9, 8)
 #define PS_ACTUAL		GENMASK(7, 4)
@@ -266,12 +267,23 @@ int asahi_g17_power_lower(struct device *dev)
 	return ret;
 }
 
-/* The automatic state to raise with: apple,sleep-ps-auto if the DT has it, else the saved one. */
+/*
+ * The automatic state to raise with: apple,sleep-ps-auto if the DT has it, else the saved one.
+ *
+ * The floor (bits 19:16) as well, from apple,sleep-ps-min if the DT has it. The sleep
+ * controller's wake replay writes the GFX word whole, with a zero floor, and the raise keeps
+ * whatever floor it finds. The boot's word has floor 4, and the domain idles at state 4
+ * between jobs. With floor 0 it goes fully off between jobs after every wake instead, and a
+ * long-lived client's compute kick then occasionally never starts. Without the property the
+ * floor stays as found.
+ */
 static u32 asahi_g17_ps_on(struct device *dev, u32 val, u32 saved)
 {
-	u32 ps_auto;
+	u32 ps_auto, ps_min;
 
 	val &= ~(PS_AUTO_ENABLE | PS_AUTO | PS_BUSY | PS_FLAGS | PS_ACTUAL | PS_TARGET);
+	if (!of_property_read_u32(dev->of_node, "apple,sleep-ps-min", &ps_min))
+		val = (val & ~PS_MIN) | FIELD_PREP(PS_MIN, ps_min & 0xf);
 
 	if (!of_property_read_u32(dev->of_node, "apple,sleep-ps-auto", &ps_auto))
 		return val | FIELD_PREP(PS_AUTO, ps_auto) | FIELD_PREP(PS_TARGET, PS_ACTIVE);
@@ -314,8 +326,13 @@ int asahi_g17_power_auto_on(struct device *dev, u32 saved)
 	if (ret)
 		return ret;
 
-	return regmap_write(regmap, offset,
-			    asahi_g17_ps_on(dev, val, saved) | (saved & PS_AUTO_ENABLE));
+	ret = regmap_write(regmap, offset,
+			   asahi_g17_ps_on(dev, val, saved) | (saved & PS_AUTO_ENABLE));
+	/* The word as the wake leaves it, its floor included (bits 19:16). */
+	if (!ret && !regmap_read(regmap, offset, &val))
+		dev_info(dev, "GPU domain after the wake: %#x (floor %lu, saved %#x)\n", val,
+			 FIELD_GET(PS_MIN, val), saved);
+	return ret;
 }
 
 /*

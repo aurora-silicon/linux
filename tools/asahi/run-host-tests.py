@@ -54,6 +54,8 @@ def mutations(flag, names, base, expect=KILL):
 
 # test file -> [(arguments, expectation)]. '{out}' is a fresh directory.
 ASAHI_TESTS = {
+    'm3-stamp-admission-tests.py': [(out(), PASS),
+                                     (out() + ['--mutation', 'live-reseed'], KILL)],
     'hardware-defaults-tests.py': [([], PASS)],
     'j613-mtp-s2idle-tests.py': [([], PASS)],
     # 11eccbedc3ed writes frames without a transport-wide lock.
@@ -85,6 +87,13 @@ ASAHI_TESTS = {
     'apple-dart-fw-tests.py': [(out(), PASS)],
     'apple-dart-fw-harness-tests.py': [([], PASS)],
     'apple-dart-range-tests.py': [([], PASS)],
+    # 551b937502b5 gives up on a stalled J700 display invalidate after 2 ms; the
+    # every-handoff mutation waits it out on every handed-off DART, not just the display's.
+    'apple-dart-tlb-stall-tests.py': [(['--dtc', '{dtc}'], PASS),
+                                      (['--ref', '551b937502b54b0d1eb250bba6d9442b3672a0fb'],
+                                       KILL),
+                                      (['--dtc', '{dtc}', '--mutation', 'every-handoff'],
+                                       KILL)],
     'apple-router-sleep-tests.py': [(out('--output'), PASS)],
     'asahi-stats-raw-tests.py': [([], PASS)],
     'agx-stats-busy-tests.py': [([], PASS), (['--negative-control'], PASS)],
@@ -127,6 +136,9 @@ ASAHI_TESTS = {
     'brcmfmac-scan-timeout-tests.py': [(out('--output'), PASS)],
     'brcmfmac-sleep-lifetime-tests.py': [([], PASS)],
     'cio-native-tests.py': [(out('--output'), PASS)],
+    'centauri-wifi-pm-tests.py': [(out(), PASS), (out() + ['--negative-controls'], PASS)],
+    'centauri-bt-arena-tests.py': [(out(), PASS), (out() + ['--negative-controls'], PASS)],
+    'centauri-recovery-tests.py': [(out(), PASS), (out() + ['--negative-controls'], PASS)],
     'clpc-gpu-demand-tests.py': [([], PASS)],
     # The old policy always disabled compute preemption.
     'compute-preempt-tests.py': [(out(), PASS),
@@ -136,6 +148,7 @@ ASAHI_TESTS = {
     'dart-sleep-power-tests.py': [([], PASS)],
     'dart-sleep-snapshot-tests.py': [([], PASS)],
     'dart-sleep-writer-tests.py': [([], PASS)],
+    'backlight-coldboot-tests.py': [(out('--output'), PASS), (out('--output') + ['--negative-controls'], PASS)],
     'dcp14-backlight-tests.py': [([], PASS)],
     'dcp14-panel-tests.py': [([], PASS)],
     'devcoredump-init-tests.py': [([], PASS)],
@@ -156,17 +169,39 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('fields', 'range', 'timestamp', 'age', 'delivery',
                                    'quarantine', 'epoch', 'cutoff', 'whole-batch', 'legacy-format', 'read-drain'), out()),
     'g17-admission-deadline-tests.py': [([], PASS)],
-    'g17-admission-order-tests.py': [([], PASS)],
+    'g17-admission-order-tests.py': [([], PASS)]
+        + mutations('--mutation', ('no-held-free', 'no-held-sibling', 'no-held-refusal', 'no-held-pick',
+                                   'no-held-spare', 'no-held-other', 'no-held-cancel', 'no-held-killed',
+                                   'no-held-used', 'no-held-wake', 'wake-on-every-clear', 'no-held-stop',
+                                   'held-blocks-owner', 'hold-ignores-release', 'hold-ignores-work',
+                                   'close-unheld', 'hold-after-release', 'put-back-own-work',
+                                   'sync-skips-lent', 'lent-close-unheld', 'parked-stays-held',
+                                   'sync-clobbers', 'sync-no-wake'), []),
     'g17-capacity-backoff-tests.py': [([], PASS)],
     'g17-capacity-fault-tests.py': [([], PASS)],
     'g17-compute-constructor-tests.py': [([], PASS)],
+    'g17-compute-owed-stamp-tests.py': [([], PASS)]
+        + mutations('--mutation', ('own-finished', 'no-retire-glue', 'retire-unchecked', 'no-expiry',
+                                   'no-step-past', 'pop-owed', 'head-includes-owed', 'held-stamped-pops',
+                                   'crossed-behind-owed', 'owed-classified', 'rebind-check-entry',
+                                   'timeout-fails-retired', 'no-owed-poll'), []),
     'g17-compute-deadline-tests.py': [([], PASS)],
     'g17-compute-growth-deadline-tests.py': [([], PASS)],
+    'g17-kill-route-tests.py': [([], PASS)]
+        + mutations('--mutation', ('no-executed-route', 'no-executed-input', 'kill-twice', 'executed-on-m5',
+                                   'unsafe-wait', 'owed-blocks-kill', 'open-owed-skipped'), []),
     'g17-firmware-selection-tests.py': [([], PASS)],
     'g17-growth-gate-tests.py': [([], PASS)],
     'g17-growth-tests.py': [([], PASS)],
+    'g17-object-fence-tests.py': [([], PASS)]
+        + mutations('--mutation', ('overrun-work-states', 'unseen-strict', 'retain-not-sticky',
+                                   'node-unmarked', 'no-release'), []),
     'g17-owner-release-order-tests.py': [([], PASS)],
     'g17-pool-release-tests.py': [([], PASS)],
+    # no-drain-release is the old rule: only a lease ends a slot's quarantine.
+    'g17-quarantine-drain-tests.py': [([], PASS)]
+        + mutations('--mutation', ('no-drain-release', 'without-witness', 'ignore-leases', 'no-last-lease',
+                                   'witness-covers-later-failure', 'unquarantined-drain'), []),
     'g17-resource-tests.py': [([], PASS)],
     'g17-shared-pool-tests.py': [([], PASS)],
     'g17-t6041-initdata-tests.py': [([], PASS)],
@@ -185,7 +220,7 @@ ASAHI_TESTS = {
                                (out('--output') + ['--old'], KILL)],
     'neo-stability-tests.py': [(out('--output'), PASS)]
         + mutations('--mutation', ('sep-syscore', 'wake-irq', 'rx-suspend', 'stale-policy',
-                                   'usb-rpm', 'vlp-client', 'six-band'), out('--output'))
+                                   'usb-rpm', 'usb-epoch-syscore', 'vlp-client', 'six-band'), out('--output'))
         + [(out('--output') + ['--old-usb'], KILL), (out('--output') + ['--old-regulatory'], KILL)],
     'pciec-policy-tests.py': [(out(), PASS)],
     'pmgr-bus-tests.py': [([], PASS)],
@@ -238,7 +273,7 @@ ASAHI_TESTS = {
 }
 
 # Rust unit-test files built with `rustc --test`, and shell drivers.
-ASAHI_RUST = ['m3-batching-tests.rs', 'm3-runtime-tests.rs', 'pmp-bootargs-tests.rs', 'pmp-power-tests.rs',
+ASAHI_RUST = ['m3-batching-tests.rs', 'm3-stamp-tests.rs', 'm3-runtime-tests.rs', 'pmp-bootargs-tests.rs', 'pmp-power-tests.rs',
               'usage-tests.rs']
 ASAHI_SHELL = ['g17-ray-query-timeout-tests.sh', 'g17-traversal-admission-tests.sh']
 

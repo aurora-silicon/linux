@@ -21,6 +21,7 @@
 #include <kunit/static_stub.h>
 #include <linux/bitfield.h>
 #include <linux/cleanup.h>
+#include <linux/completion.h>
 #include <linux/delay.h>
 #include <linux/devm-helpers.h>
 #include <linux/iopoll.h>
@@ -934,6 +935,7 @@ struct apple_atcphy {
 	struct delayed_work usb3_port_work;
 	unsigned int usb3_port_retries;
 	struct work_struct sleep_finish_work;
+	struct completion sleep_finish_done;
 	bool sleep_finish_kept;
 	enum atcphy_mode mode;
 	int dp_link_rate;
@@ -5125,10 +5127,17 @@ int apple_atc_dp_tunnel_open(struct phy *phy)
 {
 	struct apple_atcphy *atcphy;
 
-	if (!phy || phy->ops != &apple_atc_dp_phy_ops)
+	if (!phy)
 		return -EINVAL;
+	/*
+	 * Everything but t600x has nothing to open, whichever driver provides
+	 * the PHY: T6050's tunnel clocks belong to atc-t6050-dp.c, whose PHY
+	 * this driver does not know, and start from the link rate alone.
+	 */
 	if (!apple_atc_tunnel_is_t600x())
 		return -EOPNOTSUPP;
+	if (phy->ops != &apple_atc_dp_phy_ops)
+		return -EINVAL;
 	atcphy = phy_get_drvdata(phy);
 	guard(mutex)(&atcphy->lock);
 	if (atcphy->mode != APPLE_ATCPHY_MODE_USB4 && atcphy->mode != APPLE_ATCPHY_MODE_TBT)
@@ -6793,12 +6802,6 @@ static int atcphy_probe(struct platform_device *pdev)
 	apple_atc_tunnel_wiring(atcphy);
 	mutex_init(&atcphy->lock);
 	platform_set_drvdata(pdev, atcphy);
-	ret = devm_delayed_work_autocancel(dev, &atcphy->usb3_port_work, atcphy_usb3_port_work);
-	if (ret)
-		return ret;
-	ret = devm_work_autocancel(dev, &atcphy->sleep_finish_work, atcphy_sleep_finish_work);
-	if (ret)
-		return ret;
 
 	ret = atcphy_map_resources(pdev, atcphy);
 	if (ret)
@@ -6847,6 +6850,16 @@ static int atcphy_probe(struct platform_device *pdev)
 			return ret;
 		atcphy->idle_rpm = true;
 	}
+
+	/* Unpublish consumers first, then drain work before its resources are released. */
+	ret = devm_delayed_work_autocancel(dev, &atcphy->usb3_port_work, atcphy_usb3_port_work);
+	if (ret)
+		return ret;
+	init_completion(&atcphy->sleep_finish_done);
+	complete(&atcphy->sleep_finish_done);
+	ret = devm_work_autocancel(dev, &atcphy->sleep_finish_work, atcphy_sleep_finish_work);
+	if (ret)
+		return ret;
 
 	ret = atcphy_probe_finalize(atcphy);
 	if (ret)
@@ -7472,6 +7485,7 @@ static void atcphy_sleep_finish_work(struct work_struct *work)
 	struct apple_atcphy *atcphy = container_of(work, struct apple_atcphy, sleep_finish_work);
 
 	atcphy_sleep_finish(atcphy, READ_ONCE(atcphy->sleep_finish_kept));
+	complete(&atcphy->sleep_finish_done);
 }
 
 /*
@@ -7485,9 +7499,19 @@ void apple_atcphy_sleep_finish_async(struct phy *usb2_phy, bool kept)
 	if (!atcphy)
 		return;
 	WRITE_ONCE(atcphy->sleep_finish_kept, kept);
+	reinit_completion(&atcphy->sleep_finish_done);
 	queue_work(system_dfl_wq, &atcphy->sleep_finish_work);
 }
 EXPORT_SYMBOL_GPL(apple_atcphy_sleep_finish_async);
+
+/* The controller serializes finish epochs; this query never joins the PHY's work. */
+bool apple_atcphy_sleep_finish_done(struct phy *usb2_phy)
+{
+	struct apple_atcphy *atcphy = atcphy_from_usb2_phy(usb2_phy);
+
+	return !atcphy || completion_done(&atcphy->sleep_finish_done);
+}
+EXPORT_SYMBOL_GPL(apple_atcphy_sleep_finish_done);
 
 void apple_atcphy_sleep_finish_flush(struct phy *usb2_phy)
 {

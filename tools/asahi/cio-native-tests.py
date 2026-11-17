@@ -27,10 +27,13 @@ def main():
              'drivers/thunderbolt/apple-cio-sleep.c',
              'drivers/pci/controller/pcie-apple.c', 'drivers/thunderbolt/apple.c']
     sources = {p: (ROOT / p).read_text() for p in paths}
-    names = ['apple_nhi_cio_prepare', 'apple_nhi_cio_start_cpu', 'apple_nhi_cio_power_on',
+    names = ['apple_nhi_cio_phy',
+             'apple_nhi_cio_prepare', 'apple_nhi_cio_start_cpu', 'apple_nhi_cio_power_on',
              'apple_nhi_cio_wake', 'apple_nhi_cio_domains_off', 'apple_nhi_cio_dart_off',
              'apple_nhi_cio_suspend', 'apple_nhi_cio_resume', 'apple_nhi_cio_complete']
-    methods = '\n'.join(function(sources[paths[1]], n) for n in names)
+    # The PHY's steps, as T8132's lane PHY handle takes them (T6050's calls are not modelled).
+    steps = re.search(r'^enum \{ CIO_PHY_PREPARE,[^\n]+', sources[paths[1]], re.M).group()
+    methods = steps + '\n' + '\n'.join(function(sources[paths[1]], n) for n in names)
     defines = '\n'.join(re.findall(r'^#define\s+(?:PORT_|APPLE_CIO_M3_|APPLE_CIO_LSTX_)[^\n]+',
                                     sources[paths[2]] + sources[paths[3]], re.M))
     fixture = Path(__file__).with_suffix('.c').read_text()
@@ -38,23 +41,29 @@ def main():
     fixture = fixture.replace('/* ACTUAL_PCIE */', sources[paths[0]])
     fixture = fixture.replace('/* ACTUAL_NHI */', methods)
     mutations = {
-        'forget-local-perst-loss': ('pcie->cio_port_reset = true;', 'pcie->cio_port_reset = false;'),
+        'forget-local-perst-loss': ('\t\tgoto unwind;\n\tpcie->cio_port_reset = true;',
+                                    '\t\tgoto unwind;\n\tpcie->cio_port_reset = false;'),
         'inverted-t8132-reset-ack': ('stat & PORT_TUNSTAT_PERST_ACK_PEND,',
                                    '!(stat & PORT_TUNSTAT_PERST_ACK_PEND),'),
-        'skip-port-dart-off': ('ret = apple_dart_cio_off(pcie->cio_dart);', 'ret = 0;'),
+        'skip-port-dart-off': ('before APPCLK. */\n\tret = apple_dart_cio_off(pcie->cio_dart);',
+                               'before APPCLK. */\n\tret = 0;'),
         'skip-nhi-dart-off': ('ret = apple_nhi_cio_dart_off(anhi);', 'ret = 0;'),
         'skip-dart-restore': ('return apple_dart_cio_on(anhi->cio_dart);', 'return 0;'),
         'lose-partial-domain': ('anhi->cio_pd_suspended |= BIT(n);', '(void)n;'),
-        'skip-port-unwind': ('recover = apple_pcie_cio_resume(pcie);', 'recover = 0;'),
+        'skip-port-unwind': ('callback failed. */\n\trecover = apple_pcie_cio_resume(pcie);',
+                             'callback failed. */\n\trecover = 0;'),
         'skip-nhi-unwind': ('recover = apple_nhi_cio_power_on(anhi) ?: apple_nhi_cio_wake(anhi);',
                             'recover = 0;'),
         'skip-unwind-power-cycle': ('if (!anhi->cio_cycled) {\n\t\trecover', 'if (false) {\n\t\trecover'),
         'panic-on-lost-port': ('return pcie->resume_failed ? 0 : ret;', 'return ret;'),
         'wait-for-lost-link': ('if (pcie->cio_lost)\n\t\treturn -ENOTCONN;', ''),
-        'ignore-lost-pci': ('apple_pcie_tunnel_cio_lost(anhi->cio_pcie);', '(void)0;'),
+        'ignore-lost-pci': ('tunnels\\n");\n\t\tapple_pcie_tunnel_cio_lost(anhi->cio_pcie);',
+                            'tunnels\\n");\n\t\t(void)0;'),
         'skip-failed-port-stop': ('/* Until it is back, a later teardown must still stop the port. */\n\tport->needs_stop = true;', ''),
         'ignore-physical-state': ('ret = apple_pmgr_ps_verify_state(pd, true);',
                                   'ret = 0;'),
+        't6050-port-refuses-late': ('ret = apple_dart_cio_check(pcie->cio_dart, true);',
+                                    'ret = 0;'),
     }
     variants = {'real': fixture}
     for name, (old, new) in mutations.items():

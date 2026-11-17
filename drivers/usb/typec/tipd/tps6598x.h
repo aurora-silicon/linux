@@ -479,6 +479,9 @@ struct cd321x {
 	unsigned int rearm_resets;
 	bool dp_sink_reported;
 	bool dp_irq_hpd;
+	/* A plug was in when the sleep began, and a wake's first port state is still to be applied */
+	bool sleep_plug;
+	bool wake_apply;
 
 	struct cd321x_status update_status;
 	struct delayed_work update_work;
@@ -510,8 +513,8 @@ struct sn201202x {
 	bool ldcm_mitigated;
 	/* ldcm_mitigated matches the controller (unknown after a reset) */
 	bool ldcm_mitigation_known;
-	/* J714s, no connector (its MagSafe controller): only its system sleep state is driven */
-	bool sleep_only;
+	/* A mitigation was requested since the controller's last reset */
+	bool ldcm_requested;
 };
 
 extern const struct tipd_data *tipd_hw_variants[];
