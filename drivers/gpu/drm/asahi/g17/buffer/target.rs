@@ -42,6 +42,15 @@ const GTP6_SIZE: usize = GTP_SLOTS
 /// macOS 26.6.2 on the J616C spaces a clustered pass's metadata 2, 3 and 4 0x1180, 0x1400
 /// and 0x1600 apart: metadata 2 needs 0x1180, more than the M2 Pro/Max 0xc00.
 const GTP_MULTI_CLUSTER_SIZES: [usize; 3] = [0x1180, 0x280 * 16, 0x10 * 128];
+/// Floor for four-cluster metadata 1 (`0x1c920`, `gtp[7]`).
+///
+/// The M2 Pro/Max per-block formula yields 0x100 (32x32 utiles) or 0x180 (16x16) on a
+/// 3456x2234 Retina frame (Minecraft RD32) and 0x1100 on 10240x10240 (`point_size_10000`,
+/// 16x16 utiles). Because metadata 1 is the last sub-buffer in the TPC object, neither
+/// macOS's allocation size nor the hardware's written high-water mark was visible in the
+/// J616C 26.6.2 capture; keep a conservative 16 KiB floor until a capture or hardware
+/// high-water measurement shows the true upper bound.
+const META1_MIN_SIZE: usize = 0x4000;
 const META1_BLOCK_SIZE: usize = 0x44;
 
 /// Per-command geometry, independent of the capacity already allocated.
@@ -142,7 +151,7 @@ impl Layout {
                         meta1_blocks.checked_mul(META1_BLOCK_SIZE).ok_or(EOVERFLOW)?,
                         0x80,
                     )?
-                    .max(GTP_FIXED_SIZES[3]),
+                    .max(META1_MIN_SIZE),
                 ]
             } else {
                 GTP_FIXED_SIZES
@@ -506,5 +515,29 @@ mod tests {
         layout.tpc_size = cfg::TPC_MAX + 1;
         layout.tpc_end = layout.tpc_size;
         assert_eq!(layout.tpc_capacity(), Err(ERANGE));
+    }
+
+    #[test]
+    fn four_cluster_v25g83_metadata_layout() {
+        let mut retina = pass(3456, 32);
+        retina.height = 2234;
+        for (target, utile) in [(retina, 32), (retina, 16), (pass(10240, 16), 16)] {
+            let mut p = target;
+            p.utile_width = utile;
+            p.utile_height = utile;
+            let layout = Layout::new(&p, 4, RegisterPrograms::V25G83).unwrap();
+            let gtp4 = layout.gtp[4].unwrap();
+            let gtp5 = layout.gtp[5].unwrap();
+            let gtp6 = layout.gtp[6].unwrap();
+            let gtp7 = layout.gtp[7].unwrap();
+            assert_eq!(gtp5 - gtp4, GTP_MULTI_CLUSTER_SIZES[0]);
+            assert!(gtp6 - gtp5 >= GTP_MULTI_CLUSTER_SIZES[1]);
+            assert!(gtp7 - gtp6 >= GTP_MULTI_CLUSTER_SIZES[2].max(GTP6_SIZE));
+            assert_eq!(layout.tpc_end - gtp7, META1_MIN_SIZE);
+        }
+        // Two-cluster V25G83 (M4 Pro) keeps its original fixed metadata sizes.
+        let two = Layout::new(&retina, 2, RegisterPrograms::V25G83).unwrap();
+        assert_eq!(two.gtp[5].unwrap() - two.gtp[4].unwrap(), GTP_FIXED_SIZES[0]);
+        assert_eq!(two.tpc_end - two.gtp[7].unwrap(), GTP_FIXED_SIZES[3]);
     }
 }
