@@ -84,8 +84,6 @@
 		mux-control-names = "typec0";
 		/* Enabled by the boot loader once it has checked the session. */
 		status = "disabled";
-		#address-cells = <2>;
-		#size-cells = <2>;
 
 		piodma {
 			iommus = <&dispext0_dart 16>;
@@ -153,8 +151,6 @@
 		mux-control-names = "typec0";
 		/* Enabled by the boot loader once it has checked the session. */
 		status = "disabled";
-		#address-cells = <2>;
-		#size-cells = <2>;
 
 		piodma {
 			iommus = <&dispext1_dart 16>;

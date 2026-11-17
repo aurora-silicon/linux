@@ -76,7 +76,7 @@ struct apple_dcp {
  unsigned crtc_unplugs,typec_unplugs,typec_generation,typec_reconnect_tries,external_generation,external_crtc_generation;
  int external_lock,hpd_mutex,relink_lock,relink,typec_iomfb_hpd_ready;
  struct delayed_work typec_reconnect_wq,placeholder_edid_wq,external_stop_retry_wq,bl_fallback_wq;
- struct work_struct external_stop_work;
+ struct work_struct external_stop_work,ext26_blank_work;
  void *dev,*hdmi_hpd,*avep;
 };
 struct platform_device { struct apple_dcp *data; };
@@ -95,6 +95,10 @@ static bool iomfb_is_m4(struct apple_dcp *p) { return p->m4; }
 static bool iomfb_v14_7_panel_nits(struct apple_dcp *p) { return p->v14; }
 static bool dcp_has_panel(struct apple_dcp *p) { return p->panel; }
 static bool dcp_is_external_h17p(struct apple_dcp *p) { return p->external; }
+/* These fixtures exercise the internal panel and the H17P external path. */
+static bool dcp_is_ext26(struct apple_dcp *p) { (void)p;return false; }
+static bool dcp_is_retained_external(struct apple_dcp *p) { return dcp_is_external_h17p(p); }
+static void flush_work(struct work_struct *p) { (void)p;assert(!"unexpected native26 work flush"); }
 static bool dcp_is_typec_output(struct apple_dcp *p) { return p->typec; }
 static bool dcp_h17g_panel(struct apple_dcp *p) { return p->hw.iomfb_method_profile==DCP_IOMFB_METHODS_H17G; }
 static void dcp_backlight_kick(struct apple_dcp *p) { assert(p->backlight.state.ready);kicks++; }

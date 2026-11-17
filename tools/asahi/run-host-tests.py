@@ -54,6 +54,31 @@ def mutations(flag, names, base, expect=KILL):
 
 # test file -> [(arguments, expectation)]. '{out}' is a fresh directory.
 ASAHI_TESTS = {
+    'dcpext26-crossbar-union-tests.py': [([], PASS), (['--drop-native26'], KILL), (['--drop-t8132'], KILL)],
+    'dcpext26-suspend-route-tests.py': [([], PASS), (['--native-parks'], KILL), (['--drop-h17p-park'], KILL)],
+    'j613-mux-order-tests.py': [([], PASS), (['--negative-control'], KILL),
+                                 (['--ignore-nomodeset'], KILL), (['--drop-failed-completion'], KILL),
+                                 (['--ignore-external-node'], KILL), (['--drop-board-scope'], KILL)],
+    'display-sleep-merge-tests.py': [(out(), PASS)],
+    'dcpext26-slot-unregister-tests.py': [(out(), PASS)],
+    'dcpext26-budget-tests.py': [([], PASS)],
+    'dcpext26-queue-tests.py': [([], PASS), (['--drop-v27-close'], KILL)],
+    'dcpext26-retrain-tests.py': [([], PASS), (['--negative-control'], KILL)],
+    'dcpext26-lifecycle-tests.py': [([], PASS)],
+    'dcpext26-modeset-tests.py': [([], PASS)],
+    'dcpext26-parity-tests.py': [([], PASS)],
+    'dcpext26-present-tests.py': [([], PASS)],
+    'dcpext26-profile-tests.py': [([], PASS)],
+    'dcpext26-edid-tests.py': [([], PASS)],
+    'dcpext26-changeset-tests.py': [([], PASS)],
+    'dcpext26-admission-tests.py': [([], PASS)],
+
+    'dcpext26-startup-tests.py': [([], PASS)],
+    'iomfb-startup-tests.py': [([], PASS)],
+    'dcpext26-wire-tests.py': [([], PASS)],
+    'pmp-native26-tests.py': [([], PASS)],
+
+
     'm3-stamp-admission-tests.py': [(out(), PASS),
                                      (out() + ['--mutation', 'live-reseed'], KILL)],
     'hardware-defaults-tests.py': [([], PASS)],

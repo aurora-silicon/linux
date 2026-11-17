@@ -10,6 +10,7 @@
 
 #include <linux/iommu.h>
 #include <linux/iopoll.h>
+#include <linux/ktime.h>
 #include <linux/jiffies.h>
 #include <linux/of.h>
 #include <linux/overflow.h>
@@ -146,6 +147,7 @@ struct apple_rtkit_rx_work {
 	struct apple_rtkit *rtk;
 	u8 ep;
 	u64 msg;
+	u64 received_ns;
 	struct work_struct work;
 };
 
@@ -1452,7 +1454,7 @@ static void apple_rtkit_pmp_aux_rx(struct apple_rtkit *rtk, u64 msg)
 }
 
 static void apple_rtkit_rx_dispatch(struct apple_rtkit *rtk, u8 ep, u64 msg,
-				    bool retained)
+				    bool retained, u64 received_ns)
 {
 	if (READ_ONCE(rtk->shutting_down)) {
 		if (retained) {
@@ -1494,9 +1496,13 @@ static void apple_rtkit_rx_dispatch(struct apple_rtkit *rtk, u8 ep, u64 msg,
 		apple_rtkit_oslog_rx(rtk, msg);
 		break;
 	case APPLE_RTKIT_APP_ENDPOINT_START ... 0xff:
-		if (rtk->ops->recv_message)
-			rtk->ops->recv_message(rtk->cookie, ep,
-					       msg);
+		/* Buffered sleep packets have no original receive timestamp. */
+		if (received_ns && rtk->ops->recv_message_timed)
+			rtk->ops->recv_message_timed(rtk->cookie, ep, msg, received_ns);
+		else if (rtk->ops->recv_message)
+			rtk->ops->recv_message(rtk->cookie, ep, msg);
+		else if (rtk->ops->recv_message_timed)
+			rtk->ops->recv_message_timed(rtk->cookie, ep, msg, 0);
 		else
 			dev_warn(
 				rtk->dev,
@@ -1542,7 +1548,7 @@ static void apple_rtkit_rx_work(struct work_struct *work)
 {
 	struct apple_rtkit_rx_work *w = container_of(work, struct apple_rtkit_rx_work, work);
 
-	apple_rtkit_rx_dispatch(w->rtk, w->ep, w->msg, false);
+	apple_rtkit_rx_dispatch(w->rtk, w->ep, w->msg, false, w->received_ns);
 	apple_rtkit_saved_job_done(w->rtk);
 	kfree(w);
 }
@@ -1553,7 +1559,7 @@ static void apple_rtkit_m5_saved_work(struct work_struct *work)
 	struct apple_mbox_msg msg;
 
 	while (kfifo_get(&rtk->m5_saved.deferred, &msg))
-		apple_rtkit_rx_dispatch(rtk, msg.msg1, msg.msg0, true);
+		apple_rtkit_rx_dispatch(rtk, msg.msg1, msg.msg0, true, 0);
 	apple_rtkit_saved_job_done(rtk);
 }
 
@@ -1629,6 +1635,7 @@ static void apple_rtkit_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 	struct apple_rtkit *rtk = cookie;
 	struct apple_rtkit_rx_work *work;
 	u8 ep = msg.msg1;
+	u64 received_ns = ktime_get_ns();
 
 	if (READ_ONCE(rtk->shutting_down))
 		return;
@@ -1691,6 +1698,7 @@ static void apple_rtkit_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 	work->rtk = rtk;
 	work->ep = ep;
 	work->msg = msg.msg0;
+	work->received_ns = received_ns;
 	INIT_WORK(&work->work, apple_rtkit_rx_work);
 	apple_rtkit_saved_queue(rtk, rtk->wq, &work->work);
 }

@@ -734,13 +734,18 @@ static bool sn201202x_sleep_event(struct tps6598x *tps)
 }
 
 /*
- * On the J714s, the board the sleep has run on, the probe and the sleep's SLEEP command print a
- * line; on every other machine they don't. A controller without a connector (the J714s's
- * MagSafe one, hpm5) is probed as any other: it registers its Type-C port and power supply, and
- * with apple,sleep-ssps it follows the system's sleep as the USB-C ports' controllers do (woken
- * and switched to S3 at the prepare, SLEEP at the suspend, woken at the resume and switched to
- * S0 at the complete).
+ * On the T6050 boards that sleep (J714s, J716c), the probe and the sleep's SLEEP command print a
+ * line; on every other machine they don't. A controller without a connector (the MagSafe one,
+ * hpm5) is probed as any other: it registers its Type-C port and power supply, and with
+ * apple,sleep-ssps it follows the system's sleep as the USB-C ports' controllers do (woken and
+ * switched to S3 at the prepare, SLEEP at the suspend, woken at the resume and switched to S0
+ * at the complete).
  */
+static bool sn201202x_sleep_board(void)
+{
+	return of_machine_is_compatible("apple,j714s") || of_machine_is_compatible("apple,j716c");
+}
+
 static bool sn201202x_j714s(void)
 {
 	return of_machine_is_compatible("apple,j714s");
@@ -965,7 +970,7 @@ static int sn201202x_probe(struct spmi_device *device)
 	tps->data->irq_handler(tps->irq, tps);
 
 	sn201202x_idle_sleep_start(tps);
-	if (sn201202x_j714s())
+	if (sn201202x_sleep_board())
 		dev_info(tps->dev, "port controller ready%s\n", sn->polled ? ", polled" : "");
 	return 0;
 }
@@ -1057,7 +1062,7 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_suspend(struct device *dev)
 	tipd_usb_wake(tps, true);
 	reinit_completion(&sn->sleep_completion);
 	err = spmi_command_sleep(sn->sdev);
-	if (pm_suspend_via_firmware() && sn201202x_j714s())
+	if (pm_suspend_via_firmware() && sn201202x_sleep_board())
 		dev_info(dev, "SLEEP: %d\n", err);
 	if (err)
 		goto out_resume;

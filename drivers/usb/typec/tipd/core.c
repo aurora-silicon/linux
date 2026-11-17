@@ -13,6 +13,7 @@
 #include <linux/acpi.h>
 #include <linux/gpio/consumer.h>
 #include <linux/of.h>
+#include <linux/soc/apple/j613-display.h>
 #include <linux/power_supply.h>
 #include <linux/regmap.h>
 #include <linux/unaligned.h>
@@ -353,15 +354,14 @@ static int tps6598x_disconnect(struct tps6598x *tps, u32 status)
 /*
  * The sleep's rules for the port controllers' system power state command (the controller is
  * woken first, the command's end is read at intervals, a failed S3 refuses the sleep, the
- * command's limit and its lines) are in force on the board they have run on, the J714s, and on
- * the M5 MacBook Airs (J813, J815), whose SN201202x controllers sit on the same generation 4
- * SPMI and whose sleep, like the J714s's, asks for the command (apple,sleep-ssps). Elsewhere,
- * other boards with the same SoCs included, the command is as it was. Only a firmware-driven
- * sleep sends it.
+ * command's limit and its lines) apply on the J714s, J716c, J813 and J815.
+ * These boards send the command (apple,sleep-ssps) during firmware-driven
+ * sleep. Other boards retain the original command behavior.
  */
 static bool tipd_sleep_ssps_rules(void)
 {
 	return of_machine_is_compatible("apple,j714s") ||
+	       of_machine_is_compatible("apple,j716c") ||
 	       of_machine_is_compatible("apple,j813") ||
 	       of_machine_is_compatible("apple,j815");
 }
@@ -2764,6 +2764,12 @@ VISIBLE_IF_KUNIT int cd321x_init_mux(struct cd321x *cd321x)
 }
 EXPORT_SYMBOL_IF_KUNIT(cd321x_init_mux);
 
+/* The J613 profile enables its disabled DCP routes during DRM coldplug. */
+static bool cd321x_display_gate_pending(struct tps6598x *tps)
+{
+	return apple_j613_display_pending(tps->dev);
+}
+
 static int
 cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 {
@@ -3477,6 +3483,10 @@ int tipd_init(struct tps6598x *tps)
 	u32 vid = 0;
 	int ret, cleanup_ret;
 	bool reset_allowed = true;
+
+	/* Do not retain a PHY-only mux handle before the route changeset runs. */
+	if (cd321x_display_gate_pending(tps))
+		return -EPROBE_DEFER;
 
 	dev_dbg(tps->dev, "Type-C probe start\n");
 	tps->reset = devm_gpiod_get_optional(tps->dev, "reset", GPIOD_OUT_LOW);
