@@ -208,6 +208,18 @@ int main(int argc,char **argv) {
   assert(p->bank[0].busy&&p->bank[1].busy);
   avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);avd_vp9_done(&ctx,&src,&dst[1].base.vb,VB2_BUF_STATE_DONE);
  }
+ /* After a frame size change the temporal-MV input is not the prior bank. */
+ params=(struct v4l2_ctrl_vp9_frame){.flags=V4L2_VP9_FRAME_FLAG_SHOW_FRAME,
+  .frame_width_minus_1=1919,.frame_height_minus_1=1087,.bit_depth=8};
+ current_dst=&dst[0].base.vb;frame.idx=0;assert(!avd_vp9_run(&ctx));
+ struct avd_vp9_bank *shown=p->b;
+ params.frame_width_minus_1=1899;params.frame_height_minus_1=1079;
+ current_dst=&dst[1].base.vb;frame.idx=1;assert(!avd_vp9_run(&ctx));
+ assert(p->b!=shown&&p->last.width==1900&&p->last.height==1080);
+ {bool prior_color=false;u32 *words=program.cpu;
+  for(size_t j=0;j<frame.prog_words;j++)if(words[j]==(shown->bufs.color.addr>>8))prior_color=true;
+  assert(!prior_color);}
+ avd_vp9_done(&ctx,&src,&dst[0].base.vb,VB2_BUF_STATE_DONE);avd_vp9_done(&ctx,&src,&dst[1].base.vb,VB2_BUF_STATE_DONE);
  avd_vp9_stop(&ctx);assert(!avd_vp9_ready(&ctx));
  /* Old firmware and the legacy transport allocate only one bank. */
  for(unsigned int mode=0;mode<2;mode++) {

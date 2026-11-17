@@ -159,6 +159,8 @@ struct avd_vp9_frame_info {
 	u32 tx_mode : 3;
 	u32 interpolation_filter : 3;
 	u32 flags;
+	u32 width;
+	u32 height;
 	u64 timestamp;
 	dma_addr_t color;
 	struct v4l2_vp9_segmentation seg;
@@ -267,13 +269,25 @@ static void set_refs(struct avd_ctx *ctx, struct avd_vp9_run *run)
 	}
 }
 
-/* Temporal MV input is the previous shown inter picture, not the new bank. */
-static bool avd_vp9_uses_prev_mv(u32 flags, const struct avd_vp9_frame_info *last)
+static bool avd_vp9_same_size(const struct v4l2_ctrl_vp9_frame *frame,
+			      const struct avd_vp9_frame_info *last)
 {
-	return !(flags & V4L2_VP9_FRAME_FLAG_ERROR_RESILIENT) &&
-	       !(flags & V4L2_VP9_FRAME_FLAG_KEY_FRAME) && last->valid &&
+	return last->width == frame->frame_width_minus_1 + 1 &&
+	       last->height == frame->frame_height_minus_1 + 1;
+}
+
+/*
+ * Temporal MV input is the previous shown inter picture, not the new bank.
+ * VP9 uses it only if that picture has the same frame size.
+ */
+static bool avd_vp9_uses_prev_mv(const struct v4l2_ctrl_vp9_frame *frame,
+				 const struct avd_vp9_frame_info *last)
+{
+	return !(frame->flags & V4L2_VP9_FRAME_FLAG_ERROR_RESILIENT) &&
+	       !(frame->flags & V4L2_VP9_FRAME_FLAG_KEY_FRAME) && last->valid &&
 	       (last->flags & V4L2_VP9_FRAME_FLAG_SHOW_FRAME) &&
-	       !(last->flags & V4L2_VP9_FRAME_FLAG_KEY_FRAME);
+	       !(last->flags & V4L2_VP9_FRAME_FLAG_KEY_FRAME) &&
+	       avd_vp9_same_size(frame, last);
 }
 
 static u32 make_flags1(struct avd_ctx *ctx, struct avd_vp9_run *run)
@@ -327,7 +341,7 @@ static u32 make_flags1(struct avd_ctx *ctx, struct avd_vp9_run *run)
 	flags |= VP9_SEG_ENABLED(frame->seg.flags &
 				 V4L2_VP9_SEGMENTATION_FLAG_ENABLED);
 
-	flags |= VP9_HAS_REF(avd_vp9_uses_prev_mv(frame->flags, &vp9_ctx->last));
+	flags |= VP9_HAS_REF(avd_vp9_uses_prev_mv(frame, &vp9_ctx->last));
 
 	flags |= VP9_SEG_RESET(
 		frame->seg.flags & V4L2_VP9_SEGMENTATION_FLAG_ENABLED &&
@@ -425,7 +439,7 @@ static void set_header(struct avd_ctx *ctx, struct avd_vp9_run *run)
 	pusha(vp9_ctx->b->bufs.seg.addr, "seg", 1);
 	pusha(vp9_ctx->b->bufs.seg.addr, "seg", 2);
 	pusha(vp9_ctx->b->bufs.color.addr, "color", 3);
-	pusha(avd_vp9_uses_prev_mv(frame->flags, &vp9_ctx->last) ?
+	pusha(avd_vp9_uses_prev_mv(frame, &vp9_ctx->last) ?
 		      vp9_ctx->last.color : vp9_ctx->b->bufs.color.addr,
 	      "color", 4);
 
@@ -567,6 +581,8 @@ static void update_ctx_cur_info(struct avd_vp9_ctx *vp9_ctx,
 	vp9_ctx->b->cur.reference_mode = dec_params->reference_mode;
 	vp9_ctx->b->cur.interpolation_filter = dec_params->interpolation_filter;
 	vp9_ctx->b->cur.flags = dec_params->flags;
+	vp9_ctx->b->cur.width = dec_params->frame_width_minus_1 + 1;
+	vp9_ctx->b->cur.height = dec_params->frame_height_minus_1 + 1;
 	vp9_ctx->b->cur.timestamp = buf->base.vb.vb2_buf.timestamp;
 	vp9_ctx->b->cur.color = vp9_ctx->b->bufs.color.addr;
 	vp9_ctx->b->cur.seg = dec_params->seg;
