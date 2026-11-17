@@ -70,9 +70,19 @@ static void h17p_surface_wire_test(struct kunit *test)
 
 static void h17p_opaque_x_parameter_test(struct kunit *test)
 {
-	struct dcp_apply_property_h17p property = dcp_opaque_x_property_h17p();
+	/* Older firmware: enableGPAlphaDiv is 0x49. */
+	struct dcp_apply_property_h17p property = dcp_opaque_x_property_h17p(false);
 
 	KUNIT_EXPECT_EQ(test, property.property, 0x49U);
+	KUNIT_EXPECT_EQ(test, property.value, 0U);
+}
+
+static void h17p_opaque_x_parameter_27_3_test(struct kunit *test)
+{
+	/* 27.3 moved runtime property ids: enableGPAlphaDiv is 0x4f. */
+	struct dcp_apply_property_h17p property = dcp_opaque_x_property_h17p(true);
+
+	KUNIT_EXPECT_EQ(test, property.property, 0x4fU);
 	KUNIT_EXPECT_EQ(test, property.value, 0U);
 }
 
@@ -207,6 +217,7 @@ static void h17p_present_retire_test(struct kunit *test)
 static struct kunit_case h17p_present_cases[] = {
 	KUNIT_CASE(h17p_surface_wire_test),
 	KUNIT_CASE(h17p_opaque_x_parameter_test),
+	KUNIT_CASE(h17p_opaque_x_parameter_27_3_test),
 	KUNIT_CASE(h17p_callback_bounds_test),
 	KUNIT_CASE(h17p_present_abort_test),
 	KUNIT_CASE(h17p_present_retire_test),

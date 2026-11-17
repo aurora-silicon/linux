@@ -400,8 +400,13 @@ static int iomfb_enqueue_opaque_x(struct apple_dcp *dcp)
 	if (dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		return 0;
-	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 ||
-	    atomic_read(&dcp->iomfb.opaque_x_state) != IOMFB_OPAQUE_X_NEEDED)
+	/*
+	 * Pre-27 H17P keeps its 0x49 send; V_27_0 sends 0x4f only with the
+	 * 27.3 table (0x49 there is enableSBIM, unchecked below 27.3 here).
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp->tags_27_3)
+		return 0;
+	if (atomic_read(&dcp->iomfb.opaque_x_state) != IOMFB_OPAQUE_X_NEEDED)
 		return 0;
 	if (dcp->iomfb.queued >= 32)
 		return -EBUSY;
@@ -3564,7 +3569,7 @@ bool iomfb_present_complete_h17p(struct apple_dcp *dcp)
 		}
 	}
 	iomfb_keepalive_arm(dcp);
-	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0)
+	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0 || dcp->tags_27_3)
 		atomic_cmpxchg(&dcp->iomfb.opaque_x_state, IOMFB_OPAQUE_X_WAITING,
 			       IOMFB_OPAQUE_X_NEEDED);
 	iomfb_scanout_complete_h17p(dcp);

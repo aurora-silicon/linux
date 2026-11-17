@@ -1135,12 +1135,22 @@ static int apple_probe_per_dcp(struct device *dev,
 			interchange = supports_interchange &&
 				      (zpos <= 1 || surf != top_surf);
 
+			/*
+			 * The 27.3 runtime table proves enableGPAlphaDiv is
+			 * 0x4f there, so X is made opaque and XRGB formats are
+			 * safe to offer. Other firmware keeps its old lists:
+			 * 0x49 is enableSBIM on 27.3 and unchecked below it.
+			 */
 			planes[zpos] = apple_plane_init(drm, 1U << num, surf,
 							supports_l10r,
-							supports_xrgb2101010,
-							dcp_data->hw.xrgb_is_alpha ||
+							supports_xrgb2101010 ||
+							(dcp_data->fw_compat == DCP_FIRMWARE_V_27_0 &&
+							 dcp_data->tags_27_3),
+							(dcp_data->hw.xrgb_is_alpha ||
 							dcp_data->hw.iomfb_method_profile ==
-								DCP_IOMFB_METHODS_H17G,
+								DCP_IOMFB_METHODS_H17G) &&
+							!(dcp_data->fw_compat == DCP_FIRMWARE_V_27_0 &&
+							  dcp_data->tags_27_3),
 							plane_type, interchange,
 							supports_premultiplied);
 		}

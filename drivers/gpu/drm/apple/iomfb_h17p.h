@@ -150,10 +150,15 @@ struct dcp_apply_property_h17p {
 
 static_assert(sizeof(struct dcp_apply_property_h17p) == 0x8);
 
-static inline struct dcp_apply_property_h17p dcp_opaque_x_property_h17p(void)
+/*
+ * enableGPAlphaDiv: 0x49 on older firmware; on 27.3 the runtime property ids
+ * moved and it is 0x4f (0x49 there is enableSBIM). The caller passes the
+ * 27.3 flag from the DCP state.
+ */
+static inline struct dcp_apply_property_h17p dcp_opaque_x_property_h17p(bool tags_27_3)
 {
 	return (struct dcp_apply_property_h17p) {
-		.property = 0x49,
+		.property = tags_27_3 ? 0x4f : 0x49,
 		.value = 0,
 	};
 }

@@ -269,7 +269,7 @@ void iomfb_apply_opaque_x_h17p(struct apple_dcp *dcp, dcp_callback_t callback,
 		.name = "apply_property",
 		.tag = { 'A', '3', '5', '2' },
 	};
-	struct dcp_apply_property_h17p property = dcp_opaque_x_property_h17p();
+	struct dcp_apply_property_h17p property = dcp_opaque_x_property_h17p(dcp->tags_27_3);
 
 	dcp_push(dcp, false, &method, sizeof(property), sizeof(u32), &property,
 		 callback, cookie);
