@@ -135,6 +135,8 @@ ASAHI_TESTS = {
     'brcmfmac-sleep-lifetime-tests.py': [([], PASS)],
     'cio-native-tests.py': [(out('--output'), PASS)],
     'clpc-gpu-demand-tests.py': [([], PASS)],
+    'clpc-high-power-cleanup-tests.py': [(out(), PASS),
+        (out() + ['--old-ref', '677be395b9d2e15d98696107ebf88191f08efbf9'], PASS)],
     # The old policy always disabled compute preemption.
     'compute-preempt-tests.py': [(out(), PASS),
                                  (out() + ['--old-ref', '6dbfbcb21eb09d07ae59037a1ceca8cc3500841f'], PASS)],
