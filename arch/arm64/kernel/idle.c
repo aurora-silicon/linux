@@ -80,7 +80,8 @@ void __init apple_wfi_quirk_init(void)
 	 */
 	if (idle == ARM64_IDLE_NOP && !apple_keep_idle_nop &&
 	    (model == MIDR_APPLE_T8142_E || model == MIDR_APPLE_T8142_P ||
-	     model == MIDR_APPLE_T6050_064 || model == MIDR_APPLE_T6050_065)) {
+	     model == MIDR_APPLE_T6050_064 || model == MIDR_APPLE_T6050_065 ||
+	     model == MIDR_APPLE_T6050_068 || model == MIDR_APPLE_T6050_069)) {
 		idle = ARM64_IDLE_WFI;
 		pr_info("Apple: idling in WFI, ignoring idle=nop\n");
 	}
