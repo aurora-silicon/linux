@@ -7918,6 +7918,12 @@ static int apple_pcie_resume(struct device *dev)
 		port = apple_pcie_get_port(fn->pdev);
 		if (!port || !port->hib_cold)
 			continue;
+		/*
+		 * The PCI core's noirq power-up ran with the link down and left the function
+		 * marked D3: the reset brought it up in D0, so record that before the
+		 * restore, or its driver's resume can't enable MSI again (-EINVAL).
+		 */
+		pci_set_power_state(fn->pdev, PCI_D0);
 		if (pci_load_saved_state(fn->pdev, fn->state))
 			pci_warn(fn->pdev, "S2R: saved configuration not taken back\n");
 		else
