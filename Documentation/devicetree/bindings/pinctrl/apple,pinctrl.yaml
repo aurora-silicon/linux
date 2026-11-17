@@ -32,6 +32,12 @@ properties:
       - items:
           - const: apple,t6050-pinctrl
           - const: apple,t8132-pinctrl
+      - description:
+          T8152 with the uncached T8140 register access, for boards whose
+          gpio-reserved-ranges hold pins that fault on an AP read.
+        items:
+          - const: apple,t8152-pinctrl
+          - const: apple,t8140-pinctrl
       - items:
           # Do not add additional SoC to this list.
           - enum:
