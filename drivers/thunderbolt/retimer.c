@@ -507,7 +507,7 @@ static struct tb_retimer *tb_port_find_retimer(struct tb_port *port, u8 index)
 static bool tb_retimer_scan_skip(struct tb_port *port)
 {
 	if (!(port->sw->tb->nhi->quirks & QUIRK_CIO_MACOS_FRAMES) ||
-	    !of_machine_is_compatible("apple,j714s"))
+	    !(of_machine_is_compatible("apple,j714s") || of_machine_is_compatible("apple,j716c")))
 		return false;
 	tb_port_info(port, "TEST sv6u5: no retimer scan on this link (macOS sends no retimer sideband operation)\n");
 	return true;
