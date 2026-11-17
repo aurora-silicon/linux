@@ -2,7 +2,7 @@
 
 //! Wire geometry for the shared parameter-buffer owner and growth machinery.
 
-use super::{fw, BlockGeometry};
+use super::{cfg, fw, BlockGeometry};
 use kernel::prelude::*;
 
 #[derive(Clone, Copy)]
@@ -24,6 +24,25 @@ fn align(value: usize, alignment: usize) -> Result<usize> {
     value.checked_add(alignment - 1).map(|n| n & !(alignment - 1)).ok_or(EOVERFLOW)
 }
 
+/// The tiler-heap maximum macOS 25G83 gives a 128 KiB-block heap
+/// (`halGetDefaultParameterBufferSizeMax`): a twentieth of the memory, at least 192 MiB,
+/// rounded up to whole groups of 129 blocks. 3,354 blocks with 8 GiB, 19,737 with 48 GiB.
+fn macos_maximum_blocks(memory_bytes: u64) -> u64 {
+    const GROUP_BLOCKS: u64 = 129;
+    const GROUP_BYTES: u64 = GROUP_BLOCKS * cfg::TVB_BLOCK_SIZE as u64;
+    (memory_bytes / 20).max(0xc00_0000).div_ceil(GROUP_BYTES) * GROUP_BLOCKS
+}
+
+/// The normal maximum of a 128 KiB-block heap, in blocks. macOS gives a queue a third of
+/// its maximum until the queue renders memoryless (`BM+0x80`, and the cap of its pre-render
+/// growth): 1,118 blocks with 8 GiB, 6,579 with 48 GiB. The block table holds
+/// `TVB_MAX_BLOCKS`. `memory_bytes` is usable memory, below the installed amount macOS
+/// reads, so never go below the 8 GiB value of the smallest G17 Mac.
+pub(super) fn neo_normal_blocks(memory_bytes: u64) -> usize {
+    let normal = macos_maximum_blocks(memory_bytes).div_ceil(3);
+    (normal.min(cfg::TVB_MAX_BLOCKS as u64) as usize).max(fw::NORMAL_MAX_BLOCKS)
+}
+
 impl Layout {
     pub(super) const NEO: Self = Self {
         pages: fw::PAGE_LIST, page_bytes: fw::PAGE_LIST_BYTES,
@@ -32,6 +51,11 @@ impl Layout {
         scratch_slots: fw::SCRATCH_SLOTS, scratch_stride: fw::SCRATCH_STRIDE as usize,
         metric_stride: 4, normal_blocks: fw::NORMAL_MAX_BLOCKS,
     };
+
+    /// The NEO layout of a device with `memory_bytes` of memory.
+    pub(super) fn neo(memory_bytes: u64) -> Self {
+        Self { normal_blocks: neo_normal_blocks(memory_bytes), ..Self::NEO }
+    }
 
     pub(super) fn m5(geometry: BlockGeometry) -> Result<Self> {
         geometry.validate()?;
@@ -101,5 +125,33 @@ impl Layout {
             (0x64, address(self.counter)?), (0x84, discard),
         ] { put(out, at, value.to_le_bytes())?; }
         Ok(())
+    }
+}
+
+#[kernel::macros::kunit_tests(asahi_g17_tvb_limits)]
+mod tests {
+    use super::*;
+
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn maximum_matches_macos() {
+        // The maxima macOS 25G83 reports (AGXParameterBufferMaxSize), in blocks.
+        assert_eq!(macos_maximum_blocks(8 * GIB), 3354);
+        assert_eq!(macos_maximum_blocks(16 * GIB), 6579);
+        assert_eq!(macos_maximum_blocks(48 * GIB), 19737);
+        // The 192 MiB floor.
+        assert_eq!(macos_maximum_blocks(GIB), 1548);
+    }
+
+    #[test]
+    fn normal_maximum_scales_with_memory_up_to_the_block_table() {
+        assert_eq!(neo_normal_blocks(8 * GIB), fw::NORMAL_MAX_BLOCKS);
+        // Usable memory of an 8 GiB Mac keeps the 8 GiB value.
+        assert_eq!(neo_normal_blocks(7 * GIB), fw::NORMAL_MAX_BLOCKS);
+        assert_eq!(neo_normal_blocks(16 * GIB), 2193);
+        assert_eq!(neo_normal_blocks(24 * GIB), 3311);
+        assert_eq!(neo_normal_blocks(48 * GIB), cfg::TVB_MAX_BLOCKS);
+        assert_eq!(neo_normal_blocks(u64::MAX), cfg::TVB_MAX_BLOCKS);
     }
 }
