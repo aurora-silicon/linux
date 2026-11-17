@@ -127,10 +127,11 @@ static inline int ane_t6021_pm_restart_deferred(struct ane_t6021_pm *pm)
 	lockdep_assert_held(pm->fw_lock);
 	if (pm->state != ANE_T6021_PM_SUSPENDED)
 		return 0;
-	pm->state = ANE_T6021_PM_FAILED;
+	/* User space runs here and reads FAILED as wedged: stay SUSPENDED
+	 * (submitters wait on the firmware mutex) until the outcome is known.
+	 */
 	ret = pm->ops->restart_deferred(pm->ctx);
-	if (!ret)
-		pm->state = ANE_T6021_PM_ACTIVE;
+	pm->state = ret ? ANE_T6021_PM_FAILED : ANE_T6021_PM_ACTIVE;
 	return ret;
 }
 

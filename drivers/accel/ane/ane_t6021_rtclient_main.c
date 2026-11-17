@@ -3719,7 +3719,7 @@ static int ane_rtclient_sleep_restart(void *ctx)
 				 "resume: CPU domain stayed on through the sleep; restart after a power cycle\n");
 		ane->sleep_cycle = true;
 	}
-	ane->sleep_deferred = true;
+	WRITE_ONCE(ane->sleep_deferred, true);
 	queue_work(system_freezable_wq, &ane->sleep_work);
 	return ANE_T6021_PM_RESTART_DEFERRED;
 }
@@ -3737,7 +3737,6 @@ static int ane_rtclient_sleep_restart_deferred(void *ctx)
 	if (!rs)
 		return -EIO;
 	ane->sleep_restart = NULL;
-	ane->sleep_deferred = false;
 	ane->sleep_cycle = false;
 	ret = cycle ? ane_rtclient_rs_power_cycle(rs) : ane_rtclient_rs_ready(rs);
 	if (!ret) {
@@ -3746,6 +3745,8 @@ static int ane_rtclient_sleep_restart_deferred(void *ctx)
 	}
 	ret = ane_rtclient_rs_finish(rs, true, stage, ret);
 	kfree(rs);
+	/* Cleared only now: wedged_show() reads it without the lock. */
+	WRITE_ONCE(ane->sleep_deferred, false);
 	return ret;
 }
 
@@ -4464,8 +4465,13 @@ static ssize_t wedged_show(struct device *dev, struct device_attribute *attr,
 {
 	struct ane_rtclient *ane = dev_get_drvdata(dev);
 
+	/* A restart left pending by system resume is not a wedge: the first
+	 * client finishes it (ane_rtclient_admit()) and its outcome sets FAILED.
+	 */
 	return sysfs_emit(buf, "%d\n", atomic_read(&ane_t6021_quarantined) ||
-			  READ_ONCE(ane->recovering) || !READ_ONCE(ane->registered) ||
+			  (READ_ONCE(ane->recovering) &&
+			   !READ_ONCE(ane->sleep_deferred)) ||
+			  !READ_ONCE(ane->registered) ||
 			  READ_ONCE(ane->sleep_pm.state) == ANE_T6021_PM_FAILED);
 }
 static DEVICE_ATTR_RO(wedged);
