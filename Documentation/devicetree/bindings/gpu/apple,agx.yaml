@@ -108,6 +108,24 @@ properties:
       this request before it lowers the GPU's power state for a system sleep, and
       makes it again after raising it.
 
+  apple,sleep-ps-auto:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 15
+    description:
+      The automatic power state (bits 27:24 of the power state word) the GPU's
+      power domain is raised with after a system sleep. Without it the domain
+      keeps the automatic state it had before the sleep. Set by the boot
+      loader.
+
+  apple,sleep-ps-min:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 15
+    description:
+      The floor (bits 19:16 of the power state word) the GPU's power domain is
+      raised with after a system sleep, the lowest state its automatic power
+      management may take between jobs. Without it the domain keeps the floor
+      the sleep's wake left in the word.
+
   apple,idle-off-delay-ms:
     minimum: 2
     maximum: 1000

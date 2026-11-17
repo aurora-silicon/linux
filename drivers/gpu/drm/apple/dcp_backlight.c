@@ -7,6 +7,8 @@
 #include <drm/drm_modeset_lock.h>
 #include <drm/drm_print.h>
 
+#include <linux/moduleparam.h>
+#include <linux/suspend.h>
 #include <linux/backlight.h>
 #include <linux/math64.h>
 #include <linux/completion.h>
@@ -17,6 +19,10 @@
 #include "dcp.h"
 #include "dcp-internal.h"
 #include "iomfb_v14_7.h"
+
+static bool v27_keep_level = true;
+module_param(v27_keep_level, bool, 0644);
+MODULE_PARM_DESC(v27_keep_level, "Firmware 27: keep the panel's level through a sleep, as macOS");
 
 #define MIN_BRIGHTNESS_PART1	2U
 #define MAX_BRIGHTNESS_PART1	99U
@@ -497,6 +503,36 @@ bool dcp_backlight_resend(struct apple_dcp *dcp)
 	return resend;
 }
 
+/*
+ * For the first present after a firmware 27 power-on. That present comes before DRM's DPMS-on
+ * and the backlight core's resume, which clear the DPMS-off, suspend and blank marks only later
+ * (backlight_is_blank() counts the core's suspend too), so it would carry level 0. Clear the
+ * three marks now: the present carries the panel's level, and the DPMS-on and resume that
+ * follow change nothing. The level is marked for this present directly rather than through
+ * dcp_backlight_resend(), whose once-a-second budget stays for the firmware's own
+ * enable-backlight request after the power-on.
+ * Returns the level the present carries, or a negative error.
+ */
+int dcp_backlight_wake_lit(struct apple_dcp *dcp)
+{
+	struct dcp_backlight_state *state = &dcp->backlight.state;
+	unsigned long flags;
+	int ret = -ENODATA;
+
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	if (state->ready) {
+		state->dpms_off = false;
+		state->suspended = false;
+		state->core_blank = false;
+		state->controlled = true;
+		state->retries = 0;
+		dcp_bl_jump(state);
+		ret = dcp_bl_effective(state);
+	}
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+	return ret;
+}
+
 unsigned int dcp_backlight_retry_delay(struct apple_dcp *dcp)
 {
 	unsigned long flags;
@@ -792,12 +828,17 @@ static int dcp_set_brightness(struct backlight_device *bd)
 		bool fade;
 		u32 old;
 
+		bool suspended = bd->props.state & BL_CORE_SUSPENDED;
+
+		/* macOS keeps the panel's level through a firmware 27 sleep. */
+		if (suspended && READ_ONCE(v27_keep_level) &&
+		    dcp->fw_compat == DCP_FIRMWARE_V_27_0 && pm_suspend_via_firmware())
+			suspended = false;
 		/* Preserve the requested level even while the core forces zero. */
 		spin_lock_irqsave(&dcp->backlight.lock, flags);
 		old = state->target;
 		ret = dcp_bl_request(state, bd->props.brightness,
-				     backlight_is_blank(bd),
-				     bd->props.state & BL_CORE_SUSPENDED);
+				     backlight_is_blank(bd), suspended);
 		/* A new level restarts the fade from the level presented last. */
 		fade = !ret && state->fading && state->target != old;
 		if (fade)

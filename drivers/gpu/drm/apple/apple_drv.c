@@ -1234,22 +1234,28 @@ static int apple_probe_per_dcp(struct device *dev,
  * connector per port for a dock's second DP tunnel, preserving primary
  * connector names. T6050 instead exposes one connector per port/pipeline
  * pair: tunnel allocation chooses which connector is connected, without
- * changing any encoder's advertised CRTC mask after registration.
+ * changing any encoder's advertised CRTC mask after registration. Pairs
+ * whose route carries DP tunnels only come last, so adding such a route
+ * does not renumber the connectors that existed before it.
  */
 static int apple_probe_typec_ports(struct drm_device *drm,
 				   struct platform_device **dcp,
 				   u32 *crtc_mask, int num_dcp)
 {
-	unsigned int idx, nr_ports = dcp_typec_nr_ports();
+	unsigned int n, nr_ports = dcp_typec_nr_ports();
 	bool fixed = dcp_typec_fixed_crtcs();
 	unsigned int slots = fixed ? num_dcp : (dcp_typec_dual_stream() ? 2 : 1);
+	/* T6050 creates its tunnel-only port/pipeline pairs in a second pass. */
+	unsigned int passes = fixed ? 2 : 1;
 	int i, ret;
 
 	/* Keep the existing physical-port connector numbers stable. On the
 	 * M2 Pro/Max laptops, append one more connector per port for a second
 	 * USB4 DP tunnel.
 	 */
-	for (idx = 0; idx < nr_ports * slots; idx++) {
+	for (n = 0; n < passes * nr_ports * slots; n++) {
+		unsigned int pass = n / (nr_ports * slots);
+		unsigned int idx = n % (nr_ports * slots);
 		struct apple_connector *connector;
 		struct apple_encoder *enc;
 		struct platform_device *pipeline = fixed ? dcp[idx / nr_ports] : NULL;
@@ -1259,13 +1265,17 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 
 		/* Only a failed T8122 dcpext could drive it: no connector. */
 		if (dcp_typec_port_unusable(port_idx)) {
-			drm_warn(drm, "Type-C port %u: its display pipeline is unusable\n",
-				 port_idx);
+			if (!pass)
+				drm_warn(drm, "Type-C port %u: its display pipeline is unusable\n",
+					 port_idx);
 			continue;
 		}
 
 		if (fixed) {
 			if (!dcp_typec_port_has_candidate(port_idx, pipeline))
+				continue;
+			/* T6050: tunnel-only pairs in the second pass */
+			if (dcp_typec_port_tunnel_only(port_idx, pipeline) != pass)
 				continue;
 			mask = crtc_mask[idx / nr_ports];
 			if (!mask)

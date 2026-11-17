@@ -9,6 +9,20 @@
 #include <errno.h>
 typedef uint32_t u32;
 typedef uint64_t u64;
+typedef int64_t s64;
+typedef s64 ktime_t;
+static ktime_t ktime_get(void)
+{
+	return 0;
+}
+#define ktime_ms_delta(a, b) ((s64)((a) - (b)))
+#define ktime_us_delta(a, b) ((s64)((a) - (b)))
+/* Only J714s reports its sleep against macOS's; these hooks stay off here. */
+static bool of_machine_is_compatible(const char *compat)
+{
+	assert(!strcmp(compat, "apple,j714s"));
+	return false;
+}
 #define BIT(n) (1UL << (n))
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define GFP_KERNEL 0
@@ -16,6 +30,10 @@ typedef uint64_t u64;
 #define TB_CFG_HOPS 1
 #define TB_CFG_PORT 2
 #define ADP_CS_4 4
+#define ADP_USB3_CS_0 0
+#define ADP_USB3_CS_0_PE BIT(31)
+#define ADP_USB3_CS_4 4
+/* ACTUAL_QUIRKS */
 static inline void tb_err(void *tb, const char *fmt, ...)
 {
 	(void)tb;
@@ -61,6 +79,7 @@ struct tb_port {
 	struct tb_regs_hop hw, expected;
 	u32 credits;
 	bool read_before_write;
+	int cap_adap;
 };
 struct tb_switch {
 	bool is_unplugged, usb4;
@@ -71,8 +90,10 @@ struct tb_path_hop {
 	struct tb_port *in_port, *out_port;
 	int in_hop_index, next_hop_index, nfc_credits, in_counter_index;
 };
+struct tb;
 struct tb_path {
-	bool activated, sleep_valid;
+	struct tb *tb;
+	bool activated, sleep_valid, sleep_lost;
 	int path_length;
 	struct tb_regs_hop *sleep_hops;
 	struct tb_path_hop hops[2];
@@ -80,10 +101,10 @@ struct tb_path {
 struct tb;
 struct tb_tunnel {
 	struct tb *tb;
-	struct tb_port *src_port;
-	bool active, dp, dma, pci;
+	struct tb_port *src_port, *dst_port;
+	bool active, dp, dma, pci, usb3;
 	bool sleep_paused, sleep_dprx, sleep_replay, sleep_changed,
-		dprx_started, dprx_canceled;
+		dprx_started, dprx_canceled, sleep_lost;
 	unsigned long generation;
 	int npaths;
 	struct tb_path *paths[2];
@@ -111,6 +132,7 @@ struct tb_nhi_ops {
 };
 struct tb_nhi {
 	const struct tb_nhi_ops *ops;
+	unsigned int quirks;
 };
 struct tb {
 	int lock;
@@ -136,8 +158,8 @@ static struct tb_port link[2], ports[4], outs[4];
 static struct tb_path paths[2];
 static struct tb_tunnel tunnels[2];
 static struct tb_nhi nhi;
-static int fault, nth, ops, writes, drained, adapters, resumes, reads,
-	allocated;
+static int fault, nth, ops, writes, hop_writes, drained, adapters, resumes, reads,
+	allocated, pm_roles, saves;
 static bool ctl, physical, clients_awake, uid_wrong;
 #define list_for_each_entry(t, h, m) for ((t) = *(h), (void)sizeof(#m); (t); (t) = (t)->next)
 #define tb_switch_for_each_port(s, p) for ((p) = (s)->ports; (p); (p) = NULL)
@@ -237,6 +259,7 @@ static int tb_port_write(struct tb_port *p, const void *value, int space,
 	} else {
 		assert(space == TB_CFG_HOPS && p->read_before_write &&
 		       count == 2);
+		hop_writes++;
 		memcpy(&p->hw, value, 8);
 		p->read_before_write = false;
 	}
@@ -270,6 +293,10 @@ static bool tb_tunnel_is_active(struct tb_tunnel *t)
 static bool tb_tunnel_is_pci(struct tb_tunnel *t)
 {
 	return t->pci;
+}
+static bool tb_tunnel_is_usb3(struct tb_tunnel *t)
+{
+	return t->usb3;
 }
 static bool tb_tunnel_is_invalid(struct tb_tunnel *t)
 {
@@ -380,7 +407,8 @@ static void tb_switch_exit_redrive(struct tb_switch *s)
 }
 static int tb_switch_suspend_cio(struct tb_switch *s)
 {
-	assert(drained && ctl);
+	/* A host with macOS's frames leaves its PCIe and USB3 hops as they are. */
+	assert(ctl && (nhi.quirks & QUIRK_CIO_MACOS_FRAMES ? !drained : drained));
 	return fail(5) ? -EIO : 0;
 }
 static int router_sleep(struct tb_nhi *n)
@@ -399,6 +427,7 @@ static int apple_router_save_sleep(struct tb_switch *s,
 				   struct apple_router_sleep *r)
 {
 	assert(ctl && !r->valid);
+	saves++;
 	if (fail(7))
 		return -EIO;
 	r->valid = true;
@@ -409,7 +438,35 @@ static int apple_router_restore_sleep(struct tb_switch *s,
 				      struct apple_router_sleep *r)
 {
 	assert(physical && ctl && r->valid && r->data[0] == 0xcafe && enumerated);
+	if (fail(12))
+		return -EIO;
 	r->valid = false;
+	return 0;
+}
+/* The links' PM roles and CL-state cycle at prepare, before anything is released. */
+static int tb_switch_cio_pm_roles(struct tb_switch *s)
+{
+	assert(physical && ctl && s == &child && cm.hotplug_active && !cm.cio_prepared);
+	pm_roles++;
+	return fail(11) ? -EIO : 0;
+}
+/* The J714s reports against macOS's frames; never reached here. */
+static int usb4_pci_port_ltssm_state(struct tb_port *p)
+{
+	assert(false);
+	return -EIO;
+}
+static void tb_switch_cio_test_dock(u64 *route, ktime_t *bit, ktime_t *ready, int *ret)
+{
+	assert(false);
+}
+static void tb_switch_cio_test_host(struct tb *t, bool slept)
+{
+	assert(false);
+}
+static int tb_ctl_frames_sleep_check(void *c, char *buf, size_t size)
+{
+	assert(false);
 	return 0;
 }
 void tb_cio_sleep_complete(struct tb *t);
@@ -440,6 +497,7 @@ static void setup(void)
 	link[0].remote = &link[1];
 	link[1].sw = &child;
 	nhi.ops = &nhi_ops;
+	nhi.quirks = 0;
 	tb = (struct tb){ .cm_ops = &tb_cm_ops,
 			  .nhi = &nhi,
 			  .root_switch = &root };
@@ -468,6 +526,7 @@ static void setup(void)
 					      .in_counter_index = 0 };
 	}
 	for (int i = 0; i < 2; i++) {
+		paths[i].tb = &tb;
 		paths[i].activated = true;
 		paths[i].path_length = 2;
 		tunnels[i] = (struct tb_tunnel){ .tb = &tb,
@@ -484,7 +543,8 @@ static void setup(void)
 	cm.tunnel_list = tunnels;
 	cm.hotplug_active = true;
 	cm.groups[0].release_work.pending = true;
-	fault = ops = writes = drained = adapters = resumes = reads = 0;
+	fault = ops = writes = hop_writes = drained = adapters = resumes = reads = 0;
+	pm_roles = saves = 0;
 	nth = 1;
 	physical = ctl = clients_awake = true;
 	uid_wrong = dock_lost = false;
@@ -658,6 +718,91 @@ int main(void)
 	cases++;
 	setup();
 	assert(!tb_cio_sleep_prepare(&tb));
+	complete();
+	cases++;
+	/* A link that does not take its PM roles refuses the sleep before anything is released. */
+	setup();
+	inject(11, 1);
+	assert(tb_cio_sleep_prepare(&tb) == -EIO && pm_roles == 1);
+	assert(!allocated && !cm.cio_prepared && cm.hotplug_active && !cm.cio_dp_released);
+	assert(cm.groups[0].release_work.pending);
+	cases++;
+	/* A host router with no state to save sleeps, and wakes as from a cold start. */
+	setup();
+	nhi.quirks = QUIRK_CIO_NO_ROUTER_STATE;
+	assert(!tb_cio_sleep_prepare(&tb) && pm_roles == 1);
+	clients_awake = false;
+	assert(!tb_cio_sleep(&tb) && !saves && !cm.cio_router.valid);
+	poweroff();
+	physical = true;
+	assert(!tb_cio_wake(&tb, NULL) && enumerated == 1 && router_wakes == 1);
+	check_restored();
+	complete();
+	cases++;
+	/*
+	 * A saved state the router does not take back fails the wake, or, for a host that
+	 * gives up, leaves the router as from a cold start.
+	 */
+	for (int n = 0; n < 2; n++) {
+		setup();
+		nhi.quirks = n ? QUIRK_CIO_WAKE_GIVES_UP : 0;
+		assert(!tb_cio_sleep_prepare(&tb));
+		clients_awake = false;
+		assert(!tb_cio_sleep(&tb) && saves == 1 && cm.cio_router.valid);
+		poweroff();
+		physical = true;
+		inject(12, 1);
+		if (!n)
+			assert(tb_cio_wake(&tb, NULL) == -EIO && cm.cio_changed &&
+			       cm.cio_router.valid);
+		assert(!tb_cio_wake(&tb, NULL));
+		check_restored();
+		complete();
+		cases++;
+	}
+	/* A dock that is not back is waited for 30 rounds, or 2 by a host that gives up. */
+	for (int n = 0; n < 2; n++) {
+		bool pci_lost = false;
+
+		setup();
+		nhi.quirks = n ? QUIRK_CIO_WAKE_GIVES_UP : 0;
+		assert(!tb_cio_sleep_prepare(&tb));
+		clients_awake = false;
+		assert(!tb_cio_sleep(&tb));
+		poweroff();
+		physical = true;
+		dock_lost = true;
+		assert(!tb_cio_wake(&tb, &pci_lost) && pci_lost && child.is_unplugged);
+		assert(link_waits == (n ? 2 : 30));
+		complete();
+		cases++;
+	}
+	/*
+	 * macOS's frames: the PCIe and USB3 hops are left as they are for the sleep, and are
+	 * written again after it; after a refused sleep they are found as they were.
+	 */
+	setup();
+	nhi.quirks = QUIRK_CIO_MACOS_FRAMES;
+	assert(!tb_cio_sleep_prepare(&tb));
+	clients_awake = false;
+	assert(!tb_cio_sleep(&tb) && !drained);
+	for (int i = 0; i < 4; i++)
+		assert(ports[i].hw.enable);
+	poweroff();
+	physical = true;
+	assert(!tb_cio_wake(&tb, NULL) && hop_writes == 4);
+	check_restored();
+	complete();
+	cases++;
+	setup();
+	nhi.quirks = QUIRK_CIO_MACOS_FRAMES;
+	assert(!tb_cio_sleep_prepare(&tb));
+	clients_awake = false;
+	inject(6, 1);
+	assert(tb_cio_sleep(&tb) < 0 && !drained && !hop_writes && reads == 8);
+	assert(!cm.cio_changed && ctl);
+	for (int i = 0; i < 4; i++)
+		assert(ports[i].hw.enable);
 	complete();
 	cases++;
 	printf("PASS %u native tunnel replay cases\n", cases);
