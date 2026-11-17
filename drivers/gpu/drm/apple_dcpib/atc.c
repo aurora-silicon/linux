@@ -23,6 +23,22 @@
 #define ATC_AON		0x1e00
 #define ATC_CFG		0x60000
 #define ATC_XBAR	0x74000
+/*
+ * ATCPHY_CFG_BLK_ATCPHY_DP_CLKSWITCH_{SELECT,ENABLE,STATUS}_CONTROL_REGS
+ * (AppleT8152TypeCPhy::aciophy_configure_dp_clkswitch_control). DP pixel
+ * clock n (1..4) runs from switch n: SELECT field n is n for PMGR DP clock
+ * n - 1, 7 for none, and ENABLE/STATUS bit 1 + 7 * (n - 1) gates that
+ * PMGR clock. This driver uses PCLK1, from PMGR DP0, whose divider
+ * atc_clock_write() sets for the link rate.
+ */
+#define ATC_CLKSW_SELECT	(ATC_CFG + 0x14)
+#define ATC_CLKSW_ENABLE	(ATC_CFG + 0x18)
+#define ATC_CLKSW_STATUS	(ATC_CFG + 0x1c)
+#define ATC_CLKSW_PCLK1_SEL	GENMASK(2, 0)
+#define ATC_CLKSW_PCLK1_MODE	BIT(12)
+#define ATC_CLKSW_PCLK1_OFF	7
+#define ATC_CLKSW_PCLK1_DP0	1
+#define ATC_CLKSW_PCLK1_EN	BIT(1)
 #define ATC_TIMEOUT_US	10000
 
 struct dcpib_atc_port {
@@ -236,10 +252,11 @@ static int atc_dp_stop(struct dcpib *dcp, struct dcpib_atc_port *atc)
 	u32 reg;
 
 	atc_route_stop(dcp, atc);
-	atc_update(atc, ATC_CFG + 0x14, 7, 7);
-	atc_update(atc, ATC_CFG + 0x18, 1, 0);
-	if (readl_poll_timeout(atc->base + ATC_CFG + 0x1c, reg, !(reg & 1), 1,
-			       ATC_TIMEOUT_US)) {
+	atc_update(atc, ATC_CLKSW_SELECT, ATC_CLKSW_PCLK1_SEL | ATC_CLKSW_PCLK1_MODE,
+		   ATC_CLKSW_PCLK1_OFF);
+	atc_update(atc, ATC_CLKSW_ENABLE, ATC_CLKSW_PCLK1_EN, 0);
+	if (readl_poll_timeout(atc->base + ATC_CLKSW_STATUS, reg,
+			       !(reg & ATC_CLKSW_PCLK1_EN), 1, ATC_TIMEOUT_US)) {
 		dev_err(dcp->dev, "ATC%u: DPTX clock stop failed\n", atc->index);
 		return -ETIMEDOUT;
 	}
@@ -279,12 +296,11 @@ static int atc_dp_start(struct dcpib *dcp, struct dcpib_atc_port *atc, u32 r)
 {
 	static const u32 tx_ctrl[] = { 0x4eb0, 0x8b10, 0xdeb0, 0x11b10 };
 	static const u32 wake_count[] = { 0xbb5, 0xbb7, 0xbb8, 0xbb9 };
+	u32 reg;
 	int ret;
 
 	if (readl(atc->dp_clock) & BIT(30))
 		return -EBUSY;
-	atc_update(atc, ATC_CFG + 0x14, 7, 0);
-	atc_update(atc, ATC_CFG + 0x18, 1, 1);
 	if (!r) {
 		atc_update(atc, 0xe10, BIT(2), BIT(2));
 		atc_update(atc, 0xe08, BIT(29), BIT(29));
@@ -336,6 +352,21 @@ static int atc_dp_start(struct dcpib *dcp, struct dcpib_atc_port *atc, u32 r)
 	if (ret) {
 		dev_err(dcp->dev, "ATC%u: DP clock change timeout\n", atc->index);
 		return ret;
+	}
+	/*
+	 * Clock the stream from PMGR DP0 at the link-rate divider just set,
+	 * as AppleT8152TypeCPhy::aciophy_configure_dp_clks does after
+	 * setATCDPClkSrcSel. Selecting source 0 instead left the pixel
+	 * clock independent of the divider and blanked every mode above
+	 * about 165 MHz.
+	 */
+	atc_update(atc, ATC_CLKSW_SELECT, ATC_CLKSW_PCLK1_SEL | ATC_CLKSW_PCLK1_MODE,
+		   ATC_CLKSW_PCLK1_DP0);
+	atc_update(atc, ATC_CLKSW_ENABLE, ATC_CLKSW_PCLK1_EN, ATC_CLKSW_PCLK1_EN);
+	if (readl_poll_timeout(atc->base + ATC_CLKSW_STATUS, reg,
+			       reg & ATC_CLKSW_PCLK1_EN, 1, ATC_TIMEOUT_US)) {
+		dev_err(dcp->dev, "ATC%u: DP pixel clock does not start\n", atc->index);
+		return -ETIMEDOUT;
 	}
 	ret = atc_route_start(dcp, atc);
 	if (ret)
@@ -720,18 +751,6 @@ static const struct dcpib_phy_ops atc_ops = {
 	.detect = atc_detect,
 	.select = atc_select,
 	.max_link_rate = DCPIB_LINK_RATE_HBR2,
-	/*
-	 * Keep the iBoot path within the tested active-pixel budget. This
-	 * permits 2560x1440@30 and 1920x1200@60; the latter is verified
-	 * through a USB-C to HDMI adapter at a 154 MHz pixel clock.
-	 * Higher-rate modes still need display-clock bring-up.
-	 */
-	.max_pixel_rate = 140000000,
-	/*
-	 * 720x480@60 and 720x576@50 (27 MHz) show, 640x480@60 (25.2 MHz)
-	 * stays black here while HDMI shows it.
-	 */
-	.min_pixel_rate = 20000000,
 };
 
 /* PMGR registers, inside blocks their power domain driver has claimed. */

@@ -153,8 +153,8 @@ static const struct dcpib_color_mode *dcpib_find_color(struct dcpib *dcp)
 
 /*
  * A conservative console mode from 50 to 60 Hz, up to 1920x1080 on
- * USB-C. Userspace can select the larger modes, including 2560x1440@30
- * and 1920x1200@60, after the sink's EDID is available.
+ * USB-C. Userspace can select the larger modes, including 2560x1440@60,
+ * after the sink's EDID is available.
  */
 static const struct dcpib_timing_mode *dcpib_preferred(struct dcpib *dcp)
 {
