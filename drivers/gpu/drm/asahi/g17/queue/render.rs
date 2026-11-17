@@ -170,6 +170,10 @@ struct Active {
     abandoned_since: Option<u64>,
     /// First observation of this group executed and consumed while its stamps lagged.
     stamp_wait_since: Option<u64>,
+    /// The group retired on its pass record without completion stamps and its client has its
+    /// result, but the firmware may still store the stamps through its descriptor: the
+    /// descriptor slot stays held until stamps cover the group.
+    stamps_owed: bool,
 }
 
 /// A firmware-retired, unexecuted group must hold on two observations this far
@@ -188,6 +192,9 @@ pub(crate) struct Pair {
     /// The firmware identity of an M5 render pool, pinned while this pair
     /// uses the pool. G17P pools have fixed identities and need no pin.
     pool_pin: Option<crate::g17::freelist::PoolPin>,
+    /// A channel error of one of this pair's queues waits for the firmware to consume its
+    /// acknowledgement: the pair keeps its owner and graph until then.
+    channel_error: bool,
     kick_aliases: Option<[Option<mmu::KernelMapping>; 2]>,
     memory: KBox<memory::Memory>,
     kicks: [kick::Queue; 2],
@@ -248,7 +255,34 @@ pub(crate) struct Pair {
     configured_context: Option<u32>,
     /// QoS slot named by those configurations.
     configured_qos: Option<u8>,
+    /// Failed attempts to settle this pair after the firmware drained it, and when the next
+    /// attempt is due (host ns); see [`Pair::note_drain_failure`].
+    drain_failures: u32,
+    drain_retry_at: u64,
 }
+
+/// First delay after a failed settlement of a drained pair; each further failure doubles it up
+/// to [`DRAIN_RETRY_MAX_NS`].
+const DRAIN_RETRY_MIN_NS: u64 = 1_000_000;
+const DRAIN_RETRY_MAX_NS: u64 = 1_000_000_000;
+/// After this many failed attempts (about 7 s) the pair is left out of service: its clients
+/// already failed with the quarantine, and it is re-checked only every
+/// [`DRAIN_PARKED_RETRY_NS`], silently.
+pub(crate) const DRAIN_RETRY_LIMIT: u32 = 16;
+const DRAIN_PARKED_RETRY_NS: u64 = 10_000_000_000;
+
+/// The wait after the `failures`th consecutive failed settlement of a drained pair.
+pub(crate) fn drain_retry_delay(failures: u32) -> u64 {
+    if failures >= DRAIN_RETRY_LIMIT {
+        DRAIN_PARKED_RETRY_NS
+    } else {
+        DRAIN_RETRY_MIN_NS
+            .checked_shl(failures.saturating_sub(1))
+            .unwrap_or(DRAIN_RETRY_MAX_NS)
+            .min(DRAIN_RETRY_MAX_NS)
+    }
+}
+
 impl Pair {
     #[inline(never)]
     #[expect(
@@ -356,10 +390,23 @@ impl Pair {
             configuration: None,
             configured_context: None,
             configured_qos: None,
+            drain_failures: 0,
+            drain_retry_at: 0,
+            channel_error: false,
         }))
     }
     pub(crate) fn qids(&self) -> [u8; 2] {
         self.kicks.each_ref().map(|kick| kick.id().qid())
+    }
+    /// The queue record the firmware runs physical queue `qid` of this pair from.
+    pub(crate) fn queue_record_va(&self, qid: u8) -> Option<u64> {
+        self.qids().contains(&qid).then(|| {
+            self.memory.graph.queues.gpu_va()
+                + u64::from(qid) * size_of::<crate::g17::fw::queue::QueueRecord>() as u64
+        })
+    }
+    pub(crate) fn set_channel_error(&mut self, pending: bool) {
+        self.channel_error = pending;
     }
     pub(crate) fn slot(&self) -> u8 {
         self.slot
@@ -538,6 +585,7 @@ impl Pair {
             ray_query: *ray_query,
             resources: &resources,
             ordinal,
+            pair_idle: self.active.len() == 0,
             ta: abi::RenderStage {
                 qid: qids[0],
                 descriptor_va: self.memory.graph.descriptor_client(0, ordinal)?,
@@ -613,6 +661,10 @@ struct RenderBarriers {
     tiling_types: [u8; 6],
     fragment_types: [u8; 5 + crate::g17::hazard::PUBLICATION_BARRIERS],
 }
+
+/// The last fragment kick published on any pair: on the J813 the next tiling kick waits for it
+/// (see [`Pair::publish`]).
+static J813_LAST_FRAGMENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 fn render_barriers(
     fragment_stage: bool,
@@ -839,7 +891,11 @@ impl Pair {
                     crate::g17::fw::m5::queue::ConfigProfile {
                         soft_fault_enabled: true,
                         extended: false,
-                        parameter_manager: (stage == 0).then(|| u32::from(self.buffer_id())),
+                        // macOS 27.0's J813 TA configuration names the paired 3D queue at
+                        // +0x82 (qid 1 beside pb_slot 0), not the parameter manager.
+                        parameter_manager: (stage == 0
+                            && !crate::g17::J813_FORMS.load(Ordering::Relaxed))
+                        .then(|| u32::from(self.buffer_id())),
                     },
                 )?
             } else {
@@ -847,7 +903,10 @@ impl Pair {
             });
         }
         let configs = [configs[0].ok_or(EIO)?, configs[1].ok_or(EIO)?];
-        if m5 && self.registered.is_none() {
+        // The J813's (common 26A428) items carry configuration, descriptor and announcement in
+        // one publication; macOS 27.0 never publishes a configuration alone there.
+        let j813 = crate::g17::J813_FORMS.load(Ordering::Relaxed);
+        if m5 && !j813 && self.registered.is_none() {
             if self.installed == [true; 2] {
                 // The cold-install configuration pair must be consumed first.
                 let cursors = self.memory.graph.cursors()?;
@@ -883,10 +942,22 @@ impl Pair {
                 config.completion_seed_valid = 0;
                 config.completion_seed = 0;
             }
-            publication::required(cache[stage], config)
+            // macOS 27.0 sends a configuration with every J813 kick, so the firmware always
+            // runs a kick under the context its own record names; leaving it out let a fragment
+            // run under another client's (or no) context under parallel load.
+            j813 || publication::required(cache[stage], config)
         });
-        let cursors = self.memory.graph.cursors()?;
-        if cursors[0].write != self.cursors[0] || cursors[1].write != self.cursors[1] {
+        // An idle pair's next command starts from the rings' cursors; behind a command in
+        // flight it starts from that command's windows, and only the producers are checked.
+        let cursors = match self.active.front() {
+            Some(_) => None,
+            None => Some(self.memory.graph.cursors()?),
+        };
+        let producers = match cursors {
+            Some(cursors) => cursors.map(|cursors| cursors.write),
+            None => self.memory.graph.write_cursors()?,
+        };
+        if producers != self.cursors {
             return Err(EBUSY);
         }
         let queues = qids.map(|qid| self.memory.graph.queue_va(qid));
@@ -897,9 +968,28 @@ impl Pair {
             return Err(EINVAL);
         };
         let own_tiling = KickDependency::new(qids[0], kicks[0]).ok_or(EINVAL)?;
-        let barriers =
+        let mut barriers =
             render_barriers(pass.fragment_barriers, pass.stage_prefixes, dependencies, own_tiling,
                 self.board.map_or(2, crate::g17::fw::m5::compute::explicit_dependency));
+        // On the J813 a tiling kick also waits for the last fragment kick published, on any
+        // pair, as macOS 27.0 orders them there: its TA kick for render n names render n - 1's
+        // 3D kick (every such dependency in its captured queues). Without it a TA ran beside
+        // another context's 3D, and that 3D fetched its own tile data (ISP parameter fetch,
+        // requestor 0x9a) through the TA's VM slot, or slot 0, and faulted.
+        if j813 {
+            let last = KickDependency::from_word(
+                J813_LAST_FRAGMENT.load(core::sync::atomic::Ordering::Acquire),
+            )
+            .filter(|d| d.word() != 0 && d.qid() != qids[0]);
+            if let Some(last) = last {
+                if barriers.tiling_count < barriers.tiling.len() {
+                    barriers.tiling[barriers.tiling_count] = last;
+                    barriers.tiling_types[barriers.tiling_count] = 2;
+                    barriers.tiling_count += 1;
+                    barriers.tiling_types[barriers.tiling_count] = 1;
+                }
+            }
+        }
         let tiling_barriers = &barriers.tiling[..barriers.tiling_count];
         // With the G17D forms a fragment kick with history also names its parent's
         // predecessor, in class 1, after the self-parent (classes [1, 3, 1] for a lone pass).
@@ -941,8 +1031,9 @@ impl Pair {
                 },
             },
             mcache,
-            // M5 tiling kicks also retain the last event of the mask.
-            event_mask: if m5 && stage == 0 {
+            // M5 tiling kicks also retain the last event of the mask, except on the J813, whose
+            // macOS 27.0 TA and 3D kicks name no event at all.
+            event_mask: if m5 && stage == 0 && !j813 {
                 [0, 0, 0, 1u64 << 62]
             } else {
                 abi::RENDER_KICK_EVENT_MASK
@@ -1022,16 +1113,18 @@ impl Pair {
             )?,
         ];
         let windows = [lanes[0].window, lanes[1].window];
-        let previous = self.active.front().map_or(cursors, |active| {
-            active.ticket.windows.map(|window| {
+        let previous = match (self.active.front(), cursors) {
+            (Some(active), _) => active.ticket.windows.map(|window| {
                 let target = window.target();
                 retirement::Cursors {
                     done: target,
                     read: target,
                     write: target,
                 }
-            })
-        });
+            }),
+            (None, Some(cursors)) => cursors,
+            (None, None) => return Err(EIO),
+        };
         let fragment_slot = WorkSlot::new(
             DataMaster::Fragment,
             queues[1],
@@ -1082,6 +1175,7 @@ impl Pair {
                 drained_result: None,
                 abandoned_since: None,
                 stamp_wait_since: None,
+                stamps_owed: false,
             })
             .map_err(|_| EBUSY)?;
         self.prepared = None;
@@ -1170,6 +1264,7 @@ impl Pair {
         self.ordinal = next_ordinal;
         if let Some(fragment) = KickDependency::new(qids[1], kicks[1]) {
             packet.completion.note_render_publication(fragment);
+            J813_LAST_FRAGMENT.store(fragment.word(), core::sync::atomic::Ordering::Release);
         }
         self.cursors = windows.map(|window| window.target());
         for stage in 0..2 {
@@ -1547,6 +1642,44 @@ impl Pair {
         Ok(true)
     }
 
+    /// Evidence for a group whose watchdog expired: whether the firmware consumed its ring
+    /// entries (the cursors) and whether its halves ran (the pass record, which the tiler and
+    /// fragment processing write). It separates work the firmware never picked up from work it
+    /// started and never finished, which the error alone does not say. The first few groups of a
+    /// boot report; the rest would repeat them.
+    pub(crate) fn report_timeout(&self, stamps: [u32; 2], state: u32) {
+        static REPORTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        if REPORTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= 4 {
+            return;
+        }
+        let Some(front) = self.active.front() else {
+            return;
+        };
+        let ordinal = front.ticket.ordinal;
+        let Ok(snapshot) = observation::snapshot(&self.memory, ordinal) else {
+            pr_warn!(
+                "G17: render timeout slot {} ordinal {}: its graph could not be read\n",
+                self.slot,
+                ordinal
+            );
+            return;
+        };
+        pr_warn!(
+            "G17: render timeout slot {} ordinal {} qids {:?}: stamps [{:#x}, {:#x}], recovery state {}, pass [{:#x}, {:#x}], tiler {:?}, fragment {:?}, job list {}\n",
+            self.slot,
+            ordinal,
+            self.qids(),
+            stamps[0],
+            stamps[1],
+            state,
+            snapshot.pass[0],
+            snapshot.pass[1],
+            snapshot.cursors[0],
+            snapshot.cursors[1],
+            if snapshot.job_list_empty { "empty" } else { "not empty" }
+        );
+    }
+
     fn selected(&self, masks: Option<[u64; 2]>) -> bool {
         masks.is_none_or(|masks| completion_noted(self.qids(), masks))
     }
@@ -1563,6 +1696,7 @@ impl Pair {
                 published: active.published,
                 finished: false,
                 failed: self.quarantined,
+                excused: active.packet.within_allowance(crate::g17::now_ns()),
             })
     }
 
@@ -1594,9 +1728,20 @@ impl Pair {
     /// Sample PM feedback only after this pair's exact retirement. Busy pairs
     /// keep their current capacity and let firmware request growth as needed.
     pub(crate) fn host_growth_target(&mut self, packet: &Packet) -> Result<Option<usize>> {
-        let required =
+        let mut required =
             m5_render_submission::layout(&packet.command, self.clusters, self.variant.programs)?
                 .tvb_blocks;
+        // A mesh workgroup whose output is in flight when the tiler heap runs out loses part of
+        // it, whether the firmware then grows the heap or partial-renders, and the tile-count
+        // estimate does not see mesh output. Size the heap of a render with mesh shading ahead
+        // of it, to the size its automatic growth reaches after one such render.
+        if matches!(&packet.command, Validated::Render { pass, resources, .. }
+            if pass.mesh_output || resources.as_ref().is_some_and(|p| p.uses_mesh()))
+        {
+            if let Some(floor) = self.memory.manager.mesh_floor() {
+                required = required.max(floor);
+            }
+        }
         self.memory
             .manager
             .note_required(required, crate::g17::now_ns());
@@ -1611,12 +1756,114 @@ impl Pair {
         } else {
             0
         };
-        let required = required.max(feedback);
+        // The estimate is an upper bound from the tile count, and the buffer's capacity was
+        // fixed when it was created for this pair's first render. Grow as far as it goes, as the
+        // firmware's own requests do (firmware_target), instead of failing the render with
+        // ERANGE: a 16384x16384 no-attachment render after smaller ones lost the device
+        // (dEQP-GLES31.functional.fbo.no_attachments.maximums.*).
+        let required = required.max(feedback).min(self.memory.manager.max_blocks());
         Ok((required > self.memory.manager.blocks()).then_some(required))
     }
 
+    /// A quarantined pair, or a closed owner's pair that holds only groups whose stamps are
+    /// owed (`Active::stamps_owed`): those already reported to their clients, and nothing but
+    /// the stamps (or a kill of the context) releases their descriptors.
     pub(crate) fn needs_drain(&self) -> bool {
-        self.quarantined
+        self.quarantined || self.holds_only_owed_stamps()
+    }
+
+    fn holds_only_owed_stamps(&self) -> bool {
+        self.owner.is_none()
+            && self.prepared.is_none()
+            && self.active.len() != 0
+            && self.active.iter().all(|active| active.stamps_owed)
+    }
+
+    /// Work no other owner can bind this pair past: a quarantine, or a group whose stamps are
+    /// owed. Only the firmware draining the pair (the stamps, or a kill of its context) or a
+    /// processor stop ends either, so admission holds the slot from every other owner meanwhile.
+    pub(crate) fn unreusable_work(&self) -> bool {
+        self.quarantined || self.active.iter().any(|active| active.stamps_owed)
+    }
+
+    /// Whether a settlement attempt of this drained pair is due at `now`.
+    pub(crate) fn drain_due(&self, now: u64) -> bool {
+        now >= self.drain_retry_at
+    }
+
+    /// Host ns until the next settlement attempt, if one is waiting for its backoff.
+    pub(crate) fn drain_delay(&self, now: u64) -> Option<u64> {
+        (self.drain_failures != 0 && self.drain_retry_at > now).then(|| self.drain_retry_at - now)
+    }
+
+    /// Records a failed settlement at `now` and returns the number of consecutive failures.
+    /// The next attempt waits `DRAIN_RETRY_MIN_NS << (failures - 1)`, at most
+    /// `DRAIN_RETRY_MAX_NS`; from `DRAIN_RETRY_LIMIT` on, `DRAIN_PARKED_RETRY_NS`.
+    pub(crate) fn note_drain_failure(&mut self, now: u64) -> u32 {
+        self.drain_failures = self.drain_failures.saturating_add(1);
+        self.drain_retry_at = now.saturating_add(drain_retry_delay(self.drain_failures));
+        self.drain_failures
+    }
+
+    /// Consecutive failed settlements since the pair last settled.
+    pub(crate) fn drain_failures(&self) -> u32 {
+        self.drain_failures
+    }
+
+    /// One debugfs line for a pair that is quarantined or holds work: what keeps it.
+    pub(crate) fn write_hold(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        if !self.quarantined && self.active.len() == 0 && self.prepared.is_none() {
+            return Ok(());
+        }
+        writeln!(
+            f,
+            "render_pair slot={} context={} owner={} quarantined={} active={} owed={} prepared={} ordinal={} freelist={:?} unstamped={} killed={} kill_published={} drain_failures={}",
+            self.slot,
+            self.context().id(),
+            u8::from(self.owner.is_some()),
+            u8::from(self.quarantined),
+            self.active.len(),
+            self.active.iter().filter(|active| active.stamps_owed).count(),
+            u8::from(self.prepared.is_some()),
+            self.ordinal,
+            self.free_list.counters().ok(),
+            u8::from(self.executed_unstamped()),
+            u8::from(self.context_killed()),
+            u8::from(self.context().kill_published()),
+            self.drain_failures
+        )
+    }
+
+    /// Bounded state of a pair whose settlement failed, for the log.
+    pub(crate) fn report_drain(&self, host: &impl Host) {
+        let stamps = host.stamps(self.qids());
+        pr_warn!(
+            "G17: drained render slot={} qids={:?} owner={} quarantined={} active={} prepared={} stamps={:?} freelist={:?} killed={} unstamped={}\n",
+            self.slot,
+            self.qids(),
+            self.owner.is_some(),
+            self.quarantined,
+            self.active.len(),
+            self.prepared.is_some(),
+            stamps,
+            self.free_list.counters(),
+            self.context_killed(),
+            self.executed_unstamped()
+        );
+        for active in self.active.iter().take(4) {
+            pr_warn!(
+                "G17: drained render slot={} ordinal={} owned={} published={} flist={} qos={} failed={} stamps_owed={} drained={:?}\n",
+                self.slot,
+                active.ticket.ordinal,
+                self.memory.owns(active.ticket.ordinal),
+                active.outer_published,
+                active.flist_completed,
+                active.qos_completed,
+                active.failed,
+                active.stamps_owed,
+                active.drained_result.map(|result| result.err())
+            );
+        }
     }
 
     pub(crate) fn oldest_spared(&self) -> Option<bool> {
@@ -1732,6 +1979,11 @@ impl Pair {
         }
         for active in self.active.iter_mut() {
             active.packet.completion.quarantine_render();
+            if active.stamps_owed {
+                // Already reported to its client: only its descriptor is still held.
+                active.failed = true;
+                continue;
+            }
             if !active.failed {
                 defer(Deferred::FailedOwned(
                     active.packet.completion.clone(),
@@ -1818,6 +2070,28 @@ impl Pair {
         {
             return Err(EIO);
         }
+        if front.stamps_owed {
+            // Already reported: only the descriptor slot waits for the stamps.
+            let mut observer = Observer {
+                memory: &self.memory,
+                qids,
+                host,
+            };
+            let result = retirement::poll(&mut front.ticket, &mut observer);
+            let ordinal = front.ticket.ordinal;
+            return match result {
+                Ok(retirement::Poll::Complete(_)) => {
+                    self.memory.retire(ordinal)?;
+                    self.active.pop().ok_or(EIO)?;
+                    Ok(true)
+                }
+                Ok(_) => Ok(false),
+                Err(error) => {
+                    self.quarantine(error, defer)?;
+                    Ok(false)
+                }
+            };
+        }
         let stampless = front
             .stamp_wait_since
             .is_some_and(|since| Self::stamp_wait_expired(front, since, crate::g17::now_ns()));
@@ -1878,6 +2152,13 @@ impl Pair {
             front.packet.completion.clone(),
             front.packet.check_firmware_producers().map(|()| timestamps),
         ))?;
+        if stampless {
+            // The pass record is no witness that the firmware is done with the descriptor: it
+            // can still store the completion stamps through it, and a reused slot names no
+            // stamp target. Keep the slot until stamps cover the group.
+            front.stamps_owed = true;
+            return Ok(true);
+        }
         self.memory.retire(ordinal)?;
         self.active.pop().ok_or(EIO)?;
         self.executed_generation = Some(host.generation());
@@ -2281,8 +2562,11 @@ impl Pair {
     /// the firmware's job list, so neither the stamp proof nor the abandoned-group proof
     /// ever holds and the pair would stay quarantined, keeping its context, until the
     /// processors stop.
+    ///
+    /// A closed owner's pair that holds only groups whose stamps are owed counts too: they
+    /// ran and were reported, and only the stamps they never got hold their descriptors.
     fn executed_unstamped(&self) -> bool {
-        self.quarantined
+        (self.quarantined || self.holds_only_owed_stamps())
             // Only for a closed owner: a live owner would go on publishing into a context
             // whose work list still links the unstamped node.
             && self.owner.is_none()
@@ -2360,24 +2644,32 @@ impl Pair {
 
     /// Fresh proof after asynchronous control publication is the ownership
     /// boundary. A refused deferred item leaves the precise owner available.
+    /// Returns whether the proof held and released every group of the pair.
     pub(crate) fn release_witnessed(
         &mut self,
         host: &impl Host,
         defer: &mut impl FnMut(Deferred) -> Result,
-    ) -> Result {
+    ) -> Result<bool> {
         if self.active.iter().any(|a| !a.flist_completed) || !self.firmware_drained(host)? {
-            return Ok(());
+            return Ok(false);
         }
         while let Some(active) = self.active.front() {
-            let result = active.drained_result.ok_or(EIO)?;
-            defer(Deferred::Drained(active.packet.completion.clone(), result))?;
+            // A group retired on its pass record was reported then (`stamps_owed`): the pair-wide
+            // proof above covers its stamps too (or the kill of its context), so only its
+            // descriptor is released. It has no drained result of its own.
+            if !active.stamps_owed {
+                let result = active.drained_result.ok_or(EIO)?;
+                defer(Deferred::Drained(active.packet.completion.clone(), result))?;
+            }
             let ordinal = active.ticket.ordinal;
             self.memory.retire(ordinal)?;
             self.active.pop().ok_or(EIO)?;
         }
         self.quarantined = false;
+        self.drain_failures = 0;
+        self.drain_retry_at = 0;
         self.resync();
-        Ok(())
+        Ok(true)
     }
 
     /// The registry first polls the completed prefix through this exact Arc.
@@ -2663,6 +2955,10 @@ impl Pair {
             }
         }
     }
+    pub(crate) fn forget_registration(&mut self) {
+        self.registered = None;
+    }
+
     /// The scheduler page these queues last ran a command for, when the next
     /// publication for `context` changes the queues' owner.
     /// The steady state in which a command may publish without the device
@@ -2777,7 +3073,8 @@ impl Pair {
             .previous
             .as_ref()
             .is_none_or(|p| p.memory.is_none() && self.context_update && !p.ready);
-        Ok(self.owner.is_none()
+        Ok(!self.channel_error
+            && self.owner.is_none()
             && self.displaced.is_none()
             && previous_ready
             && self.idle_for_context(self.context())?)
@@ -3019,5 +3316,31 @@ mod completion_noted_tests {
         let mut both = bit(3);
         both[1] |= bit(68)[1];
         assert!(completion_noted([3, 68], both));
+    }
+}
+
+#[kunit_tests(asahi_g17_render_drain_retry)]
+mod drain_retry_tests {
+    use super::{drain_retry_delay, DRAIN_RETRY_LIMIT};
+
+    #[test]
+    fn backoff_doubles_from_a_millisecond_to_a_second() {
+        assert_eq!(drain_retry_delay(1), 1_000_000);
+        assert_eq!(drain_retry_delay(2), 2_000_000);
+        assert_eq!(drain_retry_delay(10), 512_000_000);
+        assert_eq!(drain_retry_delay(11), 1_000_000_000);
+        assert_eq!(drain_retry_delay(DRAIN_RETRY_LIMIT - 1), 1_000_000_000);
+    }
+
+    #[test]
+    fn a_pair_left_out_of_service_is_checked_every_ten_seconds() {
+        assert_eq!(drain_retry_delay(DRAIN_RETRY_LIMIT), 10_000_000_000);
+        assert_eq!(drain_retry_delay(u32::MAX), 10_000_000_000);
+    }
+
+    #[test]
+    fn the_limit_is_reached_within_ten_seconds() {
+        let total: u64 = (1..DRAIN_RETRY_LIMIT).map(drain_retry_delay).sum();
+        assert!(total < 10_000_000_000);
     }
 }

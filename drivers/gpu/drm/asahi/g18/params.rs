@@ -23,35 +23,56 @@ const fn modinfo<const N: usize>(bytes: &[u8]) -> [u8; N] {
     out
 }
 
+/// One `__param` entry of this backend, emitted as `kernel::module!` emits its own: every
+/// hand-written parameter of the G18 backend is declared through this macro.
+///
+/// The entry must be `#[used(compiler)]`, as in rust/macros/module.rs. A plain `#[used]` is
+/// `#[used(linker)]` on ELF targets: its section gets SHF_GNU_RETAIN, the module link keeps it
+/// apart from the module's other `__param` input sections, and the module loader then refuses
+/// the whole module ("cannot create duplicate filename '/module/aurora/sections/__param'"), so no
+/// GPU of any generation probes.
+///
+/// `$name` is the parameter's name as a string; built in, it gets the `aurora.` prefix.
+macro_rules! g18_kernel_param {
+    ($static:ident, $name:expr, ops: $ops:expr, perm: $perm:expr, arg: $arg:expr $(,)?) => {
+        #[link_section = "__param"]
+        #[used(compiler)]
+        static $static: kernel::module_param::KernelParam =
+            kernel::module_param::KernelParam::new(kernel::bindings::kernel_param {
+                name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
+                    kernel::c_str!($name)
+                } else {
+                    kernel::c_str!(concat!("aurora.", $name))
+                }),
+                // `__this_module` is constructed by the kernel at load time and is not
+                // freed until the module is unloaded. A raw address avoids a reference to
+                // the mutable extern static.
+                #[cfg(MODULE)]
+                mod_: &raw mut kernel::bindings::__this_module,
+                #[cfg(not(MODULE))]
+                mod_: core::ptr::null_mut(),
+                ops: $ops,
+                perm: $perm,
+                level: -1,
+                flags: 0,
+                __bindgen_anon_1: kernel::bindings::kernel_param__bindgen_ty_1 { arg: $arg },
+            });
+    };
+}
+pub(crate) use g18_kernel_param;
+
 macro_rules! g18_param {
     ($name:ident: $ty:ident = $default:expr, $ops:ident, $description:literal) => {
         pub(crate) static $name: ModuleParamAccess<$ty> = ModuleParamAccess::new($default);
 
         const _: () = {
-            #[link_section = "__param"]
-            #[used(compiler)]
-            static PARAM: kernel::module_param::KernelParam =
-                kernel::module_param::KernelParam::new(kernel::bindings::kernel_param {
-                    name: kernel::str::as_char_ptr_in_const_context(if cfg!(MODULE) {
-                        kernel::c_str!(stringify!($name))
-                    } else {
-                        kernel::c_str!(concat!("aurora.", stringify!($name)))
-                    }),
-                    // `__this_module` is constructed by the kernel at load time and is not
-                    // freed until the module is unloaded. A raw address avoids a reference to
-                    // the mutable extern static.
-                    #[cfg(MODULE)]
-                    mod_: &raw mut kernel::bindings::__this_module,
-                    #[cfg(not(MODULE))]
-                    mod_: core::ptr::null_mut(),
-                    ops: core::ptr::from_ref(&$ops),
-                    perm: 0, // Will not appear in sysfs
-                    level: -1,
-                    flags: 0,
-                    __bindgen_anon_1: kernel::bindings::kernel_param__bindgen_ty_1 {
-                        arg: $name.as_void_ptr(),
-                    },
-                });
+            g18_kernel_param!(
+                PARAM,
+                stringify!($name),
+                ops: core::ptr::from_ref(&$ops),
+                perm: 0, // Will not appear in sysfs
+                arg: $name.as_void_ptr(),
+            );
 
             #[cfg(MODULE)]
             const TYPE: &[u8] =

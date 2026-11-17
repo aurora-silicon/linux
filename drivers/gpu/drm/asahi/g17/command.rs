@@ -41,11 +41,12 @@ const FRAGMENT_BARRIERS: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_FRA
 const STAGE_PREFIXES: u32 = crate::file::DRM_ASAHI_RENDER_STAGE_PREFIXES;
 const WHOLE_ATTACHMENTS: u32 = crate::file::DRM_ASAHI_RENDER_WHOLE_ATTACHMENTS;
 const SHADER_WRITES: u32 = crate::file::DRM_ASAHI_RENDER_SHADER_WRITES;
+const MESH_OUTPUT: u32 = crate::file::DRM_ASAHI_RENDER_MESH_OUTPUT;
 /// Render flags only the M5 runtime implements.
 const M5_RENDER_FLAGS: u32 = SHADER_WRITES | STAGE_PREFIXES | WHOLE_ATTACHMENTS;
 const RENDER_FLAGS: u32 =
     PROCESS_EMPTY | RSRC_SPEC_HI | DBIAS_INT | FEW_PRIMITIVES | FRAGMENT_BARRIERS | SHADER_WRITES
-        | STAGE_PREFIXES | WHOLE_ATTACHMENTS;
+        | STAGE_PREFIXES | WHOLE_ATTACHMENTS | MESH_OUTPUT;
 
 /// Attachment settings persist until replaced, including by an empty list.
 #[derive(Clone, Copy)]
@@ -199,7 +200,34 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// A refused submission reaches userspace as EINVAL alone, which names neither the command
+    /// the parser stopped at nor what it holds. Name both, for the first few of a boot.
     pub(crate) fn next(&mut self) -> Result<Option<Command>> {
+        let head = self.bytes;
+        let result = self.next_parsed();
+        if let Err(error) = &result {
+            static REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            if REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8 {
+                match Reader::new(head).read::<uapi::drm_asahi_cmd_header>() {
+                    Ok(header) => pr_warn!(
+                        "G17: refused a submission ({:?}) at its command of type {}, {} bytes, \
+                         barriers [{:#x}, {:#x}], with {} of the submission's bytes left\n",
+                        error, header.cmd_type, header.size, header.vdm_barrier,
+                        header.cdm_barrier, head.len()
+                    ),
+                    Err(_) => pr_warn!(
+                        "G17: refused a submission ({:?}): its remaining {} bytes are not a \
+                         command header\n",
+                        error,
+                        head.len()
+                    ),
+                }
+            }
+        }
+        result
+    }
+
+    fn next_parsed(&mut self) -> Result<Option<Command>> {
         while !self.bytes.is_empty() {
             let mut reader = Reader::new(self.bytes);
             let header: uapi::drm_asahi_cmd_header = reader.read()?;
@@ -284,6 +312,13 @@ impl<'a> Parser<'a> {
 
     pub(crate) fn finish(&self) -> Result {
         if !self.bytes.is_empty() || self.counts == [0; 2] {
+            pr_warn!(
+                "G17: refused a submission: {} bytes past its last command, {} renders and {} \
+                 dispatches\n",
+                self.bytes.len(),
+                self.counts[0],
+                self.counts[1]
+            );
             return Err(EINVAL);
         }
         Ok(())
@@ -458,6 +493,8 @@ pub(crate) enum Validated {
         sampler_heap_va: u64,
         sampler_count: u32,
         timestamps: uapi::drm_asahi_timestamps,
+        /// The buffers the dispatch writes, from the compute attachment list.
+        attachments: Attachments,
     },
 }
 
@@ -470,6 +507,21 @@ impl Validated {
     pub(crate) fn allow_long_job(&mut self) {
         match self {
             Self::Render { long_job, .. } | Self::Compute { long_job, .. } => *long_job = true,
+        }
+    }
+    /// The command traces rays: it carries intersection tables or traversal scratch, in
+    /// either stage of a render or as a compute command.
+    pub(crate) fn traces_rays(&self) -> bool {
+        match self {
+            Self::Render { ray_query, .. } => ray_query
+                .iter()
+                .any(|stage| stage.intersection.enabled() || stage.scratch.enabled()),
+            Self::Compute { intersection, scratch, m5_intersection, m5_scratch, .. } => {
+                intersection.enabled()
+                    || scratch.enabled()
+                    || m5_intersection.enabled()
+                    || m5_scratch.enabled()
+            }
         }
     }
 }
@@ -494,7 +546,35 @@ impl Payload {
         }
     }
 
+    /// A refused submission reaches userspace as EINVAL alone, which names neither the command
+    /// nor the requirement it missed. Print the fields the requirements below are written in,
+    /// as userspace sent them, for the first few refusals of a boot.
     pub(crate) fn validate(
+        &self,
+        window: &UscWindow,
+        variant: &super::fw::Variant,
+        space: &impl AddressSpace,
+    ) -> Result<Validated> {
+        let result = self.validate_checked(window, variant, space);
+        if let (Err(error), Self::Render(cmd, ..)) = (&result, self) {
+            static REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            if REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 4 {
+                pr_warn!(
+                    "G17: refused a render ({:?}): {}x{} px, {} layers, {} samples, {} B/sample, \
+                     utile {}x{}, flags {:#x}, vdm {:#x}, scissor {:#x}, dbias {:#x}, oclqry {:#x}, \
+                     usc bg {:#x} eot {:#x} partial bg {:#x} eot {:#x}, samplers {} at {:#x}\n",
+                    error, cmd.width_px, cmd.height_px, cmd.layers, cmd.samples,
+                    cmd.sample_size_B, cmd.utile_width_px, cmd.utile_height_px, cmd.flags,
+                    cmd.vdm_ctrl_stream_base, cmd.isp_scissor_base, cmd.isp_dbias_base,
+                    cmd.isp_oclqry_base, cmd.bg.usc, cmd.eot.usc, cmd.partial_bg.usc,
+                    cmd.partial_eot.usc, cmd.sampler_count, cmd.sampler_heap
+                );
+            }
+        }
+        result
+    }
+
+    fn validate_checked(
         &self,
         window: &UscWindow,
         variant: &super::fw::Variant,
@@ -506,7 +586,14 @@ impl Payload {
         let attachment_rule = if m5 { AttachmentRule::Hint } else { AttachmentRule::Mapped };
         match self {
             Self::Render(cmd, _, attachments, ray_query, resources) => {
-                if cmd.flags & !(if m5 { RENDER_FLAGS } else { RENDER_FLAGS & !M5_RENDER_FLAGS }) != 0
+                let flags = if m5 {
+                    RENDER_FLAGS
+                } else if variant.render_stage_prefixes {
+                    RENDER_FLAGS & !(M5_RENDER_FLAGS & !STAGE_PREFIXES)
+                } else {
+                    RENDER_FLAGS & !M5_RENDER_FLAGS
+                };
+                if cmd.flags & !flags != 0
                     || (!m5 && resources.is_some())
                     || !(1..=MAX_DIMENSION).contains(&cmd.width_px)
                     || !(1..=MAX_DIMENSION).contains(&cmd.height_px)
@@ -578,6 +665,7 @@ impl Payload {
                     depth_bias_va: cmd.isp_dbias_base,
                     depth_bias_is_int: cmd.flags & DBIAS_INT != 0,
                     few_primitives: cmd.flags & FEW_PRIMITIVES != 0 && variant.few_primitives,
+                    mesh_output: cmd.flags & MESH_OUTPUT != 0,
                     fragment_barriers: cmd.flags & FRAGMENT_BARRIERS != 0,
                     stage_prefixes: cmd.flags & STAGE_PREFIXES != 0,
                     whole_attachments: cmd.flags & WHOLE_ATTACHMENTS != 0,
@@ -726,6 +814,7 @@ impl Payload {
                     sampler_heap_va: cmd.sampler_heap,
                     sampler_count: cmd.sampler_count,
                     timestamps: cmd.ts,
+                    attachments: *attachments,
                 })
             }
         }

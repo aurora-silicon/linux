@@ -101,6 +101,9 @@
 #define CISP_CMD_APPLE_CH_TEMPORAL_FILTER_BAND0_THRESHOLD    0xc11d
 #define CISP_CMD_APPLE_CH_TEMPORAL_FILTER_HIGH_STRENGTH	     0xc120
 
+/* Opcodes of the DEBUG channel, which has its own numbering */
+#define CISP_DEBUG_CMD_STOP_KEY_GET			     0x001d
+
 #define CISP_POOL_TYPE_META				     0x0
 #define CISP_POOL_TYPE_RENDERED				     0x1
 #define CISP_POOL_TYPE_FD				     0x2
@@ -158,6 +161,19 @@ struct cmd_print_enable {
 	u32 enable;
 } __packed;
 static_assert(sizeof(struct cmd_print_enable) == 0xc);
+
+/*
+ * CISP_DEBUG_CMD_STOP_KEY_GET: the firmware answers with a word of its
+ * memory and the value it writes there once it has stopped.
+ */
+struct cmd_stop_key {
+	u64 opcode;
+	u32 enable;
+	u32 pad_c;
+	u64 addr;
+	u64 key;
+} __packed;
+static_assert(sizeof(struct cmd_stop_key) == 0x20);
 
 struct cmd_trace_enable {
 	u64 opcode;
@@ -263,10 +279,12 @@ int isp_cmd_send(struct apple_isp *isp, void *args, u32 insize, u32 outsize,
 		 int timeout);
 int isp_cmd_start(struct apple_isp *isp, u32 mode);
 int isp_cmd_stop(struct apple_isp *isp, u32 mode);
+int isp_cmd_stop_cold(struct apple_isp *isp, u32 mode);
 int isp_cmd_power_down(struct apple_isp *isp);
 int isp_cmd_suspend(struct apple_isp *isp);
 int isp_cmd_print_enable(struct apple_isp *isp, u32 enable);
 int isp_cmd_trace_enable(struct apple_isp *isp, u32 enable);
+int isp_cmd_stop_key_get(struct apple_isp *isp, struct cmd_stop_key *args);
 int isp_cmd_config_get(struct apple_isp *isp, struct cmd_config_get *args);
 int isp_cmd_set_isp_pmu_base(struct apple_isp *isp, u64 pmu_base);
 int isp_cmd_set_dsid_clr_req_base(struct apple_isp *isp, u64 dsid_clr_base,

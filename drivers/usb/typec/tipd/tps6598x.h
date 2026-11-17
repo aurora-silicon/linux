@@ -350,7 +350,7 @@ struct tipd_data {
 	bool (*read_power_status)(struct tps6598x *tps);
 	int (*reset)(struct tps6598x *tps);
 	int (*connect)(struct tps6598x *tps, u32 status);
-	void (*prepare)(struct tps6598x *tps);
+	int (*prepare)(struct tps6598x *tps);
 	void (*complete)(struct tps6598x *tps);
 };
 
@@ -384,6 +384,8 @@ struct tps6598x {
 	int wakeup;
 	/* Handles events while the system sleeps, if the variant can filter them */
 	bool (*sleep_event)(struct tps6598x *tps);
+	/* Wakes the controller, where its bus has a command for that */
+	int (*wake)(struct tps6598x *tps);
 	u32 status; /* status reg */
 	u32 data_status;
 	u16 pwr_status;
@@ -395,6 +397,8 @@ struct tps6598x {
 
 	struct tipd_debugfs *debugfs;
 	struct typec_altmode *partner_altmode_dp;
+	/* USB remote wake armed on this port for the sleep (USBw). */
+	bool usbw_armed;
 };
 
 /* TPS_REG_USB4_STATUS */
@@ -466,12 +470,23 @@ struct cd321x {
 	atomic_t ready_event;
 	atomic_t restore_event;
 	bool display_route_active;
+	/* The sleep's debug link cut reset this controller: its setup is expected. */
+	bool reset_by_cut;
+	/* The debug link is still to be rearmed after a cut, and the tries so far */
+	bool rearm_pending;
+	unsigned int rearm_tries;
+	/* Resets taken since the cut for a contract the partner dropped, see cd321x_rearm_work() */
+	unsigned int rearm_resets;
 	bool dp_sink_reported;
 	bool dp_irq_hpd;
+	/* A plug was in when the sleep began, and a wake's first port state is still to be applied */
+	bool sleep_plug;
+	bool wake_apply;
 
 	struct cd321x_status update_status;
 	struct delayed_work update_work;
 	struct delayed_work resume_work;
+	struct delayed_work rearm_work;
 	struct cd321x_pm_state pm;
 	struct usb_pd_identity cur_partner_identity;
 	bool cur_partner_is_pd;
@@ -498,6 +513,8 @@ struct sn201202x {
 	bool ldcm_mitigated;
 	/* ldcm_mitigated matches the controller (unknown after a reset) */
 	bool ldcm_mitigation_known;
+	/* A mitigation was requested since the controller's last reset */
+	bool ldcm_requested;
 };
 
 extern const struct tipd_data *tipd_hw_variants[];
@@ -522,6 +539,7 @@ struct cd321x_sleep_state {
 };
 
 int cd321x_sleep_events(struct tps6598x *tps, struct cd321x_sleep_state *st);
+void tipd_usb_wake(struct tps6598x *tps, bool asleep);
 int tps6598x_exec_cmd_tmo(struct tps6598x *tps, const char *cmd,
 			  size_t in_len, const u8 *in_data,
 			  size_t out_len, u8 *out_data,
@@ -549,6 +567,8 @@ static inline void tipd_debugfs_exit(void) { }
 #endif
 
 #if IS_ENABLED(CONFIG_KUNIT)
+void cd321x_mux_failed(struct cd321x *cd321x, const char *what, int ret, bool held);
+void cd321x_mux_gave_up(struct cd321x *cd321x, unsigned int retries, unsigned int held_ms);
 void cd321x_init_work(struct cd321x *cd321x);
 int cd321x_init_mux(struct cd321x *cd321x);
 void cd321x_stop_work(struct cd321x *cd321x);

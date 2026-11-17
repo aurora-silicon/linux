@@ -57,7 +57,12 @@ use std::cell::RefCell;
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 macro_rules! dev_err { ($($args:tt)*) => {} }
+macro_rules! dev_info_refusal { ($($args:tt)*) => {} }
+macro_rules! dev_err_ratelimited { ($($args:tt)*) => {} }
+macro_rules! dev_info_ratelimited { ($($args:tt)*) => {} }
+macro_rules! dev_dbg { ($($args:tt)*) => {} }
 macro_rules! dev_warn { ($($args:tt)*) => {} }
+macro_rules! dev_warn_ratelimited { ($($args:tt)*) => {} }
 macro_rules! dev_info { ($($args:tt)*) => {} }
 
 const ENROL_STATUS_SENSOR: u32 = 1;

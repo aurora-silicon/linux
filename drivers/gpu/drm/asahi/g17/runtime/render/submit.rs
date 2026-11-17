@@ -318,8 +318,11 @@ impl Backend {
         self.shared.queue_events();
         self.admission_open()?;
         let started = super::super::now_ns();
+        // Backing frees only as other owners' pairs and pools are released, which takes far
+        // longer than one poll under concurrent clients: wait as long as a compute queue
+        // waits for capacity (and a render channel for its retirement).
         let remaining = self
-            .wait_deadline(clock, super::super::WORK_RING_WAIT_NS)?
+            .wait_deadline(clock, crate::g17::preparation::QUEUE_WAIT_NS)?
             .saturating_sub(started);
         if remaining == 0 {
             return Err(EBUSY);
@@ -338,7 +341,9 @@ impl Backend {
     /// Gives idle render backing back under capacity pressure. Returns whether
     /// anything was returned, in which case the caller retries at once.
     fn reclaim_render_capacity(&self) -> Result<bool> {
-        let mut deferred = DeferredBatch::publication()?;
+        let mut deferred = DeferredBatch::reclaim()?;
+        // Idle pools go back only while the shared window is short.
+        let pools = self.lower_window_short();
         let result: Result<bool> = (|| {
             let lease = self.shared.preparations.try_enter()?;
             let mut state = self.shared.state.lock();
@@ -352,7 +357,9 @@ impl Backend {
                 return Ok(false);
             }
             firmware.queues.observe_pool_releases(&firmware.init, &mut deferred)?;
-            firmware.queues.reclaim_idle_render_pools(&firmware.init, &mut deferred)?;
+            if pools {
+                firmware.queues.reclaim_idle_render_pools(&firmware.init, &mut deferred)?;
+            }
             let mut published = 0;
             if !firmware.render_control_backpressured() {
                 (published, _) = firmware.queues.vacate_idle_pools(
@@ -563,6 +570,10 @@ impl Backend {
         if self.backlog.load(Ordering::Acquire) != 0 || packet.has_dependencies() {
             return false;
         }
+        // As for compute: a render that traces rays is admitted by its scheduler.
+        if !self.traversal_inline(packet) {
+            return false;
+        }
         let admission = match self.admission.try_acquire_render(self.owner, self.pairs.into(), Request::of(packet)) {
             Ok(Some(lease)) => lease,
             _ => return false,
@@ -698,7 +709,9 @@ impl crate::g17::Firmware {
         if entry.closed {
             pair.release_owner();
         }
-        if !entry.pending_timeout {
+        let pending_timeout = entry.pending_timeout;
+        self.queues.hold_render_slot(usize::from(slot));
+        if !pending_timeout {
             return Ok(());
         }
         for _ in 0..crate::hw::t8140::queues::RENDER_DEPTH {
@@ -749,13 +762,23 @@ impl crate::g17::Firmware {
         let port = self.port.clone();
         let _render = port.render_lock();
         // Both outer destinations must have room before pool accounting or
-        // either inner queue becomes visible.
+        // either inner queue becomes visible. On M5 both are the shared compute ring: one
+        // check covers the pair, and the pair is written against its cursors (this hold
+        // is the ring's only producer; the firmware's consumers only advance).
         let priority = packet.context.policy().priority();
-        if !self.init.work_ready(priority, crate::g17::fw::queue::DataMaster::Fragment)?
-            || !self.init.work_ready(priority, crate::g17::fw::queue::DataMaster::Tiling)?
-        {
-            return Err(EBUSY);
-        }
+        let outer_cursors = if self.init.is_m5() {
+            let Some(cursors) = self.init.m5_render_room(priority)? else {
+                return Err(EBUSY);
+            };
+            Some((priority, cursors))
+        } else {
+            if !self.init.work_ready(priority, crate::g17::fw::queue::DataMaster::Fragment)?
+                || !self.init.work_ready(priority, crate::g17::fw::queue::DataMaster::Tiling)?
+            {
+                return Err(EBUSY);
+            }
+            None
+        };
         if let Some(footprint) = packet.footprint.as_ref() {
             dependencies.hazard_count = self.queues.admission.publication_barriers(
                 owner,
@@ -796,7 +819,7 @@ impl crate::g17::Firmware {
             buffer_token,
             buffer_context: buffer_context.map(|(context, _)| context),
         };
-        let result = self.with_render(usize::from(slot), |pair, host| {
+        let result = self.with_render_at(usize::from(slot), outer_cursors, |pair, host| {
             pair.publish(
                 packet.clone(),
                 &dependencies,

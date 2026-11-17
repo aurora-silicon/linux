@@ -53,14 +53,6 @@ impl<'a> View<'a> {
     fn row(&self, qid: usize) -> [u8; 8] {
         core::array::from_fn(|index| self.rows[qid][index].load(Ordering::Relaxed))
     }
-    /// The complete row in one access. The table is uncached: a publication reads
-    /// each row once, before it stores anything.
-    fn row_word(&self, qid: usize) -> [u8; 8] {
-        let row = core::ptr::from_ref(&self.rows[qid]).cast::<AtomicU64>();
-        // SAFETY: Rows are eight bytes at eight-byte offsets of the eight-byte
-        // aligned table (checked in from_raw), so the row is one aligned word.
-        unsafe { (*row).load(Ordering::Relaxed) }.to_le_bytes()
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -95,6 +87,13 @@ pub(crate) struct Accounting {
     in_flight: [u32; fw::QUEUES],
     dm_in_flight: [u64; fw::DATA_MASTERS],
     dm_by_qid: [u8; fw::QUEUES],
+    /// The table's rows and counts as last stored, indexed as in [`View`]. Only the host
+    /// writes them, so a publication counts on from these instead of reading them back.
+    rows: [[u8; 8]; fw::QUEUES],
+    queue_submitted: [u32; fw::QUEUES],
+    owner_submitted: [u32; fw::QUEUES],
+    intervals: u64,
+    times_and_counts: [u64; 7],
 }
 impl Accounting {
     pub(crate) const fn new() -> Self {
@@ -102,6 +101,11 @@ impl Accounting {
             in_flight: [0; fw::QUEUES],
             dm_in_flight: [0; fw::DATA_MASTERS],
             dm_by_qid: [0; fw::QUEUES],
+            rows: [[0; 8]; fw::QUEUES],
+            queue_submitted: [0; fw::QUEUES],
+            owner_submitted: [0; fw::QUEUES],
+            intervals: 0,
+            times_and_counts: [0; 7],
         }
     }
 
@@ -123,8 +127,8 @@ impl Accounting {
     /// Publishes the owners of one command's queues, in order, with the same
     /// firmware-visible values as one `publish` per owner. The owners use
     /// distinct queues and data masters. Every check precedes the first store,
-    /// so a refusal changes nothing; every table word is read before the first
-    /// store, so no uncached read waits for an earlier store to drain.
+    /// so a refusal changes nothing. The rows and counts come from the host's
+    /// copy: nothing is read back from the uncached table.
     pub(crate) fn publish_owners<const N: usize>(
         &mut self,
         view: &View<'_>,
@@ -149,13 +153,13 @@ impl Accounting {
             self.in_flight[qid].checked_add(1).ok_or(EOVERFLOW)?;
             self.dm_in_flight[dm].checked_add(1).ok_or(EOVERFLOW)?;
         }
-        let rows = indices.map(|(qid, _, _)| view.row_word(qid));
-        let queue_submitted = indices.map(|(qid, _, _)| view.queue_submitted[qid].load(Ordering::Relaxed));
-        let owner_submitted = indices.map(|(_, qos, _)| view.owner_submitted[qos].load(Ordering::Relaxed));
-        let dm_submitted = indices.map(|(_, _, dm)| view.times_and_counts[3 + dm].load(Ordering::Relaxed));
+        let rows = indices.map(|(qid, _, _)| self.rows[qid]);
+        let queue_submitted = indices.map(|(qid, _, _)| self.queue_submitted[qid]);
+        let owner_submitted = indices.map(|(_, qos, _)| self.owner_submitted[qos]);
+        let dm_submitted = indices.map(|(_, _, dm)| self.times_and_counts[3 + dm]);
         let starts_busy = indices.map(|(_, _, dm)| self.dm_in_flight[dm] == 0);
         let busy = starts_busy.iter().any(|&starts| starts);
-        let intervals = if busy { view.intervals.load(Ordering::Relaxed) } else { 0 };
+        let intervals = if busy { self.intervals } else { 0 };
         for (index, owner) in owners.iter().enumerate() {
             let (qid, _, _) = indices[index];
             if self.in_flight[qid] != 0
@@ -176,6 +180,7 @@ impl Accounting {
             let (qid, qos, _) = indices[index];
             view.rows[qid][0].store(owner.qos, Ordering::Relaxed);
             view.rows[qid][1].store(class, Ordering::Relaxed);
+            self.rows[qid][..2].copy_from_slice(&[owner.qos, class]);
             view.scheduler[qos].store(scheduler, Ordering::Relaxed);
             view.share[qos].store(policy.qos_share(), Ordering::Relaxed);
             first |= self.in_flight[qid] == 0;
@@ -191,21 +196,25 @@ impl Accounting {
         let mut intervals = intervals;
         for (index, owner) in owners.iter().enumerate() {
             let (qid, qos, dm) = indices[index];
-            view.queue_submitted[qid].store(queue_submitted[index].wrapping_add(1), Ordering::Relaxed);
+            let queued = queue_submitted[index].wrapping_add(1);
+            view.queue_submitted[qid].store(queued, Ordering::Relaxed);
+            self.queue_submitted[qid] = queued;
             // Owners of one logical queue share their submission count.
             let earlier = indices[..index].iter().filter(|&&(_, other, _)| other == qos).count();
-            view.owner_submitted[qos].store(
-                owner_submitted[index].wrapping_add(earlier as u32 + 1),
-                Ordering::Relaxed,
-            );
+            let owned = owner_submitted[index].wrapping_add(earlier as u32 + 1);
+            view.owner_submitted[qos].store(owned, Ordering::Relaxed);
+            self.owner_submitted[qos] = owned;
             if starts_busy[index] {
                 view.times_and_counts[dm].store(time, Ordering::Relaxed);
+                self.times_and_counts[dm] = time;
             }
             let submitted = dm_submitted[index].wrapping_add(1);
             view.times_and_counts[3 + dm].store(submitted, Ordering::Relaxed);
+            self.times_and_counts[3 + dm] = submitted;
             if starts_busy[index] {
                 intervals = intervals.wrapping_add(1);
                 view.intervals.store(intervals, Ordering::Relaxed);
+                self.intervals = intervals;
             }
             let mut record = rows[index];
             record[0] = owner.qos;
@@ -247,8 +256,8 @@ impl Accounting {
             if ids & (1u128 << qos) == 0 {
                 continue;
             }
-            if self.in_flight.iter().zip(view.rows.iter())
-                .any(|(&count, row)| count != 0 && usize::from(row[0].load(Ordering::Relaxed)) == qos)
+            if self.in_flight.iter().zip(self.rows.iter())
+                .any(|(&count, row)| count != 0 && usize::from(row[0]) == qos)
             {
                 left |= 1u128 << qos;
                 continue;
@@ -270,7 +279,7 @@ impl Accounting {
                 return Err(EINVAL);
             }
             if self.in_flight[qid] == 0
-                || view.rows[qid][0].load(Ordering::Relaxed) != owner.qos
+                || self.rows[qid][0] != owner.qos
                 || self.dm_by_qid[qid] != owner.data_master
             {
                 return Err(EIO);
@@ -287,6 +296,7 @@ impl Accounting {
             if self.in_flight[qid] == 1 {
                 view.rows[qid][0].store(0xff, Ordering::Relaxed);
                 view.rows[qid][1].store(0, Ordering::Relaxed);
+                self.rows[qid][..2].copy_from_slice(&[0xff, 0]);
             }
         }
         for owner in owners {

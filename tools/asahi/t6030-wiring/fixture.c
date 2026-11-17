@@ -7,23 +7,25 @@
 #include <string.h>
 typedef uint32_t u32;
 #define BIT(n) (1u << (n))
+/* FABRIC_DEFINES */
 struct mux_chip;
 struct mux_control {
 	struct mux_chip *chip;
 	unsigned int index;
 };
+/* Up to the DP-alt output and four DP IN outputs (the T8142 layout). */
 struct mux_chip {
 	unsigned int controllers;
-	struct mux_control mux[3];
+	struct mux_control mux[1 + DCP_FABRIC_DPIN_MAX];
 };
 struct device_node {
 	const char *name, *compatible;
 	struct device_node *parent, *child, *next, *remote;
 	unsigned int refs, reg, source, names_count;
 	bool missing_source, bad_parse;
-	const char *names[4];
-	struct device_node *providers[4];
-	unsigned int cells[4], nargs[4];
+	const char *names[1 + DCP_FABRIC_DPIN_MAX];
+	struct device_node *providers[1 + DCP_FABRIC_DPIN_MAX];
+	unsigned int cells[1 + DCP_FABRIC_DPIN_MAX], nargs[1 + DCP_FABRIC_DPIN_MAX];
 	struct mux_chip *chip;
 };
 struct of_phandle_args {
@@ -37,6 +39,7 @@ static struct device_node *get(struct device_node *n)
 		n->refs++;
 	return n;
 }
+#define of_node_get(n) get(n)
 static void of_node_put(struct device_node *n)
 {
 	if (n) {
@@ -129,6 +132,9 @@ static struct device_node *next_child(struct device_node *parent,
 	     node; node = next_child(parent, node))
 #define for_each_of_graph_port_endpoint(parent, node) \
 	for_each_child_of_node_scoped(parent, node)
+/* The connector's children are its graph ports. */
+#define for_each_of_graph_port(parent, node) \
+	for_each_child_of_node_scoped(parent, node)
 static struct device_node *
 of_graph_get_remote_port_parent(struct device_node *n)
 {
@@ -142,7 +148,7 @@ struct apple_dcp {
 };
 struct apple_dcp_typec_route {
 	struct apple_dcp *dcp;
-	struct mux_control *xbar, *dpin[2];
+	struct mux_control *xbar, *dpin[DCP_FABRIC_DPIN_MAX];
 	bool dual_stream;
 };
 #define IS_ERR(p) ((uintptr_t)(p) >= (uintptr_t)-4095)
@@ -166,7 +172,7 @@ int main(int argc, char **argv)
 	assert(argc == 2);
 	struct mux_chip chip = { .controllers = 3 },
 			other_chip = { .controllers = 3 };
-	for (unsigned int i = 0; i < 3; i++) {
+	for (unsigned int i = 0; i < 1 + DCP_FABRIC_DPIN_MAX; i++) {
 		chip.mux[i].chip = &chip;
 		chip.mux[i].index = i;
 		other_chip.mux[i].chip = &other_chip;
@@ -182,9 +188,10 @@ int main(int argc, char **argv)
 				   .names_count = 1,
 				   .names = { "typec0" },
 				   .providers = { &provider, &provider,
+						  &provider, &provider,
 						  &provider },
-				   .cells = { 0, 1, 2 },
-				   .nargs = { 1, 1, 1 } };
+				   .cells = { 0, 1, 2, 3, 4 },
+				   .nargs = { 1, 1, 1, 1, 1 } };
 	struct device_node routes = { .name = "typec-routes", .parent = &dcp };
 	struct device_node route_np = { .parent = &routes };
 	struct device_node endpoint[2] = { { .remote = &route_np },
@@ -192,6 +199,14 @@ int main(int argc, char **argv)
 	endpoint[0].next = &endpoint[1];
 	struct device_node port = { .reg = 3, .child = &endpoint[0] };
 	struct device_node connector = { .child = &port };
+	/* Graph ports that lead elsewhere: a USB controller and a USB4 router. */
+	struct device_node usb = { .name = "usb" }, router = { .name = "acio" };
+	struct device_node usb_port_np = { .parent = &usb },
+			   router_port_np = { .parent = &router };
+	struct device_node usb_endpoint = { .remote = &usb_port_np },
+			   router_endpoint = { .remote = &router_port_np };
+	struct device_node usb_port = { .reg = 0, .child = &usb_endpoint },
+			   router_port = { .reg = 3, .child = &router_endpoint };
 	struct device dev = { .of_node = &dcp };
 	struct apple_dcp engine = { .dev = &dev };
 	struct apple_dcp_typec_route route = { .dcp = &engine,
@@ -266,6 +281,40 @@ int main(int argc, char **argv)
 			expected_dcp = -EINVAL;
 		}
 	}
+	if (!strcmp(test, "routes-port2")) {
+		/* Port 3 is the USB4 router's: the routes are found on port 2. */
+		port.reg = 2;
+		connector.child = &usb_port;
+		usb_port.next = &port;
+		port.next = &router_port;
+	}
+	if (!strcmp(test, "four-dpin") || !strcmp(test, "four-dpin-short-xbar") ||
+	    !strcmp(test, "extra-dpin-unpaired")) {
+		/* T6050: a T8142-layout crossbar with an output per DP IN. */
+		t6030 = false;
+		chip.controllers = 1 + DCP_FABRIC_DPIN_MAX;
+		provider.compatible = "apple,t8142-display-crossbar";
+		dcp.names_count = 5;
+		dcp.names[1] = "typec0-dpin0";
+		dcp.names[2] = "typec0-dpin1";
+		dcp.names[3] = "typec0-dpin2";
+		dcp.names[4] = "typec0-dpin3";
+		if (!strcmp(test, "four-dpin-short-xbar")) {
+			/* DP IN 2/3 need outputs a T602X crossbar does not have. */
+			chip.controllers = 3;
+			expected_dcp = -EINVAL;
+		}
+		if (!strcmp(test, "extra-dpin-unpaired")) {
+			/* DP IN 2/3 only add outputs to a named DP IN 0/1 pair. */
+			dcp.names[1] = "typec0-dpin2";
+			dcp.names[2] = "typec0-dpin3";
+			dcp.cells[1] = 3;
+			dcp.cells[2] = 4;
+			dcp.names_count = 3;
+			expected = false;
+			expected_dcp = -EINVAL;
+		}
+	}
 	if (!strcmp(test, "usb4") || !strcmp(test, "usb4-other-soc") ||
 	    !strcmp(test, "bad-usb4")) {
 		dcp.names_count = 2;
@@ -289,11 +338,18 @@ int main(int argc, char **argv)
 				assert(route.dpin[0] == &chip.mux[1]);
 				assert(route.dpin[1] == &chip.mux[2]);
 			}
+			for (unsigned int i = 2; i < DCP_FABRIC_DPIN_MAX; i++)
+				assert(route.dpin[i] ==
+				       (!strcmp(test, "four-dpin") ?
+						&chip.mux[1 + i] : NULL));
 		}
 	}
 	assert(!provider.refs && !other.refs && !dcp.refs && !routes.refs &&
 	       !route_np.refs && !port.refs && !endpoint[0].refs &&
 	       !endpoint[1].refs);
+	assert(!usb.refs && !router.refs && !usb_port_np.refs &&
+	       !router_port_np.refs && !usb_endpoint.refs &&
+	       !router_endpoint.refs && !usb_port.refs && !router_port.refs);
 	printf("PASS %s\n", test);
 	return 0;
 }

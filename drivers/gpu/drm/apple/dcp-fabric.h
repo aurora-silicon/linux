@@ -30,10 +30,12 @@ struct apple_dcp_typec_route {
 	struct dcp_fabric_route core;
 	struct apple_dcp *dcp;
 	struct apple_dcp_typec_port *port;
+	/* T6050: this port/pipeline pair has a connector with a fixed CRTC. */
+	struct apple_connector *connector;
 	struct list_head port_link;
 	struct phy *phy;
 	struct mux_control *xbar;
-	struct mux_control *dpin[2];
+	struct mux_control *dpin[DCP_FABRIC_DPIN_MAX];
 	bool dual_stream;
 	struct typec_mux_dev *typec_mux;
 	u32 dptx_phy;
@@ -43,6 +45,8 @@ struct apple_dcp_typec_route {
 	bool phy_powered;
 	/* crossbar output actually selected: xbar (dpphy) or a Thunderbolt dpin */
 	unsigned int tunnel_dpin;
+	/* T6050: DP link rate code the tunnel's pixel clock runs at, 0 if stopped */
+	u8 tunnel_rate;
 	u64 tunnel_generation;
 	struct mux_control *active_xbar;
 	bool tunnel;
@@ -51,6 +55,8 @@ struct apple_dcp_typec_route {
 	/* Lower mux release is consumed even when idle programming fails. */
 	bool deactivate_xbar_done;
 	int deactivate_error;
+	/* Its crossbar output is down for a sleep, and not held. */
+	bool sleep_parked;
 };
 
 int dcp_typec_phy_on(struct apple_dcp *dcp);
@@ -70,9 +76,12 @@ bool dcp_has_typec_routes(struct platform_device *pdev);
 unsigned int dcp_typec_nr_ports(void);
 struct device_node *dcp_typec_port_of_node(unsigned int idx);
 bool dcp_typec_port_has_candidate(unsigned int idx, struct platform_device *pdev);
+bool dcp_typec_port_tunnel_only(unsigned int idx, struct platform_device *pdev);
 bool dcp_typec_port_unusable(unsigned int idx);
 void dcp_typec_port_set_connector(unsigned int idx, bool secondary,
-				  struct apple_connector *connector);
+				  struct apple_connector *connector,
+				  struct platform_device *pipeline);
+bool dcp_typec_fixed_crtcs(void);
 bool dcp_typec_dual_stream(void);
 bool dcp_typec_ordered_dual_stream(void);
 void dcp_typec_reorder(void);
@@ -111,6 +120,11 @@ bool dcp_is_t8132_ext(const struct apple_dcp *dcp);
 
 /* DCP probe, resume and endpoint teardown hooks. */
 int dcp_register_typec_routes(struct apple_dcp *dcp);
+void dcp_typec_route_park(struct apple_dcp *dcp);
+void dcp_typec_route_unpark(struct apple_dcp *dcp);
+int dcp_fabric_sleep_release(struct apple_dcp *dcp, s64 ms[2]);
+int dcp_fabric_sleep_withdraw(struct apple_dcp *dcp, s64 ms[2]);
+void dcp_fabric_sleep_done(struct apple_dcp *dcp);
 void dcp_typec_routes_disable(struct apple_dcp *dcp);
 void dcp_typec_routes_disable_dev(struct device *dev);
 void dcp_typec_retrain_work(struct work_struct *work);

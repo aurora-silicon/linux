@@ -57,6 +57,7 @@ struct asc_csc {
  * @yuv: Y'CbCr format (needs the CSC to pair with RGB)
  * @alpha: carries an alpha channel
  * @wide: samples are 16 bits in memory (more than 8 significant bits)
+ * @lossless: Apple lossless compressed 4:2:0 in one buffer (asc_lossless_geom())
  */
 struct asc_format {
 	u32 fourcc;
@@ -71,7 +72,27 @@ struct asc_format {
 	bool yuv;
 	bool alpha;
 	bool wide;
+	bool lossless;
 };
+
+/**
+ * struct asc_lossless_geom - byte layout of one lossless compressed picture
+ * @tiles_x: 32x32 luma (16x16 CbCr) tiles across
+ * @y_pitch: bytes of one row of luma tiles
+ * @y_meta: luma metadata offset
+ * @c: CbCr bodies offset
+ * @c_pitch: bytes of one row of CbCr tiles
+ * @c_meta: CbCr metadata offset
+ * @bytes: whole picture
+ *
+ * Luma tile bodies are 1024 bytes, CbCr ones 512; each metadata region is a
+ * square, power-of-two grid of at least 64x64 tile slots (32 and 8 bytes).
+ */
+struct asc_lossless_geom {
+	u32 tiles_x, y_pitch, y_meta, c, c_pitch, c_meta, bytes;
+};
+
+void asc_lossless_geom(u32 width, u32 height, struct asc_lossless_geom *g);
 
 /* One register write: byte offset in the MSR aperture and value. */
 struct asc_reg {
@@ -88,13 +109,15 @@ struct asc_reg {
  * @width: width in pixels
  * @height: height in pixels
  * @dva: DMA address of each colour plane
- * @stride: bytes per line of each colour plane
+ * @meta: DMA address of each plane's metadata (lossless formats)
+ * @stride: bytes per line of each colour plane (lossless: per row of tiles)
  */
 struct asc_image {
 	const struct asc_format *fmt;
 	u32 width;
 	u32 height;
 	u64 dva[ASC_MAX_PLANES];
+	u64 meta[ASC_MAX_PLANES];
 	u32 stride[ASC_MAX_PLANES];
 };
 

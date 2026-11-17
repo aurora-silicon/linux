@@ -228,6 +228,10 @@ impl Scenes {
     }
 }
 
+unsafe extern "C" {
+    fn asahi_g17_mesh_tvb_floor() -> u32;
+}
+
 /// A snapshot of the block ring; all values are modulo its fixed capacity.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Cursors {
@@ -581,8 +585,20 @@ impl MetricsLease {
         }
         let pitch = self.allocator.entry_pitch;
         let offset = self.slot.checked_mul(pitch).ok_or(EOVERFLOW)?;
-        let client = self.backing.map_range(vm, offset..offset + pitch, BlockGeometry::M5_COMPACT,
-            mmu::UAT_PGSZ as u64, mmu::PROT_GPU_SHARED_RW, 0)?;
+        // The J813's firmware touches a render's metrics in context 0, whose user root is the
+        // kernel lower VM, at the client's address. That VM maps the whole backing at the compact
+        // window's start (InitData::bind_m5_metrics), so place the entry where its offset puts
+        // it there.
+        let fixed = super::J813_FORMS.load(Ordering::Relaxed).then(|| {
+            let at = BlockGeometry::M5_COMPACT.start + offset as u64;
+            self.backing.map_range(vm, offset..offset + pitch, at..at + pitch as u64,
+                mmu::UAT_PGSZ as u64, mmu::PROT_GPU_SHARED_RW, 0).ok()
+        }).flatten();
+        let client = match fixed {
+            Some(client) => client,
+            None => self.backing.map_range(vm, offset..offset + pitch, BlockGeometry::M5_COMPACT,
+                mmu::UAT_PGSZ as u64, mmu::PROT_GPU_SHARED_RW, 0)?,
+        };
         self.addresses.client = client.iova();
         self.client = Some(client);
         Ok(())
@@ -832,6 +848,18 @@ impl Manager {
     }
     pub(crate) fn firmware_target(&self) -> usize {
         self.blocks().saturating_add(fw::GROW_BLOCKS).min(self.tvb.geometry.max_blocks())
+    }
+    /// The most blocks this buffer's geometry can hold.
+    pub(crate) fn max_blocks(&self) -> usize {
+        self.tvb.geometry.max_blocks()
+    }
+    /// The blocks an A18 Pro heap holds ahead of a render with mesh shading
+    /// (`aurora.g17_mesh_tvb_floor`): the size its automatic growth reaches.
+    /// None on other heaps, or with the switch off.
+    pub(crate) fn mesh_floor(&self) -> Option<usize> {
+        // SAFETY: Reads a module parameter; no other effect.
+        let enabled = unsafe { asahi_g17_mesh_tvb_floor() } != 0;
+        (enabled && self.tvb.geometry == BlockGeometry::NEO).then_some(self.layout.normal_blocks)
     }
     /// Read-only diagnostic while firmware is halted. In particular this
     /// does not reset the high-water counter as automatic_target() does.

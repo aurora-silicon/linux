@@ -241,6 +241,8 @@ pub(crate) struct RenderPass {
     pub(crate) depth_bias_is_int: bool,
     /// At most four known primitives; sets the auxiliary framebuffer bit 0.
     pub(crate) few_primitives: bool,
+    /// Host-only: the render contains mesh shading (DRM_ASAHI_RENDER_MESH_OUTPUT).
+    pub(crate) mesh_output: bool,
     /// Host-only: the resolved barriers order the fragment kick, not the tiling kick.
     pub(crate) fragment_barriers: bool,
     /// Host-only: the tiling kick waits on its own render and compute prefixes
@@ -386,6 +388,8 @@ pub(crate) struct RenderArgs<'a> {
     pub(crate) resources: &'a RenderResources,
     /// Submission ordinal of the render queue pair, from zero.
     pub(crate) ordinal: u64,
+    /// No earlier render of the queue pair is in flight at submit.
+    pub(crate) pair_idle: bool,
     /// Tiling stage.
     pub(crate) ta: RenderStage,
     /// Fragment stage.
@@ -1181,8 +1185,9 @@ pub(crate) struct TaDescriptor {
     pub(crate) unk_8be: u32,
     /// Non-zero on the first kick of a queue pair, like the fragment descriptor's word at the
     /// same position. Set on every kick, the firmware also notifies the host of each pass's
-    /// tiling completion, which no retirement needs. The 25G83 firmware keeps it set on every
-    /// kick until this is measured there.
+    /// tiling completion, which no retirement needs. On 25G83 a render submitted to an idle
+    /// pair keeps it set: without the notification such a render completes later (render d1
+    /// +12%, two clients at depth 1 +18-24%), while queued renders gain 5-7% without it.
     pub(crate) first_kick: u32,
     /// Completion value of the tiling kick (see
     /// [`KickTimestamp::completion_value`]).
@@ -1290,7 +1295,7 @@ impl TaDescriptor {
         self.stamp_value_2 = stamp_value;
         self.qid = args.ta.qid.into();
         self.first_kick = match args.programs == RegisterPrograms::V25G83 {
-            true => 1,
+            true => u32::from(args.ordinal == 0 || args.pair_idle),
             false => u32::from(args.ordinal == 0),
         };
         self.current_id = resources.ta_ids.current.into();
@@ -1832,6 +1837,7 @@ mod ta_mode_tests {
             resources,
             ray_query: [ray; 2],
             ordinal: 0,
+            pair_idle: true,
             ta: stage,
             fragment: stage,
             programs: RegisterPrograms::V25G83,

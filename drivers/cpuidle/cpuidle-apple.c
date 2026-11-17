@@ -188,8 +188,22 @@ static int __init apple_cpuidle_init(void)
 	 */
 	if (!of_machine_compatible_match(apple_cyc_ovrd_machines) &&
 	    !of_machine_is_compatible("apple,t6050") &&
-	    !of_machine_is_compatible("apple,t8140"))
+	    !of_machine_is_compatible("apple,t8140") &&
+	    !of_machine_is_compatible("apple,t8142"))
 		return 0;
+
+	/*
+	 * T8142 under aura's PSCI monitor idles through cpuidle-psci
+	 * (t8142-j813-psci-idle.dtsi). Raw aura has no /psci node and would
+	 * otherwise have no cpuidle driver, so s2idle never freezes the tick.
+	 */
+	if (of_machine_is_compatible("apple,t8142")) {
+		np = of_find_node_by_path("/psci");
+		if (np) {
+			of_node_put(np);
+			return 0;
+		}
+	}
 
 	pdev = platform_device_register_simple("cpuidle-apple", -1, NULL, 0);
 	if (IS_ERR(pdev)) {

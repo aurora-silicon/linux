@@ -5,6 +5,7 @@
  * Copyright The Aurora Silicon Contributors
  */
 
+#include <linux/bitops.h>
 #include <linux/edac.h>
 #include <linux/io.h>
 #include <linux/interrupt.h>
@@ -36,9 +37,23 @@ struct apple_soc_edac_range {
 	const char *name;
 };
 
+/*
+ * A fabric NI whose error status sits in its aperture: a block of status words,
+ * one per error type, whose set bits name the port. They're acknowledged by
+ * writing the set bits back.
+ */
+struct apple_soc_edac_ni {
+	u8 index;	/* interrupt index */
+	u8 reg;		/* reg index of the NI's aperture */
+	u16 status;	/* offset of the first status word */
+	u32 words;	/* bit n: a status word at status + 4 * n */
+};
+
 struct apple_soc_edac_hw {
 	const struct apple_soc_edac_range *ranges;
 	size_t nranges;
+	const struct apple_soc_edac_ni *ni;
+	size_t nni;
 	unsigned int num_irqs;
 	unsigned int num_status_regs;
 	bool event_log;
@@ -51,6 +66,8 @@ struct apple_soc_edac_irq {
 	const char *source;
 	unsigned int index;
 	int irq;
+	const struct apple_soc_edac_ni *ni;
+	void __iomem *ni_base;
 	unsigned int retries;
 	unsigned int backoff_ms;
 	unsigned long armed_jiffies;
@@ -126,6 +143,16 @@ static const struct apple_soc_edac_range t8140_error_ranges[] = {
 	{ 25, 1, "pio" },
 };
 
+/* From the ADT's niN-metadata and macOS's NI decoder tables */
+static const struct apple_soc_edac_ni t8140_ni[] = {
+	{ 18,  9, 0x1900, 0x1ffd7ff },	/* SoC NI 0 */
+	{ 19, 10, 0x1b00, 0x1ffd7ff },	/* SoC NI 1 */
+	{ 20, 11, 0x1500, 0x1ffd7ff },	/* SoC NI 2 */
+	{ 21, 12, 0x2500, 0x1ffd7ff },	/* MCC NI */
+	{ 22, 13, 0x2100, 0x7fefff },	/* AFC MCC NI */
+	{ 23, 14, 0x1d00, 0x3ff7ff },	/* GFX NI */
+};
+
 static const struct apple_soc_edac_hw t6000_error_hw = {
 	.ranges = t6000_error_ranges,
 	.nranges = ARRAY_SIZE(t6000_error_ranges),
@@ -148,6 +175,8 @@ static const struct apple_soc_edac_hw t8112_error_hw = {
 static const struct apple_soc_edac_hw t8140_error_hw = {
 	.ranges = t8140_error_ranges,
 	.nranges = ARRAY_SIZE(t8140_error_ranges),
+	.ni = t8140_ni,
+	.nni = ARRAY_SIZE(t8140_ni),
 	.num_irqs = 26,
 };
 
@@ -214,6 +243,38 @@ static bool apple_soc_edac_t6041_status(struct apple_soc_edac_irq *irq_data,
 	return false;
 }
 
+/*
+ * Log and acknowledge an NI's set status words. Returns whether any was set;
+ * @cleared says whether all of them read back clear.
+ */
+static bool apple_soc_edac_ni_status(struct apple_soc_edac_irq *irq_data,
+				     bool *cleared)
+{
+	const struct apple_soc_edac_ni *ni = irq_data->ni;
+	unsigned long words = ni->words;
+	unsigned int bit, offset;
+	bool found = false;
+	u32 status, left;
+
+	*cleared = true;
+	for_each_set_bit(bit, &words, 32) {
+		offset = ni->status + 4 * bit;
+		status = readl(irq_data->ni_base + offset);
+		if (!status)
+			continue;
+		writel(status, irq_data->ni_base + offset);
+		left = readl(irq_data->ni_base + offset);
+		dev_err_ratelimited(irq_data->edac->dev,
+				    "%s: status %#x at %#x, %#x after the acknowledge\n",
+				    irq_data->source, status, offset, left);
+		found = true;
+		if (left)
+			*cleared = false;
+	}
+
+	return found;
+}
+
 static void apple_soc_edac_rearm(struct work_struct *work)
 {
 	struct apple_soc_edac_irq *irq_data =
@@ -244,12 +305,27 @@ static irqreturn_t apple_soc_edac_irq_thread(int irq, void *data)
 		return IRQ_HANDLED;
 	}
 
+	snprintf(msg, sizeof(msg), "%s source %u", irq_data->source,
+		 irq_data->index);
+	if (irq_data->ni) {
+		bool cleared;
+
+		if (apple_soc_edac_ni_status(irq_data, &cleared)) {
+			edac_device_handle_ue(edac->dci, 0, 0, msg);
+			dev_err_ratelimited(edac->dev, "hardware error: %s (IRQ %d)\n",
+					    msg, irq);
+			if (cleared)
+				return IRQ_HANDLED;
+		} else {
+			dev_err_ratelimited(edac->dev, "%s asserted with no status set\n",
+					    msg);
+		}
+	}
+
 	/* No status was pending, or this source has no clear contract. */
 	disable_irq_nosync(irq);
 
-	snprintf(msg, sizeof(msg), "%s source %u", irq_data->source,
-		 irq_data->index);
-	if (!edac->hw->num_status_regs || irq_data->index < 45) {
+	if (!irq_data->ni && (!edac->hw->num_status_regs || irq_data->index < 45)) {
 		edac_device_handle_ue(edac->dci, 0, 0, msg);
 		dev_err_ratelimited(edac->dev,
 				    "hardware error: %s (IRQ %d)\n", msg, irq);
@@ -278,6 +354,24 @@ static irqreturn_t apple_soc_edac_irq_thread(int irq, void *data)
 				   APPLE_SOC_EDAC_BACKOFF_MAX_MS);
 
 	return IRQ_HANDLED;
+}
+
+static int apple_soc_edac_map_ni(struct platform_device *pdev,
+				 struct apple_soc_edac_irq *irq_data)
+{
+	const struct apple_soc_edac_hw *hw = irq_data->edac->hw;
+	size_t i;
+
+	for (i = 0; i < hw->nni; i++) {
+		if (hw->ni[i].index != irq_data->index)
+			continue;
+		irq_data->ni_base = devm_platform_ioremap_resource(pdev, hw->ni[i].reg);
+		if (IS_ERR(irq_data->ni_base))
+			return PTR_ERR(irq_data->ni_base);
+		irq_data->ni = &hw->ni[i];
+	}
+
+	return 0;
 }
 
 static int apple_soc_edac_probe(struct platform_device *pdev)
@@ -356,6 +450,9 @@ static int apple_soc_edac_probe(struct platform_device *pdev)
 		irq_data->irq = irq;
 		irq_data->backoff_ms = APPLE_SOC_EDAC_BACKOFF_MS;
 		irq_data->armed_jiffies = jiffies;
+		ret = apple_soc_edac_map_ni(pdev, irq_data);
+		if (ret)
+			goto err_del_device;
 		INIT_DELAYED_WORK(&irq_data->rearm, apple_soc_edac_rearm);
 
 		ret = devm_request_threaded_irq(&pdev->dev, irq, NULL,

@@ -128,6 +128,14 @@
 		interrupt-names = "phys", "virt", "hyp-phys", "hyp-virt";
 	};
 
+	cpu_pmu: pmu {
+		status = "disabled";
+		compatible = "apple,t8142-pmu";
+		interrupt-parent = <&aic>;
+		/* The AIC raises both clusters' PMU FIQs as this one, as on T8140. */
+		interrupts = <AIC_FIQ AIC_CPU_PMU_P IRQ_TYPE_LEVEL_HIGH>;
+	};
+
 	clkref: clock-ref {
 		compatible = "fixed-clock";
 		#clock-cells = <0>;
@@ -149,6 +157,23 @@
 			reg = <3 0x81000000 0 0x1cc000>,
 			      <3 0x81040000 0 0x4000>;
 			reg-names = "core", "event";
+		};
+
+		/*
+		 * System level cache planes: ADT mcc,t8142 reg[1] (amcc-reg-idx 1,
+		 * one AMCC, amcc-plane-enable-mask 0xf), four planes 0x40000 apart,
+		 * T8140's register layout (ways 0x2800, power 0x2804, allocation
+		 * disable 0x82c, flush 0x2844; m1n1/aura mcc_init_m5). aura enables
+		 * the ways and allocation before the kernel, so the driver only
+		 * checks that and flushes the cache on shutdown.
+		 */
+		mcc: memory-controller@220000000 {
+			compatible = "apple,t8142-mcc", "apple,t8140-mcc";
+			reg = <0x2 0x20000000 0x0 0x4000>,
+			      <0x2 0x20040000 0x0 0x4000>,
+			      <0x2 0x20080000 0x0 0x4000>,
+			      <0x2 0x200c0000 0x0 0x4000>;
+			status = "disabled";
 		};
 
 		serial0: serial@3a5200000 {

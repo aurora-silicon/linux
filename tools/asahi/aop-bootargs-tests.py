@@ -90,9 +90,29 @@ def method(source):
 
 
 def configs(source):
+    """struct AopHwConfig and the HW_CFG_* constants, each with its doc comment.
+
+    Other items between them (the sleep's PM callbacks) use kernel bindings the harness
+    doesn't have.
+    """
     start = source.index('struct AopHwConfig {')
     end = source.index('kernel::of_device_table!', start)
-    return source[start:end]
+    out, pending, item, keep, depth = [], [], [], None, 0
+    for line in source[start:end].splitlines(keepends=True):
+        if keep is None:
+            if not line.strip() or line.startswith(('//', '#[')):
+                pending.append(line)
+                continue
+            keep = line.startswith(('struct AopHwConfig', 'const HW_CFG_'))
+            item, pending, depth = pending + [line], [], 0
+        else:
+            item.append(line)
+        depth += line.count('{') - line.count('}')
+        if depth == 0 and line.rstrip().endswith((';', '}')):
+            if keep:
+                out += item
+            keep = None
+    return ''.join(out + pending)
 
 
 def compile_run(rustc, p, binary, code):

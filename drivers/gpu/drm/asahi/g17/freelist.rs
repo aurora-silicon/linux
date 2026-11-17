@@ -501,6 +501,17 @@ impl Pages {
     }
 }
 
+/// What one render pool of the smallest size takes of the shared lower
+/// window, with its guard.
+pub(crate) const RENDER_POOL_SPAN: u64 =
+    (TABLE_SIZE + RENDER_BLOCKS * FREE_LIST_BLOCK_SIZE + mmu::UAT_PGSZ) as u64;
+
+// The A18 Pro's shared pool window holds the smallest render pool for every execution context.
+const _: () = assert!(
+    crate::hw::t8140::dynamic::WIDE_LOWER.end - crate::hw::t8140::dynamic::WIDE_LOWER.start
+        >= crate::mmu::MAX_EXECUTION_CONTEXTS as u64 * RENDER_POOL_SPAN
+);
+
 /// Pool-object identities are independent of recycled firmware IDs and VAs.
 static RENDER_POOL_SERIAL: AtomicU64 = AtomicU64::new(0);
 
@@ -577,8 +588,9 @@ impl RenderStorage {
 
 /// A render pool retained by a logical context and every graph referencing it.
 /// Its backing can be given back while the pool's free-list release has been
-/// consumed and the client VM is evicted; a fresh backing is installed before
-/// the pool is staged again.
+/// consumed: when the client VM is evicted, or when its queue is idle and the
+/// shared window is short. A fresh backing is installed before the pool is
+/// staged again.
 pub(crate) struct RenderPool {
     storage: Arc<RenderStorage>,
     /// Counts installed backings, so a re-armed backing is a new free-list
@@ -613,15 +625,27 @@ impl RenderPool {
         Ok(pin.map(|pin| PoolPin { _identity: pin, _pool: self.clone() }))
     }
 
-    pub(crate) fn new(
+    /// Uses the identity in `reserved` when there is one
+    /// ([`super::fw::Variant::render_id_at_create`]) and takes it only once the backing is
+    /// placed, so a refused placement keeps it. Without one, the identity is taken first, so a
+    /// refused identity places no backing.
+    pub(super) fn new(
         alloc: &Allocator<'_>,
         ids: &Arc<RenderIds>,
         render_global: &mmu::Vm,
         client: &mmu::Vm,
         blocks: usize,
+        reserved: Option<&Mutex<Option<RenderId>>>,
     ) -> Result<Self> {
-        let id = RenderId::new(ids)?;
+        let fresh = match reserved {
+            Some(reserved) if reserved.lock().is_some() => None,
+            _ => Some(RenderId::new(ids)?),
+        };
         let backing = RenderBacking::new(alloc, render_global, client, blocks)?;
+        let id = match fresh.or_else(|| reserved.and_then(|reserved| reserved.lock().take())) {
+            Some(id) => id,
+            None => RenderId::new(ids)?,
+        };
         Self::with_backing(alloc, id, client, backing)
     }
 
@@ -839,7 +863,8 @@ impl RenderPool {
                 let mut bytes = [0; super::fw::m5::pool::STATE_BYTES];
                 super::fw::m5::pool::encode_g17s_render_state(pages.m5_layout(self.id())?,
                     self.state.gpu_va(), &mut bytes).map_err(|_| EINVAL)?;
-                bytes[super::fw::m5::pool::COMPLETED..super::fw::m5::pool::COMPLETED + 8]
+                let completed_at = super::fw::m5::pool::completed_offset();
+                bytes[completed_at..completed_at + 8]
                     .copy_from_slice(&submitted.to_le_bytes());
                 let raw = self.control.pointer(0, bytes.len())?;
                 for (index, byte) in bytes.into_iter().enumerate() {
@@ -891,7 +916,7 @@ impl RenderPool {
     /// counter, so retain the byte accesses required by that interface.
     pub(crate) fn counters(&self) -> Result<[u64; 2]> {
         let submitted = self.state.dword(0)?.load(Ordering::Relaxed);
-        let offset = if self.is_m5() { super::fw::m5::pool::COMPLETED }
+        let offset = if self.is_m5() { super::fw::m5::pool::completed_offset() }
             else { FreeListControl::COMPLETED };
         let completed = self.control.pointer(offset, 8)?;
         let mut bytes = [0; 8];
@@ -1073,7 +1098,8 @@ impl ComputePool {
                 use super::fw::m5::pool;
                 pool::encode_g17s_compute_state(pages.m5_layout(id)?, submitted,
                     &mut control.bytes_mut()[..pool::STATE_BYTES]).map_err(|_| EINVAL)?;
-                control.bytes_mut()[pool::COMPLETED..pool::COMPLETED + 8].copy_from_slice(&completed);
+                let completed_at = pool::completed_offset();
+                control.bytes_mut()[completed_at..completed_at + 8].copy_from_slice(&completed);
                 Ok(())
             }
             PageLayout::Neo { blocks, .. } => {
@@ -1094,7 +1120,7 @@ impl ComputePool {
         Ok(u64::from_le_bytes(self.completed_bytes()?))
     }
     fn completed_bytes(&self) -> Result<[u8; 8]> {
-        let offset = if self.m5 { super::fw::m5::pool::COMPLETED } else { FreeListControl::COMPLETED };
+        let offset = if self.m5 { super::fw::m5::pool::completed_offset() } else { FreeListControl::COMPLETED };
         let pointer = self.control.pointer(offset, 8)?;
         let mut bytes = [0; 8];
         for (index, byte) in bytes.iter_mut().enumerate() {
@@ -1371,6 +1397,11 @@ impl Lease {
     }
 
     /// Observes all older release records passed by one consumer snapshot.
+    /// A sent release whose consumption [`Self::observe_releases`] has yet to witness.
+    pub(crate) fn awaits_release(&self) -> bool {
+        self.previous_release.is_some() || matches!(self.phase, LeasePhase::ReleaseSent(_))
+    }
+
     pub(crate) fn observe_releases(&mut self, consumer: u32, producer: u32) -> Result {
         if let Some(cursor) = self.previous_release {
             if control_consumed(consumer, producer, cursor)? {

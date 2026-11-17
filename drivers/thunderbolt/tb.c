@@ -21,6 +21,7 @@
 #include "tb_regs.h"
 #include "tunnel.h"
 #include "nhi.h"
+#include "apple-router-sleep.h"
 
 #define TB_TIMEOUT		100	/* ms */
 #define TB_RELEASE_BW_TIMEOUT	10000	/* ms */
@@ -67,6 +68,7 @@ MODULE_PARM_DESC(asym_threshold,
  *		 runtime resume
  * @dp_tunnel_work: Re-pair DP resources after retired DPRX work releases its paths
  * @dp_tunnel_pending: A pairing request not yet serviced, retained across sleep
+ * @resume_cleanup_pending: Retire routes a native CIO wake found unplugged at complete
  * @dp_relink_work: Waits on the freezable queue until no system sleep
  *		    transition is in progress, then queues @dp_relink_run
  * @dp_relink_run: The host DP tunnel re-link work proper, on the domain
@@ -88,6 +90,12 @@ struct tb_cm {
 	struct list_head dp_resources;
 	bool hotplug_active;
 	bool stopping;
+	bool resume_cleanup_pending;
+	bool cio_prepared, cio_ctl_stopped, cio_changed, cio_host_slept;
+	unsigned long cio_bw_pending;
+	struct apple_router_sleep cio_router;
+	u64 cio_host_uid;
+	bool cio_dp_released;
 	struct delayed_work remove_work;
 	struct work_struct dp_tunnel_work;
 	bool dp_tunnel_pending;
@@ -354,6 +362,10 @@ static bool tb_tmu_hifi_uni_required(struct tb *tb)
 static int tb_enable_tmu(struct tb_switch *sw)
 {
 	int ret;
+
+	/* The host router's firmware runs its TMU on these hosts. */
+	if (!tb_route(sw) && tb_switch_tmu_host_managed(sw))
+		return 0;
 
 	/*
 	 * If both routers at the end of the link are v2 we simply
@@ -746,9 +758,10 @@ static int tb_maximum_bandwidth(struct tb *tb, struct tb_port *src_port,
 
 	/*
 	 * Can include asymmetric, only if it is actually supported by
-	 * the lane adapter.
+	 * the lane adapter and allowed on the host.
 	 */
-	if (!tb_asym_supported(src_port, dst_port, port))
+	if (!tb_asym_supported(src_port, dst_port, port) ||
+	    (tb->nhi->quirks & QUIRK_NO_ASYM))
 		include_asym = false;
 
 	if (tb_is_upstream_port(port)) {
@@ -1078,7 +1091,7 @@ static int tb_configure_asym(struct tb *tb, struct tb_port *src_port,
 	struct tb_port *up;
 	int ret = 0;
 
-	if (!asym_threshold)
+	if (!asym_threshold || (tb->nhi->quirks & QUIRK_NO_ASYM))
 		return 0;
 
 	downstream = tb_port_path_direction_downstream(src_port, dst_port);
@@ -1439,6 +1452,10 @@ static void tb_scan_port(struct tb_port *port)
 	 */
 	tb_switch_configuration_valid(sw);
 
+	/* TEST (J714s): then the link's PM roles, where macOS gives them. */
+	if (tb_switch_cio_pm_roles(sw))
+		tb_sw_warn(sw, "failed to set the PM roles of its link\n");
+
 	/* Scan upstream retimers */
 	tb_retimer_scan(upstream_port, true);
 
@@ -1603,8 +1620,14 @@ static void tb_bandwidth_group_release_work(struct work_struct *work)
 	struct tb_bandwidth_group *group =
 		container_of(work, typeof(*group), release_work.work);
 	struct tb *tb = group->tb;
+	struct tb_cm *tcm = tb_priv(tb);
 
 	mutex_lock(&tb->lock);
+	if (tcm->cio_prepared) {
+		tcm->cio_bw_pending |= BIT(group->index - 1);
+		mutex_unlock(&tb->lock);
+		return;
+	}
 	if (__release_group_bandwidth(group))
 		tb_recalc_estimated_bandwidth(tb);
 	__configure_group_sym(group);
@@ -3964,9 +3987,11 @@ static int tb_start(struct tb *tb, bool reset)
 	 * To support highest CLx state, we set host router's TMU to
 	 * Normal mode.
 	 */
-	tb_switch_tmu_configure(tb->root_switch, TB_SWITCH_TMU_MODE_LOWRES);
-	/* Enable TMU if it is off */
-	tb_switch_tmu_enable(tb->root_switch);
+	if (!tb_switch_tmu_host_managed(tb->root_switch)) {
+		tb_switch_tmu_configure(tb->root_switch, TB_SWITCH_TMU_MODE_LOWRES);
+		/* Enable TMU if it is off */
+		tb_switch_tmu_enable(tb->root_switch);
+	}
 
 	/*
 	 * Boot firmware might have created tunnels of its own. Since we
@@ -4062,6 +4087,10 @@ static void tb_restore_children(struct tb_switch *sw)
 
 	tb_switch_configuration_valid(sw);
 
+	/* TEST (J714s): then the link's PM roles, where macOS gives them after a wake. */
+	if (tb_switch_cio_pm_roles(sw))
+		tb_sw_warn(sw, "failed to restore the PM roles of its link\n");
+
 	tb_switch_for_each_port(sw, port) {
 		if (!tb_port_has_remote(port) && !port->xdomain)
 			continue;
@@ -4096,6 +4125,13 @@ static void tb_free_unplugged_xdomains(struct tb_switch *sw)
 	}
 }
 
+static void tb_resume_cleanup(struct tb *tb)
+{
+	tb_free_invalid_tunnels(tb);
+	tb_free_unplugged_children(tb->root_switch);
+	tb_free_unplugged_xdomains(tb->root_switch);
+}
+
 static int tb_resume_noirq(struct tb *tb)
 {
 	struct tb_cm *tcm = tb_priv(tb);
@@ -4113,9 +4149,7 @@ static int tb_resume_noirq(struct tb *tb)
 		tb_switch_reset(tb->root_switch);
 
 	tb_switch_resume(tb->root_switch, false);
-	tb_free_invalid_tunnels(tb);
-	tb_free_unplugged_children(tb->root_switch);
-	tb_free_unplugged_xdomains(tb->root_switch);
+	tb_resume_cleanup(tb);
 	tb_restore_children(tb->root_switch);
 
 	/*
@@ -4169,6 +4203,8 @@ out:
 
 	return 0;
 }
+
+#include "tb-cio-sleep.c"
 
 static int tb_freeze_noirq(struct tb *tb)
 {
@@ -4228,13 +4264,23 @@ static void tb_restore_dp_resources(struct tb_switch *sw)
 static void tb_complete(struct tb *tb)
 {
 	struct tb_cm *tcm = tb_priv(tb);
+	bool rescan = false;
+
+	scoped_guard(mutex, &tb->lock) {
+		if (tcm->resume_cleanup_pending) {
+			tb_resume_cleanup(tb);
+			tcm->resume_cleanup_pending = false;
+			tcm->hotplug_active = true;
+			rescan = true;
+		}
+	}
 
 	/*
 	 * Unregister unplugged XDomains and if there is a case where
 	 * another domain is swapped in place of unplugged XDomain we
 	 * need to run another rescan.
 	 */
-	if (tb_domain_unregister_unplugged_xdomains(tb)) {
+	if (tb_domain_unregister_unplugged_xdomains(tb) || rescan) {
 		scoped_guard(mutex, &tb->lock)
 			tb_scan_switch(tb->root_switch);
 	}

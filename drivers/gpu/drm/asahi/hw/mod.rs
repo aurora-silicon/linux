@@ -21,6 +21,7 @@ pub(crate) mod t8103;
 pub(crate) mod t8112;
 pub(crate) mod t8140;
 pub(crate) mod t6050;
+pub(crate) mod t8142;
 #[cfg(CONFIG_DRM_ASAHI_G18)]
 pub(crate) mod t8152;
 

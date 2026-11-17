@@ -118,13 +118,14 @@ ATC_RPM = ('atcphy_rpm_get', 'atcphy_rpm_busy', 'atcphy_rpm_sync', 'atcphy_rpm_p
 
 
 def atc_cio_helpers(source):
-    """The PIPE backend of a mode, which T8132 CIO keeps on the dummy one.
+    """The PIPE backend of a mode, which T8132 CIO keeps on the dummy one, and
+    whether a T8132 port is wired for DP alt mode.
 
-    The mux and PIPE functions call these; older sources have neither: ''.
+    The mux and PIPE functions call these; older sources have none: ''.
     """
     result = ''
     for name in ('atcphy_mode_is_cio', 'atcphy_pipe_state_for',
-                 'atcphy_usb2_sig_host'):
+                 'atcphy_usb2_sig_host', 'atcphy_t8132_dp_on'):
         marker = re.search(r'^static [^;{}()]+\b' + name + r'\([^;{}]*\)\s*\{', source, re.M)
         if marker:
             helper = block(source, marker.start())
@@ -146,6 +147,24 @@ def atc_restore_helpers(source):
     return atc_function(source, 'atcphy_setup_pipehandler')
 
 
+def atc_common_state_helpers(source):
+    """What atcphy_restore_after_pd_off() calls to drop the common block's DisplayPort and
+    tunnel state after a power-down. Older sources do that inline: ''.
+    """
+    if 'atcphy_forget_common_state(' not in atc_function(source, 'atcphy_restore_after_pd_off'):
+        return ''
+    return atc_function(source, 'atcphy_forget_common_state')
+
+
+def atc_mux_noop(source):
+    """The helpers atcphy_mux_set_locked() calls during a T8132 CIO sleep, to tell whether a
+    request leaves the lanes and the PIPE as they are. Older sources call none: ''.
+    """
+    if 'atcphy_mux_is_noop(' not in block(source, 'static int atcphy_mux_set_locked('):
+        return ''
+    return ''.join(atc_function(source, name) for name in ('atcphy_mux_in_mode', 'atcphy_mux_is_noop'))
+
+
 def atc_mux_without_pm(source):
     """Lane/teardown fixtures omit USB PM, keeping mode mapping and lane work real.
 
@@ -165,6 +184,7 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
     # and tells whether a SuperSpeed port that the USB side took down may come up.
     helpers = ''.join(atc_function(source, name) for name in
                       ('atcphy_usb3_port_ready', 'atcphy_mux_check', 'atcphy_mux_park'))
+    helpers += atc_mux_noop(source)
     return mapping + '\n' + helpers + block(source, 'static int atcphy_mux_switch(') + '\n' + locked + r'''
 static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *state)
 {

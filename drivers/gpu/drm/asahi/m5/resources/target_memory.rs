@@ -48,6 +48,14 @@ impl M5TargetMemory {
         p.tilemap = self.target.iova();
         p.heapmeta = self.target.iova() + self.layout.heapmeta_offset as u64;
         p.tpc = self.tpc.iova();
+        // The TA descriptor names the TPC geometry it may fill. The single-
+        // sample captures hold 0x800 (one 32x32 utile per tile); a 32x16
+        // four-sample utile doubles it, and a render past one 4x4 group of
+        // tiles failed the GPU with the fixed value (g17 M5 driver: tpc_size
+        // from the same layout). Single-sample renders keep their value.
+        if p.samples > 1 {
+            p.tpc_size = self.layout.tpc_geometry_bytes as u64;
+        }
         p.deflake_3 = self.deflake.iova();
         p.deflake_2 = self.deflake.iova() + 0x40;
         p.deflake_1 = self.deflake.iova() + 0x340;

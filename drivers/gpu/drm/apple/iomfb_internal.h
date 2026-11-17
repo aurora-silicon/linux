@@ -100,6 +100,9 @@ typedef void (*dcp_callback_t)(struct apple_dcp *, void *, void *);
 	}
 
 /* Call a DCP function given by a tag */
+int dcp_push_oob_concurrent(struct apple_dcp *dcp, const struct dcp_method_entry *call,
+			    u32 in_len, u32 out_len, void *data, dcp_callback_t cb,
+			    void *cookie);
 void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *call,
 		     u32 in_len, u32 out_len, void *data, dcp_callback_t cb,
 		     void *cookie);
@@ -112,6 +115,9 @@ void dcp_ack(struct apple_dcp *dcp, enum dcp_context_id context);
 /* The user may own drm_display_mode, so we need to search for our copy */
 bool lookup_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode,
 		 struct dcp_display_mode *out);
+
+/* One line for an external display's link, sink and mode, after a mode set. */
+void dcp_link_report(struct apple_dcp *dcp, const struct drm_display_mode *mode);
 
 u8 dcp_crtc_eotf(struct apple_dcp *dcp, struct drm_crtc *crtc,
 		 struct drm_atomic_commit *commit);

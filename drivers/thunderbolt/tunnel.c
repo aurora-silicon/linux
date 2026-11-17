@@ -413,7 +413,7 @@ static int tb_pci_host_pre_activate(struct tb_tunnel *tunnel)
 	const struct tb_nhi_ops *ops = tunnel->tb->nhi->ops;
 
 	/* Only the tunnel starting at the host owns its native PCIe port. */
-	if (tb_route(tunnel->src_port->sw))
+	if (tunnel->sleep_replay || tb_route(tunnel->src_port->sw))
 		return 0;
 	if (ops && ops->pci_tunnel_pre_activate)
 		return ops->pci_tunnel_pre_activate(tunnel->tb->nhi);
@@ -424,7 +424,7 @@ int tb_pci_tunnel_activate_host(struct tb_tunnel *tunnel)
 {
 	const struct tb_nhi_ops *ops = tunnel->tb->nhi->ops;
 
-	if (tb_route(tunnel->src_port->sw))
+	if (tunnel->sleep_replay || tb_route(tunnel->src_port->sw))
 		return 0;
 	if (ops && ops->pci_tunnel_post_activate) {
 		/* Also unwind a hook that fails after partial host setup. */
@@ -440,7 +440,7 @@ int tb_pci_tunnel_deactivate_host(struct tb_tunnel *tunnel)
 	int ret = 0;
 
 	/* Firmware tunnels discovered during resume do not own host state. */
-	if (!tunnel->host_pci_activated)
+	if (tunnel->sleep_replay || !tunnel->host_pci_activated)
 		return 0;
 	ops = tunnel->tb->nhi->ops;
 	if (ops && ops->pci_tunnel_deactivate)
@@ -1258,6 +1258,9 @@ static int tb_dp_bandwidth_alloc_mode_enable(struct tb_tunnel *tunnel)
 	for (granularity = 250; tmp / granularity > 255 && granularity <= 1000;
 	     granularity *= 2)
 		;
+	/* The host's own OS programs these adapters at 1 Gb/s. */
+	if (tb_port_dp_bw_held_ack(in))
+		granularity = 1000;
 
 	tb_tunnel_dbg(tunnel, "granularity %d Mb/s\n", granularity);
 
@@ -1319,12 +1322,45 @@ static int tb_dp_bandwidth_alloc_mode_enable(struct tb_tunnel *tunnel)
 	return 0;
 }
 
+/*
+ * An Apple silicon host sets the SSC offset that the DP OUT adapter's
+ * stream clock recovery allows, the low half of TMU capability word 6, to
+ * 1500 before it touches the adapter otherwise. Docks come up with their
+ * own value (2500 on a Barlow Ridge dock).
+ */
+#define TB_DP_APPLE_SSC_OFFSET	1500
+
+static void tb_dp_apple_ssc_offset(struct tb_tunnel *tunnel)
+{
+	struct tb_port *out = tunnel->dst_port;
+	u32 v, old;
+
+	if (!tb_port_is_apple_host_dpin(tunnel->src_port) ||
+	    !tb_port_is_dpout(out) || !out->cap_tmu)
+		return;
+	/* Only inside the TMU capability: before its next-capability pointer. */
+	if (tb_port_read(out, &v, TB_CFG_PORT, out->cap_tmu, 1) ||
+	    ((v & 0xff) && (v & 0xff) <= out->cap_tmu + 6) ||
+	    tb_port_read(out, &v, TB_CFG_PORT, out->cap_tmu + 6, 1))
+		return;
+	old = v;
+	v = (v & ~GENMASK(15, 0)) | TB_DP_APPLE_SSC_OFFSET;
+	if (v != old &&
+	    tb_port_write(out, &v, TB_CFG_PORT, out->cap_tmu + 6, 1)) {
+		tb_port_warn(out, "cannot set the DP SSC offset\n");
+		return;
+	}
+	tb_port_dbg(out, "DP SSC offset %#x (was %#x)\n", v & 0xffff, old & 0xffff);
+}
+
 static int tb_dp_pre_activate(struct tb_tunnel *tunnel)
 {
 	struct tb_port *in = tunnel->src_port;
 	struct tb_switch *sw = in->sw;
 	struct tb *tb = in->sw->tb;
 	int ret;
+
+	tb_dp_apple_ssc_offset(tunnel);
 
 	ret = tb_dp_xchg_caps(tunnel);
 	if (ret)
@@ -1609,8 +1645,9 @@ static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
 		/*
 		 * Apple silicon host: the sink link is trained by the
 		 * host's DPTX through the tunnel; keep this DP OUT adapter
-		 * from starting link training on its own, and hand it back
-		 * once the tunnel is gone.
+		 * from starting link training on its own. The bit is left
+		 * as it is when the tunnel goes: the next tunnel to this
+		 * adapter sets it again before enabling it.
 		 */
 		if (active && apple_dpin &&
 		    !tb_port_read(out, &v, TB_CFG_PORT, out->cap_adap + ADP_DP_CS_3, 1)) {
@@ -1619,13 +1656,6 @@ static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
 				tb_port_warn(out, "Apple: cannot hold off DP link training\n");
 		}
 		ret = tb_dp_port_enable(out, active);
-		/* hand link training back even if the disable failed */
-		if (!active && apple_dpin &&
-		    !tb_port_read(out, &v, TB_CFG_PORT, out->cap_adap + ADP_DP_CS_3, 1)) {
-			v &= ~ADP_DP_CS_3_NO_AUTO_LT;
-			if (tb_port_write(out, &v, TB_CFG_PORT, out->cap_adap + ADP_DP_CS_3, 1))
-				tb_port_warn(out, "Apple: cannot restore DP link training\n");
-		}
 		if (ret && active)
 			return ret;
 	}
@@ -3012,6 +3042,84 @@ struct tb_tunnel *tb_tunnel_alloc_usb3(struct tb *tb, struct tb_port *up,
 err_free:
 	tb_tunnel_put(tunnel);
 	return NULL;
+}
+
+/*
+ * No host callbacks: the PCIe and USB owners stay bound. Display tunnels
+ * were released before this and are paired again after the sleep.
+ */
+int tb_tunnel_sleep_prepare(struct tb_tunnel *tunnel)
+{
+	int i, ret;
+
+	lockdep_assert_held(&tunnel->tb->lock);
+	if (tunnel->sleep_paused || tb_tunnel_is_dma(tunnel) ||
+	    tb_tunnel_is_dp(tunnel) || !tb_tunnel_is_active(tunnel))
+		return -EBUSY;
+	for (i = 0; i < tunnel->npaths; i++) {
+		ret = tb_path_sleep_prepare(tunnel->paths[i]);
+		if (ret) {
+			while (i--)
+				tb_path_sleep_complete(tunnel->paths[i]);
+			return ret;
+		}
+	}
+	tunnel->sleep_paused = true;
+	return 0;
+}
+
+int tb_tunnel_sleep(struct tb_tunnel *tunnel)
+{
+	int i, ret;
+
+	if (!tunnel->sleep_paused)
+		return -EINVAL;
+	tunnel->sleep_changed = true;
+	for (i = 0; i < tunnel->npaths; i++) {
+		ret = tb_path_sleep(tunnel->paths[i]);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+int tb_tunnel_wake(struct tb_tunnel *tunnel)
+{
+	int i, ret = 0;
+
+	if (!tunnel->sleep_paused)
+		return -EINVAL;
+	for (i = 0; i < tunnel->npaths; i++) {
+		if (tb_path_is_invalid(tunnel->paths[i]))
+			return -ENODEV;
+	}
+	if (!tunnel->sleep_changed)
+		return 0;
+	tunnel->sleep_replay = true;
+	if (tunnel->pre_activate)
+		ret = tunnel->pre_activate(tunnel);
+	for (i = 0; !ret && i < tunnel->npaths; i++) {
+		tunnel->paths[i]->sleep_lost = tunnel->sleep_lost;
+		ret = tb_path_wake(tunnel->paths[i]);
+	}
+	if (!ret && tunnel->activate)
+		ret = tunnel->activate(tunnel, true);
+	tunnel->sleep_replay = false;
+	if (!ret)
+		tunnel->sleep_changed = false;
+	return ret;
+}
+
+void tb_tunnel_sleep_complete(struct tb_tunnel *tunnel)
+{
+	int i;
+
+	lockdep_assert_held(&tunnel->tb->lock);
+	if (!tunnel->sleep_paused)
+		return;
+	for (i = 0; i < tunnel->npaths; i++)
+		tb_path_sleep_complete(tunnel->paths[i]);
+	tunnel->sleep_paused = false;
 }
 
 /**

@@ -122,6 +122,17 @@ impl Pools {
     }
 
     fn stage(&self, init: &InitData, pool: &RenderPool) -> Result {
+        if pool.is_m5() && crate::g17::fw::m5::pool::j813_pools() {
+            // The J813's rows are the descriptor's first four words, 0x20 apart.
+            let words = descriptor_words::<4>(init.page_pool_descriptor_table()?, pool.id())?;
+            pool.repopulate()?;
+            let descriptor = pool.m5_descriptor()?;
+            for (word, value) in words.into_iter().zip(descriptor) {
+                word.store(value, Ordering::Relaxed);
+            }
+            fence(Ordering::SeqCst);
+            return Ok(());
+        }
         if pool.is_m5() {
             let words = descriptor_words::<8>(init.page_pool_descriptor_table()?, pool.id())?;
             pool.repopulate()?;
@@ -219,6 +230,11 @@ impl Pools {
     }
 
     pub(super) fn observe(&mut self, init: &InitData) -> Result {
+        // Every render publication observes: with no release in flight there is nothing to
+        // witness, and no reason to read the control ring's cursors from shared memory.
+        if !self.leases[FIRST_RENDER_POOL..].iter().flatten().any(|lease| lease.awaits_release()) {
+            return Ok(());
+        }
         fence(Ordering::Acquire);
         let consumer = init.control_consumer()?.load(Ordering::Relaxed);
         let producer = init.control_producer()?.load(Ordering::Relaxed);
@@ -250,6 +266,16 @@ impl Pools {
     /// A detached pool may capture firmware counters only after its last pair
     /// stopped using this registration. Callers check all retained pair owners.
     pub(super) fn save(&self, init: &InitData, pool: &RenderPool) -> Result {
+        if pool.is_m5() && crate::g17::fw::m5::pool::j813_pools() {
+            let words = descriptor_words::<4>(init.page_pool_descriptor_table()?, pool.id())?;
+            fence(Ordering::Acquire);
+            // The row carries only the first four words; the rest are the pool's own.
+            let mut descriptor = pool.m5_descriptor()?;
+            for (value, word) in descriptor.iter_mut().zip(words) {
+                *value = word.load(Ordering::Relaxed);
+            }
+            return pool.store_m5_descriptor(descriptor);
+        }
         if pool.is_m5() {
             let words = descriptor_words::<8>(init.page_pool_descriptor_table()?, pool.id())?;
             fence(Ordering::Acquire);

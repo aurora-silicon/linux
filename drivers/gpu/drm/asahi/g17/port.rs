@@ -541,6 +541,11 @@ impl Port {
         self.demand.set_active(full);
     }
 
+    /// The next statistics drain and reader discard what the decoder holds.
+    pub(super) fn statistics_epoch_bump(&self) {
+        self.statistics_epoch.fetch_add(1, Ordering::Release);
+    }
+
     pub(super) fn statistics_epoch(&self) -> u64 {
         self.statistics_epoch.load(Ordering::Acquire)
     }

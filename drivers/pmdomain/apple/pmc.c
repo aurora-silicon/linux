@@ -54,6 +54,7 @@
 #include <linux/soc/apple/pmc.h>
 #include <linux/spinlock.h>
 #include <linux/string_choices.h>
+#include <linux/suspend.h>
 #include <linux/thermal.h>
 #include <linux/workqueue.h>
 
@@ -1529,6 +1530,40 @@ static const struct apple_pmc_hw apple_pmc_hw_t6050 = {
 	.has_pending = true,
 };
 
+/*
+ * A system sleep that reached the hardware may have taken the enables and floors
+ * with it. Put back what the driver's books say: these are no-ops if they stayed.
+ */
+static int apple_pmc_resume_early(struct device *dev)
+{
+	struct apple_pmc *pmc = dev_get_drvdata(dev);
+	unsigned long flags;
+	unsigned int rail;
+	int ret = 0, err;
+
+	if (!pm_resume_via_firmware() || !pmc)
+		return 0;
+
+	raw_spin_lock_irqsave(&pmc->lock, flags);
+	for (rail = 0; rail < pmc->hw->rails; rail++) {
+		err = apple_pmc_enable_write(pmc, rail);
+		ret = ret ?: err;
+		if (pmc->floor_rails & BIT(rail)) {
+			err = apple_pmc_floor_apply(pmc, rail);
+			ret = ret ?: err;
+		}
+	}
+	raw_spin_unlock_irqrestore(&pmc->lock, flags);
+	if (ret)
+		dev_err(dev, "state not restored after sleep: %d\n", ret);
+
+	return 0;
+}
+
+static const struct dev_pm_ops apple_pmc_pm_ops = {
+	LATE_SYSTEM_SLEEP_PM_OPS(NULL, apple_pmc_resume_early)
+};
+
 static const struct of_device_id apple_pmc_of_match[] = {
 	{ .compatible = "apple,t6050-pmc", .data = &apple_pmc_hw_t6050 },
 	{ .compatible = "apple,t8132-pmc", .data = &apple_pmc_hw_t8132 },
@@ -1545,6 +1580,7 @@ static struct platform_driver apple_pmc_driver = {
 	.driver = {
 		.name = "apple-pmc",
 		.of_match_table = apple_pmc_of_match,
+		.pm = pm_sleep_ptr(&apple_pmc_pm_ops),
 		/* Power-domain providers are not intended for manual unbinding. */
 		.suppress_bind_attrs = true,
 	},

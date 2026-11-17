@@ -6,9 +6,14 @@
  *
  *  - apple,aic-timebase: the timebase aperture of the interrupt controller
  *  - apple,debug-dock: the debug dock connection status register
+ *  - apple,t6000-dwi, apple,t6041-dwi, apple,t8112-dwi, apple,t8140-dwi:
+ *    the DWI serial backlight interface. The panel backlight of these
+ *    machines is driven by the display coprocessor and does not use DWI, so
+ *    these registers only hold their boot state
  *
  * The driver never writes a device register and requests no interrupt.
- * Registers are read only when a debugfs file is read.
+ * Registers are read only when a debugfs file is read. A block in a power
+ * domain is powered through runtime PM only for the duration of the read.
  */
 
 #include <linux/debugfs.h>
@@ -19,6 +24,7 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
@@ -30,6 +36,7 @@ module_param(snap_bytes, uint, 0444);
 MODULE_PARM_DESC(snap_bytes, "Bytes of an MMIO view read by its snapshot file");
 
 struct dbgview {
+	struct device *dev;
 	void __iomem *base;
 	resource_size_t size;
 	struct dentry *dir;
@@ -49,6 +56,7 @@ static ssize_t dbgview_regs_read(struct file *file, char __user *ubuf,
 	loff_t pos = *ppos;
 	size_t len, i;
 	u32 *buf;
+	int ret;
 
 	if (pos < 0 || !IS_ALIGNED(pos, 4))
 		return -EINVAL;
@@ -65,8 +73,14 @@ static ssize_t dbgview_regs_read(struct file *file, char __user *ubuf,
 	if (!buf)
 		return -ENOMEM;
 
+	ret = pm_runtime_resume_and_get(dv->dev);
+	if (ret) {
+		kfree(buf);
+		return ret;
+	}
 	for (i = 0; i < len / 4; i++)
 		buf[i] = readl(dv->base + pos + i * 4);
+	pm_runtime_put(dv->dev);
 
 	if (copy_to_user(ubuf, buf, len)) {
 		kfree(buf);
@@ -93,10 +107,17 @@ static int dbgview_snapshot_show(struct seq_file *s, void *unused)
 	u64 before, after;
 	u32 *val;
 	size_t i;
+	int ret;
 
 	val = kzalloc_objs(*val, max_t(size_t, words, 1));
 	if (!val)
 		return -ENOMEM;
+
+	ret = pm_runtime_resume_and_get(dv->dev);
+	if (ret) {
+		kfree(val);
+		return ret;
+	}
 
 	/* Bracket the reads by the arch counter with nothing in between. */
 	local_irq_save(flags);
@@ -105,6 +126,8 @@ static int dbgview_snapshot_show(struct seq_file *s, void *unused)
 		val[i] = readl(dv->base + i * 4);
 	after = dbgview_cntvct();
 	local_irq_restore(flags);
+
+	pm_runtime_put(dv->dev);
 
 	seq_printf(s, "cntvct_before %016llx\n", before);
 	for (i = 0; i < words; i++)
@@ -122,15 +145,21 @@ static int dbgview_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct resource *res;
 	struct dbgview *dv;
+	int ret;
 
 	dv = devm_kzalloc(dev, sizeof(*dv), GFP_KERNEL);
 	if (!dv)
 		return -ENOMEM;
+	dv->dev = dev;
 
 	dv->base = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
 	if (IS_ERR(dv->base))
 		return PTR_ERR(dv->base);
 	dv->size = resource_size(res);
+
+	ret = devm_pm_runtime_enable(dev);
+	if (ret)
+		return ret;
 
 	dv->dir = debugfs_create_dir(dev_name(dev), dbgview_root);
 
@@ -153,6 +182,10 @@ static void dbgview_remove(struct platform_device *pdev)
 static const struct of_device_id dbgview_of_match[] = {
 	{ .compatible = "apple,aic-timebase" },
 	{ .compatible = "apple,debug-dock" },
+	{ .compatible = "apple,t6000-dwi" },
+	{ .compatible = "apple,t6041-dwi" },
+	{ .compatible = "apple,t8112-dwi" },
+	{ .compatible = "apple,t8140-dwi" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, dbgview_of_match);

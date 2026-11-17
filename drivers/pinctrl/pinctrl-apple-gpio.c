@@ -12,6 +12,7 @@
 
 #include <dt-bindings/pinctrl/apple.h>
 
+#include <linux/bitmap.h>
 #include <linux/bitfield.h>
 #include <linux/bits.h>
 #include <linux/gpio/driver.h>
@@ -26,6 +27,7 @@
 
 #include <linux/pinctrl/pinctrl.h>
 #include <linux/pinctrl/pinmux.h>
+#include <linux/suspend.h>
 
 #include "pinctrl-utils.h"
 #include "core.h"
@@ -49,6 +51,11 @@ struct apple_gpio_pinctrl {
 	struct pinctrl_desc pinctrl_desc;
 	struct gpio_chip gpio_chip;
 	u8 irq_group_base;
+	/* The pins' words across a firmware-driven suspend */
+	u32 *saved;
+	unsigned long *saved_valid;
+	/* Pins this driver has written. Others belong to someone else. */
+	unsigned long *touched;
 	struct apple_gpio_irq_group irqgrps[];
 };
 
@@ -91,6 +98,8 @@ static const struct regmap_config regmap_config = {
 static void apple_gpio_set_reg(struct apple_gpio_pinctrl *pctl,
 			       unsigned int pin, u32 mask, u32 value)
 {
+	if (pctl->touched)
+		set_bit(pin, pctl->touched);
 	regmap_update_bits(pctl->map, REG_GPIO(pin), mask, value);
 }
 
@@ -594,6 +603,15 @@ static int apple_gpio_pinctrl_probe(struct platform_device *pdev)
 		return dev_err_probe(&pdev->dev, PTR_ERR(pctl->map),
 				     "Failed to create regmap\n");
 
+	/* Only with the regmap reaching the hardware: a cache would hide the loss. */
+	if (hw && hw->no_regcache) {
+		pctl->saved = devm_kcalloc(&pdev->dev, npins, sizeof(*pctl->saved), GFP_KERNEL);
+		pctl->saved_valid = devm_bitmap_zalloc(&pdev->dev, npins, GFP_KERNEL);
+		pctl->touched = devm_bitmap_zalloc(&pdev->dev, npins, GFP_KERNEL);
+		if (!pctl->saved || !pctl->saved_valid || !pctl->touched)
+			return -ENOMEM;
+	}
+
 	for (i = 0; i < npins; i++) {
 		pins[i].number = i;
 		pins[i].name = devm_kasprintf(&pdev->dev, GFP_KERNEL, "PIN%u", i);
@@ -645,10 +663,63 @@ static const struct of_device_id apple_gpio_pinctrl_of_match[] = {
 };
 MODULE_DEVICE_TABLE(of, apple_gpio_pinctrl_of_match);
 
+/*
+ * A firmware-driven suspend powers this block off, and neither the pin core nor
+ * a consumer sets a pin up again. Slots that fault aren't readable in the regmap,
+ * so they stay out of this.
+ */
+static int apple_gpio_pinctrl_suspend_noirq(struct device *dev)
+{
+	struct apple_gpio_pinctrl *pctl = dev_get_drvdata(dev);
+	unsigned int i;
+
+	if (!pctl->saved || pm_suspend_target_state != PM_SUSPEND_MEM ||
+	    !pm_suspend_via_firmware())
+		return 0;
+
+	/*
+	 * Only the pins this driver configured. The others belong to the firmware or another
+	 * processor, and writing one back after the wake raises an SError.
+	 */
+	bitmap_zero(pctl->saved_valid, pctl->pinctrl_desc.npins);
+	for_each_set_bit(i, pctl->touched, pctl->pinctrl_desc.npins)
+		if (!regmap_read(pctl->map, REG_GPIO(i), &pctl->saved[i]))
+			set_bit(i, pctl->saved_valid);
+
+	return 0;
+}
+
+static int apple_gpio_pinctrl_resume_noirq(struct device *dev)
+{
+	struct apple_gpio_pinctrl *pctl = dev_get_drvdata(dev);
+	unsigned int i, val, restored = 0;
+
+	if (!pctl->saved || !pm_resume_via_firmware())
+		return 0;
+
+	for_each_set_bit(i, pctl->saved_valid, pctl->pinctrl_desc.npins) {
+		if (!regmap_read(pctl->map, REG_GPIO(i), &val) && val == pctl->saved[i])
+			continue;
+		regmap_write(pctl->map, REG_GPIO(i), pctl->saved[i]);
+		restored++;
+	}
+	dev_dbg(dev, "resume: %u of %u configured pins put back\n", restored,
+		bitmap_weight(pctl->saved_valid, pctl->pinctrl_desc.npins));
+	bitmap_zero(pctl->saved_valid, pctl->pinctrl_desc.npins);
+
+	return 0;
+}
+
+static const struct dev_pm_ops apple_gpio_pinctrl_pm_ops = {
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_gpio_pinctrl_suspend_noirq,
+				  apple_gpio_pinctrl_resume_noirq)
+};
+
 static struct platform_driver apple_gpio_pinctrl_driver = {
 	.driver = {
 		.name = "apple-gpio-pinctrl",
 		.of_match_table = apple_gpio_pinctrl_of_match,
+		.pm = pm_sleep_ptr(&apple_gpio_pinctrl_pm_ops),
 		.suppress_bind_attrs = true,
 	},
 	.probe = apple_gpio_pinctrl_probe,

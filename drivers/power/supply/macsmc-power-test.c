@@ -86,6 +86,9 @@ struct macsmc_charge_test {
 	u8 ch0i;
 	u8 ch0c;
 	u32 chte;
+	u8 ch0j;
+	u32 ch0r;
+	u8 buic;
 
 	/* Fail the access to fail_key (a write if fail_write) with fail_err */
 	smc_key fail_key;
@@ -113,7 +116,8 @@ struct macsmc_charge_test {
 static bool charge_test_key_is_charge_setting(smc_key key)
 {
 	return key == SMC_KEY(CHLS) || key == SMC_KEY(CH0I) ||
-	       key == SMC_KEY(CH0C) || key == SMC_KEY(CHTE);
+	       key == SMC_KEY(CH0C) || key == SMC_KEY(CHTE) ||
+	       key == SMC_KEY(CH0J) || key == SMC_KEY(CH0R) || key == SMC_KEY(BUIC);
 }
 
 static void charge_test_log(struct macsmc_charge_test *t, smc_key key, bool write,
@@ -153,6 +157,10 @@ static int charge_test_read(struct apple_smc *smc, smc_key key, void *buf, size_
 		value = t->ch0c;
 	} else if (key == SMC_KEY(CHTE) && size == sizeof(u32)) {
 		value = t->chte;
+	} else if (key == SMC_KEY(CH0R) && size == sizeof(u32)) {
+		value = t->ch0r;
+	} else if (key == SMC_KEY(BUIC) && size == sizeof(u8)) {
+		value = t->buic;
 	} else {
 		KUNIT_FAIL(t->test, "unexpected read of %08x, %zu bytes", key, size);
 		return -EINVAL;
@@ -188,7 +196,14 @@ static int charge_test_write(struct apple_smc *smc, smc_key key, const void *buf
 		t->ch0c = value;
 	else if (key == SMC_KEY(CHTE) && size == sizeof(u32))
 		t->chte = value;
-	else
+	else if (key == SMC_KEY(CH0J) && size == sizeof(u8)) {
+		/* A command key: the SMC reports its effect in CH0R */
+		t->ch0j = value;
+		if (value)
+			t->ch0r |= CH0R_NOAC_CH0J;
+		else
+			t->ch0r &= ~CH0R_NOAC_CH0J;
+	} else
 		KUNIT_FAIL(t->test, "unexpected write of %08x, %zu bytes", key, size);
 	/* An SMC write reply may echo the request length; it is not an error. */
 	return size;
@@ -261,7 +276,7 @@ static void macsmc_charge_behaviours_test(struct kunit *test)
 	struct macsmc_power *p = &t->power;
 	unsigned int combo;
 
-	for (combo = 0; combo < 32; combo++) {
+	for (combo = 0; combo < 64; combo++) {
 		unsigned int got;
 
 		p->has_ch0i = combo & BIT(0);
@@ -269,6 +284,7 @@ static void macsmc_charge_behaviours_test(struct kunit *test)
 		p->has_chte = combo & BIT(2);
 		p->has_chls = combo & BIT(3);
 		p->has_chwa = combo & BIT(4);
+		p->has_ch0j = combo & BIT(5);
 		got = macsmc_battery_charge_behaviours(p);
 
 		KUNIT_EXPECT_EQ_MSG(test, !!(got & BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO)),
@@ -276,10 +292,10 @@ static void macsmc_charge_behaviours_test(struct kunit *test)
 				    "combo %u", combo);
 		KUNIT_EXPECT_EQ_MSG(test,
 				    !!(got & BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_FORCE_DISCHARGE)),
-				    p->has_ch0i, "combo %u", combo);
+				    p->has_ch0i || p->has_ch0j, "combo %u", combo);
 		KUNIT_EXPECT_EQ_MSG(test,
 				    !!(got & BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE)),
-				    p->has_chte || p->has_ch0c, "combo %u", combo);
+				    p->has_chte || p->has_ch0c || p->has_chls, "combo %u", combo);
 		KUNIT_EXPECT_EQ_MSG(test,
 				    !!(got & BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO_DISCHARGE)),
 				    p->has_chls, "combo %u", combo);
@@ -288,7 +304,8 @@ static void macsmc_charge_behaviours_test(struct kunit *test)
 				    0U, "combo %u", combo);
 	}
 
-	/* CHWA alone offers no behaviour, as before; CHLS alone offers both autos */
+	/* CHWA alone offers no behaviour, as before; CHLS alone offers both autos and the hold */
+	p->has_ch0j = false;
 	p->has_ch0i = false;
 	p->has_ch0c = false;
 	p->has_chte = false;
@@ -299,7 +316,8 @@ static void macsmc_charge_behaviours_test(struct kunit *test)
 	p->has_chls = true;
 	KUNIT_EXPECT_EQ(test, macsmc_battery_charge_behaviours(p),
 			(unsigned int)(BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO) |
-				       BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO_DISCHARGE)));
+				       BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO_DISCHARGE) |
+				       BIT(POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE)));
 	KUNIT_EXPECT_EQ(test, t->nops, 0U);
 }
 
@@ -316,7 +334,7 @@ static void macsmc_charge_end_threshold_test(struct kunit *test)
 		{ 0x0150, 99, 0x0163 },
 		{ 0x0000, 5, 0x000a },	/* below the minimum: the minimum */
 		{ 0x0150, 0, 0x010a },
-		{ 0x0350, 60, 0x013c },	/* other high bits are not kept */
+		{ 0x0550, 60, 0x013c },	/* other high bits are not kept */
 		{ 0x0150, 100, 0x0000 },	/* no limit ends auto-discharge */
 		{ 0x0050, 100, 0x0000 },
 	};
@@ -661,7 +679,114 @@ static void macsmc_charge_clear_stray_discharge_test(struct kunit *test)
 	}
 }
 
+/* Without CHTE/CH0C, inhibit-charge holds at the current charge and gives the limit back. */
+static void macsmc_charge_hold_test(struct kunit *test)
+{
+	struct macsmc_charge_test *t = test->priv;
+	int value;
+
+	t->power.has_chls = true;
+	t->chls = 0x0150;	/* limit 80, auto-discharge */
+	t->buic = 63;
+	KUNIT_EXPECT_EQ(test, charge_test_set(t, POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
+					      POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE), 0);
+	KUNIT_EXPECT_EQ(test, t->chls, (u16)(CHLS_HOLD | 63));
+	KUNIT_EXPECT_EQ(test, charge_test_writes(t), 1U);
+	KUNIT_EXPECT_EQ(test, charge_test_get(t, POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR, &value), 0);
+	KUNIT_EXPECT_EQ(test, value, POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE);
+
+	/* The threshold still reads, and is set as, the user's own */
+	t->expect_locked = false;
+	KUNIT_EXPECT_EQ(test, charge_test_get(t, POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
+					      &value), 0);
+	KUNIT_EXPECT_EQ(test, value, 80);
+	t->expect_locked = true;
+	t->nops = 0;
+	KUNIT_EXPECT_EQ(test, charge_test_set(t, POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
+					      70), 0);
+	KUNIT_EXPECT_EQ(test, t->chls, (u16)(CHLS_HOLD | 63));
+	KUNIT_EXPECT_EQ(test, charge_test_writes(t), 0U);
+
+	/* A second hold keeps the saved limit */
+	t->buic = 64;
+	KUNIT_EXPECT_EQ(test, charge_test_set(t, POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
+					      POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE), 0);
+	KUNIT_EXPECT_EQ(test, t->chls, (u16)(CHLS_HOLD | 64));
+
+	/* auto ends the hold with the new limit and no drain */
+	KUNIT_EXPECT_EQ(test, charge_test_set(t, POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
+					      POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO), 0);
+	KUNIT_EXPECT_EQ(test, t->chls, 0x0046);
+
+	/* Full or nearly empty: the hold limit stays in the CHLS range */
+	t->buic = 100;
+	KUNIT_EXPECT_EQ(test, charge_test_set(t, POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
+					      POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE), 0);
+	KUNIT_EXPECT_EQ(test, t->chls, (u16)(CHLS_HOLD | CHLS_MAX_HOLD_LIMIT));
+	t->buic = 3;
+	KUNIT_EXPECT_EQ(test, charge_test_set(t, POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
+					      POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE), 0);
+	KUNIT_EXPECT_EQ(test, t->chls, (u16)(CHLS_HOLD | CHLS_MIN_END_THRESHOLD));
+	KUNIT_EXPECT_EQ(test, charge_test_set(t, POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
+					      POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO), 0);
+	KUNIT_EXPECT_EQ(test, t->chls, 0x0046);
+}
+
+/* With CHTE, bit 9 is not this driver's: inhibit stays on CHTE and auto keeps the bit. */
+static void macsmc_charge_hold_not_used_with_chte_test(struct kunit *test)
+{
+	struct macsmc_charge_test *t = test->priv;
+
+	t->power.has_chte = true;
+	t->power.has_chls = true;
+	t->chls = 0x0250;
+	KUNIT_EXPECT_EQ(test, charge_test_set(t, POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
+					      POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE), 0);
+	KUNIT_EXPECT_EQ(test, t->chte, 1U);
+	KUNIT_EXPECT_EQ(test, t->chls, 0x0250);
+	KUNIT_EXPECT_EQ(test, charge_test_set(t, POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
+					      POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO), 0);
+	KUNIT_EXPECT_EQ(test, t->chte, 0U);
+	KUNIT_EXPECT_EQ(test, t->chls, 0x0250);
+}
+
+/* Without CH0I, force-discharge cuts the inflow with CH0J; CH0R reports it. */
+static void macsmc_charge_inflow_off_test(struct kunit *test)
+{
+	struct macsmc_charge_test *t = test->priv;
+	int value;
+
+	t->power.has_ch0j = true;
+	t->power.has_chls = true;
+	t->chls = 0x0050;
+	KUNIT_EXPECT_EQ(test, charge_test_set(t, POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
+					      POWER_SUPPLY_CHARGE_BEHAVIOUR_FORCE_DISCHARGE), 0);
+	KUNIT_EXPECT_EQ(test, t->ch0j, CH0J_INFLOW_OFF);
+	KUNIT_EXPECT_EQ(test, t->chls, 0x0050);
+	KUNIT_EXPECT_EQ(test, charge_test_get(t, POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR, &value), 0);
+	KUNIT_EXPECT_EQ(test, value, POWER_SUPPLY_CHARGE_BEHAVIOUR_FORCE_DISCHARGE);
+
+	/* The hold turns the inflow back on first */
+	t->buic = 50;
+	KUNIT_EXPECT_EQ(test, charge_test_set(t, POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
+					      POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE), 0);
+	KUNIT_EXPECT_EQ(test, t->ch0j, 0);
+	KUNIT_EXPECT_EQ(test, t->chls, (u16)(CHLS_HOLD | 50));
+
+	KUNIT_EXPECT_EQ(test, charge_test_set(t, POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
+					      POWER_SUPPLY_CHARGE_BEHAVIOUR_FORCE_DISCHARGE), 0);
+	KUNIT_EXPECT_EQ(test, charge_test_set(t, POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR,
+					      POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO), 0);
+	KUNIT_EXPECT_EQ(test, t->ch0j, 0);
+	KUNIT_EXPECT_EQ(test, t->chls, 0x0050);
+	KUNIT_EXPECT_EQ(test, charge_test_get(t, POWER_SUPPLY_PROP_CHARGE_BEHAVIOUR, &value), 0);
+	KUNIT_EXPECT_EQ(test, value, POWER_SUPPLY_CHARGE_BEHAVIOUR_AUTO);
+}
+
 static struct kunit_case macsmc_charge_test_cases[] = {
+	KUNIT_CASE(macsmc_charge_hold_test),
+	KUNIT_CASE(macsmc_charge_hold_not_used_with_chte_test),
+	KUNIT_CASE(macsmc_charge_inflow_off_test),
 	KUNIT_CASE(macsmc_charge_behaviours_test),
 	KUNIT_CASE(macsmc_charge_end_threshold_test),
 	KUNIT_CASE(macsmc_charge_end_threshold_fault_test),

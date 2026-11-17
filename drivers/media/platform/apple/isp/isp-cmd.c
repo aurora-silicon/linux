@@ -16,26 +16,30 @@
 #define CISP_OPCODE_GET(x)    (((u64)(x)) >> CISP_OPCODE_SHIFT)
 
 #define CISP_TIMEOUT	      msecs_to_jiffies(3000)
+/* what macOS allows a DEBUG command */
+#define CISP_DEBUG_TIMEOUT    msecs_to_jiffies(1000)
 #define CISP_SEND_IN(x, a)    (isp_cmd_send((x), &(a), sizeof(a), 0, CISP_TIMEOUT))
 #define CISP_SEND_INOUT(x, a) (isp_cmd_send((x), &(a), sizeof(a), sizeof(a), CISP_TIMEOUT))
 #define CISP_SEND_OUT(x, a)   (cisp_send_read((x), (a), sizeof(*a), sizeof(*a)))
 #define CISP_POST_IN(x, a)    (isp_cmd_send((x), &(a), sizeof(a), 0, 0))
 #define CISP_POST_INOUT(x, a)    (isp_cmd_send((x), &(a), sizeof(a), sizeof(a), 0))
 
-int isp_cmd_send(struct apple_isp *isp, void *args, u32 insize, u32 outsize, int timeout)
+/* Send through the command area on a command channel. */
+static int isp_cmd_send_chan(struct apple_isp *isp, struct isp_channel *chan,
+			     void *args, u32 insize, u32 outsize,
+			     unsigned long timeout)
 {
-	struct isp_channel *chan;
 	struct isp_message *req;
 	int err;
 
-#if IS_ENABLED(CONFIG_VIDEO_APPLE_ISP_KUNIT_TEST)
-	KUNIT_STATIC_STUB_REDIRECT(isp_cmd_send, isp, args, insize, outsize, timeout);
-#endif
+	/* A failed session takes no more commands, on any channel. */
+	if (READ_ONCE(isp->ipc_error))
+		return READ_ONCE(isp->ipc_error);
+
 	/* Before the command area is overwritten */
 	err = isp_ipc_resync(isp);
 	if (err)
 		return err;
-	chan = isp->chan_io;
 	req = &chan->req;
 
 	req->arg0 = isp->cmd_iova;
@@ -69,6 +73,18 @@ int isp_cmd_send(struct apple_isp *isp, void *args, u32 insize, u32 outsize, int
 	return err;
 }
 
+int isp_cmd_send(struct apple_isp *isp, void *args, u32 insize, u32 outsize, int timeout)
+{
+	if (READ_ONCE(isp->ipc_error))
+		return READ_ONCE(isp->ipc_error);
+
+#if IS_ENABLED(CONFIG_VIDEO_APPLE_ISP_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(isp_cmd_send, isp, args, insize, outsize, timeout);
+#endif
+	return isp_cmd_send_chan(isp, isp->chan_io, args, insize, outsize,
+				 timeout);
+}
+
 static int cisp_send_read(struct apple_isp *isp, void *args, u32 insize,
 			  u32 outsize)
 {
@@ -97,6 +113,16 @@ int isp_cmd_stop(struct apple_isp *isp, u32 mode)
 		.mode = mode,
 	};
 	return CISP_SEND_IN(isp, args);
+}
+
+/* T8140's cold stop, which macOS sends as a command with its reply. */
+int isp_cmd_stop_cold(struct apple_isp *isp, u32 mode)
+{
+	struct cmd_stop args = {
+		.opcode = CISP_OPCODE(CISP_CMD_STOP),
+		.mode = mode,
+	};
+	return CISP_SEND_INOUT(isp, args);
 }
 
 int isp_cmd_power_down(struct apple_isp *isp)
@@ -131,6 +157,30 @@ int isp_cmd_trace_enable(struct apple_isp *isp, u32 enable)
 		.enable = enable,
 	};
 	return CISP_SEND_INOUT(isp, args);
+}
+
+/*
+ * macOS asks for the key on the DEBUG channel. On IO, 0x1d is another
+ * command, and the firmware answers neither it nor the STOP after it.
+ */
+int isp_cmd_stop_key_get(struct apple_isp *isp, struct cmd_stop_key *args)
+{
+	struct isp_channel *chan = isp->chan_dg;
+	int err;
+
+	if (!chan || chan->type != ISP_IPC_CHAN_TYPE_COMMAND)
+		return -ENODEV;
+
+	memset(args, 0, sizeof(*args));
+	args->opcode = CISP_OPCODE(CISP_DEBUG_CMD_STOP_KEY_GET);
+	args->enable = 1;
+	err = isp_cmd_send_chan(isp, chan, args, sizeof(*args), sizeof(*args),
+				CISP_DEBUG_TIMEOUT);
+	if (err)
+		return err;
+
+	memcpy(args, isp->cmd_virt, sizeof(*args));
+	return 0;
 }
 
 int isp_cmd_config_get(struct apple_isp *isp, struct cmd_config_get *args)

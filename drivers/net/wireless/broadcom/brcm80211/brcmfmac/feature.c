@@ -60,7 +60,8 @@ static const struct brcmf_feat_fwcap brcmf_fwcap_map[] = {
 	{ BRCMF_FEAT_SAE, "sae" },
 	{ BRCMF_FEAT_FWAUTH, "idauth" },
 	{ BRCMF_FEAT_SAE_EXT, "sae_ext" },
-	{ BRCMF_FEAT_GCMP, "gcmp"}
+	{ BRCMF_FEAT_GCMP, "gcmp" },
+	{ BRCMF_FEAT_LPAS, "lpas" },
 };
 
 #ifdef DEBUG
@@ -329,18 +330,29 @@ int brcmf_feat_attach(struct brcmf_pub *drvr)
 					  "pfn_gscan_cfg",
 					  &gscan_cfg, sizeof(gscan_cfg));
 	brcmf_feat_iovar_int_get(ifp, BRCMF_FEAT_PNO, "pfn");
-	if (drvr->bus_if->wowl_supported)
-		brcmf_feat_iovar_int_get(ifp, BRCMF_FEAT_WOWL, "wowl");
-	if (brcmf_feat_is_enabled(ifp, BRCMF_FEAT_WOWL)) {
-		err = brcmf_fil_iovar_int_get(ifp, "wowl_cap", &wowl_cap);
+	if (drvr->bus_if->wowl_transport && drvr->bus_if->wowl_wake) {
+		u32 wowl;
+
+		/* A usable WoWLAN path needs both firmware iovars. Keep the
+		 * firmware error intact so every failure, not just UNSUPPORTED,
+		 * suppresses capability advertisement.
+		 */
+		ifp->fwil_fwerr = true;
+		err = brcmf_fil_iovar_int_get(ifp, "wowl", &wowl);
+		if (!err)
+			err = brcmf_fil_iovar_int_get(ifp, "wowl_cap", &wowl_cap);
+		ifp->fwil_fwerr = false;
 		if (!err) {
-			ifp->drvr->feat_flags |= BIT(BRCMF_FEAT_WOWL_ARP_ND);
+			drvr->feat_flags |= BIT(BRCMF_FEAT_WOWL) |
+					    BIT(BRCMF_FEAT_WOWL_ARP_ND);
 			if (wowl_cap & BRCMF_WOWL_PFN_FOUND)
-				ifp->drvr->feat_flags |=
-					BIT(BRCMF_FEAT_WOWL_ND);
+				drvr->feat_flags |= BIT(BRCMF_FEAT_WOWL_ND);
 			if (wowl_cap & BRCMF_WOWL_GTK_FAILURE)
-				ifp->drvr->feat_flags |=
-					BIT(BRCMF_FEAT_WOWL_GTK);
+				drvr->feat_flags |= BIT(BRCMF_FEAT_WOWL_GTK);
+			brcmf_dbg(INFO, "enabling feature: %s\n",
+				  brcmf_feat_names[BRCMF_FEAT_WOWL]);
+		} else {
+			brcmf_dbg(TRACE, "WOWL feature check failed: %d\n", err);
 		}
 	}
 	/* MBSS does not work for all chips */

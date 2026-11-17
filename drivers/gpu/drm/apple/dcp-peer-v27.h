@@ -81,9 +81,12 @@ static inline bool dcp_peer_tiling_set_v27(struct dcp_peer_tiling *own,
 struct dcp_display_hints_v27 {
 	u8 hints[0x6c];
 	u8 padding[4];
-	__le32 primary_id, peer_id;
-	u8 extra_pipes, flags;
-	u8 allocation_reserved[22];
+	/* The allocation the AP fills in, or clears when it allocates no peer. */
+	struct_group_attr(allocation, __packed,
+		__le32 primary_id, peer_id;
+		u8 extra_pipes, flags;
+		u8 allocation_reserved[22];
+	);
 	__le32 status;
 	u8 tail[12];
 } __packed;
@@ -91,6 +94,7 @@ struct dcp_display_hints_v27 {
 static_assert(sizeof(struct dcp_display_hints_v27) == 160);
 static_assert(offsetof(struct dcp_display_hints_v27, primary_id) == 0x70);
 static_assert(offsetof(struct dcp_display_hints_v27, status) == 0x90);
+static_assert(sizeof_field(struct dcp_display_hints_v27, allocation) == 32);
 
 /* Extra pipe count, as the T602X display crossbar computes it.
  * Caps come from the live DPTX service, never from a forced clock limit.

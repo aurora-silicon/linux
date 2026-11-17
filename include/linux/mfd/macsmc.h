@@ -80,6 +80,8 @@ enum apple_smc_boot_stage {
 	APPLE_SMC_ERROR_CRASHED
 };
 
+struct apple_smc_wake_reason;
+
 /**
  * struct apple_smc
  * @dev: Underlying device struct for the physical backend device
@@ -101,6 +103,8 @@ enum apple_smc_boot_stage {
  * @mutex: Mutex for non-atomic mode
  * @lock: Spinlock for atomic mode
  */
+struct apple_sleep_smc_policy;
+
 struct apple_smc {
 	struct device *dev;
 
@@ -111,6 +115,33 @@ struct apple_smc {
 	struct blocking_notifier_head event_handlers;
 
 	struct apple_rtkit *rtk;
+
+	/* Between the AP power notices of a firmware-driven suspend. */
+	bool ap_notified;
+	/* Told of a coming sleep, and not yet of its end. */
+	bool sleep_warned;
+	const struct apple_sleep_smc_policy *sleep_policy;
+	u64 sleep_warn_ack;
+	bool sleep_pmvc_info;
+	/* The saved scope's pmVC after ANS, and when it was answered. */
+	bool saved_pmvc_sent;
+	u64 saved_pmvc_at;
+	/* T6050's saved-context ownership over a sleep. Protected by the
+	 * command mutex, or by the exclusive synchronized RX/PM scope. RX may
+	 * resolve only the matching pending ID; timeout never cancels SRAM use.
+	 */
+	bool saved_enabled, saved_blocked, saved_scope, saved_committed;
+	bool saved_pending, saved_recovery, saved_wake;
+	int saved_fault, saved_notice_error, saved_restore_error;
+	u64 saved_unexpected;
+	/* To be told at the noirq suspend, after the debug link's cut. */
+	bool sleep_warn_late;
+	/* In a noirq phase: replies are polled for. */
+	bool polled;
+	/* MBSW at the last wake: what the SMC had woken the AP for. */
+	u64 wake_record;
+	/* MBSW's bits as this SoC numbers them, from the probe. */
+	const struct apple_smc_wake_reason *wake_reasons;
 
 	struct completion init_done;
 	enum apple_smc_boot_stage boot_stage;
@@ -151,6 +182,20 @@ int apple_smc_read(struct apple_smc *smc, smc_key key, void *buf, size_t size);
  * Return: Zero on success, negative errno on error
  */
 int apple_smc_write(struct apple_smc *smc, smc_key key, const void *buf, size_t size);
+
+/**
+ * apple_smc_write_noirq - apple_smc_write() from another device's noirq callbacks
+ * @smc: Pointer to apple_smc struct
+ * @key: smc_key data will be written to
+ * @buf: Buffer from which size bytes of data will be written to SMC
+ * @size: Number of bytes to be written
+ *
+ * The reply is polled for: device interrupts are off. Only for a caller that a
+ * device link orders before the SMC's noirq suspend and after its noirq resume.
+ *
+ * Return: Zero on success, negative errno on error
+ */
+int apple_smc_write_noirq(struct apple_smc *smc, smc_key key, const void *buf, size_t size);
 
 /**
  * apple_smc_enter_atomic - Enter atomic mode to be able to use apple_smc_write_atomic

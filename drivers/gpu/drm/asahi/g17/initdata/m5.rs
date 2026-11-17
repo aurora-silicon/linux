@@ -13,13 +13,25 @@ const REGION_A: u64 = BASE + 0x1b_8000;
 const FWCTL: u64 = BASE + 0x1c_0000;
 const QOS: u64 = BASE + 0x1c_8000;
 const AON: u64 = BASE + 0x1d_0000;
+/// The always-on block the policy names, where macOS 27.0 keeps it on the J813: its policy's AON
+/// pointer (bundle +0xb858, read under aura) is the kernel window's 0xc07b_8000, right above the
+/// shared cluster. The 25G76 address, [`AON`], holds an empty page there.
+const COMMON26_AON: u64 = BASE + 0xc07b_8000;
 const KICK_SHARED: u64 = BASE + 0x1d_8000;
 const BUNDLE: u64 = BASE + 0xc078_8000;
 const COMPLETION_HIGH: u64 = BASE + 0xc080_0000;
 const COMPLETION_LOW: u64 = 0x70_0184_8000;
+/// The completion rings, where macOS 27.0 keeps them on the J813 (its own UAT, read under aura:
+/// four 0x20000 backings on this stride, the log buffers right above them).
+const COMMON26_COMPLETION_HIGH: u64 = BASE + 0xc07e_8000;
+const COMMON26_COMPLETION_LOW: u64 = 0x72_0184_8000;
 const COMPLETION_STRIDE: u64 = 0x2_8000;
 const PB: u64 = BASE + 0x15e_0000;
 const UMA: u64 = BASE + 0x15e_8000;
+/// The log buffer each J813 coprocessor is handed on the crashlog endpoint, by [`Role`]: the
+/// addresses and the size macOS 27.0 publishes there.
+const FW_LOG: [u64; 2] = [BASE + 0xc089_8000, BASE + 0xc088_8000];
+const FW_LOG_SIZE: usize = 0x8000;
 
 /// Lower-root entry 1 of the M5 layout (Mesa's driver window), linked before the firmware starts
 /// as the bare-metal J775D boot has always run.
@@ -29,12 +41,14 @@ impl InitData {
     /// The kernel lower-root ranges a bare-metal M5 firmware reaches, whose top-level links must
     /// exist before it starts: entry 1, the descriptor tables and completion rings (entry 7) and
     /// the first page of the canonical arena (`canonical`, entry 8), where queues go later.
-    pub(in crate::g17) fn m5_lower_links(canonical: core::ops::Range<u64>)
+    pub(in crate::g17) fn m5_lower_links(canonical: core::ops::Range<u64>, graph: &m::Graph)
         -> [core::ops::Range<u64>; 8]
     {
         let page = |address: u64| address..address + mmu::UAT_PGSZ as u64;
-        let ring = |index: u64| page(COMPLETION_LOW + index * COMPLETION_STRIDE);
-        [page(BOOT_LINK), page(m::REGION_VIEW_LOW_ADDRS[0]), page(m::REGION_VIEW_LOW_ADDRS[1]),
+        let low = if graph.is_common26() { COMMON26_COMPLETION_LOW } else { COMPLETION_LOW };
+        let ring = |index: u64| page(low + index * COMPLETION_STRIDE);
+        let views = graph.profile.region_view_low_addrs();
+        [page(BOOT_LINK), page(views[0]), page(views[1]),
             ring(0), ring(1), ring(2), ring(3), page(canonical.start)]
     }
 
@@ -50,19 +64,22 @@ impl InitData {
     /// firmware build's own offset.
     /// Callers hold the device state mutex, retaining this mapping for the entire sample.
     pub(crate) fn m5_policy_telemetry_word(&self, offset: usize) -> Result<u32> {
-        let layout = self.m5_layout;
-        let end = offset.checked_add(4);
-        if !self.m5 || offset & 3 != 0 || end.is_none_or(|end| end > layout.policy_size()) {
+        if !self.m5 || offset & 3 != 0
+            || offset.checked_add(4).is_none_or(|end| end > self.graph.policy_size) {
             return Err(EINVAL);
         }
-        let at = layout.shared.policy.checked_add(offset).ok_or(EINVAL)?;
+        let at = self.graph.shared.policy.checked_add(offset).ok_or(EINVAL)?;
         Ok(self.object(self.bundle)?.word(at)?.load(Ordering::Relaxed))
     }
 
-    pub(crate) fn note_m5_submission_history(&self) -> Result {
+    /// Counts `submissions` in the firmware's submission history, in the slot of this moment.
+    pub(crate) fn note_m5_submission_history(&self, submissions: u8) -> Result {
         if !self.m5 { return Err(EINVAL); }
+        // The submission history is the M5 Pro build's status config +0x73c..; the common
+        // 26A428 one (0x6d0 bytes) has no such table.
+        if self.graph.is_common26() { return Ok(()); }
         let private = self.object(self.cluster)?;
-        let base = self.m5_layout.private.status_config;
+        let base = self.graph.private.status_config;
         let field = |offset| {
             self.m5_status_config
                 .relocate(offset)
@@ -75,13 +92,22 @@ impl InitData {
         for _ in 0..64 {
             let generation = private.word(generation_at)?.load(Ordering::Acquire);
             if generation & 1 != 0 { core::hint::spin_loop(); continue; }
-            let config = private.read_words::<4>(history)?;
-            fence(Ordering::Acquire);
-            if generation != private.word(generation_at)?.load(Ordering::Acquire) {
-                core::hint::spin_loop(); continue;
-            }
-            let period = u64::from(config[0]) | u64::from(config[1]) << 32;
-            let count = u64::from(config[2]) | u64::from(config[3]) << 32;
+            // The firmware moves the generation around every change of the geometry: while it
+            // reads as it did, the geometry read under it stands, without four more loads.
+            let (period, count) = match self.history_geometry.get() {
+                Some((seen, period, count)) if seen == generation => (period, count),
+                _ => {
+                    let config = private.read_words::<4>(history)?;
+                    fence(Ordering::Acquire);
+                    if generation != private.word(generation_at)?.load(Ordering::Acquire) {
+                        core::hint::spin_loop(); continue;
+                    }
+                    let period = u64::from(config[0]) | u64::from(config[1]) << 32;
+                    let count = u64::from(config[2]) | u64::from(config[3]) << 32;
+                    self.history_geometry.set(Some((generation, period, count)));
+                    (period, count)
+                }
+            };
             if period == 0 || count == 0 || count > 256 { return Err(EINVAL); }
             let (counter, frequency) = crate::g17::qos::clock();
             let ticks = crate::g17::qos::time_from_host(counter, frequency)?;
@@ -92,13 +118,34 @@ impl InitData {
             // SAFETY: retained, bounds-checked WC byte, written as a single byte
             // after reading the even, stable generation, as the firmware expects.
             unsafe {
-                let value = core::ptr::read_volatile(byte).wrapping_add(1);
+                let value = core::ptr::read_volatile(byte).wrapping_add(submissions);
                 core::ptr::write_volatile(byte, value);
             };
             fence(Ordering::SeqCst);
             return Ok(());
         }
         Err(EBUSY)
+    }
+
+    /// The address and size of a coprocessor's log buffer, for the message that publishes it.
+    pub(in crate::g17) fn fw_log(role: Role) -> (u64, usize) {
+        (FW_LOG[role as usize], FW_LOG_SIZE)
+    }
+
+    /// A coprocessor's log buffer, as the firmware has left it. Empty before the graph is built.
+    pub(in crate::g17) fn fw_log_bytes(&self, role: Role) -> &[u8] {
+        match self.fw_log_objects[role as usize].and_then(|index| self.object(index).ok()) {
+            Some(object) => object.bytes(),
+            None => &[],
+        }
+    }
+
+    /// The hardware-data bundle as this driver built it, for diffing against a machine's own.
+    pub(in crate::g17) fn hardware_data_bytes(&self) -> &[u8] {
+        match self.object(self.bundle) {
+            Ok(object) => object.bytes(),
+            Err(_) => &[],
+        }
     }
 
     /// Builds the M5 graph in the InitData layouts the loaded firmware build (`variant`) names.
@@ -113,11 +160,13 @@ impl InitData {
         use mmu::{PROT_FW_SHARED_RW as RW, PROT_FW_SHARED_RO as RO,
                   PROT_GPU_SHARED_RW as GPU};
         let layouts = variant.m5_layouts.ok_or(EINVAL)?;
-        let profile = m::RootProfile::for_m5_layouts(layouts);
-        let layout = profile.m5_layout().ok_or(EINVAL)?;
-        self.m5 = true;
-        self.m5_layout = layout;
+        let common26 = board.graph.is_common26();
+        self.graph = if common26 { board.graph } else { m::m5_graph(layouts) };
+        let profile = self.graph.profile;
+        let layout = profile.m5_layout().unwrap_or(&m::M5_LAYOUT_26A428);
+        self.m5_status_config = profile.m5_status_config();
         self.set_m5_policy_layouts(layouts);
+        self.m5 = true;
         // TA, fragment and compute share the compute work ring per priority; every
         // preparation's claim on it is counted from the first publication on.
         self.outer_credits = Some(super::outer_credit::Credits::new()?);
@@ -127,8 +176,8 @@ impl InitData {
             KernelObject::new(dev, uat.kernel_vm(), Placement::At(address), size,
                 mmu::PROT_FW_PRIV_RW, CpuMap::WriteBack)
         };
-        let private = layout.private;
-        let shared = layout.shared;
+        let private = self.graph.private;
+        let shared = self.graph.shared;
         self.cluster = self.add(fixed(PRIVATE, private.total, RW)?)?;
         self.region_c = self.add(fixed(REGION_C, mmu::UAT_PGSZ, RO)?)?;
         self.roots = self.add(fixed(ROOTS, 0xc000, RO)?)?;
@@ -136,7 +185,16 @@ impl InitData {
         self.add(fixed(FWCTL, mmu::UAT_PGSZ, RW)?)?;
         self.qos = self.add(fixed(QOS, m::G17P_QOS_RESOURCE_SIZE, RW)?)?;
         self.add(fixed(KICK_SHARED, m::M5_KICK_SHARED_SIZE, mmu::PROT_GPU_FW_SHARED_RW)?)?;
-        let aon = self.add(fixed_controller(AON, m::M5_AON_PTD_SIZE)?)?;
+        // The J813's log buffers, which the firmware is told about once it runs (see
+        // `publish_log_buffer`); it reads and writes them through its own kernel window.
+        if common26 {
+            for (role, address) in FW_LOG.into_iter().enumerate() {
+                let object = self.add(fixed_controller(address, FW_LOG_SIZE)?)?;
+                self.fw_log_objects[role] = Some(object);
+            }
+        }
+        let aon_va = if common26 { COMMON26_AON } else { AON };
+        let aon = self.add(fixed_controller(aon_va, m::M5_AON_PTD_SIZE)?)?;
         self.bundle = self.add(fixed_controller(BUNDLE, shared.total)?)?;
         self.pb = self.add(fixed(PB, mmu::UAT_PGSZ, RW)?)?;
         self.page_pool = self.add(fixed(UMA, mmu::UAT_PGSZ, RW)?)?;
@@ -145,12 +203,18 @@ impl InitData {
                 Placement::In(uat.kernel_dynamic_range(), mmu::UAT_PGSZ as u64),
                 mmu::UAT_PGSZ, mmu::PROT_FW_SHARED_RW, CpuMap::WriteCombined)?)?;
         }
-        self.alias(self.pb, uat.kernel_lower_vm(), m::REGION_VIEW_LOW_ADDRS[0], GPU)?;
-        self.alias(self.page_pool, uat.kernel_lower_vm(), m::REGION_VIEW_LOW_ADDRS[1], GPU)?;
+        let views = profile.region_view_low_addrs();
+        self.alias(self.pb, uat.kernel_lower_vm(), views[0], GPU)?;
+        self.alias(self.page_pool, uat.kernel_lower_vm(), views[1], GPU)?;
+        let (low, high) = if common26 {
+            (COMMON26_COMPLETION_LOW, COMMON26_COMPLETION_HIGH)
+        } else {
+            (COMPLETION_LOW, COMPLETION_HIGH)
+        };
         let mut completions = [m::G17PKsmCompletionAliases { low: 0, high: 0 }; m::M5_25G76_COMPLETION_QUEUE_COUNT];
         for (index, pair) in completions.iter_mut().enumerate() {
-            pair.low = COMPLETION_LOW + index as u64 * COMPLETION_STRIDE;
-            pair.high = COMPLETION_HIGH + index as u64 * COMPLETION_STRIDE;
+            pair.low = low + index as u64 * COMPLETION_STRIDE;
+            pair.high = high + index as u64 * COMPLETION_STRIDE;
             // After initialization the host only reads completion records.
             // Match the standard G17 completion ring's CPU write-back mapping;
             // keep firmware/GPU aliases, size and lifetime unchanged.
@@ -167,10 +231,18 @@ impl InitData {
         }
         m::encode_common26_aon_ptd(board, &mut self.object_mut(aon)?.bytes_mut()[..m::M5_AON_PTD_SIZE])
             .map_err(|_| EINVAL)?;
-        m::encode_m5_region_c(self.object_mut(self.region_c)?.bytes_mut()).map_err(|_| EINVAL)?;
-        self.m5_status_config = profile.m5_status_config();
-        m::encode_m5_private_cluster(profile, PRIVATE, FWCTL,
-            &mut self.object_mut(self.cluster)?.bytes_mut()[..private.total]).map_err(|_| EINVAL)?;
+        if common26 {
+            m::encode_common26_board_region_c(
+                &mut self.object_mut(self.region_c)?.bytes_mut()[..m::REGION_C_SIZE])
+                .map_err(|_| EINVAL)?;
+            m::encode_common26_private_cluster(PRIVATE, FWCTL,
+                &mut self.object_mut(self.cluster)?.bytes_mut()[..private.total])
+                .map_err(|_| EINVAL)?;
+        } else {
+            m::encode_m5_region_c(self.object_mut(self.region_c)?.bytes_mut()).map_err(|_| EINVAL)?;
+            m::encode_m5_private_cluster_for_profile(profile, PRIVATE, FWCTL,
+                &mut self.object_mut(self.cluster)?.bytes_mut()[..private.total]).map_err(|_| EINVAL)?;
+        }
         let windows = board.register_windows();
         let windows = &windows[..board.register_window_count()];
         for (index, window) in windows.iter().enumerate() {
@@ -194,33 +266,26 @@ impl InitData {
         let views = m::PrimaryRegionViews {
             sentinel_high: BASE + 0xc07e_0000, alias_high: [PB, UMA],
         };
-        let hw_data = layout.hw_data_size();
-        m::encode_m5_hw_data(layout, board, completions, QOS, windows,
-            &mut self.object_mut(self.bundle)?.bytes_mut()[..hw_data]).map_err(|_| EINVAL)?;
-        m::set_m5_kick_shared(layout,
-            &mut self.object_mut(self.bundle)?.bytes_mut()[..hw_data], KICK_SHARED)
+        m::encode_m5_hw_data_for_layout(layout, board, completions, QOS, windows,
+            &mut self.object_mut(self.bundle)?.bytes_mut()[..m::M5_HW_DATA_SIZE]).map_err(|_| EINVAL)?;
+        m::set_m5_kick_shared_for_layout(layout, board,
+            &mut self.object_mut(self.bundle)?.bytes_mut()[..m::M5_HW_DATA_SIZE], KICK_SHARED)
             .map_err(|_| EINVAL)?;
         let masked_cores: u32 = id.core_masks.iter().map(|mask| mask.count_ones()).sum();
         let enabled_cores = if masked_cores != 0 { masked_cores }
             else { id.num_clusters.checked_mul(id.num_cores).ok_or(EOVERFLOW)? };
-        m::set_m5_enabled_cores(layout,
-            &mut self.object_mut(self.bundle)?.bytes_mut()[..hw_data], enabled_cores)
+        m::set_m5_enabled_cores_for_layout(layout, board,
+            &mut self.object_mut(self.bundle)?.bytes_mut()[..m::M5_HW_DATA_SIZE], enabled_cores)
             .map_err(|_| EINVAL)?;
-        m::encode_m5_bundle_policy(layout, m::M5PolicyBindings {
-            state: PRIVATE + private.policy_state as u64, aon_ptd: AON, boot_timestamp: 0,
-        }, self.object_mut(self.bundle)?.bytes_mut()).map_err(|_| EINVAL)?;
-        // The controller configuration applies where the part's leakage calibration matches the
-        // one it was made for, or on a board whose configuration holds for every part.
-        let calibrated = match board.calibration {
-            None => true,
-            Some(expected) => {
-                let node = dev.as_ref().as_ref().of_node().ok_or(EIO)?;
-                let calibration: Result<KVec<u32>> =
-                    node.get_property(c_str!("apple,leakage-calibration-words"));
-                calibration.as_ref().is_ok_and(|words| words.as_slice() == expected)
-            }
+        let bindings = m::M5PolicyBindings {
+            state: PRIVATE + private.policy_state as u64, aon_ptd: aon_va, boot_timestamp: 0,
         };
-        let controller_defaults = board.controller_defaults.filter(|_| calibrated);
+        if common26 {
+            m::encode_common26_bundle_policy(board, bindings, self.object_mut(self.bundle)?.bytes_mut())
+        } else {
+            m::encode_m5_bundle_policy_for_layout(layout, bindings, self.object_mut(self.bundle)?.bytes_mut())
+        }.map_err(|_| EINVAL)?;
+        let controller_defaults = board.controller_defaults;
         if let Some(defaults) = controller_defaults {
             defaults(self.object_mut(self.bundle)?.bytes_mut()).map_err(|_| EINVAL)?;
             let maximum = self.object(self.bundle)?.word(shared.policy + m::M5_POLICY_MAXIMUM_POWER)?
@@ -230,18 +295,20 @@ impl InitData {
         }
         // The policy encoders write the 26A428 layout; a build with another one gets it laid out
         // in place, within its own allocation.
-        let policy = self.m5_policy;
-        let policy_end = shared.policy.checked_add(policy.size).ok_or(EINVAL)?;
-        if policy_end > shared.block_68 {
-            return Err(EINVAL);
+        if !common26 {
+            let policy = self.m5_policy;
+            let policy_end = shared.policy.checked_add(policy.size).ok_or(EINVAL)?;
+            if policy_end > shared.block_68 {
+                return Err(EINVAL);
+            }
+            m::relayout_m5_policy(
+                policy,
+                board,
+                controller_defaults.is_some(),
+                &mut self.object_mut(self.bundle)?.bytes_mut()[shared.policy..policy_end],
+            )
+            .map_err(|_| EINVAL)?;
         }
-        m::relayout_m5_policy(
-            policy,
-            board,
-            controller_defaults.is_some(),
-            &mut self.object_mut(self.bundle)?.bytes_mut()[shared.policy..policy_end],
-        )
-        .map_err(|_| EINVAL)?;
         if let Some(microseconds) = board.idle_standby_us {
             m::set_m5_region_idle_standby(self.object_mut(self.region_c)?.bytes_mut(), microseconds)
                 .map_err(|_| EINVAL)?;
@@ -257,7 +324,7 @@ impl InitData {
                 },
             };
             let channels = m::derive_channel_table_for_profile(profile, role,
-                PRIVATE + layout.private_state_grids()[index] as u64,
+                PRIVATE + self.graph.state_grids[index] as u64,
                 instance.status_a, instance.main_config, BUNDLE);
             let offset = shared.main_config[index];
             m::encode_main_config_for_profile(profile, role, &addresses, &instance,

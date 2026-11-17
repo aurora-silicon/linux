@@ -52,12 +52,14 @@ pub(crate) const CONFIG: Config = Config {
         handoff_slot: 0xffff_ffff,
         handoff_unk2: 0,
         native_gpu_permissions: true,
+        narrow_pool_window: true,
     },
     region_c: Some(&REGION_C),
     chip: None,
     m5: None,
     adopt_root_entries: false,
     fabric_bridge: false,
+    sleep_restart: false,
     // The firmware's per-slot recovery keys are not known for this build; recovery relies on
     // the firmware's own blame.
     recovery_slot_keys: None,

@@ -9,6 +9,9 @@
 #include <linux/sizes.h>
 #include <linux/types.h>
 
+/* DAPF records: four on T6041 and T8140, five on T6050 and T8132. */
+#define ANE_FW_DAPF_MAX 5
+
 struct device_node;
 struct platform_device;
 struct ane_h16_profile;
@@ -59,6 +62,8 @@ struct ane_fw_platform {
 	u64 preload_dva[2];
 	u64 preload_size[2];
 	u16 stream_mask;
+	/* Boot qualification is platform-specific, never implied by generation. */
+	bool boot_qualified;
 	bool firmware_preloaded;
 	bool safe_reset;
 	/*
@@ -66,6 +71,12 @@ struct ane_fw_platform {
 	 * (EXCLAVE_MODE_STOP on the control ring) so that SUSPEND can run.
 	 */
 	bool exclave_mode_stop;
+	/*
+	 * The sleep macOS was recorded doing on this SoC: the engine stays off with
+	 * no firmware until its first request, and powers down in macOS's word
+	 * order. Other SoCs keep the staged backend's boot-time start.
+	 */
+	bool macos_sleep;
 	/*
 	 * System sleep keeps the firmware (EXCLAVE_MODE_STOP, SUSPEND, warm
 	 * boot); otherwise the engine is cycled cold and the programs replayed.
@@ -77,6 +88,24 @@ struct ane_fw_platform {
 	 * Without either, H16 refuses system sleep.
 	 */
 	bool sleep_cold;
+	/*
+	 * The PMP report of the SoC: the firmware is first released at boot only
+	 * once that PMP runs (see ane_h16_wait_pmp()).
+	 */
+	const char *pmp_report;
+	/*
+	 * Staged (H17) backend: the power state words in the "pmgr" window
+	 * (ANE_SYS, which genpd owns, then the CPU and the sub-block, which the
+	 * backend switches), the ANE DART compatible and revision, the DAPF
+	 * record count and the pinned TEXT digest.
+	 */
+	u32 pmgr_sys, pmgr_cpu, pmgr_subblock;
+	const char *dart_compatible;
+	u16 dart_revision;
+	u8 dapf_count;
+	const u8 *text_pin;
+	/* H16: an aux-3 window, which the build's XL tunables go to. */
+	bool has_xl;
 };
 
 /* Pure range check: the boot loader supplies the physical addresses. */
@@ -123,7 +152,9 @@ ane_fw_sleep_path(const struct ane_fw_platform *platform)
 	return platform ? ANE_SLEEP_FW_BACKEND : ANE_SLEEP_RTCLIENT;
 }
 
-extern const struct ane_fw_platform ane_h16_platform, ane_h17_platform;
+extern const struct ane_fw_platform ane_h16_platform, ane_h17_platform, ane_t6050_platform,
+				    ane_t8142_platform;
+extern const struct ane_fw_platform ane_t8132_platform;
 int ane_fw_platform_preflight(struct platform_device *pdev,
 			      const struct ane_fw_platform *soc);
 

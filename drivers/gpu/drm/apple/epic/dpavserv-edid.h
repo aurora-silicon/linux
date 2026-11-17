@@ -24,6 +24,13 @@ static inline int dpavserv_edid_size(const void *response, size_t received,
 	if (afkv2_get64(p) != EDID_BUF_SIZE)
 		return -EIO;
 	used = afkv2_get64(p + 32);
+	/*
+	 * No EDID bytes: the firmware has not read the sink for this instance
+	 * yet. It publishes a new instance on resume before its link is back,
+	 * and reads the sink again once the link is up.
+	 */
+	if (!used)
+		return -ENODATA;
 	if (used < EDID_LEADING_DATA_SIZE + EDID_BLOCK_SIZE || used > EDID_BUF_SIZE ||
 	    used > received - DPAV_EDID_HEADER_SIZE)
 		return -EIO;

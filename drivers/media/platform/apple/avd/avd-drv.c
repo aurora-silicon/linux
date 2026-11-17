@@ -21,6 +21,7 @@
 #include <media/videobuf2-dma-contig.h>
 #include <media/videobuf2-v4l2.h>
 
+#include "../apple-video-nr.h"
 #include "avd.h"
 #include "avd-inst.h"
 #include "avd-regs.h"
@@ -294,7 +295,7 @@ static int avd_v4l2_init(struct avd_dev *avd)
 	video_set_drvdata(&avd->vdev, avd);
 	strscpy(avd->vdev.name, "avd", sizeof(avd->vdev.name));
 
-	ret = video_register_device(&avd->vdev, VFL_TYPE_VIDEO, -1);
+	ret = video_register_device(&avd->vdev, VFL_TYPE_VIDEO, APPLE_M2M_VIDEO_NR);
 	if (ret) {
 		v4l2_err(&avd->v4l2_dev, "Failed to register video device\n");
 		goto err_cleanup_mc;
@@ -489,6 +490,7 @@ static const struct avd_variant avd_t8132_variant = {
 	.submit_offset = 0x40,
 	.submit_queue_max_offset = 0x44,
 	.submit_queue_status_offset = 0x7c,
+	.quirks = AVD_QUIRK_HEVC_V5_HEADER,
 };
 
 /*

@@ -75,7 +75,9 @@ properties:
     properties:
       compatible:
         items:
-          - const: apple,t6041-aop-als
+          - enum:
+              - apple,t6041-aop-als
+              - apple,t8132-aop-als
           - const: apple,aop-als
 
     required:
@@ -89,7 +91,9 @@ properties:
     properties:
       compatible:
         items:
-          - const: apple,t6041-aop-las
+          - enum:
+              - apple,t6041-aop-las
+              - apple,t8132-aop-las
           - const: apple,aop-las
 
     required:

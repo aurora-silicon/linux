@@ -77,6 +77,22 @@ properties:
         const: apple,t8140-aop-setup-mailbox
 
       - description:
+          A coprocessor's secure RTBuddy port, the ADT's
+          iop,secure-rtbuddy-proxy. It is polled, with no interrupts described.
+        items:
+          - enum:
+              - apple,t8140-secure-rtbuddy-proxy
+          - const: apple,secure-rtbuddy-proxy
+
+      - description:
+          Later AOP setup-port mailboxes with the T8140 register layout.
+        items:
+          - enum:
+              - apple,t6050-aop-setup-mailbox
+              - apple,t8142-aop-setup-mailbox
+          - const: apple,t8140-aop-setup-mailbox
+
+      - description:
           An older ASC mailbox interface found on T2 and A11 that is also
           used for the NVMe coprocessor and the system management
           controller.
@@ -134,6 +150,16 @@ properties:
     maxItems: 2
 
 allOf:
+  - if:
+      not:
+        properties:
+          compatible:
+            contains:
+              const: apple,secure-rtbuddy-proxy
+    then:
+      required:
+        - interrupts
+        - interrupt-names
   - if:
       properties:
         compatible:
@@ -212,8 +238,6 @@ allOf:
 required:
   - compatible
   - reg
-  - interrupts
-  - interrupt-names
   - "#mbox-cells"
 
 additionalProperties: false

@@ -106,6 +106,10 @@
 	status = "okay";
 };
 
+&cpu_pmu {
+	status = "okay";
+};
+
 &dockchannel {
 	status = "okay";
 };
@@ -130,3 +134,90 @@
 };
 
 /* Unexposed chassis port instances remain described and disabled. */
+
+/* aura (mcc_init_m5) turns the system level cache on; the driver confirms it and flushes on shutdown. */
+&mcc {
+	status = "okay";
+};
+
+/*
+ * Video encoder: ADT ave behind dart-ave (DART + CPUDART). aura hands over the
+ * preloaded 26A428 firmware (memory regions, CRCs in /chosen) or disables the
+ * node when the ADT has no preload.
+ */
+&ps_venc_sys {
+	status = "okay";
+};
+
+&ps_venc_dma {
+	status = "okay";
+};
+
+&ps_venc_pipe4 {
+	status = "okay";
+};
+
+&ps_venc_pipe5 {
+	status = "okay";
+};
+
+&ps_venc_me0 {
+	status = "okay";
+};
+
+&ps_venc_me1 {
+	status = "okay";
+};
+
+&ave_dart0 {
+	status = "okay";
+};
+
+&ave_dart1 {
+	status = "okay";
+};
+
+&ave {
+	status = "okay";
+};
+
+/*
+ * The Neural Engine. It stays off until the first request: the firmware is
+ * started then, from the preload, and system sleep cycles it cold.
+ */
+&ps_ane_sys {
+	status = "okay";
+};
+
+&ane_dart0 {
+	status = "okay";
+};
+
+&ane_dart1 {
+	status = "okay";
+};
+
+&ane_dart2 {
+	status = "okay";
+};
+
+&ane {
+	status = "okay";
+};
+
+/* Both JPEG engines and their DART. */
+&ps_jpg {
+	status = "okay";
+};
+
+&jpeg_dart {
+	status = "okay";
+};
+
+&jpeg0 {
+	status = "okay";
+};
+
+&jpeg1 {
+	status = "okay";
+};

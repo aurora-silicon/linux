@@ -17,6 +17,8 @@
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
+#include <linux/suspend.h>
 
 #if IS_ENABLED(CONFIG_APPLE_MCC_KUNIT_TEST)
 #include <kunit/static_stub.h>
@@ -39,6 +41,8 @@ struct apple_mcc {
 	unsigned int nr_planes;
 	bool enabled;
 	bool retained;
+	/* Turned off for a deep sleep, to be turned back on after it. */
+	bool sleep_disabled;
 };
 
 static void apple_mcc_writel(struct apple_mcc *mcc, unsigned int plane,
@@ -50,8 +54,40 @@ static void apple_mcc_writel(struct apple_mcc *mcc, unsigned int plane,
 	writel(value, mcc->planes[plane] + offset);
 }
 
-/* T8132 powers the whole cache through two multicast apertures. Unlike
- * T8140 allocation control, its dirty-data drain is not qualified yet.
+/*
+ * As traced on macOS: both multicast apertures to 0, then each plane's status counts down to 0
+ * while it writes back. Nothing allocates from here on, so whatever runs after this goes straight
+ * to memory. A write-back that doesn't finish refuses the sleep, as the data would be lost.
+ */
+static int apple_mcc_disable_t8132(struct apple_mcc *mcc)
+{
+	u32 first, status;
+	ktime_t start;
+	unsigned int p;
+
+	start = ktime_get();
+	first = readl(mcc->planes[0] + 0x1c04);
+	writel(0, mcc->planes[0] + 0x1c1c00);
+	writel(0, mcc->planes[1] + 0x1c1c00);
+	/* Complete both multicast requests before observing per-plane status. */
+	mb();
+	for (p = 0; p < 4; p++) {
+		void __iomem *plane = mcc->planes[p / 2] + (p % 2) * 0x40000;
+
+		if (readl_poll_timeout_atomic(plane + 0x1c04, status, !status, 10,
+					      MCC_FLUSH_TIMEOUT_US)) {
+			dev_err(mcc->dev, "plane %u write-back timed out: status %#x\n", p, status);
+			return -ETIMEDOUT;
+		}
+	}
+	dev_dbg(mcc->dev, "cache written back in %lld us, status was %#x\n",
+		 ktime_us_delta(ktime_get(), start), first);
+	return 0;
+}
+
+/*
+ * T8132 powers the whole cache through two multicast apertures: 1 turns it on,
+ * and 0 writes it back and turns it off, see apple_mcc_disable_t8132().
  */
 static int apple_mcc_enable_t8132(struct apple_mcc *mcc)
 {
@@ -83,8 +119,11 @@ static int apple_mcc_enable_t8132(struct apple_mcc *mcc)
 
 		ret = readl_poll_timeout(plane + 0x1c04, status[p],
 					(status[p] & 0x3ff0) == 0x2100, 100, 10000);
-		if (ret)
+		if (ret) {
+			/* Not confirmed on: off again, so that no sleep finds it allocating. */
+			apple_mcc_disable_t8132(mcc);
 			return ret;
+		}
 	}
 	return 0;
 }
@@ -225,7 +264,15 @@ static int apple_mcc_probe(struct platform_device *pdev)
 
 static void apple_mcc_remove(struct platform_device *pdev)
 {
-	apple_mcc_quiesce(platform_get_drvdata(pdev));
+	struct apple_mcc *mcc = platform_get_drvdata(pdev);
+
+	/* Without this driver nothing writes T8132's cache back before a deep sleep. */
+	if (mcc->retained) {
+		apple_mcc_disable_t8132(mcc);
+		mcc->enabled = false;
+		return;
+	}
+	apple_mcc_quiesce(mcc);
 }
 
 static void apple_mcc_shutdown(struct platform_device *pdev)
@@ -235,6 +282,55 @@ static void apple_mcc_shutdown(struct platform_device *pdev)
 	if (mcc)
 		apple_mcc_quiesce(mcc);
 }
+
+/*
+ * A deep sleep takes the cache's power with the rest of the SoC: stop allocating and write it
+ * back first, as at shutdown, and allocate again after. Suspend-to-idle keeps it.
+ */
+static int apple_mcc_suspend_noirq(struct device *dev)
+{
+	struct apple_mcc *mcc = dev_get_drvdata(dev);
+	int ret;
+
+	if (!pm_suspend_via_firmware())
+		return 0;
+	/* T8132's cache is written back even if probe left it alone: nothing else does. */
+	if (mcc->retained) {
+		ret = apple_mcc_disable_t8132(mcc);
+		if (ret)
+			return ret;
+		mcc->sleep_disabled = mcc->enabled;
+		mcc->enabled = false;
+		return 0;
+	}
+	if (!mcc->enabled)
+		return 0;
+	apple_mcc_quiesce(mcc);
+	mcc->sleep_disabled = true;
+
+	return 0;
+}
+
+static int apple_mcc_resume_noirq(struct device *dev)
+{
+	struct apple_mcc *mcc = dev_get_drvdata(dev);
+	int ret;
+
+	if (!mcc->sleep_disabled)
+		return 0;
+	mcc->sleep_disabled = false;
+	/* Only a performance setting: a cache not ready after the wake stays off. */
+	ret = mcc->retained ? apple_mcc_enable_t8132(mcc) : apple_mcc_enable(mcc);
+	mcc->enabled = !ret;
+	if (ret)
+		dev_warn(dev, "system level cache allocation stays off after the sleep: %d\n", ret);
+
+	return 0;
+}
+
+static const struct dev_pm_ops apple_mcc_pm_ops = {
+	NOIRQ_SYSTEM_SLEEP_PM_OPS(apple_mcc_suspend_noirq, apple_mcc_resume_noirq)
+};
 
 static const struct of_device_id apple_mcc_of_match[] = {
 	{ .compatible = "apple,t8132-mcc" },
@@ -247,6 +343,7 @@ static struct platform_driver apple_mcc_driver = {
 	.driver = {
 		.name = "apple-mcc",
 		.of_match_table = apple_mcc_of_match,
+		.pm = pm_sleep_ptr(&apple_mcc_pm_ops),
 	},
 	.probe = apple_mcc_probe,
 	.remove = apple_mcc_remove,

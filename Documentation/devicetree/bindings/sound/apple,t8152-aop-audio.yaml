@@ -64,6 +64,14 @@ properties:
     $ref: /schemas/types.yaml#/definitions/string
     description: Machine family used for the sound card identity.
 
+  apple,speaker-amps:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    enum: [4, 6]
+    description:
+      Number of speaker amplifiers on the firmware's speaker stream (one
+      playback slot and a voltage/current sense pair each), when it differs
+      from the SoC's default (T8142 - 4).
+
 required:
   - compatible
   - dmas

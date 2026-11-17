@@ -28,6 +28,16 @@
 		bluetooth0 = &n1_beta;
 	};
 
+	/* GPU aperture; its PMGR and coprocessors are described below. */
+	j716c_gpu_bus: soc@2300000000 {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges = <0x23 0x0 0x23 0x0 0x0 0x4000000>;
+		interrupt-parent = <&aic>;
+		nonposted-mmio;
+	};
+
 	chosen {
 		#address-cells = <2>;
 		#size-cells = <2>;
@@ -237,3 +247,7 @@
 };
 
 #include "t6050-j716c-isp.dtsi"
+#include "t6050-j716c-gpu-panel.dtsi"
+
+#include "t6050-j716c-display.dtsi"
+#include "t6050-j716c-left-usb4.dtsi"

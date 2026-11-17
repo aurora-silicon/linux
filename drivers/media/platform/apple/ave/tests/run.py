@@ -49,10 +49,13 @@ def build(src, out, baseline):
         if match:
             code += match[0] + '\n'
     # Later firmware builds; an older baseline does not define them.
-    for name in ('AVE_FW_TEXT_CRC_T6040_25G83',):
+    for name in ('AVE_FW_TEXT_CRC_T6040_25G83', 'AVE_MCTF_BUFS', 'AVE_MCTF_IN_BUFS',
+                 'AVE_MCTF_OUT_BUFS', 'AVE_MCTF_POOL_LENT', 'AVE_MCTF_POOL_READY'):
         m = re.search(r'^#define ' + name + r'\s+[^\n]+', header, re.M)
         if m:
             code += m[0] + '\n'
+    if (src / 'ave-cmp420.h').exists():
+        code += source((src / 'ave-cmp420.h').read_text())
     for name in ('ave_codec', 'ave_buf', 'ave_fw_state', 'ave_image',
                  'ave_coproc_regs', 'ave_variant', 'ave_params', 'ave_slot', 'ave_session'):
         code += declaration(header, name)
@@ -86,7 +89,7 @@ def build(src, out, baseline):
             while line.endswith('\\'):
                 line = next(lines)
                 code += line + '\n'
-    for name in ('ave_buf_req_cmp', 'ave_req', 'ave_sess_alloc', 'ave_sess_free_bufs', 'ave_sess_reply'):
+    for name in ('ave_buf_req_cmp', 'ave_req', 'ave_sess_alloc', 'ave_mctf_pool_crc', 'ave_mctf_pool_check', 'ave_mctf_pool_return', 'ave_sess_free_bufs', 'ave_sess_reply'):
         code += function(session, name)
     if not baseline:
         fw = (src / 'ave-fw.c').read_text()

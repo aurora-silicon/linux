@@ -55,6 +55,7 @@ void mt_stop_host(struct mt7932 *m)
 	flush_work(&m->disconnect_work);
 	cancel_work_sync(&m->cal_work);
 	cancel_work_sync(&m->power_work);
+	cancel_work_sync(&m->wow_work);
 	cancel_delayed_work_sync(&m->scan_timeout_work);
 	cancel_work_sync(&m->scan_finish_work);
 	/* With all producers joined, this is the sole owner of any remainder. */

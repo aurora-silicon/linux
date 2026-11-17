@@ -85,6 +85,7 @@
 #include <linux/io.h>
 #include <linux/iommu.h>
 #include <linux/iopoll.h>
+#include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/string.h>
@@ -99,7 +100,13 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/regmap.h>
 #include <linux/reset.h>
+#include <linux/phy/phy.h>
+#include <linux/phy/apple-atc.h>
+#include <linux/soc/apple/dart-cio.h>
+#include <linux/soc/apple/dcp-v27-sleep.h>
+#include <linux/soc/apple/pmgr-pwrstate.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/tunable.h>
@@ -132,7 +139,12 @@
 #define APPLE_MXWRAP_CPU_CTRL_RUN BIT(4)
 #define APPLE_MXWRAP_CPU_STATUS 0x44
 
+/* DP IN adapter blocks a host router may have (T6050 has four) */
+#define APPLE_DPIN_MAX 4
+
 struct apple_cio_hw {
+	/* DP IN adapter blocks of the router; 0 means the two of t8103 */
+	unsigned int dpin_count;
 	bool mxwrap;
 	bool lstx_explicit;
 	/* Leave MxWrap RUN alone: the CIO reconfig restarts the CPU. */
@@ -142,6 +154,8 @@ struct apple_cio_hw {
 	bool strict_fw_ready;
 	/* Keep the links of the host router out of CL states. */
 	bool no_host_clx;
+	/* Keep the domain's links symmetric. */
+	bool no_asym;
 	/* Type 7 router: Enter_USB cable words, bootloader RC tuning, Type 7 NHI. */
 	bool type7;
 	/*
@@ -153,6 +167,10 @@ struct apple_cio_hw {
 	bool lstx_hold_from_probe;
 	/* The router trains Gen4 only on a cable word that says Gen4. */
 	bool gen4_cable;
+	/* Run Gen4 links with link recovery enabled at both ends. */
+	bool gen4_link_recovery;
+	/* Leave the host router's TMU to its firmware; host TMU constants. */
+	bool host_tmu;
 	const struct apple_dpin_policy *dp;
 };
 
@@ -198,9 +216,13 @@ static const struct apple_cio_hw apple_cio_t8142_hw = {
  * T6050 is Type 7 with an MxWrap CPU wrapper that is only clocked once the
  * CIO reset (the reconfig request) has run. Its CPU is released with a plain
  * store of RUN; as on T8132 it takes LSTX over only once its RTKit is up, and
- * the AP holds the pin while the router is off. DP tunnels stay off for now.
+ * the AP holds the pin while the router is off. Its four DP IN adapters take
+ * the M5 policy, see apple_dpin_m5. A Gen4 link times out CL training once CL
+ * states are enabled, then drops; it also dropped in the middle of a
+ * transition to an asymmetric width. Its links stay in CL0 and symmetric.
  */
 static const struct apple_cio_hw apple_cio_t6050_hw = {
+	.dpin_count = 4,
 	.mxwrap = true,
 	.type7 = true,
 	.run_store = true,
@@ -208,7 +230,11 @@ static const struct apple_cio_hw apple_cio_t6050_hw = {
 	.lstx_hold_from_probe = true,
 	.strict_fw_ready = true,
 	.gen4_cable = true,
-	.dp = &apple_dpin_disabled,
+	.no_host_clx = true,
+	.no_asym = true,
+	.gen4_link_recovery = true,
+	.host_tmu = true,
+	.dp = &apple_dpin_m5,
 };
 
 static const struct apple_cio_hw apple_cio_t6040_hw = {
@@ -274,6 +300,93 @@ module_param(s2idle_teardown, bool, 0644);
 MODULE_PARM_DESC(s2idle_teardown,
 		 "Power off connected ports for system sleep and restart them on resume (default N; drops tunnels, including USB devices tunnelled through a USB4 dock: unmount their storage first; ports with PCIe tunnels are skipped)");
 
+/*
+ * T6050: a firmware sleep takes the routers' power, and its sleep driver refuses one while a
+ * router's power word is on. macOS shuts a connected port's router down for its sleep: the
+ * router processor's power-off handshake, then the port's CIO power domains, and the reverse
+ * after the wake. The port's power-off above does the same through the driver's own stop
+ * (the tunnels released while the display processors still run, the processor's power-off
+ * handshake, the domains released), and the restart after the sleep brings the dock and its
+ * displays back as newly attached. Default for a T6050 firmware sleep; a port with a PCIe
+ * tunnel is skipped as above, and the sleep is then refused with its router still on.
+ */
+static bool t6050_sleep_teardown = true;
+module_param(t6050_sleep_teardown, bool, 0644);
+MODULE_PARM_DESC(t6050_sleep_teardown,
+		 "T6050: power off connected ports for a firmware sleep and restart them after the wake, as macOS does (default Y; N: the routers stay up and the sleep is refused)");
+
+/*
+ * With t6050_sleep_teardown, a port whose dock carries a PCIe tunnel (storage behind the
+ * dock). 1: the tunnelled functions are removed in order before the port goes down, the
+ * way a power-off stops them (an NVMe controller gets its normal shutdown), if they are NVMe
+ * controllers and their PCIe ports only and no disk of theirs is open; otherwise the port
+ * stays up and the sleep is refused. They are found again after the wake. 2: also with a
+ * disk open: the block layer syncs and shuts down what is on it, and a filesystem mounted
+ * from it has to be mounted again after the wake. 0: such a port is always skipped.
+ */
+static int t6050_sleep_pcie = 1;
+module_param(t6050_sleep_pcie, int, 0644);
+MODULE_PARM_DESC(t6050_sleep_pcie,
+		 "T6050: PCIe devices tunnelled through a dock at a firmware sleep: 0 keep the port up (sleep refused), 1 remove unused NVMe storage in order (default), 2 also storage in use");
+
+/*
+ * TEST, from a macOS sleep and wake with a dock on the right port (two tunnelled displays, a
+ * PCIe and a USB tunnel). Two things macOS has that the port's power-off above did not:
+ * the router's LSTX line is low across the sleep (it logs the level it leaves, 0), where the
+ * stop keeps the level the router last drove while the cable is in; and the router is
+ * started again at once after the wake (its processor is up 0.21 s after it), where the
+ * restart waited for the port controller's own revalidation and otherwise ten seconds.
+ */
+/*
+ * sv6r3, the first sleep and wake with this (Y): the router started from cold after the wake
+ * and its lane initialisation got no answer from the retimer ("Timeout for at_rt command
+ * response", register 12, every 100 ms; at the boot the same read is answered at once), and
+ * the dock never came back. macOS's low LSTX follows its router's own sleep (lane
+ * initialisation action 4, "ACIO SLEEP process completed"), and its wake is that firmware's
+ * (action 5, "Waking up from sleep!"), not a cold start; the port's power-off here has
+ * neither, so a low line for the whole sleep is a pulled cable to the retimer and the dock.
+ * Default N again: the level the router last drove, as every other stop of a port with its
+ * cable in. The router's sleep in place is where the low line belongs.
+ */
+static bool t6050_sleep_lstx_low;
+module_param(t6050_sleep_lstx_low, bool, 0644);
+MODULE_PARM_DESC(t6050_sleep_lstx_low,
+		 "T6050: hold LSTX low while a port is powered off for a firmware sleep (default N: the level the router last drove; Y lost the dock after the wake, sv6r3)");
+
+static unsigned int t6050_sleep_restart_ms;
+module_param(t6050_sleep_restart_ms, uint, 0644);
+MODULE_PARM_DESC(t6050_sleep_restart_ms,
+		 "T6050: delay from the end of a firmware sleep's resume to the restart of a port powered off for it (default 0, as macOS; 10000 was the fallback)");
+
+/*
+ * TEST, macOS's order in the same trace: the processors of the dock's displays are idle 0.23 s
+ * before the router's paths for those displays are destroyed and the router is put to sleep.
+ * The port's power-off took the router's domain down first, and the displays were released
+ * from its teardown, while their paths went. With this the displays behind the port are
+ * released first, by the request a tunnel's own end makes, and the router goes once the
+ * display side has answered. A release that does not end in time leaves the port up and
+ * refuses the sleep.
+ */
+static bool t6050_sleep_dp_first = true;
+module_param(t6050_sleep_dp_first, bool, 0644);
+MODULE_PARM_DESC(t6050_sleep_dp_first,
+		 "T6050: release the displays behind a port before its router is powered off for a firmware sleep, as macOS does (default Y; N: from the router's teardown)");
+
+/*
+ * TEST, the same order across ports: macOS has every display processor idle before the first
+ * port loses anything (the dock's displays and the one on the other port alike). The release
+ * above ran from each port's own power-off, so a display behind a second dock went after the
+ * first port was off. With this every port releases its displays from a notifier that runs
+ * before all the power-offs (and before the USB hosts' stops and the PCIe ports' parks), and
+ * no tunnel offered from then on is handed to a display processor until the sleep is over or
+ * given up. A sleep given up with displays released and the port still up restarts the port,
+ * which brings them back as after a sleep.
+ */
+static bool t6050_sleep_dp_all_first = true;
+module_param(t6050_sleep_dp_all_first, bool, 0644);
+MODULE_PARM_DESC(t6050_sleep_dp_all_first,
+		 "T6050: release the displays behind every port before any port is powered off for a firmware sleep, and hand no new tunnel to a display until it is over (default Y; N: each port's displays at its own power-off)");
+
 #define APPLE_CIO_START_RETRIES 5
 #define APPLE_CIO_START_RETRY_DELAY_MS 100
 
@@ -304,6 +417,13 @@ static unsigned int dpin_mode_value = 8;
 module_param(dpin_mode_value, uint, 0644);
 MODULE_PARM_DESC(dpin_mode_value,
 		 "DPIN0 MODE_A/MODE_B lab value (0-" __stringify(APPLE_DPIN_MODE_VALUE_MAX) "); read at each activate");
+
+/* DP IN adapters without an interrupt are polled this often (ms). */
+#define APPLE_DPIN_POLL_MS 20
+
+static bool cio_s2r = true;
+module_param(cio_s2r, bool, 0400);
+MODULE_PARM_DESC(cio_s2r, "Enable J713 attached-dock system sleep (default: on)");
 
 struct apple_dpin_binding;
 
@@ -363,6 +483,7 @@ struct apple_cio {
 
 	struct mutex lock; /* serializes cable transitions and ACIO power up/down */
 	bool removing; /* protected by lock */
+	bool native_sleep; /* freeze cable transitions for the bound NHI */
 	struct delayed_work resume_link_work;
 	unsigned int resume_link_failures; /* protected by lock */
 	u64 resume_activity; /* snapshot before the stock resume path */
@@ -379,6 +500,19 @@ struct apple_cio {
 	u64 link_lost_cycle_activity; /* remote activity at the last cycle */
 	bool link_lost_restart; /* protected by lock: cycle requested */
 	struct notifier_block pm_notifier;
+	/*
+	 * T6050: the displays behind this port go at the start of the sleep's entry, before any
+	 * port's power-off. @sleep_dp_paused: this entry closed the DP IN admission;
+	 * @sleep_dp_released: displays it released, with the port still up; @sleep_dp_undo: the
+	 * sleep was given up with the port as that, and its restart is owed. Protected by lock.
+	 */
+	struct notifier_block pm_notifier_dp;
+	struct work_struct sleep_dp_undo_work;
+	/* A dock or host was on this port when it was powered off for a sleep: expected back. */
+	bool sleep_peer_wanted;
+	bool sleep_dp_paused;
+	unsigned int sleep_dp_released;
+	bool sleep_dp_undo;
 	struct delayed_work sleep_restart_work;
 	enum {
 		APPLE_CIO_SLEEP_OPEN,		/* cable changes apply normally */
@@ -386,6 +520,14 @@ struct apple_cio {
 		APPLE_CIO_SLEEP_RESUMED,	/* next cable state is a post-resume snapshot */
 	} sleep_phase; /* protected by lock */
 	bool sleep_restart_owed; /* protected by lock */
+	bool sleep_t6050; /* powered off for a T6050 firmware sleep; protected by lock */
+	bool sleep_in_place; /* T6050: the bound NHI sleeps the router in place */
+	/* TEST: what the router firmware's log said last, for the sleep in place's lines */
+	atomic_t fw_lane_action;	/* "Entering Phase 1. action=N", -1 before the first */
+	atomic_t fw_sleep_done;		/* "ACIO SLEEP process completed" */
+	atomic_t fw_wake_seen;		/* "Waking up from sleep!" */
+	atomic_t fw_at_answers;		/* "Got AT register 12" */
+	atomic_t fw_at_timeouts;	/* "Timeout for at_rt command response" */
 	bool sleep_aborted_early; /* protected by lock: devices never suspended */
 
 	u32 current_cable_info;
@@ -410,6 +552,7 @@ struct apple_cio {
 	/* Type-C connector this router is wired to, for DP tunnel routing */
 	struct device_node *connector_np;
 	bool dp_dual_stream;
+	unsigned int dpin_count;
 	struct workqueue_struct *dp_wq;
 	struct apple_dpin_ctx {
 		struct apple_cio *acio;
@@ -420,9 +563,19 @@ struct apple_cio {
 		unsigned int idx;
 		struct apple_dpin_state state;
 		struct apple_dpin_tokens tokens;
+		unsigned long settle_until;	/* new tunnel's admission deadline */
 		struct apple_dpin_binding *binding; /* worker-owned, handed to DCP */
 		bool dcp_touched;	/* DCP ran the handshake on this mapping */
-	} dpin[2];
+		bool dcp_active;	/* DCP activated the link (DPTX_INACTIVE clear) */
+		/* DP IN interrupts: the line, or a poll where there is none */
+		int irq;
+		bool irq_enabled;
+		struct delayed_work poll;
+		struct work_struct event_work;	/* passes events on, on dp_wq */
+		unsigned int events;	/* APPLE_DP_TUNNEL_*, under lock */
+		bool hpd;		/* HPD level last seen, under lock */
+		unsigned int irq_count;
+	} dpin[APPLE_DPIN_MAX];
 };
 
 /* Immutable identity for one callback handoff; freed only after provider drain. */
@@ -433,21 +586,27 @@ struct apple_dpin_binding {
 };
 
 /*
- * The ATC's DP IN adapter blocks ("atcN-dpin0/1" in the Apple device tree).
+ * The ATC's DP IN adapter blocks ("atcN-dpin0..3" in the Apple device tree).
  * Registers on t8103:
  *   0x00 status, bit 2 = HPD level
  *   0x04 interrupt status (write 1 to clear)
  *   0x08 interrupt enable [1:0]
  *   0x0c bit 0 DPTX_INACTIVE
  *   0x10 bit 0 DPTX_INACTIVE_ACK
- * The block sits 0x390000 after the ACIO "rc" region; dpin1 is 0x8000 after dpin0.
+ * The blocks sit 0x390000 after the ACIO "rc" region: dpin1 0x8000 after
+ * dpin0, and on routers with four, dpin2 and dpin3 0x18000 and 0x20000 after.
  */
 #define APPLE_DPIN_OFFSET		0x390000
-#define APPLE_DPIN_STRIDE		0x8000
 #define APPLE_DPIN_SIZE			0x4000
+
+static const u32 apple_dpin_offsets[APPLE_DPIN_MAX] = {
+	0x0, 0x8000, 0x18000, 0x20000,
+};
 #define APPLE_DPIN_STATUS		0x00
 #define APPLE_DPIN_STATUS_HPD		BIT(2)
 #define APPLE_DPIN_IRQ_STATUS		0x04
+#define APPLE_DPIN_IRQ_HPD_CHANGE	BIT(0)
+#define APPLE_DPIN_IRQ_SINK		BIT(1)
 #define APPLE_DPIN_IRQ_ENABLE		0x08
 #define APPLE_DPIN_CTRL			0x0c
 #define APPLE_DPIN_CTRL_INACTIVE	BIT(0)
@@ -471,6 +630,8 @@ static const struct of_device_id apple_dpin_qualified_soc[] = {
 	{ .compatible = "apple,t6021" },
 	{ .compatible = "apple,t6030" },
 	{ .compatible = "apple,t8132" },
+	/* T6050: t8103 DP IN handshake, M3 flow, four DP IN adapters */
+	{ .compatible = "apple,t6050" },
 	{},
 };
 
@@ -598,6 +759,146 @@ static void apple_dpin_request_inactive(void *data)
 	apple_dpin_set_active(c->acio, c->regs, c->idx, false);
 }
 
+/*
+ * DP IN interrupts. +0x4 holds the events, write-1-to-clear: bit 0 the HPD
+ * level in +0x0 changed (+0x0 latches status bits that are cleared by
+ * writing it back), bit 1 the sink raised IRQ_HPD. Read +0x4 until it is
+ * stable, clear it, and hand what happened to appledrm: the display's DPTX
+ * port has no HPD input of its own on a tunnel. c->lock held.
+ */
+static unsigned int apple_dpin_irq_collect(struct apple_dpin_ctx *c, bool *seen)
+{
+	unsigned int events = 0, tries;
+	u32 irq, again, st;
+	bool hpd;
+
+	lockdep_assert_held(&c->lock);
+	*seen = false;
+	/* A handler or poll may have waited on the lock while teardown stopped it. */
+	if (!c->irq_enabled || !c->state.alive || !c->regs)
+		return 0;
+	irq = readl(c->regs + APPLE_DPIN_IRQ_STATUS);
+	for (tries = 0; tries < 8; tries++) {
+		again = readl(c->regs + APPLE_DPIN_IRQ_STATUS);
+		if (again == irq)
+			break;
+		irq = again;
+	}
+	if (!irq)
+		return 0;
+	*seen = true;
+	writel(irq, c->regs + APPLE_DPIN_IRQ_STATUS);
+	st = readl(c->regs + APPLE_DPIN_STATUS);
+	if (irq & APPLE_DPIN_IRQ_HPD_CHANGE)
+		writel(st, c->regs + APPLE_DPIN_STATUS);
+	hpd = st & APPLE_DPIN_STATUS_HPD;
+	if (hpd != c->hpd)
+		events |= APPLE_DP_TUNNEL_HPD_CHANGED;
+	c->hpd = hpd;
+	if (irq & APPLE_DPIN_IRQ_SINK)
+		events |= APPLE_DP_TUNNEL_IRQ_HPD;
+	c->irq_count++;
+	dev_dbg(c->acio->dev, "dpin%u: interrupt %#x (#%u), status %#x: HPD %d%s%s\n",
+		c->idx, irq, c->irq_count, st, hpd,
+		events & APPLE_DP_TUNNEL_IRQ_HPD ? ", IRQ_HPD" : "",
+		events & APPLE_DP_TUNNEL_HPD_CHANGED ? ", HPD changed" : "");
+	events &= APPLE_DP_TUNNEL_IRQ_HPD | APPLE_DP_TUNNEL_HPD_CHANGED;
+	c->events |= events;
+	return events;
+}
+
+/* Returns false if the adapter had nothing pending. */
+static bool apple_dpin_irq_dispatch(struct apple_dpin_ctx *c)
+{
+	unsigned int events;
+	bool seen;
+
+	scoped_guard(mutex, &c->lock)
+		events = apple_dpin_irq_collect(c, &seen);
+	if (events)
+		queue_work(c->acio->dp_wq, &c->event_work);
+	return seen;
+}
+
+static irqreturn_t apple_dpin_irq_thread(int irq, void *data)
+{
+	return apple_dpin_irq_dispatch(data) ? IRQ_HANDLED : IRQ_NONE;
+}
+
+static void apple_dpin_poll_fn(struct work_struct *work)
+{
+	struct apple_dpin_ctx *c = container_of(to_delayed_work(work),
+						struct apple_dpin_ctx, poll);
+	bool mapped;
+
+	apple_dpin_irq_dispatch(c);
+	scoped_guard(mutex, &c->lock)
+		mapped = c->irq_enabled && c->regs;
+	if (mapped)
+		queue_delayed_work(system_dfl_wq, &c->poll,
+				   msecs_to_jiffies(APPLE_DPIN_POLL_MS));
+}
+
+/* Start taking the interrupts of a mapped adapter. c->lock held. */
+static void apple_dpin_irq_start(struct apple_dpin_ctx *c)
+{
+	lockdep_assert_held(&c->lock);
+	if (c->irq_enabled || !c->regs)
+		return;
+	c->hpd = readl(c->regs + APPLE_DPIN_STATUS) & APPLE_DPIN_STATUS_HPD;
+	c->events = 0;
+	c->irq_enabled = true;
+	if (c->irq > 0)
+		enable_irq(c->irq);
+	else
+		queue_delayed_work(system_dfl_wq, &c->poll,
+				   msecs_to_jiffies(APPLE_DPIN_POLL_MS));
+}
+
+/* The handler takes c->lock: never wait for it here. c->lock held. */
+static void apple_dpin_irq_stop(struct apple_dpin_ctx *c)
+{
+	lockdep_assert_held(&c->lock);
+	if (!c->irq_enabled)
+		return;
+	c->irq_enabled = false;
+	c->events = 0;
+	if (c->irq > 0)
+		disable_irq_nosync(c->irq);
+	else
+		cancel_delayed_work(&c->poll);
+}
+
+/* On dp_wq, ordered with bring-up and teardown: the binding is stable. */
+static void apple_dpin_event_fn(struct work_struct *work)
+{
+	struct apple_dpin_ctx *c = container_of(work, struct apple_dpin_ctx, event_work);
+	typeof(apple_dcp_tb_dp_event) *event;
+	unsigned int events;
+	bool hpd, active;
+	int ret;
+
+	scoped_guard(mutex, &c->lock) {
+		events = c->events;
+		c->events = 0;
+		hpd = c->hpd;
+		active = c->dcp_active && c->state.alive;
+	}
+	/* The sink's requests matter once the display has activated the link. */
+	if (!active)
+		events &= ~APPLE_DP_TUNNEL_IRQ_HPD;
+	if (!events || !c->binding)
+		return;
+	event = symbol_get(apple_dcp_tb_dp_event);
+	if (!event)
+		return;
+	ret = event(c->acio->connector_np, c->idx, c->binding->generation, events, hpd);
+	symbol_put(apple_dcp_tb_dp_event);
+	if (ret)
+		dev_info(c->acio->dev, "dpin%u: display did not take events %#x: %d\n",
+			 c->idx, events, ret);
+}
+
 static void apple_dpin_request_mask_irqs(void *data)
 {
 	struct apple_dpin_ctx *c = data;
@@ -608,6 +909,7 @@ static void apple_dpin_request_mask_irqs(void *data)
 
 	writel(readl(c->regs + APPLE_DPIN_IRQ_ENABLE) & ~3,
 	       c->regs + APPLE_DPIN_IRQ_ENABLE);
+	apple_dpin_irq_stop(c);
 }
 
 static bool apple_dpin_request(struct apple_dpin_ctx *c, u64 generation, bool active)
@@ -617,10 +919,15 @@ static bool apple_dpin_request(struct apple_dpin_ctx *c, u64 generation, bool ac
 		.mask_irqs = apple_dpin_request_mask_irqs,
 		.ctx = c,
 	};
+	bool replacement = active && c->tokens.requested != generation;
 
 	lockdep_assert_held(&c->lock);
-	return apple_dpin_powered_request(&c->state, &c->tokens, c->acio->dp,
-					  generation, active, !!c->regs, &ops);
+	if (!apple_dpin_powered_request(&c->state, &c->tokens, c->acio->dp,
+					generation, active, !!c->regs, &ops))
+		return false;
+	if (replacement)
+		c->settle_until = jiffies + msecs_to_jiffies(c->acio->dp->settle_ms);
+	return true;
 }
 
 /* Called by appledrm from DCP's Activate/Deactivate calls. */
@@ -628,6 +935,7 @@ static int apple_dpin_dcp_set_active(void *data, bool active)
 {
 	const struct apple_dpin_binding *binding = data;
 	struct apple_dpin_ctx *c = binding->ctx;
+	int ret;
 
 	guard(mutex)(&c->lock);
 	if (!apple_dpin_token_access(&c->tokens, binding->generation))
@@ -636,8 +944,22 @@ static int apple_dpin_dcp_set_active(void *data, bool active)
 	if (!c->state.alive || !c->regs)
 		return -ENODEV;
 	c->dcp_touched = true;
-	return apple_dpin_set_active(c->acio, c->regs, c->idx, active);
+	ret = apple_dpin_set_active(c->acio, c->regs, c->idx, active);
+	if (!ret)
+		c->dcp_active = active;
+	return ret;
 }
+
+bool apple_dp_tunnel_binding_live(void *data)
+{
+	const struct apple_dpin_binding *binding = data;
+	struct apple_dpin_ctx *c = binding->ctx;
+
+	guard(mutex)(&c->lock);
+	return c->state.alive &&
+	       apple_dpin_token_access(&c->tokens, binding->generation);
+}
+EXPORT_SYMBOL_GPL(apple_dp_tunnel_binding_live);
 
 static bool apple_dpin_provider_get(void *data)
 {
@@ -736,14 +1058,45 @@ static int apple_dpin_connect(struct apple_dpin_ctx *c,
 	}
 }
 
+/*
+ * A USB4 dock can withdraw and re-advertise its DP OUT adapters while the
+ * initial capability exchange completes. On T6050, starting DCP on the
+ * temporary tunnel can leave its AUX request stuck after that tunnel goes
+ * away. Let the request settle before admitting any DCP callback or touching
+ * the adapter. Teardown still idles immediately in apple_dpin_request().
+ * A replacement owns a new deadline; this worker never admits the old token.
+ */
+static int apple_dpin_wait_settled(struct apple_dpin_ctx *c, u64 generation)
+{
+	unsigned long delay, now;
+
+	if (!c->acio->dp->settle_ms)
+		return 0;
+	for (;;) {
+		scoped_guard(mutex, &c->lock) {
+			if (!c->state.alive || c->tokens.requested != generation)
+				return -ESTALE;
+			now = jiffies;
+			if (time_after_eq(now, c->settle_until))
+				return 0;
+			delay = c->settle_until - now;
+		}
+		msleep(jiffies_to_msecs(delay) + 1);
+	}
+}
+
 static int apple_dpin_up(struct apple_dpin_ctx *c,
 			 struct apple_dpin_binding *binding, bool *deferred)
 {
 	struct apple_cio *acio = c->acio;
 	void __iomem *regs = c->regs;
+	int ret;
 	u32 irq;
 
 	*deferred = false;
+	ret = apple_dpin_wait_settled(c, binding->generation);
+	if (ret)
+		return ret;
 	scoped_guard(mutex, &c->lock) {
 		if (!c->state.alive || c->tokens.requested != binding->generation)
 			return -ESTALE;
@@ -754,7 +1107,7 @@ static int apple_dpin_up(struct apple_dpin_ctx *c,
 		/* This admission also owns the first DCP call after dropping the lock. */
 		if (!regs) {
 			regs = ioremap_np(acio->rc_res->start + APPLE_DPIN_OFFSET +
-					  c->idx * APPLE_DPIN_STRIDE, APPLE_DPIN_SIZE);
+					  apple_dpin_offsets[c->idx], APPLE_DPIN_SIZE);
 			if (!regs)
 				return -ENOMEM;
 			c->regs = regs;
@@ -763,8 +1116,7 @@ static int apple_dpin_up(struct apple_dpin_ctx *c,
 		 * Acknowledge what is pending and enable the DP IN interrupts:
 		 * +0x4 is write-1-to-clear, and a plug event (bit 0) also
 		 * latches status bits in +0x0 that are cleared by writing it
-		 * back. Nothing handles these interrupts yet; they are enabled
-		 * as part of bringing the adapter up.
+		 * back. See apple_dpin_irq_collect() for what they report.
 		 */
 		if (acio->dp->setup_irqs) {
 			irq = readl(regs + APPLE_DPIN_IRQ_STATUS);
@@ -772,6 +1124,7 @@ static int apple_dpin_up(struct apple_dpin_ctx *c,
 			if (irq & BIT(0))
 				writel(readl(regs + APPLE_DPIN_STATUS), regs + APPLE_DPIN_STATUS);
 			writel(readl(regs + APPLE_DPIN_IRQ_ENABLE) | 3, regs + APPLE_DPIN_IRQ_ENABLE);
+			apple_dpin_irq_start(c);
 		}
 		/* Activate may run before attach returns, so admit its immutable cookie now. */
 		apple_dpin_token_admit(&c->tokens, binding->generation);
@@ -806,9 +1159,11 @@ static void apple_dpin_down(struct apple_dpin_ctx *c)
 	}
 	/* The powered request hook idled the adapter before queued teardown. */
 	scoped_guard(mutex, &c->lock) {
+		apple_dpin_irq_stop(c);
 		regs = c->regs;
 		c->regs = NULL;
 		c->dcp_touched = false;
+		c->dcp_active = false;
 		apple_dpin_step(&c->state, c->acio->dp, APPLE_DPIN_DROPPED, false, 0);
 	}
 	if (regs)
@@ -936,8 +1291,10 @@ static void apple_cio_destroy_wq(void *data)
 	struct apple_cio *acio = data;
 
 	/* a pending retry would queue onto the destroyed queue */
-	for (unsigned int i = 0; i < ARRAY_SIZE(acio->dpin); i++)
+	for (unsigned int i = 0; i < ARRAY_SIZE(acio->dpin); i++) {
 		cancel_delayed_work_sync(&acio->dpin[i].retry);
+		cancel_delayed_work_sync(&acio->dpin[i].poll);
+	}
 	destroy_workqueue(acio->dp_wq);
 }
 
@@ -1085,6 +1442,21 @@ struct apple_nhi {
 	struct tb_nhi_ops ops;
 
 	void __iomem *nhi_base;
+	struct apple_tunable *nhi_tunable;
+	struct apple_dart_cio *cio_dart;
+	struct phy *cio_phy;
+	/* T6050: the port's combo PHY and its four calls, taken from its module */
+	struct device *cio_phy_dev;
+	int (*cio_phy_fn[5])(struct device *dev);
+	/* TEST (J714s): the PHY's call for the port's USB host kept through the router's sleep */
+	int (*cio_phy_usb)(struct device *dev, enum apple_t6050_cio_usb step);
+	ktime_t cio_test_asleep;	/* TEST (sv6t11): the firmware's state word read asleep */
+	bool cio_t6050;
+	struct device *cio_pcie;
+	u8 cio_pd_suspended;
+	bool cio_prepared, cio_rtk_off, cio_cycled;
+	/* ATC2_CIO is down for a router's sleep in place, until the PHY's CIO mode is up again */
+	bool cio_router_pd_down;
 	void __iomem *pdf_base;
 
 	int *tx_irqs;
@@ -1101,6 +1473,12 @@ struct apple_nhi {
 	bool dp_aux_armed;
 	unsigned int dp_aux_polls;
 };
+
+static int apple_nhi_cio_bind(struct apple_nhi *anhi);
+static int apple_nhi_cio_prepare(struct apple_nhi *anhi);
+static int apple_nhi_cio_suspend(struct apple_nhi *anhi);
+static int apple_nhi_cio_resume(struct apple_nhi *anhi);
+static void apple_nhi_cio_complete(struct apple_nhi *anhi);
 
 #define nhi_to_anhi(nhi_) container_of((nhi_), struct apple_nhi, nhi)
 
@@ -1150,8 +1528,52 @@ static int apple_cio_rtkit_shmem_setup(void *cookie, struct apple_rtkit_shmem *b
 	return 0;
 }
 
+/*
+ * TEST: T6050. The router firmware names the lane initialisation it runs: action 0 at a cold
+ * start, 4 for its own sleep, 5 for its wake from that sleep (macOS, runs mxt4 and mxt5:
+ * "Entering Phase 1. action=4", "ACIO SLEEP process completed" before the processor's
+ * power-off; "Waking up from sleep!", "Entering Phase 1. action=5", "Got AT register 12"
+ * after the restart). A router restarted without its sleep runs action 0 and the dock's
+ * retimer never answers register 12. The records are only read here: every one is still
+ * logged and acknowledged as before.
+ */
+static bool apple_cio_rtkit_syslog(void *cookie, const char *context, const char *message)
+{
+	struct apple_cio *acio = cookie;
+	unsigned int action, from, to;
+	const char *p;
+
+	if (acio->hw != &apple_cio_t6050_hw)
+		return false;
+	p = strstr(message, "Entering Phase 1. action=");
+	if (p && !kstrtouint(p + strlen("Entering Phase 1. action="), 10, &action)) {
+		atomic_set(&acio->fw_lane_action, action);
+		dev_info(acio->dev, "T6050 sleep: router firmware reports lane init action %u (%s)\n",
+			 action, action == 4 ? "its own sleep" :
+			 action == 5 ? "its wake from that sleep" :
+			 action == 0 ? "a cold start" : "not one the sleep knows");
+	} else if (strstr(message, "ACIO SLEEP process completed")) {
+		atomic_inc(&acio->fw_sleep_done);
+	} else if (strstr(message, "Waking up from sleep")) {
+		atomic_inc(&acio->fw_wake_seen);
+	} else if (strstr(message, "Got AT register 12")) {
+		atomic_inc(&acio->fw_at_answers);
+	} else if (strstr(message, "Timeout for at_rt command response")) {
+		atomic_inc(&acio->fw_at_timeouts);
+	} else if ((p = strstr(message, "clx_en changed ")) &&
+		   sscanf(p, "clx_en changed %x --> %x", &from, &to) == 2) {
+		/*
+		 * TEST (sv6u4): its CL configuration change (macOS: "CLX CFG: clx_en changed"
+		 * at each of the host's CL-state writes), against the link's CL writes.
+		 */
+		tb_clx_test_fw_log(from, to);
+	}
+	return false;
+}
+
 static const struct apple_rtkit_ops apple_cio_rtkit_ops = {
 	.shmem_setup = apple_cio_rtkit_shmem_setup,
+	.syslog_is_debug = apple_cio_rtkit_syslog,
 };
 
 static int apple_nhi_probe_irqs(struct apple_nhi *anhi)
@@ -1866,7 +2288,7 @@ static void apple_dp_aux_work(struct work_struct *work)
 		return;
 
 	mutex_lock(&anhi->tb->lock);
-	if (!anhi->dp_aux_armed || !anhi->tb->root_switch)
+	if (!anhi->dp_aux_armed || !anhi->tb->root_switch || READ_ONCE(anhi->acio->native_sleep))
 		goto out_unlock;
 
 	port = &anhi->tb->root_switch->ports[anhi->dp_in_port];
@@ -1925,7 +2347,7 @@ out_unlock:
 }
 
 /*
- * Which DP IN adapter (0/1) on the host router this port is -- same
+ * Which DP IN adapter (0..3) on the host router this port is -- same
  * counting order as apple_dp_in_analog_base() above and the port-to-dpin
  * mapping in apple_nhi_dp_tunnel_changed().
  */
@@ -1947,6 +2369,12 @@ static int apple_dpin_index_for_port(struct apple_nhi *anhi, struct tb_port *in)
 	return -1;
 }
 
+/* A DP IN adapter index with a block of its own on this router */
+static bool apple_dpin_valid(const struct apple_cio *acio, int idx)
+{
+	return acio && idx >= 0 && idx < acio->dpin_count;
+}
+
 static int apple_nhi_dp_tunnel_pre_activate(struct tb_nhi *nhi,
 					    struct tb_port *in,
 					    struct tb_port *out)
@@ -1966,7 +2394,7 @@ static int apple_nhi_dp_tunnel_post_activate(struct tb_nhi *nhi,
 
 	/* Validate the token before changing analog/AUX or display state. */
 	idx = apple_dpin_index_for_port(anhi, in);
-	if (idx >= 0 && idx <= 1 && anhi->acio && anhi->acio->connector_np &&
+	if (apple_dpin_valid(anhi->acio, idx) && anhi->acio->connector_np &&
 	    anhi->acio->dp_wq) {
 		c = &anhi->acio->dpin[idx];
 		scoped_guard(mutex, &c->lock) {
@@ -1993,7 +2421,7 @@ static int apple_nhi_dp_tunnel_post_activate(struct tb_nhi *nhi,
 	apple_dp_dump_vse(in->sw);
 
 	/* Route the display pipeline through the selected host DP IN adapter. */
-	if (idx < 0 || idx > 1 || !anhi->acio) {
+	if (!apple_dpin_valid(anhi->acio, idx)) {
 		dev_warn(anhi->dev,
 			 "DP IN tunnel: could not map port %u to a dpin index\n",
 			 in->port);
@@ -2033,7 +2461,7 @@ static void apple_nhi_dp_tunnel_deactivate(struct tb_nhi *nhi,
 
 	/* Sleep the adapter before tunnel teardown can remove its power. */
 	idx = apple_dpin_index_for_port(anhi, in);
-	if (idx >= 0 && idx <= 1 && anhi->acio && anhi->acio->dp_wq) {
+	if (apple_dpin_valid(anhi->acio, idx) && anhi->acio->dp_wq) {
 		struct apple_dpin_ctx *c = &anhi->acio->dpin[idx];
 
 		scoped_guard(mutex, &c->lock) {
@@ -2056,7 +2484,7 @@ static void apple_nhi_dp_tunnel_changed(struct tb_nhi *nhi, u8 in_port,
 	unsigned int dpin = 0;
 	bool found = false;
 
-	/* The crossbar's dpin0/dpin1 follow the host router's DP IN adapters in order. */
+	/* The crossbar's dpin0..3 follow the host router's DP IN adapters in order. */
 	tb_switch_for_each_port(anhi->tb->root_switch, port) {
 		if (!tb_port_is_dpin(port))
 			continue;
@@ -2066,7 +2494,7 @@ static void apple_nhi_dp_tunnel_changed(struct tb_nhi *nhi, u8 in_port,
 		}
 		dpin++;
 	}
-	if (!found || dpin > 1) {
+	if (!found || dpin >= acio->dpin_count) {
 		dev_warn(acio->dev, "DP tunnel from unexpected adapter %u\n", in_port);
 		return;
 	}
@@ -2094,7 +2522,7 @@ static bool apple_nhi_dp_tunnel_awaits_display(struct tb_nhi *nhi,
 	int idx;
 
 	idx = apple_dpin_index_for_port(anhi, in);
-	if (idx < 0 || idx > 1 || !anhi->acio)
+	if (!apple_dpin_valid(anhi->acio, idx))
 		return false;
 	c = &anhi->acio->dpin[idx];
 	guard(mutex)(&c->lock);
@@ -2221,6 +2649,7 @@ static int apple_nhi_probe(struct platform_device *pdev)
 		ret = dev_err_probe(&pdev->dev, PTR_ERR(tunable), "Unable to load NHI tunable\n");
 		goto err;
 	}
+	anhi->nhi_tunable = tunable;
 	apple_tunable_apply(anhi->nhi_base, tunable);
 
 	/* Type 7 keeps the PDF masks in the receive ring registers only. */
@@ -2260,6 +2689,9 @@ static int apple_nhi_probe(struct platform_device *pdev)
 		anhi->ops.dp_tunnel_deactivate = apple_nhi_dp_tunnel_deactivate;
 		anhi->nhi.host_dp_policy = acio->dp->host_policy;
 	}
+	ret = apple_nhi_cio_bind(anhi);
+	if (ret)
+		goto err;
 	anhi->nhi.ops = &anhi->ops;
 	anhi->nhi.ring_layout = &apple_nhi_ring_layout;
 	anhi->nhi.iobase = anhi->nhi_base;
@@ -2268,6 +2700,25 @@ static int apple_nhi_probe(struct platform_device *pdev)
 		anhi->nhi.quirks |= QUIRK_HOST_DP_NFC_CREDITS;
 	if (acio->hw->no_host_clx)
 		anhi->nhi.quirks |= QUIRK_NO_HOST_CLX;
+	if (acio->hw->no_asym)
+		anhi->nhi.quirks |= QUIRK_NO_ASYM;
+	if (acio->hw->gen4_link_recovery)
+		anhi->nhi.quirks |= QUIRK_GEN4_LINK_RECOVERY;
+	if (acio->hw->host_tmu)
+		anhi->nhi.quirks |= QUIRK_HOST_TMU;
+
+	/*
+	 * TEST: T6050 takes the vendor sleep and the state transfer as the J713 does (macOS,
+	 * runs mxt4 and mxt5: the exchanges behind the firmware's sleep state and before its
+	 * "Waking up from sleep"), and its wake waits for the link no longer than a cold
+	 * start's training takes.
+	 */
+	/*
+	 * The control frames of that sleep and wake are in run mxt6: the request and the state
+	 * transfer are what was inferred, and what macOS sends around them is sent here too.
+	 */
+	if (anhi->cio_t6050)
+		anhi->nhi.quirks |= QUIRK_CIO_WAKE_GIVES_UP | QUIRK_CIO_MACOS_FRAMES;
 
 	anhi->nhi.hop_count = readl(anhi->nhi_base + APPLE_CIO_NHI_HOP_COUNT) &
 			      APPLE_CIO_NHI_HOP_COUNT_MASK;
@@ -2451,29 +2902,51 @@ static int apple_nhi_prepare(struct device *dev)
 {
 	struct apple_nhi *anhi = dev_get_drvdata(dev);
 	struct apple_cio *acio = anhi->acio;
+	bool recovery = READ_ONCE(resume_recovery);
+	/*
+	 * Only a sleep that may cost the router its tunnels expects them back:
+	 * one with resume recovery, as before, and the J713's native deep sleep,
+	 * which power-cycles the router.
+	 */
+	bool cycles = recovery ||
+		      (anhi->cio_dart && pm_suspend_target_state == PM_SUSPEND_MEM);
+	bool expected;
+	int ret;
 
 	acio->resume_had_peer = false;
 	/* Only resume recovery reads it: don't take the domain lock otherwise. */
-	if (!READ_ONCE(resume_recovery))
-		return 0;
-	scoped_guard(mutex, &anhi->tb->lock) {
-		struct tb_port *port;
+	if (recovery) {
+		scoped_guard(mutex, &anhi->tb->lock) {
+			struct tb_port *port;
 
-		tb_switch_for_each_port(anhi->tb->root_switch, port) {
-			if (tb_port_is_null(port) &&
-			    ((port->xdomain && !port->xdomain->is_unplugged) ||
-			     (port->remote && !port->remote->sw->is_unplugged)))
-				acio->resume_had_peer = true;
+			tb_switch_for_each_port(anhi->tb->root_switch, port) {
+				if (tb_port_is_null(port) &&
+				    ((port->xdomain && !port->xdomain->is_unplugged) ||
+				     (port->remote && !port->remote->sw->is_unplugged)))
+					acio->resume_had_peer = true;
+			}
 		}
 	}
 
+	/* Worker admission and native PCIe PM ordering are required on every sleep. */
 	apple_dpin_pause_retries(acio);
 
-	guard(mutex)(&acio->pcie_tunnel_lock);
-	/* Keep an unresolved expectation across another sleep before revalidation. */
-	acio->pcie_resume_expected |= READ_ONCE(acio->pcie_tunnel_requested);
-	acio->pcie_pm_prepared = true;
-	return 0;
+	scoped_guard(mutex, &acio->pcie_tunnel_lock) {
+		expected = acio->pcie_resume_expected;
+		/* Keep an unresolved expectation until cable revalidation. */
+		if (cycles)
+			acio->pcie_resume_expected |= READ_ONCE(acio->pcie_tunnel_requested);
+		acio->pcie_pm_prepared = true;
+	}
+	ret = apple_nhi_cio_prepare(anhi);
+	if (ret) {
+		apple_dpin_resume_retries(acio);
+		scoped_guard(mutex, &acio->pcie_tunnel_lock) {
+			acio->pcie_pm_prepared = false;
+			acio->pcie_resume_expected = expected;
+		}
+	}
+	return ret;
 }
 
 /*
@@ -2516,6 +2989,8 @@ static int apple_nhi_suspend_noirq(struct device *dev)
 {
 	struct apple_nhi *anhi = dev_get_drvdata(dev);
 
+	if (anhi->cio_prepared)
+		return apple_nhi_cio_suspend(anhi);
 	anhi->nhi.quirks &= ~(QUIRK_NO_SYSTEM_SLEEP | QUIRK_KEEP_TUNNELS);
 	if (!READ_ONCE(router_sleep)) {
 		anhi->nhi.quirks |= QUIRK_NO_SYSTEM_SLEEP;
@@ -2552,6 +3027,8 @@ static int apple_nhi_resume_noirq(struct device *dev)
 {
 	struct apple_nhi *anhi = dev_get_drvdata(dev);
 
+	if (anhi->cio_prepared)
+		return apple_nhi_cio_resume(anhi);
 	anhi->acio->resume_activity = atomic64_read(&anhi->tb->remote_activity);
 	WRITE_ONCE(anhi->acio->resume_link_pending, true);
 	return tb_domain_resume_noirq(anhi->tb);
@@ -2583,6 +3060,7 @@ static void apple_nhi_complete(struct device *dev)
 	struct apple_nhi *anhi = dev_get_drvdata(dev);
 	struct apple_cio *acio = anhi->acio;
 
+	apple_nhi_cio_complete(anhi);
 	tb_domain_complete(anhi->tb);
 	apple_dpin_resume_retries(acio);
 
@@ -2695,12 +3173,12 @@ static void apple_cio_remove_children(struct apple_cio *acio)
  * While the router is off, the AP holds LSTX at the level the router last
  * drove. The pin goes back to the router once it is up again.
  */
-static void apple_cio_lstx_hold(struct apple_cio *acio, bool high)
+static int apple_cio_lstx_hold(struct apple_cio *acio, bool high)
 {
 	struct gpio_desc *gpio;
 
 	if (!acio->lstx_hold)
-		return;
+		return 0;
 	acio->lstx_high = high;
 
 	/* The pin controller is strict: release the router's mux first. */
@@ -2715,9 +3193,10 @@ static void apple_cio_lstx_hold(struct apple_cio *acio, bool high)
 		acio->lstx_high = false;
 		dev_warn(acio->dev, "failed to take the LSTX pin back: %ld\n",
 			 PTR_ERR(gpio));
-		return;
+		return PTR_ERR(gpio);
 	}
 	acio->lstx_gpio = gpio;
+	return 0;
 }
 
 static int apple_cio_lstx_release(struct apple_cio *acio)
@@ -2762,6 +3241,66 @@ static void apple_cio_cpu_halt(struct apple_cio *acio)
 	       acio->cpu_base + APPLE_MXWRAP_CPU_CTRL);
 }
 
+/* TEST (sv6t7): the PS_PROT word of the slice a DART node names as its clock protection. */
+static int apple_cio_test_slice(struct device_node *np, unsigned int *slice, u32 *word)
+{
+	struct of_phandle_args args;
+	struct regmap *map;
+	int ret;
+
+	ret = of_parse_phandle_with_fixed_args(np, "apple,clock-protection", 1, 0, &args);
+	if (ret)
+		return ret;
+	map = syscon_node_to_regmap(args.np);
+	of_node_put(args.np);
+	if (IS_ERR(map))
+		return PTR_ERR(map);
+	*slice = args.args[0];
+	return regmap_read(map, 0x100 + 0x40 * args.args[0], word);
+}
+
+/*
+ * TEST (sv6t7): as the ACIO drops its domain links, the guard word of each of the port's
+ * DARTs (bit 4 set: the domain's power-off faults) and genpd's view of each domain.
+ */
+static void apple_cio_test_log_guards(struct apple_cio *acio)
+{
+	struct device_node *parents[] = { acio->np, acio->pcie_tunnel_np };
+	char buf[384];
+	int len = 0, i;
+
+	if (!of_machine_is_compatible("apple,j714s"))
+		return;
+	buf[0] = '\0';
+	for (i = 0; i < ARRAY_SIZE(parents); i++) {
+		if (!parents[i])
+			continue;
+		for_each_available_child_of_node_scoped(parents[i], child) {
+			unsigned int slice = 0;
+			u32 word = 0;
+			int ret;
+
+			if (!of_property_present(child, "apple,clock-protection"))
+				continue;
+			ret = apple_cio_test_slice(child, &slice, &word);
+			len += scnprintf(buf + len, sizeof(buf) - len, " %pOFn slice %u %#x (%d);",
+					 child, slice, word, ret);
+		}
+	}
+	len += scnprintf(buf + len, sizeof(buf) - len, " domains:");
+	for (i = 0; i < acio->pd_list->num_pds; i++) {
+		struct device *pd = acio->pd_list->pd_devs[i];
+		struct generic_pm_domain *genpd =
+			pd && pd->pm_domain ? pd_to_genpd(pd->pm_domain) : NULL;
+
+		len += scnprintf(buf + len, sizeof(buf) - len, " %s %s%s",
+				 genpd ? genpd->name : "?",
+				 genpd && genpd->status == GENPD_STATE_ON ? "on" : "off",
+				 acio->pd_list->pd_links[i] ? "" : " (no link)");
+	}
+	dev_info(acio->dev, "TEST sv6t7: ACIO stop, its domain links go next: PS_PROT%s\n", buf);
+}
+
 /**
  * apple_cio_stop - Stop and power down the ACIO complex
  * @acio: ACIO complex to stop
@@ -2793,6 +3332,8 @@ static void apple_cio_stop(struct apple_cio *acio)
 		apple_cio_lstx_hold(acio, acio->target_cable_info &&
 				    (readl(acio->rc_base + APPLE_CIO_M3_CTRL) &
 				     APPLE_CIO_LSTX_CTRL_LEVEL));
+
+	apple_cio_test_log_guards(acio);
 
 	/* Finally, remove the links to the PD domains to power everything off */
 	for (i = 0; i < acio->pd_list->num_pds; i++) {
@@ -3193,12 +3734,21 @@ static void apple_cio_link_lost_work(struct work_struct *work)
 		    acio->resume_recovery_failed ||
 		    acio->start_gen != READ_ONCE(acio->link_lost_gen))
 			return;
-		if (apple_cio_has_peer(acio, &activity))
+		if (apple_cio_has_peer(acio, &activity)) {
+			if (acio->sleep_peer_wanted)
+				dev_info(acio->dev, "T6050 sleep: the dock is back after the port's restart (%u more restart(s))\n",
+					 acio->link_lost_cycles);
+			acio->sleep_peer_wanted = false;
 			return;
+		}
+		if (acio->sleep_peer_wanted)
+			dev_warn(acio->dev, "T6050 sleep: no dock %d ms after the port's restart\n",
+				 APPLE_CIO_LINK_LOST_MS);
 		if (acio->link_lost_cycles >= APPLE_CIO_LINK_LOST_CYCLES) {
 			dev_warn(acio->dev,
 				 "peer link still down after %u port restarts, leaving the port alone\n",
 				 acio->link_lost_cycles);
+			acio->sleep_peer_wanted = false;
 			return;
 		}
 		acio->link_lost_cycles++;
@@ -3251,6 +3801,8 @@ static void apple_cio_resume_link_work(struct work_struct *work)
 	if (notify)
 		typec_thunderbolt_switch_notify(acio->tbt_switch);
 }
+
+#include "apple-cio-sleep.c"
 
 static int apple_cio_prepare(struct device *dev)
 {
@@ -3365,6 +3917,8 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 		break;
 	}
 
+	if (acio->native_sleep)
+		return acio->target_cable_info == acio->current_cable_info ? 0 : -EBUSY;
 	/* Until resume, record changes; CD321x reapplies fresh state afterwards. */
 	if (acio->sleep_phase == APPLE_CIO_SLEEP_CLOSED)
 		return 0;
@@ -3407,6 +3961,15 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 		ret = apple_cio_start(acio);
 		if (!ret)
 			WRITE_ONCE(acio->sleep_restart_owed, false);
+		/*
+		 * The port had a dock before its power-off for the sleep: one that is not
+		 * found again gets the port restarted, as a peer lost with the cable in.
+		 */
+		if (!ret && acio->sleep_peer_wanted) {
+			WRITE_ONCE(acio->link_lost_gen, READ_ONCE(acio->start_gen));
+			mod_delayed_work(system_freezable_wq, &acio->link_lost_work,
+					 msecs_to_jiffies(APPLE_CIO_LINK_LOST_MS));
+		}
 		if (ret && apple_cio_recovering(acio)) {
 			acio->resume_recovery_failed = true;
 			acio->target_cable_info = 0;
@@ -3422,13 +3985,105 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 	return 0;
 }
 
-static void apple_cio_sleep_teardown(struct apple_cio *acio)
+/* The T6050 firmware sleep, selected by the sleep driver's profile and mem_sleep. */
+static bool apple_cio_t6050_sleep(struct apple_cio *acio)
 {
+	return of_machine_is_compatible("apple,j714s") &&
+	       READ_ONCE(t6050_sleep_teardown) && acio->hw == &apple_cio_t6050_hw &&
+	       apple_sleep_v27_late() && !pm_suspend_default_s2idle();
+}
+
+/* The longest the displays behind a port may take to go before its router does. */
+#define APPLE_CIO_SLEEP_DP_RELEASE_MS	3000
+
+/*
+ * The displays on this router's DP IN adapters, released as at their tunnels' end and before
+ * anything of the router is touched. The tunnels' own end, at the domain's removal, then finds
+ * its request already made. With @pause the adapters' admission is closed first, as the NHI's
+ * prepare closes it: a tunnel offered from here on waits, not handed to a display processor,
+ * until the admission is opened again (the NHI's removal or complete, or the end of a sleep
+ * that was given up). Returns how many requests were ended, or -EBUSY if the display side is
+ * still at it after APPLE_CIO_SLEEP_DP_RELEASE_MS: nothing of the port has changed then but
+ * those displays.
+ */
+static int apple_cio_sleep_release_displays(struct apple_cio *acio, bool pause)
+{
+	ktime_t start = ktime_get();
+	ktime_t deadline = ktime_add_ms(start, APPLE_CIO_SLEEP_DP_RELEASE_MS);
+	unsigned int i, asked = 0, busy;
+
+	lockdep_assert_held(&acio->lock);
+	if (!acio->dp_wq)
+		return 0;
+	if (pause && acio->dp->defer_new_bringup) {
+		for (i = 0; i < acio->dpin_count && i < APPLE_DPIN_MAX; i++) {
+			struct apple_dpin_ctx *c = &acio->dpin[i];
+
+			scoped_guard(mutex, &c->lock)
+				apple_dpin_step(&c->state, acio->dp, APPLE_DPIN_PAUSE, !!c->regs, 0);
+			/* Not waited for: a retry that still fires finds the admission closed. */
+			cancel_delayed_work(&c->retry);
+		}
+		acio->sleep_dp_paused = true;
+	}
+	for (i = 0; i < acio->dpin_count && i < APPLE_DPIN_MAX; i++) {
+		struct apple_dpin_ctx *c = &acio->dpin[i];
+		bool queue = false;
+
+		scoped_guard(mutex, &c->lock) {
+			u64 generation = c->tokens.requested;
+
+			if (generation)
+				queue = apple_dpin_request(c, generation, false);
+		}
+		if (queue) {
+			queue_work(acio->dp_wq, &c->work);
+			asked |= BIT(i);
+		}
+	}
+	/* With the admission closed, an attempt that was on its way ends too. */
+	if (!asked && !pause)
+		return 0;
+	for (;;) {
+		busy = 0;
+		for (i = 0; i < acio->dpin_count && i < APPLE_DPIN_MAX; i++)
+			if (((asked & BIT(i)) || pause) && work_busy(&acio->dpin[i].work))
+				busy |= BIT(i);
+		if (!busy)
+			break;
+		if (ktime_after(ktime_get(), deadline)) {
+			dev_err(acio->dev, "T6050 sleep: the displays behind this port are not released after %lld ms (DP IN %#x still busy, %#x asked): the port stays up and the sleep is refused\n",
+				ktime_ms_delta(ktime_get(), start), busy, asked);
+			return -EBUSY;
+		}
+		usleep_range(1000, 2000);
+	}
+	if (asked || pause)
+		dev_info(acio->dev, "T6050 sleep: %u display request(s) behind this port ended in %lld ms, before %s (DP IN %#x)%s\n",
+			 hweight32(asked), ktime_ms_delta(ktime_get(), start),
+			 pause ? "any port's power-off" : "the router", asked,
+			 pause && acio->sleep_dp_paused ? "; new tunnels wait for the end of the sleep" : "");
+	return hweight32(asked);
+}
+
+static int apple_cio_sleep_teardown(struct apple_cio *acio)
+{
+	ktime_t start = ktime_get(), stop;
+	const char *lstx = "not held";
+	bool t6050;
+	int released;
+
 	cancel_delayed_work_sync(&acio->resume_link_work);
 
 	guard(mutex)(&acio->lock);
 	if (acio->removing || acio->resume_recovery_failed || !acio->current_cable_info)
-		return;
+		return 0;
+
+	if (apple_cio_t6050_sleep(acio) && READ_ONCE(t6050_sleep_dp_first)) {
+		released = apple_cio_sleep_release_displays(acio, false);
+		if (released < 0)
+			return released;
+	}
 
 	/*
 	 * PCIe endpoints may unregister PM notifiers on removal, which would
@@ -3438,16 +4093,65 @@ static void apple_cio_sleep_teardown(struct apple_cio *acio)
 	 * reopens it.
 	 */
 	scoped_guard(mutex, &acio->pcie_tunnel_lock) {
-		if (READ_ONCE(acio->pcie_tunnel_requested) || acio->pcie_tunnel_populated)
-			return;
+		if (READ_ONCE(acio->pcie_tunnel_requested) || acio->pcie_tunnel_populated) {
+			struct platform_device *pcie;
+			int mode = READ_ONCE(t6050_sleep_pcie);
+			int ret = 0;
+
+			/*
+			 * The T6050 firmware sleep takes the router's power whatever is behind
+			 * it. The tunnelled functions go first and in order, while the tunnel
+			 * still carries them: only NVMe controllers, whose driver touches no
+			 * notifier chain on removal, and by default only with no disk in use.
+			 */
+			if (!mode || !apple_cio_t6050_sleep(acio))
+				return 0;
+			pcie = apple_cio_find_pcie_tunnel(acio);
+			if (pcie) {
+				ret = apple_pcie_tunnel_remove_orderly(&pcie->dev, mode == 2);
+				put_device(&pcie->dev);
+			}
+			if (ret) {
+				dev_warn(acio->dev,
+					 "PCIe devices behind this port stay for the sleep (%d): the port is not powered off\n",
+					 ret);
+				return 0;
+			}
+		}
 		acio->pcie_tunnel_stopping = true;
 	}
 
 	dev_info(acio->dev, "powering off port for system sleep (cable info 0x%x)\n",
 		 acio->current_cable_info);
+	t6050 = apple_cio_t6050_sleep(acio);
+	if (t6050) {
+		u64 activity;
+
+		/* With no NHI the answer is "yes": then nothing is expected back. */
+		acio->sleep_peer_wanted = READ_ONCE(acio->nhi_pdev) &&
+					  apple_cio_has_peer(acio, &activity);
+		acio->link_lost_cycles = 0;
+	}
+	stop = ktime_get();
 	apple_cio_stop(acio);
 	acio->sleep_phase = APPLE_CIO_SLEEP_CLOSED;
 	WRITE_ONCE(acio->sleep_restart_owed, true);
+	/* Its displays come back with the port's restart. */
+	acio->sleep_dp_released = 0;
+	if (!t6050)
+		return 0;
+	/* The stop left the pin at the router's last level, held by the AP. */
+	if (READ_ONCE(t6050_sleep_lstx_low) && acio->lstx_gpio && acio->lstx_high) {
+		gpiod_set_value_cansleep(acio->lstx_gpio, 0);
+		acio->lstx_high = false;
+		lstx = "lowered";
+	} else if (acio->lstx_gpio) {
+		lstx = acio->lstx_high ? "left high" : "low";
+	}
+	acio->sleep_t6050 = true;
+	dev_info(acio->dev, "T6050 sleep: port off: PCIe functions %lld ms, tunnels, router and domains %lld ms, LSTX %s\n",
+		 ktime_ms_delta(stop, start), ktime_ms_delta(ktime_get(), stop), lstx);
+	return 0;
 }
 
 /* A restart still owed from the last sleep must not race this suspend. */
@@ -3485,14 +4189,27 @@ static void apple_cio_sleep_restart_work(struct work_struct *work)
 	typec_thunderbolt_switch_notify_restore(acio->tbt_switch);
 }
 
+/* Is this port powered off for the sleep about to start? Asked at PM_SUSPEND_PREPARE. */
+static bool apple_cio_sleep_tears_down(struct apple_cio *acio)
+{
+	if (READ_ONCE(s2idle_teardown))
+		return true;
+	/* A port whose router sleeps in place keeps its tunnels: its NHI owns the sleep. */
+	return apple_cio_t6050_sleep(acio) && !READ_ONCE(acio->sleep_in_place);
+}
+
 static int apple_cio_pm_notify(struct notifier_block *nb, unsigned long event,
 			       void *unused)
 {
 	struct apple_cio *acio = container_of(nb, struct apple_cio, pm_notifier);
+	bool tears_down = event == PM_SUSPEND_PREPARE && apple_cio_sleep_tears_down(acio);
+	unsigned int delay = APPLE_CIO_SLEEP_RESTART_FALLBACK_MS;
 	bool owed, early;
+	int ret;
 
 	/* Teardown off and no restart owed from an earlier sleep: nothing to do. */
-	if (!READ_ONCE(s2idle_teardown) && !READ_ONCE(acio->sleep_restart_owed))
+	if (!tears_down && !READ_ONCE(s2idle_teardown) &&
+	    !READ_ONCE(acio->sleep_restart_owed))
 		return NOTIFY_DONE;
 
 	switch (event) {
@@ -3501,8 +4218,12 @@ static int apple_cio_pm_notify(struct notifier_block *nb, unsigned long event,
 		cancel_delayed_work_sync(&acio->sleep_restart_work);
 		apple_cio_sleep_close_owed(acio);
 		/* Before tasks freeze: tearing down the NHI needs unfrozen work. */
-		if (READ_ONCE(s2idle_teardown))
-			apple_cio_sleep_teardown(acio);
+		if (tears_down) {
+			/* Only the displays' release refuses, with the port as it was. */
+			ret = apple_cio_sleep_teardown(acio);
+			if (ret)
+				return notifier_from_errno(ret);
+		}
 		break;
 	case PM_POST_SUSPEND:
 		scoped_guard(mutex, &acio->lock) {
@@ -3513,12 +4234,212 @@ static int apple_cio_pm_notify(struct notifier_block *nb, unsigned long event,
 			}
 			owed = acio->sleep_restart_owed;
 			early = acio->sleep_aborted_early;
+			/* TEST: macOS starts the router again straight after the wake. */
+			if (acio->sleep_t6050) {
+				acio->sleep_t6050 = false;
+				delay = READ_ONCE(t6050_sleep_restart_ms);
+				if (owed)
+					dev_info(acio->dev, "T6050 sleep: port restart asked %u ms after the resume%s\n",
+						 early ? 0 : delay, early ? " (the suspend was given up early)" : "");
+			}
 		}
 		/* Start from a worker: probing children inside this chain can deadlock. */
 		if (owed)
 			queue_delayed_work(system_dfl_wq, &acio->sleep_restart_work,
-					   early ? 0 :
-					   msecs_to_jiffies(APPLE_CIO_SLEEP_RESTART_FALLBACK_MS));
+					   early ? 0 : msecs_to_jiffies(delay));
+		break;
+	}
+	return NOTIFY_DONE;
+}
+
+/*
+ * A sleep was given up with this port's displays released and the port still up (a later
+ * step of the entry refused, before the port's own power-off). A released tunnel cannot be
+ * requested again, so the port is powered off and restarted, as it would have been for the
+ * sleep: the dock and its displays come back as newly attached. From a work: the stop
+ * removes devices, and must not run inside the PM notifier chain.
+ */
+static void apple_cio_sleep_dp_undo_work(struct work_struct *work)
+{
+	struct apple_cio *acio = container_of(work, struct apple_cio, sleep_dp_undo_work);
+	bool down;
+	int ret;
+
+	scoped_guard(mutex, &acio->lock) {
+		/* Not owed any more: a new sleep's entry has begun, and its restart does it. */
+		if (!acio->sleep_dp_undo)
+			return;
+		acio->sleep_dp_undo = false;
+		if (acio->removing || !acio->current_cable_info)
+			return;
+	}
+	dev_info(acio->dev, "T6050 sleep given up with this port's displays released: the port is restarted to bring them back\n");
+	ret = apple_cio_sleep_teardown(acio);
+	scoped_guard(mutex, &acio->lock) {
+		down = !ret && !acio->current_cable_info && acio->sleep_restart_owed;
+		acio->sleep_t6050 = false;
+	}
+	if (!down) {
+		/* PCIe functions that stay keep the port up: only a replug brings the displays. */
+		dev_warn(acio->dev, "T6050 sleep given up: the port stays up (%d), its released displays stay off until the dock is plugged in again\n",
+			 ret);
+		apple_dpin_resume_retries(acio);
+		return;
+	}
+	queue_delayed_work(system_dfl_wq, &acio->sleep_restart_work, 0);
+}
+
+/*
+ * A port whose router sleeps in place keeps its tunnels until its NHI's prepare, after the
+ * freezer. Until then no tunnel of it may be handed a display: a display that goes at the
+ * start of the entry frees a pipeline, and a tunnel that was waiting for one would light a
+ * display in the middle of the entry (sv6t2: "dpin1: a display pipeline came free; DP tunnel
+ * up" 0.6 s after the freezer). So the admission closes here, ahead of the display processors'
+ * own step, as for a port that is powered off; nothing is released. An attempt already on
+ * its way is waited for, and the sleep refused if it does not end.
+ */
+static int apple_cio_sleep_close_admission(struct apple_cio *acio)
+{
+	ktime_t start = ktime_get();
+	ktime_t deadline = ktime_add_ms(start, APPLE_CIO_SLEEP_DP_RELEASE_MS);
+	unsigned int i, busy, waiting = 0;
+
+	lockdep_assert_held(&acio->lock);
+	if (!acio->dp_wq || !acio->dp->defer_new_bringup)
+		return 0;
+	for (i = 0; i < acio->dpin_count && i < APPLE_DPIN_MAX; i++) {
+		struct apple_dpin_ctx *c = &acio->dpin[i];
+
+		scoped_guard(mutex, &c->lock) {
+			apple_dpin_step(&c->state, acio->dp, APPLE_DPIN_PAUSE, !!c->regs, 0);
+			if (c->state.alive && (c->state.waiting || c->state.deferred_first))
+				waiting |= BIT(i);
+		}
+		/* Not waited for: a retry that still fires finds the admission closed. */
+		cancel_delayed_work(&c->retry);
+	}
+	acio->sleep_dp_paused = true;
+	for (;;) {
+		busy = 0;
+		for (i = 0; i < acio->dpin_count && i < APPLE_DPIN_MAX; i++)
+			if (work_busy(&acio->dpin[i].work))
+				busy |= BIT(i);
+		if (!busy)
+			break;
+		if (ktime_after(ktime_get(), deadline)) {
+			dev_err(acio->dev, "T6050 sleep: a display request behind this port is still on its way after %lld ms (DP IN %#x): the sleep is refused\n",
+				ktime_ms_delta(ktime_get(), start), busy);
+			return -EBUSY;
+		}
+		usleep_range(1000, 2000);
+	}
+	dev_info(acio->dev, "T6050 sleep: DP IN admission closed for the sleep's entry in %lld ms, the router sleeps in place: no tunnel is handed a display until the sleep is over (waiting for a pipeline: DP IN %#x)\n",
+		 ktime_ms_delta(ktime_get(), start), waiting);
+	return 0;
+}
+
+/* The entry of a sleep is over, slept or given up: tunnels that waited are handed on. */
+static void apple_cio_sleep_dp_reopen(struct apple_cio *acio)
+{
+	unsigned int i, waiting = 0;
+
+	if (!acio->dp_wq)
+		return;
+	for (i = 0; i < acio->dpin_count && i < APPLE_DPIN_MAX; i++) {
+		struct apple_dpin_ctx *c = &acio->dpin[i];
+
+		guard(mutex)(&c->lock);
+		if (c->state.alive && c->state.paused && c->state.deferred_first)
+			waiting |= BIT(i);
+	}
+	if (waiting)
+		dev_info(acio->dev, "T6050 sleep: %u tunnelled display(s) offered during the sleep's entry waited (DP IN %#x): handed to the display side now\n",
+			 hweight32(waiting), waiting);
+	apple_dpin_resume_retries(acio);
+}
+
+/*
+ * The start of a T6050 firmware sleep's entry on this port. Returns 0, or the error that
+ * refuses the sleep with *@paused telling whether the admission was closed.
+ */
+static int apple_cio_sleep_dp_entry(struct apple_cio *acio, bool *paused)
+{
+	int ret;
+
+	*paused = false;
+	guard(mutex)(&acio->lock);
+	/* A restart owed from a sleep given up is this sleep's own from here. */
+	acio->sleep_dp_undo = false;
+	acio->sleep_dp_released = 0;
+	if (!READ_ONCE(t6050_sleep_dp_all_first) || !READ_ONCE(t6050_sleep_dp_first) ||
+	    !apple_cio_t6050_sleep(acio) ||
+	    acio->removing || acio->resume_recovery_failed || !acio->current_cable_info)
+		return 0;
+	if (!apple_cio_sleep_tears_down(acio)) {
+		if (!READ_ONCE(acio->sleep_in_place))
+			return 0;
+		/* Nothing released, so no restart is owed if this refuses: only the reopening. */
+		ret = apple_cio_sleep_close_admission(acio);
+		if (ret) {
+			*paused = acio->sleep_dp_paused;
+			acio->sleep_dp_paused = false;
+		}
+		return ret;
+	}
+	ret = apple_cio_sleep_release_displays(acio, true);
+	if (ret >= 0) {
+		acio->sleep_dp_released = ret;
+		return 0;
+	}
+	/* No PM_POST_SUSPEND comes to a notifier that refused: undone from here. */
+	*paused = acio->sleep_dp_paused;
+	acio->sleep_dp_paused = false;
+	acio->sleep_dp_undo = true;
+	return ret;
+}
+
+/* The end of a sleep, or of one given up after this port's entry step. */
+static bool apple_cio_sleep_dp_exit(struct apple_cio *acio, bool *paused)
+{
+	bool undo;
+
+	guard(mutex)(&acio->lock);
+	*paused = acio->sleep_dp_paused;
+	acio->sleep_dp_paused = false;
+	/* Powered off since: the restart the port's own notifier asks for brings them back. */
+	undo = acio->sleep_dp_released && acio->current_cable_info && !acio->removing;
+	acio->sleep_dp_released = 0;
+	acio->sleep_dp_undo = undo;
+	return undo;
+}
+
+/*
+ * Ahead of every other step of a T6050 firmware sleep's entry (the USB hosts' stops, the
+ * PCIe ports' parks, the ports' power-offs, all at the default priority): the displays
+ * behind this port are released and the DP IN admission closed. Refuses the sleep if the
+ * display side does not answer in time.
+ */
+static int apple_cio_dp_pm_notify(struct notifier_block *nb, unsigned long event,
+				  void *unused)
+{
+	struct apple_cio *acio = container_of(nb, struct apple_cio, pm_notifier_dp);
+	bool paused;
+	int ret;
+
+	switch (event) {
+	case PM_SUSPEND_PREPARE:
+		ret = apple_cio_sleep_dp_entry(acio, &paused);
+		if (!ret)
+			break;
+		if (paused)
+			apple_cio_sleep_dp_reopen(acio);
+		queue_work(system_dfl_wq, &acio->sleep_dp_undo_work);
+		return notifier_from_errno(ret);
+	case PM_POST_SUSPEND:
+		if (apple_cio_sleep_dp_exit(acio, &paused))
+			queue_work(system_dfl_wq, &acio->sleep_dp_undo_work);
+		else if (paused)
+			apple_cio_sleep_dp_reopen(acio);
 		break;
 	}
 	return NOTIFY_DONE;
@@ -3545,6 +4466,7 @@ static int apple_cio_probe(struct platform_device *pdev)
 	acio = devm_kzalloc(dev, sizeof(*acio), GFP_KERNEL);
 	if (!acio)
 		return -ENOMEM;
+	atomic_set(&acio->fw_lane_action, -1);
 	platform_set_drvdata(pdev, acio);
 
 	ret = devm_mutex_init(dev, &acio->lock);
@@ -3558,6 +4480,7 @@ static int apple_cio_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&acio->resume_link_work, apple_cio_resume_link_work);
 	INIT_DELAYED_WORK(&acio->link_lost_work, apple_cio_link_lost_work);
 	INIT_DELAYED_WORK(&acio->sleep_restart_work, apple_cio_sleep_restart_work);
+	INIT_WORK(&acio->sleep_dp_undo_work, apple_cio_sleep_dp_undo_work);
 	init_completion(&acio->nhi_boot_completion);
 	acio->dev = &pdev->dev;
 	acio->np = dev->of_node;
@@ -3717,6 +4640,7 @@ static int apple_cio_probe(struct platform_device *pdev)
 	else if (ret < 3)
 		return dev_err_probe(dev, -EINVAL, "Not enough PM domains\n");
 
+	acio->dpin_count = acio->hw->dpin_count ?: 2;
 	acio->connector_np = of_graph_get_remote_node(dev->of_node, 1, -1);
 	acio->dp_dual_stream = apple_dp_tunnel_dual_stream(acio->connector_np);
 	/* Register layout, root qualification and connector wiring are separate. */
@@ -3731,6 +4655,8 @@ static int apple_cio_probe(struct platform_device *pdev)
 			acio->dpin[i].idx = i;
 			INIT_WORK(&acio->dpin[i].work, apple_dpin_work_fn);
 			INIT_DELAYED_WORK(&acio->dpin[i].retry, apple_dpin_retry_fn);
+			INIT_DELAYED_WORK(&acio->dpin[i].poll, apple_dpin_poll_fn);
+			INIT_WORK(&acio->dpin[i].event_work, apple_dpin_event_fn);
 			ret = devm_mutex_init(dev, &acio->dpin[i].lock);
 			if (ret)
 				return ret;
@@ -3742,6 +4668,25 @@ static int apple_cio_probe(struct platform_device *pdev)
 		ret = devm_add_action_or_reset(dev, apple_cio_destroy_wq, acio);
 		if (ret)
 			return ret;
+		/* Freed before the queue: started and stopped with the mapping. */
+		for (unsigned int i = 0; i < acio->dpin_count && i < APPLE_DPIN_MAX; i++) {
+			struct apple_dpin_ctx *c = &acio->dpin[i];
+			char name[8];
+
+			snprintf(name, sizeof(name), "dpin%u", i);
+			c->irq = platform_get_irq_byname_optional(to_platform_device(dev), name);
+			if (c->irq <= 0)
+				continue;
+			ret = devm_request_threaded_irq(dev, c->irq, NULL,
+							apple_dpin_irq_thread,
+							IRQF_ONESHOT | IRQF_NO_AUTOEN,
+							devm_kasprintf(dev, GFP_KERNEL, "%s-%s",
+								       dev_name(dev), name),
+							c);
+			if (ret)
+				return dev_err_probe(dev, ret,
+						     "cannot request %s interrupt\n", name);
+		}
 	}
 
 	/* And finally register the OOB notification for Thunderbolt/USB4 cables */
@@ -3769,6 +4714,10 @@ static int apple_cio_probe(struct platform_device *pdev)
 
 	acio->pm_notifier.notifier_call = apple_cio_pm_notify;
 	register_pm_notifier(&acio->pm_notifier);
+	/* Before the notifiers of the default priority, after the port controllers' (30). */
+	acio->pm_notifier_dp.notifier_call = apple_cio_dp_pm_notify;
+	acio->pm_notifier_dp.priority = 20;
+	register_pm_notifier(&acio->pm_notifier_dp);
 	return 0;
 }
 
@@ -3781,7 +4730,9 @@ static void apple_cio_remove(struct platform_device *pdev)
 		acio->removing = true;
 
 	apple_pcie_tunnel_unregister_notifier(&acio->pcie_notifier);
+	unregister_pm_notifier(&acio->pm_notifier_dp);
 	unregister_pm_notifier(&acio->pm_notifier);
+	disable_work_sync(&acio->sleep_dp_undo_work);
 	disable_delayed_work_sync(&acio->sleep_restart_work);
 
 	disable_delayed_work_sync(&acio->resume_link_work);

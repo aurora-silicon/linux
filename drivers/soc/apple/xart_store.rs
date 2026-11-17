@@ -405,7 +405,7 @@ impl Store {
         };
         match saved {
             Ok(()) => {
-                pr_notice!(
+                pr_notice_ratelimited!(
                     "xART guard: allowed one rewrite of kind-{} record {} {}; its previous value is in {}\n",
                     key.kind,
                     crate::xart_guard::Id(&key.uuid),

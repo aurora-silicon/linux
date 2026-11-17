@@ -87,19 +87,39 @@
 
 #ifdef APPLE_USE_PMP
 /*
- * AVD and the JPEG codecs (one soc-device for both) also send the PMP a
- * performance request while they are powered, in request class 0x21 of
- * their SOC-DEV-DVFS entries: AVD level 2 (VMAX) at 0x112, JPEG level 1
- * (VNOM) at 0x114. The PMP then holds the SoC rail and fabric up for them.
+ * The video encoder, AVD, the JPEG codecs, the scaler and the ProRes codec
+ * also send the PMP a performance request while they are powered. The
+ * bootloader fills each entry's SOC-DEV-DVFS slot and levels from this
+ * machine's ADT (apple,adt-dvfs).
  */
+&pmp_report_venc_sys {
+	apple,adt-dvfs;
+	status = "okay";
+};
+
 &pmp_report_avd_sys {
-	apple,dvfs = <0x112 2>;
-	apple,dvfs-request-class = <0x21>;
+	apple,adt-dvfs;
 };
 
 &pmp_report_jpg {
-	apple,dvfs = <0x114 1>;
-	apple,dvfs-request-class = <0x21>;
+	apple,adt-dvfs;
+};
+
+&pmp_report_msr0 {
+	apple,adt-dvfs;
+	status = "okay";
+};
+
+&pmp_report_scodec {
+	apple,adt-dvfs;
+	status = "okay";
+};
+
+&ave {
+	power-domains = <&ps_venc_dma>, <&ps_venc_pipe4>,
+			<&ps_venc_pipe5>, <&ps_venc_me0>, <&ps_venc_me1>,
+			<&pmp_report_venc_sys>;
+	power-domain-names = "dma", "pipe4", "pipe5", "me0", "me1", "perf";
 };
 #endif
 
@@ -146,6 +166,24 @@
 	status = "okay";
 };
 
+/*
+ * The video encoder runs the firmware iBoot preloads. The bootloader hands
+ * it over at the start of the encoder's DART window and admits the
+ * preloaded code in the CPU DART's address filter; without that handoff
+ * the driver refuses the reservation and the encoder stays off.
+ */
+&ave_dart0 {
+	status = "okay";
+};
+
+&ave_dart1 {
+	status = "okay";
+};
+
+&ave {
+	status = "okay";
+};
+
 &apr0_dart {
 	status = "okay";
 };
@@ -153,6 +191,17 @@
 &apr0 {
 	status = "okay";
 };
+
+#ifdef APPLE_USE_PMP
+/* The scaler and the ProRes codec request their PMP performance level. */
+&scaler0 {
+	power-domains = <&pmp_report_msr0>, <&ps_msr0_ase_core>;
+};
+
+&apr0 {
+	power-domains = <&pmp_report_scodec>;
+};
+#endif
 
 /* Both JPEG encoders are SoC blocks with no board wiring. */
 &jpeg0_dart {

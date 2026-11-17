@@ -68,7 +68,8 @@ int machine_kexec_prepare(struct kimage *kimage)
 		return -EOPNOTSUPP;
 	}
 
-	if (kimage->type != KEXEC_TYPE_CRASH && cpus_are_stuck_in_kernel()) {
+	if (kimage->type != KEXEC_TYPE_CRASH &&
+	    (cpus_are_stuck_in_kernel() || spin_table_cpus_stuck())) {
 		pr_err("Can't kexec: CPUs are stuck in the kernel.\n");
 		return -EBUSY;
 	}

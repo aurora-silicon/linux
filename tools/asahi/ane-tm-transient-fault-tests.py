@@ -23,6 +23,28 @@ typedef int64_t ktime_t;
 #define THIS_MODULE 0
 #define TQ_NID1(qid) 0
 #define TQ_STATUS(qid) 1
+#define TQ_NID2(qid) 2
+#define TQ_HW_STATUS(qid) 3
+#define TQ_PENDING(qid) 4
+#define TQ_PRTY(qid) 5
+#define TM_TQ_EN 0x0c
+#define TM_STATUS 0x54
+#define TM_ABORT 0xf4
+#define BIT(n) (1U << (n))
+#define GENMASK(h, l) (((~0U) << (l)) & (~0U >> (31 - (h))))
+#define FIELD_PREP(mask, val) (((u32)(val) << __builtin_ctz(mask)) & (mask))
+#define FIELD_GET(mask, reg) (((reg) & (mask)) >> __builtin_ctz(mask))
+#define TM_ABORT_QUEUE GENMASK(2, 0)
+#define TM_ABORT_START BIT(4)
+#define TQ_HW_STATUS_IDLE BIT(0)
+#define TQ_PENDING_TDS GENMASK(15, 0)
+#define TQ_NID_VALID BIT(0)
+#define ANE_TM_ABORT_POLL_US 1000
+#define ANE_TM_ABORT_TIMEOUT_US 2000000
+#define ANE_TQ_COUNT 8
+#define ANE_PS_ALL_ON ((1U << (4 * 6)) - 1)
+#define dev_info(...) ((void)0)
+#define dev_dbg(...) ((void)0)
 #define lockdep_assert_held(x) ((void)0)
 #define wmb() ((void)0)
 #define rmb() ((void)0)
@@ -41,6 +63,8 @@ struct ane_device {
 	struct ane_dart_scratch scratch[ANE_DART_SCRATCH_MAX];
 	int scratch_pages;
 	bool tm_retention, wedge_final, recovery_probation;
+	unsigned int recovery_unproven;
+	void *ps;
 	const char *wedge_reason;
 };
 struct ane_request { int qid, nid; };
@@ -94,24 +118,38 @@ static void ane_dart_release_scratch(struct ane_device *ane, struct ane_dart_scr
 static int ane_tm_recover(struct ane_device *ane) { (void)ane; recoveries++; return -EIO; }
 static u32 tq_read32(struct ane_device *ane, int reg) { (void)ane; (void)reg; return 4 << 8; }
 static void tq_write32(struct ane_device *ane, int reg, u32 value) { (void)ane; (void)reg; (void)value; }
+static const int __attribute__((unused)) TQ_PRTY_TABLE[ANE_TQ_COUNT] = { 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x1e, 0x1f };
+static bool __attribute__((unused)) tm_abort = true;
+static int aborts;
+static __attribute__((unused)) u32 tm_read32(struct ane_device *ane, int reg) { (void)ane; (void)reg; return 0; }
+static __attribute__((unused)) void tm_write32(struct ane_device *ane, int reg, u32 value)
+{
+	(void)ane;
+	if (reg == TM_ABORT && (value & TM_ABORT_START))
+		aborts++;
+}
+static __attribute__((unused)) u32 ane_ps_act(struct ane_device *ane) { (void)ane; return ANE_PS_ALL_ON; }
 '''
 
 MAIN = r'''
-static int run_on(int which, struct ane_device *dev, bool retention, bool probation)
+#ifndef ANE_TM_RECOVERIES_MAX
+#define ANE_TM_RECOVERIES_MAX 3 /* older revisions have no such limit */
+#endif
+static int run_on(int which, struct ane_device *dev, bool retention, unsigned int unproven)
 {
 	struct ane_request req = {.qid = 4, .nid = 4};
 
 	*dev = (struct ane_device){0};
 	dev->tm_retention = retention;
-	dev->recovery_probation = probation;
+	dev->recovery_unproven = unproven;
 	scenario = which;
-	latch_reads = recoveries = drains = released_pages = uevents = 0;
+	latch_reads = recoveries = drains = released_pages = uevents = aborts = 0;
 	return ane_tm_execute(dev, &req);
 }
 
 static int run(int which, struct ane_device *dev)
 {
-	return run_on(which, dev, false, false);
+	return run_on(which, dev, false, 0);
 }
 
 #define CHECK(cond, ...) do { if (!(cond)) { fprintf(stderr, __VA_ARGS__); failures++; } } while (0)
@@ -155,25 +193,35 @@ int main(void)
 	      "scratch cap: rc=%d drains=%d recoveries=%d released=%d pages=%d\n",
 	      result, drains, recoveries, released_pages, dev.scratch_pages);
 
-	result = run_on(0, &dev, true, true);
-	CHECK(result == 0 && !dev.recovery_probation && !dev.wedge_final,
-	      "completion ends probation: rc=%d probation=%d final=%d\n",
-	      result, dev.recovery_probation, dev.wedge_final);
+	result = run_on(0, &dev, true, 2);
+	CHECK(result == 0 && !dev.recovery_unproven && !dev.wedge_final,
+	      "completion ends probation: rc=%d unproven=%u final=%d\n",
+	      result, dev.recovery_unproven, dev.wedge_final);
 
-	result = run_on(7, &dev, false, false);
-	CHECK(result == -ETIMEDOUT && recoveries == 1 && !dev.wedge_final && !uevents,
-	      "hang without retention: rc=%d recoveries=%d final=%d uevents=%d\n",
-	      result, recoveries, dev.wedge_final, uevents);
+	result = run_on(7, &dev, false, 0);
+	CHECK(result == -ETIMEDOUT && recoveries == 1 && !aborts && !dev.wedge_final && !uevents,
+	      "T8103 hang: rc=%d recoveries=%d aborts=%d final=%d uevents=%d\n",
+	      result, recoveries, aborts, dev.wedge_final, uevents);
 
-	result = run_on(7, &dev, true, false);
-	CHECK(result == -ETIMEDOUT && !recoveries && dev.wedge_final && dev.wedged &&
+	result = run_on(7, &dev, true, 0);
+	CHECK(result == -ETIMEDOUT && recoveries == 1 && aborts == 1 && !dev.wedge_final && !uevents,
+	      "T600x hang is aborted and recovered: rc=%d recoveries=%d aborts=%d final=%d uevents=%d\n",
+	      result, recoveries, aborts, dev.wedge_final, uevents);
+
+	result = run_on(7, &dev, true, ANE_TM_RECOVERIES_MAX - 1);
+	CHECK(result == -ETIMEDOUT && recoveries == 1 && !dev.wedge_final,
+	      "T600x hang, last recovery in a row: rc=%d recoveries=%d final=%d\n",
+	      result, recoveries, dev.wedge_final);
+
+	result = run_on(7, &dev, true, ANE_TM_RECOVERIES_MAX);
+	CHECK(result == -ETIMEDOUT && !recoveries && !aborts && dev.wedge_final && dev.wedged &&
 	      dev.wedge_reason && uevents == 1,
-	      "hang with a retained task manager: rc=%d recoveries=%d final=%d wedged=%d uevents=%d\n",
-	      result, recoveries, dev.wedge_final, dev.wedged, uevents);
+	      "T600x hangs after every recovery: rc=%d recoveries=%d aborts=%d final=%d wedged=%d uevents=%d\n",
+	      result, recoveries, aborts, dev.wedge_final, dev.wedged, uevents);
 
-	result = run_on(7, &dev, false, true);
+	result = run_on(7, &dev, false, 1);
 	CHECK(result == -ETIMEDOUT && !recoveries && dev.wedge_final && uevents == 1,
-	      "hang on the first job after a recovery: rc=%d recoveries=%d final=%d uevents=%d\n",
+	      "T8103 hang on the first job after a recovery: rc=%d recoveries=%d final=%d uevents=%d\n",
 	      result, recoveries, dev.wedge_final, uevents);
 
 	if (failures)
@@ -194,7 +242,9 @@ def helper(header):
     start = header.find('static inline bool ane_tm_failure_recoverable(')
     if start < 0:
         return ''
-    return header[start:header.index('\n}\n', start) + 3]
+    defines = ''.join(line + '\n' for line in header.splitlines()
+                      if line.startswith('#define ANE_TM_RECOVERIES_MAX'))
+    return defines + header[start:header.index('\n}\n', start) + 3]
 
 
 def build(text, header, work):

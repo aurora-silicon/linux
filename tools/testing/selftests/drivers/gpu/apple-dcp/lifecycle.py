@@ -28,6 +28,9 @@ def disconnect(root):
     held = [n for n in ('cd321x_mux_held', 'cd321x_mux_set', 'cd321x_mux_still_held',
                         'cd321x_retry_held_mux', 'cd321x_update_done')
             if re.search(r'^static \w+ ' + n + r'\(', (r / core).read_text(), re.M)]
+    # How a failed change is reported, separate so that KUnit can count it
+    reports = [n for n in ('cd321x_mux_failed', 'cd321x_mux_gave_up')
+               if re.search(r'^VISIBLE_IF_KUNIT \w+ ' + n + r'\(', (r / core).read_text(), re.M)]
     # Whether a partner identity has been received, when the update checks that
     late = [n for n in ('cd321x_identity_known',)
             if re.search(r'^static \w+ ' + n + r'\(', (r / core).read_text(), re.M)]
@@ -59,6 +62,7 @@ def disconnect(root):
         (dcp, 'dcp_external_link_locked'),
         (dcp, 'dcp_dptx_connect_oob'),
         (core, 'cd321x_retry_revalidation'),
+        *((core, n) for n in reports),
         *((core, n) for n in held),
         *((core, n) for n in ('cd321x_uses_dp_sid', 'cd321x_dp_hpd',
                               'cd321x_dp_sid_replay', 'cd321x_dp_release_first')),
@@ -131,6 +135,7 @@ struct apple_dcp {
  struct delayed_work typec_reconnect_wq, placeholder_edid_wq;
  struct work_struct external_stop_work;
  bool external_running, external_stopped, external_power_attempted;
+ unsigned int afk_power_gen;
  bool external_stop_deferred; unsigned int external_stop_retries;
  struct delayed_work external_stop_retry_wq;
  bool external_cable, typec_cable_connected, typec_crtc_off, pipe_enabled_h17p;
@@ -143,6 +148,8 @@ struct apple_dcp {
  struct dcp_announce announce;
  /* T6030 external processors only; an H17P display is never one. */
  bool external_native; int external_retries; struct delayed_work external_retry_wq;
+ /* A display a J714s firmware 27 sleep released; never set here. */
+ bool sleep_v27_torn;
 };
 #define atomic_set(p, v) (*(p) = (v))
 struct platform_device { struct apple_dcp *data; };
@@ -204,6 +211,8 @@ struct tps6598x { void *partner, *dev, *port, *psy; int lock; u32 data_status; e
 struct cd321x { struct tps6598x tps; struct cd321x_status update_status;
  struct cd321x_pm_state pm; struct delayed_work update_work, resume_work;
  struct typec_mux_state state; bool state_valid, display_route_active, cur_partner_is_pd;
+ /* A wake's first port state, applied without the debounce until a retry clears it */
+ bool sleep_plug, wake_apply;
  bool dp_irq_hpd, dp_sink_reported,dp_sid_valid;
  u32 dp_status,dp_conf; void *port_altmode_dp;
  struct usb_pd_identity cur_partner_identity; void *connector_fwnode, *tbt_switch, *mux; };
@@ -216,6 +225,8 @@ struct cd321x { struct tps6598x tps; struct cd321x_status update_status;
 #define DP_STATUS_HPD_STATE (1U << 7)
 #endif
 struct typec_displayport_data { u32 status,conf; };
+#define VISIBLE_IF_KUNIT static
+#define KUNIT_STATIC_STUB_REDIRECT(...) ((void)0)
 /* No mux here declares its timeouts transient: every failure is budgeted. */
 static bool typec_mux_timeout_transient(void *m) { (void)m; return false; }
 #define dev_dbg(...) ((void)0)
@@ -282,6 +293,7 @@ static void init(void)
  display.typec_generation = 4;
  port.tps.partner = (void *)1; port.tps.role_sw = &role; role = USB_ROLE_HOST;
  port.pm.phase = CD321X_PM_RUNNING; port.state_valid = true; port.state.mode = 2;
+ port.wake_apply = true;
  port.display_route_active = true; port.connector_fwnode = (void *)1;
  settle_error = power_error = hpd_error = release_error = 0;
  tbt_error = role_error = safe_error = mode_error = 0;
@@ -305,7 +317,7 @@ int main(void)
   CHECK(display.external_error == -ETIMEDOUT);
   CHECK(display.dptxport[0].connected && display.pipe_enabled_h17p);
   CHECK(!display.external_stopped && !display.typec_crtc_off);
-  CHECK(port.display_route_active && !port.state_valid);
+  CHECK(port.display_route_active && !port.state_valid && !port.wake_apply);
   CHECK(port.pm.phase == CD321X_PM_REVALIDATE && port.pm.attempts_left == CD321X_RESUME_ATTEMPTS);
   CHECK(notices > 0 && releases == 0);
   callback(true); CHECK(!sink.connected);
@@ -730,6 +742,16 @@ int main(void)
                      '  assert(!"T8132 dcpext teardown in an H17P scenario"); return -ENODEV; }\n')
     if 'static unsigned long jiffies;' not in unit:
         firmware += '\nstatic unsigned long jiffies;\n'
+    if 'dcp_dptx_wait_linkcfg(' in raw:
+        # Only T6050 watches the tunnel: this H17P link waits as before.
+        firmware += ('#define DCP_LINKCFG_POLL_MS 50\n'
+                     '#ifndef min_t\n#define min_t(t, a, b) ((t)(a) < (t)(b) ? (t)(a) : (t)(b))\n#endif\n'
+                     '#ifndef max_t\n#define max_t(t, a, b) ((t)(a) > (t)(b) ? (t)(a) : (t)(b))\n#endif\n'
+                     '#ifndef msecs_to_jiffies\n#define msecs_to_jiffies(x) (x)\n#endif\n'
+                     'static bool dcp_watches_tunnel_withdrawal(void) { return false; }\n'
+                     'static bool dcp_tb_tunnel_withdrawn(struct apple_dcp *d, u32 port)\n'
+                     '{ (void)d; (void)port; assert(!"tunnel watch in an H17P scenario"); return false; }\n' +
+                     apple_function(root, 'dcp_dptx_wait_linkcfg'))
     # unless the update work already needed the clock
     clock = 'static unsigned jiffies_to_msecs(unsigned long t) { return t; }\n'
     if clock in unit:
@@ -792,6 +814,8 @@ static int dcp_external_stop_locked(struct apple_dcp *d, u64 generation)
 { (void)d; (void)generation; return 0; }
 static void dcp_external_crtc_released(struct apple_dcp *d) { (void)d; }
 static bool dcp_uses_soft_dpms(struct apple_dcp *d) { return d->soft_dpms; }
+/* The T8140 display power cycle has its own test on hardware; here it only has to be reached. */
+static void dcp_dpms_power_off(struct apple_dcp *d) { (void)d; }
 static bool __attribute__((unused)) dcp_has_panel(struct apple_dcp *d) { return !d->typec_output; }
 static void __attribute__((unused)) iomfb_blank_h17p(struct apple_dcp *d)
 { (void)d; assert(!"unexpected internal-panel blank in external-link test"); }
@@ -1068,6 +1092,13 @@ def teardown(root):
     for name in ('atcphy_mode_configuration', 'atcphy_hw', 'atcphy_dp_link_rate_configuration'):
         decls.append(block(files['atc'], files['atc'].index('struct ' + name + ' {')) + ';')
     decls.append(block(files['state'], files['state'].index('enum dwc3_apple_state {')) + ';')
+    # The glue's PM sleep epoch, for its syscore helper, role switch and the model struct.
+    phase = 'enum dwc3_apple_sleep_phase {'
+    decls.append(block(files['apple'], files['apple'].index(phase)) + ';' if phase in files['apple']
+                 else 'enum dwc3_apple_sleep_phase { DWC3_APPLE_SLEEP_IDLE, DWC3_APPLE_SLEEP_PREPARING };')
+    role = 'static inline enum dwc3_apple_state dwc3_apple_state_for_role('
+    if role in files['state']:
+        decls.append(block(files['state'], files['state'].index(role)))
     start = files['atc'].index('static const struct {\n\tconst struct atcphy_mode_configuration normal;')
     end = files['atc'].index('\n};', start) + 3
     decls.append(files['atc'][start:end])
@@ -1087,13 +1118,13 @@ def teardown(root):
                 'atcphy_park_pipehandler',
                 'atcphy_get_mode_config', 'atcphy_dp_configure',
                 'j700_field_update', 'j700_aux_disable', 'atcphy_disable_dp_aux',
-                'atcphy_power_off', 'atcphy_power_on', *ATC_POST_TUNABLE, 'atcphy_configure', 'atcphy_restore_after_pd_off',
+                'atcphy_power_off', 'atcphy_power_on', *ATC_POST_TUNABLE, 'atcphy_configure', 'atcphy_forget_common_state', 'atcphy_restore_after_pd_off',
                 'atcphy_usb2_init', 'atcphy_usb3_power_off',
                 'atcphy_usb3_route', 'atcphy_usb3_set_mode', 'atcphy_usb2_power_off',
                 '_atcphy_dwc3_reset_assert', 'atcphy_dwc3_reset_assert', 'atcphy_mux_set'),
         'phy': ('phy_init', 'phy_exit', 'phy_reset', 'phy_power_on', 'phy_power_off'),
         'core': ('dwc3_phy_power_on', 'dwc3_phy_power_off', 'dwc3_phy_exit', 'dwc3_core_exit'),
-        'apple': ('dwc3_apple_host_before_core_init', 'dwc3_apple_core_stop', 'dwc3_apple_core_init', 'dwc3_apple_core_start',
+        'apple': ('dwc3_apple_syscore', 'dwc3_apple_host_before_core_init', 'dwc3_apple_core_stop', 'dwc3_apple_core_init', 'dwc3_apple_core_start',
                   'dwc3_apple_init', 'dwc3_apple_exit', 'dwc3_usb_role_switch_set'),
     }
     names['core'] = ('dwc3_phy_power_on', 'dwc3_phy_power_off', 'dwc3_phy_exit',
@@ -1195,6 +1226,7 @@ struct apple_dcp_hw_data {
     int iomfb_method_profile,firmware_compat;
     const struct resource *firmware_clock;
     u32 firmware_display_windows,firmware_scratch,firmware_request;
+    bool s2r,s2r_ext;
 };
 struct apple_dcp {
     struct device *dev; struct apple_dcp_hw_data hw;
@@ -1763,9 +1795,10 @@ struct apple_connector { bool connected; };
 /* The native T6030 14.7 backend is never selected in these scenarios. */
 enum dcp_firmware_version { DCP_FIRMWARE_UNKNOWN, DCP_FIRMWARE_V_12_3, DCP_FIRMWARE_V_13_5,
     DCP_FIRMWARE_V_14_7, DCP_FIRMWARE_V_14_7_TEMPLATE, DCP_FIRMWARE_V_26_6,
-    DCP_FIRMWARE_V_26_6_DESKTOP };
+    DCP_FIRMWARE_V_26_6_DESKTOP, DCP_FIRMWARE_V_27_0 };
 struct apple_dcp {
-    bool crashed, external, external_native, quiescing, main_display;
+    bool crashed, external, external_native, quiescing, main_display, panel;
+    int peer_check; /* what the firmware 27 paired-timing check answers */
     unsigned int nr_typec_routes;
     enum dcp_firmware_version fw_compat;
     struct { int iomfb_method_profile; } hw;
@@ -1805,6 +1838,12 @@ static int dcp_crtc_check_hdr(struct apple_dcp *d, struct drm_crtc *c,
 static bool dcp_vrr_live(struct apple_dcp *d)
 { return d->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && d->main_display; }
 static bool iomfb_is_m4(struct apple_dcp *d) { (void)d; return false; }
+static bool dcp_has_panel(struct apple_dcp *d) { return d->panel; }
+/* The firmware 27 paired-timing check (dcp-peer-runtime-v27.inc) runs on firmware 27 only. */
+static unsigned int peer_checks;
+static int dcp_peer_check_v27(struct apple_dcp *d, struct drm_atomic_commit *s,
+    struct drm_crtc_state *c)
+{ (void)s; (void)c; assert(d->fw_compat == DCP_FIRMWARE_V_27_0); peer_checks++; return d->peer_check; }
 static int iomfb_m4_error(struct apple_dcp *d) { (void)d; assert(false); return -ENODEV; }
 static int iomfb_m4_get_mode(struct apple_dcp *d,struct drm_display_mode *m)
 { (void)d; (void)m; assert(false); return -ENODEV; }
@@ -1854,8 +1893,9 @@ int main(void)
         cases++;
     }
     /* No other firmware turns a VRR change into a mode set. */
-    assert(!old_state_lookups && !state.crtc.mode_changed);
-DESKTOP_VRR    dcp.crashed = true;
+    assert(!old_state_lookups && !state.crtc.mode_changed && !peer_checks);
+DESKTOP_VRR
+FW27_VRR    dcp.crashed = true;
     state.crtc.vrr_enabled = false;
     assert(dcp_crtc_atomic_check(&crtc, &state) == -EINVAL);
     printf("PASS: %u production atomic VRR admission cases and crashed-device rejection\n", cases);
@@ -1894,7 +1934,45 @@ DESKTOP_VRR    dcp.crashed = true;
     dcp.main_display = false;
     dcp.fw_compat = DCP_FIRMWARE_UNKNOWN;
 """
-    return prefix + check + suffix.replace('DESKTOP_VRR', desktop, 1)
+    # Firmware 27: its externals change adaptive sync with a full mode set, as
+    # macOS switches between a timing's fixed and variable modes; the panel
+    # does not. A paired timing the pair cannot take fails the check.
+    fw27 = r"""    dcp.fw_compat = DCP_FIRMWARE_V_27_0;
+    dcp.hw.iomfb_method_profile = 0;
+    dcp.mode_state.valid = true;
+    dcp.connector = &connector;
+    connector.connected = true;
+    state.crtc.modeset = false;
+    for (unsigned int panel = 0; panel < 2; panel++)
+    for (unsigned int enable = 0; enable < 2; enable++)
+    for (unsigned int old_vrr = 0; old_vrr < 3; old_vrr++)
+    for (unsigned int vrr = 0; vrr < 2; vrr++)
+    for (unsigned int refuse = 0; refuse < 2; refuse++) {
+        dcp.main_display = panel;
+        dcp.panel = panel;
+        dcp.peer_check = refuse ? -EINVAL : 0;
+        state.crtc.enable = enable;
+        state.crtc.vrr_enabled = vrr;
+        state.crtc.mode_changed = false;
+        state.no_old_crtc = old_vrr == 2;
+        state.old_crtc.vrr_enabled = old_vrr == 1;
+        unsigned int checks = peer_checks;
+        int actual = dcp_crtc_atomic_check(&crtc, &state);
+        bool expected = !panel && enable && old_vrr != 2 && (old_vrr == 1) != vrr;
+        if (actual != (refuse ? -EINVAL : 0) || peer_checks != checks + 1 ||
+            state.crtc.mode_changed != expected) {
+            fprintf(stderr, "fw27 panel=%u enable=%u old_vrr=%u vrr=%u refuse=%u: got %d mode_changed=%d expected %d\n",
+                    panel, enable, old_vrr, vrr, refuse, actual, state.crtc.mode_changed, expected);
+            return 1;
+        }
+        cases++;
+    }
+    dcp.main_display = false;
+    dcp.panel = false;
+    dcp.peer_check = 0;
+    dcp.fw_compat = DCP_FIRMWARE_UNKNOWN;
+"""
+    return prefix + check + suffix.replace('DESKTOP_VRR', desktop, 1).replace('FW27_VRR', fw27, 1)
 
 
 def power_reply(root):

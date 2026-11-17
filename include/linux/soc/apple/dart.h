@@ -8,6 +8,7 @@
 #include <linux/types.h>
 
 struct device;
+struct device_node;
 
 /* Retained internal-display ownership is qualified only with a built-in
  * DART provider. Other consumers, including modular DART, keep the APIs below.
@@ -155,6 +156,14 @@ int apple_dart_restore_tunnel_state(struct device *dev);
 int apple_dart_radio_check_idle(struct device *dev);
 /* A firmware-owned buffer's address for a host copy; Linux's own mappings refused. */
 int apple_dart_fw_remote(struct device *dev, dma_addr_t iova, bool write, phys_addr_t *phys);
+/*
+ * A DART clocked by its host's port: after a real sleep it stays gated until the host has
+ * set the port up and calls apple_dart_host_resume().
+ */
+int apple_dart_set_host_resumes(struct device *dev);
+int apple_dart_host_resume(struct device *dev);
+/* The same after a sleep entry that stopped its streams: always the whole reset and restore. */
+int apple_dart_host_restart(struct device *dev);
 #else
 static inline int apple_dart_quiesce_commands(struct device *dev) { return 0; }
 static inline int apple_dart_resume_commands(struct device *dev) { return 0; }
@@ -166,6 +175,93 @@ static inline int apple_dart_fw_remote(struct device *dev, dma_addr_t iova, bool
 {
 	return -EOPNOTSUPP;
 }
+static inline int apple_dart_set_host_resumes(struct device *dev) { return -EOPNOTSUPP; }
+static inline int apple_dart_host_resume(struct device *dev) { return -EOPNOTSUPP; }
+static inline int apple_dart_host_restart(struct device *dev) { return -EOPNOTSUPP; }
+#endif
+
+/* For a consumer whose firmware gates itself around a firmware-driven suspend. */
+#if IS_REACHABLE(CONFIG_APPLE_DART)
+bool apple_dart_sleep_listed(struct device *dev);
+int apple_dart_sleep_prepare(struct device *dev);
+void apple_dart_sleep_restore(struct device *dev);
+/* A display DART's streams around a display power cycle, see the DART driver. */
+int apple_dart_display_streams(struct device *dev, u32 streams, bool on, bool flush);
+/* A GAPF slice released before its coprocessor's CPU domain comes up after a wake. */
+int apple_dart_gapf_ready(struct device *dev);
+/* A display DART whose domain goes off at runtime while others still map into it. */
+void apple_dart_power_dark(struct device *dev, bool dark);
+/* A DART's state kept across its consumer's own power cycle, outside a system sleep. */
+int apple_dart_m5_restore(struct device *dev, struct device *owner);
+/* T6050: a display coprocessor's DART around its restart, the display pipe's around its domain's. */
+int apple_dart_m5_display_cycle(struct device *dev, bool on);
+int apple_dart_m5_display_snapshot(struct device *dev);
+int apple_dart_m5_display_rewrite(struct device *dev);
+int apple_dart_state_save(struct device *dev);
+int apple_dart_state_restore(struct device *dev);
+void apple_dart_sleep_restore_lost(struct device *dev, bool lost);
+#else
+static inline bool apple_dart_sleep_listed(struct device *dev)
+{
+	return false;
+}
+
+static inline int apple_dart_sleep_prepare(struct device *dev)
+{
+	return -ENODEV;
+}
+
+static inline void apple_dart_sleep_restore(struct device *dev)
+{
+}
+
+static inline int apple_dart_display_streams(struct device *dev, u32 streams, bool on,
+					     bool flush)
+{
+	return -ENODEV;
+}
+
+static inline int apple_dart_gapf_ready(struct device *dev)
+{
+	return 0;
+}
+
+static inline void apple_dart_power_dark(struct device *dev, bool dark)
+{
+}
+
+static inline int apple_dart_m5_restore(struct device *dev, struct device *owner)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int apple_dart_m5_display_cycle(struct device *dev, bool on) { return -EOPNOTSUPP; }
+static inline int apple_dart_m5_display_snapshot(struct device *dev) { return -EOPNOTSUPP; }
+static inline int apple_dart_m5_display_rewrite(struct device *dev) { return -EOPNOTSUPP; }
+
+static inline int apple_dart_state_save(struct device *dev)
+{
+	return -ENODEV;
+}
+
+static inline int apple_dart_state_restore(struct device *dev)
+{
+	return -ENODEV;
+}
+
+static inline void apple_dart_sleep_restore_lost(struct device *dev, bool lost)
+{
+}
+#endif
+
+/*
+ * A DART marked apple,manual-availability answers only once its client (a
+ * PCIe root complex) is up. The client makes it available, and it probes then.
+ */
+#if IS_ENABLED(CONFIG_APPLE_DART)
+void apple_dart_make_available(struct device_node *np);
+#else
+static inline void apple_dart_make_available(struct device_node *np) { }
 #endif
 
 #endif

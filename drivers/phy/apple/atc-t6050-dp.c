@@ -17,9 +17,12 @@
 #include "usb-t6050/apple_t6050_cio_phy.h"
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <linux/suspend.h>
 #include <linux/soc/apple/tunable.h>
 #include <linux/soc/apple/rtkit.h>
+#include <linux/phy/apple-atc.h>
 #include <linux/soc/apple/dp-tunnel.h>
+#include <linux/soc/apple/sleep.h>
 #include <linux/usb/typec.h>
 #include <linux/usb/typec_mux.h>
 #include <linux/usb/typec_dp.h>
@@ -71,6 +74,27 @@ struct atc_domain {
 	bool active;
 };
 enum combo_mode { COMBO_SAFE, COMBO_USB, COMBO_DP4, COMBO_DP2, COMBO_CIO };
+
+/*
+ * USB4 DisplayPort tunnel pixel clocks, k = 1..4. Each has a clock gate, a
+ * source select word in the power manager's clock block (the DP link rate's
+ * source, then a busy bit to wait out), and a switch in the PHY's CFG block
+ * (bank 39): +0x14 holds a 3-bit field per clock (k = on, 7 = parked) and a
+ * UHBR bit 11 + k, +0x18 an enable bit per clock, +0x1c its status. Switch k
+ * feeds the display crossbar's pixel clock k.
+ */
+#define ATC_DP_TUNNELS		4
+#define ATC_CFG_DP_SWITCH	0x14
+#define ATC_CFG_DP_ENABLE	0x18
+#define ATC_CFG_DP_STATUS	0x1c
+#define ATC_DP_SWITCH_PARKED	7
+#define ATC_DP_SRC_SELECT	GENMASK(27, 24)
+#define ATC_DP_SRC_BUSY		BIT(30)
+
+/* The PHY CPU's control word, in bank 38, and its run bit */
+#define ATC_CPU_CONTROL		0x28
+#define ATC_CPU_RUN		BIT(4)
+
 struct t6050_dp {
 	bool combo, usb_prepared, usb2_active, pipe_active, controller_active, cio_prepared;
 	bool pipe_tunnel;	/* the active PIPE is a USB4 router's USB3 tunnel */
@@ -98,7 +122,29 @@ struct t6050_dp {
 	struct apple_rtkit *rtkit;
 	void __iomem *fw_data;
 	bool fw_running;
+	bool fw_cold;		/* idled for a system sleep and halted: its next start is a cold one */
 	void *fw_data_saved;	/* the firmware data SRAM as the first start found it */
+	/* USB4 DP tunnel pixel clocks: source words, gates, each one's link rate (0: off) */
+	void __iomem *dp_clk_src;
+	struct atc_domain dp_gate[ATC_DP_TUNNELS];
+	bool dp_gates;
+	u8 tunnel_rate[ATC_DP_TUNNELS];
+	/* A combo PHY's system sleep. */
+	u32 port;
+	struct notifier_block pm_nb;
+	enum combo_mode sleep_mode;	/* the mode the sleep's stop took down */
+	bool sleep_stopped;		/* stopped for a sleep that has not been accounted for yet */
+	bool aon_syscore;		/* the always-on domain is held out of this system transition */
+	bool aon_kept;			/* the stop left the always-on domain's reference in place */
+	/* A USB4 router's sleep in place: its host stops and restarts the port, see the end. */
+	bool cio_sleep;			/* asked for: the PHY's own stop for the sleep is skipped */
+	bool cio_sleep_off;		/* stopped by the router's host */
+	bool cio_sleep_hold;		/* the domains' references are left alone while it runs */
+	bool cio_tunnel_lost;		/* the router woke without its dock: no USB3 tunnel PIPE */
+	/* TEST (J714s): the USB host kept on the tunnel's PIPE through the router's sleep. */
+	bool cio_usb_host;		/* a router host that sleeps in place is bound to this PHY */
+	bool cio_usb_kept;		/* kept for this sleep, until its USB controller's RESULT */
+	bool cio_usb_parked;		/* its PIPE parked behind the router's sleep or refusal */
 };
 
 static int atc_domain_set(struct atc_domain *pd, bool active)
@@ -185,6 +231,14 @@ static int atc_firmware(struct t6050_dp *dp, bool start)
 	if (dp->fw_running == start)
 		return 0;
 	if (start) {
+		/* After a sleep's idle the CPU was halted: RTKit starts over, receiving on again. */
+		if (dp->fw_cold) {
+			ret = apple_rtkit_reinit(dp->rtkit);
+			if (ret)
+				goto out;
+			apple_rtkit_set_recv_enabled(dp->rtkit, true);
+			dp->fw_cold = false;
+		}
 		/*
 		 * The firmware is the boot loader's, preloaded with its data segment, and keeps
 		 * its state there: restarted on the state its last run left, it never finishes
@@ -200,18 +254,32 @@ static int atc_firmware(struct t6050_dp *dp, bool start)
 			memcpy_toio(dp->fw_data, dp->fw_data_saved, 0x10000);
 		}
 		/* Native coprocessor run, after its +0x40 firmware enable. */
-		writel(BIT(4), dp->banks[38] + 0x28);
+		writel(ATC_CPU_RUN, dp->banks[38] + ATC_CPU_CONTROL);
 		ret = apple_rtkit_wake(dp->rtkit);
 		if (!ret)
 			ret = apple_rtkit_start_ep(dp->rtkit, 0x20);
+	} else if (pm_suspend_target_state != PM_SUSPEND_ON && pm_suspend_via_firmware()) {
+		/*
+		 * A system sleep: the PHY CPU idled, with no power-down message: AP IDLE and its
+		 * echo, IOP IDLE and its ack, receiving off, then the CPU's run bit off as at a
+		 * shutdown. The next start is cold (above).
+		 */
+		ret = apple_rtkit_idle(dp->rtkit);
+		if (!ret) {
+			apple_rtkit_set_recv_enabled(dp->rtkit, false);
+			writel((u32)~ATC_CPU_RUN, dp->banks[38] + ATC_CPU_CONTROL);
+			dp->fw_cold = true;
+			dev_dbg(dp->dev, "PHY firmware idled for a system sleep\n");
+		}
 	} else {
-		/* CIO80PhyMBI::sendPowerDown, then the RTBuddy power transition. */
+		/* The PHY mailbox Power Down message, then the RTKit power transition. */
 		ret = apple_rtkit_send_message(dp->rtkit, 0x20, BIT_ULL(56), NULL, false);
 		if (!ret)
 			ret = apple_rtkit_shutdown(dp->rtkit);
 		if (!ret)
-			writel((u32)~BIT(4), dp->banks[38] + 0x28);
+			writel((u32)~ATC_CPU_RUN, dp->banks[38] + ATC_CPU_CONTROL);
 	}
+out:
 	if (ret)
 		dev_err(dp->dev, "PHY firmware %s failed: %d\n", start ? "start" : "stop", ret);
 	else
@@ -413,6 +481,152 @@ static void atc_drive(struct t6050_dp *dp, unsigned int lane, u32 preset)
 	atc_mask(base + (tx ? 0x100 : 0xa8), 0x7ffff, eq);
 }
 
+static u32 atc_dp_switch_mask(unsigned int k)
+{
+	return GENMASK(3 * k - 1, 3 * k - 3) | BIT(11 + k);
+}
+
+/* Enable (and status) bits 1, 8, 15 and 22 */
+static u32 atc_dp_enable_bit(unsigned int k)
+{
+	return BIT(7 * k - 6);
+}
+
+/* The power manager's source code for a DP link rate */
+static int atc_dp_source(u8 rate)
+{
+	switch (rate) {
+	case 0x06: return 10;	/* RBR */
+	case 0x0a: return 9;	/* HBR */
+	case 0x14: return 8;	/* HBR2 */
+	case 0x1e: return 7;	/* HBR3 */
+	case 0x81: return 6;	/* UHBR10 */
+	case 0x82: return 5;	/* UHBR20 */
+	default: return -EINVAL;
+	}
+}
+
+/*
+ * Set switch @k as tunnel clock @k's rate has it: field k (and the UHBR bit
+ * for a 128b/132b rate) with its enable bit for a clock with a rate, field 7
+ * (parked) with its enable bit clear for one without. The switch is written
+ * before the enable, then the status read back for the enable bit.
+ */
+static int atc_dp_tunnel_switch(struct t6050_dp *dp, unsigned int k, u32 *status)
+{
+	void __iomem *cfg = dp->banks[39];
+	u8 rate = dp->tunnel_rate[k - 1];
+	u32 en = atc_dp_enable_bit(k);
+	u32 sw = readl(cfg + ATC_CFG_DP_SWITCH) & ~atc_dp_switch_mask(k);
+	u32 on = readl(cfg + ATC_CFG_DP_ENABLE) & ~en;
+	u32 v;
+	int ret;
+
+	if (rate) {
+		sw |= k << (3 * k - 3);
+		if (rate == 0x81 || rate == 0x82)
+			sw |= BIT(11 + k);
+		on |= en;
+	} else {
+		sw |= ATC_DP_SWITCH_PARKED << (3 * k - 3);
+	}
+	writel(sw, cfg + ATC_CFG_DP_SWITCH);
+	writel(on, cfg + ATC_CFG_DP_ENABLE);
+	ret = readl_poll_timeout(cfg + ATC_CFG_DP_STATUS, v, !(v & en) == !rate, 10, 10000);
+	if (status)
+		*status = v;
+	return ret;
+}
+
+/*
+ * Bring tunnel clock @k to its rate: for a clock with one, its gate on, then
+ * the power manager's source for the rate (its busy bit waited out), then its
+ * switch; for a clock without one, its switch parked, then its gate off.
+ */
+static int atc_dp_tunnel_apply(struct t6050_dp *dp, unsigned int k, u32 *status)
+{
+	unsigned int i = k - 1;
+	u8 rate = dp->tunnel_rate[i];
+	void __iomem *word;
+	int ret, src;
+	u32 v;
+
+	if (!rate) {
+		if (atc_dp_tunnel_switch(dp, k, &v))
+			dev_warn(dp->dev, "DP tunnel clock %u: switch status %08x still on\n",
+				 k, v);
+		/* A failed start or gate suspend can leave a held domain at rate zero. */
+		return dp->dp_gates ? atc_domain_set(&dp->dp_gate[i], false) : 0;
+	}
+	if (dp->dp_gates) {
+		ret = atc_domain_set(&dp->dp_gate[i], true);
+		if (ret)
+			return ret;
+	}
+	src = atc_dp_source(rate);
+	word = dp->dp_clk_src + 4 * i;
+	writel((readl(word) & ~ATC_DP_SRC_SELECT) | FIELD_PREP(ATC_DP_SRC_SELECT, src), word);
+	ret = readl_poll_timeout(word, v, !(v & ATC_DP_SRC_BUSY), 10, 200000);
+	if (ret) {
+		dev_err(dp->dev, "DP tunnel clock %u: source %d not taken (%08x)\n", k, src, v);
+		return ret;
+	}
+	ret = atc_dp_tunnel_switch(dp, k, &v);
+	if (ret)
+		dev_err(dp->dev, "DP tunnel clock %u: switch status %08x not on\n", k, v);
+	if (status)
+		*status = v;
+	return ret;
+}
+
+/*
+ * Apply every tunnel clock in clock order after one has changed: each clock
+ * with a rate keeps it, its source and switch written again as they are,
+ * and each clock without one stays parked and gated. A clock is therefore
+ * only ever started from off at its own user's rate, and only stopped to off;
+ * a clock no display uses never runs. Returns @clock's result.
+ */
+static int atc_dp_tunnels_apply(struct t6050_dp *dp, unsigned int clock, u32 *status)
+{
+	int ret = 0;
+
+	for (unsigned int k = 1; k <= ATC_DP_TUNNELS; k++) {
+		int err = atc_dp_tunnel_apply(dp, k, k == clock ? status : NULL);
+
+		if (k == clock)
+			ret = err;
+	}
+	return ret;
+}
+
+/*
+ * Park every tunnel clock (field 7, enable off), once the PHY is in USB4
+ * mode: an unparked switch selects the native DP clock for its crossbar pixel
+ * clock. No clock has a rate yet.
+ */
+static void atc_dp_tunnels_park(struct t6050_dp *dp)
+{
+	atc_dp_tunnels_apply(dp, 0, NULL);
+}
+
+/*
+ * Stop every tunnel clock, before the PHY leaves USB4 mode. The switches are
+ * written only while a clock runs, which it does only in USB4 mode.
+ */
+static void atc_dp_tunnels_stop(struct t6050_dp *dp)
+{
+	bool running = memchr_inv(dp->tunnel_rate, 0, sizeof(dp->tunnel_rate));
+
+	memset(dp->tunnel_rate, 0, sizeof(dp->tunnel_rate));
+	if (running) {
+		atc_dp_tunnels_apply(dp, 0, NULL);
+		return;
+	}
+	/* A failed start or gate suspend can leave a held domain at rate zero. */
+	for (unsigned int k = 1; dp->dp_gates && k <= ATC_DP_TUNNELS; k++)
+		atc_domain_set(&dp->dp_gate[k - 1], false);
+}
+
 #include "atc-t6050-combo.h"
 
 static int t6050_dp_set_mode(struct phy *phy, enum phy_mode mode, int submode)
@@ -519,6 +733,78 @@ int apple_dp_phy_link_config(struct phy *phy, unsigned int *pclk, bool *uhbr)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(apple_dp_phy_link_config);
+
+/*
+ * A tunnel clock has one rate while its display uses it, the one its link
+ * was set up at, and none otherwise. It starts from off at that rate when the
+ * link is set up and stops to off when the link goes; a clock that runs is
+ * never given another rate in place. Every change applies all four clocks in
+ * order (atc_dp_tunnels_apply()).
+ */
+int apple_t6050_dp_tunnel_clock(struct phy *phy, unsigned int clock, u8 rate)
+{
+	struct t6050_dp *dp;
+	unsigned int i = clock - 1;
+	int src = 0, ret;
+	u32 v = 0;
+
+	if (!phy || phy->ops != &t6050_dp_ops)
+		return -EOPNOTSUPP;
+	if (clock < 1 || clock > ATC_DP_TUNNELS)
+		return -EINVAL;
+	if (rate) {
+		src = atc_dp_source(rate);
+		if (src < 0)
+			return src;
+	}
+	dp = phy_get_drvdata(phy);
+	guard(mutex)(&dp->lock);
+	if (!dp->combo || !dp->dp_clk_src)
+		return -EOPNOTSUPP;
+	if (dp->tunnel_rate[i] == rate) {
+		/* A failed start or gate suspend can leave a held domain at rate zero. */
+		if (!rate && dp->dp_gates)
+			return atc_domain_set(&dp->dp_gate[i], false);
+		return 0;
+	}
+	/*
+	 * Stop a running clock to off: its switch parked and its gate off. One
+	 * whose user now asks for another rate is stopped the same way and then
+	 * started again from off below.
+	 */
+	if (dp->tunnel_rate[i]) {
+		u8 old = dp->tunnel_rate[i];
+
+		dp->tunnel_rate[i] = 0;
+		ret = atc_dp_tunnels_apply(dp, clock, NULL);
+		if (!rate) {
+			if (!ret)
+				dev_info(dp->dev, "DP tunnel clock %u stopped\n", clock);
+			return ret;
+		}
+		if (ret)
+			dev_warn(dp->dev, "DP tunnel clock %u: gate not released: %d\n",
+				 clock, ret);
+		dev_info(dp->dev, "DP tunnel clock %u: link rate 0x%02x to 0x%02x, restarting from off\n",
+			 clock, old, rate);
+	}
+	if (dp->faulted)
+		return -EIO;
+	if (dp->combo_mode != COMBO_CIO)
+		return -ENOLINK;
+	dp->tunnel_rate[i] = rate;
+	ret = atc_dp_tunnels_apply(dp, clock, &v);
+	if (ret) {
+		/* Undo the partial start: the clock is left without a rate, for a retry. */
+		dp->tunnel_rate[i] = 0;
+		atc_dp_tunnel_apply(dp, clock, NULL);
+		return ret;
+	}
+	dev_info(dp->dev, "DP tunnel clock %u: link rate 0x%02x, source %d, switch status %08x\n",
+		 clock, rate, src, v);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_t6050_dp_tunnel_clock);
 
 /* The connector sets orientation before changing the alternate-mode mux. */
 static int t6050_set_orientation(struct t6050_dp *dp,
@@ -633,7 +919,7 @@ static int t6050_dp_probe(struct platform_device *pdev)
 	struct phy *phy;
 	struct resource *core;
 	void __iomem *base;
-	int ndomains, ret;
+	int ndomains, gates, ret;
 
 	dp = devm_kzalloc(dev, sizeof(*dp), GFP_KERNEL);
 	if (!dp)
@@ -642,12 +928,13 @@ static int t6050_dp_probe(struct platform_device *pdev)
 	dp->combo = of_device_is_compatible(dev->of_node, "apple,t6050-combo-phy");
 	if (dp->combo) {
 		u32 port;
-		/* Every Type-C port but 0, the debug port that carries the boot link. */
+		/* Only ports explicitly handed over by the boot producer. */
 		if (of_property_read_u32(dev->of_node, "apple,port-index", &port) ||
-		    port < 1 || port > 5 ||
+		    port > 5 ||
 		    !of_property_present(dev->of_node, "apple,guest-port-reserved") ||
 		    !of_property_present(dev->of_node, "mode-switch"))
 			return -EINVAL;
+		dp->port = port;
 	}
 	dp->typec = of_property_present(dev->of_node, "mode-switch");
 	dp->rate = -1;
@@ -769,6 +1056,14 @@ static int t6050_dp_probe(struct platform_device *pdev)
 	 * are in (combo_start()).
 	 */
 	ndomains = of_count_phandle_with_args(dev->of_node, "power-domains", "#power-domain-cells");
+	/* A combo's tunnel clock gates, "dp0".."dp3", follow its own domains. */
+	gates = dp->combo ?
+		of_property_match_string(dev->of_node, "power-domain-names", "dp0") : -EINVAL;
+	if (gates > 0) {
+		if (ndomains != gates + ATC_DP_TUNNELS)
+			return -EINVAL;
+		ndomains = gates;
+	}
 	if (ndomains != 3 && !(dp->combo && ndomains == 4))
 		return -EINVAL;
 	dp->ndomains = ndomains;
@@ -780,6 +1075,32 @@ static int t6050_dp_probe(struct platform_device *pdev)
 		ret = devm_add_action_or_reset(dev, atc_domain_release, &dp->domain[i]);
 		if (ret)
 			return ret;
+	}
+	for (unsigned int i = 0; gates > 0 && i < ATC_DP_TUNNELS; i++) {
+		char name[4];
+
+		snprintf(name, sizeof(name), "dp%u", i);
+		dp->dp_gate[i].dev = dev_pm_domain_attach_by_name(dev, name);
+		if (IS_ERR_OR_NULL(dp->dp_gate[i].dev)) {
+			ret = dp->dp_gate[i].dev ? PTR_ERR(dp->dp_gate[i].dev) : -ENODEV;
+			return dev_err_probe(dev, ret, "cannot attach %s domain\n", name);
+		}
+		ret = devm_add_action_or_reset(dev, atc_domain_release, &dp->dp_gate[i]);
+		if (ret)
+			return ret;
+		dp->dp_gates = true;
+	}
+	if (dp->combo) {
+		struct resource *res = platform_get_resource_byname(pdev, IORESOURCE_MEM,
+								   "dp-clock-source");
+
+		if (res) {
+			if (resource_size(res) < 4 * ATC_DP_TUNNELS)
+				return -EINVAL;
+			dp->dp_clk_src = devm_ioremap_resource(dev, res);
+			if (IS_ERR(dp->dp_clk_src))
+				return PTR_ERR(dp->dp_clk_src);
+		}
 	}
 	if (dp->typec) {
 		dp->fw_data = devm_platform_ioremap_resource_byname(pdev, "firmware-data");
@@ -810,9 +1131,255 @@ static void t6050_dp_shutdown(struct platform_device *pdev)
 	struct t6050_dp *dp = platform_get_drvdata(pdev);
 
 	guard(mutex)(&dp->lock);
-	if (dp->combo ? combo_stop(dp) : atc_stop(dp))
+	if (dp->combo ? combo_stop(dp, false) : atc_stop(dp))
 		dev_warn(dp->dev, "PHY shutdown incomplete after an earlier error\n");
 }
+
+static int t6050_dp_suspend_late(struct device *dev)
+{
+	struct t6050_dp *dp = dev_get_drvdata(dev);
+
+	if (!dp->combo || !pm_suspend_via_firmware())
+		return 0;
+	/* A router sleeping in place still uses the link: its host stops the PHY after it. */
+	scoped_guard(mutex, &dp->lock) {
+		if (dp->cio_sleep) {
+			dp->sleep_stopped = false;
+			dp->sleep_mode = dp->combo_mode;
+			return 0;
+		}
+	}
+	return combo_suspend_late(dp);
+}
+
+static int t6050_dp_resume_noirq(struct device *dev)
+{
+	struct t6050_dp *dp = dev_get_drvdata(dev);
+
+	if (dp->combo && pm_resume_via_firmware())
+		combo_resume_noirq(dp);
+	return 0;
+}
+
+static int t6050_dp_resume(struct device *dev)
+{
+	struct t6050_dp *dp = dev_get_drvdata(dev);
+
+	if (dp->combo)
+		combo_resume(dp);
+	return 0;
+}
+
+/*
+ * TEST: a USB4 router that sleeps in place (T6050, from a macOS sleep with a dock). macOS
+ * stops the port's PHY after the router: the router processor's power-off and the CIO
+ * domains first, then the PHY's CIO shutdown with its processor idled, then the wrapper, USB
+ * and common domains; after the wake the PHY is started from cold in the same mode before
+ * the router's domains and processor. The router's host calls these in its last suspend
+ * step and its first resume step, where runtime PM no longer runs: the domains'
+ * references stay as they are and the system's own power-down takes the domains.
+ */
+static struct t6050_dp *t6050_dp_from_dev(struct device *dev)
+{
+	if (!dev || !dev->driver || strcmp(dev->driver->name, "apple-t6050-dp-phy"))
+		return NULL;
+	return dev_get_drvdata(dev);
+}
+
+int apple_t6050_phy_cio_prepare(struct device *dev)
+{
+	struct t6050_dp *dp = t6050_dp_from_dev(dev);
+
+	if (!dp || !dp->combo)
+		return -EOPNOTSUPP;
+	guard(mutex)(&dp->lock);
+	if (dp->cio_sleep || dp->faulted || dp->combo_mode != COMBO_CIO || !dp->cio_prepared)
+		return -EBUSY;
+	dp->cio_sleep = true;
+	dp->cio_sleep_off = false;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_t6050_phy_cio_prepare);
+
+int apple_t6050_phy_cio_off(struct device *dev)
+{
+	struct t6050_dp *dp = t6050_dp_from_dev(dev);
+	ktime_t start = ktime_get();
+	int ret;
+
+	if (!dp)
+		return -EOPNOTSUPP;
+	guard(mutex)(&dp->lock);
+	if (!dp->cio_sleep || dp->cio_sleep_off || dp->faulted || dp->combo_mode != COMBO_CIO)
+		return -EBUSY;
+	atc_dp_tunnels_stop(dp);
+	/* A host kept for the sleep is out of reset here, its PIPE parked on the dummy producer. */
+	if (dp->pipe_active || (dp->controller_active && !dp->cio_usb_parked))
+		return -EBUSY;
+	dp->cio_sleep_hold = true;
+	ret = combo_quiesce(dp);
+	if (!ret && dp->usb2_active) {
+		ret = apple_t6050_usb2_stop(&dp->usb_platform);
+		if (!ret)
+			dp->usb2_active = false;
+	}
+	dp->cio_sleep_hold = false;
+	if (ret) {
+		dev_err(dp->dev, "CIO mode not stopped for the router's sleep (%d)\n", ret);
+		dp->faulted = true;
+		return ret < 0 ? ret : -EIO;
+	}
+	dp->cio_sleep_off = true;
+	dp->combo_mode = COMBO_SAFE;
+	dev_info(dp->dev, "CIO mode stopped for the router's sleep in %lld ms, domains left to the system\n",
+		 ktime_ms_delta(ktime_get(), start));
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_t6050_phy_cio_off);
+
+int apple_t6050_phy_cio_on(struct device *dev)
+{
+	struct t6050_dp *dp = t6050_dp_from_dev(dev);
+	int ret;
+
+	if (!dp)
+		return -EOPNOTSUPP;
+	guard(mutex)(&dp->lock);
+	if (!dp->cio_sleep)
+		return -EINVAL;
+	if (!dp->cio_sleep_off)
+		return 0;
+	/* After a real sleep the resume has already forgotten the old state; a stop alone left it. */
+	dp->cio_sleep_hold = true;
+	ret = combo_start(dp, COMBO_CIO);
+	dp->cio_sleep_hold = false;
+	if (!ret)
+		dp->cio_sleep_off = false;
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_t6050_phy_cio_on);
+
+int apple_t6050_phy_cio_finish(struct device *dev)
+{
+	struct t6050_dp *dp = t6050_dp_from_dev(dev);
+	bool off;
+
+	if (!dp)
+		return -EOPNOTSUPP;
+	guard(mutex)(&dp->lock);
+	if (!dp->cio_sleep)
+		return -EINVAL;
+	off = dp->cio_sleep_off;
+	dp->cio_sleep = dp->cio_sleep_off = false;
+	return off ? -EUCLEAN : 0;
+}
+EXPORT_SYMBOL_GPL(apple_t6050_phy_cio_finish);
+
+/*
+ * TEST: the router's host found no dock after a sleep in place and retired its tunnels. Until
+ * the port's mode is started again, DWC3 is not given the router's USB3 tunnel as its PIPE
+ * producer. Called in the host's resume, before the USB host is started again.
+ */
+int apple_t6050_phy_cio_lost(struct device *dev)
+{
+	struct t6050_dp *dp = t6050_dp_from_dev(dev);
+
+	if (!dp || !dp->combo)
+		return -EOPNOTSUPP;
+	guard(mutex)(&dp->lock);
+	dp->cio_tunnel_lost = true;
+	dev_info(dp->dev, "the router's dock is gone after the sleep: USB3 PIPE %s\n",
+		 dp->pipe_active && dp->pipe_tunnel ? "ALREADY on the USB4 tunnel" :
+		 "not given the USB4 tunnel until the port starts again");
+	return dp->pipe_active && dp->pipe_tunnel ? -EBUSY : 0;
+}
+EXPORT_SYMBOL_GPL(apple_t6050_phy_cio_lost);
+
+/*
+ * TEST (J714s): macOS keeps the port's USB host powered (ATC2_USB on) through the router's sleep
+ * and gates it 28 to 37 ms after the router firmware's state word reads asleep, after the CIO
+ * domains, the PHY's CIO shutdown and its wrapper (runs mxt4, mxt5, mxt6, mxt6b, seven sleeps).
+ * Linux removed that host before the freezer and parked its PIPE, leaving the USB3 tunnel with
+ * no host. Here the host is kept instead: xHCI suspends in place (its ports in U3), its PIPE
+ * stays on the tunnel and the controller out of reset until the router's host parks the PIPE
+ * on its dummy producer, behind the router firmware's sleep, or, for a refused sleep, with the
+ * router awake again, before anything can stop the router under it (run sv6t4: a host on a
+ * router's tunnel PIPE when that router's domains went off, then an SError). The controller's
+ * domain stays as it is and goes off with the system's sleep. KEEP refuses (-EBUSY) unless the
+ * PIPE is on the tunnel now and a router host that sleeps in place is bound; the controller
+ * then stops for the sleep as before.
+ */
+int apple_t6050_phy_cio_usb(struct device *dev, enum apple_t6050_cio_usb step)
+{
+	struct t6050_dp *dp = t6050_dp_from_dev(dev);
+	u32 mux = 0, lock = 0;	/* TEST */
+	bool parked;
+	int ret;
+
+	if (!dp || !dp->combo)
+		return -EOPNOTSUPP;
+	guard(mutex)(&dp->lock);
+	/* TEST (sv6t11): the PIPE handler, the controller's bank, read while it holds its domain. */
+	if (step == APPLE_T6050_CIO_USB_PARK && dp->cio_usb_kept && !dp->cio_usb_parked) {
+		mux = readl(dp->banks[44] + 0xc);
+		lock = readl(dp->banks[44] + 0x14);
+	}
+	switch (step) {
+	case APPLE_T6050_CIO_USB_BIND:
+	case APPLE_T6050_CIO_USB_UNBIND:
+		dp->cio_usb_host = step == APPLE_T6050_CIO_USB_BIND;
+		return 0;
+	case APPLE_T6050_CIO_USB_KEEP:
+		dp->cio_usb_kept = dp->cio_usb_parked = false;
+		if (!of_machine_is_compatible("apple,j714s") || !dp->cio_usb_host || dp->faulted ||
+		    dp->combo_mode != COMBO_CIO || !dp->cio_prepared || !dp->controller_active ||
+		    !dp->pipe_active || !dp->pipe_tunnel)
+			return -EBUSY;
+		dp->cio_usb_kept = true;
+		dev_info(dp->dev, "T6050 sleep: USB host kept on the USB4 tunnel's PIPE for the router's sleep\n");
+		return 0;
+	case APPLE_T6050_CIO_USB_PARK:
+		if (!dp->cio_usb_kept || dp->cio_usb_parked)
+			return 0;
+		if (dp->faulted)
+			return -EIO;
+		/* xHCI is suspended: no DMA, its SuperSpeed port in U3, the PIPE in P3. */
+		if (dp->pipe_active && dp->pipe_tunnel) {
+			ret = apple_t6050_usb3_pipe_stop(&dp->usb_io, combo_pipe_keep, dp);
+			if (ret) {
+				combo_pipe_fault(dp, "USB3 tunnel PIPE park for the router's sleep", ret);
+				return -EIO;
+			}
+			dp->pipe_active = dp->pipe_tunnel = false;
+		}
+		dp->cio_usb_parked = true;
+		dev_info(dp->dev, "T6050 sleep: USB3 PIPE parked on its dummy producer, the USB host suspended in place, its controller out of reset\n");
+		dev_info(dp->dev, "TEST sv6t11: PIPE handler at the park: mux %#x (%#x) and lock %#x before, mux %#x (%#x) and lock %#x after (0x42 under 0x73: its dummy producer)\n",
+			 mux, mux & 0x73, lock, readl(dp->banks[44] + 0xc),
+			 readl(dp->banks[44] + 0xc) & 0x73, readl(dp->banks[44] + 0x14));
+		return 0;
+	case APPLE_T6050_CIO_USB_RESULT:
+		if (!dp->cio_usb_kept)
+			return -ENOENT;
+		parked = dp->cio_usb_parked;
+		dp->cio_usb_kept = dp->cio_usb_parked = false;
+		/* A PIPE that did not park: its state is not known, the port needs its cable again. */
+		if (dp->faulted)
+			return -EIO;
+		/* A firmware sleep's resume forgot the controller: it lost its power and registers. */
+		if (!dp->controller_active)
+			return APPLE_T6050_CIO_USB_LOST;
+		return parked ? APPLE_T6050_CIO_USB_PARKED : APPLE_T6050_CIO_USB_KEPT;
+	}
+	return -EINVAL;
+}
+EXPORT_SYMBOL_GPL(apple_t6050_phy_cio_usb);
+
+static const struct dev_pm_ops t6050_dp_pm_ops = {
+	.suspend_late = pm_sleep_ptr(t6050_dp_suspend_late),
+	.resume_noirq = pm_sleep_ptr(t6050_dp_resume_noirq),
+	.resume = pm_sleep_ptr(t6050_dp_resume),
+};
 
 static const struct of_device_id t6050_dp_match[] = {
 	{ .compatible = "apple,t6050-dp-phy" },
@@ -827,6 +1394,7 @@ static struct platform_driver t6050_dp_driver = {
 	.driver = {
 		.name = "apple-t6050-dp-phy",
 		.of_match_table = t6050_dp_match,
+		.pm = &t6050_dp_pm_ops,
 	},
 };
 module_platform_driver(t6050_dp_driver);

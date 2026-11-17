@@ -300,7 +300,7 @@ impl<S: StoreSource> Store<S> {
         let size = file.size()?;
         if created && size == 0 {
             store.create(file)?;
-            pr_info!("created a new host-state store\n");
+            pr_info_ratelimited!("created a new host-state store\n");
             return Ok(store);
         }
 
@@ -315,7 +315,7 @@ impl<S: StoreSource> Store<S> {
         if let Err(damage) = decoded {
             if matches!(damage, Damage::Size | Damage::Header) {
                 if let Some(what) = describe(file, size) {
-                    pr_warn!(
+                    pr_warn_ratelimited!(
                         "host-state store file is {} and holds no state; initialising it\n",
                         what
                     );
@@ -336,7 +336,7 @@ impl<S: StoreSource> Store<S> {
     /// Logs why the existing file is refused, and returns the error. Nothing
     /// is written to the file.
     fn refuse(&self, damage: Damage) -> Error {
-        pr_err!(
+        pr_err_ratelimited!(
             "host-state store failed validation ({:?}), refusing it\n",
             damage
         );

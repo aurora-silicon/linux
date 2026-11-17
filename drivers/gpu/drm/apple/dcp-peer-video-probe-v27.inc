@@ -8,8 +8,9 @@ struct dcp_peer_video_wait {
 	struct kref refs;
 	struct completion done;
 	size_t size;
-	u8 reply[sizeof(struct dcp_peer_get_video_resp_v27)];
+	u8 reply[0x80]; /* the largest paired reply: A449's 0x7c bytes */
 };
+static_assert(sizeof(struct dcp_peer_get_video_resp_v27) <= 0x80);
 
 static void dcp_peer_video_free(struct kref *ref)
 {
@@ -50,8 +51,19 @@ static int dcp_peer_video_call_stream(struct apple_dcp *dcp, bool independent,
 	init_completion(&wait->done);
 	kref_init(&wait->refs);
 	kref_get(&wait->refs);
-	dcp_push(dcp, independent, &method, in_size, out_size, in,
-		 dcp_peer_video_done, wait);
+	if (independent) {
+		/* Not behind the pending primary A413: it waits for this handoff. */
+		ret = dcp_push_oob_concurrent(dcp, &method, in_size, out_size, in,
+					      dcp_peer_video_done, wait);
+		if (ret) {
+			kref_put(&wait->refs, dcp_peer_video_free);
+			kref_put(&wait->refs, dcp_peer_video_free);
+			return ret;
+		}
+	} else {
+		dcp_push(dcp, false, &method, in_size, out_size, in,
+			 dcp_peer_video_done, wait);
+	}
 	if (!wait_for_completion_timeout(&wait->done,
 		msecs_to_jiffies(!memcmp(tag, "A413", 4) ? 8500 : 2000)))
 		ret = -ETIMEDOUT;

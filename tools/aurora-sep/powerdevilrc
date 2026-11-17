@@ -1,0 +1,13 @@
+# The Touch ID sensor is the power button (see logind-aurora-sep.conf). In a
+# Plasma session PowerDevil handles the button instead of logind: a short
+# press suspends rather than opening the logout screen, as in GNOME. Holding
+# the button for a second still opens the logout screen. System Settings >
+# Power Management changes either for one user.
+[AC][SuspendAndShutdown]
+PowerButtonAction=1
+
+[Battery][SuspendAndShutdown]
+PowerButtonAction=1
+
+[LowBattery][SuspendAndShutdown]
+PowerButtonAction=1

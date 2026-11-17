@@ -1,0 +1,287 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * J614s HDMI: dcpext2 -> atc3 display crossbar -> atcphy3 (fixed DP PHY) ->
+ * on-board DP-to-HDMI converter.
+ *
+ * The J614s ADT has no dcpext0, dart-dcpext0 or dispext0, and its DISPEXT0
+ * power states are virtual (no_ps). Its second external display processor is
+ * dcpext2, dcpext1's block shifted by 0x4000000 (ADT /arm-io/dcpext2 at
+ * 0x406e00000 + 0x2_0000_0000, interrupts +0x48). The HDMI side (atc3-dpphy
+ * dp-switch-dfp-endpoint 3, dp2hdmi-gpio0) is the J616s one.
+ *
+ * As the other external chains, everything here is DISABLED. The boot loader
+ * fills dcpext2's firmware memory from this boot's ADT (aura t6041_exts) and
+ * the enable gate (drivers/soc/apple/display-gate.c) powers the chain on
+ * once the PMP is bound.
+ */
+
+/ {
+	reserved-memory {
+		dcpext2_text: dcpext2-text {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+
+		dcpext2_data: dcpext2-data {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+
+		dcpext2_heap: dcpext2-heap {
+			compatible = "apple,asc-mem";
+			reg = <0x0 0x0 0x0 0x4000>;
+			no-map;
+			status = "disabled";
+		};
+	};
+
+	dcpext2: dcp@606e00000 {
+		compatible = "apple,t6041-dcpext", "apple,dcpext";
+		reg = <0x6 0x06e00000 0x0 0x4000>,
+		      <0x6 0x04000000 0x0 0x4000000>,
+		      <0x6 0x06240000 0x0 0x10000>,
+		      <0x6 0x063a8000 0x0 0x4000>,
+		      <0x6 0x06800000 0x0 0x800000>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3";
+		mboxes = <&dcpext2_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcpext2_dart 23>;
+		/*
+		 * PMGR bandwidth agent scratch: the bwr-agent the ADT dispext2
+		 * function-bw_req_interrupt0 (0x90) names, 0x20000 + 5 * 0x4000.
+		 * The same rule gives disp0 0x20000 and dispext1 0x30000.
+		 */
+		apple,bw-scratch = <&pmgr_dcp 0 4 0x34000>;
+		/* ADT iop-dcpext2-nub external-index */
+		apple,dcp-endpoint = <3>;
+		power-domains = <&ps_dispext2_fe>;
+		/* as dcpext0/1: without it apple-dcp's probe fails with -EINVAL */
+		apple,iomfb-surfaces = <1 1 0 0>;
+		memory-region = <&dcpext2_text>, <&dcpext2_data>, <&dcpext2_heap>;
+		memory-region-names = "text", "data", "heap";
+
+		/* HDMI port: as the J616s dcpext0 (same ADT dp2hdmi-gpio0). */
+		apple,connector-type = "HDMI-A";
+		hdmi-hpd-gpios = <&pinctrl_aop 36 GPIO_ACTIVE_HIGH>;
+		hdmi-pwren-gpios = <&smc_gpio 15 GPIO_ACTIVE_HIGH>;
+		dp2hdmi-pwren-gpios = <&smc_gpio 26 GPIO_ACTIVE_HIGH>;
+		/*
+		 * The fixed HDMI path, and a route to every Type-C port beside
+		 * it, as the J616s dcpext0 (a hybrid pipeline): two USB-C
+		 * displays then use dcpext1 and dcpext2. Crossbar state =
+		 * 2 * dp-switch-ufp-endpoint (2) + port (0) on every crossbar.
+		 */
+		phys = <&atcphy3 PHY_TYPE_DP>,
+		       <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>, <&atcphy2 PHY_TYPE_DP>;
+		phy-names = "dp-phy", "typec0", "typec1", "typec2";
+		mux-controls = <&atcphy3_xbar 0>,
+			       <&atcphy0_xbar 0>, <&atcphy1_xbar 0>, <&atcphy2_xbar 0>;
+		mux-control-names = "dp-xbar", "typec0", "typec1", "typec2";
+		mux-index = <4>;
+		apple,dptx-phy = <3>;
+		apple,typec-dptx-phys = <0 1 2>;
+		apple,typec-mux-indices = <4 4 4>;
+		status = "disabled";
+
+		dispext2_piodma: piodma {
+			iommus = <&dispext2_dart 16>;
+		};
+
+		/* Enabled by the gate with dcpext2, as dcpext0's on the J616s. */
+		typec-routes {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			route@0 {
+				reg = <0>;
+				mode-switch;
+				status = "disabled";
+
+				port {
+					dcpext2_typec0: endpoint {
+						remote-endpoint = <&typec0_dcpext0>;
+					};
+				};
+			};
+
+			route@1 {
+				reg = <1>;
+				mode-switch;
+				status = "disabled";
+
+				port {
+					dcpext2_typec1: endpoint {
+						remote-endpoint = <&typec1_dcpext0>;
+					};
+				};
+			};
+
+			route@2 {
+				reg = <2>;
+				mode-switch;
+				status = "disabled";
+
+				port {
+					dcpext2_typec2: endpoint {
+						remote-endpoint = <&typec2_dcpext0>;
+					};
+				};
+			};
+		};
+	};
+
+	dcpext2_mbox: mailbox@606e08000 {
+		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x6 0x06e08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1362 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1363 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1364 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1365 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_dispext2_fe>;
+		status = "disabled";
+	};
+
+	dispext2_dart: iommu@606300000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x6 0x06300000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1309 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext2_fe>;
+		status = "disabled";
+	};
+
+	dcpext2_dart: iommu@606340000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x6 0x06340000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1309 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_dispext2_fe>;
+		status = "disabled";
+	};
+};
+
+/*
+ * PMP device-state acknowledgement for DISPEXT2: ADT iop-pmp-nub soc-device
+ * 20 (EXT2), request bit 19, as DISPEXT0 (18, report@11) and DISPEXT1 (19,
+ * report@12).
+ */
+&pmp_report {
+	pmp_dispext2: report@13 {
+		compatible = "apple,t6041-pmp-v2-report-entry",
+			     "apple,t6000-pmp-v2-report-entry";
+		reg = <0x13>;
+		label = "pmp-dispext2";
+		#power-domain-cells = <0>;
+		apple,irq-safe;
+		status = "disabled";
+	};
+};
+
+/*
+ * ADT DISPEXT2_SYS (0x5028004e0) parents: FAB7_SOC and the DISPEXT rail (the
+ * PMP request), as DISPEXT1_SYS. DISPEXT2_CPU (0x5028004f0) is a real power
+ * state here but, as for dcpext1, is not described: the DCP's own gate is
+ * the virtual DISPEXT2-CPU-V and FE is the last state the chain needs.
+ */
+&pmgr_aux {
+	ps_dispext2_sys: power-controller@4e0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4e0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dispext2_sys";
+		power-domains = <&ps_fab7_soc>, <&pmp_dispext2>;
+		status = "disabled";
+	};
+
+	ps_dispext2_fe: power-controller@4e8 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4e8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "dispext2_fe";
+		power-domains = <&ps_dispext2_sys>;
+		status = "disabled";
+	};
+};
+
+/*
+ * No dcpext0 on this board: keep it, its DARTs and its mailbox off for good,
+ * and give its Type-C routes to dcpext2. Each connector's second display
+ * endpoint (port@3 endpoint@1, labelled typecN_dcpext0) leads to dcpext2.
+ */
+&dcpext0 {
+	/delete-property/ memory-region;
+	/delete-property/ memory-region-names;
+	/delete-node/ typec-routes;
+};
+
+&typec0_dcpext0 {
+	remote-endpoint = <&dcpext2_typec0>;
+};
+
+&typec1_dcpext0 {
+	remote-endpoint = <&dcpext2_typec1>;
+};
+
+&typec2_dcpext0 {
+	remote-endpoint = <&dcpext2_typec2>;
+};
+
+/*
+ * HDMI audio: dcpext2's audio is ADT dp-audio3 (DPA3: SIO DMA channel 0x6a,
+ * power state DPA3 at 0x502280248 under DPA_P), as dcpext0's is DPA1 (0x66)
+ * and dcpext1's DPA2 (0x68) in t6040-j616s-dpaudio.dtsi. DPA1 stays wired to
+ * the absent dcpext0 and reports no audio support.
+ */
+/ {
+	dpaudio3: audio-controller-3 {
+		compatible = "apple,t6041-dpaudio", "apple,dpaudio";
+		dmas = <&sio 0x6a>;
+		dma-names = "tx";
+		power-domains = <&ps_dpa3>;
+		status = "okay";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dpaudio3_dcpext: endpoint {
+					remote-endpoint = <&dcpext2_audio>;
+				};
+			};
+		};
+	};
+};
+
+&dcpext2 {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			dcpext2_audio: endpoint {
+				remote-endpoint = <&dpaudio3_dcpext>;
+			};
+		};
+	};
+};
+
+&ps_dpa3 {
+	status = "okay";
+};

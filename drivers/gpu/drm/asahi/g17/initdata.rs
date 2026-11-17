@@ -172,8 +172,8 @@ impl WorkPublication<'_> {
 /// Session-long storage and mappings. Aliases are released before their backing objects.
 pub(super) struct InitData {
     m5: bool,
-    /// The layout of the M5 graph, once [`InitData::build_m5`] has chosen it.
-    m5_layout: &'static super::fw::m5::initdata::M5Layout,
+    /// The M5 firmware build's layout, where [`Self::m5`].
+    graph: &'static super::fw::m5::initdata::Graph,
     /// Power-policy layout of the M5 firmware build.
     m5_policy: &'static crate::g17::fw::m5::initdata::M5PolicyMap,
     /// Status-config layout of the M5 firmware build.
@@ -184,6 +184,8 @@ pub(super) struct InitData {
     _single_publisher: core::marker::PhantomData<core::cell::Cell<()>>,
     aliases: KVec<mmu::KernelMapping>,
     objects: KVec<KernelObject>,
+    /// The log buffers published to each [`Role`], for reading back what the firmware wrote.
+    fw_log_objects: [Option<usize>; 2],
     roots: usize,
     cluster: usize,
     bundle: usize,
@@ -211,6 +213,9 @@ pub(super) struct InitData {
     compute_scheduler: Option<ComputeScheduler>,
     compute_active: core::cell::Cell<bool>,
     event_ring_checked: [core::cell::Cell<(u64, u64, u32)>; 2],
+    /// M5: the submission-history geometry (period, slot count) read under the firmware's
+    /// generation, with that generation.
+    history_geometry: core::cell::Cell<Option<(u32, u64, u64)>>,
     /// Completion-ring objects; a family sets only the rings it has.
     completion_rings: [Option<usize>; 4],
     stamps: [usize; 2],
@@ -290,13 +295,14 @@ impl InitData {
     pub(super) fn new() -> Self {
         Self {
             m5: false,
-            m5_layout: &super::fw::m5::initdata::M5_LAYOUT_26A428,
+            graph: &super::fw::m5::initdata::M5_GRAPH,
             m5_policy: &crate::g17::fw::m5::initdata::M5_26A428_POLICY,
             m5_status_config: &crate::g17::fw::m5::initdata::M5_26A428_STATUS_CONFIG,
             outer_credits: None,
             _single_publisher: core::marker::PhantomData,
             aliases: KVec::new(),
             objects: KVec::new(),
+            fw_log_objects: [None; 2],
             roots: 0,
             cluster: 0,
             bundle: 0,
@@ -317,6 +323,7 @@ impl InitData {
             compute_scheduler: None,
             compute_active: core::cell::Cell::new(false),
             event_ring_checked: [const { core::cell::Cell::new((0, 0, 0)) }; 2],
+            history_geometry: core::cell::Cell::new(None),
             completion_rings: [None; 4],
             stamps: [0; 2],
             render_pages: None,
@@ -345,6 +352,20 @@ impl InitData {
             mmu::UAT_PGSZ as u64, mmu::PROT_FW_SHARED_RW)?;
         self.metrics_fw_va = alias.iova();
         self.aliases.push(alias, GFP_KERNEL)?;
+        if super::J813_FORMS.load(Ordering::Relaxed) {
+            // The J813's firmware touches a render's metrics in context 0 (the kernel lower VM)
+            // at the client's compact-window address. Every client VM maps its metrics entry at
+            // the window's start plus the entry's offset (MetricsLease::map_client), so map the
+            // whole backing at the window's start here.
+            let start = super::buffer::BlockGeometry::M5_COMPACT.start;
+            let alias = metrics.alias_in(uat.kernel_lower_vm(),
+                start..start + metrics.size() as u64, mmu::UAT_PGSZ as u64,
+                mmu::PROT_GPU_SHARED_RW)?;
+            if alias.iova() != start {
+                return Err(EINVAL);
+            }
+            self.aliases.push(alias, GFP_KERNEL)?;
+        }
         Ok(())
     }
 
@@ -423,6 +444,17 @@ impl InitData {
     /// One M5 page-pool row: the pool's eight descriptor words at its 64-byte slot.
     fn set_m5_uma(&self, slot: u16, words: [u64; 8]) -> Result {
         let object = self.object(self.page_pool)?;
+        if super::fw::m5::pool::j813_pools() {
+            // The J813's rows are the descriptor's first four words, 0x20 apart.
+            const ROW: usize = super::fw::m5::pool::J813_ROW_WORDS * 8;
+            let offset = usize::from(slot) * ROW;
+            object.pointer(offset, ROW)?;
+            for (index, word) in words.into_iter().take(ROW / 8).enumerate() {
+                object.dword(offset + index * 8)?.store(word, Ordering::Relaxed);
+            }
+            fence(Ordering::SeqCst);
+            return Ok(());
+        }
         let offset = usize::from(slot) * core::mem::size_of::<[u64; 8]>();
         // Check the full row before the first store.
         object.pointer(offset, core::mem::size_of::<[u64; 8]>())?;
@@ -700,10 +732,37 @@ impl InitData {
         Ok(next != consumer && next != consumer_b)
     }
 
+    /// M5 compute: the shared ring's cursors when it has room for one record, as
+    /// [`Self::work_ready`] judges it. The same critical section may publish against them
+    /// ([`Self::publish_work_at`]): the firmware's consumers only advance, and the producer
+    /// is the device mutex holder's.
+    pub(super) fn m5_compute_room(&self, priority: u8) -> Result<Option<[u32; 3]>> {
+        use super::fw::queue::DataMaster;
+        if !self.m5 {
+            return Err(EINVAL);
+        }
+        let cursors = self.work_cursors(priority, DataMaster::Compute)?;
+        Ok((self.outer_capacity(priority, cursors)? >= 1).then_some(cursors))
+    }
+
+    /// M5 render: the shared ring's cursors when it has room for a pair, as
+    /// [`Self::work_ready`] judges it, for the pair's publication in the same hold
+    /// ([`Self::m5_work_pair`]).
+    pub(super) fn m5_render_room(&self, priority: u8) -> Result<Option<[u32; 3]>> {
+        use super::fw::queue::DataMaster;
+        if !self.m5 {
+            return Err(EINVAL);
+        }
+        let cursors = self.work_cursors(priority, DataMaster::Compute)?;
+        Ok((self.outer_capacity(priority, cursors)? >= 2).then_some(cursors))
+    }
+
+    /// `cursors`: an M5 compute room check's sample ([`Self::m5_compute_room`]), else read here.
     fn work_publication<'a>(
         &'a self,
         priority: u8,
         record: &'a super::fw::channels::WorkSlot,
+        cursors: Option<[u32; 3]>,
     ) -> Result<WorkPublication<'a>> {
         use super::fw::{channels, queue::DataMaster};
         let engine = match record.data_master {
@@ -715,7 +774,11 @@ impl InitData {
             _ => return Err(EINVAL),
         };
         let channel = channels::work_ring_index(priority, engine).ok_or(EINVAL)?;
-        let [consumer, consumer_b, producer] = self.work_cursors(priority, engine)?;
+        let [consumer, consumer_b, producer] = match cursors {
+            Some(cursors) if self.m5 && engine == DataMaster::Compute => cursors,
+            Some(_) => return Err(EINVAL),
+            None => self.work_cursors(priority, engine)?,
+        };
         if self.m5 && engine == DataMaster::Compute
             && self.outer_capacity(priority, [consumer, consumer_b, producer])? < 1 {
             return Err(EBUSY);
@@ -743,6 +806,21 @@ impl InitData {
             producer,
             next,
         })
+    }
+
+    /// The host producer of the shared M5 ring alone (the last of [`Self::work_cursors`]).
+    pub(super) fn work_producer(&self, priority: u8) -> Result<u32> {
+        use super::fw::{channels, queue::DataMaster};
+        let channel = channels::work_ring_index(priority, DataMaster::Compute).ok_or(EINVAL)?;
+        let producer = self
+            .object(self.cluster)?
+            .word(self.state_offset(Role::Primary) + abi::work_state_offset(channel)
+                + abi::ChannelState::PRODUCER)?
+            .load(Ordering::Relaxed);
+        if producer >= channels::WORK_RING_SLOTS {
+            return Err(EINVAL);
+        }
+        Ok(producer)
     }
 
     /// Two firmware consumers and the host producer, sampled in that order.
@@ -778,16 +856,30 @@ impl InitData {
         priority: u8,
         record: &super::fw::channels::WorkSlot,
     ) -> Result<u32> {
-        Ok(self.work_publication(priority, record)?.commit())
+        self.publish_work_at(priority, record, None)
+    }
+
+    /// [`Self::publish_work`] against the cursors of a room check made earlier under the same
+    /// hold of the device mutex ([`Self::m5_compute_room`]), or a fresh read for None.
+    pub(super) fn publish_work_at(
+        &self,
+        priority: u8,
+        record: &super::fw::channels::WorkSlot,
+        cursors: Option<[u32; 3]>,
+    ) -> Result<u32> {
+        Ok(self.work_publication(priority, record, cursors)?.commit())
     }
 
     /// Reserve both common-ring slots before touching either host port. The
     /// returned views retain the graph borrow until the pair is published.
+    /// `cursors`: a room check's sample from the same hold ([`Self::m5_render_room`]),
+    /// else read here.
     pub(super) fn m5_work_pair(
         &self,
         priority: u8,
         fragment: &super::fw::channels::WorkSlot,
         tiling: &super::fw::channels::WorkSlot,
+        cursors: Option<[u32; 3]>,
     ) -> Result<work_pair::Publication<'_>> {
         use super::fw::{channels, queue::DataMaster};
         if !self.m5
@@ -796,7 +888,10 @@ impl InitData {
         {
             return Err(EINVAL);
         }
-        let cursors = self.work_cursors(priority, DataMaster::Compute)?;
+        let cursors = match cursors {
+            Some(cursors) => cursors,
+            None => self.work_cursors(priority, DataMaster::Compute)?,
+        };
         if self.outer_capacity(priority, cursors)? < 2 { return Err(EBUSY); }
         let window = work_pair::Window::new(cursors)?;
         let channel = channels::work_ring_index(priority, DataMaster::Compute).ok_or(EINVAL)?;
@@ -838,14 +933,14 @@ impl InitData {
             return Err(EINVAL);
         }
         if self.m5 {
-            let pair = self.m5_work_pair(priority, fragment, tiling)?;
+            let pair = self.m5_work_pair(priority, fragment, tiling, None)?;
             pair.prepare();
             commit_accounting()?;
             publish_late_tiling();
             return Ok(if deferred { pair.next() } else { pair.publish() });
         }
-        let fragment = self.work_publication(priority, fragment)?;
-        let tiling = self.work_publication(priority, tiling)?;
+        let fragment = self.work_publication(priority, fragment, None)?;
+        let tiling = self.work_publication(priority, tiling, None)?;
         fragment.copy_record();
         commit_accounting()?;
         fence(Ordering::SeqCst);
@@ -900,16 +995,18 @@ impl InitData {
 
     /// Release a retained pair after its control transaction. Revalidate the original producer
     /// witnesses before either copy; both bodies precede the fragment and tiling publications.
+    /// `cursors`: M5, as for [`Self::m5_work_pair`].
     pub(super) fn publish_retained_work_pair(
         &self,
         priority: u8,
         fragment: &super::fw::channels::WorkSlot,
         tiling: &super::fw::channels::WorkSlot,
         next: [u32; 2],
+        cursors: Option<[u32; 3]>,
     ) -> Result {
         use super::fw::queue::DataMaster;
         if self.m5 {
-            let pair = self.m5_work_pair(priority, fragment, tiling)?;
+            let pair = self.m5_work_pair(priority, fragment, tiling, cursors)?;
             if pair.next() != next { return Err(EBUSY); }
             pair.publish();
             return Ok(());
@@ -1664,17 +1761,17 @@ impl InitData {
     }
 
     fn main_config_offset(&self, role: Role) -> usize {
-        if self.m5 { self.m5_layout.shared.main_config[role as usize] }
+        if self.m5 { self.graph.shared.main_config[role as usize] }
         else { abi::bundle::MAIN_CONFIG[role as usize] }
     }
 
     fn work_ring_offset(&self, channel: usize) -> usize {
-        if self.m5 { super::fw::m5::initdata::work_ring_offsets(&self.m5_layout.shared)[channel] }
+        if self.m5 { self.graph.work_ring_offsets[channel] }
         else { abi::work_ring_offset(channel) }
     }
 
     fn state_offset(&self, role: Role) -> usize {
-        if self.m5 { return self.m5_layout.private_state_grids()[role as usize]; }
+        if self.m5 { return self.graph.state_grids[role as usize]; }
         match role {
             Role::Primary => abi::private::PRIMARY_STATE,
             Role::Secondary => abi::private::SECONDARY_STATE,
@@ -1682,7 +1779,7 @@ impl InitData {
     }
 
     fn status_offset(&self, role: Role) -> usize {
-        if self.m5 { return self.m5_layout.private_status_a()[role as usize]; }
+        if self.m5 { return self.graph.private.roles[role as usize].status_a; }
         match role {
             Role::Primary => self.status_a,
             Role::Secondary => abi::private::SECONDARY_STATUS_A,
@@ -1779,13 +1876,13 @@ impl InitData {
         next: u32,
     ) -> Result {
         let ring_base = if self.m5 {
-            self.m5_layout.shared.control_ring[0]
+            self.graph.shared.control_ring[0]
         } else { self.main_config_offset(Role::Primary) + abi::MainConfig::CONTROL_RING };
         let offset = ring_base + (slot as usize).checked_mul(record.len()).ok_or(EINVAL)?;
         let ring = self.object(self.bundle)?.pointer(offset, record.len())?;
         let power = self
             .object(self.region_c)?
-            .pointer(if self.m5 { super::fw::m5::power::POWER_ASSERT_TALLY }
+            .pointer(if self.m5 { self.graph.power_assert_tally }
                 else { abi::RegionC::POWER_ASSERT_TALLY }, 4)?;
         let producer = self.control_producer()?;
         // SAFETY: The checked pointers remain valid for the lifetime of this non-Sync owner.
@@ -1836,13 +1933,14 @@ impl InitData {
         fence(Ordering::Acquire);
         Ok(self
             .object(self.cluster)?
-            .word(self.m5_layout.private.status_b + m::M5_PROGRESS)?
+            .word(self.graph.private.status_b + m::M5_PROGRESS)?
             .load(Ordering::Relaxed))
     }
 
     fn recovery_state_offset(&self) -> usize {
         if self.m5 {
-            self.m5_layout.private.status_b + super::fw::m5::initdata::M5_RECOVERY_STATE
+            self.graph.private.status_b
+                + super::fw::m5::initdata::M5_RECOVERY_STATE
         } else { self.status_b + abi::PrimaryStatusB::RECOVERY_STATE }
     }
 
@@ -1850,7 +1948,7 @@ impl InitData {
     fn recovery_view_words<const N: usize>(&self, view: usize, offset: usize) -> Result<[u32; N]> {
         let bundle = self.object(self.bundle)?;
         let extent = if self.m5 {
-            *self.m5_layout.bundle_view_extents().get(view).ok_or(EINVAL)?
+            *self.graph.bundle_view_extents.get(view).ok_or(EINVAL)?
         } else {
             *abi::recovery::VIEW_EXTENTS.get(view).ok_or(EINVAL)?
         };
@@ -1859,7 +1957,7 @@ impl InitData {
             Some(views) => (self.object(*views.get(view).ok_or(EINVAL)?)?, 0),
             None if self.m5 => (
                 bundle,
-                *self.m5_layout.bundle_view_offsets().get(view).ok_or(EINVAL)?,
+                *self.graph.bundle_view_offsets.get(view).ok_or(EINVAL)?,
             ),
             None => (bundle, *abi::bundle::VIEWS.get(view).ok_or(EINVAL)?),
         };
@@ -1887,7 +1985,8 @@ impl super::recovery::Memory for InitData {
     }
     fn fault_sources(&self) -> Result<super::recovery::Sources> {
         let mask_offset = if self.m5 {
-            self.m5_layout.private.status_b + super::fw::m5::initdata::M5_RECOVERY_SLOT_MASK
+            self.graph.private.status_b
+                + super::fw::m5::initdata::M5_RECOVERY_SLOT_MASK
         } else {
             self.status_b + abi::PrimaryStatusB::RECOVERY_SLOT_MASK
         };
@@ -1934,7 +2033,8 @@ impl super::recovery::Memory for InitData {
         Ok(self
             .object(self.cluster)?
             .word(if self.m5 {
-                self.m5_layout.private.status_b + super::fw::m5::initdata::M5_HOST_RECOVERY
+                self.graph.private.status_b
+                    + super::fw::m5::initdata::M5_HOST_RECOVERY
             } else {
                 self.status_b + abi::PrimaryStatusB::HOST_RECOVERY
             })?
@@ -1942,6 +2042,8 @@ impl super::recovery::Memory for InitData {
     }
 
     fn transition(&self, expected: u32, next: u32) -> Result {
+        // A restarted firmware may lay its submission history out anew.
+        self.history_geometry.set(None);
         let state = self
             .object(self.cluster)?
             .word(self.recovery_state_offset())?;
@@ -1962,7 +2064,7 @@ impl super::recovery::Memory for InitData {
             Some(views) => (self.object(*views.get(4).ok_or(EINVAL)?)?, 0),
             None if self.m5 => (
                 self.object(self.bundle)?,
-                self.m5_layout.bundle_view_offsets()[4],
+                self.graph.bundle_view_offsets[4],
             ),
             None => (self.object(self.bundle)?, abi::bundle::VIEWS[4]),
         };
@@ -1988,7 +2090,8 @@ impl super::recovery::Memory for InitData {
         }
         let cluster = self.object(self.cluster)?;
         let base = if self.m5 {
-            self.m5_layout.private.status_b + super::fw::m5::initdata::M5_RECOVERY_INFO
+            self.graph.private.status_b
+                + super::fw::m5::initdata::M5_RECOVERY_INFO
         } else {
             self.status_b + abi::PrimaryStatusB::RECOVERY_INFO
         };
@@ -2019,9 +2122,10 @@ impl InitData {
     /// M5 only: the GPU's current power draw in mW, as the firmware's power controller reports it
     /// (integer word of the shared power-policy block).
     pub(super) fn m5_gpu_power_mw(&self) -> Result<u32> {
-        if !self.m5 { return Err(EINVAL); }
+        // The power word's place is the M5 Pro build's.
+        if !self.m5 || self.graph.is_common26() { return Err(EINVAL); }
         Ok(self.object(self.bundle)?
-            .word(self.m5_layout.shared.policy + super::thermal::POLICY_GPU_POWER)?
+            .word(self.graph.shared.policy + super::thermal::POLICY_GPU_POWER)?
             .load(Ordering::Relaxed))
     }
 
@@ -2030,7 +2134,7 @@ impl InitData {
     pub(super) fn m5_firmware_clamped(&self) -> Result<bool> {
         if !self.m5 { return Err(EINVAL); }
         let block = self.object(self.bundle)?;
-        let base = self.m5_layout.shared.policy;
+        let base = self.graph.shared.policy;
         let mask = block.word(base + super::thermal::POLICY_LIMITER_MASK)?.load(Ordering::Relaxed);
         let limit = block.word(base + super::thermal::POLICY_LIMITER_LIMIT)?.load(Ordering::Relaxed);
         Ok(super::thermal::is_emergency_clamp(mask, limit))

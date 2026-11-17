@@ -12,7 +12,6 @@
 
 #include <asm/cacheflush.h>
 #include <asm/cpufeature.h>
-#include <asm/cputype.h>
 #include <asm/setup.h>
 
 #include "pi.h"
@@ -190,13 +189,29 @@ static bool __init pfr1_sme_filter(u64 val)
 	return true;
 }
 
+static bool __init pfr1_mte_filter(u64 val)
+{
+	/*
+	 * The tag check fault address and store-only tag checking in
+	 * id_aa64pfr2_el1 are part of MTE, so they go when MTE does.
+	 */
+	if (!val) {
+		id_aa64pfr2_override.val &= ~(ID_AA64PFR2_EL1_MTEFAR_MASK |
+					      ID_AA64PFR2_EL1_MTESTOREONLY_MASK);
+		id_aa64pfr2_override.mask |= ID_AA64PFR2_EL1_MTEFAR_MASK |
+					     ID_AA64PFR2_EL1_MTESTOREONLY_MASK;
+	}
+
+	return true;
+}
+
 static const struct ftr_set_desc pfr1 __prel64_initconst = {
 	.name		= "id_aa64pfr1",
 	.override	= &id_aa64pfr1_override,
 	.fields		= {
 		FIELD("bt", ID_AA64PFR1_EL1_BT_SHIFT, NULL ),
 		FIELD("gcs", ID_AA64PFR1_EL1_GCS_SHIFT, NULL),
-		FIELD("mte", ID_AA64PFR1_EL1_MTE_SHIFT, NULL),
+		FIELD("mte", ID_AA64PFR1_EL1_MTE_SHIFT, pfr1_mte_filter),
 		FIELD("sme", ID_AA64PFR1_EL1_SME_SHIFT, pfr1_sme_filter),
 		FIELD("mpam_frac", ID_AA64PFR1_EL1_MPAM_frac_SHIFT, NULL),
 		{}
@@ -439,9 +454,38 @@ static __init void parse_cmdline(const void *fdt, int chosen)
 		__parse_cmdline(prop, true);
 }
 
+/*
+ * Apple SoCs keep MTE tag storage in DRAM that only the boot loader can
+ * place. Keep MTE off unless the device tree reserves that storage.
+ */
+static __init bool apple_mte_storage_unreserved(const void *fdt)
+{
+	static const char platform[] __initconst = "apple,arm-platform";
+	static const char reserved[] __initconst = "/reserved-memory";
+	static const char storage[] __initconst = "apple,mte-tag-storage";
+	u64 mte = cpuid_feature_extract_unsigned_field(read_sysreg(id_aa64pfr1_el1),
+						       ID_AA64PFR1_EL1_MTE_SHIFT);
+	int parent, node;
+
+	if (mte < ID_AA64PFR1_EL1_MTE_MTE2 ||
+	    fdt_node_check_compatible(fdt, 0, platform))
+		return false;
+
+	parent = fdt_path_offset(fdt, reserved);
+	if (parent < 0)
+		return true;
+
+	fdt_for_each_subnode(node, fdt, parent)
+		if (!fdt_node_check_compatible(fdt, node, storage))
+			return false;
+
+	return true;
+}
+
 void __init init_feature_override(u64 boot_status, const void *fdt,
 				  int chosen)
 {
+	static const char nomte[] __initconst = "arm64.nomte";
 	struct arm64_ftr_override *override;
 	const struct ftr_set_desc *reg;
 	int i;
@@ -458,12 +502,8 @@ void __init init_feature_override(u64 boot_status, const void *fdt,
 
 	parse_cmdline(fdt, chosen);
 
-	/*
-	 * Timed waits bypass the register-saving idle path on Apple M4+ cores.
-	 * Apply this after boot arguments so they cannot re-enable WFxT.
-	 */
-	if (IS_ENABLED(CONFIG_ARCH_APPLE) && midr_is_apple_m4_or_later(read_cpuid_id()))
-		__parse_cmdline("id_aa64isar2.wfxt=0", false);
+	if (apple_mte_storage_unreserved(fdt))
+		__parse_cmdline(nomte, true);
 
 	for (i = 0; i < ARRAY_SIZE(regs); i++) {
 		reg = prel64_pointer(regs[i].reg);

@@ -62,7 +62,11 @@ impl<'a> Lane<'a> {
         timestamp: KickTimestamp,
         lead: bool,
     ) -> Result<Self> {
-        let m5 = graph.is_m5();
+        // macOS 27.0 on the J813 (common 26A428 interface) publishes the Neo form: its
+        // TA, 3D and compute item rings carry [configuration], descriptor, KickAnnounce (tag 0xe)
+        // records, never the M5 Pro's descriptor-less tag-16 notification.
+        let j813 = crate::g17::J813_FORMS.load(core::sync::atomic::Ordering::Relaxed);
+        let m5 = graph.is_m5() && !j813;
         // M5 items carry no descriptor: [configuration], notification.
         let count = u32::from(present) + u32::from(lead) + if m5 { 1 } else { 2 };
         let window = Window::new(base, count, ITEM_RING_ENTRIES)?;
@@ -100,10 +104,13 @@ impl<'a> Lane<'a> {
         if lead {
             push(graph.config.gpu_va() + (config_offset + memory::LEAD) as u64);
         }
+        if j813 && present {
+            push(graph.config.gpu_va() + config_offset as u64);
+        }
         if !m5 {
             push(descriptor);
         }
-        if present {
+        if present && !j813 {
             push(graph.config.gpu_va() + config_offset as u64);
         }
         push(announce_va);

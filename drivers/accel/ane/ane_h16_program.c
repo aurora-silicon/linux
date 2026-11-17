@@ -497,6 +497,7 @@ module_param(execute_depth, uint, 0444);
 MODULE_PARM_DESC(execute_depth, "Maximum concurrent EXECUTEs (1-4, default 2)");
 
 static void h16_gate_work(struct work_struct *work);
+static void h16_export_work(struct work_struct *work);
 
 /* Lifecycle traffic must not interleave with a batch's command arena. */
 static void h16_drain(struct ane_h16_session *s)
@@ -511,12 +512,12 @@ static void h16_drain(struct ane_h16_session *s)
 	wake_up_all(&s->wake);
 }
 
-int ane_h16_session_init(struct ane_h16_session *s, struct ane_fw_transport *transport,
-			 const struct ane_h16_session_ops *ops, void *ctx,
-			 u64 timeout_ns)
+static int h16_session_init(struct ane_h16_session *s, struct ane_fw_transport *transport,
+			    const struct ane_h16_session_ops *ops, void *ctx,
+			    u64 timeout_ns, bool parked)
 {
-	if (!s || !transport || !transport->armed || !ops || !ops->map || !ops->log ||
-	    !timeout_ns)
+	if (!s || !transport || !transport->soc || (!parked && !transport->armed) || !ops ||
+	    !ops->map || !ops->log || !timeout_ns || (parked && !ops->wake))
 		return -EINVAL;
 	memset(s, 0, sizeof(*s));
 	s->transport = transport;
@@ -529,11 +530,33 @@ int ane_h16_session_init(struct ane_h16_session *s, struct ane_fw_transport *tra
 	init_waitqueue_head(&s->wake);
 	INIT_LIST_HEAD(&s->deferred);
 	INIT_LIST_HEAD(&s->programs);
+	INIT_LIST_HEAD(&s->held);
 	spin_lock_init(&s->stats_lock);
 	INIT_DELAYED_WORK(&s->gate_work, h16_gate_work);
+	spin_lock_init(&s->export_lock);
+	INIT_LIST_HEAD(&s->exports_done);
+	INIT_WORK(&s->export_work, h16_export_work);
+	s->asleep = parked;
+	s->parked = parked;
 	return 0;
 }
+
+int ane_h16_session_init(struct ane_h16_session *s, struct ane_fw_transport *transport,
+			 const struct ane_h16_session_ops *ops, void *ctx,
+			 u64 timeout_ns)
+{
+	return h16_session_init(s, transport, ops, ctx, timeout_ns, false);
+}
 EXPORT_SYMBOL_GPL(ane_h16_session_init);
+
+/* Closed and parked, its transport armed only by ops->wake on the first request. */
+int ane_h16_session_init_parked(struct ane_h16_session *s, struct ane_fw_transport *transport,
+				const struct ane_h16_session_ops *ops, void *ctx,
+				u64 timeout_ns)
+{
+	return h16_session_init(s, transport, ops, ctx, timeout_ns, true);
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_init_parked);
 
 static int h16_fail(struct ane_h16_session *s, int error)
 {
@@ -544,6 +567,8 @@ static int h16_fail(struct ane_h16_session *s, int error)
 		ane_h16_pending_fail_all(&s->pending, s->error);
 		wake_up_all(&s->wake);
 		s->ops->log(s->ctx, "program quarantine", (u64)-s->error, 0);
+		if (s->ops->hung)
+			s->ops->hung(s->ctx, s->error);
 	}
 	return s->error;
 }
@@ -644,12 +669,108 @@ static void h16_give_spare(struct ane_h16_session *s, struct ane_fw_surface *sur
 	memset(surface, 0, sizeof(*surface));
 }
 
+static void h16_export_work(struct work_struct *work)
+{
+	struct ane_h16_session *s = container_of(work, struct ane_h16_session, export_work);
+	struct ane_h16_export *e, *next;
+	LIST_HEAD(done);
+
+	spin_lock(&s->export_lock);
+	list_splice_init(&s->exports_done, &done);
+	spin_unlock(&s->export_lock);
+	mutex_lock(s->lock);
+	list_for_each_entry_safe(e, next, &done, node) {
+		list_del(&e->node);
+		h16_give_spare(s, &e->surface, e->write);
+		kfree(e);
+	}
+	mutex_unlock(s->lock);
+}
+
+/* Return released exports now. Caller does not hold the node lock. */
+void ane_h16_session_flush_exports(struct ane_h16_session *s)
+{
+	flush_work(&s->export_work);
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_flush_exports);
+
+/*
+ * A process maps surface @index of @p. The first mapping of a surface
+ * creates its export, held by the program; each call returns one more
+ * reference for the caller's mapping. Caller holds the node lock.
+ */
+int ane_h16_session_export(struct ane_h16_session *s, struct ane_h16_program *p,
+			   unsigned int index, struct ane_h16_export **out)
+{
+	struct ane_h16_export *e;
+	unsigned int j;
+
+	if (!s || !p || p->session != s || p->closed || p->released ||
+	    index >= p->resource_count || !p->surfaces[index])
+		return -EINVAL;
+	j = p->surfaces[index] - p->regions;
+	if (j >= p->plan.count)
+		return -EINVAL;
+	e = p->exports[j];
+	if (!e) {
+		e = kzalloc_obj(*e);
+		if (!e)
+			return -ENOMEM;
+		refcount_set(&e->ref, 1);
+		e->session = s;
+		e->surface = p->regions[j];
+		e->write = p->plan.regions[j].permissions & 2;
+		INIT_LIST_HEAD(&e->node);
+		p->exports[j] = e;
+	}
+	refcount_inc(&e->ref);
+	*out = e;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_export);
+
+void ane_h16_export_get(struct ane_h16_export *e)
+{
+	refcount_inc(&e->ref);
+}
+EXPORT_SYMBOL_GPL(ane_h16_export_get);
+
+/*
+ * Drop a reference. The last one returns a released surface to the spares
+ * from a work item: a mapping's last put runs under the process mmap lock,
+ * which an EXECUTE may wait for while holding the node lock.
+ */
+void ane_h16_export_put(struct ane_h16_export *e)
+{
+	struct ane_h16_session *s;
+
+	if (!e || !refcount_dec_and_test(&e->ref))
+		return;
+	s = e->session;
+	spin_lock(&s->export_lock);
+	list_add_tail(&e->node, &s->exports_done);
+	spin_unlock(&s->export_lock);
+	schedule_work(&s->export_work);
+}
+EXPORT_SYMBOL_GPL(ane_h16_export_put);
+
 static void h16_give_back(struct ane_h16_session *s, struct ane_h16_program *p)
 {
 	unsigned int i;
 
-	for (i = 0; i < p->plan.count; i++)
+	for (i = 0; i < p->plan.count; i++) {
+		struct ane_h16_export *e = p->exports[i];
+
+		if (e) {
+			/* Mapped by a process: the export returns it after the last unmap. */
+			e->released = true;
+			p->exports[i] = NULL;
+			memset(&p->regions[i], 0, sizeof(p->regions[i]));
+			ane_h16_export_put(e);
+			continue;
+		}
 		h16_give_spare(s, &p->regions[i], p->plan.regions[i].permissions & 2);
+	}
 	for (i = 0; i < ANE_H16_AUX_COUNT; i++)
 		h16_give_spare(s, &p->aux[i], false);
 	memset(p->surfaces, 0, sizeof(p->surfaces));
@@ -1611,12 +1732,17 @@ int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p)
 			    p->key.process);
 		return 0;
 	}
-	if (s->quarantined)
+	/* Kept, memory and all, until a verified power cycle (held list). */
+	if (s->quarantined) {
+		list_add_tail(&p->node, &s->held);
 		return -EIO;
+	}
 	/* TERMINATE and UNLOAD run with gating on, as without the hold. */
 	ret = h16_gate_release(s);
-	if (ret)
+	if (ret) {
+		list_add_tail(&p->node, &s->held);
 		return ret;
+	}
 	ret = ane_h16_terminate_encode(command, ANE_H16_TERMINATE_SIZE, p->key.program,
 				       p->key.process);
 	if (!ret)
@@ -1629,14 +1755,18 @@ int ane_h16_session_close(struct ane_h16_session *s, struct ane_h16_program *p)
 		ret = h16_send(s, ANE_FW_IO, command, ANE_H16_UNLOAD_SIZE, &reply);
 	if (!ret)
 		ret = ane_h16_id_reply(reply, ANE_H16_UNLOAD_SIZE, command);
-	if (ret)
+	if (ret) {
+		list_add_tail(&p->node, &s->held);
 		return h16_fail(s, ret);
+	}
 	s->ops->log(s->ctx, "TERMINATE and UNLOAD", p->key.program, p->key.process);
 	/* Answer the FREE of the process pool while the firmware waits for it. */
 	ret = ane_fw_transport_settle(s->transport, s->settle_ns,
 				      max(s->settle_ns, ANE_H16_SETTLE_LIMIT_NS));
-	if (ret < 0)
+	if (ret < 0) {
+		list_add_tail(&p->node, &s->held);
 		return h16_fail(s, ret);
+	}
 	/*
 	 * The firmware acknowledged TERMINATE and UNLOAD, so it no longer
 	 * reads or writes this program's memory: later programs may reuse it.
@@ -1656,10 +1786,18 @@ int ane_h16_session_enter(struct ane_h16_session *s, bool nonblock)
 	int ret;
 
 	for (;;) {
+		/* A parked engine comes up for its first request. */
+		if (READ_ONCE(s->parked) && s->ops->wake) {
+			ret = s->ops->wake(s->ctx);
+			if (ret && ret != -EAGAIN)
+				return ret;
+		}
 		/* O_NONBLOCK: a clean -EAGAIN while the engine is cycled. */
 		if (nonblock && READ_ONCE(s->asleep))
 			return -EAGAIN;
-		ret = wait_event_freezable(s->wake, !READ_ONCE(s->asleep));
+		ret = wait_event_freezable(s->wake, !READ_ONCE(s->asleep) ||
+					   (READ_ONCE(s->parked) && s->ops->wake &&
+					    !READ_ONCE(s->wake_blocked)));
 		if (ret)
 			return ret;
 		mutex_lock(s->lock);
@@ -1720,6 +1858,32 @@ void ane_h16_session_restart(struct ane_h16_session *s)
 	s->error = 0;
 }
 EXPORT_SYMBOL_GPL(ane_h16_session_restart);
+
+/*
+ * After ane_h16_session_restart() on a quarantined session: the backend
+ * powered the engine off (every domain verified off) and booted a new
+ * firmware from the preload, so nothing reads the old firmware's memory any
+ * more. End the quarantine, and give back the memory of every program that
+ * was closed while it lasted. Open programs are replayed by the caller.
+ * Called with the session asleep.
+ */
+void ane_h16_session_recovered(struct ane_h16_session *s)
+{
+	struct ane_h16_program *p, *n;
+
+	s->quarantined = false;
+	s->pending.quarantined = false;
+	s->pending.error = 0;
+	s->error = 0;
+	list_for_each_entry_safe(p, n, &s->held, node) {
+		list_del_init(&p->node);
+		h16_give_back(s, p);
+		s->ops->log(s->ctx, "program closed while quarantined, released",
+			    p->key.program, p->key.process);
+		ane_h16_session_put(s, p);
+	}
+}
+EXPORT_SYMBOL_GPL(ane_h16_session_recovered);
 
 /*
  * Put one program back on a firmware booted again from the preload, behind

@@ -111,6 +111,8 @@ struct tb_nhi_ring_layout {
  *	       Lets the NHI recover a port whose link went down while the
  *	       cable stays attached.
  * @init_interrupts: NHI specific interrupt initialization hook
+ * @router_sleep: Enter host-router sleep with the control channel running
+ * @router_wake: Start the host router's links again after its controller restarted
  * @reset_interface: Resets the host interface
  */
 struct tb_nhi_ops {
@@ -143,6 +145,8 @@ struct tb_nhi_ops {
 	bool (*dp_tunnel_awaits_display)(struct tb_nhi *nhi, struct tb_port *in);
 	int (*init_interrupts)(struct tb_nhi *nhi);
 	void (*reset_interface)(struct tb_nhi *nhi);
+	int (*router_sleep)(struct tb_nhi *nhi);
+	int (*router_wake)(struct tb_nhi *nhi);
 };
 
 /*
@@ -227,6 +231,31 @@ struct tb_nhi_ops {
 #define QUIRK_KEEP_TUNNELS				BIT(7)
 /* The links of the host router must not enter CL states. */
 #define QUIRK_NO_HOST_CLX				BIT(8)
+/* The links of the domain must stay symmetric. */
+#define QUIRK_NO_ASYM					BIT(9)
+/* Gen4 links of the domain run with link recovery enabled on both ends. */
+#define QUIRK_GEN4_LINK_RECOVERY			BIT(10)
+/*
+ * The host router's firmware runs its TMU, and enhanced uni-directional
+ * mode takes the host's own constants, see tmu.c.
+ */
+#define QUIRK_HOST_TMU					BIT(11)
+/* The host router has no vendor operation that saves its state for a sleep in place. */
+#define QUIRK_CIO_NO_ROUTER_STATE			BIT(12)
+/*
+ * After a sleep in place the host router's links are waited for only as long as a cold
+ * start's training takes, twice over, and a peer that is not back by then is retired as
+ * unplugged; a saved state the router does not take back leaves it as from a cold start.
+ */
+#define QUIRK_CIO_WAKE_GIVES_UP				BIT(13)
+/*
+ * TEST: the sleep in place exchanges the control frames macOS sends to this router (run
+ * mxt6): the PCIe and USB3 paths are left as they are for the sleep and written again
+ * after it, a router below the host sleeps with every wake of its lane adapters and its
+ * PCIe and USB3 wakes enabled, the host's own wake and sleep words are written by its NHI,
+ * and routers are enumerated with a 10 ms notification timeout.
+ */
+#define QUIRK_CIO_MACOS_FRAMES				BIT(14)
 
 /* Host display policies are independent of which optional hooks are installed. */
 #define TB_HOST_DP_NOTIFY		BIT(0)
@@ -242,6 +271,13 @@ struct tb_nhi_ops {
  * being set up again at HBR2 first.
  */
 #define TB_HOST_DP_SHARED_RATE		BIT(6)
+/*
+ * Run the host DP IN adapters' bandwidth allocation mode as the host's own
+ * OS does: 1 Gb/s granularity, and the connection manager acknowledges a
+ * DPTX bandwidth request by holding CM Ack until the adapter has cleared
+ * the request.
+ */
+#define TB_HOST_DP_BW_HELD_ACK		BIT(7)
 
 /*
  * Minimal number of vectors when we use MSI-X. Two for control channel

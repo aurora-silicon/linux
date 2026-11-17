@@ -125,6 +125,10 @@ allOf:
               - description: USB2 PHY specific controls
               - description: USB3 PIPE interface controls
               - description: Secondary eUSB2 PHY register bank (T8140)
+              - description:
+                  Power and hibernation control of the USB controller the PHY
+                  serves (T8140). The PHY drives that controller's reset and
+                  takes it through hibernation for a system sleep.
           reg-names:
             minItems: 5
             items:
@@ -134,6 +138,7 @@ allOf:
               - const: usb2phy
               - const: pipehandler
               - const: usb2phy-reg
+              - const: pwrctl
         required:
           - power-domains
   - if:
@@ -177,6 +182,7 @@ allOf:
               const: apple,t8132-atcphy
     then:
       properties:
+        apple,dp-alt-mode: false
         apple,tunable-usb3-axi2af: false
         apple,tunable-usb3-lioa: false
         apple,tunable-usb3-fabric: false
@@ -291,6 +297,14 @@ properties:
       port@3:
         $ref: /schemas/graph.yaml#/properties/port
         description: Incoming endpoint from the USB4/Thunderbolt controller.
+
+  apple,dp-alt-mode:
+    type: boolean
+    description: >
+      T8132 only. The board wires this port's SuperSpeed lanes for
+      DisplayPort alternate mode, so 4-lane DP and USB3+DP run the PHY's own
+      DP transmitter instead of falling back to USB. Without it, DP on T8132
+      is only carried in USB4/Thunderbolt tunnels.
 
   apple,tunable-usb3-axi2af:
     $ref: "#/$defs/apple,tunable"
@@ -442,6 +456,18 @@ properties:
       Per-device defaults for the secondary eUSB2 PHY register bank of the
       T8140, copied from Apple's Device Tree by the bootloader. Unlike the
       other tunables these are applied to the usb2phy-reg region.
+
+  apple,axi2af-gate:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: Register offset in the axi2af region
+        - description: Bits
+    description: >
+      The fabric bridge bits macOS clears, in this order, before the PHY's
+      common power domain goes off for a system sleep and sets again once it
+      is back. With pwrctl, the controller then keeps its power through the
+      sleep.
 
 patternProperties:
   "^apple,dp-training-table(-rbr|-hbr|-hbr2|-hbr3)?$":

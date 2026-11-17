@@ -83,3 +83,11 @@
 
 #include "hwmon-common.dtsi"
 #include "hwmon-fan-dual.dtsi"
+
+&avd_dart {
+	status = "okay";
+};
+
+&avd {
+	status = "okay";
+};

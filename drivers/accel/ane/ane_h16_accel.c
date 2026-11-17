@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
  * H16 and H17 accel node (ABI version 3). It exists only after the staged
- * opt-in completed its program stage. Every firmware-visible byte lives in private
- * kernel mappings; userspace passes the original HWX, the host-built sections
- * and plain input/output buffers, never DVAs, firmware IDs or commands.
+ * opt-in completed its program stage. Programs, sections and scratch live in
+ * private kernel mappings; userspace passes the original HWX, the host-built
+ * sections and plain input/output buffers, never DVAs, firmware IDs or
+ * commands. A process may map its program's surfaces (inputs and outputs
+ * only) and run requests on them in place, without copies.
  */
 #include <linux/ktime.h>
+#include <linux/mm.h>
+#include <linux/sizes.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
@@ -164,10 +168,13 @@ static int ane_h16_exec_ioctl(struct drm_device *drm, void *data, struct drm_fil
 	unsigned int i;
 	int ret = 0;
 
-	if (args->flags || !args->count || args->count > ANE_H16_SURFACES)
+	const bool in_place = args->flags & DRM_ANE_H16_EXEC_IN_PLACE;
+
+	if ((args->flags & ~DRM_ANE_H16_EXEC_IN_PLACE) || !args->count ||
+	    args->count > ANE_H16_SURFACES || (in_place && args->buffers_ptr))
 		return -EINVAL;
-	if (copy_from_user(buffers, u64_to_user_ptr(args->buffers_ptr),
-			   array_size(args->count, sizeof(*buffers))))
+	if (!in_place && copy_from_user(buffers, u64_to_user_ptr(args->buffers_ptr),
+					array_size(args->count, sizeof(*buffers))))
 		return -EFAULT;
 	start = ktime_get_ns();
 	mutex_lock(&f->lock);
@@ -181,7 +188,7 @@ static int ane_h16_exec_ioctl(struct drm_device *drm, void *data, struct drm_fil
 		ret = -EINVAL;
 		goto unlock;
 	}
-	for (i = 0; i < args->count; i++) {
+	for (i = 0; i < args->count && !in_place; i++) {
 		if (buffers[i].size != p->resources[i].buffer.size) {
 			ret = -EINVAL;
 			goto unlock;
@@ -192,7 +199,7 @@ static int ane_h16_exec_ioctl(struct drm_device *drm, void *data, struct drm_fil
 		goto unlock;
 	locked = ktime_get_ns();
 	/* This program's shared surfaces are ours through the final copy-out. */
-	for (i = 0; i < args->count; i++) {
+	for (i = 0; i < args->count && !in_place; i++) {
 		void *cpu = p->surfaces[i]->cpu;
 
 		if (p->resources[i].permissions == 1) {
@@ -211,7 +218,7 @@ static int ane_h16_exec_ioctl(struct drm_device *drm, void *data, struct drm_fil
 		goto release;
 	done = ktime_get_ns();
 	ane_h16_session_sync(a->session, p, false);
-	for (i = 0; i < args->count; i++)
+	for (i = 0; i < args->count && !in_place; i++)
 		if (p->resources[i].permissions == 2 &&
 		    copy_to_user(u64_to_user_ptr(buffers[i].ptr), p->surfaces[i]->cpu,
 				 buffers[i].size))
@@ -242,6 +249,96 @@ release:
 unlock:
 	mutex_unlock(&a->lock);
 	mutex_unlock(&f->lock);
+	return ret;
+}
+
+static void ane_h16_vm_open(struct vm_area_struct *vma)
+{
+	ane_h16_export_get(vma->vm_private_data);
+}
+
+static void ane_h16_vm_close(struct vm_area_struct *vma)
+{
+	ane_h16_export_put(vma->vm_private_data);
+}
+
+static const struct vm_operations_struct ane_h16_vm_ops = {
+	.open = ane_h16_vm_open,
+	.close = ane_h16_vm_close,
+};
+
+/*
+ * Map a prefix of surface i of the file's program at DRM_ANE_H16_MMAP_OFFSET(i).
+ * Inputs may be written, outputs only read. The pages are the surface's own,
+ * held by the mapping (struct ane_h16_export) until it is gone.
+ */
+static int ane_h16_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+	struct drm_file *file = filp->private_data;
+	struct ane_h16_accel *a = to_h16_accel(file->minor->dev);
+	struct ane_h16_accel_file *f = file->driver_priv;
+	const u64 offset = (u64)vma->vm_pgoff << PAGE_SHIFT;
+	const unsigned long pages = vma_pages(vma);
+	struct ane_h16_export *e = NULL;
+	struct ane_h16_program *p;
+	unsigned long n, i;
+	struct page **list;
+	unsigned int index;
+	bool input = false;
+	int ret;
+
+	/*
+	 * Surfaces are 16 KiB blocks of order-0 pages only with 16 KiB pages;
+	 * a smaller page would map the tail pages of a higher-order block.
+	 */
+	if (PAGE_SIZE != SZ_16K)
+		return -EOPNOTSUPP;
+	if (offset & GENMASK_ULL(31, 0) || offset >> 32 < 1 ||
+	    offset >> 32 > ANE_H16_SURFACES || (vma->vm_flags & VM_EXEC))
+		return -EINVAL;
+	index = (offset >> 32) - 1;
+	mutex_lock(&f->lock);
+	ret = ane_h16_session_enter(a->session, filp->f_flags & O_NONBLOCK);
+	if (ret) {
+		mutex_unlock(&f->lock);
+		return ret;
+	}
+	p = f->program;
+	ret = -EINVAL;
+	if (p && !p->closed && index < p->resource_count &&
+	    pages <= DIV_ROUND_UP(p->resources[index].buffer.size, PAGE_SIZE) &&
+	    pages <= p->surfaces[index]->size >> PAGE_SHIFT &&
+	    !((vma->vm_flags & VM_WRITE) && p->resources[index].permissions != 1)) {
+		input = p->resources[index].permissions == 1;
+		ret = ane_h16_session_export(a->session, p, index, &e);
+	}
+	mutex_unlock(&a->lock);
+	mutex_unlock(&f->lock);
+	if (ret)
+		return ret;
+
+	list = kvmalloc_array(pages, sizeof(*list), GFP_KERNEL);
+	if (!list) {
+		ane_h16_export_put(e);
+		return -ENOMEM;
+	}
+	for (i = 0; i < pages; i++)
+		list[i] = vmalloc_to_page(e->surface.cpu + i * PAGE_SIZE);
+	vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP | VM_DONTCOPY);
+	vm_flags_clear(vma, VM_MAYEXEC);
+	if (!input)
+		vm_flags_clear(vma, VM_MAYWRITE);
+	vma->vm_private_data = e;
+	vma->vm_ops = &ane_h16_vm_ops;
+	n = pages;
+	ret = vm_insert_pages(vma, vma->vm_start, list, &n);
+	kvfree(list);
+	if (ret) {
+		/* The failed mmap is unmapped without our close: drop the reference here. */
+		vma->vm_ops = NULL;
+		vma->vm_private_data = NULL;
+		ane_h16_export_put(e);
+	}
 	return ret;
 }
 
@@ -294,9 +391,9 @@ static const struct drm_ioctl_desc ane_h16_ioctls[] = {
 };
 
 /*
- * No GEM objects and no mmap: buffers travel by copy only, so this is
- * DRM_ACCEL_FOPS without .mmap (drm_gem_mmap needs DRIVER_GEM). The DRM core
- * refuses to open a file whose fops lack FOP_UNSIGNED_OFFSET.
+ * No GEM objects: DRM_ACCEL_FOPS with the driver's own surface .mmap
+ * (drm_gem_mmap needs DRIVER_GEM). The DRM core refuses to open a file whose
+ * fops lack FOP_UNSIGNED_OFFSET.
  */
 static const struct file_operations ane_h16_fops = {
 	.owner = THIS_MODULE,
@@ -308,6 +405,7 @@ static const struct file_operations ane_h16_fops = {
 	.poll = drm_poll,
 	.read = drm_read,
 	.llseek = noop_llseek,
+	.mmap = ane_h16_mmap,
 };
 
 static const struct drm_driver ane_h16_drm_driver = {
@@ -318,7 +416,7 @@ static const struct drm_driver ane_h16_drm_driver = {
 	.num_ioctls = ARRAY_SIZE(ane_h16_ioctls),
 	.fops = &ane_h16_fops,
 	.major = DRM_ANE_ABI_V3,
-	.minor = 0,
+	.minor = 1,
 	.name = "ane",
 	.desc = "Apple Neural Engine (H16 and later)",
 };

@@ -527,7 +527,7 @@
 };
 
 / {
-	/* ADT pmgr reg[44]: AppleT6041PMGR::enableCioReconfig at +0x2024. */
+	/* ADT pmgr reg[44]: the CIO reconfiguration enable, at +0x2024. */
 	pmgr_cio: power-management@502820000 {
 		compatible = "apple,t6041-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
 		#address-cells = <1>;

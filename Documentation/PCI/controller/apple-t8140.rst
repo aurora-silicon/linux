@@ -64,6 +64,19 @@ recovery remain refused. Supporting these operations requires a proven engine
 teardown/reset and endpoint recovery contract first. Renaming the provider
 does not qualify those operations.
 
+Deep sleep keeps both functions bound and the radio powered, with its firmware
+running. Their drivers stop for it, the link goes through L2 and PERST#, and the SoC
+powers the engine off. On the way back the engine's whole register file must read as it
+did before the first command, the state the bootstrap checks for; if anything differs,
+the radios stay down. Only then does the retained state reopen for one more validated
+read, on the same memory, which the retrained link needs before native ECAM. The
+functions' configuration is then restored and their drivers resume, with no firmware
+load. If a driver finds that its side didn't survive, the host removes both functions,
+which resets the chip, and scans again, so that they probe and load their firmware as at
+boot. If the link didn't come back, the radio's rail is cycled first. An abandoned sleep
+never ran that power-off, so it replays nothing. This needs tunables
+from a loader that publishes them, and is refused otherwise.
+
 Suspend-to-idle is allowed only after radio admission, with no IRQ fault,
 idle command/FIFO checks and intact arena contents. Resume restores the
 configuration banks after genpd power restoration without submitting another

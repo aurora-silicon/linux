@@ -39,6 +39,7 @@
 #include <media/v4l2-mem2mem.h>
 #include <media/videobuf2-dma-contig.h>
 
+#include "../apple-video-nr.h"
 #include "apple-scaler-hw.h"
 #include "apple-scaler-regs.h"
 
@@ -233,6 +234,19 @@ static void asc_image(struct asc_image *img, const struct v4l2_pix_format_mplane
 	img->fmt = asc_find_format(pix->pixelformat);
 	img->width = pix->width;
 	img->height = pix->height;
+	if (img->fmt->lossless) {
+		struct asc_lossless_geom g;
+		u64 base = vb2_dma_contig_plane_dma_addr(vb, 0);
+
+		asc_lossless_geom(pix->width, pix->height, &g);
+		img->dva[0] = base;
+		img->dva[1] = base + g.c;
+		img->meta[0] = base + g.y_meta;
+		img->meta[1] = base + g.c_meta;
+		img->stride[0] = g.y_pitch;
+		img->stride[1] = g.c_pitch;
+		return;
+	}
 	for (i = 0; i < img->fmt->planes; i++) {
 		if (pix->num_planes > 1) {
 			img->dva[i] = vb2_dma_contig_plane_dma_addr(vb, i);
@@ -348,7 +362,19 @@ static void asc_fill(struct v4l2_pix_format_mplane *pix, const struct v4l2_pix_f
 	h = clamp_t(u32, ALIGN(h, f->vsub), ASC_MIN_SIZE, ASC_MAX_SIZE);
 
 	memset(pix, 0, sizeof(*pix));
-	v4l2_fill_pixfmt_mp_aligned(pix, f->fourcc, w, h, ASC_STRIDE_ALIGN);
+	if (f->lossless) {
+		struct asc_lossless_geom g;
+
+		asc_lossless_geom(w, h, &g);
+		pix->pixelformat = f->fourcc;
+		pix->width = w;
+		pix->height = h;
+		pix->num_planes = 1;
+		pix->plane_fmt[0].bytesperline = g.y_pitch;
+		pix->plane_fmt[0].sizeimage = g.bytes;
+	} else {
+		v4l2_fill_pixfmt_mp_aligned(pix, f->fourcc, w, h, ASC_STRIDE_ALIGN);
+	}
 	pix->field = V4L2_FIELD_NONE;
 
 	if (ref && ref->colorspace != V4L2_COLORSPACE_DEFAULT) {
@@ -820,7 +846,7 @@ static int asc_probe(struct platform_device *pdev)
 	vdev->vfl_dir = VFL_DIR_M2M;
 	vdev->device_caps = V4L2_CAP_VIDEO_M2M_MPLANE | V4L2_CAP_STREAMING;
 	video_set_drvdata(vdev, asc);
-	return video_register_device(vdev, VFL_TYPE_VIDEO, -1);
+	return video_register_device(vdev, VFL_TYPE_VIDEO, APPLE_M2M_VIDEO_NR);
 }
 
 static void asc_remove(struct platform_device *pdev)
@@ -830,6 +856,12 @@ static void asc_remove(struct platform_device *pdev)
 	video_unregister_device(&asc->vdev);
 }
 
+/* M1: one engine with no PIODMA-side register range. */
+static const struct apple_scaler_variant apple_scaler_t8103 = {
+	.hw_version = 10,
+	.num_reg = 2,
+};
+
 static const struct apple_scaler_variant apple_scaler_t6000 = {
 	.hw_version = 12,
 	.num_reg = 3,
@@ -838,6 +870,13 @@ static const struct apple_scaler_variant apple_scaler_t6000 = {
 static const struct apple_scaler_variant apple_scaler_t8112 = {
 	.hw_version = 13,
 	.num_reg = 3,
+};
+
+/* M4: the first engine with the MSR20 control block. */
+static const struct apple_scaler_variant apple_scaler_t8132 = {
+	.hw_version = 20,
+	.num_reg = 4,
+	.msr20 = true,
 };
 
 static const struct apple_scaler_variant apple_scaler_t6041 = {
@@ -853,8 +892,10 @@ static const struct apple_scaler_variant apple_scaler_t8140 = {
 };
 
 static const struct of_device_id asc_of_match[] = {
+	{ .compatible = "apple,t8103-scaler", .data = &apple_scaler_t8103 },
 	{ .compatible = "apple,t6000-scaler", .data = &apple_scaler_t6000 },
 	{ .compatible = "apple,t8112-scaler", .data = &apple_scaler_t8112 },
+	{ .compatible = "apple,t8132-scaler", .data = &apple_scaler_t8132 },
 	{ .compatible = "apple,t6041-scaler", .data = &apple_scaler_t6041 },
 	{ .compatible = "apple,t8140-scaler", .data = &apple_scaler_t8140 },
 	{ }

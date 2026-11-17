@@ -2,6 +2,7 @@
 
 #include <linux/delay.h>
 #include <linux/io.h>
+#include <linux/iommu.h>
 #include <linux/iopoll.h>
 #include <linux/list.h>
 #include <linux/pm_domain.h>
@@ -28,7 +29,7 @@ struct cen_context {
 struct centauri_t6050_ipc {
 	struct list_head buffers;
 	struct pci_dev *function[3];
-	bool enabled[3], owned[3];
+	bool enabled[3], owned[3], domain_lease[3];
 	bool alpha_pm_domain;
 	void __iomem *bar[3];
 	struct cen_context control, alpha;
@@ -309,7 +310,7 @@ static struct dev_pm_domain centauri_t6050_alpha_pm_domain;
 static int enumerate_functions(struct centauri_t6050 *c)
 {
 	struct centauri_t6050_ipc *ipc = c->ipc;
-	int i, ret;
+	int i, ret = 0;
 
 	c->pdev->multifunction = 1;
 	pci_rescan_bus(c->pdev->bus);
@@ -323,32 +324,56 @@ static int enumerate_functions(struct centauri_t6050 *c)
 		    !(pci_resource_flags(ipc->function[i], 0) & IORESOURCE_MEM) ||
 		    pci_resource_len(ipc->function[i], 0) < (i ? 0x2000 : 0x9080))
 			return -ENODEV;
-		if (i && ipc->function[i]->dev.driver)
-			return -EBUSY;
+		if (i) {
+			/*
+			 * The driver core sets dev.driver before calling probe.
+			 * Beta can be probing only to defer until c->ready.
+			 * Wait for that probe before deciding it is owned.
+			 */
+			device_lock(&ipc->function[i]->dev);
+			if (ipc->function[i]->dev.driver) {
+				ret = -EBUSY;
+				goto unlock;
+			}
+		}
+		/* F0 already has the independent control owner's domain lease. */
+		if (i) {
+			ret = iommu_device_use_default_domain(&ipc->function[i]->dev);
+			if (ret)
+				goto unlock;
+			ipc->domain_lease[i] = true;
+		}
 		ipc->owned[i] = true;
 		ipc->bar[i] = pci_iomap(ipc->function[i], 0, 0);
-		if (!ipc->bar[i])
-			return -ENOMEM;
+		if (!ipc->bar[i]) {
+			ret = -ENOMEM;
+			goto unlock;
+		}
 		if (i) {
 			ret = pci_enable_device_mem(ipc->function[i]);
 			if (ret)
-				return ret;
+				goto unlock;
 			ipc->enabled[i] = true;
 		}
-		if (i == 1 && !ipc->function[i]->dev.driver) {
+		if (i == 1) {
 			dev_pm_domain_set(&ipc->function[i]->dev, &centauri_t6050_alpha_pm_domain);
 			ipc->alpha_pm_domain = true;
 		}
 		ret = dma_set_mask_and_coherent(&ipc->function[i]->dev, DMA_BIT_MASK(40));
 		if (ret)
-			return ret;
+			goto unlock;
 		if (i == 1) {
 			ret = centauri_t6050_request_irqs(&c->alpha_irqs, ipc->function[i],
 						    16, centauri_t6050_alpha_irq, c);
 			if (ret)
-				return ret;
+				goto unlock;
 		}
 		pci_set_master(ipc->function[i]);
+unlock:
+		if (i)
+			device_unlock(&ipc->function[i]->dev);
+		if (ret)
+			return ret;
 	}
 	return 0;
 }
@@ -457,27 +482,64 @@ int centauri_t6050_start_ipc(struct centauri_t6050 *c)
 void centauri_t6050_free_ipc(struct centauri_t6050 *c)
 {
 	struct centauri_t6050_ipc *ipc = c->ipc;
+
+	if (!ipc)
+		return;
+	centauri_t6050_wifi_unregister(c);
+	centauri_t6050_free_irqs(&c->alpha_irqs);
+	if (!centauri_t6050_ipc_fenced(ipc)) {
+		dev_warn(&c->pdev->dev, "retaining IPC DMA after pending transaction timeout\n");
+		return;
+	}
+	centauri_t6050_release_ipc(ipc);
+	c->ipc = NULL;
+}
+
+bool centauri_t6050_ipc_fenced(struct centauri_t6050_ipc *ipc)
+{
+	bool stopped = true;
+	int i;
+
+	if (!ipc)
+		return true;
+	for (i = 0; i < 3; i++)
+		if (ipc->owned[i])
+			pci_clear_master(ipc->function[i]);
+	for (i = 0; i < 3; i++)
+		if (ipc->owned[i] && !centauri_t6050_stop_dma(ipc->function[i]))
+			stopped = false;
+	return stopped;
+}
+
+/* Discard every pointer into the unbinding control driver's executable lifetime. */
+void centauri_t6050_detach_ipc(struct centauri_t6050_ipc *ipc)
+{
+	int i;
+
+	if (!ipc)
+		return;
+	if (ipc->alpha_pm_domain) {
+		dev_pm_domain_set(&ipc->function[1]->dev, NULL);
+		ipc->alpha_pm_domain = false;
+	}
+	for (i = 0; i < 3; i++) {
+		if (ipc->bar[i])
+			pci_iounmap(ipc->function[i], ipc->bar[i]);
+		ipc->bar[i] = NULL;
+		if (ipc->enabled[i])
+			pci_disable_device(ipc->function[i]);
+		ipc->enabled[i] = false;
+	}
+}
+
+/* IRQ users must be drained and every function fenced before this release. */
+void centauri_t6050_release_ipc(struct centauri_t6050_ipc *ipc)
+{
 	struct cen_buffer *buffer, *next;
 	int i;
 
 	if (!ipc)
 		return;
-	if (ipc->owned[2])
-		device_release_driver(&ipc->function[2]->dev);
-	centauri_t6050_wifi_unregister(c);
-	centauri_t6050_free_irqs(&c->alpha_irqs);
-	for (i = 0; i < 3; i++) {
-		if (!ipc->owned[i])
-			continue;
-		pci_clear_master(ipc->function[i]);
-	}
-	for (i = 0; i < 3; i++) {
-		if (ipc->owned[i] && !centauri_t6050_stop_dma(ipc->function[i])) {
-			dev_warn(&c->pdev->dev,
-				 "retaining IPC DMA after pending transaction timeout\n");
-			return;
-		}
-	}
 	list_for_each_entry_safe(buffer, next, &ipc->buffers, list) {
 		memzero_explicit(buffer->cpu, buffer->size);
 		dma_free_coherent(buffer->owner, buffer->size, buffer->cpu, buffer->dma);
@@ -485,17 +547,16 @@ void centauri_t6050_free_ipc(struct centauri_t6050 *c)
 		list_del(&buffer->list);
 		kfree(buffer);
 	}
-	if (ipc->alpha_pm_domain)
-		dev_pm_domain_set(&ipc->function[1]->dev, NULL);
+	centauri_t6050_detach_ipc(ipc);
 	for (i = 0; i < 3; i++) {
-		if (ipc->bar[i])
-			pci_iounmap(ipc->function[i], ipc->bar[i]);
-		if (ipc->enabled[i])
-			pci_disable_device(ipc->function[i]);
+		if (ipc->domain_lease[i]) {
+			device_lock(&ipc->function[i]->dev);
+			iommu_device_unuse_default_domain(&ipc->function[i]->dev);
+			device_unlock(&ipc->function[i]->dev);
+		}
 		pci_dev_put(ipc->function[i]);
 	}
 	kfree(ipc);
-	c->ipc = NULL;
 }
 
 int centauri_t6050_alpha_resources(struct centauri_t6050 *c, struct cen_alpha_resources *resources)

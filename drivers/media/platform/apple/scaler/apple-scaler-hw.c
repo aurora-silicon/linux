@@ -11,6 +11,9 @@
 #include <linux/array_size.h>
 #include <linux/bits.h>
 #include <linux/errno.h>
+#include <linux/log2.h>
+#include <linux/math.h>
+#include <linux/minmax.h>
 #include <linux/export.h>
 #include <linux/math64.h>
 #include <linux/module.h>
@@ -23,6 +26,8 @@
 
 #define ASC_SWIZZLE_IDENTITY	0x03020100
 #define ASC_SWIZZLE_CBCR	0x03000102
+/* Compression word value for the lossless formats */
+#define ASC_LOSSLESS		0x40
 
 static const struct asc_format asc_formats[] = {
 	{
@@ -47,8 +52,28 @@ static const struct asc_format asc_formats[] = {
 		.fourcc = V4L2_PIX_FMT_P010, .layout = 0xc, .code = 0x2,
 		.sampling = 0x12, .swizzle = ASC_SWIZZLE_CBCR, .planes = 2,
 		.bpp = { 2, 4 }, .hsub = 2, .vsub = 2, .yuv = true, .wide = true,
+	}, {
+		/* The AVE temporal filter's picture form; one buffer, four regions. */
+		.fourcc = V4L2_PIX_FMT_APPLE_L8V0, .layout = 0xc, .code = 0x78,
+		.sampling = 0x46, .swizzle = ASC_SWIZZLE_CBCR, .planes = 2,
+		.bpp = { 1, 2 }, .hsub = 2, .vsub = 2, .yuv = true, .lossless = true,
 	},
 };
+
+void asc_lossless_geom(u32 width, u32 height, struct asc_lossless_geom *g)
+{
+	u32 tx = DIV_ROUND_UP(width, 32), ty = DIV_ROUND_UP(height, 32);
+	u32 grid = roundup_pow_of_two(max3(tx, ty, 64u));
+
+	g->tiles_x = tx;
+	g->y_pitch = tx * 1024;
+	g->y_meta = ty * g->y_pitch;
+	g->c = g->y_meta + grid * grid * 32;
+	g->c_pitch = tx * 512;
+	g->c_meta = g->c + ty * g->c_pitch;
+	g->bytes = g->c_meta + grid * grid * 8;
+}
+EXPORT_SYMBOL_IF_KUNIT(asc_lossless_geom);
 
 const struct asc_format *asc_format_by_index(unsigned int index)
 {
@@ -214,19 +239,20 @@ static void asc_emit(struct asc_emit *e, u32 off, u32 val)
 struct asc_dma_regs {
 	u32 layout, code, sampling, plane, stride, offset, swizzle, size;
 	u32 plane_width, plane_height;
+	u32 meta;	/* first metadata address slot */
 	u32 flag;	/* or-ed into layout-adjacent words on the write side */
 };
 
 static const struct asc_dma_regs asc_rdma = {
 	.layout = 0x180, .code = 0x184, .sampling = 0x188, .plane = 0x198,
 	.stride = 0x1d8, .offset = 0x1e8, .swizzle = 0x1f8, .size = 0x1fc,
-	.plane_width = 0x234, .plane_height = 0x244, .flag = 0,
+	.plane_width = 0x234, .plane_height = 0x244, .meta = 0x1b8, .flag = 0,
 };
 
 static const struct asc_dma_regs asc_wdma = {
 	.layout = 0x280, .code = 0x284, .sampling = 0x288, .plane = 0x290,
 	.stride = 0x2c0, .offset = 0x2cc, .swizzle = 0x2d8, .size = 0x2dc,
-	.plane_width = 0x308, .plane_height = 0x314, .flag = BIT(15),
+	.plane_width = 0x308, .plane_height = 0x314, .meta = 0x2a8, .flag = BIT(15),
 };
 
 static void asc_emit_image(struct asc_emit *e, const struct asc_dma_regs *r,
@@ -241,11 +267,12 @@ static void asc_emit_image(struct asc_emit *e, const struct asc_dma_regs *r,
 	asc_emit(e, r->layout, f->layout);
 	asc_emit(e, r->code, r->flag | f->code);
 	asc_emit(e, r->sampling, r->flag | f->sampling);
+	/* Lossless compression on: one word per side, two on the read side. */
 	if (r->flag)
-		asc_emit(e, r->sampling + 4, r->flag);
+		asc_emit(e, r->sampling + 4, r->flag | (f->lossless ? ASC_LOSSLESS : 0));
 	else {
-		asc_emit(e, r->sampling + 4, 0);
-		asc_emit(e, r->sampling + 8, 0);
+		asc_emit(e, r->sampling + 4, f->lossless ? ASC_LOSSLESS : 0);
+		asc_emit(e, r->sampling + 8, f->lossless ? ASC_LOSSLESS : 0);
 	}
 	for (i = 0; i < nplanes; i++) {
 		u64 dva = i < f->planes ? img->dva[i] : 0;
@@ -253,6 +280,11 @@ static void asc_emit_image(struct asc_emit *e, const struct asc_dma_regs *r,
 		asc_emit(e, r->plane + 8 * i, lower_32_bits(dva));
 		asc_emit(e, r->plane + 8 * i + 4, upper_32_bits(dva));
 		asc_emit(e, r->stride + 4 * i, i < f->planes ? img->stride[i] : 0);
+	}
+	/* Metadata addresses follow the plane address slots. */
+	for (i = 0; f->lossless && i < f->planes; i++) {
+		asc_emit(e, r->meta + 8 * i, lower_32_bits(img->meta[i]));
+		asc_emit(e, r->meta + 8 * i + 4, upper_32_bits(img->meta[i]));
 	}
 	for (i = 0; i < 3; i++)
 		asc_emit(e, r->offset + 4 * i, 0);
@@ -305,14 +337,18 @@ static void asc_emit_chroma(struct asc_emit *e, const struct asc_job *job)
 	/* 2x2 ordered-dither index pattern, repeated over 4x4. */
 	static const u32 dither[16] = { 0, 2, 0, 2, 3, 1, 3, 1, 0, 2, 0, 2, 3, 1, 3, 1 };
 	const struct asc_format *s = job->src.fmt, *d = job->dst.fmt;
+	/* Same subsampling on both sides: chroma passes through untouched. */
+	bool same = s->yuv && d->yuv && s->hsub == d->hsub && s->vsub == d->vsub;
+	bool up_on = s->yuv && s->hsub > 1 && !same;
 	unsigned int i;
 
-	asc_emit(e, 0x800, s->yuv && s->hsub > 1 ? 0xd : 0xc);
+	asc_emit(e, 0x800, up_on ? 0xd : 0xc);
+	/* The weights are loaded for any subsampled source, used only when on. */
 	if (s->yuv && s->hsub > 1)
 		for (i = 0; i < ARRAY_SIZE(up); i++)
 			asc_emit(e, 0x804 + 4 * i, up[i]);
 	asc_emit(e, 0x824, 0xc);
-	asc_emit(e, 0x900, d->yuv && d->hsub > 1 ? 0x00010103 : 0);
+	asc_emit(e, 0x900, d->yuv && d->hsub > 1 && !same ? 0x00010103 : 0);
 	if (s->wide && !d->wide) {
 		asc_emit(e, 0xa00, 0x02020200);
 		for (i = 0; i < ARRAY_SIZE(dither); i++)

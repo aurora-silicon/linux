@@ -25,6 +25,9 @@ MUTATIONS = {
                             'control |= rtc->hw->control_event_bit;'),
     'stowe-offset': ('static const struct apple_pmu_rtc_hw apple_pmu_rtc_stowe = {',
                      'static const struct apple_pmu_rtc_hw apple_pmu_rtc_stowe = {\n\t.offset_in_seconds = true,'),
+    'baku-limit': ('.max_delay = U32_MAX,', '.max_delay = APPLE_PMU_RTC_MAX_DELAY,'),
+    'set-no-round': ('(counter + BIT(APPLE_PMU_RTC_HZ_SHIFT - 1))', '(counter)'),
+    'set-negative': ('if (offset < 0 || offset', 'if (offset'),
 }
 
 PRELUDE = r'''
@@ -41,12 +44,14 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 typedef int64_t s64;
 typedef uint32_t __le32;
+typedef uint64_t __le64;
 #define BIT(n) (1U << (n))
 #define U32_MAX UINT32_MAX
 #define RTC_TIMESTAMP_END_9999 253402300799LL
 #define cpu_to_le32(x) (x)
 #define le32_to_cpu(x) (x)
 #define le64_to_cpu(x) (x)
+#define cpu_to_le64(x) (x)
 #define IS_ERR(x) ((intptr_t)(x) < 0)
 #define PTR_ERR(x) ((int)(intptr_t)(x))
 #define kfree free
@@ -63,13 +68,15 @@ struct rtc_time { s64 seconds; };
 struct rtc_wkalrm { struct rtc_time time; bool enabled, pending; };
 struct rtc_device { int events; };
 struct device { void *data; bool wake; int wake_events; };
-struct nvmem_cell { u8 data[8]; size_t bytes; int error; };
+struct nvmem_cell { u8 data[8]; size_t bytes; int error, write_error; };
 struct regmap {
     u8 bytes[65536];
     unsigned ctrl, counter, compare, mask, event, bit, control_event;
     int ops, fail;
 };
 static int disabled, pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
+static bool firmware_suspend;
+static bool pm_suspend_via_firmware(void) { return firmware_suspend; }
 static inline __attribute__((unused)) s64 sign_extend64(u64 v, int bit) { return (s64)(v << (63 - bit)) >> (63 - bit); }
 static u64 get_unaligned_le64(const void *p) { u64 v; memcpy(&v, p, 8); return v; }
 static void mutex_lock(struct mutex *m) { (void)m; }
@@ -89,6 +96,10 @@ static void *nvmem_cell_read(struct nvmem_cell *c, size_t *bytes) {
     if (c->error) return (void *)(intptr_t)c->error;
     void *p = malloc(c->bytes); assert(p); memcpy(p, c->data, c->bytes);
     *bytes = c->bytes; return p;
+}
+static int nvmem_cell_write(struct nvmem_cell *c, void *buf, size_t bytes) {
+    if (c->write_error) return c->write_error;
+    assert(bytes == c->bytes); memcpy(c->data, buf, bytes); return bytes;
 }
 static bool io_error(struct regmap *m) { return ++m->ops == m->fail; }
 static int regmap_read(struct regmap *m, unsigned reg, unsigned *v) {
@@ -226,16 +237,59 @@ static void run_variant(int v) {
     assert(!apple_pmu_rtc_validate_alarm(&rtc, 101));
     assert(apple_pmu_rtc_validate_alarm(&rtc, 100) == -ETIME);
     assert(!apple_pmu_rtc_validate_alarm(&rtc, 3700));
-    assert(apple_pmu_rtc_validate_alarm(&rtc, 3701) == -ERANGE);
     alarm.time.seconds = 1100;
     assert(apple_pmu_rtc_set_alarm(&dev, &alarm) == -ETIME);
     alarm.time.seconds = 4701;
-    assert(apple_pmu_rtc_set_alarm(&dev, &alarm) == -ERANGE);
+    if (a) {
+        /* One hour, where the alarm only ends a suspend-to-idle. */
+        assert(apple_pmu_rtc_validate_alarm(&rtc, 3701) == -ERANGE);
+        assert(apple_pmu_rtc_set_alarm(&dev, &alarm) == -ERANGE);
+    } else {
+        /* Baku: as far as the 32-bit comparator reaches. */
+        assert(!apple_pmu_rtc_validate_alarm(&rtc, 3701));
+        assert(!apple_pmu_rtc_validate_alarm(&rtc, U32_MAX));
+        assert(!apple_pmu_rtc_set_alarm(&dev, &alarm) && comparator() == 3701);
+        alarm.time.seconds = 86400 * 7 + 1000;
+        assert(!apple_pmu_rtc_set_alarm(&dev, &alarm) && comparator() == 86400 * 7);
+        alarm.time.seconds = 1000 + (s64)U32_MAX + 1;
+        assert(apple_pmu_rtc_set_alarm(&dev, &alarm) == -ERANGE);
+        assert(!apple_pmu_rtc_alarm_enable(&dev, 0));
+    }
     /* Reject malformed offsets and propagate NVMEM errors. */
     offset.bytes = a ? 8 : 6;
     assert(apple_pmu_rtc_offset(&rtc, &ticks) == -EINVAL);
     offset.error = -EIO;
     assert(apple_pmu_rtc_read_time(&dev, &time) == -EIO);
+    if (!a) {
+        /* Baku sets its whole-second offset, rounding the counter to the second. */
+        reset(v);
+        time.seconds = 5000;
+        set_counter((100ULL << 16) + 32767);
+        assert(!apple_pmu_rtc_set_time(&dev, &time));
+        assert(get_unaligned_le64(offset.data) == 4900);
+        assert(!apple_pmu_rtc_read_time(&dev, &time) && time.seconds == 5000);
+        time.seconds = 5000;
+        set_counter((100ULL << 16) + 32768);
+        assert(!apple_pmu_rtc_set_time(&dev, &time));
+        assert(get_unaligned_le64(offset.data) == 4899);
+        /* Alarms follow the new offset. */
+        alarm.time.seconds = 5030;
+        assert(!apple_pmu_rtc_set_alarm(&dev, &alarm) && comparator() == 131);
+        assert(!apple_pmu_rtc_alarm_enable(&dev, 0));
+        /* Before the counter's own time, and past what the offset may hold. */
+        time.seconds = 99;
+        assert(apple_pmu_rtc_set_time(&dev, &time) == -ERANGE);
+        time.seconds = RTC_TIMESTAMP_END_9999;
+        assert(apple_pmu_rtc_set_time(&dev, &time) == -ERANGE);
+        assert(get_unaligned_le64(offset.data) == 4899);
+        time.seconds = 5000;
+        offset.write_error = -EIO;
+        assert(apple_pmu_rtc_set_time(&dev, &time) == -EIO);
+        offset.write_error = 0;
+        map.ops = 0; map.fail = 1;
+        assert(apple_pmu_rtc_set_time(&dev, &time) == -EIO);
+        assert(get_unaligned_le64(offset.data) == 4899);
+    }
     reset(v);
     set_offset(-32768);
     if (a) {
@@ -275,11 +329,15 @@ static void run_variant(int v) {
     reset(v); assert(!apple_pmu_rtc_prepare(&dev));
     pm_suspend_target_state = 2;
     assert(apple_pmu_rtc_prepare(&dev) == -EBUSY);
+    /* A firmware-driven suspend programs the wake itself. */
+    firmware_suspend = true;
+    assert(!apple_pmu_rtc_prepare(&dev));
+    firmware_suspend = false;
     pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
 }
 int main(void) {
     run_variant(BAKU); run_variant(ABBEY); run_variant(STOWE); run_variant(MAVERICK);
-    puts("PMU RTC: Baku, Abbey, Stowe and Maverick arithmetic, W1C transactions and fault injection passed");
+    puts("PMU RTC: Baku, Abbey, Stowe and Maverick arithmetic, W1C transactions, Baku clock setting and fault injection passed");
     return 0;
 }
 '''

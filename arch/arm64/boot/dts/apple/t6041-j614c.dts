@@ -31,10 +31,15 @@
 
 &wifi0 {
 	brcm,board-type = "apple,mriya";
+	/* WLAN host wake (PCIe WAKE#), active high */
+	wake-gpios = <&pinctrl 39 GPIO_ACTIVE_HIGH>;
+	wakeup-source;
 };
 
 &bluetooth0 {
 	brcm,board-type = "apple,mriya";
+	/* Bluetooth host wake (PCIe WAKE#), active high */
+	wake-gpios = <&pinctrl 40 GPIO_ACTIVE_HIGH>;
 };
 
 /* The J614s panel. */

@@ -109,6 +109,9 @@ static void dcuart_irq_disable(struct dcuart_port *dcuart, u32 bits)
 	dcuart_irq_update(dcuart, bits, false);
 }
 
+/* The last console character timed out: see dockchannel_wait_putc(). */
+static bool dcuart_no_reader;
+
 static void dcuart_putc(struct uart_port *port, unsigned char c)
 {
 	struct dcuart_port *dcuart = container_of(port, struct dcuart_port, port);
@@ -116,7 +119,7 @@ static void dcuart_putc(struct uart_port *port, unsigned char c)
 	if (dcuart->never_wait)
 		dockchannel_console_putc(port->membase, &dcuart->console_tx, c);
 	else
-		dockchannel_wait_putc(port->membase, c);
+		dockchannel_wait_putc(port->membase, &dcuart_no_reader, c);
 }
 
 static void dcuart_write(struct console *co, const char *s,

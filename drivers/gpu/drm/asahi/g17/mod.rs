@@ -35,6 +35,7 @@ pub(crate) mod context;
 mod data_segment;
 mod dependency;
 mod sync_input;
+pub(crate) mod exec_share;
 pub(crate) mod sync_output;
 mod trace;
 #[cfg(CONFIG_DRM_ASAHI_G15)]
@@ -61,12 +62,14 @@ mod recovery;
 mod replay;
 mod reports;
 mod runtime;
+mod sleep;
 pub(crate) mod stats;
 pub(crate) mod status;
 mod teardown;
 pub(crate) mod telemetry;
 mod thermal;
 mod timeout;
+mod traversal;
 mod validation;
 
 use core::any::Any;
@@ -235,6 +238,9 @@ pub(crate) struct Config {
     /// Enable the GPU-to-fabric bridge and dynamic core power gating before the firmware
     /// starts (A18 Pro). The M4 Pro has only run with neither written.
     pub(crate) fabric_bridge: bool,
+    /// The firmware's warm restart across a system sleep is known for this SoC. Otherwise the
+    /// driver refuses a sleep that powers the SoC down.
+    pub(crate) sleep_restart: bool,
     /// The SoC's values of region C; `None` where the firmware graph has its own (M5).
     pub(crate) region_c: Option<&'static fw::initdata::RegionCConfig>,
     pub(crate) chip: Option<&'static fw::initdata::v25g83::Chip>,
@@ -273,6 +279,11 @@ pub(crate) enum CrashBuffers {
     /// The firmware places its crash log in its own data segment, the `fw-data` reserved
     /// region, and asks for it there by physical address.
     FirmwareData,
+    /// As [`CrashBuffers::FirmwareData`] when the boot loader describes the data segment as
+    /// the `fw-data` region. A boot loader that does not gets the driver's own buffers, as
+    /// [`CrashBuffers::Fixed`], at the low bits of the physical address the firmware asks for;
+    /// the firmware does not write its crash log there.
+    FirmwareDataOrFixed([FixedBuffer; 2]),
 }
 
 /// A firmware coprocessor instance.
@@ -284,12 +295,24 @@ pub(super) enum Role {
     Secondary = 1,
 }
 
+/// RTKit's crash log endpoint, over which the host also publishes a log buffer of its own.
+const EP_CRASHLOG: u8 = 0x01;
 /// RTKit endpoint of firmware messages: initialization, its acknowledgement and event
 /// notifications.
 const EP_FIRMWARE: u8 = 0x20;
 /// RTKit endpoint of host notifications to the firmware.
 const EP_DOORBELL: u8 = 0x21;
 
+/// Host message on the crashlog endpoint that hands a coprocessor a log buffer of the host's
+/// own, which it reaches through its kernel window: the size in 4 KiB pages and the buffer's
+/// address, in the fields of a buffer request but under a type of its own. macOS 27.0 sends it
+/// to both coprocessors once they run, after RTKit has echoed each one's request for the buffer
+/// in its own data segment; without it the firmware asks for that buffer a second time.
+const MSG_LOG_BUFFER: u64 = 0x9 << 52;
+/// Bit position of [`MSG_LOG_BUFFER`]'s size, in 4 KiB pages.
+const MSG_LOG_BUFFER_PAGES_SHIFT: u32 = 44;
+/// Address bits of a buffer that [`MSG_LOG_BUFFER`] carries.
+const MSG_LOG_BUFFER_ADDR_MASK: u64 = (1 << 44) - 1;
 /// Bit position of the type field of firmware messages.
 const MSG_TYPE_SHIFT: u32 = 48;
 /// Host message handing a coprocessor the address of its initialization root.
@@ -298,10 +321,23 @@ const MSG_INITDATA: u64 = 0x81 << MSG_TYPE_SHIFT;
 const MSG_INITDATA_ADDR_MASK: u64 = (1 << 44) - 1;
 /// Firmware message acknowledging [`MSG_INITDATA`].
 const MSG_INITDATA_ACK: u64 = 0x09;
+/// Host message on the doorbell endpoint that answers [`MSG_INITDATA_ACK`]: the acknowledgement
+/// type with the host bit. macOS 27.0 on the J813 sends it to both roles a few milliseconds after
+/// it hands them their initialization root (aura's trace: 0x89000000000000 on endpoint 0x21).
+const MSG_INITDATA_DONE: u64 = 0x89 << MSG_TYPE_SHIFT;
 /// Firmware message announcing new records in the event and trace rings.
 const MSG_EVENTS: u64 = 0x42 << MSG_TYPE_SHIFT;
 /// Primary processor notification for newly published device-control records.
 const MSG_CONTROL_NOTIFY: u64 = (0x84 << MSG_TYPE_SHIFT) | 0x11;
+
+/// The board is the J813 ([`fw::m5::initdata::Board::j813_forms`]), whose firmware (common
+/// 26A428) takes work in the G17P forms. macOS 27.0 there submits through the doorbell alone: it
+/// never writes the M5 Pro's host port (sgx+0x4090/0x4098) or the KSM queue registers
+/// (sgx+0x21068..0x21080), and rings render doorbells as 0x83 | priority << 2 (0 and 8 in its
+/// trace; compute is | 2).
+pub(crate) static J813_FORMS: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Host message, sent to both coprocessors once both are initialized, ending the power-on
 /// transition. The firmware then retires the opening device-control records.
 const MSG_POWER_ON_DONE: u64 = 0x89 << MSG_TYPE_SHIFT;
@@ -525,8 +561,26 @@ impl Coprocessor {
         role: Role,
     ) -> Result<Coprocessor> {
         let index = role as usize;
-        let (crash_buffer, crash_log) = match &cfg.crash_buffers {
-            CrashBuffers::Fixed(buffers) => {
+        let fixed = match &cfg.crash_buffers {
+            CrashBuffers::Fixed(buffers) => Some(buffers),
+            CrashBuffers::FirmwareData => None,
+            CrashBuffers::FirmwareDataOrFixed(buffers) => {
+                let described = data_segment::described(dev.as_ref().as_ref());
+                if role == Role::Primary {
+                    if described {
+                        dev_info!(dev.as_ref(), "G17: crash logs from the firmware data segment\n");
+                    } else {
+                        dev_info!(
+                            dev.as_ref(),
+                            "G17: no fw-data region from the boot loader, crash logs unreadable\n"
+                        );
+                    }
+                }
+                (!described).then_some(buffers)
+            }
+        };
+        let (crash_buffer, crash_log) = match fixed {
+            Some(buffers) => {
                 let buffer = &buffers[index];
                 let mut crash_buffer = KernelObject::new(
                     dev,
@@ -544,7 +598,7 @@ impl Coprocessor {
                 };
                 (Some(crash_buffer), Some((fixed, crash_map)))
             }
-            CrashBuffers::FirmwareData => (None, None),
+            None => (None, None),
         };
         let state = Arc::pin_init(
             pin_init!(RoleState {
@@ -577,7 +631,11 @@ impl Coprocessor {
     ) -> Result<rtkit::RtKit<RoleOps>> {
         for attempt in 0..RECEIVER_ATTEMPTS {
             match rtkit::RtKit::<RoleOps>::new(dev.as_ref().as_ref(), None, index, state.clone()) {
-                Ok(receiver) => return Ok(receiver),
+                Ok(receiver) => {
+                    // Its OSLOG counters stay unanswered until a soak shows echoing them is safe.
+                    receiver.set_oslog_echo(false);
+                    return Ok(receiver);
+                }
                 Err(error) if error == EINVAL || error == ETIMEDOUT => {
                     if attempt + 1 < RECEIVER_ATTEMPTS {
                         fsleep(Delta::from_millis(RECEIVER_RETRY_MS));
@@ -619,10 +677,36 @@ impl Coprocessor {
         self.rtkit.send(EP_DOORBELL, msg)
     }
 
+    /// Starts the CPU of firmware that lost power with its state intact, and waits for RTKit to
+    /// come up. No endpoint starts and no initialization: it already has both.
+    fn restart(&mut self) -> Result {
+        self.rtkit.with(|rtkit| rtkit.warm_restart())?;
+        self.cpu.start()?;
+        self.running = true;
+        self.rtkit.with(|rtkit| rtkit.boot())
+    }
+
+    /// Hands the firmware the host's log buffer ([`MSG_LOG_BUFFER`]).
+    fn publish_log_buffer(&self, va: u64, size: usize) -> Result {
+        let msg = MSG_LOG_BUFFER
+            | (((size >> 12) as u64) << MSG_LOG_BUFFER_PAGES_SHIFT)
+            | (va & MSG_LOG_BUFFER_ADDR_MASK);
+        trace::message(trace::MAILBOX, msg);
+        self.rtkit.send(EP_CRASHLOG, msg)
+    }
+
     /// Stops the CPU. The firmware keeps its state, but no longer runs.
     fn stop(&mut self) {
         if self.running {
             self.cpu.stop();
+            self.running = false;
+        }
+    }
+
+    /// The books for a CPU that the sleep's commit stopped, with no register access.
+    fn stopped_at_commit(&mut self) {
+        if self.running {
+            self.cpu.stopped_elsewhere();
             self.running = false;
         }
     }
@@ -656,6 +740,44 @@ impl Bridge {
             regs,
             enabled: false,
         }
+    }
+
+    /// The bridge across a power-off of the GPU's domain. Nothing on a target that runs without
+    /// it. Teardown still clears it afterwards.
+    fn set(&self, enable: bool) -> Result {
+        if !self.enabled {
+            return Ok(());
+        }
+        if enable {
+            return self.regs.enable_g17_bridge();
+        }
+        self.regs.disable_g17_bridge();
+        Ok(())
+    }
+
+    /// Core gating across a power-off of the GPU's domain. Nothing on a target that runs without
+    /// the bridge.
+    fn set_gating(&self, enable: bool) -> Result {
+        if !self.enabled {
+            return Ok(());
+        }
+        if enable {
+            self.regs.enable_g17_gating()
+        } else {
+            self.regs.hold_g17_gating()
+        }
+    }
+
+    /// Both bridge words and the gating word, on a target that has them.
+    fn words(&self) -> Option<[u32; 3]> {
+        if !self.enabled {
+            return None;
+        }
+        self.regs.g17_fabric_words().ok()
+    }
+
+    fn forget(&mut self) {
+        self.enabled = false;
     }
 
     fn disable(&mut self) {
@@ -746,7 +868,10 @@ impl Firmware {
     /// held through publication and the following mailbox notification.
     fn publish_control(&mut self, record: &fw::channels::ControlRecord) -> Result<u32> {
         use recovery::Memory;
-        if self.recovery.pending() || self.init.recovery_state()? != 0 {
+        if self.primary.state.shared.sleeping()
+            || self.recovery.pending()
+            || self.init.recovery_state()? != 0
+        {
             return Err(EAGAIN);
         }
         let target = channel::Rings::publish_control(&self.init, record)?;
@@ -798,11 +923,13 @@ impl Firmware {
         commit_accounting: impl FnOnce() -> Result,
         publish_inner: impl FnOnce(),
         deferred: bool,
+        cursors: Option<[u32; 3]>,
     ) -> Result<[u32; 2]> {
         let mut commit_accounting = Some(commit_accounting);
         let mut publish_inner = Some(publish_inner);
+        let mut cursors = cursors;
         for attempt in 0..2 {
-            let pair = self.init.m5_work_pair(priority, &records[0], &records[1])?;
+            let pair = self.init.m5_work_pair(priority, &records[0], &records[1], cursors.take())?;
             pair.prepare();
             if let Some(commit) = commit_accounting.take() { commit()?; }
             match self.bridge.regs.submit_m5_work(submission) {
@@ -885,8 +1012,16 @@ impl Firmware {
         // given, and the state records, the M5 value (InitData::submission_effort).
         let published = init.submission_effort(effort, state.waited());
         port.set_effort_full(effort == power::FULL_EFFORT);
-        if state.applied() == published && init.effort()? == published {
-            return Ok(());
+        if state.applied() == published {
+            // M5 maps region C read-only to the firmware: once confirmed, the word holds
+            // `applied` without reading it back.
+            if init.is_m5() && state.confirmed() {
+                return Ok(());
+            }
+            if init.effort()? == published {
+                state.confirm();
+                return Ok(());
+            }
         }
         init.publish_effort(published)?;
         trace::message(trace::EFFORT, u64::from(published));
@@ -896,7 +1031,7 @@ impl Firmware {
 
     /// Observe a telemetry epoch boundary without changing GPU power policy.
     fn observe_statistics_power(&mut self) {
-        if self.rings.statistics_suspended() {
+        if self.rings.statistics_suspended() || self.primary.state.shared.sleeping() {
             return;
         }
         let roles = self.roles();
@@ -1073,6 +1208,14 @@ struct Shared {
     /// The M5 shared-queue resource policy (frozen device topology).
     render_policy: Option<render_resources::M5Policy>,
     crashed: AtomicBool,
+    /// The firmware is stopped, or about to be: nothing may read or publish to it.
+    sleeping: AtomicBool,
+    /// A sleep holds preparations closed, so a recovery settling meanwhile doesn't reopen them.
+    sleep_gate: AtomicBool,
+    /// The power state word as it was before the firmware stopped.
+    sleep_ps: AtomicU32,
+    /// The stop the sleep's commit makes, from `.prepare` to `.complete`; null otherwise.
+    sleep_commit: core::sync::atomic::AtomicPtr<core::ffi::c_void>,
     feed: Arc<feed::Feed>,
     #[pin]
     feed_work: Work<Shared, FEED_WORK>,
@@ -1090,6 +1233,8 @@ struct Shared {
     /// returns, an owner closes, a teardown parks, and on every event pass
     /// while a render publisher waits (firmware consumption has no event).
     renders: Arc<availability::Availability>,
+    /// Which commands may enter the GPU beside a command that traces rays.
+    traversal: Arc<runtime::traversal::Gate>,
     /// Unbound compute publishers which can reuse a retired channel.
     compute_demand: AtomicU32,
     #[pin]
@@ -1189,6 +1334,9 @@ impl_has_work! {
 impl WorkItem<GROW_WORK> for Shared {
     type Pointer = Arc<Shared>;
     fn run(this: Arc<Shared>) {
+        if this.sleeping() {
+            return;
+        }
         if let Err(error) = this.grow_render() {
             if this.state.lock().is_some() {
                 dev_err!(
@@ -1212,6 +1360,9 @@ impl WorkItem<RECLAIM_WORK> for Shared {
 impl WorkItem<POLL_WORK> for Shared {
     type Pointer = Arc<Shared>;
     fn run(this: Arc<Shared>) {
+        if this.sleeping() {
+            return;
+        }
         let result = {
             let mut state = this.state.lock();
             match (*state).as_deref_mut() {
@@ -1443,6 +1594,8 @@ pub(crate) struct Gpu {
     _capacity: Pin<KBox<kernel::debugfs::File<capacity::View>>>,
     _reports: Pin<KBox<kernel::debugfs::File<reports::View>>>,
     _power: Pin<KBox<kernel::debugfs::File<reports::PowerView>>>,
+    _firmware_log: Pin<KBox<kernel::debugfs::File<reports::FirmwareLogView>>>,
+    _hardware_data: Pin<KBox<kernel::debugfs::File<reports::HardwareDataView>>>,
 }
 
 impl Gpu {
@@ -1499,6 +1652,27 @@ impl Gpu {
                 return Err(ENODEV);
             }
             let board = cfg.m5.ok_or(EINVAL)?;
+            J813_FORMS.store(board.j813_forms(), core::sync::atomic::Ordering::Relaxed);
+            // Hold the J813's GFX power domain for the session, as the G15 and G16 paths do
+            // for theirs. Without a hold genpd gates it once it finds no active consumer, and
+            // the GPU's cores can never come up: ps_gfx reads target 0xf with actual 0 while
+            // the coprocessors run out of their own always-on island and report the GPU busy.
+            if cfg.chip_id == 0x8142 {
+                extern "C" {
+                    fn asahi_j813_hold_power(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+                    fn asahi_j813_power_on_gfx() -> core::ffi::c_int;
+                }
+                // SAFETY: `dev` is this probe's device; runtime-PM accounting has no other
+                // requirement.
+                kernel::error::to_result(unsafe {
+                    asahi_j813_hold_power(pdev.as_ref().as_raw().cast())
+                })
+                .inspect_err(|e| dev_err!(dev.as_ref(), "M5: no GFX power hold: {:?}\n", e))?;
+                // SAFETY: the helper only ioremaps and pokes the T8142 PMGR GPU power-state
+                // register.
+                kernel::error::to_result(unsafe { asahi_j813_power_on_gfx() })
+                    .inspect_err(|e| dev_err!(dev.as_ref(), "M5: GFX domain not powered: {:?}\n", e))?;
+            }
             // The M5 layouts are sized for every core slot of the board, fused-off cores
             // included, so the GPU is matched on clusters and slots, not on enabled cores.
             if id.num_clusters != board.clusters || id.num_clusters * id.num_cores != board.gpu_cores
@@ -1541,6 +1715,7 @@ impl Gpu {
         let queues = availability::Availability::new()?;
         let preparations = preparation::Gate::with_waiters(Some(progress.clone()))?;
         let renders = availability::Availability::new()?;
+        let traversal = runtime::traversal::Gate::new()?;
         let reclaim = runtime::teardown::ReclaimBatch::new()?;
         let feed = feed::Feed::new(m5)?;
         let alternate = cfg.core_layout.cores.is_some_and(|(clusters, cores)| {
@@ -1599,6 +1774,10 @@ impl Gpu {
                 firmware_test: !submits,
                 render_policy,
                 crashed: AtomicBool::new(false),
+                sleeping: AtomicBool::new(false),
+                sleep_gate: AtomicBool::new(false),
+                sleep_ps: AtomicU32::new(0),
+                sleep_commit: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
                 feed,
                 feed_work <- new_work!("g17::Shared::feed_work"),
                 preparations,
@@ -1606,6 +1785,7 @@ impl Gpu {
                 progress,
                 queues,
                 renders,
+                traversal,
                 compute_demand: AtomicU32::new(0),
                 work <- new_work!("g17::Shared::work"),
                 housekeeping: AtomicBool::new(true),
@@ -1644,9 +1824,18 @@ impl Gpu {
             directory.read_only_file(c"power", reports::PowerView(shared.clone())),
             GFP_KERNEL,
         )?;
+        let firmware_log = KBox::pin_init(
+            directory.read_only_file(c"firmware_log", reports::FirmwareLogView(shared.clone())),
+            GFP_KERNEL,
+        )?;
+        let hardware_data = KBox::pin_init(
+            directory.read_only_file(c"hardware_data", reports::HardwareDataView(shared.clone())),
+            GFP_KERNEL,
+        )?;
+        let frequencies = Self::state_frequencies(dev, cfg, variant, id.num_clusters)?;
         let stats = Arc::new(
             crate::stats::StatsSnapshot {
-                g17_reader: Some(stats::Reader(shared.clone())),
+                g17_reader: Some(stats::Reader(shared.clone(), frequencies)),
                 ..Default::default()
             },
             GFP_KERNEL,
@@ -1663,6 +1852,8 @@ impl Gpu {
                 _capacity: capacity,
                 _reports: reports,
                 _power: power,
+                _firmware_log: firmware_log,
+                _hardware_data: hardware_data,
             },
             GFP_KERNEL,
         )?;
@@ -1755,6 +1946,36 @@ impl Gpu {
         cells.as_slice().try_into().ok()
     }
 
+    /// The frequency of each performance state the firmware reports
+    /// ([`stats::reports_pstate`]): M5's from its board, the A18 Pro's from the operating
+    /// points its performance table A names. The A18 Pro's records do not name the table, but
+    /// at its top state, where it runs while work is in flight, a sustained FP32 FMA load
+    /// completes faster than table B's frequency there allows. `None` where the firmware
+    /// reports no state.
+    fn state_frequencies(
+        dev: &AsahiDrmDevice,
+        cfg: &'static Config,
+        variant: &fw::variant::Variant,
+        clusters: u32,
+    ) -> Result<Option<stats::StateFrequencies>> {
+        if !stats::reports_pstate(variant.graph, variant.m5_commands) {
+            return Ok(None);
+        }
+        if let Some(board) = cfg.m5 {
+            return Ok(stats::StateFrequencies::new(
+                board.perf_states.iter().map(|state| state.0),
+            ));
+        }
+        let perf = cfg.perf()?;
+        let opps = initdata::InitData::opps(dev, cfg.opps, clusters)?;
+        let mut mhz = [0u32; fw::initdata::PERF_STATES];
+        for (slot, &index) in mhz.iter_mut().zip(perf.states_a.iter()) {
+            let opp = opps.get(usize::from(index)).ok_or(EINVAL)?;
+            *slot = u32::try_from(opp.freq_hz / 1_000_000)?;
+        }
+        Ok(stats::StateFrequencies::new(mhz.into_iter()))
+    }
+
     /// Returns the highest advertised operating-point frequency without changing table order.
     fn max_frequency_khz(dev: &AsahiDrmDevice) -> Result<u32> {
         let node = dev.as_ref().as_ref().of_node().ok_or(EIO)?;
@@ -1810,8 +2031,24 @@ impl Gpu {
         // link the tables of every lower range the M5 graph and its queues use first.
         uat.prepare_lower_tables(&initdata::InitData::m5_lower_links(
             uat.kernel_lower_dynamic_range(),
+            board.graph,
         ))
         .inspect_err(at("lower links"))?;
+        // The J813's firmware runs part of a render in context 0, whose user root is the kernel
+        // lower VM, and touches the render's metrics through their compact-window address
+        // there (InitData::bind_m5_metrics): link that window's table too.
+        if J813_FORMS.load(core::sync::atomic::Ordering::Relaxed) {
+            let compact = buffer::BlockGeometry::M5_COMPACT.start;
+            uat.prepare_lower_tables(&[compact..compact + mmu::UAT_PGSZ as u64])
+                .inspect_err(at("lower links"))?;
+        }
+        // The J813 in native order, from aura's trace of macOS 27.0 on that machine: the start
+        // control is written first (macOS does it at platform init), the coprocessors are started
+        // next, and the Fender gating is cleared only once both of them run -- not before them.
+        // The other boards prepare both after the coprocessor boot (prepare_m5_firmware).
+        if cfg.chip_id == 0x8142 {
+            regs.set_m5_start_control().inspect_err(at("M5 start control"))?;
+        }
         let primary = Coprocessor::new(pdev, dev, cfg, &uat, shared, Role::Primary)
             .inspect_err(|e| dev_err!(dev.as_ref(), "Primary coprocessor setup failed: {:?}\n", e))?;
         let secondary = Coprocessor::new(pdev, dev, cfg, &uat, shared, Role::Secondary)
@@ -1846,7 +2083,7 @@ impl Gpu {
                     shared.feed.clone(),
                 )?,
                 seen_submissions: 0,
-                rings: channel::Rings::new(shared.variant.graph)?,
+                rings: channel::Rings::new(shared.variant.graph, shared.variant.m5_commands)?,
                 recovery: recovery::State::new(),
                 effort: power::Effort::new(),
                 hold: power::Hold::new(),
@@ -1861,7 +2098,7 @@ impl Gpu {
                     Some(shared.queues.clone()),
                     Some(shared.renders.clone()),
                 ),
-                pool: object::Pool::new()?,
+                pool: object::Pool::new(shared.variant.objects_after_release)?,
                 render_rings: kick::RenderRings::new()?,
                 render_ids: freelist::RenderIds::new()?,
                 init: initdata::InitData::new(),
@@ -1881,9 +2118,24 @@ impl Gpu {
         let session = &mut **retained;
         // M5 renders take 64-byte metrics records.
         session.queues.metrics = metrics_ids;
-        session.primary.boot().inspect_err(at("primary boot"))?;
-        let secondary = session.secondary.as_mut().ok_or(EINVAL)?;
-        secondary.boot().inspect_err(at("secondary boot"))?;
+        // The J813's macOS 27.0 starts GFX1's coprocessor first and GFX's 330 ms later (aura's
+        // trace), the same way round as the InitData it publishes below.
+        if cfg.chip_id == 0x8142 {
+            session.secondary.as_mut().ok_or(EINVAL)?.boot().inspect_err(at("secondary boot"))?;
+            session.primary.boot().inspect_err(at("primary boot"))?;
+        } else {
+            session.primary.boot().inspect_err(at("primary boot"))?;
+            session.secondary.as_mut().ok_or(EINVAL)?.boot().inspect_err(at("secondary boot"))?;
+        }
+        // Both coprocessors run: clear the J813's Fender gating here, where macOS 27.0 clears it
+        // (it reads 0x6 and writes 0 after both ASCs are running and the first mailbox exchange).
+        if cfg.chip_id == 0x8142 {
+            session
+                .bridge
+                .regs
+                .enable_g17_gating()
+                .inspect_err(at("G17 gating after the coprocessor boot"))?;
+        }
         // The firmware built its root and kernel-window tables while booting.
         session.uat.invalidate_reserved_tables();
         let root_entries = session
@@ -1915,21 +2167,45 @@ impl Gpu {
             .confirm_firmware_root_entries(root_entries)
             .inspect_err(at("root confirmation"))?;
         session.uat.mirror_secondary_root().inspect_err(at("secondary root"))?;
-        session
-            .bridge
-            .regs
-            .prepare_m5_firmware()
-            .inspect_err(at("M5 preparation"))?;
+        if cfg.chip_id == 0x8142 {
+            // The J813's log buffers, GFX1's first and then GFX's, in macOS 27.0's order and
+            // before any endpoint of theirs is started.
+            for role in [Role::Secondary, Role::Primary] {
+                let (va, size) = initdata::InitData::fw_log(role);
+                let coprocessor = match role {
+                    Role::Primary => &session.primary,
+                    Role::Secondary => session.secondary.as_ref().ok_or(EINVAL)?,
+                };
+                coprocessor.publish_log_buffer(va, size).inspect_err(at("log buffer"))?;
+            }
+        } else {
+            session
+                .bridge
+                .regs
+                .prepare_m5_firmware()
+                .inspect_err(at("M5 preparation"))?;
+        }
         let ack = shared.variant.init_ack;
-        session
-            .primary
-            .init(session.init.root_va(Role::Primary)?, ack)
-            .inspect_err(at("primary InitData"))?;
-        dev_info!(dev.as_ref(), "M5 primary initdata acknowledged\n");
-        let root_va = session.init.root_va(Role::Secondary)?;
+        let primary_root = session.init.root_va(Role::Primary)?;
+        let secondary_root = session.init.root_va(Role::Secondary)?;
+        // The J813's macOS publishes and acknowledges GFX1's InitData first, then GFX's (its
+        // 25G76 trace); the M5 Pro's graph starts with the primary.
+        if cfg.chip_id == 0x8142 {
+            let secondary = session.secondary.as_mut().ok_or(EINVAL)?;
+            secondary.init(secondary_root, ack).inspect_err(at("secondary InitData"))?;
+            secondary.notify(MSG_INITDATA_DONE)?;
+            dev_info!(dev.as_ref(), "M5 secondary initdata acknowledged\n");
+            session.primary.init(primary_root, ack).inspect_err(at("primary InitData"))?;
+            session.primary.notify(MSG_INITDATA_DONE)?;
+            dev_info!(dev.as_ref(), "M5 primary initdata acknowledged\n");
+        } else {
+            session.primary.init(primary_root, ack).inspect_err(at("primary InitData"))?;
+            dev_info!(dev.as_ref(), "M5 primary initdata acknowledged\n");
+            let secondary = session.secondary.as_mut().ok_or(EINVAL)?;
+            secondary.init(secondary_root, ack).inspect_err(at("secondary InitData"))?;
+            dev_info!(dev.as_ref(), "M5 secondary initdata acknowledged\n");
+        }
         let secondary = session.secondary.as_mut().ok_or(EINVAL)?;
-        secondary.init(root_va, ack).inspect_err(at("secondary InitData"))?;
-        dev_info!(dev.as_ref(), "M5 secondary initdata acknowledged\n");
         session.primary.notify(MSG_POWER_ON_DONE)?;
         secondary.notify(MSG_POWER_ON_DONE)?;
         Self::wait_for_opening(dev, &session.init, &session.primary, session.secondary.as_ref())
@@ -2011,7 +2287,7 @@ impl Gpu {
                     shared.feed.clone(),
                 )?,
                 seen_submissions: 0,
-                rings: channel::Rings::new(shared.variant.graph)?,
+                rings: channel::Rings::new(shared.variant.graph, shared.variant.m5_commands)?,
                 recovery: recovery::State::new(),
                 effort: power::Effort::new(),
                 hold: power::Hold::new(),
@@ -2026,7 +2302,7 @@ impl Gpu {
                     Some(shared.queues.clone()),
                     Some(shared.renders.clone()),
                 ),
-                pool: object::Pool::new()?,
+                pool: object::Pool::new(shared.variant.objects_after_release)?,
                 render_rings: kick::RenderRings::new()?,
                 render_ids: freelist::RenderIds::new()?,
                 init: initdata::InitData::new(),
@@ -2229,7 +2505,8 @@ impl gpu::Gpu for Gpu {
             u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)
                 | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS)
                 | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)
-                | sync_output::FEATURE_CUMULATIVE_SIGNALS;
+                | sync_output::FEATURE_CUMULATIVE_SIGNALS
+                | crate::file::DRM_ASAHI_FEATURE_COMPUTE_TIMEOUT;
         let variant = self.shared.variant;
         // The M5 command set has no AS-build flag: its validation refuses one.
         if !variant.m5_commands {
@@ -2237,6 +2514,14 @@ impl gpu::Gpu for Gpu {
         }
         if variant.few_primitives {
             params.features |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FEW_PRIMITIVES);
+        }
+        // Only the A18 Pro heap sizes itself for it; other command sets accept the hint too.
+        if !variant.m5_commands {
+            params.features |= crate::file::DRM_ASAHI_FEATURE_RENDER_MESH_OUTPUT;
+        }
+        // The M5 command set reports it with M5_FEATURES.
+        if !variant.m5_commands && variant.render_stage_prefixes {
+            params.features |= crate::file::DRM_ASAHI_FEATURE_RENDER_STAGE_PREFIXES_V2;
         }
         if variant.render_ray_query {
             params.features |=

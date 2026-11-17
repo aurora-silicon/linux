@@ -65,7 +65,7 @@ struct avd_decoded_buffer {
  struct {unsigned int color_size; unsigned short width,height; size_t seg_size;} av1;
 };
 struct avd_buf {void *cpu; dma_addr_t addr;};
-struct avd_run {struct {struct vb2_v4l2_buffer *src,*dst;} bufs; dma_addr_t y_out;};
+struct avd_run {struct {struct vb2_v4l2_buffer *src,*dst;} bufs; dma_addr_t y_out; int setup_err;};
 @RUN_STRUCT@
 @CTX_STRUCT@
 struct v4l2_ctrl {unsigned int elems; struct {void *p;} p_cur;};
@@ -73,7 +73,7 @@ struct v4l2_pix_format_mplane {unsigned int width,height; struct {unsigned int s
 struct avd_ctx {void *priv; int ctrl_hdl; struct {struct {struct {unsigned int width,height;} pix_mp;} fmt;} decoded_fmt;};
 static struct avd_decoded_buffer *reference;
 static struct v4l2_ctrl_av1_frame frame;
-static struct v4l2_ctrl_av1_sequence sequence;
+static struct v4l2_ctrl_av1_sequence sequence={.bit_depth=8,.flags=V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_X|V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y};
 static struct v4l2_ctrl_av1_tile_group_entry tile;
 static struct v4l2_ctrl_av1_film_grain grain;
 static struct v4l2_ctrl controls[4];
@@ -137,7 +137,7 @@ static void reservation(unsigned int width,unsigned int height,unsigned int comp
  assert(cdf%256==0&&co%256==0);assert(cdf>=compressed);assert(cdf+sizeof(struct avd_av1_cdfs)<=co);assert(co+color<=length);
  assert(cdf==aligned_cdf(length,color));assert(co==cdf+9216);
 }
-/* The preamble refuses frames larger than the format and out-of-range reference indices. */
+/* The preamble refuses frames larger than the format, out-of-range reference indices and sequences other than Main 4:2:0. */
 static int preamble(unsigned int w,unsigned int h,unsigned char primary,signed char idx){
  struct avd_decoded_buffer dst={0};struct avd_av1_ctx av1={0};struct avd_ctx ctx={.priv=&av1};struct avd_av1_run run={0};set_frame_ctx(&ctx);
  dst.base.vb.vb2_buf.planes[0].length=7000064;memset(&frame,0,sizeof(frame));
@@ -149,6 +149,10 @@ static void guards(void){
  assert(preamble(1921,1080,0,0)==-EINVAL);assert(preamble(1920,1081,0,0)==-EINVAL);
  assert(preamble(1920,1080,7,0)==0);assert(preamble(1920,1080,8,0)==-EINVAL);assert(preamble(1920,1080,255,0)==-EINVAL);
  assert(preamble(1920,1080,6,7)==0);assert(preamble(1920,1080,6,8)==-EINVAL);assert(preamble(1920,1080,0,-1)==-EINVAL);assert(preamble(1920,1080,3,-128)==-EINVAL);
+ /* A sequence stored while another codec was selected was never checked. */
+ sequence.seq_profile=1;assert(preamble(1920,1080,0,0)==-EINVAL);sequence.seq_profile=0;
+ sequence.flags&=~V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y;assert(preamble(1920,1080,0,0)==-EINVAL);sequence.flags|=V4L2_AV1_SEQUENCE_FLAG_SUBSAMPLING_Y;
+ assert(preamble(1920,1080,0,0)==0);
 }
 /* Segmentation map kept with each frame: expect 0 zeroes it, 1 copies the reference's, 2 leaves the AVD's map. */
 static void segmap(unsigned char flags,unsigned char primary,unsigned int ref_w,unsigned int ref_h,bool missing,int expect){
@@ -215,7 +219,7 @@ def main():
     text = {name: p.read_text() for name, p in paths.items()}
     src = text['avd-av1.c']
     macros = src[src.index('#define AVD_CDFS_SIZE'):src.index('struct avd_av1_run {')]
-    functions = {n: function(src, n) for n in ['avd_av1_ref_ts', 'avd_av1_set_prob', 'avd_av1_set_seg', 'avd_av1_seg_size', 'avd_color_size', 'avd_av1_check_tiles', 'avd_av1_run_preamble', 'avd_av1_adjust_decoded_fmt']}
+    functions = {n: function(src, n) for n in ['avd_av1_ref_ts', 'avd_av1_set_prob', 'avd_av1_set_seg', 'avd_av1_seg_size', 'avd_color_size', 'avd_av1_check_tiles', 'avd_av1_validate_sequence', 'avd_av1_run_preamble', 'avd_av1_adjust_decoded_fmt']}
     unaligned = ('\n#define UNALIGNED_CDFS_OFFSET(dst,cl) ((dst)-ALIGN(cl,AVD_ALIGN)-ALIGN(AVD_CDFS_SIZE,AVD_ALIGN))\n'
                  '#define UNALIGNED_SEG_OFFSET(dst,cl,sl) (UNALIGNED_CDFS_OFFSET(dst,cl)-(sl))\n')
     # Each mutation names the extracted text it rewrites; a stale one is refused, never run as a no-op.
