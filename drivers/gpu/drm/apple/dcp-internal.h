@@ -928,6 +928,8 @@ struct apple_dcp {
 		unsigned int reswaps;
 		/* swap_completed_mode=2: swap_enabled of the previous completed swap. */
 		u32 prev_swap_enabled;
+		/* A reswap repeat is in flight: its completion emits no flip event. */
+		bool reswap_active;
 		/*
 		 * Presents the firmware dropped, until it completes a later one:
 		 * at most one per present retired in present_state_h17p.

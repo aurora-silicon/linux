@@ -708,8 +708,14 @@ static void dcp_report_swap_complete(struct apple_dcp *dcp, u32 id, ktime_t now)
 	dcp->have_swap_complete = true;
 	dcp_swap_watchdog_complete(dcp);
 	if (retire) {
-		dcp_release_retained_framebuffers(dcp, id);
-		dcp_drm_crtc_page_flip(dcp, now);
+		if (dcp->iomfb.reswap_active) {
+			/* A repeat displaced nothing: no flip event, no retained release. */
+			dcp->iomfb.reswap_active = false;
+			iomfb_scanout_complete_h17p(dcp);
+		} else {
+			dcp_release_retained_framebuffers(dcp, id);
+			dcp_drm_crtc_page_flip(dcp, now);
+		}
 	}
 	if (READ_ONCE(dcp->crc_enabled)) {
 #if DCP_FW_H17(DCP_FW_VER)
@@ -3311,6 +3317,22 @@ static void dcp_w86_after_400(struct apple_dcp *dcp, void *out, void *cookie)
 }
 #endif
 
+/*
+ * Reswap repeat submit: the repeat's own scanout is already in next_scanout;
+ * run the full swap_start path so the firmware assigns a new swap_id. The
+ * completion takes the reswap branch above: no flip event, no retained
+ * release, and the repeat's scanout becomes current through the normal
+ * complete path.
+ */
+static void iomfb_reswap_submit(struct apple_dcp *dcp)
+{
+	struct DCP_FW_NAME(dcp_swap_start_req) start_req =
+		dcp_swap_start_request(dcp);
+
+	dcp->iomfb.reswap_active = true;
+	dcp_swap_start(dcp, false, &start_req, dcp_swap_started, NULL);
+}
+
 static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 {
 	int ret;
@@ -4272,13 +4294,13 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 
 		req->surf_iova[l] = apple_state->iova;
 		req->surf[l].base = apple_state->surf;
+#if DCP_FW_H17(DCP_FW_VER)
+		req->surf[l].base.surface_id = 0;
+#endif
 		if (READ_ONCE(dcp_surf_id_per_fb) && new_state->fb) {
 			req->surf[l].base.surface_id = new_state->fb->base.id;
 			req->swap.surf_ids[apl_plane->iomfb_surf] = new_state->fb->base.id;
 		}
-#if DCP_FW_H17(DCP_FW_VER)
-		req->surf[l].base.surface_id = 0;
-#endif
 
 		/* Internal panels: tag untagged RGB with the panel's own
 		 * primaries (P3-D65, as its EDID reports), so the firmware

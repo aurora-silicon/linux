@@ -3569,9 +3569,10 @@ bool iomfb_present_complete_h17p(struct apple_dcp *dcp)
 		atomic_cmpxchg(&dcp->iomfb.opaque_x_state, IOMFB_OPAQUE_X_WAITING,
 			       IOMFB_OPAQUE_X_NEEDED);
 	iomfb_scanout_complete_h17p(dcp);
-	dcp->iomfb.prev_swap_enabled = dcp->swap.h17p.swap.swap_enabled;
-	if (!transaction || !transaction->brightness_only)
+	if (!transaction || !transaction->brightness_only) {
+		dcp->iomfb.prev_swap_enabled = dcp->swap.h17p.swap.swap_enabled;
 		iomfb_reswap_kick(dcp);
+	}
 	return true;
 }
 
@@ -3797,19 +3798,37 @@ static void iomfb_atomic_release(struct iomfb_transaction *transaction)
  * same full request again as REAL swaps (new swap_id each, no flip event),
  * up to dcp_reswap times. An idle 27.3 pipeline holds the last two frames off
  * the glass until two more swaps arrive; the repeats advance it. The repeat
- * reuses the flush tail's submit path (do_swap): same pending request slot,
- * fresh timestamps, full swap_start + swap_submit, no atomic state, no
- * scanout pointer moves, so there is no lifetime question at all.
+ * builds its own scanout object (a copy of the completed one, with its own
+ * framebuffer references) and submits it through the full swap_start path;
+ * its completion takes the reswap branch (no flip event, no retained
+ * release). No atomic state, no shared scanout moves, no NULL commit
+ * dereference.
  */
-static void do_swap(struct apple_dcp *dcp, void *data, void *cookie);
+static void iomfb_reswap_submit(struct apple_dcp *dcp);
 
 static void iomfb_reswap_start(struct apple_dcp *dcp,
 			       struct iomfb_transaction *transaction)
 {
+	struct iomfb_scanout_h17p *scanout;
+
 	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0 || !iomfb_scanout_presentable(dcp))
 		return;
+	if (!READ_ONCE(dcp->mode_state.valid) || !dcp->connector ||
+	    !READ_ONCE(dcp->connector->connected))
+		return;
 
-	do_swap(dcp, NULL, NULL);
+	scanout = kzalloc_obj(*scanout);
+	if (!scanout)
+		return;
+	INIT_LIST_HEAD(&scanout->link);
+	scanout->request = dcp->iomfb.scanout->request;
+	for (unsigned int i = 0; i < SWAP_SURFACES; i++) {
+		scanout->fb[i] = dcp->iomfb.scanout->fb[i];
+		if (scanout->fb[i])
+			drm_framebuffer_get(scanout->fb[i]);
+	}
+	dcp->iomfb.next_scanout = scanout;
+	iomfb_reswap_submit(dcp);
 }
 
 static void iomfb_reswap_release(struct iomfb_transaction *transaction)
@@ -3837,13 +3856,13 @@ static void iomfb_reswap_kick(struct apple_dcp *dcp)
 		return;
 	transaction->start = iomfb_reswap_start;
 	transaction->release = iomfb_reswap_release;
+	transaction->presentation = true;
 	if (iomfb_queue(dcp, transaction)) {
 		kfree(transaction);
 		return;
 	}
 	dcp->iomfb.reswaps++;
 }
-
 
 static void iomfb_queue_atomic(struct apple_dcp *dcp, struct drm_crtc *crtc,
 			       struct drm_atomic_commit *state)
