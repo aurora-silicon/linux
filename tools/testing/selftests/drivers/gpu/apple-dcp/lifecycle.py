@@ -1221,7 +1221,10 @@ struct device_node { bool named; unsigned count; };
 struct device { struct device_node *of_node; };
 struct platform_device { struct device dev; int num_resources; struct resource resources[10]; };
 #define to_platform_device(d) ((struct platform_device *)(d))
+/* Resource-profile tests carry, but never dereference, the sleep layout. */
+static const unsigned dcp_s2r_t8140;
 struct apple_dcp_hw_data {
+    const void *s2r_layout;
     unsigned num_dptx_ports; bool adopt_live_session;
     int iomfb_method_profile,firmware_compat;
     const struct resource *firmware_clock;

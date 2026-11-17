@@ -713,8 +713,8 @@ fn select(
     if has(b"apple,t8132") && (has(b"apple,j713") || has(b"apple,j715")) {
         return Ok(&T8132);
     }
-    // The J815 and the J813, whose ADTs were read (macOS 27.0 stub firmware):
-    // the J813's SEP, its DART, spi2 and the Mesa node carry the J815's values.
+    // The J815 and the J813, whose ADTs were read: both have the sensor (mesa) on spi2
+    // at 0x3a5108000.
     if has(b"apple,t8142") && (has(b"apple,j815") || has(b"apple,j813")) {
         return Ok(&T8142);
     }

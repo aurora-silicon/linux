@@ -29,6 +29,7 @@
 #define MCC_CACHE_WAYS_ENABLED	GENMASK(4, 0)
 #define MCC_CACHE_POWER		0x2804
 #define MCC_CACHE_WAYS_POWERED	GENMASK(30, 24)
+#define MCC_CACHE_TAGS_POWERED	GENMASK(14, 8)
 #define MCC_CACHE_FLUSH		0x2844
 #define MCC_CACHE_FLUSH_BUSY	BIT(0)
 
@@ -41,6 +42,12 @@ struct apple_mcc {
 	unsigned int nr_planes;
 	bool enabled;
 	bool retained;
+	/*
+	 * T8142: a deep sleep also turns the cache's ways off, as AppleT8142MCC's sleep action
+	 * does, and the wake puts the boot's way count back.
+	 */
+	bool ways_off;
+	u32 ways;
 	/* Turned off for a deep sleep, to be turned back on after it. */
 	bool sleep_disabled;
 };
@@ -183,6 +190,34 @@ static void apple_mcc_disable_planes(struct apple_mcc *mcc, unsigned int count)
 			dev_err(mcc->dev, "plane %u flush timed out\n", i);
 }
 
+/*
+ * AppleT8142MCC's mccEnableCacheMode and aura's cold-boot enable: every plane's way count,
+ * then each plane's data and tag ways (0x2804 [30:24] and [14:8]) waited for until both
+ * read it. macOS waits without a limit.
+ */
+static int apple_mcc_set_ways(struct apple_mcc *mcc, u32 ways)
+{
+	unsigned int i;
+	u32 val;
+	int ret;
+
+	for (i = 0; i < mcc->nr_planes; i++)
+		apple_mcc_writel(mcc, i, ways, MCC_CACHE_WAYS);
+
+	for (i = 0; i < mcc->nr_planes; i++) {
+		ret = readl_poll_timeout_atomic(mcc->planes[i] + MCC_CACHE_POWER, val,
+						FIELD_GET(MCC_CACHE_WAYS_POWERED, val) == ways &&
+						FIELD_GET(MCC_CACHE_TAGS_POWERED, val) == ways,
+						10, MCC_FLUSH_TIMEOUT_US);
+		if (ret) {
+			dev_err(mcc->dev, "plane %u ways did not reach %u: %#x\n", i, ways, val);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
 static int apple_mcc_enable(struct apple_mcc *mcc)
 {
 	unsigned int i;
@@ -229,6 +264,7 @@ static int apple_mcc_probe(struct platform_device *pdev)
 
 	mcc->dev = dev;
 	mcc->retained = of_device_is_compatible(dev->of_node, "apple,t8132-mcc");
+	mcc->ways_off = of_device_is_compatible(dev->of_node, "apple,t8142-mcc");
 	while (platform_get_resource(pdev, IORESOURCE_MEM, mcc->nr_planes)) {
 		struct resource *res = platform_get_resource(pdev, IORESOURCE_MEM, mcc->nr_planes);
 
@@ -258,6 +294,9 @@ static int apple_mcc_probe(struct platform_device *pdev)
 		return ret;
 
 	mcc->enabled = true;
+	if (mcc->ways_off)
+		mcc->ways = FIELD_GET(MCC_CACHE_WAYS_ENABLED,
+				      readl(mcc->planes[0] + MCC_CACHE_WAYS));
 	dev_info(dev, "system level cache allocation enabled on %u planes\n", mcc->nr_planes);
 	return 0;
 }
@@ -306,6 +345,14 @@ static int apple_mcc_suspend_noirq(struct device *dev)
 	if (!mcc->enabled)
 		return 0;
 	apple_mcc_quiesce(mcc);
+	/*
+	 * T8142 has no skip-mcc-off-to-s2r (only T8140's J700 does), so macOS turns the ways
+	 * off before the sleep: way count 0. The flush above (the kext's own cacheFlush) has
+	 * written everything back already, so a timeout here loses nothing and only leaves
+	 * the ways as they were.
+	 */
+	if (mcc->ways_off && mcc->ways)
+		apple_mcc_set_ways(mcc, 0);
 	mcc->sleep_disabled = true;
 
 	return 0;
@@ -319,6 +366,10 @@ static int apple_mcc_resume_noirq(struct device *dev)
 	if (!mcc->sleep_disabled)
 		return 0;
 	mcc->sleep_disabled = false;
+	/* The way count the boot set, back (it reads 0 after the power loss, or after the above). */
+	if (mcc->ways_off && mcc->ways &&
+	    FIELD_GET(MCC_CACHE_WAYS_ENABLED, readl(mcc->planes[0] + MCC_CACHE_WAYS)) != mcc->ways)
+		apple_mcc_set_ways(mcc, mcc->ways);
 	/* Only a performance setting: a cache not ready after the wake stays off. */
 	ret = mcc->retained ? apple_mcc_enable_t8132(mcc) : apple_mcc_enable(mcc);
 	mcc->enabled = !ret;
@@ -335,6 +386,7 @@ static const struct dev_pm_ops apple_mcc_pm_ops = {
 static const struct of_device_id apple_mcc_of_match[] = {
 	{ .compatible = "apple,t8132-mcc" },
 	{ .compatible = "apple,t8140-mcc" },
+	{ .compatible = "apple,t8142-mcc" },
 	{}
 };
 MODULE_DEVICE_TABLE(of, apple_mcc_of_match);

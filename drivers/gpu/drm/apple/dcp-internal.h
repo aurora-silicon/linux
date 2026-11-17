@@ -228,6 +228,24 @@ struct dcp_panel {
 };
 
 /*
+ * The internal display's power words for hw.s2r, see dcp_s2r_domains_off(): its domains'
+ * offsets in "ps", its retention controls in "pwrgate" (the PMGR's per-device "retention"
+ * words: flip-flops 3 off / 0 on, memories 0 off / 1 on), and the DART streams its firmware
+ * and scanout use.
+ */
+struct dcp_s2r_layout {
+	u32 disp_cpu;
+	u32 disp_fe;
+	u32 disp_sys;
+	u32 ret_ff;
+	u32 ret_mem;
+	u32 dcp_streams;
+	u32 disp_streams;
+	/* "pmc-dcp" counts the powered DCPs: T8132 and T8140 only */
+	bool pmc_dcp;
+};
+
+/*
  * Identity of a fixed internal panel, for the EDID published on its
  * connector.  Any processor with an internal panel allocates it; the boot
  * loader's ADT supplies the fallback, and firmware metadata or a raw panel
@@ -287,6 +305,17 @@ struct apple_dcp_hw_data {
 	 */
 	bool link_report;
 	/*
+	 * The endpoint the DPTX port services are announced on, where it is not
+	 * the firmware's default (DPTX_ENDPOINT_V2 on firmware 27): the T8142
+	 * dcpext announces them on DPTX_ENDPOINT. 0: the default.
+	 */
+	u8 dptx_endpoint;
+	/*
+	 * Open the DPTX controller endpoint before the ports, as for H17P
+	 * externals: the T8142 dcpext announces AppleDCPDPTXController there.
+	 */
+	bool dptx_controller;
+	/*
 	 * With H17P firmware: a firmware-driven system sleep stops the internal processor's
 	 * firmware and powers it down, as DPMS off does, then restarts it warm, see
 	 * dcp_s2r_suspend(). @s2r_ext: the same for an external one, see dcp_s2r_ext_suspend().
@@ -298,6 +327,15 @@ struct apple_dcp_hw_data {
 	/* A firmware 27 sleep in progress, and how it ended */
 	bool v27_sleep_protocol;
 	bool v27_sleep_recovery;
+	/* Required with @s2r */
+	const struct dcp_s2r_layout *s2r_layout;
+	/* @s2r with derived power words: off unless appledrm.s2r_untested is set */
+	bool s2r_untested;
+	/*
+	 * @s2r without a secure mailbox: the SoC's ADT has no dcp-exclave-mailbox (T8142, on
+	 * firmware 27.0 and 27.2.1), so there is no secure port to idle before the IOP.
+	 */
+	bool s2r_no_secure_port;
 };
 
 enum dcp_test_point {
@@ -759,12 +797,10 @@ struct apple_dcp {
 
 	/* A firmware-driven suspend stops the firmware, see dcp_s2r_suspend(). */
 	struct apple_dcp_afkep *sleep_v27_ep[0x20];
-	/*
-	 * Firmware 27.0 on the J714s, the board the firmware 27 sleep and what it needs of the
-	 * shared paths have run on. Every other machine on firmware 27, other T6050 boards and
-	 * T8142 included, takes the paths it took before.
-	 */
+	/* The J714s normal method table, panel services and swap profile. */
 	bool v27_j714s;
+	/* Sleep endpoint inventory and control replies; not a normal RPC profile. */
+	bool v27_sleep_transport;
 	struct dcp_v27_sleep *sleep_v27;
 	bool sleep_v27_closed;
 	/*
@@ -985,6 +1021,8 @@ struct apple_dcp {
 	u64 typec_follow_gen;
 	/* dcp_poweron() reconnects DPTX; its own modeset follows the HPD */
 	bool typec_poweron_hpd;
+	/* A Type-C CRTC enable runs: its own mode set follows, the link is not bad */
+	bool typec_enable_pending;
 	/* IOMFB reports its video interface ready after DPTX link training. */
 	struct completion typec_iomfb_hpd_ready;
 	struct delayed_work typec_reconnect_wq;
