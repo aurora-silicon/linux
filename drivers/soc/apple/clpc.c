@@ -112,7 +112,9 @@ enum apple_clpc_rail {
  *	holds the CPU clusters to; 0 for none
  * @high_power_machine: the machine compatible on which the performance
  *	profile tells the SMC that macOS's High Power mode is on (the zETM
- *	record below); NULL for none
+ *	record below); NULL for none. A machine with High Power mode and no
+ *	low-power ceiling still gets the platform profile, named "apple-smc"
+ *	so that userspace keeps its own low-power CPU budget
  */
 struct apple_clpc_hw {
 	unsigned int rail[APPLE_CLPC_RAILS];
@@ -1066,10 +1068,10 @@ static int apple_clpc_status_show(struct seq_file *s, void *unused)
 			seq_printf(s, " cpu%u %u", clpc->clusters[i].policy_cpu,
 				   clpc->clusters[i].max_khz);
 		seq_puts(s, "\n");
-		if (clpc->high_power)
-			seq_printf(s, "smc high power: %s (%u records sent)\n",
-				   clpc->high_power_sent ? "on" : "off", clpc->high_power_seq);
 	}
+	if (clpc->high_power)
+		seq_printf(s, "smc high power: %s (%u records sent)\n",
+			   clpc->high_power_sent ? "on" : "off", clpc->high_power_seq);
 	if (clpc->gpu_pmgr) {
 		seq_printf(s, "gpu: powered %u for %u ms, pmp limited ", clpc->gpu_on,
 			   clpc->gpu_on ? jiffies_to_msecs(jiffies - clpc->gpu_on_since) : 0);
@@ -1355,6 +1357,7 @@ static int apple_clpc_probe(struct platform_device *pdev)
 	struct device_node *gpu = NULL;
 	struct apple_clpc *clpc;
 	unsigned int rail, i;
+	bool high_power;
 	int ret;
 
 	clpc = devm_kzalloc(dev, sizeof(*clpc), GFP_KERNEL);
@@ -1494,20 +1497,28 @@ static int apple_clpc_probe(struct platform_device *pdev)
 	clpc->power_next = jiffies;
 	if (!clpc->hw->low_power_machine || of_machine_is_compatible(clpc->hw->low_power_machine))
 		clpc->low_power_khz = clpc->hw->low_power_khz;
-	if (clpc->low_power_khz && IS_REACHABLE(CONFIG_ACPI_PLATFORM_PROFILE)) {
-		struct device *ppdev;
-
+	high_power = clpc->hw->high_power_machine &&
+		     of_machine_is_compatible(clpc->hw->high_power_machine);
+	if ((clpc->low_power_khz || high_power) && IS_REACHABLE(CONFIG_ACPI_PLATFORM_PROFILE)) {
 		/* The SMC is optional: without it the low-power profile has only its ceiling. */
 		clpc->smc_np = of_parse_phandle(dev->of_node, "apple,smc", 0);
-		clpc->high_power = clpc->smc_np && clpc->hw->high_power_machine &&
-				   of_machine_is_compatible(clpc->hw->high_power_machine);
-		if (!clpc->policy_nb_added) {
+		clpc->high_power = clpc->smc_np && high_power;
+	}
+	/* High Power mode alone needs the SMC; without it there is no profile. */
+	if ((clpc->low_power_khz || clpc->high_power) && IS_REACHABLE(CONFIG_ACPI_PLATFORM_PROFILE)) {
+		struct device *ppdev;
+
+		if (clpc->low_power_khz && !clpc->policy_nb_added) {
 			clpc->policy_nb.notifier_call = apple_clpc_policy_notify;
 			clpc->policy_nb_added = !cpufreq_register_notifier(&clpc->policy_nb,
 									   CPUFREQ_POLICY_NOTIFIER);
 		}
-		ppdev = devm_platform_profile_register(dev, "apple-clpc", clpc,
-						       &apple_clpc_profile_ops);
+		/*
+		 * "apple-clpc" budgets the low-power profile itself; "apple-smc"
+		 * only carries High Power mode, and userspace keeps the CPU budget.
+		 */
+		ppdev = devm_platform_profile_register(dev, clpc->low_power_khz ? "apple-clpc" :
+						       "apple-smc", clpc, &apple_clpc_profile_ops);
 		if (IS_ERR(ppdev))
 			dev_warn(dev, "no platform profile: %pe\n", ppdev);
 	}
@@ -1659,6 +1670,13 @@ static const struct apple_clpc_hw apple_clpc_hw_t6040 = {
 	 */
 	.low_power_khz = 2808000,
 	.low_power_machine = "apple,t6041",
+	/*
+	 * The 16-inch M4 Pro has High Power mode. Under a 300 s CPU and GPU
+	 * load on macOS 27 its fans peak at 3800 rpm in Automatic and at
+	 * 5850 rpm in High Power, with the same clocks; the extra cooling buys
+	 * 4-5% sustained throughput. The record is the J714s one.
+	 */
+	.high_power_machine = "apple,j616s",
 };
 
 /*

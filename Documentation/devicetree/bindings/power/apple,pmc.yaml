@@ -266,7 +266,8 @@ patternProperties:
         $ref: /schemas/types.yaml#/definitions/phandle
         description:
           The SMC, whose package power reading the low-power platform profile
-          holds the CPU clusters to.
+          holds the CPU clusters to, and which the performance profile tells
+          about High Power mode on Macs that have it.
 
     required:
       - compatible
