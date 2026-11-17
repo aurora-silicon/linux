@@ -66,10 +66,11 @@ preamble=r'''
 #include <errno.h>
 #define dev_warn(...) ((void)0)
 #define dev_err(...) ((void)0)
+#define WRITE_ONCE(x, v) ((x) = (v))
 struct drm_crtc {int unused;};
 struct drm_crtc_state {bool active,active_changed,color_mgmt_changed;};
 struct drm_atomic_commit {struct drm_crtc_state *state;unsigned failed_routes;};
-struct apple_dcp {void *dev;bool native,main_display;int mode_state,vblank_wq;void *connector;};
+struct apple_dcp {void *dev;bool native,main_display,typec_enable_pending;int mode_state,vblank_wq;void *connector;};
 struct apple_crtc {struct apple_dcp *dcp;bool fabric_held;};
 static struct apple_crtc owner;
 static struct apple_crtc *to_apple_crtc(struct drm_crtc *c){return &owner;}
@@ -88,7 +89,7 @@ static bool dcp_crtc_route_ready(struct drm_crtc *c,struct drm_atomic_commit *a,
 static bool dcp_crtc_needs_route_start(struct apple_dcp *d){return false;}
 static int dcp_typec_prepare_route(struct apple_dcp *d){return 0;}
 static int apple_drm_fabric_hold(void){return 0;}
-static void dcp_poweron(struct apple_dcp *d){powered++;}
+static void dcp_poweron(struct apple_dcp *d){assert(d->typec_enable_pending);powered++;}
 static void dcp_external_recover(struct apple_dcp *d){}
 static bool drm_atomic_crtc_needs_modeset(struct drm_crtc_state *s){return true;}
 static int dcp_crtc_atomic_modeset(struct drm_crtc *c,struct drm_atomic_commit *a){programmed++;return mode_error;}
@@ -104,13 +105,13 @@ int main(void){
  for(unsigned i=0;i<4;i++){
   done=woken=notified=invalidated=powered=programmed=0;mode_error=errors[i];d.mode_state=1;
   apple_crtc_atomic_enable(&crtc,&commit);
-  assert(done==1&&woken==1&&notified==1&&invalidated==1&&programmed==1&&powered==1&&!d.mode_state);
+  assert(done==1&&woken==1&&notified==1&&invalidated==1&&programmed==1&&powered==1&&!d.mode_state&&!d.typec_enable_pending);
  }
  done=woken=notified=invalidated=0;mode_error=0;
- apple_crtc_atomic_enable(&crtc,&commit);assert(done==1&&!woken&&!notified&&!invalidated);
+ apple_crtc_atomic_enable(&crtc,&commit);assert(done==1&&!woken&&!notified&&!invalidated&&!d.typec_enable_pending);
  // Existing non-native error policy is preserved.
  d.native=false;done=woken=notified=invalidated=0;mode_error=-EIO;
- apple_crtc_atomic_enable(&crtc,&commit);assert(done==1&&!woken&&!notified&&!invalidated&&classic_errors==1);
+ apple_crtc_atomic_enable(&crtc,&commit);assert(done==1&&!woken&&!notified&&!invalidated&&classic_errors==1&&!d.typec_enable_pending);
 }
 '''
 with tempfile.TemporaryDirectory() as t:
