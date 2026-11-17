@@ -196,6 +196,47 @@
 	};
 };
 
+/*
+ * The video encoder, its two DARTs and the VENC power tree. The J813 ADT has
+ * the same ave and dart-ave as the J815. The boot loader hands over iBoot's
+ * preloaded firmware, or disables the encoder when there is none.
+ */
+&ps_venc_sys {
+	status = "okay";
+};
+
+&ps_venc_dma {
+	status = "okay";
+};
+
+&ps_venc_pipe4 {
+	status = "okay";
+};
+
+&ps_venc_pipe5 {
+	status = "okay";
+};
+
+&ps_venc_me0 {
+	status = "okay";
+};
+
+&ps_venc_me1 {
+	status = "okay";
+};
+
+&ave_dart0 {
+	status = "okay";
+};
+
+&ave_dart1 {
+	status = "okay";
+};
+
+&ave {
+	status = "okay";
+};
+
 /* Unexposed chassis port instances remain described and disabled. */
 
 /*

@@ -2,6 +2,7 @@
 /* Copyright 2021 Alyssa Rosenzweig */
 
 #include <kunit/visibility.h>
+#include <linux/suspend.h>
 #include <linux/align.h>
 #include <linux/bitmap.h>
 #include <linux/clk.h>
@@ -29,6 +30,7 @@
 #include <linux/iopoll.h>
 #include <linux/of_platform.h>
 #include <linux/suspend.h>
+#include <linux/soc/apple/dcp-v27-sleep.h>
 #include <linux/property.h>
 #include <linux/random.h>
 #include <linux/slab.h>
@@ -43,6 +45,7 @@
 #include <linux/workqueue.h>
 
 #include <drm/drm_color_mgmt.h>
+#include <drm/drm_atomic.h>
 #include <drm/drm_edid.h>
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_file.h>
@@ -67,6 +70,7 @@
 #include "dcp-syslog.h"
 #include "dcpext_scanout.h"
 #include "dcp-internal.h"
+#include "j613-25g83.h"
 #include "dcp-external-bw.h"
 #include "dptx-service.h"
 #include "iomfb.h"
@@ -389,6 +393,20 @@ module_param(fw27_panel_boot_mode, int, 0644);
 MODULE_PARM_DESC(fw27_panel_boot_mode,
 		 "FW27 internal panel: -1 keep the boot mode for a single fixed timing (default), 0 always mode-set, 1 always keep the boot mode");
 
+/*
+ * update_notify_clients_dcp (A031 on H17P, A033 on H17G) form in the H17
+ * client-open sequence:
+ *    0 client numbers in the first slots, 9 states (default)
+ *    1 client flags (clients[c] = 1), 9 states: none, 6, 7, 8, 10, 11, 12,
+ *      25, 26
+ *    2 client flags, 14 states: the 9, then 13, 14, 15, 16, 17
+ * fw27 firmware expects the flag form.
+ */
+int notify_clients_form;
+module_param(notify_clients_form, int, 0644);
+MODULE_PARM_DESC(notify_clients_form,
+		 "H17 update_notify_clients_dcp: 0 client numbers (default), 1 client flags, 9 states, 2 client flags, 14 states");
+
 static bool unstable_edid = true;
 module_param(unstable_edid, bool, 0644);
 MODULE_PARM_DESC(unstable_edid, "Enable unstable EDID retrival support");
@@ -424,6 +442,32 @@ static bool wake_light = true;
 module_param(wake_light, bool, 0644);
 MODULE_PARM_DESC(wake_light,
 		 "With wake_prewarm_ms, also power the internal panel at resume if the lid is open (default 1)");
+
+/*
+ * T6050: a firmware sleep with a display on a USB-C port, and the external display
+ * processors' wake. 1: the display is released before the sleep as an unplugged one is and
+ * comes back after the wake as a newly plugged one, and every external display processor
+ * gets the wake's two calls (A500's wake form, then the power state with the sleep's flags),
+ * as macOS does. Without them the firmware's hard power state stays off and a display
+ * plugged in after the wake stays dark. 0: such a sleep is refused and the external
+ * processors get no wake call.
+ */
+static int t6050_ext_sleep = 1;
+module_param(t6050_ext_sleep, int, 0644);
+MODULE_PARM_DESC(t6050_ext_sleep,
+		 "T6050: release a USB-C display for a firmware sleep and plug it again after the wake (default 1; 0: refuse the sleep)");
+
+/*
+ * What a T6050 external display processor gained outside the firmware 27 sleep itself (the
+ * Type-C reconnect skipped for a crashed one, a crashed one refusing a deep sleep before
+ * anything is stopped, the link line) is in force on the board it has run on, the J714s.
+ * Elsewhere, other boards with the same SoC included, these are as before.
+ */
+static bool dcp_j714s_ext(struct device *dev)
+{
+	return of_machine_is_compatible("apple,j714s") &&
+	       of_device_is_compatible(dev->of_node, "apple,t6050-dcpext");
+}
 
 bool dcp_t6041_ext_enabled(void)
 {
@@ -613,7 +657,49 @@ bool dcp_is_external_h17p(struct apple_dcp *dcp)
 	return dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL;
 }
 
+bool dcp_is_retained_external(struct apple_dcp *dcp)
+{
+	return dcp_is_external_h17p(dcp) || dcp_is_ext26(dcp);
+}
+
+static void dcp_ext26_blank_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(work, struct apple_dcp, ext26_blank_work);
+	int ret;
+
+	guard(mutex)(&dcp->external_lock);
+	if (dcp->ext26_pm_preparing || dcp->external_stopped ||
+	    !READ_ONCE(dcp->pipe_enabled_h17p))
+		return;
+	iomfb_pause_presentation(dcp, true);
+	ret = iomfb_ext26_blank(dcp);
+	if (ret) {
+		WRITE_ONCE(dcp->ext26_blocked, true);
+		dcp->external_error = ret;
+		dev_err(dcp->dev, "native26 null control failed: %d; uncertain backing retained\n", ret);
+	} else {
+		WRITE_ONCE(dcp->ext26_blanked, true);
+		dev_dbg(dcp->dev, "native26 DPMS blank complete; link, mode and backing retained\n");
+	}
+}
+
 static int dcp_external_stop_locked(struct apple_dcp *dcp, u64 generation);
+int dcp_ext26_layout_stop(struct apple_dcp *dcp)
+{
+	int ret;
+
+	/* Atomic modeset owns external_lock; poweron joined the blank worker. */
+	lockdep_assert_held(&dcp->external_lock);
+	ret = dcp_external_stop_locked(dcp, dcp->external_generation);
+	if (!ret) {
+		WRITE_ONCE(dcp->ext26_blanked, false);
+		dcp->external_generation++;
+		dcp_queue_typec_reconnect(dcp, 0);
+		return -EAGAIN; /* A fresh owner/catalogue/backing is required. */
+	}
+	return ret;
+}
+
 static int dcp_external_disconnect(struct apple_dcp *dcp, bool physical);
 
 /* copied and simplified from drm_vblank.c */
@@ -997,10 +1083,10 @@ static void dcp_firmware_metadata_notify(struct apple_dcp *dcp)
 	unsigned long flags;
 	bool ready;
 
+	/* The sink's identity is enough: a timing that fits a descriptor is optional. */
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
-	ready = dcp->metadata.attributes_valid && dcp->metadata.timing_valid &&
-		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.attributes_ticket) &&
-		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.timing_ticket);
+	ready = dcp->metadata.attributes_valid &&
+		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.attributes_ticket);
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	if (ready && dcp->connector && READ_ONCE(dcp->connector->connected))
 		schedule_work(&dcp->connector->hotplug_wq);
@@ -1052,8 +1138,13 @@ void dcp_firmware_metadata_timing(struct apple_dcp *dcp)
 	 */
 	for (i = 0; i < dcp->nr_modes; i++) {
 		const struct dcp_display_mode *m = &dcp->modes[i];
+		struct drm_display_mode timing = m->mode;
 
 		if (!m->metadata_timing_valid)
+			continue;
+		/* A descriptor holds at most 655.35 MHz: faster modes are left to the list. */
+		timing.flags |= m->metadata_sync_flags;
+		if (!dcp_metadata_timing_fits(&timing))
 			continue;
 		if (best == UINT_MAX || (m->mode.type & DRM_MODE_TYPE_PREFERRED) ||
 		    (!(dcp->modes[best].mode.type & DRM_MODE_TYPE_PREFERRED) &&
@@ -1086,29 +1177,35 @@ bool dcp_firmware_metadata_current(struct apple_dcp *dcp, u64 generation)
 	return valid;
 }
 
-const struct drm_edid *dcp_firmware_edid(struct apple_dcp *dcp, u64 *generation)
+const struct drm_edid *dcp_firmware_edid(struct apple_dcp *dcp, u64 *generation,
+					 u32 *defaults)
 {
 	struct dcp_display_metadata attributes;
 	struct drm_display_mode preferred;
 	const struct drm_edid *edid;
 	unsigned long flags;
-	bool valid;
+	bool valid, timing = false;
 
 	if (!dcp_firmware_metadata_enabled(dcp))
 		return ERR_PTR(-ENODEV);
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
-	valid = dcp->metadata.attributes_valid && dcp->metadata.timing_valid &&
-		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.attributes_ticket) &&
-		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.timing_ticket);
+	valid = dcp->metadata.attributes_valid &&
+		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.attributes_ticket);
 	if (valid) {
 		attributes = dcp->metadata.attributes;
-		preferred = dcp->metadata.preferred;
+		timing = dcp->metadata.timing_valid &&
+			 dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.timing_ticket);
+		if (timing)
+			preferred = dcp->metadata.preferred;
 		*generation = dcp->metadata.epoch.generation;
 	}
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	if (!valid)
 		return ERR_PTR(-ENODATA);
-	edid = dcp_metadata_edid(&attributes, &preferred);
+	if (!timing)
+		attributes.defaults |= DCP_METADATA_DEFAULT_TIMING;
+	*defaults = attributes.defaults;
+	edid = dcp_metadata_edid(&attributes, timing ? &preferred : NULL);
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
 	valid = !dcp->metadata.epoch.invalidated && dcp->metadata.epoch.connected &&
 		*generation == dcp->metadata.epoch.generation;
@@ -1461,6 +1558,12 @@ static void dcp_delayed_vblank(struct work_struct *work)
 
 static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
 {
+	if (dcp->v27_sleep_transport && endpoint >= 0x20 && endpoint < 0x40) {
+		struct apple_dcp_afkep *ep = READ_ONCE(dcp->sleep_v27_ep[endpoint - 0x20]);
+
+		if (ep)
+			return ep;
+	}
 	/* The auxiliary endpoints of a desktop 26.x processor. */
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
 	    endpoint >= 0x20 && endpoint < 0x40) {
@@ -1470,9 +1573,24 @@ static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
 		if (ep)
 			return ep;
 	}
+	if (dcp_is_ext26(dcp)) {
+		if (endpoint == 0x27)
+			return dcp->ext26_aux[0];
+		if (endpoint == 0x29)
+			return dcp->ext26_aux[1];
+		if (endpoint == 0x2c)
+			return dcp->ext26_aux[2];
+	}
 	/* The J700 DCPEXT's audio service sits on endpoint 0x2b, not AV 0x29. */
 	if (!IS_ERR_OR_NULL(dcp->avep) && endpoint == dcp->avep->endpoint)
 		return dcp->avep;
+	/* A firmware 27 panel's AV and DP services (J714s: dcp->v27_j714s). */
+	if (dcp->v27_j714s && endpoint >= 0x20 && endpoint < 0x40) {
+		struct apple_dcp_afkep *ep = READ_ONCE(dcp->panelav[endpoint - 0x20]);
+
+		if (ep)
+			return ep;
+	}
 	/* DPAV 0x2a on H17P overlaps the legacy DPTX endpoint number. */
 	if (dcp->dcpavservep && endpoint == dcp->dcpavservep->endpoint)
 		return dcp->dcpavservep;
@@ -1587,7 +1705,7 @@ void dcp_swap_watchdog_complete(struct apple_dcp *dcp)
 void dcp_external_link_fault(struct apple_dcp *dcp)
 {
 	dcp_180hz_invalidate(dcp);
-	if (dcp_is_external_h17p(dcp) && dcp_mode_invalidate(&dcp->mode_state))
+	if (dcp_is_retained_external(dcp) && dcp_mode_invalidate(&dcp->mode_state))
 		dcp_handle_hotplug_actions(dcp, DCP_HOTPLUG_NOTIFY);
 }
 
@@ -1595,6 +1713,7 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 {
 	struct apple_dcp *dcp = cookie;
 	struct apple_dcp_afkep *ep;
+	int ret;
 
 	if (READ_ONCE(dcp->quiescing))
 		return;
@@ -1604,6 +1723,10 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 	/* A failed T8122 dcpext: its firmware may still talk, nobody listens. */
 	if (READ_ONCE(dcp->ext_dead))
 		return;
+	/* Include traffic hidden by the fail-stop logging branch below. */
+	if (dcp->v27_sleep_transport && endpoint >= 0x20 &&
+	    endpoint != IOMFB_ENDPOINT && !dcp_afkep(dcp, endpoint))
+		WRITE_ONCE(dcp->sleep_v27_unhandled, true);
 
 	/*
 	 * H17P starts endpoints that have no AFK instance behind them (the
@@ -1629,7 +1752,18 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 		return;
 	}
 
-	afk_receive_message(ep, message);
+	ret = afk_receive_message(ep, message);
+	if (ret && dcp->v27_sleep_transport)
+		WRITE_ONCE(dcp->sleep_v27_unhandled, true);
+}
+
+static void dcp_recv_msg_timed(void *cookie, u8 endpoint, u64 message, u64 received_ns)
+{
+	struct apple_dcp *dcp = cookie;
+
+	if (dcp_is_ext26(dcp) && endpoint == IOMFB_ENDPOINT)
+		dcp->ext26_rx_ns = received_ns;
+	dcp_recv_msg(cookie, endpoint, message);
 }
 
 static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_size)
@@ -1765,7 +1899,34 @@ static void dcp_rtk_shmem_destroy(void *cookie, struct apple_rtkit_shmem *bfr)
 		dma_free_coherent(dcp->dev, bfr->size, bfr->buffer, bfr->iova);
 }
 
+/*
+ * The firmware names its own choice in the line of every mode set it makes, "... DSC=YES VRR=NO
+ * link: 1": kept for the link report. The line stays at info.
+ */
+static bool dcp_rtk_syslog_mode_set(void *cookie, const char *context, const char *message)
+{
+	struct apple_dcp *dcp = cookie;
+
+	if (strstr(message, "mode_set_gated")) {
+		if (strstr(message, "DSC=YES"))
+			WRITE_ONCE(dcp->link_dsc, 1);
+		else if (strstr(message, "DSC=NO"))
+			WRITE_ONCE(dcp->link_dsc, 2);
+	}
+	return false;
+}
+
 static struct apple_rtkit_ops rtkit_ops = {
+	.crashed = dcp_rtk_crashed,
+	.recv_message = dcp_recv_msg,
+	.recv_message_timed = dcp_recv_msg_timed,
+	.shmem_setup = dcp_rtk_shmem_setup,
+	.shmem_destroy = dcp_rtk_shmem_destroy,
+};
+
+/* For a processor with the link report (hw.link_report): its log lines are searched. */
+static const struct apple_rtkit_ops link_report_rtkit_ops = {
+	.syslog_is_debug = dcp_rtk_syslog_mode_set,
 	.crashed = dcp_rtk_crashed,
 	.recv_message = dcp_recv_msg,
 	.shmem_setup = dcp_rtk_shmem_setup,
@@ -1782,6 +1943,7 @@ static const struct apple_rtkit_ops external_h17p_rtkit_ops = {
 	.syslog_is_debug = dcp_rtk_syslog_is_debug,
 	.crashed = dcp_rtk_crashed,
 	.recv_message = dcp_recv_msg,
+	.recv_message_timed = dcp_recv_msg_timed,
 	.shmem_setup = dcp_rtk_shmem_setup,
 	.shmem_destroy = dcp_rtk_shmem_destroy,
 };
@@ -1791,7 +1953,8 @@ void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message)
 	bool native_14_7 = dcp->fw_compat == DCP_FIRMWARE_V_14_7;
 	int ret;
 
-	if (READ_ONCE(dcp->quiescing))
+	if (READ_ONCE(dcp->quiescing) ||
+	    (dcp_is_ext26(dcp) && READ_ONCE(dcp->ext26_blocked)))
 		return;
 	trace_dcp_send_msg(dcp, endpoint, message);
 	/*
@@ -1800,7 +1963,11 @@ void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message)
 	 * DisplayPort handshake then waits for a reply that was never sent.
 	 */
 	ret = apple_rtkit_send_message(dcp->rtk, endpoint, message, NULL,
-				       native_14_7 ? in_atomic() : true);
+				       (native_14_7 || dcp_is_ext26(dcp)) ? in_atomic() : true);
+	if (ret && dcp_is_ext26(dcp)) {
+		WRITE_ONCE(dcp->crashed, true);
+		dev_err(dcp->dev, "native26 mailbox send failed ep=%#x: %d\n", endpoint, ret);
+	}
 	if (ret && native_14_7)
 		dev_warn_ratelimited(dcp->dev, "DCP send ep %02x failed: %d\n",
 				     endpoint, ret);
@@ -1988,7 +2155,7 @@ static bool dcp_connect_session_valid(struct apple_dcp *dcp,
 /* H17P (J700, T8140, T8142) connects and reconnects as before, without one. */
 static bool dcp_typec_sessionless(struct apple_dcp *dcp)
 {
-	return dcp->fw_compat == DCP_FIRMWARE_H17P || dcp_is_external_h17p(dcp);
+	return dcp->fw_compat == DCP_FIRMWARE_H17P || dcp_is_retained_external(dcp);
 }
 
 /* Capture the session at enqueue, not when a stale worker eventually runs. */
@@ -2041,6 +2208,77 @@ static int dcp_t8132_wait_teardown_answers(struct apple_dcp *dcp, u32 port,
 }
 
 /*
+ * Has the Thunderbolt DP tunnel feeding DPTX port @port been taken down?
+ * Port 0 carries the tunnel this pipeline was handed; port 1 carries only
+ * the second tile of a tiled split, fed by its own tunnel. The tunnel's
+ * provider knows at once, while the detach that follows waits for the
+ * connect in progress on this pipeline.
+ */
+static bool dcp_tb_tunnel_withdrawn(struct apple_dcp *dcp, u32 port)
+{
+	typeof(apple_dp_tunnel_binding_live) *live;
+	bool gone = false;
+	void *binding;
+
+	guard(mutex)(&dcp->tb_lock);
+	binding = port ? dcp->split.binding : dcp->tb_dpin_ctx;
+	if (!binding)
+		return false;
+	live = symbol_get(apple_dp_tunnel_binding_live);
+	if (live) {
+		gone = !live(binding);
+		symbol_put(apple_dp_tunnel_binding_live);
+	}
+	return gone;
+}
+
+/*
+ * Only T6050 is known to need the tunnel watched: a Thunderbolt 5 dock
+ * there withdraws a fresh tunnel right after DCP starts on it. Elsewhere
+ * the wait stays as it was until the watch is tested there.
+ */
+static bool dcp_watches_tunnel_withdrawal(void)
+{
+	return of_machine_is_compatible("apple,t6050");
+}
+
+#define DCP_LINKCFG_POLL_MS	50
+
+/*
+ * Wait up to @timeout for DCP's link configuration of @port, returning what
+ * wait_for_completion_timeout() would. With @watch_tunnel, a Thunderbolt
+ * tunnel taken down meanwhile ends the wait at once and sets *@withdrawn:
+ * no link comes on it, and DCP keeps retrying it until released. A release
+ * sent late, after the full timeout, is more likely to go unanswered and
+ * leave the pipeline held, so release it as soon as the tunnel goes.
+ */
+static unsigned long dcp_dptx_wait_linkcfg(struct apple_dcp *dcp, u32 port,
+					   unsigned long timeout, bool watch_tunnel,
+					   bool *withdrawn)
+{
+	unsigned long deadline = jiffies + timeout;
+	long left;
+
+	*withdrawn = false;
+	if (!watch_tunnel)
+		return wait_for_completion_timeout(&dcp->dptxport[port].linkcfg_completion,
+						   timeout);
+	for (;;) {
+		left = (long)(deadline - jiffies);
+		if (left <= 0)
+			return 0;
+		if (wait_for_completion_timeout(&dcp->dptxport[port].linkcfg_completion,
+						min_t(unsigned long, left,
+						      msecs_to_jiffies(DCP_LINKCFG_POLL_MS))))
+			return max_t(long, (long)(deadline - jiffies), 1);
+		if (dcp_tb_tunnel_withdrawn(dcp, port)) {
+			*withdrawn = true;
+			return 0;
+		}
+	}
+}
+
+/*
  * Connect DPTX port @port. On failure, @retryable (if given) tells whether
  * the attempt left nothing outstanding in the firmware, so that a later
  * connection may simply try again: the service was not published yet, or a
@@ -2055,7 +2293,7 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 	/* T8122 dcpext: HPD only after the link wait, see dcp_ext_dptx_607() */
 	bool late_hpd = dcp_ext_dptx_607(dcp);
 	bool t8132 = dcp_is_t8132_ext(dcp);
-	bool compact;
+	bool compact, withdrawn;
 	unsigned long timeout;
 	u64 generation;
 	u8 dfp_port;
@@ -2132,6 +2370,11 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		goto out_unlock;
 	/* a tiled display's second half comes in on the port's dpin1 */
 	dfp_port = port && READ_ONCE(dcp->split.active) ? 2 : dcp->dptx_dfp_port;
+	if (dcp_is_ext26(dcp)) {
+		ret = dcp_direct_crossbar_link(dcp, false);
+		if (ret)
+			goto out_unlock;
+	}
 	/* Compact DPTX (desktop 26.x) has no connection validation call. */
 	if (!dcp_ext_dptx_607(dcp) && !compact) {
 		ret = dptxport_validate_connection(dcp->dptxport[port].service,
@@ -2203,12 +2446,20 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 	}
 	timeout = dcp_uses_t6020_tunnel_flow(dcp) ?
 		  DPTX_TUNNEL_CONNECT_TIMEOUT : DPTX_CONNECT_TIMEOUT;
-	ret = wait_for_completion_timeout(&dcp->dptxport[port].linkcfg_completion,
-					  timeout);
+	ret = dcp_dptx_wait_linkcfg(dcp, port, timeout,
+				    !compact && !late_hpd &&
+				    dcp_watches_tunnel_withdrawal(),
+				    &withdrawn);
 	/* A revoked wait must not disconnect or publish readiness for a new session. */
 	if (!dcp_connect_session_valid(dcp, session, cable, recovery))
 		return -ESTALE;
-	if (!ret && compact) {
+	if (!ret && withdrawn) {
+		dev_info(dcp->dev,
+			 "dcp_dptx_connect: port %u: the DP tunnel went before link configuration\n",
+			 port);
+		ret = -ENOLINK;
+		goto out_withdraw;
+	} else if (!ret && compact) {
 		/* Without a sink the link is configured once one arrives. */
 		dev_dbg(dcp->dev,
 			"dcp_dptx_connect: no link configuration on port %u yet\n", port);
@@ -2266,7 +2517,7 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 	/* Do not timestamp a new attachment after an older link wait. */
 	if (!port && dcp_is_typec_output(dcp) && !dcp_is_usb4_output(dcp) &&
 	    dcp->fw_compat != DCP_FIRMWARE_H17P && !dcp->external_native &&
-	    !dcp_is_external_h17p(dcp)) {
+	    !dcp_is_retained_external(dcp)) {
 		guard(mutex)(&dcp->hpd_mutex);
 		if (dcp->typec_generation == generation && dcp->typec_cable_connected) {
 			scoped_guard(spinlock_irqsave, &dcp->relink_lock)
@@ -2289,7 +2540,7 @@ out_withdraw:
 			dev_warn(dcp->dev, "DPTX port %u withdrawn: set_hpd(0) failed: %d\n",
 				 port, err);
 	}
-	if (!dcp_is_external_h17p(dcp)) {
+	if (!dcp_is_retained_external(dcp)) {
 		dcp->dptxport[port].connected = false;
 		goto out_release;
 	}
@@ -2359,7 +2610,9 @@ static int dcp_external_link_locked(struct apple_dcp *dcp)
 	int ret;
 
 	lockdep_assert_held(&dcp->external_lock);
-	if (!dcp->external_prepared)
+	if (!dcp->external_prepared ||
+	    (dcp_is_ext26(dcp) && (!READ_ONCE(dcp->ext26_services_open) ||
+				 !dptx_native_controllers_ready(dcp))))
 		return -EAGAIN;
 	if (dcp->external_error)
 		return dcp->external_error;
@@ -2386,8 +2639,18 @@ static int dcp_external_start_locked(struct apple_dcp *dcp)
 	if (!dcp->external_running)
 		WRITE_ONCE(dcp->afk_power_gen, dcp->afk_power_gen + 1);
 	ret = dcp_external_link_locked(dcp);
-	if (ret || dcp->external_running)
+	if (ret)
 		return ret;
+	/* Gentle DPMS kept the link running but paused presentation. */
+	if (dcp_is_ext26(dcp)) {
+		dcp->external_running = true;
+		dcp->external_stopped = false;
+		WRITE_ONCE(dcp->typec_crtc_off, false);
+		iomfb_pause_presentation(dcp, false);
+		return 0;
+	}
+	if (dcp->external_running)
+		return 0;
 	/* A deferred stop sent nothing: the pipe is still powered. */
 	if (dcp->external_stop_deferred) {
 		dcp->external_stop_deferred = false;
@@ -2824,7 +3087,7 @@ int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && !dcp_is_typec_output(dcp))
 		return dcp_desktop_dptx_connect(dcp, port);
 
-	if (!dcp_is_external_h17p(dcp)) {
+	if (!dcp_is_retained_external(dcp)) {
 		if (dcp_typec_sessionless(dcp)) {
 			ret = dcp_dptx_connect_raw(dcp, port, NULL, NULL, false, false);
 		} else {
@@ -2867,6 +3130,10 @@ static int dcp_external_stop_locked(struct apple_dcp *dcp, u64 generation)
 	if (dcp->avep)
 		av_service_disconnect(dcp);
 	iomfb_pause_presentation(dcp, true);
+	if (dcp_is_ext26(dcp)) {
+		WRITE_ONCE(dcp->ext26_stopping, true);
+		dpavservep_detach(dcp);
+	}
 	dcp->external_running = false;
 	/* Route setup can call this before IOMFB or its shared memory exists. */
 	if (dcp->external_stopped || !dcp->external_power_attempted)
@@ -2916,7 +3183,33 @@ release_link:
 			dcp->dptxport[0].connected = false;
 		}
 	}
+	if (dcp_is_ext26(dcp)) {
+		struct apple_dcp_afkep *endpoints[] = {dcp->systemep, dcp->ibootep,
+			dcp->dptx_controller_ep, dcp->dptxep, dcp->dcpavservep,
+			dcp->ext26_aux[0], dcp->ext26_aux[1], dcp->ext26_aux[2]};
+		unsigned int i;
+
+		step = "draining the retained epoch";
+		apple_rtkit_flush_rx(dcp->rtk);
+		for (i = 0; i < ARRAY_SIZE(endpoints); i++)
+			if (!IS_ERR_OR_NULL(endpoints[i]))
+				flush_workqueue(endpoints[i]->wq);
+		apple_rtkit_flush_rx(dcp->rtk);
+		ret = iomfb_queue_settle(dcp, msecs_to_jiffies(5000));
+		for (i = 0; !ret && i < ARRAY_SIZE(endpoints); i++)
+			if (!IS_ERR_OR_NULL(endpoints[i]) && !afk_host_idle(endpoints[i]))
+				ret = -EBUSY;
+		if (!ret)
+			ret = iomfb_ext26_retain_epoch(dcp);
+		if (ret)
+			goto failed;
+		dcp_modes_begin_attachment(dcp);
+		WRITE_ONCE(dcp->pipe_enabled_h17p, false);
+		WRITE_ONCE(dcp->ext26_normal, false);
+	}
 	dcp->external_stopped = true;
+	if (dcp_is_ext26(dcp))
+		WRITE_ONCE(dcp->ext26_stopping, false);
 	WRITE_ONCE(dcp->typec_crtc_off, true);
 	return 0;
 failed:
@@ -2932,10 +3225,14 @@ static int dcp_external_disconnect(struct apple_dcp *dcp, bool physical)
 
 	cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
 	cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
+	if (dcp_is_ext26(dcp))
+		flush_work(&dcp->ext26_blank_work);
 	guard(mutex)(&dcp->external_lock);
 	/* Invalidate physical EDID before waiting for firmware power/link teardown. */
 	if (physical) {
 		WRITE_ONCE(dcp->external_physically_absent, true);
+		if (dcp_is_ext26(dcp))
+			dcp_modes_begin_attachment(dcp);
 		scoped_guard(mutex, &dcp->hpd_mutex) {
 			WRITE_ONCE(dcp->typec_cable_connected, false);
 			dcp->typec_generation++;
@@ -2988,10 +3285,24 @@ static void dcp_external_stop_work(struct work_struct *work)
 
 bool dcp_external_hotplug(struct apple_dcp *dcp, bool connected)
 {
-	if (!dcp_is_external_h17p(dcp))
+	if (!dcp_is_retained_external(dcp))
 		return false;
 	/* No lifecycle or HPD mutex may be acquired from the RX callback. */
 	lockdep_assert_held(&dcp->iomfb.lock);
+	if (dcp_is_ext26(dcp)) {
+		if (READ_ONCE(dcp->ext26_pm_preparing) || READ_ONCE(dcp->ext26_stopping) ||
+		    READ_ONCE(dcp->quiescing) ||
+		    READ_ONCE(dcp->external_physically_absent))
+			return true;
+		if (connected)
+			return false;
+		if (READ_ONCE(dcp->external_stopped))
+			return true;
+		dcp->external_stop_generation = dcp->external_rx_generation;
+		WRITE_ONCE(dcp->ext26_normal, false);
+		schedule_work(&dcp->external_stop_work);
+		return true;
+	}
 	if (READ_ONCE(dcp->quiescing) || READ_ONCE(dcp->external_physically_absent))
 		return true;
 	if (dcp->iomfb.presentation_paused) {
@@ -3149,6 +3460,15 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 	struct dcp_fabric_session session;
 	int ret;
 
+	/*
+	 * A crashed processor answers nothing: each call of a connect would run to its limit
+	 * (five tries, a dozen seconds of them). Its port is left alone instead, once and said.
+	 */
+	if (READ_ONCE(dcp->crashed) && dcp_j714s_ext(dcp->dev)) {
+		dev_warn(dcp->dev, "Type-C DPTX connect skipped: the display processor has crashed; its port is left alone until a reboot\n");
+		return;
+	}
+
 	/* A route following its CRTC hands the link over itself. */
 	if ((dcp->external && dcpext_scanout_terminal(dcp)) ||
 	    !READ_ONCE(dcp->typec_cable_connected) ||
@@ -3220,7 +3540,7 @@ bool dcp_hold_resume_event(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	struct apple_connector *con = READ_ONCE(dcp->connector);
 
-	if (!dcp_is_external_h17p(dcp) || !con || READ_ONCE(con->dcp) != pdev)
+	if (!dcp_is_retained_external(dcp) || !con || READ_ONCE(con->dcp) != pdev)
 		return false;
 
 	guard(mutex)(&dcp->hpd_mutex);
@@ -3292,7 +3612,7 @@ static bool dcp_typec_relink_eligible(struct apple_dcp *dcp)
 	if (dcp->fw_compat == DCP_FIRMWARE_H17P || dcp->external_native ||
 	    !dcp_is_typec_output(dcp) ||
 	    (dcp_is_usb4_output(dcp) && !dcp_tunnel_relinks(dcp)) ||
-	    dcp_is_external_h17p(dcp) || !dcp->typec_connector)
+	    dcp_is_retained_external(dcp) || !dcp->typec_connector)
 		return false;
 	/*
 	 * Only a sink that is attached, shown and still connected for DRM:
@@ -3501,7 +3821,7 @@ int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port)
 {
 	int ret;
 
-	if (dcp_is_external_h17p(dcp))
+	if (dcp_is_retained_external(dcp))
 		return dcp_external_disconnect(dcp, false);
 	/* Release the caller's RemotePort service, not the downstream DFP port. */
 	dev_info(dcp->dev, "%s(port=%d)\n", __func__, port);
@@ -3524,7 +3844,8 @@ int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && !dcp_is_typec_output(dcp))
 		return dcp_desktop_dptx_connect(dcp, port);
 
-	if (dcp_is_external_h17p(dcp)) {
+
+	if (dcp_is_retained_external(dcp)) {
 		bool new_cable;
 
 		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
@@ -3551,6 +3872,8 @@ int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 	}
 
 	if (dcp_is_typec_output(dcp)) {
+		/* A display again: the one released for a firmware sleep, or a new one. */
+		WRITE_ONCE(dcp->sleep_v27_torn, false);
 		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 		guard(mutex)(&dcp->hpd_mutex);
 		dcp_typec_attach_locked(dcp);
@@ -3569,7 +3892,7 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP && !dcp_is_typec_output(dcp))
 		return dcp_desktop_dptx_disconnect_oob(dcp, port);
 
-	if (dcp_is_external_h17p(dcp))
+	if (dcp_is_retained_external(dcp))
 		return dcp_external_disconnect(dcp, true);
 
 	if (dcp_is_typec_output(dcp)) {
@@ -3587,6 +3910,19 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
 		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 	}
+
+	/*
+	 * Firmware 27: a running pair stops before its primary's HPD low, which
+	 * the firmware answers only for a pipe that is down
+	 * (dcp_peer_unplug_v27()). Ahead of the hotplug event, so that the
+	 * CRTC's own power-off finds the pair stopped. A pair that cannot be
+	 * stopped leaves the HPD low as it was.
+	 */
+	ret = dcp_peer_unplug_v27(dcp);
+	if (ret < 0)
+		dev_warn(dcp->dev, "pair not stopped before the HPD low: %d\n", ret);
+	else if (ret)
+		dev_info(dcp->dev, "pair stopped before the HPD low\n");
 
 	disconnected_hpd_event(dcp->connector);
 
@@ -3635,7 +3971,7 @@ int dcp_dptx_recover_irq(struct apple_dcp *dcp)
 	int ret;
 
 	mutex_lock(&dcp->hpd_mutex);
-	if (dcp->external_native || dcp_is_external_h17p(dcp) ||
+	if (dcp->external_native || dcp_is_retained_external(dcp) ||
 	    !dcp_is_typec_output(dcp) || dcp_is_usb4_output(dcp) ||
 	    !dcp->typec_connector ||
 	    READ_ONCE(dcp->typec_connector->connected) ||
@@ -4172,6 +4508,77 @@ start_iomfb:
 	if (ret)
 		dev_err(dcp->dev, "Failed to start IOMFB endpoint: %d\n", ret);
 	return ret;
+	}
+static int ext26_aux_call(struct apple_epic_service *service, u16 group, u32 command,
+			 const void *data, size_t size, void *reply, size_t room)
+{
+	memset(reply, 0, room);
+	memcpy(reply, data, min(size, room));
+	if (room >= sizeof(u32))
+		put_unaligned_le32(0, reply);
+	return 0;
+}
+
+static const struct apple_epic_service_ops ext26_aux_ops[] = {
+	{ .name = "native26-observer", .call_v2 = ext26_aux_call }, {}
+};
+
+void dcp_ext26_open_services(struct apple_dcp *dcp)
+{
+	struct apple_dcp_afkep *eps[] = { dcp->systemep, dcp->ibootep,
+		dcp->dptx_controller_ep, dcp->ext26_aux[0], dcp->dcpavservep,
+		dcp->ext26_aux[1], dcp->dptxep, dcp->ext26_aux[2] };
+	unsigned int i;
+
+	WRITE_ONCE(dcp->ext26_services_open, true);
+	for (i = 0; i < ARRAY_SIZE(eps); i++)
+		if (!IS_ERR_OR_NULL(eps[i]))
+			afk_service_retry(eps[i]);
+}
+
+static int dcp_ext26_start_services(struct apple_dcp *dcp)
+{
+	static const u8 auxiliary[] = { 0x27, 0x29, 0x2c };
+	unsigned int i;
+	int ret;
+
+	ret = iomfb_start_rtkit(dcp);
+	if (ret)
+		return ret;
+	if (!wait_for_completion_timeout(&dcp->ext26_link_ready, msecs_to_jiffies(5000)))
+		return dev_err_probe(dcp->dev, -ETIMEDOUT, "native26 DCPLink readiness timed out\n");
+	if (READ_ONCE(dcp->crashed))
+		return -EIO;
+	ret = systemep_init(dcp);
+	if (!ret)
+		ret = ibootep_init(dcp);
+	if (!ret)
+		ret = dptx_controller_init(dcp);
+	for (i = 0; !ret && i < ARRAY_SIZE(auxiliary); i++) {
+		struct apple_dcp_afkep *ep;
+
+		if (i == 1) {
+			ret = dpavservep_init(dcp);
+			if (ret)
+				break;
+		}
+		if (i == 2) {
+			ret = dptxep_init(dcp);
+			if (ret)
+				break;
+		}
+		ep = afk_init(dcp, auxiliary[i], ext26_aux_ops);
+		if (IS_ERR(ep))
+			return PTR_ERR(ep);
+		ep->match_epic_name = false;
+		dcp->ext26_aux[i] = ep;
+		ret = afk_start(ep);
+	}
+	if (ret)
+		return dev_err_probe(dcp->dev, ret, "native26 AFK startup failed\n");
+	dev_dbg(dcp->dev, "native26 AFK ready: 20 23 24 27 28 29 2a 2c; starting A401\n");
+	iomfb_ext26_start(dcp);
+	return 0;
 }
 
 int dcp_start(struct platform_device *pdev)
@@ -4214,6 +4621,8 @@ int dcp_start(struct platform_device *pdev)
 
 	if (IS_ERR_OR_NULL(dcp->rtk))
 		return -ENODEV;
+	if (dcp_is_ext26(dcp))
+		return dcp_ext26_start_services(dcp);
 
 	/* Make the H17P allocator available before external service discovery. */
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL) {
@@ -4234,7 +4643,7 @@ int dcp_start(struct platform_device *pdev)
 				 ret);
 	}
 
-	if ((dcp->phy || (dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+	if ((dcp->phy || dcp_is_ext26(dcp) || (dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
 			  dcp->hw.num_dptx_ports)) &&
 	    dcp->fw_compat >= DCP_FIRMWARE_V_13_5) {
 		ret = ibootep_init(dcp);
@@ -4243,7 +4652,7 @@ int dcp_start(struct platform_device *pdev)
 				 ret);
 
 		if (dcp->hw.iomfb_method_profile ==
-		    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
+		    DCP_IOMFB_METHODS_H17P_EXTERNAL || dcp_is_ext26(dcp)) {
 			ret = dptx_controller_init(dcp);
 			if (ret)
 				return dev_err_probe(dcp->dev, ret,
@@ -4287,8 +4696,16 @@ int dcp_start(struct platform_device *pdev)
 		return ret;
 	}
 
+	/* On the board they have run on; elsewhere these endpoints are not started, as before. */
+	if (dcp->v27_j714s && !dcp->external && dcp_has_panel(dcp)) {
+		ret = panelavep_init(dcp);
+		if (ret)
+			dev_warn(dcp->dev, "panel AV and DP services not started: %d\n", ret);
+		ret = 0;
+	}
+
 #if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
-	if (hdmi_audio) {
+	if (hdmi_audio && !dcp_is_ext26(dcp)) {
 		ret = avep_init(dcp);
 		if (ret)
 			dev_warn(dcp->dev, "Failed to start AV endpoint: %d", ret);
@@ -4563,7 +4980,10 @@ void dcp_poweron(struct platform_device *pdev)
 		return;
 	}
 
-	if (dcp_is_external_h17p(dcp)) {
+
+	if (dcp_is_ext26(dcp))
+		flush_work(&dcp->ext26_blank_work);
+	if (dcp_is_retained_external(dcp)) {
 		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
 		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 		cancel_work_sync(&dcp->external_stop_work);
@@ -4591,12 +5011,18 @@ void dcp_poweron(struct platform_device *pdev)
 				WRITE_ONCE(dcp->crashed, true);
 				return;
 			}
-			/* The powerlog takeover report normally precedes this. */
-			if (dcp_has_panel(dcp))
-				queue_delayed_work(system_freezable_wq,
-						   &dcp->bl_fallback_wq,
-						   DCP_BL_FALLBACK_DELAY);
 		}
+		/*
+		 * The powerlog takeover report normally precedes this. A pipe adopted already
+		 * running (J716c) gets none either: without a level, a panel the firmware turned
+		 * off for a sleep could not be lit again.
+		 */
+		if (dcp_has_panel(dcp) && !dcp_backlight_active(dcp))
+			queue_delayed_work(system_freezable_wq, &dcp->bl_fallback_wq,
+					   DCP_BL_FALLBACK_DELAY);
+		/* The loader report or fallback may initialize the policy later. */
+		if (!dcp_backlight_active(dcp))
+			return;
 		ret = dcp_backlight_dpms(dcp, true);
 		if (ret)
 			dev_warn(dcp->dev, "backlight restore unavailable: %d\n", ret);
@@ -4699,7 +5125,7 @@ void dcp_external_recover(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
-	if (dcp_is_external_h17p(dcp))
+	if (dcp_is_retained_external(dcp))
 		dcp_poweron(pdev);
 }
 
@@ -4718,7 +5144,13 @@ void dcp_poweroff(struct platform_device *pdev)
 		return;
 	}
 
-	if (dcp_is_external_h17p(dcp)) {
+
+	if (dcp_is_ext26(dcp)) {
+		if (!READ_ONCE(dcp->ext26_pm_preparing) && !READ_ONCE(dcp->external_stopped))
+			queue_work(system_unbound_wq, &dcp->ext26_blank_work);
+		return;
+	}
+	if (dcp_is_retained_external(dcp)) {
 		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
 		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 		guard(mutex)(&dcp->external_lock);
@@ -5293,6 +5725,55 @@ static int dcp_read_fw_version(struct device *dev, const char *name,
 	return len;
 }
 
+static bool dcp_ext26_admitted(struct device_node *np)
+{
+	struct device_node *chosen = of_find_node_by_path("/chosen");
+	const char *opt, *uuid;
+	int length = 0;
+	u32 version[3], marker;
+	bool ok;
+
+	opt = chosen ? of_get_property(chosen, "asahi,j613-25g83-dcpext", &length) : NULL;
+	ok = opt && length == 2 && opt[0] == '1' && !opt[1] &&
+		of_machine_is_compatible("apple,j613") &&
+		!of_property_read_u32(np, "apple,j613-25g83-dcpext-handoff", &marker) && marker == 1 &&
+		!of_property_read_u32(np, "apple,t8122-dcpext-firmware-ready", &marker) && marker == 1 &&
+		of_property_count_u32_elems(np, "apple,firmware-compat") == 3 &&
+		!of_property_read_u32_array(np, "apple,firmware-compat", version, 3) &&
+		!of_property_read_string(np, "apple,firmware-uuid", &uuid) &&
+		j613_25g83_identity(true, 1, version, 3, uuid);
+	of_node_put(chosen);
+	return ok;
+}
+
+/*
+ * J716c shares the 27.0 endpoint-control wire format, not the J714s normal
+ * IOMFB method or panel profile. Establish this before RTKit can receive any
+ * application traffic, including traffic that invalidates a later inventory.
+ */
+static bool dcp_v27_sleep_transport_supported(struct apple_dcp *dcp)
+{
+	struct device *dev = dcp->dev;
+	char compat[DCP_FW_VERSION_STR_LEN];
+
+	if (!IS_ENABLED(CONFIG_APPLE_SOC_SLEEP))
+		return false;
+	if (dcp->v27_j714s)
+		return true;
+	if (!of_machine_is_compatible("apple,j716c") ||
+	    !of_machine_is_compatible("apple,t6050") ||
+	    !(of_device_is_compatible(dev->of_node, "apple,t6050-dcp") ||
+	      of_device_is_compatible(dev->of_node, "apple,t6050-dcpext")) ||
+	    !dcp->hw.adopt_live_session ||
+	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_DEFAULT ||
+	    dcp->fw_compat != DCP_FIRMWARE_V_27_0)
+		return false;
+
+	/* The enum also covers later 27.x method tables. */
+	return dcp_read_fw_version(dev, "apple,firmware-compat", compat) >= 0 &&
+	       !strcmp(compat, "27.0.0");
+}
+
 static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 {
 	const struct apple_dcp_hw_data *hw = of_device_get_match_data(dev);
@@ -5401,6 +5882,8 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	 * firmware through the classic IOMFB template, as on M1/M2.
 	 */
 	if (of_device_is_compatible(dev->of_node, "apple,t8122-dcpext")) {
+		if (dcp_ext26_admitted(dev->of_node))
+			return DCP_FIRMWARE_H17P;
 		if (!strcmp(compat_str, "14.7.0"))
 			return DCP_FIRMWARE_V_14_7_TEMPLATE;
 		dev_err(dev, "T8122 external display not started: DCP firmware-compat %s is not 14.7.0\n",
@@ -5484,7 +5967,7 @@ VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release
 		/* Nothing arms the timeout work past its drain below. */
 		dcp->announce.stopped = true;
 	}
-	if (release_cable && dcp_is_external_h17p(dcp))
+	if (release_cable && dcp_is_retained_external(dcp))
 		dpavservep_detach(dcp);
 	/* Block new enqueues as well as draining users of the AFK endpoints. */
 	disable_delayed_work_sync(&dcp->typec_reconnect_wq);
@@ -5527,7 +6010,7 @@ VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
 	/* A cable can be routed before the DRM component binds. */
 	if (READ_ONCE(dcp->typec_cable_connected))
 		dcp_queue_typec_reconnect(dcp, 0);
-	if (dcp_is_external_h17p(dcp)) {
+	if (dcp_is_retained_external(dcp)) {
 		struct apple_connector *con = READ_ONCE(dcp->connector);
 
 		guard(mutex)(&dcp->hpd_mutex);
@@ -5677,7 +6160,7 @@ static int dcp_ext_wait_pmp(struct apple_dcp *dcp)
 	unsigned long deadline;
 	int ret;
 
-	if (!dcp_ext_dptx_607(dcp))
+	if (!dcp_ext_dptx_607(dcp) && !dcp_is_ext26(dcp))
 		return 0;
 	entry = of_parse_phandle(dcp->dev->of_node, "apple,pmp-report", 0);
 	if (!entry) {
@@ -5702,6 +6185,36 @@ static int dcp_ext_wait_pmp(struct apple_dcp *dcp)
 	}
 	dev_info(dcp->dev, "PMP acknowledged the DISPEXT request\n");
 	return 0;
+}
+
+static int dcp_ext26_start_resident(struct apple_dcp *dcp)
+{
+	struct device *dev = dcp->dev;
+	u32 control;
+	int ret;
+
+	ret = dcp_pin_live_session(dcp);
+	if (ret)
+		return ret;
+	control = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	dcp->rtk = apple_rtkit_init(dev, dcp, "mbox", 0, &rtkit_ops);
+	if (IS_ERR(dcp->rtk))
+		return dev_err_probe(dev, PTR_ERR(dcp->rtk), "native26 RTKit mailbox initialization failed\n");
+	ret = devm_add_action_or_reset(dev, dcp_release_rtkit, dcp);
+	if (ret)
+		return ret;
+	if (!(control & APPLE_DCP_COPROC_CPU_CONTROL_RUN)) {
+		writel(control | APPLE_DCP_COPROC_CPU_CONTROL_RUN,
+		       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+		dev_dbg(dev, "native26 resident ASC started once after RTKit mailbox initialization\n");
+	}
+	ret = control & APPLE_DCP_COPROC_CPU_CONTROL_RUN ?
+		apple_rtkit_wake(dcp->rtk) : apple_rtkit_boot(dcp->rtk);
+	dev_dbg(dev, "native26 initial RTKit %s result=%d control=%#x status=%#x\n",
+		 control & APPLE_DCP_COPROC_CPU_CONTROL_RUN ? "warm INIT" : "resident boot",
+		 ret, readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL),
+		 readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS));
+	return ret;
 }
 
 static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *data)
@@ -5757,7 +6270,7 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		return ret;
 
 	/* A native external processor mapped these at probe, for its start work. */
-	if (!dcp->external_native) {
+	if (!dcp->external_native && !dcp_is_ext26(dcp)) {
 		dcp->coproc_reg = devm_platform_ioremap_resource_byname(to_platform_device(dev),
 									"coproc");
 		if (IS_ERR(dcp->coproc_reg))
@@ -5779,7 +6292,11 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 	if (dcp->hw.adopt_live_session) {
 		cpu_ctrl = readl_relaxed(dcp->coproc_reg +
 					 APPLE_DCP_COPROC_CPU_CONTROL);
-		if (!(cpu_ctrl & APPLE_DCP_COPROC_CPU_CONTROL_RUN))
+		if (dcp_is_ext26(dcp))
+			dev_dbg(dev, "native26 initial carrier: control=%#x status=%#x; RTKit %s\n",
+				 cpu_ctrl, readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS),
+				 cpu_ctrl & APPLE_DCP_COPROC_CPU_CONTROL_RUN ? "warm INIT" : "resident first boot");
+		if (!(cpu_ctrl & APPLE_DCP_COPROC_CPU_CONTROL_RUN) && !dcp_is_ext26(dcp))
 			return dev_err_probe(dev, -EOPNOTSUPP,
 					     "DCP was not left running by the bootloader\n");
 	}
@@ -5946,6 +6463,13 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 	if (ret)
 		goto err_piodma;
 
+	if (dcp_is_ext26(dcp)) {
+		ret = dcp_ext26_start_resident(dcp);
+		if (ret)
+			goto err_piodma;
+		goto session_ready;
+	}
+
 	if (!dcp->hw.adopt_live_session) {
 		cpu_ctrl =
 			readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
@@ -5962,6 +6486,8 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		dcp->rtk = apple_rtkit_init(dev, dcp, "mbox", 0,
 					    &external_h17p_rtkit_ops);
+	else if (dcp->hw.link_report)
+		dcp->rtk = apple_rtkit_init(dev, dcp, "mbox", 0, &link_report_rtkit_ops);
 	else
 		dcp->rtk = apple_rtkit_init(dev, dcp, "mbox", 0, &rtkit_ops);
 	if (IS_ERR(dcp->rtk)) {
@@ -5996,6 +6522,7 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		goto err_piodma;
 	}
 	dcp_secure_port_start(dcp);
+session_ready:
 	enable_work(&dcp->dimensions_wq);
 	schedule_work(&dcp->dimensions_wq);
 	dcp_enable_typec_work(dcp);
@@ -6055,6 +6582,8 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 
 	if (!dcp)
 		return;
+	if (IS_ENABLED(CONFIG_APPLE_SOC_SLEEP))
+		apple_sleep_v27_unregister(dev);
 	dcp_peer_forget(dcp);
 	/*
 	 * Stop the native initializer before looking up its owner, including
@@ -6103,6 +6632,8 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 		return;
 	}
 
+	if (dcp_is_ext26(dcp))
+		cancel_work_sync(&dcp->ext26_blank_work);
 	if (dcp->retain_dma) {
 		/* No firmware stop is acknowledged: detach host users, never DMA. */
 		scoped_guard(mutex, &dcp->iomfb.lock)
@@ -6120,6 +6651,10 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 		afk_quiesce(dcp->ibootep);
 		afk_quiesce(dcp->systemep);
 		afk_quiesce(dcp->dcpavservep);
+		/* Auxiliary sleep endpoints retain DMA too, but must drain host work. */
+		if (dcp->v27_sleep_transport)
+			for (int i = 0; i < ARRAY_SIZE(dcp->sleep_v27_ep); i++)
+				afk_quiesce(READ_ONCE(dcp->sleep_v27_ep[i]));
 		cancel_delayed_work_sync(&dcp->bl_fallback_wq);
 		dcp_backlight_stop(dcp);
 		if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP) {
@@ -6434,6 +6969,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	iomfb_queue_init(dcp);
 
 	dcp->fw_compat = fw_compat;
+	dcp->v27_j714s = fw_compat == DCP_FIRMWARE_V_27_0 &&
+			 of_machine_is_compatible("apple,j714s");
 	/*
 	 * Probe-lifetime like the desktop state: component bind opens a devres
 	 * group on this device and releases it on failure or unbind.
@@ -6457,6 +6994,15 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		/* Checked by dcp_check_firmware_version(). */
 		dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
 		dcp->v27_methods = iomfb_v27_methods(compat_str);
+		if (dcp->v27_j714s) {
+			const struct dcp_method_entry *own =
+				iomfb_v27_methods_j714s(dev, dcp->v27_methods);
+
+			if (own) {
+				dcp->v27_methods = own;
+				dcp->v27_a407 = true;
+			}
+		}
 	}
 	if (fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
 		dcp->desktop = devm_kzalloc(dev, sizeof(*dcp->desktop), GFP_KERNEL);
@@ -6500,6 +7046,9 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
+	/* The link report: on the board it has run on (dcp_j714s_ext()). */
+	if (!dcp_j714s_ext(dev))
+		dcp->hw.link_report = false;
 	/*
 	 * T8142 on firmware 27 runs as the T6050's firmware-27 instance, with
 	 * the default method profile: with H17G every swap fails with status 4.
@@ -6507,9 +7056,27 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	if (fw_compat == DCP_FIRMWARE_V_27_0 &&
 	    of_device_is_compatible(dev->of_node, "apple,t8142-dcp"))
 		dcp->hw.iomfb_method_profile = DCP_IOMFB_METHODS_DEFAULT;
+	dcp->v27_sleep_transport = dcp_v27_sleep_transport_supported(dcp);
 	/* The display such a processor finds at boot is its first sink. */
 	if (dcp_sink_metadata(dcp))
 		dcp_desktop_metadata_new_sink(dcp);
+	if (of_device_is_compatible(dev->of_node, "apple,t8122-dcpext") &&
+	    fw_compat == DCP_FIRMWARE_H17P) {
+		dcp->hw.iomfb_method_profile = DCP_IOMFB_METHODS_J613_EXT26;
+		dcp->hw.adopt_live_session = true;
+		dcp->hw.fw_14_7_endpoints = false;
+		init_completion(&dcp->ext26_link_ready);
+		init_completion(&dcp->ext26_ready);
+		INIT_WORK(&dcp->ext26_blank_work, dcp_ext26_blank_work);
+		INIT_LIST_HEAD(&dcp->ext26_retained);
+		dcp->coproc_reg = devm_platform_ioremap_resource_byname(pdev, "coproc");
+		if (IS_ERR(dcp->coproc_reg))
+			return PTR_ERR(dcp->coproc_reg);
+		dev_dbg(dev, "native26 probe carrier: control=%#x status=%#x; firmware CPU lease supplied by loader\n",
+			 readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL),
+			 readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS));
+	}
+
 	if (dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
 		if (!dcp->hw.firmware_clock ||
@@ -6660,6 +7227,11 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 			set_bit(surf, dcp->iomfb_surfaces);
 		surf++;
 	}
+	if (dcp_is_ext26(dcp)) {
+		bitmap_zero(dcp->iomfb_surfaces, DCP_MAX_PLANES);
+		set_bit(0, dcp->iomfb_surfaces);
+	}
+
 	/* The J700 loader names surface zero rather than enabling it. */
 	if (of_machine_is_compatible("apple,j700") &&
 	    of_device_is_compatible(dev->of_node, "apple,t8140-dcp") &&
@@ -6826,8 +7398,7 @@ fixed_done:
 		return iomfb_v14_7_external_start(dcp);
 	}
 
-	if (dcp->hw.iomfb_method_profile ==
-	    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
+	if (dcp_is_retained_external(dcp)) {
 		/* Complete optional startup before the DRM master can depend on it. */
 		ret = dcp_comp_bind(dev, NULL, NULL);
 		if (ret) {
@@ -7061,6 +7632,9 @@ static void dcp_platform_remove(struct platform_device *pdev)
 		cancel_work_sync(&dcp->s2r_prewarm_work);
 		cancel_delayed_work_sync(&dcp->s2r_prewarm_off_wq);
 	}
+	/* Registration pins callback/provider lifetimes until same-task scope end. */
+	if (IS_ENABLED(CONFIG_APPLE_SOC_SLEEP))
+		apple_sleep_v27_unregister(&pdev->dev);
 
 	if (dcp && dcp->external && !dcp->external_native) {
 		/* Enabled for the external start at probe. No component unbind. */
@@ -7189,6 +7763,16 @@ static void dcp_drain_for_sleep(struct apple_dcp *dcp)
 			return;
 		if (!dcp_backlight_active(dcp) || !dcp_backlight_pending(dcp))
 			return;
+		/*
+		 * The consumer blanks the panel before this runs, so a change
+		 * left pending while the panel is not lit is the blank itself,
+		 * or a level set while DPMS was off: the firmware will not take
+		 * it until the CRTC is active again, and resume restores it on
+		 * the enable swap. It need not reach the firmware before the
+		 * mailbox suspends, so stop here rather than wait it out.
+		 */
+		if (!dcp_backlight_lit(dcp))
+			return;
 	}
 	dev_warn(dcp->dev, "brightness change still pending at suspend\n");
 }
@@ -7272,11 +7856,28 @@ static const char *dcp_external_sleep_vetoed(struct apple_dcp *dcp)
  * Veto early so Thunderbolt cannot tear down a working tunnel first. The
  * same HPD lock serializes this gate against explicit firmware startup.
  */
+static bool dcp_v27_sleep_selected(struct apple_dcp *dcp);
+static void dcp_v27_sleep_invalidate(struct apple_dcp *dcp);
+
 static int dcp_platform_prepare(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 	const char *why;
 
+	if (pm_suspend_via_firmware() && dcp_v27_sleep_selected(dcp)) {
+		dcp_v27_sleep_invalidate(dcp);
+		return 0;
+	}
+
+	if (dcp_is_ext26(dcp)) {
+		if (READ_ONCE(dcp->crashed) || READ_ONCE(dcp->ext26_blocked))
+			return -EIO;
+		WRITE_ONCE(dcp->ext26_pm_preparing, true);
+		cancel_work_sync(&dcp->ext26_blank_work);
+		dcp_disable_typec_work(dcp, false);
+		dcp->ext26_pm_work_off = true;
+		return 0;
+	}
 	/*
 	 * J713: a T8132 external DCP refuses system sleep only for what cannot
 	 * go down with it (see iomfb_m4_ext_sleep_veto()): prepare runs before
@@ -7316,7 +7917,20 @@ static void dcp_platform_complete(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
+	if (dcp_is_ext26(dcp)) {
+		WRITE_ONCE(dcp->ext26_pm_preparing, false);
+		if (dcp->ext26_pm_work_off && !READ_ONCE(dcp->ext26_blocked) &&
+		    !READ_ONCE(dcp->crashed)) {
+			dcp_enable_typec_work(dcp);
+			dcp->ext26_pm_work_off = false;
+		}
+		return;
+	}
+
 	dcp_s2r_dark_finish(dcp);
+	/* Every device has resumed, the DRM device among them: its saved state is spent. */
+	if (!pm_dark_wake())
+		WRITE_ONCE(dcp->sleep_v27_torn, false);
 	/* The sleep failed, or wasn't one that stops the firmware: it still times out. */
 	if (READ_ONCE(dcp->s2r_wake_lit))
 		mod_delayed_work(system_freezable_wq, &dcp->s2r_prewarm_off_wq,
@@ -8360,6 +8974,17 @@ static int dcp_s2r_pm_notify(struct notifier_block *nb, unsigned long action, vo
 
 	if (action == PM_POST_SUSPEND)
 		dcp_s2r_dark_finish(dcp);
+	/*
+	 * A J714s external display processor that has crashed cannot take its sleep calls, and
+	 * the SoC cannot power down around it: the sleep is refused here, before the tasks
+	 * freeze and before any device or port controller is told of it, so nothing has to be
+	 * brought back. The processor stays as it is until a reboot.
+	 */
+	if (action == PM_SUSPEND_PREPARE && dcp_j714s_ext(dcp->dev) &&
+	    !pm_suspend_default_s2idle() && READ_ONCE(dcp->crashed)) {
+		dev_warn(dcp->dev, "the external display processor has crashed: sleep refused before anything is stopped (a reboot brings it back)\n");
+		return notifier_from_errno(-EBUSY);
+	}
 
 	return NOTIFY_DONE;
 }
@@ -8375,7 +9000,7 @@ static int dcp_s2r_pm_register(struct apple_dcp *dcp)
 {
 	int ret;
 
-	if (!dcp_s2r_ext_capable(dcp))
+	if (!dcp_s2r_ext_capable(dcp) && !dcp_j714s_ext(dcp->dev))
 		return 0;
 	dcp->s2r_pm_nb.notifier_call = dcp_s2r_pm_notify;
 	ret = register_pm_notifier(&dcp->s2r_pm_nb);
@@ -8600,6 +9225,8 @@ bool dcp_s2r_firmware_stopped(struct platform_device *pdev)
 	return READ_ONCE(dcp->s2r_fw_down);
 }
 
+#include "dcp-v27-sleep.inc"
+
 static int dcp_platform_suspend(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
@@ -8608,10 +9235,20 @@ static int dcp_platform_suspend(struct device *dev)
 	if (dcp_takeover_was_aborted(dcp))
 		return -EBUSY;
 
+	/*
+	 * An external DCP given up at probe may never have set up the works
+	 * below, and one given up has nothing to put down.
+	 */
+	if (READ_ONCE(dcp->ext_dead))
+		return 0;
+
 	/* A firmware start from the last resume finishes first; this sleep stops it again. */
 	flush_work(&dcp->s2r_prewarm_work);
 	cancel_delayed_work_sync(&dcp->s2r_prewarm_off_wq);
 	dcp->s2r_prewarmed = false;
+
+	if (pm_suspend_via_firmware() && dcp_v27_sleep_selected(dcp))
+		return dcp_v27_sleep_suspend(dcp);
 
 	if (pm_suspend_via_firmware() && dcp_s2r_capable(dcp)) {
 		int ret = dcp_s2r_suspend(dcp);
@@ -8640,8 +9277,10 @@ static int dcp_platform_suspend(struct device *dev)
 			device_set_wakeup_path(dev);
 		return ret;
 	}
-	if (READ_ONCE(dcp->ext_dead))
-		return 0;
+	if (dcp_is_ext26(dcp) && pm_suspend_target_state != PM_SUSPEND_TO_IDLE) {
+		dev_warn(dev, "native26 refuses non-s2idle target %d\n", pm_suspend_target_state);
+		return -EBUSY;
+	}
 	iomfb_v14_7_backlight_suspend(dcp);
 
 	/* Serialize PM against explicit bring-up, including queued startup work.
@@ -8665,15 +9304,20 @@ static int dcp_platform_suspend(struct device *dev)
 		mutex_unlock(&dcp->hpd_mutex);
 	}
 
-	if (dcp_is_external_h17p(dcp)) {
+	if (dcp_is_retained_external(dcp)) {
 		int ret;
 
-		dcp_disable_typec_work(dcp, false);
+		if (!dcp_is_ext26(dcp))
+			dcp_disable_typec_work(dcp, false);
 		ret = dcp_external_disconnect(dcp, false);
 		if (ret) {
-			dcp_enable_typec_work(dcp);
+			if (!dcp_is_ext26(dcp))
+				dcp_enable_typec_work(dcp);
 			return ret;
 		}
+		if (dcp_is_ext26(dcp) &&
+		    !(readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL) & APPLE_DCP_COPROC_CPU_CONTROL_RUN))
+			return -EHOSTDOWN;
 		/*
 		 * The crossbar shares the ATC power domain, which an s2idle can take
 		 * down too: with deep sleep selected, the USB controller stops for any
@@ -8682,8 +9326,12 @@ static int dcp_platform_suspend(struct device *dev)
 		 * never trains again (DEVICE_NOT_RESPONDING). Take the output down
 		 * while it has power and select it again on resume, as s2r does.
 		 */
-		dcp_typec_route_park(dcp);
+		/* Pair with the H17P unpark; native26 has its own retained resume. */
+		if (dcp_is_external_h17p(dcp))
+			dcp_typec_route_park(dcp);
 		device_set_wakeup_path(dev);
+		if (dcp_is_ext26(dcp))
+			dev_dbg(dev, "native26 retained s2idle stop; firmware and supplier leases held\n");
 		return 0;
 	}
 
@@ -8728,6 +9376,9 @@ static int dcp_platform_resume(struct device *dev)
 	if (dcp_takeover_was_aborted(dcp))
 		return 0;
 
+	if (dcp_v27_sleep_selected(dcp) && READ_ONCE(dcp->sleep_v27_closed))
+		return dcp_v27_sleep_resume(dcp);
+
 	if (dcp->s2r_stopped)
 		return dcp_s2r_resume(dcp);
 
@@ -8737,6 +9388,19 @@ static int dcp_platform_resume(struct device *dev)
 		return 0;
 
 	dcp->link_recovery_tries = 0;
+	if (dcp_is_ext26(dcp)) {
+		if (!(readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL) & APPLE_DCP_COPROC_CPU_CONTROL_RUN) ||
+		    READ_ONCE(dcp->crashed)) {
+			WRITE_ONCE(dcp->ext26_blocked, true);
+			WRITE_ONCE(dcp->external_error, -EHOSTDOWN);
+			dev_err(dev, "native26 firmware did not survive s2idle; retained session requires reboot\n");
+			return -EHOSTDOWN;
+		}
+		WRITE_ONCE(dcp->external_suspended, false);
+		/* Complete restarts discovery after DRM has dropped the stale CRTC. */
+		dev_dbg(dev, "native26 resumed retained firmware; discovery waits for PM complete\n");
+		return 0;
+	}
 	dcp_release_after_sleep(dcp);
 	iomfb_v14_7_backlight_resume(dcp);
 	/* Its crossbar output, parked by the suspend, before the link connects again. */
@@ -8889,6 +9553,9 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6041_dcpext = {
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t6050 = {
+	.v27_sleep_protocol = true,
+	/* Off until recovery from a real and from an aborted wake is validated. */
+	.v27_sleep_recovery = false,
 	.firmware_dma_bits = 41,
 	.num_dptx_ports = 0,
 	.adopt_live_session = true,
@@ -8897,11 +9564,16 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6050 = {
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t6050_dcpext = {
+	/* Off: an inactive display DART's and its GAPF slice's handling is not validated. */
+	.v27_sleep_protocol = false,
+	/* Off until recovery from a real and from an aborted wake is validated. */
+	.v27_sleep_recovery = false,
 	.firmware_dma_bits = 41,
 	.num_dptx_ports = 2,
 	.adopt_live_session = true,
 	.firmware_compat = DCP_FIRMWARE_V_27_0,
 	.sink_metadata_edid = true,
+	.link_report = true,
 };
 
 static const struct of_device_id of_match[] = {

@@ -25,6 +25,7 @@
 #include <linux/iopoll.h>
 #include <linux/jiffies.h>
 #include <linux/module.h>
+#include <linux/ktime.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
@@ -648,6 +649,60 @@ static struct apple_mbox_msg apple_mbox_read_msg(struct apple_mbox *mbox)
 	return msg;
 }
 
+/* Opt-in primitives: do not inherit the normal sender/poller's wait budgets. */
+int apple_mbox_send_nowait(struct apple_mbox *mbox, struct apple_mbox_msg msg)
+{
+	unsigned long flags;
+	int ret = 0;
+
+	local_irq_save(flags);
+	if (!spin_trylock(&mbox->tx_lock)) {
+		local_irq_restore(flags);
+		return -EBUSY;
+	}
+	if (READ_ONCE(mbox->removing) || !READ_ONCE(mbox->active))
+		ret = -ENODEV;
+	else if (mbox->hw->is_ascwrap_v8)
+		ret = -EOPNOTSUPP;
+	else if (apple_mbox_tx_full(mbox,
+		 readl_relaxed(mbox->regs + mbox->hw->a2i_control)))
+		ret = -EAGAIN;
+	else
+		apple_mbox_write_msg(mbox, msg);
+	spin_unlock_irqrestore(&mbox->tx_lock, flags);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_mbox_send_nowait);
+
+int apple_mbox_recv_nowait(struct apple_mbox *mbox, struct apple_mbox_msg *msg)
+{
+	unsigned long flags;
+	int ret = 0;
+
+	local_irq_save(flags);
+	if (!spin_trylock(&mbox->rx_lock)) {
+		local_irq_restore(flags);
+		return -EBUSY;
+	}
+	if (READ_ONCE(mbox->removing) || !READ_ONCE(mbox->active) || !mbox->rx)
+		ret = -ENODEV;
+	else if (mbox->hw->is_ascwrap_v8)
+		ret = -EOPNOTSUPP;
+	else {
+		if (!apple_mbox_rx_empty(mbox,
+		    readl_relaxed(mbox->regs + mbox->hw->i2a_control))) {
+			*msg = apple_mbox_read_msg(mbox);
+			ret = 1;
+		}
+		if (mbox->hw->has_irq_controls)
+			writel_relaxed(mbox->hw->irq_bit_recv_not_empty,
+				       mbox->regs + mbox->hw->irq_ack);
+	}
+	spin_unlock_irqrestore(&mbox->rx_lock, flags);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_mbox_recv_nowait);
+
 int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 		    bool atomic)
 {
@@ -1168,6 +1223,15 @@ void apple_mbox_set_recv_enabled(struct apple_mbox *mbox, bool enabled)
 	spin_unlock_irqrestore(&mbox->rx_lock, flags);
 }
 EXPORT_SYMBOL_GPL(apple_mbox_set_recv_enabled);
+
+int apple_mbox_ans_idle_status(struct apple_mbox *mbox, u32 *status)
+{
+	if (!of_device_is_compatible(mbox->dev->of_node, "apple,t6050-asc-mailbox"))
+		return -EOPNOTSUPP;
+	*status = readl(mbox->regs);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_mbox_ans_idle_status);
 
 /*
  * The mailbox's power domain was off while it stayed started (its consumer

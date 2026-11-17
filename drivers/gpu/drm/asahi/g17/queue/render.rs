@@ -1728,9 +1728,20 @@ impl Pair {
     /// Sample PM feedback only after this pair's exact retirement. Busy pairs
     /// keep their current capacity and let firmware request growth as needed.
     pub(crate) fn host_growth_target(&mut self, packet: &Packet) -> Result<Option<usize>> {
-        let required =
+        let mut required =
             m5_render_submission::layout(&packet.command, self.clusters, self.variant.programs)?
                 .tvb_blocks;
+        // A mesh workgroup whose output is in flight when the tiler heap runs out loses part of
+        // it, whether the firmware then grows the heap or partial-renders, and the tile-count
+        // estimate does not see mesh output. Size the heap of a render with mesh shading ahead
+        // of it, to the size its automatic growth reaches after one such render.
+        if matches!(&packet.command, Validated::Render { pass, resources, .. }
+            if pass.mesh_output || resources.as_ref().is_some_and(|p| p.uses_mesh()))
+        {
+            if let Some(floor) = self.memory.manager.mesh_floor() {
+                required = required.max(floor);
+            }
+        }
         self.memory
             .manager
             .note_required(required, crate::g17::now_ns());
@@ -1766,6 +1777,13 @@ impl Pair {
             && self.prepared.is_none()
             && self.active.len() != 0
             && self.active.iter().all(|active| active.stamps_owed)
+    }
+
+    /// Work no other owner can bind this pair past: a quarantine, or a group whose stamps are
+    /// owed. Only the firmware draining the pair (the stamps, or a kill of its context) or a
+    /// processor stop ends either, so admission holds the slot from every other owner meanwhile.
+    pub(crate) fn unreusable_work(&self) -> bool {
+        self.quarantined || self.active.iter().any(|active| active.stamps_owed)
     }
 
     /// Whether a settlement attempt of this drained pair is due at `now`.
@@ -2626,13 +2644,14 @@ impl Pair {
 
     /// Fresh proof after asynchronous control publication is the ownership
     /// boundary. A refused deferred item leaves the precise owner available.
+    /// Returns whether the proof held and released every group of the pair.
     pub(crate) fn release_witnessed(
         &mut self,
         host: &impl Host,
         defer: &mut impl FnMut(Deferred) -> Result,
-    ) -> Result {
+    ) -> Result<bool> {
         if self.active.iter().any(|a| !a.flist_completed) || !self.firmware_drained(host)? {
-            return Ok(());
+            return Ok(false);
         }
         while let Some(active) = self.active.front() {
             // A group retired on its pass record was reported then (`stamps_owed`): the pair-wide
@@ -2650,7 +2669,7 @@ impl Pair {
         self.drain_failures = 0;
         self.drain_retry_at = 0;
         self.resync();
-        Ok(())
+        Ok(true)
     }
 
     /// The registry first polls the completed prefix through this exact Arc.

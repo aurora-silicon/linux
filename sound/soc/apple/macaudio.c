@@ -183,6 +183,13 @@ struct macaudio_platform_cfg {
 	 * front-end owns the DMA channel of one serializer (AOP-fed models).
 	 */
 	bool spk_secondary_only;
+	/*
+	 * No voltage or current sense reaches the AP, so no protection daemon
+	 * can govern the speakers: their SN012776 volumes stay under safe_vol,
+	 * locked, unlocked or granted alike, and there is no sense PCM. A
+	 * granted lease runs them at safe_vol, its operating gain.
+	 */
+	bool spk_fixed_ceiling;
 };
 
 static const char *volume_control_names[] = {
@@ -527,7 +534,9 @@ static void macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
 			max = 1; //TAS5770_DB(ma->cfg->safe_vol);
 		break;
 	case AMP_SN012776:
-		if (unlock)
+		if (ma->cfg->spk_fixed_ceiling)
+			max = SN012776_DB(ma->cfg->safe_vol);
+		else if (unlock)
 			max = SN012776_0DB;
 		else
 			max = 1; //SN012776_DB(ma->cfg->safe_vol);
@@ -1026,7 +1035,11 @@ static long macaudio_spk_gain(const struct macaudio_snd_data *ma, bool granted)
 	case AMP_TAS5770:
 		return granted ? TAS5770_0DB : 0;
 	case AMP_SN012776:
-		return granted ? SN012776_0DB : 0;
+		if (!granted)
+			return 0;
+		/* The volumes' limit is the ceiling, so is the operating gain */
+		return ma->cfg->spk_fixed_ceiling ? SN012776_DB(ma->cfg->safe_vol) :
+						    SN012776_0DB;
 	case AMP_MAX98360A:
 		return granted ? MAX98360A_0DB : MAX98360A_DB(ma->cfg->safe_vol);
 	default:
@@ -1156,6 +1169,10 @@ static void macaudio_spk_ramp_down(struct macaudio_snd_data *ma, ktime_t deadlin
 	lockdep_assert_held(&ma->spk_mutex);
 
 	for (i = 0; i < ARRAY_SIZE(macaudio_spk_ramp_db); i++) {
+		/* A fixed ceiling is the operating gain: start below it */
+		if (ma->cfg->spk_fixed_ceiling &&
+		    macaudio_spk_ramp_db[i] >= ma->cfg->safe_vol)
+			continue;
 		if (!ktime_before(ktime_get(), deadline))
 			return;
 		/* A failure here is the floor's to catch; it notifies the end */
@@ -2657,7 +2674,8 @@ static int macaudio_parse_of(struct macaudio_snd_data *ma)
 				}
 			}
 			ma->has_speakers = 1;
-			if (ma->cfg->amp != AMP_SSM3515 && ma->cfg->safe_vol != 0)
+			if (ma->cfg->amp != AMP_SSM3515 && ma->cfg->safe_vol != 0 &&
+			    !ma->cfg->spk_fixed_ceiling)
 				ma->has_sense = 1;
 		}
 
@@ -4208,12 +4226,13 @@ struct macaudio_platform_cfg macaudio_j614_cfg = {
 };
 
 /*
- * J604 (T8132, MacBook Pro 14" M4): the J614s's amps, frame and chassis,
- * but its speakers have not been brought up. Keep them off entirely: the
- * speaker link is not bound, so no stream ever reaches the amps.
+ * J604 (T8132, MacBook Pro 14" M4): the J614s's six amps, two woofers and a
+ * tweeter per side, on all six playback and twelve sense slots of the same
+ * frame. The speakers stay at their safe level until speakersafetyd takes
+ * them with the J604 profile.
  */
 struct macaudio_platform_cfg macaudio_j604_cfg = {
-	.enable_speakers = false,
+	.enable_speakers = true,
 	.amp = AMP_SN012776,
 	.speakers = SPKR_2W1T,
 	.stereo = true,
@@ -4391,7 +4410,7 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j575c-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* j613    AID20   sn012776    15      2x 1W+1T Compat: apple,j413-macaudio */
 	/* j615    AID21   sn012776    15      2x 2W+1T Compat: apple,j415-macaudio */
-	/* j604    -       sn012776    15      2x 2W+1T (AOP-fed; speakers off until bring-up) */
+	/* j604    -       sn012776    15      2x 2W+1T (AOP-fed) */
 	{ .compatible = "apple,j604-macaudio", .data = &macaudio_j604_cfg },
 	/* j604    -       cs42l84     -       the jack, a card of its own (AOP-fed) */
 	{ .compatible = "apple,j604-macaudio-jack", .data = &macaudio_j616_jack_cfg },

@@ -241,6 +241,8 @@ pub(crate) struct RenderPass {
     pub(crate) depth_bias_is_int: bool,
     /// At most four known primitives; sets the auxiliary framebuffer bit 0.
     pub(crate) few_primitives: bool,
+    /// Host-only: the render contains mesh shading (DRM_ASAHI_RENDER_MESH_OUTPUT).
+    pub(crate) mesh_output: bool,
     /// Host-only: the resolved barriers order the fragment kick, not the tiling kick.
     pub(crate) fragment_barriers: bool,
     /// Host-only: the tiling kick waits on its own render and compute prefixes

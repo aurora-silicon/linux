@@ -59,6 +59,33 @@ properties:
       Host DMA allocation window as a base and nonzero size, inside the root
       slots of this AOP DART stream that are free for the host.
 
+  apple,sleep-endpoints:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 15
+    uniqueItems: true
+    items:
+      minimum: 0x20
+      maximum: 0x2e
+    description:
+      The service endpoints the host stops before a system sleep in which the
+      firmware keeps running, in the order it stops them; one not listed is
+      left as it is. Without it the host stops every started endpoint in
+      endpoint order. Filled in by the bootloader.
+
+  apple,wake-endpoints:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 15
+    uniqueItems: true
+    items:
+      minimum: 0x20
+      maximum: 0x2e
+    description:
+      The order in which the host starts the endpoints it stopped, after that
+      sleep; one not listed is not started again. Without it they start in
+      endpoint order. Filled in by the bootloader.
+
   audio:
     type: object
     $ref: /schemas/sound/apple,t8152-aop-audio.yaml#

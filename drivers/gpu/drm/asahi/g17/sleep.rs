@@ -32,6 +32,9 @@ use kernel::{
 /// Time work in flight gets to finish before the sleep is refused.
 const DRAIN_NS: u64 = 3_000_000_000;
 const DRAIN_TICK_MS: i64 = 2;
+/// Match the existing maximum compute admission wait before declaring a late builder stalled.
+const CANCEL_RETRY_NS: u64 = super::preparation::QUEUE_WAIT_NS;
+const CANCEL_CHECK_MS: u32 = 20;
 
 unsafe extern "C" {
     fn asahi_g17_pmp_request(dev: *mut core::ffi::c_void, enable: bool) -> core::ffi::c_int;
@@ -48,6 +51,7 @@ unsafe extern "C" {
         bridge: bool,
     ) -> *mut core::ffi::c_void;
     fn asahi_g17_commit_finish(commit: *mut core::ffi::c_void, saved: *mut u32) -> bool;
+    fn asahi_g17_commit_stops_firmware() -> bool;
 }
 
 /// What `.complete` does after a sleep whose stop was left to the commit.
@@ -129,6 +133,11 @@ impl Hardware for Firmware {
     }
 
     fn gating(&mut self, enable: bool) -> Result {
+        // A target without the bridge (the M5): its core gating, written once at probe, is
+        // lost when a real sleep powers the domain off. Written again before the run bit.
+        if enable && !self.bridge.enabled {
+            return self.bridge.regs.enable_g17_gating();
+        }
         self.bridge.set_gating(enable)
     }
 
@@ -339,9 +348,68 @@ impl Shared {
         }
     }
 
-    /// Undoes everything short of a stopped firmware. A builder that never finishes would keep
-    /// publication closed for good, and that is a lost device.
-    fn sleep_cancel(self: &Arc<Self>) {
+    fn sleep_cancel_reopenable(&self) -> bool {
+        self.sleeping()
+            && self.sleep_gate.load(Ordering::Acquire)
+            && !self.crashed.load(Ordering::Acquire)
+            && self.sleep_commit.load(Ordering::Acquire).is_null()
+            && self.preparations.closed_and_recoverable()
+    }
+
+    /// Only used when the commit never stopped firmware. The gate must join the entire
+    /// invalidated preparation epoch before new builders can publish into the same session.
+    fn reopen_cancelled_sleep(self: &Arc<Self>) -> bool {
+        if !self.sleep_cancel_reopenable() || !self.preparations.reopen() {
+            return false;
+        }
+        self.sleep_cancel_deadline.store(0, Ordering::Release);
+        // Clear ownership first: another PM prepare cannot pass sleeping() until the gate
+        // flag is settled, and the retry worker makes no further state changes after that.
+        self.sleep_gate.store(false, Ordering::Release);
+        self.sleeping.store(false, Ordering::Release);
+        self.queue_events();
+        true
+    }
+
+    /// This poll only retries software admission. It never runs the normal poll or touches
+    /// registers while asleep, even if the uncommitted session cannot be reopened.
+    pub(super) fn sleep_cancel_poll(self: &Arc<Self>) {
+        let deadline = self.sleep_cancel_deadline.load(Ordering::Acquire);
+        if deadline == 0 {
+            return;
+        }
+        if super::now_ns() >= deadline || !self.sleep_cancel_reopenable() {
+            self.sleep_cancel_deadline.store(0, Ordering::Release);
+            dev_warn!(self.dev.as_ref(), "GPU sleep cancellation could not reopen its session\n");
+            return;
+        }
+        if !self.reopen_cancelled_sleep() {
+            self.queue_poll_after(CANCEL_CHECK_MS);
+        }
+    }
+
+    /// Undoes everything short of a stopped firmware. T6050 keeps an uncertain session owned:
+    /// marking it lost here would let the runtime worker stop firmware before the commit.
+    fn sleep_cancel(self: &Arc<Self>, commit_only: bool) {
+        if commit_only {
+            self.sleeping.store(true, Ordering::Release);
+            self.join_event_workers();
+            let drained = self
+                .preparations
+                .wait_drained_until(super::now_ns().saturating_add(DRAIN_NS));
+            if drained.is_ok() && self.reopen_cancelled_sleep() {
+                return;
+            }
+            if drained.is_err() && self.sleep_cancel_reopenable() {
+                self.sleep_cancel_deadline.store(
+                    super::now_ns().saturating_add(CANCEL_RETRY_NS),
+                    Ordering::Release,
+                );
+                self.queue_poll_after(CANCEL_CHECK_MS);
+            }
+            dev_warn!(self.dev.as_ref(), "GPU sleep cancellation retains its session\n");
+            return;
+        }
         self.sleeping.store(false, Ordering::Release);
         self.sleep_gate.store(false, Ordering::Release);
         let drained = self
@@ -418,8 +486,11 @@ impl Shared {
 
     /// Closes publication, waits for quiet, and leaves the stop to the sleep's commit. A refusal
     /// changes nothing.
-    fn sleep_down(self: &Arc<Self>) -> Result {
+    fn sleep_down(self: &Arc<Self>, commit_only: bool) -> Result {
         if self.sleeping() {
+            if commit_only {
+                return Err(EBUSY);
+            }
             let mut state = self.state.lock();
             if let Some(firmware) = (*state).as_deref_mut() {
                 lower_domain(firmware);
@@ -443,7 +514,8 @@ impl Shared {
             });
         match result {
             Ok(()) => Ok(()),
-            Err(error) if error == ENODEV || self.crashed.load(Ordering::Acquire) => {
+            Err(error) if !commit_only &&
+                (error == ENODEV || self.crashed.load(Ordering::Acquire)) => {
                 // Nothing to save: let the worker finish detaching what's left, and then the
                 // domain only has to be off for the sleep.
                 self.sleeping.store(false, Ordering::Release);
@@ -458,7 +530,7 @@ impl Shared {
                 Ok(())
             }
             Err(error) => {
-                self.sleep_cancel();
+                self.sleep_cancel(commit_only);
                 Err(error)
             }
         }
@@ -475,6 +547,18 @@ impl Shared {
                     if result.is_ok() {
                         // The cores lost power, so the next command on each pair installs it again.
                         firmware.queues.forget_render_registrations();
+                        // So did every M5 compute queue's host-port configuration: it goes out
+                        // again here, before publication reopens and so before any doorbell.
+                        let (_, failed) = firmware
+                            .queues
+                            .restore_compute_port_configurations(&firmware.bridge.regs);
+                        if failed != 0 {
+                            dev_warn!(
+                                self.dev.as_ref(),
+                                "{} GPU compute queues not configured again after the wake\n",
+                                failed
+                            );
+                        }
                         firmware.rings.invalidate_statistics();
                         firmware.port.statistics_epoch_bump();
                     }
@@ -513,14 +597,16 @@ impl Shared {
 impl super::Gpu {
     /// Called before any device suspends. Only a sleep that powers the SoC down gets here.
     pub(crate) fn sleep_prepare(&self) -> Result {
-        if !self.cfg.sleep_restart {
+        // SAFETY: Reads the sleep driver's state: true where the commit stops the firmware.
+        let commit_stop = unsafe { asahi_g17_commit_stops_firmware() };
+        if !self.cfg.sleep_restart && !commit_stop {
             dev_warn!(
                 self.shared.dev.as_ref(),
                 "no firmware restart on this chip, refusing sleep\n"
             );
             return Err(EBUSY);
         }
-        let result = self.shared.sleep_down();
+        let result = self.shared.sleep_down(self.cfg.chip_id == 0x6050);
         if let Err(error) = result {
             dev_warn!(self.shared.dev.as_ref(), "GPU refused sleep: {:?}\n", error);
         }
@@ -540,10 +626,15 @@ impl super::Gpu {
                     self.shared.dev.as_ref(),
                     "sleep refused before the commit: GPU firmware never stopped\n"
                 );
-                self.shared.sleep_cancel();
+                self.shared.sleep_cancel(self.cfg.chip_id == 0x6050);
                 return;
             }
             self.shared.sleep_settle_commit();
+        }
+        if self.cfg.chip_id == 0x6050 && !real {
+            // With no physical wake, even an uncertain or stopped session stays owned.
+            // Neither a refusal nor a missing commit receipt authorizes power or restart.
+            return;
         }
         if !real && self.shared.sleep_hold() {
             return;

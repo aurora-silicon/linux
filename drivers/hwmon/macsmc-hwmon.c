@@ -898,6 +898,18 @@ static int macsmc_hwmon_create_sensor(struct device *dev, struct apple_smc *smc,
  * A SoC die temperature sensor: a readable float temperature key, labelled
  * "SoC die <key>".
  */
+/* The temperature channel set up so far for @key, if any. */
+static struct macsmc_hwmon_sensor *macsmc_hwmon_find_temp(struct macsmc_hwmon *hwmon,
+							  smc_key key)
+{
+	u32 i;
+
+	for (i = 0; i < hwmon->temp.count; i++)
+		if (hwmon->temp.sensors[i].macsmc_key == key)
+			return &hwmon->temp.sensors[i];
+	return NULL;
+}
+
 static int macsmc_hwmon_create_die_sensor(struct macsmc_hwmon *hwmon, const char *key,
 					  struct macsmc_hwmon_sensor *sensor)
 {
@@ -1267,6 +1279,19 @@ static int macsmc_hwmon_populate_sensors(struct macsmc_hwmon *hwmon,
 				continue;
 			}
 			hwmon->die_listed++;
+			/*
+			 * A key whose temperature node has a no-data threshold
+			 * joins the zone through that channel instead of a
+			 * second channel without the threshold.
+			 */
+			sensor = macsmc_hwmon_find_temp(hwmon, _SMC_KEY(key));
+			if (sensor && sensor->has_no_data_below) {
+				if (!sensor->die) {
+					sensor->die = true;
+					hwmon->die_count++;
+				}
+				continue;
+			}
 			sensor = &hwmon->temp.sensors[hwmon->temp.count];
 			if (!macsmc_hwmon_create_die_sensor(hwmon, key, sensor)) {
 				hwmon->die_count++;
@@ -1324,16 +1349,16 @@ static void macsmc_hwmon_populate_fan_configs(u32 *configs, const struct macsmc_
  * the zone up by name). It has no trip points and is not polled; each read
  * queries every SoC die sensor. A read fails if any of them cannot be read or
  * reads outside -40..150 degrees Celsius, so users never act on a partial or
- * implausible view.
+ * implausible view. A sensor below its no-data threshold is powered down and
+ * left out.
  */
 #if IS_ENABLED(CONFIG_THERMAL)
 #define MACSMC_SOC_DIE_ZONE	"macsmc_soc_die"
 #define MACSMC_DIE_MIN_MC	-40000
 #define MACSMC_DIE_MAX_MC	150000
 
-static int macsmc_hwmon_die_get_temp(struct thermal_zone_device *tz, int *temp)
+static int macsmc_hwmon_die_hottest(struct macsmc_hwmon *hwmon, int *temp)
 {
-	struct macsmc_hwmon *hwmon = thermal_zone_device_priv(tz);
 	bool found = false;
 	long hottest = 0, value;
 	u32 i;
@@ -1347,6 +1372,9 @@ static int macsmc_hwmon_die_get_temp(struct thermal_zone_device *tz, int *temp)
 		ret = macsmc_hwmon_read_key(hwmon->smc, sensor, 1000, &value);
 		if (ret)
 			return ret;
+		/* A powered-down sensor (a GPU key while the GPU is off) has no say. */
+		if (sensor->has_no_data_below && value < sensor->no_data_below)
+			continue;
 		if (value < MACSMC_DIE_MIN_MC || value > MACSMC_DIE_MAX_MC)
 			return -ERANGE;
 		if (!found || value > hottest)
@@ -1358,6 +1386,11 @@ static int macsmc_hwmon_die_get_temp(struct thermal_zone_device *tz, int *temp)
 
 	*temp = hottest;
 	return 0;
+}
+
+static int macsmc_hwmon_die_get_temp(struct thermal_zone_device *tz, int *temp)
+{
+	return macsmc_hwmon_die_hottest(thermal_zone_device_priv(tz), temp);
 }
 
 static const struct thermal_zone_device_ops macsmc_hwmon_die_ops = {

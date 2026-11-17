@@ -1452,6 +1452,10 @@ static void tb_scan_port(struct tb_port *port)
 	 */
 	tb_switch_configuration_valid(sw);
 
+	/* TEST (J714s): then the link's PM roles, where macOS gives them. */
+	if (tb_switch_cio_pm_roles(sw))
+		tb_sw_warn(sw, "failed to set the PM roles of its link\n");
+
 	/* Scan upstream retimers */
 	tb_retimer_scan(upstream_port, true);
 
@@ -4082,6 +4086,10 @@ static void tb_restore_children(struct tb_switch *sw)
 		tb_sw_warn(sw, "failed to restore TMU configuration\n");
 
 	tb_switch_configuration_valid(sw);
+
+	/* TEST (J714s): then the link's PM roles, where macOS gives them after a wake. */
+	if (tb_switch_cio_pm_roles(sw))
+		tb_sw_warn(sw, "failed to restore the PM roles of its link\n");
 
 	tb_switch_for_each_port(sw, port) {
 		if (!tb_port_has_remote(port) && !port->xdomain)

@@ -395,7 +395,9 @@ int dcp_backlight_prepare(struct apple_dcp *dcp, bool have_surface,
 			  struct dcp_backlight_present *present);
 bool dcp_backlight_complete(struct apple_dcp *dcp, u64 sequence, bool accepted);
 bool dcp_backlight_pending(struct apple_dcp *dcp);
+bool dcp_backlight_lit(struct apple_dcp *dcp);
 bool dcp_backlight_resend(struct apple_dcp *dcp);
+int dcp_backlight_wake_lit(struct apple_dcp *dcp);
 unsigned int dcp_backlight_retry_delay(struct apple_dcp *dcp);
 
 #endif /* __APPLE_DCP_BACKLIGHT_H__ */
