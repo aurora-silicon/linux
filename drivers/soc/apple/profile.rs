@@ -26,7 +26,7 @@
 //!   the T8140 SEP DART aperture above 4 GiB.
 //! * `T6040` / J616s (MacBook Pro 16", M4 Pro): iBoot boots sepOS, so the
 //!   driver uses the warm registration path; the sensor is the J700 part.
-//! * `T6050` / J714s (MacBook Pro 14", M5 Pro): T6040's SEP and sensor, with
+//! * `T6050` / J714s, J716c (M5 Pro/Max): T6040's SEP and sensor, with
 //!   the sensor's bus at its own address.
 
 // The boot handshake, identity source, sensor and DART fields are consumed by
@@ -466,9 +466,10 @@ pub(crate) const T6041: PlatformProfile = PlatformProfile {
 /// aperture starts at the BIT(40) alias (`vm-base-0` 0x10000004000,
 /// `vm-size-0` 0xffff0000), and the Mesa sensor J700 carries (`sensor-id`
 /// 0x3356) on spi2 at `0x505108000`, 8 MHz, chip select 0. That is J616s's
-/// SEP, so T6040's profile with this sensor bus.
+/// SEP, so T6040's profile with this sensor bus. J716c has the same pre-booted
+/// ASC, DART aperture, sensor revision, bus address and SPI frequency.
 pub(crate) const T6050: PlatformProfile = PlatformProfile {
-    name: "T6050/J714s, K116s",
+    name: "T6050/J714s, K116s, J716c",
     sensor: SensorProfile {
         controller_base: 0x5_0510_8000,
         ..T6040.sensor
@@ -703,7 +704,9 @@ fn select(
     if has(b"apple,t6041") && (has(b"apple,j616c") || has(b"apple,j614c")) {
         return Ok(&T6041);
     }
-    if has(b"apple,t6050") && (has(b"apple,j714s") || has(b"apple,k116s")) {
+    if has(b"apple,t6050")
+        && (has(b"apple,j714s") || has(b"apple,k116s") || has(b"apple,j716c"))
+    {
         return Ok(&T6050);
     }
     // Only the M4 MacBook Airs: the other T8132 Macs are unread.
@@ -796,6 +799,8 @@ mod tests {
         assert_eq!(picked(&[b"apple,j713", b"apple,t6041"]), None);
         assert_eq!(picked(&[b"apple,j714s", b"apple,t6050"]), Some(T6050.name));
         assert_eq!(picked(&[b"apple,k116s", b"apple,t6050"]), Some(T6050.name));
+        assert_eq!(picked(&[b"apple,j716c", b"apple,t6050"]), Some(T6050.name));
+        assert_eq!(picked(&[b"apple,j716c", b"apple,t6041"]), None);
         assert_eq!(picked(&[b"apple,t6050"]), None);
     }
 
@@ -807,7 +812,7 @@ mod tests {
     /// profile naming one of the known Mesa revisions.
     #[test]
     fn every_touch_id_mac_gets_a_sensor_the_shared_path_decodes() {
-        let macs: [&[&[u8]]; 15] = [
+        let macs: [&[&[u8]]; 16] = [
             &[b"apple,j313", b"apple,t8103"],
             &[b"apple,j316s", b"apple,t6000"],
             &[b"apple,j316c", b"apple,t6001"],
@@ -823,6 +828,7 @@ mod tests {
             &[b"apple,j713", b"apple,t8132"],
             &[b"apple,j700", b"apple,t8140"],
             &[b"apple,j714s", b"apple,t6050"],
+            &[b"apple,j716c", b"apple,t6050"],
         ];
         for compatibles in macs {
             let has = |c: &[u8]| compatibles.iter().any(|x| *x == c);
