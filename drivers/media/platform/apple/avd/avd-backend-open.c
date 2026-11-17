@@ -74,7 +74,7 @@ static unsigned int avd_open_max_inflight(struct avd_dev *avd)
 	return 1;
 }
 
-static int avd_open_submit(struct avd_dev *avd, struct avd_frame *f)
+int avd_open_submit(struct avd_dev *avd, struct avd_frame *f)
 {
 	struct avd_ctx *ctx = f->ctx;
 	u32 codec = f->cmd[0], vp = 0;
@@ -131,13 +131,9 @@ static int avd_open_submit(struct avd_dev *avd, struct avd_frame *f)
 	return 0;
 }
 
-static irqreturn_t avd_open_irq(struct avd_dev *avd)
+irqreturn_t avd_open_complete(struct avd_dev *avd, u32 status)
 {
 	struct avd_frame *f = avd->compat_active;
-	u32 status;
-
-	if (!avd_mbox_pop(avd, &status))
-		return IRQ_HANDLED;
 	if (!f) {
 		/*
 		 * The old driver kicked PP for every VP DONE. A VP DONE with no
@@ -175,6 +171,15 @@ static irqreturn_t avd_open_irq(struct avd_dev *avd)
 		mod_delayed_work(system_dfl_wq, &avd->queue_work, 0);
 	}
 	return IRQ_HANDLED;
+}
+
+static irqreturn_t avd_open_irq(struct avd_dev *avd)
+{
+	u32 status;
+
+	if (!avd_mbox_pop(avd, &status))
+		return IRQ_HANDLED;
+	return avd_open_complete(avd, status);
 }
 
 const struct avd_backend_ops avd_open_backend = {
@@ -235,6 +240,13 @@ static int avd_open_request_firmware(struct avd_dev *avd)
 int avd_backend_select(struct avd_dev *avd)
 {
 	int ret;
+
+	if (avd->variant->quirks & AVD_QUIRK_KOPSIA) {
+		avd->backend = &avd_kopsia_backend;
+		avd->capabilities = avd->variant->capabilities;
+		avd->fw_capabilities = avd->capabilities;
+		return avd->backend->probe(avd);
+	}
 
 	/* Apple probe returns -ENOENT only when no usable image is present. */
 	if (avd->variant->apple) {
