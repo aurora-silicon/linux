@@ -17,11 +17,22 @@ description: |
   bootstrap. This binding does not authorize adopting an existing live
   firmware session or releasing another owner's retained DART streams.
 
+  The T8142 native transport uses the same PCI function IDs but is a
+  different firmware profile. Its SoC-specific compatible identifies this
+  binding profile; the generic PCI compatible is retained as the fallback.
+  Runtime driver selection continues to use the PCI ID and host SoC, and the
+  native driver selects personalized firmware and transport data from its
+  root-board match table rather than the T6050 wire-protocol properties.
+
 properties:
   compatible:
-    enum:
-      - pci106b,1900
-      - pci106b,1901
+    oneOf:
+      - enum:
+          - pci106b,1900
+          - pci106b,1901
+      - items:
+          - const: apple,t8142-centauri-control
+          - const: pci106b,1900
 
   reg:
     maxItems: 1
@@ -40,11 +51,25 @@ properties:
     const: 27
     description: Shared firmware wire protocol profile
 
+allOf:
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8142-centauri-control
+    then:
+      properties:
+        firmware-name: false
+        apple,centauri-platform-id: false
+        apple,centauri-protocol: false
+    else:
+      required:
+        - firmware-name
+        - apple,centauri-platform-id
+        - apple,centauri-protocol
+
 required:
   - compatible
   - reg
-  - firmware-name
-  - apple,centauri-platform-id
-  - apple,centauri-protocol
 
 additionalProperties: false

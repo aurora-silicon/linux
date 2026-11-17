@@ -36,12 +36,8 @@
 		msi-controller;
 		msi-ranges = <&aic AIC_IRQ 1741 IRQ_TYPE_EDGE_RISING 32>;
 	};
+};
 
-	pcie0_dart: iommu@488000000 {
-		compatible = "apple,t8142-dart", "apple,t8110-dart";
-		reg = <4 0x88000000 0 0x20000>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 1463 IRQ_TYPE_LEVEL_HIGH>;
-		#iommu-cells = <1>;
-	};
+&pcie0_dart {
+	status = "okay";
 };

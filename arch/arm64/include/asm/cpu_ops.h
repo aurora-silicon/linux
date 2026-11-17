@@ -68,12 +68,15 @@ struct spin_table_power_ops {
 	int	(*cpu_on)(u64 mpidr);
 };
 
+struct cpumask;
+
 #ifdef CONFIG_HOTPLUG_CPU
 int spin_table_set_power_ops(const struct spin_table_power_ops *ops);
 int spin_table_hold_parked(void);
 void spin_table_unhold_parked(void);
 int spin_table_stop_parked(void);
 void spin_table_release_stopped(void);
+void spin_table_release_cpus(const struct cpumask *cpus);
 void spin_table_stop_finished(void);
 bool spin_table_cpus_stuck(void);
 #else
@@ -90,6 +93,7 @@ static inline int spin_table_stop_parked(void)
 }
 
 static inline void spin_table_release_stopped(void) {}
+static inline void spin_table_release_cpus(const struct cpumask *cpus) {}
 static inline void spin_table_stop_finished(void) {}
 
 static inline int spin_table_set_power_ops(const struct spin_table_power_ops *ops)

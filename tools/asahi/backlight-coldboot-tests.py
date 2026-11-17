@@ -71,12 +71,12 @@ struct apple_dcp {
  struct desktop *desktop;
  struct { struct dcp_backlight_state state; int lock; } backlight;
  struct { bool update; u32 maximum; } brightness;
- bool panel,m4,v14,external,typec,pipe_enabled_h17p,crashed,quiescing;
+ bool panel,m4,v14,external,ext26,typec,pipe_enabled_h17p,crashed,quiescing;
  bool typec_crtc_off,typec_cable_connected,typec_follow_start,typec_poweron_hpd,hdmi_yielded;
  unsigned crtc_unplugs,typec_unplugs,typec_generation,typec_reconnect_tries,external_generation,external_crtc_generation;
  int external_lock,hpd_mutex,relink_lock,relink,typec_iomfb_hpd_ready;
  struct delayed_work typec_reconnect_wq,placeholder_edid_wq,external_stop_retry_wq,bl_fallback_wq;
- struct work_struct external_stop_work;
+ struct work_struct external_stop_work,ext26_blank_work;
  void *dev,*hdmi_hpd,*avep;
 };
 struct platform_device { struct apple_dcp *data; };
@@ -95,6 +95,9 @@ static bool iomfb_is_m4(struct apple_dcp *p) { return p->m4; }
 static bool iomfb_v14_7_panel_nits(struct apple_dcp *p) { return p->v14; }
 static bool dcp_has_panel(struct apple_dcp *p) { return p->panel; }
 static bool dcp_is_external_h17p(struct apple_dcp *p) { return p->external; }
+static bool dcp_is_ext26(struct apple_dcp *p) { return p->ext26; }
+static bool dcp_is_retained_external(struct apple_dcp *p) { return p->external || p->ext26; }
+static void flush_work(struct work_struct *p) { (void)p; }
 static bool dcp_is_typec_output(struct apple_dcp *p) { return p->typec; }
 static bool dcp_h17g_panel(struct apple_dcp *p) { return p->hw.iomfb_method_profile==DCP_IOMFB_METHODS_H17G; }
 static void dcp_backlight_kick(struct apple_dcp *p) { assert(p->backlight.state.ready);kicks++; }
@@ -144,12 +147,18 @@ int main(void)
   dcp_work_backlight_fallback(&d.bl_fallback_wq.work);
   assert(d.backlight.state.ready && !d.backlight.state.level_known);
   assert(!d.backlight.state.controlled && !d.backlight.state.dirty && kicks==0 && infos==1);
+  assert(test_v27_backlight_admission(&d)==-EBUSY);
   assert(dcp_bl_report(&d.backlight.state,120));
   assert(d.backlight.state.target==120 && d.backlight.state.level_known);
+  assert(test_v27_backlight_admission(&d)==0);
   assert(dcp_bl_dpms(&d.backlight.state,false)==0);
   dcp_poweron(&p);
   assert(dpms_calls==1 && kicks==1 && warnings==0 && !d.backlight.state.dpms_off);
   assert(d.backlight.state.target==120 && d.backlight.state.level==120 && d.backlight.state.dirty);
+
+  d=fresh(firmware);p.data=&d;d.pipe_enabled_h17p=true;
+  dcp_poweron(&p);
+  assert(fallbacks==1 && powers==1 && dpms_calls==0);
 
   d=fresh(firmware);p.data=&d;d.pipe_enabled_h17p=true;
   assert(!dcp_bl_init(&d.backlight.state,1000,true,80,false,0));
@@ -183,7 +192,15 @@ def harness(tree, source):
     header = (tree / 'drivers/gpu/drm/apple/dcp_backlight.h').read_text()
     state = '\n'.join(function(header, n) for n in ('dcp_bl_init', 'dcp_bl_seed',
                      'dcp_bl_report', 'dcp_bl_jump', 'dcp_bl_dpms'))
-    active = '\n'.join(function(backlight, n) for n in ('dcp_backlight_presents_nits', 'dcp_backlight_active'))
+    active = '\n'.join(function(backlight, n) for n in
+                       ('dcp_backlight_presents_nits', 'dcp_backlight_active', 'dcp_backlight_level_known'))
+    sleep = (tree / 'drivers/gpu/drm/apple/dcp-v27-sleep.inc').read_text()
+    prepare = function(sleep, 'dcp_v27_sleep_prepare')
+    guard = re.search(r'^\tif \(!dcp_v27_external\(dcp\) && dcp_has_panel\(dcp\).*?^\t}', prepare, re.M | re.S)
+    assert guard, 'missing production V27 backlight guard'
+    admission = ('static bool dcp_v27_external(struct apple_dcp *dcp) { return dcp->external; }\n'
+                 'static int test_v27_backlight_admission(struct apple_dcp *dcp) {\n'
+                 + guard.group() + '\nreturn 0;\n}\n')
     dpms = function(backlight, 'dcp_backlight_dpms').replace('int dcp_backlight_dpms(', 'int production_dcpms(')
     adapter = '''
 static int dcp_backlight_dpms(struct apple_dcp *dcp,bool on) {
@@ -194,7 +211,7 @@ static int iomfb_configure_backlight_h17p(struct apple_dcp *dcp,u32 max,bool inh
  return dcp_bl_init(&dcp->backlight.state,max,inherited,level,fallback,nits);
 }
 '''
-    return PRELUDE + state + active + dpms + adapter + '\n'.join(function(source, n) for n in
+    return PRELUDE + state + active + admission + dpms + adapter + '\n'.join(function(source, n) for n in
         ('dcp_uses_soft_dpms', 'dcp_poweron', 'dcp_work_backlight_fallback')) + TESTS
 
 
@@ -241,12 +258,17 @@ def main():
                  '!d.backlight.state.ready && !d.backlight.state.controlled'),
                 ('lost-ready-restore', guard, '\t\treturn;\n', 'dpms_calls==1 && kicks==1'),
                 ('muted-real-error', warning, warning.replace('if (ret)', 'if (false)'),
-                 'dpms_calls==1 && warnings==1 && kicks==0'),
-                ('lost-fallback', '\t\t\t\tqueue_delayed_work(system_freezable_wq,\n\t\t\t\t\t\t   &dcp->bl_fallback_wq,\n\t\t\t\t\t\t   DCP_BL_FALLBACK_DELAY);',
-                 '\t\t\t\t(void)0;', 'd.pipe_enabled_h17p && fallbacks==1 && powers==1'))
+                 'dpms_calls==1 && warnings==1 && kicks==0'))
             for name, old, new, assertion in controls:
                 assert source.count(old) == 1, (name, source.count(old))
                 execute(args.tree, source.replace(old, new), directory, name, True, assertion)
+            poweron = function(source, 'dcp_poweron')
+            fallback = re.compile(r'queue_delayed_work\(system_freezable_wq,\s*&dcp->bl_fallback_wq,\s*'
+                                  r'DCP_BL_FALLBACK_DELAY\);')
+            mutated, count = fallback.subn('(void)0;', poweron)
+            assert count == 1, ('lost-fallback', count)
+            execute(args.tree, source.replace(poweron, mutated, 1), directory,
+                    'lost-fallback', True, 'd.pipe_enabled_h17p && fallbacks==1 && powers==1')
 
 
 if __name__ == '__main__': main()

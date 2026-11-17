@@ -4,6 +4,14 @@ if ARCH_APPLE || COMPILE_TEST
 
 menu "Apple SoC drivers"
 
+config APPLE_J613_DISPLAY_SYNC
+	bool
+	default y
+	depends on OF
+	help
+	  Built-in arbitration between the J613 display handoff and USB PD.
+	  State survives an absent, failed or later-loaded display module.
+
 config APPLE_DBGVIEW
 	tristate "Apple SoC read-only debug register views"
 	depends on ARCH_APPLE || COMPILE_TEST
