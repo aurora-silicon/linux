@@ -176,11 +176,12 @@
 
 /*
  * Pin 112's register (0x29c0001c0) takes an SError when read, so only the pins a node
- * here names are exposed: 80 (PCIe port 0's PERST#, ADT pci-bridge0 function-perst).
+ * here names are exposed: 80 (PCIe port 0's PERST#, ADT pci-bridge0 function-perst) and
+ * 138 (the Touch ID sensor's data-ready line).
  * A reserved line cannot be requested, so a node that names a new pin opens it here too.
  */
 &pinctrl_ap {
-	gpio-reserved-ranges = <0 80>, <81 140>;
+	gpio-reserved-ranges = <0 80>, <81 57>, <139 82>;
 };
 
 /* This board's SMC fan and power keys are not yet checked */
@@ -244,6 +245,43 @@
 			00 00 00 00 00 00 05 88 09 01 00 05 89 09 01 00
 			05 8a 09 01 00 0e 01 41 70 70 6c 65 2c 20 49 6e
 			63 2e 00 06 02 69 4f 53 00 00 00 00];
+};
+
+/*
+ * Touch ID (ADT spi2/mesa), wired as on the J714s: the Mesa sensor (sensor-id
+ * 0x3356) at 8 MHz on chip select 0, powered by NUB GPIO 21 (function-mesa_pwr),
+ * data ready on AP GPIO 138. The controller's clock (ADT clock-ids 451) is the
+ * 24 MHz reference.
+ */
+&ps_nub_gpio {
+	status = "okay";
+};
+
+&nub_gpio0 {
+	status = "okay";
+};
+
+&ps_spi2 {
+	status = "okay";
+};
+
+&spi2 {
+	clocks = <&clkref>;
+	status = "okay";
+
+	mesa: fingerprint@0 {
+		compatible = "apple,mesa-fingerprint";
+		reg = <0>;
+		spi-max-frequency = <8000000>;
+		spi-cpol;
+		spi-cs-setup-delay-ns = <20>;
+		spi-cs-hold-delay-ns = <20>;
+		enable-gpios = <&nub_gpio0 21 GPIO_ACTIVE_HIGH>;
+		interrupt-parent = <&pinctrl_ap>;
+		interrupts = <138 IRQ_TYPE_EDGE_RISING>;
+		/* Per-device factory data from this Mac's own iBoot system container */
+		firmware-name = "apple/mesacal-j716c.bin", "apple/msrk-j716c.bin";
+	};
 };
 
 #include "t6050-j716c-isp.dtsi"
