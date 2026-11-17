@@ -3404,8 +3404,7 @@ impl SepData {
 
     pub(crate) fn run_enrolment(&self) {
         // An enrolment for a Unix account whose bag is loaded goes into that
-        // user's own domain (13.5 store); one whose bag is locked waits for
-        // the password.
+        // user's own domain; one whose bag is locked waits for the password.
         let account = bio::enrol_account(&self.bio_session.lock());
         let _subject = match account.map(|uid| self.userbag_bio_subject(uid)) {
             Some(Err(_)) => {

@@ -295,6 +295,16 @@ impl LoadedBags {
         Ok(())
     }
 
+    /// Tracks a variant-5 bag, which the store addresses by its designation
+    /// `user` once designated. Already tracked is not an error: a designation
+    /// is kept until logout.
+    fn track_designated(&mut self, user: i32) -> Result<()> {
+        if self.get(user).is_some() {
+            return Ok(());
+        }
+        self.insert(user, crate::sks::KeyBagHandle::from_load_reply(user))
+    }
+
     /// Removes the entry; the caller disposes of any touch preparation.
     fn remove(&mut self, user: i32) -> Option<(crate::sks::KeyBagHandle, Option<[u8; crate::scrd::SCRD_ACM_HANDLE_LEN]>)> {
         let at = self.0.iter().position(|b| b.user == user)?;
@@ -1250,6 +1260,22 @@ impl crate::SepData {
         matches!(self.profile.key_store, crate::profile::KeyStore::Sepos13 { .. })
     }
 
+    /// Variant 5 unloads a bag once it is designated and addresses it by its
+    /// designation from then on. Its entry in `user_bags` holds only the
+    /// user's Touch ID preparation and catacomb state; nothing unloads it.
+    fn userbag_track_designated(&self, user: crate::sks::DesignateUser) -> Result<()> {
+        self.user_bags.lock().track_designated(user.special_handle().value())
+    }
+
+    /// A lock of `user`'s bag (variant 5): its Touch ID preparation ends
+    /// before the store is asked, whatever it answers.
+    fn userbag_end_touch(&self, user: crate::sks::DesignateUser) {
+        let touch = self.user_bags.lock().entry(user.special_handle().value()).and_then(|e| e.touch.take());
+        if let Some(t) = touch {
+            self.userbag_dispose_touch(t);
+        }
+    }
+
     /// Opens a user's bag through the captured device-state transition. The
     /// 13.5 store first unlocks the loaded bag itself.
     pub(crate) fn userbag_unlock(
@@ -1258,7 +1284,9 @@ impl crate::SepData {
         secret: &[u8],
     ) -> Result<()> {
         if !self.userbag_sepos13() {
-            return self.userbag_transition(user, TransitionState::Unlocked, 0, secret);
+            self.userbag_transition(user, TransitionState::Unlocked, 0, secret)?;
+            self.userbag_refresh_touch_13(user, secret);
+            return Ok(());
         }
         {
             let bags = self.user_bags.lock();
@@ -1281,7 +1309,7 @@ impl crate::SepData {
     /// fails does the first touch find the preparation stale (see
     /// `userbag_touch_subject`).
     pub(crate) fn userbag_refresh_touch_13(&self, user: crate::sks::DesignateUser, secret: &[u8]) {
-        if !self.userbag_sepos13() {
+        if !self.profile.per_user_keybags {
             return;
         }
         let uid = u32::try_from(-user.special_handle().value())
@@ -1409,12 +1437,12 @@ impl crate::SepData {
     }
 
     /// The subject of an enrolment or a verify for the Unix account `uid`
-    /// (13.5 store): that user's own domain when their bag is loaded. Refused
-    /// while it is loaded but not unlocked by the password since its last
-    /// lock, as macOS asks for the password then. None (no bag) keeps the
-    /// configured user.
+    /// (a store with per-user bags): that user's own domain when their bag
+    /// is loaded. Refused while it is loaded but not unlocked by the password
+    /// since its last lock, as macOS asks for the password then. None (no
+    /// bag) keeps the configured user.
     pub(crate) fn userbag_bio_subject(&self, uid: u32) -> Result<Option<crate::BioSubject>> {
-        if !self.userbag_sepos13() || uid < MIN_UID {
+        if !self.profile.per_user_keybags || uid < MIN_UID {
             return Ok(None);
         }
         let user = bag_designation(uid)?;
@@ -1434,11 +1462,12 @@ impl crate::SepData {
         self.user_bags.lock().touch(-subject.user)
     }
 
-    /// Touch ID for a key under `uid`'s bag (13.5 store): the preparation
-    /// must exist, i.e. the password has unlocked the bag since it last
-    /// locked, and the enclave must still find it TouchIdEnrollment-satisfied.
+    /// Touch ID for a key under `uid`'s bag (a store with per-user bags): the
+    /// preparation must exist, i.e. the password has unlocked the bag since
+    /// it last locked, and the enclave must still find it
+    /// TouchIdEnrollment-satisfied.
     pub(crate) fn userbag_touch_subject(&self, uid: u32) -> Result<Option<crate::BioSubject>> {
-        if !self.userbag_sepos13() {
+        if !self.profile.per_user_keybags {
             return Ok(None);
         }
         let user = bag_designation(uid)?;
@@ -1571,6 +1600,9 @@ impl crate::SepData {
             }
             return self.userbag_lock_13(user, 0);
         }
+        // Variant 5: this bag's Touch ID ends with any lock, including one
+        // with a grace period.
+        self.userbag_end_touch(user);
         if immediate {
             let handle = user.special_handle().value();
             return self
@@ -1671,7 +1703,7 @@ impl crate::SepData {
             dev_info_ratelimited!(self.dev, "userbag: designating the imported bag as {} failed\n", user.special_handle().value());
             return Err(EACCES);
         }
-        Ok(())
+        self.userbag_track_designated(user)
     }
 
     pub(crate) fn userbag_create(
@@ -1720,6 +1752,8 @@ impl crate::SepData {
                 let _ = self.sks_send(self.sks_req_unload_keybag(handle));
                 return Err(e);
             }
+        } else {
+            self.userbag_track_designated(user)?;
         }
         // Copying the wrapped bag into a per-user durable store is phase 2.
         // Until then this ioctl establishes only the live designated bag.
@@ -1970,7 +2004,15 @@ impl crate::SepData {
                     self.userbag_logout_13(user)?;
                     return crate::bio::ok();
                 }
-                self.userbag_lock(user, screen, lock_is_immediate(reason, grace_s))?;
+                let locked = self.userbag_lock(user, screen, lock_is_immediate(reason, grace_s));
+                if reason == LOCK_REASON_LOGOUT {
+                    // Variant 5: the next login imports the bag again.
+                    let removed = self.user_bags.lock().remove(user.special_handle().value());
+                    if let Some((_, Some(t))) = removed {
+                        self.userbag_dispose_touch(t);
+                    }
+                }
+                locked?;
                 crate::bio::ok()
             }
             IOC_CHANGE => {
@@ -2134,6 +2176,20 @@ mod tests {
         assert!(bags.get(USER_HANDLE - 1).is_none());
         assert_eq!(bags.remove(USER_HANDLE).unwrap().0.value(), 3);
         assert!(bags.remove(USER_HANDLE).is_none());
+    }
+
+    #[test]
+    fn a_designated_bag_is_tracked_once_under_its_designation() {
+        let mut bags = LoadedBags::new();
+        bags.track_designated(USER_HANDLE).expect("track");
+        assert_eq!(bags.get(USER_HANDLE).unwrap().value(), USER_HANDLE);
+        // Tracking again (a second import before logout) keeps the entry and
+        // its Touch ID preparation.
+        bags.entry(USER_HANDLE).unwrap().touch = Some([7; crate::scrd::SCRD_ACM_HANDLE_LEN]);
+        bags.track_designated(USER_HANDLE).expect("again");
+        assert_eq!(bags.touch(USER_HANDLE), Some([7; crate::scrd::SCRD_ACM_HANDLE_LEN]));
+        assert_eq!(bags.remove(USER_HANDLE).unwrap().1, Some([7; crate::scrd::SCRD_ACM_HANDLE_LEN]));
+        assert!(bags.get(USER_HANDLE).is_none());
     }
 
     #[test]

@@ -1606,7 +1606,7 @@ impl SepData {
         // one grant, one context at a time.
         let _writer = self.catacomb_writer.lock();
         // A key under a user's bag is matched in that user's domain, and
-        // only after its password unlocked the bag (13.5 store).
+        // only after its password unlocked the bag.
         let _subject = match job.grant.as_ref().and_then(|g| g.bag()) {
             Some(uid) => match self.userbag_touch_subject(uid)? {
                 Some(subject) => Some(crate::SubjectScope::new(self, subject)),
