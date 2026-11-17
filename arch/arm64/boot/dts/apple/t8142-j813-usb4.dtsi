@@ -1,0 +1,314 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* J813 rear USB-C port: the ACIO1 router and its PCIe-C tunnel. */
+
+/ {
+	aliases {
+
+		usb4-1-acio = &acio1;
+
+		usb4-1-pcie-adapter = &acio1;
+
+		usb4-1-nhi = &acio1_nhi;
+
+		/* aura copies the PCIe-C tunables here (needs aura#302). */
+		usb4-1-pcie = &apciec1;
+	};
+};
+
+&pmgr {
+
+	ps_atc1_pcie: power-controller@3d8 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3d8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc1_common>, <&ps_atc1_usb_aon>;
+		label = "atc1-pcie";
+	};
+
+	ps_atc1_cio: power-controller@3e0 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3e0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc1_common>;
+		label = "atc1-cio";
+	};
+
+	ps_atc1_cio_pcie: power-controller@4e8 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4e8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc1_cio>;
+		label = "atc1-cio-pcie";
+	};
+
+	ps_atc1_cio_usb: power-controller@4f0 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x4f0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc1_cio>;
+		label = "atc1-cio-usb";
+	};
+};
+
+/* Populate these DARTs only after their parent is powered and configured. */
+/delete-node/ &acio1_dart;
+/delete-node/ &pciec1_dart;
+
+&{/soc} {
+
+	cio_reset: reset-controller@380780000 {
+		compatible = "apple,t8142-cio-reset";
+		reg = <0x3 0x80780000 0x0 0x4000>;
+		#reset-cells = <1>;
+	};
+
+	pinctrl_aop: pinctrl@390824000 {
+		compatible = "apple,t8142-pinctrl", "apple,t8140-pinctrl", "apple,t8103-pinctrl";
+		reg = <0x3 0x90824000 0x0 0x4000>;
+		gpio-controller;
+		#gpio-cells = <2>;
+		gpio-ranges = <&pinctrl_aop 0 0 77>;
+		apple,npins = <77>;
+
+		/* Only LSTX pin 21 is ours; the AOP owns the rest of this bank. */
+		gpio-reserved-ranges = <0 21>, <22 55>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		interrupts = <AIC_IRQ 483 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 484 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 485 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 486 IRQ_TYPE_LEVEL_HIGH>;
+		apple,irq-group-base = <3>;
+
+		acio1_lstx_pins: acio1-lstx-pins {
+			pinmux = <0x10015>;
+		};
+	};
+
+	acio1_mbox: mailbox@409108000 {
+		compatible = "apple,t8142-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x4 0x09108000 0x0 0x4000>;
+		interrupts = <AIC_IRQ 1611 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1612 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1613 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1614 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+
+	/* acio@ avoids the bootloader's legacy cio@ register-index fixup. */
+	acio1: acio@409ac0000 {
+		compatible = "apple,t8142-usb4-acio";
+		reg = <0x4 0x09ac0000 0x0 0xc000>,
+		      <0x4 0x09080000 0x0 0x26000>,
+		      <0x4 0x09e44000 0x0 0x4000>,
+		      <0x4 0x09100000 0x0 0x4000>,
+		      <0x4 0x09c80000 0x0 0x4000>;
+		reg-names = "rc", "sram", "pcie-adapter", "cpu", "router-ap-fw";
+		mboxes = <&acio1_mbox>;
+		resets = <&cio_reset 1>;
+
+		power-domains = <&ps_atc1_cio>, <&ps_atc1_cio_pcie>,
+				<&ps_atc1_cio_usb>, <&ps_atc1_pcie>;
+		thunderbolt-switch;
+		apple,pcie-tunnel = <&acio1_pcie_tunnel>;
+
+		pinctrl-0 = <&acio1_lstx_pins>;
+		pinctrl-names = "lstx";
+		lstx-gpios = <&pinctrl_aop 21 GPIO_ACTIVE_HIGH>;
+
+		/* Other router tunables are supplied by the bootloader. */
+		apple,tunable-router-ap-fw = <0x8 0xff2 0x482>;
+
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges = <0x0 0x4 0x09000000 0x1000000>;
+		nonposted-mmio;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@1 {
+				reg = <1>;
+				acio1_tbt: endpoint {
+					remote-endpoint = <&typec1_usb4>;
+				};
+			};
+		};
+
+		acio1_dart: iommu@a80000 {
+			compatible = "apple,t8142-dart", "apple,t8110-dart";
+			reg = <0xa80000 0xc000>;
+			interrupts = <AIC_IRQ 1609 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_atc1_cio>;
+			#iommu-cells = <1>;
+			apple,dma-range = <0x100 0x4000 0x0 0xffff0000>;
+			apple,bypass-sids = <15>;
+			apple,full-error-reporting;
+			apple,ctc-flush;
+
+			/* ACIO DART tunables are not supplied by the bootloader. */
+			apple,tunable = <0x20c 0x80000121 0x80000121>,
+					<0x220 0xf0f 0xf0f>,
+					<0x224 0xffff 0x909>,
+					<0x300 0x1f31 0x1>,
+					<0x308 0x3ffffffc 0x10000000>,
+					<0x310 0x3ffffffc 0x3ffffffc>,
+					<0x800 0xf003f 0x10000>,
+					<0x804 0xf003f 0x10002>,
+					<0x808 0xf003f 0x10004>,
+					<0x80c 0xf003f 0x20006>,
+					<0x810 0xf003f 0x2000a>,
+					<0x814 0xf003f 0x2000e>,
+					<0x818 0xf003f 0x20012>,
+					<0x81c 0xf003f 0x20016>,
+					<0x820 0xf003f 0x2001a>,
+					<0x824 0xf003f 0x2001e>,
+					<0x828 0xf003f 0x20022>,
+					<0x82c 0xf003f 0x20026>,
+					<0x830 0xf003f 0x2002a>,
+					<0x834 0xf003f 0x2002e>,
+					<0x838 0xf003f 0x20032>,
+					<0x83c 0xf003f 0x10036>;
+		};
+
+		acio1_nhi: nhi@f00000 {
+			compatible = "apple,t8142-usb4-nhi";
+			reg = <0xf00000 0x100000>;
+			reg-names = "nhi";
+			interrupts = <AIC_IRQ 1582 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1583 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1584 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1585 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1586 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1587 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1588 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1589 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1590 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1591 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1592 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1593 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1594 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1595 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1596 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1597 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1598 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1599 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1600 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1601 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1602 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1603 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1604 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1605 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "txring0", "txring1", "txring2", "txring3",
+					  "txring4", "txring5", "txring6", "txring7",
+					  "txring8", "txring9", "txring10", "txring11",
+					  "rxring0", "rxring1", "rxring2", "rxring3",
+					  "rxring4", "rxring5", "rxring6", "rxring7",
+					  "rxring8", "rxring9", "rxring10", "rxring11";
+
+			iommus = <&acio1_dart 0>, <&acio1_dart 1>, <&acio1_dart 2>,
+				 <&acio1_dart 3>, <&acio1_dart 4>, <&acio1_dart 5>,
+				 <&acio1_dart 6>, <&acio1_dart 7>, <&acio1_dart 8>,
+				 <&acio1_dart 9>, <&acio1_dart 10>, <&acio1_dart 11>,
+				 <&acio1_dart 16>, <&acio1_dart 17>, <&acio1_dart 18>,
+				 <&acio1_dart 19>, <&acio1_dart 20>, <&acio1_dart 21>,
+				 <&acio1_dart 22>, <&acio1_dart 23>, <&acio1_dart 24>,
+				 <&acio1_dart 25>, <&acio1_dart 26>, <&acio1_dart 27>;
+
+			/* Filled by the bootloader. */
+			apple,thunderbolt-drom = [00];
+		};
+	};
+};
+
+/ {
+	acio1_pcie_tunnel: pcie-tunnel-1 {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		nonposted-mmio;
+
+		pciec1_dart: iommu@40c000000 {
+			compatible = "apple,t8142-dart", "apple,t8110-dart";
+			reg = <0x4 0x0c000000 0x0 0xc000>;
+			interrupts = <AIC_IRQ 1563 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_atc1_pcie>;
+			#iommu-cells = <1>;
+			apple,bypass-sids = <253 255>;
+			apple,full-error-reporting;
+			apple,ctc-flush;
+		};
+
+		apciec1: pcie@1c60000000 {
+			compatible = "apple,t8142-pciec";
+			device_type = "pci";
+			reg = <0x1c 0x60000000 0x0 0x10000000>,
+			      <0x4 0x0c034000 0x0 0x4000>,
+			      <0x4 0x0c020000 0x0 0x8000>,
+			      <0x4 0x0c038000 0x0 0x4000>,
+			      <0x4 0x0c060000 0x0 0x4000>,
+			      <0x4 0x0c02c000 0x0 0x4000>,
+			      <0x4 0x0c028000 0x0 0x4000>;
+			reg-names = "config", "rc", "port0", "fabric", "debug", "ltssm", "intr2axi";
+			interrupts = <AIC_IRQ 1562 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_atc1_pcie>;
+
+			apple,pciec-kernel-init;
+
+			msi-controller;
+			msi-parent = <&apciec1>;
+			msi-ranges = <&aic AIC_IRQ 1869 IRQ_TYPE_EDGE_RISING 32>;
+			apple,msi-vector-base = <128>;
+
+			iommu-map = <0x0 &pciec1_dart 0x0 0x40>;
+			iommu-map-mask = <0x3f>;
+
+			linux,pci-domain = <2>;
+
+			bus-range = <0x0 0x7f>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+
+			ranges = <0x43000000 0xc 0x0 0xc 0x0 0x2 0x0>,
+				 <0x02000000 0x0 0x00100000 0xe 0x00100000 0x0 0x3ff00000>,
+				 <0x42000000 0x0 0x40000000 0xe 0x40000000 0x0 0x40000000>;
+
+			apciec1_port: pci@0,0 {
+				device_type = "pci";
+				reg = <0x0 0x0 0x0 0x0 0x0>;
+				external-facing;
+
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+
+				interrupt-controller;
+				#interrupt-cells = <1>;
+				interrupt-map-mask = <0 0 0 7>;
+				interrupt-map = <0 0 0 1 &apciec1_port 0 0 0 0>,
+						<0 0 0 2 &apciec1_port 0 0 0 1>,
+						<0 0 0 3 &apciec1_port 0 0 0 2>,
+						<0 0 0 4 &apciec1_port 0 0 0 3>;
+			};
+		};
+	};
+};
+
+/* Port 3 is reserved for the board's DisplayPort alternate-mode route. */
+&typec1 {
+	ports {
+		port@4 {
+			reg = <4>;
+			typec1_usb4: endpoint {
+				remote-endpoint = <&acio1_tbt>;
+			};
+		};
+	};
+};
