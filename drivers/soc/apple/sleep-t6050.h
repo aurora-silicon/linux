@@ -172,6 +172,16 @@ struct apple_sleep_region_state {
 	u32 spmi_mask[8];
 	bool spmi_masked;
 	bool spmi_post_timer;
+	/* Each cluster's cores that reached their last WFI (t6050_cpu_down()) */
+	atomic_t cpus_down[3];
+	/*
+	 * The secondary clusters taken down first (t6050_clusters_down_first()): the result of the
+	 * cores' wait and of each cluster's sequencer poll, the sequencers' last reads and the
+	 * time each poll took, reported after the wake.
+	 */
+	bool early_done, early_dropped;
+	int early_ret[3];
+	u32 early_seq[2], early_us[2];
 };
 
 static const struct apple_sleep_region_desc t6050_regions[] = {
@@ -1638,6 +1648,8 @@ static int t6050_sleep_begin(struct apple_sleep *s)
 	s->ans_off_ret = 0;
 	r->staged = false;
 	r->committed = false;
+	r->early_done = false;
+	r->early_dropped = false;
 	r->pmc_saved = false;
 	r->floor_changed = 0;
 	r->display_lowered = 0;
@@ -2743,6 +2755,10 @@ static int t6050_cpm_prop(struct apple_sleep *s, const char *name, u64 **ops, un
  */
 static void __noreturn t6050_cpu_down(struct apple_sleep *s, u64 mpidr)
 {
+	unsigned int c = sleep_cpu_cluster(s, mpidr);
+
+	if (c < ARRAY_SIZE(s->region->cpus_down))
+		atomic_inc(&s->region->cpus_down[c]);
 	write_sysreg(ARCH_TIMER_CTRL_IT_MASK, cntp_ctl_el0);
 	write_sysreg(ARCH_TIMER_CTRL_IT_MASK, cntv_ctl_el0);
 	isb();
@@ -2826,6 +2842,135 @@ static void t6050_mcc_stop(struct apple_sleep *s)
 		}
 }
 
+/* Timekeeping is stopped at the commit: waits there count the CPU's own counter. */
+static u64 t6050_cnt_ticks(u32 us)
+{
+	return div_u64((u64)arch_timer_get_cntfrq() * us, USEC_PER_SEC);
+}
+
+static u32 t6050_cnt_us(u64 ticks)
+{
+	return div_u64(ticks * USEC_PER_SEC, arch_timer_get_cntfrq());
+}
+
+/* Polls @reg until it reads @want, for up to @limit_us: 0, or -ETIMEDOUT */
+static int t6050_cnt_poll(void __iomem *reg, u32 want, u32 limit_us, u32 *last, u32 *us)
+{
+	u64 start = __arch_counter_get_cntpct(), end = start + t6050_cnt_ticks(limit_us), now;
+	u32 v;
+
+	do {
+		v = readl(reg);
+		now = __arch_counter_get_cntpct();
+		if (v == want)
+			break;
+		cpu_relax();
+	} while (now < end);
+	*last = v;
+	*us = t6050_cnt_us(now - start);
+	return v == want ? 0 : -ETIMEDOUT;
+}
+
+#define T6050_EARLY_CPUS_US	2000
+#define T6050_EARLY_SETTLE_US	50
+#define T6050_EARLY_SEQ_US	5000
+#define T6050_EARLY_SEQ1_DONE	0x1a
+#define T6050_EARLY_SEQ2_DONE	0x1c01a
+
+/*
+ * The clusters other than the boot cluster (MPIDR affinity 1 of 1 and 2) taken down at the
+ * start of the commit, before anything else in it.
+ *
+ * The clusters' power-down programs run one at a time, on one engine. Dropped together in the
+ * commit window, as the cluster words step below does, the P cluster's program queues behind
+ * the boot cluster's, and that one cannot finish while the boot core still runs the commit:
+ * the P cluster never goes down and the sleep does not complete. Taken down in this order, the
+ * secondary clusters first and the boot cluster last, all three programs complete.
+ *
+ * Their cores are released to their last WFI (spin_table_release_cpus()) and counted there,
+ * then each cluster's PTD bit and request drop (t6050_mcc_release()), then each cluster's
+ * sequencer is polled until its program is done. Nothing in the commit may touch those
+ * clusters' own blocks (0x211xxxxxx, 0x212xxxxxx) after this. The results are kept for the
+ * report after the wake: nothing is printed this late.
+ *
+ * This runs past the point of no return, so nothing here refuses the sleep. Every wait is
+ * bounded on the CPU's counter (2 ms for the cores, 5 ms for each sequencer), well inside the
+ * commit's runway. If the cores are not all counted, the cluster requests are left up and the
+ * commit drops them later, as it did before this step. Any failure here ends in the engine's
+ * watchdog reset 5 s after the commit, the same as without this step, so there is nothing to
+ * undo.
+ */
+static void t6050_clusters_down_first(struct apple_sleep *s)
+{
+	struct apple_sleep_region_state *r = s->region;
+	static struct cpumask cpus;
+	unsigned int cpu, c, want[3] = {};
+	u64 end;
+
+	memset(r->early_seq, 0, sizeof(r->early_seq));
+	memset(r->early_us, 0, sizeof(r->early_us));
+	r->early_done = true;
+	cpumask_clear(&cpus);
+	for_each_present_cpu(cpu) {
+		c = sleep_cpu_cluster(s, cpu_logical_map(cpu));
+		if (c == 1 || c == 2) {
+			cpumask_set_cpu(cpu, &cpus);
+			want[c]++;
+		}
+	}
+	atomic_set(&r->cpus_down[1], 0);
+	atomic_set(&r->cpus_down[2], 0);
+	spin_table_release_cpus(&cpus);
+	end = __arch_counter_get_cntpct() + t6050_cnt_ticks(T6050_EARLY_CPUS_US);
+	r->early_ret[0] = -ETIMEDOUT;
+	do {
+		if (atomic_read(&r->cpus_down[1]) == want[1] &&
+		    atomic_read(&r->cpus_down[2]) == want[2]) {
+			r->early_ret[0] = 0;
+			break;
+		}
+		cpu_relax();
+	} while (__arch_counter_get_cntpct() < end);
+	if (r->early_ret[0]) {
+		/* The requests stay up: the commit's own step drops them, as before */
+		r->early_ret[1] = -ECANCELED;
+		r->early_ret[2] = -ECANCELED;
+		return;
+	}
+	/* Counted on the way in: let the last ones reach the WFI itself */
+	end = __arch_counter_get_cntpct() + t6050_cnt_ticks(T6050_EARLY_SETTLE_US);
+	while (__arch_counter_get_cntpct() < end)
+		cpu_relax();
+	t6050_mcc_release(s, 0);
+	t6050_mcc_release(s, 1);
+	r->early_dropped = true;
+	r->early_ret[1] = t6050_cnt_poll(s->cluster + 0x18, T6050_EARLY_SEQ1_DONE,
+					 T6050_EARLY_SEQ_US, &r->early_seq[0], &r->early_us[0]);
+	r->early_ret[2] = t6050_cnt_poll(s->cluster + 0x1c, T6050_EARLY_SEQ2_DONE,
+					 T6050_EARLY_SEQ_US, &r->early_seq[1], &r->early_us[1]);
+}
+
+/* After the wake: how the early cluster step went, in one line */
+#define T6050_EARLY_REPORT "secondary clusters down first: cores %d+%d (%d), cluster 1 %#x in %u us (%d), cluster 2 %#x in %u us (%d)\n"
+
+static void t6050_clusters_down_first_report(struct apple_sleep *s)
+{
+	struct apple_sleep_region_state *r = s->region;
+	int c1 = atomic_read(&r->cpus_down[1]), c2 = atomic_read(&r->cpus_down[2]);
+
+	if (!r->early_done)
+		return;
+	r->early_done = false;
+	if (r->early_ret[0] || r->early_ret[1] || r->early_ret[2])
+		dev_warn(s->dev, T6050_EARLY_REPORT, c1, c2, r->early_ret[0],
+			 r->early_seq[0], r->early_us[0], r->early_ret[1],
+			 r->early_seq[1], r->early_us[1], r->early_ret[2]);
+	else
+		dev_info(s->dev, T6050_EARLY_REPORT, c1, c2, r->early_ret[0],
+			 r->early_seq[0], r->early_us[0], r->early_ret[1],
+			 r->early_seq[1], r->early_us[1], r->early_ret[2]);
+}
+
 /*
  * The commit window, each step at the DT schedule's time before the sleep timer: the MCC
  * requests released, the storage link's PHY parked and its words down, the watchdogs, the
@@ -2841,7 +2986,14 @@ static void t6050_sleep_commit_regs(struct apple_sleep *s)
 	u32 value;
 
 	r->committed = true;
-	/* Only +0x4 and +0x8 are released, each after pwrgate's three words: no raise or re-arm */
+	/* Past every refusal: the secondary clusters go first, where the SoC needs that */
+	r->early_dropped = false;
+	if (s->soc->clusters_down_first)
+		t6050_clusters_down_first(s);
+	/*
+	 * Only +0x4 and +0x8 are released, each after pwrgate's three words: no raise or re-arm.
+	 * Already released by t6050_clusters_down_first() when it dropped them.
+	 */
 	for (i = 0; i < 2; i++) {
 		t6050_step(s, T6050_STEP_MCC0 + i);
 		readl(s->pwrgate + 0x120);
@@ -2850,7 +3002,8 @@ static void t6050_sleep_commit_regs(struct apple_sleep *s)
 		writel(PWRGATE_ON, s->pwrgate + 0x128);
 		readl(s->pwrgate + 0x130);
 		writel(PWRGATE_ON, s->pwrgate + 0x130);
-		t6050_mcc_release(s, i);
+		if (!r->early_dropped)
+			t6050_mcc_release(s, i);
 	}
 	/* Only after ANS's registered driver stop. Never stop ANS here. */
 	t6050_step(s, T6050_STEP_PHY_PARK);
@@ -2907,8 +3060,11 @@ static void t6050_sleep_commit_regs(struct apple_sleep *s)
 	}
 	for (i = 0; i < 3; i++) {
 		t6050_step(s, T6050_STEP_PWRGATE0 + i);
-		/* CPMn's counters read, then pwrgate's three R/W */
-		if (r->cpm[i]) {
+		/*
+		 * CPMn's counters read, then pwrgate's three R/W. Clusters 1 and 2's CPM blocks
+		 * are gone once t6050_clusters_down_first() took them down.
+		 */
+		if (r->cpm[i] && !(i && r->early_dropped)) {
 			readq(r->cpm[i] + 0x8000);
 			readq(r->cpm[i] + 0x8008);
 		}
@@ -3347,6 +3503,7 @@ static void t6050_sleep_finish(struct apple_sleep *s)
 	if (!r->attempt_active)
 		return;
 	r->attempt_active = false;
+	t6050_clusters_down_first_report(s);
 	t6050_sleep_undo_regs(s);
 	/* Before any device resumes: the radio host's noirq resume asks for the result. */
 	if (r->committed && r->n1_host) {
@@ -3537,6 +3694,7 @@ static const struct apple_sleep_soc t6050_j716c_sleep_soc = {
 	.early_context = true,
 	.own_wake = true,
 	.pmp_unstarted = true,
+	.clusters_down_first = true,
 	.machine = "apple,j716c",
 	.spmi_notify_sleep = 0x2000001,
 	.boot_mpidr = 0x040000,

@@ -551,6 +551,11 @@ struct apple_sleep_soc {
 	 * report driver to take them from. A board whose report is enabled still takes them.
 	 */
 	bool pmp_unstarted;
+	/*
+	 * T6050: the clusters other than the boot cluster are taken down at the start of the
+	 * commit, ahead of the boot cluster (t6050_clusters_down_first()).
+	 */
+	bool clusters_down_first;
 
 	/*
 	 * Only for a SoC that states its CPU topology, which the probe then checks: MPIDR's
