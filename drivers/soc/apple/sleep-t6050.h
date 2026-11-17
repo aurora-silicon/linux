@@ -171,7 +171,7 @@ struct apple_sleep_region_state {
 	/* The AP wake-enable words, on this die and the GFX die */
 	void __iomem *wake, *wake_gfx, *aic_gfx;
 	u32 wake_enabled[11], wake_saved[11];
-	/* The sticky wake status words as the wake found them, for t6050_wake_source_report() */
+	/* The raw sticky wake status words as the wake found them */
 	u32 wake_status[11];
 	bool wake_status_valid;
 	bool wake_armed, wake_sources;
@@ -2678,6 +2678,27 @@ static void t6050_sleep_before_enclave(struct apple_sleep *s)
 	t6050_sleep_dart_stop(s, T6050_DART_SEP);
 }
 
+/*
+ * The early secondary-cluster step counts each present core entering its
+ * last WFI. A core left off by a failed restart cannot acknowledge it.
+ * Parked cores, including intentionally offline ones, still take part.
+ */
+static int t6050_check_early_cpus(struct apple_sleep *s)
+{
+	unsigned int cpu, cluster;
+
+	if (!s->soc->clusters_down_first)
+		return 0;
+	for_each_present_cpu(cpu) {
+		cluster = sleep_cpu_cluster(s, cpu_logical_map(cpu));
+		if ((cluster == 1 || cluster == 2) && spin_table_cpu_tracked_off(cpu)) {
+			dev_warn(s->dev, "refused: early cluster CPU%u still tracked off\n", cpu);
+			return -EBUSY;
+		}
+	}
+	return 0;
+}
+
 /* Final returning checks: no last_stop/enclave action has happened yet. */
 static int t6050_sleep_final_check(struct apple_sleep *s)
 {
@@ -2686,6 +2707,10 @@ static int t6050_sleep_final_check(struct apple_sleep *s)
 	u64 now, delay, counter;
 	u32 compare;
 	int ret;
+
+	ret = t6050_check_early_cpus(s);
+	if (ret)
+		return ret;
 
 	if (!r->ptd_owned || !s->smc.held || !s->smc.saved_ops ||
 	    !s->smc.saved_ops->check || !s->smc.saved_ops->commit_notice) {
@@ -3532,7 +3557,7 @@ static void t6050_wake_source_read(struct apple_sleep *s)
 	r->wake_status_valid = true;
 }
 
-/* Once the wake is done: each source that raised it, by number and name */
+/* Raw latched status, not exclusive attribution or proof that a source was enabled. */
 static void t6050_wake_source_report(struct apple_sleep *s)
 {
 	struct apple_sleep_region_state *r = s->region;
@@ -3551,14 +3576,14 @@ static void t6050_wake_source_report(struct apple_sleep *s)
 				if (t6050_wake_names[i].id == id)
 					break;
 			if (i < ARRAY_SIZE(t6050_wake_names))
-				dev_info(s->dev, "wake source: %u %s\n", id,
+				dev_info(s->dev, "wake status set: AP %u %s\n", id,
 					 t6050_wake_names[i].name);
 			else
-				dev_info(s->dev, "wake source: %u\n", id);
+				dev_info(s->dev, "wake status set: AP %u\n", id);
 		}
 	for (b = 0; b < 32; b++)
 		if (r->wake_status[T6050_WAKE_WORDS] & BIT(b))
-			dev_info(s->dev, "wake source: GFX die %u\n", b);
+			dev_info(s->dev, "wake status set: GFX %u\n", b);
 }
 
 static void t6050_sleep_wake_regs(struct apple_sleep *s)
