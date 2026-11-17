@@ -230,10 +230,6 @@ unsigned int dcp_swap_target_lead_us = 0;
 module_param_named(swap_target_lead_us, dcp_swap_target_lead_us, uint, 0644);
 MODULE_PARM_DESC(swap_target_lead_us, "0 (default) = past targets as before; N = move the swap target ts0/ts6 N us into the future in every ts mode that sets clock values");
 
-unsigned int dcp_reswap = 0;
-module_param_named(reswap, dcp_reswap, uint, 0644);
-MODULE_PARM_DESC(reswap, "0 (default) = one submit per swap as before; N = after each atomic swap completes with nothing queued, submit the same full request again N times as real swaps (new swap_id, no flip event)");
-
 unsigned int dcp_swap_completed_mode = 0;
 module_param_named(swap_completed_mode, dcp_swap_completed_mode, uint, 0644);
 MODULE_PARM_DESC(swap_completed_mode, "0 (default) = swap_completed equals swap_enabled; 1 = send swap_completed 0; 2 = send the previous swap's swap_enabled");
@@ -241,6 +237,29 @@ MODULE_PARM_DESC(swap_completed_mode, "0 (default) = swap_completed equals swap_
 bool dcp_surf_id_per_fb = false;
 module_param_named(surf_id_per_fb, dcp_surf_id_per_fb, bool, 0644);
 MODULE_PARM_DESC(surf_id_per_fb, "N (default) = firmware surface ids as before; Y = send a distinct surf id per framebuffer for lab tracing of the idle-revert fault");
+
+static bool dcp_panel_adaptive_off;
+
+static int dcp_panel_adaptive_off_set(const char *val, const struct kernel_param *kp)
+{
+	int ret = param_set_bool(val, kp);
+
+	/* Live apply needs no registry walk: the next panel power-on (screen
+	 * off-and-on cycle) picks the flag up in dcp_on_set_power_state. */
+	return ret;
+}
+
+static const struct kernel_param_ops dcp_panel_adaptive_off_ops = {
+	.set = dcp_panel_adaptive_off_set,
+	.get = param_get_bool,
+};
+module_param_cb(panel_adaptive_off, &dcp_panel_adaptive_off_ops, &dcp_panel_adaptive_off, 0644);
+MODULE_PARM_DESC(panel_adaptive_off, "N (default) = firmware default refresh policy on the internal panel; Y = send adaptive-sync off (param 15, {0,0,0}, count 3 on H17 27.x) at panel power-on and when set live, so a screen off-and-on cycle applies it without a reboot");
+
+bool dcp_panel_adaptive_off_enabled(void)
+{
+	return READ_ONCE(dcp_panel_adaptive_off);
+}
 
 bool dcp_swap_band_hold = DCP_SWAP_BAND_HOLD_DEFAULT;
 module_param_named(swap_band_hold, dcp_swap_band_hold, bool, 0644);
