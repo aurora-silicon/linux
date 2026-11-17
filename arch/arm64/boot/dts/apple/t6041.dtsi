@@ -352,6 +352,7 @@
 		reg-names = "asc", "sgx";
 		mboxes = <&agx_mbox>;
 		power-domains = <&ps_gfx>;
+		apple,clpc = <&clpc>;
 	};
 
 	agx_mbox: mailbox@28a600000 {
