@@ -246,6 +246,22 @@ impl Config {
         self.thermal.busy(now);
         Ok(())
     }
+    /// Whether [`Self::check_pstate`] must run at every retirement with no later batch in
+    /// flight, whatever `asahi.m3_retire_mmio` says: the firmware's ceiling is above the runtime
+    /// cap's fallback, so the runtime cap is what bounds it by temperature
+    /// (`m3_thermal::Governor::enforces`).
+    pub(crate) fn pstate_check_required(&self) -> bool {
+        self.thermal.enforces()
+    }
+    /// Whether a render batch may be published behind batches still in flight. Always, unless
+    /// [`Self::pstate_check_required`]; then only within 500 ms of the last
+    /// [`Self::check_pstate`], which runs only at a retirement with no later batch in flight.
+    pub(crate) fn overlap_allowed(&self) -> bool {
+        if !self.thermal.enforces() {
+            return true;
+        }
+        self.thermal.overlap_allowed(kernel::time::Instant::<kernel::time::Monotonic>::now())
+    }
     pub(crate) fn render_stats(&self) -> Result<[init::Region;2]> {
         if self.profile==super::m3_profile::Profile::Legacy {
             let value=self.stats_region()?;return Ok([value;2]);
