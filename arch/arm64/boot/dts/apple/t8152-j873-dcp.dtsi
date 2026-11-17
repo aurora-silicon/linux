@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * J873g displays: the rear USB-C ports and the HDMI port, driven through
+ * J873g displays: three controllers for the rear USB-C and HDMI ports,
+ * driven through
  * the DCP firmware's iBoot interface (apple,t8152-dcp-iboot). The
- * bootloader trains the displays and hands both DCPs over with their RTKit
- * sessions running.
+ * bootloader hands over running or quiesced RTKit sessions. Unused
+ * controllers can claim another USB-C monitor through the shared crossbar.
  *
  * Resources are from the 26A434 ADT: dcp (iop,ascwrap-v8, post-office
  * mailbox 5 with alias: 0x316020000 + 2 * 5 * 0x80), dart-dcp (SID 23),
@@ -33,6 +34,17 @@
 };
 
 &dispext0_dart {
+	apple,dma-range = <0x108 0x0 0x8 0x0>;
+	status = "okay";
+};
+
+&dcpext1_dart {
+	apple,dma-range = <0x108 0x0 0x8 0x0>;
+	status = "okay";
+};
+
+&dispext1_dart {
+	reg-names = "dart", "dapf";
 	apple,dma-range = <0x108 0x0 0x8 0x0>;
 	status = "okay";
 };
@@ -93,7 +105,7 @@
 		dcp_iboot: display@286e00000 {
 			compatible = "apple,t8152-dcp-iboot";
 			reg = <0x2 0x86e00000 0x0 0x74000>,
-			      <0x3 0x0002005c 0x0 0x4>,
+			      <0x3 0x00020044 0x0 0x1c>,
 			      <0x3 0x1a760000 0x0 0x4000>,
 			      <0x3 0x00700460 0x0 0x4>;
 			/* aux: ADT dptx0-aux, aux-ps: PMGR GLOBAL_AUX_CTRL0 */
@@ -108,6 +120,7 @@
 			 * faults on entries with the DART's no-cache bit.
 			 */
 			dma-coherent;
+			apple,dp-source = <0>;
 
 			/*
 			 * The display pipe's own stream: a separate device, so
@@ -429,7 +442,7 @@
 		};
 
 		/*
-		 * HDMI: DCPEXT0 (post-office mailbox 6) drives the dedicated
+		 * DCPEXT0 (post-office mailbox 6) can drive USB-C, or the dedicated
 		 * dptx-phy through the PS190 converter. ADT dcpext0,
 		 * dart-dcpext0 and dart-dispext0.
 		 */
@@ -450,14 +463,17 @@
 			      <0x3 0x1a764000 0x0 0x4000>,
 			      <0x3 0x00700480 0x0 0x4>,
 			      <0x3 0x007016c0 0x0 0x4>,
-			      <0x3 0x00700e00 0x0 0x4>;
+			      <0x3 0x00700e00 0x0 0x4>,
+			      <0x3 0x03a12c00 0x0 0xc0>;
 			/* aux: ADT dptx1-aux, aux-ps: PMGR GLOBAL_AUX_CTRL1 */
 			/* Read-only PMGR DPTX_PHY and DISPEXT0_CPU admission checks. */
 			reg-names = "coproc", "phy-core", "phy-apb", "aux", "aux-ps",
-				    "phy-ps", "coproc-ps";
+				    "phy-ps", "coproc-ps", "coproc-psd";
 			mboxes = <&dcpext_mbox>;
 			iommus = <&dcpext0_dart 23>;
 			dma-coherent;
+			apple,dp-source = <1>;
+			apple,usb-c-ports = <&dcp_iboot>;
 			apple,hdmi;
 			/* ADT dp2hdmi-gpio0 function-hdmi_hpd */
 			hpd-gpios = <&pinctrl_aop 41 GPIO_ACTIVE_HIGH>;
@@ -467,5 +483,33 @@
 				dma-coherent;
 			};
 		};
+
+		dcpext1_mbox: mailbox@316020700 {
+			compatible = "apple,t8152-ascwrap-v8-mailbox";
+			reg = <0x3 0x16020700 0x0 0x80>;
+			interrupts = <AIC_IRQ 306 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 266 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "send-empty", "recv-not-empty";
+			#mbox-cells = <0>;
+		};
+
+		/* ADT dcpext1: crossbar UFP2, firmware SID23, scanout SID0. */
+		dcpext1_iboot: display@502e00000 {
+			compatible = "apple,t8152-dcp-iboot";
+			reg = <0x5 0x02e00000 0x0 0x74000>,
+			      <0x3 0x03a12d00 0x0 0xc0>;
+			reg-names = "coproc", "coproc-psd";
+			mboxes = <&dcpext1_mbox>;
+			iommus = <&dcpext1_dart 23>;
+			dma-coherent;
+			apple,dp-source = <2>;
+			apple,usb-c-ports = <&dcp_iboot>;
+
+			scanout {
+				iommus = <&dispext1_dart 0>;
+				dma-coherent;
+			};
+		};
+
 	};
 };
