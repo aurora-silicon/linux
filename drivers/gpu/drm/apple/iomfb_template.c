@@ -638,7 +638,8 @@ DCP_THUNK_INOUT(dcp_pipe_cfg_414, dcpep_pipe_cfg_414, u64, u64);
 DCP_THUNK_OUT(dcp_pipe_query_478, dcpep_pipe_query_478, u32);
 DCP_THUNK_OUT(dcp_pipe_query_474, dcpep_pipe_query_474, u32);
 DCP_THUNK_IN(dcp_pipe_set_476, dcpep_pipe_set_476, u32);
-#if DCP_FW_VER < DCP_FW_VERSION(27, 0, 0)
+/* Built for 27.0 too, which still dispatches it as A500; the sleep checks the build has it. */
+#if DCP_FW_VER <= DCP_FW_VERSION(27, 0, 0)
 DCP_THUNK_IN(dcp_unnamed_500, dcpep_unnamed_500, u32);
 #endif
 #endif
@@ -2644,8 +2645,8 @@ static void complete_set_powerstate(struct apple_dcp *dcp, void *out,
 	}
 }
 
-/* V27 shares the h17p template prefix, but does not own its sleep RPCs. */
-#if DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER < DCP_FW_VERSION(27, 0, 0)
+/* V27 shares the h17p template prefix; iomfb_v27.c renames these two to their _v27 names. */
+#if DCP_FW_H17(DCP_FW_VER)
 /*
  * set_power_state around a firmware-driven suspend. What macOS sends before it in
  * either direction: A414(0), A478 twice, A476(1), A478, A412. All are named in

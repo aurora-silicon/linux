@@ -394,6 +394,8 @@ static void apple_crtc_atomic_enable(struct drm_crtc *crtc,
 	}
 	if (crtc_state->active &&
 	    (crtc_state->active_changed || dcp_crtc_needs_route_start(dcp))) {
+		/* The HPD of the link dcp_poweron() reconnects precedes our mode set. */
+		WRITE_ONCE(dcp->typec_enable_pending, true);
 		dcp_poweron(apple_crtc->dcp);
 		crtc_state->color_mgmt_changed = true;
 	} else if (crtc_state->active && drm_atomic_crtc_needs_modeset(crtc_state)) {
@@ -408,6 +410,8 @@ static void apple_crtc_atomic_enable(struct drm_crtc *crtc,
 			dcp_drm_crtc_error(apple_crtc, crtc_state, ret);
 		}
 	}
+	/* The mode set of the enable has run: a sink still without one has a bad link. */
+	WRITE_ONCE(dcp->typec_enable_pending, false);
 	dcp_typec_follow_done(locked);
 	return;
 
@@ -418,6 +422,7 @@ failed:
 	dev_err(dcp->dev, "CRTC route unavailable (%d); modeset deferred\n", ret);
 	/* Flush completes any pending flip without issuing a firmware swap. */
 	schedule_work(&dcp->vblank_wq);
+	WRITE_ONCE(dcp->typec_enable_pending, false);
 	if (dcp->connector)
 		dcp_route_failure_notify(dcp->connector);
 	dcp_typec_follow_done(locked);

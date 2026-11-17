@@ -375,6 +375,8 @@ static const struct aic_info aic3_t8142_info __initconst = {
 	.fast_ipi = true,
 	.local_fast_ipi = true,
 	.vm_timer_fiq_readonly = true,
+	/* AIC3 as on T8132: its configuration is lost with the SoC's power in a deep sleep. */
+	.fw_suspend = true,
 };
 
 static const struct of_device_id aic_info_match[] = {

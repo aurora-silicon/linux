@@ -1742,15 +1742,14 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		}
 		if (ret == -ENOENT &&
 		    (ep->dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G ||
+		     (ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+		      ep->dcp->hw.firmware_compat == DCP_FIRMWARE_H17P) ||
 		     ep->dcp->v27_j714s ||
 		     (ep->dcp->v27_sleep_transport && !strcmp(name, "md-manager")))) {
 			/*
-			 * M5 (H17G) announces powerlog-service with only
-			 * ep-has-desc-mgr and interface-id, and firmware 27
-			 * its descriptor manager (md-manager) without EPIC
-			 * keys; match them by the announced name, as for
-			 * props-less announces. J716c admits only md-manager
-			 * here; its normal service matching stays unchanged.
+			 * H17G and firmware-27 T8142 can omit EPIC identity
+			 * for powerlog-service. J716c's sleep transport
+			 * admits only md-manager by name here.
 			 */
 			epic_name = NULL;
 			epic_class = NULL;

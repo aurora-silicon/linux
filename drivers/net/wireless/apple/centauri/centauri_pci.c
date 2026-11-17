@@ -261,11 +261,26 @@ static void centauri_remove(struct pci_dev *pdev)
  */
 static int centauri_suspend(struct device *dev)
 {
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct centauri *c = pci_get_drvdata(pdev);
+	int ret;
+
+	ret = centauri_wifi_suspend(c);
+	if (ret)
+		return ret;
 	device_set_awake_path(dev);
-	return pci_save_state(to_pci_dev(dev));
+	ret = pci_save_state(pdev);
+	if (ret)
+		centauri_wifi_resume(c);
+	return ret;
 }
 
-static DEFINE_SIMPLE_DEV_PM_OPS(centauri_pm_ops, centauri_suspend, NULL);
+static int centauri_resume(struct device *dev)
+{
+	return centauri_wifi_resume(pci_get_drvdata(to_pci_dev(dev)));
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(centauri_pm_ops, centauri_suspend, centauri_resume);
 
 /* 0x1903 is the Beta (Bluetooth) function: btcentauri claims it. This driver needs functions
  * 0 and 1 (1 is enabled here, its BAR is used by the Wi-Fi code) and reaches function 2 only

@@ -77,6 +77,10 @@ static int ordinary_safe(void);
 static void ordinary_initial(void);
 static void ordinary_usb2_check(void);
 static void event(char c) { assert(count+1<sizeof(events));events[count++]=c;events[count]=0; }
+/* This fixture covers M1/M2 role removal, never T8142 DP admission. */
+static bool dcp_t8142_ext(struct apple_dcp *d) { (void)d;return false; }
+static int dcp_typec_route_apply(struct typec_mux_dev *m,struct typec_mux_state *s)
+{ (void)m;(void)s;assert(!"unexpected T8142 route admission");return -EINVAL; }
 static bool dcp_is_external_h17p(struct apple_dcp *d) { return d->external; }
 static int dcp_dptx_disconnect_oob(void *dev,u32 index) { (void)dev;assert(index==0);event('Q');stops++;if(power_error){display.external_error=power_error;return power_error;}display.external_cable=false;display.external_stopped=true;display.dptxport[0].connected=false;display.typec_cable_connected=false;connector.connected=false;return 0; }
 static struct drm_device *dcp_typec_drm(void) { return NULL; }
@@ -164,6 +168,9 @@ struct phy { struct apple_atcphy *data; };
 #define phy_get_drvdata(p) ((p)->data)
 #define USB2PHY_SIG 0
 #define USB2PHY_SIG_HOST 1
+USB2_RUN_DEFINES
+/* Retained USB2 power is exercised by dwc3-teardown, not these role removals. */
+static u32 readl(void *p) { (void)p;assert(false);return 0; }
 static struct { enum atcphy_pipehandler_state pipehandler_state; bool enable_dp_aux; } atcphy_modes[7];
 static struct apple_atcphy ordinary_phy;
 static struct phy usb_phy={.data=&ordinary_phy};
@@ -200,6 +207,10 @@ static void ordinary_usb2_check(void) {
 '''
  # The ordinary port is the T8122 profile unless a case selects the T8103
  # generation, whose live legacy PIPE park the mux switch now consults.
+ ordinary_phy=ordinary_phy.replace('USB2_RUN_DEFINES', '\n'.join(
+  line for line in atc.splitlines()
+  if line.startswith(('#define USB2PHY_USBCTL ', '#define USB2PHY_USBCTL_USB_MODE ',
+                      '#define USB2PHY_USBCTL_RUN '))))
  generation='enum atcphy_generation {' in atc
  ordinary_phy=ordinary_phy.replace('GENERATION_ENUM\n',block(atc,'enum atcphy_generation {')+';\n' if generation else '',1)
  ordinary_phy=ordinary_phy.replace('GENERATION_FIELD ','enum atcphy_generation gen; ' if generation else '',1)
