@@ -3804,7 +3804,7 @@ static void iomfb_atomic_release(struct iomfb_transaction *transaction)
  * release). No atomic state, no shared scanout moves, no NULL commit
  * dereference.
  */
-static void iomfb_reswap_submit(struct apple_dcp *dcp);
+static void do_swap(struct apple_dcp *dcp, void *data, void *cookie);
 
 static void iomfb_reswap_start(struct apple_dcp *dcp,
 			       struct iomfb_transaction *transaction)
@@ -3828,7 +3828,8 @@ static void iomfb_reswap_start(struct apple_dcp *dcp,
 			drm_framebuffer_get(scanout->fb[i]);
 	}
 	dcp->iomfb.next_scanout = scanout;
-	iomfb_reswap_submit(dcp);
+	dcp->iomfb.reswap_active = true;
+	do_swap(dcp, NULL, NULL);
 }
 
 static void iomfb_reswap_release(struct iomfb_transaction *transaction)

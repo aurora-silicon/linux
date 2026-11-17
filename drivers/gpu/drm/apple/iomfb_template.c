@@ -3317,22 +3317,6 @@ static void dcp_w86_after_400(struct apple_dcp *dcp, void *out, void *cookie)
 }
 #endif
 
-/*
- * Reswap repeat submit: the repeat's own scanout is already in next_scanout;
- * run the full swap_start path so the firmware assigns a new swap_id. The
- * completion takes the reswap branch above: no flip event, no retained
- * release, and the repeat's scanout becomes current through the normal
- * complete path.
- */
-static void iomfb_reswap_submit(struct apple_dcp *dcp)
-{
-	struct DCP_FW_NAME(dcp_swap_start_req) start_req =
-		dcp_swap_start_request(dcp);
-
-	dcp->iomfb.reswap_active = true;
-	dcp_swap_start(dcp, false, &start_req, dcp_swap_started, NULL);
-}
-
 static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 {
 	int ret;
