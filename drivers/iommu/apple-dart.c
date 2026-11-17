@@ -361,6 +361,9 @@ struct apple_dart_fw_tree {
 #define APPLE_DART_GAPF_PROTECT BIT(4)
 
 struct apple_dart {
+	bool cold_gen3;
+	u32 cold_gen3_sids;
+	bool cold_gen3_pcie;
 	struct device *dev;
 	const struct apple_dart_hw *hw;
 
@@ -2648,6 +2651,39 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 	struct apple_dart_stream_map stream_map;
 	int i;
 
+	if (dart->cold_gen3) {
+		stream_map.dart = dart;
+		bitmap_zero(stream_map.sidmap, DART_MAX_STREAMS);
+		for (i = 0; i < 32; i++)
+			if (dart->cold_gen3_sids & BIT(i))
+				__set_bit(i, stream_map.sidmap);
+		if (dart->cold_gen3_pcie)
+			bitmap_set(stream_map.sidmap, 0, 253);
+		apple_dart_hw_disable_dma(&stream_map);
+		apple_dart_hw_clear_all_ttbrs(&stream_map);
+		apple_dart_apply_own_tunables(dart);
+		apple_dart_writel(dart, apple_dart_readl(dart, dart->hw->enable_streams) |
+				  dart->cold_gen3_sids, dart->hw->enable_streams);
+		if (dart->cold_gen3_pcie) {
+			/* ADT reserves 253/255 for host transactions, including MSI
+			 * writes to AIC. Stream 254 belongs to firmware; preserve it.
+			 */
+			for (i = 253; i <= 255; i += 2) {
+				apple_dart_writel(dart, DART_T8110_TCR_BYPASS_DART,
+						  DART_TCR(dart, i));
+				__set_bit(i, stream_map.sidmap);
+			}
+			for (i = 0; i < 8; i++) {
+				u32 reg = dart->hw->enable_streams + i * 4;
+				u32 enabled = apple_dart_readl(dart, reg);
+
+				enabled |= i == 7 ? (U32_MAX & ~BIT(30)) : U32_MAX;
+				apple_dart_writel(dart, enabled, reg);
+			}
+		}
+		return dart->hw->invalidate_tlb(&stream_map);
+	}
+
 	if (dart->isp_host)
 		return apple_dart_isp_host_reset(dart);
 	if (dart->managed_sids || dart->cold_ane)
@@ -3380,6 +3416,17 @@ static int __apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 		.iommu_dev = dart->dev,
 	};
 
+	if (dart->cold_gen3) {
+		if ((dma_min ^ dma_max) & ~DMA_BIT_MASK(36)) {
+			ret = -ERANGE;
+			goto done;
+		}
+		/* Gen3 selects the high DMA window separately from its two-level
+		 * 16K page-table indices, as with iBoot's display streams.
+		 */
+		pgtbl_cfg.ias = 36;
+	}
+
 	if (dart->locked) {
 		unsigned long *sidmap;
 		int sid;
@@ -4001,6 +4048,9 @@ static int apple_dart_of_xlate(struct device *dev,
 		return i;
 
 	sid = args->args[0];
+	if (dart->cold_gen3 && (dart->cold_gen3_pcie ? (sid < 0 || sid >= 253) :
+	    (sid < 0 || sid >= 32 || !(dart->cold_gen3_sids & BIT(sid)))))
+		return -EPERM;
 	if (dart->isp_host && sid != 0 && sid != 12)
 		return -EINVAL;
 	if (dart->cold_ane && sid != 0)
@@ -5535,6 +5585,15 @@ static int apple_dart_probe(struct platform_device *pdev)
 	dart->dev = dev;
 	dart->hw = of_device_get_match_data(dev);
 	dart->tunneled = tunneled;
+	if (of_device_is_compatible(dev->of_node, "apple,t8152-acio-dart")) {
+		dart->cold_gen3 = true;
+		dart->cold_gen3_sids = 0x0fff0fff;
+	}
+	if (of_device_is_compatible(dev->of_node, "apple,t8152-pciec-dart")) {
+		dart->cold_gen3 = true;
+		dart->cold_gen3_pcie = true;
+		dart->cold_gen3_sids = U32_MAX;
+	}
 	dart->cold_ane = of_device_is_compatible(dev->of_node, "apple,t8140-ane-dart") ||
 			 of_device_is_compatible(dev->of_node, "apple,t8142-ane-dart");
 	if (dart->cold_ane && !IS_BUILTIN(CONFIG_APPLE_DART))
@@ -5741,7 +5800,7 @@ static int apple_dart_probe(struct platform_device *pdev)
 	ret = devm_pm_runtime_enable(dev);
 	if (ret)
 		goto err_clk_disable;
-	if (tunneled && dart->tunables) {
+	if (tunneled && dart->tunables && !dart->cold_gen3) {
 		dev_dbg(dev, "applying %zu PCIe-C DART tunables\n",
 			dart->tunables->sz);
 		apple_dart_apply_tunables(dart, dart->tunables);
@@ -5757,7 +5816,15 @@ static int apple_dart_probe(struct platform_device *pdev)
 		 * pages, a 32-bit IOVA, a 36-bit PA and as many streams as its
 		 * register block describes.
 		 */
-		if (dart->hw->type == DART_T8110) {
+		if (dart->cold_gen3_pcie) {
+			dart->pgsize = SZ_16K;
+			dart->supports_bypass = true;
+			dart->ias = 42;
+			dart->oas = 42;
+			dart->num_streams = 256;
+			dart->four_level = false;
+			dart->version = 0x300;
+		} else if (dart->hw->type == DART_T8110) {
 			dart->pgsize = 1 << DART_PCIEC_PAGE_SHIFT;
 			dart->supports_bypass = true;
 			dart->ias = DART_PCIEC_ADDR_WIDTH;
@@ -5951,6 +6018,51 @@ params_done:
 		ret = -EBUSY;
 		goto err_clk_disable;
 	}
+	if (dart->hw->gen3) {
+		struct resource *tlbi;
+
+		/* Cold setup only for the instances a T8152 compatible selects. */
+		if (!dart->locked && !dart->cold_gen3) {
+			dev_err(dev, "Gen3 DART is not locked; cold setup is not supported\n");
+			ret = -ENODEV;
+			goto err_clk_disable;
+		}
+		if (dart->cold_gen3 &&
+		    (dart->locked || dart->version != 0x300 || !dart->tunables ||
+		     (dart->cold_gen3_pcie ? (!tunneled || !dev->pm_domain) :
+		      dart->num_streams != 32) ||
+		     (apple_dart_readl(dart, dart->hw->enable_streams) & dart->cold_gen3_sids))) {
+			ret = -EINVAL;
+			goto err_clk_disable;
+		}
+		if (dart->cold_gen3_pcie) {
+			for (sid = 0; sid < 8; sid++) {
+				u32 mask = sid == 7 ? GENMASK(28, 0) : U32_MAX;
+				u32 reg = dart->hw->enable_streams + sid * 4;
+
+				if (apple_dart_readl(dart, reg) & mask) {
+					ret = -EBUSY;
+					goto err_clk_disable;
+				}
+			}
+		}
+		/* The aperture is shared by every Gen3 DART: map, do not claim. */
+		tlbi = platform_get_resource_byname(pdev, IORESOURCE_MEM, "tlbi");
+		if (!tlbi || resource_size(tlbi) < 16) {
+			dev_err(dev, "Gen3 DART needs its TLBI aperture\n");
+			ret = -EINVAL;
+			goto err_clk_disable;
+		}
+		dart->tlbi = devm_ioremap(dev, tlbi->start, resource_size(tlbi));
+		if (!dart->tlbi) {
+			ret = -ENOMEM;
+			goto err_clk_disable;
+		}
+		dart->tlbi_route = apple_dart_readl(dart, DART_GEN3_TLBI_ROUTE) & 0xf;
+		dev_info(dev, "Gen3 DART, version %#x, TLBI route %u\n",
+			 dart->version, dart->tlbi_route);
+	}
+
 	apple_dart_parse_sleep_list(dart, res, "apple,sleep-prepare", &dart->sleep_prepare);
 	apple_dart_parse_sleep_list(dart, res, "apple,sleep-restore", &dart->sleep_restore);
 	apple_dart_parse_sleep_list(dart, res, "apple,sleep-restore-late",
@@ -6089,32 +6201,6 @@ params_done:
 		ret = apple_dart_hw_reset(dart);
 		if (ret)
 			goto err_clk_disable;
-	}
-
-	if (dart->hw->gen3) {
-		struct resource *tlbi;
-
-		/* Only an iBoot-provisioned (locked) Gen3 stream is supported. */
-		if (!dart->locked) {
-			dev_err(dev, "Gen3 DART is not locked; cold setup is not supported\n");
-			ret = -ENODEV;
-			goto err_clk_disable;
-		}
-		/* The aperture is shared by every Gen3 DART: map, do not claim. */
-		tlbi = platform_get_resource_byname(pdev, IORESOURCE_MEM, "tlbi");
-		if (!tlbi || resource_size(tlbi) < 16) {
-			dev_err(dev, "Gen3 DART needs its TLBI aperture\n");
-			ret = -EINVAL;
-			goto err_clk_disable;
-		}
-		dart->tlbi = devm_ioremap(dev, tlbi->start, resource_size(tlbi));
-		if (!dart->tlbi) {
-			ret = -ENOMEM;
-			goto err_clk_disable;
-		}
-		dart->tlbi_route = apple_dart_readl(dart, DART_GEN3_TLBI_ROUTE) & 0xf;
-		dev_info(dev, "Gen3 DART, version %#x, TLBI route %u\n",
-			 dart->version, dart->tlbi_route);
 	}
 
 	/* Borrowed display state: never acknowledge someone else's fault. */
@@ -7279,6 +7365,8 @@ static const struct dev_pm_ops apple_dart_pm_ops = {
 
 static const struct of_device_id apple_dart_of_match[] = {
 	{ .compatible = "apple,t8152-dart-gen3", .data = &apple_dart_hw_gen3 },
+	{ .compatible = "apple,t8152-acio-dart", .data = &apple_dart_hw_gen3 },
+	{ .compatible = "apple,t8152-pciec-dart", .data = &apple_dart_hw_gen3 },
 	{ .compatible = "apple,t8103-dart", .data = &apple_dart_hw_t8103 },
 	{ .compatible = "apple,t8103-usb4-dart", .data = &apple_dart_hw_t8103_usb4 },
 	{ .compatible = "apple,t8110-dart", .data = &apple_dart_hw_t8110 },
