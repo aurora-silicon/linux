@@ -150,6 +150,7 @@ struct dcpib_phy_ops {
 	int (*deactivate)(struct dcpib *dcp);
 	int (*set_link_rate)(struct dcpib *dcp, u32 rate);	/* DPCD units */
 	int (*set_lane_count)(struct dcpib *dcp, u32 lanes);	/* optional */
+	u32 (*max_lane_count)(struct dcpib *dcp);
 	int (*set_drive)(struct dcpib *dcp,
 			 const struct dcpib_drive_settings *settings, u32 count);
 	int (*set_route)(struct dcpib *dcp, bool enable);
@@ -190,6 +191,7 @@ struct dcpib {
 	struct apple_rtkit *rtk;
 	struct workqueue_struct *wq;
 	u32 inherited_afk_endpoints;
+	u32 dp_source; /* display-crossbar UFP endpoint; DPTX port 0 */
 
 	struct dcpib_ep *eps[DCPIB_NR_EPS];
 	struct dcpib_ep *iboot_ep;
@@ -250,6 +252,7 @@ struct dcpib {
 
 	/* iBoot state below, under lock */
 	struct mutex lock;
+	bool enabled;
 	bool powered;
 	struct dcpib_timing_mode *tmodes;
 	unsigned int nr_tmodes;
@@ -267,6 +270,7 @@ struct dcpib {
 	 * firmware's idle power off timer takes the link down 30 s later.
 	 */
 	struct delayed_work av_work;
+	struct delayed_work hpd_work;
 
 	struct drm_plane plane;
 	struct drm_crtc crtc;
@@ -312,6 +316,7 @@ int dcpib_wait_hpd(struct dcpib *dcp);
 int dcpib_dptx_init(struct dcpib *dcp);
 int dcpib_dpav_init(struct dcpib *dcp);
 int dcpib_dptx_connect(struct dcpib *dcp, unsigned int port);
+int dcpib_dptx_disconnect(struct dcpib *dcp, unsigned int port);
 int dcpib_dptx_set_hpd(struct dcpib *dcp, unsigned int port, bool hpd);
 
 /* aux.c */
@@ -336,7 +341,7 @@ int dcpib_hdmi_init(struct dcpib *dcp, struct device_node *np);
 
 /* pd.c */
 struct spmi_device *dcpib_pd_get(struct dcpib *dcp, struct device_node *np);
-int dcpib_pd_sink(struct spmi_device *pd, bool *flipped);
+int dcpib_pd_sink(struct spmi_device *pd, bool *flipped, u32 *lanes);
 int dcpib_pd_reconnect(struct dcpib *dcp);
 
 /* kms.c */

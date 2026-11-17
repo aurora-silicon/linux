@@ -26,6 +26,7 @@
 #define ACE3_REG_CMD1		0x08
 #define ACE3_REG_DATA1		0x09
 #define ACE3_REG_STATUS		0x1a
+#define ACE3_REG_POWER_STATE	0x20
 #define ACE3_REG_DATA_STATUS	0x5f
 
 #define STATUS_PLUG_PRESENT	BIT(0)
@@ -124,41 +125,60 @@ int dcpib_pd_reconnect(struct dcpib *dcp)
 {
 	int ret;
 
+	device_lock(&dcp->pd->dev);
 	/* Gaid resets the controller before it can report completion. */
 	ret = spmi_command_wakeup(dcp->pd);
 	if (!ret)
 		ret = ace3_write(dcp->pd, ACE3_REG_CMD1, "Gaid", 4);
 	if (ret)
-		return ret;
+		goto out;
 	for (int i = 0; i < 60; i++) {
 		msleep(500);
 		ret = ace3_cmd(dcp->pd, "SSPS", 0);
 		if (!ret)
-			return 0;
+			break;
 	}
+out:
+	device_unlock(&dcp->pd->dev);
 	return ret;
 }
 
 /* 1 with a DisplayPort sink in DP alt mode and HPD high, 0 without. */
-int dcpib_pd_sink(struct spmi_device *pd, bool *flipped)
+int dcpib_pd_sink(struct spmi_device *pd, bool *flipped, u32 *lanes)
 {
-	u8 status[4], data[4];
+	u8 status[4], data[4], power;
 	int ret;
 
+	/* Serialize the logical register window with the USB4 port monitor. */
+	device_lock(&pd->dev);
 	/* Without a plug the controller sleeps and ignores selects. */
 	ret = spmi_command_wakeup(pd);
 	if (ret)
-		return ret;
+		goto out;
+	ret = ace3_read(pd, ACE3_REG_POWER_STATE, &power, sizeof(power));
+	if (ret)
+		goto out;
+	/* Register access alone does not enable the alt-mode policy engine. */
+	if (power) {
+		ret = ace3_cmd(pd, "SSPS", 0);
+		if (ret)
+			goto out;
+	}
 	ret = ace3_read(pd, ACE3_REG_STATUS, status, sizeof(status));
 	if (!ret)
 		ret = ace3_read(pd, ACE3_REG_DATA_STATUS, data, sizeof(data));
 	if (ret)
-		return ret;
+		goto out;
 	*flipped = status[0] & STATUS_UPSIDE_DOWN;
+	/* Pin D/F shares the cable with USB3; C/E uses all four DP lanes. */
+	*lanes = get_unaligned_le32(data) & BIT(5) ? 2 : 4;
 	/* The sink answers AUX once it raised HPD, not at alt mode entry. */
-	return (status[0] & STATUS_PLUG_PRESENT) &&
+	ret = (status[0] & STATUS_PLUG_PRESENT) &&
 	       (get_unaligned_le32(data) & DATA_DP_CONNECTION) &&
 	       (get_unaligned_le32(data) & DATA_HPD_LEVEL);
+out:
+	device_unlock(&pd->dev);
+	return ret;
 }
 
 /* The PD controller @np's apple,usb-pd points at, NULL without one. */

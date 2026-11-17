@@ -71,7 +71,13 @@ int dcpib_aux_init(struct dcpib *dcp, struct dcpib_aux *aux)
 	aux_update(aux->regs + AUX_FUNC_EN_2, AUX_FUNC_EN_N, AUX_FUNC_EN_N);
 	udelay(10);
 	aux_update(aux->regs + AUX_FUNC_EN_2, AUX_FUNC_EN_N, 0);
-	writel(3 << 8, aux->regs + AUX_HW_RETRY);
+	/*
+	 * AppleDPTXController::initAuxReplyTimeout: bits 21:8 are a 14-bit
+	 * reply timeout, not Analogix's three-bit expected-delay field.
+	 * The old value 3 let native reads pass but timed out EDID through
+	 * a USB-C to HDMI adapter. Use Apple's timeout and retry interval.
+	 */
+	writel((3200 << 8) | (3 << 3), aux->regs + AUX_HW_RETRY);
 	writel(BIT(7) | 1, aux->regs + AUX_DEFER_CTL);
 	aux_update(aux->regs + AUX_SEL, 0x3f, aux->sel);
 	return 0;

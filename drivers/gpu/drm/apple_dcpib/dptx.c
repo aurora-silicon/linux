@@ -135,7 +135,7 @@ static u32 dptx_call(struct dcpib_service *service, u16 group, u32 command,
 		port->link_rate = arg;
 		return 0;
 	case DPTX_APCALL_GET_MAX_LANE_COUNT:
-		value = 4;
+		value = phy->max_lane_count ? phy->max_lane_count(dcp) : 4;
 		break;
 	case DPTX_APCALL_GET_ACTIVE_LANE_COUNT:
 		value = port->lanes;
@@ -305,6 +305,21 @@ int dcpib_dptx_connect(struct dcpib *dcp, unsigned int port)
 		ret = -EIO;
 	}
 	return ret;
+}
+
+int dcpib_dptx_disconnect(struct dcpib *dcp, unsigned int port)
+{
+	struct dcpib_service *service = dcp->port[port].service;
+	__le32 status = 0;
+	int ret;
+
+	if (!service)
+		return -ENODEV;
+	ret = dcpib_service_call(service, 8, 7, NULL, 0, 16, &status,
+				 sizeof(status), 12);
+	if (ret || status)
+		return ret ?: -EIO;
+	return dcpib_dptx_set_hpd(dcp, port, false);
 }
 
 int dcpib_dptx_set_hpd(struct dcpib *dcp, unsigned int port, bool hpd)

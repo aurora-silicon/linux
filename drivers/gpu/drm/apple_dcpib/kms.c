@@ -65,6 +65,10 @@ static bool dcpib_mode_fits(struct dcpib *dcp, const struct dcpib_timing_mode *t
 	u64 pixels = (u64)le32_to_cpu(t->width) * le32_to_cpu(t->height) *
 		     dcpib_refresh(t);
 
+	/* Hotplug may return modes larger than the buffers allocated at probe. */
+	if ((u64)ALIGN(le32_to_cpu(t->width) * 4, 64) * le32_to_cpu(t->height) >
+	    dcp->scan[0].size)
+		return false;
 	if (pixels < dcp->phy->min_pixel_rate ||
 	    (dcp->phy->max_pixel_rate && pixels > dcp->phy->max_pixel_rate))
 		return false;
@@ -130,10 +134,9 @@ static const struct dcpib_color_mode *dcpib_find_color(struct dcpib *dcp)
 }
 
 /*
- * The largest mode from 50 to 60 Hz for the console, up to 1920x1080 on
- * USB-C: on the 2-lane HBR link of the J873g USB-C monitor 1920x1080@60
- * works, while SET_MODE 1920x1200@60 crashes the firmware. Low refresh
- * modes (2560x1440@30) are left to userspace.
+ * A conservative console mode from 50 to 60 Hz, up to 1920x1080 on
+ * USB-C. Userspace can select the larger modes, including 2560x1440@30
+ * and 1920x1200@60, after the sink's EDID is available.
  */
 static const struct dcpib_timing_mode *dcpib_preferred(struct dcpib *dcp)
 {
@@ -242,6 +245,13 @@ static int dcpib_set_mode_locked(struct dcpib *dcp,
 				 const struct dcpib_timing_mode *t,
 				 const struct dcpib_color_mode *c);
 
+/* With dcp->lock held; queued work will observe the cleared pending slot. */
+static void dcpib_cancel_swap_locked(struct dcpib *dcp)
+{
+	hrtimer_cancel(&dcp->swap_timer);
+	dcp->pending = -1;
+}
+
 /* Read the sink's EDID through the phy, if it can, and keep it. */
 void dcpib_update_edid(struct dcpib *dcp)
 {
@@ -276,32 +286,47 @@ dcpib_connector_detect(struct drm_connector *connector, bool force)
 {
 	struct dcpib *dcp = to_dcpib(connector->dev);
 	bool flipped = false;
+	enum drm_connector_status status;
 	int hpd;
 
+	mutex_lock(&dcp->lock);
 	if (dcp->hpd_gpio)
 		hpd = gpiod_get_value_cansleep(dcp->hpd_gpio);
 	else if (dcp->phy->detect)
 		hpd = dcp->phy->detect(dcp, &flipped);
-	else
-		return dcp->nr_tmodes ? connector_status_connected :
+	else {
+		status = dcp->nr_tmodes ? connector_status_connected :
 					connector_status_disconnected;
-	if (hpd < 0)
-		return connector_status_unknown;
+		goto out;
+	}
+	if (hpd < 0) {
+		status = connector_status_unknown;
+		goto out;
+	}
 	if (hpd != dcp->hpd) {
 		dev_info(dcp->dev, "sink %s\n", hpd ? "plugged" : "unplugged");
 		dcp->hpd = hpd;
-		mutex_lock(&dcp->lock);
 		/*
 		 * USB-C: the DPTX port's HPD follows the PD controller, and a
 		 * new plug may come the other way round.
 		 */
 		if (dcp->pd) {
+			if (!hpd || dcp->powered) {
+				dcpib_cancel_swap_locked(dcp);
+				if (dcpib_dptx_disconnect(dcp, 0))
+					dev_err(dcp->dev, "DPTX release failed\n");
+				if (!dcpib_ib_set_power(dcp, false)) {
+					dcp->powered = false;
+					dcp->mode_set = false;
+					dcp->phy->deactivate(dcp);
+				}
+			}
 			/*
 			 * A plug while the display stayed on (unplug and plug
 			 * between two polls): start the PHY cold again, the
 			 * new plug may come the other way round.
 			 */
-			if (hpd && dcp->powered)
+			if (hpd)
 				dcp->phy->deactivate(dcp);
 			/* The sink may be on another port now. */
 			if (hpd && dcp->phy->select)
@@ -311,31 +336,65 @@ dcpib_connector_detect(struct drm_connector *connector, bool force)
 			/* The firmware talks AUX as soon as it sees HPD. */
 			if (hpd && dcp->phy->activate(dcp))
 				dev_err(dcp->dev, "phy activation failed\n");
-			if (dcpib_dptx_set_hpd(dcp, 0, hpd))
+			if (hpd && dcpib_dptx_connect(dcp, 0))
+				dev_err(dcp->dev, "DPTX connect failed\n");
+			if (hpd && dcpib_dptx_set_hpd(dcp, 0, true))
 				dev_err(dcp->dev, "DPTX HPD update failed\n");
 		}
 		/* A new sink: the firmware reads its EDID, take the new lists. */
-		if (hpd && (dcpib_wait_hpd(dcp) || dcpib_ib_get_modes(dcp)))
+		if (hpd && (dcpib_wait_hpd(dcp) || dcpib_ib_get_modes(dcp))) {
 			dev_err(dcp->dev, "no modes from the new sink\n");
+			dcp->nr_tmodes = 0;
+			dcp->nr_cmodes = 0;
+			/* A sleeping EIZO may need a fresh DP alt mode entry. */
+			if (dcp->pd && time_after(jiffies, dcp->pd_reset_time + 60 * HZ)) {
+				dcp->pd_reset_time = jiffies;
+				schedule_work(&dcp->pd_reset_work);
+			}
+		}
 		/*
 		 * The EDID once the firmware has read it, so the sink's DDC
 		 * answers, and before SET_MODE: reading it borrows the AUX path
 		 * while the firmware does no AUX.
 		 */
-		if (hpd)
+		if (hpd && dcp->nr_tmodes)
 			dcpib_update_edid(dcp);
-		/* The unplug dropped the link; SET_MODE trains it again. */
-		if (hpd && dcp->powered && (dcp->mode_set || dcp->mode_failed)) {
-			struct dcpib_timing_mode t = dcp->cur_mode;
+		/*
+		 * A fast reconnect can finish before userspace disables the CRTC.
+		 * Restore its requested state even though unplug powered it off.
+		 */
+		if (hpd && dcp->enabled && dcp->cur_mode.valid) {
+			const struct dcpib_timing_mode *t = NULL;
 			const struct dcpib_color_mode *c = dcpib_find_color(dcp);
+			int ret = 0;
 
-			if (c)
-				dcpib_set_mode_locked(dcp, &t, c);
+			for (unsigned int i = 0; i < dcp->nr_tmodes; i++) {
+				const struct dcpib_timing_mode *candidate = &dcp->tmodes[i];
+
+				if (candidate->valid && candidate->width == dcp->cur_mode.width &&
+				    candidate->height == dcp->cur_mode.height &&
+				    candidate->fps == dcp->cur_mode.fps) {
+					t = candidate;
+					break;
+				}
+			}
+			if (t && c && !dcp->powered) {
+				ret = dcpib_ib_set_surface(dcp, dcp->scan_dva[dcp->front],
+					le32_to_cpu(t->width), le32_to_cpu(t->height),
+					ALIGN(le32_to_cpu(t->width) * 4, 64));
+				if (!ret)
+					ret = dcpib_ib_set_power(dcp, true);
+				dcp->powered = !ret;
+			}
+			if (t && c && !ret)
+				dcpib_set_mode_locked(dcp, t, c);
 		}
-		mutex_unlock(&dcp->lock);
 	}
-	return hpd && dcp->nr_tmodes ? connector_status_connected :
-				       connector_status_disconnected;
+	status = hpd && dcp->nr_tmodes ? connector_status_connected :
+					 connector_status_disconnected;
+out:
+	mutex_unlock(&dcp->lock);
+	return status;
 }
 
 static const struct drm_connector_funcs dcpib_connector_funcs = {
@@ -352,14 +411,25 @@ static int dcpib_plane_atomic_check(struct drm_plane *plane,
 {
 	struct drm_plane_state *new = drm_atomic_get_new_plane_state(state, plane);
 	struct drm_crtc_state *crtc_state = NULL;
+	struct dcpib *dcp = to_dcpib(plane->dev);
+	u32 width, height;
+	int ret;
 
 	if (new->crtc)
 		crtc_state = drm_atomic_get_new_crtc_state(state, new->crtc);
 	/* The surface fills the whole mode; no scaling or positioning. */
-	return drm_atomic_helper_check_plane_state(new, crtc_state,
+	ret = drm_atomic_helper_check_plane_state(new, crtc_state,
 						   DRM_PLANE_NO_SCALING,
 						   DRM_PLANE_NO_SCALING,
 						   false, false);
+	if (ret || !new->visible)
+		return ret;
+	/* The helper clips src/dst; raw src_w/src_h may exceed the CRTC. */
+	if ((new->src.x1 | new->src.y1 | new->src.x2 | new->src.y2) & 0xffff)
+		return -EINVAL;
+	width = drm_rect_width(&new->src) >> 16;
+	height = drm_rect_height(&new->src) >> 16;
+	return (u64)ALIGN(width * 4, 64) * height <= dcp->scan[0].size ? 0 : -EINVAL;
 }
 
 static void dcpib_rect_grow(struct drm_rect *r, const struct drm_rect *add)
@@ -389,6 +459,10 @@ static void dcpib_swap_locked(struct dcpib *dcp, unsigned int buf, u32 w,
 			      u32 h, u32 pitch)
 {
 	int ret;
+
+	if (!dcp->powered || !dcp->mode_set || !dcp->hpd ||
+	    apple_rtkit_is_crashed(dcp->rtk))
+		return;
 
 	/* The pipe must see the whole frame before it is swapped in. */
 	wmb();
@@ -446,23 +520,32 @@ static void dcpib_plane_atomic_update(struct drm_plane *plane,
 	struct dcpib *dcp = to_dcpib(plane->dev);
 	struct drm_framebuffer *fb = new->fb;
 	struct drm_atomic_helper_damage_iter iter;
-	struct drm_rect clip, damage = { 0, 0, 0, 0 };
-	struct drm_rect full = DRM_RECT_INIT(0, 0, fb ? fb->width : 0,
-					     fb ? fb->height : 0);
+	struct drm_rect clip, source_clip, src, full, damage = { 0, 0, 0, 0 };
 	unsigned int pitch, back;
 	struct iosys_map dst;
 	s64 period, since;
 
 	if (!fb || !new->visible)
 		return;
-	pitch = (new->src_w >> 16) * 4;
+	src = DRM_RECT_INIT(new->src.x1 >> 16, new->src.y1 >> 16,
+			    drm_rect_width(&new->src) >> 16,
+			    drm_rect_height(&new->src) >> 16);
+	full = DRM_RECT_INIT(0, 0, drm_rect_width(&src), drm_rect_height(&src));
+	pitch = ALIGN(drm_rect_width(&full) * 4, 64);
 	drm_atomic_helper_damage_iter_init(&iter, old, new);
-	drm_atomic_for_each_plane_damage(&iter, &clip)
+	drm_atomic_for_each_plane_damage(&iter, &clip) {
+		if (!drm_rect_intersect(&clip, &src))
+			continue;
+		drm_rect_translate(&clip, -src.x1, -src.y1);
 		dcpib_rect_grow(&damage, &clip);
+	}
 	if (!drm_rect_visible(&damage))
 		return;
 
 	mutex_lock(&dcp->lock);
+	if (!dcp->powered || !dcp->mode_set || !dcp->hpd ||
+	    apple_rtkit_is_crashed(dcp->rtk))
+		goto out;
 	period = dcpib_period_ns(dcp);
 	if (!READ_ONCE(buffered)) {
 		/* Into the buffer on screen (tears during motion). */
@@ -487,7 +570,9 @@ static void dcpib_plane_atomic_update(struct drm_plane *plane,
 	if (drm_rect_intersect(&clip, &full)) {
 		iosys_map_set_vaddr(&dst, dcp->scan_wc[back]);
 		iosys_map_incr(&dst, drm_fb_clip_offset(pitch, fb->format, &clip));
-		drm_fb_memcpy(&dst, &pitch, shadow->data, fb, &clip);
+		source_clip = clip;
+		drm_rect_translate(&source_clip, src.x1, src.y1);
+		drm_fb_memcpy(&dst, &pitch, shadow->data, fb, &source_clip);
 	}
 	dcp->stale[back] = (struct drm_rect){ 0, 0, 0, 0 };
 	for (unsigned int i = 0; i < DCPIB_SCANOUT_BUFS; i++)
@@ -498,12 +583,12 @@ static void dcpib_plane_atomic_update(struct drm_plane *plane,
 
 	since = ktime_to_ns(ktime_sub(ktime_get(), dcp->last_swap));
 	if (dcp->pending < 0 && (!dcp->mode_set || since >= period)) {
-		dcpib_swap_locked(dcp, back, new->src_w >> 16, new->src_h >> 16,
+		dcpib_swap_locked(dcp, back, drm_rect_width(&full), drm_rect_height(&full),
 				  pitch);
 		goto out;
 	}
-	dcp->pending_w = new->src_w >> 16;
-	dcp->pending_h = new->src_h >> 16;
+	dcp->pending_w = drm_rect_width(&full);
+	dcp->pending_h = drm_rect_height(&full);
 	dcp->pending_pitch = pitch;
 	if (dcp->pending < 0) {
 		dcp->pending = back;
@@ -581,11 +666,11 @@ static int dcpib_set_mode_locked(struct dcpib *dcp,
 	for (unsigned int i = 0; i < DCPIB_SCANOUT_BUFS; i++)
 		dcp->stale[i] = DRM_RECT_INIT(0, 0, INT_MAX / 2, INT_MAX / 2);
 	/* A pending frame has the old geometry. */
-	dcp->pending = -1;
+	dcpib_cancel_swap_locked(dcp);
 	/* As aura swaps after a modeset. */
 	ret = dcpib_ib_set_surface(dcp, dcp->scan_dva[dcp->front], le32_to_cpu(t->width),
 				   le32_to_cpu(t->height),
-				   le32_to_cpu(t->width) * 4);
+				   ALIGN(le32_to_cpu(t->width) * 4, 64));
 	if (ret)
 		dev_err(dcp->dev, "set_surface failed: %d\n", ret);
 	return ret;
@@ -656,19 +741,27 @@ static void dcpib_crtc_atomic_enable(struct drm_crtc *crtc,
 	c = dcpib_find_color(dcp);
 	if (!t || !c)
 		goto out;
+	dcp->enabled = true;
 	if (!dcp->powered) {
 		/* The phy starts cold first; the firmware then trains. */
 		ret = dcp->phy->activate(dcp);
-		if (ret)
+		if (ret) {
 			dev_err(dcp->dev, "phy activation failed: %d\n", ret);
+			goto out;
+		}
 		/* A pipe powered on without a surface fetches from a null base. */
-		ret = dcpib_ib_set_surface(dcp, dcp->scan_dva[dcp->front], dcp->boot_w,
-					   dcp->boot_h, dcp->boot_stride);
-		if (ret)
+		ret = dcpib_ib_set_surface(dcp, dcp->scan_dva[dcp->front],
+					   le32_to_cpu(t->width), le32_to_cpu(t->height),
+					   ALIGN(le32_to_cpu(t->width) * 4, 64));
+		if (ret) {
 			dev_err(dcp->dev, "set_surface failed: %d\n", ret);
+			goto out;
+		}
 		ret = dcpib_ib_set_power(dcp, true);
-		if (ret)
+		if (ret) {
 			dev_err(dcp->dev, "set_power failed: %d\n", ret);
+			goto out;
+		}
 		dcp->powered = !ret;
 	}
 	if (dcp->mode_set && !memcmp(t, &dcp->cur_mode, sizeof(*t)))
@@ -712,6 +805,8 @@ static void dcpib_crtc_atomic_disable(struct drm_crtc *crtc,
 	 * monitor goes to sleep. The next enable sets the mode again.
 	 */
 	mutex_lock(&dcp->lock);
+	dcp->enabled = false;
+	dcpib_cancel_swap_locked(dcp);
 	if (dcp->powered) {
 		ret = dcpib_ib_set_power(dcp, false);
 		if (ret) {
@@ -765,16 +860,43 @@ static void dcpib_pd_reset_work(struct work_struct *work)
 	int ret;
 
 	dev_info(dcp->dev, "USB-C sink does not answer, entering DP alt mode again\n");
+	/* The reset may finish between polls. Release the old link explicitly. */
+	mutex_lock(&dcp->lock);
+	dcpib_cancel_swap_locked(dcp);
+	ret = dcpib_dptx_disconnect(dcp, 0);
+	if (!ret)
+		ret = dcpib_ib_set_power(dcp, false);
+	if (!ret) {
+		dcp->powered = false;
+		dcp->mode_set = false;
+		ret = dcp->phy->deactivate(dcp);
+	}
+	if (ret) {
+		mutex_unlock(&dcp->lock);
+		dev_err(dcp->dev, "cannot release old DP link: %d\n", ret);
+		return;
+	}
+	dcp->hpd = 0;
 	ret = dcpib_pd_reconnect(dcp);
+	mutex_unlock(&dcp->lock);
 	if (ret) {
 		dev_err(dcp->dev, "DP alt mode entry failed: %d\n", ret);
 		return;
 	}
-	/* The controller unplugged and plugged: run the plug path. */
-	mutex_lock(&dcp->lock);
-	dcp->hpd = 0;
-	mutex_unlock(&dcp->lock);
 	drm_kms_helper_hotplug_event(&dcp->drm);
+}
+
+static void dcpib_hpd_work(struct work_struct *work)
+{
+	struct dcpib *dcp = container_of(to_delayed_work(work), struct dcpib,
+					 hpd_work);
+
+	if (!READ_ONCE(dcp->ready))
+		return;
+	drm_helper_hpd_irq_event(&dcp->drm);
+	if (READ_ONCE(dcp->ready))
+		queue_delayed_work(system_freezable_wq, &dcp->hpd_work,
+				   msecs_to_jiffies(250));
 }
 
 void dcpib_kms_stop(struct dcpib *dcp)
@@ -782,6 +904,7 @@ void dcpib_kms_stop(struct dcpib *dcp)
 	if (!dcp->kms_work_ready)
 		return;
 
+	cancel_delayed_work_sync(&dcp->hpd_work);
 	hrtimer_cancel(&dcp->swap_timer);
 	cancel_work_sync(&dcp->swap_work);
 	cancel_work_sync(&dcp->pd_reset_work);
@@ -795,12 +918,13 @@ static void dcpib_swap_stop(void *data)
 int dcpib_kms_init(struct dcpib *dcp)
 {
 	struct drm_device *drm = &dcp->drm;
-	u32 max_w = 1920, max_h = 1080;
+	u32 max_w = 3840, max_h = 2160;
 	int ret;
 
 	dcp->pending = -1;
 	INIT_WORK(&dcp->swap_work, dcpib_swap_work);
 	INIT_WORK(&dcp->pd_reset_work, dcpib_pd_reset_work);
+	INIT_DELAYED_WORK(&dcp->hpd_work, dcpib_hpd_work);
 	hrtimer_setup(&dcp->swap_timer, dcpib_swap_timer, CLOCK_MONOTONIC,
 		      HRTIMER_MODE_ABS);
 	dcp->kms_work_ready = true;
@@ -855,6 +979,8 @@ int dcpib_kms_init(struct dcpib *dcp)
 	if (dcp->hpd_gpio || dcp->pd)
 		dcp->connector.polled = DRM_CONNECTOR_POLL_CONNECT |
 					DRM_CONNECTOR_POLL_DISCONNECT;
+	if (dcp->pd)
+		dcp->connector.polled = DRM_CONNECTOR_POLL_HPD;
 	ret = drm_connector_attach_encoder(&dcp->connector, &dcp->encoder);
 	if (ret)
 		return ret;

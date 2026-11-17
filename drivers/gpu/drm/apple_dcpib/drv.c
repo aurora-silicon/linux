@@ -2,8 +2,9 @@
 /*
  * Apple T8152 DCP on the iBoot interface: probe and bring-up.
  *
- * The bootloader (aura) trains the display and hands the DCP over with its
- * RTKit session running. This driver adopts that session, starts the iBoot,
+ * The bootloader (aura) leaves a successful display's RTKit session running,
+ * or quiesces it after a failed setup. This driver adopts or wakes that
+ * session, starts the iBoot,
  * DPAV and DPTX port endpoints, reconnects the DPTX port and asserts HPD,
  * then registers a DRM device whose flips are iBoot SET_SURFACE calls, in
  * the order aura's display_init_t8152 uses.
@@ -101,11 +102,21 @@ static void dcpib_rtk_shmem_destroy(void *cookie, struct apple_rtkit_shmem *bfr)
 		dma_free_coherent(dcp->dev, bfr->size, bfr->buffer, bfr->iova);
 }
 
+static bool dcpib_rtk_syslog_debug(void *cookie, const char *context,
+				 const char *message)
+{
+	/* Surface logging through fbcon would itself submit another surface. */
+	return strstr(message, "setSurfaceRequest") ||
+	       strstr(message, "swap_submit_dcp") ||
+	       strstr(message, "validateRequest: inSize");
+}
+
 static const struct apple_rtkit_ops dcpib_rtkit_ops = {
 	.crashed = dcpib_rtk_crashed,
 	.recv_message = dcpib_rtk_recv,
 	.shmem_setup = dcpib_rtk_shmem_setup,
 	.shmem_destroy = dcpib_rtk_shmem_destroy,
+	.syslog_is_debug = dcpib_rtk_syslog_debug,
 };
 
 DEFINE_DRM_GEM_DMA_FOPS(dcpib_fops);
@@ -125,16 +136,85 @@ static const struct drm_driver dcpib_drm_driver = {
 	.fops = &dcpib_fops,
 };
 
-/*
- * Adopt the bootloader's RTKit session. The T8152 DCP does not acknowledge
- * AP QUIESCED, so a quiesced handoff cannot be negotiated, and an IOP INIT
- * while its AP power is still ON panics the firmware ("Invalid AP power:
- * 32"). Keep the running session instead and start the application
- * endpoints explicitly (dcpib_ep_start), as drm/apple does for live M5
- * sessions.
- */
+static bool dcpib_handoff_quiesced(struct dcpib *dcp)
+{
+	struct device_node *chosen __free(device_node) = of_find_node_by_path("/chosen");
+	const char *version;
+	u32 running;
+
+	if (dcp->hdmi || !chosen)
+		return false;
+	/* Despite its name, the loader property is one for a running core. */
+	if (!of_property_read_u32(chosen, "apple,dcp-rtkit-quiesced", &running))
+		return running == 0;
+	/*
+	 * This older J873 loader predates the state property. Its failed
+	 * display setup quiesces DCP and keeps iBoot's placeholder framebuffer;
+	 * a successful setup hands over ON. Restrict this fallback to the
+	 * verified loader build, rather than guessing for other handoffs.
+	 */
+	if (of_property_read_string(chosen, "asahi,m1n1-stage2-version", &version) ||
+	    strcmp(version, "v0.1.0-259-ga30a589a"))
+		return false;
+	for_each_child_of_node_scoped(chosen, np) {
+		u32 width, height;
+
+		if (of_device_is_compatible(np, "simple-framebuffer") &&
+		    !of_property_read_u32(np, "width", &width) &&
+		    !of_property_read_u32(np, "height", &height))
+			return width == 640 && height == 1136;
+	}
+	return false;
+}
+
+/* The unused DCPEXT firmware is loaded and powered by iBoot. */
+static int dcpib_check_wake(struct dcpib *dcp)
+{
+	struct platform_device *pdev = to_platform_device(dcp->dev);
+	struct resource *res;
+	void __iomem *psd, *coproc;
+
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "coproc-psd");
+	if (!res)
+		return -EINVAL;
+	psd = devm_ioremap(dcp->dev, res->start, resource_size(res));
+	if (!psd)
+		return -ENOMEM;
+	/* A read from the coprocessor while gated hangs the machine. */
+	if (readl(psd + 0x80) & 7)
+		return -ENODEV;
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "coproc");
+	if (!res)
+		return -EINVAL;
+	coproc = devm_ioremap(dcp->dev, res->start, resource_size(res));
+	if (!coproc)
+		return -ENOMEM;
+	dev_info(dcp->dev, "firmware handoff: CPU control %#x status %#x\n",
+		 readl(coproc + 0x44), readl(coproc + 0x48));
+	return (readl(coproc + 0x44) & BIT(4)) ? 0 : -ENODEV;
+}
+
+/* Wake only a quiesced session: IOP INIT on a running DCP can panic it. */
 static int dcpib_boot(struct dcpib *dcp)
 {
+	if ((!dcp->hdmi &&
+	     of_property_read_bool(dcp->dev->of_node, "apple,rtkit-wake")) ||
+	    dcpib_handoff_quiesced(dcp)) {
+		int ret;
+
+		if (of_property_read_bool(dcp->dev->of_node, "apple,rtkit-wake")) {
+			ret = dcpib_check_wake(dcp);
+			if (ret)
+				return ret;
+		}
+		dcp->rtk = apple_rtkit_init(dcp->dev, dcp, NULL, 0,
+					  &dcpib_rtkit_ops);
+		if (IS_ERR(dcp->rtk))
+			return PTR_ERR(dcp->rtk);
+		ret = apple_rtkit_wake(dcp->rtk);
+		dev_info(dcp->dev, "quiesced DCP wake: %d\n", ret);
+		return ret;
+	}
 	dcp->rtk = apple_rtkit_init_adopted(dcp->dev, dcp, NULL, 0,
 					    &dcpib_rtkit_ops);
 	if (IS_ERR(dcp->rtk))
@@ -283,7 +363,7 @@ static int dcpib_boot_surface(struct dcpib *dcp)
 	struct device_node *chosen __free(device_node) =
 		of_find_node_by_path("/chosen");
 	struct device_node *parent __free(device_node) =
-		of_property_read_bool(dcp->dev->of_node, "apple,hdmi") ?
+		dcp->dp_source ?
 		of_find_node_by_path("/") : of_node_get(chosen);
 	u32 width = 1280, height = 720, stride = 1280 * 4;
 	int ret;
@@ -313,7 +393,8 @@ static int dcpib_boot_surface(struct dcpib *dcp)
 	 * Large enough for the largest mode: while a SET_MODE switches, the
 	 * pipe briefly scans the current surface with the new mode's size.
 	 */
-	size_t size = (size_t)stride * height;
+	/* A monitor may first appear after probe, with a larger mode list. */
+	size_t size = max_t(size_t, (size_t)stride * height, 3840 * 2160 * 4);
 
 	for (unsigned int i = 0; i < dcp->nr_tmodes; i++)
 		size = max_t(size_t, size, (size_t)le32_to_cpu(dcp->tmodes[i].width) *
@@ -372,13 +453,15 @@ static int dcpib_probe_inner(struct platform_device *pdev)
 	int source = hdmi_np ? dcpib_hdmi_source(hdmi_np) : -ENODEV;
 	struct dcpib *dcp;
 	u32 inherited_afk_endpoints;
+	bool sink = true;
 	int ret;
 
 	/*
 	 * Without a USB-C display the bootloader drives HDMI from the main DCP
 	 * (source 0) and never starts DCPEXT0.
 	 */
-	if (dev->of_node == hdmi_np && source != 1) {
+	if (dev->of_node == hdmi_np && source != 1 &&
+	    !of_property_present(dev->of_node, "apple,usb-c-ports")) {
 		dev_info(dev, "%s\n", source == 0 ? "HDMI is on the main DCP" :
 			 "no bootloader HDMI link to adopt");
 		return -ENODEV;
@@ -398,6 +481,10 @@ static int dcpib_probe_inner(struct platform_device *pdev)
 	if (IS_ERR(dcp))
 		return PTR_ERR(dcp);
 	dcp->dev = dev;
+	dcp->dp_source = dev->of_node == hdmi_np ? 1 : 0;
+	of_property_read_u32(dev->of_node, "apple,dp-source", &dcp->dp_source);
+	if (dcp->dp_source > 2)
+		return -EINVAL;
 	dcp->inherited_afk_endpoints = inherited_afk_endpoints;
 	platform_set_drvdata(pdev, dcp);
 	mutex_init(&dcp->lock);
@@ -413,18 +500,18 @@ static int dcpib_probe_inner(struct platform_device *pdev)
 	if (ret)
 		return dev_err_probe(dev, ret, "no scanout DART stream\n");
 
-	dcp->hdmi = dev->of_node == hdmi_np || source == 0;
+	dcp->hdmi = source >= 0 && source == dcp->dp_source;
 	if (dcp->hdmi && dev->of_node != hdmi_np)
 		dev_info(dev, "HDMI from the main DCP (no USB-C display at boot)\n");
 	/* Read only: the pin belongs to a controller the AOP runs. */
-	dcp->hpd_gpio = devm_fwnode_gpiod_get(dev,
-		of_fwnode_handle(dcp->hdmi ? hdmi_np : dev->of_node), "hpd",
-		GPIOD_ASIS, "hpd");
+	dcp->hpd_gpio = dcp->hdmi ?
+		devm_fwnode_gpiod_get(dev, of_fwnode_handle(hdmi_np), "hpd",
+				       GPIOD_ASIS, "hpd") : NULL;
 	if (PTR_ERR(dcp->hpd_gpio) == -ENOENT)
 		dcp->hpd_gpio = NULL;
 	if (IS_ERR(dcp->hpd_gpio))
 		return dev_err_probe(dev, PTR_ERR(dcp->hpd_gpio), "no HPD GPIO\n");
-	dcp->hpd = 1;
+	dcp->hpd = 0;
 	ret = dcp->hdmi ? dcpib_hdmi_init(dcp, hdmi_np) : dcpib_atc_init(dcp);
 	if (ret)
 		return dev_err_probe(dev, ret, "no DisplayPort phy\n");
@@ -451,23 +538,41 @@ static int dcpib_probe_inner(struct platform_device *pdev)
 	ret = dcpib_dptx_init(dcp);
 	if (ret)
 		return dev_err_probe(dev, ret, "no DPTX port service\n");
+	if (dcp->pd) {
+		ret = dcpib_dptx_disconnect(dcp, 0);
+		if (ret)
+			return dev_err_probe(dev, ret, "cannot release inherited DP link\n");
+	}
 
-	ret = dcpib_dptx_connect(dcp, 0);
-	if (ret)
-		return dev_err_probe(dev, ret, "DPTX connect failed\n");
-	ret = dcpib_dptx_set_hpd(dcp, 0, true);
-	if (ret)
-		return dev_err_probe(dev, ret, "DPTX hotplug failed\n");
-
-	ret = dcpib_wait_hpd(dcp);
-	if (ret)
-		return ret;
-	ret = dcpib_ib_get_modes(dcp);
-	if (ret)
-		return dev_err_probe(dev, ret, "no modes\n");
+	/*
+	 * USB-C negotiation can outlive probe or fail while a monitor sleeps.
+	 * Register the connector first; the hotplug path owns all USB-C links.
+	 */
+	if (dcp->pd)
+		sink = false;
+	if (sink) {
+		ret = dcpib_dptx_connect(dcp, 0);
+		if (ret)
+			return dev_err_probe(dev, ret, "DPTX connect failed\n");
+		ret = dcpib_dptx_set_hpd(dcp, 0, true);
+		if (ret)
+			return dev_err_probe(dev, ret, "DPTX hotplug failed\n");
+		ret = dcpib_wait_hpd(dcp);
+		if (ret)
+			return ret;
+		ret = dcpib_ib_get_modes(dcp);
+		if (ret)
+			return dev_err_probe(dev, ret, "no modes\n");
+	}
 	ret = dcpib_boot_surface(dcp);
 	if (ret)
 		return dev_err_probe(dev, ret, "no boot surface\n");
+	/* Keep an idle connector registered while the PD controller negotiates. */
+	if (!sink) {
+		dev_info(dev, "waiting for a USB-C display\n");
+		goto register_kms;
+	}
+	dcp->hpd = 1;
 	/*
 	 * Without the bootloader's link (no display on the port at boot) the
 	 * phy starts cold, the right way round for the plug.
@@ -493,18 +598,24 @@ static int dcpib_probe_inner(struct platform_device *pdev)
 	dev_info(dev, "%u timing modes, %u color modes\n", dcp->nr_tmodes,
 		 dcp->nr_cmodes);
 
+register_kms:
 	ret = dcpib_kms_init(dcp);
 	if (ret)
 		return ret;
-	ret = dcpib_set_boot_mode(dcp);
-	if (ret)
-		dev_warn(dev, "boot mode not set again: %d\n", ret);
+	if (sink) {
+		ret = dcpib_set_boot_mode(dcp);
+		if (ret)
+			dev_warn(dev, "boot mode not set again: %d\n", ret);
+	}
 	ret = drm_dev_register(&dcp->drm, 0);
 	if (ret)
 		return ret;
 	WRITE_ONCE(dcp->ready, true);
 	if (dcp->hpd_gpio || dcp->pd)
 		drmm_kms_helper_poll_init(&dcp->drm);
+	if (dcp->pd)
+		queue_delayed_work(system_freezable_wq, &dcp->hpd_work,
+				   msecs_to_jiffies(250));
 	drm_client_setup(&dcp->drm, NULL);
 	return 0;
 }

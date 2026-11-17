@@ -5,10 +5,10 @@
  *
  * The bootloader trains the USB-C display before Linux starts; this driver
  * takes that link over and then follows the firmware: link rate changes
- * (stop and set up the lanes again), drive settings, the DCP0 -> ATCn/DFP0
+ * (stop and set up the lanes again), drive settings, the DCP -> ATCn/DFP0
  * display crossbar route, and with the display off or unplugged a full
  * power down and a cold start. The DCP drives one USB-C port at a time:
- * the one a sink is plugged into (each port's PD controller is polled).
+ * the one it claims from the shared ports while polling their PD controllers.
  */
 
 #include <linux/bits.h>
@@ -41,12 +41,13 @@ struct dcpib_atc_port {
 	/* {offset, mask, value} tunables from the ADT, before/after xbar config */
 	const __be32 *tunable[2];
 	int tunable_len[2];
-	/* PMGR DP clock control (shared): the divider selects the link rate */
+	/* This ATC's PMGR DP clock divider selects the link rate. */
 	void __iomem *dp_clock;
 	bool swap;
 	bool active;
 	bool route_started;
 	u32 link_rate;
+	u32 lanes, next_lanes;
 };
 
 struct dcpib_atc {
@@ -57,6 +58,12 @@ struct dcpib_atc {
 	struct dcpib_atc_port *cur, *next;
 };
 
+/* J873 has one display crossbar. Claims outlive firmware PHY power cycles. */
+static DEFINE_MUTEX(atc_owner_lock);
+static struct device *atc_owner[4];
+/* All three DCPs borrow the same AP AUX controller for EDID reads. */
+static DEFINE_MUTEX(atc_aux_lock);
+
 static struct dcpib_atc_port *atc_cur(struct dcpib *dcp)
 {
 	return ((struct dcpib_atc *)dcp->phy_priv)->cur;
@@ -66,6 +73,20 @@ static const u32 atc_rates[] = {
 	DCPIB_LINK_RATE_RBR, DCPIB_LINK_RATE_HBR, DCPIB_LINK_RATE_HBR2,
 	DCPIB_LINK_RATE_HBR3,
 };
+
+static bool atc_dp_pma(struct dcpib_atc_port *atc, u32 pma)
+{
+	return atc->lanes == 4 || pma == !atc->swap;
+}
+
+static bool atc_dp_register(struct dcpib_atc_port *atc, u32 offset)
+{
+	if (offset >= 0x3000 && offset < 0xc000)
+		return atc_dp_pma(atc, 0);
+	if (offset >= 0xc000 && offset < 0x15000)
+		return atc_dp_pma(atc, 1);
+	return true;
+}
 
 static void atc_update(struct dcpib_atc_port *atc, u32 offset, u32 mask, u32 value)
 {
@@ -84,11 +105,14 @@ static int atc_poll(struct dcpib_atc_port *atc, u32 offset, u32 mask, u32 value)
 
 static int atc_route_stop(struct dcpib *dcp, struct dcpib_atc_port *atc)
 {
+	u32 ufp = dcp->dp_source * 2;
+	u32 mask = BIT(ufp);
+
 	if (!atc->route_started)
 		return 0;
-	atc_update(atc, ATC_XBAR + 0x3c, 1, 0);
-	atc_update(atc, ATC_XBAR, 1, 0);
-	atc_update(atc, ATC_XBAR + 0xc, 1, 0);
+	atc_update(atc, ATC_XBAR + 0x3c, mask, 0);
+	atc_update(atc, ATC_XBAR, mask, 0);
+	atc_update(atc, ATC_XBAR + 0xc, mask, 0);
 	atc_update(atc, ATC_XBAR + 0x24, 0x100, 0);
 	udelay(1);
 	/*
@@ -96,15 +120,15 @@ static int atc_route_stop(struct dcpib *dcp, struct dcpib_atc_port *atc)
 	 * that way) nothing acknowledges the stop; the route is idle then, so
 	 * finish it anyway.
 	 */
-	if (atc_poll(atc, ATC_XBAR + 0x800, 1, 0) ||
-	    atc_poll(atc, ATC_XBAR + 0x808, 1, 0) ||
+	if (atc_poll(atc, ATC_XBAR + 0x800, mask, 0) ||
+	    atc_poll(atc, ATC_XBAR + 0x808, mask, 0) ||
 	    atc_poll(atc, ATC_XBAR + 0x81c, 0x100, 0))
 		dev_info(dcp->dev, "ATC%u: no crossbar stop acknowledgment\n", atc->index);
-	atc_update(atc, ATC_XBAR + 8, 1, 0);
-	atc_update(atc, ATC_XBAR + 0x20, 7, 0);
+	atc_update(atc, ATC_XBAR + 8, mask, 0);
+	atc_update(atc, ATC_XBAR + 0x20, 7 << (3 * ufp), 0);
 	atc_update(atc, ATC_XBAR + 0x38, 0x700, 0);
-	atc_update(atc, ATC_XBAR + 4, 1, 1);
-	atc_update(atc, ATC_XBAR + 0x1c, 1, 1);
+	atc_update(atc, ATC_XBAR + 4, mask, mask);
+	atc_update(atc, ATC_XBAR + 0x1c, mask, mask);
 	atc_update(atc, ATC_XBAR + 0x34, 0x100, 0x100);
 	atc->route_started = false;
 	dev_dbg(dcp->dev, "ATC%u: display route disabled\n", atc->index);
@@ -113,37 +137,41 @@ static int atc_route_stop(struct dcpib *dcp, struct dcpib_atc_port *atc)
 
 /*
  * A source -> ATCn/DFP0 route, PCLK1: both DFP0 mux fields select the
- * source (AppleT8142ATCDPXBAR::connect): DCP0 or an AP AUX controller.
+ * source (AppleT8142ATCDPXBAR::connect). Upstream reset, clock and enable
+ * fields are indexed by DCP endpoint * 2 + DPTX port, independently of
+ * the downstream DFP0 fields. AUX borrowing keeps that DCP's clock path.
  */
-#define ATC_SEL_DCP0	0
 #define ATC_SEL_AUX0	9	/* UFP endpoint 5 + 4 (getMuxSelector) */
 
 static int atc_route_start_sel(struct dcpib *dcp, struct dcpib_atc_port *atc,
 			       u32 sel)
 {
+	u32 ufp = dcp->dp_source * 2;
+	u32 mask = BIT(ufp);
+
 	if (atc->route_started)
 		return 0;
 	atc_update(atc, ATC_XBAR + 0x44, 0x00f00000, sel << 20);
 	atc_update(atc, ATC_XBAR + 0x44, 0x00000f00, sel << 8);
-	atc_update(atc, ATC_XBAR + 4, 1, 0);
-	atc_update(atc, ATC_XBAR + 0x1c, 1, 0);
+	atc_update(atc, ATC_XBAR + 4, mask, 0);
+	atc_update(atc, ATC_XBAR + 0x1c, mask, 0);
 	atc_update(atc, ATC_XBAR + 0x34, 0x100, 0);
 	udelay(1);
-	if (atc_poll(atc, ATC_XBAR + 0x804, 1, 0) ||
-	    atc_poll(atc, ATC_XBAR + 0x818, 1, 0) ||
+	if (atc_poll(atc, ATC_XBAR + 0x804, mask, 0) ||
+	    atc_poll(atc, ATC_XBAR + 0x818, mask, 0) ||
 	    atc_poll(atc, ATC_XBAR + 0x82c, 0x100, 0)) {
 		dev_err(dcp->dev, "ATC%u: crossbar reset acknowledgment timeout\n", atc->index);
 		return -ETIMEDOUT;
 	}
-	atc_update(atc, ATC_XBAR + 8, 1, 1);
-	atc_update(atc, ATC_XBAR + 0x20, 7, 1);
+	atc_update(atc, ATC_XBAR + 8, mask, mask);
+	atc_update(atc, ATC_XBAR + 0x20, 7 << (3 * ufp), 1 << (3 * ufp));
 	atc_update(atc, ATC_XBAR + 0x38, 0x700, 0x100);
 	atc_update(atc, ATC_XBAR + 0x48, 1, 0);
-	atc_update(atc, ATC_XBAR, 1, 1);
-	atc_update(atc, ATC_XBAR + 0xc, 1, 1);
+	atc_update(atc, ATC_XBAR, mask, mask);
+	atc_update(atc, ATC_XBAR + 0xc, mask, mask);
 	atc_update(atc, ATC_XBAR + 0x24, 0x100, 0x100);
 	atc_update(atc, ATC_XBAR + 0x4c, 0x100, 0x100);
-	atc_update(atc, ATC_XBAR + 0x3c, 1, 1);
+	atc_update(atc, ATC_XBAR + 0x3c, mask, mask);
 	atc->route_started = true;
 	dev_dbg(dcp->dev, "ATC%u: source %u to local DFP0 route configured\n", atc->index, sel);
 	return 0;
@@ -151,7 +179,7 @@ static int atc_route_start_sel(struct dcpib *dcp, struct dcpib_atc_port *atc,
 
 static int atc_route_start(struct dcpib *dcp, struct dcpib_atc_port *atc)
 {
-	return atc_route_start_sel(dcp, atc, ATC_SEL_DCP0);
+	return atc_route_start_sel(dcp, atc, dcp->dp_source * 2);
 }
 
 /* Common four-lane setup; the rate-dependent fields follow in atc_dp_start. */
@@ -225,9 +253,14 @@ static int atc_dp_stop(struct dcpib *dcp, struct dcpib_atc_port *atc)
 	atc_update(atc, 0xe10, BIT(2), BIT(2));
 	atc_update(atc, 0xe08, BIT(29), BIT(29));
 	/* Remove both PMA clock requests, then clamp and power down both lanes. */
-	atc_update(atc, ATC_AON + 0x24, BIT(12) | BIT(16) | BIT(14) | BIT(18), 0);
-	udelay(1);
 	for (u32 offset = 0x1e18; offset <= 0x1e1c; offset += 4) {
+		u32 pma = (offset - 0x1e18) / 4;
+
+		if (!atc_dp_pma(atc, pma))
+			continue;
+		atc_update(atc, ATC_AON + 0x24,
+			   BIT(12 + 2 * pma) | BIT(16 + 2 * pma), 0);
+		udelay(1);
 		atc_update(atc, offset, BIT(5), 0);
 		udelay(1);
 		atc_update(atc, offset, BIT(0), BIT(0));
@@ -259,6 +292,8 @@ static int atc_dp_start(struct dcpib *dcp, struct dcpib_atc_port *atc, u32 r)
 	for (u32 i = 0; i < 2; i++) {
 		u32 offset = 0x1e18 + 4 * i;
 
+		if (!atc_dp_pma(atc, i))
+			continue;
 		atc_update(atc, ATC_AON + 0x24, BIT(12 + 2 * i), BIT(12 + 2 * i));
 		udelay(1);
 		atc_update(atc, ATC_AON + 0x24, BIT(16 + 2 * i), BIT(16 + 2 * i));
@@ -274,13 +309,18 @@ static int atc_dp_start(struct dcpib *dcp, struct dcpib_atc_port *atc, u32 r)
 	}
 	atc_update(atc, 0x2000, 0x380000, r << 19);
 	for (unsigned int i = 0; i < ARRAY_SIZE(atc_dp_setup); i++)
-		atc_update(atc, atc_dp_setup[i].offset, atc_dp_setup[i].mask,
-			   atc_dp_setup[i].value);
+		if (atc_dp_register(atc, atc_dp_setup[i].offset))
+			atc_update(atc, atc_dp_setup[i].offset, atc_dp_setup[i].mask,
+				   atc_dp_setup[i].value);
 	for (u32 i = 0; i < 2; i++) {
+		if (!atc_dp_pma(atc, i))
+			continue;
 		atc_update(atc, 0x8684 + i * 0x9000, 3, r ? 0 : 1);
 		atc_update(atc, 0x4c80 + i * 0x9000, 0x30, r ? 0 : 0x10);
 	}
 	for (unsigned int i = 0; i < ARRAY_SIZE(tx_ctrl); i++) {
+		if (!atc_dp_register(atc, tx_ctrl[i]))
+			continue;
 		atc_update(atc, tx_ctrl[i], 0x7e07ff, 1);
 		atc_update(atc, tx_ctrl[i] - 0x14, 0x7f, r < 2 ? 0x65 : 0x40);
 	}
@@ -301,8 +341,8 @@ static int atc_dp_start(struct dcpib *dcp, struct dcpib_atc_port *atc, u32 r)
 	if (ret)
 		return ret;
 	atc->link_rate = atc_rates[r];
-	dev_info(dcp->dev, "ATC%u: four-lane DPTX setup at rate %#x\n", atc->index,
-		 atc->link_rate);
+	dev_info(dcp->dev, "ATC%u: %u-lane DPTX setup at rate %#x\n", atc->index,
+		 atc->lanes, atc->link_rate);
 	return 0;
 }
 
@@ -371,6 +411,8 @@ static int atc_activate(struct dcpib *dcp)
 	unsigned int gates = 0;
 	u32 reg;
 
+	if (READ_ONCE(atc_owner[atc->index]) != dcp->dev)
+		return -EBUSY;
 	if (atc->active)
 		return 0;
 	if (!atc->tunable[0] || !atc->tunable[1])
@@ -393,9 +435,11 @@ static int atc_activate(struct dcpib *dcp)
 	writel(readl(cfg) | BIT(3), cfg);
 
 	atc_apply_tunables(atc, 0);
-	/* aciophy_xbar_config(mode=3): both PMAs carry DisplayPort. */
-	atc_update(atc, 0x4c, 0x1f, 0x14);
-	atc_update(atc, 0x4c, 0x3ffe0, atc->swap ? 0x100 : 0x22000);
+	/* Pin D/F keeps the other PMA out of the DP path. */
+	atc_update(atc, 0x4c, 0x1f,
+		   atc->lanes == 2 ? (atc->swap ? 0x11 : 0x10) : 0x14);
+	atc_update(atc, 0x4c, 0x3ffe0,
+		   atc->lanes == 2 || atc->swap ? 0x100 : 0x22000);
 	atc_apply_tunables(atc, 1);
 	atc_update(atc, ATC_CFG + 8, BIT(1), atc->swap ? BIT(1) : 0);
 	writel(readl(cfg) | BIT(4), cfg);
@@ -527,7 +571,7 @@ static int atc_set_drive(struct dcpib *dcp,
 
 	if (!count)
 		return 0;
-	if (count > 4 || !atc->active || !atc->link_rate)
+	if (count > atc->lanes || !atc->active || !atc->link_rate)
 		return -EINVAL;
 	/* Validate the entire request before changing any lane. */
 	for (u32 i = 0; i < count; i++) {
@@ -560,6 +604,12 @@ static void atc_set_orientation(struct dcpib *dcp, bool flipped)
 	if (atc->active && atc->swap != flipped)
 		dev_warn(dcp->dev, "ATC%u: orientation changed while active\n", atc->index);
 	atc->swap = flipped;
+	atc->lanes = atc->next_lanes;
+}
+
+static u32 atc_max_lane_count(struct dcpib *dcp)
+{
+	return atc_cur(dcp)->lanes;
 }
 
 /*
@@ -576,9 +626,12 @@ static int atc_read_edid(struct dcpib *dcp, u8 *buf, size_t size)
 
 	if (!atc->active || !atc->aux->regs)
 		return -ENODEV;
+	mutex_lock(&atc_aux_lock);
+	/* AppleAUXDPTX::getAuxSelValue: ATC instance * 3 + local DFP. */
+	atc->aux->sel = atc->index * 3;
 	ret = dcpib_aux_init(dcp, atc->aux);
 	if (ret)
-		return ret;
+		goto out;
 	atc_route_stop(dcp, atc);
 	ret = atc_route_start_sel(dcp, atc, ATC_SEL_AUX0);
 	if (!ret)
@@ -586,6 +639,8 @@ static int atc_read_edid(struct dcpib *dcp, u8 *buf, size_t size)
 	atc_route_stop(dcp, atc);
 	if (was_started)
 		atc_route_start(dcp, atc);
+out:
+	mutex_unlock(&atc_aux_lock);
 	return ret;
 }
 
@@ -596,22 +651,37 @@ static int atc_read_edid(struct dcpib *dcp, u8 *buf, size_t size)
 static int atc_detect(struct dcpib *dcp, bool *flipped)
 {
 	struct dcpib_atc *atc = dcp->phy_priv;
-	int ret = dcpib_pd_sink(atc->cur->pd, flipped);
+	int ret = 0;
 
+	mutex_lock(&atc_owner_lock);
 	atc->next = atc->cur;
-	if (ret)
-		return ret;
+	/* Keep a monitor on its controller, including while userspace blanks it. */
+	if (atc_owner[atc->cur->index] == dcp->dev) {
+		ret = dcpib_pd_sink(atc->cur->pd, flipped, &atc->cur->next_lanes);
+		if (ret > 0 && (atc->cur->swap != *flipped ||
+				atc->cur->lanes != atc->cur->next_lanes))
+			dcp->hpd = 0;
+		if (ret)
+			goto out;
+		/* Unplug powers down in KMS; release on the next poll. */
+		if (!atc->cur->active)
+			atc_owner[atc->cur->index] = NULL;
+	}
 	for (unsigned int i = 0; i < atc->nports; i++) {
 		struct dcpib_atc_port *port = &atc->port[i];
 
-		if (port == atc->cur || dcpib_pd_sink(port->pd, flipped) <= 0)
+		if (atc_owner[port->index] ||
+		    dcpib_pd_sink(port->pd, flipped, &port->next_lanes) <= 0)
 			continue;
+		atc_owner[port->index] = dcp->dev;
 		atc->next = port;
-		/* A plug the other port's HPD state does not show yet. */
 		dcp->hpd = 0;
-		return 1;
+		ret = 1;
+		break;
 	}
-	return 0;
+out:
+	mutex_unlock(&atc_owner_lock);
+	return ret;
 }
 
 /*
@@ -625,21 +695,24 @@ static void atc_select(struct dcpib *dcp)
 
 	if (!port || port == atc->cur)
 		return;
-	if (atc->cur->active)
-		atc_deactivate(dcp);
+	if (atc->cur->active && atc_deactivate(dcp))
+		return;
+	mutex_lock(&atc_owner_lock);
+	if (atc_owner[atc->cur->index] == dcp->dev)
+		atc_owner[atc->cur->index] = NULL;
+	mutex_unlock(&atc_owner_lock);
 	dev_info(dcp->dev, "USB-C display on ATC%u now, was ATC%u\n",
 		 port->index, atc->cur->index);
 	atc->cur = port;
 	dcp->pd = port->pd;
 	dcp->dcp_output = port->dfp;
-	if (dcpib_dptx_connect(dcp, 0))
-		dev_err(dcp->dev, "DPTX connect to ATC%u failed\n", port->index);
 }
 
 static const struct dcpib_phy_ops atc_ops = {
 	.activate = atc_activate,
 	.deactivate = atc_deactivate,
 	.set_link_rate = atc_set_link_rate,
+	.max_lane_count = atc_max_lane_count,
 	.set_drive = atc_set_drive,
 	.set_route = atc_set_route,
 	.set_orientation = atc_set_orientation,
@@ -648,12 +721,12 @@ static const struct dcpib_phy_ops atc_ops = {
 	.select = atc_select,
 	.max_link_rate = DCPIB_LINK_RATE_HBR2,
 	/*
-	 * Modes up to 1920x1080@60 and 1600x1200@60 (and 2560x1440@30) show,
-	 * 1920x1200@60 and anything faster stay black at HBR2 with no error:
-	 * the DCP's pixel clock on the ATC path tops out between 162 and
-	 * about 190 MHz with the firmware on its iBoot interface.
+	 * Keep the iBoot path within the tested active-pixel budget. This
+	 * permits 2560x1440@30 and 1920x1200@60; the latter is verified
+	 * through a USB-C to HDMI adapter at a 154 MHz pixel clock.
+	 * Higher-rate modes still need display-clock bring-up.
 	 */
-	.max_pixel_rate = 130000000,
+	.max_pixel_rate = 140000000,
 	/*
 	 * 720x480@60 and 720x576@50 (27 MHz) show, 640x480@60 (25.2 MHz)
 	 * stays black here while HDMI shows it.
@@ -691,7 +764,10 @@ static int atc_port_init(struct dcpib *dcp, struct dcpib_atc *atc,
 	port->dfp = 3;
 	of_property_read_u32(np, "apple,dfp-endpoint", &port->dfp);
 	port->index = port->dfp;
-	port->dp_clock = dp_clock;
+	port->lanes = port->next_lanes = 4;
+	if (port->index >= 4)
+		return -EINVAL;
+	port->dp_clock = dp_clock + port->index * 8;
 	port->aux = &atc->aux;
 	port->tunable[0] = of_get_property(np, "apple,tunable-pre",
 					   &port->tunable_len[0]);
@@ -710,12 +786,20 @@ static int atc_port_init(struct dcpib *dcp, struct dcpib_atc *atc,
 		dev_info(dcp->dev, "ATC%u: powered down\n", port->index);
 		return 0;
 	}
+	/* A different DCP may already be driving this port. */
+	if (atc_owner[port->index] ||
+	    ((readl(port->base + ATC_XBAR + 0x44) >> 20) & 0xf) !=
+							 dcp->dp_source * 2)
+		return 0;
 	/* Common block out of reset and AUX up, as aura's activation leaves it. */
 	cfg = readl(port->base + ATC_CFG);
 	port->active = (cfg & 0x1f) == 0x1b;
-	port->swap = (readl(port->base + 0x4c) & 0x3ffe0) == 0x100;
-	port->route_started = (readl(port->base + ATC_XBAR) & 1) &&
-			      (readl(port->base + ATC_XBAR + 0x3c) & 1);
+	if ((readl(port->base + 0x4c) & 0x1f) == 0x10 ||
+	    (readl(port->base + 0x4c) & 0x1f) == 0x11)
+		port->lanes = port->next_lanes = 2;
+	port->swap = !!(readl(port->base + ATC_CFG + 8) & BIT(1));
+	port->route_started = (readl(port->base + ATC_XBAR) & BIT(dcp->dp_source * 2)) &&
+		(readl(port->base + ATC_XBAR + 0x3c) & BIT(dcp->dp_source * 2));
 	r = (readl(port->base + 0x2000) >> 19) & 7;
 	if (port->active && (readl(port->base + 0x2040) & BIT(16)) &&
 	    r < ARRAY_SIZE(atc_rates))
@@ -732,21 +816,35 @@ static int atc_port_init(struct dcpib *dcp, struct dcpib_atc *atc,
 
 int dcpib_atc_init(struct dcpib *dcp)
 {
-	struct device_node *np = dcp->dev->of_node;
+	struct device_node *ports __free(device_node) =
+		of_parse_phandle(dcp->dev->of_node, "apple,usb-c-ports", 0);
+	struct device_node *np = ports ?: dcp->dev->of_node;
+	struct resource clock_res;
 	void __iomem *dp_clock;
 	struct dcpib_atc *atc;
-	bool flipped;
 	int ret;
 
 	atc = devm_kzalloc(dcp->dev, sizeof(*atc), GFP_KERNEL);
 	if (!atc)
 		return -ENOMEM;
-	dp_clock = atc_map(dcp, np, "dp-clock");
+	ret = of_property_match_string(np, "reg-names", "dp-clock");
+	if (ret < 0 || of_address_to_resource(np, ret, &clock_res))
+		return -EINVAL;
+	/* Older J873 DTs describe ATC3's divider alone; each ATC has its own. */
+	if (resource_size(&clock_res) == 4 && clock_res.start == 0x30002005cULL)
+		clock_res.start -= 3 * 8;
+	if (resource_size(&clock_res) < 28)
+		return -EINVAL;
+	dp_clock = devm_ioremap(dcp->dev, clock_res.start, resource_size(&clock_res));
 	if (!dp_clock)
 		return -ENOMEM;
-	/* AUX output select 9: the crossbar's UFP aux0 */
-	dcpib_aux_probe(dcp, &atc->aux, 9);
+	/* Shared AUX0 is serialized by atc_aux_lock. */
+	atc->aux.regs = atc_map(dcp, np, "aux");
+	atc->aux.ps = atc_map(dcp, np, "aux-ps");
+	if (!atc->aux.ps)
+		atc->aux.regs = NULL;
 
+	guard(mutex)(&atc_owner_lock);
 	/* One child per USB-C port, or the node itself for ATC3 alone. */
 	for_each_child_of_node_scoped(np, child) {
 		if (!of_property_present(child, "apple,dfp-endpoint"))
@@ -763,21 +861,15 @@ int dcpib_atc_init(struct dcpib *dcp)
 			return ret;
 	}
 
-	/* The bootloader's display port, else one with a sink, else the first. */
+	/* Only adopt a bootloader route belonging to this DCP. */
 	atc->cur = &atc->port[0];
 	for (unsigned int i = 0; i < atc->nports; i++) {
 		if (atc->port[i].active) {
 			atc->cur = &atc->port[i];
-			goto found;
-		}
-	}
-	for (unsigned int i = 0; i < atc->nports; i++) {
-		if (dcpib_pd_sink(atc->port[i].pd, &flipped) > 0) {
-			atc->cur = &atc->port[i];
+			atc_owner[atc->cur->index] = dcp->dev;
 			break;
 		}
 	}
-found:
 	atc->next = atc->cur;
 	dcp->phy = &atc_ops;
 	dcp->phy_priv = atc;

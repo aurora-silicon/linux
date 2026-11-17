@@ -162,6 +162,11 @@ static int dcpib_tx(struct dcpib_ep *ep, const void *data, size_t size)
 	int ret;
 
 	mutex_lock(&ep->tx_lock);
+	/* Do not publish more ring entries after a firmware crash. */
+	if (apple_rtkit_is_crashed(ep->dcp->rtk)) {
+		ret = -EIO;
+		goto out;
+	}
 	if (!rb->ready || size > rb->bufsz - sizeof(*qe)) {
 		ret = -EINVAL;
 		goto out;
