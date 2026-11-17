@@ -59,6 +59,11 @@
 
 #include "dma-iommu.h"
 
+#ifdef CONFIG_ARM64
+#include <asm/barrier.h>
+#include <asm/tlbflush.h>
+#endif
+
 #if IS_ENABLED(CONFIG_APPLE_DART_KUNIT_TEST)
 #include <kunit/static_stub.h>
 #endif
@@ -158,6 +163,17 @@
 #define DART_T8110_FLUSH_STALL_TIMEOUT 250000
 #define DART_T8110_FLUSH_STALL_POLL 10
 #define DART_T8110_TLB_CMD_STREAM       GENMASK(7, 0)
+
+/*
+ * T8152 Gen3 DARTs ignore TLB_CMD. A stream is invalidated through the SoC's
+ * shared TLBI aperture instead: a 16-byte command naming the DART's TLBI route
+ * and the stream, then a broadcast TLBI that the DART observes.
+ */
+#define DART_GEN3_TLBI_ROUTE_REG	0x4604
+#define DART_GEN3_TLBI_ROUTE_MASK	GENMASK(3, 0)
+#define DART_GEN3_TLBI_OP_SID		BIT_ULL(60)
+#define DART_GEN3_TLBI_ROUTE		GENMASK_ULL(59, 56)
+#define DART_GEN3_TLBI_SID		GENMASK_ULL(55, 48)
 
 #define DART_T8110_ERROR 0x100
 #define DART_T8110_ERROR_STREAM GENMASK(27, 20)
@@ -363,6 +379,9 @@ struct apple_dart {
 	void __iomem *gapf;
 	/* The GAPF slice as it read at probe; a deep sleep resets it to 0 */
 	u32 gapf_boot;
+	/* T8152 Gen3: the TLBI aperture command slot and this DART's route */
+	void __iomem *gen3_tlbi;
+	u8 gen3_route;
 	bool sleep_flushed;
 	/* The firmware 27 display sleep owns it: never replay locked trees. */
 	struct device *m5_sleep_owner;
@@ -1799,6 +1818,63 @@ static int apple_dart_t8110_tlb_wait(struct apple_dart *dart, unsigned long *fla
 		DART_T8110_TLB_CMD);
 }
 
+/* The aperture is shared by every Gen3 DART: one command at a time. */
+static DEFINE_RAW_SPINLOCK(apple_dart_gen3_tlbi_lock);
+
+/*
+ * Issue one Gen3 command: a single 16-byte store of the command and a zero
+ * high word, then the broadcast TLBI that consumes it. The command must reach
+ * the aperture before the TLBI, and the final DSB completes only when the
+ * broadcast has. There is no busy bit.
+ */
+static void apple_dart_gen3_tlbi(void __iomem *slot, u64 cmd)
+{
+#ifdef CONFIG_ARM64
+	asm volatile("stp %0, %1, [%2]" : : "r"(cmd), "r"(0UL), "r"(slot) : "memory");
+	dsb(ish);
+	__tlbi(vale1os, 0);
+	dsb(osh);
+#else
+	WARN_ON_ONCE(1);
+#endif
+}
+
+/*
+ * Invalidate every stream of @stream_map on a Gen3 DART. Like the T8110
+ * command path, this is refused with -EHOSTDOWN while the DART's commands are
+ * gated for sleep.
+ */
+static int apple_dart_gen3_invalidate_tlb(struct apple_dart_stream_map *stream_map)
+{
+	struct apple_dart *dart = stream_map->dart;
+	unsigned long flags;
+	unsigned int sid;
+
+	spin_lock_irqsave(&dart->lock, flags);
+	if (dart->commands_gated) {
+		spin_unlock_irqrestore(&dart->lock, flags);
+		return -EHOSTDOWN;
+	}
+	raw_spin_lock(&apple_dart_gen3_tlbi_lock);
+	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
+		u64 cmd = DART_GEN3_TLBI_OP_SID |
+			  FIELD_PREP(DART_GEN3_TLBI_ROUTE, dart->gen3_route) |
+			  FIELD_PREP(DART_GEN3_TLBI_SID, sid);
+
+		/* The DART must see the updated tables first. */
+		dma_wmb();
+		apple_dart_gen3_tlbi(dart->gen3_tlbi, cmd);
+	}
+	raw_spin_unlock(&apple_dart_gen3_tlbi_lock);
+	spin_unlock_irqrestore(&dart->lock, flags);
+	return 0;
+}
+
+static void apple_dart_gen3_unmap(void *addr)
+{
+	iounmap(addr);
+}
+
 static int
 apple_dart_t8110_hw_tlb_command_range(struct apple_dart_stream_map *stream_map,
 				   u32 command, bool range, u64 first, u64 last)
@@ -2066,6 +2142,20 @@ apple_dart_t8110_hw_invalidate_tlb(struct apple_dart_stream_map *stream_map)
 		return apple_dart_fw_invalidate(stream_map, 0, U64_MAX);
 	return apple_dart_t8110_hw_tlb_command_range(
 		stream_map, DART_T8110_TLB_CMD_OP_FLUSH_SID, false, 0, 0);
+}
+
+/*
+ * A T8152 DART with a TLBI aperture is a Gen3 DART, which ignores TLB_CMD:
+ * every whole-stream invalidation goes through the aperture. Without the
+ * aperture this is the T8110 path. The ranged paths for firmware-held and
+ * locked DARTs still use TLB_CMD; no Gen3 DART takes them yet.
+ */
+static int
+apple_dart_t8152_hw_invalidate_tlb(struct apple_dart_stream_map *stream_map)
+{
+	if (stream_map->dart->gen3_tlbi)
+		return apple_dart_gen3_invalidate_tlb(stream_map);
+	return apple_dart_t8110_hw_invalidate_tlb(stream_map);
 }
 
 static const char *apple_dart_t8110_v2_fault_name(u32 exception);
@@ -5533,6 +5623,32 @@ static int apple_dart_probe(struct platform_device *pdev)
 		dev_err(dev, "MMIO region too small (%pr)\n", res);
 		return -EINVAL;
 	}
+	if (of_device_is_compatible(dev->of_node, "apple,t8152-dart")) {
+		u64 aperture;
+
+		ret = of_property_read_u64(dev->of_node, "apple,tlbi-aperture", &aperture);
+		if (!ret) {
+			if (!IS_ALIGNED(aperture, 16))
+				return dev_err_probe(dev, -EINVAL,
+						     "TLBI aperture %#llx not 16-byte aligned\n",
+						     aperture);
+			/* Non-posted, like the DART registers. */
+			dart->gen3_tlbi = ioremap_np(aperture, 16);
+			if (!dart->gen3_tlbi)
+				return -ENOMEM;
+			ret = devm_add_action_or_reset(dev, apple_dart_gen3_unmap,
+						       dart->gen3_tlbi);
+			if (ret)
+				return ret;
+			dart->gen3_route = FIELD_GET(DART_GEN3_TLBI_ROUTE_MASK,
+						     readl(dart->regs + DART_GEN3_TLBI_ROUTE_REG));
+			dev_dbg(dev, "Gen3 TLBI aperture %#llx, route %u\n",
+				aperture, dart->gen3_route);
+		} else if (ret != -EINVAL) {
+			return dev_err_probe(dev, ret, "invalid apple,tlbi-aperture\n");
+		}
+		ret = 0;
+	}
 	if (platform_get_resource_byname(pdev, IORESOURCE_MEM, "gapf")) {
 		dart->gapf = devm_platform_ioremap_resource_byname(pdev, "gapf");
 		if (IS_ERR(dart->gapf))
@@ -5699,6 +5815,23 @@ params_done:
 		ret = apple_dart_parse_own_setup(dart, res, dart_params);
 		if (ret)
 			goto err_clk_disable;
+	}
+
+	if (dart->gen3_tlbi) {
+		u32 gen3_ias;
+
+		/*
+		 * A Gen3 stream may walk fewer address bits than PARAMS3
+		 * reports; DVAs are masked to the walk width before the tables
+		 * are touched, so a device can keep its high DVA window.
+		 */
+		if (!of_property_read_u32(dev->of_node, "apple,gen3-ias", &gen3_ias) &&
+		    gen3_ias >= 32 && gen3_ias <= dart->ias) {
+			dev_dbg(dev, "Gen3 walk width %u (PARAMS3 VA width %u)\n",
+				gen3_ias, dart->ias);
+			dart->ias = gen3_ias;
+			dart->four_level = gen3_ias > 36;
+		}
 	}
 
 	dart->dma_min = 0;
@@ -6329,6 +6462,34 @@ static const struct apple_dart_hw apple_dart_hw_t8110 = {
 	.type = DART_T8110,
 	.irq_handler = apple_dart_t8110_irq,
 	.invalidate_tlb = apple_dart_t8110_hw_invalidate_tlb,
+	.enable_remap = apple_dart_t8110_hw_enable_remap,
+	.fmt = APPLE_DART2,
+	.max_sid_count = 256,
+
+	.enable_streams = DART_T8110_ENABLE_STREAMS,
+	.lock = DART_T8110_PROTECT,
+	.lock_bit = DART_T8110_PROTECT_TTBR_TCR,
+
+	.error = DART_T8110_ERROR,
+
+	.tcr = DART_T8110_TCR,
+	.tcr_enabled = DART_T8110_TCR_TRANSLATE_ENABLE,
+	.tcr_disabled = 0,
+	.tcr_bypass = DART_T8110_TCR_BYPASS_DAPF | DART_T8110_TCR_BYPASS_DART,
+	.tcr_4level = DART_T8110_TCR_FOUR_LEVEL,
+
+	.ttbr = DART_T8110_TTBR,
+	.ttbr_valid = DART_T8110_TTBR_VALID,
+	.ttbr_addr_field_shift = DART_T8110_TTBR_ADDR_FIELD_SHIFT,
+	.ttbr_shift = DART_T8110_TTBR_SHIFT,
+	.ttbr_count = 1,
+};
+
+/* T8110 with the Gen3 invalidation of T8152 DARTs that have a TLBI aperture. */
+static const struct apple_dart_hw apple_dart_hw_t8152 = {
+	.type = DART_T8110,
+	.irq_handler = apple_dart_t8110_irq,
+	.invalidate_tlb = apple_dart_t8152_hw_invalidate_tlb,
 	.enable_remap = apple_dart_t8110_hw_enable_remap,
 	.fmt = APPLE_DART2,
 	.max_sid_count = 256,
@@ -7106,6 +7267,7 @@ static const struct of_device_id apple_dart_of_match[] = {
 	{ .compatible = "apple,t8103-dart", .data = &apple_dart_hw_t8103 },
 	{ .compatible = "apple,t8103-usb4-dart", .data = &apple_dart_hw_t8103_usb4 },
 	{ .compatible = "apple,t8110-dart", .data = &apple_dart_hw_t8110 },
+	{ .compatible = "apple,t8152-dart", .data = &apple_dart_hw_t8152 },
 	{ .compatible = "apple,t8132-dart", .data = &apple_dart_hw_t8110 },
 	{ .compatible = "apple,t6000-dart", .data = &apple_dart_hw_t6000 },
 	{},
