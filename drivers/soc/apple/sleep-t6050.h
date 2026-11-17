@@ -168,6 +168,8 @@ struct apple_sleep_region_state {
 	/* The AP wake-enable words, on this die and the GFX die */
 	void __iomem *wake, *wake_gfx, *aic_gfx;
 	u32 wake_enabled[11], wake_saved[11];
+	u32 wake_pending[11], wake_masks_at_return[11];
+	bool wake_snapshot_valid;
 	bool wake_armed, wake_sources;
 	u32 spmi_mask[6];
 	bool spmi_masked;
@@ -1593,6 +1595,7 @@ static int t6050_sleep_begin(struct apple_sleep *s)
 	unsigned int i;
 	int ret;
 
+	r->wake_snapshot_valid = false;
 	t6050_sleep_pins_low(s);
 	r->n1_up_ret = 0;
 	r->n1_host = t6050_n1_host_bound(s);
@@ -1980,6 +1983,44 @@ static void t6050_floor_steps(struct apple_sleep *s)
  */
 #define T6050_WAKE_ENABLE	0x0c
 #define T6050_WAKE_WORDS	10
+#define T6050_WAKE_STATUS	0x34
+#define T6050_WAKE_GFX_STATUS	0x10
+
+/* Read-only: snapshot before PMU/SPMI acknowledgment can remove a wake level. */
+static void t6050_wake_snapshot(struct apple_sleep *s)
+{
+	struct apple_sleep_region_state *r = s->region;
+	unsigned int i;
+
+	r->wake_snapshot_valid = false;
+	if (!r->wake_armed || !r->wake || !r->wake_gfx)
+		return;
+	for (i = 0; i < T6050_WAKE_WORDS; i++) {
+		r->wake_pending[i] = readl(r->wake + T6050_WAKE_STATUS + 4 * i);
+		r->wake_masks_at_return[i] = readl(r->wake + T6050_WAKE_ENABLE + 4 * i);
+	}
+	r->wake_pending[T6050_WAKE_WORDS] = readl(r->wake_gfx + T6050_WAKE_GFX_STATUS);
+	r->wake_masks_at_return[T6050_WAKE_WORDS] = readl(r->wake_gfx + T6050_WAKE_ENABLE);
+	r->wake_snapshot_valid = true;
+}
+
+static void t6050_report_wake_snapshot(struct apple_sleep *s)
+{
+	struct apple_sleep_region_state *r = s->region;
+
+	if (!s->returned)
+		return;
+	if (!r->wake_snapshot_valid) {
+		dev_warn(s->dev, "wake register snapshot unavailable\n");
+		return;
+	}
+	dev_info(s->dev, "wake pending AP %*ph GFX %#x\n",
+		 (int)(T6050_WAKE_WORDS * sizeof(u32)), r->wake_pending,
+		 r->wake_pending[T6050_WAKE_WORDS]);
+	dev_info(s->dev, "wake masks AP %*ph GFX %#x\n",
+		 (int)(T6050_WAKE_WORDS * sizeof(u32)), r->wake_masks_at_return,
+		 r->wake_masks_at_return[T6050_WAKE_WORDS]);
+}
 
 static void t6050_wake_masks(struct apple_sleep *s)
 {
@@ -3259,6 +3300,7 @@ static void t6050_sleep_wake_regs(struct apple_sleep *s)
 	unsigned int i;
 	u32 value;
 
+	t6050_wake_snapshot(s);
 	if (r->spmi_masked) {
 		/* What the PMU sent while the SoC slept (its wake), before the run-time mask */
 		t6050_spmi_pmu_ack(s);
@@ -3340,6 +3382,7 @@ static void t6050_sleep_finish(struct apple_sleep *s)
 	r->boot_stage_written = false;
 	t6050_sleep_ptd_ownership(s, false);
 	r->usb_aon_kept = 0;
+	t6050_report_wake_snapshot(s);
 	dev_dbg(s->dev, "entry %s: replay %u, timeouts %u, late %u, PMU %u/%d, DART stops %#x\n",
 		r->committed ? "returned" : "refused", s->ps_rewoken, s->ps_rewake_timeouts,
 		r->late_errors, r->pmu_errors, ret, r->dart_done);
