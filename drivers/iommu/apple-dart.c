@@ -361,6 +361,7 @@ struct apple_dart_fw_tree {
 #define APPLE_DART_GAPF_PROTECT BIT(4)
 
 struct apple_dart {
+	bool cold_gen3;
 	struct device *dev;
 	const struct apple_dart_hw *hw;
 
@@ -2648,6 +2649,17 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 	struct apple_dart_stream_map stream_map;
 	int i;
 
+	if (dart->cold_gen3) {
+		stream_map.dart = dart;
+		bitmap_zero(stream_map.sidmap, DART_MAX_STREAMS);
+		bitmap_set(stream_map.sidmap, 0, 3);
+		apple_dart_hw_disable_dma(&stream_map);
+		apple_dart_hw_clear_all_ttbrs(&stream_map);
+		apple_dart_apply_own_tunables(dart);
+		apple_dart_writel(dart, 7, dart->hw->enable_streams);
+		return dart->hw->invalidate_tlb(&stream_map);
+	}
+
 	if (dart->isp_host)
 		return apple_dart_isp_host_reset(dart);
 	if (dart->managed_sids || dart->cold_ane)
@@ -3379,6 +3391,17 @@ static int __apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 		.coherent_walk = 1,
 		.iommu_dev = dart->dev,
 	};
+
+	if (dart->cold_gen3) {
+		if ((dma_min ^ dma_max) & ~DMA_BIT_MASK(36)) {
+			ret = -ERANGE;
+			goto done;
+		}
+		/* Gen3 selects the high DMA window separately from its two-level
+		 * 16K page-table indices, as with iBoot's display streams.
+		 */
+		pgtbl_cfg.ias = 36;
+	}
 
 	if (dart->locked) {
 		unsigned long *sidmap;
@@ -5527,6 +5550,7 @@ static int apple_dart_probe(struct platform_device *pdev)
 	dart->dev = dev;
 	dart->hw = of_device_get_match_data(dev);
 	dart->tunneled = tunneled;
+	dart->cold_gen3 = of_device_is_compatible(dev->of_node, "apple,t8152-avd-dart");
 	dart->cold_ane = of_device_is_compatible(dev->of_node, "apple,t8140-ane-dart") ||
 			 of_device_is_compatible(dev->of_node, "apple,t8142-ane-dart");
 	if (dart->cold_ane && !IS_BUILTIN(CONFIG_APPLE_DART))
@@ -5943,6 +5967,38 @@ params_done:
 		ret = -EBUSY;
 		goto err_clk_disable;
 	}
+	if (dart->hw->gen3) {
+		struct resource *tlbi;
+
+		/* Cold initialization is qualified only for the AVD instance. */
+		if (!dart->locked && !dart->cold_gen3) {
+			dev_err(dev, "Gen3 DART is not locked; cold setup is not supported\n");
+			ret = -ENODEV;
+			goto err_clk_disable;
+		}
+		if (dart->cold_gen3 && (dart->locked || dart->version != 0x300 ||
+		    dart->num_streams != 16 || !dev->pm_domain || !dart->tunables ||
+		    (apple_dart_readl(dart, dart->hw->enable_streams) & 7))) {
+			ret = -EINVAL;
+			goto err_clk_disable;
+		}
+		/* The aperture is shared by every Gen3 DART: map, do not claim. */
+		tlbi = platform_get_resource_byname(pdev, IORESOURCE_MEM, "tlbi");
+		if (!tlbi || resource_size(tlbi) < 16) {
+			dev_err(dev, "Gen3 DART needs its TLBI aperture\n");
+			ret = -EINVAL;
+			goto err_clk_disable;
+		}
+		dart->tlbi = devm_ioremap(dev, tlbi->start, resource_size(tlbi));
+		if (!dart->tlbi) {
+			ret = -ENOMEM;
+			goto err_clk_disable;
+		}
+		dart->tlbi_route = apple_dart_readl(dart, DART_GEN3_TLBI_ROUTE) & 0xf;
+		dev_info(dev, "Gen3 DART, version %#x, TLBI route %u\n",
+			 dart->version, dart->tlbi_route);
+	}
+
 	apple_dart_parse_sleep_list(dart, res, "apple,sleep-prepare", &dart->sleep_prepare);
 	apple_dart_parse_sleep_list(dart, res, "apple,sleep-restore", &dart->sleep_restore);
 	apple_dart_parse_sleep_list(dart, res, "apple,sleep-restore-late",
@@ -6081,32 +6137,6 @@ params_done:
 		ret = apple_dart_hw_reset(dart);
 		if (ret)
 			goto err_clk_disable;
-	}
-
-	if (dart->hw->gen3) {
-		struct resource *tlbi;
-
-		/* Only an iBoot-provisioned (locked) Gen3 stream is supported. */
-		if (!dart->locked) {
-			dev_err(dev, "Gen3 DART is not locked; cold setup is not supported\n");
-			ret = -ENODEV;
-			goto err_clk_disable;
-		}
-		/* The aperture is shared by every Gen3 DART: map, do not claim. */
-		tlbi = platform_get_resource_byname(pdev, IORESOURCE_MEM, "tlbi");
-		if (!tlbi || resource_size(tlbi) < 16) {
-			dev_err(dev, "Gen3 DART needs its TLBI aperture\n");
-			ret = -EINVAL;
-			goto err_clk_disable;
-		}
-		dart->tlbi = devm_ioremap(dev, tlbi->start, resource_size(tlbi));
-		if (!dart->tlbi) {
-			ret = -ENOMEM;
-			goto err_clk_disable;
-		}
-		dart->tlbi_route = apple_dart_readl(dart, DART_GEN3_TLBI_ROUTE) & 0xf;
-		dev_info(dev, "Gen3 DART, version %#x, TLBI route %u\n",
-			 dart->version, dart->tlbi_route);
 	}
 
 	/* Borrowed display state: never acknowledge someone else's fault. */
@@ -7271,6 +7301,7 @@ static const struct dev_pm_ops apple_dart_pm_ops = {
 
 static const struct of_device_id apple_dart_of_match[] = {
 	{ .compatible = "apple,t8152-dart-gen3", .data = &apple_dart_hw_gen3 },
+	{ .compatible = "apple,t8152-avd-dart", .data = &apple_dart_hw_gen3 },
 	{ .compatible = "apple,t8103-dart", .data = &apple_dart_hw_t8103 },
 	{ .compatible = "apple,t8103-usb4-dart", .data = &apple_dart_hw_t8103_usb4 },
 	{ .compatible = "apple,t8110-dart", .data = &apple_dart_hw_t8110 },
