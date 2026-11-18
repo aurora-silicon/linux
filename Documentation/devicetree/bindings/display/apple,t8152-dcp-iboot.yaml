@@ -57,7 +57,7 @@ properties:
 
   reg:
     minItems: 2
-    maxItems: 8
+    maxItems: 9
 
   reg-names:
     oneOf:
@@ -84,13 +84,15 @@ properties:
           - const: phy-ps
           - const: coproc-ps
           - const: coproc-psd
+          - const: phy-psd
         minItems: 7
         description:
           DCP coprocessor, the HDMI dptx-phy blocks, the AP
           DisplayPort AUX controller that reads the sink's EDID with its
-          PMGR power state, and the read-only PMGR power states for the
-          HDMI PHY and DCPEXT CPU. The driver only adopts the bootloader's
-          powered link and must check these states before accessing the PHY.
+          PMGR power state, the PMGR power state of the HDMI PHY, the read
+          only power state of the DCPEXT CPU, and the PMGR2 PSD service of
+          the HDMI PHY. The PHY is accessed only once its power states read
+          powered; with phy-psd it is powered up for a cold HDMI start.
       - items:
           - const: coproc
           - const: coproc-psd
@@ -137,6 +139,35 @@ properties:
       The DCP drives the HDMI port through the dedicated dptx-phy and an
       on-board DisplayPort-to-HDMI converter. With apple,usb-c-ports it can
       instead claim a USB-C port when the bootloader has not assigned HDMI.
+
+  apple,tunable-phy:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: register offset in the HDMI dptx-phy core block
+        - description: mask
+        - description: value
+    description:
+      HDMI dptx-phy tunables (ADT dptx-phy asdc and lane-shm-regs groups),
+      applied when the PHY starts from cold.
+
+  apple,smc:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The SMC that switches the power of the DisplayPort-to-HDMI converter.
+
+  apple,pcon-power:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    items:
+      items:
+        - description: SMC key
+        - description: value, bits 63:32
+        - description: value, bits 31:0
+    description:
+      SMC writes, in order, that power the DisplayPort-to-HDMI converter
+      (ADT dp2hdmi-gpio0 function-dp2hdmi_pwr_en and function-hdmi_pwr_en).
+      The converter drives the HDMI hot-plug detect line only while it is
+      powered.
 
   apple,usb-pd:
     $ref: /schemas/types.yaml#/definitions/phandle
