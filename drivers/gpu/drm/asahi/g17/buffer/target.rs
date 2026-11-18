@@ -216,7 +216,15 @@ impl Layout {
         {
             return Err(ERANGE);
         }
-        Ok(aligned(self.meta_base(), mmu::UAT_PGSZ)?.max(cfg::TPC_MIN))
+        Ok(aligned(self.shared_end(), mmu::UAT_PGSZ)?.max(cfg::TPC_MIN))
+    }
+    /// End of the shared part, the TPC and GTP 1-3: GTP 4, where the metadata starts. GTP 4
+    /// need not be page aligned, and the tile maps run up to it.
+    fn shared_end(&self) -> usize {
+        match (self.m5, self.gtp[4]) {
+            (None, Some(start)) => start,
+            _ => self.tpc_end,
+        }
     }
     /// One render's clustering-metadata copy, page aligned; zero when there is none.
     fn meta_capacity(&self) -> Result<usize> {
@@ -355,7 +363,7 @@ impl Target {
     /// or absent one. The TPC object holds them after the TPC.
     pub(crate) fn gtp_va(&self, ordinal: u64, layout: &Layout) -> Result<[u64; 8]> {
         let split = layout.meta_base();
-        if split > self.tpc_stride || layout.meta_bytes() > self.meta_stride {
+        if layout.shared_end() > self.tpc_stride || layout.meta_bytes() > self.meta_stride {
             return Err(ERANGE);
         }
         let meta = match &self.meta {
@@ -558,27 +566,70 @@ mod tests {
             assert!(layout.tpc_size < cfg::TPC_MAX);
             assert!(layout.record_stride().unwrap() < cfg::TARGET_RECORD_MAX);
             assert!(layout.tpc_end > cfg::TPC_MAX);
-            assert!(layout.tpc_capacity().unwrap() >= layout.meta_base());
-            assert!(layout.tpc_capacity().unwrap() + layout.meta_capacity().unwrap() >= layout.tpc_end);
             assert_eq!(layout.gtp[0], Some(0));
             assert!(layout.gtp[1].unwrap() >= layout.tpc_size);
+            fits(&layout);
+        }
+    }
+
+    /// Every sub-buffer of `layout` lies whole in its object with its alignment: the TPC and
+    /// GTP 1-3 in the shared TPC object, GTP 4-7 in a render's metadata copy.
+    fn fits(layout: &Layout) {
+        let shared = layout.tpc_capacity().unwrap();
+        let split = layout.meta_base();
+        // GTP 0-3 sizes, as Layout::new gives them; GTP 2 exists for layered targets only.
+        let sizes = [layout.tpc_size, layout.tilemap_size * 64, 0x4000, 0];
+        for (index, size) in sizes.into_iter().enumerate() {
+            if let Some(offset) = layout.gtp[index] {
+                assert!(offset < split);
+                assert!(offset + size <= shared);
+            }
+        }
+        assert!(layout.meta_capacity().unwrap() >= layout.tpc_end - split);
+        for (offset, alignment) in layout.gtp.iter().zip(GTP_ALIGNMENTS).skip(4) {
+            assert!(offset.unwrap() >= split);
+            assert_eq!((offset.unwrap() - split) % alignment, 0);
         }
     }
 
     #[test]
     fn only_clustering_metadata_is_copied_per_render() {
         // 1728x1117 on the four-cluster M4 Max: the per-render copy is the metadata alone,
-        // not the megabyte TPC and tile maps.
+        // not the TPC and the megabyte of tile maps.
         let mut p = pass(1728, 32);
         p.height = 1117;
         let layout = Layout::new(&p, 4, RegisterPrograms::V25G83).unwrap();
         let start = layout.gtp[4].unwrap();
         assert!(layout.meta_base() <= start && start - layout.meta_base() < mmu::UAT_PGSZ);
-        assert!(layout.meta_capacity().unwrap() <= 0x2_0000);
-        assert!(layout.tpc_capacity().unwrap() >= layout.gtp[1].unwrap());
-        // Every metadata sub-buffer keeps its alignment inside a page-aligned copy.
-        for (offset, alignment) in layout.gtp.iter().zip(GTP_ALIGNMENTS).skip(4) {
-            assert_eq!((offset.unwrap() - layout.meta_base()) % alignment, 0);
+        // Metadata 4 (GTP 6) has room for 64 partial renders: 0x65e00 bytes.
+        assert!(layout.meta_capacity().unwrap() <= 0x8_0000);
+        assert!(layout.meta_capacity().unwrap() < layout.tilemap_size * 64);
+        fits(&layout);
+    }
+
+    #[test]
+    fn the_shared_object_holds_the_last_tile_map() {
+        // With 32x32 utiles at 3456x2234 the TPC is 0x46000 bytes, so GTP 4 is not page
+        // aligned and the tile maps end past GTP 4 rounded down to a page.
+        let mut p = pass(3456, 32);
+        p.height = 2234;
+        let layout = Layout::new(&p, 4, RegisterPrograms::V25G83).unwrap();
+        assert_ne!(layout.gtp[4].unwrap() % mmu::UAT_PGSZ, 0);
+        let end = layout.gtp[1].unwrap() + layout.tilemap_size * 64;
+        assert!(end > aligned(layout.meta_base(), mmu::UAT_PGSZ).unwrap());
+        assert!(layout.tpc_capacity().unwrap() >= end);
+        for (width, height) in [(1728, 1117), (3456, 2234), (2048, 2048), (1280, 720)] {
+            for (utile_width, utile_height) in [(32, 32), (32, 16), (16, 16)] {
+                for layers in [1, 2] {
+                    for clusters in [2, 4] {
+                        let mut p = pass(width, utile_width);
+                        p.height = height;
+                        p.utile_height = utile_height;
+                        p.layers = layers;
+                        fits(&Layout::new(&p, clusters, RegisterPrograms::V25G83).unwrap());
+                    }
+                }
+            }
         }
     }
 
