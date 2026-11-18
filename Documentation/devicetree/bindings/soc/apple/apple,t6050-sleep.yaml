@@ -117,10 +117,12 @@ properties:
     description: The AP pin controller, whose pins a deep sleep resets.
 
   apple,pinctrl-skip-pins:
-    $ref: /schemas/types.yaml#/definitions/uint32-array
+    oneOf:
+      - $ref: /schemas/types.yaml#/definitions/uint32-array
+      - type: boolean
     description: |
       Pins neither saved nor restored. From the ADT, set by the bootloader;
-      without it no pin is saved.
+      without it no pin is saved. Empty where every pin is saved.
 
   apple,sleep-low-pins:
     $ref: /schemas/types.yaml#/definitions/uint32-array
