@@ -323,7 +323,8 @@ static void apple_nhi_cio_phy_put(struct apple_nhi *anhi)
 static void apple_nhi_cio_usb_bind(struct apple_nhi *anhi, bool bind)
 {
 	if (bind) {
-		if (!of_machine_is_compatible("apple,j714s"))
+		if (!(of_machine_is_compatible("apple,j714s") ||
+		      of_machine_is_compatible("apple,j716c")))
 			return;
 		anhi->cio_phy_usb = symbol_get(apple_t6050_phy_cio_usb);
 		if (anhi->cio_phy_usb)
@@ -448,7 +449,7 @@ static int apple_nhi_cio_bind(struct apple_nhi *anhi)
 	if (!cio_s2r)
 		return 0;
 	if (anhi->acio->hw == &apple_cio_t6050_hw &&
-	    of_machine_is_compatible("apple,j714s")) {
+	    (of_machine_is_compatible("apple,j714s") || of_machine_is_compatible("apple,j716c"))) {
 		ret = apple_nhi_cio_bind_owner_t6050(anhi);
 		if (ret == -EPROBE_DEFER)
 			return ret;
@@ -895,8 +896,9 @@ static int apple_nhi_cio_power_off_t6050(struct apple_nhi *anhi)
 		apple_cio_cpu_halt(acio);
 		if (ret)
 			return ret;
-		/* J714s holds LSTX high through sleep; do not read the halted rc block. */
-		ret = apple_cio_lstx_hold(acio, of_machine_is_compatible("apple,j714s"));
+		/* J714s and J716c hold LSTX high through sleep; do not read the halted rc block. */
+		ret = apple_cio_lstx_hold(acio, of_machine_is_compatible("apple,j714s") ||
+					  of_machine_is_compatible("apple,j716c"));
 		if (ret)
 			return ret;
 	}
@@ -904,7 +906,8 @@ static int apple_nhi_cio_power_off_t6050(struct apple_nhi *anhi)
 	if (ret < 0)
 		return ret;
 	/* Held on by its DART: taken down here, before the PHY's shutdown, as macOS does. */
-	if (ret && of_machine_is_compatible("apple,j714s")) {
+	if (ret && (of_machine_is_compatible("apple,j714s") ||
+		    of_machine_is_compatible("apple,j716c"))) {
 		int down = apple_nhi_cio_router_pd_set(anhi, false);
 
 		if (!down) {
@@ -950,7 +953,7 @@ static int apple_nhi_cio_suspend_t6050(struct apple_nhi *anhi)
 	 * its DART's clock protection by now, as macOS does before this gate. A sleep refused
 	 * below powers it again here, before the PCIe-C port's resume starts the port from cold.
 	 */
-	if (of_machine_is_compatible("apple,j714s")) {
+	if ((of_machine_is_compatible("apple,j714s") || of_machine_is_compatible("apple,j716c"))) {
 		struct device *pd = anhi->acio->pd_list->pd_devs[apple_nhi_cio_tunnel_pd[0]];
 		int held, on, ps;	/* TEST */
 
@@ -967,7 +970,8 @@ static int apple_nhi_cio_suspend_t6050(struct apple_nhi *anhi)
 	if (ret) {
 		/* TEST (J714s): the router is awake again: its tunnel's USB host comes off it first. */
 		apple_nhi_cio_usb_park(anhi, "after the refused sleep");
-		if (of_machine_is_compatible("apple,j714s") &&
+		if ((of_machine_is_compatible("apple,j714s") ||
+		     of_machine_is_compatible("apple,j716c")) &&
 		    apple_nhi_cio_domains_t6050(anhi, apple_nhi_cio_tunnel_pd,
 						ARRAY_SIZE(apple_nhi_cio_tunnel_pd), true) < 0)
 			dev_err(anhi->dev, "T6050 sleep: the tunnelled PCIe's domain not back after the refused sleep: the PCIe-C port's resume follows all the same\n");
