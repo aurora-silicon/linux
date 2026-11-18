@@ -113,7 +113,7 @@ checkout, add ``--compare-baseline /path/to/old/drivers/media/platform/apple/ave
 Private capture comparisons must keep captured images outside the source tree
 and mask only addresses, session tokens, clocks and host bookkeeping fields.
 
-With debugfs mounted, ``apple-ave/last_start_h264``,
+With debugfs mounted, ``apple-ave-<device>/last_start_h264``,
 ``last_start_hevc``, ``last_process0_h264`` and ``last_process0_hevc`` hold the
 last Start command built and the first Process command of the last session,
 for comparison with reference captures.

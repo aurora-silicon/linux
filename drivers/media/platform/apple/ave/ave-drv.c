@@ -22,6 +22,7 @@
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
 #include <linux/seq_file.h>
+#include <linux/sprintf.h>
 #include <linux/vmalloc.h>
 
 #include "ave.h"
@@ -187,9 +188,9 @@ static const struct ave_variant ave_t8142 = {
 };
 
 /*
- * debugfs: apple-ave/last_start_{h264,hevc} hold the last Start built and
- * last_process0_{h264,hevc} the first Process of the last session, so the
- * generated commands can be compared with reference captures.
+ * debugfs: apple-ave-<device>/last_start_{h264,hevc} hold the last Start
+ * built and last_process0_{h264,hevc} the first Process of the last session,
+ * so the generated commands can be compared with reference captures.
  */
 void ave_debugfs_save(struct ave_dev *ave, enum ave_codec codec,
 		      enum ave_image kind, const void *cmd, size_t len)
@@ -343,10 +344,12 @@ static void ave_debugfs_init(struct ave_dev *ave)
 		{ "last_start_h264", "last_process0_h264" },
 		{ "last_start_hevc", "last_process0_hevc" },
 	};
+	char name[64];
 
 	if (!IS_ENABLED(CONFIG_DEBUG_FS) || !ave->layout)
 		return;
-	ave->debugfs = debugfs_create_dir("apple-ave", NULL);
+	scnprintf(name, sizeof(name), "apple-ave-%s", dev_name(ave->dev));
+	ave->debugfs = debugfs_create_dir(name, NULL);
 	if (ave->layout->abi == &ave_abi_6070) {
 		debugfs_create_file("lifecycle_test", 0200, ave->debugfs, ave,
 				    &ave_lifecycle_fops);
