@@ -816,6 +816,7 @@ struct apple_sleep {
 	void __iomem *ps;
 	void __iomem *pwrgate;
 	void __iomem *cpu_start;
+	unsigned int cpu_burst_n;	/* cores the last wake's burst started */
 	void __iomem *cllt;
 	void __iomem *cluster;
 	void __iomem *commit;
@@ -1060,9 +1061,6 @@ struct apple_sleep {
 	void __iomem *acc_e;
 	void __iomem *acc_p;
 	int cluster_p_ret;
-	int perf_soc_ret;
-	int perf_dcs_ret;
-	unsigned int perf_dcs_from;
 	/* With radio_retrain: the radio's PCIe host, and its port's blocks and tables */
 	struct device_node *radio_host_np;
 	void __iomem *radio_port;
@@ -2252,9 +2250,17 @@ MODULE_PARM_DESC(mem_restore, "T8142: put the memory side (AMCC, SoC NI, DCS) ba
 static bool sleep_clk_restore = true;
 module_param_named(clk_restore, sleep_clk_restore, bool, 0644);
 MODULE_PARM_DESC(clk_restore, "T8142: put the 126 PMGR clkgen slots and the memory clock word back at the wake as XNU does");
-static bool sleep_perf_down = true;
-module_param_named(perf_down, sleep_perf_down, bool, 0644);
-MODULE_PARM_DESC(perf_down, "T8142: SoC/DCS perf states down before the memory stop (macOS on J813 never writes them; A/B)");
+/*
+ * The cores' start after a T8142 wake. A traced macOS 27.2 run on J813 (boot, a 40 s sleep, the
+ * wake and three more entries) starts all nine other cores 16.5 ms after the wake, right after
+ * the memory side and the WD2 stop, in one 0.23 ms burst, three words each: +4 the core's bit, +8
+ * the E core's bit or 0, +0xc the P core's bit or 0. The wake does the same for the cores that
+ * were online when the sleep began (t8142_cpu_burst()); they come up through the boot object
+ * into the kernel's holding pen and wait there, and each bring-up only releases its core.
+ */
+static struct cpumask sleep_cpus_burst;
+/* The CPUs online at .begin: the ones the PM core brings back after the wake. */
+static struct cpumask sleep_cpus_awake;
 static u64 t8142_boot_mpidr = ~0ULL;
 
 extern char t8142_el1_wfi_stub[], t8142_el1_wfi_stub_end[];
@@ -2513,6 +2519,13 @@ static int sleep_cpu_on(u64 mpidr)
 	unsigned int us = 0;
 	bool trace;
 	DEFINE_DYNAMIC_DEBUG_METADATA(cpu_on_trace, "apple-sleep: cpu start after a sleep\n");
+
+	/* Started by the wake's burst: it waits in the pen; release it. */
+	if (cpu >= 0 && cpumask_test_and_clear_cpu(cpu, &sleep_cpus_burst)) {
+		pr_debug("apple-sleep: cpu%d start %#llx: started in the wake burst (%u cores), released from the pen\n",
+			 cpu, mpidr, s->cpu_burst_n);
+		return 0;
+	}
 
 	trace = DYNAMIC_DEBUG_BRANCH(cpu_on_trace) && s->soc->cpu_clusters >= 2;
 	if (trace) {
@@ -6372,6 +6385,8 @@ static int apple_sleep_begin(suspend_state_t state)
 	/* The PM core also calls .begin for s2idle when no s2idle ops are installed. */
 	if (state != PM_SUSPEND_MEM)
 		return 0;
+	/* Before the PM core takes the other CPUs down: the wake's burst starts only these. */
+	cpumask_copy(&sleep_cpus_awake, cpu_online_mask);
 
 	ret = apple_sleep_profile_check(apple_sleep);
 	if (ret)
@@ -6817,9 +6832,6 @@ static void apple_sleep_report(void)
 				s->soc->quiesce.offset[i]);
 	if (s->cpus_stop_ret)
 		dev_err(s->dev, "other CPUs did not stop: %d\n", s->cpus_stop_ret);
-	if (s->perf_soc_ret || s->perf_dcs_ret)
-		dev_warn(s->dev, "sleep perf states: SoC %d, DCS %d (DCS was %u)\n", s->perf_soc_ret,
-			 s->perf_dcs_ret, s->perf_dcs_from);
 	if (s->cluster_p_ret)
 		dev_err(s->dev, "P complex did not come back on: %d\n", s->cluster_p_ret);
 	if (s->radio_trainable && s->radio_stop_ret)
@@ -8292,15 +8304,6 @@ static const struct apple_sleep_soc t8132_sleep_soc = {
  */
 #define T8142_PMC_VOTER_AP		(3 * PMC_VOTER_STRIDE)
 #define T8142_CLUSTER_BUSY		BIT(4)
-/*
- * AppleT8142PMGR::setPerfState's words in PMGRCLKGEN_SOC_TOP (/arm-io/pmgr reg[2]): the SoC's
- * at 0x24000, DCS's at 0x25000, each like T8132's: [3:0] asks, [11:8] has reached, bit 31 busy.
- */
-#define T8142_PERF_REQ			GENMASK(3, 0)
-#define T8142_DCS_SLEEP_STATE		3
-#define T8142_DCS_STEP_STATE		5
-#define T8142_DCS_STEP_FROM		6
-#define T8142_DCS_MAX_STATE		10
 
 /*
  * Every Linux access to the complexes' ACC word 0xe440f8 has hung J815 so far: a read at
@@ -8312,32 +8315,6 @@ static bool sleep_acc_wake;
 module_param_named(acc_wake, sleep_acc_wake, bool, 0644);
 MODULE_PARM_DESC(acc_wake,
 		 "T8142: write ACC 0xe440f8 = 1 per complex at a wake, as restoreHW does (default 0)");
-
-static int t8142_perf_request(void __iomem *reg, unsigned int state)
-{
-	writel((readl(reg) & ~T8142_PERF_REQ) | FIELD_PREP(T8142_PERF_REQ, state), reg);
-	return sleep_perf_wait(reg, state);
-}
-
-/*
- * AppleT8142PMGR::quiescePerfState, the PMGR's first sleep step: the SoC to Vmin (3), then DCS
- * to 3, through 5 from 6..10. macOS waits on BUSY with no limit and panics on a DCS state
- * above 10; here each wait is bounded, and such a state is left alone.
- */
-static void t8142_perf_down(struct apple_sleep *s)
-{
-	unsigned int state = FIELD_GET(DCS_STATE, readl(s->dcs));
-
-	s->perf_dcs_from = state;
-	s->perf_soc_ret = t8142_perf_request(s->clk_perf + CLK_PERF_SOC, SOC_SLEEP_STATE);
-	if (state > T8142_DCS_MAX_STATE) {
-		s->perf_dcs_ret = -ERANGE;
-		return;
-	}
-	if (state >= T8142_DCS_STEP_FROM)
-		t8142_perf_request(s->dcs, T8142_DCS_STEP_STATE);
-	s->perf_dcs_ret = t8142_perf_request(s->dcs, T8142_DCS_SLEEP_STATE);
-}
 
 /* AppleT8142PMGR vtable 0xfa0: each complex's CPM gate word, read-modify-write. */
 static void t8142_cpm_on(struct apple_sleep *s)
@@ -8643,10 +8620,7 @@ static void t8142_commit_note(struct apple_sleep *s)
 		return;
 	if (s->cpus_stop_ret)
 		flags |= 0x01;
-	if (s->perf_soc_ret)
-		flags |= 0x02;
-	if (s->perf_dcs_ret)
-		flags |= 0x04;
+	/* 0x02 and 0x04 were the SoC and DCS perf-state steps, which are gone. */
 	for (i = 0; i < s->soc->wake_words; i++) {
 		u32 pend = readl(s->wake + s->soc->wake_status + i * 4) & s->wake_armed[i];
 
@@ -8989,9 +8963,7 @@ static void t8142_last_mile(struct apple_sleep *s)
 	const struct apple_sleep_soc *soc = s->soc;
 	int i;
 
-	/* Not in macOS's J813 entry (its perf-state page is untouched in the whole trace): A/B. */
-	if (READ_ONCE(sleep_perf_down))
-		t8142_perf_down(s);
+	/* The SoC and DCS perf states stay: macOS's J813 entry never writes them. */
 	sleep_note(s, 0x64);
 
 	/* T6050's commit window: the floor's voter to 0, not read, right before the memory stop */
@@ -9010,8 +8982,11 @@ static void t8142_last_mile(struct apple_sleep *s)
 
 	t8142_commit_note(s);
 
-	for (i = 0; i < soc->ncluster_cpu; i++)
-		writel(0, s->cluster + soc->cluster_cpu[i]);
+	for (i = 0; i < soc->ncluster_cpu; i++) {
+		void __iomem *reg = s->cluster + soc->cluster_cpu[i];
+
+		writel(readl(reg) & ~CLUSTER_ON, reg);
+	}
 
 	s->quiesce_still_on = 0;
 	for (i = 0; i < soc->quiesce.count; i++)
@@ -9133,6 +9108,35 @@ static int t8142_cluster_on(struct apple_sleep *s, u32 word, void __iomem *acc)
 	return ret;
 }
 
+/* The other cores started at once, three words each (see sleep_cpus_burst). */
+static void t8142_cpu_burst(struct apple_sleep *s)
+{
+	unsigned int cpu, n = 0, self = smp_processor_id();
+
+	cpumask_clear(&sleep_cpus_burst);
+	s->cpu_burst_n = 0;
+	/* T8142's data states no cpu_clusters (0): E = MPIDR cluster 0, P = 1, from the MPIDR. */
+	if (!s->cpu_start)
+		return;
+	for_each_cpu(cpu, &sleep_cpus_awake) {
+		u64 mpidr = cpu_logical_map(cpu);
+		unsigned int cluster = sleep_cpu_cluster(s, mpidr), core = sleep_cpu_core(mpidr);
+
+		if (cpu == self || cluster > 1)
+			continue;
+		writel(sleep_cpu_start_bit(s, mpidr), s->cpu_start + CPU_START_SYS);
+		writel(cluster == 0 ? BIT(core) : 0, s->cpu_start + CPU_START_CLUSTER(0));
+		writel(cluster == 1 ? BIT(core) : 0, s->cpu_start + CPU_START_CLUSTER(1));
+		cpumask_set_cpu(cpu, &sleep_cpus_burst);
+		n++;
+	}
+	s->cpu_burst_n = n;
+	pr_info("apple-sleep: wake: %u cores started in one burst; stop/sys/e/p now %x/%x/%x/%x\n",
+		n, readl(s->cpu_start + CPU_START_STOP), readl(s->cpu_start + CPU_START_SYS),
+		readl(s->cpu_start + CPU_START_CLUSTER(0)),
+		readl(s->cpu_start + CPU_START_CLUSTER(1)));
+}
+
 /*
  * AppleT8142PMGR::restoreHW: each complex on, pwrgate +0x0 and +0x60 read-modify-written, the
  * words back, the CPM gates, the ACC words once more. Its two "early wake hacks" (SEP's ps
@@ -9193,6 +9197,7 @@ static void t8142_wake(struct apple_sleep *s)
 		s->aon_wdt_marked = false;
 	}
 	apple_sleep_set_wd2(s, WDT_SUSPEND_SECS);
+	t8142_cpu_burst(s);
 
 	if (s->pcie_ans_stopped)
 		s->pcie_ans_on_ret = apple_sleep_raise_apcie(s);
