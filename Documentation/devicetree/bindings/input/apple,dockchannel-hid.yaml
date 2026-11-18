@@ -241,6 +241,26 @@ properties:
           Name of the touchscreen firmware that the host sends to the
           coprocessor when the interface is first opened.
 
+      apple,power-method:
+        $ref: /schemas/types.yaml#/definitions/uint32
+        enum: [1, 2]
+        default: 1
+        description:
+          The power sequencing protocol of the coprocessor firmware, as
+          described above. Power method 2 for kiwi carries its own reset
+          and power lines instead of the shared AFE reset.
+
+      apple,reset-gpios:
+        maxItems: 1
+        description:
+          The touchscreen's own reset line, when it does not share the
+          AFE reset of the parent node.
+
+      apple,power-gpios:
+        maxItems: 1
+        description:
+          The touchscreen's optional supply enable line.
+
   mtp:
     type: object
     additionalProperties: false
