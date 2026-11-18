@@ -968,3 +968,52 @@
 &ps_venc0_me1 {
 	status = "okay";
 };
+
+/*
+ * Deep sleep: the sleep controller's description and the J714s's SoC values, then what differs
+ * on this board (firmware 27.2).
+ */
+#include "t6050-k116s-sleep.dtsi"
+/* No USB4 router is described on this board: without the J714s's CIO sleep part. */
+#define T6050_SLEEP_SOC_NO_CIO
+#include "t6050-j714s-sleep-soc.dtsi"
+
+/*
+ * macOS on this board parks the four clock words with 0x80100000 in the last 0.5 ms before its
+ * commit (traced as an aura guest); the J714s's values have bit 10 set.
+ */
+&sleep {
+	apple,seq-commit-sio =
+		<0x0 17 0x290 0x400024f>,
+		<0x0 17 0x2a0 0x400024f>,
+		<0x1 51 0xa0 0x0>,
+		<0x0 51 0xa0 0x80100000>,
+		<0x1 51 0xa0 0x0>,
+		<0x1 51 0xa4 0x0>,
+		<0x0 51 0xa4 0x80100000>,
+		<0x1 51 0xa4 0x0>,
+		<0x1 51 0x94 0x0>,
+		<0x0 51 0x94 0x80100000>,
+		<0x1 51 0x94 0x0>,
+		<0x1 51 0x90 0x0>,
+		<0x0 51 0x90 0x80100000>,
+		<0x1 51 0x90 0x0>;
+};
+
+/*
+ * The PMP firmware's __DATA starts at 0x56000 on 27.2 (ADT pmp0 segment-ranges: __TEXT 0x56000
+ * bytes, __DATA 0x9b000 bytes), not at the J714s's 0x58000. With the wrong range kept over the
+ * sleep the PMP does not come back (endpoint discovery -62).
+ */
+&pmp0 {
+	apple,sram-keep = <0x56000 0x9b000>;
+};
+
+/*
+ * The panel's plug takes about 2.9 ms here from the video interface's announcement to the
+ * firmware's "ioav i/f is now closed", and the next round of reports follows about 33 ms later.
+ * With the J714s's 2500 us the open landed 25 us before the close.
+ */
+&dcp {
+	apple,panel-video-open-delay-us = <10000>;
+};
