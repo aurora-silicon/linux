@@ -1092,7 +1092,7 @@ static void cs42l84_setup_plug_detect(struct cs42l84_private *cs42l84)
 {
 	unsigned int reg;
 
-	/* Set up plug detection */
+	/* Set up plug detection, as cs42l84_plug_detect_regs[] lists it */
 	regmap_update_bits(cs42l84->regmap, CS42L84_MIC_DET_CTL4,
 			CS42L84_MIC_DET_CTL4_LATCH_TO_VP,
 			CS42L84_MIC_DET_CTL4_LATCH_TO_VP);
@@ -1271,6 +1271,77 @@ static void cs42l84_i2c_remove(struct i2c_client *i2c_client)
 }
 
 /*
+ * The registers cs42l84_setup_plug_detect() turns plug detection on with, in
+ * its order. After a firmware sleep they are written back first, in this
+ * order, so the two must stay in step.
+ */
+static const unsigned int cs42l84_plug_detect_regs[] = {
+	CS42L84_MIC_DET_CTL4,
+	CS42L84_TIP_SENSE_CTL2,
+	CS42L84_RING_SENSE_CTL,
+	CS42L84_TIP_SENSE_CTL,
+	CS42L84_MSM_BLOCK_EN3,
+};
+
+static bool cs42l84_is_plug_detect_reg(unsigned int reg)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(cs42l84_plug_detect_regs); i++) {
+		if (cs42l84_plug_detect_regs[i] == reg)
+			return true;
+	}
+	return false;
+}
+
+/* Write one cached register back, then clear what the write latched. */
+static int cs42l84_restore_reg(struct cs42l84_private *cs42l84, unsigned int reg)
+{
+	unsigned int status;
+	int ret;
+
+	ret = regcache_sync_region(cs42l84->regmap, reg, reg);
+	if (ret)
+		return ret;
+	return regmap_read(cs42l84->regmap, CS42L84_TSRS_PLUG_INT_STATUS, &status);
+}
+
+/*
+ * Write the cache back after the codec's reset. Turning tip and ring sensing
+ * on latches plug events at once, and so do some of the other writes; the
+ * remote button sources also come up latched. With the interrupt off, nothing
+ * reads them, and a codec left with a latched event stops answering the bus a
+ * write or two later. So plug detection goes first, in the probe's order, then
+ * every other register the cache holds, one at a time, with the status read
+ * after each write to clear what it latched, as the interrupt thread does.
+ */
+static int cs42l84_restore_regs(struct cs42l84_private *cs42l84)
+{
+	unsigned int i, reg, val, max = regmap_get_max_register(cs42l84->regmap);
+	int ret;
+
+	for (i = 0; i < ARRAY_SIZE(cs42l84_plug_detect_regs); i++) {
+		ret = cs42l84_restore_reg(cs42l84, cs42l84_plug_detect_regs[i]);
+		if (ret)
+			return ret;
+	}
+	ret = regmap_read(cs42l84->regmap, CS42L84_REMOTE_BUTTON_STATUS1, &val);
+	if (ret)
+		return ret;
+
+	for (reg = 0; reg <= max; reg++) {
+		/* Plug detection is back already */
+		if (cs42l84_is_plug_detect_reg(reg) ||
+		    !regcache_reg_cached(cs42l84->regmap, reg))
+			continue;
+		ret = cs42l84_restore_reg(cs42l84, reg);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+/*
  * A firmware-driven system sleep holds the codec in reset, so it comes back
  * with none of its registers and answers nothing until the reset is released.
  * Take it into reset ourselves once nothing uses it, and after the wake
@@ -1346,7 +1417,7 @@ static int cs42l84_resume(struct device *dev)
 	/* The revision was read into the cache at probe; it isn't ours to write. */
 	regcache_drop_region(cs42l84->regmap, CS42L84_REVID, CS42L84_REVID);
 
-	ret = regcache_sync(cs42l84->regmap);
+	ret = cs42l84_restore_regs(cs42l84);
 	if (ret)
 		goto err;
 
