@@ -2643,7 +2643,7 @@ static bool sleep_ps_on(struct apple_sleep *s, u32 offset)
 /* Below full power the hardware has idled it, and its registers may not answer. */
 static bool sleep_ps_full(struct apple_sleep *s, u32 offset)
 {
-	return FIELD_GET(PS_ACTUAL, readl(s->ps + offset)) == FIELD_MAX(PS_ACTUAL);
+	return FIELD_GET(PS_ACTUAL, readl(sleep_power_reg(s, offset))) == FIELD_MAX(PS_ACTUAL);
 }
 
 /*
