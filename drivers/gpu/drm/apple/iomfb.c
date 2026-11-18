@@ -904,6 +904,9 @@ static void iomfb_v27_sleep_start(struct apple_dcp *dcp,
 		if (rpc->a442_key) {
 			memset(in + 80, 0, 12);
 			in[84] = 0x20;
+		} else if (iomfb_v27_methods_renumbered(dcp->v27_methods)) {
+			/* 27.2 reads the filler as an index count and a block size */
+			memset(in + 16, 0, sizeof(in) - 16);
 		}
 		dcp_push(dcp, true, &a442, sizeof(in), 4100, in, iomfb_v27_a442_done, NULL);
 	}
