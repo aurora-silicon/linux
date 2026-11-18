@@ -313,6 +313,29 @@ impl LoadedBags {
     }
 }
 
+/// What a bag's restore does, from whether the enclave lists a catacomb
+/// component for its user, whether a saved file exists, and whether the
+/// shared master is loaded (so a missing component means something).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BagRestore {
+    /// Never enrolled: nothing to load.
+    Nothing,
+    Load,
+    /// The loaded master forgot this user: the file is stale.
+    StartFresh,
+    /// A file but no loaded master to judge it by.
+    Refuse,
+}
+
+fn bag_restore_plan(component: bool, file: bool, master_active: bool) -> BagRestore {
+    match (component, file) {
+        (true, _) => BagRestore::Load,
+        (false, false) => BagRestore::Nothing,
+        (false, true) if master_active => BagRestore::StartFresh,
+        (false, true) => BagRestore::Refuse,
+    }
+}
+
 fn encode_designate(key_store: crate::profile::KeyStore, source_handle: i32, user_handle: i32) -> Result<crate::image::Body> {
     if source_handle < 0 || user_handle >= 0 {
         return Err(EINVAL);
@@ -1402,6 +1425,9 @@ impl crate::SepData {
     /// enrolment. A user who never enrolled has neither a component nor a
     /// file: nothing to load. Either one without the other is not that.
     fn userbag_restore_13(&self, bags: &mut LoadedBags, user: crate::sks::DesignateUser, uid: u32) -> bool {
+        // Only reached after the bag's password (a Touch ID preparation
+        // exists), so starting a bag afresh never lets a finger in: it only
+        // costs the owner their enrolled fingers.
         let Some(entry) = bags.entry(user.special_handle().value()) else {
             return false;
         };
@@ -1412,12 +1438,38 @@ impl crate::SepData {
         let Some(raw) = self.read_component_states() else {
             return false;
         };
-        let state = crate::sbio::ComponentStates::new(&raw).state_for(id);
+        let states = crate::sbio::ComponentStates::new(&raw);
+        let state = states.state_for(id);
         let slot = crate::catacomb::Slot::BagUser(uid);
-        if !(state.is_none() && crate::catacomb::is_absent(slot)) {
+        let master_active = states
+            .state_for(crate::sbio::CatacombUser::MASTER.value())
+            .is_some_and(|s| s & crate::sbio::COMPONENT_STATE_ACTIVE != 0);
+        let plan = bag_restore_plan(state.is_some(), !crate::catacomb::is_absent(slot), master_active);
+        if plan == BagRestore::StartFresh {
+            // The loaded master lists nothing for this user, so its saved
+            // file predates the enclave's current templates: a kernel without
+            // per-user bags saved the master since, or the enclave was reset.
+            // Nothing in it can load; the next enrolment replaces it.
+            dev_info_ratelimited!(
+                self.dev,
+                "userbag: uid {}'s saved fingerprints are not in the enclave's templates any more (another kernel saved them since); its Touch ID starts afresh: enrol again\n",
+                uid
+            );
+        } else if plan == BagRestore::Refuse {
+            dev_info_ratelimited!(self.dev, "userbag: no Touch ID for uid {}: a saved catacomb but no loaded master to check it against\n", uid);
+            return false;
+        } else if plan == BagRestore::Load {
             let outcome = self.restore_catacomb(state, id, slot, c"bag user catacomb");
             if !matches!(outcome, crate::RestoreOutcome::AlreadyActive | crate::RestoreOutcome::Restored) {
-                dev_info_ratelimited!(self.dev, "userbag: no Touch ID for uid {}: its catacomb did not load ({:?})\n", uid, outcome);
+                if matches!(outcome, crate::RestoreOutcome::NoStoredFile) {
+                    dev_info_ratelimited!(
+                        self.dev,
+                        "userbag: no Touch ID for uid {}: the enclave expects its saved catacomb and the file is missing; restore the file (it is not recreated)\n",
+                        uid
+                    );
+                } else {
+                    dev_info_ratelimited!(self.dev, "userbag: no Touch ID for uid {}: its catacomb did not load ({:?})\n", uid, outcome);
+                }
                 return false;
             }
             // Loading it resets the enclave's biometry lockout for the user,
@@ -2176,6 +2228,20 @@ mod tests {
         assert!(bags.get(USER_HANDLE - 1).is_none());
         assert_eq!(bags.remove(USER_HANDLE).unwrap().0.value(), 3);
         assert!(bags.remove(USER_HANDLE).is_none());
+    }
+
+    #[test]
+    fn a_stale_bag_file_starts_afresh_only_against_a_loaded_master() {
+        // A component the enclave lists is loaded, file or not (a missing
+        // file is then refused by the load).
+        assert_eq!(bag_restore_plan(true, true, true), BagRestore::Load);
+        assert_eq!(bag_restore_plan(true, false, false), BagRestore::Load);
+        assert_eq!(bag_restore_plan(false, false, true), BagRestore::Nothing);
+        assert_eq!(bag_restore_plan(false, false, false), BagRestore::Nothing);
+        // A file the loaded master no longer knows is stale.
+        assert_eq!(bag_restore_plan(false, true, true), BagRestore::StartFresh);
+        // Without a loaded master, nothing proves that.
+        assert_eq!(bag_restore_plan(false, true, false), BagRestore::Refuse);
     }
 
     #[test]
