@@ -37,6 +37,8 @@ PRELUDE = r'''
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#define CONFIG_APPLE_CENTAURI_T6050_WIFI 1
+#define IS_ENABLED(option) ((option) ? 1 : 0)
 #define WRITE_ONCE(x,v) ((x)=(v))
 #define smp_store_release(p,v) (*(p)=(v))
 #define PCI_DEVFN(s,f) (((s)<<3)|(f))
@@ -93,6 +95,8 @@ static bool centauri_t6050_stop_dma(struct pci_dev *p)
 static bool centauri_t6050_ipc_fenced(struct centauri_t6050_ipc *p)
 { return !p || p->fenced; }
 static void cancel_delayed_work_sync(int *p) { (void)p; event(STOP_BOOT); }
+static void centauri_t6050_transport_recover_cancel(struct centauri_t6050 *c)
+{ (void)c; }
 static int centauri_t6050_beta_call(struct centauri_t6050_rewake *r, bool release)
 {
     struct centauri_t6050 *c = r->control->dev.data;
