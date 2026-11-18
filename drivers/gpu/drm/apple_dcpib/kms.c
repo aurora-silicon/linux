@@ -75,26 +75,44 @@ static bool dcpib_mode_fits(struct dcpib *dcp, const struct dcpib_timing_mode *t
 	return pixels * 24 * 112 / 100 <= link;
 }
 
+/* @mode's refresh rate in 16.16, as drm_mode_vrefresh() computes it. */
+static u32 dcpib_mode_fps(const struct drm_display_mode *mode)
+{
+	u64 num = mul_u32_u32(mode->clock, 1000) << 16;
+	u64 den = mul_u32_u32(mode->htotal, mode->vtotal);
+
+	if (mode->flags & DRM_MODE_FLAG_INTERLACE)
+		num *= 2;
+	if (mode->flags & DRM_MODE_FLAG_DBLSCAN)
+		den *= 2;
+	if (mode->vscan > 1)
+		den *= mode->vscan;
+	return den ? DIV64_U64_ROUND_CLOSEST(num, den) : 0;
+}
+
 /*
  * The firmware mode for @mode: same size, refresh rate within 1 Hz (EDID's
- * 59.94 against the firmware's 60.00), the nearest one.
+ * 59.94 against the firmware's 60.00), the nearest one by the exact rate.
+ * The firmware picks the timing from the rate, and next to the sink's
+ * 2560x1440@59.951 (241.5 MHz) it lists a 60.000 standard mode that it
+ * drives with CVT at 312.25 MHz, which the J873g's USB-C EV2780 rejects.
  */
 static const struct dcpib_timing_mode *
 dcpib_find_mode(struct dcpib *dcp, const struct drm_display_mode *mode)
 {
 	const struct dcpib_timing_mode *best = NULL;
-	int refresh = drm_mode_vrefresh(mode);
+	u32 fps = dcpib_mode_fps(mode);
 
 	for (unsigned int i = 0; i < dcp->nr_tmodes; i++) {
 		const struct dcpib_timing_mode *t = &dcp->tmodes[i];
 
 		if (!t->valid || le32_to_cpu(t->width) != mode->hdisplay ||
 		    le32_to_cpu(t->height) != mode->vdisplay ||
-		    abs(dcpib_refresh(t) - refresh) > 1 ||
+		    abs_diff(le32_to_cpu(t->fps), fps) > 0x10000 ||
 		    !dcpib_mode_fits(dcp, t))
 			continue;
-		if (!best || abs(dcpib_refresh(t) - refresh) <
-			     abs(dcpib_refresh(best) - refresh))
+		if (!best || abs_diff(le32_to_cpu(t->fps), fps) <
+			     abs_diff(le32_to_cpu(best->fps), fps))
 			best = t;
 	}
 	return best;
