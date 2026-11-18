@@ -1617,7 +1617,18 @@ static int dcp_v27_sleep_prepare(struct apple_dcp *dcp)
 	if (ret)
 		goto uncertain;
 	for (i = ARRAY_SIZE(v27_sleep_endpoints); i-- > 0;) {
-		ret = afk_v27_sleep_control(dcp->sleep_v27_ep[v27_sleep_endpoints[i] - 0x20], false);
+		struct apple_dcp_afkep *ep = dcp->sleep_v27_ep[v27_sleep_endpoints[i] - 0x20];
+		int check;
+
+		/*
+		 * An endpoint still taking a message (a service announced late, seen on 0x31 of
+		 * a K116s DCPEXT) answers -EBUSY for a moment: wait it out as the other steps do,
+		 * rather than refuse the sleep.
+		 */
+		if (ep)
+			read_poll_timeout(afk_v27_sleep_check, check, check != -EBUSY, 1000,
+					  300 * USEC_PER_MSEC, false, ep);
+		ret = afk_v27_sleep_control(ep, false);
 		if (ret) {
 			char name[12];
 
