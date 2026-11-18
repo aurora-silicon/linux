@@ -78,13 +78,29 @@
  */
 #define REG_CHAN_BASE_LEGACY(ch)	(0x8000 + (ch) * 0x200)
 #define REG_CHAN_BASE_EVOLVED(ch)	(((ch) & 1 ? 0xc000 : 0x8000) + ((ch) / 2) * 0x200)
-#define REG_CHAN_BASE(ad, ch)		((ad)->evolved_layout ? \
+/*
+ * T8152 (ADT admac-evolution,t8152; the macOS AudioDMAController-T8152
+ * driver): the same per-channel block, 0x4000 apart, TX at 0x40000 and RX
+ * at 0x80000, and a channel has to be put in state 2 (+0x30 bits 3:0)
+ * before it is started. The descriptor and report FIFO ports are the legacy
+ * ones (the RX descriptor port answers at 0x14000 + 4n, not at the ADT's
+ * 0x10040 + 4n).
+ */
+#define REG_CHAN_BASE_T8152(ch)		(((ch) & 1 ? 0x80000 : 0x40000) + ((ch) / 2) * 0x4000)
+#define REG_CHAN_BASE(ad, ch)		((ad)->t8152_layout ? REG_CHAN_BASE_T8152(ch) : \
+					 (ad)->evolved_layout ? \
 					 REG_CHAN_BASE_EVOLVED(ch) : REG_CHAN_BASE_LEGACY(ch))
 
 #define REG_CHAN_CTL(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0x00)
 #define REG_CHAN_CTL_RST_RINGS	BIT(0)
 #define REG_CHAN_CONFIG(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0x04)
+/* macOS writes this for the T8152 base-ns channels before every start */
+#define CHAN_CONFIG_T8152	0x029b0000
 #define REG_CHAN_BURST(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0x30)
+/* T8152: the low nibble of the same register is the channel state */
+#define REG_CHAN_STATE(ad, ch)	REG_CHAN_BURST(ad, ch)
+#define CHAN_STATE_MASK		GENMASK(3, 0)
+#define CHAN_STATE_READY	2
 
 #define REG_DESC_RING(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0x70)
 #define REG_REPORT_RING(ad, ch)	(REG_CHAN_BASE(ad, ch) + 0x74)
@@ -111,6 +127,11 @@
 
 #define REG_DESC_WRITE(ch)	(0x10000 + ((ch) / 2) * 0x4 + ((ch) & 1) * 0x4000)
 #define REG_REPORT_READ(ch)	(0x10100 + ((ch) / 2) * 0x4 + ((ch) & 1) * 0x4000)
+
+/* T8152: the AP's share of each SRAM pool starts above the firmware's. */
+#define T8152_SRAM_BASE		0x1000
+#define T8152_SRAM_BLOCK	1024
+#define SRAM_SIZE_MASK		GENMASK(15, 0)
 
 #define REG_TX_INTSTATE(idx)		(0x0030 + (idx) * 4)
 #define REG_RX_INTSTATE(idx)		(0x0040 + (idx) * 4)
@@ -163,6 +184,8 @@ struct admac_chan {
 	struct tasklet_struct tasklet;
 
 	u32 carveout;
+	/* T8152: transfer descriptor id, 1..255 */
+	u8 desc_id;
 
 	spinlock_t lock;
 	struct admac_tx *current_tx;
@@ -214,6 +237,7 @@ struct admac_data {
 	bool evolved_layout;
 	bool split_channels;
 	bool display;
+	bool t8152_layout;
 	bool ctl_programmed;
 	/* Display ADMAC: its control block's two windows and their tunables */
 	void __iomem *control[2];
@@ -247,6 +271,7 @@ struct admac_hw {
 	bool evolved_layout;
 	bool split_channels;
 	bool display;
+	bool t8152_layout;
 };
 
 static int admac_alloc_sram_carveout(struct admac_data *ad,
@@ -255,12 +280,21 @@ static int admac_alloc_sram_carveout(struct admac_data *ad,
 {
 	struct admac_sram *sram;
 	int i, ret = 0, nblocks;
+	u32 first = 0, block = SRAM_BLOCK;
+
 	ad->txcache.size = readl_relaxed(ad->base + REG_TX_SRAM_SIZE);
 	ad->rxcache.size = readl_relaxed(ad->base + REG_RX_SRAM_SIZE);
 	/* T8132 reports channel metadata in the upper half of these words. */
 	if (ad->split_channels) {
 		ad->txcache.size &= GENMASK(15, 0);
 		ad->rxcache.size &= GENMASK(15, 0);
+	}
+	if (ad->t8152_layout) {
+		/* bits 31:24 are the channel count */
+		ad->txcache.size &= SRAM_SIZE_MASK;
+		ad->rxcache.size &= SRAM_SIZE_MASK;
+		first = T8152_SRAM_BASE;
+		block = T8152_SRAM_BLOCK;
 	}
 
 	if (dir == DMA_MEM_TO_DEV)
@@ -270,14 +304,14 @@ static int admac_alloc_sram_carveout(struct admac_data *ad,
 
 	mutex_lock(&ad->cache_alloc_lock);
 
-	nblocks = sram->size / SRAM_BLOCK;
+	nblocks = sram->size > first ? (sram->size - first) / block : 0;
 	for (i = ad->split_channels ? 1 : 0; i < nblocks; i++)
 		if (!(sram->allocated & BIT(i)))
 			break;
 
 	if (i < nblocks) {
-		*out = FIELD_PREP(CHAN_SRAM_CARVEOUT_BASE, i * SRAM_BLOCK) |
-			FIELD_PREP(CHAN_SRAM_CARVEOUT_SIZE, SRAM_BLOCK);
+		*out = FIELD_PREP(CHAN_SRAM_CARVEOUT_BASE, first + i * block) |
+			FIELD_PREP(CHAN_SRAM_CARVEOUT_SIZE, block);
 		sram->allocated |= BIT(i);
 	} else {
 		ret = -EBUSY;
@@ -294,18 +328,24 @@ static void admac_free_sram_carveout(struct admac_data *ad,
 {
 	struct admac_sram *sram;
 	u32 base = FIELD_GET(CHAN_SRAM_CARVEOUT_BASE, carveout);
+	u32 first = 0, block = SRAM_BLOCK;
 	int i;
+
+	if (ad->t8152_layout) {
+		first = T8152_SRAM_BASE;
+		block = T8152_SRAM_BLOCK;
+	}
 
 	if (dir == DMA_MEM_TO_DEV)
 		sram = &ad->txcache;
 	else
 		sram = &ad->rxcache;
 
-	if (WARN_ON(base >= sram->size))
+	if (WARN_ON(base < first || base >= sram->size))
 		return;
 
 	mutex_lock(&ad->cache_alloc_lock);
-	i = base / SRAM_BLOCK;
+	i = (base - first) / block;
 	sram->allocated &= ~BIT(i);
 	mutex_unlock(&ad->cache_alloc_lock);
 }
@@ -409,6 +449,15 @@ static void admac_write_hw_desc(struct admac_data *ad, int channo,
 
 		adchan->seq = adchan->seq == 0xff ? 1 : adchan->seq + 1;
 		flags = DISPLAY_FLAG_DESC_REPORT | adchan->seq;
+	} else if (ad->t8152_layout) {
+		/*
+		 * T8152: the low byte of the last word is a descriptor id,
+		 * which macOS counts 1..255 and never leaves at 0.
+		 */
+		struct admac_chan *adchan = &ad->channels[channo];
+
+		adchan->desc_id = adchan->desc_id == 255 ? 1 : adchan->desc_id + 1;
+		flags = FLAG_DESC_NOTIFY | adchan->desc_id;
 	}
 
 	dev_dbg(ad->dev, "ch%d descriptor: addr=0x%pad len=0x%zx flags=0x%x\n",
@@ -670,6 +719,11 @@ static void admac_start_chan(struct admac_chan *adchan)
 			       ad->base + REG_CHAN_INTSTATUS(ad, adchan->no, ad->irq_index));
 		writel_relaxed(STATUS_DESC_DONE | STATUS_ERR,
 			       ad->base + REG_CHAN_INTMASK(ad, adchan->no, ad->irq_index));
+	}
+	if (ad->t8152_layout) {
+		writel_relaxed(CHAN_CONFIG_T8152, ad->base + REG_CHAN_CONFIG(ad, adchan->no));
+		admac_modify(ad, REG_CHAN_STATE(ad, adchan->no), CHAN_STATE_MASK,
+			     CHAN_STATE_READY);
 	}
 
 	switch (admac_chan_direction(adchan->no)) {
@@ -1445,7 +1499,8 @@ static int admac_device_config(struct dma_chan *chan,
 	 * of words position in a frame. That's where the importance of this control
 	 * comes from.
 	 */
-	switch (is_tx ? config->dst_port_window_size : config->src_port_window_size) {
+	switch (ad->t8152_layout ? 0 :
+		is_tx ? config->dst_port_window_size : config->src_port_window_size) {
 	case 0 ... 1:
 		break;
 	case 2:
@@ -1466,6 +1521,15 @@ static int admac_device_config(struct dma_chan *chan,
 	writel_relaxed(bus_width, ad->base + REG_BUS_WIDTH(ad, adchan->no));
 
 	adchan->realign_bytes = admac_config_realign_bytes(config);
+
+	/*
+	 * Optional: a u32 frame size in bytes, which a paused capture is
+	 * restarted aligned to on resume (see admac_cyclic_realign()).
+	 */
+	if (config->peripheral_config && config->peripheral_size == sizeof(u32))
+		adchan->realign_bytes = *(u32 *)config->peripheral_config;
+	else
+		adchan->realign_bytes = 0;
 
 	/*
 	 * By FIFOCTL_LIMIT we seem to set the maximal number of bytes allowed to be
@@ -1588,6 +1652,7 @@ static int admac_probe(struct platform_device *pdev)
 	ad->evolved_layout = hw->evolved_layout;
 	ad->split_channels = hw->split_channels;
 	ad->display = hw->display;
+	ad->t8152_layout = hw->t8152_layout;
 	mutex_init(&ad->cache_alloc_lock);
 
 	if (ad->display) {
@@ -1751,8 +1816,13 @@ static const struct admac_hw admac_t6050_display_hw = {
 	.display = true,
 };
 
+static const struct admac_hw admac_t8152_hw = {
+	.t8152_layout = true,
+};
+
 static const struct of_device_id admac_of_match[] = {
 	{ .compatible = "apple,t6050-display-admac", .data = &admac_t6050_display_hw },
+	{ .compatible = "apple,t8152-admac", .data = &admac_t8152_hw },
 	{ .compatible = "apple,t8140-admac", .data = &admac_t8140_hw },
 	{ .compatible = "apple,t8132-admac", .data = &admac_t8132_hw },
 	{ .compatible = "apple,t8122-admac", .data = &admac_t8122_hw },

@@ -10,6 +10,7 @@
 
 #include <dt-bindings/interrupt-controller/apple-aic.h>
 #include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/spmi/spmi.h>
 
 / {
 	compatible = "apple,j873g", "apple,t8152", "apple,arm-platform";
@@ -205,6 +206,15 @@
 			opp-level = <3>;
 		};
 	};
+
+	/* The 24 MHz timebase (ADT timebase-frequency), as on T8103. */
+	clkref: clock-ref {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <24000000>;
+		clock-output-names = "clkref";
+	};
+
 	timer {
 		compatible = "arm,armv8-timer";
 		interrupts = <AIC_FIQ AIC_TMR_GUEST_PHYS IRQ_TYPE_LEVEL_HIGH>,
@@ -241,6 +251,62 @@
 			#performance-domain-cells = <0>;
 		};
 
+		/*
+		 * ADT /arm-io/nub-spmi0 (gen 4) and its primary PMU, pmu-main
+		 * ("woodcote", slave 0xe). The boot flags live in the legacy
+		 * scratchpad (info-leg_scrpad = 0xf800), laid out as on T8103
+		 * and T8140; boot_stage read 0x30 (kernel started) here.
+		 */
+		nub_spmi0: spmi@308714000 {
+			/*
+			 * Gen 4: FIFO registers at 0x200 (the block is 0x4000
+			 * long); polled, so no interrupts are described yet.
+			 */
+			compatible = "apple,t8152-spmi", "apple,t8142-spmi";
+			reg = <0x3 0x08714000 0x0 0x4000>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+
+			pmic@e {
+				compatible = "apple,woodcote-pmic", "apple,spmi-nvmem";
+				reg = <0xe SPMI_USID>;
+
+				nvmem-layout {
+					compatible = "fixed-layout";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					boot_stage: boot-stage@f801 {
+						reg = <0xf801 0x1>;
+					};
+
+					boot_error_count: boot-error-count@f802,0 {
+						reg = <0xf802 0x1>;
+						bits = <0 4>;
+					};
+
+					panic_count: panic-count@f802,4 {
+						reg = <0xf802 0x1>;
+						bits = <4 4>;
+					};
+
+					/* Set before off1, or the machine powers back on. */
+					shutdown_flag: shutdown-flag@f80f,3 {
+						reg = <0xf80f 0x1>;
+						bits = <3 1>;
+					};
+				};
+			};
+		};
+
+		/* ADT /arm-io/wdt (wdt,t8152): restart fallback and /dev/watchdog. */
+		wdt: watchdog@3082b0000 {
+			compatible = "apple,t8152-wdt", "apple,t8103-wdt";
+			reg = <3 0x082b0000 0 0x4000>;
+			clocks = <&clkref>;
+			interrupts = <AIC_IRQ 447 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
 		smc_mbox: mailbox@30c710080 {
 			compatible = "apple,t8152-smc-mailbox";
 			reg = <3 0x0c710080 0 0x80>;
@@ -257,6 +323,15 @@
 			reg-names = "smc", "sram";
 			mboxes = <&smc_mbox>;
 
+			/* Power off (MBSE = off1) and restart (MBSE = phra). */
+			smc_reboot: reboot {
+				compatible = "apple,smc-reboot";
+				nvmem-cells = <&shutdown_flag>, <&boot_stage>,
+					      <&boot_error_count>, <&panic_count>;
+				nvmem-cell-names = "shutdown_flag", "boot_stage",
+						   "boot_error_count", "panic_count";
+			};
+
 			hwmon {
 				compatible = "apple,smc-hwmon";
 				apple,discover-temperatures;
@@ -265,6 +340,8 @@
 					apple,key-id = "F0Ac";
 					apple,fan-minimum = "F0Mn";
 					apple,fan-maximum = "F0Mx";
+					apple,fan-target = "F0Tg";
+					apple,fan-mode = "F0md";
 					label = "Fan";
 				};
 			};
@@ -293,12 +370,6 @@
 &dwc3_0_dart {
 	reg = <0x4 0x3020000 0x0 0xc000>,
 	      <0x4 0x3040000 0x0 0xc000>;
-};
-
-/* Retain the register view published by this board's live hardware capture. */
-&dwc3_1_dart {
-	reg = <0x4 0xb020000 0x0 0xc000>,
-	      <0x4 0xb040000 0x0 0xc000>;
 };
 
 /* Retain the register view published by this board's live hardware capture. */
@@ -423,10 +494,11 @@
 	      <0x3 0xa0000000 0x0 0x8000>;
 };
 
-/* Unexposed chassis port instances remain described and disabled. */
-
-/* Retain the register view published by this board's live hardware capture. */
-&dwc3_2_dart {
-	reg = <0x3 0x83020000 0x0 0xc000>,
-	      <0x3 0x83040000 0x0 0xc000>;
-};
+/*
+ * The J873g fragments enable and refine nodes of t8152-peripherals.dtsi
+ * (the USB, apcie port 2 and dart-sbr DARTs), so they come after it.
+ */
+#include "t8152-j873-nvme.dtsi"
+#include "t8152-j873-usb.dtsi"
+#include "t8152-j873-ethernet.dtsi"
+#include "t8152-j873-audio.dtsi"

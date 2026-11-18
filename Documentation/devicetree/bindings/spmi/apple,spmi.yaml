@@ -41,6 +41,11 @@ properties:
               - apple,t8132-spmi
               - apple,t8140-spmi
           - const: apple,t8103-spmi
+      - description:
+          The gen-4 controller of T8152, with its FIFO registers at 0x200.
+        items:
+          - const: apple,t8152-spmi
+          - const: apple,t8142-spmi
 
   reg:
     minItems: 1
