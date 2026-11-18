@@ -50,6 +50,8 @@ int centauri_t6050_boot_phase_for_control_stage(u32 control_stage,
 }
 EXPORT_SYMBOL_GPL(centauri_t6050_boot_phase_for_control_stage);
 
+#if IS_ENABLED(CONFIG_APPLE_CENTAURI_T6050)
+
 #define CEN_TRANSPORT_RECOVER_MAX 3
 
 static void centauri_t6050_transport_recover_worker(struct work_struct *work)
@@ -122,6 +124,8 @@ out_unlock:
 	mutex_unlock(&c->boot_lock);
 }
 EXPORT_SYMBOL_GPL(centauri_t6050_schedule_transport_recover);
+
+#endif /* CONFIG_APPLE_CENTAURI_T6050 */
 
 #if IS_ENABLED(CONFIG_APPLE_CENTAURI_T6050_RECOVERY_KUNIT)
 
