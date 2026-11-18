@@ -23,6 +23,7 @@
 #include <linux/unaligned.h>
 
 #include "centauri_t6050.h"
+#include "centauri_recovery.h"
 
 /* Registry owns one reference, registrations and queued work own additional ones. */
 struct centauri_t6050_rewake {
@@ -472,8 +473,10 @@ static void centauri_t6050_boot_worker(struct work_struct *work)
 			break;
 		case CEN_BOOT_IPC:
 			ret = centauri_t6050_start_ipc(c);
-			if (!ret)
+			if (!ret) {
 				c->boot_phase = CEN_BOOT_READY;
+				c->transport_recover_count = 0;
+			}
 			break;
 		default:
 			goto out;
@@ -519,6 +522,8 @@ static int centauri_t6050_probe(struct pci_dev *pdev, const struct pci_device_id
 	c->link_ready = true;
 	mutex_init(&c->boot_lock);
 	INIT_DELAYED_WORK(&c->boot_work, centauri_t6050_boot_worker);
+	if (IS_ENABLED(CONFIG_APPLE_CENTAURI_T6050_WIFI))
+		centauri_t6050_transport_recover_init(c);
 	c->boot_phase = CEN_BOOT_ROM;
 	ret = device_property_read_string(&pdev->dev, "firmware-name", &c->firmware_name);
 	if (ret)
@@ -775,6 +780,8 @@ static int centauri_t6050_quiesce(struct centauri_t6050 *c)
 	WRITE_ONCE(c->removing, true);
 	/* Pairs with control_ready: no new consumer can attach. */
 	smp_store_release(&c->ready, false);
+	if (IS_ENABLED(CONFIG_APPLE_CENTAURI_T6050_WIFI))
+		centauri_t6050_transport_recover_cancel(c);
 	cancel_delayed_work_sync(&c->boot_work);
 	/* Never hold boot_lock over an HCI close or Bluetooth work cancellation. */
 	ret = centauri_t6050_beta_call(c->recovery, false);
