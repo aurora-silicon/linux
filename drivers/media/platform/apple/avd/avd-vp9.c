@@ -189,7 +189,6 @@ struct avd_vp9_bank {
 		struct avd_buf lf_left_info;
 		struct avd_buf lf_left;
 		struct avd_buf color;
-		struct avd_buf seg;
 		struct avd_buf pipe_state;
 		struct avd_buf counts;
 		struct avd_buf probs;
@@ -205,6 +204,13 @@ struct avd_vp9_ctx {
 	unsigned int nbanks;
 	struct avd_vp9_bank bank[AVD_VP9_BANKS];
 	struct avd_vp9_bank *b;
+	/*
+	 * The segmentation map, one per stream. A frame reads the map the frame
+	 * before it left (temporal prediction, or a frame without a map update),
+	 * so the two banks of the queued transport must share it: with one
+	 * buffer per bank, a frame read the map of the frame before last.
+	 */
+	struct avd_buf seg;
 };
 
 static bool avd_vp9_needs_counts(u32 flags)
@@ -422,8 +428,8 @@ static void set_header(struct avd_ctx *ctx, struct avd_vp9_run *run)
 	pusha(vp9_ctx->b->bufs.counts.addr, "counts", 0);
 	pusha(vp9_ctx->b->bufs.probs.addr, "probs", 0);
 	pusha(vp9_ctx->b->bufs.above_info.addr, "above_info", 0);
-	pusha(vp9_ctx->b->bufs.seg.addr, "seg", 1);
-	pusha(vp9_ctx->b->bufs.seg.addr, "seg", 2);
+	pusha(vp9_ctx->seg.addr, "seg", 1);
+	pusha(vp9_ctx->seg.addr, "seg", 2);
 	pusha(vp9_ctx->b->bufs.color.addr, "color", 3);
 	pusha(avd_vp9_uses_prev_mv(frame->flags, &vp9_ctx->last) ?
 		      vp9_ctx->last.color : vp9_ctx->b->bufs.color.addr,
@@ -735,10 +741,6 @@ static int avd_vp9_alloc_bufs(struct avd_ctx *ctx, struct avd_vp9_bank *bank)
 		return ret;
 	ret = avd_buf_alloc(avd, &bank->bufs.lf_above,
 			    DIV_ROUND_UP(w, 8) * 16 * bit_depth);
-	if (ret)
-		return ret;
-
-	ret = avd_buf_alloc(avd, &bank->bufs.seg, DIV_ROUND_UP(w, 8) * 24);
 	if (ret)
 		return ret;
 
@@ -1119,6 +1121,7 @@ static void avd_vp9_free(struct avd_ctx *ctx, struct avd_vp9_ctx *vp9_ctx)
 	struct avd_dev *avd = ctx->dev;
 
 	ctx->max_frames = 1;
+	avd_buf_free(avd, &vp9_ctx->seg);
 	for (unsigned int i = 0; i < vp9_ctx->nbanks; i++) {
 		struct avd_vp9_bank *bank = &vp9_ctx->bank[i];
 
@@ -1126,7 +1129,6 @@ static void avd_vp9_free(struct avd_ctx *ctx, struct avd_vp9_ctx *vp9_ctx)
 		avd_buf_free(avd, &bank->bufs.inst);
 		avd_buf_free(avd, &bank->bufs.probs);
 		avd_buf_free(avd, &bank->bufs.counts);
-		avd_buf_free(avd, &bank->bufs.seg);
 		avd_buf_free(avd, &bank->bufs.color);
 		avd_buf_free(avd, &bank->bufs.ip_above);
 		avd_buf_free(avd, &bank->bufs.lf_above);
@@ -1157,6 +1159,9 @@ static int avd_vp9_start(struct avd_ctx *ctx)
 
 	vp9_ctx->nbanks = avd_qfw_has_vp_done(ctx->dev) ? AVD_VP9_BANKS : 1;
 	vp9_ctx->b = &vp9_ctx->bank[0];
+	ret = avd_buf_alloc(ctx->dev, &vp9_ctx->seg, DIV_ROUND_UP(fmt_width(ctx), 8) * 24);
+	if (ret)
+		goto err_free_ctx;
 	for (unsigned int i = 0; i < vp9_ctx->nbanks; i++) {
 		ret = avd_vp9_alloc_bufs(ctx, &vp9_ctx->bank[i]);
 		if (ret)
