@@ -7026,6 +7026,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 
 	INIT_LIST_HEAD(&dcp->swapped_out_fbs);
 	mutex_init(&dcp->swapped_out_fbs_lock);
+	init_completion(&dcp->v27_wake_video);
+	init_completion(&dcp->v27_wake_hotplug);
 	ret = dcp_backlight_init(dcp, dev);
 	if (ret)
 		return ret;

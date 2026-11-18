@@ -4249,6 +4249,21 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	keep_mode = dcp->v27_j714s && xchg(&dcp->v27_keep_mode, false) &&
 		    dcp->mode.color_mode_id == mode->color_mode_id &&
 		    dcp->mode.timing_mode_id == mode->timing_mode_id;
+	/*
+	 * Firmware 27.2: sent once the panel's video interface is open again and the firmware
+	 * has reported the panel, which it does after the open.
+	 */
+	if (keep_mode && iomfb_v27_methods_renumbered(dcp->v27_methods)) {
+		if (!wait_for_completion_timeout(&dcp->v27_wake_video,
+						 msecs_to_jiffies(V27_WAKE_VIDEO_MS)))
+			dev_warn(dcp->dev, "V27 wake: panel video interface not open after %u ms\n",
+				 V27_WAKE_VIDEO_MS);
+		else if (!wait_for_completion_timeout(&dcp->v27_wake_hotplug,
+						      msecs_to_jiffies(V27_WAKE_HOTPLUG_MS)))
+			dev_warn(dcp->dev, "V27 wake: no hotplug report %u ms after the panel's open\n",
+				 V27_WAKE_HOTPLUG_MS);
+		keep_mode = false;
+	}
 #endif
 	dcp->mode = (struct dcp_set_digital_out_mode_req){
 		.color_mode_id = mode->color_mode_id,

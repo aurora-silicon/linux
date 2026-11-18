@@ -944,6 +944,10 @@ struct apple_dcp {
 
 	/* V27 sleep: the panel's next mode set is the mode it already has */
 	bool v27_keep_mode;
+	/* Since the V27 wake: the panel's video interface opened, the firmware reported the panel */
+	struct completion v27_wake_video, v27_wake_hotplug;
+#define V27_WAKE_VIDEO_MS	1500
+#define V27_WAKE_HOTPLUG_MS	250
 	/* V27 sleep: the output area of the call being pushed holds this (an in/out word) */
 	const void *push_out_prefill;
 

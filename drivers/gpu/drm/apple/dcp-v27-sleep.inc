@@ -1204,6 +1204,8 @@ static int dcp_v27_reopen_live(struct apple_dcp *dcp)
 					return ret;
 				s->soft_off = false;
 			}
+			reinit_completion(&dcp->v27_wake_video);
+			reinit_completion(&dcp->v27_wake_hotplug);
 			WRITE_ONCE(dcp->v27_keep_mode, true);
 		} else if (s->ext_wake) {
 			ret = dcp_v27_ext_wake_calls(s);
