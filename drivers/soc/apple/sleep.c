@@ -3698,6 +3698,21 @@ void apple_sleep_lid_closed_wake(void)
 }
 EXPORT_SYMBOL_GPL(apple_sleep_lid_closed_wake);
 
+/*
+ * macOS leaves a wake for a charger or a cable alone a dark one. With the lid closed
+ * nothing there is for the user: sleep again.
+ */
+void apple_sleep_port_wake(bool lid_closed)
+{
+	struct apple_sleep *s = apple_sleep;
+
+	if (!s || !s->smc_woke_alone || !lid_closed)
+		return;
+	dev_info(s->dev, "woken for a port with the lid closed: dark wake\n");
+	pm_set_dark_wake();
+}
+EXPORT_SYMBOL_GPL(apple_sleep_port_wake);
+
 /* Read in the SMC's noirq resume. Forgotten as each sleep begins. */
 static int sleep_lid_closed = -ENODATA;
 
