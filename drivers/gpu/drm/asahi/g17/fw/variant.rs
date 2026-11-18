@@ -181,8 +181,8 @@ pub(crate) const V25G83: Variant = Variant {
     // When a tiling pass runs out of memory with this set, the firmware resumes it without
     // adding memory and the tiler stops silently; macOS always writes 0.
     fragment_busy: false,
-    // Not measured on this firmware.
-    busy_heap_growth: false,
+    // Taken as on 26A428: run on the J616c (T6041).
+    busy_heap_growth: true,
     lead_commands: true,
     programs: super::render::RegisterPrograms::V25G83,
     ta_mode_1: false,
@@ -212,6 +212,8 @@ pub(crate) const V25F84: Variant = Variant {
     compute: super::compute::ComputeProgram::V25F84,
     opening_record: false,
     split_firmware_area: true,
+    // Not run on this firmware.
+    busy_heap_growth: false,
     ..V25G83
 };
 
