@@ -3765,6 +3765,24 @@ static void dcp_t8132_dptx_teardown_log(struct apple_dcp *dcp, u32 port,
 		 le32_to_cpu(READ_ONCE(*ep->txbfr.rptr)), le32_to_cpu(READ_ONCE(*ep->txbfr.wptr)));
 }
 
+/*
+ * A T8132 dcpext lowers only the HPD its connect raised. An answer that comes
+ * after the call timed out is the call's orphan's (see
+ * dcp_dptx_release_locked()).
+ */
+static void dcp_t8132_hpd_low(struct apple_dcp *dcp, u32 port)
+{
+	int ret;
+
+	if (!dptx_service_available(&dcp->dptxport[port]) ||
+	    !READ_ONCE(dcp->dptxport[port].connected))
+		return;
+	ret = dptxport_set_hpd(dcp->dptxport[port].service, false);
+	dcp_t8132_dptx_teardown_log(dcp, port, "set_hpd(0)", ret);
+	if (ret == -ETIMEDOUT)
+		WRITE_ONCE(dcp->t8132_release_late, true);
+}
+
 static int dcp_dptx_release_locked(struct apple_dcp *dcp, u32 port)
 {
 	int ret;
@@ -3904,6 +3922,12 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 			/* Nothing left to retry for the display that went. */
 			if (dcp->external_native)
 				cancel_delayed_work(&dcp->external_retry_wq);
+			/*
+			 * A T8132 dcpext's replay after a deep sleep stops
+			 * waiting for it (see dcp_t8132_sleep_reconnect()).
+			 */
+			if (dcp_is_t8132_ext(dcp))
+				iomfb_m4_ext_relink_lost(dcp);
 		}
 		WRITE_ONCE(dcp->typec_crtc_off, false);
 		reinit_completion(&dcp->typec_iomfb_hpd_ready);
@@ -3930,20 +3954,12 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 		av_service_disconnect(dcp);
 
 	/*
-	 * A T8132 dcpext lowers only the HPD its connect raised, and, as
-	 * desktop 26.x compact DPTX does, still releases the display when the
-	 * firmware refuses: a refusal must not keep a released tunnel's route.
-	 * An answer that comes after the call timed out is the call's orphan's
-	 * (see dcp_dptx_release_locked()).
+	 * A T8132 dcpext, as desktop 26.x compact DPTX does, still releases the
+	 * display when the firmware refuses its HPD low: a refusal must not keep
+	 * a released tunnel's route.
 	 */
 	if (dcp_is_t8132_ext(dcp)) {
-		if (dptx_service_available(&dcp->dptxport[port]) &&
-		    READ_ONCE(dcp->dptxport[port].connected)) {
-			ret = dptxport_set_hpd(dcp->dptxport[port].service, false);
-			dcp_t8132_dptx_teardown_log(dcp, port, "set_hpd(0)", ret);
-			if (ret == -ETIMEDOUT)
-				WRITE_ONCE(dcp->t8132_release_late, true);
-		}
+		dcp_t8132_hpd_low(dcp, port);
 	} else if (dptx_service_available(&dcp->dptxport[port])) {
 		ret = dptxport_set_hpd(dcp->dptxport[port].service, false);
 		if (ret)
@@ -9227,6 +9243,67 @@ bool dcp_s2r_firmware_stopped(struct platform_device *pdev)
 
 #include "dcp-v27-sleep.inc"
 
+/*
+ * A deep sleep powers a T8132 dcpext down whole (iomfb_m4_ext_stop()), and its
+ * firmware starts again from reset after it. Firmware that starts with its
+ * DPTX port still connected brings the link up on hardware the sleep reset,
+ * and crashes (an SError) with any display attached. So, in its deep-sleep
+ * suspend, before A500 while its firmware still runs, its display is released
+ * as an unplug releases it, HPD low first, and its crossbar output is parked.
+ * The cable stays connected: dcp_t8132_sleep_reconnect() connects the display
+ * again.
+ */
+static void dcp_t8132_sleep_release(struct apple_dcp *dcp)
+{
+	if (!dcp_is_t8132_ext(dcp) || pm_suspend_target_state != PM_SUSPEND_MEM)
+		return;
+	dcp_disable_typec_work(dcp, false);
+	/*
+	 * Connected again after the wake: the DRM replay waits for it, its
+	 * connector held from before the HPD low.
+	 */
+	if (dptx_service_available(&dcp->dptxport[0]) &&
+	    READ_ONCE(dcp->dptxport[0].connected))
+		iomfb_m4_ext_relink_expect(dcp);
+	dcp_t8132_hpd_low(dcp, 0);
+	/* Released whatever the firmware answers (dcp_dptx_release_locked()). */
+	dcp_dptx_disconnect(dcp, 0);
+	dcp_typec_route_park(dcp);
+	dcp->t8132_sleep_released = true;
+}
+
+/* After the sleep, or a suspend that failed: the route back, then the link. */
+static void dcp_t8132_sleep_reconnect(struct apple_dcp *dcp)
+{
+	if (!dcp->t8132_sleep_released)
+		return;
+	dcp->t8132_sleep_released = false;
+	dcp_typec_route_unpark(dcp);
+	/*
+	 * A display unplugged from now on (or already) is not waited for: an
+	 * unplug clears the cable and reports the display lost under hpd_mutex
+	 * (dcp_dptx_disconnect_oob()), so one of the two sees the other.
+	 */
+	scoped_guard(mutex, &dcp->hpd_mutex)
+		iomfb_m4_ext_relink_arm(dcp, READ_ONCE(dcp->typec_cable_connected));
+	/* Queues the connect while the cable is still there. */
+	dcp_enable_typec_work(dcp);
+}
+
+/*
+ * Its firmware stopped for the sleep (iomfb_m4_ext_stop()) starts again from
+ * reset: the calls of an earlier teardown that timed out are never answered
+ * now, and its connect after the wake does not wait for them
+ * (dcp_t8132_wait_teardown_answers()).
+ */
+static void dcp_t8132_sleep_stopped(struct apple_dcp *dcp)
+{
+	if (!dcp_is_t8132_ext(dcp) || !dcp->dptxep || !iomfb_m4_ext_stopped(dcp))
+		return;
+	afk_compact_orphans_drop(dcp->dptxep);
+	WRITE_ONCE(dcp->t8132_release_late, false);
+}
+
 static int dcp_platform_suspend(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
@@ -9271,11 +9348,17 @@ static int dcp_platform_suspend(struct device *dev)
 	 * (iomfb_m4_suspend()).
 	 */
 	if (iomfb_is_m4(dcp)) {
-		int ret = iomfb_m4_suspend(dcp);
+		int ret;
 
-		if (!ret)
-			device_set_wakeup_path(dev);
-		return ret;
+		dcp_t8132_sleep_release(dcp);
+		ret = iomfb_m4_suspend(dcp);
+		if (ret) {
+			dcp_t8132_sleep_reconnect(dcp);
+			return ret;
+		}
+		dcp_t8132_sleep_stopped(dcp);
+		device_set_wakeup_path(dev);
+		return 0;
 	}
 	if (dcp_is_ext26(dcp) && pm_suspend_target_state != PM_SUSPEND_TO_IDLE) {
 		dev_warn(dev, "native26 refuses non-s2idle target %d\n", pm_suspend_target_state);
@@ -9382,8 +9465,12 @@ static int dcp_platform_resume(struct device *dev)
 	if (dcp->s2r_stopped)
 		return dcp_s2r_resume(dcp);
 
-	if (iomfb_is_m4(dcp))
-		return iomfb_m4_resume(dcp);
+	if (iomfb_is_m4(dcp)) {
+		int ret = iomfb_m4_resume(dcp);
+
+		dcp_t8132_sleep_reconnect(dcp);
+		return ret;
+	}
 	if (READ_ONCE(dcp->ext_dead))
 		return 0;
 
