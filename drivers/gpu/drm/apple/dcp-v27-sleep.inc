@@ -69,6 +69,13 @@ static void dcp_v27_sessions(struct apple_dcp *dcp, bool open);
 static bool dcp_v27_external(struct apple_dcp *dcp);
 static int dcp_v27_rtkit_cycle(struct apple_dcp *dcp, unsigned int pause_ms);
 
+/* The wake's mode set waits for these two reports: none from before the power-on counts. */
+static void dcp_v27_wake_expect(struct apple_dcp *dcp)
+{
+	reinit_completion(&dcp->v27_wake_video);
+	reinit_completion(&dcp->v27_wake_hotplug);
+}
+
 /*
  * The calls made before A484's plain form in either direction, at the wake and at the display's
  * sleep: A414, A489, A489, A487, A489, A412. At the wake each is followed by A500's wake form, at
@@ -1216,6 +1223,8 @@ static int dcp_v27_reopen_live(struct apple_dcp *dcp)
 				dcp_v27_rtkit_cycle(dcp, 0);
 			if (s->soft_off && v27_a115)
 				iomfb_v27_sleep_call(dcp, "A489", NULL, 0, 4);
+			/* Before the call that brings the panel up: its reports come from workers. */
+			dcp_v27_wake_expect(dcp);
 			ret = iomfb_v27_sleep_rpc(dcp, false, true);
 			if (ret)
 				return ret;
@@ -1247,6 +1256,8 @@ static int dcp_v27_reopen_live(struct apple_dcp *dcp)
 				dcp_v27_display_stage(dcp, per_call, per_call && v27_session_rounds, per_call);
 				if (v27_session_rounds)
 					dcp_v27_sessions(dcp, true);
+				/* Again, in the session the display comes on in. */
+				dcp_v27_wake_expect(dcp);
 				ret = iomfb_v27_sleep_plain(dcp, true);
 				if (ret)
 					return ret;
