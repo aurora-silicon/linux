@@ -11,7 +11,7 @@ mod attribution;
 mod slot;
 mod safety;
 pub(crate) use safety::{note_retired, since_retired};
-pub(crate) use attribution::{fault_qids, Record, Sources, PAGE_FAULT};
+pub(crate) use attribution::{fault_qids, Record, Sources};
 use attribution::Attribution;
 
 pub(super) fn slot_key(slot: usize, slot_keys: Option<u64>) -> Option<u64> {

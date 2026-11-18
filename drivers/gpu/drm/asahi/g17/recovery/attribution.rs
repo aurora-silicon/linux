@@ -58,6 +58,8 @@ pub(crate) struct Sources {
     mask: u32,
     records: [Source; SLOTS],
     count: usize,
+    /// `reason` reads PAGE_FAULT, but no MMU fault bank holds a fault (`check_fault_banks`).
+    stale_fault: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,6 +108,7 @@ impl Sources {
             mask,
             records: [Source::default(); SLOTS],
             count: 0,
+            stale_fault: false,
         };
         for slot in 0..SLOTS {
             if mask & (1 << slot) == 0 {
@@ -132,6 +135,40 @@ impl Sources {
         self.reason.or(self.record.map(|record| record.reason))
     }
 
+    /// Completes the reason of `InitData::fault_sources`. M5 attribution leaves the firmware
+    /// reason out: its latched MMU fault register (`mmu_fault`) gives reason 3. A reason read
+    /// from the firmware's reason word is checked against the MMU fault banks (`banks`, read
+    /// while the firmware is halted) on every firmware ([`Self::check_fault_banks`]).
+    pub(crate) fn settle_reason(&mut self, mmu_fault: bool, banks: impl FnOnce() -> Option<[(u64, u64); 2]>) {
+        if self.reason.is_some() {
+            if let Some(banks) = banks() {
+                self.check_fault_banks(&banks);
+            }
+        } else if mmu_fault {
+            self.reason = Some(PAGE_FAULT);
+        }
+    }
+
+    /// The firmware writes its reason word only for some restarts, and nothing clears it: after
+    /// a page fault, every later restart it gives no reason for still reads PAGE_FAULT
+    /// (2026-11-18, 25G83: a deqp-vk spin read 0 before the boot's first page fault, 3 after
+    /// it). A page fault keeps its access latched in an MMU fault bank until the restart, so
+    /// when both banks read clear the reason is an earlier restart's and this one is no page
+    /// fault.
+    fn check_fault_banks(&mut self, banks: &[(u64, u64); 2]) {
+        if self.reason == Some(PAGE_FAULT)
+            && banks.iter().all(|&(status, address)| crate::regs::decode_fault(status, address, true).is_none())
+        {
+            kernel::pr_warn!("G17: recovery reason {} without a latched MMU fault is left over from an earlier restart\n",
+                PAGE_FAULT);
+            self.stale_fault = true;
+        }
+    }
+
+    fn page_fault(&self) -> bool {
+        self.reason == Some(PAGE_FAULT) && !self.stale_fault
+    }
+
     pub(super) fn attribute(
         &mut self,
         blamed: Option<u8>,
@@ -148,7 +185,7 @@ impl Sources {
                 source.started = started(qid, source.stamp);
             }
         }
-        if self.reason == Some(PAGE_FAULT) || self.mask.count_ones() < 2 {
+        if self.page_fault() || self.mask.count_ones() < 2 {
             return Attribution::Firmware;
         }
         let Some(blamed) = blamed else {
@@ -188,7 +225,7 @@ impl Sources {
         attribution: Attribution,
         culprit: impl FnOnce() -> Option<u128>,
     ) -> Attribution {
-        if attribution != Attribution::Firmware || self.reason.is_none_or(|reason| reason == PAGE_FAULT) {
+        if attribution != Attribution::Firmware || self.reason.is_none() || self.page_fault() {
             return attribution;
         }
         culprit().map_or(Attribution::Firmware, Attribution::Queues)
@@ -206,7 +243,7 @@ impl Sources {
         slots: u64,
         culprit: impl FnOnce(u64) -> Option<u128>,
     ) -> Attribution {
-        if self.reason != Some(PAGE_FAULT) || attribution != Attribution::Firmware || slots == 0 {
+        if !self.page_fault() || attribution != Attribution::Firmware || slots == 0 {
             return attribution;
         }
         let Some(blamed) = blamed else {
@@ -325,6 +362,62 @@ mod tests {
         sources.reason = Some(0);
         assert_eq!(sources.host_fallback(Attribution::NoCulprit, || panic!("slot evidence")),
             Attribution::NoCulprit);
+    }
+
+    #[test]
+    fn a_page_fault_reason_without_a_latched_fault_is_judged_like_a_timeout() {
+        // 2026-11-18 16:39:57 UTC: deqp-vk's spinning renders (queues 84/85, failed by the
+        // first restart) kept hanging the GPU; the reason word still read the page fault of
+        // 04:30, both banks were clear, and the firmware blamed T3 Code's queue 40, then
+        // Hyprland's 36. Both lost their device.
+        let mut sources = Sources::sample(0b10, |_| Some((0, 2)));
+        sources.reason = Some(PAGE_FAULT);
+        sources.check_fault_banks(&[(0, 0); 2]);
+        let attribution = sources.attribute(Some(40), |_, _| panic!("unknown key"));
+        assert_eq!(attribution, Attribution::Firmware);
+        assert_eq!(sources.host_fallback(attribution, || Some(3 << 84)), Attribution::Queues(3 << 84));
+        assert_eq!(sources.fault_override(attribution, Some(40), 0, |_| panic!("no fault")),
+            Attribution::Firmware);
+    }
+
+    #[test]
+    fn only_a_reason_from_the_firmware_word_is_checked_against_the_banks() {
+        // Any firmware's reason word: clear banks show a left-over page fault.
+        let mut sources = Sources::sample(0b10, |_| Some((0, 2)));
+        sources.reason = Some(PAGE_FAULT);
+        sources.settle_reason(false, || Some([(0, 0); 2]));
+        assert!(sources.stale_fault);
+        // Unreadable banks leave it a page fault.
+        let mut sources = Sources::sample(0b10, |_| Some((0, 2)));
+        sources.reason = Some(PAGE_FAULT);
+        sources.settle_reason(false, || None);
+        assert!(sources.page_fault());
+        // M5 has no reason word: its latched fault register is the page fault, never judged
+        // by the banks.
+        let mut sources = Sources::sample(0b10, |_| None);
+        sources.settle_reason(true, || panic!("M5 fault checked against the banks"));
+        assert!(sources.page_fault());
+        // No reason and no latched fault stays unknown.
+        let mut sources = Sources::sample(0b10, |_| None);
+        sources.settle_reason(false, || panic!("no reason to check"));
+        assert_eq!(sources.reason, None);
+    }
+
+    #[test]
+    fn a_latched_fault_in_either_bank_keeps_the_page_fault() {
+        // 2026-11-17 18:27:07 UTC: reason 3, bank 0 clear, bank 1 an unmapped UL1C read.
+        for banks in [[(0, 0), (0x84e926e311, 0x40f00003d80 >> 6)], [(0x8f0779c411, 0), (0, 0)]] {
+            let mut sources = Sources::sample(0b10, |_| Some((0, 2)));
+            sources.reason = Some(PAGE_FAULT);
+            sources.check_fault_banks(&banks);
+            assert_eq!(sources.host_fallback(Attribution::Firmware, || panic!("page fault")),
+                Attribution::Firmware);
+        }
+        // Clear banks change no other reason.
+        let mut sources = Sources::sample(0b10, |_| Some((0, 2)));
+        sources.reason = Some(2);
+        sources.check_fault_banks(&[(0, 0); 2]);
+        assert!(!sources.stale_fault);
     }
 
     /// The in-flight work of 2026-11-06 12:37:58: WoW's render pair (QIDs 65 and 66, four

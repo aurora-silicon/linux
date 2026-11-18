@@ -168,11 +168,7 @@ impl recovery::Memory for Service<'_> {
             }
         }
         let mut sources = self.firmware.init.fault_sources()?;
-        // M5 attribution leaves the firmware reason out (see InitData::fault_sources); a
-        // latched MMU fault is reason 3.
-        if mmu_fault && sources.reason.is_none() {
-            sources.reason = Some(recovery::PAGE_FAULT);
-        }
+        sources.settle_reason(mmu_fault, || self.firmware.port.fault_banks().ok());
         Ok(sources)
     }
 
