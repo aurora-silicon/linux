@@ -280,12 +280,52 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 			FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) >= APPLE_PMGR_PS_CLKGATE, 1,
 			timeout);
 	} else {
-		ret = regmap_read_poll_timeout_atomic(
-			ps->regmap, ps->offset, cur,
-			FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) == pstate &&
-			(!ps->wait_parent || pstate != APPLE_PMGR_PS_ACTIVE ||
-			 !(cur & APPLE_PMGR_BUSY)), 1,
-			timeout);
+		int try;
+
+		for (try = 0;; try++) {
+			u32 rb;
+
+			ret = regmap_read_poll_timeout_atomic(
+				ps->regmap, ps->offset, cur,
+				FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) == pstate &&
+				(!ps->wait_parent || pstate != APPLE_PMGR_PS_ACTIVE ||
+				 !(cur & APPLE_PMGR_BUSY)), 1,
+				timeout);
+			if (ret == 0)
+				break;
+
+			/*
+			 * A bring-up write issued while a core power-gates can be
+			 * swallowed: the register keeps target=0 and only the sticky
+			 * WAS_PWRGATED bit. Verify by readback; if the target never
+			 * took, rewrite after a short delay, bounded. Any domain can
+			 * lose this race, not just the input chain's nub_gpio.
+			 */
+			if (pstate != APPLE_PMGR_PS_ACTIVE || try >= 4)
+				break;
+			if (regmap_read(ps->regmap, ps->offset, &rb) ||
+			    FIELD_GET(APPLE_PMGR_PS_TARGET, rb) == pstate)
+				break;	/* target took: not a swallowed write */
+			dev_warn_ratelimited(ps->dev,
+					     "PS %s: bring-up write swallowed (readback 0x%x), retry %d\n",
+					     genpd->name, rb, try + 1);
+			udelay(1000);
+			/* rewrite: the swallowed write must actually land this time */
+			if (regmap_write(ps->regmap, ps->offset, reg))
+				break;
+			cur = reg;
+		}
+
+		if (ret < 0) {
+			u32 rb = cur;
+
+			if (!regmap_read(ps->regmap, ps->offset, &rb) &&
+			    FIELD_GET(APPLE_PMGR_PS_TARGET, rb) !=
+			    FIELD_PREP(APPLE_PMGR_PS_TARGET, pstate))
+				dev_err(ps->dev,
+					"PS %s: bring-up target never landed after %d attempts (write swallowed; last readback 0x%x)\n",
+					genpd->name, try + 1, rb);
+		}
 	}
 	if (ps->strict_state) {
 		dev_info(ps->dev, "GFX target=%#x written=%#x actual=%#x error=%d\n",
