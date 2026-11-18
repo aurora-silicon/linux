@@ -2467,7 +2467,7 @@ pub(crate) const J716C: Board = Board {
     hw_words: &[],
     fan_curve_start_mc: 84_000,
     g17d_forms: false,
-    completion_inputs: false,
+    completion_inputs: true,
 };
 
 /// J775D's performance controllers run from P3.
