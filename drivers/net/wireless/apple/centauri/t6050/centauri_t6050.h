@@ -48,6 +48,8 @@ struct centauri_t6050 {
 	struct dentry *debug;
 	struct mutex boot_lock;
 	struct delayed_work boot_work;
+	struct work_struct transport_recover_work;
+	unsigned int transport_recover_count;
 	enum centauri_t6050_boot_phase boot_phase;
 	bool removing, ready;
 	void *firmware, *descriptor;

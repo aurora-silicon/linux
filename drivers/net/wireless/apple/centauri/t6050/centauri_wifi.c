@@ -2,6 +2,7 @@
 
 #include <linux/bitfield.h>
 #include <linux/debugfs.h>
+#include <linux/ktime.h>
 #include <linux/etherdevice.h>
 #include <linux/ieee80211.h>
 #include <linux/iopoll.h>
@@ -12,6 +13,7 @@
 #include <net/cfg80211.h>
 #include <net/regulatory.h>
 #include "centauri_t6050.h"
+#include "centauri_recovery.h"
 
 #define CR_BASE 0x100000
 #define TR_BASE 0x400000
@@ -58,6 +60,8 @@ struct centauri_t6050_wifi {
 	struct work_struct scan_work;
 	struct work_struct connect_work;
 	struct work_struct link_work;
+	ktime_t last_fw_event_at;
+	bool last_fw_event_valid;
 	bool irq_ready;
 	struct cfg80211_scan_request *scan_request;
 	struct mutex lock; /* Serializes firmware commands and ring consumers. */
@@ -114,6 +118,33 @@ struct centauri_t6050_wifi {
 };
 
 static int query_link_status(struct centauri_t6050_wifi *wifi);
+static void note_fw_event(struct centauri_t6050_wifi *wifi);
+static void command_fault(struct centauri_t6050_wifi *wifi, u32 id,
+			  u32 wifi_stage, const char *reason);
+
+static ssize_t force_transport_fault_write(struct file *file,
+					   const char __user *user_buf,
+					   size_t count, loff_t *ppos)
+{
+	struct centauri_t6050_wifi *wifi = file->private_data;
+
+	if (count == 0)
+		return 0;
+	mutex_lock(&wifi->lock);
+	if (!smp_load_acquire(&wifi->irq_ready)) {
+		mutex_unlock(&wifi->lock);
+		return -ENODEV;
+	}
+	command_fault(wifi, 0, readl(wifi->a.bar + 8), "debugfs forced");
+	mutex_unlock(&wifi->lock);
+	return count;
+}
+
+static const struct file_operations force_transport_fault_fops = {
+	.write = force_transport_fault_write,
+	.open = simple_open,
+	.llseek = no_llseek,
+};
 
 static const u32 rx_buffer[5] = { 0, 0, 0x620000, 0x680000, 0x700000 };
 static const u16 ring_size[5] = { 0, 64, 192, 96, 192 };
@@ -607,8 +638,10 @@ static void drain(struct centauri_t6050_wifi *wifi)
 			if (ring == 4) {
 				report_beacon(wifi, packet + 24, size - 24);
 			} else if (command & BIT(31)) {
-				if (command == 0x80000030)
+				if (command == 0x80000030) {
 					wifi->channels_seen++;
+					note_fw_event(wifi);
+				}
 				if (command == 0x80000005) {
 					wifi->scans_done++;
 					wifi->scan_status = status;
@@ -621,6 +654,7 @@ static void drain(struct centauri_t6050_wifi *wifi)
 				    command == 0x80000004) {
 					wifi->disconnect_event = true;
 					wifi->disconnect_status = status;
+					note_fw_event(wifi);
 				}
 				if (command == 0x80000004)
 					wifi->disconnect_pending = false;
@@ -655,15 +689,68 @@ refill:
 	drain_data_tx(wifi);
 }
 
-/* Caller holds wifi->lock. Unknown completion keeps DMA payloads owned. */
-static void command_fault(struct centauri_t6050_wifi *wifi)
+static void note_fw_event(struct centauri_t6050_wifi *wifi)
 {
+	wifi->last_fw_event_at = ktime_get();
+	wifi->last_fw_event_valid = true;
+}
+
+static s64 fw_event_gap_ms(struct centauri_t6050_wifi *wifi)
+{
+	if (!wifi->last_fw_event_valid)
+		return -1;
+
+	return ktime_to_ms(ktime_sub(ktime_get(), wifi->last_fw_event_at));
+}
+
+static void wait_fw_event_before_scan(struct centauri_t6050_wifi *wifi)
+{
+	s64 remainder;
+
+	for (;;) {
+		remainder = centauri_fw_event_scan_settle_remainder_ms(
+			wifi->last_fw_event_valid, wifi->last_fw_event_at,
+			ktime_get(), CEN_FW_EVENT_SCAN_SETTLE_MS);
+		if (remainder <= 0)
+			break;
+		drain(wifi);
+		if (remainder > 0)
+			msleep(remainder);
+	}
+}
+
+static void log_transport_fault(struct centauri_t6050_wifi *wifi, u32 id,
+				u32 wifi_stage, const char *reason)
+{
+	u32 control = wifi->control->ipc ?
+			      readl(wifi->control->bar + 0x8000) : ~0U;
+	s64 gap_ms = fw_event_gap_ms(wifi);
+
+	if (gap_ms >= 0) {
+		dev_err(&wifi->control->pdev->dev,
+			"Wi-Fi transport fault (%s) cmd=%#x wifi_stage=%#x control_stage=%#x gap_ms=%lld rx=%u\n",
+			reason, id, wifi_stage, control, gap_ms,
+			wifi->rx_seen[2]);
+	} else {
+		dev_err(&wifi->control->pdev->dev,
+			"Wi-Fi transport fault (%s) cmd=%#x wifi_stage=%#x control_stage=%#x gap_ms=unknown rx=%u\n",
+			reason, id, wifi_stage, control, wifi->rx_seen[2]);
+	}
+}
+
+/* Caller holds wifi->lock. Unknown completion keeps DMA payloads owned. */
+static void command_fault(struct centauri_t6050_wifi *wifi, u32 id,
+			  u32 wifi_stage, const char *reason)
+{
+	log_transport_fault(wifi, id, wifi_stage, reason);
 	wifi->command_failed = true;
 	wifi->configured = false;
 	wifi->data_failed = true;
-	netif_stop_queue(wifi->netdev);
+	if (wifi->netdev)
+		netif_stop_queue(wifi->netdev);
 	if (smp_load_acquire(&wifi->irq_ready))
 		schedule_work(&wifi->link_work);
+	centauri_t6050_request_transport_recover(wifi->control);
 }
 
 static bool command_payload_consumed(struct centauri_t6050_wifi *wifi, u16 slot)
@@ -727,17 +814,14 @@ static int command_reply(struct centauri_t6050_wifi *wifi, u32 id,
 	do {
 		if (READ_ONCE(wifi->stopping) ||
 		    READ_ONCE(wifi->control->removing)) {
-			command_fault(wifi);
+			command_fault(wifi, id, readl(wifi->a.bar + 8), "cancel");
 			ret = -ECANCELED;
 			goto out;
 		}
 		drain(wifi);
 		stage = readl(wifi->a.bar + 8);
 		if (stage != 2) {
-			dev_err(&wifi->control->pdev->dev,
-				"Wi-Fi command %#x lost transport: stage=%#x sequence=%u rx=%u\n",
-				id, stage, sequence, wifi->rx_seen[2]);
-			command_fault(wifi);
+			command_fault(wifi, id, stage, "lost transport");
 			ret = -EIO;
 			goto out;
 		}
@@ -757,9 +841,7 @@ static int command_reply(struct centauri_t6050_wifi *wifi, u32 id,
 		}
 		usleep_range(500, 1000);
 	} while (time_before(jiffies, deadline));
-	dev_err(&wifi->control->pdev->dev,
-		"Wi-Fi command %#x timed out (rx=%u)\n", id, wifi->rx_seen[2]);
-	command_fault(wifi);
+	command_fault(wifi, id, readl(wifi->a.bar + 8), "timeout");
 	ret = -ETIMEDOUT;
 out:
 	wifi->reply_buffer = NULL;
@@ -890,6 +972,7 @@ static void channels_apply(struct centauri_t6050_wifi *wifi)
 		if (!(channel->flags & IEEE80211_CHAN_DISABLED))
 			counted[band]++;
 	}
+	note_fw_event(wifi);
 	dev_info(&wifi->control->pdev->dev,
 		 "Wi-Fi firmware channels: 2.4 GHz %u, 5 GHz %u, 6 GHz %u (%u entries)\n",
 		 counted[0], counted[1], counted[2], list[0]);
@@ -1124,6 +1207,7 @@ static int scan_profile27(struct centauri_t6050_wifi *wifi)
 			memcpy(scan + size + 6, ssid->ssid, ssid->ssid_len);
 			size += 6 + ssid->ssid_len;
 		}
+		wait_fw_event_before_scan(wifi);
 		ret = command(wifi, 65551, scan, size);
 		if (ret) {
 			command_refused(wifi, "scan", ret);
@@ -2723,6 +2807,8 @@ int centauri_t6050_wifi_register(struct centauri_t6050 *c)
 	if (ret)
 		goto failed;
 	wifi->registered = true;
+	debugfs_create_file("force_transport_fault", 0200, wifi->wiphy->debugfsdir,
+			    wifi, &force_transport_fault_fops);
 	debugfs_create_blob("hw_channels", 0400, wifi->wiphy->debugfsdir,
 			    &wifi->hw_channels_blob);
 	debugfs_create_blob("system_caps", 0400, wifi->wiphy->debugfsdir,
