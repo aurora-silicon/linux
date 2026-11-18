@@ -14,6 +14,8 @@ struct pmgr_ps_test_reg {
 	bool parent_stuck;
 	bool parent_read_error;
 	unsigned int busy_writes;
+	unsigned int swallow_writes;	/* ACTIVE writes the bus drops */
+	unsigned int swallow_writes_total;	/* ACTIVE writes ever dropped */
 	unsigned int auto_writes;	/* writes that enabled automatic PM */
 	bool latched;		/* bit 11 latched: on stops at clock-gated, off still reaches 0 */
 	bool latch_sticky;	/* not even a PS reset clears it */
@@ -45,6 +47,16 @@ static int pmgr_ps_test_write(void *ctx, unsigned int reg, unsigned int val)
 	struct pmgr_ps_test_reg *r = ctx;
 	u32 parent = r->val & APPLE_PMGR_BUSY;
 	u32 actual;
+
+	if (r->swallow_writes &&
+	    FIELD_GET(APPLE_PMGR_PS_TARGET, val) == APPLE_PMGR_PS_ACTIVE) {
+		r->swallow_writes--;
+		r->swallow_writes_total++;
+		/* the bus accepts the write; the register keeps target 0
+		 * (the swallowed-write shape) */
+		r->val &= ~APPLE_PMGR_PS_TARGET;
+		return 0;
+	}
 
 	if (val & APPLE_PMGR_PS_RESET) {
 		r->reset_writes++;
@@ -544,10 +556,45 @@ static void pmgr_ps_consumer_refused_test(struct kunit *test)
 			APPLE_PMGR_PS_ACTIVE);
 }
 
+/*
+ * The M5 Max deep-idle race: an ACTIVE bring-up write issued while a core
+ * power-gates in idle is swallowed. The write must be rewritten until it
+ * lands (green on a3r; a3q polled without rewriting and failed this).
+ */
+static void pmgr_ps_power_on_swallowed_retry_test(struct kunit *test)
+{
+	struct pmgr_ps_test_reg *r;
+	struct apple_pmgr_ps *ps;
+
+	ps = pmgr_ps_test_domain(test, APPLE_PMGR_PS_PWRGATE, false, &r);
+	r->swallow_writes = 2;
+	KUNIT_EXPECT_EQ(test, apple_pmgr_ps_power_on(&ps->genpd), 0);
+	KUNIT_EXPECT_EQ(test, r->swallow_writes, 0U);
+	KUNIT_EXPECT_EQ(test, r->swallow_writes_total, 2U);
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_PMGR_PS_TARGET, r->val),
+			APPLE_PMGR_PS_ACTIVE);
+	KUNIT_EXPECT_EQ(test, FIELD_GET(APPLE_PMGR_PS_ACTUAL, r->val),
+			APPLE_PMGR_PS_ACTIVE);
+}
+
+/* Permanently swallowed: 5 attempts are made before giving up. */
+static void pmgr_ps_power_on_swallowed_giveup_test(struct kunit *test)
+{
+	struct pmgr_ps_test_reg *r;
+	struct apple_pmgr_ps *ps;
+
+	ps = pmgr_ps_test_domain(test, APPLE_PMGR_PS_PWRGATE, false, &r);
+	r->swallow_writes = UINT_MAX;
+	KUNIT_EXPECT_EQ(test, apple_pmgr_ps_power_on(&ps->genpd), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, r->swallow_writes_total, 5U);
+}
+
 static struct kunit_case pmgr_ps_test_cases[] = {
 	KUNIT_CASE(pmgr_ps_power_on_test),
 	KUNIT_CASE(pmgr_ps_power_off_undo_test),
 	KUNIT_CASE(pmgr_ps_power_on_fails_test),
+	KUNIT_CASE(pmgr_ps_power_on_swallowed_retry_test),
+	KUNIT_CASE(pmgr_ps_power_on_swallowed_giveup_test),
 	KUNIT_CASE(pmgr_ps_power_on_parent_delayed_test),
 	KUNIT_CASE(pmgr_ps_power_on_other_domain_test),
 	KUNIT_CASE(pmgr_ps_power_on_actual_delayed_test),
