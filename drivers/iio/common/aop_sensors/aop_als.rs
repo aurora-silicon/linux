@@ -30,10 +30,10 @@ const ALS_PROP_VERBOSITY: u32 = 0xe1;
  * interval, and it accepts that transition only once its batch and raw
  * interval properties have been written. Despite their names these two are
  * not intervals; they are the values the CT817 is configured with on the
- * T8140, and macOS runs the VD6286 of the M5 Max with the same batch value
- * and verbosity. The CT817 answers every one of these writes with a
- * not-permitted status and applies them regardless, so the status is only
- * logged.
+ * T8140. macOS runs the VD6286 of the M5 Max with the same batch value and
+ * writes no verbosity to it. The CT817 answers every one of these writes
+ * with a not-permitted status and applies them regardless, so the status is
+ * only logged.
  */
 const ALS_BATCH_INTERVAL: u32 = 1;
 const ALS_RAW_INTERVAL: u32 = 0;
@@ -78,6 +78,17 @@ fn enable_als(
     svc: &EPICService,
     offset: usize,
 ) -> Result<()> {
+    let set = |tag: u32, val: u32, what: &str| -> Result<()> {
+        let status = set_als_property(aop, svc, tag, &val.to_le_bytes())?;
+        dev_dbg!(
+            dev.as_ref(),
+            "{} = {:#x}: status {:#x}\n",
+            what,
+            val,
+            status
+        );
+        Ok(())
+    };
     if offset != LUX_OFFSET_CT817 {
         // The installer collects the calibration blob from macOS, so it is
         // not present on every system. Without it the VD6286 of the M4 Pro
@@ -94,6 +105,21 @@ fn enable_als(
                 e
             ),
         }
+        // The VD6286 is armed the way macOS arms it: batch interval, raw
+        // interval, then the report interval, and no verbosity write. At this
+        // change's predecessor the verbosity/batch/raw sequence after
+        // calibration NAKed 0xe00002e2 on the M5 Max (comb4e hardware run),
+        // and macOS writes no verbosity to this sensor. The statuses stay
+        // logged: the sensor may refuse and still apply, as the CT817 does.
+        set(
+            ALS_PROP_BATCH_INTERVAL,
+            ALS_BATCH_INTERVAL,
+            "batch interval",
+        )?;
+        set(ALS_PROP_RAW_INTERVAL, ALS_RAW_INTERVAL, "raw interval")?;
+        // The interval is zero at probe, so this is the transition that arms
+        // the sensor.
+        return set(ALS_PROP_INTERVAL, ALS_INTERVAL_US, "interval");
     }
 
     // The CT817 gets its calibration from the AOP driver over the setup port,
@@ -102,17 +128,6 @@ fn enable_als(
     // the HID report descriptor (subtype 0x01) on this endpoint: the AOP never
     // answers it, and do not write the MODE (0xd7) or 0xe4 properties: either
     // wedges the AOP for the rest of the boot.
-    let set = |tag: u32, val: u32, what: &str| -> Result<()> {
-        let status = set_als_property(aop, svc, tag, &val.to_le_bytes())?;
-        dev_dbg!(
-            dev.as_ref(),
-            "{} = {:#x}: status {:#x}\n",
-            what,
-            val,
-            status
-        );
-        Ok(())
-    };
     set(ALS_PROP_VERBOSITY, ALS_VERBOSITY, "verbosity")?;
     set(
         ALS_PROP_BATCH_INTERVAL,
