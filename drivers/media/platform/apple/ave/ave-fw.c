@@ -17,6 +17,7 @@
 #include <linux/iommu.h>
 #include <linux/iopoll.h>
 #include <linux/limits.h>
+#include <linux/minmax.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
@@ -509,13 +510,17 @@ static int ave_fw_map_extra0(struct ave_dev *ave)
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "extra0");
 	if (!res)
 		res = platform_get_resource(pdev, IORESOURCE_MEM, 3);
-	if (!res || resource_size(res) < ave->variant->extra0_size ||
-	    !IS_ALIGNED(res->start, SZ_16K))
+	/*
+	 * The window need not be 16 KiB aligned: dma_map_resource maps the
+	 * pages that contain it and returns the IOVA of its base.
+	 */
+	if (!res || resource_size(res) < ave->variant->extra0_size)
 		return dev_err_probe(
 			ave->dev, -EINVAL,
 			"missing or invalid extra0 register resource\n");
 	/* The platform resource supplies the translated physical address. */
-	ave->extra0_map_size = ALIGN(ave->variant->extra0_size, SZ_16K);
+	ave->extra0_map_size = max_t(size_t, resource_size(res),
+				     ALIGN(ave->variant->extra0_size, SZ_16K));
 	ave->extra0_dma = dma_map_resource(ave->dev, res->start,
 					   ave->extra0_map_size,
 					   DMA_BIDIRECTIONAL, 0);

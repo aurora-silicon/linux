@@ -48,9 +48,10 @@ restore. An existing session makes the operation return EBUSY.
 
 The platform must supply the extra-0 register resource as ``extra0`` or register
 resource index 3, with at least 0x24 bytes on T6000 or 0x4000 bytes on T8112.
-The driver uses the translated platform resource address, maps its containing
-16 KiB page through the device DMA API and puts that dynamically allocated IOVA
-in Config. Platform DT/binding changes are separate from this driver change.
+The driver uses the translated platform resource address, maps the 16 KiB pages
+that contain it through the device DMA API and puts that dynamically allocated
+IOVA in Config. The base need not be page aligned: Config then gets the IOVA of
+the base, not of its page. Platform DT/binding changes are separate from this driver change.
 No fixed firmware or register IOVA is used as an ordinary DMA allocation.
 
 Before every boot the driver checks the firmware's IOMMU translations. DATA must
