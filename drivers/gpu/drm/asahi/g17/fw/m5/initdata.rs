@@ -2680,6 +2680,12 @@ pub(crate) const J714_26C5035: Board = Board {
     ..J714
 };
 
+/// The M5 Max on the macOS 27.3 beta 1 (26C5035r) firmware: the J716C on the same build's graph.
+pub(crate) const J716C_26C5035: Board = Board {
+    graph: &M5_GRAPH_26C5035,
+    ..J716C
+};
+
 const _: () = {
     use super::target::min_parameter_buffer_pages;
     assert!(J714.min_parameter_buffer as u64 == min_parameter_buffer_pages(J714.clusters) << 15);

@@ -43,10 +43,6 @@ pub(crate) const CONFIG: Config = Config {
     sleep_restart: false,
     recovery_slot_keys: None,
     gpu_generation: GpuGen::G17,
-    // The firmware in `fw-text` must be this build. iBoot loads the G17S build of both roles
-    // back to back: the primary's TEXT 0x50000, then the secondary's 0x54000, with the same
-    // entropy records and boot-filled ranges as the M5 Max. The digest is that of the
-    // firmware's TEXT with those ranges zeroed, measured on two J714s boots.
     // The firmware in `fw-text` must be one of these builds. iBoot loads the G17S build of both
     // roles back to back: the primary's text at 0x50000 of `fw-text`, then the secondary's at
     // 0x54000, with the same entropy records and boot-filled ranges as the M5 Max (27.2 and 27.3
@@ -176,10 +172,6 @@ pub(crate) const CONFIG_26B123: Config = Config {
     sleep_restart: false,
     recovery_slot_keys: None,
     gpu_generation: GpuGen::G17,
-    // The firmware in `fw-text` must be this build. iBoot loads the G17S build of both roles
-    // back to back: the primary's TEXT 0x50000, then the secondary's 0x54000, with the same
-    // entropy records and boot-filled ranges as the M5 Max. The digest is that of the
-    // firmware's TEXT with those ranges zeroed, measured on two J714s boots.
     // The firmware in `fw-text` must be one of these builds. iBoot loads the G17S build of both
     // roles back to back: the primary's text at 0x50000 of `fw-text`, then the secondary's at
     // 0x54000, with the same entropy records and boot-filled ranges as the M5 Max (27.2 and 27.3
@@ -305,9 +297,6 @@ pub(crate) const CONFIG_MAX: Config = Config {
 /// this board has run with: every table change written back, page-by-page TLB invalidation, and
 /// the handoff values its firmware expects (current slot 0xffff, the byte after the flush records
 /// 1, the lock never taken).
-/// The M5 Pro on its 27.2 (26B123) firmware: the probed configuration with the build's board,
-/// whose graph carries the 26B123 policy and status-config layout.
-
 /// CONFIG_26C5035: the M5 Pro configuration for the per-build override. Its build list is empty: the driver picks builds off the chip configuration and never reads them here, and an inherited list would make the const graph cyclic.
 pub(crate) const CONFIG_26C5035: Config = Config {
     firmware: crate::g17::fw::variant::Firmware::Identified(&[]),
@@ -345,10 +334,6 @@ pub(crate) const CONFIG_26C5035: Config = Config {
     sleep_restart: false,
     recovery_slot_keys: None,
     gpu_generation: GpuGen::G17,
-    // The firmware in `fw-text` must be this build. iBoot loads the G17S build of both roles
-    // back to back: the primary's TEXT 0x50000, then the secondary's 0x54000, with the same
-    // entropy records and boot-filled ranges as the M5 Max. The digest is that of the
-    // firmware's TEXT with those ranges zeroed, measured on two J714s boots.
     // The firmware in `fw-text` must be one of these builds. iBoot loads the G17S build of both
     // roles back to back: the primary's text at 0x50000 of `fw-text`, then the secondary's at
     // 0x54000, with the same entropy records and boot-filled ranges as the M5 Max (27.2 and 27.3
@@ -395,7 +380,7 @@ pub(crate) const CONFIG_MAX_26C5035: Config = Config {
     uat_quirks: CONFIG_ULTRA.uat_quirks,
     region_c: None,
     chip: None,
-    m5: Some(&crate::g17::fw::m5::initdata::J714_26C5035),
+    m5: Some(&crate::g17::fw::m5::initdata::J716C_26C5035),
     adopt_root_entries: true,
     fabric_bridge: false,
     sleep_restart: false,
