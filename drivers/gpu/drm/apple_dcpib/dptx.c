@@ -150,8 +150,6 @@ static u32 dptx_call(struct dcpib_service *service, u16 group, u32 command,
 		if (phy->set_lane_count && phy->set_lane_count(dcp, arg))
 			return KIO_RETURN_ERROR;
 		port->lanes = arg;
-		if (arg)
-			port->trained_lanes = arg;
 		return 0;
 	case DPTX_APCALL_GET_MAX_DRIVE_SETTINGS: {
 		const struct dcpib_drive_settings maximum = {

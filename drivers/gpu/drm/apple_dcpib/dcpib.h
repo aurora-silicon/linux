@@ -173,8 +173,6 @@ struct dcpib_port {
 	struct dcpib_service *service;
 	u32 link_rate;		/* DPCD units */
 	u32 lanes;
-	/* lanes of the last training, kept while the link is down */
-	u32 trained_lanes;
 	/* last drive settings the firmware set, for GET_DRIVE_SETTINGS */
 	struct dcpib_drive_settings drive[4];
 	u32 drive_count;

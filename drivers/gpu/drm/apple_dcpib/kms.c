@@ -59,8 +59,12 @@ static int dcpib_refresh(const struct dcpib_timing_mode *t)
  */
 static bool dcpib_mode_fits(struct dcpib *dcp, const struct dcpib_timing_mode *t)
 {
-	/* The link's lanes even while the display is off and it is down. */
-	u32 lanes = dcp->port[0].trained_lanes ?: 2;
+	/*
+	 * The lanes the firmware may train, as GET_MAX_LANE_COUNT reports them:
+	 * the USB-C route's. Not the last training's: a sink that replugs while
+	 * the display is off is trained with a single lane.
+	 */
+	u32 lanes = (dcp->phy->max_lane_count ? dcp->phy->max_lane_count(dcp) : 4) ?: 2;
 	u64 link = (u64)dcp->phy->max_link_rate * 270000000ULL * lanes * 8 / 10;
 	u64 pixels = (u64)le32_to_cpu(t->width) * le32_to_cpu(t->height) *
 		     dcpib_refresh(t);
