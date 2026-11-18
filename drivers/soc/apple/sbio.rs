@@ -2255,12 +2255,14 @@ impl SepData {
             None
         };
 
+        let mut recalibrated = false;
         if !self.sensor_calibrated.load(Relaxed) {
             if !self.calibrate_sensor() {
                 diag::sensor_brought_up(bind, false);
                 return false;
             }
             self.sensor_calibrated.store(true, Relaxed);
+            recalibrated = self.sensor_recalibrate.xchg(false, Relaxed);
             if parameters.is_none() {
                 let Some(reloaded_patch) = self.wake_sensor() else {
                     diag::sensor_brought_up(bind, false);
@@ -2278,6 +2280,20 @@ impl SepData {
             Some(parameters) => self.finish_sensor_setup(patch, parameters),
             None => self.complete_bringup(patch),
         };
+        // On a sensor with a nonce session the calibration takes effect only
+        // in a session made after it: on J813 the capture on the session that
+        // carried the calibration after a deep sleep never scanned (3V0 rail
+        // at 1 mA, not 3 mA) and saw no finger, while the next bring-up's did.
+        // At boot the attach-time bring-up calibrates and the first verify
+        // brings the sensor up again; after a sleep do that second bring-up
+        // here, before the capture.
+        if ok && recalibrated && self.profile.nonce_session {
+            dev_info_ratelimited!(
+                self.dev,
+                "sensor: calibrated again after a system sleep; bringing it up once more for the capture\n"
+            );
+            return self.bring_sensor_online();
+        }
         diag::sensor_brought_up(bind, ok);
         // The sensor is patched and idle here -- the only safe moment to
         // configure the data-ready interrupt, which is then left alone for the

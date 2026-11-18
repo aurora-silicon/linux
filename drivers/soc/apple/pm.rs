@@ -237,6 +237,7 @@ unsafe extern "C" fn pm_wake() {
     }
     // SAFETY: as in `pm_event`.
     let sep = unsafe { <Arc<SepData> as ForeignOwnable>::borrow(ptr) };
+    sep.sensor_after_sleep();
     if sep.sleep_exit() {
         // The enclave slept and is back: report the accessory service online
         // again, as macOS does right after the wake.

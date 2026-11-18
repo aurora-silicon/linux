@@ -709,6 +709,8 @@ struct SepData {
     cold_restore_candidate: Atomic<bool>,
 
     sensor_calibrated: Atomic<bool>,
+    // Set by a system sleep: the next calibration is a recalibration.
+    sensor_recalibrate: Atomic<bool>,
     sensor_key_loaded: Atomic<bool>,
 
     enrol_open: Atomic<bool>,
@@ -1208,6 +1210,7 @@ impl SepData {
                 xart_refusal_logged: Atomic::new(false),
                 capture_refusal_logged: Atomic::new(false),
                 sensor_calibrated: Atomic::new(false),
+                sensor_recalibrate: Atomic::new(false),
                 sensor_key_loaded: Atomic::new(false),
                 templates_restored: Atomic::new(false),
                 cold_restore_candidate: Atomic::new(false),
@@ -1618,6 +1621,17 @@ impl SepData {
                 mbox.release_rx();
             }
         }
+    }
+
+    /// After a system sleep the sensor is neither kept nor calibrated: its
+    /// suspend powered it off, and a deep sleep also put the enclave to sleep.
+    /// On J813 every capture after a deep sleep then ended without a frame
+    /// until the next boot. The next bring-up calibrates the sensor again, as
+    /// the first one after boot does.
+    pub(crate) fn sensor_after_sleep(&self) {
+        self.sensor_kept.store(false, Relaxed);
+        self.sensor_calibrated.store(false, Relaxed);
+        self.sensor_recalibrate.store(true, Relaxed);
     }
 
     /// A refused precommit attempt was never sent; reopen normal admission.
