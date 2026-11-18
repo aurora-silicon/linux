@@ -142,7 +142,7 @@ static ssize_t force_transport_fault_write(struct file *file,
 static const struct file_operations force_transport_fault_fops = {
 	.write = force_transport_fault_write,
 	.open = simple_open,
-	.llseek = no_llseek,
+	.llseek = noop_llseek,
 };
 
 static const u32 rx_buffer[5] = { 0, 0, 0x620000, 0x680000, 0x700000 };
