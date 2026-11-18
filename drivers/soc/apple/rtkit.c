@@ -558,11 +558,9 @@ static void apple_rtkit_management_rx(struct apple_rtkit *rtk, u64 msg)
 	}
 }
 
-static int apple_rtkit_alloc_shmem(struct apple_rtkit *rtk, u8 ep,
-				   struct apple_rtkit_shmem *buffer)
+static int apple_rtkit_alloc_first_shmem(struct apple_rtkit *rtk, u8 ep,
+					 struct apple_rtkit_shmem *buffer)
 {
-	if (READ_ONCE(rtk->ans_hold))
-		return apple_rtkit_ans_fail(rtk, -EBUSY);
 	/* The crash log's buffer is asked for only at a crash: serve it after a strict restart too. */
 	if (READ_ONCE(rtk->strict_retained_buffers) && ep != APPLE_RTKIT_EP_CRASHLOG)
 		return -EPROTO;
@@ -575,6 +573,14 @@ static int apple_rtkit_alloc_shmem(struct apple_rtkit *rtk, u8 ep,
 	buffer->buffer = dma_alloc_coherent(rtk->dev, buffer->size,
 					    &buffer->iova, GFP_KERNEL);
 	return buffer->buffer ? 0 : -ENOMEM;
+}
+
+static int apple_rtkit_alloc_shmem(struct apple_rtkit *rtk, u8 ep,
+				   struct apple_rtkit_shmem *buffer)
+{
+	if (READ_ONCE(rtk->ans_hold))
+		return apple_rtkit_ans_fail(rtk, -EBUSY);
+	return apple_rtkit_alloc_first_shmem(rtk, ep, buffer);
 }
 
 static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
@@ -650,7 +656,8 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 		goto error;
 	}
 
-	err = apple_rtkit_alloc_shmem(rtk, ep, &request);
+	/* The endpoint has no buffer yet: a first one replaces nothing the ANS hold protects */
+	err = apple_rtkit_alloc_first_shmem(rtk, ep, &request);
 	if (err)
 		goto error;
 	*buffer = request;
