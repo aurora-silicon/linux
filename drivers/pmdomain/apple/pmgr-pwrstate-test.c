@@ -16,6 +16,8 @@ struct pmgr_ps_test_reg {
 	unsigned int busy_writes;
 	unsigned int swallow_writes;	/* ACTIVE writes the bus drops */
 	unsigned int swallow_writes_total;	/* ACTIVE writes ever dropped */
+	unsigned int target_writes_active;	/* regmap writes with TARGET=ACTIVE */
+	unsigned int target_writes_pwrgate;	/* regmap writes with TARGET=PWRGATE */
 	unsigned int auto_writes;	/* writes that enabled automatic PM */
 	bool latched;		/* bit 11 latched: on stops at clock-gated, off still reaches 0 */
 	bool latch_sticky;	/* not even a PS reset clears it */
@@ -47,6 +49,15 @@ static int pmgr_ps_test_write(void *ctx, unsigned int reg, unsigned int val)
 	struct pmgr_ps_test_reg *r = ctx;
 	u32 parent = r->val & APPLE_PMGR_BUSY;
 	u32 actual;
+
+	switch (FIELD_GET(APPLE_PMGR_PS_TARGET, val)) {
+	case APPLE_PMGR_PS_ACTIVE:
+		r->target_writes_active++;
+		break;
+	case APPLE_PMGR_PS_PWRGATE:
+		r->target_writes_pwrgate++;
+		break;
+	}
 
 	if (r->swallow_writes &&
 	    FIELD_GET(APPLE_PMGR_PS_TARGET, val) == APPLE_PMGR_PS_ACTIVE) {
@@ -577,16 +588,18 @@ static void pmgr_ps_power_on_swallowed_retry_test(struct kunit *test)
 			APPLE_PMGR_PS_ACTIVE);
 }
 
-/* Permanently swallowed: 5 attempts are made before giving up. */
+/* Permanently swallowed: five ACTIVE bring-up writes, then PWRGATE unwind. */
 static void pmgr_ps_power_on_swallowed_giveup_test(struct kunit *test)
 {
 	struct pmgr_ps_test_reg *r;
 	struct apple_pmgr_ps *ps;
 
-	ps = pmgr_ps_test_domain(test, APPLE_PMGR_PS_PWRGATE, false, &r);
+	ps = pmgr_ps_test_domain(test, APPLE_PMGR_PS_PWRGATE, true, &r);
 	r->swallow_writes = UINT_MAX;
 	KUNIT_EXPECT_EQ(test, apple_pmgr_ps_power_on(&ps->genpd), -ETIMEDOUT);
 	KUNIT_EXPECT_EQ(test, r->swallow_writes_total, 5U);
+	KUNIT_EXPECT_EQ(test, r->target_writes_active, 5U);
+	KUNIT_EXPECT_EQ(test, r->target_writes_pwrgate, 1U);
 }
 
 static struct kunit_case pmgr_ps_test_cases[] = {
