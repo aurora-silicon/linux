@@ -7,10 +7,11 @@ static int dcp_peer_probe_power(struct apple_dcp *dcp, struct apple_dcp *peer,
                                 bool on)
 {
 	struct dcp_peer_video_wait *wait;
-	struct dcp_method_entry method = { .name = "peer_power_test",
-		.tag = {'A', '4', '8', '4'} };
+	struct dcp_method_entry method = { .name = "peer_power_test" };
 	u8 power[16] = {}, response[8];
 	int ret;
+
+	iomfb_v27_tag(dcp->v27_methods, "A484", method.tag);
 
 	wait = kzalloc(sizeof(*wait), GFP_KERNEL);
 	if (!wait)
@@ -134,12 +135,13 @@ static int dcp_peer_probe_modeset(struct apple_dcp *dcp, struct apple_dcp *peer,
 				 bool firmware_requires_merge)
 {
 	struct dcp_peer_video_wait *wait;
-	struct dcp_method_entry method = { .name = "peer_modeset_test",
-		.tag = {'A', '4', '1', '3'} };
+	struct dcp_method_entry method = { .name = "peer_modeset_test" };
 	__le32 mode[2] = {video->color_id, video->timing_id};
 	u32 primary_id, peer_id, phase, status;
 	unsigned long deadline;
 	int ret;
+
+	iomfb_v27_tag(dcp->v27_methods, "A413", method.tag);
 
 	{
 		guard(mutex)(&dcp_peer_lock);
