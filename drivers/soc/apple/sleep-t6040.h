@@ -2379,5 +2379,4 @@ static const struct apple_sleep_soc t6040_sleep_soc = {
 	.cpu_cores_per_cluster = 6,
 	.cpu_start_first_bit = t6040_cpu_start_first_bit,
 	.cpu_valid = t6040_sleep_cpu_valid,
-	.ndisp = 5,
 };
