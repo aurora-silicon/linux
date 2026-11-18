@@ -244,12 +244,18 @@ static int __init t6041_mem_auto_setup(char *s)
 }
 __setup("t6041_mem_auto=", t6041_mem_auto_setup);
 
-/* In macOS's boot order: pmgr group 0, then group 2 (East), then nub. */
+/*
+ * In macOS's boot order on the binned J616c: pmgr group 0, then group 2
+ * (East), then nub. The full part's dcs_24-31 follow the other DCS words of
+ * their group in ADT order, as there is no macOS trace from a full part.
+ * On the binned part they are fused off, so the check below skips them.
+ */
 static const u64 t6041_mem_auto_regs[] __initconst = {
 	0x502800168,					/* fab0_soc */
 	0x502800188, 0x5028001a0, 0x5028001b0, 0x5028001c0,	/* dcs_00-03 */
 	0x5028001d0, 0x5028001e0, 0x5028001f0, 0x502800200,	/* dcs_08-11 */
 	0x502800210, 0x502800220, 0x502800230, 0x502800240,	/* dcs_16-19 */
+	0x502800250, 0x502800260, 0x502800270, 0x502800530,	/* dcs_24-27 (full part) */
 	0x502800288, 0x502800290, 0x502800298,		/* fab_gw_0, fab_gw_1, fab_afr */
 	0x5028002d0, 0x502800338, 0x502800440,		/* fab1, fab2, fab5 */
 	0x502800480, 0x502800488,			/* fab6, fab7 */
@@ -257,6 +263,7 @@ static const u64 t6041_mem_auto_regs[] __initconst = {
 	0x5022802e0, 0x5022802e8, 0x5022802f0, 0x5022802f8,	/* dcs_04-07 */
 	0x502280300, 0x502280308, 0x502280310, 0x502280318,	/* dcs_12-15 */
 	0x502280320, 0x502280328, 0x502280330, 0x502280338,	/* dcs_20-23 */
+	0x502280340, 0x502280348, 0x502280350, 0x502280358,	/* dcs_28-31 (full part) */
 	0x508300100,					/* nub_fabric */
 };
 
