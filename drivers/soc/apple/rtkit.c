@@ -2936,6 +2936,16 @@ static int apple_rtkit_strict_idle_state(struct apple_rtkit *rtk, bool ap)
 
 int apple_rtkit_idle_strict(struct apple_rtkit *rtk)
 {
+	return apple_rtkit_idle_strict_with(rtk, NULL, NULL);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_idle_strict);
+
+/*
+ * As apple_rtkit_idle_strict(), with a step between the AP state's and the IOP state's.
+ * A failed step fails the idle: the IOP state is not sent.
+ */
+int apple_rtkit_idle_strict_with(struct apple_rtkit *rtk, int (*after_ap)(void *data), void *data)
+{
 	int ret;
 
 	if (rtk->strict_idle_poisoned || rtk->crashed ||
@@ -2945,6 +2955,8 @@ int apple_rtkit_idle_strict(struct apple_rtkit *rtk)
 	reinit_completion(&rtk->strict_idle_done);
 	WRITE_ONCE(rtk->strict_idle_waiting, true);
 	ret = apple_rtkit_strict_idle_state(rtk, true);
+	if (!ret && after_ap)
+		ret = after_ap(data);
 	if (!ret)
 		ret = apple_rtkit_strict_idle_state(rtk, false);
 	if (!ret && !wait_for_completion_timeout(&rtk->strict_idle_done,
@@ -2957,7 +2969,7 @@ int apple_rtkit_idle_strict(struct apple_rtkit *rtk)
 		rtk->strict_idle_poisoned = true;
 	return ret;
 }
-EXPORT_SYMBOL_GPL(apple_rtkit_idle_strict);
+EXPORT_SYMBOL_GPL(apple_rtkit_idle_strict_with);
 
 int apple_rtkit_warm_restart_strict(struct apple_rtkit *rtk)
 {
