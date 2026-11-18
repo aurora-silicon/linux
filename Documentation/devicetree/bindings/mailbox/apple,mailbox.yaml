@@ -81,6 +81,7 @@ properties:
           iop,secure-rtbuddy-proxy. It is polled, with no interrupts described.
         items:
           - enum:
+              - apple,t6050-secure-rtbuddy-proxy
               - apple,t8140-secure-rtbuddy-proxy
           - const: apple,secure-rtbuddy-proxy
 
