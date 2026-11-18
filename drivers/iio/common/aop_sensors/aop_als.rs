@@ -40,6 +40,11 @@ const ALS_RAW_INTERVAL: u32 = 0;
 const ALS_VERBOSITY: u32 = 6;
 /// The reporting interval in microseconds.
 const ALS_INTERVAL_US: u32 = 200000;
+/// The VD6286's report interval macOS runs on the M5 Max: the captured Ioreg
+/// ReportInterval for this sensor (197380 = 0x30304). The running daily accepts
+/// it with status 0 and reads live lux; the shared 200000 above stays for the
+/// CT817, where it is the only tested value.
+const ALS_INTERVAL_US_VD6286: u32 = 197380;
 const LUX_OFFSET_CT720: usize = 0x1d;
 // These offsets address the fake-HID EPIC payload, not a host HID event.
 const LUX_OFFSET_VD6286: usize = 0x28;
@@ -123,7 +128,7 @@ fn enable_als(
         set(ALS_PROP_RAW_INTERVAL, ALS_RAW_INTERVAL, "raw interval")?;
         // The interval is zero at probe, so this is the transition that arms
         // the sensor.
-        return set(ALS_PROP_INTERVAL, ALS_INTERVAL_US, "interval");
+        return set(ALS_PROP_INTERVAL, ALS_INTERVAL_US_VD6286, "interval");
     }
 
     // The CT817 gets its calibration from the AOP driver over the setup port,
