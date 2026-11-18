@@ -445,13 +445,12 @@ static int macsmc_rtc_probe(struct platform_device *pdev)
 						       "apple,rtc-offset-seconds");
 
 	/*
-	 * The class default is NSEC_PER_SEC + 5 ms. ntp sync_hw_clock passes that
-	 * to rtc_tv_nsec_ok, so the write window is only at the second edge; on
-	 * retry the hrtimer re-arms at second + 2 s - offset, which lands in the
-	 * past when offset is about one second and spins at ~500 Hz with no
-	 * userspace adjtimex.
+	 * Free-running counter + nvmem offset, not a post-write tick-up RTC.
+	 * The class default (1s + 5 ms) shrinks rtc_tv_nsec_ok to the edge fuzz
+	 * and makes sync_hw_clock retry constantly. Use a half-second systohc
+	 * phase window like CMOS, not a transport-time offset.
 	 */
-	rtc->rtc_dev->set_offset_nsec = 5 * NSEC_PER_MSEC;
+	rtc->rtc_dev->set_offset_nsec = NSEC_PER_SEC / 2;
 
 	rtc->rtc_dev->ops = &macsmc_rtc_ops;
 	ret = macsmc_rtc_init_alarm(pdev, rtc);

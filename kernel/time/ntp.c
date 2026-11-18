@@ -747,16 +747,26 @@ static enum hrtimer_restart sync_timer_callback(struct hrtimer *timer)
 
 static void sched_sync_hw_clock(unsigned long offset_nsec, bool retry)
 {
-	ktime_t exp = ktime_set(ktime_get_real_seconds(), 0);
-	ktime_t now = ktime_get();
+	ktime_t now = ktime_get_real();
+	ktime_t exp;
 
 	if (retry)
-		exp = ktime_add_ns(exp, 2ULL * NSEC_PER_SEC - offset_nsec);
+		exp = ktime_add_ns(ktime_set(ktime_get_real_seconds(), 0),
+				   2ULL * NSEC_PER_SEC - offset_nsec);
 	else
-		exp = ktime_add_ns(exp, SYNC_PERIOD_NS - offset_nsec);
+		exp = ktime_add_ns(now, SYNC_PERIOD_NS - offset_nsec);
 
-	if (ktime_compare(exp, now) <= 0)
-		exp = ktime_add_ns(now, NSEC_PER_MSEC);
+	/* sync_hrtimer is CLOCK_REALTIME; compare and arm in the same base. */
+	if (ktime_compare(exp, now) <= 0) {
+		if (retry) {
+			exp = ktime_add_ns(ktime_set(ktime_get_real_seconds() + 1, 0),
+					   2ULL * NSEC_PER_SEC - offset_nsec);
+			if (ktime_compare(exp, now) <= 0)
+				exp = ktime_add_ns(now, NSEC_PER_MSEC);
+		} else {
+			exp = ktime_add_ns(now, NSEC_PER_MSEC);
+		}
+	}
 
 	hrtimer_start(&sync_hrtimer, exp, HRTIMER_MODE_ABS);
 }
