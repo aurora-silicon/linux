@@ -96,7 +96,9 @@ static void index_write(struct centauri_t6050_wifi *wifi, int array, int index, 
 static void put_unaligned_le16(u16 value, void *p) { memcpy(p, &value, 2); }
 static void put_unaligned_le32(u32 value, void *p) { memcpy(p, &value, 4); }
 static void put_unaligned_le64(uint64_t value, void *p) { memcpy(p, &value, 8); }
-static void command_fault(struct centauri_t6050_wifi *wifi) { wifi->command_failed = true; }
+static void command_fault(struct centauri_t6050_wifi *wifi, u32 id,
+                          u32 wifi_stage, const char *reason)
+{ (void)id; (void)wifi_stage; (void)reason; wifi->command_failed = true; }
 static void drain(struct centauri_t6050_wifi *wifi)
 {
     assert(wifi->lock);
