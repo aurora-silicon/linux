@@ -1496,6 +1496,68 @@ static void ave_t6041_text_boot_word(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ave_fw_text_boot_crc(text, size, size - 2, &a), -EINVAL);
 }
 
+/*
+ * T6000 and T8112 run the 6070 commands upstream qualified byte for byte.
+ * These CRCs pin the Start and first two Process commands the builder
+ * produces for them, so a change meant for another chip cannot alter
+ * those bytes unnoticed.
+ */
+static void ave_6070_qualified_bytes(struct kunit *test)
+{
+	static const struct {
+		enum ave_codec codec;
+		u32 width, height, fps_num, fps_den;
+		u32 start_crc, process_crc[2];
+	} cases[] = {
+		{ AVE_CODEC_H264, 1280, 720, 30, 1,
+		  0x0a894c73, { 0xbaecc863, 0x3da7ba31 } },
+		{ AVE_CODEC_H264, 1920, 1080, 30000, 1001,
+		  0xd87cabff, { 0x3147b186, 0xb60cc3d4 } },
+		{ AVE_CODEC_HEVC, 1280, 720, 30, 1,
+		  0x90dd39ba, { 0x27b4ba17, 0x852da142 } },
+		{ AVE_CODEC_HEVC, 1920, 1080, 30000, 1001,
+		  0x55b40bc0, { 0xd96b85f9, 0x7bf29eac } },
+	};
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(cases); i++) {
+		struct ave_dev *ave = kunit_kzalloc(test, sizeof(*ave), GFP_KERNEL);
+		struct ave_ctx *ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+		struct ave_session *sess = kunit_kzalloc(test, sizeof(*sess), GFP_KERNEL);
+		enum ave_codec codec = cases[i].codec;
+		size_t start_len, process_len;
+		u8 *start, *process;
+		u32 crc;
+
+		KUNIT_ASSERT_NOT_NULL(test, ave);
+		KUNIT_ASSERT_NOT_NULL(test, ctx);
+		KUNIT_ASSERT_NOT_NULL(test, sess);
+		ave_test_6070_session(test, ave, ctx, sess, codec, cases[i].width,
+				      cases[i].height);
+		sess->p.fps_num = cases[i].fps_num;
+		sess->p.fps_den = cases[i].fps_den;
+		start_len = ave->layout->bytes[codec - 1][AVE_IMAGE_START];
+		process_len = ave->layout->bytes[codec - 1][AVE_IMAGE_PROCESS];
+		start = kunit_kzalloc(test, start_len, GFP_KERNEL);
+		process = kunit_kzalloc(test, process_len, GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, start);
+		KUNIT_ASSERT_NOT_NULL(test, process);
+
+		KUNIT_ASSERT_EQ(test, ave_build_start(ctx, start, start_len), 0);
+		crc = crc32_le(~0, start, start_len);
+		KUNIT_EXPECT_EQ(test, crc, cases[i].start_crc);
+		for (unsigned int slot = 0; slot < 2; slot++) {
+			memset(process, 0, process_len);
+			KUNIT_ASSERT_EQ(test,
+					ave_build_process(ctx, process, process_len,
+							  slot, 0x8f0000000ULL,
+							  4000000, false, false),
+					0);
+			crc = crc32_le(~0, process, process_len);
+			KUNIT_EXPECT_EQ(test, crc, cases[i].process_crc[slot]);
+		}
+	}
+}
+
 static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_t6041_text_boot_word),
 	KUNIT_CASE(ave_9003_byte_equality), KUNIT_CASE(ave_9003_hevc_main10),
@@ -1504,6 +1566,7 @@ static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_6070_replies),	    KUNIT_CASE(ave_6070_frame_result),
 	KUNIT_CASE(ave_6070_split_surfaces),
 	KUNIT_CASE(ave_6070_start_process_fields),
+	KUNIT_CASE(ave_6070_qualified_bytes),
 	KUNIT_CASE(ave_6070_reordered_pictures),
 	KUNIT_CASE(ave_6070_hevc_contract),
 	KUNIT_CASE(ave_6070_entropy_interleave),
