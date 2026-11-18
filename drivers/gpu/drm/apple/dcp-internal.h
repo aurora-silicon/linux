@@ -937,6 +937,11 @@ struct apple_dcp {
 	 * Activate/Deactivate belong to it until its answer is in.
 	 */
 	bool t8132_release_late;
+	/*
+	 * T8132 dcpext: its display was released and its route parked for a
+	 * deep sleep (dcp_t8132_sleep_release()), to be connected again after it.
+	 */
+	bool t8132_sleep_released;
 	/* DPTX feeds a Thunderbolt DP IN adapter, not the Type-C PHY lanes */
 	bool dptx_tunnel;
 	/* DFP port in the DPTX target: 0 = dpphy, 1 = dpin0, 2 = dpin1 */
