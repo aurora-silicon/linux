@@ -210,6 +210,9 @@ struct macsmc_fan_test {
 	int manual_busy[2];
 	int target_writes;
 	smc_key fail_key;
+	smc_key fail_read_key;
+	bool relock_stuck;
+	u8 relock_mode;
 };
 
 static int fan_test_index(smc_key key)
@@ -222,6 +225,9 @@ static int fan_test_read(struct apple_smc *smc, smc_key key, void *buf, size_t s
 	struct macsmc_fan_test *t = container_of(smc, struct macsmc_fan_test, smc);
 	u32 value;
 	int i = fan_test_index(key);
+
+	if (key == t->fail_read_key)
+		return -EIO;
 
 	switch (key & 0xff00ffff) {
 	case __SMC_KEY('F', 0, 'M', 'd'):
@@ -262,8 +268,10 @@ static int fan_test_write(struct apple_smc *smc, smc_key key, const void *buf, s
 		for (i = 0; i < ARRAY_SIZE(t->mode); i++) {
 			if (value && t->mode[i] == MACSMC_FAN_MODE_SYSTEM)
 				t->mode[i] = MACSMC_FAN_MODE_AUTO;
-			else if (!value)
+			else if (!value && !t->relock_stuck)
 				t->mode[i] = MACSMC_FAN_MODE_SYSTEM;
+			else if (!value)
+				t->mode[i] = t->relock_mode;
 		}
 		return size;
 	}
@@ -507,6 +515,127 @@ static void macsmc_fan_test_unlock_fails(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, t->refused, 0);
 }
 
+static void fan_test_enable_controllable(struct macsmc_fan_test *t)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(t->fans); i++)
+		t->fans[i].attrs = HWMON_F_TARGET | HWMON_F_MIN | HWMON_F_MAX;
+}
+
+/* A live AUTO write failure keeps ownership so the next release retries. */
+static void macsmc_fan_test_auto_write_fails(struct kunit *test)
+{
+	struct macsmc_fan_test *t = test->priv;
+	struct device dev = {};
+
+	dev_set_drvdata(&dev, &t->hwmon);
+	fan_test_enable_controllable(t);
+
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request(&dev, 1000, 0), 5777);
+	t->fail_key = SMC_KEY(F0Md);
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_fans_request(&dev, 0, 0), -EIO);
+	KUNIT_EXPECT_TRUE(test, t->fans[0].manual);
+	KUNIT_EXPECT_TRUE(test, t->fans[0].kernel);
+	KUNIT_EXPECT_FALSE(test, t->fans[1].manual);
+	KUNIT_EXPECT_FALSE(test, t->fans[1].kernel);
+	KUNIT_EXPECT_EQ(test, t->hwmon.fan.manual, 1);
+	KUNIT_EXPECT_TRUE(test, t->hwmon.fan.unlocked);
+
+	t->fail_key = 0;
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request(&dev, 0, 0), 0);
+	fan_test_released(test, t);
+
+	/* At suspend, failed AUTO writes still yield to the global relock. */
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request(&dev, 1000, 0), 5777);
+	t->fail_key = SMC_KEY(F0Md);
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_suspend(&dev), 0);
+	fan_test_released(test, t);
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_resume(&dev), 0);
+}
+
+/* A failed relock write leaves unlocked set so the next release retries. */
+static void macsmc_fan_test_relock_write_fails(struct kunit *test)
+{
+	struct macsmc_fan_test *t = test->priv;
+	struct device dev = {};
+
+	dev_set_drvdata(&dev, &t->hwmon);
+	fan_test_enable_controllable(t);
+
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request(&dev, 1000, 0), 5777);
+	t->fail_key = SMC_KEY(Ftst);
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_fans_request(&dev, 0, 0), -EIO);
+	KUNIT_EXPECT_EQ(test, t->hwmon.fan.manual, 0);
+	KUNIT_EXPECT_TRUE(test, t->hwmon.fan.unlocked);
+
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_fans_request(&dev, 0, 0), -EIO);
+	KUNIT_EXPECT_TRUE(test, t->hwmon.fan.unlocked);
+
+	t->fail_key = 0;
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request(&dev, 0, 0), 0);
+	fan_test_released(test, t);
+}
+
+/* Relock stays pending across readback errors so repeated releases recheck. */
+static void macsmc_fan_test_relock_readback_fails(struct kunit *test)
+{
+	struct macsmc_fan_test *t = test->priv;
+	struct device dev = {};
+	int ftst_writes;
+
+	dev_set_drvdata(&dev, &t->hwmon);
+	fan_test_enable_controllable(t);
+
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request(&dev, 1000, 0), 5777);
+	t->fail_read_key = SMC_KEY(F1Md);
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_fans_request(&dev, 0, 0), -EIO);
+	KUNIT_EXPECT_EQ(test, t->hwmon.fan.manual, 0);
+	KUNIT_EXPECT_TRUE(test, t->hwmon.fan.unlocked);
+
+	/* Repeated release still fails and retries relock once while readback fails. */
+	ftst_writes = t->ftst_writes;
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_fans_request(&dev, 0, 0), -EIO);
+	KUNIT_EXPECT_EQ(test, t->ftst_writes, ftst_writes + 1);
+	KUNIT_EXPECT_TRUE(test, t->hwmon.fan.unlocked);
+
+	t->fail_read_key = 0;
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request(&dev, 0, 0), 0);
+	fan_test_released(test, t);
+
+	/* A fresh manual request after a readback failure re-unlocks Ftst. */
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request(&dev, 1000, 0), 5777);
+	t->fail_read_key = SMC_KEY(F1Md);
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_fans_request(&dev, 0, 0), -EIO);
+	KUNIT_EXPECT_TRUE(test, t->hwmon.fan.unlocked);
+	t->fail_read_key = 0;
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request(&dev, 1000, 0), 5777);
+	KUNIT_EXPECT_EQ(test, t->hwmon.fan.manual, 2);
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request(&dev, 0, 0), 0);
+	fan_test_released(test, t);
+}
+
+/* A relock readback timeout keeps unlocked set until a later release confirms system mode. */
+static void macsmc_fan_test_relock_timeout(struct kunit *test)
+{
+	struct macsmc_fan_test *t = test->priv;
+	struct device dev = {};
+
+	dev_set_drvdata(&dev, &t->hwmon);
+	fan_test_enable_controllable(t);
+
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request(&dev, 1000, 0), 5777);
+	t->relock_stuck = true;
+	t->relock_mode = MACSMC_FAN_MODE_AUTO;
+	KUNIT_EXPECT_EQ(test, macsmc_hwmon_fans_request(&dev, 0, 0), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, t->hwmon.fan.manual, 0);
+	KUNIT_EXPECT_TRUE(test, t->hwmon.fan.unlocked);
+
+	t->relock_stuck = false;
+	KUNIT_ASSERT_EQ(test, macsmc_hwmon_fans_request(&dev, 0, 0), 0);
+	fan_test_released(test, t);
+}
+
 /* A stopped fan may leave mode 3 before the manual-mode write is ready. */
 static void macsmc_fan_test_stopped_manual_busy(struct kunit *test)
 {
@@ -572,6 +701,10 @@ static struct kunit_case macsmc_fan_test_cases[] = {
 	KUNIT_CASE(macsmc_fan_test_untouched),
 	KUNIT_CASE(macsmc_fan_test_suspend_manual),
 	KUNIT_CASE(macsmc_fan_test_unlock_fails),
+	KUNIT_CASE(macsmc_fan_test_auto_write_fails),
+	KUNIT_CASE(macsmc_fan_test_relock_write_fails),
+	KUNIT_CASE(macsmc_fan_test_relock_readback_fails),
+	KUNIT_CASE(macsmc_fan_test_relock_timeout),
 	{}
 };
 

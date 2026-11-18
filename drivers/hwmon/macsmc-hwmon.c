@@ -403,7 +403,6 @@ static int macsmc_hwmon_fans_relock(struct macsmc_hwmon *hwmon)
 		dev_err(hwmon->dev, "cannot hand the fans back to the SMC (%d)\n", ret);
 		return ret;
 	}
-	hwmon->fan.unlocked = false;
 
 	timeout = jiffies + msecs_to_jiffies(MACSMC_FAN_MODE_TIMEOUT_MS);
 	for (i = 0; i < hwmon->fan.count; i++) {
@@ -426,6 +425,28 @@ static int macsmc_hwmon_fans_relock(struct macsmc_hwmon *hwmon)
 		}
 	}
 
+	hwmon->fan.unlocked = false;
+	return 0;
+}
+
+static int macsmc_hwmon_fan_set_auto(struct macsmc_hwmon *hwmon,
+				     struct macsmc_hwmon_fan *fan)
+{
+	int ret;
+
+	if (!fan->manual)
+		return 0;
+
+	ret = macsmc_hwmon_write_key(hwmon->smc, &fan->mode, MACSMC_FAN_MODE_AUTO);
+	/*
+	 * At shutdown or suspend the final unlock-key relock hands all
+	 * fans back, even if one fan refuses its individual AUTO write.
+	 */
+	if (ret < 0 && !(hwmon->fan.stopped && hwmon->fan.unlocked))
+		return ret;
+	fan->manual = false;
+	fan->kernel = false;
+	hwmon->fan.manual--;
 	return 0;
 }
 
@@ -433,23 +454,15 @@ static int macsmc_hwmon_fans_relock(struct macsmc_hwmon *hwmon)
 static int macsmc_hwmon_fan_auto(struct macsmc_hwmon *hwmon,
 				 struct macsmc_hwmon_fan *fan)
 {
-	int ret, relock;
+	int ret = macsmc_hwmon_fan_set_auto(hwmon, fan);
 
-	if (!fan->manual)
-		return 0;
+	if (ret)
+		return ret;
 
-	ret = macsmc_hwmon_write_key(hwmon->smc, &fan->mode, MACSMC_FAN_MODE_AUTO);
-	fan->manual = false;
-	fan->kernel = false;
-	hwmon->fan.manual--;
+	if (hwmon->fan.unlocked && !hwmon->fan.manual)
+		return macsmc_hwmon_fans_relock(hwmon);
 
-	if (hwmon->fan.unlocked && !hwmon->fan.manual) {
-		relock = macsmc_hwmon_fans_relock(hwmon);
-		if (relock)
-			return relock;
-	}
-
-	return ret < 0 ? ret : 0;
+	return 0;
 }
 
 /*
@@ -480,7 +493,11 @@ static int macsmc_hwmon_fan_manual(struct macsmc_hwmon *hwmon,
 		if (!hwmon->fan.unlock_key)
 			return -EOPNOTSUPP;
 
-		if (!hwmon->fan.unlocked) {
+		/*
+		 * Re-unlock when no fan is manual so a prior relock that wrote
+		 * 0 but failed readback does not wait on a locked SMC.
+		 */
+		if (!hwmon->fan.unlocked || !hwmon->fan.manual) {
 			ret = apple_smc_write_u8(hwmon->smc, hwmon->fan.unlock_key, 1);
 			if (ret < 0) {
 				/* The key may have been set anyway; clear it. */
@@ -589,14 +606,16 @@ static int macsmc_hwmon_set_fan(struct macsmc_hwmon *hwmon, int channel, long va
  * returns to the SMC at suspend, shutdown and unbind. Only fans whose device
  * tree node names their mode, target, minimum and maximum keys take part.
  *
- * Return: the first such fan's target in rpm (0 once handed back), -ENODEV
- * without such a fan, -EBUSY while stopped, or the first error.
+ * Return: the first such fan's target in rpm for a non-zero @permille, or 0
+ * when @permille is 0 (even when no fan is kernel-owned); -ENODEV if @dev is
+ * unbound or for a non-zero @permille without such a fan; -EBUSY while
+ * stopped for a non-zero @permille; or the first error.
  */
 int macsmc_hwmon_fans_request(struct device *dev, unsigned int permille,
 			      unsigned int min_step_rpm)
 {
 	struct macsmc_hwmon *hwmon = dev_get_drvdata(dev);
-	long first = -ENODEV;
+	long first = permille ? -ENODEV : 0;
 	int ret = 0;
 	u32 i;
 
@@ -622,9 +641,7 @@ int macsmc_hwmon_fans_request(struct device *dev, unsigned int permille,
 			continue;
 
 		if (!permille) {
-			if (first < 0)
-				first = 0;
-			err = macsmc_hwmon_fan_auto(hwmon, fan);
+			err = macsmc_hwmon_fan_set_auto(hwmon, fan);
 			if (err && !ret)
 				ret = err;
 			continue;
@@ -668,6 +685,13 @@ int macsmc_hwmon_fans_request(struct device *dev, unsigned int permille,
 		}
 	}
 
+	if (!permille && hwmon->fan.unlocked && !hwmon->fan.manual) {
+		int err = macsmc_hwmon_fans_relock(hwmon);
+
+		if (err && !ret)
+			ret = err;
+	}
+
 	return ret ? ret : first;
 }
 EXPORT_SYMBOL_GPL(macsmc_hwmon_fans_request);
@@ -698,7 +722,9 @@ static void macsmc_hwmon_fans_restore(struct macsmc_hwmon *hwmon)
 
 	guard(mutex)(&hwmon->fan.lock);
 	for (i = 0; i < hwmon->fan.count; i++)
-		macsmc_hwmon_fan_auto(hwmon, &hwmon->fan.fans[i]);
+		macsmc_hwmon_fan_set_auto(hwmon, &hwmon->fan.fans[i]);
+	if (hwmon->fan.unlocked && !hwmon->fan.manual)
+		macsmc_hwmon_fans_relock(hwmon);
 }
 
 static void macsmc_hwmon_fans_restore_action(void *data)
