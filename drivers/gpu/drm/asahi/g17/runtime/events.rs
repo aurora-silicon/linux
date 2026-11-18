@@ -6,7 +6,10 @@
 use super::DeferredBatch;
 use crate::g17::{
     channel, event,
-    fw::channels::{Event, FreeListCompletion, TvbGrowRequest},
+    fw::{
+        channels::{Event, FreeListCompletion, TvbGrowRequest},
+        variant::InitGraph,
+    },
     recovery,
     status::VmStatus,
     Firmware, Role,
@@ -172,6 +175,12 @@ impl recovery::Memory for Service<'_> {
         // latched MMU fault is reason 3.
         if mmu_fault && sources.reason.is_none() {
             sources.reason = Some(recovery::PAGE_FAULT);
+        }
+        // Only the banks show that the 25G83 firmware's reason word is this restart's.
+        if self.firmware.primary.state.shared.variant.graph == InitGraph::V25G83 {
+            if let Ok(banks) = self.firmware.port.fault_banks() {
+                sources.check_fault_banks(&banks);
+            }
         }
         Ok(sources)
     }
