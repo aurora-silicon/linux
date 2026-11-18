@@ -694,6 +694,12 @@ struct apple_sleep_soc {
 	unsigned int ncluster_cpu;
 	/* "cpu-start": a core's bit is BIT(cpu_start_stride * cluster + core). */
 	unsigned int cpu_start_stride;
+	/*
+	 * "cpu-start", for a SoC whose clusters don't sit a fixed stride apart (T6040: E 0-3, P0
+	 * 4-9, P1 10-15): each cluster's first bit, a core's bit is then BIT(first + core) and
+	 * cpu_start_stride is not used.
+	 */
+	const u8 *cpu_start_first_bit;
 	/* In "clk-mux": parked in this order before the commit, with this value */
 	u32 clk_mux_parked[SLEEP_CLK_MUX_MAX];
 	unsigned int nclk_mux_parked;
@@ -1869,6 +1875,9 @@ static unsigned int sleep_cpu_core(u64 mpidr)
 
 static u32 sleep_cpu_start_bit(const struct apple_sleep *s, u64 mpidr)
 {
+	if (s->soc->cpu_start_first_bit)
+		return BIT(s->soc->cpu_start_first_bit[sleep_cpu_cluster(s, mpidr)] +
+			   sleep_cpu_core(mpidr));
 	return BIT(s->soc->cpu_start_stride * sleep_cpu_cluster(s, mpidr) +
 		   sleep_cpu_core(mpidr));
 }
@@ -1887,11 +1896,18 @@ static int apple_sleep_validate_cpu_topology(struct apple_sleep *s)
 	int index, ret;
 
 	if (soc->cpu_cluster_affinity > 3 || !soc->cpu_clusters || !soc->cpu_cores_per_cluster ||
-	    soc->cpu_cores_per_cluster > 32 || soc->cpu_start_stride > 32 ||
-	    soc->cpu_start_stride < soc->cpu_cores_per_cluster ||
-	    soc->cpu_start_stride * (soc->cpu_clusters - 1) +
-		    soc->cpu_cores_per_cluster > 32)
+	    soc->cpu_cores_per_cluster > 32)
 		return dev_err_probe(s->dev, -EINVAL, "invalid CPU-start geometry\n");
+	if (soc->cpu_start_first_bit) {
+		for (cpu = 0; cpu < soc->cpu_clusters; cpu++)
+			if (soc->cpu_start_first_bit[cpu] + soc->cpu_cores_per_cluster > 32)
+				return dev_err_probe(s->dev, -EINVAL, "invalid CPU-start geometry\n");
+	} else if (soc->cpu_start_stride > 32 ||
+		   soc->cpu_start_stride < soc->cpu_cores_per_cluster ||
+		   soc->cpu_start_stride * (soc->cpu_clusters - 1) +
+			   soc->cpu_cores_per_cluster > 32) {
+		return dev_err_probe(s->dev, -EINVAL, "invalid CPU-start geometry\n");
+	}
 
 	if (soc->machine && (!of_machine_is_compatible(soc->machine) ||
 	    cpu_logical_map(0) != soc->boot_mpidr ||
