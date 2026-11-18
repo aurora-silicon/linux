@@ -5797,9 +5797,12 @@ static bool dcp_v27_sleep_transport_supported(struct apple_dcp *dcp)
 	    dcp->fw_compat != DCP_FIRMWARE_V_27_0)
 		return false;
 
-	/* The enum also covers later 27.x method tables. */
+	/*
+	 * The enum also covers later 27.x method tables. 27.2 keeps the endpoint
+	 * transport; its renumbered IOMFB calls go through iomfb_v27_tag().
+	 */
 	return dcp_read_fw_version(dev, "apple,firmware-compat", compat) >= 0 &&
-	       !strcmp(compat, "27.0.0");
+	       (!strcmp(compat, "27.0.0") || !strcmp(compat, "27.2.0"));
 }
 
 static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
