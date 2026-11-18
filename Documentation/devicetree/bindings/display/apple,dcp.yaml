@@ -92,6 +92,14 @@ properties:
       - const: mbox
       - const: secure
 
+  apple,secure-mbox:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The coprocessor's secure RTBuddy port, on a machine whose boot loader
+      hands the display over only to a node with a single mailbox in mboxes.
+      The driver takes it as the "secure" mailbox. Elsewhere the port is the
+      second entry of mboxes.
+
   iommus:
     maxItems: 1
 
