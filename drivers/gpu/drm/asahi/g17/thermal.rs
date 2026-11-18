@@ -112,6 +112,10 @@ const CPU_HEAT_FLOOR_SLACK_MW: i64 = 1000;
 fn enabled() -> bool {
     crate::module_parameters::m5_thermal_governor.value() & 1 != 0
 }
+// Fan-only assistance leaves the firmware's power budget and CPU policy in control.
+pub(super) fn hotspot_fans_only() -> bool {
+    crate::module_parameters::m5_thermal_governor.value() & 3 == 2
+}
 fn cpu_balance_enabled() -> bool {
     crate::module_parameters::m5_thermal_governor.value() & 4 != 0
 }
@@ -123,7 +127,7 @@ fn fan_curve_enabled() -> bool {
     crate::module_parameters::m5_thermal_governor.value() & 16 == 0
 }
 pub(super) fn requested() -> bool {
-    enabled()
+    enabled() || hotspot_fans_only()
 }
 fn target_mc() -> i32 {
     let parameter = crate::module_parameters::m5_thermal_target_mc.value();
@@ -247,7 +251,10 @@ fn fan_curve_permille(temp_mc: i32, target_mc: i32) -> i32 {
 /// serializes with its unbinding). A fan whose target is within `min_step_rpm` of the new one
 /// keeps it. Returns the first fan's target rpm, 0 once handed back.
 fn request_fans(permille: u32, min_step_rpm: u32) -> Option<u32> {
-    let provider = SensorProvider::acquire()?;
+    let Some(provider) = SensorProvider::acquire() else {
+        // Unbinding restores the provider's fans.
+        return (permille == 0).then_some(0);
+    };
     // SAFETY: the provider lock keeps the device bound, as the request requires.
     let rpm = unsafe { asahi_fans_request(provider.0.cast(), permille, min_step_rpm) };
     u32::try_from(rpm).ok()
@@ -259,6 +266,7 @@ fn request_fans(permille: u32, min_step_rpm: u32) -> Option<u32> {
 /// Released (automatic mode) when the governor releases or the GPU goes idle, after a hold.
 pub(crate) struct FanBoost {
     boosted: bool,
+    release_pending: bool,
     since_ns: u64,
     /// The fan target the curve last wrote (rpm), 0 while the fans are automatic.
     curve_rpm: u32,
@@ -266,7 +274,7 @@ pub(crate) struct FanBoost {
 
 impl FanBoost {
     const fn new() -> Self {
-        Self { boosted: false, since_ns: 0, curve_rpm: 0 }
+        Self { boosted: false, release_pending: false, since_ns: 0, curve_rpm: 0 }
     }
 
     /// Puts every fan in manual mode at `permille` of its minimum-to-maximum range, or back in
@@ -306,6 +314,32 @@ impl FanBoost {
     /// Applies one governor step's request. Called from the governor work without driver locks:
     /// SMC accesses sleep.
     fn apply(&mut self, want: bool, temp_mc: Option<i32>, now_ns: u64) {
+        if hotspot_fans_only() {
+            // Only ever request the SMC's rated maximum or release the fans.
+            // A busy GPU starts assistance at the top of the existing curve.
+            // Hysteresis and the hold prevent rapid transitions between owners.
+            if self.release_pending {
+                self.release();
+                return;
+            }
+            let threshold = if self.boosted { FAN_CURVE_RELEASE_MC } else { FAN_CURVE_TOP_MC };
+            if want && temp_mc.is_some_and(|temp| temp >= threshold) {
+                self.since_ns = now_ns;
+                if !self.boosted {
+                    self.boosted = self.set(true);
+                    if !self.boosted {
+                        // A later fan may refuse after an earlier one accepted.
+                        // Drop any partial request before retrying on the next tick.
+                        self.release_pending = !self.set(false);
+                    }
+                }
+            } else if self.boosted && (temp_mc.is_none()
+                || now_ns.saturating_sub(self.since_ns) >= FAN_HOLD_NS)
+            {
+                self.release();
+            }
+            return;
+        }
         if !fan_boost_enabled() {
             if fan_curve_enabled() {
                 self.apply_curve(want, temp_mc, target_mc(), now_ns);
@@ -329,7 +363,8 @@ impl FanBoost {
     }
 
     pub(crate) fn release(&mut self) {
-        if self.boosted && self.set(false) {
+        if self.boosted || self.release_pending {
+            self.release_pending = !self.set(false);
             self.boosted = false;
         }
         if self.curve_rpm != 0 && self.set_curve(None).is_some() {
@@ -338,7 +373,7 @@ impl FanBoost {
     }
 
     pub(crate) fn boosted(&self) -> bool {
-        self.boosted || self.curve_rpm != 0
+        self.boosted || self.release_pending || self.curve_rpm != 0
     }
 }
 
@@ -679,10 +714,13 @@ impl Governor {
         }
     }
 
+    pub(super) fn recent_activity(&self, now_ns: u64) -> bool {
+        self.last_activity_ns != 0 && now_ns.saturating_sub(self.last_activity_ns) < IDLE_RESTORE_NS
+    }
+
     /// Whether the fans should be boosted: while the controller governs a busy GPU.
     pub(crate) fn fans_wanted(&self, now_ns: u64) -> bool {
-        self.maximum_mw != 0 && self.active
-            && now_ns.saturating_sub(self.last_activity_ns) < IDLE_RESTORE_NS
+        self.maximum_mw != 0 && self.active && self.recent_activity(now_ns)
     }
 
     /// One control step with the hotspot temperature, the GPU's current draw (mW) and whether the

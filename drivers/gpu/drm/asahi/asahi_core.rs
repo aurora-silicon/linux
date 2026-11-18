@@ -138,7 +138,7 @@ module! {
         },
         m5_thermal_governor: u32 {
             default: 0,
-            description: "M5 thermal flags: bit 0 enables the host GPU power budget controller, bit 2 lets the controller lower the CPU frequency ceiling while the GPU is budget-bound, bit 3 runs the fans at their maximum while it governs; default 0 preserves the existing policy",
+            description: "M5 thermal flags: bit 0 enables the host GPU power budget controller, bit 1 alone boosts cooling for a hot GPU without host power budgeting, bit 2 lets the controller lower the CPU frequency ceiling while the GPU is budget-bound, bit 3 runs the fans at their maximum while it governs; default 0 preserves the existing policy",
         },
         m5_thermal_target_mc: u32 {
             default: 90000,

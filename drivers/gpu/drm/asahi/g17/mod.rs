@@ -973,6 +973,10 @@ impl Firmware {
         if self.effort.applied() != 0 && thermal::requested() {
             self.governor.note_activity(now);
         }
+        if thermal::hotspot_fans_only() {
+            let busy = self.governor.recent_activity(now);
+            return (busy || fans, thermal::CpuAdvice::Release, busy);
+        }
         let Ok(current) = self.init.m5_power_budget() else {
             return (false, thermal::CpuAdvice::Release, false);
         };
