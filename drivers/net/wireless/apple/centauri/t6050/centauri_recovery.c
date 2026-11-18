@@ -123,7 +123,7 @@ out_unlock:
 }
 EXPORT_SYMBOL_GPL(centauri_t6050_schedule_transport_recover);
 
-#if IS_ENABLED(CONFIG_KUNIT)
+#if IS_ENABLED(CONFIG_APPLE_CENTAURI_T6050_RECOVERY_KUNIT)
 
 #include <kunit/test.h>
 
