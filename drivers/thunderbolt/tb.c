@@ -2801,12 +2801,14 @@ static void tb_dp_rebuild_work(struct work_struct *work)
 	struct tb *tb = r->tb;
 	struct tb_cm *tcm = tb_priv(tb);
 	struct tb_tunnel *tunnel;
+	bool admitted;
 
 	if (pm_runtime_resume_and_get(&tb->dev) < 0)
 		goto out;
 
+	admitted = tb_dp_relink_admit();
 	mutex_lock(&tb->lock);
-	if (tcm->hotplug_active && tb->root_switch) {
+	if (admitted && tcm->hotplug_active && tb->root_switch) {
 		list_for_each_entry(tunnel, &tcm->tunnel_list, list) {
 			if (!tb_tunnel_is_host_dp(tunnel) ||
 			    tunnel->src_port->port != r->in_port ||
@@ -2818,6 +2820,8 @@ static void tb_dp_rebuild_work(struct work_struct *work)
 		}
 	}
 	mutex_unlock(&tb->lock);
+	if (admitted)
+		tb_dp_relink_done();
 
 	pm_runtime_mark_last_busy(&tb->dev);
 	pm_runtime_put_autosuspend(&tb->dev);
@@ -2829,6 +2833,9 @@ out:
 /*
  * Queues the rebuild on the domain queue. Does not take the domain lock: the
  * caller may hold a lock that tunnel notifications take.
+ * Ordering on @tb->wq runs this behind DPRX, teardown and dp_relink_run work;
+ * the queue is not freezable, so tb_dp_relink_admit() in the worker keeps a
+ * rebuild out of an in-progress system sleep transition.
  */
 int tb_dp_host_rebuild(struct tb *tb, u8 in_port, u64 generation)
 {
