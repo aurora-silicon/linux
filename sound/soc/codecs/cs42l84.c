@@ -1428,6 +1428,8 @@ static int cs42l84_resume(struct device *dev)
 		cs42l84_detect_hs(cs42l84);
 		cs42l84_set_interrupt_masks(cs42l84, 0);
 	} else {
+		/* As on an unplug: the cache may hold a headset's bias */
+		cs42l84_revert_hs(cs42l84);
 		cs42l84->hs_type = 0;
 		snd_soc_jack_report(cs42l84->jack, 0, SND_JACK_HEADSET);
 		cs42l84_set_interrupt_masks(cs42l84,
