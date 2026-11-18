@@ -7,7 +7,22 @@ struct apple_rtkit_v27_scope {
 	DECLARE_KFIFO(deferred, struct apple_mbox_msg, 64);
 	bool held, stopped, failed;
 	int error;
+	/*
+	 * Run once between the AP state's acknowledgment and the IOP request, interrupts off.
+	 * An error fails the idle.
+	 */
+	int (*after_ap)(void *data);
+	void *after_ap_data;
 };
+
+void apple_rtkit_v27_set_after_ap(struct apple_rtkit_v27_scope *s, int (*fn)(void *), void *data)
+{
+	if (s) {
+		s->after_ap = fn;
+		s->after_ap_data = data;
+	}
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_v27_set_after_ap);
 
 bool apple_rtkit_v27_live(struct apple_rtkit *rtk)
 {
@@ -118,6 +133,43 @@ int apple_rtkit_v27_check(struct apple_rtkit_v27_scope *s)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_v27_check);
 
+/*
+ * A second port's AP idle with interrupts off: sent, and its acknowledgment awaited by polling
+ * the port's mailbox, for at most @us. The port's tracked state is not updated.
+ */
+int apple_rtkit_v27_port_ap_idle_atomic(struct apple_rtkit *rtk, unsigned int us)
+{
+	struct apple_mbox_msg msg = {
+		.msg0 = FIELD_PREP(APPLE_RTKIT_MGMT_TYPE, APPLE_RTKIT_MGMT_SET_AP_PWR_STATE) |
+			FIELD_PREP(APPLE_RTKIT_MGMT_PWR_STATE, APPLE_RTKIT_PWR_STATE_IDLE),
+		.msg1 = APPLE_RTKIT_EP_MGMT,
+	};
+	unsigned int i, n = us / 10;
+	int ret = -ETIMEDOUT;
+
+	for (i = 0; i < n; i++) {
+		ret = apple_mbox_send_nowait(rtk->mbox, msg);
+		if (ret != -EAGAIN && ret != -EBUSY)
+			break;
+		udelay(10);
+	}
+	if (ret)
+		return ret;
+	for (; i < n; i++) {
+		struct apple_mbox_msg in;
+
+		ret = apple_mbox_recv_nowait(rtk->mbox, &in);
+		if (ret < 0 && ret != -EBUSY)
+			return ret;
+		if (ret > 0 && in.msg1 == APPLE_RTKIT_EP_MGMT &&
+		    FIELD_GET(APPLE_RTKIT_MGMT_TYPE, in.msg0) == APPLE_RTKIT_MGMT_SET_AP_PWR_STATE_ACK)
+			return 0;
+		udelay(10);
+	}
+	return -ETIMEDOUT;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_v27_port_ap_idle_atomic);
+
 int apple_rtkit_v27_idle_atomic(struct apple_rtkit_v27_scope *s)
 {
 	struct apple_rtkit *rtk;
@@ -180,6 +232,11 @@ int apple_rtkit_v27_idle_atomic(struct apple_rtkit_v27_scope *s)
 				    type == APPLE_RTKIT_MGMT_SET_AP_PWR_STATE_ACK &&
 				    arg == APPLE_RTKIT_PWR_STATE_IDLE) {
 					ap_ack = true;
+					if (s->after_ap) {
+						ret = s->after_ap(s->after_ap_data);
+						if (ret)
+							goto poison;
+					}
 				} else if (msg.msg1 == APPLE_RTKIT_EP_MGMT && iop_sent && !iop_ack &&
 					   type == APPLE_RTKIT_MGMT_SET_IOP_PWR_STATE_ACK &&
 					   arg == APPLE_RTKIT_PWR_STATE_IDLE) {
