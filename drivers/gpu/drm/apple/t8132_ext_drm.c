@@ -35,6 +35,7 @@
 #include <drm/drm_crtc_helper.h>
 #include <drm/drm_damage_helper.h>
 #include <drm/drm_drv.h>
+#include <drm/drm_edid.h>
 #include <drm/drm_encoder.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
@@ -625,12 +626,30 @@ static enum drm_connector_status t8132_ext_detect(struct drm_connector *connecto
 							  connector_status_disconnected;
 }
 
+/*
+ * The modes are the firmware's catalog; the sink's EDID only fills in the
+ * connector's properties (its name, physical size and the like), which a
+ * compositor needs to tell monitors apart and to scale them.
+ */
 static int t8132_ext_get_modes(struct drm_connector *connector)
 {
 	struct t8132_ext_out *out = container_of(connector, struct t8132_ext_out, connector);
 	struct apple_dcp *owner = t8132_ext_owner(out);
+	const struct drm_edid *edid;
+	int count;
 
-	return owner ? iomfb_m4_ext_get_modes(owner, connector) : 0;
+	if (!owner)
+		return 0;
+	count = iomfb_m4_ext_get_modes(owner, connector);
+	edid = iomfb_m4_ext_edid(owner);
+	if (IS_ERR(edid)) {
+		drm_dbg_kms(connector->dev, "[CONNECTOR:%d:%s] no EDID: %pe\n",
+			    connector->base.id, connector->name, edid);
+		edid = NULL;
+	}
+	drm_edid_connector_update(connector, edid);
+	drm_edid_free(edid);
+	return count;
 }
 
 static void t8132_ext_hotplug_work(struct work_struct *work)
