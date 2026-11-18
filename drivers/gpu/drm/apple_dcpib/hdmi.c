@@ -477,16 +477,16 @@ static struct gpio_desc *hdmi_port_get(struct dcpib *dcp, struct device_node *np
 }
 
 /*
- * The HDMI port of the shared ports, for a DCP whose crossbar endpoint the
- * phy's source select takes (the main DCP and DCPEXT0, as aura uses it).
- * Without the cold start description in np, HDMI stays the bootloader's.
+ * The HDMI port of the shared ports, for every DCP: the phy's source select
+ * takes each one's crossbar endpoint. Without the cold start description in
+ * np, HDMI stays the bootloader's.
  */
 int dcpib_hdmi_port_init(struct dcpib *dcp, struct device_node *np)
 {
 	struct dcpib_hdmi *hdmi;
 	int ret;
 
-	if (dcp->dp_source > 1 || !of_property_present(np, "apple,pcon-power"))
+	if (!of_property_present(np, "apple,pcon-power"))
 		return 0;
 	hdmi = devm_kzalloc(dcp->dev, sizeof(*hdmi), GFP_KERNEL);
 	if (!hdmi)
