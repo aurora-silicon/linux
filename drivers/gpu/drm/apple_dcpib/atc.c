@@ -739,6 +739,22 @@ static void atc_select(struct dcpib *dcp)
 	dcp->dcp_output = port->dfp;
 }
 
+/*
+ * Before the DCP drives another phy (the HDMI port): give up the claim on a
+ * port that is powered down. False while the current port is still up.
+ */
+bool dcpib_atc_release(struct dcpib *dcp)
+{
+	struct dcpib_atc_port *atc = atc_cur(dcp);
+
+	if (atc->active)
+		return false;
+	guard(mutex)(&atc_owner_lock);
+	if (atc_owner[atc->index] == dcp->dev)
+		atc_owner[atc->index] = NULL;
+	return true;
+}
+
 static const struct dcpib_phy_ops atc_ops = {
 	.activate = atc_activate,
 	.deactivate = atc_deactivate,

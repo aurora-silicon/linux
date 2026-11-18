@@ -4,17 +4,25 @@
  * lpdptx slot, driven by DCPEXT0 and converted by a PS190 (aura
  * src/dcp/dptx_phy.c, DPTX_PHY_T8152_HDMI).
  *
- * The bootloader powers the phy up, applies its tunables, selects the DCP
- * and trains the link. This keeps that setup and reprograms what a link
- * training changes: the PLL for a new link rate and the active lanes. Drive
- * settings are only recorded, as on macOS, and there is no per-link route.
+ * When the bootloader brought HDMI up, this keeps its setup and reprograms
+ * what a link training changes: the PLL for a new link rate and the active
+ * lanes. Drive settings are only recorded, as on macOS, and there is no
+ * per-link route. When it did not (no HDMI monitor at boot, or a USB-C
+ * display on the main DCP), the HDMI port joins the shared USB-C ports: a
+ * DCP without a USB-C display takes it on a plug and starts the phy and the
+ * PS190 from cold.
  */
 
 #include <linux/bits.h>
 #include <linux/delay.h>
+#include <linux/gpio/consumer.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
+#include <linux/mfd/macsmc.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 
 #include "dcpib.h"
@@ -28,7 +36,31 @@ struct dcpib_hdmi {
 	void __iomem *apb;
 	/* AP DisplayPort AUX controller aux1, for the EDID */
 	struct dcpib_aux aux;
+	/* The cold start of the HDMI port taken from the shared ports: */
+	void __iomem *ps;	/* PMGR DPTX_PHY */
+	void __iomem *psd;	/* PMGR2 PSD service of the phy */
+	struct gpio_desc *hpd;
+	struct device_node *smc_np;
+	const __be32 *pcon, *tunable;
+	int pcon_len, tunable_len;
+	bool active;
 };
+
+/*
+ * The DCP driving the HDMI port taken from the shared ports, if any, and its
+ * HPD line, requested once for all the DCPs that may take the port.
+ */
+static DEFINE_MUTEX(hdmi_port_lock);
+static struct device *hdmi_port_owner;
+static struct gpio_desc *hdmi_port_hpd;
+static unsigned int hdmi_port_users;
+
+#define HDMI_PS_TARGET		GENMASK(3, 0)
+#define HDMI_PS_ACTUAL		GENMASK(7, 4)
+#define HDMI_PS_FLAGS		GENMASK(9, 8)	/* write-one-to-clear */
+#define HDMI_PSD_STATE		0x80
+#define HDMI_PSD_TARGET		0x90
+#define HDMI_POWER_TIMEOUT_US	100000
 
 /* AppleT8112DPTXPort::setDPTXSourceSelect: crossbar UFP feeding the phy */
 #define HDMI_SOURCE_SELECT	0x10
@@ -260,6 +292,275 @@ static const struct dcpib_phy_ops hdmi_ops = {
 	.max_link_rate = DCPIB_LINK_RATE_HBR3,
 	/* display-crossbar0 DFP endpoint of the lpdptx slot */
 };
+
+/*
+ * The phy's PMGR and PSD power, then the PS190's through the SMC (aura
+ * dcp_init and dcp_hdmi_dptx_init).
+ */
+static int hdmi_power_up(struct dcpib *dcp, struct dcpib_hdmi *hdmi)
+{
+	struct platform_device *smc_pdev;
+	struct apple_smc *smc;
+	int ret = 0;
+	u32 val;
+
+	if ((readl(hdmi->ps) & HDMI_PS_ACTUAL) != HDMI_PS_ACTUAL) {
+		val = readl(hdmi->ps) & ~(HDMI_PS_TARGET | HDMI_PS_FLAGS);
+		writel(val | HDMI_PS_TARGET, hdmi->ps);
+		ret = readl_poll_timeout(hdmi->ps, val,
+					 (val & HDMI_PS_ACTUAL) == HDMI_PS_ACTUAL,
+					 10, HDMI_POWER_TIMEOUT_US);
+		if (ret) {
+			dev_err(dcp->dev, "HDMI: phy power state stays %#x\n", val);
+			return ret;
+		}
+	}
+	if (readl(hdmi->psd + HDMI_PSD_STATE) & 7) {
+		writel(0, hdmi->psd + HDMI_PSD_TARGET);
+		ret = readl_poll_timeout(hdmi->psd + HDMI_PSD_STATE, val, !(val & 7),
+					 10, HDMI_POWER_TIMEOUT_US);
+		if (ret) {
+			dev_err(dcp->dev, "HDMI: phy PSD state stays %#x\n", val);
+			return ret;
+		}
+	}
+
+	smc_pdev = of_find_device_by_node(hdmi->smc_np);
+	smc = smc_pdev ? platform_get_drvdata(smc_pdev) : NULL;
+	if (!smc) {
+		dev_err(dcp->dev, "HDMI: no SMC to power the PS190\n");
+		ret = -ENODEV;
+		goto out;
+	}
+	for (int i = 0; i + 3 <= hdmi->pcon_len; i += 3) {
+		u64 value = (u64)be32_to_cpu(hdmi->pcon[i + 1]) << 32 |
+			    be32_to_cpu(hdmi->pcon[i + 2]);
+
+		ret = apple_smc_write(smc, be32_to_cpu(hdmi->pcon[i]), &value,
+				      sizeof(value));
+		if (ret) {
+			dev_err(dcp->dev, "HDMI: PS190 power failed: %d\n", ret);
+			goto out;
+		}
+	}
+	msleep(25);
+out:
+	if (smc_pdev)
+		put_device(&smc_pdev->dev);
+	return ret;
+}
+
+/* AppleT8152DPTXPort::performImpedanceCalibration */
+static void hdmi_impedance_calibration(struct dcpib *dcp, struct dcpib_hdmi *hdmi)
+{
+	u32 val;
+
+	if (readl_poll_timeout(hdmi->core + 0x1c04, val, val & 1, 10, 1000000))
+		dev_warn(dcp->dev, "HDMI: impedance calibration timed out\n");
+	hdmi_set_bits(hdmi, 0x1c00, 4, 0x3f0, 0x3f);
+	val = readl(hdmi->core + 0x1c24);
+	hdmi_set_bits(hdmi, 0x1c18, 15, 0x3f8000, (val >> 6) & 0x7f);
+	hdmi_set_bits(hdmi, 0x1c18, 14, 0x4000, 1);
+}
+
+/*
+ * AppleDPTXPort::handleActivate for T8152 (aura dptx_t8152_activate): power,
+ * source select, PLL, AUX and phy power, the ADT tunables, the PLL and phy
+ * activation, four lanes and the impedance calibration. Once up, the link is
+ * kept on deactivate, as for the bootloader's HDMI.
+ */
+static int hdmi_port_activate(struct dcpib *dcp)
+{
+	struct dcpib_hdmi *hdmi = dcp->phy_priv;
+	int ret;
+
+	if (hdmi->active)
+		return 0;
+	ret = hdmi_power_up(dcp, hdmi);
+	if (ret)
+		return ret;
+	/* AppleT8112DPTXPort::setDPTXSourceSelect: only the low nibble */
+	hdmi_apb_update(hdmi, HDMI_SOURCE_SELECT, 0xf, dcp->dp_source);
+	/* pllSetPowerEnabled, auxSetPowerEnabled, phySetPowerEnabled */
+	hdmi_apb_update(hdmi, 0x48, 0x010, 0x010);
+	usleep_range(1000, 2000);
+	hdmi_apb_update(hdmi, 0x48, 0x020, 0x020);
+	hdmi_apb_update(hdmi, 0x48, 0x040, 0);
+	hdmi_apb_update(hdmi, 0x48, 0x100, 0x100);
+	usleep_range(1000, 2000);
+	hdmi_apb_update(hdmi, 0x48, 0x200, 0x200);
+	hdmi_apb_update(hdmi, 0x48, 0x400, 0);
+	hdmi_apb_update(hdmi, 0x48, 0x001, 0x001);
+	usleep_range(1000, 2000);
+	hdmi_apb_update(hdmi, 0x48, 0x002, 0x002);
+	hdmi_apb_update(hdmi, 0x48, 0x004, 0);
+
+	for (int i = 0; i + 3 <= hdmi->tunable_len; i += 3) {
+		void __iomem *reg = hdmi->core + be32_to_cpu(hdmi->tunable[i]);
+
+		writel((readl(reg) & ~be32_to_cpu(hdmi->tunable[i + 1])) |
+		       be32_to_cpu(hdmi->tunable[i + 2]), reg);
+	}
+
+	hdmi_set_bits(hdmi, 0x08d0, 4, 0x10, 1);	/* single-ended PLL clock */
+	hdmi_set_bits(hdmi, 0x0000, 1, 0x02, 1);	/* activatePll */
+	hdmi_set_bits(hdmi, 0x1400, 0, 0x01, 0);	/* auxSetupCmnControl */
+	hdmi_set_bits(hdmi, 0x1c00, 4, 0x3f0, 0x3c);	/* activatePhy */
+	hdmi_set_bits(hdmi, 0x0000, 0, 0x01, 1);
+	usleep_range(1000, 2000);
+	hdmi_set_lanes(hdmi, HDMI_LANES);
+	hdmi_impedance_calibration(dcp, hdmi);
+	hdmi->active = true;
+	dev_info(dcp->dev, "HDMI: phy up from cold, source %u\n", dcp->dp_source);
+	return 0;
+}
+
+static const struct dcpib_phy_ops hdmi_port_ops = {
+	.activate = hdmi_port_activate,
+	.deactivate = hdmi_deactivate,
+	.set_link_rate = hdmi_set_link_rate,
+	.set_lane_count = hdmi_set_lane_count,
+	.set_drive = hdmi_set_drive,
+	.set_route = hdmi_set_route,
+	.read_edid = hdmi_read_edid,
+	.max_link_rate = DCPIB_LINK_RATE_HBR3,
+};
+
+/* Registers shared with the other DCPs that may take the HDMI port. */
+static void __iomem *hdmi_ioremap(struct dcpib *dcp, struct device_node *np,
+				  const char *name)
+{
+	int index = of_property_match_string(np, "reg-names", name);
+	struct resource res;
+
+	if (index < 0 || of_address_to_resource(np, index, &res))
+		return NULL;
+	return devm_ioremap(dcp->dev, res.start, resource_size(&res));
+}
+
+static void hdmi_put_smc(void *data)
+{
+	of_node_put(data);
+}
+
+static void hdmi_port_put(void *data)
+{
+	guard(mutex)(&hdmi_port_lock);
+	if (!--hdmi_port_users) {
+		gpiod_put(hdmi_port_hpd);
+		hdmi_port_hpd = NULL;
+	}
+}
+
+static struct gpio_desc *hdmi_port_get(struct dcpib *dcp, struct device_node *np)
+{
+	struct gpio_desc *hpd;
+	int ret;
+
+	scoped_guard(mutex, &hdmi_port_lock) {
+		if (!hdmi_port_users) {
+			hpd = fwnode_gpiod_get_index(of_fwnode_handle(np), "hpd", 0,
+						     GPIOD_ASIS, "hdmi-hpd");
+			if (IS_ERR(hpd))
+				return hpd;
+			hdmi_port_hpd = hpd;
+		}
+		hdmi_port_users++;
+		hpd = hdmi_port_hpd;
+	}
+	ret = devm_add_action_or_reset(dcp->dev, hdmi_port_put, NULL);
+	return ret ? ERR_PTR(ret) : hpd;
+}
+
+/*
+ * The HDMI port of the shared ports, for a DCP whose crossbar endpoint the
+ * phy's source select takes (the main DCP and DCPEXT0, as aura uses it).
+ * Without the cold start description in np, HDMI stays the bootloader's.
+ */
+int dcpib_hdmi_port_init(struct dcpib *dcp, struct device_node *np)
+{
+	struct dcpib_hdmi *hdmi;
+	int ret;
+
+	if (dcp->dp_source > 1 || !of_property_present(np, "apple,pcon-power"))
+		return 0;
+	hdmi = devm_kzalloc(dcp->dev, sizeof(*hdmi), GFP_KERNEL);
+	if (!hdmi)
+		return -ENOMEM;
+	hdmi->core = hdmi_ioremap(dcp, np, "phy-core");
+	hdmi->apb = hdmi_ioremap(dcp, np, "phy-apb");
+	hdmi->ps = hdmi_ioremap(dcp, np, "phy-ps");
+	hdmi->psd = hdmi_ioremap(dcp, np, "phy-psd");
+	hdmi->aux.regs = hdmi_ioremap(dcp, np, "aux");
+	hdmi->aux.ps = hdmi_ioremap(dcp, np, "aux-ps");
+	/* AUX output select 0x10: the lpdptx phy */
+	hdmi->aux.sel = 0x10;
+	if (!hdmi->core || !hdmi->apb || !hdmi->ps || !hdmi->psd)
+		return -ENOMEM;
+	if (!hdmi->aux.ps)
+		hdmi->aux.regs = NULL;
+	hdmi->pcon = of_get_property(np, "apple,pcon-power", &hdmi->pcon_len);
+	hdmi->pcon_len /= sizeof(__be32);
+	hdmi->tunable = of_get_property(np, "apple,tunable-phy",
+					&hdmi->tunable_len);
+	hdmi->tunable_len /= sizeof(__be32);
+	hdmi->smc_np = of_parse_phandle(np, "apple,smc", 0);
+	if (!hdmi->smc_np)
+		return -EINVAL;
+	ret = devm_add_action_or_reset(dcp->dev, hdmi_put_smc, hdmi->smc_np);
+	if (ret)
+		return ret;
+	/* Every DCP that may take the port watches the same line. */
+	hdmi->hpd = hdmi_port_get(dcp, np);
+	if (IS_ERR(hdmi->hpd))
+		return PTR_ERR(hdmi->hpd);
+	dcp->hdmi_port = hdmi;
+	dev_info(dcp->dev, "HDMI: port shared, taken without a USB-C display\n");
+	return 0;
+}
+
+/*
+ * Take the HDMI port when a sink is plugged in and this DCP drives no USB-C
+ * display; give it back once the sink is gone and the plug path has
+ * released the link. Called from the connector's detect with dcp->lock held.
+ */
+void dcpib_hdmi_port_poll(struct dcpib *dcp)
+{
+	struct dcpib_hdmi *hdmi = dcp->hdmi_port;
+	int hpd;
+
+	if (!hdmi)
+		return;
+	hpd = gpiod_get_value_cansleep(hdmi->hpd);
+	if (hpd < 0)
+		return;
+	guard(mutex)(&hdmi_port_lock);
+	if (dcp->on_hdmi) {
+		if (hpd || dcp->hpd)
+			return;
+		dcp->phy = dcp->usbc_phy;
+		dcp->phy_priv = dcp->usbc_phy_priv;
+		dcp->dcp_output = dcp->usbc_output;
+		dcp->hpd_gpio = NULL;
+		dcp->on_hdmi = false;
+		hdmi_port_owner = NULL;
+		dev_info(dcp->dev, "HDMI: port given back\n");
+		return;
+	}
+	if (!hpd || dcp->hpd || hdmi_port_owner || !dcpib_atc_release(dcp))
+		return;
+	hdmi_port_owner = dcp->dev;
+	dcp->usbc_phy = dcp->phy;
+	dcp->usbc_phy_priv = dcp->phy_priv;
+	dcp->usbc_output = dcp->dcp_output;
+	dcp->phy = &hdmi_port_ops;
+	dcp->phy_priv = hdmi;
+	/* display-crossbar0 DFP endpoint lpdptx */
+	dcp->dcp_output = 4;
+	dcp->hpd_gpio = hdmi->hpd;
+	dcp->on_hdmi = true;
+	dev_info(dcp->dev, "HDMI: sink plugged, taking the HDMI port\n");
+}
 
 /* The DCP node that describes the HDMI phy (DCPEXT0's). */
 struct device_node *dcpib_hdmi_node(void)

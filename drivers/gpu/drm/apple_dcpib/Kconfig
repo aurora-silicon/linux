@@ -5,6 +5,7 @@ config DRM_APPLE_DCPIB
 	depends on ARCH_APPLE || COMPILE_TEST
 	depends on APPLE_RTKIT
 	depends on SPMI
+	depends on MFD_MACSMC
 	select APERTURE_HELPERS
 	select DRM_CLIENT_SELECTION
 	select DRM_GEM_DMA_HELPER
@@ -14,6 +15,8 @@ config DRM_APPLE_DCPIB
 	  the firmware's small iBoot interface. It takes over the displays
 	  the bootloader brought up, with the DCP's firmware session still
 	  running: a USB-C display on one of the rear ports and the HDMI port.
+	  An HDMI port the bootloader left off is started by the driver, with
+	  the DisplayPort-to-HDMI converter powered through the SMC.
 
 	  To compile this driver as a module, choose M here: the module will
 	  be called apple_dcpib.

@@ -246,6 +246,16 @@ struct dcpib {
 	struct spmi_device *pd;
 	/* HDMI phy: DCPEXT0, or the main DCP on the bootloader's HDMI-only route */
 	bool hdmi;
+	/*
+	 * The HDMI port of the shared ports when the bootloader brought HDMI
+	 * up on no DCP: taken while this DCP drives no USB-C display, with the
+	 * USB-C phy kept to switch back.
+	 */
+	struct dcpib_hdmi *hdmi_port;
+	bool on_hdmi;
+	const struct dcpib_phy_ops *usbc_phy;
+	void *usbc_phy_priv;
+	u32 usbc_output;
 	u32 die;
 
 	/* iBoot state below, under lock */
@@ -333,9 +343,12 @@ int dcpib_aux_read_edid(struct dcpib *dcp, struct dcpib_aux *aux, u8 *buf,
 
 /* atc.c, hdmi.c */
 int dcpib_atc_init(struct dcpib *dcp);
+bool dcpib_atc_release(struct dcpib *dcp);
 struct device_node *dcpib_hdmi_node(void);
 int dcpib_hdmi_source(struct device_node *np);
 int dcpib_hdmi_init(struct dcpib *dcp, struct device_node *np);
+int dcpib_hdmi_port_init(struct dcpib *dcp, struct device_node *np);
+void dcpib_hdmi_port_poll(struct dcpib *dcp);
 
 /* pd.c */
 struct spmi_device *dcpib_pd_get(struct dcpib *dcp, struct device_node *np);

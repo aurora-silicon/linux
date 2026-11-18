@@ -312,6 +312,7 @@ dcpib_connector_detect(struct drm_connector *connector, bool force)
 	int hpd;
 
 	mutex_lock(&dcp->lock);
+	dcpib_hdmi_port_poll(dcp);
 	if (dcp->hpd_gpio)
 		hpd = gpiod_get_value_cansleep(dcp->hpd_gpio);
 	else if (dcp->phy->detect)
@@ -369,7 +370,8 @@ dcpib_connector_detect(struct drm_connector *connector, bool force)
 			dcp->nr_tmodes = 0;
 			dcp->nr_cmodes = 0;
 			/* A sleeping EIZO may need a fresh DP alt mode entry. */
-			if (dcp->pd && time_after(jiffies, dcp->pd_reset_time + 60 * HZ)) {
+			if (dcp->pd && !dcp->on_hdmi &&
+			    time_after(jiffies, dcp->pd_reset_time + 60 * HZ)) {
 				dcp->pd_reset_time = jiffies;
 				schedule_work(&dcp->pd_reset_work);
 			}
@@ -673,7 +675,8 @@ static int dcpib_set_mode_locked(struct dcpib *dcp,
 		 * entry; the plug that follows sets the mode again. At most
 		 * once a minute, so a dead sink does not loop.
 		 */
-		if (dcp->pd && time_after(jiffies, dcp->pd_reset_time + 60 * HZ)) {
+		if (dcp->pd && !dcp->on_hdmi &&
+		    time_after(jiffies, dcp->pd_reset_time + 60 * HZ)) {
 			dcp->cur_mode = *t;
 			dcp->mode_failed = true;
 			dcp->pd_reset_time = jiffies;

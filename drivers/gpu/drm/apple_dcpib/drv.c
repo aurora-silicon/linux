@@ -532,6 +532,12 @@ static int dcpib_probe_inner(struct platform_device *pdev)
 	ret = dcp->hdmi ? dcpib_hdmi_init(dcp, hdmi_np) : dcpib_atc_init(dcp);
 	if (ret)
 		return dev_err_probe(dev, ret, "no DisplayPort phy\n");
+	/* Nobody has HDMI from the bootloader: it is one of the shared ports. */
+	if (!dcp->hdmi && source < 0 && hdmi_np) {
+		ret = dcpib_hdmi_port_init(dcp, hdmi_np);
+		if (ret)
+			return dev_err_probe(dev, ret, "no shared HDMI port\n");
+	}
 
 	ret = dcpib_boot(dcp);
 	if (ret)
