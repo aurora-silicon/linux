@@ -80,7 +80,11 @@ fn enable_als(
 ) -> Result<()> {
     let set = |tag: u32, val: u32, what: &str| -> Result<()> {
         let status = set_als_property(aop, svc, tag, &val.to_le_bytes())?;
-        dev_dbg!(
+        // Info, not dbg: release kernels compile dev_dbg out (rust pr_dbg is
+        // debug_assertions-gated even with CONFIG_DYNAMIC_DEBUG=y), so these
+        // statuses would be invisible exactly when a sensor fails to arm.
+        // This runs once at probe: three lines per boot, not noise.
+        dev_info!(
             dev.as_ref(),
             "{} = {:#x}: status {:#x}\n",
             what,
