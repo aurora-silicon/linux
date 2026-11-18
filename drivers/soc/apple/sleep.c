@@ -6700,12 +6700,17 @@ static int apple_sleep_prepare(void)
 }
 
 /* Only the SMC's sources woke the SoC. */
+static bool t6050_smc_woke_alone(struct apple_sleep *s);
+
 static bool apple_sleep_smc_woke_alone(struct apple_sleep *s)
 {
 	const struct apple_sleep_wake_name *names = s->soc->wake_names;
 	u32 smc[WAKE_WORDS] = {};
 	bool any = false;
 	int i;
+
+	if (s->soc->regions)
+		return t6050_smc_woke_alone(s);
 
 	/* SMC.CPUWakeupAP and SMC.OutboxNotEmpty, by their names. */
 	for (i = 0; i < s->soc->nwake_names; i++) {
