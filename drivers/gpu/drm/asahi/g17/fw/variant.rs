@@ -87,8 +87,6 @@ pub(crate) struct Variant {
     /// Ray-traversal commands run for one client at a time, with other clients' compute
     /// commands kept out meanwhile ([`crate::g17::traversal`]).
     pub(crate) traversal_exclusion: bool,
-    /// The InitData layouts the M5 graph must build for this firmware; `None` off M5.
-    pub(crate) m5_layouts: Option<M5Layouts>,
     /// Renders may carry ray-query stages. The M5 command set has none: it encodes no render
     /// ray-query state.
     pub(crate) render_ray_query: bool,
@@ -153,7 +151,6 @@ pub(crate) enum Firmware {
 
 /// The A18 Pro firmware (26A428).
 pub(crate) const V26A428: Variant = Variant {
-    m5_layouts: None,
     graph: InitGraph::G17P,
     init_ack: InitAck::Message,
     power_on_done: true,
@@ -184,7 +181,6 @@ pub(crate) const V26A428: Variant = Variant {
 
 /// The M4 Pro firmware (25G83, `mBoot-18000.161.10`).
 pub(crate) const V25G83: Variant = Variant {
-    m5_layouts: None,
     graph: InitGraph::V25G83,
     init_ack: InitAck::Status,
     // Never sent on the M4 Pro: the firmware has retired its opening record when it accepts
@@ -226,7 +222,6 @@ pub(crate) const V25G83: Variant = Variant {
 /// The 26A428 firmware of the M5 GPUs, which runs the M5 protocol (the M5 graph, queues and
 /// command set).
 pub(crate) const V26A428_M5: Variant = Variant {
-    m5_layouts: Some(M5Layouts::V26A428),
     m5_commands: true,
     // Not measured on the M5 firmware.
     traversal_exclusion: false,
@@ -250,17 +245,4 @@ const _: () = {
     assert!(super::queue::PointerBlock::valid_layout(&V26A428.pointers));
     assert!(super::queue::PointerBlock::valid_layout(&V25G83.pointers));
     assert!(super::queue::PointerBlock::valid_layout(&V25F84.pointers));
-};
-
-/// The 27.2 M5 firmware (26B123): the 26A428 M5 protocol with the 26B123 InitData layouts.
-pub(crate) const V26B123_M5: Variant = Variant {
-    m5_layouts: Some(M5Layouts::V26B123),
-    ..V26A428_M5
-};
-
-/// The 27.3 beta 1 M5 firmware (26C5035r): the 26A428 M5 protocol with the 26C5035r InitData
-/// layouts.
-pub(crate) const V26C5035_M5: Variant = Variant {
-    m5_layouts: Some(M5Layouts::V26C5035),
-    ..V26A428_M5
 };
