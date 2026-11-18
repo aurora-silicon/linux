@@ -323,7 +323,7 @@ pub(crate) trait Backend: Send + Sync {
     /// The device accepts command submission (an M5 GPU before its queues take submission
     /// does not).
     fn supports_submission(&self) -> bool { true }
-    /// Whether this backend's scheduler workers run in their queue creator's cluster (M5).
+    /// Whether this backend's scheduler workers run in their queue creator's cluster.
     fn creator_cluster_scheduling(&self) -> bool { false }
     /// Whether to keep compute input completion waits and wait on the host for other-engine
     /// prefix producers: without the G17D forms an M5 kick may start while its ring
@@ -560,7 +560,12 @@ impl<B: Backend> Scheduler<B> {
             // The run and free work stays in the creating CPU's cluster, as the event work
             // follows the submitter, instead of wherever an unbound worker last ran.
             let queue = workqueue::OwnedQueue::new_ordered_reclaim(name)?;
-            queue.restrict(Cpumask::cluster_of(CpuId::current()))?;
+            let cluster = Cpumask::cluster_of(CpuId::current());
+            // Without a cpu-map in the device tree each CPU is its own cluster: the queue then
+            // stays unrestricted rather than tied to the one CPU that created it.
+            if cluster.weight() > 1 {
+                queue.restrict(cluster)?;
+            }
             Some(queue)
         } else {
             // drm_sched allocates its own ordered reclaim-safe queue.

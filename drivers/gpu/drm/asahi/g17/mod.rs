@@ -1259,15 +1259,12 @@ struct Shared {
     /// step). Publishers without the device mutex set it too.
     governor_activity_ns: AtomicU64,
     /// The queue of all work that signals job fences: the event work, and every scheduler's
-    /// timeout work. Memory reclaim may wait on those fences, so it is reclaim-safe. On M5 it is
-    /// unbound, so the event work runs in the affinity pod (the L2) of the CPU that last
-    /// published work, not on whichever CPU the completion IRQ thread first ran on; on a two-die
-    /// part that keeps completion processing on the submitter's die. Elsewhere it is per-CPU and
-    /// high priority, as `system_highpri_wq`.
+    /// timeout work. Memory reclaim may wait on those fences, so it is reclaim-safe, and high
+    /// priority. The event work runs in the cluster of the CPU that last published work, not
+    /// wherever the completion IRQ thread first ran (see `queue_event_records`). On M5 it is
+    /// unbound, so a worker of that CPU's affinity pod (its L2) runs it; elsewhere it is per-CPU.
     events: Arc<workqueue::OwnedQueue>,
-    /// M5: the event work and the scheduler workers follow the submitting CPU.
-    follows_submitter: bool,
-    /// M5: the CPU of the last publication, `u32::MAX` before the first.
+    /// The CPU of the last publication, `u32::MAX` before the first.
     submitter: AtomicU32,
     #[pin]
     grow: Work<Shared, GROW_WORK>,
@@ -1445,10 +1442,14 @@ impl Shared {
         if !self.submission_enabled {
             return;
         }
-        // Already queued if this fails, which is just as good.
+        // Here when the submitter shares this CPU's cluster: waking a worker elsewhere would only
+        // add a wakeup to every completion. Already queued if this fails, which is just as good.
+        let here = kernel::cpu::CpuId::current();
         let _ = match self.submitter() {
-            Some(cpu) => self.events.enqueue_on::<Arc<Shared>, EVENT_WORK>(cpu, self.clone()),
-            None => self.events.enqueue::<Arc<Shared>, EVENT_WORK>(self.clone()),
+            Some(cpu) if !kernel::cpumask::Cpumask::cluster_of(here).test(cpu) => {
+                self.events.enqueue_on::<Arc<Shared>, EVENT_WORK>(cpu, self.clone())
+            }
+            _ => self.events.enqueue::<Arc<Shared>, EVENT_WORK>(self.clone()),
         };
     }
 
@@ -1457,15 +1458,12 @@ impl Shared {
         self.events.clone()
     }
 
-    /// Whether the event work and the scheduler workers follow the submitting CPU (M5).
-    pub(super) fn follows_submitter(&self) -> bool {
-        self.follows_submitter
-    }
-
-    /// Records the publishing CPU for the event work's placement (M5).
+    /// Records the publishing CPU for the event work's placement.
     fn note_submitter(&self) {
-        if self.follows_submitter {
-            self.submitter.store(kernel::cpu::CpuId::current().as_u32(), Ordering::Relaxed);
+        let cpu = kernel::cpu::CpuId::current().as_u32();
+        // The completion side reads this line; write it only when the submitter moves.
+        if self.submitter.load(Ordering::Relaxed) != cpu {
+            self.submitter.store(cpu, Ordering::Relaxed);
         }
     }
 
@@ -1795,7 +1793,6 @@ impl Gpu {
                 governor_armed: AtomicBool::new(false),
                 governor_activity_ns: AtomicU64::new(0),
                 events,
-                follows_submitter: m5,
                 submitter: AtomicU32::new(u32::MAX),
                 grow <- new_work!("g17::Shared::grow"),
                 reclaim_work <- new_work!("g17::Shared::reclaim_work"),
