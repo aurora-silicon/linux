@@ -913,3 +913,19 @@
 &avd {
 	status = "okay";
 };
+
+/*
+ * The PMU's RTC and its alarm. ADT: the PMU's info-rtc (0x2002),
+ * info-rtc_alarm_offset (0x2008), info-rtc_irq_mask_offset (0x200e),
+ * info-rtc_alarm_ctrl (0x2000) and info-rtc_scrpad (0x2100), the registers of
+ * the T6041 PMU. It raises no interrupt on this SoC: an armed alarm can only
+ * wake the machine from a firmware sleep, not from s2idle.
+ */
+&pmu {
+	pmu_rtc: rtc {
+		compatible = "apple,t6050-pmu-rtc", "apple,t6041-pmu-rtc";
+		nvmem-cells = <&rtc_offset>;
+		nvmem-cell-names = "rtc_offset";
+		wakeup-source;
+	};
+};
