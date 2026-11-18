@@ -444,6 +444,15 @@ static int macsmc_rtc_probe(struct platform_device *pdev)
 	rtc->offset_in_seconds = of_property_read_bool(pdev->dev.of_node,
 						       "apple,rtc-offset-seconds");
 
+	/*
+	 * The class default is NSEC_PER_SEC + 5 ms. ntp sync_hw_clock passes that
+	 * to rtc_tv_nsec_ok, so the write window is only at the second edge; on
+	 * retry the hrtimer re-arms at second + 2 s - offset, which lands in the
+	 * past when offset is about one second and spins at ~500 Hz with no
+	 * userspace adjtimex.
+	 */
+	rtc->rtc_dev->set_offset_nsec = 5 * NSEC_PER_MSEC;
+
 	rtc->rtc_dev->ops = &macsmc_rtc_ops;
 	ret = macsmc_rtc_init_alarm(pdev, rtc);
 	if (ret == -EPROBE_DEFER)
