@@ -6071,6 +6071,22 @@ impl SepData {
         } else {
             KVec::new()
         };
+        // A print enrolled into a Unix account's own key bag is not in the
+        // shared index: the enclave holds it under that user. Delete it
+        // there; without this the request reported success and the print
+        // kept matching.
+        if cmd == bio::IOC_DELETE && self.touchid_started.load(Relaxed) {
+            bio::require_admin()?;
+            let request: bio::Delete =
+                kernel::uaccess::UserSlice::new(kernel::uaccess::UserPtr::from_addr(arg), core::mem::size_of::<bio::Delete>())
+                    .reader()
+                    .read()?;
+            if !self.bio_index.lock().contains_uuid(&request.uuid) {
+                if let Some(identity) = self.enclave_account_identity(&request.uuid) {
+                    return self.delete_account_identity(identity);
+                }
+            }
+        }
         let handled = if cmd == bio::IOC_DELETE_ORPHAN {
             self.bio_delete_orphan(arg)?
         } else {
@@ -6123,6 +6139,80 @@ impl SepData {
             self.bio_wake();
         }
         Ok(handled)
+    }
+
+    fn enclave_account_identity(&self, uuid: &[u8; bio::UUID_LEN]) -> Option<crate::sbio::IdentityV1> {
+        let SbioOutcome::Ok(reply) = self.sbio_call(&crate::sbio::sbio_list_identities()) else {
+            return None;
+        };
+        crate::sbio::IdentityRecords::new(&reply)?.account_identity(uuid)
+    }
+
+    /// Deletes a print from the Unix account's own key bag that holds it.
+    /// Its bag must be unlocked by the password (its catacomb loaded), as for
+    /// an enrolment into it; then 0x57 in that user's domain, and that user's
+    /// catacomb, any other dirty one, the master and the lockout record are
+    /// saved before success is reported.
+    fn delete_account_identity(&self, identity: crate::sbio::IdentityV1) -> Result<bio::Handled> {
+        if !self.xart_writable() {
+            dev_warn_ratelimited!(
+                self.dev,
+                "Touch ID: deleting a fingerprint needs xart_writes=1; with writes off the deletion would not survive a reboot\n"
+            );
+            return Err(EROFS);
+        }
+        let uid = u32::try_from(identity.user_id())
+            .ok()
+            .and_then(|id| id.checked_sub(crate::userbag::USER_BAG_BASE))
+            .ok_or(EINVAL)?;
+        let deleted = loop {
+            self.wait_until_awake()?;
+            let _writer = self.catacomb_writer.lock();
+            if !bio::idle_for_mutation(&self.bio_session.lock()) {
+                return Err(EBUSY);
+            }
+            // A suspend began while this waited for the lock: wait it out.
+            if !self.capture_begin() {
+                continue;
+            }
+            let deleted = self.delete_in_account_domain(&identity, uid);
+            self.capture_end();
+            break deleted;
+        };
+        deleted?;
+        dev_info_ratelimited!(self.dev, "Touch ID: deleted a fingerprint from uid {}'s own key bag\n", uid);
+        bio::ok()
+    }
+
+    /// Called with `catacomb_writer` held.
+    fn delete_in_account_domain(&self, identity: &crate::sbio::IdentityV1, uid: u32) -> Result<()> {
+        let subject = match self.userbag_bio_subject(uid) {
+            Ok(Some(subject)) if subject.user == identity.user_id() => subject,
+            _ => {
+                dev_info_ratelimited!(
+                    self.dev,
+                    "Touch ID: uid {}'s key bag is not unlocked; unlock it with the password to delete a fingerprint from it\n",
+                    uid
+                );
+                return Err(EACCES);
+            }
+        };
+        let _scope = crate::SubjectScope::new(self, subject);
+        let Some(user) = crate::sbio::UserId::new(subject.user) else {
+            return Err(EIO);
+        };
+        if self.sbio_expect_ok(&crate::sbio::sbio_delete_identity(identity)).is_none() {
+            dev_err_ratelimited!(self.dev, "bio: 0x57 in a key bag's domain failed, status above; nothing was removed\n");
+            return Err(EIO);
+        }
+        if !self.save_bag_user_components(user) {
+            dev_err_ratelimited!(
+                self.dev,
+                "bio: removed from the key bag's domain but not saved; the fingerprint returns at the next boot, and deleting it again retries\n"
+            );
+            return Err(EIO);
+        }
+        Ok(())
     }
 
     fn bio_attest(&self, arg: usize) -> Result<bio::Handled> {
@@ -7472,6 +7562,19 @@ impl<'a> IdentityRecords<'a> {
         }
     }
 
+    /// The built-in identity `uuid` when a Unix account's own key bag holds
+    /// it, as the enclave lists it (that account's user id). The shared index
+    /// never holds these, so a deletion takes the user id from here.
+    pub(crate) fn account_identity(&self, uuid: &[u8; IDENTITY_UUID_LEN]) -> Option<IdentityV1> {
+        let mut found = None;
+        self.each_built_in_account(|identity| {
+            if identity.uuid == *uuid && found.is_none() {
+                found = Some(identity);
+            }
+        });
+        found
+    }
+
     pub(crate) fn each_built_in_for(&self, user_id: i32, mut visit: impl FnMut(IdentityV1)) {
         for i in 0..self.count() {
             if let Some((identity, built_in)) = self.record(i) {
@@ -7509,6 +7612,31 @@ mod identity_scope_tests {
             assert!(*identity.uuid() == [1u8; IDENTITY_UUID_LEN]);
         });
         assert_eq!(seen, 1);
+    }
+
+    #[test]
+    fn an_account_identity_keeps_its_own_user() {
+        let account = crate::userbag::USER_BAG_BASE as i32 + 1000;
+        let mut reply = [0u8; 3 * IDENTITY_RECORD_LEN];
+        for (i, (user, selector, byte)) in [
+            (SBIO_PROBE_USER_ID, IR_SELECTOR_BUILTIN, 1u8),
+            (account, IR_SELECTOR_BUILTIN, 2u8),
+            (account, 2, 3u8),
+        ].iter().enumerate() {
+            let at = i * IDENTITY_RECORD_LEN;
+            reply[at..at + 4].copy_from_slice(&user.to_le_bytes());
+            reply[at + 4..at + IDENTITY_V1_LEN].fill(*byte);
+            reply[at + IR_SELECTOR..at + IR_SELECTOR + 4]
+                .copy_from_slice(&selector.to_le_bytes());
+        }
+        let records = IdentityRecords::new(&reply).unwrap();
+        let found = records.account_identity(&[2u8; IDENTITY_UUID_LEN]).unwrap();
+        assert_eq!(found.user_id(), account);
+        // The configured user's identity is not an account's, and neither is
+        // one under another selector.
+        assert!(records.account_identity(&[1u8; IDENTITY_UUID_LEN]).is_none());
+        assert!(records.account_identity(&[3u8; IDENTITY_UUID_LEN]).is_none());
+        assert!(records.account_identity(&[9u8; IDENTITY_UUID_LEN]).is_none());
     }
 
     #[test]
@@ -7589,6 +7717,11 @@ impl IdentityV1 {
 
     pub(crate) fn uuid(&self) -> &[u8; IDENTITY_UUID_LEN] {
         &self.uuid
+    }
+
+    /// The enclave user the identity belongs to.
+    pub(crate) fn user_id(&self) -> i32 {
+        self.user_id
     }
 
     pub(crate) fn wire(&self) -> [u8; IDENTITY_V1_LEN] {
