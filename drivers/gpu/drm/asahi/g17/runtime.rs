@@ -2062,6 +2062,7 @@ impl Backend {
         if !port.note_submission() {
             return None;
         }
+        self.shared.note_submitter();
         self.shared.note_gpu_activity();
         match packet.completion.work_state().ok()?.acquire(crate::g17::job::Engine::Compute) {
             Ok(_) => {}
