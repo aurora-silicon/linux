@@ -46,7 +46,8 @@ static int dcp_peer_video_call_stream(struct apple_dcp *dcp, bool independent,
 	wait = kzalloc(sizeof(*wait), GFP_KERNEL);
 	if (!wait)
 		return -ENOMEM;
-	memcpy(method.tag, tag, sizeof(method.tag));
+	/* The calls name 27.0 IDs: this engine's build may number them differently. */
+	iomfb_v27_tag(dcp->v27_methods, tag, method.tag);
 	wait->size = out_size;
 	init_completion(&wait->done);
 	kref_init(&wait->refs);
