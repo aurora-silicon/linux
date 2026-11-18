@@ -2369,6 +2369,26 @@ static int apple_dpin_index_for_port(struct apple_nhi *anhi, struct tb_port *in)
 	return -1;
 }
 
+
+/* DP IN adapter index on the host router -> port number (inverse of apple_dpin_index_for_port). */
+static int apple_dpin_port_for_index(struct apple_nhi *anhi, unsigned int idx)
+{
+	unsigned int cur = 0;
+	struct tb_port *port;
+
+	if (!anhi || !anhi->tb || !anhi->tb->root_switch)
+		return -EINVAL;
+
+	tb_switch_for_each_port(anhi->tb->root_switch, port) {
+		if (!tb_port_is_dpin(port))
+			continue;
+		if (cur == idx)
+			return port->port;
+		cur++;
+	}
+	return -ENOENT;
+}
+
 /* A DP IN adapter index with a block of its own on this router */
 static bool apple_dpin_valid(const struct apple_cio *acio, int idx)
 {
@@ -2484,13 +2504,26 @@ int apple_dp_tunnel_rebuild(void *data)
 {
 	struct apple_dpin_binding *binding = data;
 	struct apple_dpin_ctx *c = binding->ctx;
+	struct apple_cio *acio = c->acio;
+	struct platform_device *pdev;
+	struct apple_nhi *anhi;
+	int in_port;
 
 	guard(mutex)(&c->lock);
 	if (!apple_dpin_token_access(&c->tokens, binding->generation))
 		return -ESTALE;
-	if (!c->diag_anhi)
+	if (!c->state.alive || c->binding != binding)
 		return -ENOTCONN;
-	return tb_dp_host_rebuild(c->diag_anhi->tb, c->diag_port, binding->generation);
+	pdev = READ_ONCE(acio->nhi_pdev);
+	if (!pdev)
+		return -ENODEV;
+	anhi = platform_get_drvdata(pdev);
+	if (!anhi || !anhi->tb)
+		return -ENODEV;
+	in_port = apple_dpin_port_for_index(anhi, c->idx);
+	if (in_port < 0)
+		return -ENOTCONN;
+	return tb_dp_host_rebuild(anhi->tb, in_port, binding->generation);
 }
 EXPORT_SYMBOL_GPL(apple_dp_tunnel_rebuild);
 
