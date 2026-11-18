@@ -294,14 +294,41 @@ static const struct dcpib_phy_ops hdmi_ops = {
 };
 
 /*
- * The phy's PMGR and PSD power, then the PS190's through the SMC (aura
- * dcp_init and dcp_hdmi_dptx_init).
+ * The PS190's power through the SMC (aura dcp_hdmi_dptx_init). The PS190
+ * drives the HDMI HPD line only while it is powered.
  */
+static int hdmi_pcon_power(struct dcpib *dcp, struct dcpib_hdmi *hdmi)
+{
+	struct platform_device *smc_pdev = of_find_device_by_node(hdmi->smc_np);
+	struct apple_smc *smc = smc_pdev ? platform_get_drvdata(smc_pdev) : NULL;
+	int ret = 0;
+
+	if (!smc) {
+		ret = -EPROBE_DEFER;
+		goto out;
+	}
+	for (int i = 0; i + 3 <= hdmi->pcon_len; i += 3) {
+		u64 value = (u64)be32_to_cpu(hdmi->pcon[i + 1]) << 32 |
+			    be32_to_cpu(hdmi->pcon[i + 2]);
+
+		ret = apple_smc_write(smc, be32_to_cpu(hdmi->pcon[i]), &value,
+				      sizeof(value));
+		if (ret) {
+			dev_err(dcp->dev, "HDMI: PS190 power failed: %d\n", ret);
+			goto out;
+		}
+	}
+	msleep(25);
+out:
+	if (smc_pdev)
+		put_device(&smc_pdev->dev);
+	return ret;
+}
+
+/* The phy's PMGR and PSD power, then the PS190's (aura dcp_init). */
 static int hdmi_power_up(struct dcpib *dcp, struct dcpib_hdmi *hdmi)
 {
-	struct platform_device *smc_pdev;
-	struct apple_smc *smc;
-	int ret = 0;
+	int ret;
 	u32 val;
 
 	if ((readl(hdmi->ps) & HDMI_PS_ACTUAL) != HDMI_PS_ACTUAL) {
@@ -324,30 +351,7 @@ static int hdmi_power_up(struct dcpib *dcp, struct dcpib_hdmi *hdmi)
 			return ret;
 		}
 	}
-
-	smc_pdev = of_find_device_by_node(hdmi->smc_np);
-	smc = smc_pdev ? platform_get_drvdata(smc_pdev) : NULL;
-	if (!smc) {
-		dev_err(dcp->dev, "HDMI: no SMC to power the PS190\n");
-		ret = -ENODEV;
-		goto out;
-	}
-	for (int i = 0; i + 3 <= hdmi->pcon_len; i += 3) {
-		u64 value = (u64)be32_to_cpu(hdmi->pcon[i + 1]) << 32 |
-			    be32_to_cpu(hdmi->pcon[i + 2]);
-
-		ret = apple_smc_write(smc, be32_to_cpu(hdmi->pcon[i]), &value,
-				      sizeof(value));
-		if (ret) {
-			dev_err(dcp->dev, "HDMI: PS190 power failed: %d\n", ret);
-			goto out;
-		}
-	}
-	msleep(25);
-out:
-	if (smc_pdev)
-		put_device(&smc_pdev->dev);
-	return ret;
+	return hdmi_pcon_power(dcp, hdmi);
 }
 
 /* AppleT8152DPTXPort::performImpedanceCalibration */
@@ -508,6 +512,10 @@ int dcpib_hdmi_port_init(struct dcpib *dcp, struct device_node *np)
 	if (!hdmi->smc_np)
 		return -EINVAL;
 	ret = devm_add_action_or_reset(dcp->dev, hdmi_put_smc, hdmi->smc_np);
+	if (ret)
+		return ret;
+	/* Without the bootloader's HDMI nothing else powers the PS190. */
+	ret = hdmi_pcon_power(dcp, hdmi);
 	if (ret)
 		return ret;
 	/* Every DCP that may take the port watches the same line. */
