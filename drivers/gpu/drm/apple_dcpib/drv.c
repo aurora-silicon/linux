@@ -62,8 +62,12 @@ static void dcpib_rtk_crashed(void *cookie, const void *crashlog, size_t size)
 	dev_err(dcp->dev, "DCP firmware crashed\n");
 }
 
+/* RTKit's oslog system endpoint. */
+#define DCPIB_RTKIT_EP_OSLOG	8
+
 /* Buffers the firmware pre-allocated in its own DART mappings, or new ones. */
-static int dcpib_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
+static int dcpib_rtk_shmem_setup(void *cookie, u8 endpoint,
+				 struct apple_rtkit_shmem *bfr)
 {
 	struct dcpib *dcp = cookie;
 
@@ -74,6 +78,17 @@ static int dcpib_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 		if (!domain)
 			return -ENOMEM;
 		phys = iommu_iova_to_phys(domain, bfr->iova);
+		/*
+		 * A woken DCPEXT offers the oslog ring in its own firmware
+		 * segment, at an address only the firmware's retained DART
+		 * tables map. Linux never reads that ring and only acknowledges
+		 * its write counters: take it as the firmware's, without a CPU
+		 * mapping. The request needs no reply; aura sends none either.
+		 */
+		if (!phys && endpoint == DCPIB_RTKIT_EP_OSLOG) {
+			bfr->is_mapped = true;
+			return 0;
+		}
 		if (!phys) {
 			dev_warn(dcp->dev, "no mapping for firmware buffer %pad\n",
 				 &bfr->iova);
@@ -96,10 +111,12 @@ static void dcpib_rtk_shmem_destroy(void *cookie, struct apple_rtkit_shmem *bfr)
 {
 	struct dcpib *dcp = cookie;
 
-	if (bfr->is_mapped)
-		memunmap(bfr->buffer);
-	else
+	if (bfr->is_mapped) {
+		if (bfr->buffer)
+			memunmap(bfr->buffer);
+	} else {
 		dma_free_coherent(dcp->dev, bfr->size, bfr->buffer, bfr->iova);
+	}
 }
 
 static bool dcpib_rtk_syslog_debug(void *cookie, const char *context,
@@ -114,7 +131,7 @@ static bool dcpib_rtk_syslog_debug(void *cookie, const char *context,
 static const struct apple_rtkit_ops dcpib_rtkit_ops = {
 	.crashed = dcpib_rtk_crashed,
 	.recv_message = dcpib_rtk_recv,
-	.shmem_setup = dcpib_rtk_shmem_setup,
+	.shmem_setup_ep = dcpib_rtk_shmem_setup,
 	.shmem_destroy = dcpib_rtk_shmem_destroy,
 	.syslog_is_debug = dcpib_rtk_syslog_debug,
 };
