@@ -188,6 +188,67 @@ static int apple_pmgr_ps_clear_latch(struct apple_pmgr_ps *ps, u32 reg, u32 *cur
 					       APPLE_PMGR_PS_SET_TIMEOUT);
 }
 
+/*
+ * Verify an ACTIVE bring-up write by readback and rewrite when the write
+ * was swallowed: a write issued while a core power-gates in idle keeps
+ * target 0 with only the sticky WAS_PWRGATED bit, and the domain fails to
+ * come up (M5 Max deep-idle race). Bounded at 5 attempts. Any domain can
+ * lose this race, so this lives at the write site, independent of which
+ * CPU is awake. Returns the poll result; 0 on success.
+ */
+static int apple_pmgr_ps_verify_bringup(struct apple_pmgr_ps *ps,
+					const struct generic_pm_domain *genpd,
+					u32 reg, u32 pstate, u32 *cur,
+					u32 timeout)
+{
+	int try;
+	int ret;
+	u32 rb = 0;
+
+	for (try = 0;; try++) {
+		ret = regmap_read_poll_timeout_atomic(
+			ps->regmap, ps->offset, *cur,
+			FIELD_GET(APPLE_PMGR_PS_ACTUAL, *cur) == pstate &&
+			(!ps->wait_parent || pstate != APPLE_PMGR_PS_ACTIVE ||
+			 !(*cur & APPLE_PMGR_BUSY)), 1, timeout);
+		if (ret == 0)
+			return 0;
+
+		/*
+		 * A bring-up write issued while a core power-gates can be
+		 * swallowed: the register keeps target=0 and only the sticky
+		 * WAS_PWRGATED bit. Verify by readback; if the target never
+		 * took, rewrite after a short delay, bounded. Any domain can
+		 * lose this race, not just the input chain's nub_gpio.
+		 */
+		if (pstate != APPLE_PMGR_PS_ACTIVE || try >= 4)
+			break;
+		if (regmap_read(ps->regmap, ps->offset, &rb) ||
+		    FIELD_GET(APPLE_PMGR_PS_TARGET, rb) == pstate)
+			break;	/* target took: not a swallowed write */
+		dev_warn_ratelimited(ps->dev,
+				     "PS %s: bring-up write swallowed (readback 0x%x), retry %d\n",
+				     genpd->name, rb, try + 1);
+		udelay(1000);
+		/* rewrite: the swallowed write must actually land this time */
+		if (regmap_write(ps->regmap, ps->offset, reg))
+			break;
+		*cur = reg;
+	}
+
+	if (ret < 0) {
+		u32 rb2 = *cur;
+
+		if (!regmap_read(ps->regmap, ps->offset, &rb2) &&
+		    FIELD_GET(APPLE_PMGR_PS_TARGET, rb2) !=
+		    FIELD_PREP(APPLE_PMGR_PS_TARGET, pstate))
+			dev_err(ps->dev,
+				"PS %s: bring-up target never landed after %d attempts (write swallowed; last readback 0x%x)\n",
+				genpd->name, try + 1, rb2);
+	}
+	return ret;
+}
+
 static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool auto_enable)
 {
 	int ret;
@@ -280,52 +341,8 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 			FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) >= APPLE_PMGR_PS_CLKGATE, 1,
 			timeout);
 	} else {
-		int try;
-
-		for (try = 0;; try++) {
-			u32 rb;
-
-			ret = regmap_read_poll_timeout_atomic(
-				ps->regmap, ps->offset, cur,
-				FIELD_GET(APPLE_PMGR_PS_ACTUAL, cur) == pstate &&
-				(!ps->wait_parent || pstate != APPLE_PMGR_PS_ACTIVE ||
-				 !(cur & APPLE_PMGR_BUSY)), 1,
-				timeout);
-			if (ret == 0)
-				break;
-
-			/*
-			 * A bring-up write issued while a core power-gates can be
-			 * swallowed: the register keeps target=0 and only the sticky
-			 * WAS_PWRGATED bit. Verify by readback; if the target never
-			 * took, rewrite after a short delay, bounded. Any domain can
-			 * lose this race, not just the input chain's nub_gpio.
-			 */
-			if (pstate != APPLE_PMGR_PS_ACTIVE || try >= 4)
-				break;
-			if (regmap_read(ps->regmap, ps->offset, &rb) ||
-			    FIELD_GET(APPLE_PMGR_PS_TARGET, rb) == pstate)
-				break;	/* target took: not a swallowed write */
-			dev_warn_ratelimited(ps->dev,
-					     "PS %s: bring-up write swallowed (readback 0x%x), retry %d\n",
-					     genpd->name, rb, try + 1);
-			udelay(1000);
-			/* rewrite: the swallowed write must actually land this time */
-			if (regmap_write(ps->regmap, ps->offset, reg))
-				break;
-			cur = reg;
-		}
-
-		if (ret < 0) {
-			u32 rb = cur;
-
-			if (!regmap_read(ps->regmap, ps->offset, &rb) &&
-			    FIELD_GET(APPLE_PMGR_PS_TARGET, rb) !=
-			    FIELD_PREP(APPLE_PMGR_PS_TARGET, pstate))
-				dev_err(ps->dev,
-					"PS %s: bring-up target never landed after %d attempts (write swallowed; last readback 0x%x)\n",
-					genpd->name, try + 1, rb);
-		}
+		ret = apple_pmgr_ps_verify_bringup(ps, genpd, reg, pstate,
+						   &cur, timeout);
 	}
 	if (ps->strict_state) {
 		dev_info(ps->dev, "GFX target=%#x written=%#x actual=%#x error=%d\n",
