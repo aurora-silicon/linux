@@ -51,6 +51,7 @@ early_param("idle", setup_idle);
  */
 static bool apple_wfi_loses_regs __ro_after_init;
 static bool apple_keep_idle_nop __initdata;
+static bool apple_wfi_deferred __initdata;
 
 /*
  * The boot loader appends idle=nop after the user's arguments, so it cannot
@@ -82,10 +83,33 @@ void __init apple_wfi_quirk_init(void)
 	    (model == MIDR_APPLE_T8142_E || model == MIDR_APPLE_T8142_P ||
 	     model == MIDR_APPLE_T6050_064 || model == MIDR_APPLE_T6050_065 ||
 	     model == MIDR_APPLE_T6050_068 || model == MIDR_APPLE_T6050_069)) {
-		idle = ARM64_IDLE_WFI;
-		pr_info("Apple: idling in WFI, ignoring idle=nop\n");
+		/*
+		 * WFI naps during early boot gate unclaimed root domains on
+		 * the T6050 (nub_gpio was already off at the 76 ms probe and
+		 * stayed write-refused, trial 2026-11-17 20:57). Keep the
+		 * spinning idle for bring-up and enable WFI only after all
+		 * drivers have probed.
+		 */
+		apple_wfi_deferred = true;
+		pr_info("Apple: WFI idling deferred until always-on domains assert\n");
 	}
 }
+
+/*
+ * Called after all initcalls: pmgr, pinctrl and the input chain have
+ * claimed their domains, so a WFI nap can no longer gate them out from
+ * under a driver mid-probe. cpu_do_idle() reads `idle` per entry, so the
+ * flip takes effect without restart.
+ */
+static int __init apple_wfi_defer_enable(void)
+{
+	if (!apple_wfi_deferred)
+		return 0;
+	idle = ARM64_IDLE_WFI;
+	pr_info("Apple: idling in WFI, ignoring idle=nop (after probe)\n");
+	return 0;
+}
+late_initcall_sync(apple_wfi_defer_enable);
 
 static __always_inline bool apple_wfi_needs_save(void)
 {
