@@ -938,6 +938,10 @@ static int ane_h16_map(void *ctx)
 	unsigned int count = 0, i;
 	int ret;
 
+	/* Unmanaged domains can otherwise attach retained, firmware-owned roots. */
+	ret = ane_h16_dart_protection(b, true);
+	if (ret)
+		return ret;
 	if (of_count_phandle_with_args(h->dev->of_node, "iommus", "#iommu-cells") != 3) {
 		dev_err(h->dev, "H16 map requires only SID 0 on three DARTs; refusing extra streams\n");
 		return -EOPNOTSUPP;
@@ -1527,6 +1531,8 @@ static void ane_h16_release(struct ane_h16_device *h)
 		dev_pm_domain_detach(pd, true);
 	}
 	h->acquired = false;
+	vfree(h->pristine_data);
+	h->pristine_data = NULL;
 	dev_info(h->dev, "H16 pre-RUN rollback complete; no CPU release\n");
 }
 
