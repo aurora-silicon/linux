@@ -85,13 +85,15 @@ properties:
           Address filter (DAPF) registers, which restrict the physical
           addresses the DART lets its masters reach, or the slice of the
           fabric filter (GAPF) that protects the power state of the
-          coprocessor CPU behind this DART, cleared to power that CPU down
+          coprocessor CPU behind this DART, cleared to power that CPU down,
+          or the shared PS write-disable register that holds this DART's
+          bit for the same purpose (T8142)
 
   reg-names:
     minItems: 1
     items:
       - const: dart
-      - enum: [dapf, gapf, auxiliary]
+      - enum: [dapf, gapf, ps-wr-dis, auxiliary]
 
   interrupts:
     maxItems: 1
@@ -233,6 +235,14 @@ properties:
       sleep stops a display coprocessor's DART only where both properties are
       present and the word reads one of the two; otherwise it refuses the
       sleep. Set by the boot loader.
+
+  apple,ps-wr-dis-bit:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 31
+    description: >
+      This DART's bit in the ps-wr-dis register: set, the fabric rejects
+      writes to the power state of the coprocessor CPU behind it. Required
+      with a ps-wr-dis register; only that bit of the register is changed.
 
   apple,manual-availability:
     type: boolean

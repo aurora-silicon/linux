@@ -8,11 +8,13 @@ struct apple_atcphy {
 	struct {
 		bool prepared;
 	} cio_sleep;
-    struct { void *usb3_dp; } tunables;
+	struct {
+		void *usb3_dp, *dp_lioa, *dp_common_config;
+	} tunables;
 
 	const struct atcphy_hw *hw;
 	struct {
-		unsigned char *core, *lpdptx, *pipehandler, *usb2phy;
+		unsigned char *core, *lpdptx, *lioa, *pipehandler, *usb2phy;
 	} regs;
 	struct reset_controller_dev rcdev;
 	void *dev;
@@ -255,11 +257,22 @@ static int __attribute__((unused)) atcphy_configure_pipehandler_usb3_host_t8132(
 { (void)p; assert(false); return -EOPNOTSUPP; }
 
 
-/* USB2 power-on is outside this teardown/recovery control. */
+/* Model the USB2 power-on boundary's running state. */
+static unsigned int usb2_starts;
 static void atcphy_usb2_power_on(struct apple_atcphy *p)
 {
-	(void)p;
+	usb2_starts++;
+	writel(USB2PHY_USBCTL_RUN, p->regs.usb2phy + USB2PHY_USBCTL);
 }
+
+/* This teardown fixture never selects T8142 DP calibration. */
+static void apple_tunable_apply(void *base, void *tunable)
+{
+	(void)base;
+	(void)tunable;
+	assert(!"unexpected banked DP calibration");
+}
+
 static void atcphy_apply_tunables(struct apple_atcphy *p, enum atcphy_mode m)
 {
 	(void)p;
