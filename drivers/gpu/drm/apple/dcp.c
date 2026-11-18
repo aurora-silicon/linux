@@ -270,6 +270,36 @@ static int dcp_secure_port_init(struct apple_dcp *dcp)
 {
 	struct device *dev = dcp->dev;
 
+	/*
+	 * The secure mailbox named outside mboxes, which the boot loader wants to be the one ASC
+	 * mailbox (it refuses the display handoff otherwise). Added to the live node here.
+	 */
+	if (of_property_match_string(dev->of_node, "mbox-names", "secure") < 0 &&
+	    of_property_present(dev->of_node, "apple,secure-mbox")) {
+		static const char names[] = "mbox\0secure";
+		struct property *boxes, *nm;
+		const __be32 *main_box, *sec;
+		__be32 *v;
+		int len;
+
+		main_box = of_get_property(dev->of_node, "mboxes", &len);
+		sec = of_get_property(dev->of_node, "apple,secure-mbox", NULL);
+		boxes = devm_kzalloc(dev, sizeof(*boxes), GFP_KERNEL);
+		nm = devm_kzalloc(dev, sizeof(*nm), GFP_KERNEL);
+		v = devm_kcalloc(dev, 2, sizeof(*v), GFP_KERNEL);
+		if (main_box && len == 4 && sec && boxes && nm && v) {
+			v[0] = main_box[0];
+			v[1] = sec[0];
+			boxes->name = "mboxes";
+			boxes->value = v;
+			boxes->length = 8;
+			nm->name = "mbox-names";
+			nm->value = (void *)names;
+			nm->length = sizeof(names);
+			if (!of_update_property(dev->of_node, boxes))
+				of_update_property(dev->of_node, nm);
+		}
+	}
 	if (of_property_match_string(dev->of_node, "mbox-names", "secure") < 0)
 		return 0;
 
