@@ -2755,11 +2755,20 @@ impl SepData {
         // The gates below are the configured user's. A bag user's own lock
         // and the enclave's per-user count stand in for them.
         let bag_user = subject.is_some();
+        // A match in a bag user's own domain (a verify naming them, or a key
+        // touch under their bag) is proven by the enclave's own list of that
+        // user's identities, read now, after the bag's catacomb loaded.
+        let bag_subject = self.bio_subject.lock().is_some();
+        let bag_listed = if bag_subject {
+            self.enclave_identities_for(self.bio_user()).map(|ids| ids.len())
+        } else {
+            None
+        };
         // A bag user with nothing enrolled cannot match, and the enclave
         // refuses a match against them: answer no match without a capture,
         // as an empty index is answered. fprintd's duplicate check before a
         // first enrolment asks exactly this.
-        if bag_user && self.enclave_identities_for(self.bio_user()).is_some_and(|ids| ids.is_empty()) {
+        if bag_listed == Some(0) {
             self.finish_verify(bio::VerifyOutcome::NoMatch, [0u8; bio::TOKEN_LEN]);
             return;
         }
@@ -2812,10 +2821,21 @@ impl SepData {
             return;
         }
         self.retry_restore_proof();
-        if !self.templates_restored.load(Relaxed) {
+        // The configured user's identity proof: zero identities after a
+        // restore cannot be told from a restore that silently failed. A match
+        // in a bag user's own domain does not use those templates and has its
+        // own proof instead (`bag_identity_proof`): every attach step passed,
+        // and the enclave listed the bag's identities after its catacomb
+        // loaded. A bag listing none answered no match above.
+        let proven = if bag_subject {
+            bag_identity_proof(bag_listed, self.components_restored.load(Relaxed)) == BagProof::Capture
+        } else {
+            self.templates_restored.load(Relaxed)
+        };
+        if !proven {
             dev_err_ratelimited!(
                 self.dev,
-                "verify: refusing before touching the sensor; cold-match prep, restore, or device-view identity proof did not complete. This is not a non-matching finger\n"
+                "verify: refusing before touching the sensor; cold-match prep, restore, or the identity proof (the device view, or a bag's listed identities) did not complete. This is not a non-matching finger\n"
             );
             self.finish_verify(
                 bio::VerifyOutcome::Failed(ENROL_STATUS_ENCLAVE),
@@ -6315,6 +6335,7 @@ impl SepData {
         };
         let identities = self.log_identity_count(c"after Catacomb restore with sensor registered");
         let identity_ready = matches!(identities, Some(n) if n > 0);
+        self.components_restored.store(prepared && match_context && restored, Relaxed);
         let candidate = prepared && match_context && restored && identity_ready;
         self.cold_restore_candidate.store(candidate, Relaxed);
         // COMPLETE_INIT has not synchronized the device view yet. Never make
@@ -7604,6 +7625,29 @@ impl<'a> IdentityRecords<'a> {
     }
 }
 
+/// Whether a match in a bag user's own domain may capture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BagProof {
+    Capture,
+    /// The enclave lists no identity for the bag: nothing can match.
+    NoMatch,
+    /// Not proven: an attach step failed, or the list could not be read.
+    Refuse,
+}
+
+/// The bag-side counterpart of the configured user's identity proof, from
+/// the number of identities the enclave lists for the bag user after its
+/// catacomb loaded (None: the list could not be read) and whether every
+/// attach step passed (`components_restored`).
+pub(crate) fn bag_identity_proof(listed: Option<usize>, components_restored: bool) -> BagProof {
+    match listed {
+        _ if !components_restored => BagProof::Refuse,
+        None => BagProof::Refuse,
+        Some(0) => BagProof::NoMatch,
+        Some(_) => BagProof::Capture,
+    }
+}
+
 #[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
 #[::kernel::macros::kunit_tests(apple_sep_enclave_identity_scope)]
 mod identity_scope_tests {
@@ -7630,6 +7674,21 @@ mod identity_scope_tests {
             assert!(*identity.uuid() == [1u8; IDENTITY_UUID_LEN]);
         });
         assert_eq!(seen, 1);
+    }
+
+    #[test]
+    fn a_bag_match_needs_its_own_listed_identities() {
+        // Every attach step passed and the enclave lists the bag's fingers.
+        assert_eq!(bag_identity_proof(Some(1), true), BagProof::Capture);
+        assert_eq!(bag_identity_proof(Some(5), true), BagProof::Capture);
+        // A bag whose catacomb lists no identity after loading cannot match.
+        assert_eq!(bag_identity_proof(Some(0), true), BagProof::NoMatch);
+        // A list the enclave did not give proves nothing.
+        assert_eq!(bag_identity_proof(None, true), BagProof::Refuse);
+        // Nor does any list when an attach step failed.
+        assert_eq!(bag_identity_proof(Some(1), false), BagProof::Refuse);
+        assert_eq!(bag_identity_proof(Some(0), false), BagProof::Refuse);
+        assert_eq!(bag_identity_proof(None, false), BagProof::Refuse);
     }
 
     #[test]
