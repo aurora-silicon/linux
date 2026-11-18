@@ -2819,7 +2819,15 @@ impl SepData {
             return;
         }
         self.retry_restore_proof();
-        if !self.templates_restored.load(Relaxed) {
+        // The identity proof is the configured user's: zero identities after
+        // a restore cannot be told from a restore that silently failed. A
+        // match in a bag user's own domain does not use those templates; the
+        // bag's catacomb was loaded after its password, and a bag with none
+        // answers no match above. Every attach step must still have passed.
+        let bag_subject = self.bio_subject.lock().is_some();
+        if !self.templates_restored.load(Relaxed)
+            && !(bag_subject && self.components_restored.load(Relaxed))
+        {
             dev_err_ratelimited!(
                 self.dev,
                 "verify: refusing before touching the sensor; cold-match prep, restore, or device-view identity proof did not complete. This is not a non-matching finger\n"
@@ -6297,6 +6305,7 @@ impl SepData {
         };
         let identities = self.log_identity_count(c"after Catacomb restore with sensor registered");
         let identity_ready = matches!(identities, Some(n) if n > 0);
+        self.components_restored.store(prepared && match_context && restored, Relaxed);
         let candidate = prepared && match_context && restored && identity_ready;
         self.cold_restore_candidate.store(candidate, Relaxed);
         // COMPLETE_INIT has not synchronized the device view yet. Never make

@@ -736,6 +736,10 @@ struct SepData {
     templates_restored: Atomic<bool>,
     // Provisional cold restore; COMPLETE_INIT must still prove the device view.
     cold_restore_candidate: Atomic<bool>,
+    /// Every attach step of the cold restore succeeded, whatever the
+    /// configured user's identity count: enough for a match in a bag user's
+    /// own domain, whose catacomb is loaded and checked on its own.
+    components_restored: Atomic<bool>,
 
     sensor_calibrated: Atomic<bool>,
     sensor_key_loaded: Atomic<bool>,
@@ -1252,6 +1256,7 @@ impl SepData {
                 sensor_key_loaded: Atomic::new(false),
                 templates_restored: Atomic::new(false),
                 cold_restore_candidate: Atomic::new(false),
+                components_restored: Atomic::new(false),
                 enrol_material <- new_mutex!(None),
                 match_context <- new_mutex!(None),
                 match_context_generation: Atomic::new(0),
