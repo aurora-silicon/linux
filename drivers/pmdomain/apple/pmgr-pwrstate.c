@@ -240,8 +240,7 @@ static int apple_pmgr_ps_verify_bringup(struct apple_pmgr_ps *ps,
 		u32 rb2 = *cur;
 
 		if (!regmap_read(ps->regmap, ps->offset, &rb2) &&
-		    FIELD_GET(APPLE_PMGR_PS_TARGET, rb2) !=
-		    FIELD_PREP(APPLE_PMGR_PS_TARGET, pstate))
+		    FIELD_GET(APPLE_PMGR_PS_TARGET, rb2) != pstate)
 			dev_err(ps->dev,
 				"PS %s: bring-up target never landed after %d attempts (write swallowed; last readback 0x%x)\n",
 				genpd->name, try + 1, rb2);
