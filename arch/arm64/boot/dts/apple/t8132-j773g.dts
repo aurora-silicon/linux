@@ -184,7 +184,7 @@
 		apple,sdz-group-fail-closed;
 		apple,deferred-shutdown;
 		#sound-dai-cells = <0>;
-		sound-name-prefix = "Speaker";
+		/* No sound-name-prefix: a mono speaker's controls go unprefixed (macaudio). */
 		interrupts-extended = <&pinctrl_ap 14 IRQ_TYPE_LEVEL_LOW>;
 		ti,imon-slot-no = <0>;
 		ti,vmon-slot-no = <2>;
@@ -431,6 +431,35 @@
 };
 
 &avd {
+	status = "okay";
+};
+
+/*
+ * The encoder's power domains. The T8132 PMGR policy (t8132-platform-handoff)
+ * gives a domain the board tree leaves without a status the policy's own
+ * status, which keeps the VENC domains off: say what this board wires.
+ */
+&ps_venc_sys {
+	status = "okay";
+};
+
+&ps_venc_dma {
+	status = "okay";
+};
+
+&ps_venc_pipe4 {
+	status = "okay";
+};
+
+&ps_venc_pipe5 {
+	status = "okay";
+};
+
+&ps_venc_me0 {
+	status = "okay";
+};
+
+&ps_venc_me1 {
 	status = "okay";
 };
 

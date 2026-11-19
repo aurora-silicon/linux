@@ -828,7 +828,7 @@ out:
  * confirmed swap shows it (given-up swaps that may still show it are in
  * ext_lost_swap); pinned: its unmap failed, kept until reboot.
  */
-#define DCP_M4_EXT_WINDOWS	8
+#define DCP_M4_EXT_WINDOWS	12
 struct dcp_m4_ext_window {
 	u64 dva;
 	void *key;
@@ -4359,6 +4359,28 @@ static bool dcp_m4_ext_ids_current(struct iomfb_m4 *dcp, const struct iomfb_m4_e
 }
 
 /*
+ * A copied frame: the direct swaps in flight complete (D590) or are given up
+ * first, 1 s at most (-EBUSY then), the session lock dropped meanwhile.
+ */
+static int dcp_m4_ext_drain_direct(struct iomfb_m4 *dcp, struct dcp_m4_runtime *r)
+{
+	unsigned long end = jiffies + msecs_to_jiffies(DCP_M4_EXT_SLOT_WAIT_MS);
+
+	lockdep_assert_held(&dcp->lock);
+	while (r->ext_qn) {
+		long left = (long)(end - jiffies);
+
+		if (left <= 0 || READ_ONCE(dcp->error))
+			return -EBUSY;
+		mutex_unlock(&dcp->lock);
+		wait_event_timeout(dcp->ext_settle_wq,
+				   !READ_ONCE(r->ext_qn) || READ_ONCE(dcp->error), left);
+		mutex_lock(&dcp->lock);
+	}
+	return 0;
+}
+
+/*
  * DRM: before an enable or disable, which must not be refused: the direct
  * swaps in flight complete (D590) or are given up (5 s, or at once when the
  * link goes). The session lock is dropped while waiting, so those can run;
@@ -4612,9 +4634,23 @@ int iomfb_m4_ext_present(struct apple_dcp *owner, const struct iosys_map *src, u
 	if (r->ext_mode_stale)
 		goto out;
 	ret = -EBUSY;
-	if ((r->ext_hold_id && !r->ext_hold_probe) || r->ext_orphan_start ||
-	    r->ext_qn || r->ext_sleeping)
+	if ((r->ext_hold_id && !r->ext_hold_probe) || r->ext_orphan_start || r->ext_sleeping)
 		goto out;
+	/*
+	 * Direct swaps in flight complete (or are given up) first, 1 s at most,
+	 * rather than the frame being dropped; the DART is checked again after.
+	 */
+	if (r->ext_qn) {
+		ret = dcp_m4_ext_drain_direct(dcp, r);
+		if (!ret)
+			ret = dcp_m4_ext_scanout_gate(dcp);
+		if (ret)
+			goto out;
+		ret = -EBUSY;
+		if ((r->ext_hold_id && !r->ext_hold_probe) || r->ext_orphan_start ||
+		    r->ext_sleeping || READ_ONCE(dcp->error))
+			goto out;
+	}
 	r->ext_hold_probe = false;
 	/*
 	 * Never the surface on screen, nor one a given-up swap may still
