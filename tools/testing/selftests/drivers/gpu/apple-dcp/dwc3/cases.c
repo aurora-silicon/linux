@@ -548,6 +548,21 @@ static void tunnel_role(void)
 	clean(&f);
 	puts("PASS: a role asked for during a router's sleep waits for its end");
 }
+/* A diagnostic left by sleep cannot survive an ordinary cable detach/attach. */
+static void diagnostic_role_lifetime(void)
+{
+    struct fixture f;
+    initial(&f, 1, false, false);
+    f.apple.ss_retry = true;
+    assert(role(&f, USB_ROLE_NONE) == 0 && !f.apple.ss_retry);
+    f.apple.ss_retry = true;
+    unsigned int calls = hub_check_calls;
+    assert(role(&f, USB_ROLE_HOST) == 0 && !f.apple.ss_retry);
+    assert(hub_check_calls == calls + 1);
+    assert(role(&f, USB_ROLE_NONE) == 0);
+    clean(&f);
+    puts("PASS: ordinary cable changes clear the post-sleep diagnostic");
+}
 int main(int argc, char **argv)
 {
 	if (argc == 2 && !strcmp(argv[1], "power")) {
@@ -571,6 +586,7 @@ int main(int argc, char **argv)
 	retained_dp_restart();
 	removal_and_generic();
 	tunnel_role();
+	diagnostic_role_lifetime();
 	puts("PASS: Apple teardown actual-function qualification");
 	return 0;
 }
