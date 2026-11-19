@@ -35,6 +35,14 @@ properties:
     maxItems: 192
     description: Triples of GPIO number and native pcIO low/high word templates.
 
+  apple,write-only-outputs:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 1
+    maxItems: 64
+    description:
+      GPIO numbers from apple,output-templates whose output latch cannot be
+      read back. Reading such a line reports the level last written.
+
 required:
   - compatible
   - gpio-controller
