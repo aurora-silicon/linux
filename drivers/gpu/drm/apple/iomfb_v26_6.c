@@ -1772,7 +1772,9 @@ void iomfb_v26_6_flush(struct apple_dcp *dcp, struct drm_crtc *crtc,
 		p = crtc->primary->state;
 	fb = p && p->visible ? p->fb : NULL;
 	dcp->swap_start = ktime_get();
-	if (!dcp->v26 || !dcp_v26_present(dcp->v26, fb, dcp->notch_height, &presented, cs)) {
+	/* Stopped cold for a sleep, with no restart: its mailbox no longer answers (SError). */
+	if (READ_ONCE(dcp->j613_sleep_down) || !dcp->v26 ||
+	    !dcp_v26_present(dcp->v26, fb, dcp->notch_height, &presented, cs)) {
 		dcp_v26_cancel_event(dcp);
 		return;
 	}

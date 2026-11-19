@@ -12,6 +12,9 @@ static const char *const apple_sleep_test_profiles[] = {
 	"apple,t8142-sleep",
 	"apple,t6050-sleep",
 	"apple,t6050-j716c-sleep",
+#if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP_T8122)
+	"apple,t8122-sleep",
+#endif
 };
 
 static bool apple_sleep_test_has(const struct apple_sleep_words *all, u32 offset)
@@ -364,7 +367,24 @@ static void apple_sleep_test_region_rejects_bad_inventory(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, sleep_region_validate(&p), -EINVAL);
 }
 
+#if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP_T8122)
+static void apple_sleep_test_t8122_unqualified(struct kunit *test)
+{
+	const struct apple_sleep_soc *soc = &t8122_sleep_soc;
+
+	KUNIT_EXPECT_STREQ(test, soc->machine, "apple,j613");
+	KUNIT_EXPECT_TRUE(test, soc->untested);
+	KUNIT_EXPECT_NOT_NULL(test, soc->ops->final_check);
+	KUNIT_EXPECT_NOT_NULL(test, soc->ops->commit_regs);
+	KUNIT_EXPECT_TRUE(test, apple_sleep_wake_admitted(soc, soc->wake_required,
+							 soc->nwake_required));
+}
+#endif
+
 static struct kunit_case apple_sleep_test_cases[] = {
+#if IS_ENABLED(CONFIG_APPLE_SOC_SLEEP_T8122)
+	KUNIT_CASE(apple_sleep_test_t8122_unqualified),
+#endif
 	KUNIT_CASE(apple_sleep_test_layout),
 	KUNIT_CASE(apple_sleep_test_t6050),
 	KUNIT_CASE(apple_sleep_test_j716c_inventory),
