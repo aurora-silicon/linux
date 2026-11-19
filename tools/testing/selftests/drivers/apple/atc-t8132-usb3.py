@@ -403,9 +403,11 @@ int main(void)
     phy_error=-ETIMEDOUT;
     assert(dwc3_apple_init(&a,DWC3_APPLE_HOST)==-ETIMEDOUT);
     assert(!host_calls && !gadget_calls && stops==1 && a.state==DWC3_APPLE_NO_CABLE);
+    /* No SuperSpeed device mode: the gadget starts at high speed instead. */
     phy_error=-EOPNOTSUPP;
-    assert(dwc3_apple_init(&a,DWC3_APPLE_DEVICE)==-EOPNOTSUPP);
-    assert(!gadget_calls && stops==2);
+    assert(!dwc3_apple_init(&a,DWC3_APPLE_DEVICE));
+    assert(gadget_calls==1 && stops==1 && a.state==DWC3_APPLE_DEVICE);
+    a.state=DWC3_APPLE_NO_CABLE;
     phy_error=0;
     assert(!dwc3_apple_init(&a,DWC3_APPLE_HOST));
     assert(host_calls==1 && a.state==DWC3_APPLE_HOST && syscore==1);
@@ -414,7 +416,7 @@ int main(void)
     dev.of_node="apple,t8103-dwc3"; phy_error=-ETIMEDOUT;
     assert(!dwc3_apple_init(&a,DWC3_APPLE_HOST) && host_calls==2 && syscore==2);
     assert(!a.dwc.dis_u3_susphy_quirk);
-    puts("ok 7 - T8132 PHY failures stop before xHCI, older fallback preserved");
+    puts("ok 7 - T8132 PHY failures stop before xHCI, a device role falls back to high speed, older fallback preserved");
     return 0;
 }
 '''
