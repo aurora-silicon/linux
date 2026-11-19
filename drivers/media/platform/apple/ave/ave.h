@@ -441,6 +441,7 @@ struct ave_slot {
 	u32 status;
 	bool busy; /* Process sent, reply pending */
 	bool done; /* reply in, output not delivered yet */
+	bool bframe; /* the delivered picture is a B picture (its slice type) */
 };
 
 struct ave_frame_result {
@@ -468,6 +469,7 @@ struct ave_frame_result {
 struct ave_session {
 	struct ave_session *failed_next;
 	struct ave_params p;
+	u8 hevc_extra_bits; /* PPS num_extra_slice_header_bits, for the B flag */
 	struct ave_buf hdr;
 	struct ave_buf client_mem;
 	/* 6070: per-session firmware-generated VPS/SPS/PPS output. */
@@ -643,6 +645,7 @@ int ave_build_process(struct ave_ctx *ctx, u8 *cmd, size_t len,
 		      unsigned int slot, dma_addr_t input, u32 bitrate,
 		      bool force_key, bool last);
 int ave_init_codec_state(struct ave_session *sess);
+bool ave_au_bframe(const u8 *p, size_t len, bool hevc, bool key, u8 *extra_bits);
 
 /* ave-cmd.c */
 int ave_cmd_config(struct ave_dev *ave);

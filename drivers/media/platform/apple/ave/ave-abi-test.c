@@ -1561,6 +1561,30 @@ static void ave_t8112_26b123_build(struct kunit *test)
 			    &ave_layout_6070_11_1);
 }
 
+/*
+ * HEVC B flag with a PPS whose num_extra_slice_header_bits is 2. The PPS
+ * comes with the IDR access unit; the B slice after it has two extra bits
+ * before slice_type, and reads as an I slice if they are not skipped.
+ */
+static void ave_hevc_bframe_extra_bits(struct kunit *test)
+{
+	static const u8 idr_au[] = {
+		0, 0, 0, 1, 0x44, 0x01, 0xc5, 0x80,	/* PPS: ids 0/0, 2 extra bits */
+		0, 0, 1, 0x26, 0x01, 0xa3, 0x80,	/* IDR_W_RADL slice, I */
+	};
+	static const u8 b_au[] = {
+		0, 0, 0, 1, 0x02, 0x01, 0xdc, 0x80,	/* TRAIL_R slice, extra bits 01, B */
+	};
+	u8 bits = 0;
+
+	KUNIT_EXPECT_FALSE(test, ave_au_bframe(idr_au, sizeof(idr_au), true, true, &bits));
+	KUNIT_EXPECT_EQ(test, bits, 2);
+	KUNIT_EXPECT_TRUE(test, ave_au_bframe(b_au, sizeof(b_au), true, false, &bits));
+	/* Without the PPS's bits the same slice reads as I. */
+	bits = 0;
+	KUNIT_EXPECT_FALSE(test, ave_au_bframe(b_au, sizeof(b_au), true, false, &bits));
+}
+
 static void ave_t6041_text_boot_word(struct kunit *test)
 {
 	const u32 off = ave_t6041.text_boot_word, size = off + 0x100;
@@ -1635,6 +1659,7 @@ static struct kunit_case ave_abi_cases[] = {
 	KUNIT_CASE(ave_m3_probe_only),
 	KUNIT_CASE(ave_26b123_layout),
 	KUNIT_CASE(ave_t8112_26b123_build),
+	KUNIT_CASE(ave_hevc_bframe_extra_bits),
 	{}
 };
 
