@@ -58,15 +58,6 @@ module_param_unsafe(fan_control, bool, 0644);
 MODULE_PARM_DESC(fan_control,
 		 "Allow manual fan speeds on every fan with a mode key, also where the device tree does not (default: the device tree decides)");
 
-static bool macsmc_hwmon_is_m3(void)
-{
-	return of_machine_is_compatible("apple,t6030") ||
-	       of_machine_is_compatible("apple,t6031") ||
-	       of_machine_is_compatible("apple,t6032") ||
-	       of_machine_is_compatible("apple,t6034") ||
-	       of_machine_is_compatible("apple,t8122");
-}
-
 struct macsmc_hwmon_sensor {
 	struct apple_smc_key_info info;
 	smc_key macsmc_key;
@@ -863,22 +854,25 @@ static int macsmc_hwmon_create_sensor(struct device *dev, struct apple_smc *smc,
 	if (ret)
 		return ret;
 
-	if (macsmc_hwmon_is_m3()) {
-		if (!(sensor->info.flags & APPLE_SMC_READABLE))
-			return -EACCES;
+	/*
+	 * macsmc_hwmon_read_key() decodes only these two types, so a key of any
+	 * other type, or one the SMC does not let us read, could only ever
+	 * return an error: do not set up a channel for it.
+	 */
+	if (!(sensor->info.flags & APPLE_SMC_READABLE))
+		return -EACCES;
 
-		switch (sensor->info.type_code) {
-		case __SMC_KEY('f', 'l', 't', ' '):
-			if (sensor->info.size != sizeof(u32))
-				return -EINVAL;
-			break;
-		case __SMC_KEY('i', 'o', 'f', 't'):
-			if (sensor->info.size != sizeof(u64))
-				return -EINVAL;
-			break;
-		default:
-			return -EOPNOTSUPP;
-		}
+	switch (sensor->info.type_code) {
+	case __SMC_KEY('f', 'l', 't', ' '):
+		if (sensor->info.size != sizeof(u32))
+			return -EINVAL;
+		break;
+	case __SMC_KEY('i', 'o', 'f', 't'):
+		if (sensor->info.size != sizeof(u64))
+			return -EINVAL;
+		break;
+	default:
+		return -EOPNOTSUPP;
 	}
 
 	ret = of_property_read_string(sensor_node, "label", &label);
