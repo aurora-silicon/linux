@@ -62,13 +62,58 @@ static int ave_fw_chosen_crc(struct ave_dev *ave, const char *name, u32 *crc)
 	return kstrtou32(str, 16, crc);
 }
 
+/*
+ * A loader that hands over several encoders puts aurora,crc32 on each
+ * reservation: one /chosen DATA CRC cannot name two DATA images. Without
+ * it, the /chosen property is used as before.
+ */
+static int ave_fw_expect_crc(struct ave_dev *ave, unsigned int index,
+			     const char *chosen_name, u32 *crc)
+{
+	struct device_node *np;
+	const char *str;
+	int ret;
+
+	np = of_parse_phandle(ave->dev->of_node, "memory-region", index);
+	if (!np)
+		return -ENOENT;
+	ret = of_property_read_string(np, "aurora,crc32", &str);
+	of_node_put(np);
+	if (!ret)
+		return kstrtou32(str, 16, crc);
+	return ave_fw_chosen_crc(ave, chosen_name, crc);
+}
+
+/*
+ * The iommu-addresses tuple <&dev iova-hi iova-lo size-hi size-lo> for
+ * @phandle. A reservation shared by several encoders has one tuple each;
+ * none, or two for the same device, is an error.
+ */
+static const __be32 *ave_fw_iommu_tuple(const __be32 *prop, int len,
+					u32 phandle)
+{
+	const unsigned int cells = 5;
+	const __be32 *match = NULL;
+
+	if (!prop || len <= 0 || len % (cells * sizeof(u32)))
+		return NULL;
+	for (unsigned int i = 0; i < len / sizeof(u32); i += cells) {
+		if (be32_to_cpup(prop + i) != phandle)
+			continue;
+		if (match)
+			return NULL;
+		match = prop + i;
+	}
+	return match;
+}
+
 static int ave_fw_segment(struct ave_dev *ave, unsigned int index,
 			  struct ave_fw_segment *seg)
 {
 	struct device_node *np;
 	struct resource res;
 	const __be32 *prop;
-	int len, ret;
+	int len = 0, ret;
 
 	np = of_parse_phandle(ave->dev->of_node, "memory-region", index);
 	if (!np)
@@ -83,10 +128,13 @@ static int ave_fw_segment(struct ave_dev *ave, unsigned int index,
 	if (ret)
 		goto out;
 
-	/* iommu-addresses = <&ave iova-hi iova-lo size-hi size-lo> */
+	/*
+	 * iommu-addresses = <&ave iova-hi iova-lo size-hi size-lo>, one tuple
+	 * per encoder that shares the reservation.
+	 */
 	prop = of_get_property(np, "iommu-addresses", &len);
-	if (!prop || len != 5 * sizeof(u32) ||
-	    be32_to_cpup(prop) != ave->dev->of_node->phandle) {
+	prop = ave_fw_iommu_tuple(prop, len, ave->dev->of_node->phandle);
+	if (!prop) {
 		ret = -EINVAL;
 		goto out;
 	}
@@ -292,7 +340,7 @@ int ave_fw_probe(struct ave_dev *ave)
 	ret = ave_fw_crc(&ave->text, &text_crc, NULL);
 	if (ret)
 		return ret;
-	ret = ave_fw_chosen_crc(ave, "aurora,ave-text-crc32", &want);
+	ret = ave_fw_expect_crc(ave, 0, "aurora,ave-text-crc32", &want);
 	if (ret || text_crc != want)
 		return dev_err_probe(dev, -ENODEV,
 				     "firmware text differs from loader CRC\n");
@@ -322,7 +370,7 @@ int ave_fw_probe(struct ave_dev *ave)
 	 * The loader records the DATA checksum before anything runs. If it
 	 * differs, the firmware already ran and there is no clean copy left.
 	 */
-	ret = ave_fw_chosen_crc(ave, "aurora,ave-data-crc32", &want);
+	ret = ave_fw_expect_crc(ave, 1, "aurora,ave-data-crc32", &want);
 	if (ret || data_crc != want) {
 		ret = dev_err_probe(dev, -ENODEV,
 				    "firmware data is not in its boot state\n");

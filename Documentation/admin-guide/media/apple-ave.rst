@@ -33,9 +33,13 @@ The encoder runs firmware on its own coprocessor. The bootloader loads it into
 two reserved, DART-mapped segments (TEXT and DATA) but does not start it. The
 Aurora Stage 2 loader passes both regions in the device's ``memory-region``
 property and records their CRC32 under ``/chosen`` as
-``aurora,ave-text-crc32`` and ``aurora,ave-data-crc32``. The driver only binds
-while DATA still matches the recorded checksum, and keeps a copy of DATA that
-it restores before every firmware boot.
+``aurora,ave-text-crc32`` and ``aurora,ave-data-crc32``. The loader may also
+record each segment's CRC32 as ``aurora,crc32`` on its reservation, as it
+must when two encoders' DATA differ, and a segment shared by two encoders
+has one ``iommu-addresses`` entry per encoder; the driver prefers the
+reservation's value. The driver only binds while DATA still matches the
+recorded checksum, and keeps a copy of DATA that it restores before every
+firmware boot.
 
 No firmware files are needed. The driver builds every command itself,
 including the two large session commands (Start and Process), from the
