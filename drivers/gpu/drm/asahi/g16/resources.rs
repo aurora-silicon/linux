@@ -15,10 +15,15 @@ use super::{
 use crate::mmu;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel::{
-    new_mutex,
+    new_mutex, new_spinlock,
     prelude::*,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, SpinLock},
 };
+
+/// Never-exposed PB epochs a VM keeps for its next renders. With PB epoch reuse most
+/// renders never expose the epoch prepared for them; allocating and mapping a fresh one per
+/// render submit costs far more than the render itself.
+const SPARE_EPOCHS: usize = 4;
 
 pub(crate) struct ComputeArena(crate::cleanup::Deferred<ComputeInner>);
 impl core::ops::Deref for ComputeArena {
@@ -140,7 +145,11 @@ struct Ready {
 pub(crate) struct Cache {
     #[pin]
     ready: Mutex<Ready>,
-    /// The VM's client closed: no arena is kept here any more.
+    /// Never-exposed epochs returned by retired jobs (at most [`SPARE_EPOCHS`]). Each holds
+    /// the VM, which holds this cache: [`Self::close`] breaks that cycle.
+    #[pin]
+    spares: SpinLock<KVec<Arc<PbEpoch>>>,
+    /// The VM's client closed: no arena or spare is kept here any more.
     closed: AtomicBool,
     pub(crate) factory: Factory,
     bind: mmu::VmBind,
@@ -154,17 +163,34 @@ impl Cache {
         live: Arc<super::vm::LiveToken>,
     ) -> Result<Arc<Self>> {
         let budget = super::budget::Budget::new()?;
+        let spares = KVec::with_capacity(SPARE_EPOCHS, GFP_KERNEL)?;
         Arc::pin_init(
             pin_init!(Self { ready <- new_mutex!(Ready::default(), "g16::resources"),
+            spares <- new_spinlock!(spares, "g16::spare_epochs"),
             closed: AtomicBool::new(false),
             factory, bind, live, budget }),
             GFP_KERNEL,
         )
     }
-    /// The VM's client closed. Lets go of the arenas: what jobs and the hardware slots'
-    /// last-owner leases still need, they hold themselves.
+    /// Returns a retired job's never-exposed epoch for the next renders. Any context.
+    fn give_back(&self, epoch: Arc<PbEpoch>) {
+        let mut spares = self.spares.lock();
+        // Without room, or once the client closed, the epoch drops: its deferred cleanup
+        // unmaps it as before.
+        if !self.closed.load(Ordering::Acquire) {
+            let _ = spares.push_within_capacity(epoch);
+        }
+    }
+
+    /// The VM's client closed. Lets go of the arenas and spare epochs: what jobs and the
+    /// hardware slots' last-owner leases still need, they hold themselves.
     pub(crate) fn close(&self) {
-        self.closed.store(true, Ordering::Release);
+        let spares = {
+            let mut spares = self.spares.lock();
+            self.closed.store(true, Ordering::Release);
+            core::mem::take(&mut *spares)
+        };
+        drop(spares);
         let ready = {
             let mut ready = self.ready.lock();
             (
@@ -176,7 +202,11 @@ impl Cache {
         drop(ready);
     }
 
-    pub(crate) fn prepare(&self, vm: &Arc<VmState>, commands: &[Command]) -> Result<Prepared> {
+    pub(crate) fn prepare(
+        self: &Arc<Self>,
+        vm: &Arc<VmState>,
+        commands: &[Command],
+    ) -> Result<Prepared> {
         let computes = commands
             .iter()
             .filter(|c| matches!(c, Command::Compute(_)))
@@ -250,7 +280,13 @@ impl Cache {
         for command in commands {
             pb.push(
                 if matches!(command, Command::Render(_)) {
-                    Some(PbEpoch::new(&self.factory, vm, epochs.take()?)?)
+                    // A spare keeps the budget permit it was created with; the reservation
+                    // returns the unused credit when it drops.
+                    let spare = self.spares.lock().pop();
+                    Some(match spare {
+                        Some(epoch) if epoch.unexposed() => epoch,
+                        _ => PbEpoch::new(&self.factory, vm, epochs.take()?)?,
+                    })
                 } else {
                     None
                 },
@@ -265,6 +301,7 @@ impl Cache {
             compute_ext,
             render,
             pb,
+            cache: Some(self.clone()),
         })
     }
 }
@@ -276,6 +313,21 @@ pub(crate) struct Prepared {
     pub(crate) compute_ext: Option<Arc<ComputeArena>>,
     pub(crate) render: Option<Arc<RenderArena>>,
     pb: KVec<Option<Arc<PbEpoch>>>,
+    /// The VM cache that unused epochs return to.
+    cache: Option<Arc<Cache>>,
+}
+
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        let Some(cache) = self.cache.take() else {
+            return;
+        };
+        for epoch in self.pb.iter_mut().filter_map(Option::take) {
+            if epoch.unexposed() {
+                cache.give_back(epoch);
+            }
+        }
+    }
 }
 impl Prepared {
     pub(crate) fn compute(&self) -> Result<&ComputeArena> {
