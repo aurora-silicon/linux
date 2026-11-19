@@ -485,6 +485,11 @@
 	apple,fast-die-effort = <&pmp0_report 2>;
 };
 
+/* macOS offers High Power mode on this machine */
+&clpc {
+	apple,high-power-mode;
+};
+
 &pmc {
 	/* PMP, CLPC and AP agents, once the PMP runs */
 	apple,static-voters = <0 1 3>;
