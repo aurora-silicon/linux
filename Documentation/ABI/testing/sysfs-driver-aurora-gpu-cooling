@@ -1,0 +1,18 @@
+What:		/sys/devices/platform/.../gpu_power_ceiling
+Date:		November 2026
+Contact:	Asahi Linux contributors <asahi@lists.linux.dev>
+Description:
+		Read-only. Present when the GPU's device-tree node is a
+		cooling device (#cooling-cells). One key/value pair per line:
+
+		requested_state: thermal cooling state, 0..100.
+		requested_ceiling_mw: minimum of all requester ceilings.
+		applied_ceiling_mw: ceiling last written to the firmware.
+		provisional_floor_mw: lowest ceiling, 25 percent of the
+		initialized maximum (never zero).
+		achieved_ceiling_mw: always "unsupported"; the firmware does
+		not acknowledge the ceiling.
+
+		State N requests max(25, 100 - N) percent of the initialized
+		maximum power. The debugfs file asahi-<device>-power/ceiling
+		adds the read-back firmware words and each requester's ceiling.

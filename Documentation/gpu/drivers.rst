@@ -12,6 +12,7 @@ GPU Driver Documentation
    asahi-reclaim
    asahi-usage-stats
    asahi-m4-bringup
+   asahi-gpu-thermal
    apple-dcp-m4
    i915
    imagination/index
