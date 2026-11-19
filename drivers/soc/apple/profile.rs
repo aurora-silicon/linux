@@ -185,19 +185,27 @@ pub(crate) struct PlatformProfile {
     pub(crate) key_store: KeyStore,
     /// Platforms with reboot-tested owner export and user-before-master saves.
     pub(crate) persistent_enrol: bool,
-    /// Whether creating a NEW per-user key bag (`userbag_ioctl`, linux#921) is
-    /// supported on this enclave. This is NOT the same as the create-encoding
-    /// [`KeyStore`] variant: the warm, macOS-shared enclaves (T8112/M2,
-    /// T8122/M3) encode identity bags with the variant-5 form yet never reply
-    /// to a user-bag `DESIGNATE_KEYBAG`, which would condemn the SKS endpoint
-    /// for the boot. Set true only where user-bag create/designate is proven on
-    /// hardware (T8140/Neo and the J616s/M4-Pro enclave family); false
-    /// elsewhere so the ioctl refuses cleanly with `EOPNOTSUPP`. Touch ID and
-    /// the identity bag are unaffected (they do not use `userbag_ioctl`).
-    pub(crate) per_user_keybags: bool,
+    /// The enclave never answers a user-bag `DESIGNATE_KEYBAG`, and that
+    /// unanswered request condemns the SKS endpoint for the rest of the boot
+    /// (`sks_wedged`), taking the whole key store down. Measured on T8112
+    /// (J415, OS firmware 26.6.2): CREATE_KEYBAG returns a handle, then
+    /// DESIGNATE_KEYBAG gets no reply. Such an enclave refuses per-user key
+    /// bags with `EOPNOTSUPP` before any request is sent (see
+    /// [`PlatformProfile::per_user_keybags`]).
+    pub(crate) designate_unanswered: bool,
     /// The `xart_guard` level when the parameter is left at its default (see
     /// [`crate::xart_guard`]).
     pub(crate) xart_guard: u8,
+}
+
+impl PlatformProfile {
+    /// Whether the enclave can create and designate a NEW per-user key bag
+    /// (`userbag_ioctl`, linux#921). The user-bag requests are the variant-5
+    /// key store's; the 13.5 key store has no such request shapes. An enclave
+    /// with the measured unanswered-DESIGNATE defect is the exception.
+    pub(crate) const fn per_user_keybags(&self) -> bool {
+        matches!(self.key_store, KeyStore::Variant5) && !self.designate_unanswered
+    }
 }
 
 pub(crate) const T8103: PlatformProfile = PlatformProfile {
@@ -232,7 +240,7 @@ pub(crate) const T8103: PlatformProfile = PlatformProfile {
         cpx_encryption_mode: 2,
     },
     persistent_enrol: true,
-    per_user_keybags: false,
+    designate_unanswered: false,
     nonce_session: false,
     // Off: Touch ID setup on a cold-boot SEP rewrites a session record that
     // predates Linux, so the guard would only block it.
@@ -274,7 +282,7 @@ pub(crate) const T6000: PlatformProfile = PlatformProfile {
         cpx_encryption_mode: 2,
     },
     persistent_enrol: true,
-    per_user_keybags: false,
+    designate_unanswered: false,
     nonce_session: false,
     // As T8103. On J316s, creating the identity keybag also rewrites a
     // session record that predates Linux.
@@ -309,8 +317,8 @@ pub(crate) const T6020: PlatformProfile = PlatformProfile {
     },
     key_store: KeyStore::Variant5,
     persistent_enrol: true,
-    // M2 Pro's warm macOS-shared enclave: user-bag create not proven (as M2).
-    per_user_keybags: false,
+    // Not measured: no M2 Pro/Max has run a user-bag DESIGNATE.
+    designate_unanswered: false,
     nonce_session: false,
     // A warm-attach enclave shared with macOS, as on T8112.
     xart_guard: 1,
@@ -340,9 +348,8 @@ pub(crate) const T6020_SEPOS13: PlatformProfile = PlatformProfile {
 pub(crate) const T8140: PlatformProfile = PlatformProfile {
     key_store: KeyStore::Variant5,
     persistent_enrol: true,
-    // User-bag create/designate proven on J700 hardware (variant-5 capture);
-    // the J616s/M4-Pro family (T6040 and its inheritors) shares this.
-    per_user_keybags: true,
+    // J700 answers the user-bag CREATE and DESIGNATE (variant-5 capture).
+    designate_unanswered: false,
     name: "T8140/J700",
     shmem_capacity: 0x4_0000,
     shmem_first_item: b"CINP",
@@ -415,9 +422,8 @@ pub(crate) const T8112: PlatformProfile = PlatformProfile {
     },
     key_store: KeyStore::Variant5,
     persistent_enrol: true,
-    // M2's warm macOS-shared enclave encodes the identity bag variant-5 but
-    // never replies to a user-bag DESIGNATE_KEYBAG (wedges SKS): refuse cleanly.
-    per_user_keybags: false,
+    // J415 never answers a user-bag DESIGNATE_KEYBAG (see the field).
+    designate_unanswered: true,
     nonce_session: false,
     // Guarded from its first Linux boot (2026-10-16): no record refused.
     xart_guard: 1,
@@ -447,6 +453,10 @@ pub(crate) const T8122: PlatformProfile = PlatformProfile {
     dart_window: &DART_HIGH_ALIAS,
     // A warm-attach enclave shared with macOS, as on T8112.
     xart_guard: 1,
+    // The unanswered DESIGNATE is a J415 measurement, not a property of the
+    // T8112 profile this one extends; no M3 (nor the M4/M5 Airs extending
+    // this) has run a user-bag DESIGNATE.
+    designate_unanswered: false,
     ..T8112
 };
 
@@ -789,6 +799,25 @@ mod tests {
         assert!(T6040.bootstrap == Bootstrap::WarmRegister);
         assert!(T6040.identity == IdentitySource::Chosen);
         assert!(T6040.xart_guard == 1);
+    }
+
+    #[test]
+    fn per_user_keybags_follow_the_key_store_and_the_designate_defect() {
+        // The 13.5 key store has no user-bag requests.
+        assert!(!T8103.per_user_keybags());
+        assert!(!T6000.per_user_keybags());
+        assert!(!T6020_SEPOS13.per_user_keybags());
+        // The measured unanswered DESIGNATE.
+        assert!(T8112.designate_unanswered);
+        assert!(!T8112.per_user_keybags());
+        // Every other variant-5 enclave.
+        for p in [
+            &T6020, &T8140, &T8122, &T6040, &T6041, &T6050, &T8132, &T8142,
+        ] {
+            assert!(p.key_store == KeyStore::Variant5);
+            assert!(!p.designate_unanswered);
+            assert!(p.per_user_keybags());
+        }
     }
 
     /// The name of the profile `select` picks for a root `compatible` list.
