@@ -15,7 +15,6 @@
 #include <linux/mfd/macsmc.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
-#include <linux/soc/apple/t8132.h>
 #include <linux/unaligned.h>
 
 #define MAX_GPIO 64
@@ -35,17 +34,6 @@
 #define MACSMC_J700_RADIO_REG_ON_GPIO	8
 #define MACSMC_J700_RADIO_REG_ON_LO	0x800000
 #define MACSMC_J700_RADIO_REG_ON_HI	0x80000
-
-/*
- * On the J713, J715, J604 and J773g, /amfm/function-reg_on is
- * pKW4("gP13", 0x00800000) (apple_t8132_managed_radio()). The firmware
- * function preserves the template's upper 16 bits and inserts the level into
- * its low 16 bits. This does not establish generic CMD_OUTPUT semantics, a
- * pin-mode command, or a readback operation for this line. The J716s N1's
- * power, /arm-io/apcie0/pci-bridge0 function-reset, is the same descriptor.
- */
-#define MACSMC_J713_RADIO_REG_ON_GPIO	0x13
-#define MACSMC_J713_RADIO_REG_ON_TEMPLATE	0x00800000
 
 /*
  * Commands 0-6 are, presumably, the intended API.
@@ -117,10 +105,17 @@ struct macsmc_gpio {
 	DECLARE_BITMAP(output_template_valid, MAX_GPIO);
 	u32 output_template[MAX_GPIO];
 
-	bool j713;
-	struct mutex j713_reg_on_lock;
-	bool j713_reg_on_known;
-	bool j713_reg_on_level;
+	/*
+	 * Templated outputs the device tree lists in apple,write-only-outputs:
+	 * no readback of the output latch is established for them, so a read
+	 * reports the level of the last successful write (output_level, valid
+	 * where output_level_known is set). output_lock orders those writes
+	 * with the cache.
+	 */
+	DECLARE_BITMAP(output_write_only, MAX_GPIO);
+	DECLARE_BITMAP(output_level_known, MAX_GPIO);
+	DECLARE_BITMAP(output_level, MAX_GPIO);
+	struct mutex output_lock;
 };
 
 static bool macsmc_gpio_is_j700_pcio(struct macsmc_gpio *smcgp,
@@ -138,11 +133,10 @@ static bool macsmc_gpio_has_output_template(struct macsmc_gpio *smcgp,
 	return test_bit(offset, smcgp->output_template_valid);
 }
 
-static bool macsmc_gpio_is_j713_reg_on(struct macsmc_gpio *smcgp,
+static bool macsmc_gpio_is_write_only(struct macsmc_gpio *smcgp,
 				      unsigned int offset)
 {
-	return smcgp->j713 && smcgp->base_key == (smc_key)_SMC_KEY("gP\0\0") &&
-	       offset == MACSMC_J713_RADIO_REG_ON_GPIO;
+	return offset < MAX_GPIO && test_bit(offset, smcgp->output_write_only);
 }
 
 static int macsmc_gpio_nr(smc_key key)
@@ -216,7 +210,6 @@ static int macsmc_gpio_get_direction(struct gpio_chip *gc, unsigned int offset)
 	int ret;
 
 	if (macsmc_gpio_is_j700_pcio(smcgp, offset) ||
-	    macsmc_gpio_is_j713_reg_on(smcgp, offset) ||
 	    macsmc_gpio_has_output_template(smcgp, offset))
 		return GPIO_LINE_DIRECTION_OUT;
 
@@ -240,11 +233,12 @@ static int macsmc_gpio_get(struct gpio_chip *gc, unsigned int offset)
 	u32 cmd, val;
 	int ret;
 
-	/* No qualified readback: report only the last successful native command. */
-	if (macsmc_gpio_is_j713_reg_on(smcgp, offset)) {
-		mutex_lock(&smcgp->j713_reg_on_lock);
-		ret = smcgp->j713_reg_on_known ? smcgp->j713_reg_on_level : -EOPNOTSUPP;
-		mutex_unlock(&smcgp->j713_reg_on_lock);
+	/* No established readback: report only the last successful write. */
+	if (macsmc_gpio_is_write_only(smcgp, offset)) {
+		mutex_lock(&smcgp->output_lock);
+		ret = test_bit(offset, smcgp->output_level_known) ?
+		      test_bit(offset, smcgp->output_level) : -EOPNOTSUPP;
+		mutex_unlock(&smcgp->output_lock);
 		return ret;
 	}
 
@@ -283,25 +277,22 @@ static int macsmc_gpio_set(struct gpio_chip *gc, unsigned int offset, int value)
 	smc_key key = macsmc_gpio_key(smcgp->base_key, offset);
 	int ret;
 
-	if (macsmc_gpio_is_j713_reg_on(smcgp, offset)) {
-		mutex_lock(&smcgp->j713_reg_on_lock);
-		ret = apple_smc_write_u32(smcgp->smc, key,
-					  MACSMC_J713_RADIO_REG_ON_TEMPLATE | !!value);
-		if (!ret) {
-			smcgp->j713_reg_on_level = !!value;
-			smcgp->j713_reg_on_known = true;
-		}
-		mutex_unlock(&smcgp->j713_reg_on_lock);
-		if (ret < 0)
-			dev_err_ratelimited(smcgp->dev, "gP13 set to %u failed: %d\n",
-					    !!value, ret);
-		return ret;
-	}
-
 	if (macsmc_gpio_has_output_template(smcgp, offset)) {
+		bool write_only = macsmc_gpio_is_write_only(smcgp, offset);
+
+		if (write_only)
+			mutex_lock(&smcgp->output_lock);
 		ret = apple_smc_write_u32(smcgp->smc, key,
 					  smcgp->output_template[offset] |
 					  !!value);
+		if (write_only) {
+			/* A failed write keeps the last known level. */
+			if (!ret) {
+				assign_bit(offset, smcgp->output_level, value);
+				assign_bit(offset, smcgp->output_level_known, true);
+			}
+			mutex_unlock(&smcgp->output_lock);
+		}
 		if (ret < 0)
 			dev_err_ratelimited(smcgp->dev,
 					    "templated GPIO %u set to %u failed: %d\n",
@@ -505,6 +496,26 @@ static int macsmc_gpio_parse_templates(struct macsmc_gpio *smcgp)
 		}
 	}
 
+	/* Write-only outputs: a subset of the templated outputs above. */
+	count = device_property_count_u32(dev, "apple,write-only-outputs");
+	if (count > 0) {
+		if (count > MAX_GPIO)
+			return -EINVAL;
+		values = devm_kcalloc(dev, count, sizeof(*values), GFP_KERNEL);
+		if (!values)
+			return -ENOMEM;
+		ret = device_property_read_u32_array(dev, "apple,write-only-outputs",
+						     values, count);
+		if (ret)
+			return ret;
+		for (i = 0; i < count; i++) {
+			if (values[i] >= MAX_GPIO ||
+			    !test_bit(values[i], smcgp->output_template_valid))
+				return -EINVAL;
+			set_bit(values[i], smcgp->output_write_only);
+		}
+	}
+
 	return 0;
 }
 
@@ -527,9 +538,7 @@ static int macsmc_gpio_probe(struct platform_device *pdev)
 	smcgp->base_key = data ? data->base_key : _SMC_KEY("gP\0\0");
 	smcgp->j700_pcio = of_machine_is_compatible("apple,j700") &&
 				device_is_compatible(&pdev->dev, "apple,smc-gpio");
-	smcgp->j713 = apple_t8132_managed_radio() ||
-		      of_machine_is_compatible("apple,j716s");
-	mutex_init(&smcgp->j713_reg_on_lock);
+	mutex_init(&smcgp->output_lock);
 	ret = macsmc_gpio_parse_templates(smcgp);
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret,
