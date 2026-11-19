@@ -646,10 +646,13 @@ static int apple_smc_probe(struct platform_device *pdev)
 	mutex_init(&smc->mutex);
 	spin_lock_init(&smc->lock);
 	smc->dev = &pdev->dev;
-	smc->saved_enabled = of_machine_is_compatible("apple,t6050") &&
-		(of_machine_is_compatible("apple,j714s") ||
-		 of_machine_is_compatible("apple,j716c")) &&
-		of_device_is_compatible(dev->of_node, "apple,t6050-smc");
+	/* The T6050 firmware sleep's saved context: where that sleep is described. */
+	smc->saved_enabled = of_device_is_compatible(dev->of_node, "apple,t6050-smc") &&
+		apple_t6050_sleep_described();
+	/*
+	 * Board data, not a capability: the J714s's SMC numbers its wake reasons with its own SD
+	 * reader and keyboard bits. Another board keeps the generic table until its own is read.
+	 */
 	if (smc->saved_enabled && of_machine_is_compatible("apple,j714s"))
 		smc->wake_reasons = apple_smc_j714s_wake_reasons;
 	/* J813's late notice needs the bounded, IRQ-independent transport too. */
