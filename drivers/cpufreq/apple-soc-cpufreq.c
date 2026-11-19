@@ -283,6 +283,18 @@ module_param(experimental_apsc_sync, bool, 0400);
 MODULE_PARM_DESC(experimental_apsc_sync,
 		 "refresh firmware APSC descriptors and preserve firmware-owned PS2 (default: off)");
 
+/*
+ * M2CLOCK2 TEST-ONLY (11-19, not for merge): discriminator knobs for the
+ * T8112 APSC reset. m2c_clusters: bit0 = P cluster (0x211e20000), bit1 = E
+ * cluster (0x210e20000); a cluster outside the mask keeps the stock path.
+ * m2c_kind: 0 = copy table row into the live pair (t-6738), 1 = write the
+ * live pair back with the value just read from it, 2 = reads only (no write).
+ */
+static unsigned int m2c_clusters = 3;
+module_param(m2c_clusters, uint, 0400);
+static unsigned int m2c_kind;
+module_param(m2c_kind, uint, 0400);
+
 static const struct apple_soc_cpufreq_info soc_s5l8960x_info = {
 	.has_ps2 = false,
 	.max_pstate = 7,
@@ -307,6 +319,16 @@ static const struct apple_soc_cpufreq_info soc_t6000_info = {
 	.max_pstate = 15,
 	.cur_pstate_mask = APPLE_DVFS_STATUS_CUR_PS_T8103,
 	.cur_pstate_shift = APPLE_DVFS_STATUS_CUR_PS_SHIFT_T8103,
+	.ps1_mask = APPLE_DVFS_CMD_PS1,
+	.ps1_shift = APPLE_DVFS_CMD_PS1_SHIFT,
+};
+
+/* M2CLOCK2 TEST-ONLY: T8112 cluster outside m2c_clusters (stock path). */
+static const struct apple_soc_cpufreq_info soc_t8112_nosync_info = {
+	.has_ps2 = false,
+	.max_pstate = 31,
+	.cur_pstate_mask = APPLE_DVFS_STATUS_CUR_PS_T8112,
+	.cur_pstate_shift = APPLE_DVFS_STATUS_CUR_PS_SHIFT_T8112,
 	.ps1_mask = APPLE_DVFS_CMD_PS1,
 	.ps1_shift = APPLE_DVFS_CMD_PS1_SHIFT,
 };
@@ -501,6 +523,13 @@ static int apple_soc_cpufreq_sync_apsc(struct apple_cpu_priv *priv,
 	hi = readq_relaxed(priv->reg_base + row + sizeof(lo));
 	old_lo = readq_relaxed(priv->reg_base + info->apsc_state_shadow_lo);
 	old_hi = readq_relaxed(priv->reg_base + info->apsc_state_shadow_hi);
+
+	if (m2c_kind == 2)
+		return 0;
+	if (m2c_kind == 1) {
+		lo = old_lo;
+		hi = old_hi;
+	}
 
 	writeq_relaxed(lo, priv->reg_base + info->apsc_state_shadow_lo);
 	writeq_relaxed(hi, priv->reg_base + info->apsc_state_shadow_hi);
@@ -1044,8 +1073,18 @@ static int apple_soc_cpufreq_find_cluster(struct cpufreq_policy *policy,
 			of_node_put(args.np);
 			return -ENODEV;
 		}
-		*reg_base = ioremap(res.start, max_t(resource_size_t,
-						     resource_size(&res), 0x60000));
+		if (!(((res.start == 0x211e20000ULL) && (m2c_clusters & 1)) ||
+		      ((res.start == 0x210e20000ULL) && (m2c_clusters & 2)))) {
+			pr_info("M2CLOCK2: cluster %pa stock path\n", &res.start);
+			*info = &soc_t8112_nosync_info;
+			*reg_base = of_iomap(args.np, 0);
+		} else {
+			pr_info("M2CLOCK2: cluster %pa APSC path kind %u; first transition in 1 s\n",
+				&res.start, m2c_kind);
+			msleep(1000);
+			*reg_base = ioremap(res.start, max_t(resource_size_t,
+							     resource_size(&res), 0x60000));
+		}
 	} else {
 		*reg_base = of_iomap(args.np, 0);
 	}
