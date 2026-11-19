@@ -49,6 +49,48 @@ pub(super) struct Entries {
     exact_qids: u128,
     /// QIDs with a valid record.
     queues: u128,
+    /// The first records, for the recovery's log line.
+    shown: Shown,
+}
+
+/// Records of a recovery table shown in its one log line.
+const SHOWN: usize = 24;
+
+/// The first [`SHOWN`] valid records of a recovery table as `q<qid>:<stamp>:<flags>/<match>`,
+/// the match being how the host found the command (`E` by exact stamp, `O` as the oldest
+/// published work, `-` not found, `?` not matched on M5): which queues the restart listed, and
+/// whether the firmware flagged them guilty, decide what the recovery fails and whether a
+/// restart storm counts it.
+#[derive(Default)]
+struct Shown {
+    records: [(u32, u32, u8); SHOWN],
+    count: usize,
+    more: usize,
+}
+
+impl Shown {
+    fn push(&mut self, flags: u32, stamp: u32, matched: u8) {
+        match self.records.get_mut(self.count) {
+            Some(record) => {
+                *record = (flags, stamp, matched);
+                self.count += 1;
+            }
+            None => self.more += 1,
+        }
+    }
+}
+
+impl kernel::fmt::Display for Shown {
+    fn fmt(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        for (index, &(flags, stamp, matched)) in self.records[..self.count].iter().enumerate() {
+            let sep = if index == 0 { "" } else { " " };
+            write!(f, "{}q{}:{:#x}:{:#x}/{}", sep, (flags >> 4) & 0x7f, stamp, flags, matched as char)?;
+        }
+        if self.more != 0 {
+            write!(f, " +{}", self.more)?;
+        }
+        Ok(())
+    }
 }
 
 impl Entries {
@@ -319,6 +361,8 @@ pub(super) fn service<H: Host>(
     let entries = read_entries(host);
     host.note_kill_sightings(host.recovery().accepted.wrapping_sub(1));
     host.transition(3, 0)?;
+    // The records are copied: log them once the firmware runs again.
+    pr_warn!("G17: recovery gen {} table: {} records [{}]\n", request.generation, entries.listed, entries.shown);
     if host.recovery_state()? != 0 {
         return Err(EIO);
     }
@@ -418,17 +462,23 @@ fn read_entries<H: Host>(host: &mut H) -> Entries {
             break;
         }
         if m5 {
+            entries.shown.push(flags, stamp, b'?');
             continue;
         }
         let qid = ((flags >> 4) & 0x7f) as u8;
-        match host.note_interrupted(qid, stamp) {
+        let matched = match host.note_interrupted(qid, stamp) {
             Interrupted::Exact => {
                 entries.exact += 1;
                 entries.exact_qids |= 1u128 << qid;
+                b'E'
             }
-            Interrupted::Oldest => entries.fallback += 1,
-            Interrupted::None => {}
-        }
+            Interrupted::Oldest => {
+                entries.fallback += 1;
+                b'O'
+            }
+            Interrupted::None => b'-',
+        };
+        entries.shown.push(flags, stamp, matched);
     }
     entries
 }
@@ -524,6 +574,26 @@ fn classify<Q: Queues>(queues: &mut Q, entries: Entries, blamed: Option<u8>, att
     (cancelled & !(guilty_qids & !collateral) & spared, blame, leftover, charged)
 }
 
+
+#[kernel::macros::kunit_tests(asahi_g17_recovery_table_line)]
+mod table_line_tests {
+    use super::{Shown, SHOWN};
+    use kernel::{prelude::*, str::CString};
+
+    #[test]
+    fn the_table_line_shows_queue_stamp_flags_and_match_then_a_count() {
+        let mut shown = Shown::default();
+        shown.push(1 | 2 | (41 << 4), 0x167a_1c00, b'E');
+        shown.push(1 | (42 << 4), 0x7_9300, b'-');
+        let line = CString::try_from_fmt(fmt!("{}", shown)).unwrap();
+        assert_eq!(line.to_bytes(), b"q41:0x167a1c00:0x293/E q42:0x79300:0x2a1/-");
+        for _ in 0..SHOWN {
+            shown.push(1, 0, b'O');
+        }
+        let line = CString::try_from_fmt(fmt!("{}", shown)).unwrap();
+        assert!(line.to_bytes().ends_with(b" +2"));
+    }
+}
 
 #[kernel::macros::kunit_tests(asahi_g17_recovery_snapshot)]
 mod tests {
