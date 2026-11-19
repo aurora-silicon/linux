@@ -32,31 +32,70 @@ pub(crate) struct ComputeSlot {
     pub(crate) counter: Arc<FwObject>,
     pub(crate) context_store: Arc<FwObject>,
     pub(crate) aux: Arc<FwObject>,
+    /// Pages seeded into its freelist (8192: the whole pool).
+    pub(crate) seeds: u32,
 }
+
+/// Rows (2 MiB) of a 32 MiB UMA pool given to each unit sharing it: the base unit keeps the
+/// first range, extension units take the others.
+pub(crate) const SHARED_POOL_ROWS: [core::ops::Range<u32>; 3] = [0..5, 5..10, 10..16];
 
 /// Initializes the private pool exactly once, before it is exposed. Never called on reuse.
 pub(crate) fn init_uma_pool(state: &FwObject, list: &FwObject, pool: u64) -> Result {
-    if pool & 0x3fff != 0 {
+    init_uma_pool_rows(state, list, pool, 0..16).map(|_| ())
+}
+
+/// Initializes a unit's freelist and pool table with rows `rows` of the 32 MiB pool at `pool`
+/// only. Returns the pages seeded.
+pub(crate) fn init_uma_pool_rows(
+    state: &FwObject,
+    list: &FwObject,
+    pool: u64,
+    rows: core::ops::Range<u32>,
+) -> Result<u32> {
+    if pool & 0x3fff != 0 || rows.end > 16 || rows.start >= rows.end {
         return Err(EINVAL);
     }
+    let first_page = rows.start as usize * 512;
+    let pages = (rows.end - rows.start) as usize * 512;
     let mut chunk = [0u8; 512];
-    for first in (0..8192).step_by(64) {
+    for first in (0..pages).step_by(64) {
         for j in 0..64 {
-            chunk[j * 8..j * 8 + 8]
-                .copy_from_slice(&(pool + ((first + j) as u64) * 0x1000).to_le_bytes());
+            chunk[j * 8..j * 8 + 8].copy_from_slice(
+                &(pool + ((first_page + first + j) as u64) * 0x1000).to_le_bytes(),
+            );
         }
         state.write(first * 8, &chunk)?;
     }
-    for i in 0..16 {
-        list.w64(i * 64, (1u64 << 61) | (pool + i as u64 * 0x200000))?;
+    for (i, row) in rows.enumerate() {
+        list.w64(i * 64, (1u64 << 61) | (pool + row as u64 * 0x200000))?;
     }
-    Ok(())
+    Ok(pages as u32)
 }
 
 impl ComputeSlot {
-    pub(crate) fn new(o: &mut Objects, k: u64) -> Result<Self> {
+    /// Unit `k`. With `shared`, its freelist takes rows `shared.1` of the given pool (another
+    /// unit's, or with no pool given its own) instead of all of its own 32 MiB pool.
+    pub(crate) fn new(
+        o: &mut Objects,
+        k: u64,
+        shared: Option<(Option<Arc<FwObject>>, core::ops::Range<u32>)>,
+    ) -> Result<Self> {
         let sh = Class::Shared;
-        let unit = Self {
+        let foreign = shared.as_ref().and_then(|(pool, _)| pool.clone());
+        let pool = match foreign {
+            Some(pool) => pool,
+            None => o.alloc(super::object::Request {
+                size: 0x2000000,
+                class: sh,
+                placement: super::object::Placement::Anywhere,
+                offset: 0,
+                client: Some((client::compute_pool(k), super::hw::pte::LEAF_NC)),
+                lower: None,
+                cpu: false,
+            })?,
+        };
+        let mut unit = Self {
             its: alloc(o, 16, sh, None, 0, false)?,
             preempt: alloc(
                 o,
@@ -69,15 +108,7 @@ impl ComputeSlot {
             work: alloc_work(o, 0x2000, client::WORK_PAGE + k * client::CWORK_STRIDE, 0)?,
             seq: alloc(o, 0x300, cmd_fw(), None, 0, false)?,
             barrier: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
-            pool: o.alloc(super::object::Request {
-                size: 0x2000000,
-                class: sh,
-                placement: super::object::Placement::Anywhere,
-                offset: 0,
-                client: Some((client::compute_pool(k), super::hw::pte::LEAF_NC)),
-                lower: None,
-                cpu: false,
-            })?,
+            pool,
             pool_state: alloc(
                 o,
                 0x20000,
@@ -97,11 +128,14 @@ impl ComputeSlot {
                 false,
             )?,
             aux: alloc(o, 0x4000, sh, Client::nc(client::compute_aux(k)), 0, false)?,
+            seeds: 8192,
         };
-        init_uma_pool(
+        let rows = shared.map_or(0..16, |(_, rows)| rows);
+        unit.seeds = init_uma_pool_rows(
             &unit.pool_state,
             &unit.page_list,
             unit.pool.gva.ok_or(EINVAL)?,
+            rows,
         )?;
         Ok(unit)
     }

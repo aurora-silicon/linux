@@ -51,6 +51,8 @@ pub(crate) struct ComputeRefs {
     pub(crate) target_stamp: u32,
     /// Cumulative private UMA submissions; never derived from the engine stamp.
     pub(crate) submitted: u64,
+    /// Pages seeded into the unit's UMA freelist (0: the whole 32 MiB pool, 8192).
+    pub(crate) seeds: u32,
 }
 
 const FW_START: u64 = 0xfffffc2000000000;
@@ -370,8 +372,9 @@ pub(crate) fn encode_compute(
     put32(w, d + manager::ONE, 2);
     put64(w, d + manager::FREELIST, r.pool_state_gva);
     put32(w, d + manager::UNK_1C, manager::UNK_1C_VALUE);
-    put32(w, d + manager::SEEDS_A, 8192);
-    put32(w, d + manager::SEEDS_B, 8192);
+    let seeds = if r.seeds == 0 { 8192 } else { r.seeds.min(8192) };
+    put32(w, d + manager::SEEDS_A, seeds);
+    put32(w, d + manager::SEEDS_B, seeds);
     put64(w, d + manager::POOL_TABLE, r.page_list_gva);
     put32(w, d + 0x40, 4);
     put32(w, d + 0x48, 128);

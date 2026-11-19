@@ -34,6 +34,10 @@ impl core::ops::Deref for ComputeArena {
 }
 pub(crate) struct ComputeInner {
     pub(crate) compute: KVec<ComputeSlot>,
+    /// The units share their base units' pools (see [`ComputeArena::new`]).
+    pub(crate) shared_pools: bool,
+    /// Extension units with shared pools: the base arena whose pools they draw from.
+    _base: Option<Arc<ComputeArena>>,
     _objects: Objects,
     // Mappings must disappear while their root still owns its ASID.
     _bind: mmu::VmBind,
@@ -52,22 +56,40 @@ const BURST_COMMANDS: usize = 3;
 
 impl ComputeArena {
     /// Units `units` (their index fixes their client addresses and hardware UMA slot).
+    /// With `shared` pools, base unit k (0, 1) seeds only the first rows of its own 32 MiB
+    /// pool and extension units 2..6 take the other rows of the base pools of `base`; further
+    /// units, or extension units of a base without shared pools, get pools of their own.
     fn new(
         factory: &Factory,
         bind: &mmu::VmBind,
         vm: &mmu::Vm,
         live: &Arc<super::vm::LiveToken>,
         units: core::ops::Range<usize>,
+        shared: bool,
+        base: Option<&Arc<ComputeArena>>,
     ) -> Result<Arc<Self>> {
+        use super::slots::SHARED_POOL_ROWS as ROWS;
         let mut objects = factory.objects(vm);
         let mut compute = KVec::with_capacity(units.len(), GFP_KERNEL)?;
+        let base = base.filter(|b| shared && b.shared_pools);
+        let shared_pools = if units.start == 0 { shared } else { base.is_some() };
         for k in units {
-            compute.push(ComputeSlot::new(&mut objects, k as u64)?, GFP_KERNEL)?;
+            let slice = match (k, base) {
+                (0 | 1, None) if shared => Some((None, ROWS[0].clone())),
+                (2..=5, Some(b)) => {
+                    let owner = b.compute.get((k - 2) / 2).ok_or(EINVAL)?;
+                    Some((Some(owner.pool.clone()), ROWS[1 + (k - 2) % 2].clone()))
+                }
+                _ => None,
+            };
+            compute.push(ComputeSlot::new(&mut objects, k as u64, slice)?, GFP_KERNEL)?;
         }
         objects.finish_private()?;
         Ok(Arc::new(
             Self(crate::cleanup::Deferred::new(ComputeInner {
                 compute,
+                shared_pools,
+                _base: base.cloned(),
                 _objects: objects,
                 _bind: bind.clone(),
                 _live: live.clone(),
@@ -231,6 +253,8 @@ impl Cache {
                     &vm.vm,
                     &self.live,
                     0..BASE_COMPUTE_UNITS,
+                    super::params::compute_pool_share(),
+                    None,
                 )?);
             }
             if compute {
@@ -254,6 +278,8 @@ impl Cache {
                         &vm.vm,
                         &self.live,
                         BASE_COMPUTE_UNITS..units,
+                        super::params::compute_pool_share(),
+                        ready.compute.as_ref(),
                     )
                     .ok();
                 }

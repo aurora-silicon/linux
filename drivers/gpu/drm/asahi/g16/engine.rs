@@ -1416,6 +1416,7 @@ impl Firmware {
             work_818: 0,
             target_stamp: target,
             submitted,
+            seeds: s.seeds,
         };
         let scratch = self.engine.scratch.as_deref_mut().ok_or(ENOMEM)?;
         let w = image(&mut scratch.cw)?;

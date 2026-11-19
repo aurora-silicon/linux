@@ -56,7 +56,10 @@ pub(crate) mod tune {
     /// Run the publication pass on every submission (1), or only when the submitted job
     /// can be published at once (0).
     pub(crate) static SUBMIT_PUBLISH: AtomicU32 = AtomicU32::new(0);
-    const NAMES: [(&str, &AtomicU32, u32, u32); 11] = [
+    /// A VM's compute units share its two base UMA pools in disjoint row ranges instead of
+    /// one 32 MiB pool each (compute arenas created later).
+    pub(crate) static COMPUTE_POOL_SHARE: AtomicU32 = AtomicU32::new(0);
+    const NAMES: [(&str, &AtomicU32, u32, u32); 12] = [
         ("compute_units", &COMPUTE_UNITS, 2, super::hw::sizes::COMPUTE_UNITS as u32),
         ("compute_flights", &COMPUTE_FLIGHTS, 1, super::hw::sizes::FLIGHTS as u32),
         ("resnap_us", &RESNAP_US, 0, 1000),
@@ -68,6 +71,7 @@ pub(crate) mod tune {
         ("render_hold", &RENDER_HOLD, 0, 1),
         ("credits", &CREDITS, 1, super::hw::sizes::SCHEDULER_CREDITS),
         ("submit_publish", &SUBMIT_PUBLISH, 0, 1),
+        ("compute_pool_share", &COMPUTE_POOL_SHARE, 0, 1),
     ];
 
     /// Applies one `name=value` line.
@@ -131,6 +135,11 @@ pub(crate) fn credits() -> u32 {
     tune::CREDITS
         .load(core::sync::atomic::Ordering::Relaxed)
         .clamp(1, hw::sizes::SCHEDULER_CREDITS)
+}
+
+/// Whether new compute arenas share their base UMA pools between units.
+pub(crate) fn compute_pool_share() -> bool {
+    tune::COMPUTE_POOL_SHARE.load(core::sync::atomic::Ordering::Relaxed) != 0
 }
 
 /// Whether every submission runs the publication pass.
