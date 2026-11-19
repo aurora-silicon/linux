@@ -1654,7 +1654,9 @@ int dptxep_init(struct apple_dcp *dcp)
 			 * kIOReturnNoDevice (0xe00002c0). Leave the endpoint
 			 * up so a later announce can still bind.
 			 */
-			if (dcp_fw_is_14_7(dcp) || dcp_is_ext26(dcp)) {
+			/* The M1's firmware 27 also waits for a sink first. */
+			if (dcp_fw_is_14_7(dcp) || dcp_is_ext26(dcp) ||
+			    dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
 				dev_info(dcp->dev,
 					 "DPTX port %u not announced yet\n", port);
 				return 0;
