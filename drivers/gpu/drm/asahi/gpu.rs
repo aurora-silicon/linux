@@ -396,7 +396,10 @@ pub(crate) trait Gpu: Send + Sync {
         }
         flags
     }
-    /// Temporary capacity hint and validity in milliseconds for subsequent syncobj waits.
+    /// Temporary capacity hint and validity in milliseconds for subsequent syncobj waits, or
+    /// None to leave the file's hint as it is. `file.rs` applies the same policy to every
+    /// generation that returns one: only after a submission that leaves its queue shallow,
+    /// bounded to the smallest CPU ([`fit_wait_util_min`]).
     fn syncobj_wait_hint(&self) -> Option<(u32, u32)> {
         None
     }
@@ -1531,6 +1534,20 @@ extern "C" {
     fn asahi_min_cpu_capacity() -> u32;
 }
 
+/// Bounds a syncobj wait capacity hint (`Gpu::syncobj_wait_hint`) to what the smallest CPU
+/// provides, so the hint raises the clock of the core the waiter wakes on rather than make the
+/// scheduler move the waiter to a larger cluster. Above a CPU's capacity a minimum
+/// utilization no longer fits that CPU. The margin of 59/64 of the smallest capacity is the
+/// value measured on the M1 Pro (T6000, smallest capacity 485): there 512 moved the waiter to
+/// the P-cores and slowed a host-signal round trip by 26%, while 447/448 sped it up by 10-11%
+/// and the depth-1 rows by 18-21%. Where half scale fits with that margin (M2: 571) the hint
+/// keeps its full value.
+pub(crate) fn fit_wait_util_min(util_min: u32) -> u32 {
+    // SAFETY: The helper only reads the per-CPU capacity table.
+    let smallest = unsafe { asahi_min_cpu_capacity() };
+    util_min.min(smallest * 59 / 64)
+}
+
 #[versions(AGX)]
 impl Gpu for GpuManager::ver {
     /// A light submission completes in tens of microseconds, so its submitter
@@ -1538,21 +1555,15 @@ impl Gpu for GpuManager::ver {
     /// clocks it like idle work: on G13/G14 a single client then spends more
     /// time waking, recording and submitting than the GPU spends executing.
     /// Give its blocking syncobj waits the G17 feed's expiring capacity hint
-    /// (half of the capacity scale, valid for 8 ms after each submission) when
-    /// that fits on every CPU, so the hint only raises the clock of the core
-    /// the waiter wakes on. Where the smallest cores are below half scale the
-    /// hint would move the waiter to another cluster instead, so none is given.
-    /// The hint changes no task attribute or affinity.
+    /// (half of the capacity scale, valid for 8 ms after each submission).
+    /// `file.rs` gives it only after submissions to shallow queues and bounds
+    /// it to the smallest CPU ([`fit_wait_util_min`]). The hint changes no
+    /// task attribute or affinity.
     fn syncobj_wait_hint(&self) -> Option<(u32, u32)> {
         /// Half of the CPU capacity scale (0..1024), as for the G17 feed.
         const WAIT_UTIL_MIN: u32 = 512;
         const WAIT_HINT_MS: u32 = 8;
-        if !cfg!(CONFIG_UCLAMP_TASK) {
-            return None;
-        }
-        // SAFETY: The helper only reads the per-CPU capacity table.
-        let smallest = unsafe { asahi_min_cpu_capacity() };
-        (smallest >= WAIT_UTIL_MIN).then_some((WAIT_UTIL_MIN, WAIT_HINT_MS))
+        cfg!(CONFIG_UCLAMP_TASK).then_some((WAIT_UTIL_MIN, WAIT_HINT_MS))
     }
 
     fn stats_snapshot(&self) -> Option<Arc<stats::StatsSnapshot>> {

@@ -97,6 +97,13 @@ pub(crate) trait Queue: Send + Sync {
     /// Waits for the work submitted so far to finish, before the mappings of a closing
     /// client go. Queues whose VMs keep user mappings for accepted jobs need not wait.
     fn drain(&mut self) {}
+
+    /// The fence that signals when the work of the most recent successful submission has
+    /// finished, if the queue tracks one. `file.rs` uses it to tell how many submissions of
+    /// the queue are still in flight.
+    fn last_submission(&self) -> Option<Fence> {
+        None
+    }
 }
 
 #[versions(AGX)]
@@ -759,6 +766,10 @@ impl Queue::ver {
 impl Queue for Queue::ver {
     fn drain(&mut self) {
         self.wait_submitted();
+    }
+
+    fn last_submission(&self) -> Option<Fence> {
+        self.last_out.clone()
     }
 
     fn submit<'drm>(
