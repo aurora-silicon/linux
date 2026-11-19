@@ -215,6 +215,7 @@
 		reg = <0x4 0x88000000 0x0 0x20000>;
 		interrupts = <AIC_IRQ 1463 IRQ_TYPE_LEVEL_HIGH>;
 		#iommu-cells = <1>;
+		power-domains = <&ps_apcie_sys_gp>;
 		status = "disabled";
 	};
 
