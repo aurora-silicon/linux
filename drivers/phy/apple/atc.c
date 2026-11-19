@@ -683,8 +683,12 @@ struct apple_atcphy;
  * @tunnel_t8103_clock: DP tunnels are clocked by the T8103 sequence: one
  *                      AUSPLL pixel clock (PCLK1) feeds both DP IN adapters,
  *                      see atc_tunnel_start_t8103(); the T8103, T8112 and T600x
- *                      PHYs. Without it, and without @t8122_tunnel_clock, each
- *                      DP IN has its own clock (atc_tunnel_set_t602x())
+ *                      PHYs
+ * @tunnel_dpin_clocks: DP tunnels are clocked by the T602X sequence: each DP IN
+ *                      adapter has its own pixel clock (PCLK1, PCLK2) of one
+ *                      AUSPLL, see atc_tunnel_set_t602x(); the T602X PHY. Runs
+ *                      only for a connector wired to both DP IN adapters
+ *                      (@tunnel_dual_stream of struct apple_atcphy)
  * @tunnel_dprx_clock: With @tunnel_t8103_clock, the tunnel also runs PCLK2 and
  *                     the DP IN (DPRX) clock at the same rate, and the clock
  *                     path is woken before the first rate request
@@ -725,6 +729,7 @@ struct atcphy_hw {
 	bool has_usb4;
 	bool tunnel_t8103_clock;
 	bool tunnel_dprx_clock;
+	bool tunnel_dpin_clocks;
 	bool usb2_only;
 	u32 usb2phy_sig_host;
 	u32 pipe_mux_clk;
@@ -825,8 +830,8 @@ struct atcphy_cio_sleep {
  * @swap_lanes: True if lanes must be swapped due to cable orientation
  * @dp_link_rate: DisplayPort link rate
  * @pipe_state: Backend the PIPE mux ("pipehandler") is routed to
- * @tunnel_dual_stream: This PHY connector has qualified dual-stream tunnel wiring
- * @tunnel_routes_present: Qualified dual-stream routes exist on this SoC
+ * @tunnel_dual_stream: The connector of a PHY with per-DP IN tunnel clocks is
+ *                      wired to both DP IN adapters (see apple_atc_tunnel_wiring())
  * @tunnel_clock_on: True while the DisplayPort-over-Thunderbolt pixel clock runs
  * @tunnel_attempted: A T602X tunnel clock setup has been attempted
  * @tunnel_saved: T602X PHY registers have been saved for tunnel teardown
@@ -974,7 +979,6 @@ struct apple_atcphy {
 	bool rpm_held;
 
 	bool tunnel_dual_stream;
-	bool tunnel_routes_present;
 	bool tunnel_clock_on;
 	/* The clock block was reset by a CIO sleep and no clock start has run since. */
 	bool tunnel_ack_stale;
@@ -5130,11 +5134,8 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 	if (apple_atc_tunnel_t8122_clock(atcphy))
 		return apple_atc_dp_tunnel_rate_source(phy, 0, dpin, rate);
 	if (!apple_atc_tunnel_is_t8103_style(atcphy)) {
-		bool valid_core = apple_atc_t602x_core_valid(atcphy->np, atcphy->res.core->start,
-							     resource_size(atcphy->res.core));
-
-		ret = apple_atc_t602x_gate(atcphy->tunnel_dual_stream,
-					   atcphy->tunnel_routes_present, valid_core);
+		ret = apple_atc_dpin_clock_gate(atcphy->hw->tunnel_dpin_clocks,
+						atcphy->tunnel_dual_stream);
 		if (ret)
 			return ret;
 	}
@@ -6819,27 +6820,21 @@ power_off:
 	return ret;
 }
 
+/*
+ * A PHY with a pixel clock per DP IN adapter runs a tunnel clock only for a
+ * Type-C connector whose display routes reach both DP IN adapters of its
+ * router: the device tree describes that wiring on the connector (see
+ * apple_dp_tunnel_dual_stream()). Other connectors, and the PHY that drives
+ * a fixed HDMI port, have no tunnel to clock.
+ */
 static void apple_atc_tunnel_wiring(struct apple_atcphy *atcphy)
 {
 	struct device_node *connector __free(device_node) = NULL;
-	struct device_node *candidate;
 
-	if (!apple_atc_t602x_qualified(of_root))
+	if (!atcphy->hw->tunnel_dpin_clocks)
 		return;
 	connector = of_graph_get_remote_node(atcphy->np, 0, -1);
 	atcphy->tunnel_dual_stream = apple_dp_tunnel_dual_stream(connector);
-	if (atcphy->tunnel_dual_stream) {
-		atcphy->tunnel_routes_present = true;
-		return;
-	}
-	/* Preserve EINVAL for invalid cores when qualified routes exist elsewhere. */
-	for_each_compatible_node(candidate, NULL, "usb-c-connector") {
-		if (!apple_dp_tunnel_dual_stream(candidate))
-			continue;
-		atcphy->tunnel_routes_present = true;
-		of_node_put(candidate);
-		break;
-	}
 }
 
 /*
@@ -7969,6 +7964,7 @@ static const struct atcphy_hw atcphy_hw_t6020 = {
 	.pipe_mux_clk = PIPEHANDLER_MUX_CTRL_CLK_T8103,
 	.pipe_mux_data = PIPEHANDLER_MUX_CTRL_DATA_T8103,
 	.has_usb4 = true,
+	.tunnel_dpin_clocks = true,
 	.park_pipe_unlocked = true,
 };
 
