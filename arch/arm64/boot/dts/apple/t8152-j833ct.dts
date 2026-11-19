@@ -1,10 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple iMac (24-inch, M6), J833ct.
+ *
+ * Booted from RAM by the loader (see t8152-common.dtsi); the console is the
+ * framebuffer. The keyboard and trackpad are Bluetooth accessories: the board
+ * has no MTP, keyboard backlight PWM or battery. Resources follow the J833ct
+ * ADT.
+ */
 /dts-v1/;
 
-#include "t8152.dtsi"
+#include "t8152-common.dtsi"
 
 / {
-	model = "Apple iMac (J833ct)";
 	compatible = "apple,j833ct", "apple,t8152", "apple,arm-platform";
+	model = "Apple iMac (24-inch, M6)";
 	chassis-type = "all-in-one";
+};
+
+&pinctrl_ap {
+	/* ADT no-restore-gpio-pins */
+	gpio-reserved-ranges = <78 2>, <208 1>;
 };
