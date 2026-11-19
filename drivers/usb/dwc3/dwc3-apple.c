@@ -147,6 +147,8 @@
  * @rpm_held: The glue holds a runtime PM reference for the running core
  * @pre_core_rpm: Runtime PM is the glue's own until the first core bring-up
  * @dt_dis_u3_susphy: The device tree keeps USB3 PHY suspend off itself
+ * @usb2_device_speed: The core's maximum speed before a T8132 device role was limited to USB2
+ *		       (USB_SPEED_UNKNOWN: not limited); restored before the next session starts
  * @sleep_ddr: The host votes for DRAM in a sleep while it runs (apple,sleep-ddr)
  * @drd_regs: The controller's optional blocks outside dwc3-core (drd-cfg, drd-bulk, drd-ausbc),
  *	      mapped for their tunables
@@ -189,6 +191,7 @@ struct dwc3_apple {
 	bool rpm_held;
 	bool pre_core_rpm;
 	bool dt_dis_u3_susphy;
+	enum usb_device_speed usb2_device_speed;
 	bool sleep_ddr;
 	struct notifier_block pm_nb;
 	/* Kept through a deep sleep, with the PHY's hibernation, and the GUID it had. */
@@ -940,7 +943,19 @@ static int dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_stat
 	appledwc->dwc.dis_u3_susphy_quirk = appledwc->dt_dis_u3_susphy;
 	dwc3_enable_susphy(&appledwc->dwc, true);
 	ret = phy_set_mode(appledwc->usb3_phy, host ? PHY_MODE_USB_HOST : PHY_MODE_USB_DEVICE);
-	if (ret) {
+	if (ret == -EOPNOTSUPP && !host &&
+	    of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3")) {
+		/*
+		 * The T8132 PHY has no SuperSpeed device mode once it is in a USB3 mode: the
+		 * device role runs on USB2, and the gadget must not offer more. Other PHYs
+		 * return this error for other reasons and are handled below, as before.
+		 */
+		dev_info(appledwc->dev, "USB3 PHY has no SuperSpeed device mode, USB2 only\n");
+		if (appledwc->dwc.maximum_speed > USB_SPEED_HIGH) {
+			appledwc->usb2_device_speed = appledwc->dwc.maximum_speed;
+			appledwc->dwc.maximum_speed = USB_SPEED_HIGH;
+		}
+	} else if (ret) {
 		/*
 		 * A failed T8132 BIST or PIPE handoff must not start xHCI. Neither must a failed
 		 * T6050 one: that PHY reports a port left on USB2 (four DisplayPort lanes) as
@@ -998,6 +1013,11 @@ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state st
 	if (state == DWC3_APPLE_HOST && appledwc->host_only)
 		appledwc->dwc.current_dr_role = DWC3_GCTL_PRTCAP_HOST;
 
+	/* A previous session's USB2-only device role limits nothing after it. */
+	if (appledwc->usb2_device_speed != USB_SPEED_UNKNOWN) {
+		appledwc->dwc.maximum_speed = appledwc->usb2_device_speed;
+		appledwc->usb2_device_speed = USB_SPEED_UNKNOWN;
+	}
 	ret = dwc3_apple_core_start(appledwc, state);
 	if (ret)
 		return ret;
