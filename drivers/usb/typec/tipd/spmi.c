@@ -734,47 +734,30 @@ static bool sn201202x_sleep_event(struct tps6598x *tps)
 }
 
 /*
- * On the T6050 boards that sleep (J714s, J716c), the probe and the sleep's SLEEP command print a
- * line; on every other machine they don't. A controller without a connector (the MagSafe one,
- * hpm5) is probed as any other: it registers its Type-C port and power supply, and with
- * apple,sleep-ssps it follows the system's sleep as the USB-C ports' controllers do (woken and
- * switched to S3 at the prepare, SLEEP at the suspend, woken at the resume and switched to S0
- * at the complete).
+ * A controller without a connector (the MagSafe one, hpm5) is probed as any other: it registers
+ * its Type-C port and power supply, and with apple,sleep-ssps it follows the system's sleep as
+ * the USB-C ports' controllers do (woken and switched to S3 at the prepare, SLEEP at the
+ * suspend, woken at the resume and switched to S0 at the complete).
  */
-static bool sn201202x_sleep_board(void)
-{
-	return of_machine_is_compatible("apple,j714s") || of_machine_is_compatible("apple,j716c");
-}
-
-static bool sn201202x_j714s(void)
-{
-	return of_machine_is_compatible("apple,j714s");
-}
 
 /*
- * A controller that the previous boot left in the middle of a command can fail its first
- * probe on the reads that follow. On the J714s, after a soft reboot that ended a deep-sleep
- * test run, the controllers of both USB-C ports ran their LDCM command for more than three
- * seconds. Their SPMI buses then reported frames that failed the parity check and commands
- * that were not acknowledged, the power status read failed with -EIO, and the probe failed with
- * -EINVAL. Both ports, and every USB, Thunderbolt and DisplayPort device on them, stayed gone
- * until the next boot.
+ * A controller that the previous boot left in the middle of a command keeps running it, and
+ * the first probe fails on the reads that follow: on the J714s, after a soft reboot that ended
+ * a deep-sleep test run, the controllers of both USB-C ports ran their LDCM command for more
+ * than three seconds. Their SPMI buses then reported frames that failed the parity check and
+ * commands that were not acknowledged, the power status read failed with -EIO, and the probe
+ * failed with -EINVAL. Both ports, and every USB, Thunderbolt and DisplayPort device on them,
+ * stayed gone until the next boot.
  *
- * On that board a failed probe is tried again after a growing wait. After the third failed try
- * the controller's firmware is cold-reset ("Gaid", as the debug link's recovery does), unless
- * it is in the debug mode of the boot loader's debug link, and it is tried twice more. Each try
- * runs in a devres group of its own, so what a failed try set up is released before the next.
- * A controller that is still not up after that defers its probe: the driver core tries it
- * again later, and the port is never left failed while its controller is there.
+ * tipd_shutdown() now leaves the controller idle, but a restart that does not run it (a panic,
+ * a watchdog, the boot loader) does not. So before the probe sends its first command, the
+ * command register is read until the controller has ended the command it runs, for at most the
+ * longest limit this driver gives a command. A controller that has not ended it by then is
+ * cold-reset once ("Gaid", as the debug link's recovery does), unless it is in the debug mode
+ * of the boot loader's debug link.
  */
-#define SN201202X_INIT_TRIES		5
-#define SN201202X_INIT_RESET_AFTER	3
 #define SN201202X_RESET_MS		1000
 #define SN201202X_RESET_UP_MS		2000
-
-static const unsigned int sn201202x_init_wait_ms[SN201202X_INIT_TRIES - 1] = {
-	200, 500, 0, 1000,
-};
 
 /* 0 with the controller's mode in @mode, or the error of the read */
 static int sn201202x_mode(struct tps6598x *tps, char mode[4])
@@ -786,21 +769,20 @@ static int sn201202x_mode(struct tps6598x *tps, char mode[4])
 	return memchr_inv(mode, 0, 4) ? 0 : -ENODEV;
 }
 
+/* A controller whose last command does not end: the command is written over it */
 static int sn201202x_cold_reset(struct sn201202x *sn)
 {
 	struct tps6598x *tps = &sn->cd.tps;
 	char mode[4];
 	int ms, ret;
 
-	sn201202x_wake(sn);
 	ret = sn201202x_mode(tps, mode);
 	/* The boot loader's debug link runs in this mode: it is never reset from here */
 	if (!ret && !memcmp(mode, "DBMa", 4))
 		return -EBUSY;
-	scoped_guard(mutex, &tps->lock)
-		ret = tps6598x_exec_cmd_tmo(tps, "Gaid", 0, NULL, 0, NULL, 2000, 0);
+	ret = tipd_cmd_write_busy(tps, "Gaid");
 	if (ret)
-		dev_dbg(tps->dev, "reset command: %d\n", ret);
+		return ret;
 	msleep(SN201202X_RESET_MS);
 	for (ms = 0; ms < SN201202X_RESET_UP_MS; ms += 50) {
 		if (!sn201202x_wake(sn) && !sn201202x_mode(tps, mode) && !memcmp(mode, "APP ", 4))
@@ -813,44 +795,28 @@ static int sn201202x_cold_reset(struct sn201202x *sn)
 static int sn201202x_init(struct sn201202x *sn)
 {
 	struct tps6598x *tps = &sn->cd.tps;
-	unsigned int try;
-	void *group;
+	u32 busy;
 	int ret;
 
-	if (!sn201202x_j714s()) {
-		ret = tipd_init(tps);
+	ret = tipd_cmd_wait_idle(tps, TPS_CMD_MAX_MS, &busy);
+	if (ret) {
+		if (ret == -ETIMEDOUT)
+			dev_warn(tps->dev, "command %.4s from before this boot still running\n",
+				 (char *)&busy);
+		else
+			dev_warn(tps->dev, "command register unreadable: %d\n", ret);
+		ret = sn201202x_cold_reset(sn);
+		dev_info(tps->dev, "controller reset: %d\n", ret);
+		if (!ret)
+			ret = tipd_cmd_wait_idle(tps, TPS_CMD_MAX_MS, NULL);
 		if (ret)
-			cancel_delayed_work_sync(&sn->ldcm_work);
-		return ret;
+			return ret;
 	}
 
-	for (try = 0; try < SN201202X_INIT_TRIES; try++) {
-		group = devres_open_group(tps->dev, NULL, GFP_KERNEL);
-		if (!group)
-			return -ENOMEM;
-		ret = tipd_init(tps);
-		if (!ret) {
-			devres_remove_group(tps->dev, group);
-			if (try)
-				dev_info(tps->dev, "port controller up at try %u\n", try + 1);
-			return 0;
-		}
-		devres_release_group(tps->dev, group);
+	ret = tipd_init(tps);
+	if (ret)
 		cancel_delayed_work_sync(&sn->ldcm_work);
-		if (ret == -EPROBE_DEFER || ret == -ENOMEM)
-			return ret;
-		if (try + 1 == SN201202X_INIT_TRIES)
-			break;
-		dev_warn(tps->dev, "probe try %u failed: %d; trying again\n", try + 1, ret);
-		if (try + 1 == SN201202X_INIT_RESET_AFTER)
-			dev_info(tps->dev, "controller reset before try %u: %d\n", try + 2,
-				 sn201202x_cold_reset(sn));
-		msleep(sn201202x_init_wait_ms[try]);
-		sn201202x_wake(sn);
-	}
-	dev_err(tps->dev, "not up after %u tries and a reset (%d): probe deferred\n",
-		SN201202X_INIT_TRIES, ret);
-	return -EPROBE_DEFER;
+	return ret;
 }
 
 static int sn201202x_probe(struct spmi_device *device)
@@ -970,9 +936,13 @@ static int sn201202x_probe(struct spmi_device *device)
 	tps->data->irq_handler(tps->irq, tps);
 
 	sn201202x_idle_sleep_start(tps);
-	if (sn201202x_sleep_board())
-		dev_info(tps->dev, "port controller ready%s\n", sn->polled ? ", polled" : "");
+	dev_info(tps->dev, "port controller ready%s\n", sn->polled ? ", polled" : "");
 	return 0;
+}
+
+static void sn201202x_shutdown(struct spmi_device *device)
+{
+	tipd_shutdown(spmi_device_get_drvdata(device));
 }
 
 static void sn201202x_remove(struct spmi_device *device)
@@ -1062,7 +1032,7 @@ VISIBLE_IF_KUNIT int __maybe_unused sn201202x_suspend(struct device *dev)
 	tipd_usb_wake(tps, true);
 	reinit_completion(&sn->sleep_completion);
 	err = spmi_command_sleep(sn->sdev);
-	if (pm_suspend_via_firmware() && sn201202x_sleep_board())
+	if (pm_suspend_via_firmware())
 		dev_info(dev, "SLEEP: %d\n", err);
 	if (err)
 		goto out_resume;
@@ -1155,6 +1125,7 @@ static struct spmi_driver sn201202x_driver = {
 	},
 	.probe = sn201202x_probe,
 	.remove = sn201202x_remove,
+	.shutdown = sn201202x_shutdown,
 };
 module_spmi_driver(sn201202x_driver);
 

@@ -127,6 +127,8 @@ static const char *const modes[] = {
 /* Unrecognized commands will be replaced with "!CMD" */
 #define INVALID_CMD(_cmd_)		(_cmd_ == 0x444d4321)
 
+#define TPS_CMD_IDLE_POLL_US		10000
+
 static enum power_supply_property tps6598x_psy_props[] = {
 	POWER_SUPPLY_PROP_USB_TYPE,
 	POWER_SUPPLY_PROP_ONLINE,
@@ -354,16 +356,13 @@ static int tps6598x_disconnect(struct tps6598x *tps, u32 status)
 /*
  * The sleep's rules for the port controllers' system power state command (the controller is
  * woken first, the command's end is read at intervals, a failed S3 refuses the sleep, the
- * command's limit and its lines) apply on the J714s, J716c, J813 and J815.
- * These boards send the command (apple,sleep-ssps) during firmware-driven
- * sleep. Other boards retain the original command behavior.
+ * command's limit and its lines) apply to every controller that sends the command around a
+ * firmware-driven sleep (apple,sleep-ssps, read into tps->sleep_ssps by tipd_init()). Other
+ * controllers retain the original command behavior.
  */
-static bool tipd_sleep_ssps_rules(void)
+static bool tipd_sleep_ssps_rules(const struct tps6598x *tps)
 {
-	return of_machine_is_compatible("apple,j714s") ||
-	       of_machine_is_compatible("apple,j716c") ||
-	       of_machine_is_compatible("apple,j813") ||
-	       of_machine_is_compatible("apple,j815");
+	return tps->sleep_ssps;
 }
 
 /*
@@ -415,15 +414,14 @@ static int tps6598x_exec_cmd_gap(struct tps6598x *tps, const char *cmd,
 			return -EINVAL;
 
 		/*
-		 * Under the sleep's rules a command that has ended has ended, whatever the time
-		 * its last read was made at. Elsewhere a read made past the limit is a timeout,
-		 * as before.
+		 * A command that has ended has ended, whatever the time its last read was made
+		 * at: only a command still running past the limit is a timeout.
 		 */
-		if ((val || !tipd_sleep_ssps_rules()) && time_is_before_jiffies(timeout))
+		if (val && time_is_before_jiffies(timeout))
 			return -ETIMEDOUT;
 		/* A command with a long limit is not waited for in silence: a line each second */
 		if (val && cmd_timeout_ms > 1000 && time_is_before_jiffies(note) &&
-		    tipd_sleep_ssps_rules()) {
+		    tipd_sleep_ssps_rules(tps)) {
 			dev_info(tps->dev, "command %.4s not done after %u ms (limit %u ms)\n", cmd,
 				 jiffies_to_msecs(jiffies - (timeout - msecs_to_jiffies(cmd_timeout_ms))),
 				 cmd_timeout_ms);
@@ -475,6 +473,56 @@ static int tps6598x_exec_cmd(struct tps6598x *tps, const char *cmd,
 	return tps6598x_exec_cmd_tmo(tps, cmd, in_len, in_data,
 				     out_len, out_data, 1000, 0);
 }
+
+/**
+ * tipd_cmd_wait_idle - wait for the controller to end the command it is running
+ * @tps: the controller
+ * @timeout_ms: how long to wait
+ * @busy: if not NULL, set to the command still running at the end, or 0
+ *
+ * The command register holds a command's 4CC until the controller has ended it, and then
+ * reads 0, or "!CMD" for a command it did not know. That is the controller's only report of a
+ * command's end. A command that this driver gave up waiting for, or that a reboot cut short,
+ * keeps running, and the next command written meanwhile is refused (-EBUSY). A read that
+ * fails is taken as the controller still being busy, as a bus with a busy controller on it can
+ * fail reads.
+ *
+ * Return: 0 once the controller is idle, -ETIMEDOUT if a command is still running at the end,
+ * or the error of the last read if the register could not be read until then.
+ */
+int tipd_cmd_wait_idle(struct tps6598x *tps, unsigned int timeout_ms, u32 *busy)
+{
+	unsigned long timeout = jiffies + msecs_to_jiffies(timeout_ms);
+	u32 val = 0;
+	int ret;
+
+	if (busy)
+		*busy = 0;
+	for (;;) {
+		ret = tps6598x_read32(tps, TPS_REG_CMD1, &val);
+		if (!ret && (!val || INVALID_CMD(val)))
+			return 0;
+		if (time_is_before_jiffies(timeout))
+			break;
+		usleep_range(TPS_CMD_IDLE_POLL_US, TPS_CMD_IDLE_POLL_US + TPS_CMD_IDLE_POLL_US / 4);
+	}
+	if (ret)
+		return ret;
+	if (busy)
+		*busy = val;
+	return -ETIMEDOUT;
+}
+EXPORT_SYMBOL_GPL(tipd_cmd_wait_idle);
+
+/*
+ * Write a command without the check that the controller has ended the last one. Only for a
+ * reset of a controller whose last command does not end (see tipd_cmd_wait_idle()).
+ */
+int tipd_cmd_write_busy(struct tps6598x *tps, const char *cmd)
+{
+	return tps6598x_write_4cc(tps, TPS_REG_CMD1, cmd);
+}
+EXPORT_SYMBOL_GPL(tipd_cmd_write_busy);
 
 static int tps6598x_dr_set(struct typec_port *port, enum typec_data_role role)
 {
@@ -1719,17 +1767,12 @@ static int cd321x_prepare(struct tps6598x *tps)
 	cancel_delayed_work_sync(&cd321x->rearm_work);
 
 	/* As macOS does a second or so before the commit, measured on the same controller. */
-	if (pm_suspend_via_firmware() && device_property_read_bool(tps->dev, "apple,sleep-ssps")) {
+	if (pm_suspend_via_firmware() && tipd_sleep_ssps_rules(tps)) {
 		ktime_t start = ktime_get();
 
 		guard(mutex)(&tps->lock);
 		ret = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S3);
-		/* Without the rules: the lines and their levels as they were */
-		if (!tipd_sleep_ssps_rules() && ret)
-			dev_warn(tps->dev, "didn't take system power state S3: %d\n", ret);
-		else if (!tipd_sleep_ssps_rules())
-			dev_dbg(tps->dev, "system power state S3\n");
-		else if (ret)
+		if (ret)
 			dev_warn(tps->dev, "didn't take system power state S3: %d after %lld ms%s\n", ret,
 				 ktime_ms_delta(ktime_get(), start),
 				 sleep_s3_refuse ? ": sleep refused" : "");
@@ -1737,7 +1780,7 @@ static int cd321x_prepare(struct tps6598x *tps)
 			dev_info(tps->dev, "system power state S3 in %lld ms\n",
 				 ktime_ms_delta(ktime_get(), start));
 	}
-	if (ret && sleep_s3_refuse && tipd_sleep_ssps_rules())
+	if (ret && sleep_s3_refuse)
 		return -EBUSY;
 	return 0;
 }
@@ -1916,14 +1959,12 @@ static void cd321x_complete(struct tps6598x *tps)
 		cd321x->pm.setup_pending = true;
 		cd321x->reset_by_cut = true;
 	}
-	if (pm_suspend_via_firmware() && device_property_read_bool(tps->dev, "apple,sleep-ssps")) {
+	if (pm_suspend_via_firmware() && tipd_sleep_ssps_rules(tps)) {
 		ktime_t start = ktime_get();
 		int ret = tps->data->switch_power_state(tps, TPS_SYSTEM_POWER_STATE_S0);
 
 		/* After a sleep or a refused one: never waited for in silence, and never longer */
-		if (!tipd_sleep_ssps_rules())
-			ret = 0;
-		else if (ret)
+		if (ret)
 			dev_warn(tps->dev, "didn't take system power state S0: %d after %lld ms; set up again by its next event\n",
 				 ret, ktime_ms_delta(ktime_get(), start));
 		else
@@ -2395,7 +2436,7 @@ static int cd321x_switch_power_state(struct tps6598x *tps, u8 target_state)
 	 * Under the sleep's rules the command goes to a controller that has just been sent its
 	 * bus's wake command and has answered it, whatever it was doing: woken, read, commanded.
 	 */
-	if (tps->wake && tipd_sleep_ssps_rules()) {
+	if (tps->wake && tipd_sleep_ssps_rules(tps)) {
 		ret = tps->wake(tps);
 		if (ret)
 			return ret;
@@ -2413,13 +2454,13 @@ static int cd321x_switch_power_state(struct tps6598x *tps, u8 target_state)
 	 * the sleep's rules. Under them S0 and S3 have the sleep's own limit and are read with
 	 * gaps.
 	 */
-	if ((target_state == TPS_SYSTEM_POWER_STATE_S0 || tipd_sleep_ssps_rules()) &&
+	if ((target_state == TPS_SYSTEM_POWER_STATE_S0 || tipd_sleep_ssps_rules(tps)) &&
 	    device_is_compatible(tps->dev, "apple,sn201202x"))
 		ret = tps6598x_exec_cmd_gap(tps, "SSPS", sizeof(target_state),
 					  &target_state, 0, NULL,
-					  tipd_sleep_ssps_rules() ?
+					  tipd_sleep_ssps_rules(tps) ?
 					  clamp(sleep_ssps_ms, 1000U, 5000U) : 5000, 0,
-					  tipd_sleep_ssps_rules() ? CD321X_SSPS_READ_GAP_US : 0);
+					  tipd_sleep_ssps_rules(tps) ? CD321X_SSPS_READ_GAP_US : 0);
 	else
 		ret = tps6598x_exec_cmd(tps, "SSPS", sizeof(target_state),
 				      &target_state, 0, NULL);
@@ -2728,6 +2769,21 @@ VISIBLE_IF_KUNIT int cd321x_tbt_watch_late(struct cd321x *cd321x,
 	return 0;
 }
 EXPORT_SYMBOL_IF_KUNIT(cd321x_tbt_watch_late);
+
+/*
+ * At shutdown: no worker runs again, so none sends the controller a command. Unlike
+ * cd321x_stop_work(), the Thunderbolt and display notifiers stay registered: what they queue
+ * is dropped, and the routes are left as they are.
+ */
+static void cd321x_shutdown(struct tps6598x *tps)
+{
+	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
+
+	disable_work_sync(&cd321x->tbt_attach_work);
+	disable_delayed_work_sync(&cd321x->resume_work);
+	disable_delayed_work_sync(&cd321x->update_work);
+	disable_delayed_work_sync(&cd321x->rearm_work);
+}
 
 /* Separate so that the KUnit tests can drive the workers without a port. */
 VISIBLE_IF_KUNIT void cd321x_init_work(struct cd321x *cd321x)
@@ -3489,6 +3545,7 @@ int tipd_init(struct tps6598x *tps)
 		return -EPROBE_DEFER;
 
 	dev_dbg(tps->dev, "Type-C probe start\n");
+	tps->sleep_ssps = device_property_read_bool(tps->dev, "apple,sleep-ssps");
 	tps->reset = devm_gpiod_get_optional(tps->dev, "reset", GPIOD_OUT_LOW);
 	if (IS_ERR(tps->reset))
 		return dev_err_probe(tps->dev, PTR_ERR(tps->reset),
@@ -3785,6 +3842,38 @@ void tipd_usb_wake(struct tps6598x *tps, bool asleep)
 }
 EXPORT_SYMBOL_GPL(tipd_usb_wake);
 
+/*
+ * Leave the controller idle for the next boot. A command the controller is still running when
+ * the system restarts is still running when the next kernel probes it: on a J714s an LDCM ran
+ * for more than three seconds after a soft reboot, the bus reported frames that failed their
+ * parity check meanwhile, and the probe failed. Stop the interrupt and the workers, the only
+ * senders of commands once user space is gone, and wait under the device lock, so that no
+ * command of this driver is in flight, for the controller to end the one it runs. The port, its
+ * mux and its USB role are left as they are.
+ */
+void tipd_shutdown(struct tps6598x *tps)
+{
+	u32 busy;
+	int ret;
+
+	if (tps->irq)
+		disable_irq(tps->irq);
+	else
+		disable_delayed_work_sync(&tps->wq_poll);
+	if (tps->contaminant_ops)
+		tps->contaminant_ops->stop(tps);
+	if (tps->data->shutdown)
+		tps->data->shutdown(tps);
+
+	scoped_guard(mutex, &tps->lock)
+		ret = tipd_cmd_wait_idle(tps, TPS_CMD_MAX_MS, &busy);
+	if (ret == -ETIMEDOUT)
+		dev_warn(tps->dev, "command %.4s still running at shutdown\n", (char *)&busy);
+	else if (ret)
+		dev_warn(tps->dev, "command register unreadable at shutdown: %d\n", ret);
+}
+EXPORT_SYMBOL_GPL(tipd_shutdown);
+
 int tipd_suspend(struct tps6598x *tps)
 {
 	if (tps->wakeup) {
@@ -3885,6 +3974,7 @@ static const struct tipd_data tipd_cd321x_data = {
 	.connect = cd321x_connect,
 	.prepare = cd321x_prepare,
 	.complete = cd321x_complete,
+	.shutdown = cd321x_shutdown,
 };
 
 static const struct tipd_data tipd_tps6598x_data = {
@@ -3966,6 +4056,7 @@ static const struct tipd_data tipd_sn201202x_data = {
 	.connect = cd321x_connect,
 	.prepare = cd321x_prepare,
 	.complete = cd321x_complete,
+	.shutdown = cd321x_shutdown,
 };
 
 const struct tipd_data *tipd_hw_variants[] = {
