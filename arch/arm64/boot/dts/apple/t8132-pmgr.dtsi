@@ -901,6 +901,8 @@
 		#reset-cells = <0>;
 		label = "sep";
 		apple,always-on;
+		/* Only named: the sleep's last refusal reads its state to see the enclave gate. */
+		apple,firmware-owned;
 	};
 
 	/* The ISP's own power states, children of ISP_SYS */
