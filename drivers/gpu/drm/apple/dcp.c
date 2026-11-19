@@ -6178,9 +6178,20 @@ clocks:
 	if (!of_property_present(dev->of_node, "apple,clock-ids") &&
 	    of_device_is_compatible(dev->of_node, "apple,t6041-dcpext"))
 		return 0;
+	/*
+	 * An M1/M2/M3 device tree has no apple,clock-ids: the ADT lists no DCP
+	 * firmware clocks, but the firmware-27 DCP still asks for clock index 0,
+	 * the display clock (getClockFrequency(0)). Give it the node's clocks.
+	 */
+	if (!of_property_present(dev->of_node, "apple,clock-ids")) {
+		ret = devm_clk_bulk_get_all(dev, &dcp->firmware_clocks);
+		if (ret < 0)
+			return ret;
+		dcp->num_firmware_clocks = ret;
+		return 0;
+	}
 	clocks = of_property_count_u32_elems(dev->of_node, "apple,clock-ids");
-	if (clocks == -ENODATA &&
-	    of_property_present(dev->of_node, "apple,clock-ids"))
+	if (clocks == -ENODATA)
 		clocks = 0;
 	if (clocks < 0 || clocks > 64)
 		return -EINVAL;
