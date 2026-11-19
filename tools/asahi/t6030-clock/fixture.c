@@ -30,6 +30,7 @@ typedef uint64_t u64;
 /* REGISTER_DEFINES */
 struct atcphy_hw {
 	enum atcphy_generation gen;
+	bool t8122_tunnel_clock;
 };
 struct apple_atcphy {
 	const struct atcphy_hw *hw;
@@ -85,6 +86,11 @@ static const char *machine = "apple,t6030";
 static bool of_machine_is_compatible(const char *s)
 {
 	return !strcmp(s, machine);
+}
+/* The display processors of the modeled machine have its compatible. */
+static bool dcp_is_t6030_fabric(const struct apple_dcp *dcp)
+{
+	return !strcmp(machine, "apple,t6030");
 }
 static void atcphy_restore_after_pd_off(struct apple_atcphy *p)
 {
@@ -249,7 +255,8 @@ int main(int argc, char **argv)
 			       apple_dp_tunnel_t6030_pclk(source, dpin));
 	u8 regs[0x10000] = { 0 };
 	registers = regs;
-	struct atcphy_hw hw = { .gen = ATCPHY_GENERATION_T8122 };
+	/* The T6030 PHY's match data (apple,t6030-atcphy). */
+	struct atcphy_hw hw = { .gen = ATCPHY_GENERATION_T8122, .t8122_tunnel_clock = true };
 	struct apple_atcphy d = { .hw = &hw,
 				  .regs.core = regs,
 				  .mode = APPLE_ATCPHY_MODE_USB4 };
@@ -276,7 +283,9 @@ int main(int argc, char **argv)
 		return 0;
 	}
 	if (!strcmp(name, "wrong-generation")) {
+		/* Another PHY's match data: no T8122 tunnel clock. */
 		hw.gen = ATCPHY_GENERATION_T8103;
+		hw.t8122_tunnel_clock = false;
 		assert(clock_call(&phy, 0, 0, 0x14) == -EOPNOTSUPP && !writes);
 		return 0;
 	}
