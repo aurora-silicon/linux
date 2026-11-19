@@ -229,10 +229,6 @@ impl Scene::ver {
     /// Returns the GPU pointer to the clustering layer metadata buffer, if clustering is enabled.
     #[allow(dead_code)]
     pub(crate) fn tvb_cluster_layermeta_pointer(&self) -> Option<GpuPointer<'_, &'_ [u8]>> {
-        if debug_enabled(DebugFlags::NullClusterLayerMeta) {
-            return None;
-        }
-
         self.object
             .clustering
             .as_ref()
@@ -614,7 +610,19 @@ impl Buffer::ver {
         let clustering = if inner.num_clusters > 1 {
             let cfg = inner.cfg.clustering.as_ref().unwrap();
 
-            clmeta_size = tile_info.layermeta_size * cfg.max_splits;
+            // REFFLAKE3 test (default off, debug bit 50): a single-layer pass has
+            // layermeta_size == 0, so the cluster layer metadata prefix is empty and
+            // tvb_cluster_layermeta points at the start of meta1. Reserve a real
+            // per-split prefix (the layered size) so the two never alias.
+            #[ver(G < G14)]
+            let cl_layermeta_size = if debug_enabled(DebugFlags::ClusterLayerMetaPrefix) {
+                tile_info.layermeta_size.max(0x100)
+            } else {
+                tile_info.layermeta_size
+            };
+            #[ver(G >= G14)]
+            let cl_layermeta_size = tile_info.layermeta_size;
+            clmeta_size = cl_layermeta_size * cfg.max_splits;
             // Maybe: (4x4 macro tiles + 1 global page)*n, 32bit each (17*4*n)
             // Unused on t602x?
             meta1_size = align(tile_info.meta1_blocks as usize * cfg.meta1_blocksize, 0x80);
