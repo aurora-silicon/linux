@@ -116,11 +116,16 @@ static struct cpuidle_driver apple_idle_driver = {
 		 * instead of 3204 MHz. 100 us is where the grant and the idle
 		 * cluster power stop improving on T8112; shorter only adds
 		 * wake latency.
+		 *
+		 * The exit latency is the measured cost of waking from this
+		 * state over WFI: on T8112 the cyclictest p99 delta was 13-17 us
+		 * on a P core and 18-26 us on an E core. PM QoS and the
+		 * governor's latency limit compare against it.
 		 */
 		[STATE_PWRDOWN] = {
 			.enter			= apple_enter_idle,
 			.enter_s2idle		= apple_enter_idle,
-			.exit_latency		= 10,
+			.exit_latency		= 30,
 			.target_residency	= 100,
 			.power_usage            = 0,
 			.name			= "CPU PD",
