@@ -136,6 +136,9 @@ struct apple_smc {
 	u64 saved_unexpected;
 	/* To be told at the noirq suspend, after the debug link's cut. */
 	bool sleep_warn_late;
+	/* The SMC takes WKTP: a sleep writes 2 before its notices, the wake a 0 after it. */
+	bool wktp;
+	bool wake_silent;
 	/* In a noirq phase: replies are polled for. */
 	bool polled;
 	/* MBSW at the last wake: what the SMC had woken the AP for. */
