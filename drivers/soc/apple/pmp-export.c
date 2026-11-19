@@ -84,7 +84,6 @@ int apple_pmp_set_device_power(u8 command, u16 device_id, u32 enabled)
 	/* T6030 needs both the RTKit power vote and the PTD bandwidth report. */
 	report_gfx = IS_ENABLED(CONFIG_APPLE_T6030_GPU_PMP_LINK) &&
 		     command == 0x0f && device_id == 5 &&
-		     of_machine_is_compatible("apple,t6030") &&
 		     of_device_is_compatible(pmp_device->of_node, "apple,t6030-pmp-v2");
 	if (report_gfx) {
 		ret = apple_pmp_report_check_t6030_gfx(pmp_device);
