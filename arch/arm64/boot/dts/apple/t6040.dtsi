@@ -306,6 +306,8 @@
 		 * power words (ps_ans, ps_apcie_st0/st1, ps_apcie_sys_st0/st1) are in
 		 * SOC-East and are driven through the soc-east window.
 		 */
+		apple,pinctrl = <&pinctrl>;
+		apple,pinctrl-skip-pins = <190 191 192>;
 		/* Only on a board whose sleep has been tested. */
 		status = "disabled";
 	};
