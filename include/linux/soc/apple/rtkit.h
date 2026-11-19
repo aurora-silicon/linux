@@ -400,8 +400,9 @@ int apple_rtkit_power_cycled_return(struct apple_rtkit *rtk, void __iomem *cpu_c
 int apple_rtkit_sleep_return_start(struct apple_rtkit *rtk, void __iomem *cpu_control);
 
 /*
- * Echo each OSLOG channel-0 counter the firmware sends, as macOS does. On by default on
- * T8140, where a firmware with one outstanding takes no AP power notice.
+ * Echo each OSLOG channel-0 counter the firmware sends, as macOS does, or drop them. On by
+ * default (off on a node with apple,sync-syslog-ack): a firmware with one outstanding
+ * takes no AP power notice.
  */
 void apple_rtkit_set_oslog_echo(struct apple_rtkit *rtk, bool echo);
 

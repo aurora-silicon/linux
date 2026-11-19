@@ -277,7 +277,7 @@ ASAHI_TESTS = {
         + mutations('--mutation', ('buffer-header', 'section-header', 'section-size', 'footer-room',
                                    'mailbox-minimum', 'version-string', 'message-string'), out()),
     'rtkit-oslog-tests.py': [(out(), PASS)]
-        + mutations('--mutate', ('admission', 'channel', 'counter', 'reset', 'buffer'), out()),
+        + mutations('--mutate', ('owed', 'policy', 'counter', 'reset', 'buffer'), out()),
     'rtkit-retained-tests.py': [(out(), PASS)],
     't6030-clock-tests.py': [(out(), PASS)],
     't6030-display-admission-tests.py': [(out('--output'), PASS), (out('--output') + ['--mutations'], PASS)],
