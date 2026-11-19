@@ -9,11 +9,14 @@
 //! Policy creation and the initial snapshot take the policy rwsem before the
 //! requests mutex. Removal callbacks and the worker take only requests;
 //! notifier unregistration joins callbacks without holding that mutex.
-//! M5 requests full CPU capacity only while refill pressure keeps the detector
-//! active. Sustained demand can renew its deadline indefinitely; withdrawal
-//! occurs on a later worker poll, not at an exact eight-millisecond boundary.
+//! The floor and the hints it drives are one [`Policy`] per GPU generation.
+//! Sustained demand can renew the deadline indefinitely; withdrawal occurs on a
+//! later worker poll, not at an exact eight-millisecond boundary.
+//!
+//! Pass intervals are firmware command timestamps, which count the SoC's
+//! architected system counter (CNTFRQ_EL0); the detector takes that rate at
+//! creation and keeps its thresholds in time.
 
-use crate::hw::t8140::qos::CLOCK_HZ;
 use core::{
     pin::Pin,
     sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
@@ -29,20 +32,66 @@ use core::ptr;
 #[cfg(CONFIG_CPU_FREQ)]
 use kernel::{bindings, new_mutex, sync::Mutex, types::Opaque};
 
-const MAX_REFILL_TICKS: u64 = CLOCK_HZ / 500;
-const _: () = assert!(CLOCK_HZ == crate::hw::t8140::resources::COMMAND_TIMESTAMP_HZ);
+/// The longest gap between one pass's end and the next one's start that still counts as a
+/// refill is 1/500 s (2 ms).
+const MAX_REFILL_PER_SEC: u64 = 500;
 const STREAK_ON: u32 = 8;
 const STREAK_MAX: u32 = 64;
 const LINGER_NS: u64 = 8_000_000;
 const POLL_MS: i64 = 2;
 #[cfg(CONFIG_CPU_FREQ)]
-const FLOOR_PERCENT: u64 = 50;
-const WAIT_UTIL_MIN: u32 = 512;
-const WAIT_HINT_MS: u32 = 8;
-#[cfg(CONFIG_CPU_FREQ)]
 const MAX_POLICIES: usize = 8;
 
+/// What the feed does on one GPU generation. Every value cites where it was measured; a
+/// generation without its own measurement of a value takes [`Policy::DEFAULT`]'s.
+pub(crate) struct Policy {
+    /// CPU frequency floor while host refills bound the GPU, in percent of each cpufreq
+    /// policy's top frequency.
+    floor_percent: u64,
+    /// Capacity hint for the submitter's syncobj waits while the floor is applied, and how
+    /// long it stays valid after each submission (`Gpu::syncobj_wait_hint`).
+    wait_util_min: u32,
+    wait_hint_ms: u32,
+    /// Minimum utilization of the completion receive thread while the GPU itself is the
+    /// bottleneck (`Feed::gpu_bound`), or None to keep the thread at the RT default.
+    gpu_bound_rx_util_min: Option<u32>,
+}
+
+impl Policy {
+    /// The G17P policy. Measured on the A18 Pro (J700); every other G17P SoC (the M4 family)
+    /// has no measurement of its own and uses it unchanged.
+    pub(crate) const DEFAULT: Self = Self {
+        // Half of each cluster's top frequency: the original feed policy, developed on J700
+        // (commit "drm/asahi: request temporary CPU capacity for sustained GPU feeds").
+        floor_percent: 50,
+        // Half of the capacity scale for 8 ms, from the same commit; on G13/G14 the same hint
+        // was measured on an M2 (commit "drm/asahi: hint CPU capacity for G13/G14 syncobj
+        // waits").
+        wait_util_min: 512,
+        wait_hint_ms: 8,
+        // Measured on J700 (commit "drm/asahi: g17: drop the completion thread's frequency
+        // boost while the GPU is the bottleneck"): heavy render/compute rows 1.7-3.3% faster,
+        // 0.4-0.5 W less; 512 left idle.wake 5% slower after a pause and 0 cost one
+        // completion per 250 ms on single-submit heavy compute.
+        gpu_bound_rx_util_min: Some(256),
+    };
+
+    /// The M5 policy (M5 protocol firmware, J714/J716C/J775D/J813).
+    pub(crate) const M5: Self = Self {
+        // The full refill floor, carried from the M5 bring-up (commit "drm/asahi: g17: M5:
+        // submit compute on M5 queues").
+        floor_percent: 100,
+        // The receive thread keeps its default: on the M5 Ultra (J775D) completions handled
+        // at a lowered clock were slow (commit "drm/asahi: g17: M5: Fix M5 GPU completions
+        // being handled at a lowered CPU clock").
+        gpu_bound_rx_util_min: None,
+        ..Self::DEFAULT
+    };
+}
+
 struct Detector {
+    /// [`MAX_REFILL_PER_SEC`] in counter ticks; 0 (no counter rate) never detects a refill.
+    max_refill_ticks: u64,
     last_end: AtomicU64,
     idle: AtomicU64,
     busy: AtomicU64,
@@ -56,8 +105,9 @@ struct Detector {
 }
 
 impl Detector {
-    const fn new() -> Self {
+    const fn new(counter_hz: u64) -> Self {
         Self {
+            max_refill_ticks: counter_hz / MAX_REFILL_PER_SEC,
             last_end: AtomicU64::new(0),
             idle: AtomicU64::new(0),
             busy: AtomicU64::new(0),
@@ -88,7 +138,7 @@ impl Detector {
             (0, end - start, true)
         } else if start >= previous {
             let gap = start - previous;
-            if gap < MAX_REFILL_TICKS {
+            if gap < self.max_refill_ticks {
                 (gap, end - start, false)
             } else {
                 (0, end - start, true)
@@ -145,7 +195,7 @@ struct Requests {
     policies: [*mut bindings::cpufreq_policy; MAX_POLICIES],
     maxima: [u32; MAX_POLICIES],
     applied: [u32; MAX_POLICIES],
-    /// Full CPU capacity for M5 refill pressure; other profiles retain their floor.
+    /// [`Policy::floor_percent`].
     floor_percent: u64,
 }
 
@@ -156,13 +206,13 @@ unsafe impl Send for Requests {}
 
 #[cfg(CONFIG_CPU_FREQ)]
 impl Requests {
-    fn new(m5: bool) -> Self {
+    fn new(floor_percent: u64) -> Self {
         Self {
             requests: Opaque::zeroed(),
             policies: [ptr::null_mut(); MAX_POLICIES],
             maxima: [0; MAX_POLICIES],
             applied: [0; MAX_POLICIES],
-            floor_percent: if m5 { 100 } else { FLOOR_PERCENT },
+            floor_percent,
         }
     }
 
@@ -294,6 +344,7 @@ unsafe impl Sync for PolicyNotifier {}
 
 #[pin_data(PinnedDrop)]
 pub(crate) struct Feed {
+    policy: &'static Policy,
     detector: Detector,
     #[cfg(CONFIG_CPU_FREQ)]
     #[pin]
@@ -307,14 +358,14 @@ pub(crate) struct Feed {
 }
 
 impl Feed {
-    pub(crate) fn new(m5: bool) -> Result<Arc<Self>> {
-        #[cfg(not(CONFIG_CPU_FREQ))]
-        let _ = m5;
+    /// `counter_hz` is the rate of the firmware command timestamps passed to [`Feed::note_pass`].
+    pub(crate) fn new(policy: &'static Policy, counter_hz: u64) -> Result<Arc<Self>> {
         let feed = Arc::pin_init(
             pin_init!(Self {
-                detector: Detector::new(),
+                policy,
+                detector: Detector::new(counter_hz),
                 #[cfg(CONFIG_CPU_FREQ)]
-                requests <- new_mutex!(Requests::new(m5), "G17 CPU feed"),
+                requests <- new_mutex!(Requests::new(policy.floor_percent), "G17 CPU feed"),
                 #[cfg(CONFIG_CPU_FREQ)]
                 notifier <- pin_init!(PolicyNotifier {
                     block: Opaque::new(bindings::notifier_block {
@@ -435,7 +486,7 @@ impl Feed {
         Monotonic::ktime_get() as u64
     }
 
-    /// Firmware execution intervals in the device's 24 MHz timestamp domain.
+    /// Firmware execution intervals in system counter ticks.
     /// Missing, unexecuted and wrapped intervals must not affect the detector.
     pub(crate) fn note_pass(&self, start: u64, end: u64) {
         if cfg!(CONFIG_CPU_FREQ) {
@@ -446,6 +497,12 @@ impl Feed {
     /// Whether the GPU itself is the bottleneck: passes follow each other with refill gaps
     /// under a quarter of their busy time, and the feed does not see host-refill-bound work.
     /// Lingers like streaming, so a pause of more than a few milliseconds ends it.
+    /// The receive thread's minimum utilization while [`Feed::gpu_bound`], if this generation
+    /// sets one.
+    pub(crate) fn gpu_bound_rx_util_min(&self) -> Option<u32> {
+        self.policy.gpu_bound_rx_util_min
+    }
+
     pub(crate) fn gpu_bound(&self) -> bool {
         if !cfg!(CONFIG_CPU_FREQ) {
             return false;
@@ -496,7 +553,7 @@ impl Feed {
             && self.detector.wanted(Self::now())
             && self.applied.load(Ordering::Relaxed)
         {
-            Some((WAIT_UTIL_MIN, WAIT_HINT_MS))
+            Some((self.policy.wait_util_min, self.policy.wait_hint_ms))
         } else {
             None
         }
@@ -541,6 +598,10 @@ impl PinnedDrop for Feed {
 mod detector_tests {
     use super::*;
 
+    /// The 24 MHz system counter of the Apple SoCs.
+    const CLOCK_HZ: u64 = 24_000_000;
+    const MAX_REFILL_TICKS: u64 = CLOCK_HZ / MAX_REFILL_PER_SEC;
+
     /// Notes `passes` passes of `busy` ticks, each `gap` ticks after the previous, 1 ms apart.
     fn run(detector: &Detector, passes: u64, busy: u64, gap: u64) -> u64 {
         let mut start = 1000;
@@ -555,7 +616,7 @@ mod detector_tests {
 
     #[test]
     fn back_to_back_long_passes_are_gpu_bound() {
-        let detector = Detector::new();
+        let detector = Detector::new(CLOCK_HZ);
         // 2 ms passes with 40 us refill gaps, as a deep heavy queue or a heavy row at depth 1.
         let now = run(&detector, 16, CLOCK_HZ / 500, CLOCK_HZ / 25_000);
         assert!(detector.bound(now));
@@ -565,7 +626,7 @@ mod detector_tests {
 
     #[test]
     fn refill_gaps_stream_instead() {
-        let detector = Detector::new();
+        let detector = Detector::new(CLOCK_HZ);
         // 20 us passes with 60 us refill gaps: bound by host refills.
         let now = run(&detector, 16, CLOCK_HZ / 50_000, CLOCK_HZ / 16_667);
         assert!(detector.wanted(now));
@@ -574,12 +635,12 @@ mod detector_tests {
 
     #[test]
     fn paced_or_short_runs_are_neither() {
-        let detector = Detector::new();
+        let detector = Detector::new(CLOCK_HZ);
         // Each pass starts after a pause of at least the refill limit.
         let now = run(&detector, 16, CLOCK_HZ / 500, MAX_REFILL_TICKS);
         assert!(!detector.bound(now) && !detector.wanted(now));
         // Fewer back-to-back passes than the streak needs.
-        let detector = Detector::new();
+        let detector = Detector::new(CLOCK_HZ);
         let now = run(&detector, u64::from(STREAK_ON) - 1, CLOCK_HZ / 500, 0);
         assert!(!detector.bound(now) && !detector.wanted(now));
     }
