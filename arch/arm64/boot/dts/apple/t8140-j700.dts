@@ -623,6 +623,23 @@
 };
 
 &dcp {
+	/*
+	 * The panel's power lookup table, as disp0 in the ADT has it: the
+	 * display firmware asks for it through its provider callback. The
+	 * loader may replace it with the ADT's own copy.
+	 */
+	apple,power-lut-data-x = [0d 00 00 00];
+	apple,power-lut-data-y = [01 00 00 00];
+	apple,power-lut-data-xindex = [02 00 00 00 0a 00 00 00 32 00 00 00 64 00 00 00
+	                               96 00 00 00 c8 00 00 00 fa 00 00 00 2c 01 00 00
+	                               5e 01 00 00 90 01 00 00 c2 01 00 00 f4 01 00 00
+	                               0d 02 00 00];
+	apple,power-lut-data-yindex = [64 00 00 00];
+	apple,power-lut-data-lut = [34 03 00 00 84 03 00 00 24 05 00 00 52 07 00 00
+	                            11 09 00 00 de 0a 00 00 d2 0c 00 00 e2 0e 00 00
+	                            fb 10 00 00 64 13 00 00 d5 15 00 00 68 18 00 00
+	                            a2 19 00 00];
+
 	/* 2408x1506 at 219 ppi; 525 nits peak from the backlight node */
 	panel: panel {
 		compatible = "apple,panel-j700", "apple,panel";
@@ -2206,6 +2223,18 @@
 };
 
 &dcpext {
+	/* The external firmware asks for the same table as the internal one. */
+	apple,power-lut-data-x = [0d 00 00 00];
+	apple,power-lut-data-y = [01 00 00 00];
+	apple,power-lut-data-xindex = [02 00 00 00 0a 00 00 00 32 00 00 00 64 00 00 00
+	                               96 00 00 00 c8 00 00 00 fa 00 00 00 2c 01 00 00
+	                               5e 01 00 00 90 01 00 00 c2 01 00 00 f4 01 00 00
+	                               0d 02 00 00];
+	apple,power-lut-data-yindex = [64 00 00 00];
+	apple,power-lut-data-lut = [34 03 00 00 84 03 00 00 24 05 00 00 52 07 00 00
+	                            11 09 00 00 de 0a 00 00 d2 0c 00 00 e2 0e 00 00
+	                            fb 10 00 00 64 13 00 00 d5 15 00 00 68 18 00 00
+	                            a2 19 00 00];
 	clocks = <&clk_disp0_154>, <&clk_disp0_194>;
 	clock-names = "clock-154", "clock-194";
 	phys = <&atcphy0 PHY_TYPE_DP>;

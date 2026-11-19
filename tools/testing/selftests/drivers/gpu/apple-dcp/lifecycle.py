@@ -1346,17 +1346,6 @@ typedef uint32_t __le32;
 struct device_node { bool internal, external, present; int length; };
 struct device { struct device_node *of_node; };
 struct apple_dcp { struct { int iomfb_method_profile; } hw; struct device *dev; bool crashed; };
-static bool j700 = true;
-static bool of_machine_is_compatible(const char *name)
-{
-	assert(!strcmp(name, "apple,j700"));
-	return j700;
-}
-static bool of_device_is_compatible(struct device_node *n, const char *name)
-{
-	return (!strcmp(name, "apple,t8140-dcp") && n->internal) ||
-	       (!strcmp(name, "apple,t8140-dcpext") && n->external);
-}
 static bool of_property_present(struct device_node *n, const char *name)
 {
 	(void)name;
@@ -1391,28 +1380,42 @@ int main(void)
 	struct dcp_h17p_provider_request req = { .scope = { 'V', 'O', 'R', 'P' }, .capacity = 0xc00 };
 	struct dcp_h17p_provider_reply reply;
 	unsigned int cases = 0;
+	/* No device tree data: only the empty property has a reply. */
 	for (unsigned int i = 0; i < ARRAY_SIZE(provider_properties); i++) {
+		bool ok;
+
 		memset(&reply, 0xff, sizeof(reply));
 		strcpy(req.name, provider_properties[i].name);
-		assert(trampoline_provider_property_h17p(&dcp, 400, &reply, &req));
-		assert(!dcp.crashed && reply.length == provider_properties[i].length);
-		if (reply.length)
-			assert(!memcmp(reply.data, provider_properties[i].legacy_data, reply.length));
+		dcp.crashed = false;
+		ok = trampoline_provider_property_h17p(&dcp, 400, &reply, &req);
+		assert(ok == !provider_properties[i].length && dcp.crashed == !ok);
+		if (ok)
+			assert(reply.length == 0);
 		cases++;
 	}
+	/* Device tree data of the exact length is sent, on either processor. */
+	for (unsigned int i = 0; i < ARRAY_SIZE(provider_properties); i++) {
+		if (!provider_properties[i].length)
+			continue;
+		node.present = true; node.length = provider_properties[i].length;
+		for (int profile = 0; profile < 2; profile++) {
+			node.internal = !profile; node.external = profile;
+			dcp.hw.iomfb_method_profile = profile ? 2 : 0;
+			dcp.crashed = false;
+			strcpy(req.name, provider_properties[i].name);
+			assert(trampoline_provider_property_h17p(&dcp, 400, &reply, &req) && !dcp.crashed);
+			assert(reply.length == provider_properties[i].length && reply.data[0] == 0x5a);
+			cases++;
+		}
+	}
+	/* A present property of another length, or an empty one that is present, fails. */
 	strcpy(req.name, "power-lut-data-x");
-	j700 = false;
+	node.length = 3; dcp.crashed = false;
 	assert(!trampoline_provider_property_h17p(&dcp, 400, &reply, &req) && dcp.crashed);
-	j700 = true; dcp.crashed = false; dcp.hw.iomfb_method_profile = 3;
+	strcpy(req.name, "power-lut-vbatt-cur-nominal");
+	node.length = 0; dcp.crashed = false;
 	assert(!trampoline_provider_property_h17p(&dcp, 400, &reply, &req) && dcp.crashed);
-	node.external = false; node.internal = true; dcp.crashed = false;
-	assert(trampoline_provider_property_h17p(&dcp, 400, &reply, &req) && !dcp.crashed);
-	node.internal = false; node.external = true; node.present = true; node.length = 3;
-	dcp.hw.iomfb_method_profile = 2; dcp.crashed = false;
-	assert(!trampoline_provider_property_h17p(&dcp, 400, &reply, &req) && dcp.crashed);
-	node.length = 4; dcp.crashed = false;
-	assert(trampoline_provider_property_h17p(&dcp, 400, &reply, &req) && !dcp.crashed);
-	assert(reply.length == 4 && reply.data[0] == 0x5a);
+	node.present = false;
 	strcpy(req.name, "unqualified-property");
 	assert(!trampoline_provider_property_h17p(&dcp, 400, &reply, &req));
 	printf("PASS %u provider payloads and scope/length rejection cases\n", cases);
