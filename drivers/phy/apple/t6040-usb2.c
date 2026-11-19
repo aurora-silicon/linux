@@ -174,6 +174,14 @@
 #define T6040_CPU_EP_APP		32
 #define T6040_CPU_MSG_POWER_DOWN	0x0100000000000000ULL
 
+/*
+ * A coprocessor that did not acknowledge Power Down, did not stop cleanly or
+ * did not tune the PHY gets its domains power-cycled and one more complete
+ * bring-up. Why it gets into that state is not known yet, see
+ * https://github.com/aurora-silicon/linux/issues/2315: every step is logged,
+ * and debugfs counts the recoveries, so that the retry does not hide how often
+ * it happens.
+ */
 #define T6040_RECOVERY_RETRIES		1
 
 static unsigned int recovery_dwell_ms = 50;
@@ -181,9 +189,16 @@ module_param(recovery_dwell_ms, uint, 0644);
 MODULE_PARM_DESC(recovery_dwell_ms,
 		 "PHY coprocessor hard-recovery off dwell in milliseconds (minimum 1, default 50)");
 
+/*
+ * @hard_recoveries: domain power cycles started, @retried: bring-ups tried
+ * again, @exhausted: bring-ups that failed with no retry left
+ */
 struct t6040_recovery_state {
 	bool cycle_pending;
 	u8 retries;
+	u32 hard_recoveries;
+	u32 retried;
+	u32 exhausted;
 };
 
 static void t6040_recovery_power_down(struct t6040_recovery_state *state,
@@ -202,9 +217,12 @@ static bool t6040_recovery_start(struct t6040_recovery_state *state)
 static bool t6040_recovery_retry(struct t6040_recovery_state *state)
 {
 	state->cycle_pending = true;
-	if (state->retries >= T6040_RECOVERY_RETRIES)
+	if (state->retries >= T6040_RECOVERY_RETRIES) {
+		state->exhausted++;
 		return false;
+	}
 	state->retries++;
+	state->retried++;
 	return true;
 }
 
@@ -831,6 +849,7 @@ static int t6040_usb3_hard_recover(struct t6040_usb2_phy *tphy)
 
 	if (WARN_ON(tphy->rtk))
 		t6040_rtkit_stop_transport(tphy);
+	tphy->recovery.hard_recoveries++;
 
 	ret = pm_runtime_force_suspend(tphy->dev);
 	if (ret < 0)
@@ -2176,6 +2195,11 @@ static int t6040_debugfs_init(struct t6040_usb2_phy *tphy)
 	}
 	debugfs_create_atomic_t("drop_next_power_down_ack", 0600, tphy->debugfs,
 				&tphy->drop_next_power_down_ack);
+	debugfs_create_u32("hard_recoveries", 0400, tphy->debugfs,
+			   &tphy->recovery.hard_recoveries);
+	debugfs_create_u32("bringup_retries", 0400, tphy->debugfs, &tphy->recovery.retried);
+	debugfs_create_u32("bringup_retries_exhausted", 0400, tphy->debugfs,
+			   &tphy->recovery.exhausted);
 	ret = devm_add_action_or_reset(tphy->dev, t6040_debugfs_remove, tphy->debugfs);
 	if (ret)
 		tphy->debugfs = NULL;
