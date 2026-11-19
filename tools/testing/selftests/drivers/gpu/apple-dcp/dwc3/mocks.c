@@ -76,12 +76,18 @@ static void regulator_disable(int p)
 {
 	assert(!p);
 }
+/* include/uapi/linux/usb/ch9.h: UNKNOWN is 0, so zeroed fixtures save no speed. */
+enum usb_device_speed {
+	USB_SPEED_UNKNOWN, USB_SPEED_LOW, USB_SPEED_FULL, USB_SPEED_HIGH,
+	USB_SPEED_WIRELESS, USB_SPEED_SUPER, USB_SPEED_SUPER_PLUS,
+};
 struct dwc3 {
 	struct phy *usb2_generic_phy[3], *usb3_generic_phy[3];
 	int num_usb2_ports, num_usb3_ports, usb2_phy, usb3_phy;
 	struct reset_controller_dev *reset;
 	int dev, usb_psy, vbus_draw_work, dr_mode, current_dr_role;
 	bool dis_u3_susphy_quirk;
+	enum usb_device_speed maximum_speed;
 	struct { void *notifier_call; } psy_nb;
 };
 struct dwc3_apple {
@@ -115,6 +121,8 @@ struct dwc3_apple {
 	 */
 	bool sleep_tunnel;
 	enum usb_role sleep_tunnel_role;
+	/* The controller maximum saved by a high-speed gadget clamp; UNKNOWN here. */
+	enum usb_device_speed maximum_speed;
 };
 /* The epoch spinlock: taken only when free, released only when held. */
 #define spin_lock_irqsave(l, f) do { assert(!*(l)); *(l) = 1; (f) = 0; } while (0)
