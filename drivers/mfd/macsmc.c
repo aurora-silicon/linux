@@ -991,6 +991,39 @@ static bool apple_smc_port_reasons_only(const struct apple_smc *smc, u64 record)
 
 static void apple_smc_sleep_wait(u64 acknowledged, u32 minimum_us);
 
+/*
+ * J714s: the SMC wakes the AP for USB-C_plug alone (MBSW bit 42) about 31 s into many sleeps with
+ * a display, a dock and a charger on the ports (36 of 45 sleeps on 11-18, none of them a cable
+ * plugged or pulled), and nothing changes on any port. Such a wake needs nothing from user space:
+ * it is a dark one, and the system sleeps again with user space frozen and the outputs off. Only
+ * that bit alone: any other bit (the lid, the power button, the keyboard and trackpad, a charger or
+ * a plug change of another kind, one this table doesn't name) or none at all (the PMU's RTC alarm)
+ * is a full wake, and so is the wake after SMC_PORT_DARK_WAKES_MAX dark ones in a row. The alarm
+ * the sleep was admitted with stays armed: the sleep controller checks it at every entry, and an
+ * entry too close to it is refused, which ends the dark wakes with a full one.
+ */
+#define SMC_PORT_DARK_WAKES_MAX	128
+
+static void apple_smc_port_dark_wake(struct apple_smc *smc)
+{
+	int bit = apple_smc_wake_reason_bit(smc, "USB-C_plug");
+	s64 asleep_ms;
+
+	if (bit < 0 || smc->wake_record != BIT_ULL(bit))
+		return;
+	asleep_ms = ktime_ms_delta(ktime_get_boottime(), smc->sleep_entry_boot) -
+		    ktime_ms_delta(ktime_get(), smc->sleep_entry_mono);
+	if (smc->port_dark_wakes >= SMC_PORT_DARK_WAKES_MAX) {
+		dev_warn(smc->dev, "woken for USB-C_plug alone after %lld.%03lld s asleep, %u dark wakes in a row: a full wake\n",
+			 asleep_ms / 1000, asleep_ms % 1000, smc->port_dark_wakes);
+		return;
+	}
+	smc->port_dark_wakes++;
+	dev_info(smc->dev, "woken for USB-C_plug alone after %lld.%03lld s asleep: dark wake %u (at most %u in a row)\n",
+		 asleep_ms / 1000, asleep_ms % 1000, smc->port_dark_wakes, SMC_PORT_DARK_WAKES_MAX);
+	pm_set_dark_wake();
+}
+
 static void apple_smc_sleep_wake(struct apple_smc *smc)
 {
 	bool mbsw;
@@ -1021,9 +1054,11 @@ static void apple_smc_sleep_wake(struct apple_smc *smc)
 	apple_smc_lid_wake(smc);
 	if (apple_smc_port_reasons_only(smc, smc->wake_record))
 		apple_sleep_port_wake(apple_sleep_lid_closed_at_wake() > 0);
-	/* With a sleep policy (the J714s), the record is only named and the lid read. */
-	if (smc->sleep_policy)
+	/* With a sleep policy (the J714s), the record is named, the lid read, a port alone dark. */
+	if (smc->sleep_policy) {
+		apple_smc_port_dark_wake(smc);
 		return;
+	}
 	if (apple_smc_port_reasons_only(smc, smc->wake_record))
 		apple_sleep_debug_link_cut_wake();
 	/* A dark wake isn't one: with wakeup_count in use, it would abort the sleep after it. */
@@ -1427,15 +1462,40 @@ static int apple_smc_prepare_policy(struct apple_smc *smc)
 	return apple_sleep_smc_register_saved(smc->dev, &apple_smc_saved_ops, smc);
 }
 
+/*
+ * The saved-context guard, under the command mutex, without waiting for it: a sleep a user asks
+ * for doesn't wait on a stuck command. The re-entry right after a J714s dark wake does, for at
+ * most SMC_DARK_REENTRY_MS: the notification of the event that woke it is still being handled
+ * then, its ordinary command in flight, and refusing ended every dark wake in a full one.
+ */
+#define SMC_DARK_REENTRY_MS	2000
+
+static int apple_smc_prepare_guard(struct apple_smc *smc)
+{
+	unsigned int ms = 0, limit = smc->port_dark_wakes ? SMC_DARK_REENTRY_MS : 0;
+	int ret;
+
+	for (;;) {
+		ret = -EBUSY;
+		if (mutex_trylock(&smc->mutex)) {
+			ret = apple_smc_saved_guard(smc);
+			mutex_unlock(&smc->mutex);
+		}
+		if (ret != -EBUSY || ms >= limit)
+			break;
+		msleep(10);
+		ms += 10;
+	}
+	if (ms)
+		dev_info(smc->dev, "dark wake's re-entry: the SMC was busy for %u ms (%d)\n", ms, ret);
+	return ret;
+}
+
 static int apple_smc_sleep_prepare(struct apple_smc *smc)
 {
 	if (smc->saved_enabled) {
-		int ret;
+		int ret = apple_smc_prepare_guard(smc);
 
-		if (!mutex_trylock(&smc->mutex))
-			return -EBUSY;
-		ret = apple_smc_saved_guard(smc);
-		mutex_unlock(&smc->mutex);
 		if (ret)
 			return ret; /* Do not replace a quarantined policy with NULL. */
 	}
@@ -1506,6 +1566,9 @@ static void apple_smc_complete(struct device *dev)
 	struct apple_smc *smc = dev_get_drvdata(dev);
 
 	apple_sleep_smc_unregister(dev);
+	/* A full wake ends the run of dark ones. */
+	if (!pm_dark_wake())
+		smc->port_dark_wakes = 0;
 
 	/* Not saved_pending: an ordinary command may be in flight here, and it is read without the mutex. */
 	if (smc->saved_enabled && (smc->saved_recovery || smc->saved_fault)) {
@@ -1588,6 +1651,9 @@ static int apple_smc_suspend_noirq(struct device *dev)
 	struct apple_smc *smc = dev_get_drvdata(dev);
 	int ret;
 
+	/* For the time asleep a dark wake logs: boot time counts the sleep, monotonic doesn't. */
+	smc->sleep_entry_boot = ktime_get_boottime();
+	smc->sleep_entry_mono = ktime_get();
 	if (smc->sleep_policy)
 		return 0; /* Deferred to shared final returning check, before last_stop. */
 	if (!smc->sleep_warned && !smc->sleep_warn_late)
