@@ -302,6 +302,7 @@ struct t6040_sleep {
 	void __iomem *dcp_dart;		/* dart-dcp, for its transaction idle wait */
 	void __iomem *disp_pwrgate;	/* internal display retention window 0x5022a1000 */
 	bool disp_down;			/* t6040_disp_off() lowered the internal display */
+	bool disp_by_driver;		/* the display driver had lowered DISP_SYS itself */
 	void __iomem *pmc_dcp;		/* PMS pmc-dcp voter pair 0x5048a9c14/c18 */
 	u32 pmc_dcp_saved[2];
 	u32 pmc_if_saved[2];		/* BWR and boost interface enables at the commit */
@@ -1692,7 +1693,8 @@ static void t6040_disp_sys_pre(struct t6040_sleep *s)
 {
 	void __iomem *bridge = s->axi2af_bridge[AXI2AF_DISP_SYS];
 
-	if (bridge) {
+	/* Behind DISP_SYS: an access with the domain already down never completes. */
+	if (bridge && FIELD_GET(PS_ACTUAL, readl(s->soc_east + PS_DISP_SYS))) {
 		writel(readl(bridge + AXI2AF_BRIDGE_104) & ~BIT(0), bridge + AXI2AF_BRIDGE_104);
 		writel(readl(bridge + AXI2AF_BRIDGE_108) & ~BIT(0), bridge + AXI2AF_BRIDGE_108);
 	}
@@ -1730,6 +1732,7 @@ static int t6040_disp_off(struct t6040_sleep *s, const struct t6040_sleep_group 
 	int ret;
 
 	s->disp_down = true;
+	s->disp_by_driver = !FIELD_GET(PS_ACTUAL, t6040_psw_read(&sys));
 	/*
 	 * The PMC's bandwidth-request and boost interface enables of the display pipes
 	 * (0x5048ac020 / 0x5048ac028, one bit per pipe; they belong set while a pipe's SYS
@@ -1755,9 +1758,12 @@ static int t6040_disp_off(struct t6040_sleep *s, const struct t6040_sleep_group 
 	 * idles in WFI with the run bit kept: wait for ACTUAL 0, after dart-dcp's transactions
 	 * have drained, and go on either way.
 	 */
-	if (FIELD_GET(PS_ACTUAL, t6040_psw_read(&cpu)))
+	if (FIELD_GET(PS_ACTUAL, t6040_psw_read(&cpu)) && !s->disp_by_driver)
 		t6040_dcp_dart_idle(s);
 	t6040_psw_poll_long(&cpu, PS_ACTUAL, 0, DISP_CPU_GATE_US);
+	/* Lowered by the display driver, which also raises it again after the wake. */
+	if (s->disp_by_driver)
+		return 0;
 
 	ret = t6040_psw_off(s, &fe, NULL);
 	if (!ret)
@@ -1808,10 +1814,12 @@ static void t6040_disp_back(struct t6040_sleep *s)
 		return;
 	s->disp_down = false;
 	/* DISP_CPU's word can't be written from here: automatic mode raises it. */
-	if (t6040_psw_on(s, &sys, true, true))
-		return;
-	if (t6040_psw_on(s, &fe, false, false))
-		return;
+	if (!s->disp_by_driver) {
+		if (t6040_psw_on(s, &sys, true, true))
+			return;
+		if (t6040_psw_on(s, &fe, false, false))
+			return;
+	}
 	if (s->pmc_dcp) {
 		writel(s->pmc_dcp_saved[1], s->pmc_dcp + 4);
 		writel(s->pmc_dcp_saved[0], s->pmc_dcp);
